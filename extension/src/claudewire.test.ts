@@ -3009,7 +3009,7 @@ test.each([false, true])(
       send() {},
       sessionId: SESSION,
       emit: (event) => {
-        if (event.kind === 'native') book.observe(binding, event.event, event.event.kind === 'rootEnd');
+        if (event.kind === 'native') book.observe(binding, event.event);
       },
     });
     const tool = {
@@ -3036,18 +3036,18 @@ test.each([false, true])(
       terminal_reason: 'completed',
       num_turns: 1,
     });
-    assert.equal(book.deliverable(SESSION).length, 0);
+    assert.equal(
+      book.deliverable(SESSION).length,
+      1,
+      'the ended turn makes the request deliverable before its tool settles',
+    );
     send({
       type: 'user',
       parent_tool_use_id: null,
       message: { content: [{ type: 'tool_result', tool_use_id: tool.id, is_error: false }] },
       tool_use_result: { interrupted: false },
     });
-    assert.equal(
-      book.deliverable(SESSION).length,
-      1,
-      'successful tool settlement can arrive after exact-turn settlement',
-    );
+    assert.equal(book.deliverable(SESSION).length, 1, 'a late tool settlement keeps one deliverable request');
     wire.close('finished');
   },
 );

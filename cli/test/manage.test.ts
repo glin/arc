@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, test, vi } from 'vitest';
+import { afterEach, beforeEach, test, vi } from 'vitest';
 import { WindowChannel, type SessionRequest } from '../../extension/src/sessionrequests.ts';
 import { COMPACT_CANCELLED, CompactHost, type CompactChild } from '../../extension/src/compactrequest.ts';
 import type { NativeEvent } from '../../extension/src/agentwire.ts';
@@ -12,6 +12,11 @@ import { runManagement } from '../src/manage.ts';
 import { runCompact } from '../src/compact.ts';
 import { runSessions } from '../src/sessions.ts';
 import { collectRow, collectPage, collectTurns, smokeEnv } from './smoke-fixture.ts';
+
+// An agent that Arc launched inherits its launch token. These cases choose the token themselves.
+beforeEach(() => {
+  vi.stubEnv('ARC_SESSION_TOKEN', undefined);
+});
 
 afterEach(() => {
   vi.unstubAllEnvs();
@@ -31,7 +36,7 @@ const compactArgs = [
   '--json',
 ];
 
-test('compact readiness spaces four negative reads and preserves their reason without admission', async () => {
+test('compact readiness spaces thirty negative reads one second apart and preserves their reason without admission', async () => {
   vi.useFakeTimers();
   vi.setSystemTime(0);
   const times: number[] = [];
@@ -41,14 +46,17 @@ test('compact readiness spaces four negative reads and preserves their reason wi
     return { ready: false, code: 'not-observed', reason: 'Not seen yet.' };
   });
   const pending = runCompact(compactArgs);
-  await vi.advanceTimersByTimeAsync(499);
+  await vi.advanceTimersByTimeAsync(999);
   assert.deepEqual(times, [0]);
   await vi.advanceTimersByTimeAsync(1);
-  assert.deepEqual(times, [0, 500]);
-  await vi.advanceTimersByTimeAsync(1000);
+  assert.deepEqual(times, [0, 1000]);
+  await vi.advanceTimersByTimeAsync(28_000);
   const result = JSON.parse(await pending);
-  assert.deepEqual(times, [0, 500, 1000, 1500]);
-  assert.equal(request.mock.calls.length, 4);
+  assert.deepEqual(
+    times,
+    Array.from({ length: 30 }, (_, index) => index * 1000),
+  );
+  assert.equal(request.mock.calls.length, 30);
   assert.deepEqual([result.state, result.reason], ['refused', 'Not seen yet.']);
 });
 
@@ -65,10 +73,10 @@ test('compact readiness stops new reads after a delayed negative exchange exhaus
     return { ready: false, reason: 'Still waiting.' };
   });
   const pending = runCompact(compactArgs);
-  await vi.advanceTimersByTimeAsync(1600);
+  await vi.advanceTimersByTimeAsync(29_600);
   release();
   await vi.advanceTimersByTimeAsync(0);
-  await vi.advanceTimersByTimeAsync(500);
+  await vi.advanceTimersByTimeAsync(1000);
   const result = JSON.parse(await pending);
   assert.equal(request.mock.calls.length, 1);
   assert.deepEqual([result.state, result.reason], ['refused', 'Still waiting.']);
@@ -99,7 +107,7 @@ test('compact readiness admits once when an unseen command becomes ready', async
     .mockResolvedValueOnce({ ready: true })
     .mockResolvedValueOnce({ state: 'queued' });
   const pending = runCompact(compactArgs);
-  await vi.advanceTimersByTimeAsync(500);
+  await vi.advanceTimersByTimeAsync(1000);
   assert.equal(JSON.parse(await pending).state, 'queued');
   assert.deepEqual(
     request.mock.calls.map(([method]) => method),
@@ -122,12 +130,36 @@ test('compact readiness accepts a positive in-flight reply after the read-start 
     return { state: 'queued' };
   });
   const pending = runCompact(compactArgs);
-  await vi.advanceTimersByTimeAsync(2100);
+  await vi.advanceTimersByTimeAsync(30_100);
   release();
   assert.equal(JSON.parse(await pending).state, 'queued');
   assert.deepEqual(
     request.mock.calls.map(([method]) => method),
     ['compact-ready', 'compact-request'],
+  );
+});
+
+// Catches a session's own request that waits for the window to see its command although its launch token names it.
+test('compact request with a launch token goes straight to admission and sends the token', async () => {
+  vi.useFakeTimers();
+  const token = 'd'.repeat(32);
+  vi.stubEnv('ARC_SESSION_TOKEN', token);
+  const request = vi.spyOn(sessionRequests, 'requestWindow').mockResolvedValue({ state: 'queued' });
+  assert.equal(JSON.parse(await runCompact(compactArgs)).state, 'queued');
+  assert.deepEqual(
+    request.mock.calls.map(([method, params]) => [method, params]),
+    [['compact-request', { requestId: compactArgs[4], window: compactWindow, self: true, afterTurn: true, token }]],
+  );
+  request.mockReset();
+  request.mockResolvedValueOnce({ ready: true }).mockResolvedValueOnce({ state: 'queued' });
+  vi.stubEnv('ARC_SESSION_TOKEN', 'D'.repeat(32));
+  assert.equal(JSON.parse(await runCompact(compactArgs)).state, 'queued');
+  assert.deepEqual(
+    request.mock.calls.map(([method, params]) => [method, 'token' in (params as object)]),
+    [
+      ['compact-ready', false],
+      ['compact-request', false],
+    ],
   );
 });
 
@@ -149,7 +181,7 @@ test('compact cancel repeats only while the window has not seen the command and 
     .mockResolvedValueOnce({ state: 'refused', code: 'not-observed', reason: 'Not seen yet.' })
     .mockResolvedValueOnce({ state: 'cancelled', reason: 'Cancelled.' });
   const pending = runCompact(cancelArgs);
-  await vi.advanceTimersByTimeAsync(500);
+  await vi.advanceTimersByTimeAsync(1000);
   assert.deepEqual(JSON.parse(await pending), { state: 'cancelled', reason: 'Cancelled.' });
   assert.deepEqual(
     request.mock.calls.map(([method, params]) => [method, params]),

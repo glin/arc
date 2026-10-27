@@ -9876,7 +9876,7 @@ test('a refresh posts the render the panel paints from before it offers a spend 
   );
 });
 
-test('a ready scope reports removed sessions while every panel is hidden and rows remain retained', async () => {
+test('a ready scope change while every panel is hidden retains its catalog rows', async () => {
   const provider = paintHarness(['repositoryScopeChanged'], { scopeInside: isInside });
   provider.anyVisible = () => false;
   provider.selectionWorks = new Map();
@@ -9889,12 +9889,8 @@ test('a ready scope reports removed sessions while every panel is hidden and row
   ];
   provider.newDrafts = { draft: { draftId: 'draft', cwd: 'C:/removed/draft' } };
   provider.awaitingSessionRecords = { awaiting: { sessionId: 'awaiting', cwd: 'C:/removed/new' } };
-  const changes: (ReadonlySet<string> | undefined)[] = [];
-  provider.onScopeChange = (outOfScope?: ReadonlySet<string>) => changes.push(outOfScope);
   provider.repositoryScopeChanged();
   await provider.refresh(true);
-  assert.equal(changes[0], undefined, 'delivery must wait before scope publication');
-  assert.deepEqual([...(changes[1] ?? [])], ['removed', 'draft', 'awaiting']);
   assert.equal(provider.authoritativeCatalog.length, 3, 'hidden refresh must retain its catalog');
 });
 
@@ -9931,7 +9927,7 @@ test('a repository scope change leaves a discovery continuation running and send
   await continuation;
 });
 
-test('hidden workspace-folder changes retain known directories until the replacement scope cancels removed sessions', async () => {
+test('hidden workspace-folder changes retain known directories until the replacement scope removes them', async () => {
   const provider = paintHarness(['workspaceFoldersChanged', 'repositoryScopeChanged'], { scopeInside: isInside });
   provider.anyVisible = () => false;
   provider.selectionWorks = new Map();
@@ -9948,20 +9944,12 @@ test('hidden workspace-folder changes retain known directories until the replace
   ];
   provider.newDrafts = {};
   provider.awaitingSessionRecords = {};
-  const changes: (ReadonlySet<string> | undefined)[] = [];
-  provider.onScopeChange = (outOfScope?: ReadonlySet<string>) => changes.push(outOfScope);
   provider.workspaceFoldersChanged();
   await provider.refresh(true);
   assert.equal(provider.authoritativeCatalog, null, 'workspace invalidation must remove the old rendering catalog');
-  assert.equal(
-    changes.some((sessions) => sessions?.has('removed')),
-    false,
-    'an unresolved scope must keep assignments waiting',
-  );
   ready = true;
   provider.repositoryScopeChanged();
   await provider.refresh(true);
-  assert.deepEqual([...(changes.at(-1) ?? [])], ['removed']);
   assert.deepEqual(
     [...provider.scopeSessionDirectories],
     [['kept', 'C:/kept/project']],
@@ -9975,11 +9963,6 @@ test('hidden workspace-folder changes retain known directories until the replace
   ready = true;
   provider.repositoryScopeChanged();
   await provider.refresh(true);
-  assert.deepEqual(
-    [...(changes.at(-1) ?? [])],
-    ['kept'],
-    'a second hidden scope change must cancel the surviving assignment when it leaves',
-  );
   assert.equal(
     provider.scopeSessionDirectories.size,
     0,

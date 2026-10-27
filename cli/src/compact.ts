@@ -7,8 +7,8 @@ import {
 } from '../../extension/src/compactrequest.ts';
 import { readContinuationFile } from './manage.ts';
 
-// Readiness spreads its reads across this window, so a tool start that reaches the host late can still be admitted.
-const READINESS = { attempts: 4, intervalMs: 500, deadlineMs: 2_000 } as const;
+// Readiness spreads its reads across this window, so a tool start that reaches a busy host late can still be admitted.
+const READINESS = { attempts: 30, intervalMs: 1000, deadlineMs: 30_000 } as const;
 
 // Repeats a window read until `done` accepts an answer or the readiness window ends. Returns the last
 // answer, or null when no read started before the deadline.
@@ -96,28 +96,34 @@ export async function runCompact(args: string[]): Promise<string> {
       return result('unavailable', error instanceof Error ? error.message : 'The Arc window is unavailable.');
     }
   }
-  try {
+  // Arc writes a launch token into each agent process it starts. The token names the session, so the window
+  // admits the request without first seeing the command run.
+  const token = process.env.ARC_SESSION_TOKEN;
+  const request = token && /^[a-f0-9]{32}$/.test(token) ? { ...payload, token } : payload;
+  if (!('token' in request)) {
     let reason = COMPACT_REJECTIONS['not-observed'];
-    const observation = await untilObserved(
-      async () => {
-        const answer = (await requestWindow('compact-ready', payload, payload.window)) as {
-          ready?: boolean;
-          code?: string;
-          reason?: string;
-        };
-        if (typeof answer.reason === 'string' && answer.reason) reason = answer.reason;
-        return answer;
-      },
-      // Only a command the window has not seen yet can still become ready.
-      (answer) => answer.ready === true || (answer.code !== undefined && answer.code !== 'not-observed'),
-    );
-    if (observation?.ready !== true) return result('refused', reason);
-  } catch (error) {
-    return result('refused', error instanceof Error ? error.message : 'The Arc window is unavailable.');
+    try {
+      const observation = await untilObserved(
+        async () => {
+          const answer = (await requestWindow('compact-ready', payload, payload.window)) as {
+            ready?: boolean;
+            code?: string;
+            reason?: string;
+          };
+          if (typeof answer.reason === 'string' && answer.reason) reason = answer.reason;
+          return answer;
+        },
+        // Only a command the window has not seen yet can still become ready.
+        (answer) => answer.ready === true || (answer.code !== undefined && answer.code !== 'not-observed'),
+      );
+      if (observation?.ready !== true) return result('refused', reason);
+    } catch (error) {
+      return result('refused', error instanceof Error ? error.message : 'The Arc window is unavailable.');
+    }
   }
   try {
     return JSON.stringify(
-      await requestWindow('compact-request', payload, payload.window, undefined, payload.requestId),
+      await requestWindow('compact-request', request, payload.window, undefined, payload.requestId),
     );
   } catch {
     return result(

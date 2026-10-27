@@ -632,8 +632,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           }
           panel.releaseDeliveredPromptAssets(ended, turnEndCompletesEveryPrompt(agent ?? ''), turnId);
           panel.flushQueue(ended);
-          const child = host.get(key);
-          if (child) compaction?.turnEnded(child);
           void compaction?.drain(ended);
         }
       }
@@ -701,6 +699,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       activation,
       {
         find: (provider, sessionId) => host.find(provider, sessionId),
+        findToken: (token) => host.findByToken(token),
         withActivity: (child, work) => host.withActivity(child.key, work),
         readerWork: (sessionId) => panel.readerWork(sessionId),
         continuationWork: (sessionId) => panel.continuationWork(sessionId),
@@ -715,7 +714,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     compaction = owner;
     panel.onReaderAction = (session, answer, carry) => owner.readerAction(session, answer, carry);
     panel.onReaderUnsent = (session) => owner.unsent(session);
-    panel.onScopeChange = (outOfScope) => owner.scopeChanged(outOfScope);
     panel.onSessionRowsRefreshed = () => owner.sessionsRefreshed();
     channel.setCompactRequestHandler((request) => owner.handle(request));
     context.subscriptions.push({ dispose: () => owner.dispose() });

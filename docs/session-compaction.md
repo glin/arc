@@ -34,13 +34,13 @@ Accepted Claude Stop retains submission identity for qualified interrupted dispa
 
 ## Agent-requested compaction
 
-Keep self-compaction outside queued prompts. Freeze session, turn, tool, child generation, source, activation, and reader revision when observing the command. Initiating evidence supplies intent independently of reader submissions or notification ancestry.
+Keep self-compaction outside queued prompts. `AgentSession` writes a fresh `ARC_SESSION_TOKEN` into each spawned agent process, and `AgentHost.findByToken` resolves a request's token to that live child. A token request binds to the child's last observed turn without an observed command. The request's own tool start, when Arc observes it later, attaches its tool and exact turn. The first root ending of the session after admission ends the turn of a token request that has no observed tool start. Without a token, freeze session, turn, tool, child generation, source, activation, and reader revision when observing the command. Initiating evidence supplies intent independently of reader submissions or notification ancestry.
 
 Codex admits live agent commands without PTY identity and unified-exec startup commands with process identity. Execution mode alone establishes no caller. Exclude user-shell commands, unified-exec interactions, unknown sources, and settled commands. Require the literal command and exact session and turn.
 
 Admit one pending request per exact turn within active capacity. Repeated requests consume no assignment allowance. Activation-wide native-call and request-ID tombstones prevent replay and grow until disposal. Evict terminal entries before refusing active capacity. Active operations have no execution deadline. Retain active native bindings across later requests in the same child.
 
-Require successful tool settlement, exact-turn success, and a retained final response independently. A running call can retain completion and response before admission. Claude background acknowledgments bind task IDs without settling commands. Only matching terminal notices settle them. Parse user-form notices with the shared strict task-tag parser. System notices use structured fields. Retain root tool owners across later turns. Synchronous endings follow the current shared response owner. Retain direct Bash starts because results can establish background execution.
+Deliver after the requesting turn ends, with or without success. The final response does not need to reach the panel first. Admission needs only the live child. Open asks and queued reader input wait at delivery. Claude background acknowledgments bind task IDs without settling commands. Only matching terminal notices settle them. Parse user-form notices with the shared strict task-tag parser. System notices use structured fields. Retain root tool owners across later turns. Synchronous endings follow the current shared response owner. Retain direct Bash starts because results can establish background execution.
 
 ### Reader actions and delivery
 
@@ -48,7 +48,7 @@ Stop, compact, answers, setting picks, and slash commands cancel unsubmitted wor
 
 Retained and delivered reader sends hold compaction. Unknown membership defers release until row refresh. Dropping the final undelivered send releases its hold and schedules delivery checks. Claude prompt writes advance native generation, including prompts joining running work. `readerPrompt()` appends the request-identifying carry line to delivered text only. Saved drafts and queues retain original text.
 
-`arc compact cancel` requires the requesting session's exact observed cancel command in a live root tool call. Answers can approve that tool before admission. Scope changes pause delivery until refreshed rows confirm membership. Confirmed scope loss cancels pending work.
+`arc compact cancel` requires the requesting session's exact observed cancel command in a live root tool call. Answers can approve that tool before admission. Session rows, scope changes, and source or setup changes neither pause nor cancel pending work, because the live child holds the session. Each root ending schedules a delivery check, so delivery does not wait for a rows refresh.
 
 Continuation waits for positive idle evidence and no unresolved native compaction on the retained child. Hold its activity lease, save preparation and possible input, and recheck authority synchronously beside writing. Deliver only the saved agent-authored text through ordinary submission bookkeeping. Never enqueue it as `QueuedSubmission`. Exit or replacement makes submitted unresolved work uncertain, releases active capacity, and rejects late old-child evidence. Never retry possible input automatically. Accepted continuation confirms exact prompt acknowledgment, without establishing task completion.
 

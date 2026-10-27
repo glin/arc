@@ -4,7 +4,7 @@
 
 ## Runtime shape
 
-Arc-owned children receive their immutable private CLI launcher directory before inherited PATH. Windows preserves the inherited PATH key's casing. `ARC_WINDOW` names the current activation when its channel exists. Otherwise remove it. `ARC_EDITOR_EXECUTABLE` names the editor binary.
+Arc-owned children receive their immutable private CLI launcher directory before inherited PATH. Windows preserves the inherited PATH key's casing. `ARC_WINDOW` names the current activation when its channel exists. Otherwise remove it. `ARC_EDITOR_EXECUTABLE` names the editor binary. Each child that `AgentSession` spawns receives a fresh `ARC_SESSION_TOKEN`, which `arc compact request` sends back to name the session. Other children never inherit one.
 
 Arc checks Claude's session skill and snapshot hooks separately. Each accepted plugin adds one `--plugin-dir` argument to the Claude command. Arc still launches the provider directly. [Session tools](native-skills.md#checks-before-startup-and-input) describes the checks before startup and input.
 

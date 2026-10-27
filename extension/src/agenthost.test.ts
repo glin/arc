@@ -81,7 +81,6 @@ import { livePress } from './turnfixtures.ts';
 import { RepositoryScope } from './repositoryscope';
 import { sessionCoverageMember } from './sessioncoverage';
 import { revisionOf as fileRevisionOf } from './transcript';
-import { RecordedReplies } from './sessionreads.ts';
 import { CODEX_DEADLINE_MS, sandboxPolicy } from './codexwire.ts';
 import { requesterIdentity } from './sessionrequests.ts';
 import { GuardedAttempt, McpServer, ModelList, UsageReading, WireEvent } from './agentwire.ts';
@@ -1298,12 +1297,14 @@ function fakeHost(
   states: SessionState[];
   commands: string[][];
   envs: Record<string, string>[];
+  tokens: (string | undefined)[];
 } {
   const children: FakeChild[] = [];
   const events: SessionEvent[] = [];
   const states: SessionState[] = [];
   const commands: string[][] = [];
   const envs: Record<string, string>[] = [];
+  const tokens: (string | undefined)[] = [];
   const host = new AgentHost({
     openingDeadlineMs,
     now,
@@ -1314,9 +1315,10 @@ function fakeHost(
     timer: lifecycle.timer,
     exitGraceMs: lifecycle.exitGraceMs,
     recoverySource: lifecycle.recoverySource,
-    spawner: (_command, args, _cwd, env) => {
+    spawner: (_command, args, _cwd, env, _agent, _cli, _inherited, sessionToken) => {
       commands.push(args);
       envs.push(env);
+      tokens.push(sessionToken);
       const child = new FakeChild();
       children.push(child);
       return child;
@@ -1330,7 +1332,7 @@ function fakeHost(
       lifecycle.onStateChange?.(state);
     },
   });
-  return { host, children, events, states, commands, envs };
+  return { host, children, events, states, commands, envs, tokens };
 }
 
 function settle(host: AgentHost, key: string): void {
@@ -3187,11 +3189,6 @@ test.each(['live', 'settled', 'reader-acted'] as const)(
     const admitted = h.compaction.handle({ method: 'compact-request', params: request }) as { state: string };
     assert.equal(admitted.state, mode === 'live' ? 'queued' : 'refused');
     if (mode === 'live') end();
-    h.replies.settle(
-      'session',
-      [{ promptId: native.turnId, finalResponse: { sourceId: 'native-final', text: 'Saved.' } }],
-      'codex',
-    );
     assert.equal(h.compaction.requests.deliverable('session').length, mode === 'live' ? 1 : 0);
     h.compaction.readerAction('session');
     const next = session.prompt('New directing input.');
@@ -6059,6 +6056,40 @@ test('Arc CLI environments preserve PATH casing and replace inherited window tar
       'bin',
     );
   }
+});
+
+test('Arc CLI environments carry the session token and drop inherited token variants on each platform', () => {
+  const tokenKeys = (env: Record<string, string | undefined>) =>
+    Object.keys(env).filter((name) => name.toUpperCase() === 'ARC_SESSION_TOKEN');
+  for (const platform of ['win32', 'darwin', 'linux']) {
+    const inherited = { PATH: 'inherited', ARC_SESSION_TOKEN: 'stale', Arc_Session_Token: 'other' };
+    const cli = { directory: 'bin', editorExecutable: '/editor', windowId: null, platform };
+    const token = '0123456789abcdef0123456789abcdef';
+    const env = childEnv(inherited, {}, undefined, undefined, { ...cli, sessionToken: token });
+    assert.deepEqual(tokenKeys(env), ['ARC_SESSION_TOKEN'], platform);
+    assert.equal(env.ARC_SESSION_TOKEN, token, platform);
+    assert.deepEqual(tokenKeys(childEnv(inherited, {}, undefined, undefined, cli)), [], platform);
+  }
+});
+
+test('each agent session receives its own launch token, and the host finds a live session by it', async () => {
+  const fake = fakeHost();
+  const sessions: AgentSession[] = [];
+  for (const [key, sessionId] of [
+    ['one', 'sess-a'],
+    ['two', 'sess-b'],
+  ] as const) {
+    const opening = fake.host.session(key, claudePlan(CLAUDE, { cwd: WS, sessionId }));
+    fake.children.at(-1)!.answerHandshake();
+    sessions.push(await opening);
+  }
+  assert.equal(fake.tokens.length, 2);
+  for (const [index, token] of fake.tokens.entries()) {
+    assert.match(token ?? '', /^[0-9a-f]{32}$/);
+    assert.equal(fake.host.findByToken(token!), sessions[index]);
+  }
+  assert.notEqual(fake.tokens[0], fake.tokens[1]);
+  assert.equal(fake.host.findByToken('0'.repeat(32)), null);
 });
 
 test('the extension binds its packaged CLI and current window to every child entry point', () => {
@@ -10148,19 +10179,7 @@ function compactionThroughHost(
   });
   const owners: (number | undefined)[] = [];
   const events: { kind: string; turnId: number | undefined }[] = [];
-  const replies = new RecordedReplies();
-  const holder = options.holder ?? {
-    noteRecordedReply: (
-      session: string,
-      sourceId: string,
-      text: string,
-      saved: () => void,
-      wanted: () => boolean,
-      identity?: { provider: 'claude' | 'codex'; nativeTurnId?: string; ownerTurnId?: number },
-    ) => replies.note(session, { sourceId, text, saved, wanted, ...identity }),
-    noteCompletedReply: () => {},
-    settleRecordedReplies: () => {},
-  };
+  const holder = options.holder ?? { noteCompletedReply: () => {} };
   let current: CompactChild | null = null;
   const compaction = new CompactHost<CompactChild>(
     window,
@@ -10185,12 +10204,9 @@ function compactionThroughHost(
       if (event.kind === 'native' && event.event.kind === 'toolStart') owners.push(turnId);
       if (event.kind === 'turnEnd')
         options.holder?.noteResponseEnded?.(child.state().sessionId!, event.outcome, turnId);
-      // The window's own routing, with a panel that holds recorded replies.
+      // The window's own routing, with a panel that records completed replies.
       routeCompactionEvent(compaction, holder, child, event, turnId);
-      if (event.kind === 'turnEnd') {
-        if (options.automatic) options.holder?.flushQueue?.(child.state().sessionId!);
-        compaction.turnEnded(child);
-      }
+      if (event.kind === 'turnEnd' && options.automatic) options.holder?.flushQueue?.(child.state().sessionId!);
       if (options.automatic && (event.kind === 'turnEnd' || (event.kind === 'sessionState' && event.state === 'idle')))
         void compaction.drain(child.state().sessionId!);
     },
@@ -10204,7 +10220,6 @@ function compactionThroughHost(
     payload,
     owners,
     events,
-    replies,
     compaction,
     host,
     children,
@@ -10279,12 +10294,9 @@ test.each(['effort', 'compact', 'clear', 'typed effort', 'typed compact'] as con
     const responses: { text: string; sourceId?: string; turnId?: number }[] = [];
     const h = await joinedCompaction({
       holder: {
-        noteRecordedReply: () => assert.fail('the reader response has an ordinary turn card'),
-        noteCompletedReply: (_session, text, sourceId, turnId, saved) => {
+        noteCompletedReply: (_session, text, sourceId, turnId) => {
           responses.push({ text, sourceId, turnId });
-          saved?.();
         },
-        settleRecordedReplies: () => {},
       },
     });
     const child = h.children[0];
@@ -10514,12 +10526,9 @@ test.each(['before idle', 'after idle'] as const)(
     const replies: { text: string; turnId?: number }[] = [];
     const h = await joinedCompaction({
       holder: {
-        noteRecordedReply: () => assert.fail('the reader reply retains its turn card'),
-        noteCompletedReply: (_session, text, _source, turnId, saved) => {
+        noteCompletedReply: (_session, text, _source, turnId) => {
           replies.push({ text, turnId });
-          saved?.();
         },
-        settleRecordedReplies: () => {},
       },
     });
     const child = h.children[0];
@@ -10721,13 +10730,7 @@ test.each([
   'zero-model rejection',
   'zero-model nonquery',
 ] as const)('background-woken ownership survives %s', async (ordering) => {
-  const h = await joinedCompaction({
-    holder: {
-      noteRecordedReply: () => {},
-      noteCompletedReply: (_session, _text, _sourceId, _turnId, saved) => saved?.(),
-      settleRecordedReplies: () => {},
-    },
-  });
+  const h = await joinedCompaction();
   const child = h.children[0];
   await h.send('Start the background work, then end the turn.');
   h.replay();
@@ -10898,16 +10901,11 @@ test.each([true, false])('joined reader compaction in the shared running turn, a
       },
     }) + '\n',
   );
-  if (read) h.compaction.replyRetained(h.session, first);
   const result = agentStartedTurns(h.window, h.ids).find((line) => line.includes('"type":"result"'))!;
   h.children[0].say(result + '\n');
   assert.equal(h.events.filter((event) => event.kind === 'turnEnd').at(-1)?.turnId, first);
+  assert.equal(h.compaction.requests.deliverable('sess-1').length, 1, 'the request follows its shared ending');
   if (read) {
-    assert.equal(
-      h.compaction.requests.deliverable('sess-1').length,
-      1,
-      'the request follows its successful shared ending',
-    );
     h.children[0].say(sessionState('idle'));
     await h.compaction.drain('sess-1');
     assert.equal(sentTexts(h.children[0]).at(-1), '/compact');
@@ -10999,9 +10997,7 @@ test.each([
   const ending = JSON.parse(lines.find((line) => line.includes('"runId":"run-11"'))!);
   h.children[0].say(JSON.stringify(ending) + '\n');
   assert.equal(h.events.filter((event) => event.kind === 'turnEnd').at(-1)?.turnId, owner);
-  assert.equal(h.compaction.requests.deliverable('sess-1').length, 0, 'the final response must be retained first');
-  h.replies.settle('sess-1', [{ finalResponse: { text: 'Work complete.', sourceId: 'joined-final' } }]);
-  assert.equal(h.compaction.requests.deliverable('sess-1').length, 1);
+  assert.equal(h.compaction.requests.deliverable('sess-1').length, 1, 'the woken turn ended');
   h.children[0].say(sessionState('idle'));
   await h.compaction.drain('sess-1');
   assert.equal(sentTexts(h.children[0]).at(-1), '/compact');
@@ -11179,7 +11175,6 @@ async function readerCompactionAfterScopeRecovery(queuedReaderInput: boolean) {
     through.compaction.dispose();
     for (const child of through.children) child.exit(0);
   });
-  holder.onScopeChange = (removed?: ReadonlySet<string>) => through.compaction.scopeChanged(removed);
   holder.onSessionRowsRefreshed = () => through.compaction.sessionsRefreshed();
   const opening = through.host.session('one', claudePlan(CLAUDE, { cwd, sessionId: 'sess-1' }));
   through.children[0].answerHandshake();
@@ -11384,7 +11379,7 @@ test('Stop during a turn Claude started by itself leaves the next reader prompt 
 });
 
 test('provider notification turns admit later compaction requests under the same reader task', async () => {
-  const { window, ids, payload, owners, replies, compaction, host, children, setCurrent } = compactionThroughHost();
+  const { window, ids, payload, owners, compaction, host, children, setCurrent } = compactionThroughHost();
   const opening = host.session('one', claudePlan(CLAUDE, { cwd: WS, sessionId: 'sess-1' }));
   children[0].answerHandshake();
   const session = await opening;
@@ -11403,11 +11398,7 @@ test('provider notification turns admit later compaction requests under the same
   const secondRequest = lines.findIndex((line) => line.includes(ids[1]));
   const firstEnd = lines.findIndex((line, index) => index > firstRequest && line.includes('"type":"result"'));
   for (const line of lines.slice(firstRequest + 1, firstEnd + 1)) children[0].say(line + '\n');
-  // An earlier recorded turn with the same text does not hold this turn's response.
-  replies.settle('sess-1', [{ finalResponse: { text: 'noted', sourceId: 'msg-earlier' } }]);
-  assert.equal(compaction.requests.deliverable('sess-1').length, 0, 'the response is not recorded yet');
-  replies.settle('sess-1', [{ finalResponse: { text: 'noted', sourceId: 'msg-35' } }]);
-  assert.equal(compaction.requests.deliverable('sess-1').length, 1, 'the turn ended with a recorded final response');
+  assert.equal(compaction.requests.deliverable('sess-1').length, 1, 'the requesting turn ended');
   for (const line of lines.slice(firstEnd + 1, secondRequest)) children[0].say(line + '\n');
   children[0].say(lines[secondRequest] + '\n');
   assert.deepEqual(compaction.handle({ method: 'compact-ready', params: payload(ids[1]) }), {
@@ -11554,26 +11545,11 @@ test('a provider turn needs no preceding task notice to request compaction', asy
   );
 });
 
-test('Codex provider-originated compaction retains its exact recorded native response without a reader submission', async () => {
-  vi.stubGlobal('PANEL_CSS', '');
-  vi.stubGlobal('PANEL_JS', '');
-  vi.stubGlobal('PANEL_DEV_SERVER_URL', null);
-  const { PanelProvider } = await import('./panelhost.ts');
+test('Codex provider-originated compaction compacts after its native turn without a reader submission', async () => {
   const root = tempDir('compact-codex-native-');
-  const file = path.join(root, 'rollout.jsonl');
   const sessionId = 'native-codex';
   const nativeTurnId = 'notice-turn';
-  fs.writeFileSync(file, '');
-  const holder: any = Object.assign(Object.create(PanelProvider.prototype), {
-    disposed: false,
-    showing: 'other',
-    hostSessions: new Map(),
-    newestBySession: new Map(),
-    catalog: { folders: '', sessions: [{ agent: 'codex', sessionId, file }] },
-    recordedReplies: new RecordedReplies(),
-    noteResponseEnded: () => {},
-  });
-  const h = compactionThroughHost({ holder });
+  const h = compactionThroughHost();
   const opening = h.host.session('codex-native', codexPlan(CODEX, { cwd: root, clientInfo: CODEX_CLIENT }));
   const child = h.children[0];
   await answerCodexHandshake(child);
@@ -11581,8 +11557,6 @@ test('Codex provider-originated compaction retains its exact recorded native res
   const session = await opening;
   h.setCurrent(session);
   onTestFinished(() => {
-    holder.disposed = true;
-    if (holder.recordedReplyRetry) clearTimeout(holder.recordedReplyRetry);
     h.compaction.dispose();
     child.exit(0);
   });
@@ -11615,43 +11589,7 @@ test('Codex provider-originated compaction retains its exact recorded native res
     item: { type: 'agentMessage', id: 'native-final', phase: 'final_answer', text: 'Saved the handoff.' },
   });
   send('turn/completed', { threadId: sessionId, turn: { id: nativeTurnId, status: 'completed' } });
-  assert.equal(h.compaction.requests.deliverable(sessionId).length, 0);
-  const records = (turn: string) =>
-    [
-      { type: 'session_meta', payload: { id: sessionId, cwd: root, originator: 'codex_vscode', source: 'vscode' } },
-      { type: 'event_msg', payload: { type: 'task_started', turn_id: turn } },
-      {
-        type: 'response_item',
-        payload: {
-          type: 'message',
-          id: 'native-final',
-          role: 'assistant',
-          phase: 'final_answer',
-          content: [{ type: 'output_text', text: 'Saved the handoff.' }],
-        },
-      },
-      {
-        type: 'event_msg',
-        payload: { type: 'task_complete', turn_id: turn, last_agent_message: 'Saved the handoff.' },
-      },
-    ].map((record, index) => ({ ...record, timestamp: new Date(Date.UTC(2026, 9, 22, 0, 0, index)).toISOString() }));
-  const record = (turn: string) =>
-    fs.writeFileSync(
-      file,
-      records(turn)
-        .map((entry) => JSON.stringify(entry))
-        .join('\n') + '\n',
-    );
-  record('foreign-turn');
-  holder.settleRecordedReplies();
-  assert.equal(
-    h.compaction.requests.deliverable(sessionId).length,
-    0,
-    'the same response ID in another native turn cannot retain this response',
-  );
-  record(nativeTurnId);
-  holder.settleRecordedReplies();
-  assert.equal(h.compaction.requests.deliverable(sessionId).length, 1);
+  assert.equal(h.compaction.requests.deliverable(sessionId).length, 1, 'the native turn ended');
   const drain = h.compaction.drain(sessionId);
   await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'thread/compact/start'));
   child.reply({});
@@ -11790,14 +11728,18 @@ test.each([
       terminal_reason: 'completed',
     });
     child.say(sessionState('idle'));
-    h.replies.settle('sess-1', [{ finalResponse: { sourceId: 'background-final', text: 'Saved the handoff.' } }]);
     const request = h.payload(h.ids[0]);
     assert.equal(
       (h.compaction.handle({ method: 'compact-request', params: request }) as { state: string }).state,
       'queued',
     );
     await h.compaction.drain('sess-1');
-    assert.equal(sentTexts(child).includes('/compact'), false);
+    assert.equal(
+      sentTexts(child).filter((text) => text === '/compact').length,
+      1,
+      'the ended turn and idle child deliver the request before its background job finishes',
+    );
+    const toolEnds = () => h.events.filter((event) => event.kind === 'toolEnd').length;
     const notice = (task: string, extra: object = {}, suffix = '') =>
       send(
         form === 'user'
@@ -11820,30 +11762,21 @@ test.each([
             },
       );
     notice('unrelated-job');
-    await h.compaction.drain('sess-1');
-    assert.equal(sentTexts(child).includes('/compact'), false, 'an unrelated completion supplies no tool success');
+    assert.equal(toolEnds(), 0, 'an unrelated completion cannot settle the root command');
     notice('exact-job', { parent_tool_use_id: 'subagent' });
-    await h.compaction.drain('sess-1');
-    assert.equal(sentTexts(child).includes('/compact'), false, 'subagent envelopes cannot settle the root command');
+    assert.equal(toolEnds(), 0, 'subagent envelopes cannot settle the root command');
     notice('exact-job', { session_id: 'foreign-session' });
-    await h.compaction.drain('sess-1');
-    assert.equal(sentTexts(child).includes('/compact'), false, 'foreign sessions cannot settle the root command');
+    assert.equal(toolEnds(), 0, 'foreign sessions cannot settle the root command');
     if (form === 'user') {
       for (const field of ['status', 'tool-use-id', 'task-id']) {
         for (const suffix of [`<${field}/>`, `<${field}>duplicate</${field}>`, `<${field} invalid="yes"></${field}>`]) {
           notice('exact-job', {}, suffix);
-          await h.compaction.drain('sess-1');
-          assert.equal(sentTexts(child).includes('/compact'), false, 'malformed tags cannot settle the root command');
+          assert.equal(toolEnds(), 0, 'malformed tags cannot settle the root command');
         }
       }
       notice('exact-job', { parent_tool_use_id: undefined });
       notice('exact-job', { origin: { kind: 'peer' } });
-      await h.compaction.drain('sess-1');
-      assert.equal(
-        sentTexts(child).includes('/compact'),
-        false,
-        'user notices require an exact root notification envelope',
-      );
+      assert.equal(toolEnds(), 0, 'user notices require an exact root notification envelope');
     }
     await session.prompt('A later owner turn.');
     send({
@@ -11868,150 +11801,15 @@ test.each([
     );
     assert.equal(h.events.filter((event) => event.kind === 'toolEnd').at(-1)?.turnId, originalOwner);
     await h.compaction.drain('sess-1');
-    assert.equal(sentTexts(child).at(-1) === '/compact', terminal === 'completed');
-    if (terminal === 'failed')
-      assert.equal(
-        (
-          h.compaction.handle({ method: 'compact-status', params: { requestId: request.requestId } }) as {
-            state: string;
-          }
-        ).state,
-        'failed',
-      );
+    assert.equal(sentTexts(child).filter((text) => text === '/compact').length, 1, 'the request is delivered once');
+    assert.notEqual(
+      (h.compaction.handle({ method: 'compact-status', params: { requestId: request.requestId } }) as { state: string })
+        .state,
+      'failed',
+      'a late tool outcome cannot fail a delivered request',
+    );
   },
 );
-
-// Crosses active retention limits through the host route and bounded recorded-response reads.
-test('recorded compaction responses survive 33 sessions and five native turns with fair bounded recovery', async () => {
-  const h = compactionThroughHost();
-  const root = tempDir('compact-recorded-capacity-');
-  const sessions: Array<{ session: AgentSession; emit: (event: WireEvent) => void; file: string; sessionId: string }> =
-    [];
-  let deliveries = 0;
-  onTestFinished(() => {
-    h.compaction.dispose();
-    for (const child of h.children) child.exit(0);
-  });
-  for (let index = 0; index < 33; index++) {
-    const sessionId = `capacity-${index}`;
-    let emit!: (event: WireEvent) => void;
-    const plan: AgentPlan = {
-      agent: 'codex',
-      sessionId,
-      command: 'c',
-      args: [],
-      cwd: root,
-      env: {},
-      driver: (_send, report) => {
-        emit = report;
-        return {
-          receive() {},
-          open: async () => [],
-          prompt: async () => 'reader',
-          compact: async (beforeWrite) => {
-            beforeWrite?.();
-            deliveries++;
-          },
-          clear: async () => {},
-          answer: () => false,
-          interrupt: async () => {},
-          sessionId: () => sessionId,
-          close() {},
-          hasOpenTurns: () => false,
-        };
-      },
-    };
-    const session = await h.host.session(sessionId, plan);
-    const file = path.join(root, `${sessionId}.jsonl`);
-    fs.writeFileSync(
-      file,
-      JSON.stringify({
-        type: 'session_meta',
-        payload: { id: sessionId, cwd: root, source: 'vscode', originator: 'codex_vscode' },
-      }) + '\n',
-    );
-    sessions.push({ session, emit, file, sessionId });
-  }
-  let operation = 0;
-  for (const [index, row] of sessions.entries()) {
-    h.setCurrent(row.session);
-    for (let turn = 0; turn < (index === 0 ? 5 : 1); turn++) {
-      const id = `00000000-0000-4000-8000-${String(++operation).padStart(12, '0')}`;
-      const nativeTurnId = `turn-${turn}`;
-      const sourceId = `response-${operation}`;
-      const base = {
-        provider: 'codex' as const,
-        sessionId: row.sessionId,
-        turnId: nativeTurnId,
-        generation: null,
-        evidence: {},
-      };
-      row.emit({
-        kind: 'native',
-        event: {
-          ...base,
-          kind: 'toolStart',
-          toolId: id,
-          initiating: true,
-          command: `arc compact request --self --after-turn --request-id ${h.window}:${id} --window ${h.window} --json`,
-        },
-      });
-      assert.equal(
-        (h.compaction.handle({ method: 'compact-request', params: h.payload(id) }) as { state: string }).state,
-        'queued',
-      );
-      row.emit({ kind: 'native', event: { ...base, kind: 'toolEnd', toolId: id, success: true } });
-      row.emit({ kind: 'text', text: 'Saved.', sourceId, nativeTurnId });
-      row.emit({ kind: 'native', event: { ...base, kind: 'rootEnd', success: true } });
-      row.emit({
-        kind: 'turnEnd',
-        nativeTurnId,
-        outcome: { status: 'ok', text: '', costUsd: null, turns: null, deniedTools: [] },
-      });
-      const records = [
-        { type: 'event_msg', payload: { type: 'task_started', turn_id: nativeTurnId } },
-        {
-          type: 'response_item',
-          payload: {
-            type: 'message',
-            id: sourceId,
-            role: 'assistant',
-            phase: 'final_answer',
-            content: [{ type: 'output_text', text: 'Saved.' }],
-          },
-        },
-        { type: 'event_msg', payload: { type: 'task_complete', turn_id: nativeTurnId, last_agent_message: 'Saved.' } },
-      ];
-      fs.appendFileSync(
-        row.file,
-        records
-          .map((record, offset) =>
-            JSON.stringify({ ...record, timestamp: new Date(Date.UTC(2026, 9, 22, 0, turn, offset)).toISOString() }),
-          )
-          .join('\n') + '\n',
-      );
-      if (index === 0 && turn === 0)
-        fs.appendFileSync(row.file, (JSON.stringify({ type: 'unrelated', text: 'x'.repeat(4096) }) + '\n').repeat(270));
-    }
-  }
-  assert.equal(h.replies.sessions().length, 33);
-  const first = h.replies.pollingSessions();
-  const second = h.replies.pollingSessions();
-  assert.equal(first.length, 32);
-  assert.ok(new Set([...first, ...second]).size === 33, 'polling reaches every retained session');
-  for (let pass = 0; pass < 12 && h.replies.sessions().length; pass++) {
-    for (const sessionId of h.replies.pollingSessions()) {
-      const row = sessions.find((one) => one.sessionId === sessionId)!;
-      h.replies.read({ agent: 'codex', sessionId, file: row.file } as any);
-    }
-  }
-  assert.deepEqual(h.replies.sessions(), [], 'the first response remains recoverable beyond the bounded tail');
-  for (const row of sessions) {
-    h.setCurrent(row.session);
-    await h.compaction.drain(row.sessionId);
-  }
-  assert.equal(deliveries, 37, 'every admitted operation reaches its original child');
-});
 
 const remoteControlRequests = (child: FakeChild) =>
   child.sent().filter((m) => (m.request as { subtype?: string } | undefined)?.subtype === 'remote_control');

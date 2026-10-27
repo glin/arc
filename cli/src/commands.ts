@@ -133,8 +133,8 @@ function compact(action: 'request' | 'status' | 'cancel'): Command {
       flags: [
         ...(request
           ? ([
-              ['--self', 'Compact only the requesting main agent session.'],
-              ['--after-turn', 'Wait for this turn to succeed and its final response to be saved.'],
+              ['--self', 'Compact only the session that runs this command.'],
+              ['--after-turn', 'Wait for this turn to end and the session to go idle.'],
               [
                 '--continuation-file ABSOLUTE_PATH',
                 'Optional exact UTF-8 next-turn prompt, at most 8192 bytes. Use forward slashes and single quotes.',
@@ -166,9 +166,9 @@ function compact(action: 'request' | 'status' | 'cancel'): Command {
         'All synopsis flags are required. Window and UUID syntax must match.',
         ...(request
           ? [
-              'Admission requires this live native tool call in the hosted main session, with no open asks or queued reader input.',
+              'Admission requires the launch token of a live session this window holds, or this live native tool call in a hosted session.',
               'Each turn holds one pending request. Repeated requests use fresh IDs and preserve existing task limits.',
-              'Missing readiness refuses compaction. A reader prompt carries an admitted request to the turn that answers it. Queue changes keep it. Stop and other cancelling reader actions cancel it.',
+              'Without a token, missing readiness after 30 seconds refuses compaction. A reader prompt carries an admitted request to the turn that answers it. Queue changes keep it. Stop and other cancelling reader actions cancel it.',
               'compact cancel drops an admitted request.',
             ]
           : ['A missing request or unavailable window reports unavailable.']),

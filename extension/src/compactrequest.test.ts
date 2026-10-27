@@ -164,6 +164,7 @@ function compactHostFixture(agent: 'claude' | 'codex' = 'codex', persistence?: C
         await work(child);
         return undefined;
       },
+      findToken: (token) => (token === 'c'.repeat(32) ? fixture.current : null),
       readerWork: () => fixture.work,
       continuationWork: () => fixture.continuationWork,
       authority: () => fixture.authority,
@@ -238,7 +239,6 @@ async function admitContinuation(
 async function finishRequest(fixture: ReturnType<typeof compactHostFixture>['fixture']) {
   const extra = { provider: fixture.child.agent, generation: fixture.child.agent === 'claude' ? 1 : null };
   fixture.host.native(fixture.child, compactEvent('toolEnd', extra), 7);
-  fixture.host.replyRetained(fixture.child, 7);
   fixture.host.native(fixture.child, compactEvent('rootEnd', extra), 7);
   fixture.state.busy = false;
   await fixture.host.drain('self');
@@ -321,10 +321,10 @@ test('self compaction joins one live literal root call and acknowledges before t
   book.observe(compactBinding, compactEvent('toolEnd'));
   await book.deliver(compactPayload.requestId, delivery);
   assert.equal(writes, 0);
-  book.observe(compactBinding, compactEvent('rootEnd', { turnId: 'another' }), true);
+  book.observe(compactBinding, compactEvent('rootEnd', { turnId: 'another' }));
   await book.deliver(compactPayload.requestId, delivery);
   assert.equal(writes, 0);
-  book.observe(compactBinding, compactEvent('rootEnd'), true);
+  book.observe(compactBinding, compactEvent('rootEnd'));
   await Promise.all([
     book.deliver(compactPayload.requestId, delivery),
     book.deliver(compactPayload.requestId, delivery),
@@ -366,7 +366,7 @@ test('self compaction cancels synchronously across the adapter wait and the fina
     book.observe(compactBinding, compactEvent('toolStart'));
     book.admit(compactPayload, () => true);
     book.observe(compactBinding, compactEvent('toolEnd'));
-    book.observe(compactBinding, compactEvent('rootEnd'), true);
+    book.observe(compactBinding, compactEvent('rootEnd'));
     let reach!: () => void;
     let writes = 0;
     const pending = book.deliver(compactPayload.requestId, {
@@ -389,22 +389,23 @@ test('self compaction cancels synchronously across the adapter wait and the fina
   }
 });
 
-test('self compaction rejects failed tools, lost final responses, replay and concurrent capacity', async () => {
-  for (const failure of ['tool', 'turn', 'final']) {
+test('self compaction delivers after a failed tool or turn and rejects replay and concurrent capacity', async () => {
+  for (const failure of ['tool', 'turn']) {
     const book = new CompactRequests(compactWindow);
     book.observe(compactBinding, compactEvent('toolStart'));
     book.admit(compactPayload, () => true);
     book.observe(compactBinding, compactEvent('toolEnd', { success: failure !== 'tool' }));
-    book.observe(compactBinding, compactEvent('rootEnd', { success: failure !== 'turn' }), failure !== 'final');
+    book.observe(compactBinding, compactEvent('rootEnd', { success: failure !== 'turn' }));
     let writes = 0;
     await book.deliver(compactPayload.requestId, {
       eligible: () => true,
-      submit: async () => {
+      submit: async (_binding, check) => {
+        check();
         writes++;
       },
     });
-    assert.equal(writes, 0, failure);
-    assert.equal(book.status(compactPayload.requestId)?.state, 'failed');
+    assert.equal(writes, 1, failure);
+    assert.equal(book.status(compactPayload.requestId)?.state, 'uncertain');
   }
   let clock = 0;
   const book = new CompactRequests(compactWindow, () => clock, 1);
@@ -558,7 +559,7 @@ test('self compaction completion joins native command evidence without confusing
     book.observe(binding, { ...base, kind: 'toolStart', command: compactLiteral, toolId: 'call', initiating: true });
     book.admit(compactPayload, () => true);
     book.observe(binding, { ...base, kind: 'toolEnd', toolId: 'call', success: true });
-    book.observe(binding, { ...base, kind: 'rootEnd', success: true }, true);
+    book.observe(binding, { ...base, kind: 'rootEnd', success: true });
     const compact = (
       stage: 'accepted' | 'status' | 'boundary' | 'turnStart' | 'itemStart' | 'itemEnd' | 'turnEnd',
       evidence = {},
@@ -692,7 +693,6 @@ test('both providers deliver one continuation per completed compaction after set
       compactEvent('toolEnd', { toolId: 'second', provider: agent, generation: agent === 'claude' ? 3 : null }),
       8,
     );
-    fixture.host.replyRetained(fixture.child, 8);
     fixture.host.native(
       fixture.child,
       compactEvent('rootEnd', { provider: agent, generation: agent === 'claude' ? 3 : null }),
@@ -738,10 +738,8 @@ test('continuation invalidations suppress input before preparation and at the fi
     'answer',
     'pending',
     'question',
-    'archive or source or settings',
     'archive',
     'child',
-    'scope',
     'write boundary',
     'write failure',
     'failed compaction',
@@ -786,13 +784,11 @@ test('continuation invalidations suppress input before preparation and at the fi
     if (change === 'answer') fixture.host.readerAction('self', true);
     if (change === 'pending') fixture.continuationWork = 'pending';
     if (change === 'question') fixture.state.asks = [{}];
-    if (change === 'archive or source or settings') fixture.authority = 'changed';
     if (change === 'archive') {
       fixture.host.archived(new Set(['self']));
       fixture.host.archived(new Set());
     }
     if (change === 'child') fixture.current = makeChild('replacement');
-    if (change === 'scope') fixture.work = 'absent';
     if (change === 'write boundary') fixture.continuationBoundary = () => fixture.host.readerAction('self');
     if (change === 'write failure') fixture.writeFailure = true;
     if (change === 'save failure')
@@ -807,69 +803,62 @@ test('continuation invalidations suppress input before preparation and at the fi
   }
 });
 
-test.each(['saved text', 'delivery'])(
-  'continuation replacement with colliding numeric inodes denies %s',
-  async (observation) => {
-    const source = path.join(tempDir('continuation-source-'), 'session.jsonl');
-    fs.writeFileSync(source, '{}');
-    const snapshot = fs.lstatSync(source, { bigint: true });
-    let inode = 56576470320201115n;
-    const original = filesystem.lstatSync;
-    const stat = vi.spyOn(filesystem, 'lstatSync').mockImplementation(((
-      file: fs.PathLike,
-      options?: { bigint?: boolean },
-    ) => {
-      if (String(file) !== source) return original(file, options as never);
-      const value = Object.assign(Object.create(snapshot), { dev: 0n, ino: inode });
-      return options?.bigint ? value : Object.assign(Object.create(value), { dev: 0, ino: Number(inode) });
-    }) as typeof fs.lstatSync);
+// The same window still delivers to its live child. Another window's status read needs the same source.
+test.each(['saved text'])('continuation replacement with colliding numeric inodes denies %s', async () => {
+  const source = path.join(tempDir('continuation-source-'), 'session.jsonl');
+  fs.writeFileSync(source, '{}');
+  const snapshot = fs.lstatSync(source, { bigint: true });
+  let inode = 56576470320201115n;
+  const original = filesystem.lstatSync;
+  const stat = vi.spyOn(filesystem, 'lstatSync').mockImplementation(((
+    file: fs.PathLike,
+    options?: { bigint?: boolean },
+  ) => {
+    if (String(file) !== source) return original(file, options as never);
+    const value = Object.assign(Object.create(snapshot), { dev: 0n, ino: inode });
+    return options?.bigint ? value : Object.assign(Object.create(value), { dev: 0, ino: Number(inode) });
+  }) as typeof fs.lstatSync);
+  syncBuiltinESMExports();
+  try {
+    const method = declarationSource(
+      fs.readFileSync(path.join(__dirname, 'panelhost.ts'), 'utf8'),
+      'continuationSource',
+    );
+    const compiled = ts.transpileModule(`class Source { ${method} }`, {
+      compilerOptions: { target: ts.ScriptTarget.ES2022 },
+    }).outputText;
+    const Source = runInNewContext(`${compiled}; Source;`, { fs, fileRevisionOf: revisionOf, supportedFileIdentity });
+    const host = new Source();
+    Object.assign(host, {
+      readScopeKey: () => 'scope',
+      questionSource: () => source,
+      stateFor: () => ({ agent: 'codex' }),
+      hidden: new Set(),
+      cwdForSession: () => path.dirname(source),
+    });
+    const identity = () => host.continuationSource('codex', 'self');
+    const { store } = memoryCompactionStore();
+    const { fixture } = compactHostFixture('codex', store);
+    Object.defineProperty(fixture, 'authority', { get: identity });
+    assert.equal((await admitContinuation(fixture)).state, 'queued');
+    await finishRequest(fixture);
+    finishCompact(fixture);
+    fixture.state.busy = false;
+    const before = identity();
+    inode = 56576470320201114n;
+    assert.equal(Number(inode), Number(56576470320201115n));
+    assert.deepEqual(continuationState(fixture), {
+      requestId: continuationPayload.requestId,
+      state: 'unavailable',
+    });
+    assert.notEqual(identity(), before);
+    inode = 0n;
+    assert.equal(identity(), null);
+  } finally {
+    stat.mockRestore();
     syncBuiltinESMExports();
-    try {
-      const method = declarationSource(
-        fs.readFileSync(path.join(__dirname, 'panelhost.ts'), 'utf8'),
-        'continuationSource',
-      );
-      const compiled = ts.transpileModule(`class Source { ${method} }`, {
-        compilerOptions: { target: ts.ScriptTarget.ES2022 },
-      }).outputText;
-      const Source = runInNewContext(`${compiled}; Source;`, { fs, fileRevisionOf: revisionOf, supportedFileIdentity });
-      const host = new Source();
-      Object.assign(host, {
-        readScopeKey: () => 'scope',
-        questionSource: () => source,
-        stateFor: () => ({ agent: 'codex' }),
-        hidden: new Set(),
-        cwdForSession: () => path.dirname(source),
-      });
-      const identity = () => host.continuationSource('codex', 'self');
-      const { store } = memoryCompactionStore();
-      const { fixture } = compactHostFixture('codex', store);
-      Object.defineProperty(fixture, 'authority', { get: identity });
-      assert.equal((await admitContinuation(fixture)).state, 'queued');
-      await finishRequest(fixture);
-      finishCompact(fixture);
-      fixture.state.busy = false;
-      const before = identity();
-      inode = 56576470320201114n;
-      assert.equal(Number(inode), Number(56576470320201115n));
-      if (observation === 'saved text')
-        assert.deepEqual(continuationState(fixture), {
-          requestId: continuationPayload.requestId,
-          state: 'unavailable',
-        });
-      else {
-        await fixture.host.drain('self');
-        assert.deepEqual(fixture.continuationWrites, []);
-      }
-      assert.notEqual(identity(), before);
-      inode = 0n;
-      assert.equal(identity(), null);
-    } finally {
-      stat.mockRestore();
-      syncBuiltinESMExports();
-    }
-  },
-);
+  }
+});
 
 test('continuation status after restart reads through current authority without writes or replay', async () => {
   const { store, records } = memoryCompactionStore();
@@ -928,13 +917,12 @@ test('lost continuation receipt retains one possible write and never submits a r
   assert.equal(records.get(continuationPayload.requestId)?.observation.continuation?.write, 'unknown');
 });
 
-test('unrelated reader work and unchanged scope refresh do not save continuation receipts', async () => {
+test('unrelated reader work and a rows refresh do not save continuation receipts', async () => {
   const { store, records } = memoryCompactionStore();
   const { fixture } = compactHostFixture('codex', store);
   await admitContinuation(fixture);
   const save = vi.spyOn(store, 'save');
   fixture.host.readerAction('unrelated');
-  fixture.host.scopeChanged();
   fixture.host.sessionsRefreshed();
   await fixture.host.drain('self');
   assert.equal(save.mock.calls.length, 0);
@@ -1213,16 +1201,15 @@ test('continuation storage evicts owned terminal receipts under capacity while p
   await assert.rejects(saved.reserve(oversized), /too large/);
 });
 
-test('host compaction runs once after the exact turn succeeds and its final response is saved', async () => {
+test('host compaction runs once after the exact turn ends and the child is idle', async () => {
   const { fixture } = compactHostFixture();
   const { host, child, state } = fixture;
   admittedCompaction(fixture);
-  host.native(child, compactEvent('rootEnd'), 7);
   state.busy = false;
   await host.drain('self');
-  assert.equal(fixture.writes, 0, 'a root success without a saved final response must wait');
-  host.replyRetained(child, 7);
+  assert.equal(fixture.writes, 0, 'compaction waits for the requesting turn to end');
   state.busy = true;
+  host.native(child, compactEvent('rootEnd'), 7);
   await host.drain('self');
   assert.equal(fixture.writes, 0, 'a busy child must not receive compaction');
   assert.equal(compactState(host), 'queued');
@@ -1247,59 +1234,37 @@ test('host compaction runs once after the exact turn succeeds and its final resp
   assert.equal(compactState(host), 'completed');
 });
 
-test('host compaction fails when no final response follows the requesting tool or the turn fails', async () => {
-  for (const ending of ['reply before tool', 'failed turn'] as const) {
+// Catches a request that a failed requesting tool or turn, or a final response Arc never saved, drops.
+test('host compaction runs after a failed requesting tool or turn without a saved final response', async () => {
+  for (const ending of ['failed tool', 'failed turn'] as const) {
     const { fixture } = compactHostFixture();
     const { host, child, state } = fixture;
     host.submitted(child, 7);
     host.native(child, compactEvent('toolStart'), 7);
     host.handle({ method: 'compact-request', params: compactPayload });
-    if (ending === 'reply before tool') host.replyRetained(child, 7);
-    host.native(child, compactEvent('toolEnd'), 7);
+    host.native(child, compactEvent('toolEnd', { success: ending !== 'failed tool' }), 7);
     host.native(child, compactEvent('rootEnd', { success: ending !== 'failed turn' }), 7);
-    if (ending === 'failed turn') host.replyRetained(child, 7);
-    host.turnEnded(child);
     state.busy = false;
     await host.drain('self');
-    assert.equal(fixture.writes, 0, ending);
-    assert.equal(compactState(host), 'failed', ending);
+    assert.equal(fixture.writes, 1, ending);
+    assert.equal(compactState(host), 'uncertain', ending);
   }
 });
 
-test('host compaction cancels unsubmitted work on reader action, child change, scope loss and disposal', async () => {
-  for (const change of [
-    'reader',
-    'answer',
-    'replacement',
-    'exit',
-    'scope',
-    'scope restored',
-    'disposal',
-    'write boundary',
-  ] as const) {
+test('host compaction cancels unsubmitted work on reader action, child change and disposal', async () => {
+  for (const change of ['reader', 'answer', 'replacement', 'exit', 'disposal', 'write boundary'] as const) {
     const { fixture, makeChild } = compactHostFixture();
     const { host, child, state } = fixture;
     admittedCompaction(fixture);
-    host.replyRetained(child, 7);
     host.native(child, compactEvent('rootEnd'), 7);
     state.busy = false;
     if (change === 'reader') host.readerAction('self');
     if (change === 'answer') host.readerAction('self', true);
-    // The rows refresh after a scope change shows the session gone, and a later change returns it before the next drain.
-    if (change === 'scope restored') {
-      host.scopeChanged();
-      fixture.work = 'absent';
-      host.sessionsRefreshed();
-      fixture.work = 'none';
-      host.scopeChanged();
-      host.sessionsRefreshed();
-    }
     if (change === 'replacement') fixture.current = makeChild('child');
     if (change === 'exit') {
       state.exited = true;
       host.childGone('child');
     }
-    if (change === 'scope') fixture.work = 'absent';
     if (change === 'disposal') host.dispose();
     if (change === 'write boundary') fixture.beforeWrite = () => host.readerAction('self');
     await host.drain('self');
@@ -1314,10 +1279,8 @@ test('host compaction cancels unsubmitted work on reader action, child change, s
   assert.equal(refused.state, 'refused');
 });
 
-// Catches a cancelled request that blames the agent process when the reader, the scope or the setup changed.
+// Catches a cancelled request that blames the wrong change.
 test.each([
-  ['scope', "The session left this window's scope before compaction started."],
-  ['authority', "The session's source, folder or setup changed before compaction started."],
   ['replaced', 'The agent process was replaced before compaction started.'],
   ['exited', 'The agent process exited or moved to another session before compaction started.'],
   ['moved', 'The agent process exited or moved to another session before compaction started.'],
@@ -1325,11 +1288,8 @@ test.each([
   const { fixture, makeChild } = compactHostFixture();
   const { host, child, state } = fixture;
   admittedCompaction(fixture);
-  host.replyRetained(child, 7);
   host.native(child, compactEvent('rootEnd'), 7);
   state.busy = false;
-  if (change === 'scope') fixture.work = 'absent';
-  if (change === 'authority') fixture.authority = 'another source';
   if (change === 'replaced') fixture.current = makeChild('child');
   if (change === 'exited') state.exited = true;
   if (change === 'moved') state.sessionId = 'other';
@@ -1382,7 +1342,6 @@ test('the requesting session cancels its own deferred request only while its can
   host.native(child, compactEvent('toolEnd', { toolId: 'cancel' }), 7);
   host.native(other, compactEvent('toolEnd', { sessionId: 'other', toolId: 'cancel' }), 9);
   assert.deepEqual(runCancel(host), ['refused', 'not-observed', unseen], 'settled calls cancel nothing more');
-  host.replyRetained(child, 7);
   host.native(child, compactEvent('rootEnd'), 7);
   state.busy = false;
   await host.drain('self');
@@ -1395,7 +1354,6 @@ test('a cancel command refuses a deferred request that Arc already sent', async 
   const { fixture } = compactHostFixture();
   const { host, child, state } = fixture;
   admittedCompaction(fixture);
-  host.replyRetained(child, 7);
   host.native(child, compactEvent('rootEnd'), 7);
   state.busy = false;
   await host.drain('self');
@@ -1450,7 +1408,6 @@ test.each(['lease', 'write boundary'] as const)(
     const { host, child, state } = fixture;
     admittedCompaction(fixture);
     host.native(child, compactEvent('toolStart', { toolId: 'cancel', command: cancelLiteral() }), 7);
-    host.replyRetained(child, 7);
     host.native(child, compactEvent('rootEnd'), 7);
     state.busy = false;
     let release = () => {};
@@ -1491,7 +1448,6 @@ test('a cancel command from a later turn of the requesting session cancels its r
   const { fixture } = compactHostFixture();
   const { host, child, state } = fixture;
   admittedCompaction(fixture);
-  host.replyRetained(child, 7);
   host.native(child, compactEvent('rootEnd'), 7);
   host.submitted(child, 8);
   host.native(child, compactEvent('toolStart', { turnId: 'next', toolId: 'cancel', command: cancelLiteral() }), 8);
@@ -1523,20 +1479,18 @@ test.each(['exit', 'move'] as const)('a cancel observation ends at child %s', (c
 });
 
 // Catches one stale request whose loss cancels another request of the same child and session.
-test('a stale request cancels only itself and another request of its session still runs', async () => {
+test('a reader action cancels only the request it precedes and a later request of its session still runs', async () => {
   const { fixture } = compactHostFixture();
   const { host, child, state } = fixture;
   admittedCompaction(fixture);
-  fixture.authority = 'another source';
+  host.readerAction('self');
   const second = { ...compactPayload, requestId: `${compactWindow}:bbbbbbbb-1111-2222-3333-444444444444` };
   const secondLiteral = compactLiteral.replace(compactPayload.requestId, second.requestId);
   host.submitted(child, 8);
   host.native(child, compactEvent('toolStart', { turnId: 'second', toolId: 'second', command: secondLiteral }), 8);
   assert.equal((host.handle({ method: 'compact-request', params: second }) as { state: string }).state, 'queued');
   host.native(child, compactEvent('toolEnd', { turnId: 'second', toolId: 'second' }), 8);
-  host.replyRetained(child, 7);
   host.native(child, compactEvent('rootEnd'), 7);
-  host.replyRetained(child, 8);
   host.native(child, compactEvent('rootEnd', { turnId: 'second' }), 8);
   state.busy = false;
   await host.drain('self');
@@ -1544,7 +1498,7 @@ test('a stale request cancels only itself and another request of its session sti
     host.handle({ method: 'compact-status', params: { requestId } }) as { state: string; reason: string };
   assert.deepEqual(
     [status(compactPayload.requestId).state, status(compactPayload.requestId).reason],
-    ['cancelled', "The session's source, folder or setup changed before compaction started."],
+    ['cancelled', 'The reader acted in this session before compaction started.'],
   );
   assert.equal(status(second.requestId).state, 'uncertain');
   assert.equal(fixture.writes, 1);
@@ -1579,7 +1533,6 @@ test('reader messages that join the running Claude turn carry the request and co
     assert.equal(compactState(host), 'queued');
   }
   fixture.compactions = 6;
-  host.replyRetained(child, 7);
   host.native(child, compactEvent('rootEnd', { provider: 'claude', generation: 6 }), 7);
   state.busy = false;
   await host.drain('self');
@@ -1599,7 +1552,6 @@ test.each(['sent', 'queued'] as const)(
     const { fixture } = compactHostFixture();
     const { host, child, state } = fixture;
     admittedCompaction(fixture);
-    host.replyRetained(child, 7);
     host.native(child, compactEvent('rootEnd'), 7);
     if (route === 'queued') {
       // The queued prompt holds delivery at turn end, then the queue flush delivers it.
@@ -1622,7 +1574,6 @@ test.each(['sent', 'queued'] as const)(
     host.native(child, compactEvent('toolStart', { turnId: 'next', toolId: 'work', command: 'npm test' }), 8);
     assert.equal(readerPrompt(host, 'self', prompt), prompt, 'the line goes only with the message that carried it');
     host.native(child, compactEvent('toolEnd', { turnId: 'next', toolId: 'work', command: 'npm test' }), 8);
-    host.replyRetained(child, 8);
     host.native(child, compactEvent('rootEnd', { turnId: 'next' }), 8);
     state.busy = false;
     await host.drain('self');
@@ -1647,7 +1598,6 @@ test.each([
   const { host, child, state } = fixture;
   admittedCompaction(fixture);
   host.readerAction('self', answer, readerCarry(type, text));
-  host.replyRetained(child, 7);
   host.native(child, compactEvent('rootEnd'), 7);
   state.busy = false;
   await host.drain('self');
@@ -1678,51 +1628,38 @@ test('a rejected reader prompt releases held compaction without another event', 
   await vi.waitFor(() => assert.equal(fixture.writes, 1));
 });
 
-// Catches a worktree change or a failed Git read cancelling a request whose session never left the window's scope.
-test('host compaction waits through a scope change that keeps its session and delivers after the rows refresh', async () => {
+// Catches a request that waits on or is cancelled by the panel's session rows while its live child holds the session.
+test('host compaction delivers for a live child whose session row is absent from the window scope', async () => {
   const { fixture } = compactHostFixture();
   const { host, child, state } = fixture;
   admittedCompaction(fixture);
-  host.replyRetained(child, 7);
+  fixture.work = 'absent';
+  host.sessionsRefreshed();
   host.native(child, compactEvent('rootEnd'), 7);
   state.busy = false;
-  host.scopeChanged();
   await host.drain('self');
-  assert.equal(fixture.writes, 0, 'delivery waits until the rows show the new scope');
-  assert.equal(compactState(host), 'queued');
-  host.sessionsRefreshed();
-  await vi.waitFor(() => assert.equal(fixture.writes, 1));
+  assert.equal(fixture.writes, 1);
   assert.equal(compactState(host), 'uncertain');
 });
 
-test('a ready scope cancels deferred compaction before hidden session rows refresh', async () => {
+// Catches a refusal while reader input waits: B runs while C waits, and B's agent asks to compact.
+// The request is admitted and waits until the queued input leaves the queue.
+test('host compaction admits a request while reader input waits in the queue and delivers after it clears', async () => {
   const { fixture } = compactHostFixture();
   const { host, child, state } = fixture;
-  admittedCompaction(fixture);
-  host.replyRetained(child, 7);
-  host.native(child, compactEvent('rootEnd'), 7);
-  state.busy = false;
-  host.scopeChanged();
-  assert.equal(compactState(host), 'queued', 'loading scope is not evidence of removal');
-  host.scopeChanged(new Set(['self']));
-  assert.equal(compactState(host), 'cancelled');
-  host.scopeChanged(new Set());
-  host.sessionsRefreshed();
-  await host.drain('self');
-  assert.equal(fixture.writes, 0, 'a returning scope revived the cancelled assignment');
-});
-
-// Catches admission while reader input waits: B runs while C waits, and B's agent asks to compact.
-// The refusal leaves no record, so nothing can compact after C.
-test('host compaction refuses a request while reader input waits in the queue', () => {
-  const { fixture } = compactHostFixture();
-  const { host, child } = fixture;
   fixture.work = 'pending';
   host.submitted(child, 7);
   host.native(child, compactEvent('toolStart'), 7);
-  const refused = host.handle({ method: 'compact-request', params: compactPayload }) as { state: string };
-  assert.equal(refused.state, 'refused');
-  assert.equal(compactState(host), 'unavailable');
+  const ack = host.handle({ method: 'compact-request', params: compactPayload }) as { state: string };
+  assert.equal(ack.state, 'queued');
+  host.native(child, compactEvent('toolEnd'), 7);
+  host.native(child, compactEvent('rootEnd'), 7);
+  state.busy = false;
+  await host.drain('self');
+  assert.equal(fixture.writes, 0, 'queued reader input runs first');
+  fixture.work = 'none';
+  await host.drain('self');
+  assert.equal(fixture.writes, 1);
 });
 
 // Catches an approval of the requesting command refusing its own request.
@@ -1741,7 +1678,6 @@ test('host compaction outcomes that never arrive block only their own turn and c
   const { fixture, makeChild } = compactHostFixture();
   const { host, child, state } = fixture;
   admittedCompaction(fixture);
-  host.replyRetained(child, 7);
   host.native(child, compactEvent('rootEnd'), 7);
   state.busy = false;
   await host.drain('self');
@@ -1778,7 +1714,6 @@ test('host compaction reports a refused provider request as failed', async () =>
   const { fixture } = compactHostFixture();
   const { host, child, state } = fixture;
   admittedCompaction(fixture);
-  host.replyRetained(child, 7);
   host.native(child, compactEvent('rootEnd'), 7);
   state.busy = false;
   await host.drain('self');
@@ -1812,12 +1747,9 @@ test.each(['claude', 'codex'] as const)(
       (host.handle({ method: 'compact-request', params: compactPayload }) as { state: string }).state,
       'queued',
     );
-    host.native(child, compactEvent('rootEnd', extra), 9);
-    host.replyRetained(child, 9);
-    fixture.state.busy = false;
-    await host.drain('self');
-    assert.equal(fixture.writes, 0, 'successful turn and retained reply cannot replace tool settlement');
     host.native(child, compactEvent('toolEnd', extra), 9);
+    host.native(child, compactEvent('rootEnd', extra), 9);
+    fixture.state.busy = false;
     await host.drain('self');
     assert.equal(fixture.writes, 1);
     finishCompact(fixture);
@@ -1835,7 +1767,6 @@ test('host compaction binds a Claude request to its prompt generation and comple
   const ack = host.handle({ method: 'compact-request', params: compactPayload }) as { state: string };
   assert.equal(ack.state, 'queued');
   host.native(child, claude({ kind: 'toolEnd', toolId: 'call', success: true }), 7);
-  host.replyRetained(child, 7);
   host.native(child, claude({ kind: 'rootEnd', success: true }), 7);
   state.busy = false;
   await host.drain('self');
@@ -1897,7 +1828,6 @@ test('host compaction evidence reaches only the request whose submission it name
     });
     assert.equal((ack as { state: string }).state, 'queued');
     host.native(child, compactEvent('toolEnd', { turnId, toolId: turnId }), turn);
-    host.replyRetained(child, turn);
     host.native(child, compactEvent('rootEnd', { turnId }), turn);
     state.busy = false;
     await host.drain('self');
@@ -1959,7 +1889,6 @@ test.each(['turn', 'refusal', 'bound refusal', 'early timeout', 'early refusal']
         host.native(child, compactEvent('toolStart', { turnId, toolId: turnId, command }), turn);
         host.handle({ method: 'compact-request', params: { ...compactPayload, requestId } });
         host.native(child, compactEvent('toolEnd', { turnId, toolId: turnId }), turn);
-        host.replyRetained(child, turn);
         host.native(child, compactEvent('rootEnd', { turnId }), turn);
         state.busy = false;
         void host.drain('self');
@@ -2030,7 +1959,7 @@ test('self compaction waits beyond execution deadlines and delivers after readin
   book.admit(compactPayload, () => true);
   clock = 91 * 60_000;
   assert.equal(book.status(compactPayload.requestId)?.state, 'queued');
-  book.observe(compactBinding, compactEvent('rootEnd'), true);
+  book.observe(compactBinding, compactEvent('rootEnd'));
   book.observe(compactBinding, compactEvent('toolEnd'));
   let ready = false;
   let writes = 0;
@@ -2124,7 +2053,7 @@ test('a guarded follow-up refuses as busy while a deferred self-compaction waits
   assert.equal((await admitted).status, 'accepted');
 });
 
-test('deferred compaction retains unknown membership and cancels only proven absence', async () => {
+test('deferred compaction delivers while session membership is unknown', async () => {
   for (const agent of ['claude', 'codex'] as const) {
     const { fixture } = compactHostFixture(agent);
     const { host, child, state } = fixture;
@@ -2137,19 +2066,13 @@ test('deferred compaction retains unknown membership and cancels only proven abs
       'queued',
     );
     host.native(child, event('toolEnd'), 7);
-    host.replyRetained(child, 7);
     host.native(child, event('rootEnd'), 7);
     state.busy = false;
     fixture.work = 'unknown';
     host.sessionsRefreshed();
     await host.drain('self');
-    assert.equal(fixture.writes, 0, agent);
-    assert.equal(compactState(host), 'queued', agent);
-    fixture.work = 'absent';
-    host.sessionsRefreshed();
-    await host.drain('self');
-    assert.equal(fixture.writes, 0, agent);
-    assert.equal(compactState(host), 'cancelled', agent);
+    assert.equal(fixture.writes, 1, agent);
+    assert.equal(compactState(host), 'uncertain', agent);
   }
 });
 
@@ -2185,7 +2108,7 @@ test.each(['records', 'bytes'] as const)(
         assert.equal(book.status(payload.requestId)?.state, 'queued');
       }
       book.observe(current, compactEvent('toolEnd', extra));
-      book.observe(current, compactEvent('rootEnd', extra), true);
+      book.observe(current, compactEvent('rootEnd', extra));
       await book.deliver(payload.requestId, { eligible: () => true, submit: async (_binding, write) => write() });
       book.nativeOutcome(payload.requestId, current, 'completed');
       clock += 3 * 60_000;
@@ -2256,7 +2179,7 @@ test('child exit retires unresolved compaction and its saved continuation withou
   book.observe(compactBinding, compactEvent('toolStart'));
   book.admit(compactPayload, () => true);
   book.observe(compactBinding, compactEvent('toolEnd'));
-  book.observe(compactBinding, compactEvent('rootEnd'), true);
+  book.observe(compactBinding, compactEvent('rootEnd'));
   await book.deliver(compactPayload.requestId, { eligible: () => true, submit: async (_binding, write) => write() });
   book.invalidate(() => true, 'The child ended.', false, undefined, true);
   const fresh = { ...compactPayload, requestId: compactWindow + ':bbbbbbbb-1111-2222-3333-444444444444' };
@@ -2271,14 +2194,21 @@ test('child exit retires unresolved compaction and its saved continuation withou
   assert.equal(book.admit(fresh, () => true).state, 'queued');
 });
 
-test.each(['failed', 'cancelled'] as const)(
+test.each(['refused', 'cancelled'] as const)(
   'a %s compaction does not spend permission for a fresh native call',
-  (state) => {
+  async (state) => {
     const book = new CompactRequests(compactWindow, () => 0, 1);
     const binding = { ...compactBinding, assignmentId: 'same-task' };
     book.observe(binding, compactEvent('toolStart'));
     book.admit(compactPayload, () => true);
-    if (state === 'failed') book.observe(binding, compactEvent('toolEnd', { success: false }));
+    book.observe(binding, compactEvent('rootEnd'));
+    if (state === 'refused')
+      await book.deliver(compactPayload.requestId, {
+        eligible: () => true,
+        submit: async () => {
+          throw new Error('The agent refused.');
+        },
+      });
     else book.invalidate(() => true, 'The reader acted.');
     assert.equal(book.status(compactPayload.requestId)?.state, state);
     const next = { ...compactPayload, requestId: compactWindow + ':bbbbbbbb-1111-2222-3333-444444444444' };
@@ -2346,8 +2276,105 @@ test('active native turn bindings survive later requests in the same retained ch
   }
   fixture.host.native(fixture.child, compactEvent('toolEnd', { turnId: 'turn-0', toolId: 'tool-0' }), 0);
   fixture.host.native(fixture.child, compactEvent('rootEnd', { turnId: 'turn-0' }), 0);
-  fixture.host.replyRetained(fixture.child, 0);
   fixture.state.busy = false;
   await fixture.host.drain('self');
   assert.equal(fixture.writes, 1, 'later active requests cannot evict the oldest live turn binding');
+});
+
+const tokenPayload = { ...compactPayload, token: 'c'.repeat(32) };
+
+// The owner's report: after a window reload, with the session listing stale, the session's own request was refused.
+test('a token request after a window reload is queued and delivered while the listing is stale', async () => {
+  const { fixture, makeChild } = compactHostFixture('claude');
+  const { host, state } = fixture;
+  fixture.work = 'unknown';
+  fixture.authority = null;
+  let refreshes = 0;
+  const refreshed = host.sessionsRefreshed.bind(host);
+  host.sessionsRefreshed = () => {
+    refreshes++;
+    refreshed();
+  };
+  host.submitted(fixture.child, 7);
+  const second = makeChild('child');
+  fixture.current = second;
+  host.childGone('child');
+  host.submitted(second, 8);
+  const ack = (await host.handle({ method: 'compact-request', params: tokenPayload })) as {
+    state: string;
+    reason?: string;
+  };
+  assert.equal(ack.state, 'queued', ack.reason);
+  host.native(
+    second,
+    {
+      provider: 'claude',
+      sessionId: 'self',
+      turnId: null,
+      generation: 1,
+      evidence: {},
+      kind: 'rootEnd',
+      success: true,
+    },
+    8,
+  );
+  state.busy = false;
+  await host.drain('self');
+  assert.equal(fixture.writes, 1);
+  assert.equal(compactState(host), 'uncertain');
+  assert.equal(refreshes, 0);
+});
+
+// The owner's report: on a large catalog whose discovery never completes, an observed request was refused at admission.
+test('an observed continuation request is admitted and delivered while discovery is incomplete', async () => {
+  const { store } = memoryCompactionStore();
+  const { fixture } = compactHostFixture('claude', store);
+  const { host, child, state } = fixture;
+  fixture.work = 'unknown';
+  fixture.authority = null;
+  let refreshes = 0;
+  host.sessionsRefreshed = () => {
+    refreshes++;
+  };
+  const ack = await admitContinuation(fixture);
+  assert.equal(ack.state, 'queued', (ack as { reason?: string }).reason);
+  const extra = { provider: 'claude', generation: 1 };
+  host.native(child, compactEvent('toolEnd', extra), 7);
+  host.native(child, compactEvent('rootEnd', extra), 7);
+  state.busy = false;
+  await host.drain('self');
+  assert.equal(fixture.writes, 1);
+  finishCompact(fixture);
+  state.busy = false;
+  await host.drain('self');
+  assert.deepEqual(fixture.continuationWrites, [continuationText]);
+  assert.equal(refreshes, 0);
+});
+
+// Catches a token request that its own later tool start turns into a second call, and a token that admits without a live child.
+test('a token request takes its tool and turn from a later tool start and a token without a live child refuses', async () => {
+  const { fixture } = compactHostFixture('claude');
+  const { host, child, state } = fixture;
+  const claude = { provider: 'claude', generation: 1 };
+  host.submitted(child, 7);
+  assert.equal((host.handle({ method: 'compact-request', params: tokenPayload }) as { state: string }).state, 'queued');
+  host.native(child, compactEvent('toolStart', claude), 7);
+  const status = host.handle({ method: 'compact-status', params: { requestId: compactPayload.requestId } }) as {
+    state: string;
+    toolId: string;
+    turn: string;
+  };
+  assert.deepEqual([status.state, status.toolId, status.turn], ['queued', 'call', '1']);
+  host.native(child, compactEvent('toolEnd', claude), 7);
+  host.native(child, compactEvent('rootEnd', claude), 7);
+  state.busy = false;
+  await host.drain('self');
+  assert.equal(fixture.writes, 1);
+  const missing = { ...tokenPayload, requestId: compactWindow + ':bbbbbbbb-1111-2222-3333-444444444444' };
+  fixture.current = null;
+  assert.deepEqual(host.handle({ method: 'compact-request', params: missing }), {
+    requestId: missing.requestId,
+    state: 'refused',
+    reason: 'Arc holds no live session for this token. No compaction was queued.',
+  });
 });

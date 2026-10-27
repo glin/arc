@@ -1,6 +1,6 @@
 # Request compaction of this session
 
-The command requests context maintenance for this session. Only its native main agent can request compaction through its live Arc window. A subagent cannot compact its parent. Standalone sessions need an Arc host for this transport.
+The command requests context maintenance for this session through its live Arc window. Arc writes a launch token into the environment of each agent process it starts, and the command sends it. The token identifies the session, so subagents and background commands of the session can also request its compaction. Standalone sessions need an Arc host for this transport.
 
 Run the command in this exact form. Write the window `hostId` and a fresh lowercase UUID as literal text:
 
@@ -8,9 +8,9 @@ Run the command in this exact form. Write the window `hostId` and a fresh lowerc
 arc compact request --self --after-turn --request-id WINDOW_ID:UUID --window WINDOW_ID --json
 ```
 
-Both window values are the `hostId` of the window that hosts this session, as selected in [Select a ready window](SKILL.md#select-a-ready-window). Claude agents run the command with the Bash tool. Arc does not admit it from the Claude PowerShell tool. Codex agents run the bare command as a shell command. Codex adds its own PowerShell wrapper on Windows, so never write a wrapper. Do not use shell substitutions, command chains, or alternate payload transports.
+Both window values are the `hostId` of the window that hosts this session, as selected in [Select a ready window](SKILL.md#select-a-ready-window). Claude agents run the command with the Bash tool. Without a launch token, Arc does not admit it from the Claude PowerShell tool. Codex agents run the bare command as a shell command. Codex adds its own PowerShell wrapper on Windows, so never write a wrapper. Do not use shell substitutions, command chains, or alternate payload transports.
 
-Arc admits the request only while the native tool call runs in a session this window holds. Open asks and queued reader prompts block admission. Reader activity after command observation withdraws the call. After admission, a reader prompt carries the request to the turn that answers it, and a queue change keeps it. Stop, a setting pick, a reader compaction, a slash command, and an answer cancel unsubmitted compaction and suppress continuation. An answer approving the requesting tool before admission preserves its call.
+Arc admits a request with a launch token at once for the live session that holds the token. Without a token, Arc admits the request only while it sees the native tool call run in a session this window holds, and the command waits up to 30 seconds for that. Open asks and queued reader prompts do not block admission. Arc sends the compaction after they clear. Reader activity after command observation withdraws an unadmitted call. After admission, a reader prompt carries the request to the turn that answers it, and a queue change keeps it. Stop, a setting pick, a reader compaction, a slash command, and an answer cancel unsubmitted compaction and suppress continuation. An answer approving the requesting tool before admission preserves its call.
 
 Each exact session turn holds one pending request. Each request ID is admitted once per window activation. Root background commands, notification turns, and continuation turns use the same admission rules. Repeated compaction grants no new task, spending, model, or review authority.
 
@@ -54,7 +54,7 @@ Copy only the 64-character digest into this exact command. Windows requires the 
 arc compact request --self --after-turn --continuation-file 'C:/Windows/Temp/arc-next.txt' --continuation-sha256 SHA256 --request-id WINDOW_ID:UUID --window WINDOW_ID --json
 ```
 
-Each completed compaction can deliver its explicit continuation once. Finish the requesting turn successfully after admission. Compaction completion and continuation acceptance are separate observations. The continuation states are `waiting`, `preparing`, `attempting`, `accepted`, `cancelled`, `refused`, and `uncertain`. Acceptance confirms prompt acknowledgment rather than task completion. Never retry uncertain input or reopen a child. A continuation can request another compaction with a fresh request ID within the same authorized work and its existing limits.
+Each completed compaction can deliver its explicit continuation once. Compaction completion and continuation acceptance are separate observations. The continuation states are `waiting`, `preparing`, `attempting`, `accepted`, `cancelled`, `refused`, and `uncertain`. Acceptance confirms prompt acknowledgment rather than task completion. Never retry uncertain input or reopen a child. A continuation can request another compaction with a fresh request ID within the same authorized work and its existing limits.
 
 Active requests wait for their prerequisites without an execution deadline. Terminal status remains available for up to one hour, subject to capacity eviction.
 
@@ -78,12 +78,12 @@ Run it in the same bare form as the request, with literal values and no chain, p
 
 The `state` field names one outcome:
 
-- `queued`: the request waits for its turn to succeed, a saved final response, and delivery checks. A carried request waits for the turn that answers the reader prompt.
+- `queued`: the request waits for its turn to end and for the session to be idle with no open ask or queued reader prompt. A carried request waits for the turn that answers the reader prompt.
 - `started`: the agent accepted the compaction.
 - `completed`: the agent finished the compaction.
-- `cancelled`: The request stopped before Arc sent it. The `reason` names the change: reader activity, scope loss, a changed session source or setup, a replaced agent process, an agent process that exited or moved to another session, window closure, or `arc compact cancel`. To compact after all, request again with a fresh request ID.
-- `refused`: Arc did not admit the request, or did not send it. A window without compaction support also refuses. The `reason` names the missing condition, for example an open ask, queued reader input, or a changed session.
-- `failed`: the requesting tool or turn failed, the final response was not saved, or the agent refused or failed the compaction.
+- `cancelled`: The request stopped before Arc sent it. The `reason` names the change: reader activity, a replaced agent process, an agent process that exited or moved to another session, window closure, or `arc compact cancel`. To compact after all, request again with a fresh request ID.
+- `refused`: Arc did not admit the request, or did not send it. A window without compaction support also refuses. The `reason` names the missing condition, for example a token that names no live session, an unseen command, or a changed session.
+- `failed`: the agent refused or failed the compaction.
 - `uncertain`: admission or the compaction outcome is not known yet. Arc also reports this right after it sends the compaction, until native evidence arrives. When the request command returns it, report it and finish the turn. Never resend, change transport, reopen the session, or fork the session.
 - `unavailable`: the window holds no record of this request ID, or the window did not answer the status read.
 

@@ -1871,8 +1871,6 @@ export class PanelProvider implements vscode.Disposable {
   public onReaderDirected: ((session: string) => void) | null = null;
   // The latest observed session read. Filesystem revision equality cannot detect metadata-preserving rewrites.
   private guardedReads?: Map<string, GuardedObservationFacts>;
-  // Runs synchronously when the repository scope or the workspace folders change.
-  public onScopeChange: ((outOfScope?: ReadonlySet<string>) => void) | null = null;
   // Runs after a full refresh rebuilds the session rows under a ready repository scope.
   public onSessionRowsRefreshed: (() => void) | null = null;
   public recoveryOrigin = crypto.randomBytes(16).toString('hex');
@@ -4050,7 +4048,6 @@ export class PanelProvider implements vscode.Disposable {
   // Runs on first scope readiness and whenever the repository scope roots change.
   private repositoryScopeChanged(): void {
     this.initialNamesChanged();
-    this.onScopeChange?.();
     // A catalog listed under the previous roots cannot render the current scope.
     for (const work of this.selectionWorks.values()) work.controller.abort();
     this.selectionWorks.clear();
@@ -4080,7 +4077,6 @@ export class PanelProvider implements vscode.Disposable {
           .filter((source) => source.cwd && !inScope(source.cwd))
           .map((source) => ('sessionId' in source ? source.sessionId : source.draftId)),
       );
-      this.onScopeChange?.(removed);
       for (const sessionId of removed) this.scopeSessionDirectories?.delete(sessionId);
     }
     this.loadingLine.rescope(scope.ready ? JSON.stringify(scope.roots) : null, 'repository scope');
@@ -4091,7 +4087,6 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   private workspaceFoldersChanged(): void {
-    this.onScopeChange?.();
     this.cancelProjectSpendHydration();
     this.projectSpendHydrationReady = false;
     this.repositoryScopeReady = false;
@@ -6319,6 +6314,15 @@ export class PanelProvider implements vscode.Disposable {
 
   // Unknown membership holds deferred compaction. Reader retention, delivery, queued prompts and a clear remain pending.
   public readerWork(session: string): 'none' | 'pending' | 'absent' | 'unknown' {
+    // Queued input and a clear in progress stay pending while the session rows cannot confirm membership.
+    if (
+      (this.queues[session]?.length ?? 0) > 0 ||
+      this.clearSettlements?.has(session) ||
+      this.pendingQueueDrains.has(session) ||
+      this.submissionsInFlight?.has(session) ||
+      this.readerDeliveries?.has(session)
+    )
+      return 'pending';
     const membership =
       this.newDrafts[session] || this.awaitingSessionRecords[session] ? 'present' : this.membershipOf(session);
     if (membership === 'unknown') return 'unknown';

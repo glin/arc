@@ -1075,12 +1075,8 @@ test('a Claude self-compaction request compacts once after its turn when the sel
     sessionId: session,
     emit: (event) => {
       if (event.kind === 'native') owner.native(child, event.event, 7);
-      if (event.kind === 'text')
-        provider.noteCompletedReply(session, event.text, event.sourceId, 7, () => owner.replyRetained(child, 7));
-      if (event.kind === 'turnEnd') {
-        provider.noteResponseEnded(session, event.outcome, 7);
-        owner.turnEnded(child);
-      }
+      if (event.kind === 'text') provider.noteCompletedReply(session, event.text, event.sourceId, 7);
+      if (event.kind === 'turnEnd') provider.noteResponseEnded(session, event.outcome, 7);
     },
   });
   owner.submitted(child, 7);
@@ -10293,8 +10289,6 @@ test('every reader instruction names a panel message and reports before the pane
   );
 });
 
-// Catches a scope change or a rows refresh that no longer reaches deferred compaction. A lost report lets compaction
-// run in a session that left the window's scope.
 test('workspace catalog invalidation releases the retained session page index', () => {
   assert.match(
     declarationSource(panelHostSource, 'workspaceFoldersChanged'),
@@ -10302,12 +10296,8 @@ test('workspace catalog invalidation releases the retained session page index', 
   );
 });
 
-test('repository scope changes, workspace folder changes and rows refreshes report to deferred compaction', () => {
-  for (const member of ['private repositoryScopeChanged(', 'private workspaceFoldersChanged(']) {
-    const start = panelHostSource.indexOf(member);
-    assert.ok(start !== -1, member);
-    assert.match(memberFrom(panelHostSource, start), /^\s*this\.onScopeChange\?\.\(\);/m, member);
-  }
+// Catches a rows refresh that no longer reaches deferred compaction. A lost report leaves released work waiting.
+test('full rows refreshes report to deferred compaction', () => {
   assert.equal(
     panelHostSource.match(/if \(!selectedOnly && this\.repositoryScopeReady\) this\.onSessionRowsRefreshed\?\.\(\);/g)
       ?.length,
@@ -10315,7 +10305,6 @@ test('repository scope changes, workspace folder changes and rows refreshes repo
     'both the unchanged and the rebuilt full refresh report rows',
   );
   const extensionSource = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
-  assert.match(extensionSource, /panel\.onScopeChange = \(outOfScope\) => owner\.scopeChanged\(outOfScope\);/);
   assert.match(extensionSource, /panel\.onSessionRowsRefreshed = \(\) => owner\.sessionsRefreshed\(\);/);
 });
 
@@ -28590,7 +28579,7 @@ test('completed responses replace streamed text and survive consecutive prompts 
     );
     sourceMatch(
       fs.readFileSync(path.join(__dirname, 'compactrequest.ts'), 'utf8'),
-      /if \(event\.kind === 'text'\) \{[\s\S]*?replies\.noteCompletedReply\(where, event\.text, event\.sourceId, turnId,[\s\S]*?return true;/,
+      /if \(event\.kind === 'text'\) \{[\s\S]*?replies\.noteCompletedReply\(where, event\.text, event\.sourceId, turnId\);[\s\S]*?return true;/,
       'completed response delivery waits for catalog refresh',
     );
     await vi.runOnlyPendingTimersAsync();
@@ -28932,7 +28921,7 @@ test('recorded reply reads survive long waits and stop when their request is inv
     const { provider, note, saves } = recordedReplyFixture('recorded-reply-deadline-');
     // Every panel is hidden, so polling has stopped.
     provider.watching = false;
-    note('msg-unrecorded', 'The build passed.', () => requests.awaitsReply(() => true));
+    note('msg-unrecorded', 'The build passed.', () => requests.status(payload.requestId)?.state === 'queued');
     provider.settleRecordedReplies();
     vi.runOnlyPendingTimers();
     assert.equal(vi.getTimerCount(), 1, 'the request still waits, so the reads continue');
@@ -35196,7 +35185,6 @@ function heldCompactionProvider(agent: 'claude' | 'codex' = 'codex') {
   assert.equal((owner.handle({ method: 'compact-request', params: payload }) as { state: string }).state, 'queued');
   native('toolEnd');
   const finish = async (turnId = 'root', submission = 7) => {
-    owner.replyRetained(child, submission);
     native('rootEnd', turnId, submission);
     state.busy = false;
     await owner.drain('source');
@@ -35229,7 +35217,7 @@ function heldCompactionProvider(agent: 'claude' | 'codex' = 'codex') {
   };
 }
 
-test.each(['claude', 'codex failed', 'codex unretained'] as const)(
+test.each(['claude', 'codex failed', 'codex succeeded'] as const)(
   'accepted %s reader input keeps compaction held until native answering evidence after settlement',
   async (ending) => {
     const agent = ending === 'claude' ? 'claude' : 'codex';
@@ -35281,20 +35269,13 @@ test.each(['claude', 'codex failed', 'codex unretained'] as const)(
       };
     assert.equal(status().turn, answering);
     assert.equal(status().submissionId, String(submission));
-    if (agent === 'claude') {
-      await h.finish(answering, submission);
-      assert.equal(h.writes(), 1);
-    } else {
-      h.native('rootEnd', answering, submission, ending === 'codex unretained');
+    if (agent === 'claude') await h.finish(answering, submission);
+    else {
+      h.native('rootEnd', answering, submission, ending === 'codex succeeded');
       h.state.busy = false;
       await h.owner.drain('source');
-      assert.equal(
-        h.writes(),
-        0,
-        'old turn evidence authorized compaction before a successful saved answering response',
-      );
-      assert.equal(status().state, 'queued');
     }
+    assert.equal(h.writes(), 1, 'the ended answering turn starts compaction');
   },
 );
 
@@ -35372,15 +35353,7 @@ test.each([
     };
   await h.send(failure === 'empty' ? '' : 'Reader direction.');
   await h.finish();
-  if (failure === 'vanished') {
-    await vi.waitFor(() =>
-      assert.equal(
-        (h.owner.handle({ method: 'compact-status', params: { requestId: h.requestId } }) as { state: string }).state,
-        'cancelled',
-      ),
-    );
-    assert.equal(h.owner.carriedLine('source'), null);
-  } else await vi.waitFor(() => assert.equal(h.writes(), 1));
+  await vi.waitFor(() => assert.equal(h.writes(), 1));
 });
 
 test.each(['retention', 'delivery'] as const)(
@@ -40971,7 +40944,8 @@ test('unread membership retains selection navigation derived caches exit corpus 
     provider.searchCorpus();
     assert.equal(provider.stateFor('retained'), null);
     provider.flushQueue('retained');
-    assert.equal(provider.readerWork('retained'), 'unknown');
+    // The retained queue keeps reader work pending while membership is unknown.
+    assert.equal(provider.readerWork('retained'), 'pending');
     assert.equal(provider.showing, 'retained');
     assert.deepEqual(provider.trail.places, ['retained']);
     for (const held of [
@@ -41826,7 +41800,7 @@ test.each([false, true])(
         });
         provider.flushQueue(source.sessionId);
         assert.deepEqual(sent, []);
-        assert.equal(provider.readerWork(source.sessionId), 'unknown');
+        assert.equal(provider.readerWork(source.sessionId), 'pending');
         assert.equal(provider.awaitingSessionRecords.collision, pending);
         provider.sourceEnumerations[agent] = {
           status: 'complete',

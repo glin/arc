@@ -8,8 +8,10 @@ export interface CompactPayload {
   self: true;
   afterTurn: true;
   continuation?: { text: string; sha256: string };
+  // The secret Arc writes into the environment of each agent process it launches. It names that process.
+  token?: string;
 }
-export type CompactCommand = Omit<CompactPayload, 'continuation'> & { continuation?: { sha256: string } };
+export type CompactCommand = Omit<CompactPayload, 'continuation' | 'token'> & { continuation?: { sha256: string } };
 export const CONTINUATION_LIMITS = { bytes: 8192 } as const;
 export interface ContinuationObservation {
   state: 'waiting' | 'preparing' | 'attempting' | 'accepted' | 'cancelled' | 'refused' | 'uncertain';
@@ -70,11 +72,9 @@ export const COMPACT_REJECTIONS: Record<CompactRejection, string> = {
   withdrawn: 'The session changed or closed before Arc could accept the request. No compaction was queued.',
 };
 // Why an admitted request stopped before Arc sent it. Each change that ends a request names itself.
-export type CompactLoss = 'reader' | 'scope' | 'authority' | 'replaced' | 'exited';
+export type CompactLoss = 'reader' | 'replaced' | 'exited';
 export const COMPACT_LOSSES: Record<CompactLoss, string> = {
   reader: 'The reader acted in this session before compaction started.',
-  scope: "The session left this window's scope before compaction started.",
-  authority: "The session's source, folder or setup changed before compaction started.",
   replaced: 'The agent process was replaced before compaction started.',
   exited: 'The agent process exited or moved to another session before compaction started.',
 };
@@ -139,9 +139,11 @@ interface Assignment {
   payload: CompactPayload;
   binding: Readonly<CompactBinding>;
   toolId: string;
-  toolSucceeded: boolean;
-  turnSucceeded: boolean;
-  finalRetained: boolean;
+  // The requesting turn ended, with or without success.
+  turnEnded: boolean;
+  // Admitted by launch token before Arc saw the requesting tool start. The binding names the child's
+  // last known turn, and the first root ending of the child's session ends it.
+  floating: boolean;
   submitted: boolean;
   delivering: boolean;
   terminalAt: number | null;
@@ -155,8 +157,7 @@ interface Assignment {
   carry?: Set<string>;
 }
 interface Call {
-  turnSucceeded: boolean;
-  finalRetained: boolean;
+  turnEnded: boolean;
   payload: CompactCommand;
   binding: Readonly<CompactBinding>;
   toolId: string;
@@ -166,10 +167,13 @@ export function validCompactPayload(input: unknown): input is CompactPayload {
   if (!input || typeof input !== 'object' || Array.isArray(input)) return false;
   const value = input as Record<string, unknown>;
   return (
-    Object.keys(value).sort().join(',') ===
-      (value.continuation === undefined
-        ? 'afterTurn,requestId,self,window'
-        : 'afterTurn,continuation,requestId,self,window') &&
+    Object.keys(value)
+      .filter((key) => key !== 'token' && key !== 'continuation')
+      .sort()
+      .join(',') === 'afterTurn,requestId,self,window' &&
+    (value.token === undefined || (typeof value.token === 'string' && /^[a-f0-9]{32}$/.test(value.token))) &&
+    (!('continuation' in value) || value.continuation !== undefined) &&
+    (!('token' in value) || value.token !== undefined) &&
     (value.continuation === undefined ||
       (!!value.continuation &&
         typeof value.continuation === 'object' &&
@@ -299,7 +303,7 @@ export class CompactRequests {
     private readonly persistence?: CompactPersistence,
   ) {}
 
-  observe(binding: CompactBinding, event: NativeEvent, finalRetained = false): void {
+  observe(binding: CompactBinding, event: NativeEvent): void {
     if (
       binding.activation !== this.activation ||
       event.provider !== binding.provider ||
@@ -310,7 +314,26 @@ export class CompactRequests {
     const key = `${binding.provider}:${binding.sessionId}:${binding.childGeneration}:${binding.turn}:${event.kind === 'toolStart' || event.kind === 'toolEnd' ? event.toolId : ''}`;
     if (event.kind === 'toolStart') {
       const payload = compactCommandPayload(event.command);
+      const admitted = payload ? this.assignments.get(payload.requestId) : undefined;
       if (
+        payload &&
+        admitted?.floating &&
+        event.initiating &&
+        payload.window === this.activation &&
+        admitted.binding.provider === binding.provider &&
+        admitted.binding.sessionId === binding.sessionId &&
+        admitted.binding.childGeneration === binding.childGeneration &&
+        payloadKey(admitted.payload) === payloadKey(payload)
+      ) {
+        // The tool start of a request that its launch token already admitted names its exact turn and tool.
+        this.seenCalls.add(key);
+        if (!admitted.submitted && admitted.observation.state === 'queued') {
+          admitted.toolId = event.toolId;
+          admitted.observation = { ...admitted.observation, toolId: event.toolId };
+          if (!admitted.carry) this.rebind(payload.requestId, binding);
+          admitted.floating = false;
+        }
+      } else if (
         event.initiating &&
         payload?.window === this.activation &&
         !this.seenCalls.has(key) &&
@@ -322,43 +345,33 @@ export class CompactRequests {
             payload,
             binding: Object.freeze({ ...binding }),
             toolId: event.toolId,
-            turnSucceeded: false,
-            finalRetained: false,
+            turnEnded: false,
           });
         else this.rejectPayload(payload, 'capacity');
       }
     }
     if (event.kind === 'toolEnd') this.calls.delete(key);
+    // A turn that fails still ends. The session asked for the compaction, so the request keeps waiting for idle.
     if (event.kind === 'rootEnd') {
-      for (const [id, call] of this.calls)
-        if (sameBinding(call.binding, binding)) {
-          if (!event.success) {
-            this.calls.delete(id);
-            this.rejectPayload(call.payload, 'withdrawn');
-            continue;
-          }
-          call.turnSucceeded = event.success;
-          call.finalRetained = finalRetained;
-        }
+      for (const call of this.calls.values()) if (sameBinding(call.binding, binding)) call.turnEnded = true;
+      for (const assignment of this.assignments.values())
+        if (sameBinding(assignment.binding, binding) && !assignment.submitted) assignment.turnEnded = true;
     }
-    for (const assignment of this.assignments.values()) {
+  }
+
+  // A root turn of this child's session ended. It ends every request that its launch token admitted
+  // before Arc saw the requesting tool start, unless a reader message holds the request.
+  endTurn(provider: 'claude' | 'codex', sessionId: string, childGeneration: number): void {
+    for (const assignment of this.assignments.values())
       if (
-        !sameBinding(assignment.binding, binding) ||
-        assignment.submitted ||
-        assignment.observation.state !== 'queued'
+        assignment.floating &&
+        !assignment.carry &&
+        !assignment.submitted &&
+        assignment.binding.provider === provider &&
+        assignment.binding.sessionId === sessionId &&
+        assignment.binding.childGeneration === childGeneration
       )
-        continue;
-      if (event.kind === 'toolEnd' && event.toolId === assignment.toolId) {
-        assignment.toolSucceeded = event.success;
-        if (!event.success) this.change(assignment, 'failed', 'The requesting tool did not finish successfully.');
-      }
-      if (event.kind === 'rootEnd') {
-        assignment.turnSucceeded = event.success;
-        assignment.finalRetained = finalRetained;
-        if (!event.success || !finalRetained)
-          this.change(assignment, 'failed', 'The requesting turn or its saved response is unavailable.');
-      }
-    }
+        assignment.turnEnded = true;
   }
 
   // Routes native compaction evidence to the one operation whose submission generation it names.
@@ -401,7 +414,7 @@ export class CompactRequests {
     ];
   }
 
-  // Lists queued assignments whose requesting tool, exact turn and retained final response all succeeded.
+  // Lists queued assignments whose requesting turn ended.
   deliverable(sessionId: string): { id: string; binding: Readonly<CompactBinding> }[] {
     this.prune();
     return [...this.assignments]
@@ -412,21 +425,9 @@ export class CompactRequests {
           a.persisted &&
           !a.delivering &&
           a.observation.state === 'queued' &&
-          a.toolSucceeded &&
-          a.turnSucceeded &&
-          a.finalRetained,
+          a.turnEnded,
       )
       .map(([id, a]) => ({ id, binding: a.binding }));
-  }
-
-  // Whether an unsubmitted operation still waits for its final response.
-  awaitsReply(predicate: (binding: Readonly<CompactBinding>) => boolean): boolean {
-    return (
-      [...this.calls.values()].some((call) => !call.finalRetained && predicate(call.binding)) ||
-      [...this.assignments.values()].some(
-        (a) => !a.submitted && a.observation.state === 'queued' && !a.finalRetained && predicate(a.binding),
-      )
-    );
   }
 
   readiness(payload: CompactPayload): CompactReadiness {
@@ -458,12 +459,22 @@ export class CompactRequests {
     if (this.rejections.size > this.capacity) this.rejections.delete(this.rejections.keys().next().value!);
   }
 
+  // Admits a request on its observed live call. A request that its launch token proves comes with
+  // `bound`, the binding of the child that holds the token, and needs no observed call.
   admit(
     payload: CompactPayload,
     eligible: (binding: Readonly<CompactBinding>) => boolean,
+    bound?: Readonly<CompactBinding>,
   ): Readonly<CompactObservation> {
     this.prune();
-    const live = [...this.calls].find(([, call]) => payloadKey(call.payload) === payloadKey(payload));
+    const live = [...this.calls].find(
+      ([, call]) =>
+        payloadKey(call.payload) === payloadKey(payload) &&
+        (!bound ||
+          (call.binding.provider === bound.provider &&
+            call.binding.sessionId === bound.sessionId &&
+            call.binding.childGeneration === bound.childGeneration)),
+    );
     const existing = this.assignments.get(payload.requestId);
     this.reclaim();
     if (existing && payloadKey(existing.payload) !== payloadKey(payload))
@@ -484,14 +495,14 @@ export class CompactRequests {
       this.assignments.size >= this.capacity
     )
       throw new Error('This compaction request is unavailable in this Arc window.');
-    if (!live) {
+    if (!live && !bound) {
       const readiness = this.readiness(payload);
       throw new Error(readiness.ready ? COMPACT_REJECTIONS['not-observed'] : readiness.reason);
     }
-    const [key, call] = live;
-    if (!eligible(call.binding))
-      throw new Error('The session has an open question or queued reader input. No compaction was queued.');
-    if (payload.continuation && (!this.persistence || !call.binding.authority || !call.binding.assignmentId))
+    const key = live?.[0];
+    const call = live?.[1] ?? { binding: bound!, toolId: '', turnEnded: false };
+    if (!eligible(call.binding)) throw new Error(COMPACT_REJECTIONS.withdrawn);
+    if (payload.continuation && !this.persistence)
       throw new Error('This continuation cannot be saved for the session.');
     if (
       [...this.assignments.values()].some(
@@ -504,7 +515,7 @@ export class CompactRequests {
       )
     )
       throw new Error('This turn already has a pending compaction request.');
-    this.calls.delete(key);
+    if (key !== undefined) this.calls.delete(key);
     this.consumed.add(payload.requestId);
     const acknowledgement = Object.freeze({
       requestId: payload.requestId,
@@ -537,9 +548,8 @@ export class CompactRequests {
       payload: { ...payload },
       binding: call.binding,
       toolId: call.toolId,
-      toolSucceeded: false,
-      turnSucceeded: call.turnSucceeded,
-      finalRetained: call.finalRetained,
+      turnEnded: call.turnEnded,
+      floating: !live,
       submitted: false,
       delivering: false,
       terminalAt: null,
@@ -553,6 +563,7 @@ export class CompactRequests {
   admitSaved(
     payload: CompactPayload,
     eligible: (binding: Readonly<CompactBinding>) => boolean,
+    bound?: Readonly<CompactBinding>,
   ): Promise<Readonly<CompactObservation>> {
     const pending = this.admissions.get(payload.requestId);
     if (pending) {
@@ -563,7 +574,7 @@ export class CompactRequests {
     }
     let observation: Readonly<CompactObservation>;
     try {
-      observation = this.admit(payload, eligible);
+      observation = this.admit(payload, eligible, bound);
     } catch (error) {
       return Promise.reject(error);
     }
@@ -798,13 +809,13 @@ export class CompactRequests {
       if (assignment.binding.sessionId === sessionId && assignment.carry) assignment.carry.add(turn);
   }
 
-  // Moves an unsubmitted assignment to a new binding and ends its hold. A new turn must succeed and save its own response.
+  // Moves an unsubmitted assignment to a new binding and ends its hold. A new turn must end before delivery.
   rebind(id: string, binding: Readonly<CompactBinding>): void {
     const assignment = this.assignments.get(id);
     if (!assignment || assignment.submitted || assignment.observation.state !== 'queued') return;
     if (assignment.binding.turn !== binding.turn || assignment.binding.submissionId !== binding.submissionId) {
-      assignment.turnSucceeded = false;
-      assignment.finalRetained = false;
+      assignment.turnEnded = false;
+      assignment.floating = false;
     }
     assignment.binding = Object.freeze({ ...binding });
     assignment.carry = undefined;
@@ -875,12 +886,10 @@ export class CompactRequests {
       assignment.submitted ||
       assignment.delivering ||
       assignment.observation.state !== 'queued' ||
-      !assignment.toolSucceeded ||
-      !assignment.turnSucceeded ||
-      !assignment.finalRetained
+      !assignment.turnEnded
     )
       return;
-    // Reader actions, child changes and scope changes cancel through invalidate. A failed check here
+    // Reader actions and child changes cancel through invalidate. A failed check here
     // only means the session is not ready yet.
     const check = () =>
       !this.disposed &&
@@ -1086,12 +1095,14 @@ export interface CompactChild {
 
 export interface CompactHostPort<C extends CompactChild> {
   find(provider: 'claude' | 'codex', sessionId: string): C | null;
+  // The live child whose launch environment holds this token, or null.
+  findToken?(token: string): C | null;
   // Runs work under an activity lease on this exact child. It resolves null without opening a missing child.
   withActivity(child: C, work: (live: C) => Promise<void>): Promise<unknown>;
-  // Names queued reader prompts or a clear in progress as pending, and a session outside the panel's scope as absent.
-  // Unavailable membership blocks delivery without cancelling the assignment.
+  // Names queued reader prompts or a clear in progress as pending. Pending reader work blocks delivery.
+  // Unknown membership holds a released reader carry until the session rows refresh.
   readerWork(sessionId: string): 'none' | 'pending' | 'absent' | 'unknown';
-  // Stable physical source, current scope, cwd and effective setup. Null means authority is unknown.
+  // Stable physical source, current scope, cwd and effective setup, recorded in a continuation receipt.
   authority?(provider: 'claude' | 'codex', sessionId: string): string | null;
   source?(provider: 'claude' | 'codex', sessionId: string): string | null;
   continuationWork?(sessionId: string): 'none' | 'pending' | 'absent' | 'unknown';
@@ -1114,8 +1125,8 @@ export class CompactHost<C extends CompactChild> {
   private readonly children = new Map<string, C>();
   private readonly submissions = new WeakMap<C, Map<number, Submission>>();
   private readonly bindings = new WeakMap<C, Map<string, CompactBinding>>();
-  private readonly replies = new WeakMap<C, Set<number>>();
-  private readonly endings = new WeakMap<C, Map<number, { binding: CompactBinding; event: NativeEvent }>>();
+  // The last root turn Arc saw from each child, which a token request binds to before its tool start arrives.
+  private readonly latest = new WeakMap<C, { sessionId: string; turn: string; submissionId: string }>();
   private readonly observations = new WeakMap<
     NativeEvent,
     Pick<CompactBinding, 'childGeneration' | 'readerRevision' | 'authority' | 'sourceIdentity'>
@@ -1126,8 +1137,6 @@ export class CompactHost<C extends CompactChild> {
     string,
     { requestId: string; provider: 'claude' | 'codex'; sessionId: string; child: C }
   >();
-  // True from a scope change until the panel's session rows reflect the new scope.
-  private settling = false;
   private disposed = false;
 
   constructor(
@@ -1199,19 +1208,10 @@ export class CompactHost<C extends CompactChild> {
     );
   }
 
-  // Known directories outside a ready scope cancel assignments before any rows refresh.
-  // Delivery still waits until the session rows reflect the scope.
-  scopeChanged(outOfScope: ReadonlySet<string> = new Set()): void {
-    this.settling = true;
-    this.requests.invalidate((binding) => outOfScope.has(binding.sessionId), COMPACT_LOSSES.scope);
-  }
-
-  // Runs after each full rows refresh. A session that left the panel's scope cancels its unsubmitted
-  // work, also when the scope later returns it. Work that waited on the scope change drains.
+  // Runs after each full rows refresh. Held work whose reader message settled while membership was unknown
+  // is released, and waiting work drains again.
   sessionsRefreshed(): void {
     if (this.disposed) return;
-    this.settling = false;
-    this.requests.invalidate((binding) => this.port.readerWork(binding.sessionId) === 'absent', COMPACT_LOSSES.scope);
     for (const sessionId of this.deferredReleases) this.unsent(sessionId);
     for (const sessionId of this.requests.waitingSessions()) void this.drain(sessionId);
   }
@@ -1230,6 +1230,7 @@ export class CompactHost<C extends CompactChild> {
     if (book.size > SUBMISSIONS_PER_CHILD) book.delete(book.keys().next().value!);
     this.generationOf(child);
     const sessionId = child.state().sessionId;
+    if (sessionId) this.latest.set(child, { sessionId, turn: '', submissionId: String(turnId) });
     if (origin === 'reader' && sessionId) this.requests.noteTurn(sessionId, String(turnId));
   }
 
@@ -1267,23 +1268,23 @@ export class CompactHost<C extends CompactChild> {
     if (event.kind === 'wake' || event.kind === 'launch' || event.kind === 'background') return;
     if (event.kind === 'toolStart' || event.kind === 'toolEnd') this.observeCancel(child, event);
     if (turnId !== undefined) this.carryTo(child, event, turnId);
+    const turn =
+      child.agent === 'claude' ? (event.generation === null ? null : String(event.generation)) : event.turnId;
+    if (turnId !== undefined && turn && event.provider === child.agent)
+      this.latest.set(child, { sessionId: event.sessionId, turn, submissionId: String(turnId) });
     const binding = this.binding(child, event, turnId);
     if (event.kind === 'toolStart' && (!binding || !event.initiating)) this.requests.reject(event.command, 'withdrawn');
-    if (!binding || turnId === undefined) return;
-    const replies = this.replies.get(child) ?? new Set<number>();
-    this.replies.set(child, replies);
     if (event.kind === 'rootEnd') {
-      // A root success waits until the panel saves the final response for the reader.
-      if (replies.has(turnId)) this.requests.observe(binding, event, true);
-      else if (!child.startedByAgent?.(turnId) || this.awaitsRecordedReply(child, turnId)) {
-        const endings = this.endings.get(child) ?? new Map<number, { binding: CompactBinding; event: NativeEvent }>();
-        this.endings.set(child, endings);
-        endings.set(turnId, { binding, event });
-      }
+      const generation = this.generations.get(child);
+      const state = child.state();
+      if (generation !== undefined && event.provider === child.agent && state.sessionId === event.sessionId)
+        this.requests.endTurn(event.provider, event.sessionId, generation);
+      if (binding && turnId !== undefined) this.requests.observe(binding, event);
+      // An ended turn can make waiting work deliverable without a rows refresh.
+      queueMicrotask(() => void this.drain(event.sessionId));
       return;
     }
-    // Only a response saved after the last tool settled counts as the final response.
-    replies.delete(turnId);
+    if (!binding || turnId === undefined) return;
     this.requests.observe(binding, event);
   }
 
@@ -1347,43 +1348,6 @@ export class CompactHost<C extends CompactChild> {
     if (this.cancels.size > COMPACT_LIMITS.records) this.cancels.delete(this.cancels.keys().next().value!);
   }
 
-  replyRetained(child: C, turnId: number): void {
-    if (this.disposed) return;
-    const replies = this.replies.get(child) ?? new Set<number>();
-    this.replies.set(child, replies);
-    replies.add(turnId);
-    for (const reply of replies) {
-      if (replies.size <= SUBMISSIONS_PER_CHILD) break;
-      if (!this.awaitsRecordedReply(child, reply)) replies.delete(reply);
-    }
-    const endings = this.endings.get(child);
-    const ending = endings?.get(turnId);
-    if (!ending) return;
-    endings!.delete(turnId);
-    this.requests.observe(ending.binding, ending.event, true);
-  }
-
-  // Whether an admitted request of this turn still waits for the panel to hold its final response.
-  awaitsRecordedReply(child: C, turnId: number): boolean {
-    if (this.disposed || !this.generations.has(child)) return false;
-    const generation = this.generations.get(child);
-    return this.requests.awaitsReply(
-      (binding) => binding.childGeneration === generation && binding.submissionId === String(turnId),
-    );
-  }
-
-  // A child turn ended. Root endings still waiting for a saved response fail, except the successful
-  // ending of a provider-originated turn. Its response waits for the recorded turn.
-  turnEnded(child: C): void {
-    const endings = this.endings.get(child);
-    if (!endings) return;
-    for (const [turnId, ending] of endings) {
-      if (ending.event.kind === 'rootEnd' && ending.event.success && child.startedByAgent?.(turnId)) continue;
-      endings.delete(turnId);
-      this.requests.observe(ending.binding, ending.event, false);
-    }
-  }
-
   childGone(key: string): void {
     const child = this.children.get(key);
     for (const [id, call] of this.cancels)
@@ -1409,7 +1373,6 @@ export class CompactHost<C extends CompactChild> {
   }
 
   async drain(sessionId: string): Promise<void> {
-    if (this.settling) return;
     for (const { id, binding } of this.requests.deliverable(sessionId)) {
       const child = this.resolve(binding);
       // A newer reader revision means a carried request waits for the turn that answers the reader's message.
@@ -1449,7 +1412,7 @@ export class CompactHost<C extends CompactChild> {
         await this.requests.continue(id, {
           eligible: (current, writing) =>
             this.eligible(current, writing ? 'write' : 'deliver') &&
-            (!this.port.continuationWork || this.port.continuationWork(sessionId) === 'none') &&
+            this.port.continuationWork?.(sessionId) !== 'pending' &&
             (writing || live.guardedIdle?.() === null),
           submit: (text, beforeWrite) =>
             live.guardedPrompt!(
@@ -1518,15 +1481,17 @@ export class CompactHost<C extends CompactChild> {
     try {
       if (request.method !== 'compact-request' || !validCompactPayload(params))
         throw new Error('This compaction request is unavailable in this Arc window.');
+      const bound = params.token === undefined ? undefined : this.tokenBinding(params.token);
+      if (bound === null) throw new Error('Arc holds no live session for this token. No compaction was queued.');
       if (params.continuation)
         return this.requests
-          .admitSaved(params, (binding) => this.eligible(binding, 'admit'))
+          .admitSaved(params, (binding) => this.eligible(binding, 'admit'), bound)
           .catch((error: unknown) => ({
             requestId: params.requestId,
             state: 'refused',
             reason: error instanceof Error ? error.message : 'Compaction was refused.',
           }));
-      return this.requests.admit(params, (binding) => this.eligible(binding, 'admit'));
+      return this.requests.admit(params, (binding) => this.eligible(binding, 'admit'), bound);
     } catch (error) {
       return {
         requestId: params.requestId,
@@ -1557,6 +1522,35 @@ export class CompactHost<C extends CompactChild> {
     if (this.children.has(child.key) && this.children.get(child.key) !== child) this.childGone(child.key);
     this.children.set(child.key, child);
     return generation;
+  }
+
+  // Binds a token request to the live child that holds the token, on the last turn Arc saw from it.
+  // The request's own tool start, when Arc sees it, replaces that turn with the exact one.
+  private tokenBinding(token: string): CompactBinding | null {
+    const child = this.port.findToken?.(token) ?? null;
+    const provider = child?.agent;
+    const state = child?.state();
+    if (!child || !state?.sessionId || state.exited || (provider !== 'claude' && provider !== 'codex')) return null;
+    const sessionId = state.sessionId;
+    if (this.port.find(provider, sessionId) !== child) return null;
+    const generation = this.generationOf(child);
+    const known = this.latest.get(child);
+    const turn = known?.sessionId === sessionId ? known.turn : '';
+    const submissionId = known?.sessionId === sessionId ? known.submissionId : '';
+    const authority = this.port.authority?.(provider, sessionId) ?? undefined;
+    const sourceIdentity = (this.port.source ?? this.port.authority)?.(provider, sessionId) ?? undefined;
+    return {
+      activation: this.activation,
+      provider,
+      sessionId,
+      childGeneration: generation,
+      turn,
+      submissionId,
+      readerRevision: this.revision(sessionId),
+      assignmentId: `${generation}:${turn}:${submissionId}`,
+      ...(authority === undefined ? {} : { authority }),
+      ...(sourceIdentity === undefined ? {} : { sourceIdentity }),
+    };
   }
 
   private binding(child: C, event: NativeEvent, turnId: number | undefined): CompactBinding | null {
@@ -1597,20 +1591,17 @@ export class CompactHost<C extends CompactChild> {
     return binding;
   }
 
-  // Asks and queued reader input, including a queued `/compact`, block admission and delivery.
-  // Admission runs while the requesting tool keeps the child busy. Delivery needs an idle,
-  // ready child. The provider write callback runs after the child's own command bookkeeping
-  // marks it busy, so that check omits the busy flag. Delivery also waits while an earlier
-  // compaction of the child has no answer or no ended turn, so its late turn has one owner.
+  // Admission needs only the live child. Asks and queued reader input, including a queued `/compact`,
+  // block delivery. Delivery needs an idle, ready child. The provider write callback runs after the
+  // child's own command bookkeeping marks it busy, so that check omits the busy flag. Delivery also
+  // waits while an earlier compaction of the child has no answer or no ended turn, so its late turn has one owner.
   private eligible(binding: Readonly<CompactBinding>, mode: 'admit' | 'deliver' | 'write'): boolean {
     const child = this.current(binding);
     if (!child) return false;
-    if (binding.authority && this.port.authority?.(binding.provider, binding.sessionId) !== binding.authority)
-      return false;
-    const state = child.state();
-    if (state.asks.length > 0 || this.port.readerWork(binding.sessionId) !== 'none') return false;
     if (mode === 'admit') return true;
-    if (this.settling || !state.ready || child.compactionUnresolved()) return false;
+    const state = child.state();
+    if (state.asks.length > 0 || this.port.readerWork(binding.sessionId) === 'pending') return false;
+    if (!state.ready || child.compactionUnresolved()) return false;
     return mode === 'write' || !state.busy;
   }
 
@@ -1624,9 +1615,6 @@ export class CompactHost<C extends CompactChild> {
   private resolve(binding: Readonly<CompactBinding>): C | CompactLoss {
     if (this.disposed) return 'exited';
     if (this.revision(binding.sessionId) !== binding.readerRevision) return 'reader';
-    if (this.port.readerWork(binding.sessionId) === 'absent') return 'scope';
-    const authority = this.port.authority?.(binding.provider, binding.sessionId);
-    if (binding.authority && authority && authority !== binding.authority) return 'authority';
     const child = this.port.find(binding.provider, binding.sessionId);
     if (!child) return 'exited';
     if (this.generations.get(child) !== binding.childGeneration) return 'replaced';
@@ -1635,18 +1623,9 @@ export class CompactHost<C extends CompactChild> {
   }
 }
 
-// The panel calls that hold a final response for the compaction its turn requested.
+// The panel call that records the final response of a reader turn.
 export interface ReplyHolder {
-  noteRecordedReply(
-    session: string,
-    sourceId: string,
-    text: string,
-    saved: () => void,
-    wanted: () => boolean,
-    identity?: { provider: 'claude' | 'codex'; nativeTurnId?: string; ownerTurnId?: number },
-  ): void;
-  noteCompletedReply(session: string, text: string, sourceId?: string, turnId?: number, saved?: () => void): void;
-  settleRecordedReplies(): void;
+  noteCompletedReply(session: string, text: string, sourceId?: string, turnId?: number): void;
 }
 
 // Sends a reader prompt and retains its live session and shared response owner.
@@ -1682,8 +1661,7 @@ export function readerPrompt<P extends { text: string }>(
 }
 
 // Routes the child events that self-compaction reads. Returns true when the event needs no other
-// handling. A provider-originated turn has no response card, so its final response waits for a
-// recorded turn while a compaction request of that turn waits for it.
+// handling. A provider-originated turn has no response card, so its text records no reply.
 export function routeCompactionEvent<C extends CompactChild>(
   compaction: CompactHost<C> | null,
   replies: ReplyHolder,
@@ -1698,27 +1676,9 @@ export function routeCompactionEvent<C extends CompactChild>(
   if (event.kind === 'text') {
     const where = child?.state().sessionId;
     if (!child || !where) return true;
-    if (turnId !== undefined && child.startedByAgent?.(turnId)) {
-      if (compaction?.awaitsRecordedReply(child, turnId))
-        replies.noteRecordedReply(
-          where,
-          event.sourceId ?? '',
-          event.text,
-          () => compaction.replyRetained(child, turnId),
-          () => compaction.awaitsRecordedReply(child, turnId),
-          {
-            provider: child.agent as 'claude' | 'codex',
-            ownerTurnId: turnId,
-            ...(child.agent === 'codex' && event.nativeTurnId ? { nativeTurnId: event.nativeTurnId } : {}),
-          },
-        );
-    } else
-      replies.noteCompletedReply(where, event.text, event.sourceId, turnId, () => {
-        if (turnId !== undefined) compaction?.replyRetained(child, turnId);
-      });
+    if (turnId === undefined || !child.startedByAgent?.(turnId))
+      replies.noteCompletedReply(where, event.text, event.sourceId, turnId);
     return true;
   }
-  // The transcript can record the final response after its text event.
-  if (event.kind === 'turnEnd') replies.settleRecordedReplies();
   return false;
 }

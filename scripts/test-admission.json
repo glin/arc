@@ -1,8 +1,8 @@
 {
   "cli/test/manage.test.ts": {
     "reason": "CLI management must preserve classification, validation, read delivery, and compaction cancels through a real authenticated window channel.",
-    "cases": 17,
-    "matricesSha256": "4e022b5fee407c764a58ab1e0ef83ee0471bb3cd96b4e1e4b6704a098c122dd7"
+    "cases": 18,
+    "matricesSha256": "f2821095b829c357a6a35721cd46cc263b50c8d3790056c3fc56fbc38081d6da"
   },
   "cli/test/run.test.ts": {
     "reason": "Standalone workers must retain real output, exit, cancellation, receipt ownership, and recovery across process boundaries. Held readers must preserve one worker and one outcome after recovery. Exhausted replacement retries must retain the worker's terminal observation.",
@@ -35,9 +35,9 @@
     "matricesSha256": "ee41bd99bc78c90d9caa53af20ec903968f2860939812170f9d5a393eede6a0c"
   },
   "extension/src/agenthost.test.ts": {
-    "reason": "A spawned agent must receive the activation window, editor executable, and command search path. Self-compaction crosses native background settlement, response retention for provider turns, and workspace scope recovery. Initial naming must recheck ownership after host waits and serialize after reader renames. Native session skill admission must run before every live and idle construction and refuse actual policy without replacement or input. Live question recovery must block uncertain native writes. Remote Control results must follow a Claude clear, and an exited or retired child must take its connection with it. Independent session hooks must retain the selected environment and bypass neither personal skills nor native hook policy.",
-    "cases": 321,
-    "matricesSha256": "4f25c542d329f02be5898bd76e0125f19215544cf274c353c7bf8dc07ce241cd"
+    "reason": "A spawned agent must receive the activation window, editor executable, session token, and command search path. Self-compaction crosses native background settlement and workspace scope recovery. Initial naming must recheck ownership after host waits and serialize after reader renames. Native session skill admission must run before every live and idle construction and refuse actual policy without replacement or input. Live question recovery must block uncertain native writes. Remote Control results must follow a Claude clear, and an exited or retired child must take its connection with it. Independent session hooks must retain the selected environment and bypass neither personal skills nor native hook policy.",
+    "cases": 322,
+    "matricesSha256": "8a9b18a95be49e7ce361c0d146abd9e8916a2bb25b8cb8a01cfae77171f56371"
   },
   "extension/src/chrome.browser.test.ts": {
     "reason": "Panel controls must preserve native focus, keyboard handling, and browser event delivery.",
@@ -127,7 +127,7 @@
   "extension/src/panel.webview.test.ts": {
     "reason": "Real progressive workers must deliver bounded recovery and metadata through the production panel host. Start metadata must survive storage delays, hidden panels, preference resets, and reloads. File presses and Open the changes must preserve recorded parent and subagent changes after their worktree disappears. Commit presses must never open an unrelated repository after their worktree disappears. Reader sends must release held compaction after drops without overtaking surviving input. Each Prompt box must retain its supplying child definition across sibling catalogs, idle updates, and child replacement. The Remote Control item must follow connection results and never reach saved drafts. Row posts and watcher decisions must reach the performance counters with their causes through the production host methods. A catalog refresh must name why it could not reuse the held catalog. A catalog refresh must admit settled sessions without a file check after a walk or with the held catalog, and recheck moved or replaced ones. Each prompt admission file check must name its cause. One spend update must check each child file once and publish dispatched costs once, and an integrity check that queues nothing must not publish them. The query context revision must follow both memberships as a short digest. A prompt box send must reach its session through a repository scope walk only while the latest walk holds the same source, and every return to the box must say why. A background Claude subagent that discovery has not listed must read running while its own file is fresh, and no ending recorded when that file is stale, missing, or beside a copied parent.",
     "cases": 660,
-    "matricesSha256": "6b6953073ffed45a33983d641e93cc05c64ec246b6e7f3f90e82993d7c6b25d3"
+    "matricesSha256": "4ea76ed0b7e8ea27c966d13f6f004e3991038697f57ca79514eb23911cf03306"
   },
   "extension/src/panelbundle.test.ts": {
     "reason": "The panel bundle and fixture must contain the production entry, source identity, and substituted text.",

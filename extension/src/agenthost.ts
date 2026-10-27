@@ -15,7 +15,7 @@ import { CONTEXT_FRAME_BYTES, CONTEXT_PREFIX_BYTES, type ContextFrameGate } from
 import { spawn as nodeSpawn } from 'node:child_process';
 import { readFileSync, statSync } from 'node:fs';
 import { join, type PlatformPath } from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { defaultsKey } from './configwatch';
 import { parseEnv } from 'node:util';
 import {
@@ -98,6 +98,8 @@ export type Spawner = (
   agent?: AgentName,
   cli?: ArcCliEnvironment,
   inherited?: NodeJS.ProcessEnv,
+  // The secret that names this agent process to the Arc command line it runs.
+  sessionToken?: string,
 ) => ChildLike;
 
 // Returns a refusal for Windows batch shims, which cannot be spawned directly without a shell.
@@ -137,6 +139,7 @@ export interface ArcCliEnvironment {
   editorExecutable: string;
   windowId: string | null;
   platform?: string;
+  sessionToken?: string;
 }
 
 export function childEnv(
@@ -169,6 +172,7 @@ export function childEnv(
   if (cli) {
     const windowKey = `${ARC_IDENTITY.environmentPrefix}WINDOW`;
     const editorKey = `${ARC_IDENTITY.environmentPrefix}EDITOR_EXECUTABLE`;
+    const tokenKey = `${ARC_IDENTITY.environmentPrefix}SESSION_TOKEN`;
     const pathKeys = (source: Record<string, string | undefined>) => environmentKeys(source, 'PATH');
     const inheritedKey = pathKeys(inherited)[0];
     const wantedKey = pathKeys(wanted)[0];
@@ -176,10 +180,11 @@ export function childEnv(
     for (const key of pathKeys(env)) delete env[key];
     env[inheritedKey ?? 'PATH'] = cli.directory + (value ? (windows ? ';' : ':') + value : '');
     for (const key of Object.keys(env)) {
-      if ([windowKey, editorKey].includes(key.toUpperCase())) delete env[key];
+      if ([windowKey, editorKey, tokenKey].includes(key.toUpperCase())) delete env[key];
     }
     env[editorKey] = windows ? cli.editorExecutable.replaceAll('\\', '/') : cli.editorExecutable;
     if (cli.windowId !== null) env[windowKey] = cli.windowId;
+    if (cli.sessionToken !== undefined) env[tokenKey] = cli.sessionToken;
   }
   // The editor environment takes precedence over the session directory's billing selector.
   const selectorKey = Object.keys(inherited).find(
@@ -226,8 +231,16 @@ export const spawnCli: Spawner = (command, args, cwd, env, agent, cli, inherited
 };
 
 export function arcCliSpawner(environment: () => ArcCliEnvironment, spawner: Spawner = spawnCli): Spawner {
-  return (command, args, cwd, env, agent, _cli, inherited) =>
-    spawner(command, args, cwd, env, agent, environment(), inherited);
+  return (command, args, cwd, env, agent, _cli, inherited, sessionToken) =>
+    spawner(
+      command,
+      args,
+      cwd,
+      env,
+      agent,
+      sessionToken === undefined ? environment() : { ...environment(), sessionToken },
+      inherited,
+    );
 }
 
 export type AgentName = 'claude' | 'codex';
@@ -1023,6 +1036,8 @@ export class AgentSession {
   }
 
   readonly usageSource = ++nextUsageSource;
+  // A fresh secret for each spawned process. The Arc command line that the process runs sends it back.
+  readonly token = randomBytes(16).toString('hex');
   readonly key: string;
   readonly agent: AgentName;
   readonly cwd: string;
@@ -1115,7 +1130,16 @@ export class AgentSession {
       (line) => this.child.stdin.write(line),
       (event) => this.handle(event),
     );
-    this.child = spawner(plan.command, plan.args, plan.cwd, plan.env, plan.agent, undefined, plan.inheritedEnvironment);
+    this.child = spawner(
+      plan.command,
+      plan.args,
+      plan.cwd,
+      plan.env,
+      plan.agent,
+      undefined,
+      plan.inheritedEnvironment,
+      this.token,
+    );
 
     const out = new LineReader(
       (line) => this.driver.receive(line),
@@ -3304,6 +3328,12 @@ export class AgentHost {
         return session;
       }
     }
+    return null;
+  }
+
+  // The live session whose process environment holds this token.
+  findByToken(token: string): AgentSession | null {
+    for (const session of this.sessions.values()) if (session.token === token) return session;
     return null;
   }
 
