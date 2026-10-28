@@ -3769,10 +3769,13 @@ export class PanelProvider implements vscode.Disposable {
     const batch = this.pendingWatch.take();
     const catalog = this.catalog?.sessions ?? [];
     const known = new Set(catalog.map((session) => normalizeFsPath(session.file)));
+    const walked = this.currentWalkedCatalog();
+    const walkListed = new Set(walked?.sessions.map((session) => normalizeFsPath(session.file)));
     const decision = watcherRefreshDecision(
       batch,
       (file) => known.has(normalizeFsPath(file)),
       sessionDirectoryOwners(catalog, normalizeFsPath),
+      (file) => walkListed.has(normalizeFsPath(file)),
     );
     const reason = batch.reasons.length ? batch.reasons.join('+') : 'watcher';
     const started = performance.now();
@@ -3796,7 +3799,14 @@ export class PanelProvider implements vscode.Disposable {
         durationMs: performance.now() - started,
       },
       unknownPaths,
+      decision.walkListedPaths,
     );
+  }
+
+  // The last walk, when it listed the current repository roots.
+  private currentWalkedCatalog(): { scope: string; sessions: SessionFile[] } | null {
+    const walk = this.walkedCatalog;
+    return walk?.scope === JSON.stringify(this.repositoryScopeRoots ?? []) ? walk : null;
   }
 
   // Reveal the existing editor tab, or create and adopt one when none is held.
@@ -11957,22 +11967,44 @@ export class PanelProvider implements vscode.Disposable {
         ? this.catalog.sessions.filter((session) => session.sessionId === this.showing).map((session) => session.file)
         : [];
       const named = [...new Set([...this.targetedRefreshPaths, ...selected])];
-      const held = revalidatedCatalogPaths(this.catalog.sessions, named, (file) => {
+      const statOf = (file: string) => {
         try {
           return fileRevisionOf(fs.statSync(file, { bigint: true }));
         } catch {
           return null;
         }
-      });
-      if (held) {
+      };
+      // A named file that the last walk listed and the held catalog lacks revalidates its walked row, and the row joins
+      // the listing as it does after a walk. Prompt admission then decides it as in a walk, and discovery progress keeps
+      // only accepted rows. Each walked parent stays in the next discovery request.
+      const walk = this.currentWalkedCatalog();
+      const heldFiles = new Set(this.catalog.sessions.map((session) => normalizeFsPath(session.file)));
+      const walkedFiles = new Set(walk?.sessions.map((session) => normalizeFsPath(session.file)));
+      const walkNamed = named.filter(
+        (file) => !heldFiles.has(normalizeFsPath(file)) && walkedFiles.has(normalizeFsPath(file)),
+      );
+      const heldNamed = named.filter((file) => !walkNamed.includes(file));
+      const held = heldNamed.length
+        ? revalidatedCatalogPaths(this.catalog.sessions, heldNamed, statOf)
+        : [...this.catalog.sessions];
+      const walked =
+        walk && walkNamed.length ? revalidatedCatalogPaths(walk.sessions, walkNamed, statOf) : walk?.sessions;
+      if (held && walked !== null) {
+        if (walk && walked && walked !== walk.sessions) this.walkedCatalog = { ...walk, sessions: walked };
+        const joining = new Set(walkNamed.map(normalizeFsPath));
+        const listing = [...held, ...(walked ?? []).filter((session) => joining.has(normalizeFsPath(session.file)))];
         const admitted = deferHumanPrompts
-          ? held
-          : held.filter(
+          ? listing
+          : listing.filter(
               (session) =>
                 session.agent !== 'claude' || session.childTranscript === true || this.hasHumanPrompt(session),
             );
         const sorted = orderSessionCatalog(admitted, (session) => this.activityFor(session));
-        this.claudeParents = sorted.filter((session) => session.childTranscript !== true);
+        const listed = new Set(sorted.map((session) => normalizeFsPath(session.file)));
+        this.claudeParents = [
+          ...sorted,
+          ...(walked ?? []).filter((session) => !listed.has(normalizeFsPath(session.file))),
+        ].filter((session) => session.childTranscript !== true);
         this.catalog = { folders: folderPrint, sessions: sorted };
         this.catalogWalked = false;
         return sorted;

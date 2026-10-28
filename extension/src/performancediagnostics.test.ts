@@ -197,6 +197,7 @@ test('performance counters correlate posts and replies for every open panel', ()
     watcherDecisions: {
       targeted: 1,
       broad: 1,
+      walkListedPaths: 0,
       broadReasons: { createOrRename: 1, missingFilename: 1 },
       unknownPathShapes: {},
       unknownPathExtensions: {},
@@ -267,6 +268,7 @@ test('the saved snapshot carries refresh stages, discovery, decisions, row posts
   assert.deepEqual(projected.counters.watcherDecisions, {
     targeted: 0,
     broad: 1,
+    walkListedPaths: 0,
     broadReasons: { unknownPath: 1 },
     unknownPathShapes: { walkedUnlistedCodex: 1, newBesideClaudeTranscript: 1 },
     unknownPathExtensions: { '.jsonl': 2 },

@@ -265,6 +265,7 @@ test('four known watcher files produce one targeted batch with four paths', () =
       changedPaths: batches[0].changedPaths,
       broadReasons: [],
       ownedPaths: 0,
+      walkListedPaths: 0,
       unknownPaths: [],
     },
   );
@@ -280,6 +281,7 @@ test('unknown filenames and rename events retain the broad watcher path and name
       changedPaths: [],
       broadReasons: ['missingFilename'],
       ownedPaths: 0,
+      walkListedPaths: 0,
       unknownPaths: [],
     },
   );
@@ -307,6 +309,7 @@ test('unknown filenames and rename events retain the broad watcher path and name
       changedPaths: [],
       broadReasons: ['noPaths'],
       ownedPaths: 0,
+      walkListedPaths: 0,
       unknownPaths: [],
     },
   );
@@ -334,6 +337,7 @@ test('live activity with no card names listed transcripts and draws only for a s
       changedPaths: ['listed-continued.jsonl', 'listed.jsonl'],
       broadReasons: [],
       ownedPaths: 0,
+      walkListedPaths: 0,
       unknownPaths: [],
     },
     'a session with two listed transcripts did not name both',
@@ -357,6 +361,7 @@ test('live activity with no card names listed transcripts and draws only for a s
       changedPaths: [],
       broadReasons: ['activityFallbackNoFile'],
       ownedPaths: 0,
+      walkListedPaths: 0,
       unknownPaths: [],
     },
   );
@@ -504,6 +509,7 @@ test('a Windows rename event for a new child transcript under a listed session r
     changedPaths: [parent],
     broadReasons: [],
     ownedPaths: 1,
+    walkListedPaths: 0,
     unknownPaths: [],
   });
 
@@ -519,6 +525,46 @@ test('a Windows rename event for a new child transcript under a listed session r
   const stray = new PendingWatcherWake();
   stray.noteFileEvent('C:\\elsewhere', 'other.jsonl', 'change', normalize);
   assert.deepEqual(watcherRefreshDecision(stray.take(), known, owners).broadReasons, ['unknownPath']);
+});
+
+test('a path that the last walk listed and the held catalog lacks is targeted, and a path in neither walks', () => {
+  // The batch spells each path with forward slashes on every host.
+  const slash = (file: string) => file.replace(/\\/g, '/');
+  const known = (file: string) => file === 'records/held.jsonl';
+  const walked = (file: string) => file === 'records/walked.jsonl';
+  const listed = new PendingWatcherWake();
+  listed.noteFileEvent('records', 'walked.jsonl', 'change', slash);
+  listed.noteFileEvent('records', 'held.jsonl', 'change', slash);
+  assert.deepEqual(
+    watcherRefreshDecision(listed.take(), known, () => null, walked),
+    {
+      kind: 'targeted',
+      changedPaths: ['records/held.jsonl', 'records/walked.jsonl'],
+      broadReasons: [],
+      ownedPaths: 0,
+      walkListedPaths: 1,
+      unknownPaths: [],
+    },
+  );
+  // One path in neither catalog makes the whole batch one walk.
+  const mixed = new PendingWatcherWake();
+  mixed.noteFileEvent('records', 'walked.jsonl', 'change', slash);
+  mixed.noteFileEvent('records', 'stray.jsonl', 'change', slash);
+  assert.deepEqual(
+    watcherRefreshDecision(mixed.take(), known, () => null, walked),
+    {
+      kind: 'broad',
+      changedPaths: [],
+      broadReasons: ['unknownPath'],
+      ownedPaths: 0,
+      walkListedPaths: 0,
+      unknownPaths: ['records/stray.jsonl'],
+    },
+  );
+  // A walk-listed path in a create or rename event walks, as a held path does.
+  const renamed = new PendingWatcherWake();
+  renamed.noteFileEvent('records', 'walked.jsonl', 'rename', slash);
+  assert.deepEqual(watcherRefreshDecision(renamed.take(), known, () => null, walked).broadReasons, ['createOrRename']);
 });
 
 // One source layout per platform. The changed paths spell the walked files in another case, so the walked-file shapes

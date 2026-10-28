@@ -38660,6 +38660,7 @@ test('row posts and watcher decisions reach the performance counters with their 
   assert.deepEqual(decisions, {
     targeted: 0,
     broad: 1,
+    walkListedPaths: 0,
     broadReasons: { createOrRename: 1 },
     unknownPathShapes: {},
     unknownPathExtensions: {},
@@ -38669,14 +38670,14 @@ test('row posts and watcher decisions reach the performance counters with their 
   assert.equal(last?.decision, 'broad');
   assert.deepEqual(last?.broadReasons, ['createOrRename']);
 
-  // Appends to a file the last walk listed and the held catalog dropped, to a file the walk enumerated and did not
-  // list, and to a file beside a listed transcript, all walk. The capture names the shape and extension of each such
-  // path, and never the path.
+  // Appends to a file that a walk under other roots listed and the held catalog dropped, to a file the walk enumerated
+  // and did not list, and to a file beside a listed transcript, all walk. The capture names the shape and extension of
+  // each such path, and never the path.
   const unknownPathProject = '/sources/claude/project';
   const listedRow = { agent: 'claude', file: `${unknownPathProject}/listed.jsonl`, sessionId: 'listed' };
   const droppedRow = { agent: 'claude', file: `${unknownPathProject}/dropped.jsonl`, sessionId: 'dropped' };
   const heldCatalog = { folders: 'root', sessions: [listedRow] };
-  const walkedCatalog = { scope: '[]', sessions: [listedRow, droppedRow] };
+  const walkedCatalog = { scope: JSON.stringify(['/other']), sessions: [listedRow, droppedRow] };
   const sourceEnumerations = {
     claude: {
       status: 'complete',
@@ -38707,6 +38708,7 @@ test('row posts and watcher decisions reach the performance counters with their 
   assert.deepEqual(snapshot.watcherDecisions, {
     targeted: 0,
     broad: 3,
+    walkListedPaths: 0,
     broadReasons: { createOrRename: 1, unknownPath: 2 },
     unknownPathShapes: { walkListedNotHeld: 1, walkedUnlistedClaude: 1, newBesideClaudeTranscript: 2 },
     unknownPathExtensions: { '.jsonl': 4 },

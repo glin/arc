@@ -1609,6 +1609,7 @@ function completeDiscoveryHarness(
     );
   }
   if (names.includes('allSessions')) names.push('walkedSessions');
+  if (names.includes('allSessions') || names.includes('runPendingWatch')) names.push('currentWalkedCatalog');
   if (names.includes('prepareClaudeChildren')) names.push('startedSources');
   names.push('walkCatalog');
   const body = owner.members
@@ -7346,6 +7347,85 @@ test('a new transcript that a watcher walk listed makes no poll walk', async () 
     await poll();
     await poll();
     assert.deepEqual(walks(), { 'walk:requested:startup': 1, 'walk:requested:transcript': 1 });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+// Discovery that reports progress and never completes, as in a window where discovery has not published. Each request
+// keeps only the accepted rows, as `prepareClaudeChildren` does, and records the parents it was sent.
+function discoveryInProgress(provider: any): SessionFile[][] {
+  const parents: SessionFile[][] = [];
+  provider.prepareClaudeChildren = () => {
+    parents.push(provider.claudeParents);
+    provider.discoveryComplete = undefined;
+    provider.catalog = { ...provider.catalog, sessions: provider.authoritativeCatalog };
+    return Promise.resolve(true);
+  };
+  return parents;
+}
+
+test('a write to a session that the walk listed and discovery has not accepted refreshes it without a walk', async () => {
+  const { provider, project, create, start, watch, walks, listed, counters } = pollWalkHarness();
+  try {
+    await start();
+    const accept = provider.prepareClaudeChildren;
+    const parents = discoveryInProgress(provider);
+    const late = create(path.join(project, 'late.jsonl'));
+    const quiet = create(path.join(project, 'quiet.jsonl'));
+    await watch([
+      [late, 'rename'],
+      [quiet, 'rename'],
+    ]);
+    assert.ok(!listed(late), 'discovery accepted the new session while it reported progress');
+    fs.appendFileSync(late, '{"type":"assistant"}\n');
+    await watch([[late, 'change']]);
+    assert.deepEqual(walks(), { 'walk:requested:startup': 1, 'walk:requested:transcript': 1 });
+    assert.equal(counters.snapshot().watcherDecisions.walkListedPaths, 1);
+    const sent = parents.at(-1)?.find((row) => normalizeFsPath(row.file) === normalizeFsPath(late));
+    assert.equal(sent?.size, fs.statSync(late).size, 'the discovery request carried the old size of the new session');
+    assert.ok(
+      parents.at(-1)?.some((row) => normalizeFsPath(row.file) === normalizeFsPath(quiet)),
+      'the discovery request dropped a session that the walk listed and the wake did not name',
+    );
+    // Once discovery accepts it, the row lists with its newest turn, still without a walk.
+    provider.prepareClaudeChildren = accept;
+    fs.appendFileSync(late, '{"type":"assistant"}\n');
+    await watch([[late, 'change']]);
+    const row = provider.authoritativeCatalog.find(
+      (session: SessionFile) => normalizeFsPath(session.file) === normalizeFsPath(late),
+    );
+    assert.equal(row?.size, fs.statSync(late).size, 'the accepted row missed the newest turn');
+    assert.deepEqual(walks(), { 'walk:requested:startup': 1, 'walk:requested:transcript': 1 });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('a watcher batch with a file in neither catalog walks once, with or without a walk-listed file', async () => {
+  const { provider, project, create, start, watch, walks, listed, counters } = pollWalkHarness();
+  const stranger = (name: string) => {
+    const file = path.join(project, name);
+    fs.writeFileSync(file, '{"type":"user"}\n');
+    return file;
+  };
+  try {
+    await start();
+    discoveryInProgress(provider);
+    const late = create(path.join(project, 'late.jsonl'));
+    await watch([[late, 'rename']]);
+    const alone = stranger('alone.jsonl');
+    await watch([[alone, 'change']]);
+    assert.deepEqual(walks(), { 'walk:requested:startup': 1, 'walk:requested:transcript': 2 });
+    const mixed = stranger('mixed.jsonl');
+    fs.appendFileSync(late, '{"type":"assistant"}\n');
+    await watch([
+      [late, 'change'],
+      [mixed, 'change'],
+    ]);
+    assert.deepEqual(walks(), { 'walk:requested:startup': 1, 'walk:requested:transcript': 3 });
+    assert.ok(!listed(late) && !listed(mixed), 'discovery accepted a session while it reported progress');
+    assert.deepEqual(counters.snapshot().watcherDecisions.broadReasons, { createOrRename: 1, unknownPath: 2 });
   } finally {
     vi.useRealTimers();
   }

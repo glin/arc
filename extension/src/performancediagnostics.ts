@@ -41,10 +41,12 @@ export interface WatcherOperation {
 
 // Decisions since activation. A broad decision with two causes counts under both causes and once as broad.
 // `unknownPathShapes` and `unknownPathExtensions` count each path that decided `unknownPath`, so a decision with two
-// such paths counts twice in each. Neither keeps the path.
+// such paths counts twice in each. Neither keeps the path. `walkListedPaths` counts each path that a targeted decision
+// admitted because the last walk listed it and the held catalog did not.
 export interface WatcherDecisionCounts {
   targeted: number;
   broad: number;
+  walkListedPaths: number;
   broadReasons: Record<string, number>;
   unknownPathShapes: Record<string, number>;
   unknownPathExtensions: Record<string, number>;
@@ -318,6 +320,7 @@ export class PanelPerformanceCounters {
   private readonly watcherDecisions: WatcherDecisionCounts = {
     targeted: 0,
     broad: 0,
+    walkListedPaths: 0,
     broadReasons: {},
     unknownPathShapes: {},
     unknownPathExtensions: {},
@@ -464,13 +467,16 @@ export class PanelPerformanceCounters {
     this.work.set(name, (this.work.get(name) ?? 0) + count);
   }
 
-  // `unknownPaths` holds the shape and extension of each path that decided `unknownPath`.
+  // `unknownPaths` holds the shape and extension of each path that decided `unknownPath`. `walkListedPaths` counts the
+  // paths that the decision admitted from the last walk.
   recordWatcherOperation(
     operation: Omit<WatcherOperation, 'id'>,
     unknownPaths: readonly { shape: string; extension: string }[] = [],
+    walkListedPaths = 0,
   ): void {
     this.watcherOperationCount++;
     this.watcherDecisions[operation.decision]++;
+    this.watcherDecisions.walkListedPaths += walkListedPaths;
     for (const reason of operation.broadReasons) {
       this.watcherDecisions.broadReasons[reason] = (this.watcherDecisions.broadReasons[reason] ?? 0) + 1;
     }
@@ -523,6 +529,7 @@ export class PanelPerformanceCounters {
       watcherDecisions: {
         targeted: this.watcherDecisions.targeted,
         broad: this.watcherDecisions.broad,
+        walkListedPaths: this.watcherDecisions.walkListedPaths,
         broadReasons: { ...this.watcherDecisions.broadReasons },
         unknownPathShapes: { ...this.watcherDecisions.unknownPathShapes },
         unknownPathExtensions: { ...this.watcherDecisions.unknownPathExtensions },
@@ -682,6 +689,7 @@ export function projectPerformanceDiagnostics(state: PerformanceDiagnosticState,
       watcherDecisions: {
         targeted: state.counters.watcherDecisions.targeted,
         broad: state.counters.watcherDecisions.broad,
+        walkListedPaths: state.counters.watcherDecisions.walkListedPaths,
         broadReasons: { ...state.counters.watcherDecisions.broadReasons },
         unknownPathShapes: { ...state.counters.watcherDecisions.unknownPathShapes },
         unknownPathExtensions: { ...state.counters.watcherDecisions.unknownPathExtensions },

@@ -395,7 +395,8 @@ export function sessionDirectoryOwners(
 
 // Where a path outside the held catalog sits, so a counter can say which files keep the catalog walking. The first
 // shape that matches decides.
-// `walkListedNotHeld`: the last walk listed the file, and the held catalog no longer lists it.
+// `walkListedNotHeld`: a walk under other repository roots listed the file, and the held catalog does not list it. A
+// walk under the current roots admits its listed files to a targeted decision.
 // `walkedUnlistedChild`, `walkedUnlistedClaude` and `walkedUnlistedCodex`: the last walk's file list holds the file, a
 // child transcript in a `subagents` directory, another Claude file or a rollout, and the walk did not list it.
 // `newBesideClaudeTranscript`, `newBesideChildTranscript` and `newBesideCodexRollout`: the last walk's file list does not
@@ -478,18 +479,22 @@ export function unknownPathExtension(file: string): '.jsonl' | 'other' {
 // The decision names why it walks, so a counter can say which cause keeps the catalog walking. A path outside the held
 // catalog that a listed session's directory holds, such as a new child transcript, revalidates that session's files
 // instead. The refresh that follows still sends child discovery, which lists a child that its parent records.
-// `ownedPaths` counts those paths. `unknownPaths` names the paths that decided `unknownPath`.
+// `ownedPaths` counts those paths. A path that the last walk listed and the held catalog lacks, such as a session that
+// discovery has not accepted yet, is named as it is, and the refresh revalidates the walked row. `walkListedPaths`
+// counts those paths. `unknownPaths` names the paths that decided `unknownPath`.
 // A created or moved path that no listed session owns walks, and so does a listed path that moved, because a walk is
 // the read that finds additions, removals and replacements.
 export function watcherRefreshDecision(
   batch: WatcherWakeBatch,
   knownPath: (file: string) => boolean,
   ownersOf: (file: string) => string[] | null = () => null,
+  walkListed: (file: string) => boolean = () => false,
 ): {
   kind: 'broad' | 'targeted';
   changedPaths: string[];
   broadReasons: WatcherBroadReason[];
   ownedPaths: number;
+  walkListedPaths: number;
   unknownPaths: string[];
 } {
   const created = new Set(batch.createdPaths);
@@ -510,16 +515,25 @@ export function watcherRefreshDecision(
       changedPaths: [],
       broadReasons: broadReasons.length ? broadReasons : ['unspecified'],
       ownedPaths: 0,
+      walkListedPaths: 0,
       unknownPaths: [],
     };
   }
   if (batch.changedPaths.length === 0) {
-    return { kind: 'broad', changedPaths: [], broadReasons: ['noPaths'], ownedPaths: 0, unknownPaths: [] };
+    return {
+      kind: 'broad',
+      changedPaths: [],
+      broadReasons: ['noPaths'],
+      ownedPaths: 0,
+      walkListedPaths: 0,
+      unknownPaths: [],
+    };
   }
   const broadReasons = new Set<WatcherBroadReason>();
   const changedPaths = new Set<string>();
   const unknownPaths: string[] = [];
   let ownedPaths = 0;
+  let walkListedPaths = 0;
   for (const file of batch.changedPaths) {
     const owners = ownerFiles(file);
     if (owners) {
@@ -529,15 +543,32 @@ export function watcherRefreshDecision(
       broadReasons.add('createOrRename');
     } else if (knownPath(file)) {
       changedPaths.add(file);
+    } else if (walkListed(file)) {
+      walkListedPaths++;
+      changedPaths.add(file);
     } else {
       broadReasons.add('unknownPath');
       unknownPaths.push(file);
     }
   }
   if (broadReasons.size) {
-    return { kind: 'broad', changedPaths: [], broadReasons: [...broadReasons].sort(), ownedPaths: 0, unknownPaths };
+    return {
+      kind: 'broad',
+      changedPaths: [],
+      broadReasons: [...broadReasons].sort(),
+      ownedPaths: 0,
+      walkListedPaths: 0,
+      unknownPaths,
+    };
   }
-  return { kind: 'targeted', changedPaths: [...changedPaths].sort(), broadReasons: [], ownedPaths, unknownPaths: [] };
+  return {
+    kind: 'targeted',
+    changedPaths: [...changedPaths].sort(),
+    broadReasons: [],
+    ownedPaths,
+    walkListedPaths,
+    unknownPaths: [],
+  };
 }
 
 // How long a catalog refresh holds the triggers that wait behind it. After this, the next waiting
