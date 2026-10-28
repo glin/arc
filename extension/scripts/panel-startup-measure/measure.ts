@@ -1072,9 +1072,8 @@ async function measure(commandLine: string, workspace: string, options: Options)
   let lock;
   let suite;
   try {
-    // Wait for memory before taking the locks, so a long wait never blocks a test run.
-    await awaitMachine(options.minimumFreeGb, 30 * 60_000);
-    // A measured launch holds the machine suite lock, so no multi-lane test run overlaps it.
+    // A measured launch holds the machine suite lock, so no multi-lane test run overlaps it. The runner waits for the
+    // lock like any suite does. A wait for idle before the lock never ends while suites hand the lock to each other.
     suite = await acquireSuiteLock({ deadlineMs: loadSettings().deadlineMs });
     lock = await acquireBrowserLock({ deadlineMs: timeoutMs, observation });
     const logs = path.join(ARC_STORE, DIAGNOSTICS_LOG_DIRECTORY);
