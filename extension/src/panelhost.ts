@@ -1966,6 +1966,9 @@ export class PanelProvider implements vscode.Disposable {
   private typedRenames = new Map<string, number>();
   // Pending prompt and compaction activity by session, ordered oldest first. `pressesAfter` reconciles it with recorded turns.
   private live: Record<string, LivePress[]> = {};
+  // Compactions a live child runs on its own, by session, with their start time and active items. A Claude
+  // compaction holds one empty item. This display state stays outside `live`, so no press rule reads it.
+  private automaticCompactions?: Map<string, { agent: AgentKind; at: number; items: Set<string> }>;
   private responseRates: import('./outputrate').ResponseRate[] = [];
   // A clear is complete only after the agent accepts it and names its successor. Claude
   // reports those in separate events. Codex names the successor before its request resolves.
@@ -4938,6 +4941,10 @@ export class PanelProvider implements vscode.Disposable {
       nextTurn: runtime?.nextTurn ?? null,
       // Pending live activity for this session, projected into cards by `composerview.ts`.
       live: this.live[row.id] ?? [],
+      // A held compaction press already has its card, and a failed one keeps its notice, so it hides the automatic card.
+      automaticCompaction: (this.live[row.id] ?? []).some((press) => press.kind === 'compact')
+        ? null
+        : (this.automaticCompactions?.get(row.id) ?? null),
       asks: this.asks.filter((entry) => entry.session === row.id).map((entry) => entry.ask),
     };
   }
@@ -5874,6 +5881,14 @@ export class PanelProvider implements vscode.Disposable {
     const now = Date.now();
     const keys = [...this.running];
     let swept = false;
+    // An automatic compaction ends with its record or with the running state, like a reader compaction.
+    for (const [session, automatic] of this.automaticCompactions ?? []) {
+      const seen = this.newestCompactionBySession.get(session)?.at ?? null;
+      if ((seen !== null && seen >= automatic.at) || !sessionRunning(keys, automatic.agent, session)) {
+        this.automaticCompactions!.delete(session);
+        swept = true;
+      }
+    }
     for (const [session, held] of Object.entries(this.live)) {
       const left = held.filter((press) => {
         // A compaction is not a turn, so the two are matched against different records.
@@ -8321,6 +8336,27 @@ export class PanelProvider implements vscode.Disposable {
             ? { delivered: true, reason: '', turnId: outcome.turnId }
             : { delivered: true, reason: '' },
       );
+  }
+
+  // Show or end a compaction the agent runs on its own inside a running turn. Codex can run more than one
+  // compaction item at once, so the card stays until the last one ends.
+  public noteAutomaticCompaction(
+    agent: AgentKind,
+    session: string,
+    edge: 'start' | 'end',
+    itemId: string | null,
+  ): void {
+    const item = itemId ?? '';
+    const held = this.automaticCompactions?.get(session);
+    if (edge === 'start') {
+      if (held?.items.has(item)) return;
+      if (held) held.items.add(item);
+      else (this.automaticCompactions ??= new Map()).set(session, { agent, at: Date.now(), items: new Set([item]) });
+    } else {
+      if (!held?.items.delete(item)) return;
+      if (!held.items.size) this.automaticCompactions!.delete(session);
+    }
+    void this.post({ type: 'usage', usage: this.usagePayload() });
   }
 
   // `prompted` marks a compaction the reader typed in the Prompt box. It is recorded once the agent accepts it.

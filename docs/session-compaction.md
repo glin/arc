@@ -42,7 +42,7 @@ Admit one pending request per exact turn within active capacity. A request witho
 
 Deliver after the requesting turn ends, with or without success. The final response does not need to reach the panel first. Admission needs only the live child. Delivery waits until the session is idle and ready, with no open ask, no pending reader work, and no unresolved earlier compaction. Claude background acknowledgments bind task IDs without settling commands. Only matching terminal notices settle them. Parse user-form notices with the shared strict task-tag parser. System notices use structured fields. Retain root tool owners across later turns. Synchronous endings follow the current shared response owner. Retain direct Bash starts because results can establish background execution.
 
-Agent-requested delivery shows the live compaction card that a reader-started compaction shows. That card does not hold the request's continuation or queued agent messages.
+Agent-requested delivery shows the live compaction card that a reader-started compaction shows. That card does not hold the request's continuation or queued agent messages. An automatic compaction in a live child that Arc drives shows the same card in its running state, below the live prompt cards, without controls. That card holds no prompt, continuation, or queued message. It ends when the provider ends the compaction, when the session records the compaction, or when the session stops running.
 
 ### Reader actions and delivery
 

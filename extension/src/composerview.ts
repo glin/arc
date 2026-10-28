@@ -719,6 +719,9 @@ export interface ComposerState {
   // Pending presses, oldest first. A compaction and a prompt queued behind it
   // remain separate operations.
   live: readonly LivePress[];
+  // A compaction the agent runs on its own inside a running turn, with its start time. It is not a press, so it
+  // changes no input, queue, or reply rule. Null or absent when none runs or a compaction press already shows.
+  automaticCompaction?: { at: number } | null;
   // Open requests for this session. The wire normalizes them. The host removes
   // them after an accepted answer or the turn ends.
   asks?: readonly Ask[];
@@ -3681,11 +3684,7 @@ function liveStatus(kind: LiveKind, state: LiveState, name: string, waiting: boo
 }
 
 // Build a temporary timeline card from the submission, current settings, and response state.
-function liveCard(state: ComposerState, press: LivePress, name: string, now: number): ComposerLive | null {
-  // Mid-turn prompts use the running turn's card. Failed deliveries retain a separate notice.
-  if (press.midTurn && !press.failed) {
-    return null;
-  }
+function liveCard(state: ComposerState, press: LivePress, name: string, now: number): ComposerLive {
   const which = liveState(press, state.running);
   // A prompt waits when the session runs but it has neither started nor received reply text.
   const waiting = press.kind === 'prompt' && which === 'running' && !press.started && press.reply === '';
@@ -3741,13 +3740,30 @@ function liveCard(state: ComposerState, press: LivePress, name: string, now: num
 }
 
 // Draw visible temporary cards newest first. Different submission kinds retain separate cards.
+// An automatic compaction draws below them in the running state, without controls.
 function liveCards(state: ComposerState, name: string, now: number): ComposerLive[] {
   const cards: ComposerLive[] = [];
   for (const press of state.live) {
-    const card = liveCard(state, press, name, now);
-    if (card) {
-      cards.unshift(card);
-    }
+    // Mid-turn prompts use the running turn's card. Failed deliveries retain a separate notice.
+    if (press.midTurn && !press.failed) continue;
+    cards.unshift(liveCard(state, press, name, now));
+  }
+  const automatic = state.automaticCompaction;
+  if (automatic) {
+    const press: LivePress = {
+      sessionId: state.sessionId,
+      agent: state.agent,
+      kind: 'compact',
+      text: '',
+      at: automatic.at,
+      reply: '',
+      midTurn: false,
+      ran: true,
+      started: true,
+      failed: false,
+      reason: '',
+    };
+    cards.push(liveCard({ ...state, running: true }, press, name, now));
   }
   return cards;
 }

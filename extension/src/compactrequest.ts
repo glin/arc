@@ -376,31 +376,35 @@ export class CompactRequests {
 
   // Routes native compaction evidence to the one operation whose submission generation it names.
   // It never changes an unsubmitted assignment or another submitted operation.
-  observeSubmitted(event: NativeEvent, childGeneration: number): void {
+  // Returns true when an unfinished operation took the compaction evidence. A finished operation still receives it,
+  // so a conflicting outcome can reach the request, but the evidence belongs to a later turn.
+  observeSubmitted(event: NativeEvent, childGeneration: number): boolean {
     const owns = (assignment: Assignment) =>
       assignment.submitted &&
       !assignment.retired &&
       assignment.binding.provider === event.provider &&
       assignment.binding.sessionId === event.sessionId &&
       assignment.binding.childGeneration === childGeneration;
-    if (event.generation === null) return;
+    if (event.generation === null) return false;
     if (event.kind === 'submission') {
       const claiming = this.claiming;
-      if (!claiming || !owns(claiming)) return;
+      if (!claiming || !owns(claiming)) return false;
       this.claiming = null;
       if (event.text === '/compact' && claiming.operation) claiming.operation.generation = event.generation;
       if (claiming.observation.continuation) {
         claiming.observation = { ...claiming.observation, compactGeneration: event.generation };
         void this.persist(claiming).catch(() => {});
       }
-      return;
+      return false;
     }
-    if (event.kind !== 'compact') return;
+    if (event.kind !== 'compact') return false;
     for (const assignment of this.assignments.values())
       if (owns(assignment) && assignment.operation?.generation === event.generation) {
+        const open = !assignment.operation.finished;
         assignment.operation.observe(event);
-        return;
+        return open;
       }
+    return false;
   }
 
   // Lists sessions that hold unsubmitted queued assignments.
@@ -1003,6 +1007,20 @@ function bindingCopy(binding: Readonly<CompactBinding>): CompactBinding {
   return { ...binding };
 }
 
+// Names whether native compaction evidence starts or ends a provider compaction, or null for other evidence.
+// Claude reports a start as a compacting status, and an end as a compact result or a boundary.
+// Codex reports each compaction item's start and end.
+export function automaticCompactionEdge(event: NativeEvent): 'start' | 'end' | null {
+  if (event.kind !== 'compact') return null;
+  if (event.provider === 'claude') {
+    if (event.stage === 'boundary') return 'end';
+    if (event.stage !== 'status') return null;
+    if (typeof event.evidence.compact_result === 'string') return 'end';
+    return event.evidence.status === 'compacting' ? 'start' : null;
+  }
+  return event.stage === 'itemStart' ? 'start' : event.stage === 'itemEnd' ? 'end' : null;
+}
+
 // One submitted command owns this evidence join. It never sends provider input.
 // CompactRequests sets the submission generation and routes only evidence that names it.
 class NativeCompactOperation {
@@ -1018,6 +1036,11 @@ class NativeCompactOperation {
     private readonly binding: Readonly<CompactBinding>,
     private readonly report: (state: 'started' | 'completed' | 'failed' | 'uncertain', reason?: string) => void,
   ) {}
+  // True once the compaction turn ended. Claude advances the generation only on submitted input, so a later turn
+  // that a background task starts reports its evidence under this generation.
+  get finished(): boolean {
+    return this.terminal !== null;
+  }
   observe(event: NativeEvent): void {
     if (
       event.provider !== this.binding.provider ||
@@ -1115,6 +1138,13 @@ export interface CompactHostPort<C extends CompactChild> {
   authority?(provider: 'claude' | 'codex', sessionId: string): string | null;
   source?(provider: 'claude' | 'codex', sessionId: string): string | null;
   continuationWork?(sessionId: string): 'none' | 'pending' | 'absent' | 'unknown';
+  // Shows or ends a compaction the provider runs on its own. `itemId` names the Codex compaction item, or is null for Claude.
+  automaticCompaction?(
+    provider: 'claude' | 'codex',
+    sessionId: string,
+    edge: 'start' | 'end',
+    itemId: string | null,
+  ): void;
   // Shows a native compaction as it starts and returns the callback that receives its outcome.
   compacting?(
     provider: 'claude' | 'codex',
@@ -1264,7 +1294,13 @@ export class CompactHost<C extends CompactChild> {
     if (this.disposed) return;
     if (event.kind === 'submission' || event.kind === 'compact') {
       const generation = this.generations.get(child);
-      if (generation !== undefined) this.requests.observeSubmitted(event, generation);
+      const owned = generation !== undefined && this.requests.observeSubmitted(event, generation);
+      const edge = owned ? null : automaticCompactionEdge(event);
+      if (edge) {
+        // CodexWire emits a compaction item only with a non-empty item id.
+        const item = event.provider === 'codex' ? (event.evidence.item as { id: string }).id : null;
+        this.port.automaticCompaction?.(event.provider, event.sessionId, edge, item);
+      }
       // A terminal turn or an unbound RPC refusal releases the adapter's unanswered receipt.
       if (event.kind === 'compact' && (event.stage === 'turnEnd' || event.stage === 'refused'))
         queueMicrotask(() => void this.drain(event.sessionId));

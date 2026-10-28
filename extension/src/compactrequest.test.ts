@@ -18,6 +18,7 @@ import {
   guardedFactsWithCompaction,
 } from './sessionwrites.ts';
 import {
+  automaticCompactionEdge,
   CompactHost,
   promptAsReader,
   CompactRequests,
@@ -102,6 +103,8 @@ function compactHostFixture(
     compactTurn: undefined as unknown,
     // Each compaction the panel was told about, with the request state and write count at that moment.
     compactings: [] as { provider: string; sessionId: string; state: string; writes: number; outcomes: unknown[] }[],
+    // Each automatic compaction edge the panel was told about.
+    automatic: [] as [string, string, string, string | null][],
     // Holds delivery at the activity lease while a case acts on the waiting request.
     lease: null as Promise<void> | null,
     state,
@@ -188,6 +191,8 @@ function compactHostFixture(
         fixture.compactings.push(shown);
         return (outcome) => shown.outcomes.push(outcome);
       },
+      automaticCompaction: (provider, sessionId, edge, itemId) =>
+        void fixture.automatic.push([provider, sessionId, edge, itemId]),
     },
     () => fixture.clock,
     persistence,
@@ -1835,6 +1840,8 @@ test.each(['claude', 'codex'] as const)(
   },
 );
 
+// Catches a completed Claude request that keeps a later automatic compaction from the panel. Claude advances the
+// generation only on submitted input, so a turn that a background task starts keeps the request's generation.
 test('host compaction binds a Claude request to its prompt generation and completes on the manual compact result', async () => {
   const { fixture } = compactHostFixture('claude');
   const { host, child, state } = fixture;
@@ -1857,7 +1864,98 @@ test('host compaction binds a Claude request to its prompt generation and comple
   compact('boundary', { compact_metadata: { trigger: 'manual' } });
   compact('turnEnd', { subtype: 'success', is_error: false, local_command: 'compact' });
   assert.equal(compactState(host), 'completed');
+  assert.deepEqual(fixture.automatic, [], 'the requested compaction also showed as automatic');
+  compact('status', { status: 'compacting' });
+  assert.deepEqual(
+    fixture.automatic,
+    [['claude', 'self', 'start', null]],
+    'the completed request claimed a later compaction',
+  );
+  assert.equal(compactState(host), 'completed');
 });
+
+// Catches a provider compaction inside a running turn that Arc never reports, and a reader or agent request
+// whose own evidence also reports it as automatic.
+test('automaticCompactionEdge names the start and end of every provider compaction stage', () => {
+  const event = (provider: 'claude' | 'codex', stage: string, evidence: Record<string, unknown> = {}) =>
+    ({ provider, sessionId: 'self', turnId: null, generation: null, evidence, kind: 'compact', stage }) as NativeEvent;
+  assert.deepEqual(
+    [
+      event('claude', 'status', { status: 'compacting' }),
+      event('claude', 'status', { status: null, compact_result: 'success' }),
+      event('claude', 'status', { status: null, compact_result: 'failed' }),
+      event('claude', 'boundary', { compact_metadata: { trigger: 'auto' } }),
+      event('claude', 'status', { status: null }),
+      event('claude', 'turnEnd'),
+      event('codex', 'itemStart', { item: { id: 'item' } }),
+      event('codex', 'itemEnd', { item: { id: 'item' } }),
+      event('codex', 'turnStart'),
+      event('codex', 'accepted'),
+      compactEvent('toolStart'),
+    ].map(automaticCompactionEdge),
+    ['start', 'end', 'end', 'end', null, null, 'start', 'end', null, null, null],
+  );
+});
+
+test.each(['claude', 'codex'] as const)(
+  'an unowned %s compaction reaches the panel and an owned one does not',
+  async (agent) => {
+    const { fixture, makeChild } = compactHostFixture(agent);
+    const { host, child, state } = fixture;
+    const compact = (target: CompactChild, stage: string, generation: number | null, evidence: object) =>
+      host.native(
+        target,
+        {
+          provider: agent,
+          sessionId: 'self',
+          turnId: 'turn',
+          generation,
+          evidence,
+          kind: 'compact',
+          stage,
+        } as NativeEvent,
+        undefined,
+      );
+    const start =
+      agent === 'claude'
+        ? (['status', { status: 'compacting' }] as const)
+        : (['itemStart', { item: { id: 'auto' } }] as const);
+    const end =
+      agent === 'claude'
+        ? (['status', { compact_result: 'success' }] as const)
+        : (['itemEnd', { item: { id: 'auto' } }] as const);
+    host.submitted(child, 7);
+    compact(child, start[0], agent === 'claude' ? 1 : null, start[1]);
+    compact(child, end[0], agent === 'claude' ? 1 : null, end[1]);
+    const item = agent === 'claude' ? null : 'auto';
+    assert.deepEqual(fixture.automatic, [
+      [agent, 'self', 'start', item],
+      [agent, 'self', 'end', item],
+    ]);
+    fixture.automatic.length = 0;
+    // An agent request, submitted as generation 2, owns its own compaction evidence.
+    const extra = { provider: agent, generation: agent === 'claude' ? 1 : null };
+    host.native(child, compactEvent('toolStart', extra), 7);
+    assert.equal(
+      (host.handle({ method: 'compact-request', params: compactPayload }) as { state: string }).state,
+      'queued',
+    );
+    host.native(child, compactEvent('toolEnd', extra), 7);
+    host.native(child, compactEvent('rootEnd', extra), 7);
+    state.busy = false;
+    await host.drain('self');
+    assert.equal(fixture.writes, 1);
+    if (agent === 'codex') compact(child, 'turnStart', 2, {});
+    compact(child, start[0], 2, start[1]);
+    assert.equal(compactState(host), 'started');
+    assert.deepEqual(fixture.automatic, [], 'an agent-requested compaction also showed as automatic');
+    // Another child of the same session that reports the same native generation owns no request.
+    const other = makeChild('other');
+    host.submitted(other, 1);
+    compact(other, start[0], 2, start[1]);
+    assert.deepEqual(fixture.automatic, [[agent, 'self', 'start', item]], 'a generation alone claimed the event');
+  },
+);
 
 // Catches compaction evidence that completes or reopens another request on the same child, and a timed-out
 // request whose late turn no longer completes it after a later request ran.

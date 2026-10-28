@@ -29360,6 +29360,114 @@ test('an agent-requested compaction card leaves continuation work unheld', () =>
   assert.equal(provider.continuationWork('worker'), 'pending', 'a reader compaction card stopped holding continuation');
 });
 
+// Catches an automatic compaction inside a running turn that shows no card until the provider records it.
+test('automatic compaction shows the running compaction card below the live prompt on both providers', async () => {
+  for (const agent of ['claude', 'codex'] as const) {
+    const fixture = liveProviderFixture(livePress({ agent }));
+    const provider = fixture.provider as any;
+    const session = 'sess';
+    provider.running.add(agent + ':' + session);
+    const item = agent === 'codex' ? 'item' : null;
+    provider.noteAutomaticCompaction(agent, session, 'start', item);
+    const cards = fixture.usage(fixture.posted.at(-1)!) as {
+      kind: string;
+      state: string;
+      status: string;
+      dismissLabel: string;
+    }[];
+    const name = agent === 'claude' ? 'Claude' : 'Codex';
+    assert.deepEqual(
+      cards.map((card) => [card.kind, card.state, card.status, card.dismissLabel]),
+      [
+        ['prompt', 'running', `${name} is working on this`, ''],
+        ['compact', 'running', `${name} is compacting this session`, ''],
+      ],
+      'an automatic compaction showed no running card below the live prompt',
+    );
+    assert.deepEqual(
+      provider.live[session].map((press: LivePress) => press.kind),
+      ['prompt'],
+      'the automatic card became a live press',
+    );
+    provider.noteAutomaticCompaction(agent, session, 'end', item);
+    assert.deepEqual(
+      (fixture.usage(await fixture.publishUsage()) as { kind: string }[]).map((card) => card.kind),
+      ['prompt'],
+    );
+  }
+});
+
+// Catches an automatic compaction card that outlives the compaction it shows.
+test('the automatic compaction card ends on every provider end, the record, and the end of the running state', async () => {
+  const kinds = async (fixture: ReturnType<typeof liveProviderFixture>) =>
+    (fixture.usage(await fixture.publishUsage()) as { kind: string }[]).map((card) => card.kind);
+  const running = () => {
+    const fixture = liveProviderFixture(livePress({ completed: true, outcome: 'ok' }));
+    (fixture.provider as any).running.add('claude:sess');
+    return fixture;
+  };
+  // A Claude compact result and boundary both arrive as an end edge. The second one finds no card.
+  const ended = running();
+  (ended.provider as any).noteAutomaticCompaction('claude', 'sess', 'start', null);
+  assert.deepEqual(await kinds(ended), ['prompt', 'compact']);
+  for (let edge = 0; edge < 2; edge++) (ended.provider as any).noteAutomaticCompaction('claude', 'sess', 'end', null);
+  assert.deepEqual(await kinds(ended), ['prompt'], 'the card outlived the compaction');
+  const recorded = running();
+  const provider = recorded.provider as any;
+  provider.noteAutomaticCompaction('claude', 'sess', 'start', null);
+  const at = (recorded.usage(await recorded.publishUsage()) as { kind: string; at: number }[])[1].at;
+  provider.newestCompactionBySession.set('sess', { at: at - 1 });
+  provider.dropSpentPresses();
+  assert.deepEqual(await kinds(recorded), ['prompt', 'compact'], 'an earlier compaction record ended the card');
+  provider.newestCompactionBySession.set('sess', { at });
+  assert.equal(provider.dropSpentPresses(), true);
+  assert.deepEqual(await kinds(recorded), ['prompt'], 'the recorded compaction left the card');
+  const stopped = running();
+  (stopped.provider as any).noteAutomaticCompaction('claude', 'sess', 'start', null);
+  (stopped.provider as any).running = new Set();
+  assert.equal((stopped.provider as any).dropSpentPresses(), true);
+  assert.deepEqual(await kinds(stopped), ['prompt'], 'the card outlived the running state');
+  const codex = liveProviderFixture(livePress({ agent: 'codex', completed: true, outcome: 'ok' }));
+  const host = codex.provider as any;
+  host.running.add('codex:sess');
+  host.noteAutomaticCompaction('codex', 'sess', 'start', 'first');
+  host.noteAutomaticCompaction('codex', 'sess', 'start', 'second');
+  host.noteAutomaticCompaction('codex', 'sess', 'end', 'first');
+  assert.deepEqual(await kinds(codex), ['prompt', 'compact'], 'the card ended with the first of two items');
+  host.noteAutomaticCompaction('codex', 'sess', 'end', 'second');
+  assert.deepEqual(await kinds(codex), ['prompt']);
+});
+
+// Catches a second compaction card beside a reader compaction, and an automatic start that deletes a failure notice.
+test('a held compaction press suppresses the automatic card and keeps its failure notice', async () => {
+  for (const failed of [false, true]) {
+    const compact = livePress({ kind: 'compact', text: '', failed, reason: failed ? 'Claude did not answer.' : '' });
+    const fixture = liveProviderFixture(compact);
+    const provider = fixture.provider as any;
+    provider.running.add('claude:sess');
+    provider.noteAutomaticCompaction('claude', 'sess', 'start', null);
+    const cards = fixture.usage(await fixture.publishUsage()) as { kind: string; state: string }[];
+    assert.deepEqual(
+      cards.map((card) => [card.kind, card.state]),
+      [['compact', failed ? 'failed' : 'running']],
+      'a held compaction press showed a second compaction card',
+    );
+    assert.deepEqual(provider.live.sess, [compact], 'an automatic compaction changed the held press');
+  }
+});
+
+// Catches an automatic compaction card that takes a prompt sent during it out of the running turn.
+test('a Claude prompt sent during an automatic compaction joins the running turn', () => {
+  const fixture = liveProviderFixture(livePress());
+  const provider = fixture.provider as any;
+  provider.live = {};
+  provider.running.add('claude:sess');
+  provider.noteAutomaticCompaction('claude', 'sess', 'start', null);
+  const at = provider.noteLive(provider.stateFor('sess'), 'prompt', 'Also check the tests.');
+  const press = provider.live.sess.find((one: LivePress) => one.at === at);
+  assert.equal(press.midTurn, true, 'the automatic compaction card held the prompt out of the running turn');
+});
+
 test('clear keeps terminal responses and their recorded replacement ownership in the source session', () => {
   const first = { ...livePress(), completed: true, outcome: 'ok' as const, ran: true, started: true, turnId: 1 };
   const fixture = liveProviderFixture(first);
