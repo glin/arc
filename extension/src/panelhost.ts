@@ -1277,6 +1277,8 @@ interface SessionLifetimeFigures {
 interface ClearSettlement {
   source: string;
   session: string;
+  // The sessions that this clear moved to, oldest first. `session` holds the newest.
+  successors: string[];
   state: ComposerState;
   queued: QueuedSubmission | null;
   request: 'clear' | 'new';
@@ -5969,6 +5971,7 @@ export class PanelProvider implements vscode.Disposable {
     if (clearing) {
       this.clearSettlements.delete(source);
       clearing.session = successor;
+      clearing.successors.push(successor);
       this.clearSettlements.set(successor, clearing);
       const hosts = new Map([...(this.readyHosts ?? [])].map((host) => [host, null]));
       if (hosts.size) {
@@ -7482,17 +7485,27 @@ export class PanelProvider implements vscode.Disposable {
   // An Arc agent-run launch is recorded even while its pending row files it as the reader's own.
   // Another session is recorded when its published row files it as an agent run or leaves it unclassified.
   // A reader session whose classification is still unknown can therefore enter the list and push an older entry out of the bound.
+  // `successors` lists the sessions that a typed `/clear` or Codex `/new` moved to before the agent accepted it.
+  // They inherit the record whatever their own rows say. `noteSessionMoved` passes a record to the successor of a later move.
   // `agentRuns` keeps the session, so `isAgentRunLaunch` and the prompt-cache request of its resumes do not change.
-  private notePrompted(session: string): void {
+  private notePrompted(session: string, successors: readonly string[] = []): void {
     if (this.saved.prompted?.includes(session)) return;
     const row = this.sessionRows.find((entry) => entry.id === session);
     if (!this.isAgentRunLaunch(session) && (!row || row.agentRun === false)) return;
-    this.saved.prompted = [...(this.saved.prompted ?? []), session].slice(-SESSION_LIMIT);
+    const recorded = [session, ...successors];
+    this.saved.prompted = [...new Set([...(this.saved.prompted ?? []), ...recorded])].slice(-SESSION_LIMIT);
     void this.persistHostState().catch(() => {});
-    // Patch the published row and post the session list, so the card changes before the next catalog refresh.
-    const source = this.catalog?.sessions.find((entry) => entry.sessionId === session);
-    const agentRun = source ? this.agentRunFor(source, this.sessionParentEdgeSet?.edges ?? new Map()) : false;
-    this.sessionRows = this.sessionRows.map((entry) => (entry.id === session ? { ...entry, agentRun } : entry));
+    // Patch the published rows and post the session list, so the cards change before the next catalog refresh.
+    const edges = this.sessionParentEdgeSet?.edges ?? new Map();
+    const answers = new Map(
+      recorded.map((id) => {
+        const source = this.catalog?.sessions.find((entry) => entry.sessionId === id);
+        return [id, source ? this.agentRunFor(source, edges) : false] as const;
+      }),
+    );
+    this.sessionRows = this.sessionRows.map((entry) =>
+      answers.has(entry.id) ? { ...entry, agentRun: answers.get(entry.id) ?? false } : entry,
+    );
     this.postRail(true);
   }
 
@@ -8451,6 +8464,7 @@ export class PanelProvider implements vscode.Disposable {
       resetId: queuedResetId ?? (request.command === 'new' && queued ? queued.id : `clear:${state.sessionId}`),
       preservePayload:
         request.command === 'new' || Boolean(queued && (queued.commentIds.length || queued.assets.length)),
+      successors: [],
       delivery: null,
       ...((state.submittedRecoveryId ?? queued?.recoveryId)
         ? { recoveryId: state.submittedRecoveryId ?? queued?.recoveryId }
@@ -8459,8 +8473,9 @@ export class PanelProvider implements vscode.Disposable {
     this.clearSettlements.set(state.sessionId, settlement);
     const settle = (delivery: PromptDelivery): void => {
       settlement.delivery = delivery;
-      // Record before the move so the successor inherits the record.
-      if (prompted && delivery.delivered) this.notePrompted(settlement.session);
+      // Record the session where the reader typed `/clear` or Codex `/new`, and the successors that its moves named so far.
+      // A move in the call below passes the record to its successor.
+      if (prompted && delivery.delivered) this.notePrompted(settlement.source, settlement.successors);
       if (delivery.delivered && delivery.session && delivery.session !== settlement.session) {
         this.noteSessionMoved(
           settlement.session,

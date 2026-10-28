@@ -36195,6 +36195,95 @@ test.each([
   if (path === 'send') assert.equal(delivered.length, 1, `the submission did not ${_case}`);
 });
 
+// The production `rememberStarted` runs, and each refresh publishes the pending row of a moved session as the reader's own.
+function publishMovedRows(provider: ReturnType<typeof promptedRunProvider>['provider']): void {
+  Object.assign(provider, {
+    startedHere: new Set<string>(),
+    rememberStarted: (PanelProvider.prototype as unknown as { rememberStarted: unknown }).rememberStarted,
+    refreshFrom() {
+      const pending = Object.values(
+        provider.awaitingSessionRecords as Record<string, { sessionId: string; createdAt: number }>,
+      ).filter((record) => !provider.sessionRows.some((row: { id: string }) => row.id === record.sessionId));
+      provider.sessionRows = [
+        ...syntheticDraftRows(
+          pending.map((record) => ({
+            draftId: record.sessionId,
+            createdAt: record.createdAt,
+            agent: 'Claude',
+            agentKey: 'claude' as const,
+          })),
+        ),
+        ...provider.sessionRows,
+      ];
+    },
+  });
+}
+
+// The session moves and the refresh after each move reach the panel before the agent accepts the typed /clear.
+test.each([
+  ['an agent run Arc did not launch', false, 1],
+  ['an Arc agent-run launch', true, 1],
+  ['an agent run Arc did not launch that moves twice', false, 2],
+] as const)(
+  'a typed /clear in %s keeps the cleared session and its successors outside Run by agents',
+  async (_case, launched, moves) => {
+    const { provider, session, rails, submit } = promptedRunProvider();
+    if (!launched) provider.saved.agentRuns = undefined;
+    assert.equal(provider.isAgentRunLaunch(session), launched, 'the fixture has the wrong launch record');
+    publishMovedRows(provider);
+    const successors = ['cleared-successor', 'second-successor'].slice(0, moves);
+    provider.onClear = async () => {
+      let from = session;
+      for (const to of successors) {
+        provider.noteSessionMoved(from, to, 'claude', provider.catalog.sessions[0].cwd);
+        from = to;
+      }
+      for (const id of successors)
+        assert.equal(
+          provider.sessionRows.find((row: { id: string }) => row.id === id)?.agentRun,
+          false,
+          'the refresh published no pending successor row',
+        );
+      return { delivered: true, reason: '', session: from };
+    };
+    await submit('/clear', `moved-clear-${moves}`);
+    await vi.waitFor(() => {
+      assert.ok(
+        provider.saved.prompted?.includes(session),
+        'the session where the reader typed /clear was not recorded',
+      );
+      for (const id of successors)
+        assert.ok(provider.saved.prompted.includes(id), `the successor ${id} did not inherit the takeover record`);
+    });
+    const card = rails.at(-1)?.rail.find((entry) => entry.id === session);
+    assert.equal(card?.runByAgent, false, 'the cleared session stayed in Run by agents');
+    for (const id of successors) {
+      const listed = { ...provider.catalog.sessions[0], sessionId: id };
+      assert.equal(provider.agentRunFor(listed, new Map()), false, `the listed successor ${id} files as an agent run`);
+    }
+    assert.deepEqual(
+      provider.saved.agentRuns,
+      launched ? [session, ...successors] : undefined,
+      'the takeover changed the prompt-cache request of resumes',
+    );
+  },
+);
+
+test('a reader prompt to a moved Arc agent run leaves the successor that the reader never prompted in Run by agents', async () => {
+  const { provider, session, submit } = promptedRunProvider();
+  publishMovedRows(provider);
+  const successor = 'agent-successor';
+  provider.noteSessionMoved(session, successor, 'claude', provider.catalog.sessions[0].cwd);
+  assert.deepEqual(provider.saved.agentRuns, [session, successor], 'the move did not keep the agent-run launch');
+  await submit('Keep going', 'after-move');
+  await vi.waitFor(() =>
+    assert.ok(provider.saved.prompted?.includes(session), 'the prompted superseded session was not recorded'),
+  );
+  assert.ok(!provider.saved.prompted.includes(successor), 'the successor that the reader never prompted was recorded');
+  const listed = { ...provider.catalog.sessions[0], sessionId: successor };
+  assert.equal(provider.agentRunFor(listed, new Map()), true, 'the successor left Run by agents');
+});
+
 test.each(['claude', 'codex'] as const)(
   'catalog-backed %s submissions stay undelivered when scope readiness changes during persistence',
   async (agent) => {
