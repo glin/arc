@@ -714,6 +714,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         continuationWork: (sessionId) => panel.continuationWork(sessionId),
         authority: (provider, sessionId) => panel.continuationAuthority(provider, sessionId),
         source: (provider, sessionId) => panel.continuationSource(provider, sessionId),
+        compacting: (provider, sessionId) => panel.noteAgentCompaction(provider, sessionId),
       },
       Date.now,
       context.storageUri

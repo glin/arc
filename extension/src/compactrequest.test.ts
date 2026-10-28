@@ -98,6 +98,10 @@ function compactHostFixture(
     compactions: 1,
     work: 'none' as 'none' | 'pending' | 'absent' | 'unknown',
     beforeWrite: () => {},
+    // The value the child's compaction resolves with.
+    compactTurn: undefined as unknown,
+    // Each compaction the panel was told about, with the request state and write count at that moment.
+    compactings: [] as { provider: string; sessionId: string; state: string; writes: number; outcomes: unknown[] }[],
     // Holds delivery at the activity lease while a case acts on the waiting request.
     lease: null as Promise<void> | null,
     state,
@@ -151,6 +155,7 @@ function compactHostFixture(
           },
           undefined,
         );
+        return fixture.compactTurn;
       },
     };
     return child;
@@ -172,6 +177,17 @@ function compactHostFixture(
       readerWork: () => fixture.work,
       continuationWork: () => fixture.continuationWork,
       authority: () => fixture.authority,
+      compacting: (provider, sessionId) => {
+        const shown = {
+          provider,
+          sessionId,
+          state: compactState(fixture.host),
+          writes: fixture.writes,
+          outcomes: [] as unknown[],
+        };
+        fixture.compactings.push(shown);
+        return (outcome) => shown.outcomes.push(outcome);
+      },
     },
     () => fixture.clock,
     persistence,
@@ -1739,6 +1755,60 @@ test('host compaction reports a refused provider request as failed', async () =>
     undefined,
   );
   assert.equal(compactState(host), 'failed');
+});
+
+// Catches agent-requested compaction that the panel learns of only from the recorded compaction.
+test('host compaction tells the panel inside the write boundary and settles it with the turn', async () => {
+  const { fixture } = compactHostFixture();
+  const { host, child, state } = fixture;
+  fixture.compactTurn = 12;
+  admittedCompaction(fixture);
+  host.native(child, compactEvent('rootEnd'), 7);
+  state.busy = false;
+  await host.drain('self');
+  assert.equal(fixture.writes, 1);
+  assert.deepEqual(fixture.compactings, [
+    { provider: 'codex', sessionId: 'self', state: 'uncertain', writes: 0, outcomes: [{ turnId: 12 }] },
+  ]);
+});
+
+// Catches a failed compaction write that leaves the panel showing a compaction in progress.
+test('host compaction settles the panel with the error of a write that fails after the final check', async () => {
+  const { fixture } = compactHostFixture();
+  const { host, child, state } = fixture;
+  const failure = new Error('The agent is no longer running.');
+  child.compact = async (check) => {
+    check();
+    throw failure;
+  };
+  admittedCompaction(fixture);
+  host.native(child, compactEvent('rootEnd'), 7);
+  state.busy = false;
+  await host.drain('self');
+  assert.equal(compactState(host), 'uncertain');
+  assert.deepEqual(
+    fixture.compactings.map((shown) => shown.outcomes),
+    [[{ error: failure }]],
+  );
+});
+
+// Catches a panel card that appears for a write the final check refuses, so each retry shows it again.
+test('host compaction tells the panel nothing when the session is not ready at the write', async () => {
+  const { fixture } = compactHostFixture();
+  const { host, child, state } = fixture;
+  admittedCompaction(fixture);
+  host.native(child, compactEvent('rootEnd'), 7);
+  state.busy = false;
+  fixture.beforeWrite = () => void (state.ready = false);
+  await host.drain('self');
+  assert.equal(compactState(host), 'queued');
+  assert.equal(fixture.compactings.length, 0, 'the panel showed a compaction that was never written');
+  fixture.beforeWrite = () => {};
+  state.ready = true;
+  state.busy = false;
+  await host.drain('self');
+  assert.equal(fixture.writes, 1);
+  assert.equal(fixture.compactings.length, 1);
 });
 
 // Native root commands supply compaction intent after earlier reader activity without notification ancestry.

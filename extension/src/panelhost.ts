@@ -387,6 +387,7 @@ import {
   queueSuccessorDelivery,
   queueSuccessorFailed,
   sessionRunning,
+  failedCompactionDelivery,
   runningKey,
   runningSessions,
   runningSessionsSince,
@@ -2840,6 +2841,8 @@ export class PanelProvider implements vscode.Disposable {
     const state = this.stateFor(session);
     const presses = (this.live[session] ?? []).filter((press) => !press.completed && !press.failed);
     const prompts = presses.filter((press) => press.kind === 'prompt').length;
+    // An agent-requested compaction must not hold the work that the same request continues with.
+    const controls = presses.filter((press) => press.kind !== 'prompt' && !press.byAgent).length;
     const status = this.railStatuses(Date.now(), session).statuses.get(session);
     return {
       current: matches.length === 1 && state !== null,
@@ -2854,8 +2857,7 @@ export class PanelProvider implements vscode.Disposable {
         Number(this.assetHandoffs.has(session)) +
         Number(this.staging.has(session)),
       pendingControls:
-        presses.length -
-        prompts +
+        controls +
         Number(Boolean(state?.clearing) || this.clearSettlements.has(session)) +
         Number(this.pendingQueueDrains.has(session)),
       background: status === undefined ? null : ACTIVE_RAIL_STATUSES.has(status),
@@ -5994,7 +5996,13 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   // Create live activity before delivery. Its timestamp identifies the submission when asynchronous answers arrive.
-  private noteLive(state: ComposerState, kind: LiveKind, text: string, assets: StoredPromptAsset[] = []): number {
+  private noteLive(
+    state: Pick<ComposerState, 'sessionId' | 'agent' | 'running'>,
+    kind: LiveKind,
+    text: string,
+    assets: StoredPromptAsset[] = [],
+    byAgent?: true,
+  ): number {
     // Classify the new prompt against existing activity before replacing it.
     const inFlight = this.live[state.sessionId] ?? [];
     const at = Math.max(Date.now(), ...inFlight.map((press) => press.at + 1));
@@ -6016,6 +6024,7 @@ export class PanelProvider implements vscode.Disposable {
       started: false,
       failed: false,
       reason: '',
+      ...(byAgent && { byAgent }),
     };
     const replaced = inFlight.find((press) => press.kind === kind);
     if (
@@ -8204,6 +8213,27 @@ export class PanelProvider implements vscode.Disposable {
       return;
     }
     this.startCompaction(state);
+  }
+
+  // Show a compaction the agent requested for its own session with the live card a reader-started compaction shows.
+  // The card does not count as a pending control. The returned callback settles it the way a reader-started compaction settles.
+  public noteAgentCompaction(
+    agent: AgentKind,
+    session: string,
+  ): (outcome: { turnId: unknown } | { error: unknown }) => void {
+    const running = sessionRunning([...this.running], agent, session);
+    const pressed = this.noteLive({ sessionId: session, agent, running }, 'compact', '', [], true);
+    void this.post({ type: 'usage', usage: this.usagePayload() });
+    return (outcome) =>
+      this.livePressAnswered(
+        session,
+        pressed,
+        'error' in outcome
+          ? failedCompactionDelivery(agent, outcome.error)
+          : typeof outcome.turnId === 'number'
+            ? { delivered: true, reason: '', turnId: outcome.turnId }
+            : { delivered: true, reason: '' },
+      );
   }
 
   // `prompted` marks a compaction the reader typed in the Prompt box. It is recorded once the agent accepts it.

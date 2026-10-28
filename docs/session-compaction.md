@@ -42,6 +42,8 @@ Admit one pending request per exact turn within active capacity. A request witho
 
 Deliver after the requesting turn ends, with or without success. The final response does not need to reach the panel first. Admission needs only the live child. Delivery waits until the session is idle and ready, with no open ask, no pending reader work, and no unresolved earlier compaction. Claude background acknowledgments bind task IDs without settling commands. Only matching terminal notices settle them. Parse user-form notices with the shared strict task-tag parser. System notices use structured fields. Retain root tool owners across later turns. Synchronous endings follow the current shared response owner. Retain direct Bash starts because results can establish background execution.
 
+Agent-requested delivery shows the live compaction card that a reader-started compaction shows. That card does not hold the request's continuation or queued agent messages.
+
 ### Reader actions and delivery
 
 Stop, compact, answers, setting picks, and slash commands cancel unsubmitted work and suppress continuation. Reader sends and queued delivery carry pending work instead. Answers keep the reader revision because they can approve the initiating tool. `readerAction` in [`compactrequest.ts`](../extension/src/compactrequest.ts) owns revision changes and carry rebinding.

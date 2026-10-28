@@ -27886,7 +27886,7 @@ test('fresh and forked prompt delivery retry on a replacement child after permis
 
 test('the press records whether a turn was already running when it was made', () => {
   // Capture whether the press belongs to a running turn before recording it.
-  const at = panelHostSource.indexOf('private noteLive(state: ComposerState');
+  const at = panelHostSource.indexOf('private noteLive(');
   assert.notEqual(at, -1, 'the panel no longer records the press here');
   const body = memberFrom(panelHostSource, at);
   assert.ok(
@@ -27919,7 +27919,7 @@ test('a follow-up in an unparsed successor stays between its calls instead of in
     'pressesAfter',
     'pendingAskPosition',
     'LIVE_ACTIVITY_STALE_MS',
-    `return function (state, kind, text, assets = []) {\n${methodBody('private noteLive(')}\n};`,
+    `return function (state, kind, text, assets = [], byAgent) {\n${methodBody('private noteLive(')}\n};`,
   )({ now: () => 5_000 }, pressIsMidTurn, pressesAfter, pendingAskPosition, 60_000);
   const prior = turn({
     startedAt: 1_000,
@@ -29100,6 +29100,60 @@ test('retained terminal responses allow compaction to start and retire and keep 
   assert.equal(provider.live[first.sessionId].length, 1);
   const local = { ...livePress(), at: first.at + 1, ran: true, started: false };
   assert.deepEqual(pressesAfterLocalAnswer([{ ...first, started: false }, local]), [{ ...first, started: false }]);
+});
+
+// Catches agent-requested compaction that shows no card until the agent records it, and a card that outlives it.
+test('agent-requested compaction shows the live compaction card on both providers', () => {
+  for (const agent of ['claude', 'codex'] as const) {
+    const first = { ...livePress({ agent }), completed: true, outcome: 'ok' as const, ran: true, started: true };
+    const fixture = liveProviderFixture(first);
+    const provider = fixture.provider as any;
+    const session = first.sessionId;
+    provider.running.add(agent + ':' + session);
+    const settle = provider.noteAgentCompaction(agent, session);
+    const cards = () => fixture.usage(fixture.posted.at(-1)!) as { kind: string; status: string }[];
+    const shown = cards().filter((card) => card.kind === 'compact');
+    assert.equal(shown.length, 1, 'agent-requested compaction showed no live card while it ran');
+    assert.match(shown[0].status, /compact/);
+    const press = provider.live[session][1];
+    assert.equal(press.byAgent, true);
+    settle({ turnId: 3 });
+    assert.deepEqual([provider.live[session][1].ran, provider.live[session][1].turnId], [true, 3]);
+    provider.newestCompactionBySession.set(session, { at: press.at + 1 });
+    provider.dropSpentPresses();
+    assert.deepEqual(
+      provider.live[session].map((one: LivePress) => one.kind),
+      ['prompt'],
+      'the recorded compaction left its live card',
+    );
+    const failed = provider.noteAgentCompaction(agent, session);
+    failed({ error: new Error('the agent is no longer running, so the session was not compacted') });
+    const notice = provider.live[session].at(-1);
+    assert.deepEqual([notice.kind, notice.failed, notice.reason === ''], ['compact', true, false]);
+  }
+});
+
+// Catches an agent-requested compaction card that holds the continuation its own request delivers next.
+test('an agent-requested compaction card leaves continuation work unheld', () => {
+  const { provider, observe } = guardedPanelFixture();
+  observe();
+  Object.assign(provider, {
+    live: {},
+    running: new Set<string>(),
+    newestBySession: new Map(),
+    liveActivity: {},
+    runningSince: () => new Map(),
+    post: async () => {},
+    usagePayload: () => ({}),
+    // Reader work reads session membership, which this fixture leaves unset. No live card changes it.
+    readerWork: () => 'none',
+  });
+  assert.equal(provider.continuationWork('worker'), 'none');
+  provider.noteAgentCompaction('claude', 'worker');
+  assert.equal(provider.live.worker.length, 1);
+  assert.equal(provider.continuationWork('worker'), 'none', 'the agent compaction card held its own continuation');
+  provider.live.worker[0].byAgent = undefined;
+  assert.equal(provider.continuationWork('worker'), 'pending', 'a reader compaction card stopped holding continuation');
 });
 
 test('clear keeps terminal responses and their recorded replacement ownership in the source session', () => {

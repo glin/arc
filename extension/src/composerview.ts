@@ -3452,6 +3452,8 @@ export interface LivePress extends PendingAskPosition {
   failed: boolean;
   // The reader-facing delivery failure reason, or an empty string before failure.
   reason: string;
+  // Whether the agent requested this session control for its own session.
+  byAgent?: true;
 }
 
 // The submitted prompt or session control.

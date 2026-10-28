@@ -1115,6 +1115,11 @@ export interface CompactHostPort<C extends CompactChild> {
   authority?(provider: 'claude' | 'codex', sessionId: string): string | null;
   source?(provider: 'claude' | 'codex', sessionId: string): string | null;
   continuationWork?(sessionId: string): 'none' | 'pending' | 'absent' | 'unknown';
+  // Shows a native compaction as it starts and returns the callback that receives its outcome.
+  compacting?(
+    provider: 'claude' | 'codex',
+    sessionId: string,
+  ): ((outcome: { turnId: unknown } | { error: unknown }) => void) | null;
 }
 
 interface Submission {
@@ -1397,9 +1402,25 @@ export class CompactHost<C extends CompactChild> {
         if (live !== child) return;
         await this.requests.deliver(id, {
           eligible: (current) => this.eligible(current, writing ? 'write' : 'deliver'),
-          submit: (_current, beforeWrite) => {
+          submit: (current, beforeWrite) => {
             writing = true;
-            return live.compact(beforeWrite);
+            // The panel learns of the compaction only after the final write check passes, so a retry shows nothing.
+            let settle: ((outcome: { turnId: unknown } | { error: unknown }) => void) | null = null;
+            return live
+              .compact(() => {
+                beforeWrite();
+                settle = this.port.compacting?.(current.provider, current.sessionId) ?? null;
+              })
+              .then(
+                (turnId) => {
+                  settle?.({ turnId });
+                  return turnId;
+                },
+                (error: unknown) => {
+                  settle?.({ error });
+                  throw error;
+                },
+              );
           },
         });
       });
