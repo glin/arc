@@ -394,8 +394,8 @@ export interface RailCard {
   archived: boolean;
   // Whether the card belongs to the agent-run group. Archived, pinned and labelled cards set this to false.
   agentRun: boolean;
-  // The panel's agent-run fact from `panelAgentRun`, independent of its bucket. Archiving does not change it,
-  // and a pin or a label on a non-archived session makes it false.
+  // The panel's agent-run fact from `panelAgentRun`, independent of its bucket. An archived card keeps its classification,
+  // and a pin or a label on a non-archived card makes it false.
   // Lens figures and `is:agentrun` exclude agent runs whether or not the Archived switch is on.
   runByAgent: boolean | null;
   // Agent wording for the card meta row. Pinned agent runs use the agent-run phrase.
@@ -1211,8 +1211,8 @@ export function railSessions(
     // A pinned or labelled run files and counts as the reader's session.
     const runByAgent = panelAgentRun(classified, archived, pinnedTop.has(s.id), labels.length > 0);
     const agentRun = runByAgent === true && !archived;
-    // The origin phrase reads the classification, so a pinned run still names its origin.
-    // Only pinned runs draw it because they appear without a heading that supplies it.
+    // The origin phrase reads the classification, so a pinned or labelled run still names its origin.
+    // Every unarchived run carries it in its accessible name. Only a pinned run draws it, in place of the agent name.
     const originRun = classified === true && !archived;
     const status = statuses.get(s.id) ?? null;
     const runningSince = status === 'running' ? (runningSinceById.get(s.id) ?? null) : null;

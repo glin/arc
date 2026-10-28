@@ -3318,15 +3318,26 @@ export class PanelProvider implements vscode.Disposable {
 
   private sessionQueryDiscoveryPending = false;
 
-  private sessionQueryRevisionHeld?: { discovery?: string; catalog?: string; revision: string };
+  private sessionQueryRevisionHeld?: { discovery?: string; catalog?: string; kept: string; revision: string };
 
-  // Digests the two memberships only when one of them changed since the last context.
-  private sessionQueryRevisionFor(discovery: string | undefined, catalog: string | undefined): string {
+  // Digests the memberships only when one of them changed since the last context.
+  private sessionQueryRevisionFor(discovery: string | undefined, catalog: string | undefined, kept: string): string {
     const held = this.sessionQueryRevisionHeld;
-    if (held && held.discovery === discovery && held.catalog === catalog) return held.revision;
-    const revision = sessionQueryRevision(discovery, catalog);
-    this.sessionQueryRevisionHeld = { discovery, catalog, revision };
+    if (held && held.discovery === discovery && held.catalog === catalog && held.kept === kept) return held.revision;
+    const revision = sessionQueryRevision(discovery, catalog, kept);
+    this.sessionQueryRevisionHeld = { discovery, catalog, kept, revision };
     return revision;
+  }
+
+  // The unarchived sessions that carry a pin or a label, in order. `panelAgentRun` turns the panel's `is:agentrun` off for them.
+  // A pin or label change that alters the set changes the query context, and the panel then refreshes an open content search.
+  private sessionsKeptByReader(): string {
+    const kept = new Set<string>();
+    const archived = this.hidden ?? new Set<string>();
+    for (const session of this.pinnedTop ?? []) if (!archived.has(session)) kept.add(session);
+    for (const [session, names] of Object.entries(this.saved?.labels ?? {}))
+      if (names.length > 0 && !archived.has(session)) kept.add(session);
+    return JSON.stringify([...kept].sort());
   }
 
   private sessionQueryContext(): SessionQueryContext {
@@ -3343,7 +3354,11 @@ export class PanelProvider implements vscode.Disposable {
           this.sessionReadDiscoveryRevision === index.discovery
         ? 'complete'
         : 'incomplete';
-    const revision = this.sessionQueryRevisionFor(this.sessionReadDiscoveryRevision, index?.discovery);
+    const revision = this.sessionQueryRevisionFor(
+      this.sessionReadDiscoveryRevision,
+      index?.discovery,
+      this.sessionsKeptByReader(),
+    );
     const held = this.resolvedQueryContext;
     if (
       held?.catalog === accepted &&

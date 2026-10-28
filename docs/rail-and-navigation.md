@@ -8,7 +8,7 @@ Read [session queries](session-queries.md#session-query-syntax) for matching, [p
 
 `turnrail.ts` projects session rows. Pinned sessions lead, and active work rises without reordering existing sessions on each activity event. Agent runs and archived sessions have separate buckets. Presentation changes do not determine transcript discovery.
 
-A non-archived agent run that is pinned or carries a label files and counts as the reader's session. It leaves Run by agents and counts under Running, Active, Unread, and Needs input. Every pin and label counts, whoever applied it. Removing the pin and every label files the session as an agent run again, unless [Prompt box input](timeline.md#card-sources) made it the reader's own. A saved view that matches an unpinned, unlabelled agent run still draws it, and the counts still leave it out. `panelAgentRun` in `domain/session-query.ts` owns the rule. A pinned agent run still shows "run by an agent", which reads the classification.
+A non-archived agent run that is pinned or carries a label files and counts as the reader's session. It leaves Run by agents and counts under Running, Active, Unread, and Needs input. Every pin and label counts, whoever applied it. Removing the pin and every label files the session as an agent run again. Prompt box input or a Remote Control connection keeps it the reader's own, as [card sources](timeline.md#card-sources) defines. A saved view that matches an unpinned, unlabelled agent run still draws it, and the counts still leave it out. `panelAgentRun` in `domain/session-query.ts` owns the rule. A pinned agent run still shows "run by an agent", which reads the classification.
 
 Use session IDs for actions and saved state. Titles are mutable display text.
 

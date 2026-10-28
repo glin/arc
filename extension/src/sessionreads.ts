@@ -472,11 +472,11 @@ export function sessionDiscoveryMembership(
   return proven ? sessionCatalogMembership(scope, catalog) : undefined;
 }
 
-// The query context revision: a digest of the membership discovery proved and the catalog membership. Equal memberships give
-// an equal revision, and a change to either gives a different one. Each membership names every file, so the posted context
-// carries the digest instead.
-export function sessionQueryRevision(discovery: string | undefined, catalog: string | undefined): string {
-  return digest(JSON.stringify([discovery, catalog]));
+// The query context revision: a digest of the membership discovery proved, the catalog membership, and the panel's
+// unarchived pinned or labelled sessions. Equal memberships give an equal revision, and a change to any gives a different
+// one. The discovery and catalog memberships name every file, so the posted context carries the digest instead.
+export function sessionQueryRevision(discovery: string | undefined, catalog: string | undefined, kept = ''): string {
+  return digest(JSON.stringify([discovery, catalog, kept]));
 }
 
 // Keys order the sources by ordinal comparison. A repeated provider, ID, and file is one source.

@@ -769,8 +769,8 @@ export function matchSessions<
     unread?: boolean | null;
     // The caller supplies prompt-cache status using its own clock. Omission makes is:warm match nothing.
     cacheWarm?: boolean;
-    // Whether an agent runs this session, which `is:agentrun` answers. A card's own bucket flag
-    // turns this off when the session is archived, so the caller must hand in the plain fact.
+    // Whether an agent runs this session, which `is:agentrun` answers. The panel hands in the
+    // `panelAgentRun` fact, and other callers hand in the classification.
     runByAgent?: boolean | null;
     // Whether the reader archived this session, which `is:archived` answers, whether or not
     // the caller's own Show-archived switch draws the session.

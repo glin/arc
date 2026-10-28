@@ -11154,7 +11154,7 @@ test('a prompted Arc agent-run launch is the reader own session, and a prompted 
   );
 });
 
-test('a pin or a label leaves the classification that the CLI and export report unchanged', () => {
+test('a pin or a label leaves agentRunFor and isAgentRunLaunch unchanged', () => {
   const provider: any = Object.assign(Object.create(PanelProvider.prototype), {
     saved: { agentRuns: ['run'], labels: { run: ['dev'] } },
     pinnedTop: new Set(['run']),
@@ -40900,12 +40900,18 @@ test('catalog prefix resolution suspends through discovery progress failure canc
 
 // Runs the panel's own query context, session list, and render handlers and its repaint in one scope, with every other
 // panel owner replaced by a recorder. Session list and render messages carry no query context.
-function queryContextPanel() {
+// `refreshSearch` stands in for the content search that the panel asks again for its open query.
+function queryContextPanel(refreshSearch: () => void = () => {}) {
   const calls = { railUpdates: [] as unknown[], searchRefreshes: 0, timelineDraws: 0 };
   const ignore: any = new Proxy(function () {}, { get: () => ignore, apply: () => undefined });
   const owners: Record<string, unknown> = {
     railRenderer: { update: (...args: unknown[]) => calls.railUpdates.push(args[6]), place() {} },
-    searchRenderer: { refresh: () => calls.searchRefreshes++ },
+    searchRenderer: {
+      refresh: () => {
+        calls.searchRefreshes++;
+        refreshSearch();
+      },
+    },
     render: () => calls.timelineDraws++,
     railAcrossSessionAdoption: (rail: unknown, stats: unknown) => ({ rail, stats }),
     labeledSessions: () => null,
@@ -41135,6 +41141,60 @@ test('content search answers is:agentrun as the session list does for pinned and
   assert.deepEqual(
     matchSessions(cards, 'is:agentrun').map((card) => card.id),
     ['plain-run'],
+  );
+});
+
+// The panel holds open results for `-is:agentrun`. The reader pins an unlabelled agent run, and the host's session list
+// publication reaches the panel's query context handler, which asks content search again with no reader request.
+test('pinning an agent run refreshes open content search results for is:agentrun', async () => {
+  const { provider, session, host } = promptedRunProvider();
+  const source = { agent: 'claude', sessionId: session, file: `${session}.jsonl`, size: 1, mtimeMs: 1 };
+  const query = 'find: needle -is:agentrun';
+  const contexts: any[] = [];
+  const results: any[] = [];
+  const sendRail = provider.sendToHost;
+  Object.assign(provider, {
+    readyHosts: new Set([host]),
+    sendToHost: (target: unknown, message: any) => {
+      if (message.type === 'queryContext') contexts.push(message);
+      return sendRail(target, message);
+    },
+    post: async (message: any) => {
+      if (message.type === 'results') results.push(message);
+    },
+    searchCorpus: () => [
+      {
+        key: `${session}-turn`,
+        sessionId: session,
+        sessionTitle: session,
+        agent: 'Claude',
+        startedAt: 1,
+        prompt: 'needle',
+        summary: '',
+        whole: true,
+      },
+    ],
+    showing: null,
+    allSessions: () => [source],
+    sessionParentEdges: () => ({ edges: new Map() }),
+    agentRunFor: () => true,
+  });
+  const { dispatch } = queryContextPanel(() => provider.answerSearch(query));
+  const deliver = () => {
+    for (const message of contexts.splice(0)) dispatch.queryContext(message);
+  };
+  provider.publishSessionQueryContext();
+  deliver();
+  provider.answerSearch(query);
+  const asked = results.length;
+  assert.deepEqual(results.at(-1).hits, [], 'an unpinned agent run matched -is:agentrun');
+  await provider.updateSessionMembership('pin', session);
+  deliver();
+  assert.ok(results.length > asked, 'pinning the agent run left the open search unrefreshed');
+  assert.deepEqual(
+    [...new Set(results.at(-1).hits.map((hit: any) => hit.sessionId))],
+    [session],
+    'the refreshed search still files the pinned agent run as an agent run',
   );
 });
 
