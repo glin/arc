@@ -259,7 +259,11 @@ import {
   withSweptDraftLabels,
   remapReaderParents,
   abandonReaderParents,
+  modelLabels,
+  sameModelLabels,
+  type ModelLabels,
 } from './turnview';
+import type { ListedModel } from './domain/model-catalog';
 import {
   DRAFT_SESSION_PREFIX,
   adoptLabelSession,
@@ -1251,6 +1255,13 @@ interface SessionHeldFigures {
   dispatched?: Record<string, HeldDispatchedCost>;
 }
 
+// A session's held figures before the model display names. `lifetime` draws the lifetime figures
+// with the names from inputs it already holds. New names read no file, run no spend-part function, and price no dispatched cost.
+interface SessionPricedFigures {
+  lifetime?: (labels: ModelLabels | undefined) => SessionLifetimeFigures;
+  dispatched?: Record<string, HeldDispatchedCost>;
+}
+
 interface SessionLifetimeFigures {
   stats: SessionStatChip[];
   cost: SessionCostTotal;
@@ -1542,6 +1553,10 @@ export class PanelProvider implements vscode.Disposable {
   private asks: { session: string; ask: Ask }[] = [];
   // Model catalogs by agent and prompt settings by session.
   private models: Record<string, ModelChoice[]> = {};
+  // Display names from every model list, built once per change of the lists. A card draw only looks them up.
+  private modelLabels: ModelLabels = new Map();
+  // The lists `modelLabels` holds the names of. The same list objects keep the names without a read.
+  private modelLabelLists: readonly (readonly ListedModel[])[] = [];
   private pendingModels: readonly string[] = [];
   // Held applied defaults by `defaultsKey`. A held value stays drawn until a fresh answer for its key replaces it.
   private appliedDefaults = new Map<string, HeldDefaults>();
@@ -2150,7 +2165,7 @@ export class PanelProvider implements vscode.Disposable {
   private projectSpendTomorrow: { date: string; view: ProjectSpendView } | null = null;
   private projectSpendRebuild: ReturnType<typeof setTimeout> | null = null;
   private projectSpendBuild: Generator<void, ProjectSpendView> | null = null;
-  private lifetimeFigures = new SessionFiguresCache<SessionHeldFigures, LifetimeFigures>();
+  private lifetimeFigures = new SessionFiguresCache<SessionPricedFigures, LifetimeFigures, SessionHeldFigures>();
   private dispatchedCardPrints = new Map<string, string>();
   // The cache-expiry warning each drawn turn card shows, by card key.
   private cacheExpiryCardPrints = new Map<string, string>();
@@ -4953,11 +4968,52 @@ export class PanelProvider implements vscode.Disposable {
     this.postRail(true);
   }
 
-  // Replace model catalogs and their pending state, then refresh the panel.
-  public setModels(models: Record<string, ModelChoice[]>, pending: readonly string[] = []): void {
+  // Replace model catalogs and their pending state, then refresh the panel. Each agent's catalog
+  // is this run's answer, or the saved one until the answer arrives. Codex's own saved list names
+  // the Codex models neither holds. New display names redraw the drawn cards and the session list
+  // once, from held turns and held figures.
+  public setModels(
+    models: Record<string, ModelChoice[]>,
+    pending: readonly string[] = [],
+    codexCached: readonly ListedModel[] = [],
+  ): void {
     this.models = models;
     this.pendingModels = pending;
+    const lists = [...Object.values(models), codexCached];
+    const held = this.modelLabelLists ?? [];
+    let renamed = false;
+    if (lists.length !== held.length || lists.some((list, at) => list !== held[at])) {
+      this.modelLabelLists = lists;
+      const labels = modelLabels(lists);
+      renamed = !sameModelLabels(labels, this.modelLabels ?? new Map());
+      if (renamed) this.modelLabels = labels;
+    }
     this.refreshFrom('models');
+    if (renamed) this.redrawModelNames();
+  }
+
+  // Redraw the drawn turn cards and the session list with new model display names. Both draw
+  // from held turns and held figures, so the redraw reads no file and lists no session.
+  private redrawModelNames(): void {
+    this.postRail(true, undefined, false);
+    if (!this.cards?.length) return;
+    const turns = new Map<string, Turn>();
+    for (const card of this.cards) {
+      if (card.kind !== 'turn') continue;
+      const newest = this.newestBySession.get(card.sessionId);
+      const recorded = newest && turnKey(newest) === card.key ? newest : this.turnsByKey.get(card.key);
+      if (recorded) turns.set(card.key, recorded);
+    }
+    if (!turns.size) return;
+    let held: ReturnType<typeof this.dispatchedTurnCosts> | undefined;
+    const expiryFacts = this.lifetimeFiguresBySession().cacheExpiryFacts;
+    const now = Date.now();
+    const childCosts = this.childExpiryCosts(
+      [...this.turnsByKey.values(), ...this.newestBySession.values()],
+      expiryFacts,
+      now,
+    );
+    this.postRedrawnCards(turns, () => (held ??= this.dispatchedTurnCosts()), expiryFacts, childCosts, now);
   }
 
   // Update MCP server readings for each draft or session.
@@ -10572,11 +10628,12 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   private lifetimeFiguresBySession(): LifetimeFigures {
-    // Cache lifetime figures by session sources, displayed records, and pending-source state.
+    const labels: ModelLabels | undefined = this.modelLabels;
+    // Cache lifetime figures by session sources, displayed records, pending-source state, and model display names.
     return this.lifetimeFigures.read(
       this.lifetimeDisplayFiles(),
       this.sessionSpendSources,
-      (sessionId, files, sources, pending): SessionHeldFigures | undefined => {
+      (sessionId, files, sources, pending): SessionPricedFigures | undefined => {
         // The contributions are priced here, once per change, so a card draw only looks them up.
         const contributions = sources.some((source) => source.dispatchedVia !== undefined)
           ? dispatchedSpendPartsBySession(files, sources, pending)[sessionId]
@@ -10609,30 +10666,37 @@ export class PanelProvider implements vscode.Disposable {
         if (!indexed && !turns && !cache) {
           return dispatched ? { dispatched } : undefined;
         }
-        const cost = sessionCostProjection((indexed ?? []).map(sessionCostUsageOf), coverage.get(sessionId), {
-          compactionCount: turns?.compactionCount ?? null,
-          expiry: cache?.expiry ?? null,
-        });
-        const lifetime: SessionLifetimeFigures = {
-          stats: [
-            ...cost.stats,
-            ...sessionTurnStats(turns),
-            ...sessionCacheExpiryStats(
-              cache?.expiry ?? {
-                counts: { '5m': 0, '30m': 0, '1h': 0 },
-                longestGapMs: null,
-                returns: [],
-                excluded: 0,
-                unavailable: 0,
-                truncated: false,
-              },
-            ),
-          ],
-          cost: cost.total,
-          contextDetail: sessionCompactionContextDetail(cache?.compactions ?? []),
-          // Cache-expiry counts remain unknown without available complete primary-source cache facts.
-          cacheExpiryCount: cache ? cacheExpiryReturnCount(cache.expiry) : null,
-          cacheExpiryFacts: cache?.expiry ?? null,
+        const parts = (indexed ?? []).map(sessionCostUsageOf);
+        const covered = coverage.get(sessionId);
+        const later: SessionStatChip[] = [
+          ...sessionTurnStats(turns),
+          ...sessionCacheExpiryStats(
+            cache?.expiry ?? {
+              counts: { '5m': 0, '30m': 0, '1h': 0 },
+              longestGapMs: null,
+              returns: [],
+              excluded: 0,
+              unavailable: 0,
+              truncated: false,
+            },
+          ),
+        ];
+        const contextDetail = sessionCompactionContextDetail(cache?.compactions ?? []);
+        // The cost projection is the step that reads the model display names.
+        const lifetime = (labels: ModelLabels | undefined): SessionLifetimeFigures => {
+          const cost = sessionCostProjection(parts, covered, {
+            compactionCount: turns?.compactionCount ?? null,
+            expiry: cache?.expiry ?? null,
+            labels,
+          });
+          return {
+            stats: [...cost.stats, ...later],
+            cost: cost.total,
+            contextDetail,
+            // Cache-expiry counts remain unknown without available complete primary-source cache facts.
+            cacheExpiryCount: cache ? cacheExpiryReturnCount(cache.expiry) : null,
+            cacheExpiryFacts: cache?.expiry ?? null,
+          };
         };
         return { lifetime, ...(dispatched ? { dispatched } : {}) };
       },
@@ -10663,6 +10727,14 @@ export class PanelProvider implements vscode.Disposable {
         return { stats, costs, contextDetails, cacheExpiryCounts, cacheExpiryFacts, dispatched };
       },
       (file, record) => this.projectSpendHolds(file, record),
+      // New display names draw the held figures again. They read no file, run no spend-part function, and price no dispatched cost.
+      {
+        input: labels,
+        project: ({ lifetime, dispatched }) => ({
+          ...(lifetime ? { lifetime: lifetime(labels) } : {}),
+          ...(dispatched ? { dispatched } : {}),
+        }),
+      },
     );
   }
 
@@ -10736,6 +10808,17 @@ export class PanelProvider implements vscode.Disposable {
     ]);
     if (!moved.size) return;
     this.performanceCounters?.recordWork('dispatchedCostsPostMoved');
+    this.postRedrawnCards(new Map([...turns].filter(([key]) => moved.has(key))), costs, expiryFacts, childCosts, now);
+  }
+
+  // Draw again each drawn card whose key `turns` holds, from its recorded turn, and post the new cards.
+  private postRedrawnCards(
+    turns: ReadonlyMap<string, Turn>,
+    costs: () => ReturnType<typeof this.dispatchedTurnCosts>,
+    expiryFacts: LifetimeFigures['cacheExpiryFacts'],
+    childCosts: ReadonlyMap<string, ChildExpiryCost>,
+    now: number,
+  ): void {
     const folders = this.folders();
     const running = this.runningSessions();
     const children = this.liveOpenChildren(now);
@@ -10743,8 +10826,8 @@ export class PanelProvider implements vscode.Disposable {
     const changed: RenderCard[] = [];
     for (let index = 0; index < this.cards.length; index++) {
       const previous = this.cards[index];
-      if (!moved.has(previous.key)) continue;
-      const turn = turns.get(previous.key)!;
+      const turn = turns.get(previous.key);
+      if (!turn) continue;
       const latest = this.newestBySession.get(turn.sessionId) === turn;
       const title =
         (turn.agent === 'claude' ? this.sessionNames.get(turn.sessionId)?.label : null) ||
@@ -15335,6 +15418,7 @@ export class PanelProvider implements vscode.Disposable {
       new Set(liveChildren.get(turn.sessionId)),
       counted,
       expiry,
+      this.modelLabels,
     );
     const matches = (this.claudeChildReferences ?? []).filter(
       (reference) =>

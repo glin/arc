@@ -42,6 +42,7 @@ import {
   AgentName,
   AgentPlan,
   AgentPlanSource,
+  CodexModelsCacheFile,
   McpBook,
   McpChange,
   McpPendingRefreshes,
@@ -128,7 +129,7 @@ import {
   type GuardedSendResult,
   type GuardedStartContext,
 } from './sessionwrites';
-import { claudeConfigHome } from './agentpaths';
+import { claudeConfigHome, codexHome } from './agentpaths';
 import { ClaudePluginOffer, ClaudePluginSetup, pluginTarget } from './claudeplugin';
 import {
   BundledTools,
@@ -356,6 +357,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       void saveCatalog(context.globalState, agent, readPath, cliPath(agent), list);
     },
   );
+  // Codex's own saved model list names the Codex models that no catalog holds.
+  const codexModelsCache = new CodexModelsCacheFile(path.join(codexHome(), 'models_cache.json'));
   // Retain the latest MCP server list for each draft or recorded session, without a freshness clock.
   const mcp = new McpBook();
   const mcpRefreshes = new McpPendingRefreshes();
@@ -938,6 +941,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     panel.setModels(
       models.lists(),
       USAGE_AGENT_ORDER.filter((agent) => models.pending(agent)),
+      codexModelsCache.read(),
     );
     panel.setPicks(settingBook());
   };

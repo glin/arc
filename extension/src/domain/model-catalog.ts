@@ -21,6 +21,10 @@ export interface ModelChoice {
   efforts: EffortChoice[];
 }
 
+// One entry of a model list that a CLI publishes: the value it takes, the model it resolves to,
+// and its display name.
+export type ListedModel = Pick<ModelChoice, 'value' | 'resolvedModel' | 'label'>;
+
 // A saved or inherited value can add a window to a listed value, as `opus[1m]` adds one to `opus`.
 // It matches the one row whose value is the same without its window.
 export function windowedChoice<T extends { value: string }>(models: readonly T[], value: string | undefined): T | null {

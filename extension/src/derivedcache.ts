@@ -377,7 +377,7 @@ export const MAX_CODEX_DISPATCH_CURSOR_BYTES = 64 * 1024 * 1024;
 export { MAX_CLAUDE_CHILD_REFERENCES_PER_FILE };
 // Bump when Claude or Codex dispatched spend reading changes what it derives. A mismatch drops the saved
 // facts and keeps their rows.
-export const DISPATCH_FACTS_VERSION = 1;
+export const DISPATCH_FACTS_VERSION = 2;
 export const MAX_SAVED_DISPATCH_FACTS_BYTES = 16 * 1024 * 1024;
 
 // A dispatched session's settled spend facts at one file revision and spend tree.

@@ -12391,6 +12391,184 @@ test("the host counts a dispatched session in its parent's cost once and files i
     );
     assertCounted(cardOf(nested, parentTurn(['toolu_agent'])), 1, 'a session a nested subagent dispatched');
   }
+  {
+    // New display names redraw the drawn cards and the session list once, from held turns and
+    // held figures. The redraw lists no session, reads no file and calculates no figures again.
+    // An unchanged publication reads no catalog entry. A card draw reads the names and never a
+    // catalog, and the turn the caches save keeps its recorded model ID.
+    type LabelHost = CardHost & {
+      setModels(...args: unknown[]): void;
+      lifetimeFigures: { read(...args: unknown[]): unknown };
+    };
+    const host = cardHost([]) as LabelHost;
+    const parentStats = () => JSON.stringify(host.lifetimeFiguresBySession().stats.parent);
+    assert.ok(parentStats().includes('Opus 5') && !parentStats().includes('Opus 5 listed'));
+    const read = host.lifetimeFigures.read.bind(host.lifetimeFigures);
+    let calculated = 0;
+    host.lifetimeFigures.read = (files, sources, calculate, ...rest) =>
+      read(
+        files,
+        sources,
+        (...args: unknown[]) => {
+          calculated++;
+          return (calculate as (...args: unknown[]) => unknown)(...args);
+        },
+        ...rest,
+      );
+    const usage = {
+      requests: 2,
+      input: 40_000,
+      cacheWrite1h: 0,
+      cacheWrite5m: 0,
+      cacheRead: 0,
+      output: 4_000,
+      thinking: 0,
+    };
+    const turnOf = (model: string) =>
+      fixtureTurn({
+        sessionId: 'parent',
+        startedAt: Date.parse('2026-08-31T09:00:00'),
+        files: [],
+        commits: [],
+        agents: [],
+        model,
+        usage,
+        usageParts: [
+          {
+            model,
+            provider: null,
+            contextWindow: null,
+            contextBand: null,
+            inferenceClass: null,
+            serviceTier: null,
+            usage,
+          },
+        ],
+      });
+    type Drawn = ReturnType<CardHost['renderTurnCard']>;
+    const mainModels = (card: Drawn) =>
+      (costOf(card) as unknown as { detailList: { cost: { sections: { detail?: string }[] } } }).detailList.cost
+        .sections[0].detail;
+    const recorded = turnOf('claude-opus-5');
+    const refreshes: unknown[][] = [];
+    const railPosts: unknown[][] = [];
+    const posted: { type: string; cards: Drawn[] }[] = [];
+    const forbid = (what: string) => () => {
+      throw new Error(`a model name change ${what}`);
+    };
+    Object.assign(host, {
+      refreshFrom: (...args: unknown[]) => refreshes.push(args),
+      refresh: forbid('refreshed the panel'),
+      allSessions: forbid('listed the sessions'),
+      walkCatalog: forbid('walked the catalog'),
+      completeSelectedWindow: forbid('read a transcript'),
+      postRail: (...args: unknown[]) => railPosts.push(args),
+      newestBySession: new Map([[recorded.sessionId, recorded]]),
+      cards: [{ kind: 'turn', key: turnKey(recorded), sessionId: recorded.sessionId }],
+      hosts: [{ webview: {} }],
+      sessionNames: new SessionNames(),
+      folders: () => [],
+      runningSessions: () => new Set(),
+      liveOpenChildren: () => new Map(),
+      railStatuses: () => ({ statuses: new Map(), openChildren: new Map() }),
+      themedFor: (cards: unknown[]) => cards,
+      sendToHost: (_host: unknown, message: { type: string; cards: Drawn[] }) => posted.push(message),
+    });
+    const saved = JSON.stringify(recorded);
+    const claude = [
+      { value: 'opus', resolvedModel: 'claude-opus-5', label: 'Opus 5 listed', description: '', efforts: [] },
+    ];
+    const none: never[] = [];
+    host.setModels({ claude }, [], none);
+    assert.deepEqual(refreshes, [['models']], 'new names forced a full refresh');
+    assert.equal(railPosts.length, 1, 'new names did not redraw the session list');
+    assert.equal(posted.length, 1, 'new names did not redraw the drawn cards once');
+    assert.equal(mainModels(posted[0].cards[0]), 'Opus 5 listed');
+    assert.ok(parentStats().includes('Opus 5 listed'), 'the session cost popover kept the old name');
+    assert.equal(calculated, 0, 'new names calculated the held figures again');
+    assert.equal(JSON.stringify(recorded), saved, 'a card draw wrote a display name into the turn');
+    Object.defineProperty(claude[0], 'label', {
+      get() {
+        throw new Error('an unchanged publication read a catalog entry');
+      },
+    });
+    host.setModels({ claude }, ['codex'], none);
+    assert.equal(refreshes.length, 2);
+    assert.equal(posted.length, 1, 'an unchanged list redrew the cards');
+    Object.defineProperty(host, 'models', {
+      get() {
+        throw new Error('a card draw read a model catalog');
+      },
+    });
+    assert.equal(mainModels(cardOf(host, recorded)), 'Opus 5 listed');
+  }
+  {
+    // Codex's own saved model list reaches the names through the catalog publication, and the
+    // live catalog names a model before it.
+    const host = cardHost([]) as CardHost & { setModels(...args: unknown[]): void };
+    Object.assign(host, { refreshFrom() {}, hosts: [] });
+    const extensionSource = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
+    const publishCode = esbuild.transformSync(
+      `${statementFrom(extensionSource, extensionSource.indexOf('const publishPicks ='))}\nreturn publishPicks;`,
+      { loader: 'ts' },
+    ).code;
+    let lists: Record<string, unknown[]> = {};
+    const publishPicks = new Function(
+      'panel',
+      'models',
+      'USAGE_AGENT_ORDER',
+      'codexModelsCache',
+      'stored',
+      'settingBook',
+      'ASK_MODE_KEY',
+      publishCode,
+    )(
+      Object.assign(host, { setAskLevels() {}, setPicks() {} }),
+      { lists: () => lists, pending: () => false },
+      USAGE_AGENT_ORDER,
+      { read: () => [{ value: 'gpt-6-astra', label: 'GPT-6-Astra file' }] },
+      () => ({}),
+      () => ({}),
+      'askModes',
+    ) as () => void;
+    const usage = {
+      requests: 1,
+      input: 1_000,
+      cacheWrite1h: 0,
+      cacheWrite5m: 0,
+      cacheRead: 0,
+      output: 100,
+      thinking: 0,
+    };
+    const astra = fixtureTurn({
+      sessionId: 'parent',
+      startedAt: Date.parse('2026-08-31T09:00:00'),
+      files: [],
+      commits: [],
+      agents: [],
+      model: 'gpt-6-astra',
+      usage,
+      usageParts: [
+        {
+          model: 'gpt-6-astra',
+          provider: null,
+          contextWindow: null,
+          contextBand: null,
+          inferenceClass: null,
+          serviceTier: null,
+          usage,
+        },
+      ],
+    });
+    const named = () =>
+      (costOf(cardOf(host, astra)) as unknown as { detailList: { cost: { sections: { detail?: string }[] } } })
+        .detailList.cost.sections[0].detail;
+    publishPicks();
+    assert.equal(named(), 'GPT-6-Astra file', "Codex's saved model list named no card part");
+    lists = { codex: [{ value: 'gpt-6-astra', label: 'GPT-6 Astra live', description: '', efforts: [] }] };
+    publishPicks();
+    assert.equal(named(), 'GPT-6 Astra live', "Codex's saved model list named a model before the live catalog");
+  }
 });
 
 test('Claude child sessions own lifetime figures while project files stay deduplicated', () => {
@@ -15579,6 +15757,7 @@ function catalogRefreshFixture(book?: UsageBook) {
     USAGE_AGENT_ORDER,
     mcp,
     liveMcpTarget,
+    codexModelsCache: { read: () => [] },
     panel: {
       setAskLevels() {},
       setPicks() {},
@@ -20717,6 +20896,7 @@ test('provider acceptance adopts overlapping drafts without losing either setup'
     'models',
     'USAGE_AGENT_ORDER',
     'ASK_MODE_KEY',
+    'codexModelsCache',
     `${extensionSource.slice(callbackAt, callbackEnd)}; return panel.onSessionSettingsAdopted;`,
   )(
     host,
@@ -20728,6 +20908,7 @@ test('provider acceptance adopts overlapping drafts without losing either setup'
     { lists: () => ({}), pending: () => false },
     USAGE_AGENT_ORDER,
     'arc.askModes',
+    { read: () => [] },
   );
 
   const archiveChanges: string[][] = [];
@@ -22671,7 +22852,7 @@ test('a rail card wears the status that needs attention', () => {
   );
   sourceMatch(
     lifetimeBody,
-    /sessionCostProjection\(\(indexed \?\? \[\]\)\.map\(sessionCostUsageOf\)/,
+    /const parts = \(indexed \?\? \[\]\)\.map\(sessionCostUsageOf\);[\s\S]*?sessionCostProjection\(parts,/,
     'the lifetime cost projection drops main and delegated attribution before it builds the detail',
   );
 });

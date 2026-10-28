@@ -88,6 +88,7 @@ import {
   formatWhen,
   friendlyModel,
   shortModel,
+  type ModelLabels,
 } from './turnformat';
 import { turnKey } from './turnread';
 import {
@@ -2853,6 +2854,7 @@ function costDetailList(
   shares: readonly DispatchedShare[] = [],
   expiry: CacheExpiryWarning | null = null,
   waitWarnings: readonly WaitShareWarning[] = [],
+  labels?: ModelLabels,
 ): StatDetailList {
   const agentCosts = new Map<TurnAgent, AgentCost>();
   const total = cardCostOf(turn, shares, agentCosts);
@@ -3040,7 +3042,10 @@ function costDetailList(
         sections: [
           {
             label: 'Main agent',
-            detail: modelNames(mainPriced.map((held) => held.part.model)),
+            detail: modelNames(
+              mainPriced.map((held) => held.part.model),
+              labels,
+            ),
             ...(delegates ? { value: mainValue } : {}),
             title: `${[
               centsCost(mainDollars),
@@ -3063,7 +3068,10 @@ function costDetailList(
         tabs: [
           {
             name: 'Usage',
-            parts: [{ rows: usageRows }, ...(delegates ? [delegatedModelPart(children, delegatedDollars)] : [])],
+            parts: [
+              { rows: usageRows },
+              ...(delegates ? [delegatedModelPart(children, delegatedDollars, labels)] : []),
+            ],
           },
           ...(toolRows.length || delegatedTools.length
             ? [
@@ -3968,6 +3976,7 @@ function chipsOf(
   // The dispatched sessions the card counts in its cost.
   dispatched: readonly DispatchedTurnCost[] = [],
   expiry: CacheExpiryWarning | null = null,
+  labels?: ModelLabels,
 ): StatChip[] {
   const chips: StatChip[] = [];
   const shares = dispatched.map((cost) => dispatchedShare(turn, cost));
@@ -3985,6 +3994,7 @@ function chipsOf(
       shares,
       expiry,
       waitWarnings,
+      labels,
     );
     const warnings: (CacheWriteWarning | CacheExpiryWarning | WaitShareWarning)[] = [
       ...(expiry &&
@@ -4795,6 +4805,8 @@ export function toCard(
   dispatched: readonly DispatchedTurnCost[] = [],
   // The return to an expired cache that opened this turn, from `turnCacheExpiryWarning`.
   expiry: CacheExpiryWarning | null = null,
+  // Display names from the CLIs' model lists, which the cost popover's model names read first.
+  labels?: ModelLabels,
 ): TurnCard {
   const live: AgentLive = { session: sessionLive, children: liveChildren };
   let added = 0;
@@ -4874,6 +4886,7 @@ export function toCard(
     carried,
     dispatched,
     expiry,
+    labels,
   );
   const headDetails = chips.filter((chip) => chip.headDetail).map((chip) => chip.name || chip.detail);
   const label = headLabel(
@@ -6145,7 +6158,7 @@ interface DelegatedChild {
 // row it holds. A row without a priced part reads `cost unavailable` with no share, and a row with
 // incomplete usage reads its dollars as a lower bound. Rows past the third wait behind the View
 // more expander.
-function delegatedModelPart(children: readonly DelegatedChild[], whole: number): CostDetailPart {
+function delegatedModelPart(children: readonly DelegatedChild[], whole: number, labels?: ModelLabels): CostDetailPart {
   const groups = new Map<
     string,
     { ids: Set<string>; count: number; dollars: number; priced: boolean; partial: boolean }
@@ -6153,7 +6166,7 @@ function delegatedModelPart(children: readonly DelegatedChild[], whole: number):
   for (const child of children) {
     const counted = new Set<string>();
     for (const part of child.parts) {
-      const name = friendlyModel(part.model);
+      const name = friendlyModel(part.model, labels);
       const held = groups.get(name) ?? { ids: new Set<string>(), count: 0, dollars: 0, priced: false, partial: false };
       if (part.model) held.ids.add(part.model);
       held.partial ||= Boolean(child.partial || part.partial);
@@ -6209,8 +6222,8 @@ const pricedModelParts = (costs: readonly PricedSessionCost[]) =>
   costs.map((cost) => ({ model: cost.part.model, dollars: cost.dollars, partial: cost.partial }));
 
 // The reading names of a section's models, each once.
-const modelNames = (models: readonly (string | null)[]): string =>
-  [...new Set(models.map((model) => friendlyModel(model)))].join(', ');
+const modelNames = (models: readonly (string | null)[], labels?: ModelLabels): string =>
+  [...new Set(models.map((model) => friendlyModel(model, labels)))].join(', ');
 
 // A section's fact line: request count, cached share of input, and average input. The count
 // shows only when every part recorded an exact count.
@@ -6290,11 +6303,14 @@ function waitShareLead(
 const dollarsOf = (costs: readonly PricedSessionCost[]): number =>
   costs.reduce((sum, cost) => sum + (cost.dollars ?? 0), 0);
 
-// The overheads a session cost popover names under "Included above".
+// The overheads a session cost popover names under "Included above", and the model labels its
+// model names read.
 export interface SessionOverheads {
   // The exact lifetime count of completed primary-session compactions.
   compactionCount?: number | null;
   expiry?: CacheExpiryFacts | null;
+  // Display names from the CLIs' model lists, which the model names read first.
+  labels?: ModelLabels;
 }
 
 // Groups delegated work without a named scope, marking missing usage as partial.
@@ -6538,7 +6554,10 @@ export function sessionCostProjection(
       sections: [
         {
           label: 'Main agent',
-          detail: modelNames(main.map((cost) => cost.part.model)),
+          detail: modelNames(
+            main.map((cost) => cost.part.model),
+            overheads.labels,
+          ),
           ...(delegates ? { value: mainValue } : {}),
           title: [
             centsCost(mainDollars),
@@ -6582,6 +6601,7 @@ export function sessionCostProjection(
                       { parts: pricedModelParts(unscoped), counted: false, partial: short },
                     ],
                     delegatedDollars,
+                    overheads.labels,
                   ),
                 ]
               : []),

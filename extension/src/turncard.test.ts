@@ -120,7 +120,7 @@ import type {
 } from './turncard.ts';
 import type { TurnStep } from './transcript.ts';
 import { answerPart, commentAnchorText } from './turncomments.ts';
-import { formatTokens, formatWhen } from './turnformat.ts';
+import { formatTokens, formatWhen, modelLabels } from './turnformat.ts';
 import {
   COMPACTION_SAMPLES,
   SESSION_LINK_RESPONSE,
@@ -1214,6 +1214,54 @@ test('the Delegated section lists one row per model with its agent count', () =>
     ['Sonnet 5.5', '2 agents'],
     ['Haiku 5.5', '2 agents'],
   ]);
+});
+
+// The cost popovers name each model with the display name its CLI lists, in the Main agent detail
+// and in the Delegated rows of the turn and the session.
+test('the cost popovers name models with the display names their CLIs list', () => {
+  const labels = modelLabels([
+    [{ value: 'fable', resolvedModel: 'claude-fable-5-1', label: 'Fable 5.1' }],
+    [{ value: 'gpt-6.1-sol', label: 'GPT-6.1-Sol' }],
+  ]);
+  const main = { ...sonnetPart, model: 'claude-fable-5-1', usage: tokenUsage({ requests: 4, input: 40_000 }) };
+  const delegated = (model: string, agentKind: 'claude' | 'codex') => ({
+    ...sonnetPart,
+    agent: agentKind,
+    role: 'delegated' as const,
+    scopeId: model,
+    model,
+    usage: tokenUsage({ requests: 2, input: 10_000, output: 5_000 }),
+  });
+  const child = (model: string) =>
+    agent({
+      model,
+      spendFound: true,
+      spend: [{ model, usage: tokenUsage({ requests: 2, input: 10_000 }), usageParts: [delegated(model, 'claude')] }],
+    });
+  const shown = turn({
+    model: 'claude-fable-5-1',
+    usage: main.usage,
+    usageParts: [main],
+    agents: [child('claude-fable-5-1'), child('claude-sonnet-5-5'), child('claude-mystery-1')],
+  });
+  const turnCost = toCard(shown, false, NOW, [], null, false, new Set(), [], null, labels).chips.find(
+    (chip) => chip.metric === 'cost',
+  )!.detailList!.cost!;
+  assert.equal(turnCost.sections[0].detail, 'Fable 5.1');
+  assert.deepEqual(turnCost.tabs[0].parts[1].rows.map((row) => row.label).sort(), [
+    'Fable 5.1',
+    'Sonnet 5.5',
+    'claude-mystery-1',
+  ]);
+  const plain = toCard(shown, false, NOW).chips.find((chip) => chip.metric === 'cost')!.detailList!.cost!;
+  assert.equal(plain.sections[0].detail, 'claude-fable-5-1', 'a popover without lists named a model');
+  const session = sessionCostProjection(
+    [main, delegated('claude-fable-5-1', 'claude'), delegated('gpt-6.1-sol', 'codex')],
+    false,
+    { labels },
+  ).stats[0].detailList!.cost!;
+  assert.equal(session.sections[0].detail, 'Fable 5.1');
+  assert.deepEqual(session.tabs[0].parts[1].rows.map((row) => row.label).sort(), ['Fable 5.1', 'GPT-6.1-Sol']);
 });
 
 // A turn's delegated tool rows read the tool kinds its subagents' usage parts carry, whether the

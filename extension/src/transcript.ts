@@ -9478,6 +9478,8 @@ function readClaudeOwnSpend(
     if (line.trim()) {
       lastLine = line;
     }
+    // A user line holds tool results, which the next request reads, as the spend ledger counts them.
+    noteClaudeToolResultLine(usageState, line);
     if (person && !person.person && mayHoldPersonSign(line, person)) {
       try {
         person.person = personSpokeIn(JSON.parse(line), person);

@@ -216,19 +216,22 @@ export interface SpendLedger {
 // Source changes recalculate only sessions that reference them, including dispatched sources.
 // Records retain their identity until the ledger replaces them.
 // calculate must depend only on its arguments and pending.
-// assemble runs only when a session's figures change.
+// An optional projection is the last step over each session's figures, and reads one more input.
+// A new input runs only that step again, over the held figures, and never runs calculate.
+// assemble runs only when a session's figures or projections change.
 // Pending answers are watched only for dispatched sources that await the ledger.
-// Matching records, sources, and normalization generation reuse the cached value without resolving paths.
+// Matching records, sources, normalization generation, and projection input reuse the cached value without resolving paths.
 // Invalidating a cached path advances the generation and forces source resolution.
-export class SessionFiguresCache<T, R> {
+export class SessionFiguresCache<T, R, P = T> {
   private files: readonly SpendFileIndex[] | null = null;
   private sources: readonly SessionSpendSource[] | null = null;
   private generation = -1;
   // Each dispatched source a held session consulted `pending` for, its record, and the answer.
   private watched: SpendPendingAnswers = new Map();
   private groups = new Map<string, SessionSourceGroup>();
-  private held = new Map<string, HeldSessionFigures<T>>();
+  private held = new Map<string, HeldSessionFigures<T, P>>();
   private value!: R;
+  private input: unknown;
 
   read(
     files: readonly SpendFileIndex[],
@@ -239,12 +242,17 @@ export class SessionFiguresCache<T, R> {
       sources: readonly SessionSpendSource[],
       pending: SpendSourcePending,
     ) => T | undefined,
-    assemble: (figures: ReadonlyMap<string, T>) => R,
+    assemble: (figures: ReadonlyMap<string, P>) => R,
     pending: SpendSourcePending = () => true,
+    projection?: { input: unknown; project: (figures: T) => P },
   ): R {
+    const input = projection?.input;
+    const project = projection?.project ?? ((figures: T) => figures as unknown as P);
+    const inputMoved = input !== this.input;
     const heldFiles = this.files;
     if (
       heldFiles &&
+      !inputMoved &&
       !this.pendingMoved(pending) &&
       sources === this.sources &&
       spendFileNormalizationGeneration === this.generation &&
@@ -257,7 +265,7 @@ export class SessionFiguresCache<T, R> {
       this.groups = sessionSourceGroups(sources);
     }
     const records = new Map(files.map((record) => [spendRecordKey(record), record]));
-    const next = new Map<string, HeldSessionFigures<T>>();
+    const next = new Map<string, HeldSessionFigures<T, P>>();
     const watched = new Map<string, { record: SpendFileIndex | undefined; answer: boolean }>();
     let moved = heldFiles === null;
     for (const [sessionId, group] of this.groups) {
@@ -280,17 +288,29 @@ export class SessionFiguresCache<T, R> {
         found.every((record, at) => record === previous.records[at]) &&
         sameWaiting(previous.waiting, waiting)
       ) {
-        next.set(sessionId, previous);
+        if (inputMoved && previous.value !== undefined) {
+          next.set(sessionId, { ...previous, projected: project(previous.value) });
+          moved = true;
+        } else {
+          next.set(sessionId, previous);
+        }
         continue;
       }
       moved = true;
       const own = [...new Set(found.filter((record): record is SpendFileIndex => record !== undefined))];
       const held: ReadonlyMap<string, boolean> | null = waiting;
+      const value = calculate(
+        sessionId,
+        own,
+        group.sources,
+        (file, record) => held?.get(file) ?? pending(file, record),
+      );
       next.set(sessionId, {
         sources: group.sources,
         records: found,
         waiting: held,
-        value: calculate(sessionId, own, group.sources, (file, record) => held?.get(file) ?? pending(file, record)),
+        value,
+        projected: value === undefined ? undefined : project(value),
       });
     }
     moved ||= next.size !== this.held.size;
@@ -300,11 +320,12 @@ export class SessionFiguresCache<T, R> {
     this.files = files.slice();
     this.sources = sources;
     this.generation = spendFileNormalizationGeneration;
+    this.input = input;
     if (moved) {
       this.value = assemble(
         new Map(
           [...next].flatMap(([sessionId, entry]) =>
-            entry.value === undefined ? [] : [[sessionId, entry.value] as const],
+            entry.projected === undefined ? [] : [[sessionId, entry.projected] as const],
           ),
         ),
       );
@@ -413,12 +434,14 @@ interface SessionSourceGroup {
   lexical: string[];
 }
 
-interface HeldSessionFigures<T> {
+interface HeldSessionFigures<T, P> {
   sources: readonly SessionSpendSource[];
   records: readonly (SpendFileIndex | undefined)[];
   // The `pending` answer for each unread dispatched source the figures read, or null for none.
   waiting: ReadonlyMap<string, boolean> | null;
   value: T | undefined;
+  // The projection of `value` with the input of the read that made it.
+  projected: P | undefined;
 }
 
 // A record's file in the form sources are matched against. The file of a record never changes,

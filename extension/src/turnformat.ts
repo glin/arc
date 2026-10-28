@@ -10,6 +10,8 @@ export {
 } from './view/time.ts';
 export type { RelativeStep } from './view/time.ts';
 export { formatTokens } from './view/tokens.ts';
+import { modelWindowOf, normalizeModelIdentity } from './domain/model-identity.ts';
+import type { ListedModel } from './domain/model-catalog.ts';
 
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
@@ -39,12 +41,54 @@ export function shortModel(model: string | null): string | null {
 
 const MODEL_WORD = (word: string): string => word.charAt(0).toUpperCase() + word.slice(1);
 
-// A model's reading name: `claude-opus-5-5-20261001` reads `Opus 5.5`, `gpt-6.1-sol` reads
-// `GPT-6.1 Sol` and `gpt-6-astra` reads `GPT-6 Astra`. Any other model reads its recorded ID,
-// and a missing model reads `Model not recorded`.
-export function friendlyModel(model: string | null | undefined): string {
+// Display names keyed by model ID without a context window suffix or a snapshot date, as
+// `modelLabels` builds them.
+export type ModelLabels = ReadonlyMap<string, string>;
+
+// Display names from the model lists the CLIs publish, earlier lists first. Each entry names its
+// `value` and its `resolvedModel`, and the first list that names a model wins. A `default` entry
+// names a choice, not a model. An entry whose label repeats its ID has no display name. An entry
+// whose value or resolved model carries a context window suffix can name the window in its label.
+// None of the three names anything.
+export function modelLabels(lists: readonly (readonly ListedModel[])[]): Map<string, string> {
+  const labels = new Map<string, string>();
+  for (const list of lists) {
+    for (const entry of list) {
+      const label = entry.label.trim();
+      const ids = [entry.value, entry.resolvedModel].filter((id): id is string => !!id?.trim());
+      if (
+        !label ||
+        entry.value.trim().toLowerCase() === 'default' ||
+        ids.includes(label) ||
+        ids.some((id) => modelWindowOf(id) !== '')
+      ) {
+        continue;
+      }
+      for (const id of ids) {
+        const key = normalizeModelIdentity(id);
+        if (key && !labels.has(key)) labels.set(key, label);
+      }
+    }
+  }
+  return labels;
+}
+
+// Whether two label maps hold the same names.
+export function sameModelLabels(left: ModelLabels, right: ModelLabels): boolean {
+  return left.size === right.size && [...left].every(([key, label]) => right.get(key) === label);
+}
+
+// A model's reading name. The display name a CLI's model list gives it comes first. Otherwise
+// `claude-opus-5-5-20261001` reads `Opus 5.5`, `gpt-6.1-sol` reads `GPT-6.1 Sol` and
+// `gpt-6-astra` reads `GPT-6 Astra`. Any other model reads its recorded ID, and a missing model
+// reads `Model not recorded`.
+export function friendlyModel(model: string | null | undefined, labels?: ModelLabels): string {
   if (!model) {
     return 'Model not recorded';
+  }
+  const listed = labels?.get(normalizeModelIdentity(model));
+  if (listed) {
+    return listed;
   }
   // A context suffix such as `[1m]` and a snapshot date name the same model.
   const bare = model

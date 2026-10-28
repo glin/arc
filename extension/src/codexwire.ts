@@ -1,4 +1,5 @@
 import { unavailableDefaults, type AppliedDefaults } from './view/model-picks';
+import type { ListedModel } from './domain/model-catalog';
 import { SessionNameUncertain } from './sessionrename';
 import { promptToken } from './domain/composer-editing';
 import { compareVersion, parseVersion } from './domain/version';
@@ -2432,6 +2433,25 @@ export function readModels(payload: unknown, readAt: number): ModelList | null {
     return null;
   }
   return { models, readAt };
+}
+
+// The slug and display name of each model in the model list Codex saves as `models_cache.json`.
+// Text that is not that list reads as no models.
+export function readCachedModels(text: string): ListedModel[] {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    return [];
+  }
+  const models: ListedModel[] = [];
+  for (const entry of arr(obj(payload)?.models)) {
+    const model = obj(entry);
+    const value = model && str(model.slug);
+    const label = model && str(model.display_name);
+    if (value && label) models.push({ value, label });
+  }
+  return models;
 }
 
 // Reads an error string or an object's message field.

@@ -6,7 +6,7 @@ import { turnKey } from './domain/read.ts';
 // Production modules do not import this file.
 // The fixture uses the panel's builders to keep payload fields aligned with their output.
 
-import { formatRelative, railSessions, toCard } from './turnview.ts';
+import { formatRelative, modelLabels, railSessions, toCard } from './turnview.ts';
 import { labelCounts } from './turnlabels.ts';
 import type { SavedView } from './domain/views.ts';
 import type { SavedRailFilter } from './domain/rail-filters.ts';
@@ -1493,17 +1493,26 @@ function costOverheadsParts() {
 export function costOverheadsPayload(delegated = false): Record<string, unknown> {
   const payload = renderPayload();
   const { usage, part, turn, expiry } = costOverheadsParts();
-  const child = (agentName: string, model: string, requests: number) => ({
-    agent: 'claude' as const,
-    role: 'delegated' as const,
-    agentName,
-    scopeId: `agent-${agentName}`,
-    ...part,
-    model,
-    usage: usage({ requests, input: 40_000 * requests, cacheRead: 900_000 * requests, output: 9_000 * requests }),
-  });
+  // The model list Claude Code publishes names the planner's model.
+  const labels = modelLabels([[{ value: 'fable', resolvedModel: 'claude-fable-5-1', label: 'Fable 5.1' }]]);
+  const child = (agentName: string, model: string, requests: number) => {
+    const ran = usage({ requests, input: 40_000 * requests, cacheRead: 900_000 * requests, output: 9_000 * requests });
+    return {
+      agent: 'claude' as const,
+      role: 'delegated' as const,
+      agentName,
+      scopeId: `agent-${agentName}`,
+      ...part,
+      model,
+      usage: ran,
+      tools: fixtureTools(requests, [
+        ['file read', requests / 2, usageShare(ran, 0.5)],
+        ['search', requests / 4, usageShare(ran, 0.25)],
+      ]),
+    };
+  };
   const children = delegated
-    ? [child('reviewer', 'claude-sonnet-5-5', 40), child('planner', 'claude-haiku-5-5', 20)]
+    ? [child('reviewer', 'claude-sonnet-5-5', 40), child('planner', 'claude-fable-5-1', 20)]
     : [];
   const shown = delegated
     ? {
@@ -1578,7 +1587,7 @@ export function costOverheadsPayload(delegated = false): Record<string, unknown>
           ...children.map(({ agentName: _name, ...one }) => one),
         ],
         false,
-        { compactionCount: 3, expiry: aggregate },
+        { compactionCount: 3, expiry: aggregate, labels },
       ).stats,
       ...sessionTurnStats({ turnCount: 22, firstTurnAt: turn.startedAt, lastTurnAt: turn.endedAt, compactionCount: 3 }),
       ...sessionCacheExpiryStats(aggregate),
@@ -1594,7 +1603,7 @@ export function costOverheadsPayload(delegated = false): Record<string, unknown>
     views: [],
     cards: [
       {
-        ...toCard(shown, false, NOW, [], null, false, new Set(), [], turnCacheExpiryWarning(turn, expiry)),
+        ...toCard(shown, false, NOW, [], null, false, new Set(), [], turnCacheExpiryWarning(turn, expiry), labels),
         summaryHtml: '<p>Resumed after lunch.</p>',
       },
       {

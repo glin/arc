@@ -11,6 +11,7 @@ import {
   formatTokens,
   formatWhen,
   friendlyModel,
+  modelLabels,
   shortModel,
 } from './turnformat.ts';
 import { MB, NOW } from './turnfixtures.ts';
@@ -100,6 +101,72 @@ test('a model reads its family and version, and an unknown model reads its recor
   }
   assert.equal(friendlyModel(null), 'Model not recorded');
   assert.equal(friendlyModel(''), 'Model not recorded');
+});
+
+// The display names come from the model lists Claude Code and Codex publish, which the prompt
+// box's model picker also shows.
+const CLAUDE_LIST = [
+  { value: 'default', resolvedModel: 'claude-opus-5-5', label: 'Default (recommended)' },
+  { value: 'fable', resolvedModel: 'claude-fable-5-1', label: 'Fable 5.1' },
+  { value: 'sonnet[1m]', resolvedModel: 'claude-sonnet-5-5[1m]', label: 'Sonnet 5.5 (1M context)' },
+  { value: 'sonnet', resolvedModel: 'claude-sonnet-5-5', label: 'Sonnet 5.5' },
+  { value: 'haiku', resolvedModel: 'claude-haiku-4-5', label: 'haiku' },
+];
+const CODEX_LIST = [{ value: 'gpt-6.1-sol', resolvedModel: 'gpt-6.1-sol', label: 'GPT-6.1-Sol' }];
+
+test('a model reads the display name its CLI lists for it', () => {
+  const labels = modelLabels([CLAUDE_LIST, CODEX_LIST]);
+  for (const [model, name] of [
+    ['claude-fable-5-1', 'Fable 5.1'],
+    ['claude-fable-5-1-20261001', 'Fable 5.1'],
+    ['claude-fable-5-1[1m]', 'Fable 5.1'],
+    ['gpt-6.1-sol', 'GPT-6.1-Sol'],
+    // The plain entry wins over the entry whose label names its window.
+    ['claude-sonnet-5-5', 'Sonnet 5.5'],
+  ] as const) {
+    assert.equal(friendlyModel(model, labels), name, model);
+  }
+});
+
+test('a model no list names keeps its pattern name or its recorded ID', () => {
+  const labels = modelLabels([CLAUDE_LIST, CODEX_LIST]);
+  for (const [model, name] of [
+    // A `default` entry names a choice, so its label never names the model it resolves to.
+    ['claude-opus-5-5', 'Opus 5.5'],
+    // An entry whose label repeats its value has no display name.
+    ['claude-haiku-4-5', 'Haiku 4.5'],
+    ['gpt-6-astra', 'GPT-6 Astra'],
+    ['claude-mystery-1', 'claude-mystery-1'],
+  ] as const) {
+    assert.equal(friendlyModel(model, labels), name, model);
+  }
+  assert.equal(friendlyModel('claude-fable-5-1'), 'claude-fable-5-1');
+  assert.equal(friendlyModel(null, labels), 'Model not recorded');
+});
+
+test('an earlier model list names a model before a later one', () => {
+  const labels = modelLabels([CODEX_LIST, [{ value: 'gpt-6.1-sol', label: 'GPT-6.1 Sol (saved)' }]]);
+  assert.equal(friendlyModel('gpt-6.1-sol', labels), 'GPT-6.1-Sol');
+});
+
+// A window is a property of the entry. Its label can name the window, so it never names a model.
+test('an entry with a context window names no model, in its value or its resolved model', () => {
+  const labels = modelLabels([
+    [{ value: 'sonnet[1m]', resolvedModel: 'claude-sonnet-5-5', label: 'Sonnet 5.5 (1M context)' }],
+    [{ value: 'opus', resolvedModel: 'claude-opus-5-5[1m]', label: 'Opus 5.5 (1M context)' }],
+  ]);
+  assert.equal(friendlyModel('claude-sonnet-5-5', labels), 'Sonnet 5.5');
+  assert.equal(friendlyModel('claude-opus-5-5', labels), 'Opus 5.5');
+  assert.equal(friendlyModel('claude-sonnet-5-5[1m]', labels), 'Sonnet 5.5');
+});
+
+// The sources rank first, so a later list never names a model an earlier list names.
+test('the first list with a plain entry names the model', () => {
+  const live = [{ value: 'sonnet[1m]', resolvedModel: 'claude-sonnet-5-5[1m]', label: 'Sonnet 5.5 (1M context)' }];
+  const saved = [{ value: 'sonnet', resolvedModel: 'claude-sonnet-5-5', label: 'Sonnet 5.5 saved' }];
+  const file = [{ value: 'claude-sonnet-5-5', label: 'Sonnet 5.5 file' }];
+  assert.equal(friendlyModel('claude-sonnet-5-5', modelLabels([live, saved, file])), 'Sonnet 5.5 saved');
+  assert.equal(friendlyModel('claude-sonnet-5-5', modelLabels([live, file])), 'Sonnet 5.5 file');
 });
 
 test('formatWhen names the day only when it is not today, and the year only when it differs', () => {

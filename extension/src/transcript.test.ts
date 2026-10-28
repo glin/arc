@@ -9508,6 +9508,44 @@ test('a dispatched session folds its own subagents and theirs', () => {
   assert.deepEqual([whole.models[0]?.usage.input, whole.partial], [3000, false]);
 });
 
+// A subagent's requests read the tool results its own transcript holds, so the turn cost popover
+// draws Delegated tool rows.
+test('a turn cost popover draws Delegated tool rows from a subagent transcript', () => {
+  const folder = tempDir('subagent-tools-');
+  const session = path.join(folder, 'sess.jsonl');
+  const subagents = path.join(folder, 'sess', 'subagents');
+  fs.mkdirSync(subagents, { recursive: true });
+  writeRecords(session, [
+    userPrompt('delegate a search', 0),
+    haikuRequest('m0', 1, 'tool_use', agentLaunch('launch-1'), false),
+    {
+      type: 'user',
+      timestamp: at(6),
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'launch-1', content: 'done' }] },
+      toolUseResult: { agentId: 'a1', status: 'completed', totalToolUseCount: 2 },
+    },
+    haikuRequest('m3', 7, 'end_turn', doneText, false),
+  ]);
+  writeSubagentMeta(subagents, 'a1', 'launch-1');
+  const child = path.join(subagents, 'agent-a1.jsonl');
+  writeRecords(child, [
+    userPrompt('search the tree', 2, { isSidechain: true }),
+    haikuRequest('m1', 3, 'tool_use', [
+      { type: 'tool_use', id: 'read-1', name: 'Read', input: { file_path: 'a.ts' } },
+      { type: 'tool_use', id: 'grep-1', name: 'Grep', input: { pattern: 'bug' } },
+    ]),
+    { ...toolResult('read-1', 4), isSidechain: true },
+    { ...toolResult('grep-1', 4), isSidechain: true },
+    haikuRequest('m2', 5, 'end_turn', doneText),
+  ]);
+  const [turn] = readSession(session, 'sess', { agentSpendOf: () => readClaudeAgentSpend(child) }).turns;
+  const cost = toCard(turn, false, Date.parse(at(60))).chips.find((chip) => chip.metric === 'cost')!.detailList!.cost!;
+  const tools = cost.tabs.find((tab) => tab.name === 'Tools')!;
+  const delegated = tools.parts[1];
+  assert.equal(delegated.empty, undefined, 'the Delegated section read No tool results');
+  assert.deepEqual(delegated.rows.map((row) => row.label).sort(), ['File read', 'No tool result', 'Search']);
+});
+
 // A subagent request record opens with its type, session, and agent, then its id and send time.
 function childRequest(id: string, second: number) {
   return { type: 'api-request', sessionId: 'sess', agentId: 'a1', id, timestamp: at(second), version: '2.1.302' };

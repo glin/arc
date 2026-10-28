@@ -558,10 +558,12 @@ function projectFactsOf(files: readonly SpendFileIndex[], sources: readonly Sess
 function sessionFiguresReader() {
   const cache = new SessionFiguresCache<NonNullable<ReturnType<typeof sessionFactsOf>>, object>();
   const calculated: string[] = [];
+  const projected: unknown[] = [];
   const read = (
     files: readonly SpendFileIndex[],
     sources: readonly SessionSpendSource[],
     pending?: (file: string, record: SpendFileIndex | undefined) => boolean,
+    input?: unknown,
   ) =>
     cache.read(
       files,
@@ -572,8 +574,17 @@ function sessionFiguresReader() {
       },
       (figures) => Object.fromEntries(figures),
       pending,
+      input === undefined
+        ? undefined
+        : {
+            input,
+            project: (figures) => {
+              projected.push(input);
+              return figures;
+            },
+          },
     );
-  return { read, calculated };
+  return { read, calculated, projected };
 }
 
 function lifetimeRecord(file: string, tokens: number, whole = true): SpendFileIndex {
@@ -615,6 +626,23 @@ test('held lifetime figures copy the record list, which the ledger edits in plac
   files[0] = lifetimeRecord('a.jsonl', 2);
   assert.notEqual(read(files, sources), first);
   assert.deepEqual(calculated, ['a', 'a']);
+});
+
+// Model display names change the figures without a record change. New names run only the last
+// step again, over the held figures, so no session is calculated again.
+test('held lifetime figures project again without a calculation when the projection input changes', () => {
+  const { read, calculated, projected } = sessionFiguresReader();
+  const sources: SessionSpendSource[] = [{ sessionId: 'a', file: 'a.jsonl', primary: true }];
+  const files = [lifetimeRecord('a.jsonl', 1)];
+  const names = new Map([['claude-fable-5-1', 'Fable 5.1']]);
+  const renamed = new Map(names);
+  const first = read(files, sources, undefined, names);
+  assert.equal(read(files, sources, undefined, names), first);
+  const second = read(files, sources, undefined, renamed);
+  assert.notEqual(second, first, 'new names kept the assembled figures');
+  assert.equal(read(files, sources, undefined, renamed), second);
+  assert.deepEqual(calculated, ['a'], 'new names calculated the session again');
+  assert.deepEqual(projected, [names, renamed]);
 });
 
 test('shared child supplements reject either parent-child recency direction after the child changes', () => {

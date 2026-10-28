@@ -17,6 +17,7 @@ import {
   MODELS_FRESH_MS,
   McpBook,
   McpPendingRefreshes,
+  CodexModelsCacheFile,
   ModelBook,
   SAVED_DEFAULTS_LIMIT,
   SavedDefaults,
@@ -7955,6 +7956,61 @@ test('the first catalog request of a run reads the CLI even with a saved catalog
   );
   next.dropCarried('claude');
   assert.deepEqual(next.lists(), {});
+});
+
+// Codex saves its model list as `models_cache.json`. Arc parses it again only after Codex rewrites it.
+test('the Codex model list file parses again only when its modification time changes', () => {
+  let mtimeMs = 1;
+  const reads: string[] = [];
+  let text = JSON.stringify({
+    models: [{ slug: 'gpt-6.1-sol', display_name: 'GPT-6.1-Sol' }, { slug: 'gpt-nameless' }],
+  });
+  const file = new CodexModelsCacheFile('models_cache.json', {
+    statSync: () => ({ mtimeMs }),
+    readFileSync: (name) => {
+      reads.push(name);
+      return text;
+    },
+  });
+  assert.deepEqual(file.read(), [{ value: 'gpt-6.1-sol', label: 'GPT-6.1-Sol' }]);
+  assert.deepEqual(file.read(), [{ value: 'gpt-6.1-sol', label: 'GPT-6.1-Sol' }]);
+  assert.equal(reads.length, 1, 'an unchanged file was read again');
+  text = JSON.stringify({ models: [{ slug: 'gpt-6-astra', display_name: 'GPT-6-Astra' }] });
+  mtimeMs = 2;
+  assert.deepEqual(file.read(), [{ value: 'gpt-6-astra', label: 'GPT-6-Astra' }]);
+  assert.equal(reads.length, 2);
+  // Codex can hold the file open while it rewrites it. A read that throws keeps the held list and
+  // reads again on the next call, with the same modification time.
+  let busy = true;
+  const reader = new CodexModelsCacheFile('models_cache.json', {
+    statSync: () => ({ mtimeMs }),
+    readFileSync: (name) => {
+      reads.push(name);
+      if (busy) throw Object.assign(new Error('EBUSY'), { code: 'EBUSY' });
+      return text;
+    },
+  });
+  busy = false;
+  assert.deepEqual(reader.read(), [{ value: 'gpt-6-astra', label: 'GPT-6-Astra' }]);
+  busy = true;
+  text = JSON.stringify({ models: [{ slug: 'gpt-6.1-sol', display_name: 'GPT-6.1-Sol' }] });
+  mtimeMs = 3;
+  assert.deepEqual(reader.read(), [{ value: 'gpt-6-astra', label: 'GPT-6-Astra' }], 'a busy file dropped the list');
+  busy = false;
+  assert.deepEqual(reader.read(), [{ value: 'gpt-6.1-sol', label: 'GPT-6.1-Sol' }], 'a busy file was not read again');
+  text = '{"models": [';
+  mtimeMs = 4;
+  assert.deepEqual(file.read(), []);
+  const missing = new CodexModelsCacheFile('gone.json', {
+    statSync: () => {
+      throw new Error('ENOENT');
+    },
+    readFileSync: () => {
+      throw new Error('the reader read a missing file');
+    },
+  });
+  assert.deepEqual(missing.read(), []);
+  assert.equal(missing.read(), missing.read(), 'a missing file returned a new empty list on each read');
 });
 
 test('a catalog answer that arrives after a CLI path change is not saved under the new path', async () => {

@@ -749,6 +749,14 @@ export const SHOTS: Shot[] = [
         click: '.chips [data-metric="cost"]',
       },
       {
+        name: `${size}-cost-overheads-turn-delegated-tools`,
+        width,
+        escape: true,
+        costOverheads: 'delegated' as const,
+        click: '.chips [data-metric="cost"]',
+        costTab: 'Tools' as const,
+      },
+      {
         name: `${size}-cost-overheads-turn-tools`,
         width,
         escape: true,

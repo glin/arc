@@ -37,7 +37,9 @@ import {
   appServerArgs,
   readRateLimits,
   readModels as readCodexModels,
+  readCachedModels,
 } from './codexwire';
+import type { ListedModel } from './domain/model-catalog';
 import {
   WireEvent,
   NativeEvent,
@@ -2770,6 +2772,48 @@ export async function saveCatalog(
     await storage.update(SAVED_CATALOG_PREFIX + agent, { cliPath: readPath, list });
   } catch (error) {
     console.warn('Arc: the model list was not saved, so the next window reads it again.', error);
+  }
+}
+
+// The model list Codex saves as `models_cache.json`. A read stats the file and parses it again
+// only when its modification time changed, so an unchanged file costs one stat. A missing file
+// reads as no models.
+export class CodexModelsCacheFile {
+  private modifiedAt: number | null = null;
+  private models: readonly ListedModel[] = [];
+
+  constructor(
+    private readonly file: string,
+    private readonly files: {
+      statSync(file: string): { mtimeMs: number };
+      readFileSync(file: string, encoding: 'utf8'): string;
+    } = {
+      statSync,
+      readFileSync,
+    },
+  ) {}
+
+  read(): readonly ListedModel[] {
+    let modifiedAt: number;
+    try {
+      modifiedAt = this.files.statSync(this.file).mtimeMs;
+    } catch {
+      this.modifiedAt = null;
+      // An empty list stays the same array, so readers that compare lists see no change.
+      if (this.models.length) this.models = [];
+      return this.models;
+    }
+    if (modifiedAt === this.modifiedAt) return this.models;
+    let text: string;
+    try {
+      text = this.files.readFileSync(this.file, 'utf8');
+    } catch {
+      // Codex can hold the file while it rewrites it. The held list stays, and the next call reads again.
+      return this.models;
+    }
+    this.modifiedAt = modifiedAt;
+    this.models = readCachedModels(text);
+    return this.models;
   }
 }
 

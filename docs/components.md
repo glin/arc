@@ -110,7 +110,7 @@ Paths are relative to `extension/src/`. [Architecture](architecture.md) owns pac
 | `turnread.ts` | Owns unread counts, completed identity mapping admission, retained-tail decisions, and current records for each session, then re-exports shared read rules | no |
 | `turnrail.ts` | Host session rows and ordering, the session that started each dispatched or subagent row, and re-exports of shared session list projections | no |
 | `turnsearch.ts` | Host turn-content search and snippets using full scoped catalog identity resolution and re-exports shared session-query rules and projections | no |
-| `turnformat.ts` | Formats host-only time, duration, size, tokens, and model names and re-exports shared relative-time rules | no |
+| `turnformat.ts` | Formats host-only time, duration, size, tokens, and model names, with display names from the CLIs' model lists first, and re-exports shared relative-time rules | no |
 | `turnlabels.ts` | Session-label storage, membership, counts, abandoned-draft cleanup, and editor rows and re-exports shared label rules | no |
 | `turnplaces.ts` | Tracks visited sessions for Back and Forward navigation | no |
 | `turnfixtures.ts` | Shared test fixtures. Shipped code must not import it | no |
@@ -169,13 +169,13 @@ Paths are relative to `extension/src/`. [Architecture](architecture.md) owns pac
 | `claudewire.ts` | Claude stream-json and control-channel adapter, including the per-child Remote Control state | no |
 | `compactrequest.ts` | Digest-bound self-compaction request and cancel commands, native operation bindings, separate continuation observations, durable admission ports, exact-child guarded delivery, and native completion evidence | no |
 | `compactstore.ts` | Workspace continuation receipts, exclusive immutable recovery leases, bounded storage, pure status reads, and ended-owner evidence | no |
-| `codexwire.ts` | Codex app-server JSON-RPC adapter, ordered cancellable prompt preparation, and child-local skill discovery authority for native prompt attachments | no |
+| `codexwire.ts` | Codex app-server JSON-RPC adapter, ordered cancellable prompt preparation, child-local skill discovery authority for native prompt attachments, and the parser of the model list Codex saves as `models_cache.json` | no |
 | `codexreply.ts` | Codex async-question ids and the reply envelope that answers them | no |
 | `questionrecovery.ts` | Durable captured questions, exclusive origin leases, local dispositions, admission, and contextual answer construction | no |
 | `questionrecords.ts` | Bounded exact-source reconciliation for captured question identities, with independent read cursors | no |
 | `launchpolicystore.ts` | Shared authoritative session restrictions, bounded per-session reads, atomic policy writes, and exclusive durable clear admission | no |
 | `launchpolicy.ts` | Immutable read-only launch policy, exact MCP read tools, Claude tool and git restrictions, model permission-mode eligibility, and standalone model aliases. Codex provider selection reads the top-level `model_provider` in `CODEX_HOME/config.toml` or `~/.codex/config.toml` | no |
-| `agenthost.ts` | Child ownership, packaged CLI environment and window targeting, launch environment, immutable read-only permissions and Claude attribution selection, line framing, lifecycle, durable question capture and restoration, accepted-turn identity, control-read scheduling, explicit usage attempt ownership, session state after model changes, and the Remote Control hold on idle retirement | no |
+| `agenthost.ts` | Child ownership, packaged CLI environment and window targeting, launch environment, immutable read-only permissions and Claude attribution selection, line framing, lifecycle, durable question capture and restoration, accepted-turn identity, control-read scheduling, explicit usage attempt ownership, session state after model changes, the Remote Control hold on idle retirement, and the `models_cache.json` reader that parses the file again only after its modification time changes | no |
 | `composerview.ts` | Prompt box, agent-request, and new-session view data, bounded question Markdown reuse, wording, settings, queue behavior, answers, prompt assembly, completion rows, and the walk back through earlier prompts | no |
 | `domain/ask-answer.ts` | Browser-safe completion and answer assembly rules for agent questions | no |
 | `domain/claude-skills.ts` | Browser-safe Claude skill-highlight decision, the per-working-directory skill-list cache reducer, and the safe-folder-name check the host skill-path lookup runs first | no |
