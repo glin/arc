@@ -1,4 +1,12 @@
 import checks from './typecheck-parallel.js';
+import { clampWorkerArgs, clampWorkerEnvironment } from '../extension/test/machineload.mjs';
+
+// Lower any Vitest worker request above the machine cap, on the command line or in VITEST_MAX_WORKERS.
+function cappedLane(lane) {
+  const inherited = lane.env ?? process.env;
+  const env = clampWorkerEnvironment(inherited);
+  return { ...lane, ...(lane.args ? { args: clampWorkerArgs(lane.args) } : {}), ...(env === inherited ? {} : { env }) };
+}
 
 export async function runLanes(lanes, runChecks = checks.runChecks, observation = null, options = {}) {
   for (const phase of ['queue', 'build', 'execution', 'cleanup']) {
@@ -10,7 +18,7 @@ export async function runLanes(lanes, runChecks = checks.runChecks, observation 
   let result = null;
   const failedLabels = [];
   try {
-    for (const lane of lanes) {
+    for (const lane of lanes.map(cappedLane)) {
       if (options.signal?.aborted) {
         failedLabels.push(lane.label);
         options.onCancelled?.(lane);

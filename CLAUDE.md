@@ -47,6 +47,8 @@ Before committing, check changed documentation, comments, and product messages a
 
 Read `docs/development.md` before installing dependencies, repairing the panel-mockup link, linking worktree dependencies, or profiling.
 
+A session never starts a full test suite while another runs, and the [suite runner](docs/development.md#machine-load) enforces it.
+
 Use the diagnostic capture script in [Performance capture](docs/performance.md#performance-capture) for performance investigations and diagnostic requests.
 
 Follow the Fast iteration section of `docs/development.md` to test a change while you work and before handoff.

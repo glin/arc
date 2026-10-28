@@ -1,4 +1,4 @@
-// Runs checks concurrently and groups output unless streaming is requested.
+// Runs checks concurrently, at most two at a time, and groups output unless streaming is requested.
 const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -142,6 +142,23 @@ function runCheck(
   });
 }
 
+// Each type check holds several hundred megabytes, so two run at once by default.
+const CHECK_CONCURRENCY = 2;
+
+// Start each check when a running one finishes, and keep results in check order.
+async function runPooled(items, concurrency, start) {
+  const results = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const index = next++;
+      results[index] = await start(items[index]);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
+  return results;
+}
+
 // Reports results after all checks finish and returns the failed labels.
 async function runChecks(
   checksToRun,
@@ -161,23 +178,22 @@ async function runChecks(
       const result = require('node:child_process').spawnSync('taskkill', ['/pid', String(pid), '/T', '/F']);
       return !result.error && result.status === 0;
     },
+    concurrency = CHECK_CONCURRENCY,
   } = {},
 ) {
-  const results = await Promise.all(
-    checksToRun.map((check) =>
-      runCheck(check, {
-        spawnFn,
-        stream,
-        write,
-        writeError,
-        signal,
-        onResult,
-        onOutput,
-        platform,
-        killGroup,
-        killWindowsTree,
-      }),
-    ),
+  const results = await runPooled(checksToRun, concurrency, (check) =>
+    runCheck(check, {
+      spawnFn,
+      stream,
+      write,
+      writeError,
+      signal,
+      onResult,
+      onOutput,
+      platform,
+      killGroup,
+      killWindowsTree,
+    }),
   );
   const failed = [];
   for (const result of results) {

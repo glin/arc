@@ -96,6 +96,8 @@ test('every root test file that reaches child_process carries the subprocess tag
 });
 
 test('command entry points run through a linked checkout', { tags: ['subprocess'] }, async () => {
+  // Fixture runs start in this run's temporary directory, so their suite locks never meet a real run.
+  vi.stubEnv('ARC_TEST_MEMORY_FLOOR_GB', '0');
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-entry-'));
   const linked = path.join(root, 'linked');
   const physical = path.join(root, 'physical');
@@ -116,6 +118,7 @@ test('command entry points run through a linked checkout', { tags: ['subprocess'
       'scripts/test-integration.mjs',
       'extension/test.mjs',
       'extension/test/observations.mjs',
+      'extension/test/machineload.mjs',
       'scripts/isolated-editor.mjs',
       'evals/agent-review/cli.mjs',
     ]) {
@@ -256,9 +259,14 @@ test('command entry points run through a linked checkout', { tags: ['subprocess'
       'extension/test/browserlock.mjs',
       fs.readFileSync(path.join(repositoryRoot, 'extension/test/browserlock.mjs'), 'utf8'),
     );
+    // The test kills this run while it holds the suite lock, and the fixture reports every PID alive.
+    // Its own temporary directory keeps that lock away from the later fixture runs.
+    const killedTemp = path.join(root, 'killed-temp');
+    fs.mkdirSync(killedTemp);
     const full = spawn(process.execPath, [path.join(linked, 'extension/test.mjs'), 'full'], {
       stdio: ['pipe', 'pipe', 'pipe'],
       timeout: 10_000,
+      env: { ...process.env, TEMP: killedTemp, TMP: killedTemp, TMPDIR: killedTemp },
     });
     let fullOutput = '';
     const fullResult = await new Promise((resolve, reject) => {
@@ -368,6 +376,7 @@ test('command entry points run through a linked checkout', { tags: ['subprocess'
     assert.equal(review.stdout, '');
     assert.equal(review.stderr, 'cache schema\n');
   } finally {
+    vi.unstubAllEnvs();
     if (fs.existsSync(linked)) fs.unlinkSync(linked);
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -686,6 +695,7 @@ function collectionFixture() {
     environmentFor: () => environment,
     observationFactory: () => null,
     processEmitter: emitter,
+    machineLoad: false,
   };
   const lanes = ['first', 'middle', 'last'].map((id) => ({
     id,
@@ -1586,5 +1596,256 @@ test('landing refuses reports finalized before process closure even when asserti
     }
   } finally {
     fs.rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+const DEAD_PID = 4_000_001;
+
+// Each poll waits for the test to advance the injected clock, so lock and memory waits take no real time.
+function suiteLoadFixture(directory, pid, { free = () => 8 * 1024 ** 3, env = {} } = {}) {
+  const logs = [];
+  const polls = [];
+  const state = { clock: 0 };
+  return {
+    logs,
+    polls,
+    async tick(milliseconds = 10_000) {
+      await vi.waitFor(() => assert.ok(polls.length));
+      state.clock += milliseconds;
+      polls.shift()();
+    },
+    machineLoad: {
+      lockPath: path.join(directory, 'arc-test-suite.lock'),
+      pid,
+      command: `fixture run ${pid}`,
+      env,
+      log: (line) => logs.push(line),
+      readFree: free,
+      isProcessAlive: (candidate) => candidate !== DEAD_PID,
+      monotonicNow: () => state.clock,
+      waitForPoll: () => new Promise((resolve) => polls.push(resolve)),
+      staleAfterMs: Infinity,
+      scheduleHeartbeat: () => null,
+      cancelHeartbeat: () => {},
+    },
+  };
+}
+
+const passingLanes =
+  (launched, owner = '') =>
+  async ([lane], settings) => {
+    launched.push(`${owner}${lane.id}`);
+    settings.onResult({ status: 0 });
+    return [];
+  };
+
+test('a second multi-lane suite waits for the first and names its holder every 30 seconds', async () => {
+  vi.spyOn(console, 'log').mockImplementation(() => {});
+  const fixture = collectionFixture();
+  const first = suiteLoadFixture(fixture.directory, 1001);
+  const second = suiteLoadFixture(fixture.directory, 1002);
+  const launched = [];
+  let finishFirst;
+  const firstLane = new Promise((resolve) => {
+    finishFirst = resolve;
+  });
+  const lanes = (owner) => async (entries, settings) => {
+    if (owner === 'a:' && entries[0].id === 'first') {
+      launched.push('a:first');
+      await firstLane;
+      settings.onResult({ status: 0 });
+      return [];
+    }
+    return passingLanes(launched, owner)(entries, settings);
+  };
+  try {
+    const running = suite.collectSuite({
+      ...fixture.options,
+      lanes: fixture.lanes,
+      machineLoad: first.machineLoad,
+      runChecks: lanes('a:'),
+    });
+    await vi.waitFor(() => assert.deepEqual(launched, ['a:first']));
+    const waiting = suite.collectSuite({
+      ...fixture.options,
+      reportDir: path.join(fixture.directory, 'second'),
+      lanes: fixture.lanes,
+      machineLoad: second.machineLoad,
+      runChecks: lanes('b:'),
+    });
+    await vi.waitFor(() => assert.equal(second.polls.length, 1));
+    assert.match(
+      second.logs[0],
+      /^The test suite waits for another run on this machine: PID 1001, started \S+, running fixture run 1001\. Waited 0 s of 40 min\.$/,
+    );
+    await second.tick();
+    await second.tick();
+    await second.tick();
+    await vi.waitFor(() => assert.equal(second.polls.length, 1));
+    assert.equal(second.logs.length, 2);
+    assert.match(second.logs[1], /PID 1001, .*Waited 30 s of 40 min\.$/);
+    assert.deepEqual(launched, ['a:first']);
+    finishFirst();
+    assert.equal((await running).exitCode, 0);
+    await second.tick();
+    assert.equal((await waiting).exitCode, 0);
+    assert.deepEqual(launched, ['a:first', 'a:middle', 'a:last', 'b:first', 'b:middle', 'b:last']);
+    assert.equal(fs.existsSync(first.machineLoad.lockPath), false);
+  } finally {
+    finishFirst();
+    fs.rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('a suite under the memory floor waits before each lane and gives up with its own exit status', async () => {
+  vi.spyOn(console, 'log').mockImplementation(() => {});
+  const errors = [];
+  vi.spyOn(console, 'error').mockImplementation((line) => errors.push(line));
+  const fixture = collectionFixture();
+  const events = [];
+  const readings = [2, 2, 2, 2];
+  const load = suiteLoadFixture(fixture.directory, 1001, {
+    free: () => {
+      const gigabytes = readings.shift() ?? 8;
+      events.push(`read ${gigabytes}`);
+      return gigabytes * 1024 ** 3;
+    },
+  });
+  try {
+    const pending = suite.collectSuite({
+      ...fixture.options,
+      lanes: fixture.lanes,
+      machineLoad: load.machineLoad,
+      runChecks: passingLanes(events, 'launch '),
+    });
+    for (let poll = 0; poll < 4; poll++) await load.tick();
+    assert.equal((await pending).exitCode, 0);
+    assert.deepEqual(events, [
+      ...Array(4).fill('read 2'),
+      'read 8',
+      'launch first',
+      'read 8',
+      'launch middle',
+      'read 8',
+      'launch last',
+    ]);
+    assert.deepEqual(load.logs, [
+      'The first lane waits for free memory: 2.0 GB free, floor 6.0 GB. Waited 0 s of 40 min.',
+      'The first lane waits for free memory: 2.0 GB free, floor 6.0 GB. Waited 30 s of 40 min.',
+      'Free memory is 8.0 GB. The first lane starts after 40 s.',
+    ]);
+
+    const starved = suiteLoadFixture(fixture.directory, 1002, {
+      free: () => 1024 ** 3,
+      env: { ARC_TEST_LOAD_DEADLINE_MINUTES: '1' },
+    });
+    const launched = [];
+    const status = suite.runSuiteCommand({
+      ...fixture.options,
+      reportDir: path.join(fixture.directory, 'starved'),
+      lanes: fixture.lanes,
+      machineLoad: starved.machineLoad,
+      runChecks: passingLanes(launched),
+    });
+    await starved.tick(60_000);
+    assert.equal(await status, 76);
+    assert.deepEqual(launched, []);
+    assert.match(
+      errors[0],
+      /^The first lane did not start, because free memory stayed under the 6\.0 GB floor for 1 min\./,
+    );
+    const report = JSON.parse(fs.readFileSync(path.join(fixture.directory, 'starved', 'suite.json')));
+    assert.deepEqual(
+      report.categories.map((row) => row.status),
+      ['blocked', 'cancelled', 'cancelled'],
+    );
+  } finally {
+    fs.rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('the suite lock recovers from a dead holder, admits nested and single-lane runs, and times out with its own status', async () => {
+  vi.spyOn(console, 'log').mockImplementation(() => {});
+  const errors = [];
+  vi.spyOn(console, 'error').mockImplementation((line) => errors.push(line));
+  const fixture = collectionFixture();
+  const load = suiteLoadFixture(fixture.directory, 1002);
+  const { lockPath } = load.machineLoad;
+  const hold = (pid) =>
+    fs.writeFileSync(lockPath, JSON.stringify({ pid, cwd: '/other', startedAt: 'earlier', command: 'other suite' }));
+  const launched = [];
+  const run = (name, machineLoad, lanes = fixture.lanes) =>
+    suite.runSuiteCommand({
+      ...fixture.options,
+      reportDir: path.join(fixture.directory, name),
+      lanes,
+      machineLoad,
+      runChecks: passingLanes(launched, `${name}:`),
+    });
+  try {
+    hold(DEAD_PID);
+    assert.equal(await run('dead', load.machineLoad), 0);
+    assert.deepEqual(load.logs, []);
+    assert.equal(fs.existsSync(lockPath), false);
+
+    hold(2002);
+    assert.equal(await run('nested', { ...load.machineLoad, env: { ARC_TEST_SUITE_HOLDER: '2002' } }), 0);
+    assert.equal(await run('single', load.machineLoad, [fixture.lanes[0]]), 0);
+    assert.equal(JSON.parse(fs.readFileSync(lockPath)).pid, 2002);
+    assert.equal(launched.length, 7);
+
+    const timedOut = run('timeout', { ...load.machineLoad, env: { ARC_TEST_LOAD_DEADLINE_MINUTES: '1' } });
+    await load.tick(60_000);
+    assert.equal(await timedOut, 75);
+    assert.equal(launched.length, 7);
+    assert.match(
+      errors.at(-1),
+      /held the machine suite lock for 1 min.*PID 2002 in \/other \(started earlier\) running other suite/,
+    );
+  } finally {
+    fs.rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('lanes run at most four Vitest workers whatever the caller asks', async () => {
+  vi.spyOn(console, 'log').mockImplementation(() => {});
+  vi.stubEnv('VITEST_MAX_WORKERS', '8');
+  const seen = [];
+  try {
+    await defaults.runLanes(
+      [
+        { label: 'wide', args: ['vitest.mjs', 'run', '--maxWorkers=8'] },
+        { label: 'narrow', args: ['vitest.mjs', 'run', '--maxWorkers', '2'], env: { VITEST_MAX_WORKERS: '3' } },
+      ],
+      async ([lane]) => {
+        seen.push([lane.args, lane.env?.VITEST_MAX_WORKERS]);
+        return [];
+      },
+    );
+    assert.deepEqual(seen, [
+      [['vitest.mjs', 'run', '--maxWorkers=4'], '4'],
+      [['vitest.mjs', 'run', '--maxWorkers', '2'], '3'],
+    ]);
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});
+
+test('every Vitest configuration runs at most four workers', () => {
+  const configs = [];
+  const walk = (directory, depth) => {
+    for (const entry of fs.readdirSync(path.join(repositoryRoot, directory), { withFileTypes: true })) {
+      const relative = directory ? `${directory}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) {
+        if (depth < 3 && !['node_modules', '.git', 'worktrees', 'dist', 'out'].includes(entry.name))
+          walk(relative, depth + 1);
+      } else if (/^vitest\.config\.[cm]?[jt]s$/.test(entry.name)) configs.push(relative);
+    }
+  };
+  walk('', 0);
+  assert.ok(configs.length >= 4, configs.join(', '));
+  for (const config of configs) {
+    const workers = /\bmaxWorkers:\s*(\d+)/.exec(fs.readFileSync(path.join(repositoryRoot, config), 'utf8'));
+    assert.ok(workers && Number(workers[1]) <= 4, `${config} must set maxWorkers to at most 4.`);
   }
 });

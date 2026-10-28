@@ -6,6 +6,8 @@ export default defineConfig({
     environment: 'node',
     globalSetup: [fileURLToPath(new URL('../extension/test/temp-run.ts', import.meta.url))],
     include: ['test/**/*.test.{ts,mjs}'],
+    // Vitest otherwise starts one worker per core but one. A lane on this machine runs at most four.
+    maxWorkers: 4,
     testTimeout: 30_000,
     hookTimeout: 30_000,
     strictTags: true,

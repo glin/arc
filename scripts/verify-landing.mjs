@@ -315,6 +315,6 @@ if (
     process.exitCode = decision.accepted ? 0 : 1;
   } catch (error) {
     console.error(error.message);
-    process.exitCode = 1;
+    process.exitCode = error.exitCode ?? 1;
   }
 }

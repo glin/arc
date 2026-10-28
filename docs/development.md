@@ -26,6 +26,28 @@ npm run format
 npm run test:all
 ```
 
+### Machine load
+
+One multi-lane test run uses the machine at a time. Every `scripts/test-suite.mjs` command that selects more than one lane takes the suite lock before its first lane. These commands include `npm test`, `npm run test:all`, `npm run lint`, `npm run typecheck`, and `scripts/verify-landing.mjs`. `extension/test.mjs full` takes it too. A single lane, a named test file, and a direct Vitest run take no lock.
+
+The lock is `arc-test-suite.lock` in the system temporary directory. A waiting run prints the holder's PID, start time, and command every 30 seconds. The lock releases at once when its holder's process ends. A live holder that stops refreshing the lock for three minutes also loses it. The suite lock shares its takeover code with the browser lane lock, so it has the same rare three-run race. That race can let two suites run together. Two concurrent suites therefore do not show a defect in the change under test.
+
+Before each lane, the run waits while free physical memory is under the floor. It prints the free memory and the floor every 30 seconds. Windows reads available physical memory. Linux reads `MemAvailable` from `/proc/meminfo`. macOS counts free, inactive, and speculative pages from `vm_stat`.
+
+A run inside a held suite skips the lock and the memory wait, because its parent admitted the lane that started it. The holder marks its children with `ARC_TEST_SUITE_HOLDER`.
+
+| Variable | Effect | Default |
+| --- | --- | --- |
+| `ARC_TEST_LOAD_DEADLINE_MINUTES` | How long a run waits for the lock, and how long it waits for memory before each lane | `40` |
+| `ARC_TEST_MEMORY_FLOOR_GB` | The free memory floor in GB. `0` disables the memory wait for continuous integration | `6` |
+
+| Exit status | Cause |
+| --- | --- |
+| `75` | Another run held the suite lock until the deadline. The run started no lane and wrote no report |
+| `76` | Free memory stayed under the floor until the deadline. A suite report marks the waiting lane blocked and later lanes cancelled |
+
+A Vitest lane runs at most four workers, as [Browser selection](testing.md#browser-selection) describes. `scripts/typecheck-parallel.js` runs two checks at a time. `extension/test/machineload.mjs` owns the lock, the memory read, and the worker cap.
+
 ## Source commits
 
 Use the assigned topic branch for initial candidates and correction commits. Stage only the task's changes, then run this command from that checkout:

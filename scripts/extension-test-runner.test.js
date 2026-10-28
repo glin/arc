@@ -13,13 +13,15 @@ let browserChannels;
 let browserLock;
 let observations;
 let subprocessLane;
+let machineLoad;
 beforeAll(async () => {
-  [runner, browserChannels, browserLock, observations, subprocessLane] = await Promise.all([
+  [runner, browserChannels, browserLock, observations, subprocessLane, machineLoad] = await Promise.all([
     import('../extension/test.mjs'),
     import('../extension/test/browserchannels.mjs'),
     import('../extension/test/browserlock.mjs'),
     import('../extension/test/observations.mjs'),
     import('./test-subprocess.mjs'),
+    import('../extension/test/machineload.mjs'),
   ]);
 });
 
@@ -1814,7 +1816,7 @@ test('forwards Vitest flags with the node lane worker cap and returns the child 
       path.join(root, 'node_modules', 'vitest', 'vitest.mjs'),
       'run',
       '--fileParallelism',
-      '--maxWorkers=8',
+      '--maxWorkers=4',
       'src/store.test.ts',
       'src/webview/panel.test.ts',
       '--testNamePattern',
@@ -1825,6 +1827,84 @@ test('forwards Vitest flags with the node lane worker cap and returns the child 
     vi.unstubAllEnvs();
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('a caller cannot raise a lane above four Vitest workers', () => {
+  vi.stubEnv('VITEST_MAX_WORKERS', '8');
+  const root = fixture();
+  const logs = [];
+  vi.spyOn(console, 'log').mockImplementation((line) => logs.push(line));
+  const runs = [];
+  const spawn = (_command, args, options) => {
+    runs.push({ args, env: options.env });
+    return { status: 0 };
+  };
+  try {
+    for (const extra of [['--maxWorkers=8'], ['--maxWorkers', '8'], ['--max-workers=16'], []])
+      assert.equal(runner.runTestMode('node', extra, { testRoot: root, spawn }), 0);
+    for (const { args, env } of runs) {
+      const text = args.join(' ');
+      assert.deepEqual(
+        text.match(/--max-?[wW]orkers[= ]\S+/g).map((flag) => flag.slice(-1)),
+        ['4'],
+        text,
+      );
+      assert.equal(env.VITEST_MAX_WORKERS, '4');
+    }
+    assert.deepEqual(
+      machineLoad.clampWorkerArgs(['--maxWorkers=50%', '--maxWorkers=10%'], { cores: 32, log: () => {} }),
+      ['--maxWorkers=4', '--maxWorkers=10%'],
+    );
+    assert.ok(logs.some((line) => /instead of --maxWorkers 8/.test(line)));
+    assert.ok(logs.some((line) => /instead of VITEST_MAX_WORKERS=8/.test(line)));
+    vi.stubEnv('VITEST_MAX_WORKERS', '2');
+    runs.length = 0;
+    assert.equal(runner.runTestMode('node', ['--maxWorkers=3'], { testRoot: root, spawn }), 0);
+    assert.ok(runs[0].args.includes('--maxWorkers=3'));
+    assert.equal(runs[0].env, undefined);
+  } finally {
+    vi.unstubAllEnvs();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('free memory reads the platform source on Windows, macOS, and Linux', () => {
+  const read = (platform, sources) =>
+    machineLoad.freeMemoryBytes({
+      platform,
+      readText: () => sources.meminfo ?? assert.fail('Only Linux reads /proc/meminfo.'),
+      run: () => sources.vmStat ?? assert.fail('Only macOS runs vm_stat.'),
+      osFree: () => 123,
+    });
+  const meminfo = [
+    'MemTotal:       32000000 kB',
+    'MemFree:          100000 kB',
+    'MemAvailable:    7000000 kB',
+    '',
+  ].join('\n');
+  assert.equal(read('linux', { meminfo }), 7000000 * 1024);
+  assert.equal(read('linux', { meminfo: 'MemFree: 1 kB\n' }), 123);
+  const vmStat = [
+    'Mach Virtual Memory Statistics: (page size of 16384 bytes)',
+    'Pages free:                               1000.',
+    'Pages active:                             9000.',
+    'Pages inactive:                           2000.',
+    'Pages speculative:                         300.',
+    'Pages purgeable:                           500.',
+  ].join('\n');
+  assert.equal(read('darwin', { vmStat }), 3300 * 16384);
+  assert.equal(read('darwin', { vmStat: 'vm_stat: unexpected output' }), 123);
+  assert.equal(read('win32', {}), 123);
+  assert.equal(
+    machineLoad.freeMemoryBytes({
+      platform: 'darwin',
+      run: () => {
+        throw Error('vm_stat is missing');
+      },
+      osFree: () => 456,
+    }),
+    456,
+  );
 });
 
 test('the standalone and full browser invocations use four workers', async () => {
@@ -1855,7 +1935,7 @@ test('the standalone and full browser invocations use four workers', async () =>
     assert.equal(status, 0);
     assert.equal(args.length, 3);
     assert.deepEqual(args[0].slice(2, 4), ['--fileParallelism', '--maxWorkers=4']);
-    assert.deepEqual(args[1].slice(2, 4), ['--fileParallelism', '--maxWorkers=8']);
+    assert.deepEqual(args[1].slice(2, 4), ['--fileParallelism', '--maxWorkers=4']);
     assert.deepEqual(args[2].slice(2, 4), ['--fileParallelism', '--maxWorkers=4']);
   } finally {
     vi.unstubAllEnvs();

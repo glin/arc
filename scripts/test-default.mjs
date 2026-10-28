@@ -15,6 +15,6 @@ if (
   existsSync(process.argv[1]) &&
   realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))
 ) {
-  const { collectSuite } = await import('./test-suite.mjs');
-  process.exitCode = (await collectSuite({ mode: 'default' })).exitCode;
+  const { runSuiteCommand } = await import('./test-suite.mjs');
+  process.exitCode = await runSuiteCommand({ mode: 'default' });
 }

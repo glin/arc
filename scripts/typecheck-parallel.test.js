@@ -87,6 +87,29 @@ test('parallel checks keep output grouped until every check finishes', async () 
   assert.deepEqual(errors, ['\nChecks failed: second']);
 });
 
+test('parallel checks start at most two children at once and keep check order', async () => {
+  const children = [];
+  const lines = [];
+  const pending = runChecks([fakeCheck('first', 0), fakeCheck('second', 0), fakeCheck('third', 1)], {
+    spawnFn: () => {
+      const child = new EventEmitter();
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      children.push(child);
+      return child;
+    },
+    log: (line) => lines.push(line),
+    logError: () => {},
+  });
+  assert.equal(children.length, 2);
+  children[1].emit('close', 0);
+  await vi.waitFor(() => assert.equal(children.length, 3));
+  children[2].emit('close', 1);
+  children[0].emit('close', 0);
+  assert.deepEqual(await pending, ['third']);
+  assert.deepEqual(lines, ['--- first (passed) ---', '--- second (passed) ---', '--- third (failed) ---']);
+});
+
 test('a run with no failing checks reports none', SUBPROCESS, async () => {
   const failed = await runChecks([fakeCheck('a', 0), fakeCheck('b', 0)], {
     log: () => {},

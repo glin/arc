@@ -16,7 +16,8 @@ function toolBin(name) {
 }
 
 function runTool(name, args, cwd) {
-  const env = { ...process.env };
+  // Fixture suite runs skip the free memory wait. Their suite lock stays in this run's temporary directory.
+  const env = { ...process.env, ARC_TEST_MEMORY_FLOOR_GB: '0' };
   const pathKey = Object.keys(env).find((key) => key.toLowerCase() === 'path') ?? 'PATH';
   env[pathKey] = [path.join(repositoryRoot, 'node_modules', '.bin'), env[pathKey]].filter(Boolean).join(path.delimiter);
   return spawnSync(process.execPath, [toolBin(name), ...args], { cwd, encoding: 'utf8', env });
@@ -44,6 +45,7 @@ function copyCollector(root) {
     'extension/test/browserlock.mjs',
     'extension/test/browserchannels.mjs',
     'extension/test/observations.mjs',
+    'extension/test/machineload.mjs',
   ]) {
     const target = path.join(root, file);
     fs.mkdirSync(path.dirname(target), { recursive: true });

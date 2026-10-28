@@ -4,6 +4,14 @@ import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { launchAnyBrowser } from './test/browserchannels.mjs';
 import { acquireBrowserLock, forwardSignalToChildAndRelease } from './test/browserlock.mjs';
+import {
+  clampWorkerArgs,
+  clampWorkerEnvironment,
+  hasWorkerFlag,
+  holdMachineLoad,
+  MachineLoadTimeout,
+  MAX_VITEST_WORKERS,
+} from './test/machineload.mjs';
 import { createTestObservation } from './test/observations.mjs';
 
 // Default injected runners acquire no machine lock. The CLI entry point supplies the real acquireBrowserLock.
@@ -14,10 +22,21 @@ async function noopAcquireLock() {
 const root = dirname(fileURLToPath(import.meta.url));
 const modes = new Set(['full', 'node', 'browser']);
 // Cap lane workers explicitly instead of using Vitest's core-count default.
+// VITEST_MAX_WORKERS and a caller's --maxWorkers can lower a lane below the cap, never raise it above.
 const LANE_WORKERS = {
-  node: 8,
-  browser: 4,
+  node: MAX_VITEST_WORKERS,
+  browser: MAX_VITEST_WORKERS,
 };
+
+function laneWorkers(mode) {
+  return Math.min(MAX_VITEST_WORKERS, Number.parseInt(process.env.VITEST_MAX_WORKERS) || LANE_WORKERS[mode]);
+}
+
+// Spawn options keep inheriting the parent environment unless the observation or the worker cap changes it.
+function childEnvironment(observation) {
+  const env = clampWorkerEnvironment(observation?.childEnvironment() ?? process.env);
+  return env === process.env ? {} : { env };
+}
 
 // Vitest flags with required values. The installed cliOptionsConfig marks required arguments with angle brackets.
 // The runner keeps separate following tokens out of optional-value flags.
@@ -150,14 +169,13 @@ function narrowSelection(fileArgs, selected, testRoot, mode) {
 
 // List files before flags because Vitest optional-value flags can consume following filenames.
 function vitestArgs(mode, extraArgs, selected, testRoot) {
-  const workers = process.env.VITEST_MAX_WORKERS || LANE_WORKERS[mode];
   return [
     join(testRoot, 'node_modules', 'vitest', 'vitest.mjs'),
     'run',
     '--fileParallelism',
-    `--maxWorkers=${workers}`,
+    ...(hasWorkerFlag(extraArgs) ? [] : [`--maxWorkers=${laneWorkers(mode)}`]),
     ...selected,
-    ...extraArgs,
+    ...clampWorkerArgs(extraArgs),
   ];
 }
 
@@ -166,7 +184,7 @@ function spawnLane(mode, selected, extraArgs, testRoot, spawn, observation, onCa
   const result = spawn(process.execPath, vitestArgs(mode, extraArgs, selected, testRoot), {
     cwd: testRoot,
     stdio: 'inherit',
-    ...(observation ? { env: observation.childEnvironment() } : {}),
+    ...childEnvironment(observation),
   });
   observation?.event('execution', 'child-start', { childPid: result.pid ?? null });
   observation?.end('execution', {
@@ -198,7 +216,7 @@ async function spawnBrowserLane(
     cwd: testRoot,
     stdio: 'inherit',
     detached: process.platform !== 'win32',
-    ...(observation ? { env: observation.childEnvironment() } : {}),
+    ...childEnvironment(observation),
   });
   result.arcProcessGroup = process.platform !== 'win32';
   observation?.event('execution', 'child-start', { childPid: result.pid ?? null });
@@ -437,9 +455,13 @@ export async function runFull(extraArgs, opts = {}) {
   const testRoot = opts.testRoot ?? root;
   const runNode = opts.asyncNode ? (args) => runNodeLane(args, opts) : (args) => runTestMode('node', args, opts);
   const { passthrough, files } = partitionArgs(extraArgs);
+  // Without a machine load guard, the first lane starts in the same tick, as callers that emit child events at once expect.
+  const { beforeLane } = opts;
   if (files.length === 0) {
+    if (beforeLane) await beforeLane('The extension Node lane');
     const nodeStatus = await runNode(extraArgs);
     if (cancelled) return nodeStatus || 1;
+    if (beforeLane) await beforeLane('The extension browser lane');
     const browserStatus = await runBrowserLane(extraArgs, opts);
     return nodeStatus !== 0 ? nodeStatus : browserStatus;
   }
@@ -452,6 +474,7 @@ export async function runFull(extraArgs, opts = {}) {
   }
   let nodeStatus = 0;
   if (byLane.node.length > 0) {
+    if (beforeLane) await beforeLane('The extension Node lane');
     nodeStatus = await runNode([...passthrough, ...byLane.node]);
     if (cancelled) return nodeStatus || 1;
   } else {
@@ -459,6 +482,7 @@ export async function runFull(extraArgs, opts = {}) {
   }
   let browserStatus = 0;
   if (byLane.browser.length > 0) {
+    if (beforeLane) await beforeLane('The extension browser lane');
     browserStatus = await runBrowserLane([...passthrough, ...byLane.browser], opts);
   } else {
     console.log('Browser lane skipped: no named file belongs to it.');
@@ -466,7 +490,7 @@ export async function runFull(extraArgs, opts = {}) {
   return nodeStatus !== 0 ? nodeStatus : browserStatus;
 }
 
-export async function main(argv = process.argv.slice(2)) {
+export async function main(argv = process.argv.slice(2), { machineLoad = {} } = {}) {
   const [mode = 'full', ...extraArgs] = argv;
   const opts = {
     asyncNode: true,
@@ -479,12 +503,19 @@ export async function main(argv = process.argv.slice(2)) {
         lane: `extension ${lane}`,
         cwd,
         command: [process.execPath, join(root, 'test.mjs'), lane, ...args],
-        workerCap: process.env.VITEST_MAX_WORKERS || LANE_WORKERS[lane] || null,
+        workerCap: LANE_WORKERS[lane] ? laneWorkers(lane) : null,
         capacity: lane === 'browser' ? 1 : null,
       }),
   };
   if (mode === 'full') {
-    return runFull(extraArgs, opts);
+    // Full mode runs two lanes, so it holds the machine suite lock and waits for free memory before each lane.
+    try {
+      return await holdMachineLoad((beforeLane) => runFull(extraArgs, { ...opts, beforeLane }), machineLoad);
+    } catch (error) {
+      if (!(error instanceof MachineLoadTimeout)) throw error;
+      console.error(error.message);
+      return error.exitCode;
+    }
   }
   if (mode === 'browser') {
     return runBrowserLane(extraArgs, opts);

@@ -18,6 +18,7 @@ import { fileURLToPath } from 'node:url';
 import { runLanes } from './test-lanes.mjs';
 import { subprocessVitestArgs } from './test-subprocess.mjs';
 import { createTestObservation } from '../extension/test/observations.mjs';
+import { holdMachineLoad, MachineLoadTimeout, MEMORY_TIMEOUT_EXIT } from '../extension/test/machineload.mjs';
 
 export const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const hash = (value) => createHash('sha256').update(value).digest('hex');
@@ -252,18 +253,39 @@ export function laneCommand(lane, tests) {
   ];
 }
 
-export async function collectSuite({
+// A run of more than one lane holds the machine suite lock and waits for free memory before each lane.
+// machineLoad carries injected lock and memory options, and false disables the guard.
+export async function collectSuite({ machineLoad = {}, ...options } = {}) {
+  const lanes = options.lanes ?? suiteLanes(options.cwd ?? root, options.mode ?? 'all');
+  return holdMachineLoad(
+    (beforeLane) => collectLanes({ ...options, lanes, beforeLane }),
+    lanes.length > 1 ? machineLoad : false,
+  );
+}
+
+// Return the exit status for a command entry point, including the named machine load timeouts.
+export async function runSuiteCommand(options) {
+  try {
+    return (await collectSuite(options)).exitCode;
+  } catch (error) {
+    console.error(error.message);
+    return error.exitCode ?? 1;
+  }
+}
+
+async function collectLanes({
   cwd = root,
   mode = 'all',
   reportDir,
   base = null,
-  lanes = suiteLanes(cwd, mode),
+  lanes,
   runChecks,
   processEmitter = process,
   identify = trackedIdentity,
   environmentFor = environmentIdentity,
   observationFactory = createTestObservation,
-} = {}) {
+  beforeLane,
+}) {
   reportDir ??= process.env.ARC_TEST_REPORT_DIR;
   if (reportDir) {
     reportDir = resolve(reportDir);
@@ -283,6 +305,7 @@ export async function collectSuite({
   const cancel = () => controller.abort();
   for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) processEmitter.on(signal, cancel);
   const categories = [];
+  let memoryTimeout = null;
   const observation = observationFactory({ lane: mode, cwd });
   for (const phase of ['queue', 'build', 'execution', 'cleanup'])
     observation?.unavailable(
@@ -320,9 +343,21 @@ export async function collectSuite({
               : missingTool
                 ? `Executable is unavailable: ${lane.args[0]}`
                 : null;
+      let memoryBlocked = false;
+      if (!controller.signal.aborted && !blocked) {
+        try {
+          await beforeLane(`The ${lane.id} lane`, controller.signal);
+        } catch (error) {
+          if (!(error instanceof MachineLoadTimeout)) throw error;
+          memoryTimeout = error;
+          memoryBlocked = true;
+          console.error(error.message);
+          controller.abort();
+        }
+      }
       if (controller.signal.aborted || blocked) {
-        category.status = controller.signal.aborted ? 'cancelled' : 'blocked';
-        category.reason = blocked ?? 'Collection cancelled';
+        category.status = memoryBlocked || !controller.signal.aborted ? 'blocked' : 'cancelled';
+        category.reason = memoryBlocked ? memoryTimeout.message : (blocked ?? 'Collection cancelled');
         appendFileSync(log, `${category.reason}\n`);
       } else {
         const args = category.command.slice(1);
@@ -387,18 +422,19 @@ export async function collectSuite({
     for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) processEmitter.off(signal, cancel);
   }
   const end = identify(cwd);
-  const exitCode =
-    !controller.signal.aborted &&
-    categories.every((category) => category.status === 'passed') &&
-    categories.every(
-      (category) =>
-        category.sourceStart.treeHash === start.treeHash &&
-        category.sourceEnd.treeHash === start.treeHash &&
-        category.sourceStart.candidate === start.candidate &&
-        category.sourceEnd.candidate === start.candidate,
-    ) &&
-    start.treeHash === end.treeHash &&
-    start.candidate === end.candidate
+  const exitCode = memoryTimeout
+    ? MEMORY_TIMEOUT_EXIT
+    : !controller.signal.aborted &&
+        categories.every((category) => category.status === 'passed') &&
+        categories.every(
+          (category) =>
+            category.sourceStart.treeHash === start.treeHash &&
+            category.sourceEnd.treeHash === start.treeHash &&
+            category.sourceStart.candidate === start.candidate &&
+            category.sourceEnd.candidate === start.candidate,
+        ) &&
+        start.treeHash === end.treeHash &&
+        start.candidate === end.candidate
       ? 0
       : 1;
   const report = {
@@ -437,12 +473,5 @@ if (
 ) {
   const [mode = 'all', ...args] = process.argv.slice(2);
   const reportIndex = args.indexOf('--report-dir');
-  try {
-    process.exitCode = (
-      await collectSuite({ mode, reportDir: reportIndex < 0 ? undefined : args[reportIndex + 1] })
-    ).exitCode;
-  } catch (error) {
-    console.error(error.message);
-    process.exitCode = 1;
-  }
+  process.exitCode = await runSuiteCommand({ mode, reportDir: reportIndex < 0 ? undefined : args[reportIndex + 1] });
 }

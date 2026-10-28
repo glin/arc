@@ -291,8 +291,8 @@
   },
   "scripts/extension-test-runner.test.js": {
     "reason": "Real runner commands must classify files, reject invalid selection, and preserve browser readiness status.",
-    "cases": 72,
-    "matricesSha256": "df8bde18fafde463b13fc81ffb9d04f137957421b1d52bbdcc79b11d0e29eb87"
+    "cases": 74,
+    "matricesSha256": "44b8d4e4e237c8a83272fd4fcdf479f15ee8a15a1a5616cac1eb25c85fac681b"
   },
   "scripts/install-release.test.js": {
     "reason": "Release installation must extract actual archives and preserve isolated-home hooks, skills, and partial failures.",
@@ -320,18 +320,18 @@
     "matricesSha256": "d8f469b1be1e7ce2e1a3fa46468f1703be6c94abdb205d67bbfa9d4ce480dc4a"
   },
   "scripts/test-lanes.test.js": {
-    "reason": "Public commands must report independent failures, preserve cancellation, and reject stale or incomplete landing evidence. Direct cases guard category and admission drift.",
-    "cases": 31,
-    "matricesSha256": "c1dc2b37bc9e5d3f30fd36bcfc14138d0d04cb5f791fb6ddb75f0baeef75c0e3"
+    "reason": "Public commands must report independent failures, preserve cancellation, and reject stale or incomplete landing evidence. Direct cases guard category and admission drift. Machine load cases serialize multi-lane runs, wait for free memory, and cap Vitest workers.",
+    "cases": 36,
+    "matricesSha256": "be82d0fe9043f073246bfeddc810c10b06f2e7c983969f33ab758bc41a838319"
   },
   "scripts/tool-scope.test.js": {
     "reason": "Real tool commands must respect repository scope and reject external configuration or stale packaged content.",
     "cases": 13,
-    "matricesSha256": "63b29be46f045f36a9c9a6d5acb30bc473eebf58a51da26952a2533ca4f18fd6"
+    "matricesSha256": "6c77a6c8ee5b9b8598f7c4b8766caa1fcab824a4d62785b70c323f293c5a96dd"
   },
   "scripts/typecheck-parallel.test.js": {
     "reason": "Concurrent check child processes must preserve exit status, spawn errors, and grouped output.",
-    "cases": 8,
+    "cases": 9,
     "matricesSha256": "709dd244405fe9263b4754aeb0cf5fc6757aa8c6ac879b3794ac88f86113231a"
   },
   "test/hooks-smoke.test.js": {

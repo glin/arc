@@ -48,7 +48,8 @@ function describeHolder(owner) {
   if (!owner) return 'an unreadable lock record';
   const where = owner.cwd ? ` in ${owner.cwd}` : '';
   const since = owner.startedAt ? ` (started ${owner.startedAt})` : '';
-  return `PID ${owner.pid}${where}${since}`;
+  const running = owner.command ? ` running ${owner.command}` : '';
+  return `PID ${owner.pid}${where}${since}${running}`;
 }
 
 // Missing or dead owners and missing mtimes are stale immediately.
@@ -210,9 +211,11 @@ export async function acquireBrowserLock({
   rename = renameSync,
   observation = null,
   tryOnly = false,
+  heading = `${label[0].toUpperCase()}${label.slice(1)} tests`,
+  command = null,
+  onWaiting = null,
 } = {}) {
   const lockName = `${label} test lock`;
-  const heading = `${label[0].toUpperCase()}${label.slice(1)} tests`;
   let announced = false;
   let staleObservation = null;
   const waitStartedAt = monotonicNow();
@@ -245,7 +248,12 @@ export async function acquireBrowserLock({
   try {
     while (true) {
       // Refresh startedAt for each attempt so the acquired lock records acquisition time.
-      const text = JSON.stringify({ pid, cwd, startedAt: new Date(now()).toISOString() });
+      const text = JSON.stringify({
+        pid,
+        cwd,
+        startedAt: new Date(now()).toISOString(),
+        ...(command ? { command } : {}),
+      });
       if (publishLock(lockPath, text, pid)) {
         observation?.end('queue', { lockPath });
         const acquiredAt = observation ? monotonicNow() : null;
@@ -318,13 +326,16 @@ export async function acquireBrowserLock({
           continue;
         }
       }
-      if (!announced) {
+      if (onWaiting) onWaiting({ owner: current, waitedMs: monotonicNow() - waitStartedAt });
+      else if (!announced)
         console.log(`${heading} are waiting for another run to finish: held by ${describeHolder(current)}.`);
-        announced = true;
-      }
+      announced = true;
       const remaining = deadline - monotonicNow();
       if (remaining <= 0) {
-        throw new Error(`Timed out waiting for the ${lockName} held by ${describeHolder(current)}.`);
+        const timeout = new Error(`Timed out waiting for the ${lockName} held by ${describeHolder(current)}.`);
+        timeout.code = 'ARC_LOCK_TIMEOUT';
+        timeout.holder = `The holder was ${describeHolder(current)}`;
+        throw timeout;
       }
       await waitForPoll(Math.min(pollMs, remaining));
     }
