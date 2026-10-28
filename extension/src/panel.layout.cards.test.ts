@@ -4986,6 +4986,99 @@ test(
   },
 );
 
+// A Commits heading with a long branch fact keeps its "·" on the count's line at every width.
+
+test(
+  'a long branch fact on the Commits heading starts on the count line and wraps inside its own text',
+  { timeout: 60_000 },
+  async (t) => {
+    const browser = await browserOrNone();
+    if (!browser) {
+      t.skip('no Edge, Chrome or bundled Chromium on this machine, so nothing was measured');
+      return;
+    }
+    try {
+      const page = await browser.newPage();
+      await page.setContent(themed(pageHtml()));
+      const payload = renderPayload() as { cards: Record<string, unknown>[] };
+      const card = payload.cards[LONG_TURN_INDEX] as Record<string, unknown> & { key: string };
+      const other = { key: 'c:/other/.git', name: 'rspm-builder-images', own: false };
+      const onBranch = { repository: other, branch: 'glin/self-hosted-amd64-runners' };
+      withCommits(card, [
+        commitRow('aaaa111', 'Add the runner image', NOW - 900_000, onBranch),
+        commitRow('bbbb222', 'Pin the runner version', NOW - 300_000, onBranch),
+      ]);
+      Object.assign(payload, { timelineLayout: { cardLayout: 'one-column', promptPosition: 'above' } });
+      const selector = `[data-key=${JSON.stringify(card.key)}]`;
+      await layoutAt(page, 340);
+      await page.evaluate(`window.postMessage(${JSON.stringify(payload)}, '*')`);
+      await page.evaluate(SETTLED);
+      await page.locator(`${selector} .head`).click();
+      await page.evaluate(SETTLED);
+      const lines = () =>
+        page.evaluate(`(() => {
+          const heading = document.querySelector(${JSON.stringify(`${selector} .recordcommits .acthead`)});
+          const button = heading.querySelector('.actword').getBoundingClientRect();
+          const fact = heading.querySelector('.commitheadfact');
+          const glyph = (index) => {
+            const range = document.createRange();
+            range.setStart(fact.firstChild, index);
+            range.setEnd(fact.firstChild, index + 1);
+            const box = range.getClientRects()[0];
+            return { middle: (box.top + box.bottom) / 2, text: range.toString() };
+          };
+          const last = fact.firstChild.textContent.length - 1;
+          return {
+            first: glyph(0),
+            last: glyph(last),
+            button: { top: button.top, bottom: button.bottom },
+            text: fact.textContent,
+          };
+        })()`) as Promise<{
+          first: { middle: number; text: string };
+          last: { middle: number; text: string };
+          button: { top: number; bottom: number };
+          text: string;
+        }>;
+      const onButtonLine = (glyph: { middle: number }, button: { top: number; bottom: number }) =>
+        glyph.middle >= button.top && glyph.middle <= button.bottom;
+
+      const narrow = await lines();
+      assert.equal(narrow.first.text, '·', 'the fact did not start with its separator');
+      assert.equal(
+        onButtonLine(narrow.first, narrow.button),
+        true,
+        `at 340px the separator sits at y ${Math.round(narrow.first.middle)}, off the count line (${Math.round(narrow.button.top)} to ${Math.round(narrow.button.bottom)})`,
+      );
+      assert.equal(
+        onButtonLine(narrow.last, narrow.button),
+        false,
+        'at 340px the whole fact fitted on the count line, so the fixture did not exercise a wrap',
+      );
+
+      const headingSelector = `${selector} .recordcommits .acthead`;
+      const narrowWidth = (await page.evaluate(
+        `document.querySelector(${JSON.stringify(headingSelector)}).getBoundingClientRect().width`,
+      )) as number;
+      await page.setViewportSize({ width: 1350, height: 900 });
+      await page.waitForFunction(
+        ([heading, before]) =>
+          (document.querySelector(heading as string)?.getBoundingClientRect().width ?? 0) > (before as number) + 400,
+        [headingSelector, narrowWidth],
+      );
+      await page.evaluate(SETTLED);
+      const wide = await lines();
+      assert.equal(
+        onButtonLine(wide.first, wide.button) && onButtonLine(wide.last, wide.button),
+        true,
+        `at 1350px the fact left the count line (${Math.round(wide.first.middle)} to ${Math.round(wide.last.middle)} against ${Math.round(wide.button.top)} to ${Math.round(wide.button.bottom)})`,
+      );
+    } finally {
+      await browser.close();
+    }
+  },
+);
+
 // Two columns places records beside prose at wide widths and stacks them at narrow widths. Height budgets allow font and scrollbar variation.
 
 const COLUMN_BUDGET = [

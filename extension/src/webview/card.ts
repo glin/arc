@@ -1,4 +1,4 @@
-import { Fragment, h, render, type ComponentChildren } from 'preact';
+import { Fragment, h, render, type ComponentChild, type ComponentChildren } from 'preact';
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import {
   ARRIVAL_WORD,
@@ -206,6 +206,8 @@ function Section({
   ]);
 }
 
+const NO_BREAK_SPACE = '\u00a0';
+
 // Draw branch facts and merge-arrival text beside a single-group Commits heading's collapse button.
 function factSpan(fact: { text: string; arrival?: { key: string; title: string; spoken: string } }): ComponentChildren {
   return h('span', { class: 'commitheadfact' }, [
@@ -261,28 +263,34 @@ function RecordSection({
       'h4',
       { class: 'sectionheading' },
       h('div', { class: 'acthead' }, [
-        h(
-          'button',
-          {
-            class: 'actword',
-            'aria-label': recordSectionLabel(title, count, shown),
-            'aria-controls': listId,
-            'aria-expanded': String(shown),
-            'data-control': `record:${section}:${card.key}`,
-            onClick(event: MouseEvent) {
-              stop(event);
-              setShownChoice(!shown);
-            },
-          },
-          h('span', { class: 'sec-title' }, [
-            h('span', { class: 'sec-word' }, title),
-            ' ',
-            h('span', { class: 'count' }, String(count)),
-          ]),
-        ),
         // Facts sit outside the button so long names wrap and merge tooltips remain reachable.
-        // Pressing the fact does not toggle the section.
-        fact ? factSpan(fact) : null,
+        // Pressing the fact does not toggle the section. The no-break space is its own text node, so
+        // the fact's text stays equal to the stat popover's and no line break falls before its "·".
+        inlineText<ComponentChild>(
+          [
+            h(
+              'button',
+              {
+                class: 'actword',
+                'aria-label': recordSectionLabel(title, count, shown),
+                'aria-controls': listId,
+                'aria-expanded': String(shown),
+                'data-control': `record:${section}:${card.key}`,
+                onClick(event: MouseEvent) {
+                  stop(event);
+                  setShownChoice(!shown);
+                },
+              },
+              h('span', { class: 'sec-title' }, [
+                h('span', { class: 'sec-word' }, title),
+                ' ',
+                h('span', { class: 'count' }, String(count)),
+              ]),
+            ),
+            fact ? factSpan(fact) : null,
+          ],
+          NO_BREAK_SPACE,
+        ),
       ]),
     ),
     h('div', { id: listId, hidden: !shown }, children),

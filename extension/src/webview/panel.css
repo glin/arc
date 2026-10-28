@@ -1136,7 +1136,8 @@ pre.actfull code {
   color: var(--idle);
 }
 
-/* The word opens the log. Its counts filter the rows without hiding the tool mix. */
+/* The word opens the log. Its counts filter the rows without hiding the tool mix. Every heading
+   is a wrapping flex row except the Commits heading, which the rule below draws as inline text. */
 .acthead {
   display: flex;
   flex-wrap: wrap;
@@ -1159,6 +1160,15 @@ button.acthead,
 .acthead .sec-title {
   margin: 0;
   flex: none;
+}
+/* The Commits heading draws as inline text, so its branch fact breaks inside its own words and
+   its "·" stays on the count's line. The fact follows the button after a no-break space, which
+   block flow does not pad the way the flex gap does, so the button adds the rest of the 0.4em. */
+.recordcommits .acthead {
+  display: block;
+}
+.recordcommits .acthead button.actword {
+  margin-right: 0.15em;
 }
 button.acthead:hover .actword,
 button.acthead:focus-visible .actword,
