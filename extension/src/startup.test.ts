@@ -252,7 +252,7 @@ import { countedDispatchedCosts, pendingAskPosition, toCard, TURN_QUIET_MS } fro
 import { COMMIT_REPOSITORY_PARSER_VERSION, commitRepositoryOccurrence } from './codexhistory';
 import { RepositoryCommits } from './gitcommits';
 import { CommitRepositories } from './commitrepositories';
-import { railCacheMarkOf, sessionStatusOf, stableRailOrder } from './turnrail';
+import { agentRunAnswer, railCacheMarkOf, sessionStatusOf, stableRailOrder } from './turnrail';
 import { storedAssetsForPrompt } from './promptassets';
 import { emptyTrail, renamePlace, visitPlace } from './turnplaces';
 import { adoptLabelSession, labelsOf } from './turnlabels';
@@ -13545,8 +13545,9 @@ test('incomplete discovery replies continue without a catalog refresh, and the c
   }
 });
 
-// A complete reply asks for another pass. `membersSettled` says whether only dispatched spend waits for it.
-function partialSpendHarness(membersSettled: boolean) {
+// A complete reply asks for another pass. `membersSettled` says whether only dispatched spend waits for it. `spendFailure`
+// makes the first spend-only request fail or find no held reply.
+function partialSpendHarness(membersSettled: boolean, spendFailure?: 'held-false' | 'reject') {
   const { provider, discovery } = exhaustedLoadingHarness();
   const counters = new PanelPerformanceCounters(1000);
   provider.performanceCounters = counters;
@@ -13570,6 +13571,7 @@ function partialSpendHarness(membersSettled: boolean) {
   ];
   let spendPasses = 0;
   let discoveries = 0;
+  let failed = false;
   provider.progressiveWorker.run = async (request: ProgressiveRequest, generation: number, signal: AbortSignal) => {
     if (request.kind !== 'claude-children') return run(request, generation, signal);
     const kind = request.spendOnly ? 'spend' : 'discovery';
@@ -13580,7 +13582,15 @@ function partialSpendHarness(membersSettled: boolean) {
       stamp: provider.sessionReadDiscoveryRevision,
     });
     if (request.spendOnly) {
-      // The third spend-only pass finishes the root.
+      if (spendFailure && !failed) {
+        failed = true;
+        if (spendFailure === 'reject') throw new Error('Session reading failed.');
+        return { generation, value: { kind: 'dispatch-spend', held: false } };
+      }
+      // The reference row that the derived cache saves for the root.
+      if (!provider.claudeChildReferenceEntries.has('codex-root.jsonl'))
+        provider.claudeChildReferenceEntries.set('codex-root.jsonl', { sessionId: 'codex-root' });
+      // The third spend-only pass finishes the root and returns its saved facts.
       const continuation = ++spendPasses < 3;
       return {
         generation,
@@ -13589,6 +13599,7 @@ function partialSpendHarness(membersSettled: boolean) {
           held: true,
           dispatchFacts: facts(continuation),
           continuation,
+          savedDispatch: continuation ? [] : [['codex-root.jsonl', { facts: facts(false)[0] }]],
           charges: {},
           dispatchRoots: {},
         },
@@ -13635,11 +13646,50 @@ test('a complete reply that waits only for dispatched spend publishes, and spend
       false,
       'the settled spend did not reach the row',
     );
+    assert.equal(
+      provider.claudeChildReferenceEntries.get('codex-root.jsonl')?.dispatch?.facts.spend.found,
+      true,
+      'the settled facts did not reach the saved reference row',
+    );
     assert.ok(provider.sessionReadDiscoveryRevision, 'refining spend withdrew the published catalog');
   } finally {
     vi.clearAllTimers();
     vi.useRealTimers();
   }
+});
+
+for (const failure of ['held-false', 'reject'] as const)
+  test(`a spend-only request that ${failure === 'reject' ? 'fails' : 'finds no held reply'} sends discovery back to a full pass`, async () => {
+    vi.useFakeTimers();
+    try {
+      const { provider, requests } = partialSpendHarness(true, failure);
+      provider.refreshFrom('startup', true);
+      const done = () => !provider.dispatchSpendPending && requests.length > 2 && provider.refreshController === null;
+      for (let step = 0; step < 500 && !done(); step++) await vi.advanceTimersByTimeAsync(1);
+      assert.ok(done(), `dispatched spend never settled after requests ${requests.join(', ')}`);
+      assert.deepEqual(requests, ['discovery', 'spend', 'discovery', 'spend', 'spend', 'spend']);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+test('an unowned dispatched session reads as unknown while its person scan is unfinished', () => {
+  const provider = completeDiscoveryHarness(undefined, false, ['agentRunFor'], { agentRunAnswer });
+  Object.assign(provider, {
+    saved: {},
+    startedHere: new Set(),
+    metaFor: () => ({ size: -1 }),
+  });
+  const session = { file: 'codex-root.jsonl', sessionId: 'codex-root', agent: 'codex', size: 1, mtimeMs: 1 };
+  const edges = new Map([['codex-root', { relation: 'dispatched', owned: false }]]);
+  const answer = (facts: object) => {
+    provider.dispatchFacts = new Map([['codex-root', { sessionId: 'codex-root', ...facts }]]);
+    return provider.agentRunFor(session, edges);
+  };
+  assert.equal(answer({ person: false, personPending: true }), null, 'an unfinished person scan read as an agent run');
+  assert.equal(answer({ person: false }), true);
+  assert.equal(answer({ person: true }), false);
 });
 
 test('a complete reply whose members are still unsettled publishes nothing until they settle', async () => {

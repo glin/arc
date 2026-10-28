@@ -12267,101 +12267,116 @@ test('a dispatched spend aggregate settles in bounded passes after earlier dispa
   }
 });
 
-test('settled members publish while a Codex root person scan is unfinished, and spend-only passes refine its facts', async () => {
-  const directory = tempDir('partial-spend-publication-');
-  const parentFile = path.join(directory, 'parent.jsonl');
-  const rootId = 'aaaaaaaa-3333-3333-3333-333333333333';
-  fs.writeFileSync(
-    parentFile,
-    claudeDispatchTranscript(
-      'python child.py --arc-dispatch',
-      `ARC_DISPATCH_SESSION={"agent":"codex","session_id":"${rootId}","owned":true}`,
-      'dispatch-0',
-    )
-      .map((record) => JSON.stringify(record) + '\n')
-      .join(''),
-  );
-  const record = (type: string, payload: object) => JSON.stringify({ type, timestamp: timestamp(1), payload }) + '\n';
-  // Eight 64 KiB records put the root past one 256 KiB person step, so its person scan needs more than one pass.
-  fs.writeFileSync(
-    path.join(directory, rootId + '.jsonl'),
-    record('session_meta', { id: rootId, cwd: directory, source: 'exec' }) +
-      record('event_msg', { type: 'task_started', turn_id: 'work' }) +
-      record('turn_context', { turn_id: 'work', model: 'gpt-6.1-sol' }) +
-      record('event_msg', { type: 'user_message', message: 'work' }) +
-      Array.from({ length: 8 }, () => record('ignored', { text: 'x'.repeat(65500) })).join('') +
-      record('event_msg', {
-        type: 'token_count',
-        info: {
-          last_token_usage: { input_tokens: 10, output_tokens: 3, total_tokens: 13 },
-          total_token_usage: { input_tokens: 10, output_tokens: 3, total_tokens: 13 },
-        },
-      }) +
-      record('event_msg', { type: 'task_complete', turn_id: 'work' }),
-  );
-  const session = (sessionId: string, agent: 'claude' | 'codex') => {
-    const file = path.join(directory, sessionId + '.jsonl');
-    return { file, sessionId, agent, ...revisionOf(fs.statSync(file, { bigint: true })) };
-  };
-  const request = () => ({
-    kind: 'claude-children' as const,
-    parents: [session('parent', 'claude')],
-    catalog: [session('parent', 'claude'), session(rootId, 'codex')],
-    codexChildren: [],
-    repositoryRoots: [directory],
-  });
-  // A 64 KiB pass budget leaves the spend aggregate pending beside the person scan.
-  const worker = new ProgressiveWorker(`Date.now = () => ${Date.now() + 7_200_000};` + dispatchWorkerSource(64));
-  const signal = new AbortController().signal;
-  try {
-    const other = await worker.run(
-      { ...request(), repositoryRoots: [path.join(directory, 'other')], spendOnly: true },
-      1,
-      signal,
+// A 64 KiB pass budget leaves the spend aggregate pending beside the person scan. With 8 MiB the aggregate settles in the
+// first pass, and only the person scan stays unfinished.
+for (const [budgetKiB, unfinishedWork] of [
+  [64, 'spend aggregate and person scan'],
+  [8192, 'person scan'],
+] as const)
+  test(`settled members publish while a Codex root's ${unfinishedWork} is unfinished, and spend-only passes refine its facts`, async () => {
+    const directory = tempDir('partial-spend-publication-');
+    const parentFile = path.join(directory, 'parent.jsonl');
+    const rootId = 'aaaaaaaa-3333-3333-3333-333333333333';
+    fs.writeFileSync(
+      parentFile,
+      claudeDispatchTranscript(
+        'python child.py --arc-dispatch',
+        `ARC_DISPATCH_SESSION={"agent":"codex","session_id":"${rootId}","owned":true}`,
+        'dispatch-0',
+      )
+        .map((record) => JSON.stringify(record) + '\n')
+        .join(''),
     );
-    assert.deepEqual(
-      other?.value,
-      { kind: 'dispatch-spend', held: false },
-      'a worker without a complete reply refined spend',
+    const record = (type: string, payload: object) => JSON.stringify({ type, timestamp: timestamp(1), payload }) + '\n';
+    // Eight 64 KiB records put the root past one 256 KiB person step, so its person scan needs more than one pass.
+    fs.writeFileSync(
+      path.join(directory, rootId + '.jsonl'),
+      record('session_meta', { id: rootId, cwd: directory, source: 'exec' }) +
+        record('event_msg', { type: 'task_started', turn_id: 'work' }) +
+        record('turn_context', { turn_id: 'work', model: 'gpt-6.1-sol' }) +
+        record('event_msg', { type: 'user_message', message: 'work' }) +
+        Array.from({ length: 8 }, () => record('ignored', { text: 'x'.repeat(65500) })).join('') +
+        record('event_msg', {
+          type: 'token_count',
+          info: {
+            last_token_usage: { input_tokens: 10, output_tokens: 3, total_tokens: 13 },
+            total_token_usage: { input_tokens: 10, output_tokens: 3, total_tokens: 13 },
+          },
+        }) +
+        record('event_msg', { type: 'task_complete', turn_id: 'work' }),
     );
-    let published: Extract<import('./progressiveworker').ProgressiveValue, { kind: 'claude-children' }> | null = null;
-    for (let pass = 0; pass < 8 && !published; pass++) {
-      const result = await worker.run(request(), 1, signal);
-      if (result?.value.kind === 'claude-children') published = result.value;
-    }
-    assert.ok(published, 'discovery never returned a complete reply');
-    assert.equal(published.continuation, true, 'the spend of the root settled in its first pass');
-    assert.equal(published.membershipSettled, true, 'settled members waited for dispatched spend');
-    const first = published.dispatchFacts.find((facts) => facts.sessionId === rootId);
-    assert.equal(first?.spend.partial, true, 'the unfinished spend of the root was not marked partial');
-    assert.equal(first?.spend.unfinished, true, 'the root read as finished before its person scan ended');
-    let refined: Extract<
-      import('./progressiveworker').ProgressiveValue,
-      { kind: 'dispatch-spend'; held: true }
-    > | null = null;
-    let passes = 0;
-    for (; passes < 32 && !refined; passes++) {
-      const result = await worker.run({ ...request(), spendOnly: true }, 1, signal);
-      assert.ok(result?.value.kind === 'dispatch-spend' && result.value.held, 'a spend-only request ran discovery');
-      const { childHeadFiles, receiptEntries, parentChecks } = result.value.charges;
-      assert.deepEqual(
-        { childHeadFiles, receiptEntries, parentChecks },
-        { childHeadFiles: 0, receiptEntries: 0, parentChecks: 0 },
+    const session = (sessionId: string, agent: 'claude' | 'codex') => {
+      const file = path.join(directory, sessionId + '.jsonl');
+      return { file, sessionId, agent, ...revisionOf(fs.statSync(file, { bigint: true })) };
+    };
+    const request = () => ({
+      kind: 'claude-children' as const,
+      parents: [session('parent', 'claude')],
+      catalog: [session('parent', 'claude'), session(rootId, 'codex')],
+      codexChildren: [],
+      repositoryRoots: [directory],
+    });
+    const worker = new ProgressiveWorker(
+      `Date.now = () => ${Date.now() + 7_200_000};` + dispatchWorkerSource(budgetKiB),
+    );
+    const signal = new AbortController().signal;
+    try {
+      const other = await worker.run(
+        { ...request(), repositoryRoots: [path.join(directory, 'other')], spendOnly: true },
+        1,
+        signal,
       );
-      if (!result.value.continuation) refined = result.value;
+      assert.deepEqual(
+        other?.value,
+        { kind: 'dispatch-spend', held: false },
+        'a worker without a complete reply refined spend',
+      );
+      let published: Extract<import('./progressiveworker').ProgressiveValue, { kind: 'claude-children' }> | null = null;
+      for (let pass = 0; pass < 8 && !published; pass++) {
+        const result = await worker.run(request(), 1, signal);
+        if (result?.value.kind === 'claude-children') published = result.value;
+      }
+      assert.ok(published, 'discovery never returned a complete reply');
+      assert.equal(published.continuation, true, 'the spend of the root settled in its first pass');
+      assert.equal(published.membershipSettled, true, 'settled members waited for dispatched spend');
+      const first = published.dispatchFacts.find((facts) => facts.sessionId === rootId);
+      // A pending aggregate marks the spend partial. Complete totals stay exact, and the unfinished person scan marks the
+      // root unfinished, which draws its figure as a lower bound.
+      assert.equal(first?.spend.partial, budgetKiB === 64, 'the partial mark does not follow the spend aggregate');
+      assert.equal(first?.spend.unfinished, true, 'the root read as finished before its person scan ended');
+      assert.equal(first?.personPending, true, 'an unfinished person scan read as a final classification');
+      let refined: Extract<
+        import('./progressiveworker').ProgressiveValue,
+        { kind: 'dispatch-spend'; held: true }
+      > | null = null;
+      let passes = 0;
+      for (; passes < 32 && !refined; passes++) {
+        const result = await worker.run({ ...request(), spendOnly: true }, 1, signal);
+        assert.ok(result?.value.kind === 'dispatch-spend' && result.value.held, 'a spend-only request ran discovery');
+        const { childHeadFiles, receiptEntries, parentChecks } = result.value.charges;
+        assert.deepEqual(
+          { childHeadFiles, receiptEntries, parentChecks },
+          { childHeadFiles: 0, receiptEntries: 0, parentChecks: 0 },
+        );
+        if (!result.value.continuation) refined = result.value;
+      }
+      assert.ok(refined, 'spend-only passes never settled the root');
+      if (budgetKiB === 64)
+        assert.ok(passes > 1, 'the root settled in one spend-only pass, so the passes refined nothing');
+      const facts = refined.dispatchFacts.find((one) => one.sessionId === rootId);
+      assert.equal(facts?.spend.found, true);
+      assert.equal(facts?.spend.partial, false);
+      assert.notEqual(facts?.spend.unfinished, true);
+      assert.equal(facts?.personPending, undefined);
+      assert.equal(facts?.spend.models[0]?.usage.output, 3);
+      // The pass that settles the root returns its saved facts, so the host can save them before any reload.
+      const saved = refined.savedDispatch.find(([file]) => file.toLowerCase().endsWith(rootId + '.jsonl'));
+      assert.equal(saved?.[1]?.facts.spend.found, true, 'the settled facts did not leave the worker');
+    } finally {
+      worker.stop();
+      fs.rmSync(directory, { recursive: true, force: true });
     }
-    assert.ok(refined, 'spend-only passes never settled the root');
-    assert.ok(passes > 1, 'the root settled in one spend-only pass, so the passes refined nothing');
-    const facts = refined.dispatchFacts.find((one) => one.sessionId === rootId);
-    assert.equal(facts?.spend.found, true);
-    assert.equal(facts?.spend.partial, false);
-    assert.notEqual(facts?.spend.unfinished, true);
-    assert.equal(facts?.spend.models[0]?.usage.output, 3);
-  } finally {
-    worker.stop();
-    fs.rmSync(directory, { recursive: true, force: true });
-  }
-});
+  });
 
 test('dispatched spend aggregates settle across passes beside a running Codex root and read each file once', async () => {
   const directory = tempDir('spend-aggregate-passes-');

@@ -164,6 +164,8 @@ export interface DispatchSessionFacts {
   toolUses: number;
   // Whether the session's own records establish reader input.
   person: boolean;
+  // True while a Codex person scan has not reached the end of the file, so `person` false is not final.
+  personPending?: true;
 }
 export interface DiscoveryCheckpoint {
   compatibility?: string;
@@ -432,6 +434,8 @@ export type ProgressiveValue =
       held: true;
       dispatchFacts: DispatchSessionFacts[];
       continuation: boolean;
+      // Saved facts that the pass settled or dropped, by reference row key. Null drops the row's saved facts.
+      savedDispatch: Array<[string, import('./derivedcache').SavedDispatchFacts | null]>;
       charges: DiscoveryCharges;
       dispatchRoots: Record<string, DispatchRootCharges>;
     }

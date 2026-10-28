@@ -12693,8 +12693,8 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   // Reads the dispatched facts of the accepted catalog again while its members are settled. The reply changes no member or
-  // relationship, so it starts no discovery epoch. True when a drawn figure moved. A worker that holds no complete reply
-  // for the current roots sends discovery back to a full pass.
+  // relationship, so it starts no discovery epoch. True when a drawn figure moved. A failed request, or a worker that holds
+  // no complete reply for the current roots, sends discovery back to a full pass, which reports its own failure.
   private async refineDispatchedSpend(generation: number, signal: AbortSignal): Promise<boolean> {
     const result = await this.progressiveWorker
       .run(
@@ -12708,16 +12708,21 @@ export class PanelProvider implements vscode.Disposable {
         generation,
         signal,
       )
-      .catch(() => null);
-    if (!result || result.value.kind !== 'dispatch-spend') return false;
-    const reply = result.value;
+      .catch(() => 'failed' as const);
+    // A cancelled request answers null.
+    if (!result) return false;
+    // A spend-only request always answers with a spend reply.
+    const reply =
+      result === 'failed'
+        ? ({ kind: 'dispatch-spend', held: false } as const)
+        : (result.value as Extract<import('./progressiveworker').ProgressiveValue, { kind: 'dispatch-spend' }>);
     if (reply.held)
       this.performanceCounters?.recordDiscovery?.(
         reply.charges,
         { complete: !reply.continuation, continuation: reply.continuation },
         reply.dispatchRoots,
       );
-    if (signal.aborted || result.generation !== this.refreshGeneration) return false;
+    if (signal.aborted || (result !== 'failed' && result.generation !== this.refreshGeneration)) return false;
     const waiting = this.dispatchedDiscoveryWaiting();
     if (!reply.held) {
       this.dispatchSpendPending = false;
@@ -12728,6 +12733,26 @@ export class PanelProvider implements vscode.Disposable {
     const revision = this.dispatchFiguresRevision;
     this.dispatchSpendPending = reply.continuation;
     this.applyDispatchFacts(reply.dispatchFacts);
+    // Settled facts join the reference rows that the derived cache saves, so a reload reuses them.
+    if (reply.savedDispatch.length) {
+      const entries = new Map(this.claudeChildReferenceEntries);
+      let saved = false;
+      for (const [file, dispatch] of reply.savedDispatch) {
+        const row = entries.get(file);
+        if (!row) continue;
+        if (dispatch) entries.set(file, { ...row, dispatch });
+        else {
+          const { dispatch: _dispatch, ...rest } = row;
+          entries.set(file, rest);
+        }
+        saved = true;
+      }
+      if (saved) {
+        this.claudeChildReferenceEntries = entries;
+        this.derivedCacheCheckpointState.markChanged();
+        this.checkpointDerivedCache();
+      }
+    }
     if (this.dispatchedDiscoveryWaiting() !== waiting) this.postDispatchedCostsIfMoved('spendRefined');
     return this.dispatchFiguresRevision !== revision;
   }
@@ -13663,7 +13688,12 @@ export class PanelProvider implements vscode.Disposable {
       this.startedHere,
       session.childTranscript === true,
       dispatched ? true : this.dispatchDiscoveryPending ? null : false,
-      dispatched && (edge.owned === true || this.dispatchFacts.get(session.sessionId)?.person === true),
+      dispatched &&
+        (edge.owned === true || this.dispatchFacts.get(session.sessionId)?.person === true
+          ? true
+          : this.dispatchFacts.get(session.sessionId)?.personPending
+            ? null
+            : false),
     );
   }
 

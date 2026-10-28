@@ -479,6 +479,7 @@ async function execute(
         held: true,
         dispatchFacts: spend.dispatched,
         continuation: spend.continuation,
+        savedDispatch: spend.savedChanges,
         charges,
         dispatchRoots: spend.dispatchRoots,
       };
@@ -1470,7 +1471,13 @@ function collectDispatchFacts(
   references: readonly import('./transcript').ClaudeChildSessionReference[],
   admittedReferences: ReturnType<typeof admittedDispatchReferences>,
   charges: DiscoveryCharges,
-): { dispatched: DispatchSessionFacts[]; dispatchRoots: Record<string, DispatchRootCharges>; continuation: boolean } {
+): {
+  dispatched: DispatchSessionFacts[];
+  dispatchRoots: Record<string, DispatchRootCharges>;
+  continuation: boolean;
+  // The saved facts this pass settled or dropped, by row key, so a spend-only reply can carry them to the host's cache.
+  savedChanges: Array<[string, SavedDispatchFacts | null]>;
+} {
   let continuation = false;
   const dispatched: DispatchSessionFacts[] = [];
   const seen = new Set<string>();
@@ -1605,6 +1612,7 @@ function collectDispatchFacts(
                 endedAt: null,
                 toolUses: 0,
                 person: false,
+                ...(reference.agent === 'codex' ? { personPending: true as const } : {}),
                 spend: { models: [], found: false, partial: true, effort: null },
               },
         );
@@ -1710,6 +1718,7 @@ function collectDispatchFacts(
                 endedAt: null,
                 toolUses: 0,
                 person: false,
+                ...(reference.agent === 'codex' ? { personPending: true as const } : {}),
                 spend: { models: [], found: false, partial: true, effort: null },
               },
         );
@@ -1735,6 +1744,10 @@ function collectDispatchFacts(
         endedAt: spend.endedAt ?? null,
         toolUses: spend.toolUses ?? 0,
         person,
+        // A Codex person scan that has not reached the end of the file can still find reader input.
+        ...(reference.agent === 'codex' && !person && (!codexPerson || codexPerson.bytes < revision.size)
+          ? { personPending: true as const }
+          : {}),
       };
       dispatchFacts.set(reference.file, {
         sourceGeneration,
@@ -1768,6 +1781,7 @@ function collectDispatchFacts(
       dispatchFacts.delete(file);
     }
   }
+  const previousSaved = savedDispatchFacts;
   savedDispatchFacts = new Map();
   for (const [file, held] of dispatchFacts) {
     if (!held.settled) continue;
@@ -1782,7 +1796,11 @@ function collectDispatchFacts(
     };
     savedDispatchFacts.set(normalizeFsPath(file), held.saved);
   }
-  return { dispatched, dispatchRoots, continuation };
+  const savedChanges: Array<[string, SavedDispatchFacts | null]> = [];
+  for (const [file, saved] of savedDispatchFacts)
+    if (previousSaved?.get(file) !== saved) savedChanges.push([file, saved]);
+  for (const file of previousSaved?.keys() ?? []) if (!savedDispatchFacts.has(file)) savedChanges.push([file, null]);
+  return { dispatched, dispatchRoots, continuation, savedChanges };
 }
 
 type RequestKind = ProgressiveRequest['kind'];
