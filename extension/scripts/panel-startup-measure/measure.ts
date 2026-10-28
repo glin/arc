@@ -5,7 +5,18 @@ import * as os from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
 import * as path from 'node:path';
 import { removeMeasurementTree } from './cleanup';
+import { pathRewriter, rebindDispatch } from './freeze';
 import { instrumentSelection, measureSelection, instrumentResponse, measureResponse } from './selection';
+import {
+  appendDispatchTurn,
+  hostMemory,
+  instrumentSoak,
+  linkTree,
+  machineBusy,
+  soakMeasures,
+  startDispatch,
+  type HostMemory,
+} from './soak';
 import { codexSessionFiles, codexSessionsRoot } from '../../src/codex.ts';
 import { DIAGNOSTICS_LOG_DIRECTORY } from '../../src/diagnosticslog.ts';
 import type { StartupMilestone } from '../../src/performancediagnostics.ts';
@@ -42,20 +53,30 @@ const MEASUREMENT_RUN = randomUUID();
 let selectionRequested = false;
 let responseRequested = false;
 let expectedSelection: { session: string; key?: string; prompt?: string; summary?: string } | null = null;
-function isolatedEnvironment(): NodeJS.ProcessEnv {
+let soakRequested = false;
+const SOAK = path.join(SCRATCH, 'soak');
+const SOAK_PROJECTS = path.join(SCRATCH, 'soak-projects');
+const SOAK_CODEX = path.join(SCRATCH, 'soak-codex');
+function isolatedEnvironment(run = MEASUREMENT_RUN): NodeJS.ProcessEnv {
   return {
     ...process.env,
     CLAUDE_CONFIG_DIR: path.join(SCRATCH, 'claude-config'),
     CODEX_HOME: path.join(SCRATCH, 'codex-config'),
     ARC_HOME: ARC_STORE,
-    ARC_PROJECTS_ROOT: fixture.projects,
-    ARC_CODEX_ROOT: responseRequested ? path.join(SCRATCH, 'response-codex') : fixture.codex,
+    ARC_PROJECTS_ROOT: soakRequested ? SOAK_PROJECTS : fixture.projects,
+    ARC_CODEX_ROOT: responseRequested
+      ? path.join(SCRATCH, 'response-codex')
+      : soakRequested
+        ? SOAK_CODEX
+        : fixture.codex,
     ARC_MEASURE_STATE: STATE,
     ARC_MEASURE_BLOCK_AGENTS: '1',
-    ARC_MEASURE_RUN: MEASUREMENT_RUN,
+    ARC_MEASURE_RUN: run,
     ...(selectionRequested ? { ARC_MEASURE_TRACE: path.join(SCRATCH, 'selection-trace') } : {}),
+    ...(soakRequested ? { ARC_MEASURE_SOAK: SOAK } : {}),
   };
 }
+const WARM_USER_DATA = path.join(SCRATCH, 'warm-user-data');
 const USER_DATA = path.join(SCRATCH, 'user-data');
 const EXTENSIONS = path.join(SCRATCH, 'extensions');
 const ARC_STORE = path.join(SCRATCH, 'arc-home');
@@ -70,6 +91,9 @@ interface Options {
   keep: boolean;
   selection: boolean;
   response: boolean;
+  soakMinutes: number;
+  warmUp: boolean;
+  minimumFreeGb: number;
 }
 
 interface LogLine {
@@ -124,10 +148,17 @@ function readOptions(argv: string[]): Options {
     fixture: '',
     selection: false,
     response: false,
+    soakMinutes: 0,
+    warmUp: false,
+    minimumFreeGb: 8,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const flag = argv[i];
     const value = argv[i + 1];
+    if (flag === '--warm-up') {
+      options.warmUp = true;
+      continue;
+    }
     if (flag === '--response') {
       options.response = true;
       options.selection = true;
@@ -153,6 +184,10 @@ function readOptions(argv: string[]): Options {
       options.commit = value;
     } else if (flag === '--timeout') {
       options.timeoutMs = Number(value) * 1000;
+    } else if (flag === '--soak') {
+      options.soakMinutes = Number(value);
+    } else if (flag === '--min-free-gb') {
+      options.minimumFreeGb = Number(value);
     } else {
       stop(`Unknown option ${flag}.`);
     }
@@ -162,6 +197,10 @@ function readOptions(argv: string[]): Options {
     stop('--timeout takes a number of seconds.');
   }
   if (!options.fixture) stop('--fixture requires a frozen input manifest.');
+  if (!Number.isFinite(options.soakMinutes) || options.soakMinutes < 0) stop('--soak takes a number of minutes.');
+  if (!Number.isFinite(options.minimumFreeGb) || options.minimumFreeGb < 0)
+    stop('--min-free-gb takes a number of gigabytes.');
+  if (options.soakMinutes > 0 && options.selection) stop('--soak runs without --selection and --response.');
   return options;
 }
 
@@ -308,22 +347,38 @@ export function frozenPath(root: string, input: string): string {
 
 function seedProfile(): void {
   if (responseRequested) fs.cpSync(fixture.codex, path.join(SCRATCH, 'response-codex'), { recursive: true });
-  fs.mkdirSync(path.join(USER_DATA, 'User'), { recursive: true });
-  fs.writeFileSync(
-    path.join(USER_DATA, 'User', 'settings.json'),
-    JSON.stringify({
-      'arc.diagnostics.log': true,
-      'telemetry.telemetryLevel': 'off',
-      'workbench.startupEditor': 'none',
-      'workbench.welcomePage.walkthroughs.openOnInstall': false,
-      'workbench.welcomePage.experimentalOnboarding': false,
-      'update.mode': 'none',
-      'extensions.autoCheckUpdates': false,
-      'extensions.autoUpdate': false,
-    }),
-  );
+  if (soakRequested) {
+    linkTree(fixture.projects, SOAK_PROJECTS);
+    linkTree(fixture.codex, SOAK_CODEX);
+    fs.mkdirSync(SOAK, { recursive: true });
+  }
+  for (const profile of [USER_DATA, WARM_USER_DATA]) {
+    fs.mkdirSync(path.join(profile, 'User'), { recursive: true });
+    fs.writeFileSync(
+      path.join(profile, 'User', 'settings.json'),
+      JSON.stringify({
+        'arc.diagnostics.log': true,
+        'telemetry.telemetryLevel': 'off',
+        'workbench.startupEditor': 'none',
+        'workbench.welcomePage.walkthroughs.openOnInstall': false,
+        'workbench.welcomePage.experimentalOnboarding': false,
+        'update.mode': 'none',
+        'extensions.autoCheckUpdates': false,
+        'extensions.autoUpdate': false,
+      }),
+    );
+  }
   fs.writeFileSync(STATE, JSON.stringify(sanitizeMeasurementState(JSON.parse(fs.readFileSync(fixture.state, 'utf8')))));
   seedMeasurementStore(fixture.store, ARC_STORE);
+  runRecord.dispatchRebind = rebindDispatch(
+    path.join(ARC_STORE, 'dispatch'),
+    soakRequested
+      ? pathRewriter([
+          [fixture.projects, SOAK_PROJECTS],
+          [fixture.codex, SOAK_CODEX],
+        ])
+      : undefined,
+  );
 }
 
 export function seedMeasurementStore(source: string, target: string): void {
@@ -364,9 +419,16 @@ export function inputHashes(root: string, inputs: string[]): Record<string, stri
   return hashes;
 }
 
+// The measured editor reads its own Arc home, so a fixture may sit in the Arc home's measure directory.
+export function liveDirectories(root: string, home = arcHome()): string[] {
+  const measureHome = normalizeFsPath(path.join(fs.existsSync(home) ? fs.realpathSync(home) : home, 'measure'));
+  const inMeasureHome = normalizeFsPath(fs.realpathSync(root)).startsWith(measureHome + '/');
+  return [...(inMeasureHome ? [] : [home]), projectsRoot(), codexSessionsRoot()];
+}
+
 function loadFixture(manifest: string): void {
   const root = path.dirname(fs.realpathSync(manifest));
-  const live = [arcHome(), projectsRoot(), codexSessionsRoot()];
+  const live = liveDirectories(root);
   const raw = JSON.parse(fs.readFileSync(manifest, 'utf8'));
   fixture = frozenFixturePaths(root, raw, live);
   const selected = sanitizeMeasurementState(JSON.parse(fs.readFileSync(fixture.state, 'utf8'))).showing;
@@ -696,12 +758,13 @@ interface Launch {
 }
 
 // Launches an isolated editor window through its CLI and releases the launcher process.
-function launchEditor(commandLine: string, workspace: string): Launch {
+function launchEditor(commandLine: string, workspace: string, profile = USER_DATA, run = MEASUREMENT_RUN): Launch {
   const launch: Launch = { failure: null };
+  const prefix = profile === USER_DATA ? '' : 'warm-';
   const shell = process.platform === 'win32';
   const args = [
     '--user-data-dir',
-    USER_DATA,
+    profile,
     '--extensions-dir',
     EXTENSIONS,
     '--disable-workspace-trust',
@@ -709,11 +772,11 @@ function launchEditor(commandLine: string, workspace: string): Launch {
     ...(selectionRequested ? ['--remote-debugging-port=0', '--remote-debugging-address=127.0.0.1'] : []),
     workspace,
   ];
-  const stdout = fs.openSync(path.join(SCRATCH, 'launch.stdout.log'), 'w');
-  const stderr = fs.openSync(path.join(SCRATCH, 'launch.stderr.log'), 'w');
+  const stdout = fs.openSync(path.join(SCRATCH, `${prefix}launch.stdout.log`), 'w');
+  const stderr = fs.openSync(path.join(SCRATCH, `${prefix}launch.stderr.log`), 'w');
   const child = spawn(shell ? quoted(commandLine) : commandLine, shell ? args.map(quoted) : args, {
     cwd: SCRATCH,
-    env: isolatedEnvironment(),
+    env: isolatedEnvironment(run),
     stdio: ['ignore', stdout, stderr],
     detached: true,
     shell,
@@ -722,12 +785,12 @@ function launchEditor(commandLine: string, workspace: string): Launch {
   fs.closeSync(stderr);
   const receipt = (code: number | null, signal: string | null, error?: string) =>
     fs.writeFileSync(
-      path.join(SCRATCH, 'launch.json'),
+      path.join(SCRATCH, `${prefix}launch.json`),
       JSON.stringify({
         commandLine,
         args,
         pid: child.pid ?? null,
-        profile: USER_DATA,
+        profile,
         code,
         signal,
         error: error ?? null,
@@ -750,10 +813,14 @@ function launchEditor(commandLine: string, workspace: string): Launch {
 }
 
 // Identify the run's editor processes by their isolated profile path before stopping them.
-function stopEditor(): void {
+function stopEditor(profile = USER_DATA): void {
+  const ownership = path.join(
+    SCRATCH,
+    profile === USER_DATA ? 'process-ownership.json' : 'warm-process-ownership.json',
+  );
   if (process.platform === 'win32') {
-    const escaped = USER_DATA.replaceAll("'", "''");
-    const owned = path.join(SCRATCH, 'process-ownership.json').replaceAll("'", "''");
+    const escaped = profile.replaceAll("'", "''");
+    const owned = ownership.replaceAll("'", "''");
     const query = `$profile='${escaped}'; $owned=@(Get-CimInstance Win32_Process -Filter "Name='Code.exe'" | Where-Object { $_.CommandLine -and $_.CommandLine.Contains($profile) }); $owned | Select-Object ProcessId,CreationDate,CommandLine | ConvertTo-Json | Set-Content -LiteralPath '${owned}'; foreach($entry in $owned) { $current=Get-CimInstance Win32_Process -Filter "ProcessId=$($entry.ProcessId)"; if($current -and $current.CreationDate -eq $entry.CreationDate -and $current.CommandLine -eq $entry.CommandLine) { Stop-Process -Id $entry.ProcessId -Force -ErrorAction SilentlyContinue } }`;
     spawnSync('powershell', ['-NoProfile', '-Command', query], {
       stdio: 'ignore',
@@ -764,8 +831,8 @@ function stopEditor(): void {
     spawnSync('ps', ['-eo', 'pid=,lstart=,args='], {
       encoding: 'utf8',
     }).stdout.split('\n');
-  const owned = list().filter((line) => line.includes(USER_DATA));
-  fs.writeFileSync(path.join(SCRATCH, 'process-ownership.json'), JSON.stringify(owned));
+  const owned = list().filter((line) => line.includes(profile));
+  fs.writeFileSync(ownership, JSON.stringify(owned));
   for (const line of owned) {
     if (!list().includes(line)) continue;
     const pid = Number(line.trim().split(/\s+/)[0]);
@@ -808,9 +875,155 @@ export async function pollStartup(
   }
 }
 
+// Measures of the measured launch beyond its startup milestones, written into result.json.
+const runRecord: Record<string, unknown> = {};
+
+// Wait until no full test suite runs and free memory reaches the floor. A busy machine skews every timing.
+async function awaitMachine(minimumFreeGb: number, deadlineMs: number): Promise<void> {
+  const deadline = Date.now() + deadlineMs;
+  for (;;) {
+    const busy = machineBusy(minimumFreeGb);
+    if (!busy) return;
+    if (Date.now() >= deadline) throw new Error(`The machine stayed busy: ${busy}`);
+    process.stdout.write(`Waiting before launch. ${busy}\n`);
+    await delay(30_000);
+  }
+}
+
+// The time from launch to the first accepted paint with usable session-list rows.
+export function firstUsableRowMs(lines: LogLine[], launchedAt: number): number | null {
+  const paint = lines.find(
+    (line) =>
+      line.event === 'measurementPaint' &&
+      line.accepted === true &&
+      line.stage === 'railReady' &&
+      line.usableRows === true,
+  );
+  const at = Date.parse(paint?.at ?? '');
+  return Number.isFinite(at) ? at - launchedAt : null;
+}
+
+// The measured host's startup history record, matched by process ID. The warm-up host writes its own record.
+export function measuredStartupRecord(directory: string, pid: number | null): Record<string, unknown> | null {
+  let records: Array<Record<string, unknown>> = [];
+  try {
+    records = fs
+      .readdirSync(directory)
+      .filter((name) => name.endsWith('.jsonl'))
+      .flatMap((name) => fs.readFileSync(path.join(directory, name), 'utf8').split('\n'))
+      .filter((text) => text.trim())
+      .map((text) => JSON.parse(text) as Record<string, unknown>);
+  } catch {
+    return null;
+  }
+  const own = records.filter((record) => pid !== null && record.pid === pid);
+  const last = own.at(-1);
+  if (!last) return null;
+  return {
+    pid,
+    outcome: last.outcome,
+    stages: last.stages,
+    hidden: last.hidden ?? null,
+    memory: last.memory,
+    counters: last.counters ?? null,
+  };
+}
+
+// Keep the largest extension host memory reading of the measured launch.
+class MemoryWatch {
+  last: HostMemory | null = null;
+  maximumWorkingSetBytes = 0;
+  samples = 0;
+  sample(profile: string): void {
+    const memory = hostMemory(profile);
+    if (!memory) return;
+    this.samples++;
+    this.maximumWorkingSetBytes = Math.max(this.maximumWorkingSetBytes, memory.workingSetBytes);
+    this.last = memory;
+  }
+  record(): Record<string, unknown> {
+    return {
+      samples: this.samples,
+      sampledMaximumWorkingSetBytes: this.maximumWorkingSetBytes || null,
+      peakWorkingSetBytes: this.last?.peakWorkingSetBytes ?? null,
+      lastPrivateBytes: this.last?.privateBytes ?? null,
+      pid: this.last?.pid ?? null,
+    };
+  }
+}
+
+async function requestSnapshot(name: string, deadlineMs: number): Promise<Record<string, unknown> | null> {
+  fs.writeFileSync(path.join(SOAK, `${name}.request`), '');
+  const deadline = Date.now() + deadlineMs;
+  while (Date.now() < deadline) {
+    if (fs.existsSync(path.join(SOAK, `${name}.failed`))) return null;
+    try {
+      return JSON.parse(fs.readFileSync(path.join(SOAK, `${name}.json`), 'utf8')) as Record<string, unknown>;
+    } catch {
+      await delay(1000);
+    }
+  }
+  return null;
+}
+
+// Keep the editor open, append a dispatched child turn every half minute, and save diagnostics every minute.
+async function soak(
+  minutes: number,
+  memory: MemoryWatch,
+  launch: Launch,
+): Promise<{ complete: boolean; note: string | null }> {
+  const snapshots: Array<{ name: string; at: string; measures: Record<string, number> | null }> = [];
+  const take = async (name: string) => {
+    const snapshot = await requestSnapshot(name, 120_000);
+    snapshots.push({ name, at: new Date().toISOString(), measures: snapshot ? soakMeasures(snapshot) : null });
+    return snapshot;
+  };
+  const first = await take('000-start');
+  const simulation = startDispatch(SOAK_PROJECTS, SOAK_CODEX, fixture.workspace);
+  const end = Date.now() + minutes * 60_000;
+  let minute = 0;
+  let nextAppend = Date.now() + 30_000;
+  let nextSnapshot = Date.now() + 60_000;
+  while (Date.now() < end && launch.failure === null) {
+    await delay(Math.max(0, Math.min(nextAppend, nextSnapshot, end) - Date.now()));
+    memory.sample(USER_DATA);
+    if (Date.now() >= nextAppend && Date.now() < end) {
+      appendDispatchTurn(simulation, fixture.workspace);
+      nextAppend += 30_000;
+    }
+    if (Date.now() >= nextSnapshot && Date.now() < end) {
+      minute++;
+      await take(String(minute).padStart(3, '0'));
+      nextSnapshot += 60_000;
+    }
+  }
+  memory.sample(USER_DATA);
+  const last = await take('999-end');
+  const startMeasures = first ? soakMeasures(first) : null;
+  const endMeasures = last ? soakMeasures(last) : null;
+  runRecord.soak = {
+    minutes,
+    snapshots,
+    start: startMeasures,
+    end: endMeasures,
+    dispatch: { childId: simulation.childId, appends: simulation.appends, bytes: simulation.bytes },
+    limits: [
+      'The dispatched child is a synthetic Codex rollout that a synthetic Claude parent names. No agent process runs, and no dispatch receipt exists.',
+      'The child grows by one completed turn every 30 seconds, with fixed token totals and 256 KiB of reasoning text per turn.',
+      'The soak overlay reads its request directory once a second in the extension host of both builds.',
+    ],
+  };
+  if (launch.failure !== null) return { complete: false, note: launch.failure };
+  if (!startMeasures || !endMeasures)
+    return { complete: false, note: 'The soak saved no diagnostics snapshot at its start or its end.' };
+  return { complete: true, note: null };
+}
+
 // Wait for every startup milestone by the measurement deadline.
-// Selection runs also measure session switching. Editor failure or timeout ends an incomplete run.
-async function measure(commandLine: string, workspace: string, timeoutMs: number): Promise<Outcome> {
+// Selection runs also measure session switching. A soak keeps the editor open afterwards.
+// Editor failure or timeout ends an incomplete run.
+async function measure(commandLine: string, workspace: string, options: Options): Promise<Outcome> {
+  const timeoutMs = options.timeoutMs;
   const { acquireBrowserLock } = await import('../../test/browserlock.mjs');
   const { createTestObservation } = await import('../../test/observations.mjs');
   const observation = createTestObservation({ lane: 'panel startup measurement', cwd: REPOSITORY, capacity: 1 });
@@ -822,10 +1035,32 @@ async function measure(commandLine: string, workspace: string, timeoutMs: number
     lock = await acquireBrowserLock({ deadlineMs: timeoutMs, observation });
     const logs = path.join(ARC_STORE, DIAGNOSTICS_LOG_DIRECTORY);
     const reader = new LogReader(logs);
+    if (options.warmUp) {
+      await awaitMachine(options.minimumFreeGb, 30 * 60_000);
+      const warmRun = `${MEASUREMENT_RUN}-warm`;
+      const warmAt = Date.now();
+      const warmLaunch = launchEditor(commandLine, workspace, WARM_USER_DATA, warmRun);
+      try {
+        const warm = await pollStartup(() => reader.read(), warmLaunch, timeoutMs, warmRun, expectedSelection);
+        runRecord.warmUp = {
+          complete: warm.complete,
+          note: warm.note,
+          firstUsableRowMs: firstUsableRowMs(warm.lines, warmAt),
+          completeRenderMs: milestoneOf(warm.lines, 'completeRender').hostMs,
+        };
+      } finally {
+        stopEditor(WARM_USER_DATA);
+      }
+    }
+    await awaitMachine(options.minimumFreeGb, 30 * 60_000);
+    const memory = new MemoryWatch();
+    const launchedAt = Date.now();
     const launch = launchEditor(commandLine, workspace);
+    const sampler = setInterval(() => memory.sample(USER_DATA), 10_000);
     observation.begin('execution', { boundary: 'Startup and selection measurement await' });
     try {
       const outcome = await pollStartup(() => reader.read(), launch, timeoutMs, MEASUREMENT_RUN, expectedSelection);
+      runRecord.firstUsableRowMs = firstUsableRowMs(outcome.lines, launchedAt);
       if (outcome.complete && selectionRequested) {
         const result = responseRequested
           ? await measureResponse(SCRATCH, timeoutMs)
@@ -833,12 +1068,27 @@ async function measure(commandLine: string, workspace: string, timeoutMs: number
         complete = result.complete;
         return { ...outcome, note: result.note, complete: result.complete };
       }
+      if (outcome.complete && options.soakMinutes > 0) {
+        clearInterval(sampler);
+        const result = await soak(options.soakMinutes, memory, launch);
+        complete = result.complete;
+        return {
+          ...outcome,
+          lines: linesOf(reader.read(), outcome.instance, MEASUREMENT_RUN),
+          note: result.note,
+          complete,
+        };
+      }
       complete = outcome.complete;
       return outcome;
     } finally {
+      clearInterval(sampler);
+      memory.sample(USER_DATA);
+      runRecord.memory = memory.record();
       observation.end('execution');
       observation.begin('cleanup');
       stopEditor();
+      runRecord.startupRecord = measuredStartupRecord(path.join(ARC_STORE, 'startup'), memory.last?.pid ?? null);
       lock?.release();
       observation.end('cleanup', { descendants: 'unobserved' });
     }
@@ -947,6 +1197,7 @@ function report(outcome: Outcome, label: string, workspace: string): void {
 async function main(): Promise<void> {
   const options = readOptions(process.argv.slice(2));
   selectionRequested = options.selection;
+  soakRequested = options.soakMinutes > 0;
   responseRequested = options.response;
   loadFixture(options.fixture);
   options.workspace = fixture.workspace;
@@ -961,6 +1212,7 @@ async function main(): Promise<void> {
     instrumentStartup(tree);
     if (selectionRequested) instrumentSelection(tree);
     if (responseRequested) instrumentResponse(tree);
+    if (soakRequested) instrumentSoak(tree);
     const label = git(['rev-parse', '--short', source]);
     npm(['run', 'build'], path.join(tree, 'extension'));
     npm(['run', 'package'], path.join(tree, 'extension'));
@@ -1000,13 +1252,21 @@ async function main(): Promise<void> {
                 .digest('hex'),
             }
           : {}),
+        ...(soakRequested
+          ? {
+              soakOverlaySha256: createHash('sha256')
+                .update(fs.readFileSync(path.join(__dirname, 'soak.ts')))
+                .digest('hex'),
+            }
+          : {}),
+        warmUp: options.warmUp,
         route: 'created',
         settings: { detailedLog: true },
         cacheStore: ARC_STORE,
       }),
     );
     process.stdout.write(`Owned paths and artifacts: ${SCRATCH}\n`);
-    const outcome = await measure(commandLine, options.workspace, options.timeoutMs);
+    const outcome = await measure(commandLine, options.workspace, options);
     fs.writeFileSync(
       path.join(SCRATCH, 'result.json'),
       JSON.stringify(
@@ -1015,6 +1275,7 @@ async function main(): Promise<void> {
           artifact,
           expectedSelection,
           deadlineMs: options.timeoutMs,
+          ...runRecord,
           ...outcome,
           byteMeasurement: 'JSON content-size proxy',
           nativeCloneBytes: null,

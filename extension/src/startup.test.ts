@@ -51,14 +51,15 @@ import {
   watchDirs,
   humanPromptScanSteps,
   promptScanLists,
+  readClaudeChildSessionReferences,
 } from './transcript';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import mutableFs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import * as path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { isDeepStrictEqual } from 'node:util';
 import ts from 'typescript';
 import { agentSpendIsOpen, spendFileVersion, spendTokens } from './agentspend';
@@ -75,6 +76,7 @@ import {
   codexTitleFor,
   codexAgentSpendVersion,
   codexSpendIndex,
+  readCodexSessionMeta,
 } from './codex';
 import { CodexOpeningsWriter, loadCodexOpenings } from './codexopenings';
 import { tempDir } from './temproot.ts';
@@ -299,7 +301,11 @@ import {
   outcomeOf,
   instrumentStartup,
   pollStartup,
+  liveDirectories,
 } from '../scripts/panel-startup-measure/measure';
+import { freezeCatalog, rebindDispatch, refuseUnsafeSource } from '../scripts/panel-startup-measure/freeze';
+import { DispatchReceipts } from './dispatchreceipts';
+import { appendDispatchTurn, instrumentSoak, soakMeasures, startDispatch } from '../scripts/panel-startup-measure/soak';
 
 test('selection measurements reject missing stages, unrelated worker replies, and reversed browser clocks', () => {
   const stages = [
@@ -1234,6 +1240,329 @@ test('isolated startup removes pending agent actions and rejects external frozen
     else fs.unlinkSync(path.join(root, 'linked'));
   }
   assert.equal(fs.existsSync(external), true);
+});
+
+function freezerSource() {
+  const root = tempDir('freeze-source');
+  const workspace = path.join(root, 'Owner', 'arc');
+  const projects = path.join(root, 'projects');
+  const codex = path.join(root, 'codex');
+  const settled = new Date(Date.now() - 60 * 60_000);
+  const write = (file: string, records: unknown[]) => {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+    fs.utimesSync(file, settled, settled);
+  };
+  const claude = (sessionId: string, cwd: string, answer: string) => [
+    {
+      type: 'user',
+      sessionId,
+      cwd,
+      uuid: 'u1',
+      timestamp: '2026-10-01T00:00:00.000Z',
+      message: { role: 'user', content: 'Fix the cache' },
+    },
+    {
+      type: 'assistant',
+      sessionId,
+      cwd,
+      uuid: 'a1',
+      parentUuid: 'u1',
+      timestamp: '2026-10-01T00:00:05.000Z',
+      message: { role: 'assistant', content: [{ type: 'text', text: answer }], stop_reason: 'end_turn' },
+    },
+  ];
+  const worktree = path.join(workspace, '.claude', 'worktrees', 'topic');
+  write(
+    path.join(projects, projectSlug(workspace), 'selected.jsonl'),
+    claude('selected', workspace, `Fixed ${workspace.replace(/\\/g, '/')}/a.ts.`),
+  );
+  write(path.join(projects, projectSlug(worktree), 'topic.jsonl'), claude('topic', worktree, 'Done.'));
+  write(
+    path.join(projects, projectSlug(`${workspace}-tools`), 'tools.jsonl'),
+    claude('tools', `${workspace}-tools`, 'Done.'),
+  );
+  write(path.join(projects, 'other-project', 'other.jsonl'), claude('other', path.join(root, 'other'), 'Done.'));
+  const member = path.join(codex, '2026', '10', '01', 'rollout-member.jsonl');
+  const outside = path.join(codex, '2026', '10', '01', 'rollout-outside.jsonl');
+  write(member, [
+    { type: 'session_meta', payload: { id: 'member', cwd: workspace } },
+    { type: 'event_msg', payload: { text: 'x'.repeat(100) } },
+  ]);
+  write(outside, [
+    { type: 'session_meta', payload: { id: 'outside', cwd: path.join(root, 'other') } },
+    { type: 'event_msg', payload: { text: 'y'.repeat(5000) } },
+  ]);
+  fs.writeFileSync(path.join(codex, '2026', '10', '01', 'rollout-archived.jsonl.zst'), 'z'.repeat(300));
+  return { root, workspace, worktree, projects, codex, member, outside, settled };
+}
+
+test('measurement freezer refuses a source that holds a health log or a Git directory', () => {
+  for (const unsafe of [
+    path.join('logs', 'health-0a1b2c3d-0000-4000-8000-000000000000.json'),
+    path.join('.git', 'HEAD'),
+  ]) {
+    const source = freezerSource();
+    const file = path.join(source.projects, projectSlug(source.workspace), unsafe);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, '{}');
+    const output = path.join(source.root, 'fixture');
+    assert.throws(
+      () => freezeCatalog({ workspace: source.workspace, projects: source.projects, codex: source.codex, output }),
+      /health log|Git directory/,
+    );
+    assert.equal(fs.existsSync(output), false);
+    const codexFile = path.join(source.codex, unsafe);
+    fs.mkdirSync(path.dirname(codexFile), { recursive: true });
+    fs.writeFileSync(codexFile, '{}');
+    assert.throws(() => refuseUnsafeSource(source.codex), /health log|Git directory/);
+  }
+});
+
+test('a frozen catalog moves workspace sessions into the fixture and passes runner validation', () => {
+  const source = freezerSource();
+  const output = path.join(tempDir('freeze-output'), '2026-10-28');
+  const record = freezeCatalog({ workspace: source.workspace, projects: source.projects, codex: source.codex, output });
+  const manifest = JSON.parse(fs.readFileSync(path.join(output, 'manifest.json'), 'utf8'));
+  const frozenWorkspace = path.join(output, 'workspace');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(output, 'state.json'), 'utf8')).showing, 'selected');
+  assert.deepEqual(manifest.expectedSelection, {
+    key: turnKey({ sessionId: 'selected', startedAt: Date.parse('2026-10-01T00:00:00.000Z') }),
+    prompt: 'Fix the cache',
+    summary: `Fixed ${frozenWorkspace.replace(/\\/g, '/')}/a.ts.`,
+  });
+  const selected = path.join(output, 'projects', projectSlug(frozenWorkspace), 'selected.jsonl');
+  assert.equal(JSON.parse(fs.readFileSync(selected, 'utf8').split('\n')[0]).cwd, frozenWorkspace);
+  assert.equal(fs.statSync(selected).mtimeMs, source.settled.getTime());
+  const topic = path.join(
+    output,
+    'projects',
+    projectSlug(path.join(frozenWorkspace, '.claude', 'worktrees', 'topic')),
+    'topic.jsonl',
+  );
+  assert.equal(
+    JSON.parse(fs.readFileSync(topic, 'utf8').split('\n')[0]).cwd,
+    path.join(frozenWorkspace, '.claude', 'worktrees', 'topic'),
+  );
+  const tools = path.join(output, 'projects', `${projectSlug(frozenWorkspace)}-tools`, 'tools.jsonl');
+  assert.equal(JSON.parse(fs.readFileSync(tools, 'utf8').split('\n')[0]).cwd, `${source.workspace}-tools`);
+  assert.equal(fs.existsSync(path.join(output, 'projects', 'other-project')), false);
+  const member = fs.readFileSync(path.join(output, 'codex', '2026', '10', '01', 'rollout-member.jsonl'), 'utf8');
+  assert.equal(member.split('\n').length, 3);
+  assert.equal(JSON.parse(member.split('\n')[0]).payload.cwd, frozenWorkspace);
+  const outside = fs.readFileSync(path.join(output, 'codex', '2026', '10', '01', 'rollout-outside.jsonl'), 'utf8');
+  assert.equal(outside, fs.readFileSync(source.outside, 'utf8').split('\n')[0] + '\n');
+  assert.deepEqual(manifest.frozen.reduced, record.reduced);
+  assert.deepEqual(manifest.frozen.placeholders, { files: 1, bytes: 300 });
+  assert.equal(fs.statSync(path.join(output, 'codex', '2026', '10', '01', 'rollout-archived.jsonl.zst')).size, 0);
+  assert.deepEqual(record.reduced, [
+    { file: path.join('codex', '2026', '10', '01', 'rollout-outside.jsonl'), bytes: fs.statSync(source.outside).size },
+  ]);
+  const memberSource = record.sources.find(
+    (entry) => entry.file === path.join('codex', '2026', '10', '01', 'rollout-member.jsonl'),
+  );
+  assert.equal(memberSource?.sha256, createHash('sha256').update(fs.readFileSync(source.member)).digest('hex'));
+  assert.equal(
+    manifest.frozen.sourcesSha256,
+    createHash('sha256')
+      .update(fs.readFileSync(path.join(output, 'sources.json')))
+      .digest('hex'),
+  );
+  const live = [source.projects, source.codex];
+  const inputs = frozenFixturePaths(output, manifest, live);
+  const hashes = inputHashes(output, [path.join(output, 'manifest.json'), ...Object.values(inputs)]);
+  const sourceSpellings = [source.root, source.root.replace(/\\/g, '/'), source.root.replace(/\\/g, '\\\\')].map(
+    (text) => text.toLowerCase(),
+  );
+  for (const file of Object.keys(hashes)) {
+    const text = fs.readFileSync(path.join(output, file), 'utf8').toLowerCase();
+    const leaked = sourceSpellings.filter((spelling) => text.includes(spelling));
+    if (file.includes('rollout-outside') || file.includes('-tools')) continue;
+    assert.deepEqual(leaked, [], file);
+  }
+  assert.throws(
+    () => freezeCatalog({ workspace: source.workspace, projects: source.projects, codex: source.codex, output }),
+    /already exists/,
+  );
+});
+
+test('a soak dispatch reads as a dispatched Codex child of a workspace parent', () => {
+  const root = tempDir('soak-dispatch');
+  const workspace = path.join(root, 'workspace');
+  const simulation = startDispatch(
+    path.join(root, 'projects'),
+    path.join(root, 'codex'),
+    workspace,
+    Date.parse('2026-10-28T08:00:00.000Z'),
+  );
+  appendDispatchTurn(simulation, workspace);
+  const references = readClaudeChildSessionReferences({
+    file: simulation.parent,
+    sessionId: path.basename(simulation.parent, '.jsonl'),
+  });
+  assert.deepEqual(
+    references.map((reference) => [reference.kind, reference.agent, reference.sessionId]),
+    [['dispatch', 'codex', simulation.childId]],
+  );
+  assert.equal(readCodexSessionMeta(simulation.child)?.cwd, workspace);
+  assert.equal(fs.statSync(simulation.child).size, simulation.bytes);
+  assert.equal(simulation.appends, 1);
+});
+
+test('soak measures read the counters a saved diagnostics snapshot carries', () => {
+  const counters = new PanelPerformanceCounters();
+  counters.recordRefresh('poll', 40);
+  const measures = soakMeasures({ counters: counters.snapshot() as any });
+  for (const name of [
+    'publications',
+    'partialPublications',
+    'continuations',
+    'passMs',
+    'readBytes',
+    'dispatchSpendVisits',
+    'dispatchSpendBytes',
+    'dispatchSpendRootRestarts',
+    'refreshMs:poll',
+    'refreshCount:poll',
+  ])
+    assert.equal(typeof measures[name], 'number', name);
+  const tree = tempDir('soak-overlay');
+  const file = path.join(tree, 'extension', 'src', 'extension.ts');
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, "import * as vscode from 'vscode';\nexport function activate() {}\n");
+  instrumentSoak(tree);
+  assert.match(fs.readFileSync(file, 'utf8'), /executeCommand\('arc\.savePerformanceDiagnostics'/);
+});
+
+test('the build comparison fails past a margin and passes within it', () => {
+  const root = tempDir('compare-margin');
+  const result = (firstUsableRow: number, continuations: number, memory: number, complete = true) => ({
+    source: firstUsableRow > 100_000 ? 'f6dcc393b' : 'b204536a1',
+    complete,
+    startupRecord: { stages: { firstUsableRow, completeRender: firstUsableRow + 1000 } },
+    memory: { peakWorkingSetBytes: memory },
+    soak: { end: { continuations, publications: 3, dispatchSpendBytes: 0 } },
+  });
+  const save = (name: string, value: unknown) => {
+    fs.writeFileSync(path.join(root, name), JSON.stringify(value));
+    return path.join(root, name);
+  };
+  const baseline = save('baseline.json', result(59_000, 12, 800 * 1024 ** 2));
+  const compare = (candidate: unknown, output: string) =>
+    spawnSync(
+      process.execPath,
+      [
+        path.join(__dirname, '../node_modules/tsx/dist/cli.mjs'),
+        path.join(__dirname, '../scripts/panel-startup-measure/compare.ts'),
+        '--results',
+        baseline,
+        save(`${output}.json`, candidate),
+        '--output',
+        path.join(root, output),
+      ],
+      { encoding: 'utf8' },
+    );
+  const regressed = compare(result(352_000, 12, 800 * 1024 ** 2), 'regressed');
+  assert.equal(regressed.status, 1, regressed.stderr);
+  const report = JSON.parse(fs.readFileSync(path.join(root, 'regressed', 'compare.json'), 'utf8'));
+  assert.deepEqual(report.regressions, ['firstUsableRowMs', 'firstPassMs']);
+  assert.match(
+    fs.readFileSync(path.join(root, 'regressed', 'compare.md'), 'utf8'),
+    /\| firstUsableRowMs \| 59\.0 s \| 352\.0 s \| 5\.97 \| 1\.5 \| regressed \|/,
+  );
+  const memory = compare(result(59_000, 12, 1100 * 1024 ** 2), 'memory');
+  assert.equal(memory.status, 1, memory.stderr);
+  const within = compare(result(60_000, 14, 900 * 1024 ** 2), 'within');
+  assert.equal(within.status, 0, within.stderr);
+  const incomplete = compare(result(60_000, 12, 800 * 1024 ** 2, false), 'incomplete');
+  assert.equal(incomplete.status, 2, incomplete.stderr);
+});
+
+test('a copied dispatch store validates after rebinding at the cost of its source', () => {
+  const home = tempDir('rebind-source');
+  const cwd = path.join(home, 'work');
+  fs.mkdirSync(cwd);
+  const parent = 'aaaaaaaa-1111-2222-3333-444444444444';
+  const child = 'bbbbbbbb-1111-2222-3333-444444444444';
+  const receipts = new DispatchReceipts(home);
+  const reserved = receipts.reserve({
+    origin: 'a'.repeat(24),
+    requester: { provider: 'claude', id: parent },
+    policy: null,
+    promptSha256: payloadSha256('review'),
+    completion: 'manual',
+    alias: null,
+  });
+  const launch = receipts.reserve({
+    ...reserved,
+    transport: 'standalone',
+    standalone: {
+      provider: 'codex',
+      command: 'codex',
+      args: [],
+      cwd,
+      model: 'test',
+      effort: 'high',
+      name: 'test',
+      agentRun: false,
+      background: false,
+      sessionHint: null,
+      logAlias: path.join(home, 'live.log'),
+      deadlineMs: 10_000,
+    },
+  });
+  const file = path.join(home, 'native.jsonl');
+  const opening = JSON.stringify({ sessionId: child, cwd }) + '\n';
+  fs.writeFileSync(file, opening + 'x'.repeat(2048));
+  const stat = fs.statSync(file, { bigint: true });
+  const directory = fs.statSync(home, { bigint: true });
+  receipts.startup(launch.launchId, {
+    file,
+    identity: `${stat.dev}:${stat.ino}`,
+    ancestor: home,
+    directory: `${directory.dev}:${directory.ino}`,
+    cwd: fs.realpathSync.native(cwd),
+    bytes: Buffer.byteLength(opening),
+    sha256: payloadSha256(opening),
+  });
+  receipts.standaloneSession(launch.launchId, child);
+  const catalog = [
+    { agent: 'claude' as const, sessionId: parent, file: path.join(home, 'parent.jsonl'), size: 0, mtimeMs: 0 },
+    { agent: 'codex' as const, sessionId: child, file, ...revisionOf(stat) },
+  ];
+  const scan = (store: string) => {
+    const totals = { references: 0, checks: 0, entries: 0 };
+    const steps = new DispatchReceipts(store).relationships(catalog);
+    for (let step = 0; step < 100_000; step++) {
+      const next = steps.next({ bytes: 1 << 20, entries: 1, checks: 1 });
+      if (next.done) return totals;
+      totals.checks += next.value.checks;
+      totals.entries += next.value.entries;
+      if (next.value.reference) totals.references++;
+    }
+    return assert.fail('The receipt scan did not finish.');
+  };
+  const source = scan(home);
+  assert.equal(source.references, 1);
+  const copy = tempDir('rebind-copy');
+  fs.cpSync(path.join(home, 'dispatch'), path.join(copy, 'dispatch'), { recursive: true });
+  const refused = scan(copy);
+  assert.equal(refused.references, 0);
+  assert.ok(refused.checks < source.checks, `${refused.checks} < ${source.checks}`);
+  const rebound = rebindDispatch(path.join(copy, 'dispatch'));
+  assert.equal(rebound.anchors, 1);
+  assert.equal(rebound.openings, 1);
+  assert.ok(rebound.witnesses >= 2, String(rebound.witnesses));
+  assert.deepEqual(scan(copy), source);
+});
+
+test('a fixture in the Arc home measure directory is not live data', () => {
+  const home = tempDir('freeze-home');
+  const inside = path.join(home, 'measure', 'fixtures', '2026-10-28');
+  const outside = path.join(home, 'cache');
+  for (const directory of [inside, outside]) fs.mkdirSync(directory, { recursive: true });
+  assert.equal(liveDirectories(inside, home).includes(home), false);
+  assert.equal(liveDirectories(outside, home).includes(home), true);
 });
 
 let panelProviderMembers: Set<string> | undefined;

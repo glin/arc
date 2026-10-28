@@ -51,6 +51,16 @@ A session never starts a full test suite while another runs, and the [suite runn
 
 Use the diagnostic capture script in [Performance capture](docs/performance.md#performance-capture) for performance investigations and diagnostic requests.
 
+A change to any of these lands only with a [build comparison](docs/performance.md#build-comparison) report in its plan entry:
+
+- `extension/src/progressiveworker-entry.ts`.
+- The discovery and refresh paths of `extension/src/panelhost.ts`.
+- `extension/src/scheduler.ts`.
+- The spend readers in `extension/src/codex.ts`, `extension/src/transcript.ts`, and `extension/src/projectspend.ts`.
+- `extension/src/derivedcache.ts`.
+
+A measure past its margin blocks the landing.
+
 Follow the Fast iteration section of `docs/development.md` to test a change while you work and before handoff.
 
 Check a change with the cheapest method that reaches it, in this order:

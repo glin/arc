@@ -124,6 +124,59 @@ Add `--response` to capture one synthetic live response becoming a recorded rich
 
 `--keep` retains the build checkout. Other run resources remain available for inspection. A cleanup refusal ends the run without a retry. `ARC_MEASURE_EDITOR` selects a VS Code install directory. Compare repeated runs with identical inputs, settings, selection, and imports. Shared machine workload and operating-system disk cache remain measurement limits.
 
+Before each launch, the runner waits while a `test-suite.mjs all` process runs or free physical memory sits below 8 GB. `--min-free-gb <gigabytes>` changes the floor. The wait ends the run after 30 minutes.
+
+`--warm-up` launches the build once with its own profile and the run's Arc store, waits for startup, and closes it. The measured launch then reads the store that the warm-up filled. `warmUp` in `result.json` records the warm-up startup.
+
+### Frozen catalog fixture
+
+`extension/scripts/panel-startup-measure/freeze.ts` copies one workspace's catalog into a fixture. Run it from `extension`:
+
+```bash
+npx tsx scripts/panel-startup-measure/freeze.ts --workspace <folder>
+```
+
+The fixture goes to the Arc home's `measure/fixtures/<date>` directory, or to `--output <directory>`. The runner accepts a fixture there, because the measured editor uses its own Arc home. The freezer refuses an existing output directory.
+
+The freezer copies the Claude project directories whose names match the workspace, and every Codex rollout. It writes each path of the workspace and both transcript roots as the same spelling of its fixture path. Project directories take the slug of the fixture workspace. Copies keep their source modification times. A rollout whose recorded working directory sits outside the workspace keeps only its opening record. `frozen.reduced` in the manifest lists each one with its source size. Each compressed `.jsonl.zst` rollout archive becomes an empty file of the same name, because discovery never opens one. `frozen.placeholders` counts them and their source bytes.
+
+The fixture store holds only the Arc home's dispatch receipt store, so pair the fixture with `--warm-up`. The freezer copies that store through the same path rewrite. It leaves out logs, write locks, process supervision files, and every JSON file with a key that names a credential. A producer opening keeps its rewritten prefix length and digest. Each receipt working directory inside the workspace exists in the fixture workspace. The rewritten paths change byte lengths. Byte counters therefore differ from a live window on the same catalog.
+
+A copy gives each receipt file a new device and inode number. The receipt reader refuses a receipt whose recorded identity differs, after fewer checks than an accepted receipt costs. After the runner seeds its store, `rebindDispatch` in `extension/scripts/panel-startup-measure/freeze.ts` records the identities of the run's own files and transcripts in the receipts and their witnesses. A soak run also moves the receipt transcript paths to its linked transcript tree. `dispatchRebind` in `result.json` counts the rebound anchors, witnesses, and openings.
+
+`sources.json` records each copied file with its source SHA-256, its source bytes, and its fixture bytes. The manifest records the SHA-256 of `sources.json` and the totals. The freezer selects the newest workspace Claude session last written at least ten minutes before the freeze whose newest turn has a prompt and a summary. It refuses a source directory that holds a health log, a `.git` entry, or a link.
+
+### Soak
+
+`--soak <minutes>` keeps the measured editor open after `completeRender`. The runner links every fixture transcript into the run directory with hard links, so files that the soak adds never reach the fixture. Linked files keep their identity, so the warm-up store stays valid.
+
+At the start of the soak, the runner adds a Claude parent session whose shell call launched `codex exec --json`, and the Codex child rollout it names. Every 30 seconds the runner appends one completed child turn with 256 KiB of reasoning text and growing token totals. No agent process runs, and no dispatch receipt exists.
+
+A measurement overlay in the built extension saves performance diagnostics when the runner leaves a request file in the run's `soak` directory. The overlay reads that directory once a second. The runner requests a snapshot at the start, every minute, and at the end. `soakMeasures` in `extension/scripts/panel-startup-measure/soak.ts` owns the counters that `result.json` keeps from each snapshot.
+
+The runner samples the extension host process every ten seconds. On Windows it records the process's own peak working set. On Linux it records the peak resident size. macOS reports only the sampled maximum. `startupRecord` in `result.json` holds the measured host's startup history record, including `firstUsableRow`.
+
+### Build comparison
+
+`extension/scripts/panel-startup-measure/compare.ts` measures two builds on one fixture:
+
+```bash
+npx tsx scripts/panel-startup-measure/compare.ts --fixture <manifest.json> --baseline <ref> --candidate <ref>
+```
+
+Run it from `extension`. Without `--baseline`, it measures the source commit of the newest startup history record in the Arc home. Each build runs its warm-up launch and its measured launch with a ten-minute soak, and the second build starts after the first ends. `--soak <minutes>`, `--timeout <seconds>`, and `--keep` pass to the runner. The timeout defaults to 900 seconds. A comparison takes about an hour.
+
+`compare.json` and `compare.md` go to `--output <directory>` or to a new directory under the system temporary directory. They name the installed build, the fixture identity, and each measure with its ratio of candidate to baseline. `--results <baseline.json> <candidate.json>` compares two saved runner results without launching an editor.
+
+| Measures | Margin | Floor |
+| --- | --- | --- |
+| Times: first usable row, first pass, `passMs`, refresh time by reason | 1.5 | 1 second |
+| Counts: publications, continuations, dispatched spend visits, root restarts, catalog walks, refreshes by reason | 1.5 | 5 |
+| Bytes: `readBytes`, `dispatchSpendBytes` | 1.5 | 1 MiB |
+| Peak extension host memory | 1.25 | 64 MiB |
+
+A measure regresses when the candidate exceeds the baseline by more than its margin and by more than its floor. A measure that only the candidate reports compares with zero. The script exits 1 on a regression and 2 when either run remains incomplete. `MARGINS` and `FLOORS` in `compare.ts` own the values.
+
 ### Session list publication measurement
 
 Measure the session list publication path without an editor:
