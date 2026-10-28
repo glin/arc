@@ -684,7 +684,8 @@ test('default demo history keeps distinct turns and provider-scoped expiry evide
   assert.equal(new Set(main.cards.map((card) => card.key)).size, 3);
   assert.ok(main.cards.slice(1).every((card) => !card.agents.length && !card.commits.length && !card.files.length));
   assert.ok(main.stats['arc-read-state'].find((chip) => chip.metric === 'cache-expiry'));
-  assert.ok(main.stats['arc-read-state'].find((chip) => chip.metric === 'cost')!.detail.includes('Included above'));
+  // The session's expiries reach the warning floor, so its cost popover leads with them.
+  assert.match(main.stats['arc-read-state'].find((chip) => chip.metric === 'cost')!.detail, /^1 cache expiry added \$\d+\.\d\d$/m);
   const expired = demoPayload('delegated-cost') as typeof main;
   const warning = main.cards[1].chips.find((chip) => chip.metric === 'cost')!.warnings!.find((warning) => warning.scope === 'cache-expiry');
   assert.ok(warning && warning.scope === 'cache-expiry' && warning.dollars! > 1, 'invented cold turn must cross the production warning threshold');

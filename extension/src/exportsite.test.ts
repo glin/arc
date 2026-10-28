@@ -998,8 +998,9 @@ test('a saved session keeps subagent wait usage and shows the wait-share line', 
     const cost = manifest.stats[model.sessions[0].key].find((stat) => stat.metric === 'cost') as unknown as {
       detailList: { entries: { label: string; lines?: unknown[] }[] };
     };
-    assert.deepEqual(cost.detailList.entries[0].lines?.[0], {
-      text: "Waiting on subagents took 50% of the main agent's cost: $2.00 of $4.00 went to 5 waits, 2 of them timed out",
+    assert.deepEqual(cost.detailList.entries[0], {
+      label:
+        "Waiting on subagents took 50% of the main agent's cost: $2.00 of $4.00 went to 5 waits, 2 of them timed out",
       warning: true,
     });
   } finally {

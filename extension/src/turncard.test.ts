@@ -5,6 +5,7 @@ import { ChildCacheExpiryAttribution } from './childcacheexpiry.ts';
 import { turnKey } from './domain/read.ts';
 import {
   CacheExpiryScan,
+  cacheExpiryExtraCost,
   emptyCacheExpiryFacts,
   publicProjectSpendPrice,
   type NativeChildCacheFacts,
@@ -145,6 +146,7 @@ import { reduceChildArtifacts } from './childartifacts.ts';
 import { applyHiddenTurnFields, hiddenTurnFields } from './parserstate.ts';
 import type { ChildArtifacts } from './childartifacts.ts';
 import { normalizeFsPath, sameCommitSha } from './transcript.ts';
+import { formatCost } from './view/cost.ts';
 // Shared panel fixture for screenshots and measurements.
 import { FIXTURE_CLOCK, FIXTURE_TURNS, LONG_TURN_INDEX, waitWarningPayload } from './panelfixture.ts';
 
@@ -529,6 +531,213 @@ test('the session cost popover names compactions and cache expiries under Includ
   const bare = sessionCostProjection(parts).stats[0].detailList!;
   assert.ok(!bare.entries.some((entry) => entry.group));
   assert.match(bare.footer?.[0] ?? '', /^Includes an estimated \$\d+\.\d\d for 3 compactions\./);
+});
+
+// One return that resends `side` input tokens a warm cache would have read.
+const sidedExpiry = (side: number | null, over: Partial<CacheExpiryFacts> = {}): CacheExpiryFacts => {
+  const request = economicRequest();
+  return oneExpiry({
+    returns: [
+      {
+        ...oneExpiry().returns[0],
+        request: { ...request, usage: { ...request.usage, input: (side ?? 100_000) + 1_000 } },
+        previousInputSide: side,
+      },
+    ],
+    ...over,
+  });
+};
+
+// Names each warning sentence among `texts` by its kind, in order, and skips other text.
+const warningKinds = (texts: readonly string[]) =>
+  texts.flatMap((text) =>
+    /^\s*Waiting on subagents/.test(text)
+      ? ['wait']
+      : /^\s*(Cache expired|\d+ cache expir)/.test(text)
+        ? ['cache-expiry']
+        : /^\s*Low cache reuse/.test(text)
+          ? ['cache-write']
+          : [],
+  );
+
+// The session popover's warning area names the expiries from $1 of cost added, main and children
+// together. Under the floor, or with no price, they stay under "Included above".
+test('the session cost popover leads with cache expiries from $1 and keeps them in the figure', () => {
+  const parts = [
+    { ...sonnetPart, usage: tokenUsage({ requests: 20, input: 4_000_000, cacheRead: 2_000_000, output: 40_000 }) },
+  ];
+  const facts = sidedExpiry;
+  const project = (expiry: CacheExpiryFacts, coverage: boolean = false) =>
+    sessionCostProjection(parts, coverage, { expiry }).stats[0];
+  const seen = new Set<boolean>();
+  for (const side of [100_000, 400_000, 600_000, 2_000_000]) {
+    const expiry = facts(side);
+    const added = cacheExpiryExtraCost(expiry, publicProjectSpendPrice).dollars!;
+    const visible = added >= CACHE_EXPIRY_SIGN_DOLLARS;
+    seen.add(visible);
+    const chip = project(expiry);
+    const cost = chip.detailList!.cost!;
+    const lead = cost.warnings.find((warning) => warning.title === CACHE_EXPIRY_COST_ADDED_HINT);
+    assert.equal(Boolean(lead), visible, `$${added} drew the warning at the wrong floor`);
+    assert.equal(
+      cost.included.some((row) => row.label === '1 cache expiry added'),
+      !visible,
+      'the expiry shows in both places or in neither',
+    );
+    assert.equal(chip.warnings?.some((warning) => warning.scope === 'cache-expiry') ?? false, visible);
+    if (!visible) continue;
+    const total = sessionCostProjection(parts).total.dollars!;
+    assert.equal(lead!.text, `1 cache expiry added ${formatCost(added)}`);
+    assert.equal(lead!.quiet, `${Math.round((added / total) * 100)}% of the total`);
+    // The plain text leads with the warning and has no empty "Included above" group.
+    assert.deepEqual(chip.detailList!.entries[0], { label: `${lead!.text}, ${lead!.quiet}`, warning: true });
+    assert.ok(!chip.detailList!.entries.some((entry) => entry.group));
+    assert.ok(chip.name?.startsWith(`Estimated total: ${chip.compactLabel}\n\n${lead!.text}, ${lead!.quiet}`));
+    // A lower bound, or a partial session total, has no share of the total.
+    const atLeast = project(facts(side, { truncated: true })).detailList!.cost!.warnings[0];
+    assert.deepEqual([atLeast.text, atLeast.quiet], [`1 cache expiry added at least ${formatCost(added)}`, undefined]);
+    const partial = project(expiry, true).detailList!.cost!.warnings[0];
+    assert.deepEqual([partial.text, partial.quiet], [lead!.text, undefined]);
+    // A count that is a lower bound leaves every priced return's cost a lower bound too.
+    const counted = project(facts(side, { unavailable: 1 }));
+    const uncounted = counted.detailList!.cost!.warnings[0];
+    assert.deepEqual(
+      [uncounted.text, uncounted.quiet],
+      [`1 cache expiry added at least ${formatCost(added)}`, undefined],
+    );
+    assert.equal(counted.detailList!.entries[0].label, uncounted.text);
+    assert.deepEqual(
+      counted.warnings?.map((warning) => warning.scope === 'cache-expiry' && warning.status),
+      ['atLeast'],
+    );
+  }
+  assert.deepEqual([...seen].sort(), [false, true], 'the sweep missed one side of the floor');
+  // The floor reads the main session's and its children's amounts together, each under $1 here.
+  const child = (side: number): NativeChildCacheFacts => ({
+    source: `agent-${side}.jsonl`,
+    revision: {} as NativeChildCacheFacts['revision'],
+    facts: sidedExpiry(side),
+    endedAt: null,
+    outcome: null,
+  });
+  const added = (side: number) => cacheExpiryExtraCost(facts(side), publicProjectSpendPrice).dollars!;
+  for (const [mainSide, childSide, visible] of [
+    [200_000, 200_000, true],
+    [100_000, 150_000, false],
+  ] as const) {
+    assert.ok(added(mainSide) < CACHE_EXPIRY_SIGN_DOLLARS && added(childSide) < CACHE_EXPIRY_SIGN_DOLLARS);
+    assert.equal(added(mainSide) + added(childSide) >= CACHE_EXPIRY_SIGN_DOLLARS, visible);
+    const chip = project(facts(mainSide, { counts: { '5m': 0, '30m': 0, '1h': 2 }, childSources: [child(childSide)] }));
+    const lead = chip.detailList!.cost!.warnings.find((warning) => warning.title === CACHE_EXPIRY_COST_ADDED_HINT);
+    assert.equal(
+      lead?.text,
+      visible ? `2 cache expiries added ${formatCost(added(mainSide) + added(childSide))}` : undefined,
+    );
+    assert.equal(chip.warnings?.some((warning) => warning.scope === 'cache-expiry') ?? false, visible);
+    assert.equal(
+      chip.detailList!.cost!.included.some((row) => row.label === '2 cache expiries added'),
+      !visible,
+    );
+  }
+  // An unavailable amount never warns.
+  const unpriced = project(facts(null));
+  assert.equal(unpriced.warnings, undefined);
+  assert.deepEqual(
+    unpriced.detailList!.cost!.included.map((row) => [row.label, row.value]),
+    [['1 cache expiry added', 'cost unavailable']],
+  );
+});
+
+test('the session cost popover orders its warnings as wait, cache expiry, then cache writes', () => {
+  const payload = waitWarningPayload('five', true, true, true) as { stats: Record<string, SessionStatChip[]> };
+  const chip = payload.stats.s1.find((stat) => stat.metric === 'cost')!;
+  assert.deepEqual(
+    chip.detailList!.cost!.warnings.map((warning) => [warning.text, warning.quiet]),
+    [
+      ['Waiting on subagents took $18', "35% of the main agent's cost"],
+      ['3 cache expiries added $4.75', '6% of the total'],
+    ],
+  );
+  assert.deepEqual(
+    chip.warnings?.map((warning) => warning.scope),
+    ['wait', 'cache-expiry'],
+  );
+  // The plain text leads with the wait entry, then the expiry entry.
+  assert.match(chip.detailList!.entries[0].label, /^Waiting on subagents took/);
+  assert.deepEqual(chip.detailList!.entries[1], {
+    label: '3 cache expiries added $4.75, 6% of the total',
+    warning: true,
+  });
+  assert.ok(!chip.detailList!.entries.some((entry) => entry.group));
+  // A session that also writes most of its input to the cache draws all three, in one order
+  // on the popover, the figure, the plain text and the accessible name.
+  const writeHeavy = tokenUsage({ requests: 5, cacheWrite1h: 2_000_000, cacheRead: 100_000 });
+  const waits = { requests: 5, timedOut: 2, usage: tokenUsage({ requests: 5, cacheWrite1h: 1_000_000 }) };
+  const heavy = sessionCostProjection([{ ...sonnetPart, usage: writeHeavy, waits }], false, {
+    expiry: sidedExpiry(2_000_000),
+  }).stats[0];
+  assert.deepEqual(warningKinds(heavy.detailList!.cost!.warnings.map((warning) => warning.text)), [
+    'wait',
+    'cache-expiry',
+    'cache-write',
+  ]);
+  assert.deepEqual(
+    heavy.warnings?.map((warning) => warning.scope),
+    ['wait', 'cache-expiry', 'main'],
+  );
+  assert.deepEqual(warningKinds(heavy.detail.split('\n')), ['wait', 'cache-expiry', 'cache-write']);
+  assert.deepEqual(warningKinds(heavy.name!.split('\n')), ['wait', 'cache-expiry', 'cache-write']);
+});
+
+// The restored low-cache warning marks the cached share on a section's fact line.
+test('a cost section fact line warns on a low cached share under the cache-rate rule', () => {
+  const sessionFacts = (parts: SessionCostUsage[], coverage: Parameters<typeof sessionCostProjection>[1] = false) =>
+    sessionCostProjection(parts, coverage).stats[0].detailList!.cost!.sections.map((section) => section.facts);
+  // 20 requests, $4.20 of input at 17% cached.
+  const low = { ...sonnetPart, usage: tokenUsage({ requests: 20, input: 2_000_000, cacheRead: 400_000 }) };
+  const healthy = { ...sonnetPart, usage: tokenUsage({ requests: 20, input: 200_000, cacheRead: 4_000_000 }) };
+  const [main] = sessionFacts([low]);
+  assert.deepEqual(main, {
+    parts: ['20 requests', '17% cached', '120k average input'],
+    title: main!.title,
+    warning: 1,
+  });
+  // A healthy share carries no mark of any kind.
+  assert.deepEqual(Object.keys(sessionFacts([healthy])[0]!), ['parts', 'title']);
+  // Short main usage never warns.
+  assert.equal(
+    sessionFacts([low], { main: true, delegated: false, delegatedScopeIds: new Set() })[0]!.warning,
+    undefined,
+  );
+  // Many short children under the request floor do not warn together. One child over every floor does.
+  const child = (id: string, requests: number) => ({
+    ...sonnetPart,
+    role: 'delegated' as const,
+    scopeId: id,
+    usage: tokenUsage({ requests, input: 300_000 * requests, cacheRead: 60_000 * requests }),
+  });
+  const short = Array.from({ length: 8 }, (_, at) => child(`child-${at}`, 2));
+  assert.equal(sessionFacts([healthy, ...short])[1]!.warning, undefined);
+  assert.equal(sessionFacts([healthy, ...short, child('long', 10)])[1]!.warning, 1);
+  // The turn popover warns on its Main agent section and never on its Delegated section.
+  const turnFacts = (agents: TurnAgent[]) =>
+    toCard(
+      turn({ model: 'claude-sonnet-5', usage: low.usage, usageParts: [{ ...sonnetPart, usage: low.usage }], agents }),
+      false,
+      NOW,
+    )
+      .chips.find((chip) => chip.metric === 'cost')!
+      .detailList!.cost!.sections.map((section) => section.facts?.warning);
+  assert.deepEqual(turnFacts([]), [1]);
+  const { agent: _agent, role: _role, ...lowPart } = low;
+  const spend = {
+    model: 'claude-sonnet-5',
+    provider: null,
+    contextWindow: null,
+    usage: low.usage,
+    usageParts: [lowPart],
+  };
+  assert.deepEqual(turnFacts([subagent({ model: 'claude-sonnet-5', spend: [spend] })]), [1, undefined]);
 });
 
 test('beside a compactions row the session popover keeps the delegated compaction estimate', () => {
@@ -971,16 +1180,49 @@ test('a Codex turn whose main agent spent a fifth of its cost on waits warns in 
     assert.ok(!chip.detail.includes('Waiting on subagents'));
     assert.ok(!chip.detailList?.entries.some((entry) => entry.warning));
   }
-  // A cache-expiry sentence leads, and the wait sentence follows as its own entry.
+  // The wait sentence leads, and the cache-expiry sentence follows as its own entry. The
+  // popover's warning lines and the figure's warnings keep the same order.
   const both = cost(waited(5, 1_000_000, 5_000_000), { scope: 'cache-expiry', gapMs: 72 * 60 * 1000, dollars: 2.34 });
   assert.deepEqual(both.detailList?.entries.slice(0, 2), [
-    { label: 'Cache expired after a 1h 12m gap and added $2.34', warning: true },
     { label: sentence, warning: true },
+    { label: 'Cache expired after a 1h 12m gap and added $2.34', warning: true },
   ]);
   assert.deepEqual(
-    both.warnings?.map((warning) => warning.scope),
-    ['cache-expiry', 'wait'],
+    both.detailList?.cost?.warnings.map((warning) => warning.text),
+    ['Waiting on subagents took $2.00', 'Cache expired after a 1h 12m gap and added $2.34'],
   );
+  assert.deepEqual(
+    both.warnings?.map((warning) => warning.scope),
+    ['wait', 'cache-expiry'],
+  );
+  // A turn that also writes most of its input to the cache draws all three in that order.
+  const writeUsage = tokenUsage({ requests: 20, cacheWrite1h: 5_000_000, cacheRead: 100_000 });
+  const heavy = cost(
+    turn({
+      agent: 'codex',
+      finished: true,
+      model: 'claude-sonnet-5',
+      usage: writeUsage,
+      usageParts: [
+        {
+          ...sonnetPart,
+          usage: writeUsage,
+          waits: { requests: 5, timedOut: 1, usage: tokenUsage({ requests: 5, cacheWrite1h: 1_250_000 }) },
+        },
+      ],
+    }),
+    { scope: 'cache-expiry', gapMs: 72 * 60 * 1000, dollars: 2.34 },
+  );
+  assert.deepEqual(warningKinds(heavy.detailList!.cost!.warnings.map((warning) => warning.text)), [
+    'wait',
+    'cache-expiry',
+    'cache-write',
+  ]);
+  assert.deepEqual(
+    heavy.warnings?.map((warning) => warning.scope),
+    ['wait', 'cache-expiry', 'main'],
+  );
+  assert.deepEqual(warningKinds(heavy.detail.split('\n')), ['wait', 'cache-expiry', 'cache-write']);
 });
 
 // The Tools tab and the wait warning read one wait definition, so the Waits row names the
@@ -1025,7 +1267,7 @@ test('the cost popovers lead with the wait warning, and their Waits rows count t
     assert.equal(waits.percent, `${Math.round(warning.share * 100)}%`);
     assert.match(tools.rows[2].title, /, 28 requests, 18% of .* \(other 12, git 10, search 6\)$/);
     assert.deepEqual(cost.sections[0].facts, {
-      text: '160 requests · 97% cached · 193k average input',
+      parts: ['160 requests', '97% cached', '193k average input'],
       title:
         '30,000,000 of 30,900,000 input tokens served from the cache. 193,125 input tokens per request on average.',
     });
@@ -1311,7 +1553,7 @@ for (const recorded of [false, true]) {
         ],
       );
     }
-    assert.match(cost.sections[1].facts!.text, /^5 requests · /);
+    assert.equal(cost.sections[1].facts!.parts[0], '5 requests');
   });
 }
 

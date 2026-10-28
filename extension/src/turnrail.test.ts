@@ -73,6 +73,7 @@ import {
   turn,
 } from './turnfixtures.ts';
 import type { CompactionFact } from './projectspend.ts';
+import { waitWarningPayload } from './panelfixture.ts';
 
 // Calendar arithmetic keeps day-group boundaries local to each timezone.
 
@@ -1273,6 +1274,15 @@ test('a rail card names a wait warning on its cost figure', () => {
   assert.match(
     railCardName(card),
     /whole session cost \$4\.00, Waiting on subagents took 50% of the main agent's cost/,
+  );
+});
+
+// The session figure signs its cache expiries from $1, so the row's name says what the sign means.
+test('a rail card names a cache expiry warning on its cost figure', () => {
+  const payload = waitWarningPayload('five', false, true, true) as { rail: Parameters<typeof railCardName>[0][] };
+  assert.match(
+    railCardName(payload.rail[0]),
+    /whole session cost \$78, Waiting on subagents took 35% of the main agent's cost, 3 cache expiries added \$4\.75,/,
   );
 });
 

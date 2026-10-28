@@ -6552,6 +6552,12 @@ button.railfilterlabel:focus-visible {
 .chippop .costsection > .costempty {
   color: var(--idle);
 }
+/* A low cached share on a fact line leads with the warning sign. Screen readers skip the sign,
+   and the fragment's hidden words carry the warning. */
+.chippop .costfacts .chippopcachehit.is-warning::before {
+  content: '\26A0\FE0E' / '';
+  margin-inline-end: 0.25em;
+}
 .chippop .costmore summary {
   cursor: pointer;
 }

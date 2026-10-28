@@ -11,6 +11,10 @@ export const HOVER_GRACE_MS = 150;
 
 export const STAT_WARNING_SIGN = '\u26a0\ufe0e';
 
+// What a low cached share in the warning tone means, as its title and its hidden words.
+const LOW_CACHE_WARNING =
+  'Less than 80% of input served from cache across at least five model requests and $0.50 of estimated input cost.';
+
 interface RelativeDetailLine {
   lead: string;
   at: number;
@@ -93,7 +97,7 @@ export interface CostDetailView {
     detail: string;
     value?: string;
     title: string;
-    facts?: { text: string; title: string };
+    facts?: { parts: string[]; title: string; warning?: number };
   }[];
   tabs: {
     name: string;
@@ -469,7 +473,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
           document.createTextNode(`${tail.map((part) => ` · ${part}`).join('')})`),
         );
         const share = line.cacheHit.warning
-          ? 'Less than 80% of input served from cache across at least five model requests and $0.50 of estimated input cost.'
+          ? LOW_CACHE_WARNING
           : 'Share of input tokens served from cache, including cache writes in total input.';
         rate.title = share;
         row.appendChild(rate);
@@ -647,7 +651,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
           el('span', 'context-category-label', row.label),
           ...(counted ? [el('span', 'costcount chippopscale', row.count ?? '')] : []),
           el('span', 'chippopvalue dollars', row.value),
-          el('span', 'pct', row.percent),
+          el('span', 'chippopscale pct', row.percent),
           bar,
         ]),
       );
@@ -680,8 +684,24 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
         );
         list.append(head);
         if (section.facts) {
-          const facts = el('li', 'costfacts chippopscale', section.facts.text);
+          const facts = el('li', 'costfacts chippopscale');
           facts.title = section.facts.title;
+          // One span holds the fragments, so the row's grid places the line as one cell.
+          const text = el('span');
+          const warning = section.facts.warning;
+          section.facts.parts.forEach((part, at) => {
+            if (at) text.append(' \u00B7 ');
+            if (at !== warning) {
+              text.append(part);
+              return;
+            }
+            // The sign is drawn by CSS, which screen readers skip, so hidden words carry the warning.
+            const low = el('span', 'chippopcachehit is-warning', part);
+            low.title = LOW_CACHE_WARNING;
+            low.append(el('span', 'sr-only', `, warning: ${LOW_CACHE_WARNING}`));
+            text.append(low);
+          });
+          facts.append(text);
           list.append(facts);
         }
         const rows = part.rows.map((row) => costRow(row, counted));

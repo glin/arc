@@ -358,8 +358,8 @@ test('delegated work does not dilute the wait-share warning on the session cost 
     chip.warnings?.map((warning) => warning.scope),
     ['wait'],
   );
-  assert.deepEqual(chip.detailList!.entries[0].lines?.[0], {
-    text: "Waiting on subagents took 20% of the main agent's cost: $2.00 of $10 went to 5 waits, 0 of them timed out",
+  assert.deepEqual(chip.detailList!.entries[0], {
+    label: "Waiting on subagents took 20% of the main agent's cost: $2.00 of $10 went to 5 waits, 0 of them timed out",
     warning: true,
   });
 });
@@ -392,7 +392,7 @@ test('unpriced or incomplete delegated work keeps the wait-share warning on a pa
       chip.warnings?.map((warning) => warning.scope),
       ['wait'],
     );
-    assert.deepEqual(chip.detailList!.entries[0].lines?.[0], { text: sentence, warning: true });
+    assert.deepEqual(chip.detailList!.entries[0], { label: sentence, warning: true });
   }
   // Each delegated model row keeps the state the Delegated heading shows: unavailable, or a lower bound.
   const rows = (projection: ReturnType<typeof sessionCostProjection>) => {
@@ -412,36 +412,44 @@ test('unpriced or incomplete delegated work keeps the wait-share warning on a pa
   );
 });
 
-test('the wait-share line sits under the main agent entry after the cache line and signs the figure', () => {
+test('the wait-share line leads the session entries before the cache line and signs the figure', () => {
   const writeHeavy = counts({ requests: 5, cacheWrite1h: 2_000_000, cacheRead: 100_000 });
   const waits = { requests: 5, timedOut: 2, usage: counts({ requests: 5, cacheWrite1h: 1_000_000 }) };
   const plain = sessionCostProjection([part({ role: 'main', usage: writeHeavy })]).stats[0];
   const chip = sessionCostProjection([part({ role: 'main', usage: writeHeavy, waits })]).stats[0];
-  const entry = chip.detailList!.entries[0];
+  assert.deepEqual(chip.detailList!.entries[0], {
+    label:
+      "Waiting on subagents took 50% of the main agent's cost: $4.00 of $8.02 went to 5 waits, 2 of them timed out",
+    warning: true,
+  });
+  const entry = chip.detailList!.entries[1];
   assert.equal(entry.label, 'Main agent · sonnet-5');
-  assert.deepEqual(entry.lines?.slice(0, 2), [
-    { text: 'Low cache reuse in this session: $8.00 of $8.02 went to cache writes', warning: true },
-    {
-      text: "Waiting on subagents took 50% of the main agent's cost: $4.00 of $8.02 went to 5 waits, 2 of them timed out",
-      warning: true,
-    },
-  ]);
-  assert.deepEqual(entry.lines?.slice(2), plain.detailList!.entries[0].lines?.slice(1));
+  assert.deepEqual(entry.lines?.[0], {
+    text: 'Low cache reuse in this session: $8.00 of $8.02 went to cache writes',
+    warning: true,
+  });
+  // The popover draws the same order.
+  assert.deepEqual(
+    chip.detailList!.cost!.warnings.map((warning) => warning.text.slice(0, 26)),
+    ['Waiting on subagents took ', 'Low cache reuse in this se'],
+  );
+  assert.deepEqual(entry.lines?.slice(1), plain.detailList!.entries[0].lines?.slice(1));
   // The figure keeps its label and adds the wait warning. Its accessible name reads the detail, line included.
   assert.equal(chip.label, plain.label);
   assert.deepEqual(
     chip.warnings?.map((warning) => warning.scope),
-    ['main', 'wait'],
+    ['wait', 'main'],
   );
   assert.ok(chip.name?.includes('Waiting on subagents took 50%'));
   const alone = sessionCostProjection([
     part({ role: 'main', usage: counts({ requests: 20, input: 2_000_000 }), waits: waited(5, 1_000_000, 1) }),
   ]).stats[0];
-  assert.equal(alone.detailList!.entries[0].label, 'Cost by usage · sonnet-5');
-  assert.deepEqual(alone.detailList!.entries[0].lines?.[0], {
-    text: "Waiting on subagents took 50% of the main agent's cost: $2.00 of $4.00 went to 5 waits, 1 of them timed out",
+  assert.deepEqual(alone.detailList!.entries[0], {
+    label:
+      "Waiting on subagents took 50% of the main agent's cost: $2.00 of $4.00 went to 5 waits, 1 of them timed out",
     warning: true,
   });
+  assert.equal(alone.detailList!.entries[1].label, 'Cost by usage · sonnet-5');
   assert.deepEqual(
     alone.warnings?.map((warning) => warning.scope),
     ['wait'],
@@ -461,12 +469,13 @@ test('a wait-share line without a cache warning keeps the delegated work entry',
   const entries = sessionCostProjection([owner, child]).stats[0].detailList!.entries;
   assert.deepEqual(
     entries.map((entry) => entry.label),
-    ['Main agent · sonnet-5', 'Delegated work'],
+    [
+      "Waiting on subagents took 50% of the main agent's cost: $2.00 of $4.00 went to 5 waits, 0 of them timed out",
+      'Main agent · sonnet-5',
+      'Delegated work',
+    ],
   );
-  assert.deepEqual(entries[0].lines?.[0], {
-    text: "Waiting on subagents took 50% of the main agent's cost: $2.00 of $4.00 went to 5 waits, 0 of them timed out",
-    warning: true,
-  });
+  assert.equal(entries[0].warning, true);
 });
 
 test('without a cache warning, the wait-share line is the only change to the session cost detail', () => {
@@ -484,18 +493,12 @@ test('without a cache warning, the wait-share line is the only change to the ses
   for (const others of [[], [child], [review], [{ ...child, scopeId: undefined }]]) {
     const plain = sessionCostProjection([owner, ...others]).stats[0].detailList!;
     const waited = sessionCostProjection([{ ...owner, waits }, ...others]).stats[0].detailList!;
-    assert.equal(waited.entries.flatMap((entry) => allLines(entry.lines ?? [])).filter(isWaitLine).length, 1);
-    assert.ok(waited.entries[0].lines?.some(isWaitLine));
-    // The tabbed form adds the warning line and a Tools tab. The flat entries change only by the line.
+    assert.equal(waited.entries.flatMap((entry) => allLines(entry.lines ?? [])).filter(isWaitLine).length, 0);
+    assert.match(waited.entries[0].label, /^Waiting on subagents/);
+    // The tabbed form adds the warning line and a Tools tab. The flat entries change only by the leading entry.
     const { cost: waitedCost, ...waitedFlat } = waited;
     const { cost: _plainCost, ...plainFlat } = plain;
     assert.ok(waitedCost?.warnings.some((warning) => warning.text.startsWith('Waiting on subagents')));
-    const stripped = {
-      ...waitedFlat,
-      entries: waitedFlat.entries.map((entry) =>
-        entry.lines ? { ...entry, lines: entry.lines.filter((line) => !isWaitLine(line)) } : entry,
-      ),
-    };
-    assert.deepEqual(stripped, plainFlat);
+    assert.deepEqual({ ...waitedFlat, entries: waitedFlat.entries.slice(1) }, plainFlat);
   }
 });

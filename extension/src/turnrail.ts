@@ -18,6 +18,7 @@ import {
   TURN_QUIET_MS,
   TurnStatus,
   cacheWriteWarningCondition,
+  sessionCacheExpiryCondition,
   waitShareCondition,
   sessionStats,
   statusOf,
@@ -207,11 +208,13 @@ export function hideSessions<T extends { sessionId: string }>(
   return sessions.filter((s) => !hidden.has(s.sessionId) || s.sessionId === pinned);
 }
 
-// A session figure carries cache-write and wait warnings only. A cache-expiry warning belongs to a turn figure.
+// A session figure's warnings in the cost popover's order: wait, cache expiry, then cache writes.
 function sessionWarningWords(warnings: SessionStatChip['warnings']): string {
   const words = (warnings ?? []).flatMap((warning) =>
     warning.scope === 'cache-expiry'
-      ? []
+      ? warning.count !== undefined && warning.dollars !== null
+        ? [sessionCacheExpiryCondition(warning.count, { dollars: warning.dollars, status: warning.status ?? 'exact' })]
+        : []
       : warning.scope === 'wait'
         ? [waitShareCondition(warning)]
         : [cacheWriteWarningCondition(warning)],

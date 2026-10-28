@@ -203,7 +203,15 @@ export interface CostDetailSection {
   // Absent when the popover has no delegated work, because the head's total is that figure.
   value?: string;
   title: string;
-  facts?: { text: string; title: string };
+  facts?: CostFacts;
+}
+
+// The fact line's fragments, drawn with middle dots between them. `warning` is the index of a low
+// cached share, which draws in the warning tone with the warning sign.
+export interface CostFacts {
+  parts: string[];
+  title: string;
+  warning?: number;
 }
 
 // Warning lines first, then the split bar of the main agent against delegated work, the tab
@@ -245,8 +253,9 @@ export interface StatChip {
   // See `CONTEXT_BANDS` for thresholds.
   level?: ContextLevel;
   word?: string;
-  // Each warning draws the warning sign on the figure. A turn's cache expiry joins only at
-  // `CACHE_EXPIRY_SIGN_DOLLARS` or more. Session figures carry cache-write and wait warnings only.
+  // Each warning draws the warning sign on the figure, in the order the cost popover draws them:
+  // wait, cache expiry, then cache writes. A cache expiry joins only at `CACHE_EXPIRY_SIGN_DOLLARS`
+  // or more, on a turn figure and on a session figure alike.
   warnings?: (CacheWriteWarning | CacheExpiryWarning | WaitShareWarning)[];
 }
 
@@ -259,6 +268,8 @@ export interface CacheExpiryWarning {
   status?: CacheExpiryCost['status'];
   children?: ChildExpiryCost;
   main?: { gapMs: number; dollars: number | null; status: CacheExpiryCost['status'] };
+  // A session figure's warning counts every expiry of the main session and its children.
+  count?: number;
 }
 
 export type SessionMetric = 'cost' | 'turns' | 'context' | 'cache-expiry' | 'files' | 'commits';
@@ -2959,10 +2970,10 @@ function costDetailList(
     ) ||
     sharedCosts.some((cost) => cost.part.model === 'codex-auto-review' && cost.publiclyPriced);
   const expiryText = expiry ? cacheExpiryWarningText(expiry) : '';
-  // The wait sentence follows the cache-expiry sentence as its own entry, so their dollars never add.
+  // The cache-expiry sentence follows the wait sentence as its own entry, so their dollars never add.
   const leading: StatDetailEntry[] = [
-    ...(expiryText ? [{ label: expiryText, warning: true }] : []),
     ...waitWarnings.map((warning) => ({ label: waitShareText(warning, 'turn'), warning: true })),
+    ...(expiryText ? [{ label: expiryText, warning: true }] : []),
   ];
   const totalValue = totalLabel ? `${totalLabel}${total.partial ? '+' : ''}` : 'cost unavailable';
   // A turn without usage parts prices its categories once here. The flat entries already
@@ -3029,13 +3040,16 @@ function costDetailList(
   const delegatedPartial = children.some((child) => child.partial || child.parts.some((part) => part.partial));
   const delegatedCosts = delegates ? turnDelegatedCosts(turn, shares, agentCosts) : [];
   const delegatedTools = delegates ? costToolRows(delegatedCosts, 'delegated work') : [];
-  const mainFacts = costFacts(mainPriced);
-  const delegatedFacts = delegates ? costFacts(delegatedCosts) : undefined;
+  const mainFacts = costFacts(mainPriced, 'main');
+  // The turn's Delegated section never warns. Its own subagents' costs carry no invocation scope,
+  // so the rule that reads one invocation at a time cannot read them. A dispatched session's
+  // costs keep that session's invocation scopes.
+  const delegatedFacts = delegates ? costFacts(delegatedCosts, 'off') : undefined;
   const cost: CostDetailView | undefined = usageRows.length
     ? {
         warnings: [
-          ...(expiryText ? [{ text: expiryText, title: CACHE_EXPIRY_COST_ADDED_HINT }] : []),
           ...waitWarnings.map((warning) => waitShareLead(warning, 'turn')),
+          ...(expiryText ? [{ text: expiryText, title: CACHE_EXPIRY_COST_ADDED_HINT }] : []),
           ...warnings.map((warning) => ({ text: cacheWriteWarningText(warning) })),
         ],
         ...(delegates ? costSplit(mainDollars, delegatedDollars) : {}),
@@ -3130,18 +3144,10 @@ function waitShareText(warning: WaitShareWarning, basis: 'session' | 'turn'): st
   return `${waitShareCondition(warning, basis)}: ${formatCost(warning.waitCost)} of ${formatCost(warning.mainCost)} went to ${warning.requests} waits, ${warning.timedOut} of them timed out`;
 }
 
-function waitShareLine(warning: WaitShareWarning): StatDetailLine {
-  return { text: waitShareText(warning, 'session'), warning: true };
-}
-
-// Cache warnings come first, then the wait-share warning.
-function withCostWarnings(
-  entry: StatDetailEntry,
-  warnings: readonly CacheWriteWarning[],
-  waitWarnings: readonly WaitShareWarning[] = [],
-): StatDetailEntry {
-  if (warnings.length || waitWarnings.length) {
-    entry.lines = [...warnings.map(warningLine), ...waitWarnings.map(waitShareLine), ...(entry.lines ?? [])];
+// The cache-write warnings lead the entry's lines.
+function withCostWarnings(entry: StatDetailEntry, warnings: readonly CacheWriteWarning[]): StatDetailEntry {
+  if (warnings.length) {
+    entry.lines = [...warnings.map(warningLine), ...(entry.lines ?? [])];
   }
   return entry;
 }
@@ -3249,7 +3255,8 @@ function formatExpiryGap(ms: number): string {
   return `${days}d${remainder ? ` ${remainder}h` : ''}`;
 }
 
-// The least known cost added that draws a warning in a turn's cost detail and figure.
+// The least known cost added that draws a cache expiry warning in a cost popover and on its
+// figure, for a turn and for a session.
 export const CACHE_EXPIRY_SIGN_DOLLARS = 1;
 
 // The return that opened `turn`, from the session's retained cache-expiry returns. A Claude
@@ -3997,6 +4004,7 @@ function chipsOf(
       labels,
     );
     const warnings: (CacheWriteWarning | CacheExpiryWarning | WaitShareWarning)[] = [
+      ...waitWarnings,
       ...(expiry &&
       ((expiry.dollars !== null && expiry.dollars >= CACHE_EXPIRY_SIGN_DOLLARS) ||
         (expiry.main?.dollars !== null &&
@@ -4004,7 +4012,6 @@ function chipsOf(
           expiry.main.dollars >= CACHE_EXPIRY_SIGN_DOLLARS))
         ? [expiry]
         : []),
-      ...waitWarnings,
       ...writeWarnings,
     ];
     const detail = flatDetailList(detailList).join('\n');
@@ -5860,7 +5867,7 @@ function compactionEstimateNote(costs: readonly PricedSessionCost[]): string | n
 // Says that compaction costs in an "Included above" row are modelled estimates.
 const COMPACTION_ESTIMATE_FOOTER = 'Compaction costs are estimates. Claude Code records no usage for a compaction.';
 
-// Defines the cache expiry row of an "Included above" group.
+// Defines a cache expiry's cost, in an "Included above" row or in the session popover's warning.
 const CACHE_EXPIRY_ROW_NOTE =
   "A cache expiry's cost is what resending the context cost above a cache read of the same tokens.";
 
@@ -6227,27 +6234,46 @@ const modelNames = (models: readonly (string | null)[], labels?: ModelLabels): s
 
 // A section's fact line: request count, cached share of input, and average input. The count
 // shows only when every part recorded an exact count.
-function costFacts(costs: readonly PricedSessionCost[]): CostDetailSection['facts'] {
+// `lowCache` names the rule that marks a low cached share. The Main agent section reads
+// `cacheRateDetail` over its own usage. The Delegated section reads `delegatedCacheRateDetail`,
+// which needs one invocation scope over the thresholds by itself. `short` usage, or a part
+// that is incomplete or has unclassified cache writes, never warns, the same as on a model's lines.
+function costFacts(
+  costs: readonly PricedSessionCost[],
+  lowCache: 'main' | 'delegated' | 'off',
+  short = false,
+): CostFacts | undefined {
+  const recorded = recordedCosts(costs);
   const usage = emptyUsage();
-  for (const cost of recordedCosts(costs)) {
+  for (const cost of recorded) {
     addUsage(usage, cost.part.usage);
   }
   const requests = Math.round(usage.requests ?? 0);
   const exact = costs.every((cost) => cost.part.requestCountExact !== false && cost.part.usage.requests !== undefined);
   const cached = cacheHitPercent(usage);
   const average = requests > 0 ? averageContextPerRequest(usage) : null;
-  const text = [
-    ...(exact && requests > 0 ? [`${requests.toLocaleString('en-US')} request${requests === 1 ? '' : 's'}`] : []),
+  const complete = (held: readonly PricedSessionCost[]) =>
+    !short && held.every((cost) => !cost.part.incomplete && !cost.part.unclassifiedCacheWrite);
+  const low =
+    cached !== null &&
+    (lowCache === 'main'
+      ? complete(recorded) && cacheRateDetail(usage, pricedInputCost(recorded)).cacheHit?.warning === true
+      : lowCache === 'delegated' && complete(costs) && delegatedCacheRateDetail(costs).cacheHit?.warning === true);
+  const counted =
+    exact && requests > 0 ? [`${requests.toLocaleString('en-US')} request${requests === 1 ? '' : 's'}`] : [];
+  const parts = [
+    ...counted,
     ...(cached !== null ? [`${cached}% cached`] : []),
     ...(average ? [`${formatTokens(Math.round(average))} average input`] : []),
   ];
-  if (!text.length) {
+  if (!parts.length) {
     return undefined;
   }
   const input =
     usage.input + usage.cacheRead + (usage.cacheWrite1h ?? 0) + (usage.cacheWrite5m ?? 0) + (usage.cacheWrite30m ?? 0);
   return {
-    text: text.join(' · '),
+    parts,
+    ...(low ? { warning: counted.length } : {}),
     title: [
       `${usage.cacheRead.toLocaleString('en-US')} of ${input.toLocaleString('en-US')} input tokens served from the cache.`,
       ...(average
@@ -6274,7 +6300,8 @@ function costSplit(mainDollars: number, delegatedDollars: number): Pick<CostDeta
   return { split: { main: `${main}%`, delegated: `${100 - main}%`, mainShare } };
 }
 
-// The "Included above" rows as footnote lines.
+// The "Included above" rows as footnote lines. A cache expiry under the warning floor, or one
+// whose cost is unavailable, stays here and leads the group.
 function costIncluded(entries: readonly StatDetailEntry[]): CostDetailView['included'] {
   const expiry = (entry: StatDetailEntry) => entry.valueTitle === CACHE_EXPIRY_COST_ADDED_HINT;
   return entries
@@ -6285,6 +6312,29 @@ function costIncluded(entries: readonly StatDetailEntry[]): CostDetailView['incl
       value: typeof entry.value === 'string' ? entry.value : '',
       ...(entry.valueTitle ? { title: entry.valueTitle } : {}),
     }));
+}
+
+// "3 cache expiries added $3.65", or "added at least $3.65" for a lower bound. The session cost
+// popover's warning area and the session list row's accessible name read it.
+export function sessionCacheExpiryCondition(count: number, cost: Pick<CacheExpiryCost, 'dollars' | 'status'>): string {
+  return `${count} cache ${count === 1 ? 'expiry' : 'expiries'} added ${cost.status === 'atLeast' ? 'at least ' : ''}${formatCost(cost.dollars ?? 0) ?? ZERO_COST}`;
+}
+
+// The session cost popover's cache-expiry warning, from `CACHE_EXPIRY_SIGN_DOLLARS` of the main
+// session's and its children's expiries together, or null under it or when the cost is unavailable.
+// The quiet share of the total shows only when the cost and the total are both exact, because a
+// share of a lower bound is not a fact.
+function sessionCacheExpiryLead(
+  count: number,
+  cost: CacheExpiryCost,
+  total: SessionCostTotal,
+): { text: string; quiet?: string } | null {
+  if (cost.dollars === null || cost.dollars < CACHE_EXPIRY_SIGN_DOLLARS) return null;
+  const exact = cost.status === 'exact' && !total.partial && total.dollars !== null && total.dollars > 0;
+  return {
+    text: sessionCacheExpiryCondition(count, cost),
+    ...(exact ? { quiet: `${sharePercent(costShare(cost.dollars, total.dollars!))} of the total` } : {}),
+  };
 }
 
 // The short wait line a cost popover leads with: the dollars, then the share in the quiet tone.
@@ -6368,8 +6418,8 @@ export function sessionCostProjection(
   const warnings = cacheWriteWarnings(warningScopes);
   const waitWarnings = waitShareWarnings(warningScopes[0]);
   const hasAutoReview = delegated.some((cost) => cost.part.model === 'codex-auto-review');
-  // Only a cache warning selects the per-scope layout. A wait warning joins the main entry of
-  // whichever layout applies, and the figure's sign.
+  // Only a cache warning selects the per-scope layout. A wait warning leads the entries, as on a
+  // turn, so the plain text reads wait, cache expiry, then cache writes.
   const entries = warnings.length
     ? [
         ...(main.length || mainShort
@@ -6384,7 +6434,6 @@ export function sessionCostProjection(
                   lines: usageCategoryLines(main, true, mainShort),
                 },
                 warnings.filter((warning) => warning.scope === 'main'),
-                waitWarnings,
               ),
             ]
           : []),
@@ -6412,9 +6461,7 @@ export function sessionCostProjection(
     : delegated.length || short || mainShort
       ? hasAutoReview
         ? [
-            ...sessionCostIdentityEntries(main, 'main', () => mainShort).map((entry, index) =>
-              index === 0 ? withCostWarnings(entry, [], waitWarnings) : entry,
-            ),
+            ...sessionCostIdentityEntries(main, 'main', () => mainShort),
             ...(mainShort && !main.length ? [{ label: 'Main agent', value: 'cost unavailable' }] : []),
             ...sessionCostIdentityEntries(delegated, 'delegated', delegatedShort),
             ...(short ? [otherDelegatedEntry([], short)] : []),
@@ -6422,18 +6469,14 @@ export function sessionCostProjection(
         : [
             ...(main.length || mainShort
               ? [
-                  withCostWarnings(
-                    {
-                      label: costLabelWithModels(
-                        'Main agent',
-                        main.map((cost) => cost.part.model),
-                      ),
-                      value: sessionCostValue(captured ? [captured.main] : main, captured ? false : mainShort),
-                      lines: usageCategoryLines(main, true, mainShort),
-                    },
-                    [],
-                    waitWarnings,
-                  ),
+                  {
+                    label: costLabelWithModels(
+                      'Main agent',
+                      main.map((cost) => cost.part.model),
+                    ),
+                    value: sessionCostValue(captured ? [captured.main] : main, captured ? false : mainShort),
+                    lines: usageCategoryLines(main, true, mainShort),
+                  },
                 ]
               : []),
             ...(delegated.length || short
@@ -6447,25 +6490,30 @@ export function sessionCostProjection(
               : []),
           ]
       : [
-          withCostWarnings(
-            {
-              label: costLabelWithModels(
-                'Cost by usage',
-                main.map((cost) => cost.part.model),
-              ),
-              lines: usageCategoryLines(main),
-            },
-            [],
-            waitWarnings,
-          ),
+          {
+            label: costLabelWithModels(
+              'Cost by usage',
+              main.map((cost) => cost.part.model),
+            ),
+            lines: usageCategoryLines(main),
+          },
         ];
   const compactionCount = overheads.compactionCount ?? 0;
-  const expiryCount = overheads.expiry ? cacheExpiryReturnCount(overheads.expiry).count : 0;
+  const expiryCounted = overheads.expiry ? cacheExpiryReturnCount(overheads.expiry) : null;
+  const expiryCount = expiryCounted?.count ?? 0;
+  const expiryCost =
+    overheads.expiry && expiryCount > 0 ? cacheExpiryExtraCost(overheads.expiry, publicProjectSpendPrice) : null;
+  // A count that is a lower bound leaves the warning's cost added a lower bound too.
+  const expiryWarned: CacheExpiryCost | null =
+    expiryCost && expiryCounted?.atLeast && expiryCost.status === 'exact'
+      ? { ...expiryCost, status: 'atLeast' }
+      : expiryCost;
+  // The main session's and its children's expiries together reach the warning floor, so the
+  // warning area names them and "Included above" does not.
+  const expiryLead = expiryWarned ? sessionCacheExpiryLead(expiryCount, expiryWarned, total) : null;
   const included = includedAboveEntries(
     compactionCount > 0 ? { count: compactionCount, cost: compactionOverheadCost(compactionCount, main) } : null,
-    overheads.expiry && expiryCount > 0
-      ? { count: expiryCount, cost: cacheExpiryExtraCost(overheads.expiry, publicProjectSpendPrice) }
-      : null,
+    expiryCost && !expiryLead ? { count: expiryCount, cost: expiryCost } : null,
   );
   // Beside a compactions row, the main session's note drops the count and dollars the row shows.
   // The row prices main compactions only, so delegated estimates keep their counted note.
@@ -6483,7 +6531,14 @@ export function sessionCostProjection(
       label: 'Estimated total',
       value: chip.compactLabel,
     },
-    entries: [...entries, ...included],
+    entries: [
+      ...waitWarnings.map((warning) => ({ label: waitShareText(warning, 'session'), warning: true })),
+      ...(expiryLead
+        ? [{ label: expiryLead.quiet ? `${expiryLead.text}, ${expiryLead.quiet}` : expiryLead.text, warning: true }]
+        : []),
+      ...entries,
+      ...included,
+    ],
     footer: [
       // The compaction note says part of the total is a modelled estimate, so it stays visible.
       ...compactionNotes,
@@ -6534,8 +6589,8 @@ export function sessionCostProjection(
     const tools = costToolRows(main, "the main agent's cost");
     const delegatedTools = delegates ? costToolRows(delegated, 'delegated work') : [];
     const scopeNames = new Map([...delegatedScopes].map(([id, held], index) => [id, subagentName(held, index)]));
-    const mainFacts = costFacts(main);
-    const delegatedFacts = costFacts(delegated);
+    const mainFacts = costFacts(main, 'main', mainShort);
+    const delegatedFacts = costFacts(delegated, 'delegated', short || delegatedShort(delegated));
     if (tools.length || delegatedTools.length) detailList.notes = [TOOL_RESULT_NOTE, ...(detailList.notes ?? [])];
     const requestTotal = (costs: readonly PricedSessionCost[]) =>
       costs.every((cost) => cost.part.usage.requests !== undefined)
@@ -6545,10 +6600,11 @@ export function sessionCostProjection(
         : [];
     detailList.cost = {
       warnings: [
+        ...waitWarnings.map((warning) => waitShareLead(warning, 'session')),
+        ...(expiryLead ? [{ ...expiryLead, title: CACHE_EXPIRY_COST_ADDED_HINT }] : []),
         ...warnings.map((warning) => ({
           text: `${warning.scope === 'main' ? '' : `${scopeNames.get(warning.id ?? '') ?? 'Delegated work'}: `}${cacheWriteWarningText(warning)}`,
         })),
-        ...waitWarnings.map((warning) => waitShareLead(warning, 'session')),
       ],
       ...(delegates ? costSplit(mainDollars, delegatedDollars) : {}),
       sections: [
@@ -6616,8 +6672,21 @@ export function sessionCostProjection(
   }
   chip.detailList = detailList;
   chip.detail = flatDetailList(detailList).join('\n');
-  if (warnings.length || waitWarnings.length) {
-    chip.warnings = [...warnings, ...waitWarnings];
+  const expiryWarning: CacheExpiryWarning[] =
+    expiryLead && overheads.expiry && expiryWarned
+      ? [
+          {
+            scope: 'cache-expiry',
+            // The session warning names no gap. Its words read the count and the dollars.
+            gapMs: overheads.expiry.longestGapMs ?? 0,
+            dollars: expiryWarned.dollars,
+            status: expiryWarned.status,
+            count: expiryCount,
+          },
+        ]
+      : [];
+  if (warnings.length || waitWarnings.length || expiryWarning.length) {
+    chip.warnings = [...waitWarnings, ...expiryWarning, ...warnings];
     chip.name = chip.detail;
     chip.headDetail = true;
   }

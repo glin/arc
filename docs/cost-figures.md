@@ -134,6 +134,10 @@ A timed-out wait is a request that brought back no news. [Lower agent costs](low
 
 The line stays absent until the main agent's usage is complete and every main-agent request has a supported price. Claude records no waits, so a Claude session never shows the line.
 
+### Read the cache expiry warning
+
+A cost popover draws its warnings in one order: the wait line, then the cache expiry line, then cache-write lines. A turn's expiry line reads `Cache expired after a 1h 12m gap and added $2.34`. The session heading's line reads `3 cache expiries added $3.65 · 9% of the total`, with the share in the quieter tone. A lower bound, of the count or of the cost added, reads `added at least $3.65` with no share. A partial session total drops the share too. The session line counts the main session's and its children's expiries together and shows from $1 of cost added. Below that floor the expiries stay in `Included above`. The session heading and Session list cost figures carry the warning sign whenever the line shows.
+
 ## Read the cost of waiting on subagents
 
 A parent wait longer than the prompt cache lifetime shows as the cold price in the next-turn starting price.
@@ -166,5 +170,7 @@ A native Codex status line can show model, context, token counts, limits, Git st
 ## Reading the cache percentage
 
 The cost detail shows the share of input served from cache. Amber requires a rate below 80%, at least five model requests, and at least $0.50 of estimated input cost. Input includes uncached tokens, cache reads, and cache writes. Output does not contribute to this minimum. Incomplete pricing keeps the percentage muted.
+
+A cost section's fact line draws an amber share with the warning sign, as in `294 requests · ⚠ 62% cached · 195k average input`. The Main agent section applies the rule to its own usage on both cost popovers. The session's Delegated section is amber only when its combined share is under 80% and one delegated invocation meets all three minimums by itself, so many short children never turn it amber. The turn's Delegated section is never amber. Its own subagents' costs carry no invocation scope, so the rule cannot read them one invocation at a time. In the Main agent section, incomplete usage, unclassified cache writes, recorded totals and unallocated recorded cost keep the share muted. In the Delegated section, incomplete usage or an unclassified cache write anywhere keeps it muted. A recorded total or unallocated recorded cost mutes only its own invocation, so another invocation that meets the minimums still turns the share amber.
 
 Short subagents often finish before reusing much context. The cost minimum keeps cheap runs from triggering amber. The percentage and separate low-cache-reuse warning remain available. Amber does not prove avoidable waste.

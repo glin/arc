@@ -1720,11 +1720,15 @@ function subagentOf(
 // with recorded costs, so the delegated work holds five model groups, two without a recorded model.
 // `turnAgents` gives the turn the same children as its subagents, so its card has delegated work.
 // `childTools` false leaves the children without tool results, so the Delegated section of the Tools
-// tab has no rows.
+// tab has no rows. `warnings` gives the main agent a low cached share and the session cache
+// expiries over a dollar, one of them opening the turn, so both cost popovers draw every warning
+// they carry. `widest` scales that session to a five-digit request count at the same average
+// input, the widest fact line a section draws.
 export function waitWarningPayload(
   delegated: 'three' | 'five' = 'three',
   turnAgents = false,
   childTools = true,
+  warnings: boolean | 'widest' = false,
 ): Record<string, unknown> {
   const payload = renderPayload();
   const usage = (over: Partial<Turn['usage']>): Turn['usage'] => {
@@ -1749,12 +1753,22 @@ export function waitWarningPayload(
     inferenceClass: null,
     serviceTier: null,
   };
-  const ran = usage({ requests: 160, input: 900_000, cacheRead: 30_000_000, output: 240_000 });
+  const scale = warnings === 'widest' ? 42 : 1;
+  const ran = warnings
+    ? usage({
+        requests: 297 * scale,
+        input: 21_800_000 * scale,
+        cacheRead: 35_500_000 * scale,
+        output: 296_000 * scale,
+      })
+    : usage({ requests: 160, input: 900_000, cacheRead: 30_000_000, output: 240_000 });
   const waits = {
-    requests: 42,
-    timedOut: 30,
-    tools: { wait_agent: 36, write_stdin: 6 },
-    usage: usage({ requests: 42, input: 60_000, cacheRead: 13_000_000, output: 9_000 }),
+    requests: warnings ? 100 * scale : 42,
+    timedOut: warnings ? 70 * scale : 30,
+    tools: warnings ? { wait_agent: 86 * scale, write_stdin: 14 * scale } : { wait_agent: 36, write_stdin: 6 },
+    usage: warnings
+      ? usage({ requests: 100 * scale, input: 8_000_000 * scale, cacheRead: 9_000_000 * scale, output: 60_000 * scale })
+      : usage({ requests: 42, input: 60_000, cacheRead: 13_000_000, output: 9_000 }),
   };
   // The wait requests read wait returns alone. Other requests read files, tests, Git and searches.
   const tools = fixtureTools(120, [
@@ -1825,10 +1839,41 @@ export function waitWarningPayload(
         }))
       : []),
   ];
+  // Returns to an expired cache, three or forty. The first opened the turn.
+  const sides = Array.from(
+    { length: warnings === 'widest' ? 40 : 3 },
+    (_, at) => [1_000_000, 800_000, 700_000][at % 3],
+  );
+  const expiry: CacheExpiryFacts = {
+    counts: { '5m': 0, '30m': 0, '1h': sides.length },
+    longestGapMs: 3 * 60 * 60 * 1000,
+    returns: sides.map((side, at) => ({
+      lifetime: '1h' as const,
+      gapMs: (72 + (at % 3) * 50) * 60 * 1000,
+      request: {
+        localDate: '2026-10-09',
+        agent: 'codex' as const,
+        ...part,
+        billingClass: 'metered' as const,
+        reportedCost: null,
+        usage: usage({ requests: 1, input: side + 4_000, output: 2_000 }),
+        requests: 1,
+      },
+      visibleTurnId: `codex-turn:${at ? `earlier-${at}` : turn.promptId}`,
+      requestKey: `codex:return-${at}`,
+      previousInputSide: side,
+    })),
+    excluded: 0,
+    unavailable: 0,
+    truncated: false,
+  };
   const stats = {
     s1: [
-      ...sessionCostProjection([{ agent: 'codex', role: 'main', ...part, usage: ran, waits, tools }, ...children])
-        .stats,
+      ...sessionCostProjection(
+        [{ agent: 'codex', role: 'main', ...part, usage: ran, waits, tools }, ...children],
+        false,
+        warnings ? { expiry } : {},
+      ).stats,
       ...sessionTurnStats({ turnCount: 1, firstTurnAt: turn.startedAt, lastTurnAt: turn.endedAt, compactionCount: 0 }),
     ],
   };
@@ -1842,7 +1887,17 @@ export function waitWarningPayload(
     views: [],
     cards: [
       {
-        ...toCard(turnAgents ? { ...turn, agents: children.map(subagentOf) } : turn, false, NOW),
+        ...toCard(
+          turnAgents ? { ...turn, agents: children.map(subagentOf) } : turn,
+          false,
+          NOW,
+          [],
+          null,
+          false,
+          new Set(),
+          [],
+          warnings ? turnCacheExpiryWarning(turn, expiry) : null,
+        ),
         summaryHtml: '<p>Waited on two reviewers.</p>',
       },
     ],

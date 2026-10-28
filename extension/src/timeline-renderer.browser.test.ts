@@ -5160,11 +5160,14 @@ test('the Delegated section folds models past the third behind the View more exp
     // A changed payload redraws the popover, and the expander keeps the keyboard focus.
     await page.locator('.chippop.pinned .costmore summary').focus();
     const updated = structuredClone(payload) as {
-      stats: Record<string, { metric: string; detailList?: { cost?: { sections: { facts?: { text: string } }[] } } }[]>;
+      stats: Record<
+        string,
+        { metric: string; detailList?: { cost?: { sections: { facts?: { parts: string[] } }[] } } }[]
+      >;
     };
     const facts = updated.stats.s1.find((stat) => stat.metric === 'cost')?.detailList?.cost?.sections[1]?.facts;
     assert.ok(facts, 'the fixture has a Delegated fact line');
-    facts.text = `${facts.text} · updated`;
+    facts.parts.push('updated');
     await post(page, updated);
     await page.waitForFunction(() =>
       Array.from(document.querySelectorAll('.chippop.pinned .costfacts')).some((line) =>
@@ -5250,10 +5253,20 @@ test('cache-write warnings share cost faces and retain pinned detail through upd
         /Low cache reuse in this session.*\$503 of \$508 went to cache writes/s,
       );
       assert.equal(await first.locator('.statwarningsign').count(), 1);
-      assert.equal(
-        await page.locator('#chippop .costgrid:not([hidden]) .costfacts').first().textContent(),
-        '594 requests · 3% cached · 159k average input',
-      );
+      // The low cached share takes the warning tone. Its sign is a CSS mark screen readers skip,
+      // so hidden words carry the warning to them.
+      const low =
+        'Less than 80% of input served from cache across at least five model requests and $0.50 of estimated input cost.';
+      const facts = page.locator('#chippop .costgrid:not([hidden]) .costfacts').first();
+      assert.equal(await facts.textContent(), `594 requests · 3% cached, warning: ${low} · 159k average input`);
+      const cached = facts.locator('.chippopcachehit.is-warning');
+      assert.equal(await cached.getAttribute('title'), low);
+      assert.equal(await cached.locator('.sr-only').textContent(), `, warning: ${low}`);
+      assert.equal(await cached.evaluate((node) => getComputedStyle(node, '::before').content), '"⚠︎" / ""');
+      // Every cost row's percent wears the quiet tone class, as the approved boards draw it.
+      const percents = page.locator('#chippop .costrow:not(.costhead) .pct');
+      assert.ok((await percents.count()) > 0);
+      assert.equal(await page.locator('#chippop .costrow:not(.costhead) .pct:not(.chippopscale)').count(), 0);
       const overflow = await page.locator('#chippop').evaluate((pop) => pop.scrollWidth - pop.clientWidth);
       assert.ok(overflow <= 1, `warning detail overflows at ${width}px`);
       await post(page, payload);

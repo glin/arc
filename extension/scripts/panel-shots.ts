@@ -101,7 +101,9 @@ export interface Shot {
   compactionSummary?: 'collapsed' | 'expanded';
   cacheWriteWarning?: boolean;
   costOverheads?: boolean | 'delegated'; // `delegated` adds delegated work and a turn compaction.
-  waitWarning?: boolean | 'five'; // `five` gives the delegated work five model groups.
+  // `five` gives the delegated work five model groups. `warnings` adds a low cached share and
+  // cache expiries over a dollar, and `widest` scales that session to a five-digit request count.
+  waitWarning?: boolean | 'five' | 'warnings' | 'widest';
   waitWarningTurnAgents?: boolean; // The turn holds the delegated children as its subagents.
   waitWarningNoChildTools?: boolean; // The delegated children read no tool results.
   composerSkill?: boolean;
@@ -827,6 +829,22 @@ export const SHOTS: Shot[] = [
         waitWarningTurnAgents: true,
         click: '.chips [data-metric="cost"]',
       },
+      // Every cost warning at once. The narrow popover draws the widest fact line.
+      {
+        name: `${size}-cost-warnings-session`,
+        width,
+        escape: true,
+        waitWarning: width === 1350 ? ('warnings' as const) : ('widest' as const),
+        click: '.sessionstats [data-metric="cost"]',
+      },
+      {
+        name: `${size}-cost-warnings-turn`,
+        width,
+        escape: true,
+        waitWarning: width === 1350 ? ('warnings' as const) : ('widest' as const),
+        waitWarningTurnAgents: true,
+        click: '.chips [data-metric="cost"]',
+      },
     ];
   }),
 ];
@@ -1322,8 +1340,14 @@ export async function shoot(
     await page.evaluate(SETTLED);
   }
   if (shot.waitWarning) {
-    const delegated = shot.waitWarning === 'five' ? 'five' : 'three';
-    const payload = waitWarningPayload(delegated, shot.waitWarningTurnAgents ?? false, !shot.waitWarningNoChildTools);
+    const delegated = shot.waitWarning === true ? 'three' : 'five';
+    const warnings = shot.waitWarning === 'widest' ? 'widest' : shot.waitWarning === 'warnings';
+    const payload = waitWarningPayload(
+      delegated,
+      shot.waitWarningTurnAgents ?? false,
+      !shot.waitWarningNoChildTools,
+      warnings,
+    );
     await page.evaluate(`window.postMessage(${JSON.stringify(payload)}, '*')`);
     await page.evaluate(SETTLED);
   }
