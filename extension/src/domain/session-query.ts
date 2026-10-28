@@ -738,6 +738,19 @@ export function sameQueryTerms(left: string, right: string): boolean {
   return key(left) === key(right);
 }
 
+// The agent-run fact that the panel files and counts by, and that `is:agentrun` reads in the panel.
+// A pin or a label brings a non-archived agent run into the reader's own sessions, whatever its
+// classification, for as long as one of them stays. Archived sessions keep the classification.
+// Export and the CLI report the classification alone.
+export function panelAgentRun(
+  classified: boolean | null,
+  archived: boolean,
+  pinned: boolean,
+  labelled: boolean,
+): boolean | null {
+  return classified !== false && !archived && (pinned || labelled) ? false : classified;
+}
+
 export function matchSessions<
   T extends {
     id?: string;

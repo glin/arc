@@ -18,6 +18,7 @@ import {
   sameSessionQueryContext,
   sessionQueryResolutionError,
   sessionQueryError,
+  panelAgentRun,
   type SessionQueryContext,
 } from './domain/session-query';
 import { MEASUREMENT_ENVIRONMENT, STORED_STATE_KEYS } from './identity';
@@ -15593,17 +15594,27 @@ export class PanelProvider implements vscode.Disposable {
       ? [...this.corpus.entries()].filter(([file]) => admitted?.has(file)).flatMap(([, source]) => source.entries)
       : this.searchCorpus(this.showing);
     const scope = searchScope(entries, this.showing);
-    // Apply current labels, archive state, and agent-run classification at search time. Transcript revisions do not track reader state.
+    // Apply current labels, pins, archive state, and agent-run classification at search time. Transcript revisions do not track reader state.
+    // `panelAgentRun` gives `is:agentrun` the answer the session list gives for the same session.
     const archived = this.archivedSessions();
     const sessions = retainedSessions ?? this.allSessions(true);
     const parentEdges = this.sessionParentEdges(sessions).edges;
     const runs = new Map(sessions.map((session) => [session.sessionId, this.agentRunFor(session, parentEdges)]));
-    const labelled = scope.entries.map((e) => ({
-      ...e,
-      labels: labelsOf(this.saved.labels, e.sessionId),
-      archived: archived.has(e.sessionId),
-      runByAgent: runs.get(e.sessionId) ?? null,
-    }));
+    const labelled = scope.entries.map((e) => {
+      const labels = labelsOf(this.saved.labels, e.sessionId);
+      const away = archived.has(e.sessionId);
+      return {
+        ...e,
+        labels,
+        archived: away,
+        runByAgent: panelAgentRun(
+          runs.get(e.sessionId) ?? null,
+          away,
+          this.pinnedTop.has(e.sessionId),
+          labels.length > 0,
+        ),
+      };
+    });
     const hits = searchTurns(labelled, query, Date.now(), this.sessionQueryContext());
     void this.post({ type: 'results', query, hits, scope: searchScopeName(scope) });
     if (!retained && this.membershipCoverage?.status !== 'complete') this.refreshFrom('search');

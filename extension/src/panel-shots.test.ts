@@ -212,7 +212,7 @@ test('demo samples keep dispatched costs and reader-started usage separate from 
     sessions: { id: string; parent?: SessionParent }[];
     stats: Record<string, SessionStatChip[]>;
     rail: RailCard[];
-    railVariants: Record<string, Record<string, Pick<RailCard, 'agentRun' | 'menuSection'>>>;
+    railVariants: Record<string, Record<string, Pick<RailCard, 'agentRun' | 'runByAgent' | 'agentWord' | 'menuSection'>>>;
     usage: { bar: UsageBar };
   };
   const before = README_SCENES.map((scene) => readmePayload(scene));
@@ -249,7 +249,11 @@ test('demo samples keep dispatched costs and reader-started usage separate from 
   assert.equal(review.rail.find((row) => row.id === review.showing)?.runByAgent, true);
   assert.equal(continuation.rail.find((row) => row.id === continuation.showing)?.runByAgent, false);
   assert.equal(review.railVariants['normal:read'][review.showing].agentRun, true);
-  assert.equal(review.railVariants['pinned:unread'][review.showing].agentRun, true);
+  // A pin files the run as the reader's own, and the card still names its origin.
+  assert.equal(review.railVariants['normal:read'][review.showing].runByAgent, true);
+  assert.equal(review.railVariants['pinned:unread'][review.showing].agentRun, false);
+  assert.equal(review.railVariants['pinned:unread'][review.showing].runByAgent, false);
+  assert.equal(review.railVariants['pinned:unread'][review.showing].agentWord, 'run by an agent');
   assert.equal(review.railVariants['archived:unread'][review.showing].agentRun, false);
   const card = parent.cards[0];
   assert.equal(card.agents.length, 0);

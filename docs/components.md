@@ -196,7 +196,7 @@ Paths are relative to `extension/src/`. [Architecture](architecture.md) owns pac
 | `domain/resume.ts` | Browser-safe terminal resume command for each supported agent, and the session identities that may not become one | no |
 | `domain/identity.ts` | Browser-safe product, extension, storage, package, and scheme identifiers, re-exported by `identity.ts` | no |
 | `domain/session-link.ts` | Browser-safe response session link parsing and formatting, native context masks, exact target resolution, and pending target admission | no |
-| `domain/session-query.ts` | Browser-safe session-query grammar, query context comparison, quoting, caret tokens, native session identity alternatives, catalog-backed prefix resolution and capability requirements, metadata-only listing predicates, cost, cache-expiry, status and caller-answered cache terms, matching, and content-search eligibility | no |
+| `domain/session-query.ts` | Browser-safe session-query grammar, query context comparison, quoting, caret tokens, native session identity alternatives, catalog-backed prefix resolution and capability requirements, metadata-only listing predicates, cost, cache-expiry, status and caller-answered cache terms, the panel agent-run fact for pinned and labelled sessions, matching, and content-search eligibility | no |
 | `domain/session-setups.ts` | Browser-safe pinned setup records, value checks, and recent setup limits | no |
 | `domain/export-model.ts` | Browser-safe captured session contracts | no |
 | `domain/export-limits.ts` | Capture and static viewer admission limits | no |

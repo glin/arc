@@ -8,6 +8,8 @@ Read [session queries](session-queries.md#session-query-syntax) for matching, [p
 
 `turnrail.ts` projects session rows. Pinned sessions lead, and active work rises without reordering existing sessions on each activity event. Agent runs and archived sessions have separate buckets. Presentation changes do not determine transcript discovery.
 
+A non-archived agent run that is pinned or carries a label files and counts as the reader's session. It leaves Run by agents and counts under Running, Active, Unread, and Needs input. Every pin and label counts, whoever applied it. Removing the pin and every label files the session as an agent run again, unless [Prompt box input](timeline.md#card-sources) made it the reader's own. A saved view that matches an unpinned, unlabelled agent run still draws it, and the counts still leave it out. `panelAgentRun` in `domain/session-query.ts` owns the rule. A pinned agent run still shows "run by an agent", which reads the classification.
+
 Use session IDs for actions and saved state. Titles are mutable display text.
 
 The shared responsive breakpoint selects the wide session list or compact navigation, independently of row count. The wide list remains available with zero or one session. Returning from narrow layout restores the selected draft. `webview/chrome.ts` owns compact controls. Its visibility must settle before the timeline measures its sticky heading offset. While the compact native picker has focus, defer option changes until blur.
@@ -96,7 +98,7 @@ The extension owns the workspace saved-filter list. The panel saves only its sel
 
 `railSections` in `view/rail.ts` owns section membership. Views match independently, so a session can appear in several views and Pinned. Archived inclusion also requires Show archived.
 
-Save Group by as `railGroupBy`. `railGroups` in `view/rail.ts` owns group names, ordering, and repeated membership. Pinned agent runs stay outside ordinary groups. Under Label, Agent, and Status, pinned ordinary sessions also appear in groups. Under Time and None they appear only in Pinned. Multiple labels repeat a session.
+Save Group by as `railGroupBy`. `railGroups` in `view/rail.ts` owns group names, ordering, and repeated membership. Under Label, Agent, and Status, pinned sessions also appear in groups. Under Time and None they appear only in Pinned. Multiple labels repeat a session.
 
 Filtering happens before sections claim sessions. Preserve matching section order, counts, sorting, and repeated copies. Effective queries hide empty sections and start matches open, including restored queries. Disclosure changes apply temporarily to that query. Query changes reset those folds. Payload and clock updates retain them. Clearing restores ordinary folds. Pinning opens temporary Pinned without changing its saved fold. Deleting a view removes both fold records. Search-only `find:` and `in:` words create no session list term.
 

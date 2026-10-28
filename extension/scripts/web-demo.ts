@@ -24,7 +24,7 @@ import { DEMO_MENU_COMMANDS, manifestMenu } from './web-demo-menu.ts';
 import { writeDemoExports } from './web-demo-export.ts';
 
 const destination = path.resolve(process.argv[2] ?? path.join(__dirname, '../../.scratch-web-demo/site'));
-// Bundle production label and read rules for page-local demo edits.
+// Bundle production label, read and filing rules for page-local demo edits.
 // Bundle the menu stand-in with entries supplied separately from the manifest.
 const labelRules = esbuild.buildSync({
   stdin: {
@@ -34,12 +34,14 @@ import { applyComment, normalizeComments } from './src/turncomments.ts';
 import { emptyTrail, visitPlace, stepBack, stepForward, trailPlace } from './src/turnplaces.ts';
 import { isSendChord } from './src/domain/composer-editing.ts';
 import { navigationShortcut } from './src/webview/navigation.ts';
+import { panelAgentRun } from './src/domain/session-query.ts';
 import { parseSessionLink } from './src/domain/session-link.ts';
 import { installMenu } from './scripts/web-demo-menu.ts';
 import { demoHost } from './scripts/web-demo-host.ts';
 window.__ARC_DEMO_SAMPLES__.host = demoHost;
 window.__ARC_DEMO_SAMPLES__.labelRules = { labelCounts, labelEditorReply, labelsOf, railLabelFields, setSessionLabels };
 window.__ARC_DEMO_SAMPLES__.readRules = { newBySession };
+window.__ARC_DEMO_SAMPLES__.railRules = { panelAgentRun };
 window.__ARC_DEMO_SAMPLES__.commentRules = { applyComment, normalizeComments };
 window.__ARC_DEMO_SAMPLES__.placeRules = { emptyTrail, visitPlace, stepBack, stepForward, trailPlace };
 window.__ARC_DEMO_SAMPLES__.isSendChord = isSendChord;

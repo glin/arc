@@ -126,8 +126,8 @@
   },
   "extension/src/panel.webview.test.ts": {
     "reason": "Real progressive workers must deliver bounded recovery and metadata through the production panel host. Start metadata must survive storage delays, hidden panels, preference resets, and reloads. File presses and Open the changes must preserve recorded parent and subagent changes after their worktree disappears. Commit presses must never open an unrelated repository after their worktree disappears. Reader sends must release held compaction after drops without overtaking surviving input. Each Prompt box must retain its supplying child definition across sibling catalogs, idle updates, and child replacement. The Remote Control item must follow connection results and never reach saved drafts. Row posts and watcher decisions must reach the performance counters with their causes through the production host methods. A catalog refresh must name why it could not reuse the held catalog. A catalog refresh must admit settled sessions without a file check after a walk or with the held catalog, and recheck moved or replaced ones. Each prompt admission file check must name its cause. One spend update must check each child file once and publish dispatched costs once, and an integrity check that queues nothing must not publish them. The query context revision must follow both memberships as a short digest. A prompt box send must reach its session through a repository scope walk only while the latest walk under the current roots holds the same source, and every return to the box must say why. A background Claude subagent that discovery has not listed must read running while its own file is fresh, and no ending recorded when that file is stale, missing, or beside a copied parent. A Prompt box submission to an agent run must reach the next posted session list as the reader's own on every path that queues it or that the agent accepts, and a refused or local submission must leave the run filed as one. A Prompt box Remote Control toggle on an agent run must reach its Claude process, and a connection must reach the next posted session list as the reader's own. An agent-requested compaction must show the live compaction card on both providers without holding its own continuation. Programmatic starts must validate providers for custom and saved setups. Explicit tiers must persist only for the launched session.",
-    "cases": 671,
-    "matricesSha256": "23556ff3bdd7b700c2514c82ca41a94c0db845e4863aa23d06125ff4ba48aee8"
+    "cases": 674,
+    "matricesSha256": "a0add3820ea3df07763c6f9a45ab8bf6a68e08b4211fb1ed10e820a2a6ec293c"
   },
   "extension/src/panelbundle.test.ts": {
     "reason": "The panel bundle and fixture must contain the production entry, source identity, and substituted text.",
@@ -162,7 +162,7 @@
   "extension/src/rail.rows.browser.test.ts": {
     "reason": "Session rows must preserve selection, context actions, and browser focus.",
     "cases": 25,
-    "matricesSha256": "c9fd2f4fedd95b46052ceb41fd7748ea6a860c0ccc5338db0999d962aec3be79"
+    "matricesSha256": "843e379b7c3eda0549b41d9e4ca3906cbb3394c6bf22183ef197063cfd3a5ba3"
   },
   "extension/src/rail.views.browser.test.ts": {
     "reason": "Saved views and filter menus must preserve browser interaction and keyboard focus.",

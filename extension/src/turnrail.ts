@@ -27,6 +27,7 @@ import {
   withSessionContextDetail,
 } from './turncard';
 import { labelsOf, railLabelFields } from './turnlabels';
+import { panelAgentRun } from './domain/session-query';
 import { formatWhen } from './turnformat';
 import { NewCount } from './turnread';
 import {
@@ -391,9 +392,10 @@ export interface RailCard {
   // Whether the session is archived. Its card enters the archived group
   // and its accessible name includes that state.
   archived: boolean;
-  // Whether the card belongs to the agent-run group. Archived cards set this to false.
+  // Whether the card belongs to the agent-run group. Archived, pinned and labelled cards set this to false.
   agentRun: boolean;
-  // The `agentRun` fact, independent of its bucket. Archiving does not change it.
+  // The panel's agent-run fact from `panelAgentRun`, independent of its bucket. Archiving does not change it,
+  // and a pin or a label on a non-archived session makes it false.
   // Lens figures and `is:agentrun` exclude agent runs whether or not the Archived switch is on.
   runByAgent: boolean | null;
   // Agent wording for the card meta row. Pinned agent runs use the agent-run phrase.
@@ -1203,10 +1205,15 @@ export function railSessions(
     // Archiving takes precedence over pinning, matching the unpinning performed when the panel archives a session.
     // Stored state can contain both flags. A pinned archived card must stay in its folded bucket rather than occupying the list top.
     const onTop = pinnedTop.has(s.id) && !archived;
-    // Archiving and pinning take precedence over inferred session origins. Archived runs stay in Archived. Pinned runs stay at the top.
-    // Only pinned runs need the origin phrase because they appear without a heading that supplies it.
-    const agentRun = s.agentRun === true && !archived;
-    const runByAgent = s.agentRun === null ? null : s.agentRun === true;
+    const labels = labelsOf(labelsById, s.id);
+    const classified = s.agentRun === null ? null : s.agentRun === true;
+    // Archiving takes precedence over inferred session origins, so archived runs stay in Archived.
+    // A pinned or labelled run files and counts as the reader's session.
+    const runByAgent = panelAgentRun(classified, archived, pinnedTop.has(s.id), labels.length > 0);
+    const agentRun = runByAgent === true && !archived;
+    // The origin phrase reads the classification, so a pinned run still names its origin.
+    // Only pinned runs draw it because they appear without a heading that supplies it.
+    const originRun = classified === true && !archived;
     const status = statuses.get(s.id) ?? null;
     const runningSince = status === 'running' ? (runningSinceById.get(s.id) ?? null) : null;
     const runningSinceWhen = runningSince === null ? null : formatWhen(runningSince, now);
@@ -1240,7 +1247,7 @@ export function railSessions(
     );
     // Use one full label list for visible fields and the accessible label clause.
     // Keep the label clause last so later comma-separated text is not read as another label.
-    const { labelClause, ...labelFields } = railLabelFields(labelsOf(labelsById, s.id), CARD_ACTIONS.railLabelled);
+    const { labelClause, ...labelFields } = railLabelFields(labels, CARD_ACTIONS.railLabelled);
     // Use relative age in the accessible name. The panel formats visible age from the timestamp.
     // Use the full clock time for the tooltip and shared status wording for the state.
     const statusName =
@@ -1260,7 +1267,7 @@ export function railSessions(
     const nameBeforeAge = [
       archived ? 'archived' : null,
       onTop ? 'pinned' : null,
-      agentRun ? CARD_ACTIONS.agentRun : null,
+      originRun ? CARD_ACTIONS.agentRun : null,
       s.agent,
       runningSince === null && status !== 'subagents' && status !== 'background' ? statusName : null,
     ]
@@ -1284,7 +1291,7 @@ export function railSessions(
           ? RAIL_MENU_SECTIONS.unread
           : RAIL_MENU_SECTIONS.read;
     // Pinned agent runs use the agent-run phrase because they sit outside the agent-run heading.
-    const agentWord = agentRun && onTop ? CARD_ACTIONS.agentRun : s.agent;
+    const agentWord = originRun && onTop ? CARD_ACTIONS.agentRun : s.agent;
     out.push({
       id: s.id,
       persisted: s.persisted === true,

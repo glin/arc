@@ -13,6 +13,7 @@
   const unread = new Set(sample.payloads[selected].rail.filter((row) => row.unread).map((row) => row.id));
   const labelRules = sample.labelRules;
   const readRules = sample.readRules;
+  const railRules = sample.railRules;
   let labels = sample.labels;
   let browserState = null;
   let comments = sample.commentRules.normalizeComments(
@@ -78,14 +79,17 @@
       const membership = archived ? 'archived' : pinned ? 'pinned' : 'normal';
       const reading = unread.has(row.id) ? 'unread' : 'read';
       const variant = original.railVariants[`${membership}:${reading}`][row.id];
-      const { labelClause, ...labelFields } = labelRules.railLabelFields(
-        labelRules.labelsOf(labels, row.id),
-        sample.labelWords.labelled,
-      );
+      const held = labelRules.labelsOf(labels, row.id);
+      const { labelClause, ...labelFields } = labelRules.railLabelFields(held, sample.labelWords.labelled);
+      // The variants omit labels, so the label half of the filing rule applies here.
+      const classified = original.railVariants['normal:read'][row.id].runByAgent;
+      const runByAgent = railRules.panelAgentRun(classified, archived, pinned, held.length > 0);
       return {
         ...row,
         ...variant,
         ...labelFields,
+        runByAgent,
+        agentRun: runByAgent === true && !archived,
         nameAfterAge: [variant.nameAfterAge, labelClause].filter(Boolean).join(', '),
         current: row.id === selected,
         archived,

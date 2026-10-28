@@ -44,7 +44,7 @@ A quote before a leading `-`, `id:`, or `session:` keeps it literal. Quoting onl
 
 Unknown read state matches neither `is:read` nor `is:unread`, including negations.
 
-`is:archived` selects archived sessions. `is:agentrun` selects agent runs. Both read their underlying facts independently of visible buckets. `is:warm` uses prompt-cache lifetime against the browser clock, including archived sessions and agent runs. `is:active` matches a warm cache or activity within the last hour. `is:needsyou` requires Active and either unread or Needs input. [Status projection](rail-and-navigation.md#read-and-status-state) owns how rows obtain these facts.
+`is:archived` selects archived sessions. `is:agentrun` selects agent runs. Both read their underlying facts independently of visible buckets. In the panel, `is:agentrun` excludes a non-archived session that is pinned or labelled, as [the session list](rail-and-navigation.md#session-list) files it. CLI listings and export read the classification alone, so a pinned or labelled agent run stays one there. `is:warm` uses prompt-cache lifetime against the browser clock, including archived sessions and agent runs. `is:active` matches a warm cache or activity within the last hour. `is:needsyou` requires Active and either unread or Needs input. [Status projection](rail-and-navigation.md#read-and-status-state) owns how rows obtain these facts.
 
 ### Session identity
 

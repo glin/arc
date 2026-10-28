@@ -1275,9 +1275,9 @@ test('the Show rows take a bucket out of the rail and out of every figure', { ti
     const running = new Map([
       ['s1', 'running'],
       ['s2', 'running'],
-      ['s4', 'running'],
+      ['s5', 'running'],
     ] as const);
-    const shown = payload(['s1'], [], ['s4'], [], [], [], running);
+    const shown = payload(['s1'], [], ['s5'], [], [], [], running);
     await openPage(page, shown, undefined, { railFilter: '' });
     const buckets = async () =>
       (await page.evaluate(
@@ -1293,7 +1293,7 @@ test('the Show rows take a bucket out of the rail and out of every figure', { ti
     assert.equal(
       await runningName(),
       'Running, 1 session',
-      'the Running count holds more than s2, though s1 is archived and s4 is an agent run',
+      'the Running count holds more than s2, though s1 is archived and s5 is an agent run',
     );
     assert.ok((await buckets()).includes('railarchived'), 'the fixture drew no Archived bucket');
     assert.ok((await buckets()).includes('railruns'), 'the fixture drew no Run by agents bucket');
@@ -1425,7 +1425,7 @@ test('a Group by press regroups the rail and a restored panel opens grouped', { 
     const page = await browser.newPage();
     const failures: string[] = [];
     page.on('pageerror', (error) => failures.push(String(error)));
-    const shown = payload(['s1'], [], ['s4']);
+    const shown = payload(['s1'], [], ['s5']);
     await openPage(page, shown, undefined, { railFilter: '' });
     const buckets = async (on = page) =>
       (await on.evaluate(
@@ -1480,7 +1480,7 @@ test(
       const shown = payload(
         ['s1'],
         [],
-        ['s4'],
+        ['s5'],
         [],
         [],
         [],

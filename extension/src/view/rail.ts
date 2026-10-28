@@ -592,7 +592,8 @@ export interface RailSectionCard extends RailBucketCard {
   // How long this session's prompt cache has left, which the Active lens reads against the
   // clock the caller passes in.
   cache?: RailCacheSpan | null;
-  // Agent-run identity remains true when archiving clears agentRun presentation. Counts and cache matching use this identity.
+  // The panel's agent-run fact, which stays true when archiving clears agentRun presentation and turns false
+  // while a non-archived session carries a pin or a label. Counts and cache matching use this fact.
   runByAgent?: boolean | null;
 }
 
@@ -1116,7 +1117,8 @@ export function railSections<T extends RailSectionCard>(
       );
     }
   } else {
-    // Run by agents keeps a separate bucket in each grouping. Pinned agent-run sessions remain under Pinned only.
+    // Run by agents keeps a separate bucket in each grouping. A pinned session is never in it, because a pin
+    // brings an agent run into the reader's sessions.
     const runs = loose.filter((card) => card.agentRun);
     // A pinned copy keeps its own place in the rail's order rather than leading its group.
     const members = active.filter(

@@ -43,7 +43,18 @@ import {
 } from './turnrail.ts';
 import { agentRunIn } from './transcript.ts';
 import type { ClosedChild, SessionStatFacts, TurnOutcome } from './transcript.ts';
-import { railStatChips, type RailStatus } from './view/rail.ts';
+import {
+  RAIL_FOLDS,
+  RAIL_SHOWN_BUCKETS,
+  railCounts,
+  railSections,
+  railShownCards,
+  railStatChips,
+  viewFoldId,
+  type RailStatus,
+} from './view/rail.ts';
+import { withRailLens } from './domain/rail-filters.ts';
+import type { SavedView } from './domain/views.ts';
 import { formatWhen } from './turnformat.ts';
 import {
   sessionCompactionContextDetail,
@@ -2822,4 +2833,94 @@ test('agent-run answers retain unknown evidence while honoring reader and native
   assert.equal(agentRunAnswer(null, 'reader', new Set(['reader']), false, null), false);
   assert.equal(agentRunAnswer(null, 'child', new Set(['child']), true, null), true);
   assert.equal(agentRunAnswer(false, 'reader', new Set(), false, true, true), false);
+});
+
+// One unread, recent agent-run card, built the way the host builds it, with the reader's pin and labels.
+function heldRun({
+  agentRun = agentRunAnswer(false, 'run', new Set(), false, true),
+  pinned = false,
+  labels = [],
+  status = 'running',
+}: { agentRun?: boolean | null; pinned?: boolean; labels?: string[]; status?: RailStatus } = {}) {
+  const now = new Date(2026, 9, 27, 12).getTime();
+  const cards = railSessions(
+    [{ id: 'run', label: 'Dispatched work', agent: 'Claude', when: '', at: now - 60_000, relative: '', agentRun }],
+    new Map([['run', { count: 1, atLeast: false }]]),
+    new Map([['run', now - 60_000]]),
+    new Map([['run', status]]),
+    new Set(),
+    null,
+    new Set(pinned ? ['run'] : []),
+    new Map(),
+    {},
+    labels.length ? { run: labels } : {},
+    {},
+    {},
+    new Map(),
+    now,
+  );
+  return { cards, now };
+}
+
+const LABEL_VIEW: SavedView = { id: 'dev', name: 'dev', query: 'label:dev', archived: false };
+
+test('a dispatched agent run the reader pinned and labelled counts under Running, Active and Unread', () => {
+  const { cards, now } = heldRun({ pinned: true, labels: ['dev'] });
+  const { running, active, unread } = railCounts(cards, RAIL_SHOWN_BUCKETS, now);
+  assert.deepEqual(
+    { running, active, unread },
+    { running: 1, active: 1, unread: 1 },
+    'a pinned and labelled agent run stayed out of the session header figures',
+  );
+  assert.deepEqual(
+    railShownCards(cards, { query: withRailLens('', 'unread') }, now).map((card) => card.id),
+    ['run'],
+    'the Unread lens left out a pinned and labelled agent run',
+  );
+  const { sections } = railSections(cards, now, [LABEL_VIEW]);
+  assert.ok(sections.find((section) => section.id === viewFoldId(LABEL_VIEW))?.cards.some((card) => card.id === 'run'));
+  assert.ok(!sections.some((section) => section.id === RAIL_FOLDS.agent), 'the run still filed under Run by agents');
+});
+
+test('a pin alone, a label alone, or a pin on an unclassified run each count the run as the reader own', () => {
+  const holds = [
+    { name: 'pin', pinned: true },
+    { name: 'label', labels: ['dev'] },
+    { name: 'pin on an unclassified run', pinned: true, agentRun: null },
+  ];
+  for (const { name, ...hold } of holds) {
+    const running = heldRun(hold);
+    assert.deepEqual(
+      railCounts(running.cards, RAIL_SHOWN_BUCKETS, running.now),
+      { running: 1, warm: 0, expiring: 0, active: 1, unread: 1, input: 0 },
+      `${name}: the run left the Running, Active or Unread figures`,
+    );
+    const waiting = heldRun({ ...hold, status: 'waiting' });
+    assert.equal(railCounts(waiting.cards, RAIL_SHOWN_BUCKETS, waiting.now).input, 1, `${name}: Needs input`);
+    const { sections } = railSections(running.cards, running.now, []);
+    assert.ok(!sections.some((section) => section.id === RAIL_FOLDS.agent), `${name}: filed under Run by agents`);
+  }
+});
+
+test('removing the pin and every label returns an agent run to Run by agents and out of the figures', () => {
+  const { cards, now } = heldRun();
+  assert.deepEqual(railCounts(cards, RAIL_SHOWN_BUCKETS, now), {
+    running: 0,
+    warm: 0,
+    expiring: 0,
+    active: 0,
+    unread: 0,
+    input: 0,
+  });
+  assert.ok(
+    railSections(cards, now, [])
+      .sections.find((section) => section.id === RAIL_FOLDS.agent)
+      ?.cards.some((card) => card.id === 'run'),
+    'an unpinned, unlabelled agent run left Run by agents',
+  );
+  // A view that matches by something other than a label still draws the run, and counts nothing.
+  const agentView: SavedView = { id: 'claude', name: 'Claude', query: 'agent:claude', archived: false };
+  const viewed = railSections(cards, now, [agentView]).sections;
+  assert.ok(viewed.find((section) => section.id === viewFoldId(agentView))?.cards.some((card) => card.id === 'run'));
+  assert.equal(cards[0].runByAgent, true, 'a saved view made the run the reader own');
 });

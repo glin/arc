@@ -1555,7 +1555,15 @@ export function demoPayload(sessionId: string): Record<string, unknown> {
   );
   type RailVariant = Pick<
     RailCard,
-    'agentRun' | 'agentWord' | 'nameBeforeAge' | 'nameAfterAge' | 'indicator' | 'newCount' | 'unread' | 'menuSection'
+    | 'agentRun'
+    | 'runByAgent'
+    | 'agentWord'
+    | 'nameBeforeAge'
+    | 'nameAfterAge'
+    | 'indicator'
+    | 'newCount'
+    | 'unread'
+    | 'menuSection'
   >;
   const railVariants: Record<string, Record<string, RailVariant>> = {};
   const everyId = new Set(rows.map((row) => row.id));
@@ -1573,6 +1581,7 @@ export function demoPayload(sessionId: string): Record<string, unknown> {
           card.id,
           {
             agentRun: card.agentRun,
+            runByAgent: card.runByAgent,
             agentWord: card.agentWord,
             nameBeforeAge: card.nameBeforeAge,
             nameAfterAge: card.nameAfterAge,

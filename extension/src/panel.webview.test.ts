@@ -2298,6 +2298,7 @@ import { LABEL_NAME_LIMIT, labelTypedNotes } from './domain/labels.ts';
 import {
   canStartSearch,
   matchSessions,
+  panelAgentRun,
   parseSessionQuery,
   queryToken,
   sameSessionQueryContext,
@@ -10321,7 +10322,7 @@ const browserComposerPresentationSource = fs.readFileSync(
 const queueLiveSource = fs.readFileSync(path.join(__dirname, 'webview', 'queue-live.ts'), 'utf8');
 const railSource = fs.readFileSync(path.join(__dirname, 'webview', 'rail.ts'), 'utf8');
 
-test('pinned agent-run session cards keep the provider visible and classification available', () => {
+test('pinned agent-run session cards keep the provider visible and the run by an agent word', () => {
   const [source] = sourceNodes(railSource, (node) => ts.isFunctionDeclaration(node) && node.name?.text === 'RailRow');
   assert.ok(source, 'the session list row renderer is missing');
   const compiled = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
@@ -10380,7 +10381,9 @@ test('pinned agent-run session cards keep the provider visible and classificatio
     assert.ok(provider);
     assert.equal(provider.text, agent || 'run by an agent');
     assert.equal(provider.props.title, 'run by an agent');
-    assert.equal(card.runByAgent, true);
+    // The pin files the session as the reader's own, and the drawn word keeps the classification.
+    assert.equal(card.runByAgent, false);
+    assert.equal(card.agentRun, false);
     assert.equal(card.agentWord, 'run by an agent');
     assert.match(card.nameBeforeAge, /run by an agent/);
     if (agent) assert.ok(card.nameBeforeAge.includes(agent));
@@ -11149,6 +11152,20 @@ test('a prompted Arc agent-run launch is the reader own session, and a prompted 
     true,
     'the prompt changed the launch record that sets the cache request',
   );
+});
+
+test('a pin or a label leaves the classification that the CLI and export report unchanged', () => {
+  const provider: any = Object.assign(Object.create(PanelProvider.prototype), {
+    saved: { agentRuns: ['run'], labels: { run: ['dev'] } },
+    pinnedTop: new Set(['run']),
+    startedHere: new Set(),
+    dispatchFacts: new Map(),
+    dispatchDiscoveryPending: false,
+    metaFor: () => ({ agentRun: true, size: 1, mtimeMs: 1 }),
+  });
+  const run = { agent: 'claude' as const, file: 'run.jsonl', sessionId: 'run', size: 1, mtimeMs: 1 };
+  assert.equal(provider.agentRunFor(run, new Map()), true, 'a pin or a label changed the reported agent-run field');
+  assert.equal(provider.isAgentRunLaunch('run'), true, 'a pin or a label changed the prompt-cache request');
 });
 
 test('worker metadata carries the agent-run mark to the host', () => {
@@ -18142,17 +18159,19 @@ function searchHandler(): (host: object, text: string) => void {
     'searchScopeName',
     'labelsOf',
     'searchTurns',
+    'panelAgentRun',
     member.slice(member.indexOf('{') + 1, member.lastIndexOf('}')),
   );
   const handle = new Function('msg', 'isSearch', handlerBody(panelHostSource, 'search'));
   return (host, text) => {
+    if (!('pinnedTop' in host)) Object.assign(host, { pinnedTop: new Set<string>() });
     Object.assign(host, {
       membershipCoverage: { status: 'complete' },
       sessionQueryContext() {
         return undefined;
       },
       answerSearch(this: object, query: string) {
-        answer.call(this, query, false, searchScope, searchScopeName, labelsOf, searchTurns);
+        answer.call(this, query, false, searchScope, searchScopeName, labelsOf, searchTurns, panelAgentRun);
       },
     });
     handle.call(host, { type: 'search', text }, isSearch);
@@ -35974,6 +35993,24 @@ function promptedRunProvider(agentRun: boolean | null = true, agent: 'claude' | 
   return { ...fixture, rails, reached, answered, submit };
 }
 
+test('a prompted agent run stays outside Run by agents after the reader removes its pin and label', async () => {
+  const { provider, session, rails, submit } = promptedRunProvider();
+  provider.pinnedTop = new Set([session]);
+  provider.saved.labels = { [session]: ['dev'] };
+  await submit('Keep going', 'takeover');
+  await vi.waitFor(() => assert.deepEqual(provider.saved.prompted, [session]));
+  provider.pinnedTop = new Set();
+  provider.saved.labels = {};
+  const before = rails.length;
+  provider.postRail(true);
+  assert.equal(rails.length, before + 1, 'removing the pin and the label posted no session list');
+  const card = rails.at(-1)!.rail.find((entry) => entry.id === session);
+  assert.equal(card?.pinnedTop, false);
+  assert.deepEqual(card?.labels ?? [], []);
+  assert.equal(card?.agentRun, false, 'the prompted session returned to Run by agents');
+  assert.equal(card?.runByAgent, false);
+});
+
 test('a prompt from the Prompt box moves a running Arc agent run into the Running count without a reload', async () => {
   const { provider, session, rails, submit } = promptedRunProvider();
   provider.running = new Set([runningKey('claude', session)]);
@@ -41046,6 +41083,61 @@ for (const count of [100, 1000]) {
   });
 }
 
+test('content search answers is:agentrun as the session list does for pinned and labelled agent runs', () => {
+  const { provider, sources } = pagedListingFixture(3);
+  const ids = ['pinned-run', 'labelled-run', 'plain-run'];
+  const runs = ids.map((sessionId, index) => ({ ...sources[index], sessionId }));
+  const entries = runs.map((source) => ({
+    key: `${source.sessionId}-turn`,
+    sessionId: source.sessionId,
+    sessionTitle: source.sessionId,
+    agent: 'Claude',
+    startedAt: 1,
+    prompt: 'needle',
+    summary: '',
+    whole: true,
+  }));
+  provider.searchCorpus = () => entries;
+  provider.showing = null;
+  provider.allSessions = () => runs;
+  provider.archivedSessions = () => new Set();
+  provider.sessionParentEdges = () => ({ edges: new Map() });
+  provider.agentRunFor = () => true;
+  provider.pinnedTop = new Set(['pinned-run']);
+  provider.saved.labels = { 'labelled-run': ['dev'] };
+  const posted: any[] = [];
+  provider.post = async (message: any) => {
+    posted.push(message);
+  };
+  const cards = railSessions(
+    ids.map((id) => ({ id, label: id, agent: 'Claude', when: '', at: 1, relative: '', agentRun: true })),
+    new Map(),
+    new Map(),
+    new Map(),
+    new Set(),
+    null,
+    provider.pinnedTop,
+    new Map(),
+    {},
+    provider.saved.labels,
+  );
+  for (const query of ['is:agentrun', '-is:agentrun']) {
+    provider.answerSearch(`find: needle ${query}`);
+    const hits = [...new Set(posted.at(-1).hits.map((hit: any) => hit.sessionId))].sort();
+    assert.deepEqual(
+      hits,
+      matchSessions(cards, query)
+        .map((card) => card.id)
+        .sort(),
+      `${query}: content search and the session list disagree`,
+    );
+  }
+  assert.deepEqual(
+    matchSessions(cards, 'is:agentrun').map((card) => card.id),
+    ['plain-run'],
+  );
+});
+
 test('identity updates search retained content without rereading transcripts', () => {
   const { provider, sources } = pagedListingFixture(30);
   const sessionId = 'abcdefgh-1234-1234-1234-123456789012';
@@ -41232,6 +41324,7 @@ async function coverageEnumerationFixture() {
     carriedNames: new Map(),
     corpus: new Map(),
     hidden: new Set(),
+    pinnedTop: new Set(),
     showing: null,
   });
   return { provider, writes, root, workspace, worktree, projects, codex };
