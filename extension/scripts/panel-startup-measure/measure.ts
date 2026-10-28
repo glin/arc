@@ -4,6 +4,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
 import * as path from 'node:path';
+import { SCRUBBED_VARIABLES } from '../../../scripts/isolated-editor.mjs';
 import { removeMeasurementTree } from './cleanup';
 import { pathRewriter, rebindDispatch } from './freeze';
 import { instrumentSelection, measureSelection, instrumentResponse, measureResponse } from './selection';
@@ -58,9 +59,11 @@ let soakRequested = false;
 const SOAK = path.join(SCRATCH, 'soak');
 const SOAK_PROJECTS = path.join(SCRATCH, 'soak-projects');
 const SOAK_CODEX = path.join(SCRATCH, 'soak-codex');
+// The editor inherits no editor, Electron, Arc, Claude, Node option or Git variable. A runner started by an agent
+// inherits ELECTRON_RUN_AS_NODE=1, and Code.exe then runs as Node and opens no window.
 function isolatedEnvironment(run: string = MEASUREMENT_RUN): NodeJS.ProcessEnv {
   return {
-    ...process.env,
+    ...Object.fromEntries(Object.entries(process.env).filter(([name]) => !SCRUBBED_VARIABLES.test(name))),
     CLAUDE_CONFIG_DIR: path.join(SCRATCH, 'claude-config'),
     CODEX_HOME: path.join(SCRATCH, 'codex-config'),
     ARC_HOME: ARC_STORE,
