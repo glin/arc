@@ -5,6 +5,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { arcHome } from '../../src/store.ts';
+import { REQUIRED_DISCOVERY_MEASURES } from './soak';
 
 // A candidate regresses when its value exceeds the baseline by this ratio and by the floor of its kind.
 export const MARGINS = { time: 1.5, count: 1.5, bytes: 1.5, memory: 1.25 } as const;
@@ -26,9 +27,7 @@ interface RunResult {
   source?: string;
   complete?: boolean;
   note?: string | null;
-  firstUsableRowMs?: number | null;
-  lines?: Array<{ event?: string; milestone?: string; elapsedMs?: number }>;
-  startupRecord?: { stages?: Record<string, number>; memory?: { processLifetimeMaximumRssBytes?: number } } | null;
+  startupRecord?: { stages?: Record<string, number> } | null;
   memory?: { peakWorkingSetBytes?: number | null; sampledMaximumWorkingSetBytes?: number | null };
   soak?: { end?: Record<string, number> | null };
 }
@@ -46,16 +45,9 @@ const BYTES = new Set(['dispatchSpendBytes', 'readBytes']);
 // Read the comparison's measures from one runner result.
 export function measuresOf(result: RunResult): Map<string, { kind: Kind; value: number | null }> {
   const out = new Map<string, { kind: Kind; value: number | null }>();
-  const milestone = (name: string) =>
-    result.lines?.find((line) => line.event === 'startup' && line.milestone === name)?.elapsedMs ?? null;
-  out.set('firstUsableRowMs', {
-    kind: 'time',
-    value: result.startupRecord?.stages?.firstUsableRow ?? result.firstUsableRowMs ?? null,
-  });
-  out.set('firstPassMs', {
-    kind: 'time',
-    value: result.startupRecord?.stages?.completeRender ?? milestone('completeRender'),
-  });
+  // Both startup times come from the measured host's startup record, so every value shares the host's clock origin.
+  out.set('firstUsableRowMs', { kind: 'time', value: result.startupRecord?.stages?.firstUsableRow ?? null });
+  out.set('firstPassMs', { kind: 'time', value: result.startupRecord?.stages?.completeRender ?? null });
   for (const [name, value] of Object.entries(result.soak?.end ?? {})) {
     const kind: Kind =
       COUNTS.has(name) || name.startsWith('refreshCount:') ? 'count' : BYTES.has(name) ? 'bytes' : 'time';
@@ -63,13 +55,23 @@ export function measuresOf(result: RunResult): Map<string, { kind: Kind; value: 
   }
   out.set('peakHostMemoryBytes', {
     kind: 'memory',
-    value:
-      result.memory?.peakWorkingSetBytes ??
-      result.memory?.sampledMaximumWorkingSetBytes ??
-      result.startupRecord?.memory?.processLifetimeMaximumRssBytes ??
-      null,
+    value: result.memory?.peakWorkingSetBytes ?? result.memory?.sampledMaximumWorkingSetBytes ?? null,
   });
   return out;
+}
+
+// The measures each side must report. A missing one makes the comparison incomplete instead of within its margin.
+// A refresh reason may be absent on one side, because a build can run no refresh for that reason.
+export const REQUIRED_MEASURES = [
+  'firstUsableRowMs',
+  'firstPassMs',
+  'peakHostMemoryBytes',
+  ...REQUIRED_DISCOVERY_MEASURES,
+];
+
+export function missingMeasures(result: RunResult): string[] {
+  const measures = measuresOf(result);
+  return REQUIRED_MEASURES.filter((name) => !Number.isFinite(measures.get(name)?.value ?? NaN));
 }
 
 export function compareResults(baseline: RunResult, candidate: RunResult): Measure[] {
@@ -130,7 +132,8 @@ export function installedCommit(
   return newest;
 }
 
-function runMeasure(args: string[], log: string): Promise<string> {
+// Run the runner and read its result. A runner that exits nonzero or writes no result yields an incomplete result.
+function runMeasure(args: string[], log: string): Promise<{ file: string | null; result: RunResult }> {
   return new Promise((resolve, reject) => {
     const child = spawn(
       process.execPath,
@@ -152,11 +155,26 @@ function runMeasure(args: string[], log: string): Promise<string> {
       process.stderr.write(chunk);
     });
     child.on('error', reject);
-    child.on('close', () => {
+    child.on('close', (code: number | null, signal: string | null) => {
       output.end();
       const scratch = /^Owned paths and artifacts: (.+)$/m.exec(text)?.[1]?.trim();
-      if (!scratch) reject(new Error(`The runner named no run directory. Read ${log}.`));
-      else resolve(path.join(scratch, 'result.json'));
+      const file = scratch ? path.join(scratch, 'result.json') : null;
+      let result: RunResult = {};
+      try {
+        if (file) result = JSON.parse(fs.readFileSync(file, 'utf8')) as RunResult;
+      } catch {
+        result = {};
+      }
+      if (code === 0 && file && result.complete === true) resolve({ file, result });
+      else
+        resolve({
+          file: file && fs.existsSync(file) ? file : null,
+          result: {
+            ...result,
+            complete: false,
+            note: `The runner exited with ${signal ?? String(code)}. ${result.note ?? ''} Read ${log}.`,
+          },
+        });
     });
   });
 }
@@ -220,17 +238,22 @@ async function main(): Promise<void> {
         ],
         path.join(output, `${label}.log`),
       );
-    const baselineFile = await run(baseline, 'baseline');
-    fs.copyFileSync(baselineFile, path.join(output, 'baseline-result.json'));
-    const candidateFile = await run(candidate, 'candidate');
-    fs.copyFileSync(candidateFile, path.join(output, 'candidate-result.json'));
-    baselineResult = JSON.parse(fs.readFileSync(baselineFile, 'utf8')) as RunResult;
-    candidateResult = JSON.parse(fs.readFileSync(candidateFile, 'utf8')) as RunResult;
+    const before = await run(baseline, 'baseline');
+    if (before.file) fs.copyFileSync(before.file, path.join(output, 'baseline-result.json'));
+    const after = await run(candidate, 'candidate');
+    if (after.file) fs.copyFileSync(after.file, path.join(output, 'candidate-result.json'));
+    baselineResult = before.result;
+    candidateResult = after.result;
     baselineLabel = baseline.slice(0, 9);
     candidateLabel = candidate.slice(0, 9);
   }
   const measures = compareResults(baselineResult, candidateResult);
-  const complete = baselineResult.complete === true && candidateResult.complete === true;
+  const missing = { baseline: missingMeasures(baselineResult), candidate: missingMeasures(candidateResult) };
+  const complete =
+    baselineResult.complete === true &&
+    candidateResult.complete === true &&
+    !missing.baseline.length &&
+    !missing.candidate.length;
   const regressions = measures.filter((m) => m.regressed).map((m) => m.name);
   const table = markdownTable(measures, baselineLabel, candidateLabel);
   write(
@@ -253,6 +276,7 @@ async function main(): Promise<void> {
       margins: MARGINS,
       floors: FLOORS,
       measures,
+      missing,
       regressions,
       complete,
     },
@@ -260,7 +284,7 @@ async function main(): Promise<void> {
   );
   process.stdout.write(`\n${table}\n\nComparison: ${output}\n`);
   if (!complete) {
-    process.stderr.write('A run remained incomplete, so the comparison proves nothing.\n');
+    process.stderr.write('A run remained incomplete or missed a required measure, so the comparison proves nothing.\n');
     process.exitCode = 2;
   } else if (regressions.length) {
     process.stderr.write(`The candidate regressed past its margin: ${regressions.join(', ')}.\n`);
@@ -271,5 +295,5 @@ async function main(): Promise<void> {
 if (process.argv[1] && path.resolve(process.argv[1]) === __filename)
   void main().catch((error: unknown) => {
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
-    process.exit(1);
+    process.exit(3);
   });

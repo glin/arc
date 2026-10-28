@@ -42,7 +42,8 @@ export function instrumentSoak(tree: string): void {
 }
 
 // Hard-link every file of a frozen tree into a run's own tree. New files then never reach the fixture, and linked files
-// keep their identity, so a store a warm-up launch filled stays valid. A file the run appends to must be new.
+// keep their identity, so a store a warm-up launch filled stays valid. A file the run appends to must be new. When the
+// run directory sits on another filesystem, the tree is copied instead, and the warm-up fills the store from the copy.
 export function linkTree(source: string, target: string): number {
   let linked = 0;
   const walk = (from: string, to: string) => {
@@ -53,7 +54,12 @@ export function linkTree(source: string, target: string): number {
       if (entry.isSymbolicLink()) throw new Error(`Frozen input contains a link: ${a}`);
       if (entry.isDirectory()) walk(a, b);
       else {
-        fs.linkSync(a, b);
+        try {
+          fs.linkSync(a, b);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'EXDEV') throw error;
+          fs.copyFileSync(a, b);
+        }
         fs.utimesSync(b, fs.statSync(a).atime, fs.statSync(a).mtime);
         linked++;
       }
@@ -232,36 +238,38 @@ export interface HostMemory {
   privateBytes: number | null;
 }
 
-// Read the extension host of the editor that owns this profile. Windows reports the process's own peak working set.
+// Read the measured extension host's memory by its process ID. Windows reports the process's own peak working set.
 // Linux reports its peak resident size. macOS reports current resident size only, so the caller keeps the sampled maximum.
-export function hostMemory(profile: string): HostMemory | null {
+export function hostMemory(pid: number): HostMemory | null {
   if (process.platform === 'win32') {
-    const escaped = profile.replaceAll("'", "''");
-    const query = `$p='${escaped}'; Get-CimInstance Win32_Process -Filter "Name='Code.exe'" | Where-Object { $_.CommandLine -and $_.CommandLine.Contains($p) -and $_.CommandLine.Contains('node.mojom.NodeService') } | Select-Object ProcessId,WorkingSetSize,PeakWorkingSetSize,PrivatePageCount | ConvertTo-Json -Compress`;
+    const query = `Get-CimInstance Win32_Process -Filter "ProcessId=${pid}" | Select-Object ProcessId,WorkingSetSize,PeakWorkingSetSize,PrivatePageCount | ConvertTo-Json -Compress`;
     const result = spawnSync('powershell', ['-NoProfile', '-Command', query], { encoding: 'utf8' });
     if (result.status !== 0 || !result.stdout.trim()) return null;
-    const parsed = JSON.parse(result.stdout) as Record<string, number> | Array<Record<string, number>>;
-    const row = Array.isArray(parsed) ? parsed[0] : parsed;
-    if (!row) return null;
+    const row = JSON.parse(result.stdout) as Record<string, number>;
     // Win32_Process reports PeakWorkingSetSize in kibibytes and the other sizes in bytes.
     return {
-      pid: row.ProcessId,
+      pid,
       workingSetBytes: row.WorkingSetSize,
       peakWorkingSetBytes: row.PeakWorkingSetSize * 1024,
       privateBytes: row.PrivatePageCount,
     };
   }
-  const listing = spawnSync('ps', ['-eo', 'pid=,rss=,args='], { encoding: 'utf8' }).stdout.split('\n');
-  const row = listing.find((entry) => entry.includes(profile) && entry.includes('node.mojom.NodeService'));
-  if (!row) return null;
-  const [pid, rss] = row.trim().split(/\s+/).map(Number);
-  let peak: number | null = null;
   if (process.platform === 'linux') {
-    const status = fs.readFileSync(`/proc/${pid}/status`, 'utf8');
-    const hwm = /^VmHWM:\s+(\d+)\s+kB/m.exec(status);
-    peak = hwm ? Number(hwm[1]) * 1024 : null;
+    let status: string;
+    try {
+      status = fs.readFileSync(`/proc/${pid}/status`, 'utf8');
+    } catch {
+      return null;
+    }
+    const kib = (name: string) => Number(new RegExp(`^${name}:\\s+(\\d+)\\s+kB`, 'm').exec(status)?.[1] ?? NaN) * 1024;
+    const rss = kib('VmRSS');
+    const peak = kib('VmHWM');
+    return Number.isFinite(rss)
+      ? { pid, workingSetBytes: rss, peakWorkingSetBytes: Number.isFinite(peak) ? peak : null, privateBytes: null }
+      : null;
   }
-  return { pid, workingSetBytes: rss * 1024, peakWorkingSetBytes: peak, privateBytes: null };
+  const rss = Number(spawnSync('ps', ['-o', 'rss=', '-p', String(pid)], { encoding: 'utf8' }).stdout.trim());
+  return rss > 0 ? { pid, workingSetBytes: rss * 1024, peakWorkingSetBytes: null, privateBytes: null } : null;
 }
 
 export interface ProcessEntry {
@@ -300,6 +308,21 @@ export function activeTestRuns(): number {
       .filter((match): match is RegExpExecArray => match !== null)
       .map((match) => ({ pid: Number(match[1]), parent: Number(match[2]), command: match[3] })),
   );
+}
+
+// The discovery counters every build since the comparison landed reports. A soak whose end snapshot lacks one is
+// incomplete, so a missing counter never passes as within its margin.
+export const REQUIRED_DISCOVERY_MEASURES = [
+  'publications',
+  'continuations',
+  'passMs',
+  'readBytes',
+  'dispatchSpendVisits',
+  'dispatchSpendBytes',
+] as const;
+
+export function missingSoakMeasures(measures: Record<string, number>): string[] {
+  return REQUIRED_DISCOVERY_MEASURES.filter((name) => !Number.isFinite(measures[name]));
 }
 
 // The measures a soak snapshot supplies, in the units the comparison reads.

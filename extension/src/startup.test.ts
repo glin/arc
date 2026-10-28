@@ -303,11 +303,17 @@ import {
   pollStartup,
   liveDirectories,
 } from '../scripts/panel-startup-measure/measure';
-import { freezeCatalog, rebindDispatch, refuseUnsafeSource } from '../scripts/panel-startup-measure/freeze';
+import {
+  freezeCatalog,
+  pathRewriter,
+  rebindDispatch,
+  refuseUnsafeSource,
+} from '../scripts/panel-startup-measure/freeze';
 import { DispatchReceipts } from './dispatchreceipts';
 import {
   appendDispatchTurn,
   instrumentSoak,
+  linkTree,
   runningTestRuns,
   soakMeasures,
   startDispatch,
@@ -939,6 +945,7 @@ test('isolated startup pins source provenance before a moving reference builds',
     createHash: () => ({ update: () => ({ digest: () => 'digest' }) }),
     isolatedEnvironment: () => ({}),
     measure: async () => ({ complete: true }),
+    runRecord: {},
     report() {},
     removeTree() {},
     path,
@@ -1362,7 +1369,13 @@ test('a frozen catalog moves workspace sessions into the fixture and passes runn
   assert.deepEqual(manifest.frozen.placeholders, { files: 1, bytes: 300 });
   assert.equal(fs.statSync(path.join(output, 'codex', '2026', '10', '01', 'rollout-archived.jsonl.zst')).size, 0);
   assert.deepEqual(record.reduced, [
-    { file: path.join('codex', '2026', '10', '01', 'rollout-outside.jsonl'), bytes: fs.statSync(source.outside).size },
+    {
+      file: path.join('codex', '2026', '10', '01', 'rollout-outside.jsonl'),
+      bytes: fs.statSync(source.outside).size,
+      openingSha256: createHash('sha256')
+        .update(fs.readFileSync(source.outside, 'utf8').split('\n')[0] + '\n')
+        .digest('hex'),
+    },
   ]);
   const memberSource = record.sources.find(
     (entry) => entry.file === path.join('codex', '2026', '10', '01', 'rollout-member.jsonl'),
@@ -1407,7 +1420,7 @@ test('a soak dispatch reads as a dispatched Codex child of a workspace parent', 
     sessionId: path.basename(simulation.parent, '.jsonl'),
   });
   assert.deepEqual(
-    references.map((reference) => [reference.kind, reference.agent, reference.sessionId]),
+    references.map((reference) => [reference.kind, 'agent' in reference ? reference.agent : null, reference.sessionId]),
     [['dispatch', 'codex', simulation.childId]],
   );
   assert.equal(readCodexSessionMeta(simulation.child)?.cwd, workspace);
@@ -1447,7 +1460,16 @@ test('the build comparison fails past a margin and passes within it', () => {
     complete,
     startupRecord: { stages: { firstUsableRow, completeRender: firstUsableRow + 1000 } },
     memory: { peakWorkingSetBytes: memory },
-    soak: { end: { continuations, publications: 3, dispatchSpendBytes: 0 } },
+    soak: {
+      end: {
+        continuations,
+        publications: 3,
+        passMs: 900,
+        readBytes: 1024,
+        dispatchSpendVisits: 4,
+        dispatchSpendBytes: 0,
+      },
+    },
   });
   const save = (name: string, value: unknown) => {
     fs.writeFileSync(path.join(root, name), JSON.stringify(value));
@@ -1482,6 +1504,12 @@ test('the build comparison fails past a margin and passes within it', () => {
   assert.equal(within.status, 0, within.stderr);
   const incomplete = compare(result(60_000, 12, 800 * 1024 ** 2, false), 'incomplete');
   assert.equal(incomplete.status, 2, incomplete.stderr);
+  const missing = compare({ ...result(60_000, 12, 800 * 1024 ** 2), memory: {} }, 'missing');
+  assert.equal(missing.status, 2, missing.stderr);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(root, 'missing', 'compare.json'), 'utf8')).missing, {
+    baseline: [],
+    candidate: ['peakHostMemoryBytes'],
+  });
 });
 
 test('a copied dispatch store validates after rebinding at the cost of its source', () => {
@@ -1580,6 +1608,69 @@ test('an editor launch waits only for test runs that run work', () => {
     ]),
     2,
   );
+});
+
+test('a frozen receipt store keeps its openings and leaves out logs and credentials', () => {
+  const source = freezerSource();
+  const store = path.join(source.root, 'arc-home');
+  const launch = path.join(store, 'dispatch', 'cccccccc-1111-2222-3333-444444444444');
+  const child = path.join(source.projects, projectSlug(source.worktree), 'child.jsonl');
+  const opening = JSON.stringify({ type: 'user', sessionId: 'child', cwd: source.worktree }) + '\n';
+  fs.writeFileSync(child, opening + 'x'.repeat(100));
+  fs.mkdirSync(launch, { recursive: true });
+  const write = (name: string, value: unknown) => fs.writeFileSync(path.join(launch, name), JSON.stringify(value));
+  write('startup.json', {
+    file: child,
+    ancestor: path.dirname(child),
+    identity: '1:1',
+    directory: '1:2',
+    cwd: source.worktree,
+    bytes: Buffer.byteLength(opening),
+    sha256: createHash('sha256').update(opening).digest('hex'),
+  });
+  write('receipt.json', { standalone: { cwd: source.worktree } });
+  write('monitor.json', { pid: 1, token: 'kept-out' });
+  write('settings.json', { nested: { apiKey: 'kept-out' } });
+  fs.writeFileSync(path.join(launch, 'stdout.log'), 'kept-out');
+  const output = path.join(tempDir('freeze-store'), 'fixture');
+  const record = freezeCatalog({
+    workspace: source.workspace,
+    projects: source.projects,
+    codex: source.codex,
+    store,
+    output,
+  });
+  const frozen = path.join(output, 'store', 'dispatch', path.basename(launch));
+  assert.deepEqual(fs.readdirSync(frozen).sort(), ['receipt.json', 'startup.json']);
+  assert.deepEqual(
+    record.sources
+      .filter((entry) => entry.file.startsWith(path.join('store', 'dispatch')))
+      .map((entry) => path.basename(entry.file))
+      .sort(),
+    ['receipt.json', 'startup.json'],
+  );
+  const startup = JSON.parse(fs.readFileSync(path.join(frozen, 'startup.json'), 'utf8'));
+  const frozenWorktree = path.join(output, 'workspace', '.claude', 'worktrees', 'topic');
+  assert.equal(startup.file, path.join(output, 'projects', projectSlug(frozenWorktree), 'child.jsonl'));
+  assert.equal(fs.existsSync(startup.file), true);
+  const prefix = fs.readFileSync(startup.file).subarray(0, startup.bytes);
+  assert.equal(startup.sha256, createHash('sha256').update(prefix).digest('hex'));
+  assert.equal(JSON.parse(prefix.toString('utf8')).cwd, frozenWorktree);
+  assert.equal(fs.statSync(frozenWorktree).isDirectory(), true);
+  const run = tempDir('freeze-store-run');
+  fs.cpSync(path.join(output, 'store', 'dispatch'), path.join(run, 'dispatch'), { recursive: true });
+  const moved = path.join(run, 'projects');
+  linkTree(path.join(output, 'projects'), moved);
+  assert.equal(
+    rebindDispatch(path.join(run, 'dispatch'), pathRewriter([[path.join(output, 'projects'), moved]])).openings,
+    1,
+  );
+  const rebound = JSON.parse(
+    fs.readFileSync(path.join(run, 'dispatch', path.basename(launch), 'startup.json'), 'utf8'),
+  );
+  assert.equal(rebound.file, path.join(moved, projectSlug(frozenWorktree), 'child.jsonl'));
+  const stat = fs.statSync(rebound.file, { bigint: true });
+  assert.equal(rebound.identity, `${stat.dev}:${stat.ino}`);
 });
 
 test('a fixture in the Arc home measure directory is not live data', () => {

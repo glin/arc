@@ -34,12 +34,12 @@ export interface FreezeRecord {
   frozenAt: string;
   sources: FrozenSource[];
   // Rollouts outside the workspace keep only their opening record. Discovery reads no more of them.
-  reduced: Array<{ file: string; bytes: number }>;
+  reduced: Array<{ file: string; bytes: number; openingSha256: string }>;
   // Compressed rollout archives that discovery never opens. Each keeps its name as an empty file, so listings match.
   placeholders: { files: number; bytes: number };
   bytes: number;
   frozenBytes: number;
-  dispatch?: DispatchFreeze;
+  dispatch?: Omit<DispatchFreeze, 'sources'>;
 }
 
 // Refuse a source tree that holds a health log or a Git directory. Neither may enter a fixture.
@@ -128,7 +128,11 @@ function copyRewritten(source: string, target: string, rewrite: (text: string) =
 }
 
 // Keep only the opening record of a rollout, which is all that discovery reads of another workspace's rollout.
-function copyOpening(source: string, target: string, rewrite: (text: string) => string): number {
+function copyOpening(
+  source: string,
+  target: string,
+  rewrite: (text: string) => string,
+): { bytes: number; openingSha256: string } {
   const input = fs.openSync(source, 'r');
   const buffer = Buffer.alloc(CHUNK);
   let head = Buffer.alloc(0);
@@ -149,7 +153,7 @@ function copyOpening(source: string, target: string, rewrite: (text: string) => 
   fs.writeFileSync(target, rewrite(head.toString('utf8')), { flag: 'wx' });
   const stat = fs.statSync(source);
   fs.utimesSync(target, stat.atime, stat.mtime);
-  return stat.size;
+  return { bytes: stat.size, openingSha256: createHash('sha256').update(head).digest('hex') };
 }
 
 function filesUnder(root: string): string[] {
@@ -195,7 +199,7 @@ export function selectSession(
     .map((file) => ({ file, mtimeMs: fs.statSync(file).mtimeMs }))
     .filter((entry) => now - entry.mtimeMs >= SETTLED_MS)
     .sort((a, b) => b.mtimeMs - a.mtimeMs);
-  for (const { file } of candidates.slice(0, 40)) {
+  for (const { file } of candidates) {
     const cwd = readSessionCwd(file);
     if (!cwd || !isInside(cwd, [workspace])) continue;
     const session = path.basename(file, '.jsonl');
@@ -223,6 +227,7 @@ export interface DispatchFreeze {
   excluded: number;
   prefixes: number;
   cwds: string[];
+  sources: FrozenSource[];
 }
 
 // Copy the dispatch receipt store through the path rewrite. A producer opening keeps its prefix length and digest
@@ -235,7 +240,7 @@ export function freezeDispatch(
   frozenWorkspace: string,
 ): DispatchFreeze {
   refuseUnsafeSource(source);
-  const result: DispatchFreeze = { files: 0, bytes: 0, excluded: 0, prefixes: 0, cwds: [] };
+  const result: DispatchFreeze = { files: 0, bytes: 0, excluded: 0, prefixes: 0, cwds: [], sources: [] };
   const cwds = new Set<string>();
   for (const file of filesUnder(source)) {
     const name = path.basename(file);
@@ -285,6 +290,12 @@ export function freezeDispatch(
     fs.utimesSync(out, stat.atime, stat.mtime);
     result.files++;
     result.bytes += stat.size;
+    result.sources.push({
+      file: path.relative(path.dirname(path.dirname(target)), out),
+      sha256: createHash('sha256').update(fs.readFileSync(file)).digest('hex'),
+      bytes: stat.size,
+      frozenBytes: Buffer.byteLength(content),
+    });
   }
   for (const cwd of cwds) fs.mkdirSync(cwd, { recursive: true });
   result.cwds = [...cwds].map((cwd) => path.relative(frozenWorkspace, cwd)).sort();
@@ -405,13 +416,21 @@ export function freezeCatalog(options: FreezeOptions): FreezeRecord {
   const directories = workspaceProjectDirectories(options.projects, workspace);
   for (const directory of directories) refuseUnsafeSource(path.join(options.projects, directory));
   refuseUnsafeSource(options.codex);
+  const dispatch = options.store ? path.join(options.store, 'dispatch') : null;
+  if (dispatch && fs.existsSync(dispatch)) refuseUnsafeSource(dispatch);
+  const oldSlug = projectSlug(workspace);
+  const newSlug = projectSlug(frozenWorkspace);
+  const renamed = (directory: string) => newSlug + directory.slice(oldSlug.length);
+  // A path into a project directory takes the directory's new name. The rewriter prefers the longest match.
   const rewrite = pathRewriter([
     [workspace, frozenWorkspace],
+    ...directories.map((directory): [string, string] => [
+      path.join(options.projects, directory),
+      path.join(frozenProjects, renamed(directory)),
+    ]),
     [options.projects, frozenProjects],
     [options.codex, frozenCodex],
   ]);
-  const oldSlug = projectSlug(workspace);
-  const newSlug = projectSlug(frozenWorkspace);
   for (const name of ['workspace', 'projects', 'codex', 'store'])
     fs.mkdirSync(path.join(output, name), { recursive: true });
   const record: FreezeRecord = {
@@ -431,10 +450,9 @@ export function freezeCatalog(options: FreezeOptions): FreezeRecord {
     record.frozenBytes += frozen.frozenBytes;
   };
   for (const directory of directories) {
-    const renamed = newSlug + directory.slice(oldSlug.length);
     for (const file of filesUnder(path.join(options.projects, directory))) {
       const inner = path.relative(path.join(options.projects, directory), file);
-      keep(file, path.join('projects', directory, inner), path.join(frozenProjects, renamed, inner));
+      keep(file, path.join('projects', directory, inner), path.join(frozenProjects, renamed(directory), inner));
     }
   }
   for (const file of filesUnder(options.codex)) {
@@ -455,16 +473,19 @@ export function freezeCatalog(options: FreezeOptions): FreezeRecord {
       continue;
     }
     fs.mkdirSync(path.dirname(target), { recursive: true });
-    record.reduced.push({ file: path.join('codex', relative), bytes: copyOpening(file, target, rewrite) });
+    record.reduced.push({ file: path.join('codex', relative), ...copyOpening(file, target, rewrite) });
   }
-  if (options.store && fs.existsSync(path.join(options.store, 'dispatch')))
-    record.dispatch = freezeDispatch(
-      path.join(options.store, 'dispatch'),
+  if (dispatch && fs.existsSync(dispatch)) {
+    const { sources, ...summary } = freezeDispatch(
+      dispatch,
       path.join(output, 'store', 'dispatch'),
       rewrite,
       workspace,
       frozenWorkspace,
     );
+    record.dispatch = summary;
+    record.sources.push(...sources);
+  }
   const selected = selectSession(frozenProjects, frozenWorkspace, options.now ?? Date.now());
   if (!selected) throw new Error('No settled workspace session has a newest turn with a prompt and a summary.');
   fs.writeFileSync(path.join(output, 'state.json'), JSON.stringify({ showing: selected.session }));

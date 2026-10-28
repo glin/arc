@@ -11,6 +11,7 @@ import {
   appendDispatchTurn,
   activeTestRuns,
   hostMemory,
+  missingSoakMeasures,
   instrumentSoak,
   linkTree,
   soakMeasures,
@@ -57,7 +58,7 @@ let soakRequested = false;
 const SOAK = path.join(SCRATCH, 'soak');
 const SOAK_PROJECTS = path.join(SCRATCH, 'soak-projects');
 const SOAK_CODEX = path.join(SCRATCH, 'soak-codex');
-function isolatedEnvironment(run = MEASUREMENT_RUN): NodeJS.ProcessEnv {
+function isolatedEnvironment(run: string = MEASUREMENT_RUN): NodeJS.ProcessEnv {
   return {
     ...process.env,
     CLAUDE_CONFIG_DIR: path.join(SCRATCH, 'claude-config'),
@@ -106,6 +107,7 @@ interface LogLine {
   kind?: string;
   bytes?: number;
   measurementRun?: string;
+  hostPid?: number;
   stage?: string;
   accepted?: boolean;
   usableRows?: boolean;
@@ -514,7 +516,7 @@ export function instrumentStartup(tree: string): void {
           stage: msg.stage, generation: msg.generation, usableRows: msg.usableRows === true,
           accepted: this.readyHosts.has(host) && msg.generation === this.refreshGeneration,
           observation: (raw as { measurementObservation?: unknown }).measurementObservation,
-          hostMs: performance.now(),
+          hostMs: performance.now(), hostPid: process.pid,
         });
         this.browserPainted(host, msg.generation, msg.stage, msg.usableRows);`,
   );
@@ -758,7 +760,12 @@ interface Launch {
 }
 
 // Launches an isolated editor window through its CLI and releases the launcher process.
-function launchEditor(commandLine: string, workspace: string, profile = USER_DATA, run = MEASUREMENT_RUN): Launch {
+function launchEditor(
+  commandLine: string,
+  workspace: string,
+  profile = USER_DATA,
+  run: string = MEASUREMENT_RUN,
+): Launch {
   const launch: Launch = { failure: null };
   const prefix = profile === USER_DATA ? '' : 'warm-';
   const shell = process.platform === 'win32';
@@ -885,14 +892,12 @@ async function awaitMachine(minimumFreeGb: number, deadlineMs: number): Promise<
   const deadline = Date.now() + deadlineMs;
   for (;;) {
     const runs = activeTestRuns();
-    const free = freeMemoryBytes() as number | null;
-    if (runs === 0 && free !== null && free >= minimumFreeGb * 1024 ** 3) return;
+    const free = freeMemoryBytes();
+    if (runs === 0 && free >= minimumFreeGb * 1024 ** 3) return;
     const busy =
       runs > 0
         ? `${runs} test-suite or verify-landing processes are running.`
-        : free === null
-          ? 'Free memory is unavailable.'
-          : `Free memory is ${(free / 1024 ** 3).toFixed(1)} GB, below the ${minimumFreeGb} GB floor.`;
+        : `Free memory is ${(free / 1024 ** 3).toFixed(1)} GB, below the ${minimumFreeGb} GB floor.`;
     if (Date.now() >= deadline) throw new Error(`The machine stayed loaded: ${busy}`);
     process.stdout.write(`Waiting before launch. ${busy}\n`);
     await delay(30_000);
@@ -938,13 +943,22 @@ export function measuredStartupRecord(directory: string, pid: number | null): Re
   };
 }
 
-// Keep the largest extension host memory reading of the measured launch.
+// The process ID that the measured extension host logged with its first accepted paint.
+export function measuredHostPid(lines: LogLine[]): number | null {
+  const paint = lines.find((line) => line.event === 'measurementPaint' && typeof line.hostPid === 'number');
+  return paint?.hostPid ?? null;
+}
+
+// Keep the extension host's memory. Windows and Linux report the process's own peak, so the runner reads it once at
+// the end. macOS reports only current resident size, so the runner keeps the largest of its ten-second samples.
 class MemoryWatch {
+  pid: number | null = null;
   last: HostMemory | null = null;
   maximumWorkingSetBytes = 0;
   samples = 0;
-  sample(profile: string): void {
-    const memory = hostMemory(profile);
+  sample(): void {
+    if (this.pid === null) return;
+    const memory = hostMemory(this.pid);
     if (!memory) return;
     this.samples++;
     this.maximumWorkingSetBytes = Math.max(this.maximumWorkingSetBytes, memory.workingSetBytes);
@@ -952,11 +966,11 @@ class MemoryWatch {
   }
   record(): Record<string, unknown> {
     return {
+      pid: this.pid,
       samples: this.samples,
       sampledMaximumWorkingSetBytes: this.maximumWorkingSetBytes || null,
       peakWorkingSetBytes: this.last?.peakWorkingSetBytes ?? null,
       lastPrivateBytes: this.last?.privateBytes ?? null,
-      pid: this.last?.pid ?? null,
     };
   }
 }
@@ -975,12 +989,16 @@ async function requestSnapshot(name: string, deadlineMs: number): Promise<Record
   return null;
 }
 
+const CHILD_TURN_MS = 30_000;
+
+// The appends a soak of this length schedules: one every 30 seconds after its start, before its end.
+export function scheduledAppends(minutes: number): number {
+  return Math.max(0, Math.ceil((minutes * 60_000) / CHILD_TURN_MS) - 1);
+}
+
 // Keep the editor open, append a dispatched child turn every half minute, and save diagnostics every minute.
-async function soak(
-  minutes: number,
-  memory: MemoryWatch,
-  launch: Launch,
-): Promise<{ complete: boolean; note: string | null }> {
+// Appends run on their own schedule, so a slow snapshot never reduces the work a build receives.
+async function soak(minutes: number, launch: Launch): Promise<{ complete: boolean; note: string | null }> {
   const snapshots: Array<{ name: string; at: string; measures: Record<string, number> | null }> = [];
   const take = async (name: string) => {
     const snapshot = await requestSnapshot(name, 120_000);
@@ -989,24 +1007,20 @@ async function soak(
   };
   const first = await take('000-start');
   const simulation = startDispatch(SOAK_PROJECTS, SOAK_CODEX, fixture.workspace);
-  const end = Date.now() + minutes * 60_000;
-  let minute = 0;
-  let nextAppend = Date.now() + 30_000;
-  let nextSnapshot = Date.now() + 60_000;
-  while (Date.now() < end && launch.failure === null) {
-    await delay(Math.max(0, Math.min(nextAppend, nextSnapshot, end) - Date.now()));
-    memory.sample(USER_DATA);
-    if (Date.now() >= nextAppend && Date.now() < end) {
+  const start = Date.now();
+  const end = start + minutes * 60_000;
+  const appender = (async () => {
+    for (let turn = 1; turn <= scheduledAppends(minutes) && launch.failure === null; turn++) {
+      await delay(Math.max(0, start + turn * CHILD_TURN_MS - Date.now()));
       appendDispatchTurn(simulation, fixture.workspace);
-      nextAppend += 30_000;
     }
-    if (Date.now() >= nextSnapshot && Date.now() < end) {
-      minute++;
-      await take(String(minute).padStart(3, '0'));
-      nextSnapshot += 60_000;
-    }
+  })();
+  for (let minute = 1; start + minute * 60_000 < end && launch.failure === null; minute++) {
+    await delay(Math.max(0, start + minute * 60_000 - Date.now()));
+    await take(String(minute).padStart(3, '0'));
   }
-  memory.sample(USER_DATA);
+  await delay(Math.max(0, end - Date.now()));
+  await appender;
   const last = await take('999-end');
   const startMeasures = first ? soakMeasures(first) : null;
   const endMeasures = last ? soakMeasures(last) : null;
@@ -1015,7 +1029,12 @@ async function soak(
     snapshots,
     start: startMeasures,
     end: endMeasures,
-    dispatch: { childId: simulation.childId, appends: simulation.appends, bytes: simulation.bytes },
+    dispatch: {
+      childId: simulation.childId,
+      appends: simulation.appends,
+      scheduled: scheduledAppends(minutes),
+      bytes: simulation.bytes,
+    },
     limits: [
       'The dispatched child is a synthetic Codex rollout that a synthetic Claude parent names. No agent process runs, and no dispatch receipt exists.',
       'The child grows by one completed turn every 30 seconds, with fixed token totals and 256 KiB of reasoning text per turn.',
@@ -1023,10 +1042,20 @@ async function soak(
     ],
   };
   if (launch.failure !== null) return { complete: false, note: launch.failure };
-  if (!startMeasures || !endMeasures)
-    return { complete: false, note: 'The soak saved no diagnostics snapshot at its start or its end.' };
+  const missing = endMeasures ? missingSoakMeasures(endMeasures) : ['the end snapshot'];
+  if (!startMeasures || missing.length)
+    return { complete: false, note: `The soak saved no ${startMeasures ? missing.join(', ') : 'start snapshot'}.` };
+  if (simulation.appends < scheduledAppends(minutes))
+    return {
+      complete: false,
+      note: `The soak appended ${simulation.appends} of ${scheduledAppends(minutes)} scheduled child turns.`,
+    };
   return { complete: true, note: null };
 }
+
+// A non-urgent derived-cache save waits up to five minutes after the last save, as `DERIVED_CACHE_CHECKPOINT_MS` in
+// `panelhost.ts` sets. The warm-up stays open past that point, so its store holds what it learned.
+const WARM_UP_OPEN_MS = 5.5 * 60_000;
 
 // Wait for every startup milestone by the measurement deadline.
 // Selection runs also measure session switching. A soak keeps the editor open afterwards.
@@ -1060,9 +1089,14 @@ async function measure(commandLine: string, workspace: string, options: Options)
         runRecord.warmUp = {
           complete: warm.complete,
           note: warm.note,
-          firstUsableRowMs: firstUsableRowMs(warm.lines, warmAt),
           completeRenderMs: milestoneOf(warm.lines, 'completeRender').hostMs,
+          openMs: null as number | null,
         };
+        // A failed warm-up leaves a partly filled store, which no comparison may treat as warm.
+        if (!warm.complete) return { ...warm, complete: false, note: `The warm-up launch failed. ${warm.note ?? ''}` };
+        while (Date.now() < warmAt + WARM_UP_OPEN_MS && warmLaunch.failure === null)
+          await delay(Math.min(5_000, warmAt + WARM_UP_OPEN_MS - Date.now()));
+        (runRecord.warmUp as { openMs: number | null }).openMs = Date.now() - warmAt;
       } finally {
         stopEditor(WARM_USER_DATA);
       }
@@ -1071,10 +1105,17 @@ async function measure(commandLine: string, workspace: string, options: Options)
     const memory = new MemoryWatch();
     const launchedAt = Date.now();
     const launch = launchEditor(commandLine, workspace);
-    const sampler = setInterval(() => memory.sample(USER_DATA), 10_000);
+    const sampler =
+      process.platform === 'darwin'
+        ? setInterval(() => {
+            memory.pid ??= measuredHostPid(reader.read());
+            memory.sample();
+          }, 10_000)
+        : null;
     observation.begin('execution', { boundary: 'Startup and selection measurement await' });
     try {
       const outcome = await pollStartup(() => reader.read(), launch, timeoutMs, MEASUREMENT_RUN, expectedSelection);
+      memory.pid ??= measuredHostPid(outcome.lines);
       runRecord.firstUsableRowMs = firstUsableRowMs(outcome.lines, launchedAt);
       if (outcome.complete && selectionRequested) {
         const result = responseRequested
@@ -1084,8 +1125,7 @@ async function measure(commandLine: string, workspace: string, options: Options)
         return { ...outcome, note: result.note, complete: result.complete };
       }
       if (outcome.complete && options.soakMinutes > 0) {
-        clearInterval(sampler);
-        const result = await soak(options.soakMinutes, memory, launch);
+        const result = await soak(options.soakMinutes, launch);
         complete = result.complete;
         return {
           ...outcome,
@@ -1097,21 +1137,21 @@ async function measure(commandLine: string, workspace: string, options: Options)
       complete = outcome.complete;
       return outcome;
     } finally {
-      clearInterval(sampler);
-      memory.sample(USER_DATA);
+      if (sampler) clearInterval(sampler);
+      memory.sample();
       runRecord.memory = memory.record();
       observation.end('execution');
       observation.begin('cleanup');
       stopEditor();
-      runRecord.startupRecord = measuredStartupRecord(path.join(ARC_STORE, 'startup'), memory.last?.pid ?? null);
-      lock?.release();
-      suite?.release();
+      runRecord.startupRecord = measuredStartupRecord(path.join(ARC_STORE, 'startup'), memory.pid);
       observation.end('cleanup', { descendants: 'unobserved' });
     }
   } catch (error) {
     failure = error instanceof Error ? error.message : String(error);
     throw error;
   } finally {
+    lock?.release();
+    suite?.release();
     observation.finish({
       outcome: failure ? 'failure' : complete ? 'success' : 'incomplete',
       reason: failure ?? (complete ? null : 'Startup measurement remained incomplete.'),

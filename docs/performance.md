@@ -126,7 +126,7 @@ Add `--response` to capture one synthetic live response becoming a recorded rich
 
 Each run holds the [machine suite lock](development.md#machine-load) and the browser lane lock, so no multi-lane test run overlaps it. An editor launch needs 5 GB of free memory and no `test-suite.mjs` or `verify-landing.mjs` process with a child process. The process check also covers runs that take no suite lock. A run that waits for the suite lock has no child yet, so it does not block the launch. The runner waits up to 30 minutes for both conditions before it takes the locks. Right before each launch it reads them again, with the locks held, and waits up to 10 more minutes. `--min-free-gb <gigabytes>` changes the floor. A wait past its limit ends the run.
 
-`--warm-up` launches the build once with its own profile and the run's Arc store, waits for startup, and closes it. The measured launch then reads the store that the warm-up filled. `warmUp` in `result.json` records the warm-up startup.
+`--warm-up` launches the build once with its own profile and the run's Arc store, and waits for startup. The warm-up stays open five and a half minutes after its launch, so the derived cache's routine save runs before the runner closes it. The measured launch then reads the store that the warm-up filled. A warm-up that does not complete ends the run as incomplete. `warmUp` in `result.json` records the warm-up startup.
 
 ### Frozen catalog fixture
 
@@ -138,23 +138,23 @@ npx tsx scripts/panel-startup-measure/freeze.ts --workspace <folder>
 
 The fixture goes to the Arc home's `measure/fixtures/<date>` directory, or to `--output <directory>`. The runner accepts a fixture there, because the measured editor uses its own Arc home. The freezer refuses an existing output directory.
 
-The freezer copies the Claude project directories whose names match the workspace, and every Codex rollout. It writes each path of the workspace and both transcript roots as the same spelling of its fixture path. Project directories take the slug of the fixture workspace. Copies keep their source modification times. A rollout whose recorded working directory sits outside the workspace keeps only its opening record. `frozen.reduced` in the manifest lists each one with its source size. Each compressed `.jsonl.zst` rollout archive becomes an empty file of the same name, because discovery never opens one. `frozen.placeholders` counts them and their source bytes.
+The freezer copies the Claude project directories whose names match the workspace, and every Codex rollout. It writes each path of the workspace, of each copied project directory, and of both transcript roots as the same spelling of its fixture path. Project directories take the slug of the fixture workspace. Copies keep their source modification times. A rollout whose recorded working directory sits outside the workspace keeps only its opening record. `frozen.reduced` in the manifest lists each one with its source size and the SHA-256 of the opening it keeps. Each compressed `.jsonl.zst` rollout archive becomes an empty file of the same name, because discovery never opens one. `frozen.placeholders` counts them and their source bytes.
 
 The fixture store holds only the Arc home's dispatch receipt store, so pair the fixture with `--warm-up`. The freezer copies that store through the same path rewrite. It leaves out logs, write locks, process supervision files, and every JSON file with a key that names a credential. A producer opening keeps its rewritten prefix length and digest. Each receipt working directory inside the workspace exists in the fixture workspace. The rewritten paths change byte lengths. Byte counters therefore differ from a live window on the same catalog.
 
 A copy gives each receipt file a new device and inode number. The receipt reader refuses a receipt whose recorded identity differs, after fewer checks than an accepted receipt costs. After the runner seeds its store, `rebindDispatch` in `extension/scripts/panel-startup-measure/freeze.ts` records the identities of the run's own files and transcripts in the receipts and their witnesses. A soak run also moves the receipt transcript paths to its linked transcript tree. `dispatchRebind` in `result.json` counts the rebound anchors, witnesses, and openings.
 
-`sources.json` records each copied file with its source SHA-256, its source bytes, and its fixture bytes. The manifest records the SHA-256 of `sources.json` and the totals. The freezer selects the newest workspace Claude session last written at least ten minutes before the freeze whose newest turn has a prompt and a summary. It refuses a source directory that holds a health log, a `.git` entry, or a link.
+`sources.json` records each copied transcript and receipt file with its source SHA-256, its source bytes, and its fixture bytes. The manifest records the SHA-256 of `sources.json` and the totals. The freezer selects the newest workspace Claude session last written at least ten minutes before the freeze whose newest turn has a prompt and a summary. It refuses a source directory that holds a health log, a `.git` entry, or a link.
 
 ### Soak
 
-`--soak <minutes>` keeps the measured editor open after `completeRender`. The runner links every fixture transcript into the run directory with hard links, so files that the soak adds never reach the fixture. Linked files keep their identity, so the warm-up store stays valid.
+`--soak <minutes>` keeps the measured editor open after `completeRender`. The runner links every fixture transcript into the run directory with hard links, so files that the soak adds never reach the fixture. Linked files keep their identity, so the warm-up store stays valid. When the run directory sits on another filesystem, the runner copies the transcripts instead.
 
-At the start of the soak, the runner adds a Claude parent session whose shell call launched `codex exec --json`, and the Codex child rollout it names. Every 30 seconds the runner appends one completed child turn with 256 KiB of reasoning text and growing token totals. No agent process runs, and no dispatch receipt exists.
+At the start of the soak, the runner adds a Claude parent session whose shell call launched `codex exec --json`, and the Codex child rollout it names. Every 30 seconds the runner appends one completed child turn with 256 KiB of reasoning text and growing token totals. The appends keep their own schedule while the runner waits for a snapshot, so a slow build receives the same work. No agent process runs, and no dispatch receipt exists.
 
-A measurement overlay in the built extension saves performance diagnostics when the runner leaves a request file in the run's `soak` directory. The overlay reads that directory once a second. The runner requests a snapshot at the start, every minute, and at the end. `soakMeasures` in `extension/scripts/panel-startup-measure/soak.ts` owns the counters that `result.json` keeps from each snapshot.
+A measurement overlay in the built extension saves performance diagnostics when the runner leaves a request file in the run's `soak` directory. The overlay reads that directory once a second. The runner requests a snapshot at the start, every minute, and at the end. `soakMeasures` in `extension/scripts/panel-startup-measure/soak.ts` owns the counters that `result.json` keeps from each snapshot. A soak is incomplete when it appends fewer turns than it scheduled, or when its end snapshot lacks a counter that `REQUIRED_DISCOVERY_MEASURES` names.
 
-The runner samples the extension host process every ten seconds. On Windows it records the process's own peak working set. On Linux it records the peak resident size. macOS reports only the sampled maximum. `startupRecord` in `result.json` holds the measured host's startup history record, including `firstUsableRow`.
+The measured extension host logs its process ID with each accepted paint. When the run ends, the runner reads that process's own peak working set on Windows and its peak resident size on Linux. On macOS it samples the resident size every ten seconds and keeps the maximum. `startupRecord` in `result.json` holds the startup history record that the same process wrote, including `firstUsableRow`.
 
 ### Build comparison
 
@@ -166,7 +166,7 @@ npx tsx scripts/panel-startup-measure/compare.ts --fixture <manifest.json> --bas
 
 Run it from `extension`. Without `--baseline`, it measures the source commit of the newest startup history record in the Arc home. Each build runs its warm-up launch and its measured launch with a ten-minute soak, and the second build starts after the first ends. `--soak <minutes>`, `--timeout <seconds>`, and `--keep` pass to the runner. The timeout defaults to 900 seconds. A comparison takes about an hour.
 
-`compare.json` and `compare.md` go to `--output <directory>` or to a new directory under the system temporary directory. They name the installed build, the fixture identity, and each measure with its ratio of candidate to baseline. `--results <baseline.json> <candidate.json>` compares two saved runner results without launching an editor.
+`compare.json` and `compare.md` go to `--output <directory>` or to a new directory under the system temporary directory. They name the installed build, the fixture identity, and each measure with its ratio of candidate to baseline. The first usable row and the first pass come from each host's startup history record, so both sides share the host's clock origin. `CLAUDE.md` names the changes that land only with this report. `--results <baseline.json> <candidate.json>` compares two saved runner results without launching an editor.
 
 | Measures | Margin | Floor |
 | --- | --- | --- |
@@ -175,7 +175,7 @@ Run it from `extension`. Without `--baseline`, it measures the source commit of 
 | Bytes: `readBytes`, `dispatchSpendBytes` | 1.5 | 1 MiB |
 | Peak extension host memory | 1.25 | 64 MiB |
 
-A measure regresses when the candidate exceeds the baseline by more than its margin and by more than its floor. A measure that only the candidate reports compares with zero. The script exits 1 on a regression and 2 when either run remains incomplete. `MARGINS` and `FLOORS` in `compare.ts` own the values.
+A measure regresses when the candidate exceeds the baseline by more than its margin and by more than its floor. A refresh reason that only the candidate reports compares with zero. Each side must report the measures that `REQUIRED_MEASURES` names. The script exits 1 on a regression. It exits 2 when either run remains incomplete, misses a required measure, or exits nonzero. It exits 3 when the script itself fails. `MARGINS` and `FLOORS` in `compare.ts` own the values.
 
 ### Session list publication measurement
 
