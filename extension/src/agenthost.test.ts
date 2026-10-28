@@ -70,7 +70,15 @@ test('measurement windows refuse agent processes before launch', { tags: ['subpr
   }
 });
 import { ClaudeWire, CONTROL_DEADLINE_MS, spawnArgs, type PermissionMode } from './claudewire.ts';
-import { admitClaudeSessionComponents, admitClaudeSessionSkill } from './sessionskills';
+import {
+  admitClaudeSessionComponents,
+  admitClaudeSessionSkill,
+  errorText,
+  reportWithheld,
+  sessionComponentsDiagnostics,
+  type SessionComponentsWithheld,
+} from './sessionskills';
+import { createDiagnosticsLog } from './diagnosticslog';
 import { sessionHookEnvironment, sessionHookRuntime } from './bundledtools';
 import {
   CompactHost,
@@ -12239,6 +12247,7 @@ test.each([
   'node-redirection',
   'runtime-failure',
   'runtime-change',
+  'running-refusal',
 ] as const)('Claude plan preparation admits the complete frozen %s arguments', async (kind) => {
   const source = fs.readFileSync(path.join(__dirname, 'agenthost.ts'), 'utf8');
   const start = source.indexOf('export function claudePlan(');
@@ -12274,6 +12283,8 @@ test.each([
     codexDefinition: path.join(root, 'skills/arc-sessions/SKILL.md'),
   };
   const admittedArgs: string[][] = [];
+  // A personal definition that appears after launch refuses the skill in the running child.
+  let running = false;
   const build = runInNewContext(`(() => { ${compiled} })()`, {
     process: {
       env: {
@@ -12287,6 +12298,8 @@ test.each([
     claudePlanEnv: (env: Record<string, string>) => ({ ...env }),
     claudeSkillHome: () => home,
     retainedSessionSkill: () => true,
+    reportWithheld,
+    errorText,
     sessionHookEnvironment,
     sessionHookRuntime,
     ClaudeWire,
@@ -12297,7 +12310,8 @@ test.each([
         {
           ...input,
           read: (file) =>
-            kind === 'personal' && file === path.join(home, 'skills/arc-sessions/SKILL.md')
+            (kind === 'personal' || (kind === 'running-refusal' && running)) &&
+            file === path.join(home, 'skills/arc-sessions/SKILL.md')
               ? 'matching skill'
               : undefined,
           list: () => [],
@@ -12313,11 +12327,61 @@ test.each([
     ...(kind === 'inline' ? { settings: '{"disableSideloadFlags":true}' } : {}),
     ...(kind === 'hook-policy' ? { settings: '{"disableAllHooks":true}' } : {}),
   };
-  const plan = build(
-    { ...CLAUDE, leadingArgs: ['--model', 'sonnet'], env: {}, sessionSkills: { current: () => release } },
-    options,
-  );
+  const log = createDiagnosticsLog({
+    enabled: false,
+    directory: path.join(root, 'logs'),
+    workspace: 'fixture',
+    pid: 1,
+    startedAt: 0,
+  });
+  const logged = () =>
+    log.file() && fs.existsSync(log.file()!)
+      ? fs
+          .readFileSync(log.file()!, 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => {
+            const { event, provider, stage, withheld, error, check, cwd } = JSON.parse(line);
+            return { event, provider, stage, withheld, error, check, cwd };
+          })
+      : [];
+  const launch = (withheld: (record: SessionComponentsWithheld) => void) => ({
+    ...CLAUDE,
+    leadingArgs: ['--model', 'sonnet'],
+    env: {},
+    sessionSkills: { current: () => release, withheld },
+  });
+  const plan = build(launch(sessionComponentsDiagnostics(log, (write) => write())), options);
   const prepared = plan.prepare!();
+  // Detailed logging is off. A withheld component still reaches the log a user sends.
+  const uncertain = { skill: 'uncertain-configuration', hooks: 'uncertain-configuration' };
+  // A settings refusal names the settings source and the check that failed.
+  const refusals: Record<typeof kind, [Record<string, string>, string?, string?] | undefined> = {
+    ordinary: undefined,
+    restricted: [uncertain, 'The Claude launch arguments exceed their size limit.'],
+    inline: [{ skill: 'settings-refusal', hooks: 'settings-refusal' }, undefined, '--settings:sideload-restriction'],
+    personal: [{ skill: 'native-definition' }],
+    'hook-policy': [{ hooks: 'settings-refusal' }, undefined, '--settings:hooks-disabled'],
+    'node-redirection': [{ hooks: 'unsupported-node-environment' }],
+    'runtime-failure': [{ hooks: 'unsupported-node-runtime' }, 'unsupported runtime'],
+    'runtime-change': undefined,
+    'running-refusal': undefined,
+  };
+  const refusal = refusals[kind];
+  const entries = refusal
+    ? [
+        {
+          event: 'sessionComponentsWithheld',
+          provider: 'claude',
+          stage: 'launch',
+          withheld: refusal[0],
+          error: refusal[1],
+          check: refusal[2],
+          cwd: workspace,
+        },
+      ]
+    : [];
+  assert.deepEqual(logged(), entries);
   const expected = [
     '--model',
     'sonnet',
@@ -12326,13 +12390,24 @@ test.each([
   assert.deepEqual(admittedArgs, [expected]);
   assert.deepEqual(Array.from(prepared.args), [
     ...expected,
-    ...(['ordinary', 'hook-policy', 'node-redirection', 'runtime-failure', 'runtime-change'].includes(kind)
+    ...([
+      'ordinary',
+      'hook-policy',
+      'node-redirection',
+      'runtime-failure',
+      'runtime-change',
+      'running-refusal',
+    ].includes(kind)
       ? ['--plugin-dir', release.claudePlugin]
       : []),
-    ...(['ordinary', 'personal', 'runtime-change'].includes(kind) ? ['--plugin-dir', release.claudeHooksPlugin] : []),
+    ...(['ordinary', 'personal', 'runtime-change', 'running-refusal'].includes(kind)
+      ? ['--plugin-dir', release.claudeHooksPlugin]
+      : []),
   ]);
   assert.equal(prepared.inheritedEnvironment?.CUSTOM, 'frozen');
-  const initialChecks = ['ordinary', 'personal', 'runtime-failure', 'runtime-change'].includes(kind) ? 1 : 0;
+  const initialChecks = ['ordinary', 'personal', 'runtime-failure', 'runtime-change', 'running-refusal'].includes(kind)
+    ? 1
+    : 0;
   assert.equal(version.mock.calls.length, initialChecks);
   const sent: any[] = [];
   const driver = prepared.driver(
@@ -12365,14 +12440,38 @@ test.each([
   await driver.open();
   assert.equal(version.mock.calls.length, initialChecks);
   if (kind === 'runtime-change') fs.utimesSync(executable, new Date('2020-01-01'), new Date('2020-01-02'));
-  await driver.prompt('ordinary work');
+  if (kind === 'running-refusal') {
+    running = true;
+    // Repeated input after the refusal reuses it without another check or record.
+    await assert.rejects(driver.prompt('ordinary work'));
+    await assert.rejects(driver.prompt('ordinary work'));
+    entries.push({
+      event: 'sessionComponentsWithheld',
+      provider: 'claude',
+      stage: 'running',
+      withheld: { skill: 'native-definition' },
+      error: undefined,
+      check: undefined,
+      cwd: workspace,
+    });
+  } else await driver.prompt('ordinary work');
   assert.equal(version.mock.calls.length, initialChecks + (kind === 'runtime-change' ? 1 : 0));
-  assert.equal(sent.filter((message) => message.type === 'user').length, 1);
+  assert.equal(sent.filter((message) => message.type === 'user').length, kind === 'running-refusal' ? 0 : 1);
   assert.equal(
     sent.filter((message) => message.request?.subtype === 'get_settings').length,
     ['restricted', 'inline'].includes(kind) ? 0 : 2,
   );
+  assert.deepEqual(logged(), entries);
   driver.close('closed');
+  // A diagnostics write that throws leaves the launch arguments unchanged.
+  running = false;
+  const failing = build(
+    launch(() => {
+      throw new Error('disk full');
+    }),
+    options,
+  ).prepare!();
+  assert.deepEqual(Array.from(failing.args), Array.from(prepared.args));
 });
 
 // One preparation read per actual construction protects idle paths without provider subprocesses.

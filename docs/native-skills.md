@@ -18,6 +18,8 @@ Arc repeats these checks when refreshing the displayed skill list, including not
 
 Each optional setup or refresh has one 15-second deadline across trailing notifications and retains output limits. Neither provider starts a replacement process or resends delivered input to repair optional skill discovery.
 
+When Arc withholds the skill or the hooks from a process, it writes a `sessionComponentsWithheld` line to the diagnostics log, even with `arc.diagnostics.log` off. The line names the provider, the stage, each withheld component with its reason, and the working directory. It also names the failed check when one exists. For a failed provider request, the line names the request method and, when the provider sends one, its error code. It never names the provider's error text. A Claude process writes at most one line at launch and one line while running. A Codex process writes each distinct reason and failed check once, until Arc admits the skill again. A Codex process that closes during its check writes nothing. The line can contain local paths. The [system capture](performance.md#system-capture) copies these lines from every kept log, and `arc.openDiagnosticsLog` opens the current log file in `ARC_HOME/logs`.
+
 ## Snapshot hook requirements
 
 Arc checks personal settings, ancestor settings, main-worktree settings, inline hooks, and applicable plugins. Directory marketplaces resolve their selected source. Any existing `arc-hooks` registration or setting prevents Arc from adding session hooks, including disabled registrations and registrations from another marketplace.

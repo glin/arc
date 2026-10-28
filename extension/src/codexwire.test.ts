@@ -17,6 +17,7 @@ import {
 import { WireEvent, Ask, RateLimit, GuardedAttempt } from './agentwire.ts';
 import { SessionNameUncertain } from './sessionrename.ts';
 import * as path from 'node:path';
+import { sessionComponentsDiagnostics, type SessionComponentsWithheld } from './sessionskills';
 
 // App-server fixtures retain protocol fields, including request ID 0. A truthiness check must not discard that ID.
 
@@ -24,7 +25,7 @@ const THREAD = '01a04792-145f-7c01-9dd6-f3234c381e7e';
 const TURN = '01a04792-152f-72f1-b738-f4b20621e59a';
 
 // Dedicated in-memory servers exercise registration order, raw collisions, and withdrawal without model turns.
-function sessionSkillServer() {
+function sessionSkillServer(withheld?: (record: SessionComponentsWithheld) => void) {
   const root = path.resolve('session-skill-release');
   const release = {
     contentId: 'a'.repeat(64),
@@ -50,12 +51,14 @@ function sessionSkillServer() {
     holdSteer: false,
     holdStart: false,
     failStart: false,
+    configError: undefined as string | undefined,
     refuseSteer: false,
     beforeReply: undefined as ((message: any) => void) | undefined,
   };
   const held: (() => void)[] = [];
   const sent: any[] = [];
   const events: WireEvent[] = [];
+  const logged: Record<string, unknown>[] = [];
   const cwd = process.cwd();
   const definition = (file: string, enabled = true) => ({
     name: 'arc-sessions',
@@ -68,7 +71,15 @@ function sessionSkillServer() {
   const wire = new CodexWire({
     cwd,
     clientInfo: { name: 'arc', title: 'Arc', version: '0.1.0' },
-    sessionSkills: { release, refresh: () => true },
+    sessionSkills: {
+      release,
+      refresh: () => true,
+      withheld:
+        withheld ??
+        sessionComponentsDiagnostics({ warn: (event, record) => logged.push({ event, ...record }) }, (write) =>
+          write(),
+        ),
+    },
     emit: (event) => events.push(event),
     send: (line) => {
       const message = JSON.parse(line);
@@ -99,6 +110,7 @@ function sessionSkillServer() {
             };
             break;
           case 'config/read':
+            if (state.configError) error = { code: -32603, message: state.configError };
             result = {
               config: state.disabled
                 ? { skills: { config: [{ path: release.codexDefinition, enabled: false }] } }
@@ -144,8 +156,16 @@ function sessionSkillServer() {
       });
     },
   });
-  return { wire, state, sent, events, release, held };
+  return { wire, state, sent, events, release, held, logged };
 }
+
+const codexWithheld = (reason: string, detail: Record<string, unknown> = {}) => ({
+  event: 'sessionComponentsWithheld',
+  provider: 'codex',
+  stage: 'running',
+  withheld: { skill: reason },
+  ...detail,
+});
 
 test.each([false, true])(
   'Codex registers its skill and offers completion with nullable skills %s',
@@ -180,6 +200,7 @@ test.each([false, true])(
       name: 'arc-sessions',
       path: h.release.codexDefinition,
     });
+    assert.deepEqual(h.logged, []);
     h.wire.close('closed');
   },
 );
@@ -202,6 +223,7 @@ test('Codex preserves a pre-existing enabled link to its exact immutable definit
     commands.some((command) => command.sessionSkillRelease),
     false,
   );
+  assert.deepEqual(h.logged, []);
   h.wire.close('closed');
 });
 
@@ -225,6 +247,20 @@ test.each(['collision', 'disabled', 'managed', 'unsupported'] as const)(
         h.sent.some((message) => message.method === 'skills/extraRoots/set'),
         false,
       );
+    // A second catalog read repeats the refusal without a second record.
+    await h.wire.commands();
+    assert.deepEqual(h.logged, [
+      {
+        collision: codexWithheld('conflicting-skill'),
+        disabled: codexWithheld('settings-refusal', { check: 'disabled-skill' }),
+        managed: codexWithheld('settings-refusal', { check: 'managed-requirements' }),
+        unsupported: codexWithheld('unsupported-registration', {
+          error: 'Codex refused a skill request.',
+          method: 'skills/extraRoots/set',
+          code: -32601,
+        }),
+      }[kind],
+    ]);
     h.wire.close('closed');
   },
 );
@@ -303,11 +339,99 @@ test.each([false, true])(
   },
 );
 
+test('Codex records a skill discovery that misses its deadline once', async () => {
+  vi.useFakeTimers();
+  try {
+    const h = sessionSkillServer();
+    await h.wire.initialize();
+    h.state.holdList = true;
+    const opening = assert.rejects(h.wire.commands(), /did not answer/);
+    await vi.advanceTimersByTimeAsync(16_000);
+    await opening;
+    assert.deepEqual(h.logged, [
+      codexWithheld('deadline', { error: 'Codex did not answer a skill request in time.', method: 'skills/list' }),
+    ]);
+    h.wire.close('closed');
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('Codex records each alternating refusal once until it admits its skill', async () => {
+  const h = sessionSkillServer();
+  await h.wire.initialize();
+  for (const kind of ['collision', 'disabled', 'collision', 'disabled'] as const) {
+    h.state.collision = kind === 'collision';
+    h.state.disabled = kind === 'disabled';
+    await h.wire.commands();
+  }
+  const refusals = [codexWithheld('conflicting-skill'), codexWithheld('settings-refusal', { check: 'disabled-skill' })];
+  assert.deepEqual(h.logged, refusals);
+  h.state.disabled = false;
+  assert.ok((await h.wire.commands()).some((command) => command.sessionSkillRelease));
+  h.state.collision = true;
+  await h.wire.commands();
+  assert.deepEqual(h.logged, [...refusals, codexWithheld('conflicting-skill')]);
+  h.wire.close('closed');
+});
+
+test('Codex records a refused skill request without the provider error text', async () => {
+  const h = sessionSkillServer();
+  h.state.configError = 'config.toml line 3: api_key = "sk-secret-value"';
+  await h.wire.initialize();
+  await assert.rejects(h.wire.commands());
+  assert.deepEqual(h.logged, [
+    codexWithheld('uncertain-registration', {
+      error: 'Codex refused a skill request.',
+      method: 'config/read',
+      code: -32603,
+    }),
+  ]);
+  assert.doesNotMatch(JSON.stringify(h.logged), /sk-secret-value/);
+  h.wire.close('closed');
+});
+
+test('Codex keeps its catalog when the diagnostics write throws', async () => {
+  const read = async (withheld?: (record: SessionComponentsWithheld) => void) => {
+    const h = sessionSkillServer(withheld);
+    h.state.collision = true;
+    await h.wire.initialize();
+    const commands = await h.wire.commands();
+    h.wire.close('closed');
+    return { commands, sent: h.sent.map((message) => message.method) };
+  };
+  const calls: SessionComponentsWithheld[] = [];
+  const failed = await read((record) => {
+    calls.push(record);
+    throw new Error('disk full');
+  });
+  assert.equal(calls.length, 1);
+  assert.deepEqual(failed, await read());
+});
+
+test('Codex records nothing for a child closed during its skill discovery', async () => {
+  const h = sessionSkillServer();
+  await h.wire.initialize();
+  h.state.holdList = true;
+  const opening = h.wire.commands().catch(() => undefined);
+  await vi.waitFor(() => assert.equal(h.held.length, 1));
+  h.wire.close('closed');
+  await opening;
+  assert.deepEqual(h.logged, []);
+});
+
 test('Codex malformed registration acknowledgement prevents optional readiness and session creation', async () => {
   const h = sessionSkillServer();
   h.state.invalidAck = true;
   await h.wire.initialize();
   await assert.rejects(h.wire.commands(), /unreadable/);
+  await assert.rejects(h.wire.commands(), /unreadable/);
+  assert.deepEqual(h.logged, [
+    codexWithheld('uncertain-registration', {
+      error: 'Codex returned an unexpected skill response.',
+      method: 'skills/extraRoots/set',
+    }),
+  ]);
   assert.equal(
     h.events.some((event) => event.kind === 'ready'),
     false,

@@ -142,6 +142,69 @@ function Read-Optional {
   }
 }
 
+# Each editor window writes its own diagnostics log. Copies the withheld session tool lines of every kept log to
+# WithheldDestination, then the last whole lines of the newest log to Destination. Each copy keeps its newest whole
+# lines within its bound.
+function Copy-DiagnosticsLog {
+  param(
+    [Parameter(Mandatory = $true)][string]$Directory,
+    [Parameter(Mandatory = $true)][string]$Destination,
+    [Parameter(Mandatory = $true)][string]$WithheldDestination,
+    [long]$MaximumBytes = 1048576,
+    [long]$MaximumWithheldBytes = 262144
+  )
+
+  if (-not (Test-Path -LiteralPath $Directory -PathType Container)) { return $null }
+  $logs = @(Get-ChildItem -LiteralPath $Directory -File |
+    Where-Object { $_.Name -match '^arc-\d{8}-\d{6}-\d+\.jsonl$' } |
+    Sort-Object Name)
+  if (-not $logs.Count) { return $null }
+  $withheld = New-Object System.Collections.Generic.List[string]
+  foreach ($log in $logs) {
+    $reader = New-Object IO.StreamReader([IO.File]::Open($log.FullName, 'Open', 'Read', 'ReadWrite'), (New-Object Text.UTF8Encoding($false)))
+    try {
+      foreach ($line in $reader.ReadToEnd().Split("`n")) {
+        if ($line.Contains('"event":"sessionComponentsWithheld"')) { $withheld.Add("$line`n") }
+      }
+    } finally {
+      $reader.Dispose()
+    }
+  }
+  $withheldBytes = 0
+  $first = $withheld.Count
+  while ($first -gt 0 -and $withheldBytes + [Text.Encoding]::UTF8.GetByteCount($withheld[$first - 1]) -le $MaximumWithheldBytes) {
+    $first -= 1
+    $withheldBytes += [Text.Encoding]::UTF8.GetByteCount($withheld[$first])
+  }
+  $kept = $withheld.GetRange($first, $withheld.Count - $first)
+  [IO.File]::WriteAllText($WithheldDestination, ($kept -join ''), (New-Object Text.UTF8Encoding($false)))
+  $newest = $logs[-1]
+  $start = [Math]::Max(0, $newest.Length - $MaximumBytes)
+  $buffer = New-Object byte[] ($newest.Length - $start)
+  $read = 0
+  $stream = [IO.File]::Open($newest.FullName, 'Open', 'Read', 'ReadWrite')
+  try {
+    [void]$stream.Seek($start, 'Begin')
+    while ($read -lt $buffer.Length) {
+      $count = $stream.Read($buffer, $read, $buffer.Length - $read)
+      if ($count -le 0) { break }
+      $read += $count
+    }
+  } finally {
+    $stream.Dispose()
+  }
+  $text = [Text.Encoding]::UTF8.GetString($buffer, 0, $read)
+  if ($start -gt 0) { $text = $text.Substring($text.IndexOf("`n") + 1) }
+  [IO.File]::WriteAllText($Destination, $text, (New-Object Text.UTF8Encoding($false)))
+  [pscustomobject]@{
+    path = $newest.FullName
+    bytes = $newest.Length
+    copiedBytes = [Text.Encoding]::UTF8.GetByteCount($text)
+    withheldLines = $kept.Count
+    withheldBytes = $withheldBytes
+  }
+}
+
 function Get-ProcessSnapshot {
   $cimById = @{}
   try {
@@ -445,6 +508,11 @@ foreach ($settingsPath in @(
 }
 Write-CaptureFile -Name 'panel-settings.txt' -Content ($settingsLines -join [Environment]::NewLine)
 
+$arcHome = if ($env:ARC_HOME) { $env:ARC_HOME } else { Join-Path $userProfile '.arc' }
+$diagnosticsLog = Read-Optional -Area 'diagnostics log' -Read {
+  Copy-DiagnosticsLog -Directory (Join-Path $arcHome 'logs') -Destination (Join-Path $output 'diagnostics-log.jsonl') -WithheldDestination (Join-Path $output 'session-components-withheld.jsonl')
+}
+
 $manifest = [pscustomobject]@{
   capturedAtUtc = $capturedAt.ToUniversalTime().ToString('o')
   durationSeconds = [Math]::Max(0, ($Samples - 1) * $SampleIntervalSeconds)
@@ -477,6 +545,7 @@ $manifest = [pscustomobject]@{
   installedBundles = $installedBundles
   agentsViewDatabase = $agentsViewDb
   extensionStorageFiles = $storageFiles
+  diagnosticsLog = $diagnosticsLog
   captureErrors = $captureErrors
 }
 Write-CaptureFile -Name 'manifest.json' -Content ($manifest | ConvertTo-Json -Depth 8)

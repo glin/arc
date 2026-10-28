@@ -17,6 +17,7 @@ import {
   GUARDED_RECEIPT_MS,
 } from './claudewire.ts';
 import { GuardedAttempt } from './agentwire.ts';
+import { sessionComponentsDiagnostics } from './sessionskills';
 import { CompactRequests } from './compactrequest.ts';
 import { createHash } from 'node:crypto';
 
@@ -213,7 +214,14 @@ test.each([
 test.each(['2.1.309', '3.0.0', undefined])(
   'Claude incompatible native version %s publishes no optional command',
   async (version) => {
-    const h = harness(undefined, SESSION, undefined, { release: suppliedSessionSkill, refresh: () => true });
+    const logged: Record<string, unknown>[] = [];
+    const h = harness(undefined, SESSION, undefined, {
+      release: suppliedSessionSkill,
+      refresh: () => true,
+      withheld: sessionComponentsDiagnostics({ warn: (event, record) => logged.push({ event, ...record }) }, (write) =>
+        write(),
+      ),
+    });
     const opening = h.wire.initialize();
     const failed = assert.rejects(opening, /version/);
     h.wire.receive(
@@ -232,9 +240,112 @@ test.each(['2.1.309', '3.0.0', undefined])(
       false,
     );
     assert.equal(h.parsed().filter((message) => message.type === 'user').length, 0);
+    assert.deepEqual(logged, [
+      {
+        event: 'sessionComponentsWithheld',
+        provider: 'claude',
+        stage: 'running',
+        withheld: { skill: 'unsupported-claude-version' },
+        error: `This Claude Code version cannot load Arc's skill or file snapshots. Reported version: ${version}`,
+      },
+    ]);
     h.wire.close('closed');
   },
 );
+
+test('Claude records one refusal for a child whose native settings refuse its hooks', async () => {
+  const logged: Record<string, unknown>[] = [];
+  const h = harness(undefined, SESSION, undefined, {
+    release: suppliedSessionSkill,
+    refresh: () => true,
+    skill: false,
+    hooks: true,
+    withheld: sessionComponentsDiagnostics({ warn: (event, record) => logged.push({ event, ...record }) }, (write) =>
+      write(),
+    ),
+  });
+  const answer = (subtype: string, response: unknown) =>
+    h.wire.receive(
+      JSON.stringify({
+        type: 'control_response',
+        response: {
+          subtype: 'success',
+          request_id: h.parsed().find((message) => message.request?.subtype === subtype).request_id,
+          response,
+        },
+      }),
+    );
+  const opening = h.wire.initialize();
+  answer('initialize', { claude_code_version: '2.1.310', commands: [] });
+  await vi.waitFor(() => assert.ok(h.parsed().some((message) => message.request?.subtype === 'get_settings')));
+  answer('get_settings', {
+    effective: {},
+    sources: [{ source: 'userSettings', settings: { disableAllHooks: true } }],
+    applied: {},
+  });
+  await assert.rejects(opening, /settings/);
+  await assert.rejects(h.wire.prompt('first'), /settings/);
+  await assert.rejects(h.wire.prompt('second'), /settings/);
+  assert.equal(h.parsed().filter((message) => message.request?.subtype === 'get_settings').length, 1);
+  assert.deepEqual(logged, [
+    {
+      event: 'sessionComponentsWithheld',
+      provider: 'claude',
+      stage: 'running',
+      withheld: { hooks: 'settings-refusal' },
+      error: "Claude Code cannot load Arc's skill or file snapshots with these settings.",
+      check: 'userSettings:hooks-disabled',
+    },
+  ]);
+  h.wire.close('closed');
+});
+
+test('Claude records unreadable settings without the error text the child returned', async () => {
+  const logged: Record<string, unknown>[] = [];
+  const h = harness(undefined, SESSION, undefined, {
+    release: suppliedSessionSkill,
+    refresh: () => true,
+    withheld: sessionComponentsDiagnostics({ warn: (event, record) => logged.push({ event, ...record }) }, (write) =>
+      write(),
+    ),
+  });
+  const request = (subtype: string) => h.parsed().find((message) => message.request?.subtype === subtype).request_id;
+  const opening = h.wire.initialize();
+  h.wire.receive(
+    JSON.stringify({
+      type: 'control_response',
+      response: {
+        subtype: 'success',
+        request_id: request('initialize'),
+        response: { claude_code_version: '2.1.310', commands: [] },
+      },
+    }),
+  );
+  await vi.waitFor(() => assert.ok(h.parsed().some((message) => message.request?.subtype === 'get_settings')));
+  h.wire.receive(
+    JSON.stringify({
+      type: 'control_response',
+      response: {
+        subtype: 'error',
+        request_id: request('get_settings'),
+        error: 'settings.json: {"env":{"ANTHROPIC_API_KEY":"sk-ant-secret-value"}}',
+      },
+    }),
+  );
+  await assert.rejects(opening);
+  assert.deepEqual(logged, [
+    {
+      event: 'sessionComponentsWithheld',
+      provider: 'claude',
+      stage: 'running',
+      withheld: { skill: 'settings-unreadable' },
+      error: 'Claude Code did not return its settings.',
+      method: 'get_settings',
+    },
+  ]);
+  assert.doesNotMatch(JSON.stringify(logged), /sk-ant-secret-value/);
+  h.wire.close('closed');
+});
 
 test('Claude native evidence retains root envelopes, successful tool settlement and distinct manual compaction', async () => {
   const events: WireEvent[] = [];

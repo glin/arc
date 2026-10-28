@@ -1,10 +1,9 @@
-import { test } from 'vitest';
+import { test, vi } from 'vitest';
 import assert from 'node:assert';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { tempDir } from './temproot';
 import { sessionHookEnvironment } from './bundledtools';
-import { canonicalToolPath } from './toolownership';
 import { childEnv } from './agenthost';
 import {
   admitClaudeSessionSkill,
@@ -13,12 +12,73 @@ import {
   claudeSkillHome,
   codexRawSkills,
   codexSkillConfiguration,
+  canonicalSessionSkillInput,
+  listSessionSkillInput,
+  readSessionSkillInput,
+  sessionComponentsDiagnostics,
+  type SessionComponentsWithheld,
   type SessionSkillRelease,
 } from './sessionskills';
 
 function componentFlags(input: Parameters<typeof admitClaudeSessionComponents>[0]) {
   const { skill, hooks } = admitClaudeSessionComponents(input);
   return { skill, hooks };
+}
+
+// Linux and macOS report a path through a regular file as ENOTDIR, and Windows reports ENOENT.
+// This reproduces the ENOTDIR result on every host, so the production path resolvers meet it everywhere.
+function throughRegularFile<T>(run: () => T): T {
+  const realpath = fs.realpathSync.native;
+  const spy = vi.spyOn(fs.realpathSync, 'native').mockImplementation(((file: fs.PathLike, options?: never) => {
+    const resolved = path.resolve(String(file));
+    for (let folder = path.dirname(resolved); path.dirname(folder) !== folder; folder = path.dirname(folder))
+      if (fs.statSync(folder, { throwIfNoEntry: false })?.isFile())
+        throw Object.assign(new Error(`ENOTDIR: not a directory, realpath '${resolved}'`), { code: 'ENOTDIR' });
+    return realpath(file, options);
+  }) as typeof fs.realpathSync.native);
+  try {
+    return run();
+  } finally {
+    spy.mockRestore();
+  }
+}
+
+// The real readers, with every path outside the fixture root mapped to a missing fixture path and recorded.
+// `strays()` lists recorded paths other than managed settings and the project settings of the root's ancestors.
+function ownedReaders(root: string) {
+  const unmapped: string[] = [];
+  const inside = (folder: string, file: string) => {
+    const relative = path.relative(folder, file);
+    return !relative.startsWith('..') && !path.isAbsolute(relative);
+  };
+  const mapped = (file: string) => {
+    if (inside(root, file)) return file;
+    unmapped.push(file);
+    return path.join(root, 'absent', Buffer.from(file).toString('hex'));
+  };
+  const managed = path.resolve(
+    process.platform === 'win32'
+      ? 'C:/Program Files/ClaudeCode'
+      : process.platform === 'darwin'
+        ? '/Library/Application Support/ClaudeCode'
+        : '/etc/claude-code',
+  );
+  const ancestors: string[] = [];
+  for (let folder = path.dirname(root); ; folder = path.dirname(folder)) {
+    ancestors.push(folder);
+    if (path.dirname(folder) === folder) break;
+  }
+  return {
+    read: (file: string) => readSessionSkillInput(mapped(file)),
+    list: (file: string) => listSessionSkillInput(mapped(file)),
+    canonical: (file: string) => canonicalSessionSkillInput(mapped(file)),
+    strays: () =>
+      unmapped.filter(
+        (file) =>
+          !inside(managed, file) &&
+          !ancestors.some((folder) => file === path.join(folder, '.git') || inside(path.join(folder, '.claude'), file)),
+      ),
+  };
 }
 
 test.each(['win32', 'darwin', 'linux'] as const)(
@@ -73,37 +133,89 @@ test('Claude omits its automatic skill for matching and customized manual direct
     fs.writeFileSync(path.join(folder, 'details.md'), 'matching resources');
   }
   fs.symlinkSync(target, path.join(home, 'skills/arc-sessions'), process.platform === 'win32' ? 'junction' : 'dir');
-  const mapped = (file: string) =>
-    path.relative(root, file).startsWith('..') ? path.join(root, 'absent', Buffer.from(file).toString('hex')) : file;
+  const readers = ownedReaders(root);
   const input = {
     cwd,
     home,
     args: [],
     env: {},
     release: { ...release, claudeDefinition: path.join(payload, 'SKILL.md') },
-    read: (file: string) => {
-      const owned = mapped(file);
-      try {
-        return fs.readFileSync(owned, 'utf8');
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
-        throw error;
-      }
-    },
-    list: (file: string) => {
-      const owned = mapped(file);
-      try {
-        return fs.readdirSync(owned);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
-        throw error;
-      }
-    },
-    canonical: (file: string) => canonicalToolPath(mapped(file)),
+    ...readers,
   };
   assert.equal(admitClaudeSessionSkill(input), false);
   fs.writeFileSync(path.join(target, 'details.md'), 'custom instructions');
   assert.equal(admitClaudeSessionSkill(input), false);
+  assert.deepEqual(readers.strays(), []);
+});
+
+test('Claude admits its skill and hooks when a skills folder holds regular files', () => {
+  const root = tempDir('session-skill-file-entry-');
+  const home = path.join(root, 'home');
+  const cwd = path.join(root, 'workspace');
+  for (const folder of [path.join(home, 'skills', 'writing'), path.join(cwd, '.claude')])
+    fs.mkdirSync(folder, { recursive: true });
+  fs.writeFileSync(path.join(home, 'skills', 'CLAUDE.md'), 'notes');
+  fs.writeFileSync(path.join(home, 'skills', 'writing', 'SKILL.md'), '---\nname: writing\n---\n');
+  // A project `skills` entry that is a file fails every host's directory listing.
+  // On Linux and macOS, its skill definition path also fails canonical resolution through the file.
+  fs.writeFileSync(path.join(cwd, '.claude', 'skills'), 'notes');
+  const readers = ownedReaders(root);
+  const input = { cwd, home, args: [], env: {}, release, ...readers };
+  assert.deepEqual(componentFlags(input), { skill: true, hooks: true });
+  assert.deepEqual(readers.strays(), []);
+  // The production resolver resolves the same path through the file.
+  assert.deepEqual(
+    throughRegularFile(() => componentFlags({ ...input, canonical: undefined })),
+    { skill: true, hooks: true },
+  );
+});
+
+test('withheld session tools reach the diagnostics log after the launch step, in order', () => {
+  const lines: unknown[] = [];
+  const deferred: (() => void)[] = [];
+  const write = sessionComponentsDiagnostics({ warn: (event, record) => lines.push({ event, ...record }) }, (next) =>
+    deferred.push(next),
+  );
+  const record = (stage: SessionComponentsWithheld['stage']): SessionComponentsWithheld => ({
+    provider: 'claude',
+    stage,
+    withheld: { skill: 'settings-refusal' },
+  });
+  write(record('launch'));
+  write(record('running'));
+  assert.deepEqual(lines, []);
+  assert.equal(deferred.length, 1);
+  deferred[0]();
+  assert.deepEqual(
+    lines.map((line) => (line as { stage: string }).stage),
+    ['launch', 'running'],
+  );
+});
+
+// The diagnostics log receives this error, so it must name the file a user can inspect.
+test('Claude names the unreadable plugin manifest behind an uncertain configuration', () => {
+  const root = tempDir('session-skill-manifest-');
+  const home = path.join(root, 'home');
+  const cwd = path.join(root, 'workspace');
+  const installPath = path.join(home, 'plugins', 'cache', 'market', 'tool', '1.0.0');
+  for (const folder of [installPath, cwd]) fs.mkdirSync(folder, { recursive: true });
+  fs.writeFileSync(
+    path.join(home, 'plugins', 'known_marketplaces.json'),
+    JSON.stringify({ market: { source: { source: 'github', repo: 'owner/market' } } }),
+  );
+  fs.writeFileSync(
+    path.join(home, 'plugins', 'installed_plugins.json'),
+    JSON.stringify({ version: 2, plugins: { 'tool@market': [{ scope: 'user', version: '1.0.0', installPath }] } }),
+  );
+  const readers = ownedReaders(root);
+  const result = admitClaudeSessionComponents({ cwd, home, args: [], env: {}, release, ...readers });
+  assert.deepEqual(result, {
+    skill: false,
+    hooks: false,
+    reasons: { skill: 'uncertain-configuration', hooks: 'uncertain-configuration', configuration: 'uncertain' },
+    error: `A plugin identity is unreadable: ${path.join(installPath, '.claude-plugin', 'plugin.json')}`,
+  });
+  assert.deepEqual(readers.strays(), []);
 });
 
 test.each(['win32', 'darwin', 'linux'] as const)(
@@ -504,6 +616,22 @@ test('Codex admission keeps raw duplicate identities and configured disabled pat
       definition,
     );
   }
+  // The production resolver resolves a configured path through a regular file like a missing path.
+  fs.writeFileSync(path.join(ownedDefinitions, 'notes'), 'notes');
+  assert.equal(
+    throughRegularFile(() =>
+      codexSkillConfiguration(
+        {
+          config: { skills: { config: [{ path: path.join(ownedDefinitions, 'notes', 'SKILL.md'), enabled: true }] } },
+          origins: {},
+          layers: [],
+        },
+        { requirements: null },
+        release,
+      ),
+    ),
+    true,
+  );
   const cwd = process.cwd();
   const skill = {
     name: 'arc-sessions',

@@ -17,6 +17,75 @@ export interface SessionSkillRelease {
 export interface SessionSkillSelection {
   current(): SessionSkillRelease | undefined;
   admitted?(): boolean;
+  // Receives each refusal that withholds part of Arc's session tools from a child.
+  // A Claude child sends at most one record at launch and one while running. A Codex child sends each distinct
+  // reason and failed check once until Arc admits its skill again.
+  withheld?(record: SessionComponentsWithheld): void;
+}
+
+export type SessionComponent = 'skill' | 'hooks';
+
+// `launch` records the check before Arc starts the child. `running` records a later check by the running child.
+// `error` is Arc's own text. Provider replies supply only `method` and `code`, never their message.
+export interface SessionComponentsWithheld {
+  provider: 'claude' | 'codex';
+  stage: 'launch' | 'running';
+  withheld: Partial<Record<SessionComponent, string>>;
+  error?: string;
+  // The settings check that refused, for a `settings-refusal` reason.
+  check?: string;
+  // The provider request that failed, and its JSON-RPC error code.
+  method?: string;
+  code?: number | string;
+  cwd?: string;
+}
+
+export const SESSION_COMPONENTS_WITHHELD = 'sessionComponentsWithheld';
+
+// Writes withheld session tools to the diagnostics log even when detailed logging is off.
+// The write runs after the current launch step, in the order the records arrive.
+export function sessionComponentsDiagnostics(
+  log: { warn(event: string, record: Record<string, unknown>): void },
+  defer: (write: () => void) => void = (write) => void setImmediate(write),
+): (record: SessionComponentsWithheld) => void {
+  const pending: SessionComponentsWithheld[] = [];
+  return (record) => {
+    pending.push(record);
+    if (pending.length > 1) return;
+    defer(() => {
+      for (const next of pending.splice(0))
+        try {
+          log.warn(SESSION_COMPONENTS_WITHHELD, { ...next });
+        } catch {
+          // A failed diagnostics write drops its line.
+        }
+    });
+  };
+}
+
+// Drops components without a reason and fields without a value. A failed diagnostics write never changes the launch.
+export function reportWithheld(
+  sink: ((record: SessionComponentsWithheld) => void) | undefined,
+  record: Omit<SessionComponentsWithheld, 'withheld'> & {
+    withheld: Partial<Record<SessionComponent, string | false | undefined>>;
+  },
+): void {
+  const withheld: Partial<Record<SessionComponent, string>> = {};
+  for (const component of ['skill', 'hooks'] as const) {
+    const reason = record.withheld[component];
+    if (reason) withheld[component] = reason;
+  }
+  if (!sink || !Object.keys(withheld).length) return;
+  const fields = Object.fromEntries(Object.entries(record).filter(([, value]) => value !== undefined && value !== ''));
+  try {
+    sink({ ...(fields as Omit<SessionComponentsWithheld, 'withheld'>), withheld });
+  } catch {
+    // Diagnostics never interrupt a launch.
+  }
+}
+
+export function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 export function retainedSessionSkill(release: SessionSkillRelease, selection: SessionSkillSelection): boolean {
@@ -46,30 +115,47 @@ export function skillObject(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
 }
 
-function read(file: string): string | undefined {
+// A missing entry, or a path that runs through a regular file, reads as absent.
+const absent = new Set(['ENOENT', 'ENOTDIR']);
+
+export function readSessionSkillInput(file: string): string | undefined {
   let fd: number | undefined;
   try {
     fd = fs.openSync(file, 'r');
-    if (!fs.fstatSync(fd).isFile()) throw new Error('A session skill input is not a file.');
+    if (!fs.fstatSync(fd).isFile()) throw new Error(`A session skill input is not a file: ${file}`);
     const buffer = Buffer.alloc(128 * 1024 + 1);
     const count = fs.readSync(fd, buffer, 0, buffer.length, 0);
-    if (count === buffer.length) throw new Error('A session skill input exceeds its read limit.');
+    if (count === buffer.length) throw new Error(`A session skill input exceeds its read limit: ${file}`);
     return buffer.subarray(0, count).toString('utf8');
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    if (absent.has((error as NodeJS.ErrnoException).code ?? '')) return undefined;
     throw error;
   } finally {
     if (fd !== undefined) fs.closeSync(fd);
   }
 }
 
-function list(directory: string): string[] {
+// A path that runs through a regular file is canonical below the file's canonical path, like a missing path.
+// On Linux and macOS the platform reports such a path as ENOTDIR, which `canonicalToolPath` does not walk past.
+export function canonicalSessionSkillInput(file: string, platform = process.platform): string {
+  try {
+    return canonicalToolPath(file, platform);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOTDIR') throw error;
+    const parent = path.dirname(path.resolve(file));
+    if (parent === path.resolve(file)) throw error;
+    const joined = path.join(canonicalSessionSkillInput(parent, platform), path.basename(file));
+    return platform === 'win32' ? joined.toLowerCase() : joined;
+  }
+}
+
+export function listSessionSkillInput(directory: string): string[] {
   try {
     const names = fs.readdirSync(directory);
-    if (names.length > 256) throw new Error('A session skill input exceeds its directory limit.');
+    if (names.length > 256) throw new Error(`A session skill input exceeds its directory limit: ${directory}`);
     return names;
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    if (absent.has((error as NodeJS.ErrnoException).code ?? '')) return [];
     throw error;
   }
 }
@@ -92,30 +178,39 @@ export function claudeSkillSettings(
   component: 'skill' | 'hooks' = 'skill',
   platform = process.platform,
 ): boolean {
-  if (!skillObject(value)) return false;
-  if (value.disableSideloadFlags !== undefined && value.disableSideloadFlags !== false) return false;
+  return claudeSkillSettingsRefusal(value, component, platform) === undefined;
+}
+
+// Names the first settings check that refuses the component, or returns nothing when every check admits it.
+export function claudeSkillSettingsRefusal(
+  value: unknown,
+  component: 'skill' | 'hooks' = 'skill',
+  platform = process.platform,
+): string | undefined {
+  if (!skillObject(value)) return 'malformed-settings';
+  if (value.disableSideloadFlags !== undefined && value.disableSideloadFlags !== false) return 'sideload-restriction';
   for (const key of ['strictKnownMarketplaces', 'pluginTrustMessage', 'enabledPluginsFromClaudeAi'])
-    if (value[key] !== undefined) return false;
+    if (value[key] !== undefined) return 'marketplace-restriction';
   if (value.extraKnownMarketplaces !== undefined) {
-    if (!skillObject(value.extraKnownMarketplaces)) return false;
+    if (!skillObject(value.extraKnownMarketplaces)) return 'malformed-marketplace';
     for (const marketplace of Object.values(value.extraKnownMarketplaces))
       if (
         !skillObject(marketplace) ||
         !skillObject(marketplace.source) ||
         !['github', 'git', 'url', 'directory'].includes(String(marketplace.source.source))
       )
-        return false;
+        return 'malformed-marketplace';
   }
   if (
     value.env !== undefined &&
     (!skillObject(value.env) || Object.keys(value.env).some((key) => redirectedEnvironment.has(key.toUpperCase())))
   )
-    return false;
+    return 'redirected-environment';
   if (value.enabledPlugins !== undefined) {
-    if (!skillObject(value.enabledPlugins)) return false;
+    if (!skillObject(value.enabledPlugins)) return 'malformed-plugin-entry';
     for (const [id, enabled] of Object.entries(value.enabledPlugins)) {
-      if (typeof enabled !== 'boolean') return false;
-      if (id.split('@')[0] === (component === 'skill' ? 'arc-session-tools' : 'arc-hooks')) return false;
+      if (typeof enabled !== 'boolean') return 'malformed-plugin-entry';
+      if (id.split('@')[0] === (component === 'skill' ? 'arc-session-tools' : 'arc-hooks')) return 'arc-plugin-entry';
     }
   }
   if (component === 'hooks') {
@@ -125,12 +220,12 @@ export function claudeSkillSettings(
         Object.values(value.env).some((entry) => typeof entry !== 'string') ||
         !sessionHookEnvironment(value.env as NodeJS.ProcessEnv, platform))
     )
-      return false;
+      return 'unsupported-hook-environment';
     for (const key of ['disableAllHooks', 'allowManagedHooksOnly'])
-      if (value[key] !== undefined && value[key] !== false) return false;
-    if (value.hooks !== undefined && !claudeHookDeclarations(value.hooks)) return false;
+      if (value[key] !== undefined && value[key] !== false) return 'hooks-disabled';
+    if (value.hooks !== undefined && !claudeHookDeclarations(value.hooks)) return 'conflicting-hook-declaration';
   }
-  return true;
+  return undefined;
 }
 
 export function claudeNativeSkillSettings(
@@ -138,18 +233,28 @@ export function claudeNativeSkillSettings(
   component: 'skill' | 'hooks' = 'skill',
   platform = process.platform,
 ): boolean {
-  return (
-    skillObject(value) &&
-    claudeSkillSettings(value.effective, component, platform) &&
-    Array.isArray(value.sources) &&
-    skillObject(value.applied) &&
-    value.sources.every(
-      (source) =>
-        skillObject(source) &&
-        ['userSettings', 'projectSettings', 'localSettings', 'flagSettings'].includes(String(source.source)) &&
-        claudeSkillSettings(source.settings, component, platform),
+  return claudeNativeSkillSettingsRefusal(value, component, platform) === undefined;
+}
+
+// Names the refusing check with the settings layer that failed it, such as `userSettings:hooks-disabled`.
+export function claudeNativeSkillSettingsRefusal(
+  value: unknown,
+  component: 'skill' | 'hooks' = 'skill',
+  platform = process.platform,
+): string | undefined {
+  if (!skillObject(value) || !Array.isArray(value.sources) || !skillObject(value.applied)) return 'malformed-settings';
+  const effective = claudeSkillSettingsRefusal(value.effective, component, platform);
+  if (effective) return `effective:${effective}`;
+  for (const source of value.sources) {
+    if (
+      !skillObject(source) ||
+      !['userSettings', 'projectSettings', 'localSettings', 'flagSettings'].includes(String(source.source))
     )
-  );
+      return 'unsupported-settings-layer';
+    const refusal = claudeSkillSettingsRefusal(source.settings, component, platform);
+    if (refusal) return `${String(source.source)}:${refusal}`;
+  }
+  return undefined;
 }
 
 // One existing capture command suppresses the complete automatic pair, including shell aliases.
@@ -190,6 +295,10 @@ export interface ClaudeSessionComponents {
   skill: boolean;
   hooks: boolean;
   reasons: { skill: string; hooks: string; configuration: 'admitted' | 'uncertain' };
+  // The failed check behind an `uncertain-configuration` result.
+  error?: string;
+  // The first settings check behind each `settings-refusal` reason, as `<source>:<check>`.
+  checks?: Partial<Record<SessionComponent, string>>;
 }
 
 export function claudeSkillHome(env: NodeJS.ProcessEnv, cwd: string): string {
@@ -212,34 +321,49 @@ export function admitClaudeSessionComponents(input: ClaudeSkillInputs, hooks = t
     hooks: false,
     reasons: { skill: 'uncertain-configuration', hooks: 'uncertain-configuration', configuration: 'uncertain' },
   };
-  const refuse = (component: 'skill' | 'hooks', reason: string) => {
+  const refuse = (component: 'skill' | 'hooks', reason: string, check?: string) => {
     result[component] = false;
     result.reasons[component] = reason;
+    if (check) result.checks = { ...result.checks, [component]: result.checks?.[component] ?? check };
+    else delete result.checks?.[component];
+  };
+  // Every uncertain result carries the check that failed, so the diagnostics log can name it.
+  const uncertain = (detail: string): never => {
+    throw new Error(detail);
   };
   try {
-    if (input.args.length > 256 || Buffer.byteLength(input.args.join('\0')) > 128 * 1024) return refused;
+    if (input.args.length > 256 || Buffer.byteLength(input.args.join('\0')) > 128 * 1024)
+      return uncertain('The Claude launch arguments exceed their size limit.');
     const platform = input.platform ?? process.platform;
     const paths = platform === 'win32' ? path.win32 : path.posix;
-    const canonical = input.canonical ?? ((file: string) => canonicalToolPath(file, platform));
+    const canonical = input.canonical ?? ((file: string) => canonicalSessionSkillInput(file, platform));
     let bytes = 0;
     let reads = 0;
     const text = (file: string) => {
-      if (++reads > 512) throw new Error('Session skill inputs exceed their read limit.');
-      const value = (input.read ?? read)(file);
+      if (++reads > 512) throw new Error(`Session skill inputs exceed their read limit at ${file}.`);
+      const value = (input.read ?? readSessionSkillInput)(file);
       if (value !== undefined) {
         bytes += Buffer.byteLength(value);
         if (Buffer.byteLength(value) > 128 * 1024 || bytes > 2 * 1024 * 1024)
-          throw new Error('Session skill inputs exceed their byte limit.');
+          throw new Error(`Session skill inputs exceed their byte limit at ${file}.`);
       }
       return value;
     };
+    // The parser's message can quote settings content, so the record names only the source.
+    const parsed = (value: string, source: string): unknown => {
+      try {
+        return JSON.parse(value);
+      } catch {
+        return uncertain(`${source} is not readable JSON.`);
+      }
+    };
     const json = (file: string): unknown => {
       const value = text(file);
-      return value === undefined ? undefined : JSON.parse(value);
+      return value === undefined ? undefined : parsed(value, file);
     };
     const names = (directory: string) => {
-      const entries = (input.list ?? list)(directory);
-      if (entries.length > 256) throw new Error('Session skill inputs exceed their directory limit.');
+      const entries = (input.list ?? listSessionSkillInput)(directory);
+      if (entries.length > 256) throw new Error(`Session skill inputs exceed their directory limit at ${directory}.`);
       return entries;
     };
     const contains = (root: string, file: string) => {
@@ -250,19 +374,22 @@ export function admitClaudeSessionComponents(input: ClaudeSkillInputs, hooks = t
     };
     for (const [key, value] of Object.entries(input.env))
       if (value && key.toUpperCase().startsWith('CLAUDE_') && /PLUGIN|MANAGED|BARE|ISOLAT|SAFE/.test(key.toUpperCase()))
-        return refused;
-    const settings: unknown[] = [];
+        return uncertain(`The environment variable ${key} changes how Claude loads plugins or settings.`);
+    const settings: { source: string; value: unknown }[] = [];
     for (let index = 0; index < input.args.length; index++) {
       const argument = input.args[index];
       const [flag, inline] = argument.split(/=(.*)/s);
       if (flag === '--disable-slash-commands') refuse('skill', 'slash-commands-disabled');
-      if (/^--(?:plugin|bare|safe|isolat|setting-sources|settings-sources|managed|config)/.test(flag)) return refused;
+      if (/^--(?:plugin|bare|safe|isolat|setting-sources|settings-sources|managed|config)/.test(flag))
+        return uncertain(`The launch argument ${flag} changes how Claude loads plugins or settings.`);
       if (flag === '--settings') {
         const value = inline ?? input.args[++index];
-        if (!value) return refused;
-        const supplied = value.trim().startsWith('{') ? JSON.parse(value) : json(paths.resolve(input.cwd, value));
-        if (supplied === undefined) return refused;
-        settings.push(supplied);
+        if (!value) return uncertain('The --settings launch argument has no value.');
+        const inlineSettings = value.trim().startsWith('{');
+        const source = inlineSettings ? '--settings' : paths.resolve(input.cwd, value);
+        const supplied = inlineSettings ? parsed(value, 'The --settings launch argument') : json(source);
+        if (supplied === undefined) return uncertain(`The --settings file ${source} is missing.`);
+        settings.push({ source, value: supplied });
       }
     }
     const managed =
@@ -272,9 +399,10 @@ export function admitClaudeSessionComponents(input: ClaudeSkillInputs, hooks = t
           ? '/Library/Application Support/ClaudeCode'
           : '/etc/claude-code';
     for (const file of ['managed-settings.json', 'managed-mcp.json'])
-      if (text(paths.join(managed, file)) !== undefined) return refused;
+      if (text(paths.join(managed, file)) !== undefined)
+        return uncertain(`Managed settings exist at ${paths.join(managed, file)}.`);
     if (names(managed).some((name) => (platform === 'win32' ? name.toLowerCase() : name) === 'managed-settings.d'))
-      return refused;
+      return uncertain(`Managed settings exist at ${paths.join(managed, 'managed-settings.d')}.`);
     const folders = new Set<string>([input.home]);
     const addProjects = (start: string) => {
       for (let folder = start; ; folder = paths.dirname(folder)) {
@@ -289,7 +417,7 @@ export function admitClaudeSessionComponents(input: ClaudeSkillInputs, hooks = t
         !input.read && fs.statSync(gitPath, { throwIfNoEntry: false })?.isDirectory() ? undefined : text(gitPath);
       if (git !== undefined) {
         const match = /^gitdir: (.+)\s*$/.exec(git);
-        if (!match) return refused;
+        if (!match) return uncertain(`${gitPath} does not name a Git directory.`);
         const directory = paths.resolve(folder, match[1].trim());
         const common = text(paths.join(directory, 'commondir'));
         if (common !== undefined) addProjects(paths.dirname(paths.resolve(directory, common.trim())));
@@ -309,12 +437,14 @@ export function admitClaudeSessionComponents(input: ClaudeSkillInputs, hooks = t
         throw new Error('A plugin hook declaration is unreadable.');
     };
     const manifest = (root: string, name?: string) => {
-      const value = json(paths.join(root, '.claude-plugin', 'plugin.json'));
+      const file = paths.join(root, '.claude-plugin', 'plugin.json');
+      const value = json(file);
       if (!skillObject(value) || typeof value.name !== 'string' || !value.name)
-        throw new Error('A plugin identity is unreadable.');
+        throw new Error(`A plugin identity is unreadable: ${file}`);
       if (value.name === 'arc-session-tools') refuse('skill', 'native-plugin');
       if (value.name === 'arc-hooks') refuse('hooks', 'native-plugin');
-      if (name && value.name !== name) throw new Error('A plugin identity does not match its registration.');
+      if (name && value.name !== name)
+        throw new Error(`A plugin identity does not match its registration ${name}: ${file}`);
       definition(paths.join(root, 'skills', 'arc-sessions', 'SKILL.md'));
       definition(paths.join(root, 'commands', 'arc-sessions.md'));
       if (value.skills !== undefined || value.commands !== undefined) refuse('skill', 'unclassified-component-path');
@@ -340,9 +470,10 @@ export function admitClaudeSessionComponents(input: ClaudeSkillInputs, hooks = t
         refuse('hooks', 'conflicting-or-unreadable-declaration');
       }
     };
+    const settingsFile = (file: string) => settings.push({ source: file, value: json(file) });
     for (const folder of folders) {
-      settings.push(json(paths.join(folder, 'settings.json')));
-      if (folder !== input.home) settings.push(json(paths.join(folder, 'settings.local.json')));
+      settingsFile(paths.join(folder, 'settings.json'));
+      if (folder !== input.home) settingsFile(paths.join(folder, 'settings.local.json'));
       definition(paths.join(folder, 'skills', 'arc-sessions', 'SKILL.md'));
       definition(paths.join(folder, 'commands', 'arc-sessions.md'));
       for (const name of names(paths.join(folder, 'skills'))) {
@@ -350,21 +481,30 @@ export function admitClaudeSessionComponents(input: ClaudeSkillInputs, hooks = t
         if (json(paths.join(root, '.claude-plugin', 'plugin.json')) !== undefined) manifest(root);
       }
     }
-    for (const value of settings) {
+    for (const { source, value } of settings) {
       if (value === undefined) continue;
-      if (!skillObject(value)) return refused;
-      if (!claudeSkillSettings(value)) refuse('skill', 'settings-refusal');
-      if (hooks && !claudeSkillSettings(value, 'hooks', platform)) refuse('hooks', 'settings-refusal');
+      if (!skillObject(value)) return uncertain(`The settings in ${source} are not an object.`);
+      const skillRefusal = claudeSkillSettingsRefusal(value);
+      if (skillRefusal) refuse('skill', 'settings-refusal', `${source}:${skillRefusal}`);
+      const hooksRefusal = hooks ? claudeSkillSettingsRefusal(value, 'hooks', platform) : undefined;
+      if (hooksRefusal) refuse('hooks', 'settings-refusal', `${source}:${hooksRefusal}`);
     }
-    const cloud = json(paths.join(input.home, 'plugins', 'known_marketplaces_claudeai.json'));
-    if (cloud !== undefined && (!skillObject(cloud) || Object.keys(cloud).length)) return refused;
-    const known = json(paths.join(input.home, 'plugins', 'known_marketplaces.json'));
-    if (known !== undefined && !skillObject(known)) return refused;
-    const registry = json(paths.join(input.home, 'plugins', 'installed_plugins.json'));
+    const cloudFile = paths.join(input.home, 'plugins', 'known_marketplaces_claudeai.json');
+    const cloud = json(cloudFile);
+    if (cloud !== undefined && (!skillObject(cloud) || Object.keys(cloud).length))
+      return uncertain(`${cloudFile} lists Claude marketplaces Arc cannot check.`);
+    const knownFile = paths.join(input.home, 'plugins', 'known_marketplaces.json');
+    const known = json(knownFile);
+    if (known !== undefined && !skillObject(known)) return uncertain(`${knownFile} is not an object.`);
+    const registryFile = paths.join(input.home, 'plugins', 'installed_plugins.json');
+    const registry = json(registryFile);
     if (registry === undefined) return result;
-    if (!skillObject(registry) || registry.version !== 2 || !skillObject(registry.plugins)) return refused;
+    if (!skillObject(registry) || registry.version !== 2 || !skillObject(registry.plugins))
+      return uncertain(`${registryFile} is not a version 2 plugin registry.`);
     for (const [id, installs] of Object.entries(registry.plugins)) {
-      if (!Array.isArray(installs) || !installs.length || id.split('@').length !== 2) return refused;
+      const installation = `The installation of plugin ${id} in ${registryFile}`;
+      if (!Array.isArray(installs) || !installs.length || id.split('@').length !== 2)
+        return uncertain(`${installation} is unreadable.`);
       const scopes = new Set<string>();
       for (const entry of installs) {
         if (
@@ -375,22 +515,27 @@ export function admitClaudeSessionComponents(input: ClaudeSkillInputs, hooks = t
           typeof entry.installPath !== 'string' ||
           !paths.isAbsolute(entry.installPath)
         )
-          return refused;
+          return uncertain(`${installation} is unreadable.`);
         const scopeKey = JSON.stringify([entry.scope, entry.projectPath]);
-        if (scopes.has(scopeKey)) return refused;
+        if (scopes.has(scopeKey)) return uncertain(`${installation} repeats a scope.`);
         scopes.add(scopeKey);
         if (entry.scope !== 'user') {
-          if (typeof entry.projectPath !== 'string' || !paths.isAbsolute(entry.projectPath)) return refused;
+          if (typeof entry.projectPath !== 'string' || !paths.isAbsolute(entry.projectPath))
+            return uncertain(`${installation} has an unreadable project path.`);
           if (!contains(entry.projectPath, input.cwd)) continue;
         }
         const marketplace = skillObject(known) ? known[id.split('@')[1]] : undefined;
-        if (!skillObject(marketplace) || !skillObject(marketplace.source)) return refused;
+        if (!skillObject(marketplace) || !skillObject(marketplace.source))
+          return uncertain(`The marketplace of plugin ${id} is missing from ${knownFile}.`);
         const source = marketplace.source;
         let root = entry.installPath;
         if (source.source === 'directory') {
-          if (typeof source.path !== 'string' || !paths.isAbsolute(source.path)) return refused;
-          const catalog = json(paths.join(source.path, '.claude-plugin', 'marketplace.json'));
-          if (!skillObject(catalog) || !Array.isArray(catalog.plugins)) return refused;
+          if (typeof source.path !== 'string' || !paths.isAbsolute(source.path))
+            return uncertain(`The marketplace of plugin ${id} has an unreadable directory.`);
+          const catalogFile = paths.join(source.path, '.claude-plugin', 'marketplace.json');
+          const catalog = json(catalogFile);
+          if (!skillObject(catalog) || !Array.isArray(catalog.plugins))
+            return uncertain(`${catalogFile} has no readable plugin list.`);
           const matches = catalog.plugins.filter((plugin) => skillObject(plugin) && plugin.name === id.split('@')[0]);
           if (
             matches.length !== 1 ||
@@ -398,19 +543,23 @@ export function admitClaudeSessionComponents(input: ClaudeSkillInputs, hooks = t
             typeof matches[0].source !== 'string' ||
             paths.isAbsolute(matches[0].source)
           )
-            return refused;
+            return uncertain(`${catalogFile} does not list plugin ${id} once with a relative source.`);
           root = paths.resolve(source.path, matches[0].source);
-          if (!contains(source.path, root)) return refused;
+          if (!contains(source.path, root))
+            return uncertain(`The source of plugin ${id} is outside its marketplace directory.`);
         } else if (source.source === 'git') {
-          if (typeof source.url !== 'string' || !source.url) return refused;
+          if (typeof source.url !== 'string' || !source.url)
+            return uncertain(`The marketplace of plugin ${id} has no Git URL.`);
         } else if (source.source === 'github') {
-          if (typeof source.repo !== 'string' || !source.repo) return refused;
-        } else return refused;
+          if (typeof source.repo !== 'string' || !source.repo)
+            return uncertain(`The marketplace of plugin ${id} has no GitHub repository.`);
+        } else return uncertain(`The marketplace of plugin ${id} has an unsupported source type.`);
         manifest(root, id.split('@')[0]);
       }
     }
     return result;
-  } catch {
+  } catch (error) {
+    refused.error = errorText(error);
     return refused;
   }
 }
@@ -455,23 +604,38 @@ export function codexSkillConfiguration(
   release: SessionSkillRelease,
   input: { platform?: NodeJS.Platform; canonical?(file: string): string } = {},
 ): boolean {
+  return codexSkillConfigurationRefusal(value, requirements, release, input) === undefined;
+}
+
+// Names the first configuration check that refuses the skill, or returns nothing when every check admits it.
+export function codexSkillConfigurationRefusal(
+  value: unknown,
+  requirements: unknown,
+  release: SessionSkillRelease,
+  input: { platform?: NodeJS.Platform; canonical?(file: string): string } = {},
+): string | undefined {
+  class Refusal extends Error {
+    constructor(readonly check: string) {
+      super(check);
+    }
+  }
   try {
     const platform = input.platform ?? process.platform;
     const paths = platform === 'win32' ? path.win32 : path.posix;
-    const canonicalPath = input.canonical ?? ((file: string) => canonicalToolPath(file, platform));
+    const canonicalPath = input.canonical ?? ((file: string) => canonicalSessionSkillInput(file, platform));
+    if (!skillObject(requirements)) return 'malformed-requirements';
+    if (requirements.requirements !== null) return 'managed-requirements';
     if (
-      !skillObject(requirements) ||
-      requirements.requirements !== null ||
       !skillObject(value) ||
       !skillObject(value.config) ||
       !skillObject(value.origins) ||
       !Array.isArray(value.layers)
     )
-      return false;
+      return 'malformed-configuration';
     const configured = (config: Record<string, unknown>) => {
       if (config.skills === undefined || config.skills === null) return [];
       if (!skillObject(config.skills) || !Array.isArray(config.skills.config))
-        throw new Error('Unreadable skill configuration.');
+        throw new Refusal('malformed-skill-entry');
       const entries = config.skills.config;
       const unique = new Set<string>();
       for (const entry of entries)
@@ -481,10 +645,10 @@ export function codexSkillConfiguration(
           !paths.isAbsolute(entry.path) ||
           typeof entry.enabled !== 'boolean'
         )
-          throw new Error('Unreadable skill configuration.');
+          throw new Refusal('malformed-skill-entry');
         else {
           const canonical = canonicalPath(entry.path);
-          if (unique.has(canonical)) throw new Error('Ambiguous skill configuration.');
+          if (unique.has(canonical)) throw new Refusal('ambiguous-skill-entry');
           unique.add(canonical);
         }
       return entries as { path: string; enabled: boolean }[];
@@ -494,13 +658,14 @@ export function codexSkillConfiguration(
         !skillObject(layer) ||
         !skillObject(layer.name) ||
         typeof layer.version !== 'string' ||
-        !skillObject(layer.config) ||
-        layer.disabledReason
+        !skillObject(layer.config)
       )
-        return false;
+        return 'malformed-layer';
+      if (layer.disabledReason) return 'disabled-layer';
       const type = layer.name.type;
-      if (!['packagedDefaults', 'system', 'user', 'project', 'sessionFlags'].includes(String(type))) return false;
-      if (type === 'system' && Object.keys(layer.config).length) return false;
+      if (!['packagedDefaults', 'system', 'user', 'project', 'sessionFlags'].includes(String(type)))
+        return 'unsupported-layer';
+      if (type === 'system' && Object.keys(layer.config).length) return 'managed-layer';
       configured(layer.config);
     }
     const entries = configured(value.config);
@@ -511,26 +676,26 @@ export function codexSkillConfiguration(
         typeof origin.version !== 'string' ||
         !['packagedDefaults', 'system', 'user', 'project', 'sessionFlags'].includes(String(origin.name.type))
       )
-        return false;
+        return 'unsupported-origin';
     const unique = new Set<string>();
     for (const entry of entries) {
       const canonical = canonicalPath(entry.path);
-      if (unique.has(canonical)) return false;
+      if (unique.has(canonical)) return 'ambiguous-skill-entry';
       unique.add(canonical);
       if (entry.enabled) continue;
-      if (canonical === canonicalPath(release.codexDefinition)) return false;
-      const definition = read(canonical);
+      if (canonical === canonicalPath(release.codexDefinition)) return 'disabled-skill';
+      const definition = readSessionSkillInput(canonical);
       const header = definition && /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(definition)?.[1];
       const names = header ? [...header.matchAll(/^name:[ \t]*([a-zA-Z0-9][a-zA-Z0-9_-]*)[ \t]*\r?$/gm)] : [];
       if (names.length === 1 && names[0][1].toLowerCase() !== 'arc-sessions') continue;
       // A disabled path from a retained release must suppress later automatic releases too.
       const ancestor = path.resolve(path.dirname(canonical), '../..');
       const retained = sessionSkillRelease(ancestor);
-      if (canonical === canonicalToolPath(retained.codexDefinition)) return false;
-      return false;
+      if (canonical === canonicalToolPath(retained.codexDefinition)) return 'disabled-skill';
+      return 'disabled-skill';
     }
-    return true;
-  } catch {
-    return false;
+    return undefined;
+  } catch (error) {
+    return error instanceof Refusal ? error.check : 'unreadable-skill-entry';
   }
 }

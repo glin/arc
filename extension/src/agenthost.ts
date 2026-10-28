@@ -76,7 +76,11 @@ import { QuestionRecovery, questionIdentity, type RecoveredQuestion } from './qu
 import {
   admitClaudeSessionComponents,
   claudeSkillHome,
+  errorText,
+  reportWithheld,
   retainedSessionSkill,
+  type ClaudeSessionComponents,
+  type SessionComponentsWithheld,
   type SessionSkillSelection,
   type SessionSkillRelease,
 } from './sessionskills';
@@ -429,6 +433,7 @@ export function claudePlan(
     release?: SessionSkillRelease;
     components?: { skill: boolean; hooks: boolean };
     refresh?: () => boolean;
+    withheld?: (record: SessionComponentsWithheld) => void;
     environment: NodeJS.ProcessEnv;
     args: string[];
   },
@@ -445,9 +450,22 @@ export function claudePlan(
             const args = [...launch.leadingArgs, ...spawnArgs(options, env)];
             const selected = launch.sessionSkills!.current();
             const runtime = sessionHookRuntime();
-            const admission = (hooks = true) => {
+            // The running child records only its first refusal, whether this plan or the wire finds it.
+            let runningRecorded = false;
+            const withheld = (record: SessionComponentsWithheld) => {
+              if (record.stage === 'running') {
+                if (runningRecorded) return;
+                runningRecorded = true;
+              }
+              launch.sessionSkills?.withheld?.({ ...record, cwd: options.cwd });
+            };
+            const admission = (hooks = true): ClaudeSessionComponents => {
               if (!selected || !retainedSessionSkill(selected, launch.sessionSkills!))
-                return { skill: false, hooks: false };
+                return {
+                  skill: false,
+                  hooks: false,
+                  reasons: { skill: 'unavailable-release', hooks: 'unavailable-release', configuration: 'admitted' },
+                };
               const admitted = admitClaudeSessionComponents(
                 { release: selected, cwd: options.cwd, home, env, args },
                 hooks,
@@ -461,23 +479,51 @@ export function claudePlan(
                       ? 'unsupported-node-environment'
                       : 'unavailable-hook-plugin';
                   } else runtime(hookEnvironment, options.cwd, process.platform);
-                } catch {
+                } catch (error) {
                   admitted.hooks = false;
                   admitted.reasons.hooks = 'unsupported-node-runtime';
+                  admitted.error = errorText(error);
                 }
               }
               return admitted;
             };
+            // Names the distinct settings checks behind the withheld components, like the wire's settings refusal.
+            const settingsCheck = (result: ClaudeSessionComponents, skill: boolean, hooks: boolean) =>
+              [...new Set([skill && result.checks?.skill, hooks && result.checks?.hooks].filter(Boolean))].join(' ');
             const components = admission();
+            reportWithheld(withheld, {
+              provider: 'claude',
+              stage: 'launch',
+              withheld: {
+                skill: !components.skill && components.reasons.skill,
+                hooks: !components.hooks && components.reasons.hooks,
+              },
+              error: components.error,
+              check: settingsCheck(components, !components.skill, !components.hooks),
+            });
+            // The running child calls this until its first input and stops after one refusal.
             const refresh = () => {
               const current = admission(components.hooks);
-              return (!components.skill || current.skill) && (!components.hooks || current.hooks);
+              const kept = (!components.skill || current.skill) && (!components.hooks || current.hooks);
+              if (!kept)
+                reportWithheld(withheld, {
+                  provider: 'claude',
+                  stage: 'running',
+                  withheld: {
+                    skill: components.skill && !current.skill && current.reasons.skill,
+                    hooks: components.hooks && !current.hooks && current.reasons.hooks,
+                  },
+                  error: current.error,
+                  check: settingsCheck(current, components.skill && !current.skill, components.hooks && !current.hooks),
+                });
+              return kept;
             };
             const release = components.skill || components.hooks ? selected : undefined;
             return claudePlan({ ...launch, env: { ...launch.env, CLAUDE_CONFIG_DIR: home } }, options, {
               release,
               components,
               refresh,
+              withheld,
               environment,
               args,
             });
@@ -503,7 +549,12 @@ export function claudePlan(
         emit,
         sessionId: options.resume ?? options.sessionId,
         sessionSkills: prepared?.release
-          ? { release: prepared.release, refresh: prepared.refresh!, ...prepared.components }
+          ? {
+              release: prepared.release,
+              refresh: prepared.refresh!,
+              ...prepared.components,
+              withheld: prepared.withheld,
+            }
           : undefined,
       });
       return {
@@ -599,6 +650,19 @@ export interface CodexPlanOptions {
   sandbox?: SandboxMode;
 }
 
+// Reads the release for a Codex child and records a child that starts without one.
+function codexSessionRelease(launch: Launch, cwd: string): SessionSkillRelease | undefined {
+  const release = launch.sessionSkills!.current();
+  if (!release)
+    reportWithheld(launch.sessionSkills!.withheld, {
+      provider: 'codex',
+      stage: 'launch',
+      withheld: { skill: 'unavailable-release' },
+      cwd,
+    });
+  return release;
+}
+
 // Starts one Codex app-server child per session through the resolved launch executable and arguments.
 // Per-session children keep thread ownership in the host's session map.
 export function codexPlan(
@@ -615,7 +679,7 @@ export function codexPlan(
       ? {
           prepare: () =>
             codexPlan(launch, options, {
-              release: launch.sessionSkills!.current(),
+              release: codexSessionRelease(launch, options.cwd),
               environment: { ...process.env },
             }),
         }
@@ -635,7 +699,11 @@ export function codexPlan(
         clientInfo: options.clientInfo,
         cwd: options.cwd,
         sessionSkills: prepared?.release
-          ? { release: prepared.release, refresh: () => retainedSessionSkill(prepared.release!, launch.sessionSkills!) }
+          ? {
+              release: prepared.release,
+              refresh: () => retainedSessionSkill(prepared.release!, launch.sessionSkills!),
+              withheld: (record) => launch.sessionSkills?.withheld?.({ ...record, cwd: options.cwd }),
+            }
           : undefined,
       });
       return {
@@ -775,7 +843,7 @@ export function codexIdlePlan(
       ? {
           prepare: () =>
             codexIdlePlan(launch, options, {
-              release: launch.sessionSkills!.current(),
+              release: codexSessionRelease(launch, options.cwd),
               environment: { ...process.env },
             }),
         }
@@ -794,7 +862,11 @@ export function codexIdlePlan(
         clientInfo: options.clientInfo,
         cwd: options.cwd,
         sessionSkills: prepared?.release
-          ? { release: prepared.release, refresh: () => retainedSessionSkill(prepared.release!, launch.sessionSkills!) }
+          ? {
+              release: prepared.release,
+              refresh: () => retainedSessionSkill(prepared.release!, launch.sessionSkills!),
+              withheld: (record) => launch.sessionSkills?.withheld?.({ ...record, cwd: options.cwd }),
+            }
           : undefined,
       });
       return {

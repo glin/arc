@@ -5,7 +5,14 @@ import { SessionNameUncertain } from './sessionrename';
 import { promptToken } from './domain/composer-editing';
 import { compareVersion, parseVersion } from './domain/version';
 import { canonicalToolPath } from './toolownership';
-import { codexRawSkills, codexSkillConfiguration, type NativeSkill, type SessionSkillRelease } from './sessionskills';
+import {
+  codexRawSkills,
+  codexSkillConfigurationRefusal,
+  reportWithheld,
+  type NativeSkill,
+  type SessionComponentsWithheld,
+  type SessionSkillRelease,
+} from './sessionskills';
 // Adapts Codex app-server messages to the shared agent wire events.
 // JSON-RPC messages travel over stdio as one object per line without the jsonrpc field.
 // Responses have id only, notifications have method only, and server requests have both.
@@ -100,7 +107,11 @@ export interface ClientInfo {
 }
 
 export interface CodexWireOptions {
-  sessionSkills?: { release: SessionSkillRelease; refresh(): boolean };
+  sessionSkills?: {
+    release: SessionSkillRelease;
+    refresh(): boolean;
+    withheld?(record: SessionComponentsWithheld): void;
+  };
   send(line: string): void;
   emit(event: WireEvent): void;
   clientInfo: ClientInfo;
@@ -433,6 +444,8 @@ export class CodexWire {
   private optionalNativeExact = false;
   private optionalRootsAttempted = false;
   private optionalFailure: Error | undefined;
+  // Refusals already recorded for this child. An admission clears them.
+  private readonly withheldReasons = new Set<string>();
 
   constructor(options: CodexWireOptions) {
     this.sessionSkills = options.sessionSkills;
@@ -590,7 +603,10 @@ export class CodexWire {
   private async sessionSkillCatalog(deadline: number): Promise<Json> {
     if (this.optionalFailure) throw this.optionalFailure;
     this.optionalAdmitted = false;
+    // The provider request in flight, which names a failed request in the diagnostics log.
+    let pending: string | undefined;
     const optionalRequest = async (method: string, params: Json) => {
+      pending = method;
       const remaining = deadline - performance.now();
       if (remaining <= 0) return Promise.reject(new NoAnswer('Codex did not finish loading its skills in time.'));
       const result = await this.request(method, params, undefined, undefined, remaining, true);
@@ -606,10 +622,41 @@ export class CodexWire {
     const matches = (skills: NativeSkill[]) => skills.filter((skill) => skill.name.toLowerCase() === 'arc-sessions');
     const exact = (skill: NativeSkill) =>
       canonicalToolPath(skill.path) === canonicalToolPath(selected.release.codexDefinition);
-    const settings = async () => {
+    type Refusal = { reason: string; check?: string };
+    // Returns the reason the settings refuse the skill, or nothing when they admit it.
+    const settings = async (): Promise<Refusal | undefined> => {
       const config = await optionalRequest('config/read', { cwd: this.cwd, includeLayers: true });
       const requirements = await optionalRequest('configRequirements/read', {});
-      return selected.refresh() && codexSkillConfiguration(config, requirements, selected.release);
+      if (!selected.refresh()) return { reason: 'unavailable-release' };
+      const check = codexSkillConfigurationRefusal(config, requirements, selected.release);
+      return check ? { reason: 'settings-refusal', check } : undefined;
+    };
+    // Records each distinct refusal once. A provider's error text can carry settings or credentials, so the record
+    // keeps Arc's own message with the failed method and error code.
+    const withheld = (refusal: Refusal, failure?: unknown) => {
+      if (this.closed) return;
+      const key = JSON.stringify([refusal.reason, refusal.check]);
+      if (this.withheldReasons.has(key)) return;
+      this.withheldReasons.add(key);
+      const failed =
+        failure === undefined
+          ? {}
+          : failure instanceof RequestRefused
+            ? {
+                error: 'Codex refused a skill request.',
+                method: pending,
+                code: typeof failure.code === 'number' || typeof failure.code === 'string' ? failure.code : undefined,
+              }
+            : failure instanceof NoAnswer
+              ? { error: 'Codex did not answer a skill request in time.', method: pending }
+              : { error: 'Codex returned an unexpected skill response.', method: pending };
+      reportWithheld(selected.withheld, {
+        provider: 'codex',
+        stage: 'running',
+        withheld: { skill: refusal.reason },
+        check: refusal.check,
+        ...failed,
+      });
     };
     const withdraw = async () => {
       if (!this.optionalRoots) return;
@@ -623,7 +670,10 @@ export class CodexWire {
       this.optionalNativeExact =
         !this.optionalRootsAttempted && matches(raw).some((skill) => exact(skill) && skill.enabled);
       const conflicts = matches(raw).some((skill) => !this.optionalRoots || !exact(skill) || !skill.enabled);
-      if (conflicts || !(await settings())) {
+      const refused = conflicts ? { reason: 'conflicting-skill' } : await settings();
+      if (refused) {
+        // A preserved native link to the exact definition still supplies the skill.
+        if (!this.optionalNativeExact) withheld(refused);
         await withdraw();
         return this.optionalRoots ? result : await listing();
       }
@@ -643,17 +693,27 @@ export class CodexWire {
       result = await listing();
       raw = codexRawSkills(result, this.cwd);
       const supplied = matches(raw);
-      if (supplied.length !== 1 || !exact(supplied[0]) || !supplied[0].enabled || !(await settings())) {
+      const missing =
+        supplied.length > 1
+          ? { reason: 'conflicting-skill' }
+          : supplied.length !== 1 || !exact(supplied[0]) || !supplied[0].enabled
+            ? { reason: 'skill-not-supplied' }
+            : await settings();
+      if (missing) {
+        withheld(missing);
         await withdraw();
         return await listing();
       }
       this.optionalAdmitted = true;
+      this.withheldReasons.clear();
       return result;
     } catch (error) {
       if (error instanceof RequestRefused && error.code === -32601 && !this.optionalRoots) {
         this.optionalUnsupported = true;
+        withheld({ reason: 'unsupported-registration' }, error);
         return this.request('skills/list', { cwds: [this.cwd], forceReload: true });
       }
+      withheld({ reason: error instanceof NoAnswer ? 'deadline' : 'uncertain-registration' }, error);
       this.optionalFailure = error instanceof Error ? error : new Error(String(error));
       this.skills.clear();
       this.emit({ kind: 'commands', commands: [], optionalOnly: true });

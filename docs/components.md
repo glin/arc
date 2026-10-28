@@ -10,7 +10,7 @@ Paths are relative to `extension/src/`. [Architecture](architecture.md) owns pac
 | `bundledsetup.ts` | Source-build entry for the shared command and snapshot installer | no |
 | `toolownership.ts` | Canonical paths, redirected ancestor admission, exclusive setup ownership and wrapped uncertainty | no |
 | `toolpath.ts` | Private terminal environment lifetime, PATH admission, current child CLI selection, and canonical session skill release selection | no |
-| `sessionskills.ts` | Separate read-only checks for session skills and snapshot hooks, bounded settings and plugin reads, retained release identity, and raw Codex skill validation | no |
+| `sessionskills.ts` | Separate read-only checks for session skills and snapshot hooks, bounded settings and plugin reads, retained release identity, raw Codex skill validation, and the withheld-component record with its deferred diagnostics log writer | no |
 | `claudeplugin.ts` | Consented Claude plugin detection, local source admission, bounded subprocess lifetime, scope and byte checks, and configuration ownership | no |
 | `extension.ts` | Activation, local window channel lifetime, watcher registration, commands, editor integration, and the agent host | yes |
 | `configwatch.ts` | Non-recursive applied-defaults configuration watches for queried folders and their ancestors, with directory checks and watch lifecycle | no |

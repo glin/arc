@@ -7,7 +7,12 @@ import { unavailableDefaults, type AppliedDefaults } from './view/model-picks';
 
 import * as fs from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { claudeNativeSkillSettings, type SessionSkillRelease } from './sessionskills';
+import {
+  claudeNativeSkillSettingsRefusal,
+  reportWithheld,
+  type SessionComponentsWithheld,
+  type SessionSkillRelease,
+} from './sessionskills';
 
 // Re-export the shared `agentwire.ts` types for Claude protocol callers.
 export {
@@ -519,7 +524,13 @@ function replayedText(m: Json, text: string): boolean {
 }
 
 export interface WireOptions {
-  sessionSkills?: { release: SessionSkillRelease; refresh(): boolean; skill?: boolean; hooks?: boolean };
+  sessionSkills?: {
+    release: SessionSkillRelease;
+    refresh(): boolean;
+    skill?: boolean;
+    hooks?: boolean;
+    withheld?(record: SessionComponentsWithheld): void;
+  };
   now?(): number;
   // Receives each outbound JSON line with its terminating newline.
   send(line: string): void;
@@ -662,12 +673,22 @@ export class ClaudeWire {
         Number(version[1]) !== 2 ||
         Number(version[2]) < 1 ||
         (Number(version[2]) === 1 && Number(version[3]) < 310)
-      )
-        throw new Error("This Claude Code version cannot load Arc's skill or file snapshots.");
+      ) {
+        const error = new Error("This Claude Code version cannot load Arc's skill or file snapshots.");
+        this.withheld(
+          'unsupported-claude-version',
+          `${error.message} Reported version: ${String(response.claude_code_version)}`,
+        );
+        throw error;
+      }
       await this.admitSessionSkill();
       const matches = commands.filter((command) => command.name === 'arc-session-tools:arc-sessions');
       if (this.sessionSkills.skill !== false) {
-        if (matches.length !== 1) throw new Error('Claude Code did not supply the Arc session skill.');
+        if (matches.length !== 1) {
+          const error = new Error('Claude Code did not supply the Arc session skill.');
+          this.withheld('skill-not-supplied', `${error.message} Matching commands: ${matches.length}`);
+          throw error;
+        }
         matches[0].path = this.sessionSkills.release.claudeDefinition;
         matches[0].sessionSkillRelease = this.sessionSkills.release.contentId;
       }
@@ -676,16 +697,42 @@ export class ClaudeWire {
     return commands;
   }
 
+  // Records one refusal for every component this child loaded.
+  private withheld(reason: string, error?: string, method?: string): void {
+    reportWithheld(this.sessionSkills?.withheld, {
+      provider: 'claude',
+      stage: 'running',
+      withheld: { skill: this.sessionSkills?.skill !== false && reason, hooks: !!this.sessionSkills?.hooks && reason },
+      error,
+      method,
+    });
+  }
+
+  // The first refusal is recorded once. Later calls rethrow it without another check.
   private async admitSessionSkill(): Promise<void> {
     if (this.skillFailure) throw this.skillFailure;
     try {
-      const settings = await this.request({ subtype: 'get_settings' });
-      if (
-        (this.sessionSkills?.skill !== false && !claudeNativeSkillSettings(settings)) ||
-        (this.sessionSkills?.hooks && !claudeNativeSkillSettings(settings, 'hooks')) ||
-        !this.sessionSkills?.refresh()
-      )
-        throw new Error("Claude Code cannot load Arc's skill or file snapshots with these settings.");
+      let settings: unknown;
+      try {
+        settings = await this.request({ subtype: 'get_settings' });
+      } catch (error) {
+        // The child's error text can quote settings content, so the record keeps only Arc's message.
+        this.withheld('settings-unreadable', 'Claude Code did not return its settings.', 'get_settings');
+        throw error;
+      }
+      const skill = this.sessionSkills?.skill !== false ? claudeNativeSkillSettingsRefusal(settings) : undefined;
+      const hooks = this.sessionSkills?.hooks ? claudeNativeSkillSettingsRefusal(settings, 'hooks') : undefined;
+      const refusal = "Claude Code cannot load Arc's skill or file snapshots with these settings.";
+      if (skill || hooks)
+        reportWithheld(this.sessionSkills?.withheld, {
+          provider: 'claude',
+          stage: 'running',
+          withheld: { skill: !!skill && 'settings-refusal', hooks: !!hooks && 'settings-refusal' },
+          error: refusal,
+          check: [...new Set([skill, hooks].filter(Boolean))].join(' '),
+        });
+      // The plan's refresh records its own refusal with the check that failed.
+      if (skill || hooks || !this.sessionSkills?.refresh()) throw new Error(refusal);
     } catch (error) {
       this.skillFailure = error instanceof Error ? error : new Error(String(error));
       this.emit({ kind: 'commands', commands: [], optionalOnly: true });

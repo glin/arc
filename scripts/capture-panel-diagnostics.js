@@ -313,6 +313,50 @@ async function captureDiagnostics(options, dependencies = {}) {
   if (!before || !after) findings.push('Process snapshots are unavailable. See capture-errors.txt.');
   if (!findings.length)
     findings.push('No configured thresholds were reached. Read the recorded counters before attributing a slowdown.');
+  // Each editor window writes its own diagnostics log. The capture copies the withheld session tool lines of every
+  // kept log, then the last whole lines of the newest log. Each copy keeps its newest whole lines within its bound.
+  const diagnosticsLog = optional('diagnostics log', () => {
+    const directory = path.join(environment.ARC_HOME || path.join(home, '.arc'), 'logs');
+    if (!fs.existsSync(directory)) return null;
+    const names = fs
+      .readdirSync(directory)
+      .filter((name) => /^arc-\d{8}-\d{6}-\d+\.jsonl$/.test(name))
+      .sort();
+    if (!names.length) return null;
+    const withheld = [];
+    for (const name of names)
+      for (const line of fs.readFileSync(path.join(directory, name), 'utf8').split('\n'))
+        if (line.includes('"event":"sessionComponentsWithheld"')) withheld.push(`${line}\n`);
+    let withheldBytes = 0;
+    let first = withheld.length;
+    while (
+      first > 0 &&
+      withheldBytes + Buffer.byteLength(withheld[first - 1]) <= (dependencies.withheldBytes ?? 256 * 1024)
+    )
+      withheldBytes += Buffer.byteLength(withheld[--first]);
+    write('session-components-withheld.jsonl', withheld.slice(first).join(''));
+    const file = path.join(directory, names.at(-1));
+    const bytes = fs.statSync(file).size;
+    const start = Math.max(0, bytes - (dependencies.logBytes ?? 1024 * 1024));
+    const buffer = Buffer.alloc(bytes - start);
+    const fd = fs.openSync(file, 'r');
+    let count;
+    try {
+      count = fs.readSync(fd, buffer, 0, buffer.length, start);
+    } finally {
+      fs.closeSync(fd);
+    }
+    let text = buffer.subarray(0, count).toString('utf8');
+    if (start > 0) text = text.slice(text.indexOf('\n') + 1);
+    write('diagnostics-log.jsonl', text);
+    return {
+      path: file,
+      bytes,
+      copiedBytes: Buffer.byteLength(text),
+      withheldLines: withheld.length - first,
+      withheldBytes,
+    };
+  });
   write('findings.txt', `${findings.join('\n')}\n`);
   write('panel-settings.txt', settings.join('\n'));
   write('manifest.json', {
@@ -335,6 +379,7 @@ async function captureDiagnostics(options, dependencies = {}) {
     volume,
     agentsViewDatabase: metadata(path.join(home, '.agentsview', 'sessions.db')),
     extensionStorageFiles: storageFiles,
+    diagnosticsLog,
     captureErrors: errors,
   });
   write('capture-errors.txt', errors.join('\n'));

@@ -35,6 +35,7 @@ import { STORED_STATE_KEYS } from './identity';
 import { nodeGitRunner } from './gitcommits';
 import { ProjectSetupStore, SetupProjects } from './projectsetups';
 import { settingName } from './settings';
+import { sessionComponentsDiagnostics, type SessionComponentsWithheld } from './sessionskills';
 import { uriStringsFromCommand } from './droppeduris';
 import {
   AgentHost,
@@ -194,9 +195,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push(releaseCollection);
   let privatePreparation = privateTools.refresh();
   void privatePreparation.then(releaseCollection.collect);
+  // The panel supplies the diagnostics log when it registers.
+  let sessionDiagnostics: ((record: SessionComponentsWithheld) => void) | undefined;
   const sessionSkillSelection = {
     admitted: () => vscode.workspace.isTrusted && !vscode.env.remoteName,
     current: () => (vscode.workspace.isTrusted && !vscode.env.remoteName ? privateTools.sessionSkills() : undefined),
+    withheld: (record: SessionComponentsWithheld) => sessionDiagnostics?.(record),
   };
   let invalidatePreparedDefaults: (() => void) | undefined;
   const spawner = arcCliSpawner(() => privateTools.current(channel?.windowId ?? null));
@@ -245,6 +249,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // Register the panel that displays recorded turns.
   let snapshotOffer: ClaudePluginOffer | undefined;
   const panel = registerPanel(context, root, workspaceCache, activationAt, (diagnostics) => {
+    sessionDiagnostics = sessionComponentsDiagnostics(diagnostics);
     const sink: WindowTransportSink = (event, record) => diagnostics.warn(event, record);
     channel?.setDiagnostics(sink);
     if (channelConstructionError)

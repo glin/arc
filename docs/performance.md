@@ -22,6 +22,8 @@ Keep active windows and sessions running during script captures.
 
 Collect additional snapshots or profiles only for an explicit request or a question the system capture cannot answer.
 
+Each editor window writes its own diagnostics log in `${ARC_HOME:-~/.arc}/logs`. Each capture copies the `sessionComponentsWithheld` lines of every kept log, up to the newest 256 KiB of whole lines, to `session-components-withheld.jsonl`. These lines record session tools that Arc withholds from an agent process. The capture also copies the last whole lines of the newest log, up to 1 MiB, to `diagnostics-log.jsonl`.
+
 `scripts/capture-panel-diagnostics.js` owns output files and manifest fields. The default output directory sits under the system temporary directory. Pass `--output-directory <path>` to retain a capture inside its investigation plan. The directory must not already exist. These local files can contain sensitive command-line arguments and paths. Review them before sharing.
 
 Windows delegates to `scripts/capture-panel-diagnostics.ps1`. Its output option is `-OutputDirectory`. The quota snapshot uses the Windows default of 10000 only when the registry value is absent. An invalid counter sample retains its status and has no value. Do not sum process counters to infer whole-machine CPU utilization.

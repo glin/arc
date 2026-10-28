@@ -6642,6 +6642,7 @@ test('channel construction failure leaves panel activation and provider registra
   const scope = {
     context: { subscriptions: [] as unknown[] },
     performance,
+    sessionComponentsDiagnostics: () => () => {},
     QuestionEvidenceReader: function () {
       return {};
     },

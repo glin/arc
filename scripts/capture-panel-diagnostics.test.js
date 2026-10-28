@@ -75,11 +75,31 @@ for (const platform of ['linux', 'darwin']) {
     const user = path.join(configRoot, 'Code', 'User');
     fs.mkdirSync(user, { recursive: true });
     fs.writeFileSync(path.join(user, 'settings.json'), '{\n"arc.maxSessions": 3\n}');
+    const logs = path.join(f.root, '.arc', 'logs');
+    fs.mkdirSync(logs, { recursive: true });
+    // Each window writes its own log.
+    const withheld = (pid) => `{"event":"sessionComponentsWithheld","pid":${pid}}\n`;
+    fs.writeFileSync(path.join(logs, 'arc-20261027-090000-1.jsonl'), withheld(1));
+    fs.writeFileSync(path.join(logs, 'arc-20261027-100000-2.jsonl'), `{"event":"older"}\n${withheld(2)}`);
+    fs.writeFileSync(path.join(logs, 'arc-20261027-110000-3.jsonl'), `${withheld(3)}{"event":"last"}\n`);
     await captureDiagnostics(
       { samples: 2, interval: 1, scenario: 'scrolling', outputDirectory: f.output },
-      f.dependencies,
+      { ...f.dependencies, logBytes: 30, withheldBytes: 92 },
     );
     const json = (name) => JSON.parse(fs.readFileSync(path.join(f.output, name), 'utf8'));
+    // The capture copies the newest withheld lines of every log and the last whole lines of the newest log.
+    assert.equal(
+      fs.readFileSync(path.join(f.output, 'session-components-withheld.jsonl'), 'utf8'),
+      withheld(2) + withheld(3),
+    );
+    assert.equal(fs.readFileSync(path.join(f.output, 'diagnostics-log.jsonl'), 'utf8'), '{"event":"last"}\n');
+    assert.deepEqual(json('manifest.json').diagnosticsLog, {
+      path: path.join(logs, 'arc-20261027-110000-3.jsonl'),
+      bytes: 63,
+      copiedBytes: 17,
+      withheldLines: 2,
+      withheldBytes: 92,
+    });
     assert.equal(json('manifest.json').platform, platform);
     assert.equal(json('manifest.json').windowsDiagnostics, 'not-applicable');
     assert.equal(json('manifest.json').scenario, 'scrolling');
