@@ -13,6 +13,7 @@ import {
   commitGroupName,
   commitHeadFact,
   groupCommitRows,
+  NO_BREAK_SPACE,
   openMakerSession,
   type CommitGrouping,
   type CommitGroupView,
@@ -686,21 +687,25 @@ export function CommitRow({ cardKey, commit, post }: { cardKey: string; commit: 
 // Merge-arrival tooltips and hidden text include the time and hash.
 function CommitGroupHead({ group }: { group: CommitGroupView }) {
   const arrival = group.arrival;
-  return h(
-    'div',
-    { class: 'commitgrouphead' },
-    inlineText([
-      group.repository.own ? null : h('span', { class: 'commitgrouprepo' }, `${group.repository.name} ·`),
+  return h('div', { class: 'commitgrouphead' }, [
+    ...inlineText([
+      group.repository.own
+        ? null
+        : h('span', { class: 'commitgrouprepo' }, `${group.repository.name}${NO_BREAK_SPACE}·`),
       h('span', { class: 'commitgroupname' }, commitGroupName(group)),
-      group.where ? h('span', { class: 'commitgroupfact' }, `· ${group.where}`) : null,
-      arrival
-        ? h('span', { class: 'commitgroupfact', title: arrivalTitle(arrival), 'data-arrival': group.key }, [
+    ]),
+    // A no-break space leads each "·" fact, so a line never starts on one.
+    ...(group.where ? [NO_BREAK_SPACE, h('span', { class: 'commitgroupfact' }, `· ${group.where}`)] : []),
+    ...(arrival
+      ? [
+          NO_BREAK_SPACE,
+          h('span', { class: 'commitgroupfact', title: arrivalTitle(arrival), 'data-arrival': group.key }, [
             ARRIVAL_WORD,
             h('span', { class: 'sr-only' }, arrivalSpoken(arrival)),
-          ])
-        : null,
-    ]),
-  );
+          ]),
+        ]
+      : []),
+  ]);
 }
 
 // Draw each commit group's heading and rows in one returned tree.

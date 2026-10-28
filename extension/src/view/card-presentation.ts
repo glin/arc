@@ -130,17 +130,22 @@ export function cardPrint(card: object): string {
   );
 }
 
+// A no-break space joins every "·" of the Commits heading to the word before it, so a line never begins on one.
+// The space after the "·" stays a plain space, which is where a long heading wraps.
+export const NO_BREAK_SPACE = '\u00a0';
+const COUNT_SEPARATOR = `${NO_BREAK_SPACE}· `;
+
 // Count written commits and landings separately. A landing carries work the turn did not write.
 // The commits chip and its popover use this label. The Commits heading uses repositoryWorkFigures for the same counts.
 export function repositoryWorkLabel(commits: number, landings: number): string {
   return [commits ? `${commits} commit${commits === 1 ? '' : 's'}` : null, landingFigure(landings)]
     .filter(Boolean)
-    .join(' · ');
+    .join(COUNT_SEPARATOR);
 }
 
 // The Commits heading supplies the commit label, so its count needs only a number. Landings retain their own label.
 export function repositoryWorkFigures(commits: number, landings: number): string {
-  return [commits ? String(commits) : null, landingFigure(landings)].filter(Boolean).join(' · ');
+  return [commits ? String(commits) : null, landingFigure(landings)].filter(Boolean).join(COUNT_SEPARATOR);
 }
 
 function landingFigure(landings: number): string | null {
@@ -292,12 +297,12 @@ export function commitHeadFact(group: CommitGroupView): string {
   return [
     group.branch === null
       ? commitGroupName(group)
-      : `on ${group.repository.own ? '' : `${group.repository.name} · `}${group.branch}`,
+      : `on ${group.repository.own ? '' : `${group.repository.name}${NO_BREAK_SPACE}· `}${group.branch}`,
     group.where,
   ]
     .filter(Boolean)
     .map((part) => `· ${part}`)
-    .join(' ');
+    .join(NO_BREAK_SPACE);
 }
 
 // The word a merged branch's heading ends on.

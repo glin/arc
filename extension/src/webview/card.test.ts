@@ -412,7 +412,7 @@ test('the Commits heading keeps its branch fact and the merged word readable out
     assert.ok(hiddenWords, 'the merged word carried no hidden words');
     assert.equal(fakeText(hiddenWords), ' into main at 2:30 PM, as 89abcde');
     // Hidden arrival text remains in the fact beside the button's shorter accessible name.
-    assert.equal(fakeText(fact), '· on topic · merged into main at 2:30 PM, as 89abcde');
+    assert.equal(fakeText(fact), '· on topic\u00a0· merged into main at 2:30 PM, as 89abcde');
   });
 });
 
@@ -1333,11 +1333,14 @@ test('a grouped Commits record draws a heading per branch, and a one-branch reco
     groups.map((group) => group.props?.['aria-label']),
     ['ship/commit-record-repairs, merged into main at 4:49 PM', 'main', '.claude/plans, main'],
   );
-  assert.deepEqual(findAll(drawn, (node) => node.props?.class === 'commitgrouphead').map(drawnText), [
-    'ship/commit-record-repairs · in worktree repairs · merged into main at 4:49 PM, as c36e7b5b',
+  const headTexts = findAll(drawn, (node) => node.props?.class === 'commitgrouphead').map(drawnText);
+  assert.deepEqual(headTexts, [
+    'ship/commit-record-repairs\u00a0· in worktree repairs\u00a0· merged into main at 4:49 PM, as c36e7b5b',
     'main',
-    '.claude/plans · main',
+    '.claude/plans\u00a0· main',
   ]);
+  // No "·" of a group heading follows a breaking space, or a line could start on one.
+  assert.ok(headTexts.every((text) => !text.includes(' ·')));
   // A known branch's landing appears on its heading. An unresolved landing remains a row.
   assert.deepEqual(
     findAll(drawn, (node) => node.props?.class === 'row commitrow').map((node) => node.props?.['data-commit']),
@@ -1348,8 +1351,8 @@ test('a grouped Commits record draws a heading per branch, and a one-branch reco
   const sections = recordSections({ key: 'card-3', commits: one } as CardView, { post: () => {} } as never) as Array<{
     props: { count?: string; fact?: { text: string; arrival?: { title: string; spoken: string } } };
   }>;
-  assert.equal(sections[0].props.count, '1 · 1 merged');
-  assert.equal(sections[0].props.fact?.text, '· on ship/commit-record-repairs · in worktree repairs');
+  assert.equal(sections[0].props.count, '1\u00a0· 1 merged');
+  assert.equal(sections[0].props.fact?.text, '· on ship/commit-record-repairs\u00a0· in worktree repairs');
   assert.equal(sections[0].props.fact?.arrival?.spoken, ' into main at 4:49 PM, as c36e7b5b');
   assert.match(
     sections[0].props.fact?.arrival?.title ?? '',
@@ -1398,7 +1401,7 @@ test('commit and landing rows share a record while keeping distinct identities',
   // The Commits heading counts written commits separately from landings.
   assert.deepEqual(
     sections.map((section) => [section.props.title, section.props.count]),
-    [['Commits', '1 · 1 merged']],
+    [['Commits', '1\u00a0· 1 merged']],
   );
   // A landing-only record retains the Commits heading and names its merged count.
   const onlyLanded = recordSections(
@@ -1609,18 +1612,18 @@ test('the commits record draws every case of its fixture matrix', () => {
   // The merged branch carries its arrival. The nested repository prefixes its own heading.
   assert.equal(heading('grouped')?.fact, undefined, 'a grouped record named one branch on its heading');
   assert.deepEqual(texts('grouped', 'commitgroupname'), ['ship/commit-record-repairs', 'main']);
-  assert.deepEqual(texts('grouped', 'commitgrouprepo'), ['.claude/plans ·']);
+  assert.deepEqual(texts('grouped', 'commitgrouprepo'), ['.claude/plans\u00a0·']);
   assert.deepEqual(texts('grouped', 'dim'), [], 'a merge its branch explains drew as a row');
   assert.deepEqual(texts('fallback', 'commitgroupname'), ['ship/commit-record-repairs', 'main', 'main']);
   assert.deepEqual(texts('fallback', 'dim'), ['merged in']);
   assert.deepEqual(texts('detached', 'commitgroupname'), ['detached commit', 'main']);
-  assert.equal(heading('worktree')?.fact, '· on fix/rail-pin · in worktree rail-review');
+  assert.equal(heading('worktree')?.fact, '· on fix/rail-pin\u00a0· in worktree rail-review');
   assert.deepEqual(texts('makerWithoutSession', 'commitmakername'), ['Read the reflog']);
   assert.deepEqual(texts('makerWithoutSession', 'commitmakerlink'), []);
   assert.deepEqual([heading('landingOnly')?.label, heading('landingOnly')?.fact], ['1 merged', '· on main']);
   assert.deepEqual(texts('landingOnly', 'dim'), ['merged in']);
   const run = groupCommitRows(rowsOf('manyGroups'));
-  assert.equal(heading('manyGroups')?.label, '14 commits · 6 merged');
+  assert.equal(heading('manyGroups')?.label, '14 commits\u00a0· 6 merged');
   assert.deepEqual(
     [run.groups.length, run.groups.filter((group) => group.arrival).length],
     [7, 6],

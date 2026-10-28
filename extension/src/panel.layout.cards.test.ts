@@ -4933,7 +4933,7 @@ test(
       assert.deepEqual(
         await arrivalOf(section),
         {
-          text: '· on topic · merged into main at 4:49 PM, as c36e7b5b',
+          text: '· on topic\u00a0· merged into main at 4:49 PM, as c36e7b5b',
           title: 'Merged into main at 4:49 PM, as c36e7b5b, the last commit of this branch'.replace(
             'the last commit of this branch',
             "which holds this branch's work under a new hash: Merge topic",
@@ -4948,6 +4948,12 @@ test(
         await arrivalOf('#chippop .chippophead'),
         await arrivalOf(section),
         'the popover heading says the arrival differently from the section heading',
+      );
+      // A no-break space joins the heading's label to its fact, so a line never starts on the fact's "·".
+      assert.match(
+        (await page.locator('#chippop .chippophead').textContent()) ?? '',
+        /commits\u00a0· on topic/,
+        'the popover heading parts its count from the branch fact with a breaking space',
       );
       assert.match(
         (await page.locator('#chippop').getAttribute('aria-label')) ?? '',

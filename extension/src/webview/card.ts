@@ -2,6 +2,7 @@ import { Fragment, h, render, type ComponentChild, type ComponentChildren } from
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import {
   ARRIVAL_WORD,
+  NO_BREAK_SPACE,
   arrivalSpoken,
   arrivalTitle,
   cardPartId,
@@ -206,15 +207,13 @@ function Section({
   ]);
 }
 
-const NO_BREAK_SPACE = '\u00a0';
-
 // Draw branch facts and merge-arrival text beside a single-group Commits heading's collapse button.
 function factSpan(fact: { text: string; arrival?: { key: string; title: string; spoken: string } }): ComponentChildren {
   return h('span', { class: 'commitheadfact' }, [
     fact.text,
     fact.arrival
       ? h(Fragment, {}, [
-          ' ',
+          NO_BREAK_SPACE,
           h('span', { class: 'commitheadarrival', title: fact.arrival.title, 'data-arrival': fact.arrival.key }, [
             ARRIVAL_WORD,
             h('span', { class: 'sr-only' }, fact.arrival.spoken),
@@ -230,7 +229,8 @@ export function recordSectionLabel(title: string, count: number | string, shown:
   const action = shown ? `Collapse ${title}` : `Expand ${title}`;
   const bare = typeof count === 'number' ? count : /^\d+$/.test(count) ? Number(count) : null;
   if (bare === null) {
-    return `${title}, ${count}, ${action}`;
+    // The accessible name reads the count with plain spaces.
+    return `${title}, ${String(count).replaceAll(NO_BREAK_SPACE, ' ')}, ${action}`;
   }
   // Dispatched keeps the same count word for one session and several.
   const countLabel = title === 'Dispatched' || bare !== 1 ? title.toLowerCase() : title.slice(0, -1).toLowerCase();
@@ -265,7 +265,8 @@ function RecordSection({
       h('div', { class: 'acthead' }, [
         // Facts sit outside the button so long names wrap and merge tooltips remain reachable.
         // Pressing the fact does not toggle the section. The no-break space is its own text node, so
-        // the fact's text stays equal to the stat popover's and no line break falls before its "·".
+        // the fact's text stays equal to the stat popover's. The fact joins its inner "·" marks with the
+        // same space, so no line break falls before any of them.
         inlineText<ComponentChild>(
           [
             h(

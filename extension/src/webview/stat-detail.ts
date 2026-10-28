@@ -1,6 +1,6 @@
 import { formatCacheSpan, formatRelative } from '../view/time.ts';
 import { cacheHitText, diffHalves, type CacheHitDetail } from '../view/stat-detail.ts';
-import { ARRIVAL_WORD } from '../view/card-presentation.ts';
+import { ARRIVAL_WORD, NO_BREAK_SPACE } from '../view/card-presentation.ts';
 import type { DetailRows } from './card-rows.ts';
 import { drawContextDetail, type ContextDetailView } from './context-detail.ts';
 import { FLOAT_EDGE, FLOAT_GAP } from './dom.ts';
@@ -380,9 +380,9 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
         const arrival = el('span', 'commitheadarrival', ARRIVAL_WORD);
         arrival.title = entry.factArrival.title;
         arrival.appendChild(el('span', 'sr-only', entry.factArrival.spoken));
-        fact.append(document.createTextNode(' '), arrival);
+        fact.append(document.createTextNode(NO_BREAK_SPACE), arrival);
       }
-      label.append(document.createTextNode(' '), fact);
+      label.append(document.createTextNode(NO_BREAK_SPACE), fact);
     }
     head.appendChild(label);
     // Use the chip's diff rules. Omit zero halves and omit the separator for an empty pair.
@@ -805,7 +805,8 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
         [
           [listValue.heading.label, listValue.heading.fact, listValue.heading.factArrival ? ARRIVAL_WORD : null]
             .filter(Boolean)
-            .join(' '),
+            .join(' ')
+            .replaceAll(NO_BREAK_SPACE, ' '),
           figure,
         ]
           .filter(Boolean)

@@ -9070,7 +9070,7 @@ test('a landing reaches the card beside the commits, in the order it happened', 
     ['commit', 'landing'],
   );
   const chip = card.chips.find((c) => c.metric === 'commits');
-  assert.equal(chip?.label, '1 commit · 1 merged', 'the landing is named beside the commit figure');
+  assert.equal(chip?.label, '1 commit\u00a0· 1 merged', 'the landing is named beside the commit figure');
   assert.equal(
     card.chips.some((c) => c.metric === 'landings'),
     false,
