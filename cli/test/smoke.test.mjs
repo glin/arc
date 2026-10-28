@@ -1428,8 +1428,7 @@ process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', sessio
         fs.chmodSync(claude, 0o755);
       }
       const env = { ...smokeEnv };
-      for (const key of Object.keys(env))
-        if (['PATH', 'ARC_WINDOW', 'ARC_EDITOR_EXECUTABLE'].includes(key.toUpperCase())) delete env[key];
+      for (const key of Object.keys(env)) if (key.toUpperCase() === 'PATH') delete env[key];
       Object.assign(env, {
         HOME: home,
         USERPROFILE: home,

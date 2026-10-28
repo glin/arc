@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { LAUNCH_ENV_NAMES } from '../../extension/src/agenthost.ts';
 
 function skillFiles(directory: string) {
   return fs
@@ -56,8 +57,9 @@ let version: string | undefined;
 function expectedVersion() {
   return (version ??= execFileSync(process.execPath, [cli, '--version'], { encoding: 'utf8' }).trim());
 }
+// A shell that Arc starts for an agent carries its window, editor, and session token. Smoke commands run without them.
 const smokeEnv = {
-  ...process.env,
+  ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !LAUNCH_ENV_NAMES.includes(key.toUpperCase()))),
   CLAUDE_CODE_SESSION_ID: '',
   CODEX_THREAD_ID: '',
   TERM_PROGRAM: '',
