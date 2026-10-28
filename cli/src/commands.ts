@@ -262,6 +262,7 @@ export const COMMANDS: readonly Command[] = [
       output: [
         'JSON identifies the launch receipt. Result and status remain readable after editor shutdown.',
         'Claude read-only uses print mode. Writable Claude uses --bg. Codex uses exec or an attended interactive session.',
+        'Claude refuses a --bg launch in a directory it does not trust. Trust in a directory does not cover a repository nested inside it.',
         'CLAUDE_BIN and CODEX_BIN override executable selection. Without --cache-lifetime, a caller cache TTL remains intact.',
       ],
       refusals: [
