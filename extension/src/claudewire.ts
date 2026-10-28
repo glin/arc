@@ -480,7 +480,6 @@ export type RemoteControlResult =
   | { outcome: 'refused'; reason: string; late: boolean }
   | { outcome: 'busy'; state: RemoteControlState }
   | { outcome: 'unsupported'; available: boolean | null }
-  | { outcome: 'policy' }
   | { outcome: 'uncertain' }
   | { outcome: 'closed' };
 

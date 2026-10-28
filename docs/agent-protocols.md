@@ -40,7 +40,7 @@ Positive model turns establish participating model completion. A zero-model resu
 
 ## Claude Remote Control
 
-`remote_control` sends an `enabled` boolean and starts no turn. Require `remote_control_available: true` in initialize. Ignore auto-enable fields. The toggle uses only this window's live Claude child. Refuse drafts, agent runs, absent children, and fixed read-only policies. Start no child for a toggle.
+`remote_control` sends an `enabled` boolean and starts no turn. Require `remote_control_available: true` in initialize. Ignore auto-enable fields. The toggle uses only this window's live Claude child. Refuse drafts and absent children. Send the toggle to agent runs and to children with fixed read-only permissions like any other child. Start no child for a toggle.
 
 Enable replies carry `session_url`, `connect_url`, `bridge_epoch`, and `bridge_session_id`. Retain the epoch for failure matching. Bridge identity never replaces local identity. Disable replies carry no fields. Errors retain prior state. [Prompt delivery](prompt-delivery.md#local-controls) owns link presentation.
 

@@ -4762,7 +4762,6 @@ export type RemoteControlOutcome =
   | RemoteControlResult
   | { outcome: 'arguments' }
   | { outcome: 'draft' }
-  | { outcome: 'agentRun' }
   | { outcome: 'stopped' };
 
 // The Remote Control session link Arc may store, draw, link, and open. Only an `https:` URL with no
@@ -4822,11 +4821,6 @@ export function remoteControlNotice(result: RemoteControlOutcome): { level: 'inf
             ? 'Arc: Claude Code reports that Remote Control is not available for this account or setup.'
             : 'Arc: this Claude Code version did not report Remote Control support. Update Claude Code to use /remote-control.',
       };
-    case 'policy':
-      return {
-        level: 'warning',
-        text: 'Arc: Remote Control is not available for a session that runs with fixed read-only permissions.',
-      };
     case 'arguments':
       return { level: 'warning', text: 'Arc: send /remote-control or /rc by itself, with nothing after it.' };
     case 'draft':
@@ -4834,8 +4828,6 @@ export function remoteControlNotice(result: RemoteControlOutcome): { level: 'inf
         level: 'warning',
         text: 'Arc: Remote Control needs a running session. Send a first prompt, then run /remote-control again.',
       };
-    case 'agentRun':
-      return { level: 'warning', text: 'Arc: Remote Control is not available for a session that an agent started.' };
     // `stopped` and `closed`.
     default:
       return {

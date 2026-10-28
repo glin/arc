@@ -1666,9 +1666,7 @@ export class AgentSession {
   }
 
   // Toggles Claude Remote Control on this child. `observer` receives late settlements and connection failures.
-  // A fixed launch policy refuses it, because a remote client would steer a child whose permissions Arc fixed at launch.
   async toggleRemoteControl(observer: (result: RemoteControlResult) => void): Promise<RemoteControlResult> {
-    if (this.policy) return { outcome: 'policy' };
     return this.driver.toggleRemoteControl
       ? await this.driver.toggleRemoteControl(observer)
       : { outcome: 'unsupported', available: null };

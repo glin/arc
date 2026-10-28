@@ -7393,9 +7393,9 @@ export class PanelProvider implements vscode.Disposable {
     void this.persistHostState().catch(() => {});
   }
 
-  // Record that the reader sent input from the Prompt box to a session filed as an agent run or not yet classified.
-  // `sendPrompt` records a queued submission when it enters the queue. An immediate send, `/compact`, or `/clear`
-  // records only after the agent accepts it.
+  // Record that the reader sent input from the Prompt box to a session filed as an agent run or not yet classified,
+  // or connected Remote Control to it. `sendPrompt` records a queued submission when it enters the queue.
+  // An immediate send, `/compact`, or `/clear` records only after the agent accepts it.
   // An Arc agent-run launch is recorded even while its pending row files it as the reader's own.
   // Another session is recorded when its published row files it as an agent run or leaves it unclassified.
   // A reader session whose classification is still unknown can therefore enter the list and push an older entry out of the bound.
@@ -8725,23 +8725,26 @@ export class PanelProvider implements vscode.Disposable {
     return true;
   }
 
+  // Remote Control works on any session with a Claude process in this window, including an agent run.
+  // A connection counts as the reader taking the session over, so the session that holds it leaves Run by agents.
+  // The takeover leaves `agentRuns` unchanged, so the prompt-cache request of the session's resumes does not change.
   private async remoteControlFromComposer(sessionId: string): Promise<void> {
+    const settle = (result: RemoteControlOutcome, session: string | null) => {
+      this.noteRemoteControl(session, result);
+      if (session !== null && result.outcome === 'connected') this.notePrompted(session);
+      this.showRemoteControlNotice(result);
+    };
     let result: RemoteControlOutcome;
     let holder: string | null = sessionId;
     if (Object.prototype.hasOwnProperty.call(this.newDrafts, sessionId)) result = { outcome: 'draft' };
-    else if (this.isAgentRunLaunch(sessionId)) result = { outcome: 'agentRun' };
     else if (!this.onRemoteControl) result = { outcome: 'stopped' };
     else
       try {
-        ({ result, session: holder } = await this.onRemoteControl(sessionId, (later, current) => {
-          this.noteRemoteControl(current, later);
-          this.showRemoteControlNotice(later);
-        }));
+        ({ result, session: holder } = await this.onRemoteControl(sessionId, settle));
       } catch (error) {
         result = { outcome: 'refused', reason: (error as Error).message || 'unknown error', late: false };
       }
-    this.noteRemoteControl(holder, result);
-    this.showRemoteControlNotice(result);
+    settle(result, holder);
   }
 
   // Keep the session's Remote Control state for the prompt box item. Only `connected` draws the item.

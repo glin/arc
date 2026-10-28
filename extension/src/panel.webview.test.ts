@@ -35846,6 +35846,32 @@ test('a prompt to an Arc agent-run launch that discovery has not listed records 
   );
 });
 
+test('Remote Control from the Prompt box reaches a running Arc agent run and moves it into the Running count', async () => {
+  const { provider, session, rails, submit } = promptedRunProvider();
+  provider.running = new Set([runningKey('claude', session)]);
+  const reached: string[] = [];
+  provider.remoteControl = new Map();
+  const notices: unknown[] = [];
+  provider.showRemoteControlNotice = (result: unknown) => notices.push(result);
+  provider.onRemoteControl = async (target: string) => {
+    reached.push(target);
+    return {
+      result: { outcome: 'connected', url: 'https://claude.ai/code/session_01RUN', late: false },
+      session: target,
+    };
+  };
+  await submit('/remote-control', 'remote');
+  await vi.waitFor(() => assert.deepEqual(reached, [session], 'Remote Control on an agent run never reached Claude'));
+  await vi.waitFor(() => assert.deepEqual(provider.saved.prompted, [session]));
+  assert.deepEqual(notices, [{ outcome: 'connected', url: 'https://claude.ai/code/session_01RUN', late: false }]);
+  const posted = rails.at(-1)?.rail;
+  assert.ok(posted, 'the connection posted no session list');
+  assert.equal(posted.find((card) => card.id === session)?.runByAgent, false);
+  assert.equal(railCounts(posted, { showArchived: false, showRuns: false }, Date.now()).running, 1);
+  assert.deepEqual(provider.saved.agentRuns, [session], 'the connection removed the launch record');
+  assert.equal(provider.isAgentRunLaunch(session), true, 'the connection changed the prompt-cache request of resumes');
+});
+
 // A waiting prompt that holds the queue, so a later prompt queues behind it.
 const promptedWaiting = (session: string) => ({
   id: 'waiting',
@@ -42895,29 +42921,47 @@ test('a queued Remote Control command stays queued when its files exceed the pro
   }
 });
 
-test('Remote Control refuses a draft and an agent-run session without reaching a Claude process', async () => {
+test('Remote Control refuses a draft and reaches the Claude process of an agent run', async () => {
   const remoteControlFromComposer = compiledProviderMethod(
     'async function (sessionId)',
     'private async remoteControlFromComposer(',
   );
   const reached: string[] = [];
   const notices: unknown[] = [];
+  const prompted: string[] = [];
+  const late: Array<(result: unknown, session: string | null) => void> = [];
+  const replies: Record<string, unknown> = {
+    run: { outcome: 'connected', url: null, late: false },
+    live: { outcome: 'disconnected', late: false },
+    slow: { outcome: 'uncertain' },
+  };
   const provider = {
     newDrafts: { draft: {} },
-    saved: { agentRuns: ['run'] },
+    saved: { agentRuns: ['run', 'slow'] },
     isAgentRunLaunch: compiledProviderMethod('function (session)', 'public isAgentRunLaunch('),
-    async onRemoteControl(session: string) {
+    async onRemoteControl(session: string, observer: (result: unknown, session: string | null) => void) {
       reached.push(session);
-      return { result: { outcome: 'disconnected', late: false }, session };
+      late.push(observer);
+      return { result: replies[session], session };
     },
     showRemoteControlNotice(result: unknown) {
       notices.push(result);
     },
     noteRemoteControl() {},
+    notePrompted(session: string) {
+      prompted.push(session);
+    },
   };
-  for (const session of ['draft', 'run', 'live']) await remoteControlFromComposer.call(provider, session);
-  assert.deepEqual(reached, ['live'], 'a draft or agent-run session reached the Claude process callback');
-  assert.deepEqual(notices, [{ outcome: 'draft' }, { outcome: 'agentRun' }, { outcome: 'disconnected', late: false }]);
+  for (const session of ['draft', 'run', 'live', 'slow']) await remoteControlFromComposer.call(provider, session);
+  assert.deepEqual(reached, ['run', 'live', 'slow'], 'a draft reached, or an agent run missed, the Claude process');
+  assert.deepEqual(notices, [{ outcome: 'draft' }, replies.run, replies.live, replies.slow]);
+  assert.deepEqual(prompted, ['run'], 'only a connected result counts as a takeover');
+  // A late connection is recorded under the session id the child holds when it arrives.
+  late[2]({ outcome: 'connected', url: null, late: true }, 'slow-cleared');
+  late[1]({ outcome: 'ended', reason: '' }, 'live');
+  assert.deepEqual(prompted, ['run', 'slow-cleared']);
+  assert.deepEqual(provider.saved.agentRuns, ['run', 'slow'], 'Remote Control changed the launch record');
+  assert.equal(provider.isAgentRunLaunch('run'), true, 'Remote Control changed the prompt-cache request of resumes');
 });
 
 // The final Prompt box state must preserve each supplying process's immutable definition.
@@ -42993,6 +43037,7 @@ function remoteControlState() {
     remoteControl: new Map<string, { url: string | null }>(),
     posted: [] as unknown[],
     replies: [] as unknown[],
+    notePrompted() {},
     isAgentRunLaunch: compiledProviderMethod('function (session)', 'public isAgentRunLaunch('),
     async onRemoteControl(_session: string, observer: (result: unknown, session: string | null) => void) {
       later.push(observer);
@@ -43034,7 +43079,6 @@ test('the prompt box keeps Remote Control from a connected result until the conn
     { outcome: 'busy', state: 'disconnecting' },
     { outcome: 'uncertain' },
     { outcome: 'unsupported', available: false },
-    { outcome: 'policy' },
   ]) {
     await toggle('s1', result);
     assert.deepEqual(held(), { s1: { url: REMOTE_LINK } }, `${result.outcome} changed the connection`);
@@ -43054,12 +43098,13 @@ test('the prompt box keeps Remote Control from a connected result until the conn
   // A link that fails the check is stored as no link.
   await toggle('s2', { outcome: 'connected', url: 'https://claude.ai/[x](y)', late: false });
   assert.deepEqual(held(), { s2: { url: null } });
-  // Refusals the panel decides itself change nothing.
+  // A draft refusal changes nothing. An agent run holds its connection like any other session.
   provider.newDrafts = { draft: {} };
   provider.saved.agentRuns = ['run'];
   await provider.remoteControlFromComposer('draft');
-  await provider.remoteControlFromComposer('run');
   assert.deepEqual(held(), { s2: { url: null } });
+  await toggle('run', { outcome: 'connected', url: REMOTE_LINK, late: false });
+  assert.deepEqual(held(), { s2: { url: null }, run: { url: REMOTE_LINK } });
 });
 
 test('a late Remote Control result lands under the session id the child holds when it arrives', async () => {
