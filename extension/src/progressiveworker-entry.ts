@@ -186,6 +186,9 @@ function seededDispatch(file: string): HeldDispatchFacts | undefined {
     sourceGeneration: saved.sourceGeneration,
     settled: true,
     activity: saved.activity,
+    // A map that covered the file before this first visit sent its notice to no held facts.
+    activityStale:
+      saved.activity?.covered === false && claudeRepeatedMap(file, Number.MAX_SAFE_INTEGER, 0)?.covered === true,
     saved,
   };
   dispatchFacts.set(file, held);
@@ -1186,19 +1189,13 @@ async function execute(
           continue;
         }
         // The spend of an unchanged file and tree stays true when only its activity answer is stale.
-        if (
-          held?.activityStale &&
-          held.activity &&
-          reference.agent === 'claude' &&
-          sameRevision(held.revision, revision) &&
-          held.tree === tree
-        ) {
+        if (held?.activityStale && held.activity && sameRevision(held.revision, revision) && held.tree === tree) {
           const activity = dispatchActivity(reference.file, reference.sessionId, revision, now, reference.agent);
           const covered = claudeRepeatedMap(reference.file, Number.MAX_SAFE_INTEGER, 0)?.covered === true;
           if (now >= activity.activeUntil && sameRevision(revision, revisionOf(reference.file))) {
+            // The Claude spend read never marks spend unfinished. Only an activity answer does.
             const spend: AgentSpend = { ...held.facts.spend };
-            if (held.activity.spendUnfinished === undefined) delete spend.unfinished;
-            else spend.unfinished = held.activity.spendUnfinished;
+            delete spend.unfinished;
             if (spend.artifacts && held.activity.artifactsComplete !== null)
               spend.artifacts = { ...spend.artifacts, complete: held.activity.artifactsComplete };
             if (activity.unfinished) {
@@ -1320,11 +1317,7 @@ async function execute(
         }
         const activityRead: DispatchActivityRead | undefined =
           reference.agent === 'claude' && !active
-            ? {
-                covered: activityCovered,
-                ...(spend.unfinished === undefined ? {} : { spendUnfinished: spend.unfinished }),
-                artifactsComplete: spend.artifacts?.complete ?? null,
-              }
+            ? { covered: activityCovered, artifactsComplete: spend.artifacts?.complete ?? null }
             : undefined;
         if (!active && activity.unfinished) {
           spend.unfinished = true;

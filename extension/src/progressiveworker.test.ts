@@ -11779,9 +11779,17 @@ test('an unchanged finished Claude dispatched session with subagents reads its s
     fs.rmSync(cache);
     const unfinished = (facts: unknown) => (facts as { spend: { unfinished?: boolean } }).spend.unfinished === true;
     assert.ok(!unfinished(truth.facts), 'a finished session read as unfinished');
+    // A worker that saves its facts before its map covers the root saves them uncovered. A later worker whose
+    // map covers the root before discovery visits it reads only their activity again.
+    await activate(2, ['pass']);
+    const [seeded] = await activate(3, ['covered', 'pass']);
+    assert.equal(seeded.rereads, 0, 'uncovered saved facts read their spend again');
+    assert.ok(seeded.bytes <= activityWindow, `uncovered saved facts read ${seeded.bytes} bytes`);
+    assert.deepEqual(seeded.facts, truth.facts, 'uncovered saved facts kept the hidden outcome');
+    fs.rmSync(cache);
     // A cold worker reads the tree once. Its map does not cover the root yet, so the tail's outcome stays hidden.
     // Coverage of the map then reads only the activity window again, and the facts take the true outcome.
-    const [cold, afterCoverage, settled] = await activate(2, ['pass', 'covered', 'pass', 'pass']);
+    const [cold, afterCoverage, settled] = await activate(4, ['pass', 'covered', 'pass', 'pass']);
     assert.equal(cold.rereads, 1);
     assert.ok(cold.bytes >= treeBytes(), 'the first pass did not read the dispatched session');
     assert.ok(unfinished(cold.facts), 'the fixture outcome was visible without a covering map');
@@ -11790,15 +11798,15 @@ test('an unchanged finished Claude dispatched session with subagents reads its s
     assert.deepEqual(afterCoverage.facts, truth.facts, 'map coverage left the hidden outcome in the facts');
     assert.deepEqual(spendOf(settled), { visits: 1, rereads: 0, bytes: 0 }, 'a later pass read the session again');
     // A reload reuses the saved facts, and the session list's map coverage leaves them alone.
-    const reload = await activate(3, ['pass', 'covered', 'pass']);
+    const reload = await activate(5, ['pass', 'covered', 'pass']);
     assert.equal(reload[0].rereads, 0, 'a reload read the unchanged session again');
     assert.ok(reload[0].bytes < 1024, `a reload read ${reload[0].bytes} bytes`);
     assert.deepEqual(spendOf(reload[1]), { visits: 1, rereads: 0, bytes: 0 }, 'map coverage after a reload read again');
     assert.deepEqual(reload[1].facts, truth.facts, 'a reload changed the saved facts');
-    // A grown root reads its own file once. Its unchanged subagents keep their spend.
+    // A grown root reads its spend tree once in a new worker.
     fs.appendFileSync(rootFile, JSON.stringify({ type: 'ignored', text: 'y'.repeat(1000) }) + '\n');
     fs.utimesSync(rootFile, 200, 200);
-    const grown = await activate(4, ['pass', 'covered', 'pass']);
+    const grown = await activate(6, ['pass', 'covered', 'pass']);
     assert.equal(grown[0].rereads, 1, 'a grown root kept its old spend');
     assert.ok(grown[0].bytes >= fs.statSync(rootFile).size && grown[0].bytes < 2 * treeBytes());
     assert.equal(grown[1].rereads, 0, 'map coverage read the grown root again');
@@ -11806,7 +11814,7 @@ test('an unchanged finished Claude dispatched session with subagents reads its s
     // A grown subagent moves the spend tree, so the root reads again.
     fs.appendFileSync(path.join(subagents, 'agent-a1.jsonl'), JSON.stringify({ type: 'ignored' }) + '\n');
     fs.utimesSync(path.join(subagents, 'agent-a1.jsonl'), 200, 200);
-    const [child] = await activate(5, ['pass']);
+    const [child] = await activate(7, ['pass']);
     assert.equal(child.rereads, 1, 'a grown subagent kept the old spend');
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });

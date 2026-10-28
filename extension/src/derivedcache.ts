@@ -392,11 +392,10 @@ export interface SavedDispatchFacts {
 }
 
 // The activity read behind settled Claude dispatched facts. `covered` is true when the repeated-record map
-// covered the file as the read ran. The other fields hold the spend read's own values before the activity
+// covered the file as the read ran. `artifactsComplete` holds the spend read's own value before the activity
 // read marked the facts unfinished.
 export interface DispatchActivityRead {
   covered: boolean;
-  spendUnfinished?: boolean;
   artifactsComplete: boolean | null;
 }
 
@@ -1022,7 +1021,6 @@ function dispatchActivityRead(value: unknown): boolean {
   return (
     record(value) &&
     typeof value.covered === 'boolean' &&
-    (value.spendUnfinished === undefined || typeof value.spendUnfinished === 'boolean') &&
     (value.artifactsComplete === null || typeof value.artifactsComplete === 'boolean')
   );
 }
