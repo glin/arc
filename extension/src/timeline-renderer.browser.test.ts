@@ -12,7 +12,7 @@ import {
 } from './turncard.ts';
 import { createCodexSessionReducer } from './codex.ts';
 import { renderRichMarkdown } from './richtext.ts';
-import { SESSION_LINK_RESPONSE, turn } from './turnfixtures.ts';
+import { MARKDOWN_LINK_RESPONSE, SESSION_LINK_RESPONSE, turn } from './turnfixtures.ts';
 
 test('timeline copy retains selected text after prompt focus through native copy routing', async (t) => {
   const browser = await browserOrNone();
@@ -3680,6 +3680,169 @@ test('a compaction summary link keeps Copy Path context without handoff identity
       link: '../plans/handoff.md#L42',
       preventDefaultContextMenuItems: true,
     });
+  } finally {
+    await browser.close();
+  }
+});
+
+test('Markdown preview links activate by click and Enter while expanded code copies its literal source', async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('A browser is required');
+    return;
+  }
+  const page = await browser.newPage();
+  try {
+    await page.setContent(themed(pageHtml()));
+    const payload = renderPayload() as Payload;
+    const card = {
+      ...toCard(turn({ summary: MARKDOWN_LINK_RESPONSE }), false, NOW),
+      summaryHtml: renderRichMarkdown(MARKDOWN_LINK_RESPONSE),
+      key: 's1:markdown-preview',
+    };
+    await post(page, { ...payload, cards: [card] });
+    const headline = page.locator('.headline');
+    const link = headline.locator('a[data-link]');
+    await link.waitFor();
+    assert.equal(await link.textContent(), '60-second wait guidance');
+    assert.equal(await headline.textContent(), card.headline);
+    const head = page.locator(`[data-control=${JSON.stringify(`card:${card.key}`)}]`);
+    await page.evaluate('window.__posted.length = 0');
+    await link.click();
+    await link.focus();
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => (window as any).__posted.length === 2);
+    assert.deepEqual(await page.evaluate('window.__posted'), [
+      { type: 'openLink', href: 'https://github.com/openai/codex/issues/31935', beside: false },
+      { type: 'openLink', href: 'https://github.com/openai/codex/issues/31935', beside: false },
+    ]);
+    assert.equal(await head.getAttribute('aria-expanded'), 'false');
+    await link.evaluate((node) => {
+      (window as any).__oldPreview = node;
+    });
+    await post(page, { type: 'activity', session: card.sessionId, card: { ...card, headlineHtml: undefined } });
+    await page.waitForFunction(() => !document.querySelector('.headline a'));
+    await page.evaluate('window.__posted.length = 0; window.__oldPreview.click()');
+    assert.deepEqual(await page.evaluate('window.__posted'), []);
+    await head.click();
+    const code = page.locator('.summary pre code.language-markdown');
+    await code.waitFor();
+    assert.equal((await code.textContent())?.trimEnd(), MARKDOWN_LINK_RESPONSE.split('\n')[1]);
+    assert.equal(await page.locator('.summary a').count(), 0);
+    await page.evaluate('window.__posted.length = 0');
+    await page.locator('.summary button.copy').click();
+    await page.waitForFunction(() => (window as any).__posted.some((message: any) => message.type === 'copy'));
+    assert.deepEqual(await page.evaluate('window.__posted'), [
+      { type: 'copy', text: MARKDOWN_LINK_RESPONSE.split('\n')[1] + '\n' },
+    ]);
+    const examples = [
+      {
+        summary: 'A ![&#169;](chart.png) [guide](https://example.com)',
+        expected: 'A &#169; guide',
+        href: 'https://example.com',
+        label: 'guide',
+      },
+      {
+        summary: '<https://example.com/a?x=1&copy;=2>',
+        expected: 'https://example.com/a?x=1&copy;=2',
+        href: 'https://example.com/a?x=1&copy;=2',
+        label: 'https://example.com/a?x=1&copy;=2',
+      },
+      {
+        summary: 'A &#169; [guide](https://example.com/a?x=1&y=2)',
+        expected: 'A &#169; guide',
+        href: 'https://example.com/a?x=1&y=2',
+        label: 'guide',
+      },
+      {
+        summary: 'A &copy; [guide &lt;](https://example.com/a?x=1&y=2)',
+        expected: 'A &copy; guide &lt;',
+        href: 'https://example.com/a?x=1&y=2',
+        label: 'guide &lt;',
+      },
+      {
+        summary: 'Read [guide](https://example.com/guide).  \nNext line.',
+        expected: 'Read guide.',
+        href: 'https://example.com/guide',
+        label: 'guide',
+      },
+      {
+        summary: '[**✅** Done](https://example.com)',
+        expected: 'Done',
+        href: 'https://example.com',
+        label: 'Done',
+      },
+      {
+        summary: '[✅](https://example.com) Done',
+        expected: 'Done',
+        href: 'https://example.com',
+        label: 'Done',
+      },
+      {
+        summary: '**[✅](https://example.com)** **Done**',
+        expected: 'Done',
+        href: 'https://example.com',
+        label: 'Done',
+      },
+      {
+        summary: '```markdown\n<https://example.com/a?x=1&y=2>\n```',
+        expected: 'https://example.com/a?x=1&y=2',
+        href: 'https://example.com/a?x=1&y=2',
+      },
+      {
+        summary: '```markdown\n&lt; [guide](https://example.com) &gt;\n```',
+        expected: '&lt; guide &gt;',
+        href: 'https://example.com',
+      },
+      {
+        summary: '```markdown\n[✅ Done](https://example.com)\n```',
+        expected: 'Done',
+        href: 'https://example.com',
+      },
+      {
+        summary: 'See [wiki](https://en.wikipedia.org/wiki/Function_(mathematics)).',
+        expected: 'See wiki.',
+        href: 'https://en.wikipedia.org/wiki/Function_(mathematics)',
+      },
+      {
+        summary: String.raw`\[guide](https://example.com) and https://example.org`,
+        expected: '[guide](https://example.com) and https://example.org',
+        href: 'https://example.org',
+      },
+      {
+        summary: '```markdown\n&lt; example &gt; &amp;lt; &#39; &quot;\n```',
+        expected: '&lt; example &gt; &amp;lt; &#39; &quot;',
+        href: null,
+      },
+    ];
+    for (const [index, example] of examples.entries()) {
+      const edge = {
+        ...toCard(turn({ summary: example.summary }), false, NOW),
+        summaryHtml: renderRichMarkdown(example.summary),
+        key: `s1:markdown-edge-${index}`,
+      };
+      await post(page, { ...payload, cards: [edge] });
+      const edgeHead = page.locator(`[data-control=${JSON.stringify(`card:${edge.key}`)}]`);
+      await edgeHead.waitFor();
+      assert.equal(await page.locator('.headline').textContent(), example.expected);
+      assert.equal(edge.headline, example.expected);
+      assert.ok((await edgeHead.getAttribute('aria-label'))?.includes(example.expected));
+      const edgeLink = page.locator('.headline a[data-link]');
+      assert.equal(await edgeLink.count(), example.href ? 1 : 0);
+      if (!example.href) continue;
+      assert.equal(await edgeLink.getAttribute('data-link'), example.href);
+      if (example.label) assert.equal(await page.getByRole('link', { name: example.label, exact: true }).count(), 1);
+      await page.evaluate('window.__posted.length = 0');
+      await edgeLink.click();
+      await edgeLink.focus();
+      await page.keyboard.press('Enter');
+      await page.waitForFunction(() => (window as any).__posted.length === 2);
+      assert.deepEqual(await page.evaluate('window.__posted'), [
+        { type: 'openLink', href: example.href, beside: false },
+        { type: 'openLink', href: example.href, beside: false },
+      ]);
+      assert.equal(await edgeHead.getAttribute('aria-expanded'), 'false');
+    }
   } finally {
     await browser.close();
   }

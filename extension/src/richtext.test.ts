@@ -722,11 +722,15 @@ test('renderInlineMarkdown draws a link as its words with no anchor', () => {
   assert.match(html, /See store\.ts for the rest/);
 });
 
+test('inline prose keeps the default entity policy outside headlines', () => {
+  assert.equal(renderInlineMarkdown('A &#169; &copy; [guide](https://example.com)'), 'A &#169; &copy; guide');
+});
+
 test('inline session anchors require opt-in and reject ordinary or malformed targets', () => {
   const session = '[**A\\-B**](arc-session:01a137a5-3d93-71d0-9492-965abeb0fa32)';
   assert.doesNotMatch(renderInlineMarkdown(session), /<a /);
   assert.match(
-    renderInlineMarkdown(session, undefined, true),
+    renderInlineMarkdown(session, undefined, { sessionLinks: true }),
     /data-link="arc-session:[^"]+".*<strong>A-B<\/strong><\/a>/,
   );
   for (const target of [
@@ -736,9 +740,9 @@ test('inline session anchors require opt-in and reject ordinary or malformed tar
     'arc-session:bad/id',
     'arc-visualization:/tmp/chart.html',
   ]) {
-    assert.doesNotMatch(renderInlineMarkdown(`[label](${target})`, undefined, true), /<a |<button/);
+    assert.doesNotMatch(renderInlineMarkdown(`[label](${target})`, undefined, { sessionLinks: true }), /<a |<button/);
   }
-  assert.doesNotMatch(renderInlineMarkdown('`' + session + '`', undefined, true), /<a /);
+  assert.doesNotMatch(renderInlineMarkdown('`' + session + '`', undefined, { sessionLinks: true }), /<a /);
   assert.doesNotMatch(renderRichMarkdown(session, undefined, true), /<a /);
 });
 
@@ -746,6 +750,26 @@ test('renderInlineMarkdown draws a picture as its alt text with no img', () => {
   assert.equal(renderInlineMarkdown('![a chart](chart.png)'), 'a chart');
   assert.doesNotMatch(renderInlineMarkdown('![](chart.png)'), /<img/);
   assert.match(renderInlineMarkdown('![](chart.png)'), /chart\.png/);
+});
+
+test('inline external anchors require opt-in and preserve literal examples when requested', () => {
+  const link = '[guide](https://example.com/a?x=1&y=2)';
+  assert.doesNotMatch(renderInlineMarkdown(link), /<a /);
+  assert.match(
+    renderInlineMarkdown(link, undefined, { externalLinks: true }),
+    /data-link="https:\/\/example.com\/a\?x=1&amp;y=2"/,
+  );
+  const literal = `${link} **${link}** \`${link}\` \\${link} <b>raw</b> [local](a.md) [session](arc-session:abc) [bad](javascript:alert)`;
+  const html = renderInlineMarkdown(literal, undefined, { externalLinks: true, literal: true });
+  assert.equal(visibleTextOf(html), literal.replace(link, 'guide').replace(`**${link}**`, '**guide**'));
+  assert.equal((html.match(/<a /g) ?? []).length, 2);
+  assert.doesNotMatch(html, /<strong>|<code>|<b>|data-link="(?:a.md|arc-session:|javascript:)/);
+  const label = '**bold** <b>raw</b> `code`';
+  const styledLabel = renderInlineMarkdown(`[${label}](https://example.com)`, undefined, {
+    externalLinks: true,
+    literal: true,
+  });
+  assert.equal(visibleTextOf(styledLabel), label);
 });
 
 test('renderInlineMarkdown draws the same headline twice when it carries an email address', () => {

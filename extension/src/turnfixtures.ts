@@ -189,6 +189,11 @@ export function candidateGitRunner(
   };
 }
 
+export const MARKDOWN_LINK_RESPONSE =
+  '```markdown\n' +
+  'Codex’s [60-second wait guidance](https://github.com/openai/codex/issues/31935) causes repeated parent-model requests while subagents work, charging to process the conversation again.\n' +
+  '```';
+
 export const SESSION_LINK_RESPONSE =
   String.raw`Launched [code\-coordinate\-1\-native\-session\-skills\-sol](${ARC_IDENTITY.sessionScheme}01a137a5-3d93-71d0-9492-965abeb0fa32), pinned under **packaging**.` +
   '\n\n- **Coordinator:** Sol xhigh, verified on OpenAI.' +

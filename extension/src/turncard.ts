@@ -102,7 +102,7 @@ import {
   type AgentSpend,
 } from './agentspend';
 import { childFileTotals, settleCounts, type ChildFileChange } from './childartifacts';
-import { readableRichText, renderInlineMarkdown, visibleTextOf } from './richtext';
+import { escapeHtml, readableRichText, visibleTextOf } from './richtext';
 import type { WireActivity } from './agentwire';
 import { CARD_ACTIONS, cacheWriteWarningCondition } from './view/card-words';
 import { commitHeadFact, groupCommitRows, repositoryWorkLabel } from './view/card-presentation';
@@ -4231,13 +4231,34 @@ function headlineHtmlFor(
   headline: string,
   source: HeadlineSource | null = headlineSourceOf(summaryText),
 ): string | undefined {
-  if (!source || source.fenced) return undefined;
+  if (!source || source.html === undefined) return undefined;
   const line = withoutLeadingSymbol(source.text.trim());
-  if (line === headline) {
-    return undefined;
+  let html = source.html;
+  if (html.includes('<a ')) {
+    const plain = visibleTextOf(html, true);
+    let remaining = plain.length - withoutLeadingSymbol(plain).length;
+    if (remaining) {
+      html = html.replace(/<[^>]*>|[^<]+/g, (part) => {
+        if (part.startsWith('<') || !remaining) return part;
+        const text = visibleTextOf(part, true);
+        const removed = Math.min(remaining, text.length);
+        remaining -= removed;
+        return escapeHtml(text.slice(removed));
+      });
+      // A linked mark alone borrows the following text as its readable navigation label.
+      html = html.replace(
+        /^((?:<(?!a\b)[^>]*>)*)<a([^>]*)>((?:<[^>]*>)*)<\/a>((?:<(?!\/?a\b)[^>]*>)*)([^<]+)/,
+        (_match, before: string, attributes: string, empty: string, tags: string, label: string) =>
+          `${before}${empty}${tags}<a${attributes}>${label}</a>`,
+      );
+      html = html
+        .replace(/^((?:<(?!a\b)[^>]*>)*)<a\b[^>]*>((?:<[^>]*>)*)<\/a>/, '$1$2')
+        .replace(/<(strong|em|del|code)><\/\1>/g, '');
+    }
+  } else {
+    html = withoutLeadingSymbol(html);
   }
-  const html = renderInlineMarkdown(line, undefined, true);
-  return visibleTextOf(html) === headline ? html : undefined;
+  return html !== escapeHtml(line) && visibleTextOf(html, true) === headline ? html : undefined;
 }
 
 // Completed answers other than the selected response, in reverse record order.

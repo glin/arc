@@ -5556,7 +5556,7 @@ test('a copied-turn retraction removes a held child during cursorless reconstruc
   }
 });
 
-test('a large unfinished parent reaches its final receipt under production cursor retention', async () => {
+test('a large unfinished parent reaches its final receipt under production cursor retention', async ({ signal }) => {
   const directory = tempDir('panel-progressive-codex-retention-');
   const childId = '5a7b07c1-bfcf-4d96-9eb2-8ef1fb609881';
   const child = path.join(directory, `${childId}.jsonl`);
@@ -5650,22 +5650,25 @@ test('a large unfinished parent reaches its final receipt under production curso
   const request = {
     kind: 'claude-children' as const,
     parents: [parent, ...stableParents],
+    discoveryBytes: 8 * 1024 * 1024,
     catalog: [
       { agent: 'claude' as const, file: child, sessionId: childId, size: childStat.size, mtimeMs: childStat.mtimeMs },
     ],
     repositoryRoots: [directory],
   };
-  let worker = new ProgressiveWorker(source);
+  const workerSource = 'performance.now = () => 0;' + source;
+  let worker = new ProgressiveWorker(workerSource);
+  let workerExit: Promise<unknown> | undefined;
   try {
     let held = entries;
     let found = false;
     for (let pass = 1; pass <= Math.ceil(stableParents.length / 8) + 100; pass++) {
-      const result = await discoveryState(
-        worker,
-        { ...request, referenceEntries: held },
-        pass,
-        new AbortController().signal,
-      );
+      const pending = discoveryState(worker, { ...request, referenceEntries: held }, pass, signal);
+      if (!workerExit) {
+        const thread = (worker as unknown as { worker: import('node:worker_threads').Worker }).worker;
+        workerExit = once(thread, 'exit');
+      }
+      const result = await pending;
       assert.equal(result?.value.kind, 'claude-children');
       if (!result || result.value.kind !== 'claude-children') break;
       held = result.value.referenceEntries;
@@ -5677,13 +5680,16 @@ test('a large unfinished parent reaches its final receipt under production curso
         saveDerivedCache(cacheFile, [], held);
         held = [...loadDerivedCache(cacheFile).claudeChildReferences];
         worker.stop();
-        worker = new ProgressiveWorker(source);
+        await workerExit;
+        workerExit = undefined;
+        worker = new ProgressiveWorker(workerSource);
       }
       if (found) break;
     }
     assert.equal(found, true, 'the large parent never reached its final receipt');
   } finally {
     worker.stop();
+    await workerExit;
     fs.rmSync(directory, { recursive: true, force: true });
   }
 });

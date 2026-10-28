@@ -124,6 +124,7 @@ import { answerPart, commentAnchorText } from './turncomments.ts';
 import { formatTokens, formatWhen, modelLabels } from './turnformat.ts';
 import {
   COMPACTION_SAMPLES,
+  MARKDOWN_LINK_RESPONSE,
   SESSION_LINK_RESPONSE,
   NOW,
   advisorProbeRecords,
@@ -3000,7 +3001,11 @@ test('the headline is the summary, the error, or what the turn ended up doing', 
 test('a card parses its response once to select the plain and formatted headlines', () => {
   const parses = vi.spyOn(richtext, 'markdownCodeBlocks');
   try {
-    for (const summary of ['**Done.** The `build` passes.\n\n```ts\nconst a = 1;\n```', '## Summary']) {
+    for (const summary of [
+      '**Done.** The `build` passes.\n\n```ts\nconst a = 1;\n```',
+      '## Summary',
+      MARKDOWN_LINK_RESPONSE,
+    ]) {
       parses.mockClear();
       toCard(turn({ summary }), false, NOW);
       assert.equal(
@@ -3102,6 +3107,23 @@ test('the reported escaped session response retains a collapsed session anchor',
   assert.match(card.headlineHtml ?? '', /<strong>packaging<\/strong>/);
 });
 
+test('the reported Markdown-fenced response retains a readable collapsed GitHub link and its source', () => {
+  const card = toCard(turn({ summary: MARKDOWN_LINK_RESPONSE }), false, NOW);
+  assert.equal(
+    card.headline,
+    'Codex’s 60-second wait guidance causes repeated parent-model requests while subagents work, charging to process the conversation again.',
+  );
+  assert.match(
+    card.headlineHtml ?? '',
+    /<a href="#" data-link="https:\/\/github.com\/openai\/codex\/issues\/31935">60-second wait guidance<\/a>/,
+  );
+  assert.equal(richtext.visibleTextOf(card.headlineHtml ?? ''), card.headline);
+  assert.equal(card.summary, MARKDOWN_LINK_RESPONSE);
+  const expanded = richtext.renderRichMarkdown(card.summary);
+  assert.match(expanded, /<pre><code class="language-markdown">/);
+  assert.doesNotMatch(expanded, /<a /);
+});
+
 test('collapsed fenced and inline session examples remain literal', () => {
   const line = String.raw`[code\-example](arc-session:01a137a5-3d93-71d0-9492-965abeb0fa32)`;
   for (const fence of ['```markdown', '~~~~text']) {
@@ -3130,6 +3152,164 @@ test('collapsed fenced and inline session examples remain literal', () => {
   assert.doesNotMatch(inline.headlineHtml ?? '', /<a /);
   const after = toCard(turn({ summary: `~~~\n\n~~~\n${SESSION_LINK_RESPONSE}` }), false, NOW);
   assert.match(after.headlineHtml ?? '', /<a /);
+});
+
+test('collapsed external links respect fence languages and literal Markdown examples', () => {
+  const link = '[guide](https://example.com/guide)';
+  const line = `${link} **literal** [session](arc-session:abc) [file](src/a.ts) [bad](javascript:alert) <b>raw</b> \`${link}\` \\${link}`;
+  for (const summary of [
+    `\`\`\`markdown\n${line}\n\`\`\``,
+    `~~~MARKDOWN\n${line}\n~~~`,
+    `> - \`\`\`markdown\n>   ${line}\n>   \`\`\``,
+    `1. ~~~~Markdown\n\t${line}\n\t~~~~`,
+  ]) {
+    const card = toCard(turn({ summary }), false, NOW);
+    assert.equal(card.headline, line.replace(link, 'guide'), summary);
+    assert.equal((card.headlineHtml?.match(/<a /g) ?? []).length, 1, summary);
+    assert.equal(richtext.visibleTextOf(card.headlineHtml ?? ''), card.headline, summary);
+    assert.doesNotMatch(card.headlineHtml ?? '', /<strong>|<code>|<b>|data-link="(?:arc-session:|src\/|javascript:)/);
+  }
+  for (const language of ['', 'md', 'text', 'typescript']) {
+    const card = toCard(turn({ summary: `\`\`\`${language}\n${line}\n\`\`\`` }), false, NOW);
+    assert.equal(card.headline, line);
+    assert.equal(card.headlineHtml, undefined);
+  }
+  const prose = toCard(turn({ summary: `See **the** ${link}.` }), false, NOW);
+  assert.equal(prose.headline, 'See the guide.');
+  assert.match(
+    prose.headlineHtml ?? '',
+    /<strong>the<\/strong> <a href="#" data-link="https:\/\/example.com\/guide">guide<\/a>/,
+  );
+  const bare = toCard(turn({ summary: 'See https://example.com/guide' }), false, NOW);
+  assert.equal(bare.headline, 'See https://example.com/guide');
+  assert.match(
+    bare.headlineHtml ?? '',
+    /<a href="#" data-link="https:\/\/example.com\/guide">https:\/\/example.com\/guide<\/a>/,
+  );
+  for (const target of ['javascript:alert', 'data:text/html,bad', 'file:///tmp/a', 'ftp://example.com']) {
+    const card = toCard(turn({ summary: `See [label](${target}).` }), false, NOW);
+    assert.doesNotMatch(card.headlineHtml ?? '', /<a /);
+  }
+});
+
+test('Markdown preview autolinks preserve multiple query parameters', () => {
+  const summary = '```markdown\n<https://example.com/a?x=1&y=2>\n```';
+  const card = toCard(turn({ summary }), false, NOW);
+  assert.equal(card.headline, 'https://example.com/a?x=1&y=2');
+  assert.equal(
+    card.headlineHtml,
+    '<a href="#" data-link="https://example.com/a?x=1&amp;y=2">https://example.com/a?x=1&amp;y=2</a>',
+  );
+  assert.equal(card.summary, summary);
+});
+
+test('Markdown preview literal entities retain their written text', () => {
+  for (const [line, expected] of [
+    ['&lt; example &gt;', '&lt; example &gt;'],
+    ['&amp;lt; &#39; &quot;', '&amp;lt; &#39; &quot;'],
+    ['&lt; [guide](https://example.com) &gt;', '&lt; guide &gt;'],
+  ]) {
+    const summary = `\`\`\`markdown\n${line}\n\`\`\``;
+    const card = toCard(turn({ summary }), false, NOW);
+    assert.equal(card.headline, expected);
+    assert.equal(card.summary, summary);
+  }
+});
+
+test('collapsed escaped prose link examples remain inert beside standalone URLs', () => {
+  for (const example of [String.raw`\[guide](https://example.com)`, String.raw`**\[guide](https://example.com)**`]) {
+    const card = toCard(turn({ summary: `${example} and https://example.org` }), false, NOW);
+    assert.equal(card.headline, '[guide](https://example.com) and https://example.org');
+    assert.doesNotMatch(card.headlineHtml ?? '', /data-link="https:\/\/example.com"/);
+    assert.match(card.headlineHtml ?? '', /data-link="https:\/\/example.org"/);
+  }
+});
+
+test('collapsed leading linked marks retain the anchor after the mark moves', () => {
+  for (const summary of ['[✅ Done](https://example.com)', '```markdown\n[✅ Done](https://example.com)\n```']) {
+    const card = toCard(turn({ summary }), false, NOW);
+    assert.equal(card.headline, 'Done');
+    assert.equal(card.headlineHtml, '<a href="#" data-link="https://example.com">Done</a>');
+    assert.equal(card.summary, summary);
+  }
+});
+
+test('collapsed formatted leading marks retain meaningful link labels', () => {
+  for (const [summary, expectedHtml] of [
+    ['[**✅** Done](https://example.com)', '<a href="#" data-link="https://example.com">Done</a>'],
+    ['[✅](https://example.com) Done', '<a href="#" data-link="https://example.com">Done</a>'],
+    ['```markdown\n[✅](https://example.com) Done\n```', '<a href="#" data-link="https://example.com">Done</a>'],
+    ['**[✅](https://example.com)** **Done**', '<strong><a href="#" data-link="https://example.com">Done</a></strong>'],
+    ['[✅](https://example.com) [Done](https://example.org)', '<a href="#" data-link="https://example.org">Done</a>'],
+  ]) {
+    const card = toCard(turn({ summary }), false, NOW);
+    assert.equal(card.headline, 'Done', summary);
+    assert.equal(card.headlineHtml, expectedHtml, summary);
+    assert.equal(card.summary, summary);
+  }
+});
+
+test('collapsed prose hard breaks retain headline anchors', () => {
+  for (const whitespace of [' ', '  ', '\t', '\r']) {
+    const summary = `  Read [guide](https://example.com/guide).${whitespace}\nNext line.`;
+    const card = toCard(turn({ summary }), false, NOW);
+    assert.equal(card.headline, 'Read guide.');
+    assert.equal(card.headlineHtml, 'Read <a href="#" data-link="https://example.com/guide">guide</a>.');
+    assert.equal(card.summary, summary);
+  }
+});
+
+test('collapsed prose entities retain written text beside headline links', () => {
+  for (const [entity, expected, written] of [
+    ['&#169;', 'A &#169; guide &#169;', '&amp;#169;'],
+    ['&copy;', 'A &copy; guide &copy;', '&amp;copy;'],
+    ['&#x1f600;', 'A &#x1f600; guide &#x1f600;', '&amp;#x1f600;'],
+    ['&amp;lt;', 'A &amp;lt; guide &amp;lt;', '&amp;amp;lt;'],
+    ['&quot;', 'A &quot; guide &quot;', '&amp;quot;'],
+    ['&lt;', 'A &lt; guide &lt;', '&amp;lt;'],
+  ]) {
+    const summary = `A ${entity} [guide ${entity}](https://example.com/a?x=1&y=2)`;
+    const card = toCard(turn({ summary }), false, NOW);
+    assert.equal(card.headline, expected);
+    assert.equal(
+      card.headlineHtml,
+      `A ${written} <a href="#" data-link="https://example.com/a?x=1&amp;y=2">guide ${written}</a>`,
+    );
+    assert.equal(card.summary, summary);
+  }
+});
+
+test('collapsed prose entity text stays literal in image labels and autolinks', () => {
+  const image = toCard(turn({ summary: 'A ![&#169;](chart.png) [guide](https://example.com)' }), false, NOW);
+  assert.equal(image.headline, 'A &#169; guide');
+  assert.equal(image.headlineHtml, 'A &amp;#169; <a href="#" data-link="https://example.com">guide</a>');
+  const autolink = toCard(turn({ summary: '<https://example.com/a?x=1&copy;=2>' }), false, NOW);
+  assert.equal(autolink.headline, 'https://example.com/a?x=1&copy;=2');
+  assert.equal(
+    autolink.headlineHtml,
+    '<a href="#" data-link="https://example.com/a?x=1&amp;copy;=2">https://example.com/a?x=1&amp;copy;=2</a>',
+  );
+});
+
+test('collapsed prose links retain balanced destination parentheses', () => {
+  const card = toCard(
+    turn({ summary: 'See [wiki](https://en.wikipedia.org/wiki/Function_(mathematics)).' }),
+    false,
+    NOW,
+  );
+  assert.equal(card.headline, 'See wiki.');
+  assert.equal(
+    card.headlineHtml,
+    'See <a href="#" data-link="https://en.wikipedia.org/wiki/Function_(mathematics)">wiki</a>.',
+  );
+});
+
+test('collapsed plain prose omits redundant escaped HTML', () => {
+  for (const summary of ['Tom & Jerry ok', 'A < B > C', `Tom's "guide"`]) {
+    const card = toCard(turn({ summary }), false, NOW);
+    assert.equal(card.headline, summary);
+    assert.equal(card.headlineHtml, undefined);
+  }
 });
 
 test("a folded headline keeps a file name's underscore and gets headlineHtml", () => {

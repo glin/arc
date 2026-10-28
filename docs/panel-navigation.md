@@ -107,4 +107,6 @@ Masked interiors must precede table splitting and emphasis matching. Marked's ex
 
 Successful navigation releases only the invoking panel's clear redirect for the destination. Invalid links preserve selection and redirects. Pending starts stay hosted until the current scoped catalog admits their provider and raw session ID. Exports retain inert labels.
 
-Collapsed headlines explicitly enable session anchors. Ordinary headline links and disclosure headings retain link text alone. Headline extraction preserves literal code-block examples inside lists and blockquotes. Headline HTML uses response enhancement for navigation and native context masking.
+Collapsed prose headlines enable session and HTTP(S) anchors. Escaped link examples and inline code remain literal. Disclosure headings retain link text alone. Headline HTML uses response enhancement for navigation and native context masking.
+
+An explicit `markdown` fence, matched without case, enables HTTP(S) link tokens in its collapsed headline. All other source syntax stays literal. Other fence languages, including `md`, keep every example literal. Headline extraction preserves these rules inside lists and blockquotes. Expanded fenced responses remain code blocks. Summary copy retains the complete Markdown source.

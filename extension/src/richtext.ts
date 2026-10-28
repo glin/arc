@@ -282,7 +282,10 @@ function visitCitationMarkdown(text: string, consume: (start: number) => number)
   }
 }
 
-function markdownLiteralRanges(text: string, onCode?: (start: number, end: number, text: string) => void): Uint8Array {
+function markdownLiteralRanges(
+  text: string,
+  onCode?: (start: number, end: number, text: string, language?: string) => void,
+): Uint8Array {
   const literal = new Uint8Array(text.length);
   const pending: { text: string; positions: number[] | null }[] = [{ text, positions: null }];
   while (pending.length) {
@@ -329,7 +332,7 @@ function markdownLiteralRanges(text: string, onCode?: (start: number, end: numbe
       if (block) {
         if (block.type === 'code') {
           mark(offset, offset + block.raw.length);
-          onCode?.(position(offset), position(offset + block.raw.length - 1) + 1, block.text);
+          onCode?.(position(offset), position(offset + block.raw.length - 1) + 1, block.text, block.lang);
         }
         offset += block.raw.length;
         continue;
@@ -404,9 +407,9 @@ function markdownLiteralRanges(text: string, onCode?: (start: number, end: numbe
 }
 
 // Code blocks retain their original extents and text without list or blockquote prefixes.
-export function markdownCodeBlocks(text: string): { start: number; end: number; text: string }[] {
-  const blocks: { start: number; end: number; text: string }[] = [];
-  markdownLiteralRanges(text, (start, end, text) => blocks.push({ start, end, text }));
+export function markdownCodeBlocks(text: string): { start: number; end: number; text: string; language?: string }[] {
+  const blocks: { start: number; end: number; text: string; language?: string }[] = [];
+  markdownLiteralRanges(text, (start, end, text, language) => blocks.push({ start, end, text, language }));
   return blocks.sort((a, b) => a.start - b.start);
 }
 
@@ -489,9 +492,16 @@ function markdownDisclosures(text: string): MarkdownDisclosure[] {
 }
 
 // Read back the visible words emitted by the safe Markdown renderers.
-export function visibleTextOf(html: string): string {
-  return html
-    .replace(/<[^>]*>/g, '')
+export function visibleTextOf(html: string, singlePass = false): string {
+  const text = html.replace(/<[^>]*>/g, '');
+  if (singlePass) {
+    // One pass preserves entity examples that the literal renderer escaped as source text.
+    return text.replace(
+      /&(?:amp|lt|gt|quot|#39);/g,
+      (entity) => ({ '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"', '&#39;': "'" })[entity] || entity,
+    );
+  }
+  return text
     .replace(/&amp;/g, '&')
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
@@ -780,29 +790,90 @@ export function renderRichMarkdown(text: string, resolveImage?: ImageResolver, i
 }
 
 // Renders inline text without raw HTML, image elements, or buttons.
-// Session anchors require explicit opt-in. Other links retain only their visible text.
-export function renderInlineMarkdown(text: string, links?: marked.TokensList['links'], sessionLinks = false): string {
+// Session and external anchors require explicit opt-in. Literal mode changes only eligible external link tokens.
+export function renderInlineMarkdown(
+  text: string,
+  links?: marked.TokensList['links'],
+  inline: { sessionLinks?: boolean; externalLinks?: boolean; literal?: boolean; literalEntities?: boolean } = {},
+): string {
   if (!text) {
     return '';
   }
   try {
     const renderer = new marked.Renderer();
     renderer.html = (html: string) => escapeHtml(html);
+    if (inline.literalEntities) renderer.text = (text: string) => escapeHtml(visibleTextOf(text, true));
     renderer.link = (href: string | null, _title: string | null | undefined, body: string) => {
-      if (!sessionLinks || parseSessionLink(href || '').kind !== 'session') return body;
       const label = insideLink(body);
+      if (inline.externalLinks && /^https?:\/\//i.test(href || '')) {
+        return `<a href="#" data-link="${escapeHtml(href || '')}">${label}</a>`;
+      }
+      if (!inline.sessionLinks || parseSessionLink(href || '').kind !== 'session') return body;
       return `<a href="#" data-link="${escapeHtml(href || '')}" aria-label="Open session: ${label.replace(/<[^>]*>/g, '').replace(/"/g, '&quot;')}">${label}</a>`;
     };
     renderer.image = (href: string | null, _title: string | null, alt: string) => {
       const written = (alt || '').replace(/\s+/g, ' ').trim();
-      return written || escapeHtml(imageFileName(href || ''));
+      return written ? renderer.text(written) : escapeHtml(imageFileName(href || ''));
     };
+    const tokenizer = new marked.Tokenizer() as marked.Tokenizer & marked.TokenizerThis;
+    if (inline.literalEntities) {
+      const inlineText = tokenizer.inlineText;
+      tokenizer.inlineText = function (source, smartypants) {
+        const token = inlineText.call(this, source, smartypants);
+        if (token) token.text = escapeHtml(token.raw);
+        return token;
+      };
+    }
+    if (inline.externalLinks) {
+      const autolink = tokenizer.autolink;
+      tokenizer.autolink = function (source, mangle) {
+        const token = autolink.call(this, source, mangle);
+        // Marked escapes angle-autolink destinations before the renderer receives them.
+        if (token && /^https?:\/\//i.test(token.href)) token.href = visibleTextOf(token.href, true);
+        return token;
+      };
+      if (!inline.literal) {
+        const escape = tokenizer.escape;
+        tokenizer.escape = function (source) {
+          const token = escape.call(this, source);
+          // Consume a complete escaped example before GFM recognizes its destination as a bare URL.
+          const example = token?.raw === '\\[' ? this.link(source.slice(1)) : undefined;
+          return example ? { type: 'escape', raw: '\\' + example.raw, text: escapeHtml(example.raw) } : token;
+        };
+      }
+    }
     // Disable random email character references so unchanged headlines retain stable HTML.
-    const options = { ...marked.getDefaults(), async: false, gfm: true, mangle: false, renderer };
-    if (!links) return marked.parseInline(text, options);
+    // All bare URLs stay literal in literal mode, including URLs inside escaped Markdown examples.
+    const options = { ...marked.getDefaults(), async: false, gfm: !inline.literal, mangle: false, renderer, tokenizer };
+    if (!links && !inline.literal) return marked.parseInline(text, options);
     const lexer = new marked.Lexer(options);
-    lexer.tokens.links = links;
-    return marked.Parser.parseInline(lexer.inlineTokens(text), options);
+    if (links) lexer.tokens.links = links;
+    const tokens = lexer.inlineTokens(text);
+    if (!inline.literal) return marked.Parser.parseInline(tokens, options);
+    const literalTokens = (tokens: marked.Token[]): string =>
+      tokens
+        .map((token) => {
+          if (token.type === 'link') {
+            const label = token.raw.startsWith('<') ? visibleTextOf(token.text, true) : token.text;
+            return inline.externalLinks && /^https?:\/\//i.test(token.href || '')
+              ? renderer.link(token.href, null, escapeHtml(label))
+              : escapeHtml(token.raw);
+          }
+          if ('tokens' in token && token.tokens) {
+            let offset = 0;
+            let html = '';
+            for (const child of token.tokens) {
+              const start = token.raw.indexOf(child.raw, offset);
+              if (start < 0) return escapeHtml(token.raw);
+              html += escapeHtml(token.raw.slice(offset, start)) + literalTokens([child]);
+              offset = start + child.raw.length;
+            }
+            return html + escapeHtml(token.raw.slice(offset));
+          }
+          return escapeHtml(token.raw);
+        })
+        .join('');
+    return literalTokens(tokens);
   } catch {
     return escapeHtml(text);
   }

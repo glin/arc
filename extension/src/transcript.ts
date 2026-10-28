@@ -5759,7 +5759,7 @@ function stripMarkdown(line: string): string {
 }
 
 // Selects the first content-bearing summary line and retains its fenced-code context.
-export type HeadlineSource = { text: string; fenced: boolean };
+export type HeadlineSource = { text: string; fenced: boolean; html?: string; plain: string };
 
 export function headlineSourceOf(summary: string): HeadlineSource | null {
   const blocks = markdownCodeBlocks(summary);
@@ -5775,15 +5775,31 @@ export function headlineSourceOf(summary: string): HeadlineSource | null {
         .split('\n')
         .find((line) => line.trim())
         ?.trim();
-      if (text) return { text, fenced: true };
+      if (text) {
+        const markdown = block.language?.split(/\s+/, 1)[0].toLowerCase() === 'markdown';
+        const html = markdown
+          ? renderInlineMarkdown(text, undefined, { externalLinks: true, literal: true })
+          : undefined;
+        return {
+          text,
+          fenced: true,
+          plain: html === undefined ? text : visibleTextOf(html, true),
+          ...(html === undefined ? {} : { html }),
+        };
+      }
       continue;
     }
-    const structural = stripStructuralMarkdown(raw);
-    const plain = stripInlineMarkdown(structural);
+    const structural = stripStructuralMarkdown(raw).trim();
+    const html = renderInlineMarkdown(structural, undefined, {
+      sessionLinks: true,
+      externalLinks: true,
+      literalEntities: true,
+    });
+    const plain = html.includes('<a ') ? visibleTextOf(html, true) : stripInlineMarkdown(structural);
     if (!plain || SECTION_ONLY.test(plain)) {
       continue;
     }
-    return { text: structural, fenced: false };
+    return { text: structural, fenced: false, html, plain };
   }
   return null;
 }
@@ -5792,7 +5808,7 @@ export function headlineSourceOf(summary: string): HeadlineSource | null {
 // content rather than naming a section. A caller that already selected the source from the
 // same summary passes it in, and a selected null is a valid result that skips selecting again.
 export function headlineOf(summary: string, source: HeadlineSource | null = headlineSourceOf(summary)): string {
-  return source === null ? '' : source.fenced ? source.text : stripInlineMarkdown(source.text);
+  return source?.plain ?? '';
 }
 
 // Same headline line with inline Markdown retained for folded-card rendering.

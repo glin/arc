@@ -16,6 +16,7 @@ import { payloadSha256 } from '../../extension/src/sessionwrites.ts';
 import { projectSlug } from '../../extension/src/transcript.ts';
 import * as fs from 'node:fs';
 import { WINDOW_PIPE_SOURCE } from '../../extension/src/windowpipe-source.ts';
+import { forTesting as processCleanup } from '../../extension/test/browserlock.mjs';
 import {
   skillFiles,
   collectRow,
@@ -484,8 +485,88 @@ process.stdin.on('end',()=>{
   }
 }, 30_000);
 
-test('bundled standalone command emits only its admitted native receipt after launch JSON', async () => {
+async function cleanupNativeReceipt(home, launchId, bodyError) {
+  try {
+    if (!launchId && fs.existsSync(join(home, 'dispatch')))
+      launchId = fs
+        .readdirSync(join(home, 'dispatch'))
+        .find((name) => /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(name));
+    if (launchId)
+      await vi.waitFor(
+        () =>
+          assert.equal(
+            JSON.parse(readFileSync(join(home, 'dispatch', launchId, 'monitor.json'), 'utf8')).released,
+            true,
+          ),
+        { timeout: 10_000 },
+      );
+    // The supervisor observes its native child through a retained handle before releasing the monitor.
+    // Windows releases the supervisor's cwd when that process exits naturally.
+    await vi.waitFor(() => rmSync(home, { recursive: true, force: true }), { timeout: 10_000 });
+  } catch (error) {
+    if (!bodyError) throw error;
+    console.error('Native receipt fixture cleanup failed:', error);
+  }
+}
+
+for (const failed of [false, true])
+  test(`native receipt cleanup leaves recycled PIDs alone after body ${failed ? 'failure' : 'success'}`, async () => {
+    const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-receipt-cleanup-'));
+    const launchId = 'aaaaaaaa-1111-2222-3333-444444444444';
+    fs.mkdirSync(join(home, 'dispatch', launchId), { recursive: true });
+    writeFileSync(join(home, 'dispatch', launchId, 'monitor.json'), JSON.stringify({ released: true }));
+    writeFileSync(join(home, 'native-pid.json'), JSON.stringify({ pid: 12346 }));
+    const observation = vi
+      .spyOn(DispatchReceipts.prototype, 'observation')
+      .mockReturnValue({ supervisor: { pid: 12345 } });
+    let terminated = false;
+    const kill = vi.spyOn(process, 'kill').mockImplementation(() => {
+      if (terminated) throw Object.assign(new Error('exited'), { code: 'ESRCH' });
+      return true;
+    });
+    const killTree = vi.spyOn(processCleanup, 'killProcessTree').mockImplementation(() => {
+      terminated = true;
+    });
+    const primary = failed ? new Error('receipt body failed') : undefined;
+    try {
+      await cleanupNativeReceipt(home, undefined, primary);
+      assert.equal(fs.existsSync(home), false);
+      assert.equal(kill.mock.calls.length, 0);
+      assert.equal(killTree.mock.calls.length, 0);
+    } finally {
+      kill.mockRestore();
+      killTree.mockRestore();
+      observation.mockRestore();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+test('native receipt cleanup preserves the primary body failure when cleanup fails', async () => {
+  const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-receipt-primary-'));
+  const primary = new Error('receipt body failed');
+  const cleanup = new Error('receipt cleanup failed');
+  const wait = vi.spyOn(vi, 'waitFor').mockRejectedValueOnce(cleanup);
+  const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+  try {
+    await assert.rejects(
+      async () => {
+        await cleanupNativeReceipt(home, undefined, primary);
+        throw primary;
+      },
+      (error) => error === primary,
+    );
+    assert.deepEqual(logged.mock.calls, [['Native receipt fixture cleanup failed:', cleanup]]);
+  } finally {
+    wait.mockRestore();
+    logged.mockRestore();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('bundled standalone command emits only its admitted native receipt after launch JSON', async ({ signal }) => {
   const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-native-receipt-'));
+  const sources = join(home, 'sessions');
+  fs.mkdirSync(sources);
   const run = promisify(execFile);
   const id = 'aaaaaaaa-1111-2222-3333-444444444444';
   const spoof = 'ARC_DISPATCH_SESSION={"agent":"claude","session_id":"deadbeef"}';
@@ -496,16 +577,21 @@ test('bundled standalone command emits only its admitted native receipt after la
     preloader,
     `if(require('node:path').basename(process.argv[1])==='exec') {
 const fs=require('node:fs');fs.writeFileSync(process.argv[process.argv.indexOf('-o')+1],${JSON.stringify(spoof)});
+fs.writeFileSync(${JSON.stringify(join(sources, `rollout-${id}.jsonl`))},JSON.stringify({type:'session_meta',payload:{id:'${id}',cwd:${JSON.stringify(home)}}})+'\\n');
 for(const row of [{type:'thread.started',thread_id:'${id}'},{type:'turn.started'},
 {type:'item.completed',item:{type:'agent_message',id:'answer',text:${JSON.stringify(spoof)}}},{type:'turn.completed'}]) fs.writeSync(1,JSON.stringify(row)+'\\n');process.exit(0);}`,
   );
   const env = {
     ...smokeEnv,
     ARC_HOME: home,
+    ARC_CODEX_ROOT: sources,
+    ARC_PROJECTS_ROOT: join(home, 'projects'),
     CODEX_BIN: process.execPath,
     NODE_OPTIONS: [smokeEnv.NODE_OPTIONS, `--require ${JSON.stringify(preloader)}`].filter(Boolean).join(' '),
   };
   let passed = false;
+  let bodyError;
+  let launchId;
   try {
     const result = await run(
       process.execPath,
@@ -526,11 +612,12 @@ for(const row of [{type:'thread.started',thread_id:'${id}'},{type:'turn.started'
         '--completion',
         'wait',
       ],
-      { env, encoding: 'utf8', timeout: 20_000 },
+      { env, encoding: 'utf8', timeout: 20_000, signal },
     );
     const lines = result.stdout.trim().split('\n');
     assert.equal(lines.length, 2);
     const launch = JSON.parse(lines[0]);
+    launchId = launch.launchId;
     assert.equal(launch.state, 'observed');
     assert.deepEqual(JSON.parse(lines[1].slice('ARC_DISPATCH_SESSION='.length)), {
       agent: 'codex',
@@ -545,14 +632,19 @@ for(const row of [{type:'thread.started',thread_id:'${id}'},{type:'turn.started'
         true,
       ),
     );
-    const help = await run(process.execPath, [cli, 'dispatch', 'rm', '--help'], { env, encoding: 'utf8' });
+    const help = await run(process.execPath, [cli, 'dispatch', 'rm', '--help'], { env, encoding: 'utf8', signal });
     assert.match(help.stdout, /preservation is established/);
-    await assert.rejects(run(process.execPath, [cli, 'dispatch', 'rm', launch.launchId, '--force'], { env }), /Usage:/);
+    await assert.rejects(
+      run(process.execPath, [cli, 'dispatch', 'rm', launch.launchId, '--force'], { env, signal }),
+      /Usage:/,
+    );
     passed = true;
-  } finally {
-    if (!passed) printDispatchReceipts(home);
-    rmSync(home, { recursive: true, force: true });
+  } catch (error) {
+    bodyError = error;
   }
+  if (!passed) printDispatchReceipts(home);
+  await cleanupNativeReceipt(home, launchId, bodyError);
+  if (!passed) throw bodyError;
 });
 
 test('bundled starts refuse ambiguous guarded requesters and send only accepted cache lifetimes', async () => {
