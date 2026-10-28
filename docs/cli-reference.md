@@ -172,7 +172,7 @@ Write JSON includes `requestId` and `status`. Unknown delivery omits accepted-re
 
 Forced archive replies include `evaluatedRunStatus` before membership changes, or null without a listing row. [Archive safety](cli.md#session-management) applies independently of that observation. [Child ownership and shutdown](agent-protocols.md#child-ownership-and-shutdown) define hosted process retirement.
 
-Each activation retains at most 4,096 shared write results for starts, curation, read acknowledgments, and queued, accepted, or unknown sends. Guarded sends separately admit at most 256 distinct IDs, including refused outcomes. Capacity never returns. Refused guarded sends preserve shared-result capacity. Exact retained retries precede capacity checks. Starts and curation consume no guarded units. Curation dry runs consume neither allowance. At either limit, Arc refuses new IDs until the window reloads.
+Each activation retains at most 4,096 shared write results for starts, curation, read acknowledgments, and queued, accepted, or unknown sends. Guarded sends separately admit at most 256 distinct IDs, including refused outcomes. Capacity never returns. Refused guarded sends preserve shared-result capacity. Exact retained retries precede capacity checks. Starts and curation consume no guarded units. Curation dry runs consume neither allowance. At the shared limit, Arc refuses a new ID for every request except a curation dry run. At the guarded limit, Arc refuses a new send ID. Each refusal lasts until the window reloads.
 
 ## Follow-ups
 

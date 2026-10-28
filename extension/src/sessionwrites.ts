@@ -148,9 +148,9 @@ export function sessionWriteBinding(
 }
 
 // The shared result allowance for starts, curation, sends and read acknowledgments in one activation.
-export const SESSION_WRITE_LIMIT = 4096;
+const SESSION_WRITE_LIMIT = 4096;
 // The guarded allowance bounds sends alone, so a runaway send loop stops well before the shared allowance.
-export const GUARDED_SEND_LIMIT = 256;
+const GUARDED_SEND_LIMIT = 256;
 
 // Retention never evicts an admitted ID. New guarded sends reserve lifetime capacity before their handlers run.
 // Refused sends move to a separate table, so they keep their bindings without filling the shared result table.

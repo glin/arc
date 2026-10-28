@@ -181,8 +181,8 @@
   },
   "extension/src/sessionwrites.test.ts": {
     "reason": "Authenticated window channels must preserve accepted reads, ordered writes, and ownership across native IPC.",
-    "cases": 24,
-    "matricesSha256": "96fa69c0c9ecdb3f91b22b590bab681b634885dc400ddbdd69911a3687ce72b3"
+    "cases": 29,
+    "matricesSha256": "9b242ecc7f73eff55cf3be7a780472a186a66979cd33075f67a939a8fa7d411d"
   },
   "extension/src/startup.browser.test.ts": {
     "reason": "Startup and restored panel rendering must preserve usable browser state and focus.",

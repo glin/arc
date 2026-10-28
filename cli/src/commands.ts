@@ -37,8 +37,8 @@ const requestFlag: Flag = [
 ];
 const dryRunFlag: Flag = ['--dry-run', 'Check admission without changing session metadata.'];
 const curationDryRunFlag: Flag = [
-  '--dry-run',
-  'Check admission without changing session metadata. Arc retains no dry-run result, so a retry checks again.',
+  dryRunFlag[0],
+  `${dryRunFlag[1]} Arc retains no dry-run result, so a retry checks again and the ID stays free for a later write.`,
 ];
 const windowRefusal = 'Window selection, unavailable capabilities, or repository readiness can refuse the request.';
 const curationOutput = [
