@@ -275,7 +275,8 @@ export interface ProcessEntry {
 // waits for the suite lock has started no child process yet, so it does not count.
 export function runningTestRuns(processes: readonly ProcessEntry[]): number {
   const run = (entry: ProcessEntry) =>
-    /^"?[^"\s]*node(?:\.exe)?"?\s/i.test(entry.command) && /(?:test-suite|verify-landing)\.mjs/.test(entry.command);
+    /^(?:"[^"]*node(?:\.exe)?"|\S*node(?:\.exe)?)\s/i.test(entry.command) &&
+    /(?:test-suite|verify-landing)\.mjs/.test(entry.command);
   const working = new Set(processes.filter((entry) => !run(entry)).map((entry) => entry.parent));
   return processes.filter((entry) => run(entry) && working.has(entry.pid)).length;
 }

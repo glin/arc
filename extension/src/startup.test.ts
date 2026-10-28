@@ -1485,8 +1485,11 @@ test('the build comparison fails past a margin and passes within it', () => {
 });
 
 test('a copied dispatch store validates after rebinding at the cost of its source', () => {
+  // The transcript and working directory sit outside the receipt store, as they do on a real machine. The final
+  // recheck stats each distinct ancestor once, so a shared parent would make the source cheaper than any copy.
   const home = tempDir('rebind-source');
-  const cwd = path.join(home, 'work');
+  const work = tempDir('rebind-work');
+  const cwd = path.join(work, 'cwd');
   fs.mkdirSync(cwd);
   const parent = 'aaaaaaaa-1111-2222-3333-444444444444';
   const child = 'bbbbbbbb-1111-2222-3333-444444444444';
@@ -1517,15 +1520,15 @@ test('a copied dispatch store validates after rebinding at the cost of its sourc
       deadlineMs: 10_000,
     },
   });
-  const file = path.join(home, 'native.jsonl');
+  const file = path.join(work, 'native.jsonl');
   const opening = JSON.stringify({ sessionId: child, cwd }) + '\n';
   fs.writeFileSync(file, opening + 'x'.repeat(2048));
   const stat = fs.statSync(file, { bigint: true });
-  const directory = fs.statSync(home, { bigint: true });
+  const directory = fs.statSync(work, { bigint: true });
   receipts.startup(launch.launchId, {
     file,
     identity: `${stat.dev}:${stat.ino}`,
-    ancestor: home,
+    ancestor: work,
     directory: `${directory.dev}:${directory.ino}`,
     cwd: fs.realpathSync.native(cwd),
     bytes: Buffer.byteLength(opening),
