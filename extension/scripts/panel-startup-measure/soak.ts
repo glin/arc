@@ -264,20 +264,41 @@ export function hostMemory(profile: string): HostMemory | null {
   return { pid, workingSetBytes: rss * 1024, peakWorkingSetBytes: peak, privateBytes: null };
 }
 
-// Count running test-suite and verify-landing processes, including runs that take no suite lock.
+export interface ProcessEntry {
+  pid: number;
+  parent: number;
+  command: string;
+}
+
+// Count test-suite and verify-landing processes that run work, including runs that take no suite lock. A run counts
+// when it has a child that is not another run process, so a shell that starts a run does not count again. A run that
+// waits for the suite lock has started no child process yet, so it does not count.
+export function runningTestRuns(processes: readonly ProcessEntry[]): number {
+  const run = (entry: ProcessEntry) =>
+    /^"?[^"\s]*node(?:\.exe)?"?\s/i.test(entry.command) && /(?:test-suite|verify-landing)\.mjs/.test(entry.command);
+  const working = new Set(processes.filter((entry) => !run(entry)).map((entry) => entry.parent));
+  return processes.filter((entry) => run(entry) && working.has(entry.pid)).length;
+}
+
 export function activeTestRuns(): number {
-  const pattern = /(?:test-suite|verify-landing)\.mjs/;
   if (process.platform === 'win32') {
     const query =
-      "@(Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | Where-Object { $_.CommandLine -match '(test-suite|verify-landing)\\.mjs' }).Count";
-    const count = Number(
-      spawnSync('powershell', ['-NoProfile', '-Command', query], { encoding: 'utf8' }).stdout.trim(),
+      'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CommandLine | ConvertTo-Json -Compress';
+    const rows = JSON.parse(
+      spawnSync('powershell', ['-NoProfile', '-Command', query], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
+        .stdout,
+    ) as Array<{ ProcessId: number; ParentProcessId: number; CommandLine: string | null }>;
+    return runningTestRuns(
+      rows.map((row) => ({ pid: row.ProcessId, parent: row.ParentProcessId, command: row.CommandLine ?? '' })),
     );
-    return Number.isFinite(count) ? count : 0;
   }
-  return spawnSync('ps', ['-eo', 'args='], { encoding: 'utf8' })
-    .stdout.split('\n')
-    .filter((entry) => pattern.test(entry)).length;
+  return runningTestRuns(
+    spawnSync('ps', ['-eo', 'pid=,ppid=,args='], { encoding: 'utf8' })
+      .stdout.split('\n')
+      .map((line) => /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line))
+      .filter((match): match is RegExpExecArray => match !== null)
+      .map((match) => ({ pid: Number(match[1]), parent: Number(match[2]), command: match[3] })),
+  );
 }
 
 // The measures a soak snapshot supplies, in the units the comparison reads.

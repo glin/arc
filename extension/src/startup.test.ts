@@ -305,7 +305,13 @@ import {
 } from '../scripts/panel-startup-measure/measure';
 import { freezeCatalog, rebindDispatch, refuseUnsafeSource } from '../scripts/panel-startup-measure/freeze';
 import { DispatchReceipts } from './dispatchreceipts';
-import { appendDispatchTurn, instrumentSoak, soakMeasures, startDispatch } from '../scripts/panel-startup-measure/soak';
+import {
+  appendDispatchTurn,
+  instrumentSoak,
+  runningTestRuns,
+  soakMeasures,
+  startDispatch,
+} from '../scripts/panel-startup-measure/soak';
 
 test('selection measurements reject missing stages, unrelated worker replies, and reversed browser clocks', () => {
   const stages = [
@@ -1554,6 +1560,23 @@ test('a copied dispatch store validates after rebinding at the cost of its sourc
   assert.equal(rebound.openings, 1);
   assert.ok(rebound.witnesses >= 2, String(rebound.witnesses));
   assert.deepEqual(scan(copy), source);
+});
+
+test('an editor launch waits only for test runs that run work', () => {
+  const node = '"C:/Program Files/nodejs/node.exe"';
+  assert.equal(
+    runningTestRuns([
+      { pid: 1, parent: 0, command: 'C:/WINDOWS/system32/cmd.exe /d /s /c node scripts/test-suite.mjs all' },
+      { pid: 2, parent: 1, command: 'node  scripts/test-suite.mjs all' },
+      { pid: 3, parent: 2, command: `${node} node_modules/vitest/vitest.mjs run` },
+      { pid: 4, parent: 0, command: `${node} scripts/test-suite.mjs all` },
+      { pid: 5, parent: 0, command: '"C:/Program Files/Git/bin/bash.exe" -c "node scripts/verify-landing.mjs"' },
+      { pid: 6, parent: 5, command: 'conhost.exe' },
+      { pid: 7, parent: 0, command: '/usr/bin/node scripts/verify-landing.mjs' },
+      { pid: 8, parent: 7, command: 'git status' },
+    ]),
+    2,
+  );
 });
 
 test('a fixture in the Arc home measure directory is not live data', () => {
