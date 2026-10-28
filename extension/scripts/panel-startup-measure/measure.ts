@@ -9,10 +9,10 @@ import { pathRewriter, rebindDispatch } from './freeze';
 import { instrumentSelection, measureSelection, instrumentResponse, measureResponse } from './selection';
 import {
   appendDispatchTurn,
+  activeTestRuns,
   hostMemory,
   instrumentSoak,
   linkTree,
-  machineBusy,
   soakMeasures,
   startDispatch,
   type HostMemory,
@@ -150,7 +150,7 @@ function readOptions(argv: string[]): Options {
     response: false,
     soakMinutes: 0,
     warmUp: false,
-    minimumFreeGb: 8,
+    minimumFreeGb: 5,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const flag = argv[i];
@@ -878,13 +878,22 @@ export async function pollStartup(
 // Measures of the measured launch beyond its startup milestones, written into result.json.
 const runRecord: Record<string, unknown> = {};
 
-// Wait until no full test suite runs and free memory reaches the floor. A busy machine skews every timing.
+// Wait until no test run is active and free memory reaches the floor. A loaded machine skews every timing.
+// A test run that predates the suite lock does not take it, so the process scan still applies.
 async function awaitMachine(minimumFreeGb: number, deadlineMs: number): Promise<void> {
+  const { freeMemoryBytes } = await import('../../test/machineload.mjs');
   const deadline = Date.now() + deadlineMs;
   for (;;) {
-    const busy = machineBusy(minimumFreeGb);
-    if (!busy) return;
-    if (Date.now() >= deadline) throw new Error(`The machine stayed busy: ${busy}`);
+    const runs = activeTestRuns();
+    const free = freeMemoryBytes() as number | null;
+    if (runs === 0 && free !== null && free >= minimumFreeGb * 1024 ** 3) return;
+    const busy =
+      runs > 0
+        ? `${runs} test-suite or verify-landing processes are running.`
+        : free === null
+          ? 'Free memory is unavailable.'
+          : `Free memory is ${(free / 1024 ** 3).toFixed(1)} GB, below the ${minimumFreeGb} GB floor.`;
+    if (Date.now() >= deadline) throw new Error(`The machine stayed loaded: ${busy}`);
     process.stdout.write(`Waiting before launch. ${busy}\n`);
     await delay(30_000);
   }
@@ -1025,18 +1034,24 @@ async function soak(
 async function measure(commandLine: string, workspace: string, options: Options): Promise<Outcome> {
   const timeoutMs = options.timeoutMs;
   const { acquireBrowserLock } = await import('../../test/browserlock.mjs');
+  const { acquireSuiteLock, loadSettings } = await import('../../test/machineload.mjs');
   const { createTestObservation } = await import('../../test/observations.mjs');
   const observation = createTestObservation({ lane: 'panel startup measurement', cwd: REPOSITORY, capacity: 1 });
   observation.unavailable('build', 'The measured build is prepared before this request.');
   let failure: string | null = null;
   let complete = false;
   let lock;
+  let suite;
   try {
+    // Wait for memory before taking the locks, so a long wait never blocks a test run.
+    await awaitMachine(options.minimumFreeGb, 30 * 60_000);
+    // A measured launch holds the machine suite lock, so no multi-lane test run overlaps it.
+    suite = await acquireSuiteLock({ deadlineMs: loadSettings().deadlineMs });
     lock = await acquireBrowserLock({ deadlineMs: timeoutMs, observation });
     const logs = path.join(ARC_STORE, DIAGNOSTICS_LOG_DIRECTORY);
     const reader = new LogReader(logs);
     if (options.warmUp) {
-      await awaitMachine(options.minimumFreeGb, 30 * 60_000);
+      await awaitMachine(options.minimumFreeGb, 10 * 60_000);
       const warmRun = `${MEASUREMENT_RUN}-warm`;
       const warmAt = Date.now();
       const warmLaunch = launchEditor(commandLine, workspace, WARM_USER_DATA, warmRun);
@@ -1052,7 +1067,7 @@ async function measure(commandLine: string, workspace: string, options: Options)
         stopEditor(WARM_USER_DATA);
       }
     }
-    await awaitMachine(options.minimumFreeGb, 30 * 60_000);
+    await awaitMachine(options.minimumFreeGb, 10 * 60_000);
     const memory = new MemoryWatch();
     const launchedAt = Date.now();
     const launch = launchEditor(commandLine, workspace);
@@ -1090,6 +1105,7 @@ async function measure(commandLine: string, workspace: string, options: Options)
       stopEditor();
       runRecord.startupRecord = measuredStartupRecord(path.join(ARC_STORE, 'startup'), memory.last?.pid ?? null);
       lock?.release();
+      suite?.release();
       observation.end('cleanup', { descendants: 'unobserved' });
     }
   } catch (error) {

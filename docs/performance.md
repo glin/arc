@@ -124,7 +124,7 @@ Add `--response` to capture one synthetic live response becoming a recorded rich
 
 `--keep` retains the build checkout. Other run resources remain available for inspection. A cleanup refusal ends the run without a retry. `ARC_MEASURE_EDITOR` selects a VS Code install directory. Compare repeated runs with identical inputs, settings, selection, and imports. Shared machine workload and operating-system disk cache remain measurement limits.
 
-Before each launch, the runner waits while a `test-suite.mjs all` process runs or free physical memory sits below 8 GB. `--min-free-gb <gigabytes>` changes the floor. The wait ends the run after 30 minutes.
+Each run holds the [machine suite lock](development.md#machine-load) and the browser lane lock, so no multi-lane test run overlaps it. An editor launch needs 5 GB of free memory and no running `test-suite.mjs` or `verify-landing.mjs` process. The process check also covers runs that take no suite lock. The runner waits up to 30 minutes for both conditions before it takes the locks. Right before each launch it reads them again, with the locks held, and waits up to 10 more minutes. `--min-free-gb <gigabytes>` changes the floor. A wait past its limit ends the run.
 
 `--warm-up` launches the build once with its own profile and the run's Arc store, waits for startup, and closes it. The measured launch then reads the store that the warm-up filled. `warmUp` in `result.json` records the warm-up startup.
 

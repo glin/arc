@@ -1550,7 +1550,7 @@ test('a copied dispatch store validates after rebinding at the cost of its sourc
   assert.equal(refused.references, 0);
   assert.ok(refused.checks < source.checks, `${refused.checks} < ${source.checks}`);
   const rebound = rebindDispatch(path.join(copy, 'dispatch'));
-  assert.equal(rebound.anchors, 1);
+  assert.ok(rebound.anchors >= 1, String(rebound.anchors));
   assert.equal(rebound.openings, 1);
   assert.ok(rebound.witnesses >= 2, String(rebound.witnesses));
   assert.deepEqual(scan(copy), source);

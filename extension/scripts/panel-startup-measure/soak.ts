@@ -2,7 +2,6 @@
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
-import * as os from 'node:os';
 import * as path from 'node:path';
 import { projectSlug } from '../../src/transcript.ts';
 
@@ -265,32 +264,20 @@ export function hostMemory(profile: string): HostMemory | null {
   return { pid, workingSetBytes: rss * 1024, peakWorkingSetBytes: peak, privateBytes: null };
 }
 
-// A measurement waits while a full test suite runs or free memory sits below the floor.
-export function machineBusy(minimumFreeGb: number): string | null {
-  let free = os.freemem();
-  let suites = 0;
+// Count running test-suite and verify-landing processes, including runs that take no suite lock.
+export function activeTestRuns(): number {
+  const pattern = /(?:test-suite|verify-landing)\.mjs/;
   if (process.platform === 'win32') {
     const query =
-      "(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory; @(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'test-suite\\.mjs\\s+all' }).Count";
-    const [kib, count] = spawnSync('powershell', ['-NoProfile', '-Command', query], { encoding: 'utf8' })
-      .stdout.trim()
-      .split(/\r?\n/)
-      .map(Number);
-    if (Number.isFinite(kib)) free = kib * 1024;
-    suites = Number.isFinite(count) ? count : 0;
-  } else {
-    if (process.platform === 'linux') {
-      const available = /^MemAvailable:\s+(\d+)\s+kB/m.exec(fs.readFileSync('/proc/meminfo', 'utf8'));
-      if (available) free = Number(available[1]) * 1024;
-    }
-    suites = spawnSync('ps', ['-eo', 'args='], { encoding: 'utf8' })
-      .stdout.split('\n')
-      .filter((entry) => /test-suite\.mjs\s+all/.test(entry)).length;
+      "@(Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | Where-Object { $_.CommandLine -match '(test-suite|verify-landing)\\.mjs' }).Count";
+    const count = Number(
+      spawnSync('powershell', ['-NoProfile', '-Command', query], { encoding: 'utf8' }).stdout.trim(),
+    );
+    return Number.isFinite(count) ? count : 0;
   }
-  if (suites > 0) return 'A full test suite is running.';
-  if (free < minimumFreeGb * 1024 ** 3)
-    return `Free memory is ${(free / 1024 ** 3).toFixed(1)} GB, below the ${minimumFreeGb} GB floor.`;
-  return null;
+  return spawnSync('ps', ['-eo', 'args='], { encoding: 'utf8' })
+    .stdout.split('\n')
+    .filter((entry) => pattern.test(entry)).length;
 }
 
 // The measures a soak snapshot supplies, in the units the comparison reads.
