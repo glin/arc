@@ -75,6 +75,11 @@ test(
         (payload.usage as { composer: { context: { generation: number } } }).composer.context.generation++;
         await post(page, payload);
         const requested = await page.evaluate<any>('window.__posted.filter(m => m.type === "contextDetail").at(-1)');
+        assert.equal(
+          await pop.locator('.context-breakdown').count(),
+          1,
+          'refresh dropped the breakdown before the reply',
+        );
         await post(page, { type: 'contextDetail', detail: { ...next, ...requested } });
       };
       await post(page, { type: 'contextDetail', detail });
@@ -97,10 +102,7 @@ test(
       );
       await page.keyboard.press('Shift+Tab');
       await refresh({ ...detail, capturedAt: 2 });
-      assert.equal(
-        await pop.locator('.context-bound button').evaluate((node) => node === document.activeElement),
-        true,
-      );
+      assert.equal(await summary.evaluate((node) => node === document.activeElement), true);
       assert.equal(await disclosure.evaluate((node) => (node as HTMLDetailsElement).open), true);
       await summary.focus();
       await page.keyboard.press('Space');
@@ -678,6 +680,11 @@ test(
           for (const text of ['Messages', '72.7%', 'of used context', '80,000 tokens'])
             assert.ok(mismatch.includes(text), 'mismatch row omits its reported count or percentage semantics');
           assert.equal(await detail.locator('tbody tr td').first().getAttribute('title'), '80,000 tokens');
+          const drawn = await detail.innerHTML();
+          stateContext.generation++;
+          await post(page, statePayload);
+          assert.equal(await detail.locator('.context-table').count(), 1, 'refresh dropped the kept mismatch table');
+          assert.equal(await detail.innerHTML(), drawn, 'refresh redrew the kept mismatch detail before the reply');
         } else if (state === 'zero-mismatch') {
           assert.equal(await detail.locator('.context-meter').count(), 0, 'zero used context draws meters');
           const mismatch = await detail.locator('tbody tr').first().ariaSnapshot();
@@ -731,10 +738,11 @@ test(
       composer.context.generation += 1;
       await post(page, refreshed);
       assert.equal(await detail.isVisible(), true, 'same-session refresh closed detail');
+      assert.equal(await measurement.count(), 1, 'same-session loading dropped the measurement details');
       assert.equal(
-        await detail.locator('button').evaluate((node) => node === document.activeElement),
+        await summary.evaluate((node) => node === document.activeElement),
         true,
-        'same-session loading lost focus when the measurement summary disappeared',
+        'same-session loading lost the measurement summary focus',
       );
       const refreshRequest = await page.evaluate<{ request: number; generation: number }>(
         'window.__posted.filter(m => m.type === "contextDetail").at(-1)',
@@ -757,9 +765,80 @@ test(
         'same-session reply collapsed measurement details',
       );
       assert.equal(
-        await detail.locator('.context-bound button').evaluate((node) => node === document.activeElement),
+        await summary.evaluate((node) => node === document.activeElement),
         true,
-        'same-session reply lost the surviving Compact focus',
+        'same-session reply lost the measurement summary focus',
+      );
+      composer.context.generation += 1;
+      await post(page, refreshed);
+      const pendingRequest = await page.evaluate<{ request: number; generation: number }>(
+        'window.__posted.filter(m => m.type === "contextDetail").at(-1)',
+      );
+      await post(page, {
+        type: 'contextDetail',
+        detail: {
+          ...measured,
+          ...pendingRequest,
+          provider: 'codex',
+          status: 'unavailable',
+          reason: 'pending-tools',
+          used: null,
+          capacity: null,
+          remaining: null,
+          reserve: null,
+          categories: [],
+        },
+      });
+      assert.equal(await detail.locator('.context-breakdown').count(), 1, 'pending tool reply dropped the breakdown');
+      await page.keyboard.press('Escape');
+      assert.equal(await detail.isHidden(), true);
+      await anchor.focus();
+      await page.keyboard.press('Enter');
+      assert.equal(await detail.isVisible(), true);
+      const reopened = await detail.locator('.context-breakdown').count();
+      const reopenRequest = await page.evaluate<{ request: number; generation: number }>(
+        'window.__posted.filter(m => m.type === "contextDetail").at(-1)',
+      );
+      await post(page, {
+        type: 'contextDetail',
+        detail: {
+          ...measured,
+          ...reopenRequest,
+          provider: 'codex',
+          status: 'unavailable',
+          reason: 'pending-tools',
+          used: null,
+          capacity: null,
+          remaining: null,
+          reserve: null,
+          categories: [],
+        },
+      });
+      assert.equal(
+        await detail.locator('.context-breakdown').count(),
+        reopened,
+        'reopened detail drew a breakdown that the next reply removed',
+      );
+      composer.context.generation += 1;
+      await post(page, refreshed);
+      const restoreRequest = await page.evaluate<{ request: number; generation: number }>(
+        'window.__posted.filter(m => m.type === "contextDetail").at(-1)',
+      );
+      await post(page, {
+        type: 'contextDetail',
+        detail: {
+          ...measured,
+          ...restoreRequest,
+          provider: 'codex',
+          measurement: 'local-estimate',
+          basis: 'request',
+          reserve: null,
+        },
+      });
+      await summary.focus();
+      await page.keyboard.press('Enter');
+      await page.waitForFunction(
+        () => document.querySelector<HTMLDetailsElement>('#composer-context-detail .context-measurement')?.open,
       );
       await summary.focus();
       await page.keyboard.press('Space');
@@ -770,7 +849,7 @@ test(
       composer.context.generation += 1;
       await post(page, refreshed);
       await page.evaluate(() => {
-        const text = document.querySelector('#composer-context-detail > .context-notes .context-note')!;
+        const text = document.querySelector('#composer-context-detail .context-category-label')!;
         const range = document.createRange();
         range.selectNodeContents(text);
         getSelection()!.removeAllRanges();

@@ -1,5 +1,5 @@
 import { createStatDetailRenderer, type StatDetailRenderer, type StatDetailList } from './stat-detail.ts';
-import type { ContextDetail } from '../domain/context-detail.ts';
+import { contextUnavailableReason, type ContextDetail } from '../domain/context-detail.ts';
 import { placeFloat } from './dom.ts';
 import { ChoicePicker, initializeChoicePickers } from './choice-picker.ts';
 import { h, render, type ComponentChildren } from 'preact';
@@ -612,6 +612,9 @@ export function createComposerControlsRenderer(options: ControlsOptions): Compos
   let receivedUsage = false;
   let view: ComposerView | null = null;
   let contextDetail: ContextDetail | null = null;
+  // The detail the open popover draws. It survives a context refresh until a new reply replaces it, and a
+  // transient pending reply never replaces a measured breakdown, so the popover does not collapse and regrow.
+  let contextShown: ContextDetail | null = null;
   let contextRequest = 0;
   let contextOpen = false;
   let contextLoading = false;
@@ -630,7 +633,10 @@ export function createComposerControlsRenderer(options: ControlsOptions): Compos
       contextAnchor = anchor;
       if (contextOpen || !view?.context) return;
       contextOpen = true;
-      if (contextDetail && ['available', 'mismatch'].includes(contextDetail.status)) return;
+      if (contextDetail && ['available', 'mismatch'].includes(contextDetail.status)) {
+        contextShown = contextDetail;
+        return;
+      }
       contextLoading = true;
       options.sendToHost({
         type: 'contextDetail',
@@ -642,6 +648,7 @@ export function createComposerControlsRenderer(options: ControlsOptions): Compos
     onClose() {
       contextOpen = false;
       contextLoading = false;
+      contextShown = null;
     },
   });
   const contextList = (): StatDetailList => ({
@@ -650,13 +657,14 @@ export function createComposerControlsRenderer(options: ControlsOptions): Compos
     context: {
       used: view?.context?.used ?? 0,
       capacity: view?.context?.capacity ?? 1,
-      detail: contextDetail,
-      loading: contextLoading,
+      detail: contextShown,
+      loading: contextLoading && !contextShown,
       compact: !!view?.context?.compact,
       run() {
         if (!view) return;
         const session = view.sessionId;
         contextDetail = null;
+        contextShown = null;
         contextDetails.dismiss();
         options.sendToHost({ type: 'compact', session });
       },
@@ -721,6 +729,7 @@ export function createComposerControlsRenderer(options: ControlsOptions): Compos
     contextCleanup = null;
     contextAnchor = null;
     contextDetail = null;
+    contextShown = null;
     contextRequest++;
   };
   let menus: Record<string, Menu> = {};
@@ -934,7 +943,10 @@ export function createComposerControlsRenderer(options: ControlsOptions): Compos
         return;
       contextLoading = false;
       contextDetail = detail;
-      if (contextAnchor) contextDetails.update(contextAnchor, '', contextList());
+      const transient = detail.status === 'unavailable' && contextUnavailableReason(detail.reason);
+      if (!transient || !contextShown || !['available', 'mismatch'].includes(contextShown.status))
+        contextShown = detail;
+      if (contextAnchor) contextDetails.update(contextAnchor, '', contextList);
     },
     statusBar,
     usagePopover,
@@ -974,6 +986,7 @@ export function createComposerControlsRenderer(options: ControlsOptions): Compos
         view?.context?.capacity !== nextView?.context?.capacity;
       if (replaced || refreshed) {
         contextDetail = null;
+        if (replaced || !contextOpen || !nextView?.context) contextShown = null;
         contextRequest++;
         contextLoading = false;
         if (replaced || !nextView?.context) {

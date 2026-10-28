@@ -48,7 +48,7 @@ Claude persists some MCP changes only during orderly shutdown. Close child input
 
 Category meters require their sum to equal occupied tokens. Mismatches retain a percentage-only table. Free space supplies Remaining, separately from compaction reserve.
 
-Inspection starts no child or model turn. Invalidation affects only that session and rejects obsolete replies. [Context evidence](accounting.md#context-evidence) owns provider estimates and unavailable states.
+Inspection starts no child or model turn. Invalidation affects only that session and rejects obsolete replies. An open Context popover keeps its last measured detail until a reply replaces it. A Codex reply that waits on pending tool calls or a new measurement never replaces a measured detail. [Context evidence](accounting.md#context-evidence) owns provider estimates and unavailable states.
 
 ## Project setup storage
 
