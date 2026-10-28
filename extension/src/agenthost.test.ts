@@ -41,6 +41,7 @@ import {
   codexAskMode,
   codexIdlePlan,
   codexPlan,
+  checkCodexServiceTier,
   codexRenamePlan,
   modelChange,
   openDraftMcp,
@@ -1426,6 +1427,8 @@ function policyCallbacks(host: AgentHost, policies: LaunchPolicyStore) {
     effortFor: () => '',
     sessionSettingsForProfile,
     codexPlan,
+    sessionSettings,
+    settingBook: () => ({}),
     CLIENT_INFO: CODEX_CLIENT,
     ensureSession: async (key: string, plan: AgentPlan) => {
       const child = await host.session(key, plan);
@@ -12485,4 +12488,133 @@ test('failed actual Claude skill admission starts no replacement and sends no us
   const suppliedCatalogEvent = fixture.events.find((item) => item.event.kind === 'commands');
   assert.equal(suppliedCatalogEvent?.usageSource, session.usageSource);
   assert.equal(suppliedCatalogEvent?.event.kind === 'commands' && suppliedCatalogEvent.event.optionalOnly, true);
+});
+
+test.each(['success', 'refusal', 'timeout', 'cancel'] as const)(
+  'service tier preflight awaits child exit after %s',
+  async (outcome) => {
+    vi.useFakeTimers();
+    const child = new FakeChild();
+    const abort = new AbortController();
+    const pending = checkCodexServiceTier(
+      CODEX,
+      { cwd: WS, model: 'model-a', serviceTier: 'priority', clientInfo: CODEX_CLIENT },
+      { CODEX_HOME: 'C:/codex' },
+      {
+        spawner: () => child,
+        openingDeadlineMs: 100,
+        exitGraceMs: 10,
+        signal: abort.signal,
+      },
+    );
+    let settled = false;
+    const observed = pending.then(
+      () => {
+        settled = true;
+        return null;
+      },
+      (error) => {
+        settled = true;
+        return error;
+      },
+    );
+    child.reply({ userAgent: 'codex' });
+    await vi.advanceTimersByTimeAsync(0);
+    assert.equal(child.sent().at(-1)?.method, 'model/list');
+    if (outcome === 'cancel') abort.abort();
+    else if (outcome === 'timeout') await vi.advanceTimersByTimeAsync(100);
+    else {
+      child.reply({ data: [{ id: 'model-a', serviceTiers: [{ id: 'priority' }] }] });
+      await vi.advanceTimersByTimeAsync(0);
+      assert.equal(child.sent().at(-1)?.method, 'thread/start');
+      assert.deepEqual(child.sent().at(-1)?.params, {
+        cwd: WS,
+        model: 'model-a',
+        serviceTier: 'priority',
+        ephemeral: true,
+        approvalPolicy: 'never',
+        approvalsReviewer: 'user',
+        sandbox: 'read-only',
+      });
+      child.reply({
+        thread: { id: 'temporary' },
+        model: 'model-a',
+        serviceTier: outcome === 'success' ? 'priority' : null,
+      });
+    }
+    await vi.advanceTimersByTimeAsync(0);
+    assert.equal(child.ended, true);
+    assert.equal(settled, false);
+    assert.equal(
+      child.sent().some((m) => m.method === 'turn/start'),
+      false,
+    );
+    await vi.advanceTimersByTimeAsync(10);
+    assert.equal(child.killed, true);
+    assert.equal(settled, false);
+    child.exit(0);
+    const error = await observed;
+    assert.equal(error === null, outcome === 'success');
+    vi.useRealTimers();
+  },
+);
+
+test('hosted explicit tier survives clear, retirement, resume and fork with read-only permissions', async () => {
+  const { host, children } = fakeHost();
+  const policy = launchPolicy('codex', true)!;
+  for (const [index, method] of ['start', 'resume', 'fork'].entries()) {
+    const opening = host.session(
+      'tier-session',
+      codexPlan(CODEX, {
+        cwd: WS,
+        clientInfo: CODEX_CLIENT,
+        model: 'model-a',
+        serviceTier: 'priority',
+        policy,
+        ...(method === 'resume' ? { resume: 'saved-thread' } : method === 'fork' ? { fork: 'saved-thread' } : {}),
+      }),
+    );
+    const child = children[index];
+    child.reply({ userAgent: 'codex' });
+    await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'skills/list'));
+    child.reply({ data: [] });
+    await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'model/list'));
+    child.reply({ data: [{ id: 'model-a', serviceTiers: [{ id: 'priority' }] }] });
+    await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, `thread/${method}`));
+    assert.deepEqual(
+      Object.fromEntries(
+        Object.entries(child.sent().at(-1)!.params as object).filter(([key]) =>
+          ['serviceTier', 'approvalPolicy', 'approvalsReviewer', 'sandbox'].includes(key),
+        ),
+      ),
+      { serviceTier: 'priority', approvalPolicy: 'never', approvalsReviewer: 'user', sandbox: 'read-only' },
+    );
+    child.reply({ thread: { id: 'saved-thread' }, model: 'model-a', serviceTier: 'priority' });
+    const session = await opening;
+    for (let turn = 0; turn < 2; turn++) {
+      const sending = session.prompt('Continue');
+      await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'turn/start'));
+      const params = child.sent().at(-1)?.params as Record<string, unknown>;
+      assert.equal(params.serviceTier, 'priority');
+      assert.equal(params.approvalPolicy, 'never');
+      assert.equal(params.approvalsReviewer, 'user');
+      assert.deepEqual(params.sandboxPolicy, { type: 'readOnly' });
+      child.reply({ turn: { id: `turn-${turn}` } });
+      await sending;
+      child.say(
+        JSON.stringify({
+          method: 'turn/completed',
+          params: { threadId: 'saved-thread', turn: { id: `turn-${turn}`, status: 'completed' } },
+        }) + '\n',
+      );
+    }
+    const clearing = session.clear();
+    await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'model/list'));
+    child.reply({ data: [{ id: 'model-a', serviceTiers: [{ id: 'priority' }] }] });
+    await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'thread/start'));
+    assert.equal((child.sent().at(-1)!.params as Record<string, unknown>).serviceTier, 'priority');
+    child.reply({ thread: { id: 'cleared-thread' }, model: 'model-a', serviceTier: 'priority' });
+    await clearing;
+    child.exit(0);
+  }
 });

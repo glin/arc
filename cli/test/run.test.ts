@@ -6294,3 +6294,50 @@ test.each(['ready', 'unavailable'] as const)(
     assert.equal(vi.mocked(childProcess.spawn).mock.calls.length, 1);
   },
 );
+
+test.each(['win32', 'darwin', 'linux'] as const)('standalone service tier argv and omission on %s', (platform) => {
+  const f = fixture();
+  for (const attach of [false, true])
+    for (const tier of [undefined, 'default', 'fast', 'priority', 'ultrafast']) {
+      const parsed = parseRun(
+        [...f.args, ...(attach ? ['--attach'] : []), ...(tier ? ['--service-tier', tier] : [])],
+        { CODEX_BIN: process.execPath },
+        platform,
+      );
+      const overrides = parsed.options.args.filter((arg) => arg.startsWith('service_tier='));
+      assert.deepEqual(overrides, tier ? [`service_tier="${tier === 'fast' ? 'priority' : tier}"`] : []);
+      assert.equal(parsed.tierCheck?.serviceTier, tier === 'fast' ? 'priority' : tier);
+      assert.equal(parsed.tierCheck?.launch.command ?? parsed.options.command, parsed.options.command);
+    }
+  for (const flags of [
+    ['--service-tier', ''],
+    ['--service-tier', 'auto'],
+    ['--service-tier', 'fast', '--service-tier', 'fast'],
+  ])
+    assert.throws(() => parseRun([...f.args, ...flags]));
+  assert.throws(
+    () => parseRun([...f.args.map((x) => (x === 'codex' ? 'claude' : x)), '--service-tier', 'fast']),
+    /only to Codex/,
+  );
+});
+
+test('refused standalone service tier reserves no receipt and starts no worker', async () => {
+  const f = fixture();
+  const receipts = new DispatchReceipts(f.home);
+  const reserve = vi.spyOn(receipts, 'reserve');
+  const spawn = vi.mocked(childProcess.spawn);
+  const check = vi.fn<() => Promise<void>>(async () => {
+    throw new Error('Tier unavailable');
+  });
+  await assert.rejects(
+    runStandalone([...f.args, '--service-tier', 'fast'], 'arc.cjs', {
+      env: { CODEX_BIN: process.execPath, CODEX_HOME: path.join(f.home, 'codex') },
+      receipts,
+      tierCheck: check,
+    }),
+    /Tier unavailable/,
+  );
+  assert.equal(reserve.mock.calls.length, 0);
+  assert.equal(spawn.mock.calls.length, 0);
+  assert.equal(check.mock.calls.length, 1);
+});

@@ -13,3 +13,5 @@ Start accepts an explicit identical-payload retry with the same request ID in th
 Confirm initial labels from `metadata.labels.state: saved` and its normalized `values`. Confirm pins from `metadata.pinned.state: saved` and `value`. A missing catalog row does not invalidate these save results.
 
 Read `metadata.name.state` separately from launch acceptance. `pending` retains naming work in this activation. `saved` confirms the requested name. Report `failed`, `cancelled`, or `uncertain` without launching another session or resending the prompt. Later detailed session JSON reports retained name state after catalog admission. Older hosts omit metadata.
+
+For Codex, `start` and `run` accept `--service-tier default|fast|priority|ultrafast`. Omission inherits the provider setting. `fast` selects canonical `priority`. Explicit unavailable tiers refuse before prompt delivery. Preserve the requested tier after refusal. Never retry at a different speed.

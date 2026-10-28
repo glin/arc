@@ -240,6 +240,10 @@ export const COMMANDS: readonly Command[] = [
           'Retain explicit launch classification. Delegated Claude defaults its cache TTL to 5m.',
         ],
         [
+          '--service-tier default|fast|priority|ultrafast',
+          'Select a Codex service tier. Omission inherits. Unavailable tiers refuse.',
+        ],
+        [
           '--cache-lifetime 5m|1h',
           'Set the Claude prompt cache lifetime. Overrides the caller environment. Default: 5m for Run by agents, provider default otherwise.',
         ],
@@ -547,6 +551,10 @@ export const COMMANDS: readonly Command[] = [
         [
           '--agent-run[=true|false]',
           'Omitted or false keeps reader ownership and Prompt box continuation. Bare or true files delegated work under Run by agents.',
+        ],
+        [
+          '--service-tier default|fast|priority|ultrafast',
+          'Select a Codex service tier. Omission inherits. Unavailable tiers refuse.',
         ],
         [
           '--cache-lifetime 5m|1h',

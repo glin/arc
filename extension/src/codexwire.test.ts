@@ -4549,3 +4549,196 @@ test('Codex guarded prompts accept only their own correlated turn and settle sha
     assert.equal(attempt.settled?.outcome, 'unknown', name);
   }
 });
+
+test.each(['start', 'resume', 'fork'] as const)(
+  'explicit service tier survives %s and later model changes',
+  async (method) => {
+    const h = harness();
+    const options = { cwd: 'C:/ws', model: 'model-a', serviceTier: 'fast' as const };
+    const opening =
+      method === 'start'
+        ? h.wire.startThread(options)
+        : method === 'resume'
+          ? h.wire.resumeThread(THREAD, options)
+          : h.wire.forkThread(THREAD, options);
+    assert.equal(h.parsed().at(-1).method, 'model/list');
+    reply(h, { data: [{ id: 'model-a', serviceTiers: [{ id: 'priority' }] }] });
+    await vi.waitFor(() => assert.equal(h.parsed().at(-1).method, `thread/${method}`));
+    assert.equal(h.parsed().at(-1).params.serviceTier, 'priority');
+    reply(h, { thread: { id: THREAD }, model: 'model-a', serviceTier: 'priority' });
+    await opening;
+    for (let turn = 0; turn < 2; turn++) {
+      const sending = h.wire.prompt('Continue');
+      await vi.waitFor(() => assert.equal(h.parsed().at(-1).method, 'turn/start'));
+      assert.equal(h.parsed().at(-1).params.serviceTier, 'priority');
+      reply(h, { turn: { id: `turn-${turn}` } });
+      await sending;
+      h.wire.receive(
+        JSON.stringify({
+          method: 'turn/completed',
+          params: { threadId: THREAD, turn: { id: `turn-${turn}`, status: 'completed' } },
+        }),
+      );
+    }
+    await h.wire.setModel('model-b');
+    const refused = assert.rejects(h.wire.prompt('Do not send'), /does not offer service tier/);
+    await vi.waitFor(() => assert.equal(h.parsed().at(-1).method, 'model/list'));
+    reply(h, { data: [{ id: 'model-b', serviceTiers: [] }] });
+    await refused;
+    assert.equal(h.parsed().filter((m) => m.method === 'turn/start').length, 2);
+    h.wire.close('finished');
+  },
+);
+
+test('explicit service tier binds held catalog input and later turns to the submitted model', async () => {
+  const h = harness();
+  try {
+    const opening = h.wire.startThread({ cwd: 'C:/ws', model: 'model-a', serviceTier: 'fast' });
+    reply(h, { data: [{ id: 'model-a', serviceTiers: [{ id: 'priority' }] }] });
+    await vi.waitFor(() => assert.equal(h.parsed().at(-1).method, 'thread/start'));
+    reply(h, { thread: { id: THREAD }, model: 'model-a', serviceTier: 'priority' });
+    await opening;
+
+    await h.wire.setModel('model-b');
+    const sending = h.wire.prompt('Use the checked model');
+    assert.equal(h.parsed().at(-1).method, 'model/list');
+    await h.wire.setModel('model-c');
+    assert.equal(h.parsed().filter((message) => message.method === 'turn/start').length, 0);
+    reply(h, {
+      data: [
+        { id: 'model-b', serviceTiers: [{ id: 'priority' }] },
+        { id: 'model-c', serviceTiers: [] },
+      ],
+    });
+    await vi.waitFor(() => assert.equal(h.parsed().at(-1).method, 'turn/start'));
+    const submitted = h.parsed().at(-1);
+    reply(h, { turn: { id: TURN } });
+    await sending;
+    assert.equal(submitted.params.model, 'model-b', 'input must use the model whose tier was checked');
+    assert.equal(submitted.params.serviceTier, 'priority');
+    h.wire.receive(
+      JSON.stringify({
+        method: 'turn/completed',
+        params: { threadId: THREAD, turn: { id: TURN, status: 'completed' } },
+      }),
+    );
+
+    const refused = assert.rejects(h.wire.prompt('Use the later selection'), /does not offer service tier/);
+    assert.equal(h.parsed().at(-1).method, 'model/list', 'the later selection still needs its own capability check');
+    reply(h, { data: [{ id: 'model-c', serviceTiers: [] }] });
+    await refused;
+    assert.equal(h.parsed().filter((message) => message.method === 'turn/start').length, 1);
+
+    await h.wire.setModel('');
+    const continuing = h.wire.prompt('Keep the last accepted model');
+    void continuing.catch(() => {});
+    assert.equal(h.parsed().at(-1).method, 'turn/start', 'clearing the selection retains the submitted model');
+    assert.equal(h.parsed().at(-1).params.model, 'model-b');
+    reply(h, { turn: { id: 'turn-next' } });
+    await continuing;
+  } finally {
+    h.wire.close('finished');
+  }
+});
+
+test.each([true, false])(
+  'cleared model selection retains submission order after reversed replies with newer acceptance %s',
+  async (newerAccepted) => {
+    const h = harness();
+    try {
+      const catalog = {
+        data: ['model-a', 'model-b', 'model-c'].map((id) => ({ id, serviceTiers: [{ id: 'priority' }] })),
+      };
+      const opening = h.wire.startThread({ cwd: 'C:/ws', model: 'model-a', serviceTier: 'fast' });
+      reply(h, catalog);
+      await vi.waitFor(() => assert.equal(h.parsed().at(-1).method, 'thread/start'));
+      reply(h, { thread: { id: THREAD }, model: 'model-a', serviceTier: 'priority' });
+      await opening;
+
+      await h.wire.setModel('model-b');
+      const first = h.wire.prompt('Use model B');
+      reply(h, catalog);
+      await vi.waitFor(() => assert.equal(h.parsed().at(-1).method, 'turn/start'));
+      const older = h.parsed().at(-1);
+      assert.equal(older.params.model, 'model-b');
+
+      await h.wire.setModel('model-c');
+      const second = h.wire.prompt('Use model C');
+      const settledSecond = newerAccepted ? second : assert.rejects(second, /newer start refused/);
+      reply(h, catalog);
+      await vi.waitFor(() => assert.equal(h.parsed().at(-1).method, 'turn/start'));
+      const newer = h.parsed().at(-1);
+      assert.equal(newer.params.model, 'model-c');
+      h.wire.receive(
+        JSON.stringify({
+          id: newer.id,
+          ...(newerAccepted
+            ? { result: { turn: { id: 'turn-newer' } } }
+            : { error: { code: -32600, message: 'newer start refused' } }),
+        }),
+      );
+      await settledSecond;
+      h.wire.receive(JSON.stringify({ id: older.id, result: { turn: { id: 'turn-older' } } }));
+      await first;
+
+      await h.wire.setModel('');
+      const continuing = h.wire.prompt('Keep the last accepted model');
+      void continuing.catch(() => {});
+      if (h.parsed().at(-1).method === 'model/list') reply(h, catalog);
+      await vi.waitFor(() => assert.equal(h.parsed().filter((message) => message.method === 'turn/start').length, 3));
+      const next = h.parsed().at(-1);
+      reply(h, { turn: { id: 'turn-next' } });
+      await continuing;
+      assert.equal(next.params.model, newerAccepted ? 'model-c' : 'model-b');
+      assert.equal(next.params.serviceTier, 'priority');
+    } finally {
+      h.wire.close('finished');
+    }
+  },
+);
+
+test.each([undefined, null, 'default', 'ultrafast'])(
+  'explicit service tier refuses accepted value %s before input',
+  async (accepted) => {
+    const h = harness();
+    const refused = assert.rejects(
+      h.wire.startThread({ cwd: 'C:/ws', model: 'model-a', serviceTier: 'fast' }),
+      /did not accept/,
+    );
+    reply(h, { data: [{ id: 'model-a', serviceTiers: [{ id: 'priority' }] }] });
+    await vi.waitFor(() => assert.equal(h.parsed().at(-1).method, 'thread/start'));
+    reply(h, { thread: { id: THREAD }, model: 'model-a', serviceTier: accepted });
+    await refused;
+    assert.equal(h.wire.threadId(), null);
+    assert.equal(
+      h.parsed().some((m) => m.method === 'turn/start'),
+      false,
+    );
+    h.wire.close('finished');
+  },
+);
+
+test.each([
+  ['ultrafast', { serviceTiers: [{ id: 'ultrafast' }] }, true],
+  ['ultrafast', { serviceTiers: [{ id: 'priority' }] }, false],
+  ['priority', { additionalSpeedTiers: ['fast'] }, true],
+  ['priority', { serviceTiers: [], additionalSpeedTiers: ['fast'] }, false],
+  ['priority', {}, false],
+] as const)('service tier %s requires live advertised support %j', async (serviceTier, metadata, supported) => {
+  const h = harness();
+  const opening = h.wire.startThread({ cwd: 'C:/ws', model: 'model-a', serviceTier });
+  const refused = supported ? null : assert.rejects(opening, /does not offer/);
+  reply(h, { data: [{ id: 'model-a', ...metadata }] });
+  if (supported) {
+    await vi.waitFor(() => assert.equal(h.parsed().at(-1).method, 'thread/start'));
+    reply(h, { thread: { id: THREAD }, model: 'model-a', serviceTier });
+    await opening;
+  } else {
+    await refused;
+    assert.equal(
+      h.parsed().some((m) => m.method === 'thread/start'),
+      false,
+    );
+  }
+  h.wire.close('finished');
+});

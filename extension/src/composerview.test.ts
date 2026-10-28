@@ -8702,3 +8702,28 @@ test('a Remote Control toggle sends at once and answers no pending request', () 
   assert.equal(sendAction({ ...running, asks: [], onScreen: 'later too' }), 'queue');
   assert.equal(sendAction({ ...running, asks: [] }), 'send', 'a toggle waited behind the queue');
 });
+
+test('saved service tier survives reload and accepted settings without leaking to siblings', async () => {
+  let book = withSessionSettings({}, 'one', { ...sessionSettings({}, 'one'), serviceTier: 'priority' });
+  book = JSON.parse(JSON.stringify(book));
+  await acceptedSessionSettings(
+    () => book,
+    async (next) => {
+      book = next;
+    },
+    'one',
+    { selectedModel: 'new-model' },
+    async () => {},
+  );
+  await acceptedPermissionMode(
+    () => book,
+    async (next) => {
+      book = next;
+    },
+    [{ session: 'one', accept: async () => {} }],
+    'read-only',
+  );
+  assert.equal(sessionSettings(book, 'one').serviceTier, 'priority');
+  assert.equal(sessionSettings(book, 'two').serviceTier, undefined);
+  assert.equal(sessionSettings({}, 'old').serviceTier, undefined);
+});

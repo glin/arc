@@ -1,3 +1,4 @@
+import { canonicalServiceTier, type RequestedServiceTier, type ServiceTier } from './launchpolicy';
 import { unavailableDefaults, type AppliedDefaults } from './view/model-picks';
 import type { ListedModel } from './domain/model-catalog';
 import { SessionNameUncertain } from './sessionrename';
@@ -74,6 +75,8 @@ export function sandboxPolicy(mode: SandboxMode): Json {
 }
 
 export interface CodexSpawnOptions {
+  serviceTier?: RequestedServiceTier;
+  ephemeral?: boolean;
   cwd: string;
   model?: string;
   // Reasoning effort advertised by model/list. turn/start applies it because thread/start has no effort field.
@@ -409,6 +412,10 @@ export class CodexWire {
   // thread/start accepts a model but no effort field.
   // Null overrides leave the thread's current settings unchanged.
   private model: string | null = null;
+  private serviceTier: ServiceTier | undefined;
+  private tierModel: string | null = null;
+  private effectiveModel: string | null = null;
+  private effectiveModelRequestId = 0;
   private effort: string | null = null;
   // The list response carries inventory and auth, while startup state arrives beside it as
   // notifications. Kept by server name so one reading can join the two halves.
@@ -693,6 +700,43 @@ export class CodexWire {
     if (this.closed) throw new Error('the agent is no longer running');
   }
 
+  private async checkServiceTier(tier: ServiceTier, model: string | null): Promise<void> {
+    if (tier === 'default') return;
+    const catalog = await this.models();
+    const entry = arr(catalog?.data)
+      .map(obj)
+      .find((item) => item && (item.id === model || item.model === model));
+    // Legacy catalogs name Fast in additionalSpeedTiers. A present serviceTiers list takes precedence.
+    const offered =
+      entry &&
+      (Array.isArray(entry.serviceTiers)
+        ? entry.serviceTiers.map((item: unknown) => str(obj(item)?.id))
+        : arr(entry.additionalSpeedTiers).map(str));
+    if (!model || !offered?.some((id: string | null) => (id === 'fast' ? 'priority' : id) === tier))
+      throw new Error(`Codex does not offer service tier ${tier} for ${model || 'the selected model'}.`);
+  }
+
+  private async prepareServiceTier(options?: Pick<CodexSpawnOptions, 'model' | 'serviceTier'>): Promise<void> {
+    if (options?.serviceTier !== undefined && options.model)
+      await this.checkServiceTier(canonicalServiceTier(options.serviceTier), options.model);
+  }
+
+  private async acceptServiceTier(
+    result: Json,
+    options?: Pick<CodexSpawnOptions, 'model' | 'serviceTier'>,
+  ): Promise<void> {
+    const tier = options?.serviceTier === undefined ? undefined : canonicalServiceTier(options.serviceTier);
+    const model = str(result.model) || options?.model || null;
+    if (tier !== undefined) {
+      if (result.serviceTier !== tier)
+        throw new Error(`Codex did not accept service tier ${tier}. No prompt was sent.`);
+      if (!options?.model || model !== options.model) await this.checkServiceTier(tier, model);
+    }
+    this.serviceTier = tier;
+    this.effectiveModel = model;
+    this.tierModel = model;
+  }
+
   async startThread(
     options: CodexSpawnOptions,
     name: string = '',
@@ -700,10 +744,13 @@ export class CodexWire {
     writeAttempted?: () => void,
   ): Promise<string> {
     if (this.sessionSkills) await this.skillWorkReady();
+    if (options.serviceTier !== undefined) await this.prepareServiceTier(options);
     const result = await this.request(
       'thread/start',
       {
         cwd: options.cwd,
+        ...(options.serviceTier === undefined ? {} : { serviceTier: canonicalServiceTier(options.serviceTier) }),
+        ...(options.ephemeral ? { ephemeral: true } : {}),
         ...(options.model ? { model: options.model } : {}),
         ...(options.approvalPolicy ? { approvalPolicy: options.approvalPolicy } : {}),
         ...(options.approvalsReviewer ? { approvalsReviewer: options.approvalsReviewer } : {}),
@@ -712,6 +759,7 @@ export class CodexWire {
       beforeWrite,
       writeAttempted,
     );
+    if (options?.serviceTier !== undefined) await this.acceptServiceTier(result, options);
     const threadId = this.adoptThread(result);
     if (name) {
       try {
@@ -729,17 +777,24 @@ export class CodexWire {
 
   async resumeThread(
     threadId: string,
-    options?: Pick<CodexSpawnOptions, 'approvalPolicy' | 'approvalsReviewer' | 'sandbox'>,
+    options?: Pick<CodexSpawnOptions, 'approvalPolicy' | 'approvalsReviewer' | 'sandbox' | 'model' | 'serviceTier'>,
   ): Promise<string> {
     if (this.sessionSkills) await this.skillWorkReady();
-    return this.adoptThread(
-      await this.request('thread/resume', {
-        threadId,
-        ...(options?.approvalPolicy ? { approvalPolicy: options.approvalPolicy } : {}),
-        ...(options?.approvalsReviewer ? { approvalsReviewer: options.approvalsReviewer } : {}),
-        ...(options?.sandbox ? { sandbox: options.sandbox } : {}),
-      }),
-    );
+    if (options?.serviceTier !== undefined) await this.prepareServiceTier(options);
+    const result = await this.request('thread/resume', {
+      threadId,
+      ...(options?.serviceTier === undefined
+        ? {}
+        : {
+            serviceTier: canonicalServiceTier(options.serviceTier),
+            ...(options.model ? { model: options.model } : {}),
+          }),
+      ...(options?.approvalPolicy ? { approvalPolicy: options.approvalPolicy } : {}),
+      ...(options?.approvalsReviewer ? { approvalsReviewer: options.approvalsReviewer } : {}),
+      ...(options?.sandbox ? { sandbox: options.sandbox } : {}),
+    });
+    if (options?.serviceTier !== undefined) await this.acceptServiceTier(result, options);
+    return this.adoptThread(result);
   }
 
   // A session another client still owns cannot be resumed by this app-server process.
@@ -751,26 +806,28 @@ export class CodexWire {
     writeAttempted?: () => void,
   ): Promise<string> {
     if (this.sessionSkills) await this.skillWorkReady();
-    return this.adoptThread(
-      await this.request(
-        'thread/fork',
-        {
-          threadId,
-          cwd: options.cwd,
-          ...(options.model ? { model: options.model } : {}),
-          ...(options.approvalPolicy ? { approvalPolicy: options.approvalPolicy } : {}),
-          ...(options.approvalsReviewer ? { approvalsReviewer: options.approvalsReviewer } : {}),
-          ...(options.sandbox ? { sandbox: options.sandbox } : {}),
-          // An inherited goal belongs to the source client until the reader sends this fork its
-          // first prompt. Without this, opening the recovery session can start work by itself.
-          deferGoalContinuation: true,
-          // The caller needs the new id, not a second copy of the inherited turns in the response.
-          excludeTurns: true,
-        },
-        beforeWrite,
-        writeAttempted,
-      ),
+    if (options.serviceTier !== undefined) await this.prepareServiceTier(options);
+    const result = await this.request(
+      'thread/fork',
+      {
+        threadId,
+        cwd: options.cwd,
+        ...(options.serviceTier === undefined ? {} : { serviceTier: canonicalServiceTier(options.serviceTier) }),
+        ...(options.model ? { model: options.model } : {}),
+        ...(options.approvalPolicy ? { approvalPolicy: options.approvalPolicy } : {}),
+        ...(options.approvalsReviewer ? { approvalsReviewer: options.approvalsReviewer } : {}),
+        ...(options.sandbox ? { sandbox: options.sandbox } : {}),
+        // An inherited goal belongs to the source client until the reader sends this fork its
+        // first prompt. Without this, opening the recovery session can start work by itself.
+        deferGoalContinuation: true,
+        // The caller needs the new id, not a second copy of the inherited turns in the response.
+        excludeTurns: true,
+      },
+      beforeWrite,
+      writeAttempted,
     );
+    if (options?.serviceTier !== undefined) await this.acceptServiceTier(result, options);
+    return this.adoptThread(result);
   }
 
   // Starts compaction through thread/compact/start.
@@ -908,10 +965,15 @@ export class CodexWire {
           await Promise.race([this.commandsPending ?? this.skillRefresh, cancelled]);
         }
       }
+      const model = this.serviceTier === undefined ? this.model : (this.model ?? this.effectiveModel);
+      if (this.serviceTier !== undefined && model !== this.tierModel) {
+        await Promise.race([this.checkServiceTier(this.serviceTier, model), cancelled]);
+        if (!stopped) this.tierModel = model;
+      }
       if (stopped) throw new Error('the prompt was stopped before it reached the agent');
       if (this.optionalFailure) throw this.optionalFailure;
       if (this.closed || threadId !== this.thread) throw new Error('the Codex session changed before delivery');
-      return this.startPrompt(prompt, token, threadId, guard, beforeWrite, writeAttempted);
+      return this.startPrompt(prompt, token, threadId, model, guard, beforeWrite, writeAttempted);
     } finally {
       this.pendingPrompts.delete(cancel);
       if (this.preparing === prepared) this.preparing = null;
@@ -923,6 +985,7 @@ export class CodexWire {
     prompt: ReturnType<typeof normalizeAgentPrompt>,
     token: ReturnType<typeof promptToken>,
     threadId: string,
+    model: string | null,
     guard?: GuardedAttempt,
     beforeWrite?: () => void,
     writeAttempted?: () => void,
@@ -949,6 +1012,7 @@ export class CodexWire {
     const known = guard ? this.seenTurns.size : 0;
     beforeWrite?.();
     guard?.prepareWrite();
+    let requestId = 0;
     const response = this.request(
       'turn/start',
       {
@@ -961,10 +1025,13 @@ export class CodexWire {
               sandboxPolicy: sandboxPolicy(this.approval.sandbox),
             }
           : {}),
-        ...(this.model !== null ? { model: this.model } : {}),
+        ...(this.serviceTier === undefined ? {} : { serviceTier: this.serviceTier }),
+        ...(model !== null ? { model } : {}),
         ...(this.effort !== null ? { effort: this.effort } : {}),
       },
-      undefined,
+      (id) => {
+        requestId = id;
+      },
       writeAttempted,
     );
     guard?.markWritten();
@@ -990,6 +1057,10 @@ export class CodexWire {
             }
           : { outcome: 'accepted', nativeTurnId: turnId, reason: '' },
       );
+      if (model && requestId > this.effectiveModelRequestId) {
+        this.effectiveModel = model;
+        this.effectiveModelRequestId = requestId;
+      }
       active.id = turnId;
       const ending = active.endingsBeforeStart.get(turnId);
       active.endingsBeforeStart.clear();

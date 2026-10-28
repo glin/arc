@@ -8,7 +8,7 @@ import {
   type SessionCoverage,
   type SourceEnumeration,
 } from './sessioncoverage';
-import { cacheLifetimeRefusal, launchPolicy } from './launchpolicy';
+import { canonicalServiceTier, serviceTierRefusal, cacheLifetimeRefusal, launchPolicy } from './launchpolicy';
 import { scopedLaunchCwd, startingWorktree } from './repositoryscope';
 import { SessionFilterRequests, FILTER_LIMITS, type FilterOperation } from './sessionfilter';
 import {
@@ -2599,6 +2599,8 @@ export class PanelProvider implements vscode.Disposable {
       throw new Error("Arc is still loading that provider's models. Run arc setups until it lists them, then retry.");
     if (!this.onSendDraftPrompt || !this.memento) throw new Error('Session delivery or saving is unavailable.');
     const policy = launchPolicy(profile.agent, params.readOnly === true, params.readTools, profile.permissionMode);
+    const tierRefusal = params.serviceTier === undefined ? null : serviceTierRefusal(params.serviceTier, profile.agent);
+    if (tierRefusal) throw new Error(tierRefusal);
     const lifetimeRefusal = params.cacheLifetime ? cacheLifetimeRefusal(params.cacheLifetime, profile.agent) : null;
     if (lifetimeRefusal) throw new Error(lifetimeRefusal);
     const draft = {
@@ -2612,6 +2614,7 @@ export class PanelProvider implements vscode.Disposable {
       policy,
       agentRun: params.agentRun,
       ...(params.cacheLifetime ? { cacheLifetime: params.cacheLifetime } : {}),
+      ...(params.serviceTier === undefined ? {} : { serviceTier: canonicalServiceTier(params.serviceTier) }),
     };
     const start = guardedStartContext(request);
     if (params.dispatch) {
@@ -2641,11 +2644,10 @@ export class PanelProvider implements vscode.Disposable {
     let initialName: InitialSessionName | undefined;
     try {
       this.adoptDraft(draft.draftId, session, draft, undefined, true);
-      this.picks = withSessionSettings(
-        this.picks,
-        session,
-        sessionSettingsForProfile(profile, this.models[profile.agent]),
-      );
+      this.picks = withSessionSettings(this.picks, session, {
+        ...sessionSettingsForProfile(profile, this.models[profile.agent]),
+        ...(draft.serviceTier === undefined ? {} : { serviceTier: draft.serviceTier }),
+      });
       if (params.agentRun) {
         this.startedHere.delete(session);
         this.saved.started = [...this.startedHere].slice(-SESSION_LIMIT);

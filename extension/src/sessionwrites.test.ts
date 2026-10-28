@@ -16,6 +16,8 @@ import {
   SessionReadObservations,
   runSessionRead,
   SessionWriteRequests,
+  validSessionWrite,
+  sessionWriteBinding,
   archiveRefusal,
   guardedChannelSend,
   guardedDeliveryPort,
@@ -1395,3 +1397,20 @@ test(
       );
   },
 );
+
+test('service tier schema and request binding reject changed speed while accepting aliases', () => {
+  const params = {
+    prompt: 'Work',
+    agentRun: false,
+    setup: { kind: 'custom' as const, agent: 'codex' as const, model: '', effort: '', permissionMode: '' },
+  };
+  for (const tier of ['default', 'fast', 'priority', 'ultrafast'])
+    assert.equal(validSessionWrite('start', { ...params, serviceTier: tier }), true);
+  for (const tier of ['', 'auto', null, 1])
+    assert.equal(validSessionWrite('start', { ...params, serviceTier: tier }), false);
+  const bind = (serviceTier?: 'fast' | 'priority' | 'default') =>
+    sessionWriteBinding('window', 'start', { ...params, ...(serviceTier ? { serviceTier } : {}) }, null, null);
+  assert.deepEqual(bind('fast'), bind('priority'));
+  assert.notDeepEqual(bind('priority'), bind('default'));
+  assert.notDeepEqual(bind('default'), bind());
+});

@@ -30,6 +30,8 @@ Draft setup comes only from its profile, ignoring session picks and per-agent pe
 
 [`webview/composer-controls.ts`](../extension/src/webview/composer-controls.ts) owns Remote Control presentation. [`webview/composer-presentation.ts`](../extension/src/webview/composer-presentation.ts) owns next-turn price changes and focus transfer. [Context evidence](accounting.md#context-evidence) owns pricing and cache qualifications.
 
+An explicit programmatic service tier belongs to its launched session in the saved session-settings store. Reload, model and permission changes, child replacement, resume, clear, and fork retain it. Omitted selections remain absent. Independent sessions inherit no sibling tier.
+
 ## MCP controls
 
 Opening Servers reuses a running Claude draft child through pending server startup and first-prompt delivery. Drafts and recorded sessions keep separate readings.

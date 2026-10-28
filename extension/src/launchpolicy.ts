@@ -2,6 +2,23 @@ import { readFileSync, statSync, existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 
+export const SERVICE_TIERS = ['default', 'fast', 'priority', 'ultrafast'] as const;
+export type RequestedServiceTier = (typeof SERVICE_TIERS)[number];
+export type ServiceTier = Exclude<RequestedServiceTier, 'fast'>;
+
+export function isServiceTier(value: unknown): value is RequestedServiceTier {
+  return (SERVICE_TIERS as readonly unknown[]).includes(value);
+}
+
+export function canonicalServiceTier(value: RequestedServiceTier): ServiceTier {
+  return value === 'fast' ? 'priority' : value;
+}
+
+export function serviceTierRefusal(value: unknown, agent: string): string | null {
+  if (!isServiceTier(value)) return 'Choose --service-tier default, fast, priority, or ultrafast.';
+  return agent === 'codex' ? null : '--service-tier applies only to Codex launches.';
+}
+
 export interface LaunchPolicy {
   readonly readOnly: true;
   readonly readTools: readonly string[];

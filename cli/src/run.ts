@@ -7,6 +7,9 @@ import { readPromptFile } from './manage.ts';
 import { guardedPromptRefusal, payloadSha256 } from '../../extension/src/sessionwrites.ts';
 import { requesterIdentity } from '../../extension/src/sessionrequests.ts';
 import {
+  canonicalServiceTier,
+  serviceTierRefusal,
+  type RequestedServiceTier,
   launchPolicy,
   claudeReadOnlyArgs,
   claudeReadOnlyMcp,
@@ -18,7 +21,7 @@ import {
 } from '../../extension/src/launchpolicy.ts';
 import { claudeLaunch, codexLaunch, type Machine } from '../../extension/src/composerview.ts';
 import { DispatchReceipts, type StandaloneOptions } from '../../extension/src/dispatchreceipts.ts';
-import { LAUNCH_ENV_NAMES, childEnv, unstartable } from '../../extension/src/agenthost.ts';
+import { LAUNCH_ENV_NAMES, checkCodexServiceTier, childEnv, unstartable } from '../../extension/src/agenthost.ts';
 import {
   waitStandalone,
   waitStandaloneIdentity,
@@ -50,6 +53,7 @@ export function parseRun(args: string[], env = process.env, platform = process.p
     '--log',
     '--notify-thread',
     '--cache-lifetime',
+    '--service-tier',
   ];
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -79,6 +83,11 @@ export function parseRun(args: string[], env = process.env, platform = process.p
   };
   const provider = required('--provider');
   if (provider !== 'claude' && provider !== 'codex') throw new Error('Choose --provider claude or codex.');
+  const requestedTier = values.get('--service-tier') as RequestedServiceTier | undefined;
+  const tierRefusal = requestedTier === undefined ? null : serviceTierRefusal(requestedTier, provider);
+  if (tierRefusal) throw new Error(tierRefusal);
+  const serviceTier = requestedTier === undefined ? undefined : canonicalServiceTier(requestedTier);
+  const tierArgs = serviceTier === undefined ? [] : ['-c', `service_tier="${serviceTier}"`];
   const cacheLifetime = values.get('--cache-lifetime') as RequestedCacheLifetime | undefined;
   const lifetimeRefusal = cacheLifetime === undefined ? null : cacheLifetimeRefusal(cacheLifetime, provider);
   if (lifetimeRefusal) throw new Error(lifetimeRefusal);
@@ -205,6 +214,7 @@ export function parseRun(args: string[], env = process.env, platform = process.p
           model,
           '-c',
           `model_reasoning_effort=${effort}`,
+          ...tierArgs,
         ];
   const options: StandaloneOptions = {
     provider,
@@ -230,6 +240,7 @@ export function parseRun(args: string[], env = process.env, platform = process.p
       model,
       '-c',
       `model_reasoning_effort=${effort}`,
+      ...tierArgs,
       '-s',
       policy ? 'read-only' : permission || 'workspace-write',
       ...addDirs.flatMap((dir) => ['--add-dir', dir]),
@@ -244,6 +255,8 @@ export function parseRun(args: string[], env = process.env, platform = process.p
   options.env = standaloneContext(launchEnv, cwd);
   return {
     options,
+    tierCheck:
+      serviceTier === undefined ? undefined : { launch: { ...launch, command, leadingArgs: leading }, serviceTier },
     prompt,
     policy: policy ?? null,
     completion: completion as 'manual' | 'wait',
@@ -266,6 +279,8 @@ export async function runStandalone(
     env?: NodeJS.ProcessEnv;
     platform?: NodeJS.Platform;
     receipts?: DispatchReceipts;
+    signal?: AbortSignal;
+    tierCheck?: typeof checkCodexServiceTier;
     exists?: typeof fs.existsSync;
   } = {},
 ): Promise<string> {
@@ -283,6 +298,19 @@ export async function runStandalone(
     attribution.provider && attribution.requester
       ? { provider: attribution.provider, id: attribution.requester }
       : null;
+  if (parsed.tierCheck) {
+    await (runtime.tierCheck ?? checkCodexServiceTier)(
+      parsed.tierCheck.launch,
+      {
+        cwd: parsed.options.cwd,
+        model: parsed.options.model,
+        serviceTier: parsed.tierCheck.serviceTier,
+        clientInfo: { name: 'arc', title: 'Arc', version: '1' },
+      },
+      standaloneEnvironment(parsed.options, parsed.env),
+      { signal: runtime.signal },
+    );
+  }
   const launch = receipts.reserve({
     origin: randomBytes(12).toString('hex'),
     requester,

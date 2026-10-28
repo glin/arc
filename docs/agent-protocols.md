@@ -62,6 +62,10 @@ File approvals name an item ID, without paths. Join the active `fileChange` item
 
 Images use `localImage`. Other files use `mention` with display name and staged path. Requests contain paths and metadata, never file bytes. Check the saved SHA-256 digest before delivery. Retain staged files until the turn ends.
 
+### Explicit Codex service tiers
+
+An explicit tier travels through thread start, resume, fork, and subsequent turns. Arc checks the live model catalog from that child. `serviceTiers` takes precedence over the legacy `additionalSpeedTiers` list. Legacy `fast` means `priority`. Standard `default` needs no catalog entry. Missing nonstandard support refuses input. Opening replies must report the requested canonical `serviceTier`. Missing, null, or different acceptance refuses before any prompt. Model changes trigger another capability check before input. Each prompt keeps one model through its capability check, submission, and acceptance. Selections made during that check apply to later prompts. Clearing the selection retains the model from the latest accepted submission in send order. A rejected submission does not replace that model. Omitted tiers require neither catalog support nor acceptance metadata.
+
 ### Guarded input
 
 Live input uses `turn/steer` with exactly one eligible running root and its expected turn ID. Acceptance requires the same returned ID. It creates no submission or completion owner. Ambiguous roots block it, and so do the compaction states in [Session compaction](session-compaction.md). Uncertain writes stay unknown and never enter the queue automatically.

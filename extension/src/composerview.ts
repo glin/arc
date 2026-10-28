@@ -523,6 +523,7 @@ export interface Menu {
 // confirm them. Confirmed values come from the transcript and remain outside
 // this stored shape.
 export interface SessionSettingSelection {
+  serviceTier?: ServiceTier;
   selectedModel: string;
   selectedEffort: string;
   // Retain a draft's permission choice for a replacement child.
@@ -1470,9 +1471,10 @@ export function handoffRefusalMessage(refusal: HandoffRefusal, sending: boolean)
   return messages[refusal];
 }
 
-import type { LaunchPolicy, RequestedCacheLifetime } from './launchpolicy';
+import type { LaunchPolicy, RequestedCacheLifetime, ServiceTier } from './launchpolicy';
 
 export interface NewSessionDraft {
+  serviceTier?: ServiceTier;
   policy?: LaunchPolicy;
   agentRun?: boolean;
   // A lifetime requested by a window start. Claude launches of this draft set it.

@@ -2,6 +2,10 @@
 
 [CLI launch options](cli.md#standalone-launches) owns command usage. [`cli/src/standalone.ts`](../cli/src/standalone.ts) owns process observation and capture. [`dispatchreceipts.ts`](../extension/src/dispatchreceipts.ts) owns receipt validation and publication.
 
+## Explicit service-tier checks
+
+An explicit Codex tier starts a read-only ephemeral app-server check before receipt reservation or worker launch. It uses the worker executable, environment, working directory, and model. Opening has a 15-second deadline. Cleanup closes input, requests termination after the exit grace period, and awaits exit on every outcome. The check sends no model turn. A successful check establishes launch-time capability and accepted normalization, not future account access. Exec and attended launches receive the canonical `service_tier` configuration override. Omitted tiers skip this check.
+
 ## Link a launched session
 
 Arc links direct `claude --bg` and `claude -p --output-format json` launches from IDs in parent Bash results. Fresh `codex exec --json` launches require their paired stdout `thread.started` event. Claude and Codex parents support Codex launches and wrapper receipts.

@@ -1,7 +1,14 @@
 import { runBackgroundManagement } from './standalone.ts';
 import { resolve } from 'node:path';
 import { validContinuation, validContinuationPath, CONTINUATION_LIMITS } from '../../extension/src/compactrequest.ts';
-import { cacheLifetimeRefusal, launchPolicy, type RequestedCacheLifetime } from '../../extension/src/launchpolicy.ts';
+import {
+  canonicalServiceTier,
+  serviceTierRefusal,
+  type RequestedServiceTier,
+  cacheLifetimeRefusal,
+  launchPolicy,
+  type RequestedCacheLifetime,
+} from '../../extension/src/launchpolicy.ts';
 import type { SetupListing } from '../../extension/src/view/launcher.ts';
 import * as fs from 'node:fs';
 import { requestWindow, requesterIdentity } from '../../extension/src/sessionrequests.ts';
@@ -132,6 +139,7 @@ export async function runManagement(command: string, args: string[]): Promise<st
     '--completion',
     '--report-file',
     '--cache-lifetime',
+    '--service-tier',
   ]);
   const switches = new Set([
     '--read-only',
@@ -194,6 +202,7 @@ export async function runManagement(command: string, args: string[]): Promise<st
                 '--completion',
                 '--report-file',
                 '--cache-lifetime',
+                '--service-tier',
               ]
             : [
                 '--window',
@@ -283,6 +292,10 @@ export async function runManagement(command: string, args: string[]): Promise<st
       throw new Error('A setup key cannot combine with explicit setup values.');
     if (!key && !['claude', 'codex'].includes(options.get('--provider') ?? ''))
       throw new Error('Choose --provider claude or codex, or --setup KEY.');
+    const serviceTier = options.get('--service-tier') as RequestedServiceTier | undefined;
+    const tierRefusal =
+      serviceTier === undefined ? null : serviceTierRefusal(serviceTier, options.get('--provider') ?? 'codex');
+    if (tierRefusal) throw new Error(tierRefusal);
     const cacheLifetime = options.get('--cache-lifetime');
     // A setup key names its provider only in the window, so the window refuses a Codex setup.
     const lifetimeRefusal =
@@ -319,6 +332,7 @@ export async function runManagement(command: string, args: string[]): Promise<st
       prompt,
       agentRun,
       ...(cacheLifetime ? { cacheLifetime: cacheLifetime as RequestedCacheLifetime } : {}),
+      ...(serviceTier === undefined ? {} : { serviceTier: canonicalServiceTier(serviceTier) }),
       ...(guarded
         ? {
             dispatch: true,

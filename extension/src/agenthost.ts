@@ -584,6 +584,7 @@ export function claudeRenamePlan(launch: Launch, options: SpawnOptions & { resum
 
 // Codex thread-opening settings retain immutable launch restrictions or the reader's selected permission mode.
 export interface CodexPlanOptions {
+  serviceTier?: import('./launchpolicy').ServiceTier;
   policy?: LaunchPolicy;
   beforeForkWrite?: () => void;
   forkWriteAttempted?: () => void;
@@ -645,7 +646,10 @@ export function codexPlan(
           if (options.fork) {
             await wire.forkThread(options.fork, options, options.beforeForkWrite, options.forkWriteAttempted);
           } else if (options.resume) {
-            await wire.resumeThread(options.resume, options.policy ? options : undefined);
+            await wire.resumeThread(
+              options.resume,
+              options.policy || options.serviceTier !== undefined ? options : undefined,
+            );
           } else await wire.startThread(options);
           // Apply the reader's settings to later turns, including settings for a resumed thread.
           if (options.approvalPolicy && options.approvalsReviewer && options.sandbox) {
@@ -701,6 +705,64 @@ export function codexPlan(
 // Both plans read account usage and model catalogs without sending prompts.
 export function claudeIdlePlan(launch: Launch, cwd: string, model = ''): AgentPlan {
   return claudePlan(launch, { cwd, persistSession: false, ...(model ? { model } : {}) });
+}
+
+export async function checkCodexServiceTier(
+  launch: Launch,
+  options: { cwd: string; model: string; serviceTier: import('./launchpolicy').ServiceTier; clientInfo: ClientInfo },
+  environment: NodeJS.ProcessEnv,
+  runtime: { spawner?: Spawner; openingDeadlineMs?: number; exitGraceMs?: number; signal?: AbortSignal } = {},
+): Promise<void> {
+  if (runtime.signal?.aborted) throw new Error('The service tier check was cancelled.');
+  const plan: AgentPlan = {
+    agent: 'codex',
+    sessionId: null,
+    command: launch.command,
+    args: [...launch.leadingArgs, ...appServerArgs()],
+    cwd: options.cwd,
+    env: launch.env,
+    inheritedEnvironment: environment,
+    driver(send, emit) {
+      const wire = new CodexWire({ send, emit, cwd: options.cwd, clientInfo: options.clientInfo });
+      return {
+        ...renameOnlyControls('This child only checks the requested service tier.'),
+        receive: (line) => wire.receive(line),
+        async open() {
+          await wire.initialize();
+          await wire.startThread({
+            ...options,
+            ephemeral: true,
+            approvalPolicy: 'never',
+            approvalsReviewer: 'user',
+            sandbox: 'read-only',
+          });
+          return [];
+        },
+        sessionId: () => null,
+        close: (reason) => wire.close(reason),
+      };
+    },
+  };
+  const session = new AgentSession(
+    'service-tier-check',
+    plan,
+    runtime.spawner ?? spawnCli,
+    () => {},
+    () => {},
+    runtime.openingDeadlineMs ?? 15_000,
+    runtime.exitGraceMs,
+  );
+  const cancel = () => {
+    void session.dispose();
+  };
+  runtime.signal?.addEventListener('abort', cancel, { once: true });
+  try {
+    await session.startOrThrow();
+    if (runtime.signal?.aborted) throw new Error('The service tier check was cancelled.');
+  } finally {
+    runtime.signal?.removeEventListener('abort', cancel);
+    await session.dispose();
+  }
 }
 
 export function codexIdlePlan(

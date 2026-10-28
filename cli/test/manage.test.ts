@@ -904,3 +904,32 @@ test('ordinary send and both explicit queue spellings retain their distinct deli
     await fixture.close();
   }
 });
+
+test('hosted service tier preserves setup keys, canonicalizes Fast, and rejects invalid selections', async () => {
+  const f = await host();
+  try {
+    for (const setup of [
+      ['--provider', 'codex'],
+      ['--setup', 'saved'],
+    ]) {
+      for (const tier of [undefined, 'default', 'fast', 'priority', 'ultrafast']) {
+        await runManagement('start', [...setup, '--prompt-file', f.prompt, ...(tier ? ['--service-tier', tier] : [])]);
+        assert.equal(f.requests.at(-1)?.params.serviceTier, tier === 'fast' ? 'priority' : tier);
+      }
+    }
+    const count = f.requests.length;
+    for (const flags of [
+      ['--service-tier', ''],
+      ['--service-tier', 'auto'],
+      ['--service-tier', 'fast', '--service-tier', 'fast'],
+    ])
+      await assert.rejects(runManagement('start', ['--provider', 'codex', '--prompt-file', f.prompt, ...flags]));
+    await assert.rejects(
+      runManagement('start', ['--provider', 'claude', '--prompt-file', f.prompt, '--service-tier', 'fast']),
+      /only to Codex/,
+    );
+    assert.equal(f.requests.length, count);
+  } finally {
+    await f.close();
+  }
+});

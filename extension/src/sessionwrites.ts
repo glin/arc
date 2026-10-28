@@ -2,7 +2,13 @@ import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypt
 import type { LauncherRequest } from './view/launcher';
 import type { SessionListingRow } from './sessionreads';
 import type { GuardedAttempt, GuardedReceipt } from './agentwire';
-import { isCacheLifetime, type RequestedCacheLifetime } from './launchpolicy';
+import {
+  canonicalServiceTier,
+  isServiceTier,
+  type RequestedServiceTier,
+  isCacheLifetime,
+  type RequestedCacheLifetime,
+} from './launchpolicy';
 import {
   currentAgentRead,
   normalizeAgentRead,
@@ -24,6 +30,7 @@ export interface SessionWriteParams {
   pinned?: boolean;
   agentRun?: boolean;
   cacheLifetime?: RequestedCacheLifetime;
+  serviceTier?: RequestedServiceTier;
   cwd?: string;
   readOnly?: boolean;
   readTools?: string[];
@@ -86,6 +93,7 @@ export function validSessionWrite(method: string, params: Record<string, unknown
       'pinned',
       'agentRun',
       'cacheLifetime',
+      'serviceTier',
       'cwd',
       'readOnly',
       'readTools',
@@ -98,6 +106,7 @@ export function validSessionWrite(method: string, params: Record<string, unknown
       text(params.prompt, 48 * 1024) &&
       typeof params.agentRun === 'boolean' &&
       (params.cacheLifetime === undefined || isCacheLifetime(params.cacheLifetime)) &&
+      (params.serviceTier === undefined || isServiceTier(params.serviceTier)) &&
       (params.dispatch === undefined || params.dispatch === true) &&
       (params.completion === undefined ||
         (params.dispatch === true && ['manual', 'wait'].includes(params.completion as string))) &&
@@ -144,7 +153,19 @@ export function sessionWriteBinding(
   requester: string | null,
   requesterProvider: RequesterProvider | null,
 ): unknown {
-  return { activation, method, params, requester, requesterProvider };
+  return {
+    activation,
+    method,
+    params:
+      params.serviceTier === undefined
+        ? params
+        : {
+            ...params,
+            serviceTier: canonicalServiceTier(params.serviceTier),
+          },
+    requester,
+    requesterProvider,
+  };
 }
 
 // The shared result allowance for starts, curation, sends and read acknowledgments in one activation.

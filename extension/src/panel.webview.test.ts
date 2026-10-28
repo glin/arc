@@ -16659,6 +16659,8 @@ test('saved read-only policy survives replacement, draft resume, fork and clear 
         return { state: () => ({ sessionId: 'forked' }) };
       },
       sessionSettingsForProfile,
+      sessionSettings,
+      settingBook: () => ({}),
       persistSessionSettings: async () => {},
       publishPicks() {},
       host: { questionRecovery: () => undefined },
@@ -16986,7 +16988,8 @@ test('agent-default sessions leave permission overrides out of resume and fork p
     'claudeAskMode',
     'codexPlan',
     'CLIENT_INFO',
-    'const policies = { read: () => undefined }; const panel = {}; const savePolicy = async () => {};' + resumeCode,
+    'const settingBook = () => ({}); const sessionSettings = () => ({}); const policies = { read: () => undefined }; const panel = {}; const savePolicy = async () => {};' +
+      resumeCode,
   )(
     resumeModule,
     resumeModule.exports,
@@ -17037,7 +17040,7 @@ test('agent-default sessions leave permission overrides out of resume and fork p
     'persistSessionSettings',
     'publishPicks',
     'forkSequence',
-    'const policies = { read: () => undefined, readSaved: () => undefined }; const savePolicy = async () => {};' +
+    'const settingBook = () => ({}); const sessionSettings = () => ({}); const policies = { read: () => undefined, readSaved: () => undefined }; const savePolicy = async () => {};' +
       forkCode,
   )(
     forkModule,
@@ -43447,4 +43450,51 @@ test('panel opening and configuration refresh never offer global hooks while exp
   assert.equal(offers, 0);
   sourceMatch(source, /registerCommand\('arc\.setupClaudeSnapshots'/, 'explicit global setup command is missing');
   sourceMatch(source, /return snapshotOffer\?\.check\(true\)/, 'explicit setup no longer confirms its operation');
+});
+
+test('programmatic service tiers validate setup providers and persist only the launched session', async () => {
+  for (const agent of ['claude', 'codex'] as const)
+    for (const kind of ['custom', 'row'] as const) {
+      const provider: any = liveProviderFixture(livePress({ sessionId: 'reader', agent })).provider;
+      const profile: SessionProfile = { agent, model: '', effort: '', permissionMode: '', source: 'recent' };
+      const view = sessionLauncherView(null, [profile], {});
+      const setup = kind === 'row' ? { kind, key: view.primary!.key } : { kind, ...profile };
+      const drafts: NewSessionDraft[] = [];
+      const adopted: any[] = [];
+      Object.assign(provider, {
+        setupProject: 'project',
+        pendingModels: [],
+        folders: () => ['C:/workspace'],
+        repositoryScope: { snapshot: () => ({ ready: true, roots: ['C:/workspace'] }) },
+        launcherFor: () => ({ view }),
+        memento: { update: async () => {} },
+        onSendDraftPrompt: async (draft: NewSessionDraft) => {
+          drafts.push(draft);
+          return { delivered: true, session: `started-${drafts.length}`, reason: '' };
+        },
+        adoptDraft: () => {},
+        onSessionSettingsAdopted: async (_session: string, settings: unknown) => adopted.push(settings),
+        pinnedTop: new Set(),
+        saved: normalizePanelState(null),
+      });
+      const start = (serviceTier?: string) =>
+        provider.handleSessionRequest({
+          method: 'start',
+          requester: null,
+          params: { prompt: 'Review', setup, agentRun: false, ...(serviceTier === undefined ? {} : { serviceTier }) },
+        });
+      if (agent === 'claude') {
+        await assert.rejects(start('fast'), /only to Codex/);
+        assert.equal(drafts.length, 0);
+      } else {
+        const result = await start('fast');
+        assert.equal(result.sessionId, 'started-1');
+        assert.equal(drafts[0].serviceTier, 'priority');
+        assert.equal(adopted[0].serviceTier, 'priority');
+        await start();
+        assert.equal(drafts[1].serviceTier, undefined);
+        assert.equal(adopted[1].serviceTier, undefined);
+        assert.equal(provider.picks['started-1'].serviceTier, 'priority');
+      }
+    }
 });

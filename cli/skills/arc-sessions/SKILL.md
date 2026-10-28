@@ -9,14 +9,14 @@ Use Arc for work the reader requested. Start only authorized work. Use `--json` 
 
 ## Select a ready window
 
-For window commands, run `arc windows --json` and select by folders and `hostId` when no window is established. Pass that `hostId` through `--window`. Scope covers only that window's folders. Preserve the requested provider, model, effort, and permissions. Never substitute settings to bypass a refusal.
+For window commands, run `arc windows --json` and select by folders and `hostId` when no window is established. Pass that `hostId` through `--window`. Scope covers only that window's folders. Preserve the requested provider, model, effort, service tier, and permissions. Never substitute settings to bypass a refusal.
 
 - Read [windows.md](windows.md) when discovery returns an empty or incomplete list, when a command refuses the window, or after a window reload.
 
 ## Select the command
 
 - Use `arc start` for a window session. Read [start.md](start.md) first.
-- Use `arc run` without a window. Run `arc run --help` first, then retrieve results with `arc dispatch status` and `arc dispatch result`.
+- Use `arc run` without a window. Read the service-tier guidance in [start.md](start.md). Run `arc run --help` first. Retrieve results with `arc dispatch status` and `arc dispatch result`.
 - Use `arc filter QUERY` only when asked to change the visible Session list query. `arc filter --clear` restores All sessions. Listing with `arc sessions --query` leaves the panel unchanged.
 - Use `arc cost` for saved session estimates, without a window. Read [costs.md](costs.md) before reporting costs.
 

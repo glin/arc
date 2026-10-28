@@ -2227,6 +2227,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         : codexPlan(launch, {
             cwd,
             resume: session,
+            serviceTier: sessionSettings(settingBook(), session).serviceTier,
             policy: policies.read(session),
             clientInfo: CLIENT_INFO,
             ...(mode ? codexAskMode(mode) : {}),
@@ -2275,6 +2276,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           : codexPlan(launch, {
               cwd,
               resume: session,
+              serviceTier: sessionSettings(settingBook(), session).serviceTier,
               policy: policies.read(session),
               clientInfo: CLIENT_INFO,
               ...(mode ? codexAskMode(mode) : {}),
@@ -2305,6 +2307,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       permissionMode: picked ?? '',
       source: 'custom',
     });
+    const tier = sessionSettings(settingBook(), sessionId).serviceTier;
+    if (tier !== undefined) settings.serviceTier = tier;
     // Leave a fork's permission unset when its source has no stored permission. An empty string explicitly selects the Codex default.
     if (picked === undefined) {
       delete settings.permissionMode;
@@ -2321,6 +2325,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         codexPlan(launch, {
           cwd,
           fork: sessionId,
+          serviceTier: sessionSettings(settingBook(), sessionId).serviceTier,
           policy,
           beforeForkWrite: policy
             ? () => {
@@ -2379,6 +2384,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             cwd: draft.cwd,
             policy: draft.policy,
             clientInfo: CLIENT_INFO,
+            serviceTier: draft.serviceTier,
             ...(mode ? codexAskMode(mode) : {}),
             model: draft.profile.model,
             effort: draft.profile.effort,
@@ -2412,6 +2418,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             resume: sessionId,
             policy: draft.policy ?? policies.read(sessionId),
             clientInfo: CLIENT_INFO,
+            serviceTier: draft.serviceTier,
             ...(mode ? codexAskMode(mode) : {}),
             model: draft.profile.model,
             effort: draft.profile.effort,
