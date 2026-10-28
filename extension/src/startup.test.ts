@@ -7388,15 +7388,63 @@ test('a write to a session that the walk listed and discovery has not accepted r
       parents.at(-1)?.some((row) => normalizeFsPath(row.file) === normalizeFsPath(quiet)),
       'the discovery request dropped a session that the walk listed and the wake did not name',
     );
-    // Once discovery accepts it, the row lists with its newest turn, still without a walk.
+    // Once discovery accepts it, the row lists at its newest revision, still without a walk.
     provider.prepareClaudeChildren = accept;
     fs.appendFileSync(late, '{"type":"assistant"}\n');
     await watch([[late, 'change']]);
     const row = provider.authoritativeCatalog.find(
       (session: SessionFile) => normalizeFsPath(session.file) === normalizeFsPath(late),
     );
-    assert.equal(row?.size, fs.statSync(late).size, 'the accepted row missed the newest turn');
+    assert.equal(row?.size, fs.statSync(late).size, 'the accepted row kept an old revision');
     assert.deepEqual(walks(), { 'walk:requested:startup': 1, 'walk:requested:transcript': 1 });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('a targeted wake after a search walk keeps the parents that prompt admission left out', async () => {
+  const { provider, project, create, start, watch, walks } = pollWalkHarness();
+  try {
+    await start();
+    const parents = discoveryInProgress(provider);
+    const late = create(path.join(project, 'late.jsonl'));
+    const silent = create(path.join(project, 'silent.jsonl'), '{"type":"assistant"}\n');
+    await watch([
+      [late, 'rename'],
+      [silent, 'rename'],
+    ]);
+    // A content search walks with prompt admission, so its listed rows leave out the session without a prompt.
+    provider.hasHumanPrompt = (session: SessionFile) => session.sessionId !== 'silent';
+    provider.allSessions(false, false, undefined, undefined, 'requested:search');
+    assert.ok(
+      !provider.walkedCatalog.sessions.some((row: SessionFile) => row.file === silent),
+      'the search walk listed a session without a prompt',
+    );
+    fs.appendFileSync(late, '{"type":"assistant"}\n');
+    await watch([[late, 'change']]);
+    assert.ok(
+      parents.at(-1)?.some((row) => normalizeFsPath(row.file) === normalizeFsPath(silent)),
+      'the discovery request dropped a walked parent without a prompt',
+    );
+    assert.equal(walks()['walk:requested:transcript'], 1, 'the wake on a walk-listed session walked');
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('a wake on a walk-listed session whose file was replaced walks', async () => {
+  const { provider, project, create, start, watch, walks } = pollWalkHarness();
+  try {
+    await start();
+    discoveryInProgress(provider);
+    const late = create(path.join(project, 'late.jsonl'));
+    await watch([[late, 'rename']]);
+    const copy = `${late}.copy`;
+    fs.writeFileSync(copy, '{"type":"user"}\n{"type":"assistant"}\n');
+    fs.rmSync(late);
+    fs.renameSync(copy, late);
+    await watch([[late, 'change']]);
+    assert.deepEqual(walks(), { 'walk:requested:startup': 1, 'walk:requested:transcript': 2 });
   } finally {
     vi.useRealTimers();
   }

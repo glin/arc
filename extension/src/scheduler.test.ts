@@ -531,7 +531,8 @@ test('a path that the last walk listed and the held catalog lacks is targeted, a
   // The batch spells each path with forward slashes on every host.
   const slash = (file: string) => file.replace(/\\/g, '/');
   const known = (file: string) => file === 'records/held.jsonl';
-  const walked = (file: string) => file === 'records/walked.jsonl';
+  // A walk lists the held files too, so a held path must count as held.
+  const walked = (file: string) => file === 'records/walked.jsonl' || file === 'records/held.jsonl';
   const listed = new PendingWatcherWake();
   listed.noteFileEvent('records', 'walked.jsonl', 'change', slash);
   listed.noteFileEvent('records', 'held.jsonl', 'change', slash);

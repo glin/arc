@@ -2077,8 +2077,9 @@ export class PanelProvider implements vscode.Disposable {
   private spendSourceRows: readonly SessionFile[] = [];
   // Catalog and folder identity retained for selection refreshes. Filesystem refreshes replace this snapshot.
   private catalog: { folders: string; sessions: SessionFile[] } | null = null;
-  // The rows and roots of the last filesystem walk. Discovery progress can put accepted rows back into `catalog`.
-  private walkedCatalog: { scope: string; sessions: SessionFile[] } | null = null;
+  // The rows, roots and discovery parents of the last filesystem walk. Discovery progress can put accepted rows back
+  // into `catalog`. The parents include Claude sessions that prompt admission left out of the rows.
+  private walkedCatalog: { scope: string; sessions: SessionFile[]; parents: SessionFile[] } | null = null;
   private unknownPathClassifier: { inputs: readonly unknown[]; shapeOf: (file: string) => UnknownPathShape } | null =
     null;
   // The existing-session list from the last payload that completed discovery and required
@@ -3769,13 +3770,16 @@ export class PanelProvider implements vscode.Disposable {
     const batch = this.pendingWatch.take();
     const catalog = this.catalog?.sessions ?? [];
     const known = new Set(catalog.map((session) => normalizeFsPath(session.file)));
-    const walked = this.currentWalkedCatalog();
-    const walkListed = new Set(walked?.sessions.map((session) => normalizeFsPath(session.file)));
+    // The decision asks only about paths outside the held catalog, so most wakes build no walked index.
+    let walkListed: Set<string> | null = null;
     const decision = watcherRefreshDecision(
       batch,
       (file) => known.has(normalizeFsPath(file)),
       sessionDirectoryOwners(catalog, normalizeFsPath),
-      (file) => walkListed.has(normalizeFsPath(file)),
+      (file) =>
+        (walkListed ??= new Set(
+          this.currentWalkedCatalog()?.sessions.map((session) => normalizeFsPath(session.file)),
+        )).has(normalizeFsPath(file)),
     );
     const reason = batch.reasons.length ? batch.reasons.join('+') : 'watcher';
     const started = performance.now();
@@ -3804,7 +3808,7 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   // The last walk, when it listed the current repository roots.
-  private currentWalkedCatalog(): { scope: string; sessions: SessionFile[] } | null {
+  private currentWalkedCatalog(): { scope: string; sessions: SessionFile[]; parents: SessionFile[] } | null {
     const walk = this.walkedCatalog;
     return walk?.scope === JSON.stringify(this.repositoryScopeRoots ?? []) ? walk : null;
   }
@@ -11979,19 +11983,25 @@ export class PanelProvider implements vscode.Disposable {
       // only accepted rows. Each walked parent stays in the next discovery request.
       const walk = this.currentWalkedCatalog();
       const heldFiles = new Set(this.catalog.sessions.map((session) => normalizeFsPath(session.file)));
-      const walkedFiles = new Set(walk?.sessions.map((session) => normalizeFsPath(session.file)));
-      const walkNamed = named.filter(
-        (file) => !heldFiles.has(normalizeFsPath(file)) && walkedFiles.has(normalizeFsPath(file)),
-      );
-      const heldNamed = named.filter((file) => !walkNamed.includes(file));
+      const unheld = named.filter((file) => !heldFiles.has(normalizeFsPath(file)));
+      const walkedFiles = unheld.length
+        ? new Set(walk?.sessions.map((session) => normalizeFsPath(session.file)))
+        : null;
+      const walkNamed = new Set(unheld.filter((file) => walkedFiles?.has(normalizeFsPath(file))));
+      const heldNamed = named.filter((file) => !walkNamed.has(file));
       const held = heldNamed.length
         ? revalidatedCatalogPaths(this.catalog.sessions, heldNamed, statOf)
         : [...this.catalog.sessions];
       const walked =
-        walk && walkNamed.length ? revalidatedCatalogPaths(walk.sessions, walkNamed, statOf) : walk?.sessions;
+        walk && walkNamed.size ? revalidatedCatalogPaths(walk.sessions, [...walkNamed], statOf) : walk?.sessions;
       if (held && walked !== null) {
-        if (walk && walked && walked !== walk.sessions) this.walkedCatalog = { ...walk, sessions: walked };
-        const joining = new Set(walkNamed.map(normalizeFsPath));
+        let parents = walk?.parents ?? [];
+        if (walk && walked && walked !== walk.sessions) {
+          const revised = new Map(walked.map((session) => [session.file, session]));
+          parents = parents.map((session) => revised.get(session.file) ?? session);
+          this.walkedCatalog = { ...walk, sessions: walked, parents };
+        }
+        const joining = new Set([...walkNamed].map(normalizeFsPath));
         const listing = [...held, ...(walked ?? []).filter((session) => joining.has(normalizeFsPath(session.file)))];
         const admitted = deferHumanPrompts
           ? listing
@@ -12000,11 +12010,11 @@ export class PanelProvider implements vscode.Disposable {
                 session.agent !== 'claude' || session.childTranscript === true || this.hasHumanPrompt(session),
             );
         const sorted = orderSessionCatalog(admitted, (session) => this.activityFor(session));
-        const listed = new Set(sorted.map((session) => normalizeFsPath(session.file)));
+        const listed = new Set(sorted.map((session) => session.file));
         this.claudeParents = [
-          ...sorted,
-          ...(walked ?? []).filter((session) => !listed.has(normalizeFsPath(session.file))),
-        ].filter((session) => session.childTranscript !== true);
+          ...sorted.filter((session) => session.childTranscript !== true),
+          ...parents.filter((session) => !listed.has(session.file)),
+        ];
         this.catalog = { folders: folderPrint, sessions: sorted };
         this.catalogWalked = false;
         return sorted;
@@ -12286,7 +12296,7 @@ export class PanelProvider implements vscode.Disposable {
       pendingSince: null,
     };
     this.catalogWalkPendingAt = null;
-    this.walkedCatalog = { scope: JSON.stringify(roots), sessions: walkedSessions };
+    this.walkedCatalog = { scope: JSON.stringify(roots), sessions: walkedSessions, parents: this.claudeParents };
     this.catalog = { folders: folderPrint, sessions: walkedSessions };
     this.catalogWalked = true;
     this.performanceCounters?.recordWork('catalogWalk');
