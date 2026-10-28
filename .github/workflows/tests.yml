@@ -5,6 +5,10 @@ on:
   pull_request:
 
 # The jobs run side by side. Together they run what `npm run test:all` runs locally.
+# Each job owns its runner, so the suite runner's free memory wait is off.
+env:
+  ARC_TEST_MEMORY_FLOOR_GB: '0'
+
 jobs:
   checks:
     runs-on: ubuntu-latest

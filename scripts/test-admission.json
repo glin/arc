@@ -322,7 +322,7 @@
   "scripts/test-lanes.test.js": {
     "reason": "Public commands must report independent failures, preserve cancellation, and reject stale or incomplete landing evidence. Direct cases guard category and admission drift. Machine load cases serialize multi-lane runs, wait for free memory, and cap Vitest workers.",
     "cases": 36,
-    "matricesSha256": "be82d0fe9043f073246bfeddc810c10b06f2e7c983969f33ab758bc41a838319"
+    "matricesSha256": "cc64313e6e30950e18fc7eb0e0765c1580c4a35db7f8b17f2f81af7685883abd"
   },
   "scripts/tool-scope.test.js": {
     "reason": "Real tool commands must respect repository scope and reject external configuration or stale packaged content.",

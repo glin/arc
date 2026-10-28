@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path';
 import { existsSync, realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { forwardSignalToChildAndRelease } from '../extension/test/browserlock.mjs';
+import { clampWorkerArgs, clampWorkerEnvironment } from '../extension/test/machineload.mjs';
 import { createTestObservation } from '../extension/test/observations.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -40,10 +41,12 @@ export async function runSubprocessLane(
   let detachSignalForwarding;
   try {
     observation?.begin('execution', { boundary: 'Vitest child lifetime, including collection and teardown' });
-    const child = spawnChild(process.execPath, subprocessVitestArgs(testRoot, extraArgs), {
+    const inherited = observation ? observation.childEnvironment() : process.env;
+    const env = clampWorkerEnvironment(inherited);
+    const child = spawnChild(process.execPath, clampWorkerArgs(subprocessVitestArgs(testRoot, extraArgs)), {
       cwd: testRoot,
       stdio: 'inherit',
-      ...(observation ? { env: observation.childEnvironment() } : {}),
+      ...(env === process.env ? {} : { env }),
     });
     observation?.event('execution', 'child-start', { childPid: child.pid ?? null });
     detachSignalForwarding = forwardSignalToChildAndRelease(child, null, { observation });

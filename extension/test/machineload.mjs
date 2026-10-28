@@ -12,6 +12,7 @@ import { acquireBrowserLock } from './browserlock.mjs';
 
 export const SUITE_LOCK_PATH = join(tmpdir(), 'arc-test-suite.lock');
 // A holder sets this to its PID for its children, so a nested run inside a held suite does not wait on its parent.
+// A nested run qualifies only when that PID is another live process that owns the lock file it would take.
 export const SUITE_HOLDER_ENV = 'ARC_TEST_SUITE_HOLDER';
 export const DEADLINE_ENV = 'ARC_TEST_LOAD_DEADLINE_MINUTES';
 export const MEMORY_FLOOR_ENV = 'ARC_TEST_MEMORY_FLOOR_GB';
@@ -116,6 +117,14 @@ export async function waitForMemory({
   }
 }
 
+function lockOwnerPid(lockPath) {
+  try {
+    return JSON.parse(readFileSync(lockPath, 'utf8')).pid ?? null;
+  } catch {
+    return null;
+  }
+}
+
 function describeHolder(owner) {
   if (!owner) return 'an unreadable lock record';
   const started = owner.startedAt ? `started ${owner.startedAt}` : 'start time unknown';
@@ -136,7 +145,13 @@ export async function acquireSuiteLock({
   ...lockOptions
 }) {
   const ancestor = Number(env[SUITE_HOLDER_ENV]);
-  if (Number.isInteger(ancestor) && ancestor > 0 && isProcessAlive(ancestor))
+  if (
+    Number.isInteger(ancestor) &&
+    ancestor > 0 &&
+    ancestor !== pid &&
+    lockOwnerPid(lockPath) === ancestor &&
+    isProcessAlive(ancestor)
+  )
     return { nested: true, release: () => false };
   let lastNotice = null;
   let lock;
@@ -161,7 +176,7 @@ export async function acquireSuiteLock({
   } catch (error) {
     if (error.code !== 'ARC_LOCK_TIMEOUT') throw error;
     throw new MachineLoadTimeout(
-      `Another test run held the machine suite lock for ${minutes(deadlineMs)} min, so this run did not start. ${error.holder}. ${DEADLINE_ENV} moves the limit.`,
+      `Another test run held the machine suite lock for ${minutes(deadlineMs)} min, so this run did not start. The holder was ${describeHolder(error.owner)}. ${DEADLINE_ENV} moves the limit.`,
       SUITE_LOCK_TIMEOUT_EXIT,
     );
   }
@@ -213,13 +228,14 @@ export async function holdMachineLoad(run, options = {}) {
   }
 }
 
-// Vitest reads a percentage against the available parallelism. The cap applies to the resolved count.
+// Vitest reads a percentage against the available parallelism and any other value as a JavaScript number.
+// The cap applies to the resolved count.
 function cappedWorkers(value, cores) {
   const text = String(value).trim();
   const percent = /^(\d+(?:\.\d+)?)%$/.exec(text);
   const count = percent
     ? Math.max(1, Math.min(cores, Math.round((Number(percent[1]) / 100) * cores)))
-    : /^\d+$/.test(text)
+    : text && Number.isFinite(Number(text))
       ? Number(text)
       : null;
   if (count === null || count <= MAX_VITEST_WORKERS) return null;
@@ -256,7 +272,7 @@ export function clampWorkerArgs(args, { log = console.log, cores = availablePara
 // Vitest gives VITEST_MAX_WORKERS precedence over its configuration and command line.
 // Return the environment unchanged when the value is absent or within the cap.
 export function clampWorkerEnvironment(env, { log = console.log } = {}) {
-  const value = env?.VITEST_MAX_WORKERS;
+  const value = env.VITEST_MAX_WORKERS;
   if (!value || !(Number.parseInt(value) > MAX_VITEST_WORKERS)) return env;
   log(
     `Vitest runs ${MAX_VITEST_WORKERS} workers instead of VITEST_MAX_WORKERS=${value}. A lane on this machine runs at most ${MAX_VITEST_WORKERS}.`,

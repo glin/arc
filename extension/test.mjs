@@ -23,13 +23,8 @@ const root = dirname(fileURLToPath(import.meta.url));
 const modes = new Set(['full', 'node', 'browser']);
 // Cap lane workers explicitly instead of using Vitest's core-count default.
 // VITEST_MAX_WORKERS and a caller's --maxWorkers can lower a lane below the cap, never raise it above.
-const LANE_WORKERS = {
-  node: MAX_VITEST_WORKERS,
-  browser: MAX_VITEST_WORKERS,
-};
-
-function laneWorkers(mode) {
-  return Math.min(MAX_VITEST_WORKERS, Number.parseInt(process.env.VITEST_MAX_WORKERS) || LANE_WORKERS[mode]);
+function laneWorkers() {
+  return Math.min(MAX_VITEST_WORKERS, Number.parseInt(process.env.VITEST_MAX_WORKERS) || MAX_VITEST_WORKERS);
 }
 
 // Spawn options keep inheriting the parent environment unless the observation or the worker cap changes it.
@@ -173,7 +168,7 @@ function vitestArgs(mode, extraArgs, selected, testRoot) {
     join(testRoot, 'node_modules', 'vitest', 'vitest.mjs'),
     'run',
     '--fileParallelism',
-    ...(hasWorkerFlag(extraArgs) ? [] : [`--maxWorkers=${laneWorkers(mode)}`]),
+    ...(hasWorkerFlag(extraArgs) ? [] : [`--maxWorkers=${laneWorkers()}`]),
     ...selected,
     ...clampWorkerArgs(extraArgs),
   ];
@@ -490,6 +485,19 @@ export async function runFull(extraArgs, opts = {}) {
   return nodeStatus !== 0 ? nodeStatus : browserStatus;
 }
 
+// Named files that all belong to one lane run that lane alone, like a single lane started by hand.
+// A name that matches no file runs no lane, and runFull reports it.
+function fullRunsBothLanes(extraArgs, testRoot = root) {
+  const { files } = partitionArgs(extraArgs);
+  if (!files.length) return true;
+  try {
+    const byLane = splitFilesByLane(files, testRoot);
+    return byLane.node.length > 0 && byLane.browser.length > 0;
+  } catch {
+    return false;
+  }
+}
+
 export async function main(argv = process.argv.slice(2), { machineLoad = {} } = {}) {
   const [mode = 'full', ...extraArgs] = argv;
   const opts = {
@@ -503,12 +511,13 @@ export async function main(argv = process.argv.slice(2), { machineLoad = {} } = 
         lane: `extension ${lane}`,
         cwd,
         command: [process.execPath, join(root, 'test.mjs'), lane, ...args],
-        workerCap: LANE_WORKERS[lane] ? laneWorkers(lane) : null,
+        workerCap: laneWorkers(),
         capacity: lane === 'browser' ? 1 : null,
       }),
   };
+  if (mode === 'full' && !fullRunsBothLanes(extraArgs)) return runFull(extraArgs, opts);
   if (mode === 'full') {
-    // Full mode runs two lanes, so it holds the machine suite lock and waits for free memory before each lane.
+    // A full run of both lanes holds the machine suite lock and waits for free memory before each lane.
     try {
       return await holdMachineLoad((beforeLane) => runFull(extraArgs, { ...opts, beforeLane }), machineLoad);
     } catch (error) {

@@ -334,7 +334,7 @@ export async function acquireBrowserLock({
       if (remaining <= 0) {
         const timeout = new Error(`Timed out waiting for the ${lockName} held by ${describeHolder(current)}.`);
         timeout.code = 'ARC_LOCK_TIMEOUT';
-        timeout.holder = `The holder was ${describeHolder(current)}`;
+        timeout.owner = current;
         throw timeout;
       }
       await waitForPoll(Math.min(pollMs, remaining));

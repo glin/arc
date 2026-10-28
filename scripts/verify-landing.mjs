@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { MEMORY_TIMEOUT_EXIT } from '../extension/test/machineload.mjs';
 import {
   collectSuite,
   completeTestDiagnostics,
@@ -312,7 +313,8 @@ if (
         ? `Landing accepted. Suite exit status: ${decision.suiteExitCode}.`
         : `Landing refused: ${decision.reason}`,
     );
-    process.exitCode = decision.accepted ? 0 : 1;
+    // A collection that stopped on the memory floor keeps its own status, so a caller can tell it from a refusal.
+    process.exitCode = decision.accepted ? 0 : decision.suiteExitCode === MEMORY_TIMEOUT_EXIT ? MEMORY_TIMEOUT_EXIT : 1;
   } catch (error) {
     console.error(error.message);
     process.exitCode = error.exitCode ?? 1;

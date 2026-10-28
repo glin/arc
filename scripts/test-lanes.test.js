@@ -288,6 +288,31 @@ test('command entry points run through a linked checkout', { tags: ['subprocess'
       encoding: 'utf8',
     });
     assert.equal(nestedCancellation.status, 143);
+    // Full mode over both lanes waits for the suite lock and for free memory. A named file in one lane waits for neither.
+    const loadTemp = path.join(root, 'load-temp');
+    fs.mkdirSync(loadTemp);
+    const loadEnv = (extra) => {
+      const env = { ...process.env, TEMP: loadTemp, TMP: loadTemp, TMPDIR: loadTemp, ...extra };
+      env.ARC_TEST_LOAD_DEADLINE_MINUTES = '0.001';
+      delete env.ARC_TEST_SUITE_HOLDER;
+      return env;
+    };
+    const fullRun = (args, extra) =>
+      spawnSync(process.execPath, [path.join(linked, 'extension/test.mjs'), 'full', ...args], {
+        encoding: 'utf8',
+        env: loadEnv(extra),
+      });
+    const starvedFull = fullRun([], { ARC_TEST_MEMORY_FLOOR_GB: '100000' });
+    assert.equal(starvedFull.status, 76, starvedFull.stdout + starvedFull.stderr);
+    assert.doesNotMatch(starvedFull.stdout, /Node lane:/);
+    const suiteLock = path.join(loadTemp, 'arc-test-suite.lock');
+    fs.writeFileSync(suiteLock, JSON.stringify({ pid: process.pid, startedAt: 'earlier', command: 'holder' }));
+    const heldFull = fullRun([], { ARC_TEST_MEMORY_FLOOR_GB: '0' });
+    assert.equal(heldFull.status, 75, heldFull.stdout + heldFull.stderr);
+    assert.match(heldFull.stderr, /The holder was PID \d+, started earlier, running holder\./);
+    const namedNode = fullRun(['src/example.test.ts'], { ARC_TEST_MEMORY_FLOOR_GB: '0' });
+    assert.equal(namedNode.status, 143, namedNode.stdout + namedNode.stderr);
+    fs.rmSync(suiteLock);
     assert.doesNotMatch(nestedCancellation.stdout + nestedCancellation.stderr, /Browser lane|unexpected browser/);
     write(
       'scripts/typecheck-parallel.js',
@@ -327,6 +352,12 @@ test('command entry points run through a linked checkout', { tags: ['subprocess'
       '--report-dir',
       landingDirectory,
     ];
+    const starvedLanding = spawnSync(
+      process.execPath,
+      [...verifyArgs.slice(0, -1), path.join(root, 'starved-landing')],
+      { encoding: 'utf8', env: loadEnv({ ARC_TEST_MEMORY_FLOOR_GB: '100000' }) },
+    );
+    assert.equal(starvedLanding.status, 76, starvedLanding.stdout + starvedLanding.stderr);
     const accepted = spawnSync(process.execPath, verifyArgs, { encoding: 'utf8' });
     assert.equal(accepted.status, 0, accepted.stdout + accepted.stderr);
     assert.equal(JSON.parse(fs.readFileSync(path.join(landingDirectory, 'suite.json'))).exitCode, 0);
@@ -442,6 +473,8 @@ test('both GitHub workflows retain complete categories', () => {
   assert.match(workflow, /node scripts\/test-suite.mjs browser/);
   const candidate = fs.readFileSync(path.join(repositoryRoot, '.github/workflows/vsix-candidate.yml'), 'utf8');
   assert.match(candidate, /^\s*- run: npm run test:all\s*$/m);
+  for (const file of [workflow, candidate])
+    assert.match(file, /^env:\n {2}ARC_TEST_MEMORY_FLOOR_GB: '0'$/m, 'CI runners must not wait for free memory.');
 });
 
 test('the default runs direct units and the complete command adds every integration category', () => {
@@ -1642,8 +1675,9 @@ const passingLanes =
 test('a second multi-lane suite waits for the first and names its holder every 30 seconds', async () => {
   vi.spyOn(console, 'log').mockImplementation(() => {});
   const fixture = collectionFixture();
+  // Both collections run in one process and share its environment, so the holder marker cannot admit the second.
   const first = suiteLoadFixture(fixture.directory, 1001);
-  const second = suiteLoadFixture(fixture.directory, 1002);
+  const second = suiteLoadFixture(fixture.directory, 1001, { env: first.machineLoad.env });
   const launched = [];
   let finishFirst;
   const firstLane = new Promise((resolve) => {
@@ -1794,13 +1828,17 @@ test('the suite lock recovers from a dead holder, admits nested and single-lane 
     assert.equal(JSON.parse(fs.readFileSync(lockPath)).pid, 2002);
     assert.equal(launched.length, 7);
 
-    const timedOut = run('timeout', { ...load.machineLoad, env: { ARC_TEST_LOAD_DEADLINE_MINUTES: '1' } });
+    // A live marker that does not own the lock admits nothing.
+    const timedOut = run('timeout', {
+      ...load.machineLoad,
+      env: { ARC_TEST_LOAD_DEADLINE_MINUTES: '1', ARC_TEST_SUITE_HOLDER: '3003' },
+    });
     await load.tick(60_000);
     assert.equal(await timedOut, 75);
     assert.equal(launched.length, 7);
     assert.match(
       errors.at(-1),
-      /held the machine suite lock for 1 min.*PID 2002 in \/other \(started earlier\) running other suite/,
+      /held the machine suite lock for 1 min.*The holder was PID 2002, started earlier, running other suite\./,
     );
   } finally {
     fs.rmSync(fixture.directory, { recursive: true, force: true });
@@ -1826,6 +1864,19 @@ test('lanes run at most four Vitest workers whatever the caller asks', async () 
       [['vitest.mjs', 'run', '--maxWorkers=4'], '4'],
       [['vitest.mjs', 'run', '--maxWorkers', '2'], '3'],
     ]);
+    const spawned = [];
+    const status = await lane.runSubprocessLane(['--maxWorkers=8'], {
+      testRoot: repositoryRoot,
+      spawn: (_command, args, options) => {
+        spawned.push({ args, workers: options.env?.VITEST_MAX_WORKERS });
+        const child = new EventEmitter();
+        queueMicrotask(() => child.emit('close', 0));
+        return child;
+      },
+    });
+    assert.equal(status, 0);
+    assert.ok(spawned[0].args.includes('--maxWorkers=4') && !spawned[0].args.includes('--maxWorkers=8'));
+    assert.equal(spawned[0].workers, '4');
   } finally {
     vi.unstubAllEnvs();
   }

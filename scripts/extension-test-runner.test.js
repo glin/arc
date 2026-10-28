@@ -1852,8 +1852,11 @@ test('a caller cannot raise a lane above four Vitest workers', () => {
       assert.equal(env.VITEST_MAX_WORKERS, '4');
     }
     assert.deepEqual(
-      machineLoad.clampWorkerArgs(['--maxWorkers=50%', '--maxWorkers=10%'], { cores: 32, log: () => {} }),
-      ['--maxWorkers=4', '--maxWorkers=10%'],
+      machineLoad.clampWorkerArgs(
+        ['--maxWorkers=50%', '--maxWorkers=10%', '--maxWorkers=8.0', '--maxWorkers=1e1', '--maxWorkers=2.5'],
+        { cores: 32, log: () => {} },
+      ),
+      ['--maxWorkers=4', '--maxWorkers=10%', '--maxWorkers=4', '--maxWorkers=4', '--maxWorkers=2.5'],
     );
     assert.ok(logs.some((line) => /instead of --maxWorkers 8/.test(line)));
     assert.ok(logs.some((line) => /instead of VITEST_MAX_WORKERS=8/.test(line)));

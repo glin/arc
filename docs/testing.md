@@ -64,7 +64,7 @@ Independent CI checks continue when their setup permits execution. Browser setup
 
 ### Browser selection
 
-Every Vitest lane and every Vitest configuration uses at most four workers. `VITEST_MAX_WORKERS` or a `--maxWorkers` argument can lower a lane. The runners lower a larger value to four and print that they did. A machine-wide lock serializes browser lanes. Sixteen shared slots bound browser launches, including direct Vitest, IDE, and screenshot runs. Compare queue wait separately from execution time.
+Every Vitest configuration sets at most four workers. The test runners also lower a larger `--maxWorkers` argument or `VITEST_MAX_WORKERS` value to four, and print that they did. A smaller value lowers a lane. A direct Vitest run applies `VITEST_MAX_WORKERS` over its configuration without that cap. A machine-wide lock serializes browser lanes. Sixteen shared slots bound browser launches, including direct Vitest, IDE, and screenshot runs. Compare queue wait separately from execution time.
 
 Check browser readiness and run the browser lane:
 

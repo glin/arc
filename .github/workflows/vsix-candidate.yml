@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+# The job owns its runner, so the suite runner's free memory wait is off.
+env:
+  ARC_TEST_MEMORY_FLOOR_GB: '0'
+
 jobs:
   package:
     runs-on: ubuntu-latest
