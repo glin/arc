@@ -153,6 +153,7 @@ test('performance counters correlate posts and replies for every open panel', ()
       otherPassEnds: 0,
       continuations: 0,
       publications: 0,
+      partialPublications: 0,
     },
     dispatchRoots: {},
     sourceId: 'window-a',
@@ -818,6 +819,7 @@ test('discovery counters sum relationship read charges across worker replies', (
     otherPassEnds: 38,
     continuations: 1,
     publications: 1,
+    partialPublications: 0,
   });
 });
 

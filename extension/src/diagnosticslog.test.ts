@@ -489,6 +489,7 @@ test('unfinished startup keeps fresh durable work after the pending deadline wit
     otherPassEnds: 0,
     continuations: 0,
     publications: 0,
+    partialPublications: 0,
   };
   const health = new HostHealth({
     directory,

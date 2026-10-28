@@ -170,6 +170,13 @@ const seededDispatchFacts = new Set<string>();
 // The settled facts each dispatched file saves with its reference row, by row key, from the last dispatch pass.
 // Null before this worker's first pass, so reply rows keep the facts they arrived with.
 let savedDispatchFacts: Map<string, SavedDispatchFacts> | null = null;
+// The dispatch references of the last complete discovery reply and the roots it answered for. A spend-only request
+// reads their facts again without a discovery epoch.
+let heldDispatchReferences: {
+  scope: string;
+  references: readonly import('./transcript').ClaudeChildSessionReference[];
+  admittedReferences: ReturnType<typeof admittedDispatchReferences>;
+} | null = null;
 // A new worker takes a dispatched file's facts from its saved reference row once.
 function seededDispatch(file: string): HeldDispatchFacts | undefined {
   const key = normalizeFsPath(file);
@@ -460,6 +467,22 @@ async function execute(
   }
   if (request.kind === 'claude-children') {
     const passStarted = performance.now();
+    if (request.spendOnly) {
+      const held = heldDispatchReferences;
+      if (!held || held.scope !== JSON.stringify(request.repositoryRoots))
+        return { kind: 'dispatch-spend', held: false };
+      const charges = emptyDiscoveryCharges();
+      const spend = collectDispatchFacts(request, held.references, held.admittedReferences, charges);
+      charges.passMs = performance.now() - passStarted;
+      return {
+        kind: 'dispatch-spend',
+        held: true,
+        dispatchFacts: spend.dispatched,
+        continuation: spend.continuation,
+        charges,
+        dispatchRoots: spend.dispatchRoots,
+      };
+    }
     for (const [file, entry] of request.referenceEntries ?? []) {
       const key = normalizeFsPath(file);
       if (!claudeChildReferences.has(key)) {
@@ -555,47 +578,7 @@ async function execute(
     }
     const completed = new Set(epoch.completed);
     const completionChanges = new Map<string, boolean>(released.map((key) => [key, false]));
-    const charges: DiscoveryCharges = {
-      readBytes: 0,
-      receiptEntries: 0,
-      receiptChecks: 0,
-      receiptBytes: 0,
-      revalidationBytes: 0,
-      hits: 0,
-      resets: 0,
-      quanta: 0,
-      dispatchRetries: 0,
-      parentChecks: 0,
-      parentCheckMs: 0,
-      childHeadFiles: 0,
-      childHeadBytes: 0,
-      childHeadMs: 0,
-      dispatchSpendVisits: 0,
-      dispatchSpendRereads: 0,
-      dispatchSpendFiles: 0,
-      dispatchSpendBytes: 0,
-      dispatchSpendMs: 0,
-      dispatchSpendAggregateStarts: 0,
-      dispatchSpendAggregateCompletions: 0,
-      dispatchSpendRelationshipInvalidations: 0,
-      dispatchSpendConsumedSourceInvalidations: 0,
-      dispatchSpendSourceRestarts: 0,
-      dispatchSpendParserAdvancements: 0,
-      dispatchSpendRootWaits: 0,
-      dispatchSpendAggregateExhaustedBytes: 0,
-      dispatchSpendAggregateExhaustedTime: 0,
-      dispatchSpendAggregateExhaustedSource: 0,
-      dispatchPersonBytes: 0,
-      dispatchAggregateBytes: 0,
-      dispatchClaudeSpendBytes: 0,
-      dispatchAggregateRemainingBytes: 0,
-      dispatchAggregateRemainingMs: 0,
-      dispatchSpendRootRestarts: 0,
-      passMs: 0,
-      transcriptPassEnds: 0,
-      receiptPassEnds: 0,
-      otherPassEnds: 0,
-    };
+    const charges = emptyDiscoveryCharges();
     // A parent check is one stat of a candidate source, so it reads no bytes.
     const parentCheck = <T>(check: () => T): T => {
       const startedAt = performance.now();
@@ -1115,329 +1098,21 @@ async function execute(
     retainCodexDispatchSpendRoots(
       new Set(admittedReferences.flatMap((reference) => (reference.file ? [reference.file] : []))),
     );
-    const dispatched: DispatchSessionFacts[] = [];
-    const seen = new Set<string>();
-    const dispatchRoots: Record<string, DispatchRootCharges> = {};
-    // Each request caps Codex spend reads independently of relationship discovery and of the other dispatch visits.
-    const dispatchBudget = { bytes: CODEX_DISPATCH_REQUEST_BYTES, ms: RELATIONSHIP_SLICE_MS };
-    const dispatchReads = openReadWindow();
-    // The open root takes every read from the start of its visit to the start of the next root's visit.
-    let openRoot: { root: DispatchRootCharges; before: number } | null = null;
-    const closeRoot = () => {
-      if (openRoot) openRoot.root.bytes += dispatchReads.bytes - openRoot.before;
-      openRoot = null;
-    };
-    try {
-      const subagentMetas = claudeSubagentMetaReader();
-      for (const reference of admittedReferences) {
-        if (reference.kind !== 'dispatch' || !reference.file || seen.has(reference.sessionId)) {
-          continue;
-        }
-        closeRoot();
-        seen.add(reference.sessionId);
-        charges.dispatchSpendVisits++;
-        const root: DispatchRootCharges = {
-          agent: reference.agent,
-          passes: 1,
-          bytes: 0,
-          rereads: 0,
-          rootWaits: 0,
-          restarts: 0,
-          remainingBytes: 0,
-          size: null,
-        };
-        dispatchRoots[reference.sessionId] = root;
-        openRoot = { root, before: dispatchReads.bytes };
-        const revision = revisionOf(reference.file);
-        if (!revision) {
-          continue;
-        }
-        root.size = revision.size;
-        const heldValue = dispatchFacts.get(reference.file) ?? seededDispatch(reference.file);
-        const sourceGeneration = claudeChildReferences.get(normalizeFsPath(reference.file))?.sourceGeneration;
-        const held =
-          heldValue &&
-          heldValue.sourceGeneration === sourceGeneration &&
-          onlyGrew(heldValue.revision, revision) &&
-          (heldValue.revision.size < revision.size || sameRevision(heldValue.revision, revision))
-            ? heldValue
-            : undefined;
-        const now = Date.now();
-        let codexDependencies = held?.codexDependencies ?? [reference.file];
-        const sourceFile = reference.file;
-        const codexVersion = () =>
-          codexAgentSpendVersion(
-            sourceFile,
-            codexSpendIndex(request.codexChildren ?? []),
-            reference.sessionId,
-            codexDependencies,
-          );
-        const tree =
-          reference.agent === 'codex'
-            ? childSpendRevisionKey('completed', codexVersion(), now)
-            : claudeAgentSpendVersion(reference.file, false, subagentMetas);
-        if (
-          held &&
-          sameRevision(held.revision, revision) &&
-          held.tree === tree &&
-          !held.spendPending &&
-          !held.activityStale &&
-          now < held.refreshAt &&
-          (!held.codexPerson || held.codexPerson.bytes >= revision.size)
-        ) {
-          dispatched.push(held.facts);
-          continue;
-        }
-        // The spend of an unchanged file and tree stays true when only its activity answer is stale.
-        if (held?.activityStale && held.activity && sameRevision(held.revision, revision) && held.tree === tree) {
-          const activity = dispatchActivity(reference.file, reference.sessionId, revision, now, reference.agent);
-          const covered = claudeRepeatedMap(reference.file, Number.MAX_SAFE_INTEGER, 0)?.covered === true;
-          if (now >= activity.activeUntil && sameRevision(revision, revisionOf(reference.file))) {
-            // The Claude spend read never marks spend unfinished. Only an activity answer does.
-            const spend: AgentSpend = { ...held.facts.spend };
-            delete spend.unfinished;
-            if (spend.artifacts && held.activity.artifactsComplete !== null)
-              spend.artifacts = { ...spend.artifacts, complete: held.activity.artifactsComplete };
-            if (activity.unfinished) {
-              spend.unfinished = true;
-              if (spend.artifacts) spend.artifacts = { ...spend.artifacts, complete: false };
-            }
-            const facts = { ...held.facts, spend };
-            dispatchFacts.set(reference.file, {
-              ...held,
-              facts,
-              activity: { ...held.activity, covered },
-              activityStale: false,
-              saved: undefined,
-            });
-            dispatched.push(facts);
-            continue;
-          }
-        }
-        // A visit that resumes a pending spend aggregate at the same revision does not count as a reread.
-        if (!held?.spendPending || !sameRevision(held.revision, revision)) {
-          charges.dispatchSpendRereads++;
-          root.rereads++;
-        }
-        const previousPerson =
-          held &&
-          held.revision.dev === revision.dev &&
-          held.revision.ino === revision.ino &&
-          (held.revision.size < revision.size || sameRevision(held.revision, revision))
-            ? held.codexPerson
-            : undefined;
-        const previousBytes = previousPerson?.bytes ?? 0;
-        const personBefore = dispatchReads.bytes;
-        const codexPerson =
-          reference.agent === 'codex'
-            ? scanForCodexPerson(reference.file, revision.size, previousPerson, reference.sessionId)
-            : undefined;
-        charges.dispatchPersonBytes += dispatchReads.bytes - personBefore;
-        if (!sameRevision(revision, revisionOf(reference.file))) {
-          charges.dispatchRetries++;
-          continuation = true;
-          const compatible = held && onlyGrew(held.revision, revisionOf(reference.file));
-          dispatched.push(
-            compatible
-              ? { ...held.facts, spend: { ...held.facts.spend, partial: true } }
-              : {
-                  sessionId: reference.sessionId,
-                  revision,
-                  refreshAt: now,
-                  startedAt: null,
-                  endedAt: null,
-                  toolUses: 0,
-                  person: false,
-                  spend: { models: [], found: false, partial: true, effort: null },
-                },
-          );
-          dispatchFacts.delete(reference.file);
-          continue;
-        }
-        continuation ||= !!codexPerson && codexPerson.bytes < revision.size && codexPerson.bytes > previousBytes;
-        const completion = codexPerson?.dispatchCompletion;
-        const completed =
-          codexPerson?.bytes === revision.size &&
-          codexPerson.fragment.length === 0 &&
-          completion?.terminal !== null &&
-          !!completion?.terminal &&
-          !completion.invalid &&
-          !completion.skipping;
-        const activity =
-          reference.agent === 'codex'
-            ? { activeUntil: completed ? 0 : revision.mtimeMs + TURN_QUIET_MS, unfinished: !completed }
-            : dispatchActivity(reference.file, reference.sessionId, revision, now, reference.agent);
-        const activityCovered =
-          reference.agent === 'claude' &&
-          claudeRepeatedMap(reference.file, Number.MAX_SAFE_INTEGER, 0)?.covered === true;
-        const refreshAt = activity.activeUntil;
-        const active = now < refreshAt;
-        if (active && reference.agent === 'codex') releaseCodexDispatchSpend(reference.file);
-        let spendPending = false;
-        let spendRestarted = false;
-        const spendBefore = dispatchReads.bytes;
-        const spend: AgentSpend = active
-          ? { models: [], found: false, partial: false, effort: null }
-          : reference.agent === 'codex'
-            ? (() => {
-                const result = readCodexDispatchedSpendQuantum(
-                  reference.file,
-                  request.codexChildren ?? [],
-                  now,
-                  dispatchBudget,
-                  (files) => {
-                    codexDependencies = files;
-                  },
-                  (file, entry) => parentPort?.postMessage({ dispatchSpend: [file, entry] }),
-                  (event) => {
-                    charges[event]++;
-                    if (event === 'dispatchSpendRootWaits') root.rootWaits++;
-                    if (event.startsWith('dispatchSpendAggregateExhausted')) {
-                      charges.dispatchAggregateRemainingBytes += dispatchBudget.bytes;
-                      charges.dispatchAggregateRemainingMs += dispatchBudget.ms;
-                      root.remainingBytes += dispatchBudget.bytes;
-                    }
-                  },
-                );
-                spendPending = result.pending;
-                spendRestarted = result.restarted;
-                continuation ||= result.pending;
-                return result.spend;
-              })()
-            : readClaudeAgentSpend(reference.file, request.repositoryRoots, false, subagentMetas);
-        const spendBytes = dispatchReads.bytes - spendBefore;
-        charges[reference.agent === 'codex' ? 'dispatchAggregateBytes' : 'dispatchClaudeSpendBytes'] += spendBytes;
-        if (reference.agent === 'claude' && spendBytes > 0) {
-          spendRestarted = (claudeSpendEnds.get(reference.sessionId) ?? 0) > 0;
-          rememberRestartEvidence(claudeSpendEnds, reference.sessionId, spendBytes);
-        }
-        if (spendRestarted) {
-          charges.dispatchSpendRootRestarts++;
-          root.restarts++;
-        }
-        const activityRead: DispatchActivityRead | undefined =
-          reference.agent === 'claude' && !active
-            ? { covered: activityCovered, artifactsComplete: spend.artifacts?.complete ?? null }
-            : undefined;
-        if (!active && activity.unfinished) {
-          spend.unfinished = true;
-          if (spend.artifacts) {
-            spend.artifacts.complete = false;
-          }
-        }
-        // Claude scans active appends. Codex retains its bounded prompt cursor across quiet
-        // reads because a cached spend can precede delayed copied-turn context.
-        const scanBefore = dispatchReads.bytes;
-        const scan =
-          active && reference.agent === 'claude'
-            ? scanForPerson(reference.file, revision.size, held?.person, held ? held.revision.size : revision.size)
-            : undefined;
-        charges.dispatchPersonBytes += dispatchReads.bytes - scanBefore;
-        const person =
-          reference.agent === 'codex'
-            ? codexPerson && codexPerson.bytes >= revision.size
-              ? codexPerson.person
-              : spend.person === true || codexPerson?.person === true
-            : held?.facts.person === true || (scan ? scan.person : spend.person === true);
-        if (!sameRevision(revision, revisionOf(reference.file))) {
-          charges.dispatchRetries++;
-          continuation = true;
-          const compatible = held && onlyGrew(held.revision, revisionOf(reference.file));
-          dispatched.push(
-            compatible
-              ? { ...held.facts, spend: { ...held.facts.spend, partial: true } }
-              : {
-                  sessionId: reference.sessionId,
-                  revision,
-                  refreshAt: now,
-                  startedAt: null,
-                  endedAt: null,
-                  toolUses: 0,
-                  person: false,
-                  spend: { models: [], found: false, partial: true, effort: null },
-                },
-          );
-          dispatchFacts.delete(reference.file);
-          continue;
-        }
-        const collectedTree =
-          reference.agent === 'codex'
-            ? childSpendRevisionKey('completed', codexVersion(), now)
-            : claudeAgentSpendVersion(reference.file, false, subagentMetas);
-        if (collectedTree !== tree) {
-          charges.dispatchRetries++;
-          continuation = true;
-          spend.partial = true;
-          if (spend.artifacts) spend.artifacts.complete = false;
-        }
-        const facts: DispatchSessionFacts = {
-          sessionId: reference.sessionId,
-          refreshAt: active ? refreshAt : null,
-          revision,
-          spend,
-          startedAt: spend.startedAt ?? null,
-          endedAt: spend.endedAt ?? null,
-          toolUses: spend.toolUses ?? 0,
-          person,
-        };
-        dispatchFacts.set(reference.file, {
-          sourceGeneration,
-          spendPending,
-          revision,
-          // The tree the read started from. When the tree moved during the read, the next pass reads again.
-          tree,
-          codexDependencies,
-          facts,
-          refreshAt: active ? refreshAt : Number.POSITIVE_INFINITY,
-          person: scan,
-          codexPerson,
-          settled:
-            !active && !spendPending && collectedTree === tree && (!codexPerson || codexPerson.bytes >= revision.size),
-          activity: activityRead,
-        });
-        dispatched.push(facts);
-      }
-    } finally {
-      closeRoot();
-      const dispatchTally = closeReadWindow(dispatchReads);
-      charges.dispatchSpendFiles += dispatchTally.files;
-      charges.dispatchSpendBytes += dispatchTally.bytes;
-      charges.dispatchSpendMs += dispatchTally.ms;
-    }
-    const currentFiles = new Set(
-      references.flatMap((reference) => (reference.kind === 'dispatch' && reference.file ? [reference.file] : [])),
-    );
-    for (const file of dispatchFacts.keys()) {
-      if (!currentFiles.has(file)) {
-        dispatchFacts.delete(file);
-      }
-    }
-    savedDispatchFacts = new Map();
-    for (const [file, held] of dispatchFacts) {
-      if (!held.settled) continue;
-      held.saved ??= {
-        version: DISPATCH_FACTS_VERSION,
-        revision: held.revision,
-        tree: held.tree,
-        sourceGeneration: held.sourceGeneration,
-        codexDependencies: held.codexDependencies,
-        ...(held.activity ? { activity: held.activity } : {}),
-        facts: held.facts,
-      };
-      savedDispatchFacts.set(normalizeFsPath(file), held.saved);
-    }
+    const spend = collectDispatchFacts(request, references, admittedReferences, charges);
+    heldDispatchReferences = { scope: JSON.stringify(epoch.repositoryRoots), references, admittedReferences };
     charges.passMs = performance.now() - passStarted;
     return {
       kind: 'claude-children',
       checkpoint: { ...epoch, completed: [...completed], sequence: epoch.sequence + 1 },
       ...found,
       references,
-      dispatchFacts: dispatched,
+      dispatchFacts: spend.dispatched,
       referenceEntries: [...claudeChildReferences].map(withSavedFacts),
       complete: true,
-      continuation,
+      continuation: continuation || spend.continuation,
+      membershipSettled: !continuation,
       charges,
-      dispatchRoots,
+      dispatchRoots: spend.dispatchRoots,
       roots: epoch.parents,
       scope: epoch.repositoryRoots,
     };
@@ -1744,6 +1419,372 @@ const requests = new Map<number, AbortController>();
 // Window read lifecycles in this worker. Times use this worker's monotonic clock, so only their differences leave it.
 // Overlap counts name other work that ran on this thread during the read, not the time that work took.
 const WINDOW_READS = 8;
+function emptyDiscoveryCharges(): DiscoveryCharges {
+  return {
+    readBytes: 0,
+    receiptEntries: 0,
+    receiptChecks: 0,
+    receiptBytes: 0,
+    revalidationBytes: 0,
+    hits: 0,
+    resets: 0,
+    quanta: 0,
+    dispatchRetries: 0,
+    parentChecks: 0,
+    parentCheckMs: 0,
+    childHeadFiles: 0,
+    childHeadBytes: 0,
+    childHeadMs: 0,
+    dispatchSpendVisits: 0,
+    dispatchSpendRereads: 0,
+    dispatchSpendFiles: 0,
+    dispatchSpendBytes: 0,
+    dispatchSpendMs: 0,
+    dispatchSpendAggregateStarts: 0,
+    dispatchSpendAggregateCompletions: 0,
+    dispatchSpendRelationshipInvalidations: 0,
+    dispatchSpendConsumedSourceInvalidations: 0,
+    dispatchSpendSourceRestarts: 0,
+    dispatchSpendParserAdvancements: 0,
+    dispatchSpendRootWaits: 0,
+    dispatchSpendAggregateExhaustedBytes: 0,
+    dispatchSpendAggregateExhaustedTime: 0,
+    dispatchSpendAggregateExhaustedSource: 0,
+    dispatchPersonBytes: 0,
+    dispatchAggregateBytes: 0,
+    dispatchClaudeSpendBytes: 0,
+    dispatchAggregateRemainingBytes: 0,
+    dispatchAggregateRemainingMs: 0,
+    dispatchSpendRootRestarts: 0,
+    passMs: 0,
+    transcriptPassEnds: 0,
+    receiptPassEnds: 0,
+    otherPassEnds: 0,
+  };
+}
+
+// Reads the spend and person facts of every admitted dispatched session. A pass that leaves any of that work unfinished
+// returns `continuation`. It changes no catalog member or relationship, so a spend-only request can run it alone.
+function collectDispatchFacts(
+  request: Extract<ProgressiveRequest, { kind: 'claude-children' }>,
+  references: readonly import('./transcript').ClaudeChildSessionReference[],
+  admittedReferences: ReturnType<typeof admittedDispatchReferences>,
+  charges: DiscoveryCharges,
+): { dispatched: DispatchSessionFacts[]; dispatchRoots: Record<string, DispatchRootCharges>; continuation: boolean } {
+  let continuation = false;
+  const dispatched: DispatchSessionFacts[] = [];
+  const seen = new Set<string>();
+  const dispatchRoots: Record<string, DispatchRootCharges> = {};
+  // Each request caps Codex spend reads independently of relationship discovery and of the other dispatch visits.
+  const dispatchBudget = { bytes: CODEX_DISPATCH_REQUEST_BYTES, ms: RELATIONSHIP_SLICE_MS };
+  const dispatchReads = openReadWindow();
+  // The open root takes every read from the start of its visit to the start of the next root's visit.
+  let openRoot: { root: DispatchRootCharges; before: number } | null = null;
+  const closeRoot = () => {
+    if (openRoot) openRoot.root.bytes += dispatchReads.bytes - openRoot.before;
+    openRoot = null;
+  };
+  try {
+    const subagentMetas = claudeSubagentMetaReader();
+    for (const reference of admittedReferences) {
+      if (reference.kind !== 'dispatch' || !reference.file || seen.has(reference.sessionId)) {
+        continue;
+      }
+      closeRoot();
+      seen.add(reference.sessionId);
+      charges.dispatchSpendVisits++;
+      const root: DispatchRootCharges = {
+        agent: reference.agent,
+        passes: 1,
+        bytes: 0,
+        rereads: 0,
+        rootWaits: 0,
+        restarts: 0,
+        remainingBytes: 0,
+        size: null,
+      };
+      dispatchRoots[reference.sessionId] = root;
+      openRoot = { root, before: dispatchReads.bytes };
+      const revision = revisionOf(reference.file);
+      if (!revision) {
+        continue;
+      }
+      root.size = revision.size;
+      const heldValue = dispatchFacts.get(reference.file) ?? seededDispatch(reference.file);
+      const sourceGeneration = claudeChildReferences.get(normalizeFsPath(reference.file))?.sourceGeneration;
+      const held =
+        heldValue &&
+        heldValue.sourceGeneration === sourceGeneration &&
+        onlyGrew(heldValue.revision, revision) &&
+        (heldValue.revision.size < revision.size || sameRevision(heldValue.revision, revision))
+          ? heldValue
+          : undefined;
+      const now = Date.now();
+      let codexDependencies = held?.codexDependencies ?? [reference.file];
+      const sourceFile = reference.file;
+      const codexVersion = () =>
+        codexAgentSpendVersion(
+          sourceFile,
+          codexSpendIndex(request.codexChildren ?? []),
+          reference.sessionId,
+          codexDependencies,
+        );
+      const tree =
+        reference.agent === 'codex'
+          ? childSpendRevisionKey('completed', codexVersion(), now)
+          : claudeAgentSpendVersion(reference.file, false, subagentMetas);
+      if (
+        held &&
+        sameRevision(held.revision, revision) &&
+        held.tree === tree &&
+        !held.spendPending &&
+        !held.activityStale &&
+        now < held.refreshAt &&
+        (!held.codexPerson || held.codexPerson.bytes >= revision.size)
+      ) {
+        dispatched.push(held.facts);
+        continue;
+      }
+      // The spend of an unchanged file and tree stays true when only its activity answer is stale.
+      if (held?.activityStale && held.activity && sameRevision(held.revision, revision) && held.tree === tree) {
+        const activity = dispatchActivity(reference.file, reference.sessionId, revision, now, reference.agent);
+        const covered = claudeRepeatedMap(reference.file, Number.MAX_SAFE_INTEGER, 0)?.covered === true;
+        if (now >= activity.activeUntil && sameRevision(revision, revisionOf(reference.file))) {
+          // The Claude spend read never marks spend unfinished. Only an activity answer does.
+          const spend: AgentSpend = { ...held.facts.spend };
+          delete spend.unfinished;
+          if (spend.artifacts && held.activity.artifactsComplete !== null)
+            spend.artifacts = { ...spend.artifacts, complete: held.activity.artifactsComplete };
+          if (activity.unfinished) {
+            spend.unfinished = true;
+            if (spend.artifacts) spend.artifacts = { ...spend.artifacts, complete: false };
+          }
+          const facts = { ...held.facts, spend };
+          dispatchFacts.set(reference.file, {
+            ...held,
+            facts,
+            activity: { ...held.activity, covered },
+            activityStale: false,
+            saved: undefined,
+          });
+          dispatched.push(facts);
+          continue;
+        }
+      }
+      // A visit that resumes a pending spend aggregate at the same revision does not count as a reread.
+      if (!held?.spendPending || !sameRevision(held.revision, revision)) {
+        charges.dispatchSpendRereads++;
+        root.rereads++;
+      }
+      const previousPerson =
+        held &&
+        held.revision.dev === revision.dev &&
+        held.revision.ino === revision.ino &&
+        (held.revision.size < revision.size || sameRevision(held.revision, revision))
+          ? held.codexPerson
+          : undefined;
+      const previousBytes = previousPerson?.bytes ?? 0;
+      const personBefore = dispatchReads.bytes;
+      const codexPerson =
+        reference.agent === 'codex'
+          ? scanForCodexPerson(reference.file, revision.size, previousPerson, reference.sessionId)
+          : undefined;
+      charges.dispatchPersonBytes += dispatchReads.bytes - personBefore;
+      if (!sameRevision(revision, revisionOf(reference.file))) {
+        charges.dispatchRetries++;
+        continuation = true;
+        const compatible = held && onlyGrew(held.revision, revisionOf(reference.file));
+        dispatched.push(
+          compatible
+            ? { ...held.facts, spend: { ...held.facts.spend, partial: true } }
+            : {
+                sessionId: reference.sessionId,
+                revision,
+                refreshAt: now,
+                startedAt: null,
+                endedAt: null,
+                toolUses: 0,
+                person: false,
+                spend: { models: [], found: false, partial: true, effort: null },
+              },
+        );
+        dispatchFacts.delete(reference.file);
+        continue;
+      }
+      continuation ||= !!codexPerson && codexPerson.bytes < revision.size && codexPerson.bytes > previousBytes;
+      const completion = codexPerson?.dispatchCompletion;
+      const completed =
+        codexPerson?.bytes === revision.size &&
+        codexPerson.fragment.length === 0 &&
+        completion?.terminal !== null &&
+        !!completion?.terminal &&
+        !completion.invalid &&
+        !completion.skipping;
+      const activity =
+        reference.agent === 'codex'
+          ? { activeUntil: completed ? 0 : revision.mtimeMs + TURN_QUIET_MS, unfinished: !completed }
+          : dispatchActivity(reference.file, reference.sessionId, revision, now, reference.agent);
+      const activityCovered =
+        reference.agent === 'claude' && claudeRepeatedMap(reference.file, Number.MAX_SAFE_INTEGER, 0)?.covered === true;
+      const refreshAt = activity.activeUntil;
+      const active = now < refreshAt;
+      if (active && reference.agent === 'codex') releaseCodexDispatchSpend(reference.file);
+      let spendPending = false;
+      let spendRestarted = false;
+      const spendBefore = dispatchReads.bytes;
+      const spend: AgentSpend = active
+        ? { models: [], found: false, partial: false, effort: null }
+        : reference.agent === 'codex'
+          ? (() => {
+              const result = readCodexDispatchedSpendQuantum(
+                reference.file,
+                request.codexChildren ?? [],
+                now,
+                dispatchBudget,
+                (files) => {
+                  codexDependencies = files;
+                },
+                (file, entry) => parentPort?.postMessage({ dispatchSpend: [file, entry] }),
+                (event) => {
+                  charges[event]++;
+                  if (event === 'dispatchSpendRootWaits') root.rootWaits++;
+                  if (event.startsWith('dispatchSpendAggregateExhausted')) {
+                    charges.dispatchAggregateRemainingBytes += dispatchBudget.bytes;
+                    charges.dispatchAggregateRemainingMs += dispatchBudget.ms;
+                    root.remainingBytes += dispatchBudget.bytes;
+                  }
+                },
+              );
+              spendPending = result.pending;
+              spendRestarted = result.restarted;
+              continuation ||= result.pending;
+              return result.spend;
+            })()
+          : readClaudeAgentSpend(reference.file, request.repositoryRoots, false, subagentMetas);
+      const spendBytes = dispatchReads.bytes - spendBefore;
+      charges[reference.agent === 'codex' ? 'dispatchAggregateBytes' : 'dispatchClaudeSpendBytes'] += spendBytes;
+      if (reference.agent === 'claude' && spendBytes > 0) {
+        spendRestarted = (claudeSpendEnds.get(reference.sessionId) ?? 0) > 0;
+        rememberRestartEvidence(claudeSpendEnds, reference.sessionId, spendBytes);
+      }
+      if (spendRestarted) {
+        charges.dispatchSpendRootRestarts++;
+        root.restarts++;
+      }
+      const activityRead: DispatchActivityRead | undefined =
+        reference.agent === 'claude' && !active
+          ? { covered: activityCovered, artifactsComplete: spend.artifacts?.complete ?? null }
+          : undefined;
+      if (!active && activity.unfinished) {
+        spend.unfinished = true;
+        if (spend.artifacts) {
+          spend.artifacts.complete = false;
+        }
+      }
+      // Claude scans active appends. Codex retains its bounded prompt cursor across quiet
+      // reads because a cached spend can precede delayed copied-turn context.
+      const scanBefore = dispatchReads.bytes;
+      const scan =
+        active && reference.agent === 'claude'
+          ? scanForPerson(reference.file, revision.size, held?.person, held ? held.revision.size : revision.size)
+          : undefined;
+      charges.dispatchPersonBytes += dispatchReads.bytes - scanBefore;
+      const person =
+        reference.agent === 'codex'
+          ? codexPerson && codexPerson.bytes >= revision.size
+            ? codexPerson.person
+            : spend.person === true || codexPerson?.person === true
+          : held?.facts.person === true || (scan ? scan.person : spend.person === true);
+      if (!sameRevision(revision, revisionOf(reference.file))) {
+        charges.dispatchRetries++;
+        continuation = true;
+        const compatible = held && onlyGrew(held.revision, revisionOf(reference.file));
+        dispatched.push(
+          compatible
+            ? { ...held.facts, spend: { ...held.facts.spend, partial: true } }
+            : {
+                sessionId: reference.sessionId,
+                revision,
+                refreshAt: now,
+                startedAt: null,
+                endedAt: null,
+                toolUses: 0,
+                person: false,
+                spend: { models: [], found: false, partial: true, effort: null },
+              },
+        );
+        dispatchFacts.delete(reference.file);
+        continue;
+      }
+      const collectedTree =
+        reference.agent === 'codex'
+          ? childSpendRevisionKey('completed', codexVersion(), now)
+          : claudeAgentSpendVersion(reference.file, false, subagentMetas);
+      if (collectedTree !== tree) {
+        charges.dispatchRetries++;
+        continuation = true;
+        spend.partial = true;
+        if (spend.artifacts) spend.artifacts.complete = false;
+      }
+      const facts: DispatchSessionFacts = {
+        sessionId: reference.sessionId,
+        refreshAt: active ? refreshAt : null,
+        revision,
+        spend,
+        startedAt: spend.startedAt ?? null,
+        endedAt: spend.endedAt ?? null,
+        toolUses: spend.toolUses ?? 0,
+        person,
+      };
+      dispatchFacts.set(reference.file, {
+        sourceGeneration,
+        spendPending,
+        revision,
+        // The tree the read started from. When the tree moved during the read, the next pass reads again.
+        tree,
+        codexDependencies,
+        facts,
+        refreshAt: active ? refreshAt : Number.POSITIVE_INFINITY,
+        person: scan,
+        codexPerson,
+        settled:
+          !active && !spendPending && collectedTree === tree && (!codexPerson || codexPerson.bytes >= revision.size),
+        activity: activityRead,
+      });
+      dispatched.push(facts);
+    }
+  } finally {
+    closeRoot();
+    const dispatchTally = closeReadWindow(dispatchReads);
+    charges.dispatchSpendFiles += dispatchTally.files;
+    charges.dispatchSpendBytes += dispatchTally.bytes;
+    charges.dispatchSpendMs += dispatchTally.ms;
+  }
+  const currentFiles = new Set(
+    references.flatMap((reference) => (reference.kind === 'dispatch' && reference.file ? [reference.file] : [])),
+  );
+  for (const file of dispatchFacts.keys()) {
+    if (!currentFiles.has(file)) {
+      dispatchFacts.delete(file);
+    }
+  }
+  savedDispatchFacts = new Map();
+  for (const [file, held] of dispatchFacts) {
+    if (!held.settled) continue;
+    held.saved ??= {
+      version: DISPATCH_FACTS_VERSION,
+      revision: held.revision,
+      tree: held.tree,
+      sourceGeneration: held.sourceGeneration,
+      codexDependencies: held.codexDependencies,
+      ...(held.activity ? { activity: held.activity } : {}),
+      facts: held.facts,
+    };
+    savedDispatchFacts.set(normalizeFsPath(file), held.saved);
+  }
+  return { dispatched, dispatchRoots, continuation };
+}
+
 type RequestKind = ProgressiveRequest['kind'];
 const activeKinds: Partial<Record<RequestKind, number>> = {};
 const windowReads = new Map<
@@ -2024,7 +2065,8 @@ async function handleMessage(message: {
             });
         });
       } finally {
-        if (controller.signal.aborted) closeReceiptScan();
+        // A spend-only request holds no receipt scan.
+        if (controller.signal.aborted && !request.spendOnly) closeReceiptScan();
       }
       if (!controller.signal.aborted) {
         parentPort?.postMessage({

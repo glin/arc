@@ -761,6 +761,7 @@ type DispatchedCostsCaller =
   | 'spendSources'
   | 'childrenProgress'
   | 'childrenComplete'
+  | 'spendRefined'
   | 'historyCutoff';
 
 // Escape less-than signs in JSON embedded in a script element. An unescaped
@@ -1461,7 +1462,11 @@ export class PanelProvider implements vscode.Disposable {
   // All listed Claude transcripts before peer-wake filtering. Cache trimming uses this list to retain filtered sessions' scan state.
   private walkedClaude: string[] = [];
   private claudeParents: SessionFile[] = [];
+  // True while catalog members or their relationships wait for another discovery pass.
   private dispatchDiscoveryPending = false;
+  // True while members are settled and only dispatched spend or person facts wait for another pass. The catalog publishes
+  // meanwhile, and spend-only requests refine the dispatched facts.
+  private dispatchSpendPending = false;
   // The repository scope of a complete discovery reply whose catalog is not yet published, and the session files of the catalog it
   // answered. An incomplete reply or a scope change clears it. The next catalog publication under that scope turns it into the
   // completion stamp only when the reply answered every published session.
@@ -4319,6 +4324,7 @@ export class PanelProvider implements vscode.Disposable {
         : null,
       generation: this.refreshGeneration,
       discoveryPending: this.dispatchDiscoveryPending,
+      discoverySpendPending: this.dispatchSpendPending,
       loadingFailed: this.startupFailureGeneration === this.refreshGeneration,
       checkpoint: this.discoveryCheckpoint
         ? {
@@ -10133,7 +10139,7 @@ export class PanelProvider implements vscode.Disposable {
 
   private scheduleDiscoveryContinuation(): void {
     if (
-      this.dispatchDiscoveryPending &&
+      (this.dispatchDiscoveryPending || this.dispatchSpendPending) &&
       this.startupFailureGeneration !== this.refreshGeneration &&
       this.anyVisible()
     ) {
@@ -10146,7 +10152,7 @@ export class PanelProvider implements vscode.Disposable {
   // when the reply completed discovery or changed the listed sessions, and it keeps the `dispatch-discovery` reason.
   private async continueDiscovery(): Promise<void> {
     if (
-      !this.dispatchDiscoveryPending ||
+      !(this.dispatchDiscoveryPending || this.dispatchSpendPending) ||
       this.startupFailureGeneration === this.refreshGeneration ||
       !this.anyVisible()
     )
@@ -10167,6 +10173,12 @@ export class PanelProvider implements vscode.Disposable {
     this.discoveryContinuation = controller;
     let refresh = false;
     try {
+      if (!this.dispatchDiscoveryPending) {
+        // Settled members publish meanwhile. A catalog refresh follows only when a drawn dispatched figure moved.
+        const moved = await this.refineDispatchedSpend(generation, controller.signal);
+        refresh = moved && !controller.signal.aborted && generation === this.refreshGeneration;
+        return;
+      }
       const discovered = await this.prepareClaudeChildren(generation, controller.signal);
       // An incomplete reply lists the accepted sessions, and adds a session this panel started once its source qualifies.
       const accepted = new Set((this.authoritativeCatalog ?? []).map((session) => session.file));
@@ -10767,8 +10779,9 @@ export class PanelProvider implements vscode.Disposable {
     );
   }
 
+  // Dispatched spend that is still being read keeps a missing contribution marked as a lower bound.
   private dispatchedDiscoveryWaiting(): boolean {
-    return this.dispatchDiscoveryPending || this.authoritativeCatalog === null;
+    return this.dispatchDiscoveryPending || this.dispatchSpendPending || this.authoritativeCatalog === null;
   }
 
   private dispatchedCostsForTurn(
@@ -12485,7 +12498,8 @@ export class PanelProvider implements vscode.Disposable {
         const scope = JSON.stringify(this.repositoryScopeRoots);
         const failed = this.unresolvedLoadingFailure(result.generation);
         // A complete reply that asks for no further pass leaves the list to the render, so its post names the reply, not a pending pass.
-        const settled = progress.kind === 'claude-children' && !progress.continuation;
+        const settled =
+          progress.kind === 'claude-children' && (!progress.continuation || progress.membershipSettled === true);
         const blocker = (): SessionLoadingBlocker => ({
           reason: failed ? 'failure' : settled ? 'discovery complete' : 'discovery pending',
         });
@@ -12550,7 +12564,11 @@ export class PanelProvider implements vscode.Disposable {
       return false;
     this.performanceCounters?.recordDiscovery?.(
       progress.charges,
-      { complete: progress.kind === 'claude-children', continuation: progress.continuation },
+      {
+        complete: progress.kind === 'claude-children',
+        continuation: progress.continuation,
+        membershipSettled: progress.kind === 'claude-children' && progress.membershipSettled === true,
+      },
       progress.kind === 'claude-children' ? progress.dispatchRoots : undefined,
     );
     if (signal.aborted || result.generation !== this.refreshGeneration) return false;
@@ -12577,20 +12595,9 @@ export class PanelProvider implements vscode.Disposable {
     }
     this.claudeChildReferences = progress.references;
     this.startupHistory?.stage('relationshipsComplete');
-    this.dispatchDiscoveryPending = progress.continuation;
-    const facts = new Map((progress.dispatchFacts ?? []).map((facts) => [facts.sessionId, facts]));
-    const figures = (entries: Map<string, DispatchSessionFacts> | undefined) =>
-      [...(entries?.values() ?? [])]
-        .map(({ revision: _revision, refreshAt: _refreshAt, spend, ...rendered }) => {
-          if (!spend.artifacts) return { ...rendered, spend };
-          const { revision: _artifactRevision, ...artifacts } = spend.artifacts;
-          return { ...rendered, spend: { ...spend, artifacts } };
-        })
-        .sort((left, right) => left.sessionId.localeCompare(right.sessionId));
-    if (!isDeepStrictEqual(figures(this.dispatchFacts), figures(facts))) {
-      this.dispatchFiguresRevision = (this.dispatchFiguresRevision ?? 0) + 1;
-    }
-    this.dispatchFacts = facts;
+    this.dispatchDiscoveryPending = progress.continuation && progress.membershipSettled !== true;
+    this.dispatchSpendPending = progress.continuation && progress.membershipSettled === true;
+    this.applyDispatchFacts(progress.dispatchFacts ?? []);
     this.claudeChildren = progress.children;
     this.claudeChildrenDiscovered = true;
     const currentFiles = new Set(progress.referenceEntries.map(([file]) => file));
@@ -12666,6 +12673,63 @@ export class PanelProvider implements vscode.Disposable {
       this.derivedCacheCheckpointState.markChanged();
     }
     return true;
+  }
+
+  // Replaces the dispatched facts, and moves the figures revision when a drawn figure changed.
+  private applyDispatchFacts(list: readonly DispatchSessionFacts[]): void {
+    const facts = new Map(list.map((facts) => [facts.sessionId, facts]));
+    const figures = (entries: Map<string, DispatchSessionFacts> | undefined) =>
+      [...(entries?.values() ?? [])]
+        .map(({ revision: _revision, refreshAt: _refreshAt, spend, ...rendered }) => {
+          if (!spend.artifacts) return { ...rendered, spend };
+          const { revision: _artifactRevision, ...artifacts } = spend.artifacts;
+          return { ...rendered, spend: { ...spend, artifacts } };
+        })
+        .sort((left, right) => left.sessionId.localeCompare(right.sessionId));
+    if (!isDeepStrictEqual(figures(this.dispatchFacts), figures(facts))) {
+      this.dispatchFiguresRevision = (this.dispatchFiguresRevision ?? 0) + 1;
+    }
+    this.dispatchFacts = facts;
+  }
+
+  // Reads the dispatched facts of the accepted catalog again while its members are settled. The reply changes no member or
+  // relationship, so it starts no discovery epoch. True when a drawn figure moved. A worker that holds no complete reply
+  // for the current roots sends discovery back to a full pass.
+  private async refineDispatchedSpend(generation: number, signal: AbortSignal): Promise<boolean> {
+    const result = await this.progressiveWorker
+      .run(
+        {
+          kind: 'claude-children',
+          spendOnly: true,
+          codexChildren: this.codexSubagents,
+          parents: [],
+          repositoryRoots: this.repositoryScopeRoots,
+        },
+        generation,
+        signal,
+      )
+      .catch(() => null);
+    if (!result || result.value.kind !== 'dispatch-spend') return false;
+    const reply = result.value;
+    if (reply.held)
+      this.performanceCounters?.recordDiscovery?.(
+        reply.charges,
+        { complete: !reply.continuation, continuation: reply.continuation },
+        reply.dispatchRoots,
+      );
+    if (signal.aborted || result.generation !== this.refreshGeneration) return false;
+    const waiting = this.dispatchedDiscoveryWaiting();
+    if (!reply.held) {
+      this.dispatchSpendPending = false;
+      this.dispatchDiscoveryPending = true;
+      this.publishSessionQueryContext();
+      return false;
+    }
+    const revision = this.dispatchFiguresRevision;
+    this.dispatchSpendPending = reply.continuation;
+    this.applyDispatchFacts(reply.dispatchFacts);
+    if (this.dispatchedDiscoveryWaiting() !== waiting) this.postDispatchedCostsIfMoved('spendRefined');
+    return this.dispatchFiguresRevision !== revision;
   }
 
   // Walked sources of sessions this panel started and still awaits. Each is the only walked source of its session ID, a member

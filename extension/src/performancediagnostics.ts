@@ -78,7 +78,11 @@ export interface LedgerSaveOperation {
 }
 
 export interface PerformanceCounterSnapshot {
-  discovery: import('./progressiveworker').DiscoveryCharges & { continuations: number; publications: number };
+  discovery: import('./progressiveworker').DiscoveryCharges & {
+    continuations: number;
+    publications: number;
+    partialPublications: number;
+  };
   sourceId: string;
   startedAt: string;
   captureCount: number;
@@ -295,15 +299,25 @@ export class PanelPerformanceCounters {
     otherPassEnds: 0,
     continuations: 0,
     publications: 0,
+    partialPublications: 0,
   };
-  // A complete reply that still asks for another pass counts as a continuation, so back-to-back passes show in the record.
+  // A complete reply that asks for no further pass counts as a publication. One that asks for a pass only for dispatched
+  // spend publishes its settled members and counts as a partial publication. Every other reply counts as a continuation.
   recordDiscovery(
     charges: import('./progressiveworker').DiscoveryCharges | undefined,
-    reply: { complete: boolean; continuation: boolean },
+    reply: { complete: boolean; continuation: boolean; membershipSettled?: boolean },
     dispatchRoots?: Record<string, DispatchRootCharges>,
   ): void {
     if (charges) for (const key of DISCOVERY_CHARGE_KEYS) this.discovery[key] += charges[key] ?? 0;
-    this.discovery[reply.complete && !reply.continuation ? 'publications' : 'continuations']++;
+    this.discovery[
+      !reply.complete
+        ? 'continuations'
+        : !reply.continuation
+          ? 'publications'
+          : reply.membershipSettled
+            ? 'partialPublications'
+            : 'continuations'
+    ]++;
     for (const [sessionId, root] of Object.entries(dispatchRoots ?? {})) {
       const held = this.dispatchRoots.get(sessionId);
       if (!held) {

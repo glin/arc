@@ -354,6 +354,8 @@ export type ProgressiveRequest =
       discovery?: DiscoveryCheckpoint;
       discoveryBytes?: number;
       quantumBytes?: number;
+      // Reads only the spend and person facts of the dispatch references of the last complete reply.
+      spendOnly?: true;
     }
   | { kind: 'metadata'; session: SessionFile; opening?: CodexSessionMeta | null; tailBytes?: number }
   | {
@@ -398,6 +400,9 @@ export type ProgressiveValue =
       dispatchFacts: DispatchSessionFacts[];
       complete: boolean;
       continuation: boolean;
+      // True when no catalog member or relationship asks for another pass. A reply with `continuation` and
+      // `membershipSettled` publishes the catalog while dispatched spend stays unfinished.
+      membershipSettled?: boolean;
       charges?: DiscoveryCharges;
       dispatchRoots?: Record<string, DispatchRootCharges>;
       roots?: SessionFile[];
@@ -416,6 +421,19 @@ export type ProgressiveValue =
       completed: Array<[string, boolean]>;
       continuation: true;
       charges: DiscoveryCharges;
+    }
+  | {
+      kind: 'dispatch-spend';
+      // False when the worker holds no complete reply for the requested roots, so full discovery has to run.
+      held: false;
+    }
+  | {
+      kind: 'dispatch-spend';
+      held: true;
+      dispatchFacts: DispatchSessionFacts[];
+      continuation: boolean;
+      charges: DiscoveryCharges;
+      dispatchRoots: Record<string, DispatchRootCharges>;
     }
   | {
       kind: 'claude-children-progress';

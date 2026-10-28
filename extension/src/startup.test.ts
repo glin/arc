@@ -1367,6 +1367,7 @@ function harness(pendingRefresh = false, registerRefreshHandler = true, extraMet
     'releaseCatalogRefresh',
     'scheduleDiscoveryContinuation',
     'continueDiscovery',
+    'refineDispatchedSpend',
   );
   methods.push(...extraMethods);
   const body = owner.members
@@ -1565,6 +1566,7 @@ function completeDiscoveryHarness(
     'releaseCatalogRefresh',
     'scheduleDiscoveryContinuation',
     'continueDiscovery',
+    'refineDispatchedSpend',
     'runPendingRefresh',
     'abandonCatalogRefresh',
     'drainInitialCatalogRefresh',
@@ -1610,7 +1612,7 @@ function completeDiscoveryHarness(
   }
   if (names.includes('allSessions')) names.push('walkedSessions');
   if (names.includes('allSessions') || names.includes('runPendingWatch')) names.push('currentWalkedCatalog');
-  if (names.includes('prepareClaudeChildren')) names.push('startedSources');
+  if (names.includes('prepareClaudeChildren')) names.push('startedSources', 'applyDispatchFacts');
   names.push('walkCatalog');
   const body = owner.members
     .filter((member) => member.name && names.includes(member.name.getText(file)))
@@ -2079,6 +2081,7 @@ function selectedWindowHarness(
     'releaseCatalogRefresh',
     'scheduleDiscoveryContinuation',
     'continueDiscovery',
+    'refineDispatchedSpend',
     ...extra,
     // evictCache calls pruneDerivedTitles.
     ...(extra.includes('evictCache') ? ['pruneDerivedTitles'] : []),
@@ -3719,7 +3722,7 @@ test('a session row follows the turns after a hand compaction while relationship
     });
   };
   const provider = titlePublicationHarness([accepted], run, undefined, {
-    methods: ['prepareClaudeChildren', 'activityFor'],
+    methods: ['prepareClaudeChildren', 'applyDispatchFacts', 'activityFor'],
     scope: { CLAUDE_CHILD_REFERENCE_PARSER_VERSION },
     railCacheMark: railCacheMarkOf,
   });
@@ -6565,6 +6568,7 @@ function bumpedCatalogHarness(
     [
       'allSessions',
       'prepareClaudeChildren',
+      'applyDispatchFacts',
       'pruneDerivedTitles',
       'sessionLabel',
       'claudeName',
@@ -11891,6 +11895,7 @@ test.each([false, true])(
       provider.titles.set(session.file, entry);
       const discoveryHost = bumpedCatalogHarness().provider;
       provider.prepareClaudeChildren = discoveryHost.prepareClaudeChildren;
+      provider.applyDispatchFacts = discoveryHost.applyDispatchFacts;
       provider.startedSources = discoveryHost.startedSources;
       Object.assign(provider, {
         claudeParents: [session],
@@ -12008,6 +12013,7 @@ function exhaustedLoadingHarness(extraMethods: string[] = [], scope: Record<stri
   provider.metaFor = (session: { file: string }) => provider.titles.get(session.file);
   const discoveryHost = bumpedCatalogHarness().provider;
   provider.prepareClaudeChildren = discoveryHost.prepareClaudeChildren;
+  provider.applyDispatchFacts = discoveryHost.applyDispatchFacts;
   provider.startedSources = discoveryHost.startedSources;
   Object.assign(provider, {
     claudeParents: [healthy],
@@ -13533,6 +13539,128 @@ test('incomplete discovery replies continue without a catalog refresh, and the c
     // The follow-up refresh accepts the complete reply without asking discovery again.
     assert.equal(replies, 11);
     assert.equal(provider.dispatchDiscoveryPending, false);
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
+
+// A complete reply asks for another pass. `membersSettled` says whether only dispatched spend waits for it.
+function partialSpendHarness(membersSettled: boolean) {
+  const { provider, discovery } = exhaustedLoadingHarness();
+  const counters = new PanelPerformanceCounters(1000);
+  provider.performanceCounters = counters;
+  const run = provider.progressiveWorker.run;
+  const requests: string[] = [];
+  // The catalog state when each request left, so a test can read what was published before it.
+  const published: { request: string; membersPending: boolean; stamp: unknown }[] = [];
+  const facts = (partial: boolean) => [
+    {
+      sessionId: 'codex-root',
+      revision: { size: 1, mtimeMs: 1, dev: 1, ino: 1 },
+      refreshAt: null,
+      startedAt: null,
+      endedAt: null,
+      toolUses: 0,
+      person: false,
+      spend: partial
+        ? { models: [], found: false, partial: true, effort: null }
+        : { models: [], found: true, partial: false, effort: null },
+    },
+  ];
+  let spendPasses = 0;
+  let discoveries = 0;
+  provider.progressiveWorker.run = async (request: ProgressiveRequest, generation: number, signal: AbortSignal) => {
+    if (request.kind !== 'claude-children') return run(request, generation, signal);
+    const kind = request.spendOnly ? 'spend' : 'discovery';
+    requests.push(kind);
+    published.push({
+      request: kind,
+      membersPending: provider.dispatchDiscoveryPending,
+      stamp: provider.sessionReadDiscoveryRevision,
+    });
+    if (request.spendOnly) {
+      // The third spend-only pass finishes the root.
+      const continuation = ++spendPasses < 3;
+      return {
+        generation,
+        value: {
+          kind: 'dispatch-spend',
+          held: true,
+          dispatchFacts: facts(continuation),
+          continuation,
+          charges: {},
+          dispatchRoots: {},
+        },
+      };
+    }
+    // Unsettled members settle on the third discovery pass.
+    discovery.continuation = membersSettled || ++discoveries < 3;
+    const reply = await run(request, generation, signal);
+    return {
+      ...reply,
+      value: { ...reply.value, membershipSettled: membersSettled, dispatchFacts: facts(discovery.continuation) },
+    };
+  };
+  let walks = 0;
+  provider.allSessions = (reuse: boolean) => {
+    if (!reuse) walks++;
+    return provider.catalog.sessions;
+  };
+  return { provider, counters, requests, published, walks: () => walks };
+}
+
+test('a complete reply that waits only for dispatched spend publishes, and spend-only passes refine the row without a walk', async () => {
+  vi.useFakeTimers();
+  try {
+    const { provider, counters, requests, published, walks } = partialSpendHarness(true);
+    provider.refreshFrom('startup', true);
+    const done = () => !provider.dispatchSpendPending && requests.length > 1 && provider.refreshController === null;
+    // Each step runs the timers due and the work they release. The step bound is the test's deadline.
+    for (let step = 0; step < 500 && !done(); step++) await vi.advanceTimersByTimeAsync(1);
+    assert.ok(done(), `dispatched spend never settled after requests ${requests.join(', ')}`);
+    assert.deepEqual(requests, ['discovery', 'spend', 'spend', 'spend']);
+    const first = published.find((state) => state.request === 'spend');
+    assert.equal(first?.membersPending, false, 'pending spend kept the members pending');
+    assert.ok(first?.stamp, 'the catalog was not published before the spend settled');
+    assert.equal(walks(), 1, 'a spend-only pass walked the catalog');
+    const { discovery, refreshes } = counters.snapshot();
+    assert.deepEqual(
+      { partial: discovery.partialPublications, full: discovery.publications, continuations: discovery.continuations },
+      { partial: 1, full: 1, continuations: 2 },
+    );
+    assert.equal(refreshes['dispatch-discovery']?.count, 1, 'only the pass that moved a figure refreshes the catalog');
+    assert.equal(
+      provider.dispatchFacts.get('codex-root')?.spend.partial,
+      false,
+      'the settled spend did not reach the row',
+    );
+    assert.ok(provider.sessionReadDiscoveryRevision, 'refining spend withdrew the published catalog');
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
+
+test('a complete reply whose members are still unsettled publishes nothing until they settle', async () => {
+  vi.useFakeTimers();
+  try {
+    const { provider, counters, requests, published } = partialSpendHarness(false);
+    provider.refreshFrom('startup', true);
+    const done = () =>
+      requests.length >= 3 && !provider.dispatchDiscoveryPending && provider.refreshController === null;
+    for (let step = 0; step < 500 && !done(); step++) await vi.advanceTimersByTimeAsync(1);
+    assert.ok(done(), `discovery never settled after requests ${requests.join(', ')}`);
+    assert.deepEqual(requests, ['discovery', 'discovery', 'discovery']);
+    for (const state of published.slice(1)) {
+      assert.equal(state.membersPending, true);
+      assert.equal(state.stamp, undefined, 'a catalog with unsettled members was published');
+    }
+    const { discovery } = counters.snapshot();
+    assert.deepEqual(
+      { partial: discovery.partialPublications, full: discovery.publications, continuations: discovery.continuations },
+      { partial: 0, full: 1, continuations: 2 },
+    );
   } finally {
     vi.clearAllTimers();
     vi.useRealTimers();
@@ -15611,6 +15739,7 @@ test('metadata-only upgrade resumes relationships before ordinary startup metada
     const configure = (provider: any) =>
       Object.assign(provider, {
         prepareClaudeChildren: seed.prepareClaudeChildren,
+        applyDispatchFacts: seed.applyDispatchFacts,
         repositoryScopeRoots: [root],
         claudeParents: sources,
         claudeChildStatWrites: new Map(),

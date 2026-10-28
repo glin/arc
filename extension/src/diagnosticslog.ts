@@ -289,7 +289,11 @@ export interface HostHealthOptions {
   work?: () =>
     | {
         worker: ReturnType<import('./progressiveworker').ProgressiveWorker['snapshot']>;
-        discovery: import('./progressiveworker').DiscoveryCharges & { continuations: number; publications: number };
+        discovery: import('./progressiveworker').DiscoveryCharges & {
+          continuations: number;
+          publications: number;
+          partialPublications: number;
+        };
         discoveryObservation?: {
           hostRequest: number;
           generation: number;
@@ -299,6 +303,7 @@ export interface HostHealthOptions {
         } | null;
         generation: number;
         discoveryPending: boolean;
+        discoverySpendPending?: boolean;
         loadingFailed: boolean;
         checkpoint: { position: number; sequence: number; sources: number; completed: number } | null;
         hostSaves?: { pending: number; oldestAgeMs: number | null };
