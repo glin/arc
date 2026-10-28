@@ -387,7 +387,17 @@ export interface SavedDispatchFacts {
   tree: string;
   sourceGeneration?: number;
   codexDependencies?: string[];
+  activity?: DispatchActivityRead;
   facts: import('./progressiveworker').DispatchSessionFacts;
+}
+
+// The activity read behind settled Claude dispatched facts. `covered` is true when the repeated-record map
+// covered the file as the read ran. The other fields hold the spend read's own values before the activity
+// read marked the facts unfinished.
+export interface DispatchActivityRead {
+  covered: boolean;
+  spendUnfinished?: boolean;
+  artifactsComplete: boolean | null;
 }
 
 export interface ClaudeChildReferenceCacheEntry {
@@ -1008,6 +1018,15 @@ function fileRevision(value: unknown): boolean {
   );
 }
 
+function dispatchActivityRead(value: unknown): boolean {
+  return (
+    record(value) &&
+    typeof value.covered === 'boolean' &&
+    (value.spendUnfinished === undefined || typeof value.spendUnfinished === 'boolean') &&
+    (value.artifactsComplete === null || typeof value.artifactsComplete === 'boolean')
+  );
+}
+
 function savedDispatchFacts(value: unknown): value is SavedDispatchFacts {
   if (!record(value) || !record(value.facts)) return false;
   const facts = value.facts;
@@ -1020,6 +1039,7 @@ function savedDispatchFacts(value: unknown): value is SavedDispatchFacts {
     (value.sourceGeneration === undefined || nonNegative(value.sourceGeneration)) &&
     (value.codexDependencies === undefined ||
       (Array.isArray(value.codexDependencies) && value.codexDependencies.every(nonEmptyText))) &&
+    (value.activity === undefined || dispatchActivityRead(value.activity)) &&
     nonEmptyText(facts.sessionId) &&
     facts.refreshAt === null &&
     fileRevision(facts.revision) &&

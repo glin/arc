@@ -11620,6 +11620,199 @@ test('a new worker reuses saved spend facts of unchanged dispatched sessions and
   }
 });
 
+test('an unchanged finished Claude dispatched session with subagents reads its spend once across passes and reloads', async () => {
+  const directory = tempDir('claude-root-reread-');
+  const cache = path.join(directory, 'derived-cache.json');
+  const rootId = '4f4bf298-958f-4751-8782-d8688ff808a6';
+  const parentFile = path.join(directory, 'parent.jsonl');
+  const rootFile = path.join(directory, rootId + '.jsonl');
+  const subagents = path.join(directory, rootId, 'subagents');
+  const childIds = ['a1', 'a2'];
+  const write = (file: string, rows: unknown[]) =>
+    fs.writeFileSync(file, rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
+  fs.mkdirSync(subagents, { recursive: true });
+  write(
+    parentFile,
+    claudeDispatchTranscript('claude --bg review', 'backgrounded · 4f4bf298 · Review', 'dispatch-claude'),
+  );
+  const padding = 'x'.repeat(100 * 1024);
+  write(
+    rootFile,
+    [
+      { type: 'user', cwd: directory, timestamp: timestamp(0), message: { role: 'user', content: 'Review' } },
+      ...Array.from({ length: 100 }, (_, index) => ({
+        type: 'user',
+        timestamp: timestamp(1),
+        message: { role: 'user', content: `${index} ${padding}` },
+      })),
+      ...childIds.flatMap((id) => [
+        {
+          type: 'assistant',
+          timestamp: timestamp(2),
+          message: {
+            role: 'assistant',
+            model: 'claude-sonnet-4-20250514',
+            usage: { input_tokens: 7, output_tokens: 1 },
+            content: [{ type: 'tool_use', name: 'Agent', id: `launch-${id}`, input: { prompt: 'work' } }],
+          },
+        },
+        {
+          type: 'user',
+          timestamp: timestamp(3),
+          message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: `launch-${id}`, content: 'done' }] },
+          toolUseResult: { agentId: id, status: 'completed' },
+        },
+      ]),
+      {
+        type: 'assistant',
+        timestamp: timestamp(4),
+        message: {
+          role: 'assistant',
+          stop_reason: 'end_turn',
+          content: 'Finished',
+          model: 'claude-sonnet-4-20250514',
+          usage: { input_tokens: 7, output_tokens: 1 },
+        },
+      },
+      // Record identities let a repeated-record map that does not cover the file hide the tail's outcome.
+    ].map((row, index) => ({ uuid: `root-${index}`, ...row })),
+  );
+  for (const id of childIds) {
+    fs.writeFileSync(path.join(subagents, `agent-${id}.meta.json`), JSON.stringify({ toolUseId: `launch-${id}` }));
+    write(path.join(subagents, `agent-${id}.jsonl`), [
+      { type: 'user', cwd: directory, timestamp: timestamp(2), message: { role: 'user', content: 'work' } },
+      {
+        type: 'assistant',
+        timestamp: timestamp(3),
+        message: {
+          role: 'assistant',
+          stop_reason: 'end_turn',
+          content: 'done',
+          model: 'claude-sonnet-4-20250514',
+          usage: { input_tokens: 3, output_tokens: 2 },
+        },
+      },
+    ]);
+  }
+  for (const file of [rootFile, ...childIds.map((id) => path.join(subagents, `agent-${id}.jsonl`))])
+    fs.utimesSync(file, 100, 100);
+  const session = (file: string, sessionId: string) => ({
+    file,
+    sessionId,
+    agent: 'claude' as const,
+    ...revisionOf(fs.statSync(file, { bigint: true })),
+  });
+  const request = () => ({
+    kind: 'claude-children' as const,
+    parents: [session(parentFile, 'parent'), session(rootFile, rootId)],
+    catalog: [session(parentFile, 'parent'), session(rootFile, rootId)],
+    repositoryRoots: [directory],
+  });
+  type Spend = { visits: number; rereads: number; bytes: number };
+  // Each activation starts a new worker from the saved store and saves its rows when `steps` end. A step runs
+  // one complete discovery pass, or reads the root's metadata as the session list does and waits until the
+  // worker's repeated-record map covers the root. The worker clock moves a minute forward on every read of it.
+  const activate = async (generation: number, steps: Array<'pass' | 'covered'>) => {
+    const covered: string[] = [];
+    const worker = new ProgressiveWorker(
+      'performance.now = () => 0; { let at = Date.UTC(2026, 0, 2); Date.now = () => (at += 60_000); }' + source,
+      undefined,
+      (file) => covered.push(file),
+    );
+    const passes: Array<Spend & { facts: unknown }> = [];
+    try {
+      const restored = loadDerivedCache(cache);
+      let entries = [...restored.claudeChildReferences];
+      let discovery = restored.discovery;
+      for (const step of steps) {
+        if (step === 'covered') {
+          const seen = covered.length;
+          await worker.run(
+            { kind: 'metadata', session: session(rootFile, rootId) },
+            generation,
+            new AbortController().signal,
+          );
+          await vi.waitFor(() => assert.ok(covered.slice(seen).includes(rootFile), 'the root map never covered'), {
+            timeout: 10_000,
+          });
+          continue;
+        }
+        const current = { visits: 0, rereads: 0, bytes: 0, facts: undefined as unknown };
+        for (let reply = 0; ; reply++) {
+          assert.ok(reply < 200, 'discovery never completed its captured inputs');
+          const result = await worker.run(
+            { ...request(), referenceEntries: entries, discovery },
+            generation,
+            new AbortController().signal,
+          );
+          assert.ok(result?.value.kind === 'claude-children' || result?.value.kind === 'claude-children-progress');
+          assert.ok(result.value.charges, 'the reply carried no discovery charges');
+          current.visits += result.value.charges.dispatchSpendVisits;
+          current.rereads += result.value.charges.dispatchSpendRereads;
+          current.bytes += result.value.charges.dispatchSpendBytes;
+          entries = result.value.referenceEntries;
+          discovery = result.value.checkpoint;
+          if (result.value.kind === 'claude-children' && !result.value.continuation) {
+            current.facts = result.value.dispatchFacts.find((fact) => fact.sessionId === rootId);
+            break;
+          }
+        }
+        passes.push(current);
+      }
+      saveDerivedCache(cache, [], entries, [], undefined, discovery);
+      return passes;
+    } finally {
+      worker.stop();
+    }
+  };
+  const spendOf = ({ visits, rereads, bytes }: Spend) => ({ visits, rereads, bytes });
+  const treeBytes = () =>
+    [rootFile, ...childIds.map((id) => path.join(subagents, `agent-${id}.jsonl`))].reduce(
+      (sum, file) => sum + fs.statSync(file).size,
+      0,
+    );
+  // The activity read of a dispatched session takes a 256 KiB tail and the earlier records its answer needs.
+  const activityWindow = 2 * 256 * 1024;
+  try {
+    // A worker whose map covers the root before discovery reads the true facts.
+    const [truth] = await activate(1, ['covered', 'pass']);
+    fs.rmSync(cache);
+    const unfinished = (facts: unknown) => (facts as { spend: { unfinished?: boolean } }).spend.unfinished === true;
+    assert.ok(!unfinished(truth.facts), 'a finished session read as unfinished');
+    // A cold worker reads the tree once. Its map does not cover the root yet, so the tail's outcome stays hidden.
+    // Coverage of the map then reads only the activity window again, and the facts take the true outcome.
+    const [cold, afterCoverage, settled] = await activate(2, ['pass', 'covered', 'pass', 'pass']);
+    assert.equal(cold.rereads, 1);
+    assert.ok(cold.bytes >= treeBytes(), 'the first pass did not read the dispatched session');
+    assert.ok(unfinished(cold.facts), 'the fixture outcome was visible without a covering map');
+    assert.equal(afterCoverage.rereads, 0, 'map coverage read the unchanged spend again');
+    assert.ok(afterCoverage.bytes <= activityWindow, `map coverage read ${afterCoverage.bytes} bytes`);
+    assert.deepEqual(afterCoverage.facts, truth.facts, 'map coverage left the hidden outcome in the facts');
+    assert.deepEqual(spendOf(settled), { visits: 1, rereads: 0, bytes: 0 }, 'a later pass read the session again');
+    // A reload reuses the saved facts, and the session list's map coverage leaves them alone.
+    const reload = await activate(3, ['pass', 'covered', 'pass']);
+    assert.equal(reload[0].rereads, 0, 'a reload read the unchanged session again');
+    assert.ok(reload[0].bytes < 1024, `a reload read ${reload[0].bytes} bytes`);
+    assert.deepEqual(spendOf(reload[1]), { visits: 1, rereads: 0, bytes: 0 }, 'map coverage after a reload read again');
+    assert.deepEqual(reload[1].facts, truth.facts, 'a reload changed the saved facts');
+    // A grown root reads its own file once. Its unchanged subagents keep their spend.
+    fs.appendFileSync(rootFile, JSON.stringify({ type: 'ignored', text: 'y'.repeat(1000) }) + '\n');
+    fs.utimesSync(rootFile, 200, 200);
+    const grown = await activate(4, ['pass', 'covered', 'pass']);
+    assert.equal(grown[0].rereads, 1, 'a grown root kept its old spend');
+    assert.ok(grown[0].bytes >= fs.statSync(rootFile).size && grown[0].bytes < 2 * treeBytes());
+    assert.equal(grown[1].rereads, 0, 'map coverage read the grown root again');
+    assert.ok(grown[1].bytes <= activityWindow, `map coverage read ${grown[1].bytes} bytes`);
+    // A grown subagent moves the spend tree, so the root reads again.
+    fs.appendFileSync(path.join(subagents, 'agent-a1.jsonl'), JSON.stringify({ type: 'ignored' }) + '\n');
+    fs.utimesSync(path.join(subagents, 'agent-a1.jsonl'), 200, 200);
+    const [child] = await activate(5, ['pass']);
+    assert.equal(child.rereads, 1, 'a grown subagent kept the old spend');
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 // Each case keeps one read unfinished after the other finishes: the root's person scan, or the child's spend.
 test.each([
   ['person', 12, 16],

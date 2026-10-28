@@ -52,6 +52,7 @@ import {
 import {
   adoptClaudeRepeatedMap,
   blankClaudeRepeated,
+  claudeRepeatedMap,
   createClaudeRepeatedFilter,
   onClaudeRepeatedCoverage,
   type ClaudeRepeatedHeldMap,
@@ -103,6 +104,7 @@ import {
   onlyGrew,
   scanKeptThroughGrowth,
   type ClaudeChildReferenceCacheEntry,
+  type DispatchActivityRead,
   type SavedDispatchFacts,
 } from './derivedcache';
 import {
@@ -155,6 +157,9 @@ interface HeldDispatchFacts {
   spendPending?: boolean;
   // Whether a later activation can reuse these facts for the same revision and tree.
   settled?: boolean;
+  activity?: DispatchActivityRead;
+  // True when the repeated-record map covered the file after an activity read that it did not cover.
+  activityStale?: boolean;
   saved?: SavedDispatchFacts;
 }
 const dispatchFacts = new Map<string, HeldDispatchFacts>();
@@ -180,6 +185,7 @@ function seededDispatch(file: string): HeldDispatchFacts | undefined {
     codexDependencies: saved.codexDependencies,
     sourceGeneration: saved.sourceGeneration,
     settled: true,
+    activity: saved.activity,
     saved,
   };
   dispatchFacts.set(file, held);
@@ -1172,11 +1178,44 @@ async function execute(
           sameRevision(held.revision, revision) &&
           held.tree === tree &&
           !held.spendPending &&
+          !held.activityStale &&
           now < held.refreshAt &&
           (!held.codexPerson || held.codexPerson.bytes >= revision.size)
         ) {
           dispatched.push(held.facts);
           continue;
+        }
+        // The spend of an unchanged file and tree stays true when only its activity answer is stale.
+        if (
+          held?.activityStale &&
+          held.activity &&
+          reference.agent === 'claude' &&
+          sameRevision(held.revision, revision) &&
+          held.tree === tree
+        ) {
+          const activity = dispatchActivity(reference.file, reference.sessionId, revision, now, reference.agent);
+          const covered = claudeRepeatedMap(reference.file, Number.MAX_SAFE_INTEGER, 0)?.covered === true;
+          if (now >= activity.activeUntil && sameRevision(revision, revisionOf(reference.file))) {
+            const spend: AgentSpend = { ...held.facts.spend };
+            if (held.activity.spendUnfinished === undefined) delete spend.unfinished;
+            else spend.unfinished = held.activity.spendUnfinished;
+            if (spend.artifacts && held.activity.artifactsComplete !== null)
+              spend.artifacts = { ...spend.artifacts, complete: held.activity.artifactsComplete };
+            if (activity.unfinished) {
+              spend.unfinished = true;
+              if (spend.artifacts) spend.artifacts = { ...spend.artifacts, complete: false };
+            }
+            const facts = { ...held.facts, spend };
+            dispatchFacts.set(reference.file, {
+              ...held,
+              facts,
+              activity: { ...held.activity, covered },
+              activityStale: false,
+              saved: undefined,
+            });
+            dispatched.push(facts);
+            continue;
+          }
         }
         // A visit that resumes a pending spend aggregate at the same revision does not count as a reread.
         if (!held?.spendPending || !sameRevision(held.revision, revision)) {
@@ -1231,6 +1270,9 @@ async function execute(
           reference.agent === 'codex'
             ? { activeUntil: completed ? 0 : revision.mtimeMs + TURN_QUIET_MS, unfinished: !completed }
             : dispatchActivity(reference.file, reference.sessionId, revision, now, reference.agent);
+        const activityCovered =
+          reference.agent === 'claude' &&
+          claudeRepeatedMap(reference.file, Number.MAX_SAFE_INTEGER, 0)?.covered === true;
         const refreshAt = activity.activeUntil;
         const active = now < refreshAt;
         if (active && reference.agent === 'codex') releaseCodexDispatchSpend(reference.file);
@@ -1276,6 +1318,14 @@ async function execute(
           charges.dispatchSpendRootRestarts++;
           root.restarts++;
         }
+        const activityRead: DispatchActivityRead | undefined =
+          reference.agent === 'claude' && !active
+            ? {
+                covered: activityCovered,
+                ...(spend.unfinished === undefined ? {} : { spendUnfinished: spend.unfinished }),
+                artifactsComplete: spend.artifacts?.complete ?? null,
+              }
+            : undefined;
         if (!active && activity.unfinished) {
           spend.unfinished = true;
           if (spend.artifacts) {
@@ -1350,6 +1400,7 @@ async function execute(
           codexPerson,
           settled:
             !active && !spendPending && collectedTree === tree && (!codexPerson || codexPerson.bytes >= revision.size),
+          activity: activityRead,
         });
         dispatched.push(facts);
       }
@@ -1377,6 +1428,7 @@ async function execute(
         tree: held.tree,
         sourceGeneration: held.sourceGeneration,
         codexDependencies: held.codexDependencies,
+        ...(held.activity ? { activity: held.activity } : {}),
         facts: held.facts,
       };
       savedDispatchFacts.set(normalizeFsPath(file), held.saved);
@@ -2119,7 +2171,11 @@ function runDiscovery(message: WorkerMessage): void {
 // Bounded reads skip the records that the repeated-record map does not reach yet, and request background
 // completion of the map. When a map reaches the end of its file, the host reads that file again and draws once.
 onClaudeRepeatedCoverage((file) => {
-  dispatchFacts.delete(file);
+  // A covered map gives an unchanged file the same activity answer again. Settled facts read without
+  // one read their activity again, and other facts read again whole.
+  const held = dispatchFacts.get(file);
+  if (held?.settled && held.activity) held.activityStale ||= !held.activity.covered;
+  else dispatchFacts.delete(file);
   noteBackground('repeatedCoverage');
   parentPort?.postMessage({ repeatedCoverage: file });
 });
