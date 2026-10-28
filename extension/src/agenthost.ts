@@ -487,7 +487,7 @@ export function claudePlan(
               }
               return admitted;
             };
-            // Names the distinct settings checks behind the withheld components, like the wire's settings refusal.
+            // Names the distinct settings and plugin catalog checks behind the withheld components.
             const settingsCheck = (result: ClaudeSessionComponents, skill: boolean, hooks: boolean) =>
               [...new Set([skill && result.checks?.skill, hooks && result.checks?.hooks].filter(Boolean))].join(' ');
             const components = admission();

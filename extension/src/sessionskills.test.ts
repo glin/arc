@@ -69,7 +69,7 @@ function ownedReaders(root: string) {
     if (path.dirname(folder) === folder) break;
   }
   return {
-    read: (file: string) => readSessionSkillInput(mapped(file)),
+    read: (file: string, limit?: number) => readSessionSkillInput(mapped(file), limit),
     list: (file: string) => listSessionSkillInput(mapped(file)),
     canonical: (file: string) => canonicalSessionSkillInput(mapped(file)),
     strays: () =>
@@ -192,8 +192,8 @@ test('withheld session tools reach the diagnostics log after the launch step, in
   );
 });
 
-// The diagnostics log receives this error, so it must name the file a user can inspect.
-test('Claude names the unreadable plugin manifest behind an uncertain configuration', () => {
+// The diagnostics log receives this check, so it must name the file a user can inspect and the plugin.
+test('Claude names the unlocated catalog of a plugin without a manifest', () => {
   const root = tempDir('session-skill-manifest-');
   const home = path.join(root, 'home');
   const cwd = path.join(root, 'workspace');
@@ -209,12 +209,206 @@ test('Claude names the unreadable plugin manifest behind an uncertain configurat
   );
   const readers = ownedReaders(root);
   const result = admitClaudeSessionComponents({ cwd, home, args: [], env: {}, release, ...readers });
+  const check = `${path.join(home, 'plugins', 'known_marketplaces.json')}:tool@market`;
   assert.deepEqual(result, {
     skill: false,
     hooks: false,
-    reasons: { skill: 'uncertain-configuration', hooks: 'uncertain-configuration', configuration: 'uncertain' },
-    error: `A plugin identity is unreadable: ${path.join(installPath, '.claude-plugin', 'plugin.json')}`,
+    reasons: { skill: 'unreadable-plugin-catalog', hooks: 'unreadable-plugin-catalog', configuration: 'admitted' },
+    checks: { skill: check, hooks: check },
   });
+  // The diagnostics log receives this error, so it must name the manifest a user can inspect.
+  const manifest = path.join(installPath, '.claude-plugin', 'plugin.json');
+  fs.mkdirSync(path.dirname(manifest));
+  fs.writeFileSync(manifest, '{}');
+  assert.equal(
+    admitClaudeSessionComponents({ cwd, home, args: [], env: {}, release, ...readers }).error,
+    `A plugin identity is unreadable: ${manifest}`,
+  );
+  assert.deepEqual(readers.strays(), []);
+});
+
+// A user-scope plugin without a manifest whose catalog entry lists two skill folders, as the owner's configuration has.
+test('Claude admits its skill and hooks beside a plugin that its marketplace catalog describes', () => {
+  const root = tempDir('session-skill-catalog-');
+  const home = path.join(root, 'home');
+  const cwd = path.join(root, 'workspace');
+  const installLocation = path.join(home, 'plugins', 'marketplaces', 'posit-dev-skills');
+  const installPath = path.join(home, 'plugins', 'cache', 'posit-dev-skills', 'posit-dev', 'a1b2c3d');
+  const catalogFile = path.join(installLocation, '.claude-plugin', 'marketplace.json');
+  const skills = ['./posit-dev/critical-code-reviewer', './posit-dev/describe-design', './posit-dev/Arc-Sessions'];
+  for (const folder of [cwd, path.dirname(catalogFile), ...skills.map((skill) => path.join(installPath, skill))])
+    fs.mkdirSync(folder, { recursive: true });
+  for (const skill of skills)
+    fs.writeFileSync(path.join(installPath, skill, 'SKILL.md'), `---\nname: ${path.basename(skill)}\n---\n`);
+  fs.writeFileSync(
+    path.join(home, 'plugins', 'known_marketplaces.json'),
+    JSON.stringify({ 'posit-dev-skills': { source: { source: 'github', repo: 'posit-dev/skills' }, installLocation } }),
+  );
+  fs.writeFileSync(
+    path.join(home, 'plugins', 'installed_plugins.json'),
+    JSON.stringify({
+      version: 2,
+      plugins: { 'posit-dev@posit-dev-skills': [{ scope: 'user', version: 'a1b2c3d', installPath }] },
+    }),
+  );
+  const entry = { name: 'posit-dev', source: './', strict: false, skills: skills.slice(0, 2) };
+  const catalog = (plugin: Record<string, unknown>) =>
+    fs.writeFileSync(catalogFile, JSON.stringify({ name: 'posit-dev-skills', plugins: [plugin] }));
+  catalog(entry);
+  const readers = ownedReaders(root);
+  const input = { cwd, home, args: [], env: {}, release, ...readers };
+  assert.deepEqual(componentFlags(input), { skill: true, hooks: true });
+  const capture = { Stop: [{ hooks: [{ type: 'command', command: 'node stop-manifest.cjs' }] }] };
+  const unrelated = { Stop: [{ hooks: [{ type: 'command', command: 'echo unrelated' }] }] };
+  const check = `${catalogFile}:posit-dev@posit-dev-skills`;
+  for (const [plugin, withheld] of [
+    [{ ...entry, hooks: unrelated }, {}],
+    [{ ...entry, skills }, { skill: 'native-definition' }],
+    [{ ...entry, commands: { 'arc-sessions': { content: 'Run Arc.' } } }, { skill: 'native-definition' }],
+    [{ ...entry, skills: ['../outside'] }, { skill: 'unclassified-component-path' }],
+    [{ ...entry, hooks: capture }, { hooks: 'conflicting-or-unreadable-declaration' }],
+    [{ ...entry, hooks: './hooks/extra.json' }, { hooks: 'conflicting-or-unreadable-declaration' }],
+    [{ ...entry, hooks: { hooks: unrelated } }, { hooks: 'conflicting-or-unreadable-declaration' }],
+    [{ ...entry, hooks: { ...unrelated, hooks: unrelated } }, { hooks: 'conflicting-or-unreadable-declaration' }],
+    [
+      { ...entry, name: 'other' },
+      { skill: 'unreadable-plugin-catalog', hooks: 'unreadable-plugin-catalog' },
+    ],
+  ] as const) {
+    catalog(plugin);
+    const result = admitClaudeSessionComponents(input);
+    const components = (['skill', 'hooks'] as const).filter((component) => !result[component]);
+    assert.deepEqual(
+      Object.fromEntries(components.map((component) => [component, result.reasons[component]])),
+      withheld,
+      JSON.stringify(plugin),
+    );
+    assert.deepEqual(result.checks ?? {}, Object.fromEntries(components.map((component) => [component, check])));
+  }
+  // A settings refusal of the hooks and a later catalog refusal report the later refusal's reason and check together.
+  const settingsFile = path.join(home, 'settings.json');
+  fs.writeFileSync(settingsFile, JSON.stringify({ hooks: capture }));
+  catalog({ ...entry, hooks: capture });
+  const paired = admitClaudeSessionComponents(input);
+  assert.deepEqual([paired.reasons.hooks, paired.checks?.hooks], ['conflicting-or-unreadable-declaration', check]);
+  fs.rmSync(settingsFile);
+  // The official Claude catalog exceeds 128 KiB. Arc reads it once for all plugins installed from it.
+  const secondPath = path.join(home, 'plugins', 'cache', 'posit-dev-skills', 'second', 'e4f5');
+  fs.mkdirSync(secondPath, { recursive: true });
+  fs.writeFileSync(
+    path.join(home, 'plugins', 'installed_plugins.json'),
+    JSON.stringify({
+      version: 2,
+      plugins: {
+        'posit-dev@posit-dev-skills': [{ scope: 'user', version: 'a1b2c3d', installPath }],
+        'second@posit-dev-skills': [{ scope: 'user', version: 'e4f5', installPath: secondPath }],
+      },
+    }),
+  );
+  const second = { name: 'second', source: './second', strict: false };
+  const filler = Array.from({ length: 1500 }, (_, index) => ({
+    name: `filler-${index}`,
+    source: `./plugins/filler-${index}`,
+    description: 'A plugin listed in the same catalog. '.repeat(3),
+  }));
+  fs.writeFileSync(catalogFile, JSON.stringify({ name: 'posit-dev-skills', plugins: [...filler, entry, second] }));
+  assert.ok(fs.statSync(catalogFile).size > 128 * 1024);
+  let catalogReads = 0;
+  const counted = {
+    ...input,
+    read: (file: string, limit?: number) => {
+      if (file === catalogFile) catalogReads++;
+      return readers.read(file, limit);
+    },
+  };
+  assert.deepEqual(admitClaudeSessionComponents(counted).reasons, {
+    skill: 'eligible',
+    hooks: 'eligible',
+    configuration: 'admitted',
+  });
+  assert.equal(catalogReads, 1);
+  // A catalog over 1 MiB, or one that is not JSON, withholds both components and names the catalog.
+  const secondCheck = `${catalogFile}:second@posit-dev-skills`;
+  for (const content of [
+    JSON.stringify({ plugins: [entry, second, { name: 'padding', description: 'x'.repeat(1024 * 1024) }] }),
+    '{"plugins": [',
+  ]) {
+    fs.writeFileSync(catalogFile, content);
+    const unreadable = admitClaudeSessionComponents(input);
+    assert.deepEqual(
+      { reasons: unreadable.reasons, checks: unreadable.checks },
+      {
+        reasons: { skill: 'unreadable-plugin-catalog', hooks: 'unreadable-plugin-catalog', configuration: 'admitted' },
+        checks: { skill: secondCheck, hooks: secondCheck },
+      },
+    );
+  }
+  // A Git marketplace reads its catalog at the source's `path` under its install location.
+  const gitCatalog = path.join(installLocation, 'catalogs', 'market.json');
+  fs.mkdirSync(path.dirname(gitCatalog));
+  fs.writeFileSync(gitCatalog, JSON.stringify({ plugins: [entry, second] }));
+  fs.writeFileSync(
+    path.join(home, 'plugins', 'known_marketplaces.json'),
+    JSON.stringify({
+      'posit-dev-skills': {
+        source: { source: 'git', url: 'https://example.com/skills.git', path: 'catalogs/market.json' },
+        installLocation,
+      },
+    }),
+  );
+  assert.deepEqual(componentFlags(input), { skill: true, hooks: true });
+  fs.writeFileSync(gitCatalog, JSON.stringify({ plugins: [{ ...entry, skills }, second] }));
+  const git = admitClaudeSessionComponents(input);
+  assert.deepEqual(
+    { reason: git.reasons.skill, check: git.checks?.skill },
+    { reason: 'native-definition', check: `${gitCatalog}:posit-dev@posit-dev-skills` },
+  );
+  assert.deepEqual(readers.strays(), []);
+});
+
+test('Claude reads the catalog entry of a directory marketplace for a plugin without a manifest', () => {
+  const root = tempDir('session-skill-directory-catalog-');
+  const home = path.join(root, 'home');
+  const cwd = path.join(root, 'workspace');
+  const market = path.join(root, 'market');
+  const catalogFile = path.join(market, '.claude-plugin', 'marketplace.json');
+  const installPath = path.join(home, 'plugins', 'cache', 'local-market', 'tool', '1.0.0');
+  for (const folder of [cwd, path.dirname(catalogFile), path.join(market, 'tool', 'extra'), installPath])
+    fs.mkdirSync(folder, { recursive: true });
+  fs.writeFileSync(path.join(market, 'tool', 'extra', 'SKILL.md'), '---\nname: extra\n---\n');
+  fs.writeFileSync(
+    path.join(home, 'plugins', 'known_marketplaces.json'),
+    JSON.stringify({ 'local-market': { source: { source: 'directory', path: market } } }),
+  );
+  fs.writeFileSync(
+    path.join(home, 'plugins', 'installed_plugins.json'),
+    JSON.stringify({
+      version: 2,
+      plugins: { 'tool@local-market': [{ scope: 'user', version: '1.0.0', installPath }] },
+    }),
+  );
+  const entry = { name: 'tool', source: './tool', skills: ['./extra'] };
+  const catalog = (plugins: unknown[]) => fs.writeFileSync(catalogFile, JSON.stringify({ plugins }));
+  catalog([entry]);
+  const readers = ownedReaders(root);
+  const input = { cwd, home, args: [], env: {}, release, ...readers };
+  assert.deepEqual(componentFlags(input), { skill: true, hooks: true });
+  catalog([{ ...entry, commands: { 'Arc-Sessions': { content: 'Run Arc.' } } }]);
+  const listed = admitClaudeSessionComponents(input);
+  assert.deepEqual(
+    { skill: listed.skill, hooks: listed.hooks, reason: listed.reasons.skill, checks: listed.checks },
+    { skill: false, hooks: true, reason: 'native-definition', checks: { skill: `${catalogFile}:tool@local-market` } },
+  );
+  // Arc finds the plugin root through this catalog, so a catalog without the plugin leaves the configuration uncertain.
+  catalog([{ ...entry, name: 'other' }]);
+  const missing = admitClaudeSessionComponents(input);
+  assert.deepEqual(
+    { reasons: missing.reasons, error: missing.error },
+    {
+      reasons: { skill: 'uncertain-configuration', hooks: 'uncertain-configuration', configuration: 'uncertain' },
+      error: `${catalogFile} does not list plugin tool@local-market once with a relative source.`,
+    },
+  );
   assert.deepEqual(readers.strays(), []);
 });
 
@@ -562,6 +756,54 @@ test.each(['win32', 'darwin', 'linux'] as const)(
       );
       assert.deepEqual(componentFlags(input), { skill: false, hooks: false });
     }
+    // A plugin without a manifest takes its components from its catalog entry under each platform's path rules.
+    const location = paths.join(home, 'plugins/marketplaces/Posit-Skills');
+    const installed = paths.join(home, 'plugins/cache/Posit-Skills/posit-dev/A1B2');
+    const listedSkill = paths.join(installed, 'Posit-Dev/Arc-Sessions');
+    for (const file of [
+      paths.join(location, '.claude-plugin/marketplace.json'),
+      paths.join(installed, '.claude-plugin/plugin.json'),
+      paths.join(installed, 'skills/arc-sessions/SKILL.md'),
+      paths.join(installed, 'commands/arc-sessions.md'),
+      paths.join(installed, 'hooks/hooks.json'),
+      paths.join(installed, 'skills'),
+      paths.join(installed, 'commands'),
+      paths.join(listedSkill, 'arc-sessions/SKILL.md'),
+      paths.join(listedSkill, 'SKILL.md'),
+      location,
+      installed,
+      listedSkill,
+    ])
+      admit(file);
+    write(
+      paths.join(home, 'plugins/known_marketplaces.json'),
+      JSON.stringify({ posit: { source: { source: 'github', repo: 'posit/skills' }, installLocation: location } }),
+    );
+    write(
+      paths.join(home, 'plugins/installed_plugins.json'),
+      JSON.stringify({
+        version: 2,
+        plugins: { 'posit-dev@posit': [{ scope: 'user', version: 'A1B2', installPath: installed }] },
+      }),
+    );
+    write(
+      paths.join(location, '.claude-plugin/marketplace.json'),
+      JSON.stringify({ plugins: [{ name: 'posit-dev', source: './', skills: ['./Posit-Dev/Arc-Sessions'] }] }),
+    );
+    assert.deepEqual(componentFlags(input), { skill: true, hooks: true });
+    write(paths.join(listedSkill, 'SKILL.md'), 'listed skill');
+    assert.deepEqual(componentFlags(input), { skill: false, hooks: true });
+    // A listed folder holding `Arc-Sessions/SKILL.md` withholds the skill on every platform.
+    const listedFolder = paths.join(installed, 'Posit-Dev');
+    for (const file of [listedFolder, paths.join(listedFolder, 'arc-sessions/SKILL.md')]) admit(file);
+    write(
+      paths.join(location, '.claude-plugin/marketplace.json'),
+      JSON.stringify({ plugins: [{ name: 'posit-dev', source: './', skills: ['./Posit-Dev'] }] }),
+    );
+    assert.deepEqual(componentFlags(input), { skill: true, hooks: true });
+    fs.mkdirSync(path.join(owned(listedFolder), 'Arc-Sessions'), { recursive: true });
+    assert.deepEqual(componentFlags(input), { skill: false, hooks: true });
+    assert.deepEqual(unmapped, []);
     write(paths.join(home, 'plugins/installed_plugins.json'), JSON.stringify({ version: 2, plugins: {} }));
     write(paths.join(home, 'commands/arc-sessions.md'), 'matching skill');
     assert.deepEqual(componentFlags(input), { skill: false, hooks: true });

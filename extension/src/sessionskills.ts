@@ -32,7 +32,7 @@ export interface SessionComponentsWithheld {
   stage: 'launch' | 'running';
   withheld: Partial<Record<SessionComponent, string>>;
   error?: string;
-  // The settings check that refused, for a `settings-refusal` reason.
+  // The settings or plugin catalog check that refused.
   check?: string;
   // The provider request that failed, and its JSON-RPC error code.
   method?: string;
@@ -106,7 +106,8 @@ export interface ClaudeSkillInputs {
   env: NodeJS.ProcessEnv;
   release: SessionSkillRelease;
   platform?: NodeJS.Platform;
-  read?(file: string): string | undefined;
+  // `limit` is the largest file in bytes that the read returns. A larger file throws.
+  read?(file: string, limit?: number): string | undefined;
   list?(directory: string): string[];
   canonical?(file: string): string;
 }
@@ -118,12 +119,12 @@ export function skillObject(value: unknown): value is Record<string, unknown> {
 // A missing entry, or a path that runs through a regular file, reads as absent.
 const absent = new Set(['ENOENT', 'ENOTDIR']);
 
-export function readSessionSkillInput(file: string): string | undefined {
+export function readSessionSkillInput(file: string, limit = 128 * 1024): string | undefined {
   let fd: number | undefined;
   try {
     fd = fs.openSync(file, 'r');
     if (!fs.fstatSync(fd).isFile()) throw new Error(`A session skill input is not a file: ${file}`);
-    const buffer = Buffer.alloc(128 * 1024 + 1);
+    const buffer = Buffer.alloc(limit + 1);
     const count = fs.readSync(fd, buffer, 0, buffer.length, 0);
     if (count === buffer.length) throw new Error(`A session skill input exceeds its read limit: ${file}`);
     return buffer.subarray(0, count).toString('utf8');
@@ -297,8 +298,16 @@ export interface ClaudeSessionComponents {
   reasons: { skill: string; hooks: string; configuration: 'admitted' | 'uncertain' };
   // The failed check behind an `uncertain-configuration` result.
   error?: string;
-  // The first settings check behind each `settings-refusal` reason, as `<source>:<check>`.
+  // The check behind each component's reason, from the refusal that set that reason: a settings check as
+  // `<source>:<check>`, or a plugin catalog check as `<catalog file>:<plugin id>`. A refusal without a check has none.
   checks?: Partial<Record<SessionComponent, string>>;
+}
+
+// A plugin's entry in its marketplace catalog. `file` names the catalog, or the marketplace list when Arc cannot
+// locate the catalog. `entry` is absent when the catalog is unreadable or does not list the plugin exactly once.
+interface CatalogEntry {
+  file: string;
+  entry?: Record<string, unknown>;
 }
 
 export function claudeSkillHome(env: NodeJS.ProcessEnv, cwd: string): string {
@@ -324,7 +333,7 @@ export function admitClaudeSessionComponents(input: ClaudeSkillInputs, hooks = t
   const refuse = (component: 'skill' | 'hooks', reason: string, check?: string) => {
     result[component] = false;
     result.reasons[component] = reason;
-    if (check) result.checks = { ...result.checks, [component]: result.checks?.[component] ?? check };
+    if (check) result.checks = { ...result.checks, [component]: check };
     else delete result.checks?.[component];
   };
   // Every uncertain result carries the check that failed, so the diagnostics log can name it.
@@ -338,13 +347,19 @@ export function admitClaudeSessionComponents(input: ClaudeSkillInputs, hooks = t
     const paths = platform === 'win32' ? path.win32 : path.posix;
     const canonical = input.canonical ?? ((file: string) => canonicalSessionSkillInput(file, platform));
     let bytes = 0;
+    let catalogBytes = 0;
     let reads = 0;
-    const text = (file: string) => {
+    // Marketplace catalogs have their own budget. The official Claude catalog lists 315 plugins in about 190 KB, so one
+    // catalog may hold 1 MiB and all catalogs together 4 MiB. Catalog bytes leave the budget of the other inputs intact.
+    const text = (file: string, catalog = false) => {
       if (++reads > 512) throw new Error(`Session skill inputs exceed their read limit at ${file}.`);
-      const value = (input.read ?? readSessionSkillInput)(file);
+      const limit = catalog ? 1024 * 1024 : 128 * 1024;
+      const value = (input.read ?? readSessionSkillInput)(file, limit);
       if (value !== undefined) {
-        bytes += Buffer.byteLength(value);
-        if (Buffer.byteLength(value) > 128 * 1024 || bytes > 2 * 1024 * 1024)
+        const size = Buffer.byteLength(value);
+        if (catalog) catalogBytes += size;
+        else bytes += size;
+        if (catalog ? size > limit || catalogBytes > 4 * 1024 * 1024 : size > limit || bytes > 2 * 1024 * 1024)
           throw new Error(`Session skill inputs exceed their byte limit at ${file}.`);
       }
       return value;
@@ -365,6 +380,32 @@ export function admitClaudeSessionComponents(input: ClaudeSkillInputs, hooks = t
       const entries = (input.list ?? listSessionSkillInput)(directory);
       if (entries.length > 256) throw new Error(`Session skill inputs exceed their directory limit at ${directory}.`);
       return entries;
+    };
+    // The children of a folder whose names equal `name` in any letter case, on every platform.
+    const named = (directory: string, name: string) =>
+      names(directory)
+        .filter((child) => child.toLowerCase() === name)
+        .map((child) => paths.join(directory, child));
+    // Arc reads each marketplace catalog at most once per check. The parser's message can quote catalog content, so a
+    // failure names only the file.
+    const catalogs = new Map<string, unknown[] | Error>();
+    const catalogPlugins = (file: string): unknown[] => {
+      let plugins = catalogs.get(file);
+      if (!plugins) {
+        try {
+          const value = text(file, true);
+          const catalog: unknown = value === undefined ? undefined : JSON.parse(value);
+          plugins =
+            skillObject(catalog) && Array.isArray(catalog.plugins)
+              ? catalog.plugins
+              : new Error(`${file} has no readable plugin list.`);
+        } catch {
+          plugins = new Error(`${file} has no readable plugin list.`);
+        }
+        catalogs.set(file, plugins);
+      }
+      if (plugins instanceof Error) throw plugins;
+      return plugins;
     };
     const contains = (root: string, file: string) => {
       const relative = paths.relative(canonical(root), canonical(file));
@@ -424,9 +465,9 @@ export function admitClaudeSessionComponents(input: ClaudeSkillInputs, hooks = t
       }
       if (paths.dirname(folder) === folder) break;
     }
-    const definition = (file: string) => {
+    const definition = (file: string, check?: string) => {
       canonical(file);
-      if (text(file) !== undefined) refuse('skill', 'native-definition');
+      if (text(file) !== undefined) refuse('skill', 'native-definition', check);
     };
     const hookFile = (root: string, file: string) => {
       if (paths.isAbsolute(file)) throw new Error('A plugin hook path is outside its directory.');
@@ -436,9 +477,80 @@ export function admitClaudeSessionComponents(input: ClaudeSkillInputs, hooks = t
       if (value === undefined || !skillObject(value) || !claudeHookDeclarations(value.hooks))
         throw new Error('A plugin hook declaration is unreadable.');
     };
-    const manifest = (root: string, name?: string) => {
+    // Throws when the default hook file is outside the plugin. The caller withholds the hooks.
+    const defaultHooks = (root: string, check?: string) => {
+      if (!contains(root, paths.join(root, 'hooks', 'hooks.json')))
+        throw new Error('A plugin hook path is outside its directory.');
+      const value = json(paths.join(root, 'hooks', 'hooks.json'));
+      if (value !== undefined && (!skillObject(value) || !claudeHookDeclarations(value.hooks)))
+        refuse('hooks', 'conflicting-or-unreadable-declaration', check);
+    };
+    // Claude reads the catalog entry as the manifest of a plugin without `.claude-plugin/plugin.json`. The registry
+    // name is the plugin name, and entry component paths resolve against the plugin root. Each refusal names the
+    // catalog file and the plugin.
+    const catalogPlugin = (root: string, id: string, catalog: CatalogEntry) => {
+      const check = `${catalog.file}:${id}`;
+      const entry = catalog.entry;
+      if (!entry) {
+        refuse('skill', 'unreadable-plugin-catalog', check);
+        if (hooks) refuse('hooks', 'unreadable-plugin-catalog', check);
+        return;
+      }
+      const name = id.split('@')[0];
+      if (name === 'arc-session-tools') refuse('skill', 'native-plugin', check);
+      if (name === 'arc-hooks') refuse('hooks', 'native-plugin', check);
+      // Arc lists each folder it checks, so a skill or command name matches in any letter case on every platform.
+      const skillFolder = (folder: string) => {
+        for (const skill of named(folder, 'arc-sessions')) definition(paths.join(skill, 'SKILL.md'), check);
+      };
+      const commandFolder = (folder: string) => {
+        for (const command of named(folder, 'arc-sessions.md')) definition(command, check);
+      };
+      skillFolder(paths.join(root, 'skills'));
+      commandFolder(paths.join(root, 'commands'));
+      const inside = (value: unknown) => {
+        if (typeof value !== 'string' || !value || paths.isAbsolute(value)) return undefined;
+        const target = paths.resolve(root, value);
+        return contains(root, target) ? target : undefined;
+      };
+      const each = (value: unknown) => (value === undefined ? [] : Array.isArray(value) ? value : [value]);
+      // A skills path holds `<name>/SKILL.md` folders or is one skill folder. Its folder name is the skill name.
+      for (const value of each(entry.skills)) {
+        const folder = inside(value);
+        if (!folder) refuse('skill', 'unclassified-component-path', check);
+        else {
+          skillFolder(folder);
+          if (paths.basename(folder).toLowerCase() === 'arc-sessions')
+            definition(paths.join(folder, 'SKILL.md'), check);
+        }
+      }
+      // A commands object maps command names to definitions. A commands path names a Markdown file or a folder of them.
+      if (skillObject(entry.commands)) {
+        if (Object.keys(entry.commands).some((command) => command.toLowerCase() === 'arc-sessions'))
+          refuse('skill', 'native-definition', check);
+      } else
+        for (const value of each(entry.commands)) {
+          const target = inside(value);
+          if (!target) refuse('skill', 'unclassified-component-path', check);
+          else if (!/\.md$/i.test(target)) commandFolder(target);
+          else if (paths.basename(target).toLowerCase() === 'arc-sessions.md') definition(target, check);
+        }
+      if (!hooks) return;
+      try {
+        defaultHooks(root, check);
+      } catch {
+        refuse('hooks', 'conflicting-or-unreadable-declaration', check);
+      }
+      // Claude runs entry hooks only as an inline event map with no `hooks` wrapper. It reports a hook file path or an
+      // array as an error.
+      if (entry.hooks !== undefined && !claudeHookDeclarations(entry.hooks))
+        refuse('hooks', 'conflicting-or-unreadable-declaration', check);
+    };
+    const manifest = (root: string, id?: string, catalog?: () => CatalogEntry) => {
       const file = paths.join(root, '.claude-plugin', 'plugin.json');
       const value = json(file);
+      if (value === undefined && id && catalog) return catalogPlugin(root, id, catalog());
+      const name = id?.split('@')[0];
       if (!skillObject(value) || typeof value.name !== 'string' || !value.name)
         throw new Error(`A plugin identity is unreadable: ${file}`);
       if (value.name === 'arc-session-tools') refuse('skill', 'native-plugin');
@@ -450,11 +562,7 @@ export function admitClaudeSessionComponents(input: ClaudeSkillInputs, hooks = t
       if (value.skills !== undefined || value.commands !== undefined) refuse('skill', 'unclassified-component-path');
       if (!hooks) return;
       try {
-        if (!contains(root, paths.join(root, 'hooks', 'hooks.json')))
-          throw new Error('A plugin hook path is outside its directory.');
-        const defaultHooks = json(paths.join(root, 'hooks', 'hooks.json'));
-        if (defaultHooks !== undefined && (!skillObject(defaultHooks) || !claudeHookDeclarations(defaultHooks.hooks)))
-          refuse('hooks', 'conflicting-or-unreadable-declaration');
+        defaultHooks(root);
         if (value.hooks !== undefined) {
           if (typeof value.hooks === 'string') hookFile(root, value.hooks);
           else if (Array.isArray(value.hooks)) {
@@ -528,15 +636,33 @@ export function admitClaudeSessionComponents(input: ClaudeSkillInputs, hooks = t
         if (!skillObject(marketplace) || !skillObject(marketplace.source))
           return uncertain(`The marketplace of plugin ${id} is missing from ${knownFile}.`);
         const source = marketplace.source;
+        const name = id.split('@')[0];
         let root = entry.installPath;
+        // A cloned marketplace keeps its catalog at its install location, at the source's `path` when one is set.
+        let pluginCatalog = (): CatalogEntry => {
+          const location = marketplace.installLocation;
+          const relative = source.path ?? paths.join('.claude-plugin', 'marketplace.json');
+          if (typeof location !== 'string' || !paths.isAbsolute(location) || typeof relative !== 'string')
+            return { file: knownFile };
+          const file = paths.resolve(location, relative);
+          if (!contains(location, file)) return { file: knownFile };
+          let plugins: unknown[];
+          try {
+            plugins = catalogPlugins(file);
+          } catch {
+            return { file };
+          }
+          const matches = plugins.filter((plugin) => skillObject(plugin) && plugin.name === name);
+          return { file, entry: matches.length === 1 && skillObject(matches[0]) ? matches[0] : undefined };
+        };
         if (source.source === 'directory') {
           if (typeof source.path !== 'string' || !paths.isAbsolute(source.path))
             return uncertain(`The marketplace of plugin ${id} has an unreadable directory.`);
           const catalogFile = paths.join(source.path, '.claude-plugin', 'marketplace.json');
-          const catalog = json(catalogFile);
-          if (!skillObject(catalog) || !Array.isArray(catalog.plugins))
-            return uncertain(`${catalogFile} has no readable plugin list.`);
-          const matches = catalog.plugins.filter((plugin) => skillObject(plugin) && plugin.name === id.split('@')[0]);
+          // Arc finds the plugin root through this catalog, so a catalog failure leaves every plugin from it uncertain.
+          const matches = catalogPlugins(catalogFile).filter(
+            (plugin) => skillObject(plugin) && plugin.name === id.split('@')[0],
+          );
           if (
             matches.length !== 1 ||
             !skillObject(matches[0]) ||
@@ -547,6 +673,8 @@ export function admitClaudeSessionComponents(input: ClaudeSkillInputs, hooks = t
           root = paths.resolve(source.path, matches[0].source);
           if (!contains(source.path, root))
             return uncertain(`The source of plugin ${id} is outside its marketplace directory.`);
+          const listed = matches[0];
+          pluginCatalog = () => ({ file: catalogFile, entry: listed });
         } else if (source.source === 'git') {
           if (typeof source.url !== 'string' || !source.url)
             return uncertain(`The marketplace of plugin ${id} has no Git URL.`);
@@ -554,7 +682,7 @@ export function admitClaudeSessionComponents(input: ClaudeSkillInputs, hooks = t
           if (typeof source.repo !== 'string' || !source.repo)
             return uncertain(`The marketplace of plugin ${id} has no GitHub repository.`);
         } else return uncertain(`The marketplace of plugin ${id} has an unsupported source type.`);
-        manifest(root, id.split('@')[0]);
+        manifest(root, id, pluginCatalog);
       }
     }
     return result;
