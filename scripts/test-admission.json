@@ -15,9 +15,9 @@
     "matricesSha256": "13ee9104d450f4defe21afa9658577661810c8aef9203b38b77427d0c22105a0"
   },
   "cli/test/smoke.bundled-b.test.mjs": {
-    "reason": "Compiled CLI commands must deliver session actions and streamed responses through the selected window channel.",
+    "reason": "Compiled CLI commands must deliver session actions and streamed responses through the selected window channel. Self-compaction must select readiness from its explicit launch nonce.",
     "cases": 5,
-    "matricesSha256": "7471b91677ded56b18f88c50459ffeb6997728ab57ba1c4dcf91b395a56ec6b2"
+    "matricesSha256": "19f64f5b8903875bc1f2ff1940238724f8abbf43e7526211cd31062dd4334e62"
   },
   "cli/test/smoke.bundled-c.test.mjs": {
     "reason": "Compiled CLI commands must preserve window routing, turn limits, and terminal ownership under real IPC.",

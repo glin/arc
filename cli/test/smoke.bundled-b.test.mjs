@@ -256,7 +256,7 @@ test('bundled management commands carry reader-default classification, prompt fi
   }
 }, 60_000);
 
-test('bundled self compaction uses read-only readiness, one admission and observation without retries', async () => {
+test('bundled self compaction selects readiness by launch nonce and never retries admission', async () => {
   const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc compact smoke '));
   const channel = new WindowChannel(home);
   const run = promisify(execFile);
@@ -294,6 +294,15 @@ test('bundled self compaction uses read-only readiness, one admission and observ
       ['compact-ready', 'compact-request'],
     );
     assert.equal(requests[1].id, requestId);
+    assert.equal('token' in requests[1].params, false);
+    const token = 'd'.repeat(32);
+    const beforeToken = requests.length;
+    const tokenOutput = await run(process.execPath, args, { env: { ...env, ARC_SESSION_NONCE: token } });
+    assert.equal(JSON.parse(tokenOutput.stdout).state, 'queued');
+    assert.deepEqual(
+      requests.slice(beforeToken).map((r) => [r.method, r.id, r.params.token]),
+      [['compact-request', requestId, token]],
+    );
     await run(
       process.execPath,
       [cli, 'compact', 'status', '--request-id', requestId, '--window', channel.hostId, '--json'],
