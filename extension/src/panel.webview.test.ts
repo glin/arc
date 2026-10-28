@@ -9826,7 +9826,8 @@ test(
     try {
       await provider.prepareClaudeChildren(1, new AbortController().signal);
       assert.equal(provider.dispatchFacts.size, 1);
-      assert.equal(provider.dispatchDiscoveryPending, true);
+      // The members settle in the first reply, and the dispatched spend keeps reading.
+      assert.equal(provider.dispatchSpendPending, true);
       provider.drawnDispatchFiguresRevision = provider.dispatchFiguresRevision;
       provider.threadNames = readThreadNames(codexSessionIndexPath(), null);
       provider.lastSignature = listingSignature({
@@ -9839,7 +9840,7 @@ test(
       await provider.refresh(false, true);
       assert.equal(fixture.collections(), 0);
       assert.equal(fixture.posted.filter((message) => message.type === 'render').length, 0);
-      for (let i = 0; i < 8 && provider.dispatchDiscoveryPending; i++) {
+      for (let i = 0; i < 8 && (provider.dispatchDiscoveryPending || provider.dispatchSpendPending); i++) {
         const before = fixture.continuations.length + fixture.refreshes.length;
         await vi.advanceTimersToNextTimerAsync();
         assert.ok(fixture.continuations.length + fixture.refreshes.length > before);
@@ -11186,7 +11187,7 @@ test('a session this window started overrides what its transcript suggests', () 
   assert.notEqual(readAt, -1, 'the agent-run answer is no longer read in one place');
   sourceMatch(
     memberFrom(panelHostSource, readAt),
-    /agentRunAnswer\(\s*guessed, session\.sessionId, this\.startedHere, session\.childTranscript === true,\s*dispatched \? true : this\.dispatchDiscoveryPending \? null : false, dispatched && \(edge\.owned === true \|\| this\.dispatchFacts\.get\(session\.sessionId\)\?\.person === true\)\s*\)/,
+    /agentRunAnswer\(\s*guessed, session\.sessionId, this\.startedHere, session\.childTranscript === true,\s*dispatched \? true : this\.dispatchDiscoveryPending \? null : false, dispatched && readerOwned\s*\)/,
     'the one seam every caller reads takes the transcript guess alone',
   );
 

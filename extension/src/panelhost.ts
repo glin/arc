@@ -13682,18 +13682,16 @@ export class PanelProvider implements vscode.Disposable {
         meta.agentRunScan?.end !== session.size)
         ? null
         : meta.agentRun;
+    const facts = this.dispatchFacts.get(session.sessionId);
+    // An unowned dispatch whose person scan has not reached the end of its file can still turn out reader-owned.
+    const readerOwned = edge?.owned === true || facts?.person === true ? true : facts?.personPending ? null : false;
     return agentRunAnswer(
       guessed,
       session.sessionId,
       this.startedHere,
       session.childTranscript === true,
       dispatched ? true : this.dispatchDiscoveryPending ? null : false,
-      dispatched &&
-        (edge.owned === true || this.dispatchFacts.get(session.sessionId)?.person === true
-          ? true
-          : this.dispatchFacts.get(session.sessionId)?.personPending
-            ? null
-            : false),
+      dispatched && readerOwned,
     );
   }
 
