@@ -60,7 +60,7 @@ Match rename answers by session and request ID. A reloaded panel must not reuse 
 
 The magnifying glass opens the box. Its cross clears and closes it, returning focus to the magnifying glass. Escape first dismisses completion, then clears a nonempty query, then closes an empty box. Escape on a filter button changes neither query nor box. A filter press preserves box visibility.
 
-Configured buttons appear during startup with unavailable counts and restored pressed state. After catalog publication, show configured buttons with positive scoped counts or while selected. Their order is Running, Active, Unread, Needs input. A selected zero stays enabled. Selecting a lens never adds an unchecked button. Counts belong in accessible names. Active describes warm or nearly expired caches in its icon, accessible name, and hint.
+Configured buttons stay hidden until catalog publication supplies their counts. Hide the quick-filter row when it has no buttons. After catalog publication, show configured buttons with positive scoped counts or while selected. Their order is Running, Active, Unread, Needs input. A selected zero stays enabled. Selecting a lens never adds an unchecked button. Counts belong in accessible names. Active describes warm or nearly expired caches in its icon, accessible name, and hint.
 
 While naming a view, freeze button counts and cache information, and refuse their presses. Payloads and saved-filter updates preserve the typed name. Naming completion refreshes the buttons.
 

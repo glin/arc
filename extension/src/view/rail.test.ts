@@ -754,26 +754,12 @@ const HEAD_WORDS = {
 
 const ALL_LENS = { filterId: ALL_RAIL_FILTER_ID, query: '' };
 
-test('startup shows configured quick filters with restored selection and unavailable counts', () => {
-  const buttons = railCountButtons(null, { ...ALL_LENS, query: RAIL_LENS_WORDS.running }, HEAD_WORDS, [
-    'running',
-    'active',
-  ]);
-  assert.deepEqual(
-    buttons.map(({ kind, figure, pressed, cacheState, cacheDetail, name }) => ({
-      kind,
-      figure,
-      pressed,
-      cacheState,
-      cacheDetail,
-      name,
-    })),
-    [
-      { kind: 'running', figure: '', pressed: true, cacheState: null, cacheDetail: null, name: HEAD_WORDS.running },
-      { kind: 'active', figure: '', pressed: false, cacheState: null, cacheDetail: null, name: HEAD_WORDS.active },
-    ],
-  );
-  assert.deepEqual(railCountButtons(null, ALL_LENS, HEAD_WORDS, []), []);
+test('startup hides quick filters until counts arrive, including a restored selection', () => {
+  for (const query of ['', ...RAIL_LENSES.map((lens) => RAIL_LENS_WORDS[lens])]) {
+    for (const configured of [[], RAIL_LENSES]) {
+      assert.deepEqual(railCountButtons(null, { ...ALL_LENS, query }, HEAD_WORDS, configured), []);
+    }
+  }
 });
 
 test('a lens count is pressed while the query holds its words, whatever wrote them', () => {
