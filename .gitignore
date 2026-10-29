@@ -20,7 +20,8 @@ extension/shots/
 .tmp/
 .worktrees/
 .test-logs/
-.scratch-*/
+.scratch-*
+arc-session-*/
 .claude/worktrees/
 .claude/plan-worktrees/
 .claude/dispatch/
