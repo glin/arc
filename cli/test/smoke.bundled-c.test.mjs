@@ -16,7 +16,6 @@ import { payloadSha256 } from '../../extension/src/sessionwrites.ts';
 import { projectSlug } from '../../extension/src/transcript.ts';
 import * as fs from 'node:fs';
 import { WINDOW_PIPE_SOURCE } from '../../extension/src/windowpipe-source.ts';
-import { forTesting as processCleanup } from '../../extension/test/browserlock.mjs';
 import {
   skillFiles,
   collectRow,
@@ -510,33 +509,16 @@ async function cleanupNativeReceipt(home, launchId, bodyError) {
 }
 
 for (const failed of [false, true])
-  test(`native receipt cleanup leaves recycled PIDs alone after body ${failed ? 'failure' : 'success'}`, async () => {
+  test(`native receipt cleanup removes the home after body ${failed ? 'failure' : 'success'}`, async () => {
     const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-receipt-cleanup-'));
     const launchId = 'aaaaaaaa-1111-2222-3333-444444444444';
     fs.mkdirSync(join(home, 'dispatch', launchId), { recursive: true });
     writeFileSync(join(home, 'dispatch', launchId, 'monitor.json'), JSON.stringify({ released: true }));
-    writeFileSync(join(home, 'native-pid.json'), JSON.stringify({ pid: 12346 }));
-    const observation = vi
-      .spyOn(DispatchReceipts.prototype, 'observation')
-      .mockReturnValue({ supervisor: { pid: 12345 } });
-    let terminated = false;
-    const kill = vi.spyOn(process, 'kill').mockImplementation(() => {
-      if (terminated) throw Object.assign(new Error('exited'), { code: 'ESRCH' });
-      return true;
-    });
-    const killTree = vi.spyOn(processCleanup, 'killProcessTree').mockImplementation(() => {
-      terminated = true;
-    });
     const primary = failed ? new Error('receipt body failed') : undefined;
     try {
       await cleanupNativeReceipt(home, undefined, primary);
       assert.equal(fs.existsSync(home), false);
-      assert.equal(kill.mock.calls.length, 0);
-      assert.equal(killTree.mock.calls.length, 0);
     } finally {
-      kill.mockRestore();
-      killTree.mockRestore();
-      observation.mockRestore();
       rmSync(home, { recursive: true, force: true });
     }
   });

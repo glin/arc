@@ -4245,15 +4245,23 @@ function headlineHtmlFor(
         remaining -= removed;
         return escapeHtml(text.slice(removed));
       });
-      // A linked mark alone borrows the following text as its readable navigation label.
+      // Drop earlier empty links before the last link borrows the following text.
+      const leadingEmptyBeforeLink =
+        /^((?:<(?!\/?a\b)[^>]*>)*)<a\b[^>]*>((?:<(?!\/?a\b)[^>]*>)*)<\/a>((?:<(?!\/?a\b)[^>]*>)*)(?=<a\b)/;
+      while (leadingEmptyBeforeLink.test(html)) html = html.replace(leadingEmptyBeforeLink, '$1$2$3');
       html = html.replace(
-        /^((?:<(?!a\b)[^>]*>)*)<a([^>]*)>((?:<[^>]*>)*)<\/a>((?:<(?!\/?a\b)[^>]*>)*)([^<]+)/,
+        /^((?:<(?!\/?a\b)[^>]*>)*)<a([^>]*)>((?:<(?!\/?a\b)[^>]*>)*)<\/a>((?:<(?!\/?a\b)[^>]*>)*)([^<]+)/,
         (_match, before: string, attributes: string, empty: string, tags: string, label: string) =>
           `${before}${empty}${tags}<a${attributes}>${label}</a>`,
       );
-      html = html
-        .replace(/^((?:<(?!a\b)[^>]*>)*)<a\b[^>]*>((?:<[^>]*>)*)<\/a>/, '$1$2')
-        .replace(/<(strong|em|del|code)><\/\1>/g, '');
+      const leadingEmpty = /^((?:<(?!\/?a\b)[^>]*>)*)<a\b[^>]*>((?:<(?!\/?a\b)[^>]*>)*)<\/a>/;
+      while (leadingEmpty.test(html)) html = html.replace(leadingEmpty, '$1$2');
+      html = html.replace(/<(strong|em|del|code)><\/\1>/g, '');
+      html = html.replace(
+        /<a([^>]* aria-label="Open session: [^"]*")>([\s\S]*?)<\/a>/g,
+        (_match, attributes: string, label: string) =>
+          `<a${attributes.replace(/aria-label="Open session: [^"]*"/, `aria-label="Open session: ${label.replace(/<[^>]*>/g, '').replace(/"/g, '&quot;')}"`)}>${label}</a>`,
+      );
     }
   } else {
     html = withoutLeadingSymbol(html);

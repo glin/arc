@@ -3737,6 +3737,12 @@ test('Markdown preview links activate by click and Enter while expanded code cop
     ]);
     const examples = [
       {
+        summary: '[✅](https://a.example)[✅](https://b.example) Done',
+        expected: 'Done',
+        href: 'https://b.example',
+        label: 'Done',
+      },
+      {
         summary: 'A ![&#169;](chart.png) [guide](https://example.com)',
         expected: 'A &#169; guide',
         href: 'https://example.com',
@@ -3831,6 +3837,8 @@ test('Markdown preview links activate by click and Enter while expanded code cop
       assert.equal(await edgeLink.count(), example.href ? 1 : 0);
       if (!example.href) continue;
       assert.equal(await edgeLink.getAttribute('data-link'), example.href);
+      assert.equal(await edgeLink.getAttribute('data-vscode-context'), null);
+      await edgeLink.dispatchEvent('contextmenu');
       if (example.label) assert.equal(await page.getByRole('link', { name: example.label, exact: true }).count(), 1);
       await page.evaluate('window.__posted.length = 0');
       await edgeLink.click();
@@ -3915,6 +3923,19 @@ test('named response session links activate inside Arc by click and Enter, inclu
     await head.focus();
     await page.keyboard.press('Enter');
     assert.equal(await head.getAttribute('aria-expanded'), 'true');
+    for (const summary of [`[✅ Done](arc-session:${id})`, `[✅](arc-session:${id}) Done`]) {
+      const marked = { ...toCard(turn({ summary }), false, NOW), key: 's1:marked-session' };
+      await post(page, { ...payload, cards: [marked] });
+      const link = page.getByRole('link', { name: 'Open session: Done', exact: true });
+      assert.equal(await link.count(), 1);
+      assert.equal(await link.textContent(), 'Done');
+      await page.evaluate('window.__posted.length = 0');
+      await link.focus();
+      await page.keyboard.press('Enter');
+      assert.deepEqual(await page.evaluate('window.__posted'), [
+        { type: 'showSession', session: id, responseLink: true },
+      ]);
+    }
     const card = {
       ...payload.cards[0],
       summaryHtml:

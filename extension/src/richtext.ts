@@ -498,7 +498,7 @@ export function visibleTextOf(html: string, singlePass = false): string {
     // One pass preserves entity examples that the literal renderer escaped as source text.
     return text.replace(
       /&(?:amp|lt|gt|quot|#39);/g,
-      (entity) => ({ '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"', '&#39;': "'" })[entity] || entity,
+      (entity) => ({ '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"', '&#39;': "'" })[entity]!,
     );
   }
   return text

@@ -3241,6 +3241,15 @@ test('collapsed formatted leading marks retain meaningful link labels', () => {
     ['```markdown\n[✅](https://example.com) Done\n```', '<a href="#" data-link="https://example.com">Done</a>'],
     ['**[✅](https://example.com)** **Done**', '<strong><a href="#" data-link="https://example.com">Done</a></strong>'],
     ['[✅](https://example.com) [Done](https://example.org)', '<a href="#" data-link="https://example.org">Done</a>'],
+    [
+      '[✅](arc-session:01a137a5-3d93-71d0-9492-965abeb0fa32) Done',
+      '<a href="#" data-link="arc-session:01a137a5-3d93-71d0-9492-965abeb0fa32" aria-label="Open session: Done">Done</a>',
+    ],
+    ['[✅](https://a.example)[✅](https://b.example) Done', '<a href="#" data-link="https://b.example">Done</a>'],
+    [
+      '[✅ Done](arc-session:01a137a5-3d93-71d0-9492-965abeb0fa32)',
+      '<a href="#" data-link="arc-session:01a137a5-3d93-71d0-9492-965abeb0fa32" aria-label="Open session: Done">Done</a>',
+    ],
   ]) {
     const card = toCard(turn({ summary }), false, NOW);
     assert.equal(card.headline, 'Done', summary);

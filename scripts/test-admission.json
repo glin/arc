@@ -22,7 +22,7 @@
   "cli/test/smoke.bundled-c.test.mjs": {
     "reason": "Compiled CLI commands must preserve window routing, turn limits, and terminal ownership under real IPC.",
     "cases": 17,
-    "matricesSha256": "5c78eaa16b7932df336d86a84500d6d3131bb24a1b93851ba6a73845631beed6"
+    "matricesSha256": "9adf21df1dfbba9f831e83076016e28f89b228d8cbcbf6ab3e76cd248011fb53"
   },
   "cli/test/smoke.test.mjs": {
     "reason": "Installed skill directories must preserve foreign files and ownership across executable command and filesystem boundaries. Bundled commands must update personal copies from every supported artifact layout. A detached run started through the editor launcher must run arc from its worker.",
@@ -207,7 +207,7 @@
   "extension/src/timeline-renderer.browser.test.ts": {
     "reason": "Production timeline rendering must preserve native disclosure, selection, navigation, and accessible interaction. Markdown preview links must deliver click and keyboard destinations while fenced source remains copyable.",
     "cases": 75,
-    "matricesSha256": "20430946a96df76485f95400f51af3f5449ed263b81d9a378b5c5f3ae5e0e232"
+    "matricesSha256": "d77d2569036fb078e38fad1e02ed5115cf6b730fe40eb9a80c0b1b3675bdc627"
   },
   "extension/src/timelinecheck.test.ts": {
     "reason": "Npm and extension-directory invocations must inspect the caller project through the real command environment.",
