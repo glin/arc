@@ -164,7 +164,7 @@ Paths are relative to `extension/src/`. [Architecture](architecture.md) owns pac
 | `view/static-shell.ts` | Shared decorative editor frame markup | no |
 | `view/static-page.ts` | Shared static-page body, header and session-list width | no |
 | `webview/export-model.ts` | Static viewer contracts and exhaustive capability policy | no |
-| `view/static-themes.ts` | Dark Modern, Light Modern and One Dark Pro Darker colors shared by static pages and browser fixtures | no |
+| `view/static-themes.ts` | Dark Modern, Light Modern and One Dark Pro Darker colors shared by static pages, browser fixtures and panel mockups | no |
 | `webview/context-detail.ts` | Semantic context categories, decorative chart, optional Messages disclosure, mismatch table, measurement disclosure, and Compact action. `webview/stat-detail.ts` retains disclosure state through refreshes and places the popover after disclosure toggles | no |
 | `claudewire.ts` | Claude stream-json and control-channel adapter, including the per-child Remote Control state | no |
 | `compactrequest.ts` | Digest-bound self-compaction request and cancel commands, native operation bindings, separate continuation observations, durable admission ports, exact-child guarded delivery, and native completion evidence | no |

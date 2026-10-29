@@ -46,16 +46,41 @@ export const LIGHT_MODERN_THEME = `:root{
 }
 body{background:var(--vscode-editor-background);color:var(--vscode-foreground);}`;
 
+// One Dark Pro Darker with its bordered look, layered over the Dark Modern table.
+// The bordered theme sets no widget or input border, so Arc draws its own grey #80808059 there.
+// The table names that grey so that the Dark Modern borders do not show through.
+export const ONE_DARK_PRO_DARKER_COLORS: Readonly<Record<string, string>> = {
+  descriptionForeground: '#abb2bf',
+  'editor-background': '#23272e',
+  'sideBar-background': '#1e2227',
+  'editorWidget-background': '#1e2227',
+  'widget-border': '#80808059',
+  focusBorder: '#3e4452',
+  'textLink-foreground': '#61afef',
+  'list-hoverBackground': '#2c313a',
+  'list-activeSelectionBackground': '#2c313a',
+  'list-activeSelectionForeground': '#d7dae0',
+  'list-inactiveSelectionBackground': '#323842',
+  'button-background': '#404754',
+  'button-secondaryBackground': '#30333d',
+  'button-secondaryForeground': '#c0bdbd',
+  'input-background': '#1d1f23',
+  'input-foreground': '#abb2bf',
+  'input-border': '#80808059',
+  'dropdown-background': '#1e2227',
+  'dropdown-border': '#1e2227',
+  'textBlockQuote-border': '#4b5362',
+  'editorWarning-foreground': '#d19a66',
+  'settings-headerForeground': '#fff',
+  'editorHoverWidget-background': '#1e2227',
+  'editorHoverWidget-border': '#181a1f',
+  'editor-selectionBackground': '#67769660',
+  'editor-findMatchHighlightBackground': '#ffffff22',
+};
+
 export const ONE_DARK_PRO_DARKER_THEME = `${DARK_MODERN_THEME}
 :root{
---vscode-descriptionForeground:#abb2bf;--vscode-editor-background:#23272e;--vscode-sideBar-background:#1e2227;
---vscode-editorWidget-background:#1e2227;--vscode-focusBorder:#3e4452;--vscode-textLink-foreground:#61afef;
---vscode-list-hoverBackground:#2c313a;--vscode-list-activeSelectionBackground:#2c313a;--vscode-list-activeSelectionForeground:#d7dae0;
---vscode-list-inactiveSelectionBackground:#323842;
---vscode-button-background:#404754;--vscode-button-secondaryBackground:#30333d;--vscode-button-secondaryForeground:#c0bdbd;
---vscode-input-background:#1d1f23;--vscode-input-foreground:#abb2bf;
---vscode-dropdown-background:#1e2227;--vscode-dropdown-border:#1e2227;--vscode-textBlockQuote-border:#4b5362;
---vscode-editorWarning-foreground:#d19a66;--vscode-settings-headerForeground:#fff;
---vscode-editorHoverWidget-background:#1e2227;--vscode-editorHoverWidget-border:#181a1f;
---vscode-editor-selectionBackground:#67769660;--vscode-editor-findMatchHighlightBackground:#ffffff22;
+${Object.entries(ONE_DARK_PRO_DARKER_COLORS)
+  .map(([name, value]) => `--vscode-${name}:${value};`)
+  .join('')}
 }`;

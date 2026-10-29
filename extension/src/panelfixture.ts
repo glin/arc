@@ -2051,7 +2051,7 @@ export { DARK_MODERN_THEME, LIGHT_MODERN_THEME } from './view/static-themes.ts';
 
 // Layer One Dark Pro Darker values over the Dark Modern table.
 // Variables omitted here retain the Dark Modern values.
-export { ONE_DARK_PRO_DARKER_THEME } from './view/static-themes.ts';
+export { ONE_DARK_PRO_DARKER_COLORS, ONE_DARK_PRO_DARKER_THEME } from './view/static-themes.ts';
 // High-contrast dark values layered over the Dark Modern table.
 export const HIGH_CONTRAST_DARK_THEME = `${DARK_MODERN_THEME}
 :root{

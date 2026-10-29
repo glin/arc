@@ -1,6 +1,6 @@
 // Mockup themes extend the editor defaults from panelfixture.ts.
 // Custom theme variables expose contrast differences outside the editor defaults.
-import { DARK_MODERN_THEME, LIGHT_MODERN_THEME } from '../../../extension/src/panelfixture.ts';
+import { DARK_MODERN_THEME, LIGHT_MODERN_THEME, ONE_DARK_PRO_DARKER_COLORS } from '../../../extension/src/panelfixture.ts';
 
 export interface MockTheme {
   /* The class the switcher puts on the page, as `html.theme-<id>`. */
@@ -13,7 +13,7 @@ export interface MockTheme {
 }
 
 /* Overrides selected colours while retaining every other value from the base table. */
-function derive(base: string, overrides: Record<string, string>): string {
+function derive(base: string, overrides: Readonly<Record<string, string>>): string {
   let table = base;
   for (const [name, value] of Object.entries(overrides)) {
     const at = new RegExp(`(--vscode-${name}:)[^;]+;`);
@@ -23,35 +23,11 @@ function derive(base: string, overrides: Record<string, string>): string {
   return table;
 }
 
-/* One Dark Pro Darker, from akamud's theme file. A bluish-grey ground rather than the neutral
-   grey of Dark Modern, and a brown for editorWarning.foreground where Dark Modern sends a
-   yellow. That one name is why a status word looks different here from every screenshot
-   taken against the editor's own theme. */
-const ONE_DARK_PRO_DARKER = derive(DARK_MODERN_THEME, {
-  'descriptionForeground': '#abb2bf',
-  'editor-background': '#23272e',
-  'sideBar-background': '#1e2227',
-  'editorWidget-background': '#1e2227',
-  'focusBorder': '#3e4452',
-  'textLink-foreground': '#61afef',
-  'list-hoverBackground': '#2c313a',
-  'list-activeSelectionBackground': '#2c313a',
-  'list-activeSelectionForeground': '#d7dae0',
-  'list-inactiveSelectionBackground': '#323842',
-  'button-background': '#404754',
-  'button-secondaryBackground': '#30333d',
-  'button-secondaryForeground': '#c0bdbd',
-  'input-background': '#1d1f23',
-  'input-foreground': '#abb2bf',
-  'dropdown-background': '#1e2227',
-  'dropdown-border': '#1e2227',
-  'textBlockQuote-border': '#4b5362',
-  'editorWarning-foreground': '#d19a66',
-  'editorHoverWidget-background': '#1e2227',
-  'editorHoverWidget-border': '#181a1f',
-  'editor-selectionBackground': '#67769660',
-  'editor-findMatchHighlightBackground': '#ffffff22',
-});
+/* One Dark Pro Darker, from the colors the static pages use. A bluish-grey ground rather than
+   the neutral grey of Dark Modern, and a brown for editorWarning.foreground where Dark Modern
+   sends a yellow. That one name is why a status word looks different here from every
+   screenshot taken against the editor's own theme. */
+const ONE_DARK_PRO_DARKER = derive(DARK_MODERN_THEME, ONE_DARK_PRO_DARKER_COLORS);
 
 /* The first entry is what the page shows before anyone presses anything. */
 export const MOCK_THEMES: readonly MockTheme[] = [
