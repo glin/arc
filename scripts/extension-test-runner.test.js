@@ -1403,8 +1403,9 @@ test('forwarding a signal kills the child, releases the lock only after it close
 
 test('a run killed while it waits for a lock leaves no queue ticket', async () => {
   vi.spyOn(console, 'log').mockImplementation(() => {});
-  // Without forwarding the lock's own handler exits. With forwarding the exit waits for the child to close.
-  for (const forwarding of [false, true]) {
+  // Alone, the queue handler exits. With forwarding, the exit waits for the child to close.
+  // Two waits in one process exit once.
+  for (const setup of ['alone', 'forwarding', 'two waits']) {
     const lockPath = lockFixture();
     const queue = `${lockPath}.queue`;
     fs.writeFileSync(lockPath, JSON.stringify({ pid: 1701, cwd: '/holder' }));
@@ -1415,36 +1416,89 @@ test('a run killed while it waits for a lock leaves no queue ticket', async () =
       processEmitter.emit('exit', code);
     };
     const child = new EventEmitter();
-    const detach = forwarding
-      ? browserLock.forwardSignalToChildAndRelease(child, null, {
-          processEmitter,
-          killTree: () => {},
-          scheduleFallback: () => null,
-          cancelFallback: () => {},
-        })
-      : () => {};
+    const detach =
+      setup === 'forwarding'
+        ? browserLock.forwardSignalToChildAndRelease(child, null, {
+            processEmitter,
+            killTree: () => {},
+            scheduleFallback: () => null,
+            cancelFallback: () => {},
+          })
+        : () => {};
     let polls = 0;
-    browserLock.acquireBrowserLock({
-      lockPath,
-      pid: 1702,
-      processEmitter,
-      isProcessAlive: () => true,
-      waitForPoll: () => {
-        polls++;
-        return new Promise(() => {});
-      },
-    });
+    for (const pid of setup === 'two waits' ? [1702, 1703] : [1702])
+      browserLock.acquireBrowserLock({
+        lockPath,
+        pid,
+        processEmitter,
+        isProcessAlive: () => true,
+        waitForPoll: () => {
+          polls++;
+          return new Promise(() => {});
+        },
+      });
+    const waits = setup === 'two waits' ? 2 : 1;
     try {
-      await vi.waitFor(() => assert.equal(polls, 1));
-      assert.equal(fs.existsSync(queue) && fs.readdirSync(queue).length, 1, `forwarding ${forwarding}`);
+      await vi.waitFor(() => assert.equal(polls, waits));
+      assert.equal(fs.existsSync(queue) && fs.readdirSync(queue).length, waits, setup);
       processEmitter.emit('SIGINT');
       child.emit('close');
-      assert.deepEqual(exits, [130], `forwarding ${forwarding}`);
-      assert.deepEqual(fs.readdirSync(queue), [], `forwarding ${forwarding}`);
+      assert.deepEqual(exits, [130], setup);
+      assert.deepEqual(fs.readdirSync(queue), [], setup);
     } finally {
       detach();
       fs.rmSync(path.dirname(lockPath), { recursive: true, force: true });
     }
+  }
+});
+
+test('a waiter passes a living older ticket only after watching it go unrefreshed for the stale age', async () => {
+  vi.spyOn(console, 'log').mockImplementation(() => {});
+  const lockPath = lockFixture();
+  const queue = `${lockPath}.queue`;
+  fs.writeFileSync(lockPath, JSON.stringify({ pid: 1801, cwd: '/holder' }));
+  let olderPolls = 0;
+  // The older waiter's process lives on, but its waiter stops refreshing its ticket.
+  browserLock.acquireBrowserLock({
+    lockPath,
+    pid: 1802,
+    now: () => 1_000,
+    processEmitter: new EventEmitter(),
+    isProcessAlive: () => true,
+    waitForPoll: () => {
+      olderPolls++;
+      return new Promise(() => {});
+    },
+  });
+  let clock = 0;
+  const gaps = [];
+  try {
+    await vi.waitFor(() => assert.equal(olderPolls, 1));
+    fs.rmSync(lockPath);
+    // The first gap is a machine sleep longer than the stale age. It restarts the observation instead of ending it.
+    const waits = [600_000, 2_000, 2_000, 2_000];
+    const lock = await browserLock.acquireBrowserLock({
+      lockPath,
+      pid: 1803,
+      now: () => 2_000 + clock,
+      monotonicNow: () => clock,
+      processEmitter: new EventEmitter(),
+      isProcessAlive: () => true,
+      pollMs: 2_000,
+      staleAfterMs: 6_000,
+      waitForPoll: async () => {
+        assert.ok(waits.length, 'The younger waiter must pass the unrefreshed ticket after the stale age.');
+        const gap = waits.shift();
+        gaps.push(gap);
+        clock += gap;
+      },
+    });
+    assert.deepEqual(gaps, [600_000, 2_000, 2_000, 2_000]);
+    assert.equal(readLockOwner(lockPath).pid, 1803);
+    assert.deepEqual(fs.readdirSync(queue), []);
+    lock.release();
+  } finally {
+    fs.rmSync(path.dirname(lockPath), { recursive: true, force: true });
   }
 });
 

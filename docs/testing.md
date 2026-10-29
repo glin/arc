@@ -107,7 +107,7 @@ Use `runId` and `parentRunId` to relate timing files. `extension/test/observatio
 
 Queue, observed build, child lifetime, and cleanup intervals use monotonic clocks. Vitest execution includes collection, internal builds, and teardown. Delegated stage walls include nested waiting and startup. `wholeCommandWallMs` covers one request. Never sum or subtract overlapping durations to infer pure execution. Unobserved boundaries remain unavailable.
 
-Holder notices include their observation timestamp and duration since that holder was first observed. Earlier notices remain historical when the holder changes. Holder payload timestamps do not establish total holder duration. Queue order and position remain unavailable. Release events report lock or slot removal, without confirming descendant termination. Cleanup errors retain their observed result.
+Holder notices include their observation timestamp and duration since that holder was first observed. Earlier notices remain historical when the holder changes. Holder payload timestamps do not establish total holder duration. Lane lock notices report the number of runs ahead in the queue as the queue position. Browser slot queue order and position remain unavailable. Release events report lock or slot removal, without confirming descendant termination. Cleanup errors retain their observed result.
 
 Lane locks use `os.tmpdir()`. Browser slots use `ARC_TEST_MACHINE_TEMP` or `os.tmpdir()`. Vitest redirects `TEMP`, `TMP`, and `TMPDIR` for each run and preserves the machine temporary directory. A nested lane lock inside a run directory excludes only callers using that directory. Timing files retain absent and empty environment values on Windows, macOS, and Linux.
 

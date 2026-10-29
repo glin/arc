@@ -1855,6 +1855,51 @@ test('a suite that gives up waiting for the machine lock leaves no queue ticket'
   }
 });
 
+test('a suite queued behind an earlier run waits for its turn on a free lock and names the queue when it gives up', async () => {
+  vi.spyOn(console, 'log').mockImplementation(() => {});
+  const errors = [];
+  vi.spyOn(console, 'error').mockImplementation((line) => errors.push(line));
+  const fixture = collectionFixture();
+  const earlier = suiteLoadFixture(fixture.directory, 1007, { now: () => 1_000 });
+  const waiting = suiteLoadFixture(fixture.directory, 1008, {
+    now: () => 2_000,
+    env: { ARC_TEST_LOAD_DEADLINE_MINUTES: '1' },
+  });
+  const { lockPath } = waiting.machineLoad;
+  fs.writeFileSync(lockPath, JSON.stringify({ pid: 1001, startedAt: 'earlier', command: 'holder' }));
+  const launched = [];
+  try {
+    suite.collectSuite({
+      ...fixture.options,
+      reportDir: path.join(fixture.directory, 'earlier'),
+      lanes: fixture.lanes,
+      machineLoad: earlier.machineLoad,
+      runChecks: passingLanes(launched, 'earlier:'),
+    });
+    await vi.waitFor(() => assert.equal(earlier.polls.length, 1));
+    fs.rmSync(lockPath);
+    const status = suite.runSuiteCommand({
+      ...fixture.options,
+      lanes: fixture.lanes,
+      machineLoad: waiting.machineLoad,
+      runChecks: passingLanes(launched),
+    });
+    await vi.waitFor(() => assert.equal(waiting.polls.length, 1));
+    assert.deepEqual(waiting.logs, [
+      'The test suite waits for its turn on this machine. 1 ahead in the queue. Waited 0 s of 1 min.',
+    ]);
+    await waiting.tick(60_000);
+    assert.equal(await status, 75);
+    assert.deepEqual(launched, []);
+    assert.match(
+      errors[0],
+      /^Earlier test runs in the machine queue were still ahead of this run after 1 min, so it did not start\. 1 ahead in the queue\./,
+    );
+  } finally {
+    fs.rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
 test('a suite under the memory floor waits before each lane and gives up with its own exit status', async () => {
   vi.spyOn(console, 'log').mockImplementation(() => {});
   const errors = [];

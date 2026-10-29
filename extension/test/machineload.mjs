@@ -180,7 +180,7 @@ export async function acquireSuiteLock({
     if (error.code !== 'ARC_LOCK_TIMEOUT') throw error;
     const cause = error.held
       ? `Another test run held the machine suite lock for ${minutes(deadlineMs)} min, so this run did not start. The holder was ${describeHolder(error.owner)}.`
-      : `Earlier test runs in the machine queue kept this run waiting for ${minutes(deadlineMs)} min, so it did not start.`;
+      : `Earlier test runs in the machine queue were still ahead of this run after ${minutes(deadlineMs)} min, so it did not start.`;
     throw new MachineLoadTimeout(
       `${cause} ${error.ahead} ahead in the queue. ${DEADLINE_ENV} moves the limit.`,
       SUITE_LOCK_TIMEOUT_EXIT,

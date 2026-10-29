@@ -197,29 +197,36 @@ function ticketPrecedes(a, b) {
   return a.name < b.name;
 }
 
-// Write or refresh a ticket. The mtime follows the injected clock, like the lock heartbeat.
-// Another waiter can remove a ticket it judged stale, so a missing ticket is written again.
+// Publish a ticket with a rename, so a reader never sees it written in part.
+// The mtime follows the injected clock, like the lock heartbeat.
+function writeTicket(ticket, now) {
+  const at = new Date(now());
+  const temp = `${ticket.path}.${randomUUID()}.tmp`;
+  try {
+    mkdirSync(dirname(ticket.path), { recursive: true });
+    writeFileSync(temp, ticket.text, { flag: 'wx' });
+    utimesSync(temp, at, at);
+    renameSync(temp, ticket.path);
+  } catch {
+    // A failed write leaves this waiter out of the queue until the next poll retries.
+    rmSync(temp, { force: true });
+  }
+}
+
+// Another waiter removes a ticket it watched go unrefreshed, so a missing ticket is written again.
 function refreshTicket(ticket, now) {
   const at = new Date(now());
   try {
     utimesSync(ticket.path, at, at);
-    return;
   } catch (error) {
-    if (error.code !== 'ENOENT') return;
-  }
-  try {
-    mkdirSync(dirname(ticket.path), { recursive: true });
-    writeFileSync(ticket.path, ticket.text);
-    utimesSync(ticket.path, at, at);
-  } catch {
-    // A failed write leaves this waiter out of the queue until the next poll retries.
+    if (error.code === 'ENOENT') writeTicket(ticket, now);
   }
 }
 
-// Count the living tickets ahead of own, or every living ticket before this waiter has one.
-// A ticket whose process ended is removed. A ticket unrefreshed for the stale age is also removed,
-// because a later process can reuse its PID. A partly written ticket is skipped until it parses.
-function ticketsAhead(lockPath, own, { isProcessAlive, now, staleAfterMs }) {
+// Count the living tickets ahead of own. A ticket whose process ended is removed.
+// A later process can reuse a PID, so a ticket this waiter watches go unrefreshed for the stale age is also removed.
+// That age follows the lock's stale rule: this waiter's monotonic clock, restarted after a suspension.
+function ticketsAhead(lockPath, own, observations, { isProcessAlive, monotonicNow, staleAfterMs, pollMs }) {
   const directory = queueDirectory(lockPath);
   let names;
   try {
@@ -228,6 +235,7 @@ function ticketsAhead(lockPath, own, { isProcessAlive, now, staleAfterMs }) {
     if (error.code === 'ENOENT') return 0;
     throw error;
   }
+  for (const name of observations.keys()) if (!names.includes(name)) observations.delete(name);
   let ahead = 0;
   for (const name of names) {
     if (!name.endsWith('.json') || name === own?.name) continue;
@@ -245,10 +253,19 @@ function ticketsAhead(lockPath, own, { isProcessAlive, now, staleAfterMs }) {
       const parsed = JSON.parse(text);
       if (Number.isInteger(parsed.pid) && parsed.pid > 0 && Number.isFinite(parsed.startedAt)) ticket = parsed;
     } catch {
-      // Unparsed content counts as written in part.
+      // A ticket is published whole, so unparsed content has no owner.
     }
-    const stale = now() - mtimeMs >= staleAfterMs;
-    if (stale || (ticket && !isProcessAlive(ticket.pid))) {
+    const step = stepStaleObservation(
+      observations.get(name) ?? null,
+      ticket,
+      mtimeMs,
+      monotonicNow,
+      isProcessAlive,
+      staleAfterMs,
+      pollMs,
+    );
+    if (step.stale) {
+      observations.delete(name);
       try {
         rmSync(path, { force: true });
       } catch {
@@ -256,10 +273,14 @@ function ticketsAhead(lockPath, own, { isProcessAlive, now, staleAfterMs }) {
       }
       continue;
     }
-    if (ticket && (!own || ticketPrecedes({ ...ticket, name }, own))) ahead++;
+    observations.set(name, step.observation);
+    if (!own || ticketPrecedes({ ...ticket, name }, own)) ahead++;
   }
   return ahead;
 }
+
+// Several waits in one process share one exit, so the handler knows the other queue handlers.
+const queueSignalHandlers = new Set();
 
 function defaultScheduleHeartbeat(tick, milliseconds) {
   const timer = setInterval(() => tick(), milliseconds);
@@ -335,9 +356,11 @@ export async function acquireBrowserLock({
         `${heading} holder observed at ${detail.observedAt}: ${describeHolder(owner)}. Observed for ${Math.round(detail.observedHolderMs)} ms. ${ahead} ahead in the queue.`,
       );
   };
-  // The first wait writes the ticket. Until the wait ends, an exit or a signal removes it.
-  // A signal with no other listener ends the process, as it does without this handler.
+  // A waiter writes its ticket before its first attempt. Until the wait ends, an exit or a signal removes it.
+  // A signal with no listener outside the queue ends the process, as it does without these handlers.
+  // The first queue handler calls the exit, and the exit listeners remove every ticket of the process.
   let ticket = null;
+  const ticketObservations = new Map();
   let leaveSignals = () => {};
   const leaveQueue = () => {
     if (!ticket) return;
@@ -356,24 +379,36 @@ export async function acquireBrowserLock({
       path: join(queueDirectory(lockPath), name),
       text: JSON.stringify({ pid, startedAt: arrivedAt, cwd, ...(command ? { command } : {}) }),
     };
-    refreshTicket(ticket, now);
+    writeTicket(ticket, now);
     const handlers = Object.keys(SIGNAL_EXIT_CODES).map((signal) => {
       const handler = () => {
         leaveQueue();
-        if (processEmitter.listenerCount(signal) === 1) processEmitter.exit(SIGNAL_EXIT_CODES[signal]);
+        const listeners = processEmitter.listeners(signal);
+        if (listeners.every((listener) => queueSignalHandlers.has(listener)) && listeners[0] === handler)
+          processEmitter.exit(SIGNAL_EXIT_CODES[signal]);
       };
+      queueSignalHandlers.add(handler);
       processEmitter.on(signal, handler);
       return [signal, handler];
     });
     processEmitter.on('exit', leaveQueue);
     leaveSignals = () => {
-      for (const [signal, handler] of handlers) processEmitter.off(signal, handler);
+      for (const [signal, handler] of handlers) {
+        processEmitter.off(signal, handler);
+        queueSignalHandlers.delete(handler);
+      }
       processEmitter.off('exit', leaveQueue);
     };
   };
   try {
+    if (!tryOnly) joinQueue();
     while (true) {
-      const ahead = ticketsAhead(lockPath, ticket, { isProcessAlive, now, staleAfterMs });
+      const ahead = ticketsAhead(lockPath, ticket, ticketObservations, {
+        isProcessAlive,
+        monotonicNow,
+        staleAfterMs,
+        pollMs,
+      });
       // Refresh startedAt for each attempt so the acquired lock records acquisition time.
       const text = JSON.stringify({
         pid,
@@ -456,12 +491,13 @@ export async function acquireBrowserLock({
           }
         }
       }
-      if (ticket) refreshTicket(ticket, now);
-      else joinQueue();
-      const blocker = held ? `held by ${describeHolder(current)}` : 'while it is free';
+      refreshTicket(ticket, now);
+      const blocker = held ? `held by ${describeHolder(current)}` : 'behind earlier queued runs';
       if (onWaiting) onWaiting({ owner: current, held, ahead, waitedMs: monotonicNow() - waitStartedAt });
       else if (!announced)
-        console.log(`${heading} are waiting for another run to finish: ${blocker}. ${ahead} ahead in the queue.`);
+        console.log(
+          `${heading} are waiting ${held ? `for another run to finish: ${blocker}` : blocker}. ${ahead} ahead in the queue.`,
+        );
       announced = true;
       const remaining = deadline - monotonicNow();
       if (remaining <= 0) {
