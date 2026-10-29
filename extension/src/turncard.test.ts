@@ -3258,6 +3258,21 @@ test('collapsed formatted leading marks retain meaningful link labels', () => {
   }
 });
 
+for (const [name, label, escaped] of [
+  ['attribute-like text', 'go $& style=position:fixed;inset:0 x', 'go $&amp; style=position:fixed;inset:0 x'],
+  ['double dollar', 'go $$ x', 'go $$ x'],
+]) {
+  test(`collapsed session link preserves ${name} in its accessible name`, () => {
+    const destination = 'arc-session:01a137a5-3d93-71d0-9492-965abeb0fa32';
+    const card = toCard(turn({ summary: `[\u2705 ${label}](${destination})` }), false, NOW);
+    assert.equal(card.headline, label);
+    assert.equal(
+      card.headlineHtml,
+      `<a href="#" data-link="${destination}" aria-label="Open session: ${escaped}">${escaped}</a>`,
+    );
+  });
+}
+
 test('collapsed prose hard breaks retain headline anchors', () => {
   for (const whitespace of [' ', '  ', '\t', '\r']) {
     const summary = `  Read [guide](https://example.com/guide).${whitespace}\nNext line.`;

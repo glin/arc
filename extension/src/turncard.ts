@@ -4257,10 +4257,11 @@ function headlineHtmlFor(
       const leadingEmpty = /^((?:<(?!\/?a\b)[^>]*>)*)<a\b[^>]*>((?:<(?!\/?a\b)[^>]*>)*)<\/a>/;
       while (leadingEmpty.test(html)) html = html.replace(leadingEmpty, '$1$2');
       html = html.replace(/<(strong|em|del|code)><\/\1>/g, '');
+      // Match the session accessible name produced by richtext.ts after removing the mark.
       html = html.replace(
         /<a([^>]* aria-label="Open session: [^"]*")>([\s\S]*?)<\/a>/g,
         (_match, attributes: string, label: string) =>
-          `<a${attributes.replace(/aria-label="Open session: [^"]*"/, `aria-label="Open session: ${label.replace(/<[^>]*>/g, '').replace(/"/g, '&quot;')}"`)}>${label}</a>`,
+          `<a${attributes.replace(/aria-label="Open session: [^"]*"/, () => `aria-label="Open session: ${label.replace(/<[^>]*>/g, '').replace(/"/g, '&quot;')}"`)}>${label}</a>`,
       );
     }
   } else {

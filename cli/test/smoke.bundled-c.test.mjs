@@ -499,7 +499,7 @@ async function cleanupNativeReceipt(home, launchId, bodyError) {
           ),
         { timeout: 10_000 },
       );
-    // The supervisor observes its native child through a retained handle before releasing the monitor.
+    // Monitor release does not establish that the supervisor has exited.
     // Windows releases the supervisor's cwd when that process exits naturally.
     await vi.waitFor(() => rmSync(home, { recursive: true, force: true }), { timeout: 10_000 });
   } catch (error) {

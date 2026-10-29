@@ -864,7 +864,6 @@ export function renderInlineMarkdown(
             let html = '';
             for (const child of token.tokens) {
               const start = token.raw.indexOf(child.raw, offset);
-              if (start < 0) return escapeHtml(token.raw);
               html += escapeHtml(token.raw.slice(offset, start)) + literalTokens([child]);
               offset = start + child.raw.length;
             }
