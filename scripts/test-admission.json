@@ -291,8 +291,8 @@
   },
   "scripts/extension-test-runner.test.js": {
     "reason": "Real runner commands must classify files, reject invalid selection, and preserve browser readiness status.",
-    "cases": 74,
-    "matricesSha256": "44b8d4e4e237c8a83272fd4fcdf479f15ee8a15a1a5616cac1eb25c85fac681b"
+    "cases": 75,
+    "matricesSha256": "112197309abb1b757b46f960576077eed11054f421e51e1e920b6f4a01c5e193"
   },
   "scripts/install-release.test.js": {
     "reason": "Release installation must extract actual archives and preserve isolated-home hooks, skills, and partial failures.",
@@ -320,9 +320,9 @@
     "matricesSha256": "d8f469b1be1e7ce2e1a3fa46468f1703be6c94abdb205d67bbfa9d4ce480dc4a"
   },
   "scripts/test-lanes.test.js": {
-    "reason": "Public commands must report independent failures, preserve cancellation, and reject stale or incomplete landing evidence. Direct cases guard category and admission drift. Machine load cases serialize multi-lane runs, wait for free memory, and cap Vitest workers.",
-    "cases": 36,
-    "matricesSha256": "cc64313e6e30950e18fc7eb0e0765c1580c4a35db7f8b17f2f81af7685883abd"
+    "reason": "Public commands must report independent failures, preserve cancellation, and reject stale or incomplete landing evidence. Direct cases guard category and admission drift. Machine load cases serialize multi-lane runs in arrival order, wait for free memory, and cap Vitest workers.",
+    "cases": 39,
+    "matricesSha256": "8a7fe927fa05c82d3365678f967c20e6bf3e6e5fcbb121bfefcc7e222277fe55"
   },
   "scripts/tool-scope.test.js": {
     "reason": "Real tool commands must respect repository scope and reject external configuration or stale packaged content.",

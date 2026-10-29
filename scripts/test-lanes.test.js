@@ -1635,7 +1635,11 @@ test('landing refuses reports finalized before process closure even when asserti
 const DEAD_PID = 4_000_001;
 
 // Each poll waits for the test to advance the injected clock, so lock and memory waits take no real time.
-function suiteLoadFixture(directory, pid, { free = () => 8 * 1024 ** 3, env = {} } = {}) {
+function suiteLoadFixture(
+  directory,
+  pid,
+  { free = () => 8 * 1024 ** 3, env = {}, now = Date.now, isProcessAlive = (candidate) => candidate !== DEAD_PID } = {},
+) {
   const logs = [];
   const polls = [];
   const state = { clock: 0 };
@@ -1654,7 +1658,9 @@ function suiteLoadFixture(directory, pid, { free = () => 8 * 1024 ** 3, env = {}
       env,
       log: (line) => logs.push(line),
       readFree: free,
-      isProcessAlive: (candidate) => candidate !== DEAD_PID,
+      isProcessAlive,
+      now,
+      processEmitter: new EventEmitter(),
       monotonicNow: () => state.clock,
       waitForPoll: () => new Promise((resolve) => polls.push(resolve)),
       staleAfterMs: Infinity,
@@ -1710,7 +1716,7 @@ test('a second multi-lane suite waits for the first and names its holder every 3
     await vi.waitFor(() => assert.equal(second.polls.length, 1));
     assert.match(
       second.logs[0],
-      /^The test suite waits for another run on this machine: PID 1001, started \S+, running fixture run 1001\. Waited 0 s of 40 min\.$/,
+      /^The test suite waits for another run on this machine: PID 1001, started \S+, running fixture run 1001\. 0 ahead in the queue\. Waited 0 s of 40 min\.$/,
     );
     await second.tick();
     await second.tick();
@@ -1727,6 +1733,124 @@ test('a second multi-lane suite waits for the first and names its holder every 3
     assert.equal(fs.existsSync(first.machineLoad.lockPath), false);
   } finally {
     finishFirst();
+    fs.rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+function queueTickets(lockPath) {
+  const queue = `${lockPath}.queue`;
+  return fs.existsSync(queue) ? fs.readdirSync(queue).filter((name) => name.endsWith('.json')) : [];
+}
+
+test('suites waiting for the machine lock start in arrival order', async () => {
+  vi.spyOn(console, 'log').mockImplementation(() => {});
+  const fixture = collectionFixture();
+  // The older run has the larger PID, so only its earlier start can put it first.
+  const older = suiteLoadFixture(fixture.directory, 1003, { now: () => 1_000 });
+  const younger = suiteLoadFixture(fixture.directory, 1002, { now: () => 2_000 });
+  const { lockPath } = older.machineLoad;
+  fs.writeFileSync(lockPath, JSON.stringify({ pid: 1001, startedAt: 'earlier', command: 'holder' }));
+  const launched = [];
+  const collect = (load, owner) =>
+    suite.collectSuite({
+      ...fixture.options,
+      reportDir: path.join(fixture.directory, owner),
+      lanes: fixture.lanes,
+      machineLoad: load.machineLoad,
+      runChecks: passingLanes(launched, `${owner}:`),
+    });
+  try {
+    const first = collect(older, 'older');
+    await vi.waitFor(() => assert.equal(older.polls.length, 1));
+    const second = collect(younger, 'younger');
+    await vi.waitFor(() => assert.equal(younger.polls.length, 1));
+    assert.match(
+      younger.logs[0],
+      /^The test suite waits for another run on this machine: PID 1001, started earlier, running holder\. 1 ahead in the queue\. Waited 0 s of 40 min\.$/,
+    );
+    fs.rmSync(lockPath);
+    // The younger run polls first after the release, and it must leave the lock to the older run.
+    await younger.tick();
+    await vi.waitFor(() => assert.ok(younger.polls.length === 1 || launched.length));
+    assert.deepEqual(launched, []);
+    await older.tick();
+    assert.equal((await first).exitCode, 0);
+    await younger.tick();
+    assert.equal((await second).exitCode, 0);
+    assert.deepEqual(launched, [
+      'older:first',
+      'older:middle',
+      'older:last',
+      'younger:first',
+      'younger:middle',
+      'younger:last',
+    ]);
+    assert.deepEqual(queueTickets(lockPath), []);
+  } finally {
+    fs.rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('a waiting suite skips and removes the queue ticket of a run that ended', async () => {
+  vi.spyOn(console, 'log').mockImplementation(() => {});
+  const fixture = collectionFixture();
+  const living = new Set([1001, 1004, 1005]);
+  const isProcessAlive = (pid) => living.has(pid);
+  const ended = suiteLoadFixture(fixture.directory, 1004, { now: () => 1_000, isProcessAlive });
+  const waiting = suiteLoadFixture(fixture.directory, 1005, { now: () => 2_000, isProcessAlive });
+  const { lockPath } = waiting.machineLoad;
+  fs.writeFileSync(lockPath, JSON.stringify({ pid: 1001, startedAt: 'earlier', command: 'holder' }));
+  const launched = [];
+  try {
+    suite.collectSuite({
+      ...fixture.options,
+      reportDir: path.join(fixture.directory, 'ended'),
+      lanes: fixture.lanes,
+      machineLoad: ended.machineLoad,
+      runChecks: passingLanes(launched, 'ended:'),
+    });
+    await vi.waitFor(() => assert.equal(ended.polls.length, 1));
+    const pending = suite.collectSuite({
+      ...fixture.options,
+      lanes: fixture.lanes,
+      machineLoad: waiting.machineLoad,
+      runChecks: passingLanes(launched),
+    });
+    await vi.waitFor(() => assert.equal(waiting.polls.length, 1));
+    assert.equal(queueTickets(lockPath).length, 2);
+    living.delete(1004);
+    fs.rmSync(lockPath);
+    await waiting.tick();
+    assert.equal((await pending).exitCode, 0);
+    assert.deepEqual(launched, ['first', 'middle', 'last']);
+    assert.deepEqual(queueTickets(lockPath), []);
+  } finally {
+    fs.rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('a suite that gives up waiting for the machine lock leaves no queue ticket', async () => {
+  vi.spyOn(console, 'log').mockImplementation(() => {});
+  vi.spyOn(console, 'error').mockImplementation(() => {});
+  const fixture = collectionFixture();
+  const waiting = suiteLoadFixture(fixture.directory, 1006, { env: { ARC_TEST_LOAD_DEADLINE_MINUTES: '1' } });
+  const { lockPath } = waiting.machineLoad;
+  fs.writeFileSync(lockPath, JSON.stringify({ pid: 1001, startedAt: 'earlier', command: 'holder' }));
+  const launched = [];
+  try {
+    const status = suite.runSuiteCommand({
+      ...fixture.options,
+      lanes: fixture.lanes,
+      machineLoad: waiting.machineLoad,
+      runChecks: passingLanes(launched),
+    });
+    await vi.waitFor(() => assert.equal(waiting.polls.length, 1));
+    assert.equal(queueTickets(lockPath).length, 1);
+    await waiting.tick(60_000);
+    assert.equal(await status, 75);
+    assert.deepEqual(launched, []);
+    assert.deepEqual(queueTickets(lockPath), []);
+  } finally {
     fs.rmSync(fixture.directory, { recursive: true, force: true });
   }
 });

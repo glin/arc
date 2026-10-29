@@ -3,7 +3,18 @@
 // Each lane launches up to four workers. Stale-lock takeover has a three-run race described below.
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { linkSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import {
+  linkSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  unlinkSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { performance } from 'node:perf_hooks';
@@ -173,6 +184,83 @@ function retireStaleLock(
   return 'retired';
 }
 
+// Each waiter keeps a ticket in a directory beside the lock until it acquires the lock or stops waiting.
+// A waiter takes a free lock only when no living ticket is older than its own, so waiters run in arrival order.
+function queueDirectory(lockPath) {
+  return `${lockPath}.queue`;
+}
+
+// Order by start time, then PID, then file name, so tickets written in the same millisecond still order.
+function ticketPrecedes(a, b) {
+  if (a.startedAt !== b.startedAt) return a.startedAt < b.startedAt;
+  if (a.pid !== b.pid) return a.pid < b.pid;
+  return a.name < b.name;
+}
+
+// Write or refresh a ticket. The mtime follows the injected clock, like the lock heartbeat.
+// Another waiter can remove a ticket it judged stale, so a missing ticket is written again.
+function refreshTicket(ticket, now) {
+  const at = new Date(now());
+  try {
+    utimesSync(ticket.path, at, at);
+    return;
+  } catch (error) {
+    if (error.code !== 'ENOENT') return;
+  }
+  try {
+    mkdirSync(dirname(ticket.path), { recursive: true });
+    writeFileSync(ticket.path, ticket.text);
+    utimesSync(ticket.path, at, at);
+  } catch {
+    // A failed write leaves this waiter out of the queue until the next poll retries.
+  }
+}
+
+// Count the living tickets ahead of own, or every living ticket before this waiter has one.
+// A ticket whose process ended is removed. A ticket unrefreshed for the stale age is also removed,
+// because a later process can reuse its PID. A partly written ticket is skipped until it parses.
+function ticketsAhead(lockPath, own, { isProcessAlive, now, staleAfterMs }) {
+  const directory = queueDirectory(lockPath);
+  let names;
+  try {
+    names = readdirSync(directory);
+  } catch (error) {
+    if (error.code === 'ENOENT') return 0;
+    throw error;
+  }
+  let ahead = 0;
+  for (const name of names) {
+    if (!name.endsWith('.json') || name === own?.name) continue;
+    const path = join(directory, name);
+    let text;
+    let mtimeMs;
+    try {
+      text = readFileSync(path, 'utf8');
+      mtimeMs = statSync(path).mtimeMs;
+    } catch {
+      continue; // The ticket left the queue during the read.
+    }
+    let ticket = null;
+    try {
+      const parsed = JSON.parse(text);
+      if (Number.isInteger(parsed.pid) && parsed.pid > 0 && Number.isFinite(parsed.startedAt)) ticket = parsed;
+    } catch {
+      // Unparsed content counts as written in part.
+    }
+    const stale = now() - mtimeMs >= staleAfterMs;
+    if (stale || (ticket && !isProcessAlive(ticket.pid))) {
+      try {
+        rmSync(path, { force: true });
+      } catch {
+        // Windows refuses removal while another waiter reads the ticket. A later poll retries.
+      }
+      continue;
+    }
+    if (ticket && (!own || ticketPrecedes({ ...ticket, name }, own))) ahead++;
+  }
+  return ahead;
+}
+
 function defaultScheduleHeartbeat(tick, milliseconds) {
   const timer = setInterval(() => tick(), milliseconds);
   timer.unref?.();
@@ -214,16 +302,18 @@ export async function acquireBrowserLock({
   heading = `${label[0].toUpperCase()}${label.slice(1)} tests`,
   command = null,
   onWaiting = null,
+  processEmitter = process,
 } = {}) {
   const lockName = `${label} test lock`;
   let announced = false;
   let staleObservation = null;
   const waitStartedAt = monotonicNow();
   const deadline = waitStartedAt + deadlineMs;
+  const arrivedAt = now();
   observation?.begin('queue', { lockPath, deadlineMs, queuePosition: null });
   let holder = null;
   let lastHolderNotice = -Infinity;
-  const observeHolder = (owner, text, mtimeMs) => {
+  const observeHolder = (owner, text, mtimeMs, ahead) => {
     if (!observation) return;
     const at = monotonicNow();
     const changed = holder?.text !== text;
@@ -237,16 +327,53 @@ export async function acquireBrowserLock({
       mtimeMs,
       observedHolderMs: at - holder.since,
       holderDuration: 'before first observation unavailable',
-      queuePosition: null,
+      queuePosition: ahead,
     };
     observation.event('queue', 'holder', detail);
     if (!tryOnly)
       console.log(
-        `${heading} holder observed at ${detail.observedAt}: ${describeHolder(owner)}. Observed for ${Math.round(detail.observedHolderMs)} ms. Queue position unavailable.`,
+        `${heading} holder observed at ${detail.observedAt}: ${describeHolder(owner)}. Observed for ${Math.round(detail.observedHolderMs)} ms. ${ahead} ahead in the queue.`,
       );
+  };
+  // The first wait writes the ticket. Until the wait ends, an exit or a signal removes it.
+  // A signal with no other listener ends the process, as it does without this handler.
+  let ticket = null;
+  let leaveSignals = () => {};
+  const leaveQueue = () => {
+    if (!ticket) return;
+    try {
+      rmSync(ticket.path, { force: true });
+    } catch {
+      // The next waiter removes the ticket once this process ends.
+    }
+  };
+  const joinQueue = () => {
+    const name = `${pid}-${randomUUID()}.json`;
+    ticket = {
+      name,
+      pid,
+      startedAt: arrivedAt,
+      path: join(queueDirectory(lockPath), name),
+      text: JSON.stringify({ pid, startedAt: arrivedAt, cwd, ...(command ? { command } : {}) }),
+    };
+    refreshTicket(ticket, now);
+    const handlers = Object.keys(SIGNAL_EXIT_CODES).map((signal) => {
+      const handler = () => {
+        leaveQueue();
+        if (processEmitter.listenerCount(signal) === 1) processEmitter.exit(SIGNAL_EXIT_CODES[signal]);
+      };
+      processEmitter.on(signal, handler);
+      return [signal, handler];
+    });
+    processEmitter.on('exit', leaveQueue);
+    leaveSignals = () => {
+      for (const [signal, handler] of handlers) processEmitter.off(signal, handler);
+      processEmitter.off('exit', leaveQueue);
+    };
   };
   try {
     while (true) {
+      const ahead = ticketsAhead(lockPath, ticket, { isProcessAlive, now, staleAfterMs });
       // Refresh startedAt for each attempt so the acquired lock records acquisition time.
       const text = JSON.stringify({
         pid,
@@ -254,7 +381,7 @@ export async function acquireBrowserLock({
         startedAt: new Date(now()).toISOString(),
         ...(command ? { command } : {}),
       });
-      if (publishLock(lockPath, text, pid)) {
+      if (ahead === 0 && publishLock(lockPath, text, pid)) {
         observation?.end('queue', { lockPath });
         const acquiredAt = observation ? monotonicNow() : null;
         observation?.event('resource', 'acquired', { lockPath, observedAt: new Date(now()).toISOString() });
@@ -298,43 +425,51 @@ export async function acquireBrowserLock({
       }
       const { text: currentText, mtimeMs, owner: current } = readLock(lockPath);
       if (tryOnly) {
-        observeHolder(current, currentText, mtimeMs);
+        observeHolder(current, currentText, mtimeMs, ahead);
         observation?.end('queue', { lockPath, acquired: false });
         return null;
       }
-      if (currentText === null) {
+      // A free lock with earlier tickets waits for them. The oldest living ticket takes it on its next poll.
+      const held = currentText !== null;
+      if (!held) {
         staleObservation = null;
-        continue; // The lock vanished between our publish attempt and our read.
-      }
-      observeHolder(current, currentText, mtimeMs);
-      const step = stepStaleObservation(
-        staleObservation,
-        current,
-        mtimeMs,
-        monotonicNow,
-        isProcessAlive,
-        staleAfterMs,
-        pollMs,
-      );
-      staleObservation = step.observation;
-      if (step.stale) {
-        // Retry immediately after a race because the lock content has changed.
-        // EPERM, EACCES, and EBUSY leave the path in place. Poll instead of spinning until the deadline.
-        const reason = retireStaleLock(lockPath, currentText, pid, { rename });
-        if (reason !== 'busy') {
-          staleObservation = null;
-          continue;
+        if (ahead === 0) continue; // The lock vanished between our publish attempt and our read.
+      } else {
+        observeHolder(current, currentText, mtimeMs, ahead);
+        const step = stepStaleObservation(
+          staleObservation,
+          current,
+          mtimeMs,
+          monotonicNow,
+          isProcessAlive,
+          staleAfterMs,
+          pollMs,
+        );
+        staleObservation = step.observation;
+        if (step.stale) {
+          // Retry immediately after a race because the lock content has changed.
+          // EPERM, EACCES, and EBUSY leave the path in place. Poll instead of spinning until the deadline.
+          const reason = retireStaleLock(lockPath, currentText, pid, { rename });
+          if (reason !== 'busy') {
+            staleObservation = null;
+            continue;
+          }
         }
       }
-      if (onWaiting) onWaiting({ owner: current, waitedMs: monotonicNow() - waitStartedAt });
+      if (ticket) refreshTicket(ticket, now);
+      else joinQueue();
+      const blocker = held ? `held by ${describeHolder(current)}` : 'while it is free';
+      if (onWaiting) onWaiting({ owner: current, held, ahead, waitedMs: monotonicNow() - waitStartedAt });
       else if (!announced)
-        console.log(`${heading} are waiting for another run to finish: held by ${describeHolder(current)}.`);
+        console.log(`${heading} are waiting for another run to finish: ${blocker}. ${ahead} ahead in the queue.`);
       announced = true;
       const remaining = deadline - monotonicNow();
       if (remaining <= 0) {
-        const timeout = new Error(`Timed out waiting for the ${lockName} held by ${describeHolder(current)}.`);
+        const timeout = new Error(`Timed out waiting for the ${lockName} ${blocker}. ${ahead} ahead in the queue.`);
         timeout.code = 'ARC_LOCK_TIMEOUT';
         timeout.owner = current;
+        timeout.held = held;
+        timeout.ahead = ahead;
         throw timeout;
       }
       await waitForPoll(Math.min(pollMs, remaining));
@@ -342,6 +477,9 @@ export async function acquireBrowserLock({
   } catch (error) {
     observation?.end('queue', { lockPath, error: error.message });
     throw error;
+  } finally {
+    leaveSignals();
+    leaveQueue();
   }
 }
 

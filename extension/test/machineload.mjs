@@ -164,19 +164,25 @@ export async function acquireSuiteLock({
       command,
       deadlineMs,
       isProcessAlive,
-      onWaiting: ({ owner, waitedMs }) => {
+      onWaiting: ({ owner, held, ahead, waitedMs }) => {
         if (lastNotice !== null && waitedMs - lastNotice < NOTICE_MS) return;
         lastNotice = waitedMs;
+        const blocker = held
+          ? `for another run on this machine: ${describeHolder(owner)}`
+          : 'for its turn on this machine';
         log(
-          `The test suite waits for another run on this machine: ${describeHolder(owner)}. Waited ${seconds(waitedMs)} s of ${minutes(deadlineMs)} min.`,
+          `The test suite waits ${blocker}. ${ahead} ahead in the queue. Waited ${seconds(waitedMs)} s of ${minutes(deadlineMs)} min.`,
         );
       },
       ...lockOptions,
     });
   } catch (error) {
     if (error.code !== 'ARC_LOCK_TIMEOUT') throw error;
+    const cause = error.held
+      ? `Another test run held the machine suite lock for ${minutes(deadlineMs)} min, so this run did not start. The holder was ${describeHolder(error.owner)}.`
+      : `Earlier test runs in the machine queue kept this run waiting for ${minutes(deadlineMs)} min, so it did not start.`;
     throw new MachineLoadTimeout(
-      `Another test run held the machine suite lock for ${minutes(deadlineMs)} min, so this run did not start. The holder was ${describeHolder(error.owner)}. ${DEADLINE_ENV} moves the limit.`,
+      `${cause} ${error.ahead} ahead in the queue. ${DEADLINE_ENV} moves the limit.`,
       SUITE_LOCK_TIMEOUT_EXIT,
     );
   }

@@ -277,7 +277,7 @@ test('lock observations follow changing holders and measure only time actually o
       holders.map((event) => event.observedHolderMs),
       [0, 0],
     );
-    assert.ok(holders.every((event) => event.observedAt && event.queuePosition === null));
+    assert.ok(holders.every((event) => event.observedAt && event.queuePosition === 0));
     assert.equal(timing.events.find((event) => event.phase === 'queue' && event.event === 'end').durationMs, 4);
     assert.ok(logs.some((line) => /holder observed.*PID 603/.test(line)));
     timing.observation.begin('cleanup');
@@ -970,7 +970,7 @@ test('a browser lock waits for a live holder and proceeds once it releases', asy
     assert.equal(polls, 1);
     assert.equal(
       logs[0],
-      'Browser tests are waiting for another run to finish: held by PID 601 in /repo/worktree-a (started earlier).',
+      'Browser tests are waiting for another run to finish: held by PID 601 in /repo/worktree-a (started earlier). 0 ahead in the queue.',
     );
     assert.match(logs[1], /^Browser tests resumed after \d+ ms waiting\.$/);
     assert.equal(logs.length, 2);
@@ -1146,7 +1146,9 @@ test('an empty lock file with a rename that keeps failing polls toward the deadl
       /Timed out waiting for the browser test lock held by an unreadable lock record/,
     );
     assert.ok(polls > 0);
-    assert.deepEqual(logs, ['Browser tests are waiting for another run to finish: held by an unreadable lock record.']);
+    assert.deepEqual(logs, [
+      'Browser tests are waiting for another run to finish: held by an unreadable lock record. 0 ahead in the queue.',
+    ]);
   } finally {
     console.log = originalLog;
     fs.rmSync(path.dirname(lockPath), { recursive: true, force: true });
@@ -1397,6 +1399,53 @@ test('forwarding a signal kills the child, releases the lock only after it close
   assert.deepEqual(exitCodes, [130]);
   detach();
   assert.equal(processEmitter.listenerCount('SIGINT'), baseline);
+});
+
+test('a run killed while it waits for a lock leaves no queue ticket', async () => {
+  vi.spyOn(console, 'log').mockImplementation(() => {});
+  // Without forwarding the lock's own handler exits. With forwarding the exit waits for the child to close.
+  for (const forwarding of [false, true]) {
+    const lockPath = lockFixture();
+    const queue = `${lockPath}.queue`;
+    fs.writeFileSync(lockPath, JSON.stringify({ pid: 1701, cwd: '/holder' }));
+    const processEmitter = new EventEmitter();
+    const exits = [];
+    processEmitter.exit = (code) => {
+      exits.push(code);
+      processEmitter.emit('exit', code);
+    };
+    const child = new EventEmitter();
+    const detach = forwarding
+      ? browserLock.forwardSignalToChildAndRelease(child, null, {
+          processEmitter,
+          killTree: () => {},
+          scheduleFallback: () => null,
+          cancelFallback: () => {},
+        })
+      : () => {};
+    let polls = 0;
+    browserLock.acquireBrowserLock({
+      lockPath,
+      pid: 1702,
+      processEmitter,
+      isProcessAlive: () => true,
+      waitForPoll: () => {
+        polls++;
+        return new Promise(() => {});
+      },
+    });
+    try {
+      await vi.waitFor(() => assert.equal(polls, 1));
+      assert.equal(fs.existsSync(queue) && fs.readdirSync(queue).length, 1, `forwarding ${forwarding}`);
+      processEmitter.emit('SIGINT');
+      child.emit('close');
+      assert.deepEqual(exits, [130], `forwarding ${forwarding}`);
+      assert.deepEqual(fs.readdirSync(queue), [], `forwarding ${forwarding}`);
+    } finally {
+      detach();
+      fs.rmSync(path.dirname(lockPath), { recursive: true, force: true });
+    }
+  }
 });
 
 test('signal forwarding without a lock retains child shutdown and mapped exits', () => {
