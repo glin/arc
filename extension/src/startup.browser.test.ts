@@ -243,9 +243,8 @@ test('startup progress ignores stale epochs and never replaces usable selected c
     );
     await page.evaluate(SETTLED);
     const running = page.locator('[data-control="railcount:running"]');
-    assert.equal(await running.isVisible(), true);
-    assert.equal(await running.getAttribute('aria-pressed'), 'true');
-    assert.equal(await running.locator('.railcountfig').count(), 0);
+    assert.equal(await page.locator('.railcount').count(), 0);
+    assert.equal(await page.locator('.railcounts').isVisible(), false);
     await page.evaluate(() =>
       window.postMessage(
         {
@@ -263,9 +262,8 @@ test('startup progress ignores stale epochs and never replaces usable selected c
       ),
     );
     await page.evaluate(SETTLED);
-    assert.equal(await running.isVisible(), true, 'a configuration reply hid the restored Running filter');
-    assert.equal(await running.getAttribute('aria-pressed'), 'true');
-    assert.equal(await running.locator('.railcountfig').count(), 0);
+    assert.equal(await page.locator('.railcount').count(), 0, 'a configuration reply revealed quick filters');
+    assert.equal(await page.locator('.railcounts').isVisible(), false);
     const progress = { type: 'startupProgress', generation: 2, epoch: 'accepted', sequence: 3, completed: 1, known: 3 };
     await page.evaluate((value) => window.postMessage(value, '*'), progress);
     await page.waitForFunction(() =>
