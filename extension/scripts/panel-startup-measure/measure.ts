@@ -4,7 +4,6 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
 import * as path from 'node:path';
-import { SCRUBBED_VARIABLES } from '../../../scripts/isolated-editor.mjs';
 import { removeMeasurementTree } from './cleanup';
 import { pathRewriter, rebindDispatch } from './freeze';
 import { instrumentSelection, measureSelection, instrumentResponse, measureResponse } from './selection';
@@ -56,6 +55,8 @@ let selectionRequested = false;
 let responseRequested = false;
 let expectedSelection: { session: string; key?: string; prompt?: string; summary?: string } | null = null;
 let soakRequested = false;
+// The variables that the isolated editor driver keeps from the editor, loaded at startup.
+let scrubbedVariables = /$^/;
 const SOAK = path.join(SCRATCH, 'soak');
 const SOAK_PROJECTS = path.join(SCRATCH, 'soak-projects');
 const SOAK_CODEX = path.join(SCRATCH, 'soak-codex');
@@ -63,7 +64,7 @@ const SOAK_CODEX = path.join(SCRATCH, 'soak-codex');
 // inherits ELECTRON_RUN_AS_NODE=1, and Code.exe then runs as Node and opens no window.
 function isolatedEnvironment(run: string = MEASUREMENT_RUN): NodeJS.ProcessEnv {
   return {
-    ...Object.fromEntries(Object.entries(process.env).filter(([name]) => !SCRUBBED_VARIABLES.test(name))),
+    ...Object.fromEntries(Object.entries(process.env).filter(([name]) => !scrubbedVariables.test(name))),
     CLAUDE_CONFIG_DIR: path.join(SCRATCH, 'claude-config'),
     CODEX_HOME: path.join(SCRATCH, 'codex-config'),
     ARC_HOME: ARC_STORE,
@@ -1257,6 +1258,7 @@ async function main(): Promise<void> {
   selectionRequested = options.selection;
   soakRequested = options.soakMinutes > 0;
   responseRequested = options.response;
+  ({ SCRUBBED_VARIABLES: scrubbedVariables } = await import('../../../scripts/isolated-editor.mjs'));
   loadFixture(options.fixture);
   options.workspace = fixture.workspace;
   const commandLine = editorCommandLine();
