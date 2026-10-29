@@ -1565,7 +1565,11 @@ test('demo downloads retain production cost categories and compaction overhead',
     if (root === 'delegated-cost') {
       assert.deepEqual(session.numbers.coverage, { usage: 'complete', cost: 'complete' });
       assert.doesNotMatch(cost.detail, /usage is incomplete|cost unavailable/);
-      assert.deepEqual(cost.detailList!.entries, live.detailList!.entries);
+      // A saved session carries no cache-expiry facts, so its cost detail has no expiry lead.
+      assert.deepEqual(
+        cost.detailList!.entries,
+        live.detailList!.entries.filter((entry) => !/^\d+ cache expir/.test(entry.label)),
+      );
     }
     if (root === 'arc-sol-read-state') assert.ok(cost.partial);
     if (root !== 'arc-demo-continuation') continue;

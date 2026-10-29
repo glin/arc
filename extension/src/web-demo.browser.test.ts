@@ -101,7 +101,11 @@ describe('read-only web demo', () => {
         if (captured.key === 'delegated-cost') {
           assert.deepEqual(captured.numbers.coverage, { usage: 'complete', cost: 'complete' });
           assert.doesNotMatch(cost.detail, /usage is incomplete|cost unavailable/);
-          assert.deepEqual(cost.detailList.entries, live.detailList!.entries);
+          // A saved session carries no cache-expiry facts, so its cost detail has no expiry lead.
+          assert.deepEqual(
+            cost.detailList.entries,
+            live.detailList!.entries.filter((entry) => !/^\d+ cache expir/.test(entry.label)),
+          );
         }
       }
       expect(
@@ -537,7 +541,7 @@ describe('read-only web demo', () => {
       'pinned',
     );
     await page.locator('[data-control="rail:delegated-cost"]').first().click();
-    await page.waitForFunction(() => document.querySelectorAll('#list .turn').length === 4);
+    await page.waitForFunction(() => document.querySelectorAll('#list .turn').length === 5);
     expect(await page.locator('[data-control="railpin:delegated-cost"].is-pinned').count()).toBeGreaterThan(0);
     await page.locator('[data-control="railpin:delegated-cost"]').first().click();
     expect(await page.locator('[data-control="rail:delegated-cost"]').first().getAttribute('aria-label')).not.toContain(

@@ -91,8 +91,8 @@
   },
   "extension/src/panel-shots.test.ts": {
     "reason": "Screenshot output must pass through the actual image encoder and lossless comparison while preserving its crop.",
-    "cases": 30,
-    "matricesSha256": "ef81df0f693c642dac454f21e8e8feb3e10d99a8de130109706ac74b25fafd6e"
+    "cases": 31,
+    "matricesSha256": "6d5234bd6b8ea4830687bc67f64e5e61d09591bc7eb2d3391298b1311b7e2bd3"
   },
   "extension/src/panel.layout.cards.test.ts": {
     "reason": "Turn-card browser interactions must preserve disclosure, keyboard, selection, and scrolling behavior.",

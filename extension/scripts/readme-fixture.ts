@@ -25,8 +25,17 @@ import type { CacheExpiryCarry, ProjectUsageBucket, SpendFileIndex } from '../sr
 import { usageBar } from '../src/usageview.ts';
 import type { AgentUsage } from '../src/usageview.ts';
 import { renderRichMarkdown } from '../src/richtext.ts';
-import { skillUse, subagent, turn } from '../src/turnfixtures.ts';
-import { SKILL_STEP_KIND, type Turn, type Compaction } from '../src/transcript.ts';
+import { counts, skillUse, subagent, turn } from '../src/turnfixtures.ts';
+import {
+  SKILL_STEP_KIND,
+  type Turn,
+  type Compaction,
+  type TurnUsage,
+  type TurnUsagePart,
+  type UsageCounts,
+  type UsageTools,
+  type UsageWaits,
+} from '../src/transcript.ts';
 import type { TurnComment } from '../src/turncomments.ts';
 import { railCacheMarkOf, sessionParentOf } from '../src/turnrail.ts';
 import { DEMO_DEFAULTS, DEMO_MODELS } from './demo-catalog.ts';
@@ -679,6 +688,116 @@ const readStateAgents: Turn['agents'] = readStateTurn.agents.map((agent) =>
       : agent,
 );
 
+// The share of a usage total that some of its requests hold, at the total's average per request.
+function usageShare(usage: UsageCounts, requests: number): TurnUsage {
+  const share = requests / usage.requests!;
+  return {
+    requests,
+    input: usage.input * share,
+    cacheWrite1h: usage.cacheWrite1h * share,
+    cacheWrite5m: usage.cacheWrite5m * share,
+    cacheWrite30m: (usage.cacheWrite30m ?? 0) * share,
+    cacheRead: usage.cacheRead * share,
+    output: usage.output * share,
+    thinking: usage.thinking * share,
+  };
+}
+
+function usageLess(usage: UsageCounts, less: UsageCounts): TurnUsage {
+  return {
+    requests: usage.requests! - less.requests!,
+    input: usage.input - less.input,
+    cacheWrite1h: usage.cacheWrite1h - less.cacheWrite1h,
+    cacheWrite5m: usage.cacheWrite5m - less.cacheWrite5m,
+    cacheWrite30m: (usage.cacheWrite30m ?? 0) - (less.cacheWrite30m ?? 0),
+    cacheRead: usage.cacheRead - less.cacheRead,
+    output: usage.output - less.output,
+    thinking: usage.thinking - less.thinking,
+  };
+}
+
+// Tool results by kind, where each request read one kind. A kind in `fixed` holds the usage given
+// for it, and the other kinds share the rest evenly by request. Requests that no kind counts read no tool result.
+function demoTools(
+  usage: UsageCounts,
+  kinds: Record<string, number>,
+  fixed: Record<string, TurnUsage> = {},
+): UsageTools {
+  const rest = Object.values(fixed).reduce<TurnUsage>((left, held) => usageLess(left, held), usage);
+  const entries = [
+    ...Object.entries(fixed).map(([kind, held]) => [kind, { requests: held.requests!, usage: held }] as const),
+    ...Object.entries(kinds).map(
+      ([kind, count]) => [kind, { requests: count, usage: usageShare(rest, count) }] as const,
+    ),
+  ];
+  return { requests: entries.reduce((sum, [, held]) => sum + held.requests, 0), kinds: Object.fromEntries(entries) };
+}
+
+// One recorded usage part in the short context band.
+function demoUsagePart(
+  model: string,
+  contextWindow: number,
+  usage: TurnUsage,
+  read: { tools?: UsageTools; waits?: UsageWaits },
+): TurnUsagePart {
+  return {
+    model,
+    provider: null,
+    contextWindow,
+    contextBand: 'short',
+    inferenceClass: null,
+    serviceTier: null,
+    ...read,
+    usage,
+  };
+}
+
+const demoHistoryUsage: TurnUsage = {
+  requests: 6,
+  input: 3_000,
+  cacheWrite1h: 0,
+  cacheWrite5m: 24_000,
+  cacheRead: 150_000,
+  output: 3_000,
+  thinking: 0,
+};
+
+// The Codex main agent reads 8 wait returns, and 3 of them time out.
+const demoCodexWaits: UsageWaits = {
+  requests: 8,
+  timedOut: 3,
+  tools: { wait_agent: 8 },
+  usage: {
+    requests: 8,
+    input: 6_000,
+    cacheWrite1h: 0,
+    cacheWrite5m: 0,
+    cacheRead: 1_000_000,
+    output: 8_000,
+    thinking: 0,
+  },
+};
+
+const demoSketchUsage: TurnUsage = {
+  ...emptyUsage(),
+  requests: 8,
+  input: 120_000,
+  cacheRead: 400_000,
+  output: 120_000,
+};
+
+// Each request of the Haiku test subagent stays under Haiku 5.5's 100,000-token long-context threshold.
+const demoHaikuTestUsage: TurnUsage = {
+  requests: 12,
+  input: 48_000,
+  cacheWrite1h: 0,
+  cacheWrite5m: 0,
+  cacheRead: 960_000,
+  output: 84_000,
+  thinking: 0,
+};
+demoHaikuTestUsage.byContextBand = { short: { ...demoHaikuTestUsage } };
+
 const demoCodexReadStateTurn: Turn = {
   ...readStateTurn,
   agents: readStateAgents.filter((agent) => agent.id !== 'background-review'),
@@ -791,20 +910,80 @@ const demoReadStateTurn: Turn = {
   outputRate: { output: 6_000, milliseconds: 60_000 },
   outputRateBasis: 'request',
   contextWindow: 1_000_000,
-  agents: demoCodexReadStateTurn.agents.map((agent) => {
-    const model = 'claude-sonnet-5-5';
-    return {
-      ...agent,
-      model,
-      outputRate: {
-        output: agent.id === 'background-review' ? 1_000 : agent.id === 'luna-tests' ? 2_800 : 8_400,
-        milliseconds: agent.id === 'background-review' ? 8_000 : agent.id === 'luna-tests' ? 40_000 : 120_000,
-      },
-      outputRateModel: model,
-      effort: 'high',
-      spend: agent.spend.map((part) => ({ ...part, model })),
-    };
-  }),
+  usageParts: [
+    demoUsagePart('claude-opus-5-5', 1_000_000, readStateTurn.usage, {
+      tools: demoTools(readStateTurn.usage, {
+        'file read': 3,
+        'test or build': 3,
+        'subagent launch': 3,
+        'file edit': 2,
+      }),
+    }),
+  ],
+  // The finished subagents' results are in context. The running implementation has not returned yet.
+  subagentContext: {
+    tokens: 3_000,
+    partial: false,
+    removed: false,
+    agents: [
+      { name: 'Check the view-switching test', tokens: 2_000 },
+      { name: 'Find earlier unread fixes', tokens: 1_000 },
+    ],
+  },
+  agents: [
+    ...demoCodexReadStateTurn.agents.map((agent) => {
+      const model = agent.id === 'luna-tests' ? 'claude-haiku-5-5' : 'claude-sonnet-5-5';
+      const kinds: Record<string, number> =
+        agent.id === 'luna-tests'
+          ? { 'test or build': 4, 'file read': 3 }
+          : { 'file edit': 6, 'file read': 6, 'test or build': 5 };
+      return {
+        ...agent,
+        model,
+        outputRate: {
+          output: agent.id === 'luna-tests' ? 2_800 : 8_400,
+          milliseconds: agent.id === 'luna-tests' ? 40_000 : 120_000,
+        },
+        outputRateModel: model,
+        effort: 'high',
+        ...(agent.id === 'luna-tests'
+          ? { tokens: demoHaikuTestUsage.input + demoHaikuTestUsage.cacheRead + demoHaikuTestUsage.output }
+          : {}),
+        spend: agent.spend.map((part) => {
+          const usage = agent.id === 'luna-tests' ? demoHaikuTestUsage : part.usage;
+          return {
+            ...part,
+            model,
+            usage,
+            usageParts: [demoUsagePart(model, 200_000, usage, { tools: demoTools(usage, kinds) })],
+          };
+        }),
+      };
+    }),
+    subagent({
+      id: 'unread-history',
+      description: 'Find earlier unread fixes',
+      model: 'claude-opus-5-5',
+      outputRate: { output: 3_000, milliseconds: 30_000 },
+      outputRateModel: 'claude-opus-5-5',
+      effort: 'medium',
+      spend: [
+        {
+          model: 'claude-opus-5-5',
+          usage: demoHistoryUsage,
+          usageParts: [
+            demoUsagePart('claude-opus-5-5', 1_000_000, demoHistoryUsage, {
+              tools: demoTools(demoHistoryUsage, { search: 3, git: 2 }),
+            }),
+          ],
+        },
+      ],
+      durationMs: 54_000,
+      tokens: 180_000,
+      toolUses: 5,
+      artifacts: { files: [], commits: [], complete: true, revision: 'unread-history' },
+    }),
+  ],
   steps: [
     ...demoCodexReadStateTurn.steps.map((step) =>
       step.ordinal === 22
@@ -820,22 +999,25 @@ const demoReadStateTurn: Turn = {
       at: start + 12.6 * 60_000,
       status: 'done',
     },
+    { ordinal: 24, name: 'Agent', detail: 'Find earlier unread fixes', at: start + 12.7 * 60_000, status: 'done' },
   ],
   skillUses: demoCodexReadStateTurn.skillUses.map((use) =>
     skillUse({ sourceId: use.sourceId, name: use.name, description: use.description, path: use.path, at: use.at }),
   ),
-  stepCount: 23,
+  stepCount: 24,
   stepKinds: [
     ...demoCodexReadStateTurn.stepKinds.map((kind, index) =>
       index === 21 ? SKILL_STEP_KIND : kind === 'searches' ? 'reads' : kind,
     ),
     'commands',
+    'agents',
   ],
-  toolUses: 23,
+  toolUses: 24,
   toolCounts: {
     ...demoCodexReadStateTurn.toolCounts,
     reads: demoCodexReadStateTurn.toolCounts.reads + demoCodexReadStateTurn.toolCounts.searches,
     searches: 0,
+    agents: demoCodexReadStateTurn.toolCounts.agents + 1,
     other: 0,
   },
 };
@@ -939,11 +1121,14 @@ export const DEMO_TURNS: Record<string, Turn[]> = {
       prompt: 'Check the view-switching regression test in the read-state worktree.',
       summary:
         'The test checks that switching views preserves unread results. Opening a result clears only its own mark.',
-      model: 'claude-sonnet-5-5',
+      model: demoTestAgent.model,
       effort: 'high',
       contextTokens: 18_000,
       contextWindow: 200_000,
       usage: demoTestAgent.spend[0].usage,
+      usageParts: demoTestAgent.spend[0].usageParts,
+      toolUses: demoTestAgent.toolUses ?? 0,
+      toolCounts: counts({ commands: 4, reads: 3 }),
       files: [file('extension/src/webview/read-state.test.ts', 44, 6)],
       commits: demoTestAgent.commits,
     }),
@@ -966,6 +1151,9 @@ export const DEMO_TURNS: Record<string, Turn[]> = {
       contextTokens: 22_000,
       contextWindow: 200_000,
       usage: demoReadStateTurn.agents[0].spend[0].usage,
+      usageParts: demoReadStateTurn.agents[0].spend[0].usageParts,
+      toolUses: demoReadStateTurn.agents[0].toolUses ?? 0,
+      toolCounts: counts({ edits: 6, reads: 7, commands: 5 }),
       files: readStateTurn.agents[0].artifacts!.files.map((item) => ({ ...item, edits: [] })),
       commits: readStateTurn.agents[0].commits,
     }),
@@ -997,16 +1185,58 @@ export const DEMO_TURNS: Record<string, Turn[]> = {
       usage: expiryUsage,
       finished: true,
       // Remove these subagent links so only the unread-results session opens Preserve unread state.
-      agents: readStateTurn.agents
-        .filter((agent) => agent.id !== 'background-review')
-        .map((agent) => {
-          const unlinked = { ...agent };
-          delete unlinked.childSessionId;
-          return unlinked;
+      agents: [
+        ...readStateTurn.agents
+          .filter((agent) => agent.id !== 'background-review')
+          .map((agent) => {
+            const unlinked = { ...agent };
+            delete unlinked.childSessionId;
+            return unlinked;
+          }),
+        // Its requests write most of their input to the cache and read little of it back.
+        subagent({
+          id: 'restored-tab-check',
+          description: 'Check file actions in restored tabs',
+          model: 'claude-sonnet-5-5',
+          outputRate: { output: 4_000, milliseconds: 80_000 },
+          outputRateModel: 'claude-sonnet-5-5',
+          effort: 'high',
+          spend: [
+            {
+              model: 'claude-sonnet-5-5',
+              contextWindow: 200_000,
+              usage: {
+                requests: 24,
+                input: 30_000,
+                cacheWrite1h: 0,
+                cacheWrite5m: 3_000_000,
+                cacheRead: 300_000,
+                output: 40_000,
+                thinking: 0,
+              },
+            },
+          ],
+          durationMs: 210_000,
+          tokens: 3_370_000,
+          toolUses: 23,
+          artifacts: { files: [], commits: [], complete: true, revision: 'restored-tab-check' },
         }),
+      ],
       files: [file('extension/src/turncard.ts', 28, 6)],
     }),
-    ...expiryHistory.slice(1).map((item) => ({
+    ...[
+      ...expiryHistory.slice(1),
+      {
+        ...expiryHistory[3],
+        promptId: 'list-restored-file-actions',
+        startedAt: expiryHistory[3].startedAt - 83 * 60_000,
+        endedAt: expiryHistory[3].endedAt - 83 * 60_000,
+        prompt: 'List the file actions a restored session tab offers.',
+        summary: 'A restored session tab offers the file names and the full diff action.',
+        openingResponseId: 'demo-list-restored-file-actions',
+        contextRequest: { ...expiryHistory[3].contextRequest!, at: expiryHistory[3].contextRequest!.at - 83 * 60_000 },
+      },
+    ].map((item) => ({
       ...item,
       sessionId: 'delegated-cost',
       sessionTitle: 'Count delegated work once',
@@ -1029,7 +1259,14 @@ export const DEMO_TURNS: Record<string, Turn[]> = {
       effort: 'high',
       contextTokens: 16_000,
       contextWindow: 258_400,
-      usage: { ...emptyUsage(), requests: 8, input: 120_000, cacheRead: 400_000, output: 120_000 },
+      usage: demoSketchUsage,
+      usageParts: [
+        demoUsagePart('gpt-6.1-sol', 258_400, demoSketchUsage, {
+          tools: demoTools(demoSketchUsage, { 'file read': 5, search: 2 }),
+        }),
+      ],
+      toolUses: 7,
+      toolCounts: counts({ reads: 5, searches: 2 }),
     }),
   ],
   'arc-demo-dispatch': [
@@ -1156,6 +1393,17 @@ DEMO_TURNS['arc-codex-read-state'] = DEMO_TURNS['arc-read-state'].map((item, ind
     sessionId: 'arc-codex-read-state',
     sessionTitle: 'Review unread results with Codex',
     promptId: `codex-${source.promptId}`,
+    // Only the Codex session reads wait returns. Its subagents record no tool results.
+    ...(index === 0
+      ? {
+          usageParts: [
+            demoUsagePart('gpt-6-astra', 258_400, source.usage, {
+              tools: demoTools(source.usage, { 'test or build': 2, 'file edit': 1 }, { wait: demoCodexWaits.usage }),
+              waits: demoCodexWaits,
+            }),
+          ],
+        }
+      : {}),
     agents: source.agents.map((agent) => {
       const unlinked = { ...agent };
       delete unlinked.childSessionId;
@@ -1290,6 +1538,7 @@ for (const turns of Object.values(DEMO_TURNS)) {
 for (const [sessionId, facts] of [
   ['arc-read-state', DEMO_DEFAULT_EXPIRY],
   ['arc-codex-read-state', demoCodexExpiry],
+  ['delegated-cost', demoDelegatedExpiry],
 ] as const) {
   const defaultHistory = DEMO_TURNS[sessionId].filter((item) => item.usage.requests === 1).reverse();
   for (let index = 1; index < defaultHistory.length; index++) {
@@ -1371,16 +1620,19 @@ export function demoSessionCostParts(root: string): SessionCostUsage[] {
       );
       for (const agent of item.agents) {
         if (agent.childSessionId && demoParentEdges.get(agent.childSessionId)?.parent === id) continue;
+        // A spend part with usage parts carries their tool results.
         parts.push(
-          ...agent.spend.map((part) => ({
-            ...part,
-            agent: item.agent,
-            role: 'delegated' as const,
-            scopeId: agent.id ?? undefined,
-            provider: part.provider ?? null,
-            contextWindow: part.contextWindow ?? item.contextWindow,
-            incomplete: incomplete || agent.spendPartial || !agent.spendFound,
-          })),
+          ...agent.spend.flatMap((part) =>
+            (part.usageParts?.length ? part.usageParts : [part]).map((held) => ({
+              ...held,
+              agent: item.agent,
+              role: 'delegated' as const,
+              scopeId: agent.id ?? undefined,
+              provider: held.provider ?? null,
+              contextWindow: held.contextWindow ?? item.contextWindow,
+              incomplete: incomplete || agent.spendPartial || !agent.spendFound,
+            })),
+          ),
         );
       }
     }
@@ -1412,7 +1664,14 @@ export function demoSessionCostParts(root: string): SessionCostUsage[] {
 export function demoSessionOverheads(id: string) {
   return {
     compactionCount: DEMO_COMPACTIONS[id]?.length ?? 0,
-    expiry: id === 'arc-read-state' ? DEMO_DEFAULT_EXPIRY : id === 'arc-codex-read-state' ? demoCodexExpiry : null,
+    expiry:
+      id === 'arc-read-state'
+        ? DEMO_DEFAULT_EXPIRY
+        : id === 'arc-codex-read-state'
+          ? demoCodexExpiry
+          : id === 'delegated-cost'
+            ? demoDelegatedExpiry
+            : null,
   };
 }
 
@@ -1674,10 +1933,8 @@ export function demoPayload(sessionId: string): Record<string, unknown> {
                       agent: sketch.agent,
                       role: 'delegated',
                       scopeId: sketch.sessionId,
-                      model: sketch.model,
-                      provider: sketch.provider ?? null,
-                      contextWindow: sketch.contextWindow,
-                      usage: sketch.usage,
+                      // The whole usage part, so its context band prices each tool kind.
+                      ...sketch.usageParts![0],
                       own: true,
                     },
                   ]),

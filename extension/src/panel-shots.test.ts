@@ -307,7 +307,7 @@ test('demo selections keep available setups, cache facts, and their own prompt t
   assert.doesNotMatch(main.cards[0].summaryHtml, /<table>/);
   assert.deepEqual(DEMO_SESSION_IDS.filter((id) => id === 'arc-open-changes' || id === 'session-search'), []);
   const cost = demoPayload('delegated-cost') as Payload;
-  assert.equal(cost.cards.length, 4);
+  assert.equal(cost.cards.length, 5);
   assert.ok(cost.cards.every((card) => card.sessionId === 'delegated-cost'));
 });
 
@@ -689,7 +689,8 @@ test('default demo history keeps distinct turns and provider-scoped expiry evide
   const expired = demoPayload('delegated-cost') as typeof main;
   const warning = main.cards[1].chips.find((chip) => chip.metric === 'cost')!.warnings!.find((warning) => warning.scope === 'cache-expiry');
   assert.ok(warning && warning.scope === 'cache-expiry' && warning.dollars! > 1, 'invented cold turn must cross the production warning threshold');
-  assert.ok(expired.cards.every((card) => !card.chips.some((chip) => chip.warnings?.some((warning) => warning.scope === 'cache-expiry'))));
+  // The delegated-cost session holds its own expiry evidence, so its newest return turn warns.
+  assert.ok(expired.cards[0].chips.some((chip) => chip.warnings?.some((warning) => warning.scope === 'cache-expiry')));
   const readme = readmePayload('cost') as typeof main;
   assert.ok(readme.cards[0].chips.find((chip) => chip.metric === 'cost')!.warnings!.some((warning) => warning.scope === 'cache-expiry'));
   assert.equal(DEMO_DEFAULT_EXPIRY.returns.length, 1);
@@ -719,6 +720,32 @@ test('default demo history keeps distinct turns and provider-scoped expiry evide
   assert.ok(dispatched, 'turn cost detail omits the dispatched child');
   assert.equal(dispatched.value, formatCost(childDollars), 'dispatched detail has the wrong cost');
   assert.ok(Math.abs(dollars - own - childDollars) < 1e-9, 'dispatched usage was omitted or counted twice');
+});
+
+test('demo samples reach each cost popover state', () => {
+  type Demo = { cards: TurnCard[]; stats: Record<string, SessionStatChip[]> };
+  const sessionCost = (id: string) => (demoPayload(id) as Demo).stats[id].find((chip) => chip.metric === 'cost')!.detailList!.cost!;
+  const turnChip = (id: string, metric: string) => (demoPayload(id) as Demo).cards[0].chips.find((chip) => chip.metric === metric)!.detailList!;
+  const tools = (id: string) => turnChip(id, 'cost').cost!.tabs.find((tab) => tab.name === 'Tools');
+  const claude = tools('arc-read-state');
+  assert.ok(claude, 'the Claude turn has no Tools tab');
+  assert.equal(claude.parts.length, 2, 'the Claude turn lacks a Tools section');
+  assert.ok(claude.parts.every((part) => part.rows.length), 'the Claude turn lacks tool rows in a section');
+  // The arc-read-state turn holds all of that session's delegated work, so both popovers show the same Delegated tool rows.
+  const claudeSession = sessionCost('arc-read-state').tabs.find((tab) => tab.name === 'Tools');
+  assert.deepEqual(claudeSession?.parts[1]?.rows, claude.parts[1].rows, 'the session and turn price delegated tool results differently');
+  assert.equal(tools('arc-codex-read-state')?.parts[1].empty, 'No tool results');
+  const codex = sessionCost('arc-codex-read-state');
+  assert.match(codex.warnings[0].text, /^Waiting on subagents took \$\d+\.\d\d$/);
+  assert.ok(demoSessionCostParts('arc-read-state').every((part) => !part.waits), 'the Claude session carries wait data');
+  assert.ok(turnChip('arc-read-state', 'cost').cost!.tabs[0].parts[1].more?.open.startsWith('View '));
+  const delegated = sessionCost('delegated-cost');
+  assert.notEqual(delegated.sections[0].facts?.warning, undefined, 'the main share is not amber');
+  assert.notEqual(delegated.sections[1].facts?.warning, undefined, 'the Delegated share is not amber');
+  assert.ok(delegated.warnings.some((warning) => warning.text.startsWith('Low cache reuse in this session')));
+  assert.ok(delegated.warnings.some((warning) => warning.text.includes('Low cache reuse in delegated work')));
+  assert.match(delegated.warnings.find((warning) => warning.text.includes('cache expir'))?.quiet ?? '', /^\d+% of the total$/);
+  assert.ok(turnChip('arc-read-state', 'context').entries.some((entry) => entry.label === 'Subagent results'));
 });
 
 test('demo session costs retain usage details and count compaction estimates once', () => {

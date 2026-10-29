@@ -2,12 +2,13 @@
   "models": [
     {
       "value": "default",
-      "resolvedModel": "claude-sonnet-5-5",
+      "resolvedModel": "claude-opus-5-5",
       "displayName": "Default (recommended)",
-      "description": "Sonnet 5.5 · Efficient for routine tasks",
+      "description": "Opus 5.5 · Best for everyday, complex tasks",
       "supportsEffort": true,
       "supportedEffortLevels": ["low", "medium", "high", "xhigh", "max"],
       "supportsAdaptiveThinking": true,
+      "supportsFastMode": true,
       "supportsAutoMode": true,
       "supportsThinkingOff": false
     },
