@@ -4841,6 +4841,11 @@ export function remoteControlNotice(result: RemoteControlOutcome): { level: 'inf
             ? 'Arc: Claude Code reports that Remote Control is not available for this account or setup.'
             : 'Arc: this Claude Code version did not report Remote Control support. Update Claude Code to use /remote-control.',
       };
+    case 'policy':
+      return {
+        level: 'warning',
+        text: 'Arc: Remote Control is not available for a session that runs with fixed read-only permissions.',
+      };
     case 'arguments':
       return { level: 'warning', text: 'Arc: send /remote-control or /rc by itself, with nothing after it.' };
     case 'draft':

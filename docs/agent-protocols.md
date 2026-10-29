@@ -40,7 +40,7 @@ Positive model turns establish participating model completion. A zero-model resu
 
 ## Claude Remote Control
 
-`remote_control` sends an `enabled` boolean and starts no turn. Require `remote_control_available: true` in initialize. Ignore auto-enable fields. The toggle uses only this window's live Claude child. Refuse drafts and absent children. Send the toggle to agent runs and to children with fixed read-only permissions like any other child. Start no child for a toggle.
+`remote_control` sends an `enabled` boolean and starts no turn. Require `remote_control_available: true` in initialize. Ignore auto-enable fields. The toggle uses only this window's live Claude child. Refuse drafts, absent children, and fixed read-only policies. Send the toggle to agent runs like any other child. Start no child for a toggle.
 
 Enable replies carry `session_url`, `connect_url`, `bridge_epoch`, and `bridge_session_id`. Retain the epoch for failure matching. Bridge identity never replaces local identity. Disable replies carry no fields. Errors retain prior state. [Prompt delivery](prompt-delivery.md#local-controls) owns link presentation.
 
@@ -128,7 +128,7 @@ Account-read ownership and deadlines remain independent of catalogs, commands, a
 
 Codex starts, resumes, forks, and turns with approval `never`, reviewer `user`, and a read-only sandbox. Threads use `read-only`, while turns use `readOnly`. Provider rejection prevents input. The sandbox denies filesystem writes and establishes no denial of external MCP effects.
 
-Claude disables permission prompts, user/project/local setting sources, and hooks. It isolates MCP configuration and allows Read, Grep, and Glob. [`claudeReadOnlyArgs`](../extension/src/launchpolicy.ts) owns the complete denied tool and git-command lists. Plain read-only launches deny PowerShell. Bash uses auto mode on supported models and `dontAsk` otherwise. Auto mode can approve shell writes, so Claude provides no filesystem immutability guarantee. A Remote Control client can change the permission mode of a running child. Claude refuses `bypassPermissions` because the launch omits `--dangerously-skip-permissions`. A switch from `dontAsk` to `acceptEdits` lets Bash write files. Claude reports the new mode in a `status` message and in the `init` message of the next turn.
+Claude disables permission prompts, user/project/local setting sources, and hooks. It isolates MCP configuration and allows Read, Grep, and Glob. [`claudeReadOnlyArgs`](../extension/src/launchpolicy.ts) owns the complete denied tool and git-command lists. Plain read-only launches deny PowerShell. Bash uses auto mode on supported models and `dontAsk` otherwise. Auto mode can approve shell writes, so Claude provides no filesystem immutability guarantee. A Remote Control client can change the permission mode of a running child. Claude refuses `bypassPermissions` because the launch omits `--dangerously-skip-permissions`. A switch from `dontAsk` to `acceptEdits` lets Bash write files. [Claude Remote Control](#claude-remote-control) refuses these children.
 
 Git denials cover exact verbs and arguments, optional `-C` directories, argument-bearing branch/notes/remote/tag operations, and `--output`. Keep the generated rules with their source lists. [Policy tests](../extension/src/launchpolicy.test.ts) cover isolated permissions and exact MCP reads.
 

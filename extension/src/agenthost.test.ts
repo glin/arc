@@ -12017,11 +12017,11 @@ test('archive retires a connected Remote Control child', async () => {
   assert.equal(child.ended, true);
 });
 
-test('a read-only launch policy leaves Remote Control to Claude', async () => {
+test('a read-only launch policy refuses Remote Control without a request', async () => {
   const timer = new FakeAgentHostTimer();
-  const { host, requests, toggle } = await remoteControlChild(timer, launchPolicy('claude', true));
-  assert.equal((await toggle({ session_url: 'https://example.test/s', bridge_epoch: 1 }))?.outcome, 'connected');
-  assert.equal(requests().length, 1, 'a read-only child did not receive the Remote Control request');
+  const { host, requests } = await remoteControlChild(timer, launchPolicy('claude', true));
+  assert.deepEqual(await host.remoteControl('one', () => {}), { outcome: 'policy' });
+  assert.equal(requests().length, 0);
   assert.equal(await host.remoteControl('missing', () => {}), null, 'a missing child must not start a process');
 });
 

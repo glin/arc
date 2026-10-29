@@ -43668,6 +43668,7 @@ test('the prompt box keeps Remote Control from a connected result until the conn
     { outcome: 'busy', state: 'disconnecting' },
     { outcome: 'uncertain' },
     { outcome: 'unsupported', available: false },
+    { outcome: 'policy' },
   ]) {
     await toggle('s1', result);
     assert.deepEqual(held(), { s1: { url: REMOTE_LINK } }, `${result.outcome} changed the connection`);
