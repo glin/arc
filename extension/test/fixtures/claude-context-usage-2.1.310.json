@@ -1,0 +1,175 @@
+{
+  "claudeCode": "2.1.310",
+  "reply": {
+    "categories": [
+      {
+        "id": "system_prompt",
+        "name": "System prompt",
+        "tokens": 3401,
+        "color": "promptBorder",
+        "kind": "used"
+      },
+      {
+        "id": "system_tools",
+        "name": "System tools",
+        "tokens": 12303,
+        "color": "inactive",
+        "kind": "used"
+      },
+      {
+        "id": "mcp_instructions",
+        "name": "MCP server instructions",
+        "tokens": 631,
+        "color": "green_FOR_SUBAGENTS_ONLY",
+        "kind": "used"
+      },
+      {
+        "id": "mcp_tools_deferred",
+        "name": "MCP tools (deferred)",
+        "tokens": 51429,
+        "color": "inactive",
+        "isDeferred": true,
+        "kind": "deferred"
+      },
+      {
+        "id": "system_tools_deferred",
+        "name": "System tools (deferred)",
+        "tokens": 22113,
+        "color": "inactive",
+        "isDeferred": true,
+        "kind": "deferred"
+      },
+      {
+        "id": "memory_files",
+        "name": "Memory files",
+        "tokens": 8892,
+        "color": "claude",
+        "kind": "used"
+      },
+      {
+        "id": "skills",
+        "name": "Skills",
+        "tokens": 9788,
+        "color": "warning",
+        "kind": "used"
+      },
+      {
+        "id": "messages",
+        "name": "Messages",
+        "tokens": 9829,
+        "color": "purple_FOR_SUBAGENTS_ONLY",
+        "kind": "used"
+      },
+      {
+        "id": "autocompact_buffer",
+        "name": "Autocompact buffer",
+        "tokens": 33000,
+        "color": "inactive",
+        "kind": "buffer"
+      },
+      {
+        "id": "free_space",
+        "name": "Free space",
+        "tokens": 922156,
+        "color": "promptBorder",
+        "kind": "free"
+      }
+    ],
+    "totalTokens": 44844,
+    "maxTokens": 1000000,
+    "rawMaxTokens": 1000000,
+    "autocompactSource": "model-default",
+    "percentage": 4,
+    "model": "claude-haiku-5-5",
+    "autoCompactThreshold": 967000,
+    "isAutoCompactEnabled": true,
+    "messageBreakdown": {
+      "toolCallTokens": 49,
+      "toolResultTokens": 26,
+      "attachmentTokens": 41440,
+      "assistantMessageTokens": 283,
+      "userMessageTokens": 25,
+      "redirectedContextTokens": 0,
+      "unattributedTokens": 0,
+      "toolCallsByType": [
+        {
+          "name": "Read",
+          "callTokens": 49,
+          "resultTokens": 26
+        }
+      ],
+      "attachmentsByType": [
+        {
+          "name": "prompt_snapshot",
+          "tokens": 22878
+        },
+        {
+          "name": "skill_listing",
+          "tokens": 8025
+        },
+        {
+          "name": "instructions",
+          "tokens": 6762
+        },
+        {
+          "name": "deferred_tools_delta",
+          "tokens": 1673
+        },
+        {
+          "name": "output_style_instructions",
+          "tokens": 608
+        },
+        {
+          "name": "mcp_instructions_delta",
+          "tokens": 516
+        },
+        {
+          "name": "agent_listing_delta",
+          "tokens": 441
+        },
+        {
+          "name": "hook_success",
+          "tokens": 122
+        },
+        {
+          "name": "environment",
+          "tokens": 103
+        },
+        {
+          "name": "session_context",
+          "tokens": 80
+        },
+        {
+          "name": "total_tokens_reminder",
+          "tokens": 69
+        },
+        {
+          "name": "model",
+          "tokens": 63
+        },
+        {
+          "name": "output_style",
+          "tokens": 48
+        },
+        {
+          "name": "advisor_tool",
+          "tokens": 22
+        },
+        {
+          "name": "credential_org",
+          "tokens": 21
+        },
+        {
+          "name": "date",
+          "tokens": 9
+        }
+      ]
+    },
+    "apiUsage": {
+      "input_tokens": 2,
+      "output_tokens": 10,
+      "cache_creation_input_tokens": 244,
+      "cache_read_input_tokens": 44598
+    }
+  }
+}

@@ -758,6 +758,7 @@
     ]
   },
   "scripts": {
+    "check:claude-context": "tsx scripts/claude-context-check.ts",
     "check:timeline": "tsx scripts/check-timeline.ts",
     "build": "node esbuild.mjs",
     "typecheck": "node ../scripts/test-suite.mjs extension-typecheck",

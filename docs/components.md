@@ -155,6 +155,7 @@ Paths are relative to `extension/src/`. [Architecture](architecture.md) owns pac
 | `promptassets.ts` | Prompt asset limits, descriptor normalization, media-type decisions including the plain-text check for unlisted extensions, staging paths, integrity validation, and staged-copy lifecycle | no |
 | `droppeduris.ts` | Drag type reading, `file:` URI to path conversion, path text in the path-completion format, image routing, and the `Add to Arc` argument shape | no |
 | `domain/context-detail.ts` | Separate native Claude and local Codex context normalization, provider-specific unavailable reason validation, bounded category and optional Claude message partition checks, category shares, aggregate-compatible demand reuse, and stale-demand release | no |
+| `domain/claude-context-check.ts` | The release check on a Claude Code context reply, run on stored replies by the default suite and on a fresh reply by `npm --prefix extension run check:claude-context`: missing message parts, new attachment kinds and message keys, the stored-reply scrub, and removal of the empty project folder its capture creates | no |
 | `contextframe.ts` | Claude context envelope identification and transport budgets | no |
 | `webview/export-host.ts` | Local host for captured pages, bounded decoding, navigation and read-only capabilities | no |
 | `webview/static-menu.ts` | Static editor-menu stand-in shared by the demo and captured pages | no |

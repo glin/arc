@@ -1,6 +1,8 @@
 import { normalizeContext, unavailableContext } from '../domain/context-detail.ts';
 import { test } from 'vitest';
 import assert from 'node:assert';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 test('response file citations retain their typed literal destination at the host boundary', () => {
   for (const path of ['C:/outside/file%20.csv#L10', '/outside/file:10']) {
@@ -962,6 +964,15 @@ test('context wire preserves valid Messages partitions and drops only invalid op
       detail: categories,
     });
   }
+});
+
+test('context wire keeps the Messages breakdown of a Claude Code 2.1.310 reply', () => {
+  const { reply } = JSON.parse(
+    readFileSync(join(__dirname, '../../test/fixtures/claude-context-usage-2.1.310.json'), 'utf8'),
+  );
+  const detail = normalizeContext(reply, CONTEXT_DETAIL);
+  assert.equal(detail.messageBreakdown?.length, 7);
+  assert.deepEqual(parseHostToPanel({ type: 'contextDetail', detail }), { type: 'contextDetail', detail });
 });
 
 test('context wire preserves the Claude no-source reason only for unavailable Claude detail', () => {

@@ -12,6 +12,17 @@ import {
   unavailableContext,
   type ContextIdentity,
 } from './context-detail';
+import {
+  attachmentKinds,
+  checkClaudeContextReply,
+  contextFixtureNames,
+  contextFixtureReply,
+  projectFolderNames,
+  removeCreatedProjectFolders,
+  scrubContextReply,
+  type ClaudeContextFixture,
+  type FolderSystem,
+} from './claude-context-check';
 
 const identity: ContextIdentity = {
   session: 's1',
@@ -92,8 +103,9 @@ test('optional Messages failures leave honest categories available instead of hi
     { ...messages(), toolCallTokens: 1.1 },
     { ...messages(), toolCallTokens: '15000' },
     { ...messages(), toolCallTokens: Number.MAX_SAFE_INTEGER },
-    { ...messages(), redirectedContextTokens: 0 },
-    { ...messages(), unattributedTokens: 999 },
+    { ...messages(), unattributedTokens: 1001 },
+    { ...messages(), attachmentsByType: null },
+    { ...messages(), attachmentsByType: [{ name: 'file', tokens: 3999 }] },
   ]) {
     const detail = normalizeContext({ ...native(), messageBreakdown }, identity);
     assert.equal(detail.status, 'available');
@@ -112,6 +124,183 @@ test('optional Messages failures leave honest categories available instead of hi
   ])
     assert.equal(validContextDetail({ ...detail, messageBreakdown }), false);
   assert.equal(validContextDetail({ ...detail, provider: 'codex' }), false);
+});
+
+const fixtures = path.join(__dirname, '../../test/fixtures');
+const usage = (name: string): ClaudeContextFixture => JSON.parse(fs.readFileSync(path.join(fixtures, name), 'utf8'));
+
+test('Claude Code 2.1.310 Messages drops attachments that repeat a category and leaves the rest unattributed', () => {
+  const { claudeCode, reply } = usage('claude-context-usage-2.1.310.json');
+  assert.equal(claudeCode, '2.1.310');
+  const detail = normalizeContext(reply, identity);
+  assert.equal(detail.status, 'available');
+  assert.deepEqual(Object.fromEntries(detail.messageBreakdown?.map((row) => [row.key, row.tokens]) ?? []), {
+    toolCallTokens: 49,
+    toolResultTokens: 26,
+    attachmentTokens: 3259,
+    assistantMessageTokens: 283,
+    userMessageTokens: 25,
+    redirectedContextTokens: 0,
+    unattributedTokens: 6187,
+  });
+  assert.equal(
+    detail.messageBreakdown?.reduce((sum, row) => sum + row.tokens, 0),
+    detail.categories.find((row) => row.key === 'Messages')?.tokens,
+  );
+  assert.equal(validContextDetail(detail), true);
+  const categories = reply.categories as { name: string; tokens: number }[];
+  const fields = reply.messageBreakdown as Record<string, unknown>;
+  const kinds = fields.attachmentsByType as { name: string; tokens: number }[];
+  const memory = categories.find((row) => row.name === 'Memory files')!.tokens;
+  const withMessages = (tokens: number, listed = categories) => ({
+    ...reply,
+    totalTokens: (reply.totalTokens as number) - 9829 + tokens,
+    categories: listed.map((row) => (row.name === 'Messages' ? { ...row, tokens } : row)),
+  });
+  const withKinds = (attachmentsByType: unknown) => ({ ...reply, messageBreakdown: { ...fields, attachmentsByType } });
+  const filler = (count: number) =>
+    Array.from({ length: count }, (_, index) => ({ name: `filler_${index}`, tokens: 0 }));
+  const parts = (changed: unknown) =>
+    Object.fromEntries(normalizeContext(changed, identity).messageBreakdown?.map((row) => [row.key, row.tokens]) ?? []);
+  // Raw parts that already sum to Messages keep Claude's figures.
+  const exact = parts(withMessages(41823));
+  assert.deepEqual([exact.attachmentTokens, exact.unattributedTokens], [41440, 0]);
+  // A reply without Memory files keeps the CLAUDE.md text in Attachments.
+  const unlisted = parts({
+    ...withMessages(
+      9829 + memory,
+      categories.filter((row) => row.name !== 'Memory files'),
+    ),
+    totalTokens: reply.totalTokens,
+  });
+  assert.equal(unlisted.attachmentTokens, 3259 + 6762);
+  assert.equal(parts(withKinds([...kinds, ...filler(64 - kinds.length)])).attachmentTokens, 3259);
+  for (const changed of [
+    withMessages(350),
+    withKinds(kinds.slice(1)),
+    withKinds([...kinds, kinds[0]]),
+    withKinds([...kinds, { name: kinds[0].name, tokens: 0 }]),
+    withKinds([...kinds, ...filler(65 - kinds.length)]),
+    { ...reply, messageBreakdown: Object.fromEntries(Object.keys(messages()).map((key) => [key, 0])) },
+  ]) {
+    const refused = normalizeContext(changed, identity);
+    assert.equal(refused.status, 'available');
+    assert.equal(refused.messageBreakdown, undefined);
+  }
+});
+
+test('stored Claude context replies pass the release check that a fresh reply runs', () => {
+  const names = contextFixtureNames(fs.readdirSync(fixtures));
+  assert.ok(names.includes('claude-context-usage-2.1.310.json'));
+  const stored = names.map(usage);
+  const known = new Set(stored.flatMap(({ reply }) => attachmentKinds(reply)));
+  for (const { claudeCode, reply } of stored) {
+    const check = checkClaudeContextReply(reply, known);
+    assert.deepEqual(
+      [claudeCode, check.failures, check.newAttachmentKinds, check.newMessageKeys],
+      [claudeCode, [], [], []],
+    );
+    assert.deepEqual(scrubContextReply({ ...reply, path: 'C:/private' }, reply), reply);
+  }
+  const fresh = { ...stored[0].reply, messageBreakdown: { attachmentsByType: [{ name: 'new_kind', tokens: 1 }] } };
+  const check = checkClaudeContextReply(fresh, known);
+  assert.equal(check.failures.length, 2);
+  assert.deepEqual(check.newAttachmentKinds, ['new_kind']);
+  const template = stored[0].reply;
+  const fields = template.messageBreakdown as Record<string, unknown>;
+  const added = { ...template, path: 'C:/private', messageBreakdown: { ...fields, skillTokens: 12 } };
+  assert.deepEqual(checkClaudeContextReply(added, known).newMessageKeys, ['skillTokens']);
+  assert.deepEqual(contextFixtureReply(added, template), { ...template, messageBreakdown: added.messageBreakdown });
+});
+
+test('the release check removes only an empty project folder that its capture created', () => {
+  // A simulated filesystem with each platform's case rule. Every reached path must be a fixture path.
+  const simulate = (platform: string, tree: Record<string, 'dir' | 'link'>) => {
+    const fold = (target: string) => (platform === 'linux' ? target : target.toLowerCase());
+    const separator = platform === 'win32' ? '\\' : '/';
+    const nodes = new Map(Object.entries(tree).map(([target, kind]) => [fold(target), { target, kind }]));
+    const unmapped: string[] = [];
+    const parent = (target: string) => target.slice(0, target.lastIndexOf(separator));
+    const children = (target: string) =>
+      [...nodes.values()]
+        .filter((node) => fold(parent(node.target)) === fold(target))
+        .map((node) => node.target.slice(node.target.lastIndexOf(separator) + 1));
+    const directory = (target: string) => nodes.get(fold(target))?.kind === 'dir';
+    const folders: FolderSystem = {
+      lstat: (target) => {
+        const node = nodes.get(fold(target));
+        if (!node) unmapped.push(target);
+        return node ? { isDirectory: () => node.kind === 'dir' } : null;
+      },
+      readdir: (target) => {
+        if (!directory(target)) throw new Error(`Read outside a fixture directory: ${target}`);
+        return children(target);
+      },
+      rmdir: (target) => {
+        if (!directory(target) || children(target).length)
+          throw new Error(`Removed a full or absent folder: ${target}`);
+        nodes.delete(fold(target));
+      },
+    };
+    return { folders, unmapped, remaining: () => [...nodes.values()].map((node) => node.target).sort() };
+  };
+  const platforms = {
+    win32: { root: 'C:\\Users\\Ann\\.claude\\projects', slug: 'C--Tmp-Arc-X', variant: 'c--tmp-arc-x' },
+    darwin: { root: '/Users/Ann/.claude/projects', slug: '-Tmp-Arc-X', variant: '-tmp-arc-x' },
+    linux: { root: '/home/Ann/.claude/projects', slug: '-Tmp-Arc-X', variant: '-tmp-arc-x' },
+  };
+  // The folder names each platform removes, and the folder names it keeps for their content.
+  const expected: Record<keyof typeof platforms, Record<string, [string[], string[]]>> = {
+    win32: {
+      exact: [['C--Tmp-Arc-X'], []],
+      mixedCase: [['c--tmp-arc-x'], []],
+      existing: [[], []],
+      linkedChild: [[], ['C--Tmp-Arc-X']],
+      linkedProjects: [[], []],
+    },
+    darwin: {
+      exact: [['-Tmp-Arc-X'], []],
+      mixedCase: [['-tmp-arc-x'], []],
+      existing: [[], []],
+      linkedChild: [[], ['-Tmp-Arc-X']],
+      linkedProjects: [[], []],
+    },
+    linux: {
+      exact: [['-Tmp-Arc-X'], []],
+      mixedCase: [[], []],
+      existing: [[], []],
+      linkedChild: [[], ['-Tmp-Arc-X']],
+      linkedProjects: [[], []],
+    },
+  };
+  for (const [platform, { root, slug, variant }] of Object.entries(platforms)) {
+    const separator = platform === 'win32' ? '\\' : '/';
+    const at = (...names: string[]) => [root, ...names].join(separator);
+    const scenes: Record<string, { tree: Record<string, 'dir' | 'link'>; before: boolean }> = {
+      exact: { tree: { [root]: 'dir', [at(slug)]: 'dir', [at(slug, 'memory')]: 'dir' }, before: false },
+      mixedCase: { tree: { [root]: 'dir', [at(variant)]: 'dir', [at(variant, 'memory')]: 'dir' }, before: false },
+      existing: { tree: { [root]: 'dir', [at(slug)]: 'dir', [at(slug, 'memory')]: 'dir' }, before: true },
+      linkedChild: { tree: { [root]: 'dir', [at(slug)]: 'dir', [at(slug, 'memory')]: 'link' }, before: false },
+      linkedProjects: { tree: { [root]: 'link' }, before: false },
+    };
+    for (const [scene, { tree, before }] of Object.entries(scenes)) {
+      const { folders, unmapped, remaining } = simulate(platform, tree);
+      const existing = before ? projectFolderNames(folders, root, slug, platform) : [];
+      const result = removeCreatedProjectFolders(folders, root, slug, platform, existing);
+      const [removed, kept] = expected[platform as keyof typeof platforms][scene];
+      const label = `${platform} ${scene}`;
+      assert.deepEqual(result, { removed: removed.map((name) => at(name)), kept: kept.map((name) => at(name)) }, label);
+      const gone = new Set(removed.flatMap((name) => [at(name), at(name, 'memory')]));
+      assert.deepEqual(
+        remaining(),
+        Object.keys(tree)
+          .filter((target) => !gone.has(target))
+          .sort(),
+        label,
+      );
+      assert.deepEqual(unmapped, [], label);
+    }
+  }
 });
 
 test('Claude no-source reason belongs only to unavailable Claude detail', () => {

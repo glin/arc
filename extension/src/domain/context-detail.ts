@@ -18,7 +18,7 @@ export interface ContextCategory {
   relationship: 'used';
 }
 
-const MESSAGE_FIELDS = [
+export const MESSAGE_FIELDS = [
   ['toolCallTokens', 'Tool calls'],
   ['toolResultTokens', 'Tool results'],
   ['attachmentTokens', 'Attachments'],
@@ -27,6 +27,20 @@ const MESSAGE_FIELDS = [
   ['redirectedContextTokens', 'Redirected context'],
   ['unattributedTokens', 'Unattributed'],
 ] as const;
+
+// Claude's attachment estimate includes these kinds, which Messages does not hold.
+// Attachments drops each kind whose category the reply lists.
+const REPEATED_ATTACHMENTS: ReadonlyMap<string, string> = new Map([
+  // Claude records a copy of the system prompt as an attachment. The request does not send that copy,
+  // so used context does not include it.
+  ['prompt_snapshot', 'System prompt'],
+  // The skill names and descriptions, which Skills already counts.
+  ['skill_listing', 'Skills'],
+  // The CLAUDE.md text, which Memory files already counts.
+  ['instructions', 'Memory files'],
+  // The MCP server instructions, which MCP server instructions already counts.
+  ['mcp_instructions_delta', 'MCP server instructions'],
+]);
 
 export interface ContextMessage {
   key: (typeof MESSAGE_FIELDS)[number][0];
@@ -142,12 +156,8 @@ export function normalizeContext(payload: unknown, identity: ContextIdentity, ca
   const messages = categories.find((row) => row.key === 'Messages');
   const breakdown = raw.messageBreakdown;
   let messageBreakdown: ContextMessage[] | undefined;
-  if (messages && breakdown && typeof breakdown === 'object') {
-    const fields = breakdown as Record<string, unknown>;
-    const rows = MESSAGE_FIELDS.map(([key, name]) => ({ key, name, tokens: fields[key] }));
-    const sum = rows.reduce((total, row) => total + (contextNumber(row.tokens) ? row.tokens : NaN), 0);
-    if (contextNumber(sum) && sum === messages.tokens) messageBreakdown = rows as ContextMessage[];
-  }
+  if (messages && breakdown && typeof breakdown === 'object')
+    messageBreakdown = claudeMessages(breakdown as Record<string, unknown>, messages.tokens, categories);
   return {
     ...identity,
     model: raw.model,
@@ -161,6 +171,57 @@ export function normalizeContext(payload: unknown, identity: ContextIdentity, ca
     categories,
     ...(messageBreakdown ? { messageBreakdown } : {}),
   };
+}
+
+// Claude reports Messages as used context minus the other categories, and its parts as separate estimates.
+// Parts that already sum to Messages stay as Claude reports them. Otherwise Attachments drops the kinds
+// in `REPEATED_ATTACHMENTS`, and Unattributed takes the rest of Messages.
+function claudeMessages(
+  fields: Record<string, unknown>,
+  total: number,
+  categories: readonly ContextCategory[],
+): ContextMessage[] | undefined {
+  const rows: ContextMessage[] = [];
+  for (const [key, name] of MESSAGE_FIELDS) {
+    const tokens = fields[key];
+    if (!contextNumber(tokens)) return undefined;
+    rows.push({ key, name, tokens });
+  }
+  const attachments = rows.find((row) => row.key === 'attachmentTokens')!;
+  const repeated = repeatedAttachmentTokens(fields.attachmentsByType, attachments.tokens, categories);
+  if (repeated === undefined) return undefined;
+  const raw = rows.reduce((value, row) => value + row.tokens, 0);
+  if (!contextNumber(raw)) return undefined;
+  if (raw === total) return rows;
+  attachments.tokens -= repeated;
+  const sum = raw - repeated;
+  if (sum > total) return undefined;
+  // A breakdown that names no part except Unattributed explains nothing about Messages.
+  if (rows.every((row) => row.key === 'unattributedTokens' || row.tokens === 0)) return undefined;
+  rows.find((row) => row.key === 'unattributedTokens')!.tokens += total - sum;
+  return rows;
+}
+
+function repeatedAttachmentTokens(
+  value: unknown,
+  attachments: number,
+  categories: readonly ContextCategory[],
+): number | undefined {
+  if (value === undefined) return 0;
+  if (!Array.isArray(value) || value.length > CONTEXT_ROWS * 2) return undefined;
+  const names = new Set<string>();
+  let sum = 0;
+  let repeated = 0;
+  for (const entry of value) {
+    if (!entry || typeof entry !== 'object') return undefined;
+    const { name, tokens } = entry as Record<string, unknown>;
+    if (!contextString(name) || !contextNumber(tokens) || names.has(name)) return undefined;
+    names.add(name);
+    sum += tokens;
+    const category = REPEATED_ATTACHMENTS.get(name);
+    if (category && categories.some((row) => row.key === category)) repeated += tokens;
+  }
+  return contextNumber(sum) && sum === attachments ? repeated : undefined;
 }
 
 function normalizeCodexContext(payload: unknown, identity: ContextIdentity, capturedAt: number): ContextDetail {
