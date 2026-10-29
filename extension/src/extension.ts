@@ -813,6 +813,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     arch: process.arch,
     node: process.execPath,
     exists: (p: string) => fs.existsSync(p),
+    // Keep this regular-file and POSIX permission check aligned with cli/src/run.ts and bundledsetup.ts.
     canExecute: (p: string) => {
       try {
         if (!fs.statSync(p).isFile()) {

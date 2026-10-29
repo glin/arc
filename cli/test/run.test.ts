@@ -138,6 +138,137 @@ const transcriptTime = '2026-01-01T00:00:00Z';
 function withProvider(args: string[], provider: string) {
   return args.map((value, index) => (index === 0 ? provider : value));
 }
+
+test.each(['darwin', 'linux', 'win32'] as const)(
+  'agent executable discovery uses regular files and platform permissions on %s',
+  async (platform) => {
+    const original = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const { home, args } = fixture();
+    const paths = platform === 'win32' ? path.win32 : path.posix;
+    const root = platform === 'win32' ? 'Z:\\MiXeD' : '/MiXeD';
+    const virtualHome = paths.join(root, 'Home');
+    const first = paths.join(root, 'First');
+    const second = paths.join(root, 'Second');
+    const namespace = path.join(home, 'filesystem');
+    const unmapped: string[] = [];
+    const denied = new Set<string>();
+    const links = new Map<string, string>();
+    const key = (value: string) =>
+      platform === 'win32' ? paths.normalize(value).toLowerCase() : paths.normalize(value);
+    const mapped = (value: fs.PathLike) => {
+      const text = String(value);
+      const target = links.get(key(text));
+      if (target) return target;
+      const relative = paths.relative(paths.parse(root).root, text);
+      if (
+        key(text) === key(paths.parse(root).root) ||
+        key(text)
+          .toLowerCase()
+          .startsWith(key(root).toLowerCase() + paths.sep) ||
+        key(text) === key(root) ||
+        (platform !== 'win32' && (text.startsWith('/usr/') || text.startsWith('/bin/')))
+      ) {
+        return path.join(
+          namespace,
+          ...key(relative)
+            .split(paths.sep)
+            .filter(Boolean)
+            .map((part) => Buffer.from(part).toString('hex')),
+        );
+      }
+      const owned = path.relative(home, text);
+      if (owned === '' || (!path.isAbsolute(owned) && owned !== '..' && !owned.startsWith('..' + path.sep)))
+        return text;
+      unmapped.push(text);
+      throw new Error(`Unmapped fixture path: ${text}`);
+    };
+    const command = (directory: string, agent: string) =>
+      paths.join(directory, agent + (platform === 'win32' ? '.exe' : ''));
+    const file = (candidate: string) => {
+      const physical = mapped(candidate);
+      original.mkdirSync(path.dirname(physical), { recursive: true });
+      original.writeFileSync(physical, 'agent command');
+      original.chmodSync(physical, 0o755);
+      return physical;
+    };
+    for (const agent of ['claude', 'codex']) {
+      file(command(first, agent));
+      file(command(second, agent));
+      file(command(paths.join(virtualHome, '.local', 'bin'), agent));
+    }
+    vi.mocked(os.homedir).mockReturnValue(virtualHome);
+    vi.spyOn(fs, 'existsSync').mockImplementation((target) => original.existsSync(mapped(target)));
+    vi.mocked(fs.statSync).mockImplementation((target, ...rest) =>
+      Reflect.apply(original.statSync, original, [mapped(target), ...rest]),
+    );
+    vi.spyOn(fs, 'accessSync').mockImplementation((target, mode) => {
+      if (denied.has(key(String(target))) && mode === fs.constants.X_OK)
+        throw Object.assign(new Error('Not executable'), { code: 'EACCES' });
+      original.accessSync(mapped(target), mode);
+    });
+    vi.spyOn(fs, 'readFileSync').mockImplementation((target, ...rest) =>
+      Reflect.apply(original.readFileSync, original, [typeof target === 'number' ? target : mapped(target), ...rest]),
+    );
+    const env = {
+      HOME: home,
+      USERPROFILE: home,
+      CODEX_HOME: home,
+      CLAUDE_CONFIG_DIR: home,
+      ARC_PROJECTS_ROOT: home,
+      ARC_CODEX_ROOT: home,
+      ARC_CLAUDE_BILLING_LABEL: 'omit',
+      APPDATA: paths.join(virtualHome, 'Roaming'),
+      PATH: [first, second].join(platform === 'win32' ? ';' : ':'),
+    };
+    try {
+      for (const agent of ['claude', 'codex']) {
+        const parse = (extra: NodeJS.ProcessEnv = {}) =>
+          parseRun(withProvider(args, agent), { ...env, ...extra }, platform).options.command;
+        const firstCommand = command(first, agent);
+        const secondCommand = command(second, agent);
+        assert.equal(parse(), firstCommand);
+        const local = command(paths.join(virtualHome, '.local', 'bin'), agent);
+        const lowerFirst = first.toLowerCase();
+        assert.equal(parse({ PATH: lowerFirst }), platform === 'win32' ? command(lowerFirst, agent) : local);
+        assert.equal(
+          parse({ [agent === 'claude' ? 'CLAUDE_BIN' : 'CODEX_BIN']: '/explicit/agent' }),
+          '/explicit/agent',
+        );
+        denied.add(key(firstCommand));
+        assert.equal(parse(), platform === 'win32' ? firstCommand : secondCommand);
+        denied.clear();
+        original.unlinkSync(mapped(firstCommand));
+        original.mkdirSync(mapped(firstCommand));
+        assert.equal(parse(), secondCommand, 'An executable directory must not hide the next command.');
+        assert.equal(parse({ PATH: '' }), agent === 'codex' && platform === 'win32' ? agent : local);
+        denied.add(key(local));
+        assert.equal(parse({ PATH: '' }), platform === 'win32' && agent === 'claude' ? local : agent);
+        denied.clear();
+        original.unlinkSync(mapped(local));
+        assert.equal(parse({ PATH: '' }), agent);
+        original.mkdirSync(mapped(local));
+        assert.equal(parse({ PATH: '' }), agent);
+      }
+      if (platform !== 'win32') {
+        const local = command(paths.join(virtualHome, '.local', 'bin'), 'codex');
+        original.rmdirSync(mapped(local));
+        const target = file(paths.join(virtualHome, 'packages', 'current', 'bin', 'codex'));
+        if (process.platform === 'win32') {
+          // Windows file symlinks require extra privileges. Resolve the fixture's POSIX link before the real filesystem read.
+          links.set(key(local), target);
+        } else {
+          original.symlinkSync(target, mapped(local), 'file');
+        }
+        assert.equal(parseRun(args, { ...env, PATH: '/usr/bin:/bin' }, platform).options.command, local);
+        original.unlinkSync(target);
+        assert.equal(parseRun(args, { ...env, PATH: '/usr/bin:/bin' }, platform).options.command, 'codex');
+      }
+    } finally {
+      assert.deepEqual(unmapped, [], 'Every filesystem read must stay in the owned fixture.');
+    }
+  },
+);
+
 function admit(
   receipts: DispatchReceipts,
   standalone: StandaloneOptions,

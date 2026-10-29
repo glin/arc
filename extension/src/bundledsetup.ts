@@ -27,6 +27,7 @@ async function setup(): Promise<void> {
     arch: process.arch,
     node: process.execPath,
     exists: fs.existsSync,
+    // Keep this regular-file and POSIX permission check aligned with cli/src/run.ts and extension.ts.
     canExecute: (file) => {
       try {
         fs.accessSync(file, process.platform === 'win32' ? fs.constants.F_OK : fs.constants.X_OK);

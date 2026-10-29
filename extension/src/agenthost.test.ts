@@ -3808,6 +3808,69 @@ test('a child that never started says so instead of hanging the handshake', asyn
   assert.match(session.state().lastError ?? '', /could not start/);
 });
 
+test.each(['claude', 'codex'] as const)(
+  'a missing %s command names its path setting and retains failure cleanup',
+  async (agent) => {
+    const { host, children, states } = fakeHost();
+    const plan =
+      agent === 'claude' ? claudePlan(CLAUDE, { cwd: WS }) : codexPlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT });
+    const opening = host.session('missing', plan);
+    children[0].fail(Object.assign(new Error(`spawn ${agent} ENOENT`), { code: 'ENOENT' }));
+    const session = await opening;
+    const message = session.state().lastError ?? '';
+    assert.match(message, new RegExp(agent === 'claude' ? 'Claude Code' : 'Codex'));
+    assert.ok(message.includes(`arc.${agent}Path`));
+    assert.match(message, /session folder/);
+    assert.match(message, /executable/);
+    assert.match(message, /ENOENT/);
+    assert.equal(session.state().exited, true);
+    assert.equal(session.state().busy, false);
+    assert.equal(session.state().ready, false);
+    assert.ok(states.some((state) => state.exited && state.lastError?.includes(`arc.${agent}Path`)));
+    assert.equal(children[0].ended, true);
+    children[0].close();
+    await session.dispose();
+    host.dispose();
+  },
+);
+
+test('a missing session folder with an existing executable keeps both startup checks in the failure', async () => {
+  const cwd = path.join(tempDir('missing-agent-folder-'), 'absent');
+  assert.equal(fs.statSync(process.execPath).isFile(), true);
+  assert.equal(fs.existsSync(cwd), false);
+  const child = new FakeChild();
+  const plan = codexPlan({ command: process.execPath, leadingArgs: [], env: {} }, { cwd, clientInfo: CODEX_CLIENT });
+  const session = new AgentSession(
+    'missing-folder',
+    plan,
+    () => child,
+    () => {},
+    () => {},
+  );
+  const opening = session.start();
+  child.fail(Object.assign(new Error(`spawn ${process.execPath} ENOENT`), { code: 'ENOENT' }));
+  await opening;
+  const message = session.state().lastError ?? '';
+  assert.match(message, /Codex/);
+  assert.match(message, /session folder/);
+  assert.match(message, /arc\.codexPath/);
+  assert.ok(message.includes(process.execPath));
+  child.close();
+  await session.dispose();
+});
+
+test('other startup errors retain their original details without missing-file guidance', async () => {
+  const { host, children } = fakeHost();
+  const opening = host.session('denied', claudePlan(CLAUDE, { cwd: WS }));
+  children[0].fail(Object.assign(new Error('spawn EACCES: permission denied'), { code: 'EACCES' }));
+  const session = await opening;
+  assert.match(session.state().lastError ?? '', /spawn EACCES: permission denied/);
+  assert.doesNotMatch(session.state().lastError ?? '', /arc\.claudePath|session folder/);
+  children[0].close();
+  await session.dispose();
+  host.dispose();
+});
+
 test('a failed spawn closes without an exit event and settles disposal', async () => {
   const { host, children } = fakeHost(undefined, undefined, { exitGraceMs: 20 });
   const opening = host.session('one', claudePlan(CLAUDE, { cwd: WS }));

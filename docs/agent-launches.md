@@ -14,7 +14,13 @@ Unavailable private tools refuse launch. Trusted remote children use commands on
 
 ## Launch selection
 
-[`composerview.ts`](../extension/src/composerview.ts) owns executable selection and fallbacks. Unix PATH search skips relative entries and nonexecutable files. Child working directories can differ from the host's.
+[`composerview.ts`](../extension/src/composerview.ts) owns executable selection for the panel and `arc run`. Explicit paths win, followed by the first supported PATH command, then a valid official editor extension binary. The panel reads `arc.claudePath` and `arc.codexPath`. `arc run` reads `CLAUDE_BIN` and `CODEX_BIN` and supplies no editor extension directory. Unix PATH search skips relative entries. Direct PATH executables, official extension binaries, and `~/.local/bin` commands must resolve to regular files. macOS and Linux also require execute permission. Child working directories can differ from the host's.
+
+After the extension binary, Codex checks `~/.local/bin/codex` on macOS and Linux. Windows checks the AppData npm native binary, then its package script. Claude checks `~/.local/bin/claude` on macOS and Linux, or `~/.local/bin/claude.exe` on Windows. Its next fallback is the Windows AppData npm package script. If no candidate qualifies, Arc uses bare `codex` or `claude`. Custom install directories require PATH or an explicit path. Arc does not change the inherited PATH for agent discovery or retry another executable after startup fails.
+
+Official Codex extension binaries use the current platform and x64 or ARM64 architecture. Official Claude extension binaries use the current platform and architecture. Linux also checks musl. Windows ARM64 also checks x64. Claude then checks the legacy native-binary layout. Arc skips invalid candidates within these layouts.
+
+A missing-file startup error names the agent and its panel path setting. It asks the reader to check both the executable and the session folder because either missing path produces this error.
 
 Windows npm batch shims cannot spawn directly without a shell. Resolve their package scripts and run them under `process.execPath`. VS Code's Electron binary requires `ELECTRON_RUN_AS_NODE`. Windows Codex packages prefer the platform binary and its launcher environment, avoiding a grandchild console window. Unsupported architectures use the JavaScript launcher.
 

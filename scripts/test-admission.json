@@ -5,9 +5,9 @@
     "matricesSha256": "5c419463cc072b57e206d07cd8051d33056647f9b2d637fdffd7c0105b53edd2"
   },
   "cli/test/run.test.ts": {
-    "reason": "Standalone workers must retain real output, exit, cancellation, receipt ownership, and recovery across process boundaries. Held readers must preserve one worker and one outcome after recovery. Exhausted replacement retries must retain the worker's terminal observation. Explicit tiers must reach attached and background argv on Windows, macOS, and Linux. A refused tier must reserve no receipt and start no worker.",
-    "cases": 112,
-    "matricesSha256": "4cd11e38cdd8924663c538810080d0ad6cf33cfca0cb8198397e87cb0b338cd9"
+    "reason": "Standalone workers must retain real output, exit, cancellation, receipt ownership, and recovery across process boundaries. Held readers must preserve one worker and one outcome after recovery. Exhausted replacement retries must retain the worker's terminal observation. Explicit tiers must reach attached and background argv on Windows, macOS, and Linux. A refused tier must reserve no receipt and start no worker. Agent discovery must reject directories and honor platform permissions with minimal PATH and competing commands. The added cases use filesystem fixtures without launching a process.",
+    "cases": 113,
+    "matricesSha256": "047ac168fcc88305509867848fc56fb4afe10bbd537ef1baa9e5f0657079abc4"
   },
   "cli/test/smoke.bundled-a.test.mjs": {
     "reason": "Compiled CLI commands must reach session reads, comments, and saved defaults through an authenticated window channel. Parent and provider help must avoid stdin, files, and window discovery.",
@@ -35,9 +35,9 @@
     "matricesSha256": "ee41bd99bc78c90d9caa53af20ec903968f2860939812170f9d5a393eede6a0c"
   },
   "extension/src/agenthost.test.ts": {
-    "reason": "A spawned agent must receive the activation window, editor executable, session token, and command search path. Self-compaction crosses native background settlement and workspace scope recovery. Initial naming must recheck ownership after host waits and serialize after reader renames. Native session skill admission must run before every live and idle construction and refuse actual policy for idle children without replacement or input. A Claude session whose running settings refuse Arc's plugins must reopen without them under the same session id and take the prompt. Live question recovery must block uncertain native writes. Remote Control results must follow a Claude clear, and an exited or retired child must take its connection with it. Independent session hooks must retain the selected environment and bypass neither personal skills nor native hook policy. Tier checks must await child exit after acceptance, refusal, timeout, and cancellation. Hosted tiers must survive two turns, clear, retirement, resume, and fork with read-only permissions. A withheld skill or hook must reach the diagnostics log.",
-    "cases": 328,
-    "matricesSha256": "088b68ec91e9b2be2aaa5db628a1a34d3f0169978187551bea95e3e681b63890"
+    "reason": "A spawned agent must receive the activation window, editor executable, session token, and command search path. Self-compaction crosses native background settlement and workspace scope recovery. Initial naming must recheck ownership after host waits and serialize after reader renames. Native session skill admission must run before every live and idle construction and refuse actual policy for idle children without replacement or input. A Claude session whose running settings refuse Arc's plugins must reopen without them under the same session id and take the prompt. Live question recovery must block uncertain native writes. Remote Control results must follow a Claude clear, and an exited or retired child must take its connection with it. Independent session hooks must retain the selected environment and bypass neither personal skills nor native hook policy. Tier checks must await child exit after acceptance, refusal, timeout, and cancellation. Hosted tiers must survive two turns, clear, retirement, resume, and fork with read-only permissions. A withheld skill or hook must reach the diagnostics log. Missing-command and missing-folder errors must retain both startup checks and failure cleanup. The added cases use child event fixtures.",
+    "cases": 331,
+    "matricesSha256": "95946ce63f8f484714af5934904cc3dc959d0971e649feda4a9285877cc0a616"
   },
   "extension/src/chrome.browser.test.ts": {
     "reason": "Panel controls must preserve native focus, keyboard handling, and browser event delivery.",

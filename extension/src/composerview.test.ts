@@ -485,7 +485,7 @@ test('a batch shim with no package behind it is reported, not started', () => {
   assert.match(launch.problem ?? '', /batch shim/);
 });
 
-test('nothing is guessed away from Windows, where a name on PATH starts on its own', () => {
+test('POSIX uses the local Claude command without guessing npm prefixes', () => {
   assert.deepEqual(claudeLaunch('', machine('linux')), { command: 'claude', leadingArgs: [], problem: null, env: {} });
   assert.deepEqual(claudeLaunch('', machine('linux', ['/home/g/.local/bin/claude'])), {
     command: '/home/g/.local/bin/claude',
@@ -497,10 +497,89 @@ test('nothing is guessed away from Windows, where a name on PATH starts on its o
 
   const anything: Machine = { ...machine('linux'), exists: () => true };
   assert.equal(npmPackageScript(anything, ['@openai', 'codex']), null);
-  // Codex also uses its PATH launcher outside Windows.
+  // Existence alone does not qualify a local Codex command.
 
   assert.deepEqual(codexLaunch('', anything), { command: 'codex', leadingArgs: [], problem: null, env: {} });
 });
+
+test.each(['darwin', 'linux'])(
+  'Codex finds its default standalone command with a minimal %s PATH and preserves selection priority',
+  (platform) => {
+    const local = '/home/g/.local/bin/codex';
+    const root = '/opt/editor';
+    const bundle = `${root}/bin/${platform === 'darwin' ? 'macos' : 'linux'}-x86_64/codex`;
+    const first = '/opt/current/codex';
+    const second = '/opt/older/codex';
+    const host = machine(platform, [local], 'x64', root, '', '/usr/bin:/bin');
+    assert.deepEqual(codexLaunch('', host), { command: local, leadingArgs: [], problem: null, env: {} });
+    const installed = machine(platform, [local, bundle, first, second], 'x64', root, '', '/opt/current:/opt/older');
+    assert.equal(codexLaunch('/chosen/codex', installed).command, '/chosen/codex');
+    assert.equal(codexLaunch('', installed).command, first);
+    assert.equal(codexLaunch('', { ...installed, pathEnv: '/usr/bin:/bin' }).command, bundle);
+    for (const state of ['missing', 'nonexecutable', 'directory']) {
+      const invalid = {
+        ...host,
+        exists: (candidate: string) => candidate === local && state !== 'missing',
+        canExecute: () => false,
+      };
+      assert.equal(codexLaunch('', invalid).command, 'codex', state);
+    }
+  },
+);
+
+test.each(['darwin', 'linux', 'win32'])(
+  'invalid native candidates cannot hide a later executable on %s',
+  (platform) => {
+    const separator = platform === 'win32' ? String.fromCharCode(92) : '/';
+    const join = (...parts: string[]) => parts.join(separator);
+    const root = platform === 'win32' ? 'C:\\editor' : '/opt/editor';
+    const home = machine(platform).homeDir;
+    const localClaude = join(home, '.local', 'bin', platform === 'win32' ? 'claude.exe' : 'claude');
+    const localCodex = join(home, '.local', 'bin', platform === 'win32' ? 'codex.exe' : 'codex');
+    const claudeBinary = join(
+      root,
+      'resources',
+      'native-binaries',
+      `${platform}-x64`,
+      platform === 'win32' ? 'claude.exe' : 'claude',
+    );
+    const legacyClaude = join(root, 'resources', 'native-binary', platform === 'win32' ? 'claude.exe' : 'claude');
+    const codexBinary = join(
+      root,
+      'bin',
+      `${platform === 'win32' ? 'windows' : platform === 'darwin' ? 'macos' : 'linux'}-x86_64`,
+      platform === 'win32' ? 'codex.exe' : 'codex',
+    );
+    const fallbackCodex = platform === 'win32' ? CODEX_NPM : localCodex;
+    const host = machine(
+      platform,
+      [claudeBinary, legacyClaude, localClaude, codexBinary, localCodex, CODEX_NPM, CLAUDE_NPM],
+      'x64',
+      root,
+      root,
+    );
+    for (const state of ['nonexecutable', 'directory']) {
+      const invalid = {
+        ...host,
+        canExecute: (candidate: string) => candidate === localClaude || candidate === localCodex,
+      };
+      assert.equal(claudeLaunch('', invalid).command, localClaude, state);
+      assert.equal(codexLaunch('', invalid).command, platform === 'win32' ? host.node : fallbackCodex, state);
+      assert.equal(
+        claudeLaunch('', { ...invalid, canExecute: () => false }).command,
+        platform === 'win32' ? host.node : 'claude',
+        state,
+      );
+    }
+    assert.equal(
+      claudeLaunch('', { ...host, canExecute: (candidate) => candidate === legacyClaude }).command,
+      legacyClaude,
+    );
+    if (platform === 'win32') {
+      assert.equal(codexLaunch('', machine(platform, [localCodex])).command, 'codex');
+    }
+  },
+);
 
 test('a batch shim is only a problem on Windows', () => {
   assert.equal(claudeLaunch('/home/g/bin/claude.cmd', machine('linux')).problem, null);

@@ -4223,7 +4223,7 @@ function extensionCodexBinary(machine: Machine): Launch | null {
   }
   const executable = machine.platform === 'win32' ? 'codex.exe' : 'codex';
   const binary = join(machine.platform, [machine.codexExtensionDir, 'bin', `${platform}-${arch}`, executable]);
-  return machine.exists(binary) ? { command: binary, leadingArgs: [], problem: null, env: {} } : null;
+  return machine.canExecute(binary) ? { command: binary, leadingArgs: [], problem: null, env: {} } : null;
 }
 
 // Find the Claude binary inside the official extension directory, including Linux musl and Windows ARM64 fallback paths.
@@ -4258,7 +4258,7 @@ function extensionClaudeBinary(machine: Machine): Launch | null {
     );
   }
   candidates.push(join(machine.platform, [machine.claudeExtensionDir, 'resources', 'native-binary', executable]));
-  const binary = candidates.find((candidate) => machine.exists(candidate));
+  const binary = candidates.find((candidate) => machine.canExecute(candidate));
   return binary ? { command: binary, leadingArgs: [], problem: null, env: {} } : null;
 }
 
@@ -4286,7 +4286,7 @@ export function claudeLaunch(configured: string, machine: Machine): Launch {
     'bin',
     machine.platform === 'win32' ? 'claude.exe' : 'claude',
   ]);
-  if (machine.exists(native)) {
+  if (machine.canExecute(native)) {
     return { command: native, leadingArgs: [], problem: null, env: {} };
   }
 
@@ -4298,8 +4298,7 @@ export function claudeLaunch(configured: string, machine: Machine): Launch {
   return { command: 'claude', leadingArgs: [], problem: null, env: {} };
 }
 
-// How to start the Codex app-server. The reader's setting wins, then the command on PATH,
-// then the official extension's program and standalone installs.
+// Codex uses the reader's setting, then PATH, the official extension, the POSIX local command, and Windows npm installs.
 export function codexLaunch(configured: string, machine: Machine): Launch {
   const set = configured.trim();
   if (set) {
@@ -4314,6 +4313,13 @@ export function codexLaunch(configured: string, machine: Machine): Launch {
   const extension = extensionCodexBinary(machine);
   if (extension) {
     return extension;
+  }
+
+  if (machine.platform !== 'win32') {
+    const native = join(machine.platform, [machine.homeDir, '.local', 'bin', 'codex']);
+    if (machine.canExecute(native)) {
+      return { command: native, leadingArgs: [], problem: null, env: {} };
+    }
   }
 
   const binary = codexBinary(machine);

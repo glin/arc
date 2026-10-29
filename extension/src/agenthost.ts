@@ -1313,7 +1313,16 @@ export class AgentSession {
       this.stderrTail = (this.stderrTail + String(chunk)).slice(-4000);
     });
 
-    this.child.on('error', (error) => this.finish(`the agent could not start: ${error.message}`));
+    this.child.on('error', (error) => {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        const name = plan.agent === 'claude' ? 'Claude Code' : 'Codex';
+        this.finish(
+          `${name} could not start. Check the session folder and the executable in arc.${plan.agent}Path. ${error.message}`,
+        );
+      } else {
+        this.finish(`the agent could not start: ${error.message}`);
+      }
+    });
     this.child.on('exit', (code, signal) => {
       this.childTerminated = true;
       out.flush();

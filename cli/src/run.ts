@@ -144,9 +144,11 @@ export function parseRun(args: string[], env = process.env, platform = process.p
     arch: process.arch,
     node: process.execPath,
     exists: fs.existsSync,
+    // Keep this regular-file and POSIX permission check aligned with extension.ts and bundledsetup.ts.
     canExecute: (file) => {
       try {
-        fs.accessSync(file, fs.constants.X_OK);
+        if (!fs.statSync(file).isFile()) return false;
+        if (platform !== 'win32') fs.accessSync(file, fs.constants.X_OK);
         return true;
       } catch {
         return false;
