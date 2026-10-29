@@ -412,6 +412,24 @@ export function frozenFixturePaths(root: string, raw: Record<string, string>, li
   return resolved;
 }
 
+// A recorded transcript path must sit inside the fixture, with no link on its way. The transcript itself can be
+// absent: a receipt can name a report that its agent never wrote, and Codex can archive a rollout that a record names.
+export function frozenReference(root: string, input: string): void {
+  const canonicalRoot = fs.realpathSync(root);
+  const lexical = path.resolve(canonicalRoot, input);
+  const rootIdentity = normalizeFsPath(canonicalRoot).replace(/\/$/, '');
+  if (!normalizeFsPath(lexical).startsWith(rootIdentity + '/'))
+    throw new Error(`Frozen input sits outside its fixture: ${input}`);
+  let ancestor = canonicalRoot;
+  for (const part of path.relative(canonicalRoot, lexical).split(path.sep)) {
+    ancestor = path.join(ancestor, part);
+    const stat = fs.lstatSync(ancestor, { throwIfNoEntry: false });
+    if (!stat) return;
+    if (stat.isSymbolicLink()) throw new Error(`Frozen input contains a link: ${ancestor}`);
+  }
+  frozenPath(root, input);
+}
+
 export function inputHashes(root: string, inputs: string[]): Record<string, string> {
   const canonicalRoot = fs.realpathSync(root);
   const hashes: Record<string, string> = {};
@@ -423,6 +441,20 @@ export function inputHashes(root: string, inputs: string[]): Record<string, stri
   };
   for (const input of inputs) walk(frozenPath(canonicalRoot, input));
   return hashes;
+}
+
+// Check every absolute transcript path that a JSON file of the fixture records. A receipt's logAlias names where a
+// launch writes its log. Arc reads it only to launch, which the measured editor blocks, and it can sit in the workspace
+// that launched the dispatch.
+export function checkFrozenReferences(root: string, hashes: Record<string, string>): void {
+  const check = (value: unknown, key?: string): void => {
+    if (typeof value === 'string' && path.isAbsolute(value) && value.endsWith('.jsonl')) {
+      if (key !== 'logAlias') frozenReference(root, value);
+    } else if (Array.isArray(value)) value.forEach((item) => check(item, key));
+    else if (value && typeof value === 'object') for (const [name, item] of Object.entries(value)) check(item, name);
+  };
+  for (const file of Object.keys(hashes).filter((name) => name.endsWith('.json')))
+    check(JSON.parse(fs.readFileSync(path.join(root, file), 'utf8')));
 }
 
 // The measured editor reads its own Arc home, so a fixture may sit in the Arc home's measure directory.
@@ -450,13 +482,7 @@ function loadFixture(manifest: string): void {
   if (fs.existsSync(path.join(fixture.workspace, '.git')))
     throw new Error('The frozen workspace must not resolve a live repository scope.');
   const hashes = inputHashes(root, [manifest, ...Object.values(fixture)]);
-  const checkReferences = (value: unknown): void => {
-    if (typeof value === 'string' && path.isAbsolute(value) && value.endsWith('.jsonl')) frozenPath(root, value);
-    else if (Array.isArray(value)) value.forEach(checkReferences);
-    else if (value && typeof value === 'object') Object.values(value).forEach(checkReferences);
-  };
-  for (const file of Object.keys(hashes).filter((name) => name.endsWith('.json')))
-    checkReferences(JSON.parse(fs.readFileSync(path.join(root, file), 'utf8')));
+  checkFrozenReferences(root, hashes);
   const scope = spawnSync('git', ['-C', fixture.workspace, 'rev-parse', '--show-toplevel'], { encoding: 'utf8' });
   if (scope.status === 0) throw new Error('The frozen workspace resolves a repository outside its fixture.');
   fs.writeFileSync(

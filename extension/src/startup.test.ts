@@ -293,6 +293,8 @@ import { renderRichMarkdown } from './richtext';
 import { measurementBuildPath, removeMeasurementTree } from '../scripts/panel-startup-measure/cleanup';
 import {
   frozenPath,
+  frozenReference,
+  checkFrozenReferences,
   frozenFixturePaths,
   inputHashes,
   sanitizeMeasurementState,
@@ -1247,9 +1249,13 @@ test('isolated startup removes pending agent actions and rejects external frozen
   fs.writeFileSync(path.join(root, 'source.jsonl'), '{}');
   assert.equal(frozenPath(root, 'source.jsonl'), path.join(root, 'source.jsonl'));
   assert.throws(() => frozenPath(root, external), /outside its fixture/);
+  frozenReference(root, path.join(root, 'codex', 'archived.jsonl'));
+  frozenReference(root, path.join(root, 'source.jsonl'));
+  assert.throws(() => frozenReference(root, path.join(external, 'absent.jsonl')), /outside its fixture/);
   fs.symlinkSync(external, path.join(root, 'linked'), process.platform === 'win32' ? 'junction' : 'dir');
   try {
     assert.throws(() => frozenPath(root, 'linked'), /link/);
+    assert.throws(() => frozenReference(root, path.join(root, 'linked', 'absent.jsonl')), /link/);
   } finally {
     if (process.platform === 'win32') fs.rmdirSync(path.join(root, 'linked'));
     else fs.unlinkSync(path.join(root, 'linked'));
@@ -1391,7 +1397,16 @@ test('a frozen catalog moves workspace sessions into the fixture and passes runn
   );
   const live = [source.projects, source.codex];
   const inputs = frozenFixturePaths(output, manifest, live);
+  // A record in the Codex root names a rollout that Codex archived, so the fixture holds only its placeholder.
+  const archived = path.join(output, 'codex', '2026', '10', '01', 'rollout-archived.jsonl');
+  const outsideLog = path.join(source.root, 'launch-log.jsonl');
+  const recordFile = path.join(output, 'codex', 'record.json');
+  fs.writeFileSync(recordFile, JSON.stringify({ rollout: archived, standalone: { logAlias: outsideLog } }));
   const hashes = inputHashes(output, [path.join(output, 'manifest.json'), ...Object.values(inputs)]);
+  checkFrozenReferences(output, hashes);
+  fs.writeFileSync(recordFile, JSON.stringify({ rollout: outsideLog }));
+  assert.throws(() => checkFrozenReferences(output, hashes), /outside its fixture/);
+  fs.writeFileSync(recordFile, JSON.stringify({ rollout: archived }));
   const sourceSpellings = [source.root, source.root.replace(/\\/g, '/'), source.root.replace(/\\/g, '\\\\')].map(
     (text) => text.toLowerCase(),
   );
