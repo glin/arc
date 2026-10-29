@@ -6320,9 +6320,9 @@ export function sessionCacheExpiryCondition(count: number, cost: Pick<CacheExpir
   return `${count} cache ${count === 1 ? 'expiry' : 'expiries'} added ${cost.status === 'atLeast' ? 'at least ' : ''}${formatCost(cost.dollars ?? 0) ?? ZERO_COST}`;
 }
 
-// The session cost popover's cache-expiry warning, from `CACHE_EXPIRY_SIGN_DOLLARS` of the main
-// session's and its children's expiries together, or null under it or when the cost is unavailable.
-// The quiet share of the total shows only when the cost and the total are both exact, because a
+// The session cost popover's cache-expiry warning, or null when the cost is unavailable or under
+// `CACHE_EXPIRY_SIGN_DOLLARS`. The cost counts the main session's and its children's expiries
+// together. The quiet share of the total shows only when the cost and the total are both exact. A
 // share of a lower bound is not a fact.
 function sessionCacheExpiryLead(
   count: number,
