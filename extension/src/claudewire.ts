@@ -9,6 +9,7 @@ import * as fs from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import {
   claudeNativeSkillSettingsRefusal,
+  SessionComponentsRefused,
   reportWithheld,
   type SessionComponentsWithheld,
   type SessionSkillRelease,
@@ -733,7 +734,7 @@ export class ClaudeWire {
           check: [...new Set([skill, hooks].filter(Boolean))].join(' '),
         });
       // The plan's refresh records its own refusal with the check that failed.
-      if (skill || hooks || !this.sessionSkills?.refresh()) throw new Error(refusal);
+      if (skill || hooks || !this.sessionSkills?.refresh()) throw new SessionComponentsRefused(refusal);
     } catch (error) {
       this.skillFailure = error instanceof Error ? error : new Error(String(error));
       this.emit({ kind: 'commands', commands: [], optionalOnly: true });

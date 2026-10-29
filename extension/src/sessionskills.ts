@@ -42,6 +42,10 @@ export interface SessionComponentsWithheld {
 
 export const SESSION_COMPONENTS_WITHHELD = 'sessionComponentsWithheld';
 
+// A running Claude child refused the session plugins it loaded, after recording the refusal.
+// The child can still run the session once it starts again without those plugins.
+export class SessionComponentsRefused extends Error {}
+
 // Writes withheld session tools to the diagnostics log even when detailed logging is off.
 // The write runs after the current launch step, in the order the records arrive.
 export function sessionComponentsDiagnostics(
@@ -249,12 +253,83 @@ export function claudeNativeSkillSettingsRefusal(
   for (const source of value.sources) {
     if (
       !skillObject(source) ||
-      !['userSettings', 'projectSettings', 'localSettings', 'flagSettings'].includes(String(source.source))
+      !['userSettings', 'projectSettings', 'localSettings', 'flagSettings', 'policySettings'].includes(
+        String(source.source),
+      )
     )
       return 'unsupported-settings-layer';
-    const refusal = claudeSkillSettingsRefusal(source.settings, component, platform);
+    const refusal =
+      claudeSkillSettingsRefusal(source.settings, component, platform) ??
+      (source.source === 'policySettings'
+        ? claudePolicyKeyRefusal(source.settings as Record<string, unknown>)
+        : undefined);
     if (refusal) return `${String(source.source)}:${refusal}`;
   }
+  return undefined;
+}
+
+// Top-level managed policy keys that admit Arc's session plugins. The settings checks above still run on every
+// key, and `env` and `permissions` admit only the names below. Claude Code's settings reference lists managed-only
+// restrictions such as `strictKnownMarketplaces`, `blockedMarketplaces`, `strictPluginOnlyCustomization`,
+// `allowManagedHooksOnly`, and `allowManagedPermissionRulesOnly`. None of them is here, so each refuses.
+const reviewedPolicyKeys = new Set([
+  '$schema',
+  'env',
+  'permissions',
+  'disableAutoMode',
+  'model',
+  'availableModels',
+  'fallbackModel',
+  'effortLevel',
+  'cleanupPeriodDays',
+  'companyAnnouncements',
+  'includeCoAuthoredBy',
+  'attribution',
+  'forceLoginMethod',
+  'forceLoginOrgUUID',
+  'apiKeyHelper',
+  'otelHeadersHelper',
+  'autoUpdatesChannel',
+  'feedbackSurveyRate',
+]);
+// Permission subkeys that only widen access or limit permission modes. `deny`, `ask`, `defaultMode`, and
+// `blockReadsOutsideWorkingDirectories` can stop Arc's skill or tools, so they refuse.
+const reviewedPolicyPermissions = new Set([
+  'allow',
+  'additionalDirectories',
+  'disableBypassPermissionsMode',
+  'disableAutoMode',
+]);
+// Telemetry and error reporting variables from Claude Code's environment variable reference, matched by exact
+// name or by the prefixes below. Other variables can disable plugins, skills, hooks, transcripts, or snapshots, so a
+// policy that sets one refuses.
+const reviewedPolicyEnvironment = new Set([
+  'CLAUDE_CODE_ENABLE_TELEMETRY',
+  'DISABLE_TELEMETRY',
+  'DISABLE_ERROR_REPORTING',
+  'DO_NOT_TRACK',
+  'BETA_TRACING_ENDPOINT',
+  'ENABLE_BETA_TRACING_DETAILED',
+]);
+const reviewedPolicyEnvironmentPrefixes = ['OTEL_', 'CLAUDE_CODE_OTEL_'];
+
+// Names the first managed policy key outside the reviewed keys, as `unreviewed-policy-key:<key>`, or the first
+// policy variable outside the reviewed variables, as `unreviewed-policy-env:<name>`. Neither names a value.
+function claudePolicyKeyRefusal(settings: Record<string, unknown>): string | undefined {
+  for (const key of Object.keys(settings)) if (!reviewedPolicyKeys.has(key)) return `unreviewed-policy-key:${key}`;
+  if (settings.env !== undefined) {
+    if (!skillObject(settings.env)) return 'unreviewed-policy-key:env';
+    for (const name of Object.keys(settings.env))
+      if (
+        !reviewedPolicyEnvironment.has(name) &&
+        !reviewedPolicyEnvironmentPrefixes.some((prefix) => name.startsWith(prefix))
+      )
+        return `unreviewed-policy-env:${name}`;
+  }
+  if (settings.permissions === undefined) return undefined;
+  if (!skillObject(settings.permissions)) return 'unreviewed-policy-key:permissions';
+  for (const key of Object.keys(settings.permissions))
+    if (!reviewedPolicyPermissions.has(key)) return `unreviewed-policy-key:permissions.${key}`;
   return undefined;
 }
 

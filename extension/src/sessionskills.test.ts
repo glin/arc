@@ -9,6 +9,7 @@ import {
   admitClaudeSessionSkill,
   admitClaudeSessionComponents,
   claudeNativeSkillSettings,
+  claudeNativeSkillSettingsRefusal,
   claudeSkillHome,
   codexRawSkills,
   codexSkillConfiguration,
@@ -815,18 +816,21 @@ test.each(['win32', 'darwin', 'linux'] as const)(
   },
 );
 
-test('native Claude personal tiers retain raw disablement and reject policy origins', () => {
+test('native Claude personal tiers retain raw disablement and reject unknown origins', () => {
   const response = {
     effective: {},
-    sources: ['userSettings', 'projectSettings', 'localSettings', 'flagSettings'].map((source) => ({
+    sources: ['userSettings', 'projectSettings', 'localSettings', 'flagSettings', 'policySettings'].map((source) => ({
       source,
       settings: {},
     })),
     applied: {},
   };
   assert.equal(claudeNativeSkillSettings(response), true);
-  for (const source of ['policySettings', 'managed', 'unknown'])
-    assert.equal(claudeNativeSkillSettings({ ...response, sources: [{ source, settings: {} }] }), false);
+  for (const source of ['managed', 'unknown'])
+    assert.equal(
+      claudeNativeSkillSettingsRefusal({ ...response, sources: [{ source, settings: {} }] }),
+      'unsupported-settings-layer',
+    );
   assert.equal(
     claudeNativeSkillSettings({
       ...response,
@@ -836,6 +840,70 @@ test('native Claude personal tiers retain raw disablement and reject policy orig
   );
   for (const invalid of [null, {}, { ...response, sources: {} }, { ...response, applied: null }])
     assert.equal(claudeNativeSkillSettings(invalid), false);
+});
+
+// The response shape Claude Code 2.1.312 reported under a managed telemetry and bypass-mode policy. Claude merges
+// the policy into `effective`, so a restriction that every layer refuses names the effective layer first.
+test('a managed Claude policy admits reviewed keys and names the first restricting or unreviewed key', () => {
+  const response = (policy: Record<string, unknown>) => ({
+    effective: policy,
+    sources: [
+      { source: 'userSettings', settings: {} },
+      { source: 'policySettings', settings: policy },
+    ],
+    applied: {},
+  });
+  const owner = {
+    env: { CLAUDE_CODE_ENABLE_TELEMETRY: '1', OTEL_EXPORTER_OTLP_ENDPOINT: 'https://telemetry.example' },
+    permissions: { disableBypassPermissionsMode: 'disable' },
+  };
+  for (const component of ['skill', 'hooks'] as const) {
+    assert.equal(claudeNativeSkillSettingsRefusal(response(owner), component, 'linux'), undefined);
+    assert.equal(
+      claudeNativeSkillSettingsRefusal(
+        response({
+          ...owner,
+          disableAutoMode: 'disable',
+          env: { DISABLE_TELEMETRY: '1', DISABLE_ERROR_REPORTING: '1', CLAUDE_CODE_OTEL_CONTENT_MAX_LENGTH: '9' },
+        }),
+        component,
+        'linux',
+      ),
+      undefined,
+    );
+  }
+  for (const [policy, refusal] of [
+    [{ strictKnownMarketplaces: [] }, 'effective:marketplace-restriction'],
+    [{ allowManagedPermissionRulesOnly: true }, 'policySettings:unreviewed-policy-key:allowManagedPermissionRulesOnly'],
+    [{ blockedMarketplaces: [] }, 'policySettings:unreviewed-policy-key:blockedMarketplaces'],
+    [{ strictPluginOnlyCustomization: true }, 'policySettings:unreviewed-policy-key:strictPluginOnlyCustomization'],
+    [{ ...owner, permissions: { deny: ['Bash(arc *)'] } }, 'policySettings:unreviewed-policy-key:permissions.deny'],
+    [{ permissions: { ask: ['Bash'] } }, 'policySettings:unreviewed-policy-key:permissions.ask'],
+    [{ permissions: ['allow'] }, 'policySettings:unreviewed-policy-key:permissions'],
+    [{ env: { CLAUDE_CONFIG_DIR: '/elsewhere' } }, 'effective:redirected-environment'],
+    [
+      { ...owner, env: { ...owner.env, CLAUDE_CODE_SIMPLE: 'secret-value' } },
+      'policySettings:unreviewed-policy-env:CLAUDE_CODE_SIMPLE',
+    ],
+    [{ env: { CLAUDE_CODE_SAFE_MODE: '1' } }, 'policySettings:unreviewed-policy-env:CLAUDE_CODE_SAFE_MODE'],
+    [
+      { env: { CLAUDE_CODE_SKIP_PROMPT_HISTORY: '1' } },
+      'policySettings:unreviewed-policy-env:CLAUDE_CODE_SKIP_PROMPT_HISTORY',
+    ],
+    [{ env: { DISABLE_COMPACT: '1' } }, 'policySettings:unreviewed-policy-env:DISABLE_COMPACT'],
+    [{ env: { CLAUDE_CODE_SHELL_PREFIX: 'wrap' } }, 'policySettings:unreviewed-policy-env:CLAUDE_CODE_SHELL_PREFIX'],
+    [{ env: { ARC_IGNORE_ROOTS: '/work' } }, 'policySettings:unreviewed-policy-env:ARC_IGNORE_ROOTS'],
+    [{ env: { otel_exporter_otlp_endpoint: 'x' } }, 'policySettings:unreviewed-policy-env:otel_exporter_otlp_endpoint'],
+  ] as const)
+    assert.equal(claudeNativeSkillSettingsRefusal(response(policy), 'skill', 'linux'), refusal);
+  assert.equal(
+    claudeNativeSkillSettingsRefusal(response({ allowManagedHooksOnly: true }), 'hooks', 'linux'),
+    'effective:hooks-disabled',
+  );
+  assert.equal(
+    claudeNativeSkillSettingsRefusal(response({ allowManagedHooksOnly: true }), 'skill', 'linux'),
+    'policySettings:unreviewed-policy-key:allowManagedHooksOnly',
+  );
 });
 
 test('Codex admission keeps raw duplicate identities and configured disabled paths outside native roots', () => {

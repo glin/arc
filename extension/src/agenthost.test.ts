@@ -12535,10 +12535,8 @@ test('every live and idle construction prepares its own plan before its single s
   );
 });
 
-// Actual optional-admission refusal must close the same child without sending or replaying input.
-test('failed actual Claude skill admission starts no replacement and sends no user frame', async () => {
-  const fixture = fakeHost();
-  const plan = claudePlan(CLAUDE, { cwd: WS, sessionId: 'session' });
+// A Claude session plan that loaded Arc's session skill, and the records of what the running check withheld.
+function preparedSkillPlan(): { plan: AgentPlan; withheld: SessionComponentsWithheld[]; plugin: string } {
   const release = {
     contentId: 'a'.repeat(64),
     directory: '/release',
@@ -12547,46 +12545,167 @@ test('failed actual Claude skill admission starts no replacement and sends no us
     claudeDefinition: '/release/session-plugin/skills/arc-sessions/SKILL.md',
     codexDefinition: '/release/skills/arc-sessions/SKILL.md',
   };
-  const original = plan.driver;
-  plan.driver = (send, emit) => {
-    const driver = original(send, emit);
-    const wire = new ClaudeWire({ send, emit, sessionSkills: { release, refresh: () => false } });
-    return {
-      ...driver,
-      receive: (line) => wire.receive(line),
-      open: () => wire.initialize(),
-      close: (reason) => wire.close(reason),
-    };
-  };
-  const opening = fixture.host.session('optional', plan);
-  const child = fixture.children[0];
+  const withheld: SessionComponentsWithheld[] = [];
+  const options = { cwd: WS, sessionId: 'session' };
+  const plan = claudePlan({ ...CLAUDE, sessionSkills: { current: () => release } }, options, {
+    release,
+    components: { skill: true, hooks: false },
+    refresh: () => true,
+    withheld: (record) => withheld.push(record),
+    environment: {},
+    args: spawnArgs({ ...options, replayUserMessages: true }),
+  });
+  return { plan, withheld, plugin: release.claudePlugin };
+}
+
+// Answers the opening exchange of a child that loaded Arc's session skill, with the settings its `get_settings` reports.
+// Claude merges every source, including a policy, into `effective`.
+async function answerSkillOpening(child: FakeChild, sources: { source: string; settings: object }[]): Promise<void> {
   child.answerControl('initialize', {
-    claude_code_version: '2.1.310',
+    claude_code_version: '2.1.312',
     commands: [{ name: 'arc-session-tools:arc-sessions' }],
   });
   await vi.waitFor(() =>
     assert.ok(child.sent().some((message) => (message.request as any)?.subtype === 'get_settings')),
   );
-  child.answerControl('get_settings', {
-    effective: {},
-    sources: [{ source: 'policySettings', settings: {} }],
-    applied: {},
-  });
+  const effective = Object.assign({}, ...sources.map(({ settings }) => settings));
+  child.answerControl('get_settings', { effective, sources, applied: {} });
+}
+
+// The opening of a Claude session whose running settings refuse Arc's skill, up to the refused child's input close.
+async function refusedSkillOpening(lifecycle: Parameters<typeof fakeHost>[2] = {}) {
+  const fixture = fakeHost(undefined, undefined, lifecycle);
+  const { plan, withheld, plugin } = preparedSkillPlan();
+  const opening = fixture.host.session('optional', plan);
+  const refused = fixture.children[0];
+  assert.deepEqual(fixture.commands[0].slice(-2), ['--plugin-dir', plugin]);
+  await answerSkillOpening(refused, [
+    { source: 'userSettings', settings: {} },
+    { source: 'policySettings', settings: { strictKnownMarketplaces: [] } },
+  ]);
+  await vi.waitFor(() => assert.equal(refused.ended, true));
+  return { fixture, opening, refused, withheld };
+}
+
+// The owner's managed policy sets telemetry variables and disables bypass mode. Neither restricts Arc's skill.
+test('a Claude session under a telemetry and bypass-mode policy opens with the session skill', async () => {
+  const fixture = fakeHost();
+  const { plan, withheld, plugin } = preparedSkillPlan();
+  const opening = fixture.host.session('policy', plan);
+  const child = fixture.children[0];
+  await answerSkillOpening(child, [
+    { source: 'userSettings', settings: {} },
+    {
+      source: 'policySettings',
+      settings: {
+        env: { CLAUDE_CODE_ENABLE_TELEMETRY: '1', OTEL_METRICS_EXPORTER: 'otlp' },
+        permissions: { disableBypassPermissionsMode: 'disable' },
+      },
+    },
+  ]);
   const session = await opening;
-  assert.equal(session.state().ready, false);
-  assert.match(session.state().lastError ?? '', /settings/);
+  assert.equal(session.state().lastError, null);
+  assert.equal(session.state().ready, true);
+  assert.deepEqual(fixture.commands[0].slice(-2), ['--plugin-dir', plugin]);
   assert.equal(fixture.children.length, 1);
+  assert.deepEqual(withheld, []);
+  child.exit(0);
+  child.close();
+  await session.dispose();
+  fixture.host.dispose();
+});
+
+// A running settings refusal closes the child before any input, and a child without Arc's plugins runs the session.
+test('a Claude session whose running settings refuse the skill opens without it and takes the prompt', async () => {
+  const { fixture, opening, refused, withheld } = await refusedSkillOpening();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(fixture.children.length, 1, 'a second child started while the refused child could still write');
+  refused.exit(0);
+  refused.close();
+  await vi.waitFor(() => assert.equal(fixture.children.length, 2));
+  const child = fixture.children[1];
+  assert.equal(fixture.commands[1].includes('--plugin-dir'), false);
+  assert.deepEqual(fixture.commands[1], fixture.commands[0].slice(0, -2));
+  child.answerControl('initialize', { claude_code_version: '2.1.312', commands: [] });
+  const session = await opening;
+  assert.equal(session.state().ready, true);
+  assert.equal(session.state().lastError, null);
   assert.equal(
-    child.sent().some((message) => message.type === 'user'),
+    fixture.states.some((state) => state.exited || state.lastError),
+    false,
+  );
+  await session.prompt('hello');
+  assert.equal(
+    refused.sent().some((message) => message.type === 'user'),
+    false,
+  );
+  assert.deepEqual(
+    child
+      .sent()
+      .filter((message) => message.type === 'user')
+      .map((message) => message.message),
+    [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
+  );
+  assert.deepEqual(
+    withheld.map(({ stage, withheld, check }) => ({ stage, withheld, check })),
+    [{ stage: 'running', withheld: { skill: 'settings-refusal' }, check: 'effective:marketplace-restriction' }],
+  );
+  child.exit(0);
+  child.close();
+  await session.dispose();
+  fixture.host.dispose();
+});
+
+// A model pick made while the refused child opens waits for the opening, then reaches the child that replaced it.
+test('a model change during a refused Claude opening reaches the replacement child', async () => {
+  const { fixture, opening, refused } = await refusedSkillOpening();
+  const changed = fixture.host.withActivity('optional', (child) => child.setModel('opus'));
+  refused.exit(0);
+  refused.close();
+  await vi.waitFor(() => assert.equal(fixture.children.length, 2));
+  const child = fixture.children[1];
+  child.answerControl('initialize', { claude_code_version: '2.1.312', commands: [] });
+  const session = await opening;
+  await vi.waitFor(() => assert.ok(child.sent().some((message) => (message.request as any)?.subtype === 'set_model')));
+  child.answerControl('set_model', {});
+  assert.equal(await changed, undefined, 'the model change was dropped with the refused child');
+  assert.equal(
+    refused.sent().some((message) => (message.request as any)?.subtype === 'set_model'),
     false,
   );
   child.exit(0);
   child.close();
   await session.dispose();
   fixture.host.dispose();
-  const suppliedCatalogEvent = fixture.events.find((item) => item.event.kind === 'commands');
-  assert.equal(suppliedCatalogEvent?.usageSource, session.usageSource);
-  assert.equal(suppliedCatalogEvent?.event.kind === 'commands' && suppliedCatalogEvent.event.optionalOnly, true);
+});
+
+// A refused child that never exits keeps its session id, so no second child starts and the opening fails.
+test('a refused Claude child that does not exit fails the opening without a second child', async () => {
+  const pending: { callback: () => void; delayMs: number }[] = [];
+  const timer: AgentHostTimer = {
+    set: (callback, delayMs) => {
+      const entry = { callback, delayMs };
+      pending.push(entry);
+      return entry;
+    },
+    clear: (entry) => {
+      const index = pending.indexOf(entry as (typeof pending)[number]);
+      if (index >= 0) pending.splice(index, 1);
+    },
+  };
+  const { fixture, opening, refused } = await refusedSkillOpening({ timer, exitGraceMs: 0 });
+  await vi.waitFor(() => assert.equal(refused.killed, true));
+  const deadline = pending.find(({ delayMs }) => delayMs === 5_000);
+  assert.ok(deadline, 'the wait for the refused child has no deadline');
+  deadline.callback();
+  const session = await opening;
+  assert.match(session.state().lastError ?? '', /did not close in time/);
+  assert.equal(session.state().exited, true);
+  refused.exit(0);
+  refused.close();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(fixture.children.length, 1);
+  fixture.host.dispose();
 });
 
 test.each(['success', 'refusal', 'timeout', 'cancel'] as const)(

@@ -79,6 +79,7 @@ import {
   errorText,
   reportWithheld,
   retainedSessionSkill,
+  SessionComponentsRefused,
   type ClaudeSessionComponents,
   type SessionComponentsWithheld,
   type SessionSkillSelection,
@@ -367,6 +368,8 @@ export interface Driver {
 // What to start, and how to talk to it once it is running.
 export interface AgentPlan {
   prepare?(): AgentPlan;
+  // The same launch without Arc's session plugins, for a child that refused them while running.
+  withoutSessionComponents?(): AgentPlan;
   inheritedEnvironment?: NodeJS.ProcessEnv;
   policy?: LaunchPolicy;
   agent: AgentName;
@@ -529,6 +532,9 @@ export function claudePlan(
             });
           },
         }
+      : {}),
+    ...(prepared?.release
+      ? { withoutSessionComponents: () => claudePlan(launch, options, { ...prepared, release: undefined }) }
       : {}),
     inheritedEnvironment: prepared?.environment,
     policy: options.policy,
@@ -1145,6 +1151,8 @@ export function claudeBackgroundHint(sessionId: string): string {
 // How long a child being let go has to end on its own before termination is requested.
 // This gives the CLI time to write its settings before a replacement waits for confirmed exit.
 export const EXIT_GRACE_MS = 2_000;
+// How long a child that refused its session plugins can take to exit after the termination request.
+const REPLACED_EXIT_MS = 5_000;
 
 // The expiry period for an ending owed by an accepted Stop.
 // `handle` consumes the debt only for an interrupted outcome within this period.
@@ -1346,8 +1354,9 @@ export class AgentSession {
   }
 
   // Completes the opening exchange before prompts. Failure is retained in session state and closes the child.
-  // `startOrThrow` exposes that failure as an exception.
-  async start(): Promise<void> {
+  // `startOrThrow` exposes that failure as an exception. With `keepComponentRefusal`, a refusal of the session
+  // plugins leaves the child running and unreported, so the caller can close it and start one without them.
+  async start(keepComponentRefusal = false): Promise<void> {
     try {
       // Bound an opening that starts but never answers, including a CLI waiting for terminal authentication.
       const commandVersion = this.commandVersion;
@@ -1358,10 +1367,22 @@ export class AgentSession {
       this.ready = true;
     } catch (error) {
       this.openingFailure = error instanceof Error ? error : new Error(String(error));
+      if (keepComponentRefusal && this.componentsRefused()) return;
       this.lastError = `the agent could not finish opening the session: ${(error as Error).message}`;
       void this.dispose();
     }
     this.changed();
+  }
+
+  // The opening failed because the running child refused the session plugins it loaded.
+  componentsRefused(): boolean {
+    return this.openingFailure instanceof SessionComponentsRefused;
+  }
+
+  // Reports the opening of a child kept after its refusal as failed, for a caller that cannot replace it.
+  failKeptOpening(reason: string, report: boolean): void {
+    this.lastError = `the agent could not finish opening the session: ${reason}`;
+    if (report) this.changed();
   }
 
   // The opening exchange for a caller whose whole job is the opening, such as a rename-only
@@ -3279,6 +3300,10 @@ export class AgentHost {
     this.recovery = recovery;
   }
   private readonly sessions = new Map<string, AgentSession>();
+  // Children closed after refusing their session plugins at opening. Their events and state no longer reach the reader.
+  private readonly replacedOpenings = new WeakSet<AgentSession>();
+  // The child that took each replaced child's key. Work that waited on the opening runs on it.
+  private readonly openingReplacements = new WeakMap<AgentSession, AgentSession>();
   private readonly backgroundReads = new Map<string, ClaudeBackgroundWork>();
 
   retainBackgroundWork(
@@ -3429,77 +3454,146 @@ export class AgentHost {
       ? (this.backgroundReads.get(identity) ?? new ClaudeBackgroundWork())
       : undefined;
     if (identity && retainedBackground) this.backgroundReads.set(identity, retainedBackground);
-    const session = new AgentSession(
-      key,
-      plan,
-      this.spawner,
-      (event, turnId, dispatchTurnId) => {
-        // A released Remote Control hold starts a new idle window. Later events see the child's settled state.
-        if (event.kind === 'remoteControl' && event.state === 'off')
-          queueMicrotask(() => this.applyRetirementEligibility(key, session));
-        const state = this.sessions.get(key)?.state();
-        if (this.recovery && state?.sessionId) {
-          const askKey = `${key}:${event.kind === 'ask' ? event.ask.id : event.kind === 'askResolved' ? event.id : ''}`;
-          if (event.kind === 'ask') {
-            this.recoveryAsks.set(askKey, event.ask);
-            if (
-              event.ask.kind === 'question' &&
-              !this.recovery.capture(
-                state.agent,
-                state.sessionId,
-                state.cwd,
-                event.ask,
-                this.options.recoverySource?.(state.agent, state.sessionId) ?? null,
+    const open = (childPlan: AgentPlan): AgentSession => {
+      const session = new AgentSession(
+        key,
+        childPlan,
+        this.spawner,
+        (event, turnId, dispatchTurnId) => {
+          if (this.replacedOpenings.has(session)) return;
+          // A released Remote Control hold starts a new idle window. Later events see the child's settled state.
+          if (event.kind === 'remoteControl' && event.state === 'off')
+            queueMicrotask(() => this.applyRetirementEligibility(key, session));
+          const state = this.sessions.get(key)?.state();
+          if (this.recovery && state?.sessionId) {
+            const askKey = `${key}:${event.kind === 'ask' ? event.ask.id : event.kind === 'askResolved' ? event.id : ''}`;
+            if (event.kind === 'ask') {
+              this.recoveryAsks.set(askKey, event.ask);
+              if (
+                event.ask.kind === 'question' &&
+                !this.recovery.capture(
+                  state.agent,
+                  state.sessionId,
+                  state.cwd,
+                  event.ask,
+                  this.options.recoverySource?.(state.agent, state.sessionId) ?? null,
+                )
               )
-            )
-              this.options.onRecoveryFailure?.();
-          }
-          if (event.kind === 'askResolved') {
-            const ask = this.recoveryAsks.get(askKey);
-            if (ask?.kind === 'question') {
-              if (event.outcome && event.outcome !== 'failed')
-                this.completedLiveQuestions.add(questionIdentity(state.agent, state.sessionId, state.cwd, ask));
-              try {
-                this.recovery.resolved(state.agent, state.sessionId, state.cwd, ask, event);
-              } catch {
                 this.options.onRecoveryFailure?.();
-              }
             }
-            this.recoveryAsks.delete(askKey);
+            if (event.kind === 'askResolved') {
+              const ask = this.recoveryAsks.get(askKey);
+              if (ask?.kind === 'question') {
+                if (event.outcome && event.outcome !== 'failed')
+                  this.completedLiveQuestions.add(questionIdentity(state.agent, state.sessionId, state.cwd, ask));
+                try {
+                  this.recovery.resolved(state.agent, state.sessionId, state.cwd, ask, event);
+                } catch {
+                  this.options.onRecoveryFailure?.();
+                }
+              }
+              this.recoveryAsks.delete(askKey);
+            }
           }
-        }
-        this.options.onEvent({
-          key,
-          event,
-          ...(['ready', 'commands'].includes(event.kind) ? { usageSource: session.usageSource } : {}),
-          ...(turnId === undefined ? {} : { turnId }),
-          ...(dispatchTurnId === undefined ? {} : { dispatchTurnId }),
-        });
-      },
-      (backgroundReleased) => {
-        if (backgroundReleased) this.applyRetirementEligibility(key, session);
-        else this.applyTargetedRetirementEligibility(key, session);
-        this.options.onStateChange(this.sessions.get(key)?.state() ?? session.state());
-      },
-      this.options.openingDeadlineMs,
-      this.options.exitGraceMs,
-      this.options.now,
-      retainedBackground,
-      (event) => this.options.onNativeObservation?.(key, event),
-    );
-    this.sessions.set(key, session);
-    await session.start();
+          this.options.onEvent({
+            key,
+            event,
+            ...(['ready', 'commands'].includes(event.kind) ? { usageSource: session.usageSource } : {}),
+            ...(turnId === undefined ? {} : { turnId }),
+            ...(dispatchTurnId === undefined ? {} : { dispatchTurnId }),
+          });
+        },
+        (backgroundReleased) => {
+          if (this.replacedOpenings.has(session)) return;
+          if (backgroundReleased) this.applyRetirementEligibility(key, session);
+          else this.applyTargetedRetirementEligibility(key, session);
+          this.options.onStateChange(this.sessions.get(key)?.state() ?? session.state());
+        },
+        this.options.openingDeadlineMs,
+        this.options.exitGraceMs,
+        this.options.now,
+        retainedBackground,
+        (event) => this.options.onNativeObservation?.(key, event),
+      );
+      return session;
+    };
+    let opened = open(plan);
+    this.sessions.set(key, opened);
+    await opened.start(Boolean(plan.withoutSessionComponents));
+    // A child that refused its session plugins while opening closes, and a child without them takes its key.
+    // The first child's record of the refusal stays in the diagnostics log.
+    if (opened.componentsRefused() && plan.withoutSessionComponents) {
+      const refused = opened;
+      this.replacedOpenings.add(refused);
+      // The replacement starts only after the refused child exits, so two children never write one session.
+      const exited = await this.closeWithin(refused, (this.options.exitGraceMs ?? EXIT_GRACE_MS) + REPLACED_EXIT_MS);
+      if (this.disposed) {
+        // Host disposal below closes the key.
+      } else if (this.sessions.get(key) !== refused) {
+        refused.failKeptOpening(
+          "the session closed before it could open without Arc's skill and file snapshots.",
+          false,
+        );
+      } else if (!exited) {
+        this.replacedOpenings.delete(refused);
+        refused.failKeptOpening(
+          "Claude Code did not close in time to open the session without Arc's skill and file snapshots.",
+          true,
+        );
+      } else {
+        opened = open(plan.withoutSessionComponents());
+        this.moveActivity(refused, opened);
+        this.sessions.set(key, opened);
+        await opened.start();
+      }
+    }
     if (this.disposed) {
-      if (this.sessions.get(key) === session) {
+      if (this.sessions.get(key) === opened) {
         this.sessions.delete(key);
       }
-      await session.dispose();
+      await opened.dispose();
       this.assertActive();
     }
-    if (!session.state().exited) {
-      this.settleOpening(key, session);
+    if (!opened.state().exited) {
+      this.settleOpening(key, opened);
     }
-    return session;
+    return opened;
+  }
+
+  // Resolves when the child exits, or with false once the deadline passes first.
+  private closeWithin(session: AgentSession, deadlineMs: number): Promise<boolean> {
+    return new Promise((resolve) => {
+      const deadline = this.timer.set(() => resolve(false), deadlineMs);
+      void session.dispose().then(() => {
+        this.timer.clear(deadline);
+        resolve(true);
+      });
+    });
+  }
+
+  // Moves the leases and exclusive waiter held on a replaced opening to the child that replaced it.
+  private moveActivity(replaced: AgentSession, replacement: AgentSession): void {
+    this.openingReplacements.set(replaced, replacement);
+    const leases = this.activityLeases.get(replaced);
+    if (leases !== undefined) {
+      this.activityLeases.delete(replaced);
+      this.activityLeases.set(replacement, leases);
+    }
+    const waiter = this.exclusiveActivityWaiters.get(replaced);
+    if (waiter) {
+      this.exclusiveActivityWaiters.delete(replaced);
+      this.exclusiveActivityWaiters.set(replacement, waiter);
+    }
+  }
+
+  // A running child, or a refused opening that a child without its plugins is about to replace.
+  private leasable(key: string, session: AgentSession): boolean {
+    return !session.state().exited || (this.starting.has(key) && this.replacedOpenings.has(session));
+  }
+
+  // The child that holds a lease taken on `session` before its opening settled.
+  private leased(session: AgentSession): AgentSession {
+    return this.openingReplacements.get(session) ?? session;
   }
 
   get(key: string): AgentSession | null {
@@ -3614,8 +3708,8 @@ export class AgentHost {
       return null;
     }
     const opening = this.starting.get(key);
-    const session = this.sessions.get(key) ?? null;
-    if (!session || session.state().exited) {
+    let session = this.sessions.get(key) ?? null;
+    if (!session || !this.leasable(key, session)) {
       return null;
     }
     this.cancelRetirement(key);
@@ -3623,6 +3717,7 @@ export class AgentHost {
     try {
       if (opening) {
         await Promise.allSettled([opening]);
+        session = this.leased(session);
       }
       if (session.state().exited) {
         return null;
@@ -3651,7 +3746,7 @@ export class AgentHost {
     const held = new Map<string, AgentSession>();
     for (const key of keys) {
       const session = this.sessions.get(key) ?? null;
-      if (!session || session.state().exited) {
+      if (!session || !this.leasable(key, session)) {
         for (const [heldKey, heldSession] of held) {
           this.releaseActivity(heldKey, heldSession);
         }
@@ -3671,6 +3766,7 @@ export class AgentHost {
     try {
       if (openings.size) {
         await Promise.allSettled(openings);
+        for (const [key, session] of held) held.set(key, this.leased(session));
       }
       if ([...held.values()].some((session) => session.state().exited)) {
         return null;
@@ -3703,7 +3799,7 @@ export class AgentHost {
         return null;
       }
       const session = this.sessions.get(key) ?? null;
-      if (!session || session.state().exited) {
+      if (!session || !this.leasable(key, session)) {
         for (const [heldKey, heldSession] of held) {
           this.releaseActivity(heldKey, heldSession);
         }
@@ -3720,8 +3816,10 @@ export class AgentHost {
     const retirements = [...held.keys()].map((key) => ({ key, retirement: this.requestRetirement(key, false) }));
     let accepted = false;
     try {
+      await Promise.allSettled(openings);
+      for (const [key, session] of held) held.set(key, this.leased(session));
       const priorActivities = [...held.values()].map((session) => this.waitForExclusiveActivity(session));
-      await Promise.allSettled([...openings, ...priorActivities]);
+      await Promise.allSettled(priorActivities);
       if ([...held].some(([key, session]) => this.sessions.get(key) !== session || session.state().exited)) {
         return null;
       }
