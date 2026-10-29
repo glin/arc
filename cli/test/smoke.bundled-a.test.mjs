@@ -69,6 +69,14 @@ process.stdin[Symbol.asyncIterator] = deny;
     const result = await run(process.execPath, ['--require', preload, cli, 'dispatch', 'rm', '--help'], options);
     assert.equal(result.stderr, '');
     assert.equal(result.stdout, renderCommandHelp(command) + '\n');
+    for (const verb of ['start', 'run']) {
+      for (const provider of [undefined, 'claude', 'codex']) {
+        const args = [verb, ...(provider ? [provider] : []), '--help'];
+        const result = await run(process.execPath, ['--require', preload, cli, ...args], options);
+        assert.equal(result.stdout, renderCommandHelp(findCommand(args)) + '\n');
+        assert.equal(result.stderr, '');
+      }
+    }
     for (const args of [[], ['help'], ['--help']]) {
       assert.equal(
         (await run(process.execPath, ['--require', preload, cli, ...args], options)).stdout,

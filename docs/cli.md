@@ -96,7 +96,7 @@ List available setups, then start from a regular prompt file:
 
 ```sh
 arc setups --window WINDOW_ID --json
-arc start --provider codex --prompt-file './review prompt.txt' --name 'Review branch' --label Review --pinned --window WINDOW_ID
+arc start codex --prompt-file './review prompt.txt' --name 'Review branch' --label Review --pinned --window WINDOW_ID
 ```
 
 Use a returned `--setup KEY` instead of explicit provider settings. Prompt files accept at most 48 KiB. Empty prompts and slash commands refuse launch. Requested settings do not establish observed provider execution.
@@ -173,7 +173,7 @@ Reports remain readable after host shutdown and when full cost is unknown. [Disp
 
 ## Standalone launches
 
-`arc run` starts one explicitly selected provider without a window. Run `arc run --help` for required settings and output options. Claude read-only launches use print mode. Writable Claude uses background mode, which Claude refuses in a directory it does not trust. Trust in a directory does not cover a repository nested inside it. Codex uses `exec` or an attended interactive session. Existing directories, repeated extra directories, executable overrides, and literal argument boundaries remain part of each receipt. Arc creates no branch or worktree. `--cache-lifetime` works as it does for [starts](#session-management).
+`arc run` starts one explicitly selected provider without a window. Run `arc run claude --help` or `arc run codex --help` for required settings and output options. Claude read-only launches use print mode. Writable Claude uses background mode, which Claude refuses in a directory it does not trust. Trust in a directory does not cover a repository nested inside it. Codex uses `exec` or an attended interactive session. Existing directories, repeated extra directories, executable overrides, and literal argument boundaries remain part of each receipt. Arc creates no branch or worktree. `--cache-lifetime` works as it does for [starts](#session-management).
 
 `--log PATH` exposes live print output or writable Claude native logs. Print launches retain private stdout and stderr files, preserving byte order within each channel. Ordering between channels is unspecified. Resumed observation continues captured bytes without restarting the worker or taking over a reused log alias. Writable Claude logs use its accepted background ID and retain native bytes separately from launch output. Codex freezes its final response beside the log, using the log stem followed by `.last.md`. `--report-file` or `--output` selects another report alias. Reused aliases never supply receipt report bytes.
 

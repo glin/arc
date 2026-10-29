@@ -141,6 +141,10 @@ Each provider's `models` lists exact catalog values as `{value, efforts}`, with 
 
 ## Session writes
 
+`arc start claude` and `arc start codex` select explicit providers. `arc run claude` and `arc run codex` launch without a window. The provider must immediately follow the command. Parent help lists these choices. Provider help lists shared flags and that provider's options.
+
+`arc start --setup KEY` selects a saved setup. It rejects an empty key, a positional provider, model, effort, and permissions. The window checks provider-only options against the resolved setup.
+
 Starts require a ready panel, project setup storage, and a loaded provider catalog. Unsupported settings refuse launch.
 
 Prompt files must be regular, nonempty, and at most 48 KiB. Slash commands refuse. Encoded requests above the 64 KiB channel limit refuse before connection. Explicit working directories resolve from the caller's directory and use their real filesystem destination.

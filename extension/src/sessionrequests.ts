@@ -123,7 +123,7 @@ export interface SessionRequest {
     | 'dispatch';
   terminalOrigin?: TerminalOrigin;
   requester: string | null;
-  // The requester's provider. The CLI sends it on send, session reads, and `arc start --arc-dispatch`, and only
+  // The requester's provider. The CLI sends it on send, session reads, and `arc start PROVIDER --arc-dispatch`, and only
   // when exactly one provider variable is set and the window lists `REQUESTER_PROVIDER_CAPABILITY`.
   requesterProvider?: RequesterProvider;
   params: SessionWriteParams & {

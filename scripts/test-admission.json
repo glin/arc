@@ -1,18 +1,18 @@
 {
   "cli/test/manage.test.ts": {
     "reason": "CLI management must preserve classification, validation, read delivery, and compaction cancels through a real authenticated window channel. Explicit tiers must cross the authenticated start channel for provider and saved setup routes. Invalid selections must send no request.",
-    "cases": 19,
-    "matricesSha256": "fa463115d98b46d6b3daf5423db793ea2281a9632ca4526947a1996191dcd353"
+    "cases": 20,
+    "matricesSha256": "5c419463cc072b57e206d07cd8051d33056647f9b2d637fdffd7c0105b53edd2"
   },
   "cli/test/run.test.ts": {
     "reason": "Standalone workers must retain real output, exit, cancellation, receipt ownership, and recovery across process boundaries. Held readers must preserve one worker and one outcome after recovery. Exhausted replacement retries must retain the worker's terminal observation. Explicit tiers must reach attached and background argv on Windows, macOS, and Linux. A refused tier must reserve no receipt and start no worker.",
-    "cases": 111,
-    "matricesSha256": "74c3896a9e4a828747566b39360512c306e71829e9e4285477d153f4c0613b9d"
+    "cases": 112,
+    "matricesSha256": "4cd11e38cdd8924663c538810080d0ad6cf33cfca0cb8198397e87cb0b338cd9"
   },
   "cli/test/smoke.bundled-a.test.mjs": {
-    "reason": "Compiled CLI commands must reach session reads, comments, and saved defaults through an authenticated window channel.",
+    "reason": "Compiled CLI commands must reach session reads, comments, and saved defaults through an authenticated window channel. Parent and provider help must avoid stdin, files, and window discovery.",
     "cases": 8,
-    "matricesSha256": "13ee9104d450f4defe21afa9658577661810c8aef9203b38b77427d0c22105a0"
+    "matricesSha256": "73dbba6282742f6f57f97fe751819c36d653f742691ba3e3740774458315097c"
   },
   "cli/test/smoke.bundled-b.test.mjs": {
     "reason": "Compiled CLI commands must deliver session actions and streamed responses through the selected window channel. Self-compaction must select readiness from its explicit launch nonce.",
@@ -26,8 +26,8 @@
   },
   "cli/test/smoke.test.mjs": {
     "reason": "Installed skill directories must preserve foreign files and ownership across executable command and filesystem boundaries. Bundled commands must update personal copies from every supported artifact layout. A detached run started through the editor launcher must run arc from its worker.",
-    "cases": 39,
-    "matricesSha256": "32bbfd6dd3226d2b9770ce4ecc760684ffd8979327dd7eebaa1e3e085adda0fd"
+    "cases": 40,
+    "matricesSha256": "a0218d12fb34292b04f554f78d91dd265a5ea08ad30ecd82507438661dcaf8bd"
   },
   "cli/test/stream-fixtures.test.mjs": {
     "reason": "The audit executable must print stream mismatches and return a failing process status.",
@@ -57,7 +57,7 @@
   "extension/src/codex.test.ts": {
     "reason": "Real Git worktree ownership and descendant source resolution must agree with recorded Codex session relationships.",
     "cases": 483,
-    "matricesSha256": "3098cee6bd0c865d7a8344402a57dc3cf5d6b3480f042c2e5c32aaa177e04e26"
+    "matricesSha256": "d3e7d1c3f34e940a6ecc8fc007f5249fb33aaaf57acc1ec9e7a47449f7b27d32"
   },
   "extension/src/derivedcache.test.ts": {
     "reason": "Independent writers and host death must preserve shared cache rows and release stale filesystem locks.",

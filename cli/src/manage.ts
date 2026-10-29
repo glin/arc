@@ -117,6 +117,8 @@ function renderSetups(listing: SetupListing): string {
 export async function runManagement(command: string, args: string[]): Promise<string> {
   if (command.startsWith('standalone-'))
     return runBackgroundManagement(command.slice(11) as 'logs' | 'attach' | 'stop' | 'rm', args);
+  const provider = command === 'start' && ['claude', 'codex'].includes(args[0]) ? args[0] : undefined;
+  if (provider) args = args.slice(1);
   const options = new Map<string, string>();
   const flags = new Set<string>();
   const sessions: string[] = [];
@@ -126,7 +128,6 @@ export async function runManagement(command: string, args: string[]): Promise<st
     '--window',
     '--request-id',
     '--setup',
-    '--provider',
     '--model',
     '--effort',
     '--permissions',
@@ -185,7 +186,6 @@ export async function runManagement(command: string, args: string[]): Promise<st
                 '--window',
                 '--request-id',
                 '--setup',
-                '--provider',
                 '--model',
                 '--effort',
                 '--permissions',
@@ -286,27 +286,22 @@ export async function runManagement(command: string, args: string[]): Promise<st
     return reply.status === 'refused' ? reply.reason : `${reply.reason} Request ID: ${requestId}.`;
   }
   if (command === 'start') {
-    if (sessions.length || !options.has('--prompt-file')) throw new Error('Start requires --prompt-file PATH.');
+    if (sessions.length) throw new Error('Choose arc start claude, arc start codex, or arc start --setup KEY.');
+    if (!options.has('--prompt-file')) throw new Error('Start requires --prompt-file PATH.');
     const key = options.get('--setup');
-    if (key && ['--provider', '--model', '--effort', '--permissions'].some((arg) => options.has(arg)))
+    if (options.has('--setup') && !key) throw new Error('--setup requires a nonempty key.');
+    if (key && (provider || ['--model', '--effort', '--permissions'].some((arg) => options.has(arg))))
       throw new Error('A setup key cannot combine with explicit setup values.');
-    if (!key && !['claude', 'codex'].includes(options.get('--provider') ?? ''))
-      throw new Error('Choose --provider claude or codex, or --setup KEY.');
+    if (!key && !provider) throw new Error('Choose arc start claude, arc start codex, or arc start --setup KEY.');
     const serviceTier = options.get('--service-tier') as RequestedServiceTier | undefined;
-    const tierRefusal =
-      serviceTier === undefined ? null : serviceTierRefusal(serviceTier, options.get('--provider') ?? 'codex');
+    const tierRefusal = serviceTier === undefined ? null : serviceTierRefusal(serviceTier, provider ?? 'codex');
     if (tierRefusal) throw new Error(tierRefusal);
     const cacheLifetime = options.get('--cache-lifetime');
     // A setup key names its provider only in the window, so the window refuses a Codex setup.
     const lifetimeRefusal =
-      cacheLifetime === undefined ? null : cacheLifetimeRefusal(cacheLifetime, options.get('--provider') ?? 'claude');
+      cacheLifetime === undefined ? null : cacheLifetimeRefusal(cacheLifetime, provider ?? 'claude');
     if (lifetimeRefusal) throw new Error(lifetimeRefusal);
-    launchPolicy(
-      options.get('--provider') ?? 'claude',
-      flags.has('--read-only'),
-      readTools,
-      options.get('--permissions'),
-    );
+    launchPolicy(provider ?? 'claude', flags.has('--read-only'), readTools, options.get('--permissions'));
     // `--arc-dispatch` makes a guarded start, which records the requesting session as the worker's owner.
     const guarded = flags.has('--arc-dispatch');
     if ((options.has('--completion') || options.has('--report-file')) && !guarded)
@@ -324,7 +319,7 @@ export async function runManagement(command: string, args: string[]): Promise<st
         ? { kind: 'row', key }
         : {
             kind: 'custom',
-            agent: options.get('--provider')!,
+            agent: provider!,
             model: options.get('--model') ?? '',
             effort: options.get('--effort') ?? '',
             permissionMode: options.get('--permissions') ?? '',

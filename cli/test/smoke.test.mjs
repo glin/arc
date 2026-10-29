@@ -1440,7 +1440,7 @@ process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', sessio
         PATH: join(release, 'launchers') + (windows ? ';' : ':') + (process.env.PATH ?? process.env.Path ?? ''),
       });
       const command =
-        'arc run --provider claude --cwd . --model sonnet --effort low --read-only --prompt-file prompt.md --completion wait --json';
+        'arc run claude --cwd . --model sonnet --effort low --read-only --prompt-file prompt.md --completion wait --json';
       const launched = spawnSync(
         windows ? (process.env.ComSpec ?? 'cmd.exe') : '/bin/sh',
         windows ? ['/d', '/c', command] : ['-c', command],
@@ -1742,4 +1742,24 @@ test('the CLI not-observed refusal reuses the window text', () => {
   const cli = readFileSync(new URL('../src/compact.ts', import.meta.url), 'utf8');
   assert.ok(cli.includes("COMPACT_REJECTIONS['not-observed']"), 'the CLI reports the window text');
   assert.ok(!cli.includes('has not seen this command'), 'the CLI holds no copy of the window text');
+});
+
+test('provider command help exposes only applicable options and preserves saved setups', () => {
+  for (const verb of ['start', 'run']) {
+    for (const provider of ['claude', 'codex']) {
+      const command = findCommand([verb, provider]);
+      assert.equal(command.name, `${verb} ${provider}`);
+      assert.equal(command.provider, provider);
+      const flags = command.help.flags.map(([syntax]) => syntax.split(' ')[0]);
+      assert.ok(flags.includes('--model'));
+      assert.equal(flags.includes('--service-tier'), provider === 'codex');
+      assert.equal(flags.includes('--cache-lifetime'), provider === 'claude');
+      assert.equal(flags.includes('--read-tool'), provider === 'claude');
+      assert.ok(!flags.includes('--provider'));
+      assert.ok(!flags.includes('--setup'));
+    }
+  }
+  const parent = findCommand(['start']);
+  assert.ok(parent.help.flags.some(([flag]) => flag === '--setup KEY'));
+  assert.ok(!parent.help.flags.some(([flag]) => flag === '--model MODEL'));
 });

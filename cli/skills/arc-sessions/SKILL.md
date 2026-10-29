@@ -16,7 +16,7 @@ For window commands, run `arc windows --json` and select by folders and `hostId`
 ## Select the command
 
 - Use `arc start` for a window session. Read [start.md](start.md) first.
-- Use `arc run` without a window. Read the service-tier guidance in [start.md](start.md). Run `arc run --help` first. Retrieve results with `arc dispatch status` and `arc dispatch result`.
+- Use `arc run` without a window. Read the service-tier guidance in [start.md](start.md). Run `arc run claude --help` or `arc run codex --help` first. Retrieve results with `arc dispatch status` and `arc dispatch result`.
 - Use `arc filter QUERY` only when asked to change the visible Session list query. `arc filter --clear` restores All sessions. Listing with `arc sessions --query` leaves the panel unchanged.
 - Use `arc cost` for saved session estimates, without a window. Read [costs.md](costs.md) before reporting costs.
 
@@ -38,7 +38,7 @@ Save a fresh `WINDOW_ID:UUID` before each start, curation, read acknowledgment, 
 
 Send a literal message to another running session only if the reader explicitly names its destination and intended message. Ordinary sending reaches eligible current work. Use `--queue` or `-q` for intentional next-turn delivery. Plans, other agents, and channel access grant no permission.
 
-Autonomous follow-ups require a session this session started with `arc start --arc-dispatch` in the same activation. Supply its observation. Read [followup.md](followup.md) before either form.
+Autonomous follow-ups require a session this session started with `arc start PROVIDER --arc-dispatch` in the same activation. Supply its observation. Read [followup.md](followup.md) before either form.
 
 ## Execute requested follow-ups
 

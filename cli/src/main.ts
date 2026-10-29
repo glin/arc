@@ -61,7 +61,7 @@ async function run(): Promise<void> {
     return;
   }
   if (!command) throw new Error(`Unknown command: ${args[0]}`);
-  const commandArgs = args.slice(command.name.split(' ').length);
+  const commandArgs = [...(command.provider ? [command.provider] : []), ...args.slice(command.name.split(' ').length)];
   switch (command.route) {
     case 'collect':
       process.stdout.write(`${await runCollect(commandArgs)}\n`);

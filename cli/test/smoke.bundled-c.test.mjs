@@ -370,7 +370,6 @@ process.stdin.on('end',()=>{
       [
         cli,
         'run',
-        '--provider',
         'claude',
         '--cwd',
         home,
@@ -513,7 +512,6 @@ for(const row of [{type:'thread.started',thread_id:'${id}'},{type:'turn.started'
       [
         cli,
         'run',
-        '--provider',
         'codex',
         '--cwd',
         home,
@@ -577,13 +575,13 @@ test('bundled starts refuse ambiguous guarded requesters and send only accepted 
     };
     const prompt = join(home, 'prompt.txt');
     writeFileSync(prompt, 'Prepare the worktree.');
-    const start = [cli, 'start', '--provider', 'claude', '--prompt-file', prompt];
+    const start = [cli, 'start', 'claude', '--prompt-file', prompt];
     await assert.rejects(
       run(process.execPath, [...start, '--cache-lifetime', '2h'], { env }),
       /Choose --cache-lifetime 5m or 1h\./,
     );
     await assert.rejects(
-      run(process.execPath, [cli, 'start', '--provider', 'codex', '--prompt-file', prompt, '--cache-lifetime', '1h'], {
+      run(process.execPath, [cli, 'start', 'codex', '--prompt-file', prompt, '--cache-lifetime', '1h'], {
         env,
       }),
       /--cache-lifetime applies only to Claude launches\./,

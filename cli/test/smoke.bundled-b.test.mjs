@@ -185,7 +185,6 @@ test('bundled management commands carry reader-default classification, prompt fi
       const args = [
         cli,
         'start',
-        '--provider',
         provider,
         '--model',
         'runtime-model',
@@ -215,11 +214,10 @@ test('bundled management commands carry reader-default classification, prompt fi
     await run(process.execPath, [cli, 'archive', 'accepted', '--force'], { env });
     assert.equal(requests.at(-1).params.force, true);
     for (const cwd of [home, process.cwd()]) {
-      await run(
-        process.execPath,
-        [cli, 'start', '--provider', 'codex', '--prompt-file', prompt, '--read-only', '--cwd', '.'],
-        { env, cwd },
-      );
+      await run(process.execPath, [cli, 'start', 'codex', '--prompt-file', prompt, '--read-only', '--cwd', '.'], {
+        env,
+        cwd,
+      });
       assert.equal(requests.at(-1).params.cwd, realpathSync(cwd));
       assert.equal(requests.at(-1).params.readOnly, true);
       assert.equal(requests.at(-1).params.agentRun, false);
@@ -229,7 +227,6 @@ test('bundled management commands carry reader-default classification, prompt fi
       [
         cli,
         'start',
-        '--provider',
         'claude',
         '--prompt-file',
         prompt,
@@ -244,7 +241,7 @@ test('bundled management commands carry reader-default classification, prompt fi
     assert.deepEqual(requests.at(-1).params.readTools, ['mcp__server__read', 'mcp__server__list']);
     const before = requests.length;
     await assert.rejects(
-      run(process.execPath, [cli, 'start', '--provider', 'codex', '--prompt-file', prompt, '--agent-run=yes'], {
+      run(process.execPath, [cli, 'start', 'codex', '--prompt-file', prompt, '--agent-run=yes'], {
         env,
       }),
       (error) => error.code === 1 && /--agent-run accepts only true or false/.test(error.stderr),

@@ -10256,28 +10256,33 @@ test.each([false, true])(
 
 test('standalone receipts retain delegated and reader ownership in Codex parents', () => {
   for (const agent of ['claude', 'codex'])
-    for (const flags of ['', '--agent-run', '--agent-run=true', '--agent-run=false', '--attach --agent-run']) {
-      const delegated = flags.includes('--agent-run') && !flags.includes('false') && !flags.includes('--attach');
-      const marker = `ARC_DISPATCH_SESSION=${JSON.stringify({ agent, session_id: UUID_B, name: 'Review', ...(!delegated ? { owned: true } : {}) })}`;
-      const command = `arc run --arc-dispatch --provider ${agent} ${flags}`;
-      const prefix = [meta(), event('task_started', 1, { turn_id: TURN }), turnContext(1, TURN, 'gpt-6.1-sol', 'high')];
-      const parent = writeRollout([
-        ...prefix,
-        commandCompleted(2, command, 0, 'completed', 'dispatch', {
-          stdout: JSON.stringify({ state: 'starting' }) + '\n' + marker,
-        }),
-      ]);
-      const [edge] = scanCodexDispatchReferences(parent, 'parent').references;
-      assert.equal(edge.sessionId, UUID_B);
-      assert.equal(edge.owned, !delegated);
-      assert.equal(agentRunAnswer(true, UUID_B, new Set(), false, true, edge.owned), delegated);
-      assert.equal(agentRunAnswer(false, UUID_B, new Set(), true, true, edge.owned), true);
-      const missing = writeRollout([
-        ...prefix,
-        commandCompleted(2, command, 0, 'completed', 'dispatch', { stdout: JSON.stringify({ state: 'starting' }) }),
-      ]);
-      assert.deepEqual(scanCodexDispatchReferences(missing, 'parent').references, []);
-    }
+    for (const legacy of [true, false])
+      for (const flags of ['', '--agent-run', '--agent-run=true', '--agent-run=false', '--attach --agent-run']) {
+        const delegated = flags.includes('--agent-run') && !flags.includes('false') && !flags.includes('--attach');
+        const marker = `ARC_DISPATCH_SESSION=${JSON.stringify({ agent, session_id: UUID_B, name: 'Review', ...(!delegated ? { owned: true } : {}) })}`;
+        const command = `arc run ${legacy ? `--arc-dispatch --provider ${agent}` : `${agent} --arc-dispatch`} ${flags}`;
+        const prefix = [
+          meta(),
+          event('task_started', 1, { turn_id: TURN }),
+          turnContext(1, TURN, 'gpt-6.1-sol', 'high'),
+        ];
+        const parent = writeRollout([
+          ...prefix,
+          commandCompleted(2, command, 0, 'completed', 'dispatch', {
+            stdout: JSON.stringify({ state: 'starting' }) + '\n' + marker,
+          }),
+        ]);
+        const [edge] = scanCodexDispatchReferences(parent, 'parent').references;
+        assert.equal(edge.sessionId, UUID_B);
+        assert.equal(edge.owned, !delegated);
+        assert.equal(agentRunAnswer(true, UUID_B, new Set(), false, true, edge.owned), delegated);
+        assert.equal(agentRunAnswer(false, UUID_B, new Set(), true, true, edge.owned), true);
+        const missing = writeRollout([
+          ...prefix,
+          commandCompleted(2, command, 0, 'completed', 'dispatch', { stdout: JSON.stringify({ state: 'starting' }) }),
+        ]);
+        assert.deepEqual(scanCodexDispatchReferences(missing, 'parent').references, []);
+      }
 });
 
 test.each(['event', 'response'])(

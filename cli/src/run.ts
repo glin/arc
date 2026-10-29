@@ -33,6 +33,9 @@ import {
 } from './standalone.ts';
 
 export function parseRun(args: string[], env = process.env, platform = process.platform) {
+  const [provider, ...remaining] = args;
+  if (provider !== 'claude' && provider !== 'codex') throw new Error('Choose arc run claude or arc run codex.');
+  args = remaining;
   const values = new Map<string, string>();
   const flags = new Set<string>();
   const dirs: string[] = [];
@@ -40,7 +43,6 @@ export function parseRun(args: string[], env = process.env, platform = process.p
   let agentRun = false;
   let classification = false;
   const scalars = [
-    '--provider',
     '--model',
     '--effort',
     '--permissions',
@@ -81,8 +83,6 @@ export function parseRun(args: string[], env = process.env, platform = process.p
     if (!value) throw new Error(`Standalone run requires ${key}.`);
     return value;
   };
-  const provider = required('--provider');
-  if (provider !== 'claude' && provider !== 'codex') throw new Error('Choose --provider claude or codex.');
   const requestedTier = values.get('--service-tier') as RequestedServiceTier | undefined;
   const tierRefusal = requestedTier === undefined ? null : serviceTierRefusal(requestedTier, provider);
   if (tierRefusal) throw new Error(tierRefusal);

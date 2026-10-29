@@ -1,6 +1,8 @@
 # Start a session
 
-Read this before `arc start`.
+Read this before `arc start claude`, `arc start codex`, or `arc start --setup KEY`.
+
+Choose the provider immediately after `start` or `run`. Read that provider command's `--help` for its options. Saved setups determine their own provider and reject a positional provider, model, effort, and permissions.
 
 Run `arc windows --json` when the task starts a session, even with `ARC_WINDOW` set, because start needs `scopeReady`, `panelReady`, and setups. Check `scopeReady` and `panelReady` before starting. A hidden panel leaves live attention unknown. A folderless window cannot start sessions. New sessions use the window's first folder.
 

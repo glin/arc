@@ -81,10 +81,10 @@ Replace `WINDOW_ID` with the intended window's `hostId` and `SESSION_ID` with an
 Start a Codex session with a task from `task.txt`:
 
 ```sh
-arc start --provider codex --prompt-file task.txt --name Review --arc-dispatch --window WINDOW_ID --json
+arc start codex --prompt-file task.txt --name Review --arc-dispatch --window WINDOW_ID --json
 ```
 
-Use `--provider claude` to start Claude Code instead. Either agent can launch the other.
+Use `arc start claude` to start Claude Code. Either agent can launch the other.
 
 Send a message from `message.txt` to an existing live session:
 

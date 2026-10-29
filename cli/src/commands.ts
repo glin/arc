@@ -18,6 +18,7 @@ export interface Command {
   section: Section;
   route: Route;
   action?: string;
+  provider?: 'claude' | 'codex';
   help: {
     summary: string;
     synopsis: string;
@@ -182,7 +183,7 @@ function compact(action: 'request' | 'status' | 'cancel'): Command {
   };
 }
 
-export const COMMANDS: readonly Command[] = [
+const definitions: readonly Command[] = [
   {
     name: 'collect',
     section: 'Reading',
@@ -219,9 +220,8 @@ export const COMMANDS: readonly Command[] = [
     route: 'run',
     help: {
       summary: 'Start one standalone session without an Arc window.',
-      synopsis: 'arc run --provider claude|codex --cwd DIR --model MODEL --effort EFFORT --prompt-file FILE [OPTIONS]',
+      synopsis: 'arc run PROVIDER --cwd DIR --model MODEL --effort EFFORT --prompt-file FILE [OPTIONS]',
       flags: [
-        ['--provider claude|codex', 'Select the provider explicitly.'],
         ['--cwd DIR', 'Use an existing directory. Arc creates no worktree.'],
         ['--model MODEL', 'Required. Select the provider model.'],
         ['--effort EFFORT', 'Required. Select low, medium, high, xhigh, max, or ultra.'],
@@ -267,7 +267,8 @@ export const COMMANDS: readonly Command[] = [
         'JSON identifies the launch receipt. Result and status remain readable after editor shutdown.',
         'Claude read-only uses print mode. Writable Claude uses --bg. Codex uses exec or an attended interactive session.',
         'Claude refuses a --bg launch in a directory it does not trust. Trust in a directory does not cover a repository nested inside it.',
-        'CLAUDE_BIN and CODEX_BIN override executable selection. Without --cache-lifetime, a caller cache TTL remains intact.',
+        'CLAUDE_BIN and CODEX_BIN override executable selection.',
+        'Without --cache-lifetime, a caller cache TTL remains intact.',
       ],
       refusals: [
         'Missing explicit settings, worktree flags, invalid prompts, and unavailable launch directories refuse before spawning.',
@@ -275,7 +276,7 @@ export const COMMANDS: readonly Command[] = [
         'Callback delivery requires proven original parent authority on a supported daemon and is unavailable. Manual and waited completion remain available.',
       ],
       example:
-        'arc run --provider codex --cwd . --model gpt-6.1-sol --effort high --read-only --prompt-file review.md --completion wait --json',
+        'arc run codex --cwd . --model gpt-6.1-sol --effort high --read-only --prompt-file review.md --completion wait --json',
     },
   },
   ...(['logs', 'attach', 'stop', 'rm'] as const).map((action): Command => ({
@@ -528,14 +529,16 @@ export const COMMANDS: readonly Command[] = [
     action: 'start',
     help: {
       summary: 'Start requested work with reader ownership by default.',
-      synopsis: 'arc start --prompt-file PATH (--setup KEY | --provider claude|codex) [OPTIONS]',
+      synopsis: 'arc start PROVIDER --prompt-file PATH [OPTIONS]',
       flags: [
         ['--prompt-file PATH', 'Required. Read a regular UTF-8 file up to 48 KiB.'],
         ['--setup KEY', 'Use a reusable setup key returned by setups.'],
-        ['--provider claude|codex', 'Choose a provider instead of --setup.'],
-        ['--model MODEL', 'Choose a supported model with --provider. Omission retains the provider default.'],
-        ['--effort EFFORT', 'Choose supported effort with --provider. Omission retains the provider default.'],
-        ['--permissions MODE', 'Choose supported permissions with --provider. Omission retains the provider default.'],
+        ['--model MODEL', 'Choose a supported model for this provider. Omission retains the provider default.'],
+        ['--effort EFFORT', 'Choose supported effort for this provider. Omission retains the provider default.'],
+        [
+          '--permissions MODE',
+          'Choose supported permissions for this provider. Omission retains the provider default.',
+        ],
         [
           '--read-only',
           'Keep immutable launch restrictions. Codex denies filesystem writes. Claude restricts tools and git commands but can approve shell writes. See docs/agent-protocols.md#hosted-read-only-launches.',
@@ -744,6 +747,62 @@ export function checkCommandHelp(commands: readonly Command[]): void {
       throw new Error(`Missing command help: ${command.name}`);
   }
 }
+
+// Launch entries share their contracts while each provider owns its accepted options.
+export const COMMANDS: readonly Command[] = definitions.flatMap((command): Command[] => {
+  if (command.name !== 'start' && command.name !== 'run') return [command];
+  const start = command.name === 'start';
+  const explicit = ['--model', '--effort', '--permissions'];
+  const parent: Command = {
+    ...command,
+    help: {
+      ...command.help,
+      summary: start
+        ? 'Start a saved setup or choose claude or codex.'
+        : 'Choose claude or codex for a standalone session.',
+      synopsis: start ? 'arc start --setup KEY --prompt-file PATH [OPTIONS]' : 'arc run claude|codex [OPTIONS]',
+      flags: start ? command.help.flags.filter(([flag]) => !explicit.includes(flag.split(' ')[0])) : [],
+      output: [
+        `Run arc ${command.name} claude --help or arc ${command.name} codex --help for provider options.`,
+        ...(start
+          ? [
+              ...command.help.output,
+              'The selected setup determines the provider. Arc checks provider-only options after resolving that setup.',
+            ]
+          : []),
+      ],
+      refusals: start ? command.help.refusals : ['A first positional provider is required. Choose claude or codex.'],
+      example: start ? command.help.example : 'arc run codex --help',
+    },
+  };
+  return [
+    parent,
+    ...(['claude', 'codex'] as const).map((provider): Command => ({
+      ...command,
+      name: `${command.name} ${provider}`,
+      provider,
+      help: {
+        ...command.help,
+        summary: `${command.help.summary} Provider: ${provider}.`,
+        synopsis: command.help.synopsis.replace('PROVIDER', provider),
+        flags: command.help.flags.filter(([flag]) => {
+          const name = flag.split(' ')[0];
+          return (
+            name !== '--setup' &&
+            (provider === 'claude' ? name !== '--service-tier' : !['--read-tool', '--cache-lifetime'].includes(name))
+          );
+        }),
+        output: command.help.output.filter(
+          (line) => provider === 'claude' || !line.startsWith('Without --cache-lifetime'),
+        ),
+        refusals: command.help.refusals.filter((line) => provider === 'claude' || !line.startsWith('--cache-lifetime')),
+        example: start
+          ? `arc start ${provider} --prompt-file prompt.txt --name Review --arc-dispatch --window WINDOW_ID`
+          : `arc run ${provider} --cwd . --model ${provider === 'claude' ? 'sonnet' : 'gpt-6.1-sol'} --effort high --read-only --prompt-file review.md --completion wait --json`,
+      },
+    })),
+  ];
+});
 
 checkCommandHelp(COMMANDS);
 

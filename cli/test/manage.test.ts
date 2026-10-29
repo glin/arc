@@ -343,7 +343,6 @@ test('start preserves classification and dispatch ownership for both providers',
         [['--agent-run=false'], false],
       ] as const) {
         const args = [
-          '--provider',
           provider,
           '--model',
           'runtime-model',
@@ -526,7 +525,6 @@ test('start returns a session link only for the invoking window with a usable na
       vi.spyOn(sessionRequests, 'requestWindow').mockResolvedValue(entry.reply);
       const name = entry.name === undefined ? 'Review' : entry.name;
       const args = [
-        '--provider',
         'claude',
         '--prompt-file',
         prompt,
@@ -565,14 +563,11 @@ test('start refuses invalid classification and launch flags before the host rece
       ['--read-only', '--read-tool', 'mcp__server__read'],
       ['--read-tool', 'mcp__server__read'],
     ]) {
-      await assert.rejects(runManagement('start', ['--provider', 'codex', '--prompt-file', fixture.prompt, ...flags]));
+      await assert.rejects(runManagement('start', ['codex', '--prompt-file', fixture.prompt, ...flags]));
       assert.equal(fixture.requests.length, 0, flags.join(' '));
     }
     writeFileSync(fixture.prompt, '/clear');
-    await assert.rejects(
-      runManagement('start', ['--provider', 'codex', '--prompt-file', fixture.prompt]),
-      /prompt-box command/,
-    );
+    await assert.rejects(runManagement('start', ['codex', '--prompt-file', fixture.prompt]), /prompt-box command/);
     assert.equal(fixture.requests.length, 0);
   } finally {
     await fixture.close();
@@ -908,10 +903,7 @@ test('ordinary send and both explicit queue spellings retain their distinct deli
 test('hosted service tier preserves setup keys, canonicalizes Fast, and rejects invalid selections', async () => {
   const f = await host();
   try {
-    for (const setup of [
-      ['--provider', 'codex'],
-      ['--setup', 'saved'],
-    ]) {
+    for (const setup of [['codex'], ['--setup', 'saved']]) {
       for (const tier of [undefined, 'default', 'fast', 'priority', 'ultrafast']) {
         await runManagement('start', [...setup, '--prompt-file', f.prompt, ...(tier ? ['--service-tier', tier] : [])]);
         assert.equal(f.requests.at(-1)?.params.serviceTier, tier === 'fast' ? 'priority' : tier);
@@ -923,13 +915,46 @@ test('hosted service tier preserves setup keys, canonicalizes Fast, and rejects 
       ['--service-tier', 'auto'],
       ['--service-tier', 'fast', '--service-tier', 'fast'],
     ])
-      await assert.rejects(runManagement('start', ['--provider', 'codex', '--prompt-file', f.prompt, ...flags]));
+      await assert.rejects(runManagement('start', ['codex', '--prompt-file', f.prompt, ...flags]));
     await assert.rejects(
-      runManagement('start', ['--provider', 'claude', '--prompt-file', f.prompt, '--service-tier', 'fast']),
+      runManagement('start', ['claude', '--prompt-file', f.prompt, '--service-tier', 'fast']),
       /only to Codex/,
     );
     assert.equal(f.requests.length, count);
   } finally {
     await f.close();
+  }
+});
+
+test('hosted provider commands reject ambiguous grammar before requesting a window', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'arc-provider-grammar-'));
+  const prompt = join(home, 'prompt.txt');
+  writeFileSync(prompt, 'Review this project.');
+  const request = vi.spyOn(sessionRequests, 'requestWindow').mockResolvedValue({ status: 'refused' });
+  try {
+    for (const selection of [
+      [],
+      [''],
+      ['other'],
+      ['claude', 'codex'],
+      ['codex', 'codex'],
+      ['--json', 'codex'],
+      ['--provider', 'codex'],
+      ['codex', '--provider', 'codex'],
+      ['--setup', ''],
+      ['codex', '--setup', 'saved'],
+      ['--setup', 'saved', '--model', 'model'],
+      ['--setup', 'saved', '--effort', 'high'],
+      ['--setup', 'saved', '--permissions', 'never'],
+      ['codex', '--native-option'],
+    ])
+      await assert.rejects(runManagement('start', [...selection, '--prompt-file', prompt]));
+    await assert.rejects(
+      runManagement('start', ['--window', 'W', 'codex', '--prompt-file', prompt]),
+      /Choose arc start claude, arc start codex, or arc start --setup KEY/,
+    );
+    assert.equal(request.mock.calls.length, 0);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
   }
 });

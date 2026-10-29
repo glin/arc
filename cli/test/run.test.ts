@@ -74,18 +74,7 @@ function fixture() {
   homes.push(home);
   const prompt = path.join(home, 'prompt.txt');
   fs.writeFileSync(prompt, 'Review this folder.');
-  const args = [
-    '--provider',
-    'codex',
-    '--cwd',
-    home,
-    '--model',
-    'gpt-6.1-sol',
-    '--effort',
-    'high',
-    '--prompt-file',
-    prompt,
-  ];
+  const args = ['codex', '--cwd', home, '--model', 'gpt-6.1-sol', '--effort', 'high', '--prompt-file', prompt];
   return { home, prompt, args };
 }
 afterEach(() => {
@@ -147,7 +136,7 @@ function frames() {
 }
 const transcriptTime = '2026-01-01T00:00:00Z';
 function withProvider(args: string[], provider: string) {
-  return args.map((value, index) => (index === 1 ? provider : value));
+  return args.map((value, index) => (index === 0 ? provider : value));
 }
 function admit(
   receipts: DispatchReceipts,
@@ -1541,7 +1530,7 @@ test('standalone model selection preserves legacy aliases and configured provide
   };
   const check = (input: string, expected: string) => {
     const parsed = parseRun(
-      args.map((value, i) => (i === 5 ? input : value)),
+      args.map((value, i) => (i === args.indexOf('--model') + 1 ? input : value)),
       env,
     );
     assert.equal(parsed.options.model, expected);
@@ -1578,7 +1567,7 @@ test('standalone model selection preserves legacy aliases and configured provide
   check('custom.model', 'custom.model');
   fs.writeFileSync(path.join(home, 'config.toml'), '[profiles.other]\nmodel_provider = "amazon-bedrock"\n');
   check('sol', 'gpt-6.1-sol');
-  const claudeArgs = args.map((value, i) => (i === 1 ? 'claude' : i === 5 ? 'haiku' : value));
+  const claudeArgs = args.map((value, i) => (i === 0 ? 'claude' : i === args.indexOf('--model') + 1 ? 'haiku' : value));
   const claude = parseRun([...claudeArgs, '--read-only'], env);
   assert.equal(claude.options.model, 'claude-haiku-5-5');
   assert.equal(claude.options.args[claude.options.args.indexOf('--model') + 1], 'claude-haiku-5-5');
@@ -1851,7 +1840,7 @@ test('standalone launch argv preserves platform executables and explicit permiss
   for (const { platform, command } of cases) {
     for (const permission of ['workspace-write', 'danger-full-access']) {
       const parsed = parseRun(
-        [...args.map((v, i) => (i === 7 ? 'xhigh' : v)), '--permissions', permission],
+        [...args.map((v, i) => (i === args.indexOf('--effort') + 1 ? 'xhigh' : v)), '--permissions', permission],
         { CODEX_BIN: command, CODEX_HOME: home },
         platform,
       );
@@ -1886,7 +1875,9 @@ test('standalone launch argv preserves platform executables and explicit permiss
       '-c',
       'approvals_reviewer="user"',
     ]);
-    const claudeArgs = args.map((v, i) => (i === 1 ? 'claude' : i === 5 ? 'claude-opus-4-5-20251101' : v));
+    const claudeArgs = args.map((v, i) =>
+      i === 0 ? 'claude' : i === args.indexOf('--model') + 1 ? 'claude-opus-4-5-20251101' : v,
+    );
     for (const permission of ['auto', 'default', 'acceptEdits', 'dontAsk', 'bypassPermissions', 'plan']) {
       const parsed = parseRun([...claudeArgs, '--permissions', permission], { CLAUDE_BIN: command }, platform);
       assert.equal(parsed.options.command, command);
@@ -2212,7 +2203,7 @@ test('attended refusals happen before receipt reservation or process launch', as
     /wait is unsupported/,
   );
   await assert.rejects(
-    runStandalone([...args.slice(0, 1), 'claude', ...args.slice(2), '--attach', '--read-only'], 'arc.cjs', {
+    runStandalone(['claude', ...args.slice(1), '--attach', '--read-only'], 'arc.cjs', {
       env,
       receipts,
     }),
@@ -6340,4 +6331,27 @@ test('refused standalone service tier reserves no receipt and starts no worker',
   assert.equal(reserve.mock.calls.length, 0);
   assert.equal(spawn.mock.calls.length, 0);
   assert.equal(check.mock.calls.length, 1);
+});
+
+test('standalone provider commands refuse missing, misplaced, extra, and legacy provider selections', () => {
+  const { args } = fixture();
+  for (const input of [
+    args.slice(1),
+    ['', ...args.slice(1)],
+    ['other', ...args.slice(1)],
+    ['--provider', ...args],
+    [...args, '--provider', 'codex'],
+    [...args, 'claude'],
+    ['codex', ...args],
+    ['--json', ...args],
+    [...args, '--native-option'],
+  ])
+    assert.throws(() => parseRun(input, { CODEX_BIN: process.execPath }));
+  for (const provider of ['claude', 'codex']) {
+    const parsed = parseRun(withProvider(args, provider), {
+      CODEX_BIN: process.execPath,
+      CLAUDE_BIN: process.execPath,
+    });
+    assert.equal(parsed.options.provider, provider);
+  }
 });

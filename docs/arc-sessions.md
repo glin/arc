@@ -144,7 +144,7 @@ arc CLI <--- local channel ---> Selected ready Arc window
 8. Apply only authorized labels and pins, using `--dry-run` first. Archive only sessions that the skill's [archive authority](../cli/skills/arc-sessions/SKILL.md#manage-a-bounded-set) covers. [Session management](cli.md#session-management) owns what a forced archive admits and keeps.
 9. Leave the requested continuation session available. The reader opens it and sends the next prompt through its Prompt box.
 
-`arc start --arc-dispatch` emits the parent-link receipt for `accepted` and `accepted-with-errors` results that include a session ID. Basic starts need no personal dispatch script. Personal dispatch receipts link sessions. Personal workflows track durable callback ownership and acknowledgment through claim/ack outside Arc. The receipt supplies no callback state. Arc supplies neither detached callbacks nor a cross-provider peer inbox.
+`arc start PROVIDER --arc-dispatch` emits the parent-link receipt for `accepted` and `accepted-with-errors` results that include a session ID. Basic starts need no personal dispatch script. Personal dispatch receipts link sessions. Personal workflows track durable callback ownership and acknowledgment through claim/ack outside Arc. The receipt supplies no callback state. Arc supplies neither detached callbacks nor a cross-provider peer inbox.
 
 Python and shell coordinators use the same CLI. The skill's [command rules](../cli/skills/arc-sessions/SKILL.md#select-the-command) own reader ownership and `--agent-run`. Run `arc --help` and `arc COMMAND --help` for command syntax. [CLI contracts](cli-reference.md) define delivery outcomes and session data. [Session management](cli.md#session-management) explains archive rules and uncertain launches.
 
@@ -204,8 +204,8 @@ arc start --window $arcWindow --setup 'CODEX_SETUP_KEY' --prompt-file $arcPrompt
 Without a returned key, replace the placeholders below with that provider's offered values. If a selected model, effort, or permission value is empty, omit its corresponding flag to retain the provider default. Do not combine `--setup` with explicit settings.
 
 ```powershell
-arc start --window $arcWindow --provider claude --model 'CLAUDE_MODEL_VALUE' --effort 'CLAUDE_EFFORT_VALUE' --permissions 'CLAUDE_PERMISSION_VALUE' --prompt-file $arcPrompt --name 'Claude session check' --arc-dispatch
-arc start --window $arcWindow --provider codex --model 'CODEX_MODEL_VALUE' --effort 'CODEX_EFFORT_VALUE' --permissions 'CODEX_PERMISSION_VALUE' --prompt-file $arcPrompt --name 'Codex session check' --arc-dispatch
+arc start claude --window $arcWindow --model 'CLAUDE_MODEL_VALUE' --effort 'CLAUDE_EFFORT_VALUE' --permissions 'CLAUDE_PERMISSION_VALUE' --prompt-file $arcPrompt --name 'Claude session check' --arc-dispatch
+arc start codex --window $arcWindow --model 'CODEX_MODEL_VALUE' --effort 'CODEX_EFFORT_VALUE' --permissions 'CODEX_PERMISSION_VALUE' --prompt-file $arcPrompt --name 'Codex session check' --arc-dispatch
 ```
 
 Record both accepted session IDs. Inspect each session with the read commands above and confirm its response and recorded provider settings. If delivery is unknown, stop that launch check and preserve its request ID. Do not start a replacement.
