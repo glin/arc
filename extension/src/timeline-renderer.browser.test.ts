@@ -5444,7 +5444,10 @@ test('cache-write warnings share cost faces and retain pinned detail through upd
       const facts = page.locator('#chippop .costgrid:not([hidden]) .costfacts').first();
       assert.equal(await facts.textContent(), `594 requests · 3% cached, warning: ${low} · 159k average input`);
       const cached = facts.locator('.chippopcachehit.is-warning');
-      assert.equal(await cached.getAttribute('title'), low);
+      // The fragment's hover text covers the line's, so it keeps the line's token counts after the warning.
+      const counts = (await facts.getAttribute('title')) || '';
+      assert.match(counts, /input tokens served from the cache\. .* input tokens per request on average\.$/);
+      assert.equal(await cached.getAttribute('title'), `${low}\n${counts}`);
       assert.equal(await cached.locator('.sr-only').textContent(), `, warning: ${low}`);
       assert.equal(await cached.evaluate((node) => getComputedStyle(node, '::before').content), '"⚠︎" / ""');
       // Every cost row's percent wears the quiet tone class, as the approved boards draw it.

@@ -11,7 +11,7 @@ export const HOVER_GRACE_MS = 150;
 
 export const STAT_WARNING_SIGN = '\u26a0\ufe0e';
 
-// What a low cached share in the warning tone means, as its title and its hidden words.
+// What a low cached share in the warning tone means, in its title and its hidden words.
 const LOW_CACHE_WARNING =
   'Less than 80% of input served from cache across at least five model requests and $0.50 of estimated input cost.';
 
@@ -689,6 +689,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
           // One span holds the fragments, so the row's grid places the line as one cell.
           const text = el('span');
           const warning = section.facts.warning;
+          const counts = section.facts.title;
           section.facts.parts.forEach((part, at) => {
             if (at) text.append(' \u00B7 ');
             if (at !== warning) {
@@ -696,8 +697,9 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
               return;
             }
             // The sign is drawn by CSS, which screen readers skip, so hidden words carry the warning.
+            // The fragment's own hover text covers the line's, so it repeats the line's token counts.
             const low = el('span', 'chippopcachehit is-warning', part);
-            low.title = LOW_CACHE_WARNING;
+            low.title = [LOW_CACHE_WARNING, counts].filter(Boolean).join('\n');
             low.append(el('span', 'sr-only', `, warning: ${LOW_CACHE_WARNING}`));
             text.append(low);
           });

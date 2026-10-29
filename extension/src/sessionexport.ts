@@ -5,6 +5,7 @@ import type { ExportCaptureOptions } from './exportdata';
 import { completeSessionExport, snapshotExportReaderState } from './exportdata';
 import { packagedExportAssets } from './exportassets';
 import { projectSessionSite } from './exportsite';
+import type { ModelLabels } from './turnformat';
 import { ExportCancelled, withExportTransaction } from './exportwriter';
 
 export function savedExportSource(session: string, sources: readonly SessionFile[]): SessionFile | null {
@@ -83,6 +84,8 @@ export async function writeSavedSession(
   destination: string,
   extensionDirectory: string,
   options: ExportCaptureOptions,
+  // Display names from the CLIs' model lists, which the exported pages name models with.
+  labels?: ModelLabels,
 ): Promise<{ index: string }> {
   const assets = await packagedExportAssets(extensionDirectory);
   const write = () =>
@@ -90,7 +93,7 @@ export async function writeSavedSession(
       destination,
       (writer) =>
         completeSessionExport(writer, options, (capture, transaction) =>
-          projectSessionSite(capture.model, transaction, assets),
+          projectSessionSite(capture.model, transaction, assets, labels),
         ),
       options.signal,
     );

@@ -40,6 +40,7 @@ import { renderRichMarkdown } from './richtext';
 import { createHash } from 'node:crypto';
 import { railSessions, formatRelative } from './turnview';
 import { formatCost } from './pricing';
+import type { ModelLabels } from './turnformat';
 import { staticPageBody } from './view/static-page';
 import type { PanelSessionRow, PanelStat } from './webview/protocol';
 
@@ -451,8 +452,9 @@ function turnCard(
   capturedAt: number,
   restored = exportTurn(value, agent, session),
   dispatched: readonly DispatchedTurnCost[] = [],
+  labels?: ModelLabels,
 ): CardView {
-  const card = exportCard(toCard(restored, false, capturedAt, [], null, false, new Set(), dispatched));
+  const card = exportCard(toCard(restored, false, capturedAt, [], null, false, new Set(), dispatched, null, labels));
   card.key = value.key;
   if (value.changes === 'partial' && !value.files.length)
     card.chips = card.chips?.filter((chip) => chip.metric !== 'files');
@@ -708,6 +710,8 @@ export async function projectSessionSite(
   model: SessionExport,
   writer: ExportTransaction,
   assets: ExportSiteAssets,
+  // Display names from the CLIs' model lists at capture time. Without them, a model reads its family name or its ID.
+  labels?: ModelLabels,
 ): Promise<void> {
   const script = assets.script.replace(/<\/script/gi, '<\\/script');
   const scriptHash = createHash('sha256').update(script).digest('base64');
@@ -809,7 +813,7 @@ export async function projectSessionSite(
           }
           const card =
             'turn' in entry
-              ? turnCard(entry.turn, session.agent, session.key, model.capturedAt, restored!, dispatched)
+              ? turnCard(entry.turn, session.agent, session.key, model.capturedAt, restored!, dispatched, labels)
               : compactionCard(entry.compaction, session.key, session.firstRequestCachedTokens, model.capturedAt);
           newestAt = Math.max(newestAt, card.endedAt ?? card.startedAt);
           card.sessionTitle = title;
@@ -949,7 +953,7 @@ export async function projectSessionSite(
           delegated: delegatedMissing || (unknownCoverage && delegatedParts.length > 0),
           delegatedScopeIds,
         },
-        { compactionCount: session.compactionCount },
+        { compactionCount: session.compactionCount, labels },
         session.numbers,
       );
       const cost = projection.stats[0];

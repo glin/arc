@@ -9148,6 +9148,8 @@ export class PanelProvider implements vscode.Disposable {
     const source = savedExportSource(session, sources);
     const title = source ? this.sessionLabel(source).fullLabel : session;
     const parents = this.sessionParentEdges(sources).edges;
+    // The page names models with the display names the window holds when the export starts.
+    const labels = this.modelLabels;
     const identity = (source: SessionFile): ExportIdentity => ({
       agent: source.agent,
       sessionId: source.sessionId,
@@ -9202,7 +9204,7 @@ export class PanelProvider implements vscode.Disposable {
               }
             },
           ),
-        write: (destination, options) => writeSavedSession(destination, this.extensionUri.fsPath, options),
+        write: (destination, options) => writeSavedSession(destination, this.extensionUri.fsPath, options, labels),
         completed: async (title, index) => {
           if (
             (await vscode.window.showInformationMessage(

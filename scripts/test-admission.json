@@ -71,8 +71,8 @@
   },
   "extension/src/exportsite.test.ts": {
     "reason": "The production export bundle must retain complete responses and remove host-only actions from portable output.",
-    "cases": 37,
-    "matricesSha256": "46ea953a7f24b22441e46fd7800f05f86c302694d9d6bd966d678ab5a608914a"
+    "cases": 38,
+    "matricesSha256": "43b11f359ed8da51a947e3a606ad8daff10aab1ad88da95f870043fe6dc46b4e"
   },
   "extension/src/gitcommits.test.ts": {
     "reason": "A real fast-forward must retain its reflog details. Verified foreign child commits must retain their repository across cache reload and worktree removal. A removed commit directory must open only in a containing repository that holds the commit.",

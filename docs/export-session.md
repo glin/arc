@@ -16,7 +16,7 @@ Arc creates an `arc-session-<random ID>/site` directory inside the chosen folder
 
 The page embeds scripts and captured data but loads an adjacent stylesheet. Publish the whole `site` directory. Local files, HTTP roots, and nested HTTP directories use the same relative assets.
 
-Relative ages use capture time and do not prove continued process activity. Missing or ambiguous linked evidence leaves relationship coverage partial.
+Relative ages use capture time and do not prove continued process activity. Cost details name each model with its [display name](data-sources.md#source-catalog) from the model lists the window held when the export started. A model without a listed display name reads its family name, such as `Opus 5.5`, or its recorded ID. Rows under **Subagents** and **Dispatched** name each model with its recorded ID minus a leading `claude-` and a trailing eight-digit date such as `-20251001`. Missing or ambiguous linked evidence leaves relationship coverage partial.
 
 The export starts no agent. [`webview/export-model.ts`](../extension/src/webview/export-model.ts)'s `EXPORT_HOST_POLICY` admits only local read-only actions. Markdown links and images remain inert. Recorded text can still contain private paths, addresses, or secrets. Review the complete directory before sharing it.
 

@@ -962,6 +962,52 @@ test('linked Subagents and Dispatched rows retain recorded child cost and durati
   }
 });
 
+test('an exported page names a model outside the family pattern with the display name the window held', async () => {
+  const writer = await ExportTransaction.create(tempDir('arc-site-model-labels-'));
+  try {
+    const model = await sessionSiteFixture(writer);
+    const root = model.sessions[0];
+    const page = await writer.readSpool<import('./exportdata').ExportPage>(root.pages[0]);
+    page.turns[0].model = 'claude-fable-5-1';
+    root.pages[0] = await writer.spool(page);
+    const usage = {
+      requests: 2,
+      input: 1000,
+      cacheRead: 0,
+      cacheWrite1h: 0,
+      cacheWrite5m: 0,
+      cacheWrite30m: 0,
+      output: 30,
+      thinking: 0,
+    };
+    root.numbers = {
+      parts: [costPartOf({ role: 'main', model: 'claude-fable-5-1', provider: null, contextWindow: null, usage })],
+      main: { dollars: 2, partial: false },
+      delegated: { dollars: 0, partial: false },
+      combined: { dollars: 2, partial: false },
+      coverage: { usage: 'complete', cost: 'complete' },
+    };
+    await projectSessionSite(
+      model,
+      writer,
+      { script: '', stylesheet: '' },
+      new Map([['claude-fable-5-1', 'Fable 5.1']]),
+    );
+    const { manifest, data } = exportedSiteData((await writer.publish(async () => {})).directory);
+    type CostDetail = { detailList: { cost: { sections: { detail?: string }[] } } };
+    const cost = manifest.stats.root.find((stat) => stat.metric === 'cost') as unknown as CostDetail;
+    assert.equal(cost.detailList.cost.sections[0].detail, 'Fable 5.1');
+    const card = manifest.sessions[0].pages
+      .flatMap((sitePage) => sitePage.cards ?? [])
+      .map((asset) => (data.get(asset.id) as { card: CardView }).card)
+      .find((candidate) => candidate.key === page.turns[0].key);
+    const turnCost = card?.chips?.find((chip) => chip.metric === 'cost') as unknown as CostDetail;
+    assert.equal(turnCost.detailList.cost.sections[0].detail, 'Fable 5.1');
+  } finally {
+    await writer.dispose();
+  }
+});
+
 test('a saved session keeps subagent wait usage and shows the wait-share line', async () => {
   const writer = await ExportTransaction.create(tempDir('arc-site-wait-share-'));
   try {
