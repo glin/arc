@@ -1253,12 +1253,16 @@ function report(outcome: Outcome, label: string, workspace: string): void {
   }
 }
 
+async function loadScrubbedVariables(): Promise<void> {
+  ({ SCRUBBED_VARIABLES: scrubbedVariables } = await import('../../../scripts/isolated-editor.mjs'));
+}
+
 async function main(): Promise<void> {
   const options = readOptions(process.argv.slice(2));
   selectionRequested = options.selection;
   soakRequested = options.soakMinutes > 0;
   responseRequested = options.response;
-  ({ SCRUBBED_VARIABLES: scrubbedVariables } = await import('../../../scripts/isolated-editor.mjs'));
+  await loadScrubbedVariables();
   loadFixture(options.fixture);
   options.workspace = fixture.workspace;
   const commandLine = editorCommandLine();

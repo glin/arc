@@ -910,6 +910,7 @@ test('isolated startup pins source provenance before a moving reference builds',
   const deps = {
     readOptions: () => ({ fixture: 'manifest', commit: 'topic', keep: true }),
     loadFixture() {},
+    loadScrubbedVariables: async () => {},
     fixture: { workspace: 'frozen' },
     editorCommandLine: () => 'code',
     SCRATCH: 'scratch',
