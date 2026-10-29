@@ -27,6 +27,253 @@ import { contributedFileSides } from './patchview';
 import * as crypto from 'node:crypto';
 import { codexSubagentFor, type CodexSubagentFile } from './codex';
 import { fileDiffersOnDisk } from './store';
+import * as rollouts from './rolloutsource';
+import * as rolloutZstd from 'node:zlib';
+import { receiptDispatchFixture } from './turnfixtures';
+import * as compressedSpend from './projectspend';
+
+test.skipIf(!(rolloutZstd as any).zstdCompressSync)(
+  'content search recovers after a host miss and after decoded source eviction',
+  async () => {
+    const directory = tempDir('compressed-search-');
+    const file = path.join(directory, 'rollout-aaaaaaaa-1111-2222-3333-444444444444.jsonl.zst');
+    const id = 'aaaaaaaa-1111-2222-3333-444444444444';
+    const records = [
+      { type: 'session_meta', payload: { id, cwd: directory } },
+      { type: 'event_msg', timestamp: '2026-10-01T12:00:00Z', payload: { type: 'task_started', turn_id: 'turn' } },
+      {
+        type: 'event_msg',
+        timestamp: '2026-10-01T12:00:01Z',
+        payload: { type: 'user_message', message: 'recover searchable prompt' },
+      },
+      { type: 'event_msg', timestamp: '2026-10-01T12:00:02Z', payload: { type: 'task_complete', turn_id: 'turn' } },
+    ];
+    const bytes = Buffer.from(records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+    fs.writeFileSync(file, (rolloutZstd as any).zstdCompressSync(bytes));
+    const other = path.join(directory, 'other.jsonl.zst');
+    fs.writeFileSync(other, (rolloutZstd as any).zstdCompressSync(Buffer.from('other\n'.repeat(1000))));
+    const sources = new rollouts.RolloutSources({ asyncOnly: true, budget: 16 });
+    vi.spyOn(rollouts, 'openRolloutSource').mockImplementation((file, opening, io) => sources.open(file, opening, io));
+    vi.spyOn(rollouts, 'rolloutSourceReady').mockImplementation((file) => {
+      try {
+        sources.open(file).close();
+        return true;
+      } catch {
+        return false;
+      }
+    });
+    const answers: any[][] = [];
+    const source = { agent: 'codex', sessionId: id, file, size: bytes.length, mtimeMs: 1 };
+    const provider: any = Object.assign(Object.create(PanelProvider.prototype), {
+      showing: id,
+      corpus: new Map(),
+      codexStats: new Map(),
+      rolloutSearch: 'recover',
+      allSessions: () => [source],
+      sessionLabel: () => ({ label: 'Compressed session' }),
+      refreshFrom() {},
+      answerSearch(this: { searchCorpus(only: string): any[] }) {
+        answers.push(this.searchCorpus(id));
+      },
+    });
+    let unsubscribe = sources.onReady((file) => provider.rolloutReady(file));
+    try {
+      provider.answerSearch();
+      assert.equal(provider.corpus.has(file), false);
+      await vi.waitFor(() =>
+        assert.ok(answers.at(-1)?.some((entry) => entry.prompt.includes('recover searchable prompt'))),
+      );
+      unsubscribe();
+      (await sources.prepare(other))();
+      provider.corpus.clear();
+      unsubscribe = sources.onReady((file) => provider.rolloutReady(file));
+      provider.answerSearch();
+      assert.equal(provider.corpus.has(file), false);
+      await vi.waitFor(() =>
+        assert.ok(answers.at(-1)?.some((entry) => entry.prompt.includes('recover searchable prompt'))),
+      );
+    } finally {
+      unsubscribe();
+      vi.restoreAllMocks();
+    }
+  },
+);
+
+test.skipIf(!(rolloutZstd as any).zstdCompressSync)(
+  'Project cost finishes compressed slices once despite eviction and overlapping offers',
+  async () => {
+    const directory = tempDir('compressed-spend-host-');
+    const f = receiptDispatchFixture(directory, 'codex', 'codex');
+    const plain = f.parent.file;
+    const body = fs.readFileSync(plain);
+    const file = plain + '.zst';
+    fs.writeFileSync(file, (rolloutZstd as any).zstdCompressSync(body));
+    fs.unlinkSync(plain);
+    const other = path.join(directory, 'other.jsonl.zst');
+    fs.writeFileSync(other, (rolloutZstd as any).zstdCompressSync(Buffer.from('other\n'.repeat(1000))));
+    const decoded: string[] = [];
+    const sources = new rollouts.RolloutSources({
+      asyncOnly: true,
+      budget: 16,
+      decodeStarted: (file) => {
+        decoded.push(file);
+      },
+    });
+    let begin!: () => void;
+    const waiting = new Promise<void>((resolve) => {
+      begin = resolve;
+    });
+    vi.spyOn(rollouts, 'prepareRolloutSource').mockImplementation(async (file) => {
+      await waiting;
+      return sources.prepare(file);
+    });
+    vi.spyOn(rollouts, 'openRolloutSource').mockImplementation((file, opening, io) => sources.open(file, opening, io));
+    vi.spyOn(rollouts, 'rolloutStat').mockImplementation(((file: string, options: any) =>
+      sources.stat(file, options)) as any);
+    const index = compressedSpend.indexSpendFile;
+    vi.spyOn(compressedSpend, 'indexSpendFile').mockImplementation(((
+      previous: any,
+      file: string,
+      workspace: string,
+      reducer: any,
+    ) => index(previous, file, workspace, reducer, { maxBytes: 64, maxMilliseconds: Infinity })) as any);
+    let scheduled = 0;
+    let finished = 0;
+    const provider: any = Object.assign(Object.create(PanelProvider.prototype), {
+      projectSpendWorkspace: directory,
+      projectSpendStorageDir: directory,
+      projectSpendEpoch: 1,
+      projectSpendRevision: 0,
+      projectSpendQueue: [{ file, agent: 'codex' }],
+      projectSpendFiles: [],
+      projectSpendQueued: new Set([normalizeSpendFile(file)]),
+      projectSpendLeases: new Map(),
+      spendRecordsByFile: new Map(),
+      projectSpendIndexing: true,
+      projectSpendTick: null,
+      postRailIfSpendPendingMoved() {},
+      postProjectSpend() {},
+      scheduleProjectSpendSave() {},
+      invalidateProjectSpendSnapshot() {},
+      scheduleNextProjectSpendFile() {
+        scheduled++;
+      },
+      finishProjectSpendIndex() {
+        finished++;
+      },
+    });
+    try {
+      const pending = provider.indexNextProjectSpendFile();
+      assert.equal(provider.projectSpendReading, true);
+      provider.queueProjectSpendIndex(new Map(), new Set(), []);
+      await provider.indexNextProjectSpendFile();
+      assert.equal(finished, 0);
+      assert.equal(scheduled, 0);
+      begin();
+      await pending;
+      let slices = 1;
+      while (provider.projectSpendQueue.length && slices++ < body.length) {
+        (await sources.prepare(other))();
+        await provider.indexNextProjectSpendFile();
+      }
+      assert.ok(slices > 2);
+      assert.equal(provider.projectSpendQueue.length, 0);
+      assert.equal(provider.projectSpendFiles[0].complete, true);
+      assert.equal(provider.projectSpendFiles[0].offset, body.length);
+      assert.equal(provider.projectSpendFiles[0].lifetimeBuckets[0].usage.input, 10000);
+      assert.equal(decoded.filter((value) => value === file).length, 1);
+      const checked: any[] = [];
+      provider.spendSourcesByFile = new Map([[normalizeSpendFile(file), { file, agent: 'codex' }]]);
+      provider.spendChecks = new compressedSpend.SpendCoverage();
+      provider.codexStats = { accept: (_file: string, stat: any) => checked.push(stat) };
+      provider.publishProjectSpendCoverage = () => {};
+      provider.queueProjectSpendIndex = () => {};
+      await provider.checkProjectSpendSources([normalizeSpendFile(file)], () => true);
+      assert.equal(checked[0].size, body.length);
+      assert.equal(decoded.filter((value) => value === file).length, 1);
+    } finally {
+      for (const release of provider.projectSpendLeases.values()) release();
+      vi.restoreAllMocks();
+    }
+  },
+);
+
+test('Project cost publishes completion after workspace changes during archive preparation', async () => {
+  const previous = tempDir('compressed-spend-previous-');
+  const workspace = tempDir('compressed-spend-current-');
+  const current = receiptDispatchFixture(workspace, 'codex', 'codex').parent.file;
+  const archive = path.join(previous, 'old.jsonl.zst');
+  let resume!: () => void;
+  const preparation = new Promise<void>((resolve) => {
+    resume = resolve;
+  });
+  const release = vi.fn<() => void>();
+  vi.spyOn(rollouts, 'prepareRolloutSource').mockImplementation(async () => {
+    await preparation;
+    return release;
+  });
+  const posts: boolean[] = [];
+  const completed = vi.fn<() => void>();
+  let scheduled = 0;
+  const provider: any = Object.assign(Object.create(PanelProvider.prototype), {
+    projectSpendWorkspace: previous,
+    projectSpendStorageDir: workspace,
+    projectSpendEpoch: 1,
+    projectSpendRevision: 0,
+    projectSpendQueue: [{ file: archive, agent: 'codex' }],
+    projectSpendQueued: new Set([normalizeSpendFile(archive)]),
+    projectSpendOffers: new Set(),
+    projectSpendLeases: new Map(),
+    projectSpendFiles: [],
+    projectSpendVisibleFiles: [],
+    projectSpendIndexing: true,
+    projectSpendTick: null,
+    folders: () => [workspace],
+    flushProjectSpendSave() {},
+    cancelProjectSpendSaveRetry() {},
+    cancelProjectSpendHydration() {},
+    cancelProjectSpendRebuild() {},
+    unknownProjectSpendSnapshot: () => null,
+    postRailIfSpendPendingMoved() {},
+    postProjectSpend() {
+      posts.push(this.projectSpendIndexing);
+    },
+    scheduleProjectSpendSave() {},
+    invalidateProjectSpendSnapshot() {},
+    scheduleNextProjectSpendFile() {
+      scheduled++;
+    },
+    publishProjectSpendCoverage: completed,
+    postRail() {},
+    postDispatchedCostsIfMoved() {},
+  });
+  try {
+    const pending = provider.indexNextProjectSpendFile();
+    assert.equal(provider.projectSpendReading, true);
+    provider.ensureProjectSpendWorkspace();
+    assert.equal(provider.projectSpendIndexing, false);
+    provider.queueProjectSpendIndex(new Map(), null, [{ file: current, agent: 'codex' }]);
+    assert.equal(provider.projectSpendIndexing, true);
+    assert.deepEqual(posts, [true]);
+    assert.equal(scheduled, 0);
+    resume();
+    await pending;
+    assert.equal(release.mock.calls.length, 1);
+    assert.equal(scheduled, 1);
+    assert.equal(provider.projectSpendFiles.length, 0);
+    await provider.indexNextProjectSpendFile();
+    await provider.indexNextProjectSpendFile();
+    assert.equal(provider.projectSpendIndexing, false);
+    assert.equal(provider.projectSpendVisibleFiles.length, 1);
+    assert.equal(provider.projectSpendVisibleFiles[0].complete, true);
+    assert.equal(provider.projectSpendVisibleFiles[0].lifetimeBuckets[0].usage.input, 10000);
+    assert.deepEqual(posts, [true, false]);
+    assert.equal(completed.mock.calls.length, 1);
+  } finally {
+    resume();
+    vi.restoreAllMocks();
+  }
+});
 
 test('native Copy Path and Copy Relative Path retain citation filename suffixes', async () => {
   const { linkTarget, resolveLink, relativePath, nativePath } = await import('./transcript.js');
@@ -30379,7 +30626,10 @@ test('quiet polls do not walk every Project cost source', () => {
     /trustedListedRevisions\(all, this\.catalogWalked, this\.showing\)/,
     'the source offer either states every file again or trusts revisions it did not read',
   );
-  const indexer = memberFrom(panelHostSource, panelHostSource.indexOf('private indexNextProjectSpendFile(): void {'));
+  const indexer = memberFrom(
+    panelHostSource,
+    panelHostSource.indexOf('private async indexNextProjectSpendFile(): Promise<void> {'),
+  );
   const completedAt = indexer.indexOf('if (result.complete)');
   assert.notEqual(completedAt, -1, 'the spend indexer no longer branches on a completed read');
   const completedEnd = layoutIndexOf(indexer, 'else { this.projectSpendQueue.push(next); }', completedAt);
@@ -30387,7 +30637,7 @@ test('quiet polls do not walk every Project cost source', () => {
   const completed = indexer.slice(completedAt, completedEnd);
   sourceMatch(
     completed,
-    /fs\.statSync\(next\.file, \{ bigint: true \}\)/,
+    /rolloutStat\(next\.file, \{ bigint: true \}, fs\)/,
     'a source that grows during its bounded read waits for the broad integrity pass',
   );
   sourceDoesNotMatch(completed, /queueProjectSpendIndex/, 'completing one source walks every source again');
@@ -35324,6 +35574,8 @@ test('provider registration routes retained-tab counts and build identity into d
     healthPulse() {}
   }
   const scope = {
+    setRolloutLogger: () => {},
+    onRolloutReady: () => () => {},
     performance,
     process,
     path,

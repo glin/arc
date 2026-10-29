@@ -1162,8 +1162,10 @@ $errors = ($captured | Where-Object { $_ -is [System.Management.Automation.Error
         }
         // The standalone bundle receives the same argument without a launcher.
         let stderr = '';
+        const lifecycle = new EventEmitter();
         const cliProcess = {
           ...process,
+          once: lifecycle.once.bind(lifecycle),
           argv: [process.execPath, cliPath, first],
           env,
           exitCode: 0,

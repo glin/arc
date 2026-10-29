@@ -1,6 +1,16 @@
+import {
+  isCompressedRollout,
+  openRolloutSource,
+  prepareRolloutSource,
+  readRolloutOpening,
+  rolloutStat,
+  isRolloutName,
+  rolloutStem,
+  preferPlainRollouts,
+} from './rolloutsource';
 import { meterRead, meterReadWork, readPhase } from './readmeter';
 import * as fs from 'node:fs/promises';
-import type { Dir } from 'node:fs';
+import { read as readDescriptor, type Dir } from 'node:fs';
 import * as path from 'node:path';
 import { createHash } from 'node:crypto';
 import {
@@ -153,6 +163,7 @@ interface Inventory {
   bytes: number;
 }
 interface FrozenSource {
+  bytes?: number;
   file: string;
   stamp: Stamp;
   digest: string;
@@ -183,7 +194,7 @@ async function fileEntry(agent: AgentKind, file: string, sessionId: string, pare
     agent,
     file,
     sessionId,
-    size: stat.size,
+    size: isCompressedRollout(file) ? 0 : stat.size,
     mtimeMs: stat.mtimeMs,
     dev: stat.dev,
     ino: stat.ino,
@@ -197,6 +208,13 @@ async function openingOf(
   limits: ExportLimits,
   signal?: AbortSignal,
 ): Promise<{ text: string; digest: string }> {
+  if (isCompressedRollout(file)) {
+    const opening = await readRolloutOpening(file, limits.recordBytes + 1);
+    const end = opening.indexOf(10);
+    const bytes = end < 0 ? opening : opening.subarray(0, end);
+    if (bytes.length > limits.recordBytes) throw new ExportLimitError('record', limits.recordBytes);
+    return { text: bytes.toString('utf8'), digest: hash(bytes) };
+  }
   const handle = await fs.open(file, 'r');
   try {
     let buffer = Buffer.allocUnsafe(Math.min(limits.sliceBytes, 32 * 1024));
@@ -224,27 +242,40 @@ async function openingOf(
 }
 
 async function sourceDigest(entry: Entry, limits: ExportLimits, signal?: AbortSignal): Promise<FrozenSource> {
-  checkExportCancellation(signal);
-  const before = await fs.lstat(entry.file);
-  if (!before.isFile() || before.isSymbolicLink() || !sameStamp(before, entry.stamp)) throw new SourceChanged();
-  const handle = await fs.open(entry.file, 'r');
+  const release = await prepareRolloutSource(entry.file);
   try {
-    if (!sameStamp(await handle.stat(), before)) throw new SourceChanged();
-    const digest = createHash('sha256');
-    const buffer = Buffer.allocUnsafe(limits.sliceBytes);
-    for (let at = 0; at < before.size;) {
-      checkExportCancellation(signal);
-      const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, before.size - at), at);
-      meterRead(entry.file, bytesRead, at);
-      if (!bytesRead) throw new SourceChanged();
-      digest.update(buffer.subarray(0, bytesRead));
-      at += bytesRead;
+    checkExportCancellation(signal);
+    const before = await fs.lstat(entry.file);
+    if (!before.isFile() || before.isSymbolicLink() || !sameStamp(before, entry.stamp)) throw new SourceChanged();
+    const handle = openRolloutSource(entry.file);
+    try {
+      const opened = handle.stat();
+      if (!sameStamp({ ...stampOf(opened), size: before.size }, before)) throw new SourceChanged();
+      const digest = createHash('sha256');
+      const buffer = Buffer.allocUnsafe(limits.sliceBytes);
+      for (let at = 0; at < handle.size;) {
+        checkExportCancellation(signal);
+        const bytesRead = await new Promise<number>((resolve, reject) => {
+          readDescriptor(handle.descriptor, buffer, 0, Math.min(buffer.length, handle.size - at), at, (error, count) =>
+            error ? reject(error) : resolve(count),
+          );
+        });
+        meterRead(entry.file, bytesRead, at);
+        if (!bytesRead) throw new SourceChanged();
+        digest.update(buffer.subarray(0, bytesRead));
+        at += bytesRead;
+      }
+      if (
+        !sameStamp({ ...stampOf(handle.stat()), size: before.size }, before) ||
+        !sameStamp(await fs.lstat(entry.file), before)
+      )
+        throw new SourceChanged();
+      return { file: entry.file, bytes: entry.size, stamp: stampOf(before), digest: digest.digest('hex') };
+    } finally {
+      handle.close();
     }
-    if (!sameStamp(await handle.stat(), before) || !sameStamp(await fs.lstat(entry.file), before))
-      throw new SourceChanged();
-    return { file: entry.file, stamp: stampOf(before), digest: digest.digest('hex') };
   } finally {
-    await handle.close();
+    release();
   }
 }
 
@@ -288,12 +319,20 @@ async function inventoryOf(options: ExportCaptureOptions, limits: ExportLimits):
         if (depth > 0) await walk(file, agent, depth - 1);
         continue;
       }
-      if (!child.isFile() || !child.name.endsWith('.jsonl')) continue;
+      if (!child.isFile() || !(agent === 'codex' ? isRolloutName(child.name) : child.name.endsWith('.jsonl'))) continue;
       candidates.push({ agent, file, name: child.name });
     }
   };
   await walk(options.roots?.claude ?? projectsRoot(), 'claude', 1);
   await walk(options.roots?.codex ?? codexSessionsRoot(), 'codex', 3);
+  const paired = preferPlainRollouts(
+    candidates.filter((entry) => entry.agent === 'codex'),
+    (entry) => entry.file,
+  );
+  const admitted = new Set(paired.map((entry) => entry.file));
+  for (let at = candidates.length - 1; at >= 0; at--) {
+    if (candidates[at].agent === 'codex' && !admitted.has(candidates[at].file)) candidates.splice(at, 1);
+  }
   const results: Array<{ entry?: Entry; metadata: string; reason?: ExportOmissionReason }> = [];
   let next = 0;
   // Metadata reads share a bounded worker pool. Results retain inventory order for admission.
@@ -304,7 +343,7 @@ async function inventoryOf(options: ExportCaptureOptions, limits: ExportLimits):
         const index = next++;
         const { agent, file, name } = candidates[index];
         try {
-          let entry = await fileEntry(agent, file, name.slice(0, -6));
+          let entry = await fileEntry(agent, file, path.basename(rolloutStem(name)));
           if (agent === 'codex') {
             const opening = await openingOf(file, limits, options.signal);
             const meta = openingRecordOf(opening.text);
@@ -749,82 +788,87 @@ async function referencesOf(
   limits: ExportLimits,
   progress: (bytes: number) => void,
 ): Promise<{ references: ClaudeChildSessionReference[]; complete: boolean; source: FrozenSource }> {
-  const before = await fs.lstat(entry.file);
-  if (!before.isFile() || before.isSymbolicLink() || !sameStamp(before, entry.stamp)) throw new SourceChanged();
-  const digest = createHash('sha256');
-  let through = 0;
-  const meter = {
-    readBytes: 0,
-    size: entry.stamp.size,
-    onRead(bytes: Buffer, offset: number) {
-      if (offset !== through) throw new SourceChanged();
-      digest.update(bytes);
-      through += bytes.length;
-    },
-  };
-  const check = async () => {
-    checkExportCancellation(options.signal);
-    if (!sameStamp(await fs.lstat(entry.file), before)) throw new SourceChanged();
-    progress(through);
-  };
-  const source = (): FrozenSource => {
-    if (through !== entry.stamp.size) throw new SourceChanged();
-    return { file: entry.file, stamp: entry.stamp, digest: digest.digest('hex') };
-  };
-  const policy = {
-    recordBytes: limits.recordBytes,
-    dispatchIdentities: limits.dispatchIdentities,
-    relationships: limits.relationships,
-  };
-  if (entry.agent === 'claude') {
-    let cursor: ClaudeRelationshipCursor | undefined;
+  const release = await prepareRolloutSource(entry.file);
+  try {
+    const before = await fs.lstat(entry.file);
+    if (!before.isFile() || before.isSymbolicLink() || !sameStamp(before, entry.stamp)) throw new SourceChanged();
+    const digest = createHash('sha256');
+    let through = 0;
+    const meter = {
+      readBytes: 0,
+      size: rolloutStat(entry.file).size,
+      onRead(bytes: Buffer, offset: number) {
+        if (offset !== through) throw new SourceChanged();
+        digest.update(bytes);
+        through += bytes.length;
+      },
+    };
+    const check = async () => {
+      checkExportCancellation(options.signal);
+      if (!sameStamp(await fs.lstat(entry.file), before)) throw new SourceChanged();
+      progress(through);
+    };
+    const source = (): FrozenSource => {
+      if (through !== rolloutStat(entry.file).size) throw new SourceChanged();
+      return { file: entry.file, bytes: entry.size, stamp: entry.stamp, digest: digest.digest('hex') };
+    };
+    const policy = {
+      recordBytes: limits.recordBytes,
+      dispatchIdentities: limits.dispatchIdentities,
+      relationships: limits.relationships,
+    };
+    if (entry.agent === 'claude') {
+      let cursor: ClaudeRelationshipCursor | undefined;
+      for (;;) {
+        checkExportCancellation(options.signal);
+        const offset = cursor?.offset;
+        const applied = cursor?.applied;
+        const validation = cursor?.evidence?.validation?.digest.offset;
+        const result = await scanClaudeRelationshipQuantum(
+          entry,
+          cursor,
+          limits.sliceBytes,
+          options.signal,
+          meter,
+          policy,
+        );
+        await check();
+        if (result.reset && cursor) throw new SourceChanged();
+        if (result.complete) return { references: result.references, complete: result.qualified, source: source() };
+        if (
+          cursor &&
+          result.cursor.offset === offset &&
+          result.cursor.applied === applied &&
+          result.cursor.evidence?.validation?.digest.offset === validation
+        )
+          throw new SourceChanged();
+        cursor = result.cursor;
+      }
+    }
+    let cursor: CodexDispatchCursor | null = null;
     for (;;) {
       checkExportCancellation(options.signal);
-      const offset = cursor?.offset;
-      const applied = cursor?.applied;
-      const validation = cursor?.evidence?.validation?.digest.offset;
-      const result = await scanClaudeRelationshipQuantum(
-        entry,
+      const result = await scanCodexDispatchReferencesAsync(
+        entry.file,
+        entry.sessionId,
         cursor,
         limits.sliceBytes,
-        options.signal,
+        () => options.signal?.aborted === true,
         meter,
         policy,
       );
       await check();
       if (result.reset && cursor) throw new SourceChanged();
-      if (result.complete) return { references: result.references, complete: result.qualified, source: source() };
-      if (
-        cursor &&
-        result.cursor.offset === offset &&
-        result.cursor.applied === applied &&
-        result.cursor.evidence?.validation?.digest.offset === validation
-      )
-        throw new SourceChanged();
+      if (result.traversed)
+        return { references: result.references, complete: result.complete && result.qualified, source: source() };
+      await pause();
+      checkExportCancellation(options.signal);
+      if (cursor && result.readBytes === 0 && result.cursor.offset === cursor.offset)
+        throw new Error('The session ends with incomplete saved data.');
       cursor = result.cursor;
     }
-  }
-  let cursor: CodexDispatchCursor | null = null;
-  for (;;) {
-    checkExportCancellation(options.signal);
-    const result = await scanCodexDispatchReferencesAsync(
-      entry.file,
-      entry.sessionId,
-      cursor,
-      limits.sliceBytes,
-      () => options.signal?.aborted === true,
-      meter,
-      policy,
-    );
-    await check();
-    if (result.reset && cursor) throw new SourceChanged();
-    if (result.traversed)
-      return { references: result.references, complete: result.complete && result.qualified, source: source() };
-    await pause();
-    checkExportCancellation(options.signal);
-    if (cursor && result.readBytes === 0 && result.cursor.offset === cursor.offset)
-      throw new Error('The session ends with incomplete saved data.');
-    cursor = result.cursor;
+  } finally {
+    release();
   }
 }
 
@@ -953,38 +997,43 @@ async function numericRecord(
   options: ExportCaptureOptions,
   limits: ExportLimits,
 ): Promise<SpendFileIndex> {
-  let record: SpendFileIndex | undefined;
-  const classifier =
-    entry.agent === 'claude'
-      ? createClaudeRunClassifier(needsAgentRunScan(entry))
-      : createCodexRunClassifier(entry.opening ?? null);
-  entry.runClassifier = classifier;
-  const factory = (state: unknown): UsageLineReducer => {
-    const reducer =
+  const release = await prepareRolloutSource(entry.file);
+  try {
+    let record: SpendFileIndex | undefined;
+    const classifier =
       entry.agent === 'claude'
-        ? createClaudeUsageLineReducer(state as ClaudeUsageReducerState | undefined, {
-            childTranscript: entry.childTranscript === true,
-            retainAllRequests: true,
-          })
-        : createCodexUsageLineReducer(state as Parameters<typeof createCodexUsageLineReducer>[0]);
-    return {
-      ...reducer,
-      pushLine(line, end) {
-        classifier.pushLine(line);
-        return reducer.pushLine(line, end);
-      },
+        ? createClaudeRunClassifier(needsAgentRunScan(entry))
+        : createCodexRunClassifier(entry.opening ?? null);
+    entry.runClassifier = classifier;
+    const factory = (state: unknown): UsageLineReducer => {
+      const reducer =
+        entry.agent === 'claude'
+          ? createClaudeUsageLineReducer(state as ClaudeUsageReducerState | undefined, {
+              childTranscript: entry.childTranscript === true,
+              retainAllRequests: true,
+            })
+          : createCodexUsageLineReducer(state as Parameters<typeof createCodexUsageLineReducer>[0]);
+      return {
+        ...reducer,
+        pushLine(line, end) {
+          classifier.pushLine(line);
+          return reducer.pushLine(line, end);
+        },
+      };
     };
-  };
-  for (;;) {
-    checkExportCancellation(options.signal);
-    const result = indexSpendFile(record, entry.file, entry.cwd ?? 'export', factory, {
-      maxBytes: limits.sliceBytes,
-      exportRecordBytes: limits.recordBytes,
-    });
-    if (!result.found || result.invalidated) throw new SourceChanged();
-    record = result.record;
-    if (result.complete) return record;
-    await pause();
+    for (;;) {
+      checkExportCancellation(options.signal);
+      const result = indexSpendFile(record, entry.file, entry.cwd ?? 'export', factory, {
+        maxBytes: limits.sliceBytes,
+        exportRecordBytes: limits.recordBytes,
+      });
+      if (!result.found || result.invalidated) throw new SourceChanged();
+      record = result.record;
+      if (result.complete) return record;
+      await pause();
+    }
+  } finally {
+    release();
   }
 }
 
@@ -1037,13 +1086,19 @@ export async function captureSessionExport(
   const queue: Entry[] = [];
   const discoveryPartial = new Set<string>();
   let bytes = 0;
-  const admit = (entry: Entry): string => {
+  const admit = async (entry: Entry): Promise<string> => {
     const identity = entryKey(entry);
     const known = keys.get(identity);
     if (known) {
       if (normalizeFsPath(entries.get(known)!.file) !== normalizeFsPath(entry.file))
         throw new Error('The linked session identity is ambiguous.');
       return known;
+    }
+    const release = await prepareRolloutSource(entry.file);
+    try {
+      entry.size = rolloutStat(entry.file).size;
+    } finally {
+      release();
     }
     if (entries.size + 1 > limits.sessions) throw new ExportLimitError('sessions', limits.sessions);
     if (entry.size > limits.sourceBytes) throw new ExportLimitError('source', limits.sourceBytes);
@@ -1056,10 +1111,10 @@ export async function captureSessionExport(
     queue.push(entry);
     return key;
   };
-  const rootKey = admit(root);
+  const rootKey = await admit(root);
   const edgeSet = new Set<string>();
   const edgeEvidence = new Map<string, string>();
-  const link = (
+  const link = async (
     from: string,
     kind: ExportRelationship['kind'],
     target?: Entry,
@@ -1076,7 +1131,7 @@ export async function captureSessionExport(
       throw new ExportLimitError('relationships', limits.relationships);
     edgeSet.add(identity);
     const key = `r${relationships.length + 1}`;
-    const to = target ? admit(target) : null;
+    const to = target ? await admit(target) : null;
     relationships.push({
       key,
       from,
@@ -1100,7 +1155,10 @@ export async function captureSessionExport(
     if (entry.agent === 'claude' && !entry.cwd) entry.cwd = readSessionCwd(entry.file) ?? undefined;
     const key = keys.get(entryKey(entry))!;
     readPhase('relationships');
-    const completedBytes = [...frozen.values()].reduce((total, source) => total + source.stamp.size, 0);
+    const completedBytes = [...frozen.values()].reduce(
+      (total, source) => total + (source.bytes ?? source.stamp.size),
+      0,
+    );
     const progress = (bytes: number) =>
       options.progress?.('relationships', position, {
         discovered: queue.length,
@@ -1140,17 +1198,17 @@ export async function captureSessionExport(
         const cwd = readSessionCwd(child.file);
         if (cwd) child.cwd = cwd;
         for (const id of child.launchIds?.length ? child.launchIds : [`native-${child.sessionId}`])
-          link(key, 'subagent', child, undefined, 'delegated', id);
+          await link(key, 'subagent', child, undefined, 'delegated', id);
       }
       for (const missing of native.missing)
-        link(key, 'subagent', undefined, missing.reason, 'delegated', missing.evidence, missing.identity);
+        await link(key, 'subagent', undefined, missing.reason, 'delegated', missing.evidence, missing.identity);
       for (const reference of references.filter((reference) => reference.kind !== 'dispatch')) {
         const child = native.children.find(
           (child) =>
             child.sessionId === reference.sessionId && normalizeFsPath(child.file) === normalizeFsPath(reference.file),
         );
         if (child) {
-          for (const id of reference.toolUseIds) link(key, 'subagent', child, undefined, 'delegated', id);
+          for (const id of reference.toolUseIds) await link(key, 'subagent', child, undefined, 'delegated', id);
           continue;
         }
         // A paired parent launch establishes direct ownership where older records have no meta file.
@@ -1161,16 +1219,16 @@ export async function captureSessionExport(
           if (metadata.has(metaFile)) {
             if (!native.missing.some((missing) => missing.identity === reference.sessionId))
               for (const id of reference.toolUseIds)
-                link(key, 'subagent', undefined, 'conflicting', 'delegated', id, reference.sessionId);
+                await link(key, 'subagent', undefined, 'conflicting', 'delegated', id, reference.sessionId);
             continue;
           }
           const cwd = readSessionCwd(target.file);
           if (cwd) target.cwd = cwd;
-          for (const id of reference.toolUseIds) link(key, 'subagent', target, undefined, 'delegated', id);
+          for (const id of reference.toolUseIds) await link(key, 'subagent', target, undefined, 'delegated', id);
         } catch (error) {
           if (error instanceof ExportLimitError || options.signal?.aborted) throw error;
           for (const id of reference.toolUseIds)
-            link(
+            await link(
               key,
               'subagent',
               undefined,
@@ -1191,17 +1249,17 @@ export async function captureSessionExport(
           continue;
         const owner = resolvedEntry({ agent: 'codex', sessionId: entry.sessionId }, inventory);
         if (owner.entry !== entry && entry !== root) {
-          link(key, 'subagent', undefined, 'conflicting');
+          await link(key, 'subagent', undefined, 'conflicting');
           continue;
         }
-        link(key, 'subagent', candidate);
+        await link(key, 'subagent', candidate);
       }
     }
     for (const reference of references) {
       if (reference.kind !== 'dispatch') continue;
       const target = dispatchEntry(reference, inventory);
       for (const id of reference.toolUseIds)
-        link(
+        await link(
           key,
           'dispatched',
           target.entry,
@@ -1216,7 +1274,7 @@ export async function captureSessionExport(
     for (const reader of options.readerLinks ?? []) {
       if (identityKey(reader.parent) !== identityKey(entry)) continue;
       const target = resolvedEntry(reader.child, inventory);
-      link(key, 'reader-started', target.entry, target.reason);
+      await link(key, 'reader-started', target.entry, target.reason);
     }
     const readerParentSources = new Map(
       [...inventory.entries, ...entries.values()]
@@ -1237,13 +1295,13 @@ export async function captureSessionExport(
           : inventory.partial
             ? 'inventory-incomplete'
             : 'missing';
-      link(key, 'reader-started', target, reason, 'navigation', '', child);
+      await link(key, 'reader-started', target, reason, 'navigation', '', child);
     }
   }
   options.progress?.('relationships', queue.length, {
     discovered: queue.length,
     completed: queue.length,
-    bytes: [...frozen.values()].reduce((total, source) => total + source.stamp.size, 0),
+    bytes: [...frozen.values()].reduce((total, source) => total + (source.bytes ?? source.stamp.size), 0),
   });
   const claims = relationships.filter((edge) => edge.to !== null && edge.kind !== 'reader-started');
   const parentIndex = sessionParentIndex(

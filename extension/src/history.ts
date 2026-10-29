@@ -1,4 +1,5 @@
 import * as fs from 'node:fs';
+import { openRolloutSource, prepareRolloutSource, type RolloutSource } from './rolloutsource';
 import { meterRead } from './readmeter';
 
 import {
@@ -268,16 +269,16 @@ function sameIdentity(identity: FileIdentity, revision: FileRevision): boolean {
 }
 
 function revisionFor(file: string): FileRevision | null {
-  let fd = -1;
+  let fd: RolloutSource | undefined;
   try {
-    fd = fs.openSync(file, 'r');
-    return revisionOf(fs.fstatSync(fd, { bigint: true }));
+    fd = openRolloutSource(file, false, fs);
+    return revisionOf(fd.stat({ bigint: true }));
   } catch {
     return null;
   } finally {
-    if (fd >= 0) {
+    if (fd) {
       try {
-        fs.closeSync(fd);
+        fd.close();
       } catch {
         /* ignore */
       }
@@ -286,31 +287,31 @@ function revisionFor(file: string): FileRevision | null {
 }
 
 export function readStableRange(file: string, start: number, length: number, revision: FileRevision): Buffer | null {
-  let fd = -1;
+  let fd: RolloutSource | undefined;
   try {
-    fd = fs.openSync(file, 'r');
-    if (!sameRevision(revisionOf(fs.fstatSync(fd, { bigint: true })), revision)) {
+    fd = openRolloutSource(file, false, fs);
+    if (!sameRevision(revisionOf(fd.stat({ bigint: true })), revision)) {
       return null;
     }
     const buffer = Buffer.allocUnsafe(length);
     let read = 0;
     while (read < length) {
-      const count = meterRead(file, fs.readSync(fd, buffer, read, length - read, start + read), start + read);
+      const count = meterRead(file, fd.readInto(buffer, read, length - read, start + read), start + read);
       if (count <= 0) {
         return null;
       }
       read += count;
     }
-    if (!sameRevision(revisionOf(fs.fstatSync(fd, { bigint: true })), revision)) {
+    if (!sameRevision(revisionOf(fd.stat({ bigint: true })), revision)) {
       return null;
     }
     return buffer;
   } catch {
     return null;
   } finally {
-    if (fd >= 0) {
+    if (fd) {
       try {
-        fs.closeSync(fd);
+        fd.close();
       } catch {
         /* ignore */
       }
@@ -673,20 +674,25 @@ export async function readForwardSessionAsync<State>(
   maxReadBytes = DEFAULT_FORWARD_BYTES,
   work: ForwardReadOptions = {},
 ): Promise<IncrementalSessionResult<State>> {
-  const scan = scanForwardSession(file, source, sessionId, factory, checkpoint, readRange, parserKey, maxReadBytes, {
-    ...work,
-    chunkBytes: work.chunkBytes ?? 256 * 1024,
-  });
-  let next = scan.next();
-  while (!next.done) {
-    if (work.pause) {
-      await work.pause();
-    } else {
-      await new Promise<void>((resolve) => setImmediate(resolve));
+  const release = await prepareRolloutSource(file);
+  try {
+    const scan = scanForwardSession(file, source, sessionId, factory, checkpoint, readRange, parserKey, maxReadBytes, {
+      ...work,
+      chunkBytes: work.chunkBytes ?? 256 * 1024,
+    });
+    let next = scan.next();
+    while (!next.done) {
+      if (work.pause) {
+        await work.pause();
+      } else {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+      next = scan.next();
     }
-    next = scan.next();
+    return next.value;
+  } finally {
+    release();
   }
-  return next.value;
 }
 
 function startHistoryCursor<State>(
@@ -1021,18 +1027,23 @@ export async function readSemanticHistoryPageAsync<State>(
   initial: SourceHistoryCursor<State> | null,
   options: SemanticHistoryOptions = {},
 ): Promise<SemanticHistoryResult<State>> {
-  const scan = scanSemanticHistoryPage(file, sessionId, adapter, initial, options);
-  let next = scan.next();
-  while (!next.done) {
-    if (options.signal?.aborted) {
-      return { kind: 'cancelled', page: null, openRange: null };
+  const release = await prepareRolloutSource(file);
+  try {
+    const scan = scanSemanticHistoryPage(file, sessionId, adapter, initial, options);
+    let next = scan.next();
+    while (!next.done) {
+      if (options.signal?.aborted) {
+        return { kind: 'cancelled', page: null, openRange: null };
+      }
+      if (options.pause) {
+        await options.pause();
+      } else {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+      next = scan.next();
     }
-    if (options.pause) {
-      await options.pause();
-    } else {
-      await new Promise<void>((resolve) => setImmediate(resolve));
-    }
-    next = scan.next();
+    return next.value;
+  } finally {
+    release();
   }
-  return next.value;
 }

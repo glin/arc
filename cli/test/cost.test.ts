@@ -1,3 +1,4 @@
+import * as zstd from 'node:zlib';
 import {
   bedrockAstraRecords,
   advisorProbeRecords,
@@ -1987,3 +1988,60 @@ test('cost prices Bedrock Astra parent and native Plato without counting shared 
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+const rolloutCompression: typeof zstd & { zstdCompressSync?: (bytes: Buffer) => Buffer } = zstd;
+test.skipIf(!rolloutCompression.zstdCompressSync)(
+  'arc cost includes a compressed rollout by id and prefers its plain pair',
+  async () => {
+    const f = fixture();
+    const id = 'aaaaaaaa-1111-2222-3333-444444444444';
+    const file = path.join(f.codex, `rollout-2026-09-26T00-00-00-${id}.jsonl`);
+    const timestamp = '2026-09-26T00:00:00Z';
+    const counts = {
+      input_tokens: 10000,
+      cached_input_tokens: 0,
+      cache_write_input_tokens: 0,
+      output_tokens: 2000,
+      reasoning_output_tokens: 0,
+      total_tokens: 12000,
+    };
+    fs.writeFileSync(
+      file,
+      [
+        { type: 'session_meta', timestamp, payload: { id, cwd: f.root, source: 'cli', model_provider: 'openai' } },
+        { type: 'event_msg', timestamp, payload: { type: 'task_started', turn_id: 'one' } },
+        { type: 'turn_context', timestamp, payload: { turn_id: 'one', model: 'gpt-6-sol' } },
+        {
+          type: 'token_usage_record',
+          timestamp,
+          payload: {
+            thread_id: id,
+            session_id: id,
+            turn_id: 'one',
+            response_id: 'response-one',
+            usage: counts,
+            thread_token_usage: counts,
+            turn_token_usage: counts,
+          },
+        },
+        {
+          type: 'event_msg',
+          timestamp,
+          payload: { type: 'token_count', info: { last_token_usage: counts, total_token_usage: counts } },
+        },
+      ]
+        .map((record) => JSON.stringify(record))
+        .join('\n') + '\n',
+    );
+    const flags = ['--projects', f.projects, '--codex-sessions', f.codex];
+    const plain = JSON.parse(await runCost([id, ...flags]));
+    assert.ok(plain.combined.pricedCostUsd > 0);
+    fs.writeFileSync(file + '.zst', rolloutCompression.zstdCompressSync!(fs.readFileSync(file)));
+    assert.equal(JSON.parse(await runCost([id, ...flags])).combined.pricedCostUsd, plain.combined.pricedCostUsd);
+    fs.unlinkSync(file);
+    const compressed = JSON.parse(await runCost([id, ...flags]));
+    assert.equal(compressed.source.file, file + '.zst');
+    assert.deepEqual(compressed.parent, plain.parent);
+    assert.deepEqual(compressed.combined, plain.combined);
+  },
+);

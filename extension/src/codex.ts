@@ -1,3 +1,15 @@
+import {
+  isCompressedRollout,
+  openRolloutSource,
+  rolloutStat,
+  type RolloutSource,
+  isRolloutName,
+  rolloutThreadId,
+  rolloutStem,
+  preferPlainRollouts,
+  rolloutCatalogStat,
+  readRolloutOpening,
+} from './rolloutsource';
 import type { SourceEnumeration } from './sessioncoverage';
 import { codexToolKind, nestedToolName, wrappedCommand } from './domain/tool-kinds';
 import type { InitialNameSubscription } from './sessionrename';
@@ -392,14 +404,14 @@ function firstLineStep(buf: Buffer, have: number, read: number, want: number): s
 // Read the first line in growing windows up to `META_BYTES`. Decode only through its newline.
 // Accept an unterminated line when the file ends below the bound. Failed opens and reads throw.
 function firstLineOf(file: string): string | null {
-  let fd = -1;
+  let fd: RolloutSource | undefined;
   try {
-    fd = fs.openSync(file, 'r');
+    fd = openRolloutSource(file, true, fs);
     return firstLineFromDescriptor(file, fd);
   } finally {
-    if (fd >= 0) {
+    if (fd) {
       try {
-        fs.closeSync(fd);
+        fd.close();
       } catch {
         /* ignore */
       }
@@ -407,13 +419,13 @@ function firstLineOf(file: string): string | null {
   }
 }
 
-function firstLineFromDescriptor(file: string, fd: number): string | null {
+function firstLineFromDescriptor(file: string, fd: RolloutSource): string | null {
   const buf = (headBuffer ??= Buffer.allocUnsafe(META_BYTES));
   let have = 0;
   let window = FIRST_LINE_WINDOW;
   for (;;) {
     const want = window - have;
-    const read = meterRead(file, fs.readSync(fd, buf, have, want, have), have);
+    const read = meterRead(file, fd.readInto(buf, have, want, have), have);
     const line = firstLineStep(buf, have, read, want);
     if (line !== undefined) return line;
     have += read;
@@ -431,6 +443,11 @@ export function readQualifiedCodexOpening(file: string): { value: CodexSessionMe
 // Read the first line asynchronously. This read owns its `META_BYTES` buffer until settlement.
 // Failed opens and reads reject, distinguishing refusal from a head with no opening record.
 async function firstLineOfAsync(file: string, buf: Buffer): Promise<string | null> {
+  if (isCompressedRollout(file)) {
+    const bytes = await readRolloutOpening(file, buf.length);
+    bytes.copy(buf);
+    return firstLineStep(buf, 0, bytes.length, buf.length) ?? null;
+  }
   let handle: fs.promises.FileHandle | null = null;
   try {
     handle = await fs.promises.open(file, 'r');
@@ -619,10 +636,6 @@ function codexReplayBoundaryAt(
     : payloadAt + CODEX_REPLAY_CLOCK_SLACK_MS - CODEX_TURN_START_ROUNDING_MS;
 }
 
-// The thread id at the end of `rollout-<ISO8601>-<uuid>.jsonl`, for a file whose opening
-// record did not name one.
-const ROLLOUT_NAME = /-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i;
-
 // List every rollout under `root` within `WALK_DEPTH`.
 // Directory dates describe session starts, not their latest activity. Do not prune resumed sessions by those dates.
 export function rolloutFiles(root: string): string[] {
@@ -658,7 +671,12 @@ class RolloutWalk {
 
   read(entries: fs.Dirent[]): void {
     this.directories.push(this.dir!);
-    this.open.push({ dir: this.dir!, depth: this.depth, entries, next: 0 });
+    this.open.push({
+      dir: this.dir!,
+      depth: this.depth,
+      entries: preferPlainRollouts(entries, (entry) => entry.name),
+      next: 0,
+    });
     this.dir = null;
   }
 
@@ -696,7 +714,7 @@ class RolloutWalk {
             this.depth = depth + 1;
             return;
           }
-        } else if (entry.name.endsWith('.jsonl')) {
+        } else if (isRolloutName(entry.name)) {
           this.files.push(path.join(dir, entry.name));
         }
       }
@@ -774,12 +792,12 @@ export function watchInitialCodexName(session: string, cwd: string, wake: () => 
         if (!watchers.has(directory)) {
           const watcher = fs.watch(directory, { persistent: false }, (_kind, name) => {
             const filename = name?.toString();
-            if (directory !== path.dirname(root) && filename && ROLLOUT_NAME.exec(filename)?.[1] === session)
+            if (directory !== path.dirname(root) && filename && rolloutThreadId(filename) === session)
               addFile(path.join(directory, filename));
             if (
               !filename ||
               directories.has(path.join(directory, filename)) ||
-              ROLLOUT_NAME.exec(filename)?.[1] === session ||
+              rolloutThreadId(filename) === session ||
               filename === 'session_index.jsonl'
             ) {
               inspect(!filename);
@@ -793,8 +811,8 @@ export function watchInitialCodexName(session: string, cwd: string, wake: () => 
           watchers.set(directory, watcher);
         }
         if (directory !== path.dirname(root)) {
-          for (const name of fs.readdirSync(directory)) {
-            if (ROLLOUT_NAME.exec(name)?.[1] === session) addFile(path.join(directory, name));
+          for (const name of preferPlainRollouts(fs.readdirSync(directory), (name) => name)) {
+            if (rolloutThreadId(name) === session) addFile(path.join(directory, name));
           }
         }
       } catch (error) {
@@ -805,13 +823,13 @@ export function watchInitialCodexName(session: string, cwd: string, wake: () => 
   inspect();
   return {
     current: () => {
-      const openings = [...files]
+      const openings = preferPlainRollouts([...files], (file) => file)
         .filter((file) => admittedDirectory(path.dirname(file)) && path.dirname(file) !== path.dirname(root))
         .map((file) => ({ file, opening: readQualifiedCodexOpening(file) }))
         .filter((item) => item.opening?.value.sessionId === session);
       let indexRevision = '';
       try {
-        indexRevision = JSON.stringify(revisionOf(fs.statSync(indexFile, { bigint: true })));
+        indexRevision = JSON.stringify(revisionOf(rolloutStat(indexFile, { bigint: true }, fs)));
       } catch {
         /* no index on this machine yet */
       }
@@ -859,6 +877,7 @@ export async function enumerateRolloutFilesAsync(
   signal?: AbortSignal,
   readDirectory: (dir: string) => fs.Dirent[] | Promise<fs.Dirent[]> = (dir) =>
     fs.readdirSync(dir, { withFileTypes: true }),
+  _prepareBytes = true,
 ): Promise<SourceEnumeration | null> {
   const walk = new RolloutWalk(root);
   let slice = performance.now();
@@ -925,7 +944,7 @@ export interface RolloutStat {
 
 export function readRolloutStat(file: string): RolloutStat | null {
   try {
-    const stat = fs.statSync(file, { bigint: true });
+    const stat = rolloutCatalogStat(file, fs);
     return {
       ...revisionOf(stat),
       isFile: stat.isFile(),
@@ -1077,14 +1096,14 @@ export function codexSessionFiles(
     }
     const stat = statOf(file);
     if (!stat) admission = 'incomplete';
-    if (!stat || !stat.isFile || stat.size === 0) {
+    if (!stat || !stat.isFile || (stat.size === 0 && !isCompressedRollout(file))) {
       continue;
     }
-    const named = ROLLOUT_NAME.exec(path.basename(file));
+    const named = rolloutThreadId(file);
     out.push({
       agent: 'codex',
       file,
-      sessionId: meta.sessionId || (named ? named[1] : path.basename(file, '.jsonl')),
+      sessionId: meta.sessionId || named || path.basename(rolloutStem(file)),
       mtimeMs: stat.mtimeMs,
       size: stat.size,
       cwd: meta.cwd,
@@ -1238,7 +1257,7 @@ export interface ThreadNames {
 export function readThreadNames(file: string, held: ThreadNames | null): ThreadNames {
   let stamp = '';
   try {
-    const st = fs.statSync(file);
+    const st = rolloutStat(file, undefined, fs);
     stamp = `${st.size}:${st.mtimeMs}`;
   } catch {
     /* no index on this machine yet */
@@ -3967,7 +3986,7 @@ function* codexDispatchSteps(
   meter?: RelationshipReadMeter,
   exportPolicy?: ExportRelationshipLimits,
 ): Generator<void, CodexDispatchScan> {
-  const fd = fs.openSync(file, 'r');
+  const fd = openRolloutSource(file, false, fs);
   try {
     let cursor =
       previous && JSON.stringify(previous.exportPolicy) === JSON.stringify(exportPolicy)
@@ -4119,7 +4138,7 @@ function* codexDispatchSteps(
       unresolvedTurnIds,
     };
   } finally {
-    fs.closeSync(fd);
+    fd.close();
   }
 }
 
@@ -5283,11 +5302,11 @@ export function scanForCodexPerson(
       terminal: null,
     };
   }
-  let fd = -1;
+  let fd: RolloutSource | undefined;
   try {
-    fd = fs.openSync(file, 'r');
+    fd = openRolloutSource(file, false, fs);
     const chunk = Buffer.allocUnsafe(Math.min(Math.max(0, size - scan.bytes), 256 * 1024));
-    const read = meterRead(file, fs.readSync(fd, chunk, 0, chunk.length, scan.bytes));
+    const read = meterRead(file, fd.readInto(chunk, 0, chunk.length, scan.bytes));
     scan.bytes += read;
     let bytes = Buffer.concat([scan.fragment, chunk.subarray(0, read)]);
     const completion = scan.dispatchCompletion;
@@ -5323,7 +5342,7 @@ export function scanForCodexPerson(
       scan.dispatchCompletion.terminal = null;
     }
   } finally {
-    if (fd >= 0) fs.closeSync(fd);
+    if (fd) fd.close();
   }
   return scan;
 }
@@ -5341,7 +5360,7 @@ let codexDispatchCacheBytes = 0;
 
 function dispatchSpendKey(file: string): string {
   try {
-    const stat = fs.statSync(file, { bigint: true });
+    const stat = rolloutStat(file, { bigint: true }, fs);
     return [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].join(':');
   } catch {
     return 'missing';

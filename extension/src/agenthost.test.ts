@@ -11245,6 +11245,10 @@ async function readerCompactionAfterScopeRecovery(queuedReaderInput: boolean) {
   const { PanelProvider } = await import('./panelhost.ts');
   let now = 1_000;
   const root = tempDir('compact-reader-scope-');
+  vi.stubEnv('ARC_CODEX_ROOT', tempDir('compact-reader-codex-'));
+  onTestFinished(() => {
+    vi.unstubAllEnvs();
+  });
   const cwd = path.join(root, 'project');
   const extra = path.join(root, 'extra');
   fs.mkdirSync(cwd);

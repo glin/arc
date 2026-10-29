@@ -1,4 +1,5 @@
 import os from 'node:os';
+import * as zstd from 'node:zlib';
 import { syncBuiltinESMExports } from 'node:module';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -98,6 +99,7 @@ function relationshipFixture(
   childProvider: 'claude' | 'codex' = 'codex',
   agentRun = false,
   cwd?: string,
+  compressed = false,
 ) {
   const fx = fixture();
   const launch = fx.receipts.reserve({
@@ -106,9 +108,9 @@ function relationshipFixture(
     requester: { provider: parentProvider, id: session },
     standalone: settings(fx.home, { provider: childProvider, agentRun, ...(cwd ? { cwd } : {}) }),
   });
-  const file = path.join(fx.home, 'native.jsonl');
+  const file = path.join(fx.home, 'native.jsonl' + (compressed ? '.zst' : ''));
   const opening = Buffer.from(JSON.stringify({ sessionId: turn, cwd: cwd ?? fx.home }) + '\n' + 'x'.repeat(2048));
-  fs.writeFileSync(file, opening);
+  fs.writeFileSync(file, compressed ? (zstd as any).zstdCompressSync(opening) : opening);
   const stat = fs.statSync(file, { bigint: true });
   const directory = fs.statSync(fx.home, { bigint: true });
   fx.receipts.startup(launch.launchId, {
@@ -146,6 +148,24 @@ function drainRelationships(
   return assert.fail('The bounded receipt scan did not finish.');
 }
 
+test.skipIf(!(zstd as any).zstdCompressSync).each([false, true])(
+  'compressed child receipts retain delegated relationships after compression=%s',
+  (repacked) => {
+    const fx = relationshipFixture('codex', 'codex', false, undefined, !repacked);
+    const compressed = repacked ? fx.file + '.zst' : fx.file;
+    if (repacked) {
+      fs.writeFileSync(compressed, (zstd as any).zstdCompressSync(fx.opening));
+      fs.unlinkSync(fx.file);
+      fx.catalog[1] = { ...fx.catalog[1], file: compressed };
+    }
+    const references = drainRelationships(fx.receipts.relationships(fx.catalog));
+    assert.equal(references.length, 1);
+    assert.equal(references[0].file, compressed);
+    assert.equal(references[0].parentSessionId, session);
+    assert.equal(references[0].owned, true);
+  },
+);
+
 test.each(['claude', 'codex'] as const)('verified %s receipt links survive removal of launch cwd', (provider) => {
   const cwd = scratch('arc-dispatch-worker-');
   const fx = relationshipFixture('claude', provider, false, cwd);
@@ -157,6 +177,25 @@ test.each(['claude', 'codex'] as const)('verified %s receipt links survive remov
   const restarted = new DispatchReceipts(fx.home);
   assert.deepEqual(drainRelationships(restarted.relationships(fx.catalog)), linked);
 });
+
+test.skipIf(!(zstd as any).zstdCompressSync).each([false, true])(
+  'verified child attribution survives compression with launch folder removed=%s',
+  (removed) => {
+    const cwd = scratch('arc-dispatch-worker-');
+    const fx = relationshipFixture('claude', 'codex', false, cwd);
+    const linked = drainRelationships(fx.receipts.relationships(fx.catalog));
+    assert.equal(linked.length, 1);
+    fx.receipts.checkpointRelationships();
+    if (removed) fs.rmdirSync(cwd);
+    const compressed = fx.file + '.zst';
+    fs.writeFileSync(compressed, (zstd as any).zstdCompressSync(fx.opening));
+    fs.unlinkSync(fx.file);
+    fx.catalog[1] = { ...fx.catalog[1], file: compressed };
+    const expected = linked.map((reference) => ({ ...reference, file: compressed }));
+    assert.deepEqual(drainRelationships(fx.receipts.relationships(fx.catalog)), expected);
+    assert.deepEqual(drainRelationships(new DispatchReceipts(fx.home).relationships(fx.catalog)), expected);
+  },
+);
 
 test('concurrent verification publications preserve a retained receipt link during validation', () => {
   const cwd = scratch('arc-dispatch-worker-');

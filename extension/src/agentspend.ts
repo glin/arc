@@ -1,4 +1,5 @@
-import fs from 'node:fs';
+import * as fs from 'node:fs';
+import { isCompressedRollout, openRolloutSource, rolloutStat, type RolloutSource } from './rolloutsource';
 import { meterRead } from './readmeter';
 import { StringDecoder } from 'node:string_decoder';
 import type { ChildArtifacts } from './childartifacts';
@@ -438,14 +439,17 @@ export function readChildSpend(
 
 export function spendFileVersion(file: string): string {
   try {
-    const stat = fs.statSync(file);
-    return stat.isFile() ? `${stat.size}:${stat.mtimeMs}` : 'not-file';
+    const stat = rolloutStat(file, undefined, fs);
+    if (!stat.isFile()) return 'not-file';
+    if (!isCompressedRollout(file)) return `${stat.size}:${stat.mtimeMs}`;
+    const physical = rolloutStat(file, { bigint: true }, fs);
+    return `${physical.dev}:${physical.ino}:${physical.mtimeNs}:${physical.ctimeNs}:${stat.size}:${stat.mtimeMs}`;
   } catch {
     return 'missing';
   }
 }
 
-// Reads UTF-8 lines without retaining the full transcript. One unfinished line can span several read chunks.
+// Visits UTF-8 lines in bounded chunks. One unfinished line can span several read chunks.
 // A visitor returning exactly true stops newline-delimited scanning and returns false.
 // The final unterminated line is visited after EOF. Its visitor result does not change true completion.
 export function scanLines(file: string, visit: (line: string) => unknown): boolean {
@@ -455,16 +459,16 @@ export function scanLines(file: string, visit: (line: string) => unknown): boole
   return next.value;
 }
 
-// Each chunk returns control without retaining the complete transcript.
+// Each chunk returns control to the caller.
 export function* scanLinesIncremental(
   file: string,
   visit: (line: string) => unknown,
 ): Generator<{ bytes: number; end: boolean }, boolean> {
-  let fd = -1;
+  let fd: RolloutSource | undefined;
   let readWholeFile = false;
   try {
-    fd = fs.openSync(file, 'r');
-    const size = fs.fstatSync(fd).size;
+    fd = openRolloutSource(file, false, fs);
+    const size = fd.stat().size;
     let through = 0;
     const chunk = Buffer.allocUnsafe(64 * 1024);
     const decoder = new StringDecoder('utf8');
@@ -476,7 +480,7 @@ export function* scanLinesIncremental(
       return visit(line.endsWith('\r') ? line.slice(0, -1) : line) === true;
     };
     while (!stopped) {
-      const read = meterRead(file, fs.readSync(fd, chunk, 0, chunk.length, null));
+      const read = meterRead(file, fd.readInto(chunk, 0, chunk.length, null));
       if (read === 0) {
         break;
       }
@@ -506,9 +510,9 @@ export function* scanLinesIncremental(
   } catch {
     /* an agent can remove its transcript while the store is being swept */
   } finally {
-    if (fd >= 0) {
+    if (fd) {
       try {
-        fs.closeSync(fd);
+        fd.close();
       } catch {
         /* ignore */
       }

@@ -1,3 +1,5 @@
+import * as path from 'node:path';
+import * as zstd from 'node:zlib';
 import { test, vi } from 'vitest';
 import assert from 'node:assert';
 import {
@@ -843,3 +845,17 @@ test('merged requests keep the files that reusing requests name', () => {
   assert.deepEqual(mergeRefreshRequests(request(true, ['a']), request(false, ['b'])).changedPaths, ['a', 'b']);
   assert.equal(mergeRefreshRequests(request(true, ['a']), request(false, null)).changedPaths, null);
 });
+
+test.skipIf(!(zstd as any).zstdCompressSync)(
+  'compressed rollout events wake refresh and temporary files do not',
+  () => {
+    const pending = new PendingWatcherWake();
+    assert.equal(pending.noteFileEvent('sessions', 'rollout-test.jsonl.zst', 'change'), true);
+    assert.equal(pending.noteFileEvent('sessions', 'rollout-test.jsonl.zst.lock', 'change'), false);
+    assert.equal(pending.noteFileEvent('sessions', 'rollout-test.jsonl.zst.tmp', 'change'), false);
+    const batch = pending.take();
+    assert.equal(batch.eventCount, 1);
+    assert.deepEqual(batch.changedPaths, [path.join('sessions', 'rollout-test.jsonl.zst')]);
+    assert.equal(unknownPathExtension('Rollout.JSONL.ZST'), '.jsonl.zst');
+  },
+);

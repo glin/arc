@@ -1,4 +1,5 @@
 import * as fs from 'node:fs';
+import { openRolloutSource, prepareRolloutSource, type RolloutSource } from './rolloutsource';
 import { readPreviousLines, type BackwardLineCursor, type FileRevision } from './transcript';
 import { contextNumber, type ContextCategory, type ContextUnavailableReason } from './domain/context-detail';
 import { codexRetainedContextTokens } from './codex';
@@ -288,17 +289,20 @@ export async function readCodexContext(
   revision: FileRevision,
   signal: AbortSignal,
 ): Promise<CodexContextResult | null> {
-  let descriptor = -1;
+  let release: (() => void) | undefined;
+  let descriptor: RolloutSource | undefined;
   try {
-    descriptor = fs.openSync(file, 'r');
+    release = await prepareRolloutSource(file);
+    descriptor = openRolloutSource(file, false, fs);
+    if (revision.size !== descriptor.size) return null;
     const head = Buffer.alloc(Math.min(RECORD_BYTES, revision.size));
-    if (fs.readSync(descriptor, head, 0, head.length, 0) !== head.length) return null;
+    if (descriptor.readInto(head, 0, head.length, 0) !== head.length) return null;
     const newline = head.indexOf(10);
     if (newline < 0) return null;
     const opening = JSON.parse(head.subarray(0, newline).toString('utf8'));
     if (opening.type !== 'session_meta' || opening.payload?.id !== session) return null;
     const end = Buffer.alloc(1);
-    if (fs.readSync(descriptor, end, 0, 1, revision.size - 1) !== 1 || end[0] !== 10) return null;
+    if (descriptor.readInto(end, 0, 1, revision.size - 1) !== 1 || end[0] !== 10) return null;
     let cursor: BackwardLineCursor = { revision, end: revision.size, fragment: Buffer.alloc(0) };
     const records: unknown[] = [];
     let read = head.length;
@@ -332,6 +336,7 @@ export async function readCodexContext(
   } catch {
     return null;
   } finally {
-    if (descriptor >= 0) fs.closeSync(descriptor);
+    if (descriptor) descriptor.close();
+    release?.();
   }
 }

@@ -1,3 +1,10 @@
+import {
+  isCompressedRollout,
+  openRolloutSource,
+  rolloutStat,
+  alternateRolloutPath,
+  rolloutPhysicalRevision,
+} from './rolloutsource';
 import { revisionOf } from './transcript';
 import { meterRead } from './readmeter';
 import { combineCacheExpirySummaries, combineCacheExpiryAmounts } from './cacheexpirysummary';
@@ -150,6 +157,7 @@ export interface ProjectUsageBucket {
 
 export interface SpendFileIndex {
   sourceIdentity?: string;
+  rolloutRevision?: string;
   costStateSupplement?: ClaudeCostSupplement;
   costStateProgress?: ClaudeCostProgress;
   file: string;
@@ -1759,7 +1767,7 @@ function readIncremental(
   // The saved repeated-record detector for a Claude source, or null for a source without one.
   restoredRepeated: ClaudeRepeatedState | null = null,
 ): IncrementalRead {
-  const fd = fs.openSync(file, 'r');
+  const fd = openRolloutSource(file, false, fs);
   try {
     const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, budget.maxBytes ?? 64 * 1024));
     const maxBytes = budget.maxBytes ?? DEFAULT_SCAN_BYTES;
@@ -1767,13 +1775,13 @@ function readIncremental(
     const deadline = clock() + (budget.maxMilliseconds ?? DEFAULT_SCAN_MILLISECONDS);
     // A lookup reads through this descriptor, so it reads the revision this slice reads. Lookups of
     // earlier slices carry over while the file keeps its identity.
-    const opened = restoredRepeated === null ? null : fs.fstatSync(fd);
+    const opened = restoredRepeated === null ? null : fd.stat();
     const repeated =
       restoredRepeated === null || opened === null
         ? null
         : new ClaudeRepeatedDetector(
             restoredRepeated,
-            (buffer, at, length) => meterRead(file, fs.readSync(fd, buffer, 0, length, at), at),
+            (buffer, at, length) => meterRead(file, fd.readInto(buffer, 0, length, at), at),
             claudeRepeatedLookups(file, claudeFileRevision(opened), restoredRepeated.through),
             () => clock() >= deadline,
           );
@@ -1884,7 +1892,7 @@ function readIncremental(
     // A slice reads its first chunk even past the deadline, so every slice makes progress.
     while (position < size && readBytes < maxBytes && (readBytes === 0 || clock() < deadline)) {
       const allowed = Math.min(chunk.length, size - position, maxBytes - readBytes);
-      const read = meterRead(file, fs.readSync(fd, chunk, 0, allowed, position), position);
+      const read = meterRead(file, fd.readInto(chunk, 0, allowed, position), position);
       if (read <= 0) {
         break;
       }
@@ -1990,7 +1998,7 @@ function readIncremental(
     const repeatedState = repeated ? repeated.snapshot() : null;
     // Windowed readers in this process extend the published map instead of reading the file again.
     if (repeatedState && opened && !repeatedRevisionLost) {
-      publishClaudeRepeatedMap(file, fd, repeatedState);
+      publishClaudeRepeatedMap(file, fd.descriptor, repeatedState);
     }
     return {
       offset: completedOffset,
@@ -2012,7 +2020,7 @@ function readIncremental(
       repeatedRevisionLost,
     };
   } finally {
-    fs.closeSync(fd);
+    fd.close();
   }
 }
 
@@ -2033,8 +2041,10 @@ export function indexSpendFile<State>(
   const emptyReducer = makeReducer(undefined);
   const parserKind = emptyReducer.parserKind;
   let stat: ReturnType<typeof revisionOf>;
+  let rolloutRevision: string | undefined;
   try {
-    const physical = fs.statSync(file, { bigint: true });
+    if (isCompressedRollout(file)) rolloutRevision = rolloutPhysicalRevision(file);
+    const physical = rolloutStat(file, { bigint: true }, fs);
     stat = revisionOf(physical);
     if (!physical.isFile()) {
       throw new Error('not a file');
@@ -2097,7 +2107,8 @@ export function indexSpendFile<State>(
     previous.missingAt === undefined &&
     (parserKind !== 'claude' || previous.cacheExpiryChildPolicy === (emptyReducer.nativeChildRequests?.() === true)) &&
     previous.size === stat.size &&
-    previous.mtimeMs === stat.mtimeMs;
+    previous.mtimeMs === stat.mtimeMs &&
+    (rolloutRevision === undefined || previous.rolloutRevision === rolloutRevision);
   if (unchanged) {
     return {
       record: previous,
@@ -2164,6 +2175,7 @@ export function indexSpendFile<State>(
   const buckets = scanned.buckets;
   const record: SpendFileIndex = {
     sourceIdentity: `${stat.dev}:${stat.ino}`,
+    ...(rolloutRevision === undefined ? {} : { rolloutRevision }),
     file: normalizedFile,
     workspace: normalizedWorkspace,
     size: stat.size,
@@ -2222,6 +2234,48 @@ export function indexSpendFile<State>(
     found: true,
     complete: scanned.complete,
   };
+}
+
+// A format change replaces the absent source's retained buckets in the same ledger update.
+export function replaceRolloutSpendRecord(
+  files: SpendFileIndex[],
+  record: SpendFileIndex,
+  positions?: Map<string, number>,
+): SpendFileIndex[] {
+  // A queued archive cannot restore its cost while the writable plain source exists.
+  if (record.parserKind === 'codex' && isCompressedRollout(record.file)) {
+    try {
+      if (fs.statSync(alternateRolloutPath(record.file)!).isFile()) return files;
+    } catch (error) {
+      if (!['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')) return files;
+    }
+  }
+  const records = positions ? files : [...files];
+  const index = positions ?? new Map(records.map((held, at) => [held.file, at]));
+  const at = index.get(record.file);
+  if (at === undefined) {
+    index.set(record.file, records.length);
+    records.push(record);
+  } else records[at] = record;
+  const alternate = alternateRolloutPath(record.file);
+  const peer = alternate === null ? undefined : index.get(alternate);
+  if (record.parserKind !== 'codex' || record.missingAt !== undefined || peer === undefined) return records;
+  const held = records[peer];
+  if (held.missingAt === undefined && isCompressedRollout(record.file)) {
+    try {
+      fs.statSync(held.file);
+      return records;
+    } catch (error) {
+      if (!['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')) return records;
+    }
+  }
+  const last = records.pop()!;
+  index.delete(held.file);
+  if (peer < records.length) {
+    records[peer] = last;
+    index.set(last.file, peer);
+  }
+  return records;
 }
 
 export interface PruneSpendFilesResult {

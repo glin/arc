@@ -1,3 +1,4 @@
+import * as zstd from 'node:zlib';
 import {
   ADVISOR_EXECUTOR,
   ADVISOR_ITERATIONS,
@@ -24,6 +25,7 @@ import { quoteUsage } from './pricing';
 import * as pricing from './pricing';
 import * as projectSpend from './projectspend';
 import * as codexReader from './codex';
+import { payloadSha256 } from './sessionwrites';
 import {
   findSessionTranscript,
   readSessionRequests,
@@ -6273,3 +6275,102 @@ test('the panel Tools rows agree with arc cost --by-tool on a Codex and a Claude
   assert.ok(Math.abs(none(widened).dollars - none(panel).dollars - added) < 1e-9);
   assert.ok(added > 4);
 });
+
+const rolloutCompression = zstd as typeof zstd & { zstdCompressSync?: (bytes: Buffer) => Buffer };
+test.skipIf(!rolloutCompression.zstdCompressSync)(
+  'delegated cost survives child compression after its verified launch folder disappears',
+  () => {
+    const fx = receiptDispatchFixture(directory(), 'claude', 'codex');
+    const cwd = directory();
+    vi.stubEnv('ARC_HOME', fx.home);
+    const rows = fs.readFileSync(fx.child.file, 'utf8').trimEnd().split('\n');
+    const meta = JSON.parse(rows[0]);
+    meta.payload.cwd = cwd;
+    rows[0] = JSON.stringify(meta);
+    const bytes = Buffer.from(rows.join('\n') + '\n');
+    fs.writeFileSync(fx.child.file, bytes);
+    const launch = fx.receipts.reserve({
+      origin: 'a'.repeat(24),
+      requester: { provider: 'claude', id: fx.parent.sessionId },
+      policy: null,
+      promptSha256: payloadSha256('Review the assigned work.'),
+      completion: 'manual',
+      alias: null,
+      transport: 'standalone',
+      standalone: {
+        provider: 'codex',
+        command: 'codex',
+        args: [],
+        cwd,
+        model: 'test',
+        effort: 'high',
+        name: 'Review',
+        agentRun: true,
+        background: false,
+        sessionHint: null,
+        logAlias: null,
+        deadlineMs: 1000,
+      },
+    });
+    const stat = fs.statSync(fx.child.file, { bigint: true });
+    const ancestor = path.dirname(fx.child.file);
+    const folder = fs.statSync(ancestor, { bigint: true });
+    const opening = bytes.subarray(0, bytes.indexOf(10) + 1);
+    fx.receipts.startup(launch.launchId, {
+      file: fx.child.file,
+      identity: `${stat.dev}:${stat.ino}`,
+      ancestor,
+      directory: `${folder.dev}:${folder.ino}`,
+      cwd: fs.realpathSync.native(cwd),
+      bytes: opening.length,
+      sha256: payloadSha256(opening.toString()),
+    });
+    fx.receipts.standaloneSession(launch.launchId, fx.child.sessionId);
+    const scan = fx.receipts.relationships(fx.catalog);
+    let linked = 0;
+    for (;;) {
+      const step = scan.next({ bytes: 1024, entries: 1, checks: 1 });
+      if (step.done) break;
+      if (step.value.reference) linked++;
+    }
+    assert.equal(linked, 1);
+    fx.receipts.checkpointRelationships();
+    const roots = { projects: fx.projects, codexSessions: fx.codexSessions };
+    const expected = sessionCostReport(fx.parent.file, { roots });
+    assert.equal(expected.children.length, 1);
+    assert.ok(expected.combined.pricedCostUsd! > 0);
+    fs.rmdirSync(cwd);
+    fs.writeFileSync(fx.child.file + '.zst', rolloutCompression.zstdCompressSync!(bytes));
+    fs.unlinkSync(fx.child.file);
+    const actual = sessionCostReport(fx.parent.file, { roots });
+    assert.deepEqual(
+      actual.children,
+      expected.children.map((child) => ({ ...child, file: child.file + '.zst' })),
+    );
+    assert.equal(actual.combined.pricedCostUsd, expected.combined.pricedCostUsd);
+    assert.equal(actual.combined.requests, expected.combined.requests);
+  },
+);
+
+test.skipIf(!rolloutCompression.zstdCompressSync)(
+  'arc cost resolves a compressed session id and counts a rollout pair once',
+  () => {
+    const id = 'aaaaaaaa-1111-2222-3333-444444444444';
+    const f = cumulativeCostFixture(id);
+    const plain = f.save([...f.start, f.bill('one', 3, 1), f.bill('two', 4, 2), f.snapshot(7, 2)]);
+    const roots = { projects: directory(), codexSessions: path.dirname(plain) };
+    const options = { roots, since: f.at(3), until: f.at(5) };
+    const expected = sessionCostReport(findSessionTranscript(id, roots), options);
+    assert.equal(expected.combined.pricedCostUsd, 0.006);
+    fs.writeFileSync(plain + '.zst', rolloutCompression.zstdCompressSync!(fs.readFileSync(plain)));
+    assert.equal(
+      sessionCostReport(findSessionTranscript(id, roots), options).combined.pricedCostUsd,
+      expected.combined.pricedCostUsd,
+    );
+    fs.unlinkSync(plain);
+    const actual = sessionCostReport(findSessionTranscript(id, roots), options);
+    assert.equal(findSessionTranscript(id, roots), plain + '.zst');
+    assert.equal(actual.combined.pricedCostUsd, expected.combined.pricedCostUsd);
+    assert.equal(actual.combined.requests, expected.combined.requests);
+  },
+);

@@ -1,3 +1,4 @@
+import { rolloutThreadId } from '../../extension/src/rolloutsource.js';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
@@ -730,7 +731,7 @@ export async function nativeSourceWitness(
       return entries;
     };
     if (options.provider === 'codex') {
-      const found = await enumerateRolloutFilesAsync(root, undefined, readDirectory);
+      const found = await enumerateRolloutFilesAsync(root, undefined, readDirectory, false);
       if (!found || found.status !== 'complete' || work.exhausted || runtime.now() >= deadline)
         throw new Error('Session sources are unavailable.');
       return [...found.files];
@@ -867,7 +868,7 @@ export async function nativeSourceWitness(
         const files = (foreground ? [paths.join(root, `${sessionId}.jsonl`)] : await catalog()).filter((file) =>
           options.provider === 'claude'
             ? paths.basename(file) === `${sessionId}.jsonl`
-            : file.toLowerCase().endsWith(`-${sessionId.toLowerCase()}.jsonl`),
+            : rolloutThreadId(file)?.toLowerCase() === sessionId.toLowerCase(),
         );
         if (files.length > 1) {
           receipts.startupRefused(id, true);
@@ -892,7 +893,7 @@ export async function nativeSourceWitness(
         let matches = false;
         while (bytes.length < limit) {
           const qualified = readQualifiedOpening(file, (fd) => {
-            const stat = fs.fstatSync(fd, { bigint: true });
+            const stat = fd.stat({ bigint: true });
             const length = Math.min(
               bounds.readBytes,
               READ_BYTES,
@@ -901,7 +902,7 @@ export async function nativeSourceWitness(
             );
             spend(length);
             const buffer = Buffer.alloc(length);
-            const count = fs.readSync(fd, buffer, 0, length, bytes.length);
+            const count = fd.readInto(buffer, 0, length, bytes.length);
             return { identity: `${stat.dev}:${stat.ino}`, bytes: buffer.subarray(0, count), size: Number(stat.size) };
           });
           if (!qualified) return;
@@ -1070,7 +1071,7 @@ function claudeStartup(
         return null;
       }
       const qualified = readQualifiedOpening(file, (fd) => {
-        const stat = fs.fstatSync(fd, { bigint: true });
+        const stat = fd.stat({ bigint: true });
         const current = `${stat.dev}:${stat.ino}`;
         if ((identity && current !== identity) || stat.size < BigInt(opening.length)) return { refused: true };
         const buffer = Buffer.alloc(Math.min(bounds.readBytes, READ_BYTES));
@@ -1078,14 +1079,14 @@ function claudeStartup(
         while (offset < opening.length) {
           const length = Math.min(buffer.length, opening.length - offset);
           if (work && !work.reserve(length)) return { refused: false };
-          const count = fs.readSync(fd, buffer, 0, length, offset);
+          const count = fd.readInto(buffer, 0, length, offset);
           if (!count || !buffer.subarray(0, count).equals(opening.subarray(offset, offset + count)))
             return { refused: true };
           offset += count;
         }
         const length = Math.min(buffer.length, Number(stat.size) - offset);
         if (!accepted && work && !work.reserve(length)) return { refused: false };
-        const count = accepted ? 0 : fs.readSync(fd, buffer, 0, length, offset);
+        const count = accepted ? 0 : fd.readInto(buffer, 0, length, offset);
         return { refused: false, identity: current, bytes: Buffer.from(buffer.subarray(0, count)) };
       });
       safeDispatchPath(file);
@@ -1193,7 +1194,7 @@ async function startupContinuous(
       do {
         let count = 0;
         const qualified = readQualifiedOpening(held.file, (fd) => {
-          const stat = fs.fstatSync(fd, { bigint: true });
+          const stat = fd.stat({ bigint: true });
           if (`${stat.dev}:${stat.ino}` !== held.identity || stat.size < BigInt(held.bytes)) {
             refused = true;
             return false;
@@ -1203,7 +1204,7 @@ async function startupContinuous(
           if (length <= 0) return false;
           // Reserve every requested byte, including reads whose source qualification fails.
           if (!work.reserve(length)) return false;
-          count = fs.readSync(fd, buffer, 0, length, offset);
+          count = fd.readInto(buffer, 0, length, offset);
           if (!count) return false;
           digest.update(buffer.subarray(0, count));
           offset += count;
@@ -1224,7 +1225,7 @@ async function startupContinuous(
       if (!retry) {
         if (runtime.now() >= deadline) return false;
         const final = readQualifiedOpening(held.file, (fd) => {
-          const stat = fs.fstatSync(fd, { bigint: true });
+          const stat = fd.stat({ bigint: true });
           if (`${stat.dev}:${stat.ino}` !== held.identity || stat.size < BigInt(held.bytes)) refused = true;
           return true;
         });

@@ -1,3 +1,4 @@
+import { openRolloutSource, rolloutStat, type RolloutSource } from './rolloutsource';
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import {
@@ -64,7 +65,7 @@ export function savedDispatchResponse(
   if (!source) return null;
   const before = guardedSourceRevision(source.file);
   if (!before) return null;
-  const stat = revisionOf(fs.statSync(source.file, { bigint: true }));
+  const stat = revisionOf(rolloutStat(source.file, { bigint: true }, fs));
   if (
     !sameSessionRevision(source, stat) ||
     !supportedFileIdentity(stat) ||
@@ -750,7 +751,7 @@ export type SessionTurn = Pick<
 
 function revision(file: string): string | null {
   try {
-    const stat = fs.statSync(file, { bigint: true });
+    const stat = rolloutStat(file, { bigint: true }, fs);
     const snapshot = revisionOf(stat);
     return JSON.stringify([snapshot.dev, snapshot.ino, snapshot.size, snapshot.mtimeMs, stat.ctimeNs.toString()]);
   } catch {
@@ -767,7 +768,7 @@ export function guardedSourceRevision(file: string): string | null {
 // Canonical physical path and file identity remain stable across appends, but change on replacement.
 export function guardedSourceIdentity(source: Pick<SessionFile, 'file' | 'agent' | 'sessionId'>): string | null {
   try {
-    const stat = revisionOf(fs.statSync(source.file, { bigint: true }));
+    const stat = revisionOf(rolloutStat(source.file, { bigint: true }, fs));
     if (!supportedFileIdentity(stat)) return null;
     return digest(
       JSON.stringify([source.agent, source.sessionId, fs.realpathSync.native(source.file), stat.dev, stat.ino]),
@@ -785,7 +786,7 @@ function qualifySessionReadSource(source: SessionFile, roots: readonly string[])
       ? readQualifiedCodexOpening(source.file)
       : readQualifiedOpening(source.file, (fd) => {
           const buffer = Buffer.allocUnsafe(64 * 1024);
-          const bytes = meterRead(source.file, fs.readSync(fd, buffer, 0, buffer.length, 0));
+          const bytes = meterRead(source.file, fd.readInto(buffer, 0, buffer.length, 0));
           for (const line of buffer.subarray(0, bytes).toString('utf8').split('\n')) {
             try {
               const record = JSON.parse(line);
@@ -806,13 +807,28 @@ function qualifySessionReadSource(source: SessionFile, roots: readonly string[])
           return null;
         });
   if (!opening) return 'The session opening is unavailable or changed during qualification. Retry the command.';
+  let qualifiedRevision = opening.revision;
+  if (source.agent === 'codex') {
+    try {
+      const current = revisionOf(rolloutStat(source.file, { bigint: true }, fs));
+      if (
+        current.dev !== opening.revision.dev ||
+        current.ino !== opening.revision.ino ||
+        current.mtimeMs !== opening.revision.mtimeMs
+      )
+        return 'The session source was replaced. Retry after session discovery.';
+      qualifiedRevision = current;
+    } catch {
+      return 'The session opening is unavailable or changed during qualification. Retry the command.';
+    }
+  }
   if (performance.now() > deadline) return 'The session opening exceeded the read time limit. Retry the command.';
   if (
     (source.dev !== undefined && source.dev !== opening.revision.dev) ||
     (source.ino !== undefined && source.ino !== opening.revision.ino)
   )
     return 'The session source was replaced. Retry after session discovery.';
-  if (!sessionSourceAdmitted(source, opening.revision))
+  if (!sessionSourceAdmitted(source, qualifiedRevision))
     return 'The session source revision does not match supported growth. Retry after session discovery.';
   if (typeof opening.value.sessionId !== 'string' || !opening.value.sessionId)
     return 'The session opening identity is unavailable. Retry the command.';
@@ -824,7 +840,7 @@ function qualifySessionReadSource(source: SessionFile, roots: readonly string[])
     return 'The session source no longer matches this repository scope. Retry the command.';
   if (source.cwd && normalizeFsPath(source.cwd) !== normalizeFsPath(cwd))
     return 'The session working directory changed. Retry after session discovery.';
-  return { ...source, ...opening.revision, cwd };
+  return { ...source, ...qualifiedRevision, cwd };
 }
 
 export const AGENT_SOURCE_LIMITS = {
@@ -879,14 +895,14 @@ export class AgentReadSources {
       turns: [],
     };
     if (size <= AGENT_SOURCE_LIMITS.bytes - CODEX_OPENING_BYTES) {
-      let fd = -1;
+      let fd: RolloutSource | undefined;
       try {
-        fd = fs.openSync(source.file, 'r');
+        fd = openRolloutSource(source.file, false, fs);
         const body = Buffer.allocUnsafe(size);
         let offset = 0;
         while (offset < size) {
           const length = Math.min(AGENT_SOURCE_LIMITS.chunkBytes, size - offset);
-          const count = meterRead(source.file, fs.readSync(fd, body, offset, length, offset), offset);
+          const count = meterRead(source.file, fd.readInto(body, offset, length, offset), offset);
           if (!count) return null;
           offset += count;
         }
@@ -926,7 +942,7 @@ export class AgentReadSources {
       } catch {
         return null;
       } finally {
-        if (fd >= 0) fs.closeSync(fd);
+        if (fd) fd.close();
       }
     }
     if (!current()) return null;
@@ -1201,7 +1217,7 @@ export class RecordedReplies {
       const key = guardedSourceIdentity(source);
       if (!key) continue;
       try {
-        const revision = revisionOf(fs.statSync(source.file, { bigint: true }));
+        const revision = revisionOf(rolloutStat(source.file, { bigint: true }, fs));
         if (source.size !== undefined && !sessionSourceAdmitted(source, revision)) continue;
         hash.update(JSON.stringify([key, revision.size, revision.mtimeMs]));
       } catch {
@@ -1269,7 +1285,7 @@ export class RecordedReplies {
       if (this.scans.size >= RECORDED_REPLY_LIMITS.sources) return;
       const matches = new Map<string, Pick<Turn, 'finalResponse' | 'promptId'>>();
       const control: ForwardRecoveryControl = {
-        targetRevision: revisionOf(fs.statSync(source.file, { bigint: true })),
+        targetRevision: revisionOf(rolloutStat(source.file, { bigint: true }, fs)),
         through: 0,
         readBytes: 0,
         retainedCharge: 0,
@@ -1295,7 +1311,7 @@ export class RecordedReplies {
                 source.file,
                 start,
                 length,
-                revisionOf(fs.statSync(source.file, { bigint: true })),
+                revisionOf(rolloutStat(source.file, { bigint: true }, fs)),
               );
               control.actualReadBytes = (control.actualReadBytes ?? 0) + (bytes?.length ?? 0);
               return bytes;

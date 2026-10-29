@@ -1,3 +1,7 @@
+import * as zstd from 'node:zlib';
+import { receiptDispatchFixture } from './turnfixtures';
+import { replaceRolloutSpendRecord } from './projectspend';
+import { codexSessionFiles } from './codex';
 import { syncBuiltinESMExports } from 'node:module';
 import { describe, test, vi } from 'vitest';
 import { IntegrityScheduler } from './scheduler';
@@ -7168,3 +7172,70 @@ for (const childTranscript of [false, true])
       `$${dollars.toFixed(2)}`,
     );
   });
+
+const rolloutCompression = zstd as typeof zstd & { zstdCompressSync?: (bytes: Buffer) => Buffer };
+test.skipIf(!rolloutCompression.zstdCompressSync)(
+  'compressed project spend resumes, stays unchanged, and replaces missing plain buckets once',
+  () => {
+    const folder = dir();
+    const f = receiptDispatchFixture(folder, 'codex', 'codex');
+    const plain = f.parent.file;
+    const factory = (state: Parameters<typeof createCodexUsageLineReducer>[0]) => createCodexUsageLineReducer(state);
+    const expected = indexSpendFile(undefined, plain, folder, factory).record;
+    const cost = (records: SpendFileIndex[]) =>
+      prepareProjectSpendView(records, publicProjectSpendPrice, { now: Date.UTC(2026, 0, 1, 12) }).windows[2].dollars;
+    const expectedCost = cost([expected]);
+    assert.ok(typeof expectedCost === 'number' && expectedCost > 0);
+    const file = plain + '.zst';
+    fs.writeFileSync(file, rolloutCompression.zstdCompressSync!(fs.readFileSync(plain)));
+    const both = codexSessionFiles(f.codexSessions, [folder]);
+    assert.equal(discoverCodexSpendSources(both.sessions, []).filter((source) => source.startsWith(plain)).length, 1);
+    fs.unlinkSync(plain);
+    const listed = codexSessionFiles(f.codexSessions, [folder]);
+    const discovered = discoverCodexSpendSources(listed.sessions, []).filter((source) => source === file);
+    const projectRecords = discovered.map((source) => indexSpendFile(undefined, source, folder, factory).record);
+    assert.deepEqual(
+      projectRecords.flatMap((record) => record.buckets),
+      expected.buckets,
+    );
+    assert.equal(cost(projectRecords), expectedCost);
+    const missing = indexSpendFile(expected, plain, folder, factory).record;
+    assert.ok(missing.missingAt);
+    let result = indexSpendFile(undefined, file, folder, factory, { maxBytes: 64, maxMilliseconds: Infinity });
+    assert.equal(result.rebuilt, true);
+    assert.equal(result.complete, false);
+    let passes = 0;
+    while (!result.complete && passes++ < 1000)
+      result = indexSpendFile(result.record, file, folder, factory, { maxBytes: 64, maxMilliseconds: Infinity });
+    assert.equal(result.complete, true);
+    assert.deepEqual(result.record.buckets, expected.buckets);
+    assert.equal(result.record.offset, expected.offset);
+    assert.equal(result.record.size, expected.size);
+    const unchanged = indexSpendFile(result.record, file, folder, factory);
+    assert.equal(unchanged.record, result.record);
+    const ledger = replaceRolloutSpendRecord([missing], result.record);
+    assert.equal(cost(ledger), expectedCost);
+    assert.deepEqual(
+      ledger.map((record) => record.file),
+      [normalizeSpendFile(file)],
+    );
+    assert.deepEqual(
+      ledger.flatMap((record) => record.buckets),
+      expected.buckets,
+    );
+    fs.writeFileSync(plain, (zstd as any).zstdDecompressSync(fs.readFileSync(file)));
+    const resumed = indexSpendFile(undefined, plain, folder, factory).record;
+    assert.deepEqual(
+      replaceRolloutSpendRecord(ledger, resumed).map((record) => record.file),
+      [normalizeSpendFile(plain)],
+    );
+    const restored = replaceRolloutSpendRecord(ledger, resumed);
+    const queuedArchive = indexSpendFile(result.record, file, folder, factory).record;
+    const afterQueuedArchive = replaceRolloutSpendRecord(restored, queuedArchive);
+    assert.equal(cost(afterQueuedArchive), expectedCost);
+    assert.deepEqual(
+      afterQueuedArchive.map((record) => record.file),
+      [normalizeSpendFile(plain)],
+    );
+  },
+);

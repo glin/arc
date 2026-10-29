@@ -1,6 +1,8 @@
+import * as zstd from 'node:zlib';
 import { createHash } from 'node:crypto';
 import { withReadMetrics, type ReadMetrics } from './readmeter';
-import { test } from 'vitest';
+import { test, vi } from 'vitest';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -1819,3 +1821,84 @@ test('capturing a Codex parent includes its recorded background review on the ow
     assert.ok(artifact.text.every((text) => !text.includes('PRIVATE UNRELATED REVIEW')));
   }
 });
+
+const rolloutCompression = zstd as typeof zstd & { zstdCompressSync?: (bytes: Buffer) => Buffer };
+test('plain export revalidation accepts cancellation between asynchronous reads', async () => {
+  const f = fixture();
+  const file = f.codexSession(CODEX_ID);
+  const controller = new AbortController();
+  const nativeFs = createRequire(__filename)('node:fs') as typeof fs;
+  await withExportTransaction(f.output, async (writer) => {
+    const capture = await captureSessionExport(
+      {
+        ...f.options,
+        signal: controller.signal,
+        root: { ...f.options.root, file, agent: 'codex', sessionId: CODEX_ID },
+      },
+      writer,
+    );
+    const original = nativeFs.read;
+    const read = vi.spyOn(nativeFs, 'read').mockImplementation(((...args: any[]) => {
+      const callback = args.pop();
+      return Reflect.apply(original, nativeFs, [
+        ...args,
+        (...result: any[]) => {
+          controller.abort();
+          callback(...result);
+        },
+      ]);
+    }) as any);
+    syncBuiltinESMExports();
+    try {
+      await assert.rejects(capture.recheck(), ExportCancelled);
+    } finally {
+      read.mockRestore();
+      syncBuiltinESMExports();
+    }
+  });
+});
+test.skipIf(!rolloutCompression.zstdCompressSync)(
+  'a compressed session exports its last turn and a rollout pair exports once',
+  async () => {
+    const f = fixture();
+    const plain = f.codexSession(CODEX_ID);
+    const compressed = plain + '.zst';
+    fs.writeFileSync(compressed, rolloutCompression.zstdCompressSync!(fs.readFileSync(plain)));
+    const options = {
+      ...f.options,
+      root: { ...f.options.root, file: plain, agent: 'codex' as const, sessionId: CODEX_ID },
+    };
+    const first = await withExportTransaction(f.output, async (writer) => {
+      const capture = await captureSessionExport(options, writer);
+      await capture.recheck();
+      return capture.model;
+    });
+    assert.equal(first.sessions.length, 1);
+    fs.unlinkSync(plain);
+    const second = await withExportTransaction(f.output, async (writer) => {
+      const capture = await captureSessionExport({ ...options, root: { ...options.root, file: compressed } }, writer);
+      await capture.recheck();
+      return capture.model;
+    });
+    assert.equal(second.sessions.length, 1);
+    assert.deepEqual(second.sessions[0].pages, first.sessions[0].pages);
+    assert.deepEqual(second.sessions[0].numbers, first.sessions[0].numbers);
+    assert.equal(
+      second.sessions[0].provenance.sourceBytes,
+      (zstd as any).zstdDecompressSync(fs.readFileSync(compressed)).length,
+    );
+    await assert.rejects(
+      withExportTransaction(f.output, (writer) =>
+        captureSessionExport(
+          {
+            ...options,
+            root: { ...options.root, file: compressed },
+            limits: { sourceBytes: fs.statSync(compressed).size },
+          },
+          writer,
+        ),
+      ),
+      ExportLimitError,
+    );
+  },
+);

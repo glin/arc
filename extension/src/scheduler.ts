@@ -1,3 +1,4 @@
+import { isRolloutName, isCompressedRollout } from './rolloutsource';
 import * as path from 'node:path';
 
 export interface SchedulerClock {
@@ -292,7 +293,7 @@ export class PendingWatcherWake {
     kind: string,
     normalize: (file: string) => string = (file) => file,
   ): boolean {
-    if (typeof filename === 'string' && !filename.endsWith('.jsonl')) {
+    if (typeof filename === 'string' && !isRolloutName(filename)) {
       return false;
     }
     this.eventCount++;
@@ -470,10 +471,10 @@ export function unknownPathShapes(
   };
 }
 
-// The capture's name for a file extension. Only `.jsonl` names reach a watcher decision, and any other extension counts
-// as `other`, so a file name never becomes a capture key.
-export function unknownPathExtension(file: string): '.jsonl' | 'other' {
-  return path.extname(file).toLowerCase() === '.jsonl' ? '.jsonl' : 'other';
+// Capture keys name supported transcript suffixes without retaining filenames.
+export function unknownPathExtension(file: string): '.jsonl' | '.jsonl.zst' | 'other' {
+  const name = file.toLowerCase();
+  return isCompressedRollout(name) ? '.jsonl.zst' : path.extname(name) === '.jsonl' ? '.jsonl' : 'other';
 }
 
 // The decision names why it walks, so a counter can say which cause keeps the catalog walking. A path outside the held

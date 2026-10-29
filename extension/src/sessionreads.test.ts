@@ -1,3 +1,5 @@
+import * as zstd from 'node:zlib';
+import { rolloutStat } from './rolloutsource';
 import { revisionOf, supportedFileIdentity, type SessionFile } from './transcript';
 import {
   guardedSourceRevision,
@@ -1457,3 +1459,46 @@ test('the session read keeps the subagent text a delayed Codex turn context repo
   const read = boundedSessionRead(source, 2, () => 'scope', 'local-agent', [directory]);
   assert.deepEqual(read.subagentContext, { tokens, share: tokens / 1000, partial: false });
 });
+
+const rolloutCompression = zstd as typeof zstd & { zstdCompressSync?: (bytes: Buffer) => Buffer };
+test.skipIf(!rolloutCompression.zstdCompressSync)(
+  'a compressed session opens and resolves read identities at its decompressed revision',
+  () => {
+    const directory = tempDir('compressed-session-read-');
+    const plain = path.join(directory, 'rollout-known.jsonl');
+    const timestamp = '2026-10-29T00:00:00Z';
+    const records = [
+      { type: 'session_meta', timestamp, payload: { id: 'known', cwd: directory, source: 'cli' } },
+      { type: 'ignored', text: 'x'.repeat(100000) },
+      { type: 'event_msg', timestamp, payload: { type: 'task_started', turn_id: 'turn-one' } },
+      { type: 'turn_context', timestamp, payload: { turn_id: 'turn-one', model: 'gpt-6.1-sol' } },
+      { type: 'event_msg', timestamp, payload: { type: 'user_message', message: 'Read the last turn.' } },
+      {
+        type: 'event_msg',
+        timestamp,
+        payload: { type: 'task_complete', turn_id: 'turn-one', last_agent_message: 'Saved.' },
+      },
+    ];
+    fs.writeFileSync(plain, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+    const file = plain + '.zst';
+    fs.writeFileSync(file, rolloutCompression.zstdCompressSync!(fs.readFileSync(plain)));
+    const source = {
+      agent: 'codex' as const,
+      sessionId: 'known',
+      file,
+      cwd: directory,
+      ...revisionOf(rolloutStat(file, { bigint: true })),
+    };
+    assert.ok(source.size > fs.statSync(file).size);
+    const read = boundedSessionRead(source, 2, () => 'scope', 'local-agent', [directory]);
+    assert.equal(read.state, 'current');
+    assert.equal(read.turns.length, 1);
+    assert.equal(read.turns[0].prompt, 'Read the last turn.');
+    assert.equal(read.turns[0].summary, 'Saved.');
+    const facts = new AgentReadSources().resolve(source, () => 'scope', [directory]);
+    assert.ok(facts);
+    assert.equal(facts.identitiesComplete, true);
+    assert.equal(facts.historyComplete, true);
+    assert.equal(facts.turns.length, 1);
+  },
+);

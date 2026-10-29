@@ -1,3 +1,4 @@
+import { isCompressedRollout, rolloutStem, openRolloutSource, type RolloutSource } from './rolloutsource';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
@@ -221,6 +222,7 @@ class RelationshipReader {
   readonly revisions = new Map<string, string | null>();
   readonly digests = new Map<string, string>();
   private readonly descriptors = new Set<number>();
+  private readonly decodedSources = new Set<RolloutSource>();
   constructor(
     readonly signal?: AbortSignal,
     readonly platform = process.platform,
@@ -230,6 +232,8 @@ class RelationshipReader {
   close = (): void => {
     for (const fd of this.descriptors) fs.closeSync(fd);
     this.descriptors.clear();
+    for (const source of this.decodedSources) source.close();
+    this.decodedSources.clear();
   };
   dispose(): void {
     this.signal?.removeEventListener('abort', this.close);
@@ -286,7 +290,7 @@ class RelationshipReader {
       if (current === paths.dirname(current)) break;
     }
   }
-  *read(file: string, prefix?: StandaloneStartup): RelationshipScan<string> {
+  *read(file: string, prefix?: StandaloneStartup, repacked = false): RelationshipScan<string> {
     yield* this.path(file);
     const before = yield* this.stat(file);
     if (!before?.isFile() || (!prefix && before.size > BigInt(JSON_BYTES)))
@@ -300,13 +304,21 @@ class RelationshipReader {
       }
       return opened;
     });
+    let decoded: RolloutSource | undefined;
     try {
+      if (prefix && isCompressedRollout(file))
+        decoded = yield* this.operation('checks', () => openRolloutSource(file, true, fs, prefix.bytes));
+      if (decoded) this.decodedSources.add(decoded);
       const stat = yield* this.operation('checks', () => fs.fstatSync(fd, { bigint: true }));
       if (stat.dev !== before.dev || stat.ino !== before.ino || !stat.isFile())
         throw new Error('The dispatch relationship file was replaced.');
       if (!prefix && stat.size > BigInt(JSON_BYTES)) throw new Error('The dispatch relationship file is unavailable.');
       const length = prefix ? prefix.bytes : Number(stat.size);
-      if (prefix && (`${stat.dev}:${stat.ino}` !== prefix.identity || stat.size < BigInt(length)))
+      if (
+        prefix &&
+        ((!repacked && `${stat.dev}:${stat.ino}` !== prefix.identity) ||
+          BigInt(decoded?.size ?? stat.size) < BigInt(length))
+      )
         throw new Error('The original dispatch source changed.');
       if (prefix && (stat.size !== before.size || stat.mtimeNs !== before.mtimeNs || stat.ctimeNs !== before.ctimeNs))
         throw new Error('The dispatch relationship file changed during validation.');
@@ -317,7 +329,9 @@ class RelationshipReader {
         const bytes = yield* this.operation('bytes', (remaining) => {
           const buffer = Buffer.allocUnsafe(Math.min(remaining, 64 * 1024, length - position));
           this.progress.bytes = buffer.length;
-          const count = fs.readSync(fd, buffer, 0, buffer.length, position);
+          const count = decoded
+            ? decoded.readInto(buffer, 0, buffer.length, position)
+            : fs.readSync(fd, buffer, 0, buffer.length, position);
           meterRead(file, count, position);
           return buffer.subarray(0, count);
         });
@@ -342,6 +356,8 @@ class RelationshipReader {
       this.digests.set(file, sha256);
       return prefix ? '' : new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(Buffer.concat(chunks));
     } finally {
+      decoded?.close();
+      if (decoded) this.decodedSources.delete(decoded);
       if (this.descriptors.delete(fd)) fs.closeSync(fd);
     }
   }
@@ -621,12 +637,18 @@ export class DispatchReceipts {
     if (!scoped || scoped.child.childTranscript || scoped.parent.sessionId === accepted.sessionId) return null;
     const normalize = (value: string) =>
       this.platform === 'win32' ? paths.resolve(value).toLowerCase() : paths.resolve(value);
-    if (normalize(startup.file) !== normalize(scoped.child.file)) return null;
+    const repacked =
+      options.provider === 'codex' &&
+      isCompressedRollout(scoped.child.file) &&
+      !isCompressedRollout(startup.file) &&
+      normalize(rolloutStem(startup.file)) === normalize(rolloutStem(scoped.child.file));
+    if (normalize(startup.file) !== normalize(scoped.child.file) && !repacked) return null;
     yield* reader.path(startup.ancestor);
     const ancestor = yield* reader.stat(startup.ancestor);
     if (!ancestor?.isDirectory() || `${ancestor.dev}:${ancestor.ino}` !== startup.directory) return null;
     // Bind retained cwd agreement to the exact receipt, witnesses, bindings and their physical identities.
     const verification = payloadSha256(JSON.stringify([this.platform, [...reader.revisions], [...reader.digests]]));
+    if (repacked && (yield* reader.stat(startup.file))) return null;
     const cwdPresent = yield* reader.stat(options.cwd);
     yield* reader.path(options.cwd, !cwdPresent);
     if (cwdPresent) {
@@ -636,7 +658,7 @@ export class DispatchReceipts {
       const retained = JSON.parse(yield* reader.read(this.relationshipCacheFile(id)));
       if (retained !== verification) return null;
     }
-    yield* reader.read(startup.file, startup);
+    yield* reader.read(repacked ? scoped.child.file : startup.file, startup, repacked);
     yield* reader.recheck();
     const current = lookup();
     if (

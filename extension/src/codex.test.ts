@@ -1,3 +1,5 @@
+import * as zstd from 'node:zlib';
+import * as compressedSources from './rolloutsource';
 import { sessionCostProjection, sessionCostUsageOf } from './turncard';
 
 test.each(['claude', 'codex'] as const)(
@@ -18427,4 +18429,53 @@ test('a Codex wait_agent return times out only by its own top-level timed_out fi
       ['text-reader', 1],
     ],
   );
+});
+
+const rolloutCompression = zstd as typeof zstd & { zstdCompressSync?: (bytes: Buffer) => Buffer };
+test.skipIf(!rolloutCompression.zstdCompressSync)(
+  'compressed rollouts appear in the session listing and retain their last turn',
+  async () => {
+    const root = sessionsRoot([{ day: '2026/08/25', name: ROLLOUT(UUID_A), records: ordinaryTurn() }]);
+    const plain = path.join(root, '2026', '08', '25', ROLLOUT(UUID_A));
+    const expected = readCodexSession(plain, UUID_A);
+    const file = plain + '.zst';
+    fs.writeFileSync(file, rolloutCompression.zstdCompressSync!(fs.readFileSync(plain)));
+    fs.unlinkSync(plain);
+    fs.writeFileSync(path.join(path.dirname(file), ROLLOUT(UUID_B) + '.zst'), 'corrupt');
+    const listing = codexSessionFiles(root, ['c:/repo']);
+    assert.deepEqual(
+      listing.sessions.map((session) => session.sessionId),
+      [UUID_A],
+    );
+    assert.equal(listing.sessions[0].file, file);
+    assert.deepEqual(readCodexSession(file, UUID_A).turns, expected.turns);
+    const page = await readCodexHistoryPageAsync(file, UUID_A);
+    assert.equal(page.kind, 'page');
+    if (page.kind === 'page') assert.equal(page.page.turns.at(-1)?.promptId, expected.turns.at(-1)?.promptId);
+  },
+);
+
+test.skipIf(!rolloutCompression.zstdCompressSync)('a plain and compressed rollout pair lists one source', () => {
+  const root = sessionsRoot([{ day: '.', name: ROLLOUT(UUID_A), records: ordinaryTurn() }]);
+  const plain = path.join(root, ROLLOUT(UUID_A));
+  fs.writeFileSync(plain + '.zst', rolloutCompression.zstdCompressSync!(fs.readFileSync(plain)));
+  assert.deepEqual(rolloutFiles(root), [plain]);
+  assert.equal(codexSessionFiles(root, ['c:/repo']).sessions.length, 1);
+});
+
+test.skipIf(!rolloutCompression.zstdCompressSync)('catalog walks leave compressed bodies unread', async () => {
+  const root = sessionsRoot([{ day: '.', name: ROLLOUT(UUID_A), records: ordinaryTurn() }]);
+  const plain = path.join(root, ROLLOUT(UUID_A));
+  const file = plain + '.zst';
+  fs.writeFileSync(file, rolloutCompression.zstdCompressSync!(fs.readFileSync(plain)));
+  fs.unlinkSync(plain);
+  const prepare = vi.spyOn(compressedSources, 'prepareRolloutSource');
+  try {
+    const enumeration = await enumerateRolloutFilesAsync(root);
+    assert.deepEqual(enumeration?.files, [file]);
+    assert.equal(codexSessionFiles(root, ['c:/repo']).sessions[0].sessionId, UUID_A);
+    assert.equal(prepare.mock.calls.length, 0);
+  } finally {
+    prepare.mockRestore();
+  }
 });

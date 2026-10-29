@@ -1,3 +1,4 @@
+import * as zstd from 'node:zlib';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -6486,3 +6487,35 @@ test('standalone provider commands refuse missing, misplaced, extra, and legacy 
     assert.equal(parsed.options.provider, provider);
   }
 });
+
+const rolloutCompression: typeof zstd & { zstdCompressSync?: (bytes: Buffer) => Buffer } = zstd;
+test.skipIf(!rolloutCompression.zstdCompressSync)(
+  'native source observation admits a newly compressed rollout once',
+  async () => {
+    const { home, args } = fixture();
+    const root = path.join(home, 'native');
+    fs.mkdirSync(root);
+    const parsed = parseRun(args, { CODEX_BIN: process.execPath, ARC_CODEX_ROOT: root });
+    const receipts = new DispatchReceipts(home);
+    const launch = admitParsed(receipts, parsed);
+    const runtime = frozenRuntime();
+    const bounds = { frameBytes: 128 * 1024, readBytes: 8192, workBytes: 1024 * 1024 };
+    const observe = await nativeSourceWitness(
+      receipts,
+      launch.launchId,
+      parsed.options,
+      parsed.prompt,
+      bounds,
+      runtime,
+      1000,
+      false,
+      new ObservationWork(1000, runtime, bounds.workBytes),
+    );
+    const file = path.join(root, `rollout-${session}.jsonl.zst`);
+    const opening = JSON.stringify({ type: 'session_meta', payload: { id: session, cwd: home } }) + '\n';
+    fs.writeFileSync(file, rolloutCompression.zstdCompressSync!(Buffer.from(opening)));
+    assert.equal(await observe(session), 'ready');
+    assert.equal(receipts.startup(launch.launchId)?.file, file);
+    assert.equal(await observe(session), 'ready');
+  },
+);
