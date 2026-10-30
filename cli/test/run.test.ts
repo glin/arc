@@ -561,6 +561,51 @@ test('source capture retries the pending slice before standard channel order aft
   assert.equal(vi.mocked(childProcess.spawn).mock.calls.length, 1);
 });
 
+test('source capture keeps the arrival order of both channels across a longer alias outage', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'setImmediate'] });
+  vi.spyOn(Date, 'now').mockReturnValue(0);
+  if (process.send) vi.spyOn(process, 'send').mockImplementation(() => true);
+  vi.spyOn(process, 'disconnect').mockImplementation(() => {});
+  const child = providerChild();
+  vi.mocked(childProcess.spawn).mockReturnValue(child);
+  const { receipts, launch } = workerFixture('', 100, false, true);
+  const id = launch.launchId;
+  const stdout = receipts.artifact(id, 'stdout.log');
+  const stderr = receipts.artifact(id, 'stderr.log');
+  fs.writeFileSync(stdout, 'A\n');
+  fs.writeFileSync(stderr, 'e\n');
+  const alias = launch.standalone!.logAlias!;
+  let stderrAttempt = false;
+  let failures = 0;
+  interceptCaptures(receipts, (capture) => {
+    const write = capture.write;
+    capture.write = (...args) => {
+      stderrAttempt = args[1] === 'stderr.log';
+      return write(...args);
+    };
+  });
+  denyOpen(alias, () => {
+    if (!stderrAttempt || failures === 2) return false;
+    failures++;
+    fs.appendFileSync(stdout, failures === 1 ? 'B\n' : 'C\n');
+    fs.appendFileSync(stderr, failures === 1 ? 'f\n' : 'g\n');
+    if (failures === 2) queueMicrotask(() => child.emit('close', 0, null));
+    return true;
+  });
+  const pending = produceStandaloneOutput(receipts, id);
+  await vi.runAllTimersAsync();
+  await pending;
+  assert.equal(failures, 2);
+  assert.equal(fs.readFileSync(alias, 'utf8'), 'A\ne\nB\nf\nC\ng\n');
+  assert.equal(artifactJson(receipts, id, 'output-owner.json').state, 'finished');
+  const state = artifactJson(receipts, id, 'capture.json');
+  assert.equal(state.pending, undefined);
+  assert.equal(state.sources['stdout.log'].offset, 6);
+  assert.equal(state.sources['stderr.log'].offset, 6);
+  assert.equal(fs.readFileSync(stdout, 'utf8'), 'A\nB\nC\n');
+  assert.equal(fs.readFileSync(stderr, 'utf8'), 'e\nf\ng\n');
+});
+
 test.each(['truncated', 'redirected'] as const)(
   'source producer retains capture and worker exit after a %s alias',
   async (change) => {

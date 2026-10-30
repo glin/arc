@@ -32,7 +32,8 @@ interface CaptureState {
 }
 type SourceCaptureState = CaptureState & {
   sourceFiles: true;
-  pending?: CaptureCursor & { name: 'stdout.log' | 'stderr.log' };
+  // Unpublished channel slices in arrival order. The first slice is the one in publication.
+  pending?: (CaptureCursor & { name: 'stdout.log' | 'stderr.log' })[];
 };
 export type DispatchOutcome = 'running' | 'succeeded' | 'failed' | 'interrupted' | 'needs-input' | 'unknown';
 export interface DispatchLaunch {
@@ -839,10 +840,16 @@ export class DispatchReceipts {
       safePath(marker);
       if (!equalIdentity(state.raw, identity(marker))) throw new Error('The captured worker output was replaced.');
       const sources = Object.entries(state.sources);
-      if (state.pending) {
-        if (state.pending.offset <= (state.sources[state.pending.name]?.offset ?? 0))
+      if (state.pending !== undefined) {
+        if (!Array.isArray(state.pending) || !state.pending.length)
           throw new Error('The saved log position is unavailable.');
-        sources.push([state.pending.name, state.pending]);
+        const ends: Partial<Record<CaptureSource, number>> = {};
+        for (const slice of state.pending) {
+          if (slice.offset <= (ends[slice.name] ?? state.sources[slice.name]?.offset ?? 0))
+            throw new Error('The saved log position is unavailable.');
+          ends[slice.name] = slice.offset;
+          sources.push([slice.name, slice]);
+        }
       }
       for (const [name, cursor] of sources) {
         if (name !== 'stdout.log' && name !== 'stderr.log') throw new Error('The log source is invalid.');
@@ -897,7 +904,32 @@ export class DispatchReceipts {
     };
     return {
       delivered: () => load().aliasBytes ?? 0,
-      pendingSource: () => load().pending,
+      pendingSources: () => load().pending ?? [],
+      // Output that arrives behind an unpublished slice joins its queue, so recovery keeps the arrival order of both channels.
+      defer: (name: 'stdout.log' | 'stderr.log', limit: number) =>
+        this.lock(
+          id,
+          () => {
+            const state = load();
+            if (!state.pending || limit <= 0) return;
+            const file = this.artifact(id, name);
+            safePath(file);
+            const stat = fs.statSync(file, { bigint: true });
+            const source = `${stat.dev}:${stat.ino}`;
+            const committed = state.sources[name];
+            if (!stat.isFile() || (committed && committed.identity !== source))
+              throw new Error('The original worker output was replaced or truncated.');
+            let queued = committed?.offset ?? 0;
+            for (const slice of state.pending) if (slice.name === name) queued = slice.offset;
+            const offset = Math.min(Number(stat.size), queued + limit);
+            if (offset <= queued) return;
+            const last = state.pending[state.pending.length - 1];
+            if (state.pending.length > 1 && last.name === name) last.offset = offset;
+            else state.pending.push({ name, offset, identity: source });
+            writeFileAtomically(checkpoint, JSON.stringify(state), this.replace, 0o600, false);
+          },
+          'capture-write',
+        ),
       cursor: (name: CaptureSource): CaptureCursor => ({ ...(load().sources[name] ?? { offset: 0, identity: '' }) }),
       write: (bytes: Buffer, name?: CaptureSource, cursor?: CaptureCursor) =>
         this.lock(
@@ -925,12 +957,13 @@ export class DispatchReceipts {
               return;
             }
             bytes = bytes.subarray(Math.max(0, (committed?.offset ?? 0) - start));
-            if (state.pending) {
-              if (state.pending.name !== name || cursor.offset > state.pending.offset)
+            const queue = (state.pending ??= []);
+            if (queue.length) {
+              if (queue[0].name !== name || cursor.offset > queue[0].offset)
                 throw Object.assign(new Error('The requested log is temporarily unavailable.'), { code: 'EPERM' });
             } else {
               // Save the slice's position before alias publication can fail.
-              state.pending = { name, ...cursor };
+              queue.push({ name, ...cursor });
               writeFileAtomically(checkpoint, JSON.stringify(state), this.replace, 0o600, false);
             }
             let fd: number | null = null;
@@ -955,7 +988,8 @@ export class DispatchReceipts {
             }
             state.bytes += bytes.length;
             state.sources[name] = { ...cursor };
-            if (cursor.offset === state.pending.offset) delete state.pending;
+            if (cursor.offset === queue[0].offset) queue.shift();
+            if (!queue.length) delete state.pending;
             writeFileAtomically(checkpoint, JSON.stringify(state), this.replace, 0o600, false);
           },
           'capture-write',
@@ -1215,7 +1249,8 @@ export class DispatchReceipts {
     }
     return {
       flushAlias,
-      pendingSource: () => undefined,
+      pendingSources: () => [],
+      defer: (_name: 'stdout.log' | 'stderr.log', _limit: number) => {},
       delivered: () => {
         reload();
         return state.aliasBytes ?? 0;

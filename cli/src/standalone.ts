@@ -1550,11 +1550,13 @@ function logCapture(receipts: DispatchReceipts, id: string, bounds: ReadBounds) 
     sources.reduce((total, source) => total + capture.cursor(source.name).offset, capture.delivered());
   const sourceAllowance = (bytes: number) => sources.map(() => bytes);
   const flush = (bytes: number, allowance?: number[]) => {
-    const pending = capture.pendingSource();
     const remaining = sources.map((_, index) => Math.min(bytes, allowance ? allowance[index] : bytes));
-    const ordered: [number, number][] = pending
-      ? [[sources.findIndex((source) => source.name === pending.name), pending.offset]]
-      : [];
+    if (capture.pendingSources().length)
+      for (const [index, source] of sources.entries())
+        if (fs.existsSync(source.file)) capture.defer(source.name, remaining[index]);
+    const ordered = capture
+      .pendingSources()
+      .map((slice): [number, number] => [sources.findIndex((source) => source.name === slice.name), slice.offset]);
     ordered.push(...sources.map((_, index): [number, number] => [index, Infinity]));
     for (const [index, end] of ordered) {
       const source = sources[index];
@@ -1571,6 +1573,8 @@ function logCapture(receipts: DispatchReceipts, id: string, bounds: ReadBounds) 
         source.cursor = capture.cursor(source.name);
         throw error;
       }
+      // Later output stays behind a queued slice that this flush could not finish.
+      if (end !== Infinity && source.cursor.offset < end) break;
     }
     const aliasPending = capture.flushAlias();
     return !aliasPending && sourceComplete();

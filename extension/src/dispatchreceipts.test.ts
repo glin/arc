@@ -1673,7 +1673,10 @@ test.each(['alias open', 'checkpoint', 'short write'] as const)(
         assert.equal(saved.bytes, 0);
         assert.equal(saved.aliasBytes ?? 0, 0);
         assert.equal(saved.sources['stdout.log'], undefined);
-        assert.equal(saved.pending.offset, 2);
+        assert.deepEqual(
+          saved.pending.map((slice: { offset: number }) => slice.offset),
+          [2],
+        );
       }
     } finally {
       opening.mockRestore();
