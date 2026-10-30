@@ -23,11 +23,17 @@ export interface BrowserLockTimeout extends Error {
   ahead: number;
 }
 
+// The rejection when the signal aborts the wait.
+export interface BrowserLockCancelled extends Error {
+  code: 'ARC_LOCK_CANCELLED';
+}
+
 interface BrowserLockOptions {
   deadlineMs?: number;
   label?: string;
   observation?: TestObservation | null;
   onWaiting?: ((wait: BrowserLockWait) => void) | null;
+  signal?: AbortSignal | null;
 }
 
 export function acquireBrowserLock(options?: BrowserLockOptions): Promise<{ release(): boolean }>;

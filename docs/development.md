@@ -28,25 +28,35 @@ npm run test:all
 
 ### Machine load
 
-One multi-lane test run uses the machine at a time. Every `scripts/test-suite.mjs` command that selects more than one lane takes the suite lock before its first lane. These commands include `npm test`, `npm run test:all`, `npm run lint`, `npm run typecheck`, and `scripts/verify-landing.mjs`. `extension/test.mjs full` takes it when its selection reaches both the Node and browser lanes. A single lane, named files in one lane, and a direct Vitest run take no lock.
+A multi-lane test run admits each lane by its load class. Every `scripts/test-suite.mjs` command that selects more than one lane does this. These commands include `npm test`, `npm run test:all`, `npm run lint`, `npm run typecheck`, and `scripts/verify-landing.mjs`. `extension/test.mjs full` does this when its selection reaches both the Node and browser lanes. Its Node lane includes the integration tests, so it takes the admission of the `extension-integration` lane. A single lane, named files in one lane, and a direct Vitest run wait for no memory.
 
-The lock is `arc-test-suite.lock` in the directory that `os.tmpdir()` returns, the same directory as the browser lane lock. Runs whose `TEMP`, `TMP`, or `TMPDIR` values differ use different locks and do not wait for each other. Waiting runs take the lock in the order they arrived. While another run holds the lock, a waiting run prints the holder's PID, start time, and command every 30 seconds. Every wait line names how many runs are ahead of it in the queue. Each waiting run keeps a ticket in `arc-test-suite.lock.queue` beside the lock. A ticket loses its place when its process ends, or when another waiting run sees it go unrefreshed for three minutes. The lock releases at once when its holder's process ends. A live holder that stops refreshing the lock for three minutes also loses it. The suite lock shares its takeover code with the browser lane lock, so it has the same rare three-run race. That race can let two suites run together. A suite that overlaps another through this race does not show a defect in the change under test.
+`LANE_LOADS` in `extension/test/machineload.mjs` gives every suite lane one of three classes:
 
-Before each lane, the run waits while free physical memory is under the floor. It prints the free memory and the floor every 30 seconds. Windows reads available physical memory. Linux reads `MemAvailable` from `/proc/meminfo`. macOS counts free, inactive, and speculative pages from `vm_stat`.
+| Class | Lanes | Admission |
+| --- | --- | --- |
+| Static | Format, lint, type checks, webview globals, and the CLI build | The lane starts at once |
+| Unit | Unit, subprocess, hook smoke, and CLI smoke lanes | The run waits while free physical memory is under the lane's floor. Each floor is 1.5 times the lane's measured peak working set at four workers, and at least 1 GB |
+| Heavy | `browser`, `panel-mockup`, and `extension-integration` | The run takes the lane's lock, then waits while free physical memory is under 6 GB |
 
-A run inside a held suite skips the lock and the memory wait, because its parent admitted the lane that started it. The holder marks its children with `ARC_TEST_SUITE_HOLDER`. A run counts as nested only when that variable names another live process that owns the lock file the run would take.
+Two runs can run different lanes at the same time, and the same static or unit lane at the same time. Only one run at a time holds the lock of a heavy lane. A run releases that lock when the lane ends. `extension/test.mjs browser` takes the browser lane lock as a single lane, and the [panel startup measurement](performance.md#startup-measurement) takes every heavy lane lock.
+
+Each lock is `arc-<lane>-tests.lock` in the directory that `os.tmpdir()` returns. The browser lane lock is `arc-browser-tests.lock`, which the isolated editor also takes. Runs whose `TEMP`, `TMP`, or `TMPDIR` values differ use different locks and do not wait for each other. Waiting runs take a lock in the order they arrived. While another run holds the lock, a waiting run prints the holder's PID, start time, and command every 30 seconds. Every wait line names how many runs are ahead of it in the queue. Each waiting run keeps a ticket in a `.queue` directory beside the lock. A ticket loses its place when its process ends, or when another waiting run sees it go unrefreshed for three minutes. The lock releases at once when its holder's process ends. A live holder that stops refreshing the lock for three minutes also loses it. The takeover of a stale lock has a rare three-run race. That race can let two runs of one heavy lane run together. A lane that overlaps another through this race does not show a defect in the change under test.
+
+While it waits for memory, a run prints the free memory and the floor every 30 seconds. Windows reads available physical memory. Linux reads `MemAvailable` from `/proc/meminfo`. macOS counts free, inactive, and speculative pages from `vm_stat`.
+
+A lane that an admitted run starts skips every memory wait, because its parent admitted it. The run marks its children with `ARC_TEST_SUITE_HOLDER`. A run counts as nested when that variable names another live process. A nested run still takes a heavy lane lock, unless the process that the variable names owns that lock.
 
 | Variable | Effect | Default |
 | --- | --- | --- |
-| `ARC_TEST_LOAD_DEADLINE_MINUTES` | How long a run waits for the lock, and how long it waits for memory before each lane | `40` |
-| `ARC_TEST_MEMORY_FLOOR_GB` | The free memory floor in GB. `0` disables the memory wait. The GitHub workflows set `0` | `6` |
+| `ARC_TEST_LOAD_DEADLINE_MINUTES` | How long a run waits for each heavy lane lock, and how long it waits for memory before each lane | `40` |
+| `ARC_TEST_MEMORY_FLOOR_GB` | The free memory floor in GB for every unit and heavy lane. `0` disables the memory wait. The GitHub workflows set `0` | The floor of each lane class |
 
 | Exit status | Cause |
 | --- | --- |
-| `75` | Another run held the suite lock, or earlier queued runs still waited, until the deadline. The run started no lane and wrote no report |
+| `75` | Another run held a heavy lane lock, or earlier queued runs still waited, until the deadline. A suite report marks the waiting lane blocked and later lanes cancelled. `scripts/verify-landing.mjs` also exits `75` |
 | `76` | Free memory stayed under the floor until the deadline. A suite report marks the waiting lane blocked and later lanes cancelled. `scripts/verify-landing.mjs` also exits `76` |
 
-A Vitest lane runs at most four workers, as [Browser selection](testing.md#browser-selection) describes. `scripts/typecheck-parallel.js` runs two checks at a time. `extension/test/machineload.mjs` owns the lock, the memory read, and the worker cap.
+A Vitest lane runs at most four workers, as [Browser selection](testing.md#browser-selection) describes. `scripts/typecheck-parallel.js` runs two checks at a time. `extension/test/machineload.mjs` owns the lane classes, the lane locks, the memory read, and the worker cap.
 
 ## Source commits
 

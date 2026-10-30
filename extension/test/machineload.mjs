@@ -1,7 +1,8 @@
 // Plain Node ESM lets extension/test.mjs and the root suite runner import this module.
-// A multi-lane test run holds the machine suite lock, so one such run uses the machine at a time.
-// Before each lane it waits for free physical memory, and every Vitest lane runs at most four workers.
-// The suite lock reuses the browser lane lock, including its stale-holder takeover and its three-run race.
+// A multi-lane test run admits each lane by its load class. Static lanes start at once, and unit lanes wait for their
+// memory floor. A heavy lane takes its own machine lock, so one run of that lane uses the machine at a time, and then
+// waits for the heavy floor. Every Vitest lane runs at most four workers.
+// The lane locks use the lock code of browserlock.mjs, including its stale-holder takeover and its three-run race.
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { availableParallelism, freemem, tmpdir } from 'node:os';
@@ -10,20 +11,50 @@ import { performance } from 'node:perf_hooks';
 import { processExists } from './browserchannels.mjs';
 import { acquireBrowserLock } from './browserlock.mjs';
 
-export const SUITE_LOCK_PATH = join(tmpdir(), 'arc-test-suite.lock');
-// A holder sets this to its PID for its children, so a nested run inside a held suite does not wait on its parent.
-// A nested run qualifies only when that PID is another live process that owns the lock file it would take.
+// A top-level run and a lock holder set this to their PID for their children, so a lane that an admitted run starts
+// does not wait again.
+// A run counts as nested when that PID is another live process. A nested run skips memory waits, and it takes a heavy
+// lane lock unless that process owns it.
 export const SUITE_HOLDER_ENV = 'ARC_TEST_SUITE_HOLDER';
 export const DEADLINE_ENV = 'ARC_TEST_LOAD_DEADLINE_MINUTES';
 export const MEMORY_FLOOR_ENV = 'ARC_TEST_MEMORY_FLOOR_GB';
 export const DEFAULT_DEADLINE_MINUTES = 40;
-export const DEFAULT_MEMORY_FLOOR_GB = 6;
-export const SUITE_LOCK_TIMEOUT_EXIT = 75;
+export const HEAVY_MEMORY_FLOOR_GB = 6;
+export const LANE_LOCK_TIMEOUT_EXIT = 75;
 export const MEMORY_TIMEOUT_EXIT = 76;
 export const MAX_VITEST_WORKERS = 4;
 const NOTICE_MS = 30_000;
 const MEMORY_POLL_MS = 5_000;
 const GIB = 1024 ** 3;
+
+// Each unit floor is 1.5 times the lane's measured peak working set at four workers, and never under 1 GB.
+// The plan entry for the per-lane lock records the measurements.
+const STATIC = Object.freeze({ floorGb: 0, lock: false });
+const unit = (floorGb) => Object.freeze({ floorGb, lock: false });
+const HEAVY = Object.freeze({ floorGb: HEAVY_MEMORY_FLOOR_GB, lock: true });
+export const LANE_LOADS = Object.freeze({
+  format: STATIC,
+  'lint-js': STATIC,
+  'lint-css': STATIC,
+  'webview-globals': STATIC,
+  'extension-tsc': STATIC,
+  'webview-tsc': STATIC,
+  'cli-tsc': STATIC,
+  'cli-build': STATIC,
+  'root-units': unit(1),
+  'extension-units': unit(4.5),
+  'cli-units': unit(2.2),
+  'root-subprocess': unit(2),
+  'hook-smoke': unit(1),
+  'cli-smoke': unit(3),
+  browser: HEAVY,
+  'panel-mockup': HEAVY,
+  'extension-integration': HEAVY,
+});
+export const HEAVY_LANES = Object.freeze(Object.keys(LANE_LOADS).filter((lane) => LANE_LOADS[lane].lock));
+
+// The browser lane keeps the lock name that extension/test/browserlock.mjs and the isolated editor use.
+export const laneLockPath = (lane, directory = tmpdir()) => join(directory, `arc-${lane}-tests.lock`);
 
 export class MachineLoadTimeout extends Error {
   constructor(message, exitCode) {
@@ -41,10 +72,11 @@ function setting(env, name, fallback, allowZero) {
   return value;
 }
 
+// floorGb is null unless MEMORY_FLOOR_ENV replaces every lane floor.
 export function loadSettings(env = process.env) {
   const deadlineMinutes = setting(env, DEADLINE_ENV, DEFAULT_DEADLINE_MINUTES, false);
-  const floorGb = setting(env, MEMORY_FLOOR_ENV, DEFAULT_MEMORY_FLOOR_GB, true);
-  return { deadlineMs: deadlineMinutes * 60_000, floorBytes: floorGb * GIB };
+  const floorGb = setting(env, MEMORY_FLOOR_ENV, null, true);
+  return { deadlineMs: deadlineMinutes * 60_000, floorGb };
 }
 
 // Windows reports available physical memory, which includes the standby list.
@@ -132,26 +164,30 @@ function describeHolder(owner) {
   return `PID ${owner.pid}, ${started}${command}`;
 }
 
-// Take the machine suite lock, or return a nested holder when a live ancestor already holds it.
-// The holder's children inherit SUITE_HOLDER_ENV until release.
-export async function acquireSuiteLock({
+// A live process other than this one that SUITE_HOLDER_ENV names, or null.
+function liveHolder(env, pid, isProcessAlive) {
+  const holder = Number(env[SUITE_HOLDER_ENV]);
+  return Number.isInteger(holder) && holder > 0 && holder !== pid && isProcessAlive(holder) ? holder : null;
+}
+
+// Take a heavy lane's machine lock. The run is nested when this process or the live holder named by
+// SUITE_HOLDER_ENV already owns the lock. The holder's children inherit SUITE_HOLDER_ENV until release.
+// A cancelled signal ends the wait and returns null.
+export async function acquireLaneLock({
+  lane,
+  label = `The ${lane} lane`,
   env = process.env,
   command = process.argv.join(' '),
-  deadlineMs,
-  lockPath = SUITE_LOCK_PATH,
+  deadlineMs = loadSettings(env).deadlineMs,
+  lockDirectory,
+  lockPath = laneLockPath(lane, lockDirectory),
   pid = process.pid,
   log = console.log,
   isProcessAlive = processExists,
   ...lockOptions
 }) {
-  const ancestor = Number(env[SUITE_HOLDER_ENV]);
-  if (
-    Number.isInteger(ancestor) &&
-    ancestor > 0 &&
-    ancestor !== pid &&
-    lockOwnerPid(lockPath) === ancestor &&
-    isProcessAlive(ancestor)
-  )
+  const owner = lockOwnerPid(lockPath);
+  if (owner !== null && (owner === pid || owner === liveHolder(env, pid, isProcessAlive)))
     return { nested: true, release: () => false };
   let lastNotice = null;
   let lock;
@@ -159,8 +195,8 @@ export async function acquireSuiteLock({
     lock = await acquireBrowserLock({
       lockPath,
       pid,
-      label: 'suite',
-      heading: 'The test suite',
+      label: lane,
+      heading: label,
       command,
       deadlineMs,
       isProcessAlive,
@@ -168,22 +204,23 @@ export async function acquireSuiteLock({
         if (lastNotice !== null && waitedMs - lastNotice < NOTICE_MS) return;
         lastNotice = waitedMs;
         const blocker = held
-          ? `for another run on this machine: ${describeHolder(owner)}`
+          ? `for another run of this lane on this machine: ${describeHolder(owner)}`
           : 'for its turn on this machine';
         log(
-          `The test suite waits ${blocker}. ${ahead} ahead in the queue. Waited ${seconds(waitedMs)} s of ${minutes(deadlineMs)} min.`,
+          `${label} waits ${blocker}. ${ahead} ahead in the queue. Waited ${seconds(waitedMs)} s of ${minutes(deadlineMs)} min.`,
         );
       },
       ...lockOptions,
     });
   } catch (error) {
+    if (error.code === 'ARC_LOCK_CANCELLED') return null;
     if (error.code !== 'ARC_LOCK_TIMEOUT') throw error;
     const cause = error.held
-      ? `Another test run held the machine suite lock for ${minutes(deadlineMs)} min, so this run did not start. The holder was ${describeHolder(error.owner)}.`
-      : `Earlier test runs in the machine queue were still ahead of this run after ${minutes(deadlineMs)} min, so it did not start.`;
+      ? `${label} did not start, because another run held its machine lock for ${minutes(deadlineMs)} min. The holder was ${describeHolder(error.owner)}.`
+      : `${label} did not start, because earlier runs in its machine queue were still ahead after ${minutes(deadlineMs)} min.`;
     throw new MachineLoadTimeout(
       `${cause} ${error.ahead} ahead in the queue. ${DEADLINE_ENV} moves the limit.`,
-      SUITE_LOCK_TIMEOUT_EXIT,
+      LANE_LOCK_TIMEOUT_EXIT,
     );
   }
   const previous = env[SUITE_HOLDER_ENV];
@@ -198,39 +235,81 @@ export async function acquireSuiteLock({
   };
 }
 
-// Hold the suite lock around a multi-lane run and give it a per-lane memory wait.
-// A nested run skips both, because its ancestor admitted the lane that started it.
+// Give a multi-lane run an admission step for each lane, by the lane's load class.
+// A static lane starts at once. A unit lane waits for its memory floor. A heavy lane takes its machine lock, then
+// waits for the heavy floor. The admission returns a release that the run calls when the lane ends.
+// A nested run skips every memory wait, because its holder admitted the lane that started it.
 // options = false disables the guard for in-process tests.
 export async function holdMachineLoad(run, options = {}) {
-  if (options === false) return run(async () => {});
+  if (options === false) return run(async () => () => {});
   const {
     env = process.env,
     log = console.log,
+    pid = process.pid,
+    isProcessAlive = processExists,
     readFree,
     monotonicNow,
     waitForPoll,
     memoryPollMs,
     ...lockOptions
   } = options;
-  const { deadlineMs, floorBytes } = loadSettings(env);
-  const lock = await acquireSuiteLock({ env, log, deadlineMs, monotonicNow, waitForPoll, ...lockOptions });
+  const { deadlineMs, floorGb } = loadSettings(env);
+  const nested = liveHolder(env, pid, isProcessAlive) !== null;
+  const held = new Set();
+  // A top-level run marks its children, so a run that one of its lanes starts counts as nested.
+  const previous = env[SUITE_HOLDER_ENV];
+  if (!nested) env[SUITE_HOLDER_ENV] = String(pid);
   try {
-    return await run(async (label, signal) => {
-      if (lock.nested) return;
-      await waitForMemory({
-        floorBytes,
-        deadlineMs,
-        label,
-        log,
-        readFree,
-        monotonicNow,
-        waitForPoll,
-        pollMs: memoryPollMs,
-        signal,
-      });
+    return await run(async (lane, label, signal) => {
+      const load = lane.load ?? LANE_LOADS[lane.id];
+      if (!load) throw Error(`The ${lane.id} lane has no load class in LANE_LOADS of extension/test/machineload.mjs.`);
+      const lock = load.lock
+        ? await acquireLaneLock({
+            lane: lane.id,
+            label,
+            env,
+            deadlineMs,
+            pid,
+            log,
+            isProcessAlive,
+            monotonicNow,
+            waitForPoll,
+            signal,
+            ...lockOptions,
+          })
+        : null;
+      const release = () => {
+        held.delete(release);
+        lock?.release();
+      };
+      held.add(release);
+      // The environment floor replaces each lane floor, and a static lane keeps none.
+      const floor = load.floorGb ? (floorGb ?? load.floorGb) : 0;
+      if (signal?.aborted || nested || !floor) return release;
+      try {
+        await waitForMemory({
+          floorBytes: floor * GIB,
+          deadlineMs,
+          label,
+          log,
+          readFree,
+          monotonicNow,
+          waitForPoll,
+          pollMs: memoryPollMs,
+          signal,
+        });
+      } catch (error) {
+        release();
+        throw error;
+      }
+      return release;
     });
   } finally {
-    lock.release();
+    for (const release of held) release();
+    if (!nested) {
+      if (previous === undefined) delete env[SUITE_HOLDER_ENV];
+      else env[SUITE_HOLDER_ENV] = previous;
+    }
   }
 }
 

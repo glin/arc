@@ -16,7 +16,7 @@ function toolBin(name) {
 }
 
 function runTool(name, args, cwd) {
-  // Fixture suite runs skip the free memory wait. Their suite lock stays in this run's temporary directory.
+  // Fixture suite runs skip the free memory wait. Their lane locks stay in this run's temporary directory.
   const env = { ...process.env, ARC_TEST_MEMORY_FLOOR_GB: '0' };
   const pathKey = Object.keys(env).find((key) => key.toLowerCase() === 'path') ?? 'PATH';
   env[pathKey] = [path.join(repositoryRoot, 'node_modules', '.bin'), env[pathKey]].filter(Boolean).join(path.delimiter);

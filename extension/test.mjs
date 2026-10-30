@@ -3,8 +3,9 @@ import { existsSync, readdirSync, realpathSync } from 'node:fs';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { launchAnyBrowser } from './test/browserchannels.mjs';
-import { acquireBrowserLock, forwardSignalToChildAndRelease } from './test/browserlock.mjs';
+import { forwardSignalToChildAndRelease } from './test/browserlock.mjs';
 import {
+  acquireLaneLock,
   clampWorkerArgs,
   clampWorkerEnvironment,
   hasWorkerFlag,
@@ -14,7 +15,7 @@ import {
 } from './test/machineload.mjs';
 import { createTestObservation } from './test/observations.mjs';
 
-// Default injected runners acquire no machine lock. The CLI entry point supplies the real acquireBrowserLock.
+// Default injected runners acquire no machine lock. The CLI entry point supplies the browser lane lock.
 async function noopAcquireLock() {
   return { release: () => true };
 }
@@ -451,13 +452,21 @@ export async function runFull(extraArgs, opts = {}) {
   const runNode = opts.asyncNode ? (args) => runNodeLane(args, opts) : (args) => runTestMode('node', args, opts);
   const { passthrough, files } = partitionArgs(extraArgs);
   // Without a machine load guard, the first lane starts in the same tick, as callers that emit child events at once expect.
-  const { beforeLane } = opts;
+  // The Node lane runs the integration tests too, so it takes the extension-integration lane's admission.
+  const admitted = async (lane, label, start) => {
+    const release = opts.beforeLane ? await opts.beforeLane({ id: lane }, label) : null;
+    try {
+      return await start();
+    } finally {
+      release?.();
+    }
+  };
+  const nodeLane = (args) => admitted('extension-integration', 'The extension Node lane', () => runNode(args));
+  const browserLane = (args) => admitted('browser', 'The extension browser lane', () => runBrowserLane(args, opts));
   if (files.length === 0) {
-    if (beforeLane) await beforeLane('The extension Node lane');
-    const nodeStatus = await runNode(extraArgs);
+    const nodeStatus = await nodeLane(extraArgs);
     if (cancelled) return nodeStatus || 1;
-    if (beforeLane) await beforeLane('The extension browser lane');
-    const browserStatus = await runBrowserLane(extraArgs, opts);
+    const browserStatus = await browserLane(extraArgs);
     return nodeStatus !== 0 ? nodeStatus : browserStatus;
   }
   let byLane;
@@ -469,16 +478,14 @@ export async function runFull(extraArgs, opts = {}) {
   }
   let nodeStatus = 0;
   if (byLane.node.length > 0) {
-    if (beforeLane) await beforeLane('The extension Node lane');
-    nodeStatus = await runNode([...passthrough, ...byLane.node]);
+    nodeStatus = await nodeLane([...passthrough, ...byLane.node]);
     if (cancelled) return nodeStatus || 1;
   } else {
     console.log('Node lane skipped: no named file belongs to it.');
   }
   let browserStatus = 0;
   if (byLane.browser.length > 0) {
-    if (beforeLane) await beforeLane('The extension browser lane');
-    browserStatus = await runBrowserLane([...passthrough, ...byLane.browser], opts);
+    browserStatus = await browserLane([...passthrough, ...byLane.browser]);
   } else {
     console.log('Browser lane skipped: no named file belongs to it.');
   }
@@ -505,7 +512,8 @@ export async function main(argv = process.argv.slice(2), { machineLoad = {} } = 
     onCancelled: (signal) => {
       process.exitCode = { SIGHUP: 129, SIGINT: 130, SIGTERM: 143 }[signal] ?? 1;
     },
-    acquireLock: acquireBrowserLock,
+    // A browser lane inside a run that holds the browser lane lock counts as nested and does not wait again.
+    acquireLock: (options) => acquireLaneLock({ lane: 'browser', ...options }),
     observationFactory: (lane, cwd, args) =>
       createTestObservation({
         lane: `extension ${lane}`,
@@ -515,21 +523,18 @@ export async function main(argv = process.argv.slice(2), { machineLoad = {} } = 
         capacity: lane === 'browser' ? 1 : null,
       }),
   };
-  if (mode === 'full' && !fullRunsBothLanes(extraArgs)) return runFull(extraArgs, opts);
-  if (mode === 'full') {
-    // A full run of both lanes holds the machine suite lock and waits for free memory before each lane.
-    try {
+  try {
+    if (mode === 'full' && !fullRunsBothLanes(extraArgs)) return await runFull(extraArgs, opts);
+    // A full run of both lanes admits each lane by its load class, as a multi-lane suite does.
+    if (mode === 'full')
       return await holdMachineLoad((beforeLane) => runFull(extraArgs, { ...opts, beforeLane }), machineLoad);
-    } catch (error) {
-      if (!(error instanceof MachineLoadTimeout)) throw error;
-      console.error(error.message);
-      return error.exitCode;
-    }
+    if (mode === 'browser') return await runBrowserLane(extraArgs, opts);
+    return await (mode === 'node' ? runNodeLane(extraArgs, opts) : runTestMode(mode, extraArgs, opts));
+  } catch (error) {
+    if (!(error instanceof MachineLoadTimeout)) throw error;
+    console.error(error.message);
+    return error.exitCode;
   }
-  if (mode === 'browser') {
-    return runBrowserLane(extraArgs, opts);
-  }
-  return mode === 'node' ? runNodeLane(extraArgs, opts) : runTestMode(mode, extraArgs, opts);
 }
 
 if (

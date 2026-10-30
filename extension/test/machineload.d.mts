@@ -1,6 +1,10 @@
-export const SUITE_LOCK_PATH: string;
+import type { TestObservation } from './observations.mjs';
 
-export function loadSettings(env?: NodeJS.ProcessEnv): { deadlineMs: number; floorBytes: number };
+export const HEAVY_LANES: readonly string[];
+
+export function laneLockPath(lane: string, directory?: string): string;
+
+export function loadSettings(env?: NodeJS.ProcessEnv): { deadlineMs: number; floorGb: number | null };
 
 export function freeMemoryBytes(options?: {
   platform?: NodeJS.Platform;
@@ -9,8 +13,13 @@ export function freeMemoryBytes(options?: {
   osFree?: () => number;
 }): number;
 
-export function acquireSuiteLock(options: {
-  deadlineMs: number;
+// Resolves null when the signal aborts the wait.
+export function acquireLaneLock(options: {
+  lane: string;
+  label?: string;
+  deadlineMs?: number;
   env?: NodeJS.ProcessEnv;
   command?: string;
-}): Promise<{ nested: boolean; release(): boolean }>;
+  observation?: TestObservation | null;
+  signal?: AbortSignal | null;
+}): Promise<{ nested: boolean; release(): boolean } | null>;

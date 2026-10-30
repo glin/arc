@@ -1345,6 +1345,28 @@ test('a browser lock wait times out on a deadline instead of waiting forever', a
   }
 });
 
+test('a cancelled browser lock wait rejects and leaves the queue', async () => {
+  const lockPath = lockFixture();
+  fs.writeFileSync(lockPath, JSON.stringify({ pid: 1551, cwd: '/repo/worktree-a', startedAt: 'earlier' }));
+  const controller = new AbortController();
+  try {
+    await assert.rejects(
+      browserLock.acquireBrowserLock({
+        lockPath,
+        pid: 1552,
+        isProcessAlive: () => true,
+        signal: controller.signal,
+        waitForPoll: async () => controller.abort(),
+      }),
+      (error) => error.code === 'ARC_LOCK_CANCELLED',
+    );
+    assert.deepEqual(fs.readdirSync(`${lockPath}.queue`), []);
+    assert.equal(JSON.parse(fs.readFileSync(lockPath, 'utf8')).pid, 1551);
+  } finally {
+    fs.rmSync(path.dirname(lockPath), { recursive: true, force: true });
+  }
+});
+
 test('release never throws, even when the lock file cannot be read', async () => {
   const lockPath = lockFixture();
   try {

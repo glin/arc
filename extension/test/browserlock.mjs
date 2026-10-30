@@ -22,7 +22,7 @@ import { processExists } from './browserchannels.mjs';
 
 export const BROWSER_LOCK_PATH = join(tmpdir(), 'arc-browser-tests.lock');
 const BROWSER_LOCK_POLL_MS = 2_000;
-export const BROWSER_LOCK_DEADLINE_MS = 30 * 60_000;
+export const BROWSER_LOCK_DEADLINE_MS = 40 * 60_000;
 export const BROWSER_LOCK_STALE_AFTER_MS = 3 * 60_000;
 export const BROWSER_LOCK_HEARTBEAT_MS = 30_000;
 const SIGNAL_EXIT_CODES = { SIGHUP: 129, SIGINT: 130, SIGTERM: 143 };
@@ -324,6 +324,7 @@ export async function acquireBrowserLock({
   command = null,
   onWaiting = null,
   processEmitter = process,
+  signal = null,
 } = {}) {
   const lockName = `${label} test lock`;
   let announced = false;
@@ -403,6 +404,12 @@ export async function acquireBrowserLock({
   try {
     if (!tryOnly) joinQueue();
     while (true) {
+      // A cancelled wait leaves the queue at its next poll.
+      if (signal?.aborted) {
+        const cancelled = new Error(`The wait for the ${lockName} was cancelled.`);
+        cancelled.code = 'ARC_LOCK_CANCELLED';
+        throw cancelled;
+      }
       const ahead = ticketsAhead(lockPath, ticket, ticketObservations, {
         isProcessAlive,
         monotonicNow,

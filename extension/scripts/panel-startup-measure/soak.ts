@@ -278,9 +278,9 @@ export interface ProcessEntry {
   command: string;
 }
 
-// Count test-suite and verify-landing processes that run work, including runs that take no suite lock. A run counts
-// when it has a child that is not another run process, so a shell that starts a run does not count again. A run that
-// waits for the suite lock has started no child process yet, so it does not count.
+// Count test-suite and verify-landing processes that run work, including lanes that take no lock. A run counts when it
+// has a child that is not another run process, so a shell that starts a run does not count again. A run that waits for
+// a heavy lane lock has no child process, so it does not count.
 export function runningTestRuns(processes: readonly ProcessEntry[]): number {
   const run = (entry: ProcessEntry) =>
     /^(?:"[^"]*node(?:\.exe)?"|\S*node(?:\.exe)?)\s/i.test(entry.command) &&

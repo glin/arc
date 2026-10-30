@@ -890,7 +890,7 @@ export async function pollStartup(
 const runRecord: Record<string, unknown> = {};
 
 // Wait until no test run is active and free memory reaches the floor. A loaded machine skews every timing.
-// A test run that predates the suite lock does not take it, so the process scan still applies.
+// Static and unit lanes take no lock, so the process scan still applies.
 async function awaitMachine(minimumFreeGb: number, deadlineMs: number): Promise<void> {
   const { freeMemoryBytes } = await import('../../test/machineload.mjs');
   const deadline = Date.now() + deadlineMs;
@@ -1066,20 +1066,18 @@ const WARM_UP_OPEN_MS = 5.5 * 60_000;
 // Editor failure or timeout ends an incomplete run.
 async function measure(commandLine: string, workspace: string, options: Options): Promise<Outcome> {
   const timeoutMs = options.timeoutMs;
-  const { acquireBrowserLock } = await import('../../test/browserlock.mjs');
-  const { acquireSuiteLock, loadSettings } = await import('../../test/machineload.mjs');
+  const { acquireLaneLock, HEAVY_LANES } = await import('../../test/machineload.mjs');
   const { createTestObservation } = await import('../../test/observations.mjs');
   const observation = createTestObservation({ lane: 'panel startup measurement', cwd: REPOSITORY, capacity: 1 });
   observation.unavailable('build', 'The measured build is prepared before this request.');
   let failure: string | null = null;
   let complete = false;
-  let lock;
-  let suite;
+  const locks: Array<{ release(): boolean } | null> = [];
   try {
-    // A measured launch holds the machine suite lock, so no multi-lane test run overlaps it. The runner waits for the
-    // lock like any suite does. A wait for idle before the lock never ends while suites hand the lock to each other.
-    suite = await acquireSuiteLock({ deadlineMs: loadSettings().deadlineMs });
-    lock = await acquireBrowserLock({ deadlineMs: timeoutMs, observation });
+    // A measured launch holds every heavy lane lock, so no heavy test lane overlaps it. The runner waits for each lock
+    // like a suite lane does. Every holder takes these locks in the same order, so two runners cannot block each other.
+    for (const lane of HEAVY_LANES)
+      locks.push(await acquireLaneLock({ lane, observation: lane === 'browser' ? observation : null }));
     const logs = path.join(ARC_STORE, DIAGNOSTICS_LOG_DIRECTORY);
     const reader = new LogReader(logs);
     if (options.warmUp) {
@@ -1153,8 +1151,7 @@ async function measure(commandLine: string, workspace: string, options: Options)
     failure = error instanceof Error ? error.message : String(error);
     throw error;
   } finally {
-    lock?.release();
-    suite?.release();
+    for (const lock of locks.reverse()) lock?.release();
     observation.finish({
       outcome: failure ? 'failure' : complete ? 'success' : 'incomplete',
       reason: failure ?? (complete ? null : 'Startup measurement remained incomplete.'),

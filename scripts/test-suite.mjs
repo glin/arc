@@ -18,7 +18,7 @@ import { fileURLToPath } from 'node:url';
 import { runLanes } from './test-lanes.mjs';
 import { subprocessVitestArgs } from './test-subprocess.mjs';
 import { createTestObservation } from '../extension/test/observations.mjs';
-import { holdMachineLoad, MachineLoadTimeout, MEMORY_TIMEOUT_EXIT } from '../extension/test/machineload.mjs';
+import { holdMachineLoad, MachineLoadTimeout } from '../extension/test/machineload.mjs';
 
 export const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const hash = (value) => createHash('sha256').update(value).digest('hex');
@@ -253,7 +253,7 @@ export function laneCommand(lane, tests) {
   ];
 }
 
-// A run of more than one lane holds the machine suite lock and waits for free memory before each lane.
+// A run of more than one lane admits each lane by its load class in extension/test/machineload.mjs.
 // machineLoad carries injected lock and memory options, and false disables the guard.
 export async function collectSuite({ machineLoad = {}, ...options } = {}) {
   const lanes = options.lanes ?? suiteLanes(options.cwd ?? root, options.mode ?? 'all');
@@ -305,7 +305,7 @@ async function collectLanes({
   const cancel = () => controller.abort();
   for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) processEmitter.on(signal, cancel);
   const categories = [];
-  let memoryTimeout = null;
+  let loadTimeout = null;
   const observation = observationFactory({ lane: mode, cwd });
   for (const phase of ['queue', 'build', 'execution', 'cleanup'])
     observation?.unavailable(
@@ -343,21 +343,23 @@ async function collectLanes({
               : missingTool
                 ? `Executable is unavailable: ${lane.args[0]}`
                 : null;
-      let memoryBlocked = false;
+      let loadBlocked = false;
+      let releaseLane = null;
       if (!controller.signal.aborted && !blocked) {
         try {
-          await beforeLane(`The ${lane.id} lane`, controller.signal);
+          releaseLane = await beforeLane(lane, `The ${lane.id} lane`, controller.signal);
         } catch (error) {
           if (!(error instanceof MachineLoadTimeout)) throw error;
-          memoryTimeout = error;
-          memoryBlocked = true;
+          loadTimeout = error;
+          loadBlocked = true;
           console.error(error.message);
           controller.abort();
         }
       }
       if (controller.signal.aborted || blocked) {
-        category.status = memoryBlocked || !controller.signal.aborted ? 'blocked' : 'cancelled';
-        category.reason = memoryBlocked ? memoryTimeout.message : (blocked ?? 'Collection cancelled');
+        releaseLane?.();
+        category.status = loadBlocked || !controller.signal.aborted ? 'blocked' : 'cancelled';
+        category.reason = loadBlocked ? loadTimeout.message : (blocked ?? 'Collection cancelled');
         appendFileSync(log, `${category.reason}\n`);
       } else {
         const args = category.command.slice(1);
@@ -370,14 +372,18 @@ async function collectLanes({
           ...(lane.vitest ? { ARC_TEST_RESULTS_FILE: tests } : {}),
         };
         delete env.ARC_TEST_REPORT_DIR;
-        await runLanes([{ ...lane, args, env }], runChecks, null, {
-          signal: controller.signal,
-          onOutput: (_check, chunk) => appendFileSync(log, chunk),
-          onResult: (result) => {
-            outcome = result;
-            if (result.signal || [129, 130, 143].includes(result.status)) controller.abort();
-          },
-        });
+        try {
+          await runLanes([{ ...lane, args, env }], runChecks, null, {
+            signal: controller.signal,
+            onOutput: (_check, chunk) => appendFileSync(log, chunk),
+            onResult: (result) => {
+              outcome = result;
+              if (result.signal || [129, 130, 143].includes(result.status)) controller.abort();
+            },
+          });
+        } finally {
+          releaseLane();
+        }
         observation?.end(`stage:${lane.id}`);
         category.exitCode = outcome?.status ?? 1;
         category.signal = outcome?.signal ?? null;
@@ -422,8 +428,8 @@ async function collectLanes({
     for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) processEmitter.off(signal, cancel);
   }
   const end = identify(cwd);
-  const exitCode = memoryTimeout
-    ? MEMORY_TIMEOUT_EXIT
+  const exitCode = loadTimeout
+    ? loadTimeout.exitCode
     : !controller.signal.aborted &&
         categories.every((category) => category.status === 'passed') &&
         categories.every(
