@@ -7,7 +7,9 @@ import { estimateTextTokens } from './subagentcontext';
 
 export const CODEX_CONTEXT_BYTES = 16 * 1024 * 1024;
 export const CODEX_CONTEXT_ITEMS = 4096;
-const RECORD_BYTES = 512 * 1024;
+const OPENING_BYTES = 512 * 1024;
+const RECORD_BYTES = 2 * 1024 * 1024;
+const CHUNK_BYTES = 256 * 1024;
 const RECORDS = 20_000;
 
 export interface CodexContextEstimate {
@@ -288,14 +290,37 @@ export async function readCodexContext(
   session: string,
   revision: FileRevision,
   signal: AbortSignal,
+  options: {
+    openingBytes?: number;
+    recordBytes?: number;
+    scanBytes?: number;
+    chunkBytes?: number;
+    previousLines?: typeof readPreviousLines;
+  } = {},
 ): Promise<CodexContextResult | null> {
+  for (const [value, maximum] of [
+    [options.openingBytes, OPENING_BYTES],
+    [options.recordBytes, RECORD_BYTES],
+    [options.scanBytes, CODEX_CONTEXT_BYTES],
+    [options.chunkBytes, CHUNK_BYTES],
+  ] as const) {
+    if (value !== undefined && (!Number.isInteger(value) || value <= 0 || value > maximum)) return null;
+  }
+  const openingBytes = options.openingBytes ?? OPENING_BYTES;
+  const recordBytes = options.recordBytes ?? RECORD_BYTES;
+  const scanBytes = options.scanBytes ?? CODEX_CONTEXT_BYTES;
+  const chunkBytes = options.chunkBytes ?? CHUNK_BYTES;
+  const previousLines = options.previousLines ?? readPreviousLines;
+  const headBytes = Math.min(openingBytes, revision.size);
+  if (signal.aborted || headBytes + 1 > scanBytes) return null;
   let release: (() => void) | undefined;
   let descriptor: RolloutSource | undefined;
   try {
     release = await prepareRolloutSource(file);
+    if (signal.aborted) return null;
     descriptor = openRolloutSource(file, false, fs);
     if (revision.size !== descriptor.size) return null;
-    const head = Buffer.alloc(Math.min(RECORD_BYTES, revision.size));
+    const head = Buffer.alloc(headBytes);
     if (descriptor.readInto(head, 0, head.length, 0) !== head.length) return null;
     const newline = head.indexOf(10);
     if (newline < 0) return null;
@@ -305,19 +330,20 @@ export async function readCodexContext(
     if (descriptor.readInto(end, 0, 1, revision.size - 1) !== 1 || end[0] !== 10) return null;
     let cursor: BackwardLineCursor = { revision, end: revision.size, fragment: Buffer.alloc(0) };
     const records: unknown[] = [];
-    let read = head.length;
+    let read = head.length + 1;
     let boundary = false;
-    while (cursor.end > 0 && read < CODEX_CONTEXT_BYTES && !boundary) {
+    while (cursor.end > 0 && read < scanBytes && !boundary) {
       if (signal.aborted) return null;
-      const length = Math.min(256 * 1024, CODEX_CONTEXT_BYTES - read);
-      const batch = readPreviousLines(file, cursor, length);
-      if (!batch) return null;
+      const length = Math.min(chunkBytes, scanBytes - read);
+      const batch = previousLines(file, cursor, length, undefined, recordBytes);
+      if (!batch || signal.aborted) return null;
       read += cursor.end - batch.cursor.end;
       cursor = batch.cursor;
-      if (cursor.fragment.length > RECORD_BYTES) return null;
+      if (cursor.discardedFragment || cursor.fragment.length > recordBytes) return null;
       for (const line of batch.lines) {
+        if (signal.aborted || line.oversized) return null;
         if (!line.text.trim()) continue;
-        if (Buffer.byteLength(line.text) > RECORD_BYTES || records.length >= RECORDS) return null;
+        if (Buffer.byteLength(line.text) > recordBytes || records.length >= RECORDS) return null;
         const record = JSON.parse(line.text);
         records.push(record);
         if (record.type === 'compacted') {
@@ -329,7 +355,7 @@ export async function readCodexContext(
       }
       await new Promise<void>((resolve) => setImmediate(resolve));
     }
-    if (!boundary && cursor.end > 0) return null;
+    if (signal.aborted || (!boundary && cursor.end > 0)) return null;
     records.reverse();
     if (boundary) records.unshift(opening);
     return inspectCodexContext(records, session);

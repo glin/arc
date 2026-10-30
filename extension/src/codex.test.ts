@@ -59,7 +59,7 @@ test.each(['claude', 'codex'] as const)(
   },
 );
 import { enumerateRolloutFiles, enumerateRolloutFilesAsync } from './codex';
-import { revisionOf, readQualifiedSessionCwd } from './transcript';
+import { revisionOf, readQualifiedSessionCwd, readPreviousLines } from './transcript';
 // extension/src/codex.test.ts
 import { afterAll, afterEach, beforeAll, describe, test, vi } from 'vitest';
 import assert from 'node:assert';
@@ -190,6 +190,7 @@ import {
 } from './projectspend.ts';
 import { RETAINED_COMPACTIONS } from './parserstate.ts';
 import { estimateCodexContext, inspectCodexContext, readCodexContext, CODEX_CONTEXT_ITEMS } from './codexcontext.ts';
+import { normalizeContext, type ContextIdentity } from './domain/context-detail';
 import { bedrockAstraRecords, codexContextRecords } from './turnfixtures.ts';
 import { emptyCodexResponseClock, reduceCodexResponseClock } from './outputrate';
 
@@ -705,15 +706,285 @@ test('Codex categories use retained ordinary and compacted histories without lif
     null,
   );
   const saved = codexContextRecords().map((row) => JSON.stringify(row));
-  const record = JSON.stringify({ type: 'event_msg', payload: { type: 'task_complete', detail: 'x'.repeat(60_000) } });
-  for (const suffix of [
-    JSON.stringify({ type: 'event_msg', payload: { type: 'task_complete', detail: 'x'.repeat(600_000) } }),
-    (record + '\n').repeat(300),
-    '{"type":"event_msg","payload":{"type":"task_complete"}}\n'.repeat(20_001),
-  ]) {
-    fs.writeFileSync(file, saved.join('\n') + '\n' + suffix + '\n');
-    const bounded = revisionOf(fs.statSync(file, { bigint: true }));
-    assert.equal(await readCodexContext(file, 's1', bounded, new AbortController().signal), null);
+  const suffix = '{"type":"event_msg","payload":{"type":"task_complete"}}\n'.repeat(20_001);
+  fs.writeFileSync(file, saved.join('\n') + '\n' + suffix);
+  const bounded = revisionOf(fs.statSync(file, { bigint: true }));
+  assert.equal(await readCodexContext(file, 's1', bounded, new AbortController().signal), null);
+});
+
+const savedCodexContextIdentity: ContextIdentity = {
+  session: 's1',
+  provider: 'codex',
+  model: 'gpt-6.1-sol',
+  source: 'saved',
+  generation: 1,
+  request: 1,
+};
+
+test.each([600 * 1024, 900 * 1024])(
+  'Codex context admits aligned %i-byte ordinary records through the normalizer',
+  async (bytes) => {
+    const records = codexContextRecords();
+    const large = { type: 'event_msg', payload: { type: 'task_complete', detail: '' } };
+    large.payload.detail = 'x'.repeat(bytes - Buffer.byteLength(JSON.stringify(large)));
+    assert.equal(Buffer.byteLength(JSON.stringify(large)), bytes);
+    const file = writeRollout([...records, large]);
+    const fragments: number[] = [];
+    const result = await readCodexContext(
+      file,
+      's1',
+      revisionOf(fs.statSync(file, { bigint: true })),
+      new AbortController().signal,
+      {
+        previousLines: (...args) => {
+          const batch = readPreviousLines(...args);
+          if (batch) fragments.push(batch.cursor.fragment.length);
+          return batch;
+        },
+      },
+    );
+    assert.equal(Math.max(...fragments) > 512 * 1024, bytes === 900 * 1024);
+    const detail = normalizeContext(result, savedCodexContextIdentity, 0);
+    assert.equal(detail.status, 'available');
+    assert.deepEqual(result, estimateCodexContext(records, 's1'));
+    assert.equal(
+      detail.categories.reduce((sum, row) => sum + row.tokens, 0),
+      detail.used,
+    );
+  },
+);
+
+test('Codex context admits a 926564-byte compaction and preserves pending tools through the normalizer', async () => {
+  const records = codexContextRecords('s1', true);
+  const compaction = records.find((row) => row.type === 'compacted')!;
+  const history = compaction.payload.replacement_history;
+  while (history.length < 20)
+    history.push({ type: 'message', role: 'user', content: [{ type: 'input_text', text: '' }] });
+  history.at(-1).content[0].text = 'r'.repeat(196_108 - Buffer.byteLength(JSON.stringify(history)));
+  compaction.payload.guardian_history = [{ type: 'message', role: 'assistant', content: [] }];
+  compaction.payload.guardian_history[0].content.push({ type: 'output_text', text: '' });
+  compaction.payload.guardian_history[0].content[0].text = 'g'.repeat(
+    717_662 - Buffer.byteLength(JSON.stringify(compaction.payload.guardian_history)),
+  );
+  compaction.payload.message = '';
+  compaction.payload.message = 's'.repeat(926_564 - Buffer.byteLength(JSON.stringify(compaction)));
+  assert.equal(Buffer.byteLength(JSON.stringify(compaction)), 926_564);
+  records.at(-1)!.payload.info.model_context_window = 475_000;
+  records.at(-1)!.payload.info.last_token_usage.input_tokens = 182_848;
+  const file = writeRollout(records);
+  const result = await readCodexContext(
+    file,
+    's1',
+    revisionOf(fs.statSync(file, { bigint: true })),
+    new AbortController().signal,
+  );
+  const detail = normalizeContext(result, savedCodexContextIdentity, 0);
+  assert.equal(detail.status, 'available');
+  assert.equal(detail.used, 182_948);
+  assert.equal(detail.capacity, 475_000);
+  assert.equal(
+    detail.categories.reduce((sum, row) => sum + row.tokens, 0),
+    detail.used,
+  );
+  assert.equal(
+    detail.categories.find((row) => row.name === 'Tool results')?.tokens,
+    estimateCodexContext(codexContextRecords('s1', true), 's1')!.categories.find((row) => row.name === 'Tool results')
+      ?.tokens,
+  );
+  const compressed = file + '.zst';
+  if (rolloutCompression.zstdCompressSync) {
+    fs.writeFileSync(compressed, rolloutCompression.zstdCompressSync(fs.readFileSync(file)));
+    assert.deepEqual(
+      await readCodexContext(
+        compressed,
+        's1',
+        revisionOf(compressedSources.rolloutStat(compressed, { bigint: true })),
+        new AbortController().signal,
+      ),
+      result,
+    );
+  }
+  fs.appendFileSync(
+    file,
+    JSON.stringify({
+      type: 'response_item',
+      payload: { type: 'function_call', call_id: 'pending', name: 'read', arguments: '{}' },
+    }) + '\n',
+  );
+  const pending = normalizeContext(
+    await readCodexContext(file, 's1', revisionOf(fs.statSync(file, { bigint: true })), new AbortController().signal),
+    savedCodexContextIdentity,
+    0,
+  );
+  assert.equal(pending.status, 'unavailable');
+  assert.equal(pending.reason, 'pending-tools');
+  assert.equal(pending.used, null);
+  if (rolloutCompression.zstdCompressSync) {
+    fs.writeFileSync(compressed, rolloutCompression.zstdCompressSync(fs.readFileSync(file)));
+    assert.deepEqual(
+      normalizeContext(
+        await readCodexContext(
+          compressed,
+          's1',
+          revisionOf(compressedSources.rolloutStat(compressed, { bigint: true })),
+          new AbortController().signal,
+        ),
+        savedCodexContextIdentity,
+        0,
+      ),
+      pending,
+    );
+  }
+});
+
+test('Codex context leaves large ordinary tool output unattributed after a genuine measurement', async () => {
+  const records = codexContextRecords();
+  const expected = estimateCodexContext(records, 's1')!;
+  records.find((row) => row.payload.type === 'function_call_output')!.payload.output = 'x'.repeat(900 * 1024);
+  const file = writeRollout(records);
+  const result = await readCodexContext(
+    file,
+    's1',
+    revisionOf(fs.statSync(file, { bigint: true })),
+    new AbortController().signal,
+  );
+  const detail = normalizeContext(result, savedCodexContextIdentity, 0);
+  assert.equal(detail.status, 'available');
+  assert.deepEqual(result, expected);
+  assert.equal(
+    detail.categories.some((row) => row.name === 'Tool results'),
+    false,
+  );
+});
+
+test('Codex context independently bounds records and all physical reads including opening and newline overlap', async () => {
+  const records = codexContextRecords();
+  const file = writeRollout(records);
+  const revision = revisionOf(fs.statSync(file, { bigint: true }));
+  const largest = Math.max(...records.map((row) => Buffer.byteLength(JSON.stringify(row))));
+  const openingBytes = 256;
+  const scanBytes = openingBytes + 1 + revision.size;
+  const mutableFs = createRequire(__filename)('node:fs') as typeof fs;
+  const original = mutableFs.readSync;
+  let readBytes = 0;
+  const interception = vi.spyOn(mutableFs, 'readSync').mockImplementation((...args: any[]) => {
+    const count = (original as any)(...args);
+    readBytes += count;
+    return count;
+  });
+  syncBuiltinESMExports();
+  try {
+    for (const budget of [scanBytes, scanBytes - 1]) {
+      readBytes = 0;
+      const result = await readCodexContext(file, 's1', revision, new AbortController().signal, {
+        openingBytes,
+        recordBytes: largest,
+        scanBytes: budget,
+        chunkBytes: 4096,
+      });
+      assert.equal(result?.kind ?? null, budget === scanBytes ? 'codex-retained-context' : null);
+      assert.equal(readBytes, budget);
+    }
+    for (const chunkBytes of [4096, 16 * 1024]) {
+      readBytes = 0;
+      assert.equal(
+        await readCodexContext(file, 's1', revision, new AbortController().signal, {
+          openingBytes,
+          recordBytes: largest - 1,
+          scanBytes,
+          chunkBytes,
+        }),
+        null,
+      );
+      assert.ok(readBytes <= scanBytes);
+    }
+    for (const options of [{ openingBytes: 1 }, { openingBytes, scanBytes: openingBytes }]) {
+      readBytes = 0;
+      assert.equal(await readCodexContext(file, 's1', revision, new AbortController().signal, options), null);
+      assert.ok(readBytes <= (options.scanBytes ?? 16 * 1024 * 1024));
+    }
+  } finally {
+    interception.mockRestore();
+    syncBuiltinESMExports();
+  }
+});
+
+test('Codex context refuses invalid or enlarged test budgets before backward reads', async () => {
+  const file = writeRollout(codexContextRecords());
+  const revision = revisionOf(fs.statSync(file, { bigint: true }));
+  for (const [key, maximum] of [
+    ['openingBytes', 512 * 1024],
+    ['recordBytes', 2 * 1024 * 1024],
+    ['scanBytes', 16 * 1024 * 1024],
+    ['chunkBytes', 256 * 1024],
+  ] as const) {
+    for (const value of [0, -1, 1.5, NaN, Infinity, maximum + 1]) {
+      let reads = 0;
+      assert.equal(
+        await readCodexContext(file, 's1', revision, new AbortController().signal, {
+          [key]: value,
+          previousLines: (...args) => {
+            reads++;
+            return readPreviousLines(...args);
+          },
+        }),
+        null,
+      );
+      assert.equal(reads, 0);
+    }
+  }
+});
+
+test('Codex context stops before parsing an aborted batch and refuses revision changes between chunks', async () => {
+  for (const change of ['preparation', 'abort', 'revision'] as const) {
+    const file = writeRollout(codexContextRecords());
+    const timestamp = new Date('2026-01-01T00:00:00Z');
+    fs.utimesSync(file, timestamp, timestamp);
+    const revision = revisionOf(fs.statSync(file, { bigint: true }));
+    const controller = new AbortController();
+    let reads = 0;
+    let parsed = 0;
+    let released = false;
+    const preparation =
+      change === 'preparation'
+        ? vi.spyOn(compressedSources, 'prepareRolloutSource').mockImplementation(async () => {
+            controller.abort();
+            return () => {
+              released = true;
+            };
+          })
+        : undefined;
+    const originalParse = JSON.parse;
+    const parsing = vi.spyOn(JSON, 'parse').mockImplementation((...args: Parameters<typeof JSON.parse>) => {
+      parsed++;
+      return originalParse(...args);
+    });
+    try {
+      const result = await readCodexContext(file, 's1', revision, controller.signal, {
+        openingBytes: 256,
+        recordBytes: 16 * 1024,
+        scanBytes: 32 * 1024,
+        chunkBytes: 4096,
+        previousLines: (...args) => {
+          const batch = readPreviousLines(...args);
+          if (++reads === 1) {
+            if (change === 'abort') controller.abort();
+            else fs.utimesSync(file, timestamp, new Date('2026-01-01T00:00:01Z'));
+          }
+          return batch;
+        },
+      });
+      assert.equal(result, null);
+      assert.equal(reads, change === 'preparation' ? 0 : change === 'abort' ? 1 : 2);
+      if (change === 'preparation') {
+        assert.equal(parsed, 0);
+        assert.equal(released, true);
+      }
+      if (change === 'abort') assert.equal(parsed, 1);
+    } finally {
+      parsing.mockRestore();
+      preparation?.mockRestore();
+    }
   }
 });
 

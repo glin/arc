@@ -48,6 +48,10 @@ Codex Context estimates retained plaintext at four UTF-8 bytes per token. Ordina
 
 [`inspectCodexContext`](../extension/src/codexcontext.ts) owns category admission and measurement freshness. Repeated usage notifications cannot measure later input. Aggregate Context and Compact remain available when categories are unavailable. Codex supplies no compaction reserve. Saved inspection starts no agent and uses bounded worker reads.
 
+Saved Codex inspection reads at most 512 KiB for the opening and admits complete backward records up to 2 MiB. The 16 MiB scan budget charges the opening, final-newline byte, and every backward read, including overlap. Reads use chunks up to 256 KiB and yield between chunks. Oversized records, discarded fragments, incomplete required histories, or changed revisions leave categories unavailable.
+
+Cancellation stops between reads and before record parsing. A synchronous parse cannot yield or honor cancellation until it returns.
+
 ### Subagent text in context
 
 Count returned text only when a later request reads it. A result after a turn's last request enters the next turn. Claude counts foreground results, qualifying background completion notices, and delivered hand-back records. Count the pointer and delivered report, excluding `toolUseResult.handbackReport`. Attachments use rendered text. Completion notices include their missing reminder frame and require a known `Agent` or `Task` launch. Codex counts completed notifications and final answers addressed to the parent, excluding `wait_agent` output. A later file read is an ordinary tool result.
