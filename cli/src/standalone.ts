@@ -1550,12 +1550,16 @@ function logCapture(receipts: DispatchReceipts, id: string, bounds: ReadBounds) 
     sources.reduce((total, source) => total + capture.cursor(source.name).offset, capture.delivered());
   const sourceAllowance = (bytes: number) => sources.map(() => bytes);
   const flush = (bytes: number, allowance?: number[]) => {
-    for (const [index, source] of sources.entries()) {
+    const pending = capture.pendingSource();
+    const ordered = [...sources.entries()];
+    if (pending) ordered.sort((a, b) => Number(b[1].name === pending.name) - Number(a[1].name === pending.name));
+    for (const [index, source] of ordered) {
       if (!fs.existsSync(source.file)) continue;
       try {
         source.cursor = capture.cursor(source.name);
         const remaining = allowance ? allowance[index] : bytes;
-        for (const chunk of logChunks(source.file, bounds.readBytes, source.cursor, Math.min(bytes, remaining))) {
+        const end = pending?.name === source.name ? pending.offset - source.cursor.offset : bytes;
+        for (const chunk of logChunks(source.file, bounds.readBytes, source.cursor, Math.min(bytes, remaining, end))) {
           if (allowance) allowance[index] -= chunk.length;
           capture.write(chunk, source.name, source.cursor);
         }

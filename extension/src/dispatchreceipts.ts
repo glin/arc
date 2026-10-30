@@ -30,7 +30,10 @@ interface CaptureState {
   bytes: number;
   sources: Partial<Record<CaptureSource, CaptureCursor>>;
 }
-type SourceCaptureState = CaptureState & { sourceFiles: true };
+type SourceCaptureState = CaptureState & {
+  sourceFiles: true;
+  pending?: CaptureCursor & { name: 'stdout.log' | 'stderr.log' };
+};
 export type DispatchOutcome = 'running' | 'succeeded' | 'failed' | 'interrupted' | 'needs-input' | 'unknown';
 export interface DispatchLaunch {
   launchId: string;
@@ -835,7 +838,13 @@ export class DispatchReceipts {
         throw new Error('The saved log position is unavailable.');
       safePath(marker);
       if (!equalIdentity(state.raw, identity(marker))) throw new Error('The captured worker output was replaced.');
-      for (const [name, cursor] of Object.entries(state.sources)) {
+      const sources = Object.entries(state.sources);
+      if (state.pending) {
+        if (state.pending.offset <= (state.sources[state.pending.name]?.offset ?? 0))
+          throw new Error('The saved log position is unavailable.');
+        sources.push([state.pending.name, state.pending]);
+      }
+      for (const [name, cursor] of sources) {
         if (name !== 'stdout.log' && name !== 'stderr.log') throw new Error('The log source is invalid.');
         const file = this.artifact(id, name);
         safePath(file);
@@ -851,42 +860,6 @@ export class DispatchReceipts {
       }
       return state;
     };
-    if (!fs.existsSync(checkpoint))
-      this.lock(
-        id,
-        () => {
-          if (fs.existsSync(checkpoint)) return;
-          try {
-            const existing = fs.existsSync(marker);
-            if (existing) safePath(marker);
-            else exclusive(marker, '');
-            const state: SourceCaptureState = {
-              sourceFiles: true,
-              raw: identity(marker),
-              alias: null,
-              aliasBytes: 0,
-              bytes: 0,
-              sources: {},
-            };
-            if (!existing) {
-              if (fs.existsSync(alias)) safePath(alias);
-              const temporary = path.join(path.dirname(alias), `.arc-log-${randomUUID()}`);
-              fs.writeFileSync(temporary, '', { flag: 'wx', mode: 0o600 });
-              try {
-                fs.renameSync(temporary, alias);
-              } catch (error) {
-                fs.unlinkSync(temporary);
-                throw error;
-              }
-              state.alias = identity(alias);
-            }
-            writeFileAtomically(checkpoint, JSON.stringify(state), this.replace, 0o600, false);
-          } catch (cause) {
-            throw new Error('The requested log is unavailable. Private output remains available.', { cause });
-          }
-        },
-        'capture-write',
-      );
     load();
     const openAlias = (state: SourceCaptureState) => {
       if (!state.alias) return null;
@@ -917,6 +890,7 @@ export class DispatchReceipts {
     };
     return {
       delivered: () => load().aliasBytes ?? 0,
+      pendingSource: () => load().pending,
       cursor: (name: CaptureSource): CaptureCursor => ({ ...(load().sources[name] ?? { offset: 0, identity: '' }) }),
       write: (bytes: Buffer, name?: CaptureSource, cursor?: CaptureCursor) =>
         this.lock(
@@ -944,6 +918,14 @@ export class DispatchReceipts {
               return;
             }
             bytes = bytes.subarray(Math.max(0, (committed?.offset ?? 0) - start));
+            if (state.pending) {
+              if (state.pending.name !== name || cursor.offset > state.pending.offset)
+                throw Object.assign(new Error('The requested log is temporarily unavailable.'), { code: 'EPERM' });
+            } else {
+              // Save the slice's position before alias publication can fail.
+              state.pending = { name, ...cursor };
+              writeFileAtomically(checkpoint, JSON.stringify(state), this.replace, 0o600, false);
+            }
             let fd: number | null = null;
             try {
               fd = openAlias(state);
@@ -958,7 +940,7 @@ export class DispatchReceipts {
                 state.aliasBytes = state.bytes + written;
               } else state.alias = null;
             } catch (cause) {
-              // Uncommitted slices remain in the provider files for the next bounded attempt.
+              // The saved pending slice keeps its position ahead of later channel output.
               throw Object.assign(new Error('The requested log is temporarily unavailable.', { cause }), {
                 code: 'EPERM',
               });
@@ -967,6 +949,7 @@ export class DispatchReceipts {
             }
             state.bytes += bytes.length;
             state.sources[name] = { ...cursor };
+            if (cursor.offset === state.pending.offset) delete state.pending;
             writeFileAtomically(checkpoint, JSON.stringify(state), this.replace, 0o600, false);
           },
           'capture-write',
@@ -1020,14 +1003,11 @@ export class DispatchReceipts {
       throw new Error('The log folder was replaced.');
     const rawFile = this.artifact(id, 'worker.log');
     const checkpoint = this.file(id, 'capture.json');
-    const saved = fs.existsSync(checkpoint) ? JSON.parse(readChanging(checkpoint)) : null;
-    if (saved?.sourceFiles || (sourceFiles && !options.background && !saved && !fs.existsSync(rawFile)))
-      return this.captureSourceFiles(id, aliasByteBudget, options);
-    let state: CaptureState = fs.existsSync(checkpoint)
+    let state: CaptureState & { sourceFiles?: true } = fs.existsSync(checkpoint)
       ? JSON.parse(readChanging(checkpoint))
       : this.lock(
           id,
-          (): CaptureState => {
+          (): CaptureState & { sourceFiles?: true } => {
             if (fs.existsSync(checkpoint)) return JSON.parse(readChanging(checkpoint));
             try {
               // A capture without an alias witness cannot claim its current pathname.
@@ -1047,7 +1027,13 @@ export class DispatchReceipts {
                 }
                 aliasIdentity = identity(alias);
               }
-              const initial: CaptureState = { raw: identity(rawFile), alias: aliasIdentity, bytes: 0, sources: {} };
+              const initial = {
+                ...(sourceFiles && !options.background && !existing ? { sourceFiles: true as const } : {}),
+                raw: identity(rawFile),
+                alias: aliasIdentity,
+                bytes: 0,
+                sources: {},
+              };
               writeFileAtomically(checkpoint, JSON.stringify(initial), this.replace, 0o600, false);
               return initial;
             } catch (error) {
@@ -1059,6 +1045,7 @@ export class DispatchReceipts {
           },
           'capture-write',
         );
+    if (state.sourceFiles) return this.captureSourceFiles(id, aliasByteBudget, options);
     safePath(rawFile);
     if (!Number.isSafeInteger(state.bytes) || state.bytes < 0 || !equalIdentity(state.raw, identity(rawFile)))
       throw new Error('The captured worker output was replaced.');
@@ -1211,6 +1198,7 @@ export class DispatchReceipts {
     }
     return {
       flushAlias,
+      pendingSource: () => undefined,
       delivered: () => {
         reload();
         return state.aliasBytes ?? 0;

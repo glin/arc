@@ -1588,6 +1588,41 @@ test('source file capture keeps stdout and stderr without a duplicate worker log
   }
 });
 
+test('source file capture selects the checkpoint accepted after concurrent initialization', () => {
+  const { receipts, standalone, home } = standaloneFixture();
+  const id = standalone.launchId;
+  const first = receipts.capture(id, 3, true);
+  const checkpoint = receipts.artifact(id, 'capture.json');
+  const exists = fs.existsSync;
+  let staleSnapshot = true;
+  const checking = vi.spyOn(fs, 'existsSync').mockImplementation((file) => {
+    // The first reader sees the marker before the initializing writer publishes its checkpoint.
+    if (String(file) === checkpoint && staleSnapshot) {
+      staleSnapshot = false;
+      return false;
+    }
+    return exists(file);
+  });
+  syncBuiltinESMExports();
+  let second: ReturnType<DispatchReceipts['capture']> | undefined;
+  try {
+    second = new DispatchReceipts(home).capture(id, 3, true);
+    assert.equal(staleSnapshot, false);
+    const opening = sourceSlice(receipts, id, 'stdout.log', 'abc');
+    second.write(opening.bytes, 'stdout.log', opening.cursor);
+    assert.equal(fs.statSync(receipts.artifact(id, 'worker.log')).size, 0);
+    const tail = sourceSlice(receipts, id, 'stderr.log', 'ERR');
+    first.write(tail.bytes, 'stderr.log', tail.cursor);
+    assert.equal(second.cursor('stderr.log').offset, 3);
+    assert.equal(fs.readFileSync(standalone.standalone!.logAlias!, 'utf8'), 'abcERR');
+  } finally {
+    checking.mockRestore();
+    syncBuiltinESMExports();
+    first.close();
+    second?.close();
+  }
+});
+
 test.each(['alias open', 'checkpoint', 'short write'] as const)(
   'source file capture retries a failed %s within its alias byte allowance',
   (failure) => {
