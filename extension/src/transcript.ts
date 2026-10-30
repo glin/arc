@@ -4216,6 +4216,7 @@ export class RelationshipReader {
   private readonly buffer = Buffer.allocUnsafe(RELATIONSHIP_READ_BYTES);
   readBytes = 0;
   stable = true;
+  private grew = false;
   private advanced = false;
   constructor(
     readonly fd: RolloutSource,
@@ -4229,13 +4230,18 @@ export class RelationshipReader {
     this.deadline = Number.isFinite(budget) ? performance.now() + RELATIONSHIP_SLICE_MS : Infinity;
     this.check();
   }
-  // Every read stops at the opening size, so an append to the same file leaves the bytes this reader returns unchanged. The
-  // next scan checks the grown file against its final blocks, as it does for growth between scans.
+  // Every read stops at the opening size. A same-identity file that grew after opening keeps the read stable, so a forward or
+  // anchor read under an active writer still qualifies. The stamp cannot tell an append from a rewrite that also grew the file,
+  // so the next scan checks the grown file against its final blocks only, as it does for growth between scans. A whole-prefix
+  // comparison accepts only a read that saw no growth.
   check(): boolean {
     if (this.capturedSizeOnly) return true;
-    const unchanged = (stamp: RelationshipStamp) =>
-      sameRelationshipStamp(this.stamp, stamp) ||
-      (stamp.dev === this.stamp.dev && stamp.ino === this.stamp.ino && stamp.size > this.stamp.size);
+    const unchanged = (stamp: RelationshipStamp) => {
+      if (sameRelationshipStamp(this.stamp, stamp)) return true;
+      if (stamp.dev !== this.stamp.dev || stamp.ino !== this.stamp.ino || stamp.size <= this.stamp.size) return false;
+      this.grew = true;
+      return true;
+    };
     try {
       this.stable &&=
         unchanged(relationshipStamp(this.fd.stat({ bigint: true }))) &&
@@ -4280,7 +4286,8 @@ export class RelationshipReader {
       return 'reset';
     if (!evidence.validation || !sameRelationshipStamp(evidence.validation.stamp, this.stamp)) {
       // Only growth with no comparison in progress checks the anchor. A same-size change compares the whole prefix.
-      // Growth during that comparison restarts it over the whole prefix, so a same-size interior rewrite still resets.
+      // Growth during that comparison, within a quantum or between quanta, leaves the comparison pending and the next quantum
+      // restarts it over the whole prefix, so a same-size interior rewrite still resets even when an append follows it.
       // A grown file rewritten before its final block keeps its accepted facts until a same-size change, a shrink, or a replacement.
       if (!evidence.validation && this.stamp.size > prior.size) {
         const anchored = this.anchored(evidence);
@@ -4290,7 +4297,7 @@ export class RelationshipReader {
       evidence.validation = { stamp: this.stamp, required: evidence.offset, digest: emptyRelationshipDigest() };
     }
     const comparison = evidence.validation;
-    while (comparison.digest.offset < comparison.required && this.available() > 0) {
+    while (comparison.digest.offset < comparison.required && !this.grew && this.available() > 0) {
       const remaining = comparison.required - comparison.digest.offset;
       const available = this.available();
       const allowance =
@@ -4306,7 +4313,8 @@ export class RelationshipReader {
       }
       yield;
     }
-    if (comparison.digest.offset !== comparison.required || !this.check() || this.cancelled()) return 'pending';
+    if (comparison.digest.offset !== comparison.required || !this.check() || this.grew || this.cancelled())
+      return 'pending';
     if (comparison.digest.chain !== evidence.chain || comparison.digest.tail !== evidence.tail) return 'reset';
     evidence.anchor = comparison.digest.anchor;
     return this.accept(evidence);

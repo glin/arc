@@ -1364,6 +1364,41 @@ test('dispatch evidence loss remains partial after a newline, resumption, and EO
   assert.equal(scanCodexDispatchReferences(file, 'parent', scan.cursor).complete, false);
 });
 
+test('a Codex rollout that grows during its read completes at its opening size and reads the growth next', async () => {
+  const file = writeRollout([
+    meta(),
+    event('task_started', 1, { turn_id: TURN }),
+    turnContext(2, TURN, 'gpt-6-astra', 'high'),
+    commandCompleted(3, DISPATCH_COMMAND, 0, 'completed', 'before-growth', { stdout: DISPATCH_RECEIPT }),
+    event('task_complete', 4, { turn_id: TURN }),
+  ]);
+  fs.appendFileSync(file, JSON.stringify({ type: 'ignored', payload: 'x'.repeat(16 * 1024) }) + '\n');
+  const opening = fs.statSync(file).size;
+  // The rollout's writer appends a record after every read, as a running Codex session would.
+  let appends = 0;
+  const meter = {
+    readBytes: 0,
+    onRead: () => {
+      appends++;
+      fs.appendFileSync(file, '{"type":"ignored"}\n');
+    },
+  };
+  const scan = await scanCodexDispatchReferencesAsync(file, 'parent', null, 1024 * 1024, () => false, meter);
+  assert.ok(appends > 0);
+  assert.equal(scan.qualified, true);
+  assert.equal(scan.complete, true);
+  assert.equal(scan.cursor.offset, opening);
+  assert.deepEqual(
+    scan.references.map((reference) => reference.toolUseIds),
+    [['before-growth']],
+  );
+  const next = await scanCodexDispatchReferencesAsync(file, 'parent', scan.cursor, 1024 * 1024);
+  assert.equal(next.reset, false);
+  assert.equal(next.complete, true);
+  assert.equal(next.cursor.offset, fs.statSync(file).size);
+  assert.deepEqual(next.references, scan.references);
+});
+
 test('exact export dispatch identities retain a native child receipt that Bloom membership rejects', () => {
   const ids = Array.from({ length: 19999 }, (_item, index) => `prior-${index}`);
   const bloom = Buffer.alloc(64 * 1024);

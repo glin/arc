@@ -120,6 +120,58 @@ test.each([65536, 1024 * 1024])(
   },
 );
 
+test('Claude same-size comparison finds an interior rewrite that lands with an append during its read', async () => {
+  vi.spyOn(performance, 'now').mockReturnValue(0);
+  const file = writeTranscript([
+    { type: 'ignored', payload: 'x'.repeat(1024) },
+    assistantTool('Agent', 1, 'interior-launch', {}),
+    {
+      type: 'user',
+      message: { content: [{ type: 'tool_result', tool_use_id: 'interior-launch' }] },
+      toolUseResult: { agentId: 'child-a' },
+    },
+    ...Array.from({ length: 100 }, () => ({ type: 'ignored', payload: 'y'.repeat(1024) })),
+  ]);
+  const parent = { file, sessionId: 'parent' };
+  const first = await scanClaudeRelationshipQuantum(parent, undefined);
+  assert.deepEqual(
+    first.references.map((reference) => reference.sessionId),
+    ['child-a'],
+  );
+  const at = fs.readFileSync(file, 'utf8').indexOf('child-a');
+  assert.ok(at < first.cursor.offset - 8192, 'the child lies before the final two blocks');
+  // A same-size change makes the next scan compare the whole prefix.
+  fs.utimesSync(file, new Date(0), new Date(first.cursor.revision.mtimeMs + 2000));
+  // After the comparison reads the old bytes, a writer rewrites the child in place and appends a record.
+  let rewritten = false;
+  const meter = {
+    readBytes: 0,
+    onRead: () => {
+      if (rewritten) return;
+      rewritten = true;
+      const fd = fs.openSync(file, 'r+');
+      try {
+        fs.writeSync(fd, 'child-b', at);
+      } finally {
+        fs.closeSync(fd);
+      }
+      fs.appendFileSync(file, '{"type":"ignored"}\n');
+    },
+  };
+  let scan = await scanClaudeRelationshipQuantum(parent, first.cursor, undefined, undefined, meter);
+  assert.ok(rewritten);
+  for (let pass = 0; !scan.complete && pass < 20; pass++)
+    scan = await scanClaudeRelationshipQuantum(parent, JSON.parse(JSON.stringify(scan.cursor)));
+  assert.ok(scan.complete);
+  assert.deepEqual(
+    scan.references.map((reference) => reference.sessionId),
+    ['child-b'],
+  );
+  // An unchanged file then keeps the fresh answer.
+  const again = await scanClaudeRelationshipQuantum(parent, scan.cursor);
+  assert.deepEqual(again.references, scanClaudeChildSessionReferences(parent).references);
+});
+
 test('Claude scans, rewrite comparisons and terminal continuations read forward when every slice starts past its deadline', async () => {
   // Each reading of the clock lands a full slice after the previous one, so every deadline has passed.
   let clock = 0;
