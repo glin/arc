@@ -8,6 +8,8 @@ Arc-owned children receive their immutable private CLI launcher directory before
 
 Arc checks Claude's session skill and snapshot hooks separately. Each accepted plugin adds one `--plugin-dir` argument to the Claude command. Arc still launches the provider directly. [Session tools](native-skills.md#checks-before-startup-and-input) describes the checks before startup and input.
 
+Preparing Claude's session components preserves an unset or empty `CLAUDE_CONFIG_DIR`. Launch values override inherited editor values, including an empty value. Arc resolves a nonempty selected value against the launch directory and freezes it for the child. Without a nonempty value, component discovery uses `~/.claude` without adding the variable. On macOS, explicitly setting even that default selects a separate Keychain login, which requires its own valid sign-in. [Claude authentication](https://code.claude.com/docs/en/authentication#log-in-with-multiple-accounts) describes separate configuration directories and logins.
+
 Both private launchers set `ELECTRON_RUN_AS_NODE=1` and run their release's `cli/arc.cjs` with that binary. Extensionless `arc` serves POSIX shells and Git Bash. `arc.cmd` serves Windows command shells. Every Arc-owned child uses this environment through `childEnv` in [`agenthost.ts`](../extension/src/agenthost.ts).
 
 Unavailable private tools refuse launch. Trusted remote children use commands on their execution host. Untrusted windows refuse launch. Watch builds supply development launchers without immutable package identity. [Bundled tools](installation.md#bundled-tools) defines complete development builds.

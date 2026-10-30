@@ -2,7 +2,10 @@ import { afterEach, onTestFinished, test, vi } from 'vitest';
 import assert from 'node:assert';
 import { CONTEXT_FRAME_BYTES, contextFrameId } from './contextframe';
 import * as fs from 'node:fs';
+import fsBuiltin from 'node:fs';
+import osBuiltin from 'node:os';
 import * as path from 'node:path';
+import { homedir } from 'node:os';
 import childProcessBuiltin from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
 import { runInNewContext } from 'node:vm';
@@ -73,6 +76,7 @@ import { ClaudeWire, CONTROL_DEADLINE_MS, spawnArgs, type PermissionMode } from 
 import {
   admitClaudeSessionComponents,
   admitClaudeSessionSkill,
+  claudeSkillHome,
   errorText,
   reportWithheld,
   sessionComponentsDiagnostics,
@@ -12305,6 +12309,154 @@ test('Claude plans set a requested cache lifetime over launch values and keep th
   assert.equal(planned({ agentRun: true }, { CLAUDE_CODE_PROMPT_CACHE_TTL: '1h' }).CLAUDE_CODE_PROMPT_CACHE_TTL, '1h');
 });
 
+function compiledClaudePlan(): string {
+  const source = fs.readFileSync(path.join(__dirname, 'agenthost.ts'), 'utf8');
+  const start = source.indexOf('export function claudePlan(');
+  const end = source.indexOf('// A child started only to rename', start);
+  return esbuild.transformSync(
+    source.slice(start, end).replace('export function', 'function') + '\nreturn claudePlan;',
+    { loader: 'ts' },
+  ).code;
+}
+
+test('Claude preparation preserves configured homes without inventing a default', () => {
+  const previous = Object.entries(process.env).filter(([key]) => key.toUpperCase() === 'CLAUDE_CONFIG_DIR');
+  const clear = () => {
+    for (const key of Object.keys(process.env)) if (key.toUpperCase() === 'CLAUDE_CONFIG_DIR') delete process.env[key];
+  };
+  clear();
+  onTestFinished(() => {
+    clear();
+    for (const [key, value] of previous) process.env[key] = value;
+  });
+  const root = tempDir('claude-config-environment-');
+  const release = {
+    contentId: 'a'.repeat(64),
+    directory: root,
+    claudePlugin: path.join(root, 'session-plugin'),
+    claudeDefinition: path.join(root, 'session-plugin/skills/arc-sessions/SKILL.md'),
+    codexRoot: path.join(root, 'skills'),
+    codexDefinition: path.join(root, 'skills/arc-sessions/SKILL.md'),
+  };
+  const build = runInNewContext(`(() => { ${compiledClaudePlan()} })()`, {
+    process,
+    childEnv,
+    claudePlanEnv: (env: Record<string, string>) => ({ ...env }),
+    claudeSkillHome,
+    retainedSessionSkill: () => true,
+    reportWithheld,
+    errorText,
+    sessionHookRuntime: () => () => {},
+    spawnArgs,
+    admitClaudeSessionComponents: () => ({ skill: true, hooks: false, reasons: { hooks: 'unavailable-hook-plugin' } }),
+  }) as typeof claudePlan;
+  const home = path.join(homedir(), '.claude');
+  for (const available of [true, false])
+    for (const [inherited, wanted, expected] of [
+      [undefined, undefined, undefined],
+      ['config', undefined, path.resolve(WS, 'config')],
+      ['inherited', 'config', path.resolve(WS, 'config')],
+      [undefined, home, home],
+      [home, undefined, home],
+      [undefined, '', ''],
+      ['', undefined, ''],
+      ['inherited', '', ''],
+      [undefined, ' ', path.resolve(WS, ' ')],
+    ]) {
+      clear();
+      if (inherited !== undefined) process.env.CLAUDE_CONFIG_DIR = inherited;
+      const env: Record<string, string> = wanted === undefined ? {} : { CLAUDE_CONFIG_DIR: wanted };
+      const prepared = build(
+        { ...CLAUDE, env, sessionSkills: { current: () => (available ? release : undefined) } },
+        { cwd: WS },
+      ).prepare!();
+      assert.equal(prepared.args.includes('--plugin-dir'), available);
+      process.env.CLAUDE_CONFIG_DIR = 'changed-after-preparation';
+      const child = childEnv(prepared.inheritedEnvironment!, prepared.env, 'claude', WS);
+      assert.equal(child.CLAUDE_CONFIG_DIR, expected);
+      if (expected === undefined) {
+        assert.deepEqual(
+          Object.keys(prepared.env).filter((key) => key.toUpperCase() === 'CLAUDE_CONFIG_DIR'),
+          [],
+        );
+        assert.deepEqual(
+          Object.keys(child).filter((key) => key.toUpperCase() === 'CLAUDE_CONFIG_DIR'),
+          [],
+        );
+      }
+    }
+
+  const nativeHome = path.join(root, 'native-home');
+  const workspace = path.join(root, 'workspace');
+  const explicitHome = path.join(nativeHome, '.claude');
+  fs.mkdirSync(explicitHome, { recursive: true });
+  fs.mkdirSync(workspace);
+  fs.mkdirSync(path.join(workspace, '.git'));
+  fs.writeFileSync(
+    path.join(nativeHome, '.claude.json'),
+    JSON.stringify({ mcpServers: { catalog: { command: 'native' } } }),
+  );
+  fs.writeFileSync(
+    path.join(explicitHome, '.claude.json'),
+    JSON.stringify({ mcpServers: { catalog: { command: 'explicit' } } }),
+  );
+  const allowed = new Set(
+    [
+      path.join(workspace, '.env'),
+      path.join(workspace, '.git'),
+      path.join(workspace, '.mcp.json'),
+      path.join(nativeHome, '.claude.json'),
+      path.join(explicitHome, '.claude.json'),
+    ].map((file) => (process.platform === 'win32' ? file.toLowerCase() : file)),
+  );
+  const unmapped: string[] = [];
+  const check = (file: fs.PathLike) => {
+    const resolved = path.resolve(String(file));
+    const key = process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+    if (!allowed.has(key)) {
+      unmapped.push(resolved);
+      throw new Error(`Unmapped filesystem read: ${resolved}`);
+    }
+  };
+  const originalExists = fsBuiltin.existsSync;
+  const originalStat = fsBuiltin.statSync;
+  const originalRead = fsBuiltin.readFileSync;
+  const homeSpy = vi.spyOn(osBuiltin, 'homedir').mockReturnValue(nativeHome);
+  const existsSpy = vi.spyOn(fsBuiltin, 'existsSync').mockImplementation((file) => {
+    check(file);
+    return originalExists(file);
+  });
+  const statSpy = vi.spyOn(fsBuiltin, 'statSync').mockImplementation(((file: fs.PathLike, options?: never) => {
+    check(file);
+    return originalStat(file, options);
+  }) as typeof fsBuiltin.statSync);
+  const readSpy = vi.spyOn(fsBuiltin, 'readFileSync').mockImplementation(((
+    file: fs.PathOrFileDescriptor,
+    options?: never,
+  ) => {
+    check(file as fs.PathLike);
+    return originalRead(file, options);
+  }) as typeof fsBuiltin.readFileSync);
+  syncBuiltinESMExports();
+  try {
+    clear();
+    const prepared = build(
+      { ...CLAUDE, sessionSkills: { current: () => release } },
+      { cwd: workspace, policy: { readOnly: true, readTools: ['mcp__catalog__read'] } },
+    ).prepare!();
+    const mcpIndex = prepared.args.indexOf('--mcp-config');
+    assert.notEqual(mcpIndex, -1);
+    assert.deepEqual(JSON.parse(prepared.args[mcpIndex + 1]), { mcpServers: { catalog: { command: 'native' } } });
+  } finally {
+    homeSpy.mockRestore();
+    existsSpy.mockRestore();
+    statSpy.mockRestore();
+    readSpy.mockRestore();
+    syncBuiltinESMExports();
+    assert.deepEqual(unmapped, []);
+  }
+});
+
 test.each([
   'ordinary',
   'restricted',
@@ -12316,13 +12468,7 @@ test.each([
   'runtime-change',
   'running-refusal',
 ] as const)('Claude plan preparation admits the complete frozen %s arguments', async (kind) => {
-  const source = fs.readFileSync(path.join(__dirname, 'agenthost.ts'), 'utf8');
-  const start = source.indexOf('export function claudePlan(');
-  const end = source.indexOf('// A child started only to rename', start);
-  const compiled = esbuild.transformSync(
-    source.slice(start, end).replace('export function', 'function') + '\nreturn claudePlan;',
-    { loader: 'ts' },
-  ).code;
+  const compiled = compiledClaudePlan();
   const root = tempDir('claude-plan-admission-');
   const home = path.join(root, 'home');
   const workspace = path.join(root, 'workspace');
@@ -12357,6 +12503,7 @@ test.each([
       env: {
         PATH: bin,
         CUSTOM: 'frozen',
+        CLAUDE_CONFIG_DIR: home,
         ...(kind === 'node-redirection' ? { NODE_OPTIONS: '--require /custom.cjs' } : {}),
       },
       platform: process.platform,

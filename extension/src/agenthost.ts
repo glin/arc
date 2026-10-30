@@ -449,7 +449,8 @@ export function claudePlan(
             const environment = { ...process.env };
             const env = childEnv(environment, claudePlanEnv(launch.env, options), 'claude', options.cwd);
             const home = claudeSkillHome(env, options.cwd);
-            env.CLAUDE_CONFIG_DIR = home;
+            const configHome: Record<string, string> = env.CLAUDE_CONFIG_DIR ? { CLAUDE_CONFIG_DIR: home } : {};
+            Object.assign(env, configHome);
             const args = [...launch.leadingArgs, ...spawnArgs(options, env)];
             const selected = launch.sessionSkills!.current();
             const runtime = sessionHookRuntime();
@@ -522,7 +523,7 @@ export function claudePlan(
               return kept;
             };
             const release = components.skill || components.hooks ? selected : undefined;
-            return claudePlan({ ...launch, env: { ...launch.env, CLAUDE_CONFIG_DIR: home } }, options, {
+            return claudePlan({ ...launch, env: { ...launch.env, ...configHome } }, options, {
               release,
               components,
               refresh,
