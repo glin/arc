@@ -932,7 +932,8 @@ export class ProgressiveWorker {
         held.dispose();
         held.resolve(null);
         this.worker?.postMessage({ cancel: id });
-        if (!this.pending.size && !this.discoveryWaiter) {
+        // A cancelled discovery request leaves the worker running, so its discovery state carries into the next request.
+        if (!this.pending.size && !this.discoveryWaiter && request.kind !== 'claude-children') {
           this.stop();
         }
       };

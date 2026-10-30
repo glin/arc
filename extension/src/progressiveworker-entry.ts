@@ -237,6 +237,8 @@ interface ReceiptScan {
   storeRead: boolean;
   competitionRefused: boolean;
   controller: AbortController;
+  // The physical identity of the store directory when the scan opened it.
+  storeIdentity: string;
 }
 let receiptScan: ReceiptScan | null = null;
 function closeReceiptScan(): void {
@@ -244,6 +246,14 @@ function closeReceiptScan(): void {
   receiptScan?.steps.return(undefined);
   receiptScan?.retry?.return(null);
   receiptScan = null;
+}
+function receiptStoreIdentity(store: DispatchReceipts): string {
+  try {
+    const stat = fs.statSync(store.root, { bigint: true });
+    return `${stat.dev}:${stat.ino}`;
+  } catch {
+    return '';
+  }
 }
 const catalogIdentity = (agent: string, sessionId: string) => JSON.stringify([agent, sessionId]);
 // Names the identities whose catalog rows differ between two catalogs, by file and child flag.
@@ -1015,10 +1025,14 @@ async function execute(
         parents.map(({ file, sessionId, agent, childTranscript }) => ({ file, sessionId, agent, childTranscript })),
       );
     continuation ||= parentKeys(epoch.parents) !== parentKeys(request.parents);
+    // A replaced store directory starts the scan again from its first entry. Other store changes keep the scan's position.
+    if (receiptScan && !receiptScan.storeRead && receiptStoreIdentity(receiptScan.store) !== receiptScan.storeIdentity)
+      closeReceiptScan();
     if (!receiptScan) {
       const controller = new AbortController();
       const store = new DispatchReceipts();
       const scan: ReceiptScan = {
+        storeIdentity: receiptStoreIdentity(store),
         epoch: epoch.epoch,
         store,
         controller,
@@ -2072,21 +2086,16 @@ async function handleMessage(message: {
       return;
     }
     if (request.kind === 'claude-children') {
-      let value: ProgressiveValue;
-      try {
-        value = await execute(request, controller.signal, (value) => {
-          noteBackground('discoveryProgress');
-          if (!controller.signal.aborted)
-            parentPort?.postMessage({
-              id: message.id,
-              progress: true,
-              result: { generation: message.generation, revision: null, value, workerMemory: workerMemory() },
-            });
-        });
-      } finally {
-        // A spend-only request holds no receipt scan.
-        if (controller.signal.aborted && !request.spendOnly) closeReceiptScan();
-      }
+      // A cancelled request keeps the receipt scan, so the next request resumes it where this one stopped.
+      const value = await execute(request, controller.signal, (value) => {
+        noteBackground('discoveryProgress');
+        if (!controller.signal.aborted)
+          parentPort?.postMessage({
+            id: message.id,
+            progress: true,
+            result: { generation: message.generation, revision: null, value, workerMemory: workerMemory() },
+          });
+      });
       if (!controller.signal.aborted) {
         parentPort?.postMessage({
           id: message.id,

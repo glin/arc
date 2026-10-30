@@ -328,7 +328,12 @@ test.each(['added', 'removed', 'requester removed', 'added before the launches a
 const liveWriters = (files: readonly string[]) =>
   `const liveFs=require('node:fs'),livePort=require('node:worker_threads').parentPort,liveFiles=new Set(${JSON.stringify(files.map((file) => normalizeFsPath(file)))}),liveFds=new Map(),liveOpen=liveFs.openSync,liveRead=liveFs.readSync,liveClose=liveFs.closeSync;let liveAppends=0;liveFs.openSync=function(p,...a){const fd=liveOpen.call(this,p,...a);const key=String(p).replace(/\\\\/g,'/').toLowerCase();for(const file of liveFiles)if(file.replace(/\\\\/g,'/').toLowerCase()===key)liveFds.set(fd,String(p));return fd;};liveFs.closeSync=function(fd,...a){liveFds.delete(fd);return liveClose.call(this,fd,...a);};liveFs.readSync=function(fd,...a){const count=liveRead.call(this,fd,...a);const file=liveFds.get(fd);if(file){liveFs.appendFileSync(file,JSON.stringify({type:'progress',data:{n:++liveAppends}})+'\\n');if(liveAppends%64===1)livePort.postMessage({repeatedCoverage:'live-append'});}return count;};`;
 
+// The worker reports each opening of the receipt store and each entry the scan reads from it.
+const receiptEntries = (store: string) =>
+  `const entryFs=require('node:fs'),entryPort=require('node:worker_threads').parentPort,entryOpen=entryFs.opendirSync;entryFs.opendirSync=function(p,...a){const dir=entryOpen.call(this,p,...a);if(String(p)!==${JSON.stringify(store)})return dir;entryPort.postMessage({repeatedCoverage:'receipt-store-opened'});const read=dir.readSync.bind(dir);dir.readSync=function(){entryPort.postMessage({repeatedCoverage:'receipt-entry'});return read();};return dir;};`;
+
 // Writers that append during every read leave no quiet read. A pass still completes, so discovery publishes in a few continuations.
+// Catalog refreshes cancel continuations during the receipt scan and change the repository roots, and the scan keeps its place.
 test('receipt discovery publishes while several Claude roots keep appending during each read', async () => {
   const root = tempDir('receipt-worker-live-');
   const fx = receiptDispatchFixture(root, 'claude', 'codex');
@@ -355,13 +360,23 @@ test('receipt discovery publishes while several Claude roots keep appending duri
   });
   const catalog = [...fx.catalog, ...live];
   let appends = 0;
+  let openings = 0;
+  let cancelled = 0;
+  let current = new AbortController();
+  let cancelOnEntry = false;
   const worker = new ProgressiveWorker(
     `process.env.ARC_HOME=${JSON.stringify(fx.home)};performance.now=()=>0;` +
       liveWriters(live.map((row) => row.file)) +
+      receiptEntries(fx.receipts.root) +
       source,
     undefined,
     (file) => {
       if (file === 'live-append') appends++;
+      if (file === 'receipt-store-opened') openings++;
+      if (file === 'receipt-entry' && cancelOnEntry) {
+        cancelOnEntry = false;
+        current.abort();
+      }
     },
   );
   const discovery = await receiptDiscoveryHost(worker, [root], catalog);
@@ -370,8 +385,18 @@ test('receipt discovery publishes while several Claude roots keep appending duri
     let completed: ProgressiveResult | null = null;
     let pass = 0;
     for (; pass < 60 && !completed; pass++) {
+      current = new AbortController();
+      // Once the receipt scan has opened, every other continuation is cancelled during it, and the roots change once.
+      cancelOnEntry = openings > 0 && pass % 2 === 1;
+      if (openings > 0) discovery.host.repositoryScopeRoots = [root, path.join(root, 'worker-a')];
       discovery.host.refreshGeneration = pass + 1;
-      assert.equal(await discovery.host.prepareClaudeChildren(pass + 1, new AbortController().signal), true);
+      const prepared = await discovery.host.prepareClaudeChildren(pass + 1, current.signal);
+      if (current.signal.aborted) {
+        assert.equal(prepared, false);
+        cancelled++;
+        continue;
+      }
+      assert.equal(prepared, true);
       const result = discovery.replies.last;
       assert.ok(result);
       const charges = result.value.kind === 'stale' ? undefined : (result.value as { charges?: any }).charges;
@@ -385,14 +410,59 @@ test('receipt discovery publishes while several Claude roots keep appending duri
       `Discovery never published under live writers after ${pass} continuations: ${JSON.stringify(ends)}, ${appends} append notices`,
     );
     assert.ok(
-      pass <= 12,
-      `Discovery took ${pass} continuations to publish under live writers: ${JSON.stringify(ends)}`,
+      pass <= 16,
+      `Discovery took ${pass} continuations to publish under live writers: ${JSON.stringify(ends)}, ${cancelled} cancelled, ${openings} store openings`,
     );
     assert.ok(appends > 0, 'The live writers never appended');
+    assert.ok(cancelled >= 2, `Only ${cancelled} continuations were cancelled during the receipt scan`);
+    assert.equal(openings, 1, 'A cancelled continuation started the receipt scan again from its first entry');
     assert.deepEqual(
       sessionParentIndex(completed.value.references).get(fx.child.sessionId)?.parent,
       fx.parent.sessionId,
     );
+  } finally {
+    worker.stop();
+  }
+});
+
+// The worker reports a new identity for the receipt store once the replacement marker exists, as a replaced directory would.
+const replacedStore = (store: string, marker: string) =>
+  `const idFs=require('node:fs'),idStat=idFs.statSync;idFs.statSync=function(p,...a){const stat=idStat.call(this,p,...a);if(String(p)===${JSON.stringify(store)}&&idFs.existsSync(${JSON.stringify(marker)}))stat.ino+=typeof stat.ino==='bigint'?1n:1;return stat;};`;
+
+test('a replaced receipt store starts the receipt scan again once, and discovery still publishes', async () => {
+  const root = tempDir('receipt-worker-replaced-');
+  const fx = receiptDispatchFixture(root, 'claude', 'codex');
+  fs.mkdirSync(fx.receipts.root, { recursive: true });
+  for (let index = 0; index < 300; index++)
+    fs.mkdirSync(path.join(fx.receipts.root, `${index.toString(16).padStart(8, '0')}-1111-2222-3333-444444444444`));
+  fx.launch(fx.parent, fx.child);
+  const marker = path.join(root, 'store-replaced');
+  let openings = 0;
+  const worker = new ProgressiveWorker(
+    `process.env.ARC_HOME=${JSON.stringify(fx.home)};performance.now=()=>0;` +
+      receiptEntries(fx.receipts.root) +
+      replacedStore(fx.receipts.root, marker) +
+      source,
+    undefined,
+    (file) => {
+      if (file === 'receipt-store-opened') openings++;
+    },
+  );
+  try {
+    let completed: ProgressiveResult | null = null;
+    for (let pass = 0; pass < 40 && !completed; pass++) {
+      if (openings > 0) fs.writeFileSync(marker, '');
+      const result = await worker.run(
+        { kind: 'claude-children', parents: fx.catalog, catalog: fx.catalog, repositoryRoots: [root] },
+        pass + 1,
+        new AbortController().signal,
+      );
+      assert.ok(result);
+      if (result.value.kind === 'claude-children' && !result.value.continuation) completed = result;
+    }
+    assert.ok(completed?.value.kind === 'claude-children', 'Receipt discovery never completed after the store changed');
+    assert.equal(openings, 2, 'The replaced store did not start the receipt scan again exactly once');
+    assert.equal(sessionParentIndex(completed.value.references).get(fx.child.sessionId)?.parent, fx.parent.sessionId);
   } finally {
     worker.stop();
   }
@@ -607,19 +677,21 @@ test('receipt discovery defers a changing accepted source until a quiet epoch', 
   }
 });
 
-test('cancelled receipt discovery closes its directory before a later generation publishes', async () => {
+test('cancelled receipt discovery keeps its scan for a later generation, which publishes for its own scope', async () => {
   const root = tempDir('receipt-worker-cancel-');
   const fx = receiptDispatchFixture(root, 'claude', 'codex');
   fx.launch();
   const closed = path.join(root, 'closed');
-  const prefix = `const epochFs=require('node:fs'),epochPort=require('node:worker_threads').parentPort,epochOpen=epochFs.opendirSync;let epochSent=false;epochFs.opendirSync=function(p,...a){const dir=epochOpen.call(this,p,...a);if(String(p)===${JSON.stringify(fx.receipts.root)}&&!epochSent){epochSent=true;const close=dir.closeSync;dir.closeSync=function(){const result=close.call(this);epochFs.writeFileSync(${JSON.stringify(closed)},'closed');return result;};epochPort.postMessage({repeatedCoverage:'receipt-open'});epochPort.emit('message',{cancel:1});}return dir;};`;
+  const prefix = `const epochFs=require('node:fs'),epochPort=require('node:worker_threads').parentPort,epochOpen=epochFs.opendirSync;let epochSent=false;epochFs.opendirSync=function(p,...a){const dir=epochOpen.call(this,p,...a);if(String(p)!==${JSON.stringify(fx.receipts.root)})return dir;epochPort.postMessage({repeatedCoverage:'receipt-open'});if(!epochSent){epochSent=true;const close=dir.closeSync;dir.closeSync=function(){const result=close.call(this);epochFs.writeFileSync(${JSON.stringify(closed)},'closed');return result;};epochPort.emit('message',{cancel:1});}return dir;};`;
   const controller = new AbortController();
   let selected: Promise<ProgressiveResult | null> | undefined;
+  let openings = 0;
   const worker = new ProgressiveWorker(
     `process.env.ARC_HOME=${JSON.stringify(fx.home)};` + prefix + source,
     undefined,
     (file) => {
       if (file !== 'receipt-open') return;
+      if (++openings > 1) return;
       selected = worker.run({ kind: 'metadata', session: fx.child }, 2, new AbortController().signal);
       controller.abort();
     },
@@ -633,7 +705,6 @@ test('cancelled receipt discovery closes its directory before a later generation
     assert.equal(await cancelled, null);
     assert.ok(selected);
     assert.ok(await selected);
-    await vi.waitFor(() => assert.ok(fs.existsSync(closed), 'Cancellation retained the receipt directory'));
     const result = await completeDiscovery(
       worker,
       {
@@ -647,6 +718,8 @@ test('cancelled receipt discovery closes its directory before a later generation
     );
     assert.ok(result?.value.kind === 'claude-children');
     assert.deepEqual(result.value.references, []);
+    assert.equal(openings, 1, 'The later generation started the receipt scan again');
+    assert.ok(fs.existsSync(closed), 'The finished receipt scan kept its directory open');
   } finally {
     controller.abort();
     worker.stop();
@@ -3288,9 +3361,10 @@ test.each(['claude', 'codex'] as const)(
       const afterIo = validation as typeof validation & { ioReads: number; ioStats: number };
       const reads = Math.ceil(allowance / (256 * 1024));
       assert.equal(afterIo.ioReads - beforeIo.ioReads, reads, 'validation split a buffer into individual block reads');
+      // The Codex pass also reaches the receipt phase, which reads the identity of the receipt store once.
       assert.equal(
         afterIo.ioStats - beforeIo.ioStats,
-        2 * reads + 4,
+        2 * reads + 4 + (agent === 'codex' ? 1 : 0),
         'validation repeated source stats between hash blocks',
       );
       const cursor =
