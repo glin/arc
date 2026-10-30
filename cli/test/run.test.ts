@@ -623,6 +623,49 @@ test.each(['truncated', 'redirected'] as const)(
   },
 );
 
+test.each(['denied', 'linked', 'hidden folder'] as const)(
+  'source producer retries a %s alias open over an uncommitted tail while the child runs',
+  async (failure) => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'setImmediate'] });
+    vi.spyOn(Date, 'now').mockReturnValue(0);
+    if (process.send) vi.spyOn(process, 'send').mockImplementation(() => true);
+    vi.spyOn(process, 'disconnect').mockImplementation(() => {});
+    const { receipts, launch } = workerFixture('', 100, false, true);
+    const id = launch.launchId;
+    const stdout = receipts.artifact(id, 'stdout.log');
+    fs.writeFileSync(stdout, 'output');
+    fs.writeFileSync(receipts.artifact(id, 'stderr.log'), '');
+    const child = providerChild();
+    vi.mocked(childProcess.spawn).mockReturnValue(child);
+    const running = produceStandaloneOutput(receipts, id);
+    await vi.advanceTimersByTimeAsync(0);
+    child.emit('spawn');
+    const alias = launch.standalone!.logAlias!;
+    assert.equal(fs.readFileSync(alias, 'utf8'), 'output');
+    fs.appendFileSync(alias, ' tail');
+    let blocked = true;
+    if (failure === 'hidden folder') {
+      const real = fs.realpathSync.native;
+      vi.spyOn(fs.realpathSync, 'native').mockImplementation(((file: fs.PathLike, ...rest: never[]) => {
+        if (blocked && String(file) === path.dirname(alias))
+          throw Object.assign(new Error('Folder unavailable'), { code: 'EACCES' });
+        return Reflect.apply(real, fs.realpathSync, [file, ...rest]);
+      }) as typeof real);
+    } else denyOpen(alias, () => blocked, failure === 'denied' ? 'EACCES' : 'ELOOP');
+    await vi.advanceTimersByTimeAsync(200);
+    const owner = artifactJson(receipts, id, 'output-owner.json');
+    assert.equal(owner.state, 'capturing', owner.reason);
+    blocked = false;
+    fs.appendFileSync(stdout, ' final');
+    child.emit('close', 0, null);
+    await vi.runAllTimersAsync();
+    await running;
+    assert.equal(artifactJson(receipts, id, 'output-owner.json').state, 'finished');
+    assert.equal(fs.readFileSync(alias, 'utf8'), 'output final');
+    assert.notEqual(artifactJson(receipts, id, 'capture.json').alias, null);
+  },
+);
+
 test.each(['win32', 'darwin', 'linux'] as const)('native pathname exclusion preserves %s path rules', (platform) => {
   const root = platform === 'win32' ? 'C:/MiXeD/Native' : '/MiXeD/Native';
   const first = `${root}/rollout-AbCd.jsonl`;

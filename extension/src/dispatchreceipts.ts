@@ -968,18 +968,20 @@ export class DispatchReceipts {
           safePath(alias);
           if (equalIdentity(state.alias, identity(alias)) && fs.statSync(alias).size === (state.aliasBytes ?? 0))
             return false;
-        } catch (error) {
-          if (
-            (error as NodeJS.ErrnoException).code !== 'ENOENT' &&
-            String(error) !== 'Error: The dispatch path is redirected.'
-          )
-            throw error;
+        } catch {
+          /* The locked check below decides whether the alias remains available. */
         }
         return this.lock(
           id,
           () => {
             const current = load();
-            const fd = openAlias(current);
+            let fd: number | null;
+            try {
+              fd = openAlias(current);
+            } catch {
+              // An alias that cannot be opened now, such as one denied or swapped for a link, keeps its tail for a retry.
+              return true;
+            }
             if (fd !== null) {
               try {
                 fs.ftruncateSync(fd, current.aliasBytes ?? 0);
