@@ -5,9 +5,9 @@
     "matricesSha256": "5c419463cc072b57e206d07cd8051d33056647f9b2d637fdffd7c0105b53edd2"
   },
   "cli/test/run.test.ts": {
-    "reason": "Standalone workers must retain real output, exit, cancellation, receipt ownership, and recovery across process boundaries. Held readers must preserve one worker and one outcome after recovery. Exhausted replacement retries must retain the worker's terminal observation. Explicit tiers must reach attached and background argv on Windows, macOS, and Linux. A refused tier must reserve no receipt and start no worker. Agent discovery must reject directories and honor platform permissions with minimal PATH and competing commands. The added cases use filesystem fixtures without launching a process. Native source observation must admit a compressed rollout once through its decoded opening. Source capture must retain channel order across alias contention with filesystem fixtures and no new processes.",
-    "cases": 115,
-    "matricesSha256": "7617c6dc0142dfd0a4ad5c693186bce65091ed28bf2d5ed91c559fcf4a24f7f2"
+    "reason": "Standalone workers must retain real output, exit, cancellation, receipt ownership, and recovery across process boundaries. Held readers must preserve one worker and one outcome after recovery. Exhausted replacement retries must retain the worker's terminal observation. Explicit tiers must reach attached and background argv on Windows, macOS, and Linux. A refused tier must reserve no receipt and start no worker. Agent discovery must reject directories and honor platform permissions with minimal PATH and competing commands. The added cases use filesystem fixtures without launching a process. Native source observation must admit a compressed rollout once through its decoded opening. Source capture must retain channel order across alias contention with filesystem fixtures and no new processes. Source-mode alias loss, bounded pauses, and deadline recovery use owned files, mocked children, and controlled clocks.",
+    "cases": 116,
+    "matricesSha256": "b387ec7cad303cbe30a3545987c09ac337d1c9feba8500ba4a617fb1ae337e30"
   },
   "cli/test/smoke.bundled-a.test.mjs": {
     "reason": "Compiled CLI commands must reach session reads, comments, and saved defaults through an authenticated window channel. Parent and provider help must avoid stdin, files, and window discovery.",
