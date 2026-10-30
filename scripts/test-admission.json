@@ -5,9 +5,9 @@
     "matricesSha256": "5c419463cc072b57e206d07cd8051d33056647f9b2d637fdffd7c0105b53edd2"
   },
   "cli/test/run.test.ts": {
-    "reason": "Standalone workers must retain real output, exit, cancellation, receipt ownership, and recovery across process boundaries. Held readers must preserve one worker and one outcome after recovery. Exhausted replacement retries must retain the worker's terminal observation. Explicit tiers must reach attached and background argv on Windows, macOS, and Linux. A refused tier must reserve no receipt and start no worker. Agent discovery must reject directories and honor platform permissions with minimal PATH and competing commands. The added cases use filesystem fixtures without launching a process. Native source observation must admit a compressed rollout once through its decoded opening.",
-    "cases": 114,
-    "matricesSha256": "cdb48d38b5e8f2e42a6e8c4a09bc4e6a7da22958a1067fdb839a4211119638f9"
+    "reason": "Standalone workers must retain real output, exit, cancellation, receipt ownership, and recovery across process boundaries. Held readers must preserve one worker and one outcome after recovery. Exhausted replacement retries must retain the worker's terminal observation. Explicit tiers must reach attached and background argv on Windows, macOS, and Linux. A refused tier must reserve no receipt and start no worker. Agent discovery must reject directories and honor platform permissions with minimal PATH and competing commands. The added cases use filesystem fixtures without launching a process. Native source observation must admit a compressed rollout once through its decoded opening. Source capture must retain channel order across alias contention with filesystem fixtures and no new processes.",
+    "cases": 115,
+    "matricesSha256": "49aaf609e70f81b6b83956ce7eff7263c68b040ffa8427bdf4000ad955624e2d"
   },
   "cli/test/smoke.bundled-a.test.mjs": {
     "reason": "Compiled CLI commands must reach session reads, comments, and saved defaults through an authenticated window channel. Parent and provider help must avoid stdin, files, and window discovery.",
@@ -20,9 +20,9 @@
     "matricesSha256": "19f64f5b8903875bc1f2ff1940238724f8abbf43e7526211cd31062dd4334e62"
   },
   "cli/test/smoke.bundled-c.test.mjs": {
-    "reason": "Compiled CLI commands must preserve window routing, turn limits, and terminal ownership under real IPC.",
+    "reason": "Compiled CLI commands must preserve window routing, turn limits, and terminal ownership under real IPC. Print output must retain stdout and stderr, publish their alias, and leave the worker marker empty.",
     "cases": 17,
-    "matricesSha256": "9adf21df1dfbba9f831e83076016e28f89b228d8cbcbf6ab3e76cd248011fb53"
+    "matricesSha256": "ee87c4ff2f75fa56adc23fae25ca85c92dc28b9738bf5c3154eb5b598602a2b5"
   },
   "cli/test/smoke.test.mjs": {
     "reason": "Installed skill directories must preserve foreign files and ownership across executable command and filesystem boundaries. Bundled commands must update personal copies from every supported artifact layout. A detached run started through the editor launcher must run arc from its worker.",

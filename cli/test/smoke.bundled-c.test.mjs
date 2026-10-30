@@ -428,6 +428,9 @@ process.stdin.on('end',()=>{
     );
     assert.equal(status.launch.launchId, launchId);
     assert.equal(receipts.latest(launchId), null);
+    await vi.waitFor(() => assert.equal(readFileSync(log, 'utf8'), 'Original worker is running.\n'), {
+      timeout: 10_000,
+    });
     writeFileSync(release, 'complete');
     const completion = await waited;
     assert.equal(completion.error, undefined);
@@ -444,8 +447,18 @@ process.stdin.on('end',()=>{
     );
     assert.equal(report.text, 'Original report');
     assert.equal(readFileSync(alias, 'utf8'), 'Original report');
-    assert.equal(readFileSync(log, 'utf8'), readFileSync(receipts.artifact(launchId, 'worker.log'), 'utf8'));
-    assert.match(readFileSync(log, 'utf8'), /Original worker is running/);
+    const stdout = readFileSync(receipts.artifact(launchId, 'stdout.log'), 'utf8');
+    const stderr = readFileSync(receipts.artifact(launchId, 'stderr.log'), 'utf8');
+    assert.deepEqual(JSON.parse(stdout), {
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      session_id: native.id,
+      result: 'Original report',
+    });
+    assert.equal(stderr, 'Original worker is running.\n');
+    assert.equal(readFileSync(log, 'utf8'), stderr + stdout);
+    assert.equal(readFileSync(receipts.artifact(launchId, 'worker.log'), 'utf8'), '');
     passed = true;
   } finally {
     if (!passed) printDispatchReceipts(home);
