@@ -325,6 +325,7 @@ export async function acquireBrowserLock({
   onWaiting = null,
   processEmitter = process,
   signal = null,
+  record = null,
 } = {}) {
   const lockName = `${label} test lock`;
   let announced = false;
@@ -422,6 +423,7 @@ export async function acquireBrowserLock({
         cwd,
         startedAt: new Date(now()).toISOString(),
         ...(command ? { command } : {}),
+        ...record,
       });
       if (ahead === 0 && publishLock(lockPath, text, pid)) {
         observation?.end('queue', { lockPath });

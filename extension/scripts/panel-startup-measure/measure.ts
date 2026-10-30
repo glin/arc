@@ -1062,18 +1062,17 @@ const WARM_UP_OPEN_MS = 5.5 * 60_000;
 // Editor failure or timeout ends an incomplete run.
 async function measure(commandLine: string, workspace: string, options: Options): Promise<Outcome> {
   const timeoutMs = options.timeoutMs;
-  const { acquireLaneLock, HEAVY_LANES } = await import('../../test/machineload.mjs');
+  const { acquireHeavyLaneLocks } = await import('../../test/machineload.mjs');
   const { createTestObservation } = await import('../../test/observations.mjs');
   const observation = createTestObservation({ lane: 'panel startup measurement', cwd: REPOSITORY, capacity: 1 });
   observation.unavailable('build', 'The measured build is prepared before this request.');
   let failure: string | null = null;
   let complete = false;
-  const locks: Array<{ release(): boolean } | null> = [];
+  let locks: { release(): void } | null = null;
   try {
     // A measured launch holds every heavy lane lock, so no heavy test lane overlaps it. The runner waits for each lock
-    // like a suite lane does. Every holder takes these locks in the same order, so two runners cannot block each other.
-    for (const lane of HEAVY_LANES)
-      locks.push(await acquireLaneLock({ lane, observation: lane === 'browser' ? observation : null }));
+    // like a suite lane does, and refuses to start inside a test run.
+    locks = await acquireHeavyLaneLocks({ observation });
     const logs = path.join(ARC_STORE, DIAGNOSTICS_LOG_DIRECTORY);
     const reader = new LogReader(logs);
     if (options.warmUp) {
@@ -1147,7 +1146,7 @@ async function measure(commandLine: string, workspace: string, options: Options)
     failure = error instanceof Error ? error.message : String(error);
     throw error;
   } finally {
-    for (const lock of locks.reverse()) lock?.release();
+    locks?.release();
     observation.finish({
       outcome: failure ? 'failure' : complete ? 'success' : 'incomplete',
       reason: failure ?? (complete ? null : 'Startup measurement remained incomplete.'),

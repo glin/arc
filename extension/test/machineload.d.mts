@@ -13,6 +13,12 @@ export function freeMemoryBytes(options?: {
   osFree?: () => number;
 }): number;
 
+// Takes every heavy lane lock. It refuses inside a test run.
+export function acquireHeavyLaneLocks(options?: {
+  env?: NodeJS.ProcessEnv;
+  observation?: TestObservation | null;
+}): Promise<{ release(): void }>;
+
 // Resolves null when the signal aborts the wait.
 export function acquireLaneLock(options: {
   lane: string;

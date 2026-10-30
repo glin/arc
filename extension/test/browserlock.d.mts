@@ -34,6 +34,8 @@ interface BrowserLockOptions {
   observation?: TestObservation | null;
   onWaiting?: ((wait: BrowserLockWait) => void) | null;
   signal?: AbortSignal | null;
+  // Extra fields for the lock record.
+  record?: Record<string, string> | null;
 }
 
 export function acquireBrowserLock(options?: BrowserLockOptions): Promise<{ release(): boolean }>;

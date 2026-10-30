@@ -46,7 +46,7 @@ Each lock is `arc-<lane>-tests.lock` in the directory that `os.tmpdir()` returns
 
 While it waits for memory, a run prints the free memory and the floor every 30 seconds. Windows reads available physical memory. Linux reads `MemAvailable` from `/proc/meminfo`. macOS counts free, inactive, and speculative pages from `vm_stat`.
 
-A lane that an admitted run starts skips every memory wait, because its parent admitted it. The run adds its PID and a random token to `ARC_TEST_SUITE_HOLDER` for its children. While it runs, it keeps a marker file for that token in the `arc-test-holders` directory beside the locks. A run counts as nested when that variable names another live process with a current marker. A nested run still takes a heavy lane lock, unless a process that the variable names owns that lock.
+A lane that an admitted run starts skips every memory wait, because its parent admitted it. The run adds its PID and a random token to `ARC_TEST_SUITE_HOLDER` for its children. While it runs, it keeps a marker file for that token in the `arc-test-holders` directory beside the locks, and refreshes it every 30 seconds. A run counts as nested when that variable names another live process with a marker refreshed in the last three minutes. A heavy lane lock records its holder's token. A nested run still takes a heavy lane lock, unless the lock names a PID and token from that variable.
 
 | Variable | Effect | Default |
 | --- | --- | --- |

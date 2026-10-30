@@ -311,10 +311,12 @@ test('command entry points run through a linked checkout', { tags: ['subprocess'
     const starvedFull = fullRun([], { ARC_TEST_MEMORY_FLOOR_GB: '100000' });
     assert.equal(starvedFull.status, 76, starvedFull.stdout + starvedFull.stderr);
     assert.doesNotMatch(starvedFull.stdout, /Node lane:/);
+    write('extension/src/example.browser.test.ts', '');
     const starvedBrowser = spawnSync(process.execPath, [path.join(linked, 'extension/test.mjs'), 'browser'], {
       encoding: 'utf8',
       env: loadEnv({ ARC_TEST_MEMORY_FLOOR_GB: '100000' }),
     });
+    fs.rmSync(path.join(physical, 'extension/src/example.browser.test.ts'));
     assert.equal(starvedBrowser.status, 76, starvedBrowser.stdout + starvedBrowser.stderr);
     const laneLock = path.join(loadTemp, 'arc-extension-integration-tests.lock');
     fs.writeFileSync(laneLock, JSON.stringify({ pid: process.pid, startedAt: 'earlier', command: 'holder' }));
@@ -2046,8 +2048,17 @@ test('a heavy lane lock recovers from a dead holder, admits nested runs, and tim
   const lanes = loadLanes(fixture.directory);
   const load = suiteLoadFixture(fixture.directory, 1002);
   const { lockPath } = load;
-  const hold = (pid) =>
-    fs.writeFileSync(lockPath, JSON.stringify({ pid, cwd: '/other', startedAt: 'earlier', command: 'other suite' }));
+  const hold = (pid, holder) =>
+    fs.writeFileSync(
+      lockPath,
+      JSON.stringify({
+        pid,
+        cwd: '/other',
+        startedAt: 'earlier',
+        command: 'other suite',
+        ...(holder ? { holder } : {}),
+      }),
+    );
   const launched = [];
   const run = (name, machineLoad) =>
     suite.runSuiteCommand({
@@ -2064,17 +2075,28 @@ test('a heavy lane lock recovers from a dead holder, admits nested runs, and tim
     assert.equal(fs.existsSync(lockPath), false);
 
     // A run that the lock holder started skips the lock and every memory wait.
-    hold(2002);
     const holderEnv = {};
     const unmark = machine.markHolder(holderEnv, {
       pid: 2002,
       lockDirectory: fixture.directory,
       processEmitter: new EventEmitter(),
     });
+    hold(2002, unmark.token);
     const nested = { ...load.machineLoad, env: { ...holderEnv }, readFree: () => 0 };
     assert.equal(await run('nested', nested), 0);
     assert.equal(JSON.parse(fs.readFileSync(lockPath)).pid, 2002);
     assert.equal(launched.length, 6);
+
+    // A lock that the holder's PID owns under another token belongs to a later process that reused the PID.
+    hold(2002, 'other-token');
+    const reused = run('reused', {
+      ...load.machineLoad,
+      env: { ...holderEnv, ARC_TEST_LOAD_DEADLINE_MINUTES: '1' },
+      readFree: () => 0,
+    });
+    await load.tick(60_000);
+    assert.equal(await reused, 75);
+    assert.deepEqual(launched.slice(6), ['reused:static', 'reused:unit']);
 
     // A holder entry without its marker file admits nothing, even when it names the live lock owner.
     const forged = run('forged', {
@@ -2084,7 +2106,7 @@ test('a heavy lane lock recovers from a dead holder, admits nested runs, and tim
     });
     await load.tick(60_000);
     assert.equal(await forged, 76);
-    assert.deepEqual(launched.slice(6), ['forged:static']);
+    assert.deepEqual(launched.slice(8), ['forged:static']);
     unmark();
     assert.deepEqual(fs.readdirSync(path.join(fixture.directory, 'arc-test-holders')), []);
 
@@ -2093,7 +2115,7 @@ test('a heavy lane lock recovers from a dead holder, admits nested runs, and tim
     const recycled = run('recycled', { ...load.machineLoad, env: { ARC_TEST_LOAD_DEADLINE_MINUTES: '1' } });
     await load.tick(60_000);
     assert.equal(await recycled, 75);
-    assert.deepEqual(launched.slice(7), ['recycled:static', 'recycled:unit']);
+    assert.deepEqual(launched.slice(9), ['recycled:static', 'recycled:unit']);
     hold(2002);
 
     // A live marker that does not own the lock admits nothing.
@@ -2103,7 +2125,7 @@ test('a heavy lane lock recovers from a dead holder, admits nested runs, and tim
     });
     await load.tick(60_000);
     assert.equal(await timedOut, 75);
-    assert.deepEqual(launched.slice(9), ['timeout:static', 'timeout:unit']);
+    assert.deepEqual(launched.slice(11), ['timeout:static', 'timeout:unit']);
     assert.match(
       errors.at(-1),
       /another run held its machine lock for 1 min.*The holder was PID 2002, started earlier, running other suite\./,
@@ -2120,8 +2142,17 @@ test('a grandchild run counts as nested for a lock that its grandparent holds', 
   const env = {};
   const quiet = { lockDirectory: directory, isProcessAlive: () => true, processEmitter: emitter, log: () => {} };
   try {
-    fs.writeFileSync(machine.laneLockPath('browser', directory), JSON.stringify({ pid: 2002, startedAt: 'earlier' }));
     const unmarkParent = machine.markHolder(env, { pid: 2002, lockDirectory: directory, processEmitter: emitter });
+    fs.writeFileSync(
+      machine.laneLockPath('browser', directory),
+      JSON.stringify({ pid: 2002, startedAt: 'earlier', holder: unmarkParent.token }),
+    );
+    // A marker that its holder stopped refreshing admits nothing, so a later process with that PID gains no admission.
+    const later = () => Date.now() + 4 * 60_000;
+    assert.deepEqual(
+      machine.admittedHolders(env, { pid: 2003, isProcessAlive: () => true, lockDirectory: directory, now: later }),
+      [],
+    );
     const child = await machine.acquireLaneLock({ lane: 'extension-integration', env, pid: 2003, ...quiet });
     assert.equal(child.nested, false);
     const unavailable = [];
@@ -2139,6 +2170,32 @@ test('a grandchild run counts as nested for a lock that its grandparent holds', 
     unmarkParent();
     assert.equal(env.ARC_TEST_SUITE_HOLDER, undefined);
     assert.deepEqual(fs.readdirSync(path.join(directory, 'arc-test-holders')), []);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('work that holds every heavy lane lock refuses to start inside a test run', async () => {
+  const machine = await import('../extension/test/machineload.mjs');
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-heavy-locks-'));
+  const emitter = new EventEmitter();
+  const quiet = { lockDirectory: directory, isProcessAlive: () => true, processEmitter: emitter, log: () => {} };
+  const owners = () =>
+    machine.HEAVY_LANES.map(
+      (lane) =>
+        fs.existsSync(machine.laneLockPath(lane, directory)) &&
+        JSON.parse(fs.readFileSync(machine.laneLockPath(lane, directory))).pid,
+    );
+  try {
+    const outside = await machine.acquireHeavyLaneLocks({ env: {}, pid: 2101, ...quiet });
+    assert.deepEqual(owners(), [2101, 2101, 2101]);
+    outside.release();
+    assert.deepEqual(owners(), [false, false, false]);
+    const env = {};
+    const unmark = machine.markHolder(env, { pid: 2102, lockDirectory: directory, processEmitter: emitter });
+    await assert.rejects(machine.acquireHeavyLaneLocks({ env, pid: 2103, ...quiet }), /cannot run inside a test run/);
+    assert.deepEqual(owners(), [false, false, false]);
+    unmark();
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }

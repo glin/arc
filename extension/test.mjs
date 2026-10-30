@@ -528,16 +528,20 @@ export async function main(argv = process.argv.slice(2), { machineLoad = {} } = 
     // A full run of both lanes admits each lane by its load class, as a multi-lane suite does.
     if (mode === 'full')
       return await holdMachineLoad((beforeLane) => runFull(extraArgs, { ...opts, beforeLane }), machineLoad);
-    // A browser lane run takes the lane's lock and memory floor, as a suite lane does.
+    // A browser lane run takes the lane's lock and memory floor, as a suite lane does. The admission is the lane's lock
+    // step, so the lane's timing record covers it.
     if (mode === 'browser')
-      return await holdMachineLoad(async (beforeLane) => {
-        const release = await beforeLane({ id: 'browser' }, 'The extension browser lane');
-        try {
-          return await runBrowserLane(extraArgs, opts);
-        } finally {
-          release();
-        }
-      }, machineLoad);
+      return await holdMachineLoad(
+        (beforeLane) =>
+          runBrowserLane(extraArgs, {
+            ...opts,
+            acquireLock: async (options) => {
+              const release = await beforeLane({ id: 'browser' }, 'The extension browser lane', null, options);
+              return { release: () => (release(), true) };
+            },
+          }),
+        machineLoad,
+      );
     return await (mode === 'node' ? runNodeLane(extraArgs, opts) : runTestMode(mode, extraArgs, opts));
   } catch (error) {
     if (!(error instanceof MachineLoadTimeout)) throw error;

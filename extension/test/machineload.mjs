@@ -5,7 +5,7 @@
 // The lane locks use the lock code of browserlock.mjs, including its stale-holder takeover and its three-run race.
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { availableParallelism, freemem, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
@@ -149,9 +149,10 @@ export async function waitForMemory({
   }
 }
 
-function lockOwnerPid(lockPath) {
+function readLockRecord(lockPath) {
   try {
-    return JSON.parse(readFileSync(lockPath, 'utf8')).pid ?? null;
+    const record = JSON.parse(readFileSync(lockPath, 'utf8'));
+    return Number.isInteger(record?.pid) ? record : null;
   } catch {
     return null;
   }
@@ -164,6 +165,10 @@ function describeHolder(owner) {
   return `PID ${owner.pid}, ${started}${command}`;
 }
 
+// A holder refreshes its marker file like a lock heartbeat. A holder that ended without cleanup stops refreshing, so a
+// later process that reuses its PID does not inherit its admission.
+const HOLDER_REFRESH_MS = 30_000;
+const HOLDER_STALE_MS = 3 * 60_000;
 const markerPath = (directory, pid, token) => join(directory ?? tmpdir(), 'arc-test-holders', `${pid}-${token}`);
 
 function holderEntries(env) {
@@ -174,41 +179,62 @@ function holderEntries(env) {
     .map(([, pid, token]) => ({ pid: Number(pid), token }));
 }
 
-// The live processes other than this one that SUITE_HOLDER_ENV names with a current marker file.
-// A stale or copied value names a process that ended, or a token without a marker, so it admits nothing.
-export function admittedHolders(env, { pid = process.pid, isProcessAlive = processExists, lockDirectory } = {}) {
-  return holderEntries(env)
-    .filter((entry) => entry.pid !== pid && isProcessAlive(entry.pid))
-    .filter((entry) => existsSync(markerPath(lockDirectory, entry.pid, entry.token)))
-    .map((entry) => entry.pid);
+function markerFresh(directory, entry, now) {
+  try {
+    return statSync(markerPath(directory, entry.pid, entry.token)).mtimeMs >= now() - HOLDER_STALE_MS;
+  } catch {
+    return false;
+  }
+}
+
+// The entries of SUITE_HOLDER_ENV that name a live process other than this one with a fresh marker file.
+// A stale or copied value names a process that ended, or a token without a fresh marker, so it admits nothing.
+export function admittedHolders(
+  env,
+  { pid = process.pid, isProcessAlive = processExists, lockDirectory, now = Date.now } = {},
+) {
+  return holderEntries(env).filter(
+    (entry) => entry.pid !== pid && isProcessAlive(entry.pid) && markerFresh(lockDirectory, entry, now),
+  );
 }
 
 // Add this process to the holder chain for its children, and return the function that removes it.
-// A process that the chain already names with a current marker keeps that entry.
-export function markHolder(env, { pid = process.pid, lockDirectory, processEmitter = process } = {}) {
-  if (holderEntries(env).some((entry) => entry.pid === pid && existsSync(markerPath(lockDirectory, pid, entry.token))))
-    return () => {};
+// The function's token property names the entry. A process that the chain already names keeps that entry.
+export function markHolder(env, { pid = process.pid, lockDirectory, processEmitter = process, now = Date.now } = {}) {
+  const own = holderEntries(env).find((entry) => entry.pid === pid && markerFresh(lockDirectory, entry, now));
+  if (own) return Object.assign(() => {}, { token: own.token });
   const token = randomUUID();
   const marker = markerPath(lockDirectory, pid, token);
   mkdirSync(join(marker, '..'), { recursive: true });
   writeFileSync(marker, '');
+  const refresh = setInterval(() => {
+    try {
+      const at = new Date();
+      utimesSync(marker, at, at);
+    } catch {
+      // A later tick retries.
+    }
+  }, HOLDER_REFRESH_MS);
+  refresh.unref?.();
   const removeMarker = () => rmSync(marker, { force: true });
   processEmitter.once('exit', removeMarker);
   const previous = env[SUITE_HOLDER_ENV];
   env[SUITE_HOLDER_ENV] = [previous, `${pid}:${token}`].filter(Boolean).join(' ');
-  return () => {
+  const unmark = () => {
+    clearInterval(refresh);
     processEmitter.off('exit', removeMarker);
     removeMarker();
     if (previous === undefined) delete env[SUITE_HOLDER_ENV];
     else env[SUITE_HOLDER_ENV] = previous;
   };
+  return Object.assign(unmark, { token });
 }
 
 // The lane locks that each process in this module holds, so a second request from that process counts as nested.
 const heldLocks = new Set();
 
-// Take a heavy lane's machine lock. The run is nested when this process holds the lock, or when an admitted holder
-// in SUITE_HOLDER_ENV owns it. The holder's children inherit its entry in SUITE_HOLDER_ENV until release.
+// Take a heavy lane's machine lock. The run is nested when this process holds the lock, or when the lock record names
+// an admitted holder in SUITE_HOLDER_ENV by PID and token. The holder's children inherit its entry until release.
 // A cancelled signal ends the wait and returns null.
 export async function acquireLaneLock({
   lane,
@@ -224,14 +250,17 @@ export async function acquireLaneLock({
   ...lockOptions
 }) {
   const held = `${pid}|${lockPath}`;
-  const owner = lockOwnerPid(lockPath);
+  const record = readLockRecord(lockPath);
+  const admitted = admittedHolders(env, { pid, isProcessAlive, lockDirectory });
   if (
     heldLocks.has(held) ||
-    (owner !== null && admittedHolders(env, { pid, isProcessAlive, lockDirectory }).includes(owner))
+    (record && admitted.some((entry) => entry.pid === record.pid && entry.token === record.holder))
   ) {
     lockOptions.observation?.unavailable('queue', 'The run that started this lane holds its lock.');
     return { nested: true, release: () => false };
   }
+  // The marker exists before the lock, so the lock record can name it and a marker failure leaves no lock behind.
+  const unmark = markHolder(env, { pid, lockDirectory, processEmitter: lockOptions.processEmitter });
   let lastNotice = null;
   let lock;
   try {
@@ -243,6 +272,7 @@ export async function acquireLaneLock({
       command,
       deadlineMs,
       isProcessAlive,
+      record: { holder: unmark.token },
       onWaiting: ({ owner, held, ahead, waitedMs }) => {
         if (lastNotice !== null && waitedMs - lastNotice < NOTICE_MS) return;
         lastNotice = waitedMs;
@@ -256,6 +286,7 @@ export async function acquireLaneLock({
       ...lockOptions,
     });
   } catch (error) {
+    unmark();
     if (error.code === 'ARC_LOCK_CANCELLED') return null;
     if (error.code !== 'ARC_LOCK_TIMEOUT') throw error;
     const cause = error.held
@@ -267,7 +298,6 @@ export async function acquireLaneLock({
     );
   }
   heldLocks.add(held);
-  const unmark = markHolder(env, { pid, lockDirectory, processEmitter: lockOptions.processEmitter });
   return {
     nested: false,
     release() {
@@ -278,7 +308,43 @@ export async function acquireLaneLock({
   };
 }
 
-// Give a multi-lane run an admission step for each lane, by the lane's load class.
+// Take every heavy lane lock in HEAVY_LANES order, for work that must run with no heavy test lane beside it.
+// Work inside a test run refuses, because its holder can keep a later lock while this waits for an earlier one.
+export async function acquireHeavyLaneLocks({
+  env = process.env,
+  pid = process.pid,
+  isProcessAlive = processExists,
+  lockDirectory,
+  observation = null,
+  ...options
+} = {}) {
+  if (admittedHolders(env, { pid, isProcessAlive, lockDirectory }).length)
+    throw Error('This command cannot run inside a test run. Start it outside every test lane.');
+  const locks = [];
+  const release = () => {
+    for (const lock of locks.splice(0).reverse()) lock?.release();
+  };
+  try {
+    for (const lane of HEAVY_LANES)
+      locks.push(
+        await acquireLaneLock({
+          lane,
+          env,
+          pid,
+          isProcessAlive,
+          lockDirectory,
+          observation: lane === 'browser' ? observation : null,
+          ...options,
+        }),
+      );
+  } catch (error) {
+    release();
+    throw error;
+  }
+  return { release };
+}
+
+// Give a test run an admission step for each lane, by the lane's load class. lockExtras reach the lane lock request.
 // A static lane starts at once. A unit lane waits for its memory floor. A heavy lane takes its machine lock, then
 // waits for the heavy floor. The admission returns a release that the run calls when the lane ends.
 // A nested run skips every memory wait, because its holder admitted the lane that started it.
@@ -305,7 +371,7 @@ export async function holdMachineLoad(run, options = {}) {
     ? () => {}
     : markHolder(env, { pid, lockDirectory, processEmitter: lockOptions.processEmitter });
   try {
-    return await run(async (lane, label, signal) => {
+    return await run(async (lane, label, signal, lockExtras = {}) => {
       const load = lane.load ?? LANE_LOADS[lane.id];
       if (!load) throw Error(`The ${lane.id} lane has no load class in LANE_LOADS of extension/test/machineload.mjs.`);
       const lock = load.lock
@@ -322,6 +388,7 @@ export async function holdMachineLoad(run, options = {}) {
             signal,
             lockDirectory,
             ...lockOptions,
+            ...lockExtras,
           })
         : null;
       const release = () => {
