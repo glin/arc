@@ -2672,7 +2672,7 @@ function completeDiscoveryHarness(
   railCacheMark: typeof railCacheMarkOf = () => null,
   cacheStats: typeof derivedTitleCacheStats = derivedTitleCacheStats,
 ): any {
-  scope = { startingWorktree, ...scope };
+  scope = { startingWorktree, orderTimelineEntries: cardConsumers.orderTimelineEntries, ...scope };
   const file = ts.createSourceFile(
     'panelhost.ts',
     fs.readFileSync(path.join(__dirname, 'panelhost.ts'), 'utf8'),

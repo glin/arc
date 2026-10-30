@@ -118,6 +118,7 @@ const CODEX_STATE_KEYS = {
   pendingClaudeResults: true,
   closedTurns: true,
   currentTurnDidSomething: true,
+  currentTurnDidOrdinaryWork: true,
   currentTurnCompleted: true,
   compactionCount: true,
   recentCompactions: true,
@@ -339,6 +340,9 @@ function transcriptUsageEvent(value: unknown, expectedAgent: 'claude' | 'codex')
       value.cacheLifetime === '30m' ||
       value.cacheLifetime === '1h') &&
     (value.compactionsBefore === undefined || nonNegativeInteger(value.compactionsBefore)) &&
+    (value.compactionUsage === undefined || value.compactionUsage === true) &&
+    (value.compactionStart === undefined ||
+      (value.compactionStart === true && value.compactionUsage === true && expectedAgent === 'codex')) &&
     (value.usageOrigin === undefined || value.usageOrigin === 'claude-advisor') &&
     (value.waits === undefined || usageWaits(value.waits)) &&
     (value.toolResults === undefined || toolResultKinds(value.toolResults)) &&
@@ -678,6 +682,7 @@ function codexState(value: unknown): value is CodexUsageReducerState {
     !boundedIdentityList(value.compactionResponseIds) ||
     !nonNegativeInteger(value.closedTurns) ||
     typeof value.currentTurnDidSomething !== 'boolean' ||
+    !(value.currentTurnDidOrdinaryWork === undefined || typeof value.currentTurnDidOrdinaryWork === 'boolean') ||
     typeof value.currentTurnCompleted !== 'boolean' ||
     !nonNegativeInteger(value.compactionCount) ||
     !reducerCompactions(value.recentCompactions, value.compactionCount) ||
@@ -1174,7 +1179,55 @@ function cacheExpiryLedger(value: unknown): CacheExpiryLedger | null {
   if (displacedCompactions && !displacedCompactions.every((item): item is CompactionFact => item !== null)) {
     return null;
   }
+  const compactionReturns = value.compactionReturns;
+  if (
+    compactionReturns !== undefined &&
+    (!Array.isArray(compactionReturns) || compactionReturns.length > RETAINED_COMPACTIONS)
+  )
+    return null;
+  const parsedReturns: NonNullable<CacheExpiryLedger['compactionReturns']> = [];
+  for (const item of compactionReturns ?? []) {
+    if (
+      !record(item) ||
+      !nonEmptyText(item.requestKey) ||
+      !nonNegativeInteger(item.ordinal) ||
+      item.ordinal === 0 ||
+      !record(item.verdict)
+    )
+      return null;
+    const previous = cacheExpiryCarry(item.previous);
+    if (!previous) return null;
+    const verdict = item.verdict;
+    if (verdict.kind === 'return') {
+      if (!cacheTier(verdict.lifetime) || !nonNegativeInteger(verdict.gapMs)) return null;
+      parsedReturns.push({
+        requestKey: item.requestKey,
+        ordinal: item.ordinal,
+        previous,
+        verdict: { kind: 'return', lifetime: verdict.lifetime, gapMs: verdict.gapMs },
+      });
+    } else if (verdict.kind === 'none' || verdict.kind === 'unavailable' || verdict.kind === 'excluded') {
+      parsedReturns.push({
+        requestKey: item.requestKey,
+        ordinal: item.ordinal,
+        previous,
+        verdict: { kind: verdict.kind },
+      });
+    } else return null;
+  }
+  if (
+    !(
+      value.compactionBaseLongestGapMs === undefined ||
+      value.compactionBaseLongestGapMs === null ||
+      nonNegativeInteger(value.compactionBaseLongestGapMs)
+    )
+  )
+    return null;
   return {
+    ...(compactionReturns === undefined ? {} : { compactionReturns: parsedReturns }),
+    ...(value.compactionBaseLongestGapMs === undefined
+      ? {}
+      : { compactionBaseLongestGapMs: value.compactionBaseLongestGapMs }),
     ...(displacedCompactions ? { displacedCompactions } : {}),
     facts,
     compactions,

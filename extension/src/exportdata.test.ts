@@ -16,6 +16,7 @@ import {
   exportedSiteData,
   subagent,
   turn,
+  codexLeadingCompactionRecords,
 } from './turnfixtures.ts';
 import {
   captureSessionExport,
@@ -39,6 +40,38 @@ const CODEX_ID = 'aaaaaaaa-1111-4111-8111-111111111111';
 const NATIVE_CODEX_ID = 'bbbbbbbb-2222-4222-8222-222222222222';
 const at = (second: number) => new Date(Date.UTC(2026, 8, 29, 12, 0, second)).toISOString();
 const record = (type: string, second: number, fields: object) => ({ type, timestamp: at(second), ...fields });
+
+test('capture preserves the leading compaction placement association', async () => {
+  const f = fixture();
+  const leading = codexLeadingCompactionRecords();
+  const file = f.write(path.join(f.codex, '2026', '09', '29', 'rollout-leading.jsonl'), leading.records);
+  const writer = await ExportTransaction.create(f.output);
+  try {
+    const captured = await captureSessionExport(
+      {
+        ...f.options,
+        root: {
+          agent: 'codex',
+          file,
+          sessionId: leading.id,
+          size: fs.statSync(file).size,
+          mtimeMs: fs.statSync(file).mtimeMs,
+        },
+      },
+      writer,
+    );
+    const pages = await Promise.all(captured.model.sessions[0].pages.map((key) => writer.readSpool<ExportPage>(key)));
+    const compaction = pages.flatMap((page) => page.compactions)[0];
+    const prepared = pages
+      .flatMap((page) => page.turns)
+      .find((turn) => turn.startedAt === Date.parse(leading.records[8].timestamp))!;
+    assert.equal(compaction.preparesTurnId, prepared.nativeTurnId);
+    assert.equal(compaction.at, leading.compactAt);
+    assert.equal(compaction.trigger, '');
+  } finally {
+    await writer.dispose();
+  }
+});
 
 test('per-pass pricing survives an export round trip with both bands and one executor request', () => {
   const f = fixture();

@@ -1,4 +1,137 @@
 import { sessionCostProjection, sessionCostUsageOf } from './turncard';
+import { codexLeadingCompactionRecords } from './turnfixtures';
+
+test('a leading billed compaction keeps an unknown trigger after its delayed prompt', () => {
+  const { records } = codexLeadingCompactionRecords();
+  const parsed = readCodexSession(writeRollout(records), 'sess');
+  assert.equal(parsed.compactions[0].trigger, '');
+  assert.ok(toCompactionCard(parsed.compactions[0]).headline.startsWith('Compacted.'));
+  const prepared = parsed.turns.at(-1)!;
+  assert.equal(parsed.compactions[0].preparesTurnId, prepared.promptId);
+  const fullFile = writeRollout(records);
+  const tailBytes = Buffer.byteLength(
+    records
+      .slice(7)
+      .map((row) => JSON.stringify(row))
+      .join('\n') + '\n',
+  );
+  assert.deepEqual(readCodexSession(fullFile, 'sess', { tailBytes }).compactions, parsed.compactions);
+  for (let seam = 0; seam < records.length; seam++) {
+    const usage = createCodexUsageLineReducer();
+    for (const row of records.slice(0, seam)) usage.pushLine(JSON.stringify(row));
+    const restored = createCodexUsageLineReducer(structuredClone(usage.snapshot()));
+    for (const row of records.slice(seam)) restored.pushLine(JSON.stringify(row));
+    assert.equal(restored.recentCompactions()[0].trigger, '', `usage seam ${seam}`);
+    const history = createCodexSessionReducer('sess');
+    for (const row of records.slice(0, seam)) history.pushLine(JSON.stringify(row));
+    const resumed = createCodexSessionReducer('sess', {}, null, structuredClone(history.snapshot()));
+    for (const row of records.slice(seam)) resumed.pushLine(JSON.stringify(row));
+    assert.deepEqual(resumed.read().compactions, parsed.compactions, `history seam ${seam}`);
+  }
+});
+
+test('a dedicated billed compaction stays unknown until its empty native turn completes', () => {
+  const { records } = codexLeadingCompactionRecords({ prompt: false });
+  const reducer = createCodexSessionReducer('sess');
+  for (const row of records.slice(0, -1)) reducer.pushLine(JSON.stringify(row));
+  assert.equal(reducer.read().compactions[0].trigger, '');
+  reducer.pushLine(JSON.stringify(records.at(-1)));
+  assert.equal(reducer.read().compactions[0].trigger, 'manual');
+  assert.equal(reducer.read().compactions[0].preparesTurnId, undefined);
+});
+
+test.each(['completion', 'prompt'] as const)(
+  'Codex compaction %s updates visit only their native turn in one semantic page',
+  (update) => {
+    const samples = [];
+    for (const count of [12, 24]) {
+      const records: Array<ReturnType<typeof meta> | ReturnType<typeof event>> = [meta()];
+      for (let index = 0; index < count; index++) {
+        const turnId = `compact-${index}`;
+        const second = index * 5;
+        records.push(
+          event('task_started', second + 1, { turn_id: turnId }),
+          event('compacted', second + 2),
+          event('compacted', second + 3),
+        );
+        if (update === 'prompt') records.push(event('user_message', second + 4, { message: `Ask ${index}` }));
+        records.push(event('task_complete', second + 5, { turn_id: turnId, last_agent_message: '' }));
+      }
+      const file = writeRollout(records);
+      const page = readCodexHistoryPage(file, 'sess', null, {
+        chunkBytes: fs.statSync(file).size,
+        targetTurns: count + 1,
+      });
+      assert.equal(page.kind, 'page');
+      assert.equal(page.page?.nextOlderCursor, null);
+      assert.equal(page.page?.compactions.length, count * 2);
+      assert.equal(page.page?.turns.length, update === 'prompt' ? count : 0);
+
+      const options = { maxTurns: Number.MAX_SAFE_INTEGER };
+      const initial = createCodexSessionReducer('sess', options);
+      initial.pushLine(JSON.stringify(records[0]));
+      const snapshot = initial.snapshot();
+      let memberships = snapshot.compactionTurnIds;
+      let reads = 0;
+      Object.defineProperty(snapshot, 'compactionTurnIds', {
+        configurable: true,
+        enumerable: true,
+        get: () => {
+          reads++;
+          return memberships;
+        },
+        set: (value) => {
+          memberships = value;
+        },
+      });
+      const reducer = createCodexSessionReducer('sess', options, null, snapshot);
+      reads = 0;
+      for (const record of records.slice(1)) reducer.pushLine(JSON.stringify(record));
+      samples.push({ count, reads });
+      const parsed = reducer.read();
+      assert.deepEqual(parsed.compactions, page.page?.compactions);
+      for (let index = 0; index < parsed.compactions.length; index++) {
+        const compaction = parsed.compactions[index];
+        assert.equal(compaction.trigger, update === 'completion' ? 'manual' : '');
+        assert.equal(compaction.preparesTurnId, update === 'prompt' ? `compact-${Math.floor(index / 2)}` : undefined);
+      }
+    }
+    assert.ok(
+      samples.every(({ count, reads }) => reads <= count * 2),
+      `Native-membership accesses grow with unrelated compactions: ${JSON.stringify(samples)}`,
+    );
+  },
+);
+
+test('Codex compaction associations follow retention and source trimming across checkpoints', () => {
+  const records: Array<ReturnType<typeof meta> | ReturnType<typeof event>> = [meta()];
+  for (const [index, turnId] of ['older', 'middle', 'current'].entries()) {
+    records.push(event('task_started', index * 3 + 1, { turn_id: turnId }), event('compacted', index * 3 + 2));
+    if (turnId !== 'current')
+      records.push(event('task_complete', index * 3 + 3, { turn_id: turnId, last_agent_message: '' }));
+  }
+  const options = { maxTurns: 2 };
+  const initial = createCodexSessionReducer('sess', options);
+  for (const [index, record] of records.entries())
+    initial.pushLine({ text: JSON.stringify(record), start: index * 100, end: (index + 1) * 100 });
+  const restored = createCodexSessionReducer('sess', options, null, structuredClone(initial.snapshot()));
+  assert.deepEqual([...restored.snapshot().compactionsByTurn.keys()], ['middle', 'current']);
+  assert.equal(restored.trimBefore(700), false);
+  const trimmed = restored.snapshot();
+  assert.deepEqual([...trimmed.compactionsByTurn.keys()], ['current']);
+  assert.equal(trimmed.compactionsByTurn.get('current')![0], trimmed.compactions[0]);
+  const resumed = createCodexSessionReducer('sess', options, null, structuredClone(trimmed));
+  resumed.pushLine({ text: JSON.stringify(event('user_message', 9, { message: 'Continue' })), start: 900, end: 1000 });
+  resumed.pushLine({
+    text: JSON.stringify(event('task_complete', 10, { turn_id: 'current', last_agent_message: '' })),
+    start: 1000,
+    end: 1100,
+  });
+  assert.equal(resumed.read().compactions[0].trigger, '');
+  assert.equal(resumed.read().compactions[0].preparesTurnId, 'current');
+  resumed.trimBefore(1100);
+  assert.equal(resumed.snapshot().compactionsByTurn.size, 0);
+});
 
 test.each(['claude', 'codex'] as const)(
   'qualified current opening rejects retired descriptor and changing revision for %s',
@@ -9183,10 +9316,30 @@ test('a Codex compaction uses the active turn shape as its trigger', () => {
   );
 });
 
-test('a Codex compaction without its containing turn start remains unknown', () => {
-  const [compaction] = readCodexSession(writeRollout([meta(), event('compacted', 1)]), 'sess').compactions;
-  assert.equal(compaction.trigger, '');
-});
+test.each(['task_complete', 'turn_aborted'])(
+  'a Codex compaction without its containing turn start remains unknown after %s',
+  (terminal) => {
+    const records = [meta(), event('compacted', 1), event(terminal, 2, { turn_id: TURN, last_agent_message: '' })];
+    const expected = readCodexSession(writeRollout(records), 'sess').compactions;
+    assert.equal(expected[0].trigger, '');
+    for (let seam = 0; seam <= records.length; seam++) {
+      const usage = createCodexUsageLineReducer();
+      const history = createCodexSessionReducer('sess');
+      for (const row of records.slice(0, seam)) {
+        usage.pushLine(JSON.stringify(row));
+        history.pushLine(JSON.stringify(row));
+      }
+      const restoredUsage = createCodexUsageLineReducer(structuredClone(usage.snapshot()));
+      const restoredHistory = createCodexSessionReducer('sess', {}, null, structuredClone(history.snapshot()));
+      for (const row of records.slice(seam)) {
+        restoredUsage.pushLine(JSON.stringify(row));
+        restoredHistory.pushLine(JSON.stringify(row));
+      }
+      assert.equal(restoredUsage.recentCompactions()[0].trigger, '', `usage seam ${seam}`);
+      assert.deepEqual(restoredHistory.read().compactions, expected, `history seam ${seam}`);
+    }
+  },
+);
 
 test('a delayed copied turn context retracts its compaction from the session and spend ledgers', () => {
   const records = [
@@ -9209,6 +9362,9 @@ test('a delayed copied turn context retracts its compaction from the session and
   const file = writeRollout(records);
   const parsed = readCodexSession(file, 'sess');
   assert.equal(parsed.compactions.length, 0);
+  const selected = createCodexSessionReducer('sess');
+  for (const record of records) selected.pushLine(JSON.stringify(record));
+  assert.equal(selected.snapshot().compactionsByTurn.size, 0);
   const usage = createCodexUsageLineReducer();
   for (const record of records) {
     usage.pushLine(JSON.stringify(record));
@@ -12818,7 +12974,8 @@ test('a prior Codex parser state rebuilds child identity and exact compaction us
   const initial = readCodexSessionIncremental(file, 'sess', undefined, options);
   assert.ok(initial.checkpoint);
   const parserKey = initial.checkpoint.parserKey;
-  (initial.checkpoint.parserState as { version: number }).version = 14;
+  (initial.checkpoint.parserState as { version: number }).version = 28;
+  delete (initial.checkpoint.parserState as { compactionsByTurn?: unknown }).compactionsByTurn;
   assert.equal(initial.checkpoint.parserKey, parserKey);
   const [agent] = initial.checkpoint.parserState.turns[0].agents;
   initial.checkpoint.parserState.turns[0].agents = [
@@ -12828,7 +12985,7 @@ test('a prior Codex parser state rebuilds child identity and exact compaction us
 
   const reset = readCodexSessionIncremental(file, 'sess', initial.checkpoint, options);
   assert.equal(reset.kind, 'reset');
-  assert.equal(reset.checkpoint?.parserState.version, 27);
+  assert.equal(reset.checkpoint?.parserState.version, 29);
   assert.deepEqual(
     reset.read?.turns[0].agents.map((row) => [row.id, row.description]),
     [[child.threadId, 'astra_implementer']],

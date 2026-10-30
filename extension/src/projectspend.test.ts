@@ -1224,7 +1224,7 @@ test('a linked Claude result is used only when its direct transcript is absent',
     buckets,
     lifetimeBuckets: buckets,
     turnCount: 1,
-    parserGeneration: PROJECT_SPEND_PARSER_GENERATIONS.claude,
+    parserGeneration: PROJECT_SPEND_PARSER_GENERATIONS[parserKind],
     parserKind,
     indexedAt: at,
     complete: true,
@@ -1726,7 +1726,7 @@ test('a ledger save writes the whole ledger in pieces under 1 MiB', () => {
   records[8] = spendRecord('long-odd.jsonl', { trailing: `a${'😀'.repeat(300_000)}` });
   const expected =
     `{"workspace":${JSON.stringify(normalizeWorkspace('one'))}` +
-    `,"parserGeneration":${PROJECT_SPEND_PARSER_GENERATIONS.claude}` +
+    `,"parserGeneration":${Math.max(...Object.values(PROJECT_SPEND_PARSER_GENERATIONS))}` +
     `,"files":[${records.map((record) => JSON.stringify(record)).join(',')}]` +
     `,"displayFiles":[${records.map((_, at) => at).join(',')}]}`;
   const writes: number[] = [];
@@ -2052,6 +2052,7 @@ function malformedSpendFixture() {
       'parser state for another source kind',
       changed((record) => {
         record.parserKind = 'codex';
+        record.parserGeneration = PROJECT_SPEND_PARSER_GENERATIONS.codex;
       }),
     ],
     [
@@ -2068,6 +2069,7 @@ function malformedSpendFixture() {
       'Claude event in a Codex pending request',
       changed((record) => {
         record.parserKind = 'codex';
+        record.parserGeneration = PROJECT_SPEND_PARSER_GENERATIONS.codex;
         record.parserState = {
           ...emptyCodexUsageReducerState(),
           recentTurnIds: ['turn'],
@@ -2081,6 +2083,7 @@ function malformedSpendFixture() {
       'Codex event in a pending Claude result',
       changed((record) => {
         record.parserKind = 'codex';
+        record.parserGeneration = PROJECT_SPEND_PARSER_GENERATIONS.codex;
         record.parserState = {
           ...emptyCodexUsageReducerState(),
           pendingClaudeResultIds: ['command'],
@@ -2092,6 +2095,7 @@ function malformedSpendFixture() {
       'copied current Codex turn without copied-turn evidence',
       changed((record) => {
         record.parserKind = 'codex';
+        record.parserGeneration = PROJECT_SPEND_PARSER_GENERATIONS.codex;
         record.parserState = {
           ...emptyCodexUsageReducerState(),
           currentTurnId: 'turn',
@@ -2105,6 +2109,7 @@ function malformedSpendFixture() {
       'current Codex turn marked copied only in its identity map',
       changed((record) => {
         record.parserKind = 'codex';
+        record.parserGeneration = PROJECT_SPEND_PARSER_GENERATIONS.codex;
         record.parserState = {
           ...emptyCodexUsageReducerState(),
           currentTurnId: 'turn',
@@ -2119,6 +2124,7 @@ function malformedSpendFixture() {
       changed((record) => {
         const pending = event(1, { agent: 'codex', model: null, requestKey: 'codex:request' });
         record.parserKind = 'codex';
+        record.parserGeneration = PROJECT_SPEND_PARSER_GENERATIONS.codex;
         record.parserState = {
           ...emptyCodexUsageReducerState(),
           recentTurnIds: ['turn'],
@@ -2132,6 +2138,7 @@ function malformedSpendFixture() {
       'pending Codex request with a resolved model',
       changed((record) => {
         record.parserKind = 'codex';
+        record.parserGeneration = PROJECT_SPEND_PARSER_GENERATIONS.codex;
         record.parserState = {
           ...emptyCodexUsageReducerState(),
           recentTurnIds: ['turn'],
@@ -2146,6 +2153,7 @@ function malformedSpendFixture() {
       changed((record) => {
         const ids = Array.from({ length: CODEX_USAGE_ASSOCIATION_LIMIT + 1 }, (_, index) => `turn-${index}`);
         record.parserKind = 'codex';
+        record.parserGeneration = PROJECT_SPEND_PARSER_GENERATIONS.codex;
         record.parserState = {
           ...emptyCodexUsageReducerState(),
           recentTurnIds: ids,
@@ -2157,6 +2165,7 @@ function malformedSpendFixture() {
       'Codex retention queue that disagrees with its identity map',
       changed((record) => {
         record.parserKind = 'codex';
+        record.parserGeneration = PROJECT_SPEND_PARSER_GENERATIONS.codex;
         record.parserState = {
           ...emptyCodexUsageReducerState(),
           recentTurnIds: ['missing'],

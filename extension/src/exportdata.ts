@@ -563,6 +563,7 @@ export function projectTurn(
     });
   }
   return {
+    ...(turn.agent === 'codex' ? { nativeTurnId: hash(turn.promptId) } : {}),
     key,
     startedAt: turn.startedAt,
     endedAt: turn.endedAt,
@@ -715,6 +716,7 @@ export function projectCompaction(compaction: Compaction, key: string): ExportCo
   return {
     key,
     at: compaction.at,
+    ...(compaction.preparesTurnId === undefined ? {} : { preparesTurnId: hash(compaction.preparesTurnId) }),
     summary: compaction.summary,
     trigger: compaction.trigger,
     model: compaction.model,

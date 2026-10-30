@@ -1949,6 +1949,8 @@ test('starting worktree links stay passive in hints and activate exact pinned de
     await page.evaluate('window.__posted.length = 0');
     await page.keyboard.press('Enter');
     await link.click();
+    // Keep the pointer clear of controls exposed when the popover shrinks.
+    await page.mouse.move(0, 0);
     assert.deepEqual(await page.evaluate('window.__posted.filter(m => m.type === "openDirectory")'), [
       { type: 'openDirectory', path },
       { type: 'openDirectory', path },
@@ -1972,6 +1974,7 @@ test('starting worktree links stay passive in hints and activate exact pinned de
     await post(page, payload);
     assert.equal(await pop.locator('.sessionworktree').count(), 0);
     assert.equal(await pop.evaluate((node) => node.contains(document.activeElement)), true);
+    await page.locator('#hintpop').waitFor({ state: 'hidden' });
     await page.keyboard.press('Escape');
     await pop.waitFor({ state: 'hidden' });
     assert.equal(await heading.evaluate((node) => node === document.activeElement), true);

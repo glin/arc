@@ -10,6 +10,7 @@ import {
   PER_PASS_ITERATIONS,
   bedrockAstraRecords,
   receiptDispatchFixture,
+  codexLeadingCompactionRecords,
   claudeDispatchTranscript,
 } from './turnfixtures';
 import assert from 'node:assert/strict';
@@ -40,6 +41,17 @@ function directory(): string {
 }
 
 const defaultRoots = { codexSessions: directory(), projects: directory() };
+
+test('CLI cost identifies the same leading compaction return without a second charge', () => {
+  const { records, responseId } = codexLeadingCompactionRecords({ duplicateBill: true });
+  const file = path.join(directory(), 'rollout.jsonl');
+  fs.writeFileSync(file, records.map((row) => JSON.stringify(row)).join('\n') + '\n');
+  const requests = readSessionRequests(file, 'codex');
+  assert.equal(requests.filter((item) => item.requestKey === `codex-billing:${responseId}`).length, 1);
+  const summary = summarizeRequests(requests);
+  assert.equal(summary.cacheExpiry!.returns, 1);
+  assert.equal(summary.cacheExpiry!.byLifetime['30m'], 1);
+});
 
 beforeEach(() => {
   vi.stubEnv('ARC_HOME', directory());

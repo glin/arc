@@ -106,6 +106,7 @@ export interface UsageEvent {
   // only, and never the ordered request pass.
   compactionEstimate?: true;
   compactionUsage?: true;
+  compactionStart?: true;
   // The compaction that an estimated request stands for, in request order. The ordered pass
   // measures the next return from it.
   compactionSignal?: CompactionSignal;
@@ -521,7 +522,7 @@ export function projectSpendSaveRetryDelay(retries: number): number | null {
 // Saved source records require a rebuild when the parser generation of their agent differs.
 // Increase an agent's generation when a stored field of its records changes the conclusions consumers draw from it.
 // Increase both generations for a change that alters both agents' records.
-export const PROJECT_SPEND_PARSER_GENERATIONS: Readonly<Record<'claude' | 'codex', number>> = { claude: 66, codex: 66 };
+export const PROJECT_SPEND_PARSER_GENERATIONS: Readonly<Record<'claude' | 'codex', number>> = { claude: 66, codex: 67 };
 
 // Earlier shared generations whose records of one agent match that agent's generation.
 // Shared generation 66 changed only Codex pricing, so Claude records of generation 65 match Claude generation 66.
@@ -1109,8 +1110,9 @@ export interface CompactionFact {
   requestContextWindow: number | null;
 }
 
-// The newest primary request, reduced to what the next comparison needs. Saved with the
-// ledger so an incremental slice compares across the seam instead of starting again.
+// The newest ordinary request, reduced to what the next comparison needs.
+// A preparatory compaction updates its visible identity to exclude another return in that native turn.
+// The saved ledger preserves this comparison across incremental slices.
 export interface CacheExpiryCarry {
   requestKey: string | null;
   timestamp: number;
@@ -1152,6 +1154,16 @@ export interface CacheExpiryLedger {
   // Facts for compactions a request reached, which trailing facts pushed out of `compactions`.
   // A restored scan holds them again, because a later slice can revoke the trailing compaction.
   displacedCompactions?: CompactionFact[];
+  // Recent identified compactions keep their predecessor while billing identity is delayed.
+  compactionReturns?: CacheExpiryCompactionReturn[];
+  compactionBaseLongestGapMs?: number | null;
+}
+
+export interface CacheExpiryCompactionReturn {
+  requestKey: string;
+  ordinal: number;
+  previous: CacheExpiryCarry;
+  verdict: CacheExpiryVerdict;
 }
 
 export function emptyCacheExpiryFacts(): CacheExpiryFacts {
@@ -1282,6 +1294,7 @@ function requestBucket(event: UsageEvent): ProjectUsageBucket {
     reportedCost: event.reportedCost,
     usage: { ...structuredClone(event.usage), requests: 1 },
     requests: 1,
+    ...(event.compactionUsage ? { compactionUsage: true as const } : {}),
   };
 }
 
@@ -1355,6 +1368,8 @@ export class CacheExpiryScan {
   private carry: CacheExpiryCarry | null;
   private newestReturnKey: string | null;
   private newestCompactionKey: string | null;
+  private readonly compactionReturns: CacheExpiryCompactionReturn[];
+  private compactionBaseLongestGapMs: number | null;
 
   constructor(
     previous?: CacheExpiryLedger,
@@ -1387,11 +1402,20 @@ export class CacheExpiryScan {
     ).map((item) => ({ ...item }));
     this.newestReturnKey = restored.newestReturnKey;
     this.newestCompactionKey = restored.newestCompactionKey;
+    this.compactionReturns = structuredClone(restored.compactionReturns ?? []);
+    this.compactionBaseLongestGapMs =
+      restored.compactionBaseLongestGapMs === undefined
+        ? restored.facts.longestGapMs
+        : restored.compactionBaseLongestGapMs;
   }
 
   push(event: UsageEvent): void {
     if (event.compactionSignal) {
       this.signal(event.compactionSignal);
+    }
+    if (event.compactionUsage) {
+      this.compactionReturn(event);
+      return;
     }
     if (!primaryOrderedRequest(event)) {
       return;
@@ -1423,6 +1447,62 @@ export class CacheExpiryScan {
     this.carry = next;
   }
 
+  private compactionReturn(event: UsageEvent): void {
+    let held = this.compactionReturns.find((item) => item.requestKey === event.requestKey);
+    if (
+      !held &&
+      !this.nativeChild() &&
+      event.compactionStart &&
+      event.responseId &&
+      event.requestKey !== null &&
+      this.carry &&
+      (event.usage.requests ?? 1) > 0
+    ) {
+      held = {
+        requestKey: event.requestKey,
+        ordinal: event.compactionsBefore ?? 0,
+        previous: structuredClone(this.carry),
+        verdict: { kind: 'none' },
+      };
+      this.compactionReturns.push(held);
+      this.trimCompactionReturns();
+    }
+    if (!held) return;
+    this.removeCompactionReturn(held);
+    if ((event.usage.requests ?? 1) <= 0) return;
+    const next = carryFor(event);
+    next.compactionsBefore = held.ordinal - 1;
+    // A verified native identity survives without a visible prompt. Ordinary requests retain their prompt requirement.
+    const verdict = classifyCacheExpiry(held.previous, next, event.usage, this.nativeChild());
+    held.verdict = verdict;
+    if (verdict.kind === 'return') this.judge(held.previous, next, event);
+    // Later requests in this native turn cannot create a second primary return.
+    if (this.carry && this.carry.timestamp <= event.timestamp && next.visibleTurnId !== null)
+      this.carry.visibleTurnId = next.visibleTurnId;
+  }
+
+  private trimCompactionReturns(): void {
+    while (this.compactionReturns.length > RETAINED_COMPACTIONS) {
+      const removed = this.compactionReturns.shift()!;
+      if (removed.verdict.kind === 'return')
+        this.compactionBaseLongestGapMs = Math.max(this.compactionBaseLongestGapMs ?? 0, removed.verdict.gapMs);
+    }
+  }
+
+  private removeCompactionReturn(held: CacheExpiryCompactionReturn): void {
+    if (held.verdict.kind === 'return') {
+      this.facts.counts[held.verdict.lifetime]--;
+      const index = this.facts.returns.findIndex((item) => item.requestKey === held.requestKey);
+      if (index >= 0) this.facts.returns.splice(index, 1);
+    }
+    held.verdict = { kind: 'none' };
+    const gaps = this.compactionReturns.flatMap((item) => (item.verdict.kind === 'return' ? [item.verdict.gapMs] : []));
+    this.facts.longestGapMs =
+      this.compactionBaseLongestGapMs === null && !gaps.length
+        ? null
+        : Math.max(this.compactionBaseLongestGapMs ?? 0, ...gaps);
+  }
+
   // A compaction after the newest request moves the point the next comparison measures from.
   // The carry keeps the request, and the compaction supplies the time, the compaction count, and
   // the reusable size the comparison uses. A compaction with no usable time leaves the next pair
@@ -1437,6 +1517,19 @@ export class CacheExpiryScan {
     if (!carry || signal.ordinal <= carry.compactionsBefore) {
       return;
     }
+    if (
+      !this.nativeChild() &&
+      signal.preparatoryRequestKey &&
+      !this.compactionReturns.some((item) => item.requestKey === signal.preparatoryRequestKey)
+    ) {
+      this.compactionReturns.push({
+        requestKey: signal.preparatoryRequestKey,
+        ordinal: signal.ordinal,
+        previous: structuredClone(carry),
+        verdict: { kind: 'none' },
+      });
+      this.trimCompactionReturns();
+    }
     carry.compaction = { ordinal: signal.ordinal, at: signal.at, prefixTokens: signal.prefixTokens };
   }
 
@@ -1446,6 +1539,13 @@ export class CacheExpiryScan {
   // excluded instead of measured from the revoked compaction.
   compactionCount(count: number): void {
     this.revokeCompactions(count);
+    for (let index = this.compactionReturns.length - 1; index >= 0; index--) {
+      const held = this.compactionReturns[index];
+      if (held.ordinal > count) {
+        this.removeCompactionReturn(held);
+        this.compactionReturns.splice(index, 1);
+      }
+    }
   }
 
   // A compaction count below the carry's compaction means a later record revoked it. Revoking
@@ -1556,6 +1656,8 @@ export class CacheExpiryScan {
     this.facts.counts[verdict.lifetime]++;
     this.facts.longestGapMs =
       this.facts.longestGapMs === null ? verdict.gapMs : Math.max(this.facts.longestGapMs, verdict.gapMs);
+    if (!event.compactionUsage)
+      this.compactionBaseLongestGapMs = Math.max(this.compactionBaseLongestGapMs ?? 0, verdict.gapMs);
     this.facts.returns.push({
       timestamp: positiveClock(event.timestamp) ? event.timestamp : null,
       lifetime: verdict.lifetime,
@@ -1597,6 +1699,8 @@ export class CacheExpiryScan {
     const displaced = held.slice(0, Math.max(0, held.length + trailing.length - RETAINED_COMPACTIONS));
     const byOrdinal = new Map(recorded.map((item) => [item.ordinal, item]));
     return {
+      ...(this.compactionReturns.length ? { compactionReturns: structuredClone(this.compactionReturns) } : {}),
+      compactionBaseLongestGapMs: this.compactionBaseLongestGapMs,
       ...(displaced.length > 0 ? { displacedCompactions: displaced.map((item) => ({ ...item })) } : {}),
       facts: this.facts,
       compactions: listed.map((item) => {

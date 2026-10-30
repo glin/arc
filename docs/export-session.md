@@ -40,6 +40,8 @@ Relationship capture hashes the bytes supplied to parsing and retains admitted f
 
 [`exportsite.ts`](../extension/src/exportsite.ts) projects spooled pages through production card and compaction builders using an explicit allowlist. Shared cost builders retain captured amounts and qualifications even when category prices are unavailable. Captured usage and relationship coverage qualify affected delegated scopes. Unattributed missing usage qualifies every retained scope it can affect.
 
+Capture preserves a preparatory compaction's exact-turn placement association. Projection holds adjacent semantic pages together to place linked records before dividing rendered pages. Unrelated records retain their page's timestamp order. The [timeline placement rule](timeline.md#codex-compactions) changes no recorded clock and requires no whole-session text buffer.
+
 A dispatched contribution belongs to its first chronological launch across spooled pages. Opaque normalized file identities distinguish files during cross-session aggregation and child record selection. Display paths retain project-relative spelling. Omitted file identities qualify child artifacts separately from missing line counts.
 
 Cost parts retain linked-command invocation scope regardless of request-count uncertainty. Optional `compactionUsage` distinguishes recorded compaction usage from `estimated` usage. Absence preserves ordinary usage classification.

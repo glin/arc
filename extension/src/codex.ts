@@ -1513,6 +1513,7 @@ export interface CodexUsageReducerState {
   pendingClaudeResults: Record<string, UsageEvent>;
   closedTurns: number;
   currentTurnDidSomething: boolean;
+  currentTurnDidOrdinaryWork?: boolean;
   currentTurnCompleted: boolean;
   // How many `compacted` records this rollout has held.
   compactionCount: number;
@@ -2341,10 +2342,11 @@ function reduceCodexUsageEventsInner(state: CodexUsageReducerState, record: Code
     event.model = held.requestModel;
     event.provider = held.requestProvider;
     event.serviceTier = held.requestServiceTier;
+    const turnId = event.visibleTurnId?.replace(/^codex-turn:/, '') ?? '';
+    event.effort = str(settings.reasoning_effort) ?? state.turnEfforts[turnId] ?? state.reasoningEffort;
     event.inferenceClass = event.provider === 'amazon-bedrock' ? bedrockInferenceClass(event.model) : null;
     event.contextBand = contextBandForRequest(event.model, event.provider, requestInputTokens(event.usage));
     if (event.model && held.responseId) delete event.incomplete;
-    const turnId = event.visibleTurnId?.replace(/^codex-turn:/, '') ?? '';
     if (state.pendingOwnership[turnId]) return [];
     return pending ? [releasePendingRequest(state, key)!] : [removeCodexRequest(emitted!), event];
   }
@@ -2366,6 +2368,7 @@ function reduceCodexUsageEventsInner(state: CodexUsageReducerState, record: Code
     }
     beginCodexTurn(state, payload, record.sourceStart);
     state.currentTurnDidSomething = false;
+    state.currentTurnDidOrdinaryWork = false;
     state.currentTurnCompleted = false;
     // A copied or replayed turn is not a new last turn. Its start and end are left alone so
     // the most recent real turn keeps standing for the session's span.
@@ -2412,7 +2415,7 @@ function reduceCodexUsageEventsInner(state: CodexUsageReducerState, record: Code
         trigger: codexCompactionTrigger(
           state.currentTurnId !== null,
           state.currentTurnCopied,
-          state.currentTurnDidSomething,
+          state.currentTurnDidOrdinaryWork === true,
         ),
         requestUsage,
         requestModel: turnId ? (state.turnModels[turnId] ?? null) : null,
@@ -2499,6 +2502,10 @@ function reduceCodexUsageEventsInner(state: CodexUsageReducerState, record: Code
           reportedCost: null,
           visibleTurnId: turnId ? `codex-turn:${turnId}` : null,
           compactionUsage: true,
+          effort: (turnId ? state.turnEfforts[turnId] : null) ?? state.reasoningEffort,
+          ...(!state.currentTurnDidOrdinaryWork && turnId && state.currentTurnStartedAt !== null
+            ? { compactionStart: true as const }
+            : {}),
           incomplete: true,
           compactionsBefore: state.compactionCount,
           usage: requestUsage,
@@ -2522,6 +2529,7 @@ function reduceCodexUsageEventsInner(state: CodexUsageReducerState, record: Code
           reportedCost: null,
           visibleTurnId: turnId ? `codex-turn:${turnId}` : null,
           compactionUsage: true,
+          effort: (turnId ? state.turnEfforts[turnId] : null) ?? state.reasoningEffort,
           incomplete: true,
           requestCountExact: false,
           usage: { ...emptyUsage(), requests: 1 },
@@ -2553,6 +2561,13 @@ function reduceCodexUsageEventsInner(state: CodexUsageReducerState, record: Code
     }
     if (!state.currentTurnCopied && codexTurnRecordDidSomething(entry, state.agentPath)) {
       state.currentTurnDidSomething = true;
+      state.currentTurnDidOrdinaryWork = true;
+    }
+    if (state.currentTurnCompleted && !state.currentTurnCopied && !state.currentTurnDidOrdinaryWork) {
+      const ordinals = state.compactionTurnOrdinals[state.currentTurnId] ?? [];
+      for (const compaction of state.recentCompactions) {
+        if (!compaction.trigger && ordinals.includes(compaction.ordinal)) compaction.trigger = 'manual';
+      }
     }
     if ((!state.currentTurnCopied || state.pendingOwnership[state.currentTurnId]) && state.currentTurnOutcome) {
       if (
@@ -2966,6 +2981,7 @@ export function createCodexUsageLineReducer(restored?: CodexUsageReducerState): 
         turnEfforts: JSON.parse(JSON.stringify(restored.turnEfforts ?? {})) as Record<string, string | null>,
         closedTurns: restored.closedTurns ?? 0,
         currentTurnDidSomething: restored.currentTurnDidSomething,
+        currentTurnDidOrdinaryWork: restored.currentTurnDidOrdinaryWork === true,
         currentTurnCompleted: restored.currentTurnCompleted,
         compactionCount: restored.compactionCount ?? 0,
         recentCompactions: (restored.recentCompactions ?? []).map((item) => ({ ...item })),
@@ -2998,7 +3014,15 @@ export function createCodexUsageLineReducer(restored?: CodexUsageReducerState): 
       if (state.compactionCount > compactionsBefore) {
         for (const item of state.recentCompactions) {
           if (item.ordinal > compactionsBefore) {
-            signals.push({ ordinal: item.ordinal, at: item.at, prefixTokens: null });
+            const request = [...events, ...Object.values(state.pendingRequests).flat()].find(
+              (event) => event.compactionStart && event.responseId === item.responseId,
+            );
+            signals.push({
+              ordinal: item.ordinal,
+              at: item.at,
+              prefixTokens: null,
+              ...(request ? { preparatoryRequestKey: request.requestKey } : {}),
+            });
           }
         }
         signals.splice(0, Math.max(0, signals.length - RETAINED_COMPACTIONS));
@@ -5838,7 +5862,7 @@ function codexCompactionTrigger(
   if (!turnStarted || turnCopied) {
     return '';
   }
-  return turnDidSomething ? 'auto' : 'manual';
+  return turnDidSomething ? 'auto' : '';
 }
 
 interface CodexNewestBoundaryState {
@@ -5976,7 +6000,7 @@ export function discoverCodexNewestTurn(
 }
 
 export interface CodexSessionParserState {
-  version: 27;
+  version: 29;
   // Text that subagents returned into this session's context.
   subagents: SubagentContextState;
   responseClock: CodexResponseClock;
@@ -5986,6 +6010,7 @@ export interface CodexSessionParserState {
   compactions: Compaction[];
   compactionRanges: Array<{ start: number; end: number }>;
   compactionTurnIds: Array<string | null>;
+  compactionsByTurn: Map<string, Compaction[]>;
   compactionValueSources: Array<{
     context: { start: number; end: number } | null;
     model: { start: number; end: number } | null;
@@ -6067,7 +6092,7 @@ function emptyCodexSessionParserState(meta: CodexSessionMeta | null): CodexSessi
   const replayBoundaryAt = meta?.replayBoundaryAt ?? null;
   const openingSessionId = meta?.sessionId ?? null;
   return {
-    version: 27,
+    version: 29,
     subagents: emptySubagentContext(),
     responseClock: emptyCodexResponseClock(),
     turns: [],
@@ -6076,6 +6101,7 @@ function emptyCodexSessionParserState(meta: CodexSessionMeta | null): CodexSessi
     compactions: [],
     compactionRanges: [],
     compactionTurnIds: [],
+    compactionsByTurn: new Map(),
     compactionValueSources: [],
     pendingCompactionBilling: null,
     turnLimitReached: false,
@@ -6252,6 +6278,17 @@ function retractPendingCodexTurn(state: CodexSessionParserState, id: string): bo
   return true;
 }
 
+function reindexCodexCompactions(state: CodexSessionParserState): void {
+  state.compactionsByTurn.clear();
+  for (let index = 0; index < state.compactions.length; index++) {
+    const id = state.compactionTurnIds[index];
+    if (!id) continue;
+    const associated = state.compactionsByTurn.get(id) ?? [];
+    associated.push(state.compactions[index]);
+    state.compactionsByTurn.set(id, associated);
+  }
+}
+
 function retractCopiedCodexCompactions(state: CodexSessionParserState, id: string): void {
   const removed = new Set<number>();
   const kept = state.compactions
@@ -6271,6 +6308,7 @@ function retractCopiedCodexCompactions(state: CodexSessionParserState, id: strin
   state.compactionRanges = kept.map(({ index }) => state.compactionRanges[index]);
   state.compactionTurnIds = kept.map(({ index }) => state.compactionTurnIds[index]);
   state.compactionValueSources = kept.map(({ index }) => state.compactionValueSources[index]);
+  reindexCodexCompactions(state);
   if (latestWasRemoved) {
     state.pendingCompactionBilling = null;
   }
@@ -6325,6 +6363,7 @@ function boundCodexTurns(state: CodexSessionParserState, maxTurns: number): void
     state.compactionRanges.splice(0, count);
     state.compactionTurnIds.splice(0, count);
     state.compactionValueSources.splice(0, count);
+    reindexCodexCompactions(state);
   }
   compactCodexAssociations(state, maxTurns);
 }
@@ -6419,6 +6458,7 @@ function trimCodexBefore(state: CodexSessionParserState, offset: number, maxTurn
   state.compactionRanges = compactions.map(({ range }) => range);
   state.compactionTurnIds = compactions.map(({ turnId }) => turnId);
   state.compactionValueSources = compactions.map(({ valueSources }) => valueSources);
+  reindexCodexCompactions(state);
   for (const [id, context] of state.contexts) {
     if (context.start < offset) {
       state.contexts.delete(id);
@@ -6961,7 +7001,7 @@ function reduceCodexSessionLine(
       trigger: codexCompactionTrigger(
         state.usageState.currentTurnId !== null,
         state.usageState.currentTurnCopied,
-        state.usageState.currentTurnDidSomething,
+        state.usageState.currentTurnDidOrdinaryWork === true,
       ),
       model: exactUsage ? null : model,
       summary: '',
@@ -6985,6 +7025,11 @@ function reduceCodexSessionLine(
     });
     state.compactionRanges.push({ start: sourceStart, end: sourceEnd });
     state.compactionTurnIds.push(state.usageState.currentTurnId);
+    if (turnId) {
+      const associated = state.compactionsByTurn.get(turnId) ?? [];
+      associated.push(state.compactions.at(-1)!);
+      state.compactionsByTurn.set(turnId, associated);
+    }
     state.compactionValueSources.push({
       context: exactUsage
         ? { start: sourceStart, end: sourceEnd }
@@ -7042,6 +7087,16 @@ function reduceCodexSessionLine(
 
   if (kind === 'task_complete' || kind === 'turn_aborted') {
     state.pendingCompactionBilling = null;
+    if (
+      state.usageState.currentTurnId !== null &&
+      state.usageState.currentTurnStartedAt !== null &&
+      !state.usageState.currentTurnCopied &&
+      !state.usageState.currentTurnDidOrdinaryWork
+    ) {
+      for (const compaction of state.compactionsByTurn.get(state.usageState.currentTurnId) ?? []) {
+        if (!compaction.trigger) compaction.trigger = 'manual';
+      }
+    }
   }
   if (!state.open) {
     releaseUsageSources();
@@ -7100,6 +7155,9 @@ function reduceCodexSessionLine(
         }
         if (!turn.prompt) {
           turn.prompt = asked;
+          for (const compaction of state.compactionsByTurn.get(turn.promptId) ?? []) {
+            if (!compaction.trigger) compaction.preparesTurnId = turn.promptId;
+          }
           break;
         }
         turn.laterPrompts.push({ text: asked, at, stepsBefore: turn.stepCount });
@@ -7866,7 +7924,7 @@ export function createCodexSessionReducer(
   restored?: CodexSessionParserState,
 ): CodexSessionReducer {
   const state = restored ? cloneParserState(restored) : emptyCodexSessionParserState(meta);
-  if (state.version !== 27) {
+  if (state.version !== 29) {
     throw new Error('Incompatible Codex parser state');
   }
   applyHiddenParserState(codexHiddenSlots(state), state.hidden, CODEX_HIDDEN_POLICY);

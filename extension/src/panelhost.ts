@@ -221,6 +221,7 @@ import {
   toCard,
   commitRowsOf,
   toCompactionCard,
+  orderTimelineEntries,
   groupBySession,
   newestPerSession,
   currentRecordsBySession,
@@ -15678,10 +15679,14 @@ export class PanelProvider implements vscode.Disposable {
       const card = toCompactionCard(c, now);
       // Compaction cards also carry the session title used by grouping.
       card.sessionTitle = titleOf(c.sessionId);
-      cards.push({ ...card, summaryHtml: renderRichMarkdown(c.summary), at: c.at });
+      cards.push({
+        ...card,
+        summaryHtml: renderRichMarkdown(c.summary),
+        at: c.at,
+        preparesTurnId: c.preparesTurnId,
+      });
     }
-    cards.sort((a, b) => b.at - a.at);
-    return groupBySession(cards);
+    return groupBySession(orderTimelineEntries(cards));
   }
 
   // The turn cards of the listed turns. The newest turn of each session is its latest card.
@@ -15690,7 +15695,7 @@ export class PanelProvider implements vscode.Disposable {
     titleOf: (sessionId: string) => string,
     now: number,
     folders: string[],
-  ): (RenderCard & { at: number })[] {
+  ): (RenderCard & { at: number; turnId?: string; preparesTurnId?: string })[] {
     const newestOf = newestPerSession(listed);
     // Include live background children on launching cards and carried children on each session's newest card.
     const runningSessions = this.runningSessions();
@@ -15721,7 +15726,7 @@ export class PanelProvider implements vscode.Disposable {
         cacheExpiryFacts,
         childCosts,
       );
-      return { ...card, at: recordedTurn.startedAt };
+      return { ...card, at: recordedTurn.startedAt, turnId: recordedTurn.promptId };
     });
   }
 

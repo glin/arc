@@ -102,4 +102,8 @@ A kept compaction's first prompt can name `compactMetadata.preservedSegment.tail
 
 The timeline retains readable summaries independently of usage revocation. Compactions remain ordered boundaries among turns. Readable carried-over text stays collapsed. An encrypted replacement without a recorded size remains unreadable with unknown size. A boundary without a body stays visible without an expansion control.
 
-Codex infers an automatic compaction only from normal work in an active non-replayed turn. A known empty dedicated turn implies manual compaction. A missing start or replay leaves the reason unknown. Context size establishes no trigger. [Accounting](accounting.md#accounting-contracts) owns compaction request usage and context figures.
+### Codex compactions
+
+Codex trigger classification follows [Provider operations](session-compaction.md#provider-operations). [Accounting](accounting.md#accounting-contracts) owns compaction request usage and context figures.
+
+A Codex compaction recorded before its native turn's first prompt carries that turn's exact identity as a placement association. In newest-first order, the turn appears above its preparatory compaction. Compactions during ordinary work keep timestamp order. Missing membership supplies no placement association. Recorded clocks, durations, card keys, read state, and comment anchors retain their own values. `orderTimelineEntries` in [`turncard.ts`](../extension/src/turncard.ts) applies this rule to the panel and saved-session HTML.

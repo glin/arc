@@ -98,7 +98,7 @@ Paths are relative to `extension/src/`. [Architecture](architecture.md) owns pac
 | `history.ts` | Exact-revision history cursors, semantic pages, transactional forward checkpoints, and opt-in metadata recovery slices with live source reduction and resumable payload accounting | no |
 | `exportlimits.ts` | Admission limits and typed failures for explicit saved-session captures | no |
 | `exportdata.ts` | Workspace-independent source identities, reachable session relationships, complete semantic pages, provider-owned saved names, allowlisted numeric facts, and graph revision checks | no |
-| `exportsite.ts` | Bounded card, full-text and numeric projection through production builders, inert Markdown and relative script assets | no |
+| `exportsite.ts` | Bounded card, full-text and numeric projection through production builders, linked compaction placement across adjacent semantic pages, inert Markdown and relative script assets | no |
 | `sessionexport.ts` | Saved-source admission, native export sequence through injected ports, packaged asset projection and completion outcomes | no |
 | `exportassets.ts` | Reads packaged static viewer assets from the installed extension directory | no |
 | `exportwriter.ts` | Generated assets, page spools, exclusive directory publication, cancellation, and ownership-checked cleanup | no |
@@ -107,7 +107,7 @@ Paths are relative to `extension/src/`. [Architecture](architecture.md) owns pac
 | `codexhistory.ts` | Codex semantic-page and forward-checkpoint adapter, bounded display-model recovery, and bounded raw parent/child commit ownership coverage | no |
 | `historypages.ts` | Per-session older-history pages, completed turns displaced from an accepted selected window, their retention budget, and end-of-list control | no |
 | `turnview.ts` | Saved panel state, parse budgets, list selection, empty states, and re-exports | no |
-| `turncard.ts` | Reduces a turn to the card the panel draws, merging each child's recorded files and commits into the card's own rows with the child's session, naming each commit's repository and branch, and re-exports shared card-menu projections | no |
+| `turncard.ts` | Reduces a turn to the card the panel draws, places linked preparatory compactions, merges each child's recorded files and commits into the card's own rows with the child's session, names each commit's repository and branch, and re-exports shared card-menu projections | no |
 | `turncomments.ts` | Normalizes, stores, and emits comments, then re-exports shared comment rules | no |
 | `turnread.ts` | Owns unread counts, completed identity mapping admission, retained-tail decisions, and current records for each session, then re-exports shared read rules | no |
 | `turnrail.ts` | Host session rows and ordering, the session that started each dispatched or subagent row, and re-exports of shared session list projections | no |

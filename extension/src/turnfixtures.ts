@@ -21,6 +21,103 @@ import {
 } from './transcript.ts';
 import { type GitRunner, IDENTITY_ARGS, exactCommitArgs } from './gitcommits.ts';
 
+// A native compaction completes before Codex records the prompt it prepares.
+export function codexLeadingCompactionRecords(
+  options: { prompt?: boolean; gapMinutes?: number; snapshotBeforeCompaction?: boolean; duplicateBill?: boolean } = {},
+) {
+  const id = 'leading-compaction-session';
+  const turnId = 'leading-compaction-turn';
+  const start = Date.parse('2026-10-29T21:14:00Z');
+  const returned = start + (options.gapMinutes ?? 364) * 60_000 + 23_000;
+  const row = (type: string, at: number, payload: Record<string, unknown>) => ({
+    type,
+    timestamp: new Date(at).toISOString(),
+    payload,
+  });
+  const event = (type: string, at: number, payload: Record<string, unknown> = {}) =>
+    row('event_msg', at, { type, ...payload });
+  const usage = (input: number, cached: number, output: number) => ({
+    input_tokens: input,
+    cached_input_tokens: cached,
+    output_tokens: output,
+    cache_write_input_tokens: 0,
+    reasoning_output_tokens: 0,
+    total_tokens: input + output,
+  });
+  const bill = (at: number, turn: string, response: string, value: ReturnType<typeof usage>) =>
+    row('token_usage_record', at, { thread_id: id, turn_id: turn, response_id: response, usage: value });
+  const settings = (at: number) =>
+    event('thread_settings_applied', at, {
+      thread_settings: {
+        model: 'gpt-6.1-sol',
+        model_provider_id: 'openai',
+        service_tier: 'priority',
+        reasoning_effort: 'xhigh',
+      },
+    });
+  const context = (at: number, turn: string) =>
+    row('turn_context', at, {
+      turn_id: turn,
+      model: 'gpt-6.1-sol',
+      effort: 'xhigh',
+      current_date: '2026-10-29',
+    });
+  const snapshot = (at: number, value: ReturnType<typeof usage>, total = value) =>
+    event('token_count', at, {
+      info: { last_token_usage: value, total_token_usage: total, model_context_window: 1_050_000 },
+    });
+  const prior = usage(360_000, 350_000, 100);
+  const compact = usage(367_579, 8_320, 4_388);
+  const response = { thread_id: id, turn_id: turnId, response_id: 'leading-compaction-response', usage: compact };
+  const prompt = row('response_item', returned + 725, {
+    type: 'message',
+    role: 'user',
+    content: [{ type: 'input_text', text: '/close-session ?' }],
+  });
+  const records = [
+    row('session_meta', start, { id, cwd: '/fixture', source: 'vscode', model_provider: 'openai' }),
+    event('task_started', start + 1, { turn_id: 'previous' }),
+    context(start + 2, 'previous'),
+    settings(start + 3),
+    event('user_message', start + 4, { message: 'finish the earlier work' }),
+    bill(start + 1_000, 'previous', 'previous-response', prior),
+    snapshot(start + 1_001, prior),
+    event('task_complete', start + 2_000, { turn_id: 'previous', last_agent_message: 'Complete.' }),
+    event('task_started', returned - 57_600, { turn_id: turnId, model_context_window: 475_000 }),
+    bill(returned + 644, turnId, response.response_id, compact),
+    ...(options.snapshotBeforeCompaction ? [snapshot(returned + 645, compact, usage(727_579, 358_320, 4_488))] : []),
+    row('compacted', returned + 657, {
+      compaction_response_id: response.response_id,
+      latest_token_usage_record: response,
+      replacement_history: [],
+    }),
+    context(returned + 658, turnId),
+    settings(returned + 659),
+    ...(options.duplicateBill ? [bill(returned + 660, turnId, response.response_id, compact)] : []),
+    event('item_completed', returned + 678, {
+      turn_id: turnId,
+      item: { type: 'ContextCompaction', status: 'completed' },
+    }),
+    ...(options.prompt === false
+      ? []
+      : [
+          prompt,
+          row('response_item', returned + 4_000, {
+            type: 'message',
+            role: 'assistant',
+            phase: 'commentary',
+            content: [{ type: 'output_text', text: 'Closing the session.' }],
+          }),
+          snapshot(returned + 5_000, usage(30_000, 29_000, 50), usage(390_000, 379_000, 150)),
+        ]),
+    event('task_complete', returned + 63_000, {
+      turn_id: turnId,
+      last_agent_message: options.prompt === false ? '' : 'Closed.',
+    }),
+  ];
+  return { id, turnId, responseId: response.response_id, records, promptAt: returned + 725, compactAt: returned + 657 };
+}
+
 export function receiptDispatchFixture(root: string, parentAgent: 'claude' | 'codex', childAgent: 'claude' | 'codex') {
   const home = path.join(root, 'arc');
   const projects = path.join(root, 'projects');

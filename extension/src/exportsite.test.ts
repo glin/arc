@@ -21,6 +21,53 @@ import { costPartOf, costPartsOf, projectTurn, projectCompaction } from './expor
 import { railBuckets } from './view/rail';
 import { createClaudeSessionReducer } from './transcript';
 import { createCodexSessionReducer } from './codex';
+import { readCodexSession } from './codex';
+import { codexLeadingCompactionRecords } from './turnfixtures';
+
+test('a leading compaction follows its prompt across semantic and rendered page boundaries', async () => {
+  const folder = tempDir('leading-export-');
+  const source = path.join(folder, 'rollout.jsonl');
+  const fixture = codexLeadingCompactionRecords();
+  await fs.writeFile(source, fixture.records.map((row) => JSON.stringify(row)).join('\n') + '\n');
+  const parsed = readCodexSession(source, fixture.id);
+  const writer = await ExportTransaction.create(folder);
+  try {
+    const model = await sessionSiteFixture(writer);
+    const session = model.sessions[0];
+    const prepared = parsed.turns.find((value) => value.promptId === fixture.turnId)!;
+    session.agent = 'codex';
+    const projected = projectTurn(prepared, 'prepared', { cwd: '/fixture' }, [], session.key, new Map());
+    const compact = projectCompaction(parsed.compactions[0], 'preparatory');
+    const newer = Array.from({ length: 19 }, (_, index) =>
+      projectTurn(
+        turn({
+          startedAt: prepared.startedAt + (index + 1) * 100_000,
+          endedAt: prepared.startedAt + (index + 1) * 100_000 + 1,
+          prompt: 'Later work',
+        }),
+        `later-${index}`,
+        {},
+        [],
+        session.key,
+        new Map(),
+      ),
+    );
+    session.pages = [
+      await writer.spool({ key: 'newer', session: session.key, turns: newer, compactions: [compact] }),
+      await writer.spool({ key: 'older', session: session.key, turns: [projected], compactions: [] }),
+    ];
+    await projectSessionSite(model, writer, { script: '', stylesheet: '' });
+    const { manifest, data } = exportedSiteData((await writer.publish(async () => {})).directory);
+    const pages = manifest.sessions[0].pages;
+    assert.equal(pages[0].keys.at(-1), 'prepared');
+    assert.equal(pages[1].keys[0], 'preparatory');
+    const boundary = (data.get(pages[1].cards![0].id) as { card: CardView }).card;
+    assert.equal(boundary.at, fixture.compactAt);
+    assert.ok(boundary.headline.startsWith('Compacted.'));
+  } finally {
+    await writer.dispose();
+  }
+});
 import { AgentRow, agentFigureRecord, DetailRowList, detailRowsFor } from './webview/card-rows';
 import { StaticStatChip } from './webview/stat-chip';
 import type { StatDetailList, StatDetailRenderer } from './webview/stat-detail';

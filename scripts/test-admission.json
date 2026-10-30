@@ -55,14 +55,14 @@
     "matricesSha256": "7233dd3ad393a62ecbd4ba987f2c6c489196504ddb484835419dcff9134eb053"
   },
   "extension/src/codex.test.ts": {
-    "reason": "Real Git worktree ownership and descendant source resolution must agree with recorded Codex session relationships. Terra provider coverage adds in-process request fixtures without additional subprocesses. Compressed rollout names use filesystem fixtures without additional subprocesses.",
-    "cases": 497,
-    "matricesSha256": "63f12ccc3ad11547d4d85004cb3cf4eb730b1826b18797491a7b3ea8398721b4"
+    "reason": "Real Git worktree ownership and descendant source resolution must agree with recorded Codex session relationships. Terra provider coverage adds in-process request fixtures without additional subprocesses. Compressed rollout names use filesystem fixtures without additional subprocesses. Compaction ownership and retention fixtures use in-process reducers and existing source fixtures.",
+    "cases": 501,
+    "matricesSha256": "09f07c16b6c3417487824407e3e20281bb71c5950b0aa400d63edfdda785157a"
   },
   "extension/src/derivedcache.test.ts": {
     "reason": "Independent writers and host death must preserve shared cache rows and release stale filesystem locks. Terra generation recovery adds in-process provider fixtures without additional writers. Agent generation migration reads a previous cache file beside the current file and keeps the previous file for rollback.",
     "cases": 93,
-    "matricesSha256": "b8d58c602ba69b1027c545508d4d478da468f4d973f5013617624d91c7f02e7b"
+    "matricesSha256": "d3e3cb37a6e07a21f5312002aed5396d5f3117d29a2e23bc8fb71320fd1a547c"
   },
   "extension/src/exportsite.browser.test.ts": {
     "reason": "An offline exported session must retain interactive navigation and safe local browser behavior.",
@@ -70,9 +70,9 @@
     "matricesSha256": "1729f86a1bedd916432b1d5b354c73bd38b81022bf6d2c2d02bee50398f938ef"
   },
   "extension/src/exportsite.test.ts": {
-    "reason": "The production export bundle must retain complete responses and remove host-only actions from portable output.",
-    "cases": 38,
-    "matricesSha256": "43b11f359ed8da51a947e3a606ad8daff10aab1ad88da95f870043fe6dc46b4e"
+    "reason": "The production export bundle must retain complete responses and remove host-only actions from portable output. Preparatory compaction pagination uses the existing export bundle.",
+    "cases": 39,
+    "matricesSha256": "ea733bb17fcb7aebcdc5cacba0c0a0d2a39178fb8125604ed1211c7f44fea087"
   },
   "extension/src/gitcommits.test.ts": {
     "reason": "A real fast-forward must retain its reflog details. Verified foreign child commits must retain their repository across cache reload and worktree removal. A removed commit directory must open only in a containing repository that holds the commit.",

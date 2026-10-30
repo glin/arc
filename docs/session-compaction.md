@@ -10,7 +10,7 @@ Codex uses `thread/compact/start` on the established thread. Literal `/compact` 
 
 Track active compaction items separately from roots containing them. Completed automatic compaction preserves ordinary root-ending attribution and permits live input in that root. Manual and unresolved compaction block live input.
 
-Codex rollout compaction usage comes only from `latest_token_usage_record.usage`, with optional model and billing route from the following `thread_settings_applied`. Never derive it from cumulative counters. Codex records no trigger. Non-replayed ordinary work before the boundary indicates automatic compaction. A known empty dedicated turn indicates manual compaction. Incomplete starts stay unknown. Context size supplies no trigger evidence.
+Codex rollout compaction usage comes only from `latest_token_usage_record.usage`, with optional model and billing route from the following `thread_settings_applied`. Never derive it from cumulative counters. Codex records no trigger. Non-replayed ordinary work before the boundary indicates automatic compaction. A completed dedicated turn without ordinary work indicates manual compaction. Work recorded only after the boundary leaves the trigger unknown. Open turns and missing starts stay unknown. Billing records and context size supply no trigger evidence.
 
 ## Codex compaction receipts
 

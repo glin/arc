@@ -535,6 +535,8 @@ export interface UsageEvent {
   // estimates it and marks it here. It is never one of the ordered primary requests.
   compactionEstimate?: true;
   compactionUsage?: true;
+  // Exact compaction usage before ordinary work in an owned native turn with a recorded start.
+  compactionStart?: true;
   // The compaction that the estimated request stands for, which the ordered pass measures the
   // next cache-expiry return from.
   compactionSignal?: CompactionSignal;
@@ -557,6 +559,8 @@ export interface CompactionSignal {
   // The cached prefix the compaction left, in tokens. Null where no record establishes it
   // before the first request after the compaction.
   prefixTokens: number | null;
+  // A preparatory Codex response whose billing or ownership identity can resolve later.
+  preparatoryRequestKey?: string;
 }
 
 // Compaction fact in source order, with an explicit ordinal independent of its timestamp.
@@ -1087,12 +1091,14 @@ export interface Compaction {
   retainedContext?: { tokens: number; window: number | null };
   droppedTokens: number; // cumulative across the session, 0 if unknown
   durationMs: number; // how long the summarising call took, 0 if unknown
-  trigger: string; // 'manual' when asked for, 'auto' when the context ran out
+  trigger: string; // 'manual', 'auto', another recorded trigger, or '' when unknown
   model: string | null; // the model that ran, for pricing the summarising call
   summary: string; // the summary that carried over, as markdown
   // Compaction request usage when recorded. Claude records none.
   usage?: TurnUsage;
   responseId?: string;
+  // A prompt in the same native turn follows this boundary in source order.
+  preparesTurnId?: string;
   postCompactionCacheRead?: number | null;
   provider?: string | null;
   contextWindow?: number | null;

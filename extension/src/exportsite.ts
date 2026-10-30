@@ -22,6 +22,7 @@ import {
 import {
   toCard,
   toCompactionCard,
+  orderTimelineEntries,
   sessionStats,
   sessionCostProjection,
   dispatchedAgentCard,
@@ -659,6 +660,7 @@ function exportCompaction(
   const compaction: Compaction = {
     sessionId: session,
     at: value.at,
+    ...(value.preparesTurnId === undefined ? {} : { preparesTurnId: value.preparesTurnId }),
     summary: value.summary,
     trigger: value.trigger,
     model: value.model,
@@ -706,6 +708,52 @@ function compactionCard(
   return card;
 }
 
+type ExportTimelineEntry = {
+  sessionId: string;
+  at: number;
+  turnId?: string;
+  preparesTurnId?: string;
+} & ({ turn: ExportTurn } | { compaction: ExportCompaction });
+
+// One-page lookahead carries linked boundaries across adjacent semantic pages.
+// Rendered page admission happens after this order is established.
+async function* orderedExportEntries(
+  session: SessionExport['sessions'][number],
+  writer: ExportTransaction,
+): AsyncGenerator<ExportTimelineEntry> {
+  let pending: ExportTimelineEntry[] = [];
+  for (const spool of session.pages) {
+    checkExportCancellation(writer.signal);
+    const page = await writer.readSpool<ExportPage>(spool);
+    const current: ExportTimelineEntry[] = [
+      ...page.turns.map((turn) => ({
+        sessionId: session.key,
+        at: turn.startedAt,
+        turnId: turn.nativeTurnId,
+        turn,
+      })),
+      ...page.compactions.map((compaction) => ({
+        sessionId: session.key,
+        at: compaction.at,
+        preparesTurnId: compaction.preparesTurnId,
+        compaction,
+      })),
+    ];
+    const pendingTurns = new Set(pending.map((entry) => entry.turnId).filter((at) => at !== undefined));
+    const currentTurns = new Set(current.map((entry) => entry.turnId).filter((at) => at !== undefined));
+    const toCurrent = pending.filter(
+      (entry) => entry.preparesTurnId !== undefined && currentTurns.has(entry.preparesTurnId),
+    );
+    const toPending = current.filter(
+      (entry) => entry.preparesTurnId !== undefined && pendingTurns.has(entry.preparesTurnId),
+    );
+    const moved = new Set([...toCurrent, ...toPending]);
+    yield* orderTimelineEntries([...pending.filter((entry) => !moved.has(entry)), ...toPending]);
+    pending = orderTimelineEntries([...current.filter((entry) => !moved.has(entry)), ...toCurrent]);
+  }
+  yield* pending;
+}
+
 export async function projectSessionSite(
   model: SessionExport,
   writer: ExportTransaction,
@@ -742,168 +790,157 @@ export async function projectSessionSite(
         keys = [];
         bytes = 0;
       };
-      for (const spool of session.pages) {
-        checkExportCancellation(writer.signal);
-        const page = await writer.readSpool<ExportPage>(spool);
-        const entries = [
-          ...page.turns.map((turn) => ({ at: turn.startedAt, turn })),
-          ...page.compactions.map((compaction) => ({ at: compaction.at, compaction })),
-        ].sort((a, b) => b.at - a.at);
-        for (const entry of entries) {
-          const restored = 'turn' in entry ? exportTurn(entry.turn, session.agent, session.key) : null;
-          const dispatched: DispatchedTurnCost[] = [];
-          if (restored && 'turn' in entry) {
-            for (const edge of model.relationships.filter((edge) => entry.turn.relationships.includes(edge.key))) {
-              const facts = edge.to ? childFacts.get(edge.to) : undefined;
-              const target = edge.to ? sources.get(edge.to) : undefined;
-              if (!facts || !target) continue;
-              const existing = entry.turn.agents.findIndex((agent) => agent.relationships?.includes(edge.key));
-              // Graph keys keep printed Claude costs matched to their included child.
-              if (existing >= 0) restored.agents[existing].id = edge.to;
-              if (edge.kind === 'subagent' && existing >= 0) {
-                const agent = restored.agents[existing];
-                agent.spend = facts.spend.models;
-                agent.spendFound = true;
-                agent.spendPartial = facts.spend.partial;
-                agent.ownModel = facts.spend.ownModel ?? undefined;
-                agent.artifacts = facts.spend.artifacts
-                  ? {
-                      ...facts.spend.artifacts,
-                      complete: facts.spend.artifacts.complete && agent.artifacts?.complete !== false,
-                    }
-                  : undefined;
-                agent.commits = facts.spend.commits;
-                agent.outputRate = facts.spend.outputRate;
-                agent.outputRateModel = facts.spend.outputRateModel;
-                agent.effort ??= facts.spend.effort;
-                agent.startedAt ??= facts.spend.artifacts?.startedAt ?? null;
-                agent.toolUses ??= childToolCalls(facts.spend.artifacts);
-                if (['running', 'async_launched', 'launched'].includes(agent.status) && facts.state !== 'open')
-                  agent.status = facts.state === 'done' ? 'completed' : facts.state;
-                if (
-                  agent.durationMs === null &&
-                  facts.state !== 'open' &&
-                  facts.spend.artifacts?.startedAt != null &&
-                  facts.spend.artifacts?.endedAt != null
-                )
-                  agent.durationMs = Math.max(0, facts.spend.artifacts.endedAt - facts.spend.artifacts.startedAt);
-              }
+      for await (const entry of orderedExportEntries(session, writer)) {
+        const restored = 'turn' in entry ? exportTurn(entry.turn, session.agent, session.key) : null;
+        const dispatched: DispatchedTurnCost[] = [];
+        if (restored && 'turn' in entry) {
+          for (const edge of model.relationships.filter((edge) => entry.turn.relationships.includes(edge.key))) {
+            const facts = edge.to ? childFacts.get(edge.to) : undefined;
+            const target = edge.to ? sources.get(edge.to) : undefined;
+            if (!facts || !target) continue;
+            const existing = entry.turn.agents.findIndex((agent) => agent.relationships?.includes(edge.key));
+            // Graph keys keep printed Claude costs matched to their included child.
+            if (existing >= 0) restored.agents[existing].id = edge.to;
+            if (edge.kind === 'subagent' && existing >= 0) {
+              const agent = restored.agents[existing];
+              agent.spend = facts.spend.models;
+              agent.spendFound = true;
+              agent.spendPartial = facts.spend.partial;
+              agent.ownModel = facts.spend.ownModel ?? undefined;
+              agent.artifacts = facts.spend.artifacts
+                ? {
+                    ...facts.spend.artifacts,
+                    complete: facts.spend.artifacts.complete && agent.artifacts?.complete !== false,
+                  }
+                : undefined;
+              agent.commits = facts.spend.commits;
+              agent.outputRate = facts.spend.outputRate;
+              agent.outputRateModel = facts.spend.outputRateModel;
+              agent.effort ??= facts.spend.effort;
+              agent.startedAt ??= facts.spend.artifacts?.startedAt ?? null;
+              agent.toolUses ??= childToolCalls(facts.spend.artifacts);
+              if (['running', 'async_launched', 'launched'].includes(agent.status) && facts.state !== 'open')
+                agent.status = facts.state === 'done' ? 'completed' : facts.state;
               if (
-                edge.kind === 'dispatched' &&
-                childFacts.get(session.key)?.dispatchOwners.get(edge.to!) === entry.turn.key &&
-                !countedDispatches.has(`${session.key}:${edge.to}`)
-              ) {
-                countedDispatches.add(`${session.key}:${edge.to}`);
-                dispatched.push({
-                  sessionId: edge.to!,
-                  name: target.title,
-                  costs: priceDispatchedParts(
-                    target.numbers.parts
-                      .filter((part) => part.origin !== 'claude-cost-state')
-                      .map((part) => ({
-                        ...sessionCostUsage(part),
-                        ...(part.role === 'main' ? { own: true as const } : {}),
-                      })),
-                  ),
-                  short: target.numbers.coverage.usage !== 'complete' || edge.coverage === 'partial',
-                  ownSettledAt: facts.state === 'open' ? null : facts.newest,
-                });
-              }
+                agent.durationMs === null &&
+                facts.state !== 'open' &&
+                facts.spend.artifacts?.startedAt != null &&
+                facts.spend.artifacts?.endedAt != null
+              )
+                agent.durationMs = Math.max(0, facts.spend.artifacts.endedAt - facts.spend.artifacts.startedAt);
+            }
+            if (
+              edge.kind === 'dispatched' &&
+              childFacts.get(session.key)?.dispatchOwners.get(edge.to!) === entry.turn.key &&
+              !countedDispatches.has(`${session.key}:${edge.to}`)
+            ) {
+              countedDispatches.add(`${session.key}:${edge.to}`);
+              dispatched.push({
+                sessionId: edge.to!,
+                name: target.title,
+                costs: priceDispatchedParts(
+                  target.numbers.parts
+                    .filter((part) => part.origin !== 'claude-cost-state')
+                    .map((part) => ({
+                      ...sessionCostUsage(part),
+                      ...(part.role === 'main' ? { own: true as const } : {}),
+                    })),
+                ),
+                short: target.numbers.coverage.usage !== 'complete' || edge.coverage === 'partial',
+                ownSettledAt: facts.state === 'open' ? null : facts.newest,
+              });
             }
           }
-          const card =
-            'turn' in entry
-              ? turnCard(entry.turn, session.agent, session.key, model.capturedAt, restored!, dispatched, labels)
-              : compactionCard(entry.compaction, session.key, session.firstRequestCachedTokens, model.capturedAt);
-          newestAt = Math.max(newestAt, card.endedAt ?? card.startedAt);
-          card.sessionTitle = title;
-          if ('compaction' in entry)
-            compactions.push(
-              exportCompaction({ ...entry.compaction, summary: '' }, session.key, session.firstRequestCachedTokens),
-            );
-          if ('turn' in entry) {
-            const numeric = exportTurn(
-              { ...entry.turn, blocks: [], activity: { ...entry.turn.activity, steps: [] } },
-              session.agent,
-              session.key,
-            );
-            figures.push(numeric);
-            const links = entry.turn.relationships
-              .map((key) => model.relationships.find((edge) => edge.key === key))
-              .filter((edge) => !!edge);
-            for (const edge of links) {
-              const existing = entry.turn.agents.findIndex((agent) => agent.relationships?.includes(edge.key));
-              if (edge.kind === 'subagent' && existing >= 0 && card.agents?.[existing]) {
-                card.agents[existing].sessionId = edge.to;
-                if (edge.coverage === 'partial')
-                  card.agents[existing].hintDetail = [
-                    card.agents[existing].hintDetail,
-                    `Work is not included: ${edge.reason ?? 'unresolved'}.`,
-                  ]
-                    .filter(Boolean)
-                    .join(' ');
-                continue;
-              }
-              const target = model.sessions.find((candidate) => candidate.key === edge.to);
-              const facts = edge.to ? childFacts.get(edge.to) : undefined;
-              const child =
-                facts && target
-                  ? exportCard({
-                      ...toCard(restored!, false, model.capturedAt),
-                      agents: [
-                        dispatchedAgentCard(
-                          target.key,
-                          target.title,
-                          linkedRowSpend(facts.spend, edge.kind, target.agent),
-                          facts.state,
-                          facts.spend.artifacts?.startedAt ?? null,
-                          facts.spend.artifacts?.endedAt ?? null,
-                          childToolCalls(facts.spend.artifacts) ?? 0,
-                          [],
-                          model.capturedAt,
-                          target.agent,
-                          edge.kind === 'reader-started' ? 'session' : edge.kind,
-                        ),
-                      ],
-                    }).agents![0]
-                  : {
-                      kind: edge.kind === 'dispatched' ? ('dispatch' as const) : ('subagent' as const),
-                      description:
-                        target?.title ??
-                        `${edge.label ? edge.label + '. ' : ''}Work is not included: ${edge.reason ?? 'unresolved'}.`,
-                      model: null,
-                      effort: null,
-                      state: 'done' as const,
-                      stateWord: '',
-                      since: null,
-                      hintDetail: '',
-                      sessionId: edge.to,
-                      figures: [],
-                    };
-              child.kind = edge.kind === 'dispatched' ? 'dispatch' : 'subagent';
-              if (edge.kind === 'dispatched') (card.dispatched ??= []).push(child);
-              else (card.agents ??= []).push(child);
-            }
-            if (card.dispatched?.length)
-              card.chips!.push(dispatchedChip(card.dispatched as Parameters<typeof dispatchedChip>[0]));
-          }
-          const json = exportScriptJson({
-            card,
-            blocks: 'turn' in entry ? entry.turn.blocks : [{ text: entry.compaction.summary }],
-            relationships: 'turn' in entry ? entry.turn.relationships : [],
-          });
-          const size = Buffer.byteLength(json);
-          if (
-            cards.length &&
-            (cards.length >= EXPORT_LIMITS.initialCards || bytes + size > EXPORT_LIMITS.retainedBytes)
-          )
-            flush();
-          const id = `d${(++sequence).toString(36)}`;
-          cards.push({ id, bytes: size });
-          keys.push(card.key);
-          bytes += size;
-          yield encode(id, json);
         }
+        const card =
+          'turn' in entry
+            ? turnCard(entry.turn, session.agent, session.key, model.capturedAt, restored!, dispatched, labels)
+            : compactionCard(entry.compaction, session.key, session.firstRequestCachedTokens, model.capturedAt);
+        newestAt = Math.max(newestAt, card.endedAt ?? card.startedAt);
+        card.sessionTitle = title;
+        if ('compaction' in entry)
+          compactions.push(
+            exportCompaction({ ...entry.compaction, summary: '' }, session.key, session.firstRequestCachedTokens),
+          );
+        if ('turn' in entry) {
+          const numeric = exportTurn(
+            { ...entry.turn, blocks: [], activity: { ...entry.turn.activity, steps: [] } },
+            session.agent,
+            session.key,
+          );
+          figures.push(numeric);
+          const links = entry.turn.relationships
+            .map((key) => model.relationships.find((edge) => edge.key === key))
+            .filter((edge) => !!edge);
+          for (const edge of links) {
+            const existing = entry.turn.agents.findIndex((agent) => agent.relationships?.includes(edge.key));
+            if (edge.kind === 'subagent' && existing >= 0 && card.agents?.[existing]) {
+              card.agents[existing].sessionId = edge.to;
+              if (edge.coverage === 'partial')
+                card.agents[existing].hintDetail = [
+                  card.agents[existing].hintDetail,
+                  `Work is not included: ${edge.reason ?? 'unresolved'}.`,
+                ]
+                  .filter(Boolean)
+                  .join(' ');
+              continue;
+            }
+            const target = model.sessions.find((candidate) => candidate.key === edge.to);
+            const facts = edge.to ? childFacts.get(edge.to) : undefined;
+            const child =
+              facts && target
+                ? exportCard({
+                    ...toCard(restored!, false, model.capturedAt),
+                    agents: [
+                      dispatchedAgentCard(
+                        target.key,
+                        target.title,
+                        linkedRowSpend(facts.spend, edge.kind, target.agent),
+                        facts.state,
+                        facts.spend.artifacts?.startedAt ?? null,
+                        facts.spend.artifacts?.endedAt ?? null,
+                        childToolCalls(facts.spend.artifacts) ?? 0,
+                        [],
+                        model.capturedAt,
+                        target.agent,
+                        edge.kind === 'reader-started' ? 'session' : edge.kind,
+                      ),
+                    ],
+                  }).agents![0]
+                : {
+                    kind: edge.kind === 'dispatched' ? ('dispatch' as const) : ('subagent' as const),
+                    description:
+                      target?.title ??
+                      `${edge.label ? edge.label + '. ' : ''}Work is not included: ${edge.reason ?? 'unresolved'}.`,
+                    model: null,
+                    effort: null,
+                    state: 'done' as const,
+                    stateWord: '',
+                    since: null,
+                    hintDetail: '',
+                    sessionId: edge.to,
+                    figures: [],
+                  };
+            child.kind = edge.kind === 'dispatched' ? 'dispatch' : 'subagent';
+            if (edge.kind === 'dispatched') (card.dispatched ??= []).push(child);
+            else (card.agents ??= []).push(child);
+          }
+          if (card.dispatched?.length)
+            card.chips!.push(dispatchedChip(card.dispatched as Parameters<typeof dispatchedChip>[0]));
+        }
+        const json = exportScriptJson({
+          card,
+          blocks: 'turn' in entry ? entry.turn.blocks : [{ text: entry.compaction.summary }],
+          relationships: 'turn' in entry ? entry.turn.relationships : [],
+        });
+        const size = Buffer.byteLength(json);
+        if (cards.length && (cards.length >= EXPORT_LIMITS.initialCards || bytes + size > EXPORT_LIMITS.retainedBytes))
+          flush();
+        const id = `d${(++sequence).toString(36)}`;
+        cards.push({ id, bytes: size });
+        keys.push(card.key);
+        bytes += size;
+        yield encode(id, json);
       }
       flush();
       sessions.push({ ...session, pages });

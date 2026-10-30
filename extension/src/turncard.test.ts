@@ -11,6 +11,34 @@ import {
   type NativeChildCacheFacts,
 } from './projectspend.ts';
 import { turnCacheExpiryWarning, turnFileContributors, type CacheExpiryWarning } from './turncard.ts';
+import { orderTimelineEntries } from './turncard.ts';
+
+test('linked preparatory compactions change placement while card identity and clocks stay intact', () => {
+  const comment = { text: 'Keep this comment' };
+  const prepared = { sessionId: 'one', key: 'turn', at: 10, turnId: 'native', comments: [comment], read: true };
+  const boundary = { sessionId: 'one', key: 'compact', at: 30, preparesTurnId: 'native' };
+  const unrelated = { sessionId: 'two', key: 'other', at: 25, turnId: 'native' };
+  const unlinked = { sessionId: 'one', key: 'unlinked', at: 20 };
+  const input = [boundary, prepared, unrelated, unlinked];
+  const ordered = orderTimelineEntries(input);
+  assert.deepEqual(
+    ordered.map((item) => item.key),
+    ['other', 'unlinked', 'turn', 'compact'],
+  );
+  assert.equal(ordered[2], prepared);
+  assert.equal(ordered[3], boundary);
+  assert.equal(prepared.comments[0], comment);
+  assert.equal(prepared.read, true);
+  assert.equal(boundary.at, 30);
+  assert.deepEqual(orderTimelineEntries([boundary, unrelated]), [boundary, unrelated]);
+  const sameClock = { ...prepared, key: 'other-native-turn', turnId: 'other-native-turn' };
+  assert.deepEqual(orderTimelineEntries([boundary, sameClock]), [boundary, sameClock]);
+  assert.deepEqual(
+    orderTimelineEntries([boundary, sameClock, prepared]).map((item) => item.key),
+    ['other-native-turn', 'turn', 'compact'],
+  );
+  assert.deepEqual(input, [boundary, prepared, unrelated, unlinked]);
+});
 import assert from 'node:assert';
 import * as path from 'node:path';
 import * as fs from 'node:fs';

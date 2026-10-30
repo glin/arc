@@ -3273,7 +3273,7 @@ test('v1 import keeps each agent by its own generation through migration, restar
   fs.writeFileSync(legacy, JSON.stringify({ version: 63, titles: [], claudeChildReferences: [] }));
   for (const [version, kept] of [
     [70, [claudeFile]],
-    [71, [claudeFile, codexFile]],
+    [71, [claudeFile]],
     [69, []],
     [72, []],
   ] as const) {

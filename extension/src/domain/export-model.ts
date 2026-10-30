@@ -93,6 +93,8 @@ export interface ExportBlock {
   notResponse: 'repeat-notice' | 'no-response-requested' | 'after-handback' | null;
 }
 export interface ExportTurn {
+  // Opaque native-turn identity for compaction placement.
+  nativeTurnId?: string;
   key: string;
   startedAt: number;
   endedAt: number;
@@ -203,6 +205,7 @@ export interface ExportTurn {
 export interface ExportCompaction {
   key: string;
   at: number;
+  preparesTurnId?: string;
   summary: string;
   trigger: string;
   model: string | null;

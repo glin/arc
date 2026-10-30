@@ -32,6 +32,250 @@ import { ChildCacheExpiryAttribution } from './childcacheexpiry.ts';
 import { readSession } from './transcript.ts';
 import { toCard, turnCacheExpiryWarning } from './turncard.ts';
 import { turnKey } from './domain/read.ts';
+import { codexLeadingCompactionRecords } from './turnfixtures';
+import { sessionCostProjection, sessionCostUsageOf } from './turncard';
+import { turnCacheExpiryReturn } from './turncard';
+import { readCodexSession } from './codex';
+
+test('a leading billed compaction counts the cold return once before its delayed prompt', () => {
+  for (const snapshotBeforeCompaction of [false, true]) {
+    const { records, responseId } = codexLeadingCompactionRecords({ snapshotBeforeCompaction, duplicateBill: true });
+    const record = indexed(
+      records.map((row) => JSON.stringify(row)),
+      createCodexUsageLineReducer,
+    );
+    assert.deepEqual(facts(record).counts, { '5m': 0, '30m': 1, '1h': 0 });
+    assert.equal(facts(record).returns[0].requestKey, `codex-response:${responseId}`);
+    assert.equal(
+      record.lifetimeBuckets!.filter((item) => item.compactionUsage).reduce((sum, item) => sum + item.requests, 0),
+      1,
+    );
+    const parts = record.lifetimeBuckets!.map((bucket) => sessionCostUsageOf({ bucket, role: 'main' }));
+    const total = sessionCostProjection(parts, false).stats[0].dollars;
+    const projection = sessionCostProjection(parts, false, { compactionCount: 1, expiry: facts(record) });
+    assert.equal(projection.stats[0].dollars, total);
+    assert.equal(facts(record).returns[0].request.compactionUsage, true);
+    assert.ok(projection.stats[0].detailList!.notes!.some((note) => note.includes('overlap')));
+    const rebuilt = indexSpendFile(
+      { ...record, parserGeneration: 65, cacheExpiry: emptyCacheExpiryLedger() },
+      record.file,
+      'w',
+      createCodexUsageLineReducer,
+      BASE,
+      stillClock,
+    );
+    assert.equal(rebuilt.rebuilt, true);
+    assert.equal(facts(rebuilt.record).counts['30m'], 1);
+  }
+});
+
+test('a leading compaction excludes changed effort through context and delayed settings', () => {
+  const reference = indexed(
+    codexLeadingCompactionRecords().records.map((row) => JSON.stringify(row)),
+    createCodexUsageLineReducer,
+  );
+  const total = (record: SpendFileIndex) =>
+    sessionCostProjection(
+      record.lifetimeBuckets!.map((bucket) => sessionCostUsageOf({ bucket, role: 'main' })),
+      false,
+    ).stats[0].dollars;
+  for (const identity of ['context', 'settings', 'delayed settings'] as const) {
+    for (const effort of ['xhigh', 'high']) {
+      const { records, turnId } = codexLeadingCompactionRecords({ duplicateBill: true });
+      const context = records.find((row) => row.type === 'turn_context' && row.payload.turn_id === turnId)!;
+      const settings = records.filter((row) => row.payload.type === 'thread_settings_applied').at(-1)!;
+      context.payload.effort = effort;
+      (settings.payload.thread_settings as Record<string, unknown>).reasoning_effort = effort;
+      if (identity === 'context') {
+        records.splice(records.indexOf(context), 1);
+        records.splice(
+          records.findIndex((row) => row.type === 'compacted'),
+          0,
+          context,
+        );
+        delete (settings.payload.thread_settings as Record<string, unknown>).reasoning_effort;
+      } else if (identity === 'delayed settings') {
+        records.splice(records.indexOf(settings), 1);
+        records.splice(records.length - 1, 0, settings);
+      }
+      const lines = records.map((row) => JSON.stringify(row));
+      const usage = createCodexUsageLineReducer();
+      const compaction = records.findIndex((row) => row.type === 'compacted');
+      for (const line of lines.slice(0, compaction)) usage.pushLine(line);
+      const initial = usage
+        .pushLine(lines[compaction])
+        .find((event) => event.compactionUsage && (event.usage.requests ?? 1) > 0);
+      assert.ok(initial);
+      assert.equal(initial.effort, identity === 'context' ? effort : 'xhigh', `${identity}, initial effort`);
+      const record = indexed(lines, createCodexUsageLineReducer);
+      const label = `${identity}, ${effort}`;
+      assert.equal(facts(record).counts['30m'], effort === 'high' ? 0 : 1, label);
+      assert.equal(total(record), total(reference), label);
+      assert.equal(
+        record.lifetimeBuckets!.reduce((sum, bucket) => sum + bucket.requests, 0),
+        reference.lifetimeBuckets!.reduce((sum, bucket) => sum + bucket.requests, 0),
+        label,
+      );
+      for (let seam = 1; seam < lines.length; seam++) {
+        const folder = dir();
+        const file = path.join(folder, 'source.jsonl');
+        fs.writeFileSync(file, lines.slice(0, seam).join('\n') + '\n');
+        fs.utimesSync(file, BASE / 1000, BASE / 1000);
+        const first = indexSpendFile(undefined, file, 'w', createCodexUsageLineReducer, BASE, stillClock).record;
+        saveSpendLedger(folder, 'w', [first]);
+        const restored = loadSpendLedger(folder, 'w').files[0];
+        assert.ok(restored, `${label}, saved seam ${seam}`);
+        fs.appendFileSync(file, lines.slice(seam).join('\n') + '\n');
+        fs.utimesSync(file, BASE / 1000 + 1, BASE / 1000 + 1);
+        const resumed = indexSpendFile(restored, file, 'w', createCodexUsageLineReducer, BASE + 1, stillClock).record;
+        assert.deepEqual(resumed.cacheExpiry, record.cacheExpiry, `${label}, expiry seam ${seam}`);
+        assert.deepEqual(resumed.lifetimeBuckets, record.lifetimeBuckets, `${label}, cost seam ${seam}`);
+      }
+    }
+  }
+});
+
+test('a leading compaction preserves exact return evidence through append and ledger restoration', () => {
+  const { records } = codexLeadingCompactionRecords({ duplicateBill: true, snapshotBeforeCompaction: true });
+  const lines = records.map((row) => JSON.stringify(row));
+  const expected = indexed(lines, createCodexUsageLineReducer);
+  for (let seam = 1; seam < lines.length; seam++) {
+    const folder = dir();
+    const file = path.join(folder, 'source.jsonl');
+    fs.writeFileSync(file, lines.slice(0, seam).join('\n') + '\n');
+    fs.utimesSync(file, BASE / 1000, BASE / 1000);
+    const first = indexSpendFile(undefined, file, 'w', createCodexUsageLineReducer, BASE, stillClock).record;
+    saveSpendLedger(folder, 'w', [first]);
+    const restored = loadSpendLedger(folder, 'w').files[0];
+    assert.ok(restored, `saved seam ${seam}`);
+    fs.appendFileSync(file, lines.slice(seam).join('\n') + '\n');
+    fs.utimesSync(file, BASE / 1000 + 1, BASE / 1000 + 1);
+    const resumed = indexSpendFile(restored, file, 'w', createCodexUsageLineReducer, BASE + 1, stillClock).record;
+    assert.deepEqual(resumed.cacheExpiry, expected.cacheExpiry, `ledger seam ${seam}`);
+    assert.deepEqual(resumed.lifetimeBuckets, expected.lifetimeBuckets, `cost seam ${seam}`);
+  }
+});
+
+test('a leading compaction without a prompt counts only its own verified session return', () => {
+  const { records, turnId } = codexLeadingCompactionRecords({ prompt: false });
+  const file = path.join(dir(), 'source.jsonl');
+  fs.writeFileSync(file, records.map((row) => JSON.stringify(row)).join('\n') + '\n');
+  const record = indexSpendFile(undefined, file, 'w', createCodexUsageLineReducer, BASE, stillClock).record;
+  assert.equal(facts(record).counts['30m'], 1);
+  assert.equal(facts(record).returns[0].visibleTurnId, `codex-turn:${turnId}`);
+  const parsed = readSessionRequests(file, 'codex');
+  assert.equal(parsed.filter((item) => item.compactionUsage).length, 1);
+  const visible = readCodexSession(file, 'session').turns;
+  assert.equal(visible.length, 1);
+  assert.equal(turnCacheExpiryReturn(visible[0], facts(record).returns), null);
+});
+
+test('a delayed copied native turn withdraws its leading compaction return', () => {
+  const { records, turnId } = codexLeadingCompactionRecords();
+  const rows = [
+    ...records,
+    {
+      type: 'turn_context',
+      timestamp: '2026-10-30T03:20:00Z',
+      payload: { turn_id: turnId, model: 'gpt-6.1-sol', current_date: '2026-10-28' },
+    },
+  ];
+  const file = path.join(dir(), 'source.jsonl');
+  fs.writeFileSync(file, rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
+  const record = indexSpendFile(undefined, file, 'w', createCodexUsageLineReducer, BASE, stillClock).record;
+  assert.equal(facts(record).counts['30m'], 0);
+  assert.equal(record.compactionCount, 0);
+  assert.equal(readCodexSession(file, 'session').compactions.length, 0);
+});
+
+test('a warm leading compaction and an unresolved compaction bill add no expiry', () => {
+  for (const mode of ['warm', 'unresolved'] as const) {
+    const { records } = codexLeadingCompactionRecords({ gapMinutes: mode === 'warm' ? 10 : 364 });
+    const lines = records.filter(
+      (row) => mode !== 'unresolved' || (row.payload.type !== 'thread_settings_applied' && row.type !== 'turn_context'),
+    );
+    const record = indexed(
+      lines.map((row) => JSON.stringify(row)),
+      createCodexUsageLineReducer,
+    );
+    assert.equal(facts(record).counts['30m'], 0, mode);
+  }
+});
+
+test('a leading compaction return revises late identity and retracts revoked ownership', () => {
+  const { records } = codexLeadingCompactionRecords();
+  const reducer = createCodexUsageLineReducer();
+  const scan = new CacheExpiryScan();
+  let billed: UsageEvent | undefined;
+  const ordinary: UsageEvent[] = [];
+  for (const row of records) {
+    for (const event of reducer.pushLine(JSON.stringify(row))) {
+      scan.push(event);
+      if (!event.compactionUsage && (event.usage.requests ?? 1) > 0) ordinary.push(event);
+      if (event.compactionUsage && !event.incomplete && (event.usage.requests ?? 1) > 0) billed = event;
+    }
+    for (const signal of reducer.takeCompactionSignals()) scan.signal(signal);
+    scan.compactionCount(reducer.compactionCount());
+  }
+  assert.ok(billed);
+  assert.ok(billed.requestKey);
+  const delayed = new CacheExpiryScan();
+  delayed.push(ordinary[0]);
+  delayed.signal({ ordinal: 1, at: billed.timestamp, prefixTokens: null, preparatoryRequestKey: billed.requestKey });
+  delayed.push(ordinary.at(-1)!);
+  const restored = new CacheExpiryScan(structuredClone(delayed.ledger(reducer.recentCompactions())));
+  restored.push(billed);
+  assert.equal(restored.ledger(reducer.recentCompactions()).facts.counts['30m'], 1, 'identity after ordinary work');
+  assert.equal(scan.ledger(reducer.recentCompactions()).facts.counts['30m'], 1);
+  const removal = { ...billed, usage: { ...billed.usage, requests: -1 } };
+  for (const changed of [
+    { model: 'gpt-6-astra' },
+    { provider: 'amazon-bedrock' },
+    { serviceTier: 'standard' },
+    { effort: 'high' },
+  ]) {
+    scan.push(removal);
+    scan.push({ ...billed, ...changed });
+    assert.equal(scan.ledger(reducer.recentCompactions()).facts.counts['30m'], 0, JSON.stringify(changed));
+    scan.push(billed);
+    assert.equal(scan.ledger(reducer.recentCompactions()).facts.counts['30m'], 1, JSON.stringify(changed));
+  }
+  scan.compactionCount(0);
+  assert.equal(scan.ledger([]).facts.counts['30m'], 0);
+  assert.equal(scan.ledger([]).facts.longestGapMs, null);
+});
+
+test('a cold opening request excludes a later cold compaction inside the same native turn', () => {
+  const { records, turnId } = codexLeadingCompactionRecords();
+  const started = records.findIndex((row) => row.payload.type === 'task_started' && row.payload.turn_id === turnId);
+  const openingAt = Date.parse(records[started].timestamp) + 10;
+  const context = records.find((row) => row.type === 'turn_context' && row.payload.turn_id === turnId)!;
+  const settings = records.find((row) => row.payload.type === 'thread_settings_applied')!;
+  const snapshot = records.find((row) => row.payload.type === 'token_count')!;
+  const first = [
+    { ...context, timestamp: new Date(openingAt).toISOString() },
+    { ...settings, timestamp: new Date(openingAt + 1).toISOString() },
+    {
+      type: 'event_msg',
+      timestamp: new Date(openingAt + 2).toISOString(),
+      payload: { type: 'user_message', message: 'continue' },
+    },
+    { ...snapshot, timestamp: new Date(openingAt + 3).toISOString() },
+  ];
+  const later = records
+    .slice(started + 1)
+    .map((row) => ({ ...row, timestamp: new Date(Date.parse(row.timestamp) + 31 * MINUTE).toISOString() }));
+  const rows = [...records.slice(0, started + 1), ...first, ...later];
+  const file = path.join(dir(), 'source.jsonl');
+  fs.writeFileSync(file, rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
+  const record = indexSpendFile(undefined, file, 'w', createCodexUsageLineReducer, BASE, stillClock).record;
+  assert.equal(facts(record).counts['30m'], 1);
+  assert.equal(facts(record).returns[0].request.compactionUsage, undefined);
+  const parsed = readCodexSession(file, 'session');
+  assert.equal(parsed.compactions[0].trigger, 'auto');
+  assert.equal(parsed.compactions[0].preparesTurnId, undefined);
+  assert.equal(turnCacheExpiryReturn(parsed.turns.at(-1)!, facts(record).returns), facts(record).returns[0]);
+});
 
 const dir = () => tempDir('cache-expiry-');
 

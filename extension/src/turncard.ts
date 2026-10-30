@@ -270,6 +270,7 @@ export interface CacheExpiryWarning {
   main?: { gapMs: number; dollars: number | null; status: CacheExpiryCost['status'] };
   // A session figure's warning counts every expiry of the main session and its children.
   count?: number;
+  compaction?: true;
 }
 
 export type SessionMetric = 'cost' | 'turns' | 'context' | 'cache-expiry' | 'files' | 'commits';
@@ -3120,6 +3121,7 @@ function costDetailList(
       ...(toolRows.length || delegatedTools.length ? [TOOL_RESULT_NOTE] : []),
       ...(hasCacheRead ? [CACHED_INPUT_READ_EXPLANATION] : []),
       ...(hasPublicAutoReview ? [AUTO_REVIEW_RATE_NOTE] : []),
+      ...(expiry?.compaction ? [COMPACTION_EXPIRY_OVERLAP_NOTE] : []),
       COST_ESTIMATE_NOTE,
     ],
   };
@@ -3298,9 +3300,11 @@ export function turnCacheExpiryWarning(
           publicProjectSpendPrice,
         )
       : null;
-  if (!children) return { scope: 'cache-expiry', gapMs: found!.gapMs, ...priced! };
+  const overlap = found?.request.compactionUsage ? { compaction: true as const } : {};
+  if (!children) return { scope: 'cache-expiry', gapMs: found!.gapMs, ...priced!, ...overlap };
   return {
     scope: 'cache-expiry',
+    ...overlap,
     gapMs: found?.gapMs ?? children.longestGapMs,
     dollars: children.dollars,
     status: children.status,
@@ -3653,6 +3657,35 @@ function compactionChips(c: Compaction): StatChip[] {
     });
   }
   return chips;
+}
+
+// Keep recorded clocks while placing a preparatory boundary below its prompt in newest-first order.
+export function orderTimelineEntries<
+  T extends {
+    sessionId: string;
+    at: number;
+    turnId?: string;
+    preparesTurnId?: string;
+  },
+>(entries: readonly T[]): T[] {
+  const sorted = [...entries].sort((left, right) => right.at - left.at);
+  const turns = new Set(
+    sorted.filter((item) => item.turnId !== undefined).map((item) => JSON.stringify([item.sessionId, item.turnId])),
+  );
+  const linked = new Map<string, T[]>();
+  const ordinary: T[] = [];
+  for (const entry of sorted) {
+    const key = JSON.stringify([entry.sessionId, entry.preparesTurnId]);
+    if (entry.preparesTurnId !== undefined && turns.has(key)) {
+      const group = linked.get(key) ?? [];
+      group.push(entry);
+      linked.set(key, group);
+    } else ordinary.push(entry);
+  }
+  return ordinary.flatMap((entry) => [
+    entry,
+    ...(entry.turnId === undefined ? [] : (linked.get(JSON.stringify([entry.sessionId, entry.turnId])) ?? [])),
+  ]);
 }
 
 export function toCompactionCard(c: Compaction, now: number = Date.now()): CompactionCard {
@@ -5921,6 +5954,8 @@ const COMPACTION_ESTIMATE_FOOTER = 'Compaction costs are estimates. Claude Code 
 // Defines a cache expiry's cost, in an "Included above" row or in the session popover's warning.
 const CACHE_EXPIRY_ROW_NOTE =
   "A cache expiry's cost is what resending the context cost above a cache read of the same tokens.";
+const COMPACTION_EXPIRY_OVERLAP_NOTE =
+  'Compaction and cache expiry costs overlap when the compaction resends expired context. The total counts that request once.';
 
 // The cost of overheads a total already counts, as one value-column figure.
 function overheadCostValue(cost: CacheExpiryCost): string {
@@ -6605,6 +6640,9 @@ export function sessionCostProjection(
         ? [AUTO_REVIEW_RATE_NOTE]
         : []),
       ...(expiryCount > 0 ? [CACHE_EXPIRY_ROW_NOTE] : []),
+      ...(overheads.expiry?.returns.some((item) => item.request.compactionUsage)
+        ? [COMPACTION_EXPIRY_OVERLAP_NOTE]
+        : []),
       scope,
       COST_ESTIMATE_NOTE,
     ],
