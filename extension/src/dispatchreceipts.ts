@@ -18,6 +18,8 @@ const EVENT_BYTES = JSON_BYTES - 20 * 1024;
 const STATUS_BYTES = JSON_BYTES - 4096;
 const REPORT_BYTES = 8 * 1024 * 1024;
 const CAPTURE_SLICE_BYTES = 64 * 1024;
+// A full queue of unpublished slices stays well inside the checkpoint read allowance.
+const PENDING_SLICES = 256;
 const OWNER = /^[A-Za-z0-9_.:-]{1,128}$/;
 const TOKEN = /^[a-f0-9]{64}$/;
 type FileIdentity = { dev: string; ino: string };
@@ -114,9 +116,21 @@ interface EventState {
   dispositionSha256?: string;
 }
 
+class DispatchPathRedirected extends Error {
+  constructor() {
+    super('The dispatch path is redirected.');
+  }
+}
+// An alias publication that failed, or waits behind an earlier unpublished slice, keeps its slice queued for a retry.
+export class CapturePublicationPending extends Error {
+  readonly code = 'EPERM';
+  constructor(cause?: unknown) {
+    super('The requested log is temporarily unavailable.', { cause });
+  }
+}
 function identity(file: string): FileIdentity {
   const stat = fs.lstatSync(file, { bigint: true });
-  if (stat.isSymbolicLink()) throw new Error('The dispatch path is redirected.');
+  if (stat.isSymbolicLink()) throw new DispatchPathRedirected();
   return { dev: String(stat.dev), ino: String(stat.ino) };
 }
 function equalIdentity(a: FileIdentity, b: FileIdentity): boolean {
@@ -131,7 +145,7 @@ export function safeDispatchPath(file: string, platform = process.platform): voi
     if ([os.homedir(), os.tmpdir()].some((base) => normalized(current) === normalized(base))) break;
     if (platform === 'darwin' && current === '/tmp' && fs.realpathSync.native(current) === '/private/tmp') break;
     const stat = fs.lstatSync(current);
-    if (stat.isSymbolicLink()) throw new Error('The dispatch path is redirected.');
+    if (stat.isSymbolicLink()) throw new DispatchPathRedirected();
     const parent = paths.dirname(current);
     if (parent === current) break;
     current = parent;
@@ -268,7 +282,7 @@ class RelationshipReader {
         throw error;
       }
     });
-    if (stat?.isSymbolicLink()) throw new Error('The dispatch path is redirected.');
+    if (stat?.isSymbolicLink()) throw new DispatchPathRedirected();
     const revision = stat
       ? stat.isDirectory()
         ? `${stat.dev}:${stat.ino}:directory`
@@ -851,11 +865,17 @@ export class DispatchReceipts {
           sources.push([slice.name, slice]);
         }
       }
+      // Each channel is read once, however many queued slices it has.
+      const stats = new Map<string, fs.BigIntStats>();
       for (const [name, cursor] of sources) {
         if (name !== 'stdout.log' && name !== 'stderr.log') throw new Error('The log source is invalid.');
-        const file = this.artifact(id, name);
-        safePath(file);
-        const stat = fs.statSync(file, { bigint: true });
+        let stat = stats.get(name);
+        if (!stat) {
+          const file = this.file(id, name);
+          safePath(file);
+          stat = fs.statSync(file, { bigint: true });
+          stats.set(name, stat);
+        }
         if (
           !stat.isFile() ||
           `${stat.dev}:${stat.ino}` !== cursor.identity ||
@@ -868,6 +888,15 @@ export class DispatchReceipts {
       return state;
     };
     load();
+    const save = (state: SourceCaptureState) => {
+      try {
+        writeFileAtomically(checkpoint, JSON.stringify(state), this.replace, 0o600, false);
+      } catch (cause) {
+        // A transient checkpoint failure keeps the previous checkpoint, and the caller retries.
+        if (!['EPERM', 'EACCES', 'EBUSY'].includes((cause as NodeJS.ErrnoException).code ?? '')) throw cause;
+        throw Object.assign(new Error('The requested log is temporarily unavailable.', { cause }), { code: 'EPERM' });
+      }
+    };
     const openAlias = (state: SourceCaptureState) => {
       if (!state.alias) return null;
       try {
@@ -878,11 +907,7 @@ export class DispatchReceipts {
         )
           return null;
       } catch (error) {
-        if (
-          (error as NodeJS.ErrnoException).code === 'ENOENT' ||
-          String(error) === 'Error: The dispatch path is redirected.'
-        )
-          return null;
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT' || error instanceof DispatchPathRedirected) return null;
         throw error;
       }
       const fd = fs.openSync(alias, fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW ?? 0));
@@ -906,27 +931,36 @@ export class DispatchReceipts {
       delivered: () => load().aliasBytes ?? 0,
       pendingSources: () => load().pending ?? [],
       // Output that arrives behind an unpublished slice joins its queue, so recovery keeps the arrival order of both channels.
-      defer: (name: 'stdout.log' | 'stderr.log', limit: number) =>
+      // Each limit queues at most `limit` bytes past the channel's queued end, and never past `end`.
+      // All channels join in one checkpoint write.
+      defer: (limits: readonly (readonly [name: 'stdout.log' | 'stderr.log', limit: number, end?: number])[]) =>
         this.lock(
           id,
           () => {
             const state = load();
-            if (!state.pending || limit <= 0) return;
-            const file = this.artifact(id, name);
-            safePath(file);
-            const stat = fs.statSync(file, { bigint: true });
-            const source = `${stat.dev}:${stat.ino}`;
-            const committed = state.sources[name];
-            if (!stat.isFile() || (committed && committed.identity !== source))
-              throw new Error('The original worker output was replaced or truncated.');
-            let queued = committed?.offset ?? 0;
-            for (const slice of state.pending) if (slice.name === name) queued = slice.offset;
-            const offset = Math.min(Number(stat.size), queued + limit);
-            if (offset <= queued) return;
-            const last = state.pending[state.pending.length - 1];
-            if (state.pending.length > 1 && last.name === name) last.offset = offset;
-            else state.pending.push({ name, offset, identity: source });
-            writeFileAtomically(checkpoint, JSON.stringify(state), this.replace, 0o600, false);
+            if (!state.pending) return;
+            let changed = false;
+            for (const [name, limit, end = Infinity] of limits) {
+              if (limit <= 0) continue;
+              const file = this.artifact(id, name);
+              safePath(file);
+              const stat = fs.statSync(file, { bigint: true });
+              const source = `${stat.dev}:${stat.ino}`;
+              const committed = state.sources[name];
+              if (!stat.isFile() || (committed && committed.identity !== source))
+                throw new Error('The original worker output was replaced or truncated.');
+              let queued = committed?.offset ?? 0;
+              for (const slice of state.pending) if (slice.name === name) queued = slice.offset;
+              const offset = Math.min(Number(stat.size), queued + limit, end);
+              if (offset <= queued) continue;
+              const last = state.pending[state.pending.length - 1];
+              if (state.pending.length > 1 && last.name === name) last.offset = offset;
+              // Output behind a full queue follows it in standard channel order.
+              else if (state.pending.length < PENDING_SLICES) state.pending.push({ name, offset, identity: source });
+              else continue;
+              changed = true;
+            }
+            if (changed) save(state);
           },
           'capture-write',
         ),
@@ -959,12 +993,11 @@ export class DispatchReceipts {
             bytes = bytes.subarray(Math.max(0, (committed?.offset ?? 0) - start));
             const queue = (state.pending ??= []);
             if (queue.length) {
-              if (queue[0].name !== name || cursor.offset > queue[0].offset)
-                throw Object.assign(new Error('The requested log is temporarily unavailable.'), { code: 'EPERM' });
+              if (queue[0].name !== name || cursor.offset > queue[0].offset) throw new CapturePublicationPending();
             } else {
               // Save the slice's position before alias publication can fail.
               queue.push({ name, ...cursor });
-              writeFileAtomically(checkpoint, JSON.stringify(state), this.replace, 0o600, false);
+              save(state);
             }
             let fd: number | null = null;
             try {
@@ -980,9 +1013,7 @@ export class DispatchReceipts {
               } else state.alias = null;
             } catch (cause) {
               // The saved pending slice keeps its position ahead of later channel output.
-              throw Object.assign(new Error('The requested log is temporarily unavailable.', { cause }), {
-                code: 'EPERM',
-              });
+              throw new CapturePublicationPending(cause);
             } finally {
               if (fd !== null) fs.closeSync(fd);
             }
@@ -990,7 +1021,7 @@ export class DispatchReceipts {
             state.sources[name] = { ...cursor };
             if (cursor.offset === queue[0].offset) queue.shift();
             if (!queue.length) delete state.pending;
-            writeFileAtomically(checkpoint, JSON.stringify(state), this.replace, 0o600, false);
+            save(state);
           },
           'capture-write',
         ),
@@ -1027,7 +1058,7 @@ export class DispatchReceipts {
               }
             } else if (current.alias) {
               current.alias = null;
-              writeFileAtomically(checkpoint, JSON.stringify(current), this.replace, 0o600, false);
+              save(current);
             }
             return false;
           },
@@ -1250,7 +1281,7 @@ export class DispatchReceipts {
     return {
       flushAlias,
       pendingSources: () => [],
-      defer: (_name: 'stdout.log' | 'stderr.log', _limit: number) => {},
+      defer: (_limits: readonly (readonly [name: 'stdout.log' | 'stderr.log', limit: number, end?: number])[]) => {},
       delivered: () => {
         reload();
         return state.aliasBytes ?? 0;

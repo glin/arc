@@ -6,6 +6,7 @@ import { spawn, execFile, ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { isDeepStrictEqual, promisify } from 'node:util';
 import {
+  CapturePublicationPending,
   DispatchReceipts,
   DISPATCH_ID,
   safeDispatchPath,
@@ -1551,9 +1552,15 @@ function logCapture(receipts: DispatchReceipts, id: string, bounds: ReadBounds) 
   const sourceAllowance = (bytes: number) => sources.map(() => bytes);
   const flush = (bytes: number, allowance?: number[]) => {
     const remaining = sources.map((_, index) => Math.min(bytes, allowance ? allowance[index] : bytes));
-    if (capture.pendingSources().length)
-      for (const [index, source] of sources.entries())
-        if (fs.existsSync(source.file)) capture.defer(source.name, remaining[index]);
+    const queue = (from: number, failedEnd = Infinity) =>
+      capture.defer(
+        sources.flatMap((source, index) =>
+          index < from || !fs.existsSync(source.file)
+            ? []
+            : [[source.name, remaining[index], index === from ? failedEnd : Infinity] as const],
+        ),
+      );
+    if (capture.pendingSources().length) queue(0);
     const ordered = capture
       .pendingSources()
       .map((slice): [number, number] => [sources.findIndex((source) => source.name === slice.name), slice.offset]);
@@ -1561,6 +1568,7 @@ function logCapture(receipts: DispatchReceipts, id: string, bounds: ReadBounds) 
     for (const [index, end] of ordered) {
       const source = sources[index];
       if (!fs.existsSync(source.file)) continue;
+      const size = fs.statSync(source.file).size;
       try {
         source.cursor = capture.cursor(source.name);
         const limit = Math.min(remaining[index], Math.max(0, end - source.cursor.offset));
@@ -1571,7 +1579,10 @@ function logCapture(receipts: DispatchReceipts, id: string, bounds: ReadBounds) 
         }
       } catch (error) {
         source.cursor = capture.cursor(source.name);
-        throw error;
+        if (!(error instanceof CapturePublicationPending)) throw error;
+        // The output this flush read joins the queue ahead of later channels, as a healthy flush would publish it.
+        queue(index, size);
+        return false;
       }
       // Later output stays behind a queued slice that this flush could not finish.
       if (end !== Infinity && source.cursor.offset < end) break;
@@ -1579,7 +1590,8 @@ function logCapture(receipts: DispatchReceipts, id: string, bounds: ReadBounds) 
     const aliasPending = capture.flushAlias();
     return !aliasPending && sourceComplete();
   };
-  return { native: capture.native, flush, sourceComplete, sourceAllowance, progress, close: capture.close };
+  const queued = () => capture.pendingSources().length > 0;
+  return { native: capture.native, flush, sourceComplete, sourceAllowance, progress, queued, close: capture.close };
 }
 
 function liveLogCapture(receipts: DispatchReceipts, id: string, bounds: ReadBounds) {
@@ -1605,7 +1617,7 @@ function liveLogCapture(receipts: DispatchReceipts, id: string, bounds: ReadBoun
           try {
             const before = capture.progress();
             if (capture.flush(capture.sourceComplete() ? 0 : bytes, allowance)) return true;
-            if (!capture.sourceComplete()) return false;
+            if (!capture.sourceComplete() && !capture.queued()) return false;
             stalled = capture.progress() <= before;
           } catch (error) {
             if (!captureWriteBusy(error)) return false;
@@ -1736,7 +1748,7 @@ export async function produceStandaloneOutput(receipts: DispatchReceipts, id: st
         const before = capture.progress();
         complete = capture.flush(capture.sourceComplete() ? 0 : READ_BYTES);
         stalled = !complete && capture.progress() <= before;
-        if (ended && stalled && !capture.sourceComplete())
+        if (ended && stalled && !capture.sourceComplete() && !capture.queued())
           throw new Error('The requested log is incomplete. Private output remains available.');
         progressAt = Date.now();
         if (!ended) waits = Math.ceil(options.deadlineMs / 50);

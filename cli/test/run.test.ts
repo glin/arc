@@ -8,6 +8,7 @@ import * as childProcess from 'node:child_process';
 import { PassThrough } from 'node:stream';
 import { once } from 'node:events';
 import { promisify } from 'node:util';
+import { createRequire } from 'node:module';
 import { afterAll, afterEach, test, vi } from 'vitest';
 import { parseRun, runStandalone, runSupervisor } from '../src/run.ts';
 import {
@@ -604,6 +605,91 @@ test('source capture keeps the arrival order of both channels across a longer al
   assert.equal(state.sources['stderr.log'].offset, 6);
   assert.equal(fs.readFileSync(stdout, 'utf8'), 'A\nB\nC\n');
   assert.equal(fs.readFileSync(stderr, 'utf8'), 'e\nf\ng\n');
+});
+
+test.each([1, 2, 6])(
+  'source producer keeps capture and arrival order through %i failed flushes that start on stdout',
+  async (failures) => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'setImmediate'] });
+    vi.spyOn(Date, 'now').mockReturnValue(0);
+    if (process.send) vi.spyOn(process, 'send').mockImplementation(() => true);
+    vi.spyOn(process, 'disconnect').mockImplementation(() => {});
+    const child = providerChild();
+    vi.mocked(childProcess.spawn).mockReturnValue(child);
+    const { receipts, launch } = workerFixture('', 100, false, true);
+    const id = launch.launchId;
+    const stdout = receipts.artifact(id, 'stdout.log');
+    const stderr = receipts.artifact(id, 'stderr.log');
+    fs.writeFileSync(stdout, 'A\n');
+    fs.writeFileSync(stderr, 'e\n');
+    const alias = launch.standalone!.logAlias!;
+    let denied = 0;
+    denyOpen(alias, () => denied < failures && ++denied > 0);
+    let expected = 'A\ne\n';
+    const running = produceStandaloneOutput(receipts, id);
+    await vi.advanceTimersByTimeAsync(0);
+    child.emit('spawn');
+    for (let flush = 1; flush <= failures; flush++) {
+      assert.equal(denied, flush);
+      assert.equal(artifactJson(receipts, id, 'output-owner.json').state, 'capturing');
+      fs.appendFileSync(stdout, `${flush}\n`);
+      fs.appendFileSync(stderr, `e${flush}\n`);
+      expected += `${flush}\ne${flush}\n`;
+      await vi.advanceTimersByTimeAsync(50);
+    }
+    child.emit('close', 0, null);
+    await vi.runAllTimersAsync();
+    await running;
+    assert.equal(fs.readFileSync(alias, 'utf8'), expected);
+    assert.equal(artifactJson(receipts, id, 'output-owner.json').state, 'finished');
+    assert.equal(artifactJson(receipts, id, 'capture.json').pending, undefined);
+  },
+);
+
+test('source producer retries a transient checkpoint failure while it queues output behind an alias outage', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'setImmediate'] });
+  vi.spyOn(Date, 'now').mockReturnValue(0);
+  if (process.send) vi.spyOn(process, 'send').mockImplementation(() => true);
+  vi.spyOn(process, 'disconnect').mockImplementation(() => {});
+  const child = providerChild();
+  vi.mocked(childProcess.spawn).mockReturnValue(child);
+  const { receipts, launch } = workerFixture('', 100, false, true);
+  const id = launch.launchId;
+  const stdout = receipts.artifact(id, 'stdout.log');
+  const stderr = receipts.artifact(id, 'stderr.log');
+  fs.writeFileSync(stdout, 'A\n');
+  fs.writeFileSync(stderr, 'e\n');
+  const alias = launch.standalone!.logAlias!;
+  let blocked = true;
+  denyOpen(alias, () => blocked);
+  const checkpoint = receipts.artifact(id, 'capture.json');
+  // Checkpoint saves reach the file system through the module's default export.
+  const shared: typeof fs = createRequire(import.meta.url)('node:fs');
+  const write = shared.writeFileSync;
+  let failCheckpoint = false;
+  vi.spyOn(shared, 'writeFileSync').mockImplementation((file, ...args) => {
+    if (failCheckpoint && String(file).startsWith(`${checkpoint}.`)) {
+      failCheckpoint = false;
+      throw Object.assign(new Error('Checkpoint unavailable'), { code: 'EACCES' });
+    }
+    return Reflect.apply(write, shared, [file, ...args]);
+  });
+  const running = produceStandaloneOutput(receipts, id);
+  await vi.advanceTimersByTimeAsync(0);
+  child.emit('spawn');
+  fs.appendFileSync(stdout, 'B\n');
+  fs.appendFileSync(stderr, 'f\n');
+  failCheckpoint = true;
+  await vi.advanceTimersByTimeAsync(50);
+  assert.equal(failCheckpoint, false);
+  const owner = artifactJson(receipts, id, 'output-owner.json');
+  assert.equal(owner.state, 'capturing', owner.reason);
+  blocked = false;
+  child.emit('close', 0, null);
+  await vi.runAllTimersAsync();
+  await running;
+  assert.equal(fs.readFileSync(alias, 'utf8'), 'A\ne\nB\nf\n');
+  assert.equal(artifactJson(receipts, id, 'output-owner.json').state, 'finished');
 });
 
 test.each(['truncated', 'redirected'] as const)(
