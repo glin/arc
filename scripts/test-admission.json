@@ -47,7 +47,7 @@
   "extension/src/claudeplugin.test.ts": {
     "reason": "Bundled command installation must validate real Node executables and preserve owned launchers through partial filesystem failures.",
     "cases": 90,
-    "matricesSha256": "447a8b5748c05809ca6b8e6327d7be23f774afbf6df92f8c1f7512e8a02486e8"
+    "matricesSha256": "399cd4fb0416318b85cbbfb078ccc2a8e6fa98b804db9ed58c29896386edaa50"
   },
   "extension/src/clauderepeated.test.ts": {
     "reason": "The real worker must read repeated-record maps and invalidate them after source revision changes.",
