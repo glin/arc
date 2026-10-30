@@ -1581,7 +1581,12 @@ function retentionFixture(labels: string[]) {
   const builds = [bundledFixture(labels[0])];
   for (const label of labels.slice(1)) builds.push(bundledFixture(label, builds[0].tools.root));
   const { root, tools } = builds[0].tools;
-  const clock = { wall: Date.now(), mono: 0, now: () => clock.wall, monotonic: () => clock.mono };
+  const clock = {
+    wall: Math.floor(Date.now() / 1000) * 1000,
+    mono: 0,
+    now: () => clock.wall,
+    monotonic: () => clock.mono,
+  };
   vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
   vi.setSystemTime(clock.wall);
   onTestFinished(() => {
