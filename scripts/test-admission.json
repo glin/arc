@@ -7,7 +7,7 @@
   "cli/test/run.test.ts": {
     "reason": "Standalone workers must retain real output, exit, cancellation, receipt ownership, and recovery across process boundaries. Held readers must preserve one worker and one outcome after recovery. Exhausted replacement retries must retain the worker's terminal observation. Explicit tiers must reach attached and background argv on Windows, macOS, and Linux. A refused tier must reserve no receipt and start no worker. Agent discovery must reject directories and honor platform permissions with minimal PATH and competing commands. The added cases use filesystem fixtures without launching a process. Native source observation must admit a compressed rollout once through its decoded opening.",
     "cases": 114,
-    "matricesSha256": "9788dcfde67ca305995fc48ecfa9a18c07564826b69770024390c2f70a19d05d"
+    "matricesSha256": "cdb48d38b5e8f2e42a6e8c4a09bc4e6a7da22958a1067fdb839a4211119638f9"
   },
   "cli/test/smoke.bundled-a.test.mjs": {
     "reason": "Compiled CLI commands must reach session reads, comments, and saved defaults through an authenticated window channel. Parent and provider help must avoid stdin, files, and window discovery.",

@@ -1553,6 +1553,253 @@ test('private reports remain independent when output aliases collide', () => {
   assert.equal(a.receipts.refresh(a.launch.launchId), null);
   assert.equal(a.receipts.status(a.launch.launchId).events.length, 1);
 });
+function sourceSlice(receipts: DispatchReceipts, id: string, name: 'stdout.log' | 'stderr.log', text: string) {
+  const file = receipts.artifact(id, name);
+  fs.appendFileSync(file, text);
+  const stat = fs.statSync(file, { bigint: true });
+  return { bytes: Buffer.from(text), cursor: { offset: Number(stat.size), identity: `${stat.dev}:${stat.ino}` } };
+}
+
+test('source file capture keeps stdout and stderr without a duplicate worker log', () => {
+  const { receipts, standalone } = standaloneFixture();
+  const id = standalone.launchId;
+  const capture = receipts.capture(id, 3, true);
+  const stale = receipts.capture(id, 3, true);
+  const alias = standalone.standalone!.logAlias!;
+  try {
+    const first = sourceSlice(receipts, id, 'stdout.log', 'abc');
+    capture.write(first.bytes, 'stdout.log', first.cursor);
+    stale.write(first.bytes, 'stdout.log', { ...first.cursor });
+    const error = sourceSlice(receipts, id, 'stderr.log', 'ERR');
+    stale.write(error.bytes, 'stderr.log', error.cursor);
+    const tail = sourceSlice(receipts, id, 'stdout.log', 'def');
+    capture.write(tail.bytes, 'stdout.log', tail.cursor);
+    assert.equal(fs.readFileSync(alias, 'utf8'), 'abcERRdef');
+    assert.equal(fs.readFileSync(receipts.artifact(id, 'stdout.log'), 'utf8'), 'abcdef');
+    assert.equal(fs.readFileSync(receipts.artifact(id, 'stderr.log'), 'utf8'), 'ERR');
+    assert.equal(fs.statSync(receipts.artifact(id, 'worker.log')).size, 0);
+    assert.equal(capture.delivered(), 9);
+    const history = fs.readdirSync(path.dirname(receipts.artifact(id, 'capture.json')));
+    for (let pass = 0; pass < 3; pass++) assert.equal(capture.flushAlias(), false);
+    assert.deepEqual(fs.readdirSync(path.dirname(receipts.artifact(id, 'capture.json'))), history);
+  } finally {
+    capture.close();
+    stale.close();
+  }
+});
+
+test.each(['alias open', 'checkpoint', 'short write'] as const)(
+  'source file capture retries a failed %s within its alias byte allowance',
+  (failure) => {
+    const { receipts, standalone } = standaloneFixture();
+    const id = standalone.launchId;
+    const alias = standalone.standalone!.logAlias!;
+    const capture = receipts.capture(id, 2, true);
+    const slice = sourceSlice(receipts, id, 'stdout.log', 'abcd');
+    assert.throws(() => capture.write(slice.bytes, 'stdout.log', slice.cursor), /byte allowance/);
+    assert.equal(fs.statSync(alias).size, 0);
+    const cursor = { ...slice.cursor, offset: 2 };
+    const open = fs.openSync;
+    const rename = fs.renameSync;
+    const write = fs.writeSync;
+    let fired = false;
+    const opening = vi.spyOn(fs, 'openSync').mockImplementation((file, ...args) => {
+      if (failure === 'alias open' && String(file) === alias) {
+        fired = true;
+        throw Object.assign(new Error('alias busy'), { code: 'EPERM' });
+      }
+      return (open as any)(file, ...args);
+    });
+    const renaming = vi.spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+      if (failure === 'checkpoint' && String(to) === receipts.artifact(id, 'capture.json')) {
+        fired = true;
+        throw new Error('checkpoint unavailable');
+      }
+      return rename(from, to);
+    });
+    const writing = vi.spyOn(fs, 'writeSync').mockImplementation(((fd: number, buffer: any, ...args: any[]) => {
+      if (failure === 'short write' && Buffer.isBuffer(buffer) && buffer.equals(Buffer.from('ab'))) {
+        fired = true;
+        return (write as any)(fd, buffer, args[0], 1, args[2]);
+      }
+      return (write as any)(fd, buffer, ...args);
+    }) as typeof fs.writeSync);
+    syncBuiltinESMExports();
+    try {
+      if (failure === 'short write') capture.write(slice.bytes.subarray(0, 2), 'stdout.log', cursor);
+      else assert.throws(() => capture.write(slice.bytes.subarray(0, 2), 'stdout.log', cursor), /unavailable/);
+      assert.equal(fired, true);
+    } finally {
+      opening.mockRestore();
+      renaming.mockRestore();
+      writing.mockRestore();
+      syncBuiltinESMExports();
+      capture.close();
+    }
+    const resumed = receipts.capture(id, 2, true);
+    try {
+      resumed.flushAlias();
+      resumed.write(slice.bytes.subarray(0, 2), 'stdout.log', cursor);
+      assert.equal(fs.readFileSync(alias, 'utf8'), 'ab');
+      resumed.write(slice.bytes.subarray(2), 'stdout.log', slice.cursor);
+      assert.equal(fs.readFileSync(alias, 'utf8'), 'abcd');
+      assert.equal(resumed.cursor('stdout.log').offset, 4);
+      assert.equal(fs.statSync(receipts.artifact(id, 'worker.log')).size, 0);
+    } finally {
+      resumed.close();
+    }
+  },
+);
+
+test.each(['replaced', 'missing', 'reused', 'no witness'] as const)(
+  'source file capture keeps private output away from a %s alias',
+  (change) => {
+    const { receipts, standalone } = standaloneFixture();
+    const id = standalone.launchId;
+    const alias = standalone.standalone!.logAlias!;
+    const capture = receipts.capture(id, 3, true);
+    const first = sourceSlice(receipts, id, 'stdout.log', 'abc');
+    capture.write(first.bytes, 'stdout.log', first.cursor);
+    if (change === 'reused') {
+      const second = receipts.reserve({ ...standalone, origin: 'b'.repeat(24) });
+      receipts.capture(second.launchId, 3, true).close();
+    } else if (change === 'no witness') {
+      const file = receipts.artifact(id, 'capture.json');
+      const state = JSON.parse(fs.readFileSync(file, 'utf8'));
+      fs.writeFileSync(file, JSON.stringify({ ...state, alias: null }));
+    } else {
+      fs.renameSync(alias, alias + '.old');
+      if (change === 'replaced') fs.writeFileSync(alias, 'other');
+    }
+    const before = fs.existsSync(alias) ? fs.readFileSync(alias) : null;
+    const tail = sourceSlice(receipts, id, 'stdout.log', 'def');
+    try {
+      capture.write(tail.bytes, 'stdout.log', tail.cursor);
+      capture.flushAlias();
+      assert.deepEqual(fs.existsSync(alias) ? fs.readFileSync(alias) : null, before);
+      if (change === 'replaced' || change === 'missing') assert.equal(fs.readFileSync(alias + '.old', 'utf8'), 'abc');
+      assert.equal(fs.readFileSync(receipts.artifact(id, 'stdout.log'), 'utf8'), 'abcdef');
+      assert.equal(capture.cursor('stdout.log').offset, 6);
+    } finally {
+      capture.close();
+    }
+  },
+);
+
+test.each(['source replaced', 'source truncated', 'marker replaced', 'folder replaced'] as const)(
+  'source file capture refuses output after %s',
+  (change) => {
+    const { receipts, standalone } = standaloneFixture();
+    const id = standalone.launchId;
+    const capture = receipts.capture(id, 3, true);
+    const first = sourceSlice(receipts, id, 'stdout.log', 'abc');
+    capture.write(first.bytes, 'stdout.log', first.cursor);
+    const source = receipts.artifact(id, 'stdout.log');
+    const alias = standalone.standalone!.logAlias!;
+    if (change === 'source replaced') {
+      fs.renameSync(source, source + '.old');
+      fs.writeFileSync(source, 'other');
+    } else if (change === 'source truncated') fs.truncateSync(source, 1);
+    else if (change === 'marker replaced') {
+      const marker = receipts.artifact(id, 'worker.log');
+      fs.renameSync(marker, marker + '.old');
+      fs.writeFileSync(marker, '');
+    } else {
+      const folder = path.dirname(source);
+      fs.renameSync(folder, folder + '.old');
+      fs.mkdirSync(folder);
+      for (const name of fs.readdirSync(folder + '.old'))
+        fs.copyFileSync(path.join(folder + '.old', name), path.join(folder, name));
+    }
+    try {
+      assert.throws(() => capture.cursor('stdout.log'), /replaced|truncated/);
+      assert.equal(fs.readFileSync(alias, 'utf8'), 'abc');
+    } finally {
+      capture.close();
+    }
+  },
+);
+
+test.each(['alias', 'checkpoint'] as const)(
+  'source capture retains its witness after failed initial %s publication',
+  (failure) => {
+    const { receipts, standalone } = standaloneFixture();
+    const id = standalone.launchId;
+    const alias = standalone.standalone!.logAlias!;
+    const checkpoint = receipts.artifact(id, 'capture.json');
+    const rename = fs.renameSync;
+    const renaming = vi.spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+      if (String(to) === (failure === 'alias' ? alias : checkpoint)) throw new Error('publication unavailable');
+      return rename(from, to);
+    });
+    syncBuiltinESMExports();
+    try {
+      assert.throws(() => receipts.capture(id, 3, true), /requested log is unavailable/);
+    } finally {
+      renaming.mockRestore();
+      syncBuiltinESMExports();
+    }
+    assert.equal(fs.statSync(receipts.artifact(id, 'worker.log')).size, 0);
+    assert.equal(fs.existsSync(checkpoint), false);
+    fs.writeFileSync(alias, 'other');
+    const resumed = receipts.capture(id, 3, true);
+    try {
+      const slice = sourceSlice(receipts, id, 'stdout.log', 'abc');
+      resumed.write(slice.bytes, 'stdout.log', slice.cursor);
+      assert.equal(fs.readFileSync(alias, 'utf8'), 'other');
+      assert.equal(JSON.parse(fs.readFileSync(checkpoint, 'utf8')).alias, null);
+    } finally {
+      resumed.close();
+    }
+  },
+);
+
+test('source capture without its checkpoint never reclaims an alias', () => {
+  const { receipts, standalone } = standaloneFixture();
+  const id = standalone.launchId;
+  const alias = standalone.standalone!.logAlias!;
+  const capture = receipts.capture(id, 3, true);
+  const first = sourceSlice(receipts, id, 'stdout.log', 'abc');
+  capture.write(first.bytes, 'stdout.log', first.cursor);
+  capture.close();
+  fs.unlinkSync(receipts.artifact(id, 'capture.json'));
+  fs.renameSync(alias, alias + '.old');
+  fs.writeFileSync(alias, 'other');
+  const resumed = receipts.capture(id, 3, true);
+  try {
+    resumed.write(first.bytes, 'stdout.log', first.cursor);
+    assert.equal(fs.readFileSync(alias, 'utf8'), 'other');
+    assert.equal(fs.readFileSync(alias + '.old', 'utf8'), 'abc');
+    assert.equal(JSON.parse(fs.readFileSync(receipts.artifact(id, 'capture.json'), 'utf8')).alias, null);
+  } finally {
+    resumed.close();
+  }
+});
+
+test('source file capture selection preserves legacy checkpoints and native background capture', () => {
+  for (const background of [false, true]) {
+    const { receipts, standalone } = standaloneFixture(background ? nativeBackground : {});
+    const id = standalone.launchId;
+    const original = receipts.capture(id);
+    original.write(Buffer.from('diagnostic'));
+    original.close();
+    const resumed = receipts.capture(id, 3, true);
+    try {
+      if (background) {
+        resumed.native(Buffer.from('native'));
+        drainAlias(resumed);
+      } else resumed.write(Buffer.from(' tail'));
+      assert.equal(fs.readFileSync(standalone.standalone!.logAlias!, 'utf8'), background ? 'native' : 'diagnostic ta');
+      assert.equal(
+        fs.readFileSync(receipts.artifact(id, 'worker.log'), 'utf8'),
+        background ? 'diagnostic' : 'diagnostic tail',
+      );
+    } finally {
+      resumed.close();
+    }
+  }
+});
+
 test('concurrent channel captures retain each source byte once across stale cursors', () => {
   const { receipts, standalone } = standaloneFixture();
   const a = receipts.capture(standalone.launchId);

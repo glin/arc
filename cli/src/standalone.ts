@@ -1531,7 +1531,7 @@ async function openCapture<T>(construct: () => T, deadline: number, runtime = OB
 }
 
 function logCapture(receipts: DispatchReceipts, id: string, bounds: ReadBounds) {
-  const capture = receipts.capture(id, bounds.readBytes);
+  const capture = receipts.capture(id, bounds.readBytes, true);
   const sources = (() => {
     try {
       return (['stdout.log', 'stderr.log'] as const).map((name) => ({

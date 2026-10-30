@@ -487,16 +487,15 @@ test.each(['complete', 'budget', 'denied', 'transient', 'busy', 'busy-budget', '
       yield: async () => {
         assert.ok(++yields <= 32, 'Capture exceeded finite yields.');
         if (kind === 'transient' && fs.existsSync(receipts.artifact(id, 'capture.json'))) {
-          const state = artifactJson(receipts, id, 'capture.json');
-          if (state.sources['stderr.log']?.offset === stderr.length && ++aliasYields >= 2) blocked = false;
+          if (++aliasYields >= 2) blocked = false;
         }
       },
     })) as any;
     const cursor = artifactJson(receipts, id, 'capture.json');
-    assert.equal(cursor.sources['stdout.log'].offset, stdout.length);
+    assert.equal(cursor.sources['stdout.log']?.offset ?? 0, kind === 'denied' ? 0 : stdout.length);
     assert.equal(
       cursor.sources['stderr.log']?.offset ?? 0,
-      kind === 'busy-denied'
+      kind === 'busy-denied' || kind === 'denied'
         ? 0
         : kind === 'busy-budget'
           ? bounds.workBytes - bounds.readBytes
@@ -1273,7 +1272,7 @@ test.each([
   'init-cleanup',
   'producer-init',
 ] as const)(
-  'construction contention handles %s without losing output or capture ownership',
+  'legacy capture construction handles %s without losing output or capture ownership',
   { tags: ['subprocess'] },
   async (phase) => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
@@ -1333,7 +1332,7 @@ test.each([
       if (phase === 'invalid') throw new Error('The captured worker output was replaced.');
       if (phase === 'persistent' || (phase === 'construct' && attempts === 1))
         throw new Error('The dispatch write changed during recovery. Try again.');
-      const capture = construct(...args);
+      const capture = construct(args[0], args[1]);
       opened++;
       const close = capture.close;
       capture.close = () => {
@@ -1415,6 +1414,7 @@ test('pending final capture waits between alias attempts with a frozen clock', {
   const id = launch.launchId;
   const stdout = outputFrames();
   stoppedOutput(receipts, id, stdout, 'diagnostic');
+  receipts.capture(id).close();
   let attempts = 0;
   denyOpen(launch.standalone!.logAlias!, () => {
     assert.ok(++attempts <= 8, 'Alias attempts exceeded the tiny retry budget.');
@@ -1468,6 +1468,7 @@ test.each(['progress', 'exit'] as const)(
     const id = launch.launchId;
     fs.writeFileSync(receipts.artifact(id, 'stdout.log'), 'output');
     fs.writeFileSync(receipts.artifact(id, 'stderr.log'), 'diagnostic');
+    receipts.capture(id).close();
     const child = providerChild();
     vi.mocked(childProcess.spawn).mockReturnValue(child);
     let blocked = true;
@@ -1527,13 +1528,16 @@ test.each(
       return child;
     });
     let blocked = failure === 'denied' || failure === 'transient';
-    denyOpen(launch.standalone!.logAlias!, () => blocked);
+    let aliasAttempts = 0;
+    denyOpen(launch.standalone!.logAlias!, () => {
+      if (failure === 'transient' && ++aliasAttempts > 2) blocked = false;
+      return blocked;
+    });
     let flushes = 0;
     interceptCaptures(receipts, (result) => {
       const flush = result.flushAlias;
       result.flushAlias = () => {
         if (++flushes > 12) throw new Error('Finite alias invocation bound.');
-        if (failure === 'transient' && flushes > 2) blocked = false;
         if (failure === 'permanent-busy' || (failure === 'busy' && flushes === 2))
           throw new Error('Another process holds this dispatch write');
         return flush();
@@ -3198,6 +3202,7 @@ test.each(['complete', 'deadline'] as const)(
       reason: 'The requested log is incomplete. Private output remains available.',
     };
     stoppedOutput(receipts, id, stdout, stderr, owner);
+    receipts.capture(id).close();
     const alias = launch.standalone!.logAlias!;
     let blocked = true;
     const failure = denyOpen(alias, () => blocked);
@@ -3288,7 +3293,7 @@ test(
         },
       })) as any;
       const position = artifactJson(receipts, id, 'capture.json');
-      const captured = fs.readFileSync(receipts.artifact(id, 'worker.log'));
+      const captured = fs.readFileSync(alias);
       const expectedStderr = Math.min(stderr.length, previousStderr + bounds.workBytes);
       assert.equal(position.sources['stdout.log'].offset, stdout.length);
       assert.equal(position.sources['stderr.log'].offset, expectedStderr);
@@ -3588,7 +3593,6 @@ test(
     const spawns = vi.mocked(childProcess.spawn).mock.calls.length;
     const stdout = fs.readFileSync(receipts.artifact(launch.launchId, 'stdout.log'));
     const stderr = fs.readFileSync(receipts.artifact(launch.launchId, 'stderr.log'));
-    const raw = receipts.artifact(launch.launchId, 'worker.log');
     const log = launch.standalone!.logAlias!;
     const capturePosition = () => {
       const capture = receipts.capture(launch.launchId);
@@ -3599,7 +3603,7 @@ test(
       }
     };
     let captured = capturePosition();
-    let expected = fs.readFileSync(raw);
+    let expected = fs.readFileSync(log);
     assert.equal(captured.stderr, stderr.length);
     const diagnostic = expected.indexOf(stderr);
     assert.ok(diagnostic >= 0);
@@ -3633,12 +3637,12 @@ test(
         stdout.subarray(captured.stdout, next.stdout),
         stderr.subarray(captured.stderr, next.stderr),
       ]);
-      assert.deepEqual(fs.readFileSync(raw), expected);
       assert.deepEqual(fs.readFileSync(log), expected);
       captured = next;
     }
     assert.deepEqual(captured, { stdout: stdout.length, stderr: stderr.length });
     assert.equal(expected.length, stdout.length + stderr.length);
+    assert.equal(fs.statSync(receipts.artifact(launch.launchId, 'worker.log')).size, 0);
     assert.deepEqual(receipts.observation(launch.launchId)?.worker, worker);
     assert.deepEqual(receipts.observation(launch.launchId)?.launcher, launcher);
     assert.equal(vi.mocked(childProcess.spawn).mock.calls.length, spawns);
@@ -5286,10 +5290,15 @@ test(
       await vi.runAllTimersAsync();
       await pending;
       assert.equal(owner().state, 'unavailable');
-      assert.equal(fs.readFileSync(receipts.artifact(launch.launchId, 'worker.log'), 'utf8'), 'prefix final');
+      assert.equal(fs.readFileSync(stdout, 'utf8'), 'prefix final');
+      assert.equal(fs.statSync(receipts.artifact(launch.launchId, 'worker.log')).size, 0);
       blocked = false;
       const recovery = receipts.capture(launch.launchId);
       try {
+        const cursor = recovery.cursor('stdout.log');
+        const remaining = fs.readFileSync(stdout).subarray(cursor.offset);
+        cursor.offset += remaining.length;
+        recovery.write(remaining, 'stdout.log', cursor);
         assert.equal(recovery.flushAlias(), false);
       } finally {
         recovery.close();
@@ -5386,12 +5395,7 @@ const lateWatcher=fs.watch(process.cwd(),lateFinish);lateFinish();return;`;
       const stderr = fs.readFileSync(receipts.artifact(launch.launchId, 'stderr.log'));
       assert.equal(stdout.equals(Buffer.from(stdoutPrefix + (stderrEnding ? '' : terminal))), true);
       assert.equal(stderr.equals(Buffer.concat([diagnostic, ...(stderrEnding ? [Buffer.from(terminal)] : [])])), true);
-      const captured = fs.readFileSync(receipts.artifact(launch.launchId, 'worker.log'));
-      assert.equal(captured.length, stdout.length + stderr.length);
-      if (!stderrEnding) {
-        assert.equal(Buffer.from([...captured].filter((byte) => byte !== 255)).equals(stdout), true);
-        assert.equal([...captured].filter((byte) => byte === 255).length, diagnostic.length);
-      }
+      assert.equal(fs.statSync(receipts.artifact(launch.launchId, 'worker.log')).size, 0);
       assert.equal(fs.readFileSync(alias, 'utf8'), 'Second launch');
       assert.equal((receipts.result(launch.launchId, frozen!.eventId) as any).text, 'Frozen report');
       await superviseStandalone(

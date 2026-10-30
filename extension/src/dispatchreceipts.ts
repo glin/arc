@@ -30,6 +30,7 @@ interface CaptureState {
   bytes: number;
   sources: Partial<Record<CaptureSource, CaptureCursor>>;
 }
+type SourceCaptureState = CaptureState & { sourceFiles: true };
 export type DispatchOutcome = 'running' | 'succeeded' | 'failed' | 'interrupted' | 'needs-input' | 'unknown';
 export interface DispatchLaunch {
   launchId: string;
@@ -823,7 +824,189 @@ export class DispatchReceipts {
     this.launch(id);
     return this.file(id, name);
   }
-  capture(id: string, aliasByteBudget = CAPTURE_SLICE_BYTES) {
+  private captureSourceFiles(id: string, aliasByteBudget: number, options: StandaloneOptions) {
+    const alias = options.logAlias!;
+    const checkpoint = this.file(id, 'capture.json');
+    const marker = this.artifact(id, 'worker.log');
+    const load = () => {
+      this.launch(id);
+      const state = JSON.parse(readChanging(checkpoint)) as SourceCaptureState;
+      if (!state.sourceFiles || !Number.isSafeInteger(state.bytes) || state.bytes < 0)
+        throw new Error('The saved log position is unavailable.');
+      safePath(marker);
+      if (!equalIdentity(state.raw, identity(marker))) throw new Error('The captured worker output was replaced.');
+      for (const [name, cursor] of Object.entries(state.sources)) {
+        if (name !== 'stdout.log' && name !== 'stderr.log') throw new Error('The log source is invalid.');
+        const file = this.artifact(id, name);
+        safePath(file);
+        const stat = fs.statSync(file, { bigint: true });
+        if (
+          !stat.isFile() ||
+          `${stat.dev}:${stat.ino}` !== cursor.identity ||
+          !Number.isSafeInteger(cursor.offset) ||
+          cursor.offset < 0 ||
+          stat.size < BigInt(cursor.offset)
+        )
+          throw new Error('The original worker output was replaced or truncated.');
+      }
+      return state;
+    };
+    if (!fs.existsSync(checkpoint))
+      this.lock(
+        id,
+        () => {
+          if (fs.existsSync(checkpoint)) return;
+          try {
+            const existing = fs.existsSync(marker);
+            if (existing) safePath(marker);
+            else exclusive(marker, '');
+            const state: SourceCaptureState = {
+              sourceFiles: true,
+              raw: identity(marker),
+              alias: null,
+              aliasBytes: 0,
+              bytes: 0,
+              sources: {},
+            };
+            if (!existing) {
+              if (fs.existsSync(alias)) safePath(alias);
+              const temporary = path.join(path.dirname(alias), `.arc-log-${randomUUID()}`);
+              fs.writeFileSync(temporary, '', { flag: 'wx', mode: 0o600 });
+              try {
+                fs.renameSync(temporary, alias);
+              } catch (error) {
+                fs.unlinkSync(temporary);
+                throw error;
+              }
+              state.alias = identity(alias);
+            }
+            writeFileAtomically(checkpoint, JSON.stringify(state), this.replace, 0o600, false);
+          } catch (cause) {
+            throw new Error('The requested log is unavailable. Private output remains available.', { cause });
+          }
+        },
+        'capture-write',
+      );
+    load();
+    const openAlias = (state: SourceCaptureState) => {
+      if (!state.alias) return null;
+      try {
+        safePath(alias);
+        if (
+          !equalIdentity(options.logAliasParent!, identity(fs.realpathSync.native(path.dirname(alias)))) ||
+          !equalIdentity(state.alias, identity(alias))
+        )
+          return null;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+        throw error;
+      }
+      const fd = fs.openSync(alias, fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW ?? 0));
+      try {
+        const stat = fs.fstatSync(fd, { bigint: true });
+        if (!stat.isFile() || !equalIdentity(state.alias, { dev: String(stat.dev), ino: String(stat.ino) })) {
+          fs.closeSync(fd);
+          return null;
+        }
+        if (stat.size < BigInt(state.aliasBytes ?? 0)) throw new Error('The requested log was truncated.');
+        return fd;
+      } catch (error) {
+        fs.closeSync(fd);
+        throw error;
+      }
+    };
+    return {
+      delivered: () => load().aliasBytes ?? 0,
+      cursor: (name: CaptureSource): CaptureCursor => ({ ...(load().sources[name] ?? { offset: 0, identity: '' }) }),
+      write: (bytes: Buffer, name?: CaptureSource, cursor?: CaptureCursor) =>
+        this.lock(
+          id,
+          () => {
+            const state = load();
+            if (!name || name === 'native-source.log' || !cursor || bytes.length > aliasByteBudget)
+              throw new Error('The requested log exceeds its byte allowance or has no output file.');
+            const file = this.artifact(id, name);
+            safePath(file);
+            const stat = fs.statSync(file, { bigint: true });
+            if (!stat.isFile() || `${stat.dev}:${stat.ino}` !== cursor.identity || stat.size < BigInt(cursor.offset))
+              throw new Error('The original worker output was replaced or truncated.');
+            const committed = state.sources[name];
+            const start = cursor.offset - bytes.length;
+            if (
+              !Number.isSafeInteger(cursor.offset) ||
+              start < 0 ||
+              start > (committed?.offset ?? 0) ||
+              (committed && committed.identity !== cursor.identity)
+            )
+              throw new Error('The original worker output position changed.');
+            if (committed && cursor.offset <= committed.offset) {
+              Object.assign(cursor, committed);
+              return;
+            }
+            bytes = bytes.subarray(Math.max(0, (committed?.offset ?? 0) - start));
+            let fd: number | null = null;
+            try {
+              fd = openAlias(state);
+              if (fd !== null) {
+                let written = 0;
+                while (written < bytes.length) {
+                  const count = fs.writeSync(fd, bytes, written, bytes.length - written, state.bytes + written);
+                  if (!count) throw new Error('The requested log write is incomplete.');
+                  written += count;
+                }
+                fs.ftruncateSync(fd, state.bytes + written);
+                state.aliasBytes = state.bytes + written;
+              } else state.alias = null;
+            } catch (cause) {
+              // Uncommitted slices remain in the provider files for the next bounded attempt.
+              throw Object.assign(new Error('The requested log is temporarily unavailable.', { cause }), {
+                code: 'EPERM',
+              });
+            } finally {
+              if (fd !== null) fs.closeSync(fd);
+            }
+            state.bytes += bytes.length;
+            state.sources[name] = { ...cursor };
+            writeFileAtomically(checkpoint, JSON.stringify(state), this.replace, 0o600, false);
+          },
+          'capture-write',
+        ),
+      flushAlias: () => {
+        const state = load();
+        // A failed checkpoint can leave an alias tail that the next source slice will overwrite.
+        if (!state.alias) return false;
+        try {
+          safePath(alias);
+          if (!equalIdentity(state.alias, identity(alias)) || fs.statSync(alias).size === (state.aliasBytes ?? 0))
+            return false;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+          throw error;
+        }
+        return this.lock(
+          id,
+          () => {
+            const current = load();
+            const fd = openAlias(current);
+            if (fd !== null) {
+              try {
+                fs.ftruncateSync(fd, current.aliasBytes ?? 0);
+              } finally {
+                fs.closeSync(fd);
+              }
+            }
+            return false;
+          },
+          'capture-write',
+        );
+      },
+      native: (_bytes: Buffer, _cursor?: CaptureCursor) => {
+        throw new Error('This launch has no native log capture.');
+      },
+      close: () => {},
+    };
+  }
+  capture(id: string, aliasByteBudget = CAPTURE_SLICE_BYTES, sourceFiles = false) {
     if (!Number.isSafeInteger(aliasByteBudget) || aliasByteBudget <= 0)
       throw new Error('The log byte allowance must be a positive integer.');
     const options = this.launch(id).standalone;
@@ -837,6 +1020,9 @@ export class DispatchReceipts {
       throw new Error('The log folder was replaced.');
     const rawFile = this.artifact(id, 'worker.log');
     const checkpoint = this.file(id, 'capture.json');
+    const saved = fs.existsSync(checkpoint) ? JSON.parse(readChanging(checkpoint)) : null;
+    if (saved?.sourceFiles || (sourceFiles && !options.background && !saved && !fs.existsSync(rawFile)))
+      return this.captureSourceFiles(id, aliasByteBudget, options);
     let state: CaptureState = fs.existsSync(checkpoint)
       ? JSON.parse(readChanging(checkpoint))
       : this.lock(
