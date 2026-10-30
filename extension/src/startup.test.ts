@@ -15387,6 +15387,34 @@ test('a spend pass that settles a new cost posts a rail with that cost', () => {
   }
 });
 
+test('a pending-state check reads the spend history setting once for all its sources', () => {
+  let reads = 0;
+  const provider = railPostHarness(['postRailIfSpendPendingMoved', 'projectSpendHolds', 'projectSpendHistoryCutoff'], {
+    projectSpendHistoryCutoff,
+    spendSourceHeld,
+    snapshotHistoryDays: (key: string) => {
+      if (key === 'projectCost.historyDays') reads++;
+      return 30;
+    },
+  });
+  const files = Array.from({ length: 50 }, (_, at) => `source-${at}.jsonl`);
+  let asked = 0;
+  Object.assign(provider, {
+    projectSpendQueued: new Set(),
+    spendRecordsByFile: new Map(),
+    projectSpendFiles: [],
+    railPendingAnswers: null,
+    lifetimeFigures: {
+      pendingMoved: (holds: (file: string, record: undefined) => boolean) =>
+        files.filter((file) => (asked++, holds(file, undefined))).length > 0,
+    },
+    postDispatchedCostsIfMoved() {},
+  });
+  provider.postRailIfSpendPendingMoved('indexIdle', false);
+  assert.equal(asked, files.length, 'the check did not ask about every source');
+  assert.equal(reads, 1);
+});
+
 test('running agents that only grow their transcripts start no refresh from a spend pass and save on the maximum wait', async () => {
   vi.useFakeTimers();
   try {

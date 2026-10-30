@@ -11018,12 +11018,16 @@ export class PanelProvider implements vscode.Disposable {
 
   // Incomplete replacements keep dispatched completion pending, including after a failed read drains the queue.
   // Complete records also follow queued, unfinished-line, open-turn, and history-limit rules.
-  private projectSpendHolds(file: string, record: SpendFileIndex | undefined): boolean {
+  private projectSpendHolds(
+    file: string,
+    record: SpendFileIndex | undefined,
+    cutoff = this.projectSpendHistoryCutoff(),
+  ): boolean {
     const at = this.spendRecordsByFile?.get(file);
     const current = at === undefined ? record : this.projectSpendFiles[at];
     return (
       (current?.complete === false && current.missingAt === undefined) ||
-      spendSourceHeld(record, this.projectSpendQueued.has(file), this.projectSpendHistoryCutoff())
+      spendSourceHeld(record, this.projectSpendQueued.has(file), cutoff)
     );
   }
 
@@ -11032,7 +11036,9 @@ export class PanelProvider implements vscode.Disposable {
     caller: 'spendOffer' | 'integrityCheck' | 'indexIdle',
     costInputsMoved = true,
   ): void {
-    const holds: SpendSourcePending = (file, record) => this.projectSpendHolds(file, record);
+    // One setting read serves every source the check asks about.
+    const cutoff = this.projectSpendHistoryCutoff();
+    const holds: SpendSourcePending = (file, record) => this.projectSpendHolds(file, record, cutoff);
     const pendingMoved =
       this.lifetimeFigures.pendingMoved(holds) ||
       (this.railPendingAnswers !== null && this.lifetimeFigures.pendingMoved(holds, this.railPendingAnswers));
