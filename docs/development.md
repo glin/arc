@@ -28,15 +28,17 @@ npm run test:all
 
 ### Machine load
 
-A multi-lane test run admits each lane by its load class. Every `scripts/test-suite.mjs` command that selects more than one lane does this. These commands include `npm test`, `npm run test:all`, `npm run lint`, `npm run typecheck`, and `scripts/verify-landing.mjs`. `extension/test.mjs full` does this when its selection reaches both the Node and browser lanes. Its Node lane includes the integration tests, so it takes the admission of the `extension-integration` lane. A single lane, named files in one lane, and a direct Vitest run wait for no memory.
+A test run admits each lane by its load class. Every `scripts/test-suite.mjs` command does this, also for a single lane. These commands include `npm test`, `npm run test:all`, `npm run lint`, `npm run typecheck`, and `scripts/verify-landing.mjs`. `extension/test.mjs browser` takes the admission of the browser lane. `extension/test.mjs full` admits each lane when its selection reaches both the Node and browser lanes. Its Node lane includes the integration tests, so it takes the admission of the `extension-integration` lane. `extension/test.mjs node`, named files of `extension/test.mjs full` in one lane, and a direct Vitest run wait for no memory. Named browser files still take the browser lane lock.
 
 `LANE_LOADS` in `extension/test/machineload.mjs` gives every suite lane one of three classes:
 
 | Class | Lanes | Admission |
 | --- | --- | --- |
 | Static | Format, lint, type checks, webview globals, and the CLI build | The lane starts at once |
-| Unit | Unit, subprocess, hook smoke, and CLI smoke lanes | The run waits while free physical memory is under the lane's floor. Each floor is 1.5 times the lane's measured peak working set at four workers, and at least 1 GB |
-| Heavy | `browser`, `panel-mockup`, and `extension-integration` | The run takes the lane's lock, then waits while free physical memory is under 6 GB |
+| Unit | Unit, subprocess, hook smoke, and CLI smoke lanes | The run waits while free physical memory is under the lane's floor |
+| Heavy | `browser`, `panel-mockup`, and `extension-integration` | The run takes the lane's lock, then waits while free physical memory is under the lane's floor |
+
+Each floor is 1.5 times the lane's measured peak private working set at four workers, summed over the lane's process tree. A unit floor is at least 1 GB, and a heavy floor is at least 2 GB.
 
 Two runs can run different lanes at the same time, and the same static or unit lane at the same time. Only one run at a time holds the lock of a heavy lane. A run releases that lock when the lane ends. `extension/test.mjs browser` takes the browser lane lock as a single lane, and the [panel startup measurement](performance.md#startup-measurement) takes every heavy lane lock.
 
@@ -44,16 +46,16 @@ Each lock is `arc-<lane>-tests.lock` in the directory that `os.tmpdir()` returns
 
 While it waits for memory, a run prints the free memory and the floor every 30 seconds. Windows reads available physical memory. Linux reads `MemAvailable` from `/proc/meminfo`. macOS counts free, inactive, and speculative pages from `vm_stat`.
 
-A lane that an admitted run starts skips every memory wait, because its parent admitted it. The run marks its children with `ARC_TEST_SUITE_HOLDER`. A run counts as nested when that variable names another live process. A nested run still takes a heavy lane lock, unless the process that the variable names owns that lock.
+A lane that an admitted run starts skips every memory wait, because its parent admitted it. The run adds its PID and a random token to `ARC_TEST_SUITE_HOLDER` for its children. While it runs, it keeps a marker file for that token in the `arc-test-holders` directory beside the locks. A run counts as nested when that variable names another live process with a current marker. A nested run still takes a heavy lane lock, unless a process that the variable names owns that lock.
 
 | Variable | Effect | Default |
 | --- | --- | --- |
 | `ARC_TEST_LOAD_DEADLINE_MINUTES` | How long a run waits for each heavy lane lock, and how long it waits for memory before each lane | `40` |
-| `ARC_TEST_MEMORY_FLOOR_GB` | The free memory floor in GB for every unit and heavy lane. `0` disables the memory wait. The GitHub workflows set `0` | The floor of each lane class |
+| `ARC_TEST_MEMORY_FLOOR_GB` | The free memory floor in GB for every unit and heavy lane. `0` disables the memory wait. The GitHub workflows set `0` | The floor of each lane |
 
 | Exit status | Cause |
 | --- | --- |
-| `75` | Another run held a heavy lane lock, or earlier queued runs still waited, until the deadline. A suite report marks the waiting lane blocked and later lanes cancelled. `scripts/verify-landing.mjs` also exits `75` |
+| `75` | Another run held a heavy lane lock, or earlier queued runs still waited, until the deadline. A suite report marks the waiting lane blocked and later lanes cancelled, also when the lane's own child waited. `scripts/verify-landing.mjs` also exits `75` |
 | `76` | Free memory stayed under the floor until the deadline. A suite report marks the waiting lane blocked and later lanes cancelled. `scripts/verify-landing.mjs` also exits `76` |
 
 A Vitest lane runs at most four workers, as [Browser selection](testing.md#browser-selection) describes. `scripts/typecheck-parallel.js` runs two checks at a time. `extension/test/machineload.mjs` owns the lane classes, the lane locks, the memory read, and the worker cap.

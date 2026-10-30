@@ -9,7 +9,6 @@ import { pathRewriter, rebindDispatch } from './freeze';
 import { instrumentSelection, measureSelection, instrumentResponse, measureResponse } from './selection';
 import {
   appendDispatchTurn,
-  activeTestRuns,
   hostMemory,
   missingSoakMeasures,
   instrumentSoak,
@@ -156,7 +155,8 @@ function readOptions(argv: string[]): Options {
     response: false,
     soakMinutes: 0,
     warmUp: false,
-    minimumFreeGb: 5,
+    // 1.5 times the largest extension host peak working set that saved measurements record.
+    minimumFreeGb: 5.4,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const flag = argv[i];
@@ -889,19 +889,15 @@ export async function pollStartup(
 // Measures of the measured launch beyond its startup milestones, written into result.json.
 const runRecord: Record<string, unknown> = {};
 
-// Wait until no test run is active and free memory reaches the floor. A loaded machine skews every timing.
-// Static and unit lanes take no lock, so the process scan still applies.
+// Wait until free memory reaches the floor. The runner holds every heavy lane lock, so no heavy lane runs beside it.
+// Static and unit lanes can run beside it.
 async function awaitMachine(minimumFreeGb: number, deadlineMs: number): Promise<void> {
   const { freeMemoryBytes } = await import('../../test/machineload.mjs');
   const deadline = Date.now() + deadlineMs;
   for (;;) {
-    const runs = activeTestRuns();
     const free = freeMemoryBytes();
-    if (runs === 0 && free >= minimumFreeGb * 1024 ** 3) return;
-    const busy =
-      runs > 0
-        ? `${runs} test-suite or verify-landing processes are running.`
-        : `Free memory is ${(free / 1024 ** 3).toFixed(1)} GB, below the ${minimumFreeGb} GB floor.`;
+    if (free >= minimumFreeGb * 1024 ** 3) return;
+    const busy = `Free memory is ${(free / 1024 ** 3).toFixed(1)} GB, below the ${minimumFreeGb} GB floor.`;
     if (Date.now() >= deadline) throw new Error(`The machine stayed loaded: ${busy}`);
     process.stdout.write(`Waiting before launch. ${busy}\n`);
     await delay(30_000);

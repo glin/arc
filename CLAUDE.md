@@ -47,7 +47,7 @@ Before committing, check changed documentation, comments, and product messages a
 
 Read `docs/development.md` before installing dependencies, repairing the panel-mockup link, linking worktree dependencies, or profiling.
 
-Only one session at a time runs a heavy test lane, such as the browser lane, and the [suite runner](docs/development.md#machine-load) enforces it.
+Only one session at a time runs each heavy test lane, such as the browser lane, and the [suite runner](docs/development.md#machine-load) enforces it.
 
 Use the diagnostic capture script in [Performance capture](docs/performance.md#performance-capture) for performance investigations and diagnostic requests.
 

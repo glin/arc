@@ -18,7 +18,12 @@ import { fileURLToPath } from 'node:url';
 import { runLanes } from './test-lanes.mjs';
 import { subprocessVitestArgs } from './test-subprocess.mjs';
 import { createTestObservation } from '../extension/test/observations.mjs';
-import { holdMachineLoad, MachineLoadTimeout } from '../extension/test/machineload.mjs';
+import {
+  holdMachineLoad,
+  LANE_LOCK_TIMEOUT_EXIT,
+  MachineLoadTimeout,
+  MEMORY_TIMEOUT_EXIT,
+} from '../extension/test/machineload.mjs';
 
 export const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const hash = (value) => createHash('sha256').update(value).digest('hex');
@@ -253,14 +258,11 @@ export function laneCommand(lane, tests) {
   ];
 }
 
-// A run of more than one lane admits each lane by its load class in extension/test/machineload.mjs.
+// A run admits each lane by its load class in extension/test/machineload.mjs, also when it selects one lane.
 // machineLoad carries injected lock and memory options, and false disables the guard.
 export async function collectSuite({ machineLoad = {}, ...options } = {}) {
   const lanes = options.lanes ?? suiteLanes(options.cwd ?? root, options.mode ?? 'all');
-  return holdMachineLoad(
-    (beforeLane) => collectLanes({ ...options, lanes, beforeLane }),
-    lanes.length > 1 ? machineLoad : false,
-  );
+  return holdMachineLoad((beforeLane) => collectLanes({ ...options, lanes, beforeLane }), machineLoad);
 }
 
 // Return the exit status for a command entry point, including the named machine load timeouts.
@@ -415,6 +417,16 @@ async function collectLanes({
         } catch (error) {
           if (category.status !== 'cancelled') category.status = 'failed';
           category.reason = error.message;
+        }
+        // A lane child that waited past its own machine load deadline exits with that status, as a single lane does.
+        if (
+          category.status !== 'cancelled' &&
+          [LANE_LOCK_TIMEOUT_EXIT, MEMORY_TIMEOUT_EXIT].includes(category.exitCode)
+        ) {
+          category.status = 'blocked';
+          category.reason = `The ${lane.id} lane did not start before its machine load deadline. It exited ${category.exitCode}.`;
+          loadTimeout ??= { exitCode: category.exitCode, message: category.reason };
+          controller.abort();
         }
       }
       if (category.status !== 'passed' && !category.failures.length)

@@ -272,44 +272,6 @@ export function hostMemory(pid: number): HostMemory | null {
   return rss > 0 ? { pid, workingSetBytes: rss * 1024, peakWorkingSetBytes: null, privateBytes: null } : null;
 }
 
-export interface ProcessEntry {
-  pid: number;
-  parent: number;
-  command: string;
-}
-
-// Count test-suite and verify-landing processes that run work, including lanes that take no lock. A run counts when it
-// has a child that is not another run process, so a shell that starts a run does not count again. A run that waits for
-// a heavy lane lock has no child process, so it does not count.
-export function runningTestRuns(processes: readonly ProcessEntry[]): number {
-  const run = (entry: ProcessEntry) =>
-    /^(?:"[^"]*node(?:\.exe)?"|\S*node(?:\.exe)?)\s/i.test(entry.command) &&
-    /(?:test-suite|verify-landing)\.mjs/.test(entry.command);
-  const working = new Set(processes.filter((entry) => !run(entry)).map((entry) => entry.parent));
-  return processes.filter((entry) => run(entry) && working.has(entry.pid)).length;
-}
-
-export function activeTestRuns(): number {
-  if (process.platform === 'win32') {
-    const query =
-      'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CommandLine | ConvertTo-Json -Compress';
-    const rows = JSON.parse(
-      spawnSync('powershell', ['-NoProfile', '-Command', query], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
-        .stdout,
-    ) as Array<{ ProcessId: number; ParentProcessId: number; CommandLine: string | null }>;
-    return runningTestRuns(
-      rows.map((row) => ({ pid: row.ProcessId, parent: row.ParentProcessId, command: row.CommandLine ?? '' })),
-    );
-  }
-  return runningTestRuns(
-    spawnSync('ps', ['-eo', 'pid=,ppid=,args='], { encoding: 'utf8' })
-      .stdout.split('\n')
-      .map((line) => /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line))
-      .filter((match): match is RegExpExecArray => match !== null)
-      .map((match) => ({ pid: Number(match[1]), parent: Number(match[2]), command: match[3] })),
-  );
-}
-
 // The discovery counters every build since the comparison landed reports. A soak whose end snapshot lacks one is
 // incomplete, so a missing counter never passes as within its margin.
 export const REQUIRED_DISCOVERY_MEASURES = [

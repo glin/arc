@@ -284,8 +284,13 @@ test('command entry points run through a linked checkout', { tags: ['subprocess'
     assert.match(fullOutput, /Node child selected/);
     assert.doesNotMatch(fullOutput, /Browser lane|unexpected browser/);
     write('extension/node_modules/vitest/vitest.mjs', 'process.exit(143);');
+    // Its own temporary directory keeps its lane locks away from real runs and from the killed run's lock.
+    const cancelTemp = path.join(root, 'cancel-temp');
+    fs.mkdirSync(cancelTemp);
     const nestedCancellation = spawnSync(process.execPath, [path.join(linked, 'extension/test.mjs'), 'full'], {
       encoding: 'utf8',
+      timeout: 60_000,
+      env: { ...process.env, TEMP: cancelTemp, TMP: cancelTemp, TMPDIR: cancelTemp },
     });
     assert.equal(nestedCancellation.status, 143);
     // Full mode over both lanes takes each heavy lane lock and waits for free memory. A named file in one lane waits for
@@ -306,6 +311,11 @@ test('command entry points run through a linked checkout', { tags: ['subprocess'
     const starvedFull = fullRun([], { ARC_TEST_MEMORY_FLOOR_GB: '100000' });
     assert.equal(starvedFull.status, 76, starvedFull.stdout + starvedFull.stderr);
     assert.doesNotMatch(starvedFull.stdout, /Node lane:/);
+    const starvedBrowser = spawnSync(process.execPath, [path.join(linked, 'extension/test.mjs'), 'browser'], {
+      encoding: 'utf8',
+      env: loadEnv({ ARC_TEST_MEMORY_FLOOR_GB: '100000' }),
+    });
+    assert.equal(starvedBrowser.status, 76, starvedBrowser.stdout + starvedBrowser.stderr);
     const laneLock = path.join(loadTemp, 'arc-extension-integration-tests.lock');
     fs.writeFileSync(laneLock, JSON.stringify({ pid: process.pid, startedAt: 'earlier', command: 'holder' }));
     const heldFull = fullRun([], { ARC_TEST_MEMORY_FLOOR_GB: '0' });
@@ -1722,7 +1732,7 @@ test('every suite lane has a load class, and only the browser, panel-mockup, and
   );
   assert.deepEqual([...machine.HEAVY_LANES].sort(), ['browser', 'extension-integration', 'panel-mockup']);
   for (const [id, load] of Object.entries(machine.LANE_LOADS))
-    assert.ok(load.lock ? load.floorGb === 6 : load.floorGb === 0 || load.floorGb >= 1, id);
+    assert.ok(load.lock ? load.floorGb >= 2 : load.floorGb === 0 || load.floorGb >= 1, id);
   const { BROWSER_LOCK_PATH } = await import('../extension/test/browserlock.mjs');
   assert.equal(machine.laneLockPath('browser'), BROWSER_LOCK_PATH);
 });
@@ -2028,6 +2038,7 @@ test('static lanes start at once, and unit and heavy lanes wait for their own me
 });
 
 test('a heavy lane lock recovers from a dead holder, admits nested runs, and times out with its own status', async () => {
+  const machine = await import('../extension/test/machineload.mjs');
   vi.spyOn(console, 'log').mockImplementation(() => {});
   const errors = [];
   vi.spyOn(console, 'error').mockImplementation((line) => errors.push(line));
@@ -2054,10 +2065,36 @@ test('a heavy lane lock recovers from a dead holder, admits nested runs, and tim
 
     // A run that the lock holder started skips the lock and every memory wait.
     hold(2002);
-    const nested = { ...load.machineLoad, env: { ARC_TEST_SUITE_HOLDER: '2002' }, readFree: () => 0 };
+    const holderEnv = {};
+    const unmark = machine.markHolder(holderEnv, {
+      pid: 2002,
+      lockDirectory: fixture.directory,
+      processEmitter: new EventEmitter(),
+    });
+    const nested = { ...load.machineLoad, env: { ...holderEnv }, readFree: () => 0 };
     assert.equal(await run('nested', nested), 0);
     assert.equal(JSON.parse(fs.readFileSync(lockPath)).pid, 2002);
     assert.equal(launched.length, 6);
+
+    // A holder entry without its marker file admits nothing, even when it names the live lock owner.
+    const forged = run('forged', {
+      ...load.machineLoad,
+      env: { ARC_TEST_LOAD_DEADLINE_MINUTES: '1', ARC_TEST_SUITE_HOLDER: '2002:forged' },
+      readFree: () => 0,
+    });
+    await load.tick(60_000);
+    assert.equal(await forged, 76);
+    assert.deepEqual(launched.slice(6), ['forged:static']);
+    unmark();
+    assert.deepEqual(fs.readdirSync(path.join(fixture.directory, 'arc-test-holders')), []);
+
+    // A lock file that an earlier process with this run's PID left behind is not this run's lock.
+    hold(1002);
+    const recycled = run('recycled', { ...load.machineLoad, env: { ARC_TEST_LOAD_DEADLINE_MINUTES: '1' } });
+    await load.tick(60_000);
+    assert.equal(await recycled, 75);
+    assert.deepEqual(launched.slice(7), ['recycled:static', 'recycled:unit']);
+    hold(2002);
 
     // A live marker that does not own the lock admits nothing.
     const timedOut = run('timeout', {
@@ -2066,11 +2103,83 @@ test('a heavy lane lock recovers from a dead holder, admits nested runs, and tim
     });
     await load.tick(60_000);
     assert.equal(await timedOut, 75);
-    assert.deepEqual(launched.slice(6), ['timeout:static', 'timeout:unit']);
+    assert.deepEqual(launched.slice(9), ['timeout:static', 'timeout:unit']);
     assert.match(
       errors.at(-1),
       /another run held its machine lock for 1 min.*The holder was PID 2002, started earlier, running other suite\./,
     );
+  } finally {
+    fs.rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('a grandchild run counts as nested for a lock that its grandparent holds', async () => {
+  const machine = await import('../extension/test/machineload.mjs');
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-holder-chain-'));
+  const emitter = new EventEmitter();
+  const env = {};
+  const quiet = { lockDirectory: directory, isProcessAlive: () => true, processEmitter: emitter, log: () => {} };
+  try {
+    fs.writeFileSync(machine.laneLockPath('browser', directory), JSON.stringify({ pid: 2002, startedAt: 'earlier' }));
+    const unmarkParent = machine.markHolder(env, { pid: 2002, lockDirectory: directory, processEmitter: emitter });
+    const child = await machine.acquireLaneLock({ lane: 'extension-integration', env, pid: 2003, ...quiet });
+    assert.equal(child.nested, false);
+    const unavailable = [];
+    const grandchild = await machine.acquireLaneLock({
+      lane: 'browser',
+      env: { ...env },
+      pid: 2004,
+      deadlineMs: 1,
+      observation: { unavailable: (phase) => unavailable.push(phase) },
+      ...quiet,
+    });
+    assert.equal(grandchild.nested, true);
+    assert.deepEqual(unavailable, ['queue']);
+    child.release();
+    unmarkParent();
+    assert.equal(env.ARC_TEST_SUITE_HOLDER, undefined);
+    assert.deepEqual(fs.readdirSync(path.join(directory, 'arc-test-holders')), []);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('a single heavy lane selection takes its lane lock', async () => {
+  vi.spyOn(console, 'log').mockImplementation(() => {});
+  vi.spyOn(console, 'error').mockImplementation(() => {});
+  const fixture = collectionFixture();
+  const waiting = suiteLoadFixture(fixture.directory, 1010, { env: { ARC_TEST_LOAD_DEADLINE_MINUTES: '1' } });
+  fs.writeFileSync(waiting.lockPath, JSON.stringify({ pid: 1001, startedAt: 'earlier', command: 'holder' }));
+  const launched = [];
+  try {
+    const status = suite.runSuiteCommand({
+      ...fixture.options,
+      lanes: [loadLanes(fixture.directory)[2]],
+      machineLoad: waiting.machineLoad,
+      runChecks: passingLanes(launched),
+    });
+    await waiting.tick(60_000);
+    assert.equal(await status, 75);
+    assert.deepEqual(launched, []);
+  } finally {
+    fs.rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('a single lane whose child waited past its machine load deadline reports that status', async () => {
+  const fixture = collectionFixture();
+  vi.spyOn(console, 'log').mockImplementation(() => {});
+  try {
+    const report = await suite.collectSuite({
+      ...fixture.options,
+      lanes: [fixture.lanes[0]],
+      runChecks: async (_lanes, settings) => {
+        settings.onResult({ status: 75 });
+        return ['first'];
+      },
+    });
+    assert.equal(report.exitCode, 75);
+    assert.equal(report.categories[0].status, 'blocked');
   } finally {
     fs.rmSync(fixture.directory, { recursive: true, force: true });
   }

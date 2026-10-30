@@ -1,25 +1,25 @@
 // Plain Node ESM lets extension/test.mjs and the root suite runner import this module.
-// A multi-lane test run admits each lane by its load class. Static lanes start at once, and unit lanes wait for their
-// memory floor. A heavy lane takes its own machine lock, so one run of that lane uses the machine at a time, and then
-// waits for the heavy floor. Every Vitest lane runs at most four workers.
+// A test run admits each lane by its load class. Static lanes start at once, and unit lanes wait for their memory
+// floor. A heavy lane takes its own machine lock, so one run of that lane uses the machine at a time, and then waits
+// for its memory floor. Every Vitest lane runs at most four workers.
 // The lane locks use the lock code of browserlock.mjs, including its stale-holder takeover and its three-run race.
 import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { availableParallelism, freemem, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { processExists } from './browserchannels.mjs';
 import { acquireBrowserLock } from './browserlock.mjs';
 
-// A top-level run and a lock holder set this to their PID for their children, so a lane that an admitted run starts
-// does not wait again.
-// A run counts as nested when that PID is another live process. A nested run skips memory waits, and it takes a heavy
-// lane lock unless that process owns it.
+// A top-level run and a lock holder add an entry to this chain for their children, so a lane that an admitted run
+// starts does not wait again. Each entry is PID:token, and the holder keeps a marker file for the token while it runs.
+// A run counts as nested when an entry names another live process with its marker file. A nested run skips memory
+// waits, and it takes a heavy lane lock unless such a process owns it.
 export const SUITE_HOLDER_ENV = 'ARC_TEST_SUITE_HOLDER';
 export const DEADLINE_ENV = 'ARC_TEST_LOAD_DEADLINE_MINUTES';
 export const MEMORY_FLOOR_ENV = 'ARC_TEST_MEMORY_FLOOR_GB';
 export const DEFAULT_DEADLINE_MINUTES = 40;
-export const HEAVY_MEMORY_FLOOR_GB = 6;
 export const LANE_LOCK_TIMEOUT_EXIT = 75;
 export const MEMORY_TIMEOUT_EXIT = 76;
 export const MAX_VITEST_WORKERS = 4;
@@ -27,11 +27,11 @@ const NOTICE_MS = 30_000;
 const MEMORY_POLL_MS = 5_000;
 const GIB = 1024 ** 3;
 
-// Each unit floor is 1.5 times the lane's measured peak working set at four workers, and never under 1 GB.
-// The plan entry for the per-lane lock records the measurements.
+// Each floor is 1.5 times the lane's measured peak private working set at four workers, summed over its process tree.
+// A unit floor is at least 1 GB, and a heavy floor is at least 2 GB. The performance plan records the measurements.
 const STATIC = Object.freeze({ floorGb: 0, lock: false });
 const unit = (floorGb) => Object.freeze({ floorGb, lock: false });
-const HEAVY = Object.freeze({ floorGb: HEAVY_MEMORY_FLOOR_GB, lock: true });
+const heavy = (floorGb) => Object.freeze({ floorGb, lock: true });
 export const LANE_LOADS = Object.freeze({
   format: STATIC,
   'lint-js': STATIC,
@@ -42,14 +42,14 @@ export const LANE_LOADS = Object.freeze({
   'cli-tsc': STATIC,
   'cli-build': STATIC,
   'root-units': unit(1),
-  'extension-units': unit(4.5),
-  'cli-units': unit(2.2),
-  'root-subprocess': unit(2),
+  'extension-units': unit(3.6),
+  'cli-units': unit(1.5),
+  'root-subprocess': unit(1),
   'hook-smoke': unit(1),
-  'cli-smoke': unit(3),
-  browser: HEAVY,
-  'panel-mockup': HEAVY,
-  'extension-integration': HEAVY,
+  'cli-smoke': unit(2.8),
+  browser: heavy(4),
+  'panel-mockup': heavy(2),
+  'extension-integration': heavy(5.2),
 });
 export const HEAVY_LANES = Object.freeze(Object.keys(LANE_LOADS).filter((lane) => LANE_LOADS[lane].lock));
 
@@ -164,14 +164,51 @@ function describeHolder(owner) {
   return `PID ${owner.pid}, ${started}${command}`;
 }
 
-// A live process other than this one that SUITE_HOLDER_ENV names, or null.
-function liveHolder(env, pid, isProcessAlive) {
-  const holder = Number(env[SUITE_HOLDER_ENV]);
-  return Number.isInteger(holder) && holder > 0 && holder !== pid && isProcessAlive(holder) ? holder : null;
+const markerPath = (directory, pid, token) => join(directory ?? tmpdir(), 'arc-test-holders', `${pid}-${token}`);
+
+function holderEntries(env) {
+  return String(env[SUITE_HOLDER_ENV] ?? '')
+    .split(' ')
+    .map((entry) => /^(\d+):([\w-]+)$/.exec(entry))
+    .filter(Boolean)
+    .map(([, pid, token]) => ({ pid: Number(pid), token }));
 }
 
-// Take a heavy lane's machine lock. The run is nested when this process or the live holder named by
-// SUITE_HOLDER_ENV already owns the lock. The holder's children inherit SUITE_HOLDER_ENV until release.
+// The live processes other than this one that SUITE_HOLDER_ENV names with a current marker file.
+// A stale or copied value names a process that ended, or a token without a marker, so it admits nothing.
+export function admittedHolders(env, { pid = process.pid, isProcessAlive = processExists, lockDirectory } = {}) {
+  return holderEntries(env)
+    .filter((entry) => entry.pid !== pid && isProcessAlive(entry.pid))
+    .filter((entry) => existsSync(markerPath(lockDirectory, entry.pid, entry.token)))
+    .map((entry) => entry.pid);
+}
+
+// Add this process to the holder chain for its children, and return the function that removes it.
+// A process that the chain already names with a current marker keeps that entry.
+export function markHolder(env, { pid = process.pid, lockDirectory, processEmitter = process } = {}) {
+  if (holderEntries(env).some((entry) => entry.pid === pid && existsSync(markerPath(lockDirectory, pid, entry.token))))
+    return () => {};
+  const token = randomUUID();
+  const marker = markerPath(lockDirectory, pid, token);
+  mkdirSync(join(marker, '..'), { recursive: true });
+  writeFileSync(marker, '');
+  const removeMarker = () => rmSync(marker, { force: true });
+  processEmitter.once('exit', removeMarker);
+  const previous = env[SUITE_HOLDER_ENV];
+  env[SUITE_HOLDER_ENV] = [previous, `${pid}:${token}`].filter(Boolean).join(' ');
+  return () => {
+    processEmitter.off('exit', removeMarker);
+    removeMarker();
+    if (previous === undefined) delete env[SUITE_HOLDER_ENV];
+    else env[SUITE_HOLDER_ENV] = previous;
+  };
+}
+
+// The lane locks that each process in this module holds, so a second request from that process counts as nested.
+const heldLocks = new Set();
+
+// Take a heavy lane's machine lock. The run is nested when this process holds the lock, or when an admitted holder
+// in SUITE_HOLDER_ENV owns it. The holder's children inherit its entry in SUITE_HOLDER_ENV until release.
 // A cancelled signal ends the wait and returns null.
 export async function acquireLaneLock({
   lane,
@@ -186,9 +223,15 @@ export async function acquireLaneLock({
   isProcessAlive = processExists,
   ...lockOptions
 }) {
+  const held = `${pid}|${lockPath}`;
   const owner = lockOwnerPid(lockPath);
-  if (owner !== null && (owner === pid || owner === liveHolder(env, pid, isProcessAlive)))
+  if (
+    heldLocks.has(held) ||
+    (owner !== null && admittedHolders(env, { pid, isProcessAlive, lockDirectory }).includes(owner))
+  ) {
+    lockOptions.observation?.unavailable('queue', 'The run that started this lane holds its lock.');
     return { nested: true, release: () => false };
+  }
   let lastNotice = null;
   let lock;
   try {
@@ -223,13 +266,13 @@ export async function acquireLaneLock({
       LANE_LOCK_TIMEOUT_EXIT,
     );
   }
-  const previous = env[SUITE_HOLDER_ENV];
-  env[SUITE_HOLDER_ENV] = String(pid);
+  heldLocks.add(held);
+  const unmark = markHolder(env, { pid, lockDirectory, processEmitter: lockOptions.processEmitter });
   return {
     nested: false,
     release() {
-      if (previous === undefined) delete env[SUITE_HOLDER_ENV];
-      else env[SUITE_HOLDER_ENV] = previous;
+      unmark();
+      heldLocks.delete(held);
       return lock.release();
     },
   };
@@ -251,14 +294,16 @@ export async function holdMachineLoad(run, options = {}) {
     monotonicNow,
     waitForPoll,
     memoryPollMs,
+    lockDirectory,
     ...lockOptions
   } = options;
   const { deadlineMs, floorGb } = loadSettings(env);
-  const nested = liveHolder(env, pid, isProcessAlive) !== null;
+  const nested = admittedHolders(env, { pid, isProcessAlive, lockDirectory }).length > 0;
   const held = new Set();
   // A top-level run marks its children, so a run that one of its lanes starts counts as nested.
-  const previous = env[SUITE_HOLDER_ENV];
-  if (!nested) env[SUITE_HOLDER_ENV] = String(pid);
+  const unmark = nested
+    ? () => {}
+    : markHolder(env, { pid, lockDirectory, processEmitter: lockOptions.processEmitter });
   try {
     return await run(async (lane, label, signal) => {
       const load = lane.load ?? LANE_LOADS[lane.id];
@@ -275,6 +320,7 @@ export async function holdMachineLoad(run, options = {}) {
             monotonicNow,
             waitForPoll,
             signal,
+            lockDirectory,
             ...lockOptions,
           })
         : null;
@@ -306,10 +352,7 @@ export async function holdMachineLoad(run, options = {}) {
     });
   } finally {
     for (const release of held) release();
-    if (!nested) {
-      if (previous === undefined) delete env[SUITE_HOLDER_ENV];
-      else env[SUITE_HOLDER_ENV] = previous;
-    }
+    unmark();
   }
 }
 
