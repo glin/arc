@@ -1638,6 +1638,7 @@ test.each(['alias open', 'checkpoint', 'short write'] as const)(
     const rename = fs.renameSync;
     const write = fs.writeSync;
     let fired = false;
+    let checkpointWrites = 0;
     const opening = vi.spyOn(fs, 'openSync').mockImplementation((file, ...args) => {
       if (failure === 'alias open' && String(file) === alias) {
         fired = true;
@@ -1647,8 +1648,10 @@ test.each(['alias open', 'checkpoint', 'short write'] as const)(
     });
     const renaming = vi.spyOn(fs, 'renameSync').mockImplementation((from, to) => {
       if (failure === 'checkpoint' && String(to) === receipts.artifact(id, 'capture.json')) {
-        fired = true;
-        throw new Error('checkpoint unavailable');
+        if (++checkpointWrites === 2) {
+          fired = true;
+          throw new Error('checkpoint unavailable');
+        }
       }
       return rename(from, to);
     });
@@ -1664,6 +1667,14 @@ test.each(['alias open', 'checkpoint', 'short write'] as const)(
       if (failure === 'short write') capture.write(slice.bytes.subarray(0, 2), 'stdout.log', cursor);
       else assert.throws(() => capture.write(slice.bytes.subarray(0, 2), 'stdout.log', cursor), /unavailable/);
       assert.equal(fired, true);
+      if (failure === 'checkpoint') {
+        assert.equal(fs.readFileSync(alias, 'utf8'), 'ab');
+        const saved = JSON.parse(fs.readFileSync(receipts.artifact(id, 'capture.json'), 'utf8'));
+        assert.equal(saved.bytes, 0);
+        assert.equal(saved.aliasBytes ?? 0, 0);
+        assert.equal(saved.sources['stdout.log'], undefined);
+        assert.equal(saved.pending.offset, 2);
+      }
     } finally {
       opening.mockRestore();
       renaming.mockRestore();
@@ -1673,7 +1684,7 @@ test.each(['alias open', 'checkpoint', 'short write'] as const)(
     }
     const resumed = receipts.capture(id, 2, true);
     try {
-      resumed.flushAlias();
+      if (failure !== 'checkpoint') resumed.flushAlias();
       resumed.write(slice.bytes.subarray(0, 2), 'stdout.log', cursor);
       assert.equal(fs.readFileSync(alias, 'utf8'), 'ab');
       resumed.write(slice.bytes.subarray(2), 'stdout.log', slice.cursor);
