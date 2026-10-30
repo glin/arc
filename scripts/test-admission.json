@@ -136,8 +136,8 @@
   },
   "extension/src/progressiveworker.test.ts": {
     "reason": "Worker protocol, cancellation, host death, bounded transcript reads, and scoped subagent edit reads must survive the actual worker boundary.",
-    "cases": 151,
-    "matricesSha256": "c99e7ccf4064bc3d68923e9f2436e9a4dce3d6859c8f16f328f26ffad6954117"
+    "cases": 152,
+    "matricesSha256": "cb89a9095ade5c26ce81f8e3453602f049aaa0485a79de6aaba3efb22527d39e"
   },
   "extension/src/projectsetups.test.ts": {
     "reason": "Real Git worktrees and canonical filesystem aliases must share project identity while clones stay distinct.",

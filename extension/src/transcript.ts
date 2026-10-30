@@ -4229,12 +4229,17 @@ export class RelationshipReader {
     this.deadline = Number.isFinite(budget) ? performance.now() + RELATIONSHIP_SLICE_MS : Infinity;
     this.check();
   }
+  // Every read stops at the opening size, so an append to the same file leaves the bytes this reader returns unchanged. The
+  // next scan checks the grown file against its final blocks, as it does for growth between scans.
   check(): boolean {
     if (this.capturedSizeOnly) return true;
+    const unchanged = (stamp: RelationshipStamp) =>
+      sameRelationshipStamp(this.stamp, stamp) ||
+      (stamp.dev === this.stamp.dev && stamp.ino === this.stamp.ino && stamp.size > this.stamp.size);
     try {
       this.stable &&=
-        sameRelationshipStamp(this.stamp, relationshipStamp(this.fd.stat({ bigint: true }))) &&
-        sameRelationshipStamp(this.stamp, relationshipStamp(rolloutStat(this.file, { bigint: true }, fs)));
+        unchanged(relationshipStamp(this.fd.stat({ bigint: true }))) &&
+        unchanged(relationshipStamp(rolloutStat(this.file, { bigint: true }, fs)));
     } catch {
       this.stable = false;
     }

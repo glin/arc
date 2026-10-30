@@ -324,6 +324,80 @@ test.each(['added', 'removed', 'requester removed', 'added before the launches a
   },
 );
 
+// The worker appends one record to a live transcript after every read of it, as an agent writing that session would.
+const liveWriters = (files: readonly string[]) =>
+  `const liveFs=require('node:fs'),livePort=require('node:worker_threads').parentPort,liveFiles=new Set(${JSON.stringify(files.map((file) => normalizeFsPath(file)))}),liveFds=new Map(),liveOpen=liveFs.openSync,liveRead=liveFs.readSync,liveClose=liveFs.closeSync;let liveAppends=0;liveFs.openSync=function(p,...a){const fd=liveOpen.call(this,p,...a);const key=String(p).replace(/\\\\/g,'/').toLowerCase();for(const file of liveFiles)if(file.replace(/\\\\/g,'/').toLowerCase()===key)liveFds.set(fd,String(p));return fd;};liveFs.closeSync=function(fd,...a){liveFds.delete(fd);return liveClose.call(this,fd,...a);};liveFs.readSync=function(fd,...a){const count=liveRead.call(this,fd,...a);const file=liveFds.get(fd);if(file){liveFs.appendFileSync(file,JSON.stringify({type:'progress',data:{n:++liveAppends}})+'\\n');if(liveAppends%64===1)livePort.postMessage({repeatedCoverage:'live-append'});}return count;};`;
+
+// Writers that append during every read leave no quiet read. A pass still completes, so discovery publishes in a few continuations.
+test('receipt discovery publishes while several Claude roots keep appending during each read', async () => {
+  const root = tempDir('receipt-worker-live-');
+  const fx = receiptDispatchFixture(root, 'claude', 'codex');
+  fs.mkdirSync(fx.receipts.root, { recursive: true });
+  for (let index = 0; index < 300; index++)
+    fs.mkdirSync(path.join(fx.receipts.root, `${index.toString(16).padStart(8, '0')}-1111-2222-3333-444444444444`));
+  fx.launch(fx.parent, fx.child);
+  fx.launch(fx.child, fx.grandchild);
+  const projects = path.dirname(fx.parent.file);
+  const live = Array.from({ length: 4 }, (_, index) => {
+    const sessionId = `${String(index).repeat(8)}-5555-6666-7777-888888888888`;
+    const file = path.join(projects, `${sessionId}.jsonl`);
+    const padding = 'x'.repeat(4096);
+    fs.writeFileSync(
+      file,
+      [
+        { type: 'user', uuid: sessionId, sessionId, cwd: root, message: { role: 'user', content: 'Keep working.' } },
+        ...Array.from({ length: 64 }, () => ({ type: 'progress', data: { padding } })),
+      ]
+        .map((row) => JSON.stringify(row))
+        .join('\n') + '\n',
+    );
+    return { file, sessionId, agent: 'claude' as const, cwd: root, ...revisionOf(fs.statSync(file, { bigint: true })) };
+  });
+  const catalog = [...fx.catalog, ...live];
+  let appends = 0;
+  const worker = new ProgressiveWorker(
+    `process.env.ARC_HOME=${JSON.stringify(fx.home)};performance.now=()=>0;` +
+      liveWriters(live.map((row) => row.file)) +
+      source,
+    undefined,
+    (file) => {
+      if (file === 'live-append') appends++;
+    },
+  );
+  const discovery = await receiptDiscoveryHost(worker, [root], catalog);
+  const ends = { transcript: 0, receipt: 0, other: 0 };
+  try {
+    let completed: ProgressiveResult | null = null;
+    let pass = 0;
+    for (; pass < 60 && !completed; pass++) {
+      discovery.host.refreshGeneration = pass + 1;
+      assert.equal(await discovery.host.prepareClaudeChildren(pass + 1, new AbortController().signal), true);
+      const result = discovery.replies.last;
+      assert.ok(result);
+      const charges = result.value.kind === 'stale' ? undefined : (result.value as { charges?: any }).charges;
+      ends.transcript += charges?.transcriptPassEnds ?? 0;
+      ends.receipt += charges?.receiptPassEnds ?? 0;
+      ends.other += charges?.otherPassEnds ?? 0;
+      if (result.value.kind === 'claude-children' && !discovery.host.dispatchDiscoveryPending) completed = result;
+    }
+    assert.ok(
+      completed?.value.kind === 'claude-children',
+      `Discovery never published under live writers after ${pass} continuations: ${JSON.stringify(ends)}, ${appends} append notices`,
+    );
+    assert.ok(
+      pass <= 12,
+      `Discovery took ${pass} continuations to publish under live writers: ${JSON.stringify(ends)}`,
+    );
+    assert.ok(appends > 0, 'The live writers never appended');
+    assert.deepEqual(
+      sessionParentIndex(completed.value.references).get(fx.child.sessionId)?.parent,
+      fx.parent.sessionId,
+    );
+  } finally {
+    worker.stop();
+  }
+});
+
 test('receipt discovery revisits pending identity and discards cancelled scope generations', async () => {
   const root = tempDir('receipt-worker-pending-');
   const fx = receiptDispatchFixture(root, 'claude', 'codex');
@@ -1109,10 +1183,11 @@ test('a new Claude session reaches a complete cut beside parent growth with boun
     assert.ok(appendQuanta > 1);
     const after = (result as typeof result & { bytes: Record<string, number> }).bytes;
     // Growth reads the final full block, the partial block after it, and the new bytes.
-    // The armed append lands during the first anchor read, so the reader checks the anchor twice.
+    // The armed append lands during the anchor read. The reader keeps its opening size, so it checks the anchor once and
+    // leaves the armed record to the next refresh.
     const anchorBytes = 4096 + (firstOffset % 4096);
-    const grownBytes = fs.statSync(file).size - firstOffset;
-    assert.equal(after[file] - before[file], 2 * anchorBytes + grownBytes, 'append qualification read past its anchor');
+    const grownBytes = fs.statSync(file).size - firstOffset - Buffer.byteLength('{"type":"ignored"}\n');
+    assert.equal(after[file] - before[file], anchorBytes + grownBytes, 'append qualification read past its anchor');
     assert.equal(after[quiet], before[quiet], 'the quiet parent reread content');
     assert.ok(after[fresh] > 0, 'the new session never entered the captured inputs');
   } finally {
