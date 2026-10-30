@@ -871,17 +871,24 @@ export class DispatchReceipts {
         )
           return null;
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+        if (
+          (error as NodeJS.ErrnoException).code === 'ENOENT' ||
+          String(error) === 'Error: The dispatch path is redirected.'
+        )
+          return null;
         throw error;
       }
       const fd = fs.openSync(alias, fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW ?? 0));
       try {
         const stat = fs.fstatSync(fd, { bigint: true });
-        if (!stat.isFile() || !equalIdentity(state.alias, { dev: String(stat.dev), ino: String(stat.ino) })) {
+        if (
+          !stat.isFile() ||
+          !equalIdentity(state.alias, { dev: String(stat.dev), ino: String(stat.ino) }) ||
+          stat.size < BigInt(state.aliasBytes ?? 0)
+        ) {
           fs.closeSync(fd);
           return null;
         }
-        if (stat.size < BigInt(state.aliasBytes ?? 0)) throw new Error('The requested log was truncated.');
         return fd;
       } catch (error) {
         fs.closeSync(fd);
@@ -936,7 +943,6 @@ export class DispatchReceipts {
                   if (!count) throw new Error('The requested log write is incomplete.');
                   written += count;
                 }
-                fs.ftruncateSync(fd, state.bytes + written);
                 state.aliasBytes = state.bytes + written;
               } else state.alias = null;
             } catch (cause) {
@@ -960,11 +966,14 @@ export class DispatchReceipts {
         if (!state.alias) return false;
         try {
           safePath(alias);
-          if (!equalIdentity(state.alias, identity(alias)) || fs.statSync(alias).size === (state.aliasBytes ?? 0))
+          if (equalIdentity(state.alias, identity(alias)) && fs.statSync(alias).size === (state.aliasBytes ?? 0))
             return false;
         } catch (error) {
-          if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
-          throw error;
+          if (
+            (error as NodeJS.ErrnoException).code !== 'ENOENT' &&
+            String(error) !== 'Error: The dispatch path is redirected.'
+          )
+            throw error;
         }
         return this.lock(
           id,
@@ -974,9 +983,15 @@ export class DispatchReceipts {
             if (fd !== null) {
               try {
                 fs.ftruncateSync(fd, current.aliasBytes ?? 0);
+              } catch {
+                // A mapped alias can retain an uncommitted tail until its reader releases the view.
+                return true;
               } finally {
                 fs.closeSync(fd);
               }
+            } else if (current.alias) {
+              current.alias = null;
+              writeFileAtomically(checkpoint, JSON.stringify(current), this.replace, 0o600, false);
             }
             return false;
           },

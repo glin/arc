@@ -1551,21 +1551,21 @@ function logCapture(receipts: DispatchReceipts, id: string, bounds: ReadBounds) 
   const sourceAllowance = (bytes: number) => sources.map(() => bytes);
   const flush = (bytes: number, allowance?: number[]) => {
     const pending = capture.pendingSource();
-    const ordered = [...sources.entries()];
-    if (pending) ordered.sort((a, b) => Number(b[1].name === pending.name) - Number(a[1].name === pending.name));
-    for (const [index, source] of ordered) {
+    const remaining = sources.map((_, index) => Math.min(bytes, allowance ? allowance[index] : bytes));
+    const ordered: [number, number][] = pending
+      ? [[sources.findIndex((source) => source.name === pending.name), pending.offset]]
+      : [];
+    ordered.push(...sources.map((_, index): [number, number] => [index, Infinity]));
+    for (const [index, end] of ordered) {
+      const source = sources[index];
       if (!fs.existsSync(source.file)) continue;
       try {
         source.cursor = capture.cursor(source.name);
-        let remaining = Math.min(bytes, allowance ? allowance[index] : bytes);
-        const ends = pending?.name === source.name ? [pending.offset, Infinity] : [Infinity];
-        for (const end of ends) {
-          const limit = Math.min(remaining, Math.max(0, end - source.cursor.offset));
-          for (const chunk of logChunks(source.file, bounds.readBytes, source.cursor, limit)) {
-            remaining -= chunk.length;
-            if (allowance) allowance[index] -= chunk.length;
-            capture.write(chunk, source.name, source.cursor);
-          }
+        const limit = Math.min(remaining[index], Math.max(0, end - source.cursor.offset));
+        for (const chunk of logChunks(source.file, bounds.readBytes, source.cursor, limit)) {
+          remaining[index] -= chunk.length;
+          if (allowance) allowance[index] -= chunk.length;
+          capture.write(chunk, source.name, source.cursor);
         }
       } catch (error) {
         source.cursor = capture.cursor(source.name);

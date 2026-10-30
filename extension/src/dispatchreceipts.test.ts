@@ -1697,6 +1697,46 @@ test.each(['alias open', 'checkpoint', 'short write'] as const)(
   },
 );
 
+test('source capture advances through a mapped uncommitted alias tail and retries trimming', () => {
+  const { receipts, standalone } = standaloneFixture();
+  const id = standalone.launchId;
+  const alias = standalone.standalone!.logAlias!;
+  const capture = receipts.capture(id, 6, true);
+  const slice = sourceSlice(receipts, id, 'stdout.log', 'abcdef');
+  const rename = fs.renameSync;
+  let checkpoints = 0;
+  const failure = vi.spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+    if (String(to) === receipts.artifact(id, 'capture.json') && ++checkpoints === 2)
+      throw new Error('checkpoint unavailable');
+    return rename(from, to);
+  });
+  syncBuiltinESMExports();
+  assert.throws(() => capture.write(slice.bytes, 'stdout.log', slice.cursor), /checkpoint unavailable/);
+  failure.mockRestore();
+  const truncate = vi.spyOn(fs, 'ftruncateSync').mockImplementation(() => {
+    throw Object.assign(new Error('mapped view'), { code: 'UNKNOWN', errno: -4094 });
+  });
+  syncBuiltinESMExports();
+  try {
+    capture.write(slice.bytes.subarray(0, 3), 'stdout.log', { ...slice.cursor, offset: 3 });
+    assert.equal(capture.cursor('stdout.log').offset, 3);
+    assert.equal(capture.delivered(), 3);
+    assert.equal(fs.readFileSync(alias, 'utf8'), 'abcdef');
+    assert.equal(capture.flushAlias(), true);
+    assert.equal(truncate.mock.calls.length, 1);
+    truncate.mockRestore();
+    syncBuiltinESMExports();
+    assert.equal(capture.flushAlias(), false);
+    assert.equal(fs.readFileSync(alias, 'utf8'), 'abc');
+    capture.write(slice.bytes.subarray(3), 'stdout.log', slice.cursor);
+    assert.equal(capture.flushAlias(), false);
+    assert.equal(fs.readFileSync(alias, 'utf8'), 'abcdef');
+    assert.equal(capture.cursor('stdout.log').offset, 6);
+  } finally {
+    capture.close();
+  }
+});
+
 test.each(['replaced', 'missing', 'reused', 'no witness'] as const)(
   'source file capture keeps private output away from a %s alias',
   (change) => {
