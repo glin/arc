@@ -1751,9 +1751,8 @@ export async function produceStandaloneOutput(receipts: DispatchReceipts, id: st
         if (Date.now() >= drainDeadline! || (stalled && waits-- <= 0))
           throw new Error('The requested log is incomplete. Private output remains available.');
       }
-      if (ended && stalled) await pause(50);
-      else if (ended || !complete) await OBSERVATION_RUNTIME.yield();
-      else await pause(50);
+      if (stalled || (!ended && complete)) await pause(50);
+      else await OBSERVATION_RUNTIME.yield();
     }
     save('finished');
   } catch (error) {

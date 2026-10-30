@@ -1575,6 +1575,48 @@ test.each(['legacy', 'source'] as const)(
   },
 );
 
+test('source producer pauses between trim retries while a running child leaves a mapped alias tail', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'setImmediate'] });
+  vi.spyOn(Date, 'now').mockReturnValue(0);
+  if (process.send) vi.spyOn(process, 'send').mockImplementation(() => true);
+  vi.spyOn(process, 'disconnect').mockImplementation(() => {});
+  const { receipts, launch } = workerFixture('', 100, false, true);
+  const id = launch.launchId;
+  fs.writeFileSync(receipts.artifact(id, 'stdout.log'), 'output');
+  fs.writeFileSync(receipts.artifact(id, 'stderr.log'), '');
+  const child = providerChild();
+  vi.mocked(childProcess.spawn).mockReturnValue(child);
+  const alias = launch.standalone!.logAlias!;
+  let flushes = 0;
+  interceptCaptures(receipts, (capture) => {
+    const flush = capture.flushAlias;
+    capture.flushAlias = () => {
+      if (++flushes > 40) throw new Error('The producer retried the alias without a pause.');
+      return flush();
+    };
+  });
+  const running = produceStandaloneOutput(receipts, id);
+  await vi.advanceTimersByTimeAsync(0);
+  child.emit('spawn');
+  assert.equal(fs.readFileSync(alias, 'utf8'), 'output');
+  fs.appendFileSync(alias, ' tail');
+  const truncate = vi.spyOn(fs, 'ftruncateSync').mockImplementation(() => {
+    throw Object.assign(new Error('mapped view'), { code: 'UNKNOWN', errno: -4094 });
+  });
+  const before = flushes;
+  await vi.advanceTimersByTimeAsync(500);
+  const owner = artifactJson(receipts, id, 'output-owner.json');
+  assert.equal(owner.state, 'capturing', owner.reason);
+  assert.ok(truncate.mock.calls.length >= 2);
+  assert.ok(flushes - before <= 12, `The producer retried the alias ${flushes - before} times in 500 ms.`);
+  truncate.mockRestore();
+  child.emit('close', 0, null);
+  await vi.runAllTimersAsync();
+  await running;
+  assert.equal(artifactJson(receipts, id, 'output-owner.json').state, 'finished');
+  assert.equal(fs.readFileSync(alias, 'utf8'), 'output');
+});
+
 test.each(['progress', 'exit'] as const)(
   'print retry allowance renews after %s before the ended drain',
   { tags: ['subprocess'] },
