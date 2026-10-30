@@ -511,11 +511,12 @@ test.each(['complete', 'budget', 'denied', 'transient', 'busy', 'busy-budget', '
   },
 );
 
-test('source capture retries earlier stderr before stdout that arrives during an alias failure', async () => {
+test('source capture drains stderr growth before later stdout after an alias failure', async () => {
   const { receipts, launch } = workerFixture('', 100, false, true);
   const id = launch.launchId;
   const stdout = Buffer.from(outputFrames());
   const stderr = Buffer.from('earlier stderr\n');
+  const stderrTail = Buffer.from('later stderr\n');
   const tail = Buffer.from('\n');
   stoppedOutput(receipts, id, stdout, stderr);
   const alias = launch.standalone!.logAlias!;
@@ -531,20 +532,26 @@ test('source capture retries earlier stderr before stdout that arrives during an
   denyOpen(alias, () => {
     if (!stderrAttempt || failed) return false;
     failed = true;
+    fs.appendFileSync(receipts.artifact(id, 'stderr.log'), stderrTail);
     fs.appendFileSync(receipts.artifact(id, 'stdout.log'), tail);
     return true;
   });
-  await superviseStandalone(
+  const status = (await superviseStandalone(
     receipts,
     id,
     true,
     { frameBytes: 1024, readBytes: 1024, workBytes: 4096 },
     frozenRuntime(),
-  );
+  )) as any;
   assert.equal(failed, true);
-  assert.deepEqual(fs.readFileSync(alias), Buffer.concat([stdout, stderr, tail]));
+  assert.deepEqual(fs.readFileSync(alias), Buffer.concat([stdout, stderr, stderrTail, tail]));
   assert.deepEqual(fs.readFileSync(receipts.artifact(id, 'stdout.log')), Buffer.concat([stdout, tail]));
-  assert.deepEqual(fs.readFileSync(receipts.artifact(id, 'stderr.log')), stderr);
+  assert.deepEqual(fs.readFileSync(receipts.artifact(id, 'stderr.log')), Buffer.concat([stderr, stderrTail]));
+  assert.equal(status.observation.monitor, 'finished');
+  assert.equal(
+    artifactJson(receipts, id, 'capture.json').sources['stderr.log'].offset,
+    stderr.length + stderrTail.length,
+  );
   assert.equal(fs.statSync(receipts.artifact(id, 'worker.log')).size, 0);
   assert.equal(artifactJson(receipts, id, 'capture.json').sourceFiles, true);
   assert.equal(vi.mocked(childProcess.spawn).mock.calls.length, 0);

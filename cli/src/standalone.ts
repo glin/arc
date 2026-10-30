@@ -1557,11 +1557,15 @@ function logCapture(receipts: DispatchReceipts, id: string, bounds: ReadBounds) 
       if (!fs.existsSync(source.file)) continue;
       try {
         source.cursor = capture.cursor(source.name);
-        const remaining = allowance ? allowance[index] : bytes;
-        const end = pending?.name === source.name ? pending.offset - source.cursor.offset : bytes;
-        for (const chunk of logChunks(source.file, bounds.readBytes, source.cursor, Math.min(bytes, remaining, end))) {
-          if (allowance) allowance[index] -= chunk.length;
-          capture.write(chunk, source.name, source.cursor);
+        let remaining = Math.min(bytes, allowance ? allowance[index] : bytes);
+        const ends = pending?.name === source.name ? [pending.offset, Infinity] : [Infinity];
+        for (const end of ends) {
+          const limit = Math.min(remaining, Math.max(0, end - source.cursor.offset));
+          for (const chunk of logChunks(source.file, bounds.readBytes, source.cursor, limit)) {
+            remaining -= chunk.length;
+            if (allowance) allowance[index] -= chunk.length;
+            capture.write(chunk, source.name, source.cursor);
+          }
         }
       } catch (error) {
         source.cursor = capture.cursor(source.name);
