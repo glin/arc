@@ -646,6 +646,52 @@ test('Claude kept marks complete while the file grows during the second check of
   );
 });
 
+test('Claude kept marks start at the first mark again after a same-size rewrite that follows a pending stop', async () => {
+  vi.spyOn(performance, 'now').mockReturnValue(0);
+  const { parent, old, ends, meter } = growthPointTranscript();
+  const first = await scanClaudeRelationshipQuantum(parent, undefined, 16 * 1024 * 1024, undefined, meter);
+  assert.equal(first.complete, true);
+  fs.appendFileSync(parent.file, '{"type":"ignored"}\n');
+  const pending = await scanClaudeRelationshipQuantum(parent, JSON.parse(JSON.stringify(first.cursor)), 24 * 1024);
+  assert.equal(pending.qualified, false);
+  const evidence = pending.cursor.evidence!;
+  const at = evidence.resume?.at ?? 0;
+  assert.ok(at > 1 && at < 7, `the check stopped at kept mark ${at}`);
+  // The writer rewrites the child and one byte in the final block before the first kept mark, keeps the size, and appends
+  // nothing. The next allowance ends after the anchor, before any check of the marks before the stop.
+  const fd = fs.openSync(parent.file, 'r+');
+  try {
+    const changed = old.lastIndexOf('y', ends[0] - 100);
+    assert.ok(old.indexOf('child-a') < ends[0] - 8192 && changed >= ends[0] - 4096);
+    fs.writeSync(fd, 'child-b', old.indexOf('child-a'));
+    fs.writeSync(fd, 'z', changed);
+  } finally {
+    fs.closeSync(fd);
+  }
+  const stat = fs.statSync(parent.file);
+  fs.utimesSync(parent.file, stat.atime, new Date(stat.mtimeMs + 1_000));
+  const check = (offset: number) => (offset % 4096) + 4096;
+  const kept = evidence.marks!.filter((mark) => mark.offset < evidence.offset);
+  const allowance = [...kept.slice(at).map((mark) => mark.offset), evidence.offset].reduce(
+    (total, offset) => total + check(offset),
+    0,
+  );
+  const published: string[][] = [];
+  let scan = await scanClaudeRelationshipQuantum(parent, JSON.parse(JSON.stringify(pending.cursor)), allowance);
+  if (scan.complete) published.push(scan.references.map((reference) => reference.sessionId));
+  for (let pass = 0; pass < 8; pass++) {
+    scan = await scanClaudeRelationshipQuantum(parent, JSON.parse(JSON.stringify(scan.cursor)), 16 * 1024 * 1024);
+    if (scan.complete) published.push(scan.references.map((reference) => reference.sessionId));
+  }
+  assert.ok(published.length, 'the rewritten transcript never completed');
+  for (const references of published)
+    assert.deepEqual(
+      references,
+      ['child-b'],
+      'a same-size rewrite after a pending stop resumed past the first kept mark',
+    );
+});
+
 for (const stop of ['its budget', 'its deadline', 'cancellation'] as const)
   test(`Claude kept mark that a check matched before it stopped at ${stop} still finds a rewrite with an append`, async () => {
     let clock = 0;
