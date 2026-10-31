@@ -1322,8 +1322,11 @@ test(
   'capture recovery reports the log incomplete after a released producer leaves a queue record that fails its checksum',
   { tags: ['subprocess'] },
   async () => {
-    const recovery = await heldBoundaryRecovery({ save: true }, 'closes', { corrupt: true });
-    assert.ok(orderedOrIncomplete(recovery), recovery.published);
+    const { published, reason, expected, known } = await heldBoundaryRecovery({ save: true }, 'closes', {
+      corrupt: true,
+    });
+    assert.ok(published.startsWith(known) && published !== expected && expected.startsWith(published), published);
+    assert.equal(reason, 'The requested log is incomplete. Private output remains available.');
   },
 );
 
