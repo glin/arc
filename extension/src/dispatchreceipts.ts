@@ -1038,6 +1038,17 @@ export class DispatchReceipts {
           fs.closeSync(fd);
         }
       });
+    // Output past the last boundary on record has no known place after the boundaries that an ended capture observed
+    // and did not write, or after a queue record that stops partway or fails its checksum. The marker stays.
+    const lostFile = this.file(id, 'capture-write.lost');
+    const orderLost = () => fs.existsSync(lostFile);
+    const loseOrder = () => {
+      try {
+        exclusive(lostFile, '');
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      }
+    };
     const queuedEnd = (state: SourceCaptureState, name: PendingSlice['name']) => {
       let offset = state.sources[name]?.offset ?? 0;
       for (const slice of state.pending ?? []) if (slice.name === name) offset = slice.offset;
@@ -1046,7 +1057,7 @@ export class DispatchReceipts {
     // Records past the saved end are boundaries that a capture wrote before a save that never happened, because the
     // capture ended or its save failed. They keep their file order ahead of later output, as far as `limit`.
     // A complete record that does not pass its channel's queued end is left from a queue that drained, and ends them.
-    // A record that stops partway or fails its checksum leaves the order of later output unknown.
+    // A record that stops partway or fails its checksum ends them and leaves the order of later output unknown.
     const unsaved = (state: SourceCaptureState, limit = Infinity) => {
       const end = state.records?.end ?? 0;
       const stat = transient(() => fs.statSync(queueFile, { throwIfNoEntry: false }));
@@ -1056,9 +1067,15 @@ export class DispatchReceipts {
       // The first read takes one record, so a record left from a drained queue costs one record. Each later read doubles.
       for (let position = end, count = 1; position < size; count *= 2) {
         const records = readQueue(position, Math.min(count, Math.ceil((size - position) / QUEUE_RECORD_BYTES)));
-        if (!records.length) throw new Error('The requested log is incomplete. Private output remains available.');
+        if (!records.length) {
+          loseOrder();
+          return slices;
+        }
         for (const slice of records) {
-          if (!slice) throw new Error('The requested log is incomplete. Private output remains available.');
+          if (!slice) {
+            loseOrder();
+            return slices;
+          }
           if (slice.offset <= ends[slice.name]) return slices;
           ends[slice.name] = slice.offset;
           slices.push(slice);
@@ -1105,7 +1122,7 @@ export class DispatchReceipts {
     let held: PendingSlice[] = [];
     let heldAt = 0;
     const hold: LockHold = { keep: () => held.length > 0 };
-    return {
+    const capture = {
       delivered: () => load().aliasBytes ?? 0,
       pendingSources: () => load().pending ?? [],
       // Output that arrives behind an unpublished slice joins its queue, so recovery keeps the arrival order of both channels.
@@ -1148,7 +1165,8 @@ export class DispatchReceipts {
               if (slice.identity !== `${stat.dev}:${stat.ino}`)
                 throw new Error('The original worker output was replaced or truncated.');
             }
-            for (const [name, limit, end = Infinity] of limits) {
+            // Output past a lost boundary joins no queue.
+            for (const [name, limit, end = Infinity] of orderLost() ? [] : limits) {
               if (limit <= 0) continue;
               const stat = source(name);
               const offset = Math.min(Number(stat.size), ends[name] + limit, end);
@@ -1171,6 +1189,7 @@ export class DispatchReceipts {
           },
           'capture-write',
           hold,
+          true,
         ),
       cursor: (name: CaptureSource): CaptureCursor => ({ ...(load().sources[name] ?? { offset: 0, identity: '' }) }),
       write: (bytes: Buffer, name?: CaptureSource, cursor?: CaptureCursor) =>
@@ -1204,6 +1223,7 @@ export class DispatchReceipts {
             if (queued) {
               if (queue[0].name !== name || cursor.offset > queue[0].offset) throw new CapturePublicationPending();
             } else {
+              if (orderLost()) throw new Error('The requested log is incomplete. Private output remains available.');
               // Save the slice's position before alias publication can fail.
               queue.push({ name, ...cursor });
               save(state);
@@ -1297,9 +1317,16 @@ export class DispatchReceipts {
       native: (_bytes: Buffer, _cursor?: CaptureCursor) => {
         throw new Error('This launch has no native log capture.');
       },
-      // Boundaries still held end with this capture, as output that no capture observed.
+      // A capture that closes with boundaries it could not write keeps the write lock. The capture that takes the lock
+      // after this process ends publishes no output past them.
       close: () => {
-        if (hold.owner)
+        if (held.length)
+          try {
+            capture.defer([]);
+          } catch {
+            /* A failed queue file write keeps the boundaries held, and a failed save leaves them in the file. */
+          }
+        if (hold.owner && !held.length)
           try {
             this.release(id, 'capture-write', hold.owner, hold);
           } catch {
@@ -1307,6 +1334,7 @@ export class DispatchReceipts {
           }
       },
     };
+    return capture;
   }
   capture(id: string, aliasByteBudget = CAPTURE_SLICE_BYTES, sourceFiles = false) {
     if (!Number.isSafeInteger(aliasByteBudget) || aliasByteBudget <= 0)
@@ -2261,12 +2289,16 @@ export class DispatchReceipts {
   }
   // A caller that passes `hold` keeps the lock after `work` while `hold.keep()` is true, and reenters it on its next
   // call. Other callers find a live owner until a later call or `release` ends the hold.
-  private lock<T>(id: string, work: () => T, name = 'write', hold?: LockHold): T {
+  // A caller that passes `observes` names it in the owner record. A caller that takes the lock from such an owner
+  // after that owner ended first writes `<name>.lost`, because the ended owner can have lost what it observed.
+  private lock<T>(id: string, work: () => T, name = 'write', hold?: LockHold, observes = false): T {
     this.launch(id);
     const file = this.file(id, `${name}.lock`);
     const kept = hold?.owner;
     const temporary = kept ? null : this.file(id, `${name}.${process.pid}.${randomUUID()}.lock`);
-    const owner = kept ?? JSON.stringify({ pid: process.pid, token: randomUUID(), launchId: id });
+    const owner =
+      kept ??
+      JSON.stringify({ pid: process.pid, token: randomUUID(), launchId: id, ...(observes ? { observes } : {}) });
     if (temporary) exclusive(temporary, owner);
     let acquired = Boolean(kept);
     let failure: { error: unknown } | undefined;
@@ -2304,6 +2336,12 @@ export class DispatchReceipts {
             dead = (error as NodeJS.ErrnoException).code === 'ESRCH';
           }
           if (!dead) throw new Error('Another process holds this dispatch write.');
+          if (held.observes === true)
+            try {
+              exclusive(this.file(id, `${name}.lost`), heldText);
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+            }
           target = successor;
           break;
         }
