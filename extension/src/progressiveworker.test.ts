@@ -5486,60 +5486,67 @@ test('a pass keeps an active transcript that grows after its seed check', async 
       if (second?.value.kind !== 'claude-children-progress') break;
     }
     assert.equal(fs.existsSync(marker), false, 'the worker never checked the active transcript');
-    assert.equal(second?.value.kind, 'claude-children', 'growth after the seed check reset the active transcript');
-    assert.equal(resets, 0);
+    assert.equal(second?.value.kind, 'claude-children', 'the request replied with progress in all 20 runs');
+    assert.equal(resets, 0, 'growth after the seed check reset the active transcript');
   } finally {
     worker.stop();
     fs.rmSync(directory, { recursive: true, force: true });
   }
 });
 
-test('a pass after a complete reply reads an unchanged Codex rollout that stopped before its end', async () => {
-  const directory = tempDir('panel-progressive-seeded-codex-');
-  const file = path.join(directory, 'parent.jsonl');
-  const filler = JSON.stringify({ type: 'ignored', payload: 'x'.repeat(1024) }) + String.fromCharCode(10);
-  fs.writeFileSync(
-    file,
-    JSON.stringify({ type: 'session_meta', timestamp: timestamp(0), payload: { id: 'parent', cwd: directory } }) +
-      String.fromCharCode(10) +
-      filler.repeat(960),
-  );
-  const stat = revisionOf(fs.statSync(file, { bigint: true }));
-  const parent = { agent: 'codex' as const, file, sessionId: 'parent', size: stat.size, mtimeMs: stat.mtimeMs };
-  const worker = new ProgressiveWorker(source);
-  try {
-    const request = {
-      kind: 'claude-children' as const,
-      parents: [parent],
-      repositoryRoots: [directory],
-      discoveryBytes: 64 * 1024,
-    };
-    // A pass that reaches its deadline replies with progress, so each request runs again until a reply that is not progress.
-    // The charges of every reply of a request add up.
-    const pass = async (generation: number) => {
-      const charges = { hits: 0, quanta: 0 };
-      for (let attempt = 0; attempt < 20; attempt++) {
-        const result = await worker.run(request, generation, new AbortController().signal);
-        assert.ok(result?.value.kind === 'claude-children' || result?.value.kind === 'claude-children-progress');
-        charges.hits += result.value.charges?.hits ?? 0;
-        charges.quanta += result.value.charges?.quanta ?? 0;
-        if (result.value.kind === 'claude-children') return { value: result.value, charges };
-      }
-      throw new Error(`request ${generation} never replied without progress`);
-    };
-    const first = await pass(1);
-    assert.equal(first.value.continuation, true, 'the first pass reached the end of the rollout');
-    const stopped = first.value.referenceEntries[0][1];
-    assert.equal(stopped.visitedEof, false);
-    const second = await pass(2);
-    assert.equal(second.charges.hits, 0, 'an unfinished Codex rollout counted as finished');
-    assert.ok(second.charges.quanta >= 1, 'the follow-up pass skipped an unfinished Codex rollout');
-    assert.ok(second.value.referenceEntries[0][1].cursor!.offset > stopped.cursor!.offset);
-  } finally {
-    worker.stop();
-    fs.rmSync(directory, { recursive: true, force: true });
-  }
-});
+// A worker that is paused between two adjacent clock reads in every request sees its deadlines pass at once.
+const JUMPING_CLOCK =
+  '{const now=performance.now.bind(performance);let reads=0,skew=0;performance.now=()=>{if(++reads%2===0)skew+=20;return now()+skew;};}';
+
+test.each(['the real clock', 'a clock that jumps 20 ms on every second read'])(
+  'a pass after a complete reply reads an unchanged Codex rollout that stopped before its end, under %s',
+  async (clock) => {
+    const directory = tempDir('panel-progressive-seeded-codex-');
+    const file = path.join(directory, 'parent.jsonl');
+    const filler = JSON.stringify({ type: 'ignored', payload: 'x'.repeat(1024) }) + String.fromCharCode(10);
+    fs.writeFileSync(
+      file,
+      JSON.stringify({ type: 'session_meta', timestamp: timestamp(0), payload: { id: 'parent', cwd: directory } }) +
+        String.fromCharCode(10) +
+        filler.repeat(960),
+    );
+    const stat = revisionOf(fs.statSync(file, { bigint: true }));
+    const parent = { agent: 'codex' as const, file, sessionId: 'parent', size: stat.size, mtimeMs: stat.mtimeMs };
+    const worker = new ProgressiveWorker((clock === 'the real clock' ? '' : JUMPING_CLOCK) + source);
+    try {
+      const request = {
+        kind: 'claude-children' as const,
+        parents: [parent],
+        repositoryRoots: [directory],
+        discoveryBytes: 64 * 1024,
+      };
+      // A pass that reaches its deadline replies with progress, so each request runs again until a reply that is not progress.
+      // The charges of every reply of a request add up.
+      const pass = async (generation: number) => {
+        const charges = { hits: 0, quanta: 0 };
+        for (let attempt = 0; attempt < 20; attempt++) {
+          const result = await worker.run(request, generation, new AbortController().signal);
+          assert.ok(result?.value.kind === 'claude-children' || result?.value.kind === 'claude-children-progress');
+          charges.hits += result.value.charges?.hits ?? 0;
+          charges.quanta += result.value.charges?.quanta ?? 0;
+          if (result.value.kind === 'claude-children') return { value: result.value, charges };
+        }
+        throw new Error(`request ${generation} never replied without progress`);
+      };
+      const first = await pass(1);
+      assert.equal(first.value.continuation, true, 'the first pass reached the end of the rollout');
+      const stopped = first.value.referenceEntries[0][1];
+      assert.equal(stopped.visitedEof, false);
+      const second = await pass(2);
+      assert.equal(second.charges.hits, 0, 'an unfinished Codex rollout counted as finished');
+      assert.ok(second.charges.quanta >= 1, 'the follow-up pass skipped an unfinished Codex rollout');
+      assert.ok(second.value.referenceEntries[0][1].cursor!.offset > stopped.cursor!.offset);
+    } finally {
+      worker.stop();
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  },
+);
 
 test('unfinished cursor overflow keeps discovery and saved progress alive', async () => {
   const directory = tempDir('panel-progressive-codex-overflow-');

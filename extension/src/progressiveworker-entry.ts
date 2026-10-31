@@ -1050,8 +1050,13 @@ async function execute(
     const activeReceipts = receiptScan;
     const receiptDeadline = performance.now() + RELATIONSHIP_SLICE_MS;
     let receiptSteps = 0;
+    // The deadline ends the loop only after a step, so a worker paused past the deadline in every request still advances.
     while (!signal.aborted) {
-      if (requestBytes <= charges.readBytes || receiptSteps >= 256 || performance.now() >= receiptDeadline) {
+      if (
+        requestBytes <= charges.readBytes ||
+        receiptSteps >= 256 ||
+        (receiptSteps > 0 && performance.now() >= receiptDeadline)
+      ) {
         charges.receiptPassEnds++;
         return pending();
       }
