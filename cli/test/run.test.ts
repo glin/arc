@@ -1083,10 +1083,14 @@ function sameFile(fd: number, file: string) {
 
 // Behind pending A and e, the producer observes stdout B and then stderr f, and fails to write their queue records.
 // `budget` is the number of queue file bytes it writes, and `denied` the number of queue file opens that fail.
+// With `save`, it writes both records and its checkpoint save fails instead.
 // After the producer ends, stdout C arrives and a recovery runs.
+// `marker` fails the creation of `capture-write.lost`, and `corrupt` breaks the checksum of the last queue record
+// before recovery.
 async function heldBoundaryRecovery(
-  failure: { budget?: number; denied?: number },
+  failure: { budget?: number; denied?: number; save?: true },
   ending: 'dies' | 'closes' | 'closes and dies',
+  fault: { marker?: 'write'; corrupt?: true } = {},
 ) {
   const { receipts, launch } = workerFixture('', 100, false, true);
   const id = launch.launchId;
@@ -1123,21 +1127,38 @@ async function heldBoundaryRecovery(
     budget -= count;
     return count;
   }) as typeof fs.writeSync);
+  const marker = path.join(path.dirname(queueFile), 'capture-write.lost');
+  if (fault.marker === 'write') {
+    const writeFile = fs.writeFileSync;
+    vi.spyOn(fs, 'writeFileSync').mockImplementation((file, ...args) => {
+      if (String(file) === marker) throw Object.assign(new Error('Marker unavailable'), { code: 'EACCES' });
+      return Reflect.apply(writeFile, fs, [file, ...args]);
+    });
+  }
   queueOutage(
     receipts,
     id,
     () => {},
     (state) => state.pending.length >= 2,
   );
+  let saving = false;
+  if (failure.save) failCheckpointSave(receipts, id, () => saving, 'EACCES');
   const producer = receipts.capture(id, 64 * 1024, true);
   fs.appendFileSync(stdout, frames[1]);
   fs.appendFileSync(stderr, 'f\n');
   budget = failure.budget ?? Infinity;
   denied = failure.denied ?? 0;
+  saving = Boolean(failure.save);
   assert.throws(() => producer.defer(captureLimits));
   budget = Infinity;
+  saving = false;
   if (ending !== 'dies') producer.close();
   denied = 0;
+  if (fault.corrupt) {
+    const queue = fs.readFileSync(queueFile);
+    queue[queue.length - 2] = queue[queue.length - 2] === 0x30 ? 0x31 : 0x30;
+    fs.writeFileSync(queueFile, queue);
+  }
   // The test process stands in for the producer, so an ended producer is a process that no longer exists.
   if (ending !== 'closes') {
     const kill = process.kill;
@@ -1198,6 +1219,25 @@ test(
   { tags: ['subprocess'] },
   async () => {
     const recovery = await heldBoundaryRecovery({ denied: 2 }, 'closes and dies');
+    assert.ok(orderedOrIncomplete(recovery), recovery.published);
+  },
+);
+
+test(
+  'capture recovery publishes no output after a producer ends when the lost order marker cannot be written',
+  { tags: ['subprocess'] },
+  async () => {
+    const { published, reason, expected } = await heldBoundaryRecovery({ budget: 128 }, 'dies', { marker: 'write' });
+    assert.ok(expected.startsWith(published), published);
+    assert.equal(reason, 'The requested log is incomplete. Private output remains available.');
+  },
+);
+
+test(
+  'capture recovery reports the log incomplete after a released producer leaves a queue record that fails its checksum',
+  { tags: ['subprocess'] },
+  async () => {
+    const recovery = await heldBoundaryRecovery({ save: true }, 'closes', { corrupt: true });
     assert.ok(orderedOrIncomplete(recovery), recovery.published);
   },
 );
