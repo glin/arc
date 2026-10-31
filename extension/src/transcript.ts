@@ -4381,29 +4381,34 @@ export class RelationshipReader {
   }
   // Check passes over the marks. A pass runs the stamp check and then hashes the final full block and the tail at each mark again,
   // as the next quantum would after a read that stopped there. A new grown stamp seen in a pass marks the end of the evidence and
-  // starts another pass, so a rewrite that lands during the checks is checked too. The first pass ignores the deadline and
-  // cancellation. A later pass that meets either, a mark without the budget for its check, an unstable or short check, or a new
-  // grown stamp in every pass leaves the outcome pending. A pass starts at mark `from` while the reader has seen no growth, and
-  // at the first mark after growth. A pass from a later mark checks the marks before it again after the last mark. The deadline,
-  // cancellation, or a mark without the budget ends those checks with a match. A pass that stops before the last mark at the
-  // deadline, at cancellation, or at a mark without the budget saw no new grown stamp, so `checked` is the first mark that no
-  // check matched. Every other outcome leaves 0.
+  // starts another pass, so a rewrite that lands during the checks is checked too. Every pass starts at mark `from`. A pass from a
+  // later mark checks the marks before it again after the last mark. The deadline, cancellation, a mark without the budget, or a
+  // new grown stamp ends those checks with a match. Before those checks, the first pass ignores the deadline and cancellation. A
+  // later pass that meets either, a mark without the budget for its check, an unstable or short check, or a new grown stamp in
+  // every pass leaves the outcome pending. After a pending outcome, `checked` is the end of the longest run of matched checks from
+  // `from` in any pass, so growth never moves it back. An unstable stamp or a short check leaves 0.
   private passes(evidence: RelationshipDigest, from = 0): 'match' | 'mismatch' | 'pending' {
+    let reached = from;
     for (let pass = 0; pass < RELATIONSHIP_SETTLE_PASSES; pass++) {
       this.checked = 0;
       this.note(evidence);
       if (!this.check()) return 'pending';
       if (this.moved) continue;
-      this.checked = this.grew ? 0 : from;
+      this.checked = from;
       const remaining = this.marks.length - this.checked;
       const order = [...this.marks.slice(this.checked), ...this.marks.slice(0, this.checked)];
       for (const [index, mark] of order.entries()) {
         const again = index >= remaining;
         const start = markStart(mark);
         if (start === undefined) return 'mismatch';
-        if ((pass > 0 || again) && (this.cancelled() || performance.now() >= this.deadline))
-          return again ? 'match' : 'pending';
-        if (this.budget - this.readBytes < mark.offset - start) return again ? 'match' : 'pending';
+        if (
+          ((pass > 0 || again) && (this.cancelled() || performance.now() >= this.deadline)) ||
+          this.budget - this.readBytes < mark.offset - start
+        ) {
+          if (again) return 'match';
+          this.checked = reached;
+          return 'pending';
+        }
         const bytes = this.readAt(start, mark.offset - start);
         if (this.meter) this.meter.revalidationBytes = (this.meter.revalidationBytes ?? 0) + bytes.length;
         if (!this.stable || bytes.length !== mark.offset - start) {
@@ -4417,12 +4422,15 @@ export class RelationshipReader {
         };
         extendRelationshipEvidence(digest, bytes);
         if (markHash(digest) !== mark.hash) return 'mismatch';
-        if (this.moved) break;
-        if (!again) this.checked++;
+        if (this.moved) {
+          if (again) return 'match';
+          break;
+        }
+        if (!again) reached = Math.max(reached, ++this.checked);
       }
       if (!this.moved) return 'match';
     }
-    this.checked = 0;
+    this.checked = reached;
     return 'pending';
   }
   // The last check before a scanner reports its read qualified. A match qualifies the read. A mismatch leaves a whole-prefix
@@ -4491,12 +4499,13 @@ export class RelationshipReader {
     return this.accept(evidence);
   }
   // Check passes over the marks of the latest read in order, then over the final full block and the tail at the anchor, at most
-  // two blocks each. A pending outcome keeps every mark for the next quantum. When a pass stopped by its deadline,
-  // cancellation, or budget before the anchor, the evidence also keeps the stamp of its checks and the first mark that no
-  // check matched. The next quantum starts there when the file keeps that stamp or grew from it, and the reader sees no growth.
-  // It checks the earlier marks again after the anchor while its allowance lasts. A shrink, a same-size change, or a changed
-  // identity starts at the first mark. Only acceptance, a replacement under the mark limit, a mismatch, or the fall back to a
-  // whole-prefix comparison removes a mark. A missing or mismatched anchor needs the whole prefix.
+  // two blocks each. A pending outcome keeps every mark for the next quantum. When a pass matched checks before the anchor and
+  // then stopped, the evidence also keeps the stamp of the checks and the first mark after the longest run of matched checks.
+  // The next quantum starts there when the file keeps that stamp or grew from it. After the anchor, its passes check the earlier
+  // marks again until the allowance, the deadline, cancellation, or growth ends those checks. A shrink, a same-size change, or a
+  // changed identity starts at the first mark. Only acceptance, a replacement under the mark limit, a mismatch, the fall back to
+  // a whole-prefix comparison, or a scan that starts again from the beginning removes a mark. A missing or mismatched anchor
+  // needs the whole prefix.
   private anchored(evidence: RelationshipEvidence): 'match' | 'pending' | 'compare' {
     if (evidence.anchor === undefined || evidence.offset < RELATIONSHIP_BLOCK_BYTES) return 'compare';
     const kept = (evidence.marks ?? []).filter((mark) => mark.offset < evidence.offset);

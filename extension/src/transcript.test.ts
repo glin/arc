@@ -563,6 +563,89 @@ test('Claude kept marks under a short allowance complete while the file grows be
   );
 });
 
+test('Claude kept marks under a short allowance complete while the file grows during every check after the anchor', async () => {
+  vi.spyOn(performance, 'now').mockReturnValue(0);
+  const { parent, ends, meter } = growthPointTranscript();
+  const first = await scanClaudeRelationshipQuantum(parent, undefined, 16 * 1024 * 1024, undefined, meter);
+  assert.equal(first.complete, true);
+  assert.equal(first.cursor.evidence?.marks?.length, 8, `the read had ${ends.length} growth points`);
+  fs.appendFileSync(parent.file, '{"type":"ignored"}\n');
+  // Each allowance covers seven of the checks of the seven kept marks and the anchor. A pass that resumes past the first kept
+  // mark checks it again after the anchor, and a writer appends during that check in every such pass.
+  const allowance = 28 * 1024;
+  let scan = first;
+  let quanta = 0;
+  let appends = 0;
+  do {
+    const evidence = scan.cursor.evidence;
+    let anchored = false;
+    const writer = {
+      readBytes: 0,
+      onRead: (bytes: Buffer, offset: number) => {
+        if (evidence?.marks?.length !== 8) return;
+        if (offset + bytes.length === evidence.offset) anchored = true;
+        else if (anchored && offset + bytes.length === evidence.marks[0].offset) {
+          anchored = false;
+          appends++;
+          fs.appendFileSync(parent.file, '{"type":"ignored"}\n');
+        }
+      },
+    };
+    scan = await scanClaudeRelationshipQuantum(
+      parent,
+      JSON.parse(JSON.stringify(scan.cursor)),
+      allowance,
+      undefined,
+      writer,
+    );
+    assert.ok(scan.readBytes <= allowance);
+  } while (!scan.complete && ++quanta < 12);
+  assert.ok(appends > 0, 'no pass checked the first kept mark again after the anchor');
+  assert.equal(scan.complete, true, 'growth during the checks after the anchor kept the source unfinished');
+  assert.deepEqual(
+    scan.references.map((reference) => reference.sessionId),
+    ['child-a'],
+  );
+});
+
+test('Claude kept marks complete while the file grows during the second check of every quantum and the deadline then passes', async () => {
+  let clock = 0;
+  vi.spyOn(performance, 'now').mockImplementation(() => clock);
+  const { parent, ends, meter } = growthPointTranscript();
+  const first = await scanClaudeRelationshipQuantum(parent, undefined, 16 * 1024 * 1024, undefined, meter);
+  assert.equal(first.complete, true);
+  assert.equal(first.cursor.evidence?.marks?.length, 8, `the read had ${ends.length} growth points`);
+  fs.appendFileSync(parent.file, '{"type":"ignored"}\n');
+  // The first check of each quantum matches. A writer appends during the second check, and the deadline passes then, so the
+  // pass after the growth stops at its first mark.
+  let scan = first;
+  let quanta = 0;
+  do {
+    const kept = scan.cursor.evidence?.marks?.length;
+    let reads = 0;
+    const writer = {
+      readBytes: 0,
+      onRead: () => {
+        if (kept !== 8 || ++reads !== 2) return;
+        fs.appendFileSync(parent.file, '{"type":"ignored"}\n');
+        clock += 1_000;
+      },
+    };
+    scan = await scanClaudeRelationshipQuantum(
+      parent,
+      JSON.parse(JSON.stringify(scan.cursor)),
+      16 * 1024 * 1024,
+      undefined,
+      writer,
+    );
+  } while (!scan.complete && ++quanta < 12);
+  assert.equal(scan.complete, true, 'growth during the second check of every quantum kept the source unfinished');
+  assert.deepEqual(
+    scan.references.map((reference) => reference.sessionId),
+    ['child-a'],
+  );
+});
+
 for (const stop of ['its budget', 'its deadline', 'cancellation'] as const)
   test(`Claude kept mark that a check matched before it stopped at ${stop} still finds a rewrite with an append`, async () => {
     let clock = 0;
