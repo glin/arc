@@ -456,7 +456,7 @@ test('Claude scan of a new transcript that grows before its first read completes
   assert.deepEqual(next.references, first.references);
 });
 
-// A transcript of twelve reads. A writer that appends after every forward read makes each read end a growth point.
+// A transcript of more than eight reads. A writer that appends after every forward read makes each read end a growth point.
 function growthPointTranscript() {
   const file = writeTranscript([
     assistantTool('Agent', 1, 'read-launch', {}),
