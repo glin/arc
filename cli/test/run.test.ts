@@ -1240,8 +1240,10 @@ test(
   'capture recovery reports the log incomplete when the lost order marker cannot be read',
   { tags: ['subprocess'] },
   async () => {
-    const recovery = await heldBoundaryRecovery({ budget: 128 }, 'dies', { marker: 'lookup' });
-    assert.ok(orderedOrIncomplete(recovery), recovery.published);
+    // A lookup that keeps failing settles no new boundary, so recovery holds the output that it read.
+    const { published, reason, expected } = await heldBoundaryRecovery({ budget: 128 }, 'dies', { marker: 'lookup' });
+    assert.ok(expected.startsWith(published), published);
+    assert.equal(reason, 'The requested log is incomplete. Private output remains available.');
   },
 );
 
@@ -1252,7 +1254,7 @@ test.each([
   { marker: 'can be written', unwritable: false },
   { marker: 'cannot be written', unwritable: true },
 ])(
-  'capture keeps arrival order or reports the log incomplete after a marker lookup fails once when the marker $marker',
+  'capture keeps arrival order after a marker lookup fails once when the marker $marker',
   { tags: ['subprocess'] },
   async ({ unwritable }) => {
     const { receipts, launch } = workerFixture('', 100, false, true);
@@ -1288,8 +1290,11 @@ test.each([
       fs.appendFileSync(stdout, frames[1]);
       fs.appendFileSync(stderr, 'f\n');
       failing = true;
-      if (unwritable) assert.throws(() => producer.defer(captureLimits), /Marker unavailable/);
-      else producer.defer(captureLimits);
+      try {
+        producer.defer(captureLimits);
+      } catch {
+        /* The next flush settles the boundaries of this one. */
+      }
       failing = false;
       fs.appendFileSync(stdout, frames[2]);
       producer.defer(captureLimits);
@@ -1298,13 +1303,46 @@ test.each([
     }
     blocked = false;
     const status = (await superviseStandalone(receipts, id, true, undefined, recoveryRuntime)) as any;
-    const recovery = {
-      published: fs.readFileSync(alias, 'utf8'),
-      reason: status.observation.reason,
-      expected: `${frames[0]}e\n${frames[1]}f\n${frames[2]}`,
-      known: frames[0],
-    };
-    assert.ok(orderedOrIncomplete(recovery), recovery.published);
+    assert.equal(fs.readFileSync(alias, 'utf8'), `${frames[0]}e\n${frames[1]}f\n${frames[2]}`);
+    assert.notEqual(status.observation.reason, 'The requested log is incomplete. Private output remains available.');
+  },
+);
+
+// With no queue and no lost order marker, the marker lookup fails once when the producer starts a slice.
+test(
+  'capture recovery publishes the full log after a marker lookup fails once at a new slice',
+  { tags: ['subprocess'] },
+  async () => {
+    const { receipts, launch } = workerFixture('', 100, false, true);
+    const id = launch.launchId;
+    const frames = outputFrames().split(/(?<=\n)/);
+    stoppedOutput(receipts, id, frames[0], 'e\n');
+    const stdout = receipts.artifact(id, 'stdout.log');
+    const marker = path.join(path.dirname(receipts.artifact(id, 'capture-queue.log')), 'capture-write.lost');
+    const alias = launch.standalone!.logAlias!;
+    let failing = true;
+    const lstat = fs.lstatSync;
+    vi.spyOn(fs, 'lstatSync').mockImplementation(((file: fs.PathLike, options: any) => {
+      if (failing && String(file) === marker) throw Object.assign(new Error('Marker unreadable'), { code: 'EIO' });
+      return lstat(file, options);
+    }) as typeof fs.lstatSync);
+    const producer = receipts.capture(id, 64 * 1024, true);
+    let fault: unknown;
+    try {
+      const cursor = { offset: fs.statSync(stdout).size, identity: channelIdentity(stdout) };
+      producer.write(fs.readFileSync(stdout), 'stdout.log', cursor);
+    } catch (error) {
+      fault = error;
+    } finally {
+      producer.close();
+    }
+    failing = false;
+    fs.appendFileSync(stdout, frames[1]);
+    const status = (await superviseStandalone(receipts, id, true, undefined, recoveryRuntime)) as any;
+    assert.equal(fs.readFileSync(alias, 'utf8'), `${frames[0]}${frames[1]}e\n`);
+    assert.notEqual(status.observation.reason, 'The requested log is incomplete. Private output remains available.');
+    // The producer retries the slice.
+    assert.equal((fault as NodeJS.ErrnoException)?.code, 'EPERM');
   },
 );
 

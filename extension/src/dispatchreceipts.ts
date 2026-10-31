@@ -214,14 +214,12 @@ function exclusive(file: string, text: string): void {
   fs.writeFileSync(file, text, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
 }
 // A marker that exists, as any file type, stays written. Only a confirmed absence counts as no marker. A lookup that
-// fails writes the marker, so the loss that it cannot rule out stays on record after the lookup recovers. If that
-// write fails too, the write error reaches the caller.
+// fails settles neither and writes nothing, so the caller retries.
 function marked(file: string): boolean {
   try {
     return fs.lstatSync(file, { throwIfNoEntry: false }) !== undefined;
   } catch {
-    mark(file, '');
-    return true;
+    throw Object.assign(new Error('The requested log is temporarily unavailable.'), { code: 'EPERM' });
   }
 }
 function mark(file: string, text: string): void {
@@ -1197,8 +1195,8 @@ export class DispatchReceipts {
             }
             held = boundaries.slice(written);
             if (held.length) heldAt = (state.records?.end ?? 0) + written * QUEUE_RECORD_BYTES;
-            // A lookup that fails and cannot write the marker leaves the order unknown. The new boundaries wait in
-            // `held` with the write lock, ahead of later output, until a later lookup settles it.
+            // A lookup that fails leaves the order unknown. The new boundaries wait in `held` with the write lock, ahead
+            // of later output, until a later lookup settles it.
             if (lookup) throw lookup;
             if (!boundaries.length) return;
             // The queue file names each boundary before the checkpoint does, so the next capture finds the boundaries
