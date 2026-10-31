@@ -221,13 +221,22 @@ function exclusive(file: string, text: string): void {
   safePath(path.dirname(file));
   fs.writeFileSync(file, text, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
 }
+// Access and sharing faults that clear when another process, such as a scanner or a sync client, releases the file.
+const TRANSIENT_FAULTS = ['EPERM', 'EACCES', 'EBUSY'];
 // A marker that exists, as any file type, stays written. Only a confirmed absence counts as no marker. A lookup that
-// fails settles neither and writes nothing, so the caller retries.
+// fails with a transient fault settles neither and writes nothing, so the caller retries. Any other failed lookup,
+// such as one through a file or a link loop, does not clear, so it writes the marker and capture ends.
 function marked(file: string): boolean {
   try {
     return fs.lstatSync(file, { throwIfNoEntry: false }) !== undefined;
-  } catch {
-    throw new CaptureOrderPending();
+  } catch (cause) {
+    if (TRANSIENT_FAULTS.includes((cause as NodeJS.ErrnoException).code ?? '')) throw new CaptureOrderPending(cause);
+    try {
+      mark(file, '');
+    } catch (error) {
+      throw new Error('The requested log is incomplete. Private output remains available.', { cause: error });
+    }
+    return true;
   }
 }
 function mark(file: string, text: string): void {
@@ -955,7 +964,7 @@ export class DispatchReceipts {
       try {
         return operation();
       } catch (cause) {
-        if (!['EPERM', 'EACCES', 'EBUSY'].includes((cause as NodeJS.ErrnoException).code ?? '')) throw cause;
+        if (!TRANSIENT_FAULTS.includes((cause as NodeJS.ErrnoException).code ?? '')) throw cause;
         throw Object.assign(new Error('The requested log is temporarily unavailable.', { cause }), { code: 'EPERM' });
       }
     };

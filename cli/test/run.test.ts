@@ -342,7 +342,7 @@ function denyOpen(target: string, when: () => boolean = () => true, code = 'EPER
   });
 }
 // Fails a metadata lookup of `target` with `code` when `when()` is true.
-function failLookup(target: string, when: () => boolean, code = 'EIO') {
+function failLookup(target: string, when: () => boolean, code = 'EBUSY') {
   const lstat = fs.lstatSync;
   return vi.spyOn(fs, 'lstatSync').mockImplementation(((file: fs.PathLike, options: any) => {
     if (String(file) === target && when()) throw Object.assign(new Error('Marker unreadable'), { code });
@@ -1186,7 +1186,7 @@ async function heldBoundaryRecovery(
     const lstat = fs.lstatSync;
     vi.spyOn(fs, 'lstatSync').mockImplementation(((file: fs.PathLike, options: any) => {
       if (String(file) === marker && fs.statSync(marker, { throwIfNoEntry: false }))
-        throw Object.assign(new Error('Marker unreadable'), { code: 'EIO' });
+        throw Object.assign(new Error('Marker unreadable'), { code: 'EBUSY' });
       return lstat(file, options);
     }) as typeof fs.lstatSync);
   }
@@ -1357,11 +1357,15 @@ test.each([
   },
 );
 
-// With no queue and no lost order marker, the marker lookup fails once when the producer starts a slice.
-test(
-  'capture recovery publishes the full log after a marker lookup fails once at a new slice',
+// With no queue and no lost order marker, the marker lookup fails once with `code` when the producer starts a slice.
+// A sharing fault clears, and a lookup through a file does not.
+test.each([
+  { code: 'EBUSY', clears: true },
+  { code: 'ENOTDIR', clears: false },
+])(
+  'capture after a marker lookup fails once with $code at a new slice',
   { tags: ['subprocess'] },
-  async () => {
+  async ({ code, clears }) => {
     const { receipts, launch } = workerFixture('', 100, false, true);
     const id = launch.launchId;
     const frames = outputFrames().split(/(?<=\n)/);
@@ -1370,7 +1374,7 @@ test(
     const marker = path.join(path.dirname(receipts.artifact(id, 'capture-queue.log')), 'capture-write.lost');
     const alias = launch.standalone!.logAlias!;
     let failing = true;
-    failLookup(marker, () => failing);
+    failLookup(marker, () => failing, code);
     const producer = receipts.capture(id, 64 * 1024, true);
     let fault: unknown;
     try {
@@ -1384,10 +1388,17 @@ test(
     failing = false;
     fs.appendFileSync(stdout, frames[1]);
     const status = (await superviseStandalone(receipts, id, true, undefined, recoveryRuntime)) as any;
-    assert.equal(fs.readFileSync(alias, 'utf8'), `${frames[0]}${frames[1]}e\n`);
-    assert.notEqual(status.observation.reason, 'The requested log is incomplete. Private output remains available.');
-    // The producer retries the slice.
-    assert.equal((fault as NodeJS.ErrnoException)?.code, 'EPERM');
+    if (clears) {
+      assert.equal(fs.readFileSync(alias, 'utf8'), `${frames[0]}${frames[1]}e\n`);
+      assert.notEqual(status.observation.reason, 'The requested log is incomplete. Private output remains available.');
+      // The producer retries the slice.
+      assert.equal((fault as NodeJS.ErrnoException)?.code, 'EPERM');
+    } else {
+      // The producer ends capture at once, and recovery reports the log incomplete.
+      assert.equal(String(fault), 'Error: The requested log is incomplete. Private output remains available.');
+      assert.equal((fault as NodeJS.ErrnoException).code, undefined);
+      assert.equal(status.observation.reason, 'The requested log is incomplete. Private output remains available.');
+    }
   },
 );
 
