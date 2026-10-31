@@ -24,7 +24,7 @@ function fixture(body = 'opening\n' + 'old line\n'.repeat(10000)) {
   return { plain, file, body: Buffer.from(body) };
 }
 
-test.skipIf(!codec.zstdCompressSync)('the final oversized lease release removes its decoded disk file', async () => {
+test.skipIf(!codec.zstdCompressSync)('oversized ranges reuse one decoded disk file after every close', async () => {
   const f = fixture('opening\n' + 'x'.repeat(1024 * 1024));
   const root = tempDir('oversized-cache-');
   const temporary = vi.spyOn(os, 'tmpdir').mockReturnValue(root);
@@ -40,19 +40,24 @@ test.skipIf(!codec.zstdCompressSync)('the final oversized lease release removes 
     second.close();
     assert.equal(fs.statSync(file).size, f.body.length);
     release();
-    assert.equal(fs.existsSync(file), false);
+    assert.equal(fs.statSync(file).size, f.body.length);
     release();
-    const asyncRelease = await sources.prepare(f.file);
-    assert.equal(fs.statSync(path.join(directory, '2')).size, f.body.length);
-    asyncRelease();
-    assert.deepEqual(fs.readdirSync(directory), []);
+    for (const offset of [0, 256 * 1024, 512 * 1024, f.body.length - 32]) {
+      const source = sources.open(f.file);
+      assert.deepEqual(source.read(offset, 32), f.body.subarray(offset, offset + 32));
+      source.close();
+    }
+    assert.deepEqual(fs.readdirSync(directory), ['1']);
+    const next = fixture('next\n' + 'y'.repeat(1024));
+    sources.open(next.file).close();
+    assert.deepEqual(fs.readdirSync(directory), ['2'], 'the next source must evict the unleased oversized source');
   } finally {
     temporary.mockRestore();
   }
 });
 
 test.skipIf(!codec.zstdCompressSync)(
-  'decoded source handoff survives readiness callbacks and concurrent leases',
+  'oversized sources remain reusable across readiness callbacks and concurrent leases',
   async () => {
     const f = fixture();
     const root = tempDir('handoff-cache-');
@@ -68,16 +73,58 @@ test.skipIf(!codec.zstdCompressSync)(
       releases[1]();
       assert.deepEqual(fs.readdirSync(directory), ['1']);
       reader.close();
-      assert.deepEqual(fs.readdirSync(directory), []);
+      assert.deepEqual(fs.readdirSync(directory), ['1']);
     } finally {
       temporary.mockRestore();
     }
   },
 );
 
+test.skipIf(!codec.zstdCompressSync)('an oversized async miss becomes readable after the readiness turn', async () => {
+  const f = fixture();
+  const decoded: string[] = [];
+  const sources = new RolloutSources({ budget: 16, asyncOnly: true, decodeStarted: (file) => decoded.push(file) });
+  const root = tempDir('async-cache-');
+  const temporary = vi.spyOn(os, 'tmpdir').mockReturnValue(root);
+  try {
+    const ready = new Promise<void>((resolve) => sources.onReady(() => resolve()));
+    assert.throws(() => sources.open(f.file), { code: 'EAGAIN' });
+    await ready;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const source = sources.open(f.file);
+    try {
+      assert.deepEqual(source.read(source.size - 32, 32), f.body.subarray(-32));
+    } finally {
+      source.close();
+    }
+    assert.deepEqual(decoded, [f.file]);
+    const next = Array.from({ length: 3 }, () => fixture());
+    const completed = new Set<string>();
+    const allReady = new Promise<void>((resolve) =>
+      sources.onReady((file) => {
+        completed.add(file);
+        if (completed.size === next.length) resolve();
+      }),
+    );
+    for (const { file } of next) assert.throws(() => sources.open(file), { code: 'EAGAIN' });
+    await allReady;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const directory = path.join(root, fs.readdirSync(root)[0]);
+    assert.deepEqual(
+      fs.readdirSync(directory),
+      ['4'],
+      'async misses must retain only the newest unleased oversized source',
+    );
+    assert.deepEqual(decoded, [f.file, ...next.map(({ file }) => file)]);
+  } finally {
+    temporary.mockRestore();
+  }
+});
+
 test.skipIf(!codec.zstdCompressSync)('failed unlinks count toward the disk budget and retry on later reads', () => {
   const first = fixture('a'.repeat(16));
   const second = fixture('b'.repeat(16));
+  const third = fixture('c'.repeat(8));
   const root = tempDir('retry-cache-');
   const temporary = vi.spyOn(os, 'tmpdir').mockReturnValue(root);
   const sources = new RolloutSources({ budget: 24 });
@@ -98,16 +145,17 @@ test.skipIf(!codec.zstdCompressSync)('failed unlinks count toward the disk budge
     assert.equal(fs.statSync(failed).size, 16);
     assert.equal(fs.statSync(path.join(directory, '2')).size, 16);
     held.close();
-    assert.deepEqual(fs.readdirSync(directory), ['1'], 'failed removals must still consume the budget');
+    sources.open(third.file).close();
+    assert.deepEqual(fs.readdirSync(directory), ['1', '3'], 'failed removals must still consume the budget');
     const before = attempts.length;
     sources.open(first.plain).close();
     assert.ok(attempts.length - before <= 8, 'one read retried an unbounded number of failed removals');
     failed = undefined;
     sources.open(first.plain).close();
-    assert.deepEqual(fs.readdirSync(directory), []);
+    assert.deepEqual(fs.readdirSync(directory), ['3']);
     blockAll = true;
     const oversized = new RolloutSources({ budget: 0 });
-    for (let index = 0; index < 12; index++) oversized.open(first.file).close();
+    for (let index = 0; index < 13; index++) oversized.open(fixture(String(index)).file).close();
     const retries = attempts.length;
     oversized.open(first.plain).close();
     assert.equal(attempts.length - retries, 8, 'one operation must retry only eight failed paths');
@@ -115,12 +163,12 @@ test.skipIf(!codec.zstdCompressSync)('failed unlinks count toward the disk budge
       root,
       fs.readdirSync(root).find((name) => path.join(root, name) !== directory)!,
     );
-    assert.equal(fs.readdirSync(retainedDirectory).length, 12);
+    assert.equal(fs.readdirSync(retainedDirectory).length, 13);
     blockAll = false;
     oversized.open(first.plain).close();
-    assert.equal(fs.readdirSync(retainedDirectory).length, 4);
+    assert.equal(fs.readdirSync(retainedDirectory).length, 5);
     oversized.open(first.plain).close();
-    assert.deepEqual(fs.readdirSync(retainedDirectory), []);
+    assert.deepEqual(fs.readdirSync(retainedDirectory), ['13']);
   } finally {
     remove.mockRestore();
     temporary.mockRestore();
