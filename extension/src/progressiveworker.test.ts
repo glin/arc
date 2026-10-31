@@ -5,8 +5,6 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import { tempDir } from './temproot.ts';
 import * as path from 'node:path';
-import os from 'node:os';
-import * as zlib from 'node:zlib';
 import { buildSync } from 'esbuild';
 import { once } from 'node:events';
 import { createDiagnosticsLog } from './diagnosticslog';
@@ -2600,91 +2598,6 @@ test('cancelled generation and disposal do not report a worker crash', async () 
   assert.equal(worker.snapshot().state, 'cancelled');
   assert.deepEqual(failures, []);
 });
-
-test.skipIf(!(zlib as any).zstdCompressSync)(
-  'worker termination removes decoded disk files while preserving its live replacement',
-  async () => {
-    const root = tempDir('worker-rollout-retention-');
-    const file = path.join(root, 'session.jsonl.zst');
-    fs.writeFileSync(file, (zlib as any).zstdCompressSync(Buffer.from('opening\n' + 'x'.repeat(1024 * 1024))));
-    const workerSource = buildSync({
-      stdin: {
-        resolveDir: __dirname,
-        contents: `import { RolloutSources } from './rolloutsource';
-        import { parentPort, threadId } from 'node:worker_threads';
-        import os from 'node:os';
-        os.tmpdir = () => ${JSON.stringify(root)};
-        const sources = new RolloutSources();
-        parentPort.on('message', async message => {
-          if (!message.request) return;
-          await sources.prepare(${JSON.stringify(file)});
-          const result = { generation: message.generation, revision: null, value: { kind: 'metadata', entry: null } };
-          if (message.request.session.sessionId === 'ready') parentPort.postMessage({ id: message.id, result });
-          else {
-            parentPort.postMessage({ id: message.id, result, progress: true });
-            if (message.request.session.sessionId === 'crash') {
-              process.removeAllListeners('exit');
-              setImmediate(() => { throw new Error('Reader failure.'); });
-            }
-          }
-        });`,
-      },
-      bundle: true,
-      platform: 'node',
-      format: 'cjs',
-      target: 'node18',
-      write: false,
-    }).outputFiles[0].text;
-    const temporary = vi.spyOn(os, 'tmpdir').mockReturnValue(root);
-    try {
-      for (const mode of ['cancel', 'stop', 'crash']) {
-        const worker = new ProgressiveWorker(workerSource);
-        const controller = new AbortController();
-        const request = (sessionId: string) => ({
-          kind: 'metadata' as const,
-          session: { file, sessionId, agent: 'codex' as const, size: 0, mtimeMs: 0 },
-        });
-        let ready!: () => void;
-        const prepared = new Promise<void>((resolve) => {
-          ready = resolve;
-        });
-        const pending = worker
-          .run(request(mode === 'crash' ? 'crash' : 'hold'), 1, controller.signal, ready)
-          .catch(() => null);
-        await prepared;
-        const old = (worker as unknown as { worker: import('node:worker_threads').Worker }).worker;
-        const oldDirectory = fs
-          .readdirSync(root)
-          .find((name) => name.startsWith(`arc-rollouts-${process.pid}-${old.threadId}-`))!;
-        assert.equal(fs.statSync(path.join(root, oldDirectory, '1')).size, 1024 * 1024 + 8);
-        const exited = new Promise<void>((resolve) => old.once('exit', () => resolve()));
-        try {
-          if (mode === 'crash') await pending;
-          else if (mode === 'cancel') controller.abort();
-          else worker.stop();
-          const replacementRequest = worker.run(request('ready'), 2, new AbortController().signal);
-          assert.ok(await replacementRequest);
-          const replacement = (worker as unknown as { worker: import('node:worker_threads').Worker }).worker;
-          const replacementDirectory = fs
-            .readdirSync(root)
-            .find((name) => name.startsWith(`arc-rollouts-${process.pid}-${replacement.threadId}-`))!;
-          await exited;
-          assert.equal(await pending, null);
-          await vi.waitFor(() => assert.equal(fs.existsSync(path.join(root, oldDirectory)), false));
-          assert.equal(fs.statSync(path.join(root, replacementDirectory, '1')).size, 1024 * 1024 + 8);
-          const replacementExited = once(replacement, 'exit');
-          worker.stop();
-          await replacementExited;
-          await vi.waitFor(() => assert.equal(fs.existsSync(path.join(root, replacementDirectory)), false));
-        } finally {
-          worker.stop();
-        }
-      }
-    } finally {
-      temporary.mockRestore();
-    }
-  },
-);
 
 test('a caught worker request exception preserves safe cause without its message', async () => {
   const directory = tempDir('worker-request-diagnostics');

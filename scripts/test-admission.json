@@ -136,8 +136,8 @@
   },
   "extension/src/progressiveworker.test.ts": {
     "reason": "Worker protocol, cancellation, host death, bounded transcript reads, and scoped subagent edit reads must survive the actual worker boundary.",
-    "cases": 154,
-    "matricesSha256": "5d65f03abf27cf6fb5cd7423348bbe722b134d9d184f6bd44fe728950d135901"
+    "cases": 153,
+    "matricesSha256": "2541fc38bce3daf8fee02a3380effe62a9967a54764084411244333009449471"
   },
   "extension/src/projectsetups.test.ts": {
     "reason": "Real Git worktrees and canonical filesystem aliases must share project identity while clones stay distinct.",
@@ -168,11 +168,6 @@
     "reason": "Saved views and filter menus must preserve browser interaction and keyboard focus.",
     "cases": 21,
     "matricesSha256": "86b0fd56084f092c79649d8aa3efc9409d65cf28c017600bcd5292f68416fd31"
-  },
-  "extension/src/rolloutsource.test.ts": {
-    "reason": "Decoded disk leases, dead-process recovery, and temporary-file deletion must preserve real filesystem ownership.",
-    "cases": 13,
-    "matricesSha256": "2bfdc953a4ba1389d18a5ec8021a64d37705aa1e633d80a2e5ec483d6423613c"
   },
   "extension/src/sessiondiscovery.test.ts": {
     "reason": "Real window listeners and registry discovery must preserve ownership, reachability, and partial listing across native IPC.",

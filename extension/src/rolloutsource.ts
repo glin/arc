@@ -1,8 +1,8 @@
 import fs from 'node:fs';
 import * as path from 'node:path';
-import os from 'node:os';
+import * as os from 'node:os';
 import * as zlib from 'node:zlib';
-import { Worker, isMainThread, threadId } from 'node:worker_threads';
+import { Worker, isMainThread } from 'node:worker_threads';
 import { revisionOf } from './filerevision';
 
 type Zstd = { createZstdDecompress?: (options?: { chunkSize: number }) => zlib.Gunzip };
@@ -97,80 +97,18 @@ interface Decoded {
 }
 const temporaryFiles = new Set<string>();
 const temporaryDirectories = new Set<string>();
-function temporaryOwner(name: string): { pid: number; thread?: number } | null {
-  const match = /^arc-rollouts-([1-9]\d*)-(?:(0|[1-9]\d*)-)?[A-Za-z0-9]{6}$/.exec(name);
-  if (!match) return null;
-  const pid = Number(match[1]);
-  const thread = match[2] === undefined ? undefined : Number(match[2]);
-  return Number.isSafeInteger(pid) && (thread === undefined || Number.isSafeInteger(thread)) ? { pid, thread } : null;
-}
-
-// An omitted owner admits only directories whose process is definitively absent.
-export async function cleanupRolloutDirectories(
-  owner?: { pid: number; thread: number },
-  root = os.tmpdir(),
-  kill: (pid: number, signal: 0) => unknown = process.kill,
-): Promise<void> {
-  try {
-    for (const name of await fs.promises.readdir(root)) {
-      const identity = temporaryOwner(name);
-      if (!identity) continue;
-      if (owner) {
-        if (identity.pid !== owner.pid || identity.thread !== owner.thread) continue;
-      } else {
-        try {
-          kill(identity.pid, 0);
-          continue;
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== 'ESRCH') continue;
-        }
-      }
-      const directory = path.join(root, name);
-      try {
-        const stat = await fs.promises.lstat(directory);
-        if (!stat.isDirectory() || stat.isSymbolicLink()) continue;
-        const children = await fs.promises.readdir(directory, { withFileTypes: true });
-        if (children.some((child) => !/^[1-9]\d*$/.test(child.name) || !child.isFile() || child.isSymbolicLink()))
-          continue;
-        const current = await fs.promises.lstat(directory);
-        if (!current.isDirectory() || current.isSymbolicLink() || current.dev !== stat.dev || current.ino !== stat.ino)
-          continue;
-        for (const child of children) {
-          const file = path.join(directory, child.name);
-          try {
-            const childStat = await fs.promises.lstat(file);
-            if (childStat.isFile() && !childStat.isSymbolicLink()) await fs.promises.unlink(file);
-          } catch {
-            /* Retry retained files on a later cleanup. */
-          }
-        }
-        await fs.promises.rmdir(directory);
-      } catch {
-        /* Retain unavailable or occupied directories. */
-      }
-    }
-  } catch {
-    /* Temporary storage is unavailable. */
-  }
-}
-if (isMainThread) void cleanupRolloutDirectories();
-
 process.once('exit', () => {
   // Parser threads share the host process. Its exit also removes their temporary files.
   if (isMainThread) {
     try {
       for (const name of fs.readdirSync(os.tmpdir())) {
-        if (temporaryOwner(name)?.pid !== process.pid) continue;
+        if (!name.startsWith(`arc-rollouts-${process.pid}-`)) continue;
         const directory = path.join(os.tmpdir(), name);
         if (fs.lstatSync(directory).isSymbolicLink() || !fs.lstatSync(directory).isDirectory()) continue;
-        const children = fs.readdirSync(directory, { withFileTypes: true });
-        if (children.some((child) => !/^[1-9]\d*$/.test(child.name) || !child.isFile() || child.isSymbolicLink()))
-          continue;
-        for (const { name: child } of children) {
+        for (const child of fs.readdirSync(directory)) {
           const file = path.join(directory, child);
           try {
-            if (/^[1-9]\d*$/.test(child) && fs.lstatSync(file).isFile() && !fs.lstatSync(file).isSymbolicLink())
-              fs.unlinkSync(file);
+            if (fs.lstatSync(file).isFile()) fs.unlinkSync(file);
           } catch {
             /* still open */
           }
@@ -241,8 +179,6 @@ parentPort.on('message', async ({ file, destination, limit, firstLine, shared })
 // Decoded bodies live in private temporary files. Leases pin files, never decoded buffers.
 export class RolloutSources {
   private readonly cache = new Map<string, Decoded>();
-  private readonly files = new Map<string, { size: number; users: number }>();
-  private readonly discarded = new Set<string>();
   private readonly sizes = new Map<string, { key: string; size: number }>();
   private readonly pending = new Map<string, Promise<Decoded>>();
   private gate: Promise<unknown> = Promise.resolve();
@@ -298,45 +234,30 @@ export class RolloutSources {
   }
   private destination(): string {
     if (!this.directory) {
-      this.directory = fs.mkdtempSync(path.join(os.tmpdir(), `arc-rollouts-${process.pid}-${threadId}-`));
+      this.directory = fs.mkdtempSync(path.join(os.tmpdir(), `arc-rollouts-${process.pid}-`));
       temporaryDirectories.add(this.directory);
     }
     const file = path.join(this.directory, String(++this.sequence));
     temporaryFiles.add(file);
-    this.files.set(file, { size: 0, users: 0 });
     return file;
   }
-  private remove(entry: Pick<Decoded, 'file'>): boolean {
+  private remove(entry: Pick<Decoded, 'file'>): void {
     try {
       fs.unlinkSync(entry.file);
+      temporaryFiles.delete(entry.file);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-        const held = this.files.get(entry.file);
-        try {
-          this.files.set(entry.file, { size: fs.statSync(entry.file).size, users: held?.users ?? 0 });
-        } catch {
-          /* Keep the last known size. */
-        }
-        this.discarded.add(entry.file);
-        return false;
-      }
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') temporaryFiles.delete(entry.file);
+      // Other failures leave the path registered for process-exit cleanup.
     }
-    temporaryFiles.delete(entry.file);
-    this.discarded.delete(entry.file);
-    this.files.delete(entry.file);
-    return true;
   }
   private trim(keep?: Decoded): void {
-    for (const file of [...this.discarded].slice(0, 8)) {
-      this.discarded.delete(file);
-      if (!this.files.get(file)?.users) this.remove({ file });
-    }
-    let used = [...this.files.values()].reduce((total, entry) => total + entry.size, 0);
+    let used = [...this.cache.values()].reduce((total, entry) => total + entry.size, 0);
     for (const [key, entry] of this.cache) {
       if (used <= (this.options.budget ?? 256 * 1024 * 1024)) break;
       if (entry.users || entry === keep) continue;
       this.cache.delete(key);
-      if (this.remove(entry)) used -= entry.size;
+      used -= entry.size;
+      this.remove(entry);
     }
   }
   private hit(key: string, stat: fs.BigIntStats): Decoded | undefined {
@@ -364,21 +285,13 @@ export class RolloutSources {
         released = true;
         entry.users--;
         if (!entry.users && ![...this.cache.values()].includes(entry)) this.remove(entry);
-        this.trim();
+        this.trim(entry);
       }
     };
   }
   private accepted(file: string, destination: string, before: fs.BigIntStats): Decoded {
     if (revisionKey(this.physical(file)) !== revisionKey(before)) throw new Error('The session file changed.');
-    const entry = {
-      key: revisionKey(before),
-      file: destination,
-      size: fs.statSync(destination).size,
-      stat: before,
-      users: 0,
-    };
-    this.files.set(destination, entry);
-    return entry;
+    return { key: revisionKey(before), file: destination, size: fs.statSync(destination).size, stat: before, users: 0 };
   }
   private synchronous(file: string, opening: boolean, stat: fs.BigIntStats, prefixBytes?: number): Decoded {
     const destination = this.destination();
@@ -403,7 +316,6 @@ export class RolloutSources {
     }
   }
   open(file: string, opening = false, io: typeof fs = fs, prefixBytes?: number): RolloutSource {
-    this.trim();
     if (!isCompressedRollout(file)) return new RolloutSource(file, io.openSync(file, 'r'), undefined, io);
     const stat = this.physical(file);
     const key = opening
@@ -412,9 +324,7 @@ export class RolloutSources {
     let entry = this.hit(file, stat) ?? (opening ? this.hit(key, stat) : undefined);
     if (!entry) {
       if (this.asyncOnly) {
-        void this.load(file, opening, prefixBytes ?? 1024 * 1024, prefixBytes === undefined)
-          .then(({ release }) => release())
-          .catch(() => undefined);
+        void this.load(file, opening, prefixBytes ?? 1024 * 1024, prefixBytes === undefined).catch(() => undefined);
         throw Object.assign(new Error('The session is still loading.'), { code: 'EAGAIN' });
       }
       entry = this.synchronous(file, opening, stat, prefixBytes);
@@ -428,20 +338,13 @@ export class RolloutSources {
       throw error;
     }
   }
-  private load(
-    file: string,
-    opening = false,
-    limit = 1024 * 1024,
-    firstLine = true,
-  ): Promise<{ entry: Decoded; release: () => void }> {
-    this.trim();
+  private load(file: string, opening = false, limit = 1024 * 1024, firstLine = true): Promise<Decoded> {
     const stat = this.physical(file);
     const key = opening ? file + (firstLine ? '\nopening:' + limit : '\nprefix:' + limit) : file;
     const hit = this.hit(file, stat) ?? this.hit(key, stat);
-    if (hit) return Promise.resolve({ entry: hit, release: this.pin(hit) });
+    if (hit) return Promise.resolve(hit);
     const held = this.pending.get(key);
-    if (held) return held.then((entry) => ({ entry, release: this.pin(entry) }));
-    let releaseHandoff: (() => void) | undefined;
+    if (held) return held;
     const pending = this.gate
       .catch(() => undefined)
       .then(async () => {
@@ -490,7 +393,6 @@ export class RolloutSources {
             }
           }
           const entry = this.accepted(file, destination, before);
-          releaseHandoff = this.pin(entry);
           this.remember(key, entry);
           return entry;
         } catch (error) {
@@ -506,30 +408,25 @@ export class RolloutSources {
     void pending.then(
       () => {
         this.pending.delete(key);
-        try {
-          for (const callback of this.ready) callback(file);
-        } finally {
-          queueMicrotask(() => releaseHandoff?.());
-        }
+        for (const callback of this.ready) callback(file);
       },
       () => {
         this.pending.delete(key);
       },
     );
-    return pending.then((entry) => ({ entry, release: this.pin(entry) }));
+    return pending;
   }
   async prepare(file: string): Promise<() => void> {
     if (!isCompressedRollout(file)) return () => undefined;
-    return (await this.load(file)).release;
+    return this.pin(await this.load(file));
   }
   async opening(file: string, limit = 1024 * 1024): Promise<Buffer> {
     let release: (() => void) | undefined;
     let handle: fs.promises.FileHandle | undefined;
     try {
       if (isCompressedRollout(file)) {
-        const loaded = await this.load(file, true, limit);
-        const { entry } = loaded;
-        release = loaded.release;
+        const entry = await this.load(file, true, limit);
+        release = this.pin(entry);
         handle = await fs.promises.open(entry.file, 'r');
       } else handle = await fs.promises.open(file, 'r');
       const buffer = Buffer.allocUnsafe(limit);
