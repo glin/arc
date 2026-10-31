@@ -213,12 +213,14 @@ function exclusive(file: string, text: string): void {
   safePath(path.dirname(file));
   fs.writeFileSync(file, text, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
 }
-// A marker that exists, as any file type, stays written. Only a confirmed absence counts as no marker, so a marker
-// whose metadata cannot be read counts as written.
+// A marker that exists, as any file type, stays written. Only a confirmed absence counts as no marker. A lookup that
+// fails writes the marker, so the loss that it cannot rule out stays on record after the lookup recovers. If that
+// write fails too, the write error reaches the caller.
 function marked(file: string): boolean {
   try {
     return fs.lstatSync(file, { throwIfNoEntry: false }) !== undefined;
   } catch {
+    mark(file, '');
     return true;
   }
 }
@@ -1165,7 +1167,15 @@ export class DispatchReceipts {
             const written = boundaries.length;
             const ends = { 'stdout.log': queuedEnd(state, 'stdout.log'), 'stderr.log': queuedEnd(state, 'stderr.log') };
             for (const slice of boundaries) ends[slice.name] = slice.offset;
-            for (const slice of held)
+            let lookup: unknown;
+            let lost = false;
+            try {
+              lost = orderLost();
+            } catch (error) {
+              lookup = error;
+            }
+            // Held boundaries past a lost boundary have no known place either.
+            for (const slice of lost ? [] : held)
               if (slice.offset > ends[slice.name]) {
                 boundaries.push(slice);
                 ends[slice.name] = slice.offset;
@@ -1176,7 +1186,7 @@ export class DispatchReceipts {
                 throw new Error('The original worker output was replaced or truncated.');
             }
             // Output past a lost boundary joins no queue.
-            for (const [name, limit, end = Infinity] of orderLost() ? [] : limits) {
+            for (const [name, limit, end = Infinity] of lost ? [] : limits) {
               if (limit <= 0) continue;
               const stat = source(name);
               const offset = Math.min(Number(stat.size), ends[name] + limit, end);
@@ -1186,13 +1196,14 @@ export class DispatchReceipts {
               }
             }
             held = boundaries.slice(written);
+            if (held.length) heldAt = (state.records?.end ?? 0) + written * QUEUE_RECORD_BYTES;
+            // A lookup that fails and cannot write the marker leaves the order unknown. The new boundaries wait in
+            // `held` with the write lock, ahead of later output, until a later lookup settles it.
+            if (lookup) throw lookup;
             if (!boundaries.length) return;
             // The queue file names each boundary before the checkpoint does, so the next capture finds the boundaries
             // of a save that never happened.
-            if (held.length) {
-              heldAt = (state.records?.end ?? 0) + written * QUEUE_RECORD_BYTES;
-              appendQueue(heldAt, held, !state.records && !written);
-            }
+            if (held.length) appendQueue(heldAt, held, !state.records && !written);
             held = [];
             for (const slice of boundaries) enqueue(state, slice);
             save(state);

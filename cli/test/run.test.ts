@@ -1245,6 +1245,69 @@ test(
   },
 );
 
+// Behind pending A and e with no lost order marker, the marker lookup fails during the flush of stdout B and stderr f,
+// and the alias stays unavailable. Stdout C arrives after the lookup recovers. With `unwritable`, the marker cannot be
+// created during the failed lookup either.
+test.each([
+  { marker: 'can be written', unwritable: false },
+  { marker: 'cannot be written', unwritable: true },
+])(
+  'capture keeps arrival order or reports the log incomplete after a marker lookup fails once when the marker $marker',
+  { tags: ['subprocess'] },
+  async ({ unwritable }) => {
+    const { receipts, launch } = workerFixture('', 100, false, true);
+    const id = launch.launchId;
+    const frames = outputFrames().split(/(?<=\n)/);
+    stoppedOutput(receipts, id, frames[0], 'e\n');
+    const stdout = receipts.artifact(id, 'stdout.log');
+    const stderr = receipts.artifact(id, 'stderr.log');
+    const marker = path.join(path.dirname(receipts.artifact(id, 'capture-queue.log')), 'capture-write.lost');
+    const alias = launch.standalone!.logAlias!;
+    let blocked = true;
+    denyOpen(alias, () => blocked);
+    let failing = false;
+    const lstat = fs.lstatSync;
+    vi.spyOn(fs, 'lstatSync').mockImplementation(((file: fs.PathLike, options: any) => {
+      if (failing && String(file) === marker) throw Object.assign(new Error('Marker unreadable'), { code: 'EIO' });
+      return lstat(file, options);
+    }) as typeof fs.lstatSync);
+    const writeFile = fs.writeFileSync;
+    vi.spyOn(fs, 'writeFileSync').mockImplementation((file, ...args) => {
+      if (failing && unwritable && String(file) === marker)
+        throw Object.assign(new Error('Marker unavailable'), { code: 'EACCES' });
+      return Reflect.apply(writeFile, fs, [file, ...args]);
+    });
+    queueOutage(
+      receipts,
+      id,
+      () => {},
+      (state) => state.pending.length >= 2,
+    );
+    const producer = receipts.capture(id, 64 * 1024, true);
+    try {
+      fs.appendFileSync(stdout, frames[1]);
+      fs.appendFileSync(stderr, 'f\n');
+      failing = true;
+      if (unwritable) assert.throws(() => producer.defer(captureLimits), /Marker unavailable/);
+      else producer.defer(captureLimits);
+      failing = false;
+      fs.appendFileSync(stdout, frames[2]);
+      producer.defer(captureLimits);
+    } finally {
+      producer.close();
+    }
+    blocked = false;
+    const status = (await superviseStandalone(receipts, id, true, undefined, recoveryRuntime)) as any;
+    const recovery = {
+      published: fs.readFileSync(alias, 'utf8'),
+      reason: status.observation.reason,
+      expected: `${frames[0]}e\n${frames[1]}f\n${frames[2]}`,
+      known: frames[0],
+    };
+    assert.ok(orderedOrIncomplete(recovery), recovery.published);
+  },
+);
+
 test(
   'capture recovery publishes no output after a producer ends when the lost order marker cannot be written',
   { tags: ['subprocess'] },
