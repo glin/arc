@@ -4062,8 +4062,10 @@ export const RELATIONSHIP_QUANTUM_BYTES = 1024 * 1024;
 export const RELATIONSHIP_READ_BYTES = 256 * 1024;
 export const RELATIONSHIP_RESERVE_BYTES = 16 * 1024;
 export const RELATIONSHIP_SLICE_MS = 15;
-// The check passes before a read whose file keeps growing during its checks falls back to a whole-prefix comparison.
+// The check passes before a read whose file keeps growing during its checks ends unqualified and leaves its marks to the next quantum.
 const RELATIONSHIP_SETTLE_PASSES = 4;
+// The marks that one read keeps. Past this count, a new mark replaces the latest one, so the first growth point always stays.
+export const RELATIONSHIP_MARKS = 8;
 export const RELATIONSHIP_EVIDENCE_BYTES = 16 * 1024;
 const RELATIONSHIP_BLOCK_BYTES = 4096;
 
@@ -4110,6 +4112,15 @@ export interface RelationshipEvidence extends RelationshipDigest {
   accepted: RelationshipStamp | null;
   provisional: RelationshipStamp;
   validation?: { stamp: RelationshipStamp; required: number; digest: RelationshipDigest };
+  // The growth points of the latest read. The next quantum checks each of them before it accepts a grown file.
+  marks?: RelationshipMark[];
+}
+
+// A growth point of a read: its offset, the chain before its final full block, and a hash of the chain and the tail there.
+export interface RelationshipMark {
+  offset: number;
+  anchor?: string;
+  hash: string;
 }
 
 export function relationshipStamp(stat: fs.BigIntStats): RelationshipStamp {
@@ -4165,6 +4176,26 @@ export function validRelationshipEvidence(value: unknown, offset: number): value
     !(value.accepted === null || (stamp(value.accepted) && sameRelationshipStamp(value.accepted, value.provisional)))
   )
     return false;
+  const marks = value.marks;
+  if (
+    marks !== undefined &&
+    !(
+      Array.isArray(marks) &&
+      marks.length > 0 &&
+      marks.length <= RELATIONSHIP_MARKS &&
+      marks.every(
+        (mark: unknown, index) =>
+          object(mark) &&
+          Number.isSafeInteger(mark.offset) &&
+          (mark.offset as number) > (index ? (marks[index - 1] as RelationshipMark).offset : 0) &&
+          (mark.offset as number) <= offset &&
+          (mark.anchor === undefined || (typeof mark.anchor === 'string' && /^[0-9a-f]{64}$/.test(mark.anchor))) &&
+          typeof mark.hash === 'string' &&
+          /^[0-9a-f]{64}$/.test(mark.hash),
+      )
+    )
+  )
+    return false;
   const validation = value.validation;
   return (
     validation === undefined ||
@@ -4212,11 +4243,29 @@ export interface RelationshipReadMeter {
   onRead?: (bytes: Buffer, offset: number) => void;
 }
 
+function markHash(digest: RelationshipDigest): string {
+  return createHash('sha256').update(`arc-relationship-mark-v1:${digest.chain}:${digest.tail}`).digest('hex');
+}
+
+function relationshipMark(digest: RelationshipDigest): RelationshipMark {
+  return {
+    offset: digest.offset,
+    ...(digest.anchor === undefined ? {} : { anchor: digest.anchor }),
+    hash: markHash(digest),
+  };
+}
+
 // The check of a mark reads its final full block and its tail, or its whole prefix when that is shorter than a block.
 // Evidence of a full block or more without an anchor has no short check.
-function markStart(mark: RelationshipDigest): number | undefined {
-  if (mark.anchor !== undefined) return mark.offset - Buffer.byteLength(mark.tail, 'base64') - RELATIONSHIP_BLOCK_BYTES;
+function markStart(mark: RelationshipMark): number | undefined {
+  if (mark.anchor !== undefined)
+    return mark.offset - (mark.offset % RELATIONSHIP_BLOCK_BYTES) - RELATIONSHIP_BLOCK_BYTES;
   return mark.offset < RELATIONSHIP_BLOCK_BYTES ? 0 : undefined;
+}
+
+function markLength(mark: RelationshipMark): number {
+  const start = markStart(mark);
+  return start === undefined ? 0 : mark.offset - start;
 }
 
 export class RelationshipReader {
@@ -4229,7 +4278,7 @@ export class RelationshipReader {
   // The last grown stamp, whether a scanner marked the evidence after it appeared, the marks, and the bytes their checks read.
   private seen: RelationshipStamp | null = null;
   private moved = false;
-  private readonly marks: RelationshipDigest[] = [];
+  private marks: RelationshipMark[] = [];
   private markBytes = 0;
   private advanced = false;
   constructor(
@@ -4245,9 +4294,10 @@ export class RelationshipReader {
     this.check();
   }
   // Every read stops at the opening size. A same-identity file that grew after opening keeps the read stable, so a forward or
-  // anchor read under an active writer still qualifies. The stamp cannot tell an append from a rewrite that also grew the file,
-  // so each new grown stamp marks the evidence that the reads reached, and settle() checks the final blocks at every mark again
-  // before it accepts the read. A whole-prefix comparison accepts only a read that saw no growth.
+  // mark read under an active writer still qualifies. The stamp cannot tell an append from a rewrite that also grew the file,
+  // so each new grown stamp marks the evidence that the reads reached. settle() checks the final blocks at every mark again
+  // before it accepts the read, and the evidence keeps the marks for the next quantum, which checks them all again before it
+  // accepts a grown file. A whole-prefix comparison accepts only a read that saw no growth.
   check(): boolean {
     if (this.capturedSizeOnly) return true;
     const unchanged = (stamp: RelationshipStamp) => {
@@ -4272,7 +4322,7 @@ export class RelationshipReader {
   // Reads ignore the deadline until a read that moves the scan returns bytes, so every slice makes progress.
   available(reserve = RELATIONSHIP_RESERVE_BYTES): number {
     return this.stable && !this.cancelled() && (!this.advanced || performance.now() < this.deadline)
-      ? Math.max(0, this.budget - this.readBytes - reserve - this.markBytes)
+      ? Math.max(0, this.budget - this.readBytes - reserve - RELATIONSHIP_SETTLE_PASSES * this.markBytes)
       : 0;
   }
   // The one-byte check after a terminal record passes advances false, so the parsing read that follows it still ignores the deadline.
@@ -4296,56 +4346,63 @@ export class RelationshipReader {
     this.check();
     return this.buffer.subarray(0, count);
   }
-  // Scanners call this before each forward read and after each extension, and settle() calls it before each check pass. A mark is
-  // the evidence at the first call after a check saw a new grown stamp. Later forward reads leave room in the budget for one
+  // Scanners call this before each forward read and after each extension, and each check pass calls it first. A mark is the
+  // evidence at the first call after a check saw a new grown stamp. Later forward reads leave room in the budget for every
   // check pass over every mark.
   note(evidence: RelationshipDigest): void {
     if (!this.moved) return;
     this.moved = false;
     if (this.marks.at(-1)?.offset === evidence.offset) return;
-    const mark = { offset: evidence.offset, chain: evidence.chain, tail: evidence.tail, anchor: evidence.anchor };
-    const start = markStart(mark);
+    if (this.marks.length === RELATIONSHIP_MARKS) this.markBytes -= markLength(this.marks.pop()!);
+    const mark = relationshipMark(evidence);
     this.marks.push(mark);
-    if (start !== undefined) this.markBytes += mark.offset - start;
+    this.markBytes += markLength(mark);
   }
-  // The last check before a scanner reports its read qualified. At each mark it hashes the final full block and the tail again,
-  // as the next quantum would after a read that stopped there. These reads ignore the deadline and cancellation. A pass runs
-  // the stamp check and then every mark check. A new grown stamp seen in a pass marks the end of the evidence and starts
-  // another pass, so a rewrite that lands during the checks is checked too. The read qualifies after a pass that sees no new
-  // grown stamp. A mark at the end of the evidence without the budget for its check leaves the read unqualified, and the next
-  // quantum checks the anchor there. A mismatch, or growth in every pass, leaves a whole-prefix comparison for the next quantum.
-  settle(evidence: RelationshipEvidence): boolean {
-    const compare = () => {
-      this.stable = false;
-      evidence.validation = { stamp: this.stamp, required: evidence.offset, digest: emptyRelationshipDigest() };
-      return false;
-    };
+  // Check passes over the marks. A pass runs the stamp check and then hashes the final full block and the tail at each mark again,
+  // as the next quantum would after a read that stopped there. A new grown stamp seen in a pass marks the end of the evidence and
+  // starts another pass, so a rewrite that lands during the checks is checked too. The first pass ignores the deadline and
+  // cancellation. A later pass that meets either, a mark without the budget for its check, an unstable or short check, or a new
+  // grown stamp in every pass leaves the outcome pending.
+  private passes(evidence: RelationshipDigest): 'match' | 'mismatch' | 'pending' {
     for (let pass = 0; pass < RELATIONSHIP_SETTLE_PASSES; pass++) {
       this.note(evidence);
-      if (!this.check()) return false;
+      if (!this.check()) return 'pending';
       if (this.moved) continue;
       for (const mark of this.marks) {
         const start = markStart(mark);
-        if (start === undefined) return compare();
-        if (this.budget - this.readBytes < mark.offset - start) {
-          if (mark.offset === evidence.offset) return false;
-          return compare();
-        }
+        if (start === undefined) return 'mismatch';
+        if (pass > 0 && (this.cancelled() || performance.now() >= this.deadline)) return 'pending';
+        if (this.budget - this.readBytes < mark.offset - start) return 'pending';
         const bytes = this.readAt(start, mark.offset - start);
         if (this.meter) this.meter.revalidationBytes = (this.meter.revalidationBytes ?? 0) + bytes.length;
-        if (!this.stable) return false;
+        if (!this.stable || bytes.length !== mark.offset - start) return 'pending';
         const digest: RelationshipDigest = {
           offset: start,
           chain: mark.anchor ?? emptyRelationshipDigest().chain,
           tail: '',
         };
         extendRelationshipEvidence(digest, bytes);
-        if (digest.chain !== mark.chain || digest.tail !== mark.tail) return compare();
+        if (markHash(digest) !== mark.hash) return 'mismatch';
         if (this.moved) break;
       }
-      if (!this.moved) return true;
+      if (!this.moved) return 'match';
     }
-    return compare();
+    return 'pending';
+  }
+  // The last check before a scanner reports its read qualified. A match qualifies the read. A mismatch leaves a whole-prefix
+  // comparison for the next quantum. A pending outcome leaves the read unqualified. After a match or a pending outcome, the
+  // evidence keeps the marks of the read for the next quantum.
+  settle(evidence: RelationshipEvidence): boolean {
+    const outcome = this.passes(evidence);
+    if (outcome === 'mismatch') {
+      this.stable = false;
+      evidence.validation = { stamp: this.stamp, required: evidence.offset, digest: emptyRelationshipDigest() };
+      delete evidence.marks;
+      return false;
+    }
+    if (this.marks.length) evidence.marks = this.marks.map((mark) => ({ ...mark }));
+    else delete evidence.marks;
+    return outcome === 'match';
   }
   *qualifySteps(evidence: RelationshipEvidence): Generator<void, 'match' | 'pending' | 'reset'> {
     if (sameRelationshipStamp(evidence.accepted, this.stamp) && this.check()) return 'match';
@@ -4361,13 +4418,15 @@ export class RelationshipReader {
       // Only growth with no comparison in progress checks the anchor. A same-size change compares the whole prefix.
       // Growth during that comparison, within a quantum or between quanta, leaves the comparison pending and the next quantum
       // restarts it over the whole prefix, so a same-size interior rewrite still resets even when an append follows it.
-      // A grown file rewritten before its final block keeps its accepted facts until a same-size change, a shrink, or a replacement.
+      // A grown file rewritten outside its final block and every kept mark keeps its accepted facts until a same-size change, a
+      // shrink, a replacement, or a mismatch at a later check.
       if (!evidence.validation && this.stamp.size > prior.size) {
         const anchored = this.anchored(evidence);
         if (anchored === 'match') return this.accept(evidence);
         if (anchored === 'pending') return 'pending';
       }
       evidence.validation = { stamp: this.stamp, required: evidence.offset, digest: emptyRelationshipDigest() };
+      delete evidence.marks;
     }
     const comparison = evidence.validation;
     while (comparison.digest.offset < comparison.required && !this.grew && this.available() > 0) {
@@ -4392,21 +4451,24 @@ export class RelationshipReader {
     evidence.anchor = comparison.digest.anchor;
     return this.accept(evidence);
   }
-  // Reads the final full block and the tail, at most two blocks. A cancelled, short, or unstable read leaves the anchor for the next quantum. A missing or mismatched anchor needs the whole prefix.
+  // Check passes over the marks of the latest read and over the final full block and the tail, at most two blocks each. A
+  // pending outcome keeps the marks for the next quantum. A missing or mismatched anchor needs the whole prefix.
   private anchored(evidence: RelationshipEvidence): 'match' | 'pending' | 'compare' {
     if (evidence.anchor === undefined || evidence.offset < RELATIONSHIP_BLOCK_BYTES) return 'compare';
-    const start = evidence.offset - Buffer.byteLength(evidence.tail, 'base64') - RELATIONSHIP_BLOCK_BYTES;
-    const bytes = this.read(start, evidence.offset - start);
-    if (this.meter) this.meter.revalidationBytes = (this.meter.revalidationBytes ?? 0) + bytes.length;
-    if (bytes.length !== evidence.offset - start || !this.check() || this.cancelled()) return 'pending';
-    const check: RelationshipDigest = { offset: start, chain: evidence.anchor, tail: '' };
-    extendRelationshipEvidence(check, bytes);
-    return check.chain === evidence.chain && check.tail === evidence.tail ? 'match' : 'compare';
+    this.marks = [
+      ...(evidence.marks ?? []).filter((mark) => mark.offset < evidence.offset),
+      relationshipMark(evidence),
+    ];
+    const outcome = this.passes(evidence);
+    this.marks = [];
+    this.markBytes = 0;
+    return outcome === 'mismatch' ? 'compare' : outcome;
   }
   private accept(evidence: RelationshipEvidence): 'match' {
     evidence.accepted = this.stamp;
     evidence.provisional = this.stamp;
     delete evidence.validation;
+    delete evidence.marks;
     return 'match';
   }
 }

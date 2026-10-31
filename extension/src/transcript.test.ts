@@ -261,8 +261,10 @@ test('Claude read that sees growth while it checks its marks qualifies only afte
   // The writer appends after the first read, which marks the evidence there. In the first sequence, after the check of that
   // mark reads its bytes, the writer rewrites the child and one byte in the checked block, then appends. In the second, the
   // writer appends after every read of the first scan, so no check pass is free of growth. A scan that reads the marked
-  // bytes again only in a later quantum sees the rewrite there.
-  const scans = async (sequence: 'rewrite during the mark check' | 'append after every read') => {
+  // bytes again only in a later quantum sees the rewrite there. In the third, the writer only appends during the mark check.
+  const scans = async (
+    sequence: 'rewrite during the mark check' | 'append after every read' | 'append during the mark check',
+  ) => {
     fs.writeFileSync(file, old);
     let furthest = 0;
     let writing = true;
@@ -273,10 +275,10 @@ test('Claude read that sees growth while it checks its marks qualifies only afte
         const forward = offset + bytes.length > furthest;
         furthest = Math.max(furthest, offset + bytes.length);
         if (!writing) return;
-        if (sequence === 'rewrite during the mark check') {
+        if (sequence !== 'append after every read') {
           if (forward && offset > 0) return;
-          if (!forward) {
-            writing = false;
+          if (!forward) writing = false;
+          if (!forward && sequence === 'rewrite during the mark check') {
             rewrote = true;
             const fd = fs.openSync(file, 'r+');
             try {
@@ -319,6 +321,105 @@ test('Claude read that sees growth while it checks its marks qualifies only afte
   assert.ok(appended.published.length, 'the appended transcript never completed after its writer stopped');
   for (const published of appended.published) assert.deepEqual(published, ['child-a']);
   assert.equal(appended.chain, appended.fresh);
+  // An append during a mark check with no rewrite leaves the next pass quiet, so the read completes at its opening size.
+  const checked = await scans('append during the mark check');
+  assert.equal(checked.first.qualified, true, 'an append during the mark check left the read unqualified');
+  assert.equal(checked.first.complete, true);
+  assert.equal(checked.first.cursor.offset, old.length);
+  for (const published of checked.published) assert.deepEqual(published, ['child-a']);
+  assert.equal(checked.chain, checked.fresh);
+});
+
+test('Claude rewrite at a growth point after its read qualified publishes the rewritten child', async () => {
+  vi.spyOn(performance, 'now').mockReturnValue(0);
+  const file = writeTranscript([
+    assistantTool('Agent', 1, 'read-launch', {}),
+    {
+      type: 'user',
+      message: { content: [{ type: 'tool_result', tool_use_id: 'read-launch' }] },
+      toolUseResult: { agentId: 'child-a' },
+    },
+    ...Array.from({ length: 700 }, () => ({ type: 'ignored', payload: 'y'.repeat(1024) })),
+  ]);
+  const parent = { file, sessionId: 'parent' };
+  const old = fs.readFileSync(file, 'utf8');
+  // The writer appends once after the first read, which marks the evidence there, and the read continues to the opening size.
+  let growth = 0;
+  const meter = {
+    readBytes: 0,
+    onRead: (bytes: Buffer, offset: number) => {
+      if (offset !== 0 || growth) return;
+      growth = bytes.length;
+      fs.appendFileSync(file, '{"type":"ignored"}\n');
+    },
+  };
+  let scan = await scanClaudeRelationshipQuantum(parent, undefined, undefined, undefined, meter);
+  assert.ok(growth > 0 && growth < old.length - 8192, 'the first read did not stop before the final blocks');
+  // Before the next scan, the writer rewrites the child and one byte in the final block before the growth point, then appends.
+  // The final block at the opening size keeps its bytes.
+  const fd = fs.openSync(file, 'r+');
+  try {
+    assert.ok(old.indexOf('child-a') < growth - 8192);
+    fs.writeSync(fd, 'child-b', old.indexOf('child-a'));
+    fs.writeSync(fd, 'z', old.lastIndexOf('y', growth - 100));
+  } finally {
+    fs.closeSync(fd);
+  }
+  fs.appendFileSync(file, '{"type":"ignored"}\n');
+  const published: string[][] = [];
+  for (let pass = 0; pass < 8; pass++) {
+    scan = await scanClaudeRelationshipQuantum(parent, JSON.parse(JSON.stringify(scan.cursor)));
+    if (scan.complete) published.push(scan.references.map((reference) => reference.sessionId));
+  }
+  assert.ok(published.length, 'the rewritten transcript never completed');
+  for (const references of published)
+    assert.deepEqual(
+      references,
+      ['child-b'],
+      'a rewrite at the growth point after the read qualified kept the old child',
+    );
+});
+
+test('Claude read that sees growth in every check pass completes at its opening size in the next quiet quantum', async () => {
+  vi.spyOn(performance, 'now').mockReturnValue(0);
+  const file = writeTranscript([
+    assistantTool('Agent', 1, 'read-launch', {}),
+    {
+      type: 'user',
+      message: { content: [{ type: 'tool_result', tool_use_id: 'read-launch' }] },
+      toolUseResult: { agentId: 'child-a' },
+    },
+    ...Array.from({ length: 1500 }, () => ({ type: 'ignored', payload: 'y'.repeat(1024) })),
+  ]);
+  const parent = { file, sessionId: 'parent' };
+  const first = await scanClaudeRelationshipQuantum(parent, undefined);
+  assert.ok(
+    first.qualified && first.cursor.offset < first.cursor.target,
+    'the first quantum read the whole transcript',
+  );
+  // The writer appends after every read of the second quantum, including each check read, so no check pass is quiet.
+  let checkAppends = 0;
+  let furthest = first.cursor.offset;
+  const meter = {
+    readBytes: 0,
+    onRead: (bytes: Buffer, offset: number) => {
+      if (offset + bytes.length <= furthest) checkAppends++;
+      furthest = Math.max(furthest, offset + bytes.length);
+      fs.appendFileSync(file, '{"type":"ignored"}\n');
+    },
+  };
+  const busy = await scanClaudeRelationshipQuantum(parent, first.cursor, undefined, undefined, meter);
+  assert.equal(busy.cursor.offset, busy.cursor.target, 'the second quantum did not reach its target');
+  assert.equal(busy.qualified, false, 'a read that saw growth during every check pass qualified');
+  assert.ok(checkAppends >= 4, `the writer appended during ${checkAppends} check reads`);
+  const quiet = await scanClaudeRelationshipQuantum(parent, JSON.parse(JSON.stringify(busy.cursor)));
+  assert.equal(quiet.qualified, true, 'the quiet quantum after the busy one did not qualify');
+  assert.equal(quiet.complete, true);
+  assert.equal(quiet.cursor.offset, fs.statSync(file).size);
+  assert.deepEqual(
+    quiet.references.map((reference) => reference.sessionId),
+    ['child-a'],
+  );
 });
 
 test('Claude scans, rewrite comparisons and terminal continuations read forward when every slice starts past its deadline', async () => {
