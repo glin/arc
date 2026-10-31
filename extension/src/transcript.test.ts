@@ -5,6 +5,8 @@ import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { EXPORT_LIMITS, ExportLimitError } from './exportlimits.ts';
 import {
   scanClaudeRelationshipQuantum,
+  RELATIONSHIP_QUANTUM_BYTES,
+  RELATIONSHIP_SLICE_MS,
   replacedCatalogFiles,
   scanClaudeChildSessionReferences,
   type ClaudeRelationshipCursor,
@@ -616,8 +618,7 @@ test('Claude kept marks complete while the file grows during the second check of
   assert.equal(first.complete, true);
   assert.equal(first.cursor.evidence?.marks?.length, 8, `the read had ${ends.length} growth points`);
   fs.appendFileSync(parent.file, '{"type":"ignored"}\n');
-  // The first check of each quantum matches. A writer appends during the second check, and the deadline passes then, so the
-  // pass after the growth stops at its first mark.
+  // The first check of each quantum matches. A writer appends during the second check, and the deadline passes then.
   let scan = first;
   let quanta = 0;
   do {
@@ -640,6 +641,71 @@ test('Claude kept marks complete while the file grows during the second check of
     );
   } while (!scan.complete && ++quanta < 12);
   assert.equal(scan.complete, true, 'growth during the second check of every quantum kept the source unfinished');
+  assert.deepEqual(
+    scan.references.map((reference) => reference.sessionId),
+    ['child-a'],
+  );
+});
+
+test('Claude kept marks at the worker allowance finish every request that an anchor check alone finishes while a writer appends at the slice deadline', async () => {
+  let clock = 0;
+  vi.spyOn(performance, 'now').mockImplementation(() => clock);
+  const file = writeTranscript([
+    assistantTool('Agent', 1, 'read-launch', {}),
+    {
+      type: 'user',
+      message: { content: [{ type: 'tool_result', tool_use_id: 'read-launch' }] },
+      toolUseResult: { agentId: 'child-a' },
+    },
+    ...Array.from({ length: 800 }, () => ({ type: 'ignored', payload: 'y'.repeat(1024) })),
+  ]);
+  const parent = { file, sessionId: 'parent' };
+  const append = () => fs.appendFileSync(file, '{"type":"ignored"}\n');
+  // In the first request the clock stands still and the writer appends after each forward read, so the read keeps marks.
+  let furthest = 0;
+  let scan = await scanClaudeRelationshipQuantum(parent, undefined, RELATIONSHIP_QUANTUM_BYTES, undefined, {
+    readBytes: 0,
+    onRead: (bytes: Buffer, offset: number) => {
+      if (offset + bytes.length <= furthest) return;
+      furthest = offset + bytes.length;
+      append();
+    },
+  });
+  // Later reads take 2 ms per KiB, so the first check of a request ends before the slice deadline and the second check ends
+  // after it. The writer appends once in each request, during the read that passes the deadline, or after the request when no
+  // read passes it.
+  const completions = [scan.complete];
+  for (let request = 2; request <= 12; request++) {
+    const start = clock;
+    let appended = false;
+    const writer = {
+      readBytes: 0,
+      onRead: (bytes: Buffer) => {
+        clock += (bytes.length / 1024) * 2;
+        if (appended || clock < start + RELATIONSHIP_SLICE_MS) return;
+        appended = true;
+        append();
+      },
+    };
+    scan = await scanClaudeRelationshipQuantum(
+      parent,
+      JSON.parse(JSON.stringify(scan.cursor)),
+      RELATIONSHIP_QUANTUM_BYTES,
+      undefined,
+      writer,
+    );
+    if (!appended) append();
+    clock += 1_000;
+    completions.push(scan.complete);
+  }
+  // A reader that checks only the anchor finishes from the fifth request on under this writer.
+  const first = completions.indexOf(true);
+  assert.ok(first >= 0 && first < 5, `the source first finished in request ${first + 1}`);
+  assert.deepEqual(
+    completions.slice(first),
+    completions.slice(first).map(() => true),
+    'a request after the first finished request left the source unfinished',
+  );
   assert.deepEqual(
     scan.references.map((reference) => reference.sessionId),
     ['child-a'],
@@ -692,16 +758,15 @@ test('Claude kept marks start at the first mark again after a same-size rewrite 
     );
 });
 
-for (const stop of ['its budget', 'its deadline', 'cancellation'] as const)
+for (const stop of ['its budget', 'cancellation'] as const)
   test(`Claude kept mark that a check matched before it stopped at ${stop} still finds a rewrite with an append`, async () => {
-    let clock = 0;
-    vi.spyOn(performance, 'now').mockImplementation(() => clock);
+    vi.spyOn(performance, 'now').mockReturnValue(0);
     const { parent, old, ends, meter } = growthPointTranscript();
     const first = await scanClaudeRelationshipQuantum(parent, undefined, 16 * 1024 * 1024, undefined, meter);
     assert.equal(first.complete, true);
     fs.appendFileSync(parent.file, '{"type":"ignored"}\n');
     // The check of the grown file matches the first kept mark and stops before the second. A budget stop needs only a small
-    // allowance. A deadline or cancellation stops only a later pass, so the first check read sees an append.
+    // allowance. Cancellation stops only a later pass, so the first check read sees an append.
     const controller = new AbortController();
     let checks = 0;
     const stopping = {
@@ -709,7 +774,6 @@ for (const stop of ['its budget', 'its deadline', 'cancellation'] as const)
       onRead: () => {
         checks++;
         if (stop !== 'its budget' && checks === 1) fs.appendFileSync(parent.file, '{"type":"ignored"}\n');
-        if (stop === 'its deadline' && checks === 2) clock = 1_000;
         if (stop === 'cancellation' && checks === 2) controller.abort();
       },
     };
