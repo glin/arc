@@ -1374,11 +1374,14 @@ test('a Codex rollout that grows during its read completes at its opening size a
   ]);
   fs.appendFileSync(file, JSON.stringify({ type: 'ignored', payload: 'x'.repeat(16 * 1024) }) + '\n');
   const opening = fs.statSync(file).size;
-  // The rollout's writer appends a record after every read, as a running Codex session would.
+  // The rollout's writer appends a record after every read that reaches new bytes, as a running Codex session would.
   let appends = 0;
+  let furthest = 0;
   const meter = {
     readBytes: 0,
-    onRead: () => {
+    onRead: (bytes: Buffer, offset: number) => {
+      if (offset + bytes.length <= furthest) return;
+      furthest = offset + bytes.length;
       appends++;
       fs.appendFileSync(file, '{"type":"ignored"}\n');
     },
@@ -1397,6 +1400,56 @@ test('a Codex rollout that grows during its read completes at its opening size a
   assert.equal(next.complete, true);
   assert.equal(next.cursor.offset, fs.statSync(file).size);
   assert.deepEqual(next.references, scan.references);
+});
+
+test('a Codex rollout rewritten with an append after its last read keeps no old dispatch reference', async () => {
+  const file = writeRollout([
+    meta(),
+    event('task_started', 1, { turn_id: TURN }),
+    turnContext(2, TURN, 'gpt-6-astra', 'high'),
+    commandCompleted(3, DISPATCH_COMMAND, 0, 'completed', 'before-growth', { stdout: DISPATCH_RECEIPT }),
+    event('task_complete', 4, { turn_id: TURN }),
+  ]);
+  for (let index = 0; index < 300; index++) fs.appendFileSync(file, ignoredCodexLineOfBytes(2048));
+  const old = fs.readFileSync(file, 'latin1');
+  const opening = old.length;
+  // The writer appends after the first read, which marks the evidence there. After the last read and before the final stamp
+  // check, it rewrites the dispatch call and one byte in the final block that read reached, then appends.
+  let writing = true;
+  const meter = {
+    readBytes: 0,
+    onRead: (bytes: Buffer, offset: number) => {
+      if (!writing) return;
+      if (offset === 0) fs.appendFileSync(file, '{"type":"ignored"}\n');
+      if (offset + bytes.length !== opening) return;
+      writing = false;
+      setImmediate(() => {
+        const fd = fs.openSync(file, 'r+');
+        try {
+          for (let at = old.indexOf('before-growth'); at >= 0; at = old.indexOf('before-growth', at + 1))
+            fs.writeSync(fd, 'rewritten-ids', at);
+          fs.writeSync(fd, 'z', old.lastIndexOf('x', opening - 100));
+        } finally {
+          fs.closeSync(fd);
+        }
+        fs.appendFileSync(file, '{"type":"ignored"}\n');
+      });
+    },
+  };
+  const published: string[][][] = [];
+  let scan = await scanCodexDispatchReferencesAsync(file, 'parent', null, 1024 * 1024, () => false, meter);
+  for (let pass = 0; pass < 8; pass++) {
+    if (scan.complete) published.push(scan.references.map((reference) => reference.toolUseIds));
+    scan = await scanCodexDispatchReferencesAsync(file, 'parent', scan.cursor, 1024 * 1024, () => false, meter);
+  }
+  assert.equal(writing, false, 'the writer never saw the last read');
+  assert.ok(published.length, 'the rewritten rollout never completed');
+  for (const references of published)
+    assert.deepEqual(
+      references,
+      [['rewritten-ids']],
+      'a rewrite before the final stamp check kept the old dispatch call',
+    );
 });
 
 test('exact export dispatch identities retain a native child receipt that Bloom membership rejects', () => {

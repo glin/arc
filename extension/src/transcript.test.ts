@@ -245,6 +245,82 @@ test('Claude forward read that sees a rewrite plus an append after its first rea
   }
 });
 
+test('Claude read that sees growth while it checks its marks qualifies only after a check pass that sees no growth', async () => {
+  vi.spyOn(performance, 'now').mockReturnValue(0);
+  const file = writeTranscript([
+    assistantTool('Agent', 1, 'read-launch', {}),
+    {
+      type: 'user',
+      message: { content: [{ type: 'tool_result', tool_use_id: 'read-launch' }] },
+      toolUseResult: { agentId: 'child-a' },
+    },
+    ...Array.from({ length: 600 }, () => ({ type: 'ignored', payload: 'y'.repeat(1024) })),
+  ]);
+  const parent = { file, sessionId: 'parent' };
+  const old = fs.readFileSync(file, 'utf8');
+  // The writer appends after the first read, which marks the evidence there. In the first sequence, after the check of that
+  // mark reads its bytes, the writer rewrites the child and one byte in the checked block, then appends. In the second, the
+  // writer appends after every read of the first scan, so no check pass is free of growth. A scan that reads the marked
+  // bytes again only in a later quantum sees the rewrite there.
+  const scans = async (sequence: 'rewrite during the mark check' | 'append after every read') => {
+    fs.writeFileSync(file, old);
+    let furthest = 0;
+    let writing = true;
+    let rewrote = false;
+    const meter = {
+      readBytes: 0,
+      onRead: (bytes: Buffer, offset: number) => {
+        const forward = offset + bytes.length > furthest;
+        furthest = Math.max(furthest, offset + bytes.length);
+        if (!writing) return;
+        if (sequence === 'rewrite during the mark check') {
+          if (forward && offset > 0) return;
+          if (!forward) {
+            writing = false;
+            rewrote = true;
+            const fd = fs.openSync(file, 'r+');
+            try {
+              assert.ok(offset > old.indexOf('child-a') && offset + bytes.length < old.length);
+              fs.writeSync(fd, 'child-b', old.indexOf('child-a'));
+              fs.writeSync(fd, 'z', old.lastIndexOf('y', offset + bytes.length - 100));
+            } finally {
+              fs.closeSync(fd);
+            }
+          }
+        }
+        fs.appendFileSync(file, '{"type":"ignored"}\n');
+      },
+    };
+    const first = await scanClaudeRelationshipQuantum(parent, undefined, undefined, undefined, meter);
+    if (sequence === 'append after every read') writing = false;
+    const published: string[][] = [];
+    let scan = first;
+    for (let pass = 0; pass < 8; pass++) {
+      if (scan.complete) published.push(scan.references.map((reference) => reference.sessionId));
+      scan = await scanClaudeRelationshipQuantum(
+        parent,
+        JSON.parse(JSON.stringify(scan.cursor)),
+        undefined,
+        undefined,
+        meter,
+      );
+    }
+    assert.equal(rewrote, sequence === 'rewrite during the mark check', sequence);
+    const fresh = await scanClaudeRelationshipQuantum(parent, undefined);
+    return { first, published, chain: scan.cursor.evidence?.chain, fresh: fresh.cursor.evidence?.chain };
+  };
+  const rewritten = await scans('rewrite during the mark check');
+  assert.ok(rewritten.published.length, 'the rewritten transcript never completed');
+  for (const published of rewritten.published)
+    assert.deepEqual(published, ['child-b'], 'a rewrite during the mark check kept the old child');
+  assert.equal(rewritten.chain, rewritten.fresh);
+  const appended = await scans('append after every read');
+  assert.equal(appended.first.qualified, false, 'a read that saw growth during every check pass qualified');
+  assert.ok(appended.published.length, 'the appended transcript never completed after its writer stopped');
+  for (const published of appended.published) assert.deepEqual(published, ['child-a']);
+  assert.equal(appended.chain, appended.fresh);
+});
+
 test('Claude scans, rewrite comparisons and terminal continuations read forward when every slice starts past its deadline', async () => {
   // Each reading of the clock lands a full slice after the previous one, so every deadline has passed.
   let clock = 0;

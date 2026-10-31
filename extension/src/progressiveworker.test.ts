@@ -324,17 +324,19 @@ test.each(['added', 'removed', 'requester removed', 'added before the launches a
   },
 );
 
-// The worker appends one record to a live transcript after every read of it, as an agent writing that session would.
+// The worker appends one record to a live transcript after every read that reaches bytes no earlier read of it reached, as an
+// agent writing that session would.
 const liveWriters = (files: readonly string[]) =>
-  `const liveFs=require('node:fs'),livePort=require('node:worker_threads').parentPort,liveFiles=new Set(${JSON.stringify(files.map((file) => normalizeFsPath(file)))}),liveFds=new Map(),liveOpen=liveFs.openSync,liveRead=liveFs.readSync,liveClose=liveFs.closeSync;let liveAppends=0;liveFs.openSync=function(p,...a){const fd=liveOpen.call(this,p,...a);const key=String(p).replace(/\\\\/g,'/').toLowerCase();for(const file of liveFiles)if(file.replace(/\\\\/g,'/').toLowerCase()===key)liveFds.set(fd,String(p));return fd;};liveFs.closeSync=function(fd,...a){liveFds.delete(fd);return liveClose.call(this,fd,...a);};liveFs.readSync=function(fd,...a){const count=liveRead.call(this,fd,...a);const file=liveFds.get(fd);if(file){liveFs.appendFileSync(file,JSON.stringify({type:'progress',data:{n:++liveAppends}})+'\\n');if(liveAppends%64===1)livePort.postMessage({repeatedCoverage:'live-append'});}return count;};`;
+  `const liveFs=require('node:fs'),livePort=require('node:worker_threads').parentPort,liveFiles=new Set(${JSON.stringify(files.map((file) => normalizeFsPath(file)))}),liveFds=new Map(),liveEnds=new Map(),liveOpen=liveFs.openSync,liveRead=liveFs.readSync,liveClose=liveFs.closeSync;let liveAppends=0;liveFs.openSync=function(p,...a){const fd=liveOpen.call(this,p,...a);const key=String(p).replace(/\\\\/g,'/').toLowerCase();for(const file of liveFiles)if(file.replace(/\\\\/g,'/').toLowerCase()===key)liveFds.set(fd,String(p));return fd;};liveFs.closeSync=function(fd,...a){liveFds.delete(fd);return liveClose.call(this,fd,...a);};liveFs.readSync=function(fd,...a){const count=liveRead.call(this,fd,...a);const file=liveFds.get(fd);if(file){const at=typeof a[3]==='number'?a[3]:null,reached=liveEnds.get(file)??0;if(at!==null&&at+count<=reached)return count;if(at!==null)liveEnds.set(file,at+count);liveFs.appendFileSync(file,JSON.stringify({type:'progress',data:{n:++liveAppends}})+'\\n');if(liveAppends%64===1)livePort.postMessage({repeatedCoverage:'live-append'});}return count;};`;
 
 // The worker reports each opening of the receipt store and each entry the scan reads from it.
 const receiptEntries = (store: string) =>
   `const entryFs=require('node:fs'),entryPort=require('node:worker_threads').parentPort,entryOpen=entryFs.opendirSync;entryFs.opendirSync=function(p,...a){const dir=entryOpen.call(this,p,...a);if(String(p)!==${JSON.stringify(store)})return dir;entryPort.postMessage({repeatedCoverage:'receipt-store-opened'});const read=dir.readSync.bind(dir);dir.readSync=function(){entryPort.postMessage({repeatedCoverage:'receipt-entry'});return read();};return dir;};`;
 
-// Writers that append during every read leave no quiet read. A pass still completes, so discovery publishes in a few continuations.
+// Writers that append during every forward read leave no quiet forward read. A pass still completes, so discovery publishes in a few
+// continuations.
 // Catalog refreshes cancel continuations during the receipt scan and change the repository roots, and the scan keeps its place.
-test('receipt discovery publishes while several Claude roots keep appending during each read', async () => {
+test('receipt discovery publishes while several Claude roots keep appending during each forward read', async () => {
   const root = tempDir('receipt-worker-live-');
   const fx = receiptDispatchFixture(root, 'claude', 'codex');
   fs.mkdirSync(fx.receipts.root, { recursive: true });
@@ -5138,7 +5140,7 @@ test('a completed Codex parent defers later growth until the next refresh reads 
   }
 });
 
-test('a Codex parent that grows during every read completes its coverage and asks for no continuation', async () => {
+test('a Codex parent that grows during every forward read completes its coverage and asks for no continuation', async () => {
   const directory = tempDir('panel-progressive-codex-live-');
   const childId = '7c9d29e3-d1e1-4f18-9fd4-a013b821bab3';
   const child = path.join(directory, `${childId}.jsonl`);

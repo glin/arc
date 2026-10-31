@@ -4062,6 +4062,8 @@ export const RELATIONSHIP_QUANTUM_BYTES = 1024 * 1024;
 export const RELATIONSHIP_READ_BYTES = 256 * 1024;
 export const RELATIONSHIP_RESERVE_BYTES = 16 * 1024;
 export const RELATIONSHIP_SLICE_MS = 15;
+// The check passes before a read whose file keeps growing during its checks falls back to a whole-prefix comparison.
+const RELATIONSHIP_SETTLE_PASSES = 4;
 export const RELATIONSHIP_EVIDENCE_BYTES = 16 * 1024;
 const RELATIONSHIP_BLOCK_BYTES = 4096;
 
@@ -4294,8 +4296,9 @@ export class RelationshipReader {
     this.check();
     return this.buffer.subarray(0, count);
   }
-  // Scanners call this before each forward read and after each extension. A mark is the evidence at the first call after a check
-  // saw a new grown stamp. Later forward reads leave room in the budget for the check of every mark.
+  // Scanners call this before each forward read and after each extension, and settle() calls it before each check pass. A mark is
+  // the evidence at the first call after a check saw a new grown stamp. Later forward reads leave room in the budget for one
+  // check pass over every mark.
   note(evidence: RelationshipDigest): void {
     if (!this.moved) return;
     this.moved = false;
@@ -4306,38 +4309,43 @@ export class RelationshipReader {
     if (start !== undefined) this.markBytes += mark.offset - start;
   }
   // The last check before a scanner reports its read qualified. At each mark it hashes the final full block and the tail again,
-  // as the next quantum would after a read that stopped there. These reads ignore the deadline and cancellation. A mark at the
-  // end of the evidence without the budget for its check leaves the read unqualified, and the next quantum checks the anchor
-  // there. A mismatch leaves a whole-prefix comparison for the next quantum.
+  // as the next quantum would after a read that stopped there. These reads ignore the deadline and cancellation. A pass runs
+  // the stamp check and then every mark check. A new grown stamp seen in a pass marks the end of the evidence and starts
+  // another pass, so a rewrite that lands during the checks is checked too. The read qualifies after a pass that sees no new
+  // grown stamp. A mark at the end of the evidence without the budget for its check leaves the read unqualified, and the next
+  // quantum checks the anchor there. A mismatch, or growth in every pass, leaves a whole-prefix comparison for the next quantum.
   settle(evidence: RelationshipEvidence): boolean {
-    this.note(evidence);
-    if (!this.check()) return false;
-    for (const mark of this.marks) {
-      const start = markStart(mark);
-      let matched = false;
-      if (start !== undefined) {
+    const compare = () => {
+      this.stable = false;
+      evidence.validation = { stamp: this.stamp, required: evidence.offset, digest: emptyRelationshipDigest() };
+      return false;
+    };
+    for (let pass = 0; pass < RELATIONSHIP_SETTLE_PASSES; pass++) {
+      this.note(evidence);
+      if (!this.check()) return false;
+      if (this.moved) continue;
+      for (const mark of this.marks) {
+        const start = markStart(mark);
+        if (start === undefined) return compare();
         if (this.budget - this.readBytes < mark.offset - start) {
           if (mark.offset === evidence.offset) return false;
-        } else {
-          const bytes = this.readAt(start, mark.offset - start);
-          if (this.meter) this.meter.revalidationBytes = (this.meter.revalidationBytes ?? 0) + bytes.length;
-          if (!this.stable) return false;
-          const digest: RelationshipDigest = {
-            offset: start,
-            chain: mark.anchor ?? emptyRelationshipDigest().chain,
-            tail: '',
-          };
-          extendRelationshipEvidence(digest, bytes);
-          matched = digest.chain === mark.chain && digest.tail === mark.tail;
+          return compare();
         }
+        const bytes = this.readAt(start, mark.offset - start);
+        if (this.meter) this.meter.revalidationBytes = (this.meter.revalidationBytes ?? 0) + bytes.length;
+        if (!this.stable) return false;
+        const digest: RelationshipDigest = {
+          offset: start,
+          chain: mark.anchor ?? emptyRelationshipDigest().chain,
+          tail: '',
+        };
+        extendRelationshipEvidence(digest, bytes);
+        if (digest.chain !== mark.chain || digest.tail !== mark.tail) return compare();
+        if (this.moved) break;
       }
-      if (!matched) {
-        this.stable = false;
-        evidence.validation = { stamp: this.stamp, required: evidence.offset, digest: emptyRelationshipDigest() };
-        return false;
-      }
+      if (!this.moved) return true;
     }
-    return true;
+    return compare();
   }
   *qualifySteps(evidence: RelationshipEvidence): Generator<void, 'match' | 'pending' | 'reset'> {
     if (sameRelationshipStamp(evidence.accepted, this.stamp) && this.check()) return 'match';
