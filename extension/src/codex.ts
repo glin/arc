@@ -4048,9 +4048,11 @@ function* codexDispatchSteps(
           delete cursor.replayFragment;
           delete cursor.replayThrough;
         }
+        reader.note(cursor.evidence!);
         const bytes = reader.read(cursor.offset, cursor.target! - cursor.offset);
         if (!bytes.length) break;
         extendRelationshipEvidence(cursor.evidence!, bytes);
+        reader.note(cursor.evidence!);
         cursor.offset += bytes.length;
         if (exportPolicy) {
           const newline = bytes.indexOf(10);
@@ -4107,7 +4109,7 @@ function* codexDispatchSteps(
       if (!cursor.terminalApplied) cursor.fragmentStart = cursor.offset - bytes.length;
       cursor.fragment = '';
     }
-    const qualified = qualification === 'match' && reader.check();
+    const qualified = qualification === 'match' && reader.settle(cursor.evidence!);
     if (!qualified && qualification === 'match') cursor.evidence!.accepted = null;
     const traversed =
       !reset &&

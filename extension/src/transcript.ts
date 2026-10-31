@@ -4210,6 +4210,13 @@ export interface RelationshipReadMeter {
   onRead?: (bytes: Buffer, offset: number) => void;
 }
 
+// The check of a mark reads its final full block and its tail, or its whole prefix when that is shorter than a block.
+// Evidence of a full block or more without an anchor has no short check.
+function markStart(mark: RelationshipDigest): number | undefined {
+  if (mark.anchor !== undefined) return mark.offset - Buffer.byteLength(mark.tail, 'base64') - RELATIONSHIP_BLOCK_BYTES;
+  return mark.offset < RELATIONSHIP_BLOCK_BYTES ? 0 : undefined;
+}
+
 export class RelationshipReader {
   readonly stamp: RelationshipStamp;
   readonly deadline: number;
@@ -4217,6 +4224,11 @@ export class RelationshipReader {
   readBytes = 0;
   stable = true;
   private grew = false;
+  // The last grown stamp, whether a scanner marked the evidence after it appeared, the marks, and the bytes their checks read.
+  private seen: RelationshipStamp | null = null;
+  private moved = false;
+  private readonly marks: RelationshipDigest[] = [];
+  private markBytes = 0;
   private advanced = false;
   constructor(
     readonly fd: RolloutSource,
@@ -4232,14 +4244,18 @@ export class RelationshipReader {
   }
   // Every read stops at the opening size. A same-identity file that grew after opening keeps the read stable, so a forward or
   // anchor read under an active writer still qualifies. The stamp cannot tell an append from a rewrite that also grew the file,
-  // so the next scan checks the grown file against its final blocks only, as it does for growth between scans. A whole-prefix
-  // comparison accepts only a read that saw no growth.
+  // so each new grown stamp marks the evidence that the reads reached, and settle() checks the final blocks at every mark again
+  // before it accepts the read. A whole-prefix comparison accepts only a read that saw no growth.
   check(): boolean {
     if (this.capturedSizeOnly) return true;
     const unchanged = (stamp: RelationshipStamp) => {
       if (sameRelationshipStamp(this.stamp, stamp)) return true;
       if (stamp.dev !== this.stamp.dev || stamp.ino !== this.stamp.ino || stamp.size <= this.stamp.size) return false;
       this.grew = true;
+      if (!sameRelationshipStamp(this.seen, stamp)) {
+        this.seen = stamp;
+        this.moved = true;
+      }
       return true;
     };
     try {
@@ -4254,7 +4270,7 @@ export class RelationshipReader {
   // Reads ignore the deadline until a read that moves the scan returns bytes, so every slice makes progress.
   available(reserve = RELATIONSHIP_RESERVE_BYTES): number {
     return this.stable && !this.cancelled() && (!this.advanced || performance.now() < this.deadline)
-      ? Math.max(0, this.budget - this.readBytes - reserve)
+      ? Math.max(0, this.budget - this.readBytes - reserve - this.markBytes)
       : 0;
   }
   // The one-byte check after a terminal record passes advances false, so the parsing read that follows it still ignores the deadline.
@@ -4266,13 +4282,62 @@ export class RelationshipReader {
       (this.meter?.size ?? Infinity) - at,
     );
     if (size <= 0) return Buffer.alloc(0);
+    const bytes = this.readAt(at, size);
+    if (advances && bytes.length > 0) this.advanced = true;
+    return bytes;
+  }
+  private readAt(at: number, size: number): Buffer {
     const count = meterRead(this.file, this.fd.readInto(this.buffer, 0, size, at), at);
     this.readBytes += count;
-    if (advances && count > 0) this.advanced = true;
     if (this.meter) this.meter.readBytes += count;
     this.meter?.onRead?.(this.buffer.subarray(0, count), at);
     this.check();
     return this.buffer.subarray(0, count);
+  }
+  // Scanners call this before each forward read and after each extension. A mark is the evidence at the first call after a check
+  // saw a new grown stamp. Later forward reads leave room in the budget for the check of every mark.
+  note(evidence: RelationshipDigest): void {
+    if (!this.moved) return;
+    this.moved = false;
+    if (this.marks.at(-1)?.offset === evidence.offset) return;
+    const mark = { offset: evidence.offset, chain: evidence.chain, tail: evidence.tail, anchor: evidence.anchor };
+    const start = markStart(mark);
+    this.marks.push(mark);
+    if (start !== undefined) this.markBytes += mark.offset - start;
+  }
+  // The last check before a scanner reports its read qualified. At each mark it hashes the final full block and the tail again,
+  // as the next quantum would after a read that stopped there. These reads ignore the deadline and cancellation. A mark at the
+  // end of the evidence without the budget for its check leaves the read unqualified, and the next quantum checks the anchor
+  // there. A mismatch leaves a whole-prefix comparison for the next quantum.
+  settle(evidence: RelationshipEvidence): boolean {
+    this.note(evidence);
+    if (!this.check()) return false;
+    for (const mark of this.marks) {
+      const start = markStart(mark);
+      let matched = false;
+      if (start !== undefined) {
+        if (this.budget - this.readBytes < mark.offset - start) {
+          if (mark.offset === evidence.offset) return false;
+        } else {
+          const bytes = this.readAt(start, mark.offset - start);
+          if (this.meter) this.meter.revalidationBytes = (this.meter.revalidationBytes ?? 0) + bytes.length;
+          if (!this.stable) return false;
+          const digest: RelationshipDigest = {
+            offset: start,
+            chain: mark.anchor ?? emptyRelationshipDigest().chain,
+            tail: '',
+          };
+          extendRelationshipEvidence(digest, bytes);
+          matched = digest.chain === mark.chain && digest.tail === mark.tail;
+        }
+      }
+      if (!matched) {
+        this.stable = false;
+        evidence.validation = { stamp: this.stamp, required: evidence.offset, digest: emptyRelationshipDigest() };
+        return false;
+      }
+    }
+    return true;
   }
   *qualifySteps(evidence: RelationshipEvidence): Generator<void, 'match' | 'pending' | 'reset'> {
     if (sameRelationshipStamp(evidence.accepted, this.stamp) && this.check()) return 'match';
@@ -4434,9 +4499,11 @@ export async function scanClaudeRelationshipQuantum(
     }
     if (!reset && qualification === 'match')
       while (cursor.offset < cursor.target && reader.available() > 0) {
+        reader.note(cursor.evidence!);
         const bytes = reader.read(cursor.offset, cursor.target - cursor.offset);
         if (!bytes.length) break;
         extendRelationshipEvidence(cursor.evidence!, bytes);
+        reader.note(cursor.evidence!);
         const base = cursor.offset;
         cursor.offset += bytes.length;
         let start = 0;
@@ -4486,7 +4553,7 @@ export async function scanClaudeRelationshipQuantum(
         /* An incomplete terminal record waits for its remaining bytes. */
       }
     }
-    const qualified = qualification === 'match' && reader.check();
+    const qualified = qualification === 'match' && reader.settle(cursor.evidence!);
     if (!qualified && qualification === 'match') cursor.evidence!.accepted = null;
     cursor.state = reducer.state();
     cursor.sequence++;

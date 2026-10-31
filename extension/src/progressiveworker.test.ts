@@ -1256,11 +1256,11 @@ test('a new Claude session reaches a complete cut beside parent growth with boun
     assert.ok(appendQuanta > 1);
     const after = (result as typeof result & { bytes: Record<string, number> }).bytes;
     // Growth reads the final full block, the partial block after it, and the new bytes.
-    // The armed append lands during the anchor read. The reader keeps its opening size, so it checks the anchor once and
-    // leaves the armed record to the next refresh.
+    // The armed append lands during the anchor read. The reader keeps its opening size and leaves the armed record to the next
+    // refresh. Before it accepts the read, it checks the anchor that the growth followed a second time.
     const anchorBytes = 4096 + (firstOffset % 4096);
     const grownBytes = fs.statSync(file).size - firstOffset - Buffer.byteLength('{"type":"ignored"}\n');
-    assert.equal(after[file] - before[file], anchorBytes + grownBytes, 'append qualification read past its anchor');
+    assert.equal(after[file] - before[file], 2 * anchorBytes + grownBytes, 'append qualification read past its anchor');
     assert.equal(after[quiet], before[quiet], 'the quiet parent reread content');
     assert.ok(after[fresh] > 0, 'the new session never entered the captured inputs');
   } finally {

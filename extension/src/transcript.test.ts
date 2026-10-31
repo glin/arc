@@ -172,6 +172,79 @@ test('Claude same-size comparison finds an interior rewrite that lands with an a
   assert.deepEqual(again.references, scanClaudeChildSessionReferences(parent).references);
 });
 
+test('Claude forward read that sees a rewrite plus an append after its first read publishes the rewritten child', async () => {
+  vi.spyOn(performance, 'now').mockReturnValue(0);
+  const launch = (id: string, child: string) => [
+    assistantTool('Agent', 1, id, {}),
+    {
+      type: 'user',
+      message: { content: [{ type: 'tool_result', tool_use_id: id }] },
+      toolUseResult: { agentId: child },
+    },
+  ];
+  const file = writeTranscript([
+    { type: 'ignored', payload: 'x'.repeat(1024) },
+    ...launch('read-launch', 'child-a'),
+    ...Array.from({ length: 300 }, () => ({ type: 'ignored', payload: 'y'.repeat(1024) })),
+    ...launch('unread-launch', 'child-c'),
+  ]);
+  const parent = { file, sessionId: 'parent' };
+  const old = fs.readFileSync(file, 'utf8');
+  // A writer appends after each of the first reads. After the first read in one case, and after the second in the other, it also
+  // rewrites bytes in place: a child the scan already read, an unread child in the first case, and the final block of that read.
+  const rewrite = async (rewriteAfter: number) => {
+    let reads = 0;
+    fs.writeFileSync(file, old);
+    const meter = {
+      readBytes: 0,
+      onRead: (bytes: Buffer, offset: number) => {
+        if (++reads > rewriteAfter) return;
+        const end = offset + bytes.length;
+        const fd = fs.openSync(file, 'r+');
+        try {
+          if (reads === 1 && rewriteAfter === 1) {
+            assert.ok(old.indexOf('child-a') < end - 8192 && old.indexOf('child-c') > end);
+            fs.writeSync(fd, 'child-b', old.indexOf('child-a'));
+            fs.writeSync(fd, 'child-d', old.indexOf('child-c'));
+            fs.writeSync(fd, 'z', old.lastIndexOf('y', end - 100));
+          }
+          if (reads === 2) {
+            fs.writeSync(fd, 'child-d', old.indexOf('child-c'));
+            fs.writeSync(fd, 'z', old.lastIndexOf('y', old.length - 100));
+          }
+        } finally {
+          fs.closeSync(fd);
+        }
+        fs.appendFileSync(file, '{"type":"ignored"}\n');
+      },
+    };
+    const published: string[][] = [];
+    let scan = await scanClaudeRelationshipQuantum(parent, undefined, undefined, undefined, meter);
+    for (let pass = 0; pass < 8; pass++) {
+      if (scan.complete) published.push(scan.references.map((reference) => reference.sessionId));
+      scan = await scanClaudeRelationshipQuantum(
+        parent,
+        JSON.parse(JSON.stringify(scan.cursor)),
+        undefined,
+        undefined,
+        meter,
+      );
+    }
+    assert.ok(reads >= rewriteAfter);
+    const fresh = await scanClaudeRelationshipQuantum(parent, undefined);
+    return { published, chain: scan.cursor.evidence?.chain, fresh: fresh.cursor.evidence?.chain };
+  };
+  for (const [rewriteAfter, children] of [
+    [1, ['child-b', 'child-d']],
+    [2, ['child-a', 'child-d']],
+  ] as const) {
+    const { published, chain, fresh } = await rewrite(rewriteAfter);
+    assert.ok(published.length, `rewrite after read ${rewriteAfter}`);
+    for (const published_ of published) assert.deepEqual(published_, children, `rewrite after read ${rewriteAfter}`);
+    assert.equal(chain, fresh, `rewrite after read ${rewriteAfter}`);
+  }
+});
+
 test('Claude scans, rewrite comparisons and terminal continuations read forward when every slice starts past its deadline', async () => {
   // Each reading of the clock lands a full slice after the previous one, so every deadline has passed.
   let clock = 0;
