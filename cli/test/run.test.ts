@@ -794,9 +794,40 @@ test.each(['queued output', 'failed publication'] as const)(
   },
 );
 
-test.each(['the checkpoint queue', 'the checkpoint read allowance'] as const)(
-  'source producer keeps arrival order and a readable checkpoint through an alias outage that fills %s',
-  async (filled) => {
+function channelIdentity(file: string) {
+  const stat = fs.statSync(file, { bigint: true });
+  return `${stat.dev}:${stat.ino}`;
+}
+// An earlier part of an alias outage queued the existing stdout, then alternating slices of both channels until `full`.
+function queueOutage(receipts: DispatchReceipts, id: string, interval: () => void, full: (state: any) => boolean) {
+  const stdout = receipts.artifact(id, 'stdout.log');
+  const seed = receipts.capture(id, 64 * 1024, true);
+  try {
+    const cursor = { offset: fs.statSync(stdout).size, identity: channelIdentity(stdout) };
+    assert.throws(() => seed.write(fs.readFileSync(stdout), 'stdout.log', cursor), /temporarily unavailable/);
+  } finally {
+    seed.close();
+  }
+  const state = artifactJson(receipts, id, 'capture.json');
+  const slice = (name: 'stdout.log' | 'stderr.log') => ({
+    name,
+    offset: fs.statSync(receipts.artifact(id, name)).size,
+    identity: channelIdentity(receipts.artifact(id, name)),
+  });
+  state.pending.push(slice('stderr.log'));
+  while (!full(state)) {
+    interval();
+    state.pending.push(slice('stdout.log'), slice('stderr.log'));
+  }
+  fs.writeFileSync(receipts.artifact(id, 'capture.json'), JSON.stringify(state));
+}
+
+test.each([
+  { filled: 'the checkpoint queue', kept: 'arrival order' },
+  { filled: 'the checkpoint read allowance', kept: 'a readable checkpoint' },
+] as const)(
+  'source producer keeps $kept through an alias outage that fills $filled',
+  async ({ filled }) => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'setImmediate'] });
     vi.spyOn(Date, 'now').mockReturnValue(0);
     if (process.send) vi.spyOn(process, 'send').mockImplementation(() => true);
@@ -821,37 +852,12 @@ test.each(['the checkpoint queue', 'the checkpoint read allowance'] as const)(
       fs.appendFileSync(stderr, `e${count}\n`);
       expected += `${count}\ne${count}\n`;
     };
-    const identity = (file: string) => {
-      const stat = fs.statSync(file, { bigint: true });
-      return `${stat.dev}:${stat.ino}`;
-    };
-    const seed = receipts.capture(id, 64 * 1024, true);
-    try {
-      assert.throws(
-        () => seed.write(Buffer.from('A\n'), 'stdout.log', { offset: 2, identity: identity(stdout) }),
-        /temporarily unavailable/,
-      );
-    } finally {
-      seed.close();
-    }
-    // An earlier part of the outage queued alternating slices of both channels.
-    const state = artifactJson(receipts, id, 'capture.json');
-    const slice = (name: 'stdout.log' | 'stderr.log') => ({
-      name,
-      offset: fs.statSync(receipts.artifact(id, name)).size,
-      identity: identity(receipts.artifact(id, name)),
-    });
-    state.pending.push(slice('stderr.log'));
-    const size = JSON.stringify(slice('stdout.log')).length + 1;
-    while (
+    const size = JSON.stringify({ name: 'stdout.log', offset: 99_999, identity: channelIdentity(stdout) }).length + 1;
+    queueOutage(receipts, id, interval, (state) =>
       filled === 'the checkpoint queue'
-        ? state.pending.length < 256
-        : JSON.stringify(state).length < 48 * 1024 - 4 * size
-    ) {
-      interval();
-      state.pending.push(slice('stdout.log'), slice('stderr.log'));
-    }
-    fs.writeFileSync(checkpoint, JSON.stringify(state));
+        ? state.pending.length >= 256
+        : JSON.stringify(state).length >= 48 * 1024 - 4 * size,
+    );
     const running = produceStandaloneOutput(receipts, id);
     await vi.advanceTimersByTimeAsync(0);
     child.emit('spawn');
@@ -862,7 +868,7 @@ test.each(['the checkpoint queue', 'the checkpoint read allowance'] as const)(
     const owner = artifactJson(receipts, id, 'output-owner.json');
     assert.equal(owner.state, 'capturing', owner.reason);
     assert.ok(fs.statSync(checkpoint).size < 48 * 1024);
-    // A queue at the read allowance publishes one slice at a time, so that case ends during the outage.
+    // The checkpoint queue case covers arrival order, so this case ends during the outage.
     if (filled === 'the checkpoint read allowance') {
       child.emit('close', 0, null);
       await vi.runAllTimersAsync();
