@@ -1263,7 +1263,7 @@ export class DispatchReceipts {
             if (queued) {
               if (queue[0].name !== name || cursor.offset > queue[0].offset) throw new CapturePublicationPending();
             } else {
-              // Output past held boundaries waits until a deferral writes them.
+              // Output outside the saved queue waits until a deferral writes the held boundaries.
               if (held.length) throw new CapturePublicationPending();
               if (orderLost()) throw new Error('The requested log is incomplete. Private output remains available.');
               // Save the slice's position before alias publication can fail.
