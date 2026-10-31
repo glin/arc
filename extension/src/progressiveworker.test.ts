@@ -60,6 +60,7 @@ import {
   throughStructuredClone,
   worktreeCreationCommand,
   receiptDispatchFixture,
+  clockWriter,
 } from './turnfixtures';
 
 test.each(['claude', 'codex'] as const)(
@@ -333,99 +334,124 @@ const liveWriters = (files: readonly string[]) =>
 const receiptEntries = (store: string) =>
   `const entryFs=require('node:fs'),entryPort=require('node:worker_threads').parentPort,entryOpen=entryFs.opendirSync;entryFs.opendirSync=function(p,...a){const dir=entryOpen.call(this,p,...a);if(String(p)!==${JSON.stringify(store)})return dir;entryPort.postMessage({repeatedCoverage:'receipt-store-opened'});const read=dir.readSync.bind(dir);dir.readSync=function(){entryPort.postMessage({repeatedCoverage:'receipt-entry'});return read();};return dir;};`;
 
-// Writers that append during every forward read leave no quiet forward read. A pass still completes, so discovery publishes in a few
-// continuations.
+// Writers that append during every forward read leave no quiet forward read. Writers on their own clock append every millisecond,
+// so their appends also land during check reads. A pass still completes, so discovery publishes in a few continuations.
 // Catalog refreshes cancel continuations during the receipt scan and change the repository roots, and the scan keeps its place.
-test('receipt discovery publishes while several Claude roots keep appending during each forward read', async () => {
-  const root = tempDir('receipt-worker-live-');
-  const fx = receiptDispatchFixture(root, 'claude', 'codex');
-  fs.mkdirSync(fx.receipts.root, { recursive: true });
-  for (let index = 0; index < 300; index++)
-    fs.mkdirSync(path.join(fx.receipts.root, `${index.toString(16).padStart(8, '0')}-1111-2222-3333-444444444444`));
-  fx.launch(fx.parent, fx.child);
-  fx.launch(fx.child, fx.grandchild);
-  const projects = path.dirname(fx.parent.file);
-  const live = Array.from({ length: 4 }, (_, index) => {
-    const sessionId = `${String(index).repeat(8)}-5555-6666-7777-888888888888`;
-    const file = path.join(projects, `${sessionId}.jsonl`);
-    const padding = 'x'.repeat(4096);
-    fs.writeFileSync(
-      file,
-      [
-        { type: 'user', uuid: sessionId, sessionId, cwd: root, message: { role: 'user', content: 'Keep working.' } },
-        ...Array.from({ length: 64 }, () => ({ type: 'progress', data: { padding } })),
-      ]
-        .map((row) => JSON.stringify(row))
-        .join('\n') + '\n',
+test.each(['during each forward read', 'on their own clock'])(
+  'receipt discovery publishes while several Claude roots keep appending %s',
+  async (writer) => {
+    const root = tempDir('receipt-worker-live-');
+    const fx = receiptDispatchFixture(root, 'claude', 'codex');
+    fs.mkdirSync(fx.receipts.root, { recursive: true });
+    for (let index = 0; index < 300; index++)
+      fs.mkdirSync(path.join(fx.receipts.root, `${index.toString(16).padStart(8, '0')}-1111-2222-3333-444444444444`));
+    fx.launch(fx.parent, fx.child);
+    fx.launch(fx.child, fx.grandchild);
+    const projects = path.dirname(fx.parent.file);
+    const live = Array.from({ length: 4 }, (_, index) => {
+      const sessionId = `${String(index).repeat(8)}-5555-6666-7777-888888888888`;
+      const file = path.join(projects, `${sessionId}.jsonl`);
+      const padding = 'x'.repeat(4096);
+      fs.writeFileSync(
+        file,
+        [
+          {
+            type: 'user',
+            uuid: sessionId,
+            sessionId,
+            cwd: root,
+            message: { role: 'user', content: 'Keep working.' },
+          },
+          ...Array.from({ length: 64 }, () => ({ type: 'progress', data: { padding } })),
+        ]
+          .map((row) => JSON.stringify(row))
+          .join('\n') + '\n',
+      );
+      return {
+        file,
+        sessionId,
+        agent: 'claude' as const,
+        cwd: root,
+        ...revisionOf(fs.statSync(file, { bigint: true })),
+      };
+    });
+    const catalog = [...fx.catalog, ...live];
+    let appends = 0;
+    let openings = 0;
+    let cancelled = 0;
+    let current = new AbortController();
+    let cancelOnEntry = false;
+    const clock = writer === 'on their own clock';
+    const worker = new ProgressiveWorker(
+      `process.env.ARC_HOME=${JSON.stringify(fx.home)};performance.now=()=>0;` +
+        (clock ? '' : liveWriters(live.map((row) => row.file))) +
+        receiptEntries(fx.receipts.root) +
+        source,
+      undefined,
+      (file) => {
+        if (file === 'live-append') appends++;
+        if (file === 'receipt-store-opened') openings++;
+        if (file === 'receipt-entry' && cancelOnEntry) {
+          cancelOnEntry = false;
+          current.abort();
+        }
+      },
     );
-    return { file, sessionId, agent: 'claude' as const, cwd: root, ...revisionOf(fs.statSync(file, { bigint: true })) };
-  });
-  const catalog = [...fx.catalog, ...live];
-  let appends = 0;
-  let openings = 0;
-  let cancelled = 0;
-  let current = new AbortController();
-  let cancelOnEntry = false;
-  const worker = new ProgressiveWorker(
-    `process.env.ARC_HOME=${JSON.stringify(fx.home)};performance.now=()=>0;` +
-      liveWriters(live.map((row) => row.file)) +
-      receiptEntries(fx.receipts.root) +
-      source,
-    undefined,
-    (file) => {
-      if (file === 'live-append') appends++;
-      if (file === 'receipt-store-opened') openings++;
-      if (file === 'receipt-entry' && cancelOnEntry) {
-        cancelOnEntry = false;
-        current.abort();
+    const discovery = await receiptDiscoveryHost(worker, [root], catalog);
+    const ends = { transcript: 0, receipt: 0, other: 0 };
+    const stop = clock
+      ? await clockWriter(
+          live.map((row) => row.file),
+          1,
+          JSON.stringify({ type: 'progress', data: { n: 1 } }) + String.fromCharCode(10),
+        )
+      : undefined;
+    try {
+      let completed: ProgressiveResult | null = null;
+      let pass = 0;
+      for (; pass < 60 && !completed; pass++) {
+        current = new AbortController();
+        // Once the receipt scan has opened, every other continuation is cancelled during it, and the roots change once.
+        cancelOnEntry = openings > 0 && pass % 2 === 1;
+        if (openings > 0) discovery.host.repositoryScopeRoots = [root, path.join(root, 'worker-a')];
+        discovery.host.refreshGeneration = pass + 1;
+        const prepared = await discovery.host.prepareClaudeChildren(pass + 1, current.signal);
+        if (current.signal.aborted) {
+          assert.equal(prepared, false);
+          cancelled++;
+          continue;
+        }
+        assert.equal(prepared, true);
+        const result = discovery.replies.last;
+        assert.ok(result);
+        const charges = result.value.kind === 'stale' ? undefined : (result.value as { charges?: any }).charges;
+        ends.transcript += charges?.transcriptPassEnds ?? 0;
+        ends.receipt += charges?.receiptPassEnds ?? 0;
+        ends.other += charges?.otherPassEnds ?? 0;
+        if (result.value.kind === 'claude-children' && !discovery.host.dispatchDiscoveryPending) completed = result;
       }
-    },
-  );
-  const discovery = await receiptDiscoveryHost(worker, [root], catalog);
-  const ends = { transcript: 0, receipt: 0, other: 0 };
-  try {
-    let completed: ProgressiveResult | null = null;
-    let pass = 0;
-    for (; pass < 60 && !completed; pass++) {
-      current = new AbortController();
-      // Once the receipt scan has opened, every other continuation is cancelled during it, and the roots change once.
-      cancelOnEntry = openings > 0 && pass % 2 === 1;
-      if (openings > 0) discovery.host.repositoryScopeRoots = [root, path.join(root, 'worker-a')];
-      discovery.host.refreshGeneration = pass + 1;
-      const prepared = await discovery.host.prepareClaudeChildren(pass + 1, current.signal);
-      if (current.signal.aborted) {
-        assert.equal(prepared, false);
-        cancelled++;
-        continue;
-      }
-      assert.equal(prepared, true);
-      const result = discovery.replies.last;
-      assert.ok(result);
-      const charges = result.value.kind === 'stale' ? undefined : (result.value as { charges?: any }).charges;
-      ends.transcript += charges?.transcriptPassEnds ?? 0;
-      ends.receipt += charges?.receiptPassEnds ?? 0;
-      ends.other += charges?.otherPassEnds ?? 0;
-      if (result.value.kind === 'claude-children' && !discovery.host.dispatchDiscoveryPending) completed = result;
+      assert.ok(
+        completed?.value.kind === 'claude-children',
+        `Discovery never published under live writers after ${pass} continuations: ${JSON.stringify(ends)}, ${appends} append notices`,
+      );
+      assert.ok(
+        pass <= 16,
+        `Discovery took ${pass} continuations to publish under live writers: ${JSON.stringify(ends)}, ${cancelled} cancelled, ${openings} store openings`,
+      );
+      if (stop) appends = (await stop()).length;
+      assert.ok(appends > 0, 'The live writers never appended');
+      assert.ok(cancelled >= 2, `Only ${cancelled} continuations were cancelled during the receipt scan`);
+      assert.equal(openings, 1, 'A cancelled continuation started the receipt scan again from its first entry');
+      assert.deepEqual(
+        sessionParentIndex(completed.value.references).get(fx.child.sessionId)?.parent,
+        fx.parent.sessionId,
+      );
+    } finally {
+      await stop?.();
+      worker.stop();
     }
-    assert.ok(
-      completed?.value.kind === 'claude-children',
-      `Discovery never published under live writers after ${pass} continuations: ${JSON.stringify(ends)}, ${appends} append notices`,
-    );
-    assert.ok(
-      pass <= 16,
-      `Discovery took ${pass} continuations to publish under live writers: ${JSON.stringify(ends)}, ${cancelled} cancelled, ${openings} store openings`,
-    );
-    assert.ok(appends > 0, 'The live writers never appended');
-    assert.ok(cancelled >= 2, `Only ${cancelled} continuations were cancelled during the receipt scan`);
-    assert.equal(openings, 1, 'A cancelled continuation started the receipt scan again from its first entry');
-    assert.deepEqual(
-      sessionParentIndex(completed.value.references).get(fx.child.sessionId)?.parent,
-      fx.parent.sessionId,
-    );
-  } finally {
-    worker.stop();
-  }
-});
+  },
+);
 
 // The worker reports a new identity for the receipt store once the replacement marker exists, as a replaced directory would.
 const replacedStore = (store: string, marker: string) =>
@@ -444,8 +470,10 @@ test.each(['during the scan', 'after the last store entry'])(
     for (let index = 0; index < 300; index++)
       fs.mkdirSync(path.join(fx.receipts.root, `${index.toString(16).padStart(8, '0')}-1111-2222-3333-444444444444`));
     const { launchId } = fx.launch(fx.parent, fx.child);
+    fx.launch(fx.child, fx.grandchild);
     const marker = path.join(root, 'store-replaced');
-    // The replacement store holds every entry except the launch, so a link from the old store cannot survive the replacement.
+    // The replacement store holds every entry except the first launch, so a link from the old store cannot survive the
+    // replacement, while the second launch still publishes its link.
     const replace = () => {
       for (const name of fs.readdirSync(fx.receipts.root))
         if (name.startsWith(launchId)) fs.rmSync(path.join(fx.receipts.root, name), { recursive: true, force: true });
@@ -483,6 +511,11 @@ test.each(['during the scan', 'after the last store entry'])(
         sessionParentIndex(completed.value.references).get(fx.child.sessionId),
         undefined,
         'A link from the replaced store survived the replacement',
+      );
+      assert.equal(
+        sessionParentIndex(completed.value.references).get(fx.grandchild.sessionId)?.parent,
+        fx.child.sessionId,
+        'The replacement store published no link for the launch it holds',
       );
       assert.equal(openings, 2, 'The replaced store did not start the receipt scan again exactly once');
     } finally {
@@ -5150,64 +5183,93 @@ test('a completed Codex parent defers later growth until the next refresh reads 
   }
 });
 
-test('a Codex parent that grows during every forward read completes its coverage and asks for no continuation', async () => {
-  const directory = tempDir('panel-progressive-codex-live-');
-  const childId = '7c9d29e3-d1e1-4f18-9fd4-a013b821bab3';
-  const child = path.join(directory, `${childId}.jsonl`);
-  fs.writeFileSync(child, JSON.stringify({ type: 'user', cwd: directory }) + String.fromCharCode(10));
-  const file = path.join(directory, 'parent.jsonl');
-  const line = (record: object) => JSON.stringify(record) + String.fromCharCode(10);
-  fs.writeFileSync(
-    file,
-    line({ type: 'session_meta', timestamp: timestamp(0), payload: { id: 'parent', cwd: directory } }) +
-      line({ type: 'event_msg', timestamp: timestamp(1), payload: { type: 'task_started', turn_id: 'turn' } }) +
-      line({ type: 'turn_context', timestamp: timestamp(2), payload: { turn_id: 'turn' } }) +
+test.each(['during every forward read', 'on its own clock'])(
+  'a Codex parent that grows %s completes its coverage and asks for no continuation',
+  async (writer) => {
+    const directory = tempDir('panel-progressive-codex-live-');
+    const childId = '7c9d29e3-d1e1-4f18-9fd4-a013b821bab3';
+    const child = path.join(directory, `${childId}.jsonl`);
+    fs.writeFileSync(child, JSON.stringify({ type: 'user', cwd: directory }) + String.fromCharCode(10));
+    const file = path.join(directory, 'parent.jsonl');
+    const line = (record: object) => JSON.stringify(record) + String.fromCharCode(10);
+    fs.writeFileSync(
+      file,
       line({
-        type: 'event_msg',
-        timestamp: timestamp(3),
-        payload: {
-          type: 'item_completed',
-          item: {
-            type: 'CommandExecution',
-            id: 'launch',
-            parsed_cmd: [{ type: 'unknown', cmd: 'python dispatch.py --arc-dispatch' }],
-            stdout: `ARC_DISPATCH_SESSION={"agent":"claude","session_id":"${childId}"}`,
+        type: 'session_meta',
+        timestamp: timestamp(0),
+        payload: { id: 'parent', cwd: directory },
+      }) +
+        line({
+          type: 'event_msg',
+          timestamp: timestamp(1),
+          payload: { type: 'task_started', turn_id: 'turn' },
+        }) +
+        line({ type: 'turn_context', timestamp: timestamp(2), payload: { turn_id: 'turn' } }) +
+        line({
+          type: 'event_msg',
+          timestamp: timestamp(3),
+          payload: {
+            type: 'item_completed',
+            item: {
+              type: 'CommandExecution',
+              id: 'launch',
+              parsed_cmd: [{ type: 'unknown', cmd: 'python dispatch.py --arc-dispatch' }],
+              stdout: `ARC_DISPATCH_SESSION={"agent":"claude","session_id":"${childId}"}`,
+            },
           },
-        },
-      }),
-  );
-  const opening = fs.statSync(file).size;
-  const worker = new ProgressiveWorker('performance.now=()=>0;' + liveWriters([file]) + source);
-  const stat = revisionOf(fs.statSync(file, { bigint: true }));
-  const childStat = revisionOf(fs.statSync(child, { bigint: true }));
-  try {
-    const result = await discoveryState(
-      worker,
-      {
-        kind: 'claude-children',
-        parents: [{ agent: 'codex', file, sessionId: 'parent', size: stat.size, mtimeMs: stat.mtimeMs }],
-        catalog: [
-          { agent: 'claude', file: child, sessionId: childId, size: childStat.size, mtimeMs: childStat.mtimeMs },
-        ],
-        repositoryRoots: [directory],
-      },
-      1,
-      new AbortController().signal,
+        }) +
+        line({ type: 'ignored', payload: 'x'.repeat(2000) }).repeat(300),
     );
-    assert.ok(fs.statSync(file).size > opening, 'the parent never grew during its read');
-    assert.ok(result?.value.kind === 'claude-children');
-    assert.equal(
-      result.value.referenceEntries.find(([, entry]) => entry.sessionId === 'parent')?.[1].complete,
-      true,
-      'growth during the read left the Codex coverage incomplete',
-    );
-    assert.equal(result.value.continuation, false, 'growth during the read asked for another pass');
-    assert.ok(result.value.references.some((reference) => reference.sessionId === childId));
-  } finally {
-    worker.stop();
-    fs.rmSync(directory, { recursive: true, force: true });
-  }
-});
+    const opening = fs.statSync(file).size;
+    // The writer on its own clock appends every millisecond, so its appends also land during check reads.
+    const clock = writer === 'on its own clock';
+    const worker = new ProgressiveWorker('performance.now=()=>0;' + (clock ? '' : liveWriters([file])) + source);
+    const stat = revisionOf(fs.statSync(file, { bigint: true }));
+    const childStat = revisionOf(fs.statSync(child, { bigint: true }));
+    const stop = clock ? await clockWriter([file], 1, line({ type: 'ignored' })) : undefined;
+    try {
+      const request = (referenceEntries?: [string, any][]) =>
+        ({
+          kind: 'claude-children',
+          parents: [{ agent: 'codex', file, sessionId: 'parent', size: stat.size, mtimeMs: stat.mtimeMs }],
+          catalog: [
+            {
+              agent: 'claude',
+              file: child,
+              sessionId: childId,
+              size: childStat.size,
+              mtimeMs: childStat.mtimeMs,
+            },
+          ],
+          repositoryRoots: [directory],
+          ...(referenceEntries ? { referenceEntries } : {}),
+        }) as import('./progressiveworker').ProgressiveRequest;
+      let result = await discoveryState(worker, request(), 1, new AbortController().signal);
+      if (clock)
+        for (let pass = 2; result?.value.kind === 'claude-children' && result.value.continuation && pass < 10; pass++)
+          result = await discoveryState(
+            worker,
+            request(result.value.referenceEntries),
+            pass,
+            new AbortController().signal,
+          );
+      if (stop) assert.ok((await stop()).length > 0, 'the writer never appended');
+      assert.ok(fs.statSync(file).size > opening, 'the parent never grew during its read');
+      assert.ok(result?.value.kind === 'claude-children');
+      assert.equal(
+        result.value.referenceEntries.find(([, entry]) => entry.sessionId === 'parent')?.[1].complete,
+        true,
+        'growth during the read left the Codex coverage incomplete',
+      );
+      assert.equal(result.value.continuation, false, 'growth during the read asked for another pass');
+      assert.ok(result.value.references.some((reference) => reference.sessionId === childId));
+    } finally {
+      await stop?.();
+      worker.stop();
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  },
+);
 
 test('a rotated scan hides a changed parent until it reads the replacement receipt', async () => {
   const directory = tempDir('panel-progressive-codex-rotated-');

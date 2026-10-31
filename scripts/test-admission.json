@@ -56,8 +56,8 @@
   },
   "extension/src/codex.test.ts": {
     "reason": "Real Git worktree ownership and descendant source resolution must agree with recorded Codex session relationships. Compressed rollout catalogs must preserve decoded metadata, prefer plain copies, and avoid preparing bodies.",
-    "cases": 494,
-    "matricesSha256": "047f70a3def85b43991797ab274326c099e9d3b8af65a68b64c85566fbded84d"
+    "cases": 496,
+    "matricesSha256": "47e3d240bbb90e90eea4d41a50fabcfae21f0da2c9edb44543056c14d727102e"
   },
   "extension/src/derivedcache.test.ts": {
     "reason": "Independent writers and host death must preserve shared cache rows and release stale filesystem locks.",
@@ -136,8 +136,8 @@
   },
   "extension/src/progressiveworker.test.ts": {
     "reason": "Worker protocol, cancellation, host death, bounded transcript reads, and scoped subagent edit reads must survive the actual worker boundary.",
-    "cases": 153,
-    "matricesSha256": "14d39a71626ed8400311f43e34692d9f05bbe4695a18f7613f1ce696491649f2"
+    "cases": 154,
+    "matricesSha256": "fb2df70dabeb94717e5fe39ca5677d151c637f1148d371bdbd6c21a1e135bf27"
   },
   "extension/src/projectsetups.test.ts": {
     "reason": "Real Git worktrees and canonical filesystem aliases must share project identity while clones stay distinct.",

@@ -191,7 +191,7 @@ import {
 import { RETAINED_COMPACTIONS } from './parserstate.ts';
 import { estimateCodexContext, inspectCodexContext, readCodexContext, CODEX_CONTEXT_ITEMS } from './codexcontext.ts';
 import { normalizeContext, type ContextIdentity } from './domain/context-detail';
-import { bedrockAstraRecords, codexContextRecords } from './turnfixtures.ts';
+import { bedrockAstraRecords, clockWriter, codexContextRecords } from './turnfixtures.ts';
 import { emptyCodexResponseClock, reduceCodexResponseClock } from './outputrate';
 
 afterEach(() => vi.unstubAllEnvs());
@@ -1364,43 +1364,68 @@ test('dispatch evidence loss remains partial after a newline, resumption, and EO
   assert.equal(scanCodexDispatchReferences(file, 'parent', scan.cursor).complete, false);
 });
 
-test('a Codex rollout that grows during its read completes at its opening size and reads the growth next', async () => {
-  const file = writeRollout([
-    meta(),
-    event('task_started', 1, { turn_id: TURN }),
-    turnContext(2, TURN, 'gpt-6-astra', 'high'),
-    commandCompleted(3, DISPATCH_COMMAND, 0, 'completed', 'before-growth', { stdout: DISPATCH_RECEIPT }),
-    event('task_complete', 4, { turn_id: TURN }),
-  ]);
-  fs.appendFileSync(file, JSON.stringify({ type: 'ignored', payload: 'x'.repeat(16 * 1024) }) + '\n');
-  const opening = fs.statSync(file).size;
-  // The rollout's writer appends a record after every read that reaches new bytes, as a running Codex session would.
-  let appends = 0;
-  let furthest = 0;
-  const meter = {
-    readBytes: 0,
-    onRead: (bytes: Buffer, offset: number) => {
-      if (offset + bytes.length <= furthest) return;
-      furthest = offset + bytes.length;
-      appends++;
-      fs.appendFileSync(file, '{"type":"ignored"}\n');
-    },
-  };
-  const scan = await scanCodexDispatchReferencesAsync(file, 'parent', null, 1024 * 1024, () => false, meter);
-  assert.ok(appends > 0);
-  assert.equal(scan.qualified, true);
-  assert.equal(scan.complete, true);
-  assert.equal(scan.cursor.offset, opening);
-  assert.deepEqual(
-    scan.references.map((reference) => reference.toolUseIds),
-    [['before-growth']],
-  );
-  const next = await scanCodexDispatchReferencesAsync(file, 'parent', scan.cursor, 1024 * 1024);
-  assert.equal(next.reset, false);
-  assert.equal(next.complete, true);
-  assert.equal(next.cursor.offset, fs.statSync(file).size);
-  assert.deepEqual(next.references, scan.references);
-});
+test.each(['after each read that reaches new bytes', 'on its own clock'])(
+  'a Codex rollout that grows during its read completes at its opening size and reads the growth next, with a writer that appends %s',
+  async (writer) => {
+    const file = writeRollout([
+      meta(),
+      event('task_started', 1, { turn_id: TURN }),
+      turnContext(2, TURN, 'gpt-6-astra', 'high'),
+      commandCompleted(3, DISPATCH_COMMAND, 0, 'completed', 'before-growth', { stdout: DISPATCH_RECEIPT }),
+      event('task_complete', 4, { turn_id: TURN }),
+    ]);
+    for (let index = 0; index < 300; index++) fs.appendFileSync(file, ignoredCodexLineOfBytes(2048));
+    const opening = fs.statSync(file).size;
+    // The first writer appends a record after every read that reaches new bytes. The second appends every millisecond on its
+    // own thread, so its appends also land during check reads, and a read can end unqualified and finish in a later quantum.
+    let appends = 0;
+    let furthest = 0;
+    let grewDuringRead = false;
+    let quantumSize = 0;
+    const meter = {
+      readBytes: 0,
+      onRead: (bytes: Buffer, offset: number) => {
+        if (writer === 'on its own clock') {
+          const size = fs.statSync(file).size;
+          if (quantumSize && size > quantumSize) grewDuringRead = true;
+          quantumSize ||= size;
+          return;
+        }
+        if (offset + bytes.length <= furthest) return;
+        furthest = offset + bytes.length;
+        appends++;
+        fs.appendFileSync(file, '{"type":"ignored"}\n');
+      },
+    };
+    const stop = writer === 'on its own clock' ? await clockWriter([file], 1, '{"type":"ignored"}\n') : undefined;
+    let scan = await scanCodexDispatchReferencesAsync(file, 'parent', null, 1024 * 1024, () => false, meter);
+    if (stop)
+      for (let pass = 0; !scan.complete && pass < 8; pass++) {
+        quantumSize = 0;
+        scan = await scanCodexDispatchReferencesAsync(file, 'parent', scan.cursor, 1024 * 1024, () => false, meter);
+      }
+    if (stop) {
+      const times = await stop();
+      assert.ok(grewDuringRead, `the rollout never grew during a read in ${times.length} appends`);
+      assert.equal(scan.complete, true, 'the rollout never completed while its writer ran');
+      assert.equal(scan.cursor.offset, scan.cursor.size);
+    } else {
+      assert.ok(appends > 0);
+      assert.equal(scan.qualified, true);
+      assert.equal(scan.complete, true);
+      assert.equal(scan.cursor.offset, opening);
+    }
+    assert.deepEqual(
+      scan.references.map((reference) => reference.toolUseIds),
+      [['before-growth']],
+    );
+    const next = await scanCodexDispatchReferencesAsync(file, 'parent', scan.cursor, 1024 * 1024);
+    assert.equal(next.reset, false);
+    assert.equal(next.complete, true);
+    assert.equal(next.cursor.offset, fs.statSync(file).size);
+    assert.deepEqual(next.references, scan.references);
+  },
+);
 
 test('a Codex rollout rewritten with an append after its last read keeps no old dispatch reference', async () => {
   const file = writeRollout([
@@ -1449,6 +1474,54 @@ test('a Codex rollout rewritten with an append after its last read keeps no old 
       references,
       [['rewritten-ids']],
       'a rewrite before the final stamp check kept the old dispatch call',
+    );
+});
+
+test('a Codex rollout rewritten at a growth point after its read qualified keeps no old dispatch reference', async () => {
+  const file = writeRollout([
+    meta(),
+    event('task_started', 1, { turn_id: TURN }),
+    turnContext(2, TURN, 'gpt-6-astra', 'high'),
+    commandCompleted(3, DISPATCH_COMMAND, 0, 'completed', 'before-growth', { stdout: DISPATCH_RECEIPT }),
+    event('task_complete', 4, { turn_id: TURN }),
+  ]);
+  for (let index = 0; index < 300; index++) fs.appendFileSync(file, ignoredCodexLineOfBytes(2048));
+  const old = fs.readFileSync(file, 'latin1');
+  // The writer appends once after the first read, which marks the evidence there, and the read continues to the opening size.
+  let growth = 0;
+  const meter = {
+    readBytes: 0,
+    onRead: (bytes: Buffer, offset: number) => {
+      if (offset !== 0 || growth) return;
+      growth = bytes.length;
+      fs.appendFileSync(file, '{"type":"ignored"}\n');
+    },
+  };
+  let scan = await scanCodexDispatchReferencesAsync(file, 'parent', null, 1024 * 1024, () => false, meter);
+  assert.ok(growth > 0 && growth < old.length - 8192, 'the first read did not stop before the final blocks');
+  // Before the next scan, the writer rewrites the dispatch call and one byte in the final block before the growth point, then
+  // appends. The final block at the opening size keeps its bytes.
+  const fd = fs.openSync(file, 'r+');
+  try {
+    assert.ok(old.indexOf('before-growth') < growth - 8192);
+    for (let at = old.indexOf('before-growth'); at >= 0; at = old.indexOf('before-growth', at + 1))
+      fs.writeSync(fd, 'rewritten-ids', at);
+    fs.writeSync(fd, 'z', old.lastIndexOf('x', growth - 100));
+  } finally {
+    fs.closeSync(fd);
+  }
+  fs.appendFileSync(file, '{"type":"ignored"}\n');
+  const published: string[][][] = [];
+  for (let pass = 0; pass < 8; pass++) {
+    scan = await scanCodexDispatchReferencesAsync(file, 'parent', scan.cursor, 1024 * 1024);
+    if (scan.complete) published.push(scan.references.map((reference) => reference.toolUseIds));
+  }
+  assert.ok(published.length, 'the rewritten rollout never completed');
+  for (const references of published)
+    assert.deepEqual(
+      references,
+      [['rewritten-ids']],
+      'a rewrite at the growth point after the read qualified kept the old dispatch call',
     );
 });
 

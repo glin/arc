@@ -1,5 +1,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { once } from 'node:events';
+import { Worker } from 'node:worker_threads';
 import { DispatchReceipts } from './dispatchreceipts';
 import { payloadSha256 } from './sessionwrites';
 import type { SiteManifest } from './webview/export-model';
@@ -2064,4 +2066,26 @@ export function exportedSiteData(directory: string): { manifest: SiteManifest; d
   ))
     data.set(match[1], JSON.parse(Buffer.from(match[2], 'base64').toString('utf8')));
   return { manifest: data.get('manifest') as SiteManifest, data };
+}
+
+// A writer on its own thread appends a record to each file every `ms` milliseconds by its own clock, whatever the reader does, as
+// a running agent would. Stopping it returns the time of each append.
+export async function clockWriter(
+  files: readonly string[],
+  ms: number,
+  line: string,
+): Promise<() => Promise<number[]>> {
+  const stop = new Int32Array(new SharedArrayBuffer(4));
+  const thread = new Worker(
+    `const fs=require('node:fs'),{workerData,parentPort}=require('node:worker_threads');const stop=new Int32Array(workerData.stop),times=[];let next=0;while(Atomics.load(stop,0)===0){const now=performance.now();if(now<next)continue;next=now+workerData.ms;times.push(now);for(const file of workerData.files)fs.appendFileSync(file,workerData.line);}parentPort.postMessage(times);`,
+    { eval: true, workerData: { files, ms, line, stop: stop.buffer } },
+  );
+  const times = once(thread, 'message');
+  await once(thread, 'online');
+  return async () => {
+    Atomics.store(stop, 0, 1);
+    const [result] = await times;
+    await thread.terminate();
+    return result as number[];
+  };
 }
