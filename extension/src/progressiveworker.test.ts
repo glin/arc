@@ -5494,11 +5494,10 @@ test('a pass keeps an active transcript that grows after its seed check', async 
   }
 });
 
-// A worker that is paused between two adjacent clock reads in every request sees its deadlines pass at once.
-const JUMPING_CLOCK =
-  '{const now=performance.now.bind(performance);let reads=0,skew=0;performance.now=()=>{if(++reads%2===0)skew+=20;return now()+skew;};}';
+// A worker that is paused before every clock read sees each deadline pass at the next read, whatever the count of reads.
+const JUMPING_CLOCK = '{const now=performance.now.bind(performance);let skew=0;performance.now=()=>now()+(skew+=20);}';
 
-test.each(['the real clock', 'a clock that jumps 20 ms on every second read'])(
+test.each(['the real clock', 'a clock that jumps 20 ms on every read'])(
   'a pass after a complete reply reads an unchanged Codex rollout that stopped before its end, under %s',
   async (clock) => {
     const directory = tempDir('panel-progressive-seeded-codex-');
