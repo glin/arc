@@ -1071,6 +1071,75 @@ test(
   },
 );
 
+const recoveryRuntime = { now: () => 0, identity: async () => null, yield: async () => {} };
+const captureLimits = [
+  ['stdout.log', 64 * 1024],
+  ['stderr.log', 64 * 1024],
+] as const;
+function sameFile(fd: number, file: string) {
+  const stat = fs.statSync(file, { bigint: true, throwIfNoEntry: false });
+  return Boolean(stat && fs.fstatSync(fd, { bigint: true }).ino === stat.ino);
+}
+
+test(
+  'capture recovery keeps arrival order or reports the log incomplete after a producer ends inside a queue record',
+  { tags: ['subprocess'] },
+  async () => {
+    const { receipts, launch } = workerFixture('', 100, false, true);
+    const id = launch.launchId;
+    const frames = outputFrames().split(/(?<=\n)/);
+    stoppedOutput(receipts, id, frames[0], 'e\n');
+    const stdout = receipts.artifact(id, 'stdout.log');
+    const stderr = receipts.artifact(id, 'stderr.log');
+    const queueFile = receipts.artifact(id, 'capture-queue.log');
+    const alias = launch.standalone!.logAlias!;
+    let blocked = true;
+    denyOpen(alias, () => blocked);
+    queueOutage(
+      receipts,
+      id,
+      () => {},
+      (state) => state.pending.length >= 2,
+    );
+    // The producer observes B and then f, and ends partway through the record for f.
+    let budget = Infinity;
+    const write = fs.writeSync;
+    vi.spyOn(fs, 'writeSync').mockImplementation(((
+      fd: number,
+      buffer: Buffer,
+      offset: number,
+      length: number,
+      at: number,
+    ) => {
+      if (budget === Infinity || !sameFile(fd, queueFile))
+        return Reflect.apply(write, fs, [fd, buffer, offset, length, at]);
+      if (budget <= 0) throw Object.assign(new Error('Producer ended'), { code: 'EIO' });
+      const count = Reflect.apply(write, fs, [fd, buffer, offset, Math.min(length, budget), at]) as number;
+      budget -= count;
+      return count;
+    }) as typeof fs.writeSync);
+    const producer = receipts.capture(id, 64 * 1024, true);
+    try {
+      fs.appendFileSync(stdout, frames[1]);
+      fs.appendFileSync(stderr, 'f\n');
+      budget = 128 + 50;
+      assert.throws(() => producer.defer(captureLimits), /Producer ended/);
+    } finally {
+      budget = Infinity;
+      producer.close();
+    }
+    fs.appendFileSync(stdout, frames[2]);
+    blocked = false;
+    const status = (await superviseStandalone(receipts, id, true, undefined, recoveryRuntime)) as any;
+    const expected = `${frames[0]}e\n${frames[1]}f\n${frames[2]}`;
+    const published = fs.readFileSync(alias, 'utf8');
+    if (published !== expected) {
+      assert.ok(expected.startsWith(published), published);
+      assert.equal(status.observation.reason, 'The requested log is incomplete. Private output remains available.');
+    }
+  },
+);
+
 test.each(['truncated', 'redirected'] as const)(
   'source producer retains capture and worker exit after a %s alias',
   async (change) => {

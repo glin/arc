@@ -20,8 +20,11 @@ const REPORT_BYTES = 8 * 1024 * 1024;
 const CAPTURE_SLICE_BYTES = 64 * 1024;
 // The checkpoint holds this many unpublished slices, well inside its read allowance. Later boundaries wait in the queue file.
 const PENDING_SLICES = 256;
-// Each boundary in the queue file is one fixed-width JSON line.
+// Each boundary in the queue file is one fixed-width line: padded JSON, then a checksum of the JSON, then a newline.
 const QUEUE_RECORD_BYTES = 128;
+const QUEUE_SUM_BYTES = 8;
+const QUEUE_BODY_BYTES = QUEUE_RECORD_BYTES - QUEUE_SUM_BYTES - 1;
+const queueSum = (body: Uint8Array) => createHash('sha256').update(body).digest('hex').slice(0, QUEUE_SUM_BYTES);
 const OWNER = /^[A-Za-z0-9_.:-]{1,128}$/;
 const TOKEN = /^[a-f0-9]{64}$/;
 type FileIdentity = { dev: string; ino: string };
@@ -989,10 +992,15 @@ export class DispatchReceipts {
           fs.closeSync(fd);
         }
         return Array.from({ length: Math.floor(read / QUEUE_RECORD_BYTES) }, (_, index): PendingSlice | null => {
+          const start = index * QUEUE_RECORD_BYTES;
+          const body = buffer.subarray(start, start + QUEUE_BODY_BYTES);
+          if (
+            buffer[start + QUEUE_RECORD_BYTES - 1] !== 0x0a ||
+            buffer.toString('latin1', start + QUEUE_BODY_BYTES, start + QUEUE_RECORD_BYTES - 1) !== queueSum(body)
+          )
+            return null;
           try {
-            const slice = JSON.parse(
-              buffer.toString('utf8', index * QUEUE_RECORD_BYTES, (index + 1) * QUEUE_RECORD_BYTES),
-            ) as PendingSlice;
+            const slice = JSON.parse(body.toString('utf8')) as PendingSlice;
             if (
               (slice?.name === 'stdout.log' || slice?.name === 'stderr.log') &&
               Number.isSafeInteger(slice.offset) &&
@@ -1005,20 +1013,25 @@ export class DispatchReceipts {
           return null;
         });
       });
-    const appendQueue = (position: number, slices: readonly PendingSlice[]) =>
+    // A new queue truncates the file, so a record that stops partway never lies over a complete older one.
+    const appendQueue = (position: number, slices: readonly PendingSlice[], truncate: boolean) =>
       transient(() => {
-        const records = Buffer.concat(
-          slices.map((slice) => Buffer.from(`${JSON.stringify(slice).padEnd(QUEUE_RECORD_BYTES - 1)}\n`)),
-        );
-        if (records.length !== slices.length * QUEUE_RECORD_BYTES)
+        const records = slices.map((slice) => {
+          const body = Buffer.from(JSON.stringify(slice).padEnd(QUEUE_BODY_BYTES));
+          return Buffer.concat([body, Buffer.from(`${queueSum(body)}\n`)]);
+        });
+        if (records.some((record) => record.length !== QUEUE_RECORD_BYTES))
           throw new Error('The saved log position is unavailable.');
-        const fd = openQueue(fs.constants.O_WRONLY | fs.constants.O_CREAT);
+        const fd = openQueue(fs.constants.O_WRONLY | fs.constants.O_CREAT | (truncate ? fs.constants.O_TRUNC : 0));
         try {
-          for (let written = 0; written < records.length;) {
-            const count = fs.writeSync(fd, records, written, records.length - written, position + written);
-            if (!count) throw new Error('The saved log position is unavailable.');
-            written += count;
-          }
+          records.forEach((record, index) => {
+            for (let written = 0; written < record.length;) {
+              const at = position + index * QUEUE_RECORD_BYTES + written;
+              const count = fs.writeSync(fd, record, written, record.length - written, at);
+              if (!count) throw new Error('The saved log position is unavailable.');
+              written += count;
+            }
+          });
         } finally {
           fs.closeSync(fd);
         }
@@ -1029,19 +1042,25 @@ export class DispatchReceipts {
       return Math.max(offset, state.records?.ends[name] ?? 0);
     };
     // Records past the saved end are boundaries that a capture wrote before a save that never happened, because the
-    // capture ended or its save failed. They keep their file order ahead of later output. The first record that does
-    // not pass its channel's queued end ends them, such as a record left from a queue that drained.
+    // capture ended or its save failed. They keep their file order ahead of later output.
+    // A complete record that does not pass its channel's queued end is left from a queue that drained, and ends them.
+    // A record that stops partway or fails its checksum leaves the order of later output unknown.
     const unsaved = (state: SourceCaptureState) => {
       const end = state.records?.end ?? 0;
       const stat = transient(() => fs.statSync(queueFile, { throwIfNoEntry: false }));
-      if (!stat || stat.size - end < QUEUE_RECORD_BYTES) return [];
+      const size = stat?.size ?? 0;
       const ends = { 'stdout.log': queuedEnd(state, 'stdout.log'), 'stderr.log': queuedEnd(state, 'stderr.log') };
       const slices: PendingSlice[] = [];
-      for (const slice of readQueue(end, Math.floor((stat.size - end) / QUEUE_RECORD_BYTES))) {
-        if (!slice || slice.offset <= ends[slice.name]) break;
+      let position = end;
+      const records = size > end ? readQueue(end, Math.ceil((size - end) / QUEUE_RECORD_BYTES)) : [];
+      for (const slice of records) {
+        if (!slice) throw new Error('The requested log is incomplete. Private output remains available.');
+        if (slice.offset <= ends[slice.name]) return slices;
         ends[slice.name] = slice.offset;
         slices.push(slice);
+        position += QUEUE_RECORD_BYTES;
       }
+      if (position < size) throw new Error('The requested log is incomplete. Private output remains available.');
       return slices;
     };
     // Each boundary follows its own record in the queue file. A boundary in the last slice's channel extends that
@@ -1134,7 +1153,8 @@ export class DispatchReceipts {
             if (!boundaries.length) return;
             // The queue file names each boundary before the checkpoint does, so the next capture finds the boundaries
             // of a save that never happened.
-            if (held.length) appendQueue((state.records?.end ?? 0) + written * QUEUE_RECORD_BYTES, held);
+            if (held.length)
+              appendQueue((state.records?.end ?? 0) + written * QUEUE_RECORD_BYTES, held, !state.records && !written);
             held = [];
             for (const slice of boundaries) enqueue(state, slice);
             save(state);
@@ -1214,7 +1234,7 @@ export class DispatchReceipts {
                 safePath(path.dirname(queueFile));
                 fs.rmSync(queueFile, { force: true });
               } catch {
-                /* A record left behind does not pass its channel's queued end, so the next queue stops before it. */
+                /* A record left behind does not pass its channel's queued end, and the next queue truncates it. */
               }
           },
           'capture-write',
