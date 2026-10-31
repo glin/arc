@@ -1,5 +1,3 @@
-import * as zstd from 'node:zlib';
-import * as compressedSources from './rolloutsource';
 import { sessionCostProjection, sessionCostUsageOf } from './turncard';
 
 test.each(['claude', 'codex'] as const)(
@@ -791,19 +789,6 @@ test('Codex context admits a 926564-byte compaction and preserves pending tools 
     estimateCodexContext(codexContextRecords('s1', true), 's1')!.categories.find((row) => row.name === 'Tool results')
       ?.tokens,
   );
-  const compressed = file + '.zst';
-  if (rolloutCompression.zstdCompressSync) {
-    fs.writeFileSync(compressed, rolloutCompression.zstdCompressSync(fs.readFileSync(file)));
-    assert.deepEqual(
-      await readCodexContext(
-        compressed,
-        's1',
-        revisionOf(compressedSources.rolloutStat(compressed, { bigint: true })),
-        new AbortController().signal,
-      ),
-      result,
-    );
-  }
   fs.appendFileSync(
     file,
     JSON.stringify({
@@ -819,22 +804,6 @@ test('Codex context admits a 926564-byte compaction and preserves pending tools 
   assert.equal(pending.status, 'unavailable');
   assert.equal(pending.reason, 'pending-tools');
   assert.equal(pending.used, null);
-  if (rolloutCompression.zstdCompressSync) {
-    fs.writeFileSync(compressed, rolloutCompression.zstdCompressSync(fs.readFileSync(file)));
-    assert.deepEqual(
-      normalizeContext(
-        await readCodexContext(
-          compressed,
-          's1',
-          revisionOf(compressedSources.rolloutStat(compressed, { bigint: true })),
-          new AbortController().signal,
-        ),
-        savedCodexContextIdentity,
-        0,
-      ),
-      pending,
-    );
-  }
 });
 
 test('Codex context leaves large ordinary tool output unattributed after a genuine measurement', async () => {
@@ -936,7 +905,7 @@ test('Codex context refuses invalid or enlarged test budgets before backward rea
 });
 
 test('Codex context stops before parsing an aborted batch and refuses revision changes between chunks', async () => {
-  for (const change of ['preparation', 'abort', 'revision'] as const) {
+  for (const change of ['abort', 'revision'] as const) {
     const file = writeRollout(codexContextRecords());
     const timestamp = new Date('2026-01-01T00:00:00Z');
     fs.utimesSync(file, timestamp, timestamp);
@@ -944,16 +913,6 @@ test('Codex context stops before parsing an aborted batch and refuses revision c
     const controller = new AbortController();
     let reads = 0;
     let parsed = 0;
-    let released = false;
-    const preparation =
-      change === 'preparation'
-        ? vi.spyOn(compressedSources, 'prepareRolloutSource').mockImplementation(async () => {
-            controller.abort();
-            return () => {
-              released = true;
-            };
-          })
-        : undefined;
     const originalParse = JSON.parse;
     const parsing = vi.spyOn(JSON, 'parse').mockImplementation((...args: Parameters<typeof JSON.parse>) => {
       parsed++;
@@ -975,15 +934,10 @@ test('Codex context stops before parsing an aborted batch and refuses revision c
         },
       });
       assert.equal(result, null);
-      assert.equal(reads, change === 'preparation' ? 0 : change === 'abort' ? 1 : 2);
-      if (change === 'preparation') {
-        assert.equal(parsed, 0);
-        assert.equal(released, true);
-      }
+      assert.equal(reads, change === 'abort' ? 1 : 2);
       if (change === 'abort') assert.equal(parsed, 1);
     } finally {
       parsing.mockRestore();
-      preparation?.mockRestore();
     }
   }
 });
@@ -18917,53 +18871,4 @@ test('a Codex wait_agent return times out only by its own top-level timed_out fi
       ['text-reader', 1],
     ],
   );
-});
-
-const rolloutCompression = zstd as typeof zstd & { zstdCompressSync?: (bytes: Buffer) => Buffer };
-test.skipIf(!rolloutCompression.zstdCompressSync)(
-  'compressed rollouts appear in the session listing and retain their last turn',
-  async () => {
-    const root = sessionsRoot([{ day: '2026/08/25', name: ROLLOUT(UUID_A), records: ordinaryTurn() }]);
-    const plain = path.join(root, '2026', '08', '25', ROLLOUT(UUID_A));
-    const expected = readCodexSession(plain, UUID_A);
-    const file = plain + '.zst';
-    fs.writeFileSync(file, rolloutCompression.zstdCompressSync!(fs.readFileSync(plain)));
-    fs.unlinkSync(plain);
-    fs.writeFileSync(path.join(path.dirname(file), ROLLOUT(UUID_B) + '.zst'), 'corrupt');
-    const listing = codexSessionFiles(root, ['c:/repo']);
-    assert.deepEqual(
-      listing.sessions.map((session) => session.sessionId),
-      [UUID_A],
-    );
-    assert.equal(listing.sessions[0].file, file);
-    assert.deepEqual(readCodexSession(file, UUID_A).turns, expected.turns);
-    const page = await readCodexHistoryPageAsync(file, UUID_A);
-    assert.equal(page.kind, 'page');
-    if (page.kind === 'page') assert.equal(page.page.turns.at(-1)?.promptId, expected.turns.at(-1)?.promptId);
-  },
-);
-
-test.skipIf(!rolloutCompression.zstdCompressSync)('a plain and compressed rollout pair lists one source', () => {
-  const root = sessionsRoot([{ day: '.', name: ROLLOUT(UUID_A), records: ordinaryTurn() }]);
-  const plain = path.join(root, ROLLOUT(UUID_A));
-  fs.writeFileSync(plain + '.zst', rolloutCompression.zstdCompressSync!(fs.readFileSync(plain)));
-  assert.deepEqual(rolloutFiles(root), [plain]);
-  assert.equal(codexSessionFiles(root, ['c:/repo']).sessions.length, 1);
-});
-
-test.skipIf(!rolloutCompression.zstdCompressSync)('catalog walks leave compressed bodies unread', async () => {
-  const root = sessionsRoot([{ day: '.', name: ROLLOUT(UUID_A), records: ordinaryTurn() }]);
-  const plain = path.join(root, ROLLOUT(UUID_A));
-  const file = plain + '.zst';
-  fs.writeFileSync(file, rolloutCompression.zstdCompressSync!(fs.readFileSync(plain)));
-  fs.unlinkSync(plain);
-  const prepare = vi.spyOn(compressedSources, 'prepareRolloutSource');
-  try {
-    const enumeration = await enumerateRolloutFilesAsync(root);
-    assert.deepEqual(enumeration?.files, [file]);
-    assert.equal(codexSessionFiles(root, ['c:/repo']).sessions[0].sessionId, UUID_A);
-    assert.equal(prepare.mock.calls.length, 0);
-  } finally {
-    prepare.mockRestore();
-  }
 });

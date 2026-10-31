@@ -1,5 +1,3 @@
-import * as fs from 'node:fs';
-import { openRolloutSource, rolloutStat } from './rolloutsource';
 import {
   codexDispatchCursor,
   codexDispatchRecord,
@@ -21,6 +19,7 @@ import {
   emptyCodexUsageReducerState,
   readCodexSessionMeta,
 } from './codex';
+import * as fs from 'node:fs';
 import { revisionOf } from './transcript';
 import {
   normalizeSessionTitle,
@@ -147,7 +146,7 @@ export function commitRepositoryOccurrence(commit: CommitRepositoryRequest['comm
 
 export function commitSourceRevision(source: CommitRepositorySource): boolean {
   try {
-    const stat = revisionOf(rolloutStat(source.file, { bigint: true }, fs));
+    const stat = revisionOf(fs.statSync(source.file, { bigint: true }));
     return Object.entries(source.revision).every(([key, value]) => stat[key as keyof typeof stat] === value);
   } catch {
     return false;
@@ -309,11 +308,11 @@ export async function scanCommitRepositorySource(
   const started = now();
   let charged = 0;
   if (!commitSourceRevision(cursor.source)) return { status: 'stale', readBytes: charged };
-  const fd = openRolloutSource(cursor.source.file, false, fs);
+  const fd = fs.openSync(cursor.source.file, 'r');
   const read = (position: number, size: number): Buffer | null => {
     if (size > allowance - charged) return null;
     const buffer = Buffer.allocUnsafe(size);
-    const count = fd.readInto(buffer, 0, size, position);
+    const count = fs.readSync(fd, buffer, 0, size, position);
     charged += count;
     cursor.readBytes += count;
     return buffer.subarray(0, count);
@@ -377,7 +376,7 @@ export async function scanCommitRepositorySource(
       await new Promise<void>((resolve) => setImmediate(resolve));
     }
   } finally {
-    fd.close();
+    fs.closeSync(fd);
   }
   if (signal?.aborted) return { status: 'cancelled', readBytes: charged };
   if (!commitSourceRevision(cursor.source)) return { status: 'stale', readBytes: charged };

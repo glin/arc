@@ -1,4 +1,3 @@
-import { isRolloutName, rolloutStem, rolloutStat, rolloutCatalogStat } from './rolloutsource';
 import fs from 'node:fs';
 import { combineCacheExpirySummaries, combineCacheExpiryAmounts } from './cacheexpirysummary';
 import path from 'node:path';
@@ -1099,7 +1098,7 @@ function* sessionTranscriptSteps(
   }
   for (const file of yield* rolloutPaths(codexStore(roots), signal)) {
     yield;
-    if (rolloutStem(path.basename(file)).endsWith(`-${target}`)) matches.push(file);
+    if (path.basename(file).endsWith(`-${target}.jsonl`)) matches.push(file);
   }
   if (matches.length === 0) throw new Error(`No transcript found for ${target}`);
   if (matches.length > 1) throw new Error(`More than one transcript matched ${target}: ${matches.join(', ')}`);
@@ -1107,7 +1106,7 @@ function* sessionTranscriptSteps(
 }
 
 function isCodex(file: string): boolean {
-  return (path.basename(file).startsWith('rollout-') && isRolloutName(file)) || readCodexSessionMeta(file) !== null;
+  return /^rollout-.*\.jsonl$/.test(path.basename(file)) || readCodexSessionMeta(file) !== null;
 }
 
 function claudeSourceId(file: string): string {
@@ -2747,17 +2746,17 @@ function* sessionSourceSteps(
       const meta = readCodexOpening(file);
       if (meta === undefined) {
         try {
-          rolloutCatalogStat(file, fs);
+          fs.statSync(file);
           refuseCatalog('codex', new Error(`Cannot read transcript: ${file}`));
         } catch (error) {
           refuseCatalog('codex', error);
         }
       }
       if (!meta?.sessionId) continue;
-      const stat = rolloutCatalogStat(file, fs);
+      const stat = fs.statSync(file);
       codexFiles.push({
-        size: Number(stat.size),
-        mtimeMs: Number(stat.mtimeMs),
+        size: stat.size,
+        mtimeMs: stat.mtimeMs,
         file,
         sessionId: meta.sessionId,
         agent: 'codex',
@@ -2871,7 +2870,7 @@ function* sessionSourceSteps(
       if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue;
       const file = path.join(directory, entry.name);
       try {
-        if (!rolloutStat(file, undefined, fs).isFile()) continue;
+        if (!fs.statSync(file).isFile()) continue;
       } catch (error) {
         const code = (error as NodeJS.ErrnoException).code;
         if (code !== 'ENOENT' && code !== 'ENOTDIR') throw error;

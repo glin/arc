@@ -1,5 +1,4 @@
 import * as fs from 'node:fs';
-import { openRolloutSource, prepareRolloutSource, type RolloutSource } from './rolloutsource';
 import { readPreviousLines, type BackwardLineCursor, type FileRevision } from './transcript';
 import { contextNumber, type ContextCategory, type ContextUnavailableReason } from './domain/context-detail';
 import { codexRetainedContextTokens } from './codex';
@@ -313,21 +312,17 @@ export async function readCodexContext(
   const previousLines = options.previousLines ?? readPreviousLines;
   const headBytes = Math.min(openingBytes, revision.size);
   if (signal.aborted || headBytes + 1 > scanBytes) return null;
-  let release: (() => void) | undefined;
-  let descriptor: RolloutSource | undefined;
+  let descriptor = -1;
   try {
-    release = await prepareRolloutSource(file);
-    if (signal.aborted) return null;
-    descriptor = openRolloutSource(file, false, fs);
-    if (revision.size !== descriptor.size) return null;
+    descriptor = fs.openSync(file, 'r');
     const head = Buffer.alloc(headBytes);
-    if (descriptor.readInto(head, 0, head.length, 0) !== head.length) return null;
+    if (fs.readSync(descriptor, head, 0, head.length, 0) !== head.length) return null;
     const newline = head.indexOf(10);
     if (newline < 0) return null;
     const opening = JSON.parse(head.subarray(0, newline).toString('utf8'));
     if (opening.type !== 'session_meta' || opening.payload?.id !== session) return null;
     const end = Buffer.alloc(1);
-    if (descriptor.readInto(end, 0, 1, revision.size - 1) !== 1 || end[0] !== 10) return null;
+    if (fs.readSync(descriptor, end, 0, 1, revision.size - 1) !== 1 || end[0] !== 10) return null;
     let cursor: BackwardLineCursor = { revision, end: revision.size, fragment: Buffer.alloc(0) };
     const records: unknown[] = [];
     let read = head.length + 1;
@@ -362,7 +357,6 @@ export async function readCodexContext(
   } catch {
     return null;
   } finally {
-    if (descriptor) descriptor.close();
-    release?.();
+    if (descriptor >= 0) fs.closeSync(descriptor);
   }
 }

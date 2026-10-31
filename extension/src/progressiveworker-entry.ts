@@ -1,4 +1,3 @@
-import { rolloutStat } from './rolloutsource';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { readCodexContext } from './codexcontext';
@@ -308,7 +307,7 @@ function dispatchActivity(
 
 function revisionOf(file: string): FileRevision | null {
   try {
-    return fileRevisionOf(rolloutStat(file, { bigint: true }, fs));
+    return fileRevisionOf(fs.statSync(file, { bigint: true }));
   } catch {
     return null;
   }
@@ -607,7 +606,7 @@ async function execute(
       if (parentStamps.has(key)) return parentStamps.get(key)!;
       const stamp = parentCheck(() => {
         try {
-          return relationshipStamp(rolloutStat(file, { bigint: true }, fs));
+          return relationshipStamp(fs.statSync(file, { bigint: true }));
         } catch {
           return null;
         }

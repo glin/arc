@@ -1,4 +1,3 @@
-import { openRolloutSource, rolloutStat, type RolloutSource } from './rolloutsource';
 import { toolKind } from './domain/tool-kinds';
 import { revisionOf } from './filerevision';
 import { turnKey } from './domain/read';
@@ -1313,16 +1312,16 @@ export function readSessionCwd(file: string): string | null {
 }
 
 export function scanSessionCwd(file: string, onUnreadable?: () => void): string | null {
-  let fd: RolloutSource | undefined;
+  let fd = -1;
   try {
-    fd = openRolloutSource(file, false, fs);
+    fd = fs.openSync(file, 'r');
     return cwdFromDescriptor(file, fd);
   } catch {
     onUnreadable?.();
   } finally {
-    if (fd) {
+    if (fd >= 0) {
       try {
-        fd.close();
+        fs.closeSync(fd);
       } catch {
         /* ignore */
       }
@@ -1331,9 +1330,9 @@ export function scanSessionCwd(file: string, onUnreadable?: () => void): string 
   return null;
 }
 
-function cwdFromDescriptor(file: string, fd: RolloutSource): string | null {
+function cwdFromDescriptor(file: string, fd: number): string | null {
   const buf = Buffer.allocUnsafe(64 * 1024);
-  const read = meterRead(file, fd.readInto(buf, 0, buf.length, 0));
+  const read = meterRead(file, fs.readSync(fd, buf, 0, buf.length, 0));
   for (const line of buf.subarray(0, read).toString('utf8').split('\n')) {
     if (line.indexOf('"cwd"') < 0) continue;
     try {
@@ -1353,18 +1352,18 @@ export function readQualifiedSessionCwd(file: string): { value: string; revision
 // Opening metadata belongs to the descriptor and pathname only while their complete revisions agree.
 export function readQualifiedOpening<T>(
   file: string,
-  read: (fd: RolloutSource) => T | null,
+  read: (fd: number) => T | null,
 ): { value: T; revision: FileRevision } | null {
-  let fd: RolloutSource | undefined;
+  let fd = -1;
   try {
-    fd = openRolloutSource(file, true, fs);
-    const before = fd.physicalStat();
+    fd = fs.openSync(file, 'r');
+    const before = fs.fstatSync(fd, { bigint: true });
     const revision = revisionOf(before);
     if (!before.isFile() || revision.size < 0 || !supportedFileIdentity(revision)) return null;
     const value = read(fd);
     if (
       value === null ||
-      !sameFileRevision(fd.physicalStat(), revision) ||
+      !sameFileRevision(fs.fstatSync(fd, { bigint: true }), revision) ||
       !sameFileRevision(fs.statSync(file, { bigint: true }), revision)
     )
       return null;
@@ -1372,9 +1371,9 @@ export function readQualifiedOpening<T>(
   } catch {
     return null;
   } finally {
-    if (fd) {
+    if (fd >= 0) {
       try {
-        fd.close();
+        fs.closeSync(fd);
       } catch {
         /* ignore */
       }
@@ -1437,10 +1436,10 @@ export function readTurnStartsFromTail(
   // Set for a Claude transcript, whose repeated records the window skips.
   claude = false,
 ): TurnStarts {
-  let fd: RolloutSource | undefined;
+  let fd = -1;
   try {
-    fd = openRolloutSource(file, false, fs);
-    const size = fd.stat().size;
+    fd = fs.openSync(file, 'r');
+    const size = fs.fstatSync(fd).size;
     const initialBytes = Math.max(1, Math.floor(bytes));
     const scale = TURN_START_MAX_BYTES / TURN_START_BYTES;
     const maxBytes = initialBytes * scale;
@@ -1454,7 +1453,7 @@ export function readTurnStartsFromTail(
       const chunk = Buffer.allocUnsafe(length);
       let read = 0;
       while (read < length) {
-        const next = meterRead(file, fd.readInto(chunk, read, length - read, nextStart + read));
+        const next = meterRead(file, fs.readSync(fd, chunk, read, length - read, nextStart + read));
         if (next <= 0) {
           throw new Error('Turn-start glance stopped before its requested range.');
         }
@@ -1483,9 +1482,9 @@ export function readTurnStartsFromTail(
   } catch {
     return { starts: [], whole: false };
   } finally {
-    if (fd) {
+    if (fd >= 0) {
       try {
-        fd.close();
+        fs.closeSync(fd);
       } catch {
         /* ignore */
       }
@@ -1763,14 +1762,14 @@ function* completeLineSteps(
   if (size <= bytes) {
     return { bytes, rest: Buffer.alloc(0) };
   }
-  let fd: RolloutSource | undefined;
+  let fd = -1;
   try {
-    fd = openRolloutSource(file, false, fs);
+    fd = fs.openSync(file, 'r');
     let carry = cursor.carry;
     let pos = cursor.pos;
     const chunk = Buffer.allocUnsafe(256 * 1024);
     while (pos < size) {
-      const read = meterRead(file, fd.readInto(chunk, 0, Math.min(chunk.length, size - pos, readLimit()), pos));
+      const read = meterRead(file, fs.readSync(fd, chunk, 0, Math.min(chunk.length, size - pos, readLimit()), pos));
       if (read <= 0) {
         break;
       }
@@ -1797,9 +1796,9 @@ function* completeLineSteps(
   } catch {
     /* unreadable. Return collected lines. */
   } finally {
-    if (fd) {
+    if (fd >= 0) {
       try {
-        fd.close();
+        fs.closeSync(fd);
       } catch {
         /* ignore */
       }
@@ -1844,19 +1843,19 @@ export function readCustomTitleSidecar(sessionFile: string, bytes = CUSTOM_TITLE
     return null;
   }
   const sidecar = path.join(path.dirname(sessionFile), sessionId, 'custom-title.json');
-  let fd: RolloutSource | undefined;
+  let fd = -1;
   try {
-    fd = openRolloutSource(sidecar, false, fs);
+    fd = fs.openSync(sidecar, 'r');
     // The size is checked on the open file, so a file that grows after a stat cannot make
     // this read more than the bound.
-    const size = fd.stat().size;
+    const size = fs.fstatSync(fd).size;
     if (size < 1 || size > bytes) {
       return null;
     }
     const content = Buffer.alloc(size);
     let offset = 0;
     while (offset < size) {
-      const read = meterRead(sidecar, fd.readInto(content, offset, size - offset, offset));
+      const read = meterRead(sidecar, fs.readSync(fd, content, offset, size - offset, offset));
       if (read <= 0) {
         return null;
       }
@@ -1867,9 +1866,9 @@ export function readCustomTitleSidecar(sessionFile: string, bytes = CUSTOM_TITLE
   } catch {
     return null;
   } finally {
-    if (fd) {
+    if (fd >= 0) {
       try {
-        fd.close();
+        fs.closeSync(fd);
       } catch {
         /* already closed */
       }
@@ -1962,11 +1961,11 @@ export function headLines(file: string, bytes: number): string[] {
 
 // The same read, with the fingerprint of the first record when the window holds all of it.
 function headOf(file: string, bytes: number): { lines: string[]; key?: string } {
-  let fd: RolloutSource | undefined;
+  let fd = -1;
   try {
-    fd = openRolloutSource(file, false, fs);
+    fd = fs.openSync(file, 'r');
     const buf = Buffer.allocUnsafe(bytes);
-    const read = meterRead(file, fd.readInto(buf, 0, bytes, 0), 0);
+    const read = meterRead(file, fs.readSync(fd, buf, 0, bytes, 0), 0);
     const text = buf.subarray(0, read).toString('utf8');
     const lines = text.split('\n');
     if (read === bytes) {
@@ -1976,9 +1975,9 @@ function headOf(file: string, bytes: number): { lines: string[]; key?: string } 
   } catch {
     return { lines: [] };
   } finally {
-    if (fd) {
+    if (fd >= 0) {
       try {
-        fd.close();
+        fs.closeSync(fd);
       } catch {
         /* ignore */
       }
@@ -2817,13 +2816,13 @@ export function scanForPerson(file: string, size: number, prev?: PersonScan, sta
 // Checks raw bytes for a user-record marker, including fragments, and stops on the first match.
 function holdsUserRecord(file: string, size: number): boolean {
   const mark = Buffer.from('"type":"user"');
-  let fd: RolloutSource | undefined;
+  let fd = -1;
   try {
-    fd = openRolloutSource(file, false, fs);
+    fd = fs.openSync(file, 'r');
     const chunk = Buffer.allocUnsafe(4 * 1024);
     let pos = 0;
     while (pos < size) {
-      const read = meterRead(file, fd.readInto(chunk, 0, Math.min(chunk.length, size - pos), pos));
+      const read = meterRead(file, fs.readSync(fd, chunk, 0, Math.min(chunk.length, size - pos), pos));
       if (read <= 0) {
         break;
       }
@@ -2839,9 +2838,9 @@ function holdsUserRecord(file: string, size: number): boolean {
   } catch {
     /* unreadable. No user marker found. */
   } finally {
-    if (fd) {
+    if (fd >= 0) {
       try {
-        fd.close();
+        fs.closeSync(fd);
       } catch {
         /* ignore */
       }
@@ -3618,7 +3617,7 @@ export function sessionFileFor(root: string, folders: string[], sessionId: strin
     if (!slugs.some((slug) => projectDirectoryMatches(name, slug))) continue;
     const file = path.join(root, dir, `${sessionId}.jsonl`);
     try {
-      if (!rolloutStat(file, undefined, fs).isFile()) continue;
+      if (!fs.statSync(file).isFile()) continue;
     } catch {
       continue;
     }
@@ -3730,7 +3729,7 @@ export function enumerateSessionFiles(dir: string): SourceEnumeration & { sessio
     }
     const file = path.join(dir, name);
     try {
-      const stat = rolloutStat(file, { bigint: true }, fs);
+      const stat = fs.statSync(file, { bigint: true });
       if (!stat.isFile()) continue;
       (evidence.files as string[]).push(file);
       if (stat.size > BigInt(Number.MAX_SAFE_INTEGER)) {
@@ -4081,7 +4080,7 @@ export interface CommitSource {
 
 export function commitSourceStamp(file: string): RelationshipStamp | null {
   try {
-    const stat = rolloutStat(file, { bigint: true }, fs);
+    const stat = fs.statSync(file, { bigint: true });
     return stat.isFile() && supportedFileIdentity(revisionOf(stat)) ? relationshipStamp(stat) : null;
   } catch {
     return null;
@@ -4303,14 +4302,14 @@ export class RelationshipReader {
   private checked = 0;
   private advanced = false;
   constructor(
-    readonly fd: RolloutSource,
+    readonly fd: number,
     readonly file: string,
     readonly budget: number,
     readonly cancelled: () => boolean,
     readonly meter?: RelationshipReadMeter,
     readonly capturedSizeOnly = false,
   ) {
-    this.stamp = relationshipStamp(fd.stat({ bigint: true }));
+    this.stamp = relationshipStamp(fs.fstatSync(fd, { bigint: true }));
     this.deadline = Number.isFinite(budget) ? performance.now() + RELATIONSHIP_SLICE_MS : Infinity;
     this.check();
   }
@@ -4333,8 +4332,8 @@ export class RelationshipReader {
     };
     try {
       this.stable &&=
-        unchanged(relationshipStamp(this.fd.stat({ bigint: true }))) &&
-        unchanged(relationshipStamp(rolloutStat(this.file, { bigint: true }, fs)));
+        unchanged(relationshipStamp(fs.fstatSync(this.fd, { bigint: true }))) &&
+        unchanged(relationshipStamp(fs.statSync(this.file, { bigint: true })));
     } catch {
       this.stable = false;
     }
@@ -4360,7 +4359,7 @@ export class RelationshipReader {
     return bytes;
   }
   private readAt(at: number, size: number): Buffer {
-    const count = meterRead(this.file, this.fd.readInto(this.buffer, 0, size, at), at);
+    const count = meterRead(this.file, fs.readSync(this.fd, this.buffer, 0, size, at), at);
     this.readBytes += count;
     if (this.meter) this.meter.readBytes += count;
     this.meter?.onRead?.(this.buffer.subarray(0, count), at);
@@ -4571,7 +4570,7 @@ export async function scanClaudeRelationshipQuantum(
   readBytes: number;
   reset: boolean;
 }> {
-  const fd = openRolloutSource(parent.file, false, fs);
+  const fd = fs.openSync(parent.file, 'r');
   try {
     let cursor =
       previous && JSON.stringify(previous.exportPolicy) === JSON.stringify(exportPolicy)
@@ -4706,7 +4705,7 @@ export async function scanClaudeRelationshipQuantum(
       reset,
     };
   } finally {
-    fd.close();
+    fs.closeSync(fd);
   }
 }
 
@@ -5155,7 +5154,7 @@ export class ClaudeChildSessionCache implements ClaudeChildSessionResolver {
     const key = normalizeFsPath(reference.file);
     let stat: fs.BigIntStats;
     try {
-      stat = rolloutStat(reference.file, { bigint: true }, fs);
+      stat = fs.statSync(reference.file, { bigint: true });
       if (!stat.isFile() || stat.size === 0n || stat.size > BigInt(Number.MAX_SAFE_INTEGER)) {
         this.entries.delete(key);
         return null;
@@ -5462,15 +5461,15 @@ function sameFileRevision(snapshot: fs.Stats | fs.BigIntStats, revision: FileRev
 }
 
 export function tailOf(file: string, bytes: number, keepCursor = false): TailRead {
-  let fd: RolloutSource | undefined;
+  let fd = -1;
   try {
-    fd = openRolloutSource(file, false, fs);
-    const stat = revisionOf(fd.stat({ bigint: true }));
+    fd = fs.openSync(file, 'r');
+    const stat = revisionOf(fs.fstatSync(fd, { bigint: true }));
     const size = stat.size;
     const start = Math.max(0, size - bytes);
     const len = size - start;
     const buf = Buffer.allocUnsafe(len);
-    const read = meterRead(file, fd.readInto(buf, 0, len, start), start);
+    const read = meterRead(file, fs.readSync(fd, buf, 0, len, start), start);
     const body = buf.subarray(0, read);
     const lines = body.toString('utf8').split('\n');
     if (start > 0) {
@@ -5481,7 +5480,7 @@ export function tailOf(file: string, bytes: number, keepCursor = false): TailRea
     return {
       lines,
       whole: start === 0 && read === len,
-      success: read === len && sameFileRevision(fd.stat({ bigint: true }), stat),
+      success: read === len && sameFileRevision(fs.fstatSync(fd, { bigint: true }), stat),
       readBytes: body.length,
       offset: start === 0 ? 0 : start + (firstNewline < 0 ? body.length : firstNewline + 1),
       ...(keepCursor && start > 0
@@ -5497,9 +5496,9 @@ export function tailOf(file: string, bytes: number, keepCursor = false): TailRea
   } catch {
     return { lines: [], whole: false, readBytes: 0 };
   } finally {
-    if (fd) {
+    if (fd >= 0) {
       try {
-        fd.close();
+        fs.closeSync(fd);
       } catch {
         /* ignore */
       }
@@ -5508,31 +5507,31 @@ export function tailOf(file: string, bytes: number, keepCursor = false): TailRea
 }
 
 function readBackwardRange(file: string, start: number, length: number, revision: FileRevision): Buffer | null {
-  let fd: RolloutSource | undefined;
+  let fd = -1;
   try {
-    fd = openRolloutSource(file, false, fs);
-    if (!sameFileRevision(fd.stat({ bigint: true }), revision)) {
+    fd = fs.openSync(file, 'r');
+    if (!sameFileRevision(fs.fstatSync(fd, { bigint: true }), revision)) {
       return null;
     }
     const buffer = Buffer.allocUnsafe(length);
     let read = 0;
     while (read < length) {
-      const next = meterRead(file, fd.readInto(buffer, read, length - read, start + read), start + read);
+      const next = meterRead(file, fs.readSync(fd, buffer, read, length - read, start + read), start + read);
       if (next <= 0) {
         return null;
       }
       read += next;
     }
-    if (!sameFileRevision(fd.stat({ bigint: true }), revision)) {
+    if (!sameFileRevision(fs.fstatSync(fd, { bigint: true }), revision)) {
       return null;
     }
     return buffer;
   } catch {
     return null;
   } finally {
-    if (fd) {
+    if (fd >= 0) {
       try {
-        fd.close();
+        fs.closeSync(fd);
       } catch {
         /* ignore */
       }
@@ -9964,7 +9963,7 @@ const FIRST_REQUEST_READS_KEPT = 512;
 export function claudeFirstRequestCachedTokens(file: string, childTranscript = false): number | null {
   let stat: fs.Stats;
   try {
-    stat = rolloutStat(file, undefined, fs);
+    stat = fs.statSync(file);
   } catch {
     return null;
   }

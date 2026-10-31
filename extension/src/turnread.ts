@@ -1,8 +1,7 @@
-import * as fs from 'node:fs';
-import { openRolloutSource, type RolloutSource } from './rolloutsource';
 // Tracks read state, unread counts, and retained transcript tails.
 // `turnview.ts` re-exports these helpers for existing callers.
 
+import * as fs from 'node:fs';
 import { meterRead } from './readmeter';
 import * as crypto from 'node:crypto';
 import { TurnStarts } from './transcript';
@@ -284,15 +283,15 @@ export function retainedRangeFingerprint(file: string, start: number, end: numbe
   if (start < 0 || end < start) {
     return null;
   }
-  let fd: RolloutSource | undefined;
+  let fd = -1;
   try {
-    fd = openRolloutSource(file, false, fs);
+    fd = fs.openSync(file, 'r');
     const hash = crypto.createHash('sha256');
     hash.update(`${start}:${end}:`);
     const buffer = Buffer.allocUnsafe(Math.min(RETAINED_FINGERPRINT_CHUNK_BYTES, Math.max(1, end - start)));
     for (let position = start; position < end; position += buffer.length) {
       const length = Math.min(buffer.length, end - position);
-      const read = meterRead(file, fd.readInto(buffer, 0, length, position));
+      const read = meterRead(file, fs.readSync(fd, buffer, 0, length, position));
       if (read !== length) {
         return null;
       }
@@ -302,9 +301,9 @@ export function retainedRangeFingerprint(file: string, start: number, end: numbe
   } catch {
     return null;
   } finally {
-    if (fd) {
+    if (fd >= 0) {
       try {
-        fd.close();
+        fs.closeSync(fd);
       } catch {
         /* ignore */
       }

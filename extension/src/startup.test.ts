@@ -1,5 +1,3 @@
-import { rolloutStat, rolloutStatAsync, prepareRolloutSource } from './rolloutsource';
-import { replaceRolloutSpendRecord, spendRecordHasLifetimeFacts } from './projectspend';
 import { startingWorktree } from './repositoryscope';
 import * as spendConsumers from './projectspend';
 import * as cardConsumers from './turncard';
@@ -1958,15 +1956,7 @@ function completeDiscoveryHarness(
   railCacheMark: typeof railCacheMarkOf = () => null,
   cacheStats: typeof derivedTitleCacheStats = derivedTitleCacheStats,
 ): any {
-  scope = {
-    startingWorktree,
-    rolloutStat,
-    rolloutStatAsync,
-    prepareRolloutSource,
-    replaceRolloutSpendRecord,
-    spendRecordHasLifetimeFacts,
-    ...scope,
-  };
+  scope = { startingWorktree, ...scope };
   const file = ts.createSourceFile(
     'panelhost.ts',
     fs.readFileSync(path.join(__dirname, 'panelhost.ts'), 'utf8'),

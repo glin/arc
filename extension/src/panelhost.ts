@@ -1,12 +1,3 @@
-import {
-  prepareRolloutSource,
-  rolloutStat,
-  rolloutStatAsync,
-  rolloutSourceReady,
-  onRolloutReady,
-  setRolloutLogger,
-} from './rolloutsource';
-import { replaceRolloutSpendRecord, spendRecordHasLifetimeFacts } from './projectspend';
 import { compatibleDiscovery, discoveryCompatibility } from './progressiveworker';
 import {
   sessionCoverageMember,
@@ -1724,11 +1715,7 @@ export class PanelProvider implements vscode.Disposable {
     if (!listed) return null;
     const revision = () => {
       try {
-        return fileRevisionOf(
-          listed.file.endsWith('.jsonl.zst')
-            ? rolloutStat(listed.file, { bigint: true }, fs)
-            : fs.statSync(listed.file, { bigint: true }),
-        );
+        return fileRevisionOf(fs.statSync(listed.file, { bigint: true }));
       } catch {
         return null;
       }
@@ -2212,9 +2199,6 @@ export class PanelProvider implements vscode.Disposable {
   private projectSpendSaveRetries = 0;
   private projectSpendRailOwed = false;
   private projectSpendIndexing = false;
-  private projectSpendReading = false;
-  private projectSpendLeases = new Map<string, () => void>();
-  private rolloutSearch: string | null = null;
   private projectSpendCostQueue: string[] | null = null;
   // Performance counters share measurements with diagnostics. Disabled logging skips record construction.
   private readonly performanceCounters = new PanelPerformanceCounters(Date.now(), this.performanceSink());
@@ -4207,14 +4191,6 @@ export class PanelProvider implements vscode.Disposable {
     this.disposables.push({ dispose: stopCoverage });
     // Update permitted webview resource roots when workspace folders change.
     this.disposables.push(vscode.workspace.onDidChangeWorkspaceFolders(() => this.workspaceFoldersChanged()));
-  }
-
-  rolloutReady(file: string): void {
-    if (this.disposed) return;
-    this.codexStats.delete(file);
-    this.corpus.delete(file);
-    this.refreshFrom('rollout-ready', true, false, [file]);
-    if (this.rolloutSearch) this.answerSearch(this.rolloutSearch);
   }
 
   // A bounded read skips records the repeated-record map does not reach yet. When the map of the extension
@@ -9617,11 +9593,7 @@ export class PanelProvider implements vscode.Disposable {
         all =
           revalidatedCatalog(this.authoritativeCatalog, this.showing, (file) => {
             try {
-              const stat = fileRevisionOf(
-                file.endsWith('.jsonl.zst')
-                  ? rolloutStat(file, { bigint: true }, fs)
-                  : fs.statSync(file, { bigint: true }),
-              );
+              const stat = fileRevisionOf(fs.statSync(file, { bigint: true }));
               return { mtimeMs: stat.mtimeMs, size: stat.size };
             } catch {
               return null;
@@ -11708,8 +11680,7 @@ export class PanelProvider implements vscode.Disposable {
     const accepted = await Promise.all(
       sources.map(async (source) => {
         try {
-          const previous = this.projectSpendFiles[this.spendRecordsByFile?.get(normalizeSpendFile(source.file)) ?? -1];
-          const physical = await rolloutStatAsync(source.file, previous, fs);
+          const physical = await fs.promises.stat(source.file, { bigint: true });
           return physical.isFile() ? { source, stat: fileRevisionOf(physical) } : null;
         } catch (error) {
           return ['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')
@@ -11724,11 +11695,10 @@ export class PanelProvider implements vscode.Disposable {
     for (const checked of accepted) {
       if (!checked) continue;
       const { source, stat } = checked;
-      const at = this.spendRecordsByFile?.get(normalizeSpendFile(source.file));
+      const at = this.spendRecordsByFile.get(normalizeSpendFile(source.file));
       const record = at === undefined ? undefined : this.projectSpendFiles[at];
       if (!stat && record?.missingAt !== undefined) this.spendChecks.set(record, Date.now());
-      if (stat && (!source.file.endsWith('.jsonl.zst') || stat.size > 0) && source.agent === 'codex')
-        this.codexStats.accept(source.file, { ...stat, isFile: true });
+      if (stat && source.agent === 'codex') this.codexStats.accept(source.file, { ...stat, isFile: true });
       if (
         stat &&
         record &&
@@ -11792,13 +11762,7 @@ export class PanelProvider implements vscode.Disposable {
           sources.slice(offset, offset + 16).map(async (source) => {
             if (revisions.has(source.file) || (onlyFiles && !onlyFiles.has(normalizeFsPath(source.file)))) return;
             try {
-              const stat = fileRevisionOf(
-                await rolloutStatAsync(
-                  source.file,
-                  this.projectSpendFiles[this.spendRecordsByFile?.get(normalizeSpendFile(source.file)) ?? -1],
-                  fs,
-                ),
-              );
+              const stat = fileRevisionOf(await fs.promises.stat(source.file, { bigint: true }));
               revisions.set(source.file, {
                 size: stat.size,
                 mtimeMs: stat.mtimeMs,
@@ -11854,8 +11818,6 @@ export class PanelProvider implements vscode.Disposable {
 
   // Cancel deferred source offers when their workspace or panel lifetime ends.
   private cancelProjectSpendOffers(): void {
-    for (const release of this.projectSpendLeases?.values() ?? []) release();
-    this.projectSpendLeases?.clear();
     for (const tick of this.projectSpendOffers) {
       clearTimeout(tick);
     }
@@ -11926,12 +11888,12 @@ export class PanelProvider implements vscode.Disposable {
     if (!this.projectSpendQueue.length && !this.projectSpendIndexing) {
       return;
     }
-    if (this.projectSpendIndexing && (this.projectSpendTick || this.projectSpendReading)) {
+    if (this.projectSpendTick) {
       return;
     }
     this.projectSpendIndexing = true;
     this.postProjectSpend();
-    if (!this.projectSpendTick && !this.projectSpendReading) this.scheduleNextProjectSpendFile();
+    this.scheduleNextProjectSpendFile();
   }
 
   private projectSpendHistoryCutoff(now = Date.now()): number | null {
@@ -11953,170 +11915,102 @@ export class PanelProvider implements vscode.Disposable {
   private scheduleNextProjectSpendFile(): void {
     const epoch = this.projectSpendEpoch;
     this.projectSpendTick = setTimeout(() => {
-      if (!this.disposed && epoch === this.projectSpendEpoch) void this.indexNextProjectSpendFile();
+      if (!this.disposed && epoch === this.projectSpendEpoch) this.indexNextProjectSpendFile();
     }, 0);
   }
 
-  private async indexNextProjectSpendFile(): Promise<void> {
-    if (this.projectSpendReading) {
-      this.projectSpendTick = null;
+  private indexNextProjectSpendFile(): void {
+    this.projectSpendTick = null;
+    const next = this.projectSpendQueue.shift();
+    const workspace = this.projectSpendWorkspace;
+    if (!workspace || !this.projectSpendStorageDir) {
+      this.finishProjectSpendIndex();
       return;
     }
-    this.projectSpendReading = true;
-    try {
-      this.projectSpendTick = null;
-      const next = this.projectSpendQueue.shift();
-      const workspace = this.projectSpendWorkspace;
-      if (!workspace || !this.projectSpendStorageDir) {
-        this.finishProjectSpendIndex();
-        return;
-      }
-      if (!next) {
-        if (this.indexNextClaudeCostState()) {
-          this.scheduleNextProjectSpendFile();
-        } else this.finishProjectSpendIndex();
-        return;
-      }
-      const epoch = this.projectSpendEpoch;
-      let release: (() => void) | undefined;
-      try {
-        const held = this.projectSpendFiles[this.spendRecordsByFile?.get(normalizeSpendFile(next.file)) ?? -1];
-        let unchanged = false;
-        if (
-          next.file.endsWith('.jsonl.zst') &&
-          held &&
-          held.complete !== false &&
-          held.missingAt === undefined &&
-          held.parserKind === 'codex' &&
-          spendRecordHasLifetimeFacts(held)
-        ) {
-          try {
-            const stat = fileRevisionOf(
-              next.file.endsWith('.jsonl.zst')
-                ? rolloutStat(next.file, { bigint: true }, fs)
-                : fs.statSync(next.file, { bigint: true }),
-            );
-            unchanged =
-              held.size === stat.size &&
-              held.mtimeMs === stat.mtimeMs &&
-              held.sourceIdentity === `${stat.dev}:${stat.ino}`;
-          } catch {
-            /* A missing logical size needs preparation. */
-          }
-        }
-        release =
-          (this.projectSpendLeases ??= new Map()).get(next.file) ??
-          (unchanged || !next.file.endsWith('.jsonl.zst') ? () => undefined : await prepareRolloutSource(next.file));
-      } catch {
-        if (!this.disposed && epoch === this.projectSpendEpoch) {
-          this.projectSpendQueued.delete(normalizeSpendFile(next.file));
-          this.scheduleNextProjectSpendFile();
-        }
-        return;
-      }
-      if (this.disposed || epoch !== this.projectSpendEpoch) {
-        release();
-        return;
-      }
-      let retain = false;
-      try {
-        const key = normalizeSpendFile(next.file);
-        this.spendRecordsByFile ??= new Map(this.projectSpendFiles.map((record, index) => [record.file, index]));
-        const at = this.spendRecordsByFile.get(key) ?? -1;
-        const previous = at >= 0 ? this.projectSpendFiles[at] : undefined;
-        const makeReducer =
-          next.agent === 'claude'
-            ? (state: unknown) =>
-                createClaudeUsageLineReducer(state as Parameters<typeof createClaudeUsageLineReducer>[0], {
-                  childTranscript: next.primary === false,
-                  nativeChildRequests: (this.spendNativeChildren ??= new Set(
-                    this.sessionSpendSources
-                      .filter((source) => source.nativeParentFile !== undefined)
-                      .map((source) => normalizeSpendFile(source.file)),
-                  )).has(key),
-                })
-            : (state: unknown) =>
-                createCodexUsageLineReducer(state as Parameters<typeof createCodexUsageLineReducer>[0]);
-        let result: ReturnType<typeof indexSpendFile>;
-        try {
-          result = indexSpendFile(previous, next.file, workspace, makeReducer);
-        } catch {
-          this.projectSpendQueued.delete(key);
-          this.scheduleNextProjectSpendFile();
-          return;
-        }
-        this.projectSpendFiles = replaceRolloutSpendRecord(
-          this.projectSpendFiles,
-          result.record,
-          this.spendRecordsByFile,
-        );
-        if (result.record !== previous) {
-          this.projectSpendRevision++;
-          this.invalidateProjectSpendSnapshot();
-        }
-        if (result.stateChanged) {
-          this.scheduleProjectSpendSave();
-        }
-        if (spendRecordChangesRail(previous, result.record)) {
-          this.projectSpendRailOwed = true;
-        }
-        if (result.complete) {
-          if (result.record.complete !== false || result.record.missingAt !== undefined) this.spendChecks?.account(key);
-          this.projectSpendQueued.delete(key);
-          // Requeue this file if it grew during indexing instead of waiting for the next integrity pass.
-          try {
-            const stat = fileRevisionOf(
-              next.file.endsWith('.jsonl.zst')
-                ? rolloutStat(next.file, { bigint: true }, fs)
-                : fs.statSync(next.file, { bigint: true }),
-            );
-            if (
-              stat.size !== result.record.size ||
-              stat.mtimeMs !== result.record.mtimeMs ||
-              (result.record.sourceIdentity !== undefined && result.record.sourceIdentity !== `${stat.dev}:${stat.ino}`)
-            ) {
-              this.projectSpendQueued.add(key);
-              this.projectSpendQueue.push(next);
-            } else if (result.found && this.spendChecks) {
-              this.spendChecks.set(result.record, Date.now());
-            }
-          } catch (error) {
-            invalidateSpendFileNormalization(next.file);
-            if (
-              result.record.missingAt !== undefined &&
-              ['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')
-            )
-              this.spendChecks?.set(result.record, Date.now());
-            // The integrity pass marks the disappeared source in the ledger.
-          }
-        } else if (next.file.endsWith('.jsonl.zst') || spendRecordHoldsLongLine(result.record)) {
-          if (next.file.endsWith('.jsonl.zst')) {
-            retain = true;
-            this.projectSpendLeases.set(next.file, release);
-          }
-          // The file reads next, and the slice that ends the held line stops there. A re-offer can queue
-          // another source first, so any other record that holds a long line lets it go.
-          this.projectSpendQueue.unshift(next);
-          this.projectSpendFiles.forEach((record, index) => {
-            if (record !== result.record && spendRecordHoldsLongLine(record)) {
-              this.projectSpendFiles[index] = releaseSpendHeldLine(record);
-            }
-          });
-        } else {
-          this.projectSpendQueue.push(next);
-        }
+    if (!next) {
+      if (this.indexNextClaudeCostState()) {
         this.scheduleNextProjectSpendFile();
-      } finally {
-        if (!retain) {
-          release();
-          this.projectSpendLeases.delete(next.file);
-        }
-      }
-    } finally {
-      this.projectSpendReading = false;
-      if (!this.disposed && this.projectSpendQueue.length && !this.projectSpendTick)
-        this.scheduleNextProjectSpendFile();
+      } else this.finishProjectSpendIndex();
+      return;
     }
+    const key = normalizeSpendFile(next.file);
+    this.spendRecordsByFile ??= new Map(this.projectSpendFiles.map((record, index) => [record.file, index]));
+    const at = this.spendRecordsByFile.get(key) ?? -1;
+    const previous = at >= 0 ? this.projectSpendFiles[at] : undefined;
+    const makeReducer =
+      next.agent === 'claude'
+        ? (state: unknown) =>
+            createClaudeUsageLineReducer(state as Parameters<typeof createClaudeUsageLineReducer>[0], {
+              childTranscript: next.primary === false,
+              nativeChildRequests: (this.spendNativeChildren ??= new Set(
+                this.sessionSpendSources
+                  .filter((source) => source.nativeParentFile !== undefined)
+                  .map((source) => normalizeSpendFile(source.file)),
+              )).has(key),
+            })
+        : (state: unknown) => createCodexUsageLineReducer(state as Parameters<typeof createCodexUsageLineReducer>[0]);
+    let result: ReturnType<typeof indexSpendFile>;
+    try {
+      result = indexSpendFile(previous, next.file, workspace, makeReducer);
+    } catch {
+      this.projectSpendQueued.delete(key);
+      this.scheduleNextProjectSpendFile();
+      return;
+    }
+    if (at >= 0) {
+      this.projectSpendFiles[at] = result.record;
+    } else {
+      this.spendRecordsByFile.set(key, this.projectSpendFiles.length);
+      this.projectSpendFiles.push(result.record);
+    }
+    if (result.record !== previous) {
+      this.projectSpendRevision++;
+      this.invalidateProjectSpendSnapshot();
+    }
+    if (result.stateChanged) {
+      this.scheduleProjectSpendSave();
+    }
+    if (spendRecordChangesRail(previous, result.record)) {
+      this.projectSpendRailOwed = true;
+    }
+    if (result.complete) {
+      if (result.record.complete !== false || result.record.missingAt !== undefined) this.spendChecks?.account(key);
+      this.projectSpendQueued.delete(key);
+      // Requeue this file if it grew during indexing instead of waiting for the next integrity pass.
+      try {
+        const stat = fileRevisionOf(fs.statSync(next.file, { bigint: true }));
+        if (
+          stat.size !== result.record.size ||
+          stat.mtimeMs !== result.record.mtimeMs ||
+          (result.record.sourceIdentity !== undefined && result.record.sourceIdentity !== `${stat.dev}:${stat.ino}`)
+        ) {
+          this.projectSpendQueued.add(key);
+          this.projectSpendQueue.push(next);
+        } else if (result.found && this.spendChecks) {
+          this.spendChecks.set(result.record, Date.now());
+        }
+      } catch (error) {
+        invalidateSpendFileNormalization(next.file);
+        if (
+          result.record.missingAt !== undefined &&
+          ['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')
+        )
+          this.spendChecks?.set(result.record, Date.now());
+        // The integrity pass marks the disappeared source in the ledger.
+      }
+    } else if (spendRecordHoldsLongLine(result.record)) {
+      // The file reads next, and the slice that ends the held line stops there. A re-offer can queue
+      // another source first, so any other record that holds a long line lets it go.
+      this.projectSpendQueue.unshift(next);
+      this.projectSpendFiles.forEach((record, index) => {
+        if (record !== result.record && spendRecordHoldsLongLine(record)) {
+          this.projectSpendFiles[index] = releaseSpendHeldLine(record);
+        }
+      });
+    } else {
+      this.projectSpendQueue.push(next);
+    }
+    this.scheduleNextProjectSpendFile();
   }
 
   private indexNextClaudeCostState(): boolean {
@@ -12293,9 +12187,7 @@ export class PanelProvider implements vscode.Disposable {
       const named = [...new Set([...this.targetedRefreshPaths, ...selected])];
       const statOf = (file: string) => {
         try {
-          return fileRevisionOf(
-            file.endsWith('.jsonl.zst') ? rolloutStat(file, { bigint: true }, fs) : fs.statSync(file, { bigint: true }),
-          );
+          return fileRevisionOf(fs.statSync(file, { bigint: true }));
         } catch {
           return null;
         }
@@ -12352,11 +12244,7 @@ export class PanelProvider implements vscode.Disposable {
           ? [...this.catalog.sessions]
           : revalidatedCatalog(this.catalog.sessions, this.showing, (file) => {
               try {
-                return fileRevisionOf(
-                  file.endsWith('.jsonl.zst')
-                    ? rolloutStat(file, { bigint: true }, fs)
-                    : fs.statSync(file, { bigint: true }),
-                );
+                return fileRevisionOf(fs.statSync(file, { bigint: true }));
               } catch {
                 selectedFileGone = true;
                 return null;
@@ -12482,22 +12370,13 @@ export class PanelProvider implements vscode.Disposable {
       (file) => {
         if (collides('codex', file)) {
           const opening = readQualifiedCodexOpening(file);
-          const stat = readRolloutStat(file);
-          if (
-            opening &&
-            stat &&
-            stat.isFile &&
-            stat.dev === opening.revision.dev &&
-            stat.ino === opening.revision.ino &&
-            stat.mtimeMs === opening.revision.mtimeMs
-          ) {
-            const revision = { ...opening.revision, size: stat.size };
+          if (opening) {
             const source: SessionFile = {
               agent: 'codex',
               file,
               sessionId: opening.value.sessionId!,
               cwd: opening.value.cwd!,
-              ...revision,
+              ...opening.revision,
             };
             this.codexMetas.install(file, opening.value);
             this.codexStats.delete(file);
@@ -12507,7 +12386,7 @@ export class PanelProvider implements vscode.Disposable {
               excluded: !inRoots(source.cwd!),
               hidden: isHiddenThread(opening.value),
             });
-            qualifiedCodexStats.set(file, { ...revision, isFile: true });
+            qualifiedCodexStats.set(file, { ...opening.revision, isFile: true });
             return opening.value;
           }
         }
@@ -13285,11 +13164,7 @@ export class PanelProvider implements vscode.Disposable {
       let revision;
       this.performanceCounters?.recordWork(`humanPromptStat:${cause}`);
       try {
-        revision = fileRevisionOf(
-          session.file.endsWith('.jsonl.zst')
-            ? rolloutStat(session.file, { bigint: true }, fs)
-            : fs.statSync(session.file, { bigint: true }),
-        );
+        revision = fileRevisionOf(fs.statSync(session.file, { bigint: true }));
       } catch {
         this.enumeratedAdmissionComplete = false;
         work.unknown.add(session.file);
@@ -13336,11 +13211,7 @@ export class PanelProvider implements vscode.Disposable {
         }
         work.sources++;
         this.performanceCounters?.recordWork(`humanPromptStat:${cause}`);
-        const current = fileRevisionOf(
-          session.file.endsWith('.jsonl.zst')
-            ? rolloutStat(session.file, { bigint: true }, fs)
-            : fs.statSync(session.file, { bigint: true }),
-        );
+        const current = fileRevisionOf(fs.statSync(session.file, { bigint: true }));
         if (!currentRefresh()) return [];
         if (
           revision.dev !== current.dev ||
@@ -13385,9 +13256,7 @@ export class PanelProvider implements vscode.Disposable {
     let size = session.size;
     if (!sizeCurrent) {
       try {
-        size = (
-          session.file.endsWith('.jsonl.zst') ? rolloutStat(session.file, undefined, fs) : fs.statSync(session.file)
-        ).size;
+        size = fs.statSync(session.file).size;
       } catch {
         return false;
       }
@@ -15042,11 +14911,7 @@ export class PanelProvider implements vscode.Disposable {
   // Read current file identity and revision for stale-result and cursor checks.
   private revisionOf(session: SessionFile): FileRevision {
     try {
-      return fileRevisionOf(
-        session.file.endsWith('.jsonl.zst')
-          ? rolloutStat(session.file, { bigint: true }, fs)
-          : fs.statSync(session.file, { bigint: true }),
-      );
+      return fileRevisionOf(fs.statSync(session.file, { bigint: true }));
     } catch {
       return { size: -1, mtimeMs: -1, dev: -1, ino: -1 };
     }
@@ -15797,7 +15662,6 @@ export class PanelProvider implements vscode.Disposable {
 
   // The results of one search query, posted to the panel.
   private answerSearch(query: string, retained = false): void {
-    this.rolloutSearch = retained ? null : query;
     // Retained matching admits cached files from the accepted scoped catalog without revalidating files.
     const repository = retained ? this.repositoryScope.snapshot(this.folders()) : null;
     const roots = JSON.stringify(repository?.roots ?? []);
@@ -15866,7 +15730,6 @@ export class PanelProvider implements vscode.Disposable {
         out.push(...held.entries);
         continue;
       }
-      if (session.file.endsWith('.jsonl.zst') && !rolloutSourceReady(session.file)) continue;
       // Search has a separate read window and cache so it does not replace selected-session reads.
       const read =
         session.agent === 'codex'
@@ -16601,7 +16464,6 @@ export class PanelProvider implements vscode.Disposable {
         search: (msg) => {
           const query = msg.text;
           this.waitingSearch = null;
-          this.rolloutSearch = null;
           if (!isSearch(query)) {
             void this.post({ type: 'results', query, hits: null, scope: 'workspace' });
             return;
@@ -16896,7 +16758,6 @@ export function registerPanel(
   observeDiagnostics?: (diagnostics: DiagnosticsLog) => void,
 ): PanelProvider {
   const output = vscode.window.createOutputChannel('Arc');
-  setRolloutLogger((message) => output.appendLine(message));
   output.appendLine(
     `Arc reads Claude sessions from ${projectsRoot()}. Arc reads Codex sessions from ${codexSessionsRoot()}.`,
   );
@@ -16941,7 +16802,6 @@ export function registerPanel(
     path.join(workspaceCache.root, 'derived-session-cache.json'),
   );
   context.subscriptions.push(
-    { dispose: onRolloutReady((file) => provider.rolloutReady(file)) },
     provider,
     vscode.workspace.registerTextDocumentContentProvider(PATCH_SCHEME, {
       provideTextDocumentContent: (uri) => provider.patches.get(uri.toString()) ?? '',
