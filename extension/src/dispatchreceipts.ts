@@ -18,8 +18,10 @@ const EVENT_BYTES = JSON_BYTES - 20 * 1024;
 const STATUS_BYTES = JSON_BYTES - 4096;
 const REPORT_BYTES = 8 * 1024 * 1024;
 const CAPTURE_SLICE_BYTES = 64 * 1024;
-// A full queue of unpublished slices stays well inside the checkpoint read allowance.
+// The checkpoint holds this many unpublished slices, well inside its read allowance. Later boundaries wait in the queue file.
 const PENDING_SLICES = 256;
+// Each boundary in the queue file is one fixed-width JSON line.
+const QUEUE_RECORD_BYTES = 128;
 const OWNER = /^[A-Za-z0-9_.:-]{1,128}$/;
 const TOKEN = /^[a-f0-9]{64}$/;
 type FileIdentity = { dev: string; ino: string };
@@ -32,10 +34,14 @@ interface CaptureState {
   bytes: number;
   sources: Partial<Record<CaptureSource, CaptureCursor>>;
 }
+type PendingSlice = CaptureCursor & { name: 'stdout.log' | 'stderr.log' };
 type SourceCaptureState = CaptureState & {
   sourceFiles: true;
   // Unpublished channel slices in arrival order. The first slice is the one in publication.
-  pending?: (CaptureCursor & { name: 'stdout.log' | 'stderr.log' })[];
+  pending?: PendingSlice[];
+  // Slices past the checkpoint allowance follow `pending` in `capture-queue.log` from `read` to `end`, then `tail`.
+  // `ends` holds the last position of each channel in the queue file.
+  spill?: { read: number; end: number; ends: Partial<Record<PendingSlice['name'], number>>; tail: PendingSlice };
 };
 export type DispatchOutcome = 'running' | 'succeeded' | 'failed' | 'interrupted' | 'needs-input' | 'unknown';
 export interface DispatchLaunch {
@@ -854,16 +860,45 @@ export class DispatchReceipts {
       safePath(marker);
       if (!equalIdentity(state.raw, identity(marker))) throw new Error('The captured worker output was replaced.');
       const sources = Object.entries(state.sources);
+      const ends: Partial<Record<CaptureSource, number>> = {};
       if (state.pending !== undefined) {
         if (!Array.isArray(state.pending) || !state.pending.length)
           throw new Error('The saved log position is unavailable.');
-        const ends: Partial<Record<CaptureSource, number>> = {};
         for (const slice of state.pending) {
           if (slice.offset <= (ends[slice.name] ?? state.sources[slice.name]?.offset ?? 0))
             throw new Error('The saved log position is unavailable.');
           ends[slice.name] = slice.offset;
           sources.push([slice.name, slice]);
         }
+      }
+      if (state.spill !== undefined) {
+        const { read, end, ends: spilled, tail } = state.spill;
+        if (
+          !state.pending ||
+          !Number.isSafeInteger(read) ||
+          !Number.isSafeInteger(end) ||
+          read < 0 ||
+          end < read ||
+          read % QUEUE_RECORD_BYTES ||
+          end % QUEUE_RECORD_BYTES ||
+          typeof spilled !== 'object' ||
+          !spilled ||
+          !tail
+        )
+          throw new Error('The saved log position is unavailable.');
+        // Records already moved into `pending` can share their channel's last position with it.
+        for (const [name, offset] of Object.entries(spilled) as [CaptureSource, number][]) {
+          if (
+            (name !== 'stdout.log' && name !== 'stderr.log') ||
+            !Number.isSafeInteger(offset) ||
+            offset < (ends[name] ?? state.sources[name]?.offset ?? 0)
+          )
+            throw new Error('The saved log position is unavailable.');
+          ends[name] = offset;
+        }
+        if (tail.offset <= (ends[tail.name] ?? state.sources[tail.name]?.offset ?? 0))
+          throw new Error('The saved log position is unavailable.');
+        sources.push([tail.name, tail]);
       }
       // Each channel is read once, however many queued slices it has.
       const stats = new Map<string, fs.BigIntStats>();
@@ -927,6 +962,83 @@ export class DispatchReceipts {
         throw error;
       }
     };
+    const queueFile = this.file(id, 'capture-queue.log');
+    const openQueue = (flags: number) => {
+      safePath(path.dirname(queueFile));
+      if (fs.existsSync(queueFile)) safePath(queueFile);
+      const fd = fs.openSync(queueFile, flags | (fs.constants.O_NOFOLLOW ?? 0), 0o600);
+      if (!fs.fstatSync(fd).isFile()) {
+        fs.closeSync(fd);
+        throw new Error('The saved log position is unavailable.');
+      }
+      return fd;
+    };
+    const queuedEnd = (state: SourceCaptureState, name: PendingSlice['name']) => {
+      let offset = state.sources[name]?.offset ?? 0;
+      for (const slice of state.pending ?? []) if (slice.name === name) offset = slice.offset;
+      if (state.spill) offset = Math.max(offset, state.spill.ends[name] ?? 0);
+      return state.spill?.tail.name === name ? state.spill.tail.offset : offset;
+    };
+    // A boundary in the last slice's channel extends that slice. Other boundaries start a slice.
+    const enqueue = (state: SourceCaptureState, slice: PendingSlice) => {
+      const pending = state.pending!;
+      const spill = state.spill;
+      const last = pending[pending.length - 1];
+      if (spill?.tail.name === slice.name) spill.tail.offset = slice.offset;
+      else if (spill) {
+        // This write replaces any record that a failed checkpoint save left past `end`.
+        const record = Buffer.from(`${JSON.stringify(spill.tail).padEnd(QUEUE_RECORD_BYTES - 1)}\n`);
+        if (record.length !== QUEUE_RECORD_BYTES) throw new Error('The saved log position is unavailable.');
+        const fd = openQueue(
+          fs.constants.O_WRONLY | fs.constants.O_CREAT | (spill.end === 0 ? fs.constants.O_TRUNC : 0),
+        );
+        try {
+          for (let written = 0; written < record.length;) {
+            const count = fs.writeSync(fd, record, written, record.length - written, spill.end + written);
+            if (!count) throw new Error('The saved log position is unavailable.');
+            written += count;
+          }
+        } finally {
+          fs.closeSync(fd);
+        }
+        spill.ends[spill.tail.name] = spill.tail.offset;
+        spill.end += QUEUE_RECORD_BYTES;
+        spill.tail = { ...slice };
+      } else if (pending.length > 1 && last.name === slice.name) last.offset = slice.offset;
+      else if (pending.length < PENDING_SLICES) pending.push({ ...slice });
+      else state.spill = { read: 0, end: 0, ends: {}, tail: { ...slice } };
+    };
+    // Queue file records move into the checkpoint as its slices publish, and the tail follows the last record.
+    const refill = (state: SourceCaptureState) => {
+      const spill = state.spill;
+      if (!spill) return;
+      const pending = (state.pending ??= []);
+      const count = Math.min(PENDING_SLICES - pending.length, (spill.end - spill.read) / QUEUE_RECORD_BYTES);
+      if (count > 0) {
+        const buffer = Buffer.alloc(count * QUEUE_RECORD_BYTES);
+        const fd = openQueue(fs.constants.O_RDONLY);
+        try {
+          for (let read = 0; read < buffer.length;) {
+            const bytes = fs.readSync(fd, buffer, read, buffer.length - read, spill.read + read);
+            if (!bytes) throw new Error('The saved log position is unavailable.');
+            read += bytes;
+          }
+        } finally {
+          fs.closeSync(fd);
+        }
+        for (let index = 0; index < count; index++)
+          pending.push(
+            JSON.parse(buffer.toString('utf8', index * QUEUE_RECORD_BYTES, (index + 1) * QUEUE_RECORD_BYTES)),
+          );
+        spill.read += count * QUEUE_RECORD_BYTES;
+      }
+      if (spill.read === spill.end && pending.length < PENDING_SLICES) {
+        pending.push(spill.tail);
+        delete state.spill;
+      }
+    };
+    // Boundaries that a failed checkpoint save did not keep, in arrival order. The next deferral saves them first.
+    let held: PendingSlice[] = [];
     return {
       delivered: () => load().aliasBytes ?? 0,
       pendingSources: () => load().pending ?? [],
@@ -938,29 +1050,43 @@ export class DispatchReceipts {
           id,
           () => {
             const state = load();
-            if (!state.pending) return;
-            let changed = false;
+            if (!state.pending) {
+              held = [];
+              return;
+            }
+            const stats = new Map<string, fs.BigIntStats>();
+            const source = (name: PendingSlice['name']) => {
+              let stat = stats.get(name);
+              if (!stat) {
+                const file = this.artifact(id, name);
+                safePath(file);
+                stat = fs.statSync(file, { bigint: true });
+                const committed = state.sources[name];
+                if (!stat.isFile() || (committed && committed.identity !== `${stat.dev}:${stat.ino}`))
+                  throw new Error('The original worker output was replaced or truncated.');
+                stats.set(name, stat);
+              }
+              return stat;
+            };
+            const boundaries = held.filter((slice) => slice.offset > queuedEnd(state, slice.name));
+            for (const slice of boundaries) {
+              const stat = source(slice.name);
+              if (slice.identity !== `${stat.dev}:${stat.ino}`)
+                throw new Error('The original worker output was replaced or truncated.');
+            }
             for (const [name, limit, end = Infinity] of limits) {
               if (limit <= 0) continue;
-              const file = this.artifact(id, name);
-              safePath(file);
-              const stat = fs.statSync(file, { bigint: true });
-              const source = `${stat.dev}:${stat.ino}`;
-              const committed = state.sources[name];
-              if (!stat.isFile() || (committed && committed.identity !== source))
-                throw new Error('The original worker output was replaced or truncated.');
-              let queued = committed?.offset ?? 0;
-              for (const slice of state.pending) if (slice.name === name) queued = slice.offset;
+              const stat = source(name);
+              let queued = queuedEnd(state, name);
+              for (const slice of boundaries) if (slice.name === name) queued = Math.max(queued, slice.offset);
               const offset = Math.min(Number(stat.size), queued + limit, end);
-              if (offset <= queued) continue;
-              const last = state.pending[state.pending.length - 1];
-              if (state.pending.length > 1 && last.name === name) last.offset = offset;
-              // Output behind a full queue follows it in standard channel order.
-              else if (state.pending.length < PENDING_SLICES) state.pending.push({ name, offset, identity: source });
-              else continue;
-              changed = true;
+              if (offset > queued) boundaries.push({ name, offset, identity: `${stat.dev}:${stat.ino}` });
             }
-            if (changed) save(state);
+            held = boundaries;
+            if (!boundaries.length) return;
+            for (const slice of boundaries) enqueue(state, slice);
+            save(state);
+            held = [];
           },
           'capture-write',
         ),
@@ -1019,7 +1145,10 @@ export class DispatchReceipts {
             }
             state.bytes += bytes.length;
             state.sources[name] = { ...cursor };
-            if (cursor.offset === queue[0].offset) queue.shift();
+            if (cursor.offset === queue[0].offset) {
+              queue.shift();
+              refill(state);
+            }
             if (!queue.length) delete state.pending;
             save(state);
           },

@@ -512,6 +512,48 @@ test.each(['complete', 'budget', 'denied', 'transient', 'busy', 'busy-budget', '
   },
 );
 
+test(
+  'frozen-clock capture close reports incomplete output when a queued slice exceeds its allowance',
+  { tags: ['subprocess'] },
+  async () => {
+    const { receipts, launch } = workerFixture('', 24 * 60 * 60 * 1000, false, true);
+    const id = launch.launchId;
+    const stdout = Buffer.from(outputFrames());
+    const stderr = Buffer.alloc(700, 255);
+    stoppedOutput(receipts, id, stdout, stderr);
+    const alias = launch.standalone!.logAlias!;
+    let blocked = true;
+    denyOpen(alias, () => blocked);
+    // An earlier alias outage queued all of stderr behind stdout.
+    const seed = receipts.capture(id, 64 * 1024, true);
+    try {
+      const stat = fs.statSync(receipts.artifact(id, 'stdout.log'), { bigint: true });
+      const cursor = { offset: stdout.length, identity: `${stat.dev}:${stat.ino}` };
+      assert.throws(() => seed.write(stdout, 'stdout.log', cursor), /temporarily unavailable/);
+      seed.defer([['stderr.log', stderr.length]]);
+    } finally {
+      seed.close();
+    }
+    blocked = false;
+    let yields = 0;
+    const bounds = { frameBytes: 1024, readBytes: 64 * 1024, workBytes: 512 };
+    const status = (await superviseStandalone(receipts, id, true, bounds, {
+      now: () => 0,
+      identity: async () => null,
+      yield: async () => {
+        // A close that keeps waiting ends here and fails the yield count below.
+        if (++yields > 32) throw new Error('Capture exceeded finite yields.');
+      },
+    })) as any;
+    assert.ok(yields <= 32, 'Capture exceeded finite yields.');
+    assert.equal(status.observation.monitor, 'timed-out');
+    const cursor = artifactJson(receipts, id, 'capture.json');
+    assert.equal(cursor.sources['stdout.log'].offset, stdout.length);
+    assert.equal(cursor.sources['stderr.log'].offset, bounds.workBytes);
+    assert.equal(fs.readFileSync(alias).equals(Buffer.concat([stdout, stderr.subarray(0, bounds.workBytes)])), true);
+  },
+);
+
 test('source capture retries the pending slice before standard channel order after an alias failure', async () => {
   vi.useFakeTimers({ toFake: ['setTimeout', 'setImmediate'] });
   vi.spyOn(Date, 'now').mockReturnValue(0);
@@ -691,6 +733,156 @@ test('source producer retries a transient checkpoint failure while it queues out
   assert.equal(fs.readFileSync(alias, 'utf8'), 'A\ne\nB\nf\n');
   assert.equal(artifactJson(receipts, id, 'output-owner.json').state, 'finished');
 });
+
+test.each(['queued output', 'failed publication'] as const)(
+  'source producer keeps channel boundaries when a checkpoint save fails after %s',
+  async (mode) => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'setImmediate'] });
+    vi.spyOn(Date, 'now').mockReturnValue(0);
+    if (process.send) vi.spyOn(process, 'send').mockImplementation(() => true);
+    vi.spyOn(process, 'disconnect').mockImplementation(() => {});
+    const child = providerChild();
+    vi.mocked(childProcess.spawn).mockReturnValue(child);
+    const { receipts, launch } = workerFixture('', 100, false, true);
+    const id = launch.launchId;
+    const stdout = receipts.artifact(id, 'stdout.log');
+    const stderr = receipts.artifact(id, 'stderr.log');
+    fs.writeFileSync(stdout, '');
+    fs.writeFileSync(stderr, '');
+    const alias = launch.standalone!.logAlias!;
+    let blocked = false;
+    denyOpen(alias, () => blocked);
+    const checkpoint = receipts.artifact(id, 'capture.json');
+    // Checkpoint saves reach the file system through the module's default export.
+    const shared: typeof fs = createRequire(import.meta.url)('node:fs');
+    const write = shared.writeFileSync;
+    let saves = 0;
+    let failAt = 0;
+    vi.spyOn(shared, 'writeFileSync').mockImplementation((file, ...args) => {
+      if (failAt && String(file).startsWith(`${checkpoint}.`) && ++saves === failAt)
+        throw Object.assign(new Error('Checkpoint unavailable'), { code: 'EACCES' });
+      return Reflect.apply(write, shared, [file, ...args]);
+    });
+    const running = produceStandaloneOutput(receipts, id);
+    await vi.advanceTimersByTimeAsync(0);
+    child.emit('spawn');
+    fs.appendFileSync(stdout, 'A\n');
+    fs.appendFileSync(stderr, 'e\n');
+    blocked = true;
+    // The first save keeps the stdout slice. The second queues stderr behind it after the alias open fails.
+    if (mode === 'failed publication') failAt = 2;
+    await vi.advanceTimersByTimeAsync(50);
+    fs.appendFileSync(stdout, 'B\n');
+    fs.appendFileSync(stderr, 'f\n');
+    let expected = 'A\ne\nB\nf\n';
+    if (mode === 'queued output') {
+      failAt = 1;
+      await vi.advanceTimersByTimeAsync(50);
+      fs.appendFileSync(stdout, 'C\n');
+      fs.appendFileSync(stderr, 'g\n');
+      expected += 'C\ng\n';
+    }
+    assert.equal(saves, failAt);
+    const owner = artifactJson(receipts, id, 'output-owner.json');
+    assert.equal(owner.state, 'capturing', owner.reason);
+    blocked = false;
+    child.emit('close', 0, null);
+    await vi.runAllTimersAsync();
+    await running;
+    assert.equal(fs.readFileSync(alias, 'utf8'), expected);
+    assert.equal(artifactJson(receipts, id, 'output-owner.json').state, 'finished');
+  },
+);
+
+test.each(['the checkpoint queue', 'the checkpoint read allowance'] as const)(
+  'source producer keeps arrival order and a readable checkpoint through an alias outage that fills %s',
+  async (filled) => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'setImmediate'] });
+    vi.spyOn(Date, 'now').mockReturnValue(0);
+    if (process.send) vi.spyOn(process, 'send').mockImplementation(() => true);
+    vi.spyOn(process, 'disconnect').mockImplementation(() => {});
+    const child = providerChild();
+    vi.mocked(childProcess.spawn).mockReturnValue(child);
+    const { receipts, launch } = workerFixture('', 100, false, true);
+    const id = launch.launchId;
+    const stdout = receipts.artifact(id, 'stdout.log');
+    const stderr = receipts.artifact(id, 'stderr.log');
+    fs.writeFileSync(stdout, 'A\n');
+    fs.writeFileSync(stderr, 'e\n');
+    const alias = launch.standalone!.logAlias!;
+    let blocked = true;
+    denyOpen(alias, () => blocked);
+    const checkpoint = receipts.artifact(id, 'capture.json');
+    let expected = 'A\ne\n';
+    let count = 0;
+    const interval = () => {
+      count++;
+      fs.appendFileSync(stdout, `${count}\n`);
+      fs.appendFileSync(stderr, `e${count}\n`);
+      expected += `${count}\ne${count}\n`;
+    };
+    const identity = (file: string) => {
+      const stat = fs.statSync(file, { bigint: true });
+      return `${stat.dev}:${stat.ino}`;
+    };
+    const seed = receipts.capture(id, 64 * 1024, true);
+    try {
+      assert.throws(
+        () => seed.write(Buffer.from('A\n'), 'stdout.log', { offset: 2, identity: identity(stdout) }),
+        /temporarily unavailable/,
+      );
+    } finally {
+      seed.close();
+    }
+    // An earlier part of the outage queued alternating slices of both channels.
+    const state = artifactJson(receipts, id, 'capture.json');
+    const slice = (name: 'stdout.log' | 'stderr.log') => ({
+      name,
+      offset: fs.statSync(receipts.artifact(id, name)).size,
+      identity: identity(receipts.artifact(id, name)),
+    });
+    state.pending.push(slice('stderr.log'));
+    const size = JSON.stringify(slice('stdout.log')).length + 1;
+    while (
+      filled === 'the checkpoint queue'
+        ? state.pending.length < 256
+        : JSON.stringify(state).length < 48 * 1024 - 4 * size
+    ) {
+      interval();
+      state.pending.push(slice('stdout.log'), slice('stderr.log'));
+    }
+    fs.writeFileSync(checkpoint, JSON.stringify(state));
+    const running = produceStandaloneOutput(receipts, id);
+    await vi.advanceTimersByTimeAsync(0);
+    child.emit('spawn');
+    for (let live = 0; live < 4; live++) {
+      interval();
+      await vi.advanceTimersByTimeAsync(50);
+    }
+    const owner = artifactJson(receipts, id, 'output-owner.json');
+    assert.equal(owner.state, 'capturing', owner.reason);
+    assert.ok(fs.statSync(checkpoint).size < 48 * 1024);
+    // A queue at the read allowance publishes one slice at a time, so that case ends during the outage.
+    if (filled === 'the checkpoint read allowance') {
+      child.emit('close', 0, null);
+      await vi.runAllTimersAsync();
+      await running;
+      assert.equal(fs.statSync(alias).size, 0);
+      assert.equal(
+        artifactJson(receipts, id, 'output-owner.json').reason,
+        'Error: The requested log is incomplete. Private output remains available.',
+      );
+      return;
+    }
+    blocked = false;
+    child.emit('close', 0, null);
+    await vi.runAllTimersAsync();
+    await running;
+    assert.equal(fs.readFileSync(alias, 'utf8'), expected);
+    assert.equal(artifactJson(receipts, id, 'output-owner.json').state, 'finished');
+    assert.equal(artifactJson(receipts, id, 'capture.json').pending, undefined);
+  },
+);
 
 test.each(['truncated', 'redirected'] as const)(
   'source producer retains capture and worker exit after a %s alias',

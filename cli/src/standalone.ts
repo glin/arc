@@ -1560,14 +1560,10 @@ function logCapture(receipts: DispatchReceipts, id: string, bounds: ReadBounds) 
             : [[source.name, remaining[index], index === from ? failedEnd : Infinity] as const],
         ),
       );
-    if (capture.pendingSources().length) queue(0);
-    const ordered = capture
-      .pendingSources()
-      .map((slice): [number, number] => [sources.findIndex((source) => source.name === slice.name), slice.offset]);
-    ordered.push(...sources.map((_, index): [number, number] => [index, Infinity]));
-    for (const [index, end] of ordered) {
+    // Publishes one channel up to `end`. False means that publication stays pending.
+    const publish = (index: number, end: number) => {
       const source = sources[index];
-      if (!fs.existsSync(source.file)) continue;
+      if (!fs.existsSync(source.file)) return true;
       const size = fs.statSync(source.file).size;
       try {
         source.cursor = capture.cursor(source.name);
@@ -1584,14 +1580,37 @@ function logCapture(receipts: DispatchReceipts, id: string, bounds: ReadBounds) 
         queue(index, size);
         return false;
       }
-      // Later output stays behind a queued slice that this flush could not finish.
-      if (end !== Infinity && source.cursor.offset < end) break;
-    }
-    const aliasPending = capture.flushAlias();
-    return !aliasPending && sourceComplete();
+      return true;
+    };
+    const finish = () => !capture.flushAlias() && sourceComplete();
+    if (capture.pendingSources().length) queue(0);
+    // The checkpoint lists a bounded window of the queue. A finished window lists the next one.
+    for (let window = capture.pendingSources(); window.length; window = capture.pendingSources())
+      for (const slice of window) {
+        const index = sources.findIndex((source) => source.name === slice.name);
+        if (!publish(index, slice.offset)) return false;
+        // Later output stays behind a queued slice that this flush could not finish.
+        if (sources[index].cursor.offset < slice.offset) return finish();
+      }
+    for (const index of sources.keys()) if (!publish(index, Infinity)) return false;
+    return finish();
   };
   const queued = () => capture.pendingSources().length > 0;
-  return { native: capture.native, flush, sourceComplete, sourceAllowance, progress, queued, close: capture.close };
+  // A channel with output left past its allowance cannot finish this drain.
+  const exhausted = (allowance: number[]) =>
+    sources.some(
+      (source, index) => allowance[index] <= 0 && capture.cursor(source.name).offset < fs.statSync(source.file).size,
+    );
+  return {
+    native: capture.native,
+    flush,
+    sourceComplete,
+    sourceAllowance,
+    progress,
+    queued,
+    exhausted,
+    close: capture.close,
+  };
 }
 
 function liveLogCapture(receipts: DispatchReceipts, id: string, bounds: ReadBounds) {
@@ -1617,7 +1636,7 @@ function liveLogCapture(receipts: DispatchReceipts, id: string, bounds: ReadBoun
           try {
             const before = capture.progress();
             if (capture.flush(capture.sourceComplete() ? 0 : bytes, allowance)) return true;
-            if (!capture.sourceComplete() && !capture.queued()) return false;
+            if (!capture.sourceComplete() && (!capture.queued() || capture.exhausted(allowance))) return false;
             stalled = capture.progress() <= before;
           } catch (error) {
             if (!captureWriteBusy(error)) return false;

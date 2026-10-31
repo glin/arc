@@ -1700,66 +1700,26 @@ test.each(['alias open', 'checkpoint', 'short write'] as const)(
   },
 );
 
-test('source file capture keeps its checkpoint readable through a long alias outage with alternating output', () => {
+test('source file capture keeps its alias through an unrelated error that carries the redirect message', () => {
   const { receipts, standalone } = standaloneFixture();
   const id = standalone.launchId;
   const alias = standalone.standalone!.logAlias!;
   const capture = receipts.capture(id, 3, true);
-  const open = fs.openSync;
-  const opening = vi.spyOn(fs, 'openSync').mockImplementation((file, ...args) => {
-    if (String(file) === alias) throw Object.assign(new Error('alias busy'), { code: 'EPERM' });
-    return (open as any)(file, ...args);
-  });
-  syncBuiltinESMExports();
+  const slice = sourceSlice(receipts, id, 'stdout.log', 'abc');
+  const realpath = fs.realpathSync.native;
+  const failure = vi.spyOn(fs.realpathSync, 'native').mockImplementation(((file: fs.PathLike, ...args: any[]) => {
+    if (String(file) === path.dirname(alias)) throw new Error('The dispatch path is redirected.');
+    return (realpath as any)(file, ...args);
+  }) as typeof fs.realpathSync.native);
   try {
-    const first = sourceSlice(receipts, id, 'stdout.log', 'A');
-    assert.throws(() => capture.write(first.bytes, 'stdout.log', first.cursor), /unavailable/);
-    // A long outage already queued alternating one-byte intervals to just inside the checkpoint read allowance.
-    const checkpoint = receipts.artifact(id, 'capture.json');
-    const state = JSON.parse(fs.readFileSync(checkpoint, 'utf8'));
-    const stderr = sourceSlice(receipts, id, 'stderr.log', '');
-    const slice = JSON.stringify(state.pending[0]).length + 1;
-    let intervals = 0;
-    while (JSON.stringify(state).length < 48 * 1024 - 4 * slice) {
-      intervals++;
-      state.pending.push({ name: 'stderr.log', offset: intervals, identity: stderr.cursor.identity });
-      state.pending.push({ name: 'stdout.log', offset: intervals + 1, identity: first.cursor.identity });
-    }
-    sourceSlice(receipts, id, 'stderr.log', 'e'.repeat(intervals));
-    sourceSlice(receipts, id, 'stdout.log', 'o'.repeat(intervals));
-    fs.writeFileSync(checkpoint, JSON.stringify(state));
-    for (let interval = 0; interval < 4; interval++) {
-      sourceSlice(receipts, id, 'stderr.log', 'e');
-      sourceSlice(receipts, id, 'stdout.log', 'o');
-      capture.defer([
-        ['stdout.log', 1],
-        ['stderr.log', 1],
-      ]);
-    }
+    assert.throws(() => capture.write(slice.bytes, 'stdout.log', slice.cursor), /temporarily unavailable/);
+    failure.mockRestore();
+    capture.write(slice.bytes, 'stdout.log', slice.cursor);
+    assert.equal(fs.readFileSync(alias, 'utf8'), 'abc');
+    assert.equal(capture.delivered(), 3);
   } finally {
-    opening.mockRestore();
-    syncBuiltinESMExports();
+    failure.mockRestore();
     capture.close();
-  }
-  const resumed = receipts.capture(id, 3, true);
-  try {
-    assert.deepEqual(
-      resumed
-        .pendingSources()
-        .slice(0, 4)
-        .map((slice) => [slice.name, slice.offset]),
-      [
-        ['stdout.log', 1],
-        ['stderr.log', 1],
-        ['stdout.log', 2],
-        ['stderr.log', 2],
-      ],
-    );
-    const head = resumed.pendingSources()[0];
-    resumed.write(Buffer.from('A'), 'stdout.log', { offset: head.offset, identity: head.identity });
-    assert.equal(fs.readFileSync(alias, 'utf8'), 'A');
-  } finally {
-    resumed.close();
   }
 });
 
