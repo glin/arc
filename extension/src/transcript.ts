@@ -4495,8 +4495,8 @@ export class RelationshipReader {
   // cancellation, or budget before the anchor, the evidence also keeps the stamp of its checks and the first mark that no
   // check matched. The next quantum starts there when the file keeps that stamp or grew from it, and the reader sees no growth.
   // It checks the earlier marks again after the anchor while its allowance lasts. A shrink, a same-size change, or a changed
-  // identity starts at the first mark. Only acceptance or a replacement under the mark limit removes a mark. A missing or
-  // mismatched anchor needs the whole prefix.
+  // identity starts at the first mark. Only acceptance, a replacement under the mark limit, a mismatch, or the fall back to a
+  // whole-prefix comparison removes a mark. A missing or mismatched anchor needs the whole prefix.
   private anchored(evidence: RelationshipEvidence): 'match' | 'pending' | 'compare' {
     if (evidence.anchor === undefined || evidence.offset < RELATIONSHIP_BLOCK_BYTES) return 'compare';
     const kept = (evidence.marks ?? []).filter((mark) => mark.offset < evidence.offset);
