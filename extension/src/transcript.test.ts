@@ -536,6 +536,58 @@ test('Claude kept marks that exceed a later allowance complete over several quan
   );
 });
 
+for (const stop of ['its budget', 'its deadline', 'cancellation'] as const)
+  test(`Claude kept mark that a check matched before it stopped at ${stop} still finds a rewrite with an append`, async () => {
+    let clock = 0;
+    vi.spyOn(performance, 'now').mockImplementation(() => clock);
+    const { parent, old, ends, meter } = growthPointTranscript();
+    const first = await scanClaudeRelationshipQuantum(parent, undefined, 16 * 1024 * 1024, undefined, meter);
+    assert.equal(first.complete, true);
+    fs.appendFileSync(parent.file, '{"type":"ignored"}\n');
+    // The check of the grown file matches the first kept mark and stops before the second. A budget stop needs only a small
+    // allowance. A deadline or cancellation stops only a later pass, so the first check read sees an append.
+    const controller = new AbortController();
+    let checks = 0;
+    const stopping = {
+      readBytes: 0,
+      onRead: () => {
+        checks++;
+        if (stop !== 'its budget' && checks === 1) fs.appendFileSync(parent.file, '{"type":"ignored"}\n');
+        if (stop === 'its deadline' && checks === 2) clock = 1_000;
+        if (stop === 'cancellation' && checks === 2) controller.abort();
+      },
+    };
+    const pending = await scanClaudeRelationshipQuantum(
+      parent,
+      JSON.parse(JSON.stringify(first.cursor)),
+      stop === 'its budget' ? 6 * 1024 : 16 * 1024 * 1024,
+      controller.signal,
+      stopping,
+    );
+    assert.equal(pending.qualified, false);
+    assert.equal(checks, stop === 'its budget' ? 1 : 2, 'the check did not stop after its first kept mark');
+    // The writer rewrites the child and one byte in the final block before the matched mark, then appends.
+    const fd = fs.openSync(parent.file, 'r+');
+    try {
+      const changed = old.lastIndexOf('y', ends[0] - 100);
+      assert.ok(old.indexOf('child-a') < ends[0] - 8192 && changed >= ends[0] - 4096);
+      fs.writeSync(fd, 'child-b', old.indexOf('child-a'));
+      fs.writeSync(fd, 'z', changed);
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.appendFileSync(parent.file, '{"type":"ignored"}\n');
+    const published: string[][] = [];
+    let scan = pending;
+    for (let pass = 0; pass < 8; pass++) {
+      scan = await scanClaudeRelationshipQuantum(parent, JSON.parse(JSON.stringify(scan.cursor)), 16 * 1024 * 1024);
+      if (scan.complete) published.push(scan.references.map((reference) => reference.sessionId));
+    }
+    assert.ok(published.length, 'the rewritten transcript never completed');
+    for (const references of published)
+      assert.deepEqual(references, ['child-b'], 'a rewrite at a mark that a pending check matched stayed hidden');
+  });
+
 test('Claude scans, rewrite comparisons and terminal continuations read forward when every slice starts past its deadline', async () => {
   // Each reading of the clock lands a full slice after the previous one, so every deadline has passed.
   let clock = 0;

@@ -4114,6 +4114,8 @@ export interface RelationshipEvidence extends RelationshipDigest {
   validation?: { stamp: RelationshipStamp; required: number; digest: RelationshipDigest };
   // The growth points of the latest read. The next quantum checks each of them before it accepts a grown file.
   marks?: RelationshipMark[];
+  // The stamp at which a pending check matched the leading kept marks, and the index of the first mark it did not match.
+  resume?: { stamp: RelationshipStamp; at: number };
 }
 
 // A growth point of a read: its offset, the chain before its final full block, and a hash of the chain and the tail there.
@@ -4193,6 +4195,18 @@ export function validRelationshipEvidence(value: unknown, offset: number): value
           typeof mark.hash === 'string' &&
           /^[0-9a-f]{64}$/.test(mark.hash),
       )
+    )
+  )
+    return false;
+  const resume = value.resume;
+  if (
+    resume !== undefined &&
+    !(
+      object(resume) &&
+      stamp(resume.stamp) &&
+      Number.isSafeInteger(resume.at) &&
+      (resume.at as number) > 0 &&
+      (resume.at as number) <= (marks?.length ?? 0)
     )
   )
     return false;
@@ -4364,15 +4378,17 @@ export class RelationshipReader {
   // as the next quantum would after a read that stopped there. A new grown stamp seen in a pass marks the end of the evidence and
   // starts another pass, so a rewrite that lands during the checks is checked too. The first pass ignores the deadline and
   // cancellation. A later pass that meets either, a mark without the budget for its check, an unstable or short check, or a new
-  // grown stamp in every pass leaves the outcome pending. A pass that stops at the deadline, at cancellation, or at a mark
-  // without the budget saw no new grown stamp, so `checked` counts the leading marks it matched. Every other outcome leaves 0.
-  private passes(evidence: RelationshipDigest): 'match' | 'mismatch' | 'pending' {
+  // grown stamp in every pass leaves the outcome pending. A pass starts at mark `from` while the reader has seen no growth, and
+  // at the first mark after growth. A pass that stops at the deadline, at cancellation, or at a mark without the budget saw no
+  // new grown stamp, so `checked` counts the leading marks matched at the current stamp. Every other outcome leaves 0.
+  private passes(evidence: RelationshipDigest, from = 0): 'match' | 'mismatch' | 'pending' {
     for (let pass = 0; pass < RELATIONSHIP_SETTLE_PASSES; pass++) {
       this.checked = 0;
       this.note(evidence);
       if (!this.check()) return 'pending';
       if (this.moved) continue;
-      for (const mark of this.marks) {
+      this.checked = this.grew ? 0 : from;
+      for (const mark of this.marks.slice(this.checked)) {
         const start = markStart(mark);
         if (start === undefined) return 'mismatch';
         if (pass > 0 && (this.cancelled() || performance.now() >= this.deadline)) return 'pending';
@@ -4407,10 +4423,12 @@ export class RelationshipReader {
       this.stable = false;
       evidence.validation = { stamp: this.stamp, required: evidence.offset, digest: emptyRelationshipDigest() };
       delete evidence.marks;
+      delete evidence.resume;
       return false;
     }
     if (this.marks.length) evidence.marks = this.marks.map((mark) => ({ ...mark }));
     else delete evidence.marks;
+    delete evidence.resume;
     return outcome === 'match';
   }
   *qualifySteps(evidence: RelationshipEvidence): Generator<void, 'match' | 'pending' | 'reset'> {
@@ -4436,6 +4454,7 @@ export class RelationshipReader {
       }
       evidence.validation = { stamp: this.stamp, required: evidence.offset, digest: emptyRelationshipDigest() };
       delete evidence.marks;
+      delete evidence.resume;
     }
     const comparison = evidence.validation;
     while (comparison.digest.offset < comparison.required && !this.grew && this.available() > 0) {
@@ -4460,19 +4479,24 @@ export class RelationshipReader {
     evidence.anchor = comparison.digest.anchor;
     return this.accept(evidence);
   }
-  // Check passes over the marks of the latest read and over the final full block and the tail, at most two blocks each. A
-  // pending outcome keeps the marks for the next quantum, except the leading marks that a pass stopped by its deadline,
-  // cancellation, or budget already matched. The next quantum resumes at the first unchecked mark, so a source completes even
-  // when no allowance covers every mark. A missing or mismatched anchor needs the whole prefix.
+  // Check passes over the marks of the latest read in order, then over the final full block and the tail at the anchor, at most
+  // two blocks each. A pending outcome keeps every mark for the next quantum. When a pass stopped by its deadline,
+  // cancellation, or budget matched leading marks, the evidence also keeps the stamp of those checks and the first mark after
+  // them. The next quantum starts there while the file keeps that stamp and the reader sees no growth, and at the first mark
+  // otherwise. Only acceptance or a replacement under the mark limit removes a mark. A missing or mismatched anchor needs the
+  // whole prefix.
   private anchored(evidence: RelationshipEvidence): 'match' | 'pending' | 'compare' {
     if (evidence.anchor === undefined || evidence.offset < RELATIONSHIP_BLOCK_BYTES) return 'compare';
     const kept = (evidence.marks ?? []).filter((mark) => mark.offset < evidence.offset);
+    const resume = evidence.resume;
     this.marks = [...kept, relationshipMark(evidence)];
-    const outcome = this.passes(evidence);
-    if (outcome === 'pending' && this.checked) {
-      const remaining = kept.slice(this.checked);
-      if (remaining.length) evidence.marks = remaining;
-      else delete evidence.marks;
+    const outcome = this.passes(
+      evidence,
+      resume && sameRelationshipStamp(resume.stamp, this.stamp) ? Math.min(resume.at, kept.length) : 0,
+    );
+    if (outcome === 'pending') {
+      if (this.checked) evidence.resume = { stamp: this.seen ?? this.stamp, at: this.checked };
+      else delete evidence.resume;
     }
     this.marks = [];
     this.markBytes = 0;
@@ -4483,6 +4507,7 @@ export class RelationshipReader {
     evidence.provisional = this.stamp;
     delete evidence.validation;
     delete evidence.marks;
+    delete evidence.resume;
     return 'match';
   }
 }
