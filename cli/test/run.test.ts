@@ -821,6 +821,18 @@ function queueOutage(receipts: DispatchReceipts, id: string, interval: () => voi
   }
   fs.writeFileSync(receipts.artifact(id, 'capture.json'), JSON.stringify(state));
 }
+// Fails the next checkpoint save with `code` when `failing()` is true.
+function failCheckpointSave(receipts: DispatchReceipts, id: string, failing: () => boolean, code: string) {
+  const checkpoint = receipts.artifact(id, 'capture.json');
+  // Checkpoint saves reach the file system through the module's default export.
+  const shared: typeof fs = createRequire(import.meta.url)('node:fs');
+  const write = shared.writeFileSync;
+  vi.spyOn(shared, 'writeFileSync').mockImplementation((file, ...args) => {
+    if (String(file).startsWith(`${checkpoint}.`) && failing())
+      throw Object.assign(new Error('Checkpoint unavailable'), { code });
+    return Reflect.apply(write, shared, [file, ...args]);
+  });
+}
 
 test.each([
   { filled: 'the checkpoint queue', kept: 'arrival order' },
@@ -887,6 +899,97 @@ test.each([
     assert.equal(fs.readFileSync(alias, 'utf8'), expected);
     assert.equal(artifactJson(receipts, id, 'output-owner.json').state, 'finished');
     assert.equal(artifactJson(receipts, id, 'capture.json').pending, undefined);
+  },
+);
+
+test.each(['the checkpoint', 'the queue file'] as const)(
+  'capture recovery keeps arrival order after a producer ends before its checkpoint save, with boundaries in %s',
+  { tags: ['subprocess'] },
+  async (queued) => {
+    const { receipts, launch } = workerFixture('', 100, false, true);
+    const id = launch.launchId;
+    const frames = outputFrames().split(/(?<=\n)/);
+    stoppedOutput(receipts, id, frames[0], 'e\n');
+    const stdout = receipts.artifact(id, 'stdout.log');
+    const stderr = receipts.artifact(id, 'stderr.log');
+    const alias = launch.standalone!.logAlias!;
+    let blocked = true;
+    denyOpen(alias, () => blocked);
+    let expected = `${frames[0]}e\n`;
+    const interval = (out: string, err: string) => {
+      fs.appendFileSync(stdout, out);
+      fs.appendFileSync(stderr, err);
+      expected += out + err;
+    };
+    let count = 0;
+    queueOutage(
+      receipts,
+      id,
+      () => interval(frames[1], `e${++count}\n`),
+      (state) => state.pending.length >= (queued === 'the queue file' ? 256 : 2),
+    );
+    // The producer observes B and f, then ends before its checkpoint names them.
+    let ending = false;
+    failCheckpointSave(receipts, id, () => ending, 'EIO');
+    const producer = receipts.capture(id, 64 * 1024, true);
+    try {
+      interval(frames[1], 'f\n');
+      ending = true;
+      assert.throws(() => producer.defer([['stdout.log', 64 * 1024], ['stderr.log', 64 * 1024]]), /Checkpoint/);
+      ending = false;
+    } finally {
+      producer.close();
+    }
+    interval(frames[2] + frames[3], 'g\n');
+    blocked = false;
+    await superviseStandalone(receipts, id, true, undefined, {
+      now: () => 0,
+      identity: async () => null,
+      yield: async () => {},
+    });
+    // The combined log of the same input keeps each interval's stdout ahead of its stderr.
+    assert.equal(fs.readFileSync(alias, 'utf8'), expected);
+  },
+);
+
+test(
+  'capture recovery keeps the boundaries that another capture failed to save',
+  { tags: ['subprocess'] },
+  async () => {
+    const { receipts, launch } = workerFixture('', 100, false, true);
+    const id = launch.launchId;
+    const frames = outputFrames().split(/(?<=\n)/);
+    stoppedOutput(receipts, id, frames[0], 'e\n');
+    const stdout = receipts.artifact(id, 'stdout.log');
+    const stderr = receipts.artifact(id, 'stderr.log');
+    const alias = launch.standalone!.logAlias!;
+    let blocked = true;
+    denyOpen(alias, () => blocked);
+    queueOutage(receipts, id, () => {}, (state) => state.pending.length >= 2);
+    let failing = false;
+    failCheckpointSave(receipts, id, () => failing, 'EACCES');
+    const producer = receipts.capture(id, 64 * 1024, true);
+    const limits = [['stdout.log', 64 * 1024], ['stderr.log', 64 * 1024]] as const;
+    try {
+      fs.appendFileSync(stdout, frames[1]);
+      fs.appendFileSync(stderr, 'f\n');
+      failing = true;
+      assert.throws(() => producer.defer(limits), /temporarily unavailable/);
+      failing = false;
+      fs.appendFileSync(stdout, frames[2] + frames[3]);
+      fs.appendFileSync(stderr, 'g\n');
+      // Recovery drains the checkpoint before the producer retries.
+      blocked = false;
+      await superviseStandalone(receipts, id, true, undefined, {
+        now: () => 0,
+        identity: async () => null,
+        yield: async () => {},
+      });
+      producer.defer(limits);
+    } finally {
+      producer.close();
+    }
+    assert.equal(fs.readFileSync(alias, 'utf8'), `${frames[0]}e\n${frames[1]}f\n${frames[2]}${frames[3]}g\n`);
   },
 );
 
