@@ -148,6 +148,14 @@ export class CaptureOrderPending extends Error {
     super('The requested log is temporarily unavailable.', { cause });
   }
 }
+// A lookup of the lost order marker that failed with a fault outside the transient set leaves the order of new output
+// unknown, and capture ends at the first output past the saved queue. It writes no marker, so a later recovery looks
+// the marker up again.
+export class CaptureOrderUnknown extends Error {
+  constructor(cause: unknown) {
+    super('The requested log order cannot be checked.', { cause });
+  }
+}
 function identity(file: string): FileIdentity {
   const stat = fs.lstatSync(file, { bigint: true });
   if (stat.isSymbolicLink()) throw new DispatchPathRedirected();
@@ -223,20 +231,14 @@ function exclusive(file: string, text: string): void {
 }
 // Access and sharing faults that clear when another process, such as a scanner or a sync client, releases the file.
 const TRANSIENT_FAULTS = ['EPERM', 'EACCES', 'EBUSY'];
-// A marker that exists, as any file type, stays written. Only a confirmed absence counts as no marker. A lookup that
-// fails with a transient fault settles neither and writes nothing, so the caller retries. Any other failed lookup,
-// such as one through a file or a link loop, does not clear, so it writes the marker and capture ends.
+// A marker that exists, as any file type, stays written. Only a confirmed absence counts as no marker. A failed lookup
+// settles neither and writes nothing. After a transient fault the caller retries. Any other fault ends capture.
 function marked(file: string): boolean {
   try {
     return fs.lstatSync(file, { throwIfNoEntry: false }) !== undefined;
   } catch (cause) {
     if (TRANSIENT_FAULTS.includes((cause as NodeJS.ErrnoException).code ?? '')) throw new CaptureOrderPending(cause);
-    try {
-      mark(file, '');
-    } catch (error) {
-      throw new Error('The requested log is incomplete. Private output remains available.', { cause: error });
-    }
-    return true;
+    throw new CaptureOrderUnknown(cause);
   }
 }
 function mark(file: string, text: string): void {

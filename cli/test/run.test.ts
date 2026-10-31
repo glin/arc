@@ -1357,13 +1357,14 @@ test.each([
   },
 );
 
-// With no queue and no lost order marker, the marker lookup fails once with `code` when the producer starts a slice.
-// A sharing fault clears, and a lookup through a file does not.
+// With no queue and no lost order marker, the marker lookup fails with `code` when the producer starts a slice. The
+// fault clears before recovery, or persists through it.
 test.each([
   { code: 'EBUSY', clears: true },
+  { code: 'ENOTDIR', clears: true },
   { code: 'ENOTDIR', clears: false },
 ])(
-  'capture after a marker lookup fails once with $code at a new slice',
+  'capture after a marker lookup fails with $code at a new slice and clears $clears',
   { tags: ['subprocess'] },
   async ({ code, clears }) => {
     const { receipts, launch } = workerFixture('', 100, false, true);
@@ -1385,19 +1386,27 @@ test.each([
     } finally {
       producer.close();
     }
-    failing = false;
+    failing = !clears;
     fs.appendFileSync(stdout, frames[1]);
     const status = (await superviseStandalone(receipts, id, true, undefined, recoveryRuntime)) as any;
     if (clears) {
       assert.equal(fs.readFileSync(alias, 'utf8'), `${frames[0]}${frames[1]}e\n`);
       assert.notEqual(status.observation.reason, 'The requested log is incomplete. Private output remains available.');
+    } else {
+      // Recovery ends as after a failed save, and leaves no marker for a later recovery.
+      assert.equal(fs.readFileSync(alias, 'utf8'), '');
+      assert.equal(status.observation.reason, 'The requested log is incomplete. Private output remains available.');
+    }
+    // No boundary is held, so the order of all output stays known.
+    assert.equal(fs.existsSync(marker), false);
+    if (code === 'EBUSY') {
       // The producer retries the slice.
       assert.equal((fault as NodeJS.ErrnoException)?.code, 'EPERM');
     } else {
-      // The producer ends capture at once, and recovery reports the log incomplete.
-      assert.equal(String(fault), 'Error: The requested log is incomplete. Private output remains available.');
+      // The producer ends capture at once.
+      assert.equal(String(fault), 'Error: The requested log order cannot be checked.');
       assert.equal((fault as NodeJS.ErrnoException).code, undefined);
-      assert.equal(status.observation.reason, 'The requested log is incomplete. Private output remains available.');
+      assert.equal(((fault as Error).cause as NodeJS.ErrnoException).code, code);
     }
   },
 );
