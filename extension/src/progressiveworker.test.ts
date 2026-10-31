@@ -431,9 +431,9 @@ test('receipt discovery publishes while several Claude roots keep appending duri
 const replacedStore = (store: string, marker: string) =>
   `const idFs=require('node:fs'),idStat=idFs.statSync;idFs.statSync=function(p,...a){const stat=idStat.call(this,p,...a);if(String(p)===${JSON.stringify(store)}&&idFs.existsSync(${JSON.stringify(marker)}))stat.ino+=typeof stat.ino==='bigint'?1n:1;return stat;};`;
 
-// The worker creates the replacement marker when the scan reads past the last store entry.
-const replacedAtStoreEnd = (store: string, marker: string) =>
-  `const endFs=require('node:fs'),endOpen=endFs.opendirSync;endFs.opendirSync=function(p,...a){const dir=endOpen.call(this,p,...a);if(String(p)!==${JSON.stringify(store)})return dir;const read=dir.readSync.bind(dir);dir.readSync=function(){const entry=read();if(entry===null)endFs.writeFileSync(${JSON.stringify(marker)},'');return entry;};return dir;};`;
+// The worker replaces the store when the scan reads past its last entry: it removes the launch and creates the replacement marker.
+const replacedAtStoreEnd = (store: string, marker: string, launchId: string) =>
+  `const endFs=require('node:fs'),endPath=require('node:path'),endOpen=endFs.opendirSync;endFs.opendirSync=function(p,...a){const dir=endOpen.call(this,p,...a);if(String(p)!==${JSON.stringify(store)})return dir;const read=dir.readSync.bind(dir);dir.readSync=function(){const entry=read();if(entry===null&&!endFs.existsSync(${JSON.stringify(marker)})){for(const name of endFs.readdirSync(${JSON.stringify(store)}))if(name.startsWith(${JSON.stringify(launchId)}))endFs.rmSync(endPath.join(${JSON.stringify(store)},name),{recursive:true,force:true});endFs.writeFileSync(${JSON.stringify(marker)},'');}return entry;};return dir;};`;
 
 test.each(['during the scan', 'after the last store entry'])(
   'a receipt store replaced %s starts the receipt scan again once, and discovery still publishes',
@@ -443,14 +443,20 @@ test.each(['during the scan', 'after the last store entry'])(
     fs.mkdirSync(fx.receipts.root, { recursive: true });
     for (let index = 0; index < 300; index++)
       fs.mkdirSync(path.join(fx.receipts.root, `${index.toString(16).padStart(8, '0')}-1111-2222-3333-444444444444`));
-    fx.launch(fx.parent, fx.child);
+    const { launchId } = fx.launch(fx.parent, fx.child);
     const marker = path.join(root, 'store-replaced');
+    // The replacement store holds every entry except the launch, so a link from the old store cannot survive the replacement.
+    const replace = () => {
+      for (const name of fs.readdirSync(fx.receipts.root))
+        if (name.startsWith(launchId)) fs.rmSync(path.join(fx.receipts.root, name), { recursive: true, force: true });
+      fs.writeFileSync(marker, '');
+    };
     let openings = 0;
     const worker = new ProgressiveWorker(
       `process.env.ARC_HOME=${JSON.stringify(fx.home)};performance.now=()=>0;` +
         receiptEntries(fx.receipts.root) +
         replacedStore(fx.receipts.root, marker) +
-        (when === 'during the scan' ? '' : replacedAtStoreEnd(fx.receipts.root, marker)) +
+        (when === 'during the scan' ? '' : replacedAtStoreEnd(fx.receipts.root, marker, launchId)) +
         source,
       undefined,
       (file) => {
@@ -460,7 +466,7 @@ test.each(['during the scan', 'after the last store entry'])(
     try {
       let completed: ProgressiveResult | null = null;
       for (let pass = 0; pass < 40 && !completed; pass++) {
-        if (when === 'during the scan' && openings > 0) fs.writeFileSync(marker, '');
+        if (when === 'during the scan' && openings > 0 && !fs.existsSync(marker)) replace();
         const result = await worker.run(
           { kind: 'claude-children', parents: fx.catalog, catalog: fx.catalog, repositoryRoots: [root] },
           pass + 1,
@@ -473,8 +479,12 @@ test.each(['during the scan', 'after the last store entry'])(
         completed?.value.kind === 'claude-children',
         'Receipt discovery never completed after the store changed',
       );
+      assert.equal(
+        sessionParentIndex(completed.value.references).get(fx.child.sessionId),
+        undefined,
+        'A link from the replaced store survived the replacement',
+      );
       assert.equal(openings, 2, 'The replaced store did not start the receipt scan again exactly once');
-      assert.equal(sessionParentIndex(completed.value.references).get(fx.child.sessionId)?.parent, fx.parent.sessionId);
     } finally {
       worker.stop();
     }
