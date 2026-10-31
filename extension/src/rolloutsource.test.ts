@@ -2,10 +2,18 @@ import fs from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import * as path from 'node:path';
 import * as zlib from 'node:zlib';
+import os from 'node:os';
+import { threadId } from 'node:worker_threads';
 import assert from 'node:assert/strict';
 import { test, vi } from 'vitest';
 import { tempDir } from './temproot';
-import { RolloutSources, preferPlainRollouts, rolloutStem, rolloutThreadId } from './rolloutsource';
+import {
+  RolloutSources,
+  cleanupRolloutDirectories,
+  preferPlainRollouts,
+  rolloutStem,
+  rolloutThreadId,
+} from './rolloutsource';
 
 const codec = zlib as typeof zlib & { zstdCompressSync?: (bytes: Buffer) => Buffer };
 function fixture(body = 'opening\n' + 'old line\n'.repeat(10000)) {
@@ -15,6 +23,184 @@ function fixture(body = 'opening\n' + 'old line\n'.repeat(10000)) {
   fs.writeFileSync(file, codec.zstdCompressSync!(Buffer.from(body)));
   return { plain, file, body: Buffer.from(body) };
 }
+
+test.skipIf(!codec.zstdCompressSync)('the final oversized lease release removes its decoded disk file', async () => {
+  const f = fixture('opening\n' + 'x'.repeat(1024 * 1024));
+  const root = tempDir('oversized-cache-');
+  const temporary = vi.spyOn(os, 'tmpdir').mockReturnValue(root);
+  try {
+    const sources = new RolloutSources({ budget: 16 });
+    const first = sources.open(f.file);
+    const directory = path.join(root, fs.readdirSync(root)[0]);
+    assert.match(path.basename(directory), new RegExp(`^arc-rollouts-${process.pid}-${threadId}-[A-Za-z0-9]{6}$`));
+    const file = path.join(directory, '1');
+    const second = sources.open(f.file);
+    const release = await sources.prepare(f.file);
+    first.close();
+    second.close();
+    assert.equal(fs.statSync(file).size, f.body.length);
+    release();
+    assert.equal(fs.existsSync(file), false);
+    release();
+    const asyncRelease = await sources.prepare(f.file);
+    assert.equal(fs.statSync(path.join(directory, '2')).size, f.body.length);
+    asyncRelease();
+    assert.deepEqual(fs.readdirSync(directory), []);
+  } finally {
+    temporary.mockRestore();
+  }
+});
+
+test.skipIf(!codec.zstdCompressSync)(
+  'decoded source handoff survives readiness callbacks and concurrent leases',
+  async () => {
+    const f = fixture();
+    const root = tempDir('handoff-cache-');
+    const temporary = vi.spyOn(os, 'tmpdir').mockReturnValue(root);
+    try {
+      const sources = new RolloutSources({ budget: 16 });
+      sources.onReady(() => sources.open(f.file).close());
+      const releases = await Promise.all([sources.prepare(f.file), sources.prepare(f.file)]);
+      const directory = path.join(root, fs.readdirSync(root)[0]);
+      releases[0]();
+      const reader = sources.open(f.file);
+      assert.equal(reader.size, f.body.length);
+      releases[1]();
+      assert.deepEqual(fs.readdirSync(directory), ['1']);
+      reader.close();
+      assert.deepEqual(fs.readdirSync(directory), []);
+    } finally {
+      temporary.mockRestore();
+    }
+  },
+);
+
+test.skipIf(!codec.zstdCompressSync)('failed unlinks count toward the disk budget and retry on later reads', () => {
+  const first = fixture('a'.repeat(16));
+  const second = fixture('b'.repeat(16));
+  const root = tempDir('retry-cache-');
+  const temporary = vi.spyOn(os, 'tmpdir').mockReturnValue(root);
+  const sources = new RolloutSources({ budget: 24 });
+  const unlink = fs.unlinkSync;
+  let failed: string | undefined;
+  let blockAll = false;
+  const attempts: string[] = [];
+  const remove = vi.spyOn(fs, 'unlinkSync').mockImplementation((file) => {
+    attempts.push(String(file));
+    if (blockAll || file === failed) throw Object.assign(new Error('Busy.'), { code: 'EBUSY' });
+    unlink(file);
+  });
+  try {
+    sources.open(first.file).close();
+    const directory = path.join(root, fs.readdirSync(root)[0]);
+    failed = path.join(directory, '1');
+    const held = sources.open(second.file);
+    assert.equal(fs.statSync(failed).size, 16);
+    assert.equal(fs.statSync(path.join(directory, '2')).size, 16);
+    held.close();
+    assert.deepEqual(fs.readdirSync(directory), ['1'], 'failed removals must still consume the budget');
+    const before = attempts.length;
+    sources.open(first.plain).close();
+    assert.ok(attempts.length - before <= 8, 'one read retried an unbounded number of failed removals');
+    failed = undefined;
+    sources.open(first.plain).close();
+    assert.deepEqual(fs.readdirSync(directory), []);
+    blockAll = true;
+    const oversized = new RolloutSources({ budget: 0 });
+    for (let index = 0; index < 12; index++) oversized.open(first.file).close();
+    const retries = attempts.length;
+    oversized.open(first.plain).close();
+    assert.equal(attempts.length - retries, 8, 'one operation must retry only eight failed paths');
+    const retainedDirectory = path.join(
+      root,
+      fs.readdirSync(root).find((name) => path.join(root, name) !== directory)!,
+    );
+    assert.equal(fs.readdirSync(retainedDirectory).length, 12);
+    blockAll = false;
+    oversized.open(first.plain).close();
+    assert.equal(fs.readdirSync(retainedDirectory).length, 4);
+    oversized.open(first.plain).close();
+    assert.deepEqual(fs.readdirSync(retainedDirectory), []);
+  } finally {
+    remove.mockRestore();
+    temporary.mockRestore();
+  }
+});
+
+test('temporary recovery admits only exact rollout identities and definitively dead processes', async () => {
+  const root = tempDir('recover-cache-');
+  const directory = (name: string, child = '1') => {
+    const result = path.join(root, name);
+    fs.mkdirSync(result);
+    fs.writeFileSync(path.join(result, child), 'decoded');
+    return result;
+  };
+  const legacy = directory('arc-rollouts-101-Ab0xyZ');
+  const current = directory('arc-rollouts-101-7-Ab0xyZ');
+  const live = directory('arc-rollouts-102-7-Ab0xyZ');
+  const denied = directory('arc-rollouts-103-Ab0xyZ');
+  const uncertain = directory('arc-rollouts-104-Ab0xyZ');
+  const malformed = directory('arc-rollouts-0101-Ab0xyZ');
+  const suffix = directory('arc-rollouts-101-Ab0xyZ-extra');
+  const malformedThread = directory('arc-rollouts-101-07-Ab0xyZ');
+  const startup = directory('arc-startup-measure-101-Ab0xyZ');
+  const unknown = directory('arc-rollouts-101-Qb0xyZ', 'notes');
+  const nested = directory('arc-rollouts-101-Rb0xyZ');
+  fs.mkdirSync(path.join(nested, '2'));
+  const outside = directory('outside');
+  const link = path.join(root, 'arc-rollouts-101-Sb0xyZ');
+  fs.symlinkSync(outside, link, 'junction');
+  const childLink = directory('arc-rollouts-101-Tb0xyZ');
+  fs.symlinkSync(outside, path.join(childLink, '2'), 'junction');
+  const kill = vi.fn<(pid: number, signal: 0) => void>((pid, signal) => {
+    assert.equal(signal, 0);
+    if (pid === 102) return;
+    throw Object.assign(new Error('Process status.'), { code: pid === 103 ? 'EPERM' : pid === 104 ? 'EIO' : 'ESRCH' });
+  });
+  await cleanupRolloutDirectories(undefined, root, kill);
+  assert.equal(fs.existsSync(legacy), false);
+  assert.equal(fs.existsSync(current), false);
+  for (const retained of [
+    live,
+    denied,
+    uncertain,
+    malformed,
+    malformedThread,
+    suffix,
+    startup,
+    unknown,
+    nested,
+    outside,
+    link,
+    childLink,
+  ])
+    assert.equal(fs.existsSync(retained), true, retained);
+  assert.equal(fs.readFileSync(path.join(outside, '1'), 'utf8'), 'decoded');
+  assert.equal(fs.existsSync(path.join(nested, '1')), true);
+  assert.deepEqual([...new Set(kill.mock.calls.map(([pid]) => pid))].sort(), [101, 102, 103, 104]);
+});
+
+test('worker cleanup preserves every other thread, PID, and legacy directory', async () => {
+  const root = tempDir('worker-cache-');
+  const names = [
+    'arc-rollouts-101-7-Ab0xyZ',
+    'arc-rollouts-101-70-Ab0xyZ',
+    'arc-rollouts-101-8-Ab0xyZ',
+    'arc-rollouts-101-Ab0xyZ',
+    'arc-rollouts-1010-7-Ab0xyZ',
+  ];
+  for (const name of names) {
+    fs.mkdirSync(path.join(root, name));
+    fs.writeFileSync(path.join(root, name, '1'), 'decoded');
+  }
+  const kill = vi.fn<() => never>(() => {
+    throw new Error('A known worker needs no process read.');
+  });
+  await cleanupRolloutDirectories({ pid: 101, thread: 7 }, root, kill);
+  assert.equal(fs.existsSync(path.join(root, names[0])), false);
+  for (const name of names.slice(1)) assert.equal(fs.existsSync(path.join(root, name, '1')), true);
+  assert.equal(kill.mock.calls.length, 0);
+});
 
 test.skipIf(!codec.zstdCompressSync)(
   'compressed byte offsets, tails and backward ranges match the plain source',

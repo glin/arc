@@ -1,4 +1,5 @@
 import { Worker } from 'node:worker_threads';
+import { cleanupRolloutDirectories } from './rolloutsource';
 import { CODEX_META_VERSION } from './codexopenings';
 import { brotliDecompressSync } from 'node:zlib';
 import { CODEX_TITLE_BYTES, type CodexSessionMeta, type CodexSubagentFile } from './codex';
@@ -777,7 +778,8 @@ export class ProgressiveWorker {
         return Promise.reject(error);
       }
       this.worker = worker;
-      this.workerThreadId = worker.threadId;
+      const workerThreadId = worker.threadId;
+      this.workerThreadId = workerThreadId;
       this.workerMemory = null;
       this.workerMemoryThreadId = null;
       this.workerMemoryRequestId = null;
@@ -890,6 +892,7 @@ export class ProgressiveWorker {
         }
       });
       worker.on('exit', (exitCode) => {
+        void cleanupRolloutDirectories({ pid: process.pid, thread: workerThreadId });
         if (terminalFailure) {
           terminalFailure.exitCode = exitCode;
           this.onFailure?.(terminalFailure);
