@@ -4385,8 +4385,9 @@ export class RelationshipReader {
   // later mark checks the marks before it again after the last mark. The deadline, cancellation, a mark without the budget, or a
   // new grown stamp ends those checks with a match. Before those checks, every pass ignores the deadline, and the first pass also
   // ignores cancellation. Cancellation in a later pass, a mark without the budget for its check, an unstable or short check, or a
-  // new grown stamp in every pass leaves the outcome pending. After a pending outcome, `checked` is the end of the longest run of checks from `from`
-  // in any pass that matched without a new grown stamp, so growth never moves it back. An unstable stamp or a short check leaves 0.
+  // new grown stamp in every pass leaves the outcome pending. After a pending outcome, `checked` is the end of the longest run of
+  // checks from `from` in any pass that matched without a new grown stamp, so growth never moves it back. An unstable stamp or a
+  // short check leaves 0.
   private passes(evidence: RelationshipDigest, from = 0): 'match' | 'mismatch' | 'pending' {
     let reached = from;
     for (let pass = 0; pass < RELATIONSHIP_SETTLE_PASSES; pass++) {
