@@ -31460,7 +31460,7 @@ test.each([
   assert.deepEqual(observed.at(-1)?.[0], 'hostSave');
 });
 
-test('startup selection keeps quick filters hidden until the workspace catalog arrives', () => {
+test('startup shows only the restored selected quick filter until the workspace catalog arrives', () => {
   const words = {
     running: CARD_ACTIONS.railNarrowToValues.running,
     active: CARD_ACTIONS.railCountActive,
@@ -31542,7 +31542,10 @@ test('startup selection keeps quick filters hidden until the workspace catalog a
     sessionAdoptions: [],
   };
   const unknown = () => {
-    assert.deepEqual(buttons, []);
+    assert.deepEqual(
+      buttons.map((button) => [button.kind, button.figure, button.pressed]),
+      [['running', '', true]],
+    );
   };
   handlers.rail(configuration);
   unknown();

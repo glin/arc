@@ -243,8 +243,15 @@ test('startup progress ignores stale epochs and never replaces usable selected c
     );
     await page.evaluate(SETTLED);
     const running = page.locator('[data-control="railcount:running"]');
-    assert.equal(await page.locator('.railcount').count(), 0);
-    assert.equal(await page.locator('.railcounts').isVisible(), false);
+    const startupRestored = async (why: string) => {
+      assert.equal(await page.locator('.railcount').count(), 1, why);
+      assert.equal(await running.count(), 1, why);
+      assert.equal(await running.getAttribute('aria-pressed'), 'true', why);
+      assert.equal(await running.isEnabled(), true, why);
+      assert.equal(await running.locator('.railcountfig').count(), 0, why);
+      assert.equal(await page.locator('[data-control="railcount:active"]').count(), 0, why);
+    };
+    await startupRestored('the restored selected Running filter was not shown before the catalog');
     await page.evaluate(() =>
       window.postMessage(
         {
@@ -262,8 +269,7 @@ test('startup progress ignores stale epochs and never replaces usable selected c
       ),
     );
     await page.evaluate(SETTLED);
-    assert.equal(await page.locator('.railcount').count(), 0, 'a configuration reply revealed quick filters');
-    assert.equal(await page.locator('.railcounts').isVisible(), false);
+    await startupRestored('a configuration reply changed the quick filters before the catalog');
     const progress = { type: 'startupProgress', generation: 2, epoch: 'accepted', sequence: 3, completed: 1, known: 3 };
     await page.evaluate((value) => window.postMessage(value, '*'), progress);
     await page.waitForFunction(() =>
@@ -333,6 +339,40 @@ test('startup progress ignores stale epochs and never replaces usable selected c
       'window.__posted.some(message => message.type === "painted" && message.generation === 6 && message.stage === "completeRender")',
     );
     assert.equal(await background.isVisible(), false);
+  } finally {
+    await browser.close();
+  }
+});
+
+test('a restored selected Active filter clears from its button before the first render', async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('Edge or Chrome is required');
+    return;
+  }
+  const page = await browser.newPage();
+  try {
+    const saved = {
+      railFilter: 'is:active -is:archived -is:agentrun',
+      railFilterId: 'all',
+      railQuickFilters: ['running', 'active'],
+    };
+    await page.setContent(
+      themed(pageHtml().replace('const SAVED_STATE = {};', `const SAVED_STATE = ${JSON.stringify(saved)};`)),
+    );
+    await page.evaluate(SETTLED);
+    const active = page.locator('[data-control="railcount:active"]');
+    assert.equal(await active.count(), 1, 'the restored selected Active filter was not shown before the first render');
+    assert.equal(await active.getAttribute('aria-pressed'), 'true');
+    assert.equal(await active.isEnabled(), true);
+    assert.equal(await active.locator('.railcountfig').count(), 0);
+    assert.equal(await page.locator('[data-control="railcount:running"]').count(), 0);
+    assert.equal(await page.locator('.railfiltersicon.active').count(), 1);
+    await active.click();
+    await page.evaluate(SETTLED);
+    assert.equal(await active.count(), 0, 'pressing the selected Active filter left its button');
+    assert.equal(await page.locator('.railcount').count(), 0);
+    assert.equal(await page.locator('.railfiltersicon.active').count(), 0, 'the query was not cleared');
   } finally {
     await browser.close();
   }

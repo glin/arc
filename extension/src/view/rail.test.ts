@@ -754,11 +754,23 @@ const HEAD_WORDS = {
 
 const ALL_LENS = { filterId: ALL_RAIL_FILTER_ID, query: '' };
 
-test('startup hides quick filters until counts arrive, including a restored selection', () => {
-  for (const query of ['', ...RAIL_LENSES.map((lens) => RAIL_LENS_WORDS[lens])]) {
-    for (const configured of [[], RAIL_LENSES]) {
-      assert.deepEqual(railCountButtons(null, { ...ALL_LENS, query }, HEAD_WORDS, configured), []);
-    }
+test('startup shows only a selected configured quick filter, without a figure, until counts arrive', () => {
+  for (const configured of [[], RAIL_LENSES]) {
+    assert.deepEqual(railCountButtons(null, ALL_LENS, HEAD_WORDS, configured), []);
+  }
+  for (const lens of RAIL_LENSES) {
+    const selected = { ...ALL_LENS, query: RAIL_LENS_WORDS[lens] };
+    assert.deepEqual(railCountButtons(null, selected, HEAD_WORDS, []), [], lens);
+    const buttons = railCountButtons(null, selected, HEAD_WORDS, RAIL_LENSES);
+    assert.equal(buttons.length, 1, lens);
+    const [button] = buttons;
+    assert.deepEqual(
+      [button.kind, button.figure, button.pressed, button.name, button.hint],
+      [lens, '', true, HEAD_WORDS[lens], HEAD_WORDS.pressedHint],
+      lens,
+    );
+    const cleared = { ...selected, query: pressRailLens(selected.query, lens) };
+    assert.deepEqual(railCountButtons(null, cleared, HEAD_WORDS, RAIL_LENSES), [], lens);
   }
 });
 

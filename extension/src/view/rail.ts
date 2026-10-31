@@ -841,7 +841,8 @@ export function railCountPressed(kind: RailCountKind, lens: RailHeadLens): boole
   return railQueryHeldLens(lens.query) === kind;
 }
 
-// Configured shortcuts wait for catalog counts, then draw while selected or while their scoped session count is positive.
+// Configured shortcuts draw while selected or while their scoped session count is positive.
+// Before the catalog supplies counts, only a selected shortcut draws, without a figure, so a restored selection stays clearable.
 // Naming holds their counts and disables presses. Active adds its scoped cache information.
 export function railCountButtons(
   counts: RailCounts | null,
@@ -849,9 +850,6 @@ export function railCountButtons(
   words: RailCountWords,
   headLenses: readonly RailLens[] = DEFAULT_RAIL_QUICK_FILTERS,
 ): RailCountButton[] {
-  if (counts === null) {
-    return [];
-  }
   const hints: Record<RailCountKind, string> = {
     running: words.runningHint,
     active: words.activeHint,
@@ -859,7 +857,7 @@ export function railCountButtons(
     input: words.inputHint,
   };
   return RAIL_LENSES.filter(
-    (kind) => headLenses.includes(kind) && (counts[kind] > 0 || railCountPressed(kind, lens)),
+    (kind) => headLenses.includes(kind) && ((counts?.[kind] ?? 0) > 0 || railCountPressed(kind, lens)),
   ).map((kind) => {
     const count = counts?.[kind];
     const figure = count === undefined ? '' : count.toLocaleString('en-US');
