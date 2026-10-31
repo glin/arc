@@ -1025,9 +1025,9 @@ async function execute(
         parents.map(({ file, sessionId, agent, childTranscript }) => ({ file, sessionId, agent, childTranscript })),
       );
     continuation ||= parentKeys(epoch.parents) !== parentKeys(request.parents);
-    // A replaced store directory starts the scan again from its first entry. Other store changes keep the scan's position.
-    if (receiptScan && !receiptScan.storeRead && receiptStoreIdentity(receiptScan.store) !== receiptScan.storeIdentity)
-      closeReceiptScan();
+    // A replaced store directory starts the scan again from its first entry, here and before publication. Other store changes
+    // keep the scan's position.
+    if (receiptScan && receiptStoreIdentity(receiptScan.store) !== receiptScan.storeIdentity) closeReceiptScan();
     if (!receiptScan) {
       const controller = new AbortController();
       const store = new DispatchReceipts();
@@ -1096,6 +1096,12 @@ async function execute(
       await new Promise<void>((resolve) => setImmediate(resolve));
     }
     if (signal.aborted) return { kind: 'stale' };
+    // Links read from a replaced store never publish with retries read from its replacement.
+    if (receiptStoreIdentity(activeReceipts.store) !== activeReceipts.storeIdentity) {
+      closeReceiptScan();
+      charges.receiptPassEnds++;
+      return pending();
+    }
     const transcriptReferences = resolveClaudeDispatchReferences(found.references, epoch.catalog);
     if (
       activeReceipts.competitionRefused &&

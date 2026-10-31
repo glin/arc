@@ -429,44 +429,55 @@ test('receipt discovery publishes while several Claude roots keep appending duri
 const replacedStore = (store: string, marker: string) =>
   `const idFs=require('node:fs'),idStat=idFs.statSync;idFs.statSync=function(p,...a){const stat=idStat.call(this,p,...a);if(String(p)===${JSON.stringify(store)}&&idFs.existsSync(${JSON.stringify(marker)}))stat.ino+=typeof stat.ino==='bigint'?1n:1;return stat;};`;
 
-test('a replaced receipt store starts the receipt scan again once, and discovery still publishes', async () => {
-  const root = tempDir('receipt-worker-replaced-');
-  const fx = receiptDispatchFixture(root, 'claude', 'codex');
-  fs.mkdirSync(fx.receipts.root, { recursive: true });
-  for (let index = 0; index < 300; index++)
-    fs.mkdirSync(path.join(fx.receipts.root, `${index.toString(16).padStart(8, '0')}-1111-2222-3333-444444444444`));
-  fx.launch(fx.parent, fx.child);
-  const marker = path.join(root, 'store-replaced');
-  let openings = 0;
-  const worker = new ProgressiveWorker(
-    `process.env.ARC_HOME=${JSON.stringify(fx.home)};performance.now=()=>0;` +
-      receiptEntries(fx.receipts.root) +
-      replacedStore(fx.receipts.root, marker) +
-      source,
-    undefined,
-    (file) => {
-      if (file === 'receipt-store-opened') openings++;
-    },
-  );
-  try {
-    let completed: ProgressiveResult | null = null;
-    for (let pass = 0; pass < 40 && !completed; pass++) {
-      if (openings > 0) fs.writeFileSync(marker, '');
-      const result = await worker.run(
-        { kind: 'claude-children', parents: fx.catalog, catalog: fx.catalog, repositoryRoots: [root] },
-        pass + 1,
-        new AbortController().signal,
+// The worker creates the replacement marker when the scan reads past the last store entry.
+const replacedAtStoreEnd = (store: string, marker: string) =>
+  `const endFs=require('node:fs'),endOpen=endFs.opendirSync;endFs.opendirSync=function(p,...a){const dir=endOpen.call(this,p,...a);if(String(p)!==${JSON.stringify(store)})return dir;const read=dir.readSync.bind(dir);dir.readSync=function(){const entry=read();if(entry===null)endFs.writeFileSync(${JSON.stringify(marker)},'');return entry;};return dir;};`;
+
+test.each(['during the scan', 'after the last store entry'])(
+  'a receipt store replaced %s starts the receipt scan again once, and discovery still publishes',
+  async (when) => {
+    const root = tempDir('receipt-worker-replaced-');
+    const fx = receiptDispatchFixture(root, 'claude', 'codex');
+    fs.mkdirSync(fx.receipts.root, { recursive: true });
+    for (let index = 0; index < 300; index++)
+      fs.mkdirSync(path.join(fx.receipts.root, `${index.toString(16).padStart(8, '0')}-1111-2222-3333-444444444444`));
+    fx.launch(fx.parent, fx.child);
+    const marker = path.join(root, 'store-replaced');
+    let openings = 0;
+    const worker = new ProgressiveWorker(
+      `process.env.ARC_HOME=${JSON.stringify(fx.home)};performance.now=()=>0;` +
+        receiptEntries(fx.receipts.root) +
+        replacedStore(fx.receipts.root, marker) +
+        (when === 'during the scan' ? '' : replacedAtStoreEnd(fx.receipts.root, marker)) +
+        source,
+      undefined,
+      (file) => {
+        if (file === 'receipt-store-opened') openings++;
+      },
+    );
+    try {
+      let completed: ProgressiveResult | null = null;
+      for (let pass = 0; pass < 40 && !completed; pass++) {
+        if (when === 'during the scan' && openings > 0) fs.writeFileSync(marker, '');
+        const result = await worker.run(
+          { kind: 'claude-children', parents: fx.catalog, catalog: fx.catalog, repositoryRoots: [root] },
+          pass + 1,
+          new AbortController().signal,
+        );
+        assert.ok(result);
+        if (result.value.kind === 'claude-children' && !result.value.continuation) completed = result;
+      }
+      assert.ok(
+        completed?.value.kind === 'claude-children',
+        'Receipt discovery never completed after the store changed',
       );
-      assert.ok(result);
-      if (result.value.kind === 'claude-children' && !result.value.continuation) completed = result;
+      assert.equal(openings, 2, 'The replaced store did not start the receipt scan again exactly once');
+      assert.equal(sessionParentIndex(completed.value.references).get(fx.child.sessionId)?.parent, fx.parent.sessionId);
+    } finally {
+      worker.stop();
     }
-    assert.ok(completed?.value.kind === 'claude-children', 'Receipt discovery never completed after the store changed');
-    assert.equal(openings, 2, 'The replaced store did not start the receipt scan again exactly once');
-    assert.equal(sessionParentIndex(completed.value.references).get(fx.child.sessionId)?.parent, fx.parent.sessionId);
-  } finally {
-    worker.stop();
-  }
-});
+  },
+);
 
 test('receipt discovery revisits pending identity and discards cancelled scope generations', async () => {
   const root = tempDir('receipt-worker-pending-');
@@ -3361,10 +3372,11 @@ test.each(['claude', 'codex'] as const)(
       const afterIo = validation as typeof validation & { ioReads: number; ioStats: number };
       const reads = Math.ceil(allowance / (256 * 1024));
       assert.equal(afterIo.ioReads - beforeIo.ioReads, reads, 'validation split a buffer into individual block reads');
-      // The Codex pass also reaches the receipt phase, which reads the identity of the receipt store once.
+      // The Codex pass also reaches the receipt phase, which reads the identity of the receipt store before its scan and before
+      // it publishes.
       assert.equal(
         afterIo.ioStats - beforeIo.ioStats,
-        2 * reads + 4 + (agent === 'codex' ? 1 : 0),
+        2 * reads + 4 + (agent === 'codex' ? 2 : 0),
         'validation repeated source stats between hash blocks',
       );
       const cursor =
