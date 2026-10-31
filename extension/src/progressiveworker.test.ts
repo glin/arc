@@ -5475,11 +5475,19 @@ test('a pass keeps an active transcript that grows after its seed check', async 
     fs.appendFileSync(files[0], line({ type: 'user', cwd: directory, message: { content: 'again' } }));
     fs.appendFileSync(files[1], line({ type: 'user', cwd: directory, message: { content: 'again' } }));
     fs.writeFileSync(marker, '');
-    const second = await worker.run(request(), 2, new AbortController().signal);
+    // A pass that reaches its slice deadline replies with progress, so the same request runs again until the complete reply.
+    const follow = request();
+    let second: ProgressiveResult | null = null;
+    let resets = 0;
+    for (let pass = 0; pass < 20; pass++) {
+      second = await worker.run(follow, 2, new AbortController().signal);
+      if (second?.value.kind === 'claude-children' || second?.value.kind === 'claude-children-progress')
+        resets += second.value.charges?.resets ?? 0;
+      if (second?.value.kind !== 'claude-children-progress') break;
+    }
     assert.equal(fs.existsSync(marker), false, 'the worker never checked the active transcript');
     assert.equal(second?.value.kind, 'claude-children', 'growth after the seed check reset the active transcript');
-    if (second?.value.kind !== 'claude-children') return;
-    assert.equal(second.value.charges?.resets, 0);
+    assert.equal(resets, 0);
   } finally {
     worker.stop();
     fs.rmSync(directory, { recursive: true, force: true });
@@ -5494,7 +5502,7 @@ test('a pass after a complete reply reads an unchanged Codex rollout that stoppe
     file,
     JSON.stringify({ type: 'session_meta', timestamp: timestamp(0), payload: { id: 'parent', cwd: directory } }) +
       String.fromCharCode(10) +
-      filler.repeat(160),
+      filler.repeat(960),
   );
   const stat = revisionOf(fs.statSync(file, { bigint: true }));
   const parent = { agent: 'codex' as const, file, sessionId: 'parent', size: stat.size, mtimeMs: stat.mtimeMs };
@@ -5506,15 +5514,26 @@ test('a pass after a complete reply reads an unchanged Codex rollout that stoppe
       repositoryRoots: [directory],
       discoveryBytes: 64 * 1024,
     };
-    const first = await worker.run(request, 1, new AbortController().signal);
-    assert.ok(first?.value.kind === 'claude-children');
+    // A pass that reaches its deadline replies with progress, so each request runs again until a reply that is not progress.
+    // The charges of every reply of a request add up.
+    const pass = async (generation: number) => {
+      const charges = { hits: 0, quanta: 0 };
+      for (let attempt = 0; attempt < 20; attempt++) {
+        const result = await worker.run(request, generation, new AbortController().signal);
+        assert.ok(result?.value.kind === 'claude-children' || result?.value.kind === 'claude-children-progress');
+        charges.hits += result.value.charges?.hits ?? 0;
+        charges.quanta += result.value.charges?.quanta ?? 0;
+        if (result.value.kind === 'claude-children') return { value: result.value, charges };
+      }
+      throw new Error(`request ${generation} never replied without progress`);
+    };
+    const first = await pass(1);
     assert.equal(first.value.continuation, true, 'the first pass reached the end of the rollout');
     const stopped = first.value.referenceEntries[0][1];
     assert.equal(stopped.visitedEof, false);
-    const second = await worker.run(request, 2, new AbortController().signal);
-    assert.ok(second?.value.kind === 'claude-children');
-    assert.equal(second.value.charges?.hits, 0, 'an unfinished Codex rollout counted as finished');
-    assert.equal(second.value.charges?.quanta, 1, 'the follow-up pass skipped an unfinished Codex rollout');
+    const second = await pass(2);
+    assert.equal(second.charges.hits, 0, 'an unfinished Codex rollout counted as finished');
+    assert.ok(second.charges.quanta >= 1, 'the follow-up pass skipped an unfinished Codex rollout');
     assert.ok(second.value.referenceEntries[0][1].cursor!.offset > stopped.cursor!.offset);
   } finally {
     worker.stop();
