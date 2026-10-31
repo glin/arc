@@ -536,6 +536,33 @@ test('Claude kept marks that exceed a later allowance complete over several quan
   );
 });
 
+test('Claude kept marks under a short allowance complete while the file grows before every quantum', async () => {
+  vi.spyOn(performance, 'now').mockReturnValue(0);
+  const { parent, ends, meter } = growthPointTranscript();
+  const first = await scanClaudeRelationshipQuantum(parent, undefined, 16 * 1024 * 1024, undefined, meter);
+  assert.equal(first.complete, true);
+  assert.equal(first.cursor.evidence?.marks?.length, 8, `the read had ${ends.length} growth points`);
+  // A writer appends before every quantum, and each allowance covers the checks of only some of the kept marks. The nine checks
+  // of at most 8 KiB each fit in three such quanta, and a later quantum parses the appends.
+  const allowance = 24 * 1024;
+  let scan = first;
+  let quanta = 0;
+  do {
+    fs.appendFileSync(parent.file, '{"type":"ignored"}' + String.fromCharCode(10));
+    scan = await scanClaudeRelationshipQuantum(parent, JSON.parse(JSON.stringify(scan.cursor)), allowance);
+    assert.ok(scan.readBytes <= allowance);
+  } while (!scan.complete && ++quanta < 6);
+  assert.equal(
+    scan.complete,
+    true,
+    'the kept marks did not complete in six quanta while the file grew before every quantum',
+  );
+  assert.deepEqual(
+    scan.references.map((reference) => reference.sessionId),
+    ['child-a'],
+  );
+});
+
 for (const stop of ['its budget', 'its deadline', 'cancellation'] as const)
   test(`Claude kept mark that a check matched before it stopped at ${stop} still finds a rewrite with an append`, async () => {
     let clock = 0;
