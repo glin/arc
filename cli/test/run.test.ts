@@ -1081,62 +1081,133 @@ function sameFile(fd: number, file: string) {
   return Boolean(stat && fs.fstatSync(fd, { bigint: true }).ino === stat.ino);
 }
 
+// Behind pending A and e, the producer observes stdout B and then stderr f, and fails to write their queue records.
+// `budget` is the number of queue file bytes it writes, and `denied` the number of queue file opens that fail.
+// After the producer ends, stdout C arrives and a recovery runs.
+async function heldBoundaryRecovery(
+  failure: { budget?: number; denied?: number },
+  ending: 'dies' | 'closes' | 'closes and dies',
+) {
+  const { receipts, launch } = workerFixture('', 100, false, true);
+  const id = launch.launchId;
+  const frames = outputFrames().split(/(?<=\n)/);
+  stoppedOutput(receipts, id, frames[0], 'e\n');
+  const stdout = receipts.artifact(id, 'stdout.log');
+  const stderr = receipts.artifact(id, 'stderr.log');
+  const queueFile = receipts.artifact(id, 'capture-queue.log');
+  const alias = launch.standalone!.logAlias!;
+  let blocked = true;
+  let denied = 0;
+  const open = fs.openSync;
+  vi.spyOn(fs, 'openSync').mockImplementation((file, ...args) => {
+    if (String(file) === alias && blocked) throw Object.assign(new Error('Alias unavailable'), { code: 'EPERM' });
+    if (String(file) === queueFile && denied > 0) {
+      denied--;
+      throw Object.assign(new Error('Queue unavailable'), { code: 'EACCES' });
+    }
+    return Reflect.apply(open, fs, [file, ...args]);
+  });
+  let budget = Infinity;
+  const write = fs.writeSync;
+  vi.spyOn(fs, 'writeSync').mockImplementation(((
+    fd: number,
+    buffer: Buffer,
+    offset: number,
+    length: number,
+    at: number,
+  ) => {
+    if (budget === Infinity || !sameFile(fd, queueFile))
+      return Reflect.apply(write, fs, [fd, buffer, offset, length, at]);
+    if (budget <= 0) throw Object.assign(new Error('Producer ended'), { code: 'EIO' });
+    const count = Reflect.apply(write, fs, [fd, buffer, offset, Math.min(length, budget), at]) as number;
+    budget -= count;
+    return count;
+  }) as typeof fs.writeSync);
+  queueOutage(
+    receipts,
+    id,
+    () => {},
+    (state) => state.pending.length >= 2,
+  );
+  const producer = receipts.capture(id, 64 * 1024, true);
+  fs.appendFileSync(stdout, frames[1]);
+  fs.appendFileSync(stderr, 'f\n');
+  budget = failure.budget ?? Infinity;
+  denied = failure.denied ?? 0;
+  assert.throws(() => producer.defer(captureLimits));
+  budget = Infinity;
+  if (ending !== 'dies') producer.close();
+  denied = 0;
+  // The test process stands in for the producer, so an ended producer is a process that no longer exists.
+  if (ending !== 'closes') {
+    const kill = process.kill;
+    vi.spyOn(process, 'kill').mockImplementation((pid, signal) => {
+      if (pid === process.pid && signal === 0) throw Object.assign(new Error('Producer ended'), { code: 'ESRCH' });
+      return Reflect.apply(kill, process, [pid, signal]);
+    });
+  }
+  fs.appendFileSync(stdout, frames[2]);
+  blocked = false;
+  const status = (await superviseStandalone(receipts, id, true, undefined, recoveryRuntime)) as any;
+  return {
+    published: fs.readFileSync(alias, 'utf8'),
+    reason: status.observation.reason,
+    expected: `${frames[0]}e\n${frames[1]}f\n${frames[2]}`,
+    known: frames[0],
+  };
+}
+// Recovery publishes the combined order, or a strict prefix of it that keeps A with the incomplete report.
+function orderedOrIncomplete({ published, reason, expected, known }: Awaited<ReturnType<typeof heldBoundaryRecovery>>) {
+  return (
+    published === expected ||
+    (published.startsWith(known) &&
+      expected.startsWith(published) &&
+      reason === 'The requested log is incomplete. Private output remains available.')
+  );
+}
+
 test(
   'capture recovery keeps arrival order or reports the log incomplete after a producer ends inside a queue record',
   { tags: ['subprocess'] },
   async () => {
-    const { receipts, launch } = workerFixture('', 100, false, true);
-    const id = launch.launchId;
-    const frames = outputFrames().split(/(?<=\n)/);
-    stoppedOutput(receipts, id, frames[0], 'e\n');
-    const stdout = receipts.artifact(id, 'stdout.log');
-    const stderr = receipts.artifact(id, 'stderr.log');
-    const queueFile = receipts.artifact(id, 'capture-queue.log');
-    const alias = launch.standalone!.logAlias!;
-    let blocked = true;
-    denyOpen(alias, () => blocked);
-    queueOutage(
-      receipts,
-      id,
-      () => {},
-      (state) => state.pending.length >= 2,
-    );
-    // The producer observes B and then f, and ends partway through the record for f.
-    let budget = Infinity;
-    const write = fs.writeSync;
-    vi.spyOn(fs, 'writeSync').mockImplementation(((
-      fd: number,
-      buffer: Buffer,
-      offset: number,
-      length: number,
-      at: number,
-    ) => {
-      if (budget === Infinity || !sameFile(fd, queueFile))
-        return Reflect.apply(write, fs, [fd, buffer, offset, length, at]);
-      if (budget <= 0) throw Object.assign(new Error('Producer ended'), { code: 'EIO' });
-      const count = Reflect.apply(write, fs, [fd, buffer, offset, Math.min(length, budget), at]) as number;
-      budget -= count;
-      return count;
-    }) as typeof fs.writeSync);
-    const producer = receipts.capture(id, 64 * 1024, true);
-    try {
-      fs.appendFileSync(stdout, frames[1]);
-      fs.appendFileSync(stderr, 'f\n');
-      budget = 128 + 50;
-      assert.throws(() => producer.defer(captureLimits), /Producer ended/);
-    } finally {
-      budget = Infinity;
-      producer.close();
-    }
-    fs.appendFileSync(stdout, frames[2]);
-    blocked = false;
-    const status = (await superviseStandalone(receipts, id, true, undefined, recoveryRuntime)) as any;
-    const expected = `${frames[0]}e\n${frames[1]}f\n${frames[2]}`;
-    const published = fs.readFileSync(alias, 'utf8');
-    if (published !== expected) {
-      assert.ok(expected.startsWith(published), published);
-      assert.equal(status.observation.reason, 'The requested log is incomplete. Private output remains available.');
-    }
+    const recovery = await heldBoundaryRecovery({ budget: 128 + 50 }, 'dies');
+    assert.ok(orderedOrIncomplete(recovery), recovery.published);
+  },
+);
+
+test(
+  'capture recovery keeps arrival order or reports the log incomplete after a producer ends between queue records',
+  { tags: ['subprocess'] },
+  async () => {
+    const recovery = await heldBoundaryRecovery({ budget: 128 }, 'dies');
+    assert.ok(orderedOrIncomplete(recovery), recovery.published);
+  },
+);
+
+test(
+  'capture recovery keeps arrival order or reports the log incomplete after a producer ends with no queue record written',
+  { tags: ['subprocess'] },
+  async () => {
+    const recovery = await heldBoundaryRecovery({ denied: 1 }, 'dies');
+    assert.ok(orderedOrIncomplete(recovery), recovery.published);
+  },
+);
+
+test(
+  'capture recovery keeps arrival order or reports the log incomplete after a producer closes with boundaries it cannot write',
+  { tags: ['subprocess'] },
+  async () => {
+    const recovery = await heldBoundaryRecovery({ denied: 2 }, 'closes and dies');
+    assert.ok(orderedOrIncomplete(recovery), recovery.published);
+  },
+);
+
+test(
+  'capture recovery keeps arrival order after a producer writes its held boundaries as it closes',
+  { tags: ['subprocess'] },
+  async () => {
+    const { published, expected } = await heldBoundaryRecovery({ denied: 1 }, 'closes');
+    assert.equal(published, expected);
   },
 );
 
