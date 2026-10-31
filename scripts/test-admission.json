@@ -57,7 +57,7 @@
   "extension/src/codex.test.ts": {
     "reason": "Real Git worktree ownership and descendant source resolution must agree with recorded Codex session relationships. Compressed rollout catalogs must preserve decoded metadata, prefer plain copies, and avoid preparing bodies.",
     "cases": 497,
-    "matricesSha256": "52c0191fdd71432c21397fa445ae156c0ecfcfb817b7f13481bec9bc9290b613"
+    "matricesSha256": "4d3079fff466d12a20b79bc26534c74852019926e9e580f22e7affc4e5bd3374"
   },
   "extension/src/derivedcache.test.ts": {
     "reason": "Independent writers and host death must preserve shared cache rows and release stale filesystem locks.",

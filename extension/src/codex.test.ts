@@ -1364,7 +1364,7 @@ test('dispatch evidence loss remains partial after a newline, resumption, and EO
   assert.equal(scanCodexDispatchReferences(file, 'parent', scan.cursor).complete, false);
 });
 
-test.each(['after each read that reaches new bytes', 'on its own clock'])(
+test.each(['after each read that reaches new bytes', 'on its own clock', 'on its own clock while its scan fails'])(
   'a Codex rollout that grows during its read completes at its opening size and reads the growth next, with a writer that appends %s',
   async (writer) => {
     const file = writeRollout([
@@ -1378,6 +1378,7 @@ test.each(['after each read that reaches new bytes', 'on its own clock'])(
     const opening = fs.statSync(file).size;
     // The first writer appends a record after every read that reaches new bytes. The second appends every millisecond on its
     // own thread, so its appends also land during check reads, and a read can end unqualified and finish in a later quantum.
+    // The third is the second under a scan that fails at its first read, and the writer must stop all the same.
     let appends = 0;
     let furthest = 0;
     let grewDuringRead = false;
@@ -1385,6 +1386,7 @@ test.each(['after each read that reaches new bytes', 'on its own clock'])(
     const meter = {
       readBytes: 0,
       onRead: (bytes: Buffer, offset: number) => {
+        if (writer === 'on its own clock while its scan fails') throw new Error('the scan failed');
         if (writer === 'on its own clock') {
           const size = fs.statSync(file).size;
           if (quantumSize && size > quantumSize) grewDuringRead = true;
@@ -1397,19 +1399,34 @@ test.each(['after each read that reaches new bytes', 'on its own clock'])(
         fs.appendFileSync(file, '{"type":"ignored"}\n');
       },
     };
-    const stop = writer === 'on its own clock' ? await clockWriter([file], 1, '{"type":"ignored"}\n') : undefined;
-    let scan: Awaited<ReturnType<typeof scanCodexDispatchReferencesAsync>>;
+    const stop =
+      writer === 'after each read that reaches new bytes'
+        ? undefined
+        : await clockWriter([file], 1, '{"type":"ignored"}\n');
+    let stopped = false;
     let times: number[] = [];
-    try {
-      scan = await scanCodexDispatchReferencesAsync(file, 'parent', null, 1024 * 1024, () => false, meter);
-      if (stop)
-        for (let pass = 0; !scan.complete && pass < 8; pass++) {
-          quantumSize = 0;
-          scan = await scanCodexDispatchReferencesAsync(file, 'parent', scan.cursor, 1024 * 1024, () => false, meter);
+    const scanned = (async () => {
+      try {
+        let scan = await scanCodexDispatchReferencesAsync(file, 'parent', null, 1024 * 1024, () => false, meter);
+        if (stop)
+          for (let pass = 0; !scan.complete && pass < 8; pass++) {
+            quantumSize = 0;
+            scan = await scanCodexDispatchReferencesAsync(file, 'parent', scan.cursor, 1024 * 1024, () => false, meter);
+          }
+        return scan;
+      } finally {
+        if (stop) {
+          times = await stop();
+          stopped = true;
         }
-    } finally {
-      if (stop) times = await stop();
+      }
+    })();
+    if (writer === 'on its own clock while its scan fails') {
+      await assert.rejects(scanned, /the scan failed/);
+      assert.equal(stopped, true, 'the writer kept appending after the scan failed');
+      return;
     }
+    const scan = await scanned;
     if (stop) {
       assert.ok(grewDuringRead, `the rollout never grew during a read in ${times.length} appends`);
       assert.equal(scan.complete, true, 'the rollout never completed while its writer ran');
