@@ -837,9 +837,71 @@ function failCheckpointSave(receipts: DispatchReceipts, id: string, failing: () 
 test.each([
   { filled: 'the checkpoint queue', kept: 'arrival order' },
   { filled: 'the checkpoint read allowance', kept: 'a readable checkpoint' },
-] as const)(
-  'source producer keeps $kept through an alias outage that fills $filled',
-  async ({ filled }) => {
+] as const)('source producer keeps $kept through an alias outage that fills $filled', async ({ filled }) => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'setImmediate'] });
+  vi.spyOn(Date, 'now').mockReturnValue(0);
+  if (process.send) vi.spyOn(process, 'send').mockImplementation(() => true);
+  vi.spyOn(process, 'disconnect').mockImplementation(() => {});
+  const child = providerChild();
+  vi.mocked(childProcess.spawn).mockReturnValue(child);
+  const { receipts, launch } = workerFixture('', 100, false, true);
+  const id = launch.launchId;
+  const stdout = receipts.artifact(id, 'stdout.log');
+  const stderr = receipts.artifact(id, 'stderr.log');
+  fs.writeFileSync(stdout, 'A\n');
+  fs.writeFileSync(stderr, 'e\n');
+  const alias = launch.standalone!.logAlias!;
+  let blocked = true;
+  denyOpen(alias, () => blocked);
+  const checkpoint = receipts.artifact(id, 'capture.json');
+  let expected = 'A\ne\n';
+  let count = 0;
+  const interval = () => {
+    count++;
+    fs.appendFileSync(stdout, `${count}\n`);
+    fs.appendFileSync(stderr, `e${count}\n`);
+    expected += `${count}\ne${count}\n`;
+  };
+  const size = JSON.stringify({ name: 'stdout.log', offset: 99_999, identity: channelIdentity(stdout) }).length + 1;
+  queueOutage(receipts, id, interval, (state) =>
+    filled === 'the checkpoint queue'
+      ? state.pending.length >= 256
+      : JSON.stringify(state).length >= 48 * 1024 - 4 * size,
+  );
+  const running = produceStandaloneOutput(receipts, id);
+  await vi.advanceTimersByTimeAsync(0);
+  child.emit('spawn');
+  for (let live = 0; live < 4; live++) {
+    interval();
+    await vi.advanceTimersByTimeAsync(50);
+  }
+  const owner = artifactJson(receipts, id, 'output-owner.json');
+  assert.equal(owner.state, 'capturing', owner.reason);
+  assert.ok(fs.statSync(checkpoint).size < 48 * 1024);
+  // The checkpoint queue case covers arrival order, so this case ends during the outage.
+  if (filled === 'the checkpoint read allowance') {
+    child.emit('close', 0, null);
+    await vi.runAllTimersAsync();
+    await running;
+    assert.equal(fs.statSync(alias).size, 0);
+    assert.equal(
+      artifactJson(receipts, id, 'output-owner.json').reason,
+      'Error: The requested log is incomplete. Private output remains available.',
+    );
+    return;
+  }
+  blocked = false;
+  child.emit('close', 0, null);
+  await vi.runAllTimersAsync();
+  await running;
+  assert.equal(fs.readFileSync(alias, 'utf8'), expected);
+  assert.equal(artifactJson(receipts, id, 'output-owner.json').state, 'finished');
+  assert.equal(artifactJson(receipts, id, 'capture.json').pending, undefined);
+});
+
+test.each(['an append', 'a refill'] as const)(
+  'source producer keeps arrival order through a transient queue file failure during %s',
+  async (failure) => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'setImmediate'] });
     vi.spyOn(Date, 'now').mockReturnValue(0);
     if (process.send) vi.spyOn(process, 'send').mockImplementation(() => true);
@@ -853,9 +915,20 @@ test.each([
     fs.writeFileSync(stdout, 'A\n');
     fs.writeFileSync(stderr, 'e\n');
     const alias = launch.standalone!.logAlias!;
+    const queueFile = receipts.artifact(id, 'capture-queue.log');
     let blocked = true;
-    denyOpen(alias, () => blocked);
-    const checkpoint = receipts.artifact(id, 'capture.json');
+    let denyQueue = false;
+    let denied = 0;
+    const open = fs.openSync;
+    vi.spyOn(fs, 'openSync').mockImplementation((file, ...args) => {
+      if (String(file) === alias && blocked) throw Object.assign(new Error('Alias unavailable'), { code: 'EPERM' });
+      if (String(file) === queueFile && denyQueue) {
+        denyQueue = false;
+        denied++;
+        throw Object.assign(new Error('Queue unavailable'), { code: 'EACCES' });
+      }
+      return Reflect.apply(open, fs, [file, ...args]);
+    });
     let expected = 'A\ne\n';
     let count = 0;
     const interval = () => {
@@ -864,41 +937,30 @@ test.each([
       fs.appendFileSync(stderr, `e${count}\n`);
       expected += `${count}\ne${count}\n`;
     };
-    const size = JSON.stringify({ name: 'stdout.log', offset: 99_999, identity: channelIdentity(stdout) }).length + 1;
-    queueOutage(receipts, id, interval, (state) =>
-      filled === 'the checkpoint queue'
-        ? state.pending.length >= 256
-        : JSON.stringify(state).length >= 48 * 1024 - 4 * size,
-    );
+    queueOutage(receipts, id, interval, (state) => state.pending.length >= 256);
     const running = produceStandaloneOutput(receipts, id);
     await vi.advanceTimersByTimeAsync(0);
     child.emit('spawn');
     for (let live = 0; live < 4; live++) {
+      if (failure === 'an append' && live === 1) denyQueue = true;
       interval();
       await vi.advanceTimersByTimeAsync(50);
     }
-    const owner = artifactJson(receipts, id, 'output-owner.json');
+    let owner = artifactJson(receipts, id, 'output-owner.json');
     assert.equal(owner.state, 'capturing', owner.reason);
-    assert.ok(fs.statSync(checkpoint).size < 48 * 1024);
-    // The checkpoint queue case covers arrival order, so this case ends during the outage.
-    if (filled === 'the checkpoint read allowance') {
-      child.emit('close', 0, null);
-      await vi.runAllTimersAsync();
-      await running;
-      assert.equal(fs.statSync(alias).size, 0);
-      assert.equal(
-        artifactJson(receipts, id, 'output-owner.json').reason,
-        'Error: The requested log is incomplete. Private output remains available.',
-      );
-      return;
-    }
     blocked = false;
+    if (failure === 'a refill') {
+      denyQueue = true;
+      await vi.advanceTimersByTimeAsync(50);
+      owner = artifactJson(receipts, id, 'output-owner.json');
+      assert.equal(owner.state, 'capturing', owner.reason);
+    }
+    assert.equal(denied, 1);
     child.emit('close', 0, null);
     await vi.runAllTimersAsync();
     await running;
     assert.equal(fs.readFileSync(alias, 'utf8'), expected);
     assert.equal(artifactJson(receipts, id, 'output-owner.json').state, 'finished');
-    assert.equal(artifactJson(receipts, id, 'capture.json').pending, undefined);
   },
 );
 
@@ -935,7 +997,14 @@ test.each(['the checkpoint', 'the queue file'] as const)(
     try {
       interval(frames[1], 'f\n');
       ending = true;
-      assert.throws(() => producer.defer([['stdout.log', 64 * 1024], ['stderr.log', 64 * 1024]]), /Checkpoint/);
+      assert.throws(
+        () =>
+          producer.defer([
+            ['stdout.log', 64 * 1024],
+            ['stderr.log', 64 * 1024],
+          ]),
+        /Checkpoint/,
+      );
       ending = false;
     } finally {
       producer.close();
@@ -965,11 +1034,19 @@ test(
     const alias = launch.standalone!.logAlias!;
     let blocked = true;
     denyOpen(alias, () => blocked);
-    queueOutage(receipts, id, () => {}, (state) => state.pending.length >= 2);
+    queueOutage(
+      receipts,
+      id,
+      () => {},
+      (state) => state.pending.length >= 2,
+    );
     let failing = false;
     failCheckpointSave(receipts, id, () => failing, 'EACCES');
     const producer = receipts.capture(id, 64 * 1024, true);
-    const limits = [['stdout.log', 64 * 1024], ['stderr.log', 64 * 1024]] as const;
+    const limits = [
+      ['stdout.log', 64 * 1024],
+      ['stderr.log', 64 * 1024],
+    ] as const;
     try {
       fs.appendFileSync(stdout, frames[1]);
       fs.appendFileSync(stderr, 'f\n');

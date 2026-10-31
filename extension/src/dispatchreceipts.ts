@@ -920,15 +920,17 @@ export class DispatchReceipts {
       return state;
     };
     load();
-    const save = (state: SourceCaptureState) => {
+    // A transient checkpoint or queue file failure keeps the previous checkpoint, and the caller retries.
+    const transient = <T>(operation: () => T): T => {
       try {
-        writeFileAtomically(checkpoint, JSON.stringify(state), this.replace, 0o600, false);
+        return operation();
       } catch (cause) {
-        // A transient checkpoint failure keeps the previous checkpoint, and the caller retries.
         if (!['EPERM', 'EACCES', 'EBUSY'].includes((cause as NodeJS.ErrnoException).code ?? '')) throw cause;
         throw Object.assign(new Error('The requested log is temporarily unavailable.', { cause }), { code: 'EPERM' });
       }
     };
+    const save = (state: SourceCaptureState) =>
+      transient(() => writeFileAtomically(checkpoint, JSON.stringify(state), this.replace, 0o600, false));
     const openAlias = (state: SourceCaptureState) => {
       if (!state.alias) return null;
       try {
@@ -971,53 +973,55 @@ export class DispatchReceipts {
       return fd;
     };
     // Reads `count` records from `position`, as far as the file reaches. An unreadable record reads as null.
-    const readQueue = (position: number, count: number) => {
-      const buffer = Buffer.alloc(count * QUEUE_RECORD_BYTES);
-      const fd = openQueue(fs.constants.O_RDONLY);
-      let read = 0;
-      try {
-        while (read < buffer.length) {
-          const bytes = fs.readSync(fd, buffer, read, buffer.length - read, position + read);
-          if (!bytes) break;
-          read += bytes;
-        }
-      } finally {
-        fs.closeSync(fd);
-      }
-      return Array.from({ length: Math.floor(read / QUEUE_RECORD_BYTES) }, (_, index): PendingSlice | null => {
+    const readQueue = (position: number, count: number) =>
+      transient(() => {
+        const buffer = Buffer.alloc(count * QUEUE_RECORD_BYTES);
+        const fd = openQueue(fs.constants.O_RDONLY);
+        let read = 0;
         try {
-          const slice = JSON.parse(
-            buffer.toString('utf8', index * QUEUE_RECORD_BYTES, (index + 1) * QUEUE_RECORD_BYTES),
-          ) as PendingSlice;
-          if (
-            (slice?.name === 'stdout.log' || slice?.name === 'stderr.log') &&
-            Number.isSafeInteger(slice.offset) &&
-            typeof slice.identity === 'string'
-          )
-            return { name: slice.name, offset: slice.offset, identity: slice.identity };
-        } catch {
-          /* The caller decides what an unreadable record means. */
+          while (read < buffer.length) {
+            const bytes = fs.readSync(fd, buffer, read, buffer.length - read, position + read);
+            if (!bytes) break;
+            read += bytes;
+          }
+        } finally {
+          fs.closeSync(fd);
         }
-        return null;
+        return Array.from({ length: Math.floor(read / QUEUE_RECORD_BYTES) }, (_, index): PendingSlice | null => {
+          try {
+            const slice = JSON.parse(
+              buffer.toString('utf8', index * QUEUE_RECORD_BYTES, (index + 1) * QUEUE_RECORD_BYTES),
+            ) as PendingSlice;
+            if (
+              (slice?.name === 'stdout.log' || slice?.name === 'stderr.log') &&
+              Number.isSafeInteger(slice.offset) &&
+              typeof slice.identity === 'string'
+            )
+              return { name: slice.name, offset: slice.offset, identity: slice.identity };
+          } catch {
+            /* The caller decides what an unreadable record means. */
+          }
+          return null;
+        });
       });
-    };
-    const appendQueue = (position: number, slices: readonly PendingSlice[]) => {
-      const records = Buffer.concat(
-        slices.map((slice) => Buffer.from(`${JSON.stringify(slice).padEnd(QUEUE_RECORD_BYTES - 1)}\n`)),
-      );
-      if (records.length !== slices.length * QUEUE_RECORD_BYTES)
-        throw new Error('The saved log position is unavailable.');
-      const fd = openQueue(fs.constants.O_WRONLY | fs.constants.O_CREAT);
-      try {
-        for (let written = 0; written < records.length;) {
-          const count = fs.writeSync(fd, records, written, records.length - written, position + written);
-          if (!count) throw new Error('The saved log position is unavailable.');
-          written += count;
+    const appendQueue = (position: number, slices: readonly PendingSlice[]) =>
+      transient(() => {
+        const records = Buffer.concat(
+          slices.map((slice) => Buffer.from(`${JSON.stringify(slice).padEnd(QUEUE_RECORD_BYTES - 1)}\n`)),
+        );
+        if (records.length !== slices.length * QUEUE_RECORD_BYTES)
+          throw new Error('The saved log position is unavailable.');
+        const fd = openQueue(fs.constants.O_WRONLY | fs.constants.O_CREAT);
+        try {
+          for (let written = 0; written < records.length;) {
+            const count = fs.writeSync(fd, records, written, records.length - written, position + written);
+            if (!count) throw new Error('The saved log position is unavailable.');
+            written += count;
+          }
+        } finally {
+          fs.closeSync(fd);
         }
-      } finally {
-        fs.closeSync(fd);
-      }
-    };
+      });
     const queuedEnd = (state: SourceCaptureState, name: PendingSlice['name']) => {
       let offset = state.sources[name]?.offset ?? 0;
       for (const slice of state.pending ?? []) if (slice.name === name) offset = slice.offset;
@@ -1028,7 +1032,7 @@ export class DispatchReceipts {
     // not pass its channel's queued end ends them, such as a record left from a queue that drained.
     const unsaved = (state: SourceCaptureState) => {
       const end = state.records?.end ?? 0;
-      const stat = fs.statSync(queueFile, { throwIfNoEntry: false });
+      const stat = transient(() => fs.statSync(queueFile, { throwIfNoEntry: false }));
       if (!stat || stat.size - end < QUEUE_RECORD_BYTES) return [];
       const ends = { 'stdout.log': queuedEnd(state, 'stdout.log'), 'stderr.log': queuedEnd(state, 'stderr.log') };
       const slices: PendingSlice[] = [];
