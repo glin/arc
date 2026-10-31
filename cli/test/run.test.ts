@@ -1140,6 +1140,61 @@ test(
   },
 );
 
+test(
+  'capture recovery keeps the boundaries that a live producer holds after a queue file failure',
+  { tags: ['subprocess'] },
+  async () => {
+    const { receipts, launch } = workerFixture('', 100, false, true);
+    const id = launch.launchId;
+    const frames = outputFrames().split(/(?<=\n)/);
+    stoppedOutput(receipts, id, frames[0], 'e\n');
+    const stdout = receipts.artifact(id, 'stdout.log');
+    const stderr = receipts.artifact(id, 'stderr.log');
+    const queueFile = receipts.artifact(id, 'capture-queue.log');
+    const alias = launch.standalone!.logAlias!;
+    let blocked = true;
+    let denyQueue = false;
+    const open = fs.openSync;
+    vi.spyOn(fs, 'openSync').mockImplementation((file, ...args) => {
+      if (String(file) === alias && blocked) throw Object.assign(new Error('Alias unavailable'), { code: 'EPERM' });
+      if (String(file) === queueFile && denyQueue) {
+        denyQueue = false;
+        throw Object.assign(new Error('Queue unavailable'), { code: 'EACCES' });
+      }
+      return Reflect.apply(open, fs, [file, ...args]);
+    });
+    queueOutage(
+      receipts,
+      id,
+      () => {},
+      (state) => state.pending.length >= 2,
+    );
+    const producer = receipts.capture(id, 64 * 1024, true);
+    const recovery = receipts.capture(id, 64 * 1024, true);
+    try {
+      fs.appendFileSync(stdout, frames[1]);
+      fs.appendFileSync(stderr, 'f\n');
+      denyQueue = true;
+      assert.throws(() => producer.defer(captureLimits), /temporarily unavailable/);
+      fs.appendFileSync(stdout, frames[2] + frames[3]);
+      fs.appendFileSync(stderr, 'g\n');
+      // Another capture starts its drain while the producer still holds B and f, and retries later as its drain does.
+      try {
+        recovery.defer(captureLimits);
+      } catch (error) {
+        assert.match(String(error), /Another process holds this dispatch write/);
+      }
+      producer.defer(captureLimits);
+    } finally {
+      producer.close();
+      recovery.close();
+    }
+    blocked = false;
+    await superviseStandalone(receipts, id, true, undefined, recoveryRuntime);
+    assert.equal(fs.readFileSync(alias, 'utf8'), `${frames[0]}e\n${frames[1]}f\n${frames[2]}${frames[3]}g\n`);
+  },
+);
+
 test.each(['truncated', 'redirected'] as const)(
   'source producer retains capture and worker exit after a %s alias',
   async (change) => {

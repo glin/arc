@@ -131,6 +131,8 @@ class DispatchPathRedirected extends Error {
     super('The dispatch path is redirected.');
   }
 }
+type LockHold = { owner?: string; keep: () => boolean };
+
 // An alias publication that failed, or waits behind an earlier unpublished slice, keeps its slice queued for a retry.
 export class CapturePublicationPending extends Error {
   readonly code = 'EPERM';
@@ -1042,13 +1044,13 @@ export class DispatchReceipts {
       return Math.max(offset, state.records?.ends[name] ?? 0);
     };
     // Records past the saved end are boundaries that a capture wrote before a save that never happened, because the
-    // capture ended or its save failed. They keep their file order ahead of later output.
+    // capture ended or its save failed. They keep their file order ahead of later output, as far as `limit`.
     // A complete record that does not pass its channel's queued end is left from a queue that drained, and ends them.
     // A record that stops partway or fails its checksum leaves the order of later output unknown.
-    const unsaved = (state: SourceCaptureState) => {
+    const unsaved = (state: SourceCaptureState, limit = Infinity) => {
       const end = state.records?.end ?? 0;
       const stat = transient(() => fs.statSync(queueFile, { throwIfNoEntry: false }));
-      const size = stat?.size ?? 0;
+      const size = Math.min(stat?.size ?? 0, limit);
       const ends = { 'stdout.log': queuedEnd(state, 'stdout.log'), 'stderr.log': queuedEnd(state, 'stderr.log') };
       const slices: PendingSlice[] = [];
       let position = end;
@@ -1095,8 +1097,12 @@ export class DispatchReceipts {
       }
       records.read += count * QUEUE_RECORD_BYTES;
     };
-    // Boundaries that a failed queue file write did not keep, in arrival order. The next deferral writes them first.
+    // Boundaries that a failed queue file write did not keep, in arrival order, and the position where they start.
+    // The next deferral writes them first. Until then this capture keeps the write lock, so no other capture
+    // publishes output that follows them.
     let held: PendingSlice[] = [];
+    let heldAt = 0;
+    const hold: LockHold = { keep: () => held.length > 0 };
     return {
       delivered: () => load().aliasBytes ?? 0,
       pendingSources: () => load().pending ?? [],
@@ -1126,7 +1132,7 @@ export class DispatchReceipts {
               }
               return stat;
             };
-            const boundaries = unsaved(state);
+            const boundaries = unsaved(state, held.length ? heldAt : Infinity);
             const written = boundaries.length;
             const ends = { 'stdout.log': queuedEnd(state, 'stdout.log'), 'stderr.log': queuedEnd(state, 'stderr.log') };
             for (const slice of boundaries) ends[slice.name] = slice.offset;
@@ -1153,13 +1159,16 @@ export class DispatchReceipts {
             if (!boundaries.length) return;
             // The queue file names each boundary before the checkpoint does, so the next capture finds the boundaries
             // of a save that never happened.
-            if (held.length)
-              appendQueue((state.records?.end ?? 0) + written * QUEUE_RECORD_BYTES, held, !state.records && !written);
+            if (held.length) {
+              heldAt = (state.records?.end ?? 0) + written * QUEUE_RECORD_BYTES;
+              appendQueue(heldAt, held, !state.records && !written);
+            }
             held = [];
             for (const slice of boundaries) enqueue(state, slice);
             save(state);
           },
           'capture-write',
+          hold,
         ),
       cursor: (name: CaptureSource): CaptureCursor => ({ ...(load().sources[name] ?? { offset: 0, identity: '' }) }),
       write: (bytes: Buffer, name?: CaptureSource, cursor?: CaptureCursor) =>
@@ -1238,6 +1247,7 @@ export class DispatchReceipts {
               }
           },
           'capture-write',
+          hold,
         ),
       flushAlias: () => {
         const state = load();
@@ -1277,12 +1287,21 @@ export class DispatchReceipts {
             return false;
           },
           'capture-write',
+          hold,
         );
       },
       native: (_bytes: Buffer, _cursor?: CaptureCursor) => {
         throw new Error('This launch has no native log capture.');
       },
-      close: () => {},
+      // Boundaries still held end with this capture, as output that no capture observed.
+      close: () => {
+        if (hold.owner)
+          try {
+            this.release(id, 'capture-write', hold.owner, hold);
+          } catch {
+            /* A lock whose owner process ended admits the next capture. */
+          }
+      },
     };
   }
   capture(id: string, aliasByteBudget = CAPTURE_SLICE_BYTES, sourceFiles = false) {
@@ -2236,18 +2255,23 @@ export class DispatchReceipts {
       false,
     );
   }
-  private lock<T>(id: string, work: () => T, name = 'write'): T {
+  // A caller that passes `hold` keeps the lock after `work` while `hold.keep()` is true, and reenters it on its next
+  // call. Other callers find a live owner until a later call or `release` ends the hold.
+  private lock<T>(id: string, work: () => T, name = 'write', hold?: LockHold): T {
     this.launch(id);
     const file = this.file(id, `${name}.lock`);
-    const temporary = this.file(id, `${name}.${process.pid}.${randomUUID()}.lock`);
-    const owner = JSON.stringify({ pid: process.pid, token: randomUUID(), launchId: id });
-    exclusive(temporary, owner);
-    let acquired = false;
+    const kept = hold?.owner;
+    const temporary = kept ? null : this.file(id, `${name}.${process.pid}.${randomUUID()}.lock`);
+    const owner = kept ?? JSON.stringify({ pid: process.pid, token: randomUUID(), launchId: id });
+    if (temporary) exclusive(temporary, owner);
+    let acquired = Boolean(kept);
     let failure: { error: unknown } | undefined;
     let result: T | undefined;
     try {
       let target = file;
-      if (fs.existsSync(file)) {
+      if (kept) {
+        /* This caller already holds the lock. */
+      } else if (fs.existsSync(file)) {
         let current = file;
         for (let steps = 0; ; steps++) {
           const heldText = current === file ? readChanging(current) : read(current);
@@ -2280,17 +2304,20 @@ export class DispatchReceipts {
           break;
         }
       }
-      // Each immutable predecessor admits one successor, including concurrent dead-owner recovery.
-      fs.linkSync(temporary, target);
-      acquired = true;
-      if (target !== file) writeFileAtomically(file, owner, this.replace, 0o600, false);
+      if (temporary) {
+        // Each immutable predecessor admits one successor, including concurrent dead-owner recovery.
+        fs.linkSync(temporary, target);
+        acquired = true;
+        if (target !== file) writeFileAtomically(file, owner, this.replace, 0o600, false);
+      }
       result = work();
     } catch (error) {
       failure = { error };
     }
     try {
-      if (acquired) exclusive(this.file(id, `${name}.${JSON.parse(owner).token}.released`), owner);
-      fs.unlinkSync(temporary);
+      if (acquired && hold?.keep()) hold.owner = owner;
+      else if (acquired) this.release(id, name, owner, hold);
+      if (temporary) fs.unlinkSync(temporary);
     } catch (error) {
       if (failure)
         throw Object.assign(
@@ -2303,5 +2330,9 @@ export class DispatchReceipts {
     }
     if (failure) throw failure.error;
     return result!;
+  }
+  private release(id: string, name: string, owner: string, hold?: LockHold) {
+    exclusive(this.file(id, `${name}.${JSON.parse(owner).token}.released`), owner);
+    if (hold) hold.owner = undefined;
   }
 }
