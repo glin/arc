@@ -1239,6 +1239,82 @@ test(
   },
 );
 
+test(
+  'capture deferral reads one record of a queue file left from a drained queue',
+  { tags: ['subprocess'] },
+  async () => {
+    const { receipts, launch } = workerFixture('', 100, false, true);
+    const id = launch.launchId;
+    const frames = outputFrames().split(/(?<=\n)/);
+    stoppedOutput(receipts, id, frames[0], 'e\n');
+    const stdout = receipts.artifact(id, 'stdout.log');
+    const stderr = receipts.artifact(id, 'stderr.log');
+    const queueFile = receipts.artifact(id, 'capture-queue.log');
+    const alias = launch.standalone!.logAlias!;
+    let blocked = true;
+    denyOpen(alias, () => blocked);
+    let count = 0;
+    queueOutage(
+      receipts,
+      id,
+      () => {
+        fs.appendFileSync(stdout, frames[1]);
+        fs.appendFileSync(stderr, `e${++count}\n`);
+      },
+      (state) => state.pending.length >= 256,
+    );
+    const producer = receipts.capture(id, 64 * 1024, true);
+    try {
+      for (let interval = 0; interval < 8; interval++) {
+        fs.appendFileSync(stdout, frames[1]);
+        fs.appendFileSync(stderr, `f${interval}\n`);
+        producer.defer(captureLimits);
+      }
+    } finally {
+      producer.close();
+    }
+    // The drain cannot delete the queue file.
+    const remove = fs.rmSync;
+    vi.spyOn(fs, 'rmSync').mockImplementation((file, ...args) => {
+      if (String(file) === queueFile) throw Object.assign(new Error('Queue busy'), { code: 'EBUSY' });
+      return Reflect.apply(remove, fs, [file, ...args]);
+    });
+    blocked = false;
+    await superviseStandalone(receipts, id, true, undefined, recoveryRuntime);
+    assert.equal(artifactJson(receipts, id, 'capture.json').pending, undefined);
+    assert.ok(fs.statSync(queueFile).size >= 16 * 128);
+    // A second outage queues new output behind the file's old records.
+    blocked = true;
+    fs.appendFileSync(stdout, frames[2]);
+    const capture = receipts.capture(id, 64 * 1024, true);
+    try {
+      const committed = artifactJson(receipts, id, 'capture.json').sources['stdout.log'].offset;
+      const cursor = { offset: fs.statSync(stdout).size, identity: channelIdentity(stdout) };
+      const unpublished = fs.readFileSync(stdout).subarray(committed);
+      assert.throws(() => capture.write(unpublished, 'stdout.log', cursor), /temporarily unavailable/);
+      fs.appendFileSync(stdout, frames[3]);
+      fs.appendFileSync(stderr, 'g\n');
+      let bytes = 0;
+      const read = fs.readSync;
+      vi.spyOn(fs, 'readSync').mockImplementation(((
+        fd: number,
+        buffer: Buffer,
+        offset: number,
+        length: number,
+        at: number,
+      ) => {
+        const result = Reflect.apply(read, fs, [fd, buffer, offset, length, at]) as number;
+        if (sameFile(fd, queueFile)) bytes += result;
+        return result;
+      }) as typeof fs.readSync);
+      capture.defer(captureLimits);
+      assert.equal(bytes, 128);
+    } finally {
+      capture.close();
+    }
+  },
+);
+
 test.each(['truncated', 'redirected'] as const)(
   'source producer retains capture and worker exit after a %s alias',
   async (change) => {

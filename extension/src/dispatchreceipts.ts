@@ -1053,16 +1053,18 @@ export class DispatchReceipts {
       const size = Math.min(stat?.size ?? 0, limit);
       const ends = { 'stdout.log': queuedEnd(state, 'stdout.log'), 'stderr.log': queuedEnd(state, 'stderr.log') };
       const slices: PendingSlice[] = [];
-      let position = end;
-      const records = size > end ? readQueue(end, Math.ceil((size - end) / QUEUE_RECORD_BYTES)) : [];
-      for (const slice of records) {
-        if (!slice) throw new Error('The requested log is incomplete. Private output remains available.');
-        if (slice.offset <= ends[slice.name]) return slices;
-        ends[slice.name] = slice.offset;
-        slices.push(slice);
-        position += QUEUE_RECORD_BYTES;
+      // The first read takes one record, so a record left from a drained queue costs one record. Each later read doubles.
+      for (let position = end, count = 1; position < size; count *= 2) {
+        const records = readQueue(position, Math.min(count, Math.ceil((size - position) / QUEUE_RECORD_BYTES)));
+        if (!records.length) throw new Error('The requested log is incomplete. Private output remains available.');
+        for (const slice of records) {
+          if (!slice) throw new Error('The requested log is incomplete. Private output remains available.');
+          if (slice.offset <= ends[slice.name]) return slices;
+          ends[slice.name] = slice.offset;
+          slices.push(slice);
+          position += QUEUE_RECORD_BYTES;
+        }
       }
-      if (position < size) throw new Error('The requested log is incomplete. Private output remains available.');
       return slices;
     };
     // Each boundary follows its own record in the queue file. A boundary in the last slice's channel extends that
