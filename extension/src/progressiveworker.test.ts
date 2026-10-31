@@ -5138,6 +5138,65 @@ test('a completed Codex parent defers later growth until the next refresh reads 
   }
 });
 
+test('a Codex parent that grows during every read completes its coverage and asks for no continuation', async () => {
+  const directory = tempDir('panel-progressive-codex-live-');
+  const childId = '7c9d29e3-d1e1-4f18-9fd4-a013b821bab3';
+  const child = path.join(directory, `${childId}.jsonl`);
+  fs.writeFileSync(child, JSON.stringify({ type: 'user', cwd: directory }) + String.fromCharCode(10));
+  const file = path.join(directory, 'parent.jsonl');
+  const line = (record: object) => JSON.stringify(record) + String.fromCharCode(10);
+  fs.writeFileSync(
+    file,
+    line({ type: 'session_meta', timestamp: timestamp(0), payload: { id: 'parent', cwd: directory } }) +
+      line({ type: 'event_msg', timestamp: timestamp(1), payload: { type: 'task_started', turn_id: 'turn' } }) +
+      line({ type: 'turn_context', timestamp: timestamp(2), payload: { turn_id: 'turn' } }) +
+      line({
+        type: 'event_msg',
+        timestamp: timestamp(3),
+        payload: {
+          type: 'item_completed',
+          item: {
+            type: 'CommandExecution',
+            id: 'launch',
+            parsed_cmd: [{ type: 'unknown', cmd: 'python dispatch.py --arc-dispatch' }],
+            stdout: `ARC_DISPATCH_SESSION={"agent":"claude","session_id":"${childId}"}`,
+          },
+        },
+      }),
+  );
+  const opening = fs.statSync(file).size;
+  const worker = new ProgressiveWorker('performance.now=()=>0;' + liveWriters([file]) + source);
+  const stat = revisionOf(fs.statSync(file, { bigint: true }));
+  const childStat = revisionOf(fs.statSync(child, { bigint: true }));
+  try {
+    const result = await discoveryState(
+      worker,
+      {
+        kind: 'claude-children',
+        parents: [{ agent: 'codex', file, sessionId: 'parent', size: stat.size, mtimeMs: stat.mtimeMs }],
+        catalog: [
+          { agent: 'claude', file: child, sessionId: childId, size: childStat.size, mtimeMs: childStat.mtimeMs },
+        ],
+        repositoryRoots: [directory],
+      },
+      1,
+      new AbortController().signal,
+    );
+    assert.ok(fs.statSync(file).size > opening, 'the parent never grew during its read');
+    assert.ok(result?.value.kind === 'claude-children');
+    assert.equal(
+      result.value.referenceEntries.find(([, entry]) => entry.sessionId === 'parent')?.[1].complete,
+      true,
+      'growth during the read left the Codex coverage incomplete',
+    );
+    assert.equal(result.value.continuation, false, 'growth during the read asked for another pass');
+    assert.ok(result.value.references.some((reference) => reference.sessionId === childId));
+  } finally {
+    worker.stop();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('a rotated scan hides a changed parent until it reads the replacement receipt', async () => {
   const directory = tempDir('panel-progressive-codex-rotated-');
   const oldId = '5a7b07c1-bfcf-4d96-9eb2-8ef1fb609881';
