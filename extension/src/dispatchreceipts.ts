@@ -1206,6 +1206,18 @@ export class DispatchReceipts {
               queue.push({ name, ...cursor });
               save(state);
             }
+            // The next slices are read before alias publication, so a record that cannot be read leaves this slice
+            // unpublished and the checkpoint unchanged.
+            if (cursor.offset === queue[0].offset) {
+              queue.shift();
+              refill(state);
+            }
+            // Boundaries that another capture wrote and did not save follow the drained queue.
+            if (queued && !queue.length) for (const slice of unsaved(state)) enqueue(state, slice);
+            if (!queue.length) {
+              delete state.pending;
+              delete state.records;
+            }
             let fd: number | null = null;
             try {
               fd = openAlias(state);
@@ -1226,16 +1238,6 @@ export class DispatchReceipts {
             }
             state.bytes += bytes.length;
             state.sources[name] = { ...cursor };
-            if (cursor.offset === queue[0].offset) {
-              queue.shift();
-              refill(state);
-            }
-            // Boundaries that another capture wrote and did not save follow the drained queue.
-            if (queued && !queue.length) for (const slice of unsaved(state)) enqueue(state, slice);
-            if (!queue.length) {
-              delete state.pending;
-              delete state.records;
-            }
             save(state);
             // The checkpoint names no position in the queue file of a drained queue.
             if (queued && !state.pending)

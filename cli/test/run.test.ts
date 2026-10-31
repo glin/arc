@@ -1195,6 +1195,50 @@ test(
   },
 );
 
+test(
+  'capture recovery publishes no slice past its checkpoint when a saved queue record is truncated',
+  { tags: ['subprocess'] },
+  async () => {
+    const { receipts, launch } = workerFixture('', 100, false, true);
+    const id = launch.launchId;
+    const frames = outputFrames().split(/(?<=\n)/);
+    stoppedOutput(receipts, id, frames[0], 'e\n');
+    const stdout = receipts.artifact(id, 'stdout.log');
+    const stderr = receipts.artifact(id, 'stderr.log');
+    const alias = launch.standalone!.logAlias!;
+    let blocked = true;
+    denyOpen(alias, () => blocked);
+    let expected = `${frames[0]}e\n`;
+    const interval = (out: string, err: string) => {
+      fs.appendFileSync(stdout, out);
+      fs.appendFileSync(stderr, err);
+      expected += out + err;
+    };
+    let count = 0;
+    queueOutage(
+      receipts,
+      id,
+      () => interval(frames[1], `e${++count}\n`),
+      (state) => state.pending.length >= 256,
+    );
+    const producer = receipts.capture(id, 64 * 1024, true);
+    try {
+      interval(frames[1], 'f\n');
+      producer.defer(captureLimits);
+    } finally {
+      producer.close();
+    }
+    const { records } = artifactJson(receipts, id, 'capture.json');
+    assert.ok(records.read < records.end);
+    fs.truncateSync(receipts.artifact(id, 'capture-queue.log'), records.read + 64);
+    blocked = false;
+    await superviseStandalone(receipts, id, true, undefined, recoveryRuntime);
+    const published = fs.readFileSync(alias, 'utf8');
+    assert.ok(expected.startsWith(published));
+    assert.equal(Buffer.byteLength(published), artifactJson(receipts, id, 'capture.json').aliasBytes ?? 0);
+  },
+);
+
 test.each(['truncated', 'redirected'] as const)(
   'source producer retains capture and worker exit after a %s alias',
   async (change) => {
