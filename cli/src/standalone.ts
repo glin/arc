@@ -7,6 +7,7 @@ import { createHash } from 'node:crypto';
 import { isDeepStrictEqual, promisify } from 'node:util';
 import {
   CaptureOrderPending,
+  CaptureOrderUnknown,
   CapturePublicationPending,
   DispatchReceipts,
   DISPATCH_ID,
@@ -1589,7 +1590,7 @@ function logCapture(receipts: DispatchReceipts, id: string, bounds: ReadBounds) 
       try {
         queue(0);
       } catch (error) {
-        if (!(error instanceof CaptureOrderPending)) throw error;
+        if (!(error instanceof CaptureOrderPending || error instanceof CaptureOrderUnknown)) throw error;
       }
     // The checkpoint lists a bounded window of the queue. A finished window lists the next one.
     for (let window = capture.pendingSources(); window.length; window = capture.pendingSources())

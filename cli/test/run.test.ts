@@ -1257,11 +1257,16 @@ test(
   },
 );
 
-// Pending A and e reach the end of both channels, with no lost order marker, and every marker lookup fails.
-test(
-  'capture recovery publishes a saved queue that reaches the end of the output while the marker lookup fails',
+// Pending A and e reach the end of both channels, with no lost order marker, and every marker lookup fails with `code`.
+// With `later`, stdout B arrives past the saved queue. The marker cannot be written either.
+test.each([
+  { code: 'EBUSY', later: false },
+  { code: 'EIO', later: false },
+  { code: 'EIO', later: true },
+])(
+  'capture recovery publishes a saved queue while the marker lookup fails with $code and later output $later',
   { tags: ['subprocess'] },
-  async () => {
+  async ({ code, later }) => {
     const { receipts, launch } = workerFixture('', 100, false, true);
     const id = launch.launchId;
     const frames = outputFrames().split(/(?<=\n)/);
@@ -1277,10 +1282,19 @@ test(
       (state) => state.pending.length >= 2,
     );
     blocked = false;
-    failLookup(marker, () => true);
+    if (later) fs.appendFileSync(receipts.artifact(id, 'stdout.log'), frames[1]);
+    failLookup(marker, () => true, code);
+    const writeFile = fs.writeFileSync;
+    vi.spyOn(fs, 'writeFileSync').mockImplementation((file, ...args) => {
+      if (String(file) === marker) throw Object.assign(new Error('Marker unavailable'), { code: 'EACCES' });
+      return Reflect.apply(writeFile, fs, [file, ...args]);
+    });
     const status = (await superviseStandalone(receipts, id, true, undefined, recoveryRuntime)) as any;
+    // Nothing publishes past the saved queue while the lookup fails.
     assert.equal(fs.readFileSync(alias, 'utf8'), `${frames[0]}e\n`);
-    assert.notEqual(status.observation.reason, 'The requested log is incomplete. Private output remains available.');
+    const reason = status.observation.reason;
+    assert.equal(reason === 'The requested log is incomplete. Private output remains available.', later, reason);
+    assert.equal(fs.existsSync(marker), false);
   },
 );
 
