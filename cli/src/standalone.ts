@@ -6,6 +6,7 @@ import { spawn, execFile, ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { isDeepStrictEqual, promisify } from 'node:util';
 import {
+  CaptureOrderPending,
   CapturePublicationPending,
   DispatchReceipts,
   DISPATCH_ID,
@@ -1583,7 +1584,13 @@ function logCapture(receipts: DispatchReceipts, id: string, bounds: ReadBounds) 
       return true;
     };
     const finish = () => !capture.flushAlias() && sourceComplete();
-    if (capture.pendingSources().length) queue(0);
+    // A failed marker lookup holds the new output, and the saved queue still publishes in its known order.
+    if (capture.pendingSources().length)
+      try {
+        queue(0);
+      } catch (error) {
+        if (!(error instanceof CaptureOrderPending)) throw error;
+      }
     // The checkpoint lists a bounded window of the queue. A finished window lists the next one.
     for (let window = capture.pendingSources(); window.length; window = capture.pendingSources())
       for (const slice of window) {

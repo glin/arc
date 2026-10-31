@@ -140,6 +140,14 @@ export class CapturePublicationPending extends Error {
     super('The requested log is temporarily unavailable.', { cause });
   }
 }
+// A lookup of the lost order marker that failed leaves the order of new output unknown for a retry. The saved queue
+// keeps its known order and can still publish.
+export class CaptureOrderPending extends Error {
+  readonly code = 'EPERM';
+  constructor(cause?: unknown) {
+    super('The requested log is temporarily unavailable.', { cause });
+  }
+}
 function identity(file: string): FileIdentity {
   const stat = fs.lstatSync(file, { bigint: true });
   if (stat.isSymbolicLink()) throw new DispatchPathRedirected();
@@ -219,7 +227,7 @@ function marked(file: string): boolean {
   try {
     return fs.lstatSync(file, { throwIfNoEntry: false }) !== undefined;
   } catch {
-    throw Object.assign(new Error('The requested log is temporarily unavailable.'), { code: 'EPERM' });
+    throw new CaptureOrderPending();
   }
 }
 function mark(file: string, text: string): void {
@@ -1144,8 +1152,10 @@ export class DispatchReceipts {
           () => {
             const state = load();
             if (!state.pending) {
-              held = [];
-              return;
+              if (!held.length) return;
+              // The saved queue drained while the boundaries waited, so they start a new queue file.
+              heldAt = 0;
+              state.pending = [];
             }
             const stats = new Map<string, fs.BigIntStats>();
             const source = (name: PendingSlice['name']) => {
@@ -1242,6 +1252,8 @@ export class DispatchReceipts {
             if (queued) {
               if (queue[0].name !== name || cursor.offset > queue[0].offset) throw new CapturePublicationPending();
             } else {
+              // Output past held boundaries waits until a deferral writes them.
+              if (held.length) throw new CapturePublicationPending();
               if (orderLost()) throw new Error('The requested log is incomplete. Private output remains available.');
               // Save the slice's position before alias publication can fail.
               queue.push({ name, ...cursor });

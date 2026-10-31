@@ -341,6 +341,14 @@ function denyOpen(target: string, when: () => boolean = () => true, code = 'EPER
     return Reflect.apply(open, fs, [file, ...args]);
   });
 }
+// Fails a metadata lookup of `target` with `code` when `when()` is true.
+function failLookup(target: string, when: () => boolean, code = 'EIO') {
+  const lstat = fs.lstatSync;
+  return vi.spyOn(fs, 'lstatSync').mockImplementation(((file: fs.PathLike, options: any) => {
+    if (String(file) === target && when()) throw Object.assign(new Error('Marker unreadable'), { code });
+    return lstat(file, options);
+  }) as typeof fs.lstatSync);
+}
 function interceptCaptures(
   receipts: DispatchReceipts,
   edit: (capture: ReturnType<DispatchReceipts['capture']>) => void,
@@ -1188,6 +1196,8 @@ async function heldBoundaryRecovery(
     reason: status.observation.reason,
     expected: `${frames[0]}e\n${frames[1]}f\n${frames[2]}`,
     known: frames[0],
+    // A, e, and B, whose queue record a budget of 128 bytes completes.
+    recorded: `${frames[0]}e\n${frames[1]}`,
   };
 }
 // Recovery publishes the combined order, or a strict prefix of it that keeps A with the incomplete report.
@@ -1240,23 +1250,50 @@ test(
   'capture recovery reports the log incomplete when the lost order marker cannot be read',
   { tags: ['subprocess'] },
   async () => {
-    // A lookup that keeps failing settles no new boundary, so recovery holds the output that it read.
-    const { published, reason, expected } = await heldBoundaryRecovery({ budget: 128 }, 'dies', { marker: 'lookup' });
-    assert.ok(expected.startsWith(published), published);
+    // A lookup that keeps failing holds the new output, and recovery publishes the saved queue and the complete record.
+    const { published, reason, recorded } = await heldBoundaryRecovery({ budget: 128 }, 'dies', { marker: 'lookup' });
+    assert.equal(published, recorded);
     assert.equal(reason, 'The requested log is incomplete. Private output remains available.');
   },
 );
 
-// Behind pending A and e with no lost order marker, the marker lookup fails during the flush of stdout B and stderr f,
-// and the alias stays unavailable. Stdout C arrives after the lookup recovers. With `unwritable`, the marker cannot be
-// created during the failed lookup either.
-test.each([
-  { marker: 'can be written', unwritable: false },
-  { marker: 'cannot be written', unwritable: true },
-])(
-  'capture keeps arrival order after a marker lookup fails once when the marker $marker',
+// Pending A and e reach the end of both channels, with no lost order marker, and every marker lookup fails.
+test(
+  'capture recovery publishes a saved queue that reaches the end of the output while the marker lookup fails',
   { tags: ['subprocess'] },
-  async ({ unwritable }) => {
+  async () => {
+    const { receipts, launch } = workerFixture('', 100, false, true);
+    const id = launch.launchId;
+    const frames = outputFrames().split(/(?<=\n)/);
+    stoppedOutput(receipts, id, frames[0], 'e\n');
+    const marker = path.join(path.dirname(receipts.artifact(id, 'capture-queue.log')), 'capture-write.lost');
+    const alias = launch.standalone!.logAlias!;
+    let blocked = true;
+    denyOpen(alias, () => blocked);
+    queueOutage(
+      receipts,
+      id,
+      () => {},
+      (state) => state.pending.length >= 2,
+    );
+    blocked = false;
+    failLookup(marker, () => true);
+    const status = (await superviseStandalone(receipts, id, true, undefined, recoveryRuntime)) as any;
+    assert.equal(fs.readFileSync(alias, 'utf8'), `${frames[0]}e\n`);
+    assert.notEqual(status.observation.reason, 'The requested log is incomplete. Private output remains available.');
+  },
+);
+
+// Behind pending A and e with no lost order marker, the marker lookup fails during the flush of stdout B and stderr f.
+// Stdout C arrives after the lookup recovers. With `opens`, the alias accepts A and e during the failed lookup, and the
+// producer tries to publish stdout past them before and after the lookup recovers, as later flushes do.
+test.each([
+  { alias: 'stays unavailable', opens: false },
+  { alias: 'accepts the saved queue', opens: true },
+])(
+  'capture keeps arrival order after a marker lookup fails once while the alias $alias',
+  { tags: ['subprocess'] },
+  async ({ opens }) => {
     const { receipts, launch } = workerFixture('', 100, false, true);
     const id = launch.launchId;
     const frames = outputFrames().split(/(?<=\n)/);
@@ -1268,17 +1305,7 @@ test.each([
     let blocked = true;
     denyOpen(alias, () => blocked);
     let failing = false;
-    const lstat = fs.lstatSync;
-    vi.spyOn(fs, 'lstatSync').mockImplementation(((file: fs.PathLike, options: any) => {
-      if (failing && String(file) === marker) throw Object.assign(new Error('Marker unreadable'), { code: 'EIO' });
-      return lstat(file, options);
-    }) as typeof fs.lstatSync);
-    const writeFile = fs.writeFileSync;
-    vi.spyOn(fs, 'writeFileSync').mockImplementation((file, ...args) => {
-      if (failing && unwritable && String(file) === marker)
-        throw Object.assign(new Error('Marker unavailable'), { code: 'EACCES' });
-      return Reflect.apply(writeFile, fs, [file, ...args]);
-    });
+    failLookup(marker, () => failing);
     queueOutage(
       receipts,
       id,
@@ -1295,8 +1322,30 @@ test.each([
       } catch {
         /* The next flush settles the boundaries of this one. */
       }
+      const later = () => {
+        const bytes = fs.readFileSync(stdout);
+        const cursor = { offset: bytes.length, identity: channelIdentity(stdout) };
+        try {
+          producer.write(bytes.subarray(producer.cursor('stdout.log').offset), 'stdout.log', cursor);
+        } catch {
+          /* A flush retries the slice. */
+        }
+      };
+      if (opens) {
+        blocked = false;
+        const identity = channelIdentity(stdout);
+        producer.write(Buffer.from(frames[0]), 'stdout.log', { offset: frames[0].length, identity });
+        producer.write(Buffer.from('e\n'), 'stderr.log', { offset: 2, identity: channelIdentity(stderr) });
+        later();
+        try {
+          producer.defer(captureLimits);
+        } catch {
+          /* The lookup still fails. */
+        }
+      }
       failing = false;
       fs.appendFileSync(stdout, frames[2]);
+      if (opens) later();
       producer.defer(captureLimits);
     } finally {
       producer.close();
@@ -1321,11 +1370,7 @@ test(
     const marker = path.join(path.dirname(receipts.artifact(id, 'capture-queue.log')), 'capture-write.lost');
     const alias = launch.standalone!.logAlias!;
     let failing = true;
-    const lstat = fs.lstatSync;
-    vi.spyOn(fs, 'lstatSync').mockImplementation(((file: fs.PathLike, options: any) => {
-      if (failing && String(file) === marker) throw Object.assign(new Error('Marker unreadable'), { code: 'EIO' });
-      return lstat(file, options);
-    }) as typeof fs.lstatSync);
+    failLookup(marker, () => failing);
     const producer = receipts.capture(id, 64 * 1024, true);
     let fault: unknown;
     try {
