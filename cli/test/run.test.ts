@@ -1085,12 +1085,12 @@ function sameFile(fd: number, file: string) {
 // `budget` is the number of queue file bytes it writes, and `denied` the number of queue file opens that fail.
 // With `save`, it writes both records and its checkpoint save fails instead.
 // After the producer ends, stdout C arrives and a recovery runs.
-// `marker` fails the creation of `capture-write.lost`, and `corrupt` breaks the checksum of the last queue record
-// before recovery.
+// `marker` fails the creation or the metadata lookup of `capture-write.lost`, and `corrupt` breaks the checksum of the
+// last queue record before recovery.
 async function heldBoundaryRecovery(
   failure: { budget?: number; denied?: number; save?: true },
   ending: 'dies' | 'closes' | 'closes and dies',
-  fault: { marker?: 'write'; corrupt?: true } = {},
+  fault: { marker?: 'write' | 'lookup'; corrupt?: true } = {},
 ) {
   const { receipts, launch } = workerFixture('', 100, false, true);
   const id = launch.launchId;
@@ -1169,6 +1169,18 @@ async function heldBoundaryRecovery(
   }
   fs.appendFileSync(stdout, frames[2]);
   blocked = false;
+  // The marker lookup fails after recovery takes the lock and writes the marker.
+  if (fault.marker === 'lookup') {
+    // A metadata lookup that fails reads as an absent file through `existsSync`.
+    const exists = fs.existsSync;
+    vi.spyOn(fs, 'existsSync').mockImplementation((file) => String(file) !== marker && exists(file));
+    const lstat = fs.lstatSync;
+    vi.spyOn(fs, 'lstatSync').mockImplementation(((file: fs.PathLike, options: any) => {
+      if (String(file) === marker && fs.statSync(marker, { throwIfNoEntry: false }))
+        throw Object.assign(new Error('Marker unreadable'), { code: 'EIO' });
+      return lstat(file, options);
+    }) as typeof fs.lstatSync);
+  }
   const status = (await superviseStandalone(receipts, id, true, undefined, recoveryRuntime)) as any;
   return {
     published: fs.readFileSync(alias, 'utf8'),
@@ -1219,6 +1231,15 @@ test(
   { tags: ['subprocess'] },
   async () => {
     const recovery = await heldBoundaryRecovery({ denied: 2 }, 'closes and dies');
+    assert.ok(orderedOrIncomplete(recovery), recovery.published);
+  },
+);
+
+test(
+  'capture recovery reports the log incomplete when the lost order marker cannot be read',
+  { tags: ['subprocess'] },
+  async () => {
+    const recovery = await heldBoundaryRecovery({ budget: 128 }, 'dies', { marker: 'lookup' });
     assert.ok(orderedOrIncomplete(recovery), recovery.published);
   },
 );

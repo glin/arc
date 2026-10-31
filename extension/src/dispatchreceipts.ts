@@ -213,6 +213,22 @@ function exclusive(file: string, text: string): void {
   safePath(path.dirname(file));
   fs.writeFileSync(file, text, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
 }
+// A marker that exists, as any file type, stays written. Only a confirmed absence counts as no marker, so a marker
+// whose metadata cannot be read counts as written.
+function marked(file: string): boolean {
+  try {
+    return fs.lstatSync(file, { throwIfNoEntry: false }) !== undefined;
+  } catch {
+    return true;
+  }
+}
+function mark(file: string, text: string): void {
+  try {
+    exclusive(file, text);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+  }
+}
 function validId(id: string): void {
   if (!DISPATCH_ID.test(id)) throw new Error('The dispatch identity is invalid.');
 }
@@ -1041,14 +1057,8 @@ export class DispatchReceipts {
     // Output past the last boundary on record has no known place after the boundaries that an ended capture observed
     // and did not write, or after a queue record that stops partway or fails its checksum. The marker stays.
     const lostFile = this.file(id, 'capture-write.lost');
-    const orderLost = () => fs.existsSync(lostFile);
-    const loseOrder = () => {
-      try {
-        exclusive(lostFile, '');
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-      }
-    };
+    const orderLost = () => marked(lostFile);
+    const loseOrder = () => mark(lostFile, '');
     const queuedEnd = (state: SourceCaptureState, name: PendingSlice['name']) => {
       let offset = state.sources[name]?.offset ?? 0;
       for (const slice of state.pending ?? []) if (slice.name === name) offset = slice.offset;
@@ -2336,12 +2346,7 @@ export class DispatchReceipts {
             dead = (error as NodeJS.ErrnoException).code === 'ESRCH';
           }
           if (!dead) throw new Error('Another process holds this dispatch write.');
-          if (held.observes === true)
-            try {
-              exclusive(this.file(id, `${name}.lost`), heldText);
-            } catch (error) {
-              if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-            }
+          if (held.observes === true) mark(this.file(id, `${name}.lost`), heldText);
           target = successor;
           break;
         }
