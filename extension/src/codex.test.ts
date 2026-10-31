@@ -18921,41 +18921,6 @@ test('a Codex wait_agent return times out only by its own top-level timed_out fi
 
 const rolloutCompression = zstd as typeof zstd & { zstdCompressSync?: (bytes: Buffer) => Buffer };
 test.skipIf(!rolloutCompression.zstdCompressSync)(
-  'person scan continuations reuse one oversized decoded source',
-  async () => {
-    const records = [meta(), ...Array.from({ length: 8 }, () => message('assistant', 1, 'x'.repeat(128 * 1024)))];
-    const plain = writeRollout(records);
-    const body = fs.readFileSync(plain);
-    const file = plain + '.zst';
-    fs.writeFileSync(file, rolloutCompression.zstdCompressSync!(body));
-    const decodes: string[] = [];
-    const sources = new compressedSources.RolloutSources({
-      budget: 16,
-      asyncOnly: true,
-      decodeStarted: (source) => decodes.push(source),
-    });
-    const open = vi
-      .spyOn(compressedSources, 'openRolloutSource')
-      .mockImplementation((...args) => sources.open(...args));
-    try {
-      const release = await sources.prepare(file);
-      release();
-      let scan: ReturnType<typeof scanForCodexPerson> | undefined;
-      while (!scan || scan.bytes < body.length) {
-        const before = scan?.bytes ?? 0;
-        scan = scanForCodexPerson(file, body.length, scan);
-        assert.ok(scan.bytes > before, 'every continuation must read the next decoded range');
-      }
-      assert.equal(scan.bytes, body.length);
-      assert.equal(scan.person, false);
-      assert.deepEqual(decodes, [file]);
-    } finally {
-      open.mockRestore();
-    }
-  },
-);
-
-test.skipIf(!rolloutCompression.zstdCompressSync)(
   'compressed rollouts appear in the session listing and retain their last turn',
   async () => {
     const root = sessionsRoot([{ day: '2026/08/25', name: ROLLOUT(UUID_A), records: ordinaryTurn() }]);

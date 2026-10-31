@@ -326,14 +326,11 @@ export class RolloutSources {
     this.files.delete(entry.file);
     return true;
   }
-  private retryDiscarded(): void {
+  private trim(keep?: Decoded): void {
     for (const file of [...this.discarded].slice(0, 8)) {
       this.discarded.delete(file);
       if (!this.files.get(file)?.users) this.remove({ file });
     }
-  }
-  private trim(keep?: Decoded): void {
-    this.retryDiscarded();
     let used = [...this.files.values()].reduce((total, entry) => total + entry.size, 0);
     for (const [key, entry] of this.cache) {
       if (used <= (this.options.budget ?? 256 * 1024 * 1024)) break;
@@ -367,7 +364,7 @@ export class RolloutSources {
         released = true;
         entry.users--;
         if (!entry.users && ![...this.cache.values()].includes(entry)) this.remove(entry);
-        this.trim(entry);
+        this.trim();
       }
     };
   }
@@ -406,7 +403,7 @@ export class RolloutSources {
     }
   }
   open(file: string, opening = false, io: typeof fs = fs, prefixBytes?: number): RolloutSource {
-    this.retryDiscarded();
+    this.trim();
     if (!isCompressedRollout(file)) return new RolloutSource(file, io.openSync(file, 'r'), undefined, io);
     const stat = this.physical(file);
     const key = opening
@@ -415,7 +412,9 @@ export class RolloutSources {
     let entry = this.hit(file, stat) ?? (opening ? this.hit(key, stat) : undefined);
     if (!entry) {
       if (this.asyncOnly) {
-        void this.load(file, opening, prefixBytes ?? 1024 * 1024, prefixBytes === undefined).catch(() => undefined);
+        void this.load(file, opening, prefixBytes ?? 1024 * 1024, prefixBytes === undefined)
+          .then(({ release }) => release())
+          .catch(() => undefined);
         throw Object.assign(new Error('The session is still loading.'), { code: 'EAGAIN' });
       }
       entry = this.synchronous(file, opening, stat, prefixBytes);
@@ -429,14 +428,20 @@ export class RolloutSources {
       throw error;
     }
   }
-  private load(file: string, opening = false, limit = 1024 * 1024, firstLine = true): Promise<Decoded> {
-    this.retryDiscarded();
+  private load(
+    file: string,
+    opening = false,
+    limit = 1024 * 1024,
+    firstLine = true,
+  ): Promise<{ entry: Decoded; release: () => void }> {
+    this.trim();
     const stat = this.physical(file);
     const key = opening ? file + (firstLine ? '\nopening:' + limit : '\nprefix:' + limit) : file;
     const hit = this.hit(file, stat) ?? this.hit(key, stat);
-    if (hit) return Promise.resolve(hit);
+    if (hit) return Promise.resolve({ entry: hit, release: this.pin(hit) });
     const held = this.pending.get(key);
-    if (held) return held;
+    if (held) return held.then((entry) => ({ entry, release: this.pin(entry) }));
+    let releaseHandoff: (() => void) | undefined;
     const pending = this.gate
       .catch(() => undefined)
       .then(async () => {
@@ -485,6 +490,7 @@ export class RolloutSources {
             }
           }
           const entry = this.accepted(file, destination, before);
+          releaseHandoff = this.pin(entry);
           this.remember(key, entry);
           return entry;
         } catch (error) {
@@ -500,25 +506,30 @@ export class RolloutSources {
     void pending.then(
       () => {
         this.pending.delete(key);
-        for (const callback of this.ready) callback(file);
+        try {
+          for (const callback of this.ready) callback(file);
+        } finally {
+          queueMicrotask(() => releaseHandoff?.());
+        }
       },
       () => {
         this.pending.delete(key);
       },
     );
-    return pending;
+    return pending.then((entry) => ({ entry, release: this.pin(entry) }));
   }
   async prepare(file: string): Promise<() => void> {
     if (!isCompressedRollout(file)) return () => undefined;
-    return this.pin(await this.load(file));
+    return (await this.load(file)).release;
   }
   async opening(file: string, limit = 1024 * 1024): Promise<Buffer> {
     let release: (() => void) | undefined;
     let handle: fs.promises.FileHandle | undefined;
     try {
       if (isCompressedRollout(file)) {
-        const entry = await this.load(file, true, limit);
-        release = this.pin(entry);
+        const loaded = await this.load(file, true, limit);
+        const { entry } = loaded;
+        release = loaded.release;
         handle = await fs.promises.open(entry.file, 'r');
       } else handle = await fs.promises.open(file, 'r');
       const buffer = Buffer.allocUnsafe(limit);

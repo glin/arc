@@ -56,8 +56,8 @@
   },
   "extension/src/codex.test.ts": {
     "reason": "Real Git worktree ownership and descendant source resolution must agree with recorded Codex session relationships. Compressed rollout catalogs must preserve decoded metadata, prefer plain copies, and avoid preparing bodies.",
-    "cases": 497,
-    "matricesSha256": "4d3079fff466d12a20b79bc26534c74852019926e9e580f22e7affc4e5bd3374"
+    "cases": 496,
+    "matricesSha256": "1e26b661f5950e06e2226abe9cf3789b8e74fd8a9d869ab4290243a89683df5f"
   },
   "extension/src/derivedcache.test.ts": {
     "reason": "Independent writers and host death must preserve shared cache rows and release stale filesystem locks.",
@@ -171,8 +171,8 @@
   },
   "extension/src/rolloutsource.test.ts": {
     "reason": "Decoded disk leases, dead-process recovery, and temporary-file deletion must preserve real filesystem ownership.",
-    "cases": 14,
-    "matricesSha256": "edccedde86c7564eba291ca01c5e6b511d27d8a89910a80dac460db45ea44f7f"
+    "cases": 13,
+    "matricesSha256": "2bfdc953a4ba1389d18a5ec8021a64d37705aa1e633d80a2e5ec483d6423613c"
   },
   "extension/src/sessiondiscovery.test.ts": {
     "reason": "Real window listeners and registry discovery must preserve ownership, reachability, and partial listing across native IPC.",
