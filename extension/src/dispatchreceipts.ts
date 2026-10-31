@@ -844,7 +844,8 @@ export class DispatchReceipts {
       | 'native.md'
       | 'attend.sh'
       | 'output-owner.json'
-      | 'capture.json',
+      | 'capture.json'
+      | 'capture-queue.log',
   ): string {
     this.launch(id);
     return this.file(id, name);
@@ -1207,6 +1208,14 @@ export class DispatchReceipts {
               delete state.records;
             }
             save(state);
+            // The checkpoint names no position in the queue file of a drained queue.
+            if (queued && !state.pending)
+              try {
+                safePath(path.dirname(queueFile));
+                fs.rmSync(queueFile, { force: true });
+              } catch {
+                /* A record left behind does not pass its channel's queued end, so the next queue stops before it. */
+              }
           },
           'capture-write',
         ),

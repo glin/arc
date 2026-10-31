@@ -897,6 +897,7 @@ test.each([
   assert.equal(fs.readFileSync(alias, 'utf8'), expected);
   assert.equal(artifactJson(receipts, id, 'output-owner.json').state, 'finished');
   assert.equal(artifactJson(receipts, id, 'capture.json').pending, undefined);
+  assert.equal(fs.existsSync(receipts.artifact(id, 'capture-queue.log')), false);
 });
 
 test.each(['an append', 'a refill'] as const)(
