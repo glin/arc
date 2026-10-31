@@ -4275,11 +4275,13 @@ export class RelationshipReader {
   readBytes = 0;
   stable = true;
   private grew = false;
-  // The last grown stamp, whether a scanner marked the evidence after it appeared, the marks, and the bytes their checks read.
+  // The last grown stamp, whether a scanner marked the evidence after it appeared, the marks, the bytes their checks read, and
+  // the leading marks that the last check pass matched.
   private seen: RelationshipStamp | null = null;
   private moved = false;
   private marks: RelationshipMark[] = [];
   private markBytes = 0;
+  private checked = 0;
   private advanced = false;
   constructor(
     readonly fd: RolloutSource,
@@ -4347,12 +4349,12 @@ export class RelationshipReader {
     return this.buffer.subarray(0, count);
   }
   // Scanners call this before each forward read and after each extension, and each check pass calls it first. A mark is the
-  // evidence at the first call after a check saw a new grown stamp. Later forward reads leave room in the budget for every
-  // check pass over every mark.
+  // evidence at the first call after a check saw a new grown stamp. Evidence at offset 0 holds no bytes to check, so growth
+  // before the first read makes no mark. Later forward reads leave room in the budget for every check pass over every mark.
   note(evidence: RelationshipDigest): void {
     if (!this.moved) return;
     this.moved = false;
-    if (this.marks.at(-1)?.offset === evidence.offset) return;
+    if (evidence.offset === 0 || this.marks.at(-1)?.offset === evidence.offset) return;
     if (this.marks.length === RELATIONSHIP_MARKS) this.markBytes -= markLength(this.marks.pop()!);
     const mark = relationshipMark(evidence);
     this.marks.push(mark);
@@ -4362,9 +4364,11 @@ export class RelationshipReader {
   // as the next quantum would after a read that stopped there. A new grown stamp seen in a pass marks the end of the evidence and
   // starts another pass, so a rewrite that lands during the checks is checked too. The first pass ignores the deadline and
   // cancellation. A later pass that meets either, a mark without the budget for its check, an unstable or short check, or a new
-  // grown stamp in every pass leaves the outcome pending.
+  // grown stamp in every pass leaves the outcome pending. A pass that stops at the deadline, at cancellation, or at a mark
+  // without the budget saw no new grown stamp, so `checked` counts the leading marks it matched. Every other outcome leaves 0.
   private passes(evidence: RelationshipDigest): 'match' | 'mismatch' | 'pending' {
     for (let pass = 0; pass < RELATIONSHIP_SETTLE_PASSES; pass++) {
+      this.checked = 0;
       this.note(evidence);
       if (!this.check()) return 'pending';
       if (this.moved) continue;
@@ -4375,7 +4379,10 @@ export class RelationshipReader {
         if (this.budget - this.readBytes < mark.offset - start) return 'pending';
         const bytes = this.readAt(start, mark.offset - start);
         if (this.meter) this.meter.revalidationBytes = (this.meter.revalidationBytes ?? 0) + bytes.length;
-        if (!this.stable || bytes.length !== mark.offset - start) return 'pending';
+        if (!this.stable || bytes.length !== mark.offset - start) {
+          this.checked = 0;
+          return 'pending';
+        }
         const digest: RelationshipDigest = {
           offset: start,
           chain: mark.anchor ?? emptyRelationshipDigest().chain,
@@ -4384,9 +4391,11 @@ export class RelationshipReader {
         extendRelationshipEvidence(digest, bytes);
         if (markHash(digest) !== mark.hash) return 'mismatch';
         if (this.moved) break;
+        this.checked++;
       }
       if (!this.moved) return 'match';
     }
+    this.checked = 0;
     return 'pending';
   }
   // The last check before a scanner reports its read qualified. A match qualifies the read. A mismatch leaves a whole-prefix
@@ -4452,14 +4461,19 @@ export class RelationshipReader {
     return this.accept(evidence);
   }
   // Check passes over the marks of the latest read and over the final full block and the tail, at most two blocks each. A
-  // pending outcome keeps the marks for the next quantum. A missing or mismatched anchor needs the whole prefix.
+  // pending outcome keeps the marks for the next quantum, except the leading marks that a pass stopped by its deadline,
+  // cancellation, or budget already matched. The next quantum resumes at the first unchecked mark, so a source completes even
+  // when no allowance covers every mark. A missing or mismatched anchor needs the whole prefix.
   private anchored(evidence: RelationshipEvidence): 'match' | 'pending' | 'compare' {
     if (evidence.anchor === undefined || evidence.offset < RELATIONSHIP_BLOCK_BYTES) return 'compare';
-    this.marks = [
-      ...(evidence.marks ?? []).filter((mark) => mark.offset < evidence.offset),
-      relationshipMark(evidence),
-    ];
+    const kept = (evidence.marks ?? []).filter((mark) => mark.offset < evidence.offset);
+    this.marks = [...kept, relationshipMark(evidence)];
     const outcome = this.passes(evidence);
+    if (outcome === 'pending' && this.checked) {
+      const remaining = kept.slice(this.checked);
+      if (remaining.length) evidence.marks = remaining;
+      else delete evidence.marks;
+    }
     this.marks = [];
     this.markBytes = 0;
     return outcome === 'mismatch' ? 'compare' : outcome;

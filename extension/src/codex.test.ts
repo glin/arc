@@ -1398,14 +1398,19 @@ test.each(['after each read that reaches new bytes', 'on its own clock'])(
       },
     };
     const stop = writer === 'on its own clock' ? await clockWriter([file], 1, '{"type":"ignored"}\n') : undefined;
-    let scan = await scanCodexDispatchReferencesAsync(file, 'parent', null, 1024 * 1024, () => false, meter);
-    if (stop)
-      for (let pass = 0; !scan.complete && pass < 8; pass++) {
-        quantumSize = 0;
-        scan = await scanCodexDispatchReferencesAsync(file, 'parent', scan.cursor, 1024 * 1024, () => false, meter);
-      }
+    let scan: Awaited<ReturnType<typeof scanCodexDispatchReferencesAsync>>;
+    let times: number[] = [];
+    try {
+      scan = await scanCodexDispatchReferencesAsync(file, 'parent', null, 1024 * 1024, () => false, meter);
+      if (stop)
+        for (let pass = 0; !scan.complete && pass < 8; pass++) {
+          quantumSize = 0;
+          scan = await scanCodexDispatchReferencesAsync(file, 'parent', scan.cursor, 1024 * 1024, () => false, meter);
+        }
+    } finally {
+      if (stop) times = await stop();
+    }
     if (stop) {
-      const times = await stop();
       assert.ok(grewDuringRead, `the rollout never grew during a read in ${times.length} appends`);
       assert.equal(scan.complete, true, 'the rollout never completed while its writer ran');
       assert.equal(scan.cursor.offset, scan.cursor.size);
@@ -1426,6 +1431,38 @@ test.each(['after each read that reaches new bytes', 'on its own clock'])(
     assert.deepEqual(next.references, scan.references);
   },
 );
+
+test('a new Codex rollout that grows before its first read completes at its opening size', async () => {
+  const file = writeRollout([
+    meta(),
+    event('task_started', 1, { turn_id: TURN }),
+    turnContext(2, TURN, 'gpt-6-astra', 'high'),
+    commandCompleted(3, DISPATCH_COMMAND, 0, 'completed', 'before-growth', { stdout: DISPATCH_RECEIPT }),
+    event('task_complete', 4, { turn_id: TURN }),
+  ]);
+  for (let index = 0; index < 100; index++) fs.appendFileSync(file, ignoredCodexLineOfBytes(2048));
+  const opening = fs.statSync(file).size;
+  // The writer appends when the scan first reads the clock, after the scan opens the file and before its first stamp check.
+  let appended = false;
+  vi.spyOn(performance, 'now').mockImplementation(() => {
+    if (!appended) fs.appendFileSync(file, '{"type":"ignored"}\n');
+    appended = true;
+    return 0;
+  });
+  const scan = await scanCodexDispatchReferencesAsync(file, 'parent', null, 1024 * 1024, () => false);
+  assert.ok(appended);
+  assert.equal(scan.qualified, true, 'growth before the first read left the read unqualified');
+  assert.equal(scan.complete, true);
+  assert.equal(scan.cursor.offset, opening);
+  assert.deepEqual(
+    scan.references.map((reference) => reference.toolUseIds),
+    [['before-growth']],
+  );
+  const next = await scanCodexDispatchReferencesAsync(file, 'parent', scan.cursor, 1024 * 1024);
+  assert.equal(next.complete, true);
+  assert.equal(next.cursor.offset, fs.statSync(file).size);
+  assert.deepEqual(next.references, scan.references);
+});
 
 test('a Codex rollout rewritten with an append after its last read keeps no old dispatch reference', async () => {
   const file = writeRollout([
