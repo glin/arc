@@ -1327,8 +1327,9 @@ export class DispatchReceipts {
       native: (_bytes: Buffer, _cursor?: CaptureCursor) => {
         throw new Error('This launch has no native log capture.');
       },
-      // A capture that closes with boundaries it could not write keeps the write lock. The capture that takes the lock
-      // after this process ends publishes no output past them.
+      // A capture that closes with boundaries it could not write marks the order of later output lost, and then
+      // releases the write lock. If the marker write fails, the capture keeps the lock, and the capture that takes the
+      // lock after this process ends writes the marker.
       close: () => {
         if (held.length)
           try {
@@ -1336,12 +1337,16 @@ export class DispatchReceipts {
           } catch {
             /* A failed queue file write keeps the boundaries held, and a failed save leaves them in the file. */
           }
-        if (hold.owner && !held.length)
-          try {
-            this.release(id, 'capture-write', hold.owner, hold);
-          } catch {
-            /* A lock whose owner process ended admits the next capture. */
+        if (!hold.owner) return;
+        try {
+          if (held.length) {
+            loseOrder();
+            held = [];
           }
+          this.release(id, 'capture-write', hold.owner, hold);
+        } catch {
+          /* A lock whose owner process ended admits the next capture. */
+        }
       },
     };
     return capture;

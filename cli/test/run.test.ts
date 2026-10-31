@@ -1085,12 +1085,12 @@ function sameFile(fd: number, file: string) {
 // `budget` is the number of queue file bytes it writes, and `denied` the number of queue file opens that fail.
 // With `save`, it writes both records and its checkpoint save fails instead.
 // After the producer ends, stdout C arrives and a recovery runs.
-// `marker` fails the creation or the metadata lookup of `capture-write.lost`, and `corrupt` breaks the checksum of the
-// last queue record before recovery.
+// `marker` fails the creation or the metadata lookup of `capture-write.lost`. `corrupt` breaks the checksum of the last
+// queue record before recovery, and `probe` runs just before recovery.
 async function heldBoundaryRecovery(
   failure: { budget?: number; denied?: number; save?: true },
   ending: 'dies' | 'closes' | 'closes and dies',
-  fault: { marker?: 'write' | 'lookup'; corrupt?: true } = {},
+  fault: { marker?: 'write' | 'lookup'; corrupt?: true; probe?: (receipts: DispatchReceipts, id: string) => void } = {},
 ) {
   const { receipts, launch } = workerFixture('', 100, false, true);
   const id = launch.launchId;
@@ -1169,6 +1169,7 @@ async function heldBoundaryRecovery(
   }
   fs.appendFileSync(stdout, frames[2]);
   blocked = false;
+  fault.probe?.(receipts, id);
   // The marker lookup fails after recovery takes the lock and writes the marker.
   if (fault.marker === 'lookup') {
     // A metadata lookup that fails reads as an absent file through `existsSync`.
@@ -1259,6 +1260,17 @@ test(
   { tags: ['subprocess'] },
   async () => {
     const recovery = await heldBoundaryRecovery({ save: true }, 'closes', { corrupt: true });
+    assert.ok(orderedOrIncomplete(recovery), recovery.published);
+  },
+);
+
+test(
+  'capture that closes with boundaries it cannot write admits the next capture while its process runs',
+  { tags: ['subprocess'] },
+  async () => {
+    const recovery = await heldBoundaryRecovery({ denied: 2 }, 'closes', {
+      probe: (receipts, id) => receipts.capture(id, 64 * 1024, true).defer([]),
+    });
     assert.ok(orderedOrIncomplete(recovery), recovery.published);
   },
 );
