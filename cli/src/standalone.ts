@@ -1705,6 +1705,17 @@ function outputProducer(receipts: DispatchReceipts, id: string, entry: string, s
   return { worker, ready };
 }
 
+// The private reason in `output-owner.json` names the error and up to four of its causes.
+function producerFailure(error: unknown): string {
+  let reason = String(error);
+  let cause = (error as Error)?.cause;
+  for (let depth = 0; cause && depth < 4 && reason.length < 512; depth++) {
+    reason += `: ${String(cause)}`;
+    cause = (cause as Error).cause;
+  }
+  return reason.slice(0, 512);
+}
+
 export async function produceStandaloneOutput(receipts: DispatchReceipts, id: string): Promise<void> {
   const options = receipts.launch(id).standalone;
   if (!options?.logAlias) throw new Error('This launch has no independent log.');
@@ -1721,13 +1732,7 @@ export async function produceStandaloneOutput(receipts: DispatchReceipts, id: st
   try {
     capture = await openCapture(() => logCapture(receipts, id, READ_BOUNDS), Date.now() + options.deadlineMs);
   } catch (error) {
-    let reason = String(error);
-    let cause = (error as Error)?.cause;
-    for (let depth = 0; cause && depth < 4 && reason.length < 512; depth++) {
-      reason += `: ${String(cause)}`;
-      cause = (cause as Error).cause;
-    }
-    save('unavailable', reason.slice(0, 512));
+    save('unavailable', producerFailure(error));
     throw error;
   }
   const send = (message: object) => {
@@ -1799,7 +1804,7 @@ export async function produceStandaloneOutput(receipts: DispatchReceipts, id: st
     }
     save('finished');
   } catch (error) {
-    save('unavailable', String(error).slice(0, 512));
+    save('unavailable', producerFailure(error));
     // The native child retains its output files after capture failure.
     worker.unref();
   } finally {

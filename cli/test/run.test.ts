@@ -657,6 +657,29 @@ test('source capture keeps the arrival order of both channels across a longer al
   assert.equal(fs.readFileSync(stderr, 'utf8'), 'e\nf\ng\n');
 });
 
+test('source producer ends without the lost order marker when a marker lookup fails outside the transient faults', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'setImmediate'] });
+  vi.spyOn(Date, 'now').mockReturnValue(0);
+  if (process.send) vi.spyOn(process, 'send').mockImplementation(() => true);
+  vi.spyOn(process, 'disconnect').mockImplementation(() => {});
+  vi.mocked(childProcess.spawn).mockReturnValue(providerChild());
+  const { receipts, launch } = workerFixture('', 100, false, true);
+  const id = launch.launchId;
+  fs.writeFileSync(receipts.artifact(id, 'stdout.log'), 'A\n');
+  fs.writeFileSync(receipts.artifact(id, 'stderr.log'), 'e\n');
+  const marker = path.join(path.dirname(receipts.artifact(id, 'capture-queue.log')), 'capture-write.lost');
+  failLookup(marker, () => true, 'EIO');
+  const pending = produceStandaloneOutput(receipts, id);
+  await vi.runAllTimersAsync();
+  await pending;
+  const owner = artifactJson(receipts, id, 'output-owner.json');
+  assert.equal(owner.state, 'unavailable');
+  assert.equal(fs.existsSync(marker), false);
+  // The private reason keeps the lookup fault.
+  assert.match(owner.reason, /^Error: The requested log order cannot be checked\.: Error: Marker unreadable/);
+  assert.equal(fs.readFileSync(launch.standalone!.logAlias!, 'utf8'), '');
+});
+
 test.each([1, 2, 6])(
   'source producer keeps capture and arrival order through %i failed flushes that start on stdout',
   async (failures) => {
