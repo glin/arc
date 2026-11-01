@@ -149,9 +149,10 @@ export class CaptureOrderPending extends Error {
   }
 }
 // A lookup of the lost order marker that failed with a fault outside the transient set leaves the order of new output
-// unknown. Capture ends at the first output past the saved queue whose own lookup fails too. The error writes no
-// marker, so without held boundaries a later recovery looks the marker up again. A capture that closes with held
-// boundaries still marks the order lost.
+// unknown. The flush catches it only at the deferral of the saved queue. The error ends capture only at a live
+// capture's final drain or in the producer loop, because the 50 ms timer flush retries. The error writes no marker,
+// so without held boundaries a later recovery looks the marker up again. A capture that closes with held boundaries
+// still marks the order lost, unless its close retry saves them.
 export class CaptureOrderUnknown extends Error {
   constructor(cause: unknown) {
     super('The requested log order cannot be checked.', { cause });
@@ -233,8 +234,10 @@ function exclusive(file: string, text: string): void {
 // Access and sharing faults that clear when another process, such as a scanner or a sync client, releases the file.
 const TRANSIENT_FAULTS = ['EPERM', 'EACCES', 'EBUSY'];
 // A marker that exists, as any file type, stays written. Only a confirmed absence counts as no marker. A failed lookup
-// settles neither and writes nothing. After a transient fault the caller retries. Any other fault ends capture when it
-// fails the lookup of output past the saved queue.
+// settles neither and writes nothing. After a transient fault the caller retries. Any other fault ends capture only
+// at a live capture's final drain or in the producer loop, because the 50 ms timer flush retries. A capture without
+// held boundaries writes no marker, and a capture that closes with held boundaries writes it unless its close retry
+// saves them.
 function marked(file: string): boolean {
   try {
     return fs.lstatSync(file, { throwIfNoEntry: false }) !== undefined;
