@@ -1281,7 +1281,7 @@ test(
 );
 
 // Pending A and e reach the end of both channels, with no lost order marker, and every marker lookup fails with `code`.
-// With `later`, stdout B arrives past the saved queue. The marker cannot be written either.
+// With `later`, stdout B arrives past the saved queue. Without it, the marker cannot be written either.
 test.each([
   { code: 'EBUSY', later: false },
   { code: 'EIO', later: false },
@@ -1309,7 +1309,7 @@ test.each([
     failLookup(marker, () => true, code);
     const writeFile = fs.writeFileSync;
     vi.spyOn(fs, 'writeFileSync').mockImplementation((file, ...args) => {
-      if (String(file) === marker) throw Object.assign(new Error('Marker unavailable'), { code: 'EACCES' });
+      if (String(file) === marker && !later) throw Object.assign(new Error('Marker unavailable'), { code: 'EACCES' });
       return Reflect.apply(writeFile, fs, [file, ...args]);
     });
     const status = (await superviseStandalone(receipts, id, true, undefined, recoveryRuntime)) as any;
@@ -1317,7 +1317,8 @@ test.each([
     assert.equal(fs.readFileSync(alias, 'utf8'), `${frames[0]}e\n`);
     const reason = status.observation.reason;
     assert.equal(reason === 'The requested log is incomplete. Private output remains available.', later, reason);
-    assert.equal(fs.existsSync(marker), false);
+    // B stays held when capture closes, so the order past the saved queue is lost for good.
+    assert.equal(fs.existsSync(marker), later);
   },
 );
 
@@ -1430,9 +1431,14 @@ test.each([
       assert.equal(fs.readFileSync(alias, 'utf8'), `${frames[0]}${frames[1]}e\n`);
       assert.notEqual(status.observation.reason, 'The requested log is incomplete. Private output remains available.');
     } else {
-      // Recovery ends as after a failed save, and leaves no marker for a later recovery.
+      // Recovery ends as after a failed save and leaves no marker. The next recovery after the fault clears completes
+      // the log.
       assert.equal(fs.readFileSync(alias, 'utf8'), '');
       assert.equal(status.observation.reason, 'The requested log is incomplete. Private output remains available.');
+      failing = false;
+      const second = (await superviseStandalone(receipts, id, true, undefined, recoveryRuntime)) as any;
+      assert.equal(fs.readFileSync(alias, 'utf8'), `${frames[0]}${frames[1]}e\n`);
+      assert.notEqual(second.observation.reason, 'The requested log is incomplete. Private output remains available.');
     }
     // No boundary is held, so the order of all output stays known.
     assert.equal(fs.existsSync(marker), false);
