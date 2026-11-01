@@ -77,6 +77,7 @@ Paths are relative to `extension/src/`. [Architecture](architecture.md) owns pac
 | `payload.ts` | Shapes the render, selection, and session list messages the extension posts, and weighs a message by field, by session list row, and by repeated long string | no |
 | `richtext.ts` | Safe block and noninteractive inline Markdown, named response session anchors, literal file citations, validated disclosure structure, host-only content references, local picture rules, and fallback text | no |
 | `uris.ts` | Read-only URI schemes used by diff editors | yes |
+| `externalopen.ts` | Binary-document eligibility for external opening, executable and text exclusions, and bounded regular-file sampling | no |
 | `config.ts` | Reads and writes extension settings through `vscode` | yes |
 | `store.ts` | Snapshot manifests, path matching, current-file comparison, expiry, lazy cache partition ownership, and conservative folderless retention | no |
 | `agentpaths.ts` | Resolves the Claude Code and Codex homes from their process environment and home-directory fallbacks | no |

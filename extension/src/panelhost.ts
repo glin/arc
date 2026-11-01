@@ -52,6 +52,7 @@ import {
 } from './sessionwrites';
 import { resolveResponseSession, pendingResponseSessionAdmitted, parseSessionLink } from './domain/session-link';
 import { nativeCitationPath } from './domain/file-citation';
+import { externalOpenEligible } from './externalopen';
 import {
   boundedSessionRead,
   AgentReadSources,
@@ -938,7 +939,14 @@ async function openLink(
         return;
       }
       const selection = from >= 0 ? new vscode.Range(from, 0, to, 0) : undefined;
-      await vscode.window.showTextDocument(uri, { selection, preview: true, viewColumn: column });
+      try {
+        await vscode.window.showTextDocument(uri, { selection, preview: true, viewColumn: column });
+      } catch (error) {
+        if (vscode.env.remoteName !== undefined || !(await externalOpenEligible(uri.fsPath))) throw error;
+        if (!(await vscode.env.openExternal(uri))) {
+          throw new Error('The default application did not open the file.', { cause: error });
+        }
+      }
       return;
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);

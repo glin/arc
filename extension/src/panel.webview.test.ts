@@ -23,6 +23,7 @@ import { createSavedState } from './webview/state.ts';
 import type { QueuedSubmission, TurnComment } from './turnview.ts';
 import { resolveResponseSession, pendingResponseSessionAdmitted, sessionLinkContext } from './domain/session-link';
 import { nativeCitationPath } from './domain/file-citation';
+import { externalOpenEligible, type ExternalOpenFs } from './externalopen';
 import { contributedFileSides } from './patchview';
 import * as crypto from 'node:crypto';
 import { codexSubagentFor, type CodexSubagentFile } from './codex';
@@ -320,12 +321,59 @@ test('native Copy Path and Copy Relative Path retain citation filename suffixes'
   }
 });
 
+function externalLinkFiles() {
+  const files = new Map<string, Buffer>();
+  const unmapped: string[] = [];
+  const events: string[] = [];
+  let closeFails = false;
+  const io: ExternalOpenFs = {
+    constants: { O_RDONLY: 0x100, O_NONBLOCK: 0x200 },
+    lstat: async (file) => {
+      events.push(`lstat:${file}`);
+      if (!files.has(file)) {
+        unmapped.push(file);
+        throw new Error('unmapped test file');
+      }
+      return { isFile: () => true, isSymbolicLink: () => false, mode: 0o644 };
+    },
+    open: async (file) => {
+      const bytes = files.get(file);
+      if (!bytes) {
+        unmapped.push(file);
+        throw new Error('unmapped test file');
+      }
+      return {
+        stat: async () => ({ isFile: () => true, mode: 0o644 }),
+        read: async (buffer, offset, length, position) => ({
+          bytesRead: bytes.copy(buffer, offset, position, Math.min(bytes.length, position + length)),
+        }),
+        close: async () => {
+          events.push(`close:${file}`);
+          if (closeFails) throw new Error('close unavailable');
+        },
+      };
+    },
+  };
+  return {
+    files,
+    unmapped,
+    events,
+    io,
+    failClose: (fail: boolean) => {
+      closeFails = fail;
+    },
+  };
+}
+
 test('response citation presses open external literal files without workspace or snapshot routing', async () => {
   const { linkCandidates, linkLocation, linkTargetIsVideo } = await import('./transcript.js');
   const opened: Array<{ path: string; options: Record<string, unknown> }> = [];
   const commands: unknown[][] = [];
   const notices: string[] = [];
   const checked: string[] = [];
+  const external: unknown[] = [];
+  const binary = externalLinkFiles();
+  let textFails = false;
   let kind = 1;
   let missing = false;
   const root = process.platform === 'win32' ? 'C:/workspace' : '/workspace';
@@ -345,8 +393,10 @@ test('response citation presses open external literal files without workspace or
       },
     },
     env: {
-      openExternal: async () => {
-        throw new Error('unexpected external URL');
+      openExternal: async (file: { fsPath: string }) => {
+        assert.equal(binary.events.at(-1), `close:${file.fsPath}`);
+        external.push(file);
+        return true;
       },
     },
     commands: {
@@ -366,6 +416,7 @@ test('response citation presses open external literal files without workspace or
       showInformationMessage: (message: string) => notices.push(message),
       showTextDocument: async (file: { fsPath: string }, options: Record<string, unknown>) => {
         opened.push({ path: file.fsPath, options });
+        if (textFails) throw new Error('File seems to be binary and cannot be opened as text');
       },
     },
   };
@@ -383,6 +434,7 @@ test('response citation presses open external literal files without workspace or
     'linkTargetIsHtml',
     'linkTargetIsMarkdown',
     'linkTargetIsVideo',
+    'externalOpenEligible',
     `${source}\nreturn openLink;`,
   )(
     host,
@@ -395,6 +447,7 @@ test('response citation presses open external literal files without workspace or
     (file: string) => file.endsWith('.html'),
     (file: string) => file.endsWith('.md'),
     linkTargetIsVideo,
+    (file: string) => externalOpenEligible(file, process.platform, binary.io),
   );
   for (const name of ['one%20.csv', 'one .csv', 'one#L10', 'one:10', 'Case.csv', 'case.csv', 'guide.md#appendix']) {
     const file = `${outside}/${name}`;
@@ -408,6 +461,19 @@ test('response citation presses open external literal files without workspace or
   assert.equal(opened.length, literalOpens + 1);
   assert.equal(opened.at(-1)!.path, path.normalize(`${outside}/file.csv`));
   assert.equal(notices.length, 0);
+  textFails = true;
+  for (const name of ['Scene 100%.BLEND', 'Scene.blend#L42', 'Scene.unknown:42']) {
+    const file = `${outside}/${name}`;
+    binary.files.set(file, Buffer.from([66, 76, 69, 78, 68, 69, 82, 0, 118]));
+    const beforeExternal = external.length;
+    await open(file, 2, true);
+    assert.equal(external.length, beforeExternal + 1, 'a binary citation did not reach its default application');
+    assert.equal((external.at(-1) as { fsPath: string }).fsPath, file);
+    assert.equal((external.at(-1) as { toString(): string }).toString(), `file://${file}`);
+    assert.equal(notices.length, 0);
+  }
+  assert.deepEqual(binary.unmapped, []);
+  textFails = false;
   await open(`${root}/file.csv#L10-L12`, 1);
   assert.equal(opened.at(-1)!.path, path.resolve(root, 'file.csv'));
   assert.equal((opened.at(-1)!.options.selection as { from: number }).from, 9);
@@ -609,10 +675,13 @@ test('clicked local links open outside workspace folders through their existing 
     const notices: string[] = [];
     const checked: string[] = [];
     const external: string[] = [];
+    const externalUris: unknown[] = [];
+    const binary = externalLinkFiles();
     const existing = new Map<string, number>();
     let previewFails = false;
     const statErrors = new Map<string, unknown>();
     const openErrors = new Map<string, unknown>();
+    const textErrors = new Map<string, unknown>();
     const host = {
       Uri: {
         file: uri,
@@ -633,9 +702,13 @@ test('clicked local links open outside workspace folders through their existing 
         },
       },
       env: {
+        remoteName: undefined as string | undefined,
         openExternal: async (href: string | ReturnType<typeof uri>) => {
           const target = typeof href === 'string' ? href : href.fsPath;
           external.push(target);
+          externalUris.push(href);
+          if (binary.files.has(target) && !linkTargetIsVideo(target))
+            assert.equal(binary.events.at(-1), `close:${target}`);
           if (openErrors.has(target)) {
             const error = openErrors.get(target);
             if (error === false) return false;
@@ -647,7 +720,7 @@ test('clicked local links open outside workspace folders through their existing 
       commands: {
         executeCommand: async (...args: unknown[]) => {
           commands.push(args);
-          if (previewFails && args[0] === 'vscode.openWith') throw new Error('preview unavailable');
+          if (previewFails) throw new Error('preview unavailable');
         },
       },
       Range: class {
@@ -663,7 +736,7 @@ test('clicked local links open outside workspace folders through their existing 
         showTextDocument: async (file: ReturnType<typeof uri>, options: Record<string, unknown>) => {
           opened.push({ file, options });
           if (linkTargetIsVideo(file.fsPath)) throw new Error('binary text refused');
-          if (openErrors.has(file.fsPath)) throw openErrors.get(file.fsPath);
+          if (textErrors.has(file.fsPath)) throw textErrors.get(file.fsPath);
         },
       },
     };
@@ -679,6 +752,7 @@ test('clicked local links open outside workspace folders through their existing 
       'linkTargetIsHtml',
       'linkTargetIsMarkdown',
       'linkTargetIsVideo',
+      'externalOpenEligible',
       `${source}\nreturn openLink;`,
     )(
       { platform },
@@ -692,6 +766,7 @@ test('clicked local links open outside workspace folders through their existing 
       (file: string) => /\.html?$/i.test(file),
       (file: string) => /\.(md|markdown)$/i.test(file),
       linkTargetIsVideo,
+      (file: string) => externalOpenEligible(file, platform, binary.io),
     );
     for (const folder of [
       ...['tree#L10', 'tree é space', ...(platform === 'win32' ? [] : ['tree:42'])].map((name) =>
@@ -712,6 +787,7 @@ test('clicked local links open outside workspace folders through their existing 
     }
     const video = paths.join(paths.dirname(text), 'Story 100%.MP4');
     existing.set(video, 1);
+    binary.files.set(video, Buffer.from([66, 76, 69, 78, 68, 69, 82, 0, 118]));
     const beforeVideo = opened.length;
     for (const target of [
       video,
@@ -731,10 +807,12 @@ test('clicked local links open outside workspace folders through their existing 
       Object.assign(new Error('opener file missing'), { code: 'FileNotFound' }),
     ]) {
       openErrors.set(video, refusal);
+      const beforeExternal = external.length;
       await open(video, 2);
       const detail = refusal instanceof Error ? refusal.message : 'The default application did not open the video.';
       assert.equal(notices.pop(), `Arc: did not open ${video}. ${detail}`);
       assert.equal(opened.length, beforeVideo);
+      assert.equal(external.length, beforeExternal + 1, 'a failed video dispatch was retried');
     }
     openErrors.delete(video);
     const missingVideo = paths.join(paths.dirname(text), 'missing.mp4');
@@ -779,9 +857,77 @@ test('clicked local links open outside workspace folders through their existing 
     statErrors.delete(first);
     const failedText = paths.join(paths.dirname(text), 'binary.txt');
     existing.set(failedText, 1);
-    openErrors.set(failedText, new Error('binary text refused'));
+    textErrors.set(failedText, new Error('binary text refused'));
+    binary.files.set(failedText, Buffer.from('plain text'));
     await open(failedText, 1);
     assert.equal(notices.pop(), `Arc: did not open ${failedText}. binary text refused`);
+    const document = paths.join(paths.dirname(text), 'Scene 100%.BLEND');
+    const unknown = paths.join(paths.dirname(text), 'Scene.unknown');
+    for (const file of [document, unknown]) {
+      existing.set(file, 1);
+      binary.files.set(file, Buffer.from([66, 76, 69, 78, 68, 69, 82, 0, 118]));
+      textErrors.set(file, new Error('File seems to be binary and cannot be opened as text'));
+      for (const target of [file, file + '#L42-L51', file + ':42:7']) {
+        await open(target, 2);
+        assert.equal(external.at(-1), file, platform);
+        assert.equal(externalUris.at(-1), opened.at(-1)!.file, 'the resolved original URI was replaced');
+        assert.equal(notices.length, 0);
+      }
+      await open(file, 2, true);
+      assert.equal(external.at(-1), file, platform);
+      assert.equal(externalUris.at(-1), opened.at(-1)!.file);
+    }
+    for (const name of ['Scene 100%.blend#L42', 'Scene.unknown:42']) {
+      const file = paths.join(paths.dirname(text), name);
+      existing.set(file, 1);
+      binary.files.set(file, Buffer.from([66, 76, 69, 78, 68, 69, 82, 0, 118]));
+      textErrors.set(file, new Error('binary text refused'));
+      await open(file, 2, true);
+      assert.equal(external.at(-1), file, platform);
+      assert.equal(externalUris.at(-1), opened.at(-1)!.file);
+    }
+    const encodedText = paths.join(paths.dirname(text), 'utf16.txt');
+    existing.set(encodedText, 1);
+    textErrors.set(encodedText, new Error('text editor unavailable'));
+    binary.files.set(encodedText, Buffer.from([0xff, 0xfe, 65, 0, 66, 0]));
+    await open(encodedText, 2);
+    assert.equal(notices.pop(), `Arc: did not open ${encodedText}. text editor unavailable`);
+    for (const refusal of [false, new Error('association unavailable')]) {
+      openErrors.set(document, refusal);
+      await open(document, 2);
+      assert.equal(
+        notices.pop(),
+        `Arc: did not open ${document}. ${refusal instanceof Error ? refusal.message : 'The default application did not open the file.'}`,
+      );
+    }
+    openErrors.delete(document);
+    for (const remoteName of ['ssh-remote', undefined]) {
+      host.env.remoteName = remoteName;
+      const before = external.length;
+      const beforeSampling = binary.events.length;
+      binary.failClose(remoteName === undefined);
+      await open(document, 2);
+      assert.equal(external.length, before);
+      if (remoteName) assert.equal(binary.events.length, beforeSampling);
+      assert.equal(
+        notices.pop(),
+        `Arc: did not open ${document}. File seems to be binary and cannot be opened as text`,
+      );
+    }
+    binary.failClose(false);
+    const relativeDocuments = roots.map((root) => paths.join(root, 'fallback.blend'));
+    for (const file of relativeDocuments) {
+      existing.set(file, 1);
+      binary.files.set(file, Buffer.from([66, 76, 69, 78, 68, 69, 82, 0, 118]));
+      textErrors.set(file, new Error('binary text refused'));
+      openErrors.set(file, new Error('first association failed'));
+    }
+    await open('fallback.blend', 2);
+    assert.equal(notices.pop(), `Arc: did not open ${relativeDocuments[0]}. first association failed`);
+    openErrors.delete(relativeDocuments[1]);
+    await open('fallback.blend', 2);
+    assert.equal(external.at(-1), relativeDocuments[1]);
+    assert.deepEqual(notices, []);
     for (const suffix of ['#L10', ':10', '%20']) {
       const literalVideo = paths.join(paths.dirname(text), 'literal.mp4' + suffix);
       existing.set(literalVideo, 1);
@@ -896,6 +1042,19 @@ test('clicked local links open outside workspace folders through their existing 
     assert.equal(opened.length, beforePreview);
     assert.equal(notices.pop(), `Arc: VS Code did not open ${skillPath} in Markdown Preview.`);
     previewFails = false;
+    for (const [name, notice] of [
+      ['image.png', 'Arc: did not open'],
+      ['page.html', 'Arc: VS Code did not open'],
+    ]) {
+      const file = paths.join(paths.dirname(text), name);
+      const before = external.length;
+      binary.files.set(file, Buffer.from([66, 76, 69, 78, 68, 69, 82, 0, 118]));
+      previewFails = true;
+      await open(file, 2);
+      assert.ok(notices.pop()!.startsWith(notice));
+      assert.equal(external.length, before);
+    }
+    previewFails = false;
     await open(text + '.missing', 1);
     assert.equal(notices.pop(), `Arc: no file at ${text}.missing.`);
     for (const href of ['command:workbench.action.files.openFile', 'file:///tmp/file', 'mailto:reader@example.com']) {
@@ -920,6 +1079,7 @@ test('clicked local links open outside workspace folders through their existing 
     await open('missing.ts', 1);
     assert.deepEqual(checked, []);
     assert.equal(notices.pop(), 'Arc: no file at missing.ts.');
+    assert.deepEqual(binary.unmapped, []);
   }
 });
 

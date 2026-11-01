@@ -578,7 +578,6 @@ const IMAGE_SUFFIX = /\.(?:png|jpe?g|gif|webp|avif|bmp|svg|ico)$/i;
 
 // Identifies image targets using the same suffixes the panel renders.
 // The editor opens those targets in its image viewer.
-// Opening them as text can produce a missing-file message even when the file exists.
 export function linkTargetIsImage(target: string): boolean {
   return IMAGE_SUFFIX.test(target);
 }

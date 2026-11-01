@@ -26,11 +26,17 @@ Normal opening prefers the active text-editor group outside the panel, then the 
 
 Video extensions match regardless of case on Windows, macOS, and Linux. Video opening needs a default application and uses no editor group. Successful opening does not establish playback or codec support. Integrated-browser placement follows `workbench.browser.newTabPlacement`, and VS Code applies workspace trust to local HTML. HTTP and HTTPS links open in the configured external browser.
 
+Response links and literal file citations without a dedicated directory, image, HTML, Markdown, or video route first use the text editor. This route bypasses custom editors and `workbench.editor.defaultBinaryEditor`. After text opening fails, eligible binary documents use the default application. Configured binary editors do not override this fallback. An accepted external request establishes dispatch, not successful document loading.
+
+`externalopen.ts` owns binary eligibility. The fallback requires a local window and a file URI. The reader requires regular-file metadata before and after opening the file for reading. It rejects final symbolic links, POSIX executable permissions, listed program and launcher suffixes, and executable signatures. The policy ignores executable permission bits on Windows. The reader accumulates at most 512 bytes, then closes the descriptor before external dispatch. Its metadata and reads have no wall-clock deadline. Eligibility requires a NUL byte and excludes byte-order marks, their incomplete prefixes, and alternating UTF-16 byte patterns. Binary documents without qualifying prefix evidence retain the text-opening error. These checks establish observed eligibility without preventing every concurrent filesystem replacement. Document contents and application associations determine what an admitted file does.
+
 Clicked local links can leave workspace folders. Absolute paths need no open folder. Relative paths try open folders in order, including `..`, and have no base in a folderless window. Ordinary Markdown links separate heading fragments from file paths and pass the heading to Markdown Preview. Percent-encoded headings decode once. Malformed escapes remain unchanged. Copy Path excludes the heading. Literal file citations retain hash suffixes as part of the filename. `#L42-L51` and `:42` select text-file lines. `:42:7` ignores the column. Other URI schemes become filesystem paths and never execute as schemes.
 
 ### Opening failures
 
 Only `FileNotFound` establishes absence. Other file-check errors and Explorer, picture, default-application, or text-editor failures retain the target and error. Relative paths continue through later workspace folders. A successful candidate ends opening without a failure notice. Exhausted candidates report the first access or opening failure before absence. HTML and Markdown failures stop with their dedicated notice and never open raw text.
+
+Binary eligibility is independent of the text-opening error's cause. Ineligible files and metadata, open, read, or descriptor-close failures retain that original error. A refused external request reports that the default application did not open the file. A thrown external error retains its detail. Dedicated image, HTML, Markdown, and video failures never enter the binary fallback.
 
 ### Commit destinations
 
