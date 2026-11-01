@@ -1378,7 +1378,9 @@ test.each(['after each read that reaches new bytes', 'on its own clock', 'on its
     const opening = fs.statSync(file).size;
     // The first writer appends a record after every read that reaches new bytes. The second appends every millisecond on its
     // own thread, so its appends also land during check reads, and a read can end unqualified and finish in a later quantum.
-    // The third is the second under a scan that fails at its first read, and the writer must stop all the same.
+    // The third is the second under a scan that fails at its first read, and the writer must stop all the same. The first
+    // writer's scan runs one quantum under a held clock, so the slice deadline cannot end that quantum before the opening size.
+    if (writer === 'after each read that reaches new bytes') vi.spyOn(performance, 'now').mockReturnValue(0);
     let appends = 0;
     let furthest = 0;
     let grewDuringRead = false;
