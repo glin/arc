@@ -4502,12 +4502,12 @@ export class RelationshipReader {
   }
   // Check passes over the marks of the latest read in order, then over the final full block and the tail at the anchor, at most
   // two blocks each. A pending outcome keeps every mark for the next quantum. When a pass matched checks before the anchor and
-  // then stopped, the evidence also keeps the stamp of the checks and the first mark after the longest run of matched checks.
-  // The next quantum starts there when the file keeps that stamp or grew from it. After the anchor, its passes check the earlier
-  // marks again until the allowance, the deadline, cancellation, or growth ends those checks. A shrink, a same-size change, or a
-  // changed identity starts at the first mark. Only acceptance, a replacement under the mark limit, a mismatch, the fall back to
-  // a whole-prefix comparison, or a scan that starts again from the beginning removes a mark. A missing or mismatched anchor
-  // needs the whole prefix.
+  // then stopped, the evidence also keeps the stamp of the checks and the first mark after the longest run of checks that matched
+  // without a new grown stamp. The next quantum starts there when the file keeps that stamp or grew from it. After the anchor,
+  // its passes check the earlier marks again until the allowance, the deadline, cancellation, or growth ends those checks. A
+  // shrink, a same-size change, or a changed identity starts at the first mark. Only acceptance, a replacement under the mark
+  // limit, a mismatch, the fall back to a whole-prefix comparison, or a scan that starts again from the beginning removes a mark.
+  // A missing or mismatched anchor needs the whole prefix.
   private anchored(evidence: RelationshipEvidence): 'match' | 'pending' | 'compare' {
     if (evidence.anchor === undefined || evidence.offset < RELATIONSHIP_BLOCK_BYTES) return 'compare';
     const kept = (evidence.marks ?? []).filter((mark) => mark.offset < evidence.offset);
