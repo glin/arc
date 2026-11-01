@@ -4383,13 +4383,14 @@ export class RelationshipReader {
   // as the next quantum would after a read that stopped there. A new grown stamp seen in a pass marks the end of the evidence and
   // starts another pass, so a rewrite that lands during the checks is checked too. Every pass starts at mark `from`. A pass from a
   // later mark checks the marks before it again after the last mark. The deadline, cancellation, a mark without the budget, or a
-  // new grown stamp ends those checks with a match. Before those checks, every pass ignores the deadline, and the first pass also
-  // ignores cancellation. Cancellation in a later pass, a mark without the budget for its check, an unstable or short check, or a
-  // new grown stamp in every pass leaves the outcome pending. After a pending outcome, `checked` is the end of the longest run of
-  // checks from `from` in any pass that matched without a new grown stamp, so growth never moves it back. An unstable stamp or a
-  // short check leaves 0.
+  // new grown stamp ends those checks with a match. Before those checks, the first pass ignores the deadline and cancellation.
+  // Later passes together check at most the bytes of one such pass after the deadline. Cancellation in a later pass, that limit, a
+  // mark without the budget for its check, an unstable or short check, or a new grown stamp in every pass leaves the outcome
+  // pending. After a pending outcome, `checked` is the end of the longest run of checks from `from` in any pass that matched
+  // without a new grown stamp, so growth never moves it back. An unstable stamp or a short check leaves 0.
   private passes(evidence: RelationshipDigest, from = 0): 'match' | 'mismatch' | 'pending' {
     let reached = from;
+    let overdue = 0;
     for (let pass = 0; pass < RELATIONSHIP_SETTLE_PASSES; pass++) {
       this.checked = 0;
       this.note(evidence);
@@ -4398,13 +4399,16 @@ export class RelationshipReader {
       this.checked = from;
       const remaining = this.marks.length - this.checked;
       const order = [...this.marks.slice(this.checked), ...this.marks.slice(0, this.checked)];
+      const passBytes = order.slice(0, remaining).reduce((total, mark) => total + markLength(mark), 0);
       for (const [index, mark] of order.entries()) {
         const again = index >= remaining;
         const start = markStart(mark);
         if (start === undefined) return 'mismatch';
+        const late = pass > 0 && performance.now() >= this.deadline;
         if (
           (again && (this.cancelled() || performance.now() >= this.deadline)) ||
           (pass > 0 && this.cancelled()) ||
+          (late && overdue + mark.offset - start > passBytes) ||
           this.budget - this.readBytes < mark.offset - start
         ) {
           if (again) return 'match';
@@ -4412,6 +4416,7 @@ export class RelationshipReader {
           return 'pending';
         }
         const bytes = this.readAt(start, mark.offset - start);
+        if (late) overdue += bytes.length;
         if (this.meter) this.meter.revalidationBytes = (this.meter.revalidationBytes ?? 0) + bytes.length;
         if (!this.stable || bytes.length !== mark.offset - start) {
           this.checked = 0;
