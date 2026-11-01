@@ -44,13 +44,13 @@ Menus use `extension/scripts/web-demo-menu.ts`, the extension manifest, and pane
 
 ## Static web demo
 
-Build the sample demo from the repository root:
+Build the sample demo from `extension/`:
 
 ```bash
-npx tsx extension/scripts/web-demo.ts
+node --import tsx scripts/web-demo.ts
 ```
 
-Serve `.scratch-web-demo/site` as a static directory. Relative assets work at `/` and project paths such as `/arc/`. The demo uses the packaged panel, invented sessions, and a fixed clock. It has no agent connection. Edits remain in page memory and reset on reload. File and external links remain inert. `extension/scripts/web-demo-adapter.js` owns interactions. `extension/scripts/web-demo-export.ts` owns downloads under the [saved-session restrictions](export-session.md).
+The command writes the site to `.scratch-web-demo/site` at the repository root, which is `../.scratch-web-demo/site` from `extension/`. It reads nothing from `extension/dist`. Serve that folder as a static directory. Relative assets work at `/` and project paths such as `/arc/`. The demo uses the packaged panel, invented sessions, and a fixed clock. It has no agent connection. Edits remain in page memory and reset on reload. File and external links remain inert. `extension/scripts/web-demo-adapter.js` owns interactions. `extension/scripts/web-demo-export.ts` owns downloads under the [saved-session restrictions](export-session.md).
 
 Mouse Back and Forward navigate sessions. Keyboard shortcuts leave editable fields unchanged:
 
@@ -80,16 +80,28 @@ Refresh stale snapshots with `--refresh`, then review their model and default ch
 
 Classify every `PanelToHost` message in `extension/scripts/web-demo-host.ts`. Add an adapter branch for each handled message. Keep agent launch, file, and terminal actions as silent no-ops.
 
-Run the fixture and interaction checks, then export the current source:
+Publish only a commit that `main` on the `arc` remote holds. Push `main` to the `arc` remote before the checks.
+
+Run the fixture and interaction checks with screenshots from `extension/`, then [build the site](#static-web-demo) at the same HEAD:
 
 ```bash
-node extension/test.mjs node src/panel-shots.test.ts
-node extension/test.mjs browser src/web-demo.browser.test.ts
-npm --prefix extension run build
-npx tsx extension/scripts/web-demo.ts
+node test.mjs node src/panel-shots.test.ts
+ARC_DEMO_SHOTS=<dir> node test.mjs browser src/web-demo.browser.test.ts
 ```
 
-Inspect both providers' context detail, cache expiry, turn history, dispatched-session navigation, and existing interactions in dark and light themes at desktop and narrow widths. Run the [README capture command](#readme-screenshots) when a shared fixture changes a published scene. Retain original image bytes when only rasterization differs. New visible states need representative sample data and interaction checks. The protocol policy does not establish complete UI coverage.
+The browser test builds its own site from the same checkout. `ARC_DEMO_SHOTS` keeps its screenshots and downloads in `<dir>`, and the test creates `<dir>` when it is missing.
+
+Serve the built site over local HTTP. Inspect the screenshots and the served site for both providers' context detail, cache expiry, turn history, dispatched-session navigation, and existing interactions in dark and light themes at desktop and narrow widths. Run the [README capture command](#readme-screenshots) when a shared fixture changes a published scene. Retain original image bytes when only rasterization differs. New visible states need representative sample data and interaction checks. The protocol policy does not establish complete UI coverage.
+
+Publish from the inspected HEAD. Run this from `extension/`:
+
+```bash
+node --import tsx scripts/web-demo-publish.ts --message "<subject>"
+```
+
+The script fetches `main` and `gh-pages` from the remote. It refuses a checkout whose tracked files differ from HEAD, and a HEAD that the remote's `main` does not hold. It builds the site, runs `.github/scripts/check-web-demo-site.mjs`, and refuses when HEAD or a tracked file changed during the build. It commits the site and an empty `.nojekyll` with the remote's `gh-pages` as the one parent. The subject is `docs(demo): <subject>`, and the trailer is `Source: <full HEAD SHA>`. Then the script moves local `gh-pages` to that commit. It stops with no commit when the site matches the remote's `gh-pages`. It refuses when local `gh-pages` holds commits that the remote lacks, and when a worktree has `gh-pages` checked out. The script builds the tree in a temporary index file and creates the commit with `git commit-tree`, so commit hooks such as `pre-commit` and `commit-msg` do not run. The real index and the working tree stay untouched.
+
+The script prints the source SHA. Check that it matches the HEAD you inspected. Without `--push`, the script prints the push command and pushes nothing. With `--push`, it runs `git push <remote> gh-pages:gh-pages`, which never forces. An agent passes `--push` only with owner approval. `--remote <name>` selects a remote other than `arc`.
 
 ## Demo source contracts
 

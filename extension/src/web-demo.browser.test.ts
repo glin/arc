@@ -163,6 +163,7 @@ describe('read-only web demo', () => {
         expect.arrayContaining(['raw-tools', 'reasoning', 'commands', 'patches', 'attachments', 'comments', 'drafts']),
       );
       if (process.env.ARC_DEMO_SHOTS) {
+        fs.mkdirSync(process.env.ARC_DEMO_SHOTS, { recursive: true });
         fs.copyFileSync(file, path.join(process.env.ARC_DEMO_SHOTS, download.suggestedFilename()));
         await offline.screenshot({
           path: path.join(process.env.ARC_DEMO_SHOTS, `offline-${session}.png`),

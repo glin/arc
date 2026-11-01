@@ -219,6 +219,11 @@
     "cases": 20,
     "matricesSha256": "e58d9afdc9625ad44fe51d83443f37758e64a3b844b1f84ea769c30926256e9b"
   },
+  "extension/src/web-demo-publish.test.ts": {
+    "reason": "The publish script must commit the built site through real Git processes on fixture repositories. It must leave the checkout unchanged and refuse unsafe source and branch states.",
+    "cases": 12,
+    "matricesSha256": "1b8cf87882f49649fe5a7bbbb6c05511091f3e5488cb509a0cfcab17c6627529"
+  },
   "extension/src/web-demo.browser.test.ts": {
     "reason": "The packaged static demo must preserve production menu, comment, navigation, and download interactions.",
     "cases": 19,
