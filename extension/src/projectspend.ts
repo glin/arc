@@ -2229,10 +2229,22 @@ export interface PruneSpendFilesResult {
   pruned: boolean;
 }
 
+// Discovery reads no compressed rollout, so a saved record of one counts a session that the list does not show.
+function unreadSpendFile(file: string): boolean {
+  return file.toLowerCase().endsWith('.jsonl.zst');
+}
+
 export function pruneSpendFilesWithResult(files: readonly SpendFileIndex[], now = Date.now()): PruneSpendFilesResult {
   const cutoff = projectSpendWindows(now)[2].start;
   let pruned = false;
   const retained = files
+    .filter((record) => {
+      const unread = unreadSpendFile(record.file);
+      if (unread) {
+        pruned = true;
+      }
+      return !unread;
+    })
     .map((record) => {
       const buckets = record.buckets.filter((bucket) => bucket.localDate >= cutoff);
       if (buckets.length === record.buckets.length) {

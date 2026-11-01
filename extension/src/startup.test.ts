@@ -148,6 +148,7 @@ import {
   SessionSpendSourceIndex,
   indexSpendFile,
   normalizeSpendFile,
+  normalizeWorkspace,
   sessionSpendPartsBySession,
 } from './projectspend';
 import {
@@ -16741,6 +16742,87 @@ test('Project cost snapshot hydration replaces an interrupted build without coun
     await vi.runAllTimersAsync();
     assert.equal(provider.projectSpendFiles.length, 1);
     assert.equal(provider.projectSpendPayload().windows[0].dollars, 11);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+// The ledger holds the spend of a compressed rollout that an earlier build read, beside one plain rollout.
+async function hydrateCompressedRolloutLedger() {
+  const storage = tempDir('spend-compressed-rollout');
+  const folder = tempDir('spend-compressed-sessions');
+  const saved = (name: string, dollars: number): SpendFileIndex => ({
+    ...snapshotSpendFile(dollars),
+    file: normalizeSpendFile(path.join(folder, name)),
+    workspace: normalizeWorkspace('project'),
+  });
+  const plain = path.join(folder, 'rollout-a.jsonl');
+  saveSpendLedger(storage, 'project', [saved('rollout-a.Jsonl.ZST', 7), saved('rollout-b.jsonl', 5)]);
+  let saves = 0;
+  const provider = projectSpendSnapshotHarness(
+    {
+      loadSpendLedger,
+      pruneSpendFilesWithResult,
+      normalizeSpendFile,
+      spendRecordChangesRail: () => false,
+      spendRecordHoldsLongLine,
+      releaseSpendHeldLine,
+      invalidateSpendFileNormalization: () => {},
+      createClaudeUsageLineReducer: () => null,
+      createCodexUsageLineReducer: () => null,
+      // The plain rollout holds the same requests as the compressed one.
+      indexSpendFile: () => ({ record: saved('rollout-a.jsonl', 7), stateChanged: true, complete: true, found: true }),
+      fs,
+    },
+    ['hydrateProjectSpend', 'indexNextProjectSpendFile', 'finishProjectSpendIndex'],
+  );
+  provider.projectSpendStorageDir = storage;
+  provider.projectSpendFiles = [];
+  provider.projectSpendVisibleFiles = [];
+  provider.projectSpendHydrated = false;
+  provider.projectSpendQueued = new Set();
+  provider.scheduleProjectSpendMidnight = () => {};
+  provider.scheduleProjectSpendIndex = () => {};
+  provider.scheduleNextProjectSpendFile = () => {};
+  provider.scheduleProjectSpendSave = () => {
+    saves++;
+    saveSpendLedger(storage, 'project', provider.projectSpendFiles, provider.projectSpendVisibleFiles);
+  };
+  provider.postRail = () => {};
+  provider.hydrateProjectSpend('project', provider.refreshGeneration, null);
+  await vi.runAllTimersAsync();
+  return { provider, storage, plain, saves: () => saves };
+}
+
+test('Project cost hydration drops the saved spend of a compressed rollout and saves the ledger without it', async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date('2026-10-21T12:00:00'));
+  try {
+    const { provider, storage, saves } = await hydrateCompressedRolloutLedger();
+    assert.equal(provider.projectSpendPayload().windows[0].dollars, 5, 'Project cost counted the compressed rollout');
+    assert.equal(saves(), 1, 'hydration left the compressed rollout in the saved ledger');
+    const ledger = loadSpendLedger(storage, 'project');
+    for (const files of [ledger.files, ledger.completeFiles])
+      assert.deepEqual(
+        files.map((record) => path.basename(record.file).toLowerCase()),
+        ['rollout-b.jsonl'],
+      );
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('Project cost counts a session once when its plain rollout is indexed after a saved compressed rollout', async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date('2026-10-21T12:00:00'));
+  try {
+    const { provider, plain } = await hydrateCompressedRolloutLedger();
+    provider.projectSpendQueue = [{ file: plain, agent: 'codex', primary: true }];
+    provider.projectSpendQueued.add(normalizeSpendFile(plain));
+    provider.indexNextProjectSpendFile();
+    provider.finishProjectSpendIndex();
+    await vi.runAllTimersAsync();
+    assert.equal(provider.projectSpendPayload().windows[0].dollars, 12, 'Project cost counted the session twice');
   } finally {
     vi.useRealTimers();
   }
