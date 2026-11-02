@@ -343,6 +343,7 @@ import {
   appendDispatchTurn,
   instrumentSoak,
   linkTree,
+  NAMED_COUNTERS,
   soakMeasures,
   startDispatch,
 } from '../scripts/panel-startup-measure/soak';
@@ -1613,6 +1614,11 @@ test('a soak dispatch reads as a dispatched Codex child of a workspace parent', 
   assert.equal(simulation.appends, 1);
 });
 
+test('the named counters hold every counter that the measure table lists', () => {
+  for (const name of ['compressedDecodes', 'compressedStoreWriteBytes', 'refreshCount:compressed-facts'])
+    assert.ok((NAMED_COUNTERS as readonly string[]).includes(name), name);
+});
+
 test('soak measures read the counters a saved diagnostics snapshot carries', () => {
   const counters = new PanelPerformanceCounters();
   counters.recordRefresh('poll', 40);
@@ -1625,9 +1631,25 @@ test('soak measures read the counters a saved diagnostics snapshot carries', () 
   assert.equal(measures.compressedDecodes, 0);
   assert.equal(measures.catalogWalks, 0);
   assert.deepEqual(
-    soakMeasures({ counters: { work: { compressedDecodes: 2 }, loopDelay: { maxMs: 120, p99Ms: 30 } } }),
-    { compressedDecodes: 2, catalogWalks: 0, loopDelayMaxMs: 120, loopDelayP99Ms: 30 },
+    soakMeasures({
+      counters: {
+        work: { compressedDecodes: 2, compressedStoreWriteBytes: 4096 },
+        refreshes: { 'compressed-facts': { count: 3, totalDurationMs: 30 } },
+        loopDelay: { maxMs: 120, p99Ms: 30 },
+      },
+    }),
+    {
+      compressedDecodes: 2,
+      compressedStoreWriteBytes: 4096,
+      catalogWalks: 0,
+      'refreshMs:compressed-facts': 30,
+      'refreshCount:compressed-facts': 3,
+      loopDelayMaxMs: 120,
+      loopDelayP99Ms: 30,
+    },
   );
+  assert.equal(measures['refreshCount:compressed-facts'], 0);
+  assert.equal(measures.compressedStoreWriteBytes, 0);
   for (const name of [
     'publications',
     'partialPublications',

@@ -287,12 +287,16 @@ export function missingSoakMeasures(measures: Record<string, number>): string[] 
   return REQUIRED_DISCOVERY_MEASURES.filter((name) => !Number.isFinite(measures[name]));
 }
 
-// The host counters the measure table names, by their `work` name and their measure name. A build that never counted
-// one reports 0.
-export const NAMED_COUNTERS: Readonly<Record<string, string>> = {
-  catalogWalk: 'catalogWalks',
-  compressedDecodes: 'compressedDecodes',
-};
+// The host counters the measure table names, by measure name. A refresh count reads the refreshes of its reason. Every
+// other counter reads the `work` counter that `WORK_COUNTERS` names, or the `work` counter of its own name. A build that
+// never counted one reports 0.
+export const NAMED_COUNTERS = [
+  'catalogWalks',
+  'compressedDecodes',
+  'compressedStoreWriteBytes',
+  'refreshCount:compressed-facts',
+] as const;
+const WORK_COUNTERS: Readonly<Record<string, string>> = { catalogWalks: 'catalogWalk' };
 
 // The measures a soak snapshot supplies, in the units the comparison reads. Every gauge passes through by its own name.
 export function soakMeasures(snapshot: {
@@ -323,8 +327,11 @@ export function soakMeasures(snapshot: {
     if (typeof counts.maximumDurationMs === 'number') out[`refreshMaxMs:${reason}`] = counts.maximumDurationMs;
   }
   const work = snapshot.counters?.work ?? {};
-  for (const [counter, measure] of Object.entries(NAMED_COUNTERS))
-    out[measure] = typeof work[counter] === 'number' ? work[counter] : 0;
+  for (const measure of NAMED_COUNTERS) {
+    if (typeof out[measure] === 'number') continue;
+    const value = measure.startsWith('refreshCount:') ? undefined : work[WORK_COUNTERS[measure] ?? measure];
+    out[measure] = typeof value === 'number' ? value : 0;
+  }
   for (const [name, value] of Object.entries(snapshot.counters?.gauges ?? {}))
     if (typeof value === 'number') out[name] = value;
   const loopDelay = snapshot.counters?.loopDelay;
