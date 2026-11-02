@@ -61,6 +61,7 @@ import { syncBuiltinESMExports } from 'node:module';
 import * as path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { isDeepStrictEqual } from 'node:util';
+import * as zlib from 'node:zlib';
 import ts from 'typescript';
 import { agentSpendIsOpen, spendFileVersion, spendTokens } from './agentspend';
 import {
@@ -1373,8 +1374,8 @@ test('a frozen catalog moves workspace sessions into the fixture and passes runn
   const outside = fs.readFileSync(path.join(output, 'codex', '2026', '10', '01', 'rollout-outside.jsonl'), 'utf8');
   assert.equal(outside, fs.readFileSync(source.outside, 'utf8').split('\n')[0] + '\n');
   assert.deepEqual(manifest.frozen.reduced, record.reduced);
-  assert.deepEqual(manifest.frozen.placeholders, { files: 1, bytes: 300 });
-  assert.equal(fs.statSync(path.join(output, 'codex', '2026', '10', '01', 'rollout-archived.jsonl.zst')).size, 0);
+  assert.deepEqual(manifest.frozen.compressed, { files: 1, bytes: 300 });
+  assert.equal(fs.statSync(path.join(output, 'codex', '2026', '10', '01', 'rollout-archived.jsonl.zst')).size, 300);
   assert.deepEqual(record.reduced, [
     {
       file: path.join('codex', '2026', '10', '01', 'rollout-outside.jsonl'),
@@ -1396,7 +1397,7 @@ test('a frozen catalog moves workspace sessions into the fixture and passes runn
   );
   const live = [source.projects, source.codex];
   const inputs = frozenFixturePaths(output, manifest, live);
-  // A record in the Codex root names a rollout that Codex archived, so the fixture holds only its placeholder.
+  // A record in the Codex root names a rollout that Codex archived, so the fixture holds only its compressed archive.
   const archived = path.join(output, 'codex', '2026', '10', '01', 'rollout-archived.jsonl');
   const outsideLog = path.join(source.root, 'launch-log.jsonl');
   const recordFile = path.join(output, 'codex', 'record.json');
@@ -1420,6 +1421,61 @@ test('a frozen catalog moves workspace sessions into the fixture and passes runn
     /already exists/,
   );
 });
+
+const rolloutCompression = zlib as typeof zlib & {
+  zstdCompressSync?: (bytes: Buffer) => Buffer;
+  zstdDecompressSync?: (bytes: Buffer) => Buffer;
+};
+test.skipIf(!rolloutCompression.zstdCompressSync)(
+  'a frozen catalog copies a compressed rollout unchanged and still reduces a plain rollout',
+  () => {
+    const source = freezerSource();
+    const archive = path.join(source.codex, '2026', '10', '01', 'rollout-archived.jsonl.zst');
+    const text =
+      [
+        { type: 'session_meta', payload: { id: 'archived', cwd: path.join(source.root, 'other') } },
+        { type: 'event_msg', payload: { text: `${source.workspace} `.repeat(2000) } },
+      ]
+        .map((entry) => JSON.stringify(entry))
+        .join('\n') + '\n';
+    const compressed = rolloutCompression.zstdCompressSync!(Buffer.from(text, 'utf8'));
+    fs.writeFileSync(archive, compressed);
+    fs.utimesSync(archive, source.settled, source.settled);
+    const output = path.join(tempDir('freeze-output'), '2026-11-02');
+    const record = freezeCatalog({
+      workspace: source.workspace,
+      projects: source.projects,
+      codex: source.codex,
+      output,
+    });
+    const manifest = JSON.parse(fs.readFileSync(path.join(output, 'manifest.json'), 'utf8'));
+    const frozen = path.join(output, 'codex', '2026', '10', '01', 'rollout-archived.jsonl.zst');
+    assert.ok(fs.readFileSync(frozen).equals(compressed));
+    assert.equal(rolloutCompression.zstdDecompressSync!(fs.readFileSync(frozen)).toString('utf8'), text);
+    assert.equal(fs.statSync(frozen).mtimeMs, source.settled.getTime());
+    assert.deepEqual(manifest.frozen.compressed, { files: 1, bytes: compressed.length });
+    assert.equal(manifest.frozen.placeholders, undefined);
+    assert.deepEqual(
+      record.sources.find(
+        (entry) => entry.file === path.join('codex', '2026', '10', '01', 'rollout-archived.jsonl.zst'),
+      ),
+      {
+        file: path.join('codex', '2026', '10', '01', 'rollout-archived.jsonl.zst'),
+        sha256: createHash('sha256').update(compressed).digest('hex'),
+        bytes: compressed.length,
+        frozenBytes: compressed.length,
+      },
+    );
+    assert.deepEqual(
+      manifest.frozen.reduced.map((entry: { file: string }) => entry.file),
+      [path.join('codex', '2026', '10', '01', 'rollout-outside.jsonl')],
+    );
+    assert.equal(
+      fs.readFileSync(path.join(output, 'codex', '2026', '10', '01', 'rollout-outside.jsonl'), 'utf8'),
+      fs.readFileSync(source.outside, 'utf8').split('\n')[0] + '\n',
+    );
+  },
+);
 
 test('a soak dispatch reads as a dispatched Codex child of a workspace parent', () => {
   const root = tempDir('soak-dispatch');

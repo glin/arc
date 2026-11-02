@@ -35,8 +35,8 @@ export interface FreezeRecord {
   sources: FrozenSource[];
   // Rollouts outside the workspace keep only their opening record. Discovery reads no more of them.
   reduced: Array<{ file: string; bytes: number; openingSha256: string }>;
-  // Compressed rollout archives that discovery never opens. Each keeps its name as an empty file, so listings match.
-  placeholders: { files: number; bytes: number };
+  // Compressed rollout archives, copied byte for byte. A cut zstd stream does not decode, so none is reduced.
+  compressed: { files: number; bytes: number };
   bytes: number;
   frozenBytes: number;
   dispatch?: Omit<DispatchFreeze, 'sources'>;
@@ -125,6 +125,30 @@ function copyRewritten(source: string, target: string, rewrite: (text: string) =
   const stat = fs.statSync(source);
   fs.utimesSync(target, stat.atime, stat.mtime);
   return { file: '', sha256: hash.digest('hex'), bytes, frozenBytes };
+}
+
+// Copy one file byte for byte, and keep its source times.
+function copyExact(source: string, target: string): FrozenSource {
+  const hash = createHash('sha256');
+  const input = fs.openSync(source, 'r');
+  const output = fs.openSync(target, 'wx');
+  const buffer = Buffer.alloc(CHUNK);
+  let bytes = 0;
+  try {
+    for (;;) {
+      const read = fs.readSync(input, buffer, 0, CHUNK, null);
+      if (read === 0) break;
+      bytes += read;
+      hash.update(buffer.subarray(0, read));
+      fs.writeSync(output, buffer, 0, read);
+    }
+  } finally {
+    fs.closeSync(input);
+    fs.closeSync(output);
+  }
+  const stat = fs.statSync(source);
+  fs.utimesSync(target, stat.atime, stat.mtime);
+  return { file: '', sha256: hash.digest('hex'), bytes, frozenBytes: bytes };
 }
 
 // Keep only the opening record of a rollout, which is all that discovery reads of another workspace's rollout.
@@ -438,13 +462,13 @@ export function freezeCatalog(options: FreezeOptions): FreezeRecord {
     frozenAt: new Date(options.now ?? Date.now()).toISOString(),
     sources: [],
     reduced: [],
-    placeholders: { files: 0, bytes: 0 },
+    compressed: { files: 0, bytes: 0 },
     bytes: 0,
     frozenBytes: 0,
   };
-  const keep = (source: string, relative: string, target: string) => {
+  const keep = (source: string, relative: string, target: string, copy = copyRewritten) => {
     fs.mkdirSync(path.dirname(target), { recursive: true });
-    const frozen = copyRewritten(source, target, rewrite);
+    const frozen = copy(source, target, rewrite);
     record.sources.push({ ...frozen, file: relative });
     record.bytes += frozen.bytes;
     record.frozenBytes += frozen.frozenBytes;
@@ -459,12 +483,9 @@ export function freezeCatalog(options: FreezeOptions): FreezeRecord {
     const relative = path.relative(options.codex, file);
     const target = path.join(frozenCodex, relative);
     if (file.endsWith('.zst')) {
-      fs.mkdirSync(path.dirname(target), { recursive: true });
-      fs.writeFileSync(target, '', { flag: 'wx' });
-      const stat = fs.statSync(file);
-      fs.utimesSync(target, stat.atime, stat.mtime);
-      record.placeholders.files++;
-      record.placeholders.bytes += stat.size;
+      keep(file, path.join('codex', relative), target, copyExact);
+      record.compressed.files++;
+      record.compressed.bytes += record.sources[record.sources.length - 1].bytes;
       continue;
     }
     const cwd = file.endsWith('.jsonl') ? readCodexSessionMeta(file)?.cwd : null;
@@ -509,7 +530,7 @@ export function freezeCatalog(options: FreezeOptions): FreezeRecord {
           frozenBytes: record.frozenBytes,
           reducedBytes: record.reduced.reduce((sum, entry) => sum + entry.bytes, 0),
           reduced: record.reduced,
-          placeholders: record.placeholders,
+          compressed: record.compressed,
           dispatch: record.dispatch
             ? {
                 files: record.dispatch.files,
@@ -551,6 +572,8 @@ function main(): void {
       bytes: record.bytes,
       frozenBytes: record.frozenBytes,
       reducedRollouts: record.reduced.length,
+      compressedRollouts: record.compressed.files,
+      compressedBytes: record.compressed.bytes,
     })}\n`,
   );
 }
