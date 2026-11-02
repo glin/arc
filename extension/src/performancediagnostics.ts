@@ -1,5 +1,6 @@
 import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { monitorEventLoopDelay, type IntervalHistogram } from 'node:perf_hooks';
 
 import { ARC_IDENTITY } from './identity';
 
@@ -98,6 +99,10 @@ export interface PerformanceCounterSnapshot {
   rowsGapCount: number;
   // Named host operations since activation, by count. Each name is one derivation or file check the host repeats.
   work: Record<string, number>;
+  // Named host values that their producer replaces. A gauge is absent until its producer sets it.
+  gauges: Record<string, number>;
+  // The event loop delay of the extension host since the counters started. It is null before the first sample.
+  loopDelay: { maxMs: number; p99Ms: number } | null;
   ledgerSaveCount: number;
   lastWatcherOperation: WatcherOperation | null;
   lastLedgerSave: LedgerSaveOperation | null;
@@ -342,6 +347,8 @@ export class PanelPerformanceCounters {
   private readonly rowPosts = new Map<string, RowPostCounts>();
   private rowsGapCount = 0;
   private readonly work = new Map<string, number>();
+  private readonly gauges = new Map<string, number>();
+  private readonly loopDelay: IntervalHistogram = monitorEventLoopDelay({ resolution: 10 });
   private ledgerSaveCount = 0;
   private readonly refreshes = new Map<string, OperationCounts>();
   private readonly refreshStages: Record<RefreshStage, number> = {
@@ -369,6 +376,7 @@ export class PanelPerformanceCounters {
     this.sourceId = typeof sourceIdOrSink === 'string' ? sourceIdOrSink : randomUUID();
     this.sink = typeof sourceIdOrSink === 'string' ? sink : sourceIdOrSink;
     this.startedAt = new Date(startedAt).toISOString();
+    this.loopDelay.enable();
   }
 
   recordCapture(): void {
@@ -481,6 +489,12 @@ export class PanelPerformanceCounters {
     this.work.set(name, (this.work.get(name) ?? 0) + count);
   }
 
+  // Replace a named value. An absent or non-finite value deletes the gauge.
+  recordGauge(name: string, value: number | null | undefined): void {
+    if (typeof value === 'number' && Number.isFinite(value)) this.gauges.set(name, value);
+    else this.gauges.delete(name);
+  }
+
   // `unknownPaths` holds the shape and extension of each path that decided `unknownPath`. `walkListedPaths` counts the
   // paths that the decision admitted from the last walk.
   recordWatcherOperation(
@@ -551,6 +565,11 @@ export class PanelPerformanceCounters {
       rowPosts: sortedRecord(this.rowPosts, rowPostSnapshot),
       rowsGapCount: this.rowsGapCount,
       work: sortedRecord(this.work, (count) => count),
+      gauges: sortedRecord(this.gauges, (value) => value),
+      // The histogram records nanoseconds.
+      loopDelay: this.loopDelay.count
+        ? { maxMs: this.loopDelay.max / 1e6, p99Ms: this.loopDelay.percentile(99) / 1e6 }
+        : null,
       ledgerSaveCount: this.ledgerSaveCount,
       lastWatcherOperation: this.lastWatcherOperation
         ? { ...this.lastWatcherOperation, broadReasons: [...this.lastWatcherOperation.broadReasons] }
@@ -713,6 +732,8 @@ export function projectPerformanceDiagnostics(state: PerformanceDiagnosticState,
       ),
       rowsGapCount: state.counters.rowsGapCount,
       work: { ...state.counters.work },
+      gauges: { ...state.counters.gauges },
+      loopDelay: state.counters.loopDelay ? { ...state.counters.loopDelay } : null,
       ledgerSaveCount: state.counters.ledgerSaveCount,
       lastWatcherOperation: state.counters.lastWatcherOperation
         ? {

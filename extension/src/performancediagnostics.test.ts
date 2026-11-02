@@ -1,5 +1,5 @@
 import { meterRead, readPhase, meterReadWork, withReadMetrics, type ReadMetrics } from './readmeter';
-import { test } from 'vitest';
+import { test, vi } from 'vitest';
 import assert from 'node:assert';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
@@ -108,6 +108,10 @@ test('performance counters correlate posts and replies for every open panel', ()
   counters.recordWork('childVersionStat');
   counters.recordWork('childVersionStat', 4);
   counters.recordWork('railPayloadBuilt');
+  counters.recordGauge('backfillPending', 4);
+  counters.recordGauge('compressedRows', 7);
+  counters.recordGauge('backfillPending', undefined);
+  counters.recordGauge('compressedRows', 9);
   counters.recordLedgerSave({ reason: 'maximum', durationMs: 20, succeeded: true });
 
   assert.deepEqual(counters.snapshot(), {
@@ -214,6 +218,8 @@ test('performance counters correlate posts and replies for every open panel', ()
     },
     rowsGapCount: 1,
     work: { childVersionStat: 5, railPayloadBuilt: 1 },
+    gauges: { compressedRows: 9 },
+    loopDelay: null,
     ledgerSaveCount: 1,
     lastWatcherOperation: {
       id: 2,
@@ -254,6 +260,7 @@ test('the saved snapshot carries refresh stages, discovery, decisions, row posts
   counters.recordRowPost('render', { whole: true, reason: 'globalMoved:scope', rowsHeld: 2, rowsSent: 2 }, 100);
   counters.recordRowsGap();
   counters.recordWork('dispatchedCostsPost', 3);
+  counters.recordGauge('compressedRows', 12);
   const projected = projectPerformanceDiagnostics(state(counters.snapshot()), 2_000) as {
     counters: Record<string, unknown>;
   };
@@ -283,9 +290,33 @@ test('the saved snapshot carries refresh stages, discovery, decisions, row posts
   });
   assert.equal(projected.counters.rowsGapCount, 1);
   assert.deepEqual(projected.counters.work, { dispatchedCostsPost: 3 });
+  assert.deepEqual(projected.counters.gauges, { compressedRows: 12 });
   assert.deepEqual((projected.counters.lastWatcherOperation as { broadReasons: string[] }).broadReasons, [
     'unknownPath',
   ]);
+});
+
+test('the loop delay measures read milliseconds from the extension host loop', async () => {
+  const counters = new PanelPerformanceCounters(1_000, 'window-a');
+  // The histogram measures from its first sample, so a delay before that sample counts nowhere.
+  await vi.waitFor(() => assert.ok(counters.snapshot().loopDelay), { timeout: 5_000, interval: 10 });
+  // Hold the loop so the histogram records one long delay.
+  const blockedUntil = Date.now() + 60;
+  while (Date.now() < blockedUntil);
+  await vi.waitFor(
+    () => {
+      const delay = counters.snapshot().loopDelay;
+      assert.ok(delay && delay.maxMs >= 40, JSON.stringify(delay));
+    },
+    { timeout: 5_000, interval: 10 },
+  );
+  const { maxMs, p99Ms } = counters.snapshot().loopDelay!;
+  assert.ok(maxMs < 10_000, `the maximum read ${maxMs}, which is not milliseconds`);
+  assert.ok(p99Ms > 0 && p99Ms <= maxMs, `the 99th percentile read ${p99Ms}`);
+  const projected = projectPerformanceDiagnostics(state(counters.snapshot()), 2_000) as {
+    counters: { loopDelay: unknown };
+  };
+  assert.deepEqual(Object.keys(projected.counters.loopDelay as object).sort(), ['maxMs', 'p99Ms']);
 });
 
 test('released panels leave no diagnostic entry after repeated disposal', () => {
