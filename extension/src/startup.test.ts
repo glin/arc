@@ -1318,7 +1318,7 @@ function freezerSource() {
   return { root, workspace, worktree, projects, codex, member, outside, settled };
 }
 
-test('measurement freezer refuses a source that holds a health log or a Git directory', () => {
+test('measurement freezer refuses a source that holds a health log or a Git directory', async () => {
   for (const unsafe of [
     path.join('logs', 'health-0a1b2c3d-0000-4000-8000-000000000000.json'),
     path.join('.git', 'HEAD'),
@@ -1328,8 +1328,8 @@ test('measurement freezer refuses a source that holds a health log or a Git dire
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, '{}');
     const output = path.join(source.root, 'fixture');
-    assert.throws(
-      () => freezeCatalog({ workspace: source.workspace, projects: source.projects, codex: source.codex, output }),
+    await assert.rejects(
+      freezeCatalog({ workspace: source.workspace, projects: source.projects, codex: source.codex, output }),
       /health log|Git directory/,
     );
     assert.equal(fs.existsSync(output), false);
@@ -1340,10 +1340,15 @@ test('measurement freezer refuses a source that holds a health log or a Git dire
   }
 });
 
-test('a frozen catalog moves workspace sessions into the fixture and passes runner validation', () => {
+test('a frozen catalog moves workspace sessions into the fixture and passes runner validation', async () => {
   const source = freezerSource();
   const output = path.join(tempDir('freeze-output'), '2026-10-28');
-  const record = freezeCatalog({ workspace: source.workspace, projects: source.projects, codex: source.codex, output });
+  const record = await freezeCatalog({
+    workspace: source.workspace,
+    projects: source.projects,
+    codex: source.codex,
+    output,
+  });
   const manifest = JSON.parse(fs.readFileSync(path.join(output, 'manifest.json'), 'utf8'));
   const frozenWorkspace = path.join(output, 'workspace');
   assert.equal(JSON.parse(fs.readFileSync(path.join(output, 'state.json'), 'utf8')).showing, 'selected');
@@ -1374,7 +1379,23 @@ test('a frozen catalog moves workspace sessions into the fixture and passes runn
   const outside = fs.readFileSync(path.join(output, 'codex', '2026', '10', '01', 'rollout-outside.jsonl'), 'utf8');
   assert.equal(outside, fs.readFileSync(source.outside, 'utf8').split('\n')[0] + '\n');
   assert.deepEqual(manifest.frozen.reduced, record.reduced);
-  assert.deepEqual(manifest.frozen.compressed, { files: 1, bytes: 300 });
+  assert.deepEqual(manifest.frozen.compressed, {
+    files: 1,
+    bytes: 300,
+    frozenBytes: 300,
+    rewritten: 0,
+    undecodable: 1,
+    rollouts: [
+      {
+        file: path.join('codex', '2026', '10', '01', 'rollout-archived.jsonl.zst'),
+        sha256: createHash('sha256').update('z'.repeat(300)).digest('hex'),
+        bytes: 300,
+        frozenBytes: 300,
+        frozenSha256: createHash('sha256').update('z'.repeat(300)).digest('hex'),
+        archive: 'undecodable',
+      },
+    ],
+  });
   assert.equal(fs.statSync(path.join(output, 'codex', '2026', '10', '01', 'rollout-archived.jsonl.zst')).size, 300);
   assert.deepEqual(record.reduced, [
     {
@@ -1416,8 +1437,8 @@ test('a frozen catalog moves workspace sessions into the fixture and passes runn
     if (file.includes('rollout-outside') || file.includes('-tools')) continue;
     assert.deepEqual(leaked, [], file);
   }
-  assert.throws(
-    () => freezeCatalog({ workspace: source.workspace, projects: source.projects, codex: source.codex, output }),
+  await assert.rejects(
+    freezeCatalog({ workspace: source.workspace, projects: source.projects, codex: source.codex, output }),
     /already exists/,
   );
 });
@@ -1427,52 +1448,70 @@ const rolloutCompression = zlib as typeof zlib & {
   zstdDecompressSync?: (bytes: Buffer) => Buffer;
 };
 test.skipIf(!rolloutCompression.zstdCompressSync)(
-  'a frozen catalog copies a compressed rollout unchanged and still reduces a plain rollout',
-  () => {
+  'a frozen catalog moves workspace paths inside a compressed rollout and keeps an untouched one',
+  async () => {
     const source = freezerSource();
-    const archive = path.join(source.codex, '2026', '10', '01', 'rollout-archived.jsonl.zst');
-    const text =
+    const day = path.join('codex', '2026', '10', '01');
+    const rollout = (workspace: string, cwd: string) =>
       [
-        { type: 'session_meta', payload: { id: 'archived', cwd: path.join(source.root, 'other') } },
-        { type: 'event_msg', payload: { text: `${source.workspace} `.repeat(2000) } },
+        { type: 'session_meta', payload: { id: 'packed', cwd } },
+        { type: 'event_msg', payload: { text: `${workspace} `.repeat(2000) } },
       ]
         .map((entry) => JSON.stringify(entry))
         .join('\n') + '\n';
-    const compressed = rolloutCompression.zstdCompressSync!(Buffer.from(text, 'utf8'));
-    fs.writeFileSync(archive, compressed);
-    fs.utimesSync(archive, source.settled, source.settled);
+    const pack = (name: string, text: string) => {
+      const file = path.join(source.root, day, name);
+      const bytes = rolloutCompression.zstdCompressSync!(Buffer.from(text, 'utf8'));
+      fs.writeFileSync(file, bytes);
+      fs.utimesSync(file, source.settled, source.settled);
+      return bytes;
+    };
+    const member = pack('rollout-packed-member.jsonl.zst', rollout(source.workspace, source.workspace));
+    const other = pack('rollout-packed-other.jsonl.zst', rollout('elsewhere', path.join(source.root, 'other')));
     const output = path.join(tempDir('freeze-output'), '2026-11-02');
-    const record = freezeCatalog({
-      workspace: source.workspace,
-      projects: source.projects,
-      codex: source.codex,
-      output,
-    });
+    await freezeCatalog({ workspace: source.workspace, projects: source.projects, codex: source.codex, output });
     const manifest = JSON.parse(fs.readFileSync(path.join(output, 'manifest.json'), 'utf8'));
-    const frozen = path.join(output, 'codex', '2026', '10', '01', 'rollout-archived.jsonl.zst');
-    assert.ok(fs.readFileSync(frozen).equals(compressed));
-    assert.equal(rolloutCompression.zstdDecompressSync!(fs.readFileSync(frozen)).toString('utf8'), text);
-    assert.equal(fs.statSync(frozen).mtimeMs, source.settled.getTime());
-    assert.deepEqual(manifest.frozen.compressed, { files: 1, bytes: compressed.length });
-    assert.equal(manifest.frozen.placeholders, undefined);
-    assert.deepEqual(
-      record.sources.find(
-        (entry) => entry.file === path.join('codex', '2026', '10', '01', 'rollout-archived.jsonl.zst'),
-      ),
-      {
-        file: path.join('codex', '2026', '10', '01', 'rollout-archived.jsonl.zst'),
-        sha256: createHash('sha256').update(compressed).digest('hex'),
-        bytes: compressed.length,
-        frozenBytes: compressed.length,
-      },
-    );
-    assert.deepEqual(
-      manifest.frozen.reduced.map((entry: { file: string }) => entry.file),
-      [path.join('codex', '2026', '10', '01', 'rollout-outside.jsonl')],
+    const frozenMember = fs.readFileSync(path.join(output, day, 'rollout-packed-member.jsonl.zst'));
+    const frozenWorkspace = path.join(output, 'workspace');
+    assert.equal(
+      rolloutCompression.zstdDecompressSync!(frozenMember).toString('utf8'),
+      rollout(frozenWorkspace, frozenWorkspace),
     );
     assert.equal(
-      fs.readFileSync(path.join(output, 'codex', '2026', '10', '01', 'rollout-outside.jsonl'), 'utf8'),
-      fs.readFileSync(source.outside, 'utf8').split('\n')[0] + '\n',
+      fs.statSync(path.join(output, day, 'rollout-packed-member.jsonl.zst')).mtimeMs,
+      source.settled.getTime(),
+    );
+    assert.ok(fs.readFileSync(path.join(output, day, 'rollout-packed-other.jsonl.zst')).equals(other));
+    const sha256 = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex');
+    const listed = (name: string) =>
+      manifest.frozen.compressed.rollouts.find((entry: { file: string }) => entry.file === path.join(day, name));
+    assert.deepEqual(listed('rollout-packed-member.jsonl.zst'), {
+      file: path.join(day, 'rollout-packed-member.jsonl.zst'),
+      sha256: sha256(member),
+      bytes: member.length,
+      frozenSha256: sha256(frozenMember),
+      frozenBytes: frozenMember.length,
+      archive: 'rewritten',
+    });
+    assert.deepEqual(listed('rollout-packed-other.jsonl.zst'), {
+      file: path.join(day, 'rollout-packed-other.jsonl.zst'),
+      sha256: sha256(other),
+      bytes: other.length,
+      frozenSha256: sha256(other),
+      frozenBytes: other.length,
+      archive: 'copied',
+    });
+    assert.deepEqual(
+      JSON.parse(fs.readFileSync(path.join(output, 'sources.json'), 'utf8')).sources.filter(
+        (entry: { archive?: string }) => entry.archive,
+      ),
+      manifest.frozen.compressed.rollouts,
+    );
+    assert.equal(manifest.frozen.compressed.files, 3);
+    assert.equal(manifest.frozen.compressed.rewritten, 1);
+    assert.deepEqual(
+      manifest.frozen.reduced.map((entry: { file: string }) => entry.file),
+      [path.join(day, 'rollout-outside.jsonl')],
     );
   },
 );
@@ -1665,7 +1704,7 @@ test('a copied dispatch store validates after rebinding at the cost of its sourc
   assert.deepEqual(scan(copy), source);
 });
 
-test('a frozen receipt store keeps its openings and leaves out logs and credentials', () => {
+test('a frozen receipt store keeps its openings and leaves out logs and credentials', async () => {
   const source = freezerSource();
   const store = path.join(source.root, 'arc-home');
   const launch = path.join(store, 'dispatch', 'cccccccc-1111-2222-3333-444444444444');
@@ -1688,7 +1727,7 @@ test('a frozen receipt store keeps its openings and leaves out logs and credenti
   write('settings.json', { nested: { apiKey: 'kept-out' } });
   fs.writeFileSync(path.join(launch, 'stdout.log'), 'kept-out');
   const output = path.join(tempDir('freeze-store'), 'fixture');
-  const record = freezeCatalog({
+  const record = await freezeCatalog({
     workspace: source.workspace,
     projects: source.projects,
     codex: source.codex,

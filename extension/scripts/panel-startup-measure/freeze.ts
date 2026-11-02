@@ -2,6 +2,9 @@
 import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import type { Transform } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+import * as zlib from 'node:zlib';
 import { codexSessionsRoot, readCodexSessionMeta } from '../../src/codex.ts';
 import { DISPATCH_ID } from '../../src/dispatchreceipts.ts';
 import { turnKey } from '../../src/domain/read.ts';
@@ -27,6 +30,10 @@ export interface FrozenSource {
   sha256: string;
   bytes: number;
   frozenBytes: number;
+  // A compressed rollout records its fixture digest, and whether the fixture holds its source bytes or a rewritten
+  // archive. One that does not decode keeps its source bytes.
+  frozenSha256?: string;
+  archive?: 'copied' | 'rewritten' | 'undecodable';
 }
 
 export interface FreezeRecord {
@@ -35,8 +42,8 @@ export interface FreezeRecord {
   sources: FrozenSource[];
   // Rollouts outside the workspace keep only their opening record. Discovery reads no more of them.
   reduced: Array<{ file: string; bytes: number; openingSha256: string }>;
-  // Compressed rollout archives, copied byte for byte. A cut zstd stream does not decode, so none is reduced.
-  compressed: { files: number; bytes: number };
+  // Compressed rollouts. `sources` holds each one. None is reduced.
+  compressed: { files: number; bytes: number; frozenBytes: number; rewritten: number; undecodable: number };
   bytes: number;
   frozenBytes: number;
   dispatch?: Omit<DispatchFreeze, 'sources'>;
@@ -88,67 +95,185 @@ export function pathRewriter(pairs: Array<[string, string]>): (text: string) => 
   return (text) => text.replace(pattern, (match) => map.get(match.toLowerCase()) ?? match);
 }
 
-// Copy one file through the rewriter in newline-bounded chunks, and keep its source times.
-function copyRewritten(source: string, target: string, rewrite: (text: string) => string): FrozenSource {
-  const hash = createHash('sha256');
-  const input = fs.openSync(source, 'r');
-  const output = fs.openSync(target, 'wx');
-  const buffer = Buffer.alloc(CHUNK);
-  let carry = Buffer.alloc(0);
-  let bytes = 0;
-  let frozenBytes = 0;
-  const write = (chunk: Buffer) => {
-    const text = Buffer.from(rewrite(chunk.toString('utf8')), 'utf8');
-    fs.writeSync(output, text);
-    frozenBytes += text.length;
-  };
-  try {
-    for (;;) {
-      const read = fs.readSync(input, buffer, 0, CHUNK, null);
-      if (read === 0) break;
-      bytes += read;
-      hash.update(buffer.subarray(0, read));
-      const pending = Buffer.concat([carry, buffer.subarray(0, read)]);
-      const end = pending.lastIndexOf(0x0a);
-      if (end < 0) {
-        carry = pending;
-        continue;
-      }
-      write(pending.subarray(0, end + 1));
-      carry = Buffer.from(pending.subarray(end + 1));
-    }
-    if (carry.length) write(carry);
-  } finally {
-    fs.closeSync(input);
-    fs.closeSync(output);
+// fs.writeSync can accept fewer bytes than it was given, so write until the whole buffer is out.
+function writeAll(descriptor: number, bytes: Buffer): void {
+  for (let offset = 0; offset < bytes.length;) {
+    const written = fs.writeSync(descriptor, bytes, offset, bytes.length - offset);
+    if (written <= 0) throw new Error('The fixture file accepted no bytes.');
+    offset += written;
   }
+}
+
+function keepTimes(source: string, target: string): void {
   const stat = fs.statSync(source);
   fs.utimesSync(target, stat.atime, stat.mtime);
+}
+
+// Rewrite text in newline-bounded pieces, so that no path is split between two pieces.
+function lineRewriter(rewrite: (text: string) => string) {
+  let pending: Buffer[] = [];
+  const state = { changed: false };
+  const convert = (bytes: Buffer): Buffer => {
+    const text = bytes.toString('utf8');
+    const moved = rewrite(text);
+    if (moved !== text) state.changed = true;
+    return Buffer.from(moved, 'utf8');
+  };
+  return {
+    state,
+    push(chunk: Buffer): Buffer | null {
+      const end = chunk.lastIndexOf(0x0a);
+      if (end < 0) {
+        pending.push(Buffer.from(chunk));
+        return null;
+      }
+      const lines = Buffer.concat([...pending, chunk.subarray(0, end + 1)]);
+      pending = [Buffer.from(chunk.subarray(end + 1))];
+      return convert(lines);
+    },
+    flush(): Buffer | null {
+      const rest = Buffer.concat(pending);
+      pending = [];
+      return rest.length ? convert(rest) : null;
+    },
+  };
+}
+
+// Copy one file through the rewriter, and keep its source times.
+function copyRewritten(source: string, target: string, rewrite: (text: string) => string): FrozenSource {
+  const hash = createHash('sha256');
+  const lines = lineRewriter(rewrite);
+  const buffer = Buffer.alloc(CHUNK);
+  let bytes = 0;
+  let frozenBytes = 0;
+  const input = fs.openSync(source, 'r');
+  try {
+    const output = fs.openSync(target, 'wx');
+    try {
+      const write = (text: Buffer | null) => {
+        if (!text) return;
+        writeAll(output, text);
+        frozenBytes += text.length;
+      };
+      for (;;) {
+        const read = fs.readSync(input, buffer, 0, CHUNK, null);
+        if (read === 0) break;
+        bytes += read;
+        hash.update(buffer.subarray(0, read));
+        write(lines.push(buffer.subarray(0, read)));
+      }
+      write(lines.flush());
+    } finally {
+      fs.closeSync(output);
+    }
+  } finally {
+    fs.closeSync(input);
+  }
+  keepTimes(source, target);
   return { file: '', sha256: hash.digest('hex'), bytes, frozenBytes };
 }
 
 // Copy one file byte for byte, and keep its source times.
 function copyExact(source: string, target: string): FrozenSource {
   const hash = createHash('sha256');
-  const input = fs.openSync(source, 'r');
-  const output = fs.openSync(target, 'wx');
   const buffer = Buffer.alloc(CHUNK);
   let bytes = 0;
+  const input = fs.openSync(source, 'r');
   try {
-    for (;;) {
-      const read = fs.readSync(input, buffer, 0, CHUNK, null);
-      if (read === 0) break;
-      bytes += read;
-      hash.update(buffer.subarray(0, read));
-      fs.writeSync(output, buffer, 0, read);
+    const output = fs.openSync(target, 'wx');
+    try {
+      for (;;) {
+        const read = fs.readSync(input, buffer, 0, CHUNK, null);
+        if (read === 0) break;
+        bytes += read;
+        hash.update(buffer.subarray(0, read));
+        writeAll(output, buffer.subarray(0, read));
+      }
+    } finally {
+      fs.closeSync(output);
     }
   } finally {
     fs.closeSync(input);
+  }
+  keepTimes(source, target);
+  return { file: '', sha256: hash.digest('hex'), bytes, frozenBytes: bytes };
+}
+
+const zstd: {
+  createZstdCompress?: (options: { params: Record<number, number> }) => Transform;
+  createZstdDecompress?: () => Transform;
+  constants: typeof zlib.constants & { ZSTD_c_compressionLevel?: number };
+} = zlib;
+// Codex writes its compressed rollouts at zstd level 3.
+const CODEX_ZSTD_LEVEL = 3;
+
+// Decode a compressed rollout, rewrite its paths, and encode it again at the Codex level. A rollout that the rewrite
+// leaves unchanged keeps its source bytes, and so does a rollout that does not decode.
+async function copyCompressed(
+  source: string,
+  target: string,
+  rewrite: (text: string) => string,
+): Promise<FrozenSource> {
+  const { createZstdCompress, createZstdDecompress } = zstd;
+  const level = zstd.constants.ZSTD_c_compressionLevel;
+  if (!createZstdCompress || !createZstdDecompress || level === undefined)
+    throw new Error(`This Node.js has no zstd, so the freezer cannot move the paths in ${source}.`);
+  const hash = createHash('sha256');
+  const frozenHash = createHash('sha256');
+  const lines = lineRewriter(rewrite);
+  let bytes = 0;
+  let frozenBytes = 0;
+  let undecodable = false;
+  const output = fs.openSync(target, 'wx');
+  try {
+    await pipeline(
+      fs.createReadStream(source, { highWaterMark: CHUNK }),
+      async function* (chunks: AsyncIterable<Buffer>) {
+        for await (const chunk of chunks) {
+          bytes += chunk.length;
+          hash.update(chunk);
+          yield chunk;
+        }
+      },
+      createZstdDecompress(),
+      async function* (chunks: AsyncIterable<Buffer>) {
+        for await (const chunk of chunks) {
+          const text = lines.push(chunk);
+          if (text) yield text;
+        }
+        const rest = lines.flush();
+        if (rest) yield rest;
+      },
+      createZstdCompress({ params: { [level]: CODEX_ZSTD_LEVEL } }),
+      async (chunks: AsyncIterable<Buffer>) => {
+        for await (const chunk of chunks) {
+          writeAll(output, chunk);
+          frozenHash.update(chunk);
+          frozenBytes += chunk.length;
+        }
+      },
+    );
+  } catch (error) {
+    const code = (error as { code?: unknown }).code;
+    if (typeof code !== 'string' || !code.startsWith('ZSTD_')) throw error;
+    undecodable = true;
+  } finally {
     fs.closeSync(output);
   }
-  const stat = fs.statSync(source);
-  fs.utimesSync(target, stat.atime, stat.mtime);
-  return { file: '', sha256: hash.digest('hex'), bytes, frozenBytes: bytes };
+  if (undecodable || !lines.state.changed) {
+    fs.rmSync(target);
+    const copied = copyExact(source, target);
+    return { ...copied, frozenSha256: copied.sha256, archive: undecodable ? 'undecodable' : 'copied' };
+  }
+  keepTimes(source, target);
+  return {
+    file: '',
+    sha256: hash.digest('hex'),
+    bytes,
+    frozenSha256: frozenHash.digest('hex'),
+    frozenBytes,
+    archive: 'rewritten',
+  };
 }
 
 // Keep only the opening record of a rollout, which is all that discovery reads of another workspace's rollout.
@@ -175,9 +300,8 @@ function copyOpening(
     fs.closeSync(input);
   }
   fs.writeFileSync(target, rewrite(head.toString('utf8')), { flag: 'wx' });
-  const stat = fs.statSync(source);
-  fs.utimesSync(target, stat.atime, stat.mtime);
-  return { bytes: stat.size, openingSha256: createHash('sha256').update(head).digest('hex') };
+  keepTimes(source, target);
+  return { bytes: fs.statSync(source).size, openingSha256: createHash('sha256').update(head).digest('hex') };
 }
 
 function filesUnder(root: string): string[] {
@@ -430,7 +554,7 @@ export function rebindDispatch(
   return counts;
 }
 
-export function freezeCatalog(options: FreezeOptions): FreezeRecord {
+export async function freezeCatalog(options: FreezeOptions): Promise<FreezeRecord> {
   const output = path.resolve(options.output);
   if (fs.existsSync(output)) throw new Error(`The fixture directory already exists: ${output}`);
   const workspace = path.resolve(options.workspace);
@@ -462,13 +586,11 @@ export function freezeCatalog(options: FreezeOptions): FreezeRecord {
     frozenAt: new Date(options.now ?? Date.now()).toISOString(),
     sources: [],
     reduced: [],
-    compressed: { files: 0, bytes: 0 },
+    compressed: { files: 0, bytes: 0, frozenBytes: 0, rewritten: 0, undecodable: 0 },
     bytes: 0,
     frozenBytes: 0,
   };
-  const keep = (source: string, relative: string, target: string, copy = copyRewritten) => {
-    fs.mkdirSync(path.dirname(target), { recursive: true });
-    const frozen = copy(source, target, rewrite);
+  const keep = (frozen: FrozenSource, relative: string) => {
     record.sources.push({ ...frozen, file: relative });
     record.bytes += frozen.bytes;
     record.frozenBytes += frozen.frozenBytes;
@@ -476,24 +598,30 @@ export function freezeCatalog(options: FreezeOptions): FreezeRecord {
   for (const directory of directories) {
     for (const file of filesUnder(path.join(options.projects, directory))) {
       const inner = path.relative(path.join(options.projects, directory), file);
-      keep(file, path.join('projects', directory, inner), path.join(frozenProjects, renamed(directory), inner));
+      const target = path.join(frozenProjects, renamed(directory), inner);
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      keep(copyRewritten(file, target, rewrite), path.join('projects', directory, inner));
     }
   }
   for (const file of filesUnder(options.codex)) {
     const relative = path.relative(options.codex, file);
     const target = path.join(frozenCodex, relative);
-    if (file.endsWith('.zst')) {
-      keep(file, path.join('codex', relative), target, copyExact);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    if (file.endsWith('.jsonl.zst')) {
+      const frozen = await copyCompressed(file, target, rewrite);
+      keep(frozen, path.join('codex', relative));
       record.compressed.files++;
-      record.compressed.bytes += record.sources[record.sources.length - 1].bytes;
+      record.compressed.bytes += frozen.bytes;
+      record.compressed.frozenBytes += frozen.frozenBytes;
+      if (frozen.archive === 'rewritten') record.compressed.rewritten++;
+      if (frozen.archive === 'undecodable') record.compressed.undecodable++;
       continue;
     }
     const cwd = file.endsWith('.jsonl') ? readCodexSessionMeta(file)?.cwd : null;
     if (!file.endsWith('.jsonl') || (cwd && isInside(cwd, [workspace]))) {
-      keep(file, path.join('codex', relative), target);
+      keep(copyRewritten(file, target, rewrite), path.join('codex', relative));
       continue;
     }
-    fs.mkdirSync(path.dirname(target), { recursive: true });
     record.reduced.push({ file: path.join('codex', relative), ...copyOpening(file, target, rewrite) });
   }
   if (dispatch && fs.existsSync(dispatch)) {
@@ -530,7 +658,7 @@ export function freezeCatalog(options: FreezeOptions): FreezeRecord {
           frozenBytes: record.frozenBytes,
           reducedBytes: record.reduced.reduce((sum, entry) => sum + entry.bytes, 0),
           reduced: record.reduced,
-          compressed: record.compressed,
+          compressed: { ...record.compressed, rollouts: record.sources.filter((entry) => entry.archive) },
           dispatch: record.dispatch
             ? {
                 files: record.dispatch.files,
@@ -548,7 +676,7 @@ export function freezeCatalog(options: FreezeOptions): FreezeRecord {
   return record;
 }
 
-function main(): void {
+async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const value = (flag: string) => {
     const index = args.indexOf(flag);
@@ -558,7 +686,7 @@ function main(): void {
   if (!workspace) throw new Error('--workspace names the folder whose sessions the fixture freezes.');
   const date = value('--date') ?? new Date().toISOString().slice(0, 10);
   const output = value('--output') ?? path.join(arcHome(), 'measure', 'fixtures', date);
-  const record = freezeCatalog({
+  const record = await freezeCatalog({
     workspace,
     projects: projectsRoot(),
     codex: codexSessionsRoot(),
@@ -574,8 +702,15 @@ function main(): void {
       reducedRollouts: record.reduced.length,
       compressedRollouts: record.compressed.files,
       compressedBytes: record.compressed.bytes,
+      compressedFrozenBytes: record.compressed.frozenBytes,
+      rewrittenRollouts: record.compressed.rewritten,
+      undecodableRollouts: record.compressed.undecodable,
     })}\n`,
   );
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === __filename) main();
+if (process.argv[1] && path.resolve(process.argv[1]) === __filename)
+  void main().catch((error: unknown) => {
+    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+    process.exit(1);
+  });
