@@ -31,9 +31,10 @@ export interface FrozenSource {
   bytes: number;
   frozenBytes: number;
   // A compressed rollout records its fixture digest, and whether the fixture holds its source bytes or a rewritten
-  // archive. One that does not decode keeps its source bytes.
+  // archive. One that does not decode, or that does not end at a zstd frame boundary, keeps
+  // its source bytes.
   frozenSha256?: string;
-  archive?: 'copied' | 'rewritten' | 'undecodable';
+  archive?: 'copied' | 'rewritten' | 'undecodable' | 'truncated';
 }
 
 export interface FreezeRecord {
@@ -43,7 +44,14 @@ export interface FreezeRecord {
   // Rollouts outside the workspace keep only their opening record. Discovery reads no more of them.
   reduced: Array<{ file: string; bytes: number; openingSha256: string }>;
   // Compressed rollouts. `sources` holds each one. None is reduced.
-  compressed: { files: number; bytes: number; frozenBytes: number; rewritten: number; undecodable: number };
+  compressed: {
+    files: number;
+    bytes: number;
+    frozenBytes: number;
+    rewritten: number;
+    undecodable: number;
+    truncated: number;
+  };
   bytes: number;
   frozenBytes: number;
   dispatch?: Omit<DispatchFreeze, 'sources'>;
@@ -207,20 +215,93 @@ const zstd: {
 // Codex writes its compressed rollouts at zstd level 3.
 const CODEX_ZSTD_LEVEL = 3;
 
+function zstdCodec() {
+  const { createZstdCompress, createZstdDecompress } = zstd;
+  const level = zstd.constants.ZSTD_c_compressionLevel;
+  if (!createZstdCompress || !createZstdDecompress || level === undefined) return null;
+  return { createZstdCompress, createZstdDecompress, level };
+}
+
+// Read the frame and block headers of a zstd stream without decoding it. The Node decoder ends without an error on a
+// stream cut off inside a frame, so the freezer checks that the stream ends on a frame boundary.
+function zstdFrames() {
+  const ZSTD_MAGIC = 0xfd2fb528;
+  const SKIPPABLE_MAGIC = 0x184d2a50;
+  let state: 'magic' | 'skippable' | 'descriptor' | 'header' | 'block' | 'invalid' = 'magic';
+  let need = 4;
+  let held = Buffer.alloc(0);
+  let skip = 0;
+  let checksum = 0;
+  let frames = 0;
+  const take = (head: Buffer) => {
+    if (state === 'magic') {
+      const magic = head.readUInt32LE(0);
+      if (magic === ZSTD_MAGIC) [state, need] = ['descriptor', 1];
+      else if ((magic & 0xfffffff0) >>> 0 === SKIPPABLE_MAGIC) [state, need] = ['skippable', 4];
+      else state = 'invalid';
+    } else if (state === 'skippable') {
+      [state, need, skip] = ['magic', 4, head.readUInt32LE(0)];
+    } else if (state === 'descriptor') {
+      const descriptor = head[0];
+      const single = (descriptor >> 5) & 1;
+      checksum = (descriptor >> 2) & 1 ? 4 : 0;
+      const header = (single ? 0 : 1) + [0, 1, 2, 4][descriptor & 3] + [single ? 1 : 0, 2, 4, 8][descriptor >> 6];
+      [state, need] = header ? ['header', header] : ['block', 3];
+    } else if (state === 'header') {
+      [state, need] = ['block', 3];
+    } else {
+      const block = head[0] | (head[1] << 8) | (head[2] << 16);
+      const type = (block >> 1) & 3;
+      if (type === 3) {
+        state = 'invalid';
+        return;
+      }
+      skip = type === 1 ? 1 : block >>> 3;
+      if (block & 1) {
+        skip += checksum;
+        [state, need] = ['magic', 4];
+        frames++;
+      }
+    }
+  };
+  return {
+    push(chunk: Buffer) {
+      for (let at = 0; at < chunk.length;) {
+        if (state === 'invalid') return;
+        if (skip) {
+          const step = Math.min(skip, chunk.length - at);
+          skip -= step;
+          at += step;
+          continue;
+        }
+        const step = Math.min(need - held.length, chunk.length - at);
+        held = Buffer.concat([held, chunk.subarray(at, at + step)]);
+        at += step;
+        if (held.length === need) {
+          const head = held;
+          held = Buffer.alloc(0);
+          take(head);
+        }
+      }
+    },
+    complete: () => state === 'magic' && !held.length && !skip && frames > 0,
+  };
+}
+
 // Decode a compressed rollout, rewrite its paths, and encode it again at the Codex level. A rollout that the rewrite
-// leaves unchanged keeps its source bytes, and so does a rollout that does not decode.
+// leaves unchanged keeps its source bytes, and so does a rollout that does not decode or end at a zstd frame boundary.
 async function copyCompressed(
   source: string,
   target: string,
   rewrite: (text: string) => string,
 ): Promise<FrozenSource> {
-  const { createZstdCompress, createZstdDecompress } = zstd;
-  const level = zstd.constants.ZSTD_c_compressionLevel;
-  if (!createZstdCompress || !createZstdDecompress || level === undefined)
-    throw new Error(`This Node.js has no zstd, so the freezer cannot move the paths in ${source}.`);
+  const codec = zstdCodec();
+  if (!codec) throw new Error(`This Node.js has no zstd, so the freezer cannot move the paths in ${source}.`);
+  const { createZstdCompress, createZstdDecompress, level } = codec;
   const hash = createHash('sha256');
   const frozenHash = createHash('sha256');
   const lines = lineRewriter(rewrite);
+  const frames = zstdFrames();
   let bytes = 0;
   let frozenBytes = 0;
   let undecodable = false;
@@ -232,6 +313,7 @@ async function copyCompressed(
         for await (const chunk of chunks) {
           bytes += chunk.length;
           hash.update(chunk);
+          frames.push(chunk);
           yield chunk;
         }
       },
@@ -260,10 +342,12 @@ async function copyCompressed(
   } finally {
     fs.closeSync(output);
   }
-  if (undecodable || !lines.state.changed) {
+  const truncated = !undecodable && !frames.complete();
+  if (undecodable || truncated || !lines.state.changed) {
     fs.rmSync(target);
     const copied = copyExact(source, target);
-    return { ...copied, frozenSha256: copied.sha256, archive: undecodable ? 'undecodable' : 'copied' };
+    const archive = undecodable ? 'undecodable' : truncated ? 'truncated' : 'copied';
+    return { ...copied, frozenSha256: copied.sha256, archive };
   }
   keepTimes(source, target);
   return {
@@ -579,6 +663,9 @@ export async function freezeCatalog(options: FreezeOptions): Promise<FreezeRecor
     [options.projects, frozenProjects],
     [options.codex, frozenCodex],
   ]);
+  const codexFiles = filesUnder(options.codex);
+  if (!zstdCodec() && codexFiles.some((file) => file.endsWith('.jsonl.zst')))
+    throw new Error('This Node.js has no zstd, so the freezer cannot move the paths in the compressed rollouts.');
   for (const name of ['workspace', 'projects', 'codex', 'store'])
     fs.mkdirSync(path.join(output, name), { recursive: true });
   const record: FreezeRecord = {
@@ -586,7 +673,7 @@ export async function freezeCatalog(options: FreezeOptions): Promise<FreezeRecor
     frozenAt: new Date(options.now ?? Date.now()).toISOString(),
     sources: [],
     reduced: [],
-    compressed: { files: 0, bytes: 0, frozenBytes: 0, rewritten: 0, undecodable: 0 },
+    compressed: { files: 0, bytes: 0, frozenBytes: 0, rewritten: 0, undecodable: 0, truncated: 0 },
     bytes: 0,
     frozenBytes: 0,
   };
@@ -603,7 +690,7 @@ export async function freezeCatalog(options: FreezeOptions): Promise<FreezeRecor
       keep(copyRewritten(file, target, rewrite), path.join('projects', directory, inner));
     }
   }
-  for (const file of filesUnder(options.codex)) {
+  for (const file of codexFiles) {
     const relative = path.relative(options.codex, file);
     const target = path.join(frozenCodex, relative);
     fs.mkdirSync(path.dirname(target), { recursive: true });
@@ -615,6 +702,7 @@ export async function freezeCatalog(options: FreezeOptions): Promise<FreezeRecor
       record.compressed.frozenBytes += frozen.frozenBytes;
       if (frozen.archive === 'rewritten') record.compressed.rewritten++;
       if (frozen.archive === 'undecodable') record.compressed.undecodable++;
+      if (frozen.archive === 'truncated') record.compressed.truncated++;
       continue;
     }
     const cwd = file.endsWith('.jsonl') ? readCodexSessionMeta(file)?.cwd : null;
@@ -705,6 +793,7 @@ async function main(): Promise<void> {
       compressedFrozenBytes: record.compressed.frozenBytes,
       rewrittenRollouts: record.compressed.rewritten,
       undecodableRollouts: record.compressed.undecodable,
+      truncatedRollouts: record.compressed.truncated,
     })}\n`,
   );
 }

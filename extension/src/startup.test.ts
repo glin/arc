@@ -1385,6 +1385,7 @@ test('a frozen catalog moves workspace sessions into the fixture and passes runn
     frozenBytes: 300,
     rewritten: 0,
     undecodable: 1,
+    truncated: 0,
     rollouts: [
       {
         file: path.join('codex', '2026', '10', '01', 'rollout-archived.jsonl.zst'),
@@ -1513,6 +1514,49 @@ test.skipIf(!rolloutCompression.zstdCompressSync)(
       manifest.frozen.reduced.map((entry: { file: string }) => entry.file),
       [path.join(day, 'rollout-outside.jsonl')],
     );
+  },
+);
+
+test.skipIf(!rolloutCompression.zstdCompressSync)(
+  'a frozen catalog keeps the source bytes of a compressed rollout that ends inside its zstd frame',
+  async () => {
+    const source = freezerSource();
+    const day = path.join('codex', '2026', '10', '01');
+    // Hashes keep the text from compressing into one block, so the decoder emits whole blocks before the cut.
+    const text =
+      [
+        { type: 'session_meta', payload: { id: 'cut', cwd: source.workspace } },
+        ...Array.from({ length: 8000 }, (_, index) => ({
+          type: 'event_msg',
+          payload: { text: `${source.workspace} ${createHash('sha256').update(String(index)).digest('hex')}` },
+        })),
+      ]
+        .map((entry) => JSON.stringify(entry))
+        .join('\n') + '\n';
+    const archive = rolloutCompression.zstdCompressSync!(Buffer.from(text, 'utf8'));
+    const cut = archive.subarray(0, Math.floor(archive.length / 2));
+    const file = path.join(source.root, day, 'rollout-cut.jsonl.zst');
+    fs.writeFileSync(file, cut);
+    fs.utimesSync(file, source.settled, source.settled);
+    const output = path.join(tempDir('freeze-output'), '2026-11-02');
+    await freezeCatalog({ workspace: source.workspace, projects: source.projects, codex: source.codex, output });
+    const manifest = JSON.parse(fs.readFileSync(path.join(output, 'manifest.json'), 'utf8'));
+    assert.ok(fs.readFileSync(path.join(output, day, 'rollout-cut.jsonl.zst')).equals(cut));
+    const sha256 = createHash('sha256').update(cut).digest('hex');
+    assert.deepEqual(
+      manifest.frozen.compressed.rollouts.find(
+        (entry: { file: string }) => entry.file === path.join(day, 'rollout-cut.jsonl.zst'),
+      ),
+      {
+        file: path.join(day, 'rollout-cut.jsonl.zst'),
+        sha256,
+        bytes: cut.length,
+        frozenSha256: sha256,
+        frozenBytes: cut.length,
+        archive: 'truncated',
+      },
+    );
+    assert.equal(manifest.frozen.compressed.truncated, 1);
   },
 );
 
