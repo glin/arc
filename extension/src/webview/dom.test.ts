@@ -4,7 +4,7 @@ import { tempDir } from '../temproot.ts';
 import * as path from 'node:path';
 import { test, vi } from 'vitest';
 import { productionFiles } from '../../scripts/check-webview-globals.ts';
-import { actionable, found, markdownOf, panelDom, placeFloat } from './dom.ts';
+import { actionable, found, markdownOf, panelDom, placeFloat, visibleEndOf } from './dom.ts';
 import { renderRichMarkdown } from '../richtext.ts';
 
 test('DOM Markdown copy retains native disclosures with lists, fences, and tables', () => {
@@ -184,4 +184,90 @@ test('a float that does not fit below flips, stays, or slides as its placement s
   assert.deepEqual(floatAt(140, { top: 20, left: 10 }, { gap: 4, overflow: 'slide' })[1], '34px');
   // Taller than the view: a slide stops at the top margin.
   assert.deepEqual(floatAt(90, { top: 20, left: 10 }, { gap: 4, overflow: 'slide' })[1], '6px');
+});
+
+class TreeNode {
+  parentNode: TreeNode | null = null;
+  readonly childNodes: TreeNode[];
+  constructor(
+    readonly nodeType: number,
+    readonly nodeName: string,
+    children: TreeNode[] = [],
+    readonly text = '',
+  ) {
+    this.childNodes = children;
+    for (const child of children) child.parentNode = this;
+  }
+  get textContent(): string {
+    return this.nodeType === 3 ? this.text : this.childNodes.map((child) => child.textContent).join('');
+  }
+  get previousSibling(): TreeNode | null {
+    const siblings = this.parentNode?.childNodes ?? [];
+    return siblings[siblings.indexOf(this) - 1] ?? null;
+  }
+  get lastChild(): TreeNode | null {
+    return this.childNodes.at(-1) ?? null;
+  }
+}
+const tag = (name: string, ...children: TreeNode[]) => new TreeNode(1, name, children);
+const words = (value: string) => new TreeNode(3, '#text', [], value);
+
+// A timeline whose first card ends in the selected paragraph, followed by a second card when `next` is set.
+function timeline(next: boolean, ...after: TreeNode[]) {
+  const paragraph = words('Final words stay. ');
+  const heading = words('Card two ');
+  const first = tag('DIV', tag('DIV', words('Card one')), tag('P', words('Opening.')), tag('P', paragraph));
+  const second = tag('DIV', tag('DIV', heading), tag('P', words('More.')));
+  const list = tag('DIV', first, words('\n'), ...(next ? [second] : []), ...after);
+  return { paragraph, heading, first, list };
+}
+
+// The page draws every node outside `hidden` with a box.
+function endOf(start: TreeNode, end: TreeNode, endOffset: number, root: TreeNode, hidden: TreeNode[] = []) {
+  const range = {
+    startContainer: start,
+    startOffset: 0,
+    endContainer: end,
+    endOffset,
+    commonAncestorContainer: root,
+  } as unknown as Parameters<typeof visibleEndOf>[0];
+  return visibleEndOf(range, (node) => {
+    for (let at: Node | null = node; at; at = at.parentNode) {
+      if (hidden.includes(at as unknown as TreeNode)) return false;
+    }
+    return true;
+  });
+}
+
+test('a last-paragraph selection that ends on the next card heading trims to the paragraph', () => {
+  const { paragraph, heading, list } = timeline(true);
+  const end = endOf(paragraph, heading.parentNode!, 0, list);
+  assert.equal(end?.node, paragraph);
+  assert.equal(end?.offset, 'Final words stay.'.length);
+});
+
+test('a last-paragraph selection that ends past the last card skips script and hidden text', () => {
+  const script = tag('SCRIPT', words('window.ready = true;'));
+  const hidden = tag('DIV', words('Hidden status'));
+  const { paragraph, list } = timeline(false, script, hidden);
+  const end = endOf(paragraph, list, list.childNodes.length, list, [script, hidden]);
+  assert.equal(end?.node, paragraph);
+  assert.equal(end?.offset, 'Final words stay.'.length);
+});
+
+test('visible text in the next card stops the trim outside the start card', () => {
+  const { paragraph, heading, list } = timeline(true);
+  const end = endOf(paragraph, heading, heading.textContent.length, list);
+  assert.equal(end?.node, heading);
+  assert.equal(end?.offset, 'Card two'.length);
+});
+
+test('an image after the paragraph stops the trim after the image', () => {
+  const image = tag('IMG');
+  const { paragraph, heading, first, list } = timeline(true);
+  first.childNodes.push(image);
+  image.parentNode = first;
+  const end = endOf(paragraph, heading.parentNode!, 0, list);
+  assert.equal(end?.node, first);
+  assert.equal(end?.offset, first.childNodes.length);
 });

@@ -367,3 +367,100 @@ export function markdownOf(root: Node): string {
   };
   return flowOf(root, `${NEWLINE}${NEWLINE}`);
 }
+
+export interface RangeEnds {
+  readonly startContainer: Node;
+  readonly startOffset: number;
+  readonly endContainer: Node;
+  readonly endOffset: number;
+  readonly commonAncestorContainer: Node;
+}
+
+export interface BoundaryPoint {
+  node: Node;
+  offset: number;
+}
+
+const MEDIA_NAMES = new Set(['img', 'svg', 'canvas', 'video']);
+
+function childIndex(node: Node): number {
+  let index = 0;
+  for (let sibling = node.previousSibling; sibling; sibling = sibling.previousSibling) index++;
+  return index;
+}
+
+// Orders two boundary points by the DOM Range rules: negative, zero, or positive.
+function compareBoundaryPoints(a: Node, aOffset: number, b: Node, bOffset: number): number {
+  if (a === b) return Math.sign(aOffset - bOffset);
+  const pathOf = (node: Node): Node[] => {
+    const path: Node[] = [];
+    for (let at: Node | null = node; at; at = at.parentNode) path.unshift(at);
+    return path;
+  };
+  const aPath = pathOf(a);
+  const bPath = pathOf(b);
+  let depth = 0;
+  while (aPath[depth] === bPath[depth]) depth++;
+  if (depth === aPath.length) return childIndex(bPath[depth]) < aOffset ? 1 : -1;
+  if (depth === bPath.length) return childIndex(aPath[depth]) < bOffset ? -1 : 1;
+  return childIndex(aPath[depth]) < childIndex(bPath[depth]) ? -1 : 1;
+}
+
+// Steps back in document order like TreeWalker.previousNode over elements and text under root.
+function previousNodeIn(root: Node, from: Node): Node | null {
+  const kept = (node: Node) => node.nodeType === 1 || node.nodeType === 3;
+  let node = from;
+  while (node !== root) {
+    let sibling = node.previousSibling;
+    while (sibling) {
+      node = sibling;
+      while (node.lastChild) node = node.lastChild;
+      if (kept(node)) return node;
+      sibling = node.previousSibling;
+    }
+    if (!node.parentNode) return null;
+    node = node.parentNode;
+    if (kept(node)) return node;
+  }
+  return null;
+}
+
+/**
+ * Walks back from the range end to the last visible content inside the range.
+ * Non-whitespace text that `shown` accepts for its trimmed slice stops the walk before its trailing whitespace.
+ * An `img`, `svg`, `canvas`, or `video` that lies wholly inside the range and that `shown` accepts stops the walk after itself.
+ * Returns null when the walk reaches text before the range start or runs out of nodes.
+ */
+export function visibleEndOf(
+  range: RangeEnds,
+  shown: (node: Node, from: number, to: number) => boolean,
+): BoundaryPoint | null {
+  const { startContainer, startOffset, endContainer, endOffset } = range;
+  let node: Node | null = endContainer;
+  if (endContainer.nodeType === 1 && endOffset > 0) {
+    node = endContainer.childNodes[endOffset - 1];
+    while (node.lastChild) node = node.lastChild;
+  }
+  for (; node; node = previousNodeIn(range.commonAncestorContainer, node)) {
+    let media: Node | null = node;
+    while (media && !(media.nodeType === 1 && MEDIA_NAMES.has(media.nodeName.toLowerCase()))) media = media.parentNode;
+    if (media?.parentNode) {
+      const index = childIndex(media);
+      if (
+        compareBoundaryPoints(startContainer, startOffset, media.parentNode, index) <= 0 &&
+        compareBoundaryPoints(endContainer, endOffset, media.parentNode, index + 1) >= 0 &&
+        shown(media, 0, 0)
+      ) {
+        return { node: media.parentNode, offset: index + 1 };
+      }
+    }
+    if (node.nodeType !== 3) continue;
+    const from = node === startContainer ? startOffset : 0;
+    const to = node === endContainer ? endOffset : node.textContent!.length;
+    if (compareBoundaryPoints(node, to, startContainer, startOffset) < 0) break;
+    const text = node.textContent!.slice(from, to).trimEnd();
+    if (!text.trim() || !shown(node, from, from + text.length)) continue;
+    return { node, offset: from + text.length };
+  }
+  return null;
+}

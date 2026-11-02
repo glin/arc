@@ -1,4 +1,4 @@
-import { actionable, editableTarget } from './dom.ts';
+import { actionable, editableTarget, visibleEndOf } from './dom.ts';
 import type { ReadStateOwner } from './read-state.ts';
 import { turnMenuContext, type TurnMenuNode } from '../view/card-menu.ts';
 import {
@@ -319,46 +319,20 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
     if (!start || (end && start.contains(end) && !end.closest('.notesec') && !outsideCommentMarks(end))) {
       return range;
     }
-    const trimmed = range.cloneRange();
-    const walk = document.createTreeWalker(
-      range.commonAncestorContainer,
-      NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT,
-    );
-    walk.currentNode = range.endContainer;
-    if (range.endContainer.nodeType === Node.ELEMENT_NODE && range.endOffset > 0) {
-      walk.currentNode = range.endContainer.childNodes[range.endOffset - 1];
-      while (walk.currentNode.lastChild) walk.currentNode = walk.currentNode.lastChild;
-    }
-    for (let node: Node | null = walk.currentNode; node; node = walk.previousNode()) {
-      const media = elementOf(node)?.closest('img, svg, canvas, video');
-      if (media) {
-        const contents = document.createRange();
-        contents.selectNode(media);
-        const box = media.getBoundingClientRect();
-        if (
-          box.width &&
-          box.height &&
-          range.compareBoundaryPoints(Range.START_TO_START, contents) <= 0 &&
-          range.compareBoundaryPoints(Range.END_TO_END, contents) >= 0
-        ) {
-          trimmed.setEndAfter(media);
-          return elementOf(trimmed.endContainer)?.closest('.turn:not(.clive), .compaction') === start ? trimmed : range;
-        }
+    const visible = visibleEndOf(range, (node, from, to) => {
+      if (node.nodeType !== Node.TEXT_NODE) {
+        const box = (node as Element).getBoundingClientRect();
+        return !!box.width && !!box.height;
       }
-      if (node.nodeType !== Node.TEXT_NODE) continue;
-      const from = node === range.startContainer ? range.startOffset : 0;
-      const to = node === range.endContainer ? range.endOffset : node.textContent!.length;
-      if (range.comparePoint(node, to) < 0) break;
-      const text = node.textContent!.slice(from, to).trimEnd();
-      if (!text.trim()) continue;
       const contents = document.createRange();
       contents.setStart(node, from);
-      contents.setEnd(node, from + text.length);
-      if (!contents.getClientRects().length) continue;
-      trimmed.setEnd(node, from + text.length);
-      return elementOf(node)?.closest('.turn:not(.clive), .compaction') === start ? trimmed : range;
-    }
-    return range;
+      contents.setEnd(node, to);
+      return contents.getClientRects().length > 0;
+    });
+    if (!visible) return range;
+    const trimmed = range.cloneRange();
+    trimmed.setEnd(visible.node, visible.offset);
+    return elementOf(trimmed.endContainer)?.closest('.turn:not(.clive), .compaction') === start ? trimmed : range;
   };
 
   const selectionHere = (): CommentAnchor | null => {

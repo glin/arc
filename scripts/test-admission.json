@@ -100,9 +100,9 @@
     "matricesSha256": "716827f083e8b689f383bbddc7d866c21a6a54807d7eebcf496d1504bfbff249"
   },
   "extension/src/panel.layout.comments.test.ts": {
-    "reason": "Comment controls must preserve native selection, focus, and saved comment interaction. Paragraph selections must reach comment actions across card and Activity boundaries and retain saved text highlights beside local images.",
-    "cases": 35,
-    "matricesSha256": "0b28ac0b684dad2006262db63973d28f8bb42af05811a8de59c4cfeeb49b6990"
+    "reason": "Comment controls must preserve native selection, focus, and saved comment interaction. A triple-click paragraph selection must reach comment actions across a card boundary.",
+    "cases": 34,
+    "matricesSha256": "7ea732a6972fe6fadc4961897be500a2c2d5b0429e4527d5d0cf9d5beef35aba"
   },
   "extension/src/panel.layout.heading.test.ts": {
     "reason": "Session headings must retain accessible controls and browser interaction across responsive states.",

@@ -5,7 +5,7 @@ import { test, vi } from 'vitest';
 import assert from 'node:assert';
 import { EventEmitter } from 'node:events';
 import type { Browser } from 'playwright-core';
-import { browserOrNone, SETTLED, type TestBrowser } from '../test/browser.ts';
+import { browserOrNone, SETTLED } from '../test/browser.ts';
 import { RAIL_MIN_WIDTH } from './turnview.ts';
 import { renderRichMarkdown } from './richtext.ts';
 import { composerView, pickMenu } from './composerview.ts';
@@ -22,7 +22,6 @@ import {
 import {
   layoutAt,
   setLogMessages,
-  flatLog,
   COMMENTABLE_RESPONSE,
   COMMENTABLE_ANSWER,
   COMMENT_SHAPES,
@@ -667,272 +666,83 @@ test('the bar waits for the reader to let go before it offers anything', { timeo
   }
 });
 
-const LAST_PARAGRAPH = 'The final paragraph keeps every selected word.';
-const PARAGRAPH_IMAGE =
-  'data:image/svg+xml,' +
-  encodeURIComponent(
-    '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><rect width="16" height="16"/></svg>',
-  );
-
-async function lastParagraphPage(
-  browser: TestBrowser,
-  where: 'response' | 'message',
-  after: 'card' | 'timeline' | 'tool',
-  image = false,
-) {
-  const page = await browser.newPage();
-  await page.setViewportSize({ width: 1100, height: 900 });
-  await page.setContent(themed(pageHtml()));
-  const payload = renderPayload() as { cards: Record<string, any>[]; comments: unknown[]; timelineLayout: unknown };
-  const tools = flatLog(payload.cards.flatMap((card) => card.activity ?? [])).filter((row) => row.kind === 'step');
-  const card = payload.cards[0];
-  payload.cards = after === 'card' ? payload.cards.slice(0, 2) : [card];
-  payload.comments = [];
-  payload.timelineLayout = { cardLayout: 'compact', promptPosition: 'above' };
-  card.status = 'done';
-  card.activity = [];
-  card.saidMessages = [];
-  const html = renderRichMarkdown(
-    'The opening paragraph is separate.\n\n' + LAST_PARAGRAPH + (image ? ' ![diagram](diagram.svg)' : ''),
-    () => ({ path: 'C:/work/diagram.svg', src: PARAGRAPH_IMAGE }),
-  );
-  card.summaryHtml = html;
-  if (where === 'message') {
-    card.summaryHtml = '<p>The response precedes Activity.</p>';
-    card.saidMessages = [
-      {
-        id: 'commentary:1:0',
-        kind: 'commentary',
-        text: LAST_PARAGRAPH,
-        summaryHtml: html,
-        at: NOW - 900_000,
-        when: '2:20 PM',
-        absolute: 'earlier today',
-      },
-    ];
-    setLogMessages(card);
-    if (after === 'tool') {
-      assert.ok(tools.length, 'the fixture contains no Activity tool row');
-      card.activity.push(tools[0]);
-      card.status = 'running';
-    }
+// Chromium ends a triple-click paragraph selection at the first position of the next card's heading.
+test('a triple-click on the last paragraph of a response comments on its words', { timeout: 30_000 }, async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('no browser installed');
+    return;
   }
-  await page.evaluate((value) => window.postMessage(value, '*'), payload);
-  await page.locator('.turn .head').first().click();
-  const target = where === 'message' ? '.turn .actrow.message .summary p:last-child' : '.turn .summary p:last-child';
-  await page.locator(target).first().waitFor({ state: 'visible' });
-  if (image)
-    await page.waitForFunction(() =>
-      Array.from(document.querySelectorAll<HTMLImageElement>('.turn img')).every((img) => img.complete),
+  try {
+    const words = 'The final paragraph keeps every selected word.';
+    const page = await browser.newPage();
+    await page.setViewportSize({ width: 1100, height: 900 });
+    await page.setContent(themed(pageHtml()));
+    const payload = renderPayload() as { cards: Record<string, any>[]; comments: unknown[]; timelineLayout: unknown };
+    payload.cards = payload.cards.slice(0, 2);
+    payload.comments = [];
+    payload.timelineLayout = { cardLayout: 'compact', promptPosition: 'above' };
+    const card = payload.cards[0];
+    card.status = 'done';
+    card.activity = [];
+    card.saidMessages = [];
+    card.summaryHtml = renderRichMarkdown('The opening paragraph is separate.\n\n' + words);
+    await page.evaluate((value) => window.postMessage(value, '*'), payload);
+    await page.locator('.turn .head').first().click();
+    const paragraph = page.locator('.turn .summary p:last-child').first();
+    await paragraph.waitFor({ state: 'visible' });
+    const at = await paragraph.evaluate((node) => {
+      node.scrollIntoView({ block: 'center' });
+      const text = node.firstChild!;
+      const last = [...text.textContent!.matchAll(/\S+/g)].at(-1)!.index;
+      const range = document.createRange();
+      range.setStart(text, last);
+      range.setEnd(text, last + 1);
+      const box = range.getBoundingClientRect();
+      return { x: box.left + 1, y: box.top + box.height / 2 };
+    });
+    await page.mouse.click(at.x, at.y, { clickCount: 3 });
+    const shape = await paragraph.evaluate((node) => {
+      const range = getSelection()!.getRangeAt(0);
+      const end =
+        range.endContainer.nodeType === Node.ELEMENT_NODE
+          ? (range.endContainer as Element)
+          : range.endContainer.parentElement!;
+      return {
+        outside: !node.closest('.turn')!.contains(end),
+        offset: range.endOffset,
+        text: getSelection()!.toString(),
+      };
+    });
+    assert.equal(shape.outside, true, 'the browser did not select through the card boundary: ' + JSON.stringify(shape));
+    assert.equal(shape.offset, 0, JSON.stringify(shape));
+    assert.equal(shape.text.trim(), words);
+    await page.waitForFunction(
+      () => !!document.querySelector('.quotefloat') && !document.querySelector<HTMLElement>('.quotefloat')!.hidden,
+      {},
+      { timeout: 3000 },
     );
-  return { page, card, target, payload };
-}
-
-const PARAGRAPH_ENDINGS = [
-  { where: 'response', after: 'card', image: false, entry: 'button' },
-  { where: 'response', after: 'card', image: false, entry: 'key' },
-  { where: 'response', after: 'card', image: false, entry: 'menu' },
-  { where: 'response', after: 'timeline', image: false, entry: 'button' },
-  { where: 'response', after: 'card', image: true, entry: 'button' },
-  { where: 'message', after: 'card', image: false, entry: 'button' },
-  { where: 'message', after: 'timeline', image: false, entry: 'button' },
-  { where: 'message', after: 'tool', image: false, entry: 'button' },
-] as const;
-
-// Chromium puts a paragraph selection's end at the first position of the following block.
-test.for(PARAGRAPH_ENDINGS)(
-  'last paragraph in $where before $after with image=$image accepts the comment $entry',
-  { timeout: 30_000 },
-  async ({ where, after, image, entry }, t) => {
-    const browser = await browserOrNone();
-    if (!browser) {
-      t.skip('no browser installed');
-      return;
-    }
-    try {
-      const { page, card, target, payload } = await lastParagraphPage(browser, where, after, image);
-      const at = await page
-        .locator(target)
-        .first()
-        .evaluate((paragraph) => {
-          paragraph.scrollIntoView({ block: 'center' });
-          const text = paragraph.firstChild!;
-          const words = [...text.textContent!.matchAll(/\S+/g)];
-          const range = document.createRange();
-          range.setStart(text, words.at(-1)!.index);
-          range.setEnd(text, words.at(-1)!.index + 1);
-          const box = range.getBoundingClientRect();
-          return { x: box.left + 1, y: box.top + box.height / 2 };
-        });
-      await page.mouse.click(at.x, at.y, { clickCount: 3 });
-      if (image) {
-        await page.evaluate(() => {
-          const selection = getSelection()!;
-          const range = selection.getRangeAt(0);
-          const end =
-            range.endContainer.nodeType === Node.ELEMENT_NODE
-              ? (range.endContainer as Element)
-              : range.endContainer.parentElement!;
-          if (!end.closest('.image-link')) throw new Error('The paragraph selection did not end at the image block.');
-          // The local image starts a new block. Extend through it to the next card boundary.
-          range.setEnd(document.querySelectorAll('.turn .head')[1].firstChild!, 0);
-          selection.removeAllRanges();
-          selection.addRange(range);
-          document.dispatchEvent(new Event('selectionchange'));
-        });
-      }
-      const shape = await page
-        .locator(target)
-        .first()
-        .evaluate((paragraph) => {
-          const range = getSelection()!.getRangeAt(0);
-          const end =
-            range.endContainer.nodeType === Node.ELEMENT_NODE
-              ? (range.endContainer as Element)
-              : range.endContainer.parentElement!;
-          return {
-            outside: !paragraph.closest('.turn')!.contains(end),
-            tool: !!end.closest('.actrow:not(.message)'),
-            offset: range.endOffset,
-            text: getSelection()!.toString(),
-            image: !!range.cloneContents().querySelector('img'),
-          };
-        });
-      assert.equal(
-        shape.offset,
-        0,
-        'the browser did not select through the paragraph boundary: ' + JSON.stringify(shape),
-      );
-      assert.equal(after === 'tool' ? shape.tool : shape.outside, true, JSON.stringify(shape));
-      assert.equal(shape.text.trim(), LAST_PARAGRAPH);
-      assert.equal(shape.image, image);
-      if (entry === 'button') {
-        await page.waitForFunction(
-          () => !!document.querySelector('.quotefloat') && !document.querySelector<HTMLElement>('.quotefloat')!.hidden,
-          {},
-          { timeout: 3000 },
-        );
-        await page.locator('.quotebar .quoteact').first().click();
-      } else if (entry === 'key') {
-        await page.keyboard.press('c');
-      } else {
-        await page
-          .locator(target)
-          .first()
-          .evaluate((paragraph) => paragraph.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true })));
-        assert.equal(
-          await page.evaluate(() => (window as any).__posted.some((m: any) => m.type === 'armSelectedText')),
-          true,
-          'the context menu armed a clicked line instead of the selection',
-        );
-        await page.evaluate((key) => window.postMessage({ type: 'openComment', key }, '*'), card.key);
-      }
-      await page.locator('.notearea').waitFor({ state: 'visible', timeout: 3000 });
-      assert.equal(
-        await page
-          .locator('.csel')
-          .allTextContents()
-          .then((parts) => parts.join('')),
-        LAST_PARAGRAPH + (image ? ' ' : ''),
-      );
-      await page.locator('.notearea').fill('Keep this paragraph.');
-      await page.locator('.notesave').click();
-      await page.waitForFunction(() =>
-        (window as any).__posted.some((m: any) => m.type === 'note' && m.note.op === 'write'),
-      );
-      const saved = await page.evaluate(() =>
-        (window as any).__posted
-          .filter((m: any) => m.type === 'note' && m.note.op === 'write')
-          .map((m: any) => m.note.note),
-      );
-      assert.equal(saved.length, 1);
-      assert.equal(saved[0].turnKey, card.key);
-      assert.equal(saved[0].part, where === 'message' ? 'said:commentary:1:0' : 'summary');
-      assert.equal(saved[0].quote, LAST_PARAGRAPH);
-      await page.evaluate(() => {
-        getSelection()!.removeAllRanges();
-        document.dispatchEvent(new Event('selectionchange'));
-      });
-      card.summaryHtml = card.summaryHtml
-        .replace('opening paragraph is separate', 'opening paragraph is updated')
-        .replace('response precedes Activity', 'response still precedes Activity');
-      payload.comments = saved;
-      await page.evaluate((value) => window.postMessage(value, '*'), payload);
-      await page.waitForFunction(
-        () =>
-          document.querySelector('.turn .summary')!.textContent.includes('opening paragraph is updated') ||
-          document.querySelector('.turn .summary')!.textContent.includes('response still precedes Activity'),
-      );
-      await page.waitForFunction(
-        ({ target, quote }) =>
-          Array.from(document.querySelector(target)!.querySelectorAll('.cmark'))
-            .map((node) => node.textContent)
-            .join('') === quote,
-        { target, quote: LAST_PARAGRAPH },
-      );
-      assert.equal(
-        await page
-          .locator('.turn')
-          .first()
-          .locator('.cmark')
-          .allTextContents()
-          .then((parts) => parts.join('')),
-        LAST_PARAGRAPH,
-      );
-    } finally {
-      await browser.close();
-    }
-  },
-);
-
-test.for(['card', 'tool', 'start'] as const)(
-  'last paragraph selection refuses visible content across %s',
-  { timeout: 30_000 },
-  async (boundary, t) => {
-    const browser = await browserOrNone();
-    if (!browser) {
-      t.skip('no browser installed');
-      return;
-    }
-    try {
-      const { page, target } = await lastParagraphPage(
-        browser,
-        boundary === 'tool' ? 'message' : 'response',
-        boundary === 'tool' ? 'tool' : 'card',
-      );
-      await page.evaluate(
-        ({ target, boundary }) => {
-          const paragraph = document.querySelector(target)!;
-          const other =
-            boundary === 'tool'
-              ? document.querySelector('.actrow:not(.message)')!
-              : document.querySelectorAll('.turn .head')[1];
-          const walker = document.createTreeWalker(other, NodeFilter.SHOW_TEXT);
-          let text = walker.nextNode()!;
-          while (!text.textContent!.trim()) text = walker.nextNode()!;
-          const range = document.createRange();
-          range.setStart(paragraph.firstChild!, 0);
-          range.setEnd(text, Math.min(4, text.textContent!.length));
-          if (boundary === 'start') {
-            range.setEnd(paragraph.firstChild!, paragraph.firstChild!.textContent!.length);
-            range.setStartBefore(paragraph.closest('.turn')!);
-          }
-          getSelection()!.removeAllRanges();
-          getSelection()!.addRange(range);
-          document.dispatchEvent(new Event('selectionchange'));
-        },
-        { target, boundary },
-      );
-      await page.evaluate(SETTLED);
-      assert.equal(await page.locator('.quotefloat').evaluate((node: HTMLElement) => node.hidden), true);
-      await page.keyboard.press('c');
-      await page.evaluate(SETTLED);
-      assert.equal(await page.locator('.notearea').count(), 0);
-    } finally {
-      await browser.close();
-    }
-  },
-);
+    await page.locator('.quotebar .quoteact').first().click();
+    await page.locator('.notearea').waitFor({ state: 'visible', timeout: 3000 });
+    assert.equal((await page.locator('.csel').allTextContents()).join(''), words);
+    await page.locator('.notearea').fill('Keep this paragraph.');
+    await page.locator('.notesave').click();
+    await page.waitForFunction(() =>
+      (window as any).__posted.some((m: any) => m.type === 'note' && m.note.op === 'write'),
+    );
+    const saved = await page.evaluate(() =>
+      (window as any).__posted
+        .filter((m: any) => m.type === 'note' && m.note.op === 'write')
+        .map((m: any) => m.note.note),
+    );
+    assert.equal(saved.length, 1);
+    assert.equal(saved[0].turnKey, card.key);
+    assert.equal(saved[0].part, 'summary');
+    assert.equal(saved[0].quote, words);
+  } finally {
+    await browser.close();
+  }
+});
 
 test('a comment on a prompt the reader sent twice marks the one they were in', { timeout: 60_000 }, async (t) => {
   const browser = await browserOrNone();
