@@ -319,6 +319,14 @@ test('the loop delay measures read milliseconds from the extension host loop', a
   assert.deepEqual(Object.keys(projected.counters.loopDelay as object).sort(), ['maxMs', 'p99Ms']);
 });
 
+test('disposed counters stop the loop delay sampler', () => {
+  const counters = new PanelPerformanceCounters(1_000, 'window-a');
+  const sampler = (counters as unknown as { loopDelay: { disable(): boolean } }).loopDelay;
+  counters.dispose();
+  // `disable` answers false when the sampler already stopped.
+  assert.equal(sampler.disable(), false, 'the sampler still ran after dispose');
+});
+
 test('released panels leave no diagnostic entry after repeated disposal', () => {
   const counters = new PanelPerformanceCounters(1_000, 'window-a');
   const disposedPanel = {};

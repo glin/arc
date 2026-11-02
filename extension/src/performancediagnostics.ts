@@ -379,6 +379,11 @@ export class PanelPerformanceCounters {
     this.loopDelay.enable();
   }
 
+  // Stop the loop delay sampler. A snapshot after this keeps the delays recorded before it.
+  dispose(): void {
+    this.loopDelay.disable();
+  }
+
   recordCapture(): void {
     this.captureCount++;
   }

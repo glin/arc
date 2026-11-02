@@ -3590,6 +3590,7 @@ export class PanelProvider implements vscode.Disposable {
     for (const turnId of this.pendingResponseOwners?.keys() ?? []) this.forgetPendingResponses(turnId);
     this.metadataRecoveryQueue = [];
     this.progressiveWorker.stop();
+    this.performanceCounters.dispose();
     this.readyHosts.clear();
     this.panelVisibility?.clear();
     this.initialCatalogRefreshPending = false;
