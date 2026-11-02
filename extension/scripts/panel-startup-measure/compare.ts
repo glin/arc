@@ -56,7 +56,8 @@ const COUNTS = new Set([
   'compressedTempEntries',
 ]);
 const BYTES = new Set(['dispatchSpendBytes', 'readBytes', 'compressedStoreWriteBytes', 'compressedStoreBytes']);
-// Measures that the report shows and the comparison gates only through a bound.
+// Measures that the report shows and the comparison gates only through a bound. Every row whose name starts with a
+// prefix of `REPORT_ONLY_PREFIXES` is report-only too.
 export const REPORT_ONLY = new Set([
   'loopDelayMaxMs',
   'loopDelayP99Ms',
@@ -64,7 +65,13 @@ export const REPORT_ONLY = new Set([
   'backfillMs',
   'compressedStoreWriteBytes',
   'compressedStoreBytes',
+  'refreshCount:compressed-facts',
 ]);
+export const REPORT_ONLY_PREFIXES = ['refreshMs:', 'refreshMaxMs:'] as const;
+
+export function isReportOnly(name: string): boolean {
+  return REPORT_ONLY.has(name) || REPORT_ONLY_PREFIXES.some((prefix) => name.startsWith(prefix));
+}
 
 function kindOf(name: string): Kind {
   return COUNTS.has(name) || name.startsWith('refreshCount:') ? 'count' : BYTES.has(name) ? 'bytes' : 'time';
@@ -146,7 +153,7 @@ export function compareResults(
     const b = outside ? worst : median(runs);
     const ratio = a !== null && b !== null ? (a === 0 ? (b === 0 ? 1 : Infinity) : b / a) : null;
     const margin = MARGINS[kind];
-    const reportOnly = !bound && REPORT_ONLY.has(name);
+    const reportOnly = !bound && isReportOnly(name);
     // A measure only the candidate reports compares with zero, so a new refresh reason still counts.
     const regressed = bound
       ? outside || runs.length < candidates

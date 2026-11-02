@@ -1894,6 +1894,21 @@ test('floor fails a value under', () => {
   assert.deepEqual([loop.reportOnly, loop.regressed], [true, false]);
 });
 
+test('refresh rows report past the margin and fail past a limit', () => {
+  const rows = (bounds = {}) =>
+    compareResults(
+      [runnerResult({ 'refreshMaxMs:poll': 100, 'refreshMs:poll': 200, 'refreshCount:compressed-facts': 1 })],
+      [runnerResult({ 'refreshMaxMs:poll': 9_000, 'refreshMs:poll': 20_000, 'refreshCount:compressed-facts': 40 })],
+      bounds,
+    );
+  const row = (measures: ReturnType<typeof rows>, name: string) => measures.find((measure) => measure.name === name)!;
+  const reported = rows();
+  for (const name of ['refreshMaxMs:poll', 'refreshMs:poll', 'refreshCount:compressed-facts'])
+    assert.deepEqual([row(reported, name).reportOnly, row(reported, name).regressed], [true, false], name);
+  const limited = row(rows(boundsOf(['--limit', 'refreshMaxMs:poll=50'])), 'refreshMaxMs:poll');
+  assert.deepEqual([limited.reportOnly, limited.regressed], [false, true]);
+});
+
 test('pre-check refuses low disk', () => {
   const gib = 1024 ** 3;
   assert.equal(
