@@ -26,7 +26,11 @@ test.skipIf(!encode)('the first record of a compressed rollout decodes alone, wi
   const rollout = write('rollout.jsonl.zst', encode!(body));
   assert.equal(await readCompressedFirstRecord(rollout, 1024), opening);
   assert.equal(await readCompressedFirstRecord(rollout, 10), null, 'a record past the cap was read');
-  assert.equal(await readCompressedFirstRecord(write('one.jsonl.zst', encode!(Buffer.from(opening))), 1024), opening);
+  assert.equal(
+    await readCompressedFirstRecord(write('one.jsonl.zst', encode!(Buffer.from(opening))), 1024),
+    null,
+    'an unterminated first record was read',
+  );
   assert.equal(await readCompressedFirstRecord(write('empty.jsonl.zst', encode!(Buffer.alloc(0))), 1024), null);
   assert.equal(await readCompressedFirstRecord(write('plain.jsonl.zst', Buffer.from(`${opening}\n`)), 1024), null);
   await assert.rejects(readCompressedFirstRecord(path.join(root, 'missing.jsonl.zst'), 1024), { code: 'ENOENT' });

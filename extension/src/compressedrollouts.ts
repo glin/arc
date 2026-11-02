@@ -87,8 +87,8 @@ export function zstdFrames() {
 }
 
 // Decode the first record of a compressed rollout, and stop the decode there. The answer is null when Node.js has no
-// zstd decoder, when the stream does not decode, or when no line ends within `maxBytes` decoded bytes. A body without a
-// line break answers its whole text. A file system refusal rejects.
+// zstd decoder, when the stream does not decode, or when no line ends within `maxBytes` decoded bytes. A body that ends
+// before its first line break answers null, because its first record is not complete. A file system refusal rejects.
 export async function readCompressedFirstRecord(file: string, maxBytes: number): Promise<string | null> {
   const decoder = createZstdDecoder();
   if (!decoder) return null;
@@ -112,7 +112,7 @@ export async function readCompressedFirstRecord(file: string, maxBytes: number):
             return;
           }
         }
-        line = length ? Buffer.concat(held).toString('utf8') : null;
+        line = null;
       },
       { signal: stop.signal },
     );
