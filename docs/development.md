@@ -147,7 +147,7 @@ Change model and provider pricing in `extension/src/pricing.ts`.
 3. Check `effortChangeKeepsCache` independently of `cachePolicy`. General prompt-cache support does not establish retention after an effort change. Set `true` only when primary retention evidence covers the whole pricing row. Use an exact-identity `RegExp` when primary evidence covers only part of the pricing row. Leave the field absent when primary evidence does not establish retention.
 4. Preserve detectable route exclusions. Undetectable routes retain the direct-model policy. Record conflicting primary evidence as a route-detection limitation. Missing route signals do not establish a direct route.
 5. An absent retention policy returns false. A false result does not establish provider rejection.
-6. Add explicit provider support beside that definition for every confirmed provider.
+6. Add explicit provider support beside that definition for every confirmed provider. Every Codex shorthand target requires an independent decision for direct OpenAI and Amazon Bedrock in `pricing.test.ts`. The guard reads the exported shorthand map and the independent support matrix. A supported route requires rates and cache policy. An unpriced route requires an exact, sourced reason beside the matrix. Removing production and expected support together must fail the guard.
 7. Specify each provider's accepted prefixes, regional multiplier, effective dates, fallback window, and explicit sourced cache policy.
 8. Reuse shared rates only when published provider rates establish equivalence. Set a provider rate override when they differ.
 9. Keep service tiers specific to their provider. Price recorded cache tokens without inferring caching support or a lifetime.
@@ -157,7 +157,7 @@ Change model and provider pricing in `extension/src/pricing.ts`.
 13. Add symptom regressions to the existing pricing and consumer tests. Include saved usage and both request bands.
 14. Bump `PROJECT_SPEND_PARSER_GENERATION` in `projectspend.ts` when model support changes saved request bands or derived usage facts.
 15. Bump `VERSION` in `derivedcache.ts` when model support changes saved session cost or context facts.
-16. Remove the new provider support temporarily and run the symptom regressions. Also remove its cache policy, price, and independent route expectation separately. Remove the new effort-change retention policy and its independent expectation separately. Also widen each exact-identity retention pattern. Require each guard to fail, then restore from plain backups.
+16. Remove the new provider support temporarily and run the symptom regressions. Also remove its cache policy, price, and independent route expectation separately. Remove production and expected provider support together. Change a shorthand target to an unreviewed model. Remove the new effort-change retention policy and its independent expectation separately. Also widen each exact-identity retention pattern. Require each guard to fail, then restore from plain backups.
 17. Update exact model coverage in [Supported pricing](cost-figures.md#supported-pricing). Update README provider summaries when provider coverage changes.
 18. Check personal billing consumers against the same request evidence and Arc build. Record independent pricing behavior until each consumer uses Arc billing.
 

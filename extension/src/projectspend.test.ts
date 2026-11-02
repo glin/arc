@@ -5357,6 +5357,9 @@ test('Bedrock rate bands stay with each request before daily aggregation', () =>
 test('GPT-6.1 Sol and Terra rebuild saved unpriced requests without treating two short requests as long', () => {
   for (const [model, expected] of [
     ['gpt-6.1-terra', 0.8],
+    ['openai.gpt-6.1-terra', 0.88],
+    ['us.openai.gpt-6.1-terra', 0.88],
+    ['global.openai.gpt-6.1-terra', 0.8],
     ['openai.gpt-6.1-sol', 1.76],
     ['us.openai.gpt-6.1-sol', 1.76],
     ['global.openai.gpt-6.1-sol', 1.6],
@@ -5394,7 +5397,7 @@ test('GPT-6.1 Sol and Terra rebuild saved unpriced requests without treating two
     saveSpendLedger(storage, 'w', [
       {
         ...current,
-        parserGeneration: model === 'gpt-6.1-terra' ? 64 : 27,
+        parserGeneration: model.includes('gpt-6.1-terra') ? 65 : 27,
         buckets: [unbanded],
         lifetimeBuckets: [unbanded],
       },

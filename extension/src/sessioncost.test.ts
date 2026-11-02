@@ -4255,6 +4255,38 @@ test('request prices use the request context band, regional rate, and service ti
     const unsupported = summarizeRequests([pricedRequest('gpt-6.1-terra', 100_000, options)]);
     assert.equal(unsupported.costUsd, null);
   }
+  for (const [model, expected] of [
+    ['openai.gpt-6.1-terra', 0.88],
+    ['us.openai.gpt-6.1-terra', 0.88],
+    ['global.openai.gpt-6.1-terra', 0.8],
+  ] as const) {
+    const requests = [100_000, 100_000, 150_000].map((input, index) =>
+      pricedRequest(model, input, {
+        provider: 'amazon-bedrock',
+        serviceTier: 'default',
+        contextBand: index === 2 ? 'long' : 'short',
+        usage: {
+          requests: 1,
+          input,
+          cacheWrite5m: 0,
+          cacheWrite1h: 0,
+          cacheWrite30m: 20_000,
+          cacheRead: index === 2 ? 150_000 : 100_000,
+          output: 10_000,
+          thinking: 0,
+        },
+      }),
+    );
+    const report = summarizeRequests(requests);
+    assert.equal(report.requests, 3);
+    assert.equal(report.pricedRequests, 3);
+    assert.equal(report.unpricedRequests, 0);
+    assert.ok(Math.abs(report.costUsd! - expected) < 1e-12);
+    for (const options of [{ serviceTier: 'priority' }, { provider: 'unknown-provider' }, { incomplete: true }]) {
+      assert.equal(summarizeRequests([{ ...requests[0], ...options }]).costUsd, null);
+    }
+    assert.equal(summarizeRequests([{ ...requests[0], reportedCost: 0 }]).costUsd, 0);
+  }
 });
 
 test('model costs reconcile individual request quotes across providers, tiers, and context bands', () => {

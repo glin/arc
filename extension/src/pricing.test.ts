@@ -31,6 +31,7 @@ import {
 } from './pricing.ts';
 
 import { TurnUsage } from './transcript.ts';
+import { codexModelShorthands } from './launchpolicy.ts';
 import { COMPACTION_SAMPLES, previousContextOf, type CompactionCalibrationRow } from './turnfixtures.ts';
 
 // Keep expected model ids independent of the price table so missing rows fail the test.
@@ -268,7 +269,17 @@ const SUPPORT_MATRIX: { models: string[]; definition: ModelDefinition }[] = [
     { input: 1, cacheWrite30m: 1.25, cacheRead: 0.05, output: 5 },
     1_050_000,
     '30m',
-    undefined,
+    {
+      prefixes: /^(?:us|global)?$/,
+      regionalMultiplier: 1.1,
+      window: 1_050_000,
+      effectiveDate: null,
+      cachePolicy: {
+        kind: 'documented',
+        lifetime: '30m',
+        sources: ['https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-6-1-terra.html'],
+      },
+    },
     { fast: 2, priority: 2, flex: 0.5, batch: 0.5 },
   ),
   openaiSupport(
@@ -326,6 +337,16 @@ const SUPPORT_MATRIX: { models: string[]; definition: ModelDefinition }[] = [
     bedrockSupport('2026-07-30', '2026-08-20'),
   ),
 ];
+
+test('every Codex shorthand target has an independent pricing decision for each configured provider', () => {
+  for (const model of new Set(Object.values(codexModelShorthands))) {
+    const expected = SUPPORT_MATRIX.find((entry) => entry.models.includes(model))?.definition;
+    assert.ok(expected?.providers?.includes('openai'), `${model} needs a direct OpenAI pricing decision`);
+    assert.ok(resolveModelPricing(model, 'openai'), model);
+    assert.ok(expected?.bedrock, `${model} needs an Amazon Bedrock pricing decision`);
+    assert.ok(resolveModelPricing(`openai.${model}`, 'amazon-bedrock'), model);
+  }
+});
 
 test('every supported pricing route has independently reviewed complete pricing and cache policy', () => {
   const actual = MODEL_DEFINITIONS.map(({ promotion: _promotion, ...definition }) => definition);
@@ -555,15 +576,7 @@ test('GPT-6.1 Terra prices only its exact direct identity across request bands a
     assert.equal(quoteUsage({ usage: tokens, model, provider }), null);
     assert.equal(contextWindowFor(model, provider), null);
   }
-  for (const id of [
-    'gpt-6.11-terra',
-    'gpt-6.1-terra-codex',
-    'gpt-6.1-terra-2026-10-27',
-    'gpt-6.1-terra[1m]',
-    'openai.gpt-6.1-terra',
-    'us.openai.gpt-6.1-terra',
-    'global.openai.gpt-6.1-terra',
-  ]) {
+  for (const id of ['gpt-6.11-terra', 'gpt-6.1-terra-codex', 'gpt-6.1-terra-2026-10-27', 'gpt-6.1-terra[1m]']) {
     assert.equal(rateFor(id), null, id);
     assert.equal(rateFor(id, 'amazon-bedrock'), null, id);
   }
@@ -641,6 +654,92 @@ test('Bedrock GPT-6.1 Sol prices supported routes with its documented cache life
     'openai.gpt-6.1-sol-extra',
     'openai.gpt-6.11-sol',
     'openai.gpt-6.2-sol',
+    'openai.gpt-5.6',
+  ]) {
+    assert.equal(rateFor(model, provider), null, model);
+    assert.equal(contextWindowFor(model, provider), null, model);
+    assert.equal(cacheLifetimeFor(model, provider), null, model);
+    assert.equal(contextBandForRequest(model, provider, 100_000), null, model);
+  }
+});
+
+test('Bedrock GPT-6.1 Terra prices supported routes with its documented cache lifetime and provider-specific tiers', () => {
+  const provider = 'amazon-bedrock';
+  const short = usage({ requests: 1, input: 100_000, cacheWrite30m: 20_000, cacheRead: 100_000, output: 10_000 });
+  const long = usage({ requests: 1, input: 150_000, cacheWrite30m: 20_000, cacheRead: 150_000, output: 10_000 });
+  for (const [model, shortRate, longRate, shortCost, longCost] of [
+    [
+      'openai.gpt-6.1-terra',
+      { input: 1.1, cacheWrite30m: 1.375, cacheRead: 0.055, output: 5.5 },
+      { input: 2.2, cacheWrite30m: 2.75, cacheRead: 0.11, output: 8.25 },
+      0.198,
+      0.484,
+    ],
+    [
+      'us.openai.gpt-6.1-terra',
+      { input: 1.1, cacheWrite30m: 1.375, cacheRead: 0.055, output: 5.5 },
+      { input: 2.2, cacheWrite30m: 2.75, cacheRead: 0.11, output: 8.25 },
+      0.198,
+      0.484,
+    ],
+    [
+      'global.openai.gpt-6.1-terra',
+      { input: 1, cacheWrite30m: 1.25, cacheRead: 0.05, output: 5 },
+      { input: 2, cacheWrite30m: 2.5, cacheRead: 0.1, output: 7.5 },
+      0.18,
+      0.44,
+    ],
+  ] as const) {
+    assert.deepEqual(rateFor(model, provider), shortRate);
+    assert.equal(contextWindowFor(model, provider), 1_050_000);
+    assert.equal(cacheLifetimeFor(model, provider), '30m');
+    assert.equal(effortChangeKeepsCache(model, provider), false);
+    assert.equal(resolveModelPricing(model, 'unknown-provider'), null);
+    assert.equal(contextBandForRequest(model, provider, 272_000), 'short');
+    assert.equal(contextBandForRequest(model, provider, 272_001), 'long');
+    assert.equal(rateFor(model, provider, 1_050_000), null);
+    assert.equal(rateFor(model, 'openai'), null);
+    assert.equal(rateFor(model), null);
+    for (const serviceTier of [null, 'standard', 'default']) {
+      for (const [tokens, counts, rate, cost, band] of [
+        [220_000, short, shortRate, shortCost, 'short'],
+        [320_000, long, longRate, longCost, 'long'],
+      ] as const) {
+        const quote = quoteUsage({ usage: counts, model, provider, requestTokens: tokens, serviceTier });
+        assert.deepEqual(quote?.rate, rate);
+        assert.equal(quote?.contextBand, band);
+        assert.equal(quote?.effectiveDate, null);
+        assert.equal(quote?.source, 'AWS Bedrock standard');
+        assert.ok(quote && Math.abs(quote.cost - cost) < 1e-12);
+      }
+    }
+    for (const serviceTier of ['fast', 'priority', 'flex', 'batch', 'reserved', 'unknown-tier']) {
+      assert.equal(quoteUsage({ usage: short, model, provider, requestTokens: 220_000, serviceTier }), null);
+    }
+    const mixed = usage({
+      requests: 2,
+      input: 250_000,
+      cacheWrite30m: 40_000,
+      cacheRead: 250_000,
+      output: 20_000,
+      byContextBand: { short, long },
+    });
+    assert.ok(Math.abs(estimateCost(mixed, model, provider)! - shortCost - longCost) < 1e-12);
+    const { byContextBand: _bands, ...unbanded } = mixed;
+    assert.equal(estimateCost(unbanded, model, provider), null);
+  }
+  for (const model of [
+    'gpt-6.1-terra',
+    'eu.openai.gpt-6.1-terra',
+    'ap.openai.gpt-6.1-terra',
+    'apac.openai.gpt-6.1-terra',
+    'openai.gpt-6.1-terra-2026-10-27',
+    'openai.gpt-6.1-terra[1m]',
+    'xx.openai.gpt-6.1-terra',
+    'US.openai.gpt-6.1-terra',
+    'openai.gpt-6.1-terra-extra',
+    'openai.gpt-6.11-terra',
+    'openai.gpt-6.2-terra',
     'openai.gpt-5.6',
   ]) {
     assert.equal(rateFor(model, provider), null, model);

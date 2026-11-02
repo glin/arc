@@ -1328,30 +1328,96 @@ test('derived cache discards GPT-6.1 Sol Bedrock facts saved without provider su
   assert.deepEqual(loaded.carriedNames.get('/bedrock.jsonl'), { label: title.label, fullLabel: title.fullLabel });
 });
 
-test('derived cache discards pre-support Terra figures and carries session names', () => {
-  const file = path.join(folder(), 'cache.json');
-  const unpriced: DerivedTitleEntry = {
-    ...title,
-    stats: {
-      turns: [
-        { ...stats.turns[0], model: 'gpt-6.1-terra', provider: 'openai', contextWindow: null, contextRequest: null },
-      ],
-      compactions: [],
-    },
-  };
-  fs.writeFileSync(
-    file,
-    JSON.stringify({
-      formatVersion: 1,
-      metadataVersion: 69,
-      codexMetaVersion: CODEX_META_VERSION,
-      codexMetas: [],
-      titles: [{ file: '/terra.jsonl', entry: unpriced }],
-    }),
-  );
-  const loaded = loadDerivedCache(file);
-  assert.equal(loaded.titles.size, 0);
-  assert.deepEqual(loaded.carriedNames.get('/terra.jsonl'), { label: title.label, fullLabel: title.fullLabel });
+test('derived cache rebuilds generation 70 Terra facts from unchanged sources and carries session names', async () => {
+  const { readCodexSession } = await import('./codex.ts');
+  const { sessionStatFactsOf } = await import('./transcript.ts');
+  for (const [model, provider, expected] of [
+    ['gpt-6.1-terra', 'openai', 0.8],
+    ['openai.gpt-6.1-terra', 'amazon-bedrock', 0.88],
+    ['us.openai.gpt-6.1-terra', 'amazon-bedrock', 0.88],
+    ['global.openai.gpt-6.1-terra', 'amazon-bedrock', 0.8],
+  ] as const) {
+    const directory = folder();
+    const source = path.join(directory, 'terra.jsonl');
+    const cache = path.join(directory, 'cache.json');
+    const at = '2026-11-02T00:00:00Z';
+    const records: object[] = [
+      { type: 'session_meta', timestamp: at, payload: { id: 'terra', model_provider: provider } },
+    ];
+    for (const [index, input] of [220_000, 220_000, 320_000].entries()) {
+      const turn_id = `terra-${index}`;
+      const requestUsage = {
+        input_tokens: input,
+        cached_input_tokens: index === 2 ? 150_000 : 100_000,
+        cache_write_input_tokens: 20_000,
+        output_tokens: 10_000,
+        reasoning_output_tokens: 0,
+        total_tokens: input + 10_000,
+      };
+      records.push(
+        { type: 'event_msg', timestamp: at, payload: { type: 'task_started', turn_id, model_context_window: 500_000 } },
+        { type: 'turn_context', timestamp: at, payload: { turn_id, model, service_tier: 'default' } },
+        { type: 'event_msg', timestamp: at, payload: { type: 'user_message', message: 'price the request' } },
+        {
+          type: 'event_msg',
+          timestamp: at,
+          payload: {
+            type: 'token_count',
+            info: {
+              last_token_usage: requestUsage,
+              total_token_usage: requestUsage,
+              model_context_window: 500_000,
+            },
+          },
+        },
+        { type: 'event_msg', timestamp: at, payload: { type: 'task_complete', turn_id } },
+      );
+    }
+    fs.writeFileSync(source, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+    const before = fs.statSync(source);
+    const fresh = sessionStatFactsOf(readCodexSession(source, 'terra'));
+    assert.ok(fresh);
+    const stale: DerivedTitleEntry = {
+      ...title,
+      size: before.size,
+      mtimeMs: before.mtimeMs,
+      stats: {
+        ...fresh,
+        turns: fresh.turns.map((turn) => ({
+          ...turn,
+          contextWindow: null,
+          contextRequest: null,
+          usageParts: undefined,
+          usage: { ...turn.usage, byContextBand: undefined },
+        })),
+      },
+    };
+    saveDerivedCache(cache, [[source, stale]]);
+    const envelope = JSON.parse(fs.readFileSync(cache, 'utf8'));
+    envelope.metadataVersion = 70;
+    fs.writeFileSync(cache, JSON.stringify(envelope));
+    const loaded = loadDerivedCache(cache);
+    assert.equal(loaded.titles.size, 0);
+    assert.equal(loaded.reuse?.reason, 'generation-mismatch');
+    assert.deepEqual(loaded.carriedNames.get(source), { label: title.label, fullLabel: title.fullLabel });
+    saveDerivedCache(cache, [[source, { ...stale, stats: sessionStatFactsOf(readCodexSession(source, 'terra')) }]]);
+    const persisted = loadDerivedCache(cache).titles.get(source);
+    assert.ok(persisted?.stats);
+    assert.equal(persisted.stats.turns.length, 3);
+    for (const [index, turn] of persisted.stats.turns.entries()) {
+      assert.equal(turn.contextWindow, 500_000);
+      assert.equal(turn.contextRequest?.lifetime, '30m');
+      assert.equal(turn.usageParts?.[0]?.contextBand, index === 2 ? 'long' : 'short');
+    }
+    const dollars = persisted.stats.turns.reduce((sum, turn) => sum + estimateCost(turn.usage, model, provider)!, 0);
+    assert.ok(Math.abs(dollars - expected) < 1e-12);
+    assert.equal(persisted.label, title.label);
+    assert.equal(persisted.fullLabel, title.fullLabel);
+    assert.equal(persisted.size, before.size);
+    assert.equal(persisted.mtimeMs, before.mtimeMs);
+    assert.equal(fs.statSync(source).size, before.size);
+    assert.equal(fs.statSync(source).mtimeMs, before.mtimeMs);
+  }
 });
 
 test('derived cache rejects malformed request pricing identities', () => {

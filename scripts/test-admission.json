@@ -55,14 +55,14 @@
     "matricesSha256": "7233dd3ad393a62ecbd4ba987f2c6c489196504ddb484835419dcff9134eb053"
   },
   "extension/src/codex.test.ts": {
-    "reason": "Real Git worktree ownership and descendant source resolution must agree with recorded Codex session relationships.",
+    "reason": "Real Git worktree ownership and descendant source resolution must agree with recorded Codex session relationships. Terra provider coverage adds in-process request fixtures without additional subprocesses.",
     "cases": 493,
-    "matricesSha256": "cadf28b7d63ed38f3f77208b6d55f1f2231d3e9665086c748d5fff5939371f5d"
+    "matricesSha256": "628adde9cb02de59fbd50820aebdb0ade3f3dcf36db9930154181d4f68d3226e"
   },
   "extension/src/derivedcache.test.ts": {
-    "reason": "Independent writers and host death must preserve shared cache rows and release stale filesystem locks.",
+    "reason": "Independent writers and host death must preserve shared cache rows and release stale filesystem locks. Terra generation recovery adds in-process provider fixtures without additional writers.",
     "cases": 92,
-    "matricesSha256": "21c54df8d2390471ccd06ad351899b5fa506f8ab9f2d8ef74b4628740f7b585a"
+    "matricesSha256": "ee5c081825f1db5dcf92ffc395e05939b85a73419494413e56db20b0ddb30345"
   },
   "extension/src/exportsite.browser.test.ts": {
     "reason": "An offline exported session must retain interactive navigation and safe local browser behavior.",

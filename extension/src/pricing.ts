@@ -285,6 +285,17 @@ export const MODEL_DEFINITIONS: readonly ModelDefinition[] = [
     maxPricedContext: 272_000,
     longContext: { threshold: 272_000, inputMultiplier: 2, outputMultiplier: 1.5 },
     serviceTierMultipliers: { fast: 2, priority: 2, flex: 0.5, batch: 0.5 },
+    bedrock: {
+      prefixes: /^(?:us|global)?$/,
+      regionalMultiplier: 1.1,
+      window: 1_050_000,
+      cachePolicy: {
+        kind: 'documented',
+        lifetime: '30m',
+        sources: ['https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-6-1-terra.html'],
+      },
+      effectiveDate: null,
+    },
   },
   // https://developers.openai.com/api/docs/models/gpt-6-sol
   {

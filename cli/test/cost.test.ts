@@ -1069,6 +1069,9 @@ test('cost selects the explicit Codex sessions root over the environment root', 
 test('cost prices recorded GPT-6.1 Sol and Terra requests and cache categories', async () => {
   for (const [model, expected] of [
     ['gpt-6.1-terra', 0.8],
+    ['openai.gpt-6.1-terra', 0.88],
+    ['us.openai.gpt-6.1-terra', 0.88],
+    ['global.openai.gpt-6.1-terra', 0.8],
     ['openai.gpt-6.1-sol', 1.76],
     ['us.openai.gpt-6.1-sol', 1.76],
     ['global.openai.gpt-6.1-sol', 1.6],

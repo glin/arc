@@ -24,7 +24,7 @@ export interface LaunchPolicy {
   readonly readTools: readonly string[];
 }
 
-const codexModelShorthands: Readonly<Record<string, string>> = {
+export const codexModelShorthands: Readonly<Record<string, string>> = {
   sol: 'gpt-6.1-sol',
   sol6: 'gpt-6-sol',
   terra: 'gpt-6.1-terra',
