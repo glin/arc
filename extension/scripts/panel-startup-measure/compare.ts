@@ -34,6 +34,9 @@ export interface Bound {
 
 export type Bounds = Record<string, Bound>;
 
+// A measure's own ratio from `--margin`. It replaces the class margin for that row and applies no floor.
+export type Margins = Record<string, number>;
+
 interface RunResult {
   source?: string;
   complete?: boolean;
@@ -100,10 +103,11 @@ export const REQUIRED_MEASURES = [
   ...REQUIRED_DISCOVERY_MEASURES,
 ];
 
-// Every repetition must report each required measure and each bounded measure. A non-finite value counts as missing.
-export function missingMeasures(result: RunResult | RunResult[], bounds: Bounds = {}): string[] {
+// Every repetition must report each required measure, each bounded measure and each measure with its own margin. A
+// non-finite value counts as missing.
+export function missingMeasures(result: RunResult | RunResult[], bounds: Bounds = {}, margins: Margins = {}): string[] {
   const runs = Array.isArray(result) ? result : [result];
-  const required = [...new Set([...REQUIRED_MEASURES, ...Object.keys(bounds)])];
+  const required = [...new Set([...REQUIRED_MEASURES, ...Object.keys(bounds), ...Object.keys(margins)])];
   return required.filter((name) => runs.some((run) => !Number.isFinite(measuresOf(run).get(name)?.value ?? NaN)));
 }
 
@@ -126,6 +130,7 @@ export function compareResults(
   baseline: RunResult | RunResult[],
   candidate: RunResult | RunResult[],
   bounds: Bounds = {},
+  margins: Margins = {},
 ): Measure[] {
   const values = (runs: RunResult | RunResult[]) => {
     const out = new Map<string, { kind: Kind; values: number[] }>();
@@ -152,14 +157,29 @@ export function compareResults(
     const outside = bound !== null && runs.length > 0 && past(worst, bound) > 0;
     const b = outside ? worst : median(runs);
     const ratio = a !== null && b !== null ? (a === 0 ? (b === 0 ? 1 : Infinity) : b / a) : null;
-    const margin = MARGINS[kind];
-    const reportOnly = !bound && isReportOnly(name);
+    const own = margins[name];
+    const margin = own ?? MARGINS[kind];
+    const floor = own === undefined ? FLOORS[kind] : 0;
+    const reportOnly = !bound && own === undefined && isReportOnly(name);
     // A measure only the candidate reports compares with zero, so a new refresh reason still counts.
     const regressed = bound
       ? outside || runs.length < candidates
-      : !reportOnly && b !== null && b - (a ?? 0) > FLOORS[kind] && (a === null || a === 0 || b / a > margin);
+      : !reportOnly && b !== null && b - (a ?? 0) > floor && (a === null || a === 0 || b / a > margin);
     return { name, kind, baseline: a, candidate: b, ratio, margin, bound, reportOnly, regressed };
   });
+}
+
+// Read each `--margin` value, as `<measure>=<ratio>`. The flag repeats.
+export function marginsOf(args: string[]): Margins {
+  const margins: Margins = {};
+  for (let index = 0; index < args.length; index++) {
+    if (args[index] !== '--margin') continue;
+    const match = /^([^=]+)=(.+)$/.exec(args[index + 1] ?? '');
+    const ratio = match ? Number(match[2]) : NaN;
+    if (!match || !Number.isFinite(ratio) || ratio <= 0) throw new Error('--margin takes <measure>=<ratio>.');
+    margins[match[1]] = ratio;
+  }
+  return margins;
 }
 
 // Read each `--limit` and `--floor` value, as `<measure>=<value>`. Either flag repeats.
@@ -329,6 +349,7 @@ async function main(): Promise<void> {
   const output = path.resolve(value('--output') ?? path.join(os.tmpdir(), `arc-compare-${Date.now()}`));
   const installed = installedCommit();
   const bounds = boundsOf(args);
+  const margins = marginsOf(args);
   const repeat = Number(value('--repeat') ?? '1');
   if (!Number.isInteger(repeat) || repeat < 1) throw new Error('--repeat takes a whole number of repetitions.');
   let baselineResults: RunResult[];
@@ -399,8 +420,11 @@ async function main(): Promise<void> {
     baselineLabel = baseline.slice(0, 9);
     candidateLabel = candidate.slice(0, 9);
   }
-  const measures = compareResults(baselineResults, candidateResults, bounds);
-  const missing = { baseline: missingMeasures(baselineResults), candidate: missingMeasures(candidateResults, bounds) };
+  const measures = compareResults(baselineResults, candidateResults, bounds, margins);
+  const missing = {
+    baseline: missingMeasures(baselineResults, {}, margins),
+    candidate: missingMeasures(candidateResults, bounds, margins),
+  };
   // A repetition that fails or times out leaves the comparison incomplete.
   const complete =
     [...baselineResults, ...candidateResults].every((result) => result.complete === true) &&
@@ -426,6 +450,7 @@ async function main(): Promise<void> {
       margins: MARGINS,
       floors: FLOORS,
       bounds,
+      measureMargins: margins,
       measures,
       missing,
       regressions,

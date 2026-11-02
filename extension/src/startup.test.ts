@@ -321,6 +321,7 @@ import {
 import {
   boundsOf,
   compareResults,
+  marginsOf,
   missingMeasures,
   runRepetitions,
   type Side,
@@ -1907,6 +1908,28 @@ test('refresh rows report past the margin and fail past a limit', () => {
     assert.deepEqual([row(reported, name).reportOnly, row(reported, name).regressed], [true, false], name);
   const limited = row(rows(boundsOf(['--limit', 'refreshMaxMs:poll=50'])), 'refreshMaxMs:poll');
   assert.deepEqual([limited.reportOnly, limited.regressed], [false, true]);
+});
+
+test('margin sets one measure ratio without a floor', () => {
+  const margins = marginsOf(['--margin', 'firstUsableRowMs=1.8', '--margin', 'firstPassMs=1.1', '--soak', '10']);
+  assert.deepEqual(margins, { firstUsableRowMs: 1.8, firstPassMs: 1.1 });
+  assert.throws(() => marginsOf(['--margin', 'firstPassMs']), /--margin takes <measure>=<ratio>/);
+  // The candidate is 1.7 times the baseline: past the class margin of 1.5 and under its own margin of 1.8.
+  const rows = compareResults([runnerResult({}, 60_000)], [runnerResult({}, 102_000)], {}, margins);
+  const row = (name: string) => rows.find((measure) => measure.name === name)!;
+  assert.deepEqual([row('firstUsableRowMs').margin, row('firstUsableRowMs').regressed], [1.8, false]);
+  // Its own margin has no floor, so a difference under the class floor still fails past it.
+  const close = compareResults([runnerResult({}, 1_000)], [runnerResult({}, 1_500)], {}, margins);
+  assert.equal(close.find((measure) => measure.name === 'firstPassMs')!.regressed, true);
+  // A margin gates a report-only row, and makes the row required.
+  const refresh = compareResults(
+    [runnerResult({ 'refreshMaxMs:poll': 100 })],
+    [runnerResult({ 'refreshMaxMs:poll': 300 })],
+    {},
+    { 'refreshMaxMs:poll': 2 },
+  ).find((measure) => measure.name === 'refreshMaxMs:poll')!;
+  assert.deepEqual([refresh.reportOnly, refresh.regressed], [false, true]);
+  assert.deepEqual(missingMeasures([runnerResult()], {}, { 'refreshMaxMs:poll': 2 }), ['refreshMaxMs:poll']);
 });
 
 test('pre-check refuses low disk', () => {
