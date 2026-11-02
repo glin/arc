@@ -343,14 +343,21 @@ function write(output: string, report: Record<string, unknown>, table: string): 
   fs.writeFileSync(path.join(output, 'compare.md'), table + '\n');
 }
 
-async function main(): Promise<void> {
-  const args = process.argv.slice(2);
+// What a comparison calls outside itself. A test replaces them.
+export interface ComparisonDependencies {
+  measure?: (args: string[], log: string) => Promise<Repetition>;
+  installed?: () => ReturnType<typeof installedCommit>;
+  discard?: (scratch: string) => void;
+}
+
+// Run one comparison from its command line arguments, and answer the exit status.
+export async function runComparison(args: string[], dependencies: ComparisonDependencies = {}): Promise<number> {
   const value = (flag: string) => {
     const index = args.indexOf(flag);
     return index >= 0 ? args[index + 1] : undefined;
   };
   const output = path.resolve(value('--output') ?? path.join(os.tmpdir(), `arc-compare-${Date.now()}`));
-  const installed = installedCommit();
+  const installed = (dependencies.installed ?? installedCommit)();
   const bounds = boundsOf(args);
   const margins = marginsOf(args);
   const repeat = Number(value('--repeat') ?? '1');
@@ -391,7 +398,7 @@ async function main(): Promise<void> {
     // Each repetition runs its warm-up launch and its measured launch back to back. The builds never overlap.
     const run = async (side: Side, index: number, buildDirectory: string) => {
       const suffix = repeat > 1 ? `-${index + 1}` : '';
-      const repetition = await runMeasure(
+      const repetition = await (dependencies.measure ?? runMeasure)(
         [
           '--fixture',
           manifest,
@@ -417,6 +424,7 @@ async function main(): Promise<void> {
       buildDirectory: (side) => path.join(output, `${side}-build`),
       run,
       keep: args.includes('--keep'),
+      discard: dependencies.discard,
     });
     baselineResults = repetitions.baseline.map((repetition) => repetition.result);
     candidateResults = repetitions.candidate.map((repetition) => repetition.result);
@@ -464,15 +472,22 @@ async function main(): Promise<void> {
   process.stdout.write(`\n${table}\n\nComparison: ${output}\n`);
   if (!complete) {
     process.stderr.write('A run remained incomplete or missed a required measure, so the comparison proves nothing.\n');
-    process.exitCode = 2;
-  } else if (regressions.length) {
-    process.stderr.write(`The candidate regressed past its margin: ${regressions.join(', ')}.\n`);
-    process.exitCode = 1;
+    return 2;
   }
+  if (regressions.length) {
+    process.stderr.write(`The candidate regressed past its margin: ${regressions.join(', ')}.\n`);
+    return 1;
+  }
+  return 0;
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === __filename)
-  void main().catch((error: unknown) => {
-    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
-    process.exit(3);
-  });
+  void runComparison(process.argv.slice(2)).then(
+    (status) => {
+      process.exitCode = status;
+    },
+    (error: unknown) => {
+      process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+      process.exit(3);
+    },
+  );

@@ -99,7 +99,7 @@ const ARC_STORE = path.join(SCRATCH, 'arc-home');
 const BUILD_TREE = path.join(SCRATCH, 'build');
 const NODE_MODULES = ['node_modules', 'extension/node_modules', 'cli/node_modules'];
 
-interface Options {
+export interface Options {
   commit: string | null;
   fixture: string;
   workspace: string;
@@ -164,7 +164,7 @@ function stop(message: string): never {
   process.exit(1);
 }
 
-function readOptions(argv: string[]): Options {
+export function readOptions(argv: string[]): Options {
   const options: Options = {
     commit: null,
     workspace: REPOSITORY,
@@ -1248,6 +1248,24 @@ export function cachedBuild(directory: string, key: BuildKey): Build | null {
   }
 }
 
+// The build key of a run: its source commit and the overlays its options add.
+export function buildKeyOf(options: Options, source: string): BuildKey {
+  return {
+    source,
+    selection: options.selection,
+    response: options.response,
+    snapshots: options.soakMinutes > 0 || options.warmUntil.length > 0,
+  };
+}
+
+// Install the kept build of the cache directory when its key is equal, and otherwise build and keep the result.
+export function preparedBuild(directory: string | null, key: BuildKey, build: () => Build): Build {
+  const cached = directory ? cachedBuild(directory, key) : null;
+  if (cached) return cached;
+  const built = build();
+  return directory ? saveBuild(directory, key, built) : built;
+}
+
 export function saveBuild(directory: string, key: BuildKey, build: Build): Build {
   fs.mkdirSync(directory, { recursive: true });
   const vsix = path.join(directory, 'arc.vsix');
@@ -1587,14 +1605,8 @@ async function main(): Promise<void> {
   try {
     const source = git(['rev-parse', options.commit ?? 'HEAD']);
     const label = git(['rev-parse', '--short', source]);
-    const key: BuildKey = {
-      source,
-      selection: selectionRequested,
-      response: responseRequested,
-      snapshots: soakRequested || warmUntilRequested,
-    };
-    let build = options.buildCache ? cachedBuild(options.buildCache, key) : null;
-    if (!build) {
+    const key = buildKeyOf(options, source);
+    const build = preparedBuild(options.buildCache, key, () => {
       const tree = prepareTree(source);
       protectBaseline(tree);
       instrumentStartup(tree);
@@ -1606,12 +1618,11 @@ async function main(): Promise<void> {
       const bundle = fs.readFileSync(path.join(tree, 'extension', 'dist', 'extension.js'));
       if (!bundle.toString('utf8').includes('MEASURE_BLOCK_AGENTS'))
         throw new Error('The built extension lacks the agent launch block.');
-      build = {
+      return {
         vsix: path.join(tree, 'extension', 'arc.vsix'),
         artifact: createHash('sha256').update(bundle).digest('hex'),
       };
-      if (options.buildCache) build = saveBuild(options.buildCache, key, build);
-    }
+    });
     run(
       commandLine,
       ['--user-data-dir', USER_DATA, '--extensions-dir', EXTENSIONS, '--install-extension', build.vsix, '--force'],

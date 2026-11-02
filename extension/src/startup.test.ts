@@ -315,13 +315,13 @@ import {
   scratchPeakBytes,
   freeDiskBytes,
   SCRATCH_PEAK_BYTES,
-  cachedBuild,
-  saveBuild,
+  buildKeyOf,
+  preparedBuild,
+  readOptions,
   countCompressed,
   compressedStoreBytes,
   runnerMeasures,
   COMPRESSED_STORES,
-  type BuildKey,
 } from '../scripts/panel-startup-measure/measure';
 import {
   boundsOf,
@@ -329,8 +329,8 @@ import {
   marginsOf,
   measuresOf,
   missingMeasures,
-  runRepetitions,
-  type Side,
+  runComparison,
+  type Repetition,
 } from '../scripts/panel-startup-measure/compare';
 import {
   freezeCatalog,
@@ -942,8 +942,8 @@ test('isolated startup pins source provenance before a moving reference builds',
     diskPreCheck: () => null,
     freeDiskBytes: () => 0,
     scratchPeakBytes: () => 0,
-    cachedBuild: () => null,
-    saveBuild: (_directory: string, _key: unknown, build: unknown) => build,
+    buildKeyOf: (_options: unknown, source: string) => ({ source }),
+    preparedBuild: (_directory: string, _key: unknown, build: () => unknown) => build(),
     loadScrubbedVariables: async () => {},
     fixture: { workspace: 'frozen' },
     editorCommandLine: () => 'code',
@@ -1752,44 +1752,48 @@ function runnerResult(end: Record<string, number> = {}, firstUsableRow = 60_000)
 
 test('repeat builds each side once', async () => {
   const output = tempDir('compare-repeat');
-  const builds: Side[] = [];
+  const manifest = path.join(output, 'manifest.json');
+  fs.writeFileSync(manifest, '{}');
+  const builds: string[] = [];
   const order: string[] = [];
   const discarded: string[] = [];
-  const key = (side: Side): BuildKey => ({ source: side, selection: false, response: false, snapshots: true });
-  const repetitions = await runRepetitions({
-    repeat: 3,
-    buildDirectory: (side) => path.join(output, `${side}-build`),
-    discard: (scratch) => discarded.push(scratch),
-    run: async (side, index, directory) => {
-      order.push(`${side}-${index}`);
-      if (!cachedBuild(directory, key(side))) {
-        builds.push(side);
-        const vsix = path.join(output, `${side}-${index}.vsix`);
-        fs.writeFileSync(vsix, side);
-        saveBuild(directory, key(side), { vsix, artifact: `${side}-artifact` });
-      }
-      const startup = (side === 'baseline' ? 50_000 : 60_000) + [0, 30_000, 10_000][index];
-      return { file: null, scratch: path.join(output, `scratch-${order.length}`), result: runnerResult({}, startup) };
-    },
-  });
+  const warmUntil: string[] = [];
+  // The measure runner of each repetition reads the arguments that the comparison passes, as `measure.ts` reads them.
+  const measure = async (args: string[]): Promise<Repetition> => {
+    const options = readOptions(args);
+    const side = options.commit === 'base' ? 'baseline' : 'candidate';
+    const index = order.filter((name) => name.startsWith(side)).length;
+    order.push(`${side}-${index}`);
+    if (options.warmUntil.length) warmUntil.push(side);
+    preparedBuild(options.buildCache, buildKeyOf(options, side), () => {
+      builds.push(side);
+      const vsix = path.join(output, `${side}-${index}.vsix`);
+      fs.writeFileSync(vsix, side);
+      return { vsix, artifact: `${side}-artifact` };
+    });
+    const startup = (side === 'baseline' ? 50_000 : 60_000) + [0, 30_000, 10_000][index];
+    return { file: null, scratch: path.join(output, `scratch-${order.length}`), result: runnerResult({}, startup) };
+  };
+  const status = await runComparison(
+    [
+      ...['--fixture', manifest, '--baseline', 'base', '--candidate', 'next', '--repeat', '3'],
+      ...['--warm-until', 'stubPending=0', '--output', path.join(output, 'report')],
+    ],
+    { measure, installed: () => null, discard: (scratch) => discarded.push(scratch) },
+  );
+  assert.equal(status, 0);
   assert.deepEqual(builds, ['baseline', 'candidate'], 'a side built more than once');
   assert.deepEqual(order, ['baseline-0', 'candidate-0', 'baseline-1', 'candidate-1', 'baseline-2', 'candidate-2']);
+  assert.deepEqual(warmUntil, ['candidate', 'candidate', 'candidate']);
   // Each repetition deletes the scratch of the one before it, and the last one stays for the report.
   assert.deepEqual(
     discarded,
     [1, 2, 3, 4, 5].map((index) => path.join(output, `scratch-${index}`)),
   );
-  assert.deepEqual(cachedBuild(path.join(output, 'candidate-build'), key('candidate')), {
-    vsix: path.join(output, 'candidate-build', 'arc.vsix'),
-    artifact: 'candidate-artifact',
-  });
-  assert.equal(cachedBuild(path.join(output, 'candidate-build'), { ...key('candidate'), snapshots: false }), null);
   // The gate reads the ratio of the medians.
-  const row = compareResults(
-    repetitions.baseline.map((repetition) => repetition.result),
-    repetitions.candidate.map((repetition) => repetition.result),
-  ).find((measure) => measure.name === 'firstUsableRowMs')!;
-  assert.deepEqual([row.baseline, row.candidate, row.ratio], [60_000, 70_000, 70_000 / 60_000]);
+  const report = JSON.parse(fs.readFileSync(path.join(output, 'report', 'compare.json'), 'utf8'));
+  const row = report.measures.find((measure: { name: string }) => measure.name === 'firstUsableRowMs');
+  assert.deepEqual([report.repeat, row.baseline, row.candidate], [3, 60_000, 70_000]);
 });
 
 test('warm-until ends when the measure reads the value', async () => {
