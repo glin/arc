@@ -311,12 +311,62 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
     return undefined;
   };
 
+  const trimSelectionEnd = (range: Range): Range => {
+    const elementOf = (node: Node): Element | null =>
+      node.nodeType === Node.ELEMENT_NODE ? (node as Element) : node.parentElement;
+    const start = elementOf(range.startContainer)?.closest('.turn:not(.clive), .compaction');
+    const end = elementOf(range.endContainer);
+    if (!start || (end && start.contains(end) && !end.closest('.notesec') && !outsideCommentMarks(end))) {
+      return range;
+    }
+    const trimmed = range.cloneRange();
+    const walk = document.createTreeWalker(
+      range.commonAncestorContainer,
+      NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT,
+    );
+    walk.currentNode = range.endContainer;
+    if (range.endContainer.nodeType === Node.ELEMENT_NODE && range.endOffset > 0) {
+      walk.currentNode = range.endContainer.childNodes[range.endOffset - 1];
+      while (walk.currentNode.lastChild) walk.currentNode = walk.currentNode.lastChild;
+    }
+    for (let node: Node | null = walk.currentNode; node; node = walk.previousNode()) {
+      const media = elementOf(node)?.closest('img, svg, canvas, video');
+      if (media) {
+        const contents = document.createRange();
+        contents.selectNode(media);
+        const box = media.getBoundingClientRect();
+        if (
+          box.width &&
+          box.height &&
+          range.compareBoundaryPoints(Range.START_TO_START, contents) <= 0 &&
+          range.compareBoundaryPoints(Range.END_TO_END, contents) >= 0
+        ) {
+          trimmed.setEndAfter(media);
+          return elementOf(trimmed.endContainer)?.closest('.turn:not(.clive), .compaction') === start ? trimmed : range;
+        }
+      }
+      if (node.nodeType !== Node.TEXT_NODE) continue;
+      const from = node === range.startContainer ? range.startOffset : 0;
+      const to = node === range.endContainer ? range.endOffset : node.textContent!.length;
+      if (range.comparePoint(node, to) < 0) break;
+      const text = node.textContent!.slice(from, to).trimEnd();
+      if (!text.trim()) continue;
+      const contents = document.createRange();
+      contents.setStart(node, from);
+      contents.setEnd(node, from + text.length);
+      if (!contents.getClientRects().length) continue;
+      trimmed.setEnd(node, from + text.length);
+      return elementOf(node)?.closest('.turn:not(.clive), .compaction') === start ? trimmed : range;
+    }
+    return range;
+  };
+
   const selectionHere = (): CommentAnchor | null => {
     const selection = view.getSelection();
     if (!selection || selection.isCollapsed || !selection.rangeCount) {
       return null;
     }
-    const range = selection.getRangeAt(0);
+    const range = trimSelectionEnd(selection.getRangeAt(0));
     const common = range.commonAncestorContainer;
     const node = common.nodeType === Node.ELEMENT_NODE ? (common as Element) : common.parentElement;
     const host = node?.closest<HTMLElement>('.turn:not(.clive), .compaction');
@@ -329,7 +379,7 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
     );
     const at = ends[0] && host.contains(ends[0]) ? ends[0] : node;
     const part = partOfNode(at);
-    const text = quoteOf(node, () => range.cloneContents(), selection.toString());
+    const text = quoteOf(node, () => range.cloneContents(), range.toString());
     const rect = range.getBoundingClientRect();
     if (!text || (!rect.width && !rect.height)) {
       return null;

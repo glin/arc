@@ -14,6 +14,8 @@ Shared panel state keeps comments through repaints, hidden panels, and restored 
 
 `quoteOf` in `webview/comments.ts` serializes selection quotes as Markdown, with fenced code and a plain-text fallback. `offsetOf` supplies the saved offset. `selectionHere` checks endpoints, not intervening nodes. It rejects endpoints in comments, opening-input headings, and ineligible Activity rows.
 
+When the range ends outside the start card or in an excluded region, `selectionHere` tries to move its end back. Non-whitespace text with a client rectangle stops the trim. An `img`, `svg`, `canvas`, or `video` with a non-empty bounding box also stops it. The trimmed end must remain in the start card and pass the endpoint checks. The document selection stays unchanged.
+
 Quote matching lives in `view/comments.ts`. Saved offsets break ties between repeated text. Saving and drawing must count the same card-heading lines. Matches respect word boundaries when a quote starts or ends with a word character.
 
 Prompt, summary, answer blocks, and messages have separate initial search pools. Activity log comments use message ids because filtering changes row positions. If the original part has no match, summary and answer parts search each other, and message parts search other message parts. A comment anchored to an earlier answer stays there while its quote matches, even when the summary repeats it. Unmatched comments remain in the turn's comment list without a text tint.
