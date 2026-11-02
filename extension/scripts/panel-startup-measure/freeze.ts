@@ -6,6 +6,7 @@ import type { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import * as zlib from 'node:zlib';
 import { codexSessionsRoot, readCodexSessionMeta } from '../../src/codex.ts';
+import { zstdFrames } from '../../src/compressedrollouts.ts';
 import { DISPATCH_ID } from '../../src/dispatchreceipts.ts';
 import { turnKey } from '../../src/domain/read.ts';
 import { arcHome } from '../../src/store.ts';
@@ -220,72 +221,6 @@ function zstdCodec() {
   const level = zstd.constants.ZSTD_c_compressionLevel;
   if (!createZstdCompress || !createZstdDecompress || level === undefined) return null;
   return { createZstdCompress, createZstdDecompress, level };
-}
-
-// Read the frame and block headers of a zstd stream without decoding it. The Node decoder ends without an error on a
-// stream cut off inside a frame, so the freezer checks that the stream ends on a frame boundary.
-function zstdFrames() {
-  const ZSTD_MAGIC = 0xfd2fb528;
-  const SKIPPABLE_MAGIC = 0x184d2a50;
-  let state: 'magic' | 'skippable' | 'descriptor' | 'header' | 'block' | 'invalid' = 'magic';
-  let need = 4;
-  let held = Buffer.alloc(0);
-  let skip = 0;
-  let checksum = 0;
-  let frames = 0;
-  const take = (head: Buffer) => {
-    if (state === 'magic') {
-      const magic = head.readUInt32LE(0);
-      if (magic === ZSTD_MAGIC) [state, need] = ['descriptor', 1];
-      else if ((magic & 0xfffffff0) >>> 0 === SKIPPABLE_MAGIC) [state, need] = ['skippable', 4];
-      else state = 'invalid';
-    } else if (state === 'skippable') {
-      [state, need, skip] = ['magic', 4, head.readUInt32LE(0)];
-    } else if (state === 'descriptor') {
-      const descriptor = head[0];
-      const single = (descriptor >> 5) & 1;
-      checksum = (descriptor >> 2) & 1 ? 4 : 0;
-      const header = (single ? 0 : 1) + [0, 1, 2, 4][descriptor & 3] + [single ? 1 : 0, 2, 4, 8][descriptor >> 6];
-      [state, need] = header ? ['header', header] : ['block', 3];
-    } else if (state === 'header') {
-      [state, need] = ['block', 3];
-    } else {
-      const block = head[0] | (head[1] << 8) | (head[2] << 16);
-      const type = (block >> 1) & 3;
-      if (type === 3) {
-        state = 'invalid';
-        return;
-      }
-      skip = type === 1 ? 1 : block >>> 3;
-      if (block & 1) {
-        skip += checksum;
-        [state, need] = ['magic', 4];
-        frames++;
-      }
-    }
-  };
-  return {
-    push(chunk: Buffer) {
-      for (let at = 0; at < chunk.length;) {
-        if (state === 'invalid') return;
-        if (skip) {
-          const step = Math.min(skip, chunk.length - at);
-          skip -= step;
-          at += step;
-          continue;
-        }
-        const step = Math.min(need - held.length, chunk.length - at);
-        held = Buffer.concat([held, chunk.subarray(at, at + step)]);
-        at += step;
-        if (held.length === need) {
-          const head = held;
-          held = Buffer.alloc(0);
-          take(head);
-        }
-      }
-    },
-    complete: () => state === 'magic' && !held.length && !skip && frames > 0,
-  };
 }
 
 // Decode a compressed rollout, rewrite its paths, and encode it again at the Codex level. A rollout that the rewrite
