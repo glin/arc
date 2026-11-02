@@ -128,11 +128,11 @@ Each run holds every [heavy lane lock](development.md#machine-load), so no heavy
 
 `--warm-up` launches the build once with its own profile and the run's Arc store, and waits for startup. The warm-up stays open five and a half minutes after its launch, so the derived cache's routine save runs before the runner closes it. The measured launch then reads the store that the warm-up filled. A warm-up that does not complete ends the run as incomplete. `warmUp` in `result.json` records the warm-up startup.
 
-`--warm-until <measure>=<value>` replaces the fixed hold of the warm-up and implies `--warm-up`. After the warm-up startup, the runner requests a diagnostics snapshot at once and then every 15 seconds. It reads each snapshot through `soakMeasures`. The hold ends when every named measure reads its value in one snapshot. The flag repeats. The run fails when no snapshot reaches the values within 30 minutes of the warm-up launch, or when the warm-up editor fails. `warmUp.hold` in `result.json` records the snapshot count and the measures of the last snapshot.
+`--warm-until <measure>=<value>` extends the hold of the warm-up and implies `--warm-up`. The warm-up first stays open five and a half minutes after its launch, as it does without the flag. Then the runner starts a reading every 15 seconds on a fixed schedule, so a slow reading does not move the next start. A reading joins the `soakMeasures` of a diagnostics snapshot with the measures of `runnerMeasures` in `measure.ts`. The hold ends at the first reading that holds every named value. The flag repeats. The run fails 30 minutes after the warm-up launch, and a reading that returns after that time fails it too. The run also fails when the warm-up editor fails. After the hold ends, the runner takes one more snapshot. `warmUp.hold` in `result.json` records the reading count, the measures of the last reading, and the measures of that snapshot.
 
-Before it builds, the runner reads the free disk of its run directory. It stops unless the free disk is at least twice the peak scratch of one run. `SCRATCH_PEAK_BYTES` in `measure.ts` gives that peak. It is 4 GB when the fixture and the run directory share a volume. It is 16.5 GB when they do not, because the runner then copies the transcripts.
+Before it builds, the runner reads the free disk of its run directory. It stops unless the free disk is at least twice the peak scratch of one run. `SCRATCH_PEAK_BYTES` in `measure.ts` gives that peak. It is 4 GB when the fixture and the run directory share a volume. It is 16.5 GB when they do not, because the runner then copies the transcripts. Both peaks are estimates until a measured repetition replaces them.
 
-`--build-cache <directory>` keeps the packaged build in that directory. A later run with the same source commit and the same overlays installs the kept build and builds nothing.
+`--build-cache <directory>` keeps the packaged build in that directory. The key of a kept build holds the source commit and the overlay flags: selection, response and snapshots. A later run with an equal key installs the kept build and builds nothing. The key does not hold the overlay code, so a kept build keeps its overlays after the runner's overlay code changes.
 
 `--count-compressed <manifest.json>` prints the number of compressed rollouts in the fixture that list as session rows, and launches no editor. It decodes the first record of each rollout in `frozen.compressed.rollouts`. It applies the folder rule and the row exclusions of the Codex session list. Its roots are the roots that the runner counts sessions under: the fixture workspace and the worktrees of its repository. A rollout with a plain `.jsonl` twin does not count, and each session counts once.
 
@@ -164,6 +164,8 @@ A measurement overlay in the built extension saves performance diagnostics when 
 
 The measured extension host logs its process ID with each accepted paint. When the run ends, the runner reads that process's own peak working set on Windows and its peak resident size on Linux. On macOS it samples the resident size every ten seconds and keeps the maximum. `startupRecord` in `result.json` holds the startup history record that the same process wrote, including `firstUsableRow`.
 
+After the measured editor exits, the runner writes a `runner` block in `result.json`. `runnerMeasures` in `measure.ts` owns its measures. `compressedStoreBytes` counts the bytes of `compressed-rollout-openings-v1` in the `cache` directory of the run's Arc home. It adds the bytes of `compressed-rollout-facts-v1` in each workspace directory of that `cache` directory. An absent store reads 0. `compressedTempEntries` counts the top-level names in the system temporary directory that start with `arc-compressed-` and were absent before the measured launch. The comparison reads the `runner` block beside the end snapshot of the soak.
+
 ### Build comparison
 
 `extension/scripts/panel-startup-measure/compare.ts` measures two builds on one fixture:
@@ -178,16 +180,20 @@ Run it from `extension`. Without `--baseline`, it measures the source commit of 
 
 `--repeat <n>` runs the two builds in turn n times, baseline first. Each build happens once, through `--build-cache`, and each run has its own profile, Arc store and run directory. Before each run, the script deletes the run directory of the run before it, unless `--keep` is set. The gate reads the ratio of the medians. A run that fails or times out leaves the comparison incomplete. `--warm-until` passes to the candidate runs only.
 
-`--limit <measure>=<value>` and `--floor <measure>=<value>` bound the candidate in every run. A bounded row compares only with its bound, and never with the baseline. Both flags repeat. A candidate run that lacks a bounded measure, or reports a value that is not finite, leaves the comparison incomplete. The measures that `REPORT_ONLY` in `compare.ts` names appear in the report, and fail only through a bound.
+`--limit <measure>=<value>` and `--floor <measure>=<value>` bound the candidate in every run. A bounded row compares only with its bound, and never with the baseline. Both flags repeat. A candidate run that lacks a bounded measure, or reports a value that is not finite, leaves the comparison incomplete.
+
+`--margin <measure>=<ratio>` sets the ratio of one measure in place of the margin of its class. That row has no floor. The flag repeats. Each run of both sides must report a measure that `--margin` names.
+
+The measures that `REPORT_ONLY` in `compare.ts` names appear in the report and never regress. So do the measures whose names start with `refreshMs:` or `refreshMaxMs:`. A `--limit`, `--floor` or `--margin` that names such a measure gates it.
 
 | Measures | Margin | Floor |
 | --- | --- | --- |
-| Times: first usable row, first pass, `passMs`, refresh time by reason | 1.5 | 1 second |
-| Counts: publications, continuations, dispatched spend visits, root restarts, catalog walks, refreshes by reason | 1.5 | 5 |
+| Times: first usable row, first pass, `passMs` | 1.5 | 1 second |
+| Counts: publications, continuations, dispatched spend visits, root restarts, catalog walks, refreshes by reason other than `compressed-facts` | 1.5 | 5 |
 | Bytes: `readBytes`, `dispatchSpendBytes` | 1.5 | 1 MiB |
 | Peak extension host memory | 1.25 | 64 MiB |
 
-A measure regresses when the candidate exceeds the baseline by more than its margin and by more than its floor. A refresh reason that only the candidate reports compares with zero. Each side must report the measures that `REQUIRED_MEASURES` names. The script exits 1 on a regression. It exits 2 when either run remains incomplete, misses a required or bounded measure, or exits nonzero. It exits 3 when the script itself fails. `MARGINS` and `FLOORS` in `compare.ts` own the values.
+A measure regresses when the candidate exceeds the baseline by more than its margin and by more than its floor. A refresh reason that only the candidate reports compares with zero. Each side must report the measures that `REQUIRED_MEASURES` names. The script exits 1 on a regression. It exits 2 when either run remains incomplete, misses a required, bounded or `--margin` measure, or exits nonzero. It exits 3 when the script itself fails. `MARGINS` and `FLOORS` in `compare.ts` own the values.
 
 ### Session list publication measurement
 
