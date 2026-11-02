@@ -316,12 +316,16 @@ import {
   cachedBuild,
   saveBuild,
   countCompressed,
+  compressedStoreBytes,
+  runnerMeasures,
+  COMPRESSED_STORES,
   type BuildKey,
 } from '../scripts/panel-startup-measure/measure';
 import {
   boundsOf,
   compareResults,
   marginsOf,
+  measuresOf,
   missingMeasures,
   runRepetitions,
   type Side,
@@ -1930,6 +1934,40 @@ test('margin sets one measure ratio without a floor', () => {
   ).find((measure) => measure.name === 'refreshMaxMs:poll')!;
   assert.deepEqual([refresh.reportOnly, refresh.regressed], [false, true]);
   assert.deepEqual(missingMeasures([runnerResult()], {}, { 'refreshMaxMs:poll': 2 }), ['refreshMaxMs:poll']);
+});
+
+test('the runner block counts the bytes of both compressed stores', () => {
+  const home = tempDir('runner-stores');
+  const write = (file: string, bytes: number) => {
+    fs.mkdirSync(path.dirname(path.join(home, file)), { recursive: true });
+    fs.writeFileSync(path.join(home, file), Buffer.alloc(bytes));
+  };
+  assert.equal(compressedStoreBytes(home), 0, 'an absent store read bytes');
+  write(`cache/${COMPRESSED_STORES.openings}/segment-1-a-1`, 10);
+  write(`cache/Workspace-A/${COMPRESSED_STORES.facts}/segment-1-a-1`, 20);
+  write(`cache/Workspace-A/${COMPRESSED_STORES.facts}/shards/shard-1-a-2`, 5);
+  write(`cache/workspace-b/${COMPRESSED_STORES.facts}/epoch`, 7);
+  // Files outside the two stores do not count.
+  write('cache/Workspace-A/derived.json', 100);
+  write('cache/codex-openings.json', 100);
+  write(`${COMPRESSED_STORES.facts}/segment-1-a-1`, 100);
+  assert.equal(compressedStoreBytes(home), 42);
+  const runner = runnerMeasures({ home, tempBefore: new Set(), listTemp: () => [] });
+  assert.deepEqual(runner, { compressedStoreBytes: 42, compressedTempEntries: 0 });
+  const measures = measuresOf({ runner });
+  assert.deepEqual(measures.get('compressedStoreBytes'), { kind: 'bytes', value: 42 });
+});
+
+test('the runner block counts the new compressed Temp names', () => {
+  const home = path.join(tempDir('runner-temp'), 'absent');
+  const listing = ['arc-compressed-old', 'arc-compressed-new-1', 'arc-compressed-new-2.tmp', 'arc-other', 'zstd'];
+  const runner = runnerMeasures({
+    home,
+    tempBefore: new Set(['arc-compressed-old', 'arc-compressed-gone']),
+    listTemp: () => listing,
+  });
+  assert.deepEqual(runner, { compressedStoreBytes: 0, compressedTempEntries: 2 });
+  assert.deepEqual(measuresOf({ runner }).get('compressedTempEntries'), { kind: 'count', value: 2 });
 });
 
 test('pre-check refuses low disk', () => {

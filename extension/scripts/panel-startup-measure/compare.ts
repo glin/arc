@@ -44,6 +44,8 @@ interface RunResult {
   startupRecord?: { stages?: Record<string, number> } | null;
   memory?: { peakWorkingSetBytes?: number | null; sampledMaximumWorkingSetBytes?: number | null };
   soak?: { end?: Record<string, number> | null };
+  // The measures the runner computes from files after the editor exits.
+  runner?: Record<string, number> | null;
 }
 
 const COUNTS = new Set([
@@ -55,7 +57,7 @@ const COUNTS = new Set([
   'catalogWalks',
   'compressedRows',
   'compressedDecodes',
-  'backfillPending',
+  'compressedPending',
   'compressedTempEntries',
 ]);
 const BYTES = new Set(['dispatchSpendBytes', 'readBytes', 'compressedStoreWriteBytes', 'compressedStoreBytes']);
@@ -87,6 +89,7 @@ export function measuresOf(result: RunResult): Map<string, { kind: Kind; value: 
   out.set('firstUsableRowMs', { kind: 'time', value: result.startupRecord?.stages?.firstUsableRow ?? null });
   out.set('firstPassMs', { kind: 'time', value: result.startupRecord?.stages?.completeRender ?? null });
   for (const [name, value] of Object.entries(result.soak?.end ?? {})) out.set(name, { kind: kindOf(name), value });
+  for (const [name, value] of Object.entries(result.runner ?? {})) out.set(name, { kind: kindOf(name), value });
   out.set('peakHostMemoryBytes', {
     kind: 'memory',
     value: result.memory?.peakWorkingSetBytes ?? result.memory?.sampledMaximumWorkingSetBytes ?? null,

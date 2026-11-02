@@ -1222,6 +1222,70 @@ export function saveBuild(directory: string, key: BuildKey, build: Build): Build
   return { vsix, artifact: build.artifact };
 }
 
+// The two compressed rollout stores: the machine store of openings in the cache directory, and the facts store in each
+// workspace directory of the cache.
+export const COMPRESSED_STORES = {
+  openings: 'compressed-rollout-openings-v1',
+  facts: 'compressed-rollout-facts-v1',
+} as const;
+const COMPRESSED_TEMP_PREFIX = 'arc-compressed-';
+
+function directoryBytes(directory: string): number {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(directory, { withFileTypes: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 0;
+    throw error;
+  }
+  let bytes = 0;
+  for (const entry of entries) {
+    const target = path.join(directory, entry.name);
+    if (entry.isDirectory()) bytes += directoryBytes(target);
+    else if (entry.isFile()) bytes += fs.statSync(target).size;
+  }
+  return bytes;
+}
+
+// The bytes of both compressed rollout stores under an Arc home. An absent store reads 0.
+export function compressedStoreBytes(home: string): number {
+  const cache = path.join(home, 'cache');
+  let bytes = directoryBytes(path.join(cache, COMPRESSED_STORES.openings));
+  let workspaces: fs.Dirent[] = [];
+  try {
+    workspaces = fs.readdirSync(cache, { withFileTypes: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  for (const workspace of workspaces)
+    if (workspace.isDirectory() && workspace.name !== COMPRESSED_STORES.openings)
+      bytes += directoryBytes(path.join(cache, workspace.name, COMPRESSED_STORES.facts));
+  return bytes;
+}
+
+// The top-level names in a Temp listing that a compressed rollout reader can leave behind.
+export function compressedTempNames(names: readonly string[]): Set<string> {
+  return new Set(names.filter((name) => name.startsWith(COMPRESSED_TEMP_PREFIX)));
+}
+
+function listTemp(): string[] {
+  return fs.readdirSync(os.tmpdir());
+}
+
+// The measures the runner computes from files under the run's Arc home and from the Temp directory. Every runner
+// measure is added here, and the warm-up hold and the `runner` block of `result.json` both read this map.
+export function runnerMeasures(input: {
+  home: string;
+  tempBefore: ReadonlySet<string>;
+  listTemp?: () => string[];
+}): Record<string, number> {
+  const after = compressedTempNames((input.listTemp ?? listTemp)());
+  return {
+    compressedStoreBytes: compressedStoreBytes(input.home),
+    compressedTempEntries: [...after].filter((name) => !input.tempBefore.has(name)).length,
+  };
+}
+
 // Count the compressed rollouts of a fixture that would list as session rows. The roots are those of `sessionCount`.
 // A `.jsonl` twin excludes its compressed copy, and the count holds each session key once.
 export async function countCompressed(input: {
@@ -1298,6 +1362,7 @@ async function measure(commandLine: string, workspace: string, options: Options)
     }
     await awaitMachine(options.minimumFreeGb, 10 * 60_000);
     const memory = new MemoryWatch();
+    const tempBefore = compressedTempNames(listTemp());
     const launchedAt = Date.now();
     const launch = launchEditor(commandLine, workspace);
     const sampler =
@@ -1338,6 +1403,7 @@ async function measure(commandLine: string, workspace: string, options: Options)
       observation.end('execution');
       observation.begin('cleanup');
       stopEditor();
+      runRecord.runner = runnerMeasures({ home: ARC_STORE, tempBefore });
       runRecord.startupRecord = measuredStartupRecord(path.join(ARC_STORE, 'startup'), memory.pid);
       observation.end('cleanup', { descendants: 'unobserved' });
     }
