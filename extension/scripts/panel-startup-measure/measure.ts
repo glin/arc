@@ -19,6 +19,7 @@ import {
 } from './soak';
 import {
   CODEX_OPENING_BYTES,
+  ROLLOUT_NAME,
   codexRowAdmitted,
   codexSessionFiles,
   codexSessionsRoot,
@@ -1320,7 +1321,8 @@ export function runnerMeasures(input: {
 }
 
 // Count the compressed rollouts of a fixture that would list as session rows. The roots are those of `sessionCount`.
-// A `.jsonl` twin excludes its compressed copy, and the count holds each session key once.
+// A `.jsonl` twin excludes its compressed copy, and the count holds each session key once. A rollout without an id in
+// its first record takes the id of its file name, as `codexSessionFiles` keys it.
 export async function countCompressed(input: {
   workspace: string;
   codex: string;
@@ -1330,10 +1332,12 @@ export async function countCompressed(input: {
   const keys = new Set<string>();
   for (const entry of input.rollouts) {
     const file = path.join(input.codex, path.relative('codex', entry.file));
-    if (!isCompressedRollout(file) || fs.existsSync(file.slice(0, -'.zst'.length))) continue;
+    const plain = file.slice(0, -'.zst'.length);
+    if (!isCompressedRollout(file) || fs.existsSync(plain)) continue;
     const meta = openingRecordOf(await readCompressedFirstRecord(file, CODEX_OPENING_BYTES));
     if (!meta || !codexRowAdmitted(meta, readRolloutStat(file), inFolders)) continue;
-    keys.add(meta.sessionId || path.basename(file, '.jsonl.zst'));
+    const named = ROLLOUT_NAME.exec(path.basename(plain));
+    keys.add(meta.sessionId || (named ? named[1] : path.basename(plain, '.jsonl')));
   }
   return keys.size;
 }

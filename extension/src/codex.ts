@@ -621,7 +621,7 @@ function codexReplayBoundaryAt(
 
 // The thread id at the end of `rollout-<ISO8601>-<uuid>.jsonl`, for a file whose opening
 // record did not name one.
-const ROLLOUT_NAME = /-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i;
+export const ROLLOUT_NAME = /-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i;
 
 // List every rollout under `root` within `WALK_DEPTH`.
 // Directory dates describe session starts, not their latest activity. Do not prune resumed sessions by those dates.

@@ -1882,9 +1882,12 @@ test.skipIf(!rolloutCompression.zstdCompressSync)('count-compressed uses the ses
     rollout('01', id(3), outside),
     rollout('01', id(4), worktree, {}, true),
     rollout('01', id(5), repository, { thread_source: 'guardian_review' }),
+    // A first record without an id keys the session by the id in its name, so two dated names count once.
+    rollout('03', id(7), repository, { id: undefined }),
+    rollout('04', id(7), repository, { id: undefined }),
   ];
   const count = await countCompressed({ workspace: repository, codex, rollouts });
-  assert.equal(count, process.platform === 'win32' ? 3 : 2);
+  assert.equal(count, process.platform === 'win32' ? 4 : 3);
   // The worktree session counts from the main checkout, as `sessionCount` lists it.
   assert.equal(await countCompressed({ workspace: repository, codex, rollouts: [rollouts[1]] }), 1);
 });
