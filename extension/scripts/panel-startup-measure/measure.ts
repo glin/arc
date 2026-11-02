@@ -17,13 +17,22 @@ import {
   startDispatch,
   type HostMemory,
 } from './soak';
-import { codexSessionFiles, codexSessionsRoot } from '../../src/codex.ts';
+import {
+  CODEX_OPENING_BYTES,
+  codexRowAdmitted,
+  codexSessionFiles,
+  codexSessionsRoot,
+  openingRecordOf,
+  readRolloutStat,
+} from '../../src/codex.ts';
+import { isCompressedRollout, readCompressedFirstRecord } from '../../src/compressedrollouts.ts';
 import { DIAGNOSTICS_LOG_DIRECTORY } from '../../src/diagnosticslog.ts';
 import type { StartupMilestone } from '../../src/performancediagnostics.ts';
 import { parseWorktreeRoots } from '../../src/repositoryscope.ts';
 import { arcHome } from '../../src/store.ts';
 import {
   discoverClaudeChildSessionFiles,
+  folderMatcher,
   normalizeFsPath,
   projectsRoot,
   scanForHumanPrompt,
@@ -54,6 +63,8 @@ let selectionRequested = false;
 let responseRequested = false;
 let expectedSelection: { session: string; key?: string; prompt?: string; summary?: string } | null = null;
 let soakRequested = false;
+// A warm-up hold reads its measures through the soak overlay.
+let warmUntilRequested = false;
 // The variables that the isolated editor driver keeps from the editor, loaded at startup.
 let scrubbedVariables = /$^/;
 const SOAK = path.join(SCRATCH, 'soak');
@@ -77,7 +88,7 @@ function isolatedEnvironment(run: string = MEASUREMENT_RUN): NodeJS.ProcessEnv {
     ARC_MEASURE_BLOCK_AGENTS: '1',
     ARC_MEASURE_RUN: run,
     ...(selectionRequested ? { ARC_MEASURE_TRACE: path.join(SCRATCH, 'selection-trace') } : {}),
-    ...(soakRequested ? { ARC_MEASURE_SOAK: SOAK } : {}),
+    ...(soakRequested || warmUntilRequested ? { ARC_MEASURE_SOAK: SOAK } : {}),
   };
 }
 const WARM_USER_DATA = path.join(SCRATCH, 'warm-user-data');
@@ -97,7 +108,15 @@ interface Options {
   response: boolean;
   soakMinutes: number;
   warmUp: boolean;
+  warmUntil: WarmCondition[];
+  buildCache: string | null;
+  countCompressed: string | null;
   minimumFreeGb: number;
+}
+
+export interface WarmCondition {
+  measure: string;
+  value: number;
 }
 
 interface LogLine {
@@ -155,6 +174,9 @@ function readOptions(argv: string[]): Options {
     response: false,
     soakMinutes: 0,
     warmUp: false,
+    warmUntil: [],
+    buildCache: null,
+    countCompressed: null,
     // 1.5 times the largest extension host peak working set that saved measurements record.
     minimumFreeGb: 5.4,
   };
@@ -194,6 +216,15 @@ function readOptions(argv: string[]): Options {
       options.soakMinutes = Number(value);
     } else if (flag === '--min-free-gb') {
       options.minimumFreeGb = Number(value);
+    } else if (flag === '--warm-until') {
+      const match = /^([^=]+)=(.+)$/.exec(value);
+      if (!match || !Number.isFinite(Number(match[2]))) stop('--warm-until takes <measure>=<number>.');
+      options.warmUntil.push({ measure: match[1], value: Number(match[2]) });
+      options.warmUp = true;
+    } else if (flag === '--build-cache') {
+      options.buildCache = path.resolve(value);
+    } else if (flag === '--count-compressed') {
+      options.countCompressed = path.resolve(value);
     } else {
       stop(`Unknown option ${flag}.`);
     }
@@ -202,6 +233,7 @@ function readOptions(argv: string[]): Options {
   if (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0) {
     stop('--timeout takes a number of seconds.');
   }
+  if (options.countCompressed) return options;
   if (!options.fixture) stop('--fixture requires a frozen input manifest.');
   if (!Number.isFinite(options.soakMinutes) || options.soakMinutes < 0) stop('--soak takes a number of minutes.');
   if (!Number.isFinite(options.minimumFreeGb) || options.minimumFreeGb < 0)
@@ -358,6 +390,7 @@ function seedProfile(): void {
     linkTree(fixture.codex, SOAK_CODEX);
     fs.mkdirSync(SOAK, { recursive: true });
   }
+  if (warmUntilRequested) fs.mkdirSync(SOAK, { recursive: true });
   for (const profile of [USER_DATA, WARM_USER_DATA]) {
     fs.mkdirSync(path.join(profile, 'User'), { recursive: true });
     fs.writeFileSync(
@@ -1083,6 +1116,131 @@ async function soak(minutes: number, launch: Launch): Promise<{ complete: boolea
 // `panelhost.ts` sets. The warm-up stays open past that point, so its store holds what it learned.
 const WARM_UP_OPEN_MS = 5.5 * 60_000;
 
+// A `--warm-until` hold reads its measures at this interval, and fails the run this long after the warm-up launch.
+export const WARM_UNTIL_INTERVAL_MS = 15_000;
+export const WARM_UNTIL_CAP_MS = 30 * 60_000;
+
+export interface WarmHold {
+  reached: boolean;
+  samples: number;
+  measures: Record<string, number> | null;
+  note: string | null;
+}
+
+// Read the measures at once and then every interval, until every condition holds in one snapshot. A snapshot that
+// fails to arrive counts as a read that holds no condition.
+export async function holdUntil(options: {
+  conditions: WarmCondition[];
+  launchedAt: number;
+  sample: (index: number) => Promise<Record<string, number> | null>;
+  failure?: () => string | null;
+  now?: () => number;
+  wait?: (ms: number) => Promise<void>;
+}): Promise<WarmHold> {
+  const now = options.now ?? Date.now;
+  const wait = options.wait ?? delay;
+  const deadline = options.launchedAt + WARM_UNTIL_CAP_MS;
+  let measures: Record<string, number> | null = null;
+  for (let index = 1; ; index++) {
+    const failure = options.failure?.() ?? null;
+    if (failure) return { reached: false, samples: index - 1, measures, note: failure };
+    measures = await options.sample(index);
+    const read = measures;
+    if (read && options.conditions.every((condition) => read[condition.measure] === condition.value))
+      return { reached: true, samples: index, measures, note: null };
+    const left = deadline - now();
+    if (left <= 0) {
+      const wanted = options.conditions.map((condition) => `${condition.measure}=${condition.value}`).join(', ');
+      const last = options.conditions
+        .map((condition) => `${condition.measure} read ${read?.[condition.measure] ?? 'nothing'}`)
+        .join(', ');
+      return {
+        reached: false,
+        samples: index,
+        measures,
+        note: `The warm-up did not reach ${wanted} within ${WARM_UNTIL_CAP_MS / 60_000} min of its launch: ${last}.`,
+      };
+    }
+    await wait(Math.min(WARM_UNTIL_INTERVAL_MS, left));
+  }
+}
+
+// The peak scratch disk of one repetition: the fixture tree hard-linked under the scratch directory, or copied when the
+// two sit on different volumes.
+export const SCRATCH_PEAK_BYTES = { linked: 4 * 1024 ** 3, copied: 16.5 * 1024 ** 3 } as const;
+
+export function scratchPeakBytes(source: string, scratch: string): number {
+  return fs.statSync(source).dev === fs.statSync(scratch).dev ? SCRATCH_PEAK_BYTES.linked : SCRATCH_PEAK_BYTES.copied;
+}
+
+export function freeDiskBytes(directory: string): number {
+  const volume = fs.statfsSync(directory);
+  return volume.bavail * volume.bsize;
+}
+
+// A repetition starts only with free disk of at least twice its peak scratch.
+export function diskPreCheck(freeBytes: number, peakBytes: number): string | null {
+  if (freeBytes >= 2 * peakBytes) return null;
+  const gb = (bytes: number) => (bytes / 1024 ** 3).toFixed(1);
+  return `Free disk is ${gb(freeBytes)} GB, under twice the ${gb(peakBytes)} GB peak scratch of one repetition.`;
+}
+
+export interface BuildKey {
+  source: string;
+  selection: boolean;
+  response: boolean;
+  snapshots: boolean;
+}
+
+export interface Build {
+  vsix: string;
+  artifact: string;
+}
+
+// A build directory holds one packaged build and the key it was built for. A repetition with an equal key installs it
+// and builds nothing.
+export function cachedBuild(directory: string, key: BuildKey): Build | null {
+  try {
+    const saved = JSON.parse(fs.readFileSync(path.join(directory, 'build.json'), 'utf8')) as {
+      key?: BuildKey;
+      artifact?: string;
+    };
+    const vsix = path.join(directory, 'arc.vsix');
+    if (JSON.stringify(saved.key) !== JSON.stringify(key) || typeof saved.artifact !== 'string' || !fs.existsSync(vsix))
+      return null;
+    return { vsix, artifact: saved.artifact };
+  } catch {
+    return null;
+  }
+}
+
+export function saveBuild(directory: string, key: BuildKey, build: Build): Build {
+  fs.mkdirSync(directory, { recursive: true });
+  const vsix = path.join(directory, 'arc.vsix');
+  fs.copyFileSync(build.vsix, vsix);
+  fs.writeFileSync(path.join(directory, 'build.json'), JSON.stringify({ key, artifact: build.artifact }));
+  return { vsix, artifact: build.artifact };
+}
+
+// Count the compressed rollouts of a fixture that would list as session rows. The roots are those of `sessionCount`.
+// A `.jsonl` twin excludes its compressed copy, and the count holds each session key once.
+export async function countCompressed(input: {
+  workspace: string;
+  codex: string;
+  rollouts: ReadonlyArray<{ file: string }>;
+}): Promise<number> {
+  const inFolders = folderMatcher(repositoryRoots(input.workspace));
+  const keys = new Set<string>();
+  for (const entry of input.rollouts) {
+    const file = path.join(input.codex, path.relative('codex', entry.file));
+    if (!isCompressedRollout(file) || fs.existsSync(file.slice(0, -'.zst'.length))) continue;
+    const meta = openingRecordOf(await readCompressedFirstRecord(file, CODEX_OPENING_BYTES));
+    if (!meta || !codexRowAdmitted(meta, readRolloutStat(file), inFolders)) continue;
+    keys.add(meta.sessionId || path.basename(file, '.jsonl.zst'));
+  }
+  return keys.size;
+}
+
 // Wait for every startup milestone by the measurement deadline.
 // Selection runs also measure session switching. A soak keeps the editor open afterwards.
 // Editor failure or timeout ends an incomplete run.
@@ -1116,9 +1274,24 @@ async function measure(commandLine: string, workspace: string, options: Options)
         };
         // A failed warm-up leaves a partly filled store, which no comparison may treat as warm.
         if (!warm.complete) return { ...warm, complete: false, note: `The warm-up launch failed. ${warm.note ?? ''}` };
-        while (Date.now() < warmAt + WARM_UP_OPEN_MS && warmLaunch.failure === null)
-          await delay(Math.min(5_000, warmAt + WARM_UP_OPEN_MS - Date.now()));
-        (runRecord.warmUp as { openMs: number | null }).openMs = Date.now() - warmAt;
+        if (options.warmUntil.length) {
+          const hold = await holdUntil({
+            conditions: options.warmUntil,
+            launchedAt: warmAt,
+            sample: async (index) => {
+              const snapshot = await requestSnapshot(`warm-${String(index).padStart(3, '0')}`, 120_000);
+              return snapshot ? soakMeasures(snapshot) : null;
+            },
+            failure: () => warmLaunch.failure,
+          });
+          Object.assign(runRecord.warmUp as object, { until: options.warmUntil, hold });
+          (runRecord.warmUp as { openMs: number | null }).openMs = Date.now() - warmAt;
+          if (!hold.reached) return { ...warm, complete: false, note: `The warm-up hold failed. ${hold.note ?? ''}` };
+        } else {
+          while (Date.now() < warmAt + WARM_UP_OPEN_MS && warmLaunch.failure === null)
+            await delay(Math.min(5_000, warmAt + WARM_UP_OPEN_MS - Date.now()));
+          (runRecord.warmUp as { openMs: number | null }).openMs = Date.now() - warmAt;
+        }
       } finally {
         stopEditor(WARM_USER_DATA);
       }
@@ -1277,47 +1450,68 @@ async function loadScrubbedVariables(): Promise<void> {
 
 async function main(): Promise<void> {
   const options = readOptions(process.argv.slice(2));
+  if (options.countCompressed) {
+    const root = path.dirname(fs.realpathSync(options.countCompressed));
+    const raw = JSON.parse(fs.readFileSync(options.countCompressed, 'utf8'));
+    const paths = frozenFixturePaths(root, raw, liveDirectories(root));
+    const count = await countCompressed({
+      workspace: paths.workspace,
+      codex: paths.codex,
+      rollouts: raw.frozen?.compressed?.rollouts ?? [],
+    });
+    fs.rmdirSync(SCRATCH);
+    process.stdout.write(`Compressed rows: ${count}\n`);
+    return;
+  }
   selectionRequested = options.selection;
   soakRequested = options.soakMinutes > 0;
   responseRequested = options.response;
+  warmUntilRequested = options.warmUntil.length > 0;
   await loadScrubbedVariables();
   loadFixture(options.fixture);
   options.workspace = fixture.workspace;
+  const disk = diskPreCheck(freeDiskBytes(SCRATCH), scratchPeakBytes(fixture.codex, SCRATCH));
+  if (disk) stop(disk);
   const commandLine = editorCommandLine();
   for (const directory of [SCRATCH, USER_DATA, EXTENSIONS, ARC_STORE]) {
     fs.mkdirSync(directory, { recursive: true });
   }
   try {
     const source = git(['rev-parse', options.commit ?? 'HEAD']);
-    const tree = prepareTree(source);
-    protectBaseline(tree);
-    instrumentStartup(tree);
-    if (selectionRequested) instrumentSelection(tree);
-    if (responseRequested) instrumentResponse(tree);
-    if (soakRequested) instrumentSoak(tree);
     const label = git(['rev-parse', '--short', source]);
-    npm(['run', 'build'], path.join(tree, 'extension'));
-    npm(['run', 'package'], path.join(tree, 'extension'));
+    const key: BuildKey = {
+      source,
+      selection: selectionRequested,
+      response: responseRequested,
+      snapshots: soakRequested || warmUntilRequested,
+    };
+    let build = options.buildCache ? cachedBuild(options.buildCache, key) : null;
+    if (!build) {
+      const tree = prepareTree(source);
+      protectBaseline(tree);
+      instrumentStartup(tree);
+      if (selectionRequested) instrumentSelection(tree);
+      if (responseRequested) instrumentResponse(tree);
+      if (key.snapshots) instrumentSoak(tree);
+      npm(['run', 'build'], path.join(tree, 'extension'));
+      npm(['run', 'package'], path.join(tree, 'extension'));
+      const bundle = fs.readFileSync(path.join(tree, 'extension', 'dist', 'extension.js'));
+      if (!bundle.toString('utf8').includes('MEASURE_BLOCK_AGENTS'))
+        throw new Error('The built extension lacks the agent launch block.');
+      build = {
+        vsix: path.join(tree, 'extension', 'arc.vsix'),
+        artifact: createHash('sha256').update(bundle).digest('hex'),
+      };
+      if (options.buildCache) build = saveBuild(options.buildCache, key, build);
+    }
     run(
       commandLine,
-      [
-        '--user-data-dir',
-        USER_DATA,
-        '--extensions-dir',
-        EXTENSIONS,
-        '--install-extension',
-        path.join(tree, 'extension', 'arc.vsix'),
-        '--force',
-      ],
+      ['--user-data-dir', USER_DATA, '--extensions-dir', EXTENSIONS, '--install-extension', build.vsix, '--force'],
       SCRATCH,
       isolatedEnvironment(),
     );
     seedProfile();
-    const artifact = createHash('sha256')
-      .update(fs.readFileSync(path.join(tree, 'extension', 'dist', 'extension.js')))
-      .digest('hex');
-    if (!fs.readFileSync(path.join(tree, 'extension', 'dist', 'extension.js'), 'utf8').includes('MEASURE_BLOCK_AGENTS'))
-      throw new Error('The built extension lacks the agent launch block.');
+    const artifact = build.artifact;
     fs.writeFileSync(
       path.join(SCRATCH, 'artifact.json'),
       JSON.stringify({
@@ -1334,7 +1528,7 @@ async function main(): Promise<void> {
                 .digest('hex'),
             }
           : {}),
-        ...(soakRequested
+        ...(key.snapshots
           ? {
               soakOverlaySha256: createHash('sha256')
                 .update(fs.readFileSync(path.join(__dirname, 'soak.ts')))
@@ -1342,6 +1536,8 @@ async function main(): Promise<void> {
             }
           : {}),
         warmUp: options.warmUp,
+        warmUntil: options.warmUntil,
+        buildCache: options.buildCache,
         route: 'created',
         settings: { detailedLog: true },
         cacheStore: ARC_STORE,

@@ -128,6 +128,14 @@ Each run holds every [heavy lane lock](development.md#machine-load), so no heavy
 
 `--warm-up` launches the build once with its own profile and the run's Arc store, and waits for startup. The warm-up stays open five and a half minutes after its launch, so the derived cache's routine save runs before the runner closes it. The measured launch then reads the store that the warm-up filled. A warm-up that does not complete ends the run as incomplete. `warmUp` in `result.json` records the warm-up startup.
 
+`--warm-until <measure>=<value>` replaces the fixed hold of the warm-up and implies `--warm-up`. After the warm-up startup, the runner requests a diagnostics snapshot at once and then every 15 seconds. It reads each snapshot through `soakMeasures`. The hold ends when every named measure reads its value in one snapshot. The flag repeats. The run fails when no snapshot reaches the values within 30 minutes of the warm-up launch, or when the warm-up editor fails. `warmUp.hold` in `result.json` records the snapshot count and the measures of the last snapshot.
+
+Before it builds, the runner reads the free disk of its run directory. It stops unless the free disk is at least twice the peak scratch of one run. `SCRATCH_PEAK_BYTES` in `measure.ts` gives that peak. It is 4 GB when the fixture and the run directory share a volume. It is 16.5 GB when they do not, because the runner then copies the transcripts.
+
+`--build-cache <directory>` keeps the packaged build in that directory. A later run with the same source commit and the same overlays installs the kept build and builds nothing.
+
+`--count-compressed <manifest.json>` prints the number of compressed rollouts in the fixture that list as session rows, and launches no editor. It decodes the first record of each rollout in `frozen.compressed.rollouts`. It applies the folder rule and the row exclusions of the Codex session list. Its roots are the roots that the runner counts sessions under: the fixture workspace and the worktrees of its repository. A rollout with a plain `.jsonl` twin does not count, and each session counts once.
+
 ### Frozen catalog fixture
 
 `extension/scripts/panel-startup-measure/freeze.ts` copies one workspace's catalog into a fixture. Run it from `extension`:
@@ -152,7 +160,7 @@ A copy gives each receipt file a new device and inode number. The receipt reader
 
 At the start of the soak, the runner adds a Claude parent session whose shell call launched `codex exec --json`, and the Codex child rollout it names. Every 30 seconds the runner appends one completed child turn with 256 KiB of reasoning text and growing token totals. The appends keep their own schedule while the runner waits for a snapshot, so a slow build receives the same work. No agent process runs, and no dispatch receipt exists.
 
-A measurement overlay in the built extension saves performance diagnostics when the runner leaves a request file in the run's `soak` directory. The overlay reads that directory once a second. The runner requests a snapshot at the start, every minute, and at the end. `soakMeasures` in `extension/scripts/panel-startup-measure/soak.ts` owns the counters that `result.json` keeps from each snapshot. A soak is incomplete when it appends fewer turns than it scheduled, or when its end snapshot lacks a counter that `REQUIRED_DISCOVERY_MEASURES` names.
+A measurement overlay in the built extension saves performance diagnostics when the runner leaves a request file in the run's `soak` directory. The overlay reads that directory once a second. The runner requests a snapshot at the start, every minute, and at the end. `soakMeasures` in `extension/scripts/panel-startup-measure/soak.ts` owns the counters that `result.json` keeps from each snapshot. It copies every gauge by its name, `loopDelay` as `loopDelayMaxMs` and `loopDelayP99Ms`, and the longest refresh of each reason as `refreshMaxMs:<reason>`. A counter that `NAMED_COUNTERS` names reads 0 when the build never counted it. A soak is incomplete when it appends fewer turns than it scheduled, or when its end snapshot lacks a counter that `REQUIRED_DISCOVERY_MEASURES` names.
 
 The measured extension host logs its process ID with each accepted paint. When the run ends, the runner reads that process's own peak working set on Windows and its peak resident size on Linux. On macOS it samples the resident size every ten seconds and keeps the maximum. `startupRecord` in `result.json` holds the startup history record that the same process wrote, including `firstUsableRow`.
 
@@ -168,6 +176,10 @@ Run it from `extension`. Without `--baseline`, it measures the source commit of 
 
 `compare.json` and `compare.md` go to `--output <directory>` or to a new directory under the system temporary directory. They name the installed build, the fixture identity, and each measure with its ratio of candidate to baseline. The first usable row and the first pass come from each host's startup history record, so both sides share the host's clock origin. `CLAUDE.md` names the changes that land only with this report. `--results <baseline.json> <candidate.json>` compares two saved runner results without launching an editor.
 
+`--repeat <n>` runs the two builds in turn n times, baseline first. Each build happens once, through `--build-cache`, and each run has its own profile, Arc store and run directory. Before each run, the script deletes the run directory of the run before it, unless `--keep` is set. The gate reads the ratio of the medians. A run that fails or times out leaves the comparison incomplete. `--warm-until` passes to the candidate runs only.
+
+`--limit <measure>=<value>` and `--floor <measure>=<value>` bound the candidate in every run. A bounded row compares only with its bound, and never with the baseline. Both flags repeat. A candidate run that lacks a bounded measure, or reports a value that is not finite, leaves the comparison incomplete. The measures that `REPORT_ONLY` in `compare.ts` names appear in the report, and fail only through a bound.
+
 | Measures | Margin | Floor |
 | --- | --- | --- |
 | Times: first usable row, first pass, `passMs`, refresh time by reason | 1.5 | 1 second |
@@ -175,7 +187,7 @@ Run it from `extension`. Without `--baseline`, it measures the source commit of 
 | Bytes: `readBytes`, `dispatchSpendBytes` | 1.5 | 1 MiB |
 | Peak extension host memory | 1.25 | 64 MiB |
 
-A measure regresses when the candidate exceeds the baseline by more than its margin and by more than its floor. A refresh reason that only the candidate reports compares with zero. Each side must report the measures that `REQUIRED_MEASURES` names. The script exits 1 on a regression. It exits 2 when either run remains incomplete, misses a required measure, or exits nonzero. It exits 3 when the script itself fails. `MARGINS` and `FLOORS` in `compare.ts` own the values.
+A measure regresses when the candidate exceeds the baseline by more than its margin and by more than its floor. A refresh reason that only the candidate reports compares with zero. Each side must report the measures that `REQUIRED_MEASURES` names. The script exits 1 on a regression. It exits 2 when either run remains incomplete, misses a required or bounded measure, or exits nonzero. It exits 3 when the script itself fails. `MARGINS` and `FLOORS` in `compare.ts` own the values.
 
 ### Session list publication measurement
 

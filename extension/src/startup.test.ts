@@ -306,7 +306,25 @@ import {
   instrumentStartup,
   pollStartup,
   liveDirectories,
+  holdUntil,
+  WARM_UNTIL_CAP_MS,
+  WARM_UNTIL_INTERVAL_MS,
+  diskPreCheck,
+  scratchPeakBytes,
+  freeDiskBytes,
+  SCRATCH_PEAK_BYTES,
+  cachedBuild,
+  saveBuild,
+  countCompressed,
+  type BuildKey,
 } from '../scripts/panel-startup-measure/measure';
+import {
+  boundsOf,
+  compareResults,
+  missingMeasures,
+  runRepetitions,
+  type Side,
+} from '../scripts/panel-startup-measure/compare';
 import {
   freezeCatalog,
   pathRewriter,
@@ -911,8 +929,13 @@ test('isolated startup pins source provenance before a moving reference builds',
   const resolved: string[] = [];
   let artifact: any;
   const deps = {
-    readOptions: () => ({ fixture: 'manifest', commit: 'topic', keep: true }),
+    readOptions: () => ({ fixture: 'manifest', commit: 'topic', keep: true, warmUntil: [], buildCache: null }),
     loadFixture() {},
+    diskPreCheck: () => null,
+    freeDiskBytes: () => 0,
+    scratchPeakBytes: () => 0,
+    cachedBuild: () => null,
+    saveBuild: (_directory: string, _key: unknown, build: unknown) => build,
     loadScrubbedVariables: async () => {},
     fixture: { workspace: 'frozen' },
     editorCommandLine: () => 'code',
@@ -1586,7 +1609,18 @@ test('a soak dispatch reads as a dispatched Codex child of a workspace parent', 
 test('soak measures read the counters a saved diagnostics snapshot carries', () => {
   const counters = new PanelPerformanceCounters();
   counters.recordRefresh('poll', 40);
+  counters.recordRefresh('poll', 90);
+  counters.recordGauge('compressedRows', 7);
   const measures = soakMeasures({ counters: counters.snapshot() as any });
+  assert.equal(measures['refreshMaxMs:poll'], 90);
+  assert.equal(measures.compressedRows, 7);
+  // A named counter that no operation counted reads 0, so a build that never counts it still reports it.
+  assert.equal(measures.compressedDecodes, 0);
+  assert.equal(measures.catalogWalks, 0);
+  assert.deepEqual(
+    soakMeasures({ counters: { work: { compressedDecodes: 2 }, loopDelay: { maxMs: 120, p99Ms: 30 } } }),
+    { compressedDecodes: 2, catalogWalks: 0, loopDelayMaxMs: 120, loopDelayP99Ms: 30 },
+  );
   for (const name of [
     'publications',
     'partialPublications',
@@ -1665,6 +1699,211 @@ test('the build comparison fails past a margin and passes within it', () => {
     baseline: [],
     candidate: ['peakHostMemoryBytes'],
   });
+});
+
+// A runner result whose soak end snapshot holds every required discovery measure and the given extra ones.
+function runnerResult(end: Record<string, number> = {}, firstUsableRow = 60_000) {
+  return {
+    complete: true,
+    startupRecord: { stages: { firstUsableRow, completeRender: firstUsableRow + 1000 } },
+    memory: { peakWorkingSetBytes: 800 * 1024 ** 2 },
+    soak: {
+      end: {
+        continuations: 12,
+        publications: 3,
+        passMs: 900,
+        readBytes: 1024,
+        dispatchSpendVisits: 4,
+        dispatchSpendBytes: 0,
+        ...end,
+      },
+    },
+  };
+}
+
+test('repeat builds each side once', async () => {
+  const output = tempDir('compare-repeat');
+  const builds: Side[] = [];
+  const order: string[] = [];
+  const discarded: string[] = [];
+  const key = (side: Side): BuildKey => ({ source: side, selection: false, response: false, snapshots: true });
+  const repetitions = await runRepetitions({
+    repeat: 3,
+    buildDirectory: (side) => path.join(output, `${side}-build`),
+    discard: (scratch) => discarded.push(scratch),
+    run: async (side, index, directory) => {
+      order.push(`${side}-${index}`);
+      if (!cachedBuild(directory, key(side))) {
+        builds.push(side);
+        const vsix = path.join(output, `${side}-${index}.vsix`);
+        fs.writeFileSync(vsix, side);
+        saveBuild(directory, key(side), { vsix, artifact: `${side}-artifact` });
+      }
+      const startup = (side === 'baseline' ? 50_000 : 60_000) + [0, 30_000, 10_000][index];
+      return { file: null, scratch: path.join(output, `scratch-${order.length}`), result: runnerResult({}, startup) };
+    },
+  });
+  assert.deepEqual(builds, ['baseline', 'candidate'], 'a side built more than once');
+  assert.deepEqual(order, ['baseline-0', 'candidate-0', 'baseline-1', 'candidate-1', 'baseline-2', 'candidate-2']);
+  // Each repetition deletes the scratch of the one before it, and the last one stays for the report.
+  assert.deepEqual(
+    discarded,
+    [1, 2, 3, 4, 5].map((index) => path.join(output, `scratch-${index}`)),
+  );
+  assert.deepEqual(cachedBuild(path.join(output, 'candidate-build'), key('candidate')), {
+    vsix: path.join(output, 'candidate-build', 'arc.vsix'),
+    artifact: 'candidate-artifact',
+  });
+  assert.equal(cachedBuild(path.join(output, 'candidate-build'), { ...key('candidate'), snapshots: false }), null);
+  // The gate reads the ratio of the medians.
+  const row = compareResults(
+    repetitions.baseline.map((repetition) => repetition.result),
+    repetitions.candidate.map((repetition) => repetition.result),
+  ).find((measure) => measure.name === 'firstUsableRowMs')!;
+  assert.deepEqual([row.baseline, row.candidate, row.ratio], [60_000, 70_000, 70_000 / 60_000]);
+});
+
+test('warm-until holds until the measure reads its value', async () => {
+  let clock = 1_000_000;
+  const waits: number[] = [];
+  const wait = async (ms: number) => {
+    waits.push(ms);
+    clock += ms;
+  };
+  const pending = (value: number) => ({ measure: 'backfillPending', value });
+  const reads: Array<Record<string, number> | null> = [{ backfillPending: 3 }, null, { backfillPending: 1 }];
+  const reached = await holdUntil({
+    conditions: [pending(0)],
+    launchedAt: clock - 60_000,
+    sample: async () => (reads.length ? reads.shift()! : { backfillPending: 0 }),
+    now: () => clock,
+    wait,
+  });
+  assert.deepEqual(reached, { reached: true, samples: 4, measures: { backfillPending: 0 }, note: null });
+  assert.deepEqual(waits, [WARM_UNTIL_INTERVAL_MS, WARM_UNTIL_INTERVAL_MS, WARM_UNTIL_INTERVAL_MS]);
+  // A repeated flag holds until every measure reads its value in one snapshot.
+  const pairs = [
+    { backfillPending: 0, compressedRows: 4 },
+    { backfillPending: 2, compressedRows: 5 },
+    { backfillPending: 0, compressedRows: 5 },
+  ];
+  const both = await holdUntil({
+    conditions: [pending(0), { measure: 'compressedRows', value: 5 }],
+    launchedAt: clock,
+    sample: async () => pairs.shift()!,
+    now: () => clock,
+    wait,
+  });
+  assert.equal(both.samples, 3);
+  // The cap counts from the warm-up launch, so the hold ends 30 min after it with a last read at the cap.
+  waits.length = 0;
+  let samples = 0;
+  const capped = await holdUntil({
+    conditions: [pending(0)],
+    launchedAt: clock - WARM_UNTIL_CAP_MS + 20_000,
+    sample: async () => (samples++, { backfillPending: 2 }),
+    now: () => clock,
+    wait,
+  });
+  assert.equal(capped.reached, false);
+  assert.deepEqual(waits, [WARM_UNTIL_INTERVAL_MS, 5_000]);
+  assert.equal(samples, 3);
+  assert.match(capped.note ?? '', /backfillPending=0 within 30 min of its launch: backfillPending read 2/);
+  const failed = await holdUntil({
+    conditions: [pending(0)],
+    launchedAt: clock,
+    sample: async () => assert.fail('a hold read a measure after its editor failed'),
+    failure: () => 'The editor exited.',
+    now: () => clock,
+    wait,
+  });
+  assert.deepEqual(failed, { reached: false, samples: 0, measures: null, note: 'The editor exited.' });
+});
+
+test.skipIf(!rolloutCompression.zstdCompressSync)('count-compressed uses the sessionCount roots', async () => {
+  const encode = rolloutCompression.zstdCompressSync!;
+  const base = tempDir('count-compressed');
+  const repository = path.join(base, 'Repository');
+  const worktree = path.join(base, 'Worktree');
+  const outside = path.join(base, 'outside');
+  fs.mkdirSync(repository);
+  fs.mkdirSync(outside);
+  const git = (...args: string[]) => execFileSync('git', ['-C', repository, ...args], { encoding: 'utf8' });
+  git('init', '-q');
+  git('-c', 'user.name=Arc', '-c', 'user.email=arc@example.invalid', 'commit', '-q', '--allow-empty', '-m', 'start');
+  git('worktree', 'add', '-q', worktree);
+  const codex = path.join(base, 'codex');
+  const rollout = (day: string, id: string, cwd: string, payload: Record<string, unknown> = {}, plain = false) => {
+    const directory = path.join(codex, 'sessions', '2026', '11', day);
+    fs.mkdirSync(directory, { recursive: true });
+    const name = `rollout-2026-11-${day}T00-00-00-${id}.jsonl`;
+    const opening = { type: 'session_meta', payload: { id, cwd, source: 'cli', thread_source: 'user', ...payload } };
+    const text = JSON.stringify({ timestamp: `2026-11-${day}T00:00:00.000Z`, ...opening }) + '\n{"type":"event_msg"}\n';
+    fs.writeFileSync(path.join(directory, `${name}.zst`), encode(Buffer.from(text)));
+    if (plain) fs.writeFileSync(path.join(directory, name), text);
+    return { file: path.join('codex', 'sessions', '2026', '11', day, `${name}.zst`) };
+  };
+  const id = (n: number) => `01a032c9-0000-7000-8000-00000000000${n}`;
+  const rollouts = [
+    rollout('01', id(1), repository),
+    rollout('01', id(2), worktree),
+    // The same session in a second archive counts once.
+    rollout('02', id(2), worktree),
+    // Windows compares paths without case. Linux and macOS compare them with case.
+    rollout('01', id(6), worktree.toUpperCase()),
+    rollout('01', id(3), outside),
+    rollout('01', id(4), worktree, {}, true),
+    rollout('01', id(5), repository, { thread_source: 'guardian_review' }),
+  ];
+  const count = await countCompressed({ workspace: repository, codex, rollouts });
+  assert.equal(count, process.platform === 'win32' ? 3 : 2);
+  // The worktree session counts from the main checkout, as `sessionCount` lists it.
+  assert.equal(await countCompressed({ workspace: repository, codex, rollouts: [rollouts[1]] }), 1);
+});
+
+test('limit fails a value past or missing', () => {
+  const bounds = boundsOf(['--limit', 'compressedDecodes=0', '--soak', '10']);
+  assert.deepEqual(bounds, { compressedDecodes: { limit: 0 } });
+  assert.throws(() => boundsOf(['--limit', 'compressedDecodes']), /--limit takes <measure>=<number>/);
+  const row = (candidates: ReturnType<typeof runnerResult>[]) =>
+    compareResults([runnerResult({ compressedDecodes: 5 })], candidates, bounds).find(
+      (measure) => measure.name === 'compressedDecodes',
+    )!;
+  // The bound alone decides the row, whatever the baseline read.
+  assert.equal(row([runnerResult({ compressedDecodes: 0 }), runnerResult({ compressedDecodes: 0 })]).regressed, false);
+  const past = row([runnerResult({ compressedDecodes: 0 }), runnerResult({ compressedDecodes: 2 })]);
+  assert.deepEqual([past.regressed, past.candidate], [true, 2]);
+  const missing = [runnerResult({ compressedDecodes: 0 }), runnerResult()];
+  assert.equal(row(missing).regressed, true);
+  assert.deepEqual(missingMeasures(missing, bounds), ['compressedDecodes']);
+  assert.deepEqual(missingMeasures([runnerResult({ compressedDecodes: Infinity })], bounds), ['compressedDecodes']);
+  assert.deepEqual(missingMeasures(missing), [], 'an unbounded measure became required');
+});
+
+test('floor fails a value under', () => {
+  const bounds = boundsOf(['--floor', 'compressedRows=10']);
+  const row = (candidates: ReturnType<typeof runnerResult>[]) =>
+    compareResults([runnerResult()], candidates, bounds).find((measure) => measure.name === 'compressedRows')!;
+  // The baseline lacks the measure, so the margin rule alone would fail every candidate value here.
+  assert.equal(row([runnerResult({ compressedRows: 12 }), runnerResult({ compressedRows: 10 })]).regressed, false);
+  const under = row([runnerResult({ compressedRows: 12 }), runnerResult({ compressedRows: 9 })]);
+  assert.deepEqual([under.regressed, under.candidate, under.bound], [true, 9, { floor: 10 }]);
+  // A report-only measure never fails without a bound.
+  const reported = compareResults([runnerResult({ loopDelayMaxMs: 100 })], [runnerResult({ loopDelayMaxMs: 9000 })]);
+  const loop = reported.find((measure) => measure.name === 'loopDelayMaxMs')!;
+  assert.deepEqual([loop.reportOnly, loop.regressed], [true, false]);
+});
+
+test('pre-check refuses low disk', () => {
+  const gib = 1024 ** 3;
+  assert.equal(
+    diskPreCheck(7.9 * gib, SCRATCH_PEAK_BYTES.linked),
+    'Free disk is 7.9 GB, under twice the 4.0 GB peak scratch of one repetition.',
+  );
+  assert.equal(diskPreCheck(8 * gib, SCRATCH_PEAK_BYTES.linked), null);
+  assert.equal(scratchPeakBytes(tempDir('disk-source'), tempDir('disk-scratch')), SCRATCH_PEAK_BYTES.linked);
+  const free = freeDiskBytes(tempDir('disk-free'));
+  assert.ok(Number.isFinite(free) && free > 0, String(free));
 });
 
 test('a copied dispatch store validates after rebinding at the cost of its source', () => {

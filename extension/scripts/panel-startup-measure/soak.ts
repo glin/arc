@@ -287,12 +287,21 @@ export function missingSoakMeasures(measures: Record<string, number>): string[] 
   return REQUIRED_DISCOVERY_MEASURES.filter((name) => !Number.isFinite(measures[name]));
 }
 
-// The measures a soak snapshot supplies, in the units the comparison reads.
+// The host counters the measure table names, by their `work` name and their measure name. A build that never counted
+// one reports 0.
+export const NAMED_COUNTERS: Readonly<Record<string, string>> = {
+  catalogWalk: 'catalogWalks',
+  compressedDecodes: 'compressedDecodes',
+};
+
+// The measures a soak snapshot supplies, in the units the comparison reads. Every gauge passes through by its own name.
 export function soakMeasures(snapshot: {
   counters?: {
     discovery?: Record<string, number>;
-    refreshes?: Record<string, { count: number; totalDurationMs: number }>;
+    refreshes?: Record<string, { count: number; totalDurationMs: number; maximumDurationMs?: number }>;
     work?: Record<string, number>;
+    gauges?: Record<string, number>;
+    loopDelay?: { maxMs: number; p99Ms: number } | null;
   };
 }): Record<string, number> {
   const discovery = snapshot.counters?.discovery ?? {};
@@ -311,7 +320,17 @@ export function soakMeasures(snapshot: {
   for (const [reason, counts] of Object.entries(snapshot.counters?.refreshes ?? {})) {
     out[`refreshMs:${reason}`] = counts.totalDurationMs;
     out[`refreshCount:${reason}`] = counts.count;
+    if (typeof counts.maximumDurationMs === 'number') out[`refreshMaxMs:${reason}`] = counts.maximumDurationMs;
   }
-  if (typeof snapshot.counters?.work?.catalogWalk === 'number') out.catalogWalks = snapshot.counters.work.catalogWalk;
+  const work = snapshot.counters?.work ?? {};
+  for (const [counter, measure] of Object.entries(NAMED_COUNTERS))
+    out[measure] = typeof work[counter] === 'number' ? work[counter] : 0;
+  for (const [name, value] of Object.entries(snapshot.counters?.gauges ?? {}))
+    if (typeof value === 'number') out[name] = value;
+  const loopDelay = snapshot.counters?.loopDelay;
+  if (loopDelay) {
+    out.loopDelayMaxMs = loopDelay.maxMs;
+    out.loopDelayP99Ms = loopDelay.p99Ms;
+  }
   return out;
 }
