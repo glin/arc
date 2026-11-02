@@ -110,6 +110,7 @@ import {
   REFUSED_OPENING_RETRY_MS,
   rolloutFiles,
   codexSessionFiles,
+  codexRowAdmitted,
   codexSessionsRoot,
   codexSessionIndexPath,
   codexSubagentFor,
@@ -5105,6 +5106,29 @@ test('the window comes from the turn’s opening record, and again from its last
   // The last request wins. A model swapped part-way through moves the window, and the
   // request that set it is the one the context count beside it was measured against.
   assert.equal(readCodexSession(writeRollout(moved), 'sess').turns[0].contextWindow, 353400);
+});
+
+test('a rollout is a session row only with a member working directory, a visible thread and a nonempty file', () => {
+  const root = sessionsRoot([
+    { day: '2026/08/25', name: ROLLOUT(UUID_A), records: [meta({ id: UUID_A })] },
+    { day: '2026/08/25', name: ROLLOUT(UUID_B), records: [meta({ id: UUID_B, cwd: 'c:\\elsewhere' })] },
+    { day: '2026/08/25', name: ROLLOUT(UUID_C), records: [meta({ id: UUID_C, thread_source: 'guardian_review' })] },
+  ]);
+  const file = (id: string) => path.join(root, '2026', '08', '25', ROLLOUT(id));
+  const inFolders = (cwd: string) => cwd === 'c:\\repo';
+  const admitted = (id: string, stat = { mtimeMs: 1, size: 10, isFile: true }) =>
+    codexRowAdmitted(readCodexSessionMeta(file(id)), stat, inFolders);
+  assert.equal(admitted(UUID_A), true);
+  assert.equal(admitted(UUID_B), false, 'a working directory outside the folders listed a row');
+  assert.equal(admitted(UUID_C), false, 'a guardian review listed a row');
+  assert.equal(admitted(UUID_A, { mtimeMs: 1, size: 0, isFile: true }), false, 'an empty file listed a row');
+  assert.equal(admitted(UUID_A, { mtimeMs: 1, size: 10, isFile: false }), false, 'a directory listed a row');
+  assert.equal(codexRowAdmitted(readCodexSessionMeta(file(UUID_A)), null, inFolders), false);
+  assert.equal(codexRowAdmitted(null, { mtimeMs: 1, size: 10, isFile: true }, inFolders), false);
+  assert.deepEqual(
+    codexSessionFiles(root, ['c:\\repo']).sessions.map((session) => session.sessionId),
+    [UUID_A],
+  );
 });
 
 test('a session says which agent wrote it, so a merged list can tell two of them apart', () => {

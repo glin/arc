@@ -1014,6 +1014,16 @@ export async function coldOpeningPass(
   return signal?.aborted ? { walked: [], enumeration: null, read } : { walked, enumeration, read };
 }
 
+// A rollout is a visible session row when its opening names a working directory inside the folders, its thread is not
+// hidden, and its stat shows a nonempty file.
+export function codexRowAdmitted(
+  meta: CodexSessionMeta | null,
+  stat: RolloutStat | null,
+  inFolders: (cwd: string) => boolean,
+): boolean {
+  return !!meta?.cwd && inFolders(meta.cwd) && !isHiddenThread(meta) && !!stat?.isFile && stat.size > 0;
+}
+
 // List workspace sessions by newest activity, using each opening's recorded cwd for membership.
 // Callers supply cached opening and stat readers. `walked` defaults to a fresh traversal of `root`.
 export function codexSessionFiles(
@@ -1077,7 +1087,7 @@ export function codexSessionFiles(
     }
     const stat = statOf(file);
     if (!stat) admission = 'incomplete';
-    if (!stat || !stat.isFile || stat.size === 0) {
+    if (!stat || !codexRowAdmitted(meta, stat, cwdInFolders)) {
       continue;
     }
     const named = ROLLOUT_NAME.exec(path.basename(file));

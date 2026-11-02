@@ -56,8 +56,8 @@
   },
   "extension/src/codex.test.ts": {
     "reason": "Real Git worktree ownership and descendant source resolution must agree with recorded Codex session relationships. Terra provider coverage adds in-process request fixtures without additional subprocesses.",
-    "cases": 493,
-    "matricesSha256": "136512332266a91a5b15137f1604a35382b223206c6ee44c80ae5882d12af097"
+    "cases": 494,
+    "matricesSha256": "d7a818045c671b0afed28f303360f5d78d68ad1e79000140d2931c29a6aca4e7"
   },
   "extension/src/derivedcache.test.ts": {
     "reason": "Independent writers and host death must preserve shared cache rows and release stale filesystem locks. Terra generation recovery adds in-process provider fixtures without additional writers.",
