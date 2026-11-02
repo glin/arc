@@ -1114,25 +1114,42 @@ async function soak(minutes: number, launch: Launch): Promise<{ complete: boolea
 
 // A non-urgent derived-cache save waits up to five minutes after the last save, as `DERIVED_CACHE_CHECKPOINT_MS` in
 // `panelhost.ts` sets. The warm-up stays open past that point, so its store holds what it learned.
-const WARM_UP_OPEN_MS = 5.5 * 60_000;
+export const WARM_UP_OPEN_MS = 5.5 * 60_000;
 
-// A `--warm-until` hold reads its measures at this interval, and fails the run this long after the warm-up launch.
+// A `--warm-until` hold starts a read at this interval, and fails the run this long after the warm-up launch.
 export const WARM_UNTIL_INTERVAL_MS = 15_000;
 export const WARM_UNTIL_CAP_MS = 30 * 60_000;
+// The hold checks the warm-up editor at this interval while it keeps the minimum open time.
+const WARM_UP_CHECK_MS = 5_000;
 
 export interface WarmHold {
   reached: boolean;
-  samples: number;
+  reads: number;
+  // The reading that ended the hold, or the last reading.
   measures: Record<string, number> | null;
+  // The measures of the snapshot that the runner takes after the hold ends.
+  snapshot: Record<string, number> | null;
   note: string | null;
 }
 
-// Read the measures at once and then every interval, until every condition holds in one snapshot. A snapshot that
-// fails to arrive counts as a read that holds no condition.
+// One reading of a warm-up hold: the measures of a diagnostics snapshot and the runner measures, in one map. A
+// snapshot that fails to arrive gives no reading.
+export function holdReading(
+  snapshot: Parameters<typeof soakMeasures>[0] | null,
+  runner: () => Record<string, number>,
+): Record<string, number> | null {
+  return snapshot ? { ...soakMeasures(snapshot), ...runner() } : null;
+}
+
+// Keep the warm-up open for `minimumMs` after its launch. Then start a read every interval, until one reading holds
+// every condition. Reads start on a fixed schedule, so a slow read does not delay the next start. A read that runs past
+// a start moves the next read to the first later start. A reading that is missing holds no condition. The hold fails
+// at the cap after the launch, and a read that returns after the cap fails it too.
 export async function holdUntil(options: {
   conditions: WarmCondition[];
   launchedAt: number;
   sample: (index: number) => Promise<Record<string, number> | null>;
+  minimumMs?: number;
   failure?: () => string | null;
   now?: () => number;
   wait?: (ms: number) => Promise<void>;
@@ -1140,28 +1157,44 @@ export async function holdUntil(options: {
   const now = options.now ?? Date.now;
   const wait = options.wait ?? delay;
   const deadline = options.launchedAt + WARM_UNTIL_CAP_MS;
+  let next = options.launchedAt + (options.minimumMs ?? WARM_UP_OPEN_MS);
   let measures: Record<string, number> | null = null;
-  for (let index = 1; ; index++) {
+  let reads = 0;
+  const ended = (reached: boolean, note: string | null): WarmHold => ({
+    reached,
+    reads,
+    measures,
+    snapshot: null,
+    note,
+  });
+  const capped = () => {
+    const wanted = options.conditions.map((condition) => `${condition.measure}=${condition.value}`).join(', ');
+    const last = options.conditions
+      .map((condition) => `${condition.measure} read ${measures?.[condition.measure] ?? 'nothing'}`)
+      .join(', ');
+    return ended(
+      false,
+      `The warm-up did not reach ${wanted} within ${WARM_UNTIL_CAP_MS / 60_000} min of its launch: ${last}.`,
+    );
+  };
+  while (now() < next) {
     const failure = options.failure?.() ?? null;
-    if (failure) return { reached: false, samples: index - 1, measures, note: failure };
-    measures = await options.sample(index);
+    if (failure) return ended(false, failure);
+    await wait(Math.min(WARM_UP_CHECK_MS, next - now()));
+  }
+  for (;;) {
+    const failure = options.failure?.() ?? null;
+    if (failure) return ended(false, failure);
+    if (now() >= deadline) return capped();
+    const startedAt = now();
+    measures = await options.sample(++reads);
+    if (now() > deadline) return capped();
     const read = measures;
     if (read && options.conditions.every((condition) => read[condition.measure] === condition.value))
-      return { reached: true, samples: index, measures, note: null };
-    const left = deadline - now();
-    if (left <= 0) {
-      const wanted = options.conditions.map((condition) => `${condition.measure}=${condition.value}`).join(', ');
-      const last = options.conditions
-        .map((condition) => `${condition.measure} read ${read?.[condition.measure] ?? 'nothing'}`)
-        .join(', ');
-      return {
-        reached: false,
-        samples: index,
-        measures,
-        note: `The warm-up did not reach ${wanted} within ${WARM_UNTIL_CAP_MS / 60_000} min of its launch: ${last}.`,
-      };
-    }
-    await wait(Math.min(WARM_UNTIL_INTERVAL_MS, left));
+      return ended(true, null);
+    next = Math.max(next, startedAt) + WARM_UNTIL_INTERVAL_MS;
+    while (next < now()) next += WARM_UNTIL_INTERVAL_MS;
+    await wait(Math.max(0, Math.min(next, deadline) - now()));
   }
 }
 
@@ -1326,6 +1359,7 @@ async function measure(commandLine: string, workspace: string, options: Options)
     if (options.warmUp) {
       await awaitMachine(options.minimumFreeGb, 10 * 60_000);
       const warmRun = `${MEASUREMENT_RUN}-warm`;
+      const warmTempBefore = compressedTempNames(listTemp());
       const warmAt = Date.now();
       const warmLaunch = launchEditor(commandLine, workspace, WARM_USER_DATA, warmRun);
       try {
@@ -1342,12 +1376,16 @@ async function measure(commandLine: string, workspace: string, options: Options)
           const hold = await holdUntil({
             conditions: options.warmUntil,
             launchedAt: warmAt,
-            sample: async (index) => {
-              const snapshot = await requestSnapshot(`warm-${String(index).padStart(3, '0')}`, 120_000);
-              return snapshot ? soakMeasures(snapshot) : null;
-            },
+            sample: async (index) =>
+              holdReading(await requestSnapshot(`warm-${String(index).padStart(3, '0')}`, 120_000), () =>
+                runnerMeasures({ home: ARC_STORE, tempBefore: warmTempBefore }),
+              ),
             failure: () => warmLaunch.failure,
           });
+          if (hold.reached) {
+            const snapshot = await requestSnapshot('warm-end', 120_000);
+            hold.snapshot = snapshot ? soakMeasures(snapshot) : null;
+          }
           Object.assign(runRecord.warmUp as object, { until: options.warmUntil, hold });
           (runRecord.warmUp as { openMs: number | null }).openMs = Date.now() - warmAt;
           if (!hold.reached) return { ...warm, complete: false, note: `The warm-up hold failed. ${hold.note ?? ''}` };

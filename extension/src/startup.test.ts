@@ -307,6 +307,8 @@ import {
   pollStartup,
   liveDirectories,
   holdUntil,
+  holdReading,
+  WARM_UP_OPEN_MS,
   WARM_UNTIL_CAP_MS,
   WARM_UNTIL_INTERVAL_MS,
   diskPreCheck,
@@ -1768,61 +1770,82 @@ test('repeat builds each side once', async () => {
   assert.deepEqual([row.baseline, row.candidate, row.ratio], [60_000, 70_000, 70_000 / 60_000]);
 });
 
-test('warm-until holds until the measure reads its value', async () => {
-  let clock = 1_000_000;
-  const waits: number[] = [];
+test('warm-until ends when the measure reads the value', async () => {
+  const launchedAt = 1_000_000;
+  let clock = launchedAt;
   const wait = async (ms: number) => {
-    waits.push(ms);
     clock += ms;
   };
-  const pending = (value: number) => ({ measure: 'backfillPending', value });
-  const reads: Array<Record<string, number> | null> = [{ backfillPending: 3 }, null, { backfillPending: 1 }];
-  const reached = await holdUntil({
-    conditions: [pending(0)],
-    launchedAt: clock - 60_000,
-    sample: async () => (reads.length ? reads.shift()! : { backfillPending: 0 }),
-    now: () => clock,
-    wait,
-  });
-  assert.deepEqual(reached, { reached: true, samples: 4, measures: { backfillPending: 0 }, note: null });
-  assert.deepEqual(waits, [WARM_UNTIL_INTERVAL_MS, WARM_UNTIL_INTERVAL_MS, WARM_UNTIL_INTERVAL_MS]);
-  // A repeated flag holds until every measure reads its value in one snapshot.
-  const pairs = [
-    { backfillPending: 0, compressedRows: 4 },
-    { backfillPending: 2, compressedRows: 5 },
-    { backfillPending: 0, compressedRows: 5 },
-  ];
-  const both = await holdUntil({
-    conditions: [pending(0), { measure: 'compressedRows', value: 5 }],
-    launchedAt: clock,
-    sample: async () => pairs.shift()!,
-    now: () => clock,
-    wait,
-  });
-  assert.equal(both.samples, 3);
-  // The cap counts from the warm-up launch, so the hold ends 30 min after it with a last read at the cap.
-  waits.length = 0;
-  let samples = 0;
+  // Each reading joins a diagnostics snapshot with a stub runner measure, as the runner reads the stores.
+  const reading = (pending: number | null, rows = 4) =>
+    holdReading(pending === null ? null : { counters: { gauges: { compressedRows: rows } } }, () => ({
+      stubPending: pending ?? -1,
+    }));
+  const pending = (value: number) => ({ measure: 'stubPending', value });
+  const hold = async (readings: Array<Record<string, number> | null>, readMs = 2_000, conditions = [pending(0)]) => {
+    const starts: number[] = [];
+    const result = await holdUntil({
+      conditions,
+      launchedAt,
+      sample: async () => {
+        starts.push(clock - launchedAt);
+        clock += readMs;
+        return readings.length > 1 ? readings.shift()! : readings[0];
+      },
+      now: () => clock,
+      wait,
+    });
+    return { result, starts };
+  };
+  // A value that holds at the first read still keeps the warm-up open for the minimum.
+  const first = await hold([reading(0)]);
+  assert.deepEqual(first.starts, [WARM_UP_OPEN_MS]);
+  assert.deepEqual(first.result, { reached: true, reads: 1, measures: reading(0), snapshot: null, note: null });
+  // The hold ends at the first read after the minimum that holds the value. A missing snapshot holds nothing. Reads
+  // start 15 s apart whatever each read takes, and a read that runs past a start moves to the next start.
+  clock = launchedAt;
+  const later = await hold([reading(3), reading(null), reading(1), reading(0)], 4_000);
+  assert.deepEqual(
+    later.starts,
+    [0, 1, 2, 3].map((index) => WARM_UP_OPEN_MS + index * WARM_UNTIL_INTERVAL_MS),
+  );
+  assert.deepEqual([later.result.reached, later.result.reads], [true, 4]);
+  clock = launchedAt;
+  const slow = await hold([reading(2), reading(0)], 20_000);
+  assert.deepEqual(slow.starts, [WARM_UP_OPEN_MS, WARM_UP_OPEN_MS + 2 * WARM_UNTIL_INTERVAL_MS]);
+  // A repeated flag holds until every measure reads its value in one reading.
+  clock = launchedAt;
+  const both = await hold([reading(0, 4), reading(2, 5), reading(0, 5)], 2_000, [
+    pending(0),
+    { measure: 'compressedRows', value: 5 },
+  ]);
+  assert.equal(both.result.reads, 3);
+  // A read that starts before the cap and returns after it fails the run, though its value holds.
+  clock = launchedAt;
+  const reads = Math.ceil((WARM_UNTIL_CAP_MS - WARM_UP_OPEN_MS) / WARM_UNTIL_INTERVAL_MS);
+  const lastStart = WARM_UP_OPEN_MS + (reads - 1) * WARM_UNTIL_INTERVAL_MS;
   const capped = await holdUntil({
     conditions: [pending(0)],
-    launchedAt: clock - WARM_UNTIL_CAP_MS + 20_000,
-    sample: async () => (samples++, { backfillPending: 2 }),
+    launchedAt,
+    sample: async () => {
+      const late = clock - launchedAt === lastStart;
+      clock += late ? 30_000 : 1_000;
+      return reading(late ? 0 : 2);
+    },
     now: () => clock,
     wait,
   });
-  assert.equal(capped.reached, false);
-  assert.deepEqual(waits, [WARM_UNTIL_INTERVAL_MS, 5_000]);
-  assert.equal(samples, 3);
-  assert.match(capped.note ?? '', /backfillPending=0 within 30 min of its launch: backfillPending read 2/);
+  assert.deepEqual([capped.reached, capped.reads], [false, reads]);
+  assert.match(capped.note ?? '', /stubPending=0 within 30 min of its launch: stubPending read 0/);
   const failed = await holdUntil({
     conditions: [pending(0)],
-    launchedAt: clock,
+    launchedAt,
     sample: async () => assert.fail('a hold read a measure after its editor failed'),
     failure: () => 'The editor exited.',
     now: () => clock,
     wait,
   });
-  assert.deepEqual(failed, { reached: false, samples: 0, measures: null, note: 'The editor exited.' });
+  assert.deepEqual(failed, { reached: false, reads: 0, measures: null, snapshot: null, note: 'The editor exited.' });
 });
 
 test.skipIf(!rolloutCompression.zstdCompressSync)('count-compressed uses the sessionCount roots', async () => {
