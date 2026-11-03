@@ -1157,7 +1157,9 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
       const next = (event as FocusEvent).relatedTarget as Node | null;
       if (next && pop.contains(next)) return;
       if (options.actionAnchor && !next) return;
-      if (dismissedAnchor === node) dismissedAnchor = null;
+      if (dismissedAnchor === node && (event.type !== 'blur' || options.actionAnchor || !pointerHits(node))) {
+        dismissedAnchor = null;
+      }
       hide(node);
     };
     const focus = () => {

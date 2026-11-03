@@ -1091,6 +1091,9 @@ test(
       });
       await page.setViewportSize({ width: 340, height: 1400 });
       await page.keyboard.press('Escape');
+      assert.equal(await cost.evaluate((node) => document.activeElement === node), true);
+      await page.keyboard.press('Tab');
+      assert.equal(await cost.evaluate((node) => document.activeElement === node), false);
       // A resize can deliver pointer departure and entry while the pointer remains over the same figure.
       await cost.dispatchEvent('pointerleave', point);
       await cost.dispatchEvent('pointerenter', point);
