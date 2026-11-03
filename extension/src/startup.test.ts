@@ -65,7 +65,7 @@ import { isDeepStrictEqual } from 'node:util';
 import * as zlib from 'node:zlib';
 import { compressedRolloutsReadable, isCompressedRollout } from './compressedrollouts.ts';
 import ts from 'typescript';
-import { agentSpendIsOpen, spendFileVersion, spendTokens } from './agentspend';
+import { agentSpendIsOpen, heaviestModel, spendFileVersion, spendTokens } from './agentspend';
 import {
   CodexMetaCache,
   createCodexUsageLineReducer,
@@ -3028,6 +3028,7 @@ function completeDiscoveryHarness(
     'isDeepStrictEqual',
     'invalidateClaudeCostSupplements',
     'countedDispatchedCosts',
+    'heaviestModel',
     'SessionLoadingLine',
     'pendingResponseSessionAdmitted',
     'sessionDiscoveryMembership',
@@ -3079,6 +3080,7 @@ function completeDiscoveryHarness(
     isDeepStrictEqual,
     invalidateClaudeCostSupplements,
     countedDispatchedCosts,
+    heaviestModel,
     SessionLoadingLine,
     pendingResponseSessionAdmitted,
     sessionDiscoveryMembership,

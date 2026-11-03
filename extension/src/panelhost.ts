@@ -5160,6 +5160,9 @@ export class PanelProvider implements vscode.Disposable {
         confirmedModel: runtime?.confirmedModel ?? null,
         confirmedModelAttachment: runtime?.confirmedModelAttachment ?? null,
         confirmedEffort: runtime?.confirmedEffort ?? null,
+        confirmedServiceTier: runtime?.confirmedServiceTier ?? null,
+        confirmedProvider: runtime?.confirmedProvider ?? null,
+        confirmedSpeed: runtime?.confirmedSpeed ?? null,
       },
       askMode: permissionMode,
       effectiveMode: this.codexEffectiveModes?.[row.id] ?? null,
@@ -9381,6 +9384,7 @@ export class PanelProvider implements vscode.Disposable {
       title,
       {
         roots: { claude: projectsRoot(), codex: codexSessionsRoot() },
+        modelLabels: Object.fromEntries(this.modelLabels),
         readerParents: { ...this.saved.readerParents },
         readerState,
         capturedAt: Date.now(),
@@ -11151,17 +11155,22 @@ export class PanelProvider implements vscode.Disposable {
     const out: Record<string, Record<string, DispatchedSessionCost>> = {};
     for (const [sessionId, contributions] of Object.entries(this.lifetimeFiguresBySession().dispatched)) {
       out[sessionId] = Object.fromEntries(
-        Object.entries(contributions).map(([via, { costs, short, own }]) => [
-          via,
-          {
-            costs,
-            short,
-            ownSettledAt:
-              own?.record && !this.projectSpendHolds(own.file, own.record)
-                ? (own.record.newestTurnStartedAt ?? null)
-                : null,
-          },
-        ]),
+        Object.entries(contributions).map(([via, { costs, short, own }]) => {
+          const spend = this.dispatchFacts?.get(via)?.spend;
+          return [
+            via,
+            {
+              ownModel: spend?.ownModel ?? null,
+              ownModelTiers: spend?.ownModelTiers,
+              costs,
+              short,
+              ownSettledAt:
+                own?.record && !this.projectSpendHolds(own.file, own.record)
+                  ? (own.record.newestTurnStartedAt ?? null)
+                  : null,
+            },
+          ];
+        }),
       );
     }
     return out;

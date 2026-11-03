@@ -4241,7 +4241,7 @@ test('request prices use the request context band, regional rate, and service ti
   const fast = summarizeRequests([pricedRequest('claude-opus-5-5', 1_000, { serviceTier: 'fast' })]);
   assert.equal(fast.costUsd, 0.008);
   const priority = summarizeRequests([pricedRequest('gpt-5.6-terra', 1_000, { serviceTier: 'priority' })]);
-  assert.equal(priority.costUsd, null);
+  assert.equal(priority.costUsd, 0.004);
   assert.deepEqual(priority.unpricedModels, []);
   const terra = summarizeRequests([
     pricedRequest('gpt-6.1-terra', 100_000, {
@@ -6316,4 +6316,11 @@ test('the panel Tools rows agree with arc cost --by-tool on a Codex and a Claude
   assert.equal(none(widened).requests, none(panel).requests + 5);
   assert.ok(Math.abs(none(widened).dollars - none(panel).dollars - added) < 1e-9);
   assert.ok(added > 4);
+});
+
+test('recorded request summaries price Astra Standard Fast and Ultrafast separately', () => {
+  const requests = ['default', 'priority', 'ultrafast'].map((serviceTier) =>
+    pricedRequest('gpt-6-astra', 100000, { serviceTier, contextBand: 'short' }),
+  );
+  assert.equal(summarizeRequests(requests).costUsd, 9);
 });

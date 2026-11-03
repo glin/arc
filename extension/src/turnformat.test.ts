@@ -13,6 +13,11 @@ import {
   friendlyModel,
   modelLabels,
   shortModel,
+  modelSpeed,
+  recordedModelSpeed,
+  modelTierKey,
+  modelWithSpeed,
+  speedName,
 } from './turnformat.ts';
 import { MB, NOW } from './turnfixtures.ts';
 
@@ -208,4 +213,32 @@ test('a byte count is said in the units the setting is written in', () => {
   assert.equal(formatMegabytes(1023.6 * MB), '1 GB');
   assert.equal(formatMegabytes(1536 * MB), '1.5 GB');
   assert.equal(formatMegabytes(4096 * MB), '4 GB');
+});
+
+test('recorded speed remains separate from model names and unknown evidence', () => {
+  const model = 'gpt-6.1-sol';
+  const identity = (serviceTier: string | null, provider: string | null = 'openai') => ({
+    model,
+    provider,
+    serviceTier,
+  });
+  assert.equal(modelSpeed(model, [identity('priority'), identity('fast')]), 'Fast');
+  assert.equal(modelSpeed(model, [identity('default'), identity('priority')]), 'Mixed speeds');
+  assert.equal(modelSpeed(model, [identity('priority'), identity(null)]), null);
+  assert.equal(modelSpeed(model, undefined), null);
+  assert.equal(recordedModelSpeed(model, [identity('default')]), 'Standard');
+  assert.equal(recordedModelSpeed(model, undefined), null);
+  assert.equal(
+    modelSpeed(model, [identity('default'), { model: 'gpt-6-astra', provider: 'openai', serviceTier: 'priority' }]),
+    null,
+  );
+  assert.equal(
+    modelSpeed('future-model', [{ model: 'future-model', provider: 'openai', serviceTier: 'ultrafast' }]),
+    'Ultrafast',
+  );
+  assert.equal(speedName('amazon-bedrock', 'priority'), null);
+  assert.equal(modelTierKey(identity('fast')), modelTierKey(identity('priority')));
+  assert.notEqual(modelTierKey(identity(null)), modelTierKey(identity('default')));
+  assert.notEqual(modelTierKey(identity('priority')), modelTierKey(identity('priority', 'other')));
+  assert.equal(modelWithSpeed(identity('priority'), new Map([[model, 'Catalog Sol']])), 'Catalog Sol · Fast');
 });

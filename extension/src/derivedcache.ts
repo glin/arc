@@ -403,7 +403,7 @@ export const MAX_CODEX_DISPATCH_CURSOR_BYTES = 64 * 1024 * 1024;
 export { MAX_CLAUDE_CHILD_REFERENCES_PER_FILE };
 // Bump when Claude or Codex dispatched spend reading changes what it derives. A mismatch drops the saved
 // facts and keeps their rows.
-export const DISPATCH_FACTS_VERSION = 2;
+export const DISPATCH_FACTS_VERSION = 4;
 export const MAX_SAVED_DISPATCH_FACTS_BYTES = 16 * 1024 * 1024;
 
 // A dispatched session's settled spend facts at one file revision and spend tree.
@@ -485,7 +485,7 @@ export type MetadataGenerations = Readonly<Record<AgentKind, number>>;
 // The initial metadata budget, `INITIAL_RAIL_READ_BYTES`, spreads large workspace rebuilds across refreshes.
 // Targeted invalidation avoids a full rebuild when affected entries are identifiable at load.
 // Codex opening rows use `CODEX_META_VERSION` from codexopenings.ts and survive these generation changes.
-export const METADATA_GENERATIONS: MetadataGenerations = { claude: 72, codex: 72 };
+export const METADATA_GENERATIONS: MetadataGenerations = { claude: 73, codex: 73 };
 
 // The agent generations that each shared `metadataVersion` of `derived-session-cache-v1.json` matches.
 // Each pair names the agent generation of the stored facts.
@@ -493,6 +493,7 @@ export const METADATA_GENERATIONS: MetadataGenerations = { claude: 72, codex: 72
 export const V1_METADATA_GENERATIONS: Readonly<Record<number, Partial<MetadataGenerations>>> = {
   70: { claude: 71 },
   71: { claude: 71, codex: 71 },
+  72: { claude: 72, codex: 72 },
 };
 
 // The agent whose source root holds a file. A file inside neither root, or inside both, has no agent.
@@ -1146,6 +1147,15 @@ function savedDispatchFacts(value: unknown): value is SavedDispatchFacts {
     typeof facts.person === 'boolean' &&
     Array.isArray(spend.models) &&
     spend.models.every(record) &&
+    (spend.ownModelTiers === undefined ||
+      (Array.isArray(spend.ownModelTiers) &&
+        spend.ownModelTiers.every(
+          (part) =>
+            record(part) &&
+            (part.model === null || nonEmptyText(part.model)) &&
+            (part.provider === undefined || part.provider === null || nonEmptyText(part.provider)) &&
+            (part.serviceTier === undefined || part.serviceTier === null || nonEmptyText(part.serviceTier)),
+        ))) &&
     typeof spend.found === 'boolean' &&
     typeof spend.partial === 'boolean'
   );

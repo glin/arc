@@ -1,4 +1,5 @@
 import { wholePercent } from './view/tokens.ts';
+import { normalizeModelIdentity } from './domain/model-identity';
 import type { ChildExpiryCost } from './childcacheexpiry';
 import { outputRateText, type OutputRate, type OutputRateBasis } from './outputrate';
 // Reduces turns to card headlines, status, figures, and control text.
@@ -86,7 +87,12 @@ import {
   formatRelative,
   formatTokens,
   formatWhen,
-  friendlyModel,
+  modelSpeed,
+  recordedModelSpeed,
+  modelTierKey,
+  modelWithSpeed,
+  speedName,
+  type ModelTierIdentity,
   shortModel,
   type ModelLabels,
 } from './turnformat';
@@ -325,6 +331,7 @@ export interface AgentFigure extends AgentFigureFacts {
 // Figures contain cost, commits, files, and duration.
 // `hintDetail` contains tool uses for completed children.
 export interface AgentCard {
+  speed?: string | null;
   kind?: 'subagent' | 'dispatch';
   files?: FileCard[];
   commits?: CommitCard[];
@@ -483,6 +490,7 @@ export interface ActivitySkill {
 }
 
 export interface TurnCard {
+  speed?: string | null;
   promptId?: string;
   kind: 'turn';
   key: string;
@@ -1137,7 +1145,7 @@ function agentDisplay(
   const open = state === 'running' || state === 'open';
   // Finished children have no state word.
   const stateWord = AGENT_STATE_WORDS[state];
-  const detail = [model, agent.effort, time, tools, ...usage];
+  const detail = [model, agent.effort, modelSpeed(agentModel(agent), agent.ownModelTiers), time, tools, ...usage];
   // Child hover text contains tool count and duration while open.
   // Cost, artifacts, and token breakdowns belong to their figure records.
   const figures = [open ? time : null, tools].filter(Boolean).join(' · ');
@@ -1435,6 +1443,9 @@ function agentCard(
   return {
     description: agent.description,
     model: shortModel(agentModel(agent)),
+    ...(modelSpeed(agentModel(agent), agent.ownModelTiers)
+      ? { speed: modelSpeed(agentModel(agent), agent.ownModelTiers) }
+      : {}),
     effort: agent.effort,
     figures: agentFigures(agent, display.state, rowPaths, now, runner, row),
     state: display.state,
@@ -1503,6 +1514,7 @@ export function dispatchedAgentCard(
     agentType: null,
     model: null,
     ...(spend.ownModel ? { ownModel: spend.ownModel } : {}),
+    ...(spend.ownModelTiers ? { ownModelTiers: spend.ownModelTiers.map((part) => ({ ...part })) } : {}),
     effort: spend.effort,
     spend: spend.models,
     spendFound: spend.found,
@@ -1566,6 +1578,8 @@ function agentOutcome(agent: TurnAgent): string {
   if (agent.effort) {
     parts.push(agent.effort);
   }
+  const speed = modelSpeed(agentModel(agent), agent.ownModelTiers);
+  if (speed) parts.push(speed);
   if (agent.durationMs != null) {
     parts.push(formatDuration(agent.durationMs));
   }
@@ -2034,7 +2048,7 @@ function spendCost(agent: TurnAgent): AgentCost {
       );
       costs.push(...pricedParts);
       const exact = sessionCostTotalOf(pricedParts);
-      parts.push({ model: part.model, dollars: exact.dollars, partial: exact.partial });
+      parts.push(...pricedModelParts(pricedParts));
       if (exact.dollars !== null) {
         dollars += exact.dollars;
         priced = true;
@@ -2047,7 +2061,12 @@ function spendCost(agent: TurnAgent): AgentCost {
       recordedListCost ?? estimateCost(part.usage, part.model, part.provider ?? null, part.contextWindow ?? null);
     const unclassified = recordedListCost === undefined && (part.unclassifiedCacheWrite ?? 0) > 0;
     const short = Boolean(part.usageParts?.some((usage) => usage.incomplete));
-    parts.push({ model: part.model, dollars: cost, partial: unclassified || short || cost === null });
+    parts.push({
+      model: part.model,
+      provider: part.provider ?? null,
+      dollars: cost,
+      partial: unclassified || short || cost === null,
+    });
     // A recorded list cost prices the whole part, and its usage parts still carry the tool and
     // wait figures and the request count's exactness.
     const recorded: { tools?: UsageTools; waits?: UsageWaits } = {};
@@ -2127,6 +2146,8 @@ export function priceDispatchedParts(parts: readonly DispatchedCostUsage[]): Pri
 // Dispatched session contribution and coverage state.
 // `ownSettledAt` holds its newest turn start after its primary group settles and leaves the ledger.
 export interface DispatchedSessionCost {
+  ownModel?: string | null;
+  ownModelTiers?: readonly ModelTierIdentity[];
   costs: readonly PricedDispatchedCost[];
   short: boolean;
   ownSettledAt: number | null;
@@ -2599,8 +2620,14 @@ function hasPricedCacheRead(
   return dollars !== null && dollars > 0;
 }
 
-function costLabelWithModels(label: string, models: readonly (string | null)[]): string {
-  const names = [...new Set(models.map((model) => shortModel(model) ?? 'model not recorded'))];
+function costLabelWithModels(label: string, models: readonly (string | null | ModelTierIdentity)[]): string {
+  const names = [
+    ...new Set(
+      models.map((part) =>
+        modelWithSpeed(typeof part === 'object' && part !== null ? part : { model: part }, undefined, true),
+      ),
+    ),
+  ];
   return names.length ? `${label} · ${names.join(', ')}` : label;
 }
 
@@ -2655,10 +2682,7 @@ function recordedCostNote(basis: string | undefined): string | null {
 function exactCostEntry(name: string, parts: readonly SessionCostUsage[], finished = true): StatDetailEntry {
   const costs = parts.map(priceSessionCost);
   return {
-    label: costLabelWithModels(
-      name,
-      parts.map((part) => part.model),
-    ),
+    label: costLabelWithModels(name, parts),
     value: sessionCostValue(costs),
     lines: usageCategoryLines(costs, finished),
   };
@@ -2858,6 +2882,20 @@ function turnDelegatedCosts(
   ];
 }
 
+function ownTurnModelTiers(turn: Turn): ModelTierIdentity[] {
+  return turn.usageParts?.length
+    ? turn.usageParts.filter((part) => !part.usageOrigin && !part.compactionEstimate && !part.linkedInvocationId)
+    : turn.usage.requests === 1
+      ? [{ model: turn.model, provider: turn.provider, serviceTier: turn.contextRequest?.serviceTier }]
+      : [];
+}
+
+function missingModelTier(model: string | null, parts: readonly ModelTierIdentity[] | undefined): boolean {
+  if (parts?.some((part) => !normalizeModelIdentity(part.model))) return true;
+  const own = parts?.filter((part) => normalizeModelIdentity(part.model) === normalizeModelIdentity(model)) ?? [];
+  return !own.length || own.some((part) => !part.serviceTier);
+}
+
 function costDetailList(
   turn: Turn,
   warnings: readonly CacheWriteWarning[] = [],
@@ -2931,6 +2969,14 @@ function costDetailList(
               lines: usageCostDetail(turn.usage, turn.model, turn.provider ?? null, turn.contextWindow, { finished }),
             },
           ];
+  const speedUnknown =
+    missingModelTier(turn.model, ownTurnModelTiers(turn)) ||
+    turn.agents.some((agent) => missingModelTier(agentModel(agent), agent.ownModelTiers)) ||
+    shares.some(
+      (share) =>
+        !share.cost.ownModelTiers?.length ||
+        share.cost.ownModelTiers.some((part) => !normalizeModelIdentity(part.model) || !part.serviceTier),
+    );
   if (!turn.agents.length && !shares.length && mainWarnings.length) {
     entries[0].label = mainEntry().label;
     withCostWarnings(entries[0], mainWarnings);
@@ -3030,7 +3076,9 @@ function costDetailList(
       return;
     }
     const priced = agentCosts.get(agent);
-    const parts = priced?.parts ?? agent.spend.map((part) => ({ model: part.model, dollars: null }));
+    const parts =
+      priced?.parts ??
+      agent.spend.map((part) => ({ model: part.model, provider: part.provider ?? null, dollars: null }));
     // An agent with no spend yet still counts, under its model with no cost.
     holdChild(key, parts.length ? parts : [{ model: agentModel(agent), dollars: null }], priced?.unattributed ?? true);
   });
@@ -3058,7 +3106,7 @@ function costDetailList(
           {
             label: 'Main agent',
             detail: modelNames(
-              mainPriced.map((held) => held.part.model),
+              mainPriced.map((held) => held.part),
               labels,
             ),
             ...(delegates ? { value: mainValue } : {}),
@@ -3118,6 +3166,7 @@ function costDetailList(
         }
       : {}),
     notes: [
+      ...(speedUnknown ? ['Speed was not fully recorded.'] : []),
       ...(toolRows.length || delegatedTools.length ? [TOOL_RESULT_NOTE] : []),
       ...(hasCacheRead ? [CACHED_INPUT_READ_EXPLANATION] : []),
       ...(hasPublicAutoReview ? [AUTO_REVIEW_RATE_NOTE] : []),
@@ -4923,6 +4972,7 @@ export function toCard(
   const duration = formatDuration(durationEnd - turn.startedAt);
   const lastRelative = formatRelative(turn.endedAt, now);
   const model = shortModel(turn.model);
+  const speed = modelSpeed(turn.model, ownTurnModelTiers(turn));
   const readableSummary = readableRichText(turn.summary);
   const headlineSource = headlineSourceOf(readableSummary);
   const headline = withoutLeadingSymbol(headlineFor(turn, status, readableSummary, headlineSource));
@@ -4991,7 +5041,9 @@ export function toCard(
       lastRelative,
       duration ? `${durationWord(status)} ${duration}` : null,
       `started ${formatWhen(turn.startedAt, now)}`,
-      [AGENT_NAMES[turn.agent], model, turn.effort].filter(Boolean).join(' ') || null,
+      [AGENT_NAMES[turn.agent], model, turn.effort, speed ? `${speed} recorded speed setting` : null]
+        .filter(Boolean)
+        .join(' ') || null,
       marks.map((m) => m.word).join(', ') || null,
     ],
     headline,
@@ -5034,6 +5086,7 @@ export function toCard(
     agent: AGENT_NAMES[turn.agent],
     model,
     effort: turn.effort,
+    speed,
     headline,
     ...(headlineHtml ? { headlineHtml } : {}),
     prompt: turn.prompt,
@@ -5206,6 +5259,9 @@ export function nextTurnBasisOf(
 export interface ComposerRuntimeFacts {
   confirmedModel: string | null;
   confirmedModelAttachment: string | null;
+  confirmedServiceTier?: string | null;
+  confirmedProvider?: string | null;
+  confirmedSpeed?: string | null;
   confirmedEffort: string | null;
   context: CurrentContextSelection | null;
   nextTurn: NextTurnBasis | null;
@@ -5251,6 +5307,9 @@ export function composerRuntimeBySession(
             : (ordered.find((turn) => turn.model)?.model ?? null)
           : null),
       confirmedModelAttachment: newest?.modelAttachment ?? null,
+      confirmedServiceTier: newest?.model ? (newest.contextRequest?.serviceTier ?? null) : null,
+      confirmedProvider: newest?.model ? (newest.provider ?? null) : null,
+      confirmedSpeed: newest?.model ? recordedModelSpeed(newest.model, ownTurnModelTiers(newest)) : null,
       confirmedEffort: newest?.effort ?? null,
       context: currentContextOf(newest, compaction),
       nextTurn: nextTurnBasisOf(newest, compaction),
@@ -5511,11 +5570,11 @@ function displayProviderName(provider: string): string {
   return provider;
 }
 
-function autoReviewUsageIdentity(provider: string | null | undefined): UsageIdentity {
+function autoReviewUsageIdentity(provider: string | null | undefined, serviceTier?: string | null): UsageIdentity {
   const displayed = provider ? displayProviderName(provider) : null;
   const namedProvider = displayed && displayed !== 'OpenAI' ? ` · ${displayed}` : '';
   return {
-    key: JSON.stringify([null, 'codex-auto-review', namedProvider]),
+    key: modelTierKey({ model: 'codex-auto-review', provider, serviceTier }),
     label: `Codex Auto Review${namedProvider}`,
   };
 }
@@ -5524,11 +5583,11 @@ function usageIdentity(part: SessionCostUsage): UsageIdentity {
   const agent = displayAgentName(part.agent);
   const provider = part.provider ? displayProviderName(part.provider) : null;
   if (part.model === 'codex-auto-review') {
-    return autoReviewUsageIdentity(part.provider);
+    return autoReviewUsageIdentity(part.provider, part.serviceTier);
   }
-  const model = shortModel(part.model);
-  const key = JSON.stringify([agent, provider, model]);
-  if (!agent && !model && !provider) {
+  const model = modelWithSpeed(part, undefined, true);
+  const key = JSON.stringify([part.agent ?? null, modelTierKey(part)]);
+  if (!agent && !part.model && !provider) {
     return { key, label: 'Model and provider not recorded' };
   }
   const label = [agent, model ?? 'model not recorded', provider ?? (!agent ? 'provider not recorded' : null)]
@@ -5626,9 +5685,9 @@ function unavailableReasons(cost: PricedSessionCost): string[] {
       priceSessionCost({ ...cost.part, serviceTier: null }).dollars !== null
     ) {
       reasons.push(
-        cost.part.serviceTier === 'fast'
+        speedName(cost.part.provider, cost.part.serviceTier) === 'Fast'
           ? 'fast-mode price unavailable'
-          : `${cost.part.serviceTier} service-tier price unavailable`,
+          : `${speedName(cost.part.provider, cost.part.serviceTier) ?? cost.part.serviceTier} service-tier price unavailable`,
       );
     } else {
       reasons.push('reliable list-price estimate unavailable');
@@ -5771,11 +5830,7 @@ function roleUsageIdentity(part: SessionCostUsage, role: 'main' | 'delegated'): 
   const provider = part.provider ? displayProviderName(part.provider) : null;
   const standardProvider =
     (agent === 'Codex' && provider === 'OpenAI') || (agent === 'Claude' && provider === 'Anthropic');
-  const label = [
-    'Main agent',
-    shortModel(part.model) ?? 'model not recorded',
-    provider && !standardProvider ? provider : null,
-  ]
+  const label = ['Main agent', modelWithSpeed(part, undefined, true), provider && !standardProvider ? provider : null]
     .filter((held): held is string => Boolean(held))
     .join(' · ');
   return { key: identity.key, label };
@@ -6239,14 +6294,14 @@ const DELEGATED_MODELS_SHOWN = 3;
 // whether it counts as an agent. Delegated work without a child session adds dollars but no count.
 interface DelegatedChild {
   // A part's partial flag marks its dollars as a lower bound, and only its own model's row reads so.
-  parts: readonly { model: string | null; dollars: number | null; partial?: boolean }[];
+  parts: readonly (ModelTierIdentity & { dollars: number | null; partial?: boolean })[];
   counted: boolean;
   // Incomplete usage that no part's model can be told apart from, so every row of the child reads
   // its dollars as a lower bound.
   partial?: boolean;
 }
 
-// The Delegated section's Usage rows: one row per model's reading name, most expensive first, with
+// The Delegated section's Usage rows keep raw model, provider, and tier separate, most expensive first, with
 // its agent count. Each part's dollars go to its own model's row, and a child counts once in each
 // row it holds. A row without a priced part reads `cost unavailable` with no share, and a row with
 // incomplete usage reads its dollars as a lower bound. Rows past the third wait behind the View
@@ -6254,29 +6309,55 @@ interface DelegatedChild {
 function delegatedModelPart(children: readonly DelegatedChild[], whole: number, labels?: ModelLabels): CostDetailPart {
   const groups = new Map<
     string,
-    { ids: Set<string>; count: number; dollars: number; priced: boolean; partial: boolean }
+    {
+      name: string;
+      identity: ModelTierIdentity;
+      ids: Set<string>;
+      count: number;
+      dollars: number;
+      priced: boolean;
+      partial: boolean;
+    }
   >();
   for (const child of children) {
     const counted = new Set<string>();
     for (const part of child.parts) {
-      const name = friendlyModel(part.model, labels);
-      const held = groups.get(name) ?? { ids: new Set<string>(), count: 0, dollars: 0, priced: false, partial: false };
+      const name = modelWithSpeed(part, labels);
+      const key = modelTierKey(part);
+      const held = groups.get(key) ?? {
+        name,
+        identity: part,
+        ids: new Set<string>(),
+        count: 0,
+        dollars: 0,
+        priced: false,
+        partial: false,
+      };
       if (part.model) held.ids.add(part.model);
       held.partial ||= Boolean(child.partial || part.partial);
       held.dollars += part.dollars ?? 0;
       held.priced ||= part.dollars !== null;
-      groups.set(name, held);
-      if (child.counted && !counted.has(name)) {
-        counted.add(name);
+      groups.set(key, held);
+      if (child.counted && !counted.has(key)) {
+        counted.add(key);
         held.count++;
       }
     }
   }
   const rows = [...groups]
     .sort((left, right) => right[1].dollars - left[1].dollars || right[1].count - left[1].count)
-    .map(([name, held]): CostDetailRow => {
+    .map(([, held]): CostDetailRow => {
+      const name = held.name;
       const count = held.count ? agentCount(held.count) : undefined;
-      const head = [held.ids.size ? [...held.ids].join(', ') : name, ...(count ? [count] : [])].join(', ');
+      const tier = speedName(held.identity.provider, held.identity.serviceTier);
+      const identity = [
+        held.ids.size ? [...held.ids].join(', ') : name,
+        held.identity.provider ? displayProviderName(held.identity.provider) : null,
+        tier && tier !== 'Standard' ? tier : null,
+      ]
+        .filter(Boolean)
+        .join(' · ');
+      const head = [identity, ...(count ? [count] : [])].join(', ');
       const { dollars: _dollars, ...built } = costDetailRow(name, held.dollars, whole, 'delegated work', []);
       if (!held.priced) {
         return {
@@ -6312,11 +6393,17 @@ function delegatedModelPart(children: readonly DelegatedChild[], whole: number, 
 
 // Each priced part's model with its dollars, for the delegated model rows.
 const pricedModelParts = (costs: readonly PricedSessionCost[]) =>
-  costs.map((cost) => ({ model: cost.part.model, dollars: cost.dollars, partial: cost.partial }));
+  costs.map((cost) => ({
+    model: cost.part.model,
+    provider: cost.part.provider,
+    serviceTier: cost.part.serviceTier,
+    dollars: cost.dollars,
+    partial: cost.partial,
+  }));
 
 // The reading names of a section's models, each once.
-const modelNames = (models: readonly (string | null)[], labels?: ModelLabels): string =>
-  [...new Set(models.map((model) => friendlyModel(model, labels)))].join(', ');
+const modelNames = (models: readonly ModelTierIdentity[], labels?: ModelLabels): string =>
+  [...new Map(models.map((part) => [modelTierKey(part), modelWithSpeed(part, labels)])).values()].join(', ');
 
 // A section's fact line: request count, cached share of input, and average input. The count
 // shows only when every part recorded an exact count.
@@ -6514,7 +6601,7 @@ export function sessionCostProjection(
                 {
                   label: costLabelWithModels(
                     'Main agent',
-                    main.map((cost) => cost.part.model),
+                    main.map((cost) => cost.part),
                   ),
                   value: sessionCostValue(captured ? [captured.main] : main, captured ? false : mainShort),
                   lines: usageCategoryLines(main, true, mainShort),
@@ -6558,7 +6645,7 @@ export function sessionCostProjection(
                   {
                     label: costLabelWithModels(
                       'Main agent',
-                      main.map((cost) => cost.part.model),
+                      main.map((cost) => cost.part),
                     ),
                     value: sessionCostValue(captured ? [captured.main] : main, captured ? false : mainShort),
                     lines: usageCategoryLines(main, true, mainShort),
@@ -6579,7 +6666,7 @@ export function sessionCostProjection(
           {
             label: costLabelWithModels(
               'Cost by usage',
-              main.map((cost) => cost.part.model),
+              main.map((cost) => cost.part),
             ),
             lines: usageCategoryLines(main),
           },
@@ -6700,7 +6787,7 @@ export function sessionCostProjection(
         {
           label: 'Main agent',
           detail: modelNames(
-            main.map((cost) => cost.part.model),
+            main.map((cost) => cost.part),
             overheads.labels,
           ),
           ...(delegates ? { value: mainValue } : {}),

@@ -5,7 +5,7 @@ import * as fs from 'node:fs';
 import { tempDir } from './temproot.ts';
 import * as path from 'node:path';
 import { normalizeFsPath, scanClaudeRelationshipQuantum, RelationshipReader, revisionOf } from './transcript';
-import { scanCodexDispatchReferencesAsync } from './codex';
+import { scanCodexDispatchReferencesAsync, readCodexAgentSpend } from './codex';
 import { commitSourceStamp } from './transcript';
 import {
   MAX_COMMIT_REPOSITORIES,
@@ -1097,6 +1097,29 @@ test('derived cache rejects child references from another parser generation', ()
 test('derived cache drops saved dispatched facts of another facts version and keeps their rows', () => {
   const file = path.join(folder(), 'cache.json');
   const revision = { size: 20, mtimeMs: 10, dev: 1, ino: 2 };
+  const source = path.join(path.dirname(file), 'child.jsonl');
+  fs.writeFileSync(
+    source,
+    [
+      { type: 'session_meta', payload: { id: 'child', model_provider: 'openai' } },
+      {
+        type: 'event_msg',
+        payload: {
+          type: 'thread_settings_applied',
+          thread_settings: { model_provider_id: 'openai', service_tier: 'default' },
+        },
+      },
+      { type: 'event_msg', payload: { type: 'task_started', turn_id: 'work' } },
+      { type: 'turn_context', payload: { turn_id: 'work', model: 'gpt-6.1-sol', service_tier: 'default' } },
+      {
+        type: 'event_msg',
+        payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 100, output_tokens: 10 } } },
+      },
+    ]
+      .map((row) => JSON.stringify({ ...row, timestamp: '2026-10-01T00:00:00Z' }))
+      .join('\n') + '\n',
+  );
+  const before = fs.statSync(source);
   const dispatch = (sessionId: string, toolUses: number) => ({
     version: DISPATCH_FACTS_VERSION,
     revision,
@@ -1105,7 +1128,7 @@ test('derived cache drops saved dispatched facts of another facts version and ke
       sessionId,
       refreshAt: null,
       revision,
-      spend: { models: [], found: true, partial: false, effort: null },
+      spend: readCodexAgentSpend(source),
       startedAt: null,
       endedAt: null,
       toolUses,
@@ -1120,11 +1143,26 @@ test('derived cache drops saved dispatched facts of another facts version and ke
     references: [],
     dispatch: dispatch(sessionId, toolUses),
   });
-  saveClaudeCache(file, [], [['/dispatched.jsonl', entry('dispatched', 1)]]);
+  saveClaudeCache(file, [['/parent.jsonl', title]], [['/dispatched.jsonl', entry('dispatched', 1)]]);
   assert.deepEqual(
     loadClaudeCache(file).claudeChildReferences.get('/dispatched.jsonl')?.dispatch,
     dispatch('dispatched', 1),
   );
+  const currentBytes = fs.readFileSync(file, 'utf8');
+  const parentCache = JSON.parse(currentBytes);
+  parentCache.metadataGenerations = { claude: 71, codex: 71 };
+  parentCache.claudeChildReferences[0].entry.dispatch.version = 3;
+  delete parentCache.claudeChildReferences[0].entry.dispatch.facts.spend.ownModelTiers;
+  fs.writeFileSync(file, JSON.stringify(parentCache));
+  assert.equal(loadClaudeCache(file).claudeChildReferences.get('/dispatched.jsonl')?.dispatch, undefined);
+  assert.equal(loadClaudeCache(file).titles.size, 0);
+  saveClaudeCache(file, [['/parent.jsonl', title]], [['/dispatched.jsonl', entry('dispatched', 1)]]);
+  assert.deepEqual(
+    loadClaudeCache(file).claudeChildReferences.get('/dispatched.jsonl')?.dispatch?.facts.spend.ownModelTiers,
+    [{ model: 'gpt-6.1-sol', provider: 'openai', serviceTier: 'default' }],
+  );
+  assert.equal(fs.statSync(source).size, before.size);
+  assert.equal(fs.statSync(source).mtimeMs, before.mtimeMs);
   const stored = JSON.parse(fs.readFileSync(file, 'utf8'));
   stored.claudeChildReferences[0].entry.dispatch.version = DISPATCH_FACTS_VERSION + 1;
   fs.writeFileSync(file, JSON.stringify(stored));
@@ -3374,8 +3412,9 @@ test('v1 import keeps each agent by its own generation through migration, restar
   for (const [version, kept] of [
     [70, []],
     [71, []],
-    [69, []],
     [72, []],
+    [69, []],
+    [73, []],
   ] as const) {
     fs.writeFileSync(previous, v1(version));
     const loaded = load();

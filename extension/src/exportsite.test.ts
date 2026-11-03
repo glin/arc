@@ -1901,3 +1901,102 @@ test('matched native agent rows retain completion and figures with missing or am
     }
   }
 });
+
+test('static cost figures use captured catalog names and speed identities', async () => {
+  const writer = await ExportTransaction.create(tempDir('site-speed-labels-'));
+  try {
+    const model = await sessionSiteFixture(writer);
+    model.modelLabels = { 'claude-opus-5': 'Captured Opus' };
+    for (const session of model.sessions)
+      session.numbers.parts = [
+        costPartOf({
+          role: 'main',
+          model: 'claude-opus-5',
+          provider: null,
+          contextWindow: 1000000,
+          serviceTier: 'fast',
+          usage: {
+            requests: 1,
+            input: 100000,
+            cacheRead: 0,
+            cacheWrite1h: 0,
+            cacheWrite5m: 0,
+            cacheWrite30m: 0,
+            output: 1000,
+            thinking: 0,
+          },
+        }),
+      ];
+    await projectSessionSite(model, writer, { script: '', stylesheet: '' });
+    const { manifest } = exportedSiteData((await writer.publish(async () => {})).directory);
+    const cost = manifest.stats.root.find((chip) => chip.metric === 'cost');
+    assert.match(JSON.stringify(cost), /Captured Opus · Fast/);
+  } finally {
+    await writer.dispose();
+  }
+});
+
+test('dispatched cost notes use own tiers when a descendant has the largest model usage', async () => {
+  for (const evidence of ['known', 'mixed', 'unknown', 'missing', 'other-model-unknown'] as const) {
+    const writer = await ExportTransaction.create(tempDir('site-dispatched-speed-'));
+    try {
+      const model = await sessionSiteFixture(writer);
+      const own = {
+        role: 'main' as const,
+        model: 'gpt-6.1-sol',
+        provider: 'openai',
+        contextWindow: 1000000,
+        contextBand: 'short' as const,
+        serviceTier: 'default',
+        usage: { requests: 1, input: 1000, cacheRead: 0, cacheWrite1h: 0, cacheWrite5m: 0, output: 0, thinking: 0 },
+      };
+      const descendant = {
+        ...own,
+        role: 'delegated' as const,
+        model: 'gpt-6-astra',
+        usage: { ...own.usage, input: 10000 },
+      };
+      const root = model.sessions[0];
+      const child = model.sessions[1];
+      root.agent = 'codex';
+      child.agent = 'codex';
+      root.numbers = { ...root.numbers, parts: [costPartOf(own)] };
+      child.numbers = { ...child.numbers, parts: [costPartOf(own), costPartOf(descendant)] };
+      child.ownModelTiers = [own];
+      if (evidence === 'mixed') child.ownModelTiers.push({ ...own, serviceTier: 'priority' });
+      if (evidence === 'unknown') child.ownModelTiers.push({ ...own, serviceTier: null });
+      if (evidence === 'other-model-unknown')
+        child.ownModelTiers.push({ ...own, model: descendant.model, serviceTier: null });
+      if (evidence === 'missing') delete child.ownModelTiers;
+      for (const session of [root, child]) {
+        const page = await writer.readSpool<import('./exportdata').ExportPage>(session.pages[0]);
+        Object.assign(page.turns[0], {
+          model: own.model,
+          provider: own.provider,
+          usage: own.usage,
+          usageParts: [costPartOf(own)],
+          finished: true,
+          relationships: session === root ? ['reader-link'] : [],
+        });
+        session.pages = [await writer.spool(page)];
+        session.turnCount = 1;
+      }
+      model.relationships = [
+        { ...model.relationships[0], kind: 'dispatched', ownership: 'delegated', requestedByReader: false },
+      ];
+      await projectSessionSite(model, writer, { script: '', stylesheet: '' });
+      const { manifest, data } = exportedSiteData((await writer.publish(async () => {})).directory);
+      const card = (data.get(manifest.sessions[0].pages[0].cards![0].id) as { card: CardView }).card;
+      const cost = card.chips!.find((chip) => chip.metric === 'cost')!.detailList!;
+      assert.equal(
+        cost.notes!.includes('Speed was not fully recorded.'),
+        !['known', 'mixed'].includes(evidence),
+        evidence,
+      );
+      assert.equal(cost.heading!.value, formatCost(sessionCostProjection([own, own, descendant]).total.dollars));
+      assert.equal(card.dispatched!.length, 1);
+    } finally {
+      await writer.dispose();
+    }
+  }
+});

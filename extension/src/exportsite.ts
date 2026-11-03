@@ -92,6 +92,7 @@ export function exportCard(value: ReturnType<typeof toCard> | ReturnType<typeof 
     agent: turn?.agent ?? '',
     model: turn?.model ?? null,
     effort: turn?.effort ?? null,
+    ...(turn?.speed ? { speed: turn.speed } : {}),
     headline: value.headline,
     prompt: turn?.prompt ?? '',
     delegation: turn?.delegation ?? '',
@@ -213,6 +214,7 @@ export function exportCard(value: ReturnType<typeof toCard> | ReturnType<typeof 
       description: agent.description,
       model: agent.model,
       effort: agent.effort,
+      ...(agent.speed ? { speed: agent.speed } : {}),
       state: agent.state,
       stateWord: agent.stateWord,
       since: null,
@@ -349,6 +351,7 @@ export function exportTurn(value: ExportTurn, agent: 'claude' | 'codex', session
       agentType: agent.agentType,
       model: agent.model,
       ...(agent.ownModel ? { ownModel: agent.ownModel } : {}),
+      ...(agent.ownModelTiers ? { ownModelTiers: agent.ownModelTiers.map((part) => ({ ...part })) } : {}),
       ...(agent.outputRate ? { outputRate: agent.outputRate } : {}),
       ...(agent.outputRateModel ? { outputRateModel: agent.outputRateModel } : {}),
       effort: agent.effort,
@@ -579,6 +582,7 @@ async function sessionAgentFacts(
       dispatchOwners: new Map([...launches].map(([key, value]) => [key, value.turn])),
       spend: {
         models,
+        ...(session.ownModelTiers ? { ownModelTiers: session.ownModelTiers.map((part) => ({ ...part })) } : {}),
         ownModel: session.agent === 'claude' ? heaviestModel(models.filter((part) => part.role === 'main')) : undefined,
         found: true,
         partial: session.numbers.coverage.usage !== 'complete' || session.numbers.combined.partial,
@@ -759,7 +763,7 @@ export async function projectSessionSite(
   writer: ExportTransaction,
   assets: ExportSiteAssets,
   // Display names from the CLIs' model lists at capture time. Without them, a model reads its family name or its ID.
-  labels?: ModelLabels,
+  labels: ModelLabels = new Map(Object.entries(model.modelLabels ?? {})),
 ): Promise<void> {
   const script = assets.script.replace(/<\/script/gi, '<\\/script');
   const scriptHash = createHash('sha256').update(script).digest('base64');
@@ -807,6 +811,7 @@ export async function projectSessionSite(
               agent.spendFound = true;
               agent.spendPartial = facts.spend.partial;
               agent.ownModel = facts.spend.ownModel ?? undefined;
+              agent.ownModelTiers = facts.spend.ownModelTiers?.map((part) => ({ ...part }));
               agent.artifacts = facts.spend.artifacts
                 ? {
                     ...facts.spend.artifacts,
@@ -838,6 +843,8 @@ export async function projectSessionSite(
               dispatched.push({
                 sessionId: edge.to!,
                 name: target.title,
+                ownModel: facts.spend.ownModel ?? null,
+                ownModelTiers: facts.spend.ownModelTiers,
                 costs: priceDispatchedParts(
                   target.numbers.parts
                     .filter((part) => part.origin !== 'claude-cost-state')
@@ -890,7 +897,7 @@ export async function projectSessionSite(
             const child =
               facts && target
                 ? exportCard({
-                    ...toCard(restored!, false, model.capturedAt),
+                    ...toCard(restored!, false, model.capturedAt, [], null, false, new Set(), [], null, labels),
                     agents: [
                       dispatchedAgentCard(
                         target.key,

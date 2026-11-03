@@ -52,3 +52,20 @@ export function namesDeploymentOf(resolved: string | null | undefined, id: strin
   const base = strip(id);
   return base !== '' && full.startsWith(base) && DEPLOYMENT_SUFFIX.test(full.slice(base.length));
 }
+
+export interface ModelTierIdentity {
+  model: string | null;
+  provider?: string | null;
+  serviceTier?: string | null;
+}
+
+// Retain raw identities once, independently of billing bands and request counts.
+export function distinctModelTierIdentities(parts: Iterable<ModelTierIdentity>): ModelTierIdentity[] {
+  const held = new Map<string, ModelTierIdentity>();
+  for (const { model, provider, serviceTier } of parts) {
+    const identity = { model, provider: provider ?? null, serviceTier: serviceTier ?? null };
+    const key = JSON.stringify([identity.model, identity.provider, identity.serviceTier]);
+    if (!held.has(key)) held.set(key, identity);
+  }
+  return [...held.values()];
+}

@@ -36,6 +36,7 @@ type CommentForm = HTMLFormElement & { _area?: HTMLTextAreaElement };
 interface CommentAnchor {
   card: CommentCard;
   text: string;
+  matchQuote?: string;
   part: CommentPart;
   offset?: number;
   rect: DOMRect;
@@ -263,12 +264,25 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
     return text.trim();
   };
 
+  // Generated speed text contributes no comment offset.
+  const quoteContents = (block: Element, range: Range): DocumentFragment => {
+    const contents = range.cloneContents();
+    for (const speed of Array.from(contents.querySelectorAll('[data-comment-metadata="speed"]'))) {
+      speed.remove();
+    }
+    return contents;
+  };
+
   const lineQuote = (block: Element | null): string => {
     if (!block) {
       return '';
     }
+    if (block.closest('pre')) {
+      return quoteOf(block, () => contentRange(block).cloneContents(), block.textContent || '');
+    }
     const range = contentRange(block);
-    return quoteOf(block, () => range.cloneContents(), block.textContent || '');
+    const contents = quoteContents(block, range);
+    return quoteOf(block, () => contents, contents.textContent || '');
   };
 
   const lineBlock = (at: Element | null, card: Element): Element | null => {
@@ -304,7 +318,7 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
         } catch {
           return total;
         }
-        return total + (before.cloneContents().textContent || '').replace(/\s+/g, ' ').trimStart().length;
+        return total + (quoteContents(candidate, before).textContent || '').replace(/\s+/g, ' ').trimStart().length;
       }
       total += lineQuote(candidate).replace(/\s+/g, ' ').trim().length + 1;
     }
@@ -354,6 +368,14 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
     const at = ends[0] && host.contains(ends[0]) ? ends[0] : node;
     const part = partOfNode(at);
     const text = quoteOf(node, () => range.cloneContents(), range.toString());
+    const metadata = node.closest('[data-comment-metadata="speed"]');
+    const metadataBlock = metadata?.closest('.agenthead') ?? metadata?.closest(QUOTE_BLOCKS);
+    const contents = node.closest('pre') || metadataBlock ? null : quoteContents(node, range);
+    const matchQuote = metadataBlock
+      ? lineQuote(metadataBlock)
+      : contents
+        ? quoteOf(node, () => contents, contents.textContent || '')
+        : text;
     const rect = range.getBoundingClientRect();
     if (!text || (!rect.width && !rect.height)) {
       return null;
@@ -367,8 +389,9 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
     return {
       card,
       text,
+      ...(matchQuote !== text ? { matchQuote } : {}),
       part,
-      offset: offsetOf(host, part, range.startContainer, range.startOffset),
+      offset: offsetOf(host, part, metadataBlock ?? range.startContainer, metadataBlock ? 0 : range.startOffset),
       rect,
       range: range.cloneRange(),
     };
@@ -954,7 +977,14 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
     options.post({ type: 'note', note: move });
   };
 
-  const write = (card: CommentCard, quote: string, part: CommentPart, words: string, offset?: number) => {
+  const write = (
+    card: CommentCard,
+    quote: string,
+    part: CommentPart,
+    words: string,
+    offset?: number,
+    matchQuote?: string,
+  ) => {
     if (options.readOnly) return;
     count += 1;
     const note: TurnComment = {
@@ -963,6 +993,7 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
       turnKey: card.key,
       part,
       quote,
+      ...(matchQuote === undefined ? {} : { matchQuote }),
       ...(offset === undefined ? {} : { offset }),
       note: words,
       headline: card.headline || '',
@@ -999,7 +1030,7 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
         const words = text.trim();
         closeEditor();
         if (current && words) {
-          write(current.card, current.text, current.part, words, current.offset);
+          write(current.card, current.text, current.part, words, current.offset, current.matchQuote);
         }
       },
       closeEditor,
@@ -1181,14 +1212,49 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
   };
 
   const markBlock = (block: Element, notes: TurnComment[], quote: string, partOffset: number) => {
-    const text = (block.textContent || '').replace(/\s+/g, ' ').trim();
+    const visible = { text: '', positions: [] as number[] };
+    const stable = { text: '', positions: [] as number[] };
+    let at = 0;
+    const mapped = !!block.querySelector('[data-comment-metadata="speed"]');
+    if (!mapped) visible.text = stable.text = (block.textContent || '').replace(/\s+/g, ' ').trim();
+    for (const run of mapped ? textRuns(block) : []) {
+      const generated = run.node.parentElement?.closest('[data-comment-metadata="speed"]');
+      const views = generated ? [visible] : [visible, stable];
+      for (let index = 0; index < run.node.length; index++) {
+        const character = run.node.data[index];
+        for (const view of views) {
+          if (!/\s/.test(character) || (view.text && !view.text.endsWith(' '))) {
+            view.positions.push(at);
+            view.text += /\s/.test(character) ? ' ' : character;
+          }
+        }
+        at++;
+      }
+    }
+    visible.text = visible.text.trimEnd();
+    stable.text = stable.text.trimEnd();
     const hits: Array<{ from: number; to: number; id: string }> = [];
     for (const note of notes) {
-      const wanted = withoutMarker((note.quote || '').replace(/[*`]/g, '').replace(/\s+/g, ' ').trim());
       const relative = note.offset === undefined ? undefined : Math.max(0, note.offset - partOffset);
-      const span = quoteSpan(text, wanted, relative);
+      const words = (quote: string) => withoutMarker(quote.replace(/[*`]/g, '').replace(/\s+/g, ' ').trim());
+      const visibleOffset =
+        relative === undefined || !mapped
+          ? relative
+          : visible.positions.findIndex((position) => position >= (stable.positions[relative] ?? at));
+      const full = note.matchQuote === undefined ? null : quoteSpan(visible.text, words(note.quote), visibleOffset);
+      const view = full ? visible : stable;
+      const span = full ?? quoteSpan(stable.text, words(note.matchQuote ?? note.quote ?? ''), relative);
       if (span) {
-        hits.push({ ...span, id: note.id });
+        if (!mapped) {
+          hits.push({ ...span, id: note.id });
+          continue;
+        }
+        for (let end = span.to; end > span.from;) {
+          let start = end - 1;
+          while (start > span.from && view.positions[start] === view.positions[start - 1] + 1) start--;
+          hits.push({ from: view.positions[start], to: view.positions[end - 1] + 1, id: note.id });
+          end = start;
+        }
       }
     }
     const edges = Array.from(new Set(hits.flatMap((hit) => [hit.from, hit.to]))).sort((one, other) => one - other);
@@ -1213,7 +1279,14 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
 
   const sweepSource = (host: Element, body: HTMLElement, mine: readonly TurnComment[]): string =>
     JSON.stringify([
-      mine.map((note) => [note.id, note.part || 'summary', note.quote || '', note.offset ?? null, note.note]),
+      mine.map((note) => [
+        note.id,
+        note.part || 'summary',
+        note.quote || '',
+        note.matchQuote ?? null,
+        note.offset ?? null,
+        note.note,
+      ]),
       countedBlocks(host).map((node) => [partOfNode(node), body.contains(node), node.textContent || '']),
       Array.from(body.querySelectorAll(PROMPT_LEAD_LABEL)).map((node) => node.textContent || ''),
     ]);
@@ -1293,12 +1366,12 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
     for (const note of mine) {
       let nodes = sides.get(note.part || 'summary') ?? [];
       let quotes = nodes.map(lineQuote);
-      let index = blockOfQuote(quotes, note.quote || '', within(note));
+      let index = blockOfQuote(quotes, note.matchQuote ?? note.quote ?? '', within(note));
       if (index < 0) {
         for (const part of elsewhere(note)) {
           nodes = sides.get(part) ?? [];
           quotes = nodes.map(lineQuote);
-          index = blockOfQuote(quotes, note.quote || '', within(note));
+          index = blockOfQuote(quotes, note.matchQuote ?? note.quote ?? '', within(note));
           if (index >= 0) {
             break;
           }
@@ -1400,6 +1473,7 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
       selected: !!inside,
       card,
       text: inside?.text ?? lineQuote(block),
+      ...(inside?.matchQuote === undefined ? {} : { matchQuote: inside.matchQuote }),
       part,
       offset: inside?.offset,
       rect: inside?.rect ?? (block ?? host).getBoundingClientRect(),

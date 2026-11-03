@@ -30,6 +30,7 @@ export const CARD_CONTENT_FIELDS: readonly string[] = [
   'agent',
   'model',
   'effort',
+  'speed',
   'headline',
   'headlineHtml',
   'prompt',

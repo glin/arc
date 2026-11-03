@@ -8,6 +8,7 @@ import type { Browser } from 'playwright-core';
 import { browserOrNone, SETTLED } from '../test/browser.ts';
 import { RAIL_MIN_WIDTH } from './turnview.ts';
 import { renderRichMarkdown } from './richtext.ts';
+import { normalizeComments } from './turncomments.ts';
 import { composerView, pickMenu } from './composerview.ts';
 import {
   COMPOSER,
@@ -1501,6 +1502,225 @@ test('a comment editor stays between the sticky heading and the fixed composer',
     await browser.close();
   }
 });
+
+test('saved comments keep the second identical paragraph when model speed changes', { timeout: 60_000 }, async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('no browser installed');
+    return;
+  }
+  try {
+    const failures: string[] = [];
+    for (const initialSpeed of [undefined, 'Fast', 'Ultrafast']) {
+      const page = await browser.newPage();
+      page.on('pageerror', (error) => failures.push(String(error)));
+      await page.setContent(themed(pageHtml()));
+      const payload = renderPayload() as { cards: Record<string, any>[]; comments: unknown[] };
+      const card = payload.cards[0];
+      payload.cards = [card];
+      payload.comments = [];
+      card.speed = initialSpeed;
+      card.summaryHtml = '<p>yes</p><p>yes</p>';
+      await page.evaluate((value) => window.postMessage(value, '*'), payload);
+      await page.locator('.turn .head').click();
+      await page.locator('.turn .summary p').nth(1).waitFor({ state: 'visible' });
+      await page.evaluate(() => {
+        const line = document.querySelectorAll('.turn .summary p')[1];
+        const range = document.createRange();
+        range.selectNodeContents(line);
+        getSelection()!.removeAllRanges();
+        getSelection()!.addRange(range);
+        document.dispatchEvent(new Event('selectionchange'));
+        line.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true }));
+      });
+      await page.evaluate((key) => window.postMessage({ type: 'openComment', key }, '*'), card.key);
+      await page.locator('.notearea').fill('The second paragraph.');
+      await page.locator('.notesave').click();
+      await page.waitForFunction(() =>
+        (window as any).__posted.some((message: any) => message.type === 'note' && message.note.op === 'write'),
+      );
+      const saved = await page.evaluate(
+        () => (window as any).__posted.filter((message: any) => message.type === 'note').at(-1).note.note,
+      );
+      assert.equal(saved.quote, 'yes');
+      assert.equal(typeof saved.offset, 'number');
+      const persisted = JSON.stringify([saved]);
+      payload.comments = normalizeComments(JSON.parse(persisted));
+      assert.equal((payload.comments[0] as typeof saved).offset, saved.offset);
+      await page.close();
+      for (const speed of ['Fast', 'Ultrafast', undefined]) {
+        const restoredPage = await browser.newPage();
+        restoredPage.on('pageerror', (error) => failures.push(String(error)));
+        card.speed = speed;
+        await restoredPage.setContent(themed(pageHtml()));
+        await restoredPage.evaluate((value) => window.postMessage(value, '*'), payload);
+        await restoredPage.locator('.turn .head').click();
+        await restoredPage.waitForFunction(() => !!document.querySelector('.turn .summary .linemark'));
+        const seen = await restoredPage.locator('.turn').evaluate((node) => ({
+          marks: Array.from(node.querySelectorAll('.summary p')).map((line) => !!line.querySelector('.linemark')),
+          tints: Array.from(node.querySelectorAll('.summary p')).map(
+            (line) => line.querySelector('.cmark')?.textContent || '',
+          ),
+          speed: node.querySelector('.cardheading .speed')?.textContent,
+        }));
+        assert.equal(seen.speed, speed);
+        assert.deepEqual(
+          { marks: seen.marks, tints: seen.tints },
+          { marks: [false, true], tints: ['', 'yes'] },
+          `The saved comment moved when speed changed from ${initialSpeed || 'default'} to ${speed || 'default'}.`,
+        );
+        await restoredPage.close();
+      }
+    }
+    assert.deepEqual(failures, [], 'The panel failed while restoring saved comments.');
+  } finally {
+    await browser.close();
+  }
+});
+
+test(
+  'saved comments keep the second identical subagent row when model speed changes',
+  { timeout: 60_000 },
+  async (t) => {
+    const browser = await browserOrNone();
+    if (!browser) {
+      t.skip('no browser installed');
+      return;
+    }
+    try {
+      const failures: string[] = [];
+      for (const selection of ['description', 'model', 'speed']) {
+        for (const initialSpeed of [undefined, 'Fast', 'Ultrafast']) {
+          if (selection === 'speed' && !initialSpeed) continue;
+          const page = await browser.newPage();
+          page.on('pageerror', (error) => failures.push(String(error)));
+          await page.setContent(themed(pageHtml()));
+          const payload = renderPayload() as { cards: Record<string, any>[]; comments: unknown[] };
+          const card = payload.cards[0];
+          payload.cards = [card];
+          payload.comments = [];
+          Object.assign(payload, { timelineLayout: { cardLayout: 'two-columns', promptPosition: 'above' } });
+          card.agents = [0, 1].map(() => ({
+            description: 'yes',
+            model: 'GPT-6.1',
+            effort: 'high',
+            speed: initialSpeed,
+            figures: [{ metric: 'cost', compactLabel: '$1', name: '$1 spent' }],
+            state: 'running',
+            stateWord: 'running',
+            since: NOW - 1000,
+            hintDetail: '',
+            sessionId: null,
+          }));
+          card.summaryHtml = '<p>Fast response.</p>';
+          card.dispatched = [];
+          card.files = [];
+          card.commits = [];
+          await page.evaluate((value) => window.postMessage(value, '*'), payload);
+          await page.locator('.turn .head').click();
+          await page.locator('.turn .agentrow').nth(1).waitFor({ state: 'visible' });
+          const clone = await page.evaluate((selection) => {
+            const line = document.querySelectorAll('.turn .agentrow')[1];
+            const range = document.createRange();
+            range.selectNodeContents(
+              selection === 'speed'
+                ? Array.from(line.querySelector('.speed')!.childNodes).find((node) => node.nodeType === Node.TEXT_NODE)!
+                : selection === 'model'
+                  ? line.querySelector('.agentmodelrun')!
+                  : line.querySelector('.name')!.firstChild!,
+            );
+            getSelection()!.removeAllRanges();
+            getSelection()!.addRange(range);
+            document.dispatchEvent(new Event('selectionchange'));
+            line.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true }));
+            return {
+              text: range.cloneContents().textContent,
+              wrappers: range.cloneContents().querySelectorAll('[data-comment-metadata="speed"]').length,
+            };
+          }, selection);
+          if (selection === 'speed') assert.deepEqual(clone, { text: initialSpeed, wrappers: 0 });
+          await page.evaluate((key) => window.postMessage({ type: 'openComment', key }, '*'), card.key);
+          await page.locator('.notearea').fill('The second paragraph.');
+          await page.locator('.notesave').click();
+          await page.waitForFunction(() =>
+            (window as any).__posted.some((message: any) => message.type === 'note' && message.note.op === 'write'),
+          );
+          const saved = await page.evaluate(
+            () => (window as any).__posted.filter((message: any) => message.type === 'note').at(-1).note.note,
+          );
+          if (selection === 'speed') {
+            assert.equal(saved.quote, initialSpeed);
+          } else if (selection === 'model') {
+            assert.ok(saved.quote.includes('GPT-6.1'));
+            if (initialSpeed) {
+              assert.ok(saved.quote.includes(initialSpeed));
+              assert.ok(!saved.matchQuote.includes(initialSpeed));
+            }
+          } else assert.equal(saved.quote, 'yes');
+          assert.equal(typeof saved.offset, 'number');
+          const persisted = JSON.stringify([saved]);
+          payload.comments = normalizeComments(JSON.parse(persisted));
+          assert.equal((payload.comments[0] as typeof saved).offset, saved.offset);
+          await page.close();
+          for (const [speed, update] of [
+            ['Fast', 'timer'],
+            ['Ultrafast', 'figures'],
+            [undefined, 'finished'],
+          ] as const) {
+            for (const withOffset of selection === 'speed' ? [false, true] : [true]) {
+              const restoredPage = await browser.newPage();
+              restoredPage.on('pageerror', (error) => failures.push(String(error)));
+              for (const agent of card.agents) {
+                agent.speed = speed;
+                agent.since = update === 'finished' ? null : NOW - 62_000;
+                agent.state = update === 'finished' ? 'done' : 'running';
+                agent.stateWord = update === 'finished' ? '' : 'running';
+                agent.figures = [{ metric: 'cost', compactLabel: update === 'timer' ? '$1' : '$2', name: 'Spent' }];
+              }
+              payload.comments = normalizeComments([{ ...saved, offset: withOffset ? saved.offset : undefined }]);
+              await restoredPage.setContent(themed(pageHtml()));
+              await restoredPage.evaluate((value) => window.postMessage(value, '*'), payload);
+              await restoredPage.locator('.turn .head').click();
+              await restoredPage.waitForFunction(() => !!document.querySelector('.turn .linemark'));
+              const seen = await restoredPage.locator('.turn').evaluate((node) => ({
+                marks: Array.from(node.querySelectorAll('.agentrow')).map((line) => !!line.querySelector('.linemark')),
+                tints: Array.from(node.querySelectorAll('.agentrow')).map((line) =>
+                  Array.from(line.querySelectorAll('.cmark'))
+                    .map((span) => span.textContent)
+                    .join(''),
+                ),
+                speed: node.querySelector('.agentrow .speed')?.textContent.trim(),
+                responseMarks: node.querySelectorAll('.summary .linemark, .summary .cmark').length,
+              }));
+              assert.equal(seen.speed?.includes(speed || 'recorded speed setting'), speed ? true : undefined);
+              assert.deepEqual(
+                { marks: seen.marks, tints: seen.tints },
+                {
+                  marks: withOffset ? [false, true] : [true, false],
+                  tints: [
+                    ...(!withOffset ? [] : ['']),
+                    selection === 'description'
+                      ? 'yes'
+                      : speed === initialSpeed
+                        ? saved.quote
+                        : (saved.matchQuote ?? saved.quote),
+                    ...(!withOffset ? [''] : []),
+                  ],
+                },
+                `The saved comment moved when speed changed from ${initialSpeed || 'default'} to ${speed || 'default'}.`,
+              );
+              assert.equal(seen.responseMarks, 0, 'The response took the subagent row comment.');
+              await restoredPage.close();
+            }
+          }
+        }
+      }
+      assert.deepEqual(failures, [], 'The panel failed while restoring saved comments.');
+    } finally {
+      await browser.close();
+    }
+  },
+);
 
 test(
   'saved offsets and new comments select the correct repeated text without matching partial words',

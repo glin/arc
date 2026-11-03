@@ -10217,6 +10217,10 @@ test('a Claude child transcript keeps model rates apart, reports nested work, an
         },
       ],
       ownModel: 'claude-opus-5',
+      ownModelTiers: [
+        { model: 'claude-opus-5', provider: null, serviceTier: null },
+        { model: 'claude-sonnet-5', provider: null, serviceTier: null },
+      ],
       found: true,
       partial: true,
       effort: 'high',
@@ -18460,9 +18464,53 @@ test('explicit browser destinations distinguish web authority from local HTML an
   assert.equal(linkBrowserKind({ kind: 'fileCitation', path: '/report.html#L10' }), null);
   assert.equal(linkBrowserKind({ kind: 'fileCitation', path: '/report%20.HTML' }), 'html');
 });
-
 test('tailOf reads a compressed rollout as an unreadable file', () => {
   const file = path.join(tempDir('tail-compressed-'), 'rollout-a.jsonl.zst');
   fs.writeFileSync(file, '{"type":"session_meta"}\n{"type":"event_msg"}\n');
   assert.deepEqual(tailOf(file, 1024, true), { lines: [], whole: false, readBytes: 0 });
+});
+
+test('a Claude child retains its own tier before same-model descendant spend is added', () => {
+  const folder = tempDir('own-tier-child-');
+  const source = path.join(folder, 'agent-a1.jsonl');
+  const own = childBlock('own', 'own-request', 2, 100, 'end_turn', 'claude-opus-5', [
+    ...agentLaunch('launch-tier'),
+    ...doneText,
+  ]);
+  Object.assign(own.message.usage, { speed: 'standard' });
+  writeRecords(source, [childTurn('own', 0), childRequest('own-request', 1), own]);
+  writeSubagentMeta(folder, 'a2', 'launch-tier', 'a1');
+  const nested = childBlock('nested', 'nested-request', 5, 900);
+  Object.assign(nested.message.usage, { speed: 'fast' });
+  writeRecords(path.join(folder, 'agent-a2.jsonl'), [
+    childTurn('nested', 3),
+    childRequest('nested-request', 4),
+    nested,
+  ]);
+  const spend = readClaudeAgentSpend(source);
+  assert.deepEqual(spend.ownModelTiers, [{ model: 'claude-opus-5', provider: null, serviceTier: 'standard' }]);
+  assert.equal(spend.models[0].usage.output, 1000);
+  assert.deepEqual(new Set(spend.models[0].usageParts?.map((part) => part.serviceTier)), new Set(['standard', 'fast']));
+});
+
+test('repeated Claude requests retain distinct raw own identities', () => {
+  const folder = tempDir('own-distinct-tiers-');
+  const source = path.join(folder, 'agent-distinct.jsonl');
+  const records: object[] = [childTurn('own', 0)];
+  for (let i = 0; i < 60; i++) {
+    const block = childBlock(`b${i}`, `r${i}`, 2 + i * 2, 100);
+    Object.assign(block.message.usage, {
+      input_tokens: i % 2 ? 300000 : 100,
+      inference_geo: i % 2 ? 'global' : 'in-region',
+    });
+    if (i > 0) Object.assign(block.message.usage, { speed: i === 59 ? 'fast' : 'standard' });
+    records.push(childRequest(`r${i}`, 1 + i * 2), block);
+  }
+  writeRecords(source, records);
+  const spend = readClaudeAgentSpend(source);
+  assert.deepEqual(spend.ownModelTiers, [
+    { model: 'claude-opus-5', provider: null, serviceTier: null },
+    { model: 'claude-opus-5', provider: null, serviceTier: 'standard' },
+    { model: 'claude-opus-5', provider: null, serviceTier: 'fast' },
+  ]);
 });

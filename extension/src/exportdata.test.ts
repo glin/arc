@@ -1867,3 +1867,109 @@ test('capturing a Codex parent includes its recorded background review on the ow
     assert.ok(artifact.text.every((text) => !text.includes('PRIVATE UNRELATED REVIEW')));
   }
 });
+
+test('export captures represented catalog labels and retains own-tier facts without requiring them in version one', async () => {
+  const f = fixture();
+  const writer = await ExportTransaction.create(f.output);
+  try {
+    const capture = await captureSessionExport(
+      { ...f.options, modelLabels: { 'claude-sonnet-4-5': 'Catalog Sonnet', unrepresented: 'Unused' } },
+      writer,
+    );
+    assert.deepEqual(capture.model.modelLabels, { 'claude-sonnet-4-5': 'Catalog Sonnet' });
+    const model = 'gpt-6.1-sol';
+    const source = turn({
+      model,
+      agents: [subagent({ model, ownModelTiers: [{ model, provider: 'openai', serviceTier: 'ultrafast' }] })],
+    });
+    const saved = projectTurn(source, 'turn', { cwd: '/project' }, [], 'root', new Map());
+    const restored = exportTurn(JSON.parse(JSON.stringify(saved)), 'codex', 'root');
+    assert.deepEqual(restored.agents[0].ownModelTiers, source.agents[0].ownModelTiers);
+    delete saved.agents[0].ownModelTiers;
+    assert.equal(exportTurn(saved, 'codex', 'root').agents[0].ownModelTiers, undefined);
+    delete capture.model.modelLabels;
+    assert.equal(capture.model.version, 1);
+  } finally {
+    await writer.dispose();
+  }
+});
+
+test('old dispatched exports explain missing own speed despite known billing tiers', async () => {
+  for (const retainOwnIdentities of [true, false]) {
+    const f = fixture();
+    const requests = (id: string, serviceTier: string) => {
+      const records = codexTurn(id);
+      Object.assign((records[1] as { payload: object }).payload, {
+        model: 'gpt-6.1-sol',
+      });
+      records.unshift(
+        record('event_msg', 0, {
+          payload: {
+            type: 'thread_settings_applied',
+            thread_settings: { model: 'gpt-6.1-sol', model_provider_id: 'openai', service_tier: serviceTier },
+          },
+        }),
+      );
+      return records;
+    };
+    f.codexSession(NATIVE_CODEX_ID, undefined, requests('child', 'ultrafast'));
+    const records = requests('parent', 'priority');
+    records.splice(
+      3,
+      0,
+      record('event_msg', 1, {
+        payload: {
+          type: 'item_completed',
+          item: {
+            type: 'CommandExecution',
+            id: 'dispatch-child',
+            command: ['powershell.exe', '-Command', 'python dispatch.py --arc-dispatch --runner codex'],
+            parsed_cmd: [{ type: 'unknown', cmd: 'python dispatch.py --arc-dispatch --runner codex' }],
+            cwd: 'file:///C:/repo',
+            status: 'completed',
+            exit_code: 0,
+            stdout: `ARC_DISPATCH_SESSION={"agent":"codex","session_id":"${NATIVE_CODEX_ID}"}`,
+          },
+        },
+      }),
+    );
+    const root = f.codexSession(CODEX_ID, undefined, records);
+    const writer = await ExportTransaction.create(f.output);
+    try {
+      const captured = await captureSessionExport(
+        {
+          ...f.options,
+          root: { ...f.options.root, agent: 'codex', sessionId: CODEX_ID, file: root },
+        },
+        writer,
+      );
+      const model = JSON.parse(JSON.stringify(captured.model)) as SessionExport;
+      assert.equal(model.version, 1);
+      const edge = model.relationships.find((edge) => edge.kind === 'dispatched')!;
+      assert.ok(edge?.to);
+      const child = model.sessions.find((session) => session.key === edge.to)!;
+      assert.equal(child.ownModelTiers?.[0]?.serviceTier, 'ultrafast', JSON.stringify(child.numbers));
+      assert.ok(child.numbers.parts.every((part) => part.serviceTier === 'ultrafast'));
+      const rootPage = await writer.readSpool<ExportPage>(
+        model.sessions.find((session) => session.key === model.root)!.pages[0],
+      );
+      assert.equal(rootPage.turns[0].usageParts[0].serviceTier, 'priority');
+      if (!retainOwnIdentities) delete child.ownModelTiers;
+      child.numbers.coverage.usage = 'partial';
+      const amount = model.sessions.find((session) => session.key === model.root)!.numbers.combined.dollars!;
+      await projectSessionSite(model, writer, { script: '', stylesheet: '' });
+      const { manifest, data } = exportedSiteData((await writer.publish(async () => {})).directory);
+      const card = [...data.values()]
+        .map((value) => value as { card?: import('./webview/payload-contracts').CardView })
+        .find((value) => value.card?.key === edge.turn)!.card!;
+      assert.equal(card.speed, 'Fast');
+      assert.equal(card.dispatched?.[0].speed, retainOwnIdentities ? 'Ultrafast' : undefined);
+      const cost = card.chips!.find((chip) => chip.metric === 'cost')!;
+      assert.equal(cost.detailList!.notes!.includes('Speed was not fully recorded.'), !retainOwnIdentities);
+      assert.equal(cost.label, `${formatCost(amount)}+`);
+      assert.equal(manifest.relationships.find((value) => value.key === edge.key)!.ownership, 'delegated');
+    } finally {
+      await writer.dispose();
+    }
+  }
+});

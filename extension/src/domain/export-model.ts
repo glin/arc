@@ -161,6 +161,7 @@ export interface ExportTurn {
     agentType: string | null;
     model: string | null;
     ownModel?: string;
+    ownModelTiers?: import('./model-identity').ModelTierIdentity[];
     outputRate?: { output: number; milliseconds: number };
     outputRateModel?: string;
     effort: string | null;
@@ -238,6 +239,7 @@ export interface ExportPage {
   compactions: ExportCompaction[];
 }
 export interface ExportSession {
+  ownModelTiers?: import('./model-identity').ModelTierIdentity[];
   key: string;
   agent: 'claude' | 'codex';
   title: string;
@@ -258,6 +260,7 @@ export interface ExportSession {
   };
 }
 export interface SessionExport {
+  modelLabels?: Record<string, string>;
   version: 1;
   root: string;
   capturedAt: number;

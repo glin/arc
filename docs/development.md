@@ -161,6 +161,14 @@ Change model and provider pricing in `extension/src/pricing.ts`.
 17. Update exact model coverage in [Supported pricing](cost-figures.md#supported-pricing). Update README provider summaries when provider coverage changes.
 18. Check personal billing consumers against the same request evidence and Arc build. Record independent pricing behavior until each consumer uses Arc billing.
 
+For each direct OpenAI model, audit Standard, Fast/Priority, Flex, Batch, and Ultrafast against primary rate tables. Record independently expected category rates and supported request bands in `OPENAI_TIER_AUDIT` in `pricing.test.ts`. Mark unpublished combinations explicitly. Audit exact identities, snapshots, rate aliases, promotions, and provider routes. A new model without a tier decision fails the independent support matrix.
+
+Keep applied settings separate from returned request evidence. An applied tier establishes a recorded selection, without proving delivered throughput or an invoice. Preserve unknown evidence. Normalize equivalent aliases only for the provider that defines them. Keep configured prices authoritative for their named mode.
+
+Use model-specific multipliers only for uniform ratios. Declare restricted bands and exact category rates when published tables require them. A short-only tier needs request-size or retained-band evidence. Missing evidence leaves its price unavailable. Inspect recorded cache-duration counters before admitting another cache product. A speed change establishes no cache lifetime.
+
+Check request, session, Project cost, next-turn, child, saved-cache, and export consumers. Keep money identities separate by raw model, provider, and canonical tier. Keep each child's own executor identities before adding descendants.
+
 ## Environment overrides
 
 Empty vendor homes count as unset.
@@ -193,6 +201,8 @@ The launch passes the checkout as a positional folder argument on Windows. Do no
 The server binds strictly to `127.0.0.1:5173`. Stop a conflicting process before retrying. Fix syntax errors and save to recover. Check reconnects with a reopened panel and a restored tab.
 
 Development command selection follows the [bundled tools contract](installation.md#bundled-tools). Reload the Extension Development Host after extension-host source saves. Watch-mode CLI commands run the rebuilt bundle on their next invocation. `extension/esbuild.mjs` owns both watchers.
+
+Panel rebuilds run in sequence. Closing the build waits for an active rebuild and closes its replacement context before returning.
 
 This workflow supports a local Windows Extension Development Host. Remote extension hosts and port-forwarded development servers are unsupported. The webview loads its loopback address on the local VS Code machine, while a remote command binds on the remote machine.
 

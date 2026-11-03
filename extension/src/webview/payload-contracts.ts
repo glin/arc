@@ -62,6 +62,7 @@ export interface CardView extends Record<string, unknown> {
   agent: string;
   model: string | null;
   effort: string | null;
+  speed?: string | null;
   headline: string;
   headlineHtml?: string;
   prompt: string;
@@ -133,6 +134,7 @@ export interface CardView extends Record<string, unknown> {
     description: string;
     model: string | null;
     effort: string | null;
+    speed?: string | null;
     figures: WireAgentFigure[];
     state: 'done' | 'running' | 'open' | 'failed' | 'interrupted' | 'stopped';
     stateWord: string;

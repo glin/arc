@@ -608,6 +608,7 @@ function composerLive(value: unknown): value is ComposerLive {
     isString(live.absolute) &&
     isString(live.agent) &&
     isString(live.model) &&
+    (live.speed === undefined || live.speed === null || isString(live.speed)) &&
     isString(live.label) &&
     isString(live.headline) &&
     isString(live.status) &&

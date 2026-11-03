@@ -1,6 +1,7 @@
 import type { SourceEnumeration } from './sessioncoverage';
 import { codexToolKind, nestedToolName, wrappedCommand } from './domain/tool-kinds';
 import type { InitialNameSubscription } from './sessionrename';
+import { distinctModelTierIdentities } from './domain/model-identity';
 import * as fs from 'node:fs';
 import { ExportLimitError, type ExportRelationshipLimits } from './exportlimits';
 import {
@@ -4806,9 +4807,23 @@ function* readCodexOwnSpendIncremental(file: string): Generator<{ bytes: number;
   if (meta && isHiddenThread(meta) && meta.startedAt !== null) {
     artifacts.startedAt = meta.startedAt;
   }
+  const activeRequests = new Map<string, UsageEvent>();
+  for (const event of requests) {
+    activeRequests.delete(event.requestKey);
+    if ((event.usage.requests ?? 1) > 0) activeRequests.set(event.requestKey, event);
+  }
   const spend: AgentSpend = found
     ? {
         models: [...byIdentity.values()],
+        ownModelTiers: distinctModelTierIdentities(
+          [...activeRequests.values()]
+            .filter((event) => !event.usageOrigin && !event.linkedInvocationId && !event.compactionEstimate)
+            .map((event) => ({
+              model: event.model,
+              provider: event.agent === 'claude' ? event.provider : (event.provider ?? provider),
+              serviceTier: event.serviceTier,
+            })),
+        ),
         ...measured,
         found: true,
         partial,
@@ -6022,7 +6037,7 @@ export function discoverCodexNewestTurn(
 }
 
 export interface CodexSessionParserState {
-  version: 29;
+  version: 30;
   // Text that subagents returned into this session's context.
   subagents: SubagentContextState;
   responseClock: CodexResponseClock;
@@ -6114,7 +6129,7 @@ function emptyCodexSessionParserState(meta: CodexSessionMeta | null): CodexSessi
   const replayBoundaryAt = meta?.replayBoundaryAt ?? null;
   const openingSessionId = meta?.sessionId ?? null;
   return {
-    version: 29,
+    version: 30,
     subagents: emptySubagentContext(),
     responseClock: emptyCodexResponseClock(),
     turns: [],
@@ -7946,7 +7961,7 @@ export function createCodexSessionReducer(
   restored?: CodexSessionParserState,
 ): CodexSessionReducer {
   const state = restored ? cloneParserState(restored) : emptyCodexSessionParserState(meta);
-  if (state.version !== 29) {
+  if (state.version !== 30) {
     throw new Error('Incompatible Codex parser state');
   }
   applyHiddenParserState(codexHiddenSlots(state), state.hidden, CODEX_HIDDEN_POLICY);
@@ -8049,6 +8064,8 @@ function attachCodexAgentSpend(turns: Turn[], lookup: AgentSpendLookup | undefin
         status: agent.status,
       });
       agent.spend = spend.models;
+      if (spend.ownModelTiers) agent.ownModelTiers = spend.ownModelTiers.map((part) => ({ ...part }));
+      else delete agent.ownModelTiers;
       delete agent.outputRate;
       delete agent.outputRateModel;
       if (spend.outputRate && spend.outputRateModel) {

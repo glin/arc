@@ -43,7 +43,7 @@ import assert from 'node:assert';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { readCodexAgentSpend, refreshCodexStructuralAgents } from './codex.ts';
-import { AgentSpendCache, emptyUsage, readChildSpend, spendFileVersion } from './agentspend.ts';
+import { AgentSpendCache, emptyUsage, heaviestModel, readChildSpend, spendFileVersion } from './agentspend.ts';
 import { tempDir } from './temproot.ts';
 import * as pricing from './pricing.ts';
 import * as richtext from './richtext.ts';
@@ -1327,7 +1327,7 @@ test('the cost popovers lead with the wait warning, and their Waits rows count t
     ],
   );
   assert.equal(models.more, undefined);
-  assert.match(models.rows[1].title, /^gpt-6-astra, 1 agent\. \$[0-9.]+, \d+% of delegated work\.$/);
+  assert.match(models.rows[1].title, /^gpt-6-astra · OpenAI, 1 agent\. \$[0-9.]+, \d+% of delegated work\.$/);
   // Delegated work reads its own tool rows, as shares of delegated work.
   const delegatedTools = split.tabs[1].parts[1].rows;
   assert.deepEqual(
@@ -1387,8 +1387,11 @@ test('the Delegated section lists one row per model with its agent count', () =>
     child('agent-1', 'claude-sonnet-5-5', 5_000),
     child('agent-2', 'claude-sonnet-5-5-20261001', 6_000),
   ]);
-  assert.deepEqual(rowsOf(sonnets.part), [['Sonnet 5.5', '2 agents']]);
-  assert.match(sonnets.part.rows[0].title, /^claude-sonnet-5-5, claude-sonnet-5-5-20261001, 2 agents\. /);
+  assert.deepEqual(rowsOf(sonnets.part), [
+    ['Sonnet 5.5', '1 agent'],
+    ['Sonnet 5.5', '1 agent'],
+  ]);
+  assert.match(sonnets.part.rows[0].title, /^claude-sonnet-5-5-20261001, 1 agent\. /);
   const six = delegatedOf([
     main,
     child('agent-1', 'claude-sonnet-5-5', 900_000),
@@ -6529,6 +6532,7 @@ test('the cost chip includes child transcripts and its hover breaks the total do
     'Audit the parser · haiku-4-5: $1.00',
     '  Cached input reads: $0 (0% cached)',
     '  Uncached input: $1.00',
+    'Speed was not fully recorded.',
     'Estimated from published model rates. Your actual charge may differ.',
   ];
   assert.deepEqual(costDetail(t), expectedDetail);
@@ -6547,7 +6551,7 @@ test('the cost chip includes child transcripts and its hover breaks the total do
         lines: costLines('Cached input reads: $0 (0% cached)', 'Uncached input: $1.00'),
       },
     ],
-    notes: ['Estimated from published model rates. Your actual charge may differ.'],
+    notes: ['Speed was not fully recorded.', 'Estimated from published model rates. Your actual charge may differ.'],
   });
   assert.equal(cost?.headDetail, true);
   assert.match(cost!.name!, /Audit the parser .* haiku-4-5: \$1\.00/);
@@ -7710,7 +7714,7 @@ test('Auto Review child detail uses exact service and inference identities', () 
   const cost = card.chips.find((chip) => chip.metric === 'cost')!;
   const review = cost.detailList?.entries.find((entry) => entry.label === 'Codex Auto Review');
   assert.equal(review?.value, cost.label);
-  assert.match(cost.detail, /Priority service-tier price unavailable\./);
+  assert.match(cost.detail, /Fast-mode price unavailable\./);
 });
 
 test('a running child keeps a priced subtotal marked as incomplete', () => {
@@ -7886,6 +7890,7 @@ test('the cost detail follows the shared usage category order', () => {
     '  Uncached input: <$0.01',
     '  1-hour cache writes: $0.40',
     '  5-minute cache writes: $0.05',
+    'Speed was not fully recorded.',
     CACHED_INPUT_READ_EXPLANATION,
     'Estimated from published model rates. Your actual charge may differ.',
   ]);
@@ -9691,8 +9696,8 @@ test('indexed lifetime cost prices Auto Review and names every remaining unprice
   );
   assert.equal(
     chips[0].detailList?.entries.filter((entry) => entry.label === 'Codex Auto Review').length,
-    1,
-    'provider variants and repeated usage from Auto Review remain one detail entry',
+    2,
+    'raw provider variants retain separate detail entries',
   );
   assert.match(chips[0].detail, /Some usage could not be priced, so the estimated total may be low\./);
   assert.match(chips[0].detail, /Includes the main session and delegated work\./);
@@ -9856,7 +9861,7 @@ test('indexed lifetime cost separates the main agent from rolled-up delegated wo
       model: 'gpt-5.6-sol',
       provider: 'openai',
       contextWindow: 1_000_000,
-      serviceTier: 'priority',
+      serviceTier: 'unsupported',
       usage,
     },
     {
@@ -9891,7 +9896,7 @@ test('indexed lifetime cost separates the main agent from rolled-up delegated wo
       {
         label: 'Main agent · gpt-5.6-sol',
         value: 'cost unavailable',
-        lines: ['Priority service-tier price unavailable.'],
+        lines: ['Unsupported service-tier price unavailable.'],
       },
       {
         label: 'Claude · opus-5',
@@ -10004,13 +10009,22 @@ test('indexed lifetime cost prices aggregated Auto Review volume without changin
       label: 'Codex Auto Review',
       value: '$0.04',
       lines: costLines(
-        'Output: $0.03',
-        'Cached input reads: <$0.01 (57% cached · 3 requests · 4,667 avg input)',
+        'Output: $0.02',
+        'Cached input reads: <$0.01 (56% cached · 2 requests · 5,350 avg input)',
         'Uncached input: $0.01',
       ),
     },
+    {
+      label: 'Codex Auto Review',
+      value: '<$0.01',
+      lines: costLines(
+        'Output: <$0.01',
+        'Cached input reads: <$0.01 (61% cached · 1 request · 3,300 avg input)',
+        'Uncached input: <$0.01',
+      ),
+    },
   ]);
-  assert.equal(chip.detailList?.entries.filter((entry) => entry.label === 'Codex Auto Review').length, 1);
+  assert.equal(chip.detailList?.entries.filter((entry) => entry.label === 'Codex Auto Review').length, 2);
   assert.equal(chip.partialDetail, undefined);
   assert.match(chip.detail, /Codex Auto Review uses the OpenAI Codex rate card\./);
   assert.match(chip.detail, /Estimated from published model rates\. Your actual charge may differ\./);
@@ -10040,7 +10054,16 @@ test('indexed lifetime cost prices aggregated Auto Review volume without changin
   });
   const card = toCard(parent, false, NOW);
   assert.equal(card.chips.find((held) => held.label.includes(' in'))?.label, '2k in · 200 out');
-  const wholeReview = chip.detailList?.entries.find((entry) => entry.label === 'Codex Auto Review');
+  const wholeReview = sessionCostStats(
+    [firstReview, secondReview].map((usage) => ({
+      agent: 'codex',
+      role: 'delegated' as const,
+      model: 'codex-auto-review',
+      provider: 'openai',
+      contextWindow: null,
+      usage,
+    })),
+  )[0].detailList?.entries.find((entry) => entry.label === 'Codex Auto Review');
   const turnReview = card.chips
     .find((held) => held.label.startsWith('$'))
     ?.detailList?.entries.find((entry) => entry.label.includes('Auto Review'));
@@ -10147,7 +10170,7 @@ test('indexed lifetime cost prices aggregated Auto Review volume without changin
   );
 });
 
-test('lifetime cost rolls dated and undated model ids into their shared displayed identity', () => {
+test('lifetime cost retains raw dated identities when their reading names match', () => {
   const usage = { input: 1, cacheWrite1h: 0, cacheWrite5m: 0, cacheRead: 0, output: 1, thinking: 0 };
   const chip = sessionCostStats([
     {
@@ -10185,7 +10208,11 @@ test('lifetime cost rolls dated and undated model ids into their shared displaye
   assert.equal(chip.detailList?.entries[0].label, 'Main agent · opus-5');
   assert.deepEqual(chip.detailList?.entries[1].lines, [
     {
-      text: 'Claude · haiku-4-5: $5.00',
+      text: 'Claude · haiku-4-5: $3.00',
+      cacheHit: { percent: 0, warning: false },
+    },
+    {
+      text: 'Claude · haiku-4-5: $2.00',
       cacheHit: { percent: 0, warning: false },
     },
   ]);
@@ -10206,7 +10233,7 @@ test('lifetime cost rolls dated and undated model ids into their shared displaye
   ])[0];
   assert.equal(
     unpriced.partialDetail,
-    'Cost unavailable for Claude · unlisted-model: reliable list-price estimate unavailable. Some usage could not be priced, so the estimated total may be low.',
+    'Cost unavailable for Claude · unlisted-model: reliable list-price estimate unavailable. Cost is also unavailable for 1 more. Some usage could not be priced, so the estimated total may be low.',
   );
 });
 
@@ -10426,12 +10453,12 @@ test('indexed lifetime cost explains an unavailable tier beside priced usage fro
   };
   const chip = sessionCostStats([
     { ...part, serviceTier: 'default' },
-    { ...part, serviceTier: 'priority' },
+    { ...part, serviceTier: 'unsupported' },
   ])[0];
   assert.equal(chip.compactLabel, '$4.00+');
   assert.deepEqual(chip.detailList?.entries[0].lines, [
     ...costLines('Uncached input: $4.00'),
-    'Cost unavailable for Codex · gpt-5.6-sol · OpenAI: priority service-tier price unavailable.',
+    'Cost unavailable for Codex · gpt-5.6-sol · OpenAI: unsupported service-tier price unavailable.',
   ]);
 });
 
@@ -13194,4 +13221,190 @@ test('revoked parsed child closure retains its cache-expiry return after checkpo
     );
     assert.equal(result.get(turnKey(parent))?.count, 1);
   }
+});
+
+test('a child keeps its own speed while its same-model descendant prices separately', () => {
+  const model = 'gpt-6.1-sol';
+  const part = (serviceTier: string) => ({
+    model,
+    provider: 'openai',
+    contextWindow: 1050000,
+    contextBand: 'short' as const,
+    inferenceClass: null,
+    serviceTier,
+    usage: { ...emptyUsage(), requests: 1, input: 100000 },
+  });
+  const child = agent({
+    model,
+    ownModel: model,
+    ownModelTiers: [{ model, provider: 'openai', serviceTier: 'default' }],
+    spendFound: true,
+    status: 'completed',
+    spend: [
+      {
+        model,
+        provider: 'openai',
+        usage: { ...emptyUsage(), input: 200000 },
+        usageParts: [part('default'), part('priority')],
+      },
+    ],
+  });
+  const t = turn({
+    agent: 'codex',
+    model,
+    provider: 'openai',
+    finished: true,
+    usage: { ...emptyUsage(), requests: 1, input: 100000 },
+    usageParts: [part('priority')],
+    agents: [child],
+  });
+  const card = toCard(t, false, NOW);
+  assert.equal(card.speed, 'Fast');
+  assert.match(card.label, /Fast recorded speed setting/);
+  assert.equal(card.agents[0].speed, undefined);
+  const rows = card.chips.find((chip) => chip.metric === 'cost')!.detailList!.cost!.tabs[0].parts[1].rows;
+  assert.deepEqual(
+    rows.map((row) => [row.label, row.value, row.count]),
+    [
+      ['GPT-6.1 Sol · Fast', '$0.40', '1 agent'],
+      ['GPT-6.1 Sol', '$0.20', '1 agent'],
+    ],
+  );
+  child.ownModelTiers = [{ model, provider: 'openai', serviceTier: 'ultrafast' }];
+  assert.equal(toCard(t, false, NOW).agents[0].speed, 'Ultrafast');
+  delete child.ownModelTiers;
+  assert.equal(toCard(t, false, NOW).agents[0].speed, undefined);
+});
+
+test('one retained request cannot attribute speed to an unknown multi-request scope', () => {
+  const model = 'gpt-6.1-sol';
+  const source = turn({
+    agent: 'codex',
+    model,
+    provider: 'openai',
+    usageParts: [],
+    usage: { ...emptyUsage(), requests: 2, input: 100000 },
+    contextRequest: {
+      at: NOW,
+      lifetime: null,
+      inferenceClass: null,
+      serviceTier: 'priority',
+      readBack: true,
+      outputTokens: 0,
+    },
+  });
+  assert.equal(toCard(source, false, NOW).speed, null);
+  source.usage.requests = 1;
+  assert.equal(toCard(source, false, NOW).speed, 'Fast');
+});
+
+test('own speed uncertainty includes children and excludes other usage scopes', () => {
+  const model = 'gpt-6.1-sol';
+  const known = {
+    model,
+    provider: 'openai',
+    serviceTier: 'priority',
+    contextWindow: null,
+    contextBand: 'short' as const,
+    inferenceClass: null,
+    usage: { ...emptyUsage(), requests: 1, input: 100 },
+  };
+  const subject = turn({ agent: 'codex', model, provider: 'openai', usage: known.usage, usageParts: [known] });
+  const notes = (costs: DispatchedTurnCost[] = []) =>
+    costFigure(toCard(subject, false, NOW, [], null, false, new Set(), costs)).detailList!.notes!.includes(
+      'Speed was not fully recorded.',
+    );
+  assert.equal(notes(), false);
+  subject.usage = { ...known.usage, requests: 2, input: 200 };
+  subject.usageParts = [known, { ...known, model: 'gpt-6-astra', serviceTier: null }];
+  assert.equal(toCard(subject, false, NOW).speed, 'Fast');
+  assert.equal(notes(), false);
+  subject.usageParts = [known, { ...known, model: null, serviceTier: null }];
+  assert.deepEqual(
+    { speed: toCard(subject, false, NOW).speed, incomplete: notes() },
+    { speed: null, incomplete: true },
+  );
+  subject.usageParts = [known];
+  subject.usage = known.usage;
+  subject.agents = [
+    agent({ model, ownModel: model, spendFound: true, spend: [{ model, usage: known.usage, usageParts: [known] }] }),
+  ];
+  assert.equal(notes(), true);
+  subject.agents[0].ownModelTiers = [{ model, provider: 'openai', serviceTier: 'priority' }];
+  assert.equal(notes(), false);
+  subject.agents[0].ownModelTiers.push({ model, provider: 'openai', serviceTier: null });
+  assert.equal(toCard(subject, false, NOW).agents[0].speed, undefined);
+  assert.equal(notes(), true);
+  subject.agents[0].ownModelTiers = [
+    { model, provider: 'openai', serviceTier: 'priority' },
+    { model: null, provider: null, serviceTier: null },
+  ];
+  assert.equal(toCard(subject, false, NOW).agents[0].speed, undefined);
+  assert.equal(notes(), true);
+  subject.agents = [];
+  assert.equal(
+    notes([
+      dispatchedCost({ parts: [dispatchedPart(100, { model, provider: 'openai', own: true, serviceTier: null })] }),
+    ]),
+    true,
+  );
+  assert.equal(
+    notes([
+      dispatchedCost({
+        ownModel: model,
+        ownModelTiers: [{ model, provider: 'amazon-bedrock', serviceTier: 'priority' }],
+        parts: [dispatchedPart(100, { model, provider: 'amazon-bedrock', own: true, serviceTier: 'priority' })],
+      }),
+    ]),
+    false,
+  );
+  const dispatched = dispatchedCost({
+    ownModel: model,
+    ownModelTiers: [{ model, provider: 'openai', serviceTier: 'priority' }],
+    parts: [dispatchedPart(100, { model, provider: 'openai', own: true, serviceTier: 'priority' })],
+  });
+  assert.equal(notes([dispatched]), false);
+  const descendant = { ...known, model: 'gpt-6-astra', usage: { ...known.usage, input: 10000 } };
+  const nested = dispatchedCost({
+    ownModel: heaviestModel([known, descendant]),
+    ownModelTiers: dispatched.ownModelTiers,
+    parts: [
+      dispatchedPart(100, { model, provider: 'openai', own: true, serviceTier: 'priority' }),
+      dispatchedPart(10000, { model: descendant.model, provider: 'openai', serviceTier: 'priority' }),
+    ],
+  });
+  assert.equal(nested.ownModel, descendant.model);
+  assert.equal(notes([nested]), false);
+  nested.ownModelTiers = [...nested.ownModelTiers!, { model, provider: 'openai', serviceTier: 'default' }];
+  assert.equal(notes([nested]), false);
+  nested.ownModel = model;
+  nested.ownModelTiers = [...nested.ownModelTiers, { model: descendant.model, provider: 'openai', serviceTier: null }];
+  assert.equal(notes([nested]), true);
+  dispatched.ownModelTiers = [...dispatched.ownModelTiers!, { model, provider: 'openai', serviceTier: null }];
+  assert.equal(notes([dispatched]), true);
+  dispatched.ownModelTiers = [
+    { model, provider: 'openai', serviceTier: 'priority' },
+    { model: null, provider: null, serviceTier: null },
+  ];
+  assert.equal(notes([dispatched]), true);
+  delete dispatched.ownModelTiers;
+  assert.equal(notes([dispatched]), true);
+  subject.usageParts = [
+    known,
+    { ...known, serviceTier: null, linkedInvocationId: 'linked' },
+    { ...known, serviceTier: null, compactionEstimate: true },
+  ];
+  assert.equal(toCard(subject, false, NOW).speed, 'Fast');
+  assert.equal(notes(), false);
+  subject.usageParts = [];
+  subject.usage.requests = 2;
+  subject.contextRequest = {
+    at: NOW,
+    lifetime: null,
+    inferenceClass: null,
+    serviceTier: 'priority',
+    readBack: true,
+    outputTokens: 0,
+  };
+  assert.equal(notes(), true);
 });

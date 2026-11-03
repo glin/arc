@@ -6,6 +6,8 @@ Arc estimates costs in the panel, CLI, and Claude status line from recorded usag
 
 ## Supported pricing
 
+Direct OpenAI estimates cover published Fast/Priority, Flex, and Batch prices for the supported GPT-6 and GPT-5.6 rows, GPT-5.5, and GPT-5.4. Astra and Sol 6.1 also support published Ultrafast prices. GPT-5.5 and GPT-5.4 Fast prices require the short request band. Their long Fast requests remain unpriced. GPT-5.4 Flex and Batch retain the table's exact category rates. Provider routes keep independent tier support. [Model pricing](development.md#model-pricing) owns the onboarding audit.
+
 Claude Code and Codex write usage records. The billing provider and route select the published rates.
 
 | Billing route | Supported model identities |

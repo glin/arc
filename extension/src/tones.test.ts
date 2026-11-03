@@ -885,6 +885,7 @@ const SUBAGENT_ROW_OTHER_COLOURS = [
   '.sessionworktreedestination { color: var(--idle) }',
   '.sessionworktreelink { color: var(--vscode-textLink-foreground) }',
   '.sha { color: var(--vscode-textLink-foreground) }',
+  '.speed { color: var(--idle) }',
   '.statbusy { color: var(--busy) }',
   '.statwarningsign { color: var(--warn) }',
   '.stopped .glyph { color: var(--idle) }',

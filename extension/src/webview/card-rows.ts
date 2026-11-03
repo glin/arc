@@ -559,7 +559,7 @@ export function AgentRow({
                 agent.description,
                 h('span', { class: 'sr-only' }, ','),
               ]),
-          agent.model || agent.effort
+          agent.model || agent.effort || agent.speed
             ? h(
                 'span',
                 { class: 'agentmodelrun' },
@@ -570,6 +570,13 @@ export function AgentRow({
                         agent.model ? h('span', { 'aria-hidden': 'true' }, '· ') : null,
                         agent.effort,
                         h('span', { class: 'sr-only' }, ' reasoning effort'),
+                      ])
+                    : null,
+                  agent.speed
+                    ? h('span', { class: 'speed', 'data-comment-metadata': 'speed' }, [
+                        agent.model || agent.effort ? h('span', { 'aria-hidden': 'true' }, '· ') : null,
+                        agent.speed,
+                        h('span', { class: 'sr-only' }, ' recorded speed setting'),
                       ])
                     : null,
                 ]),

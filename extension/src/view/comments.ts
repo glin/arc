@@ -26,6 +26,7 @@ export interface TurnComment {
   turnKey: string;
   part: CommentPart;
   quote: string;
+  matchQuote?: string;
   offset?: number;
   note: string;
   headline: string;

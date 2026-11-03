@@ -24052,7 +24052,7 @@ const FIGURE_SIZES = [
   '.compactnewmenu { font-size: var(--t-small) }',
   '.agent { font-size: var(--t-body) }',
   '.model { font-size: var(--t-body) }',
-  '.effort { font-size: var(--t-body) }',
+  '.effort, .speed { font-size: var(--t-body) }',
   '.doing { font-size: var(--t-small) }',
   '.actcode, .chippoppath, pre.actfull code { font-size: 0.92em }',
   'button.acthead, .acthead button.actword { font: inherit }',
@@ -25690,6 +25690,343 @@ test('the shared rail projection groups sessions by day', () => {
       buckets([card('a', 0), card('o', 30), card('p', 30), card('r', 0, { agentRun: true })], now).olderFolded,
       false,
     );
+  }
+});
+
+test('persisted repeated-paragraph comments retain their block across model speed changes', async () => {
+  const rules = await import('./view/comments.ts');
+  const { normalizeComments } = await import('./turncomments.ts');
+  let speed = '';
+  const heading = { heading: true, words: 'Turn heading' };
+  const row = { heading: true, words: 'First subagent row' };
+  const lines = [{ words: 'yes' }, { words: 'yes' }];
+  type Block = { heading?: boolean; words: string; facts?: string };
+  const blocks = ([heading, row, ...lines] as Block[]).map((value) => ({
+    ...value,
+    nodeType: 1,
+    get textContent() {
+      return value.words + (value.heading ? speed : '');
+    },
+    closest(selector: string) {
+      return selector === rulesSource.QUOTE_BLOCKS ? this : selector === '.turn:not(.clive), .compaction' ? host : null;
+    },
+    matches(selector: string) {
+      return selector === '.cardheading' && this === blocks[0];
+    },
+  }));
+  const fragment = (block: Block, end?: number) => {
+    let heldSpeed = block.heading ? speed : '';
+    return {
+      get textContent() {
+        return (block.words + heldSpeed + (block.facts ?? '')).slice(0, end);
+      },
+      querySelectorAll(selector: string) {
+        assert.ok(['.speed', '[data-comment-metadata="speed"]'].includes(selector));
+        return heldSpeed
+          ? [
+              {
+                remove() {
+                  heldSpeed = '';
+                },
+              },
+            ]
+          : [];
+      },
+    };
+  };
+  let clones = 0;
+  const document = {
+    createRange() {
+      let block: Block;
+      let end: number | undefined;
+      return {
+        selectNodeContents(value: Block) {
+          block = value;
+        },
+        setEnd(node: { lineStart?: number }, value: number) {
+          end = (node.lineStart ?? 0) + value;
+        },
+        cloneContents() {
+          clones++;
+          return fragment(block, end);
+        },
+      };
+    },
+  };
+  const host = { querySelectorAll: () => blocks, contains: () => true, classList: { contains: () => true } };
+  let selectionRange: any;
+  const cards = new Map();
+  const body = {
+    contains: (node: unknown) => blocks.slice(1).includes(node as (typeof blocks)[number]),
+    querySelectorAll: () => [],
+    querySelector: () => null,
+    insertBefore() {},
+  };
+  const marked: unknown[] = [];
+  let serialized = '';
+  const noop = () => {};
+  const scope = {
+    ...rules,
+    outsideCommentMarks,
+    document,
+    cards,
+    trimSelectionEnd: (range: unknown) => range,
+    view: { getSelection: () => ({ isCollapsed: false, rangeCount: 1, getRangeAt: () => selectionRange }) },
+    Node: { ELEMENT_NODE: 1 },
+    options: {
+      open: new Set(),
+      save: noop,
+      updateLatest: noop,
+      post: (message: { note: { note: TurnComment } }) => {
+        serialized = JSON.stringify([message.note.note]);
+      },
+      markdownOf: () => '',
+    },
+    notify: noop,
+    listHolds: () => false,
+    notesOn: () => rulesSource.snapshot(),
+    cardHostOf: () => host,
+    sweepSource: () => '',
+    drawnFrom: new Map(),
+    drawnMarks: () => '',
+    takeListOff: noop,
+    putListBack: noop,
+    unpaint: noop,
+    el: () => ({ appendChild: noop }),
+    lineMark: () => ({ dataset: {} }),
+    markBlock: (node: unknown) => marked.push(blocks.indexOf(node as (typeof blocks)[number]) - 2),
+  };
+  const names = [
+    'QUOTE_BLOCKS',
+    'PROMPT_LEAD_LABEL',
+    'SAID_ROW',
+    'FENCE',
+    'contentRange',
+    'quoteOf',
+    'lineQuote',
+    'countedBlocks',
+    'partOfNode',
+    'partBlocks',
+    'offsetOf',
+    'selectionHere',
+    'change',
+    'write',
+    'renderAnnotations',
+  ];
+  if (commentsSource.includes('const quoteContents =')) names.unshift('quoteContents');
+  const compiled = esbuild.transformSync(
+    [
+      'let comments = [], count = 0;',
+      ...names.map((name) => `const ${declarationSource(commentsSource, name)};`),
+      'return { QUOTE_BLOCKS, lineQuote, offsetOf, selectionHere, write, renderAnnotations, snapshot: () => comments, adopt: (value) => { comments = value; } };',
+    ].join('\n'),
+    { loader: 'ts' },
+  ).code;
+  const rulesSource = new Function(...Object.keys(scope), compiled)(...Object.values(scope));
+  const fenced = {
+    words: 'x'.repeat(1024 * 1024),
+    get textContent() {
+      return this.words;
+    },
+    closest: () => true,
+  };
+  const clonesBeforeCode = clones;
+  assert.equal(rulesSource.lineQuote(fenced), '```\n' + fenced.textContent + '\n```');
+  assert.equal(clones, clonesBeforeCode);
+  const painted: Array<{ from: number; to: number }> = [];
+  const runValues = ['Read \u{1d11e} GPT ', '? Fast recorded speed setting', ' tail'];
+  const rowText = runValues.join('');
+  const rowBlock = { textContent: rowText, querySelector: () => true, insertBefore: noop, firstChild: null };
+  const rowRuns = runValues.map((data, index) => ({
+    node: { data, length: data.length, textContent: data, parentElement: { closest: () => index === 1 } },
+  }));
+  const markCode = esbuild.transformSync(
+    'return (' + declarationSource(commentsSource, 'markBlock').replace(/^markBlock\s*=\s*/, '') + ');',
+    { loader: 'ts' },
+  ).code;
+  const mark = new Function('quoteSpan', 'withoutMarker', 'textRuns', 'wrapText', 'lineMark', markCode)(
+    rules.quoteSpan,
+    rules.withoutMarker,
+    () => rowRuns,
+    (_root: unknown, from: number, to: number) => painted.push({ from, to }),
+    noop,
+  );
+  for (const offset of [undefined, 0]) {
+    painted.length = 0;
+    mark(rowBlock, [{ id: 'old', quote: 'Read \u{1d11e} GPT tail', offset }], '', 0);
+    assert.equal(
+      painted
+        .sort((a, b) => a.from - b.from)
+        .map((span) => rowText.slice(span.from, span.to))
+        .join(''),
+      'Read \u{1d11e} GPT tail',
+    );
+  }
+  const card = { key: 'turn', sessionId: 'session', headline: '', startedAt: 1 };
+  cards.set(host, card);
+  for (const capturedSpeed of ['', 'Fast', 'Ultrafast']) {
+    speed = capturedSpeed;
+    rulesSource.adopt([]);
+    const selected = { nodeType: 3, parentElement: blocks[3] };
+    const offset = rulesSource.offsetOf(host, 'summary', selected, 0);
+    rulesSource.write(card, 'yes', 'summary', 'The second paragraph.', offset);
+    const restored = normalizeComments(JSON.parse(serialized));
+    assert.equal(restored[0].offset, offset);
+    for (const displayedSpeed of ['Fast', 'Ultrafast', '']) {
+      speed = displayedSpeed;
+      rulesSource.adopt(restored);
+      scope.drawnFrom.clear();
+      marked.length = 0;
+      rulesSource.renderAnnotations(body, card);
+      assert.deepEqual(
+        marked,
+        [1],
+        `The saved comment moved from ${capturedSpeed || 'default'} to ${displayedSpeed || 'default'}.`,
+      );
+    }
+  }
+  let rowFacts = '';
+  const modelRows = [0, 1].map(() => ({
+    ...blocks[1],
+    words: '* Read \u{1d11e} GPT high',
+    get facts() {
+      return rowFacts;
+    },
+    get textContent(): string {
+      return this.words + speed + rowFacts;
+    },
+  }));
+  blocks.push(...modelRows);
+  for (const capturedSpeed of ['Fast', 'Ultrafast']) {
+    speed = capturedSpeed;
+    const selected = modelRows[1];
+    selectionRange = {
+      commonAncestorContainer: selected,
+      startContainer: selected,
+      endContainer: selected,
+      startOffset: 0,
+      endOffset: selected.textContent.length,
+      cloneContents: () => fragment(selected),
+      toString: () => selected.textContent,
+      cloneRange: () => selectionRange,
+      getBoundingClientRect: () => ({ width: 50, height: 20 }),
+    };
+    const anchor = rulesSource.selectionHere();
+    assert.equal(anchor.text, selected.textContent);
+    assert.equal(anchor.matchQuote, selected.words);
+    rulesSource.adopt([]);
+    rulesSource.write(card, anchor.text, anchor.part, 'Keep this model choice.', anchor.offset, anchor.matchQuote);
+    const restored = normalizeComments(JSON.parse(serialized));
+    assert.equal(restored[0].quote, selected.textContent);
+    assert.equal(restored[0].matchQuote, selected.words);
+    for (const offset of [undefined, anchor.offset]) {
+      for (const displayedSpeed of ['', 'Fast', 'Ultrafast']) {
+        speed = displayedSpeed;
+        rulesSource.adopt([{ ...restored[0], offset }]);
+        scope.drawnFrom.clear();
+        marked.length = 0;
+        rulesSource.renderAnnotations(body, card);
+        assert.deepEqual(marked, [offset === undefined ? 2 : 3]);
+      }
+    }
+  }
+  for (const offset of [undefined, 0]) {
+    painted.length = 0;
+    mark(rowBlock, [{ id: 'new', quote: rowText, matchQuote: 'Read \u{1d11e} GPT tail', offset }], '', 0);
+    assert.equal(
+      painted
+        .sort((a, b) => a.from - b.from)
+        .map((span) => rowText.slice(span.from, span.to))
+        .join(''),
+      rowText,
+    );
+  }
+  painted.length = 0;
+  mark(rowBlock, [{ id: 'after-speed', quote: 'tail', matchQuote: 'tail', offset: 12 }], '', 0);
+  assert.deepEqual(
+    painted.map((span) => rowText.slice(span.from, span.to)),
+    ['tail'],
+  );
+  const response = { ...blocks[2], words: 'Fast response.', textContent: 'Fast response.' };
+  blocks.push(response);
+  for (const capturedSpeed of ['Fast', 'Ultrafast']) {
+    speed = capturedSpeed;
+    rowFacts = ' $1 running 1s';
+    const selected = modelRows[1];
+    const head = {
+      heading: true,
+      words: selected.words.slice(2),
+      lineStart: 2,
+      closest: (selector: string) => (selector === rulesSource.QUOTE_BLOCKS ? selected : null),
+    };
+    const metadata = {
+      closest: (selector: string) =>
+        selector === '[data-comment-metadata="speed"]'
+          ? metadata
+          : selector === '.agenthead'
+            ? head
+            : selector === rulesSource.QUOTE_BLOCKS
+              ? selected
+              : selector === '.turn:not(.clive), .compaction'
+                ? host
+                : null,
+    };
+    const text = { nodeType: 3, parentElement: metadata };
+    selectionRange = {
+      commonAncestorContainer: text,
+      startContainer: text,
+      endContainer: text,
+      startOffset: 0,
+      endOffset: capturedSpeed.length,
+      cloneContents: () => ({ textContent: capturedSpeed, querySelectorAll: () => [] }),
+      toString: () => capturedSpeed,
+      cloneRange: () => selectionRange,
+      getBoundingClientRect: () => ({ width: 50, height: 20 }),
+    };
+    const anchor = rulesSource.selectionHere();
+    rulesSource.adopt([]);
+    rulesSource.write(card, anchor.text, anchor.part, 'Keep this speed choice.', anchor.offset, anchor.matchQuote);
+    const restored = normalizeComments(JSON.parse(serialized));
+    assert.equal(restored[0].quote, capturedSpeed);
+    for (const offset of [undefined, anchor.offset]) {
+      for (const displayedSpeed of ['', 'Fast', 'Ultrafast']) {
+        for (const facts of [' $1 running 2s', ' $2 running 2s', ' $3 finished']) {
+          rowFacts = facts;
+          speed = displayedSpeed;
+          rulesSource.adopt([{ ...restored[0], offset }]);
+          scope.drawnFrom.clear();
+          marked.length = 0;
+          rulesSource.renderAnnotations(body, card);
+          assert.deepEqual(marked, [offset === undefined ? 2 : 3], 'The speed-only comment left its subagent row.');
+          const values = [selected.words, displayedSpeed ? ' ' + displayedSpeed : '', rowFacts];
+          const raw = values.join('');
+          const runs = values.map((data, index) => ({
+            node: { data, length: data.length, parentElement: { closest: () => index === 1 } },
+          }));
+          const tint = new Function('quoteSpan', 'withoutMarker', 'textRuns', 'wrapText', 'lineMark', markCode)(
+            rules.quoteSpan,
+            rules.withoutMarker,
+            () => runs,
+            (_root: unknown, from: number, to: number) => painted.push({ from, to }),
+            noop,
+          );
+          painted.length = 0;
+          tint(
+            { textContent: raw, querySelector: () => !!displayedSpeed, insertBefore: noop },
+            [{ ...restored[0], offset }],
+            '',
+            anchor.offset - head.lineStart,
+          );
+          assert.equal(
+            painted
+              .sort((a, b) => a.from - b.from)
+              .map((span) => raw.slice(span.from, span.to))
+              .join(''),
+            displayedSpeed === capturedSpeed ? capturedSpeed : head.words,
+          );
+        }
+      }
+    }
   }
 });
 

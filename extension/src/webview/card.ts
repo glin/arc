@@ -1870,6 +1870,7 @@ function Card({
         card.agent ? h('span', { class: 'agent' }, card.agent) : null,
         card.model ? h('span', { class: 'model' }, card.model) : null,
         card.effort ? h('span', { class: 'effort' }, card.effort) : null,
+        card.speed ? h('span', { class: 'speed', 'data-comment-metadata': 'speed' }, card.speed) : null,
       ]),
     ),
     h(

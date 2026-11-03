@@ -117,6 +117,7 @@ import {
   pressOfKind,
   pressForReply,
   LIVE_PRESS_LIMIT_MS,
+  EMPTY_SESSION_SETTINGS,
   appendReply,
   replyAfterCommentary,
   activeWriterFailure,
@@ -159,6 +160,8 @@ import { Ask, readModels } from './claudewire.ts';
 import { formatCacheSpan } from './view/time.ts';
 import { McpServer, ModelChoice, PromptEntry, QuestionAsk } from './agentwire.ts';
 import { createClaudeSessionReducer } from './transcript.ts';
+import { turn as fixtureTurn } from './turnfixtures.ts';
+import { emptyUsage } from './agentspend.ts';
 import { composerRuntimeBySession, nextTurnBasisOf } from './turncard.ts';
 import {
   CONTEXT_BANDS,
@@ -8805,4 +8808,239 @@ test('saved service tier survives reload and accepted settings without leaking t
   assert.equal(sessionSettings(book, 'one').serviceTier, 'priority');
   assert.equal(sessionSettings(book, 'two').serviceTier, undefined);
   assert.equal(sessionSettings({}, 'old').serviceTier, undefined);
+});
+
+test('prospective prices use explicit speed selections before a simultaneous model change', () => {
+  const models = [
+    { value: 'gpt-6.1-sol', label: 'Sol', description: '', efforts: [] },
+    { value: 'gpt-6-astra', label: 'Astra', description: '', efforts: [] },
+  ];
+  const state = composerState({
+    agent: 'codex',
+    models,
+    model: '',
+    nextTurn: {
+      ...FLOOR_BASIS,
+      model: 'gpt-6.1-sol',
+      provider: 'openai',
+      tokens: 100000,
+      window: 1050000,
+      tier: '30m',
+      serviceTier: 'default',
+    },
+  });
+  state.settings = {
+    ...state.settings,
+    confirmedModel: 'gpt-6.1-sol',
+    confirmedProvider: 'openai',
+    confirmedServiceTier: 'default',
+  };
+  const standard = composerView(state)!.nextTurn!.cold!.price;
+  state.settings.serviceTier = 'priority';
+  assert.equal(prospectiveNextTurn(state)!.basis.serviceTier, 'priority');
+  assert.notEqual(composerView(state)!.nextTurn!.cold!.price, standard);
+  assert.match(composerView(state)!.picks[0].name, /Fast selected for the next turn/);
+  state.settings.serviceTier = 'default';
+  state.nextTurn!.serviceTier = 'priority';
+  assert.equal(prospectiveNextTurn(state)!.basis.serviceTier, 'default');
+  assert.equal(composerView(state)!.nextTurn!.cold!.price, standard);
+  state.settings.selectedModel = 'gpt-6-astra';
+  state.settings.serviceTier = 'ultrafast';
+  assert.equal(prospectiveNextTurn(state)!.basis.model, 'gpt-6-astra');
+  assert.equal(prospectiveNextTurn(state)!.basis.serviceTier, 'ultrafast');
+  delete state.settings.serviceTier;
+  assert.equal(prospectiveNextTurn(state)!.basis.serviceTier, 'priority');
+});
+
+test('live speed belongs to the confirmed model and current tier selection', () => {
+  const state = composerState({
+    agent: 'codex',
+    model: '',
+    models: [{ value: 'gpt-6.1-sol', label: 'Sol', description: '', efforts: [] }],
+    live: [
+      {
+        sessionId: 'session-1',
+        agent: 'codex',
+        kind: 'prompt',
+        text: 'go',
+        reply: '',
+        at: AT,
+        midTurn: false,
+        ran: false,
+        started: false,
+        failed: false,
+        reason: '',
+      },
+    ],
+  });
+  state.settings = {
+    ...state.settings,
+    confirmedModel: 'gpt-6.1-sol',
+    confirmedProvider: 'openai',
+    confirmedServiceTier: 'priority',
+    confirmedSpeed: 'Mixed speeds',
+    serviceTier: 'default',
+  };
+  assert.equal(composerView(state, AT)!.live[0].speed, undefined);
+  state.settings.serviceTier = 'priority';
+  assert.equal(composerView(state, AT)!.live[0].speed, 'Fast');
+  state.settings.selectedModel = 'gpt-6-astra';
+  assert.equal(composerView(state, AT)!.live[0].speed, undefined);
+});
+
+test('explicit restored profile models retain confirmed speed and provider scope', () => {
+  const models = [{ value: 'gpt-6.1-sol', label: 'Sol', description: '', efforts: [] }];
+  for (const provider of ['openai', 'amazon-bedrock']) {
+    const state = composerState({
+      agent: 'codex',
+      models,
+      model: '',
+      nextTurn: { ...FLOOR_BASIS, model: 'gpt-6.1-sol', provider, tokens: 100000, serviceTier: 'priority' },
+    });
+    state.settings = {
+      ...sessionSettingsForProfile(
+        { agent: 'codex', model: 'gpt-6.1-sol', effort: '', permissionMode: 'read-only', source: 'custom' },
+        models,
+      ),
+      confirmedModel: 'gpt-6.1-sol',
+      confirmedEffort: null,
+      confirmedProvider: provider,
+      confirmedServiceTier: 'priority',
+      serviceTier: 'priority',
+    };
+    state.settings = JSON.parse(JSON.stringify(state.settings));
+    const pick = composerView(state)!.picks[0];
+    if (provider === 'openai') assert.match(pick.detail, /Recorded speed: Fast/);
+    else assert.doesNotMatch(pick.detail + pick.name, /Fast/);
+    state.settings.serviceTier = 'default';
+    assert.equal(prospectiveNextTurn(state)!.basis.provider, provider);
+    assert.equal(prospectiveNextTurn(state)!.basis.serviceTier, 'default');
+    assert.match(composerView(state)!.picks[0].detail, /Standard selected for the next turn/);
+  }
+});
+
+test('failed presses and restored selections keep pending speed with prices', () => {
+  const state = composerState({
+    agent: 'codex',
+    model: '',
+    models: [{ value: 'gpt-6.1-sol', label: 'Sol', description: '', efforts: [] }],
+    nextTurn: { ...FLOOR_BASIS, model: 'gpt-6.1-sol', provider: 'openai', tokens: 100000, serviceTier: 'default' },
+  });
+  state.settings = {
+    ...state.settings,
+    confirmedModel: 'gpt-6.1-sol',
+    confirmedProvider: 'openai',
+    confirmedServiceTier: 'default',
+    serviceTier: 'priority',
+  };
+  state.live = [
+    {
+      sessionId: state.sessionId,
+      agent: 'codex',
+      kind: 'prompt',
+      text: 'go',
+      reply: '',
+      at: AT,
+      midTurn: false,
+      ran: false,
+      started: false,
+      failed: true,
+      reason: 'stopped',
+    },
+  ];
+  const standard = composerView({ ...state, settings: { ...state.settings, serviceTier: 'default' } })!.nextTurn!.cold!
+    .price;
+  for (const [confirmed, selected, pending] of [
+    ['default', 'priority', 'Fast'],
+    ['priority', 'default', 'Standard'],
+  ]) {
+    state.settings = JSON.parse(
+      JSON.stringify({ ...state.settings, confirmedServiceTier: confirmed, serviceTier: selected }),
+    );
+    state.nextTurn!.serviceTier = confirmed;
+    assert.match(composerView(state)!.picks[0].detail, new RegExp(`${pending} selected for the next turn`));
+    assert.equal(composerView(state)!.live[0].speed, undefined);
+    const price = composerView(state)!.nextTurn!.cold!.price;
+    if (selected === 'default') assert.equal(price, standard);
+    else assert.notEqual(price, standard);
+  }
+});
+
+test('pending Bedrock priority never takes the OpenAI Fast alias', () => {
+  const state = composerState({
+    agent: 'codex',
+    model: '',
+    nextTurn: { ...FLOOR_BASIS, provider: 'amazon-bedrock', serviceTier: 'default' },
+  });
+  state.settings = {
+    ...state.settings,
+    confirmedModel: 'gpt-6.1-sol',
+    confirmedProvider: 'amazon-bedrock',
+    confirmedServiceTier: 'default',
+    serviceTier: 'priority',
+  };
+  assert.doesNotMatch(composerView(state)!.picks[0].detail + composerView(state)!.picks[0].name, /Fast/);
+  assert.equal(composerView(state)!.nextTurn, null);
+});
+
+test('live cards carry confirmed speed without introducing effort', () => {
+  const live = liveOf({
+    agent: 'codex',
+    model: '',
+    ran: { model: 'gpt-6.1-sol', effort: 'xhigh' },
+    settings: {
+      ...EMPTY_SESSION_SETTINGS,
+      confirmedModel: 'gpt-6.1-sol',
+      confirmedEffort: 'xhigh',
+      confirmedProvider: 'openai',
+      confirmedServiceTier: 'priority',
+    },
+    live: [press({ agent: 'codex' })],
+  });
+  assert.ok(live);
+  assert.equal(live.speed, 'Fast');
+  assert.equal(Object.hasOwn(live, 'effort'), false);
+});
+
+test('interrupted reported models inherit no earlier speed', () => {
+  const stopped = fixtureTurn({
+    sessionId: 'sess',
+    agent: 'codex',
+    model: null,
+    interrupted: true,
+    finished: true,
+    usage: emptyUsage(),
+    startedAt: AT,
+  });
+  const earlier = fixtureTurn({
+    sessionId: 'sess',
+    agent: 'codex',
+    model: 'gpt-6.1-sol',
+    provider: 'openai',
+    finished: true,
+    startedAt: AT - 1000,
+    endedAt: AT - 500,
+    contextRequest: {
+      at: AT - 500,
+      lifetime: null,
+      inferenceClass: null,
+      serviceTier: 'priority',
+      readBack: true,
+      outputTokens: 0,
+    },
+  });
+  const runtime = composerRuntimeBySession([earlier, stopped], new Map(), new Map([['sess', 'gpt-6-astra']])).get(
+    'sess',
+  )!;
+  assert.equal(runtime.confirmedModel, 'gpt-6-astra');
+  assert.equal(runtime.confirmedSpeed, null);
+  assert.equal(runtime.confirmedServiceTier, null);
+  const state = composerState({
+    agent: 'codex',
+    model: '',
+    settings: { ...EMPTY_SESSION_SETTINGS, ...runtime },
+    live: [press({ agent: 'codex' })],
+  });
+  assert.equal(composerView(state)!.live[0].speed, undefined);
+  assert.doesNotMatch(composerView(state)!.picks[0].detail, /Fast|Ultrafast/);
 });

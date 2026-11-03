@@ -118,6 +118,662 @@ const claudeSupport = (
     ...(effectiveDate ? { effectiveDate } : {}),
   },
 });
+// Independent rates transcribed from the primary API tier tables. Null means unpublished.
+const OPENAI_TIER_AUDIT: Record<
+  string,
+  Record<string, { short?: ModelDefinition['rate']; long?: ModelDefinition['rate'] } | null>
+> = {
+  'gpt-6-astra': {
+    default: {
+      short: {
+        input: 10.0,
+        output: 50.0,
+        cacheRead: 1.0,
+        cacheWrite30m: 12.5,
+      },
+      long: {
+        input: 20.0,
+        output: 75.0,
+        cacheRead: 2.0,
+        cacheWrite30m: 25.0,
+      },
+    },
+    priority: {
+      short: {
+        input: 20.0,
+        output: 100.0,
+        cacheRead: 2.0,
+        cacheWrite30m: 25.0,
+      },
+      long: {
+        input: 40.0,
+        output: 150.0,
+        cacheRead: 4.0,
+        cacheWrite30m: 50.0,
+      },
+    },
+    flex: {
+      short: {
+        input: 5.0,
+        output: 25.0,
+        cacheRead: 0.5,
+        cacheWrite30m: 6.25,
+      },
+      long: {
+        input: 10.0,
+        output: 37.5,
+        cacheRead: 1.0,
+        cacheWrite30m: 12.5,
+      },
+    },
+    batch: {
+      short: {
+        input: 5.0,
+        output: 25.0,
+        cacheRead: 0.5,
+        cacheWrite30m: 6.25,
+      },
+      long: {
+        input: 10.0,
+        output: 37.5,
+        cacheRead: 1.0,
+        cacheWrite30m: 12.5,
+      },
+    },
+    ultrafast: {
+      short: {
+        input: 60.0,
+        output: 300.0,
+        cacheRead: 6.0,
+        cacheWrite30m: 75.0,
+      },
+      long: {
+        input: 120.0,
+        output: 450.0,
+        cacheRead: 12.0,
+        cacheWrite30m: 150.0,
+      },
+    },
+  },
+  'gpt-6.1-sol': {
+    default: {
+      short: {
+        input: 2.0,
+        output: 10.0,
+        cacheRead: 0.1,
+        cacheWrite30m: 2.5,
+      },
+      long: {
+        input: 4.0,
+        output: 15.0,
+        cacheRead: 0.2,
+        cacheWrite30m: 5.0,
+      },
+    },
+    priority: {
+      short: {
+        input: 4.0,
+        output: 20.0,
+        cacheRead: 0.2,
+        cacheWrite30m: 5.0,
+      },
+      long: {
+        input: 8.0,
+        output: 30.0,
+        cacheRead: 0.4,
+        cacheWrite30m: 10.0,
+      },
+    },
+    flex: {
+      short: {
+        input: 1.0,
+        output: 5.0,
+        cacheRead: 0.05,
+        cacheWrite30m: 1.25,
+      },
+      long: {
+        input: 2.0,
+        output: 7.5,
+        cacheRead: 0.1,
+        cacheWrite30m: 2.5,
+      },
+    },
+    batch: {
+      short: {
+        input: 1.0,
+        output: 5.0,
+        cacheRead: 0.05,
+        cacheWrite30m: 1.25,
+      },
+      long: {
+        input: 2.0,
+        output: 7.5,
+        cacheRead: 0.1,
+        cacheWrite30m: 2.5,
+      },
+    },
+    ultrafast: {
+      short: {
+        input: 12.0,
+        output: 60.0,
+        cacheRead: 0.6,
+        cacheWrite30m: 15.0,
+      },
+      long: {
+        input: 24.0,
+        output: 90.0,
+        cacheRead: 1.2,
+        cacheWrite30m: 30.0,
+      },
+    },
+  },
+  'gpt-6.1-terra': {
+    default: {
+      short: {
+        input: 1.0,
+        output: 5.0,
+        cacheRead: 0.05,
+        cacheWrite30m: 1.25,
+      },
+      long: {
+        input: 2.0,
+        output: 7.5,
+        cacheRead: 0.1,
+        cacheWrite30m: 2.5,
+      },
+    },
+    priority: {
+      short: {
+        input: 2.0,
+        output: 10.0,
+        cacheRead: 0.1,
+        cacheWrite30m: 2.5,
+      },
+      long: {
+        input: 4.0,
+        output: 15.0,
+        cacheRead: 0.2,
+        cacheWrite30m: 5.0,
+      },
+    },
+    flex: {
+      short: {
+        input: 0.5,
+        output: 2.5,
+        cacheRead: 0.025,
+        cacheWrite30m: 0.625,
+      },
+      long: {
+        input: 1.0,
+        output: 3.75,
+        cacheRead: 0.05,
+        cacheWrite30m: 1.25,
+      },
+    },
+    batch: {
+      short: {
+        input: 0.5,
+        output: 2.5,
+        cacheRead: 0.025,
+        cacheWrite30m: 0.625,
+      },
+      long: {
+        input: 1.0,
+        output: 3.75,
+        cacheRead: 0.05,
+        cacheWrite30m: 1.25,
+      },
+    },
+    ultrafast: null,
+  },
+  'gpt-6-sol': {
+    default: {
+      short: {
+        input: 2.0,
+        output: 10.0,
+        cacheRead: 0.2,
+        cacheWrite30m: 2.5,
+      },
+      long: {
+        input: 4.0,
+        output: 15.0,
+        cacheRead: 0.4,
+        cacheWrite30m: 5.0,
+      },
+    },
+    priority: {
+      short: {
+        input: 4.0,
+        output: 20.0,
+        cacheRead: 0.4,
+        cacheWrite30m: 5.0,
+      },
+      long: {
+        input: 8.0,
+        output: 30.0,
+        cacheRead: 0.8,
+        cacheWrite30m: 10.0,
+      },
+    },
+    flex: {
+      short: {
+        input: 1.0,
+        output: 5.0,
+        cacheRead: 0.1,
+        cacheWrite30m: 1.25,
+      },
+      long: {
+        input: 2.0,
+        output: 7.5,
+        cacheRead: 0.2,
+        cacheWrite30m: 2.5,
+      },
+    },
+    batch: {
+      short: {
+        input: 1.0,
+        output: 5.0,
+        cacheRead: 0.1,
+        cacheWrite30m: 1.25,
+      },
+      long: {
+        input: 2.0,
+        output: 7.5,
+        cacheRead: 0.2,
+        cacheWrite30m: 2.5,
+      },
+    },
+    ultrafast: null,
+  },
+  'gpt-6-luna': {
+    default: {
+      short: {
+        input: 0.1,
+        output: 0.5,
+        cacheRead: 0.01,
+        cacheWrite30m: 0.125,
+      },
+      long: {
+        input: 0.2,
+        output: 0.75,
+        cacheRead: 0.02,
+        cacheWrite30m: 0.25,
+      },
+    },
+    priority: {
+      short: {
+        input: 0.2,
+        output: 1.0,
+        cacheRead: 0.02,
+        cacheWrite30m: 0.25,
+      },
+      long: {
+        input: 0.4,
+        output: 1.5,
+        cacheRead: 0.04,
+        cacheWrite30m: 0.5,
+      },
+    },
+    flex: {
+      short: {
+        input: 0.05,
+        output: 0.25,
+        cacheRead: 0.005,
+        cacheWrite30m: 0.0625,
+      },
+      long: {
+        input: 0.1,
+        output: 0.375,
+        cacheRead: 0.01,
+        cacheWrite30m: 0.125,
+      },
+    },
+    batch: {
+      short: {
+        input: 0.05,
+        output: 0.25,
+        cacheRead: 0.005,
+        cacheWrite30m: 0.0625,
+      },
+      long: {
+        input: 0.1,
+        output: 0.375,
+        cacheRead: 0.01,
+        cacheWrite30m: 0.125,
+      },
+    },
+    ultrafast: null,
+  },
+  'gpt-5.5': {
+    default: {
+      short: {
+        input: 5.0,
+        output: 30.0,
+        cacheRead: 0.5,
+      },
+      long: {
+        input: 10.0,
+        output: 45.0,
+        cacheRead: 1.0,
+      },
+    },
+    priority: {
+      short: {
+        input: 12.5,
+        output: 75.0,
+        cacheRead: 1.25,
+      },
+    },
+    flex: {
+      short: {
+        input: 2.5,
+        output: 15.0,
+        cacheRead: 0.25,
+      },
+      long: {
+        input: 5.0,
+        output: 22.5,
+        cacheRead: 0.5,
+      },
+    },
+    batch: {
+      short: {
+        input: 2.5,
+        output: 15.0,
+        cacheRead: 0.25,
+      },
+      long: {
+        input: 5.0,
+        output: 22.5,
+        cacheRead: 0.5,
+      },
+    },
+    ultrafast: null,
+  },
+  'gpt-5.4': {
+    default: {
+      short: {
+        input: 2.5,
+        output: 15.0,
+        cacheRead: 0.25,
+      },
+      long: {
+        input: 5.0,
+        output: 22.5,
+        cacheRead: 0.5,
+      },
+    },
+    priority: {
+      short: {
+        input: 5.0,
+        output: 30.0,
+        cacheRead: 0.5,
+      },
+    },
+    flex: {
+      short: {
+        input: 1.25,
+        output: 7.5,
+        cacheRead: 0.13,
+      },
+      long: {
+        input: 2.5,
+        output: 11.25,
+        cacheRead: 0.25,
+      },
+    },
+    batch: {
+      short: {
+        input: 1.25,
+        output: 7.5,
+        cacheRead: 0.13,
+      },
+      long: {
+        input: 2.5,
+        output: 11.25,
+        cacheRead: 0.25,
+      },
+    },
+    ultrafast: null,
+  },
+  'gpt-5.6-sol': {
+    default: {
+      short: {
+        input: 4.0,
+        output: 20.0,
+        cacheRead: 0.4,
+        cacheWrite30m: 5.0,
+      },
+      long: {
+        input: 8.0,
+        output: 30.0,
+        cacheRead: 0.8,
+        cacheWrite30m: 10.0,
+      },
+    },
+    priority: {
+      short: {
+        input: 8.0,
+        output: 40.0,
+        cacheRead: 0.8,
+        cacheWrite30m: 10.0,
+      },
+      long: {
+        input: 16.0,
+        output: 60.0,
+        cacheRead: 1.6,
+        cacheWrite30m: 20.0,
+      },
+    },
+    flex: {
+      short: {
+        input: 2.0,
+        output: 10.0,
+        cacheRead: 0.2,
+        cacheWrite30m: 2.5,
+      },
+      long: {
+        input: 4.0,
+        output: 15.0,
+        cacheRead: 0.4,
+        cacheWrite30m: 5.0,
+      },
+    },
+    batch: {
+      short: {
+        input: 2.0,
+        output: 10.0,
+        cacheRead: 0.2,
+        cacheWrite30m: 2.5,
+      },
+      long: {
+        input: 4.0,
+        output: 15.0,
+        cacheRead: 0.4,
+        cacheWrite30m: 5.0,
+      },
+    },
+    ultrafast: null,
+  },
+  'gpt-5.6-terra': {
+    default: {
+      short: {
+        input: 2.0,
+        output: 12.0,
+        cacheRead: 0.2,
+        cacheWrite30m: 2.5,
+      },
+      long: {
+        input: 4.0,
+        output: 18.0,
+        cacheRead: 0.4,
+        cacheWrite30m: 5.0,
+      },
+    },
+    priority: {
+      short: {
+        input: 4.0,
+        output: 24.0,
+        cacheRead: 0.4,
+        cacheWrite30m: 5.0,
+      },
+      long: {
+        input: 8.0,
+        output: 36.0,
+        cacheRead: 0.8,
+        cacheWrite30m: 10.0,
+      },
+    },
+    flex: {
+      short: {
+        input: 1.0,
+        output: 6.0,
+        cacheRead: 0.1,
+        cacheWrite30m: 1.25,
+      },
+      long: {
+        input: 2.0,
+        output: 9.0,
+        cacheRead: 0.2,
+        cacheWrite30m: 2.5,
+      },
+    },
+    batch: {
+      short: {
+        input: 1.0,
+        output: 6.0,
+        cacheRead: 0.1,
+        cacheWrite30m: 1.25,
+      },
+      long: {
+        input: 2.0,
+        output: 9.0,
+        cacheRead: 0.2,
+        cacheWrite30m: 2.5,
+      },
+    },
+    ultrafast: null,
+  },
+  'gpt-5.6-luna': {
+    default: {
+      short: {
+        input: 0.2,
+        output: 1.2,
+        cacheRead: 0.02,
+        cacheWrite30m: 0.25,
+      },
+      long: {
+        input: 0.4,
+        output: 1.8,
+        cacheRead: 0.04,
+        cacheWrite30m: 0.5,
+      },
+    },
+    priority: {
+      short: {
+        input: 0.4,
+        output: 2.4,
+        cacheRead: 0.04,
+        cacheWrite30m: 0.5,
+      },
+      long: {
+        input: 0.8,
+        output: 3.6,
+        cacheRead: 0.08,
+        cacheWrite30m: 1.0,
+      },
+    },
+    flex: {
+      short: {
+        input: 0.1,
+        output: 0.6,
+        cacheRead: 0.01,
+        cacheWrite30m: 0.125,
+      },
+      long: {
+        input: 0.2,
+        output: 0.9,
+        cacheRead: 0.02,
+        cacheWrite30m: 0.25,
+      },
+    },
+    batch: {
+      short: {
+        input: 0.1,
+        output: 0.6,
+        cacheRead: 0.01,
+        cacheWrite30m: 0.125,
+      },
+      long: {
+        input: 0.2,
+        output: 0.9,
+        cacheRead: 0.02,
+        cacheWrite30m: 0.25,
+      },
+    },
+    ultrafast: null,
+  },
+  'gpt-5.6': {
+    default: {
+      short: {
+        input: 4.0,
+        output: 20.0,
+        cacheRead: 0.4,
+        cacheWrite30m: 5.0,
+      },
+      long: {
+        input: 8.0,
+        output: 30.0,
+        cacheRead: 0.8,
+        cacheWrite30m: 10.0,
+      },
+    },
+    priority: {
+      short: {
+        input: 8.0,
+        output: 40.0,
+        cacheRead: 0.8,
+        cacheWrite30m: 10.0,
+      },
+      long: {
+        input: 16.0,
+        output: 60.0,
+        cacheRead: 1.6,
+        cacheWrite30m: 20.0,
+      },
+    },
+    flex: {
+      short: {
+        input: 2.0,
+        output: 10.0,
+        cacheRead: 0.2,
+        cacheWrite30m: 2.5,
+      },
+      long: {
+        input: 4.0,
+        output: 15.0,
+        cacheRead: 0.4,
+        cacheWrite30m: 5.0,
+      },
+    },
+    batch: {
+      short: {
+        input: 2.0,
+        output: 10.0,
+        cacheRead: 0.2,
+        cacheWrite30m: 2.5,
+      },
+      long: {
+        input: 4.0,
+        output: 15.0,
+        cacheRead: 0.4,
+        cacheWrite30m: 5.0,
+      },
+    },
+    ultrafast: null,
+  },
+};
+
 const openaiSupport = (
   pattern: RegExp,
   models: string[],
@@ -125,7 +781,7 @@ const openaiSupport = (
   window: number,
   lifetime: '5m' | '30m',
   bedrock?: ModelDefinition['bedrock'],
-  tiers?: Record<string, number>,
+  _tiers?: Record<string, number>,
 ) => ({
   models,
   definition: {
@@ -137,7 +793,19 @@ const openaiSupport = (
     maxPricedContext: 272_000,
     longContext: { threshold: 272_000, inputMultiplier: 2, outputMultiplier: 1.5 },
     ...(bedrock ? { bedrock } : {}),
-    ...(tiers ? { serviceTierMultipliers: tiers } : {}),
+    serviceTierMultipliers: {
+      fast: models[0] === 'gpt-5.5' ? 2.5 : 2,
+      priority: models[0] === 'gpt-5.5' ? 2.5 : 2,
+      flex: 0.5,
+      batch: 0.5,
+      ...(OPENAI_TIER_AUDIT[models[0]]?.ultrafast ? { ultrafast: 6 } : {}),
+    },
+    ...(['gpt-5.4', 'gpt-5.5'].includes(models[0])
+      ? { serviceTierBands: { fast: ['short'] as const, priority: ['short'] as const } }
+      : {}),
+    ...(models[0] === 'gpt-5.4'
+      ? { serviceTierRates: { flex: OPENAI_TIER_AUDIT['gpt-5.4'].flex!, batch: OPENAI_TIER_AUDIT['gpt-5.4'].batch! } }
+      : {}),
   },
 });
 const bedrockSupport = (effectiveDate: string, profileEffectiveDate?: string, model?: string) => ({
@@ -819,7 +1487,7 @@ test('GPT-6 Astra prices cache writes and reads across request bands', () => {
   assert.equal(estimateCost(legacy, 'gpt-6-astra', 'openai', 1_050_000), null);
 });
 
-test('GPT-6 Astra keeps nonstandard service tiers unpriced without a recorded amount', () => {
+test('GPT-6 Astra prices its published tiers and preserves recorded amounts', () => {
   const input = {
     usage: usage({ requests: 1, input: 100_000 }),
     model: 'gpt-6-astra',
@@ -828,7 +1496,8 @@ test('GPT-6 Astra keeps nonstandard service tiers unpriced without a recorded am
   };
   assert.equal(quoteUsage({ ...input, serviceTier: 'default' })?.cost, 1);
   for (const serviceTier of ['fast', 'priority', 'flex', 'batch', 'unknown-tier']) {
-    assert.equal(quoteUsage({ ...input, serviceTier }), null, serviceTier);
+    const expected = ({ fast: 2, priority: 2, flex: 0.5, batch: 0.5 } as Record<string, number>)[serviceTier];
+    assert.equal(quoteUsage({ ...input, serviceTier })?.cost ?? null, expected ?? null, serviceTier);
     assert.equal(quoteUsage({ ...input, serviceTier, reportedCost: 0.75 })?.cost, 0.75, serviceTier);
   }
 });
@@ -1479,8 +2148,8 @@ test('provider-specific standard service tiers use standard public rates', () =>
 
   const codex = { usage: usage({ input: 1_000_000 }), model: 'gpt-5.6-sol', provider: 'openai' };
   assert.equal(quoteUsage({ ...codex, serviceTier: 'default' })?.cost, 4);
-  assert.equal(quoteUsage({ ...codex, serviceTier: 'priority' }), null);
-  assert.equal(quoteUsage({ ...codex, serviceTier: 'flex' }), null);
+  assert.equal(quoteUsage({ ...codex, serviceTier: 'priority' })?.cost, 8);
+  assert.equal(quoteUsage({ ...codex, serviceTier: 'flex' })?.cost, 2);
   assert.equal(quoteUsage({ ...codex, serviceTier: 'unrecognized-tier' }), null);
 
   const bedrock = {
@@ -2089,4 +2758,68 @@ test('a cold Claude compaction writes the measured shared prefix without reading
     const fallback = compactionEstimate({ ...input, postCompactionCacheRead: null })!.usage;
     assert.equal(fallback.cacheWrite1h + fallback.cacheWrite5m + (fallback.cacheWrite30m ?? 0), 18000);
   }
+});
+
+test('every direct OpenAI model has an independent tier and request-band decision', () => {
+  for (const { models, definition } of SUPPORT_MATRIX.filter((entry) =>
+    entry.definition.providers?.includes('openai'),
+  )) {
+    for (const model of models) {
+      const key = model.replace(/-2026-\d{2}-\d{2}$/, '');
+      const audit = OPENAI_TIER_AUDIT[key];
+      assert.ok(audit, `${model} lacks its tier audit`);
+      assert.deepEqual(Object.keys(audit).sort(), ['batch', 'default', 'flex', 'priority', 'ultrafast']);
+      for (const [tier, bands] of Object.entries(audit))
+        for (const [band, requestTokens] of [
+          ['short', 272000],
+          ['long', 272001],
+        ] as const) {
+          const expected = bands?.[band];
+          for (const alias of tier === 'priority' ? ['priority', 'fast'] : [tier]) {
+            const quote = quoteUsage({
+              model,
+              provider: 'openai',
+              serviceTier: alias,
+              requestTokens,
+              usage: usage({
+                input: 1,
+                output: 1,
+                cacheRead: 1,
+                ...(expected?.cacheWrite30m === undefined ? {} : { cacheWrite30m: 1 }),
+              }),
+            });
+            if (!expected) assert.equal(quote, null, `${model} ${alias} ${band}`);
+            else assert.deepEqual(quote?.rate, expected, `${model} ${alias} ${band}`);
+          }
+        }
+      if (definition.serviceTierBands)
+        for (const tier of ['fast', 'priority']) {
+          assert.equal(quoteUsage({ model, provider: 'openai', serviceTier: tier, usage: usage({ input: 1 }) }), null);
+          assert.equal(
+            quoteUsage({
+              model,
+              provider: 'openai',
+              serviceTier: tier,
+              contextBand: 'long',
+              usage: usage({ input: 1 }),
+            }),
+            null,
+          );
+        }
+    }
+  }
+});
+
+test('configured prices require the matching canonical tier and retain recorded-charge precedence', () => {
+  const input = { model: 'gpt-6-astra', provider: 'openai', requestTokens: 1000, usage: usage({ input: 1000000 }) };
+  const override = { rate: { input: 3, output: 7 }, source: 'configured', effectiveDate: '2026-10-01' };
+  for (const tier of ['priority', 'fast', 'ultrafast', 'flex', 'batch']) {
+    assert.equal(quoteUsage({ ...input, serviceTier: tier, override }), null);
+    assert.equal(quoteUsage({ ...input, serviceTier: tier, override, reportedCost: 0.25 })?.cost, 0.25);
+  }
+  assert.equal(
+    quoteUsage({ ...input, serviceTier: 'priority', override: { ...override, serviceTier: 'fast' } })?.cost,
+    3,
+  );
+  assert.equal(quoteUsage({ ...input, serviceTier: 'default', override: { ...override, serviceTier: 'fast' } }), null);
 });

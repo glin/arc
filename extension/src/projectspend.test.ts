@@ -5673,9 +5673,9 @@ test('a configured input rate retains a published 30-minute cache-write multipli
   );
 });
 
-// A configured rate without a service tier prices standard Claude usage and refuses fast usage.
+// A configured rate without a service tier applies only to Standard usage.
 
-test('a configured rate refuses a fast Claude turn and keeps pricing a standard one', () => {
+test('a Standard configured rate leaves Fast on its public or explicit configured price', () => {
   const bucketAt = (serviceTier: string) =>
     aggregateUsageEvents([
       event(stamp('2026-08-31T10:00:00'), {
@@ -5693,7 +5693,8 @@ test('a configured rate refuses a fast Claude turn and keeps pricing a standard 
     effectiveDate: '2026-08-01',
   };
   assert.equal(publicProjectSpendPrice(bucketAt('standard'), [configured])?.dollars, 3);
-  assert.equal(publicProjectSpendPrice(bucketAt('fast'), [configured]), null);
+  assert.equal(publicProjectSpendPrice(bucketAt('fast'), [configured])?.dollars, 8);
+  assert.equal(publicProjectSpendPrice(bucketAt('fast'), [configured])?.provenance, 'public');
   assert.equal(publicProjectSpendPrice(bucketAt('fast'))?.dollars, 8, 'a fast turn takes the fast list rate');
   const fastConfigured = { ...configured, serviceTier: 'fast', input: 6 };
   assert.deepEqual(publicProjectSpendPrice(bucketAt('fast'), [fastConfigured]), {
@@ -7380,4 +7381,147 @@ test('persisted compaction associations reject duplicate identities and unsuppor
     },
     true,
   );
+});
+
+test('a saved Astra tier bucket reprices from retained request facts after reload', () => {
+  const folder = dir();
+  const file = path.join(folder, 'tier.jsonl');
+  const rows = [
+    { type: 'session_meta', payload: { id: 'tier', model_provider: 'openai' } },
+    {
+      type: 'event_msg',
+      payload: {
+        type: 'thread_settings_applied',
+        thread_settings: { service_tier: 'priority', model_provider_id: 'openai' },
+      },
+    },
+    { type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn' } },
+    { type: 'turn_context', payload: { turn_id: 'turn', model: 'gpt-6-astra' } },
+    {
+      type: 'token_usage_record',
+      payload: {
+        thread_id: 'tier',
+        turn_id: 'turn',
+        response_id: 'response',
+        usage: { input_tokens: 1000, cached_input_tokens: 0, output_tokens: 10 },
+      },
+    },
+    {
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: {
+          last_token_usage: { input_tokens: 1000, cached_input_tokens: 0, output_tokens: 10 },
+          total_token_usage: { input_tokens: 1000, cached_input_tokens: 0, output_tokens: 10 },
+        },
+      },
+    },
+  ];
+  fs.writeFileSync(
+    file,
+    rows
+      .map((row, index) =>
+        JSON.stringify({ ...row, timestamp: new Date(Date.UTC(2026, 8, 26, 0, 0, index)).toISOString() }),
+      )
+      .join('\n') + '\n',
+  );
+  const current = indexSpendFile(
+    undefined,
+    file,
+    'workspace',
+    createCodexUsageLineReducer,
+    Date.UTC(2026, 8, 26, 0, 1),
+  ).record;
+  assert.equal(current.buckets[0].serviceTier, 'priority');
+  saveSpendLedger(folder, 'workspace', [current]);
+  const [restored] = loadSpendLedger(folder, 'workspace').files;
+  assert.deepEqual(restored.buckets, current.buckets);
+  assert.equal(publicProjectSpendPrice(restored.buckets[0])?.dollars, 0.021);
+  assert.equal(restored.parserGeneration, PROJECT_SPEND_PARSER_GENERATIONS.codex);
+});
+
+test('configured Standard and Fast rates select independently of order', () => {
+  for (const [provider, tier, configuredTier] of [
+    ['openai', 'priority', 'fast'],
+    ['amazon-bedrock', 'priority', 'priority'],
+    [null, 'fast', 'fast'],
+  ] as const) {
+    const [bucket] = aggregateUsageEvents([
+      event(stamp('2026-09-01T12:00:00'), {
+        provider,
+        serviceTier: tier,
+        model: 'private-model',
+        reportedCost: null,
+        usage: { ...usage(), input: 1_000_000, output: 0 },
+      }),
+    ]);
+    const fast = {
+      model: 'private-model',
+      serviceTier: configuredTier,
+      input: 7,
+      output: 7,
+      source: 'Fast',
+      effectiveDate: '2026-01-01',
+    };
+    const standard = { model: 'private-model', input: 3, output: 3, source: 'Standard', effectiveDate: '2026-08-01' };
+    for (const overrides of [
+      [fast, standard],
+      [standard, fast],
+    ]) {
+      assert.equal(publicProjectSpendPrice(bucket, overrides)?.dollars, 7);
+      assert.equal(
+        publicProjectSpendPrice({ ...bucket, serviceTier: provider ? 'default' : 'standard' }, overrides)?.dollars,
+        3,
+      );
+      assert.equal(publicProjectSpendPrice(bucket, [standard]), null);
+    }
+  }
+});
+
+test('parent generation 66 rereads unchanged Claude Standard for configured prices', () => {
+  const folder = dir();
+  const file = path.join(folder, 'standard.jsonl');
+  fs.writeFileSync(
+    file,
+    JSON.stringify({
+      type: 'assistant',
+      uuid: 'response',
+      timestamp: '2026-10-01T00:00:00Z',
+      message: {
+        id: 'response',
+        model: 'claude-sonnet-5-5',
+        content: [{ type: 'text', text: 'Complete.' }],
+        usage: { input_tokens: 1000, output_tokens: 10, speed: 'standard' },
+      },
+    }) + '\n',
+  );
+  const current = indexSpendFile(undefined, file, 'w', createClaudeUsageLineReducer, 1).record;
+  assert.equal(current.buckets[0].serviceTier, 'standard');
+  const staleBuckets = current.buckets.map((bucket) => ({ ...bucket, serviceTier: null }));
+  saveSpendLedger(folder, 'w', [
+    { ...current, parserGeneration: 66, buckets: staleBuckets, lifetimeBuckets: staleBuckets },
+  ]);
+  const before = fs.statSync(file);
+  const [loaded] = loadSpendLedger(folder, 'w').files;
+  const rebuilt = indexSpendFile(loaded, file, 'w', createClaudeUsageLineReducer, 2);
+  assert.equal(rebuilt.rebuilt, true);
+  assert.equal(rebuilt.record.buckets[0].serviceTier, 'standard');
+  saveSpendLedger(folder, 'w', [rebuilt.record]);
+  const [restored] = loadSpendLedger(folder, 'w').files;
+  assert.equal(
+    publicProjectSpendPrice(restored.buckets[0], [
+      {
+        model: 'claude-sonnet-5-5',
+        serviceTier: 'standard',
+        input: 7,
+        output: 7,
+        source: 'Configured',
+        effectiveDate: '2026-01-01',
+      },
+    ])?.dollars,
+    0.00707,
+  );
+  assert.equal(indexSpendFile(restored, file, 'w', createClaudeUsageLineReducer, 3).rebuilt, false);
+  assert.equal(fs.statSync(file).size, before.size);
+  assert.equal(fs.statSync(file).mtimeMs, before.mtimeMs);
 });

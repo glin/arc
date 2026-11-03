@@ -4,6 +4,8 @@
 
 ## Card sources
 
+Turn headers show model, effort, and recorded speed as separate fields. Child rows place literal middle dots between those facts. Each surface preserves its existing model spelling. Known differing tiers read `Mixed speeds`. Missing evidence suppresses a positive speed annotation, and cost detail explains the gap. Standard has no compact suffix. A lone retained context request supplies whole-turn speed only when the turn records exactly one request. These labels describe recorded settings, without promising delivered throughput. [Delegated attribution](accounting.md#delegated-attribution) owns child scope.
+
 `turncard.ts` prepares the browser-facing card. `webview/card.ts` draws it without repeating decisions about wording, status, marks, cost, context, or file meaning. Keep presentation decisions in the host projection when adding a field.
 
 The folded running card shows the newest running tool, or the latest commentary when no tool runs. Commentary previews show inline Markdown link labels, preserve literal code and written entities, flatten whitespace, and stop at 120 characters. Markdown hard breaks separate words. Reference-style links remain literal. Activity retains the full commentary.

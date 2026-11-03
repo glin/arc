@@ -31,6 +31,8 @@ import {
   withRetainedRequestEvents,
 } from './parserstate';
 import {
+  canonicalPriceTier,
+  usesStandardPublicRate,
   cacheLapsedBy,
   type CacheTier,
   cacheLifetimeFor,
@@ -523,7 +525,7 @@ export function projectSpendSaveRetryDelay(retries: number): number | null {
 // Saved source records require a rebuild when the parser generation of their agent differs.
 // Increase an agent's generation when a stored field of its records changes the conclusions consumers draw from it.
 // Increase both generations for a change that alters both agents' records.
-export const PROJECT_SPEND_PARSER_GENERATIONS: Readonly<Record<'claude' | 'codex', number>> = { claude: 67, codex: 68 };
+export const PROJECT_SPEND_PARSER_GENERATIONS: Readonly<Record<'claude' | 'codex', number>> = { claude: 68, codex: 69 };
 
 // Earlier shared generations whose records of one agent match that agent's generation.
 // Each mapping names the agent generation of the stored facts.
@@ -763,7 +765,10 @@ function matchingOverride(bucket: ProjectUsageBucket, entry: ModelPricingSetting
     entry.model === bucket.model &&
     (entry.provider === undefined || entry.provider === bucket.provider) &&
     (entry.inferenceClass === undefined || entry.inferenceClass === bucket.inferenceClass) &&
-    (entry.serviceTier === undefined || entry.serviceTier === bucket.serviceTier)
+    (entry.serviceTier === undefined
+      ? usesStandardPublicRate(bucket.provider, bucket.serviceTier)
+      : canonicalPriceTier(bucket.provider, entry.serviceTier) ===
+        canonicalPriceTier(bucket.provider, bucket.serviceTier))
   );
 }
 

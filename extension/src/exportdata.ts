@@ -1,3 +1,4 @@
+import { distinctModelTierIdentities, normalizeModelIdentity } from './domain/model-identity';
 import { meterRead, meterReadWork, readPhase } from './readmeter';
 import { isCompressedRollout } from './compressedrollouts';
 import * as fs from 'node:fs/promises';
@@ -93,6 +94,7 @@ import type {
   SessionExport,
 } from './domain/export-model';
 export interface ExportCaptureOptions {
+  modelLabels?: Readonly<Record<string, string>>;
   root: SessionFile & { parentSessionId?: string };
   roots?: { claude?: string; codex?: string };
   readerLinks?: readonly ExportReaderLink[];
@@ -656,6 +658,7 @@ export function projectTurn(
       agentType: agent.agentType,
       model: agent.model,
       ...(agent.ownModel ? { ownModel: agent.ownModel } : {}),
+      ...(agent.ownModelTiers ? { ownModelTiers: agent.ownModelTiers.map((part) => ({ ...part })) } : {}),
       ...(agent.outputRate ? { outputRate: agent.outputRate } : {}),
       ...(agent.outputRateModel ? { outputRateModel: agent.outputRateModel } : {}),
       effort: agent.effort,
@@ -1411,6 +1414,12 @@ export async function captureSessionExport(
         turnCount++;
         session.turnCount++;
         seen.set(semantic, digest);
+        session.ownModelTiers = distinctModelTierIdentities([
+          ...(session.ownModelTiers ?? []),
+          ...(turn.usageParts ?? []).filter(
+            (part) => !part.usageOrigin && !part.compactionEstimate && !part.linkedInvocationId,
+          ),
+        ]);
         if (title) session.title = title;
         else if (turn.sessionFullTitle || turn.sessionTitle)
           session.title = turn.sessionFullTitle ?? turn.sessionTitle!;
@@ -1591,7 +1600,34 @@ export async function captureSessionExport(
           ? 'partial'
           : 'complete';
   }
+  const represented = new Set<string>();
+  const includeModel = (model: string | null | undefined) => {
+    if (model) represented.add(normalizeModelIdentity(model));
+  };
+  if (options.modelLabels)
+    for (const session of sessions) {
+      for (const part of session.numbers.parts) includeModel(part.model);
+      for (const spool of session.pages) {
+        const page = await writer.readSpool<import('./domain/export-model').ExportPage>(spool);
+        for (const turn of page.turns) {
+          includeModel(turn.model);
+          for (const agent of turn.agents) {
+            includeModel(agent.model);
+            includeModel(agent.ownModel);
+            for (const part of agent.ownModelTiers ?? []) includeModel(part.model);
+          }
+        }
+      }
+    }
+  const capturedLabels = options.modelLabels
+    ? Object.fromEntries(
+        Object.entries(options.modelLabels)
+          .filter(([key]) => represented.has(normalizeModelIdentity(key)))
+          .map(([key, label]) => [normalizeModelIdentity(key), label]),
+      )
+    : undefined;
   const model: SessionExport = {
+    ...(capturedLabels ? { modelLabels: capturedLabels } : {}),
     version: 1,
     root: rootKey,
     capturedAt: options.capturedAt ?? Date.now(),

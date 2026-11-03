@@ -162,6 +162,7 @@ function LiveCard(props: {
     h('span', { class: 'when', title: live.absolute, 'data-at': String(live.at) }, live.relative),
     live.agent ? h('span', { class: 'agent' }, live.agent) : null,
     live.model ? h('span', { class: 'model' }, live.model) : null,
+    live.speed ? h('span', { class: 'speed' }, live.speed) : null,
   ];
   return h(
     'div',

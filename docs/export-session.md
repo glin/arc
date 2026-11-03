@@ -32,6 +32,8 @@ Encoded HTML nodes remain in the document, so total file size and browser memory
 
 ## Capture and projection contracts
 
+Version-1 exports optionally capture catalog labels for represented normalized model IDs and each source's own executor-tier identities. Production card and cost projections use those labels. Exports without the optional fields retain fallback names and unknown own speed. Capture retains own identities from executor requests independently of billing origins. Child graph reconstruction keeps source-owned identities separate from descendant spend.
+
 [`exportdata.ts`](../extension/src/exportdata.ts) captures semantic pages at one graph revision. The host snapshots archive and retained launch membership before native export choices. Capture keeps provider and parent identities mapped to artifact keys through retries. Participating name sources remain frozen until publication.
 
 Provider classifiers consume the numeric read to classify agent runs and reader participation. Retained launch ownership and provider evidence pass through reader overrides. A dispatch relationship alone supplies no run evidence. Both static render phases retain archive membership, including the selected root.

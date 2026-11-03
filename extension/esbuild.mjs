@@ -190,10 +190,15 @@ export async function buildExtension({ watch = false, developmentServerUrl = nul
   await cli.watch();
   let watchers = [];
   let pending = null;
+  let closed = false;
+  let rebuilding = Promise.resolve();
   const rebuildPanel = async () => {
-    await current.context.dispose();
+    if (closed) return;
     try {
+      await current.context.dispose();
+      if (closed) return;
       current = await createBuildContext(developmentServerUrl, identity, watch);
+      if (closed) return;
       await current.context.watch();
       rewatch();
       console.log(`rebuilt: the ${developmentServerUrl === null ? 'panel' : 'worker'} source changed`);
@@ -206,21 +211,25 @@ export async function buildExtension({ watch = false, developmentServerUrl = nul
     for (const watcher of watchers) {
       watcher.close();
     }
+    if (closed) return;
     watchers = current.inputs.map((file) =>
       fs.watch(file, () => {
+        if (closed) return;
         clearTimeout(pending);
         pending = setTimeout(() => {
-          void rebuildPanel();
+          rebuilding = rebuilding.then(rebuildPanel);
         }, 50);
       }),
     );
   };
   rewatch();
   return async () => {
+    closed = true;
     clearTimeout(pending);
     for (const watcher of watchers) {
       watcher.close();
     }
+    await rebuilding;
     await current.context.dispose();
     await cli.dispose();
   };

@@ -12,6 +12,7 @@ export type { RelativeStep } from './view/time.ts';
 export { formatTokens } from './view/tokens.ts';
 import { modelWindowOf, normalizeModelIdentity } from './domain/model-identity.ts';
 import type { ListedModel } from './domain/model-catalog.ts';
+import { canonicalPriceTier } from './pricing';
 
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
@@ -37,6 +38,58 @@ export function shortModel(model: string | null): string | null {
     return null;
   }
   return model.replace(/^claude-/, '').replace(/-\d{8}$/, '');
+}
+
+export type { ModelTierIdentity } from './domain/model-identity';
+import type { ModelTierIdentity } from './domain/model-identity';
+
+export function speedName(provider: string | null | undefined, tier: string | null | undefined): string | null {
+  const canonical = canonicalPriceTier(provider, tier);
+  if (
+    (provider == null && canonical === 'standard') ||
+    ((provider === 'openai' || provider === 'amazon-bedrock') && canonical === 'default')
+  )
+    return 'Standard';
+  if (provider === 'openai') {
+    return (
+      ({ priority: 'Fast', ultrafast: 'Ultrafast', flex: 'Flex', batch: 'Batch' } as Record<string, string>)[
+        canonical ?? ''
+      ] ?? null
+    );
+  }
+  return provider == null && canonical === 'fast' ? 'Fast' : null;
+}
+
+// Only the displayed model's own requests establish its recorded speed.
+export function recordedModelSpeed(
+  model: string | null,
+  parts: readonly ModelTierIdentity[] | undefined,
+): string | null {
+  if (!model || parts?.some((part) => !normalizeModelIdentity(part.model))) return null;
+  const held =
+    parts?.filter((part) => normalizeModelIdentity(part.model ?? '') === normalizeModelIdentity(model)) ?? [];
+  if (!held.length) return null;
+  const speeds = held.map((part) => speedName(part.provider, part.serviceTier));
+  if (speeds.some((speed) => speed === null)) return null;
+  const distinct = new Set(speeds);
+  if (distinct.size > 1) return 'Mixed speeds';
+  return speeds[0];
+}
+
+// Compact labels omit a known Standard setting while keeping it distinct in retained evidence.
+export function modelSpeed(model: string | null, parts: readonly ModelTierIdentity[] | undefined): string | null {
+  const speed = recordedModelSpeed(model, parts);
+  return speed === 'Standard' ? null : speed;
+}
+
+export function modelTierKey(part: ModelTierIdentity): string {
+  return JSON.stringify([part.model, part.provider ?? null, canonicalPriceTier(part.provider, part.serviceTier)]);
+}
+
+export function modelWithSpeed(part: ModelTierIdentity, labels?: ModelLabels, short = false): string {
+  const model = short ? (shortModel(part.model) ?? 'model not recorded') : friendlyModel(part.model, labels);
+  const speed = speedName(part.provider, part.serviceTier);
+  return speed && speed !== 'Standard' ? `${model} · ${speed}` : model;
 }
 
 const MODEL_WORD = (word: string): string => word.charAt(0).toUpperCase() + word.slice(1);

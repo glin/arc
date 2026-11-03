@@ -56,7 +56,7 @@ import {
   UNNAMED_TOOL,
 } from './childartifacts';
 import { HEX_SHA, sameCommitSha } from './domain/commit-sha';
-import { sameModelIdentity } from './domain/model-identity';
+import { distinctModelTierIdentities, sameModelIdentity } from './domain/model-identity';
 import {
   applyHiddenParserState,
   cloneParserState,
@@ -182,6 +182,7 @@ export interface TurnAgent {
   // The model the child's own requests used most, from `AgentSpend.ownModel`. Absent for a child
   // whose spend reader does not record it.
   ownModel?: string;
+  ownModelTiers?: import('./domain/model-identity').ModelTierIdentity[];
   effort: string | null;
   // Recorded child usage grouped by pricing identity. Empty when no request usage is available.
   spend: ModelSpend[];
@@ -9097,13 +9098,13 @@ function numericUsageField(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
-// Nonstandard recorded speed takes precedence over `service_tier`. Standard or absent speed leaves the service tier unchanged.
+// Nonstandard speed takes precedence. A recorded standard speed remains evidence when no service tier is supplied.
 function claudeServiceTier(usage: ClaudeUsage): string | null {
   const speed = typeof usage.speed === 'string' && usage.speed ? usage.speed : null;
   if (speed && speed !== 'standard') {
     return speed;
   }
-  return typeof usage.service_tier === 'string' && usage.service_tier ? usage.service_tier : null;
+  return typeof usage.service_tier === 'string' && usage.service_tier ? usage.service_tier : speed;
 }
 
 function claudeInferenceClass(value: unknown): UsageInferenceClass {
@@ -10241,6 +10242,9 @@ function readClaudeSpendTree(
     spend: {
       models,
       ownModel,
+      ownModelTiers: distinctModelTierIdentities(
+        own.usageParts.filter((part) => !part.usageOrigin && !part.compactionEstimate && !part.linkedInvocationId),
+      ),
       found: true,
       partial,
       effort: own.effort,
@@ -10439,7 +10443,7 @@ interface RecordedTitleState {
 }
 
 export interface ClaudeSessionParserState {
-  version: 12;
+  version: 13;
   taskEvidence?: ClaudeTaskEvidence;
   // Text that subagents returned into this session's context since the newest compaction.
   subagents: SubagentContextState;
@@ -10588,7 +10592,7 @@ function emptyClaudeSessionParserState(opts: ReadOptions): ClaudeSessionParserSt
   const suppliedTitle = normalizeSessionTitle(opts.sessionTitle);
   const suppliedFullTitle = normalizeFullSessionTitle(opts.sessionTitle);
   return {
-    version: 12,
+    version: 13,
     subagents: emptySubagentContext(),
     turns: [],
     turnRanges: [],
@@ -12860,7 +12864,7 @@ export function createClaudeSessionReducer(
   restored?: ClaudeSessionParserState,
 ): ClaudeSessionReducer {
   const state = restored ? cloneParserState(restored) : emptyClaudeSessionParserState(opts);
-  if (state.version !== 12) {
+  if (state.version !== 13) {
     throw new Error('Incompatible Claude parser state');
   }
   applyHiddenParserState(claudeHiddenSlots(state), state.hidden, CLAUDE_HIDDEN_POLICY);
@@ -13057,6 +13061,8 @@ export function refreshClaudeAgentFacts(
       }
       const spend = lookup(ref);
       agent.spend = spend.models;
+      if (spend.ownModelTiers) agent.ownModelTiers = spend.ownModelTiers.map((part) => ({ ...part }));
+      else delete agent.ownModelTiers;
       if (spend.ownModel) {
         agent.ownModel = spend.ownModel;
       } else {
@@ -13184,6 +13190,7 @@ function shareChildSpendByTurn(turns: readonly Turn[], timed: readonly ChildRequ
         agentType: source.agentType,
         model: source.model,
         ...(source.ownModel ? { ownModel: source.ownModel } : {}),
+        ...(source.ownModelTiers ? { ownModelTiers: source.ownModelTiers.map((part) => ({ ...part })) } : {}),
         effort: source.effort,
         spend: [],
         spendFound: true,

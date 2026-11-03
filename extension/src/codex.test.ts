@@ -9669,6 +9669,10 @@ test('a spawned Codex rollout keeps billed requests under their turn models and 
           }),
         },
       ],
+      ownModelTiers: [
+        { model: 'gpt-5.6-sol', provider: null, serviceTier: null },
+        { model: 'gpt-5.6-terra', provider: null, serviceTier: null },
+      ],
       found: true,
       partial: true,
       effort: 'medium',
@@ -11634,6 +11638,7 @@ test('a spawned Bedrock rollout keeps provider-qualified cache-write spend', () 
           }),
         },
       ],
+      ownModelTiers: [{ model: 'openai.gpt-5.6-sol', provider: 'amazon-bedrock', serviceTier: null }],
       found: true,
       partial: true,
       effort: 'high',
@@ -11654,6 +11659,7 @@ test('a spawned rollout marks direct usage incomplete when a billed request has 
   ]);
   assert.deepEqual((({ artifacts: _artifacts, ...spend }) => spend)(readCodexAgentSpend(file)), {
     models: [],
+    ownModelTiers: [{ model: 'gpt-5.6-sol', provider: null, serviceTier: null }],
     found: true,
     partial: true,
     effort: 'high',
@@ -12985,7 +12991,7 @@ test('a prior Codex parser state rebuilds child identity and exact compaction us
 
   const reset = readCodexSessionIncremental(file, 'sess', initial.checkpoint, options);
   assert.equal(reset.kind, 'reset');
-  assert.equal(reset.checkpoint?.parserState.version, 29);
+  assert.equal(reset.checkpoint?.parserState.version, 30);
   assert.deepEqual(
     reset.read?.turns[0].agents.map((row) => [row.id, row.description]),
     [[child.threadId, 'astra_implementer']],
@@ -19178,4 +19184,167 @@ test('a Codex wait_agent return times out only by its own top-level timed_out fi
       ['text-reader', 1],
     ],
   );
+});
+
+test('a native Codex child keeps its own tier when a same-model descendant differs', () => {
+  const fixture = nestedCodexCostFixture();
+  for (const [file, tier] of [
+    [fixture.child, 'default'],
+    [fixture.grandchild, 'priority'],
+  ]) {
+    const rows = fs
+      .readFileSync(file, 'utf8')
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    rows.splice(1, 0, {
+      timestamp: rows[0].timestamp,
+      type: 'event_msg',
+      payload: {
+        type: 'thread_settings_applied',
+        thread_settings: { model_provider_id: 'openai', service_tier: tier },
+      },
+    });
+    fs.writeFileSync(file, rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
+  }
+  const read = codexAgentSpendReader(codexSpendIndex(fixture.children));
+  const spend = read(fixture.child);
+  assert.deepEqual(spend.ownModelTiers, [{ model: 'gpt-5.6-sol', provider: 'openai', serviceTier: 'default' }]);
+  assert.ok(spend.models.flatMap((part) => part.usageParts ?? []).some((part) => part.serviceTier === 'priority'));
+  assert.equal(JSON.parse(JSON.stringify(spend)).ownModelTiers[0].serviceTier, 'default');
+});
+
+test('incomplete own requests retain distinct identities before billing exclusion', () => {
+  for (const [first, second] of [
+    ['priority', 'default'],
+    [undefined, 'priority'],
+  ] as const) {
+    const records = [
+      meta({ model_provider: 'openai' }),
+      event('task_started', 1, { turn_id: TURN }),
+      {
+        type: 'thread_settings_applied',
+        timestamp: at(2),
+        payload: { thread_settings: { model_provider_id: 'openai', service_tier: first } },
+      },
+      turnContext(3, TURN, 'gpt-5.6-sol', 'high'),
+      ...(first
+        ? [tokens(4, { input_tokens: 100, output_tokens: 10 })]
+        : [event('token_count', 4, { info: { last_token_usage: null } })]),
+      {
+        type: 'thread_settings_applied',
+        timestamp: at(5),
+        payload: { thread_settings: { model_provider_id: 'openai', service_tier: second } },
+      },
+      ...(first
+        ? [event('token_count', 6, { info: { last_token_usage: null } })]
+        : [tokens(6, { input_tokens: 100, output_tokens: 10 })]),
+    ];
+    const spend = readCodexAgentSpend(writeRollout(records));
+    assert.deepEqual(
+      spend.ownModelTiers?.map((part) => part.serviceTier),
+      [first ?? null, second],
+    );
+    assert.equal(spend.models[0].usage.requests, 1);
+    assert.equal(spend.usageIncomplete, true);
+  }
+});
+
+test('repeated Codex requests keep distinct raw identities only', () => {
+  const records: object[] = [
+    meta({ model_provider: 'openai' }),
+    event('task_started', 1, { turn_id: TURN }),
+    turnContext(2, TURN, 'gpt-5.6-sol', 'high'),
+  ];
+  for (let i = 0; i < 60; i++)
+    records.push(
+      event('token_count', 3 + i, {
+        info: {
+          last_token_usage: usage({ input_tokens: i % 2 ? 300000 + i : 100 + i, output_tokens: 10 }),
+          model_context_window: 1_000_000 + i,
+        },
+      }),
+    );
+  for (const [i, tier] of ['fast', 'priority', 'default'].entries()) {
+    records.push({
+      type: 'thread_settings_applied',
+      timestamp: at(70 + i * 2),
+      payload: { thread_settings: { model_provider_id: 'openai', service_tier: tier } },
+    });
+    records.push(tokens(71 + i * 2, { input_tokens: 200 + i, output_tokens: 10 }));
+  }
+  const spend = readCodexAgentSpend(writeRollout(records));
+  assert.deepEqual(
+    spend.ownModelTiers?.map((part) => part.serviceTier),
+    [null, 'fast', 'priority', 'default'],
+  );
+  assert.equal(JSON.parse(JSON.stringify(spend)).ownModelTiers.length, 4);
+});
+
+test('own speed drops retracted copied requests and corrected compaction identities', () => {
+  const settings = (second: number, service_tier: string) =>
+    event('thread_settings_applied', second, { thread_settings: { service_tier, model_provider_id: 'openai' } });
+  const records: object[] = [
+    meta({ model_provider: 'openai' }),
+    settings(1, 'priority'),
+    event('task_started', 2, { turn_id: 'copied' }),
+    turnContext(3, 'copied', 'gpt-5.6-sol', 'high'),
+    event('user_message', 4, { message: 'Copied work' }),
+    tokens(5, { input_tokens: 100, output_tokens: 10 }),
+    event('task_complete', 6, { turn_id: 'copied' }),
+    settings(7, 'default'),
+    event('task_started', 8, { turn_id: 'current' }),
+    turnContext(9, 'current', 'gpt-5.6-sol', 'high'),
+    event('user_message', 10, { message: 'Current work' }),
+    tokens(11, { input_tokens: 200, output_tokens: 20 }),
+    event('task_complete', 12, { turn_id: 'current' }),
+  ];
+  const file = writeRollout(records);
+  assert.deepEqual(
+    readCodexAgentSpend(file).ownModelTiers?.map((part) => part.serviceTier),
+    ['priority', 'default'],
+  );
+  records.push({
+    type: 'turn_context',
+    timestamp: at(13),
+    payload: {
+      turn_id: 'copied',
+      model: 'gpt-5.6-sol',
+      current_date: '2020-01-01',
+    },
+  });
+  fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+  const retracted = readCodexAgentSpend(file);
+  assert.deepEqual(retracted.ownModelTiers, [{ model: 'gpt-5.6-sol', provider: 'openai', serviceTier: 'default' }]);
+  assert.equal(
+    retracted.models.reduce((sum, part) => sum + (part.usage.requests ?? 0), 0),
+    1,
+  );
+  const compacted = writeRollout([
+    meta({ model_provider: 'openai' }),
+    settings(1, 'default'),
+    event('task_started', 2, { turn_id: TURN }),
+    event('user_message', 3, { message: 'Compact this work' }),
+    {
+      type: 'compacted',
+      timestamp: at(4),
+      payload: {
+        latest_token_usage_record: {
+          response_id: 'compaction',
+          usage: usage({ input_tokens: 100, output_tokens: 10 }),
+        },
+      },
+    },
+    event('thread_settings_applied', 5, {
+      thread_settings: {
+        model: 'gpt-5.6-sol',
+        model_provider_id: 'openai',
+        service_tier: 'default',
+      },
+    }),
+    event('task_complete', 6, { turn_id: TURN }),
+  ]);
+  assert.deepEqual(readCodexAgentSpend(compacted).ownModelTiers, [
+    { model: 'gpt-5.6-sol', provider: 'openai', serviceTier: 'default' },
+  ]);
 });

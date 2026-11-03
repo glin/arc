@@ -7,6 +7,8 @@ import { tempDir } from './temproot.ts';
 import * as path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createHash } from 'node:crypto';
+import { runInNewContext } from 'node:vm';
+import ts from 'typescript';
 import { readToolPackage, prepareEditorCommands } from './bundledtools.ts';
 import { TerminalTools, terminalToolPath, type ToolAdmission } from './toolpath.ts';
 import { childEnv } from './agenthost.ts';
@@ -200,6 +202,93 @@ test(
     }
   },
 );
+
+test('closing the build during a panel rebuild closes every watcher and context', async () => {
+  const source = ts.createSourceFile(
+    'esbuild.mjs',
+    fs.readFileSync(path.join(extensionRoot, 'esbuild.mjs'), 'utf8'),
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.JS,
+  );
+  const build = source.statements.find(
+    (statement): statement is ts.FunctionDeclaration =>
+      ts.isFunctionDeclaration(statement) && statement.name?.text === 'buildExtension',
+  )!;
+  const watchers: { closed: boolean; changed: () => void }[] = [];
+  const contexts: { disposed: boolean; watching: boolean; dispose: () => Promise<void>; watch: () => Promise<void> }[] =
+    [];
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let entered = 0;
+  const context = () => {
+    const result = {
+      disposed: false,
+      watching: false,
+      async dispose() {
+        this.disposed = true;
+        this.watching = false;
+      },
+      async watch() {
+        this.disposed = false;
+        this.watching = true;
+      },
+      async rebuild() {},
+    };
+    contexts.push(result);
+    return result;
+  };
+  vi.useFakeTimers();
+  const dependencies = {
+    fs: {
+      rmSync() {},
+      watch(_file: string, changed: () => void) {
+        const watcher = {
+          closed: false,
+          changed,
+          close() {
+            this.closed = true;
+          },
+        };
+        watchers.push(watcher);
+        return watcher;
+      },
+    },
+    copyWindowsPipe() {},
+    createCliContext: async () => context(),
+    createBuildContext: async () => {
+      entered++;
+      if (entered > 1) await blocked;
+      return { context: context(), inputs: ['panel.css'] };
+    },
+    setTimeout,
+    clearTimeout,
+    console: { log() {}, error() {} },
+  };
+  try {
+    const run = runInNewContext(
+      `const {${Object.keys(dependencies).join(',')}} = dependencies; ${build
+        .getText(source)
+        .replace(/^export /, '')
+        .replaceAll('import.meta.url', JSON.stringify('file:///fixture/esbuild.mjs'))}; buildExtension;`,
+      { dependencies },
+    );
+    const close = await run({ watch: true });
+    watchers[0].changed();
+    await vi.advanceTimersByTimeAsync(50);
+    assert.equal(entered, 2);
+    const closing = close();
+    release();
+    await closing;
+    assert.ok(contexts.every((item) => item.disposed && !item.watching));
+    assert.ok(watchers.every((item) => item.closed));
+  } finally {
+    release();
+    vi.useRealTimers();
+  }
+});
 
 test(
   'CLI watching survives panel rebuilds and ends when the build closes',
@@ -880,11 +969,11 @@ test('obsolete private preparation never publishes after admission changes or di
 });
 
 test('private ownership waits preserve retained locks until canceled', async () => {
+  vi.useFakeTimers();
   const root = tempDir('arc-retained-lock-');
   const file = path.join(root, '.install.lock');
   const lock = acquireToolLock(file);
   const bytes = fs.readFileSync(file);
-  vi.useFakeTimers();
   try {
     const controller = new AbortController();
     let settled = false;

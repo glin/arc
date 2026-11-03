@@ -83,6 +83,7 @@ function normalizeComment(raw: unknown): TurnComment | null {
     turnKey: key,
     part: commentPart(source.part),
     quote: text(source.quote, COMMENT_TEXT_LIMIT),
+    ...(typeof source.matchQuote === 'string' ? { matchQuote: text(source.matchQuote, COMMENT_TEXT_LIMIT) } : {}),
     offset:
       typeof source.offset === 'number' && Number.isFinite(source.offset) && source.offset >= 0
         ? Math.trunc(source.offset)

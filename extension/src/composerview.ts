@@ -35,7 +35,7 @@ import {
   MAX_PROMPT_ASSET_BYTES,
   MAX_PROMPT_ASSET_TOTAL_BYTES,
 } from './promptassets';
-import { formatMegabytes } from './turnformat';
+import { formatMegabytes, speedName } from './turnformat';
 import { PermissionMode, type RemoteControlResult } from './claudewire';
 // `mcpview.ts` prepares the Servers control and menu. This module places the control
 // on the row. Type-only imports there prevent a runtime dependency cycle.
@@ -87,6 +87,7 @@ import {
   formatConservativeCost,
   nextTurnFloor,
   effortChangeKeepsCache,
+  canonicalPriceTier,
 } from './pricing';
 import { CACHE_SPAN_MINIMUM_SECONDS } from './view/time';
 import { looksLikeComments } from './turncomments';
@@ -541,6 +542,9 @@ export interface AppliedSessionSettings extends SessionSettingSelection {
   // The model attachment that names the same model with its window, when the transcript has one.
   confirmedModelAttachment?: string | null;
   confirmedEffort: string | null;
+  confirmedServiceTier?: string | null;
+  confirmedProvider?: string | null;
+  confirmedSpeed?: string | null;
 }
 
 export type SessionSettingBook = Record<string, SessionSettingSelection>;
@@ -817,6 +821,7 @@ export interface ComposerLive {
   agent: string;
   // Empty until a model pick or recorded turn identifies the model.
   model: string;
+  speed?: string | null;
   // The head row's spoken name, which carries what the eye reads off the row.
   label: string;
   // The first line of the submitted prompt occupies the turn card's headline slot.
@@ -2073,8 +2078,10 @@ interface ProspectiveNextTurn {
 
 // A changed model replaces pricing identity and clears cache state. Effort changes retain the recorded model and write tier.
 export function prospectiveNextTurn(state: ComposerState): ProspectiveNextTurn | null {
-  const basis = state.nextTurn;
-  if (!basis) return null;
+  const recorded = state.nextTurn;
+  if (!recorded) return null;
+  const basis =
+    state.settings.serviceTier === undefined ? recorded : { ...recorded, serviceTier: state.settings.serviceTier };
   const selected = chosenModel(state.models, state.settings.selectedModel);
   const unchanged =
     !selected ||
@@ -2423,17 +2430,46 @@ function modelPick(state: ComposerState, name: string): ComposerPick {
   const waiting = menu.items.length === 0;
   // Describe a recorded model only when the label uses confirmed state.
   const read = readConfirmed && (running !== null || recorded !== '');
+  const selectedTier = state.settings.serviceTier;
+  const provider = state.nextTurn
+    ? state.nextTurn.provider
+    : (state.settings.confirmedProvider ?? (state.agent === 'codex' ? 'openai' : null));
+  const selectedIdentity = chosen?.resolvedModel ?? chosen?.value ?? selected;
+  const confirmedSelection = Boolean(
+    selectedIdentity && sameModelIdentity(selectedIdentity, state.settings.confirmedModel),
+  );
+  const tierPending =
+    selectedTier !== undefined &&
+    (state.settings.confirmedSpeed === null ||
+      canonicalPriceTier(provider, selectedTier) !==
+        canonicalPriceTier(state.settings.confirmedProvider, state.settings.confirmedServiceTier));
+  const speed =
+    selectedTier !== undefined && (tierPending || pending)
+      ? speedName(provider, selectedTier)
+      : read || confirmedSelection
+        ? state.settings.confirmedSpeed !== undefined
+          ? state.settings.confirmedSpeed
+          : speedName(state.settings.confirmedProvider, state.settings.confirmedServiceTier)
+        : null;
+  const speedDetail = speed
+    ? tierPending || pending
+      ? `${speed} selected for the next turn.`
+      : `Recorded speed: ${speed}.`
+    : '';
   const application = pending ? ', selected for the next turn' : read ? ', which is what the last turn ran on' : '';
   return {
     control: 'model',
     label,
     name: waiting
       ? `Model: ${label}. ${menu.empty}`
-      : `Model: ${label}${application}. ` + 'Press to run this session on another model.',
+      : `Model: ${label}${application}. ${speedDetail}${speedDetail ? ' ' : ''}` +
+        'Press to run this session on another model.',
     detail:
       !pending && read
-        ? 'What the last turn in this session ran on. Nothing has been picked for it yet.'
-        : chosen?.description || `Which model ${name} runs this session on`,
+        ? tierPending
+          ? speedDetail
+          : `What the last turn in this session ran on. ${speedDetail}${speedDetail ? ' ' : ''}Nothing has been picked for it yet.`
+        : [speedDetail, chosen?.description || `Which model ${name} runs this session on`].filter(Boolean).join(' '),
     disabled: waiting,
     // Model controls use no caution styling.
     caution: false,
@@ -3693,7 +3729,18 @@ function liveCard(state: ComposerState, press: LivePress, name: string, now: num
   const failed = press.failed;
   const tone = which === 'sent' ? 'running' : which;
   // Prefer the selected model, then the confirmed model. Without either, leave the model label empty.
-  const model = shortModel(state.settings.selectedModel || state.settings.confirmedModel) ?? '';
+  const identity = state.settings.selectedModel || state.settings.confirmedModel;
+  const model = shortModel(identity) ?? '';
+  const confirmed = Boolean(
+    identity && state.settings.confirmedModel && sameModelIdentity(identity, state.settings.confirmedModel),
+  );
+  const tierMatches =
+    state.settings.serviceTier === undefined ||
+    canonicalPriceTier(state.settings.confirmedProvider, state.settings.serviceTier) ===
+      canonicalPriceTier(state.settings.confirmedProvider, state.settings.confirmedServiceTier);
+  const speed =
+    confirmed && tierMatches ? speedName(state.settings.confirmedProvider, state.settings.confirmedServiceTier) : null;
+  const compactSpeed = speed === 'Standard' ? null : speed;
   const relative = formatRelative(press.at, now);
   // Session controls have no prompt headline.
   const compaction = press.kind === 'compact' || press.kind === 'clear';
@@ -3708,7 +3755,16 @@ function liveCard(state: ComposerState, press: LivePress, name: string, now: num
     at: press.at,
     agent: name,
     model,
-    label: headLabel('Turn', [STATUS_WORDS[tone], relative, [name, model].filter(Boolean).join(' ') || null], said),
+    ...(compactSpeed ? { speed: compactSpeed } : {}),
+    label: headLabel(
+      'Turn',
+      [
+        STATUS_WORDS[tone],
+        relative,
+        [name, model, compactSpeed ? `${compactSpeed} recorded speed setting` : null].filter(Boolean).join(' ') || null,
+      ],
+      said,
+    ),
     // Use the prompt's first line as the headline. Session controls leave it empty.
     headline: compaction ? '' : firstLine(press.text),
     reply: press.reply,

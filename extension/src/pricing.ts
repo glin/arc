@@ -59,6 +59,10 @@ export interface ModelDefinition {
   fast?: Rate;
   // Only tiers published for this model have a multiplier. Others remain unpriced.
   serviceTierMultipliers?: Readonly<Record<string, number>>;
+  // A restricted tier requires a recorded request band.
+  serviceTierBands?: Readonly<Record<string, readonly UsageContextBand[]>>;
+  // Exact category prices take precedence over tier multipliers.
+  serviceTierRates?: Readonly<Record<string, Partial<Record<UsageContextBand, Rate>>>>;
   bedrock?: BedrockSupport;
   promotion?: Promotion;
 }
@@ -229,6 +233,7 @@ export const MODEL_DEFINITIONS: readonly ModelDefinition[] = [
       sources: ['https://developers.openai.com/api/docs/guides/prompt-caching'],
     },
     providers: ['openai'],
+    serviceTierMultipliers: { fast: 2, priority: 2, flex: 0.5, batch: 0.5, ultrafast: 6 },
     maxPricedContext: 272_000,
     longContext: { threshold: 272_000, inputMultiplier: 2, outputMultiplier: 1.5 },
     // https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-6-astra.html
@@ -254,9 +259,9 @@ export const MODEL_DEFINITIONS: readonly ModelDefinition[] = [
       sources: ['https://developers.openai.com/api/docs/guides/prompt-caching'],
     },
     providers: ['openai'],
+    serviceTierMultipliers: { fast: 2, priority: 2, flex: 0.5, batch: 0.5, ultrafast: 6 },
     maxPricedContext: 272_000,
     longContext: { threshold: 272_000, inputMultiplier: 2, outputMultiplier: 1.5 },
-    serviceTierMultipliers: { fast: 2, priority: 2, flex: 0.5, batch: 0.5 },
     // https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-6-1-sol.html
     // The model card specifies thirty minutes as the default and only supported cache lifetime.
     bedrock: {
@@ -282,9 +287,9 @@ export const MODEL_DEFINITIONS: readonly ModelDefinition[] = [
       sources: ['https://developers.openai.com/api/docs/guides/prompt-caching'],
     },
     providers: ['openai'],
+    serviceTierMultipliers: { fast: 2, priority: 2, flex: 0.5, batch: 0.5 },
     maxPricedContext: 272_000,
     longContext: { threshold: 272_000, inputMultiplier: 2, outputMultiplier: 1.5 },
-    serviceTierMultipliers: { fast: 2, priority: 2, flex: 0.5, batch: 0.5 },
     bedrock: {
       prefixes: /^(?:us|global)?$/,
       regionalMultiplier: 1.1,
@@ -308,6 +313,7 @@ export const MODEL_DEFINITIONS: readonly ModelDefinition[] = [
       sources: ['https://developers.openai.com/api/docs/guides/prompt-caching'],
     },
     providers: ['openai'],
+    serviceTierMultipliers: { fast: 2, priority: 2, flex: 0.5, batch: 0.5 },
     maxPricedContext: 272_000,
     longContext: { threshold: 272_000, inputMultiplier: 2, outputMultiplier: 1.5 },
     // https://aws.amazon.com/about-aws/whats-new/2026/09/openai-gpt-6-sol-luna-on-amazon-bedrock/
@@ -324,6 +330,7 @@ export const MODEL_DEFINITIONS: readonly ModelDefinition[] = [
       sources: ['https://developers.openai.com/api/docs/guides/prompt-caching'],
     },
     providers: ['openai'],
+    serviceTierMultipliers: { fast: 2, priority: 2, flex: 0.5, batch: 0.5 },
     maxPricedContext: 272_000,
     longContext: { threshold: 272_000, inputMultiplier: 2, outputMultiplier: 1.5 },
     // https://aws.amazon.com/about-aws/whats-new/2026/09/openai-gpt-6-sol-luna-on-amazon-bedrock/
@@ -341,11 +348,23 @@ export const MODEL_DEFINITIONS: readonly ModelDefinition[] = [
       sources: ['https://developers.openai.com/api/docs/guides/prompt-caching'],
     },
     providers: ['openai'],
+    serviceTierMultipliers: { fast: 2.5, priority: 2.5, flex: 0.5, batch: 0.5 },
+    serviceTierBands: { fast: ['short'], priority: ['short'] },
     maxPricedContext: 272_000,
     longContext: { threshold: 272_000, inputMultiplier: 2, outputMultiplier: 1.5 },
   },
   {
     pattern: /^gpt-5\.4(?:-2026-03-05)?$/,
+    serviceTierRates: {
+      flex: {
+        short: { input: 1.25, output: 7.5, cacheRead: 0.13 },
+        long: { input: 2.5, output: 11.25, cacheRead: 0.25 },
+      },
+      batch: {
+        short: { input: 1.25, output: 7.5, cacheRead: 0.13 },
+        long: { input: 2.5, output: 11.25, cacheRead: 0.25 },
+      },
+    },
     rate: { input: 2.5, cacheRead: 0.25, output: 15 },
     window: 1_050_000,
     cachePolicy: {
@@ -354,6 +373,8 @@ export const MODEL_DEFINITIONS: readonly ModelDefinition[] = [
       sources: ['https://developers.openai.com/api/docs/guides/prompt-caching'],
     },
     providers: ['openai'],
+    serviceTierMultipliers: { fast: 2, priority: 2, flex: 0.5, batch: 0.5 },
+    serviceTierBands: { fast: ['short'], priority: ['short'] },
     maxPricedContext: 272_000,
     longContext: { threshold: 272_000, inputMultiplier: 2, outputMultiplier: 1.5 },
   },
@@ -375,6 +396,7 @@ export const MODEL_DEFINITIONS: readonly ModelDefinition[] = [
       sources: ['https://developers.openai.com/api/docs/guides/prompt-caching'],
     },
     providers: ['openai'],
+    serviceTierMultipliers: { fast: 2, priority: 2, flex: 0.5, batch: 0.5 },
     maxPricedContext: 272_000,
     longContext: { threshold: 272_000, inputMultiplier: 2, outputMultiplier: 1.5 },
     bedrock: {
@@ -394,6 +416,7 @@ export const MODEL_DEFINITIONS: readonly ModelDefinition[] = [
       sources: ['https://developers.openai.com/api/docs/guides/prompt-caching'],
     },
     providers: ['openai'],
+    serviceTierMultipliers: { fast: 2, priority: 2, flex: 0.5, batch: 0.5 },
     maxPricedContext: 272_000,
     longContext: { threshold: 272_000, inputMultiplier: 2, outputMultiplier: 1.5 },
     bedrock: {
@@ -412,6 +435,7 @@ export const MODEL_DEFINITIONS: readonly ModelDefinition[] = [
       sources: ['https://developers.openai.com/api/docs/guides/prompt-caching'],
     },
     providers: ['openai'],
+    serviceTierMultipliers: { fast: 2, priority: 2, flex: 0.5, batch: 0.5 },
     maxPricedContext: 272_000,
     longContext: { threshold: 272_000, inputMultiplier: 2, outputMultiplier: 1.5 },
     bedrock: {
@@ -634,13 +658,18 @@ function publicRateFor(
         }
       : null;
   }
+  if (model === CODEX_AUTO_REVIEW_MODEL && !standard) return null;
+  const allowedBands = row.serviceTierBands?.[serviceTier ?? ''];
+  if (allowedBands && (band === null || !allowedBands.includes(band))) return null;
   const tierMultiplier = row.serviceTierMultipliers?.[serviceTier ?? ''];
   if (!standard && !(fast && row.fast) && tierMultiplier === undefined) {
     return null;
   }
   const contextRate = fast && row.fast ? row.fast : longContextRate(row, band);
   // Modern Claude in-region and regional Bedrock requests receive one 1.1 multiplier, selected by their inference class.
-  const tierRate = tierMultiplier === undefined ? contextRate : multiplied(contextRate, tierMultiplier);
+  const tierRate =
+    row.serviceTierRates?.[serviceTier ?? '']?.[band ?? 'short'] ??
+    (tierMultiplier === undefined ? contextRate : multiplied(contextRate, tierMultiplier));
   const rate = multiplied(tierRate, resolved.regionalMultiplier);
   return {
     rate,
@@ -653,6 +682,17 @@ function publicRateFor(
     effectiveDate: resolved.effectiveDate,
     ...(model === CODEX_AUTO_REVIEW_MODEL ? { cacheWritesFree: true } : {}),
   };
+}
+
+// Canonical keys preserve unknown evidence and provider-specific tier spellings.
+export function canonicalPriceTier(
+  provider: string | null | undefined,
+  tier: string | null | undefined,
+): string | null {
+  if (tier == null) return null;
+  if (provider === 'openai' && tier === 'fast') return 'priority';
+  if ((provider === 'openai' || provider === 'amazon-bedrock') && tier === 'standard') return 'default';
+  return tier;
 }
 
 export function usesStandardPublicRate(provider: string | null, serviceTier: string | null): boolean {
@@ -949,8 +989,13 @@ export function quoteUsage(input: UsageQuoteInput): UsageQuote | null {
       ...metadata,
     };
   }
-  // Overrides for fast requests must name the fast tier. Overrides without it leave fast usage unpriced.
-  if (input.override && input.serviceTier === FAST_SPEED && input.override.serviceTier !== FAST_SPEED) {
+  // A configured rate prices only its named tier, or standard usage when it names none.
+  if (
+    input.override &&
+    (input.override.serviceTier === undefined
+      ? !usesStandardPublicRate(provider, input.serviceTier ?? null)
+      : canonicalPriceTier(provider, input.serviceTier) !== canonicalPriceTier(provider, input.override.serviceTier))
+  ) {
     return null;
   }
   const publicPrice = input.override

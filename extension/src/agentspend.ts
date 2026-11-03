@@ -32,6 +32,8 @@ export interface ModelSpend {
 }
 
 export interface AgentSpend {
+  // Own executor identities exclude advisor consultations and descendant usage.
+  ownModelTiers?: import('./domain/model-identity').ModelTierIdentity[];
   models: ModelSpend[];
   outputRate?: import('./outputrate').OutputRate;
   outputRateModel?: string;
@@ -428,6 +430,7 @@ export function readChildSpend(
     ...(spend.outputRate ? { outputRate: { ...spend.outputRate } } : {}),
     ...(spend.outputRateModel ? { outputRateModel: spend.outputRateModel } : {}),
     ...(spend.ownModel ? { ownModel: spend.ownModel } : {}),
+    ...(spend.ownModelTiers ? { ownModelTiers: spend.ownModelTiers.map((part) => ({ ...part })) } : {}),
     found: spend.found,
     partial: spend.partial,
     effort: spend.effort,

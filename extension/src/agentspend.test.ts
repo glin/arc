@@ -288,3 +288,20 @@ test('open child usage preserves native measurement and clears it on a source re
   assert.equal(refreshed.outputRate, undefined);
   assert.equal(refreshed.outputRateModel, undefined);
 });
+
+test('open child projections retain own tiers without borrowing rolled-up model spend', () => {
+  const file = path.join(tempDir('own-tier-open-'), 'child.jsonl');
+  fs.writeFileSync(file, 'child');
+  const cache = new AgentSpendCache();
+  const load = () => ({
+    models: [{ model: 'gpt-6.1-sol', usage: usage(1000) }],
+    ownModelTiers: [{ model: 'gpt-6.1-sol', provider: 'openai', serviceTier: 'default' }],
+    found: true,
+    partial: false,
+    effort: null,
+  });
+  const read = readChildSpend(cache, file, 'running', spendFileVersion(file), load, 'own-tier', false, 10000);
+  assert.equal(read.ownModelTiers?.[0].serviceTier, 'default');
+  read.ownModelTiers![0].serviceTier = 'priority';
+  assert.equal(cache.read(file, load, 'own-tier').ownModelTiers?.[0].serviceTier, 'default');
+});

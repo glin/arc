@@ -1056,7 +1056,8 @@ button.head:hover .durationfact {
 }
 /* Sized with the model it sits beside, not with the body. The agent carries the margin
    that pushes the run right, so this one follows it. */
-.effort {
+.effort,
+.speed {
   color: var(--idle);
   font-size: var(--t-body);
   white-space: nowrap;
@@ -2057,7 +2058,7 @@ button.sessionparent:focus-visible .sessionparenttitle {
   gap: 0 0.4em;
   align-items: baseline;
 }
-/* The model and its reasoning effort are one run, because `Opus` alone on a line and `· high`
+/* The model, reasoning effort, and recorded speed are one run, because `Opus` alone on a line and `· high`
    alone on the next read as two facts. The run holds the right end of line one and never
    yields its width. A long name ends before the model run. The head's gap separates the name
    and model run. The model drops the margin it carries on the card head. */
