@@ -49,7 +49,7 @@ Read `docs/development.md` before installing dependencies, repairing the panel-m
 
 Only one session at a time runs each heavy test lane, such as the browser lane, and the [suite runner](docs/development.md#machine-load) enforces it.
 
-When local resources block checks, use remote CI only with access and authorization to publish the candidate. Push a temporary branch to trigger CI. Record the tested commit and results, and list unrun checks as pending in the handoff. After preserving the tested commit elsewhere, delete only temporary local and remote branches you created for these checks. Without remote access, hand off the pending checks. Existing landing and performance gates still apply.
+When local resources block checks, use remote CI only with access and authorization to publish the candidate. Push a temporary branch to `origin` (`glin/arc`) to trigger CI. Arc's repository is `glin/arc`. Never push to another remote for CI or read its results, even when the checkout lists one. Record the tested commit and results, and list unrun checks as pending in the handoff. After preserving the tested commit elsewhere, delete only temporary local and remote branches you created for these checks. Without remote access, hand off the pending checks. Existing landing and performance gates still apply.
 
 Use the diagnostic capture script in [Performance capture](docs/performance.md#performance-capture) for performance investigations and diagnostic requests.
 
