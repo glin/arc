@@ -49,6 +49,8 @@ Read `docs/development.md` before installing dependencies, repairing the panel-m
 
 Only one session at a time runs each heavy test lane, such as the browser lane, and the [suite runner](docs/development.md#machine-load) enforces it.
 
+When local resources block checks, use remote CI if access and authorization permit. Record the candidate and results, and identify unrun checks as pending in the handoff. Existing landing and performance gates still apply.
+
 Use the diagnostic capture script in [Performance capture](docs/performance.md#performance-capture) for performance investigations and diagnostic requests.
 
 A change to any of these lands only with a [build comparison](docs/performance.md#build-comparison) report in its plan entry:
