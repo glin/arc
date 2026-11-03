@@ -312,6 +312,9 @@ import {
   awaitExit,
   survivorNote,
   probedAlive,
+  windowsStopped,
+  signalStop,
+  editorStopNote,
   EDITOR_EXIT_MS,
   WARM_UP_OPEN_MS,
   WARM_UNTIL_CAP_MS,
@@ -986,6 +989,7 @@ test('isolated startup pins source provenance before a moving reference builds',
     isolatedEnvironment: () => ({}),
     measure: async () => ({ complete: true }),
     runRecord: {},
+    editorStopNote,
     report() {},
     removeTree() {},
     path,
@@ -2173,6 +2177,30 @@ test('a Windows exit probe counts every id alive unless it succeeds', () => {
       probedAlive([1, 2, 3], null, null, new Error('spawn powershell ENOENT')),
     ],
     [[], [1, 3], [1, 2, 3], [1, 2, 3]],
+  );
+});
+
+test('a failed editor stop makes the run incomplete, and a process the runner cannot signal stays in the wait', () => {
+  const failure = (code: string) => () => {
+    throw Object.assign(new Error(code), { code });
+  };
+  assert.deepEqual(
+    [
+      windowsStopped(0, '7\r\n9\r\n', undefined),
+      windowsStopped(1, '', undefined).failed,
+      windowsStopped(null, null, new Error('spawn powershell ENOENT')).failed,
+      [signalStop(1, () => {}), signalStop(2, failure('ESRCH')), signalStop(3, failure('EPERM'))],
+      editorStopNote({ survivors: [], failed: false }),
+      editorStopNote({ survivors: [3], failed: true }),
+    ],
+    [
+      { pids: [7, 9], failed: false },
+      true,
+      true,
+      [true, false, true],
+      null,
+      'The editor stop command failed. The editor processes 3 did not exit within 30 s of the stop.',
+    ],
   );
 });
 

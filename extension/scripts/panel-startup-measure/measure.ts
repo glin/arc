@@ -943,9 +943,46 @@ export function survivorNote(pids: readonly number[]): string {
   return `The editor processes ${pids.join(', ')} did not exit within ${EDITOR_EXIT_MS / 1000} s of the stop.`;
 }
 
-// Identify the run's editor processes by their isolated profile path before stopping them. Then wait until they exit,
-// and return the ids of the processes that outlive the wait.
-async function stopEditor(profile = USER_DATA): Promise<number[]> {
+// The result of one editor stop. `survivors` holds the ids of the processes that outlive the wait. `failed` is true
+// when the stop command itself failed, so an owned process can still run without an id in `survivors`.
+export interface EditorStop {
+  survivors: number[];
+  failed: boolean;
+}
+
+// The note of a run whose editor stop failed or left processes running, or null after a clean stop.
+export function editorStopNote(result: EditorStop): string | null {
+  const notes = [
+    ...(result.failed ? ['The editor stop command failed.'] : []),
+    ...(result.survivors.length ? [survivorNote(result.survivors)] : []),
+  ];
+  return notes.length ? notes.join(' ') : null;
+}
+
+// The ids that the Windows stop command printed, and whether the command failed. A spawn error or a nonzero status
+// means that the command did not stop every owned process.
+export function windowsStopped(
+  status: number | null,
+  stdout: string | null,
+  error: Error | undefined,
+): { pids: number[]; failed: boolean } {
+  const pids = (stdout ?? '').split(/\s+/).filter(Boolean).map(Number).filter(Number.isSafeInteger);
+  return { pids, failed: Boolean(error) || status !== 0 };
+}
+
+// Send the stop signal to one process. Return whether the wait must probe it. A process that does not exist needs no
+// wait. A process that the runner cannot signal stays, so the wait reports it as a survivor.
+export function signalStop(pid: number, kill: (pid: number) => void = (id) => process.kill(id)): boolean {
+  try {
+    kill(pid);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH';
+  }
+}
+
+// Identify the run's editor processes by their isolated profile path before stopping them. Then wait until they exit.
+async function stopEditor(profile = USER_DATA): Promise<EditorStop> {
   const ownership = path.join(
     SCRATCH,
     profile === USER_DATA ? 'process-ownership.json' : 'warm-process-ownership.json',
@@ -958,8 +995,8 @@ async function stopEditor(profile = USER_DATA): Promise<number[]> {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
     });
-    const pids = (stopped.stdout ?? '').split(/\s+/).filter(Boolean).map(Number).filter(Number.isSafeInteger);
-    return awaitExit(pids, { alive: aliveProcesses });
+    const { pids, failed } = windowsStopped(stopped.status, stopped.stdout, stopped.error);
+    return { survivors: await awaitExit(pids, { alive: aliveProcesses }), failed };
   }
   const list = () =>
     spawnSync('ps', ['-eo', 'pid=,lstart=,args='], {
@@ -971,14 +1008,9 @@ async function stopEditor(profile = USER_DATA): Promise<number[]> {
   for (const line of owned) {
     if (!list().includes(line)) continue;
     const pid = Number(line.trim().split(/\s+/)[0]);
-    if (Number.isSafeInteger(pid) && pid !== process.pid) {
-      try {
-        process.kill(pid);
-        pids.push(pid);
-      } catch {}
-    }
+    if (Number.isSafeInteger(pid) && pid !== process.pid && signalStop(pid)) pids.push(pid);
   }
-  return awaitExit(pids, { alive: aliveProcesses });
+  return { survivors: await awaitExit(pids, { alive: aliveProcesses }), failed: false };
 }
 
 export async function pollStartup(
@@ -1473,7 +1505,14 @@ async function measure(commandLine: string, workspace: string, options: Options)
   let failure: string | null = null;
   let complete = false;
   let locks: { release(): void } | null = null;
-  const survivors: number[] = [];
+  const editorStop: EditorStop = { survivors: [], failed: false };
+  // `main` reads the stop from the run record, because a return from the try block wins over any later check.
+  const recordStop = (next: EditorStop) => {
+    editorStop.survivors.push(...next.survivors);
+    editorStop.failed ||= next.failed;
+    runRecord.editorSurvivors = [...editorStop.survivors];
+    runRecord.editorStopFailed = editorStop.failed;
+  };
   try {
     // A measured launch holds every heavy lane lock, so no heavy test lane overlaps it. The runner waits for each lock
     // like a suite lane does, and refuses to start inside a test run.
@@ -1517,13 +1556,11 @@ async function measure(commandLine: string, workspace: string, options: Options)
           (runRecord.warmUp as { openMs: number | null }).openMs = Date.now() - warmAt;
         }
       } finally {
-        survivors.push(...(await stopEditor(WARM_USER_DATA)));
-        // `main` names the survivors from the run record, because a return from the try block wins over any later check.
-        runRecord.editorSurvivors = [...survivors];
+        recordStop(await stopEditor(WARM_USER_DATA));
       }
-      // A warm-up process that outlives the wait can still write the store that the measured launch reads. The note
-      // that names it comes from `main`.
-      if (survivors.length) return { lines: [], instance: null, complete: false, note: null };
+      // A warm-up process that outlives the wait, or that a failed stop left running, can still write the store that the
+      // measured launch reads. The note of the stop comes from `main`.
+      if (editorStopNote(editorStop)) return { lines: [], instance: null, complete: false, note: null };
     }
     await awaitMachine(options.minimumFreeGb, 10 * 60_000);
     const memory = new MemoryWatch();
@@ -1568,9 +1605,8 @@ async function measure(commandLine: string, workspace: string, options: Options)
       observation.end('execution');
       observation.begin('cleanup');
       // The stores and the Temp listing are read only after the editor processes exit, or after the wait ends.
-      survivors.push(...(await stopEditor()));
-      if (survivors.length) complete = false;
-      runRecord.editorSurvivors = survivors;
+      recordStop(await stopEditor());
+      if (editorStopNote(editorStop)) complete = false;
       runRecord.runner = runnerMeasures({ home: ARC_STORE, tempBefore });
       runRecord.startupRecord = measuredStartupRecord(path.join(ARC_STORE, 'startup'), memory.pid);
       observation.end('cleanup', { descendants: 'unobserved' });
@@ -1773,9 +1809,12 @@ async function main(): Promise<void> {
     process.stdout.write(`Owned paths and artifacts: ${SCRATCH}\n`);
     const measured = await measure(commandLine, options.workspace, options);
     // A process that outlives the stop can still write the stores, so the runner block is not reliable.
-    const survivors = (runRecord.editorSurvivors ?? []) as number[];
-    const outcome = survivors.length
-      ? { ...measured, complete: false, note: `${survivorNote(survivors)} ${measured.note ?? ''}`.trimEnd() }
+    const stopNote = editorStopNote({
+      survivors: (runRecord.editorSurvivors ?? []) as number[],
+      failed: runRecord.editorStopFailed === true,
+    });
+    const outcome = stopNote
+      ? { ...measured, complete: false, note: `${stopNote} ${measured.note ?? ''}`.trimEnd() }
       : measured;
     fs.writeFileSync(
       path.join(SCRATCH, 'result.json'),
