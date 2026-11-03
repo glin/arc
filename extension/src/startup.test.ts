@@ -2052,6 +2052,19 @@ test('the runner block counts the new compressed Temp names', () => {
   assert.deepEqual(measuresOf({ runner }).get('compressedTempEntries'), { kind: 'count', value: 2 });
 });
 
+test('a runner measure never replaces a measure of the end snapshot', () => {
+  const result = { ...runnerResult({ compressedStoreBytes: 1 }), runner: { compressedStoreBytes: 2 } };
+  assert.throws(() => measuresOf(result), /The runner measure compressedStoreBytes has the name of a snapshot measure/);
+});
+
+test('a runner measure never replaces a measure of a hold reading', () => {
+  const snapshot = { counters: { gauges: { compressedRows: 4 } } };
+  assert.throws(
+    () => holdReading(snapshot, () => ({ compressedRows: 0 })),
+    /The runner measure compressedRows has the name of a snapshot measure/,
+  );
+});
+
 test('pre-check refuses low disk', () => {
   const gib = 1024 ** 3;
   assert.equal(

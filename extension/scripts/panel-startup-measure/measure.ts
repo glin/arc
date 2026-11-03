@@ -1139,7 +1139,14 @@ export function holdReading(
   snapshot: Parameters<typeof soakMeasures>[0] | null,
   runner: () => Record<string, number>,
 ): Record<string, number> | null {
-  return snapshot ? { ...soakMeasures(snapshot), ...runner() } : null;
+  if (!snapshot) return null;
+  const measures = soakMeasures(snapshot);
+  for (const [name, value] of Object.entries(runner())) {
+    if (Object.hasOwn(measures, name))
+      throw new Error(`The runner measure ${name} has the name of a snapshot measure.`);
+    measures[name] = value;
+  }
+  return measures;
 }
 
 // Keep the warm-up open for `minimumMs` after its launch. Then start a read every interval, until one reading holds

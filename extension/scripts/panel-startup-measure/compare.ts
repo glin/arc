@@ -96,12 +96,15 @@ export function measuresOf(result: RunResult): Map<string, { kind: Kind; value: 
   // Both startup times come from the measured host's startup record, so every value shares the host's clock origin.
   out.set('firstUsableRowMs', { kind: 'time', value: result.startupRecord?.stages?.firstUsableRow ?? null });
   out.set('firstPassMs', { kind: 'time', value: result.startupRecord?.stages?.completeRender ?? null });
-  for (const [name, value] of Object.entries(result.runner ?? {})) out.set(name, { kind: kindOf(name), value });
   const hold = result.warmUp?.hold?.snapshot ?? null;
   for (const [name, value] of Object.entries(result.soak?.end ?? {}))
     if (!hold || !readFromHold(name)) out.set(name, { kind: kindOf(name), value });
   for (const [name, value] of Object.entries(hold ?? {}))
     if (readFromHold(name)) out.set(name, { kind: kindOf(name), value });
+  for (const [name, value] of Object.entries(result.runner ?? {})) {
+    if (out.has(name)) throw new Error(`The runner measure ${name} has the name of a snapshot measure.`);
+    out.set(name, { kind: kindOf(name), value });
+  }
   out.set('peakHostMemoryBytes', {
     kind: 'memory',
     value: result.memory?.peakWorkingSetBytes ?? result.memory?.sampledMaximumWorkingSetBytes ?? null,
