@@ -1084,9 +1084,21 @@ test(
       assert.ok(room < 520, 'the turn cost figure has room for the ordinary cap, so nothing was measured');
       const middle = await open('#list .turn .chips [data-metric="cost"]');
       assert.ok(parseFloat(middle.cap) >= 520, `the turn cost popover cap ${middle.cap} fell below the ordinary cap`);
+      const cost = page.locator('#list .turn .chips [data-metric="cost"]').first();
+      const point = await cost.evaluate((node) => {
+        const box = node.getBoundingClientRect();
+        return { clientX: (box.left + box.right) / 2, clientY: (box.top + box.bottom) / 2, pointerType: 'mouse' };
+      });
       await page.setViewportSize({ width: 340, height: 1400 });
       await page.keyboard.press('Escape');
+      // A resize can deliver pointer departure and entry while the pointer remains over the same figure.
+      await cost.dispatchEvent('pointerleave', point);
+      await cost.dispatchEvent('pointerenter', point);
       await page.waitForFunction(() => document.getElementById('chippop')?.hidden);
+      await page.mouse.move(0, 0);
+      await cost.hover();
+      await page.waitForFunction(() => document.getElementById('chippop')?.hidden === false);
+      await page.keyboard.press('Escape');
       const ordinary = await open('#list .turn .chips .has-detail:has-text("40 agents")');
       assert.equal(ordinary.cap, '520px', 'another figure popover lost the stylesheet cap');
       assert.ok(ordinary.scrolls, 'the forty agent rows fit the cap, so nothing was measured');

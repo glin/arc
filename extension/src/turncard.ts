@@ -102,7 +102,7 @@ import {
   type AgentSpend,
 } from './agentspend';
 import { childFileTotals, settleCounts, type ChildFileChange } from './childartifacts';
-import { escapeHtml, readableRichText, visibleTextOf } from './richtext';
+import { escapeHtml, markdownCodeBlocks, readableRichText, renderInlineMarkdown, visibleTextOf } from './richtext';
 import type { WireActivity } from './agentwire';
 import { CARD_ACTIONS, cacheWriteWarningCondition } from './view/card-words';
 import { commitHeadFact, groupCommitRows, repositoryWorkLabel } from './view/card-presentation';
@@ -4460,14 +4460,16 @@ export function withLiveActivity(turn: Turn, activity: readonly TimedWireActivit
       if (!text) {
         continue;
       }
-      updates.push({
+      const update: TurnUpdate = {
         stepsBefore: ordinal,
         sourceId: item.sourceId,
         kind: item.kind,
         text,
         at: item.at,
         status: item.status,
-      });
+      };
+      liveCommentarySources.set(update, item);
+      updates.push(update);
       known.add(item.sourceId);
       changed = true;
       continue;
@@ -4809,6 +4811,29 @@ function latestCommentaryOf(turn: Turn): TurnUpdate | null {
   return null;
 }
 
+// Live projections recreate updates while their wire activity remains retained.
+const liveCommentarySources = new WeakMap<TurnUpdate, TimedWireActivity>();
+const commentaryPreviews = new WeakMap<TurnUpdate | TimedWireActivity, { source: string; preview: string }>();
+
+function commentaryText(update: TurnUpdate): string {
+  const text = update.text;
+  const source = liveCommentarySources.get(update) ?? update;
+  const held = commentaryPreviews.get(source);
+  if (held?.source === text) return held.preview;
+  const prose = (source: string) =>
+    visibleTextOf(renderInlineMarkdown(source, undefined, { literalEntities: true }).replace(/<br\s*\/?>/g, ' '), true);
+  const parts: string[] = [];
+  let offset = 0;
+  for (const { start, end } of markdownCodeBlocks(text)) {
+    parts.push(prose(text.slice(offset, start)), text.slice(start, end));
+    offset = end;
+  }
+  parts.push(prose(text.slice(offset)));
+  const preview = shortenTo(parts.join('').replace(/\s+/g, ' ').trim(), STEP_DETAIL_LIMIT, STEP_CUT);
+  commentaryPreviews.set(source, { source: text, preview });
+  return preview;
+}
+
 // The newest eligible card counts live child IDs absent from its own subagent rows.
 export function carriedSubagentCount(
   turn: Pick<Turn, 'agents'>,
@@ -4966,11 +4991,7 @@ export function toCard(
     // Use the total skill-load count, including repeated loads and records outside the retained rows.
     activitySkillCount: turn.skillUseCount,
     activitySkillLabel: turn.skillUseCount === 1 ? '1 skill' : `${turn.skillUseCount} skills`,
-    doing: onNow
-      ? stepLine(onNow)
-      : narration
-        ? shortenTo(narration.text.replace(/\s+/g, ' ').trim(), STEP_DETAIL_LIMIT, STEP_CUT)
-        : '',
+    doing: onNow ? stepLine(onNow) : narration ? commentaryText(narration) : '',
     doingCode: onNow ? stepCode(onNow) : '',
     doingSince: onNow?.at ?? (narration?.status === 'running' ? narration.at : null),
     startedAt: turn.startedAt,

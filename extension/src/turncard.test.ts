@@ -11863,6 +11863,59 @@ test('a folded running card uses the latest commentary when no tool is running',
   assert.equal(running.doingCode, '');
   assert.equal(running.doingSince, null);
 
+  const screenshot =
+    'The [ship skill](C:/work/skills/ship/SKILL.md) says a test that also fails on the base \u201cstill blocks the landing.\u201d\nThat is why these failures need a scope decision. The category budget remains authorized.';
+  const readable =
+    'The ship skill says a test that also fails on the base \u201cstill blocks the landing.\u201d That is why these failures need a scope decision. The category budget remains authorized.';
+  const cases = [
+    [screenshot, readable.slice(0, 117) + '...'],
+    [
+      'Read [the **plan**](https://example.com/' + 'x'.repeat(200) + ')\nthen\tcontinue.',
+      'Read the plan then continue.',
+    ],
+    [
+      '`[sample](target) &amp; **bold**` and \\[escaped](target)',
+      '[sample](target) &amp; **bold** and [escaped](target)',
+    ],
+    ['&amp; &lt; &quot; &#39; &amp;lt; &#65; &copy;', '&amp; &lt; &quot; &#39; &amp;lt; &#65; &copy;'],
+    ['Read [plan](a).  \nThen continue.', 'Read plan. Then continue.'],
+    ['Read [plan](a).\\\nThen continue.', 'Read plan. Then continue.'],
+    ['Literal <br> and `<br/>` and \\<br> and &lt;br&gt;.', 'Literal <br> and <br/> and <br> and &lt;br&gt;.'],
+    ['[label][ref]\n\n[ref]: https://example.com', '[label][ref] [ref]: https://example.com'],
+    ['```markdown\n[sample](target) &amp; **bold**\n```', '```markdown [sample](target) &amp; **bold** ```'],
+    ['~~~text\n[sample](target)\n~~~', '~~~text [sample](target) ~~~'],
+    ['> - ```markdown\n>   [sample](target)\n>   ```', '> - ```markdown > [sample](target) > ```'],
+    ['Before [one](a).\n```text\n[two](b)\n```\nAfter [three](c).', 'Before one. ```text [two](b) ``` After three.'],
+  ];
+  for (const [text, expected] of cases) {
+    const card = toCard(
+      turn({
+        steps: [],
+        stepCount: 0,
+        updates: [
+          {
+            stepsBefore: 0,
+            sourceId: 'older',
+            kind: 'commentary',
+            text: '[older](target)',
+            at: NOW - 2_000,
+            status: 'done',
+          },
+          { stepsBefore: 0, sourceId: 'newer', kind: 'commentary', text, at: NOW - 1_000, status: 'running' },
+        ],
+        startedAt: NOW - 60_000,
+        endedAt: NOW,
+        finished: false,
+      }),
+      true,
+      NOW,
+    );
+    assert.equal(card.doing, expected, text);
+    assert.equal(card.doingCode, '');
+    assert.equal(card.doingSince, NOW - 1_000);
+    assert.equal(card.activity.find((row) => row.kind === 'message' && row.at === NOW - 1_000)?.text, text);
+  }
+
   const withTool = toCard(
     turn({
       steps: [step({ name: 'Bash', detail: 'npm test', status: 'running', at: NOW - 500 })],
@@ -11871,7 +11924,7 @@ test('a folded running card uses the latest commentary when no tool is running',
           stepsBefore: 0,
           sourceId: 'newer',
           kind: 'commentary',
-          text: 'I am preparing the result.',
+          text: 'I am preparing [the result](https://example.com).',
           at: NOW - 100,
           status: 'done',
         },
@@ -11886,6 +11939,74 @@ test('a folded running card uses the latest commentary when no tool is running',
   );
   assert.equal(withTool.doing, 'Running');
   assert.equal(withTool.doingCode, 'npm test');
+});
+
+test('a folded running card reuses unchanged commentary and refreshes changed text', () => {
+  const text = 'Read [the plan](https://example.com/plan) then continue.';
+  const update = {
+    stepsBefore: 0,
+    sourceId: 'latest',
+    kind: 'commentary' as const,
+    text,
+    at: NOW - 1_000,
+    status: 'running' as const,
+  };
+  const input = turn({
+    summary: '',
+    steps: [],
+    stepCount: 0,
+    updates: [update],
+    startedAt: NOW - 60_000,
+    endedAt: NOW,
+    finished: false,
+  });
+  const renders = vi.spyOn(richtext, 'renderInlineMarkdown');
+  const commentaryCalls = () => renders.mock.calls.filter(([source]) => source === update.text).length;
+  try {
+    assert.equal(toCard(input, true, NOW).doing, 'Read the plan then continue.');
+    assert.equal(commentaryCalls(), 1);
+    renders.mockClear();
+    assert.equal(toCard({ ...input }, true, NOW + 100).doing, 'Read the plan then continue.');
+    assert.equal(commentaryCalls(), 0, 'unchanged commentary was parsed again');
+
+    update.text = 'Check [the result](https://example.com/result).';
+    renders.mockClear();
+    const changed = toCard(input, true, NOW + 200);
+    assert.equal(changed.doing, 'Check the result.');
+    assert.equal(commentaryCalls(), 1);
+    assert.equal(changed.activity.find((row) => row.kind === 'message')?.text, update.text);
+    renders.mockClear();
+    assert.equal(toCard(input, true, NOW + 300).doing, 'Check the result.');
+    assert.equal(commentaryCalls(), 0);
+
+    input.updates = [{ ...update, text }];
+    renders.mockClear();
+    assert.equal(toCard(input, true, NOW + 400).doing, 'Read the plan then continue.');
+    assert.equal(renders.mock.calls.filter(([source]) => source === text).length, 1);
+
+    input.updates = [];
+    const live = {
+      sourceId: 'live-commentary',
+      kind: 'commentary' as const,
+      name: 'Update',
+      headline: '',
+      detail: text,
+      status: 'done' as const,
+      at: NOW - 1_000,
+    };
+    renders.mockClear();
+    assert.equal(toCard(withLiveActivity(input, [live]), true, NOW).doing, 'Read the plan then continue.');
+    assert.equal(renders.mock.calls.filter(([source]) => source === text).length, 1);
+    renders.mockClear();
+    assert.equal(toCard(withLiveActivity(input, [live]), true, NOW + 100).doing, 'Read the plan then continue.');
+    assert.equal(renders.mock.calls.filter(([source]) => source === text).length, 0);
+    live.detail = update.text;
+    renders.mockClear();
+    assert.equal(toCard(withLiveActivity(input, [live]), true, NOW + 200).doing, 'Check the result.');
+    assert.equal(commentaryCalls(), 1);
+  } finally {
+    renders.mockRestore();
+  }
 });
 
 // Next-turn cost basis uses the context-setting request's timestamp and cache lifetime, independently of aggregate turn usage and later activity.

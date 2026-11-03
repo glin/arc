@@ -57,7 +57,7 @@
   "extension/src/codex.test.ts": {
     "reason": "Real Git worktree ownership and descendant source resolution must agree with recorded Codex session relationships. Terra provider coverage adds in-process request fixtures without additional subprocesses.",
     "cases": 493,
-    "matricesSha256": "628adde9cb02de59fbd50820aebdb0ade3f3dcf36db9930154181d4f68d3226e"
+    "matricesSha256": "136512332266a91a5b15137f1604a35382b223206c6ee44c80ae5882d12af097"
   },
   "extension/src/derivedcache.test.ts": {
     "reason": "Independent writers and host death must preserve shared cache rows and release stale filesystem locks. Terra generation recovery adds in-process provider fixtures without additional writers.",
@@ -107,7 +107,7 @@
   "extension/src/panel.layout.heading.test.ts": {
     "reason": "Session headings must retain accessible controls and browser interaction across responsive states.",
     "cases": 20,
-    "matricesSha256": "e06fe9d07a4f8a0e80e7d2064b4e55859a255093c532b6adc2857c602f3402cb"
+    "matricesSha256": "2fbd7fa7744cb2679377b4045c9f189df85b93a3b9ff69d90f53f997b662689b"
   },
   "extension/src/panel.layout.messages.test.ts": {
     "reason": "Rendered messages must preserve browser selection and interaction for rich content.",

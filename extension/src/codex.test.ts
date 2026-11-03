@@ -1318,7 +1318,11 @@ test('dispatch evidence loss remains partial after a newline, resumption, and EO
   assert.equal(scanCodexDispatchReferences(file, 'parent', scan.cursor).complete, false);
 });
 
-test.each(['after each read that reaches new bytes', 'on its own clock', 'on its own clock while its scan fails'])(
+test.each([
+  'after each read that reaches new bytes',
+  'during revision checks across quanta',
+  'on its own clock while its scan fails',
+])(
   'a Codex rollout that grows during its read completes at its opening size and reads the growth next, with a writer that appends %s',
   async (writer) => {
     const file = writeRollout([
@@ -1330,49 +1334,40 @@ test.each(['after each read that reaches new bytes', 'on its own clock', 'on its
     ]);
     for (let index = 0; index < 300; index++) fs.appendFileSync(file, ignoredCodexLineOfBytes(2048));
     const opening = fs.statSync(file).size;
-    // The first writer appends a record after every read that reaches new bytes. The second appends every millisecond on its
-    // own thread, so its appends also land during check reads, and a read can end unqualified and finish in a later quantum.
-    // The third is the second under a scan that fails at its first read, and the writer must stop all the same. The first
-    // writer's scan runs one quantum under a held clock, so the slice deadline cannot end that quantum before the opening size.
-    if (writer === 'after each read that reaches new bytes') vi.spyOn(performance, 'now').mockReturnValue(0);
+    // Hold the slice clock so the byte budget determines completion.
+    // Append at read boundaries so file growth does not depend on worker scheduling.
+    vi.spyOn(performance, 'now').mockReturnValue(0);
     let appends = 0;
     let furthest = 0;
-    let grewDuringRead = false;
-    let quantumSize = 0;
+    let quantum = 1;
+    let checkAppends = 0;
+    let secondCheckAppends = 0;
     const meter = {
       readBytes: 0,
       onRead: (bytes: Buffer, offset: number) => {
         if (writer === 'on its own clock while its scan fails') throw new Error('the scan failed');
-        if (writer === 'on its own clock') {
-          const size = fs.statSync(file).size;
-          if (quantumSize && size > quantumSize) grewDuringRead = true;
-          quantumSize ||= size;
-          return;
+        const repeated = offset + bytes.length <= furthest;
+        if (writer === 'after each read that reaches new bytes' && repeated) return;
+        if (writer === 'during revision checks across quanta' && repeated) {
+          if (quantum === 2 && secondCheckAppends++ > 0) return;
+          checkAppends++;
         }
-        if (offset + bytes.length <= furthest) return;
-        furthest = offset + bytes.length;
+        furthest = Math.max(furthest, offset + bytes.length);
         appends++;
         fs.appendFileSync(file, '{"type":"ignored"}\n');
       },
     };
     const stop =
-      writer === 'after each read that reaches new bytes'
-        ? undefined
-        : await clockWriter([file], 1, '{"type":"ignored"}\n');
+      writer === 'on its own clock while its scan fails'
+        ? await clockWriter([file], 1, '{"type":"ignored"}\n')
+        : undefined;
     let stopped = false;
-    let times: number[] = [];
     const scanned = (async () => {
       try {
-        let scan = await scanCodexDispatchReferencesAsync(file, 'parent', null, 1024 * 1024, () => false, meter);
-        if (stop)
-          for (let pass = 0; !scan.complete && pass < 8; pass++) {
-            quantumSize = 0;
-            scan = await scanCodexDispatchReferencesAsync(file, 'parent', scan.cursor, 1024 * 1024, () => false, meter);
-          }
-        return scan;
+        return await scanCodexDispatchReferencesAsync(file, 'parent', null, 1024 * 1024, () => false, meter);
       } finally {
         if (stop) {
-          times = await stop();
+          await stop();
           stopped = true;
         }
       }
@@ -1382,17 +1377,36 @@ test.each(['after each read that reaches new bytes', 'on its own clock', 'on its
       assert.equal(stopped, true, 'the writer kept appending after the scan failed');
       return;
     }
-    const scan = await scanned;
-    if (stop) {
-      assert.ok(grewDuringRead, `the rollout never grew during a read in ${times.length} appends`);
-      assert.equal(scan.complete, true, 'the rollout never completed while its writer ran');
-      assert.equal(scan.cursor.offset, scan.cursor.size);
-    } else {
-      assert.ok(appends > 0);
-      assert.equal(scan.qualified, true);
-      assert.equal(scan.complete, true);
+    let scan = await scanned;
+    let completedOpening = opening;
+    if (writer === 'during revision checks across quanta') {
       assert.equal(scan.cursor.offset, opening);
+      assert.equal(scan.cursor.target, opening);
+      assert.equal(scan.qualified, false);
+      assert.equal(scan.complete, false);
+      assert.ok(checkAppends > 0);
+      assert.ok(scan.readBytes <= 1024 * 1024);
+      assert.deepEqual(
+        scan.references.map((reference) => reference.toolUseIds),
+        [['before-growth']],
+      );
+      completedOpening = fs.statSync(file).size;
+      assert.ok(completedOpening > opening);
+      const priorChecks = checkAppends;
+      const priorAppends = appends;
+      quantum = 2;
+      scan = await scanCodexDispatchReferencesAsync(file, 'parent', scan.cursor, 1024 * 1024, () => false, meter);
+      assert.equal(checkAppends - priorChecks, 1);
+      assert.ok(appends - priorAppends > 1, 'the resumed scan must append during a forward read too');
+      assert.equal(scan.reset, false);
+      assert.ok(scan.readBytes <= 1024 * 1024);
     }
+    assert.ok(appends > 0);
+
+    assert.equal(scan.qualified, true);
+    assert.equal(scan.complete, true);
+    assert.equal(scan.cursor.offset, completedOpening);
+    assert.ok(fs.statSync(file).size > completedOpening);
     assert.deepEqual(
       scan.references.map((reference) => reference.toolUseIds),
       [['before-growth']],

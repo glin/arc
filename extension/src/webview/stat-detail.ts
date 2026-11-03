@@ -289,6 +289,14 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
   // Suppress the anchor's focus handler while returning focus after dismissal.
   let returning = false;
   let dismissedAnchor: HTMLElement | null = null;
+  let pointerPoint: { x: number; y: number } | null = null;
+  const pointerHits = (node: HTMLElement, point = pointerPoint): boolean => {
+    if (!point) return false;
+    const hit = document
+      .elementsFromPoint(point.x, point.y)
+      .find((element) => !pop.contains(element) && !inNested(element));
+    return !!hit && node.contains(hit);
+  };
   let drawnPrint: string | null = null;
   // Track whether the current draw includes actions. The content print does not include this flag.
   let drawnActions = false;
@@ -1135,9 +1143,14 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
       }
     };
     // Leaving the chip starts the grace period. Entering the popover cancels it.
-    const leave = () => {
+    const leave = (event: PointerEvent) => {
       pointerOnAnchor = false;
-      if (dismissedAnchor === node) dismissedAnchor = null;
+      if (
+        dismissedAnchor === node &&
+        (options.actionAnchor || !pointerHits(node, { x: event.clientX, y: event.clientY }))
+      ) {
+        dismissedAnchor = null;
+      }
       hideAfterGrace(node);
     };
     const away = (event: Event) => {
@@ -1372,8 +1385,14 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
   });
 
   if (!options.nested) {
+    const trackPointer = (event: PointerEvent) => {
+      pointerPoint = event.pointerType === 'touch' ? null : { x: event.clientX, y: event.clientY };
+      if (dismissedAnchor && !options.actionAnchor && !pointerHits(dismissedAnchor)) dismissedAnchor = null;
+    };
+    options.events.document('pointermove', (raw) => trackPointer(raw as PointerEvent));
     options.events.document('pointerdown', (raw) => {
       const event = raw as PointerEvent;
+      trackPointer(event);
       const pointed = pointerAnchors.get(event);
       if (
         (!pinned && !options.actionAnchor) ||
@@ -1397,7 +1416,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
       if (nested?.dismiss()) {
         return;
       }
-      if (options.actionAnchor) dismissedAnchor = anchor;
+      dismissedAnchor = options.actionAnchor || (anchor && pointerHits(anchor)) ? anchor : null;
       hide(null, true, pinned || !!options.actionAnchor);
     });
   }

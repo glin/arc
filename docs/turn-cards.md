@@ -6,6 +6,10 @@
 
 `turncard.ts` prepares the browser-facing card. `webview/card.ts` draws it without repeating decisions about wording, status, marks, cost, context, or file meaning. Keep presentation decisions in the host projection when adding a field.
 
+The folded running card shows the newest running tool, or the latest commentary when no tool runs. Commentary previews show inline Markdown link labels, preserve literal code and written entities, flatten whitespace, and stop at 120 characters. Markdown hard breaks separate words. Reference-style links remain literal. Activity retains the full commentary.
+
+The projection reuses each commentary preview while its recorded update or live activity and source text remain unchanged. In-place text changes replace the saved preview. Preview storage follows the source object's lifetime.
+
 `chipsOf` in [`turncard.ts`](../extension/src/turncard.ts) builds figures. The host resolves dispatched children through its catalog and appends their figure.
 
 Card layouts and chip popovers share `DetailRowList` in [`webview/card-rows.ts`](../extension/src/webview/card-rows.ts). The host names the record collection. Popovers receive a row-rendering callback instead of importing row components.
@@ -98,7 +102,7 @@ Keep clock fields outside card content fingerprints. The shared clock updates mo
 
 The `activity` message's single-card form updates mounted content. Its list form replaces matching cards and draws the timeline once, retaining focus and selected text. A list draw supersedes held single-card updates. Full timeline draws own structural and layout changes. Repaint deferral must preserve comment editing, comment-list interaction, and active selection through the interaction owner.
 
-[`webview/stat-detail.ts`](../extension/src/webview/stat-detail.ts) owns popover pinning, dismissal, and keyboard routes. Popovers mount on `body`, outside the document Tab walk used to leave a record.
+[`webview/stat-detail.ts`](../extension/src/webview/stat-detail.ts) owns popover pinning, dismissal, and keyboard routes. Popovers mount on `body`, outside the document Tab walk used to leave a record. Escape keeps a figure under the pointer closed until pointer or focus departure, or another press.
 
 Outer and nested record popovers keep separate anchors. The outer instance treats the nested instance as internal for departure checks. Suspend focus-departure handling while replacing rows, because removing focused rows does not represent reader navigation.
 
