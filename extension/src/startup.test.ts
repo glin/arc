@@ -62,6 +62,7 @@ import * as path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { isDeepStrictEqual } from 'node:util';
 import * as zlib from 'node:zlib';
+import { isCompressedRollout } from './compressedrollouts.ts';
 import ts from 'typescript';
 import { agentSpendIsOpen, spendFileVersion, spendTokens } from './agentspend';
 import {
@@ -2684,6 +2685,7 @@ function completeDiscoveryHarness(
     replacedCatalogFiles: async () => [],
     enumerateRolloutFilesAsync,
     enumerateClaudeChildSources,
+    isCompressedRollout,
     ...scope,
   };
   const names = [
@@ -2744,6 +2746,7 @@ function completeDiscoveryHarness(
     );
   }
   if (names.includes('allSessions')) names.push('walkedSessions');
+  if (names.includes('walkedSessions') || names.includes('runPendingWatch')) names.push('noteCompressedRollouts');
   if (names.includes('allSessions') || names.includes('runPendingWatch')) names.push('currentWalkedCatalog');
   if (names.includes('prepareClaudeChildren')) names.push('startedSources', 'applyDispatchFacts');
   names.push('walkCatalog');
@@ -2792,7 +2795,7 @@ function completeDiscoveryHarness(
       commitRepositories = new CommitRepositories({ run: async () => null }, () => {});
       repositoryCommits = new RepositoryCommits({ run: async () => null }, () => {});
       _showing = null; selections = []; messages = []; partial = []; catalog = null; drawnCards = [];
-      coverageRevision = 0; enumeratedAdmissionComplete = true; claudeChildren = [];
+      coverageRevision = 0; enumeratedAdmissionComplete = true; claudeChildren = []; compressedRollouts = new Set();
       authoritativeCatalog = null; attachmentHandoffs = new Set(); titles = new Map();
       metadataRevision = 0; drawnMetadataRevision = 0; startupProgressAt = 0;
       derivedCacheCheckpointState = { markChanged() {} };
@@ -8169,6 +8172,53 @@ test('targeted reuse avoids the broad walk, and a failed reuse performs exactly 
   assert.equal(walks.length, 2, 'a failed targeted refresh did not walk exactly once');
   assert.deepEqual(files(), [added, held].sort());
 });
+
+test.skipIf(!rolloutCompression.zstdCompressSync)(
+  'the host holds the compressed rollouts that the walk lists and a wake batch names, and drops one the walk no longer lists',
+  async () => {
+    const { provider, root, walks, files, writeRollout, releaseAll } = heldWalkHarness(
+      { watcherRefreshDecision, sessionDirectoryOwners, unknownPathShapes, unknownPathExtension },
+      ['runPendingWatch', 'unknownPathShapeOf'],
+    );
+    provider.performanceCounters = new PanelPerformanceCounters();
+    provider.pendingWatch = new PendingWatcherWake();
+    const requested = (start: () => void) => {
+      const refresh = provider.refresh;
+      let started: Promise<void> | undefined;
+      provider.refresh = (...args: unknown[]) => (started = refresh.apply(provider, args));
+      try {
+        start();
+      } finally {
+        provider.refresh = refresh;
+      }
+      assert.ok(started, 'the requester started no refresh');
+      return releaseAll(started);
+    };
+    const compress = (plain: string, keepPlain: boolean) => {
+      fs.writeFileSync(`${plain}.zst`, rolloutCompression.zstdCompressSync!(fs.readFileSync(plain)));
+      if (!keepPlain) fs.unlinkSync(plain);
+      return `${plain}.zst`;
+    };
+    const held = writeRollout('01a032c9-1a92-7931-845c-723117d24dbe');
+    const pairTwin = compress(held, true);
+    const lone = compress(writeRollout('01a032c9-8581-7942-9262-ab4289a674c4'), false);
+    await requested(() => provider.refreshFrom('startup', true));
+    assert.deepEqual([...provider.compressedRollouts].sort(), [pairTwin, lone].sort());
+    assert.deepEqual(files(), [held], 'a compressed rollout gave a row');
+    const named = compress(writeRollout('01a032c9-984d-7972-a0e5-abe29d0f50cf'), false);
+    const walksBefore = walks.length;
+    assert.equal(provider.pendingWatch.noteFileEvent(root, path.basename(named), 'rename', normalizeFsPath), false);
+    assert.equal(provider.pendingWatch.noteFileEvent(root, path.basename(held), 'change', normalizeFsPath), true);
+    await requested(() => provider.runPendingWatch({ cause: 'quiet', firstAt: 0, lastAt: 0, firedAt: 0 }));
+    assert.equal(walks.length, walksBefore, 'a compressed name in the batch started a walk');
+    assert.deepEqual([...provider.compressedRollouts].sort(), [pairTwin, lone, named].sort());
+    fs.unlinkSync(lone);
+    await requested(() => provider.refreshFrom('poll'));
+    assert.equal(walks.length, walksBefore + 1);
+    assert.deepEqual([...provider.compressedRollouts].sort(), [pairTwin, named].sort());
+    assert.deepEqual(files(), [held]);
+  },
+);
 
 test('each catalog walk names its requester, and the re-list after a replaced file names itself', async () => {
   let replaced: string[] = [];

@@ -6,7 +6,7 @@
 
 [`allSessions`](../extension/src/panelhost.ts) owns catalog assembly. Membership remains separate from selected-turn parsing. Bounded metadata, turn starts, and completed primary spend sources supply session facts independently of selection. The incremental spend index supplies lifetime cost.
 
-The Codex walk lists a file whose name ends in `.jsonl` as a rollout. It lists a file whose name ends in `-<thread id>.jsonl.zst` as a compressed rollout, without a stat. Both suffix tests are case-sensitive on every platform, so a name that ends in `.JSONL.ZST` is neither. A compressed rollout gives no row and gets no opening read.
+The Codex walk lists a file whose name ends in `.jsonl` as a rollout. It lists a file whose name ends in `-<thread id>.jsonl.zst` as a compressed rollout, without a stat. Both suffix tests are case-sensitive on every platform, so a name that ends in `.JSONL.ZST` is neither. A compressed rollout gives no row and gets no opening read. The host keeps the compressed rollouts in its set `compressedRollouts`. Each walk adds the names it lists, and a complete walk also removes every name it no longer lists. A watcher event for a compressed name starts no refresh. The host adds that name when it takes the next wake batch.
 
 Claude admission requires an eligible typed human prompt. A command answered locally by the CLI supplies no evidence, even when model work follows. Model work after manual compaction makes `/compact` eligible again. A command without a recorded CLI answer remains eligible. Refresh rechecks pending command evidence and preserves reader state when admission changes.
 

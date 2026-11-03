@@ -8,6 +8,7 @@ import {
   type SessionCoverage,
   type SourceEnumeration,
 } from './sessioncoverage';
+import { isCompressedRollout } from './compressedrollouts';
 import { canonicalServiceTier, serviceTierRefusal, cacheLifetimeRefusal, launchPolicy } from './launchpolicy';
 import { scopedLaunchCwd, startingWorktree } from './repositoryscope';
 import { SessionFilterRequests, FILTER_LIMITS, type FilterOperation } from './sessionfilter';
@@ -1437,6 +1438,8 @@ export class PanelProvider implements vscode.Disposable {
   private readonly sessionSpendSourceIndex = new SessionSpendSourceIndex();
   private readonly subagentDirectories = new SubagentDirectoryCache();
   private readonly codexStats = new CodexStatCache();
+  // Compressed Codex rollouts that the walk listed or a wake batch named. None of them gives a row.
+  private readonly compressedRollouts = new Set<string>();
   // Recorded working directories, keyed by transcript path. Missing values retry after the file revision changes.
   private cwds = new Map<string, { cwd: string | null; mtimeMs: number; size: number; unavailable?: boolean }>();
   // Cached Codex opening metadata, including each rollout's working directory.
@@ -3822,6 +3825,7 @@ export class PanelProvider implements vscode.Disposable {
 
   private runPendingWatch(event: ScheduledRun): void {
     const batch = this.pendingWatch.take();
+    this.noteCompressedRollouts(batch.compressedPaths);
     const catalog = this.catalog?.sessions ?? [];
     const known = new Set(catalog.map((session) => normalizeFsPath(session.file)));
     // The decision asks only about paths outside the held catalog, so most wakes build no walked index.
@@ -12158,6 +12162,16 @@ export class PanelProvider implements vscode.Disposable {
     return this.allSessions(false, true, enumeration);
   }
 
+  // Add the compressed rollouts that a walk listed or a wake batch named. A complete walk also removes every name it no
+  // longer lists. An incomplete walk removes nothing, because its unread directories can still hold a listed name.
+  private noteCompressedRollouts(names: readonly string[], walk?: SourceEnumeration): void {
+    if (walk?.status === 'complete') {
+      const listed = new Set(walk.compressed);
+      for (const name of this.compressedRollouts) if (!listed.has(name)) this.compressedRollouts.delete(name);
+    }
+    for (const name of names) this.compressedRollouts.add(name);
+  }
+
   // Enumerate Claude and Codex sessions in repository scope. Accepted metadata supplies the catalog's recorded-activity order.
   // With `deferWalk`, a missed reuse that has no supplied Codex enumeration sets `deferWalk.needed` and lists
   // nothing, so the caller can walk the rollout tree asynchronously.
@@ -12369,6 +12383,7 @@ export class PanelProvider implements vscode.Disposable {
       codexSessionsRoot(),
       roots,
       (file) => {
+        if (isCompressedRollout(file)) return null;
         if (collides('codex', file)) {
           const opening = readQualifiedCodexOpening(file);
           if (opening) {
@@ -12411,6 +12426,7 @@ export class PanelProvider implements vscode.Disposable {
           excluded: !inRoots(source.cwd),
         });
     this.sourceEnumerations = { claude: claudeListing, codex: listing.enumeration };
+    this.noteCompressedRollouts(listing.enumeration.compressed ?? [], listing.enumeration);
     // Only a cached file that the walk missed needs this, so a refresh with none builds no path sets.
     let physical: SessionCoverage | undefined;
     const absent = (file: string) => {
