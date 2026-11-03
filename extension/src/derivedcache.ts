@@ -10,7 +10,7 @@ import {
   type SessionName,
   type SessionNameSource,
 } from './sessionnames';
-import type { CodexSessionMeta } from './codex';
+import { codexSessionsRoot, type CodexSessionMeta } from './codex';
 import {
   agentRunOfScan,
   isCacheLifetime,
@@ -18,9 +18,12 @@ import {
   normalizeFsPath,
   sameSessionRevision,
   fileIdentityValue,
+  isInside,
+  projectsRoot,
   validRelationshipEvidence,
   sessionOutcomeOf,
   sessionStatFactsOf,
+  type AgentKind,
   type AgentRunScan,
   type ClaudeChildSessionReference,
   type FileRevision,
@@ -350,6 +353,7 @@ export interface DerivedCache {
     reason: string;
     storedGeneration?: unknown;
     rejectedRelationships?: number;
+    rejectedTitles?: number;
     acceptedRelationships?: number;
     format?: number;
     source?: string;
@@ -362,7 +366,7 @@ export interface DerivedCache {
   codexMetas: Map<string, CodexSessionMeta>;
   titles: Map<string, DerivedTitleEntry>;
   claudeChildReferences: Map<string, ClaudeChildReferenceCacheEntry>;
-  // Names carried across a `VERSION` change until a metadata read supplies a title entry.
+  // Names carried across a metadata generation change until a metadata read supplies a title entry.
   carriedNames: Map<string, CarriedName>;
 }
 
@@ -429,6 +433,7 @@ export interface ClaudeChildReferenceCacheEntry {
 
 interface StoredTitle {
   file: string;
+  agent: AgentKind;
   entry: DerivedTitleEntry;
 }
 interface StoredChildReferences {
@@ -441,20 +446,38 @@ interface StoredCarriedName extends CarriedName {
 interface StoredCache {
   commitRepositories?: VerifiedCommitRepository[];
   discovery?: import('./progressiveworker').DiscoveryCheckpoint;
-  formatVersion: 1;
-  metadataVersion: number;
+  formatVersion: 2;
+  metadataGenerations: MetadataGenerations;
   titles: StoredTitle[];
   claudeChildReferences: StoredChildReferences[];
   carriedNames: StoredCarriedName[];
 }
 
-// Versions stored metadata. A mismatch carries session names until metadata replaces them.
-// Bump the version for stored field changes or changed derivation rules, including agent-run classification in transcript.ts and codex.ts.
+export type MetadataGenerations = Readonly<Record<AgentKind, number>>;
+
+// Versions stored metadata for each agent. A mismatch drops that agent's entries and carries their names until metadata replaces them.
+// Bump an agent's generation for stored field changes or changed derivation rules of its sessions, including agent-run classification in transcript.ts and codex.ts.
+// Bump both generations for a change that alters both agents' facts.
 // Unchanged files otherwise retain valid-looking stale facts indefinitely.
 // The initial metadata budget, `INITIAL_RAIL_READ_BYTES`, spreads large workspace rebuilds across refreshes.
 // Targeted invalidation avoids a full rebuild when affected entries are identifiable at load.
-// Codex opening rows use `CODEX_META_VERSION` from codexopenings.ts and survive this version change.
-export const VERSION = 71;
+// Codex opening rows use `CODEX_META_VERSION` from codexopenings.ts and survive these generation changes.
+export const METADATA_GENERATIONS: MetadataGenerations = { claude: 71, codex: 71 };
+
+// The agent generations that each shared `metadataVersion` of `derived-session-cache-v1.json` matches.
+// Shared version 71 changed only Codex pricing, so Claude entries of version 70 match Claude generation 71.
+// An absent pair matches no generation. A later bump of one agent's generation stops importing that agent's entries.
+export const V1_METADATA_GENERATIONS: Readonly<Record<number, Partial<MetadataGenerations>>> = {
+  70: { claude: 71 },
+  71: { claude: 71, codex: 71 },
+};
+
+// The agent whose source root holds a file. A file inside neither root, or inside both, has no agent.
+export function sourceAgentOf(file: string): AgentKind | null {
+  const claude = isInside(file, [projectsRoot()]);
+  const codex = isInside(file, [codexSessionsRoot()]);
+  return claude === codex ? null : claude ? 'claude' : 'codex';
+}
 
 export class DerivedCacheCheckpointState {
   private generation = 0;
@@ -582,6 +605,13 @@ function carryNames(
       into.set(row.file, name);
     }
   }
+}
+
+function metadataGenerations(value: unknown): value is MetadataGenerations {
+  return (
+    record(value) &&
+    [value.claude, value.codex].every((generation) => Number.isInteger(generation) && (generation as number) >= 0)
+  );
 }
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -1208,17 +1238,43 @@ export function sameClaudeChildReferenceCaches(
   return true;
 }
 
-export function loadDerivedCache(file: string, legacyFile?: string): DerivedCache {
-  let source = 'current';
+export interface DerivedCacheSources {
+  // `derived-session-cache-v1.json`. Only absence of the current file permits its import.
+  previous?: string;
+  // `derived-session-cache.json`. Only absence of the current and previous files permits its import.
+  legacy?: string;
+  // Qualifies each entry's agent. Defaults to `sourceAgentOf`.
+  agentOf?: (file: string) => AgentKind | null;
+}
+
+// Format 2 stores one metadata generation per agent and an agent on every title row.
+// Format 1 rows carry no agent. Import takes each row's agent from `agentOf` and its generation from `V1_METADATA_GENERATIONS`.
+// Rows of an unknown agent or an incompatible generation keep only their names.
+export function loadDerivedCache(
+  file: string,
+  sources: string | DerivedCacheSources = {},
+  generations: MetadataGenerations = METADATA_GENERATIONS,
+): DerivedCache {
+  const options = typeof sources === 'string' ? { legacy: sources } : sources;
+  const agentOf = options.agentOf ?? sourceAgentOf;
+  let source: 'current' | 'previous' | 'legacy' | undefined;
   try {
-    let text: string;
-    try {
-      text = fs.readFileSync(file, 'utf8');
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT' || !legacyFile) throw error;
-      source = 'legacy';
-      text = fs.readFileSync(legacyFile, 'utf8');
+    let text = '';
+    for (const [name, candidate] of [
+      ['current', file],
+      ['previous', options.previous],
+      ['legacy', options.legacy],
+    ] as const) {
+      if (candidate === undefined) continue;
+      try {
+        text = fs.readFileSync(candidate, 'utf8');
+        source = name;
+        break;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
     }
+    if (source === undefined) throw Object.assign(new Error('missing'), { code: 'ENOENT' });
     const parsed: unknown = JSON.parse(text);
     const loaded = empty();
     loaded.reuse = { reason: 'reused', source, checkpoint: 'missing' };
@@ -1226,13 +1282,16 @@ export function loadDerivedCache(file: string, legacyFile?: string): DerivedCach
       loaded.reuse.reason = 'invalid-format';
       return loaded;
     }
-    const legacy = source === 'legacy' || (legacyFile === undefined && parsed.formatVersion === undefined);
-    if (
-      !legacy &&
-      (parsed.formatVersion !== 1 ||
-        !Number.isInteger(parsed.metadataVersion) ||
-        (parsed.metadataVersion as number) < 0)
-    ) {
+    const legacy = source === 'legacy' || (options.legacy === undefined && parsed.formatVersion === undefined);
+    const format = legacy ? 0 : parsed.formatVersion;
+    const valid =
+      legacy ||
+      (format === 2 && source === 'current' && metadataGenerations(parsed.metadataGenerations)) ||
+      (format === 1 &&
+        (source === 'previous' || options.previous === undefined) &&
+        Number.isInteger(parsed.metadataVersion) &&
+        (parsed.metadataVersion as number) >= 0);
+    if (!valid) {
       loaded.reuse.reason = 'invalid-format';
       return loaded;
     }
@@ -1240,24 +1299,44 @@ export function loadDerivedCache(file: string, legacyFile?: string): DerivedCach
     if ((!legacy || knownLegacy) && Array.isArray(parsed.commitRepositories)) {
       loaded.commitRepositories = boundedCommitRepositories(parsed.commitRepositories);
     }
-    loaded.reuse.format = legacy ? 0 : 1;
+    loaded.reuse.format = format as number;
     loaded.codexMetas = legacy ? storedCodexMetas(parsed) : new Map();
     carryNames(loaded.carriedNames, parsed.carriedNames, (row) => row);
-    const generation = legacy ? parsed.version : parsed.metadataVersion;
-    loaded.reuse.storedGeneration = generation;
-    const compatibleMetadata = generation === VERSION && (!legacy || knownLegacy);
-    if (!compatibleMetadata) {
+    loaded.reuse.storedGeneration = legacy
+      ? parsed.version
+      : format === 1
+        ? parsed.metadataVersion
+        : parsed.metadataGenerations;
+    // Legacy metadata matches no current generation.
+    const stored: Partial<MetadataGenerations> = legacy
+      ? {}
+      : format === 1
+        ? (V1_METADATA_GENERATIONS[parsed.metadataVersion as number] ?? {})
+        : (parsed.metadataGenerations as MetadataGenerations);
+    const compatible = (agent: AgentKind | null) => agent !== null && stored[agent] === generations[agent];
+    const agentOfRow = (row: Record<string, unknown>): AgentKind | null => {
+      if (format === 1) return agentOf(row.file as string);
+      const qualified = agentOf(row.file as string);
+      return (row.agent === 'claude' || row.agent === 'codex') && qualified === row.agent ? row.agent : null;
+    };
+    if (!compatible('claude') && !compatible('codex')) {
       loaded.reuse.reason = 'generation-mismatch';
       carryNames(loaded.carriedNames, parsed.titles, (row) => row.entry);
     } else if (!Array.isArray(parsed.titles)) {
       loaded.reuse.reason = 'invalid-rows';
     } else {
+      let rejected = 0;
       for (const row of parsed.titles) {
-        if (record(row) && fileName(row.file) && titleEntry(row.entry)) {
+        if (!record(row) || !fileName(row.file)) continue;
+        if (!compatible(agentOfRow(row))) {
+          rejected++;
+          carryNames(loaded.carriedNames, [row], (title) => title.entry);
+        } else if (titleEntry(row.entry)) {
           loaded.titles.set(row.file, row.entry);
           loaded.carriedNames.delete(row.file);
         }
       }
+      if (rejected) loaded.reuse.rejectedTitles = rejected;
     }
     const relationshipRows = Array.isArray(parsed.claudeChildReferences) ? parsed.claudeChildReferences : [];
     for (const row of legacy && !knownLegacy ? [] : relationshipRows) {
@@ -1272,10 +1351,12 @@ export function loadDerivedCache(file: string, legacyFile?: string): DerivedCach
     );
     loaded.reuse.rejectedRelationships = relationshipRows.length - loaded.claudeChildReferences.size;
     loaded.reuse.acceptedRelationships = loaded.claudeChildReferences.size;
+    // Imported rows reach the current file at the next checkpoint, even when no source grows.
     loaded.migrationPending =
-      legacy &&
+      format !== 2 &&
       !!(
-        knownLegacy ||
+        (legacy && knownLegacy) ||
+        (format === 1 && record(parsed.discovery)) ||
         loaded.commitRepositories?.length ||
         loaded.titles.size ||
         loaded.claudeChildReferences.size ||
@@ -1342,13 +1423,22 @@ export function saveDerivedCache(
   replace: (temporary: string, target: string) => void = fs.renameSync,
   discovery?: import('./progressiveworker').DiscoveryCheckpoint,
   commitRepositories: Iterable<VerifiedCommitRepository> = [],
+  agentOf: (file: string) => AgentKind | null = sourceAgentOf,
 ): void {
-  const titleRows = [...titles]
-    .map(([entryFile, entry]) => ({
-      file: entryFile,
-      entry: entry.agentRun === null ? { ...entry, agentRun: false } : entry,
-    }))
-    .sort((a, b) => a.file.localeCompare(b.file));
+  const unqualified = new Map<string, CarriedName>();
+  const titleRows: StoredTitle[] = [];
+  for (const [entryFile, entry] of titles) {
+    const agent = agentOf(entryFile);
+    // An entry without a qualified agent keeps only its name.
+    if (agent === null) unqualified.set(entryFile, { label: entry.label, fullLabel: entry.fullLabel });
+    else
+      titleRows.push({
+        file: entryFile,
+        agent,
+        entry: entry.agentRun === null ? { ...entry, agentRun: false } : entry,
+      });
+  }
+  titleRows.sort((a, b) => a.file.localeCompare(b.file));
   const titled = new Set(titleRows.map((row) => row.file));
   const sourceEntries = new Map([...claudeChildReferences].map(([key, entry]) => [normalizeFsPath(key), entry]));
   const childRows = limitCodexDispatchCursors(sourceEntries)
@@ -1362,8 +1452,8 @@ export function saveDerivedCache(
     );
   const data: StoredCache = {
     commitRepositories: boundedCommitRepositories(commitRepositories),
-    formatVersion: 1,
-    metadataVersion: VERSION,
+    formatVersion: 2,
+    metadataGenerations: METADATA_GENERATIONS,
     discovery:
       compatibleDiscovery(discovery, CLAUDE_CHILD_REFERENCE_PARSER_VERSION) &&
       retainedDiscoveryRelationships(
@@ -1375,8 +1465,8 @@ export function saveDerivedCache(
     titles: titleRows,
     claudeChildReferences: limitSavedDispatchFacts(childRows.slice(0, MAX_CLAUDE_CHILD_REFERENCE_FILES)),
     // Persists carried names until a title entry replaces them, including across restarts.
-    carriedNames: [...carriedNames]
-      .filter(([entryFile]) => !titled.has(entryFile))
+    carriedNames: [...carriedNames, ...unqualified]
+      .filter(([entryFile, name]) => !titled.has(entryFile) && carriedName(name))
       .map(([entryFile, name]) => ({ file: entryFile, label: name.label, fullLabel: name.fullLabel }))
       .sort((a, b) => a.file.localeCompare(b.file)),
   };

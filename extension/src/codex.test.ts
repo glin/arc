@@ -18596,15 +18596,18 @@ test('saved Codex figures exclude wait output after rebuilding unchanged rollout
     outcome: null,
     stats,
   };
-  saveDerivedCache(cacheFile, [[file, entry]]);
+  const codexSession = () => 'codex' as const;
+  saveDerivedCache(cacheFile, [[file, entry]], [], [], undefined, undefined, [], codexSession);
   const stale = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
-  stale.metadataVersion = 65;
+  stale.metadataGenerations = { ...stale.metadataGenerations, codex: stale.metadataGenerations.codex - 1 };
   fs.writeFileSync(cacheFile, JSON.stringify(stale));
-  const loaded = loadDerivedCache(cacheFile);
+  const loaded = loadDerivedCache(cacheFile, { agentOf: codexSession });
   assert.equal(loaded.titles.size, 0);
-  assert.equal(loaded.reuse?.reason, 'generation-mismatch');
-  saveDerivedCache(cacheFile, [[file, { ...entry, stats: sessionStatFactsOf(readCodexSession(file, 'sess')) }]]);
-  assert.equal(loadDerivedCache(cacheFile).titles.get(file)?.stats?.turns[0].subagentContext?.tokens, expected);
+  assert.equal(loaded.reuse?.rejectedTitles, 1);
+  const rebuilt = { ...entry, stats: sessionStatFactsOf(readCodexSession(file, 'sess')) };
+  saveDerivedCache(cacheFile, [[file, rebuilt]], [], [], undefined, undefined, [], codexSession);
+  const restored = loadDerivedCache(cacheFile, { agentOf: codexSession }).titles.get(file);
+  assert.equal(restored?.stats?.turns[0].subagentContext?.tokens, expected);
   assert.deepEqual(fs.readFileSync(file), original);
   assert.equal(fs.statSync(file).mtimeMs, stamp.mtimeMs);
 });

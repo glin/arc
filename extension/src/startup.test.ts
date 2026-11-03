@@ -110,7 +110,7 @@ import {
   scanForRailEnrichment,
   SessionFactFigures,
   DerivedCacheCheckpointState,
-  VERSION,
+  METADATA_GENERATIONS,
   withAgentRunScanProgress,
   withRailEnrichment,
   withMetadataCoverage,
@@ -356,6 +356,8 @@ import {
   soakMeasures,
   startDispatch,
 } from '../scripts/panel-startup-measure/soak';
+// The shared metadata version of a format 0 or format 1 file whose rows match both current agent generations.
+const VERSION = METADATA_GENERATIONS.claude;
 
 test('selection measurements reject missing stages, unrelated worker replies, and reversed browser clocks', () => {
   const stages = [
@@ -16884,8 +16886,15 @@ test.each(['selected', 'background'] as const)(
 // A metadata-only generation change must retain qualified relationship work through the startup barrier.
 test('metadata-only upgrade resumes relationships before ordinary startup metadata recovery', async () => {
   const root = tempDir('metadata-upgrade-');
-  const doneFile = path.join(root, 'done.jsonl');
-  const partialFile = path.join(root, 'pending.jsonl');
+  // Saved entries qualify their agent through the source roots.
+  const projects = path.join(root, 'projects');
+  const rollouts = path.join(root, 'rollouts');
+  fs.mkdirSync(projects);
+  fs.mkdirSync(rollouts);
+  vi.stubEnv('ARC_PROJECTS_ROOT', projects);
+  vi.stubEnv('ARC_CODEX_ROOT', rollouts);
+  const doneFile = path.join(projects, 'done.jsonl');
+  const partialFile = path.join(projects, 'pending.jsonl');
   const user = (id: string) =>
     JSON.stringify({
       type: 'user',
@@ -16908,10 +16917,10 @@ test('metadata-only upgrade resumes relationships before ordinary startup metada
   });
   const sources = [
     source(doneFile, 'done'),
-    titleRollout(root, 'codex', 'Codex completed'),
+    titleRollout(rollouts, 'codex', 'Codex completed'),
     source(partialFile, 'pending'),
   ];
-  const cache = path.join(root, 'derived-session-cache-v1.json');
+  const cache = path.join(root, 'derived-session-cache-v2.json');
   const quantumClock = 'let tick = 0; performance.now = () => ++tick;';
   let worker = titleWorker(quantumClock);
   const { provider: seed } = bumpedCatalogHarness();
@@ -16960,7 +16969,7 @@ test('metadata-only upgrade resumes relationships before ordinary startup metada
       seed.discoveryCheckpoint,
     );
     const stored = JSON.parse(fs.readFileSync(cache, 'utf8'));
-    stored.metadataVersion = VERSION - 1;
+    stored.metadataGenerations = { ...METADATA_GENERATIONS, claude: METADATA_GENERATIONS.claude - 1 };
     fs.writeFileSync(cache, JSON.stringify(stored));
     worker.stop();
     worker = titleWorker(quantumClock);
@@ -17076,6 +17085,134 @@ test('metadata-only upgrade resumes relationships before ordinary startup metada
     );
   } finally {
     worker.stop();
+    vi.unstubAllEnvs();
+  }
+});
+
+test('an upgrade from shared metadata version 70 reads Claude sessions as a restart does and rebuilds Codex entries', async () => {
+  const root = tempDir('agent-generation-upgrade-');
+  const projects = path.join(root, 'projects');
+  const rollouts = path.join(root, 'rollouts');
+  fs.mkdirSync(projects);
+  fs.mkdirSync(rollouts);
+  vi.stubEnv('ARC_PROJECTS_ROOT', projects);
+  vi.stubEnv('ARC_CODEX_ROOT', rollouts);
+  const claudeFile = path.join(projects, 'claude.jsonl');
+  const at = '2026-01-01T00:00:00Z';
+  const lines = (records: object[]) => records.map((record) => JSON.stringify(record)).join('\n') + '\n';
+  fs.writeFileSync(
+    claudeFile,
+    lines([
+      {
+        type: 'user',
+        sessionId: 'claude',
+        uuid: 'prompt',
+        timestamp: at,
+        message: { role: 'user', content: 'Read the Claude inputs' },
+      },
+    ]),
+  );
+  const claude = {
+    file: claudeFile,
+    sessionId: 'claude',
+    agent: 'claude' as const,
+    ...revisionOf(fs.statSync(claudeFile, { bigint: true })),
+    activity: 1,
+  };
+  const codex = titleRollout(rollouts, 'codex', 'Codex completed');
+  const sources = [claude, codex];
+  const cache = path.join(root, 'derived-session-cache-v2.json');
+  let worker = titleWorker('let tick = 0; performance.now = () => ++tick;');
+  const { provider: seed } = bumpedCatalogHarness();
+  const read: string[] = [];
+  try {
+    const run = (
+      request: ProgressiveRequest,
+      generation: number,
+      signal: AbortSignal,
+      accept?: (reply: ProgressiveResult) => boolean,
+    ) => {
+      if (request.kind !== 'claude-children') {
+        const text = JSON.stringify(request);
+        for (const session of sources)
+          if (text.includes(JSON.stringify(session.file))) read.push(session.agent + ':' + request.kind);
+      }
+      return worker.run(request, generation, signal, accept);
+    };
+    const start = () => {
+      const provider = titlePublicationHarness(sources, run, cache);
+      Object.assign(provider, {
+        prepareClaudeChildren: seed.prepareClaudeChildren,
+        applyDispatchFacts: seed.applyDispatchFacts,
+        repositoryScopeRoots: [root],
+        claudeParents: [claude],
+        claudeChildStatWrites: new Map(),
+        claudeChildren: [],
+        pruneDerivedTitles: () => false,
+        updateSessionSpendSources() {},
+        checkpointDerivedCache() {},
+      });
+      provider.useSessionStats(sessionStatsFromFacts);
+      return provider;
+    };
+    const settle = async (provider: any) => {
+      await provider.refresh(true);
+      await vi.waitFor(() => assert.equal(provider.titles.size, 2, 'startup never read both sessions'), {
+        timeout: 10000,
+      });
+      provider.anyVisible = () => false;
+      await vi.waitFor(() => assert.equal(provider.refreshController, null));
+      assert.equal(provider.writeDerivedCache(), true);
+      return JSON.parse(fs.readFileSync(cache, 'utf8'));
+    };
+    const restart = () => {
+      worker.stop();
+      worker = titleWorker('let tick = 0; performance.now = () => ++tick;');
+      read.length = 0;
+      return start();
+    };
+    const complete = await settle(start());
+    // A restart from the current format reads only what every restart reads.
+    await settle(restart());
+    const control = [...read];
+    const of = (reads: string[], agent: string) => reads.filter((kind) => kind.startsWith(agent + ':'));
+    // A build of shared metadata version 70 wrote the same rows without agents.
+    fs.writeFileSync(
+      cache,
+      JSON.stringify({
+        ...complete,
+        formatVersion: 1,
+        metadataVersion: 70,
+        metadataGenerations: undefined,
+        titles: complete.titles.map(({ agent: _agent, ...row }: { agent: string }) => row),
+      }),
+    );
+    const first = restart();
+    assert.deepEqual(
+      [...first.titles.keys()],
+      [claudeFile],
+      'the upgrade dropped Claude metadata or kept Codex metadata',
+    );
+    assert.equal(first.carriedNames.get(codex.file)?.label, 'Codex completed');
+    const saved = await settle(first);
+    // The only difference from the control restart is the shared version 70 file.
+    assert.deepEqual(
+      of(read, 'claude'),
+      of(control, 'claude'),
+      'the upgrade read an unchanged Claude transcript again',
+    );
+
+    assert.ok(read.includes('codex:metadata'), 'the upgrade kept a Codex entry without reading its rollout');
+    assert.equal(saved.formatVersion, 2);
+    assert.deepEqual(
+      saved.titles.map((row: { file: string; agent: string }) => [row.file, row.agent]),
+      sources.map((session) => [session.file, session.agent]).sort((a, b) => a[0].localeCompare(b[0])),
+    );
+    await settle(restart());
+    assert.deepEqual(read, control, 'a second restart read more than the control restart');
+  } finally {
+    worker.stop();
+    vi.unstubAllEnvs();
   }
 });
 

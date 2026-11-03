@@ -13610,6 +13610,10 @@ test('the newest turn card counts a carried subagent', () => {
 // Cached outcomes retain carried subagents without closed-child facts.
 
 test('a session at rest keeps its carried subagent through the derived cache', () => {
+  // Test sessions live outside both source roots, so the cache qualifies each entry as a Claude session.
+  const claudeSession = () => 'claude' as const;
+  const saveClaudeCache = (file: string, titles: Parameters<typeof saveDerivedCache>[1]) =>
+    saveDerivedCache(file, titles, [], [], undefined, undefined, [], claudeSession);
   const read = readSession(
     writeTranscript([
       userPrompt('scan in the background', 0),
@@ -13638,8 +13642,8 @@ test('a session at rest keeps its carried subagent through the derived cache', (
     foldedLabel: 'a session',
   };
   const cacheFile = path.join(tempDir('carried-cache-'), 'cache.json');
-  saveDerivedCache(cacheFile, [['/sess.jsonl', entry]]);
-  const cached = loadDerivedCache(cacheFile).titles.get('/sess.jsonl')?.outcome ?? null;
+  saveClaudeCache(cacheFile, [['/sess.jsonl', entry]]);
+  const cached = loadDerivedCache(cacheFile, { agentOf: claudeSession }).titles.get('/sess.jsonl')?.outcome ?? null;
   const now = ms(20);
   const outcomes = new Map([['sess', cached]]);
   const live = liveOpenChildren(outcomes, () => now - 60_000, new Map(), now);
@@ -13657,7 +13661,7 @@ test('a session at rest keeps its carried subagent through the derived cache', (
     { status: 'subagents', rail: 1, card: 1, heading: '1 subagent started before this turn' },
   );
 
-  saveDerivedCache(cacheFile, [
+  saveClaudeCache(cacheFile, [
     [
       '/legacy.jsonl',
       {
@@ -13667,34 +13671,35 @@ test('a session at rest keeps its carried subagent through the derived cache', (
     ],
   ]);
   assert.deepEqual(
-    loadDerivedCache(cacheFile).titles.get('/legacy.jsonl')?.outcome?.closedChildren,
+    loadDerivedCache(cacheFile, { agentOf: claudeSession }).titles.get('/legacy.jsonl')?.outcome?.closedChildren,
     ['x1'],
     'a persisted id without a close time still loads',
   );
 
   const commands = [{ id: 'cmd1', startedAt: ms(1) }];
-  saveDerivedCache(cacheFile, [
-    ['/command.jsonl', { ...entry, outcome: { ...stored!, backgroundCommands: commands } }],
-  ]);
-  assert.deepEqual(loadDerivedCache(cacheFile).titles.get('/command.jsonl')?.outcome?.backgroundCommands, commands);
+  saveClaudeCache(cacheFile, [['/command.jsonl', { ...entry, outcome: { ...stored!, backgroundCommands: commands } }]]);
+  assert.deepEqual(
+    loadDerivedCache(cacheFile, { agentOf: claudeSession }).titles.get('/command.jsonl')?.outcome?.backgroundCommands,
+    commands,
+  );
   const unstamped = [{ id: 'cmd1' }] as unknown as typeof commands;
-  saveDerivedCache(cacheFile, [
+  saveClaudeCache(cacheFile, [
     ['/unstamped.jsonl', { ...entry, outcome: { ...stored!, backgroundCommands: unstamped } }],
   ]);
   assert.equal(
-    loadDerivedCache(cacheFile).titles.get('/unstamped.jsonl')?.outcome?.backgroundCommands,
+    loadDerivedCache(cacheFile, { agentOf: claudeSession }).titles.get('/unstamped.jsonl')?.outcome?.backgroundCommands,
     undefined,
     'a command without a launch time is refused',
   );
-  saveDerivedCache(cacheFile, [['/tail.jsonl', { ...entry, outcome: null, backgroundCommands: commands }]]);
+  saveClaudeCache(cacheFile, [['/tail.jsonl', { ...entry, outcome: null, backgroundCommands: commands }]]);
   assert.deepEqual(
-    loadDerivedCache(cacheFile).titles.get('/tail.jsonl')?.backgroundCommands,
+    loadDerivedCache(cacheFile, { agentOf: claudeSession }).titles.get('/tail.jsonl')?.backgroundCommands,
     commands,
     'commands beside no tail outcome',
   );
-  saveDerivedCache(cacheFile, [['/tail-unstamped.jsonl', { ...entry, outcome: null, backgroundCommands: unstamped }]]);
+  saveClaudeCache(cacheFile, [['/tail-unstamped.jsonl', { ...entry, outcome: null, backgroundCommands: unstamped }]]);
   assert.equal(
-    loadDerivedCache(cacheFile).titles.get('/tail-unstamped.jsonl'),
+    loadDerivedCache(cacheFile, { agentOf: claudeSession }).titles.get('/tail-unstamped.jsonl'),
     undefined,
     'an unstamped command beside no tail outcome is refused',
   );

@@ -1731,8 +1731,8 @@ test(
       assert.equal(fixture.provider.metadataReadIntent, null);
       assert.equal(checkpoints, 1);
       const cache = path.join(directory, 'derived.json');
-      saveDerivedCache(cache, fixture.provider.titles);
-      fixture.provider.titles = loadDerivedCache(cache).titles;
+      saveDerivedCache(cache, fixture.provider.titles, [], [], undefined, undefined, [], () => 'codex');
+      fixture.provider.titles = loadDerivedCache(cache, { agentOf: () => 'codex' }).titles;
       assert.ok(railEnrichmentNeeds(fixture.provider.titles.get(file), session)?.recovery);
       await fixture.pass();
       assert.ok(fixture.requests.filter((request) => request.kind === 'metadata-recovery').length > before);
@@ -1819,8 +1819,8 @@ test(
       assert.equal(fixture.provider.titles.get(file).metadataWindow.exhausted, true);
       const before = fixture.requests.filter((request) => request.kind === 'metadata-recovery').length;
       const cache = path.join(directory, 'derived.json');
-      saveDerivedCache(cache, fixture.provider.titles);
-      fixture.provider.titles = loadDerivedCache(cache).titles;
+      saveDerivedCache(cache, fixture.provider.titles, [], [], undefined, undefined, [], () => 'codex');
+      fixture.provider.titles = loadDerivedCache(cache, { agentOf: () => 'codex' }).titles;
       Object.assign(fixture.provider, {
         showing: '0',
         shownSessions: () => [session],
@@ -1985,8 +1985,8 @@ test(
       assert.equal(accepted.outcome, null);
       assert.equal(railEnrichmentNeeds(accepted, session)?.recovery, true);
       const cache = path.join(directory, 'derived.json');
-      saveDerivedCache(cache, fixture.provider.titles);
-      const restored = loadDerivedCache(cache).titles.get(file)!;
+      saveDerivedCache(cache, fixture.provider.titles, [], [], undefined, undefined, [], () => 'codex');
+      const restored = loadDerivedCache(cache, { agentOf: () => 'codex' }).titles.get(file)!;
       assert.equal(restored.stats, null);
       assert.equal(restored.outcome, null);
       assert.equal(railEnrichmentNeeds(restored, session)?.recovery, true);
@@ -2262,8 +2262,8 @@ test.each([13 * 1024 * 1024, 84_686_045])(
       assert.deepEqual(fixture.provider.titles.get(healthy).stats, sessionStatFactsOf(completeHealthy));
       assert.deepEqual(fixture.provider.titles.get(healthy).outcome, sessionOutcomeOf(completeHealthy));
       const cache = path.join(directory, 'derived.json');
-      saveDerivedCache(cache, fixture.provider.titles);
-      fixture.provider.titles = loadDerivedCache(cache).titles;
+      saveDerivedCache(cache, fixture.provider.titles, [], [], undefined, undefined, [], () => 'codex');
+      fixture.provider.titles = loadDerivedCache(cache, { agentOf: () => 'codex' }).titles;
       fixture.worker.stop();
       fixture.provider.progressiveWorker = new ProgressiveWorker(getProgressiveWorkerSource());
       assert.equal((await fixture.pass()).changed, false);
@@ -11159,6 +11159,8 @@ test(
   async () => {
     const directory = tempDir('classification-unknown-');
     const file = path.join(directory, 'unknown.jsonl');
+    // The restarted provider qualifies the saved entry as a Claude session through its source root.
+    vi.stubEnv('ARC_PROJECTS_ROOT', directory);
     const at = new Date('2026-10-21T12:00:00.000Z');
     const prompt =
       JSON.stringify({
@@ -11231,6 +11233,7 @@ test(
       assert.equal(classification(), false);
     } finally {
       fixture.worker.stop();
+      vi.unstubAllEnvs();
     }
   },
 );
@@ -11469,7 +11472,7 @@ test('derived session caches load, trim against the walk, and checkpoint after f
   const body = ctor;
   sourceMatch(
     body,
-    /loadDerivedCache\(this\.derivedCacheFile, this\.legacyDerivedCacheFile\)/,
+    /loadDerivedCache\(this\.derivedCacheFile, this\.derivedCacheImports\)/,
     'the provider does not restore the optional derived cache at startup',
   );
   sourceMatch(
@@ -11573,7 +11576,7 @@ test('derived session caches load, trim against the walk, and checkpoint after f
   );
   sourceMatch(
     panelHostSource,
-    /path\.join\(workspaceCache.root, 'derived-session-cache-v1\.json'\),\s*path\.join\(cacheRoot\(\), 'codex-openings\.json'\)/,
+    /path\.join\(workspaceCache.root, 'derived-session-cache-v2\.json'\),\s*path\.join\(cacheRoot\(\), 'codex-openings\.json'\)/,
     'the derived cache is not stored in the current workspace cache partition, or the Codex opening records not once per machine',
   );
 });

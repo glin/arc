@@ -233,7 +233,7 @@ test('Claude pending cursors survive soft cache pressure and reject corrupt dura
   assert.equal(loadDerivedCache(cache).claudeChildReferences.size, 0, 'corrupt fragments survived durable validation');
 });
 import {
-  VERSION,
+  METADATA_GENERATIONS,
   CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
   DISPATCH_FACTS_VERSION,
   MAX_CLAUDE_CHILD_REFERENCE_FILES,
@@ -258,8 +258,25 @@ import {
   withMetadataCoverage,
   withSessionName,
   type ClaudeChildReferenceCacheEntry,
+  type DerivedCache,
+  type DerivedCacheSources,
   type DerivedTitleEntry,
 } from './derivedcache.ts';
+// The shared metadata version of a format 0 or format 1 file whose rows match both current agent generations.
+const VERSION = METADATA_GENERATIONS.claude;
+// Test sessions live outside both source roots. These helpers qualify every entry as a Claude session.
+const claudeSession = () => 'claude' as const;
+function saveClaudeCache(...args: Parameters<typeof saveDerivedCache>): void {
+  const [file, titles, references = [], names = [], replace, discovery, repositories = [], agentOf = claudeSession] =
+    args;
+  saveDerivedCache(file, titles, references, names, replace, discovery, repositories, agentOf);
+}
+function loadClaudeCache(file: string, sources: string | DerivedCacheSources = {}): DerivedCache {
+  return loadDerivedCache(file, {
+    agentOf: claudeSession,
+    ...(typeof sources === 'string' ? { legacy: sources } : sources),
+  });
+}
 
 test('durable prefix validation rejects inconsistent stamps offsets framing and oversized evidence', async () => {
   const directory = folder();
@@ -289,9 +306,9 @@ test('durable prefix validation rejects inconsistent stamps offsets framing and 
     relationshipComplete: false,
     claudeCursor: pending.cursor,
   };
-  saveDerivedCache(cache, [], [[file, entry]]);
+  saveClaudeCache(cache, [], [[file, entry]]);
   assert.deepEqual(
-    loadDerivedCache(cache).claudeChildReferences.get(normalizeFsPath(file))?.claudeCursor,
+    loadClaudeCache(cache).claudeChildReferences.get(normalizeFsPath(file))?.claudeCursor,
     pending.cursor,
   );
   const saved = fs.readFileSync(cache, 'utf8');
@@ -319,7 +336,7 @@ test('durable prefix validation rejects inconsistent stamps offsets framing and 
     const data = JSON.parse(saved);
     corrupt(data.claudeChildReferences[0].entry.claudeCursor);
     fs.writeFileSync(cache, JSON.stringify(data));
-    assert.equal(loadDerivedCache(cache).claudeChildReferences.size, 0);
+    assert.equal(loadClaudeCache(cache).claudeChildReferences.size, 0);
   }
   const limited = limitCodexDispatchCursors(
     [
@@ -360,15 +377,15 @@ test('partial empty and positive metadata remains eligible and exhaustion surviv
       ...partial,
       metadataWindow: { ...earlier.metadataWindow, exhaustedRule: METADATA_EXHAUSTED_RULE },
     };
-    saveDerivedCache(file, [
+    saveClaudeCache(file, [
       ['session.jsonl', limited],
       ['earlier.jsonl', earlier],
     ]);
-    const loaded = loadDerivedCache(file).titles.get('session.jsonl')!;
+    const loaded = loadClaudeCache(file).titles.get('session.jsonl')!;
     assert.deepEqual(loaded.sourceIdentity, entry.sourceIdentity, 'cache reload lost exact filesystem identity');
     assert.equal(railEnrichmentNeeds(loaded, loaded), null);
     assert.equal(derivedTitleNeedsRailFacts(loaded), false);
-    const reopened = loadDerivedCache(file).titles.get('earlier.jsonl')!;
+    const reopened = loadClaudeCache(file).titles.get('earlier.jsonl')!;
     assert.equal(
       railEnrichmentNeeds(reopened, reopened)?.recovery,
       true,
@@ -436,14 +453,14 @@ test('reference cache retains a stable subset above its file cap', () => {
     position: 0,
     sequence: 1,
   };
-  saveDerivedCache(file, [], rows, [], undefined, discovery);
+  saveClaudeCache(file, [], rows, [], undefined, discovery);
   assert.equal(
     JSON.parse(fs.readFileSync(file, 'utf8')).discovery,
     undefined,
     'evicted relationships persisted dependent scheduling',
   );
-  assert.equal(loadDerivedCache(file).discovery, undefined, 'evicted relationships retained dependent scheduling');
-  const restored = loadDerivedCache(file).claudeChildReferences;
+  assert.equal(loadClaudeCache(file).discovery, undefined, 'evicted relationships retained dependent scheduling');
+  const restored = loadClaudeCache(file).claudeChildReferences;
   assert.equal(restored.size, MAX_CLAUDE_CHILD_REFERENCE_FILES);
   assert.ok(restored.has(rows[0][0]));
   assert.ok(!restored.has(rows.at(-1)![0]));
@@ -599,13 +616,13 @@ test('observed Codex turn effort survives metadata and a derived-cache reload', 
     meta: readCodexSessionMeta(source),
   }).stats!;
   assert.equal(facts.turns[0].effort, 'low');
-  saveDerivedCache(cache, [[source, { ...title, stats: facts }]]);
-  assert.equal(loadDerivedCache(cache).titles.get(source)!.stats!.turns[0].effort, 'low');
+  saveClaudeCache(cache, [[source, { ...title, stats: facts }]]);
+  assert.equal(loadClaudeCache(cache).titles.get(source)!.stats!.turns[0].effort, 'low');
   for (const effort of [null, undefined, 7, '']) {
-    saveDerivedCache(cache, [
+    saveClaudeCache(cache, [
       [source, { ...title, stats: { ...facts, turns: [{ ...facts.turns[0], effort } as any] } }],
     ]);
-    const restored = loadDerivedCache(cache).titles.get(source);
+    const restored = loadClaudeCache(cache).titles.get(source);
     if (effort === null || effort === undefined) assert.ok(restored);
     else assert.equal(restored, undefined);
   }
@@ -623,8 +640,8 @@ test('per-pass pricing survives a derived-cache reload with both bands and reque
   );
   const facts = sessionStatFactsOf(readSession(source, 's'));
   assert.ok(facts);
-  saveDerivedCache(cache, [[source, { ...title, stats: facts }]]);
-  const restored = loadDerivedCache(cache).titles.get(source)!.stats!.turns[0];
+  saveClaudeCache(cache, [[source, { ...title, stats: facts }]]);
+  const restored = loadClaudeCache(cache).titles.get(source)!.stats!.turns[0];
   assert.ok(Math.abs(estimateCost(restored.usage, restored.model)! - 0.0600315) < 1e-12);
   assert.equal(averageContextPerRequest(restored.usage), 200001);
   assert.deepEqual(restored.usage, facts.turns[0].usage);
@@ -645,7 +662,7 @@ test('prior derived generations drop saved figures and carry valid names for bou
         ],
       }),
     );
-    const loaded = loadDerivedCache(file);
+    const loaded = loadClaudeCache(file);
     assert.equal(loaded.titles.size, 0);
     assert.ok(!loaded.carriedNames.has('/empty.jsonl'));
     assert.equal(loaded.carriedNames.get('/named.jsonl')?.label, title.label);
@@ -678,7 +695,7 @@ test('a derived cache saved before Claude request bands rereads its Haiku 5.5 us
       titles: [{ file: '/haiku.jsonl', entry: haiku }],
     }),
   );
-  const loaded = loadDerivedCache(file);
+  const loaded = loadClaudeCache(file);
   assert.equal(loaded.titles.size, 0, 'a turn total saved without its request bands was read');
   assert.equal(loaded.carriedNames.get('/haiku.jsonl')?.label, title.label);
 });
@@ -712,8 +729,8 @@ test('a turn of Haiku 5.5 and Sonnet requests survives a save and reload of the 
   assert.equal(stats?.turns[0].usage.requests, 2);
   assert.equal(stats?.turns[0].usage.input, 100_000);
   const entry: DerivedTitleEntry = { ...title, stats };
-  saveDerivedCache(cache, [[source, entry]]);
-  assert.deepEqual(loadDerivedCache(cache).titles.get(source), entry, 'the saved mixed-model turn was rejected');
+  saveClaudeCache(cache, [[source, entry]]);
+  assert.deepEqual(loadClaudeCache(cache).titles.get(source), entry, 'the saved mixed-model turn was rejected');
 });
 
 test('a full parse fills missing derived facts without replacing facts already cached', () => {
@@ -803,15 +820,15 @@ test('generation 61 discards mixed-tier normal and held context facts and persis
       ],
     }),
   );
-  const loaded = loadDerivedCache(cache);
+  const loaded = loadClaudeCache(cache);
   assert.equal(loaded.titles.size, 0);
   assert.equal(loaded.reuse?.reason, 'generation-mismatch');
-  saveDerivedCache(cache, [
+  saveClaudeCache(cache, [
     [source, { ...title, stats: fresh }],
     ['/held.jsonl', { ...title, stats: null, heldStats: fresh }],
   ]);
   for (let refresh = 0; refresh < 3; refresh++) {
-    const restored = loadDerivedCache(cache).titles;
+    const restored = loadClaudeCache(cache).titles;
     assert.equal(restored.get(source)?.stats?.turns[0].contextRequest?.lifetime, '1h');
     assert.equal(restored.get('/held.jsonl')?.heldStats?.turns[0].contextRequest?.lifetime, '1h');
   }
@@ -819,8 +836,8 @@ test('generation 61 discards mixed-tier normal and held context facts and persis
 
 test('derived cache round trips positive metadata and outcome facts', () => {
   const file = path.join(folder(), 'nested', 'cache.json');
-  saveDerivedCache(file, [['/session.jsonl', title]]);
-  const loaded = loadDerivedCache(file);
+  saveClaudeCache(file, [['/session.jsonl', title]]);
+  const loaded = loadClaudeCache(file);
   assert.deepEqual(loaded.titles.get('/session.jsonl'), title);
   assert.doesNotMatch(fs.readFileSync(file, 'utf8'), /status/);
   assert.deepEqual(fs.readdirSync(path.dirname(file)), ['cache.json']);
@@ -840,14 +857,14 @@ test('a derived cache from an earlier version keeps no outcome that predates the
       titles: [{ file: '/open.jsonl', entry: open }],
     }),
   );
-  assert.equal(loadDerivedCache(file).titles.size, 0, 'a cache written before this version was read');
+  assert.equal(loadClaudeCache(file).titles.size, 0, 'a cache written before this version was read');
   // Current-version outcomes retain open children through a save and reload.
   // Stored child state remains available for carried subagents.
-  saveDerivedCache(file, [
+  saveClaudeCache(file, [
     ['/open.jsonl', open],
     ['/quiet.jsonl', title],
   ]);
-  const again = loadDerivedCache(file);
+  const again = loadClaudeCache(file);
   assert.deepEqual(again.titles.get('/open.jsonl'), open);
   assert.deepEqual(again.titles.get('/quiet.jsonl'), title);
 });
@@ -876,7 +893,7 @@ test('a derived cache from an earlier version carries only well-formed names', (
       ],
     }),
   );
-  const loaded = loadDerivedCache(file);
+  const loaded = loadClaudeCache(file);
   assert.equal(loaded.titles.size, 0, 'a cache written before this version was read');
   assert.deepEqual(
     loaded.carriedNames,
@@ -887,13 +904,13 @@ test('a derived cache from an earlier version carries only well-formed names', (
     'a malformed row carried a name, or a well-formed one was lost',
   );
 
-  saveDerivedCache(file, [], [], loaded.carriedNames);
-  const unread = loadDerivedCache(file);
+  saveClaudeCache(file, [], [], loaded.carriedNames);
+  const unread = loadClaudeCache(file);
   assert.deepEqual(unread.carriedNames, loaded.carriedNames, 'saving before a session read lost its carried name');
   assert.equal(unread.titles.size, 0);
 
-  saveDerivedCache(file, [['/older.jsonl', title]], [], unread.carriedNames);
-  const again = loadDerivedCache(file);
+  saveClaudeCache(file, [['/older.jsonl', title]], [], unread.carriedNames);
+  const again = loadClaudeCache(file);
   assert.deepEqual(again.titles.get('/older.jsonl'), title);
   assert.deepEqual(
     again.carriedNames,
@@ -933,7 +950,7 @@ test('derived cache round trips completed Claude child-reference facts including
     ],
   };
   const negative = { ...entry, sessionId: 'quiet', references: [] };
-  saveDerivedCache(
+  saveClaudeCache(
     file,
     [],
     [
@@ -941,16 +958,16 @@ test('derived cache round trips completed Claude child-reference facts including
       ['/quiet.jsonl', negative],
     ],
   );
-  const loaded = loadDerivedCache(file).claudeChildReferences;
+  const loaded = loadClaudeCache(file).claudeChildReferences;
   assert.deepEqual(loaded.get('c:/parent.jsonl'), entry);
   assert.deepEqual(loaded.get('/quiet.jsonl'), negative);
 
   // A dispatch reference without an explicit owned value requires a parent rescan.
   // Missing ownership must not classify the dispatch as unowned.
   const { owned: _owned, ...unmarked } = entry.references[1] as { owned: boolean };
-  saveDerivedCache(file, [], [['/parent.jsonl', { ...entry, references: [entry.references[0], unmarked as never] }]]);
+  saveClaudeCache(file, [], [['/parent.jsonl', { ...entry, references: [entry.references[0], unmarked as never] }]]);
   assert.equal(
-    loadDerivedCache(file).claudeChildReferences.size,
+    loadClaudeCache(file).claudeChildReferences.size,
     0,
     'a stored dispatch reference without its owned mark was kept',
   );
@@ -981,7 +998,7 @@ test('derived cache rejects child references from another parser generation', ()
       ],
     }),
   );
-  assert.equal(loadDerivedCache(file).claudeChildReferences.size, 0);
+  assert.equal(loadClaudeCache(file).claudeChildReferences.size, 0);
 });
 
 test('derived cache drops saved dispatched facts of another facts version and keeps their rows', () => {
@@ -1010,22 +1027,22 @@ test('derived cache drops saved dispatched facts of another facts version and ke
     references: [],
     dispatch: dispatch(sessionId, toolUses),
   });
-  saveDerivedCache(file, [], [['/dispatched.jsonl', entry('dispatched', 1)]]);
+  saveClaudeCache(file, [], [['/dispatched.jsonl', entry('dispatched', 1)]]);
   assert.deepEqual(
-    loadDerivedCache(file).claudeChildReferences.get('/dispatched.jsonl')?.dispatch,
+    loadClaudeCache(file).claudeChildReferences.get('/dispatched.jsonl')?.dispatch,
     dispatch('dispatched', 1),
   );
   const stored = JSON.parse(fs.readFileSync(file, 'utf8'));
   stored.claudeChildReferences[0].entry.dispatch.version = DISPATCH_FACTS_VERSION + 1;
   fs.writeFileSync(file, JSON.stringify(stored));
-  const loaded = loadDerivedCache(file);
+  const loaded = loadClaudeCache(file);
   assert.equal(loaded.reuse?.rejectedRelationships, 0);
   assert.equal(loaded.claudeChildReferences.get('/dispatched.jsonl')?.dispatch, undefined);
   assert.equal(loaded.claudeChildReferences.get('/dispatched.jsonl')?.sessionId, 'dispatched');
   // The byte cap keeps the smaller saved facts and the row of the larger.
   const large = { ...entry('large', 1), dispatch: { ...dispatch('large', 1), tree: 'x'.repeat(9 * 1024 * 1024) } };
   const small = { ...entry('small', 1), dispatch: { ...dispatch('small', 1), tree: 'x'.repeat(9 * 1024 * 1024 - 1) } };
-  saveDerivedCache(
+  saveClaudeCache(
     file,
     [],
     [
@@ -1033,7 +1050,7 @@ test('derived cache drops saved dispatched facts of another facts version and ke
       ['/small.jsonl', small],
     ],
   );
-  const capped = loadDerivedCache(file).claudeChildReferences;
+  const capped = loadClaudeCache(file).claudeChildReferences;
   assert.equal(capped.get('/large.jsonl')?.dispatch, undefined);
   assert.equal(capped.get('/large.jsonl')?.sessionId, 'large');
   assert.equal(capped.get('/small.jsonl')?.dispatch?.facts.sessionId, 'small');
@@ -1068,7 +1085,7 @@ test('derived cache rescans an unchanged parent after the receipt parser upgrade
         ],
       }),
     );
-    assert.equal(loadDerivedCache(file).claudeChildReferences.size, 0, `parser ${parserVersion} was kept`);
+    assert.equal(loadClaudeCache(file).claudeChildReferences.size, 0, `parser ${parserVersion} was kept`);
   }
   const parent = path.join(folder(), 'parent.jsonl');
   fs.writeFileSync(parent, JSON.stringify({ type: 'session_meta', payload: { id: 'parent' } }) + '\n');
@@ -1102,7 +1119,7 @@ test('derived cache rescans an unchanged parent after the receipt parser upgrade
         ],
       }),
     );
-    const loaded = loadDerivedCache(file);
+    const loaded = loadClaudeCache(file);
     assert.equal(
       loaded.claudeChildReferences.size,
       0,
@@ -1115,7 +1132,7 @@ test('derived cache rescans an unchanged parent after the receipt parser upgrade
     file,
     JSON.stringify({ version: 28, codexMetas: [], titles: [{ file: '/bg.jsonl', entry: title }] }),
   );
-  assert.equal(loadDerivedCache(file).titles.size, 0, 'a cache from version 28 was kept');
+  assert.equal(loadClaudeCache(file).titles.size, 0, 'a cache from version 28 was kept');
 });
 
 test('an oversized child-reference entry falls back to scanning instead of truncating relationships', () => {
@@ -1136,15 +1153,15 @@ test('an oversized child-reference entry falls back to scanning instead of trunc
       toolUseIds: [`launch-${index}`],
     })),
   };
-  saveDerivedCache(file, [], [['/parent.jsonl', entry]]);
-  assert.equal(loadDerivedCache(file).claudeChildReferences.size, 0);
+  saveClaudeCache(file, [], [['/parent.jsonl', entry]]);
+  assert.equal(loadClaudeCache(file).claudeChildReferences.size, 0);
 });
 
 test('derived cache retains a completed expanded read with no stats', () => {
   const file = path.join(folder(), 'cache.json');
   const completed = { ...title, stats: null, expandedStatsRead: true };
-  saveDerivedCache(file, [['/session.jsonl', completed]]);
-  assert.deepEqual(loadDerivedCache(file).titles.get('/session.jsonl'), completed);
+  saveClaudeCache(file, [['/session.jsonl', completed]]);
+  assert.deepEqual(loadClaudeCache(file).titles.get('/session.jsonl'), completed);
 });
 
 test('derived cache rejects malformed bounded starts and folded labels', () => {
@@ -1160,7 +1177,7 @@ test('derived cache rejects malformed bounded starts and folded labels', () => {
       ],
     }),
   );
-  assert.equal(loadDerivedCache(file).titles.size, 0);
+  assert.equal(loadClaudeCache(file).titles.size, 0);
 });
 
 test('derived cache round trips request pricing bands', () => {
@@ -1200,8 +1217,8 @@ test('derived cache round trips request pricing bands', () => {
       compactions: [],
     },
   };
-  saveDerivedCache(file, [['/session.jsonl', banded]]);
-  assert.deepEqual(loadDerivedCache(file).titles.get('/session.jsonl'), banded);
+  saveClaudeCache(file, [['/session.jsonl', banded]]);
+  assert.deepEqual(loadClaudeCache(file).titles.get('/session.jsonl'), banded);
 });
 
 test('derived cache round trips subagent wait usage and drops an impossible timeout count', () => {
@@ -1221,10 +1238,10 @@ test('derived cache round trips subagent wait usage and drops an impossible time
     ...title,
     stats: { turns: [{ ...turn, model: 'gpt-6-sol', usageParts: [waitPart(timedOut)] }], compactions: [] },
   });
-  saveDerivedCache(file, [['/session.jsonl', waited(1)]]);
-  assert.deepEqual(loadDerivedCache(file).titles.get('/session.jsonl'), waited(1));
-  saveDerivedCache(file, [['/session.jsonl', waited(3)]]);
-  assert.equal(loadDerivedCache(file).titles.get('/session.jsonl'), undefined);
+  saveClaudeCache(file, [['/session.jsonl', waited(1)]]);
+  assert.deepEqual(loadClaudeCache(file).titles.get('/session.jsonl'), waited(1));
+  saveClaudeCache(file, [['/session.jsonl', waited(3)]]);
+  assert.equal(loadClaudeCache(file).titles.get('/session.jsonl'), undefined);
 });
 
 test('derived cache round trips a regional Bedrock request', () => {
@@ -1259,8 +1276,8 @@ test('derived cache round trips a regional Bedrock request', () => {
       compactions: [],
     },
   };
-  saveDerivedCache(file, [['/session.jsonl', bedrock]]);
-  assert.deepEqual(loadDerivedCache(file).titles.get('/session.jsonl'), bedrock);
+  saveClaudeCache(file, [['/session.jsonl', bedrock]]);
+  assert.deepEqual(loadClaudeCache(file).titles.get('/session.jsonl'), bedrock);
 });
 
 // Unsupported cache versions must not supply stored Bedrock pricing.
@@ -1294,7 +1311,7 @@ test('a derived cache from before the Bedrock charge serves no list-priced Bedro
     file,
     JSON.stringify({ version: 27, codexMetas: [], titles: [{ file: '/bedrock.jsonl', entry: listPriced }] }),
   );
-  assert.equal(loadDerivedCache(file).titles.size, 0, 'a parse stored before the Bedrock charge was served');
+  assert.equal(loadClaudeCache(file).titles.size, 0, 'a parse stored before the Bedrock charge was served');
 });
 
 test('derived cache discards GPT-6.1 Sol Bedrock facts saved without provider support', () => {
@@ -1323,12 +1340,12 @@ test('derived cache discards GPT-6.1 Sol Bedrock facts saved without provider su
       titles: [{ file: '/bedrock.jsonl', entry: unpriced }],
     }),
   );
-  const loaded = loadDerivedCache(file);
+  const loaded = loadClaudeCache(file);
   assert.equal(loaded.titles.size, 0, 'saved unavailable provider facts prevented a fresh context read');
   assert.deepEqual(loaded.carriedNames.get('/bedrock.jsonl'), { label: title.label, fullLabel: title.fullLabel });
 });
 
-test('derived cache rebuilds generation 70 Terra facts from unchanged sources and carries session names', async () => {
+test('a version 70 Codex entry rebuilds Terra facts from its unchanged source and carries its name', async () => {
   const { readCodexSession } = await import('./codex.ts');
   const { sessionStatFactsOf } = await import('./transcript.ts');
   for (const [model, provider, expected] of [
@@ -1392,16 +1409,20 @@ test('derived cache rebuilds generation 70 Terra facts from unchanged sources an
         })),
       },
     };
-    saveDerivedCache(cache, [[source, stale]]);
-    const envelope = JSON.parse(fs.readFileSync(cache, 'utf8'));
-    envelope.metadataVersion = 70;
-    fs.writeFileSync(cache, JSON.stringify(envelope));
-    const loaded = loadDerivedCache(cache);
+    const previous = path.join(directory, 'previous.json');
+    const codexSession = () => 'codex' as const;
+    fs.writeFileSync(
+      previous,
+      JSON.stringify({ formatVersion: 1, metadataVersion: 70, titles: [{ file: source, entry: stale }] }),
+    );
+    const loaded = loadDerivedCache(cache, { previous, agentOf: codexSession });
     assert.equal(loaded.titles.size, 0);
-    assert.equal(loaded.reuse?.reason, 'generation-mismatch');
+    assert.equal(loaded.reuse?.rejectedTitles, 1);
+    assert.equal(loaded.migrationPending, true);
     assert.deepEqual(loaded.carriedNames.get(source), { label: title.label, fullLabel: title.fullLabel });
-    saveDerivedCache(cache, [[source, { ...stale, stats: sessionStatFactsOf(readCodexSession(source, 'terra')) }]]);
-    const persisted = loadDerivedCache(cache).titles.get(source);
+    const rebuilt = { ...stale, stats: sessionStatFactsOf(readCodexSession(source, 'terra')) };
+    saveDerivedCache(cache, [[source, rebuilt]], [], [], undefined, undefined, [], codexSession);
+    const persisted = loadDerivedCache(cache, { previous, agentOf: codexSession }).titles.get(source);
     assert.ok(persisted?.stats);
     assert.equal(persisted.stats.turns.length, 3);
     for (const [index, turn] of persisted.stats.turns.entries()) {
@@ -1456,7 +1477,7 @@ test('derived cache rejects malformed request pricing identities', () => {
       ],
     }),
   );
-  assert.equal(loadDerivedCache(file).titles.size, 0);
+  assert.equal(loadClaudeCache(file).titles.size, 0);
 });
 
 test('derived cache rejects a rail request fact that cannot name a cache state', () => {
@@ -1486,7 +1507,7 @@ test('derived cache rejects a rail request fact that cannot name a cache state',
     }),
   );
   assert.equal(
-    loadDerivedCache(file).titles.size,
+    loadClaudeCache(file).titles.size,
     0,
     'an invalid request clock would let an old rail row claim that a cache remains warm',
   );
@@ -1509,7 +1530,7 @@ test('derived cache rejects rail facts that cannot say whether the last context 
     }),
   );
   assert.equal(
-    loadDerivedCache(file).titles.size,
+    loadClaudeCache(file).titles.size,
     0,
     'a row with no completion fact could quote a request before an unmeasured tool result',
   );
@@ -1532,7 +1553,7 @@ test('derived cache rejects rail facts that cannot say whether the last request 
     }),
   );
   assert.equal(
-    loadDerivedCache(file).titles.size,
+    loadClaudeCache(file).titles.size,
     0,
     'a row with no failure fact could mark an earlier successful request as warm',
   );
@@ -1565,7 +1586,7 @@ test('derived cache uses the transcript lifetime guard for rail request facts', 
     }),
   );
   assert.equal(
-    loadDerivedCache(file).titles.size,
+    loadClaudeCache(file).titles.size,
     0,
     'a lifetime accepted outside the transcript union can outlive the cache a provider sold',
   );
@@ -1573,16 +1594,16 @@ test('derived cache uses the transcript lifetime guard for rail request facts', 
 
 test('missing, corrupt, and invalid-version caches are empty', () => {
   const file = path.join(folder(), 'cache.json');
-  assert.equal(loadDerivedCache(file).codexMetas.size, 0);
+  assert.equal(loadClaudeCache(file).codexMetas.size, 0);
   fs.writeFileSync(file, '{');
-  assert.equal(loadDerivedCache(file).titles.size, 0);
+  assert.equal(loadClaudeCache(file).titles.size, 0);
   fs.writeFileSync(file, JSON.stringify({ version: 99, codexMetas: [], titles: [] }));
-  assert.equal(loadDerivedCache(file).codexMetas.size, 0);
+  assert.equal(loadClaudeCache(file).codexMetas.size, 0);
   fs.writeFileSync(
     file,
     JSON.stringify({ version: VERSION - 1, codexMetas: [], titles: [{ file: '/old.jsonl', entry: title }] }),
   );
-  assert.equal(loadDerivedCache(file).titles.size, 0);
+  assert.equal(loadClaudeCache(file).titles.size, 0);
 });
 
 test('a cache row without its full title is rejected on reload', () => {
@@ -1596,7 +1617,7 @@ test('a cache row without its full title is rejected on reload', () => {
     }),
   );
   assert.equal(
-    loadDerivedCache(file).titles.size,
+    loadClaudeCache(file).titles.size,
     0,
     'a cache written before full titles can pair a new detail value with an old display title',
   );
@@ -1606,10 +1627,10 @@ test('workspace-specific cache files keep their rows separate', () => {
   const root = folder();
   const first = path.join(root, 'first', 'cache.json');
   const second = path.join(root, 'second', 'cache.json');
-  saveDerivedCache(first, [['/first.jsonl', title]]);
-  saveDerivedCache(second, [['/second.jsonl', { ...title, label: 'second' }]]);
-  assert.deepEqual([...loadDerivedCache(first).titles.keys()], ['/first.jsonl']);
-  assert.deepEqual([...loadDerivedCache(second).titles.keys()], ['/second.jsonl']);
+  saveClaudeCache(first, [['/first.jsonl', title]]);
+  saveClaudeCache(second, [['/second.jsonl', { ...title, label: 'second' }]]);
+  assert.deepEqual([...loadClaudeCache(first).titles.keys()], ['/first.jsonl']);
+  assert.deepEqual([...loadClaudeCache(second).titles.keys()], ['/second.jsonl']);
 });
 
 test('invalid rows and old title entries are discarded without losing valid rows', () => {
@@ -1688,10 +1709,10 @@ test('invalid rows and old title entries are discarded without losing valid rows
     }),
   );
   // The legacy format carries Codex openings. Only the current format holds the current generation.
-  assert.equal(loadDerivedCache(file).codexMetas.size, 1);
+  assert.equal(loadClaudeCache(file).codexMetas.size, 1);
   const rows = JSON.parse(fs.readFileSync(file, 'utf8'));
   fs.writeFileSync(file, JSON.stringify({ formatVersion: 1, metadataVersion: VERSION, titles: rows.titles }));
-  const loaded = loadDerivedCache(file);
+  const loaded = loadClaudeCache(file);
   assert.deepEqual(loaded.titles.get('/good-session.jsonl'), title);
   assert.equal(loaded.titles.has('/old-session.jsonl'), false);
   assert.equal(loaded.titles.has('/bad-session.jsonl'), false);
@@ -1704,37 +1725,37 @@ test('invalid rows and old title entries are discarded without losing valid rows
 test('a half-written target is treated as a cold cache', () => {
   const file = path.join(folder(), 'cache.json');
   fs.writeFileSync(file, `{"version":${VERSION},"codexMetas":[`);
-  const loaded = loadDerivedCache(file);
+  const loaded = loadClaudeCache(file);
   assert.equal(loaded.codexMetas.size, 0);
   assert.equal(loaded.titles.size, 0);
 });
 
 test('a failed replacement preserves the old cache and removes its temporary file', () => {
   const file = path.join(folder(), 'cache.json');
-  saveDerivedCache(file, [['/old.jsonl', title]]);
+  saveClaudeCache(file, [['/old.jsonl', title]]);
   let temporary = '';
   assert.throws(
     () =>
-      saveDerivedCache(file, [['/new.jsonl', title]], [], [], (from) => {
+      saveClaudeCache(file, [['/new.jsonl', title]], [], [], (from) => {
         temporary = from;
         throw new Error('replacement failed');
       }),
     /replacement failed/,
   );
-  assert.deepEqual([...loadDerivedCache(file).titles.keys()], ['/old.jsonl']);
+  assert.deepEqual([...loadClaudeCache(file).titles.keys()], ['/old.jsonl']);
   assert.equal(fs.existsSync(temporary), false);
   assert.deepEqual(fs.readdirSync(path.dirname(file)), ['cache.json']);
 });
 
 test('a save clears the temporaries a killed process left beside the cache', () => {
   const file = path.join(folder(), 'cache.json');
-  saveDerivedCache(file, []);
+  saveClaudeCache(file, []);
   for (const at of [1, 2, 3]) {
     fs.writeFileSync(`${file}.${process.pid}.${at}.tmp`, '');
   }
-  saveDerivedCache(file, [['/session.jsonl', title]]);
+  saveClaudeCache(file, [['/session.jsonl', title]]);
   assert.deepEqual(fs.readdirSync(path.dirname(file)), ['cache.json']);
-  assert.deepEqual([...loadDerivedCache(file).titles.keys()], ['/session.jsonl']);
+  assert.deepEqual([...loadClaudeCache(file).titles.keys()], ['/session.jsonl']);
 });
 
 test('an empty cached Codex field is rejected and the next lookup reads the rollout', () => {
@@ -1747,7 +1768,7 @@ test('an empty cached Codex field is rejected and the next lookup reads the roll
       titles: [],
     }),
   );
-  const loaded = loadDerivedCache(file);
+  const loaded = loadClaudeCache(file);
   let reads = 0;
   const cache = new CodexMetaCache(() => {
     reads += 1;
@@ -1779,8 +1800,8 @@ test('a metadata read that finds no facts publishes the last ones, and still ask
 test('held session facts survive a cache round trip and a malformed one is rejected', () => {
   const file = path.join(folder(), 'cache.json');
   const held: DerivedTitleEntry = { ...title, stats: null, heldStats: stats, heldRevision: { mtimeMs: 9, size: 10 } };
-  saveDerivedCache(file, [['/session.jsonl', held]]);
-  assert.deepEqual(loadDerivedCache(file).titles.get('/session.jsonl'), held);
+  saveClaudeCache(file, [['/session.jsonl', held]]);
+  assert.deepEqual(loadClaudeCache(file).titles.get('/session.jsonl'), held);
   const withoutHeld: Partial<DerivedTitleEntry> = { ...held };
   delete withoutHeld.heldStats;
   for (const entry of [
@@ -1792,7 +1813,7 @@ test('held session facts survive a cache round trip and a malformed one is rejec
       file,
       JSON.stringify({ version: VERSION, codexMetas: [], titles: [{ file: '/session.jsonl', entry }] }),
     );
-    assert.equal(loadDerivedCache(file).titles.size, 0, JSON.stringify(entry));
+    assert.equal(loadClaudeCache(file).titles.size, 0, JSON.stringify(entry));
   }
 });
 
@@ -1958,8 +1979,8 @@ test('a held name survives a save and a load of the derived cache', () => {
     },
     { label: 'Rail row names', fullLabel: 'Rail row names', source: 'generated', at: 60 },
   );
-  saveDerivedCache(file, new Map([['session.jsonl', entry]]));
-  const loaded = loadDerivedCache(file).titles.get('session.jsonl');
+  saveClaudeCache(file, new Map([['session.jsonl', entry]]));
+  const loaded = loadClaudeCache(file).titles.get('session.jsonl');
   assert.deepEqual(
     [loaded?.label, loaded?.nameSource, loaded?.nameAt, loaded?.foldedLabel, loaded?.headKey],
     ['Rail row names', 'generated', 60, 'rail row names', 'a'],
@@ -2411,7 +2432,7 @@ test('a derived cache from an earlier version keeps Codex opening rows at the cu
     }),
   );
   const again = countingCodexMetas();
-  again.cache.load(loadDerivedCache(file).codexMetas);
+  again.cache.load(loadClaudeCache(file).codexMetas);
   assert.equal(again.list(root, [root]).sessions.length, 3);
   assert.equal(again.reads(), 0, 'a derived cache version bump read every rollout head again');
 });
@@ -2424,7 +2445,7 @@ test('a second workspace with no cache partition reads no opening record the sha
   assert.ok(saveCodexOpenings(shared, new Map(first.cache.snapshot()), listing.walked));
   const second = countingCodexMetas();
   const partition = path.join(folder(), 'second', 'derived-session-cache.json');
-  second.cache.load(codexOpeningsAtStartup(shared, loadDerivedCache(partition).codexMetas).rows);
+  second.cache.load(codexOpeningsAtStartup(shared, loadClaudeCache(partition).codexMetas).rows);
   assert.equal(second.list(root, [path.join(root, 'elsewhere')]).sessions.length, 0);
   assert.equal(second.reads(), 0, 'a workspace opened for the first time read every rollout head');
 });
@@ -2445,7 +2466,7 @@ test('legacy workspace files discard opening rows with obsolete clocks', () => {
       workspace,
       JSON.stringify({ version, codexMetas: storedRows(first.cache), titles: [], claudeChildReferences: [] }),
     );
-    const openings = codexOpeningsAtStartup(missing, loadDerivedCache(workspace).codexMetas);
+    const openings = codexOpeningsAtStartup(missing, loadClaudeCache(workspace).codexMetas);
     assert.equal(openings.seeded, true);
     const window = countingCodexMetas();
     window.cache.load(openings.rows);
@@ -2546,13 +2567,13 @@ test('manual CLI compaction drops generation 45 running facts at unchanged EOF',
     outcome: { finished: false, error: false, interrupted: false, endedAt: Date.parse(records[0].timestamp) },
   };
   fs.writeFileSync(cache, JSON.stringify({ version: 45, codexMetas: [], titles: [{ file: source, entry: stale }] }));
-  const loaded = loadDerivedCache(cache);
+  const loaded = loadClaudeCache(cache);
   assert.equal(loaded.titles.size, 0);
   assert.equal(loaded.reuse?.reason, 'generation-mismatch');
   const fresh = { ...stale, outcome: readSessionMeta(source).outcome };
   assert.equal(fresh.outcome, null);
-  saveDerivedCache(cache, [[source, fresh]]);
-  assert.equal(loadDerivedCache(cache).titles.get(source)?.outcome, null);
+  saveClaudeCache(cache, [[source, fresh]]);
+  assert.equal(loadClaudeCache(cache).titles.get(source)?.outcome, null);
   assert.equal(fs.statSync(source).size, before.size);
   assert.equal(fs.statSync(source).mtimeMs, before.mtimeMs);
 });
@@ -2565,7 +2586,7 @@ test('literal native derived generation 38 discards saved missing-turn figures',
       file,
       JSON.stringify({ version, codexMetas: [], titles: [{ file: '/native.jsonl', entry: stale }] }),
     );
-    const loaded = loadDerivedCache(file);
+    const loaded = loadClaudeCache(file);
     assert.equal(loaded.titles.has('/native.jsonl'), false);
     assert.equal(loaded.carriedNames.get('/native.jsonl')?.label, title.label);
   }
@@ -2644,7 +2665,7 @@ test('literal native child-reference generation 22 discards an excluded dispatch
     cache,
     JSON.stringify({ version: VERSION, codexMetas: [], titles: [], claudeChildReferences: [{ file, entry }] }),
   );
-  const loaded = loadDerivedCache(cache).claudeChildReferences;
+  const loaded = loadClaudeCache(cache).claudeChildReferences;
   assert.equal(loaded.has(normalizeFsPath(file)), false);
   assert.equal(
     scanCodexDispatchReferences(file, 'native', loaded.get(normalizeFsPath(file))?.cursor ?? null).references.length,
@@ -2744,7 +2765,7 @@ test('a workspace seed reaches the shared file at the first save when the walk r
       claudeChildReferences: [],
     }),
   );
-  const cached = loadDerivedCache(workspace);
+  const cached = loadClaudeCache(workspace);
   const openings = codexOpeningsAtStartup(shared, cached.codexMetas);
   const window = countingCodexMetas();
   window.cache.load(openings.rows);
@@ -2752,10 +2773,10 @@ test('a workspace seed reaches the shared file at the first save when the walk r
   writer.setWalk(window.list(root, [root]).walked);
   assert.equal(window.reads(), 0);
   // The first checkpoint writes both files and removes the workspace opening seed.
-  saveDerivedCache(workspace, cached.titles, cached.claudeChildReferences);
+  saveClaudeCache(workspace, cached.titles, cached.claudeChildReferences);
   assert.ok(writer.write());
   const next = countingCodexMetas();
-  next.cache.load(codexOpeningsAtStartup(shared, loadDerivedCache(workspace).codexMetas).rows);
+  next.cache.load(codexOpeningsAtStartup(shared, loadClaudeCache(workspace).codexMetas).rows);
   next.list(root, [root]);
   assert.equal(next.reads(), 0, 'the first checkpoint lost the rows the workspace file held');
 });
@@ -3029,18 +3050,18 @@ test('version 42 null Bedrock lifetimes rebuild and persist with unchanged sourc
       },
     };
     fs.writeFileSync(cache, JSON.stringify({ version, codexMetas: [], titles: [{ file: source, entry: stale }] }));
-    const loaded = loadDerivedCache(cache);
+    const loaded = loadClaudeCache(cache);
     assert.equal(loaded.titles.size, 0);
     assert.equal(loaded.reuse?.reason, 'generation-mismatch');
     const rebuilt = { ...stale, stats: sessionStatFactsOf(readCodexSession(source, 'sess')) };
-    saveDerivedCache(cache, [[source, rebuilt]]);
-    const persisted = loadDerivedCache(cache).titles.get(source);
+    saveClaudeCache(cache, [[source, rebuilt]]);
+    const persisted = loadClaudeCache(cache).titles.get(source);
     assert.equal(persisted?.stats?.turns[0].contextRequest?.lifetime, '30m');
     assert.equal(persisted?.size, before.size);
     assert.equal(persisted?.mtimeMs, before.mtimeMs);
     assert.equal(fs.statSync(source).size, before.size);
     assert.equal(fs.statSync(source).mtimeMs, before.mtimeMs);
-    assert.equal(JSON.parse(fs.readFileSync(cache, 'utf8')).metadataVersion, VERSION);
+    assert.deepEqual(JSON.parse(fs.readFileSync(cache, 'utf8')).metadataGenerations, METADATA_GENERATIONS);
   }
 });
 
@@ -3080,13 +3101,13 @@ test('Bedrock Astra discards literal derived generation 44 and rebuilds unchange
     },
   };
   fs.writeFileSync(cache, JSON.stringify({ version: 44, codexMetas: [], titles: [{ file: source, entry: stale }] }));
-  const loaded = loadDerivedCache(cache);
+  const loaded = loadClaudeCache(cache);
   assert.equal(loaded.titles.size, 0);
   assert.equal(loaded.reuse?.reason, 'generation-mismatch');
   assert.deepEqual(loaded.carriedNames.get(source), { label: title.label, fullLabel: title.fullLabel });
   const rebuilt = { ...stale, stats: sessionStatFactsOf(readCodexSession(source, 'bedrock-astra-parent')) };
-  saveDerivedCache(cache, [[source, rebuilt]]);
-  const persisted = loadDerivedCache(cache).titles.get(source);
+  saveClaudeCache(cache, [[source, rebuilt]]);
+  const persisted = loadClaudeCache(cache).titles.get(source);
   assert.equal(persisted?.stats?.turns[0].contextWindow, 258_400);
   assert.equal(persisted?.stats?.turns[0].contextRequest?.lifetime, null);
   assert.equal(persisted?.stats?.turns[0].usage.byContextBand?.short?.requests, 33);
@@ -3110,14 +3131,14 @@ test('derived cache retains global Bedrock request effort without changing prici
       ],
     },
   };
-  saveDerivedCache(file, [['/session.jsonl', saved]]);
-  assert.deepEqual(loadDerivedCache(file).titles.get('/session.jsonl'), saved);
+  saveClaudeCache(file, [['/session.jsonl', saved]]);
+  assert.deepEqual(loadClaudeCache(file).titles.get('/session.jsonl'), saved);
 });
 
 // These families retain different semantic dependencies across quiet-source restarts.
 test('cache family admission and format fallback preserve only qualified facts', async () => {
   const root = folder();
-  const current = path.join(root, 'derived-session-cache-v1.json');
+  const current = path.join(root, 'derived-session-cache-v2.json');
   const legacy = path.join(root, 'derived-session-cache.json');
   const file = path.join(root, 'parent.jsonl');
   fs.writeFileSync(file, '{"type":"ignored","text":"' + 'x'.repeat(100000) + '"}\n');
@@ -3132,16 +3153,19 @@ test('cache family admission and format fallback preserve only qualified facts',
     complete: false,
     claudeCursor: scan.cursor,
   };
-  saveDerivedCache(current, [[file, title]], [[file, entry]]);
+  saveClaudeCache(current, [[file, title]], [[file, entry]]);
   const supported = JSON.parse(fs.readFileSync(current, 'utf8'));
   const old = { version: 63, titles: supported.titles, claudeChildReferences: supported.claudeChildReferences };
   const legacyBytes = JSON.stringify(old);
   fs.writeFileSync(legacy, legacyBytes);
   const read = (value: unknown) => {
     fs.writeFileSync(current, JSON.stringify(value));
-    return loadDerivedCache(current, legacy);
+    return loadClaudeCache(current, legacy);
   };
-  const mismatch = read({ ...supported, metadataVersion: VERSION - 1 });
+  const mismatch = read({
+    ...supported,
+    metadataGenerations: { ...METADATA_GENERATIONS, claude: METADATA_GENERATIONS.claude - 1 },
+  });
   assert.equal(mismatch.titles.size, 0);
   assert.equal(mismatch.carriedNames.get(file)?.label, title.label);
   assert.deepEqual(mismatch.claudeChildReferences.get(normalizeFsPath(file)), entry);
@@ -3170,36 +3194,201 @@ test('cache family admission and format fallback preserve only qualified facts',
   assert.equal(read({ ...supported, discovery: { ...discovery, compatibility: undefined } }).discovery, undefined);
   assert.equal(read({ ...supported, formatVersion: 9 }).titles.size, 0);
   fs.writeFileSync(current, '{');
-  assert.equal(loadDerivedCache(current, legacy).carriedNames.size, 0, 'corruption revived legacy names');
-  assert.equal(loadDerivedCache(current, legacy).titles.size, 0, 'corruption revived legacy metadata');
+  assert.equal(loadClaudeCache(current, legacy).carriedNames.size, 0, 'corruption revived legacy names');
+  assert.equal(loadClaudeCache(current, legacy).titles.size, 0, 'corruption revived legacy metadata');
   assert.equal(
-    loadDerivedCache(current, legacy).claudeChildReferences.size,
+    loadClaudeCache(current, legacy).claudeChildReferences.size,
     0,
     'corruption revived legacy relationships',
   );
   const directory = path.join(root, 'directory');
   fs.mkdirSync(directory);
-  assert.equal(loadDerivedCache(directory, legacy).titles.size, 0, 'a failed read revived legacy metadata');
+  assert.equal(loadClaudeCache(directory, legacy).titles.size, 0, 'a failed read revived legacy metadata');
   fs.unlinkSync(current);
-  const imported = loadDerivedCache(current, legacy);
+  const imported = loadClaudeCache(current, legacy);
   assert.equal(imported.migrationPending, true);
   assert.equal(imported.claudeChildReferences.size, 1);
   assert.equal(imported.titles.size, 0, `legacy metadata 63 survived generation ${VERSION}`);
   fs.writeFileSync(legacy, JSON.stringify({ ...old, version: LEGACY_GENERATION }));
-  const main64 = loadDerivedCache(current, legacy);
+  const main64 = loadClaudeCache(current, legacy);
   assert.equal(main64.titles.size, 0, `legacy metadata ${LEGACY_GENERATION} survived generation ${VERSION}`);
   assert.equal(main64.carriedNames.size, 1);
   assert.equal(main64.claudeChildReferences.size, 1);
   fs.writeFileSync(legacy, JSON.stringify({ ...old, version: 62 }));
   assert.equal(
-    loadDerivedCache(current, legacy).claudeChildReferences.size,
+    loadClaudeCache(current, legacy).claudeChildReferences.size,
     0,
     'unknown legacy rows acquired compatibility',
   );
   fs.writeFileSync(legacy, legacyBytes);
-  saveDerivedCache(current, [], imported.claudeChildReferences);
-  assert.equal(loadDerivedCache(current, legacy).carriedNames.size, 0, 'a removed name returned beside legacy data');
+  saveClaudeCache(current, [], imported.claudeChildReferences);
+  assert.equal(loadClaudeCache(current, legacy).carriedNames.size, 0, 'a removed name returned beside legacy data');
   assert.equal(fs.readFileSync(legacy, 'utf8'), legacyBytes);
+});
+
+test('v1 import keeps each agent by its own generation through migration, restarts, and an older writer', async () => {
+  const root = folder();
+  const current = path.join(root, 'derived-session-cache-v2.json');
+  const previous = path.join(root, 'derived-session-cache-v1.json');
+  const legacy = path.join(root, 'derived-session-cache.json');
+  const claudeFile = path.join(root, 'claude.jsonl');
+  const codexFile = path.join(root, 'codex.jsonl');
+  const strayFile = path.join(root, 'stray.jsonl');
+  const agents = new Map<string, 'claude' | 'codex'>([
+    [claudeFile, 'claude'],
+    [codexFile, 'codex'],
+  ]);
+  const agentOf = (file: string) => agents.get(file) ?? null;
+  const named = (label: string): DerivedTitleEntry => ({ ...title, label, fullLabel: label });
+  fs.writeFileSync(claudeFile, '{"type":"ignored","text":"' + 'x'.repeat(100000) + '"}\n');
+  const scan = await scanClaudeRelationshipQuantum({ file: claudeFile, sessionId: 'parent' }, undefined, 32768);
+  const relationship: ClaudeChildReferenceCacheEntry = {
+    parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
+    source: 'claude',
+    sessionId: 'parent',
+    ...scan.cursor.evidence!.provisional,
+    childTranscript: false,
+    references: [],
+    complete: false,
+    claudeCursor: scan.cursor,
+  };
+  const v1 = (metadataVersion: number) =>
+    JSON.stringify({
+      formatVersion: 1,
+      metadataVersion,
+      titles: [
+        { file: claudeFile, entry: named('Claude') },
+        { file: codexFile, entry: named('Codex') },
+        { file: strayFile, entry: named('Stray') },
+      ],
+      claudeChildReferences: [{ file: claudeFile, entry: relationship }],
+      carriedNames: [],
+    });
+  const load = () => loadDerivedCache(current, { previous, legacy, agentOf });
+  const labels = new Map([
+    [claudeFile, 'Claude'],
+    [codexFile, 'Codex'],
+    [strayFile, 'Stray'],
+  ]);
+  fs.writeFileSync(legacy, JSON.stringify({ version: 63, titles: [], claudeChildReferences: [] }));
+  for (const [version, kept] of [
+    [70, [claudeFile]],
+    [71, [claudeFile, codexFile]],
+    [69, []],
+    [72, []],
+  ] as const) {
+    fs.writeFileSync(previous, v1(version));
+    const loaded = load();
+    assert.equal(loaded.reuse?.source, 'previous');
+    assert.deepEqual([...loaded.titles.keys()], kept, `shared version ${version}`);
+    for (const [file, label] of labels) {
+      if (!loaded.titles.has(file)) assert.equal(loaded.carriedNames.get(file)?.label, label, `${label} lost its name`);
+    }
+    assert.deepEqual(loaded.claudeChildReferences.get(normalizeFsPath(claudeFile)), relationship);
+    assert.equal(loaded.migrationPending, true);
+  }
+  fs.writeFileSync(previous, v1(70));
+  const previousBytes = fs.readFileSync(previous, 'utf8');
+  const first = load();
+  assert.throws(() =>
+    saveDerivedCache(
+      current,
+      first.titles,
+      first.claudeChildReferences,
+      first.carriedNames,
+      () => {
+        throw new Error('interrupted');
+      },
+      undefined,
+      [],
+      agentOf,
+    ),
+  );
+  assert.equal(fs.existsSync(current), false);
+  const second = load();
+  assert.deepEqual([...second.titles.keys()], [claudeFile], 'an interrupted migration lost Claude metadata');
+  assert.deepEqual(second.claudeChildReferences.get(normalizeFsPath(claudeFile))?.claudeCursor, scan.cursor);
+  saveDerivedCache(
+    current,
+    second.titles,
+    second.claudeChildReferences,
+    second.carriedNames,
+    undefined,
+    undefined,
+    [],
+    agentOf,
+  );
+  assert.equal(fs.readFileSync(previous, 'utf8'), previousBytes, 'migration rewrote the rollback file');
+  const saved = JSON.parse(fs.readFileSync(current, 'utf8'));
+  assert.equal(saved.formatVersion, 2);
+  assert.deepEqual(saved.metadataGenerations, METADATA_GENERATIONS);
+  assert.deepEqual(
+    saved.titles.map((row: { file: string; agent: string }) => [row.file, row.agent]),
+    [[claudeFile, 'claude']],
+  );
+  // An older window keeps writing the previous file after migration.
+  fs.writeFileSync(previous, v1(71));
+  const restarted = load();
+  assert.equal(restarted.reuse?.source, 'current');
+  assert.equal(restarted.migrationPending, false);
+  assert.deepEqual([...restarted.titles.keys()], [claudeFile], 'an older writer replaced migrated metadata');
+  assert.equal(restarted.carriedNames.get(codexFile)?.label, 'Codex');
+  assert.deepEqual(restarted.claudeChildReferences.get(normalizeFsPath(claudeFile))?.claudeCursor, scan.cursor);
+  saveDerivedCache(
+    current,
+    [
+      [claudeFile, named('Claude')],
+      [codexFile, named('Codex')],
+    ],
+    [],
+    [],
+    undefined,
+    undefined,
+    [],
+    agentOf,
+  );
+  const both = JSON.parse(fs.readFileSync(current, 'utf8'));
+  for (const [agent, survivor] of [
+    ['codex', claudeFile],
+    ['claude', codexFile],
+  ] as const) {
+    const generations = { ...METADATA_GENERATIONS, [agent]: METADATA_GENERATIONS[agent] + 1 };
+    const loaded = loadDerivedCache(current, { previous, agentOf }, generations);
+    assert.deepEqual([...loaded.titles.keys()], [survivor], `a ${agent}-only change kept the wrong entries`);
+    assert.equal(loaded.reuse?.rejectedTitles, 1);
+  }
+  const shared = loadDerivedCache(
+    current,
+    { previous, agentOf },
+    { claude: METADATA_GENERATIONS.claude + 1, codex: METADATA_GENERATIONS.codex + 1 },
+  );
+  assert.equal(shared.titles.size, 0);
+  assert.equal(shared.reuse?.reason, 'generation-mismatch');
+  assert.equal(shared.carriedNames.size, 2);
+  const rows = (titles: unknown[]) => {
+    fs.writeFileSync(current, JSON.stringify({ ...both, titles }));
+    return load();
+  };
+  const swapped = rows(
+    both.titles.map((row: { agent: string }) => ({ ...row, agent: row.agent === 'claude' ? 'codex' : 'claude' })),
+  );
+  assert.equal(swapped.titles.size, 0, 'a conflicting agent admitted metadata');
+  assert.equal(swapped.carriedNames.size, 2);
+  assert.equal(rows(both.titles.map(({ agent: _agent, ...row }: { agent: string }) => row)).titles.size, 0);
+  saveDerivedCache(current, [[strayFile, named('Stray')]], [], [], undefined, undefined, [], agentOf);
+  assert.deepEqual(JSON.parse(fs.readFileSync(current, 'utf8')).titles, [], 'an entry without an agent was saved');
+  assert.equal(load().carriedNames.get(strayFile)?.label, 'Stray');
+  for (const text of [
+    '{',
+    JSON.stringify({ ...both, formatVersion: 3 }),
+    JSON.stringify({ ...both, formatVersion: 1, metadataVersion: 71 }),
+  ]) {
+    fs.writeFileSync(current, text);
+    const damaged = load();
+    assert.equal(damaged.titles.size, 0, 'a damaged current file revived older metadata');
+    assert.equal(damaged.carriedNames.size, 0, 'a damaged current file revived older names');
+    assert.equal(damaged.claudeChildReferences.size, 0, 'a damaged current file revived older relationships');
+  }
 });
 
 test('Codex cursor eviction discards dependent discovery while retaining the source row', async () => {
@@ -3236,11 +3425,11 @@ test('Codex cursor eviction discards dependent discovery while retaining the sou
     .spyOn(Buffer, 'byteLength')
     .mockImplementation((value, encoding) => (value === serialized ? 65 * 1024 * 1024 : byteLength(value, encoding)));
   try {
-    saveDerivedCache(cache, [], [[file, entry]], [], undefined, discovery);
+    saveClaudeCache(cache, [], [[file, entry]], [], undefined, discovery);
   } finally {
     size.mockRestore();
   }
-  const loaded = loadDerivedCache(cache);
+  const loaded = loadClaudeCache(cache);
   assert.equal(loaded.claudeChildReferences.size, 1);
   assert.equal(loaded.claudeChildReferences.get(normalizeFsPath(file))?.cursor, undefined);
   assert.equal(loaded.discovery, undefined, 'an evicted partial cursor retained its scheduler');

@@ -4297,8 +4297,8 @@ test('generation 35 empty names reread an unchanged image-bearing rollout after 
       'Compare the screenshot with the panel and explain the missing session heading',
     );
     assert.deepEqual({ size: fs.statSync(file).size, mtimeMs: fs.statSync(file).mtimeMs }, { size, mtimeMs });
-    saveDerivedCache(cache, [[file, result.value.entry]]);
-    const restored = loadDerivedCache(cache).titles.get(file)!;
+    saveDerivedCache(cache, [[file, result.value.entry]], [], [], undefined, undefined, [], () => 'codex');
+    const restored = loadDerivedCache(cache, { agentOf: () => 'codex' }).titles.get(file)!;
     assert.equal(restored.label, result.value.entry.label);
     assert.equal(restored.fullLabel, result.value.entry.fullLabel);
   } finally {
@@ -10252,8 +10252,8 @@ test('the agent-run scan resumes from its stored cursor and stops reading a pers
     assert.equal(first.agentRun, true);
     const firstScan = first.agentRunScan;
     assert.ok(firstScan);
-    saveDerivedCache(cache, [[file, first]]);
-    const stored = loadDerivedCache(cache).titles.get(file);
+    saveDerivedCache(cache, [[file, first]], [], [], undefined, undefined, [], () => 'claude');
+    const stored = loadDerivedCache(cache, { agentOf: () => 'claude' }).titles.get(file);
     assert.deepEqual(stored?.agentRunScan, first.agentRunScan, 'the scan cursor does not survive the derived cache');
 
     // Corrupt the first record so an accidental restart produces a different person classification.

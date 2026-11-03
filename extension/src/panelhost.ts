@@ -594,7 +594,7 @@ import {
 } from './sessionrename';
 import {
   CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
-  VERSION as DERIVED_CACHE_VERSION,
+  METADATA_GENERATIONS,
   DerivedCacheCheckpointState,
   DerivedTitleEntry,
   agentRunScanUnread,
@@ -604,6 +604,7 @@ import {
   derivedTitleCacheStats,
   derivedTitleStats,
   loadDerivedCache,
+  type DerivedCacheSources,
   METADATA_EXHAUSTED_RULE,
   onlyGrew,
   railEnrichmentNeeds,
@@ -3417,6 +3418,11 @@ export class PanelProvider implements vscode.Disposable {
     });
   }
 
+  // Earlier cache files that the current derived cache file imports when it is absent.
+  private get derivedCacheImports(): DerivedCacheSources {
+    return { previous: this.previousDerivedCacheFile, legacy: this.legacyDerivedCacheFile };
+  }
+
   constructor(
     private storeRootDir: string,
     private extensionUri: vscode.Uri,
@@ -3432,6 +3438,7 @@ export class PanelProvider implements vscode.Disposable {
     startupDirectory?: string,
     private readonly health?: HostHealth,
     private readonly legacyDerivedCacheFile?: string,
+    private readonly previousDerivedCacheFile?: string,
   ) {
     this.editorIconPaths = {
       light: vscode.Uri.joinPath(this.extensionUri, 'icons', 'agent-light.svg'),
@@ -3446,7 +3453,7 @@ export class PanelProvider implements vscode.Disposable {
       this.settleRecordedReplies();
     });
     this.projectSpendSaveScheduler = this.newProjectSpendSaveScheduler();
-    const cached = this.derivedCacheFile ? loadDerivedCache(this.derivedCacheFile, this.legacyDerivedCacheFile) : null;
+    const cached = this.derivedCacheFile ? loadDerivedCache(this.derivedCacheFile, this.derivedCacheImports) : null;
     if (cached) {
       this.titles = cached.titles;
       // Cached negative answers require current classifier evidence after restart.
@@ -3463,7 +3470,7 @@ export class PanelProvider implements vscode.Disposable {
     }
     this.startupCache = {
       file: this.derivedCacheFile ?? null,
-      generation: DERIVED_CACHE_VERSION,
+      generation: METADATA_GENERATIONS,
       relationshipGeneration: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
       reuse: cached?.reuse ?? { reason: 'unconfigured' },
       loadedTitles: cached?.titles.size ?? 0,
@@ -16807,7 +16814,7 @@ export function registerPanel(
     context.extensionUri,
     context.workspaceState,
     projectSpendDirectory(workspaceCache.root),
-    path.join(workspaceCache.root, 'derived-session-cache-v1.json'),
+    path.join(workspaceCache.root, 'derived-session-cache-v2.json'),
     path.join(cacheRoot(), 'codex-openings.json'),
     path.join(context.globalStorageUri.fsPath, 'prompt-assets'),
     output,
@@ -16817,6 +16824,7 @@ export function registerPanel(
     path.join(arcHome(), 'startup'),
     health,
     path.join(workspaceCache.root, 'derived-session-cache.json'),
+    path.join(workspaceCache.root, 'derived-session-cache-v1.json'),
   );
   context.subscriptions.push(
     provider,
