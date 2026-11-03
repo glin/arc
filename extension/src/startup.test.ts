@@ -1268,7 +1268,7 @@ function freezerSource() {
   const workspace = path.join(root, 'Owner', 'arc');
   const projects = path.join(root, 'projects');
   const codex = path.join(root, 'codex');
-  const settled = new Date(Date.now() - 60 * 60_000);
+  const settled = new Date(Math.floor(Date.now() / 1000) * 1000 - 60 * 60_000);
   const write = (file: string, records: unknown[]) => {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
