@@ -1362,7 +1362,9 @@ export const COMPRESSED_STORES = {
 } as const;
 const COMPRESSED_TEMP_PREFIX = 'arc-compressed-';
 
-function directoryBytes(directory: string): number {
+type Stat = (file: string) => { size: number };
+
+function directoryBytes(directory: string, stat: Stat): number {
   let entries: fs.Dirent[];
   try {
     entries = fs.readdirSync(directory, { withFileTypes: true });
@@ -1373,16 +1375,23 @@ function directoryBytes(directory: string): number {
   let bytes = 0;
   for (const entry of entries) {
     const target = path.join(directory, entry.name);
-    if (entry.isDirectory()) bytes += directoryBytes(target);
-    else if (entry.isFile()) bytes += fs.statSync(target).size;
+    if (entry.isDirectory()) bytes += directoryBytes(target, stat);
+    else if (entry.isFile()) {
+      // The worker can replace a store file between the listing and the stat. A replaced file adds nothing.
+      try {
+        bytes += stat(target).size;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+    }
   }
   return bytes;
 }
 
-// The bytes of both compressed rollout stores under an Arc home. An absent store reads 0.
-export function compressedStoreBytes(home: string): number {
+// The bytes of both compressed rollout stores under an Arc home. An absent store or file reads 0.
+export function compressedStoreBytes(home: string, stat: Stat = fs.statSync): number {
   const cache = path.join(home, 'cache');
-  let bytes = directoryBytes(path.join(cache, COMPRESSED_STORES.openings));
+  let bytes = directoryBytes(path.join(cache, COMPRESSED_STORES.openings), stat);
   let workspaces: fs.Dirent[] = [];
   try {
     workspaces = fs.readdirSync(cache, { withFileTypes: true });
@@ -1391,7 +1400,7 @@ export function compressedStoreBytes(home: string): number {
   }
   for (const workspace of workspaces)
     if (workspace.isDirectory() && workspace.name !== COMPRESSED_STORES.openings)
-      bytes += directoryBytes(path.join(cache, workspace.name, COMPRESSED_STORES.facts));
+      bytes += directoryBytes(path.join(cache, workspace.name, COMPRESSED_STORES.facts), stat);
   return bytes;
 }
 

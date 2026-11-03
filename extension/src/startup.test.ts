@@ -2094,6 +2094,21 @@ test('the runner block counts the bytes of both compressed stores', () => {
   write('cache/codex-openings.json', 100);
   write(`${COMPRESSED_STORES.facts}/segment-1-a-1`, 100);
   assert.equal(compressedStoreBytes(home), 42);
+  // A store file that the worker replaces between the listing and the stat adds nothing.
+  const replaced = path.join('Workspace-A', COMPRESSED_STORES.facts, 'segment-1-a-1');
+  const fault = (code: string) => Object.assign(new Error(`${code} on a store file`), { code });
+  const vanishing = (file: string) => {
+    if (file.endsWith(replaced)) throw fault('ENOENT');
+    return fs.statSync(file);
+  };
+  assert.equal(compressedStoreBytes(home, vanishing), 22);
+  assert.throws(
+    () =>
+      compressedStoreBytes(home, () => {
+        throw fault('EACCES');
+      }),
+    /EACCES on a store file/,
+  );
   const runner = runnerMeasures({ home, tempBefore: new Set(), listTemp: () => [] });
   assert.deepEqual(runner, { compressedStoreBytes: 42, compressedTempEntries: 0 });
   const measures = measuresOf({ runner });
