@@ -378,21 +378,25 @@ test.each(['during each forward read', 'on their own clock'])(
     let openings = 0;
     let cancelled = 0;
     let current = new AbortController();
-    let cancelOnEntry = false;
+    let currentGeneration = 0;
     const clock = writer === 'on their own clock';
+    const requestStart = 'requests.set(message.id, controller);';
+    assert.equal(source.split(requestStart).length - 1, 1, 'Worker request instrumentation did not match');
+    const instrumented = source.replace(
+      requestStart,
+      `${requestStart} if (message.request.kind === 'claude-children') entryActive = { id: message.id, generation: message.generation, armed: entryOpened && message.generation % 2 === 0 };`,
+    );
+    const cancelReceiptEntry = `const entryPort=require('node:worker_threads').parentPort,entryFs=require('node:fs'),entryOpen=entryFs.opendirSync;let entryActive,entryOpened=false;entryFs.opendirSync=function(p,...a){const dir=entryOpen.call(this,p,...a);if(String(p)!==${JSON.stringify(fx.receipts.root)})return dir;entryOpened=true;entryPort.postMessage({repeatedCoverage:'receipt-store-opened'});const read=dir.readSync.bind(dir);dir.readSync=function(){if(entryActive?.armed){entryActive.armed=false;entryPort.emit('message',{cancel:entryActive.id});entryPort.postMessage({repeatedCoverage:'receipt-cancel:'+entryActive.generation});}return read();};return dir;};`;
     const worker = new ProgressiveWorker(
       `process.env.ARC_HOME=${JSON.stringify(fx.home)};performance.now=()=>0;` +
         (clock ? '' : liveWriters(live.map((row) => row.file))) +
-        receiptEntries(fx.receipts.root) +
-        source,
+        cancelReceiptEntry +
+        instrumented,
       undefined,
       (file) => {
         if (file === 'live-append') appends++;
         if (file === 'receipt-store-opened') openings++;
-        if (file === 'receipt-entry' && cancelOnEntry) {
-          cancelOnEntry = false;
-          current.abort();
-        }
+        if (file === `receipt-cancel:${currentGeneration}`) current.abort();
       },
     );
     const discovery = await receiptDiscoveryHost(worker, [root], catalog);
@@ -410,9 +414,9 @@ test.each(['during each forward read', 'on their own clock'])(
       for (; pass < 60 && !completed; pass++) {
         current = new AbortController();
         // Once the receipt scan has opened, every other continuation is cancelled during it, and the roots change once.
-        cancelOnEntry = openings > 0 && pass % 2 === 1;
+        currentGeneration = pass + 1;
         if (openings > 0) discovery.host.repositoryScopeRoots = [root, path.join(root, 'worker-a')];
-        discovery.host.refreshGeneration = pass + 1;
+        discovery.host.refreshGeneration = currentGeneration;
         const prepared = await discovery.host.prepareClaudeChildren(pass + 1, current.signal);
         if (current.signal.aborted) {
           assert.equal(prepared, false);
