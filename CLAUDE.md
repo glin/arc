@@ -49,7 +49,7 @@ Read `docs/development.md` before installing dependencies, repairing the panel-m
 
 Only one session at a time runs each heavy test lane, such as the browser lane, and the [suite runner](docs/development.md#machine-load) enforces it.
 
-When local resources block checks, use remote CI if access and authorization permit. Record the candidate and results, and identify unrun checks as pending in the handoff. Existing landing and performance gates still apply.
+When local resources block checks, use remote CI only with access and authorization to publish the candidate. Push a temporary branch to trigger CI. Record the tested commit and results, and list unrun checks as pending in the handoff. After preserving the tested commit elsewhere, delete only temporary local and remote branches you created for these checks. Without remote access, hand off the pending checks. Existing landing and performance gates still apply.
 
 Use the diagnostic capture script in [Performance capture](docs/performance.md#performance-capture) for performance investigations and diagnostic requests.
 
