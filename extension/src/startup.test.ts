@@ -1966,6 +1966,36 @@ test('refresh rows report past the margin and fail past a limit', () => {
   assert.deepEqual([limited.reportOnly, limited.regressed], [false, true]);
 });
 
+test('refresh rows read the hold snapshot when the run holds', () => {
+  const bounds = boundsOf(['--limit', 'refreshMaxMs:compressed-facts=50']);
+  const launch = runnerResult({
+    'refreshMaxMs:compressed-facts': 10,
+    'refreshMs:compressed-facts': 20,
+    'refreshCount:compressed-facts': 2,
+  });
+  const hold = {
+    'refreshMaxMs:compressed-facts': 80,
+    'refreshMs:compressed-facts': 300,
+    'refreshCount:compressed-facts': 6,
+    publications: 99,
+  };
+  const held = { ...launch, warmUp: { hold: { snapshot: hold } } };
+  const row = (candidate: typeof launch) =>
+    compareResults([runnerResult()], [candidate], bounds).find(
+      (measure) => measure.name === 'refreshMaxMs:compressed-facts',
+    )!;
+  assert.deepEqual([row(held).regressed, row(held).candidate], [true, 80]);
+  assert.deepEqual([row(launch).regressed, row(launch).candidate], [false, 10]);
+  // The other refresh rows read the hold too, and every other row keeps the measured launch.
+  const measures = measuresOf(held);
+  assert.deepEqual(
+    ['refreshMs:compressed-facts', 'refreshCount:compressed-facts', 'publications'].map(
+      (name) => measures.get(name)?.value,
+    ),
+    [300, 6, 3],
+  );
+});
+
 test('margin sets one measure ratio without a floor', () => {
   const margins = marginsOf(['--margin', 'firstUsableRowMs=1.8', '--margin', 'firstPassMs=1.1', '--soak', '10']);
   assert.deepEqual(margins, { firstUsableRowMs: 1.8, firstPassMs: 1.1 });

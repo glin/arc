@@ -44,6 +44,8 @@ interface RunResult {
   startupRecord?: { stages?: Record<string, number> } | null;
   memory?: { peakWorkingSetBytes?: number | null; sampledMaximumWorkingSetBytes?: number | null };
   soak?: { end?: Record<string, number> | null };
+  // The snapshot that the runner takes after a `--warm-until` hold ends.
+  warmUp?: { hold?: { snapshot?: Record<string, number> | null } | null } | null;
   // The measures the runner computes from files after the editor exits.
   runner?: Record<string, number> | null;
 }
@@ -82,14 +84,24 @@ function kindOf(name: string): Kind {
   return COUNTS.has(name) || name.startsWith('refreshCount:') ? 'count' : BYTES.has(name) ? 'bytes' : 'time';
 }
 
+// The refresh rows that the comparison reads from the hold snapshot when the run holds, and from the end snapshot of
+// the measured launch otherwise.
+export function readFromHold(name: string): boolean {
+  return name.startsWith('refreshMs:') || name.startsWith('refreshMaxMs:') || name === 'refreshCount:compressed-facts';
+}
+
 // Read the comparison's measures from one runner result.
 export function measuresOf(result: RunResult): Map<string, { kind: Kind; value: number | null }> {
   const out = new Map<string, { kind: Kind; value: number | null }>();
   // Both startup times come from the measured host's startup record, so every value shares the host's clock origin.
   out.set('firstUsableRowMs', { kind: 'time', value: result.startupRecord?.stages?.firstUsableRow ?? null });
   out.set('firstPassMs', { kind: 'time', value: result.startupRecord?.stages?.completeRender ?? null });
-  for (const [name, value] of Object.entries(result.soak?.end ?? {})) out.set(name, { kind: kindOf(name), value });
   for (const [name, value] of Object.entries(result.runner ?? {})) out.set(name, { kind: kindOf(name), value });
+  const hold = result.warmUp?.hold?.snapshot ?? null;
+  for (const [name, value] of Object.entries(result.soak?.end ?? {}))
+    if (!hold || !readFromHold(name)) out.set(name, { kind: kindOf(name), value });
+  for (const [name, value] of Object.entries(hold ?? {}))
+    if (readFromHold(name)) out.set(name, { kind: kindOf(name), value });
   out.set('peakHostMemoryBytes', {
     kind: 'memory',
     value: result.memory?.peakWorkingSetBytes ?? result.memory?.sampledMaximumWorkingSetBytes ?? null,
