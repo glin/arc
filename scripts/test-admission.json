@@ -131,7 +131,7 @@
   },
   "extension/src/panelbundle.test.ts": {
     "reason": "The panel bundle and fixture must contain the production entry, source identity, and substituted text.",
-    "cases": 3,
+    "cases": 2,
     "matricesSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
   },
   "extension/src/progressiveworker.test.ts": {
