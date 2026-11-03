@@ -136,6 +136,7 @@ import {
 import { ARC_IDENTITY } from './identity';
 import { codexHome } from './agentpaths';
 import { parseQuestionReply, type QuestionReply } from './codexreply';
+import { isCompressedRollout, isCompressedRolloutName } from './compressedrollouts';
 
 // Reads Codex rollouts into the shared `Turn` shape without writing to the source files.
 // `task_started` and `task_complete` supply explicit turn boundaries through `turn_id`.
@@ -207,7 +208,9 @@ export class CodexMetaCache {
     private now: () => number = () => performance.now(),
   ) {}
 
+  // A compressed rollout gets no opening read, and its name gets no entry.
   get(file: string): CodexSessionMeta | null {
+    if (isCompressedRollout(file)) return null;
     const hit = this.entries.get(file);
     if (hit?.meta) {
       return hit.meta;
@@ -243,7 +246,7 @@ export class CodexMetaCache {
   // Preserve any non-refusal entry `get` supplies during the read.
   // A missing record keeps its measured size. Later `get` calls retry after growth.
   // Rejected reads leave existing entries unchanged. Return true when a readable opening was added.
-  // An aborted `signal` stops each lane before its next read.
+  // An aborted `signal` stops each lane before its next read. A compressed rollout gets no read.
   async prime(
     files: readonly string[],
     readAsync: (file: string, buf: Buffer) => Promise<CodexSessionMeta | null> = readCodexSessionMetaAsync,
@@ -251,7 +254,7 @@ export class CodexMetaCache {
     sizeAsync: (file: string) => Promise<number | null> = fileSizeAsync,
     signal?: AbortSignal,
   ): Promise<boolean> {
-    const missing = files.filter((file) => this.entries.get(file)?.meta === undefined);
+    const missing = files.filter((file) => !isCompressedRollout(file) && this.entries.get(file)?.meta === undefined);
     const before = this.changed;
     let next = 0;
     const lane = async (): Promise<void> => {
@@ -644,6 +647,7 @@ class RolloutWalk {
   private missingRoot = false;
   private readonly directories: string[] = [];
   private readonly files: string[] = [];
+  private readonly compressed: string[] = [];
   private readonly uncertain: string[] = [];
   // Directories whose entries the walk has not finished, innermost last.
   private readonly open: { dir: string; depth: number; entries: fs.Dirent[]; next: number }[] = [];
@@ -672,15 +676,16 @@ class RolloutWalk {
   }
 
   result(): SourceEnumeration {
-    const { status, root, directories, files, uncertain } = this;
+    const { status, root, directories, files, uncertain, compressed } = this;
     return this.missingRoot
-      ? { status, root, directories, files, uncertain, missingRoot: true }
-      : { status, root, directories, files, uncertain };
+      ? { status, root, directories, files, uncertain, compressed, missingRoot: true }
+      : { status, root, directories, files, uncertain, compressed };
   }
 
   // Collects rollouts in entry order until the next directory to descend into, which then waits
   // in `dir`. Rollouts listed after that directory are collected once its subtree is done.
   // Collection also stops before an entry once `pause` answers true, and the next call resumes there.
+  // A compressed rollout goes to `compressed` and never to `files`, with no stat.
   collect(pause?: () => boolean): void {
     if (this.dir !== null) return;
     const open = this.open;
@@ -698,6 +703,8 @@ class RolloutWalk {
           }
         } else if (entry.name.endsWith('.jsonl')) {
           this.files.push(path.join(dir, entry.name));
+        } else if (isCompressedRolloutName(entry.name)) {
+          this.compressed.push(path.join(dir, entry.name));
         }
       }
       open.pop();

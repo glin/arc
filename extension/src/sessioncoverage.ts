@@ -20,6 +20,8 @@ export interface SourceEnumeration {
   missingRoot?: boolean;
   root?: string;
   directories?: readonly string[];
+  // The compressed Codex rollouts the walk saw. They are not in `files`, and the walk read no stat for them.
+  compressed?: readonly string[];
 }
 
 export interface SessionCoverage extends SourceEnumeration {

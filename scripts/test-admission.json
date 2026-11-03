@@ -55,9 +55,9 @@
     "matricesSha256": "7233dd3ad393a62ecbd4ba987f2c6c489196504ddb484835419dcff9134eb053"
   },
   "extension/src/codex.test.ts": {
-    "reason": "Real Git worktree ownership and descendant source resolution must agree with recorded Codex session relationships. Terra provider coverage adds in-process request fixtures without additional subprocesses.",
-    "cases": 494,
-    "matricesSha256": "d7a818045c671b0afed28f303360f5d78d68ad1e79000140d2931c29a6aca4e7"
+    "reason": "Real Git worktree ownership and descendant source resolution must agree with recorded Codex session relationships. Terra provider coverage adds in-process request fixtures without additional subprocesses. Compressed rollout names use filesystem fixtures without additional subprocesses.",
+    "cases": 497,
+    "matricesSha256": "da3cdfb9c3f9f4285828c11847047171d1a6d64488d877dc63104be3bd2e1213"
   },
   "extension/src/derivedcache.test.ts": {
     "reason": "Independent writers and host death must preserve shared cache rows and release stale filesystem locks. Terra generation recovery adds in-process provider fixtures without additional writers.",

@@ -13,6 +13,15 @@ export function isCompressedRollout(file: string): boolean {
   return file.endsWith(COMPRESSED_ROLLOUT_SUFFIX);
 }
 
+// The thread id at the end of `rollout-<ISO8601>-<uuid>.jsonl.zst`, the compressed twin of `ROLLOUT_NAME` in `codex.ts`.
+export const COMPRESSED_ROLLOUT_NAME = /-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl\.zst$/i;
+
+// A file name that the rollout walk and the watcher list as a compressed rollout. The lowercase suffix test runs before
+// the name pattern, so `X.JSONL.ZST` is no compressed rollout on any platform.
+export function isCompressedRolloutName(name: string): boolean {
+  return isCompressedRollout(name) && COMPRESSED_ROLLOUT_NAME.test(name);
+}
+
 const zstd: { createZstdDecompress?: () => Transform; constants: typeof zlib.constants } = zlib;
 
 // The zstd decoder of this Node.js, or null when Node.js has none.

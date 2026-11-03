@@ -64,6 +64,7 @@ import assert from 'node:assert';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
+import * as zlib from 'node:zlib';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { EXPORT_LIMITS, ExportLimitError } from './exportlimits.ts';
@@ -15373,6 +15374,93 @@ test('a listing reports every rollout it walked, not only the ones it kept', () 
   assert.equal(codexSessionFiles(root, []).walked.length, 3);
 });
 
+// Codex compresses a finished rollout into a `.jsonl.zst` twin and then deletes the plain file. The walk lists the twin
+// apart from the plain rollouts, and the twin gives no row and no opening read.
+const zstdEncode = (zlib as { zstdCompressSync?: (input: Buffer) => Buffer }).zstdCompressSync;
+const compressedTwin = (plain: string) => {
+  fs.writeFileSync(`${plain}.zst`, zstdEncode!(fs.readFileSync(plain)));
+  return `${plain}.zst`;
+};
+
+test.skipIf(!zstdEncode)('a rollout and its compressed twin give one row in every order they appear', () => {
+  const orders = {
+    'twin first': ['twin', 'plain'],
+    'plain first': ['plain', 'twin'],
+    'both at once': ['both'],
+  } as const;
+  for (const [order, steps] of Object.entries(orders)) {
+    const root = sessionsRoot([{ day: '2026/08/25', name: ROLLOUT(UUID_A), records: [meta({ id: UUID_A })] }]);
+    const plain = path.join(root, '2026', '08', '25', ROLLOUT(UUID_A));
+    const body = fs.readFileSync(plain);
+    fs.unlinkSync(plain);
+    const seen: { rows: number; files: readonly string[]; compressed: readonly string[] | undefined }[] = [];
+    for (const step of steps) {
+      if (step !== 'plain') fs.writeFileSync(`${plain}.zst`, zstdEncode!(body));
+      if (step !== 'twin') fs.writeFileSync(plain, body);
+      const listing = codexSessionFiles(root, ['c:\\repo']);
+      seen.push({ rows: listing.sessions.length, files: listing.walked, compressed: listing.enumeration.compressed });
+    }
+    const twinOnly = { rows: 0, files: [], compressed: [`${plain}.zst`] };
+    const plainOnly = { rows: 1, files: [plain], compressed: [] };
+    const pair = { rows: 1, files: [plain], compressed: [`${plain}.zst`] };
+    const expected = { 'twin first': [twinOnly, pair], 'plain first': [plainOnly, pair], 'both at once': [pair] }[
+      order as keyof typeof orders
+    ];
+    assert.deepEqual(seen, expected, order);
+  }
+});
+
+test.skipIf(!zstdEncode)('only a lower-case compressed rollout name joins the walk, on every platform', () => {
+  const root = sessionsRoot(
+    [UUID_A, UUID_B, UUID_C, UUID_D].map((id) => ({ day: '2026/08/25', name: ROLLOUT(id), records: [meta({ id })] })),
+  );
+  const day = path.join(root, '2026', '08', '25');
+  const twin = compressedTwin(path.join(day, ROLLOUT(UUID_A)));
+  const upper = compressedTwin(path.join(day, ROLLOUT(UUID_B))).replace(/\.jsonl\.zst$/, '.JSONL.ZST');
+  fs.renameSync(path.join(day, `${ROLLOUT(UUID_B)}.zst`), upper);
+  const mixed = compressedTwin(path.join(day, ROLLOUT(UUID_C))).replace(/\.zst$/, '.Zst');
+  fs.renameSync(path.join(day, `${ROLLOUT(UUID_C)}.zst`), mixed);
+  fs.writeFileSync(path.join(day, 'notes.jsonl.zst'), zstdEncode!(Buffer.from('{}\n')));
+  const plain = [UUID_A, UUID_B, UUID_C, UUID_D].map((id) => path.join(day, ROLLOUT(id))).sort();
+  const expected = {
+    win32: { compressed: [twin], files: plain },
+    darwin: { compressed: [twin], files: plain },
+    linux: { compressed: [twin], files: plain },
+  };
+  const original = Object.getOwnPropertyDescriptor(process, 'platform')!;
+  for (const [platform, want] of Object.entries(expected)) {
+    Object.defineProperty(process, 'platform', { ...original, value: platform });
+    try {
+      const walk = enumerateRolloutFiles(root);
+      assert.deepEqual({ compressed: walk.compressed, files: [...walk.files].sort() }, want, platform);
+    } finally {
+      Object.defineProperty(process, 'platform', original);
+    }
+  }
+});
+
+test.skipIf(!zstdEncode)('no foreground opening read reaches a compressed rollout head', async () => {
+  const root = sessionsRoot([{ day: '2026/08/25', name: ROLLOUT(UUID_A), records: [meta({ id: UUID_A })] }]);
+  const plain = path.join(root, '2026', '08', '25', ROLLOUT(UUID_A));
+  const twin = compressedTwin(plain);
+  const asked: string[] = [];
+  const cache = new CodexMetaCache((file) => {
+    asked.push(file);
+    return readCodexSessionMeta(file);
+  });
+  const pass = await coldOpeningPass(cache, root);
+  assert.deepEqual(pass.walked, [plain]);
+  assert.deepEqual(pass.enumeration?.compressed, [twin]);
+  const primed: string[] = [];
+  await cache.prime([twin, plain], async (file) => (primed.push(file), null));
+  assert.deepEqual(primed, [], 'the pass had read the plain rollout already, and the twin is never read');
+  await new CodexMetaCache().prime([twin], async (file) => (primed.push(file), null));
+  assert.deepEqual(primed, [], 'a pass read a compressed head');
+  assert.equal(cache.get(twin), null);
+  assert.deepEqual(asked, [], 'the main thread read a compressed head');
+  assert.deepEqual([...cache.keys()], [plain], 'a compressed rollout holds an opening entry');
+});
+
 // Membership is decided per distinct working directory, so the cost of the folder list must not grow with the rollout count.
 test('a listing matches many rollouts that share a few working directories without renormalizing the folders', () => {
   const root = sessionsRoot([{ day: '2026/08/25', name: ROLLOUT(UUID_A), records: [meta({ id: UUID_A })] }]);
@@ -17942,6 +18030,11 @@ test('asynchronous Codex enumeration matches the synchronous walk for every trav
     '2026/10/16/deep/deeper/rollout-beyond-depth.jsonl',
     '2026/10/17/blocked/rollout-unread.jsonl',
     '2025/12/01/rollout-c.jsonl',
+    '2026/10/16/rollout-x-01a032c9-1a92-7931-845c-723117d24dbe.jsonl.zst',
+    '2026/rollout-x-01a032c9-8581-7942-9262-ab4289a674c4.JSONL.ZST',
+    '2026/notes.jsonl.zst',
+    '2026/10/16/deep/deeper/rollout-x-01a032c9-984d-7972-a0e5-abe29d0f50cf.jsonl.zst',
+    '2026/10/17/blocked/rollout-x-01a032c9-0004-7000-8000-000000000004.jsonl.zst',
   ])
     write(relative);
   const blocked = path.join(root, '2026', '10', '17', 'blocked');
@@ -17973,7 +18066,9 @@ test('asynchronous Codex enumeration matches the synchronous walk for every trav
     directories: [] as string[],
     files: [] as string[],
     uncertain: [] as string[],
+    compressed: [] as string[],
   };
+  const compressedName = /-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}[.]jsonl[.]zst$/;
   const visit = (dir: string, depth: number) => {
     if (fails(dir)) {
       reference.uncertain.push(dir);
@@ -17985,6 +18080,7 @@ test('asynchronous Codex enumeration matches the synchronous walk for every trav
       if (entry.isDirectory()) {
         if (depth < 4) visit(full, depth + 1);
       } else if (entry.name.endsWith('.jsonl')) reference.files.push(full);
+      else if (compressedName.test(entry.name)) reference.compressed.push(full);
     }
   };
   visit(root, 0);
