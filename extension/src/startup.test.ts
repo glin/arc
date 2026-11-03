@@ -17216,6 +17216,171 @@ test('an upgrade from shared metadata version 70 reads Claude sessions as a rest
   }
 });
 
+// The derived cache files that extension activation passes to the panel, rooted at `root`.
+function activationCacheFiles(root: string): {
+  derivedCacheFile?: string;
+  previousDerivedCacheFile?: string;
+  legacyDerivedCacheFile?: string;
+} {
+  const file = ts.createSourceFile(
+    'panelhost.ts',
+    fs.readFileSync(path.join(__dirname, 'panelhost.ts'), 'utf8'),
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  const owner = file.statements.find(
+    (statement): statement is ts.ClassDeclaration =>
+      ts.isClassDeclaration(statement) && statement.name?.text === 'PanelProvider',
+  );
+  const parameters = owner?.members.find(ts.isConstructorDeclaration)?.parameters.map((p) => p.name.getText(file));
+  assert.ok(parameters, 'panelhost.ts no longer declares the PanelProvider constructor');
+  let created: ts.NewExpression | undefined;
+  const visit = (node: ts.Node): void => {
+    if (ts.isNewExpression(node) && node.expression.getText(file) === 'PanelProvider') created = node;
+    else ts.forEachChild(node, visit);
+  };
+  visit(file);
+  assert.ok(created?.arguments, 'panelhost.ts no longer creates the panel');
+  const value = (name: string): string | undefined => {
+    const argument = created!.arguments![parameters.indexOf(name)];
+    return argument
+      ? new Function('path', 'workspaceCache', `return ${argument.getText(file)};`)(path, { root })
+      : undefined;
+  };
+  return {
+    derivedCacheFile: value('derivedCacheFile'),
+    previousDerivedCacheFile: value('previousDerivedCacheFile'),
+    legacyDerivedCacheFile: value('legacyDerivedCacheFile'),
+  };
+}
+
+// The panel's derived cache restore, its migration scheduling, and its checkpoint save.
+function derivedCacheMigrationHarness(files: ReturnType<typeof activationCacheFiles>): any {
+  const file = ts.createSourceFile(
+    'panelhost.ts',
+    fs.readFileSync(path.join(__dirname, 'panelhost.ts'), 'utf8'),
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  const owner = file.statements.find(
+    (statement): statement is ts.ClassDeclaration =>
+      ts.isClassDeclaration(statement) && statement.name?.text === 'PanelProvider',
+  );
+  assert.ok(owner);
+  const statements = (owner.members.find(ts.isConstructorDeclaration)?.body?.statements ?? [])
+    .map((statement) => statement.getText(file))
+    .filter((text) => text.startsWith('const cached = ') || text.includes('derivedMigrationPending'));
+  assert.ok(
+    statements[0]?.startsWith('const cached = this.derivedCacheFile ? loadDerivedCache('),
+    'the provider no longer restores the derived cache at startup',
+  );
+  const members = ['derivedCacheImports', 'checkpointDerivedCache', 'writeDerivedCache'].map((name) => {
+    const member = owner.members.find((candidate) => candidate.name?.getText(file) === name);
+    assert.ok(member, `panelhost.ts no longer declares ${name}`);
+    return member.getText(file);
+  });
+  const compiled = transformSync(
+    `
+    export class Harness {
+      disposed = false; cacheShutdownFlushing = false; codexOpenings = undefined; workspaceCache = undefined;
+      derivedCacheCheckpointState = new DerivedCacheCheckpointState(Date.now()); derivedCacheCheckpointTick = null;
+      derivedMigrationPending = false; derivedMigrationNeedsOpenings = false; derivedMigrationRetries = 0;
+      titles = new Map(); carriedNames = new Map(); claudeChildReferenceEntries = new Map(); discoveryCheckpoint;
+      commitRepositories = new CommitRepositories({ run: async () => null }, () => {});
+      startupCache = {};
+      constructor(files) {
+        Object.assign(this, files);
+        ${statements.join('\n')}
+      }
+      ${members.join('\n')}
+    }`,
+    { loader: 'ts', format: 'cjs' },
+  ).code;
+  const module = { exports: {} as any };
+  const scope = {
+    CommitRepositories,
+    DerivedCacheCheckpointState,
+    DERIVED_CACHE_CHECKPOINT_MS: 5 * 60 * 1000,
+    CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
+    METADATA_GENERATIONS,
+    loadDerivedCache,
+    saveDerivedCache,
+  };
+  new Function('module', 'exports', ...Object.keys(scope), compiled)(module, module.exports, ...Object.values(scope));
+  return new module.exports.Harness(files);
+}
+
+test('an upgrade from shared metadata version 70 saves the current cache file once from the previous file', async () => {
+  const root = tempDir('agent-generation-migration-');
+  const projects = path.join(root, 'projects');
+  const rollouts = path.join(root, 'rollouts');
+  fs.mkdirSync(projects);
+  fs.mkdirSync(rollouts);
+  vi.stubEnv('ARC_PROJECTS_ROOT', projects);
+  vi.stubEnv('ARC_CODEX_ROOT', rollouts);
+  const claudeFile = path.join(projects, 'claude.jsonl');
+  const codexFile = path.join(rollouts, 'codex.jsonl');
+  const entry = (label: string) => ({
+    size: 7,
+    mtimeMs: 7,
+    label,
+    fullLabel: label,
+    activityMs: null,
+    agentRun: false,
+    outcome: null,
+    stats: null,
+  });
+  const files = activationCacheFiles(root);
+  const current = files.derivedCacheFile!;
+  const previous = path.join(root, 'derived-session-cache-v1.json');
+  // A build of shared metadata version 70 wrote both rows without agents.
+  const seed = JSON.stringify({
+    formatVersion: 1,
+    metadataVersion: 70,
+    titles: [
+      { file: claudeFile, entry: entry('Read the Claude inputs') },
+      { file: codexFile, entry: entry('Codex completed') },
+    ],
+    claudeChildReferences: [],
+    carriedNames: [],
+  });
+  fs.writeFileSync(previous, seed);
+  const timers: ReturnType<typeof setTimeout>[] = [];
+  try {
+    const first = derivedCacheMigrationHarness(files);
+    timers.push(first.derivedCacheCheckpointTick);
+    await vi.waitFor(() => assert.ok(fs.existsSync(current), 'the upgrade never saved the current cache file'), {
+      timeout: 5000,
+    });
+    const saved = JSON.parse(fs.readFileSync(current, 'utf8'));
+    assert.equal(saved.formatVersion, 2);
+    assert.deepEqual(
+      saved.titles,
+      [{ file: claudeFile, agent: 'claude', entry: entry('Read the Claude inputs') }],
+      'the upgrade dropped the Claude entry or kept the Codex entry',
+    );
+    assert.deepEqual(
+      saved.carriedNames.map((row: { file: string; label: string }) => [row.file, row.label]),
+      [[codexFile, 'Codex completed']],
+      'the upgrade lost the Codex name',
+    );
+    assert.equal(fs.readFileSync(previous, 'utf8'), seed, 'the upgrade changed the previous cache file');
+    assert.equal(first.startupCache.migration, 'saved');
+    const written = fs.readFileSync(current, 'utf8');
+    const second = derivedCacheMigrationHarness(files);
+    timers.push(second.derivedCacheCheckpointTick);
+    assert.equal(second.startupCache.reuse.source, 'current', 'a second restart imported the previous file');
+    assert.deepEqual([...second.titles.keys()], [claudeFile]);
+    assert.equal(second.startupCache.migration, 'unneeded');
+    assert.equal(second.derivedCacheCheckpointTick, null, 'a second restart scheduled another migration save');
+    assert.equal(fs.readFileSync(current, 'utf8'), written);
+    assert.equal(fs.readFileSync(previous, 'utf8'), seed);
+  } finally {
+    for (const timer of timers) clearTimeout(timer);
+    vi.unstubAllEnvs();
+  }
+});
+
 test.each(['scope', 'stamp', 'missing stamp'])(
   'startup rejects stale discovery %s before attaching spend associations',
   async (failure) => {
