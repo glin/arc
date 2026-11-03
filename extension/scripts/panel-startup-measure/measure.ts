@@ -883,8 +883,57 @@ function launchEditor(
   return launch;
 }
 
-// Identify the run's editor processes by their isolated profile path before stopping them.
-function stopEditor(profile = USER_DATA): void {
+// The runner waits this long for the stopped editor processes to exit, and probes them at this interval.
+export const EDITOR_EXIT_MS = 30_000;
+const EDITOR_EXIT_CHECK_MS = 500;
+
+// Probe the process ids until none exists or the deadline passes. Return the ids that exist at the last probe.
+export async function awaitExit(
+  pids: readonly number[],
+  options: {
+    alive: (pids: readonly number[]) => number[];
+    now?: () => number;
+    wait?: (ms: number) => Promise<void>;
+  },
+): Promise<number[]> {
+  const now = options.now ?? Date.now;
+  const wait = options.wait ?? delay;
+  const deadline = now() + EDITOR_EXIT_MS;
+  for (;;) {
+    const alive = pids.length ? options.alive(pids) : [];
+    if (!alive.length || now() >= deadline) return alive;
+    await wait(Math.min(EDITOR_EXIT_CHECK_MS, deadline - now()));
+  }
+}
+
+// The ids of the processes that have not exited. Windows reads `HasExited`, which turns true only after the process
+// teardown ends. Linux and macOS send signal 0, which fails with `ESRCH` for a process that does not exist.
+function aliveProcesses(pids: readonly number[]): number[] {
+  if (process.platform === 'win32') {
+    const query = `Get-Process -Id ${pids.join(',')} -ErrorAction SilentlyContinue | Where-Object { -not $_.HasExited } | ForEach-Object { $_.Id }`;
+    const result = spawnSync('powershell', ['-NoProfile', '-Command', query], { encoding: 'utf8' });
+    if (result.status !== 0 && !result.stdout) return [...pids];
+    const found = new Set(result.stdout.split(/\s+/).filter(Boolean).map(Number));
+    return pids.filter((pid) => found.has(pid));
+  }
+  return pids.filter((pid) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code !== 'ESRCH';
+    }
+  });
+}
+
+// The note of a run whose editor processes did not exit in time. A live process can still write the stores.
+export function survivorNote(pids: readonly number[]): string {
+  return `The editor processes ${pids.join(', ')} did not exit within ${EDITOR_EXIT_MS / 1000} s of the stop.`;
+}
+
+// Identify the run's editor processes by their isolated profile path before stopping them. Then wait until they exit,
+// and return the ids of the processes that outlive the wait.
+async function stopEditor(profile = USER_DATA): Promise<number[]> {
   const ownership = path.join(
     SCRATCH,
     profile === USER_DATA ? 'process-ownership.json' : 'warm-process-ownership.json',
@@ -892,11 +941,13 @@ function stopEditor(profile = USER_DATA): void {
   if (process.platform === 'win32') {
     const escaped = profile.replaceAll("'", "''");
     const owned = ownership.replaceAll("'", "''");
-    const query = `$profile='${escaped}'; $owned=@(Get-CimInstance Win32_Process -Filter "Name='Code.exe'" | Where-Object { $_.CommandLine -and $_.CommandLine.Contains($profile) }); $owned | Select-Object ProcessId,CreationDate,CommandLine | ConvertTo-Json | Set-Content -LiteralPath '${owned}'; foreach($entry in $owned) { $current=Get-CimInstance Win32_Process -Filter "ProcessId=$($entry.ProcessId)"; if($current -and $current.CreationDate -eq $entry.CreationDate -and $current.CommandLine -eq $entry.CommandLine) { Stop-Process -Id $entry.ProcessId -Force -ErrorAction SilentlyContinue } }`;
-    spawnSync('powershell', ['-NoProfile', '-Command', query], {
-      stdio: 'ignore',
+    const query = `$profile='${escaped}'; $owned=@(Get-CimInstance Win32_Process -Filter "Name='Code.exe'" | Where-Object { $_.CommandLine -and $_.CommandLine.Contains($profile) }); $owned | Select-Object ProcessId,CreationDate,CommandLine | ConvertTo-Json | Set-Content -LiteralPath '${owned}'; foreach($entry in $owned) { $current=Get-CimInstance Win32_Process -Filter "ProcessId=$($entry.ProcessId)"; if($current -and $current.CreationDate -eq $entry.CreationDate -and $current.CommandLine -eq $entry.CommandLine) { Stop-Process -Id $entry.ProcessId -Force -ErrorAction SilentlyContinue; $entry.ProcessId } }`;
+    const stopped = spawnSync('powershell', ['-NoProfile', '-Command', query], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
     });
-    return;
+    const pids = (stopped.stdout ?? '').split(/\s+/).filter(Boolean).map(Number).filter(Number.isSafeInteger);
+    return awaitExit(pids, { alive: aliveProcesses });
   }
   const list = () =>
     spawnSync('ps', ['-eo', 'pid=,lstart=,args='], {
@@ -904,15 +955,18 @@ function stopEditor(profile = USER_DATA): void {
     }).stdout.split('\n');
   const owned = list().filter((line) => line.includes(profile));
   fs.writeFileSync(ownership, JSON.stringify(owned));
+  const pids: number[] = [];
   for (const line of owned) {
     if (!list().includes(line)) continue;
     const pid = Number(line.trim().split(/\s+/)[0]);
     if (Number.isSafeInteger(pid) && pid !== process.pid) {
       try {
         process.kill(pid);
+        pids.push(pid);
       } catch {}
     }
   }
+  return awaitExit(pids, { alive: aliveProcesses });
 }
 
 export async function pollStartup(
@@ -1398,6 +1452,7 @@ async function measure(commandLine: string, workspace: string, options: Options)
   let failure: string | null = null;
   let complete = false;
   let locks: { release(): void } | null = null;
+  const survivors: number[] = [];
   try {
     // A measured launch holds every heavy lane lock, so no heavy test lane overlaps it. The runner waits for each lock
     // like a suite lane does, and refuses to start inside a test run.
@@ -1441,8 +1496,10 @@ async function measure(commandLine: string, workspace: string, options: Options)
           (runRecord.warmUp as { openMs: number | null }).openMs = Date.now() - warmAt;
         }
       } finally {
-        stopEditor(WARM_USER_DATA);
+        survivors.push(...(await stopEditor(WARM_USER_DATA)));
       }
+      // A warm-up process that outlives the wait can still write the store that the measured launch reads.
+      if (survivors.length) return { lines: [], instance: null, complete: false, note: survivorNote(survivors) };
     }
     await awaitMachine(options.minimumFreeGb, 10 * 60_000);
     const memory = new MemoryWatch();
@@ -1486,7 +1543,10 @@ async function measure(commandLine: string, workspace: string, options: Options)
       runRecord.memory = memory.record();
       observation.end('execution');
       observation.begin('cleanup');
-      stopEditor();
+      // The stores and the Temp listing are read only after the editor processes exit, or after the wait ends.
+      survivors.push(...(await stopEditor()));
+      if (survivors.length) complete = false;
+      runRecord.editorSurvivors = survivors;
       runRecord.runner = runnerMeasures({ home: ARC_STORE, tempBefore });
       runRecord.startupRecord = measuredStartupRecord(path.join(ARC_STORE, 'startup'), memory.pid);
       observation.end('cleanup', { descendants: 'unobserved' });
@@ -1687,7 +1747,12 @@ async function main(): Promise<void> {
       }),
     );
     process.stdout.write(`Owned paths and artifacts: ${SCRATCH}\n`);
-    const outcome = await measure(commandLine, options.workspace, options);
+    const measured = await measure(commandLine, options.workspace, options);
+    // A process that outlives the stop can still write the stores, so the runner block is not reliable.
+    const survivors = (runRecord.editorSurvivors ?? []) as number[];
+    const outcome = survivors.length
+      ? { ...measured, complete: false, note: `${survivorNote(survivors)} ${measured.note ?? ''}`.trimEnd() }
+      : measured;
     fs.writeFileSync(
       path.join(SCRATCH, 'result.json'),
       JSON.stringify(

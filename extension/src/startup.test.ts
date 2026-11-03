@@ -309,6 +309,9 @@ import {
   holdUntil,
   holdReading,
   finishHold,
+  awaitExit,
+  survivorNote,
+  EDITOR_EXIT_MS,
   WARM_UP_OPEN_MS,
   WARM_UNTIL_CAP_MS,
   WARM_UNTIL_INTERVAL_MS,
@@ -2120,6 +2123,29 @@ test('a runner measure never replaces a measure of a hold reading', () => {
     () => holdReading(snapshot, () => ({ compressedRows: 0 })),
     /The runner measure compressedRows has the name of a snapshot measure/,
   );
+});
+
+test('the runner waits for the stopped editor processes to exit', async () => {
+  let clock = 0;
+  const wait = async (ms: number) => {
+    clock += ms;
+  };
+  // Process 1 exits before the first probe, and process 2 outlives two probes.
+  const probes: number[][] = [];
+  const exits = [[2], [2], []];
+  const none = await awaitExit([1, 2], {
+    alive: (pids) => {
+      probes.push([...pids]);
+      return exits[probes.length - 1];
+    },
+    now: () => clock,
+    wait,
+  });
+  assert.deepEqual([none, probes.length], [[], 3]);
+  clock = 0;
+  const survivors = await awaitExit([1, 2], { alive: (pids) => [...pids], now: () => clock, wait });
+  assert.deepEqual([survivors, clock], [[1, 2], EDITOR_EXIT_MS]);
+  assert.equal(survivorNote(survivors), 'The editor processes 1, 2 did not exit within 30 s of the stop.');
 });
 
 test('pre-check refuses low disk', () => {
