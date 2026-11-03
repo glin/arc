@@ -101,7 +101,7 @@ function pressFigure(event: KeyboardEvent) {
   }
 }
 
-function WarningSign() {
+export function WarningSign() {
   return h('span', { class: 'statwarningsign', 'aria-hidden': 'true' }, STAT_WARNING_SIGN);
 }
 

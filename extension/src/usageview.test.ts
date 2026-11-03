@@ -100,14 +100,27 @@ const CODEX = usage({
   ],
 });
 
-test('mixed reading times appear in the shared age without per-agent age rows', () => {
-  const claude = usage({ windows: [reading({ readAt: NOW - 12 * 3600_000 })] });
+test('each group names its oldest displayed reading while the footer names the oldest across groups', () => {
+  const claude = usage({
+    windows: [reading({ readAt: NOW - 3600_000 })],
+    spend: spendReading({ readAt: NOW - 3 * 3600_000 }),
+  });
   const codex = usage({ agent: 'codex' });
   const bar = usageBar([claude, codex], NOW)!;
-  assert.equal(bar.age, 'updated 12h ago');
-  for (const group of bar.groups) {
-    assert.equal('age' in group, false);
-  }
+  assert.equal(bar.age, 'updated 3h ago');
+  assert.equal(bar.read, 'updated 3h ago \u00b7 press to read again');
+  assert.deepEqual(
+    bar.groups.map((group) => group.age),
+    ['updated 3h ago', ''],
+  );
+  const mixed = usageBar([claude, usage({ agent: 'codex', windows: [reading({ readAt: NOW - 25 * 60_000 })] })], NOW)!;
+  assert.deepEqual(
+    mixed.groups.map((group) => group.age),
+    ['updated 3h ago', 'updated 25m ago'],
+  );
+  assert.equal(mixed.read, 'updated 3h ago \u00b7 press to read again');
+  const boundary = usage({ agent: 'codex', windows: [reading({ readAt: NOW - USAGE_FRESH_MS })] });
+  assert.equal(usageBar([boundary], NOW)!.groups[0].age, '');
   assert.ok(bar.groups[0].exact);
   assert.notEqual(bar.groups[0].exact, bar.groups[1].exact);
   const book = new UsageBook([claude, codex]);
@@ -120,7 +133,28 @@ test('mixed reading times appear in the shared age without per-agent age rows', 
     readAt: NOW,
   });
   assert.equal(book.bar(NOW)?.age, '');
+  assert.ok(book.bar(NOW)?.groups.every((group) => group.age === ''));
   assert.equal(book.bar(NOW)?.read, 'updated just now · press to read again');
+});
+
+test('failed and empty groups omit the provider prefix while accessible refresh wording keeps it', () => {
+  for (const [agent, label] of [
+    ['claude', 'Claude'],
+    ['codex', 'Codex'],
+  ]) {
+    for (const [phase, text] of [
+      ['failed', 'Usage reading failed'],
+      ['empty', 'No usable usage reading'],
+    ] as const) {
+      const detail = 'Read again to retry.';
+      const bar = usageBar([], NOW, { id: 9, agents: { [agent]: { phase, detail } } })!;
+      assert.equal(bar.groups[0].status, `${text}. ${detail}`);
+      assert.equal(bar.groups[0].age, '');
+      assert.ok(bar.name.includes(`${label}: ${text}. ${detail}`));
+      assert.ok(bar.refresh!.name.includes(`${label}: ${text}. ${detail}`));
+      assert.equal(bar.refresh!.announcement, `${label}: ${text}. ${detail}`);
+    }
+  }
 });
 
 test('usage progress survives absent or expired figures and retains retry after mixed outcomes', () => {
@@ -298,7 +332,7 @@ test('a successful refresh updates figures and reading times without a separate 
   const current = usageBar(book.usages(), NOW + 12 * 3600_000, refresh)!;
   for (const [index, group] of current.groups.entries()) {
     assert.equal(group.status, '');
-    assert.equal('age' in group, false);
+    assert.equal(group.age, '');
     assert.notEqual(group.exact, old.groups[index].exact);
     assert.equal(group.lines[0].percent, 23);
     assert.equal(group.lines[0].resets, 'resets in 4h');

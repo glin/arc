@@ -29,6 +29,7 @@ export interface UsageGroup {
   agent: string;
   label: string;
   plan: string;
+  age: string;
   lines: UsageLine[];
   exact: string;
   status: string;

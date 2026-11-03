@@ -10572,9 +10572,10 @@ test('usage refresh renders busy phases without an action and retains the availa
     composerControlsSource.indexOf('function PickRow('),
   );
   const compiled = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
-  const open = new Function('h', 'CONTEXT_CLASSES', `${compiled}\nreturn UsageOpenView;`)(
+  const open = new Function('h', 'CONTEXT_CLASSES', 'WarningSign', `${compiled}\nreturn UsageOpenView;`)(
     (tag: string, attributes: Record<string, any>, children: unknown) => ({ tag, attributes, children }),
     {},
+    () => null,
   );
   const sent: unknown[] = [];
   const nameExpression = composerControlsSource.match(

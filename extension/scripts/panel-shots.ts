@@ -157,6 +157,8 @@ const LONG_CARD_COST_CHIP = `#list [data-key="${turnKey(FIXTURE_TURNS[LONG_TURN_
 
 export const SHOTS: Shot[] = [
   { name: 'wide', width: 1350 },
+  { name: 'wide-usage-open', width: 1350, click: '.sbrow', escape: true },
+  { name: 'narrow-usage-open', width: 340, click: '.sbrow', escape: true },
   ...(['claude', 'claude-unavailable', 'codex', 'codex-compacted'] as const).flatMap((contextDetail) =>
     [1350, 340].map((width) => ({
       name: `${width === 1350 ? 'wide' : 'narrow'}-composer-context-${contextDetail}`,

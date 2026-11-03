@@ -8,6 +8,7 @@ import type { UsageBar } from '../view/usage.ts';
 import { CONTEXT_CLASSES } from '../view/card-presentation.ts';
 import type { ComposerView, Menu, PanelToHost } from './protocol.ts';
 import { found } from './dom.ts';
+import { WarningSign } from './stat-chip.ts';
 
 const CHOSEN = '\u2713';
 const TWIST = { open: '\u25BE', shut: '\u25B8' };
@@ -65,7 +66,7 @@ function UsageBriefView(props: { brief: UsageBar['briefs'][number] }): Component
   ]);
 }
 
-function UsageOpenView(props: { bar: UsageBar; sendToHost(message: PanelToHost): void }): ComponentChildren {
+export function UsageOpenView(props: { bar: UsageBar; sendToHost(message: PanelToHost): void }): ComponentChildren {
   return h('div', { class: 'sbopen' }, [
     ...props.bar.groups.map((group) =>
       h(
@@ -79,24 +80,49 @@ function UsageOpenView(props: { bar: UsageBar; sendToHost(message: PanelToHost):
         [
           h('div', { class: 'sbhead' }, [
             h('span', {}, group.label),
-            group.plan ? [' ', h('span', { class: 'sbplan' }, group.plan)] : null,
+            group.plan || group.age
+              ? [
+                  ' ',
+                  h(
+                    'span',
+                    { class: 'sbplan', title: group.age ? group.exact : undefined },
+                    [group.plan, group.age].filter(Boolean).join(' \u00b7 '),
+                  ),
+                ]
+              : null,
           ]),
-          group.status ? h('div', { class: 'pickwhy', style: { overflowWrap: 'anywhere' } }, group.status) : null,
-          ...group.lines.map((line) => {
-            const band = line.level ? CONTEXT_CLASSES[line.level] : '';
-            return h('div', { class: 'sbline', key: line.key, title: line.name }, [
-              h('span', { class: 'sblabel' }, line.label),
-              ' ',
-              h(
-                'span',
-                { class: `sbbar${band ? ` ${band}` : ''}`, 'aria-hidden': 'true' },
-                h('i', { style: { width: `${line.fill}%` } }),
-              ),
-              h('span', { class: `sbpct${band ? ` ${band}` : ''}` }, `${line.percent}%`),
-              line.resets ? [' ', h('span', { class: 'sbreset', title: line.resetsExact }, line.resets)] : null,
-              line.detail ? [' ', h('span', { class: 'sbdetail' }, line.detail)] : null,
-            ]);
-          }),
+          group.status ? h('div', { class: 'sbstatus' }, [h(WarningSign, {}), group.status]) : null,
+          !group.lines.length && !group.status ? h('div', { class: 'sbnone' }, 'No usage reading') : null,
+          group.lines.length
+            ? h(
+                'div',
+                { class: 'sbrows' },
+                group.lines.map((line) => {
+                  const band = line.level ? CONTEXT_CLASSES[line.level] : '';
+                  return h(
+                    'div',
+                    {
+                      class: `sbline${line.key.endsWith(':spend') ? ' is-cap' : ''}`,
+                      key: line.key,
+                      title: line.name,
+                    },
+                    [
+                      h('span', { class: 'sblabel' }, line.label),
+                      ' ',
+                      h(
+                        'span',
+                        { class: `sbbar${band ? ` ${band}` : ''}`, 'aria-hidden': 'true' },
+                        h('i', { style: { width: `${line.fill}%` } }),
+                      ),
+                      h('span', { class: `sbpct${band ? ` ${band}` : ''}` }, `${line.percent}%`),
+                      ' ',
+                      h('span', { class: 'sbreset', title: line.resets ? line.resetsExact : undefined }, line.resets),
+                      line.detail ? [' ', h('span', { class: 'sbdetail' }, line.detail)] : null,
+                    ],
+                  );
+                }),
+              )
+            : null,
         ],
       ),
     ),

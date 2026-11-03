@@ -408,9 +408,9 @@ export function usageBar(usages: AgentUsage[], now: number, refresh?: UsageRefre
   const byAgent = new Map(usages.map((u) => [u.agent, u]));
   const briefs: UsageBrief[] = [];
   const groups: UsageGroup[] = [];
-  // The oldest reading among the figures actually drawn. The bar says its age once, so it
-  // must not let a fresh event make an older account cap sound fresh.
+  // The shared age names the oldest displayed reading, including retained account caps.
   let readAt = Number.POSITIVE_INFINITY;
+  const groupStatuses: Record<string, string> = {};
   const statuses = Object.fromEntries(
     Object.entries(refresh?.agents ?? {})
       .filter(([, state]) => !state.superseded && !['discovering', 'excluded'].includes(state.phase))
@@ -426,7 +426,8 @@ export function usageBar(usages: AgentUsage[], now: number, refresh?: UsageRefre
           empty: 'No usable usage reading',
           failed: 'Usage reading failed',
         }[state.phase];
-        return [agent, text ? `${agentLabel(agent)}: ${text}${state.detail ? `. ${state.detail}` : ''}` : ''];
+        groupStatuses[agent] = text ? `${text}${state.detail ? `. ${state.detail}` : ''}` : '';
+        return [agent, text ? `${agentLabel(agent)}: ${groupStatuses[agent]}` : ''];
       }),
   );
   for (const agent of agentOrder([...byAgent.keys(), ...Object.keys(statuses)])) {
@@ -511,9 +512,13 @@ export function usageBar(usages: AgentUsage[], now: number, refresh?: UsageRefre
       agent,
       label,
       plan: usage ? usagePlanLabel(usage) : '',
+      age:
+        Number.isFinite(agentReadAt) && now - agentReadAt > USAGE_FRESH_MS
+          ? `updated ${lengthWord(now - agentReadAt)} ago`
+          : '',
       lines,
       exact: Number.isFinite(agentReadAt) ? new Date(agentReadAt).toLocaleString() : '',
-      status: ['failed', 'empty'].includes(refresh?.agents[agent]?.phase ?? '') ? (statuses[agent] ?? '') : '',
+      status: ['failed', 'empty'].includes(refresh?.agents[agent]?.phase ?? '') ? (groupStatuses[agent] ?? '') : '',
     });
   }
   if (!groups.length) {

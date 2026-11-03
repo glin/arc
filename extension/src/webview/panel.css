@@ -1604,7 +1604,8 @@ button.sessionparent:focus-visible .sessionparenttitle {
   display: inline-block;
   margin-inline-end: 0.3em;
 }
-.chippopwarning {
+.chippopwarning,
+.sbstatus {
   color: var(--warn);
 }
 /* A chip that has crossed a threshold carries its tone in the pill as well as in the text.
@@ -4337,7 +4338,7 @@ button.cctx:hover {
 #usagepop {
   left: 6px;
   bottom: calc(var(--statusbar-height, 0px) + 6px);
-  width: min(300px, calc(100vw - 12px));
+  width: min(282px, calc(100vw - 12px));
 }
 .sbopen {
   display: flex;
@@ -4349,6 +4350,12 @@ button.cctx:hover {
   display: flex;
   flex-direction: column;
   gap: 4px;
+}
+.sbrows {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45em;
+  margin-top: 0.1em;
 }
 .sbhead {
   display: flex;
@@ -4370,10 +4377,24 @@ button.cctx:hover {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  column-gap: 7px;
+  column-gap: 8px;
   row-gap: 2px;
   font-size: var(--t-small);
-  color: var(--idle);
+  color: var(--vscode-foreground);
+}
+.sbline.is-cap {
+  margin-top: 0.25em;
+}
+.sbline .sbbar {
+  flex: 1 1 0;
+  min-width: 0;
+  width: auto;
+  height: 6px;
+}
+.sbline .sbpct {
+  flex: none;
+  min-width: 3ch;
+  text-align: right;
 }
 .sblabel {
   flex: none;
@@ -4397,22 +4418,36 @@ button.cctx:hover {
   background: var(--idle);
 }
 .sbbar.ctx-filling i {
-  background: var(--notice);
+  background: color-mix(in srgb, var(--notice) 55%, transparent);
 }
 .sbbar.ctx-getting-full i {
-  background: var(--warn);
+  background: color-mix(in srgb, var(--warn) 55%, transparent);
 }
 .sbbar.ctx-nearly-full i {
-  background: var(--full);
+  background: color-mix(in srgb, var(--full) 55%, transparent);
 }
 .sbreset {
-  margin-left: auto;
+  flex: none;
+  min-width: 5.8em;
+  text-align: right;
   white-space: nowrap;
+  color: var(--idle);
 }
 .sbdetail {
   margin-left: auto;
   white-space: nowrap;
   font-variant-numeric: tabular-nums;
+  color: var(--idle);
+}
+.sbstatus {
+  margin: 0.1em 0 0.15em;
+  font-size: var(--t-small);
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+.sbnone {
+  font-size: var(--t-small);
+  color: var(--idle);
 }
 /* A figure is only as fresh as the last answer, so the press that reads it again says when
    it last did. */
