@@ -12866,6 +12866,87 @@ test('a Claude session whose running settings refuse the skill opens without it 
   fixture.host.dispose();
 });
 
+// A settings request that Claude Code answers with an error leaves the settings unknown, so the session opens without Arc's plugins like a refusal.
+test('a Claude session whose settings request is answered with an error opens without the skill and takes the prompt', async () => {
+  const fixture = fakeHost();
+  const { plan, withheld, plugin } = preparedSkillPlan();
+  const opening = fixture.host.session('optional', plan);
+  const unreadable = fixture.children[0];
+  assert.deepEqual(fixture.commands[0].slice(-2), ['--plugin-dir', plugin]);
+  unreadable.answerControl('initialize', {
+    claude_code_version: '2.1.312',
+    commands: [{ name: 'arc-session-tools:arc-sessions' }],
+  });
+  await vi.waitFor(() =>
+    assert.ok(unreadable.sent().some((message) => (message.request as any)?.subtype === 'get_settings')),
+  );
+  unreadable.rejectControl('get_settings', 'settings.json: {"env":{"ANTHROPIC_API_KEY":"sk-ant-secret-value"}}');
+  await vi.waitFor(() => assert.equal(unreadable.ended, true));
+  unreadable.exit(0);
+  unreadable.close();
+  await vi.waitFor(() => assert.equal(fixture.children.length, 2));
+  const child = fixture.children[1];
+  assert.equal(fixture.commands[1].includes('--plugin-dir'), false);
+  assert.deepEqual(fixture.commands[1], fixture.commands[0].slice(0, -2));
+  child.answerControl('initialize', { claude_code_version: '2.1.312', commands: [] });
+  const session = await opening;
+  assert.equal(session.state().ready, true);
+  assert.equal(session.state().lastError, null);
+  await session.prompt('hello');
+  assert.equal(
+    unreadable.sent().some((message) => message.type === 'user'),
+    false,
+  );
+  assert.deepEqual(
+    child
+      .sent()
+      .filter((message) => message.type === 'user')
+      .map((message) => message.message),
+    [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
+  );
+  assert.deepEqual(
+    withheld.map(({ stage, withheld, error, method }) => ({ stage, withheld, error, method })),
+    [
+      {
+        stage: 'running',
+        withheld: { skill: 'settings-unreadable' },
+        error: 'Claude Code did not return its settings.',
+        method: 'get_settings',
+      },
+    ],
+  );
+  assert.doesNotMatch(JSON.stringify([withheld, fixture.states]), /sk-ant-secret-value/);
+  child.exit(0);
+  child.close();
+  await session.dispose();
+  fixture.host.dispose();
+});
+
+// A child that exits during its settings request is no answer from Claude Code, so the opening fails without a second child.
+test('a Claude child that exits during its settings request fails the opening without a replacement', async () => {
+  const fixture = fakeHost();
+  const { plan } = preparedSkillPlan();
+  const opening = fixture.host.session('optional', plan);
+  const failing = fixture.children[0];
+  failing.answerControl('initialize', {
+    claude_code_version: '2.1.312',
+    commands: [{ name: 'arc-session-tools:arc-sessions' }],
+  });
+  await vi.waitFor(() =>
+    assert.ok(failing.sent().some((message) => (message.request as any)?.subtype === 'get_settings')),
+  );
+  failing.exit(1);
+  failing.close();
+  const session = await opening;
+  assert.equal(session.state().ready, false);
+  assert.equal(session.state().exited, true);
+  assert.match(session.state().lastError ?? '', /the agent stopped with code 1/);
+  assert.doesNotMatch(session.state().lastError ?? '', /settings/);
+  assert.equal(fixture.children.length, 1);
+  assert.equal(fixture.commands.length, 1);
+  fixture.host.dispose();
+});
+
 // A model pick made while the refused child opens waits for the opening, then reaches the child that replaced it.
 test('a model change during a refused Claude opening reaches the replacement child', async () => {
   const { fixture, opening, refused } = await refusedSkillOpening();

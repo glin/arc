@@ -42,7 +42,7 @@ export interface SessionComponentsWithheld {
 
 export const SESSION_COMPONENTS_WITHHELD = 'sessionComponentsWithheld';
 
-// A running Claude child refused the session plugins it loaded, after recording the refusal.
+// A running Claude child refused the session plugins it loaded, or answered its settings request with an error, after recording the withheld reason.
 // The child can still run the session once it starts again without those plugins.
 export class SessionComponentsRefused extends Error {}
 

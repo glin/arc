@@ -499,6 +499,9 @@ function sameBridgeEpoch(event: number | null, connection: number | null): boole
   return event === null || connection === null || event === connection;
 }
 
+// The child answered a control request with an error response.
+class ControlRefused extends Error {}
+
 class ControlDeadline extends Error {
   constructor() {
     super('the agent did not answer');
@@ -718,9 +721,12 @@ export class ClaudeWire {
       try {
         settings = await this.request({ subtype: 'get_settings' });
       } catch (error) {
-        // The child's error text can quote settings content, so the record keeps only Arc's message.
-        this.withheld('settings-unreadable', 'Claude Code did not return its settings.', 'get_settings');
-        throw error;
+        // The child's error text can quote settings content, so the record and the refusal keep only Arc's message.
+        const unreadable = 'Claude Code did not return its settings.';
+        this.withheld('settings-unreadable', unreadable, 'get_settings');
+        // An error answer refuses the plugins like known settings do, so a live session opening reopens without them.
+        // An exit, a closed pipe, a failed send, a cancellation, and a timeout keep their own error.
+        throw error instanceof ControlRefused ? new SessionComponentsRefused(unreadable) : error;
       }
       const skill = this.sessionSkills?.skill !== false ? claudeNativeSkillSettingsRefusal(settings) : undefined;
       const hooks = this.sessionSkills?.hooks ? claudeNativeSkillSettingsRefusal(settings, 'hooks') : undefined;
@@ -1737,7 +1743,7 @@ export class ClaudeWire {
     }
     if (str(response.subtype) === 'success') {
       waiting.resolve(obj(response.response) ?? {});
-    } else waiting.reject(new Error(str(response.error) ?? 'the agent refused the request'));
+    } else waiting.reject(new ControlRefused(str(response.error) ?? 'the agent refused the request'));
   }
 
   // Removes one pending control request and clears its deadline timer.
