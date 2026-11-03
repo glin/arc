@@ -1199,7 +1199,7 @@ function buckets(value: unknown): ProjectUsageBucket[] | null {
 function spendRecord(
   value: unknown,
   workspace: string,
-  currentParserGeneration: number,
+  currentParser: (kind: unknown, generation: unknown) => boolean,
   normalizeFile: (file: string) => string,
 ): SpendFileIndex | null {
   if (
@@ -1330,10 +1330,10 @@ function spendRecord(
       return null;
     }
   }
-  const currentParser = value.parserGeneration === currentParserGeneration;
   const parserKind = value.parserKind;
+  const current = currentParser(parserKind, value.parserGeneration);
   if (
-    currentParser &&
+    current &&
     parserKind !== undefined &&
     value.missingAt === undefined &&
     !parserState(value.parserState, parserKind)
@@ -1341,14 +1341,13 @@ function spendRecord(
     return null;
   }
   if (
-    currentParser &&
+    current &&
     parserKind !== undefined &&
     value.parserState !== undefined &&
     !parserState(value.parserState, parserKind)
   ) {
     return null;
   }
-  const persistedParserGeneration = currentParser && parserKind === undefined ? 0 : value.parserGeneration;
   return {
     file: normalizeFile(value.file),
     workspace: value.workspace,
@@ -1371,14 +1370,12 @@ function spendRecord(
     ...(typeof value.cacheExpiryChildPolicy === 'boolean'
       ? { cacheExpiryChildPolicy: value.cacheExpiryChildPolicy }
       : {}),
-    ...(persistedParserGeneration === undefined ? {} : { parserGeneration: persistedParserGeneration }),
+    ...(value.parserGeneration === undefined ? {} : { parserGeneration: value.parserGeneration }),
     ...(parserKind === undefined ? {} : { parserKind }),
     indexedAt: value.indexedAt,
     ...(typeof value.sourceIdentity === 'string' ? { sourceIdentity: value.sourceIdentity } : {}),
-    ...(currentParser && parserKind !== undefined && value.parserState !== undefined
-      ? { parserState: value.parserState }
-      : {}),
-    ...(currentParser && value.claudeRepeated !== undefined ? { claudeRepeated: value.claudeRepeated } : {}),
+    ...(current && value.parserState !== undefined ? { parserState: value.parserState } : {}),
+    ...(current && value.claudeRepeated !== undefined ? { claudeRepeated: value.claudeRepeated } : {}),
     ...(value.complete === undefined ? {} : { complete: value.complete }),
     ...(value.scanOffset === undefined ? {} : { scanOffset: value.scanOffset }),
     ...(value.pendingBytes === undefined ? {} : { pendingBytes: value.pendingBytes }),
@@ -1389,7 +1386,7 @@ function spendRecord(
 export function parseSpendLedger(
   value: unknown,
   workspace: string,
-  currentParserGeneration: number,
+  currentParser: (kind: unknown, generation: unknown) => boolean,
   normalizeFile: (file: string) => string,
 ): SpendLedger | null {
   if (!record(value) || value.workspace !== workspace || !Array.isArray(value.files)) {
@@ -1399,7 +1396,7 @@ export function parseSpendLedger(
   if (!nonNegativeInteger(parserGeneration)) {
     return null;
   }
-  const parsedByIndex = value.files.map((item) => spendRecord(item, workspace, currentParserGeneration, normalizeFile));
+  const parsedByIndex = value.files.map((item) => spendRecord(item, workspace, currentParser, normalizeFile));
   const files: SpendFileIndex[] = [];
   const fileNames = new Set<string>();
   for (let index = 0; index < parsedByIndex.length; index++) {
@@ -1429,7 +1426,7 @@ export function parseSpendLedger(
         if (!nonNegativeInteger(entry) || entry >= parsedByIndex.length || !addComplete(parsedByIndex[entry])) {
           return null;
         }
-      } else if (!addComplete(spendRecord(entry, workspace, currentParserGeneration, normalizeFile))) {
+      } else if (!addComplete(spendRecord(entry, workspace, currentParser, normalizeFile))) {
         return null;
       }
     }
@@ -1438,7 +1435,7 @@ export function parseSpendLedger(
       return null;
     }
     for (const entry of value.completeFiles) {
-      const item = spendRecord(entry, workspace, currentParserGeneration, normalizeFile);
+      const item = spendRecord(entry, workspace, currentParser, normalizeFile);
       if (item && !completeNames.has(item.file)) {
         addComplete(item);
       }

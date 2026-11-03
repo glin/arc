@@ -179,7 +179,6 @@ import { formatWhen } from './turnformat.ts';
 import { agentRunAnswer, railCacheMarkOf } from './turnrail.ts';
 import { resumeCommand } from './domain/resume.ts';
 import {
-  PROJECT_SPEND_PARSER_GENERATION,
   aggregateUsageEvents,
   indexSpendFile,
   loadSpendLedger,
@@ -9227,7 +9226,7 @@ test('a delayed copied turn context retracts its compaction from the session and
   assert.equal(loaded.compactionCount, 0);
   assert.equal((loaded.parserState as ReturnType<typeof usage.snapshot>).recentCompactions.length, 0);
   const rebuilt = indexSpendFile(
-    { ...loaded, parserGeneration: PROJECT_SPEND_PARSER_GENERATION - 1 },
+    { ...loaded, parserGeneration: 0 },
     ledgerFile,
     'workspace',
     createCodexUsageLineReducer,

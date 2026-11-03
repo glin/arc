@@ -127,7 +127,7 @@ import {
   projectSpendHistoryCutoff,
   projectSpendOfferDecision,
   projectSpendSourceOfferDue,
-  PROJECT_SPEND_PARSER_GENERATION,
+  PROJECT_SPEND_PARSER_GENERATIONS,
   PROJECT_SPEND_SAVE_MAX_MS,
   PROJECT_SPEND_SAVE_MS,
   PROJECT_SPEND_SAVE_RETRIES,
@@ -15871,6 +15871,7 @@ test('a source of long lines leaves the queue front after each line, and one rec
       createCodexUsageLineReducer: (state: number | undefined) => {
         let lines = state ?? 0;
         return {
+          parserKind: 'codex' as const,
           pushLine: () => {
             lines++;
             return [];
@@ -16215,7 +16216,8 @@ test('running agents that only grow their transcripts start no refresh from a sp
               newestTurnStartedAt: null,
               outcome: null,
               cacheExpiry: null,
-              parserGeneration: PROJECT_SPEND_PARSER_GENERATION,
+              parserGeneration: PROJECT_SPEND_PARSER_GENERATIONS.claude,
+              parserKind: 'claude' as const,
             },
             stateChanged: true,
             complete: true,

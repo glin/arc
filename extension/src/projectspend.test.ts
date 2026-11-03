@@ -19,7 +19,8 @@ import path from 'node:path';
 import {
   PROJECT_SPEND_INTEGRITY_MILLISECONDS,
   PROJECT_SPEND_HELD_LINE_BYTES,
-  PROJECT_SPEND_PARSER_GENERATION,
+  PROJECT_SPEND_PARSER_GENERATIONS,
+  spendParserCurrent,
   spendRecordHoldsLongLine,
   sessionCacheFactsBySession,
   SessionFiguresCache,
@@ -959,7 +960,8 @@ describe('Project cost history limit', () => {
     newestTurnStartedAt: null,
     outcome: null,
     cacheExpiry: undefined,
-    parserGeneration: PROJECT_SPEND_PARSER_GENERATION,
+    parserGeneration: PROJECT_SPEND_PARSER_GENERATIONS.claude,
+    parserKind: 'claude',
     ...more,
   });
   const offers = (cutoff: number | null) => [
@@ -1222,7 +1224,7 @@ test('a linked Claude result is used only when its direct transcript is absent',
     buckets,
     lifetimeBuckets: buckets,
     turnCount: 1,
-    parserGeneration: PROJECT_SPEND_PARSER_GENERATION,
+    parserGeneration: PROJECT_SPEND_PARSER_GENERATIONS.claude,
     parserKind,
     indexedAt: at,
     complete: true,
@@ -1544,7 +1546,7 @@ test('a completed Claude child turn supplies lifetime timing and outcome facts',
     lastTurnAt: null,
     newestTurnStartedAt: null,
     outcome: null,
-    parserGeneration: PROJECT_SPEND_PARSER_GENERATION - 1,
+    parserGeneration: 0,
   };
   const rebuilt = indexSpendFile(stale, file, 'w', makeChildReducer, 2);
   assert.equal(rebuilt.rebuilt, true);
@@ -1724,7 +1726,7 @@ test('a ledger save writes the whole ledger in pieces under 1 MiB', () => {
   records[8] = spendRecord('long-odd.jsonl', { trailing: `a${'😀'.repeat(300_000)}` });
   const expected =
     `{"workspace":${JSON.stringify(normalizeWorkspace('one'))}` +
-    `,"parserGeneration":${PROJECT_SPEND_PARSER_GENERATION}` +
+    `,"parserGeneration":${PROJECT_SPEND_PARSER_GENERATIONS.claude}` +
     `,"files":[${records.map((record) => JSON.stringify(record)).join(',')}]` +
     `,"displayFiles":[${records.map((_, at) => at).join(',')}]}`;
   const writes: number[] = [];
@@ -1802,7 +1804,7 @@ test('a valid ledger restores canonical record paths without resolving them agai
   const records = sources.map((source) =>
     spendRecord(source, {
       file: normalizeSpendFile(source),
-      parserGeneration: PROJECT_SPEND_PARSER_GENERATION,
+      parserGeneration: PROJECT_SPEND_PARSER_GENERATIONS.claude,
       complete: true,
     }),
   );
@@ -1923,7 +1925,7 @@ const ledgerText = (folder: string): string => fs.readFileSync(path.join(folder,
 test('persistence accepts one complete Codex usage snapshot and rejects malformed counter arrays', () => {
   const validSnapshot = { turnId: 'turn-1', last: [1, 2, 3, 4, 5, 6], total: [7, 8, 9, 10, 11, 12] };
   const savedRecord = spendRecord('snapshot.jsonl', {
-    parserGeneration: PROJECT_SPEND_PARSER_GENERATION,
+    parserGeneration: PROJECT_SPEND_PARSER_GENERATIONS.codex,
     parserKind: 'codex',
     parserState: { ...emptyCodexUsageReducerState(), lastUsageSnapshot: validSnapshot },
   });
@@ -1950,7 +1952,7 @@ test('persistence accepts one complete Codex usage snapshot and rejects malforme
 test('persistence keeps a withdrawn Claude command turn and rejects a damaged one', () => {
   const turn = { open: true, answered: false, startedAt: 2000, endedAt: 3000, firstTurnAt: 1000, outcome: null };
   const savedRecord = spendRecord('withdrawn.jsonl', {
-    parserGeneration: PROJECT_SPEND_PARSER_GENERATION,
+    parserGeneration: PROJECT_SPEND_PARSER_GENERATIONS.claude,
     parserKind: 'claude',
     parserState: {
       ...emptyClaudeUsageReducerState(),
@@ -1989,7 +1991,7 @@ function malformedSpendFixture() {
   const valid = spendRecord('valid.jsonl', {
     buckets,
     lifetimeBuckets: buckets,
-    parserGeneration: PROJECT_SPEND_PARSER_GENERATION,
+    parserGeneration: PROJECT_SPEND_PARSER_GENERATIONS.claude,
     parserKind: 'claude',
     parserState: emptyClaudeUsageReducerState(),
     complete: true,
@@ -2299,7 +2301,7 @@ function duplicateSpendFixture() {
   const valid = spendRecord('valid.jsonl', {
     buckets: [bucket],
     lifetimeBuckets: [bucket],
-    parserGeneration: PROJECT_SPEND_PARSER_GENERATION,
+    parserGeneration: PROJECT_SPEND_PARSER_GENERATIONS.claude,
     parserKind: 'claude',
     parserState: emptyClaudeUsageReducerState(),
     complete: true,
@@ -2388,7 +2390,7 @@ test('a saved Claude index withdraws a local command whose answer arrives after 
   );
   const folder = dir();
   const saved = spendRecord('local-command.jsonl', {
-    parserGeneration: PROJECT_SPEND_PARSER_GENERATION,
+    parserGeneration: PROJECT_SPEND_PARSER_GENERATIONS.claude,
     parserKind: 'claude',
     parserState: indexed.snapshot(),
   });
@@ -2417,7 +2419,7 @@ test('a saved Claude index withdraws a local command whose answer arrives after 
   // answers the prompt before it and clears the stop the answer gave that prompt.
   saveSpendLedger(folder, 'one', [
     spendRecord('local-command.jsonl', {
-      parserGeneration: PROJECT_SPEND_PARSER_GENERATION,
+      parserGeneration: PROJECT_SPEND_PARSER_GENERATIONS.claude,
       parserKind: 'claude',
       parserState: resumed.snapshot(),
     }),
@@ -2447,7 +2449,7 @@ test('a record both ledgers share is written once, and a differing one is writte
   const folder = dir();
   const shared = [0, 1, 2, 3].map((at) =>
     spendRecord(`shared-${at}.jsonl`, {
-      parserGeneration: PROJECT_SPEND_PARSER_GENERATION,
+      parserGeneration: PROJECT_SPEND_PARSER_GENERATIONS.claude,
       parserKind: 'claude',
       parserState: {
         ...emptyClaudeUsageReducerState(),
@@ -2525,7 +2527,7 @@ test('a ledger written before the display ledger was shared still loads whole', 
     path.join(folder, ledgerName(folder)),
     JSON.stringify({
       workspace: loadSpendLedger(folder, 'one').workspace,
-      parserGeneration: PROJECT_SPEND_PARSER_GENERATION,
+      parserGeneration: PROJECT_SPEND_PARSER_GENERATIONS.claude,
       files: [rescanning],
       completeFiles: [whole],
     }),
@@ -2535,23 +2537,111 @@ test('a ledger written before the display ledger was shared still loads whole', 
   const loaded = loadSpendLedger(folder, 'one');
   assert.equal(
     loaded.parserGeneration,
-    PROJECT_SPEND_PARSER_GENERATION,
+    PROJECT_SPEND_PARSER_GENERATIONS.claude,
     'an older file reads at the current generation, so nothing rebuilds',
   );
   assert.deepEqual(loaded.files, [rescanning]);
   assert.deepEqual(loaded.completeFiles, [whole], 'the older array still names the display ledger');
 });
 
+test('saved shared generation 65 keeps unchanged Claude reductions and rebuilds Codex reductions', () => {
+  const folder = dir();
+  const at = '2026-11-01T10:00:00.000Z';
+  const claudeFile = path.join(folder, 'claude.jsonl');
+  fs.writeFileSync(
+    claudeFile,
+    [
+      { type: 'user', timestamp: at, message: { role: 'user', content: 'Read the inputs' } },
+      {
+        type: 'assistant',
+        timestamp: at,
+        requestId: 'request-1',
+        message: {
+          id: 'message-1',
+          role: 'assistant',
+          model: 'claude-sonnet-5-5',
+          content: [{ type: 'text', text: 'Done' }],
+          usage: { input_tokens: 100, output_tokens: 10 },
+        },
+      },
+    ]
+      .map((record) => JSON.stringify(record))
+      .join('\n') + '\n',
+  );
+  const codexFile = path.join(folder, 'codex.jsonl');
+  fs.writeFileSync(
+    codexFile,
+    [
+      { type: 'session_meta', timestamp: at, payload: { id: 'codex', model_provider: 'openai' } },
+      { type: 'event_msg', timestamp: at, payload: { type: 'task_started', turn_id: 'turn' } },
+      { type: 'turn_context', timestamp: at, payload: { turn_id: 'turn', model: 'gpt-6.1-terra' } },
+      {
+        type: 'event_msg',
+        timestamp: at,
+        payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 1000, output_tokens: 100 } } },
+      },
+    ]
+      .map((record) => JSON.stringify(record))
+      .join('\n') + '\n',
+  );
+  const claude = indexSpendFile(undefined, claudeFile, 'w', createClaudeUsageLineReducer, 1).record;
+  const codex = indexSpendFile(undefined, codexFile, 'w', createCodexUsageLineReducer, 1).record;
+  assert.equal(claude.parserKind, 'claude');
+  assert.equal(codex.parserKind, 'codex');
+  const reload = (records: SpendFileIndex[]) => {
+    saveSpendLedger(folder, 'w', records);
+    return new Map(loadSpendLedger(folder, 'w').files.map((record) => [record.file, record]));
+  };
+  const earlier = reload([
+    { ...claude, parserGeneration: 65 },
+    { ...codex, parserGeneration: 65 },
+  ]);
+  const savedClaude = earlier.get(claude.file)!;
+  const savedCodex = earlier.get(codex.file)!;
+  assert.ok(savedClaude.parserState, 'a compatible Claude record lost its parser state');
+  assert.equal(savedCodex.parserState, undefined, 'an earlier Codex record kept its parser state');
+  const keptClaude = indexSpendFile(savedClaude, claudeFile, 'w', createClaudeUsageLineReducer, 2);
+  assert.equal(keptClaude.rebuilt, false);
+  assert.equal(keptClaude.changed, false);
+  assert.equal(keptClaude.record, savedClaude, 'an unchanged Claude source was read again');
+  assert.equal(keptClaude.record.parserGeneration, 65);
+  const rebuiltCodex = indexSpendFile(savedCodex, codexFile, 'w', createCodexUsageLineReducer, 2);
+  assert.equal(rebuiltCodex.rebuilt, true);
+  assert.equal(rebuiltCodex.record.parserGeneration, PROJECT_SPEND_PARSER_GENERATIONS.codex);
+  assert.deepEqual(rebuiltCodex.record.buckets, codex.buckets);
+  const current = reload([
+    { ...claude, parserGeneration: PROJECT_SPEND_PARSER_GENERATIONS.claude },
+    { ...codex, parserGeneration: PROJECT_SPEND_PARSER_GENERATIONS.codex },
+  ]);
+  for (const [record, file, reducer] of [
+    [current.get(claude.file)!, claudeFile, createClaudeUsageLineReducer],
+    [current.get(codex.file)!, codexFile, createCodexUsageLineReducer],
+  ] as const) {
+    assert.ok(record.parserState);
+    assert.equal(indexSpendFile(record, file, 'w', reducer as UsageReducerFactory, 2).record, record);
+  }
+  // A generation that no writer mapping names rebuilds both agents.
+  const unknown = reload([
+    { ...claude, parserGeneration: 64 },
+    { ...codex, parserGeneration: PROJECT_SPEND_PARSER_GENERATIONS.codex + 1 },
+  ]);
+  assert.equal(
+    indexSpendFile(unknown.get(claude.file), claudeFile, 'w', createClaudeUsageLineReducer, 2).rebuilt,
+    true,
+  );
+  assert.equal(indexSpendFile(unknown.get(codex.file), codexFile, 'w', createCodexUsageLineReducer, 2).rebuilt, true);
+});
+
 test('a current parser snapshot without a source kind rebuilds instead of resuming ambiguously', () => {
   const folder = dir();
   const record = spendRecord('source.jsonl', {
-    parserGeneration: PROJECT_SPEND_PARSER_GENERATION,
+    parserGeneration: PROJECT_SPEND_PARSER_GENERATIONS.claude,
     parserState: emptyClaudeUsageReducerState(),
   });
   saveSpendLedger(folder, 'one', [record]);
 
   const loaded = loadSpendLedger(folder, 'one').files[0];
-  assert.equal(loaded.parserGeneration, 0);
+  assert.equal(spendParserCurrent(loaded.parserKind, loaded.parserGeneration), false);
   assert.equal(loaded.parserState, undefined);
 });
 
@@ -2571,7 +2661,7 @@ test('saving trims a retained request window written under a larger limit', () =
   const buckets = aggregateUsageEvents([event(1)]);
   const record = spendRecord('child.jsonl', {
     buckets,
-    parserGeneration: PROJECT_SPEND_PARSER_GENERATION,
+    parserGeneration: PROJECT_SPEND_PARSER_GENERATIONS.claude,
     parserKind: 'claude',
     parserState: {
       seenRequestKeys: keys,
@@ -2967,7 +3057,7 @@ describe('a dispatched session in lifetime cost', () => {
       newestTurnStartedAt: at,
       outcome: null,
       cacheExpiry: undefined,
-      parserGeneration: PROJECT_SPEND_PARSER_GENERATION,
+      parserGeneration: PROJECT_SPEND_PARSER_GENERATIONS.claude,
     };
   };
   const records = [
@@ -4138,16 +4228,19 @@ test('an older parser generation rebuilds an unchanged source once', () => {
   const file = path.join(folder, 'source.jsonl');
   fs.writeFileSync(file, JSON.stringify(event(stamp('2026-08-31T10:00:00'))) + '\n');
   const current = indexSpendFile(undefined, file, 'w', reducer, 1).record;
-  const legacy = { ...current, parserGeneration: PROJECT_SPEND_PARSER_GENERATION - 1 };
+  const legacy = { ...current, parserGeneration: 0 };
   const rebuilt = indexSpendFile(legacy, file, 'w', reducer, 2);
   assert.equal(spendRecordHasLifetimeFacts(legacy), false);
   assert.equal(rebuilt.rebuilt, true);
-  assert.equal(rebuilt.record.parserGeneration, PROJECT_SPEND_PARSER_GENERATION);
+  assert.equal(rebuilt.record.parserGeneration, PROJECT_SPEND_PARSER_GENERATIONS.claude);
   assert.equal(rebuilt.stateChanged, true);
   assert.equal(indexSpendFile(rebuilt.record, file, 'w', reducer, 3).rebuilt, false);
 
   saveSpendLedger(folder, 'w', [rebuilt.record]);
-  assert.equal(loadSpendLedger(folder, 'w').parserGeneration, PROJECT_SPEND_PARSER_GENERATION);
+  assert.equal(
+    loadSpendLedger(folder, 'w').parserGeneration,
+    Math.max(PROJECT_SPEND_PARSER_GENERATIONS.claude, PROJECT_SPEND_PARSER_GENERATIONS.codex),
+  );
 });
 
 test('Codex append indexing preserves retained checkpoint outcomes and display persistence', () => {
@@ -5366,6 +5459,12 @@ test('GPT-6.1 Sol and Terra rebuild saved unpriced requests without treating two
   ] as const) {
     const folder = dir();
     const file = path.join(folder, 'bedrock-sol.jsonl');
+    // Codex records of shared generation 65 predate Terra Bedrock pricing.
+    const codexReducer: UsageReducerFactory = () => ({
+      ...reducer(undefined),
+      parserKind: 'codex',
+      snapshot: () => emptyCodexUsageReducerState(),
+    });
     const events = [100_000, 100_000, 150_000].map((input, index) =>
       event(stamp(`2026-10-01T1${index}:00:00`), {
         agent: 'codex',
@@ -5382,7 +5481,7 @@ test('GPT-6.1 Sol and Terra rebuild saved unpriced requests without treating two
       }),
     );
     fs.writeFileSync(file, events.map((request) => JSON.stringify(request)).join('\n') + '\n');
-    const current = indexSpendFile(undefined, file, 'w', reducer, 1).record;
+    const current = indexSpendFile(undefined, file, 'w', codexReducer, 1).record;
     const unbanded = {
       ...current.buckets[0],
       contextBand: null,
@@ -5405,16 +5504,16 @@ test('GPT-6.1 Sol and Terra rebuild saved unpriced requests without treating two
     const loaded = loadSpendLedger(storage, 'w').files[0];
     assert.ok(loaded);
     assert.equal(loaded.offset, loaded.size);
-    const upgraded = indexSpendFile(loaded, file, 'w', reducer, 2);
+    const upgraded = indexSpendFile(loaded, file, 'w', codexReducer, 2);
     assert.equal(upgraded.rebuilt, true);
-    assert.equal(upgraded.record.parserGeneration, PROJECT_SPEND_PARSER_GENERATION);
+    assert.equal(upgraded.record.parserGeneration, PROJECT_SPEND_PARSER_GENERATIONS.codex);
     assert.equal(upgraded.record.buckets.find((bucket) => bucket.contextBand === 'short')?.requests, 2);
     assert.equal(upgraded.record.buckets.find((bucket) => bucket.contextBand === 'long')?.requests, 1);
     saveSpendLedger(storage, 'w', [upgraded.record]);
     const restored = loadSpendLedger(storage, 'w').files[0];
     const dollars = restored.buckets.reduce((sum, bucket) => sum + publicProjectSpendPrice(bucket)!.dollars, 0);
     assert.ok(Math.abs(dollars - expected) < 1e-12);
-    assert.equal(indexSpendFile(restored, file, 'w', reducer, 3).rebuilt, false);
+    assert.equal(indexSpendFile(restored, file, 'w', codexReducer, 3).rebuilt, false);
   }
 });
 
@@ -6015,7 +6114,7 @@ test('generation 34 zero-return Bedrock ledgers rebuild and persist corrected fa
     assert.equal(fs.statSync(file).mtimeMs, before.mtimeMs);
     saveSpendLedger(folder, 'w', [rebuilt.record]);
     const persisted = loadSpendLedger(folder, 'w').files[0];
-    assert.equal(persisted.parserGeneration, PROJECT_SPEND_PARSER_GENERATION);
+    assert.equal(persisted.parserGeneration, PROJECT_SPEND_PARSER_GENERATIONS.codex);
     assert.equal(persisted.cacheExpiry?.facts.counts['30m'], 1);
     assert.equal(persisted.cacheExpiry?.carry?.lifetime, '30m');
     assert.equal(indexSpendFile(persisted, file, 'w', createCodexUsageLineReducer, 3).rebuilt, false);
@@ -6877,6 +6976,23 @@ describe('Claude background cost accounting', () => {
     const invalidated = invalidateClaudeCostSupplements(fixture.records, late);
     assert.equal(invalidated[0].costStateSupplement, undefined);
     assert.equal(tokens(invalidated[1].lifetimeBuckets!), 100);
+  });
+
+  test('a supplement saved at shared generation 65 survives until a contributor rebuilds', () => {
+    const fixture = indexCompactionSession([clock(), snapshot(120)], [answer('a', at, 100, true)]);
+    fixture.records.forEach((record, index) => (fixture.records[index] = { ...record, parserGeneration: 65 }));
+    const identity = replay(fixture).supplement!.identity;
+    const [parent, child] = fixture.records;
+    assert.equal(
+      invalidateClaudeCostSupplements(fixture.records, fixture.sources)[0].costStateSupplement?.identity,
+      identity,
+    );
+    const rebuiltChild = [parent, { ...child, parserGeneration: PROJECT_SPEND_PARSER_GENERATIONS.claude }];
+    assert.equal(invalidateClaudeCostSupplements(rebuiltChild, fixture.sources)[0].costStateSupplement, undefined);
+    // A Codex contributor of shared generation 65 rebuilds, so the parent has no current dependency set.
+    const codexChild = [parent, { ...child, parserKind: 'codex' as const }];
+    assert.equal(claudeCostStateDependencies(fixture.sources[0], fixture.sources, codexChild), null);
+    assert.equal(invalidateClaudeCostSupplements(codexChild, fixture.sources)[0].costStateSupplement, undefined);
   });
 
   test('native grandchildren and a child accounting owner each contribute once', () => {

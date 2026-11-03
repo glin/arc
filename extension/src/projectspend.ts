@@ -518,9 +518,37 @@ export const PROJECT_SPEND_SAVE_RETRIES = 5;
 export function projectSpendSaveRetryDelay(retries: number): number | null {
   return retries < PROJECT_SPEND_SAVE_RETRIES ? PROJECT_SPEND_SAVE_RETRY_MS * 2 ** retries : null;
 }
-// Saved source records require a rebuild when their parser generation differs.
-// Increase this when a stored field changes the conclusions consumers draw from it.
-export const PROJECT_SPEND_PARSER_GENERATION = 66;
+// Saved source records require a rebuild when the parser generation of their agent differs.
+// Increase an agent's generation when a stored field of its records changes the conclusions consumers draw from it.
+// Increase both generations for a change that alters both agents' records.
+export const PROJECT_SPEND_PARSER_GENERATIONS: Readonly<Record<'claude' | 'codex', number>> = { claude: 66, codex: 66 };
+
+// Earlier shared generations whose records of one agent match that agent's generation.
+// Shared generation 66 changed only Codex pricing, so Claude records of generation 65 match Claude generation 66.
+// A later bump of one agent's generation stops accepting that agent's earlier records.
+export const PROJECT_SPEND_PARSER_IMPORTS: Readonly<Record<'claude' | 'codex', Readonly<Record<number, number>>>> = {
+  claude: { 65: 66 },
+  codex: {},
+};
+
+// The generation a reducer of this kind writes. A record of an unknown kind matches no generation.
+export function spendParserGeneration(kind: 'claude' | 'codex' | undefined): number {
+  return kind === undefined ? 0 : PROJECT_SPEND_PARSER_GENERATIONS[kind];
+}
+
+// Whether a saved record of this kind and generation holds current facts.
+// A record keeps the generation it was written with, so cost-state dependencies of unchanged sources keep their identity.
+export function spendParserCurrent(kind: unknown, generation: unknown): boolean {
+  if (kind !== 'claude' && kind !== 'codex') return false;
+  const current = PROJECT_SPEND_PARSER_GENERATIONS[kind];
+  return generation === current || PROJECT_SPEND_PARSER_IMPORTS[kind][generation as number] === current;
+}
+
+// The ledger header generation. Readers ignore its value, and older readers require a nonnegative integer.
+const PROJECT_SPEND_LEDGER_GENERATION = Math.max(
+  PROJECT_SPEND_PARSER_GENERATIONS.claude,
+  PROJECT_SPEND_PARSER_GENERATIONS.codex,
+);
 
 export function projectSpendSourceOfferDue(listingMoved: boolean, now: number, lastOfferAt: number): boolean {
   return listingMoved || now - lastOfferAt >= PROJECT_SPEND_INTEGRITY_MILLISECONDS;
@@ -661,7 +689,7 @@ export function spendRecordHasLifetimeFacts(record: SpendFileIndex): boolean {
     readyTimestamp(record.lastTurnAt) &&
     readyTimestamp(record.newestTurnStartedAt) &&
     readyOutcome(record.outcome) &&
-    record.parserGeneration === PROJECT_SPEND_PARSER_GENERATION
+    spendParserCurrent(record.parserKind, record.parserGeneration)
   );
 }
 
@@ -2183,7 +2211,7 @@ export function indexSpendFile<State>(
     outcome: reducer.newestTurnOutcome?.() ?? null,
     cacheExpiry: scanned.cacheExpiry,
     cacheExpiryChildPolicy: reducer.nativeChildRequests?.() === true,
-    parserGeneration: PROJECT_SPEND_PARSER_GENERATION,
+    parserGeneration: spendParserGeneration(parserKind),
     ...(parserKind === undefined ? {} : { parserKind }),
     indexedAt: now,
     parserState: reducer.snapshot(),
@@ -2314,12 +2342,7 @@ function consumeSpendPadding(record: SpendFileIndex): SpendFileIndex {
 export function loadSpendLedger(storageDirectory: string, workspace: string): SpendLedger {
   try {
     const parsed: unknown = JSON.parse(fs.readFileSync(ledgerFile(storageDirectory, workspace), 'utf8'));
-    const ledger = parseSpendLedger(
-      parsed,
-      normalizeWorkspace(workspace),
-      PROJECT_SPEND_PARSER_GENERATION,
-      normalizeWorkspace,
-    );
+    const ledger = parseSpendLedger(parsed, normalizeWorkspace(workspace), spendParserCurrent, normalizeWorkspace);
     if (!ledger) {
       throw new Error('invalid ledger');
     }
@@ -2334,7 +2357,7 @@ export function loadSpendLedger(storageDirectory: string, workspace: string): Sp
   } catch {
     return {
       workspace: normalizeWorkspace(workspace),
-      parserGeneration: PROJECT_SPEND_PARSER_GENERATION,
+      parserGeneration: PROJECT_SPEND_LEDGER_GENERATION,
       files: [],
       completeFiles: [],
     };
@@ -2379,7 +2402,7 @@ export function saveSpendLedger(
   writeFileStreamAtomically(ledgerFile(storageDirectory, workspace), (write) => {
     write(
       `{"workspace":${JSON.stringify(normalizeWorkspace(workspace))}` +
-        `,"parserGeneration":${PROJECT_SPEND_PARSER_GENERATION}` +
+        `,"parserGeneration":${PROJECT_SPEND_LEDGER_GENERATION}` +
         `,"files":[`,
     );
     present.forEach((record, at) => write((at ? ',' : '') + JSON.stringify(checkpoint(record))));
@@ -2820,7 +2843,7 @@ export function claudeCostStateDependencies(
         file.missingAt ||
         file.trailing ||
         file.trailingBytes ||
-        file.parserGeneration !== PROJECT_SPEND_PARSER_GENERATION,
+        !spendParserCurrent(file.parserKind, file.parserGeneration),
     )
   )
     return null;
@@ -3572,7 +3595,7 @@ export function sessionCacheFactsBySession(
     if (
       !record ||
       record.missingAt !== undefined ||
-      record.parserGeneration !== PROJECT_SPEND_PARSER_GENERATION ||
+      !spendParserCurrent(record.parserKind, record.parserGeneration) ||
       record.complete === false ||
       Boolean(record.trailingBytes || record.trailing) ||
       !record.cacheExpiry
@@ -3598,7 +3621,7 @@ export function sessionCacheFactsBySession(
         child.complete === false ||
         child.trailingBytes ||
         child.trailing ||
-        child.parserGeneration !== PROJECT_SPEND_PARSER_GENERATION ||
+        !spendParserCurrent(child.parserKind, child.parserGeneration) ||
         !child.cacheExpiry
       ) {
         incompleteSources++;

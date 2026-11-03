@@ -155,7 +155,7 @@ Change model and provider pricing in `extension/src/pricing.ts`.
 11. Extend existing independent effort-change policy tests for exact identities, dated snapshots, context suffixes, broad-row exceptions, and detectable provider routes.
 12. Require documented duration, recorded duration, unsupported caching, or sourced unknown duration. Never infer duration from token-field names.
 13. Add symptom regressions to the existing pricing and consumer tests. Include saved usage and both request bands.
-14. Bump `PROJECT_SPEND_PARSER_GENERATION` in `projectspend.ts` when model support changes saved request bands or derived usage facts.
+14. Bump the generation of the affected agent in `PROJECT_SPEND_PARSER_GENERATIONS` in `projectspend.ts` when model support changes saved request bands or derived usage facts. Bump both generations when the change affects both agents.
 15. Bump `VERSION` in `derivedcache.ts` when model support changes saved session cost or context facts.
 16. Remove the new provider support temporarily and run the symptom regressions. Also remove its cache policy, price, and independent route expectation separately. Remove production and expected provider support together. Change a shorthand target to an unreviewed model. Remove the new effort-change retention policy and its independent expectation separately. Also widen each exact-identity retention pattern. Require each guard to fail, then restore from plain backups.
 17. Update exact model coverage in [Supported pricing](cost-figures.md#supported-pricing). Update README provider summaries when provider coverage changes.

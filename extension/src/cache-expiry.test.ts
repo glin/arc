@@ -7,7 +7,6 @@ import {
   cacheExpiryExtraCost,
   classifyCacheExpiry,
   discoverClaudeSessionSpendSources,
-  PROJECT_SPEND_PARSER_GENERATION,
   emptyCacheExpiryLedger,
   indexSpendFile,
   loadSpendLedger,
@@ -1359,7 +1358,7 @@ test('a ledger written by an older parser generation rebuilds instead of loading
 
   const stale: SpendFileIndex = {
     ...current,
-    parserGeneration: PROJECT_SPEND_PARSER_GENERATION - 1,
+    parserGeneration: 0,
     cacheExpiry: undefined,
   };
   const rebuilt = indexSpendFile(stale, file, 'w', claudeReducer, Date.now() + 1, stillClock);
@@ -1650,14 +1649,7 @@ test('real Claude sidechain returns count on the session and warn on their paren
   saveSpendLedger(storage, 'w', [first]);
   const restored = loadSpendLedger(storage, 'w').files[0];
   assert.equal(restored.cacheExpiry?.facts.returns[0].timestamp, BASE + 10 * MINUTE);
-  const rebuilt = indexSpendFile(
-    { ...restored, parserGeneration: PROJECT_SPEND_PARSER_GENERATION - 1 },
-    first.file,
-    'w',
-    childReducer,
-    BASE,
-    stillClock,
-  );
+  const rebuilt = indexSpendFile({ ...restored, parserGeneration: 0 }, first.file, 'w', childReducer, BASE, stillClock);
   assert.equal(rebuilt.rebuilt, true);
   assert.equal(facts(rebuilt.record).counts['5m'], 1);
 });
@@ -2907,7 +2899,7 @@ test('a saved return without the cost-added fields keeps a deleted source and le
   // saved record is the only copy of its spend.
   const deleted: SpendFileIndex = {
     ...record,
-    parserGeneration: PROJECT_SPEND_PARSER_GENERATION - 1,
+    parserGeneration: 0,
     missingAt: Date.now(),
     cacheExpiry: {
       ...record.cacheExpiry!,
