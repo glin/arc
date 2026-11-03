@@ -311,6 +311,7 @@ import {
   finishHold,
   awaitExit,
   survivorNote,
+  probedAlive,
   EDITOR_EXIT_MS,
   WARM_UP_OPEN_MS,
   WARM_UNTIL_CAP_MS,
@@ -2161,6 +2162,18 @@ test('the runner waits for the stopped editor processes to exit', async () => {
   const survivors = await awaitExit([1, 2], { alive: (pids) => [...pids], now: () => clock, wait });
   assert.deepEqual([survivors, clock], [[1, 2], EDITOR_EXIT_MS]);
   assert.equal(survivorNote(survivors), 'The editor processes 1, 2 did not exit within 30 s of the stop.');
+});
+
+test('a Windows exit probe counts every id alive unless it succeeds', () => {
+  assert.deepEqual(
+    [
+      probedAlive([1, 2, 3], 0, '', undefined),
+      probedAlive([1, 2, 3], 0, '3\r\n1\r\n', undefined),
+      probedAlive([1, 2, 3], 1, '', undefined),
+      probedAlive([1, 2, 3], null, null, new Error('spawn powershell ENOENT')),
+    ],
+    [[], [1, 3], [1, 2, 3], [1, 2, 3]],
+  );
 });
 
 test('pre-check refuses low disk', () => {

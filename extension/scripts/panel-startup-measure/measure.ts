@@ -906,15 +906,27 @@ export async function awaitExit(
   }
 }
 
+// The ids that one Windows exit probe reports alive. A spawn error or a nonzero status means that the probe failed, so
+// every id counts as alive. A zero status means that the output names every live id.
+export function probedAlive(
+  pids: readonly number[],
+  status: number | null,
+  stdout: string | null,
+  error: Error | undefined,
+): number[] {
+  if (error || status !== 0) return [...pids];
+  const found = new Set((stdout ?? '').split(/\s+/).filter(Boolean).map(Number));
+  return pids.filter((pid) => found.has(pid));
+}
+
 // The ids of the processes that have not exited. Windows reads `HasExited`, which turns true only after the process
-// teardown ends. Linux and macOS send signal 0, which fails with `ESRCH` for a process that does not exist.
+// teardown ends. `Get-Process` exits with status 1 when an id does not exist, so the query ends with `exit 0`.
+// Linux and macOS send signal 0, which fails with `ESRCH` for a process that does not exist.
 function aliveProcesses(pids: readonly number[]): number[] {
   if (process.platform === 'win32') {
-    const query = `Get-Process -Id ${pids.join(',')} -ErrorAction SilentlyContinue | Where-Object { -not $_.HasExited } | ForEach-Object { $_.Id }`;
+    const query = `Get-Process -Id ${pids.join(',')} -ErrorAction SilentlyContinue | Where-Object { -not $_.HasExited } | ForEach-Object { $_.Id }; exit 0`;
     const result = spawnSync('powershell', ['-NoProfile', '-Command', query], { encoding: 'utf8' });
-    if (result.status !== 0 && !result.stdout) return [...pids];
-    const found = new Set(result.stdout.split(/\s+/).filter(Boolean).map(Number));
-    return pids.filter((pid) => found.has(pid));
+    return probedAlive(pids, result.status, result.stdout, result.error);
   }
   return pids.filter((pid) => {
     try {
