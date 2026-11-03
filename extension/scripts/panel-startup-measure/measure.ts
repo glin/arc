@@ -1518,9 +1518,12 @@ async function measure(commandLine: string, workspace: string, options: Options)
         }
       } finally {
         survivors.push(...(await stopEditor(WARM_USER_DATA)));
+        // `main` names the survivors from the run record, because a return from the try block wins over any later check.
+        runRecord.editorSurvivors = [...survivors];
       }
-      // A warm-up process that outlives the wait can still write the store that the measured launch reads.
-      if (survivors.length) return { lines: [], instance: null, complete: false, note: survivorNote(survivors) };
+      // A warm-up process that outlives the wait can still write the store that the measured launch reads. The note
+      // that names it comes from `main`.
+      if (survivors.length) return { lines: [], instance: null, complete: false, note: null };
     }
     await awaitMachine(options.minimumFreeGb, 10 * 60_000);
     const memory = new MemoryWatch();
