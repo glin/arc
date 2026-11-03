@@ -15,6 +15,8 @@ import {
   unknownPathShapes,
   watcherRefreshDecision,
 } from './scheduler.ts';
+import * as path from 'node:path';
+import { normalizeFsPath } from './transcript.ts';
 
 test('watch priorities retain promotions for the same lifetime as integrity checks', () => {
   const clock = new FakeClock();
@@ -319,6 +321,88 @@ test('unknown filenames and rename events retain the broad watcher path and name
   both.noteFileEvent('records', 'new.jsonl', 'rename');
   assert.deepEqual(watcherRefreshDecision(both.take(), () => true).broadReasons, ['createOrRename', 'missingFilename']);
   assert.deepEqual(both.take().broadReasons, [], 'a taken batch kept its broad causes');
+});
+
+// Codex writes a compressed twin beside a finished rollout before it deletes the plain file. The twin rides with the
+// batch that another event starts, and only the plain rollout reaches the refresh decision.
+test('a compressed twin rides with the next batch and the plain rollout alone decides it, in every order', () => {
+  const plain = 'rollout-2026-08-25T12-00-00-01a032c9-1a92-7931-845c-723117d24dbe.jsonl';
+  const twin = `${plain}.zst`;
+  const at = (name: string) => path.join('records', name);
+  const orders: Record<string, [string, string, number][]> = {
+    'twin first': [
+      [twin, 'rename', 0],
+      [plain, 'change', 50],
+    ],
+    'plain first': [
+      [plain, 'change', 0],
+      [twin, 'rename', 500],
+      [plain, 'change', 1_000],
+    ],
+    'both in one batch': [
+      [plain, 'change', 0],
+      [twin, 'rename', 50],
+    ],
+  };
+  const pair = { compressedPaths: [at(twin)], kind: 'targeted', changedPaths: [at(plain)] };
+  const expected: Record<string, unknown[]> = {
+    'twin first': [pair],
+    'plain first': [{ ...pair, compressedPaths: [] }, pair],
+    'both in one batch': [pair],
+  };
+  for (const [order, events] of Object.entries(orders)) {
+    const clock = new FakeClock();
+    const pending = new PendingWatcherWake();
+    const batches: ReturnType<PendingWatcherWake['take']>[] = [];
+    const scheduler = new BoundedTrailingScheduler(200, 1_000, () => batches.push(pending.take()), clock);
+    for (const [name, kind, time] of events) {
+      clock.advanceTo(time);
+      if (pending.noteFileEvent('records', name, kind)) scheduler.offer();
+    }
+    clock.advanceTo(5_000);
+    const decided = batches.map((batch) => {
+      const { kind, changedPaths } = watcherRefreshDecision(batch, (file) => file === at(plain));
+      return { compressedPaths: batch.compressedPaths, kind, changedPaths };
+    });
+    assert.deepEqual(decided, expected[order], order);
+    assert.equal(
+      batches.reduce((count, batch) => count + batch.eventCount, 0),
+      events.filter(([name]) => name === plain).length,
+      `${order}: a compressed twin counted as an event`,
+    );
+  }
+});
+
+test('only a lower-case compressed rollout name joins a batch, on every platform', () => {
+  const id = '01a032c9-1a92-7931-845c-723117d24dbe';
+  const names = [
+    `rollout-x-${id}.jsonl.zst`,
+    `rollout-x-${id}.JSONL.ZST`,
+    `rollout-x-${id}.jsonl.Zst`,
+    'notes.jsonl.zst',
+  ];
+  // The batch keeps a compressed path as the watcher joined it, so it equals the name that the walk lists.
+  const expected = {
+    win32: [path.join('Records', names[0])],
+    darwin: [path.join('Records', names[0])],
+    linux: [path.join('Records', names[0])],
+  };
+  const original = Object.getOwnPropertyDescriptor(process, 'platform')!;
+  for (const [platform, compressedPaths] of Object.entries(expected)) {
+    Object.defineProperty(process, 'platform', { ...original, value: platform });
+    try {
+      const pending = new PendingWatcherWake();
+      const woke = names.map((name) => pending.noteFileEvent('Records', name, 'rename', normalizeFsPath));
+      const batch = pending.take();
+      assert.deepEqual(
+        { woke, compressedPaths: batch.compressedPaths, eventCount: batch.eventCount },
+        { woke: [false, false, false, false], compressedPaths, eventCount: 0 },
+        platform,
+      );
+    } finally {
+      Object.defineProperty(process, 'platform', original);
+    }
+  }
 });
 
 test('live activity with no card names listed transcripts and draws only for a shown session', () => {

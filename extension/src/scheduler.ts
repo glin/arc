@@ -1,4 +1,5 @@
 import * as path from 'node:path';
+import { isCompressedRolloutName } from './compressedrollouts';
 
 export interface SchedulerClock {
   now(): number;
@@ -253,6 +254,8 @@ export interface WatcherWakeBatch {
   changedPaths: string[];
   // Paths whose event reported a file that appeared, moved or disappeared.
   createdPaths: string[];
+  // Compressed rollouts that an event named, as the watcher joined them. They take no part in the refresh decision.
+  compressedPaths: string[];
   broadRequired: boolean;
   broadReasons: WatcherBroadReason[];
   // A shown session gained live activity that no drawn card carries, so the wake draws even
@@ -281,6 +284,7 @@ export class PendingWatcherWake {
   private eventCount = 0;
   private readonly changedPaths = new Set<string>();
   private readonly createdPaths = new Set<string>();
+  private readonly compressedPaths = new Set<string>();
   private broadRequired = false;
   private readonly broadReasons = new Set<WatcherBroadReason>();
   private drawRequired = false;
@@ -293,6 +297,8 @@ export class PendingWatcherWake {
     normalize: (file: string) => string = (file) => file,
   ): boolean {
     if (typeof filename === 'string' && !filename.endsWith('.jsonl')) {
+      // A compressed rollout rides with the next batch and wakes nothing of its own.
+      if (isCompressedRolloutName(filename)) this.compressedPaths.add(path.join(directory, filename));
       return false;
     }
     this.eventCount++;
@@ -343,6 +349,7 @@ export class PendingWatcherWake {
       eventCount: this.eventCount,
       changedPaths: [...this.changedPaths].sort(),
       createdPaths: [...this.createdPaths].sort(),
+      compressedPaths: [...this.compressedPaths].sort(),
       broadRequired: this.broadRequired,
       broadReasons: [...this.broadReasons].sort(),
       drawRequired: this.drawRequired,
@@ -355,6 +362,7 @@ export class PendingWatcherWake {
     this.eventCount = 0;
     this.changedPaths.clear();
     this.createdPaths.clear();
+    this.compressedPaths.clear();
     this.broadRequired = false;
     this.broadReasons.clear();
     this.drawRequired = false;
