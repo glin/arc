@@ -308,6 +308,7 @@ import {
   liveDirectories,
   holdUntil,
   holdReading,
+  finishHold,
   WARM_UP_OPEN_MS,
   WARM_UNTIL_CAP_MS,
   WARM_UNTIL_INTERVAL_MS,
@@ -1872,6 +1873,62 @@ test('warm-until ends when the measure reads the value', async () => {
     wait,
   });
   assert.deepEqual(failed, { reached: false, reads: 0, measures: null, snapshot: null, note: 'The editor exited.' });
+  // An editor that fails while a read runs fails the hold, though the reading holds the value.
+  clock = launchedAt;
+  let exited: string | null = null;
+  const during = await holdUntil({
+    conditions: [pending(0)],
+    launchedAt,
+    sample: async () => {
+      exited = 'The editor exited.';
+      return reading(0);
+    },
+    failure: () => exited,
+    now: () => clock,
+    wait,
+  });
+  assert.deepEqual(during, { reached: false, reads: 1, measures: null, snapshot: null, note: 'The editor exited.' });
+});
+
+test('the warm-up hold fails when its end snapshot does not return', async () => {
+  const reached = { reached: true, reads: 2, measures: { stubPending: 0 }, snapshot: null, note: null };
+  const snapshot = { counters: { gauges: { compressedRows: 4 } } };
+  const taken = await finishHold(
+    reached,
+    async () => snapshot,
+    () => null,
+  );
+  assert.deepEqual([taken.reached, taken.snapshot?.compressedRows, taken.note], [true, 4, null]);
+  // A snapshot request that times out, or whose overlay fails, returns nothing.
+  const missing = await finishHold(
+    reached,
+    async () => null,
+    () => null,
+  );
+  assert.deepEqual(
+    [missing.reached, missing.snapshot, missing.note],
+    [false, null, 'The end snapshot of the warm-up did not return.'],
+  );
+  let exited: string | null = null;
+  const failed = await finishHold(
+    reached,
+    async () => {
+      exited = 'The editor exited with 1 before the run finished.';
+      return snapshot;
+    },
+    () => exited,
+  );
+  assert.deepEqual([failed.reached, failed.snapshot], [false, null]);
+  assert.match(failed.note ?? '', /end snapshot\. The editor exited with 1/);
+  const capped = { ...reached, reached: false, note: 'The warm-up did not reach stubPending=0.' };
+  assert.equal(
+    await finishHold(
+      capped,
+      async () => assert.fail('a failed hold took an end snapshot'),
+      () => null,
+    ),
+    capped,
+  );
 });
 
 test.skipIf(!rolloutCompression.zstdCompressSync)('count-compressed uses the sessionCount roots', async () => {

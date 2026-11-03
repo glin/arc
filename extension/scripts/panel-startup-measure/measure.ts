@@ -1152,7 +1152,8 @@ export function holdReading(
 // Keep the warm-up open for `minimumMs` after its launch. Then start a read every interval, until one reading holds
 // every condition. Reads start on a fixed schedule, so a slow read does not delay the next start. A read that runs past
 // a start moves the next read to the first later start. A reading that is missing holds no condition. The hold fails
-// at the cap after the launch, and a read that returns after the cap fails it too.
+// at the cap after the launch, and a read that returns after the cap fails it too. An editor failure before a read
+// starts or before its values count fails the hold.
 export async function holdUntil(options: {
   conditions: WarmCondition[];
   launchedAt: number;
@@ -1195,7 +1196,10 @@ export async function holdUntil(options: {
     if (failure) return ended(false, failure);
     if (now() >= deadline) return capped();
     const startedAt = now();
-    measures = await options.sample(++reads);
+    const sampled = await options.sample(++reads);
+    const failed = options.failure?.() ?? null;
+    if (failed) return ended(false, failed);
+    measures = sampled;
     if (now() > deadline) return capped();
     const read = measures;
     if (read && options.conditions.every((condition) => read[condition.measure] === condition.value))
@@ -1204,6 +1208,21 @@ export async function holdUntil(options: {
     while (next < now()) next += WARM_UNTIL_INTERVAL_MS;
     await wait(Math.max(0, Math.min(next, deadline) - now()));
   }
+}
+
+// Take the snapshot after a hold that reached every value. The hold fails when that snapshot does not return, or when
+// the editor fails before the runner accepts it.
+export async function finishHold(
+  hold: WarmHold,
+  requestEnd: () => Promise<Parameters<typeof soakMeasures>[0] | null>,
+  failure: () => string | null,
+): Promise<WarmHold> {
+  if (!hold.reached) return hold;
+  const snapshot = await requestEnd();
+  const failed = failure();
+  if (failed) return { ...hold, reached: false, note: `The editor failed during the end snapshot. ${failed}` };
+  if (!snapshot) return { ...hold, reached: false, note: 'The end snapshot of the warm-up did not return.' };
+  return { ...hold, snapshot: soakMeasures(snapshot) };
 }
 
 // The peak scratch disk of one repetition: the fixture tree hard-linked under the scratch directory, or copied when the
@@ -1402,19 +1421,17 @@ async function measure(commandLine: string, workspace: string, options: Options)
         // A failed warm-up leaves a partly filled store, which no comparison may treat as warm.
         if (!warm.complete) return { ...warm, complete: false, note: `The warm-up launch failed. ${warm.note ?? ''}` };
         if (options.warmUntil.length) {
-          const hold = await holdUntil({
+          const failure = () => warmLaunch.failure;
+          const reading = await holdUntil({
             conditions: options.warmUntil,
             launchedAt: warmAt,
             sample: async (index) =>
               holdReading(await requestSnapshot(`warm-${String(index).padStart(3, '0')}`, 120_000), () =>
                 runnerMeasures({ home: ARC_STORE, tempBefore: warmTempBefore }),
               ),
-            failure: () => warmLaunch.failure,
+            failure,
           });
-          if (hold.reached) {
-            const snapshot = await requestSnapshot('warm-end', 120_000);
-            hold.snapshot = snapshot ? soakMeasures(snapshot) : null;
-          }
+          const hold = await finishHold(reading, () => requestSnapshot('warm-end', 120_000), failure);
           Object.assign(runRecord.warmUp as object, { until: options.warmUntil, hold });
           (runRecord.warmUp as { openMs: number | null }).openMs = Date.now() - warmAt;
           if (!hold.reached) return { ...warm, complete: false, note: `The warm-up hold failed. ${hold.note ?? ''}` };
