@@ -978,8 +978,6 @@ async function numericRecord(
       },
     };
   };
-  // The spend reader reads plain transcripts only, so a compressed rollout counts as a changed source.
-  if (isCompressedRollout(entry.file)) throw new SourceChanged();
   for (;;) {
     checkExportCancellation(options.signal);
     const result = indexSpendFile(record, entry.file, entry.cwd ?? 'export', factory, {
