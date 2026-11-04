@@ -322,26 +322,86 @@ function revisionOf(file: string): FileRevision | null {
   }
 }
 
-// The one decoded body this worker holds, and the decode that a window or page request waits on. A request that names
-// another compressed path drops both, and the host drops them when the selection leaves the session.
+// The one decoded body this worker holds, and the one decode that window and page requests wait on. A request for
+// another compressed path aborts the running decode and waits until every request on the current path ends, so the
+// worker never decodes or holds two bodies. The host releases the body when the selection leaves its session.
+interface BodyDecode {
+  file: string;
+  controller: AbortController;
+  // Requests that wait on this decode. The decode stops when the last of them ends.
+  waiters: number;
+  read: Promise<CompressedBodyRead>;
+}
 let heldBody: CompressedBody | null = null;
-let bodyDecode: { file: string; read: Promise<CompressedBodyRead> } | null = null;
+let bodyDecode: BodyDecode | null = null;
+// The compressed path that window and page requests read, how many of them run, and the requests for another path
+// that wait until they end.
+let bodyPath: string | null = null;
+let bodyUsers = 0;
+let bodyDrained: Array<() => void> = [];
+// The body that each window or page request read, by the signal of the request.
+const requestBodies = new WeakMap<AbortSignal, CompressedBody>();
 
 function releaseCompressedBody(): void {
   heldBody = null;
-  bodyDecode = null;
+  bodyDecode?.controller.abort();
+}
+
+// Enter the compressed path of a window or page request. A request for another path, or any request while one waits,
+// waits until the requests on the current path end. False when the request ended first.
+async function enterBodyPath(file: string, signal: AbortSignal): Promise<boolean> {
+  // Another request changes the path and the user count while this one waits.
+  const mustWait = () => bodyUsers > 0 && (bodyPath !== file || bodyDrained.length > 0);
+  while (mustWait()) {
+    if (bodyPath !== file) releaseCompressedBody();
+    await new Promise<void>((resolve) => bodyDrained.push(resolve));
+  }
+  if (signal.aborted) return false;
+  if (bodyPath !== file) {
+    releaseCompressedBody();
+    bodyPath = file;
+  }
+  bodyUsers += 1;
+  return true;
+}
+
+function leaveBodyPath(): void {
+  bodyUsers -= 1;
+  if (bodyUsers > 0) return;
+  const drained = bodyDrained;
+  bodyDrained = [];
+  for (const resolve of drained) resolve();
+}
+
+// Wait on a decode. A request that ends stops waiting, and the decode stops when no request waits on it.
+async function awaitDecode(decode: BodyDecode, signal: AbortSignal): Promise<CompressedBodyRead> {
+  decode.waiters += 1;
+  const leave = () => {
+    decode.waiters -= 1;
+    if (decode.waiters === 0) decode.controller.abort();
+  };
+  signal.addEventListener('abort', leave, { once: true });
+  try {
+    const read = await decode.read;
+    return signal.aborted ? { kind: 'cancelled' } : read;
+  } finally {
+    if (!signal.aborted) {
+      signal.removeEventListener('abort', leave);
+      decode.waiters -= 1;
+    }
+  }
 }
 
 // The decoded body of a compressed rollout. `verify` hashes the file again, and a hash or revision that differs from
-// the held body decodes the file again. Without `verify` an unchanged `fstat` keeps the held body.
+// the held body decodes the file again. Without `verify` an unchanged `fstat` keeps the held body. A decode that a
+// release or another path stopped answers `cancelled`.
 async function openCompressedBody(
   file: string,
   verify: boolean,
   signal: AbortSignal,
   limits?: import('./progressiveworker').ProgressiveInput['compressedLimits'],
 ): Promise<CompressedBodyRead> {
-  if (heldBody && heldBody.file !== file) releaseCompressedBody();
-  if (bodyDecode && bodyDecode.file !== file) bodyDecode = null;
+  if (heldBody && heldBody.file !== file) heldBody = null;
   if (heldBody) {
     const body = heldBody;
     const stat = compressedStat(file);
@@ -353,21 +413,25 @@ async function openCompressedBody(
     }
     if (heldBody === body) heldBody = null;
   }
+  // A stopped decode ends within one chunk. A new one starts after it.
+  for (let running = bodyDecode; running?.controller.signal.aborted; running = bodyDecode) await running.read;
+  if (signal.aborted) return { kind: 'cancelled' };
   if (!bodyDecode) {
-    const decode = {
+    const controller = new AbortController();
+    const decode: BodyDecode = {
       file,
-      read: decodeCompressedRollout(file, limits).then((read) => {
-        if (bodyDecode === decode) {
-          bodyDecode = null;
-          if (read.kind === 'body') heldBody = read.body;
-        }
+      controller,
+      waiters: 0,
+      read: decodeCompressedRollout(file, { ...limits, signal: controller.signal }).then((read) => {
+        if (bodyDecode === decode) bodyDecode = null;
+        if (controller.signal.aborted) return { kind: 'cancelled' };
+        if (read.kind === 'body' && bodyPath === file) heldBody = read.body;
         return read;
       }),
     };
     bodyDecode = decode;
   }
-  const read = await bodyDecode.read;
-  return signal.aborted ? { kind: 'cancelled' } : read;
+  return awaitDecode(bodyDecode, signal);
 }
 
 function missingFile(file: string): boolean {
@@ -1381,6 +1445,7 @@ async function execute(
     if (session.agent !== 'codex') return { kind: 'stale' as const };
     const opened = await openCompressedBody(session.file, verify, signal, request.input.compressedLimits);
     if (opened.kind !== 'body') return opened;
+    requestBodies.set(signal, opened.body);
     const source = compressedByteSource(opened.body);
     const opening = openingRecordOf(source.opening());
     return { kind: 'source' as const, source, opening };
@@ -1458,7 +1523,9 @@ async function execute(
       ? { kind: 'failed', unsupported: true }
       : opened.kind === 'failed'
         ? { kind: 'failed' }
-        : { kind: 'stale' };
+        : opened.kind === 'cancelled'
+          ? { kind: 'stale', interrupted: true }
+          : { kind: 'stale' };
   }
   const compressed = opened?.kind === 'source' ? opened : null;
   const body = compressed?.source.body;
@@ -2211,6 +2278,7 @@ async function handleMessage(message: {
     });
   }
   countKind(activeKinds, kind);
+  let bodyEntered = false;
   try {
     const request = message.request;
     if (request.kind === 'child-file-edits') {
@@ -2295,15 +2363,21 @@ async function handleMessage(message: {
     if (read) read.enteredAt = performance.now();
     // Every window read signals its start, including one past the lifecycle bound.
     if (kind === 'window') parentPort?.postMessage({ id: message.id, windowEntered: true });
+    // A window or page of a compressed rollout reads one body, so it waits while requests read another path.
+    const bodyRead = (kind === 'window' || kind === 'page') && isCompressedRollout(file);
+    if (bodyRead && !(await enterBodyPath(file, controller.signal))) return;
+    bodyEntered = bodyRead;
     const value = await execute(metadataRequest ?? request, controller.signal);
     if (read) read.completedAt = performance.now();
     const after = revisionOf(file);
     const stable = sameRevision(before, after);
-    // A compressed window compares its checkpoint with `before` at the decoded length of a body read from `before`.
+    // A compressed window compares its checkpoint with `before` at the held length of the body that it read from
+    // `before`.
+    const body = requestBodies.get(controller.signal);
     const windowRevision = !isCompressedRollout(file)
       ? before
-      : heldBody?.file === file && sameRevision(heldBody.stat, before)
-        ? { ...before, size: heldBody.length }
+      : body?.file === file && sameRevision(body.stat, before)
+        ? { ...before, size: body.length }
         : null;
     const stableWindow = value.kind !== 'window' || sameRevision(value.checkpoint.revision, windowRevision);
     const kept = stable ? undefined : scanKeptThroughGrowth(value, before, after);
@@ -2348,6 +2422,7 @@ async function handleMessage(message: {
         windowRead: windowReadReport(message.id),
       });
   } finally {
+    if (bodyEntered) leaveBodyPath();
     requests.delete(message.id);
     windowReads.delete(message.id);
     if (activeKinds[kind]! > 1) activeKinds[kind]!--;

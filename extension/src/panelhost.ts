@@ -14713,7 +14713,8 @@ export class PanelProvider implements vscode.Disposable {
           (result.value.kind === 'stale' || result.value.kind === 'window') &&
           result.generation === generation &&
           !controller.signal.aborted &&
-          (!sameProgressiveRevision(result.revision, requestedRevision) ||
+          ((result.value.kind === 'stale' && result.value.interrupted === true) ||
+            !sameProgressiveRevision(result.revision, requestedRevision) ||
             !sameProgressiveRevision(result.revision, currentRevision)),
         );
         if (retryLatestRevision) {

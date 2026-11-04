@@ -489,7 +489,8 @@ export type ProgressiveValue =
   | { kind: 'failed'; unsupported?: true }
   | { kind: 'retained'; pages: HistoryPage[] }
   // `unread` marks a request the worker refused before it opened the source.
-  | { kind: 'stale'; agentRunScan?: AgentRunScan; recoveryBytes?: number; unread?: true };
+  // `interrupted`: a release or a request for another compressed path stopped the decode, so the read can run again.
+  | { kind: 'stale'; agentRunScan?: AgentRunScan; recoveryBytes?: number; unread?: true; interrupted?: true };
 export interface ProgressiveResult {
   generation: number;
   revision: FileRevision | null;
