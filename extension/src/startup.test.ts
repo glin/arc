@@ -2566,7 +2566,7 @@ function harness(pendingRefresh = false, registerRefreshHandler = true, extraMet
       performanceCounters = { recordRowPost() {}, recordRowsGap() {}, recordWork() {}, recordWatcherOperation() {}, registerPanel() {}, releasePanel() {}, recordStartup() {}, recordMessage() {}, recordRefresh() {}, recordRefreshStage() {}, dispose() {} };
       poll = null; watching = true; codexStats = null; pendingWatch = new Map(); watchScheduler = { cancel() {} };
       watchDirectories() {}
-      pendingRefresh = null; showing = 'selected'; repositoryScopeReady = true; repositoryScopeRoots = ['project']; awaitingSessionRecords = {}; newDrafts = {}; selectionGeneration = 0; selectionWork = null; selectionFailure = null;
+      pendingRefresh = null; showing = 'selected'; repositoryScopeReady = true; repositoryScopeRoots = ['project']; awaitingSessionRecords = {}; newDrafts = {}; selectionGeneration = 0; selectionWork = null; selectionFailures = new Map();
       sessions = [{ file: 'selected.jsonl', size: 1, mtimeMs: 1 }];
       allSessions() { return this.sessions; }
       folders() { return ['project']; }
@@ -2759,6 +2759,11 @@ function completeDiscoveryHarness(
     'unresolvedLoadingFailure',
     // refresh and show release a compressed body that no selected session reads.
     'releaseUnselectedCompressedBody',
+    // refresh, show and the selected window keep a read failure for each session file.
+    'selectionFailureOf',
+    'drawnSelectionFailure',
+    'carrySelectionFailures',
+    'dropRemovedSelectionFailures',
     ...extraMethods,
   ];
   if (realSelectedWindow) {
@@ -2838,7 +2843,7 @@ function completeDiscoveryHarness(
       heldRows = new RowDeltaReceiver();
       expandRows(message) { const held = this.heldRows.expand(message); if (!held) throw new Error('a ' + message.type + ' message did not apply to the rows the panel holds'); return held; }
       hosts = [{ webview: { postMessage: (message) => { this.messages.push(message.type === 'render' || message.type === 'rail' ? this.expandRows(message) : message); return Promise.resolve(true); } }, active: () => false, visible: () => true }]; readyHosts = new Set(this.hosts); panelVisibility = createPanelVisibility();
-      refreshGeneration = 0; refreshController = null; pendingRefresh = null; refreshReason = 'startup'; targetedRefreshPaths = null; selectionGeneration = 0; selectionWork = null; selectionFailure = null; interruptedRereads = new Map();
+      refreshGeneration = 0; refreshController = null; pendingRefresh = null; refreshReason = 'startup'; targetedRefreshPaths = null; selectionGeneration = 0; selectionWork = null; selectionFailures = new Map(); interruptedRereads = new Map();
       repositoryScopeReady = true; repositoryScopeRoots = ['project']; awaitingSessionRecords = {}; newDrafts = {}; draftProfiles = {}; sessionOrigins = {}; drafts = {}; picks = {};
       refreshUsageHandler = null; initialCatalogRefreshPending = false; initialCatalogRefreshRequested = false;
       recentProfiles = []; models = {}; watching = false; trail = null; sessionAliases = new Map();
@@ -3249,6 +3254,10 @@ function selectedWindowHarness(
     'acceptCompressedWindow',
     'noteCompressedDecoderMissing',
     'releaseUnselectedCompressedBody',
+    'selectionFailureOf',
+    'drawnSelectionFailure',
+    'carrySelectionFailures',
+    'dropRemovedSelectionFailures',
     'jointSplitWindow',
     'acceptJointSplitWindow',
     'refreshFrom',
@@ -3291,7 +3300,7 @@ function selectedWindowHarness(
       publishSessionQueryContext() {}
       failSessionLoading() {}
       noteSessionRead() {}
-      selectionGeneration = 1; refreshGeneration = 1; showing = 'selected'; selectionWork = null; selectionFailure = null; interruptedRereads = new Map();
+      selectionGeneration = 1; refreshGeneration = 1; showing = 'selected'; selectionWork = null; selectionFailures = new Map(); interruptedRereads = new Map();
       trail = { places: [], at: -1 };
       settleRailSeed() {}
       cache = new Map(); refreshes = 0; published = []; dropped = 0; lastError = null;
@@ -3619,7 +3628,7 @@ test('a selected window whose decode another request stopped reads again', async
   await provider.completeSelectedWindow('selected', 1);
   await vi.waitFor(() => assert.ok(provider.cache.has(provider.session.file), 'the stopped window did not read again'));
   assert.equal(requests, 2);
-  assert.equal(provider.selectionFailure, null, 'a stopped decode showed the read failure');
+  assert.equal(provider.selectionFailures.size, 0, 'a stopped decode showed the read failure');
 
   // A worker that stops every decode fails the window after its one reread, and a later read sends no request.
   let stops = 0;
@@ -3632,12 +3641,12 @@ test('a selected window whose decode another request stopped reads again', async
       : { generation, revision, value: { kind: 'stale', interrupted: true } };
   });
   await stopped.completeSelectedWindow('selected', 1);
-  await vi.waitFor(() => assert.ok(stopped.selectionFailure, 'a window stopped twice did not fail'));
+  await vi.waitFor(() => assert.ok(stopped.selectionFailures.size, 'a window stopped twice did not fail'));
   assert.equal(stops, 2, 'a stopped window read again more than once');
   await stopped.completeSelectedWindow('selected', 1);
   assert.equal(stops, 2, 'a later read of the failed window stopped the other decode again');
   assert.equal(stopped.cache.has(stopped.session.file), false);
-  assert.deepEqual(stopped.selectionFailure, {
+  assert.deepEqual(stopped.selectionFailures.get(stopped.session.file), {
     sessionId: 'selected',
     generation: 1,
     revision: stopped.revisionOf(stopped.session),
@@ -3700,6 +3709,15 @@ for (const [cause, stale] of [
     await provider.refresh(true);
     assert.equal(requests, 2, 'a refresh read the failed window again');
     assert.equal(provider.cache.has(fixture.file), false);
+    // A removed source takes its read failure and its reread record with it.
+    provider.partial = [];
+    provider.catalog = { sessions: [] };
+    await provider.refresh(true);
+    assert.equal(
+      provider.selectionFailures.size + provider.interruptedRereads.size,
+      0,
+      'a removed source kept its failure',
+    );
   });
 }
 
@@ -3749,15 +3767,15 @@ test('two panels on two compressed sessions draw one window and one read failure
   void provider.completeSelectedWindow(first.sessionId, 1);
   void provider.completeSelectedWindow(second.sessionId, 1);
   await vi.waitFor(() =>
-    assert.ok(provider.cache.has(second.file) && provider.selectionFailure, 'the panels did not settle'),
+    assert.ok(provider.cache.has(second.file) && provider.selectionFailures.size, 'the panels did not settle'),
   );
   await vi.waitFor(() => assert.equal(provider.selectionWorks.size, 0, 'a panel kept its read running'));
   // The first panel spends its reread, the second panel's reread stops it again, and the second window arrives.
   assert.deepEqual(requests, ['first', 'second', 'first', 'second']);
   assert.equal(provider.cache.has(first.file), false, 'the failed panel drew a window');
-  assert.equal(
-    provider.selectionFailure.sessionId,
-    first.sessionId,
+  assert.deepEqual(
+    [...provider.selectionFailures.keys()],
+    [first.file],
     'the drawn window cleared the other panel failure',
   );
   await provider.completeSelectedWindow(first.sessionId, 1);
@@ -3774,12 +3792,50 @@ test('two panels on two compressed sessions draw one window and one read failure
   provider.show(third.sessionId, secondPanel);
   await vi.waitFor(() => assert.ok(provider.cache.has(third.file), 'the selected window was not drawn'));
   assert.deepEqual(
-    provider.selectionFailure,
+    provider.selectionFailures.get(first.file),
     { sessionId: first.sessionId, generation: provider.selectionGeneration, revision: provider.revisionOf(first) },
     'the selection cleared the read failure of the other panel',
   );
   await provider.completeSelectedWindow(first.sessionId, provider.selectionGeneration);
   assert.deepEqual(requests, ['first', 'second', 'first', 'second', 'third'], 'the selection read the failed window');
+});
+
+test('two panels whose compressed sessions fail in turn each keep their own read failure', async () => {
+  const first = { file: 'first.jsonl.zst', sessionId: 'first', agent: 'codex', size: 10, mtimeMs: 10, dev: 1, ino: 3 };
+  const second = { ...first, file: 'second.jsonl.zst', sessionId: 'second', ino: 4 };
+  // Another decode stops every window, so each window fails after its one reread.
+  const requests: string[] = [];
+  const provider = selectedWindowHarness(
+    async (request, generation) => {
+      const session = request.kind === 'window' ? request.input.session : first;
+      requests.push(session.sessionId);
+      // A reread that never ends draws a window after the eighth request, so the count fails instead of the heap.
+      if (requests.length > 8) return windowResult(generation, provider.revisionOf(session));
+      return { generation, revision: provider.revisionOf(session), value: { kind: 'stale', interrupted: true } };
+    },
+    ['show'],
+  );
+  provider.progressiveWorker.releaseCompressedBody = () => {};
+  const firstPanel = {};
+  const secondPanel = {};
+  provider.hosts = [firstPanel, secondPanel];
+  provider.hostSessions = new Map([
+    [firstPanel, first.sessionId],
+    [secondPanel, 'plain'],
+  ]);
+  provider.selectionWorks = new Map();
+  provider.catalog = [first, second];
+  provider.showing = first.sessionId;
+  await provider.completeSelectedWindow(first.sessionId, 1);
+  await vi.waitFor(() => assert.ok(provider.drawnSelectionFailure(first), 'the first panel did not fail'));
+  provider.show(second.sessionId, secondPanel);
+  await vi.waitFor(() => assert.ok(provider.drawnSelectionFailure(second), 'the second panel did not fail'));
+  await vi.waitFor(() => assert.equal(provider.selectionWorks.size, 0, 'a panel kept its read running'));
+  assert.ok(provider.drawnSelectionFailure(first), 'the failure of the second panel replaced the first panel failure');
+  // Both failed windows stay failed, so a later read of either panel sends no request.
+  await provider.completeSelectedWindow(first.sessionId, provider.selectionGeneration);
+  await provider.completeSelectedWindow(second.sessionId, provider.selectionGeneration);
+  assert.deepEqual(requests, ['first', 'first', 'second', 'second'], 'a failed window read again');
 });
 
 test('a page read of a compressed session releases its body when its panel leaves the session', async () => {
@@ -9216,7 +9272,11 @@ test('selection failure reaches the provider payload as history status or diagno
       read: { turns: [], compactions: [], readBytes: 1, turnLimitReached: false },
     });
     provider.readWindows.set('selected', { readBytes: 1, turnLimitReached: false, loadedTurns: cards.length });
-    provider.selectionFailure = { sessionId: 'selected', generation: 0, revision: provider.revisionOf(selected) };
+    provider.selectionFailures.set(selected.file, {
+      sessionId: 'selected',
+      generation: 0,
+      revision: provider.revisionOf(selected),
+    });
     await provider.refresh(true, true, true, true);
     const payload = provider.messages.at(-1);
     if (cards.length) {
@@ -11085,14 +11145,14 @@ test('a selected read failure becomes visible state and a later read recovers', 
     null,
     `failed selected work remained held: ${JSON.stringify(provider.selectionWork)}`,
   );
-  assert.deepEqual(provider.selectionFailure, {
+  assert.deepEqual(provider.selectionFailures.get(provider.session.file), {
     sessionId: 'selected',
     generation: 1,
     revision: { size: 10, mtimeMs: 10, dev: 1, ino: 2 },
   });
   assert.equal(provider.refreshes, 1, 'the read failure did not request its visible failed state');
   await provider.completeSelectedWindow('selected', 1);
-  assert.equal(provider.selectionFailure, null);
+  assert.equal(provider.selectionFailures.size, 0);
   assert.ok(provider.cache.has('selected.jsonl'), 'the retry did not publish the selected window');
 });
 
@@ -11106,11 +11166,15 @@ test('a selected read that finds its window held clears a drawn read failure wit
   });
   await provider.completeSelectedWindow('selected', 1);
   assert.equal(attempts, 1);
-  provider.selectionFailure = { sessionId: 'selected', generation: 1, revision: provider.revisionOf(provider.session) };
+  provider.selectionFailures.set(provider.session.file, {
+    sessionId: 'selected',
+    generation: 1,
+    revision: provider.revisionOf(provider.session),
+  });
   const before = provider.refreshes;
   await provider.completeSelectedWindow('selected', 1);
   assert.equal(attempts, 1, 'the held window was read again');
-  assert.equal(provider.selectionFailure, null);
+  assert.equal(provider.selectionFailures.size, 0);
   assert.equal(provider.refreshes - before, 1, 'the cleared read failure stayed on screen');
 });
 

@@ -1451,8 +1451,9 @@ export class PanelProvider implements vscode.Disposable {
   private previousSelection: string | null = null;
   private selectionWork: SelectionWork | null = null;
   private selectionWorks = new Map<string, SelectionWork>();
-  private selectionFailure: { sessionId: string; generation: number; revision: FileRevision } | null = null;
-  // The selection generation in which each session spent its one reread of an interrupted window, and whether a
+  // The read failure of each session file, with the selection generation in which a panel draws it.
+  private selectionFailures = new Map<string, { sessionId: string; generation: number; revision: FileRevision }>();
+  // The selection generation in which each session file spent its one reread of an interrupted window, and whether a
   // second interruption then failed the window.
   private interruptedRereads = new Map<string, { generation: number; failed: boolean }>();
   // The selection generation whose compressed rollout still needs its hash check, or null when no check is owed.
@@ -5563,7 +5564,7 @@ export class PanelProvider implements vscode.Disposable {
     this.selectionGeneration++;
     this.selectionWork?.controller.abort();
     this.selectionWork = null;
-    this.selectionFailure = null;
+    this.carrySelectionFailures(draftId);
     this.previousSelection = this.showing;
     this.showing = draftId;
     this.onSelectionChanged?.(draftId, profile.agent, draft.cwd);
@@ -9501,19 +9502,7 @@ export class PanelProvider implements vscode.Disposable {
       this.selectionWork?.controller.abort();
       this.selectionWork = null;
     }
-    // A selection clears the read failure of its own session. The failure of a session that another panel shows stays
-    // drawn in the new selection generation, and that panel does not read the failed window again.
-    const failure = this.selectionFailure;
-    const failureShown =
-      !!failure && failure.sessionId !== session && [...this.hostSessions.values()].includes(failure.sessionId);
-    if (!failure || !failureShown) {
-      this.selectionFailure = null;
-    } else if (failure.generation === this.selectionGeneration - 1) {
-      this.selectionFailure = { ...failure, generation: this.selectionGeneration };
-      const reread = this.interruptedRereads.get(failure.sessionId);
-      if (reread?.generation === failure.generation)
-        this.interruptedRereads.set(failure.sessionId, { ...reread, generation: this.selectionGeneration });
-    }
+    this.carrySelectionFailures(session);
     // Selection reuses the catalog and promotes its sources for integrity checks.
     const seeded = this.selectionGeneration;
     this.railSeedOwedFor = seeded;
@@ -9944,6 +9933,7 @@ export class PanelProvider implements vscode.Disposable {
       // Reconcile navigation with reachable sessions and record the settled selection.
       this.trail = visitPlace(prunePlaces(this.trail, new Set(reachable)), this.showing ?? '');
       this.releaseUnselectedCompressedBody();
+      this.dropRemovedSelectionFailures(all);
       const sessions = this.shownSessions(all);
       if (
         this.showing &&
@@ -10197,11 +10187,7 @@ export class PanelProvider implements vscode.Disposable {
         const loadingLabel = loadingNewest
           ? (hostRows.find((row) => row.id === hostSession)?.label ?? hostSession)
           : null;
-        const selectedFailure =
-          selectedSession &&
-          this.selectionFailure?.sessionId === selectedSession.sessionId &&
-          this.selectionFailure.generation === this.selectionGeneration &&
-          sameProgressiveRevision(this.selectionFailure.revision, this.revisionOf(selectedSession));
+        const selectedFailure = selectedSession && this.drawnSelectionFailure(selectedSession);
         const discoveryLoading = selectedFailure
           ? hostDrawn.length
             ? {
@@ -14687,8 +14673,8 @@ export class PanelProvider implements vscode.Disposable {
       ) {
         this.acceptSelectedMetadataRead(session, generation);
         // Refresh a current retained window only when worker work or a displayed failure changed its presentation.
-        const failureDrawn = this.selectionFailure?.sessionId === sessionId;
-        if (failureDrawn) this.selectionFailure = null;
+        const failureDrawn = !!this.selectionFailureOf(session);
+        if (failureDrawn) this.selectionFailures.delete(session.file);
         if (roundTrip || failureDrawn) {
           this.refreshFrom('selected-window', true, true, null, true, true);
         }
@@ -14703,13 +14689,13 @@ export class PanelProvider implements vscode.Disposable {
             onlyGrew(previous.revision, requestedRevision)));
       // A window that a second interruption failed stays failed for its selection and revision, so a later refresh
       // does not stop the other decode again. The owner selects the session to read it again.
-      const interruptedReread = this.interruptedRereads.get(sessionId);
+      const interruptedReread = this.interruptedRereads.get(session.file);
+      const failure = this.selectionFailureOf(session);
       if (
         interruptedReread?.failed &&
         interruptedReread.generation === generation &&
-        this.selectionFailure?.sessionId === sessionId &&
-        this.selectionFailure.generation === generation &&
-        sameProgressiveRevision(this.selectionFailure.revision, requestedRevision)
+        failure?.generation === generation &&
+        sameProgressiveRevision(failure.revision, requestedRevision)
       ) {
         return;
       }
@@ -14739,7 +14725,7 @@ export class PanelProvider implements vscode.Disposable {
       ) {
         // Another decode stopped this one. The window reads again once in its selection, and a second stop fails it.
         const interrupted = result?.value.kind === 'stale' && result.value.interrupted === true;
-        const rereadInterrupted = interrupted && this.interruptedRereads.get(sessionId)?.generation !== generation;
+        const rereadInterrupted = interrupted && this.interruptedRereads.get(current.file)?.generation !== generation;
         retryLatestRevision = Boolean(
           result &&
           result.revision &&
@@ -14752,15 +14738,15 @@ export class PanelProvider implements vscode.Disposable {
                 !sameProgressiveRevision(result.revision, currentRevision)))),
         );
         if (retryLatestRevision) {
-          if (rereadInterrupted) this.interruptedRereads.set(sessionId, { generation, failed: false });
+          if (rereadInterrupted) this.interruptedRereads.set(current.file, { generation, failed: false });
           return;
         }
-        if (interrupted) this.interruptedRereads.set(sessionId, { generation, failed: true });
-        this.selectionFailure = { sessionId, generation, revision: currentRevision };
+        if (interrupted) this.interruptedRereads.set(current.file, { generation, failed: true });
+        this.selectionFailures.set(current.file, { sessionId, generation, revision: currentRevision });
         this.refreshFrom('selected-failure', true, true, null, true, true);
         return;
       }
-      this.interruptedRereads.delete(sessionId);
+      this.interruptedRereads.delete(current.file);
       this.updateHistoryAfterAcceptedWindow(sessionId, previous, result, true, current.file);
       this.acceptCompressedWindow(current, result.value, sessionId, generation);
       this.acceptSelectedMetadataRead(current, generation);
@@ -14778,7 +14764,7 @@ export class PanelProvider implements vscode.Disposable {
         checkpointBytes: result.value.checkpointBytes,
       });
       // Another panel's failure stays drawn when this panel's window arrives.
-      if (this.selectionFailure?.sessionId === sessionId) this.selectionFailure = null;
+      if (this.selectionFailureOf(current)) this.selectionFailures.delete(current.file);
       retryLatestRevision ||= result.value.recoveryPending === true;
       // A new Claude window changes the turns the subagent split reads, so the next pass refreshes the retained
       // pages with it.
@@ -14821,7 +14807,7 @@ export class PanelProvider implements vscode.Disposable {
     } catch {
       const current = this.currentSelectedSession(work);
       if (current) {
-        this.selectionFailure = { sessionId, generation, revision: this.revisionOf(current) };
+        this.selectionFailures.set(current.file, { sessionId, generation, revision: this.revisionOf(current) });
         this.refreshFrom('selected-failure', true, true, null, true, true);
       }
     } finally {
@@ -14860,13 +14846,8 @@ export class PanelProvider implements vscode.Disposable {
       if (signal.aborted) {
         return false;
       }
-      const selectedFailure =
-        this.selectionFailure?.sessionId === session.sessionId &&
-        this.selectionFailure.generation === this.selectionGeneration &&
-        sameProgressiveRevision(this.selectionFailure.revision, this.revisionOf(session));
-      if (this.selectionFailure?.sessionId === session.sessionId && !selectedFailure) {
-        this.selectionFailure = null;
-      }
+      const selectedFailure = this.drawnSelectionFailure(session);
+      if (this.selectionFailureOf(session) && !selectedFailure) this.selectionFailures.delete(session.file);
       if (session.sessionId === this.showing) {
         continue;
       }
@@ -15431,6 +15412,46 @@ export class PanelProvider implements vscode.Disposable {
     )) {
       this.dropOlderHistory(sessionId);
     }
+  }
+
+  // The read failure of the session, when its file holds one for that session.
+  private selectionFailureOf(session: { file: string; sessionId: string }) {
+    const failure = this.selectionFailures?.get(session.file);
+    return failure?.sessionId === session.sessionId ? failure : undefined;
+  }
+
+  // A panel draws the read failure of its session in the selection generation of the failure, at an unchanged revision.
+  private drawnSelectionFailure(session: SessionFile): boolean {
+    const failure = this.selectionFailureOf(session);
+    return (
+      !!failure &&
+      failure.generation === this.selectionGeneration &&
+      sameProgressiveRevision(failure.revision, this.revisionOf(session))
+    );
+  }
+
+  // A selection clears the read failure of its own session. The failure of a session that another panel shows stays
+  // drawn in the new selection generation with its reread record, and that panel does not read the failed window again.
+  private carrySelectionFailures(selected: string | null): void {
+    const shown = new Set(this.hostSessions?.values() ?? []);
+    for (const [file, failure] of this.selectionFailures ?? []) {
+      if (failure.sessionId === selected) {
+        this.selectionFailures.delete(file);
+      } else if (shown.has(failure.sessionId) && failure.generation === this.selectionGeneration - 1) {
+        this.selectionFailures.set(file, { ...failure, generation: this.selectionGeneration });
+        const reread = this.interruptedRereads?.get(file);
+        if (reread?.generation === failure.generation)
+          this.interruptedRereads.set(file, { ...reread, generation: this.selectionGeneration });
+      }
+    }
+  }
+
+  // A removed source takes its read failure and its reread record with it.
+  private dropRemovedSelectionFailures(sources: SessionFile[]): void {
+    const files = new Set(sources.map((source) => source.file));
+    for (const file of this.selectionFailures?.keys() ?? []) if (!files.has(file)) this.selectionFailures.delete(file);
+    for (const file of this.interruptedRereads?.keys() ?? [])
+      if (!files.has(file)) this.interruptedRereads.delete(file);
   }
 
   // Before a window request for another path, drop the pages that the previous path read.
