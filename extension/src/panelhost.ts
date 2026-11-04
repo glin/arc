@@ -9505,7 +9505,7 @@ export class PanelProvider implements vscode.Disposable {
     // drawn in the new selection generation, and that panel does not read the failed window again.
     const failure = this.selectionFailure;
     const failureShown =
-      failure !== null && failure.sessionId !== session && [...this.hostSessions.values()].includes(failure.sessionId);
+      !!failure && failure.sessionId !== session && [...this.hostSessions.values()].includes(failure.sessionId);
     if (!failure || !failureShown) {
       this.selectionFailure = null;
     } else if (failure.generation === this.selectionGeneration - 1) {
