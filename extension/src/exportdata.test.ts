@@ -1461,6 +1461,21 @@ test('missing native records retain each relationship and an explicit partial re
   });
 });
 
+test('a compressed root rollout is an unavailable session file', async () => {
+  const f = fixture();
+  const plain = f.codexSession(CODEX_ID);
+  const root = `${plain}.zst`;
+  fs.renameSync(plain, root);
+  const stat = fs.statSync(root);
+  const options: ExportCaptureOptions = {
+    ...f.options,
+    root: { agent: 'codex', file: root, sessionId: CODEX_ID, size: stat.size, mtimeMs: stat.mtimeMs },
+  };
+  await withExportTransaction(f.output, async (writer) => {
+    await assert.rejects(captureSessionExport(options, writer), /The session file is unavailable/);
+  });
+});
+
 test('selecting a native child preserves an outside parent without following its incoming link', async () => {
   const f = fixture();
   f.codexSession(CODEX_ID);

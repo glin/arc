@@ -1,4 +1,5 @@
 import { meterRead, meterReadWork, readPhase } from './readmeter';
+import { isCompressedRollout } from './compressedrollouts';
 import * as fs from 'node:fs/promises';
 import type { Dir } from 'node:fs';
 import * as path from 'node:path';
@@ -177,6 +178,8 @@ const identityKey = (entry: ExportIdentity) =>
 const entryKey = (entry: Entry) => entry.qualified ?? identityKey(entry);
 
 async function fileEntry(agent: AgentKind, file: string, sessionId: string, parentSessionId?: string): Promise<Entry> {
+  // Export reads plain transcripts only. A compressed rollout is unavailable to it.
+  if (isCompressedRollout(file)) throw new Error('The session file is unavailable.');
   const stat = await fs.lstat(file);
   if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('The session file is unavailable.');
   return {
@@ -975,6 +978,8 @@ async function numericRecord(
       },
     };
   };
+  // The spend reader reads plain transcripts only, so a compressed rollout counts as a changed source.
+  if (isCompressedRollout(entry.file)) throw new SourceChanged();
   for (;;) {
     checkExportCancellation(options.signal);
     const result = indexSpendFile(record, entry.file, entry.cwd ?? 'export', factory, {
