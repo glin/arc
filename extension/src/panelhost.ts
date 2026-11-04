@@ -9501,7 +9501,19 @@ export class PanelProvider implements vscode.Disposable {
       this.selectionWork?.controller.abort();
       this.selectionWork = null;
     }
-    this.selectionFailure = null;
+    // A selection clears the read failure of its own session. The failure of a session that another panel shows stays
+    // drawn in the new selection generation, and that panel does not read the failed window again.
+    const failure = this.selectionFailure;
+    const failureShown =
+      failure !== null && failure.sessionId !== session && [...this.hostSessions.values()].includes(failure.sessionId);
+    if (!failure || !failureShown) {
+      this.selectionFailure = null;
+    } else if (failure.generation === this.selectionGeneration - 1) {
+      this.selectionFailure = { ...failure, generation: this.selectionGeneration };
+      const reread = this.interruptedRereads.get(failure.sessionId);
+      if (reread?.generation === failure.generation)
+        this.interruptedRereads.set(failure.sessionId, { ...reread, generation: this.selectionGeneration });
+    }
     // Selection reuses the catalog and promotes its sources for integrity checks.
     const seeded = this.selectionGeneration;
     this.railSeedOwedFor = seeded;

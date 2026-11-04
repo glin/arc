@@ -3705,29 +3705,32 @@ test('two panels on two compressed sessions draw one window and one read failure
   // The worker decodes one body at a time. A window for another path stops the running decode, which answers interrupted.
   let running: { file: string; stop: () => void } | null = null;
   const requests: string[] = [];
-  const provider = selectedWindowHarness((request, generation) => {
-    const session = request.kind === 'window' ? request.input.session : first;
-    requests.push(session.sessionId);
-    const revision = provider.revisionOf(session);
-    return new Promise((resolve) => {
-      // A ping-pong that never ends draws both windows after the eighth request, so the count fails instead of the heap.
-      if (requests.length > 8) return resolve(windowResult(generation, revision));
-      if (running && running.file !== session.file) running.stop();
-      const decode = {
-        file: session.file,
-        stop: () => {
-          if (running === decode) running = null;
-          resolve({ generation, revision, value: { kind: 'stale', interrupted: true } });
-        },
-      };
-      running = decode;
-      setImmediate(() => {
-        if (running !== decode) return;
-        running = null;
-        resolve(windowResult(generation, revision));
+  const provider = selectedWindowHarness(
+    (request, generation) => {
+      const session = request.kind === 'window' ? request.input.session : first;
+      requests.push(session.sessionId);
+      const revision = provider.revisionOf(session);
+      return new Promise((resolve) => {
+        // A ping-pong that never ends draws both windows after the eighth request, so the count fails instead of the heap.
+        if (requests.length > 8) return resolve(windowResult(generation, revision));
+        if (running && running.file !== session.file) running.stop();
+        const decode = {
+          file: session.file,
+          stop: () => {
+            if (running === decode) running = null;
+            resolve({ generation, revision, value: { kind: 'stale', interrupted: true } });
+          },
+        };
+        running = decode;
+        setImmediate(() => {
+          if (running !== decode) return;
+          running = null;
+          resolve(windowResult(generation, revision));
+        });
       });
-    });
-  });
+    },
+    ['show'],
+  );
   provider.progressiveWorker.releaseCompressedBody = () => {};
   const firstPanel = {};
   const secondPanel = {};
@@ -3761,6 +3764,18 @@ test('two panels on two compressed sessions draw one window and one read failure
   provider.hostSessions.set(secondPanel, 'plain');
   provider.releaseUnselectedCompressedBody();
   assert.deepEqual(released, [second.file], 'the body of the drawn window stayed after its panel left it');
+  // A selection in the second panel keeps the read failure of the first panel drawn and sends no read for it.
+  const third = { ...first, file: 'third.jsonl', sessionId: 'third', ino: 5 };
+  provider.catalog = [first, second, third];
+  provider.show(third.sessionId, secondPanel);
+  await vi.waitFor(() => assert.ok(provider.cache.has(third.file), 'the selected window was not drawn'));
+  assert.deepEqual(
+    provider.selectionFailure,
+    { sessionId: first.sessionId, generation: provider.selectionGeneration, revision: provider.revisionOf(first) },
+    'the selection cleared the read failure of the other panel',
+  );
+  await provider.completeSelectedWindow(first.sessionId, provider.selectionGeneration);
+  assert.deepEqual(requests, ['first', 'second', 'first', 'second', 'third'], 'the selection read the failed window');
 });
 
 test('a page read of a compressed session releases its body when its panel leaves the session', async () => {
