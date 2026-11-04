@@ -3576,6 +3576,8 @@ test('a selected window whose decode another request stopped reads again', async
   let requests = 0;
   const provider = selectedWindowHarness(async (_request, generation) => {
     requests++;
+    // A retry that never ends answers nothing after the third request, so the count fails instead of the heap.
+    if (requests > 2) return null;
     const revision = provider.revisionOf(provider.session);
     return requests === 1
       ? { generation, revision, value: { kind: 'stale', interrupted: true } }
