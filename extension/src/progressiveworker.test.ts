@@ -3,6 +3,8 @@ import { revisionOf } from './transcript';
 import { beforeAll, test, vi } from 'vitest';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
+import * as zlib from 'node:zlib';
+import { createHash } from 'node:crypto';
 import { tempDir } from './temproot.ts';
 import * as path from 'node:path';
 import { buildSync } from 'esbuild';
@@ -21,6 +23,7 @@ import {
   type ProgressiveCheckpoint,
   type DispatchRootCharges,
   type ProgressiveResult,
+  type ProgressiveCursor,
 } from './progressiveworker';
 import {
   readSession,
@@ -9126,7 +9129,8 @@ for (const agent of ['claude', 'codex'] as const) {
           ]
             .map((record) => JSON.stringify(record))
             .join('\n') + '\n';
-        const seam = 'const tail = tailOf(session.file, tailBytes, true);';
+        const seam =
+          'const tail = compressed ? compressed.source.tail(tailBytes, true) : tailOf(session.file, tailBytes, true);';
         const racedSource = source.replace(
           seam,
           `require('node:fs').writeFileSync(session.file, ${JSON.stringify(replacement)}); ${seam}`,
@@ -13222,6 +13226,332 @@ test('a child edit read that fails after its first chunk publishes no edits', as
     );
     if (result?.value.kind !== 'child-file-edits') throw new Error('the worker sent no child edit reply');
     assert.deepEqual([result.value.status, result.value.files], ['unreadable', []]);
+  } finally {
+    worker.stop();
+  }
+});
+
+const zstdCompress = (zlib as { zstdCompressSync?: (input: Buffer) => Buffer }).zstdCompressSync;
+const COMPRESSED_THREAD = '019a0000-0000-7000-8000-00000000c0de';
+
+// A Codex rollout of finished turns with usage, written plain and compressed under one name in two directories.
+function compressedRolloutPair(extra: (turn: number) => object[] = () => [], frames = 1, turns = 3) {
+  const directory = tempDir('worker-compressed-');
+  const at = (second: number) => timestamp(second);
+  const records: object[] = [
+    {
+      timestamp: at(0),
+      type: 'session_meta',
+      payload: { id: COMPRESSED_THREAD, cwd: directory, model_provider: 'openai' },
+    },
+  ];
+  for (let turn = 1; turn <= turns; turn++) {
+    const turnId = `turn-${turn}`;
+    const usage = {
+      input_tokens: 1000 * turn,
+      cached_input_tokens: 0,
+      output_tokens: 10,
+      reasoning_output_tokens: 0,
+      total_tokens: 1000 * turn + 10,
+    };
+    records.push(
+      { timestamp: at(turn * 10), type: 'event_msg', payload: { type: 'task_started', turn_id: turnId } },
+      {
+        timestamp: at(turn * 10 + 1),
+        type: 'turn_context',
+        payload: { turn_id: turnId, cwd: directory, model: 'gpt-5.6-sol' },
+      },
+      {
+        timestamp: at(turn * 10 + 2),
+        type: 'event_msg',
+        payload: { type: 'user_message', message: `request ${turn}` },
+      },
+      {
+        timestamp: at(turn * 10 + 3),
+        type: 'response_item',
+        payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: `answer ${turn}` }] },
+      },
+      ...extra(turn),
+      {
+        timestamp: at(turn * 10 + 4),
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          info: { total_token_usage: usage, last_token_usage: usage, model_context_window: 258400 },
+        },
+      },
+      { timestamp: at(turn * 10 + 5), type: 'event_msg', payload: { type: 'task_complete', turn_id: turnId } },
+    );
+  }
+  const body = Buffer.from(records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+  const name = `rollout-2026-01-01T00-00-00-${COMPRESSED_THREAD}`;
+  fs.mkdirSync(path.join(directory, 'plain'));
+  fs.mkdirSync(path.join(directory, 'compressed'));
+  const plain = path.join(directory, 'plain', `${name}.jsonl`);
+  const compressed = path.join(directory, 'compressed', `${name}.jsonl.zst`);
+  fs.writeFileSync(plain, body);
+  const cut = Math.floor(body.length / frames);
+  fs.writeFileSync(
+    compressed,
+    Buffer.concat(
+      Array.from({ length: frames }, (_frame, index) =>
+        zstdCompress!(body.subarray(index * cut, index === frames - 1 ? body.length : (index + 1) * cut)),
+      ),
+    ),
+  );
+  const session = (file: string) => {
+    const stat = revisionOf(fs.statSync(file, { bigint: true }));
+    return { file, sessionId: COMPRESSED_THREAD, agent: 'codex' as const, ...stat };
+  };
+  const input = (file: string, compressedLimits?: ProgressiveInput['compressedLimits']): ProgressiveInput => ({
+    session: session(file),
+    folders: [directory],
+    children: [],
+    maxTurns: 40,
+    tailBytes: 65536,
+    ...(compressedLimits ? { compressedLimits } : {}),
+  });
+  return { directory, plain, compressed, body, session, input };
+}
+
+const windowOf = (result: ProgressiveResult | null) => {
+  assert.equal(result?.value.kind, 'window', `the read answered ${result?.value.kind}`);
+  return result.value;
+};
+
+test.skipIf(!zstdCompress)(
+  'a compressed window equals its plain copy and skips an oversized record without usage',
+  async () => {
+    // The record has no usage and no turn content, so dropping it leaves the turns, title and cost of the plain copy.
+    const pair = compressedRolloutPair((turn) =>
+      turn === 2
+        ? [
+            {
+              timestamp: timestamp(23),
+              type: 'event_msg',
+              payload: { type: 'raw_dump', items: Array(4000).fill('ab') },
+            },
+          ]
+        : [],
+    );
+    const limits = { reduceAbove: 1024, recordBytes: 4096 };
+    const worker = new ProgressiveWorker(source);
+    try {
+      const plain = windowOf(
+        await worker.run({ kind: 'window', input: pair.input(pair.plain) }, 1, new AbortController().signal),
+      );
+      const result = await worker.run(
+        { kind: 'window', input: pair.input(pair.compressed, limits) },
+        1,
+        new AbortController().signal,
+      );
+      const compressed = windowOf(result);
+      assert.equal(compressed.read.turns.length, 3);
+      assert.deepEqual(compressed.read.turns, plain.read.turns, 'the compressed window differs from its plain copy');
+      assert.deepEqual(compressed.read.compactions, plain.read.compactions);
+      assert.deepEqual(
+        compressed.read.turns.map((turn) => turnCost(turn)),
+        plain.read.turns.map((turn) => turnCost(turn)),
+      );
+      assert.equal(compressed.skippedRecords, 1);
+      assert.equal(compressed.undercount, undefined, 'a record without usage set the undercount mark');
+      assert.equal(compressed.partial, undefined);
+      assert.equal(
+        compressed.checkpoint.bodyHash,
+        createHash('sha256').update(fs.readFileSync(pair.compressed)).digest('hex'),
+      );
+      assert.deepEqual(
+        result!.revision,
+        revisionOf(fs.statSync(pair.compressed, { bigint: true })),
+        'the envelope left the physical revision',
+      );
+      assert.equal(plain.checkpoint.revision.size, pair.body.length);
+      assert.ok(compressed.checkpoint.revision.size < pair.body.length, 'the decoded length kept the skipped record');
+    } finally {
+      worker.stop();
+    }
+  },
+);
+
+test.skipIf(!zstdCompress)('a skipped compressed record with usage sets the undercount mark', async () => {
+  const pair = compressedRolloutPair((turn) =>
+    turn === 2
+      ? [
+          {
+            timestamp: timestamp(23),
+            type: 'event_msg',
+            payload: { type: 'token_count', info: null, rate_limits: { pad: Array(4000).fill('ab') } },
+          },
+        ]
+      : [],
+  );
+  const worker = new ProgressiveWorker(source);
+  try {
+    const value = windowOf(
+      await worker.run(
+        { kind: 'window', input: pair.input(pair.compressed, { reduceAbove: 1024, recordBytes: 4096 }) },
+        1,
+        new AbortController().signal,
+      ),
+    );
+    assert.equal(value.skippedRecords, 1);
+    assert.equal(value.undercount, true, 'a skipped usage record left no undercount mark');
+  } finally {
+    worker.stop();
+  }
+});
+
+test.skipIf(!zstdCompress)(
+  'a compressed rollout cut inside a frame returns its window as partial, and past its cap fails',
+  async () => {
+    const pair = compressedRolloutPair(undefined, 2);
+    const whole = fs.readFileSync(pair.compressed);
+    fs.writeFileSync(pair.compressed, whole.subarray(0, whole.length - 8));
+    let worker = new ProgressiveWorker(source);
+    try {
+      const cut = windowOf(
+        await worker.run({ kind: 'window', input: pair.input(pair.compressed) }, 1, new AbortController().signal),
+      );
+      assert.equal(cut.partial, 1, 'a cut decode did not count its one complete frame');
+      fs.writeFileSync(pair.compressed, whole);
+      const complete = windowOf(
+        await worker.run({ kind: 'window', input: pair.input(pair.compressed) }, 2, new AbortController().signal),
+      );
+      assert.equal(complete.partial, undefined, 'a complete decode returned partial');
+      // A new worker holds no body, so the decode runs under the lower cap.
+      worker.stop();
+      worker = new ProgressiveWorker(source);
+      const capped = await worker.run(
+        { kind: 'window', input: pair.input(pair.compressed, { bodyBytes: 1024 }) },
+        3,
+        new AbortController().signal,
+      );
+      assert.equal(capped?.value.kind, 'failed', 'a body past its cap opened');
+    } finally {
+      worker.stop();
+    }
+  },
+);
+
+test.skipIf(!zstdCompress)('a compressed checkpoint and cursor serve only their own path and body hash', async () => {
+  const pair = compressedRolloutPair(undefined, 1, 25);
+  const worker = new ProgressiveWorker(source);
+  const run = (request: Parameters<ProgressiveWorker['run']>[0]) =>
+    worker.run(request, 1, new AbortController().signal);
+  try {
+    const first = windowOf(await run({ kind: 'window', input: pair.input(pair.compressed) }));
+    const again = windowOf(
+      await run({ kind: 'window', input: pair.input(pair.compressed), checkpoint: first.checkpoint }),
+    );
+    assert.equal(again.reset, false, 'an equal body hash did not reuse its checkpoint');
+    const other = windowOf(
+      await run({
+        kind: 'window',
+        input: pair.input(pair.compressed),
+        checkpoint: { ...first.checkpoint, bodyHash: 'other' },
+      }),
+    );
+    assert.equal(other.reset, true, 'a checkpoint of another body hash was reused');
+    const plainWindow = windowOf(
+      await run({ kind: 'window', input: pair.input(pair.plain), checkpoint: first.checkpoint }),
+    );
+    assert.equal(plainWindow.reset, true, 'a compressed checkpoint served the plain copy');
+
+    const page = await run({ kind: 'page', input: pair.input(pair.compressed), cursor: null });
+    assert.equal(page?.value.kind === 'page' && page.value.page.kind, 'page');
+    const plainPage = await run({ kind: 'page', input: pair.input(pair.plain), cursor: null });
+    assert.equal(plainPage?.value.kind === 'page' && plainPage.value.page.kind, 'page');
+    const cursorOf = (result: ProgressiveResult | null) =>
+      result?.value.kind === 'page' && result.value.page.kind === 'page' ? result.value.page.cursor : null;
+    const compressedCursor = {
+      revision: first.checkpoint.revision,
+      end: 1,
+      fragment: Buffer.alloc(0),
+      pageEnd: 1,
+      heldRecords: [],
+      source: 'codex',
+      sessionId: COMPRESSED_THREAD,
+      adapterState: null,
+      ...cursorOf(page),
+      bodyFile: pair.compressed,
+      bodyHash: first.checkpoint.bodyHash,
+    } as ProgressiveCursor;
+    const stale = async (file: string, cursor: ProgressiveCursor) => {
+      const result = await run({ kind: 'page', input: pair.input(file), cursor });
+      return result?.value.kind === 'page' && result.value.page.kind === 'stale';
+    };
+    assert.equal(
+      await stale(pair.compressed, { ...compressedCursor, bodyHash: 'other' }),
+      true,
+      'a cursor of another hash read a page',
+    );
+    assert.equal(
+      await stale(pair.compressed, { ...compressedCursor, bodyFile: pair.plain }),
+      true,
+      'a cursor of another path read a page',
+    );
+    assert.equal(await stale(pair.plain, compressedCursor), true, 'a compressed cursor read the plain copy');
+    const plainCursor = { ...compressedCursor, ...cursorOf(plainPage) };
+    delete plainCursor.bodyFile;
+    delete plainCursor.bodyHash;
+    assert.equal(await stale(pair.compressed, plainCursor), true, 'a plain cursor read the compressed body');
+    assert.equal(
+      await stale(pair.compressed, compressedCursor),
+      false,
+      'a cursor of the same path and hash went stale',
+    );
+  } finally {
+    worker.stop();
+  }
+});
+
+test('worker requests outside the opening path refuse a compressed rollout', async () => {
+  const directory = tempDir('worker-compressed-refusal-');
+  const file = path.join(directory, `rollout-2026-01-01T00-00-00-${COMPRESSED_THREAD}.jsonl.zst`);
+  // The file holds plain records, so each request would read them without its refusal.
+  fs.writeFileSync(file, compressedRolloutPair().body);
+  const stat = revisionOf(fs.statSync(file, { bigint: true }));
+  const session = { file, sessionId: COMPRESSED_THREAD, agent: 'codex' as const, ...stat };
+  const worker = new ProgressiveWorker(source);
+  const run = (request: Parameters<ProgressiveWorker['run']>[0]) =>
+    worker.run(request, 1, new AbortController().signal);
+  try {
+    assert.deepEqual((await run({ kind: 'codex-context', session }))?.value, { kind: 'codex-context', estimate: null });
+    assert.deepEqual((await run({ kind: 'starts', session }))?.value, { kind: 'stale', unread: true });
+    assert.deepEqual((await run({ kind: 'metadata', session }))?.value, { kind: 'stale', unread: true });
+    assert.deepEqual(
+      (await run({ kind: 'metadata-recovery', session, sliceBytes: 1024, eligible: [COMPRESSED_THREAD] }))?.value,
+      {
+        kind: 'stale',
+        unread: true,
+      },
+    );
+    const { spendFileVersion } = await import('./agentspend.js');
+    const edits = await run({
+      kind: 'child-file-edits',
+      source: {
+        agent: 'codex',
+        file,
+        revision: spendFileVersion(file),
+        threadId: COMPRESSED_THREAD,
+        parentThreadId: null,
+      },
+      keys: ['a.ts'],
+      folders: [],
+    });
+    assert.equal(edits?.value.kind === 'child-file-edits' && edits.value.status, 'unreadable');
+    const { COMMIT_REPOSITORY_PARSER_VERSION: parserVersion } = await import('./codexhistory.js');
+    const commit = await run({
+      kind: 'commit-repositories',
+      parent: { file, sessionId: COMPRESSED_THREAD, revision: stat },
+      child: { file, sessionId: COMPRESSED_THREAD, revision: stat },
+      commits: [],
+      parentBytes: 1024,
+      childBytes: 1024,
+      token: null,
+      parserVersion,
+    });
+    assert.equal(commit?.value.kind === 'commit-repositories' && commit.value.status, 'stale');
   } finally {
     worker.stop();
   }

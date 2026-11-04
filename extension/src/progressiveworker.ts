@@ -153,6 +153,8 @@ export interface ProgressiveInput {
   // Host-supplied clock for child activity and its cache key.
   // The worker otherwise reads the clock once per request.
   spendNow?: number;
+  // Limits of a compressed rollout decode. Absent uses the 512 MiB body cap and main's record bounds.
+  compressedLimits?: { bodyBytes?: number; reduceAbove?: number; recordBytes?: number };
 }
 export interface DispatchSessionFacts {
   sessionId: string;

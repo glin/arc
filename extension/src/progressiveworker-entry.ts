@@ -334,7 +334,12 @@ function releaseCompressedBody(): void {
 
 // The decoded body of a compressed rollout. `verify` hashes the file again, and a hash or revision that differs from
 // the held body decodes the file again. Without `verify` an unchanged `fstat` keeps the held body.
-async function openCompressedBody(file: string, verify: boolean, signal: AbortSignal): Promise<CompressedBodyRead> {
+async function openCompressedBody(
+  file: string,
+  verify: boolean,
+  signal: AbortSignal,
+  limits?: import('./progressiveworker').ProgressiveInput['compressedLimits'],
+): Promise<CompressedBodyRead> {
   if (heldBody && heldBody.file !== file) releaseCompressedBody();
   if (bodyDecode && bodyDecode.file !== file) bodyDecode = null;
   if (heldBody) {
@@ -351,7 +356,7 @@ async function openCompressedBody(file: string, verify: boolean, signal: AbortSi
   if (!bodyDecode) {
     const decode = {
       file,
-      read: decodeCompressedRollout(file).then((read) => {
+      read: decodeCompressedRollout(file, limits).then((read) => {
         if (bodyDecode === decode) {
           bodyDecode = null;
           if (read.kind === 'body') heldBody = read.body;
@@ -1374,7 +1379,7 @@ async function execute(
   const openCompressed = async (verify: boolean) => {
     if (!compressedFile) return null;
     if (session.agent !== 'codex') return { kind: 'stale' as const };
-    const opened = await openCompressedBody(session.file, verify, signal);
+    const opened = await openCompressedBody(session.file, verify, signal, request.input.compressedLimits);
     if (opened.kind !== 'body') return opened;
     const source = compressedByteSource(opened.body);
     const opening = openingRecordOf(source.opening());
