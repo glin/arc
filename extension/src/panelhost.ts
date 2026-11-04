@@ -1452,6 +1452,9 @@ export class PanelProvider implements vscode.Disposable {
   private selectionWork: SelectionWork | null = null;
   private selectionWorks = new Map<string, SelectionWork>();
   private selectionFailure: { sessionId: string; generation: number; revision: FileRevision } | null = null;
+  // The selection generation in which each session spent its one reread of an interrupted window, and whether a
+  // second interruption then failed the window.
+  private interruptedRereads = new Map<string, { generation: number; failed: boolean }>();
   // The selection generation whose compressed rollout still needs its hash check, or null when no check is owed.
   private compressedCheck: number | null = null;
   // The compressed rollout whose decoded body the worker holds for the selection.
@@ -14685,6 +14688,18 @@ export class PanelProvider implements vscode.Disposable {
           (!compressed &&
             requestedRevision.size > previous.revision.size &&
             onlyGrew(previous.revision, requestedRevision)));
+      // A window that a second interruption failed stays failed for its selection and revision, so a later refresh
+      // does not stop the other decode again. The owner selects the session to read it again.
+      const interruptedReread = this.interruptedRereads.get(sessionId);
+      if (
+        interruptedReread?.failed &&
+        interruptedReread.generation === generation &&
+        this.selectionFailure?.sessionId === sessionId &&
+        this.selectionFailure.generation === generation &&
+        sameProgressiveRevision(this.selectionFailure.revision, requestedRevision)
+      ) {
+        return;
+      }
       this.dropHistoryOfOtherPath(session);
       const result = await this.progressiveWorker.run(
         {
@@ -14707,23 +14722,30 @@ export class PanelProvider implements vscode.Disposable {
         !result.revision ||
         !acceptsProgressiveResult(result, generation, currentRevision)
       ) {
+        // Another decode stopped this one. The window reads again once in its selection, and a second stop fails it.
+        const interrupted = result?.value.kind === 'stale' && result.value.interrupted === true;
+        const rereadInterrupted = interrupted && this.interruptedRereads.get(sessionId)?.generation !== generation;
         retryLatestRevision = Boolean(
           result &&
           result.revision &&
           (result.value.kind === 'stale' || result.value.kind === 'window') &&
           result.generation === generation &&
           !controller.signal.aborted &&
-          ((result.value.kind === 'stale' && result.value.interrupted === true) ||
-            !sameProgressiveRevision(result.revision, requestedRevision) ||
-            !sameProgressiveRevision(result.revision, currentRevision)),
+          (rereadInterrupted ||
+            (!interrupted &&
+              (!sameProgressiveRevision(result.revision, requestedRevision) ||
+                !sameProgressiveRevision(result.revision, currentRevision)))),
         );
         if (retryLatestRevision) {
+          if (rereadInterrupted) this.interruptedRereads.set(sessionId, { generation, failed: false });
           return;
         }
+        if (interrupted) this.interruptedRereads.set(sessionId, { generation, failed: true });
         this.selectionFailure = { sessionId, generation, revision: currentRevision };
         this.refreshFrom('selected-failure', true, true, null, true, true);
         return;
       }
+      this.interruptedRereads.delete(sessionId);
       this.updateHistoryAfterAcceptedWindow(sessionId, previous, result, true, current.file);
       this.acceptCompressedWindow(current, result.value, sessionId, generation);
       this.acceptSelectedMetadataRead(current, generation);
