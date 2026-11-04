@@ -13772,6 +13772,42 @@ test.skipIf(!zstdCompress)('a window of a released path waits until the read of 
   }
 });
 
+test.skipIf(!zstdCompress)(
+  'a page whose file the host released while it waited behind another path keeps no body',
+  async () => {
+    const first = compressedRolloutPair();
+    const second = compressedRolloutPair();
+    // The window of the second path holds its first chunk until the gate opens. The page stops that decode and waits
+    // until the window ends.
+    const { worker, decoders, open } = decoderWorker(first.directory, [1]);
+    try {
+      const window = worker.run(
+        { kind: 'window', input: second.input(second.compressed) },
+        1,
+        new AbortController().signal,
+      );
+      await vi.waitFor(() => assert.equal(decoders().made, 1), DECODE_STARTS);
+      const page = worker.run(
+        { kind: 'page', input: first.input(first.compressed), cursor: null },
+        1,
+        new AbortController().signal,
+      );
+      worker.releaseCompressedBody(first.compressed);
+      open();
+      assert.deepEqual(staleKind(await window), { kind: 'stale', interrupted: true });
+      assert.equal(pageKind(await page), 'stale', 'a page read a body that the host released while it waited');
+      assert.equal(decoders().made, 2, 'the waiting page did not decode its body');
+      // No body is held, so the next window of the released path decodes again.
+      windowOf(
+        await worker.run({ kind: 'window', input: first.input(first.compressed) }, 2, new AbortController().signal),
+      );
+      assert.equal(decoders().made, 3, 'the worker kept the body that the host released');
+    } finally {
+      worker.stop();
+    }
+  },
+);
+
 test('worker requests outside the opening path refuse a compressed rollout', async () => {
   const directory = tempDir('worker-compressed-refusal-');
   const file = path.join(directory, `rollout-2026-01-01T00-00-00-${COMPRESSED_THREAD}.jsonl.zst`);

@@ -344,16 +344,22 @@ let bodyDrained: Array<() => void> = [];
 // answers stale with `interrupted`.
 let bodyReleases = 0;
 const requestBodies = new WeakMap<AbortSignal, { body: CompressedBody; releases: number }>();
+// Every host release in arrival order, the last release of each file, and the release count that each request read
+// when it arrived, by its signal. A request whose file the host released after it arrived drops the body it decoded.
+let releaseSequence = 0;
+const fileReleases = new Map<string, number>();
+const arrivalReleases = new WeakMap<AbortSignal, number>();
 
 function releaseCompressedBody(): void {
   heldBody = null;
   bodyDecode?.controller.abort();
 }
 
-// The host releases the body of `file`. A release of another path changes nothing. The released path leaves
-// `bodyPath`, so a later request for it waits until the reads of the released body end and never decodes a second body
-// beside it.
+// The host releases the body of `file`. The release stamps the file for the requests that wait. A release of another
+// path than `bodyPath` changes nothing else. The released path leaves `bodyPath`, so a later request for it waits until
+// the reads of the released body end and never decodes a second body beside it.
 function releaseHostBody(file: string): void {
+  fileReleases.set(file, ++releaseSequence);
   if (bodyPath !== file) return;
   bodyReleases += 1;
   bodyPath = null;
@@ -375,6 +381,15 @@ async function enterBodyPath(file: string, signal: AbortSignal): Promise<boolean
     bodyPath = file;
   }
   bodyUsers += 1;
+  return true;
+}
+
+// A request whose file the host released after the request arrived keeps no body. It drops the body it decoded, as a
+// release during its read does.
+function releasedSinceArrival(file: string, body: CompressedBody, signal: AbortSignal): boolean {
+  if ((fileReleases.get(file) ?? 0) <= (arrivalReleases.get(signal) ?? releaseSequence)) return false;
+  if (heldBody === body) heldBody = null;
+  if (bodyPath === file) bodyPath = null;
   return true;
 }
 
@@ -1461,6 +1476,7 @@ async function execute(
     const releases = bodyReleases;
     const opened = await openCompressedBody(session.file, verify, signal, request.input.compressedLimits);
     if (opened.kind !== 'body') return opened;
+    if (releasedSinceArrival(session.file, opened.body, signal)) return { kind: 'cancelled' as const };
     requestBodies.set(signal, { body: opened.body, releases });
     const source = compressedByteSource(opened.body);
     const opening = openingRecordOf(source.opening());
@@ -2279,6 +2295,7 @@ async function handleMessage(message: {
   }
   const controller = new AbortController();
   requests.set(message.id, controller);
+  arrivalReleases.set(controller.signal, releaseSequence);
   const kind = message.request.kind;
   for (const read of windowReads.values()) countKind(read.report.during.received, kind);
   if (kind === 'window' && windowReads.size < WINDOW_READS) {
