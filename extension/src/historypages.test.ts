@@ -40,6 +40,7 @@ import {
   restartHistoryCoverage,
   staleCursorIsStuck,
   startSessionHistory,
+  historyOfOtherPath,
 } from './historypages.ts';
 import { ClaudeHistoryCursor, readClaudeHistoryPageAsync } from './claudehistory.ts';
 import { CodexHistoryCursor, readCodexHistoryPageAsync, readCodexSessionIncrementalAsync } from './codexhistory.ts';
@@ -1943,6 +1944,12 @@ test.skipIf(!zstdCompress)(
   },
   120_000,
 );
+
+test('a history record that startSessionHistory creates is dropped by a window for another path', () => {
+  const held = startSessionHistory({ sessionId: 'sess', size: 10, mtimeMs: 1, file: 'rollout-a.jsonl.zst' }, 1);
+  assert.equal(historyOfOtherPath(held, 'rollout-a.jsonl'), true, 'a window for another path kept the pages');
+  assert.equal(historyOfOtherPath(held, 'rollout-a.jsonl.zst'), false, 'a window for the same path dropped the pages');
+});
 
 test('a changed body hash drops the loaded pages, and an equal one keeps them', () => {
   const revision = { size: 10, mtimeMs: 1, dev: 1, ino: 1 };
