@@ -13511,12 +13511,27 @@ test.skipIf(!zstdCompress)('a compressed checkpoint and cursor serve only their 
 });
 
 // A worker whose zstd decoders write how many exist, run and ran at once to a file. Each decoder whose number is in
-// `gated` holds its first chunk until the gate file exists, so a test can act while that decode runs.
-function decoderWorker(directory: string, gated: number[]) {
+// `gated` holds its first chunk until the gate file exists, so a test can act while that decode runs. With `holdRead`,
+// the first event-loop yield after a decode ends writes the held file and waits until the gate file exists, so a test
+// can act between the end of the decode and the window check.
+function decoderWorker(directory: string, gated: number[], holdRead = false) {
   const log = path.join(directory, 'decoders.json');
   const gate = path.join(directory, 'gate');
+  const heldFile = path.join(directory, 'held');
   const prefix = `{
     const zlib = require('node:zlib');
+    let decoded = false;
+    if (${JSON.stringify(holdRead)}) {
+      const later = setImmediate;
+      let held = false;
+      globalThis.setImmediate = (callback, ...args) => {
+        if (!decoded || held) return later(callback, ...args);
+        held = true;
+        require('node:fs').writeFileSync(${JSON.stringify(heldFile)}, '');
+        const go = () => (require('node:fs').existsSync(${JSON.stringify(gate)}) ? callback(...args) : setTimeout(go, 5));
+        return setTimeout(go, 5);
+      };
+    }
     const fs = require('node:fs');
     const make = zlib.createZstdDecompress;
     let made = 0, live = 0, peak = 0;
@@ -13529,6 +13544,7 @@ function decoderWorker(directory: string, gated: number[]) {
       peak = Math.max(peak, live);
       note();
       decoder.once('close', () => { live--; note(); });
+      decoder.once('end', () => { decoded = true; });
       if (${JSON.stringify(gated)}.includes(made)) {
         const transform = decoder._transform;
         decoder._transform = function (chunk, encoding, done) {
@@ -13542,7 +13558,12 @@ function decoderWorker(directory: string, gated: number[]) {
   }`;
   const decoders = (): { made: number; live: number; peak: number } =>
     fs.existsSync(log) ? JSON.parse(fs.readFileSync(log, 'utf8')) : { made: 0, live: 0, peak: 0 };
-  return { worker: new ProgressiveWorker(prefix + source), decoders, open: () => fs.writeFileSync(gate, '') };
+  return {
+    worker: new ProgressiveWorker(prefix + source),
+    decoders,
+    open: () => fs.writeFileSync(gate, ''),
+    held: () => fs.existsSync(heldFile),
+  };
 }
 
 // The worker thread loads its bundle before its first decode starts.
@@ -13630,6 +13651,33 @@ test.skipIf(!zstdCompress)('a release, or the abort of the request it serves, st
     worker.stop();
   }
 });
+
+test.skipIf(!zstdCompress)(
+  'a release between the end of a decode and the window check turns the window stale',
+  async () => {
+    const pair = compressedRolloutPair();
+    const { worker, decoders, open, held } = decoderWorker(pair.directory, [], true);
+    try {
+      const window = worker.run(
+        { kind: 'window', input: pair.input(pair.compressed) },
+        1,
+        new AbortController().signal,
+      );
+      await vi.waitFor(() => assert.ok(held(), 'the window read did not yield after its decode'), DECODE_STARTS);
+      assert.equal(decoders().made, 1);
+      worker.releaseCompressedBody();
+      open();
+      assert.equal((await window)?.value.kind, 'stale', 'a window read over a released body');
+      // No body is held, so the next window of the path decodes again.
+      windowOf(
+        await worker.run({ kind: 'window', input: pair.input(pair.compressed) }, 2, new AbortController().signal),
+      );
+      assert.equal(decoders().made, 2, 'the released body served the next window');
+    } finally {
+      worker.stop();
+    }
+  },
+);
 
 test('worker requests outside the opening path refuse a compressed rollout', async () => {
   const directory = tempDir('worker-compressed-refusal-');
