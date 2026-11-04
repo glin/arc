@@ -2747,6 +2747,7 @@ function completeDiscoveryHarness(
       'windowCheckpoint',
       'acceptCompressedWindow',
       'noteCompressedDecoderMissing',
+      'releaseUnselectedCompressedBody',
       'acceptExplicitMetadataRead',
       'acceptSelectedMetadataRead',
     );
@@ -3219,6 +3220,7 @@ function selectedWindowHarness(
     'windowCheckpoint',
     'acceptCompressedWindow',
     'noteCompressedDecoderMissing',
+    'releaseUnselectedCompressedBody',
     'jointSplitWindow',
     'acceptJointSplitWindow',
     'refreshFrom',
@@ -3542,6 +3544,47 @@ test('an imported session waits for catalog publication after discovery complete
     assert.ok(provider.cache.has(fixture.file));
     assert.deepEqual(provider.awaitingSessionRecords, {});
   }
+});
+
+test('the decoded body goes when no selected session reads its compressed rollout', () => {
+  const provider = selectedWindowHarness(async () => null);
+  let released = 0;
+  provider.progressiveWorker.releaseCompressedBody = () => released++;
+  const held = { file: 'held.jsonl.zst', sessionId: 'held', agent: 'codex', size: 1, mtimeMs: 1, dev: 1, ino: 1 };
+  const other = { ...held, file: 'other.jsonl', sessionId: 'other' };
+  const release = (showing: string, catalog: unknown[]) => {
+    provider.compressedBodyFile = held.file;
+    provider.showing = showing;
+    provider.catalog = catalog;
+    released = 0;
+    provider.releaseUnselectedCompressedBody();
+    return [released, provider.compressedBodyFile];
+  };
+  assert.deepEqual(release('held', [held, other]), [0, held.file], 'the selected body was released');
+  assert.deepEqual(release('other', [held, other]), [1, null], 'a reconciled selection kept the body');
+  assert.deepEqual(release('held', [other]), [1, null], 'a removed source kept the body');
+  assert.deepEqual(
+    release('held', [{ ...held, file: 'held.jsonl' }, other]),
+    [1, null],
+    'a plain window kept the body',
+  );
+  provider.hostSessions = new Map([[{}, 'held']]);
+  assert.deepEqual(release('other', [held, other]), [0, held.file], 'a body that another panel shows was released');
+});
+
+test('a selected window whose decode another request stopped reads again', async () => {
+  let requests = 0;
+  const provider = selectedWindowHarness(async (_request, generation) => {
+    requests++;
+    const revision = provider.revisionOf(provider.session);
+    return requests === 1
+      ? { generation, revision, value: { kind: 'stale', interrupted: true } }
+      : windowResult(generation, revision);
+  });
+  await provider.completeSelectedWindow('selected', 1);
+  await vi.waitFor(() => assert.ok(provider.cache.has(provider.session.file), 'the stopped window did not read again'));
+  assert.equal(requests, 2);
+  assert.equal(provider.selectionFailure, null, 'a stopped decode showed the read failure');
 });
 
 test('a slow selected read keeps its request until selection cancels it', async () => {
