@@ -470,8 +470,21 @@ export type ProgressiveValue =
       agentKey: string;
       structuralKey: string;
       structuralAgentIds?: readonly string[];
+      // A compressed rollout whose decode ended inside a frame: the count of complete frames decoded.
+      partial?: number;
+      // Records of a compressed rollout that stayed too large after reduction, and whether one of them held usage.
+      skippedRecords?: number;
+      undercount?: true;
     }
-  | { kind: 'page'; page: HistoryPageOutcome<ProgressiveCursor>; recoveryBytes?: number }
+  | {
+      kind: 'page';
+      page: HistoryPageOutcome<ProgressiveCursor>;
+      recoveryBytes?: number;
+      partial?: number;
+      skippedRecords?: number;
+    }
+  // A compressed rollout that does not decode or decodes past its cap. `unsupported` marks a Node.js without a decoder.
+  | { kind: 'failed'; unsupported?: true }
   | { kind: 'retained'; pages: HistoryPage[] }
   // `unread` marks a request the worker refused before it opened the source.
   | { kind: 'stale'; agentRunScan?: AgentRunScan; recoveryBytes?: number; unread?: true };
@@ -520,10 +533,17 @@ export function acceptsProgressiveResult(
   );
 }
 
-export function preservesLoadedHistory(previousRevision: FileRevision, result: ProgressiveResult): boolean {
+// `previousBodyHash` is the body hash of the previous checkpoint, and a compressed rollout keeps its pages only while
+// the hash stays the same.
+export function preservesLoadedHistory(
+  previousRevision: FileRevision,
+  result: ProgressiveResult,
+  previousBodyHash?: string,
+): boolean {
   return (
     result.revision !== null &&
     result.value.kind === 'window' &&
+    result.value.checkpoint.bodyHash === previousBodyHash &&
     (sameProgressiveRevision(result.revision, previousRevision) ||
       (result.value.appendFrom !== null && sameProgressiveRevision(result.value.appendFrom, previousRevision)))
   );
@@ -719,6 +739,11 @@ export class ProgressiveWorker {
 
   retainMetadataRecovery(sessionIds: string[]): void {
     this.worker?.postMessage({ metadataEligible: sessionIds });
+  }
+
+  // Drop the decoded body of a compressed rollout that the worker holds.
+  releaseCompressedBody(): void {
+    this.worker?.postMessage({ releaseBody: true });
   }
 
   run(

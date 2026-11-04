@@ -138,6 +138,15 @@ import {
 import { TURN_QUIET_MS, statusOf } from './turncard';
 import { DispatchReceipts } from './dispatchreceipts';
 import { admittedDispatchReferences } from './turnrail';
+import {
+  compressedByteSource,
+  compressedStat,
+  decodeCompressedRollout,
+  hashCompressedRollout,
+  isCompressedRollout,
+  type CompressedBody,
+  type CompressedBodyRead,
+} from './compressedrollouts';
 
 const agentSpends = new AgentSpendCache();
 const claudeChildSessions = new ClaudeChildSessionCache();
@@ -313,6 +322,49 @@ function revisionOf(file: string): FileRevision | null {
   }
 }
 
+// The one decoded body this worker holds, and the decode that a window or page request waits on. A request that names
+// another compressed path drops both, and the host drops them when the selection leaves the session.
+let heldBody: CompressedBody | null = null;
+let bodyDecode: { file: string; read: Promise<CompressedBodyRead> } | null = null;
+
+function releaseCompressedBody(): void {
+  heldBody = null;
+  bodyDecode = null;
+}
+
+// The decoded body of a compressed rollout. `verify` hashes the file again, and a hash or revision that differs from
+// the held body decodes the file again. Without `verify` an unchanged `fstat` keeps the held body.
+async function openCompressedBody(file: string, verify: boolean, signal: AbortSignal): Promise<CompressedBodyRead> {
+  if (heldBody && heldBody.file !== file) releaseCompressedBody();
+  if (bodyDecode && bodyDecode.file !== file) bodyDecode = null;
+  if (heldBody) {
+    const body = heldBody;
+    const stat = compressedStat(file);
+    if (stat && sameRevision(stat, body.stat)) {
+      if (!verify) return { kind: 'body', body };
+      const hashed = await hashCompressedRollout(file, signal);
+      if (signal.aborted) return { kind: 'cancelled' };
+      if (hashed && hashed.hash === body.hash && sameRevision(hashed.stat, body.stat)) return { kind: 'body', body };
+    }
+    if (heldBody === body) heldBody = null;
+  }
+  if (!bodyDecode) {
+    const decode = {
+      file,
+      read: decodeCompressedRollout(file).then((read) => {
+        if (bodyDecode === decode) {
+          bodyDecode = null;
+          if (read.kind === 'body') heldBody = read.body;
+        }
+        return read;
+      }),
+    };
+    bodyDecode = decode;
+  }
+  const read = await bodyDecode.read;
+  return signal.aborted ? { kind: 'cancelled' } : read;
+}
+
 function missingFile(file: string): boolean {
   try {
     fs.statSync(file);
@@ -383,6 +435,7 @@ async function execute(
   acknowledge?: (value: ProgressiveValue) => void,
 ): Promise<ProgressiveValue> {
   if (request.kind === 'codex-context') {
+    if (isCompressedRollout(request.session.file)) return { kind: 'codex-context', estimate: null };
     const revision = revisionOf(request.session.file);
     return {
       kind: 'codex-context',
@@ -394,6 +447,7 @@ async function execute(
   if (request.kind === 'commit-repositories') return executeCommitRepositories(request, signal);
   if (request.kind === 'child-file-edits') return executeChildFileEdits(request, signal);
   if (request.kind === 'metadata-recovery') {
+    if (isCompressedRollout(request.session.file)) return { kind: 'stale', unread: true };
     if (metadataRecovery && !request.eligible.includes(metadataRecovery.sessionId)) metadataRecovery = null;
     if (metadataRecovery && metadataRecovery.sessionId !== request.session.sessionId) {
       return { kind: 'stale' };
@@ -1143,6 +1197,9 @@ async function execute(
       scope: epoch.repositoryRoots,
     };
   }
+  if ((request.kind === 'starts' || request.kind === 'metadata') && isCompressedRollout(request.session.file)) {
+    return { kind: 'stale', unread: true };
+  }
   if (request.kind === 'starts') {
     const starts =
       request.session.agent === 'claude'
@@ -1312,11 +1369,42 @@ async function execute(
       }),
     };
   }
+  // A compressed rollout opens through its decoded body. A cursor or checkpoint of another form, path or hash is stale.
+  const compressedFile = isCompressedRollout(session.file);
+  const openCompressed = async (verify: boolean) => {
+    if (!compressedFile) return null;
+    if (session.agent !== 'codex') return { kind: 'stale' as const };
+    const opened = await openCompressedBody(session.file, verify, signal);
+    if (opened.kind !== 'body') return opened;
+    const source = compressedByteSource(opened.body);
+    const opening = openingRecordOf(source.opening());
+    return { kind: 'source' as const, source, opening };
+  };
   if (request.kind === 'page') {
+    const opened = await openCompressed(false);
+    const failed = { kind: 'page' as const, page: { kind: 'failed' as const }, recoveryBytes: 0 };
+    const stale = { kind: 'page' as const, page: { kind: 'stale' as const }, recoveryBytes: 0 };
+    if (opened && opened.kind !== 'source') return opened.kind === 'failed' ? failed : stale;
+    const compressed = opened?.kind === 'source' ? opened : null;
+    if (
+      request.cursor &&
+      (compressed
+        ? request.cursor.bodyHash !== compressed.source.body.hash || request.cursor.bodyFile !== session.file
+        : request.cursor.bodyHash !== undefined)
+    )
+      return stale;
     const sourceStamp = commitSourceStamp(session.file);
     if (request.cursor) {
       request.cursor.fragment = Buffer.from(request.cursor.fragment);
     }
+    const bodyOptions = compressed
+      ? {
+          revision: compressed.source.revision,
+          readRange: compressed.source.readRange,
+          evidenceReadRange: compressed.source.readRange,
+          opening: () => compressed.opening,
+        }
+      : {};
     const result =
       session.agent === 'claude'
         ? await readClaudeHistoryPageAsync(
@@ -1330,12 +1418,19 @@ async function execute(
             session.file,
             session.sessionId,
             request.cursor as CodexHistoryCursor | null,
-            { signal, targetTurns: 20 },
+            { signal, targetTurns: 20, ...bodyOptions },
             options,
           );
     if (result.kind === 'page') bindCommitSources(result.page.turns, session.file, sourceStamp);
+    const body = compressed?.source.body;
+    if (body && result.kind === 'page' && result.page.nextOlderCursor) {
+      result.page.nextOlderCursor.bodyFile = body.file;
+      result.page.nextOlderCursor.bodyHash = body.hash;
+    }
     return {
       kind: 'page',
+      ...(body && !body.complete ? { partial: body.frames } : {}),
+      ...(body?.skippedRecords ? { skippedRecords: body.skippedRecords } : {}),
       recoveryBytes: result.kind === 'page' ? (result.page.recoveryBytes ?? 0) : 0,
       page:
         result.kind === 'page'
@@ -1352,7 +1447,27 @@ async function execute(
             : { kind: 'failed' },
     };
   }
-  const checkpoint = revive(request.checkpoint);
+  const opened = await openCompressed(true);
+  if (opened && opened.kind !== 'source') {
+    return opened.kind === 'unsupported'
+      ? { kind: 'failed', unsupported: true }
+      : opened.kind === 'failed'
+        ? { kind: 'failed' }
+        : { kind: 'stale' };
+  }
+  const compressed = opened?.kind === 'source' ? opened : null;
+  const body = compressed?.source.body;
+  const revived = revive(request.checkpoint);
+  // The host sends a compressed checkpoint for an equal physical revision. A new hash or form drops it.
+  const checkpoint = revived && revived.bodyHash === body?.hash ? revived : undefined;
+  const bodyWork = compressed
+    ? {
+        revision: compressed.source.revision,
+        readRange: compressed.source.readRange,
+        opening: () => compressed.opening,
+      }
+    : {};
+  const sessionSize = body ? body.length : session.size;
   let recoveryBytes = 0;
   const read = async (bytes: number, held = checkpoint) => {
     const result = await (session.agent === 'claude'
@@ -1368,7 +1483,7 @@ async function execute(
           session.sessionId,
           held as CodexForwardCheckpoint | undefined,
           { ...options, tailBytes: bytes },
-          { signal },
+          { signal, ...bodyWork },
         ));
     recoveryBytes += 'recoveryBytes' in result ? Number(result.recoveryBytes) : 0;
     return result;
@@ -1384,7 +1499,7 @@ async function execute(
   let appendFrom = result.appendFrom;
   const initialRevision = result.checkpoint.revision;
   if (!result.read.turns.length && result.checkpoint.coveredFrom > 0) {
-    const tail = tailOf(session.file, tailBytes, true);
+    const tail = compressed ? compressed.source.tail(tailBytes, true) : tailOf(session.file, tailBytes, true);
     if (session.agent === 'claude') {
       tail.lines = blankClaudeRepeated(session.file, tail.lines, tail.offset ?? 0, Number.MAX_SAFE_INTEGER);
     }
@@ -1395,11 +1510,17 @@ async function execute(
         const discovered =
           session.agent === 'claude'
             ? await discoverClaudeNewestTurn(session.file, tail.cursor, { signal, chunkBytes: 256 * 1024 }, tail.lines)
-            : await discoverCodexNewestTurn(session.file, tail.cursor, undefined, { signal, chunkBytes: 256 * 1024 });
+            : await discoverCodexNewestTurn(session.file, tail.cursor, undefined, {
+                signal,
+                chunkBytes: 256 * 1024,
+                ...(compressed
+                  ? { readRange: compressed.source.readRange, agentPath: compressed.opening?.agentPath ?? null }
+                  : {}),
+              });
         if (discovered.kind === 'cancelled' || discovered.kind === 'stale') {
           return { kind: 'stale', recoveryBytes };
         }
-        const bytes = discovered.kind === 'found' ? discovered.readBytes : session.size;
+        const bytes = discovered.kind === 'found' ? discovered.readBytes : sessionSize;
         result = await read(bytes, undefined);
       }
       appendFrom =
@@ -1417,8 +1538,12 @@ async function execute(
       : [];
   if (!result.checkpoint.lineFragment.length && !result.checkpoint.discardUntilNewline)
     bindCommitSources(result.read.turns, session.file, sourceStamp);
+  if (body) result.checkpoint.bodyHash = body.hash;
   return {
     kind: 'window',
+    ...(body && !body.complete ? { partial: body.frames } : {}),
+    ...(body?.skippedRecords ? { skippedRecords: body.skippedRecords } : {}),
+    ...(body?.undercount ? { undercount: true as const } : {}),
     read: result.read,
     checkpoint: result.checkpoint,
     reset: result.kind === 'reset',
@@ -1921,6 +2046,8 @@ async function executeCommitRepositories(
   let status: import('./codexhistory').CommitRepositoryReply['status'] = 'pending';
   const charges = { parent: 0, child: 0 };
   if (
+    isCompressedRollout(request.parent.file) ||
+    isCompressedRollout(request.child.file) ||
     request.parserVersion !== COMMIT_REPOSITORY_PARSER_VERSION ||
     request.parentBytes + request.childBytes > COMMIT_REPOSITORY_REQUEST_BYTES ||
     request.parentBytes < 0 ||
@@ -1990,6 +2117,7 @@ async function executeChildFileEdits(
     (!!meta &&
       meta.sessionId === source.threadId &&
       (meta.parentThreadId === null || meta.parentThreadId === source.parentThreadId));
+  if (isCompressedRollout(source.file)) return reply('unreadable');
   const before = revisionOf(source.file);
   if (!before || spendFileVersion(source.file) !== source.revision) return reply('stale');
   if (before.size > CHILD_EDIT_READ_BYTES) return reply('too-large');
@@ -2166,7 +2294,13 @@ async function handleMessage(message: {
     if (read) read.completedAt = performance.now();
     const after = revisionOf(file);
     const stable = sameRevision(before, after);
-    const stableWindow = value.kind !== 'window' || sameRevision(value.checkpoint.revision, before);
+    // A compressed window compares its checkpoint with `before` at the decoded length of a body read from `before`.
+    const windowRevision = !isCompressedRollout(file)
+      ? before
+      : heldBody?.file === file && sameRevision(heldBody.stat, before)
+        ? { ...before, size: heldBody.length }
+        : null;
+    const stableWindow = value.kind !== 'window' || sameRevision(value.checkpoint.revision, windowRevision);
     const kept = stable ? undefined : scanKeptThroughGrowth(value, before, after);
     const metadataPrefix = value.kind === 'metadata' && after && after.size > before.size && onlyGrew(before, after);
     const result: ProgressiveResult = {
@@ -2262,9 +2396,14 @@ parentPort?.on(
     metadataEligible?: string[];
     dispatchSpendEntries?: Array<[string, CodexDispatchSpendEntry]>;
     repeated?: { file: string; map: ClaudeRepeatedHeldMap };
+    releaseBody?: true;
   }) => {
     if (message.dispatchSpendEntries) {
       for (const [file, entry] of message.dispatchSpendEntries) retainCodexDispatchSpend(file, entry);
+      return;
+    }
+    if (message.releaseBody) {
+      releaseCompressedBody();
       return;
     }
     if (message.repeated) adoptClaudeRepeatedMap(message.repeated.file, message.repeated.map);
