@@ -8,6 +8,7 @@ import { payloadSha256, type RequesterIdentity } from './sessionwrites';
 import type { LaunchPolicy } from './launchpolicy';
 import { canonicalToolPath } from './toolownership';
 import { meterRead } from './readmeter';
+import { isCompressedRollout } from './compressedrollouts';
 import type { ClaudeDispatchSessionReference, SessionFile } from './transcript';
 
 export const DISPATCH_ID = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
@@ -674,6 +675,8 @@ export class DispatchReceipts {
       !TOKEN.test(startup.sha256)
     )
       return null;
+    // The receipt check reads plain transcripts only. A compressed child transcript counts as missing.
+    if (isCompressedRollout(startup.file)) return null;
     reader.identities = {
       requester: { agent: launch.requester.provider, sessionId: launch.requester.id },
       child: { agent: options.provider, sessionId: accepted.sessionId },

@@ -98,6 +98,7 @@ function relationshipFixture(
   childProvider: 'claude' | 'codex' = 'codex',
   agentRun = false,
   cwd?: string,
+  name = 'native.jsonl',
 ) {
   const fx = fixture();
   const launch = fx.receipts.reserve({
@@ -106,7 +107,7 @@ function relationshipFixture(
     requester: { provider: parentProvider, id: session },
     standalone: settings(fx.home, { provider: childProvider, agentRun, ...(cwd ? { cwd } : {}) }),
   });
-  const file = path.join(fx.home, 'native.jsonl');
+  const file = path.join(fx.home, name);
   const opening = Buffer.from(JSON.stringify({ sessionId: turn, cwd: cwd ?? fx.home }) + '\n' + 'x'.repeat(2048));
   fs.writeFileSync(file, opening);
   const stat = fs.statSync(file, { bigint: true });
@@ -145,6 +146,11 @@ function drainRelationships(
   scan.return(undefined);
   return assert.fail('The bounded receipt scan did not finish.');
 }
+
+test('a receipt that names a compressed child transcript links no session', () => {
+  const fx = relationshipFixture('claude', 'codex', false, undefined, 'native.jsonl.zst');
+  assert.deepEqual(drainRelationships(fx.receipts.relationships(fx.catalog)), []);
+});
 
 test.each(['claude', 'codex'] as const)('verified %s receipt links survive removal of launch cwd', (provider) => {
   const cwd = scratch('arc-dispatch-worker-');
