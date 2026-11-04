@@ -7619,6 +7619,7 @@ function selectCommitSession(provider: any, session: any, turns: any[]) {
     ]),
     selectionWork: null,
     selectionFailure: null,
+    interruptedRereads: new Map(),
     selectionGeneration: 1,
     showing: session.sessionId,
     hosts: [],
@@ -18797,6 +18798,7 @@ test('the live Codex subagent route keeps each panel on the place its shared tra
     selectionGeneration: 0,
     selectionWork: null,
     selectionFailure: null,
+    interruptedRereads: new Map(),
     railSeedOwedFor: null,
     railSeedSkipped: false,
     notePanelStart() {},
@@ -21437,6 +21439,7 @@ test('opening another draft retries an unanswered MCP read for its agent', () =>
     selectionGeneration: 0,
     selectionWork: null,
     selectionFailure: null,
+    interruptedRereads: new Map(),
     showing: 's1',
     onSelectionChanged(session: string | null) {
       selected.push(session);
@@ -29029,6 +29032,7 @@ function liveProviderFixture(press: LivePress, newest = turn({ startedAt: press.
     sessionOrigins: {},
     selectionWork: null,
     selectionFailure: null,
+    interruptedRereads: new Map(),
     selectionGeneration: 1,
     history: new Map(),
     historyStructuralKeys: new Map(),
