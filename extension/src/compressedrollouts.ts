@@ -198,12 +198,15 @@ export interface CompressedBodyLimits {
   signal?: AbortSignal;
 }
 
+// Writes each record straight into the body chunks. A record that passes `reduceAbove` moves out of the chunks into
+// the reducer, and the body continues from the record's start.
 class BodyBuilder {
   readonly chunks: Buffer[] = [];
   length = 0;
   skippedRecords = 0;
   undercount = false;
-  private record: Buffer[] = [];
+  // The body offset where the current record starts, and the decoded bytes it has so far.
+  private recordStart = 0;
   private recordBytes = 0;
   private head = Buffer.alloc(0);
   private reducer: OversizedRecordReducer | null = null;
@@ -237,8 +240,15 @@ class BodyBuilder {
     if (this.skipping) return;
     if (!this.reducer && this.recordBytes > this.reduceAbove) {
       this.reducer = new OversizedRecordReducer();
-      for (const held of this.record) this.reducer.push(held);
-      this.record = [];
+      for (let at = this.recordStart; at < this.length;) {
+        const offset = at % READ_CHUNK;
+        const step = Math.min(READ_CHUNK - offset, this.length - at);
+        this.reducer.push(this.chunks[Math.floor(at / READ_CHUNK)].subarray(offset, offset + step));
+        at += step;
+      }
+      // The reducer copies what it keeps, so the record's bytes leave the chunks.
+      this.length = this.recordStart;
+      this.chunks.length = Math.ceil(this.length / READ_CHUNK);
     }
     if (this.reducer) {
       this.reducer.push(bytes);
@@ -246,7 +256,7 @@ class BodyBuilder {
         this.reducer = null;
         this.skipping = true;
       }
-    } else this.record.push(Buffer.from(bytes));
+    } else this.append(bytes);
   }
 
   private close(newline: boolean): void {
@@ -254,10 +264,10 @@ class BodyBuilder {
       this.skippedRecords++;
       if (this.head.includes('"token_count"')) this.undercount = true;
     } else {
-      this.append(this.reducer ? this.reducer.finish().bytes : Buffer.concat(this.record, this.recordBytes));
+      if (this.reducer) this.append(this.reducer.finish().bytes);
       if (newline) this.append(NEWLINE);
     }
-    this.record = [];
+    this.recordStart = this.length;
     this.recordBytes = 0;
     this.head = Buffer.alloc(0);
     this.reducer = null;

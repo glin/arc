@@ -12,6 +12,8 @@ A completed prefix can publish when the same file grows during reading, then res
 
 A selected window read stays reusable while its revision, turn and byte limits, workspace folders and Claude child relationships match. `claudeRelationshipKey` in `selectedsource.ts` builds the relationship key for both the host and the worker. Dispatched sessions are not part of that key.
 
+A compressed rollout opens through its decoded body. Each window read hashes the `.jsonl.zst` file and decodes the whole body before the readers start, unless the worker holds the body of that hash. The host sends a window read once per selection, even when it holds a current window. Window and page reads then read the body at its decoded length. A checkpoint or page cursor of another path or body hash does not serve a read. A decode that ends inside a zstd frame draws as a normal window, and the host reads it again after 10 s, 60 s and 600 s. A body above 512 MiB shows the failed history status.
+
 Older history uses semantic pages without enlarging or reparsing the ordinary tail. One request runs at a time, with one cursor per session. [`webview/history-control.ts`](../extension/src/webview/history-control.ts) owns automatic and explicit requests.
 
 A page must establish both semantic edges before admission. A request containing only represented turns continues within a bound derived from loaded turns. Pages merge by stable turn identity. Each page retains target turns, an older guard, and required boundary records. Relevant turns can exceed a chunk. Irrelevant sparse lines do not accumulate.
