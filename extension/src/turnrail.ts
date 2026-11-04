@@ -10,6 +10,7 @@ import {
   TurnOutcome,
   type BackgroundCommand,
   type ClosedChild,
+  type ClaudeTaskCompletion,
 } from './transcript';
 import {
   CARD_ACTIONS,
@@ -735,6 +736,34 @@ function mergedWiderChildren(
       closedById.set(id, child);
     }
   }
+  const processEnd = Math.max(
+    0,
+    ...[lifetime, parsed].map((outcome) =>
+      outcome?.processEndedAt !== undefined && outcome.processEndedAt <= (tail.startedAt ?? 0)
+        ? outcome.processEndedAt
+        : 0,
+    ),
+  );
+  const completions = new Map<string, ClaudeTaskCompletion>();
+  for (const completion of [tail, lifetime, parsed].flatMap((outcome) =>
+    outcome?.startedAt === tail.startedAt ? (outcome?.taskCompletions ?? []) : [],
+  )) {
+    if (completion.closedAt <= processEnd) continue;
+    const key = JSON.stringify([completion.toolId, completion.taskId, completion.status, completion.closedAt]);
+    const previous = completions.get(key);
+    if (!previous) completions.set(key, { ...completion });
+    else if (
+      previous.ambiguous ||
+      completion.ambiguous ||
+      (previous.kind !== 'unknown' && completion.kind !== 'unknown' && previous.kind !== completion.kind)
+    )
+      completions.set(key, { ...completion, kind: 'unknown', ambiguous: true });
+    else if (completion.kind !== 'unknown') completions.set(key, { ...completion });
+  }
+  const taskCompletions = [...completions.values()];
+  for (const completion of taskCompletions) {
+    if (completion.kind !== 'child' && completion.taskId !== null) closedById.delete(completion.taskId);
+  }
   const closedChildren = [...closedById.values()];
   const closedIds = new Set(closedChildren.map((child) => (typeof child === 'string' ? child : child.id)));
   const openChildren = [...new Set([...wider, ...held])].filter((id) => !closedIds.has(id));
@@ -747,10 +776,21 @@ function mergedWiderChildren(
         ? child === previous
         : child.id === previous.id && child.closedAt === previous.closedAt;
     });
-  if (sameClosed && openChildren.length === held.length && openChildren.every((id) => held.includes(id))) {
+  if (
+    JSON.stringify(taskCompletions) === JSON.stringify(tail.taskCompletions ?? []) &&
+    sameClosed &&
+    openChildren.length === held.length &&
+    openChildren.every((id) => held.includes(id))
+  ) {
     return tail;
   }
-  const merged: TurnOutcome = { ...tail, openChildren, closedChildren };
+  const merged: TurnOutcome = {
+    ...tail,
+    openChildren,
+    closedChildren,
+    taskCompletions,
+  };
+  if (!taskCompletions.length) delete merged.taskCompletions;
   if (!openChildren.length) {
     delete merged.openChildren;
   }

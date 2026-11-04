@@ -1,6 +1,7 @@
 // Session list projections, status precedence, grouping, and parent relationships.
 
 import { test } from 'vitest';
+import { sessionReadStatus } from './sessionreads';
 import assert from 'node:assert';
 import { matchSessions } from './domain/session-query.ts';
 import {
@@ -2933,4 +2934,34 @@ test('removing the pin and every label returns an agent run to Run by agents and
   const viewed = railSections(cards, now, [agentView]).sections;
   assert.ok(viewed.find((section) => section.id === viewFoldId(agentView))?.cards.some((card) => card.id === 'run'));
   assert.equal(cards[0].runByAgent, true, 'a saved view made the run the reader own');
+});
+
+test('stale wider notices cannot cross a recorded process end into a completed lifetime', () => {
+  const current: TurnOutcome = { startedAt: 10, endedAt: 12, finished: true, error: false, interrupted: false };
+  const older: TurnOutcome = {
+    startedAt: 1,
+    endedAt: 4,
+    finished: true,
+    error: false,
+    interrupted: false,
+    processEndedAt: 4,
+    taskCompletions: [{ taskId: 'old-task', toolId: 'old-tool', status: 'completed', closedAt: 2, kind: 'unknown' }],
+  };
+  for (const [lifetime, parsed] of [
+    [older, null],
+    [null, older],
+    [older, older],
+  ]) {
+    const merged = outcomeWithWiderChildren(current, lifetime, parsed);
+    assert.equal(merged?.taskCompletions, undefined);
+    assert.equal(
+      sessionReadStatus('sess', merged, false, false, undefined, undefined, { unchanged: true, mtimeMs: 12 }),
+      'done',
+    );
+  }
+  const staleBeforeEnd = { ...older, processEndedAt: undefined };
+  assert.equal(outcomeWithWiderChildren(current, staleBeforeEnd)?.taskCompletions, undefined);
+  const currentLifetime = { ...staleBeforeEnd, startedAt: current.startedAt, endedAt: current.endedAt };
+  assert.equal(outcomeWithWiderChildren(current, currentLifetime)?.taskCompletions?.[0].kind, 'unknown');
+  assert.equal(outcomeWithWiderChildren(current, older, currentLifetime)?.taskCompletions, undefined);
 });

@@ -11,6 +11,9 @@ import {
   normalizeFullSessionTitle,
   readSessionRecordedTitlePair,
   taskNotificationText,
+  claudeTaskNotification,
+  claudeProcessEndedAt,
+  applyClaudeSessionTaskEvidence,
   withClaudeFirstRequest,
   claudeModelEvidence,
   readPreviousLines,
@@ -141,7 +144,74 @@ export interface ClaudeBackwardState {
   titleRecord: ClaudeSessionParserState['titleRecord'];
   compactMeta: ClaudeSessionParserState['compactMeta'];
   terminalChildren: ClaudeTerminalChildEvidence[];
+  taskIdentities?: ClaudeLaterTaskIdentity[];
+  taskIdentityGapStart?: number;
   attachmentEvidence?: ClaudeAttachmentRecovery;
+}
+
+interface ClaudeLaterTaskIdentity {
+  start: number;
+  end: number;
+  record: Record<string, unknown>;
+  turnsRemaining: number;
+}
+
+function laterTaskIdentity(
+  source: { text: string; start: number; end: number },
+  turnsRemaining: number,
+  childTranscript: boolean,
+): ClaudeLaterTaskIdentity | null {
+  if (!source.text.includes('tool_use') && !source.text.includes('cost-state')) return null;
+  try {
+    const parsed = JSON.parse(source.text) as Record<string, unknown>;
+    if (parsed.isSidechain && !childTranscript) return null;
+    if (claudeProcessEndedAt(parsed) !== null)
+      return {
+        start: source.start,
+        end: source.end,
+        record: { type: 'cost-state', startTime: parsed.startTime, totalDuration: parsed.totalDuration },
+        turnsRemaining,
+      };
+    const content = (parsed.message as { content?: unknown } | undefined)?.content;
+    if (!Array.isArray(content)) return null;
+    const blocks = content
+      .filter((block) =>
+        parsed.type === 'assistant'
+          ? block?.type === 'tool_use' && ['Agent', 'Task', 'Bash'].includes(block.name)
+          : parsed.type === 'user' && block?.type === 'tool_result',
+      )
+      .map((block) => ({
+        type: block.type,
+        ...(block.type === 'tool_use'
+          ? { id: block.id, name: block.name }
+          : { tool_use_id: block.tool_use_id, is_error: block.is_error }),
+      }));
+    if (!blocks.length) return null;
+    const result = (parsed.toolUseResult ?? parsed.tool_use_result) as Record<string, unknown> | undefined;
+    if (parsed.type === 'user' && !result?.agentId && !result?.backgroundTaskId) return null;
+    return {
+      start: source.start,
+      end: source.end,
+      turnsRemaining,
+      record: {
+        type: parsed.type,
+        // Distinct unlabelled launches remain distinct across overlapping page guards.
+        uuid: typeof parsed.uuid === 'string' ? parsed.uuid : `source:${source.start}`,
+        message: { content: blocks },
+        ...(result
+          ? {
+              toolUseResult: {
+                status: result.status,
+                agentId: result.agentId,
+                backgroundTaskId: result.backgroundTaskId,
+              },
+            }
+          : {}),
+      },
+    };
+  } catch {
+    return null;
+  }
 }
 
 interface ClaudeTerminalChildEvidence {
@@ -156,6 +226,7 @@ interface ClaudeTerminalChildEvidence {
   end: number;
   ownerStart: number | null;
   turnsRemaining: number;
+  laterTaskIdentities?: ClaudeLaterTaskIdentity[];
 }
 export type ClaudeHistoryCursor = SourceHistoryCursor<ClaudeBackwardState>;
 export type ClaudeHistoryPageResult = SemanticHistoryResult<ClaudeBackwardState>;
@@ -175,9 +246,8 @@ function terminalChildEvidence(
     if (content === null) {
       return null;
     }
-    const toolUseId = /<tool-use-id>([^<]+)<\/tool-use-id>/.exec(content)?.[1] ?? '';
-    const status = /<status>([^<]+)<\/status>/.exec(content)?.[1] ?? '';
-    if (!toolUseId || !status || status === 'running') {
+    const notice = claudeTaskNotification(parsed, false);
+    if (!notice) {
       return null;
     }
     const figure = (name: string): number | null => {
@@ -188,9 +258,9 @@ function terminalChildEvidence(
     const recordedAt = parsed.type === 'attachment' && attachment?.timestamp ? attachment.timestamp : parsed.timestamp;
     const closedAt = Date.parse(String(recordedAt ?? ''));
     return {
-      toolUseId,
-      agentId: /<task-id>([^<]+)<\/task-id>/.exec(content)?.[1] ?? null,
-      status,
+      toolUseId: notice.toolId,
+      agentId: notice.taskId,
+      status: notice.status,
       tokens: figure('subagent_tokens'),
       toolUses: figure('tool_uses'),
       durationMs: figure('duration_ms'),
@@ -211,7 +281,7 @@ function titleRank(source: RecordedTitleSource | undefined): number {
 
 function claudeParserKey(opts: ReadOptions): string {
   return JSON.stringify({
-    version: 14,
+    version: 15,
     recoveredModelAttachment: opts.recoveredModelAttachment ?? null,
     tailBytes: opts.tailBytes ?? DEFAULT_TAIL_BYTES,
     maxTurns: opts.maxTurns ?? 40,
@@ -365,6 +435,23 @@ function claudeAdapter(sessionId: string, opts: ReadOptions): SemanticSourceAdap
         reducer.pushLine(record);
       }
       const snapshot = reducer.snapshot();
+      const taskIdentities = new Map((backward.taskIdentities ?? []).map((item) => [item.start, item]));
+      for (const record of records) {
+        const identity = laterTaskIdentity(record, terminalChildHorizon, opts.childTranscript === true);
+        if (identity) taskIdentities.set(identity.start, identity);
+      }
+      const retainedTaskIdentities = new Map(taskIdentities);
+      for (const notice of backward.terminalChildren) {
+        for (const identity of notice.laterTaskIdentities ?? []) retainedTaskIdentities.set(identity.start, identity);
+      }
+      const laterIdentities = [...retainedTaskIdentities.values()]
+        .filter((item) => item.start >= (records.at(-1)?.end ?? 0))
+        .sort((a, b) => a.start - b.start);
+      const processBoundary = laterIdentities.find((item) => claudeProcessEndedAt(item.record) !== null)?.start;
+      for (const identity of laterIdentities) {
+        if (identity.start === processBoundary) break;
+        applyClaudeSessionTaskEvidence(snapshot, identity.record);
+      }
       const terminalChildren = new Map<string, ClaudeTerminalChildEvidence>();
       for (const evidence of backward.terminalChildren) {
         terminalChildren.set(`${evidence.start}:${evidence.end}`, { ...evidence, ownerStart: null });
@@ -372,10 +459,27 @@ function claudeAdapter(sessionId: string, opts: ReadOptions): SemanticSourceAdap
       for (const record of records) {
         const evidence = terminalChildEvidence(record, terminalChildHorizon);
         if (evidence) {
-          terminalChildren.set(`${evidence.start}:${evidence.end}`, evidence);
+          const key = `${evidence.start}:${evidence.end}`;
+          terminalChildren.set(key, { ...terminalChildren.get(key), ...evidence });
         }
       }
       for (const evidence of terminalChildren.values()) {
+        // A notice retains its later identity checks until the notice itself expires.
+        const noticeIdentities = new Map((evidence.laterTaskIdentities ?? []).map((item) => [item.start, item]));
+        for (const identity of taskIdentities.values()) {
+          if (identity.start < evidence.end) continue;
+          const record = identity.record;
+          const content = (record.message as { content?: Array<Record<string, unknown>> } | undefined)?.content;
+          const result = record.toolUseResult as { agentId?: unknown; backgroundTaskId?: unknown } | undefined;
+          if (
+            claudeProcessEndedAt(record) !== null ||
+            content?.some((block) => block.id === evidence.toolUseId || block.tool_use_id === evidence.toolUseId) ||
+            (evidence.agentId !== null &&
+              (result?.agentId === evidence.agentId || result?.backgroundTaskId === evidence.agentId))
+          )
+            noticeIdentities.set(identity.start, identity);
+        }
+        if (noticeIdentities.size) evidence.laterTaskIdentities = [...noticeIdentities.values()];
         let owner: { start: number; agent: ClaudeSessionParserState['turns'][number]['agents'][number] } | null = null;
         for (let index = 0; index < snapshot.turns.length; index += 1) {
           const range = snapshot.turnRanges[index];
@@ -387,7 +491,32 @@ function claudeAdapter(sessionId: string, opts: ReadOptions): SemanticSourceAdap
             owner = { start: range.start, agent };
           }
         }
-        if (!owner) {
+        const task = evidence.agentId === null ? null : '@' + evidence.agentId;
+        const tool = '@' + evidence.toolUseId;
+        const tasks = snapshot.taskEvidence;
+        const gap = backward.taskIdentityGapStart;
+        if (
+          owner &&
+          gap !== undefined &&
+          ![...retainedTaskIdentities.values()].some(
+            (identity) =>
+              identity.start >= evidence.end && identity.start < gap && claudeProcessEndedAt(identity.record) !== null,
+          )
+        ) {
+          if (owner.agent.closedAt === evidence.closedAt) {
+            owner.agent.status = 'running';
+            delete owner.agent.closedAt;
+          }
+          continue;
+        }
+        if (
+          !owner ||
+          !task ||
+          (processBoundary !== undefined && evidence.start > processBoundary) ||
+          tasks?.tools[tool] !== 'child' ||
+          (tasks.tasks[task] !== undefined && tasks.tasks[task] !== tool) ||
+          (tasks.toolTasks[tool] !== undefined && tasks.toolTasks[tool] !== task)
+        ) {
           continue;
         }
         evidence.ownerStart = owner.start;
@@ -464,6 +593,8 @@ function claudeAdapter(sessionId: string, opts: ReadOptions): SemanticSourceAdap
           titleRecord,
           compactMeta: snapshot.compactMeta,
           terminalChildren: [...terminalChildren.values()],
+          taskIdentities: [...taskIdentities.values()],
+          taskIdentityGapStart: backward.taskIdentityGapStart,
           attachmentEvidence: evidence,
         },
         olderEvidence:
@@ -491,9 +622,24 @@ function claudeAdapter(sessionId: string, opts: ReadOptions): SemanticSourceAdap
     },
     stateForOlder: (parsed, pageStart) => {
       const crossedTurns = parsed.turns.filter((entry) => entry.start >= pageStart).length;
+      const taskIdentities = parsed.adapterState.taskIdentities ?? [];
+      const processBoundary = taskIdentities
+        .filter((identity) => identity.start >= pageStart && claudeProcessEndedAt(identity.record) !== null)
+        .sort((a, b) => a.start - b.start)[0]?.start;
+      let taskIdentityGapStart = parsed.adapterState.taskIdentityGapStart;
+      const retainedTaskIdentities = taskIdentities.flatMap((identity) => {
+        if (identity.start < pageStart || (processBoundary !== undefined && identity.start >= processBoundary))
+          return [];
+        const turnsRemaining = identity.turnsRemaining - crossedTurns;
+        if (turnsRemaining > 0) return [{ ...identity, turnsRemaining }];
+        taskIdentityGapStart = Math.min(taskIdentityGapStart ?? identity.start, identity.start);
+        return [];
+      });
+      if (processBoundary !== undefined && (taskIdentityGapStart ?? Infinity) > processBoundary)
+        taskIdentityGapStart = undefined;
       const terminalChildren: ClaudeTerminalChildEvidence[] = [];
       for (const evidence of parsed.adapterState.terminalChildren) {
-        if (evidence.start < pageStart) {
+        if (evidence.start < pageStart || (processBoundary !== undefined && evidence.start >= processBoundary)) {
           continue;
         }
         if (evidence.ownerStart !== null) {
@@ -531,6 +677,8 @@ function claudeAdapter(sessionId: string, opts: ReadOptions): SemanticSourceAdap
           return !closest || closest.start < pageStart;
         }),
         terminalChildren,
+        taskIdentities: retainedTaskIdentities,
+        taskIdentityGapStart,
       };
     },
   };

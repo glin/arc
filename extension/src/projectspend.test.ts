@@ -2007,6 +2007,7 @@ function malformedSpendFixture() {
   const changed = (change: (record: Record<string, unknown>) => void): string => {
     const copy = structuredClone(saved);
     change(copy.files[0]);
+    copy.files[0].parserGeneration = PROJECT_SPEND_PARSER_GENERATIONS[copy.files[0].parserKind as 'claude' | 'codex'];
     return JSON.stringify(copy);
   };
   const cases = new Map<string, string>([
@@ -2554,7 +2555,7 @@ test('a ledger written before the display ledger was shared still loads whole', 
   assert.deepEqual(loaded.completeFiles, [whole], 'the older array still names the display ledger');
 });
 
-test('saved shared generation 65 keeps unchanged Claude reductions and rebuilds Codex reductions', () => {
+test('saved shared generation 65 rebuilds Claude and Codex reductions', () => {
   const folder = dir();
   const at = '2026-11-01T10:00:00.000Z';
   const claudeFile = path.join(folder, 'claude.jsonl');
@@ -2608,13 +2609,12 @@ test('saved shared generation 65 keeps unchanged Claude reductions and rebuilds 
   ]);
   const savedClaude = earlier.get(claude.file)!;
   const savedCodex = earlier.get(codex.file)!;
-  assert.ok(savedClaude.parserState, 'a compatible Claude record lost its parser state');
+  assert.equal(savedClaude.parserState, undefined, 'an earlier Claude record kept its parser state');
   assert.equal(savedCodex.parserState, undefined, 'an earlier Codex record kept its parser state');
-  const keptClaude = indexSpendFile(savedClaude, claudeFile, 'w', createClaudeUsageLineReducer, 2);
-  assert.equal(keptClaude.rebuilt, false);
-  assert.equal(keptClaude.changed, false);
-  assert.equal(keptClaude.record, savedClaude, 'an unchanged Claude source was read again');
-  assert.equal(keptClaude.record.parserGeneration, 65);
+  const rebuiltClaude = indexSpendFile(savedClaude, claudeFile, 'w', createClaudeUsageLineReducer, 2);
+  assert.equal(rebuiltClaude.rebuilt, true);
+  assert.equal(rebuiltClaude.record.parserGeneration, PROJECT_SPEND_PARSER_GENERATIONS.claude);
+  assert.deepEqual(rebuiltClaude.record.buckets, claude.buckets);
   const rebuiltCodex = indexSpendFile(savedCodex, codexFile, 'w', createCodexUsageLineReducer, 2);
   assert.equal(rebuiltCodex.rebuilt, true);
   assert.equal(rebuiltCodex.record.parserGeneration, PROJECT_SPEND_PARSER_GENERATIONS.codex);
@@ -4159,6 +4159,20 @@ test('an old spend record without a turn count rebuilds once', () => {
   const legacy = { ...current };
   delete legacy.turnCount;
   assert.equal(spendRecordHasLifetimeFacts(legacy), false);
+  assert.equal(
+    spendRecordHasLifetimeFacts({
+      ...current,
+      parserGeneration: 66,
+      outcome: {
+        finished: true,
+        error: false,
+        interrupted: false,
+        endedAt: 42,
+        closedChildren: [{ id: 'command-task', closedAt: 42 }],
+      },
+    }),
+    false,
+  );
   assert.equal(spendRecordHasLifetimeFacts({ ...current, turnCount: -1 }), false);
   assert.equal(spendRecordHasLifetimeFacts({ ...current, turnCount: 'four' as unknown as number }), false);
   const rebuilt = indexSpendFile(legacy, file, 'w', reducer, 2);
@@ -6555,12 +6569,20 @@ describe('Claude background cost accounting', () => {
     );
     const partial = replay(fixture, { maxBytes: bytes });
     assert.equal(partial.complete, false);
-    assert.equal((partial.progress.reducer as ClaudeUsageReducerState).closedChildIndex?.size, 1);
+    assert.equal(
+      (partial.progress.reducer as ClaudeUsageReducerState).currentTurnOutcome?.taskCompletions?.[0].kind,
+      'unknown',
+    );
     fixture.records[0] = { ...fixture.records[0], costStateProgress: partial.progress };
     const store = dir();
     saveSpendLedger(store, 'w', fixture.records);
     const loaded = loadSpendLedger(store, 'w');
     assert.equal(loaded.files.length, 2);
+    assert.equal(
+      (loaded.files[0].costStateProgress!.reducer as ClaudeUsageReducerState).currentTurnOutcome?.taskCompletions?.[0]
+        .kind,
+      'unknown',
+    );
     const resumed = replay(fixture, {}, loaded.files[0].costStateProgress);
     assert.equal(tokens(resumed.supplement!.lifetime), 20);
     assert.equal(
@@ -6988,21 +7010,19 @@ describe('Claude background cost accounting', () => {
     assert.equal(tokens(invalidated[1].lifetimeBuckets!), 100);
   });
 
-  test('a supplement saved at shared generation 65 survives until a contributor rebuilds', () => {
+  test('a current supplement is invalidated when a contributor has shared generation 65', () => {
     const fixture = indexCompactionSession([clock(), snapshot(120)], [answer('a', at, 100, true)]);
-    fixture.records.forEach((record, index) => (fixture.records[index] = { ...record, parserGeneration: 65 }));
     const identity = replay(fixture).supplement!.identity;
     const [parent, child] = fixture.records;
     assert.equal(
       invalidateClaudeCostSupplements(fixture.records, fixture.sources)[0].costStateSupplement?.identity,
       identity,
     );
-    const rebuiltChild = [parent, { ...child, parserGeneration: PROJECT_SPEND_PARSER_GENERATIONS.claude }];
-    assert.equal(invalidateClaudeCostSupplements(rebuiltChild, fixture.sources)[0].costStateSupplement, undefined);
-    // A Codex contributor of shared generation 65 rebuilds, so the parent has no current dependency set.
-    const codexChild = [parent, { ...child, parserKind: 'codex' as const }];
-    assert.equal(claudeCostStateDependencies(fixture.sources[0], fixture.sources, codexChild), null);
-    assert.equal(invalidateClaudeCostSupplements(codexChild, fixture.sources)[0].costStateSupplement, undefined);
+    for (const parserKind of ['claude', 'codex'] as const) {
+      const stale = [parent, { ...child, parserKind, parserGeneration: 65 }];
+      assert.equal(claudeCostStateDependencies(fixture.sources[0], fixture.sources, stale), null);
+      assert.equal(invalidateClaudeCostSupplements(stale, fixture.sources)[0].costStateSupplement, undefined);
+    }
   });
 
   test('native grandchildren and a child accounting owner each contribute once', () => {

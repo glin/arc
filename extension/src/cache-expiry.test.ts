@@ -28,6 +28,7 @@ import { createClaudeRepeatedFilter } from './clauderepeated.ts';
 import { tempDir } from './temproot.ts';
 import { sessionCacheExpiryStats } from './turncard.ts';
 import { readSessionRequests } from './sessioncost.ts';
+import { readClaudeHistoryPage } from './claudehistory.ts';
 import { ChildCacheExpiryAttribution } from './childcacheexpiry.ts';
 import { readSession } from './transcript.ts';
 import { toCard, turnCacheExpiryWarning } from './turncard.ts';
@@ -1911,6 +1912,82 @@ function indexedNativeExpiry(id: string, model = 'claude-sonnet-5'): SpendFileIn
     (state: ClaudeUsageReducerState | undefined) => createClaudeUsageLineReducer(state, { childTranscript: true }),
   );
 }
+
+test.each([0, 38, 40])('older Claude pages retain child returns after a collision across %s turns', (distance) => {
+  const tool = (name: string, minutes: number) =>
+    JSON.stringify({
+      type: 'assistant',
+      timestamp: at(minutes),
+      message: {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'child-call', name, input: { run_in_background: true } }],
+      },
+    });
+  const reply = (minutes: number, id: string) => {
+    const response = JSON.parse(claudeResponse(minutes, { id }));
+    response.message.content = [{ type: 'text', text: 'Done.' }];
+    response.message.stop_reason = 'end_turn';
+    return JSON.stringify(response);
+  };
+  const records = [
+    claudePrompt(0, 'root'),
+    tool('Agent', 1),
+    JSON.stringify({
+      type: 'user',
+      timestamp: at(2),
+      toolUseResult: { status: 'running', agentId: 'child' },
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'child-call', content: 'launched' }] },
+    }),
+    reply(3, 'root'),
+    claudePrompt(9, 'newer'),
+    JSON.stringify({
+      type: 'user',
+      timestamp: at(9.99),
+      origin: { kind: 'task-notification' },
+      message: {
+        role: 'user',
+        content:
+          '<task-notification><tool-use-id>child-call</tool-use-id><task-id>child</task-id><status>completed</status></task-notification>',
+      },
+    }),
+    reply(10.25, 'received'),
+    ...Array.from({ length: distance }, (_value, index) => [
+      claudePrompt(10.26 + index * 0.001, `ordinary-${index}`),
+      reply(10.2605 + index * 0.001, `ordinary-${index}`),
+    ]).flat(),
+    claudePrompt(10.5, 'continue'),
+    tool('Bash', 11),
+    reply(12, 'finished'),
+  ];
+  const main = indexed(records, claudeReducer);
+  const original = indexedNativeExpiry('child');
+  const child = { ...original, file: path.join(path.dirname(original.file), 'agent-child.jsonl') };
+  fs.copyFileSync(original.file, child.file);
+  const cache = sessionCacheFactsBySession(
+    [main, child],
+    [
+      { sessionId: 'root', file: main.file, primary: true },
+      { sessionId: 'root', file: child.file, primary: false },
+    ],
+  ).root.expiry;
+  const turns = [];
+  let cursor = null;
+  do {
+    const result = readClaudeHistoryPage(main.file, 'root', cursor, { chunkBytes: 80, targetTurns: 1 });
+    assert.equal(result.kind, 'page');
+    if (result.kind !== 'page') break;
+    turns.unshift(...result.page.turns);
+    cursor = structuredClone(result.page.nextOlderCursor);
+  } while (cursor);
+  const older = turns[0];
+  assert.equal(readSession(main.file, 'root').taskCompletions?.[0].ambiguous, true);
+  const fullOlder = readSession(main.file, 'root', { maxTurns: 100 }).turns[0];
+  for (const turn of [fullOlder, older]) {
+    const costs = new ChildCacheExpiryAttribution().read([turn], { root: cache }, BASE + 20 * MINUTE);
+    assert.equal(costs.get(turnKey(turn))?.count, 1);
+    assert.equal(turn.agents[0].closedAt, undefined);
+  }
+});
 
 test('native child coverage follows nested ownership through indexed expiry facts', () => {
   const main = indexed([claudePrompt(0, 'root'), claudeResponse(1, { id: 'root', input: 100 })], claudeReducer);

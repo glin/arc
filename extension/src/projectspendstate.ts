@@ -30,7 +30,7 @@ import {
   RETAINED_COMPACTIONS,
   RETAINED_REQUESTS,
 } from './parserstate';
-import { CLAUDE_TOOL_CALL_LIMIT } from './transcript';
+import { CLAUDE_TOOL_CALL_LIMIT, validClaudeTaskCompletions, validClaudeTaskEvidence } from './transcript';
 import type {
   ClaudePreviousTurn,
   ClaudeUsageReducerState,
@@ -43,6 +43,7 @@ import type {
 type PersistedClaudeUsageReducerState = Omit<ClaudeUsageReducerState, 'seenRequests' | 'closedChildIndex'>;
 
 const CLAUDE_STATE_KEYS = {
+  taskEvidence: true,
   costState: true,
   seenRequestKeys: true,
   closedTurns: true,
@@ -167,6 +168,8 @@ function turnOutcome(value: unknown): value is TurnOutcome {
     typeof value.interrupted === 'boolean' &&
     timestamp(value.endedAt) &&
     (!Object.prototype.hasOwnProperty.call(value, 'processEndedAt') || timestamp(value.processEndedAt)) &&
+    (!Object.prototype.hasOwnProperty.call(value, 'taskCompletions') ||
+      validClaudeTaskCompletions(value.taskCompletions)) &&
     (!Object.prototype.hasOwnProperty.call(value, 'openChildren') ||
       (Array.isArray(value.openChildren) && value.openChildren.every(nonEmptyText)))
   );
@@ -447,6 +450,7 @@ function claudeState(value: unknown, retain = RETAINED_REQUESTS): value is Claud
   if (
     !record(value) ||
     !onlyKeys(value, CLAUDE_STATE_KEYS) ||
+    !(value.taskEvidence === undefined || validClaudeTaskEvidence(value.taskEvidence)) ||
     !(value.costState === undefined || validClaudeCostCapture(value.costState)) ||
     !Array.isArray(value.seenRequestKeys) ||
     !value.seenRequestKeys.every(nonEmptyText) ||

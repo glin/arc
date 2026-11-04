@@ -1,4 +1,4 @@
-import { revisionOf } from './transcript';
+import { revisionOf, validClaudeTaskCompletions } from './transcript';
 import { meterRead } from './readmeter';
 import { combineCacheExpirySummaries, combineCacheExpiryAmounts } from './cacheexpirysummary';
 import crypto from 'node:crypto';
@@ -523,10 +523,10 @@ export function projectSpendSaveRetryDelay(retries: number): number | null {
 // Saved source records require a rebuild when the parser generation of their agent differs.
 // Increase an agent's generation when a stored field of its records changes the conclusions consumers draw from it.
 // Increase both generations for a change that alters both agents' records.
-export const PROJECT_SPEND_PARSER_GENERATIONS: Readonly<Record<'claude' | 'codex', number>> = { claude: 66, codex: 68 };
+export const PROJECT_SPEND_PARSER_GENERATIONS: Readonly<Record<'claude' | 'codex', number>> = { claude: 67, codex: 68 };
 
 // Earlier shared generations whose records of one agent match that agent's generation.
-// Shared generation 66 changed only Codex pricing, so Claude records of generation 65 match Claude generation 66.
+// Each mapping names the agent generation of the stored facts.
 // A later bump of one agent's generation stops accepting that agent's earlier records.
 export const PROJECT_SPEND_PARSER_IMPORTS: Readonly<Record<'claude' | 'codex', Readonly<Record<number, number>>>> = {
   claude: { 65: 66 },
@@ -671,6 +671,8 @@ function readyOutcome(value: TurnOutcome | null | undefined): boolean {
       (!Object.prototype.hasOwnProperty.call(value, 'openChildren') ||
         (Array.isArray(value.openChildren) &&
           value.openChildren.every((id) => typeof id === 'string' && id.length > 0))) &&
+      (!Object.prototype.hasOwnProperty.call(value, 'taskCompletions') ||
+        validClaudeTaskCompletions(value.taskCompletions)) &&
       (!Object.prototype.hasOwnProperty.call(value, 'closedChildren') ||
         (Array.isArray(value.closedChildren) && value.closedChildren.every(readyClosedChild))))
   );

@@ -262,7 +262,7 @@ import {
   type DerivedCacheSources,
   type DerivedTitleEntry,
 } from './derivedcache.ts';
-// The shared metadata version of a format 0 or format 1 file whose rows match both current agent generations.
+// The Claude metadata generation used by current-format fixtures.
 const VERSION = METADATA_GENERATIONS.claude;
 // Test sessions live outside both source roots. These helpers qualify every entry as a Claude session.
 const claudeSession = () => 'claude' as const;
@@ -843,6 +843,37 @@ test('derived cache round trips positive metadata and outcome facts', () => {
   assert.deepEqual(fs.readdirSync(path.dirname(file)), ['cache.json']);
 });
 
+test('derived outcomes retain task classification and reject malformed completion evidence', () => {
+  const file = path.join(folder(), 'tasks.json');
+  const completion = {
+    taskId: 'command-task',
+    toolId: 'bash-call',
+    status: 'completed',
+    closedAt: 42,
+    kind: 'command' as const,
+  };
+  const entry = { ...title, outcome: { ...outcome, taskCompletions: [completion] } };
+  saveClaudeCache(file, [['/session.jsonl', entry]]);
+  assert.deepEqual(loadClaudeCache(file).titles.get('/session.jsonl')?.outcome?.taskCompletions, [completion]);
+  const previous = JSON.parse(fs.readFileSync(file, 'utf8'));
+  previous.metadataGenerations.claude = 71;
+  previous.titles[0].entry.outcome = { ...outcome, closedChildren: [{ id: 'command-task', closedAt: 42 }] };
+  fs.writeFileSync(file, JSON.stringify(previous));
+  assert.equal(loadDerivedCache(file).titles.size, 0);
+  for (const invalid of [
+    { ...completion, kind: 'other' },
+    { ...completion, taskId: 1 },
+    { ...completion, taskId: null },
+    { ...completion, ambiguous: true },
+    { ...completion, closedAt: null },
+  ]) {
+    saveClaudeCache(file, [
+      ['/session.jsonl', { ...entry, outcome: { ...outcome, taskCompletions: [invalid] } } as any],
+    ]);
+    assert.equal(loadDerivedCache(file).titles.get('/session.jsonl'), undefined);
+  }
+});
+
 // Earlier cache versions discard outcomes, including stored child state.
 // Current-version outcomes preserve open children without requiring a closed-child list.
 // A missing closed-child list has the same meaning as an empty list.
@@ -1417,7 +1448,7 @@ test('a version 70 Codex entry rebuilds Terra facts from its unchanged source an
     );
     const loaded = loadDerivedCache(cache, { previous, agentOf: codexSession });
     assert.equal(loaded.titles.size, 0);
-    assert.equal(loaded.reuse?.rejectedTitles, 1);
+    assert.equal(loaded.reuse?.reason, 'generation-mismatch');
     assert.equal(loaded.migrationPending, true);
     assert.deepEqual(loaded.carriedNames.get(source), { label: title.label, fullLabel: title.fullLabel });
     const rebuilt = { ...stale, stats: sessionStatFactsOf(readCodexSession(source, 'terra')) };
@@ -1711,7 +1742,14 @@ test('invalid rows and old title entries are discarded without losing valid rows
   // The legacy format carries Codex openings. Only the current format holds the current generation.
   assert.equal(loadClaudeCache(file).codexMetas.size, 1);
   const rows = JSON.parse(fs.readFileSync(file, 'utf8'));
-  fs.writeFileSync(file, JSON.stringify({ formatVersion: 1, metadataVersion: VERSION, titles: rows.titles }));
+  fs.writeFileSync(
+    file,
+    JSON.stringify({
+      formatVersion: 2,
+      metadataGenerations: METADATA_GENERATIONS,
+      titles: rows.titles.map((row: object) => ({ ...row, agent: 'claude' })),
+    }),
+  );
   const loaded = loadClaudeCache(file);
   assert.deepEqual(loaded.titles.get('/good-session.jsonl'), title);
   assert.equal(loaded.titles.has('/old-session.jsonl'), false);
@@ -3272,8 +3310,8 @@ test('v1 import keeps each agent by its own generation through migration, restar
   ]);
   fs.writeFileSync(legacy, JSON.stringify({ version: 63, titles: [], claudeChildReferences: [] }));
   for (const [version, kept] of [
-    [70, [claudeFile]],
-    [71, [claudeFile]],
+    [70, []],
+    [71, []],
     [69, []],
     [72, []],
   ] as const) {
@@ -3287,7 +3325,7 @@ test('v1 import keeps each agent by its own generation through migration, restar
     assert.deepEqual(loaded.claudeChildReferences.get(normalizeFsPath(claudeFile)), relationship);
     assert.equal(loaded.migrationPending, true);
   }
-  fs.writeFileSync(previous, v1(70));
+  fs.writeFileSync(previous, v1(71));
   const previousBytes = fs.readFileSync(previous, 'utf8');
   const first = load();
   assert.throws(() =>
@@ -3306,7 +3344,7 @@ test('v1 import keeps each agent by its own generation through migration, restar
   );
   assert.equal(fs.existsSync(current), false);
   const second = load();
-  assert.deepEqual([...second.titles.keys()], [claudeFile], 'an interrupted migration lost Claude metadata');
+  assert.deepEqual([...second.titles.keys()], [codexFile], 'an interrupted migration lost Codex metadata');
   assert.deepEqual(second.claudeChildReferences.get(normalizeFsPath(claudeFile))?.claudeCursor, scan.cursor);
   saveDerivedCache(
     current,
@@ -3324,15 +3362,15 @@ test('v1 import keeps each agent by its own generation through migration, restar
   assert.deepEqual(saved.metadataGenerations, METADATA_GENERATIONS);
   assert.deepEqual(
     saved.titles.map((row: { file: string; agent: string }) => [row.file, row.agent]),
-    [[claudeFile, 'claude']],
+    [[codexFile, 'codex']],
   );
   // An older window keeps writing the previous file after migration.
   fs.writeFileSync(previous, v1(71));
   const restarted = load();
   assert.equal(restarted.reuse?.source, 'current');
   assert.equal(restarted.migrationPending, false);
-  assert.deepEqual([...restarted.titles.keys()], [claudeFile], 'an older writer replaced migrated metadata');
-  assert.equal(restarted.carriedNames.get(codexFile)?.label, 'Codex');
+  assert.deepEqual([...restarted.titles.keys()], [codexFile], 'an older writer replaced migrated metadata');
+  assert.equal(restarted.carriedNames.get(claudeFile)?.label, 'Claude');
   assert.deepEqual(restarted.claudeChildReferences.get(normalizeFsPath(claudeFile))?.claudeCursor, scan.cursor);
   saveDerivedCache(
     current,

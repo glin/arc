@@ -361,7 +361,7 @@ import {
 
 const STAGED_UPDATE_MESSAGE =
   'VS Code holds a staged update. Restart VS Code with every window closed, then run again.';
-// The shared metadata version of a format 0 or format 1 file whose rows match both current agent generations.
+// The Claude metadata generation used by current-format fixtures.
 const VERSION = METADATA_GENERATIONS.claude;
 
 test('selection measurements reject missing stages, unrelated worker replies, and reversed browser clocks', () => {
@@ -17558,7 +17558,7 @@ test('metadata-only upgrade resumes relationships before ordinary startup metada
   }
 });
 
-test('an upgrade from shared metadata version 70 reads Claude sessions as a restart does and rebuilds Codex entries', async () => {
+test('an upgrade from shared metadata version 70 rebuilds Claude and Codex entries', async () => {
   const root = tempDir('agent-generation-upgrade-');
   const projects = path.join(root, 'projects');
   const rollouts = path.join(root, 'rollouts');
@@ -17657,18 +17657,12 @@ test('an upgrade from shared metadata version 70 reads Claude sessions as a rest
       }),
     );
     const first = restart();
-    assert.deepEqual(
-      [...first.titles.keys()],
-      [claudeFile],
-      'the upgrade dropped Claude metadata or kept Codex metadata',
-    );
+    assert.deepEqual([...first.titles.keys()], [], 'the upgrade kept metadata from an incompatible parser generation');
     assert.equal(first.carriedNames.get(codex.file)?.label, 'Codex completed');
     const saved = await settle(first);
-    // The only difference from the control restart is the shared version 70 file.
-    assert.deepEqual(
-      of(read, 'claude'),
-      of(control, 'claude'),
-      'the upgrade read an unchanged Claude transcript again',
+    assert.ok(
+      of(read, 'claude').includes('claude:metadata'),
+      'the upgrade kept a Claude entry without reading its transcript',
     );
 
     assert.ok(read.includes('codex:metadata'), 'the upgrade kept a Codex entry without reading its rollout');
@@ -17823,15 +17817,14 @@ test('an upgrade from shared metadata version 70 saves the current cache file on
     });
     const saved = JSON.parse(fs.readFileSync(current, 'utf8'));
     assert.equal(saved.formatVersion, 2);
-    assert.deepEqual(
-      saved.titles,
-      [{ file: claudeFile, agent: 'claude', entry: entry('Read the Claude inputs') }],
-      'the upgrade dropped the Claude entry or kept the Codex entry',
-    );
+    assert.deepEqual(saved.titles, [], 'the upgrade kept metadata from an incompatible parser generation');
     assert.deepEqual(
       saved.carriedNames.map((row: { file: string; label: string }) => [row.file, row.label]),
-      [[codexFile, 'Codex completed']],
-      'the upgrade lost the Codex name',
+      [
+        [claudeFile, 'Read the Claude inputs'],
+        [codexFile, 'Codex completed'],
+      ].sort((a, b) => a[0].localeCompare(b[0])),
+      'the upgrade lost a session name',
     );
     assert.equal(fs.readFileSync(previous, 'utf8'), seed, 'the upgrade changed the previous cache file');
     assert.equal(first.startupCache.migration, 'saved');
@@ -17839,7 +17832,7 @@ test('an upgrade from shared metadata version 70 saves the current cache file on
     const second = derivedCacheMigrationHarness(files);
     timers.push(second.derivedCacheCheckpointTick);
     assert.equal(second.startupCache.reuse.source, 'current', 'a second restart imported the previous file');
-    assert.deepEqual([...second.titles.keys()], [claudeFile]);
+    assert.deepEqual([...second.titles.keys()], []);
     assert.equal(second.startupCache.migration, 'unneeded');
     assert.equal(second.derivedCacheCheckpointTick, null, 'a second restart scheduled another migration save');
     assert.equal(fs.readFileSync(current, 'utf8'), written);

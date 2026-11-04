@@ -320,9 +320,18 @@ export function sessionReadStatus(
   if (!outcome && !ended && !running && !waiting && backgroundCommands?.length) return 'background';
   if (status === 'running' && !active) return undefined;
   if (
+    (status === 'done' || status === 'stopped') &&
+    observedOutcome?.processEndedAt === undefined &&
+    outcome?.taskCompletions?.some((completion) => completion.kind === 'unknown')
+  )
+    return undefined;
+  if (
     status === 'done' &&
     observedOutcome?.processEndedAt === undefined &&
-    (outcome?.openChildren?.length || outcome?.closedChildren?.length || outcome?.backgroundCommands?.length)
+    (outcome?.openChildren?.length ||
+      outcome?.closedChildren?.length ||
+      outcome?.backgroundCommands?.length ||
+      outcome?.taskCompletions?.some((completion) => completion.kind !== 'command'))
   )
     return undefined;
   return status;

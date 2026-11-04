@@ -1457,3 +1457,31 @@ test('the session read keeps the subagent text a delayed Codex turn context repo
   const read = boundedSessionRead(source, 2, () => 'scope', 'local-agent', [directory]);
   assert.deepEqual(read.subagentContext, { tokens, share: tokens / 1000, partial: false });
 });
+
+test('an unresolved task notice withholds completion after a quiet turn without a process end', () => {
+  const endedAt = Date.now() - 2 * 60 * 60 * 1000;
+  const outcome = {
+    startedAt: endedAt - 1000,
+    endedAt,
+    finished: false,
+    error: false,
+    interrupted: false,
+    taskCompletions: [
+      {
+        toolId: 'missing-tool',
+        taskId: 'missing-task',
+        status: 'completed',
+        kind: 'unknown' as const,
+        closedAt: endedAt,
+      },
+    ],
+  };
+  assert.equal(
+    sessionReadStatus('session', outcome, false, false, undefined, undefined, { unchanged: true, mtimeMs: endedAt }),
+    undefined,
+  );
+  assert.equal(
+    sessionReadStatus('session', outcome, false, false, undefined, endedAt + 1, { unchanged: true, mtimeMs: endedAt }),
+    'stopped',
+  );
+});

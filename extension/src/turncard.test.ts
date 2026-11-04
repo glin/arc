@@ -59,6 +59,8 @@ import {
   cleanPrompt,
   readClaudeAgentSpend,
   readSession,
+  createClaudeSessionReducer,
+  sessionOutcomeOf,
   refreshClaudeAgentFacts,
   refreshRetainedClaudeAgentFacts,
   sessionStatFactsOf,
@@ -13119,4 +13121,77 @@ test('the file actions select the same rows the card displays, and the card carr
     ],
   );
   assert.ok(!JSON.stringify(card).includes('parent text'), 'the card payload carries recorded edit text');
+});
+
+test('revoked parsed child closure retains its cache-expiry return after checkpoint restoration', () => {
+  const at = (second: number) => new Date(NOW - 60_000 + second * 1000).toISOString();
+  const prefix = [
+    { type: 'user', timestamp: at(0), message: { role: 'user', content: 'Delegate' } },
+    {
+      type: 'assistant',
+      timestamp: at(1),
+      message: {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'agent1', name: 'Agent', input: { run_in_background: true } }],
+        stop_reason: 'tool_use',
+      },
+    },
+    {
+      type: 'user',
+      timestamp: at(2),
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'agent1', content: 'launched' }] },
+      toolUseResult: { status: 'async_launched', agentId: 'child1' },
+    },
+    {
+      type: 'user',
+      timestamp: at(3),
+      origin: { kind: 'task-notification' },
+      message: {
+        role: 'user',
+        content:
+          '<task-notification><task-id>child1</task-id><tool-use-id>agent1</tool-use-id><status>completed</status></task-notification>',
+      },
+    },
+  ];
+  const first = createClaudeSessionReducer('parent');
+  prefix.forEach((record) => first.pushLine(JSON.stringify(record)));
+  const restored = createClaudeSessionReducer('parent', {}, structuredClone(first.snapshot()));
+  for (const reducer of [first, restored]) {
+    reducer.pushLine(
+      JSON.stringify({
+        type: 'assistant',
+        timestamp: at(5),
+        message: {
+          role: 'assistant',
+          content: [{ type: 'tool_use', id: 'agent1', name: 'Bash', input: {} }],
+          stop_reason: 'tool_use',
+        },
+      }),
+    );
+    reducer.pushLine(
+      JSON.stringify({
+        type: 'assistant',
+        timestamp: at(7),
+        message: { role: 'assistant', content: [{ type: 'text', text: 'Done' }], stop_reason: 'end_turn' },
+      }),
+    );
+    const read = reducer.finish();
+    const parent = read.turns[0];
+    const timestamp = Date.parse(at(3.5));
+    const source: NativeChildCacheFacts = {
+      source: 'agent-child1.jsonl',
+      childId: 'child1',
+      revision: {} as NativeChildCacheFacts['revision'],
+      facts: { ...emptyCacheExpiryFacts(), returns: [{ ...oneExpiry().returns[0], timestamp }] },
+      endedAt: timestamp,
+      outcome: null,
+    };
+    const result = new ChildCacheExpiryAttribution().read(
+      read.turns,
+      { parent: { ...emptyCacheExpiryFacts(), childSources: [source] } },
+      NOW,
+      new Map([['parent', sessionOutcomeOf(read)]]),
+    );
+    assert.equal(result.get(turnKey(parent))?.count, 1);
+  }
 });

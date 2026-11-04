@@ -70,6 +70,8 @@ Narration and clear reasoning summaries are ordered Activity messages, separate 
 
 Claude background completion notices arrive as queued attachments while the parent works and as `task-notification` user records while it waits. Both must reach `applyClaudeTaskNotification`. Unknown launch ids create no row. A nested foreground result needs its own `agentId:` line followed by `<usage>` before it supplies child identity. An id quoted in the report cannot identify the child. A background result remains open until its completion notice.
 
+Claude classifies task notices through structured tool names and launch-result associations. Completed Bash tasks create no closed child. Child closures require a matching Agent or Task identity and `completed`, `failed`, or `killed` status. Missing, malformed, or conflicting identities retain unknown completion. Wider task notices require an outcome for the newest turn. Notices before a recorded process end do not carry into a later turn. Task IDs, summary text, and output paths alone establish no task kind. Command notices end their matching command regardless of status. Runtime retirement accepts only supported terminal notices through its independent identity checks.
+
 Peer handbacks and coordinator messages wake existing turns. Keep handback ids across typed prompts because a completion notice can repeat an earlier turn's handback. A notice after a closed reply, without intervening tool work, marks a later reply as a repeated receipt. It does so only when that turn already has a response. Thinking and text with one message id remain one reply.
 
 `SubagentHandback.message` supplies the child response. [`reduceClaudeSessionLine`](../extension/src/transcript.ts) owns handback and closing-reply deduplication.

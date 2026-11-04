@@ -3187,13 +3187,14 @@ test('Claude page cursors expire ownerless terminal child evidence at the turn h
   for (let index = 0; index < 24; index += 1) {
     records.push(
       userPrompt(`ownerless ${index}`, index * 3),
+      assistantTool('Bash', index * 3, 'shared-task-tool', { command: 'x'.repeat(256) }),
       {
         type: 'user',
         timestamp: at(index * 3 + 1),
         origin: { kind: 'task-notification' },
         message: {
           role: 'user',
-          content: `<tool-use-id>missing-${index}</tool-use-id><status>completed</status>`,
+          content: `<tool-use-id>shared-task-tool</tool-use-id><task-id>missing-${index}</task-id><status>completed</status>`,
         },
       },
       assistantAnswer(`ownerless answer ${index}`, index * 3 + 2),
@@ -3220,6 +3221,10 @@ test('Claude page cursors expire ownerless terminal child evidence at the turn h
     cursor = result.page.nextOlderCursor;
     if (cursor) {
       retainedCounts.push(cursor.adapterState.terminalChildren.length);
+      assert.ok((cursor.adapterState.taskIdentities?.length ?? 0) <= 3);
+      for (const notice of cursor.adapterState.terminalChildren) {
+        assert.ok((notice.laterTaskIdentities?.length ?? 0) <= 3);
+      }
     }
   } while (cursor);
   assert.ok(retainedCounts.length > 3);
@@ -3393,7 +3398,7 @@ test('a Claude page keeps the next prompt as lookahead for an abrupt older turn'
   assert.equal(Object.getOwnPropertyDescriptor(paged[0].steps[0], 'fullDetail')?.enumerable, false);
 });
 
-test('Claude pages carry a later child completion back to its guard owner', () => {
+test.each([false, true])('Claude pages qualify a later child completion for its owner (conflict %s)', (conflict) => {
   const file = writeTranscript([
     userPrompt('launch the older child', 0),
     assistantTool('Agent', 1, 'paged-background-child', {
@@ -3407,7 +3412,11 @@ test('Claude pages carry a later child completion back to its guard owner', () =
         role: 'user',
         content: [{ type: 'tool_result', tool_use_id: 'paged-background-child', content: 'launched' }],
       },
-      toolUseResult: { agentId: 'paged-child', description: 'paged worker', status: 'running' },
+      toolUseResult: {
+        agentId: conflict ? 'other-child' : 'paged-child',
+        description: 'paged worker',
+        status: 'running',
+      },
     },
     assistantAnswer('The child is running.', 3),
     userPrompt('newer owner-independent turn', 4),
@@ -3441,8 +3450,114 @@ test('Claude pages carry a later child completion back to its guard owner', () =
   assert.deepEqual(paged, oneShot);
   assert.deepEqual(
     paged[0].agents.map((agent) => [agent.status, agent.tokens, agent.toolUses, agent.durationMs]),
-    [['completed', 41, 6, 1200]],
+    [conflict ? ['running', null, null, null] : ['completed', 41, 6, 1200]],
   );
+});
+
+test.each(['same turn', 'following turn'])(
+  'Claude older pages retain later identity collisions in the %s',
+  (placement) => {
+    for (const collision of [
+      [assistantTool('Bash', 7, 'agent1', { run_in_background: true })],
+      [backgroundLaunch('agent1', 'other-child', 7)],
+      [assistantTool('Agent', 7, 'agent2', {}), backgroundLaunch('agent2', 'child1', 8)],
+      [assistantTool('Agent', 7, 'agent1', {})],
+    ]) {
+      const file = writeTranscript([
+        userPrompt('Delegate', 0),
+        assistantTool('Agent', 1, 'agent1', { run_in_background: true }),
+        backgroundLaunch('agent1', 'child1', 2),
+        assistantAnswer('The child is running.', 3),
+        userPrompt('Check the child', 4),
+        commandNotice('agent1', 'child1', 'completed', 5),
+        ...(placement === 'following turn' ? [assistantAnswer('Received.', 6), userPrompt('Continue', 6)] : []),
+        ...collision,
+        assistantAnswer('Done.', 9),
+      ]);
+      const pages = [];
+      let cursor = null;
+      do {
+        const result = readClaudeHistoryPage(file, 'sess', cursor, { chunkBytes: 80, targetTurns: 1 });
+        assert.equal(result.kind, 'page');
+        if (result.kind !== 'page') break;
+        pages.push(result.page);
+        cursor = structuredClone(result.page.nextOlderCursor);
+      } while (cursor);
+      const paged = pages.reverse().flatMap((page) => page.turns);
+      assert.deepEqual(paged, readSession(file, 'sess').turns);
+      assert.equal(paged[0].agents[0].status, 'running');
+      assert.equal(paged[0].agents[0].closedAt, undefined);
+    }
+  },
+);
+
+test.each([36, 37, 38, 39, 40])('Claude notice identity checks survive %s intervening turns', (distance) => {
+  for (const placement of ['owner turn', 'next turn']) {
+    const records = [
+      userPrompt('Delegate', 0),
+      assistantTool('Agent', 1, 'agent1', { run_in_background: true }),
+      backgroundLaunch('agent1', 'child1', 2),
+      ...(placement === 'next turn' ? [assistantAnswer('The child is running.', 3), userPrompt('Check', 4)] : []),
+      commandNotice('agent1', 'child1', 'completed', 5),
+      assistantAnswer('Received.', 6),
+    ];
+    for (let index = 0; index < distance; index++) {
+      records.push(userPrompt(`Ordinary ${index}`, 7 + index * 3), assistantAnswer('Done.', 8 + index * 3));
+    }
+    records.push(
+      userPrompt('Continue', 10 + distance * 3),
+      assistantTool('Bash', 11 + distance * 3, 'agent1', {}),
+      assistantAnswer('Done.', 12 + distance * 3),
+    );
+    const file = writeTranscript(records);
+    const full = readSession(file, 'sess');
+    assert.equal(full.taskCompletions?.[0].ambiguous, true);
+    const turns = [];
+    let cursor = null;
+    do {
+      const result = readClaudeHistoryPage(file, 'sess', cursor, { chunkBytes: 80, targetTurns: 1 });
+      assert.equal(result.kind, 'page');
+      if (result.kind !== 'page') break;
+      turns.unshift(...result.page.turns);
+      cursor = structuredClone(result.page.nextOlderCursor);
+    } while (cursor);
+    assert.equal(turns[0].agents[0].status, 'running', placement);
+    assert.equal(turns[0].agents[0].closedAt, undefined, placement);
+  }
+});
+
+test.each([false, true])('Claude page task identities respect process ends (notice before end %s)', (beforeEnd) => {
+  const notice = commandNotice('agent1', 'child1', 'completed', 6);
+  const ended = { type: 'cost-state', startTime: ms(0), totalDuration: beforeEnd ? 6500 : 4000 };
+  const file = writeTranscript([
+    userPrompt('Delegate', 0),
+    assistantTool('Agent', 1, 'agent1', {}),
+    backgroundLaunch('agent1', 'child1', 2),
+    assistantAnswer('The child is running.', 3),
+    ...(!beforeEnd ? [ended] : []),
+    userPrompt('Check the child', 5),
+    notice,
+    ...(beforeEnd ? [ended] : []),
+    assistantAnswer('Received.', 7),
+    ...Array.from({ length: 40 }, (_value, index) => [
+      userPrompt(`Ordinary ${index}`, 8 + index * 3),
+      assistantAnswer('Done.', 9 + index * 3),
+    ]).flat(),
+    userPrompt('Continue', 129),
+    assistantTool('Bash', 130, 'agent1', {}),
+    assistantAnswer('Done.', 131),
+  ]);
+  const turns = [];
+  let cursor = null;
+  do {
+    const result = readClaudeHistoryPage(file, 'sess', cursor, { chunkBytes: 80, targetTurns: 1 });
+    assert.equal(result.kind, 'page');
+    if (result.kind !== 'page') break;
+    turns.unshift(...result.page.turns);
+    cursor = structuredClone(result.page.nextOlderCursor);
+  } while (cursor);
+  assert.deepEqual(turns, readSession(file, 'sess', { maxTurns: 100 }).turns);
+  assert.equal(turns[0].agents[0].status, beforeEnd ? 'completed' : 'running');
 });
 
 test('Claude pages hold the open newest turn outside complete history', () => {
@@ -7194,7 +7309,8 @@ test('a background subagent stays running until its notification arrives', () =>
       origin: { kind: 'task-notification' },
       message: {
         role: 'user',
-        content: '<task-notification><tool-use-id>bg1</tool-use-id><status>completed</status></task-notification>',
+        content:
+          '<task-notification><task-id>x1</task-id><tool-use-id>bg1</tool-use-id><status>completed</status></task-notification>',
       },
     },
     assistantText('It finished.', 4),
@@ -12189,7 +12305,7 @@ test('a Claude local command answer hands background children back to the turn b
     ...launch,
     caveat,
     command,
-    completionNotice('background-agent', 5),
+    commandNotice('background-call', 'background-agent', 'completed', 5),
     { ...(answer as Record<string, unknown>), timestamp: at(6) },
   ]);
   assert.deepEqual(closed.starts, [ms(0), ms(0), ms(0)]);
@@ -13142,6 +13258,7 @@ test('session metadata follows the parser through API errors and a turn that res
     interrupted: false,
     endedAt: parsed.endedAt,
     startedAt: parsed.startedAt,
+    taskCompletions: [{ taskId: null, toolId: null, status: null, closedAt: ms(3), kind: 'unknown', ambiguous: true }],
   });
 });
 
@@ -13228,6 +13345,183 @@ const backgroundCommandTurn = [
   },
   assistantAnswer('The suite runs in the background.', 3),
 ];
+
+test('completed Bash tasks stay out of child state across metadata, full, append and restored reads', () => {
+  for (const status of ['completed', 'failed', 'killed', 'stopped']) {
+    const completion = commandNotice('cmd1', 'b349silf3', status, 5);
+    const records = [...backgroundCommandTurn, completion, assistantAnswer('The command ended.', 6)];
+    const file = writeTranscript(backgroundCommandTurn);
+    const initial = readClaudeSessionIncremental(file, 'sess');
+    fs.appendFileSync(file, [completion, records.at(-1)].map((record) => JSON.stringify(record)).join('\n') + '\n');
+    const append = readClaudeSessionIncremental(file, 'sess', structuredClone(initial.checkpoint!));
+    for (const [reader, outcome] of Object.entries({
+      ...outcomeReaders(records),
+      append: sessionOutcomeOf(append.read!),
+    })) {
+      assert.equal(outcome?.closedChildren, undefined, `${status} ${reader}`);
+      assert.equal(outcome?.openChildren, undefined, `${status} ${reader}`);
+      assert.equal(outcome?.taskCompletions?.[0].kind, 'command', `${status} ${reader}`);
+      assert.equal(outcome?.taskCompletions?.[0].taskId, 'b349silf3');
+    }
+    assert.equal(readSessionMeta(file).outcome?.backgroundCommands, undefined);
+  }
+});
+
+test('wider task evidence resolves a launch before the tail without inventing a child', () => {
+  const records = [
+    ...backgroundCommandTurn,
+    assistantAnswer('x'.repeat(8000), 4),
+    userPrompt('Is it done?', 5),
+    commandNotice('cmd1', 'b349silf3', 'completed', 6),
+    assistantAnswer('Yes.', 7),
+  ];
+  const file = writeTranscript(records);
+  const tail = readSessionMeta(file, 2048, 'sess').outcome;
+  assert.equal(tail?.taskCompletions?.[0].kind, 'unknown');
+  const readers = outcomeReaders(records);
+  for (const wider of [readers.full, readers.lifetime, readers.restored]) {
+    const merged = outcomeWithWiderChildren(tail, wider);
+    assert.equal(merged?.taskCompletions?.[0].kind, 'command');
+    assert.equal(merged?.closedChildren, undefined);
+  }
+});
+
+test('selected recovery retains conflicting Bash task identities before admitting completion', () => {
+  const records = [
+    ...backgroundCommandTurn,
+    assistantAnswer('x'.repeat(8000), 4),
+    userPrompt('Is it done?', 5),
+    commandNotice('cmd1', 'wrong-task', 'completed', 6),
+    assistantAnswer('Done', 7),
+  ];
+  const lines = records.map((record) => JSON.stringify(record));
+  const recovered = createClaudeSessionReducer('sess');
+  for (const line of lines.filter(claudeSessionLineMayAffectRead)) recovered.pushLine(line);
+  const tail = readSessionMeta(writeTranscript(records), 2048, 'sess').outcome;
+  const outcome = outcomeWithWiderChildren(tail, null, sessionOutcomeOf(recovered.finish()));
+  assert.equal(outcome?.taskCompletions?.[0].kind, 'unknown');
+  assert.equal(outcome?.taskCompletions?.[0].ambiguous, true);
+});
+
+test('late child identity collisions reopen full, tail, append and restored child safeguards', () => {
+  const prefix = [
+    userPrompt('Delegate', 0),
+    assistantTool('Agent', 1, 'agent1', { run_in_background: true }),
+    backgroundLaunch('agent1', 'child1', 2),
+    commandNotice('agent1', 'child1', 'completed', 3),
+    assistantAnswer('Done', 4),
+  ];
+  for (const collision of [
+    [assistantTool('Bash', 5, 'agent1', { run_in_background: true })],
+    [
+      {
+        ...backgroundCommandTurn[2],
+        timestamp: at(5),
+        message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'agent1', content: 'started' }] },
+      },
+    ],
+    [assistantTool('Agent', 5, 'agent2', { run_in_background: true }), backgroundLaunch('agent2', 'child1', 6)],
+  ]) {
+    const suffix = [...collision, assistantAnswer('Done', 7)];
+    const records = [...prefix, ...suffix];
+    const file = writeTranscript(prefix);
+    const initial = readClaudeSessionIncremental(file, 'sess');
+    fs.appendFileSync(file, suffix.map((record) => JSON.stringify(record)).join('\n') + '\n');
+    const appended = readClaudeSessionIncremental(file, 'sess', structuredClone(initial.checkpoint!)).read!;
+    const lifetime = createClaudeUsageLineReducer();
+    prefix.forEach((record) => lifetime.pushLine(JSON.stringify(record)));
+    const restored = createClaudeUsageLineReducer(JSON.parse(JSON.stringify(lifetime.snapshot())));
+    suffix.forEach((record) => restored.pushLine(JSON.stringify(record)));
+    for (const [name, outcome] of Object.entries({
+      ...outcomeReaders(records),
+      append: sessionOutcomeOf(appended),
+      restoredBeforeCollision: restored.newestTurnOutcome(),
+    })) {
+      assert.ok(outcome?.openChildren?.includes('child1'), name);
+      assert.equal(outcome?.closedChildren, undefined, name);
+      assert.equal(outcome?.taskCompletions?.[0].kind, 'unknown', name);
+    }
+    for (const read of [readSession(file, 'sess'), appended]) {
+      const agent = read.turns.flatMap((turn) => turn.agents).find((agent) => agent.toolUseId === 'agent1')!;
+      assert.equal(agent.status, 'running');
+      assert.equal(agent.closedAt, undefined);
+    }
+  }
+});
+
+test('task kind collisions and missing or malformed notice identities retain uncertainty', () => {
+  const notice = commandNotice('cmd1', 'b349silf3', 'completed', 6);
+  for (const records of [
+    [userPrompt('Work', 0), notice, assistantAnswer('Done', 7)],
+    [
+      ...backgroundCommandTurn,
+      notice,
+      assistantTool('Agent', 6, 'agent2', { run_in_background: true }),
+      backgroundLaunch('agent2', 'b349silf3', 6),
+      assistantAnswer('Done', 7),
+    ],
+    [
+      ...backgroundCommandTurn,
+      assistantTool('Agent', 4, 'agent2', { run_in_background: true }),
+      backgroundLaunch('agent2', 'b349silf3', 5),
+      notice,
+      assistantAnswer('Done', 7),
+    ],
+    [
+      ...backgroundCommandTurn,
+      assistantTool('Agent', 4, 'cmd1', { run_in_background: true }),
+      backgroundLaunch('cmd1', 'child2', 5),
+      notice,
+      assistantAnswer('Done', 7),
+    ],
+    [
+      ...backgroundCommandTurn,
+      {
+        ...notice,
+        message: {
+          role: 'user',
+          content: notice.message.content.replace('</task-id>', '</task-id><task-id>other</task-id>'),
+        },
+      },
+      assistantAnswer('Done', 7),
+    ],
+  ]) {
+    for (const [reader, outcome] of Object.entries(outcomeReaders(records))) {
+      assert.equal(outcome?.taskCompletions?.[0].kind, 'unknown', reader);
+      assert.equal(outcome?.closedChildren, undefined, reader);
+      if (outcome?.taskCompletions?.[0].ambiguous) {
+        const known = outcomeReaders([...backgroundCommandTurn, notice, assistantAnswer('Done', 7)]).tail;
+        assert.equal(
+          outcomeWithWiderChildren(known, outcome)?.taskCompletions?.some(
+            (completion) => completion.kind === 'unknown',
+          ),
+          true,
+        );
+      }
+    }
+  }
+});
+
+test('a wider child launch closes a notice whose launch precedes the tail', () => {
+  const records = [
+    userPrompt('Delegate', 0),
+    assistantTool('Agent', 1, 'agent1', { run_in_background: true }),
+    backgroundLaunch('agent1', 'child1', 2),
+    assistantAnswer('x'.repeat(8000), 3),
+    userPrompt('Ready?', 4),
+    commandNotice('agent1', 'child1', 'completed', 5),
+    assistantAnswer('Done', 6),
+  ];
+  const file = writeTranscript(records);
+  const tail = readSessionMeta(file, 2048, 'sess').outcome;
+  assert.equal(tail?.taskCompletions?.[0].kind, 'unknown');
+  const wider = outcomeReaders(records);
+  for (const outcome of [wider.full, wider.lifetime, wider.restored]) {
+    const merged = outcomeWithWiderChildren(tail, outcome);
+    assert.deepEqual(merged?.closedChildren, [{ id: 'child1', closedAt: ms(5) }]);
+    assert.equal(merged?.taskCompletions?.[0].kind, 'child');
+  }
+});
 
 // Derive session status from transcript metadata and the supplied open-child count at one clock reading.
 
@@ -13459,6 +13753,10 @@ test('a restored lifetime scan indexes closed child ids once across a large comp
       closedChildren,
     },
   };
+
+  for (let index = 0; index < count; index++) {
+    reduceClaudeUsageLine(state, JSON.stringify(backgroundLaunch(`call-${index}`, `new-${index}`, index)));
+  }
 
   for (let index = 0; index < count; index++) {
     reduceClaudeUsageLine(
@@ -13728,7 +14026,7 @@ test('a session at rest keeps its carried subagent through the derived cache', (
 
 // A completion observed by metadata or lifetime readers prevents a parsed open row from reopening the child.
 
-test('a child that any read closed does not count as open', () => {
+test('a child notice without its tool identity preserves unknown completion', () => {
   const { tail, full, lifetime } = outcomeReaders([
     userPrompt('scan in the background', 0),
     assistantTool('Agent', 1, 'bg1', { description: 'Scan x1', run_in_background: true }),
@@ -13748,13 +14046,14 @@ test('a child that any read closed does not count as open', () => {
     assistantAnswer('Nothing else.', 7),
   ]);
   assert.deepEqual(full?.openChildren, ['x1'], 'the parsed window keeps the row open');
-  assert.equal(tail?.openChildren, undefined, 'the tail read closed the child');
-  assert.equal(lifetime?.openChildren, undefined, 'the lifetime facts closed the child');
+  assert.deepEqual(tail?.openChildren, ['x1']);
+  assert.deepEqual(lifetime?.openChildren, ['x1']);
+  for (const outcome of [tail, full, lifetime]) assert.equal(outcome?.taskCompletions?.[0].kind, 'unknown');
   const merged = outcomeWithWiderChildren(tail, lifetime, full);
   const now = ms(20);
   assert.deepEqual(
     liveOpenChildren(new Map([['sess', merged]]), () => now - 60_000, new Map(), now),
-    new Map(),
+    new Map([['sess', ['x1']]]),
   );
 });
 

@@ -1,3 +1,4 @@
+import { validClaudeTaskCompletions } from './transcript';
 import * as fs from 'node:fs';
 import { boundedCommitRepositories, type VerifiedCommitRepository } from './commitrepositories';
 import { writeFileAtomically } from './atomicfile';
@@ -462,10 +463,10 @@ export type MetadataGenerations = Readonly<Record<AgentKind, number>>;
 // The initial metadata budget, `INITIAL_RAIL_READ_BYTES`, spreads large workspace rebuilds across refreshes.
 // Targeted invalidation avoids a full rebuild when affected entries are identifiable at load.
 // Codex opening rows use `CODEX_META_VERSION` from codexopenings.ts and survive these generation changes.
-export const METADATA_GENERATIONS: MetadataGenerations = { claude: 71, codex: 72 };
+export const METADATA_GENERATIONS: MetadataGenerations = { claude: 72, codex: 72 };
 
 // The agent generations that each shared `metadataVersion` of `derived-session-cache-v1.json` matches.
-// Shared version 71 changed only Codex pricing, so Claude entries of version 70 match Claude generation 71.
+// Each pair names the agent generation of the stored facts.
 // An absent pair matches no generation. A later bump of one agent's generation stops importing that agent's entries.
 export const V1_METADATA_GENERATIONS: Readonly<Record<number, Partial<MetadataGenerations>>> = {
   70: { claude: 71 },
@@ -654,6 +655,8 @@ function outcome(value: unknown): value is TurnOutcome | null {
       (Array.isArray(value.openChildren) && value.openChildren.every(nonEmptyText))) &&
     (!Object.prototype.hasOwnProperty.call(value, 'closedChildren') ||
       (Array.isArray(value.closedChildren) && value.closedChildren.every(closedChild))) &&
+    (!Object.prototype.hasOwnProperty.call(value, 'taskCompletions') ||
+      validClaudeTaskCompletions(value.taskCompletions)) &&
     (!Object.prototype.hasOwnProperty.call(value, 'backgroundCommands') ||
       (Array.isArray(value.backgroundCommands) && value.backgroundCommands.every(backgroundCommand)))
   );

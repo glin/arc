@@ -1136,6 +1136,7 @@ interface CompactMetadata {
 }
 
 export interface SessionRead {
+  taskCompletions?: ClaudeTaskCompletion[];
   // Recorded Codex identity for display only. It establishes no request or context facts.
   lastReportedModel?: string | null;
   turns: Turn[];
@@ -1292,6 +1293,12 @@ export function sessionOutcomeOf(read: SessionRead): TurnOutcome | null {
       closedChildIndex.clear();
     }
   }
+  const unconfirmed = new Set(
+    (read.taskCompletions ?? [])
+      .filter((completion) => completion.kind !== 'child')
+      .map((completion) => completion.taskId),
+  );
+  const confirmedChildren = closedChildren.filter((child) => !unconfirmed.has(closedChildId(child)));
   return newest
     ? {
         finished: newest.finished,
@@ -1299,9 +1306,10 @@ export function sessionOutcomeOf(read: SessionRead): TurnOutcome | null {
         interrupted: newest.interrupted,
         endedAt: newest.endedAt,
         startedAt: newest.startedAt,
+        ...(read.taskCompletions?.length ? { taskCompletions: read.taskCompletions } : {}),
         ...(newest.processEndedAt !== undefined ? { processEndedAt: newest.processEndedAt } : {}),
         ...(openChildren.length > 0 ? { openChildren } : {}),
-        ...(closedChildren.length > 0 ? { closedChildren: [...closedChildren] } : {}),
+        ...(confirmedChildren.length > 0 ? { closedChildren: confirmedChildren } : {}),
       }
     : null;
 }
@@ -2063,6 +2071,8 @@ export function readSessionWork(file: string, bytes = 256 * 1024, now = Infinity
 }
 
 export interface TurnOutcome {
+  // Structured task notices retain their classification across bounded and wider reads.
+  taskCompletions?: ClaudeTaskCompletion[];
   finished: boolean;
   error: boolean;
   interrupted: boolean;
@@ -2225,40 +2235,219 @@ function claudeBackgroundLaunchOf(record: Record<string, unknown>): string | nul
   return typeof result.agentId === 'string' && result.agentId ? result.agentId : null;
 }
 
-// The child id a completion notice closes. A notice that still reports `running`, or that
-// carries no status, closes nothing, as it leaves the full read's row open.
-function claudeClosedChildOf(notice: string): string | null {
-  const status = /<status>([^<]+)<\/status>/.exec(notice);
-  if (!status || status[1] === 'running') {
-    return null;
+export interface ClaudeTaskCompletion {
+  taskId: string | null;
+  toolId: string | null;
+  status: string | null;
+  closedAt: number;
+  kind: 'command' | 'child' | 'unknown';
+  ambiguous?: true;
+}
+
+export function validClaudeTaskCompletions(value: unknown): value is ClaudeTaskCompletion[] {
+  return (
+    Array.isArray(value) &&
+    value.every((entry: unknown) => {
+      if (!entry || typeof entry !== 'object') return false;
+      const item = entry as Record<string, unknown>;
+      return (
+        [item.taskId, item.toolId, item.status].every(
+          (field) => field === null || (typeof field === 'string' && field.length > 0),
+        ) &&
+        Number.isFinite(item.closedAt) &&
+        typeof item.kind === 'string' &&
+        ['command', 'child', 'unknown'].includes(item.kind) &&
+        (item.kind === 'unknown' ||
+          ([item.toolId, item.taskId, item.status].every((field) => typeof field === 'string' && field.length > 0) &&
+            !item.ambiguous)) &&
+        (item.ambiguous === undefined || item.ambiguous === true)
+      );
+    })
+  );
+}
+
+interface ClaudeTaskEvidence {
+  tools: Record<string, ClaudeTaskCompletion['kind']>;
+  tasks: Record<string, string>;
+  toolTasks: Record<string, string>;
+  launches: Record<string, string>;
+  completions: ClaudeTaskCompletion[];
+  noticesByTool: Record<string, number[]>;
+}
+
+export function validClaudeTaskEvidence(value: unknown): boolean {
+  if (!value || typeof value !== 'object') return false;
+  const state = value as ClaudeTaskEvidence;
+  const dictionary = (input: unknown, check: (entry: unknown) => boolean) =>
+    !!input &&
+    typeof input === 'object' &&
+    !Array.isArray(input) &&
+    Object.entries(input).every(([key, entry]) => key.startsWith('@') && check(entry));
+  if (!validClaudeTaskCompletions(state.completions)) return false;
+  const expected: Record<string, number[]> = {};
+  state.completions.forEach((completion, index) => {
+    if (completion.toolId !== null) (expected['@' + completion.toolId] ??= []).push(index);
+  });
+  return (
+    state.noticesByTool !== null &&
+    typeof state.noticesByTool === 'object' &&
+    Object.keys(state.noticesByTool).length === Object.keys(expected).length &&
+    Object.entries(expected).every(
+      ([tool, indices]) => JSON.stringify(state.noticesByTool[tool]) === JSON.stringify(indices),
+    ) &&
+    dictionary(state.tools, (entry) => ['command', 'child', 'unknown'].includes(String(entry))) &&
+    [state.tasks, state.toolTasks, state.launches].every((input) =>
+      dictionary(input, (entry) => typeof entry === 'string'),
+    ) &&
+    dictionary(
+      state.noticesByTool,
+      (entry) =>
+        Array.isArray(entry) &&
+        entry.every((index) => Number.isSafeInteger(index) && index >= 0 && index < state.completions.length),
+    )
+  );
+}
+
+function emptyClaudeTaskEvidence(): ClaudeTaskEvidence {
+  return { tools: {}, tasks: {}, toolTasks: {}, launches: {}, completions: [], noticesByTool: {} };
+}
+
+interface ClaudeTaskChange extends ClaudeTaskCompletion {
+  reopenedChild?: true;
+}
+
+// Prefix dictionary keys so transcript identities cannot name object prototype properties.
+function observeClaudeTask(state: ClaudeTaskEvidence, record: Record<string, unknown>): ClaudeTaskChange[] {
+  const affected = new Set<string>();
+  const added: number[] = [];
+  const content = (record.message as { content?: unknown } | undefined)?.content;
+  const blocks = Array.isArray(content) ? (content as Record<string, unknown>[]) : [];
+  const kindOf = (name: unknown): ClaudeTaskCompletion['kind'] =>
+    name === 'Bash' ? 'command' : name === 'Agent' || name === 'Task' ? 'child' : 'unknown';
+  const noteKind = (tool: string, kind: ClaudeTaskCompletion['kind']) => {
+    affected.add(tool);
+    state.tools[tool] = state.tools[tool] === undefined || state.tools[tool] === kind ? kind : 'unknown';
+  };
+  if (record.type === 'assistant') {
+    for (const block of blocks) {
+      if (block?.type !== 'tool_use' || typeof block.id !== 'string' || !block.id || kindOf(block.name) === 'unknown')
+        continue;
+      const tool = '@' + block.id;
+      const identity =
+        typeof record.uuid === 'string'
+          ? record.uuid
+          : createHash('sha256').update(JSON.stringify(record)).digest('hex');
+      noteKind(tool, kindOf(block.name));
+      if (state.launches[tool] !== undefined && (typeof record.uuid !== 'string' || state.launches[tool] !== identity))
+        state.tools[tool] = 'unknown';
+      state.launches[tool] = identity;
+    }
   }
-  return /<task-id>([^<]+)<\/task-id>/.exec(notice)?.[1] ?? null;
+  if (record.type === 'user') {
+    const result = (record.toolUseResult ?? record.tool_use_result) as
+      | { status?: unknown; agentId?: unknown; backgroundTaskId?: unknown }
+      | undefined;
+    const child =
+      result?.status === 'async_launched' || result?.status === 'launched' || result?.status === 'running'
+        ? result.agentId
+        : undefined;
+    const task = child ?? result?.backgroundTaskId;
+    if (typeof task === 'string' && task) {
+      for (const block of blocks) {
+        if (
+          block?.type !== 'tool_result' ||
+          block.is_error === true ||
+          typeof block.tool_use_id !== 'string' ||
+          !block.tool_use_id
+        )
+          continue;
+        const tool = '@' + block.tool_use_id,
+          key = '@' + task;
+        noteKind(tool, typeof child === 'string' ? 'child' : 'command');
+        if (typeof child === 'string' && typeof result?.backgroundTaskId === 'string') noteKind(tool, 'unknown');
+        const previous = state.tasks[key],
+          previousTask = state.toolTasks[tool];
+        if (previous !== undefined && previous !== tool) {
+          state.tools[tool] = 'unknown';
+          if (previous) {
+            state.tools[previous] = 'unknown';
+            affected.add(previous);
+          }
+          state.tasks[key] = '';
+        } else state.tasks[key] = tool;
+        if (previousTask !== undefined && previousTask !== key) {
+          state.tools[tool] = 'unknown';
+          state.toolTasks[tool] = '';
+        } else state.toolTasks[tool] = key;
+      }
+    }
+  }
+  const notice = taskNotificationText(record);
+  if (notice !== null) {
+    const fields = claudeTaskFields(notice, false);
+    const index = state.completions.length;
+    state.completions.push({ ...fields, closedAt: claudeRecordAt(record), kind: 'unknown' });
+    added.push(index);
+    if (fields.toolId !== null) (state.noticesByTool['@' + fields.toolId] ??= []).push(index);
+  }
+  // Conflicting later associations also revoke an earlier classification.
+  const changed: ClaudeTaskChange[] = [];
+  const indices = new Set([...added, ...[...affected].flatMap((tool) => state.noticesByTool[tool] ?? [])]);
+  for (const index of indices) {
+    const completion = state.completions[index];
+    const previousKind = completion.kind;
+    const wasClosedChild = terminalChild(completion);
+    const tool = completion.toolId === null ? null : '@' + completion.toolId;
+    const task = completion.taskId === null ? null : '@' + completion.taskId;
+    const matches =
+      tool !== null &&
+      task !== null &&
+      (state.tasks[task] === undefined || state.tasks[task] === tool) &&
+      (state.toolTasks[tool] === undefined || state.toolTasks[tool] === task);
+    completion.kind = matches && completion.status !== null ? (state.tools[tool] ?? 'unknown') : 'unknown';
+    if (completion.kind === 'child' && !['running', 'completed', 'failed', 'killed'].includes(completion.status ?? ''))
+      completion.kind = 'unknown';
+    if (!matches || (tool !== null && state.tools[tool] === 'unknown')) completion.ambiguous = true;
+    else delete completion.ambiguous;
+    if (added.includes(index) || completion.kind !== previousKind)
+      changed.push({
+        ...completion,
+        ...(wasClosedChild && !terminalChild(completion) ? { reopenedChild: true as const } : {}),
+      });
+  }
+  if (claudeProcessEndedAt(record) !== null) Object.assign(state, emptyClaudeTaskEvidence());
+  return changed;
 }
 
-// Add one notice to an ordered close list. A notice closes its child even when the launch lies
-// before the read, so a wider read that holds the launch cannot reopen it.
-function addClosedChildNotice(
-  closed: ClosedChild[],
-  index: Map<string, number>,
-  notice: string | null,
-  closedAt: number,
-): boolean {
-  const id = notice === null ? null : claudeClosedChildOf(notice);
-  return id !== null && closeChild(closed, index, id, closedAt);
+function terminalChild(completion: ClaudeTaskCompletion): boolean {
+  return (
+    completion.kind === 'child' &&
+    completion.taskId !== null &&
+    ['completed', 'failed', 'killed'].includes(completion.status ?? '')
+  );
 }
 
-// The open children after one record, as a new list, or the same list when nothing changed.
 function nextOpenChildren(
   open: readonly string[],
   record: Record<string, unknown>,
-  notice: string | null,
+  completions: readonly ClaudeTaskChange[],
 ): readonly string[] {
-  const closed = notice === null ? null : claudeClosedChildOf(notice);
-  if (closed !== null) {
-    return open.includes(closed) ? open.filter((id) => id !== closed) : open;
-  }
   const launched = claudeBackgroundLaunchOf(record);
-  return launched !== null && !open.includes(launched) ? [...open, launched] : open;
+  let next = launched !== null && !open.includes(launched) ? [...open, launched] : open;
+  for (const completion of completions)
+    if (completion.reopenedChild && completion.taskId !== null && !next.includes(completion.taskId))
+      next = [...next, completion.taskId];
+  const closed = new Set(completions.filter(terminalChild).map((completion) => completion.taskId));
+  return next.some((id) => closed.has(id)) ? next.filter((id) => !closed.has(id)) : next;
+}
+
+function addClosedChildNotices(
+  closed: ClosedChild[],
+  index: Map<string, number>,
+  completions: readonly ClaudeTaskCompletion[],
+): void {
+  for (const completion of completions)
+    if (terminalChild(completion)) closeChild(closed, index, completion.taskId!, completion.closedAt);
 }
 
 // The background commands after one record, as a new list, or the same list when nothing
@@ -3208,6 +3397,7 @@ function outcomeIn(
   const tasks = new Map<string, string>();
   const closed: ClosedChild[] = [];
   const closedIndex = new Map<string, number>();
+  const taskEvidence = emptyClaudeTaskEvidence();
   for (const line of lines) {
     if (line.length < 20) {
       continue;
@@ -3231,7 +3421,9 @@ function outcomeIn(
     if (o.isSidechain && !childTranscript) {
       continue;
     }
+    const taskChanges = observeClaudeTask(taskEvidence, o);
     if (taskIdOnly) {
+      open = nextOpenChildren(open, o, taskChanges);
       commands = nextBackgroundCommands(commands, o, null, tasks);
       continue;
     }
@@ -3343,13 +3535,13 @@ function outcomeIn(
     const processEndedAt = claudeProcessEndedAt(o);
     // A recorded process end ends every background child the process held, so a resume
     // after it starts with none open.
-    open = processEndedAt !== null ? [] : nextOpenChildren(open, o, notice);
+    open = processEndedAt !== null ? [] : nextOpenChildren(open, o, taskChanges);
     commands = processEndedAt !== null ? [] : nextBackgroundCommands(commands, o, notice, tasks);
     if (processEndedAt !== null) {
       closed.length = 0;
       closedIndex.clear();
     } else {
-      addClosedChildNotice(closed, closedIndex, notice, claudeRecordAt(o));
+      addClosedChildNotices(closed, closedIndex, taskChanges);
     }
     // A long child turn can have its prompt before the tail. A stop reason or a result that
     // ends the turn still gives it an outcome.
@@ -3431,9 +3623,14 @@ function outcomeIn(
   if (outcome && open.length > 0) {
     outcome.openChildren = [...open];
   }
+  closed.length = 0;
+  closedIndex.clear();
+  addClosedChildNotices(closed, closedIndex, taskEvidence.completions);
   if (outcome && closed.length > 0) {
     outcome.closedChildren = [...closed];
   }
+  if (outcome && taskEvidence.completions.length)
+    outcome.taskCompletions = taskEvidence.completions.map((completion) => ({ ...completion }));
   if (outcome && commands.length > 0) {
     outcome.backgroundCommands = [...commands];
   }
@@ -5801,29 +5998,42 @@ function readerQueuedAsk(
 // Reads terminal task identities from Claude user notices and queued task notifications.
 export function claudeTaskNotification(
   record: Record<string, unknown>,
+  strictFrame = true,
 ): { toolId: string; taskId: string; status: string } | null {
   const notice = taskNotificationText(record);
   if (notice === null) return null;
-  const tags = (name: string) => {
+  const fields = claudeTaskFields(notice, strictFrame);
+  return fields.toolId !== null &&
+    fields.taskId !== null &&
+    ['completed', 'failed', 'killed'].includes(fields.status ?? '')
+    ? { toolId: fields.toolId, taskId: fields.taskId, status: fields.status! }
+    : null;
+}
+
+function claudeTaskFields(
+  notice: string,
+  strictFrame = true,
+): Pick<ClaudeTaskCompletion, 'toolId' | 'taskId' | 'status'> {
+  const tag = (name: string): string | null => {
     const occurrences = [...notice.matchAll(new RegExp(`</?${name}(?=[^a-zA-Z0-9_-]|$)[^>]*(?:>|$)`, 'g'))];
-    if (occurrences.length !== 2 || occurrences[0][0] !== `<${name}>` || occurrences[1][0] !== `</${name}>`) return [];
+    if (occurrences.length !== 2 || occurrences[0][0] !== `<${name}>` || occurrences[1][0] !== `</${name}>`)
+      return null;
     const value = new RegExp(`<${name}>([^<>]+)</${name}>`).exec(notice)?.[1];
-    return value?.trim() ? [value] : [];
+    return value?.trim() ? value : null;
   };
-  const statuses = tags('status'),
-    tools = tags('tool-use-id'),
-    tasks = tags('task-id');
-  if (
-    statuses.length !== 1 ||
-    !['completed', 'failed', 'killed'].includes(statuses[0]) ||
-    tools.length !== 1 ||
-    tasks.length !== 1 ||
-    !/^\s*<task-notification>[\s\S]*<\/task-notification>\s*$/.test(notice) ||
-    (notice.match(/<task-notification>/g)?.length ?? 0) !== 1 ||
-    (notice.match(/<\/task-notification>/g)?.length ?? 0) !== 1
-  )
-    return null;
-  return { toolId: tools[0], taskId: tasks[0], status: statuses[0] };
+  const openings = notice.match(/<task-notification>/g)?.length ?? 0;
+  const closings = notice.match(/<\/task-notification>/g)?.length ?? 0;
+  const framed = strictFrame
+    ? /^\s*<task-notification>[\s\S]*<\/task-notification>\s*$/.test(notice) && openings === 1 && closings === 1
+    : (openings === 0 && closings === 0) ||
+      (openings === 1 &&
+        closings === 1 &&
+        notice.indexOf('<task-notification>') < notice.indexOf('</task-notification>'));
+  return {
+    toolId: framed ? tag('tool-use-id') : null,
+    taskId: framed ? tag('task-id') : null,
+    status: framed ? tag('status') : null,
+  };
 }
 
 // Raw task-notification text from a user record's content or a queued attachment's prompt.
@@ -7921,6 +8131,7 @@ export type ClaudeUsage = {
 // Kept as JSON data so an incremental scanner can save it beside its byte offset and resume
 // after the extension host restarts.
 export interface ClaudeUsageReducerState {
+  taskEvidence?: ClaudeTaskEvidence;
   costState?: ClaudeCostCapture;
   // First-seen request keys, oldest first. Parent reads retain every key.
   // Child reads retain the newest keys unless retainAllRequests is set. Snapshots keep an array.
@@ -8089,6 +8300,8 @@ function restoreClaudeTurn(state: ClaudeUsageReducerState, turn: ClaudePreviousT
   if (outcome) {
     delete outcome.openChildren;
     delete outcome.closedChildren;
+    delete outcome.taskCompletions;
+    if (moved?.taskCompletions?.length) outcome.taskCompletions = moved.taskCompletions;
     if (moved?.openChildren?.length) {
       outcome.openChildren = moved.openChildren;
     }
@@ -8400,6 +8613,7 @@ function reduceClaudeTurnRecord(
   if (record.isSidechain && !childTranscript) {
     return;
   }
+  const taskChanges = observeClaudeTask((state.taskEvidence ??= emptyClaudeTaskEvidence()), record);
   const queuedAsk = readerQueuedAsk(record);
   if (queuedAsk && !state.currentTurnWithdrawn) {
     state.currentTurnCompact = false;
@@ -8522,6 +8736,7 @@ function reduceClaudeTurnRecord(
       startedAt: at,
       ...(openChildren && openChildren.length > 0 ? { openChildren } : {}),
       ...(closedChildren && closedChildren.length > 0 ? { closedChildren } : {}),
+      ...(state.taskEvidence?.completions.length ? { taskCompletions: state.taskEvidence.completions } : {}),
     };
     if (state.firstTurnAt === null) {
       state.firstTurnAt = at;
@@ -8580,7 +8795,7 @@ function reduceClaudeTurnRecord(
   const notice = taskNotificationText(record);
   if (state.currentTurnOutcome) {
     const held = state.currentTurnOutcome.openChildren ?? [];
-    const open = nextOpenChildren(held, record, notice);
+    const open = nextOpenChildren(held, record, taskChanges);
     if (open !== held) {
       if (open.length > 0) {
         state.currentTurnOutcome.openChildren = [...open];
@@ -8588,13 +8803,23 @@ function reduceClaudeTurnRecord(
         delete state.currentTurnOutcome.openChildren;
       }
     }
-    const heldClosed = state.currentTurnOutcome.closedChildren ?? [];
-    if (notice !== null) {
-      state.closedChildIndex ??= indexClosedChildren(heldClosed);
-      if (addClosedChildNotice(heldClosed, state.closedChildIndex, notice, claudeRecordAt(record))) {
-        state.currentTurnOutcome.closedChildren = heldClosed;
+    if (taskChanges.length) {
+      const invalid = new Set(
+        taskChanges.filter((completion) => completion.ambiguous).map((completion) => completion.taskId),
+      );
+      let closed = state.currentTurnOutcome.closedChildren ?? [];
+      if (invalid.size && closed.some((child) => invalid.has(closedChildId(child)))) {
+        closed = closed.filter((child) => !invalid.has(closedChildId(child)));
+        state.closedChildIndex = undefined;
       }
+      state.closedChildIndex ??= indexClosedChildren(closed);
+      addClosedChildNotices(closed, state.closedChildIndex, taskChanges);
+      if (closed.length) state.currentTurnOutcome.closedChildren = closed;
+      else delete state.currentTurnOutcome.closedChildren;
     }
+    if (state.taskEvidence.completions.length)
+      state.currentTurnOutcome.taskCompletions = state.taskEvidence.completions;
+    else delete state.currentTurnOutcome.taskCompletions;
   }
   const processEndedAt = claudeProcessEndedAt(record);
   if (processEndedAt !== null && state.currentTurnOutcome) {
@@ -8602,6 +8827,7 @@ function reduceClaudeTurnRecord(
     // The process end ends every background child the process held.
     delete state.currentTurnOutcome.openChildren;
     delete state.currentTurnOutcome.closedChildren;
+    delete state.currentTurnOutcome.taskCompletions;
     state.closedChildIndex = undefined;
     state.currentTurnOutcome.processEndedAt = Math.max(state.currentTurnOutcome.processEndedAt ?? 0, processEndedAt);
     return;
@@ -9192,7 +9418,7 @@ function acceptsClaudeUsageLine(line: string): boolean {
   ) {
     return false;
   }
-  return !skipsOrdinaryToolResult(line, isUser);
+  return !skipsOrdinaryToolResult(line, isUser) || line.includes('"backgroundTaskId"');
 }
 
 export function reduceClaudeUsageLine(
@@ -9253,6 +9479,9 @@ function copyTurnOutcome(outcome: TurnOutcome | null): TurnOutcome | null {
         ...outcome,
         ...(outcome.openChildren ? { openChildren: [...outcome.openChildren] } : {}),
         ...(outcome.closedChildren ? { closedChildren: [...outcome.closedChildren] } : {}),
+        ...(outcome.taskCompletions
+          ? { taskCompletions: outcome.taskCompletions.map((completion) => ({ ...completion })) }
+          : {}),
       }
     : null;
 }
@@ -9370,6 +9599,7 @@ export function createClaudeUsageLineReducer(
               ? { currentTurnQueuedBefore: { ...restored.currentTurnQueuedBefore } }
               : {}),
             ...(restored.currentTurnToolEnded ? { currentTurnToolEnded: true } : {}),
+            taskEvidence: restored.taskEvidence ? structuredClone(restored.taskEvidence) : undefined,
             currentTurnOutcome: copyTurnOutcome(restored.currentTurnOutcome),
             // Only child reads retain request events for replacement. Parent reads discard repeated request keys.
             ...(opts.childTranscript && restored.requestEvents
@@ -9460,6 +9690,7 @@ export function createClaudeUsageLineReducer(
             ...(state.currentTurnQueued ? { currentTurnQueued: true } : {}),
             ...(state.currentTurnQueuedBefore ? { currentTurnQueuedBefore: { ...state.currentTurnQueuedBefore } } : {}),
             ...(state.currentTurnToolEnded ? { currentTurnToolEnded: true } : {}),
+            taskEvidence: state.taskEvidence ? structuredClone(state.taskEvidence) : undefined,
             currentTurnOutcome: copyTurnOutcome(state.currentTurnOutcome),
             ...(state.requestEvents ? { requestEvents: { ...state.requestEvents } } : {}),
           },
@@ -10152,7 +10383,8 @@ interface RecordedTitleState {
 }
 
 export interface ClaudeSessionParserState {
-  version: 11;
+  version: 12;
+  taskEvidence?: ClaudeTaskEvidence;
   // Text that subagents returned into this session's context since the newest compaction.
   subagents: SubagentContextState;
   turns: Turn[];
@@ -10300,7 +10532,7 @@ function emptyClaudeSessionParserState(opts: ReadOptions): ClaudeSessionParserSt
   const suppliedTitle = normalizeSessionTitle(opts.sessionTitle);
   const suppliedFullTitle = normalizeFullSessionTitle(opts.sessionTitle);
   return {
-    version: 11,
+    version: 12,
     subagents: emptySubagentContext(),
     turns: [],
     turnRanges: [],
@@ -10411,6 +10643,20 @@ function emitClaudeTurn(state: ClaudeSessionParserState, turn: SourcedBuilding, 
 
 function retainedClaudeTurns(state: ClaudeSessionParserState): Array<Turn | SourcedBuilding> {
   return [...state.turns, ...(state.cur ? [state.cur] : []), ...(state.pending.held ? [state.pending.held] : [])];
+}
+
+export function applyClaudeSessionTaskEvidence(state: ClaudeSessionParserState, record: Record<string, unknown>): void {
+  const changes = observeClaudeTask((state.taskEvidence ??= emptyClaudeTaskEvidence()), record);
+  for (const completion of changes) {
+    if (!completion.reopenedChild || completion.toolId === null) continue;
+    for (const turn of retainedClaudeTurns(state)) {
+      for (const agent of turn.agents) {
+        if (agent.toolUseId !== completion.toolId || agent.closedAt !== completion.closedAt) continue;
+        agent.status = 'running';
+        delete agent.closedAt;
+      }
+    }
+  }
 }
 
 function discardClaudeToolAssociation(state: ClaudeSessionParserState, id: string): void {
@@ -10705,11 +10951,13 @@ function applyClaudeTaskNotification(
   // The notice reports this agent's own background work, not a new request, so a reply to it
   // after a `SubagentHandback` call stays a receipt. A later report arrives as a second call.
   const status = /<status>([^<]+)<\/status>/.exec(raw);
-  const agent = id ? state.launched.get(id[1]) : undefined;
+  const completion = state.taskEvidence?.completions.at(-1);
+  const confirmed = completion?.kind === 'child' && !completion.ambiguous;
+  const agent = id && confirmed ? state.launched.get(id[1]) : undefined;
   // A finished subagent's notice enters context whole, its frame included. A notice whose call
   // launched no subagent, such as a background command, is not subagent text.
   if (status && status[1] !== 'running') {
-    if (id && knownSubagentLaunch(state.subagents, id[1])) {
+    if (confirmed && id && knownSubagentLaunch(state.subagents, id[1])) {
       const key = task?.[1] ?? id[1];
       const frame = raw.includes('<system-reminder>') ? 0 : CLAUDE_NOTICE_FRAME_BYTES;
       const name = agent?.description ?? claudeAgentName(state, key);
@@ -12372,7 +12620,7 @@ export function claudeSessionLineMayAffectRead(line: string): boolean {
   }
   const isAssistant = line.indexOf('"type":"assistant"') >= 0;
   const isUser = !isAssistant && line.indexOf('"type":"user"') >= 0;
-  return (isAssistant || isUser) && !skipsOrdinaryToolResult(line, isUser);
+  return (isAssistant || isUser) && (!skipsOrdinaryToolResult(line, isUser) || line.includes('"backgroundTaskId"'));
 }
 
 // The prompt scan reads prompts and commands, so it never parses a request record.
@@ -12523,6 +12771,9 @@ function finishClaudeSession(state: ClaudeSessionParserState, opts: ReadOptions,
   return {
     turns: state.turns,
     compactions: state.compactions,
+    ...(state.taskEvidence?.completions.length
+      ? { taskCompletions: state.taskEvidence.completions.map((completion) => ({ ...completion })) }
+      : {}),
     readBytes,
     turnLimitReached: state.turnLimitReached,
   };
@@ -12553,7 +12804,7 @@ export function createClaudeSessionReducer(
   restored?: ClaudeSessionParserState,
 ): ClaudeSessionReducer {
   const state = restored ? cloneParserState(restored) : emptyClaudeSessionParserState(opts);
-  if (state.version !== 11) {
+  if (state.version !== 12) {
     throw new Error('Incompatible Claude parser state');
   }
   applyHiddenParserState(claudeHiddenSlots(state), state.hidden, CLAUDE_HIDDEN_POLICY);
@@ -12609,6 +12860,17 @@ export function createClaudeSessionReducer(
       ) {
         const start = state.cur[SOURCE_START] ?? line.start ?? 0;
         if (line.end - start > opts.exportTurnBytes) throw new ExportLimitError('turn', opts.exportTurnBytes);
+      }
+      const text = typeof line === 'string' ? line : line.text;
+      if (text.includes('tool_use') || text.includes('task-notification') || text.includes('cost-state')) {
+        try {
+          const record = JSON.parse(text) as Record<string, unknown>;
+          if (record && (!record.isSidechain || opts.childTranscript)) {
+            applyClaudeSessionTaskEvidence(state, record);
+          }
+        } catch {
+          /* Incomplete records supply no task evidence. */
+        }
       }
       reduceClaudeSessionLine(state, line, sessionId, opts);
       if (opts.captureSessionText && typeof line !== 'string') {

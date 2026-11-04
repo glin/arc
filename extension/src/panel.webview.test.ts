@@ -1091,6 +1091,7 @@ test('response session navigation releases only its invoking clear route and ret
   }
 });
 import type { TurnOutcome } from './transcript';
+import { outcomeWithWiderChildren } from './turnrail';
 import {
   guardedSourceRevision,
   RecordedReplies,
@@ -2405,6 +2406,8 @@ import {
   normalizeSessionTitle,
   readSession,
   readSessionMeta,
+  createClaudeSessionReducer,
+  claudeSessionLineMayAffectRead,
   revisionOf,
   supportedFileIdentity,
   ClaudeChildSessionCache,
@@ -5616,6 +5619,148 @@ test.each(['event', 'refresh'])(
     assert.deepEqual([hidden.facts, hidden.lastActivity, hidden.attention], ['current', 1001, 'unknown']);
   },
 );
+
+test('window archive admits a completed Bash task and retains real-child and unknown-notice safeguards', async () => {
+  for (const shape of ['bash', 'child', 'unknown', 'recovery-conflict', 'revoked-child'] as const) {
+    const { provider, sources } = pagedListingFixture(2);
+    const roots = provider.folders();
+    provider.sessionAliases = new Map();
+    const source = sources.find((item: any) => item.agent === 'claude' && !item.parentSessionId)!;
+    const at = (second: number) => new Date(1000 + second * 1000).toISOString();
+    const records: any[] = [
+      { type: 'user', timestamp: at(0), message: { role: 'user', content: 'Run the command' } },
+      {
+        type: 'assistant',
+        timestamp: at(1),
+        message: {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'bash-call', name: 'Bash', input: { command: 'test', run_in_background: true } },
+          ],
+          stop_reason: 'tool_use',
+        },
+      },
+      {
+        type: 'user',
+        timestamp: at(2),
+        message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'bash-call', content: 'started' }] },
+        toolUseResult: { backgroundTaskId: 'command-task' },
+      },
+    ];
+    if (shape === 'child' || shape === 'revoked-child')
+      records.push(
+        {
+          type: 'assistant',
+          timestamp: at(3),
+          message: {
+            role: 'assistant',
+            content: [{ type: 'tool_use', id: 'agent-call', name: 'Agent', input: { run_in_background: true } }],
+            stop_reason: 'tool_use',
+          },
+        },
+        {
+          type: 'user',
+          timestamp: at(4),
+          message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'agent-call', content: 'started' }] },
+          toolUseResult: { status: 'async_launched', agentId: 'real-child' },
+        },
+        {
+          type: 'user',
+          timestamp: at(5),
+          origin: { kind: 'task-notification' },
+          message: {
+            role: 'user',
+            content:
+              '<task-notification><task-id>real-child</task-id><tool-use-id>agent-call</tool-use-id><status>completed</status></task-notification>',
+          },
+        },
+      );
+    if (shape === 'revoked-child')
+      records.push({
+        type: 'assistant',
+        timestamp: at(5.5),
+        message: {
+          role: 'assistant',
+          content: [{ type: 'tool_use', id: 'agent-call', name: 'Bash', input: {} }],
+          stop_reason: 'tool_use',
+        },
+      });
+    if (shape === 'recovery-conflict')
+      records.push(
+        {
+          type: 'assistant',
+          timestamp: at(3),
+          message: { role: 'assistant', content: [{ type: 'text', text: 'x'.repeat(8000) }], stop_reason: 'end_turn' },
+        },
+        { type: 'user', timestamp: at(4), message: { role: 'user', content: 'Ready?' } },
+      );
+    records.push(
+      {
+        type: 'user',
+        timestamp: at(6),
+        origin: { kind: 'task-notification' },
+        message: {
+          role: 'user',
+          content: `<task-notification><task-id>${shape === 'unknown' || shape === 'recovery-conflict' ? 'unmapped-task' : 'command-task'}</task-id><tool-use-id>bash-call</tool-use-id><status>completed</status></task-notification>`,
+        },
+      },
+      {
+        type: 'assistant',
+        timestamp: at(7),
+        message: {
+          role: 'assistant',
+          model: 'claude-opus-5',
+          content: [{ type: 'text', text: 'Finished' }],
+          stop_reason: 'end_turn',
+        },
+      },
+    );
+    fs.writeFileSync(source.file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+    Object.assign(source, revisionOf(fs.statSync(source.file, { bigint: true })));
+    provider.enumeratedMembers = new Set(sources.map(sessionCoverageMember));
+    provider.sessionReadDiscoveryRevision = sessionCatalogMembership(JSON.stringify(roots), sources);
+    const metadata = readSessionMeta(source.file, shape === 'recovery-conflict' ? 2048 : Infinity, source.sessionId);
+    const recovery = createClaudeSessionReducer(source.sessionId);
+    for (const line of records.map((record) => JSON.stringify(record)).filter(claudeSessionLineMayAffectRead))
+      recovery.pushLine(line);
+    metadata.outcome = outcomeWithWiderChildren(metadata.outcome, null, sessionOutcomeOf(recovery.finish()));
+    provider.titles.set(source.file, { ...source, ...metadata, starts: { starts: [1000], whole: true } });
+    provider.saved.readTo[source.sessionId] = 10000;
+    const list = () =>
+      provider
+        .readSessionRequest({ method: 'sessions', requester: null, params: {} })
+        .sessions.find((row: any) => row.id === source.sessionId);
+    assert.equal(
+      list().runStatus,
+      shape === 'bash' ? 'done' : shape === 'revoked-child' ? 'subagents' : 'unknown',
+      shape,
+    );
+    const archive = (dryRun: boolean, force = false) =>
+      provider.handleSessionRequest({
+        method: 'curate',
+        requester: null,
+        params: { sessionId: source.sessionId, action: 'archive', dryRun, force },
+      });
+    if (shape === 'bash') {
+      provider.saved.readTo[source.sessionId] = 0;
+      assert.match((await archive(true)).reason, /unread/);
+      provider.saved.readTo[source.sessionId] = 10000;
+      provider.anyVisible = () => false;
+      assert.match((await archive(true)).reason, /hidden/);
+      provider.anyVisible = () => true;
+      assert.equal((await archive(true)).status, 'dry-run');
+      assert.equal(provider.hidden.has(source.sessionId), false);
+      assert.equal((await archive(false)).status, 'applied');
+      assert.equal(provider.hidden.has(source.sessionId), true);
+    } else {
+      for (const dryRun of [true, false]) {
+        assert.equal((await archive(dryRun)).status, 'refused');
+        if (shape === 'revoked-child') assert.equal((await archive(dryRun, true)).status, 'refused');
+      }
+      assert.equal(provider.hidden.has(source.sessionId), false);
+    }
+  }
+});
 
 test('window session listings refuse ordinary archive of unread work while accepted starts await expanded metadata', async () => {
   const { sources, child, provider } = pagedListingFixture(2);
@@ -33543,7 +33688,7 @@ test.each(['subagents', 'background', 'waiting'] as const)(
             message: {
               role: 'user',
               content: subagent
-                ? '<task-notification><task-id>x1</task-id><status>completed</status></task-notification>'
+                ? '<task-notification><task-id>x1</task-id><tool-use-id>bg1</tool-use-id><status>completed</status></task-notification>'
                 : '<task-notification><tool-use-id>cmd1</tool-use-id><status>completed</status></task-notification>',
             },
           },
