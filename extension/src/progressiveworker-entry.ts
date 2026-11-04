@@ -339,8 +339,10 @@ let bodyDecode: BodyDecode | null = null;
 let bodyPath: string | null = null;
 let bodyUsers = 0;
 let bodyDrained: Array<() => void> = [];
-// The body that each window or page request read, by the signal of the request.
-const requestBodies = new WeakMap<AbortSignal, CompressedBody>();
+// The host's body releases, and the body that each window or page request read with the release count at its read, by
+// the signal of the request. A window whose body the host released during its read answers stale.
+let bodyReleases = 0;
+const requestBodies = new WeakMap<AbortSignal, { body: CompressedBody; releases: number }>();
 
 function releaseCompressedBody(): void {
   heldBody = null;
@@ -1445,7 +1447,7 @@ async function execute(
     if (session.agent !== 'codex') return { kind: 'stale' as const };
     const opened = await openCompressedBody(session.file, verify, signal, request.input.compressedLimits);
     if (opened.kind !== 'body') return opened;
-    requestBodies.set(signal, opened.body);
+    requestBodies.set(signal, { body: opened.body, releases: bodyReleases });
     const source = compressedByteSource(opened.body);
     const opening = openingRecordOf(source.opening());
     return { kind: 'source' as const, source, opening };
@@ -2373,7 +2375,8 @@ async function handleMessage(message: {
     const stable = sameRevision(before, after);
     // A compressed window compares its checkpoint with `before` at the held length of the body that it read from
     // `before`.
-    const body = requestBodies.get(controller.signal);
+    const requestBody = requestBodies.get(controller.signal);
+    const body = requestBody?.releases === bodyReleases ? requestBody.body : undefined;
     const windowRevision = !isCompressedRollout(file)
       ? before
       : body?.file === file && sameRevision(body.stat, before)
@@ -2483,6 +2486,7 @@ parentPort?.on(
       return;
     }
     if (message.releaseBody) {
+      bodyReleases += 1;
       releaseCompressedBody();
       return;
     }
