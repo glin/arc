@@ -9485,10 +9485,7 @@ export class PanelProvider implements vscode.Disposable {
     this.compressedCheck = selectedFile && isCompressedRollout(selectedFile) ? this.selectionGeneration : null;
     if (this.compressedRetry?.timer) clearTimeout(this.compressedRetry.timer);
     this.compressedRetry = null;
-    if (this.compressedBodyFile && this.compressedBodyFile !== selectedFile) {
-      this.compressedBodyFile = null;
-      this.progressiveWorker.releaseCompressedBody();
-    }
+    this.releaseUnselectedCompressedBody();
     for (const [id, work] of this.selectionWorks ?? []) {
       if (work.host && this.hostSessions.get(work.host) === id) continue;
       work.controller.abort();
@@ -9928,6 +9925,7 @@ export class PanelProvider implements vscode.Disposable {
       }
       // Reconcile navigation with reachable sessions and record the settled selection.
       this.trail = visitPlace(prunePlaces(this.trail, new Set(reachable)), this.showing ?? '');
+      this.releaseUnselectedCompressedBody();
       const sessions = this.shownSessions(all);
       if (
         this.showing &&
@@ -14663,6 +14661,7 @@ export class PanelProvider implements vscode.Disposable {
       const requestedRevision = this.revisionOf(session);
       const compressed = isCompressedRollout(session.file);
       if (compressed) this.compressedBodyFile = session.file;
+      else this.releaseUnselectedCompressedBody();
       if (
         this.progressiveCurrent(session) &&
         !(compressed && this.compressedCheck === generation) &&
@@ -14890,6 +14889,8 @@ export class PanelProvider implements vscode.Disposable {
         }
         continue;
       }
+      // Only the selected session decodes a compressed body, so a background window skips a compressed rollout.
+      if (isCompressedRollout(session.file)) continue;
       const previous = this.cache.get(session.file);
       this.dropHistoryOfOtherPath(session);
       const result = await this.progressiveWorker.run(
@@ -15395,6 +15396,21 @@ export class PanelProvider implements vscode.Disposable {
   private dropHistoryOfOtherPath(session: SessionFile): void {
     const held = this.history.get(session.sessionId);
     if (held?.file !== undefined && held.file !== session.file) this.dropOlderHistory(session.sessionId);
+  }
+
+  // Release the decoded body in the worker when no selected session reads its compressed rollout. The selection, a
+  // reconciled selection, a removed source and a window of another path all reach this check.
+  private releaseUnselectedCompressedBody(): void {
+    if (!this.compressedBodyFile) return;
+    const selected = new Set([this.showing, ...(this.hostSessions?.values() ?? [])]);
+    if (
+      this.authoritativeCatalog?.some(
+        (source) => source.file === this.compressedBodyFile && selected.has(source.sessionId),
+      )
+    )
+      return;
+    this.compressedBodyFile = null;
+    this.progressiveWorker.releaseCompressedBody();
   }
 
   // A compressed checkpoint passes only for an equal physical revision.
