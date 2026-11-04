@@ -14674,8 +14674,8 @@ export class PanelProvider implements vscode.Disposable {
       ) {
         this.acceptSelectedMetadataRead(session, generation);
         // Refresh a current retained window only when worker work or a displayed failure changed its presentation.
-        const failureDrawn = this.selectionFailure !== null;
-        this.selectionFailure = null;
+        const failureDrawn = this.selectionFailure?.sessionId === sessionId;
+        if (failureDrawn) this.selectionFailure = null;
         if (roundTrip || failureDrawn) {
           this.refreshFrom('selected-window', true, true, null, true, true);
         }
@@ -14762,7 +14762,8 @@ export class PanelProvider implements vscode.Disposable {
         bytes: result.value.retainedBytes,
         checkpointBytes: result.value.checkpointBytes,
       });
-      this.selectionFailure = null;
+      // Another panel's failure stays drawn when this panel's window arrives.
+      if (this.selectionFailure?.sessionId === sessionId) this.selectionFailure = null;
       retryLatestRevision ||= result.value.recoveryPending === true;
       // A new Claude window changes the turns the subagent split reads, so the next pass refreshes the retained
       // pages with it.
