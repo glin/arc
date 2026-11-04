@@ -2838,7 +2838,7 @@ function completeDiscoveryHarness(
       heldRows = new RowDeltaReceiver();
       expandRows(message) { const held = this.heldRows.expand(message); if (!held) throw new Error('a ' + message.type + ' message did not apply to the rows the panel holds'); return held; }
       hosts = [{ webview: { postMessage: (message) => { this.messages.push(message.type === 'render' || message.type === 'rail' ? this.expandRows(message) : message); return Promise.resolve(true); } }, active: () => false, visible: () => true }]; readyHosts = new Set(this.hosts); panelVisibility = createPanelVisibility();
-      refreshGeneration = 0; refreshController = null; pendingRefresh = null; refreshReason = 'startup'; targetedRefreshPaths = null; selectionGeneration = 0; selectionWork = null; selectionFailure = null;
+      refreshGeneration = 0; refreshController = null; pendingRefresh = null; refreshReason = 'startup'; targetedRefreshPaths = null; selectionGeneration = 0; selectionWork = null; selectionFailure = null; interruptedRereads = new Map();
       repositoryScopeReady = true; repositoryScopeRoots = ['project']; awaitingSessionRecords = {}; newDrafts = {}; draftProfiles = {}; sessionOrigins = {}; drafts = {}; picks = {};
       refreshUsageHandler = null; initialCatalogRefreshPending = false; initialCatalogRefreshRequested = false;
       recentProfiles = []; models = {}; watching = false; trail = null; sessionAliases = new Map();
@@ -3291,7 +3291,7 @@ function selectedWindowHarness(
       publishSessionQueryContext() {}
       failSessionLoading() {}
       noteSessionRead() {}
-      selectionGeneration = 1; refreshGeneration = 1; showing = 'selected'; selectionWork = null; selectionFailure = null;
+      selectionGeneration = 1; refreshGeneration = 1; showing = 'selected'; selectionWork = null; selectionFailure = null; interruptedRereads = new Map();
       trail = { places: [], at: -1 };
       settleRailSeed() {}
       cache = new Map(); refreshes = 0; published = []; dropped = 0; lastError = null;
@@ -3620,6 +3620,141 @@ test('a selected window whose decode another request stopped reads again', async
   await vi.waitFor(() => assert.ok(provider.cache.has(provider.session.file), 'the stopped window did not read again'));
   assert.equal(requests, 2);
   assert.equal(provider.selectionFailure, null, 'a stopped decode showed the read failure');
+
+  // A worker that stops every decode fails the window after its one reread, and a later read sends no request.
+  let stops = 0;
+  const stopped = selectedWindowHarness(async (_request, generation) => {
+    stops++;
+    const revision = stopped.revisionOf(stopped.session);
+    // A reread that never ends draws a window after the fourth request, so the count fails instead of the heap.
+    return stops > 3
+      ? windowResult(generation, revision)
+      : { generation, revision, value: { kind: 'stale', interrupted: true } };
+  });
+  await stopped.completeSelectedWindow('selected', 1);
+  await vi.waitFor(() => assert.ok(stopped.selectionFailure, 'a window stopped twice did not fail'));
+  assert.equal(stops, 2, 'a stopped window read again more than once');
+  await stopped.completeSelectedWindow('selected', 1);
+  assert.equal(stops, 2, 'a later read of the failed window stopped the other decode again');
+  assert.equal(stopped.cache.has(stopped.session.file), false);
+  assert.deepEqual(stopped.selectionFailure, {
+    sessionId: 'selected',
+    generation: 1,
+    revision: stopped.revisionOf(stopped.session),
+  });
+  // A new selection reads the window again.
+  stopped.selectionGeneration = 2;
+  await stopped.completeSelectedWindow('selected', 2);
+  await vi.waitFor(() => assert.ok(stopped.cache.has(stopped.session.file), 'a new selection did not read again'));
+});
+
+test('a selected window that another decode stops twice draws the read failure and reads no more', async () => {
+  const fixture = selectedSourceFixture('codex');
+  const provider = completeDiscoveryHarness(undefined, true, ['stateFor'], {
+    projectsRoot: () => fixture.projects,
+    codexSessionsRoot: () => fixture.codex,
+  });
+  provider.folders = () => [fixture.workspace];
+  provider.repositoryScopeRoots = [fixture.workspace, fixture.worktree];
+  provider.repositoryScope = { snapshot: () => ({ ready: true, roots: provider.repositoryScopeRoots, revision: 1 }) };
+  provider._showing = fixture.sessionId;
+  provider.hostSessions = new Map([[provider.hosts[0], fixture.sessionId]]);
+  provider.revisionOf = (source: any) => {
+    const stat = fs.statSync(source.file);
+    return { size: stat.size, mtimeMs: stat.mtimeMs, dev: stat.dev, ino: stat.ino };
+  };
+  provider.progressiveCurrent = (source: any) => Boolean(provider.cache.get(source.file));
+  let requests = 0;
+  provider.progressiveWorker = {
+    run: async (request: ProgressiveRequest, generation: number) => {
+      if (request.kind !== 'window') return null;
+      requests++;
+      const revision = provider.revisionOf({ file: fixture.file });
+      // A reread that never ends draws a window after the fourth request, so the count fails instead of the heap.
+      return requests > 3
+        ? windowResult(generation, revision)
+        : { generation, revision, value: { kind: 'stale', interrupted: true } };
+    },
+    releaseCompressedBody() {},
+  };
+  provider.partial = [
+    {
+      file: fixture.file,
+      sessionId: fixture.sessionId,
+      agent: 'codex',
+      cwd: fixture.worktree,
+      activity: 1,
+      ...provider.revisionOf({ file: fixture.file }),
+    },
+  ];
+  provider.catalog = { sessions: provider.partial };
+  provider.discovery = Promise.resolve(true);
+  const failure = 'Could not read this session. Select it to try again.';
+  const drawn = () => JSON.stringify(provider.messages).includes(failure);
+  await provider.refresh(true);
+  await vi.waitFor(() => assert.ok(drawn(), 'the stopped window did not draw the read failure'));
+  assert.equal(requests, 2, 'a stopped window read again more than once');
+  await provider.refresh(true);
+  assert.equal(requests, 2, 'a refresh read the failed window again');
+  assert.equal(provider.cache.has(fixture.file), false);
+});
+
+test('two panels on two compressed sessions draw one window and one read failure', async () => {
+  const first = { file: 'first.jsonl.zst', sessionId: 'first', agent: 'codex', size: 10, mtimeMs: 10, dev: 1, ino: 3 };
+  const second = { ...first, file: 'second.jsonl.zst', sessionId: 'second', ino: 4 };
+  // The worker decodes one body at a time. A window for another path stops the running decode, which answers interrupted.
+  let running: { file: string; stop: () => void } | null = null;
+  const requests: string[] = [];
+  const provider = selectedWindowHarness((request, generation) => {
+    const session = request.kind === 'window' ? request.input.session : first;
+    requests.push(session.sessionId);
+    const revision = provider.revisionOf(session);
+    return new Promise((resolve) => {
+      // A ping-pong that never ends draws both windows after the eighth request, so the count fails instead of the heap.
+      if (requests.length > 8) return resolve(windowResult(generation, revision));
+      if (running && running.file !== session.file) running.stop();
+      const decode = {
+        file: session.file,
+        stop: () => {
+          if (running === decode) running = null;
+          resolve({ generation, revision, value: { kind: 'stale', interrupted: true } });
+        },
+      };
+      running = decode;
+      setImmediate(() => {
+        if (running !== decode) return;
+        running = null;
+        resolve(windowResult(generation, revision));
+      });
+    });
+  });
+  provider.progressiveWorker.releaseCompressedBody = () => {};
+  const firstPanel = {};
+  const secondPanel = {};
+  provider.hosts = [firstPanel, secondPanel];
+  provider.hostSessions = new Map([
+    [firstPanel, first.sessionId],
+    [secondPanel, second.sessionId],
+  ]);
+  provider.selectionWorks = new Map();
+  provider.catalog = [first, second];
+  provider.showing = first.sessionId;
+  void provider.completeSelectedWindow(first.sessionId, 1);
+  void provider.completeSelectedWindow(second.sessionId, 1);
+  await vi.waitFor(() =>
+    assert.ok(provider.cache.has(second.file) && provider.selectionFailure, 'the panels did not settle'),
+  );
+  await vi.waitFor(() => assert.equal(provider.selectionWorks.size, 0, 'a panel kept its read running'));
+  // The first panel spends its reread, the second panel's reread stops it again, and the second window arrives.
+  assert.deepEqual(requests, ['first', 'second', 'first', 'second']);
+  assert.equal(provider.cache.has(first.file), false, 'the failed panel drew a window');
+  assert.equal(
+    provider.selectionFailure.sessionId,
+    first.sessionId,
+    'the drawn window cleared the other panel failure',
+  );
+  await provider.completeSelectedWindow(first.sessionId, 1);
+  assert.equal(requests.length, 4, 'a later read of the failed panel stopped the drawn decode');
 });
 
 test('a slow selected read keeps its request until selection cancels it', async () => {
