@@ -9,7 +9,7 @@ import {
   type SessionCoverage,
   type SourceEnumeration,
 } from './sessioncoverage';
-import { isCompressedRollout } from './compressedrollouts';
+import { compressedRolloutsReadable, isCompressedRollout } from './compressedrollouts';
 import { canonicalServiceTier, serviceTierRefusal, cacheLifetimeRefusal, launchPolicy } from './launchpolicy';
 import { scopedLaunchCwd, startingWorktree } from './repositoryscope';
 import { SessionFilterRequests, FILTER_LIMITS, type FilterOperation } from './sessionfilter';
@@ -746,6 +746,8 @@ interface WindowRead {
 }
 const TRANSCRIPT_TURN_LIMIT = 40;
 const TRANSCRIPT_TAIL_BYTES = 4 * 1024 * 1024;
+// The delays before a partial compressed window reads again.
+const COMPRESSED_RETRY_MS = [10_000, 60_000, 600_000];
 const SEARCH_TAIL_BYTES = 16 * 1024 * 1024;
 const POLL_INTERVAL_MILLISECONDS = 5 * 1000;
 // A hidden panel does not poll, so a final response the transcript records late gets its own reads.
@@ -1449,6 +1451,16 @@ export class PanelProvider implements vscode.Disposable {
   private selectionWork: SelectionWork | null = null;
   private selectionWorks = new Map<string, SelectionWork>();
   private selectionFailure: { sessionId: string; generation: number; revision: FileRevision } | null = null;
+  // The selection generation whose compressed rollout still needs its hash check, or null when no check is owed.
+  private compressedCheck: number | null = null;
+  // The compressed rollout whose decoded body the worker holds for the selection.
+  private compressedBodyFile: string | null = null;
+  // Retries of a partial compressed window, by selection generation, and the timer of the next one.
+  private compressedRetry: { generation: number; count: number; timer: ReturnType<typeof setTimeout> | null } | null =
+    null;
+  // Compressed rollouts already named in the output channel for skipped records, and whether the missing decoder was.
+  private readonly compressedSkipsNamed = new Set<string>();
+  private compressedDecoderNamed = false;
   // The newest session menu's host. Native commands carry no webview identity.
   private detailsMenuArm: { host: PanelHost; session: string; browserSession: string; at: number } | null = null;
   private linkMenuArm: { host: PanelHost; token: string; destination: LinkDestination; at: number } | null = null;
@@ -5414,8 +5426,9 @@ export class PanelProvider implements vscode.Disposable {
         }
         const session = { ...source, ...this.revisionOf(source) };
         const held = this.cache.get(session.file);
+        this.dropHistoryOfOtherPath(session);
         const result = await this.progressiveWorker.run(
-          { kind: 'window', input: this.progressiveInput(session), checkpoint: held?.checkpoint },
+          { kind: 'window', input: this.progressiveInput(session), checkpoint: this.windowCheckpoint(session, held) },
           generation,
           controller.signal,
         );
@@ -5431,7 +5444,7 @@ export class PanelProvider implements vscode.Disposable {
           return;
         }
         const value = result.value;
-        this.updateHistoryAfterAcceptedWindow(sessionId, held, result, sessionId === this.showing);
+        this.updateHistoryAfterAcceptedWindow(sessionId, held, result, sessionId === this.showing, session.file);
         this.carryCommitRepositories(session, held?.read.turns, value.read.turns);
         this.cache.set(session.file, {
           key: transcriptReadCacheKey(session, TRANSCRIPT_TURN_LIMIT, TRANSCRIPT_TAIL_BYTES, this.folders()),
@@ -9466,6 +9479,16 @@ export class PanelProvider implements vscode.Disposable {
     );
     this.selectionGeneration++;
     this.metadataReadIntent = session ? { sessionId: session, generation: this.selectionGeneration } : null;
+    const selectedFile = session
+      ? this.authoritativeCatalog?.find((candidate) => candidate.sessionId === session)?.file
+      : undefined;
+    this.compressedCheck = selectedFile && isCompressedRollout(selectedFile) ? this.selectionGeneration : null;
+    if (this.compressedRetry?.timer) clearTimeout(this.compressedRetry.timer);
+    this.compressedRetry = null;
+    if (this.compressedBodyFile && this.compressedBodyFile !== selectedFile) {
+      this.compressedBodyFile = null;
+      this.progressiveWorker.releaseCompressedBody();
+    }
     for (const [id, work] of this.selectionWorks ?? []) {
       if (work.host && this.hostSessions.get(work.host) === id) continue;
       work.controller.abort();
@@ -14628,8 +14651,11 @@ export class PanelProvider implements vscode.Disposable {
         });
       }
       const requestedRevision = this.revisionOf(session);
+      const compressed = isCompressedRollout(session.file);
+      if (compressed) this.compressedBodyFile = session.file;
       if (
         this.progressiveCurrent(session) &&
+        !(compressed && this.compressedCheck === generation) &&
         (previous?.checkpoint as ClaudeForwardCheckpoint | undefined)?.attachmentRecovery?.status !== 'pending' &&
         (previous?.checkpoint as CodexForwardCheckpoint | undefined)?.modelRecovery?.status !== 'pending'
       ) {
@@ -14642,10 +14668,14 @@ export class PanelProvider implements vscode.Disposable {
         }
         return;
       }
+      // A compressed rollout never grows, so its checkpoint passes only for an equal physical revision.
       const checkpointCompatible =
         previous &&
         (sameProgressiveRevision(previous.revision, requestedRevision) ||
-          (requestedRevision.size > previous.revision.size && onlyGrew(previous.revision, requestedRevision)));
+          (!compressed &&
+            requestedRevision.size > previous.revision.size &&
+            onlyGrew(previous.revision, requestedRevision)));
+      this.dropHistoryOfOtherPath(session);
       const result = await this.progressiveWorker.run(
         {
           kind: 'window',
@@ -14660,6 +14690,7 @@ export class PanelProvider implements vscode.Disposable {
         return;
       }
       const currentRevision = this.revisionOf(current);
+      if (result?.value.kind === 'failed' && result.value.unsupported) this.noteCompressedDecoderMissing();
       if (
         !result ||
         result.value.kind !== 'window' ||
@@ -14682,7 +14713,8 @@ export class PanelProvider implements vscode.Disposable {
         this.refreshFrom('selected-failure', true, true, null, true, true);
         return;
       }
-      this.updateHistoryAfterAcceptedWindow(sessionId, previous, result, true);
+      this.updateHistoryAfterAcceptedWindow(sessionId, previous, result, true, current.file);
+      this.acceptCompressedWindow(current, result.value, sessionId, generation);
       this.acceptSelectedMetadataRead(current, generation);
       this.carryCommitRepositories(current, previous?.read.turns, result.value.read.turns);
       this.cache.set(current.file, {
@@ -14848,11 +14880,12 @@ export class PanelProvider implements vscode.Disposable {
         continue;
       }
       const previous = this.cache.get(session.file);
+      this.dropHistoryOfOtherPath(session);
       const result = await this.progressiveWorker.run(
         {
           kind: 'window',
           input: this.progressiveInput(session),
-          checkpoint: previous?.checkpoint,
+          checkpoint: this.windowCheckpoint(session, previous),
         },
         generation,
         signal,
@@ -14871,7 +14904,7 @@ export class PanelProvider implements vscode.Disposable {
       if (!revision) {
         return false;
       }
-      this.updateHistoryAfterAcceptedWindow(session.sessionId, previous, result, false);
+      this.updateHistoryAfterAcceptedWindow(session.sessionId, previous, result, false, session.file);
       this.carryCommitRepositories(session, previous?.read.turns, result.value.read.turns);
       this.cache.set(session.file, {
         key: transcriptReadCacheKey(session, TRANSCRIPT_TURN_LIMIT, TRANSCRIPT_TAIL_BYTES, this.folders()),
@@ -15282,6 +15315,7 @@ export class PanelProvider implements vscode.Disposable {
     previous: CacheEntry | undefined,
     result: ProgressiveResult,
     selected: boolean,
+    file: string,
   ): void {
     const held = this.history.get(sessionId);
     if (
@@ -15289,7 +15323,8 @@ export class PanelProvider implements vscode.Disposable {
       result.revision === null ||
       result.value.kind !== 'window' ||
       (held && (held.size !== previous.revision.size || held.mtimeMs !== previous.revision.mtimeMs)) ||
-      !preservesLoadedHistory(previous.revision, result)
+      (held?.file !== undefined && held.file !== file) ||
+      !preservesLoadedHistory(previous.revision, result, previous.checkpoint?.bodyHash)
     ) {
       if (held) {
         this.dropOlderHistory(sessionId);
@@ -15320,7 +15355,7 @@ export class PanelProvider implements vscode.Disposable {
       );
     }
     if (held || updated.pages.length) {
-      this.history.set(sessionId, updated);
+      this.history.set(sessionId, { ...updated, file });
       // A new Claude window changes the turns the subagent split reads with the retained pages.
       if (updated.pages !== held?.pages || (updated.pages.length && result.value.read.turns[0]?.agent === 'claude')) {
         this.historyStructuralKeys.delete(sessionId);
@@ -15343,6 +15378,63 @@ export class PanelProvider implements vscode.Disposable {
     )) {
       this.dropOlderHistory(sessionId);
     }
+  }
+
+  // Before a window request for another path, drop the pages that the previous path read.
+  private dropHistoryOfOtherPath(session: SessionFile): void {
+    const held = this.history.get(session.sessionId);
+    if (held?.file !== undefined && held.file !== session.file) this.dropOlderHistory(session.sessionId);
+  }
+
+  // A compressed checkpoint passes only for an equal physical revision.
+  private windowCheckpoint(session: SessionFile, held: CacheEntry | undefined): ProgressiveCheckpoint | undefined {
+    if (!held) return undefined;
+    return !isCompressedRollout(session.file) || sameProgressiveRevision(held.revision, this.revisionOf(session))
+      ? held.checkpoint
+      : undefined;
+  }
+
+  // A complete compressed window clears the hash check of its selection. A partial one keeps it and reads the window
+  // again after 10 s, 60 s and 600 s. Skipped records are named once for each path.
+  private acceptCompressedWindow(
+    session: SessionFile,
+    value: Extract<import('./progressiveworker').ProgressiveValue, { kind: 'window' }>,
+    sessionId: string,
+    generation: number,
+  ): void {
+    if (!isCompressedRollout(session.file)) return;
+    if (value.skippedRecords && !this.compressedSkipsNamed.has(session.file)) {
+      this.compressedSkipsNamed.add(session.file);
+      this.performanceOutput ??= vscode.window.createOutputChannel('Arc');
+      this.performanceOutput.appendLine(
+        `Arc left out ${value.skippedRecords} oversized ${value.skippedRecords === 1 ? 'record' : 'records'} of the compressed Codex session ${session.file}.`,
+      );
+    }
+    if (value.partial === undefined) {
+      if (this.compressedCheck === generation) this.compressedCheck = null;
+      return;
+    }
+    if (this.compressedCheck !== generation) return;
+    const retry =
+      this.compressedRetry?.generation === generation ? this.compressedRetry : { generation, count: 0, timer: null };
+    const delay = COMPRESSED_RETRY_MS[retry.count];
+    if (delay === undefined || retry.timer) return;
+    retry.count++;
+    retry.timer = setTimeout(() => {
+      retry.timer = null;
+      if (this.disposed || this.selectionGeneration !== generation || this.showing !== sessionId) return;
+      void this.completeSelectedWindow(sessionId, generation);
+    }, delay);
+    this.compressedRetry = retry;
+  }
+
+  private noteCompressedDecoderMissing(): void {
+    if (this.compressedDecoderNamed || compressedRolloutsReadable()) return;
+    this.compressedDecoderNamed = true;
+    this.performanceOutput ??= vscode.window.createOutputChannel('Arc');
+    this.performanceOutput.appendLine(
+      `Arc cannot open compressed Codex sessions, because this editor runs Node.js ${process.versions.node}. They open with Node.js 22.15 or later.`,
+    );
   }
 
   private dropOlderHistory(sessionId: string): void {

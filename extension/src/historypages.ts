@@ -47,6 +47,8 @@ export interface HistoryCoverage {
 // Retained history beyond the ordinary tail for one session.
 export interface SessionHistory<Cursor> {
   sessionId: string;
+  // The transcript path that the pages read. A window for another path drops the pages.
+  file?: string;
   // Source size and modification time used by `historyAfterRevision`.
   size: number;
   mtimeMs: number;
