@@ -5960,13 +5960,17 @@ export function discoverCodexNewestTurn(
   file: string,
   cursor: BackwardLineCursor,
   opaqueState: unknown,
-  options: BoundaryDiscoveryOptions = {},
+  // `agentPath` gives the agent path of the opening record, which a compressed rollout reads from its body.
+  options: BoundaryDiscoveryOptions & { agentPath?: string | null } = {},
 ): Promise<BoundaryDiscovery> {
   const restored = opaqueState as Partial<CodexNewestBoundaryState> | undefined;
   const state: CodexNewestBoundaryState = {
     didSomething: restored?.didSomething === true,
     completed: restored?.completed === true,
-    agentPath: restored?.agentPath ?? readCodexSessionMeta(file)?.agentPath ?? null,
+    agentPath:
+      restored?.agentPath ??
+      (options.agentPath !== undefined ? options.agentPath : readCodexSessionMeta(file)?.agentPath) ??
+      null,
   };
   return discoverBackwardBoundary(file, cursor, (line) => visitCodexBoundary(state, line.text), options);
 }

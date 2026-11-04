@@ -40,6 +40,8 @@ export interface ForwardParserCheckpoint<State> {
   discardUntilNewline: boolean;
   contentAnchor: ContentAnchor;
   parserState: State;
+  // The SHA-256 of the compressed rollout that the checkpoint read. Absent for a plain file.
+  bodyHash?: string;
 }
 
 export interface ForwardSessionReducer<State> {
@@ -68,6 +70,8 @@ export type IncrementalSessionResult<State> =
 
 export interface ForwardReadOptions {
   chunkBytes?: number;
+  // The revision of the source for each revision read. Absent reads `fstat` of the file.
+  revision?: (file: string) => FileRevision | null;
   signal?: AbortSignal;
   pause?: () => Promise<void>;
   recovery?: ForwardRecoveryControl;
@@ -189,6 +193,9 @@ export interface SourceHistoryCursor<State = unknown> {
   heldRecords: BufferedHistoryRecord[];
   adapterState: State;
   exportRanges?: Array<{ start: number; bytes: Buffer }>;
+  // The compressed rollout that the cursor read, and the SHA-256 of its bytes. Absent for a plain file.
+  bodyFile?: string;
+  bodyHash?: string;
 }
 
 export interface SemanticHistoryPage<State = unknown> {
@@ -252,6 +259,8 @@ export interface SemanticHistoryOptions {
   targetTurns?: number;
   readRange?: BackwardRangeReader;
   evidenceReadRange?: BackwardRangeReader;
+  // The revision of the source for each revision read. Absent reads `fstat` of the file.
+  revision?: (file: string) => FileRevision | null;
   signal?: AbortSignal;
   pause?: () => Promise<void>;
 }
@@ -408,7 +417,8 @@ function* scanForwardSession<State>(
       return bytes;
     };
   }
-  let revision = revisionFor(file);
+  const sourceRevision = work.revision ?? revisionFor;
+  let revision = sourceRevision(file);
   if (!revision) {
     return { kind: 'missing', read: null, checkpoint: null, readBytes: 0 };
   }
@@ -517,7 +527,7 @@ function* scanForwardSession<State>(
   let recoveryAnchor: ContentAnchor = { start: 0, bytes: Buffer.alloc(0) };
   for (let offset = start; ;) {
     if (work.recovery && offset > 0) {
-      const current = revisionFor(file);
+      const current = sourceRevision(file);
       if (!current || !sameRevision(current, revision)) {
         const anchorStart = Math.max(0, offset - CONTENT_ANCHOR_BYTES);
         const prior = readRange(file, anchorStart, offset - anchorStart, current ?? revision);
@@ -714,13 +724,14 @@ function initialHistoryCursor<State>(
   sessionId: string,
   adapter: SemanticSourceAdapter<State>,
   exportLimits?: ExportReadLimits,
+  revisionOfFile: (file: string) => FileRevision | null = revisionFor,
 ): { kind: 'ready'; cursor: SourceHistoryCursor<State> } | { kind: 'missing' | 'stale' } {
-  const revision = revisionFor(file);
+  const revision = revisionOfFile(file);
   if (!revision) {
     return { kind: 'missing' };
   }
   const state = adapter.initialState(file, revision);
-  const confirmed = revisionFor(file);
+  const confirmed = revisionOfFile(file);
   if (!confirmed) {
     return { kind: 'missing' };
   }
@@ -739,19 +750,20 @@ function* scanSemanticHistoryPage<State>(
 ): Generator<void, SemanticHistoryResult<State>, void> {
   if (options.signal?.aborted) return { kind: 'cancelled', page: null, openRange: null };
   if (JSON.stringify(initial?.exportLimits) !== JSON.stringify(options.exportLimits)) initial = null;
-  const started = initial ? null : initialHistoryCursor(file, sessionId, adapter, options.exportLimits);
+  const revisionOfFile = options.revision ?? revisionFor;
+  const started = initial ? null : initialHistoryCursor(file, sessionId, adapter, options.exportLimits, revisionOfFile);
   if (started && started.kind !== 'ready') {
     return { kind: started.kind, page: null, openRange: null };
   }
   let cursor = initial ?? (started as { kind: 'ready'; cursor: SourceHistoryCursor<State> }).cursor;
   if (cursor.source !== adapter.source || cursor.sessionId !== sessionId) {
-    const reset = initialHistoryCursor(file, sessionId, adapter, options.exportLimits);
+    const reset = initialHistoryCursor(file, sessionId, adapter, options.exportLimits, revisionOfFile);
     if (reset.kind !== 'ready') {
       return { kind: reset.kind, page: null, openRange: null };
     }
     cursor = reset.cursor;
   }
-  const current = revisionFor(file);
+  const current = revisionOfFile(file);
   if (!current) {
     return { kind: 'missing', page: null, openRange: null };
   }
@@ -787,7 +799,7 @@ function* scanSemanticHistoryPage<State>(
   };
   if (limits) trimRanges(Math.max(0, limits.pageBytes - heldBytes - byteCursor.fragment.length));
   const captureRange: BackwardRangeReader = (source, start, length, revision) => {
-    const current = revisionFor(source);
+    const current = revisionOfFile(source);
     if (!current || !sameRevision(current, revision)) return null;
     const pieces: Buffer[] = [];
     const end = start + length;

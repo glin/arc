@@ -20,7 +20,7 @@ import {
   readCodexSessionMeta,
 } from './codex';
 import * as fs from 'node:fs';
-import { revisionOf } from './transcript';
+import { revisionOf, type BackwardRangeReader } from './transcript';
 import {
   normalizeSessionTitle,
   normalizeFsPath,
@@ -550,6 +550,9 @@ export async function readCodexSessionIncrementalAsync(
   opts: CodexReadOptions = {},
   work: ForwardReadOptions & {
     modelBudget?: { maxBytes?: number; maxMilliseconds?: number; clock?: () => number };
+    // The source of a compressed rollout: its range reads and its opening record.
+    readRange?: BackwardRangeReader;
+    opening?: () => CodexSessionMeta | null;
   } = {},
 ): Promise<IncrementalSessionResult<CodexSessionParserState> & { recoveryBytes?: number; recoveryPending?: boolean }> {
   let meta: CodexSessionMeta | null | undefined;
@@ -559,12 +562,12 @@ export async function readCodexSessionIncrementalAsync(
     sessionId,
     (restored) => {
       if (!restored && meta === undefined) {
-        meta = readCodexSessionMeta(file);
+        meta = work.opening ? work.opening() : readCodexSessionMeta(file);
       }
       return createCodexSessionReducer(sessionId, opts, restored ? null : (meta ?? null), restored);
     },
     checkpoint,
-    undefined,
+    work.readRange,
     codexParserKey(opts),
     opts.tailBytes ?? DEFAULT_TAIL_BYTES,
     work,
@@ -620,7 +623,7 @@ export async function readCodexSessionIncrementalAsync(
       file,
       recovery.cursor,
       Math.min(256 * 1024, maxBytes - recoveryBytes),
-      undefined,
+      work.readRange,
       256 * 1024,
     );
     if (!batch) return { kind: 'stale', read: null, checkpoint: null, readBytes: result.readBytes, recoveryBytes };
@@ -655,7 +658,7 @@ export async function readCodexSessionIncrementalAsync(
           break;
         }
         if (record.kind === 'session_meta') {
-          meta ??= readCodexSessionMeta(file);
+          meta ??= work.opening ? work.opening() : readCodexSessionMeta(file);
           if ((record.payload.id ?? record.payload.session_id) === meta?.sessionId)
             recovery.model = recovery.admittedModel;
           recovery.status = 'complete';
@@ -683,7 +686,7 @@ export async function readCodexSessionIncrementalAsync(
           recovery.status = 'complete';
           break;
         }
-        meta ??= readCodexSessionMeta(file);
+        meta ??= work.opening ? work.opening() : readCodexSessionMeta(file);
         const reducer = createCodexSessionReducer(sessionId, { maxTurns: 1 }, meta ?? null);
         reducer.pushLine(line.text);
         reducer.pushLine(recovery.candidate.text);
@@ -703,7 +706,7 @@ export async function readCodexSessionIncrementalAsync(
         }
         recovery.candidate = null;
       } else if (record.kind === 'session_meta') {
-        meta ??= readCodexSessionMeta(file);
+        meta ??= work.opening ? work.opening() : readCodexSessionMeta(file);
         if (
           recovery.candidate?.turnId === null &&
           (record.payload.id ?? record.payload.session_id) === meta?.sessionId
@@ -1002,9 +1005,11 @@ export function readCodexHistoryPageAsync(
   file: string,
   sessionId: string,
   cursor: CodexHistoryCursor | null = null,
-  options: SemanticHistoryOptions = {},
+  // `opening` gives the opening record of a compressed rollout.
+  options: SemanticHistoryOptions & { opening?: () => CodexSessionMeta | null } = {},
   readOptions: CodexReadOptions = {},
 ): Promise<CodexHistoryPageResult> {
+  const held = cursorMetaForSession(cursor, sessionId, options.exportLimits);
   return readSemanticHistoryPageAsync(
     file,
     sessionId,
@@ -1013,7 +1018,7 @@ export function readCodexHistoryPageAsync(
       options.exportLimits
         ? { ...readOptions, captureSessionText: true, exportTurnBytes: options.exportLimits.turnBytes }
         : readOptions,
-      cursorMetaForSession(cursor, sessionId, options.exportLimits),
+      held === undefined && options.opening ? options.opening() : held,
       options.exportLimits ? 1 : Math.max(1, options.targetTurns ?? 20),
     ),
     cursor,
