@@ -1,6 +1,7 @@
 import { linkBrowserKind, parseLinkDestination } from './domain/link-path';
 import { isDeepStrictEqual } from 'node:util';
 import { CommandCatalogs } from './commandcatalog';
+import { isCompressedRollout } from './compressedrollouts.ts';
 import { commitSourceStamp, recordCommits as recordTranscriptCommits } from './transcript';
 import {
   startingWorktree,
@@ -3712,6 +3713,7 @@ test('command-only admission removes pending rows through every catalog path and
   };
   let sources: any[] = [];
   const dependencies = {
+    isCompressedRollout,
     fs,
     fileRevisionOf: revisionOf,
     revalidatedCatalog,
@@ -3932,6 +3934,7 @@ test('a catalog refresh admits settled sessions without a file check after a wal
   let stats = 0;
   const checked: string[] = [];
   const dependencies = {
+    isCompressedRollout,
     fs: {
       statSync: (...args: any[]) => {
         stats++;
@@ -4235,6 +4238,7 @@ test('refresh human admission shares read and source allowances and resumes canc
       resolve();
     });
   const dependencies = {
+    isCompressedRollout,
     fs: {
       statSync: (...args: any[]) => {
         attempts[attempts.length - 1]++;
@@ -6195,6 +6199,7 @@ test('window session pages lose coverage when a served transcript is replaced at
   for (const route of ['targeted', 'reuse']) {
     const { sources, provider, traverse } = pagedListingFixture(150);
     const dependencies = {
+      isCompressedRollout,
       fs,
       fileRevisionOf: revisionOf,
       revalidatedCatalog,
@@ -10586,6 +10591,7 @@ test('pinned agent-run session cards keep the provider visible and the run by an
       return { tag, props, text };
     };
     const dependencies = {
+      isCompressedRollout,
       h,
       railTimeSlot,
       railCacheState: () => null,
