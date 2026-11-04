@@ -13234,9 +13234,8 @@ test('a child edit read that fails after its first chunk publishes no edits', as
 const zstdCompress = (zlib as { zstdCompressSync?: (input: Buffer) => Buffer }).zstdCompressSync;
 const COMPRESSED_THREAD = '019a0000-0000-7000-8000-00000000c0de';
 
-// A Codex rollout of finished turns with usage, written plain and compressed under one name in two directories.
-function compressedRolloutPair(extra: (turn: number) => object[] = () => [], frames = 1, turns = 3) {
-  const directory = tempDir('worker-compressed-');
+// The records of a Codex rollout of finished turns with usage, whose working directory is `directory`.
+function codexRolloutBody(directory: string, extra: (turn: number) => object[] = () => [], turns = 3): Buffer {
   const at = (second: number) => timestamp(second);
   const records: object[] = [
     {
@@ -13283,7 +13282,13 @@ function compressedRolloutPair(extra: (turn: number) => object[] = () => [], fra
       { timestamp: at(turn * 10 + 5), type: 'event_msg', payload: { type: 'task_complete', turn_id: turnId } },
     );
   }
-  const body = Buffer.from(records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+  return Buffer.from(records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+}
+
+// A Codex rollout of finished turns with usage, written plain and compressed under one name in two directories.
+function compressedRolloutPair(extra: (turn: number) => object[] = () => [], frames = 1, turns = 3) {
+  const directory = tempDir('worker-compressed-');
+  const body = codexRolloutBody(directory, extra, turns);
   const name = `rollout-2026-01-01T00-00-00-${COMPRESSED_THREAD}`;
   fs.mkdirSync(path.join(directory, 'plain'));
   fs.mkdirSync(path.join(directory, 'compressed'));
@@ -13505,11 +13510,132 @@ test.skipIf(!zstdCompress)('a compressed checkpoint and cursor serve only their 
   }
 });
 
+// A worker whose zstd decoders write how many exist, run and ran at once to a file. Each decoder whose number is in
+// `gated` holds its first chunk until the gate file exists, so a test can act while that decode runs.
+function decoderWorker(directory: string, gated: number[]) {
+  const log = path.join(directory, 'decoders.json');
+  const gate = path.join(directory, 'gate');
+  const prefix = `{
+    const zlib = require('node:zlib');
+    const fs = require('node:fs');
+    const make = zlib.createZstdDecompress;
+    let made = 0, live = 0, peak = 0;
+    const note = () => fs.writeFileSync(${JSON.stringify(log)}, JSON.stringify({ made, live, peak }));
+    // The export is read-only and configurable, so only a new definition replaces it.
+    Object.defineProperty(zlib, 'createZstdDecompress', { configurable: true, enumerable: true, value: (options) => {
+      const decoder = make(options);
+      made++;
+      live++;
+      peak = Math.max(peak, live);
+      note();
+      decoder.once('close', () => { live--; note(); });
+      if (${JSON.stringify(gated)}.includes(made)) {
+        const transform = decoder._transform;
+        decoder._transform = function (chunk, encoding, done) {
+          const go = () =>
+            fs.existsSync(${JSON.stringify(gate)}) ? transform.call(this, chunk, encoding, done) : setTimeout(go, 5);
+          go();
+        };
+      }
+      return decoder;
+    } });
+  }`;
+  const decoders = (): { made: number; live: number; peak: number } =>
+    fs.existsSync(log) ? JSON.parse(fs.readFileSync(log, 'utf8')) : { made: 0, live: 0, peak: 0 };
+  return { worker: new ProgressiveWorker(prefix + source), decoders, open: () => fs.writeFileSync(gate, '') };
+}
+
+// The worker thread loads its bundle before its first decode starts.
+const DECODE_STARTS = { timeout: 10_000 };
+
+const pageKind = (result: ProgressiveResult | null) =>
+  result?.value.kind === 'page' ? result.value.page.kind : result?.value.kind;
+
+test.skipIf(!zstdCompress)(
+  'a page of another compressed path stops the running decode, and the worker never decodes two bodies',
+  async () => {
+    const first = compressedRolloutPair();
+    const second = compressedRolloutPair();
+    const { worker, decoders } = decoderWorker(first.directory, [1]);
+    try {
+      const window = worker.run(
+        { kind: 'window', input: first.input(first.compressed) },
+        1,
+        new AbortController().signal,
+      );
+      await vi.waitFor(() => assert.equal(decoders().made, 1), DECODE_STARTS);
+      const page = await worker.run(
+        { kind: 'page', input: second.input(second.compressed), cursor: null },
+        1,
+        new AbortController().signal,
+      );
+      assert.equal(pageKind(page), 'page', 'the page of the second path did not read');
+      assert.equal(decoders().peak, 1, 'two decodes ran at once');
+      assert.deepEqual((await window)?.value, { kind: 'stale', interrupted: true }, 'the stopped window gave no retry');
+      await vi.waitFor(() => assert.deepEqual(decoders(), { made: 2, live: 0, peak: 1 }));
+    } finally {
+      worker.stop();
+    }
+  },
+);
+
+test.skipIf(!zstdCompress)('a window and a page of one compressed path share one decode', async () => {
+  const pair = compressedRolloutPair();
+  const { worker, decoders, open } = decoderWorker(pair.directory, [1]);
+  try {
+    const window = worker.run({ kind: 'window', input: pair.input(pair.compressed) }, 1, new AbortController().signal);
+    await vi.waitFor(() => assert.equal(decoders().made, 1), DECODE_STARTS);
+    const page = worker.run(
+      { kind: 'page', input: pair.input(pair.compressed), cursor: null },
+      1,
+      new AbortController().signal,
+    );
+    open();
+    windowOf(await window);
+    assert.equal(pageKind(await page), 'page');
+    assert.equal(decoders().made, 1, 'the page decoded the body again');
+  } finally {
+    worker.stop();
+  }
+});
+
+test.skipIf(!zstdCompress)('a release, or the abort of the request it serves, stops a running decode', async () => {
+  const pair = compressedRolloutPair();
+  // Both decoders hold their first chunk for the whole test, so only a stop ends them.
+  const { worker, decoders } = decoderWorker(pair.directory, [1, 2]);
+  try {
+    const released = worker.run(
+      { kind: 'window', input: pair.input(pair.compressed) },
+      1,
+      new AbortController().signal,
+    );
+    await vi.waitFor(() => assert.equal(decoders().made, 1), DECODE_STARTS);
+    worker.releaseCompressedBody();
+    assert.deepEqual((await released)?.value, { kind: 'stale', interrupted: true });
+    await vi.waitFor(() => assert.equal(decoders().live, 0, 'a release left the decode running'), DECODE_STARTS);
+    // A waiting discovery keeps the worker alive after the abort, as it does in the host.
+    (worker as unknown as { discoveryWaiter: object }).discoveryWaiter = { start() {}, cancel() {} };
+    const controller = new AbortController();
+    const aborted = worker
+      .run({ kind: 'window', input: pair.input(pair.compressed) }, 2, controller.signal)
+      .catch(() => null);
+    await vi.waitFor(() => assert.equal(decoders().made, 2), DECODE_STARTS);
+    controller.abort();
+    await aborted;
+    await vi.waitFor(
+      () => assert.equal(decoders().live, 0, 'the abort of its request left the decode running'),
+      DECODE_STARTS,
+    );
+  } finally {
+    worker.stop();
+  }
+});
+
 test('worker requests outside the opening path refuse a compressed rollout', async () => {
   const directory = tempDir('worker-compressed-refusal-');
   const file = path.join(directory, `rollout-2026-01-01T00-00-00-${COMPRESSED_THREAD}.jsonl.zst`);
   // The file holds plain records, so each request would read them without its refusal.
-  fs.writeFileSync(file, compressedRolloutPair().body);
+  fs.writeFileSync(file, codexRolloutBody(directory));
   const stat = revisionOf(fs.statSync(file, { bigint: true }));
   const session = { file, sessionId: COMPRESSED_THREAD, agent: 'codex' as const, ...stat };
   const worker = new ProgressiveWorker(source);
