@@ -12787,6 +12787,102 @@ test('successful integrity coverage includes unchanged dependencies and survives
   assert.equal(provider.spendCoverageAt, 80, 'an empty ledger must use successful discovery coverage');
 });
 
+test('the spend integrity check treats a compressed rollout as unreadable without a stat', async () => {
+  const stats: string[] = [];
+  const provider = completeDiscoveryHarness(
+    undefined,
+    false,
+    ['checkProjectSpendSources', 'publishProjectSpendCoverage'],
+    {
+      normalizeSpendFile: (file: string) => file,
+      fs: {
+        promises: {
+          stat: async (file: string) => {
+            stats.push(file);
+            return { size: 10, mtimeMs: 20, dev: 1, ino: 2, isFile: () => true };
+          },
+        },
+      },
+    },
+  );
+  const file = 'rollout-a.jsonl.zst';
+  provider.spendChecks = new SpendCoverage();
+  provider.spendSourcesByFile = new Map([[file, { file, agent: 'codex' }]]);
+  provider.spendRecordsByFile = new Map();
+  provider.projectSpendFiles = [];
+  provider.spendCoverageAt = null;
+  provider.codexStats = { accept: () => {} };
+  const offers: unknown[][] = [];
+  provider.queueProjectSpendIndex = (...args: unknown[]) => offers.push(args);
+  await provider.checkProjectSpendSources([file], () => true);
+  assert.deepEqual(stats, []);
+  assert.equal((offers.at(-1) as any[])[2].length, 0, 'a compressed rollout reached indexing');
+});
+
+test('spend indexing skips a compressed rollout without reading it', () => {
+  const read: string[] = [];
+  const provider = completeDiscoveryHarness(undefined, false, ['indexNextProjectSpendFile'], {
+    normalizeSpendFile: (file: string) => file,
+    indexSpendFile: (_previous: unknown, file: string) => {
+      read.push(file);
+      throw new Error('unreadable');
+    },
+  });
+  const file = 'rollout-a.jsonl.zst';
+  let scheduled = 0;
+  Object.assign(provider, {
+    projectSpendWorkspace: 'project',
+    projectSpendStorageDir: 'storage',
+    projectSpendFiles: [],
+    projectSpendQueue: [{ file, agent: 'codex', primary: true }],
+    projectSpendQueued: new Set([file]),
+    scheduleNextProjectSpendFile: () => scheduled++,
+  });
+  provider.indexNextProjectSpendFile();
+  assert.deepEqual(read, []);
+  assert.equal(provider.projectSpendQueued.size, 0);
+  assert.equal(scheduled, 1);
+});
+
+test('content search skips a compressed rollout without reading it', () => {
+  const read: string[] = [];
+  const reader = (file: string) => {
+    read.push(file);
+    return { turns: [], readBytes: 0 };
+  };
+  const provider = completeDiscoveryHarness(undefined, false, ['searchCorpus'], {
+    readCodexSession: reader,
+    readSession: reader,
+    SEARCH_TAIL_BYTES: 1024,
+  });
+  const session = { file: 'rollout-a.jsonl.zst', sessionId: 'compressed', agent: 'codex', size: 1, mtimeMs: 1 };
+  provider.corpus = new Map();
+  provider.allSessions = () => [session];
+  provider.sessionLabel = () => ({ label: 'compressed' });
+  assert.deepEqual(provider.searchCorpus(), []);
+  assert.deepEqual(read, []);
+});
+
+// Only a Claude row reaches the prompt check, so the fixture gives the compressed name to a Claude row.
+test('the prompt check skips a compressed file without a read', async () => {
+  const checked: string[] = [];
+  const provider = completeDiscoveryHarness(undefined, false, ['prepareHumanPrompts'], {
+    fs: {
+      ...fs,
+      statSync: (file: string) => {
+        checked.push(file);
+        return { size: 1, mtimeMs: 1, dev: 1, ino: 1 };
+      },
+    },
+    humanPromptScanSteps,
+    promptScanLists,
+  });
+  provider.humanScans = new Map();
+  const session = { file: 'rollout-a.jsonl.zst', sessionId: 'compressed', agent: 'claude', size: 1, mtimeMs: 1 };
+  assert.deepEqual(await provider.prepareHumanPrompts([session], true, new AbortController().signal), []);
+  assert.deepEqual(checked, []);
+});
+
 // Replaces the harness's inert ledger save with the production save methods and scheduler.
 function useLedgerSave(provider: any): void {
   delete provider.flushProjectSpendSave;

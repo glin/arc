@@ -11786,6 +11786,8 @@ export class PanelProvider implements vscode.Disposable {
     const sources = files.map((file) => this.spendSourcesByFile.get(file)).filter((source) => source !== undefined);
     const accepted = await Promise.all(
       sources.map(async (source) => {
+        // The spend reader cannot read a compressed rollout, so the check treats it as an unreadable source.
+        if (isCompressedRollout(source.file)) return null;
         try {
           const physical = await fs.promises.stat(source.file, { bigint: true });
           return physical.isFile() ? { source, stat: fileRevisionOf(physical) } : null;
@@ -12041,6 +12043,12 @@ export class PanelProvider implements vscode.Disposable {
       return;
     }
     const key = normalizeSpendFile(next.file);
+    // The spend reader reads plain transcripts only. A compressed rollout leaves the queue as a failed index does.
+    if (isCompressedRollout(next.file)) {
+      this.projectSpendQueued.delete(key);
+      this.scheduleNextProjectSpendFile();
+      return;
+    }
     this.spendRecordsByFile ??= new Map(this.projectSpendFiles.map((record, index) => [record.file, index]));
     const at = this.spendRecordsByFile.get(key) ?? -1;
     const previous = at >= 0 ? this.projectSpendFiles[at] : undefined;
@@ -13250,6 +13258,8 @@ export class PanelProvider implements vscode.Disposable {
         admitted.push(session);
         continue;
       }
+      // The prompt check reads plain transcripts only, so it skips a compressed file without a read.
+      if (isCompressedRollout(session.file)) continue;
       // The file check's cause: a recheck checks every candidate, and a catalog refresh checks a file whose listed revision
       // moved, whose complete scan found no prompt, or that has no complete scan of the listed revision.
       let cause: 'walk' | 'moved' | 'noPrompt' | 'unscanned' = 'walk';
@@ -15907,6 +15917,8 @@ export class PanelProvider implements vscode.Disposable {
       if (only && session.sessionId !== only) {
         continue;
       }
+      // Content search reads plain transcripts only, so it skips a compressed rollout.
+      if (isCompressedRollout(session.file)) continue;
       const held = this.corpus.get(session.file);
       // Compare size and mtime so appends within one timestamp tick invalidate cached entries.
       if (held && held.mtimeMs === session.mtimeMs && held.size === session.size) {
