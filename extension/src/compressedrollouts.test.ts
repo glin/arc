@@ -3,7 +3,12 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as zlib from 'node:zlib';
 import { test } from 'vitest';
-import { isCompressedRollout, readCompressedFirstRecord, zstdFrames } from './compressedrollouts.ts';
+import {
+  decodeCompressedRollout,
+  isCompressedRollout,
+  readCompressedFirstRecord,
+  zstdFrames,
+} from './compressedrollouts.ts';
 import { tempDir } from './temproot.ts';
 
 const encode = (zlib as { zstdCompressSync?: (input: Buffer) => Buffer }).zstdCompressSync;
@@ -13,6 +18,14 @@ test('a compressed rollout name ends in the lower-case suffix on every platform'
   assert.equal(isCompressedRollout(path.join('sessions', 'rollout-a.JSONL.ZST')), false);
   assert.equal(isCompressedRollout(path.join('sessions', 'rollout-a.jsonl')), false);
   assert.equal(isCompressedRollout(path.join('sessions', 'rollout-a.zst')), false);
+});
+
+test.skipIf(!encode)('a corrupt zstd frame decodes as unreadable, not as a missing or changed file', async () => {
+  const file = path.join(tempDir('compressed-corrupt'), 'rollout-a.jsonl.zst');
+  const corrupt = Buffer.from(encode!(Buffer.from('{"type":"session_meta","payload":{}}\n'.repeat(1000))));
+  for (let at = 8; at < corrupt.length - 4; at++) corrupt[at] ^= 0x5a;
+  fs.writeFileSync(file, corrupt);
+  assert.equal((await decodeCompressedRollout(file)).kind, 'failed');
 });
 
 test.skipIf(!encode)('the first record of a compressed rollout decodes alone, within its byte cap', async () => {
