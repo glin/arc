@@ -69,11 +69,12 @@ export interface SessionHistory<Cursor> {
 }
 
 export function startSessionHistory<Cursor>(
-  session: { sessionId: string; size: number; mtimeMs: number },
+  session: { sessionId: string; size: number; mtimeMs: number; file?: string },
   at: number,
 ): SessionHistory<Cursor> {
   return {
     sessionId: session.sessionId,
+    ...(session.file !== undefined ? { file: session.file } : {}),
     size: session.size,
     mtimeMs: session.mtimeMs,
     pages: [],
@@ -86,6 +87,11 @@ export function startSessionHistory<Cursor>(
     failed: false,
     usedAt: at,
   };
+}
+
+// A window for another path than the one the pages read drops the pages.
+export function historyOfOtherPath(held: { file?: string } | undefined, file: string): boolean {
+  return held?.file !== undefined && held.file !== file;
 }
 
 // Older history exists when the read excludes bytes or the parser reached its turn limit.

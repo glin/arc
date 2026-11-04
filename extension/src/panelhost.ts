@@ -637,6 +637,7 @@ import {
   historyStateAfterRevision,
   staleCursorIsStuck,
   startSessionHistory,
+  historyOfOtherPath,
 } from './historypages';
 import { ClaudeHistoryCursor } from './claudehistory';
 import { CodexHistoryCursor, type CodexForwardCheckpoint } from './codexhistory';
@@ -15011,7 +15012,7 @@ export class PanelProvider implements vscode.Disposable {
         }
         const current = this.history.get(sessionId) ?? held;
         const applied = afterHistoryPage(current, outcome, tail, Date.now());
-        this.history.set(sessionId, applied.history);
+        this.history.set(sessionId, { ...applied.history, file: applied.history.file ?? session.file });
         // A child listing can move while the page reader is yielding. Reproject every
         // page after admission so a page parsed against the earlier listing cannot stay stale.
         if (outcome.kind === 'page') {
@@ -15394,8 +15395,7 @@ export class PanelProvider implements vscode.Disposable {
 
   // Before a window request for another path, drop the pages that the previous path read.
   private dropHistoryOfOtherPath(session: SessionFile): void {
-    const held = this.history.get(session.sessionId);
-    if (held?.file !== undefined && held.file !== session.file) this.dropOlderHistory(session.sessionId);
+    if (historyOfOtherPath(this.history.get(session.sessionId), session.file)) this.dropOlderHistory(session.sessionId);
   }
 
   // Release the decoded body in the worker when no selected session reads its compressed rollout. The selection, a
