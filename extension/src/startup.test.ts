@@ -62,7 +62,7 @@ import * as path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { isDeepStrictEqual } from 'node:util';
 import * as zlib from 'node:zlib';
-import { isCompressedRollout } from './compressedrollouts.ts';
+import { compressedRolloutsReadable, isCompressedRollout } from './compressedrollouts.ts';
 import ts from 'typescript';
 import { agentSpendIsOpen, spendFileVersion, spendTokens } from './agentspend';
 import {
@@ -2743,6 +2743,10 @@ function completeDiscoveryHarness(
       'carryCommitRepositories',
       'hydrateCommitRepositories',
       'updateHistoryAfterAcceptedWindow',
+      'dropHistoryOfOtherPath',
+      'windowCheckpoint',
+      'acceptCompressedWindow',
+      'noteCompressedDecoderMissing',
       'acceptExplicitMetadataRead',
       'acceptSelectedMetadataRead',
     );
@@ -3211,6 +3215,10 @@ function selectedWindowHarness(
     'acceptSelectedMetadataRead',
     'spendVersion',
     'updateHistoryAfterAcceptedWindow',
+    'dropHistoryOfOtherPath',
+    'windowCheckpoint',
+    'acceptCompressedWindow',
+    'noteCompressedDecoderMissing',
     'jointSplitWindow',
     'acceptJointSplitWindow',
     'refreshFrom',
@@ -3321,6 +3329,8 @@ function selectedWindowHarness(
     'RepositoryCommits',
     'selectedDependencies',
     'claudeRelationshipKey',
+    'isCompressedRollout',
+    'compressedRolloutsReadable',
     compiled,
   )(
     module,
@@ -3355,6 +3365,8 @@ function selectedWindowHarness(
     RepositoryCommits,
     selectedDependencies,
     claudeRelationshipKey,
+    isCompressedRollout,
+    compressedRolloutsReadable,
   );
   return guardedHarness(new module.exports.Harness(run));
 }
