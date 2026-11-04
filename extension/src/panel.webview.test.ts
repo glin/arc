@@ -22964,8 +22964,30 @@ test('older pages survive an append, and go when the file or the budget says so'
   );
   sourceMatch(
     admission,
-    /preservesLoadedHistory\(previous\.revision, result\)[\s\S]*?historyStateAfterRevision\(/,
+    /preservesLoadedHistory\(previous\.revision, result, previous\.checkpoint\?\.bodyHash\)[\s\S]*?historyStateAfterRevision\(/,
     'accepted windows do not own the retained-history revision transition',
+  );
+  // Each window request for another path drops the pages of the previous path first.
+  for (const member of [
+    'private async finishHandoffRecovery(',
+    'private async completeSelectedWindow(',
+    'private async prepareProgressive(',
+  ]) {
+    sourceMatch(
+      memberFrom(panelHostSource, panelHostSource.indexOf(member)),
+      /this\.dropHistoryOfOtherPath\(session\);\s*const result = await this\.progressiveWorker\.run\(\s*\{\s*kind: 'window'/,
+      `${member} reads a window of another path over the pages of the previous one`,
+    );
+  }
+  sourceMatch(
+    memberFrom(panelHostSource, panelHostSource.indexOf('private async completeSelectedWindow(')),
+    /this\.progressiveCurrent\(session\) &&\s*!\(compressed && this\.compressedCheck === generation\) &&/,
+    'a selected compressed rollout returns its cached window before its hash check',
+  );
+  sourceMatch(
+    memberFrom(panelHostSource, panelHostSource.indexOf('private show(')),
+    /this\.selectionGeneration\+\+;[\s\S]*?this\.compressedCheck = selectedFile && isCompressedRollout\(selectedFile\) \? this\.selectionGeneration : null;/,
+    'a selection does not set the hash check of its compressed rollout',
   );
   const progressive = memberFrom(panelHostSource, panelHostSource.indexOf('private async prepareProgressive('));
   sourceMatch(
