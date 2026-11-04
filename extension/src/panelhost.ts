@@ -628,6 +628,7 @@ import {
   historyBudgetBytes,
   historyBytes,
   historyEvictions,
+  historyOfOtherPath,
   historyPageReads,
   historyRecordsOutside,
   historyRequestContinues,
@@ -637,7 +638,6 @@ import {
   historyStateAfterRevision,
   staleCursorIsStuck,
   startSessionHistory,
-  historyOfOtherPath,
 } from './historypages';
 import { ClaudeHistoryCursor } from './claudehistory';
 import { CodexHistoryCursor, type CodexForwardCheckpoint } from './codexhistory';
@@ -1457,7 +1457,8 @@ export class PanelProvider implements vscode.Disposable {
   private interruptedRereads = new Map<string, { generation: number; failed: boolean }>();
   // The selection generation whose compressed rollout still needs its hash check, or null when no check is owed.
   private compressedCheck: number | null = null;
-  // The compressed rollout whose decoded body the worker holds for the selection.
+  // The compressed rollout whose decoded body the worker holds: the path of the latest window or page request that
+  // opened one.
   private compressedBodyFile: string | null = null;
   // Retries of a partial compressed window, by selection generation, and the timer of the next one.
   private compressedRetry: { generation: number; count: number; timer: ReturnType<typeof setTimeout> | null } | null =
@@ -5430,6 +5431,7 @@ export class PanelProvider implements vscode.Disposable {
         }
         const session = { ...source, ...this.revisionOf(source) };
         const held = this.cache.get(session.file);
+        if (isCompressedRollout(session.file)) this.compressedBodyFile = session.file;
         this.dropHistoryOfOtherPath(session);
         const result = await this.progressiveWorker.run(
           { kind: 'window', input: this.progressiveInput(session), checkpoint: this.windowCheckpoint(session, held) },
@@ -14664,8 +14666,7 @@ export class PanelProvider implements vscode.Disposable {
       }
       const requestedRevision = this.revisionOf(session);
       const compressed = isCompressedRollout(session.file);
-      if (compressed) this.compressedBodyFile = session.file;
-      else this.releaseUnselectedCompressedBody();
+      if (!compressed) this.releaseUnselectedCompressedBody();
       if (
         this.progressiveCurrent(session) &&
         !(compressed && this.compressedCheck === generation) &&
@@ -14700,6 +14701,8 @@ export class PanelProvider implements vscode.Disposable {
       ) {
         return;
       }
+      // The window request opens the body, so the worker holds this path from here.
+      if (compressed) this.compressedBodyFile = session.file;
       this.dropHistoryOfOtherPath(session);
       const result = await this.progressiveWorker.run(
         {
@@ -15109,6 +15112,8 @@ export class PanelProvider implements vscode.Disposable {
     signal: AbortSignal,
   ): Promise<HistoryPageOutcome<HistoryCursor>> {
     const generation = this.historyGeneration;
+    // A page of a compressed rollout opens its body in the worker.
+    if (isCompressedRollout(session.file)) this.compressedBodyFile = session.file;
     const result = await this.progressiveWorker.run(
       {
         kind: 'page',

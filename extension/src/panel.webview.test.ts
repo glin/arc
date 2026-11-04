@@ -23016,7 +23016,7 @@ test('older pages survive an append, and go when the file or the budget says so'
   );
   sourceMatch(
     memberFrom(panelHostSource, panelHostSource.indexOf('private async completeSelectedWindow(')),
-    /if \(compressed\) this\.compressedBodyFile = session\.file;\s*else this\.releaseUnselectedCompressedBody\(\);/,
+    /const compressed = isCompressedRollout\(session\.file\);\s*if \(!compressed\) this\.releaseUnselectedCompressedBody\(\);/,
     'a window of a plain path keeps a compressed body',
   );
   const progressive = memberFrom(panelHostSource, panelHostSource.indexOf('private async prepareProgressive('));

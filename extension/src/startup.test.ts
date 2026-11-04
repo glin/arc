@@ -3755,6 +3755,41 @@ test('two panels on two compressed sessions draw one window and one read failure
   );
   await provider.completeSelectedWindow(first.sessionId, 1);
   assert.equal(requests.length, 4, 'a later read of the failed panel stopped the drawn decode');
+  // The worker holds the body of the drawn window, so the second panel's move to a plain session releases it.
+  const released: string[] = [];
+  provider.progressiveWorker.releaseCompressedBody = (file: string) => released.push(file);
+  provider.hostSessions.set(secondPanel, 'plain');
+  provider.releaseUnselectedCompressedBody();
+  assert.deepEqual(released, [second.file], 'the body of the drawn window stayed after its panel left it');
+});
+
+test('a page read of a compressed session releases its body when its panel leaves the session', async () => {
+  const first = { file: 'first.jsonl.zst', sessionId: 'first', agent: 'codex', size: 10, mtimeMs: 10, dev: 1, ino: 3 };
+  const second = { ...first, file: 'second.jsonl.zst', sessionId: 'second', ino: 4 };
+  const provider = selectedWindowHarness(
+    async (request, generation) =>
+      request.kind === 'window' ? windowResult(generation, provider.revisionOf(request.input.session)) : null,
+    ['readOlderHistoryPage'],
+  );
+  const released: string[] = [];
+  provider.progressiveWorker.releaseCompressedBody = (file: string) => released.push(file);
+  const firstPanel = {};
+  const secondPanel = {};
+  provider.hosts = [firstPanel, secondPanel];
+  provider.hostSessions = new Map([
+    [firstPanel, first.sessionId],
+    [secondPanel, second.sessionId],
+  ]);
+  provider.selectionWorks = new Map();
+  provider.catalog = [first, second];
+  provider.showing = second.sessionId;
+  await provider.completeSelectedWindow(second.sessionId, 1);
+  assert.ok(provider.cache.has(second.file), 'the second window was not drawn');
+  // An older page of the first session decodes its body in the worker in place of the second body.
+  await provider.readOlderHistoryPage(first, null, new AbortController().signal);
+  provider.hostSessions.set(firstPanel, 'plain');
+  provider.releaseUnselectedCompressedBody();
+  assert.deepEqual(released, [first.file], 'the body of the page read stayed after its panel left it');
 });
 
 test('a slow selected read keeps its request until selection cancels it', async () => {
