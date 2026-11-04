@@ -226,6 +226,7 @@ import {
   afterHistoryRequest,
   historyBytes,
   historyEvictions,
+  historyOfOtherPath,
   historyPageReads,
   historyRequestContinues,
   historyRecordsOutside,
@@ -2377,6 +2378,22 @@ let harnessFaults: Error[] = [];
 // Each guarded harness has a signal that resolves with its fault. The signal lives here, outside the proxy, so reading it
 // never counts as a PanelProvider member read.
 const harnessFaultSignals = new WeakMap<object, Promise<Error>>();
+const harnessFaultSetters = new WeakMap<object, (error: Error) => void>();
+
+// A compiled method that names a module helper missing from the harness scope throws a ReferenceError. A swallowing catch
+// in that method turns the miss into a failed read, and a refresh that reads the window again repeats it after the test
+// ends, until the worker runs out of memory. Each harness rewrites its swallowing catches to call this helper, which
+// records the miss as the fault of the provider, so every later read throws and the cycle ends.
+function noteHarnessScopeMiss(provider: object | undefined, caught: unknown): void {
+  if (!(caught instanceof ReferenceError)) return;
+  const fault = new Error(
+    `The startup harness scope lacks a name that the code under test used: ${caught.message}. Add it to the scope of the harness that built this provider.`,
+  );
+  const fail = provider ? harnessFaultSetters.get(provider) : undefined;
+  if (fail) fail(fault);
+  else harnessFaults.push(fault);
+}
+const SCOPE_MISS_CATCH = '} catch (caught) { noteHarnessScopeMiss(this, caught);';
 
 afterEach(() => {
   const faults = harnessFaults;
@@ -2452,17 +2469,24 @@ function guardedHarness<T extends object>(provider: T): T {
     get(target, key, receiver) {
       if (typeof key !== 'string' || key === 'then') return Reflect.get(target, key, receiver);
       if (!fault && members.has(key) && !(key in target)) {
-        fault = new Error(
-          `The startup harness lacks the PanelProvider member ${key}, which the code under test used. Add ${key} to the method list of the harness that built this provider.`,
+        fail(
+          new Error(
+            `The startup harness lacks the PanelProvider member ${key}, which the code under test used. Add ${key} to the method list of the harness that built this provider.`,
+          ),
         );
-        harnessFaults.push(fault);
-        notify(fault);
       }
       if (fault) throw fault;
       return Reflect.get(target, key, receiver);
     },
   });
+  const fail = (error: Error) => {
+    if (fault) return;
+    fault = error;
+    harnessFaults.push(error);
+    notify(error);
+  };
   harnessFaultSignals.set(guarded, signal);
+  harnessFaultSetters.set(guarded, fail);
   return guarded;
 }
 
@@ -2688,6 +2712,8 @@ function completeDiscoveryHarness(
     enumerateRolloutFilesAsync,
     enumerateClaudeChildSources,
     isCompressedRollout,
+    historyOfOtherPath,
+    noteHarnessScopeMiss,
     ...scope,
   };
   const names = [
@@ -2731,6 +2757,8 @@ function completeDiscoveryHarness(
     'applyCommitRepositories',
     'agentFile',
     'unresolvedLoadingFailure',
+    // refresh and show release a compressed body that no selected session reads.
+    'releaseUnselectedCompressedBody',
     ...extraMethods,
   ];
   if (realSelectedWindow) {
@@ -2747,7 +2775,6 @@ function completeDiscoveryHarness(
       'windowCheckpoint',
       'acceptCompressedWindow',
       'noteCompressedDecoderMissing',
-      'releaseUnselectedCompressedBody',
       'acceptExplicitMetadataRead',
       'acceptSelectedMetadataRead',
     );
@@ -2760,7 +2787,8 @@ function completeDiscoveryHarness(
   const body = owner.members
     .filter((member) => member.name && names.includes(member.name.getText(file)))
     .map((member) => member.getText(file))
-    .join('\n');
+    .join('\n')
+    .replaceAll('} catch {', SCOPE_MISS_CATCH);
   const compiled = transformSync(
     `
     const isInside = ${scope.scopeInside ? 'scopeInside' : '() => true'};
@@ -3238,7 +3266,8 @@ function selectedWindowHarness(
     .filter((member) => member.name && names.has(member.name.getText(file)))
     .map((member) => member.getText(file))
     .join('\n')
-    .replace('} catch (error) {', '} catch (error) { this.lastError = error;');
+    .replace('} catch (error) {', '} catch (error) { this.lastError = error;')
+    .replaceAll('} catch {', SCOPE_MISS_CATCH);
   // The eviction harness refreshes all three selected sessions.
 
   const refreshBody = extra.includes('evictCache')
@@ -3311,6 +3340,7 @@ function selectedWindowHarness(
     'retainDisplacedWindow',
     'historyRecordsOutside',
     'startSessionHistory',
+    'historyOfOtherPath',
     'onlyGrew',
     'historyBytes',
     'historyEvictions',
@@ -3333,6 +3363,7 @@ function selectedWindowHarness(
     'claudeRelationshipKey',
     'isCompressedRollout',
     'compressedRolloutsReadable',
+    'noteHarnessScopeMiss',
     compiled,
   )(
     module,
@@ -3347,6 +3378,7 @@ function selectedWindowHarness(
     retainDisplacedWindow,
     historyRecordsOutside,
     startSessionHistory,
+    historyOfOtherPath,
     onlyGrew,
     historyBytes,
     historyEvictions,
@@ -3369,6 +3401,7 @@ function selectedWindowHarness(
     claudeRelationshipKey,
     isCompressedRollout,
     compressedRolloutsReadable,
+    noteHarnessScopeMiss,
   );
   return guardedHarness(new module.exports.Harness(run));
 }
