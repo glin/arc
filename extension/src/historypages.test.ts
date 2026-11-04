@@ -3,6 +3,7 @@ import assert from 'node:assert';
 import * as fs from 'node:fs';
 import { tempDir } from './temproot.ts';
 import * as path from 'node:path';
+import * as zlib from 'node:zlib';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import {
   createCommitRepositoryCursor,
@@ -41,9 +42,11 @@ import {
   startSessionHistory,
 } from './historypages.ts';
 import { ClaudeHistoryCursor, readClaudeHistoryPageAsync } from './claudehistory.ts';
-import { CodexHistoryCursor, readCodexHistoryPageAsync } from './codexhistory.ts';
-import { readCodexSession } from './codex.ts';
-import { Compaction, Turn, readSession, revisionOf } from './transcript.ts';
+import { CodexHistoryCursor, readCodexHistoryPageAsync, readCodexSessionIncrementalAsync } from './codexhistory.ts';
+import { discoverCodexNewestTurn, openingRecordOf, readCodexSession } from './codex.ts';
+import { Compaction, Turn, readSession, revisionOf, tailOf } from './transcript.ts';
+import { compressedByteSource, decodeCompressedRollout } from './compressedrollouts.ts';
+import { preservesLoadedHistory, type ProgressiveCheckpoint, type ProgressiveResult } from './progressiveworker.ts';
 import { compaction, turn } from './turnfixtures.ts';
 import { turnKey } from './turnread.ts';
 import { EXPORT_LIMITS, ExportLimitError } from './exportlimits.ts';
@@ -1798,4 +1801,170 @@ test('Codex capture shares the raw page allowance with growing unfinished fragme
   assert.deepEqual(found, ids.slice(-found.length).reverse());
   assert.ok(fragments > 0);
   assert.equal(reachedPageLimit, true);
+});
+
+const zstdCompress = (zlib as { zstdCompressSync?: (input: Buffer, options?: object) => Buffer }).zstdCompressSync;
+
+// A 70 MiB Codex rollout whose newest turn holds 8 MiB, so the window reads past its tail to find that turn's start.
+function largeCodexRollout(): Buffer {
+  const at = (second: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, second)).toISOString();
+  const output = 'o'.repeat(60 * 1024);
+  const lines = [
+    JSON.stringify({
+      timestamp: at(0),
+      type: 'session_meta',
+      payload: { id: 'large', cwd: 'c:\\large', model_provider: 'openai' },
+    }),
+  ];
+  const turn = (index: number, outputs: number) => {
+    const turnId = `turn-${index}`;
+    lines.push(
+      JSON.stringify({
+        timestamp: at(index * 10),
+        type: 'event_msg',
+        payload: { type: 'task_started', turn_id: turnId },
+      }),
+      JSON.stringify({
+        timestamp: at(index * 10 + 1),
+        type: 'turn_context',
+        payload: { turn_id: turnId, model: 'gpt-5.6-sol' },
+      }),
+      JSON.stringify({
+        timestamp: at(index * 10 + 2),
+        type: 'event_msg',
+        payload: { type: 'user_message', message: `request ${index}` },
+      }),
+    );
+    for (let call = 0; call < outputs; call++)
+      lines.push(
+        JSON.stringify({
+          timestamp: at(index * 10 + 3),
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call_output',
+            call_id: `call-${index}-${call}`,
+            output: [{ type: 'input_text', text: output }],
+          },
+        }),
+      );
+    lines.push(
+      JSON.stringify({
+        timestamp: at(index * 10 + 4),
+        type: 'event_msg',
+        payload: { type: 'task_complete', turn_id: turnId },
+      }),
+    );
+  };
+  for (let index = 1; index <= 270; index++) turn(index, 4);
+  turn(271, 8 * 17);
+  return Buffer.from(lines.join('\n') + '\n');
+}
+
+test.skipIf(!zstdCompress)(
+  'a compressed rollout reads the window and every page of its plain copy',
+  async () => {
+    const body = largeCodexRollout();
+    assert.ok(body.length > 70 * 1024 * 1024, 'the fixture is smaller than 70 MiB');
+    const directory = transcriptDir();
+    const plain = path.join(directory, 'rollout-large.jsonl');
+    fs.writeFileSync(plain, body);
+    const contentSize = (zlib.constants as { ZSTD_c_contentSizeFlag?: number }).ZSTD_c_contentSizeFlag!;
+    const variants = {
+      'with a decoded length': zstdCompress!(body),
+      'without a decoded length': zstdCompress!(body, { params: { [contentSize]: 0 } }),
+    };
+    const window = async (
+      file: string,
+      work: Parameters<typeof readCodexSessionIncrementalAsync>[4],
+      tail: typeof tailOf,
+    ) => {
+      const options = { maxTurns: 40, tailBytes: 4 * 1024 * 1024 };
+      const first = await readCodexSessionIncrementalAsync(file, 'large', undefined, options, work);
+      assert.equal(
+        first.read?.turns.length,
+        0,
+        'the newest turn fit in the tail, so the window never searched for its start',
+      );
+      const cursor = tail(file, options.tailBytes, true).cursor!;
+      const found = await discoverCodexNewestTurn(file, cursor, undefined, {
+        readRange: work?.readRange,
+        agentPath: work?.opening?.()?.agentPath,
+      });
+      assert.equal(found.kind, 'found');
+      const bytes = found.kind === 'found' ? found.readBytes : 0;
+      const read = await readCodexSessionIncrementalAsync(
+        file,
+        'large',
+        undefined,
+        { ...options, tailBytes: bytes },
+        work,
+      );
+      return { readBytes: bytes, read: read.read };
+    };
+    const pages = async (file: string, options: Parameters<typeof readCodexHistoryPageAsync>[3]) => {
+      const all: unknown[] = [];
+      let cursor: CodexHistoryCursor | null = null;
+      do {
+        const result = await readCodexHistoryPageAsync(file, 'large', cursor, { targetTurns: 20, ...options });
+        assert.equal(result.kind, 'page');
+        if (result.kind !== 'page') break;
+        all.push({
+          turns: result.page.turns,
+          compactions: result.page.compactions,
+          ownedRange: result.page.ownedRange,
+        });
+        cursor = result.page.nextOlderCursor;
+      } while (cursor && all.length < 40);
+      return all;
+    };
+    const plainWindow = await window(plain, {}, tailOf);
+    assert.equal(plainWindow.read?.turns.length, 1);
+    const plainPages = await pages(plain, {});
+    assert.ok(plainPages.length >= 13, `the plain copy gave ${plainPages.length} pages`);
+    for (const [name, bytes] of Object.entries(variants)) {
+      const file = path.join(directory, `rollout-large-${name.replace(/ /g, '-')}.jsonl.zst`);
+      fs.writeFileSync(file, bytes);
+      const decoded = await decodeCompressedRollout(file);
+      assert.equal(decoded.kind, 'body', `${name}: the body did not decode`);
+      if (decoded.kind !== 'body') continue;
+      assert.equal(decoded.body.length, body.length, name);
+      assert.equal(decoded.body.complete, true, name);
+      const source = compressedByteSource(decoded.body);
+      const opening = () => openingRecordOf(source.opening());
+      const work = { revision: source.revision, readRange: source.readRange, opening };
+      const compressedWindow = await window(file, work, (_file, tail, keep) => source.tail(tail, keep));
+      assert.deepEqual(compressedWindow, plainWindow, `${name}: the window differs from the plain copy`);
+      const compressedPages = await pages(file, { ...work, evidenceReadRange: source.readRange });
+      assert.equal(compressedPages.length, plainPages.length, `${name}: the page count differs`);
+      compressedPages.forEach((page, index) =>
+        assert.deepEqual(page, plainPages[index], `${name}: page ${index} differs`),
+      );
+    }
+  },
+  120_000,
+);
+
+test('a changed body hash drops the loaded pages, and an equal one keeps them', () => {
+  const revision = { size: 10, mtimeMs: 1, dev: 1, ino: 1 };
+  const result = (bodyHash?: string): ProgressiveResult => ({
+    generation: 1,
+    revision,
+    value: {
+      kind: 'window',
+      read: { turns: [], compactions: [], readBytes: 0, turnLimitReached: false },
+      checkpoint: { bodyHash } as unknown as ProgressiveCheckpoint,
+      reset: false,
+      appendFrom: null,
+      readBytes: 0,
+      retainedBytes: 0,
+      checkpointBytes: 0,
+      agentKey: '',
+      structuralKey: '',
+    },
+  });
+  assert.equal(preservesLoadedHistory(revision, result('a'), 'a'), true);
+  assert.equal(preservesLoadedHistory(revision, result('b'), 'a'), false, 'a new body hash kept the pages');
+  assert.equal(preservesLoadedHistory(revision, result(), 'a'), false, 'a plain window kept compressed pages');
+  assert.equal(preservesLoadedHistory(revision, result('a')), false, 'a compressed window kept plain pages');
+  assert.equal(preservesLoadedHistory(revision, result()), true);
 });
