@@ -4351,6 +4351,11 @@ button.cctx:hover {
   flex-direction: column;
   gap: 4px;
 }
+.sbgroup + .sbgroup {
+  border-top: 1px solid var(--edge);
+  padding-top: 10px;
+  margin-top: 3px;
+}
 .sbrows {
   display: flex;
   flex-direction: column;
@@ -4360,18 +4365,22 @@ button.cctx:hover {
 .sbhead {
   display: flex;
   align-items: baseline;
-  gap: 6px;
+  gap: 7px;
   font-size: var(--t-small);
   font-weight: 600;
   letter-spacing: 0.06em;
   text-transform: uppercase;
-  color: var(--idle);
+  color: var(--vscode-foreground);
 }
-.sbplan {
-  margin-left: auto;
+.sbplan,
+.sbhead .sbage {
+  color: var(--idle);
   font-weight: 400;
   letter-spacing: 0;
   text-transform: none;
+}
+.sbhead .sbage {
+  margin-left: auto;
 }
 .sbline {
   display: flex;

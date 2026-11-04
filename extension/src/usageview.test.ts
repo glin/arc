@@ -111,12 +111,12 @@ test('each group names its oldest displayed reading while the footer names the o
   assert.equal(bar.read, 'updated 3h ago \u00b7 press to read again');
   assert.deepEqual(
     bar.groups.map((group) => group.age),
-    ['updated 3h ago', ''],
+    ['3h ago', ''],
   );
   const mixed = usageBar([claude, usage({ agent: 'codex', windows: [reading({ readAt: NOW - 25 * 60_000 })] })], NOW)!;
   assert.deepEqual(
     mixed.groups.map((group) => group.age),
-    ['updated 3h ago', 'updated 25m ago'],
+    ['3h ago', '25m ago'],
   );
   assert.equal(mixed.read, 'updated 3h ago \u00b7 press to read again');
   const boundary = usage({ agent: 'codex', windows: [reading({ readAt: NOW - USAGE_FRESH_MS })] });

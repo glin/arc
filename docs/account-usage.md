@@ -8,7 +8,7 @@ Account limits come from CLI account readings and live events, never transcript 
 
 The shared age belongs to the oldest displayed reading so a fresh event cannot make an older cap appear fresh. An admitted reading refreshes age even when utilization is unchanged.
 
-Each popover heading shows its group's oldest displayed reading age after the plan when it exceeds two minutes. Its native tooltip shows the full local reading time. A failed or empty read displays a warning line under that heading. A group without figures or a warning displays `No usage reading`.
+Each popover heading shows the plan beside the agent name and the group's oldest displayed reading age on the right when it exceeds two minutes. Its native tooltip shows the full local reading time. A failed or empty read displays a warning line under that heading. A group without figures or a warning displays `No usage reading`.
 
 Read again discovers Codex eligibility before settling refresh. Bedrock Codex accounts contribute no subscription figures, plans, groups, refresh outcomes, or announcements, including after busy-wait expiry. Discovery removes retained Codex limits from workspace state. Claude readings and historical usage files remain. Unknown accounts, signed-out accounts, and discovery failures retain retryable errors.
 

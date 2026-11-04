@@ -20,6 +20,7 @@ import { HostReadPersistence, preserveHostRead } from './domain/read.ts';
 import { LaunchPolicyStore } from './launchpolicystore';
 import { SessionFilterRequests, FILTER_LIMITS } from './sessionfilter.ts';
 import { createSavedState } from './webview/state.ts';
+import { inlineText } from './webview/inline-text.ts';
 import type { QueuedSubmission, TurnComment } from './turnview.ts';
 import { resolveResponseSession, pendingResponseSessionAdmitted, sessionLinkContext } from './domain/session-link';
 import { nativeCitationPath } from './domain/file-citation';
@@ -10584,6 +10585,7 @@ test('usage refresh renders busy phases without an action and retains the availa
     /usagePopover\.setAttribute\(\s*'aria-label',\s*([\s\S]*?)\s*\);/,
   )![1];
   const popoverName = new Function('props', `return ${nameExpression.replace(/,\s*$/, '')};`);
+  vi.stubGlobal('inlineText', inlineText);
   for (const phase of ['reading', 'discovering', 'queued', 'waiting', 'success', 'empty', 'failed'] as const) {
     const bar = usageBar([], NOW, {
       id: 1,

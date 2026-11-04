@@ -9,6 +9,7 @@ import { CONTEXT_CLASSES } from '../view/card-presentation.ts';
 import type { ComposerView, Menu, PanelToHost } from './protocol.ts';
 import { found } from './dom.ts';
 import { WarningSign } from './stat-chip.ts';
+import { inlineText } from './inline-text.ts';
 
 const CHOSEN = '\u2713';
 const TWIST = { open: '\u25BE', shut: '\u25B8' };
@@ -78,19 +79,15 @@ export function UsageOpenView(props: { bar: UsageBar; sendToHost(message: PanelT
           'aria-label': [group.label, group.exact].filter(Boolean).join(', '),
         },
         [
-          h('div', { class: 'sbhead' }, [
-            h('span', {}, group.label),
-            group.plan || group.age
-              ? [
-                  ' ',
-                  h(
-                    'span',
-                    { class: 'sbplan', title: group.age ? group.exact : undefined },
-                    [group.plan, group.age].filter(Boolean).join(' \u00b7 '),
-                  ),
-                ]
-              : null,
-          ]),
+          h(
+            'div',
+            { class: 'sbhead' },
+            inlineText([
+              h('span', {}, group.label),
+              group.plan ? h('span', { class: 'sbplan' }, group.plan) : null,
+              group.age ? h('span', { class: 'sbage', title: group.exact }, group.age) : null,
+            ]),
+          ),
           group.status ? h('div', { class: 'sbstatus' }, [h(WarningSign, {}), group.status]) : null,
           !group.lines.length && !group.status ? h('div', { class: 'sbnone' }, 'No usage reading') : null,
           group.lines.length

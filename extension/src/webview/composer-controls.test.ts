@@ -86,21 +86,29 @@ const group = (over: Partial<UsageGroup> = {}): UsageGroup => ({
   ...over,
 });
 
-test('usage headings join plan and age and expose the exact reading time', async () => {
+test('usage headings place plans and ages separately and expose the exact reading time', async () => {
   const root = await usageView([
-    group({ plan: 'Max plan', age: 'updated 3h ago', exact: '11/2/2026, 11:32:00 AM' }),
-    group({ agent: 'codex', label: 'Codex', age: 'updated 25m ago', exact: '11/2/2026, 2:07:00 PM' }),
+    group({ plan: 'Max plan', age: '3h ago', exact: '11/2/2026, 11:32:00 AM' }),
+    group({ agent: 'codex', label: 'Codex', age: '25m ago', exact: '11/2/2026, 2:07:00 PM' }),
     group({ agent: 'fresh', plan: 'Max plan' }),
     group({ agent: 'unknown' }),
   ]);
-  const plans = root.byClass('sbplan');
+  const heads = root.byClass('sbhead');
   assert.deepEqual(
-    plans.map((plan) => plan.textContent),
-    ['Max plan \u00b7 updated 3h ago', 'updated 25m ago', 'Max plan'],
+    heads.map((head) => head.textContent),
+    ['Claude Max plan 3h ago', 'Codex 25m ago', 'Claude Max plan', 'Claude'],
   );
-  assert.equal(plans[0].attributes.get('title'), '11/2/2026, 11:32:00 AM');
-  assert.equal(plans[1].attributes.get('title'), '11/2/2026, 2:07:00 PM');
-  assert.equal(plans[2].attributes.has('title'), false);
+  assert.deepEqual(
+    root.byClass('sbplan').map((plan) => plan.textContent),
+    ['Max plan', 'Max plan'],
+  );
+  const ages = root.byClass('sbage');
+  assert.deepEqual(
+    ages.map((age) => age.textContent),
+    ['3h ago', '25m ago'],
+  );
+  assert.equal(ages[0].attributes.get('title'), '11/2/2026, 11:32:00 AM');
+  assert.equal(ages[1].attributes.get('title'), '11/2/2026, 2:07:00 PM');
   assert.equal(root.byClass('sbgroup')[0].attributes.get('aria-label'), 'Claude, 11/2/2026, 11:32:00 AM');
 });
 

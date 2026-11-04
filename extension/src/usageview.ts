@@ -514,7 +514,7 @@ export function usageBar(usages: AgentUsage[], now: number, refresh?: UsageRefre
       plan: usage ? usagePlanLabel(usage) : '',
       age:
         Number.isFinite(agentReadAt) && now - agentReadAt > USAGE_FRESH_MS
-          ? `updated ${lengthWord(now - agentReadAt)} ago`
+          ? `${lengthWord(now - agentReadAt)} ago`
           : '',
       lines,
       exact: Number.isFinite(agentReadAt) ? new Date(agentReadAt).toLocaleString() : '',
@@ -528,8 +528,7 @@ export function usageBar(usages: AgentUsage[], now: number, refresh?: UsageRefre
   // How old the figures are, on the ladder the reset times are drawn on. Empty inside the
   // fresh window, where the age is not a signal the reader can act on.
   const age = stale ? `updated ${lengthWord(now - readAt)} ago` : '';
-  // The control that reads again carries the same words, so two wordings of one reading,
-  // drawn a few pixels apart, can never name different numbers.
+  // The control that reads again uses the oldest displayed reading.
   const readWord = Number.isFinite(readAt) ? age || 'updated just now' : '';
   // Adds the reading's clock time to stale accessible age wording.
   const spokenAge = stale ? `${age}, ${formatClock(readAt)}` : '';
