@@ -22895,8 +22895,8 @@ test('one older page is read at a time, for the session on screen alone', () => 
   );
   sourceMatch(
     body,
-    /this\.history\.set\(sessionId, applied\.history\);[\s\S]*?if \(outcome\.kind === 'page'\) \{\s*this\.historyStructuralKeys\.delete\(sessionId\);/,
-    'a page parsed against an older child listing can remain stale after it is admitted',
+    /this\.history\.set\(sessionId, \{ \.\.\.applied\.history, file: applied\.history\.file \?\? session\.file \}\);[\s\S]*?if \(outcome\.kind === 'page'\) \{\s*this\.historyStructuralKeys\.delete\(sessionId\);/,
+    'a page parsed against an older child listing can remain stale after it is admitted, or an admitted page keeps no path',
   );
   // Accept worker page results only for the current history generation and source revision.
   const readerAt = panelHostSource.indexOf('private async readOlderHistoryPage(');
@@ -22994,6 +22994,27 @@ test('older pages survive an append, and go when the file or the budget says so'
     memberFrom(panelHostSource, panelHostSource.indexOf('private show(')),
     /this\.selectionGeneration\+\+;[\s\S]*?this\.compressedCheck = selectedFile && isCompressedRollout\(selectedFile\) \? this\.selectionGeneration : null;/,
     'a selection does not set the hash check of its compressed rollout',
+  );
+  // Only the selected session decodes a compressed body, and each change that leaves it releases the body.
+  sourceMatch(
+    memberFrom(panelHostSource, panelHostSource.indexOf('private async prepareProgressive(')),
+    /if \(isCompressedRollout\(session\.file\)\) continue;\s*const previous = this\.cache\.get\(session\.file\);\s*this\.dropHistoryOfOtherPath\(session\);\s*const result = await this\.progressiveWorker\.run\(\s*\{\s*kind: 'window'/,
+    'a background window decodes a compressed body',
+  );
+  sourceMatch(
+    memberFrom(panelHostSource, panelHostSource.indexOf('private show(')),
+    /this\.showing = session;[\s\S]*?this\.releaseUnselectedCompressedBody\(\);/,
+    'a selection keeps the body of the session it leaves',
+  );
+  sourceMatch(
+    panelHostSource,
+    /this\.showing = pickShowing\(reachable, this\.showing\);[\s\S]{0,1500}?this\.releaseUnselectedCompressedBody\(\);/,
+    'a reconciled selection keeps the body of the session it leaves',
+  );
+  sourceMatch(
+    memberFrom(panelHostSource, panelHostSource.indexOf('private async completeSelectedWindow(')),
+    /if \(compressed\) this\.compressedBodyFile = session\.file;\s*else this\.releaseUnselectedCompressedBody\(\);/,
+    'a window of a plain path keeps a compressed body',
   );
   const progressive = memberFrom(panelHostSource, panelHostSource.indexOf('private async prepareProgressive('));
   sourceMatch(
