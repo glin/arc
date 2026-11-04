@@ -12650,7 +12650,7 @@ for (const [budgetKiB, unfinishedWork] of [
       repositoryRoots: [directory],
     });
     const worker = new ProgressiveWorker(
-      `Date.now = () => ${Date.now() + 7_200_000};` + dispatchWorkerSource(budgetKiB),
+      `performance.now = () => 0; Date.now = () => ${Date.now() + 7_200_000};` + dispatchWorkerSource(budgetKiB),
     );
     const signal = new AbortController().signal;
     try {

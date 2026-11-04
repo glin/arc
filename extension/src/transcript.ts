@@ -563,6 +563,15 @@ export interface CompactionSignal {
   preparatoryRequestKey?: string;
 }
 
+// Exact removed boundaries and the preceding bounded history, before survivor ordinals change.
+export interface CompactionRetraction {
+  previousCount: number;
+  count: number;
+  turnId: string;
+  removed: Array<{ ordinal: number; responseId: string | null }>;
+  compactions: ReducerCompaction[];
+}
+
 // Compaction fact in source order, with an explicit ordinal independent of its timestamp.
 // A record without a usable clock still counts, so positions cannot pair bounded timestamps with the total.
 export interface ReducerCompaction {

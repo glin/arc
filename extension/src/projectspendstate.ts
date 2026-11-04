@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from 'node:util';
 import { CODEX_USAGE_ASSOCIATION_LIMIT, type CodexUsageReducerState } from './codex';
 import {
   costStateIdentity,
@@ -1139,6 +1140,12 @@ function cacheExpiryFacts(value: unknown): CacheExpiryFacts | null {
   if (returns.length > counted || (!value.truncated && returns.length !== counted)) {
     return null;
   }
+  const keys = returns.flatMap((item) => (item.requestKey === null ? [] : [item.requestKey]));
+  if (new Set(keys).size !== keys.length) return null;
+  for (const tier of ['5m', '30m', '1h'] as const) {
+    const retained = returns.filter((item) => item.lifetime === tier).length;
+    if (retained > counts[tier] || (!value.truncated && retained !== counts[tier])) return null;
+  }
   return {
     counts: { '5m': counts['5m'], '30m': counts['30m'], '1h': counts['1h'] },
     returns,
@@ -1186,6 +1193,8 @@ function cacheExpiryLedger(value: unknown): CacheExpiryLedger | null {
   )
     return null;
   const parsedReturns: NonNullable<CacheExpiryLedger['compactionReturns']> = [];
+  const keys = new Set<string>();
+  const ordinals = new Set<number>();
   for (const item of compactionReturns ?? []) {
     if (
       !record(item) ||
@@ -1195,8 +1204,31 @@ function cacheExpiryLedger(value: unknown): CacheExpiryLedger | null {
       !record(item.verdict)
     )
       return null;
+    if (keys.has(item.requestKey) || ordinals.has(item.ordinal)) return null;
+    keys.add(item.requestKey);
+    ordinals.add(item.ordinal);
     const previous = cacheExpiryCarry(item.previous);
-    if (!previous) return null;
+    if (!previous || previous.compactionsBefore >= item.ordinal) return null;
+    if (!Object.hasOwn(item, 'next') || !Object.hasOwn(item, 'request')) return null;
+    const next = item.next === null ? null : cacheExpiryCarry(item.next);
+    const request = item.request === null ? null : bucket(item.request);
+    if ((item.next !== null && !next) || (item.request !== null && !request) || Boolean(next) !== Boolean(request))
+      return null;
+    if (next && (next.requestKey !== item.requestKey || next.compactionsBefore !== item.ordinal - 1 || next.incomplete))
+      return null;
+    if (previous.compaction && previous.compaction.ordinal >= item.ordinal) return null;
+    if (
+      next &&
+      request &&
+      (['model', 'provider', 'serviceTier', 'inferenceClass'] as const).some((key) => next[key] !== request[key])
+    )
+      return null;
+    if (
+      request &&
+      (!request.compactionUsage || request.incomplete || request.requests !== 1 || request.usage.requests !== 1)
+    )
+      return null;
+    if (!next && item.verdict.kind !== 'none') return null;
     const verdict = item.verdict;
     if (verdict.kind === 'return') {
       if (!cacheTier(verdict.lifetime) || !nonNegativeInteger(verdict.gapMs)) return null;
@@ -1204,6 +1236,8 @@ function cacheExpiryLedger(value: unknown): CacheExpiryLedger | null {
         requestKey: item.requestKey,
         ordinal: item.ordinal,
         previous,
+        next,
+        request,
         verdict: { kind: 'return', lifetime: verdict.lifetime, gapMs: verdict.gapMs },
       });
     } else if (verdict.kind === 'none' || verdict.kind === 'unavailable' || verdict.kind === 'excluded') {
@@ -1211,9 +1245,33 @@ function cacheExpiryLedger(value: unknown): CacheExpiryLedger | null {
         requestKey: item.requestKey,
         ordinal: item.ordinal,
         previous,
+        next,
+        request,
         verdict: { kind: verdict.kind },
       });
     } else return null;
+  }
+  for (const tier of ['5m', '30m', '1h'] as const) {
+    const active = parsedReturns.filter(
+      (item) => item.verdict.kind === 'return' && item.verdict.lifetime === tier,
+    ).length;
+    if (active > facts.counts[tier]) return null;
+  }
+  for (const kind of ['unavailable', 'excluded'] as const) {
+    if (parsedReturns.filter((item) => item.verdict.kind === kind).length > facts[kind]) return null;
+  }
+  for (const held of parsedReturns) {
+    const detail = facts.returns.find((item) => item.requestKey === held.requestKey);
+    if (
+      detail &&
+      (held.verdict.kind !== 'return' ||
+        detail.lifetime !== held.verdict.lifetime ||
+        detail.gapMs !== held.verdict.gapMs ||
+        detail.visibleTurnId !== held.next?.visibleTurnId ||
+        !isDeepStrictEqual(detail.request, held.request))
+    )
+      return null;
+    if (held.verdict.kind === 'return' && !facts.truncated && !detail) return null;
   }
   if (
     !(
@@ -1350,6 +1408,12 @@ function spendRecord(
   if (expiry === null && value.cacheExpiry !== null && value.cacheExpiry !== undefined) {
     return null;
   }
+  if (
+    expiry?.compactionReturns?.some(
+      (item) => typeof value.compactionCount === 'number' && item.ordinal > value.compactionCount,
+    )
+  )
+    return null;
   if (value.complete === false) {
     const scanOffset = value.scanOffset ?? value.offset;
     if (scanOffset < value.offset || scanOffset > value.size) {

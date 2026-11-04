@@ -33,7 +33,7 @@ import { readSession } from './transcript.ts';
 import { toCard, turnCacheExpiryWarning } from './turncard.ts';
 import { turnKey } from './domain/read.ts';
 import { codexLeadingCompactionRecords } from './turnfixtures';
-import { sessionCostProjection, sessionCostUsageOf } from './turncard';
+import { cacheExpiryReturnCount, sessionCostProjection, sessionCostUsageOf } from './turncard';
 import { turnCacheExpiryReturn } from './turncard';
 import { readCodexSession } from './codex';
 
@@ -110,6 +110,7 @@ test('a leading compaction excludes changed effort through context and delayed s
       const record = indexed(lines, createCodexUsageLineReducer);
       const label = `${identity}, ${effort}`;
       assert.equal(facts(record).counts['30m'], effort === 'high' ? 0 : 1, label);
+      assert.equal(facts(record).excluded, effort === 'high' ? 1 : 0, label);
       assert.equal(total(record), total(reference), label);
       assert.equal(
         record.lifetimeBuckets!.reduce((sum, bucket) => sum + bucket.requests, 0),
@@ -237,7 +238,9 @@ test('a leading compaction return revises late identity and retracts revoked own
     scan.push(removal);
     scan.push({ ...billed, ...changed });
     assert.equal(scan.ledger(reducer.recentCompactions()).facts.counts['30m'], 0, JSON.stringify(changed));
+    assert.equal(scan.ledger(reducer.recentCompactions()).facts.excluded, 1);
     scan.push(billed);
+    assert.equal(scan.ledger(reducer.recentCompactions()).facts.excluded, 0);
     assert.equal(scan.ledger(reducer.recentCompactions()).facts.counts['30m'], 1, JSON.stringify(changed));
   }
   scan.compactionCount(0);
@@ -3161,4 +3164,156 @@ test('a saved return without the cost-added fields keeps a deleted source and le
   assert.equal(facts(loaded).returns[0].requestKey, null);
   assert.equal(facts(loaded).returns[0].previousInputSide, null);
   assert.deepEqual(cacheExpiryExtraCost(facts(loaded), pricer), { dollars: null, status: 'unknown' });
+});
+
+test('removing an earlier copied compaction preserves the later cold return across saved seams', () => {
+  const a = codexLeadingCompactionRecords({ gapMinutes: 10, prompt: false });
+  const b = codexLeadingCompactionRecords({ duplicateBill: true });
+  const later = b.records
+    .slice(8)
+    .map((row) =>
+      JSON.parse(
+        JSON.stringify(row).replaceAll(b.turnId, 'surviving-turn').replaceAll(b.responseId, 'surviving-response'),
+      ),
+    );
+  const rows = [
+    ...a.records,
+    ...later,
+    {
+      type: 'turn_context',
+      timestamp: '2026-10-30T03:30:00Z',
+      payload: { turn_id: a.turnId, model: 'gpt-6.1-sol', current_date: '2026-10-28' },
+    },
+  ];
+  const lines = rows.map((row) => JSON.stringify(row));
+  const expected = indexed(lines, createCodexUsageLineReducer);
+  const check = (record: SpendFileIndex) => {
+    assert.equal(record.compactionCount, 1);
+    assert.equal(facts(record).counts['30m'], 1);
+    const returned = facts(record).returns.find((item) => item.requestKey === 'codex-response:surviving-response');
+    assert.ok(returned);
+    assert.equal(returned.previousInputSide, 360_000);
+    assert.equal(returned.gapMs, Date.parse(b.records[10].timestamp) - 1 - Date.parse(a.records[5].timestamp));
+    assert.equal(
+      record.cacheExpiry!.compactionReturns!.find((item) => item.requestKey === returned.requestKey)!.ordinal,
+      1,
+    );
+  };
+  check(expected);
+  const bounded = indexed(lines.slice(0, -1), createCodexUsageLineReducer);
+  bounded.cacheExpiry!.compactionReturns = bounded.cacheExpiry!.compactionReturns!.filter((held) => held.ordinal !== 1);
+  fs.appendFileSync(bounded.file, lines.at(-1)! + '\n');
+  fs.utimesSync(bounded.file, BASE / 1000 + 2, BASE / 1000 + 2);
+  const uncertain = indexSpendFile(
+    bounded,
+    bounded.file,
+    'w',
+    createCodexUsageLineReducer,
+    BASE + 2,
+    stillClock,
+  ).record;
+  assert.equal(facts(uncertain).counts['30m'], 0);
+  assert.equal(facts(uncertain).unavailable, 1, 'missing ownership history cannot establish the ordinary predecessor');
+  for (let seam = 1; seam < lines.length; seam++) {
+    const folder = dir();
+    const file = path.join(folder, 'source.jsonl');
+    fs.writeFileSync(file, lines.slice(0, seam).join('\n') + '\n');
+    fs.utimesSync(file, BASE / 1000, BASE / 1000);
+    const first = indexSpendFile(undefined, file, 'w', createCodexUsageLineReducer, BASE, stillClock).record;
+    saveSpendLedger(folder, 'w', [first]);
+    const restored = loadSpendLedger(folder, 'w').files[0];
+    assert.ok(restored, `saved seam ${seam}`);
+    fs.appendFileSync(file, lines.slice(seam).join('\n') + '\n');
+    fs.utimesSync(file, BASE / 1000 + 1, BASE / 1000 + 1);
+    const resumed = indexSpendFile(restored, file, 'w', createCodexUsageLineReducer, BASE + 1, stillClock).record;
+    check(resumed);
+    assert.deepEqual(resumed.cacheExpiry, expected.cacheExpiry, `seam ${seam}`);
+    assert.deepEqual(resumed.lifetimeBuckets, expected.lifetimeBuckets, `bills ${seam}`);
+  }
+});
+
+test('a resolved dedicated compaction with unknown lifetime qualifies the existing session count', () => {
+  const known = codexLeadingCompactionRecords();
+  const unknown = codexLeadingCompactionRecords({ prompt: false });
+  const rows = unknown.records
+    .slice(1)
+    .map((row) =>
+      JSON.parse(
+        JSON.stringify(row)
+          .replaceAll('gpt-6.1-sol', 'unknown-timing-model')
+          .replaceAll(unknown.turnId, 'unknown-turn')
+          .replaceAll(unknown.responseId, 'unknown-response')
+          .replaceAll('previous', 'unknown-previous'),
+      ),
+    );
+  const shift = Date.parse(known.records.at(-1)!.timestamp) - Date.parse(rows[0].timestamp) + 1_000;
+  for (const row of rows) row.timestamp = new Date(Date.parse(row.timestamp) + shift).toISOString();
+  const record = indexed(
+    [...known.records, ...rows].map((row) => JSON.stringify(row)),
+    createCodexUsageLineReducer,
+  );
+  assert.equal(facts(record).counts['30m'], 1);
+  assert.equal(facts(record).unavailable, 1);
+  const parts = record.lifetimeBuckets!.map((bucket) => sessionCostUsageOf({ bucket, role: 'main' }));
+  const projection = sessionCostProjection(parts, false, {
+    compactionCount: record.compactionCount!,
+    expiry: facts(record),
+  });
+  assert.deepEqual(cacheExpiryReturnCount(facts(record)), { count: 1, atLeast: true });
+  assert.ok(projection.stats[0].detailList);
+});
+
+test('removing a middle copied compaction keeps surrounding boundaries and accepts an ordinal reused by a new bill', () => {
+  const first = codexLeadingCompactionRecords({ gapMinutes: 10, prompt: false });
+  const rows = [...first.records];
+  for (const [id, minutes] of [
+    ['middle', 20],
+    ['last', 364],
+  ] as const) {
+    const next = codexLeadingCompactionRecords({ gapMinutes: minutes, prompt: false });
+    rows.push(
+      ...next.records.slice(8).map((row) =>
+        JSON.parse(
+          JSON.stringify(row)
+            .replaceAll(next.turnId, id)
+            .replaceAll(next.responseId, id + '-response'),
+        ),
+      ),
+    );
+  }
+  rows.push({
+    type: 'turn_context',
+    timestamp: '2026-10-30T03:30:00Z',
+    payload: { turn_id: 'middle', model: 'gpt-6.1-sol', current_date: '2026-10-28' },
+  });
+  const final = codexLeadingCompactionRecords({ gapMinutes: 400, prompt: false });
+  rows.push(
+    ...final.records
+      .slice(8)
+      .map((row) =>
+        JSON.parse(JSON.stringify(row).replaceAll(final.turnId, 'new').replaceAll(final.responseId, 'new-response')),
+      ),
+  );
+  const record = indexed(
+    rows.map((row) => JSON.stringify(row)),
+    createCodexUsageLineReducer,
+  );
+  assert.equal(record.compactionCount, 3);
+  assert.equal(facts(record).counts['30m'], 2);
+  assert.deepEqual(
+    record.cacheExpiry!.compactionReturns!.map((held) => [held.requestKey, held.ordinal]),
+    [
+      ['codex-response:leading-compaction-response', 1],
+      ['codex-response:last-response', 2],
+      ['codex-response:new-response', 3],
+    ],
+  );
+  const last = facts(record).returns.find((item) => item.requestKey === 'codex-response:last-response')!;
+  assert.equal(last.previousInputSide, null);
+  assert.equal(
+    last.gapMs,
+    Date.parse(
+      rows.find((row) => row.type === 'compacted' && row.payload.compaction_response_id === 'last-response')!.timestamp,
+    ) - first.compactAt,
+  );
 });

@@ -1,3 +1,4 @@
+import { codexLeadingCompactionRecords } from './turnfixtures';
 import { syncBuiltinESMExports } from 'node:module';
 import { describe, test, vi } from 'vitest';
 import { IntegrityScheduler } from './scheduler';
@@ -7296,3 +7297,67 @@ for (const childTranscript of [false, true])
       `$${dollars.toFixed(2)}`,
     );
   });
+
+test('persisted compaction associations reject duplicate identities and unsupported categories', () => {
+  const folder = dir();
+  const file = path.join(folder, 'source.jsonl');
+  fs.writeFileSync(
+    file,
+    codexLeadingCompactionRecords()
+      .records.map((row) => JSON.stringify(row))
+      .join('\n') + '\n',
+  );
+  const record = indexSpendFile(undefined, file, 'one', createCodexUsageLineReducer).record;
+  saveSpendLedger(folder, 'one', [record]);
+  const target = path.join(folder, ledgerName(folder));
+  const saved = JSON.parse(ledgerText(folder));
+  const check = (name: string, change: (expiry: any, record: any) => void, accepted = false) => {
+    const copy = structuredClone(saved);
+    change(copy.files[0].cacheExpiry, copy.files[0]);
+    fs.writeFileSync(target, JSON.stringify(copy));
+    assert.equal(loadSpendLedger(folder, 'one').files.length, accepted ? 1 : 0, name);
+  };
+  check('duplicate key', (expiry, record) => {
+    const held = structuredClone(expiry.compactionReturns[0]);
+    held.ordinal = 2;
+    held.next.compactionsBefore = 1;
+    expiry.compactionReturns.push(held);
+    expiry.facts.counts['30m'] = 2;
+    expiry.facts.truncated = true;
+    record.compactionCount = 2;
+  });
+  check('duplicate ordinal', (expiry) => {
+    const held = structuredClone(expiry.compactionReturns[0]);
+    held.requestKey = 'other';
+    held.next.requestKey = 'other';
+    expiry.compactionReturns.push(held);
+    expiry.facts.counts['30m'] = 2;
+    expiry.facts.truncated = true;
+  });
+  check('zero support', (expiry) => {
+    expiry.facts.counts['30m'] = 0;
+    expiry.facts.returns = [];
+    expiry.facts.truncated = true;
+  });
+  check('wrong tier', (expiry) => {
+    expiry.compactionReturns[0].verdict.lifetime = '5m';
+    expiry.facts.returns = [];
+    expiry.facts.truncated = true;
+  });
+  check('contradictory detail', (expiry) => {
+    expiry.facts.returns[0].gapMs++;
+  });
+  check('duplicate detail', (expiry) => {
+    expiry.facts.returns.push(structuredClone(expiry.facts.returns[0]));
+    expiry.facts.counts['30m']++;
+  });
+  check(
+    'valid historical totals',
+    (expiry) => {
+      expiry.facts.truncated = true;
+      expiry.facts.returns = [];
+      expiry.facts.counts['30m'] += 40;
+    },
+    true,
+  );
+});

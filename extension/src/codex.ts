@@ -23,6 +23,7 @@ import {
   CacheLifetime,
   Compaction,
   CompactionSignal,
+  CompactionRetraction,
   PatchHunk,
   ReadOptions,
   ReducerCompaction,
@@ -1882,11 +1883,27 @@ function discardPendingCodexRequests(state: CodexUsageReducerState, turnId: stri
   delete state.pendingOwnership[turnId];
 }
 
-function retractCodexUsageCompactions(state: CodexUsageReducerState, ordinals: readonly number[]): void {
+const codexCompactionRetractions = new WeakMap<CodexUsageReducerState, CompactionRetraction[]>();
+
+function retractCodexUsageCompactions(
+  state: CodexUsageReducerState,
+  ordinals: readonly number[],
+  turnId: string,
+): void {
   const retracted = new Set(ordinals);
   if (!retracted.size) {
     return;
   }
+  codexCompactionRetractions.get(state)?.push({
+    previousCount: state.compactionCount,
+    count: state.compactionCount - retracted.size,
+    turnId,
+    removed: ordinals.map((ordinal) => ({
+      ordinal,
+      responseId: state.recentCompactions.find((item) => item.ordinal === ordinal)?.responseId ?? null,
+    })),
+    compactions: state.recentCompactions.map((item) => ({ ...item })),
+  });
   const earlierRetracted = (ordinal: number) => [...retracted].filter((item) => item < ordinal).length;
   state.compactionCount = Math.max(0, state.compactionCount - retracted.size);
   state.recentCompactions = state.recentCompactions
@@ -1921,7 +1938,7 @@ function applyCodexTurnDate(state: CodexUsageReducerState, payload: Record<strin
   state.datedCopiedTurnIds[turnId] = true;
   const compactionOrdinals = state.compactionTurnOrdinals[turnId] ?? [];
   if (compactionOrdinals.length) {
-    retractCodexUsageCompactions(state, compactionOrdinals);
+    retractCodexUsageCompactions(state, compactionOrdinals, turnId);
   }
   if (turnId === state.currentTurnId) {
     state.currentTurnCopied = true;
@@ -2925,6 +2942,7 @@ export interface CodexUsageLineReducer {
   // Compactions recorded since the last call, oldest first. Recorded compaction usage stays
   // outside request adjacency, so the cache-expiry scan reads its boundaries here.
   takeCompactionSignals(): CompactionSignal[];
+  takeCompactionRetractions(): CompactionRetraction[];
   firstTurnAt(): number | null;
   lastTurnAt(): number | null;
   newestTurnStartedAt(): number | null;
@@ -3003,10 +3021,13 @@ export function createCodexUsageLineReducer(restored?: CodexUsageReducerState): 
   state.currentTurnOutcome ??= null;
   state.lastTurnOutcome ??= null;
   const signals: CompactionSignal[] = [];
+  const retractions: CompactionRetraction[] = [];
+  codexCompactionRetractions.set(state, retractions);
   return {
     parserKind: 'codex',
     nativeChildRequests: () => state.nativeCacheChild === true,
     pushLine: (line) => {
+      retractions.length = 0;
       const compactionsBefore = state.compactionCount;
       const events = reduceCodexUsageLineEvents(state, line);
       // Compaction facts are the reducer's own, so a signal reads the retained entry it added.
@@ -3040,6 +3061,7 @@ export function createCodexUsageLineReducer(restored?: CodexUsageReducerState): 
     compactionCount: () => state.compactionCount,
     recentCompactions: () => state.recentCompactions.map((item) => ({ ...item })),
     takeCompactionSignals: () => signals.splice(0),
+    takeCompactionRetractions: () => retractions.splice(0),
     firstTurnAt: () =>
       state.firstTurnAt !== null
         ? state.firstTurnAt

@@ -43,6 +43,7 @@ import { parseSpendLedger, projectUsageKey } from './projectspendstate';
 import type {
   CacheLifetime,
   CompactionSignal,
+  CompactionRetraction,
   ReducerCompaction,
   TurnOutcome,
   TurnUsage,
@@ -522,7 +523,7 @@ export function projectSpendSaveRetryDelay(retries: number): number | null {
 // Saved source records require a rebuild when the parser generation of their agent differs.
 // Increase an agent's generation when a stored field of its records changes the conclusions consumers draw from it.
 // Increase both generations for a change that alters both agents' records.
-export const PROJECT_SPEND_PARSER_GENERATIONS: Readonly<Record<'claude' | 'codex', number>> = { claude: 66, codex: 67 };
+export const PROJECT_SPEND_PARSER_GENERATIONS: Readonly<Record<'claude' | 'codex', number>> = { claude: 66, codex: 68 };
 
 // Earlier shared generations whose records of one agent match that agent's generation.
 // Shared generation 66 changed only Codex pricing, so Claude records of generation 65 match Claude generation 66.
@@ -608,6 +609,7 @@ export interface UsageLineReducer<State = unknown> {
   // Compactions recorded by the lines pushed since the last call, oldest first. A reducer whose
   // compactions arrive on its usage events instead leaves this out.
   takeCompactionSignals?(): readonly CompactionSignal[];
+  takeCompactionRetractions?(): readonly CompactionRetraction[];
   firstTurnAt?(): number | null;
   lastTurnAt?(): number | null;
   newestTurnStartedAt?(): number | null;
@@ -1164,6 +1166,8 @@ export interface CacheExpiryCompactionReturn {
   ordinal: number;
   previous: CacheExpiryCarry;
   verdict: CacheExpiryVerdict;
+  next: CacheExpiryCarry | null;
+  request: ProjectUsageBucket | null;
 }
 
 export function emptyCacheExpiryFacts(): CacheExpiryFacts {
@@ -1463,22 +1467,41 @@ export class CacheExpiryScan {
         ordinal: event.compactionsBefore ?? 0,
         previous: structuredClone(this.carry),
         verdict: { kind: 'none' },
+        next: null,
+        request: null,
       };
       this.compactionReturns.push(held);
       this.trimCompactionReturns();
     }
     if (!held) return;
     this.removeCompactionReturn(held);
+    held.next = null;
+    held.request = null;
     if ((event.usage.requests ?? 1) <= 0) return;
     const next = carryFor(event);
     next.compactionsBefore = held.ordinal - 1;
-    // A verified native identity survives without a visible prompt. Ordinary requests retain their prompt requirement.
-    const verdict = classifyCacheExpiry(held.previous, next, event.usage, this.nativeChild());
-    held.verdict = verdict;
-    if (verdict.kind === 'return') this.judge(held.previous, next, event);
     // Later requests in this native turn cannot create a second primary return.
     if (this.carry && this.carry.timestamp <= event.timestamp && next.visibleTurnId !== null)
       this.carry.visibleTurnId = next.visibleTurnId;
+    // An unresolved bill does not establish another eligible comparison.
+    if (event.incomplete) return;
+    held.next = next;
+    held.request = requestBucket(event);
+    this.judgeCompaction(held);
+  }
+
+  private judgeCompaction(held: CacheExpiryCompactionReturn): void {
+    if (!held.next || !held.request) return;
+    held.verdict = classifyCacheExpiry(held.previous, held.next, held.request.usage, this.nativeChild());
+    this.judge(held.previous, held.next, {
+      ...held.request,
+      agent: 'codex',
+      usageOrigin: undefined,
+      timestamp: held.next.timestamp,
+      requestKey: held.requestKey,
+      visibleTurnId: held.next.visibleTurnId,
+      compactionUsage: true,
+    });
   }
 
   private trimCompactionReturns(): void {
@@ -1495,6 +1518,8 @@ export class CacheExpiryScan {
       const index = this.facts.returns.findIndex((item) => item.requestKey === held.requestKey);
       if (index >= 0) this.facts.returns.splice(index, 1);
     }
+    if (held.verdict.kind === 'unavailable') this.facts.unavailable--;
+    if (held.verdict.kind === 'excluded') this.facts.excluded--;
     held.verdict = { kind: 'none' };
     const gaps = this.compactionReturns.flatMap((item) => (item.verdict.kind === 'return' ? [item.verdict.gapMs] : []));
     this.facts.longestGapMs =
@@ -1527,10 +1552,59 @@ export class CacheExpiryScan {
         ordinal: signal.ordinal,
         previous: structuredClone(carry),
         verdict: { kind: 'none' },
+        next: null,
+        request: null,
       });
       this.trimCompactionReturns();
     }
     carry.compaction = { ordinal: signal.ordinal, at: signal.at, prefixTokens: signal.prefixTokens };
+  }
+
+  // Correct bounded associations before a smaller total can look like suffix removal.
+  retractCompactions(change: CompactionRetraction): void {
+    const removed = new Set(change.removed.map((item) => item.ordinal));
+    const shift = (ordinal: number) => ordinal - change.removed.filter((item) => item.ordinal <= ordinal).length;
+    const revoked = this.compactionReturns.filter((item) => removed.has(item.ordinal));
+    const reconcile = (carry: CacheExpiryCarry) => {
+      const base = carry.compactionsBefore;
+      for (const held of revoked) {
+        if (carry.visibleTurnId === held.next?.visibleTurnId) {
+          if (carry.requestKey === held.previous.requestKey) carry.visibleTurnId = held.previous.visibleTurnId;
+          else carry.incomplete = true;
+        }
+      }
+      if (carry.visibleTurnId === `codex-turn:${change.turnId}`) carry.incomplete = true;
+      if (carry.compaction) {
+        let ordinal = carry.compaction.ordinal;
+        if (removed.has(ordinal)) {
+          while (removed.has(ordinal)) ordinal--;
+          if (ordinal <= base) delete carry.compaction;
+          else {
+            const boundary = change.compactions.find((item) => item.ordinal === ordinal);
+            carry.compaction = { ordinal, at: boundary?.at ?? null, prefixTokens: null };
+          }
+        }
+        if (carry.compaction) carry.compaction.ordinal = shift(carry.compaction.ordinal);
+      }
+      carry.compactionsBefore = shift(base);
+    };
+    for (const held of this.compactionReturns) this.removeCompactionReturn(held);
+    for (let index = this.compactionReturns.length - 1; index >= 0; index--) {
+      const held = this.compactionReturns[index];
+      if (removed.has(held.ordinal)) this.compactionReturns.splice(index, 1);
+      else {
+        held.ordinal = shift(held.ordinal);
+        reconcile(held.previous);
+        if (held.next) held.next.compactionsBefore = held.ordinal - 1;
+      }
+    }
+    if (this.carry) reconcile(this.carry);
+    for (let index = this.compactions.length - 1; index >= 0; index--) {
+      const fact = this.compactions[index];
+      if (removed.has(fact.ordinal)) this.compactions.splice(index, 1);
+      else fact.ordinal = shift(fact.ordinal);
+    }
+    for (const held of this.compactionReturns) this.judgeCompaction(held);
   }
 
   // The reducer's compaction count after a line. A record that revokes a compaction lowers the
@@ -2071,7 +2145,9 @@ function readIncremental(
         }
         classified = true;
         if (!repeat) {
-          for (const event of reducer.pushLine(text, end)) {
+          const events = reducer.pushLine(text, end);
+          for (const correction of reducer.takeCompactionRetractions?.() ?? []) ordered?.retractCompactions(correction);
+          for (const event of events) {
             add(event);
           }
           signal();
