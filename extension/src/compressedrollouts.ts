@@ -428,7 +428,8 @@ function bodyRange(body: CompressedBody, start: number, length: number): Buffer 
 // read answers null once the file no longer matches the file that the body decoded.
 export interface CompressedByteSource {
   body: CompressedBody;
-  // `dev`, `ino` and `mtimeMs` from `fstat` of the `.jsonl.zst`, and `size` equal to the decoded length.
+  // `dev`, `ino` and `mtimeMs` from `fstat` of the `.jsonl.zst`, and `size` equal to the held body length. The held
+  // length equals the decoded length when no record is reduced or skipped.
   revision(file: string): FileRevision | null;
   readRange: BackwardRangeReader;
   // The first record of the body without its line break, or null when no line ends within 1 MiB.
