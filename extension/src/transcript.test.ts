@@ -18017,3 +18017,9 @@ test('explicit browser destinations distinguish web authority from local HTML an
   assert.equal(linkBrowserKind({ kind: 'fileCitation', path: '/report.html#L10' }), null);
   assert.equal(linkBrowserKind({ kind: 'fileCitation', path: '/report%20.HTML' }), 'html');
 });
+
+test('tailOf reads a compressed rollout as an unreadable file', () => {
+  const file = path.join(tempDir('tail-compressed-'), 'rollout-a.jsonl.zst');
+  fs.writeFileSync(file, '{"type":"session_meta"}\n{"type":"event_msg"}\n');
+  assert.deepEqual(tailOf(file, 1024, true), { lines: [], whole: false, readBytes: 0 });
+});

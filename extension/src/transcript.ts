@@ -1,5 +1,6 @@
 import { toolKind } from './domain/tool-kinds';
 import { revisionOf } from './filerevision';
+import { isCompressedRollout } from './compressedrollouts';
 import { turnKey } from './domain/read';
 export { revisionOf } from './filerevision';
 import type { SourceEnumeration } from './sessioncoverage';
@@ -5468,6 +5469,8 @@ function sameFileRevision(snapshot: fs.Stats | fs.BigIntStats, revision: FileRev
 }
 
 export function tailOf(file: string, bytes: number, keepCursor = false): TailRead {
+  // A compressed rollout has no plain lines to tail, so it reads as an unreadable file.
+  if (isCompressedRollout(file)) return { lines: [], whole: false, readBytes: 0 };
   let fd = -1;
   try {
     fd = fs.openSync(file, 'r');
