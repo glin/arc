@@ -744,9 +744,9 @@ export class ProgressiveWorker {
     this.worker?.postMessage({ metadataEligible: sessionIds });
   }
 
-  // Drop the decoded body of a compressed rollout that the worker holds.
-  releaseCompressedBody(): void {
-    this.worker?.postMessage({ releaseBody: true });
+  // Drop the decoded body of the compressed rollout `file`. The worker ignores a release of a body that it does not hold.
+  releaseCompressedBody(file: string): void {
+    this.worker?.postMessage({ releaseBody: file });
   }
 
   run(

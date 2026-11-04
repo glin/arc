@@ -15432,8 +15432,9 @@ export class PanelProvider implements vscode.Disposable {
       )
     )
       return;
+    const file = this.compressedBodyFile;
     this.compressedBodyFile = null;
-    this.progressiveWorker.releaseCompressedBody();
+    this.progressiveWorker.releaseCompressedBody(file);
   }
 
   // A compressed checkpoint passes only for an equal physical revision.

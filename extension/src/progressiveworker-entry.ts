@@ -339,14 +339,25 @@ let bodyDecode: BodyDecode | null = null;
 let bodyPath: string | null = null;
 let bodyUsers = 0;
 let bodyDrained: Array<() => void> = [];
-// The host's body releases, and the body that each window or page request read with the release count at its read, by
-// the signal of the request. A window whose body the host released during its read answers stale.
+// The host's body releases, and the body that each window or page request read with the release count before it
+// opened that body, by the signal of the request. A window whose body the host released during its open or read
+// answers stale with `interrupted`.
 let bodyReleases = 0;
 const requestBodies = new WeakMap<AbortSignal, { body: CompressedBody; releases: number }>();
 
 function releaseCompressedBody(): void {
   heldBody = null;
   bodyDecode?.controller.abort();
+}
+
+// The host releases the body of `file`. A release of another path changes nothing. The released path leaves
+// `bodyPath`, so a later request for it waits until the reads of the released body end and never decodes a second body
+// beside it.
+function releaseHostBody(file: string): void {
+  if (bodyPath !== file) return;
+  bodyReleases += 1;
+  bodyPath = null;
+  releaseCompressedBody();
 }
 
 // Enter the compressed path of a window or page request. A request for another path, or any request while one waits,
@@ -411,6 +422,8 @@ async function openCompressedBody(
       if (!verify) return { kind: 'body', body };
       const hashed = await hashCompressedRollout(file, signal);
       if (signal.aborted) return { kind: 'cancelled' };
+      // A release during the hash dropped the body, so the request answers like a stopped decode.
+      if (heldBody !== body) return { kind: 'cancelled' };
       if (hashed && hashed.hash === body.hash && sameRevision(hashed.stat, body.stat)) return { kind: 'body', body };
     }
     if (heldBody === body) heldBody = null;
@@ -1445,9 +1458,10 @@ async function execute(
   const openCompressed = async (verify: boolean) => {
     if (!compressedFile) return null;
     if (session.agent !== 'codex') return { kind: 'stale' as const };
+    const releases = bodyReleases;
     const opened = await openCompressedBody(session.file, verify, signal, request.input.compressedLimits);
     if (opened.kind !== 'body') return opened;
-    requestBodies.set(signal, { body: opened.body, releases: bodyReleases });
+    requestBodies.set(signal, { body: opened.body, releases });
     const source = compressedByteSource(opened.body);
     const opening = openingRecordOf(source.opening());
     return { kind: 'source' as const, source, opening };
@@ -2376,7 +2390,8 @@ async function handleMessage(message: {
     // A compressed window compares its checkpoint with `before` at the held length of the body that it read from
     // `before`.
     const requestBody = requestBodies.get(controller.signal);
-    const body = requestBody?.releases === bodyReleases ? requestBody.body : undefined;
+    const released = requestBody !== undefined && requestBody.releases !== bodyReleases;
+    const body = released ? undefined : requestBody?.body;
     const windowRevision = !isCompressedRollout(file)
       ? before
       : body?.file === file && sameRevision(body.stat, before)
@@ -2397,7 +2412,12 @@ async function handleMessage(message: {
                 agentRunScan: kept,
                 recoveryBytes: 'recoveryBytes' in value ? value.recoveryBytes : undefined,
               }
-            : { kind: 'stale', recoveryBytes: 'recoveryBytes' in value ? value.recoveryBytes : undefined },
+            : {
+                kind: 'stale',
+                recoveryBytes: 'recoveryBytes' in value ? value.recoveryBytes : undefined,
+                // A window whose own body the host released reads again like a stopped decode.
+                ...(released && value.kind === 'window' ? { interrupted: true as const } : {}),
+              },
     };
     if (!controller.signal.aborted) {
       if (request.kind === 'metadata-recovery' && result.value.kind === 'stale') metadataRecovery = null;
@@ -2479,15 +2499,14 @@ parentPort?.on(
     metadataEligible?: string[];
     dispatchSpendEntries?: Array<[string, CodexDispatchSpendEntry]>;
     repeated?: { file: string; map: ClaudeRepeatedHeldMap };
-    releaseBody?: true;
+    releaseBody?: string;
   }) => {
     if (message.dispatchSpendEntries) {
       for (const [file, entry] of message.dispatchSpendEntries) retainCodexDispatchSpend(file, entry);
       return;
     }
     if (message.releaseBody) {
-      bodyReleases += 1;
-      releaseCompressedBody();
+      releaseHostBody(message.releaseBody);
       return;
     }
     if (message.repeated) adoptClaudeRepeatedMap(message.repeated.file, message.repeated.map);
