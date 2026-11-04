@@ -3648,56 +3648,60 @@ test('a selected window whose decode another request stopped reads again', async
   await vi.waitFor(() => assert.ok(stopped.cache.has(stopped.session.file), 'a new selection did not read again'));
 });
 
-test('a selected window that another decode stops twice draws the read failure and reads no more', async () => {
-  const fixture = selectedSourceFixture('codex');
-  const provider = completeDiscoveryHarness(undefined, true, ['stateFor'], {
-    projectsRoot: () => fixture.projects,
-    codexSessionsRoot: () => fixture.codex,
+// The worker answers a stopped decode, and a window whose body the host released during its read, with a retry.
+for (const [cause, stale] of [
+  ['that another decode stops', { kind: 'stale', interrupted: true }],
+  ['whose body the host releases', { kind: 'stale', recoveryBytes: 64, interrupted: true }],
+] as const) {
+  test(`a selected window ${cause} twice draws the read failure and reads no more`, async () => {
+    const fixture = selectedSourceFixture('codex');
+    const provider = completeDiscoveryHarness(undefined, true, ['stateFor'], {
+      projectsRoot: () => fixture.projects,
+      codexSessionsRoot: () => fixture.codex,
+    });
+    provider.folders = () => [fixture.workspace];
+    provider.repositoryScopeRoots = [fixture.workspace, fixture.worktree];
+    provider.repositoryScope = { snapshot: () => ({ ready: true, roots: provider.repositoryScopeRoots, revision: 1 }) };
+    provider._showing = fixture.sessionId;
+    provider.hostSessions = new Map([[provider.hosts[0], fixture.sessionId]]);
+    provider.revisionOf = (source: any) => {
+      const stat = fs.statSync(source.file);
+      return { size: stat.size, mtimeMs: stat.mtimeMs, dev: stat.dev, ino: stat.ino };
+    };
+    provider.progressiveCurrent = (source: any) => Boolean(provider.cache.get(source.file));
+    let requests = 0;
+    provider.progressiveWorker = {
+      run: async (request: ProgressiveRequest, generation: number) => {
+        if (request.kind !== 'window') return null;
+        requests++;
+        const revision = provider.revisionOf({ file: fixture.file });
+        // A reread that never ends draws a window after the fourth request, so the count fails instead of the heap.
+        return requests > 3 ? windowResult(generation, revision) : { generation, revision, value: stale };
+      },
+      releaseCompressedBody() {},
+    };
+    provider.partial = [
+      {
+        file: fixture.file,
+        sessionId: fixture.sessionId,
+        agent: 'codex',
+        cwd: fixture.worktree,
+        activity: 1,
+        ...provider.revisionOf({ file: fixture.file }),
+      },
+    ];
+    provider.catalog = { sessions: provider.partial };
+    provider.discovery = Promise.resolve(true);
+    const failure = 'Could not read this session. Select it to try again.';
+    const drawn = () => JSON.stringify(provider.messages).includes(failure);
+    await provider.refresh(true);
+    await vi.waitFor(() => assert.ok(drawn(), 'the stopped window did not draw the read failure'));
+    assert.equal(requests, 2, 'a stopped window read again more than once');
+    await provider.refresh(true);
+    assert.equal(requests, 2, 'a refresh read the failed window again');
+    assert.equal(provider.cache.has(fixture.file), false);
   });
-  provider.folders = () => [fixture.workspace];
-  provider.repositoryScopeRoots = [fixture.workspace, fixture.worktree];
-  provider.repositoryScope = { snapshot: () => ({ ready: true, roots: provider.repositoryScopeRoots, revision: 1 }) };
-  provider._showing = fixture.sessionId;
-  provider.hostSessions = new Map([[provider.hosts[0], fixture.sessionId]]);
-  provider.revisionOf = (source: any) => {
-    const stat = fs.statSync(source.file);
-    return { size: stat.size, mtimeMs: stat.mtimeMs, dev: stat.dev, ino: stat.ino };
-  };
-  provider.progressiveCurrent = (source: any) => Boolean(provider.cache.get(source.file));
-  let requests = 0;
-  provider.progressiveWorker = {
-    run: async (request: ProgressiveRequest, generation: number) => {
-      if (request.kind !== 'window') return null;
-      requests++;
-      const revision = provider.revisionOf({ file: fixture.file });
-      // A reread that never ends draws a window after the fourth request, so the count fails instead of the heap.
-      return requests > 3
-        ? windowResult(generation, revision)
-        : { generation, revision, value: { kind: 'stale', interrupted: true } };
-    },
-    releaseCompressedBody() {},
-  };
-  provider.partial = [
-    {
-      file: fixture.file,
-      sessionId: fixture.sessionId,
-      agent: 'codex',
-      cwd: fixture.worktree,
-      activity: 1,
-      ...provider.revisionOf({ file: fixture.file }),
-    },
-  ];
-  provider.catalog = { sessions: provider.partial };
-  provider.discovery = Promise.resolve(true);
-  const failure = 'Could not read this session. Select it to try again.';
-  const drawn = () => JSON.stringify(provider.messages).includes(failure);
-  await provider.refresh(true);
-  await vi.waitFor(() => assert.ok(drawn(), 'the stopped window did not draw the read failure'));
-  assert.equal(requests, 2, 'a stopped window read again more than once');
-  await provider.refresh(true);
-  assert.equal(requests, 2, 'a refresh read the failed window again');
-  assert.equal(provider.cache.has(fixture.file), false);
-});
+}
 
 test('two panels on two compressed sessions draw one window and one read failure', async () => {
   const first = { file: 'first.jsonl.zst', sessionId: 'first', agent: 'codex', size: 10, mtimeMs: 10, dev: 1, ino: 3 };
