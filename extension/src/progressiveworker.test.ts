@@ -13535,7 +13535,10 @@ function decoderWorker(directory: string, gated: number[], holdRead = false, hol
         if (hashHeld || !nodeFs.existsSync(${JSON.stringify(armFile)})) return openFile.apply(promises, args);
         hashHeld = true;
         nodeFs.writeFileSync(${JSON.stringify(heldFile)}, '');
-        while (!nodeFs.existsSync(${JSON.stringify(gate)})) await new Promise((resolve) => setTimeout(resolve, 5));
+        await new Promise((resolve) => {
+          const go = () => (nodeFs.existsSync(${JSON.stringify(gate)}) ? resolve(undefined) : setTimeout(go, 5));
+          go();
+        });
         return openFile.apply(promises, args);
       } });
     }
