@@ -159,9 +159,9 @@ interface Outcome {
   note: string | null;
 }
 
-function stop(message: string): never {
+function stop(message: string, code = 1): never {
   process.stderr.write(`${message}\n`);
-  process.exit(1);
+  process.exit(code);
 }
 
 export function readOptions(argv: string[]): Options {
@@ -253,6 +253,15 @@ function editorCommandLine(): string {
     }
   }
   return stop('No VS Code install found. Name its directory in ARC_MEASURE_EDITOR.');
+}
+
+// The launcher sits in the bin directory of the install directory on Windows, where the staged update marker lives.
+export async function stagedUpdateRefusal(
+  commandLine: string,
+  platform: NodeJS.Platform = process.platform,
+): Promise<string | null> {
+  const { stagedUpdate } = await import('../../../scripts/isolated-editor.mjs');
+  return stagedUpdate(path.dirname(path.dirname(commandLine)), { platform });
 }
 
 function commandLineIn(root: string): string {
@@ -1743,6 +1752,8 @@ async function main(): Promise<void> {
   const disk = diskPreCheck(freeDiskBytes(SCRATCH), scratchPeakBytes(fixture.codex, SCRATCH));
   if (disk) stop(disk);
   const commandLine = editorCommandLine();
+  const staged = await stagedUpdateRefusal(commandLine);
+  if (staged) stop(staged, 2);
   for (const directory of [SCRATCH, USER_DATA, EXTENSIONS, ARC_STORE]) {
     fs.mkdirSync(directory, { recursive: true });
   }

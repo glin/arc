@@ -262,6 +262,17 @@ describe('isolated editor environment', () => {
       /--editor <install directory> or set ARC_MEASURE_EDITOR/,
     );
   });
+
+  test('a staged Windows update refuses the launch on Windows only', () => {
+    const install = scratch();
+    fs.writeFileSync(path.join(install, 'Code.exe'), '');
+    fs.writeFileSync(path.join(install, 'code'), '');
+    assert.equal(editor.launchRefusal({ editor: install, platform: 'win32' }), null);
+    fs.writeFileSync(path.join(install, 'updating_version'), '');
+    assert.equal(editor.launchRefusal({ editor: install, platform: 'win32' }), editor.STAGED_UPDATE_MESSAGE);
+    for (const platform of ['darwin', 'linux']) assert.equal(editor.launchRefusal({ editor: install, platform }), null);
+    assert.equal(editor.launchRefusal({ editor: path.join(install, 'missing'), platform: 'win32' }), null);
+  });
 });
 
 describe('installed editor CLI', () => {

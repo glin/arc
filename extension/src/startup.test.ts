@@ -322,6 +322,7 @@ import {
   WARM_UNTIL_CAP_MS,
   WARM_UNTIL_INTERVAL_MS,
   diskPreCheck,
+  stagedUpdateRefusal,
   scratchPeakBytes,
   freeDiskBytes,
   SCRATCH_PEAK_BYTES,
@@ -357,6 +358,9 @@ import {
   soakMeasures,
   startDispatch,
 } from '../scripts/panel-startup-measure/soak';
+
+const STAGED_UPDATE_MESSAGE =
+  'VS Code holds a staged update. Restart VS Code with every window closed, then run again.';
 // The shared metadata version of a format 0 or format 1 file whose rows match both current agent generations.
 const VERSION = METADATA_GENERATIONS.claude;
 
@@ -959,6 +963,10 @@ test('isolated startup pins source provenance before a moving reference builds',
     loadScrubbedVariables: async () => {},
     fixture: { workspace: 'frozen' },
     editorCommandLine: () => 'code',
+    stagedUpdateRefusal: async () => null,
+    stop: (message: string, code: number) => {
+      throw Object.assign(new Error(message), { code });
+    },
     SCRATCH: 'scratch',
     USER_DATA: 'profile',
     EXTENSIONS: 'extensions',
@@ -1003,9 +1011,19 @@ test('isolated startup pins source provenance before a moving reference builds',
     loader: 'ts',
     format: 'cjs',
   }).code;
-  const module = { exports: {} as any };
-  new Function('deps', 'module', 'exports', compiled)(deps, module, module.exports);
-  await module.exports.main();
+  const load = (values: object) => {
+    const module = { exports: {} as any };
+    new Function('deps', 'module', 'exports', compiled)(values, module, module.exports);
+    return module.exports.main as () => Promise<void>;
+  };
+  const refused = load({
+    ...deps,
+    stagedUpdateRefusal: async (commandLine: string) => (commandLine === 'code' ? STAGED_UPDATE_MESSAGE : null),
+  });
+  await assert.rejects(refused(), { message: STAGED_UPDATE_MESSAGE, code: 2 });
+  assert.deepEqual(sources, []);
+  assert.deepEqual(resolved, []);
+  await load(deps)();
   assert.notEqual(reference, original);
   assert.deepEqual(sources, [original]);
   assert.deepEqual(resolved, ['topic']);
@@ -2206,6 +2224,18 @@ test('a failed editor stop makes the run incomplete, and a process the runner ca
       'The editor stop command failed. The editor processes 3 did not exit within 30 s of the stop.',
     ],
   );
+});
+
+test('pre-check refuses a staged VS Code update on Windows only', async () => {
+  const install = tempDir('staged-update');
+  fs.mkdirSync(path.join(install, 'bin'));
+  const launcher = path.join(install, 'bin', 'code.cmd');
+  fs.writeFileSync(launcher, '');
+  assert.equal(await stagedUpdateRefusal(launcher, 'win32'), null);
+  fs.writeFileSync(path.join(install, 'updating_version'), '');
+  assert.equal(await stagedUpdateRefusal(launcher, 'win32'), STAGED_UPDATE_MESSAGE);
+  for (const platform of ['darwin', 'linux'] as const)
+    assert.equal(await stagedUpdateRefusal(launcher, platform), null);
 });
 
 test('pre-check refuses low disk', () => {

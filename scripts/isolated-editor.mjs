@@ -451,6 +451,32 @@ export function editorExecutable({
   );
 }
 
+export const STAGED_UPDATE_MESSAGE =
+  'VS Code holds a staged update. Restart VS Code with every window closed, then run again.';
+
+// Windows VS Code stages an update beside the running version and marks the install directory with updating_version.
+// While any window stays open, a new editor process exits without a window. macOS and Linux keep no such marker there.
+export function stagedUpdate(installDirectory, { platform = process.platform, exists = fs.existsSync } = {}) {
+  return platform === 'win32' && exists(path.join(installDirectory, 'updating_version')) ? STAGED_UPDATE_MESSAGE : null;
+}
+
+// The launch reports a missing install itself, so the check passes when no executable resolves.
+export function launchRefusal({
+  editor,
+  environment = process.env,
+  platform = process.platform,
+  exists = fs.existsSync,
+} = {}) {
+  if (platform !== 'win32') return null;
+  let executable;
+  try {
+    executable = editorExecutable({ editor, environment, platform, exists });
+  } catch {
+    return null;
+  }
+  return stagedUpdate(path.dirname(executable), { platform, exists });
+}
+
 export function extensionIdOf(extensionPath) {
   const manifest = JSON.parse(fs.readFileSync(path.join(extensionPath, 'package.json'), 'utf8'));
   return `${manifest.publisher}.${manifest.name}`;
@@ -1710,6 +1736,8 @@ export async function cleanupCommand(
 
 export async function main(argv) {
   const options = parseArguments(argv);
+  const refusal = options.command === 'cleanup' ? null : launchRefusal({ editor: options.editor });
+  if (refusal) throw new Error(refusal);
   if (options.command === 'run') return runCommand(options);
   if (options.command === 'open') return openCommand(options);
   if (options.command === 'restore') return restoreCommand(options);
