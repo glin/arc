@@ -8549,6 +8549,7 @@ function openClaudeQueuedTurn(state: ClaudeUsageReducerState, at: number): void 
     startedAt: at,
     ...(openChildren && openChildren.length > 0 ? { openChildren } : {}),
     ...(closedChildren && closedChildren.length > 0 ? { closedChildren } : {}),
+    ...(state.taskEvidence?.completions.length ? { taskCompletions: state.taskEvidence.completions } : {}),
   };
   state.firstTurnAt ??= at;
 }

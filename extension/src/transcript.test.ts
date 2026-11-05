@@ -1154,6 +1154,7 @@ import {
 } from './turnrail.ts';
 import { searchableSummary } from './turnsearch.ts';
 import { BACKGROUND_COMMAND_CAP_MS, liveBackgroundCommands, sessionRunningSince, sessionStatusOf } from './turnrail.ts';
+import { sessionReadStatus } from './sessionreads.ts';
 import { resumeCommand } from './domain/resume.ts';
 import type { ClaudeHistoryCursor } from './claudehistory.ts';
 import { readClaudeHistoryPage, readClaudeHistoryPageAsync, readClaudeSessionIncremental } from './claudehistory.ts';
@@ -12355,6 +12356,62 @@ test('a prompt queued after a Claude local command answer waits on an unanswered
   );
   assert.equal(stopped.count, stopped.turns.length, 'the header counts the turns differently after the command');
   assert.deepEqual([stopped.full, stopped.rail, stopped.index], ['stopped', 'stopped', 'stopped']);
+});
+
+test('queued prompts around a local command retain unknown completion after the quiet deadline', () => {
+  vi.useFakeTimers({ toFake: ['Date'] });
+  try {
+    vi.setSystemTime(ms(4) + TURN_QUIET_MS + 1);
+    for (const beforeAnswer of [false, true]) {
+      const [caveat, command, answer] = localCommand('/rename', 'new name', 2, 'rename-1', {
+        stdout: 'Session renamed to: new name',
+      });
+      const ask = typedMidTurn('a queued follow-up', 3);
+      const records = [
+        userPrompt('first question', 0),
+        commandNotice('missing-tool', 'missing-task', 'completed', 0.5),
+        assistantAnswer('first answer', 1),
+        { type: 'bookkeeping', padding: 'x'.repeat(8000) },
+        caveat,
+        command,
+        ...(beforeAnswer ? [ask, { ...answer, timestamp: at(4) }] : [answer, ask]),
+      ];
+      const file = writeTranscript(records);
+      fs.utimesSync(file, new Date(ms(4)), new Date(ms(4)));
+      const lifetime = createClaudeUsageLineReducer();
+      records.slice(0, -1).forEach((record) => lifetime.pushLine(JSON.stringify(record)));
+      const restored = createClaudeUsageLineReducer(JSON.parse(JSON.stringify(lifetime.snapshot())));
+      for (const reducer of [lifetime, restored]) reducer.pushLine(JSON.stringify(records.at(-1)));
+      const tail = readSessionMeta(file, 2048, 'sess').outcome;
+      assert.equal(tail, null, 'the bounded tail still reaches the turn before the command');
+      for (const [reader, outcome] of Object.entries({
+        full: sessionOutcomeOf(readSession(file, 'sess')),
+        metadata: readSessionMeta(file).outcome,
+        lifetime: lifetime.newestTurnOutcome(),
+        restored: restored.newestTurnOutcome(),
+        restoredAfterQueue: createClaudeUsageLineReducer(
+          JSON.parse(JSON.stringify(lifetime.snapshot())),
+        ).newestTurnOutcome(),
+      })) {
+        const label = `${beforeAnswer ? 'before' : 'after'} answer, ${reader}`;
+        const status = sessionReadStatus(
+          'sess',
+          outcomeWithWiderChildren(tail, outcome),
+          false,
+          false,
+          undefined,
+          undefined,
+          { unchanged: true, mtimeMs: ms(4) },
+        );
+        assert.equal(status, undefined, `${label}: lost task uncertainty reports ${status}`);
+        assert.equal(outcome?.startedAt, ms(3), label);
+        assert.equal(outcome?.taskCompletions?.[0].kind, 'unknown', label);
+        assert.equal(outcome?.taskCompletions?.[0].taskId, 'missing-task', label);
+      }
+    }
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 test('a typed prompt takes in a prompt queued after a Claude local command answer once', () => {
