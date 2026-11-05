@@ -313,6 +313,47 @@ test('receipt scan replies follow the step allowance, restart after a parent cha
   });
 });
 
+// A new worker admits each finished source from its saved cut. A hard link moves only the change time, so the source is read
+// again as a metadata rescan. An append moves its size, so it is read again as a changed source.
+test('a new worker counts transcript rescans by cause', async () => {
+  const root = tempDir('receipt-worker-rescans-');
+  const fx = receiptDispatchFixture(root, 'claude', 'codex');
+  fx.launch(fx.parent, fx.child, true, true);
+  fx.launch(fx.child, fx.grandchild, true, true);
+  let saved = new Map<string, unknown>();
+  const settle = async () => {
+    const worker = new ProgressiveWorker(`process.env.ARC_HOME=${JSON.stringify(fx.home)};` + source);
+    const { host, replies } = await receiptDiscoveryHost(worker, [root], fx.catalog);
+    const counters = new PanelPerformanceCounters(0, 'transcript-rescans');
+    host.performanceCounters = counters;
+    host.claudeChildReferenceEntries = new Map(saved);
+    try {
+      for (let request = 1; request <= 50; request++) {
+        host.refreshGeneration = request;
+        await host.prepareClaudeChildren(request, new AbortController().signal);
+        const reply = replies.last?.value;
+        if (reply?.kind !== 'claude-children' || !reply.membershipSettled) continue;
+        saved = new Map(host.claudeChildReferenceEntries);
+        const { transcriptRescans, transcriptRescansChanged, transcriptRescansMetadata } =
+          counters.snapshot().discovery;
+        return { rescans: transcriptRescans, changed: transcriptRescansChanged, metadata: transcriptRescansMetadata };
+      }
+      throw new Error('Discovery never settled');
+    } finally {
+      worker.stop();
+    }
+  };
+  const none = { rescans: 0, changed: 0, metadata: 0 };
+  assert.deepEqual(await settle(), none);
+  assert.deepEqual(await settle(), none, 'a new worker read an unchanged finished source again');
+  const link = fx.parent.file + '.link';
+  fs.linkSync(fx.parent.file, link);
+  fs.unlinkSync(link);
+  assert.deepEqual(await settle(), { rescans: 1, changed: 0, metadata: 1 });
+  fs.appendFileSync(fx.parent.file, JSON.stringify({ type: 'system', uuid: 'appended' }) + '\n');
+  assert.deepEqual(await settle(), { rescans: 1, changed: 1, metadata: 0 });
+});
+
 // Each receipt step yields to the worker's other messages, so a window read does not wait for the receipt pass.
 test('a window read sent during a receipt pass completes before the pass ends', async () => {
   const root = tempDir('receipt-worker-window-');

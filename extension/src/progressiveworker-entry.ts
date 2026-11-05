@@ -782,6 +782,17 @@ async function execute(
       return stamp;
     };
     const checkMissing = (file: string) => parentCheck(() => missingFile(file));
+    // A finished source that this epoch reads again, by why its saved cut no longer qualifies. A source whose size, time and
+    // identity match its entry moved only its change time or its saved evidence.
+    const countRescan = (
+      entry: ClaudeChildReferenceCacheEntry | undefined,
+      revision: import('./transcript').RelationshipStamp | null,
+    ) => {
+      if (!entry || !revision || !(entry.complete === true || (entry.source === 'codex' && entry.visitedEof === true)))
+        return;
+      charges.transcriptRescans!++;
+      charges[sameRevision(entry, revision) ? 'transcriptRescansMetadata' : 'transcriptRescansChanged']!++;
+    };
     let continuation = false;
     // The membership branches that asked for another pass in this request. A complete reply counts each one.
     const unsettled = { unfinished: false, unread: false, changed: false, parents: false };
@@ -809,6 +820,7 @@ async function execute(
               const revision = checkParent(parent.file);
               if (revision && unchangedFinished(entry, parent, revision)) admittedCompletions.add(key);
               else {
+                countRescan(entry, revision);
                 completed.delete(key);
                 completionChanges.set(key, false);
                 claudeChildReferences.set(key, {
@@ -932,6 +944,7 @@ async function execute(
         } else {
           if (completed.delete(key)) completionChanges.set(key, false);
           const entry = claudeChildReferences.get(key);
+          countRescan(entry, revision);
           if (entry)
             claudeChildReferences.set(key, {
               ...entry,
@@ -1724,6 +1737,9 @@ function emptyDiscoveryCharges(): DiscoveryCharges {
     dispatchSpendPasses: 0,
     dispatchSpendOnlyPasses: 0,
     dispatchSpendSettledSkips: 0,
+    transcriptRescans: 0,
+    transcriptRescansChanged: 0,
+    transcriptRescansMetadata: 0,
     revalidationBytes: 0,
     hits: 0,
     resets: 0,
