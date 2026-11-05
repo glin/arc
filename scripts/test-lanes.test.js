@@ -601,7 +601,7 @@ test.each(['default', 'unit', 'integration'])('%s lanes publish child output bef
   assert.equal(Buffer.concat(errors).toString(), 'child progress\n');
 });
 
-test('expensive tests retain admitted boundaries and repetition budgets', () => {
+test('admission entries match the boundaries, cases and matrices of every expensive test', () => {
   const admission = JSON.parse(fs.readFileSync(path.join(__dirname, 'test-admission.json'), 'utf8'));
   const found = {};
   for (const file of testFiles(repositoryRoot)) {
