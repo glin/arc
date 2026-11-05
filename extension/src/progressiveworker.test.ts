@@ -178,6 +178,87 @@ test.each(['claude', 'codex'] as const)(
   },
 );
 
+// The receipt scan resumes across continuations, so the step allowance of one request sets how many replies one scan takes.
+// An unsettled complete reply starts a new epoch and a new scan. A cancelled request keeps the scan's position.
+test('receipt scan replies follow the step allowance, restart after a parent change, and resume after cancellation', async () => {
+  const root = tempDir('receipt-worker-allowance-');
+  const fx = receiptDispatchFixture(root, 'claude', 'codex');
+  // Each read of these launches stops at the catalog lookup, because no catalog lists their sessions.
+  for (let index = 0; index < 200; index++) {
+    const prefix = index.toString(16).padStart(8, '0');
+    const target = fx.write('codex', `${prefix}-9999-aaaa-bbbb-cccccccccccc`);
+    fx.launch({ ...fx.parent, sessionId: `${prefix}-5555-6666-7777-888888888888` }, target);
+  }
+  fx.launch(fx.parent, fx.child, true, true, 36 * 1024);
+  fx.launch(fx.child, fx.grandchild, true, true, 36 * 1024);
+  const added = fx.write('claude', 'dddddddd-1111-2222-3333-444444444444');
+  const step = 'receiptSteps++;';
+  const cap = /receiptSteps >= \w+/;
+  assert.ok(source.includes(step));
+  assert.match(source, cap);
+  // The frozen clock holds the receipt deadline still, so only the step allowance or the store's end ends a pass. Each
+  // step counts in the reply's charges and tells the host, which lets a test cancel a request inside the receipt loop.
+  const workerSource = (uncapped: boolean) =>
+    `process.env.ARC_HOME=${JSON.stringify(fx.home)};performance.now = () => 0;` +
+    "const receiptStepPort = require('node:worker_threads').parentPort;" +
+    (uncapped ? source.replace(cap, 'receiptSteps >= Infinity') : source).replace(
+      step,
+      step +
+        "charges.receiptStepCount = (charges.receiptStepCount ?? 0) + 1; receiptStepPort.postMessage({ repeatedCoverage: 'receipt-step' });",
+    );
+  const scan = async (uncapped: boolean, options: { addParent?: boolean; cancelEverySecond?: boolean } = {}) => {
+    let cancel: AbortController | undefined;
+    const worker = new ProgressiveWorker(workerSource(uncapped), undefined, (message) => {
+      if (message === 'receipt-step') cancel?.abort();
+    });
+    const { host, replies } = await receiptDiscoveryHost(worker, [root], fx.catalog);
+    const counts = { answered: 0, entries: 0, steps: 0, unsettled: 0 };
+    try {
+      for (let request = 1; request <= 200; request++) {
+        host.refreshGeneration = request;
+        cancel = options.cancelEverySecond && request % 2 === 0 ? new AbortController() : undefined;
+        replies.last = null;
+        await host.prepareClaudeChildren(request, (cancel ?? new AbortController()).signal);
+        if (request === 1 && options.addParent) host.claudeParents = [...fx.catalog, added];
+        const reply = replies.last?.value;
+        if (!reply) {
+          assert.ok(cancel?.signal.aborted, 'an uncancelled request posted no reply');
+          continue;
+        }
+        assert.ok(!cancel, 'a cancelled request posted a reply');
+        assert.ok(reply.kind === 'claude-children' || reply.kind === 'claude-children-progress', reply.kind);
+        counts.answered++;
+        counts.entries += reply.charges?.receiptEntries ?? 0;
+        counts.steps += (reply.charges as { receiptStepCount?: number } | undefined)?.receiptStepCount ?? 0;
+        if (reply.kind !== 'claude-children') continue;
+        if (reply.membershipSettled) return counts;
+        counts.unsettled++;
+      }
+      throw new Error('Receipt discovery never settled');
+    } finally {
+      worker.stop();
+    }
+  };
+  // One request with no step allowance reads the whole store: its steps are S and its entries are one listing.
+  const whole = await scan(true);
+  assert.equal(whole.answered, 1, JSON.stringify(whole));
+  const replies = Math.ceil(whole.steps / 256);
+  assert.ok(replies > 1, `one scan of ${whole.steps} steps fits one allowance`);
+  const fixed = await scan(false);
+  assert.ok(fixed.answered >= replies && fixed.answered <= replies + 2, JSON.stringify({ whole, fixed }));
+  assert.equal(fixed.entries, whole.entries);
+  assert.equal(fixed.unsettled, 0);
+  const restarted = await scan(false, { addParent: true });
+  assert.equal(restarted.unsettled, 1, JSON.stringify(restarted));
+  assert.ok(
+    restarted.answered >= 2 * replies && restarted.answered <= 2 * replies + 3,
+    JSON.stringify({ whole, restarted }),
+  );
+  assert.equal(restarted.entries, 2 * whole.entries);
+  const cancelled = await scan(false, { cancelEverySecond: true });
+  assert.ok(cancelled.answered <= fixed.answered, JSON.stringify({ fixed, cancelled }));
+});
+
 // A panel host whose discovery requests reach the worker, with the last worker reply kept for the test.
 async function receiptDiscoveryHost(
   worker: ProgressiveWorker,
