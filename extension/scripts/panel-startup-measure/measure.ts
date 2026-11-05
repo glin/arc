@@ -1034,7 +1034,7 @@ export async function pollStartup(
         complete: false,
         note:
           lines.length === 0
-            ? `Arc wrote no diagnostics line in ${waited}s. Check that the window opened and that the panel tab is in the stored window state.`
+            ? `Arc wrote no diagnostics line in ${waited}s. The window never opened, the panel tab is not in the stored window state, or VS Code staged an update after this run started.`
             : `The startup remained incomplete after ${waited}s. ${outcome.note ?? ''}`,
       };
     }
