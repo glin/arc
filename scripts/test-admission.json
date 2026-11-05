@@ -137,7 +137,7 @@
   "extension/src/progressiveworker.test.ts": {
     "reason": "Worker protocol, cancellation, host death, bounded transcript reads, compressed rollout opens with one decode at a time, its cancellation, a stale window over a body released during its hash check or its read, a release of another path that keeps the held body, a read of a released path that waits for the reads of the released body, and a waiting read whose file the host released that keeps no body, and scoped subagent edit reads must survive the actual worker boundary.",
     "cases": 165,
-    "matricesSha256": "2214d58d4444ddac0c22a869cea412bc3d0a6cdbd4e5f4a78c4b4198924a7d43"
+    "matricesSha256": "9fa4b91c09663af22503efe4a0ecc01abe490833bcb2d2351f775faf2f297a0f"
   },
   "extension/src/projectsetups.test.ts": {
     "reason": "Real Git worktrees and canonical filesystem aliases must share project identity while clones stay distinct.",
