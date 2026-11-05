@@ -257,6 +257,9 @@ test('receipt scan replies follow the step allowance, restart after a parent cha
       otherBranches:
         discovery.unsettledUnfinishedSources! + discovery.unsettledUnreadSources! + discovery.unsettledChangedSources!,
       aborts: discovery.discoveryAborts,
+      // The dispatched windows and the root visits to the first settled reply.
+      spendPasses: discovery.dispatchSpendPasses,
+      spendVisits: discovery.dispatchSpendVisits,
     };
   };
   const whole = await scan(true);
@@ -274,6 +277,8 @@ test('receipt scan replies follow the step allowance, restart after a parent cha
     parentChanges: 0,
     otherBranches: 0,
     aborts: 0,
+    spendPasses: 1,
+    spendVisits: 2,
   });
   const restarted = await scan(false, { addParent: true });
   assert.equal(restarted.unsettled, 1, JSON.stringify(restarted));
@@ -289,6 +294,9 @@ test('receipt scan replies follow the step allowance, restart after a parent cha
     parentChanges: 1,
     otherBranches: 0,
     aborts: 0,
+    // Each complete reply reads the two dispatched roots once.
+    spendPasses: 2,
+    spendVisits: 4,
   });
   const cancelled = await scan(false, { cancelEverySecond: true });
   assert.ok(cancelled.answered <= fixed.answered, JSON.stringify({ fixed, cancelled }));
@@ -300,6 +308,8 @@ test('receipt scan replies follow the step allowance, restart after a parent cha
     parentChanges: 0,
     otherBranches: 0,
     aborts: cancelled.cancelled,
+    spendPasses: 1,
+    spendVisits: 2,
   });
 });
 
@@ -12894,6 +12904,31 @@ for (const [budgetKiB, unfinishedWork] of [
       // The pass that settles the root returns its saved facts, so the host can save them before any reload.
       const saved = refined.savedDispatch.find(([file]) => file.toLowerCase().endsWith(rootId + '.jsonl'));
       assert.equal(saved?.[1]?.facts.spend.found, true, 'the settled facts did not leave the worker');
+      // The next spend-only pass passes over the settled root and reads nothing, so the tail ends with it. A root whose
+      // file grew is visited again.
+      const spendPass = async () => {
+        const result = await worker.run({ ...request(), spendOnly: true }, 1, signal);
+        assert.ok(result?.value.kind === 'dispatch-spend' && result.value.held, 'a spend-only request ran discovery');
+        const { dispatchSpendVisits, dispatchSpendSettledSkips, dispatchSpendOnlyPasses, dispatchSpendPasses } =
+          result.value.charges;
+        return {
+          visits: dispatchSpendVisits,
+          skips: dispatchSpendSettledSkips,
+          passes: [dispatchSpendOnlyPasses, dispatchSpendPasses],
+          read: result.value.charges.dispatchSpendBytes > 0,
+          continuation: result.value.continuation,
+        };
+      };
+      assert.deepEqual(await spendPass(), { visits: 0, skips: 1, passes: [1, 1], read: false, continuation: false });
+      fs.appendFileSync(path.join(directory, rootId + '.jsonl'), record('ignored', { text: 'more' }));
+      // A 64 KiB budget reads the grown root over more than one pass.
+      assert.deepEqual(await spendPass(), {
+        visits: 1,
+        skips: 0,
+        passes: [1, 1],
+        read: true,
+        continuation: budgetKiB === 64,
+      });
     } finally {
       worker.stop();
       fs.rmSync(directory, { recursive: true, force: true });

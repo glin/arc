@@ -648,7 +648,8 @@ async function execute(
       if (!held || held.scope !== JSON.stringify(request.repositoryRoots))
         return { kind: 'dispatch-spend', held: false };
       const charges = emptyDiscoveryCharges();
-      const spend = collectDispatchFacts(request, held.references, held.admittedReferences, charges);
+      charges.dispatchSpendOnlyPasses!++;
+      const spend = collectDispatchFacts(request, held.references, held.admittedReferences, charges, true);
       charges.passMs = performance.now() - passStarted;
       return {
         kind: 'dispatch-spend',
@@ -1720,6 +1721,9 @@ function emptyDiscoveryCharges(): DiscoveryCharges {
     unsettledUnreadSources: 0,
     unsettledChangedSources: 0,
     unsettledParentChanges: 0,
+    dispatchSpendPasses: 0,
+    dispatchSpendOnlyPasses: 0,
+    dispatchSpendSettledSkips: 0,
     revalidationBytes: 0,
     hits: 0,
     resets: 0,
@@ -1765,6 +1769,7 @@ function collectDispatchFacts(
   references: readonly import('./transcript').ClaudeChildSessionReference[],
   admittedReferences: ReturnType<typeof admittedDispatchReferences>,
   charges: DiscoveryCharges,
+  spendOnly = false,
 ): {
   dispatched: DispatchSessionFacts[];
   dispatchRoots: Record<string, DispatchRootCharges>;
@@ -1773,6 +1778,7 @@ function collectDispatchFacts(
   savedChanges: Array<[string, SavedDispatchFacts | null]>;
 } {
   let continuation = false;
+  charges.dispatchSpendPasses!++;
   const dispatched: DispatchSessionFacts[] = [];
   const seen = new Set<string>();
   const dispatchRoots: Record<string, DispatchRootCharges> = {};
@@ -1793,6 +1799,23 @@ function collectDispatchFacts(
       }
       closeRoot();
       seen.add(reference.sessionId);
+      const revision = revisionOf(reference.file);
+      const heldValue = revision ? (dispatchFacts.get(reference.file) ?? seededDispatch(reference.file)) : undefined;
+      const sourceGeneration = claudeChildReferences.get(normalizeFsPath(reference.file))?.sourceGeneration;
+      // A spend-only pass passes over a settled root whose file kept its revision, without its spend tree or a read. A
+      // full pass still checks the spend tree of every root.
+      if (
+        spendOnly &&
+        revision &&
+        heldValue?.settled &&
+        !heldValue.activityStale &&
+        heldValue.sourceGeneration === sourceGeneration &&
+        sameRevision(heldValue.revision, revision)
+      ) {
+        charges.dispatchSpendSettledSkips!++;
+        dispatched.push(heldValue.facts);
+        continue;
+      }
       charges.dispatchSpendVisits++;
       const root: DispatchRootCharges = {
         agent: reference.agent,
@@ -1806,13 +1829,10 @@ function collectDispatchFacts(
       };
       dispatchRoots[reference.sessionId] = root;
       openRoot = { root, before: dispatchReads.bytes };
-      const revision = revisionOf(reference.file);
       if (!revision) {
         continue;
       }
       root.size = revision.size;
-      const heldValue = dispatchFacts.get(reference.file) ?? seededDispatch(reference.file);
-      const sourceGeneration = claudeChildReferences.get(normalizeFsPath(reference.file))?.sourceGeneration;
       const held =
         heldValue &&
         heldValue.sourceGeneration === sourceGeneration &&

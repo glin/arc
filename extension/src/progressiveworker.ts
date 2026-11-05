@@ -293,6 +293,11 @@ export interface DiscoveryCharges extends Record<import('./codex').CodexDispatch
   unsettledUnreadSources?: number;
   unsettledChangedSources?: number;
   unsettledParentChanges?: number;
+  // Each dispatched window of a reply, each spend-only request among them, and each settled root whose file kept its
+  // revision, which a spend-only pass passes over without a visit.
+  dispatchSpendPasses?: number;
+  dispatchSpendOnlyPasses?: number;
+  dispatchSpendSettledSkips?: number;
   revalidationBytes?: number;
   hits: number;
   resets: number;
