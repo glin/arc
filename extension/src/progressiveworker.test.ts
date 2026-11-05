@@ -71,7 +71,8 @@ test.each(['claude', 'codex'] as const)(
       const root = tempDir('receipt-worker-');
       const fx = receiptDispatchFixture(root, parentAgent, childAgent);
       fs.mkdirSync(fx.receipts.root, { recursive: true });
-      for (let index = 0; index < 300; index++)
+      // An empty launch directory costs about four receipt steps, so the store takes more than one request's allowance.
+      for (let index = 0; index < 1200; index++)
         fs.mkdirSync(path.join(fx.receipts.root, `${index.toString(16).padStart(8, '0')}-1111-2222-3333-444444444444`));
       fx.launch(fx.parent, fx.child, true, true, 36 * 1024);
       fx.launch(fx.child, fx.grandchild, true, true, 36 * 1024);
@@ -242,7 +243,7 @@ test('receipt scan replies follow the step allowance, restart after a parent cha
   // One request with no step allowance reads the whole store: its steps are S and its entries are one listing.
   const whole = await scan(true);
   assert.equal(whole.answered, 1, JSON.stringify(whole));
-  const replies = Math.ceil(whole.steps / 256);
+  const replies = Math.ceil(whole.steps / 4096);
   assert.ok(replies > 1, `one scan of ${whole.steps} steps fits one allowance`);
   const fixed = await scan(false);
   assert.ok(fixed.answered >= replies && fixed.answered <= replies + 2, JSON.stringify({ whole, fixed }));
@@ -11065,14 +11066,14 @@ test.each(['large-opening', 'copied-before', 'copied-after'])(
       mtimeMs: fs.statSync(file).mtimeMs,
     });
     const parent = session(parentFile, 'parent', 'claude');
-    const deadline = 'const receiptDeadline = performance.now() + RELATIONSHIP_SLICE_MS;';
+    const deadline = 'const receiptDeadline = performance.now() + RECEIPT_SLICE_MS;';
     assert.ok(source.includes(deadline));
     // Expire the first receipt slice, then keep the performance clock fixed for continuation.
     const workerSource =
       'let receiptClock = 0, receiptExpired = false; performance.now = () => receiptClock;' +
       source.replace(
         deadline,
-        deadline + 'if (!receiptExpired) { receiptExpired = true; receiptClock += RELATIONSHIP_SLICE_MS; }',
+        deadline + 'if (!receiptExpired) { receiptExpired = true; receiptClock += RECEIPT_SLICE_MS; }',
       );
     const worker = new ProgressiveWorker(
       workerSource + `\nDate.now = () => Number(require('node:fs').readFileSync(${JSON.stringify(clock)}, 'utf8'));`,

@@ -230,6 +230,10 @@ function withSavedFacts([file, entry]: [string, ClaudeChildReferenceCacheEntry])
 }
 const DISPATCH_METADATA_BYTES = 256 * 1024;
 export const CODEX_DISPATCH_REQUEST_BYTES = 8 * 1024 * 1024;
+// The receipt scan's allowance in each discovery request. Each step is one filesystem operation and yields to the worker's
+// other messages, so window reads run between steps.
+const RECEIPT_SLICE_MS = 250;
+const RECEIPT_STEPS = 4096;
 let discoveryEpoch: DiscoveryCheckpoint | null = null;
 interface ReceiptScan {
   epoch: string | undefined;
@@ -1200,13 +1204,13 @@ async function execute(
       receiptScan = scan;
     }
     const activeReceipts = receiptScan;
-    const receiptDeadline = performance.now() + RELATIONSHIP_SLICE_MS;
+    const receiptDeadline = performance.now() + RECEIPT_SLICE_MS;
     let receiptSteps = 0;
     // The deadline ends the loop only after a step, so a worker paused past the deadline in every request still advances.
     while (!signal.aborted) {
       if (
         requestBytes <= charges.readBytes ||
-        receiptSteps >= 256 ||
+        receiptSteps >= RECEIPT_STEPS ||
         (receiptSteps > 0 && performance.now() >= receiptDeadline)
       ) {
         charges.receiptPassEnds++;
