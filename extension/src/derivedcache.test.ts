@@ -3344,7 +3344,7 @@ test('v1 import keeps each agent by its own generation through migration, restar
   );
   assert.equal(fs.existsSync(current), false);
   const second = load();
-  assert.deepEqual([...second.titles.keys()], [codexFile], 'an interrupted migration lost Codex metadata');
+  assert.deepEqual([...second.titles.keys()], [], 'an interrupted migration kept stale metadata');
   assert.deepEqual(second.claudeChildReferences.get(normalizeFsPath(claudeFile))?.claudeCursor, scan.cursor);
   saveDerivedCache(
     current,
@@ -3362,14 +3362,15 @@ test('v1 import keeps each agent by its own generation through migration, restar
   assert.deepEqual(saved.metadataGenerations, METADATA_GENERATIONS);
   assert.deepEqual(
     saved.titles.map((row: { file: string; agent: string }) => [row.file, row.agent]),
-    [[codexFile, 'codex']],
+    [],
   );
   // An older window keeps writing the previous file after migration.
   fs.writeFileSync(previous, v1(71));
   const restarted = load();
   assert.equal(restarted.reuse?.source, 'current');
   assert.equal(restarted.migrationPending, false);
-  assert.deepEqual([...restarted.titles.keys()], [codexFile], 'an older writer replaced migrated metadata');
+  assert.deepEqual([...restarted.titles.keys()], [], 'an older writer restored stale metadata');
+  assert.equal(restarted.carriedNames.get(codexFile)?.label, 'Codex');
   assert.equal(restarted.carriedNames.get(claudeFile)?.label, 'Claude');
   assert.deepEqual(restarted.claudeChildReferences.get(normalizeFsPath(claudeFile))?.claudeCursor, scan.cursor);
   saveDerivedCache(
