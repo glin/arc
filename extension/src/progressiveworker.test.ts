@@ -220,7 +220,7 @@ test('receipt scan replies follow the step allowance, restart after a parent cha
         replies.last = null;
         await host.prepareClaudeChildren(request, (cancel ?? new AbortController()).signal);
         if (request === 1 && options.addParent) host.claudeParents = [...fx.catalog, added];
-        const reply = replies.last?.value;
+        const reply = (replies.last as ProgressiveResult | null)?.value;
         if (!reply) {
           assert.ok(cancel?.signal.aborted, 'an uncancelled request posted no reply');
           continue;
