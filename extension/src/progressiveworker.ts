@@ -280,6 +280,19 @@ export interface DiscoveryCharges extends Record<import('./codex').CodexDispatch
   receiptEntries?: number;
   receiptChecks?: number;
   receiptBytes?: number;
+  // Each receipt scan that opened in the request, split by why the worker's previous scan closed. A scan with no earlier
+  // scan in its worker counts as a new worker.
+  receiptScanOpens?: number;
+  receiptScanOpensNewWorker?: number;
+  receiptScanOpensAfterEpoch?: number;
+  receiptScanOpensAfterStore?: number;
+  receiptScanOpensAfterRefusal?: number;
+  receiptScanOpensAfterCompletion?: number;
+  // A complete reply that leaves membership unsettled counts each branch that asked for another pass.
+  unsettledUnfinishedSources?: number;
+  unsettledUnreadSources?: number;
+  unsettledChangedSources?: number;
+  unsettledParentChanges?: number;
   revalidationBytes?: number;
   hits: number;
   resets: number;

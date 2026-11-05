@@ -12882,6 +12882,7 @@ export class PanelProvider implements vscode.Disposable {
       )
       .catch(() => null);
     if (!result) {
+      if (signal.aborted) this.performanceCounters?.recordDiscoveryAbort?.();
       this.failSessionLoading(generation, signal);
       return false;
     }

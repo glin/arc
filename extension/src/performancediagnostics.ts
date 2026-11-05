@@ -83,6 +83,7 @@ export interface PerformanceCounterSnapshot {
     continuations: number;
     publications: number;
     partialPublications: number;
+    discoveryAborts: number;
   };
   sourceId: string;
   startedAt: string;
@@ -203,6 +204,16 @@ const DISCOVERY_CHARGE_FIELDS: { readonly [K in keyof DiscoveryCharges]-?: true 
   receiptEntries: true,
   receiptChecks: true,
   receiptBytes: true,
+  receiptScanOpens: true,
+  receiptScanOpensNewWorker: true,
+  receiptScanOpensAfterEpoch: true,
+  receiptScanOpensAfterStore: true,
+  receiptScanOpensAfterRefusal: true,
+  receiptScanOpensAfterCompletion: true,
+  unsettledUnfinishedSources: true,
+  unsettledUnreadSources: true,
+  unsettledChangedSources: true,
+  unsettledParentChanges: true,
   revalidationBytes: true,
   hits: true,
   resets: true,
@@ -267,6 +278,16 @@ export class PanelPerformanceCounters {
     receiptEntries: 0,
     receiptChecks: 0,
     receiptBytes: 0,
+    receiptScanOpens: 0,
+    receiptScanOpensNewWorker: 0,
+    receiptScanOpensAfterEpoch: 0,
+    receiptScanOpensAfterStore: 0,
+    receiptScanOpensAfterRefusal: 0,
+    receiptScanOpensAfterCompletion: 0,
+    unsettledUnfinishedSources: 0,
+    unsettledUnreadSources: 0,
+    unsettledChangedSources: 0,
+    unsettledParentChanges: 0,
     revalidationBytes: 0,
     hits: 0,
     resets: 0,
@@ -305,6 +326,7 @@ export class PanelPerformanceCounters {
     continuations: 0,
     publications: 0,
     partialPublications: 0,
+    discoveryAborts: 0,
   };
   // A complete reply that asks for no further pass counts as a publication. One that asks for a pass only for dispatched
   // spend publishes its settled members and counts as a partial publication. Every other reply counts as a continuation.
@@ -333,6 +355,10 @@ export class PanelPerformanceCounters {
       held.agent = root.agent;
       if (root.size !== null) held.size = root.size;
     }
+  }
+  // A discovery request that the host aborted before the worker replied.
+  recordDiscoveryAbort(): void {
+    this.discovery.discoveryAborts++;
   }
   private readonly dispatchRoots = new Map<string, DispatchRootCharges>();
   private watcherOperationCount = 0;

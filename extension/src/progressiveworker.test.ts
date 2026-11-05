@@ -10,6 +10,7 @@ import * as path from 'node:path';
 import { buildSync } from 'esbuild';
 import { once } from 'node:events';
 import { createDiagnosticsLog } from './diagnosticslog';
+import { PanelPerformanceCounters } from './performancediagnostics';
 import type { HistoryPage } from './historypages';
 import {
   ProgressiveWorker,
@@ -213,11 +214,14 @@ test('receipt scan replies follow the step allowance, restart after a parent cha
       if (message === 'receipt-step') cancel?.abort();
     });
     const { host, replies } = await receiptDiscoveryHost(worker, [root], fx.catalog);
-    const counts = { answered: 0, entries: 0, steps: 0, unsettled: 0 };
+    const counters = new PanelPerformanceCounters(0, 'receipt-allowance');
+    host.performanceCounters = counters;
+    const counts = { answered: 0, entries: 0, steps: 0, unsettled: 0, cancelled: 0 };
     try {
       for (let request = 1; request <= 200; request++) {
         host.refreshGeneration = request;
         cancel = options.cancelEverySecond && request % 2 === 0 ? new AbortController() : undefined;
+        if (cancel) counts.cancelled++;
         replies.last = null;
         await host.prepareClaudeChildren(request, (cancel ?? new AbortController()).signal);
         if (request === 1 && options.addParent) host.claudeParents = [...fx.catalog, added];
@@ -232,7 +236,7 @@ test('receipt scan replies follow the step allowance, restart after a parent cha
         counts.entries += reply.charges?.receiptEntries ?? 0;
         counts.steps += (reply.charges as { receiptStepCount?: number } | undefined)?.receiptStepCount ?? 0;
         if (reply.kind !== 'claude-children') continue;
-        if (reply.membershipSettled) return counts;
+        if (reply.membershipSettled) return { ...counts, charges: receiptCharges(counters) };
         counts.unsettled++;
       }
       throw new Error('Receipt discovery never settled');
@@ -241,6 +245,20 @@ test('receipt scan replies follow the step allowance, restart after a parent cha
     }
   };
   // One request with no step allowance reads the whole store: its steps are S and its entries are one listing.
+  // Each reply counts the scans that opened in it, by why the worker's previous scan closed, and each branch that left a
+  // complete reply unsettled.
+  const receiptCharges = (counters: PanelPerformanceCounters) => {
+    const discovery = counters.snapshot().discovery;
+    return {
+      opens: discovery.receiptScanOpens,
+      newWorker: discovery.receiptScanOpensNewWorker,
+      afterCompletion: discovery.receiptScanOpensAfterCompletion,
+      parentChanges: discovery.unsettledParentChanges,
+      otherBranches:
+        discovery.unsettledUnfinishedSources! + discovery.unsettledUnreadSources! + discovery.unsettledChangedSources!,
+      aborts: discovery.discoveryAborts,
+    };
+  };
   const whole = await scan(true);
   assert.equal(whole.answered, 1, JSON.stringify(whole));
   const replies = Math.ceil(whole.steps / 4096);
@@ -249,6 +267,14 @@ test('receipt scan replies follow the step allowance, restart after a parent cha
   assert.ok(fixed.answered >= replies && fixed.answered <= replies + 2, JSON.stringify({ whole, fixed }));
   assert.equal(fixed.entries, whole.entries);
   assert.equal(fixed.unsettled, 0);
+  assert.deepEqual(fixed.charges, {
+    opens: 1,
+    newWorker: 1,
+    afterCompletion: 0,
+    parentChanges: 0,
+    otherBranches: 0,
+    aborts: 0,
+  });
   const restarted = await scan(false, { addParent: true });
   assert.equal(restarted.unsettled, 1, JSON.stringify(restarted));
   assert.ok(
@@ -256,8 +282,25 @@ test('receipt scan replies follow the step allowance, restart after a parent cha
     JSON.stringify({ whole, restarted }),
   );
   assert.equal(restarted.entries, 2 * whole.entries);
+  assert.deepEqual(restarted.charges, {
+    opens: 2,
+    newWorker: 1,
+    afterCompletion: 1,
+    parentChanges: 1,
+    otherBranches: 0,
+    aborts: 0,
+  });
   const cancelled = await scan(false, { cancelEverySecond: true });
   assert.ok(cancelled.answered <= fixed.answered, JSON.stringify({ fixed, cancelled }));
+  assert.ok(cancelled.cancelled > 0);
+  assert.deepEqual(cancelled.charges, {
+    opens: 1,
+    newWorker: 1,
+    afterCompletion: 0,
+    parentChanges: 0,
+    otherBranches: 0,
+    aborts: cancelled.cancelled,
+  });
 });
 
 // A panel host whose discovery requests reach the worker, with the last worker reply kept for the test.

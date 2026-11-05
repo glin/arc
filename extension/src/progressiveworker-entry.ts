@@ -253,7 +253,16 @@ interface ReceiptScan {
   storeIdentity: string;
 }
 let receiptScan: ReceiptScan | null = null;
-function closeReceiptScan(): void {
+// Why the last receipt scan of this worker closed. The next scan counts it when it opens.
+let receiptScanClosed: 'epoch' | 'store' | 'refusal' | 'completion' | undefined;
+const RECEIPT_SCAN_OPEN_CHARGES = {
+  epoch: 'receiptScanOpensAfterEpoch',
+  store: 'receiptScanOpensAfterStore',
+  refusal: 'receiptScanOpensAfterRefusal',
+  completion: 'receiptScanOpensAfterCompletion',
+} as const;
+function closeReceiptScan(cause: 'epoch' | 'store' | 'refusal'): void {
+  if (receiptScan) receiptScanClosed = cause;
   receiptScan?.controller.abort();
   receiptScan?.steps.return(undefined);
   receiptScan?.retry?.return(null);
@@ -737,7 +746,7 @@ async function execute(
       };
     }
     const epoch = discoveryEpoch;
-    if (receiptScan && receiptScan.epoch !== epoch.epoch) closeReceiptScan();
+    if (receiptScan && receiptScan.epoch !== epoch.epoch) closeReceiptScan('epoch');
     // A new worker checks saved completions as their sources become reachable.
     const seeding = heldEpoch?.epoch !== epoch.epoch;
     if (seeding) {
@@ -773,6 +782,8 @@ async function execute(
     };
     const checkMissing = (file: string) => parentCheck(() => missingFile(file));
     let continuation = false;
+    // The membership branches that asked for another pass in this request. A complete reply counts each one.
+    const unsettled = { unfinished: false, unread: false, changed: false, parents: false };
     let incomplete = false;
     let admitting = seeding;
     const candidates = new Map<string, import('./transcript').SessionFile>();
@@ -1117,7 +1128,10 @@ async function execute(
           completed.delete(key);
           completionChanges.set(key, false);
         }
-        continuation ||= !finished;
+        if (!finished) {
+          continuation = true;
+          unsettled.unfinished = true;
+        }
         if (!finished && parent.agent === 'claude') {
           completed.delete(key);
           completionChanges.set(key, false);
@@ -1155,7 +1169,10 @@ async function execute(
       if (completed.has(file)) continue;
       const entry = claudeChildReferences.get(file);
       if (!entry) {
-        continuation ||= !checkMissing(file);
+        if (!unsettled.unread && !checkMissing(file)) {
+          continuation = true;
+          unsettled.unread = true;
+        }
         continue;
       }
       const current = checkParent(file);
@@ -1164,6 +1181,7 @@ async function execute(
         completionChanges.set(file, false);
         claudeChildReferences.set(file, { ...entry, complete: false, relationshipComplete: false });
         continuation = true;
+        unsettled.changed = true;
         if (candidates.get(file)!.agent === 'claude') {
           charges.otherPassEnds++;
           return pending();
@@ -1180,11 +1198,14 @@ async function execute(
       JSON.stringify(
         parents.map(({ file, sessionId, agent, childTranscript }) => ({ file, sessionId, agent, childTranscript })),
       );
-    continuation ||= parentKeys(epoch.parents) !== parentKeys(request.parents);
+    unsettled.parents = parentKeys(epoch.parents) !== parentKeys(request.parents);
+    continuation ||= unsettled.parents;
     // A replaced store directory starts the scan again from its first entry, here and before publication. Other store changes
     // keep the scan's position.
-    if (receiptScan && receiptStoreIdentity(receiptScan.store) !== receiptScan.storeIdentity) closeReceiptScan();
+    if (receiptScan && receiptStoreIdentity(receiptScan.store) !== receiptScan.storeIdentity) closeReceiptScan('store');
     if (!receiptScan) {
+      charges.receiptScanOpens!++;
+      charges[receiptScanClosed ? RECEIPT_SCAN_OPEN_CHARGES[receiptScanClosed] : 'receiptScanOpensNewWorker']!++;
       const controller = new AbortController();
       const store = new DispatchReceipts();
       const scan: ReceiptScan = {
@@ -1259,7 +1280,7 @@ async function execute(
     if (signal.aborted) return { kind: 'stale' };
     // Links read from a replaced store never publish with retries read from its replacement.
     if (receiptStoreIdentity(activeReceipts.store) !== activeReceipts.storeIdentity) {
-      closeReceiptScan();
+      closeReceiptScan('store');
       charges.receiptPassEnds++;
       return pending();
     }
@@ -1269,13 +1290,14 @@ async function execute(
       (activeReceipts.references.size ||
         transcriptReferences.some((reference) => reference.kind === 'dispatch' && reference.file))
     ) {
-      closeReceiptScan();
+      closeReceiptScan('refusal');
       charges.otherPassEnds++;
       return pending();
     }
     discoveryPosition = epoch.position;
     discoveryEpoch = null;
     receiptScan = null;
+    receiptScanClosed = 'completion';
     const references = [...transcriptReferences, ...activeReceipts.references.values()];
     const admittedReferences = admittedDispatchReferences(references, found.children, request.codexChildren);
     retainCodexDispatchSpendRoots(
@@ -1283,6 +1305,10 @@ async function execute(
     );
     const spend = collectDispatchFacts(request, references, admittedReferences, charges);
     heldDispatchReferences = { scope: JSON.stringify(epoch.repositoryRoots), references, admittedReferences };
+    if (unsettled.unfinished) charges.unsettledUnfinishedSources!++;
+    if (unsettled.unread) charges.unsettledUnreadSources!++;
+    if (unsettled.changed) charges.unsettledChangedSources!++;
+    if (unsettled.parents) charges.unsettledParentChanges!++;
     charges.passMs = performance.now() - passStarted;
     return {
       kind: 'claude-children',
@@ -1684,6 +1710,16 @@ function emptyDiscoveryCharges(): DiscoveryCharges {
     receiptEntries: 0,
     receiptChecks: 0,
     receiptBytes: 0,
+    receiptScanOpens: 0,
+    receiptScanOpensNewWorker: 0,
+    receiptScanOpensAfterEpoch: 0,
+    receiptScanOpensAfterStore: 0,
+    receiptScanOpensAfterRefusal: 0,
+    receiptScanOpensAfterCompletion: 0,
+    unsettledUnfinishedSources: 0,
+    unsettledUnreadSources: 0,
+    unsettledChangedSources: 0,
+    unsettledParentChanges: 0,
     revalidationBytes: 0,
     hits: 0,
     resets: 0,
