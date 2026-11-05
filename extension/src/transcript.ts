@@ -2329,11 +2329,12 @@ function observeClaudeTask(state: ClaudeTaskEvidence, record: Record<string, unk
     state.tools[tool] = state.tools[tool] === undefined || state.tools[tool] === kind ? kind : 'unknown';
   };
   if (record.type === 'assistant') {
+    let identity: string | undefined;
     for (const block of blocks) {
       if (block?.type !== 'tool_use' || typeof block.id !== 'string' || !block.id || kindOf(block.name) === 'unknown')
         continue;
       const tool = '@' + block.id;
-      const identity =
+      identity ??=
         claudeRecordKey(JSON.stringify(record)) ??
         (typeof record.uuid === 'string'
           ? record.uuid
