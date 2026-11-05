@@ -303,6 +303,63 @@ test('receipt scan replies follow the step allowance, restart after a parent cha
   });
 });
 
+// Each receipt step yields to the worker's other messages, so a window read does not wait for the receipt pass.
+test('a window read sent during a receipt pass completes before the pass ends', async () => {
+  const root = tempDir('receipt-worker-window-');
+  const fx = receiptDispatchFixture(root, 'claude', 'codex');
+  fs.mkdirSync(fx.receipts.root, { recursive: true });
+  // An empty launch directory costs about four receipt steps, so the pass runs its whole step allowance.
+  for (let index = 0; index < 1200; index++)
+    fs.mkdirSync(path.join(fx.receipts.root, `${index.toString(16).padStart(8, '0')}-1111-2222-3333-444444444444`));
+  const step = 'receiptSteps++;';
+  const deadline = /const receiptDeadline = performance\.now\(\) \+ \w+;/;
+  assert.ok(source.includes(step));
+  assert.match(source, deadline);
+  let stepped!: () => void;
+  const firstStep = new Promise<void>((resolve) => (stepped = resolve));
+  // Only the step allowance ends the pass, and each step tells the host.
+  const worker = new ProgressiveWorker(
+    `process.env.ARC_HOME=${JSON.stringify(fx.home)};` +
+      "const receiptStepPort = require('node:worker_threads').parentPort;" +
+      source
+        .replace(deadline, 'const receiptDeadline = Infinity;')
+        .replace(step, step + "receiptStepPort.postMessage({ repeatedCoverage: 'receipt-step' });"),
+    undefined,
+    (message) => {
+      if (message === 'receipt-step') stepped();
+    },
+  );
+  const order: string[] = [];
+  try {
+    const discovery = worker
+      .run(
+        { kind: 'claude-children', parents: fx.catalog, catalog: fx.catalog, repositoryRoots: [root] },
+        1,
+        new AbortController().signal,
+      )
+      .then((result) => {
+        order.push('discovery');
+        return result;
+      });
+    await firstStep;
+    const { file, sessionId, agent, size, mtimeMs } = fx.parent;
+    const session = { file, sessionId, agent, size, mtimeMs };
+    const window = await worker.run(
+      { kind: 'window', input: { session, folders: [root], children: [], maxTurns: 40, tailBytes: 65536 } },
+      2,
+      new AbortController().signal,
+    );
+    order.push('window');
+    assert.equal(window?.value.kind, 'window');
+    const pass = await discovery;
+    assert.deepEqual(order, ['window', 'discovery']);
+    assert.equal(pass?.value.kind, 'claude-children-progress');
+    assert.equal(pass.value.charges?.receiptPassEnds, 1);
+  } finally {
+    worker.stop();
+  }
+});
+
 // A panel host whose discovery requests reach the worker, with the last worker reply kept for the test.
 async function receiptDiscoveryHost(
   worker: ProgressiveWorker,
