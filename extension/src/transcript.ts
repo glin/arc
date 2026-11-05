@@ -3564,6 +3564,7 @@ export function linkLocation(href: string): { target: string; from: number; to: 
       return { target: beforeHash, from: -1, to: -1, fragment };
     }
   }
+  // Keep line suffixes aligned with linkBrowserKind in domain/link-path.ts.
   const anchor = /#L(\d+)(?:-L?(\d+))?$/.exec(href) || /:(\d+)(?::\d+)?$/.exec(href);
   const from = anchor ? Number(anchor[1]) - 1 : -1;
   return {
@@ -3574,9 +3575,7 @@ export function linkLocation(href: string): { target: string; from: number; to: 
   };
 }
 
-export function linkTargetIsHtml(target: string): boolean {
-  return /\.html?$/i.test(target);
-}
+export { linkTargetIsHtml } from './domain/link-path';
 
 export function linkTargetIsMarkdown(target: string): boolean {
   return /\.(?:md|markdown)$/i.test(target);

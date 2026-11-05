@@ -1,3 +1,4 @@
+import { parseLinkDestination, linkBrowserKind, type LinkDestination, type LinkOpening } from './domain/link-path';
 import { compatibleDiscovery, discoveryCompatibility } from './progressiveworker';
 import {
   sessionCoverageMember,
@@ -840,6 +841,7 @@ async function openLink(
   href: string,
   column: vscode.ViewColumn,
   literal: boolean | 'directory' = false,
+  opening?: LinkOpening,
 ): Promise<void> {
   if (
     literal &&
@@ -852,6 +854,43 @@ async function openLink(
     )
   )
     return;
+  if (opening) {
+    const destination: LinkDestination =
+      literal === true
+        ? { kind: 'fileCitation', path: href }
+        : /^https?:/i.test(href)
+          ? { kind: 'url', url: href }
+          : { kind: 'path', path: href };
+    const kind = linkBrowserKind(destination);
+    if (!kind || (kind === 'web' ? opening === 'default' : opening === 'external')) return;
+    if (
+      kind === 'html' &&
+      (vscode.env.remoteName !== undefined ||
+        (vscode.workspace.workspaceFolders ?? []).some((folder) => folder.uri.scheme !== 'file'))
+    ) {
+      void vscode.window.showInformationMessage(`Arc: ${href} needs a local desktop window.`);
+      return;
+    }
+    if (
+      opening === 'integrated' &&
+      !(await vscode.commands.getCommands(true)).includes('workbench.action.browser.open')
+    ) {
+      void vscode.window.showInformationMessage('Arc: the integrated browser is unavailable in this window.');
+      return;
+    }
+    if (kind === 'web') {
+      try {
+        if (opening === 'integrated') await vscode.commands.executeCommand('workbench.action.browser.open', href);
+        else if (!(await vscode.env.openExternal(vscode.Uri.parse(href))))
+          throw new Error('The external browser did not open the link.');
+      } catch (error) {
+        void vscode.window.showInformationMessage(
+          `Arc: did not open ${href}. ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      return;
+    }
+  }
   if (!literal && /^https?:\/\//i.test(href)) {
     await vscode.env.openExternal(vscode.Uri.parse(href));
     return;
@@ -885,6 +924,20 @@ async function openLink(
       continue;
     }
     try {
+      if (
+        opening &&
+        (!(stat.type & vscode.FileType.File) || stat.type & vscode.FileType.Directory || !linkTargetIsHtml(uri.fsPath))
+      ) {
+        failure ??= `Arc: ${uri.fsPath} is not an HTML file.`;
+        continue;
+      }
+      if (opening) {
+        if (opening === 'integrated')
+          await vscode.commands.executeCommand('workbench.action.browser.open', uri.toString());
+        else if (!(await vscode.env.openExternal(uri)))
+          throw new Error('The default application did not open the file.');
+        return;
+      }
       if (stat.type & vscode.FileType.Directory) {
         if (literal === true) {
           void vscode.window.showInformationMessage(`Arc: ${target} is a folder.`);
@@ -1398,6 +1451,7 @@ export class PanelProvider implements vscode.Disposable {
   private selectionFailure: { sessionId: string; generation: number; revision: FileRevision } | null = null;
   // The newest session menu's host. Native commands carry no webview identity.
   private detailsMenuArm: { host: PanelHost; session: string; browserSession: string; at: number } | null = null;
+  private linkMenuArm: { host: PanelHost; token: string; destination: LinkDestination; at: number } | null = null;
   private composerMenuArm: { host: PanelHost; at: number } | null = null;
   // Native selected-text commands carry no host identity. The armed host supplies the selected text.
   private selectedTextMenuArm: {
@@ -4473,6 +4527,7 @@ export class PanelProvider implements vscode.Disposable {
         if (this.detailsMenuArm?.host === host) {
           this.detailsMenuArm = null;
         }
+        if (this.linkMenuArm?.host === host) this.linkMenuArm = null;
         if (this.composerMenuArm?.host === host) {
           this.composerMenuArm = null;
         }
@@ -8788,6 +8843,23 @@ export class PanelProvider implements vscode.Disposable {
   // Broadcast the comment-editor request. Only the host with a matching context-menu selection opens it.
   public openComment(key: string): void {
     void this.post({ type: 'openComment', key });
+  }
+
+  public async openLinkFromMenu(raw: unknown, opening: LinkOpening): Promise<void> {
+    if (!raw || typeof raw !== 'object') return;
+    const context = raw as Record<string, unknown>;
+    const destination = parseLinkDestination(context.linkDestination);
+    const arm = this.linkMenuArm;
+    if (!arm || !destination || context.linkMenuToken !== arm.token || !isDeepStrictEqual(destination, arm.destination))
+      return;
+    this.linkMenuArm = null;
+    if (Date.now() - arm.at > 30_000 || !this.hosts.includes(arm.host)) return;
+    await openLink(
+      destination.kind === 'url' ? destination.url : destination.path,
+      this.column(),
+      destination.kind === 'fileCitation',
+      opening,
+    );
   }
 
   public requestSelectedTextHandoff(session: string, key: string, copyLabels: boolean): void {
@@ -16386,6 +16458,9 @@ export class PanelProvider implements vscode.Disposable {
         },
         selectedTextHandoff: (msg) => {
           this.acceptSelectedTextHandoff(host, msg.text, msg.session, msg.key, msg.copyLabels);
+        },
+        armLinkMenu: (msg) => {
+          this.linkMenuArm = { host, token: msg.token, destination: msg.destination, at: Date.now() };
         },
         armSessionDetails: (msg) => {
           this.detailsMenuArm = {

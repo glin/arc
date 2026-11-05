@@ -288,6 +288,27 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // Path commands accept the context object attached to a file row or summary link.
   reg('arc.copyPath', (arg) => void copyPath(arg, false));
   reg('arc.copyLink', (arg) => void copyLink(arg));
+  reg('arc.openLinkIntegrated', (arg) => void panel.openLinkFromMenu(arg, 'integrated'));
+  reg('arc.openLinkExternal', (arg) => void panel.openLinkFromMenu(arg, 'external'));
+  reg('arc.openLinkDefault', (arg) => void panel.openLinkFromMenu(arg, 'default'));
+  void vscode.commands
+    .getCommands(true)
+    .then((commands) =>
+      vscode.commands.executeCommand(
+        'setContext',
+        'arc.integratedBrowserAvailable',
+        commands.includes('workbench.action.browser.open'),
+      ),
+    );
+  const refreshLocalLinkBrowser = () =>
+    void vscode.commands.executeCommand(
+      'setContext',
+      'arc.localLinkBrowserAvailable',
+      vscode.env.remoteName === undefined &&
+        (vscode.workspace.workspaceFolders ?? []).every((folder) => folder.uri.scheme === 'file'),
+    );
+  refreshLocalLinkBrowser();
+  context.subscriptions.push(vscode.workspace.onDidChangeWorkspaceFolders(refreshLocalLinkBrowser));
   // Explorer and editor tab menus pass the clicked resource, then the Explorer's multi-selection.
   reg('arc.addToArc', (resource, selection) => panel.addToComposer(uriStringsFromCommand(resource, selection)));
   reg('arc.sendResponseLinkWithLabels', (arg) => sendResponseLink(panel, arg, true));

@@ -1,3 +1,4 @@
+import { webLinkUrl, linkBrowserKind, parseLinkDestination } from './domain/link-path';
 import { test, vi } from 'vitest';
 import { agentRunAnswer } from './turnrail';
 import { enumerateClaudeChildSources, enumerateSessionFiles, enumerateSessionFilesFor } from './transcript';
@@ -17970,4 +17971,49 @@ test('a Claude turn cost popover draws Tools rows from the results each request 
       ['Search', '25%', '1 request'],
     ],
   );
+});
+
+test('explicit browser destinations distinguish web authority from local HTML and literal filenames', () => {
+  for (const url of [
+    'https://example.com/report.pdf',
+    'http://localhost:3000/a',
+    'http://127.0.0.1/a',
+    'http://[::1]:3000/a',
+    'HTTPS://EXAMPLE.COM/a b?view=full#part',
+    'https://example.com/\u00e9%20?q=%25#part',
+  ]) {
+    assert.equal(webLinkUrl(url), true, url);
+    assert.equal(linkBrowserKind({ kind: 'url', url }), 'web');
+    assert.deepEqual(parseLinkDestination({ kind: 'url', url }), { kind: 'url', url });
+  }
+  for (const url of [
+    ' https://example.com',
+    'https:///report.html',
+    'https:report.html',
+    'http:/a.html',
+    'https://',
+    'https://?q=a',
+    'https://[broken',
+    'arc-session:id',
+    'data:text/html,a',
+    'https://exa mple.com',
+  ]) {
+    assert.equal(webLinkUrl(url), false, url);
+    assert.equal(linkBrowserKind({ kind: 'url', url }), null);
+  }
+  for (const path of ['report.html', 'report.HTM', 'C:/Notes/Report.HTML:42:7', '/notes/report.html#L10-L20'])
+    assert.equal(linkBrowserKind({ kind: 'path', path }), 'html', path);
+  for (const path of [
+    'report.md',
+    'report.svg',
+    'report.pdf',
+    'report.mp4',
+    'report',
+    'mailto:a.html',
+    'https:///report.html',
+    '  https://example.com/report.html',
+  ])
+    assert.equal(linkBrowserKind({ kind: 'path', path }), null, path);
+  assert.equal(linkBrowserKind({ kind: 'fileCitation', path: '/report.html#L10' }), null);
+  assert.equal(linkBrowserKind({ kind: 'fileCitation', path: '/report%20.HTML' }), 'html');
 });

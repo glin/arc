@@ -3837,7 +3837,7 @@ test('Markdown preview links activate by click and Enter while expanded code cop
       assert.equal(await edgeLink.count(), example.href ? 1 : 0);
       if (!example.href) continue;
       assert.equal(await edgeLink.getAttribute('data-link'), example.href);
-      assert.equal(await edgeLink.getAttribute('data-vscode-context'), null);
+      assert.equal(JSON.parse((await edgeLink.getAttribute('data-vscode-context'))!).arcLinkBrowser, 'web');
       await edgeLink.dispatchEvent('contextmenu');
       if (example.label) assert.equal(await page.getByRole('link', { name: example.label, exact: true }).count(), 1);
       await page.evaluate('window.__posted.length = 0');
@@ -3997,12 +3997,18 @@ test('a rendered Markdown table link offers Copy Link for its destination', asyn
     await page.locator(`[data-control=${JSON.stringify(`card:${card.key}`)}]`).click();
     const link = page.locator('table a[data-link]');
     await link.dispatchEvent('contextmenu');
-    assert.deepEqual(JSON.parse((await link.getAttribute('data-vscode-context')) || '{}'), {
-      webviewSection: 'arcTableLink',
-      link: 'https://example.com/reports/weekly?view=full#results',
-      arcCopyLink: true,
-      preventDefaultContextMenuItems: true,
-    });
+    const context = JSON.parse((await link.getAttribute('data-vscode-context')) || '{}');
+    assert.equal(context.arcLinkBrowser, 'web');
+    assert.equal(context.arcCopyLink, true);
+    assert.equal(context.link, 'https://example.com/reports/weekly?view=full#results');
+    assert.deepEqual(context.linkDestination, { kind: 'url', url: context.link });
+    assert.equal(typeof context.linkMenuToken, 'string');
+    assert.equal(context.session, '');
+    assert.equal(context.arcTurn, false);
+    const armed = await page.evaluate('window.__posted.filter(message => message.type === "armLinkMenu")');
+    assert.deepEqual(armed, [
+      { type: 'armLinkMenu', token: context.linkMenuToken, destination: context.linkDestination },
+    ]);
   } finally {
     await browser.close();
   }
@@ -4048,7 +4054,16 @@ test('a non-file summary URI keeps Copy Path context without handoff identity', 
         { webviewSection: 'arcLink', link: 'x:foo', preventDefaultContextMenuItems: true },
       ],
     );
-    assert.deepEqual(contexts.slice(4), [null, null, null, null], 'an HTTP link gained a native local-link context');
+    assert.deepEqual(
+      contexts.slice(4).map((raw) => JSON.parse(raw!).arcLinkBrowser ?? null),
+      [null, 'web', null, null],
+    );
+    for (const raw of contexts.slice(4)) {
+      const context = JSON.parse(raw!);
+      assert.equal(context.session, '');
+      assert.equal(context.arcSelection, false);
+      assert.equal(context.arcComments, false);
+    }
   } finally {
     await browser.close();
   }
@@ -6039,6 +6054,54 @@ test('a subagent opened from its parent opens that parent again from its heading
       [{ type: 'showSession', session: parentId }],
       'the subagent heading did not open the session that started it',
     );
+  } finally {
+    await browser.close();
+  }
+});
+
+test('response browser menus arm nested web and literal HTML links without inheriting turn actions', async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('A browser is required');
+    return;
+  }
+  const page = await browser.newPage();
+  try {
+    await page.setContent(themed(pageHtml()));
+    const payload = renderPayload() as Payload;
+    const card = {
+      ...payload.cards[0],
+      summaryHtml:
+        '<p><a data-link="https://example.com/a.png?q=%25#part"><strong>Report</strong></a></p>' +
+        '<p><a data-link="Report.HTML">HTML</a> <a data-link="/report%20.html" data-link-kind="file-citation">Literal</a></p>',
+    };
+    await post(page, { ...payload, cards: [card] });
+    await page.locator(`[data-control=${JSON.stringify(`card:${card.key}`)}]`).click();
+    const web = page.locator('a[data-link]').first();
+    await web.locator('strong').dispatchEvent('contextmenu');
+    const first = JSON.parse((await web.getAttribute('data-vscode-context'))!);
+    assert.equal(first.arcLinkBrowser, 'web');
+    assert.equal(first.arcSelection, false);
+    assert.equal(first.arcTurn, false);
+    assert.equal(first.arcComments, false);
+    await web.dispatchEvent('contextmenu');
+    const second = JSON.parse((await web.getAttribute('data-vscode-context'))!);
+    assert.notEqual(first.linkMenuToken, second.linkMenuToken);
+    for (const [index, destination] of [
+      [1, { kind: 'path', path: 'Report.HTML' }],
+      [2, { kind: 'fileCitation', path: '/report%20.html' }],
+    ] as const) {
+      const link = page.locator('a[data-link]').nth(index);
+      await link.focus();
+      await link.dispatchEvent('contextmenu');
+      const context = JSON.parse((await link.getAttribute('data-vscode-context'))!);
+      assert.equal(context.arcLinkBrowser, 'html');
+      assert.deepEqual(context.linkDestination, destination);
+    }
+    const messages = await page.evaluate<unknown[]>(
+      'window.__posted.filter(message => message.type === "armLinkMenu")',
+    );
+    assert.equal(messages.length, 4);
   } finally {
     await browser.close();
   }

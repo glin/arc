@@ -1,3 +1,5 @@
+import { linkBrowserKind, parseLinkDestination } from './domain/link-path';
+import { isDeepStrictEqual } from 'node:util';
 import { CommandCatalogs } from './commandcatalog';
 import { commitSourceStamp, recordCommits as recordTranscriptCommits } from './transcript';
 import {
@@ -44091,4 +44093,270 @@ test('programmatic service tiers validate setup providers and persist only the l
         assert.equal(provider.picks['started-1'].serviceTier, 'priority');
       }
     }
+});
+
+test('local HTML menu eligibility follows workspace folder changes', () => {
+  const extensionSource = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
+  const start = extensionSource.indexOf('const refreshLocalLinkBrowser =');
+  const end = extensionSource.indexOf('// Explorer and editor tab menus', start);
+  assert.ok(start >= 0 && end > start);
+  const compiled = ts.transpileModule(extensionSource.slice(start, end), {
+    compilerOptions: { target: ts.ScriptTarget.ES2022 },
+  }).outputText;
+  for (const remoteName of [undefined, 'ssh-remote', 'wsl', 'dev-container']) {
+    const calls: unknown[][] = [];
+    const listeners: Array<() => void> = [];
+    const disposable = { dispose() {} };
+    const context = { subscriptions: [] as unknown[] };
+    const host = {
+      env: { remoteName },
+      commands: { executeCommand: (...args: unknown[]) => calls.push(args) },
+      workspace: {
+        workspaceFolders: [{ uri: { scheme: 'file' } }],
+        onDidChangeWorkspaceFolders: (listener: () => void) => {
+          listeners.push(listener);
+          return disposable;
+        },
+      },
+    };
+    new Function('vscode', 'context', compiled)(host, context);
+    assert.deepEqual(calls.pop(), ['setContext', 'arc.localLinkBrowserAvailable', remoteName === undefined]);
+    host.workspace.workspaceFolders.push({ uri: { scheme: 'memfs' } });
+    for (const listener of listeners) listener();
+    assert.deepEqual(calls.pop(), ['setContext', 'arc.localLinkBrowserAvailable', false]);
+    host.workspace.workspaceFolders.pop();
+    for (const listener of listeners) listener();
+    assert.deepEqual(calls.pop(), ['setContext', 'arc.localLinkBrowserAvailable', remoteName === undefined]);
+    host.workspace.workspaceFolders = [];
+    for (const listener of listeners) listener();
+    assert.deepEqual(calls.pop(), ['setContext', 'arc.localLinkBrowserAvailable', remoteName === undefined]);
+    assert.deepEqual(calls, []);
+    assert.deepEqual(context.subscriptions, [disposable]);
+  }
+});
+
+test('explicit link actions dispatch only their validated destination and retain automatic clicks', async () => {
+  const { linkCandidates, linkLocation } = await import('./transcript.js');
+  const compiled = ts.transpileModule(declarationSource(panelHostSource, 'openLink'), {
+    compilerOptions: { target: ts.ScriptTarget.ES2022 },
+  }).outputText;
+  for (const platform of ['win32', 'darwin', 'linux'] as const) {
+    const paths = platform === 'win32' ? path.win32 : path.posix;
+    const root = platform === 'win32' ? 'C:/Notes' : '/notes';
+    const files = new Map<string, number>();
+    const failures = new Map<string, unknown>();
+    const calls: unknown[][] = [];
+    const notices: string[] = [];
+    const reads: string[] = [];
+    let available = true;
+    let accepted = true;
+    let throws = false;
+    const uri = (file: string) => ({
+      scheme: 'file',
+      fsPath: file,
+      toString: (skipEncoding = false) => {
+        const normalized = file.replaceAll('\\', '/');
+        const pathname = normalized.startsWith('/') ? normalized : `/${normalized}`;
+        return `file://${skipEncoding ? pathname : encodeURI(pathname).replaceAll('#', '%23').replaceAll('?', '%3F')}`;
+      },
+    });
+    const host = {
+      Uri: { file: uri, parse: (url: string) => url },
+      FileType: { File: 1, Directory: 2 },
+      env: {
+        remoteName: undefined as string | undefined,
+        openExternal: async (value: unknown) => {
+          calls.push(['external', value]);
+          if (throws) throw new Error('application failed');
+          return accepted;
+        },
+      },
+      workspace: {
+        workspaceFolders: [{ uri: uri(root) }],
+        fs: {
+          stat: async (value: ReturnType<typeof uri>) => {
+            reads.push(value.fsPath);
+            if (failures.has(value.fsPath)) throw failures.get(value.fsPath);
+            const type = files.get(value.fsPath);
+            if (type === undefined) throw Object.assign(new Error('missing'), { code: 'FileNotFound' });
+            return { type };
+          },
+        },
+      },
+      commands: {
+        getCommands: async () => (available ? ['workbench.action.browser.open'] : []),
+        executeCommand: async (...args: unknown[]) => {
+          calls.push(args);
+        },
+      },
+      window: {
+        showInformationMessage: (message: string) => notices.push(message),
+        showTextDocument: async (...args: unknown[]) => {
+          calls.push(['text', ...args]);
+        },
+      },
+    };
+    const open = new Function(
+      'process',
+      'vscode',
+      'linkBrowserKind',
+      'nativeCitationPath',
+      'linkLocation',
+      'linkCandidates',
+      'linkTargetIsHtml',
+      `${compiled}; return openLink;`,
+    )(
+      { platform },
+      host,
+      linkBrowserKind,
+      (value: string) => nativeCitationPath(value, platform),
+      linkLocation,
+      (target: string, folders: string[]) => linkCandidates(target, folders, platform),
+      (value: string) => /\.html?$/i.test(value),
+    );
+    for (const url of ['HTTPS://example.com/a.pdf?q=%25#part', 'http://localhost:3000/a', 'http://[::1]:3000/\u00e9']) {
+      await open(url, 2, false, 'integrated');
+      assert.deepEqual(calls.pop(), ['workbench.action.browser.open', url]);
+      await open(url, 2, false, 'external');
+      assert.deepEqual(calls.pop(), ['external', url]);
+    }
+    assert.deepEqual(reads, []);
+    for (const url of [' https://example.com/a.html', 'https:///a.html', 'https:a.html', 'mailto:a.html']) {
+      await open(url, 2, false, 'integrated');
+      await open(url, 2, false, 'external');
+    }
+    assert.deepEqual(calls, []);
+    const html = paths.join(root, 'Report.HTML');
+    files.set(html, 1);
+    await open('Report.HTML:42:7', 2, false, 'integrated');
+    assert.deepEqual(calls.pop(), ['workbench.action.browser.open', uri(html).toString()]);
+    await open('Report.HTML', 2, false, 'default');
+    assert.equal((calls.pop()![1] as ReturnType<typeof uri>).fsPath, html);
+    const literal = `${root}/report%20.html`;
+    files.set(literal, 1);
+    const decoded = `${root}/report .html`;
+    files.set(decoded, 1);
+    files.set(paths.resolve(root, 'report%20.html'), 1);
+    files.set(paths.resolve(root, 'report .html'), 1);
+    for (const [written, literalPath, expected] of [
+      [literal, true, 'report%20.html'],
+      [decoded, true, 'report .html'],
+      [`${root}/report%2520.html`, false, 'report%20.html'],
+      [literal, false, 'report .html'],
+    ] as const) {
+      await open(written, 2, literalPath, 'integrated');
+      const [command, destination] = calls.pop()!;
+      assert.equal(command, 'workbench.action.browser.open');
+      assert.equal(
+        decodeURIComponent(new URL(destination as string).pathname)
+          .split('/')
+          .at(-1),
+        expected,
+      );
+      assert.equal(reads.at(-1)!.replaceAll('\\', '/').split('/').at(-1), expected);
+    }
+    await open(literal, 2, true, 'default');
+    assert.equal((calls.pop()![1] as ReturnType<typeof uri>).fsPath, literal);
+    for (const file of ['report.md', 'report.png', 'report.pdf', 'report.mp4', 'report.html#L10']) {
+      await open(`${root}/${file}`, 2, true, 'default');
+      assert.deepEqual(calls, []);
+    }
+    files.set(html, 2);
+    await open('Report.HTML', 2, false, 'default');
+    assert.match(notices.pop()!, /not an HTML file/);
+    assert.deepEqual(calls, []);
+    files.delete(html);
+    await open('Report.HTML', 2, false, 'default');
+    assert.match(notices.pop()!, /no file/);
+    failures.set(html, new Error('permission denied'));
+    await open('Report.HTML', 2, false, 'default');
+    assert.match(notices.pop()!, /permission denied/);
+    failures.clear();
+    files.set(html, 1);
+    host.env.remoteName = 'ssh-remote';
+    await open('Report.HTML', 2, false, 'default');
+    assert.match(notices.pop()!, /local desktop/);
+    await open('http://localhost:3000/a', 2, false, 'external');
+    assert.deepEqual(calls.pop(), ['external', 'http://localhost:3000/a']);
+    host.env.remoteName = undefined;
+    host.workspace.workspaceFolders[0].uri.scheme = 'vscode-remote';
+    await open('Report.HTML', 2, false, 'integrated');
+    assert.match(notices.pop()!, /local desktop/);
+    host.workspace.workspaceFolders[0].uri.scheme = 'file';
+    available = false;
+    await open('https://example.com', 2, false, 'integrated');
+    assert.match(notices.pop()!, /unavailable/);
+    assert.deepEqual(calls, []);
+    accepted = false;
+    await open('https://example.com', 2, false, 'external');
+    assert.match(notices.pop()!, /external browser did not open/);
+    calls.length = 0;
+    await open('Report.HTML', 2, false, 'default');
+    assert.match(notices.pop()!, /default application did not open/);
+    calls.length = 0;
+    throws = true;
+    await open('https://example.com', 2, false, 'external');
+    assert.match(notices.pop()!, /application failed/);
+    calls.length = 0;
+    throws = false;
+    accepted = true;
+    await open('https:///report.html', 2);
+    assert.deepEqual(calls.pop(), ['external', 'https:///report.html']);
+  }
+});
+
+test('native link opening consumes only the invoking panel token and exact typed destination', async () => {
+  vi.useFakeTimers();
+  try {
+    vi.setSystemTime(1000);
+    const calls: unknown[][] = [];
+    const compiled = ts.transpileModule(
+      `async function invoke(raw: unknown, opening: unknown) {${methodBody('public async openLinkFromMenu(')}}`,
+      {
+        compilerOptions: { target: ts.ScriptTarget.ES2022 },
+      },
+    ).outputText;
+    const invoke = new Function('parseLinkDestination', 'isDeepStrictEqual', 'openLink', `${compiled}; return invoke;`)(
+      parseLinkDestination,
+      isDeepStrictEqual,
+      async (...args: unknown[]) => {
+        calls.push(args);
+      },
+    );
+    const first = { session: 'same' },
+      second = { session: 'same' },
+      third = { session: 'other' };
+    const destination = { kind: 'url', url: 'https://example.com' };
+    const owner = { hosts: [first, second, third], linkMenuArm: null as any, column: () => 2 };
+    const arm = (host: object, token: string) => {
+      owner.linkMenuArm = { host, token, destination, at: Date.now() };
+    };
+    arm(first, 'first');
+    arm(second, 'second');
+    await invoke.call(owner, { linkMenuToken: 'first', linkDestination: destination }, 'integrated');
+    assert.deepEqual(calls, []);
+    await invoke.call(
+      owner,
+      { linkMenuToken: 'second', linkDestination: { ...destination, url: 'https://other.test' } },
+      'integrated',
+    );
+    assert.deepEqual(calls, []);
+    await invoke.call(owner, { linkMenuToken: 'second', linkDestination: destination }, 'integrated');
+    assert.deepEqual(calls.pop(), ['https://example.com', 2, false, 'integrated']);
+    await invoke.call(owner, { linkMenuToken: 'second', linkDestination: destination }, 'external');
+    assert.deepEqual(calls, []);
+    arm(third, 'third');
+    vi.advanceTimersByTime(30_001);
+    await invoke.call(owner, { linkMenuToken: 'third', linkDestination: destination }, 'external');
+    assert.equal(owner.linkMenuArm, null);
+    arm(second, 'disposed');
+    owner.hosts = [first, third];
+    await invoke.call(owner, { linkMenuToken: 'disposed', linkDestination: destination }, 'external');
+    assert.equal(owner.linkMenuArm, null);
+    await invoke.call(owner, {}, 'external');
+    assert.deepEqual(calls, []);
+    sourceMatch(panelHostSource, /if \(this\.linkMenuArm\?\.host === host\) this\.linkMenuArm = null/);
+  } finally {
+    vi.useRealTimers();
+  }
 });

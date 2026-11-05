@@ -291,6 +291,18 @@
         "command": "arc.exportSession",
         "title": "Export session as HTML...",
         "category": "Arc Session"
+      },
+      {
+        "command": "arc.openLinkIntegrated",
+        "title": "Open in Integrated Browser"
+      },
+      {
+        "command": "arc.openLinkExternal",
+        "title": "Open in External Browser"
+      },
+      {
+        "command": "arc.openLinkDefault",
+        "title": "Open in Default Application"
       }
     ],
     "menus": {
@@ -335,6 +347,21 @@
           "command": "arc.copyRelativePath",
           "when": "webviewSection == 'arcFile'",
           "group": "5_copypath@2"
+        },
+        {
+          "command": "arc.openLinkIntegrated",
+          "when": "arc.integratedBrowserAvailable && (arcLinkBrowser == 'web' || (arcLinkBrowser == 'html' && arc.localLinkBrowserAvailable))",
+          "group": "0_open@1"
+        },
+        {
+          "command": "arc.openLinkExternal",
+          "when": "arcLinkBrowser == 'web'",
+          "group": "0_open@2"
+        },
+        {
+          "command": "arc.openLinkDefault",
+          "when": "arcLinkBrowser == 'html' && arc.localLinkBrowserAvailable",
+          "group": "0_open@2"
         },
         {
           "command": "arc.copyLink",
@@ -725,6 +752,18 @@
         },
         {
           "command": "arc.exportSession",
+          "when": "false"
+        },
+        {
+          "command": "arc.openLinkIntegrated",
+          "when": "false"
+        },
+        {
+          "command": "arc.openLinkExternal",
+          "when": "false"
+        },
+        {
+          "command": "arc.openLinkDefault",
           "when": "false"
         }
       ]

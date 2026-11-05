@@ -22,7 +22,7 @@ Display paths use forward slashes. Actions send the recorded path. File rows ope
 
 Normal opening prefers the active text-editor group outside the panel, then the leftmost visible text-editor group outside it. With neither, it reuses the panel group, or group one without a panel. Explicit split actions request another group. Whole-turn diff split actions reuse their previous group while it remains open and differs from the panel.
 
-`openLink` in `panelhost.ts` owns local response-link routing. `linkTargetIsHtml`, `linkTargetIsMarkdown`, and `linkTargetIsVideo` in `transcript.ts` own extension matching.
+`openLink` in `panelhost.ts` owns local response-link routing. `domain/link-path.ts` owns HTML matching and explicit browser destination classification. `linkTargetIsMarkdown` and `linkTargetIsVideo` in `transcript.ts` own Markdown and video matching.
 
 Video extensions match regardless of case on Windows, macOS, and Linux. Video opening needs a default application and uses no editor group. Successful opening does not establish playback or codec support. Integrated-browser placement follows `workbench.browser.newTabPlacement`, and VS Code applies workspace trust to local HTML. HTTP and HTTPS links open in the configured external browser.
 
@@ -81,7 +81,9 @@ During `/clear`, resolve the source through the invoking panel. Copy that panel'
 
 ### Link menus and copy paths
 
-Named session links suppress inherited turn, selection, comment, and copy actions. Compaction links retain Copy Path without source identity. HTTP and HTTPS links keep the browser menu outside Markdown tables. Inside tables, Arc supplies Copy Link.
+Named session links suppress inherited turn, selection, comment, and copy actions. Compaction links retain Copy Path without source identity. Valid HTTP and HTTPS links offer Open in Integrated Browser, Open in External Browser, and Copy Link inside and outside Markdown tables. Web URL suffixes do not change these actions. The integrated entry requires the editor browser command. Local HTML links offer Open in Integrated Browser and Open in Default Application in local desktop windows. Virtual workspace folders hide local HTML opening actions until removed. Other local types retain their existing path actions. HTML hints require no filesystem reads. Explicit opening checks for a regular HTML file and rejects folders. Copy Link preserves the complete written URL.
+
+Each native link invocation supplies a fresh token and typed destination through its own panel. Opening consumes only the matching invocation within 30 seconds. Disposed panels and mismatched invocations supply no destination. Exported sessions and the web demo block these host actions.
 
 Copy-path actions use one extension-prepared spelling. Ordinary Markdown links receive native Copy Path context without target resolution or a workspace-containment check. [Literal citations](#response-link-and-citation-contracts) keep separate native actions.
 

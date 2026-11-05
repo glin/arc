@@ -1,3 +1,4 @@
+import { parseLinkDestination, type LinkDestination } from '../domain/link-path';
 import { RAIL_FILTER_QUERY_LIMIT } from '../domain/rail-filters.ts';
 import { sessionQueryError, type SessionQueryContext } from '../domain/session-query.ts';
 import type { FileCitationDestination } from '../domain/file-citation.ts';
@@ -455,6 +456,7 @@ export type PanelToHost =
   | { type: 'note'; note: unknown }
   | { type: 'armSelectedText'; session: string; key: string }
   | { type: 'selectedTextHandoff'; session: string; key: string; text: string; copyLabels: boolean }
+  | { type: 'armLinkMenu'; token: string; destination: LinkDestination }
   | { type: 'armSessionDetails'; session: string }
   | { type: 'armComposer' }
   | { type: 'showReaderParent'; session: string }
@@ -1290,6 +1292,12 @@ export function parsePanelToHost(raw: unknown): PanelToHost | null {
             copyLabels: m.copyLabels,
           }
         : null;
+    case 'armLinkMenu': {
+      const destination = parseLinkDestination(m.destination);
+      return isString(m.token) && m.token.length > 0 && m.token.length <= 128 && destination
+        ? { type: 'armLinkMenu', token: m.token, destination }
+        : null;
+    }
     case 'armSessionDetails':
       return isString(m.session) && m.session.length > 0 ? { type: 'armSessionDetails', session: m.session } : null;
     case 'armComposer':
@@ -1608,6 +1616,8 @@ export function dispatchPanelToHost<R>(message: PanelToHost, handlers: PanelToHo
       return handlers.armSelectedText(message);
     case 'selectedTextHandoff':
       return handlers.selectedTextHandoff(message);
+    case 'armLinkMenu':
+      return handlers.armLinkMenu(message);
     case 'armSessionDetails':
       return handlers.armSessionDetails(message);
     case 'armComposer':

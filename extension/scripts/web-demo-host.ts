@@ -47,6 +47,7 @@ export const DEMO_HOST_POLICY = {
   note: 'handled',
   armSelectedText: 'noop',
   selectedTextHandoff: 'noop',
+  armLinkMenu: 'noop',
   armSessionDetails: 'noop',
   armComposer: 'noop',
   showReaderParent: 'handled',

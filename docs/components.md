@@ -189,7 +189,7 @@ Paths are relative to `extension/src/`. [Architecture](architecture.md) owns pac
 | `domain/labels.ts` | Browser-safe label identity, name ceiling, typed-name warning, label-count wording rules, and the choice of the row Tab applies | no |
 | `domain/model-identity.ts` | Model id comparison shared by transcript turns and the Prompt box: window suffix, snapshot date, Bedrock prefix, and deployment suffix | no |
 | `domain/version.ts` | Release version parsing and semantic-version ordering for the Claude snapshot setup floor and the Codex applied-defaults floor | no |
-| `domain/link-path.ts` | Browser-safe local-path versus URI-scheme classification | no |
+| `domain/link-path.ts` | Browser-safe local-path and URI-scheme classification, HTML matching, and explicit browser destination contracts | no |
 | `domain/file-citation.ts` | Bounded assistant-directive grammar, source masking, and native literal file destination admission | no |
 | `domain/prompt-assets.ts` | Browser-safe prompt attachment count and byte limits and the shared drag type list | no |
 | `domain/prompt-text.ts` | Browser-safe individual text limit shared by drafts, queued submissions, and submitted prompt recovery | no |

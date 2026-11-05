@@ -23,6 +23,21 @@ test('response file citations retain their typed literal destination at the host
   );
 });
 
+test('link menus retain their invocation token and typed destination at the host boundary', () => {
+  for (const destination of [
+    { kind: 'url', url: 'https://localhost:3000/a?x=1#part' },
+    { kind: 'path', path: 'report.html' },
+    { kind: 'fileCitation', path: '/report.html#L10' },
+  ]) {
+    const message = { type: 'armLinkMenu', token: 'invocation', destination };
+    assert.deepEqual(parsePanelToHost(message), message);
+  }
+  for (const token of [null, '', 2, 'x'.repeat(129)])
+    assert.equal(parsePanelToHost({ type: 'armLinkMenu', token, destination: { kind: 'path', path: 'a.html' } }), null);
+  for (const destination of [null, {}, { kind: 'url', url: 'https:///report.html' }, { kind: 'path', path: 1 }])
+    assert.equal(parsePanelToHost({ type: 'armLinkMenu', token: 'menu', destination }), null);
+});
+
 test('response session navigation retains its explicit marker and rejects malformed markers', () => {
   const message = { type: 'showSession', session: 'saved-id', responseLink: true };
   assert.deepEqual(parsePanelToHost(message), message);
@@ -613,6 +628,10 @@ const PANEL: Array<{ raw: Record<string, unknown>; parsed: PanelToHost }> = [
     parsed: { type: 'selectedTextHandoff', session: 's1', key: 's1:1', text: 'selected', copyLabels: false },
   },
   {
+    raw: { type: 'armLinkMenu', token: 'menu', destination: { kind: 'path', path: 'a.html' } },
+    parsed: { type: 'armLinkMenu', token: 'menu', destination: { kind: 'path', path: 'a.html' } },
+  },
+  {
     raw: { type: 'armSessionDetails', session: 's1' },
     parsed: { type: 'armSessionDetails', session: 's1' },
   },
@@ -792,6 +811,7 @@ function panelRecorder(seen: string[]): PanelToHostHandlers<void> {
     note: take('note'),
     armSelectedText: take('armSelectedText'),
     selectedTextHandoff: take('selectedTextHandoff'),
+    armLinkMenu: take('armLinkMenu'),
     armSessionDetails: take('armSessionDetails'),
     armComposer: take('armComposer'),
     showReaderParent: take('showReaderParent'),

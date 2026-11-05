@@ -1,5 +1,5 @@
 import type { PanelToHost } from './protocol.ts';
-import { isLocalLinkPath } from '../domain/link-path.ts';
+import { isLocalLinkPath, webLinkUrl, linkBrowserKind, type LinkDestination } from '../domain/link-path.ts';
 import { parseSessionLink, sessionLinkContext } from '../domain/session-link.ts';
 
 export interface SummaryWords {
@@ -107,9 +107,13 @@ export function enhanceSummary(root: HTMLElement, options: SummaryOptions): () =
     }
     const inTable = !!link.closest('table');
     const webLink = /^https?:/i.test(href.trimStart());
-    if (webLink && !inTable) {
-      continue;
-    }
+    const destination: LinkDestination =
+      link.dataset.linkKind === 'file-citation'
+        ? { kind: 'fileCitation', path: href }
+        : webLinkUrl(href)
+          ? { kind: 'url', url: href }
+          : { kind: 'path', path: href };
+    const browserKind = linkBrowserKind(destination);
     const source =
       isLocalLinkPath(href) && options.sessionId && options.turnKey
         ? {
@@ -120,12 +124,34 @@ export function enhanceSummary(root: HTMLElement, options: SummaryOptions): () =
     link.dataset.vscodeContext = JSON.stringify({
       webviewSection: webLink ? 'arcTableLink' : 'arcLink',
       link: link.dataset.link,
-      ...(link.dataset.linkKind === 'file-citation' ? { destination: { kind: 'fileCitation', path: href } } : {}),
-      ...(inTable ? { arcCopyLink: true } : {}),
+      ...(link.dataset.linkKind === 'file-citation' ? { destination } : {}),
+      ...(browserKind ? { arcLinkBrowser: browserKind } : {}),
+      ...(webLink ? { session: '', key: '', arcSelection: false, arcTurn: false, arcComments: false } : {}),
+      ...(inTable || webLink ? { arcCopyLink: true } : {}),
       ...source,
       preventDefaultContextMenuItems: true,
     });
   }
+
+  const armMenu = (event: MouseEvent) => {
+    const link = closestWithin<HTMLAnchorElement>(root, event.target, 'a[data-link]');
+    if (!link) return;
+    const context = JSON.parse(link.dataset.vscodeContext || '{}');
+    if (!context.arcLinkBrowser) return;
+    const raw = link.dataset.link || '';
+    const destination: LinkDestination =
+      link.dataset.linkKind === 'file-citation'
+        ? { kind: 'fileCitation', path: raw }
+        : webLinkUrl(raw)
+          ? { kind: 'url', url: raw }
+          : { kind: 'path', path: raw };
+    const token = Array.from(crypto.getRandomValues(new Uint32Array(4)), (word) =>
+      word.toString(16).padStart(8, '0'),
+    ).join('');
+    link.dataset.vscodeContext = JSON.stringify({ ...context, linkMenuToken: token, linkDestination: destination });
+    options.post({ type: 'armLinkMenu', token, destination });
+  };
+  root.addEventListener('contextmenu', armMenu);
 
   const activate = (event: MouseEvent) => {
     const copy = closestWithin<HTMLButtonElement>(root, event.target, 'button.copy');
@@ -185,6 +211,7 @@ export function enhanceSummary(root: HTMLElement, options: SummaryOptions): () =
   root.addEventListener('click', activate);
   return () => {
     root.removeEventListener('click', activate);
+    root.removeEventListener('contextmenu', armMenu);
     for (const timer of timers) {
       clearTimeout(timer);
     }

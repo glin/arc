@@ -63,6 +63,7 @@ export const EXPORT_HOST_POLICY = {
   note: 'blocked',
   armSelectedText: 'blocked',
   selectedTextHandoff: 'blocked',
+  armLinkMenu: 'blocked',
   armSessionDetails: 'blocked',
   armComposer: 'blocked',
   showReaderParent: 'local',
