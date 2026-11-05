@@ -15312,6 +15312,38 @@ test('a complete reply that waits only for dispatched spend publishes, and spend
   }
 });
 
+// A dispatched file that moves after members settle reads its spend in one spend-only pass. A full pass would open a new
+// discovery epoch and scan the receipt store again from its first entry.
+test('a dispatched file that moves after members settle reads its spend without a full discovery pass', async () => {
+  vi.useFakeTimers();
+  try {
+    const { provider, counters, requests, walks } = partialSpendHarness(true);
+    provider.refreshFrom('startup', true);
+    const quiet = (count: number) =>
+      !provider.dispatchSpendPending && requests.length >= count && provider.refreshController === null;
+    // Each step runs the timers due and the work they release. The step bound is the test's deadline.
+    for (let step = 0; step < 500 && !quiet(4); step++) await vi.advanceTimersByTimeAsync(1);
+    assert.deepEqual(requests, ['discovery', 'spend', 'spend', 'spend']);
+    // The accepted reply names a dispatched session whose held facts no longer match its catalog row.
+    provider.claudeChildReferences = [
+      { kind: 'dispatch', sessionId: 'codex-a', file: 'codex-a.jsonl', parentSessionId: 'parent', toolUseIds: [] },
+    ];
+    provider.refreshFrom('dispatch-discovery', false, true);
+    for (let step = 0; step < 500 && !quiet(5); step++) await vi.advanceTimersByTimeAsync(1);
+    // The tail ends once the moved root settles: no further request follows the spend-only pass.
+    for (let step = 0; step < 50; step++) await vi.advanceTimersByTimeAsync(1);
+    assert.deepEqual(requests, ['discovery', 'spend', 'spend', 'spend', 'spend']);
+    assert.equal(walks(), 1, 'the refresh walked the catalog');
+    const { work, discovery } = counters.snapshot();
+    assert.equal(work['discoveryRequest:dispatchSpend'], 1);
+    assert.equal(work['discoveryRequest:dispatchChanged'], undefined, 'a moved dispatched file sent a full pass');
+    assert.equal(discovery.publications, 2);
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
+
 for (const failure of ['held-false', 'reject'] as const)
   test(`a spend-only request that ${failure === 'reject' ? 'fails' : 'finds no held reply'} sends discovery back to a full pass`, async () => {
     vi.useFakeTimers();

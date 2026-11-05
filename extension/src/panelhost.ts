@@ -9819,7 +9819,25 @@ export class PanelProvider implements vscode.Disposable {
       // A held complete reply, such as one a discovery continuation applied, waits for a refresh to accept it. A refresh that
       // reuses the catalog accepts it before it sends another request.
       const replyHeld = reuseCatalog && this.discoveryComplete?.scope === JSON.stringify(this.repositoryScopeRoots);
-      if (!selectedOnly && (!reuseCatalog || (!replyHeld && (dispatchChanged || this.dispatchDiscoveryPending)))) {
+      // While members stay settled, a dispatched file that moved needs only its spend read again. The spend-only pass that
+      // follows this refresh reads it with no discovery epoch and no receipt scan.
+      const spendOnly =
+        dispatchChanged &&
+        reuseCatalog &&
+        !replyHeld &&
+        !this.dispatchDiscoveryPending &&
+        this.claudeChildrenDiscovered;
+      if (spendOnly) {
+        this.dispatchSpendPending = true;
+        this.performanceCounters.recordWork('discoveryRequest:dispatchSpend');
+      }
+      if (
+        !selectedOnly &&
+        (!reuseCatalog || (!replyHeld && ((dispatchChanged && !spendOnly) || this.dispatchDiscoveryPending)))
+      ) {
+        this.performanceCounters.recordWork(
+          `discoveryRequest:${!reuseCatalog ? 'walked' : this.dispatchDiscoveryPending ? 'membersPending' : 'dispatchChanged'}`,
+        );
         this.startupHistory?.stage('relationshipsStarted');
         const listed = new Map(all.map((session) => [session.file, session]));
         const discovered = await this.prepareClaudeChildren(generation, controller.signal, humanPromptWork);
