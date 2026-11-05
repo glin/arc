@@ -405,6 +405,13 @@ async function receiptDiscoveryHost(
   return { host, replies };
 }
 
+// Tests of events inside a receipt scan read a small store over several requests, so each request gets 256 receipt steps.
+function narrowReceiptAllowance(code: string): string {
+  const allowance = 'receiptSteps >= RECEIPT_STEPS';
+  assert.equal(code.split(allowance).length - 1, 1, 'The receipt step allowance did not match');
+  return code.replace(allowance, 'receiptSteps >= 256');
+}
+
 // The worker lists the receipt store's launch directories first, or last when asked, and reports when it has listed every
 // launch directory. It also reports each later opening of the store, which starts a receipt scan again from its first entry.
 const launchesFirst = (store: string, last = false) =>
@@ -446,7 +453,7 @@ test.each(['added', 'removed', 'requester removed', 'added before the launches a
       const worker = new ProgressiveWorker(
         `process.env.ARC_HOME=${JSON.stringify(fx.home)};performance.now=()=>0;` +
           launchesFirst(fx.receipts.root, early) +
-          source,
+          narrowReceiptAllowance(source),
         undefined,
         (file) => {
           if (file === 'receipt-store-opened') storeOpened = true;
@@ -567,7 +574,7 @@ test.each(['during each forward read', 'on their own clock'])(
     const clock = writer === 'on their own clock';
     const requestStart = 'requests.set(message.id, controller);';
     assert.equal(source.split(requestStart).length - 1, 1, 'Worker request instrumentation did not match');
-    const instrumented = source.replace(
+    const instrumented = narrowReceiptAllowance(source).replace(
       requestStart,
       `${requestStart} if (message.request.kind === 'claude-children') entryActive = { id: message.id, generation: message.generation, armed: entryOpened && message.generation % 2 === 0 };`,
     );
@@ -672,7 +679,7 @@ test.each(['during the scan', 'after the last store entry'])(
         receiptEntries(fx.receipts.root) +
         replacedStore(fx.receipts.root, marker) +
         (when === 'during the scan' ? '' : replacedAtStoreEnd(fx.receipts.root, marker, launchId)) +
-        source,
+        narrowReceiptAllowance(source),
       undefined,
       (file) => {
         if (file === 'receipt-store-opened') openings++;
@@ -2413,7 +2420,7 @@ test('a Claude child whose root leaves and returns within one epoch keeps its ow
   ];
   // A frozen clock ends each pass on its receipt step allowance.
   const worker = new ProgressiveWorker(
-    `process.env.ARC_HOME=${JSON.stringify(arcHome)};performance.now=()=>0;` + source,
+    `process.env.ARC_HOME=${JSON.stringify(arcHome)};performance.now=()=>0;` + narrowReceiptAllowance(source),
   );
   const request = (roots: string[]) => ({
     kind: 'claude-children' as const,
