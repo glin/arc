@@ -197,6 +197,7 @@ function laterTaskIdentity(
         type: parsed.type,
         // Distinct unlabelled launches remain distinct across overlapping page guards.
         uuid: typeof parsed.uuid === 'string' ? parsed.uuid : `source:${source.start}`,
+        timestamp: parsed.timestamp,
         message: { content: blocks },
         ...(result
           ? {

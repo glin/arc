@@ -2334,9 +2334,10 @@ function observeClaudeTask(state: ClaudeTaskEvidence, record: Record<string, unk
         continue;
       const tool = '@' + block.id;
       const identity =
-        typeof record.uuid === 'string'
+        claudeRecordKey(JSON.stringify(record)) ??
+        (typeof record.uuid === 'string'
           ? record.uuid
-          : createHash('sha256').update(JSON.stringify(record)).digest('hex');
+          : createHash('sha256').update(JSON.stringify(record)).digest('hex'));
       noteKind(tool, kindOf(block.name));
       if (state.launches[tool] !== undefined && (typeof record.uuid !== 'string' || state.launches[tool] !== identity))
         state.tools[tool] = 'unknown';
@@ -2936,8 +2937,8 @@ export interface PersonScan {
   countedBefore?: boolean;
 }
 
-// The identity key of a counted record, or null for a record without an identity.
-function personRecordKey(line: string): string | null {
+// The top-level UUID and timestamp key, or null for a record without an identity.
+function claudeRecordKey(line: string): string | null {
   const identity = claudeRecordIdentity(line);
   return identity ? `${identity.uuid}\n${identity.timestamp}` : null;
 }
@@ -2958,7 +2959,7 @@ function countPersonRecordsBefore(file: string, scan: PersonScan): void {
         continue;
       }
       const prompts = probe.prompts;
-      const key = personSpokeIn(parsed, probe) || probe.prompts !== prompts ? personRecordKey(line) : null;
+      const key = personSpokeIn(parsed, probe) || probe.prompts !== prompts ? claudeRecordKey(line) : null;
       if (key) counted.push(key);
     }
     return false;
@@ -2996,7 +2997,7 @@ export function scanForPerson(file: string, size: number, prev?: PersonScan, sta
       }
       const trial = { ...scan };
       const spoke = personSpokeIn(parsed, trial);
-      const key = spoke || trial.prompts !== scan.prompts ? personRecordKey(line) : null;
+      const key = spoke || trial.prompts !== scan.prompts ? claudeRecordKey(line) : null;
       if (key) {
         // A record that would decide checks the bytes before a tail scan's start once.
         if (spoke && scan.start > 0 && !scan.countedBefore) countPersonRecordsBefore(file, scan);

@@ -1093,6 +1093,7 @@ import {
   reduceClaudeUsageLine,
   createClaudeUsageLineReducer,
   createClaudeSessionReducer,
+  applyClaudeSessionTaskEvidence,
   discoverBackwardBoundary,
   discoverClaudeNewestTurn,
   tailOf,
@@ -3462,10 +3463,12 @@ test.each(['same turn', 'following turn'])(
       [backgroundLaunch('agent1', 'other-child', 7)],
       [assistantTool('Agent', 7, 'agent2', {}), backgroundLaunch('agent2', 'child1', 8)],
       [assistantTool('Agent', 7, 'agent1', {})],
+      [{ ...assistantTool('Agent', 7, 'agent1', {}), uuid: 'launch' }],
+      [{ ...assistantTool('Agent', 1, 'agent1', {}), uuid: 'different-launch' }],
     ]) {
       const file = writeTranscript([
         userPrompt('Delegate', 0),
-        assistantTool('Agent', 1, 'agent1', { run_in_background: true }),
+        { ...assistantTool('Agent', 1, 'agent1', { run_in_background: true }), uuid: 'launch' },
         backgroundLaunch('agent1', 'child1', 2),
         assistantAnswer('The child is running.', 3),
         userPrompt('Check the child', 4),
@@ -13406,13 +13409,15 @@ test('selected recovery retains conflicting Bash task identities before admittin
 test('late child identity collisions reopen full, tail, append and restored child safeguards', () => {
   const prefix = [
     userPrompt('Delegate', 0),
-    assistantTool('Agent', 1, 'agent1', { run_in_background: true }),
+    { ...assistantTool('Agent', 1, 'agent1', { run_in_background: true }), uuid: 'launch' },
     backgroundLaunch('agent1', 'child1', 2),
     commandNotice('agent1', 'child1', 'completed', 3),
     assistantAnswer('Done', 4),
   ];
   for (const collision of [
     [assistantTool('Bash', 5, 'agent1', { run_in_background: true })],
+    [{ ...assistantTool('Agent', 5, 'agent1', { run_in_background: true }), uuid: 'launch' }],
+    [{ ...assistantTool('Agent', 1, 'agent1', { run_in_background: true }), uuid: 'different-launch' }],
     [
       {
         ...backgroundCommandTurn[2],
@@ -13446,6 +13451,63 @@ test('late child identity collisions reopen full, tail, append and restored chil
       assert.equal(agent.status, 'running');
       assert.equal(agent.closedAt, undefined);
     }
+  }
+});
+
+test('overlapping Claude launch identities preserve child closure across full, append, restored and older reads', () => {
+  const launch = { ...assistantTool('Agent', 1, 'agent1', { run_in_background: true }), uuid: 'launch' };
+  const prefix = [
+    userPrompt('Delegate', 0),
+    launch,
+    backgroundLaunch('agent1', 'child1', 2),
+    commandNotice('agent1', 'child1', 'completed', 3),
+    assistantAnswer('Done', 4),
+  ];
+  const evidenceFile = writeTranscript([userPrompt('Earlier', 0), assistantAnswer('Earlier answer', 0), ...prefix]);
+  const evidencePage = readClaudeHistoryPage(evidenceFile, 'sess', null, { chunkBytes: 80, targetTurns: 1 });
+  assert.equal(evidencePage.kind, 'page');
+  const compactLaunch = evidencePage.page!.nextOlderCursor!.adapterState.taskIdentities!.find(
+    (identity) => identity.record.uuid === 'launch',
+  )!.record;
+  const overlapping = createClaudeSessionReducer('sess');
+  prefix.forEach((record) => overlapping.pushLine(JSON.stringify(record)));
+  const overlapState = overlapping.snapshot();
+  applyClaudeSessionTaskEvidence(overlapState, structuredClone(compactLaunch));
+  const overlapRead = createClaudeSessionReducer('sess', {}, overlapState).finish();
+  assert.equal(overlapRead.turns[0].agents[0].status, 'completed');
+  assert.equal(overlapRead.turns[0].agents[0].closedAt, ms(3));
+  const suffix = [userPrompt('Check', 5), launch, assistantAnswer('Still done', 6)];
+  const records = [...prefix, ...suffix];
+  const file = writeTranscript(prefix);
+  const initial = readClaudeSessionIncremental(file, 'sess');
+  fs.appendFileSync(file, suffix.map((record) => JSON.stringify(record)).join('\n') + '\n');
+  const appended = readClaudeSessionIncremental(file, 'sess', structuredClone(initial.checkpoint!));
+  const lifetime = createClaudeUsageLineReducer();
+  prefix.forEach((record) => lifetime.pushLine(JSON.stringify(record)));
+  const restored = createClaudeUsageLineReducer(structuredClone(lifetime.snapshot()));
+  suffix.forEach((record) => restored.pushLine(JSON.stringify(record)));
+  for (const [reader, outcome] of Object.entries({
+    ...outcomeReaders(records),
+    append: sessionOutcomeOf(appended.read!),
+    restoredBeforeOverlap: restored.newestTurnOutcome(),
+  })) {
+    assert.deepEqual(outcome?.closedChildren, [{ id: 'child1', closedAt: ms(3) }], reader);
+    assert.equal(outcome?.taskCompletions?.[0].kind, 'child', reader);
+    assert.equal(outcome?.openChildren, undefined, reader);
+  }
+  const turns = [];
+  let cursor = null;
+  do {
+    const page = readClaudeHistoryPage(file, 'sess', cursor, { chunkBytes: 80, targetTurns: 1 });
+    assert.equal(page.kind, 'page');
+    if (page.kind !== 'page') break;
+    turns.unshift(...page.page.turns);
+    cursor = structuredClone(page.page.nextOlderCursor);
+  } while (cursor);
+  assert.deepEqual(turns, readSession(file, 'sess').turns);
+  for (const read of [turns, appended.read!.turns]) {
+    assert.equal(read[0].agents[0].status, 'completed');
+    assert.equal(read[0].agents[0].closedAt, ms(3));
   }
 });
 
