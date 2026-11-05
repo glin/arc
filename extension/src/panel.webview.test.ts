@@ -61,6 +61,26 @@ test('native Copy Path and Copy Relative Path retain citation filename suffixes'
     'nativeCitationPath',
     `${compiled}\nreturn copyPath;`,
   )(host, fs, () => null, linkTarget, resolveLink, relativePath, nativePath, nativeCitationPath);
+  for (const [link, absolute, relative] of [
+    [`${root}/Two%20words.html#L42`, `${root}/Two words.html`, 'Two words.html'],
+    [`${root}/Two%2520words.html:42`, `${root}/Two%20words.html`, 'Two%20words.html'],
+    [`${root}/guide%2Emd#section`, `${root}/guide.md`, 'guide.md'],
+  ]) {
+    await copy({ link }, false);
+    assert.equal(copied.at(-1), nativePath(absolute));
+    await copy({ link }, true);
+    assert.equal(copied.at(-1), nativePath(relative));
+  }
+  await copy(
+    { link: `${root}/report%20.csv`, destination: { kind: 'fileCitation', path: `${root}/report%20.csv` } },
+    false,
+  );
+  assert.equal(copied.at(-1), nativePath(`${root}/report%20.csv`));
+  await copy(
+    { link: `${root}/report%20.csv`, destination: { kind: 'fileCitation', path: `${root}/report%20.csv` } },
+    true,
+  );
+  assert.equal(copied.at(-1), nativePath('report%20.csv'));
   for (const folder of [root, outside]) {
     for (const suffix of ['#L10', ':10', '%20']) {
       const file = `${folder}/report.csv${suffix}`;
@@ -790,6 +810,53 @@ test('clicked local links open outside workspace folders through their existing 
         command === 'workbench.action.browser.open' ? `file://${file}` : file,
       );
     }
+    for (const [written, name] of [
+      ['Two%20words.html', 'Two words.html'],
+      ['Two%2520words.html', 'Two%20words.html'],
+    ]) {
+      const file = paths.join(paths.dirname(text), name);
+      existing.set(paths.join(paths.dirname(text), 'Two words.html'), 1);
+      existing.set(paths.join(paths.dirname(text), 'Two%20words.html'), 1);
+      const href = `${paths.dirname(text).replace(/\\/g, '/')}/${written}`;
+      const html = renderRichMarkdown(`[report](${href})`);
+      const rendered = /data-link="([^"]+)"/.exec(html)?.[1];
+      assert.equal(rendered, href);
+      checked.length = 0;
+      const noticeCount = notices.length;
+      await open(rendered, 2);
+      assert.deepEqual(checked, [file], platform);
+      assert.equal(notices.length, noticeCount, platform);
+      assert.equal(commands.at(-1)![0], 'workbench.action.browser.open');
+      assert.equal(commands.at(-1)![1], `file://${file}`);
+    }
+    for (const name of [
+      'notes.txt#L42',
+      'notes.txt#L42-L51',
+      ...(platform === 'win32' ? [] : ['notes.txt:42', 'notes.txt:42:7']),
+    ]) {
+      const file = paths.join(paths.dirname(text), name);
+      existing.set(file, 1);
+      const href = file
+        .replace(/\\/g, '/')
+        .replace(/#/g, '%23')
+        .replace(/:(?=42)/g, '%3A')
+        .replace(/:7$/, '%3A7');
+      checked.length = 0;
+      await open(href, 1);
+      assert.deepEqual(checked, [file], platform);
+      assert.equal(opened.at(-1)!.file.fsPath, file);
+      assert.equal(opened.at(-1)!.options.selection, undefined);
+      assert.deepEqual(notices, []);
+    }
+    const encodedGuide = paths.join(paths.dirname(text), 'guide name.md');
+    existing.set(encodedGuide, 1);
+    checked.length = 0;
+    await open(`${paths.dirname(text).replace(/\\/g, '/')}/guide%20name%2Emd#section%2520name`, 2);
+    assert.deepEqual(checked, [encodedGuide]);
+    assert.equal(commands.at(-1)![0], 'vscode.openWith');
+    assert.equal((commands.at(-1)![1] as ReturnType<typeof uri>).fsPath, encodedGuide);
+    assert.equal((commands.at(-1)![1] as ReturnType<typeof uri>).fragment, 'section%20name');
+    assert.deepEqual(notices, []);
     const beforePreview = opened.length;
     previewFails = true;
     await open(`${skill}#appendix`, 2);
@@ -822,6 +889,15 @@ test('clicked local links open outside workspace folders through their existing 
       assert.equal(commands.length, commandCount);
       assert.equal(notices.pop(), `Arc: no file at ${href}.`);
     }
+    checked.length = 0;
+    const externalCount = external.length;
+    await open('https%3A%2F%2Fexample.com%2Fa.md', 1);
+    assert.deepEqual(
+      checked,
+      roots.map((root) => paths.join(root, 'https://example.com/a.md')),
+    );
+    assert.equal(external.length, externalCount);
+    assert.equal(notices.pop(), 'Arc: no file at https://example.com/a.md.');
     checked.length = 0;
     for (const href of ['http://example.com/a.md', 'HTTPS://example.com/a.md']) await open(href, 2);
     assert.deepEqual(external, ['http://example.com/a.md', 'HTTPS://example.com/a.md']);

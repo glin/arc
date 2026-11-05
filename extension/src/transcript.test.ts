@@ -1052,6 +1052,7 @@ import {
   openingLines,
   closingRows,
   linkTarget,
+  linkLocation,
   linkTargetIsHtml,
   linkTargetIsMarkdown,
   linkTargetIsVideo,
@@ -12865,6 +12866,25 @@ test('a link names its file with the anchor stripped, and a URL names nothing', 
     assert.equal(linkTarget(`${prefix}/guide.markdown#section:42`), `${prefix}/guide.markdown`);
   }
   assert.equal(linkTarget('report.csv#part'), 'report.csv#part');
+  for (const [href, target, from, to, fragment] of [
+    ['Two%20words.html', 'Two words.html', -1, -1, null],
+    ['Two%2520words.html', 'Two%20words.html', -1, -1, null],
+    ['caf%C3%A9.html', 'caf\u00e9.html', -1, -1, null],
+    ['bad%ZZ%20name.html', 'bad%ZZ%20name.html', -1, -1, null],
+    ['guide%2Emd#section%20name', 'guide.md', -1, -1, 'section name'],
+    ['guide%20name.md#section%2520name', 'guide name.md', -1, -1, 'section%20name'],
+    ['notes.txt%23L42', 'notes.txt#L42', -1, -1, null],
+    ['notes.txt%23L42-L51', 'notes.txt#L42-L51', -1, -1, null],
+    ['notes.txt%3A42', 'notes.txt:42', -1, -1, null],
+    ['notes.txt%3A42%3A7', 'notes.txt:42:7', -1, -1, null],
+    ['notes%20name.ts#L42-L51', 'notes name.ts', 41, 50, null],
+    ['notes%20name.ts:42:7', 'notes name.ts', 41, 41, null],
+    ['C:/Reader/Two%20words.html', 'C:/Reader/Two words.html', -1, -1, null],
+    ['/Reader/Two%20words.html', '/Reader/Two words.html', -1, -1, null],
+  ] as const) {
+    assert.deepEqual(linkLocation(href), { target, from, to, fragment }, href);
+    assert.equal(linkTarget(href), target, href);
+  }
 });
 
 test('a linked HTML file is recognized by its resolved suffix', () => {

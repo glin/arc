@@ -3544,8 +3544,16 @@ export function linkTarget(href: string): string | null {
 }
 
 export function linkLocation(href: string): { target: string; from: number; to: number; fragment: string | null } {
+  const decodePath = (value: string): string => {
+    try {
+      return decodeURIComponent(value);
+    } catch {
+      return value;
+    }
+  };
   const hash = href.indexOf('#');
-  if (hash >= 0 && linkTargetIsMarkdown(href.slice(0, hash))) {
+  const beforeHash = hash >= 0 ? decodePath(href.slice(0, hash)) : '';
+  if (hash >= 0 && linkTargetIsMarkdown(beforeHash)) {
     let fragment = href.slice(hash + 1);
     if (!/^L\d+(?:-L?\d+)?$/.test(fragment)) {
       try {
@@ -3553,13 +3561,13 @@ export function linkLocation(href: string): { target: string; from: number; to: 
       } catch {
         // A malformed escape remains part of the requested heading.
       }
-      return { target: href.slice(0, hash), from: -1, to: -1, fragment };
+      return { target: beforeHash, from: -1, to: -1, fragment };
     }
   }
   const anchor = /#L(\d+)(?:-L?(\d+))?$/.exec(href) || /:(\d+)(?::\d+)?$/.exec(href);
   const from = anchor ? Number(anchor[1]) - 1 : -1;
   return {
-    target: anchor ? href.slice(0, anchor.index) : href,
+    target: decodePath(anchor ? href.slice(0, anchor.index) : href),
     from,
     to: anchor && anchor[2] ? Number(anchor[2]) - 1 : from,
     fragment: null,

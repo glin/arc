@@ -101,7 +101,7 @@ Hosting changes require checks of new and restored tabs in the [isolated editor]
 
 ### Literal file citations
 
-File citations carry typed literal destinations through response links and native copy actions. Reader presses open native absolute files, including files outside workspace folders. Preserve percent signs and location-like filename suffixes. Ordinary Markdown links retain path candidates and optional line selection.
+File citations carry typed literal destinations through response links and native copy actions. Reader presses open native absolute files, including files outside workspace folders. Preserve percent signs and location-like filename suffixes. Ordinary Markdown links parse heading and line suffixes before decoding the file path once. A malformed escape leaves the file path unchanged. The decoded path supplies candidates and optional line selection.
 
 `domain/file-citation.ts` gives directive scanning one shared allowance of four code units per source code unit across candidates and quotation modes. `richtext.ts` consumes Markdown protection in source order before masking eligible directives. Preserve literal code, links, images, definitions, tags, and comments. Malformed or incomplete enclosing candidates keep nested citations literal. Container traversal lies outside the scanner allowance.
 
