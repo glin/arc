@@ -53,7 +53,7 @@ When local resources block checks, use remote CI only with access and authorizat
 
 Use the diagnostic capture script in [Performance capture](docs/performance.md#performance-capture) for performance investigations and diagnostic requests.
 
-A change to any of these lands only with a [build comparison](docs/performance.md#build-comparison) report in its plan entry:
+A change to any of these lands with a [build comparison](docs/performance.md#build-comparison) report in its plan entry when the measured startup runs the changed code:
 
 - `extension/src/progressiveworker-entry.ts`.
 - The discovery and refresh paths of `extension/src/panelhost.ts`.
@@ -61,7 +61,7 @@ A change to any of these lands only with a [build comparison](docs/performance.m
 - The spend readers in `extension/src/codex.ts`, `extension/src/transcript.ts`, and `extension/src/projectspend.ts`.
 - `extension/src/derivedcache.ts`.
 
-A measure past its margin blocks the landing.
+A measure past its margin blocks the landing. When the measured startup never runs the changed code, which the report shows as a zero count for that path, the change lands with the open memory script `extension/scripts/compressed-open-memory.mjs` and the [session list publication measurement](docs/performance.md#session-list-publication-measurement) in its plan entry. The build comparison then runs at the landing that makes the path run, or before a push, once for every change since the last report.
 
 Follow the Fast iteration section of `docs/development.md` to test a change while you work and before handoff.
 
