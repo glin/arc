@@ -2889,7 +2889,7 @@ function completeDiscoveryHarness(
       sessionNames = { observe() { return false; }, get() { return null; }, observeTurns() { return new Set(); } };
       projectSpendHydrated = true; projectSpendHydrationReady = true; projectSpendHydrationTick = null;
       projectSpendIndexing = false; projectSpendOffers = new Set(); readWindows = new Map(); history = new Map(); historyRequest = null;
-      projectSpendFiles = []; projectSpendVisibleFiles = [];
+      projectSpendFiles = []; projectSpendVisibleFiles = []; projectSpendCostOwners = new Map();
       projectSpendEpoch = 0; projectSpendSnapshot = null; projectSpendTomorrow = null;
       projectSpendSnapshotDate = null; projectSpendSnapshotPrice = null;
       projectSpendRebuild = null; projectSpendBuild = null;
@@ -17198,6 +17198,86 @@ test('the Claude cost-state queue reads each owner dependencies once and orders 
     const sorted = ['b', 'd', 'c', 'a', 'e'].map((name) => normalizeSpendFile(file(name)));
     assert.deepEqual(order, sorted.slice(1));
     assert.deepEqual(provider.projectSpendCostQueue, sorted);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+// Children c1 and c2, parents p1 and p2, grandparent g over p1, and unrelated u. p1, g and u start with current supplements.
+function costQueueHarness() {
+  const folder = tempDir('startup-cost-requeue-');
+  const tree: Record<string, string[]> = { c1: [], c2: [], p1: ['c1'], p2: ['c2'], g: ['p1', 'c1'], u: [] };
+  const key = (name: string) => normalizeSpendFile(path.join(folder, `${name}.jsonl`));
+  const record = (name: string) => provider.projectSpendFiles.find((file: SpendFileIndex) => file.file === key(name));
+  const dependency = (file: SpendFileIndex, index = 0) =>
+    index > 0 ? `${file.file}:${file.costStateSupplement?.identity ?? ''}` : file.file;
+  const identity = (files: SpendFileIndex[]) => files.map(dependency).join('|');
+  const dependencies = (name: string) => [name, ...tree[name]].map(record);
+  const reads: string[] = [];
+  const provider = completeDiscoveryHarness(undefined, false, ['indexNextClaudeCostState'], {
+    normalizeSpendFile,
+    costStateDependency: dependency,
+    costStateIdentity: (files: string[]) => files.join('|'),
+    claudeCostStateDependencies: (owner: { sessionId: string }) => {
+      reads.push(owner.sessionId);
+      return dependencies(owner.sessionId);
+    },
+    reconcileClaudeCostState: (_capture: unknown, files: SpendFileIndex[]) => ({
+      invalidated: false,
+      complete: true,
+      progress: {},
+      supplement: { identity: identity(files) },
+    }),
+  });
+  provider.projectSpendFiles = Object.keys(tree).map((name) => ({
+    file: key(name),
+    parserState: { costState: { snapshots: [{}] } },
+  }));
+  for (const name of ['p1', 'g', 'u']) record(name).costStateSupplement = { identity: identity(dependencies(name)) };
+  provider.projectSpendRevision = 0;
+  provider.projectSpendCostQueue = null;
+  provider.claudeSpendSources = Object.keys(tree).map((name) => ({
+    sessionId: name,
+    file: path.join(folder, `${name}.jsonl`),
+    primary: true,
+  }));
+  provider.scheduleProjectSpendSave = vi.fn<() => void>();
+  provider.claudeChildrenDiscovered = true;
+  return { provider, reads, key, record };
+}
+
+test('a finished child supplement requeues only the Claude cost-state owners whose dependencies hold it', () => {
+  vi.useFakeTimers();
+  try {
+    const { provider, reads, key, record } = costQueueHarness();
+    const unrelated = record('u').costStateSupplement;
+    assert.equal(provider.indexNextClaudeCostState(), true);
+    assert.ok(record('c1').costStateSupplement);
+    assert.deepEqual(reads, ['c1', 'c2', 'p1', 'p2', 'g', 'u', 'c1', 'p1', 'g']);
+    assert.deepEqual(
+      provider.projectSpendCostQueue,
+      ['c2', 'p2', 'p1', 'g'].map((name) => key(name)),
+    );
+    assert.equal(record('p1').costStateSupplement, undefined);
+    assert.equal(record('g').costStateSupplement, undefined);
+    assert.equal(record('u').costStateSupplement, unrelated);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('a queued Claude cost-state parent keeps its place when its child supplement finishes', () => {
+  vi.useFakeTimers();
+  try {
+    const { provider, reads, key } = costQueueHarness();
+    provider.indexNextClaudeCostState();
+    reads.length = 0;
+    assert.equal(provider.indexNextClaudeCostState(), true);
+    assert.deepEqual(reads, ['c2', 'p2']);
+    assert.deepEqual(
+      provider.projectSpendCostQueue,
+      ['p2', 'p1', 'g'].map((name) => key(name)),
+    );
   } finally {
     vi.useRealTimers();
   }

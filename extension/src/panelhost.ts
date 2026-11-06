@@ -2282,6 +2282,10 @@ export class PanelProvider implements vscode.Disposable {
   private projectSpendRailOwed = false;
   private projectSpendIndexing = false;
   private projectSpendCostQueue: string[] | null = null;
+  private projectSpendCostOwners = new Map<
+    string,
+    { owner: SessionSpendSource; length: number; files: ReadonlySet<string> }
+  >();
   // Performance counters share measurements with diagnostics. Disabled logging skips record construction.
   private readonly performanceCounters = new PanelPerformanceCounters(Date.now(), this.performanceSink());
   private readonly startupThresholds = new StartupThresholdWatch();
@@ -12179,36 +12183,46 @@ export class PanelProvider implements vscode.Disposable {
   private indexNextClaudeCostState(): boolean {
     if (!this.claudeChildrenDiscovered || this.dispatchDiscoveryPending) return false;
     const sources = this.sessionSpendSources ?? this.claudeSpendSources;
+    // Each key keeps the first owner with that key, its dependency count, which orders the queue, and its dependency files.
+    const owners = this.projectSpendCostOwners;
+    const offer = (owner: SessionSpendSource, queue: string[]) => {
+      const key = normalizeSpendFile(owner.file);
+      const at = this.projectSpendFiles.findIndex((file) => file.file === key);
+      const record = this.projectSpendFiles[at];
+      const capture = (record?.parserState as ClaudeUsageReducerState | undefined)?.costState;
+      if (!record || !capture?.snapshots.length) return;
+      const dependencies = claudeCostStateDependencies(owner, sources, this.projectSpendFiles);
+      if (!owners.has(key))
+        owners.set(key, {
+          owner,
+          length: dependencies?.length ?? 0,
+          files: new Set(dependencies?.map((file) => file.file)),
+        });
+      const identity = dependencies ? costStateIdentity(dependencies.map(costStateDependency)) : null;
+      if (record.costStateSupplement?.identity !== identity && record.costStateSupplement) {
+        const { costStateSupplement: _supplement, ...baseline } = record;
+        this.projectSpendFiles[at] = baseline;
+        const checked = this.spendChecks?.get(record);
+        if (checked !== undefined) this.spendChecks.set(baseline, checked);
+        this.projectSpendRevision++;
+        this.invalidateProjectSpendSnapshot();
+        this.scheduleProjectSpendSave();
+      }
+      if (
+        dependencies &&
+        record.costStateSupplement?.identity !== identity &&
+        !(record.costStateProgress?.identity === identity && record.costStateProgress.reason)
+      )
+        queue.push(key);
+    };
+    const sort = (queue: string[]) =>
+      queue.sort((left, right) => (owners.get(left)?.length ?? 0) - (owners.get(right)?.length ?? 0));
     if (this.projectSpendCostQueue === null) {
       this.projectSpendCostQueue = [];
-      // Each key's dependency count, from the first owner with that key, orders the queue.
-      const lengths = new Map<string, number>();
-      for (const owner of sources.filter((source) => !source.dispatchedFrom && !source.dispatchedVia)) {
-        const key = normalizeSpendFile(owner.file);
-        const at = this.projectSpendFiles.findIndex((file) => file.file === key);
-        const record = this.projectSpendFiles[at];
-        const capture = (record?.parserState as ClaudeUsageReducerState | undefined)?.costState;
-        if (!record || !capture?.snapshots.length) continue;
-        const dependencies = claudeCostStateDependencies(owner, sources, this.projectSpendFiles);
-        if (!lengths.has(key)) lengths.set(key, dependencies?.length ?? 0);
-        const identity = dependencies ? costStateIdentity(dependencies.map(costStateDependency)) : null;
-        if (record.costStateSupplement?.identity !== identity && record.costStateSupplement) {
-          const { costStateSupplement: _supplement, ...baseline } = record;
-          this.projectSpendFiles[at] = baseline;
-          const checked = this.spendChecks?.get(record);
-          if (checked !== undefined) this.spendChecks.set(baseline, checked);
-          this.projectSpendRevision++;
-          this.invalidateProjectSpendSnapshot();
-          this.scheduleProjectSpendSave();
-        }
-        if (
-          dependencies &&
-          record.costStateSupplement?.identity !== identity &&
-          !(record.costStateProgress?.identity === identity && record.costStateProgress.reason)
-        )
-          this.projectSpendCostQueue.push(key);
-      }
-      this.projectSpendCostQueue.sort((left, right) => (lengths.get(left) ?? 0) - (lengths.get(right) ?? 0));
+      owners.clear();
+      for (const owner of sources.filter((source) => !source.dispatchedFrom && !source.dispatchedVia))
+        offer(owner, this.projectSpendCostQueue);
+      sort(this.projectSpendCostQueue);
     }
     const key = this.projectSpendCostQueue.shift();
     if (!key) return false;
@@ -12250,7 +12264,12 @@ export class PanelProvider implements vscode.Disposable {
     if (result.progress.reason)
       this.diagnostics.warn('claudeCostStateWithheld', { file: key, reason: result.progress.reason });
     if (!result.complete) this.projectSpendCostQueue.unshift(key);
-    if (result.supplement) this.projectSpendCostQueue = null;
+    if (result.supplement) {
+      // A finished supplement changes the dependency identity of each owner whose dependencies hold it.
+      const queue = this.projectSpendCostQueue;
+      for (const [other, entry] of owners) if (other !== key && entry.files.has(key)) offer(entry.owner, queue);
+      this.projectSpendCostQueue = sort([...new Set(queue)]);
+    }
     return true;
   }
 
