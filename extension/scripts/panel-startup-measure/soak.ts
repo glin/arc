@@ -24,8 +24,17 @@ if (process.env.ARC_MEASURE_BLOCK_AGENTS === '1' && process.env.ARC_MEASURE_SOAK
       .find((name: string) => !names.includes(name + '.json') && !names.includes(name + '.failed'));
     if (!next) return;
     soakBusy = true;
-    Promise.resolve(vscode.commands.executeCommand('arc.savePerformanceDiagnostics', soakPath.join(soakDirectory, next + '.json')))
-      .then((written: unknown) => { if (!written) soakFs.writeFileSync(soakPath.join(soakDirectory, next + '.failed'), 'null'); },
+    const snapshotFile = soakPath.join(soakDirectory, next + (process.env.ARC_MEASURE_MATCHED ? '.snapshot' : '.json'));
+    Promise.resolve(vscode.commands.executeCommand('arc.savePerformanceDiagnostics', snapshotFile))
+      .then((written: unknown) => {
+        if (!written) soakFs.writeFileSync(soakPath.join(soakDirectory, next + '.failed'), 'null');
+        else if (process.env.ARC_MEASURE_MATCHED) {
+          const file = soakPath.join(soakDirectory, next + '.json');
+          const snapshot = JSON.parse(soakFs.readFileSync(snapshotFile, 'utf8'));
+          snapshot.matchedWork = (globalThis as any).__arcMatchedWork ?? null;
+          soakFs.writeFileSync(file, JSON.stringify(snapshot));
+        }
+      },
         (error: unknown) => soakFs.writeFileSync(soakPath.join(soakDirectory, next + '.failed'), JSON.stringify(String(error))))
       .finally(() => { soakBusy = false; });
   }, 1000);
@@ -75,6 +84,8 @@ export interface DispatchSimulation {
   childId: string;
   appends: number;
   bytes: number;
+  seedClock?: number;
+  initialTurns?: number;
 }
 
 function line(record: unknown): string {
@@ -88,9 +99,10 @@ export function startDispatch(
   codex: string,
   workspace: string,
   now = Date.now(),
+  identities = { parent: randomUUID(), child: randomUUID() },
 ): DispatchSimulation {
-  const parentId = randomUUID();
-  const childId = randomUUID();
+  const parentId = identities.parent;
+  const childId = identities.child;
   const at = (offset: number) => new Date(now + offset).toISOString();
   const parent = path.join(projects, projectSlug(workspace), `${parentId}.jsonl`);
   const toolUseId = `toolu_soak${parentId.replace(/-/g, '').slice(0, 16)}`;
@@ -146,6 +158,7 @@ export function startDispatch(
     ]
       .map(line)
       .join(''),
+    { flag: 'wx' },
   );
   const date = new Date(now);
   const day = [
@@ -170,14 +183,15 @@ export function startDispatch(
       model_provider: 'openai',
     },
   });
-  fs.writeFileSync(child, opening);
+  fs.writeFileSync(child, opening, { flag: 'wx' });
   return { parent, child, childId, appends: 0, bytes: Buffer.byteLength(opening) };
 }
 
 // Append one completed child turn with growing token totals.
 export function appendDispatchTurn(simulation: DispatchSimulation, workspace: string, now = Date.now()): void {
-  const turn = simulation.appends + 1;
-  const turnId = randomUUID();
+  const turn = simulation.appends + (simulation.initialTurns ?? 0) + 1;
+  if (simulation.seedClock !== undefined) now = simulation.seedClock + turn * 30_000;
+  const turnId = simulation.seedClock === undefined ? randomUUID() : `matched-turn-${turn}`;
   const at = (offset: number) => new Date(now + offset).toISOString();
   const usage = (scale: number) => ({
     input_tokens: 20_000 * scale,
@@ -227,8 +241,268 @@ export function appendDispatchTurn(simulation: DispatchSimulation, workspace: st
     .map(line)
     .join('');
   fs.appendFileSync(simulation.child, bytes);
-  simulation.appends = turn;
+  simulation.appends++;
   simulation.bytes += Buffer.byteLength(bytes);
+  if (simulation.seedClock !== undefined) fs.utimesSync(simulation.child, now / 1000, now / 1000);
+}
+
+// A private prompted child exists before either launch. Exclusive creation refuses fixture collisions.
+export function seedDispatch(
+  projects: string,
+  codex: string,
+  workspace: string,
+  clock = Date.parse('2026-10-28T08:00:00.000Z'),
+): DispatchSimulation {
+  const simulation = startDispatch(projects, codex, workspace, clock, {
+    parent: '8bef578d-91e2-46c0-83ae-d9e67dfd5a01',
+    child: '8bef578d-91e2-46c0-83ae-d9e67dfd5a02',
+  });
+  simulation.seedClock = clock;
+  appendDispatchTurn(simulation, workspace);
+  simulation.initialTurns = 1;
+  simulation.appends = 0;
+  fs.utimesSync(simulation.parent, clock / 1000, clock / 1000);
+  return simulation;
+}
+
+export interface MatchedEvent {
+  kind: string;
+  size?: number;
+  mtimeMs?: number;
+  activity?: number;
+}
+
+export interface MatchedObservation {
+  run: string;
+  selected: string | null;
+  parentListed: boolean;
+  childListed: boolean;
+  watched: boolean;
+  qualification: {
+    path: string;
+    entries: number;
+    admitted: number;
+    inputs: { walkedParent: boolean; walkedChild: boolean; acceptedParent: boolean; acceptedChild: boolean };
+  };
+  discovery: { entries: number; completed: number };
+  relationshipComplete: boolean;
+  spendComplete: boolean;
+  overflow: boolean;
+  events: MatchedEvent[];
+  work: { members: number; childSize: number; childMtimeMs: number; childActivity: number; parentSize: number } | null;
+  parent: string | null;
+  relation: string | null;
+}
+
+export interface MatchedTurn {
+  turn: number;
+  size: number;
+  mtimeMs: number;
+  activity: number;
+  sha256: string;
+}
+
+export interface MatchedEvidence {
+  ready: MatchedObservation | null;
+  end: MatchedObservation | null;
+  turns: MatchedTurn[];
+  childId: string;
+  parentId: string;
+  seed: { parentSha256: string; childSha256: string };
+}
+
+export function matchedReadiness(
+  observation: MatchedObservation | null,
+  childId: string,
+  expectedSelection?: string,
+): string[] {
+  if (!observation) return ['matched observation'];
+  const missing: string[] = [];
+  if (!observation.parentListed || !observation.childListed) missing.push('listed parent and child');
+  if (!observation.watched) missing.push('child directory subscription');
+  if (
+    !observation.selected ||
+    observation.selected === childId ||
+    (expectedSelection && observation.selected !== expectedSelection)
+  )
+    missing.push('selected fixture session');
+  if (!Object.hasOwn(observation, 'overflow') || observation.overflow) missing.push('bounded complete trace');
+  return missing;
+}
+
+// Equal scheduled writes alone establish no completed work. Every revision needs each observable boundary.
+export function missingMatchedEvidence(evidence: MatchedEvidence | undefined, scheduled: number): string[] {
+  if (!evidence) return ['matched evidence'];
+  const missing = matchedReadiness(evidence.ready, evidence.childId);
+  const end = evidence.end;
+  if (!end) return [...missing, 'matched end observation'];
+  if (!evidence.ready?.run || evidence.ready.run !== end.run || evidence.ready.selected !== end.selected)
+    missing.push('single measured host and selection');
+  if (!(end.qualification.entries > 0) || !end.qualification.path) missing.push('qualification path entry');
+  if (!(end.discovery.entries > 0) || !(end.discovery.completed > 0)) missing.push('completed discovery path');
+  if (!Object.hasOwn(end, 'overflow') || end.overflow) missing.push('bounded complete end trace');
+  if (evidence.turns.length !== scheduled) missing.push('scheduled revisions');
+  for (const observation of [evidence.ready, end]) {
+    if (typeof observation?.relationshipComplete !== 'boolean' || typeof observation?.spendComplete !== 'boolean')
+      missing.push('relationship and spend status');
+  }
+  if (end.parent !== evidence.parentId || end.relation !== 'dispatched') missing.push('completed child relationship');
+  if (
+    !evidence.seed ||
+    Object.values(evidence.seed).length !== 2 ||
+    Object.values(evidence.seed).some((hash) => !/^[a-f0-9]{64}$/.test(hash))
+  )
+    missing.push('seed hashes');
+  if (
+    !end.work ||
+    ['members', 'childSize', 'childMtimeMs', 'childActivity', 'parentSize'].some(
+      (key) => !Number.isFinite(end.work![key as keyof NonNullable<MatchedObservation['work']>]),
+    )
+  )
+    missing.push('completed source work');
+  const last = evidence.turns.at(-1);
+  if (
+    last &&
+    (end.work?.childSize !== last.size ||
+      end.work.childMtimeMs !== last.mtimeMs ||
+      end.work.childActivity !== last.activity)
+  )
+    missing.push('final completed revision');
+  for (const [index, turn] of evidence.turns.entries()) {
+    if (
+      turn.turn !== index + 1 ||
+      !/^[a-f0-9]{64}$/.test(turn.sha256) ||
+      !Number.isFinite(turn.size) ||
+      !Number.isFinite(turn.mtimeMs) ||
+      !Number.isFinite(turn.activity) ||
+      (index > 0 && turn.size <= evidence.turns[index - 1].size)
+    )
+      missing.push(`turn ${index + 1} source revision`);
+    for (const kind of ['notification', 'refreshed', 'accepted', 'published']) {
+      if (
+        !end.events.some(
+          (event) =>
+            event.kind === kind &&
+            event.size === turn.size &&
+            event.mtimeMs === turn.mtimeMs &&
+            (kind !== 'published' || event.activity === turn.activity),
+        )
+      )
+        missing.push(`turn ${turn.turn} ${kind}`);
+    }
+  }
+  return missing;
+}
+
+export function unmatchedWork(a: MatchedEvidence | undefined, b: MatchedEvidence | undefined): string[] {
+  if (!a || !b) return ['matched pair evidence'];
+  const different: string[] = [];
+  if (a.childId !== b.childId || a.parentId !== b.parentId || a.ready?.selected !== b.ready?.selected)
+    different.push('session identities');
+  if (JSON.stringify(a.turns) !== JSON.stringify(b.turns)) different.push('source revisions and bytes');
+  if (JSON.stringify(a.seed) !== JSON.stringify(b.seed)) different.push('seed bytes');
+  if (a.end?.relationshipComplete !== b.end?.relationshipComplete || a.end?.spendComplete !== b.end?.spendComplete)
+    different.push('completed work');
+  if (JSON.stringify(a.end?.work) !== JSON.stringify(b.end?.work)) different.push('completed source work');
+  return different;
+}
+
+// These wrappers exist only in measured build trees. Both revisions receive this runner's identical overlay.
+export const MATCHED_OVERLAY = `
+if (process.env.ARC_MEASURE_MATCHED) {
+  const matchedFs = require('node:fs');
+  const matchedPath = require('node:path');
+  const config = JSON.parse(process.env.ARC_MEASURE_MATCHED);
+  const state = { run: process.env.ARC_MEASURE_RUN, selected: null, parentListed: false, childListed: false,
+    watched: false, qualification: { path: '', entries: 0, admitted: 0, inputs: { walkedParent: false, walkedChild: false, acceptedParent: false, acceptedChild: false } }, discovery: { entries: 0, completed: 0 },
+    relationshipComplete: false, spendComplete: false, overflow: false, events: [], work: null, parent: null, relation: null };
+  (globalThis as any).__arcMatchedWork = state;
+  const eventKeys = new Set<string>();
+  const emit = (event: any) => {
+    const key = JSON.stringify([event.kind, event.size, event.mtimeMs, event.activity]);
+    if (eventKeys.has(key)) return;
+    if (state.events.length < 4096) { eventKeys.add(key); (state.events as any[]).push(event); }
+    else state.overflow = true;
+  };
+  const revision = () => { const s = matchedFs.statSync(config.child); return { size: s.size, mtimeMs: s.mtimeMs }; };
+  const proto = PanelProvider.prototype as any;
+  const observe = (owner: any) => {
+    state.selected = owner.showing;
+    state.watched = owner.watchers.has(matchedPath.dirname(config.child));
+    state.relationshipComplete = owner.dispatchDiscoveryPending === false;
+    state.spendComplete = owner.dispatchSpendPending === false;
+    const accepted = owner.titles.get(config.child);
+    const parent = owner.titles.get(config.parent);
+    const edge = owner.sessionParentsOf().get(config.childId);
+    state.parent = edge?.parent ?? null;
+    state.relation = edge?.relation ?? null;
+    state.work = { members: owner.authoritativeCatalog?.length, childSize: accepted?.size,
+      childMtimeMs: accepted?.mtimeMs, childActivity: accepted?.activityMs, parentSize: parent?.size } as any;
+    if (accepted) emit({ kind: 'accepted', size: accepted.size, mtimeMs: accepted.mtimeMs });
+  };
+  const qualify = typeof proto.qualifiedPendingSources === 'function' ? 'qualifiedPendingSources' : 'startedSources';
+  state.qualification.path = qualify;
+  const originalQualify = proto[qualify];
+  if (typeof originalQualify !== 'function') throw new Error('Missing matched qualification path');
+  proto[qualify] = function(...args: any[]) {
+    state.qualification.entries++;
+    for (const [index, prefix] of [[0, 'walked'], [1, 'accepted']] as const) {
+      for (const [label, id, file] of [['Parent', config.parentId, config.parent], ['Child', config.childId, config.child]]) {
+        if (args[index]?.some((source: any) => source.sessionId === id && source.file === file))
+          (state.qualification.inputs as any)[prefix + label] = true;
+      }
+    }
+    const out = originalQualify.apply(this, args);
+    state.qualification.admitted += out.length;
+    return out;
+  };
+  for (const method of ['refresh', 'prepareClaudeChildren']) {
+    const original = proto[method];
+    if (typeof original !== 'function') throw new Error('Missing matched path: ' + method);
+    proto[method] = async function(...args: any[]) {
+      if (method === 'prepareClaudeChildren') state.discovery.entries++;
+      const result = await original.apply(this, args);
+      if (method === 'prepareClaudeChildren' && result === true) state.discovery.completed++;
+      observe(this);
+      if (method === 'refresh') {
+        const accepted = this.titles.get(config.child);
+        if (accepted) emit({ kind: 'refreshed', size: accepted.size, mtimeMs: accepted.mtimeMs });
+      }
+      return result;
+    };
+  }
+  const wake = proto.wakeFromWatch;
+  proto.wakeFromWatch = function(directory: string, kind: string, filename: unknown) {
+    if (typeof filename === 'string' && matchedPath.join(directory, filename) === config.child)
+      emit({ kind: 'notification', ...revision() });
+    return wake.call(this, directory, kind, filename);
+  };
+  const post = proto.postRows;
+  proto.postRows = function(...args: any[]) {
+    const message = args[1];
+    const rows = message.sessions;
+    const child = rows?.find((row: any) => row.id === config.childId);
+    const parent = rows?.find((row: any) => row.id === config.parentId);
+    const accepted = this.titles.get(config.child);
+    const event = child && accepted ? { kind: 'published', size: accepted.size, mtimeMs: accepted.mtimeMs, activity: child.at } : null;
+    const result = post.apply(this, args);
+    Promise.resolve(result).then((ok) => {
+      if (!ok) return;
+      if (rows && message.type !== 'selection') { state.childListed = !!child; state.parentListed = !!parent; }
+      if (event) emit(event);
+      observe(this);
+    });
+    return result;
+  };
+}
+`;
+
+export function instrumentMatchedWork(tree: string): void {
+  const file = path.join(tree, 'extension', 'src', 'panelhost.ts');
+  const source = fs.readFileSync(file, 'utf8');
+  for (const method of ['prepareClaudeChildren', 'wakeFromWatch', 'postRows'])
+    if (!source.includes(`${method}(`)) throw new Error(`The baseline lacks its matched path: ${method}`);
+  fs.writeFileSync(file, source + MATCHED_OVERLAY);
 }
 
 export interface HostMemory {

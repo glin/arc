@@ -6,7 +6,7 @@ import { normalizeFsPath, type SessionFile } from './transcript';
 import assert from 'node:assert/strict';
 import { browserOrNone, SETTLED } from '../test/browser';
 import { LIVE_PRESS, MAX_RAIL_FILTER_NAME, pageHtml, renderPayload, themed } from './panelfixture';
-import { newestTurnLoading } from './turnview';
+import { newestTurnLoading, normalizePanelState } from './turnview';
 
 test('startup acknowledgements follow DOM application and a rendering opportunity for the current generation', async (t) => {
   const browser = await browserOrNone();
@@ -395,6 +395,7 @@ test.for([
     vi.stubGlobal('PANEL_DEV_SERVER_URL', null);
     const { PanelProvider } = await import('./panelhost.ts');
     const provider = Object.create(PanelProvider.prototype) as Record<string, any>;
+    provider.saved = normalizePanelState({});
     const page = await browser.newPage();
     page.setDefaultTimeout(5000);
     await page.setContent(themed(pageHtml()));
@@ -620,6 +621,7 @@ test('exhausted sources complete the session list through repeated full source c
     vi.stubGlobal('PANEL_DEV_SERVER_URL', null);
     const { PanelProvider } = await import('./panelhost.ts');
     const provider = Object.create(PanelProvider.prototype) as Record<string, any>;
+    provider.saved = normalizePanelState({});
     const page = await browser.newPage();
     page.setDefaultTimeout(5000);
     await page.setContent(themed(pageHtml()));

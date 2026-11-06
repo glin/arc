@@ -1,5 +1,6 @@
 // @module-tag subprocess
 import { revisionOf } from './transcript';
+import { normalizePanelState } from './turnview';
 import { beforeAll, test, vi } from 'vitest';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
@@ -191,6 +192,7 @@ async function receiptDiscoveryHost(
   const host = Object.create(PanelProvider.prototype) as Record<string, any>;
   Object.defineProperty(host, 'loadingLine', { value: { held: () => true, withhold() {} } });
   Object.assign(host, {
+    saved: normalizePanelState({}),
     progressiveWorker: worker,
     refreshGeneration: 0,
     repositoryScopeRoots: roots,

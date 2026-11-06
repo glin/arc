@@ -1,3 +1,5 @@
+import { isAgentRun as codexIsAgentRun } from './codex';
+import { railShownCards } from './view/rail';
 import { startingWorktree } from './repositoryscope';
 import * as spendConsumers from './projectspend';
 import * as cardConsumers from './turncard';
@@ -22,6 +24,7 @@ import {
 } from './composerview';
 import {
   normalizeQueuedSubmissions,
+  SESSION_LIMIT,
   queuedSubmissionBookFits,
   normalizeDrafts,
   normalizeDraftCommentIds,
@@ -57,6 +60,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import mutableFs from 'node:fs';
+import { EventEmitter } from 'node:events';
 import { syncBuiltinESMExports } from 'node:module';
 import * as path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
@@ -258,7 +262,7 @@ import { countedDispatchedCosts, pendingAskPosition, toCard, TURN_QUIET_MS } fro
 import { COMMIT_REPOSITORY_PARSER_VERSION, commitRepositoryOccurrence } from './codexhistory';
 import { RepositoryCommits } from './gitcommits';
 import { CommitRepositories } from './commitrepositories';
-import { agentRunAnswer, railCacheMarkOf, sessionStatusOf, stableRailOrder } from './turnrail';
+import { railSessions, agentRunAnswer, railCacheMarkOf, sessionStatusOf, stableRailOrder } from './turnrail';
 import { storedAssetsForPrompt } from './promptassets';
 import { emptyTrail, renamePlace, visitPlace } from './turnplaces';
 import { adoptLabelSession, labelsOf } from './turnlabels';
@@ -356,6 +360,12 @@ import {
   NAMED_COUNTERS,
   soakMeasures,
   startDispatch,
+  seedDispatch,
+  missingMatchedEvidence,
+  matchedReadiness,
+  unmatchedWork,
+  type MatchedEvidence,
+  MATCHED_OVERLAY,
 } from '../scripts/panel-startup-measure/soak';
 // The shared metadata version of a format 0 or format 1 file whose rows match both current agent generations.
 const VERSION = METADATA_GENERATIONS.claude;
@@ -1632,6 +1642,325 @@ test('the named counters hold every counter that the measure table lists', () =>
     assert.ok((NAMED_COUNTERS as readonly string[]).includes(name), name);
 });
 
+test('matched seeds preserve frozen hard links and repeat identical private source bytes', () => {
+  const root = tempDir('matched-seed');
+  const frozen = path.join(root, 'frozen');
+  fs.mkdirSync(frozen);
+  fs.writeFileSync(path.join(frozen, 'retained.jsonl'), 'frozen bytes');
+  const runs = ['a', 'b'].map((name) => {
+    const projects = path.join(root, name, 'projects');
+    const codex = path.join(root, name, 'codex');
+    linkTree(frozen, projects);
+    return seedDispatch(projects, codex, path.join(root, 'workspace'));
+  });
+  const [a, b] = runs;
+  assert.equal(a.childId, b.childId);
+  assert.deepEqual(fs.readFileSync(a.parent), fs.readFileSync(b.parent));
+  assert.deepEqual(fs.readFileSync(a.child), fs.readFileSync(b.child));
+  assert.equal(a.appends, 0);
+  assert.equal(readCodexSessionTitlePair(a.child).short, 'Continue turn 1.');
+  for (const simulation of runs) appendDispatchTurn(simulation, path.join(root, 'workspace'));
+  assert.deepEqual(fs.readFileSync(a.child), fs.readFileSync(b.child));
+  assert.equal(a.appends, 1);
+  assert.ok(a.bytes < 530_000);
+  assert.equal(fs.readFileSync(path.join(frozen, 'retained.jsonl'), 'utf8'), 'frozen bytes');
+  const collisionProjects = path.join(root, 'collision', 'projects');
+  const collision = path.join(collisionProjects, path.relative(path.join(root, 'a', 'projects'), a.parent));
+  fs.mkdirSync(path.dirname(collision), { recursive: true });
+  fs.linkSync(path.join(frozen, 'retained.jsonl'), collision);
+  assert.throws(
+    () => seedDispatch(collisionProjects, path.join(root, 'collision', 'codex'), path.join(root, 'workspace')),
+    /EEXIST/,
+  );
+  assert.equal(fs.readFileSync(path.join(frozen, 'retained.jsonl'), 'utf8'), 'frozen bytes');
+  assert.deepEqual(fs.readFileSync(a.child), fs.readFileSync(b.child));
+});
+
+function matchedEvidence(): MatchedEvidence {
+  const observation = {
+    run: 'measured',
+    selected: 'fixture-session',
+    parentListed: true,
+    childListed: true,
+    watched: true,
+    qualification: {
+      path: 'qualifiedPendingSources',
+      entries: 1,
+      admitted: 0,
+      inputs: { walkedParent: false, walkedChild: false, acceptedParent: false, acceptedChild: false },
+    },
+    discovery: { entries: 1, completed: 1 },
+    relationshipComplete: true,
+    spendComplete: true,
+    overflow: false,
+    work: { members: 4, childSize: 100, childMtimeMs: 1000, childActivity: 1006, parentSize: 30 },
+    parent: 'parent',
+    relation: 'dispatched',
+    events: ['notification', 'refreshed', 'accepted', 'published'].map((kind) => ({
+      kind,
+      size: 100,
+      mtimeMs: 1000,
+      activity: 1006,
+    })),
+  };
+  return {
+    ready: structuredClone(observation),
+    end: structuredClone(observation),
+    childId: 'child',
+    parentId: 'parent',
+    seed: { parentSha256: 'a'.repeat(64), childSha256: 'b'.repeat(64) },
+    turns: [{ turn: 1, size: 100, mtimeMs: 1000, activity: 1006, sha256: 'c'.repeat(64) }],
+  };
+}
+
+test('matched evidence rejects missing reached paths, subscriptions, revisions and completed work', () => {
+  const evidence = matchedEvidence();
+  assert.deepEqual(missingMatchedEvidence(evidence, 1), []);
+  assert.deepEqual(unmatchedWork(evidence, structuredClone(evidence)), []);
+  for (const kind of ['notification', 'refreshed', 'accepted', 'published']) {
+    const changed = structuredClone(evidence);
+    changed.end!.events = changed.end!.events.filter((event) => event.kind !== kind);
+    assert.ok(missingMatchedEvidence(changed, 1).includes(`turn 1 ${kind}`));
+  }
+  for (const field of ['parentListed', 'childListed', 'watched'] as const) {
+    const changed = structuredClone(evidence);
+    changed.ready![field] = false;
+    assert.ok(matchedReadiness(changed.ready, 'child').length);
+  }
+  const changed = structuredClone(evidence);
+  changed.ready!.qualification.entries = 0;
+  changed.ready!.discovery.completed = 0;
+  assert.deepEqual(matchedReadiness(changed.ready, 'child', 'fixture-session'), []);
+  assert.ok(matchedReadiness(changed.ready, 'child', 'another-session').includes('selected fixture session'));
+  changed.end!.qualification.entries = 0;
+  changed.end!.discovery.completed = 0;
+  changed.end!.relationshipComplete = false;
+  changed.end!.overflow = true;
+  assert.ok(missingMatchedEvidence(changed, 1).length >= 3);
+  changed.turns[0].sha256 = 'different-bytes';
+  assert.ok(unmatchedWork(evidence, changed).includes('source revisions and bytes'));
+  changed.end!.work!.members++;
+  assert.ok(unmatchedWork(evidence, changed).includes('completed source work'));
+  assert.deepEqual(missingMatchedEvidence(undefined, 19), ['matched evidence']);
+});
+
+test('matched evidence requires boolean status and permits equal pending status', () => {
+  const evidence = matchedEvidence();
+  for (const observation of [evidence.ready!, evidence.end!]) {
+    observation.relationshipComplete = false;
+    observation.spendComplete = false;
+  }
+  assert.deepEqual(missingMatchedEvidence(evidence, 1), []);
+  assert.deepEqual(unmatchedWork(evidence, structuredClone(evidence)), []);
+  for (const field of ['relationshipComplete', 'spendComplete'] as const) {
+    for (const boundary of ['ready', 'end'] as const) {
+      for (const value of [undefined, null, 'false', 0]) {
+        const changed = structuredClone(evidence);
+        if (value === undefined) Reflect.deleteProperty(changed[boundary]!, field);
+        else Object.assign(changed[boundary]!, { [field]: value });
+        assert.ok(missingMatchedEvidence(changed, 1).includes('relationship and spend status'));
+      }
+    }
+    const changed = structuredClone(evidence);
+    changed.end![field] = true;
+    assert.ok(unmatchedWork(evidence, changed).includes('completed work'));
+  }
+});
+
+test('matched rollout options and overlay hashes separate cached builds from the unchanged default', () => {
+  const ordinary = readOptions(['--fixture', 'fixture', '--soak', '10']);
+  const matched = readOptions(['--fixture', 'fixture', '--soak', '10', '--existing-rollout']);
+  assert.equal(ordinary.existingRollout, false);
+  assert.equal(matched.existingRollout, true);
+  const key = buildKeyOf(ordinary, 'source');
+  const next = buildKeyOf(matched, 'source');
+  assert.notDeepEqual(key, next);
+  assert.match(next.overlays, /^[a-f0-9]{64}$/);
+  for (const overlay of ['measure.ts', 'soak.ts', 'selection.ts'])
+    assert.notEqual(
+      buildKeyOf(matched, 'source', (file) =>
+        path.basename(file) === overlay ? Buffer.from('changed overlay') : fs.readFileSync(file),
+      ).overlays,
+      next.overlays,
+      overlay,
+    );
+  const root = tempDir('matched-build-cache');
+  const vsix = path.join(root, 'source.vsix');
+  fs.writeFileSync(vsix, 'artifact');
+  let builds = 0;
+  const build = () => {
+    builds++;
+    return { vsix, artifact: 'artifact' };
+  };
+  preparedBuild(path.join(root, 'cache'), key, build);
+  preparedBuild(path.join(root, 'cache'), next, build);
+  preparedBuild(path.join(root, 'cache'), { ...next, overlays: 'changed-overlay' }, build);
+  assert.equal(builds, 3);
+});
+
+test('matched comparison propagates both arms and refuses successful counters without matched work', async () => {
+  const root = tempDir('matched-compare');
+  const manifest = path.join(root, 'manifest.json');
+  fs.writeFileSync(manifest, '{}');
+  const options: boolean[] = [];
+  const status = await runComparison(
+    [
+      '--fixture',
+      manifest,
+      '--baseline',
+      'base',
+      '--candidate',
+      'next',
+      '--existing-rollout',
+      '--output',
+      path.join(root, 'report'),
+    ],
+    {
+      installed: () => null,
+      discard: () => {},
+      measure: async (args) => {
+        options.push(readOptions(args).existingRollout);
+        return { file: null, scratch: root, result: runnerResult() };
+      },
+    },
+  );
+  assert.deepEqual(options, [true, true]);
+  assert.equal(status, 2);
+  const report = JSON.parse(fs.readFileSync(path.join(root, 'report', 'compare.json'), 'utf8'));
+  assert.equal(report.complete, false);
+  assert.ok(report.matchedMissing.length);
+  const compare = (unequal: boolean) =>
+    runComparison(
+      [
+        '--fixture',
+        manifest,
+        '--baseline',
+        'base',
+        '--candidate',
+        'next',
+        '--existing-rollout',
+        '--output',
+        path.join(root, unequal ? 'unequal' : 'equal'),
+      ],
+      {
+        installed: () => null,
+        discard: () => {},
+        measure: async (args) => {
+          const matched = matchedEvidence();
+          if (unequal && readOptions(args).commit === 'next') matched.turns[0].sha256 = 'different';
+          return {
+            file: null,
+            scratch: root,
+            result: {
+              ...runnerResult(),
+              soak: {
+                ...runnerResult().soak,
+                mode: 'existing-rollout',
+                matched,
+                dispatch: { scheduled: 1 },
+              },
+            },
+          };
+        },
+      },
+    );
+  assert.equal(await compare(false), 0);
+  assert.equal(await compare(true), 2);
+});
+
+test('matched overlay records baseline and candidate paths and accepted row activity', async () => {
+  const { transpileModule } = await import('typescript');
+  const code = transpileModule(MATCHED_OVERLAY, { compilerOptions: { target: 9 } }).outputText;
+  const root = tempDir('matched-overlay');
+  const child = path.join(root, 'child.jsonl');
+  fs.writeFileSync(child, 'private child');
+  const stamp = fs.statSync(child);
+  for (const pathName of ['startedSources', 'qualifiedPendingSources']) {
+    class Provider {
+      showing = 'fixture-session';
+      watchers = new Map([[root, {}]]);
+      dispatchDiscoveryPending = false;
+      dispatchSpendPending = false;
+      authoritativeCatalog = [{}, {}];
+      titles = new Map([
+        [child, { size: stamp.size, mtimeMs: stamp.mtimeMs, activityMs: 1006 }],
+        ['parent', { size: 30, mtimeMs: 1000, activityMs: 1000 }],
+      ]);
+      sessionParentsOf() {
+        return new Map([['child', { parent: 'parent-id', relation: 'dispatched' }]]);
+      }
+      async prepareClaudeChildren() {
+        return true;
+      }
+      async refresh() {}
+      wakeFromWatch() {}
+      postRows() {
+        return Promise.resolve(true);
+      }
+    }
+    Object.defineProperty(Provider.prototype, pathName, { value: () => [], writable: true });
+    const global = {} as { __arcMatchedWork?: MatchedEvidence['end'] };
+    const process = {
+      env: {
+        ARC_MEASURE_RUN: 'measured',
+        ARC_MEASURE_MATCHED: JSON.stringify({ child, parent: 'parent', childId: 'child', parentId: 'parent-id' }),
+      },
+    };
+    new Function('PanelProvider', 'process', 'require', 'globalThis', code)(
+      Provider,
+      process,
+      (name: string) => (name === 'node:fs' ? fs : path),
+      global,
+    );
+    const provider = new Provider();
+    const wrapped = provider as unknown as Record<string, (...args: unknown[]) => unknown>;
+    wrapped[pathName](
+      [
+        { sessionId: 'child', file: child },
+        { sessionId: 'parent-id', file: 'parent' },
+      ],
+      [],
+    );
+    await provider.prepareClaudeChildren();
+    wrapped.wakeFromWatch(root, 'change', 'child.jsonl');
+    await provider.refresh();
+    await wrapped.postRows(
+      {},
+      {
+        sessions: [
+          { id: 'parent-id', at: 1000 },
+          { id: 'child', at: 1006 },
+        ],
+      },
+    );
+    assert.deepEqual(matchedReadiness(global.__arcMatchedWork!, 'child'), []);
+    assert.equal(global.__arcMatchedWork!.qualification.path, pathName);
+    assert.equal(global.__arcMatchedWork!.qualification.admitted, 0);
+    assert.equal(global.__arcMatchedWork!.qualification.inputs.walkedChild, true);
+    for (let i = 0; i < 2050; i++) await provider.refresh();
+    assert.equal(global.__arcMatchedWork!.overflow, false);
+    for (let i = 1; i <= 19; i++) {
+      provider.titles.set(child, { size: stamp.size + i, mtimeMs: stamp.mtimeMs + i, activityMs: 1006 + i });
+      await provider.refresh();
+      assert.ok(
+        global.__arcMatchedWork!.events.some((event) => event.kind === 'refreshed' && event.size === stamp.size + i),
+      );
+    }
+    assert.equal(global.__arcMatchedWork!.parent, 'parent-id');
+    for (const kind of ['notification', 'refreshed', 'accepted', 'published'])
+      assert.ok(
+        global.__arcMatchedWork!.events.some((event) => event.kind === kind && event.size === stamp.size),
+        kind,
+      );
+    assert.equal(global.__arcMatchedWork!.events.find((event) => event.kind === 'published')!.activity, 1006);
+    for (let i = 20; i < 4120; i++) {
+      provider.titles.set(child, { size: stamp.size + i, mtimeMs: stamp.mtimeMs + i, activityMs: 1006 + i });
+      await provider.refresh();
+    }
+    assert.equal(global.__arcMatchedWork!.overflow, true);
+  }
+});
+
 test('soak measures read the counters a saved diagnostics snapshot carries', () => {
   const counters = new PanelPerformanceCounters();
   counters.recordRefresh('poll', 40);
@@ -2694,6 +3023,7 @@ function completeDiscoveryHarness(
     discoveryCompatibility,
     projectSpendWindows,
     sessionCoverageMember,
+    SESSION_LIMIT,
     reconcileSessionCollisions,
     sessionCatalogMembership,
     sessionPageSources,
@@ -2787,7 +3117,9 @@ function completeDiscoveryHarness(
   if (names.includes('allSessions')) names.push('walkedSessions');
   if (names.includes('walkedSessions') || names.includes('runPendingWatch')) names.push('noteCompressedRollouts');
   if (names.includes('allSessions') || names.includes('runPendingWatch')) names.push('currentWalkedCatalog');
-  if (names.includes('prepareClaudeChildren')) names.push('startedSources', 'applyDispatchFacts');
+  if (names.includes('prepareClaudeChildren'))
+    names.push('qualifiedPendingSources', 'applyDispatchFacts', 'settlePromptedPending', 'dispatchReaderOwned');
+  if (names.includes('agentRunFor')) names.push('dispatchReaderOwned', 'pendingPrompted');
   names.push('walkCatalog');
   const body = owner.members
     .filter((member) => member.name && names.includes(member.name.getText(file)))
@@ -5314,171 +5646,220 @@ test('a session row follows the turns after a hand compaction while relationship
 });
 
 // A Codex session this panel started takes its name and recorded responses while unrelated discovery stays pending.
-test('a started Codex session publishes its name and recorded responses while relationship discovery stays pending', async () => {
-  const directory = tempDir('pending-discovery-admission-');
-  const id = '01a176ec-7cfb-7d62-9b62-ad564e398274';
-  const record = (second: number, type: string, payload: object) =>
-    JSON.stringify({ type, timestamp: `2026-10-26T00:00:${String(second).padStart(2, '0')}Z`, payload }) + '\n';
-  const answered = (second: number, turnId: string, prompt: string, answer: string) =>
-    record(second, 'event_msg', { type: 'task_started', turn_id: turnId }) +
-    record(second + 1, 'event_msg', { type: 'user_message', message: prompt }) +
-    record(second + 2, 'event_msg', { type: 'agent_message', message: answer }) +
-    record(second + 3, 'event_msg', { type: 'task_complete', turn_id: turnId, last_agent_message: answer });
-  const file = path.join(directory, `rollout-2026-10-26T00-00-00-${id}.jsonl`);
-  fs.writeFileSync(
-    file,
-    record(0, 'session_meta', { id, cwd: directory, source: 'vscode' }) +
-      answered(
-        1,
-        'one',
-        'Explain the admission plan',
-        'First **answer** with a [link](https://example.com)\n\n- one item',
-      ),
-  );
-  const started = {
-    file,
-    sessionId: id,
-    agent: 'codex' as const,
-    cwd: directory,
-    ...revisionOf(fs.statSync(file, { bigint: true })),
-    activity: 2,
-  };
-  const {
-    provider,
-    codex: older,
-    claude,
-    codexWalk,
-  } = bumpedCatalogHarness({ selectedWindowContainsRecordedTurn, livePressOver, sessionRunning }, true, [
-    'readFor',
-    'dropSpentPresses',
-  ]);
-  const accepted = [claude, older];
-  (codexWalk as SessionFile[]).push(started);
-  const worker = titleWorker();
-  let discoveryReplies = 0;
-  // The temporary cards of two consecutive prompts, each submitted before its recorded turn started.
-  const press = (second: number, text: string, turnId: number): LivePress => ({
-    sessionId: id,
-    agent: 'codex',
-    kind: 'prompt',
-    text,
-    at: Date.parse(`2026-10-26T00:00:0${second}.500Z`),
-    reply: `${text} streamed as text`,
-    completed: true,
-    turnId,
-    midTurn: false,
-    ran: true,
-    started: true,
-    failed: false,
-    reason: '',
-  });
-  Object.assign(provider, {
-    authoritativeCatalog: accepted,
-    authoritativeCatalogScope: JSON.stringify(provider.repositoryScopeRoots),
-    catalog: { sessions: accepted },
-    dispatchDiscoveryPending: true,
-    awaitingSessionRecords: { [id]: { sessionId: id, agent: 'codex', cwd: directory, createdAt: 1 } },
-    live: { [id]: [press(0, 'Explain the admission plan', 1), press(9, 'Continue', 2)] },
-    running: new Set(),
-    checkpointDerivedCache() {},
-  });
-  provider.showing = id;
-  provider.threadNames = { names: new Map([[id, 'Admission plan']]), fullNames: new Map(), stamp: 'named' };
-  provider.progressiveInput = (session: SessionFile) => ({
-    session,
-    folders: [],
-    children: [],
-    maxTurns: 40,
-    tailBytes: 64 * 1024,
-  });
-  provider.progressiveCurrent = (source: SessionFile) => provider.cache.get(source.file)?.revision.size === source.size;
-  provider.sessionCacheBudgetBytes = () => 64 * 1024 * 1024;
-  // Cards come from the accepted selected read through the production renderer, and the newest recorded turn per session is
-  // derived the way the panel's own collection derives it, so the real sweep decides which temporary card retires.
-  provider.collect = (sources: SessionFile[]) => {
-    const turns = sources.flatMap((source) => provider.readFor(source, 40, 1024).read.turns);
-    provider.newestBySession = currentRecordsBySession(turns, []).newestTurns;
-    return turns.map((value: any) => {
-      const card = toCard(value, true, Date.now(), provider.folders());
-      return { ...card, summaryHtml: renderRichMarkdown(card.summary) };
+test.each(['started here', 'started outside Arc'])(
+  'a Codex session %s publishes its name and recorded responses while relationship discovery stays pending',
+  async (origin) => {
+    const directory = tempDir('pending-discovery-admission-');
+    const id = '01a176ec-7cfb-7d62-9b62-ad564e398274';
+    const record = (second: number, type: string, payload: object) =>
+      JSON.stringify({ type, timestamp: `2026-10-26T00:00:${String(second).padStart(2, '0')}Z`, payload }) + '\n';
+    const answered = (second: number, turnId: string, prompt: string, answer: string) =>
+      record(second, 'event_msg', { type: 'task_started', turn_id: turnId }) +
+      record(second + 1, 'event_msg', { type: 'user_message', message: prompt }) +
+      record(second + 2, 'event_msg', { type: 'agent_message', message: answer }) +
+      record(second + 3, 'event_msg', { type: 'task_complete', turn_id: turnId, last_agent_message: answer });
+    const file = path.join(directory, `rollout-2026-10-26T00-00-00-${id}.jsonl`);
+    fs.writeFileSync(
+      file,
+      record(0, 'session_meta', { id, cwd: directory, source: 'vscode', thread_source: 'user' }) +
+        answered(
+          1,
+          'one',
+          'Explain the admission plan',
+          'First **answer** with a [link](https://example.com)\n\n- one item',
+        ),
+    );
+    const started = {
+      file,
+      sessionId: id,
+      agent: 'codex' as const,
+      cwd: directory,
+      ...revisionOf(fs.statSync(file, { bigint: true })),
+      activity: 2,
+    };
+    const {
+      provider,
+      codex: older,
+      claude,
+      codexWalk,
+    } = bumpedCatalogHarness(
+      {
+        selectedWindowContainsRecordedTurn,
+        livePressOver,
+        sessionRunning,
+        agentRunAnswer,
+        needsAgentRunScan: () => false,
+      },
+      true,
+      ['readFor', 'dropSpentPresses', 'agentRunFor', 'activityFor'],
+    );
+    const accepted = [claude, older];
+    codexWalk.push(started);
+    const worker = titleWorker();
+    let discoveryReplies = 0;
+    // The temporary cards of two consecutive prompts, each submitted before its recorded turn started.
+    const press = (second: number, text: string, turnId: number): LivePress => ({
+      sessionId: id,
+      agent: 'codex',
+      kind: 'prompt',
+      text,
+      at: Date.parse(`2026-10-26T00:00:0${second}.500Z`),
+      reply: `${text} streamed as text`,
+      completed: true,
+      turnId,
+      midTurn: false,
+      ran: true,
+      started: true,
+      failed: false,
+      reason: '',
     });
-  };
-  provider.progressiveWorker = {
-    run: (request: ProgressiveRequest, generation: number, signal: AbortSignal) => {
-      if (request.kind !== 'claude-children') return worker.run(request, generation, signal);
-      discoveryReplies++;
-      // Relationship discovery for unrelated sessions never completes.
-      return Promise.resolve({
-        generation,
-        value: {
-          kind: 'claude-children-progress',
-          checkpoint: {
-            compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
-            parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
-            parents: request.parents,
-            catalog: request.parents,
-            repositoryRoots: request.repositoryRoots,
-            completed: [],
-            position: 0,
-            sequence: discoveryReplies,
-          },
-          referenceEntries: [],
-          continuation: true,
-        },
+    Object.assign(provider, {
+      authoritativeCatalog: accepted,
+      authoritativeCatalogScope: JSON.stringify(provider.repositoryScopeRoots),
+      catalog: { sessions: accepted },
+      dispatchDiscoveryPending: true,
+      awaitingSessionRecords:
+        origin === 'started here' ? { [id]: { sessionId: id, agent: 'codex', cwd: directory, createdAt: 1 } } : {},
+      startedHere: new Set(),
+      dispatchFacts: new Map(),
+      live: { [id]: [press(0, 'Explain the admission plan', 1), press(9, 'Continue', 2)] },
+      running: new Set(),
+      checkpointDerivedCache() {},
+    });
+    provider.titles.set(file, {
+      ...started,
+      label: 'Admission plan',
+      fullLabel: 'Admission plan',
+      agentRun: codexIsAgentRun(readCodexSessionMeta(file)!),
+      activityMs: Date.parse('2026-10-26T00:00:04Z'),
+      stats: null,
+      outcome: null,
+    });
+    provider.showing = id;
+    provider.threadNames = { names: new Map([[id, 'Admission plan']]), fullNames: new Map(), stamp: 'named' };
+    provider.progressiveInput = (session: SessionFile) => ({
+      session,
+      folders: [],
+      children: [],
+      maxTurns: 40,
+      tailBytes: 64 * 1024,
+    });
+    provider.progressiveCurrent = (source: SessionFile) =>
+      provider.cache.get(source.file)?.revision.size === source.size;
+    provider.sessionCacheBudgetBytes = () => 64 * 1024 * 1024;
+    // Cards come from the accepted selected read through the production renderer, and the newest recorded turn per session is
+    // derived the way the panel's own collection derives it, so the real sweep decides which temporary card retires.
+    provider.collect = (sources: SessionFile[]) => {
+      const turns = sources.flatMap((source) => provider.readFor(source, 40, 1024).read.turns);
+      provider.newestBySession = currentRecordsBySession(turns, []).newestTurns;
+      return turns.map((value: any) => {
+        const card = toCard(value, true, Date.now(), provider.folders());
+        return { ...card, summaryHtml: renderRichMarkdown(card.summary) };
       });
-    },
-    stop: () => worker.stop(),
-  };
-  // The selected window read posts the selected row and its cards in a selection message, and a catalog refresh in a render.
-  const drawn = (count: number) =>
-    provider.messages.findLast(
-      (message: any) =>
-        (message.type === 'render' || message.type === 'selection') &&
-        message.showing === id &&
-        message.cards?.length === count,
-    );
-  const first =
-    '<p>First <strong>answer</strong> with a <a href="#" data-link="https://example.com">link</a></p>\n<ul>\n<li>one item</li>\n</ul>\n';
-  try {
-    await provider.refresh();
-    assert.ok(discoveryReplies > 0, 'the refresh never reached relationship discovery');
-    await vi.waitFor(
-      () => assert.ok(drawn(1), 'the started session kept its temporary state, so no recorded response was drawn'),
-      { timeout: 5000 },
-    );
-    assert.equal(drawn(1).sessions.find((row: any) => row.id === id)?.label, 'Admission plan');
-    assert.deepEqual(
-      drawn(1).cards.map((card: any) => card.summaryHtml),
-      [first],
-    );
-    assert.equal(
-      provider.awaitingSessionRecords[id],
-      undefined,
-      'the recorded session never replaced the temporary one',
-    );
-    assert.deepEqual(
-      provider.live[id]?.map((held: LivePress) => held.text),
-      ['Continue'],
-      'the first recorded answer did not retire only its own temporary card',
-    );
-    fs.appendFileSync(file, answered(10, 'two', 'Continue', 'Second answer with `inline code`'));
-    Object.assign(started, revisionOf(fs.statSync(file, { bigint: true })));
-    await provider.refresh();
-    await vi.waitFor(() => assert.ok(drawn(2), 'the second recorded answer was never drawn'), { timeout: 5000 });
-    assert.deepEqual(
-      drawn(2).cards.map((card: any) => card.summaryHtml),
-      [first, '<p>Second answer with <code>inline code</code></p>\n'],
-    );
-    assert.equal(provider.live[id], undefined, 'the second recorded answer left its temporary card');
-    assert.equal(provider.dispatchDiscoveryPending, true, 'relationship discovery completed');
-    assert.equal(provider.sessionQueryDiscoveryPending, true, 'search coverage claimed complete discovery');
-  } finally {
-    worker.stop();
-    fs.rmSync(directory, { recursive: true, force: true });
-  }
-});
+    };
+    provider.progressiveWorker = {
+      run: (request: ProgressiveRequest, generation: number, signal: AbortSignal) => {
+        if (request.kind !== 'claude-children') return worker.run(request, generation, signal);
+        discoveryReplies++;
+        // Relationship discovery for unrelated sessions never completes.
+        return Promise.resolve({
+          generation,
+          value: {
+            kind: 'claude-children-progress',
+            checkpoint: {
+              compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
+              parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
+              parents: request.parents,
+              catalog: request.parents,
+              repositoryRoots: request.repositoryRoots,
+              completed: [],
+              position: 0,
+              sequence: discoveryReplies,
+            },
+            referenceEntries: [],
+            continuation: true,
+          },
+        });
+      },
+      stop: () => worker.stop(),
+    };
+    // The selected window read posts the selected row and its cards in a selection message, and a catalog refresh in a render.
+    const drawn = (count: number) =>
+      provider.messages.findLast(
+        (message: any) =>
+          (message.type === 'render' || message.type === 'selection') &&
+          message.showing === id &&
+          message.cards?.length === count,
+      );
+    const first =
+      '<p>First <strong>answer</strong> with a <a href="#" data-link="https://example.com">link</a></p>\n<ul>\n<li>one item</li>\n</ul>\n';
+    try {
+      await provider.refresh();
+      assert.ok(discoveryReplies > 0, 'the refresh never reached relationship discovery');
+      await vi.waitFor(
+        () => assert.ok(drawn(1), 'the started session kept its temporary state, so no recorded response was drawn'),
+        { timeout: 5000 },
+      );
+      assert.equal(drawn(1).sessions.find((row: any) => row.id === id)?.label, 'Admission plan');
+      const row = drawn(1).sessions.find((row: any) => row.id === id);
+      assert.equal(row?.agentRun, false, 'the external reader session has no reader classification');
+      const now = Date.parse('2026-10-26T00:00:15Z');
+      const cards = railSessions(
+        [row],
+        new Map(),
+        new Map(),
+        new Map(),
+        new Set(),
+        null,
+        new Set(),
+        new Map(),
+        {},
+        {},
+        {},
+        {},
+        new Map(),
+        now,
+      );
+      const active = railShownCards(cards, { query: 'is:active -is:archived -is:agentrun' }, now);
+      assert.deepEqual(
+        active.map((card) => card.id),
+        [id],
+        'the published external session is missing from Active',
+      );
+      assert.equal(active[0].agentWord, active[0].agent, 'the reader session carries agent-run wording');
+      assert.deepEqual(
+        drawn(1).cards.map((card: any) => card.summaryHtml),
+        [first],
+      );
+      assert.equal(
+        provider.awaitingSessionRecords[id],
+        undefined,
+        'the recorded session never replaced the temporary one',
+      );
+      assert.deepEqual(
+        provider.live[id]?.map((held: LivePress) => held.text),
+        ['Continue'],
+        'the first recorded answer did not retire only its own temporary card',
+      );
+      fs.appendFileSync(file, answered(10, 'two', 'Continue', 'Second answer with `inline code`'));
+      Object.assign(started, revisionOf(fs.statSync(file, { bigint: true })));
+      await provider.refresh();
+      await vi.waitFor(() => assert.ok(drawn(2), 'the second recorded answer was never drawn'), { timeout: 5000 });
+      assert.deepEqual(
+        drawn(2).cards.map((card: any) => card.summaryHtml),
+        [first, '<p>Second answer with <code>inline code</code></p>\n'],
+      );
+      assert.equal(provider.live[id], undefined, 'the second recorded answer left its temporary card');
+      assert.equal(provider.dispatchDiscoveryPending, true, 'relationship discovery completed');
+      assert.equal(provider.sessionQueryDiscoveryPending, true, 'search coverage claimed complete discovery');
+    } finally {
+      worker.stop();
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  },
+);
 
-// Only a walked source that alone answers a session this panel started joins the accepted rows before discovery completes.
+// Qualified sources join accepted rows while discovery continues, including sessions started outside Arc.
 test.each([
   'qualified',
   'not started here',
@@ -5493,7 +5874,15 @@ test.each([
   'inode zero',
   'without a recorded cwd',
   'qualified Claude',
-] as const)('a pending discovery reply admits only a qualified started source: %s', async (change) => {
+  'unstarted second walked source',
+  'unstarted colliding session ID',
+  'unstarted child transcript',
+  'unstarted outside repository scope',
+  'unstarted not an enumerated member',
+  'unstarted already accepted',
+] as const)('a pending discovery reply admits only a qualified source: %s', async (variant) => {
+  const unstarted = variant.startsWith('unstarted ') || variant === 'not started here';
+  const change = variant.replace('unstarted ', '');
   const { provider, claude, codex } = bumpedCatalogHarness({ scopeInside: isInside });
   const root = path.resolve('project');
   const started: SessionFile = {
@@ -5521,17 +5910,16 @@ test.each([
     authoritativeCatalog: accepted,
     catalog: { sessions: walked },
     refreshGeneration: 4,
-    awaitingSessionRecords:
-      change === 'not started here'
-        ? {}
-        : {
-            [started.sessionId]: {
-              sessionId: started.sessionId,
-              agent: change === 'other provider' ? 'claude' : started.agent,
-              cwd: root,
-              createdAt: 1,
-            },
+    awaitingSessionRecords: unstarted
+      ? {}
+      : {
+          [started.sessionId]: {
+            sessionId: started.sessionId,
+            agent: change === 'other provider' ? 'claude' : started.agent,
+            cwd: root,
+            createdAt: 1,
           },
+        },
     enumeratedMembers: new Set(
       walked.filter((source) => change !== 'not an enumerated member' || source !== started).map(sessionCoverageMember),
     ),
@@ -5555,7 +5943,12 @@ test.each([
     });
   assert.equal(await provider.prepareClaudeChildren(4, new AbortController().signal), true);
   assert.equal(provider.dispatchDiscoveryPending, true);
-  if (change === 'qualified' || change === 'without a recorded cwd' || change === 'qualified Claude')
+  if (
+    (unstarted && variant === 'not started here') ||
+    change === 'qualified' ||
+    change === 'without a recorded cwd' ||
+    change === 'qualified Claude'
+  )
     assert.deepEqual(provider.catalog.sessions, [...accepted, started]);
   else assert.equal(provider.catalog.sessions, accepted, 'a refused source joined the accepted rows');
 });
@@ -8033,8 +8426,8 @@ function bumpedCatalogHarness(
   extraMethods: string[] = [],
 ) {
   const { cacheFile, codex, claude, child } = bumpedDerivedCache();
-  const codexWalk = [codex];
-  const claudeWalk = [claude];
+  const codexWalk: SessionFile[] = [codex];
+  const claudeWalk: SessionFile[] = [claude];
   const provider = completeDiscoveryHarness(
     undefined,
     realSelectedWindow,
@@ -13520,7 +13913,9 @@ test.each([false, true])(
       const discoveryHost = bumpedCatalogHarness().provider;
       provider.prepareClaudeChildren = discoveryHost.prepareClaudeChildren;
       provider.applyDispatchFacts = discoveryHost.applyDispatchFacts;
-      provider.startedSources = discoveryHost.startedSources;
+      provider.settlePromptedPending = discoveryHost.settlePromptedPending;
+      provider.dispatchReaderOwned = discoveryHost.dispatchReaderOwned;
+      provider.qualifiedPendingSources = discoveryHost.qualifiedPendingSources;
       Object.assign(provider, {
         claudeParents: [session],
         claudeChildren: [],
@@ -13638,7 +14033,9 @@ function exhaustedLoadingHarness(extraMethods: string[] = [], scope: Record<stri
   const discoveryHost = bumpedCatalogHarness().provider;
   provider.prepareClaudeChildren = discoveryHost.prepareClaudeChildren;
   provider.applyDispatchFacts = discoveryHost.applyDispatchFacts;
-  provider.startedSources = discoveryHost.startedSources;
+  provider.settlePromptedPending = discoveryHost.settlePromptedPending;
+  provider.dispatchReaderOwned = discoveryHost.dispatchReaderOwned;
+  provider.qualifiedPendingSources = discoveryHost.qualifiedPendingSources;
   Object.assign(provider, {
     claudeParents: [healthy],
     claudeChildren: [],
@@ -17159,8 +17556,8 @@ test('finite delegated reads publish the startup catalog while repeated catalog 
   const parent = session(parentFile, 'parent', 'claude'),
     child = session(childFile, id, 'codex');
   const { provider, claudeWalk, codexWalk } = bumpedCatalogHarness();
-  (claudeWalk as SessionFile[]).splice(0, claudeWalk.length, parent);
-  (codexWalk as SessionFile[]).splice(0, codexWalk.length, child);
+  claudeWalk.splice(0, claudeWalk.length, parent);
+  codexWalk.splice(0, codexWalk.length, child);
   Object.assign(provider, {
     repositoryScopeRoots: [directory],
     repositoryScope: { snapshot: () => ({ ready: true, roots: [directory], revision: 1 }) },
@@ -17451,6 +17848,8 @@ test('metadata-only upgrade resumes relationships before ordinary startup metada
       Object.assign(provider, {
         prepareClaudeChildren: seed.prepareClaudeChildren,
         applyDispatchFacts: seed.applyDispatchFacts,
+        settlePromptedPending: seed.settlePromptedPending,
+        dispatchReaderOwned: seed.dispatchReaderOwned,
         repositoryScopeRoots: [root],
         claudeParents: sources,
         claudeChildStatWrites: new Map(),
@@ -17583,6 +17982,8 @@ test('an upgrade from shared metadata version 70 reads Claude sessions as a rest
       Object.assign(provider, {
         prepareClaudeChildren: seed.prepareClaudeChildren,
         applyDispatchFacts: seed.applyDispatchFacts,
+        settlePromptedPending: seed.settlePromptedPending,
+        dispatchReaderOwned: seed.dispatchReaderOwned,
         repositoryScopeRoots: [root],
         claudeParents: [claude],
         claudeChildStatWrites: new Map(),
@@ -19444,5 +19845,299 @@ test('a selected session with a dispatched child reads its newest turn once', as
     assert.deepEqual(kinds, ['window'], 'a later pass read the unchanged newest turn again');
   } finally {
     worker.stop();
+  }
+});
+
+test.each([
+  'unowned',
+  'reader-owned edge',
+  'reader person',
+  'pending person',
+  'missing facts',
+  'reader-owned edge without facts',
+  'no edge',
+] as const)(
+  'a complete discovery reply settles provisional prompt ownership from fresh evidence: %s',
+  async (ownership) => {
+    const { provider, claude, codex } = bumpedCatalogHarness(
+      { agentRunAnswer, needsAgentRunScan: () => false },
+      false,
+      ['agentRunFor'],
+    );
+    let persisted = 0;
+    Object.assign(provider, {
+      saved: {
+        comments: [],
+        labels: {},
+        prompted: Array.from({ length: 500 }, (_, i) => `confirmed-${i}`),
+        promptedPending: [codex.sessionId],
+      },
+      startedHere: new Set(),
+      dispatchFacts: new Map(),
+      refreshGeneration: 4,
+      catalog: { sessions: [claude, codex] },
+      authoritativeCatalog: [claude, codex],
+      claudeChildren: [{ sessionId: codex.sessionId, parentSessionId: claude.sessionId }],
+      claudeParents: [claude, codex],
+      codexSubagents: [],
+      persistHostState: async () => {
+        persisted++;
+      },
+      checkpointDerivedCache() {},
+      metaFor: () => ({ ...codex, agentRun: false }),
+    });
+    const reference = {
+      kind: 'dispatch',
+      parentSessionId: claude.sessionId,
+      sessionId: codex.sessionId,
+      file: codex.file,
+      toolUseIds: [],
+      name: 'worker',
+      ...(ownership.startsWith('reader-owned edge') ? { owned: true } : {}),
+    };
+    provider.progressiveWorker.run = (_request: ProgressiveRequest, generation: number) =>
+      Promise.resolve({
+        generation,
+        value: {
+          compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
+          kind: 'claude-children',
+          complete: true,
+          continuation: false,
+          roots: [claude, codex],
+          references: ownership === 'no edge' ? [] : [reference],
+          children: [],
+          referenceEntries: [],
+          dispatchFacts: ownership.includes('facts')
+            ? []
+            : [
+                {
+                  sessionId: codex.sessionId,
+                  person: ownership === 'reader person',
+                  personPending: ownership === 'pending person',
+                  spend: {},
+                },
+              ],
+        },
+      });
+    assert.equal(await provider.prepareClaudeChildren(4, new AbortController().signal), true);
+    const confirmed = Array.from({ length: 500 }, (_, i) => `confirmed-${i}`);
+    assert.deepEqual(
+      provider.saved.prompted,
+      ownership === 'unowned' ? [...confirmed.slice(1), codex.sessionId] : confirmed,
+    );
+    assert.deepEqual(
+      provider.saved.promptedPending,
+      ['pending person', 'missing facts', 'no edge'].includes(ownership) ? [codex.sessionId] : [],
+    );
+    assert.equal(provider.agentRunFor(codex, provider.sessionParentsOf()), false);
+    assert.equal(persisted, ['pending person', 'missing facts', 'no edge'].includes(ownership) ? 0 : 1);
+    if (ownership === 'no edge') {
+      await provider.refresh();
+      assert.ok(provider.sessionReadDiscoveryRevision, 'the fixture never accepted complete relationship coverage');
+      assert.deepEqual(
+        provider.saved.promptedPending,
+        [codex.sessionId],
+        'complete coverage erased reader ownership before late launch evidence',
+      );
+    }
+  },
+);
+
+test('external session admission keeps appended rollouts watched during pending discovery', async () => {
+  const root = tempDir('pending-discovery-watch-');
+  const projects = path.join(root, 'projects');
+  const codexRoot = path.join(root, 'sessions');
+  const workspace = path.join(root, 'workspace');
+  fs.mkdirSync(workspace);
+  const now = Date.parse('2026-11-01T12:00:00.000Z');
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(now);
+  const simulation = startDispatch(projects, codexRoot, workspace, now);
+  fs.utimesSync(simulation.child, now / 1000, now / 1000);
+  const subscriptions = new Map<string, (kind: fs.WatchEventType, name: string) => void>();
+  const requested: string[][] = [];
+  const delivered: string[] = [];
+  const qualified: { input: string[]; output: string[] }[] = [];
+  const watchMock = vi
+    .spyOn(mutableFs, 'watch')
+    .mockImplementation(
+      (
+        directory: fs.PathLike,
+        options?: fs.WatchOptions | string | fs.WatchListener<string>,
+        callback?: fs.WatchListener<string>,
+      ) => {
+        assert.equal(typeof directory, 'string');
+        const listener = typeof options === 'function' ? options : callback;
+        assert.ok(listener);
+        const key = String(directory);
+        subscriptions.set(key, (kind, name) => listener(kind, name));
+        return new (class extends EventEmitter implements fs.FSWatcher {
+          close() {
+            subscriptions.delete(key);
+          }
+          ref() {
+            return this;
+          }
+          unref() {
+            return this;
+          }
+        })();
+      },
+    );
+  syncBuiltinESMExports();
+  const counters = new PanelPerformanceCounters();
+  const { provider, codex, claude, codexWalk, claudeWalk } = bumpedCatalogHarness(
+    {
+      productionWatchDirs: watchDirs,
+      watcherRefreshDecision,
+      sessionDirectoryOwners,
+      unknownPathShapes,
+      unknownPathExtension,
+      path,
+      revalidatedCatalogPaths,
+    },
+    false,
+    ['watchDirectories', 'wakeFromWatch', 'runPendingWatch', 'unknownPathShapeOf', 'activityFor'],
+  );
+  const source = (file: string, agent: 'claude' | 'codex', sessionId: string): SessionFile => ({
+    file,
+    agent,
+    sessionId,
+    cwd: workspace,
+    ...revisionOf(fs.statSync(file, { bigint: true })),
+  });
+  const oldClaudeFile = path.join(path.dirname(simulation.parent), 'accepted.jsonl');
+  const oldCodexFile = path.join(codexRoot, '2026', '10', '31', 'rollout-accepted.jsonl');
+  fs.mkdirSync(path.dirname(oldCodexFile), { recursive: true });
+  fs.writeFileSync(oldClaudeFile, '{"type":"user"}\n');
+  fs.writeFileSync(oldCodexFile, '{"type":"session_meta"}\n');
+  Object.assign(claude, source(oldClaudeFile, 'claude', claude.sessionId));
+  Object.assign(codex, source(oldCodexFile, 'codex', codex.sessionId));
+  const accepted = [claude, codex];
+  const parentId = path.basename(simulation.parent, '.jsonl');
+  claudeWalk.push(source(simulation.parent, 'claude', parentId));
+  codexWalk.push(source(simulation.child, 'codex', simulation.childId));
+  Object.assign(provider, {
+    watching: true,
+    watchers: new Map(),
+    pendingWatch: new PendingWatcherWake(),
+    watchScheduler: { offer() {}, cancel() {} },
+    performanceCounters: counters,
+    codexStats: new CodexStatCache(),
+    authoritativeCatalog: accepted,
+    authoritativeCatalogScope: JSON.stringify(['project']),
+    catalog: { sessions: accepted },
+    dispatchDiscoveryPending: true,
+    dispatchFacts: new Map(),
+    startedHere: new Set(),
+    claudeChildReferences: [],
+    claudeChildStatWrites: new Map(),
+    scheduleDiscoveryContinuation() {},
+    progressiveWorker: {
+      run(request: ProgressiveRequest, generation: number) {
+        assert.equal(request.kind, 'claude-children');
+        return Promise.resolve({
+          generation,
+          value: {
+            kind: 'claude-children-progress',
+            continuation: true,
+            checkpoint: {
+              compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
+              parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
+              parents: request.parents,
+              catalog: request.parents,
+              repositoryRoots: request.repositoryRoots,
+              completed: [],
+              position: 0,
+              sequence: qualified.length + 1,
+            },
+            referenceEntries: [],
+          },
+        });
+      },
+    },
+  });
+  const qualify = provider.qualifiedPendingSources;
+  provider.qualifiedPendingSources = (walked: SessionFile[], held: SessionFile[]) => {
+    const output = qualify.call(provider, walked, held);
+    qualified.push({
+      input: walked.map((row) => row.sessionId),
+      output: output.map((row: SessionFile) => row.sessionId),
+    });
+    return output;
+  };
+  const watch = provider.watchDirectories;
+  provider.watchDirectories = (directories: string[]) => {
+    requested.push(directories);
+    watch.call(provider, directories);
+  };
+  provider.watchScheduler = new BoundedTrailingScheduler(200, 1_000, (event) => provider.runPendingWatch(event));
+  const pending: Promise<void>[] = [];
+  const refresh = provider.refresh;
+  provider.refresh = (...args: unknown[]) => {
+    const run = refresh.apply(provider, args);
+    pending.push(run);
+    return run;
+  };
+  const settle = async () => {
+    for (let index = 0; index < pending.length; index++) await pending[index];
+  };
+  const notify = async (file: string, kind: 'rename' | 'change') => {
+    const callback = subscriptions.get(path.dirname(file));
+    if (!callback) return;
+    delivered.push(file);
+    callback(kind, path.basename(file));
+    assert.equal(provider.watchScheduler.flush(), true);
+    await settle();
+  };
+  try {
+    provider.watchDirectories(watchDirs(accepted));
+    await notify(simulation.parent, 'rename');
+    assert.equal(
+      subscriptions.has(path.dirname(simulation.child)),
+      true,
+      'the early rollout did not gain its directory watch',
+    );
+    assert.ok(provider.sessionRows.some((row: { id: string }) => row.id === simulation.childId));
+    for (let turn = 1; turn <= 19; turn++) {
+      vi.setSystemTime(now + turn * 30_000);
+      appendDispatchTurn(simulation, workspace, Date.now());
+      fs.utimesSync(simulation.child, Date.now() / 1000, Date.now() / 1000);
+      codexWalk[1] = source(simulation.child, 'codex', simulation.childId);
+      await notify(simulation.child, 'change');
+      assert.equal(
+        provider.authoritativeCatalog.find((row: SessionFile) => row.sessionId === simulation.childId)?.size,
+        fs.statSync(simulation.child).size,
+      );
+      assert.equal(
+        provider.messages.at(-1).sessions.find((row: { id: string }) => row.id === simulation.childId)?.at,
+        Date.now(),
+        'the published rollout row did not gain the appended activity',
+      );
+    }
+    assert.equal(qualified.length, 20);
+    assert.deepEqual(new Set(qualified[0].output), new Set([parentId, simulation.childId]));
+    assert.ok(qualified.slice(1).every((row) => row.output.length === 0));
+    assert.equal(requested.length, 21);
+    assert.equal(watchMock.mock.calls.length, 3);
+    assert.equal(simulation.appends, 19);
+    assert.ok(simulation.bytes < 5_100_000);
+    assert.equal(provider.dispatchDiscoveryPending, true);
+    assert.equal(delivered.length, 20);
+    assert.equal(counters.snapshot().watcherDecisions.targeted, 19);
+    assert.equal(counters.snapshot().work.catalogWalk, 1);
+    assert.equal(counters.snapshot().refreshes.transcript.count, 20);
+    assert.equal(
+      provider.authoritativeCatalog.find((row: SessionFile) => row.sessionId === simulation.childId)?.size,
+      fs.statSync(simulation.child).size,
+    );
+  } finally {
+    provider.watching = false;
+    provider.watchScheduler.cancel();
+    for (const watcher of provider.watchers.values()) watcher.close();
+    provider.abandonCatalogRefresh();
+    watchMock.mockRestore();
+    syncBuiltinESMExports();
+    vi.useRealTimers();
   }
 });

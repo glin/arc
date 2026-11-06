@@ -5758,6 +5758,54 @@ test('a Codex subagent turn keeps its recorded assignment when the parent instru
   assert.deepEqual(readCodexTurnStarts(file), { starts: [ms(1)], whole: true });
 });
 
+test.each([
+  { boundary: 'an older recorded start', startedAt: ms(-20), bounded: false },
+  { boundary: 'no recorded start', startedAt: null, bounded: false },
+  { boundary: 'a title window inside copied history', startedAt: ms(-20), bounded: true },
+  { boundary: 'a recent copied start and a readable assignment', startedAt: ms(-1), bounded: false },
+])('a forked Codex subagent title excludes copied parent history with $boundary', ({ startedAt, bounded }) => {
+  const task = '/root/sleep42';
+  const inherited = [
+    meta({
+      id: 'child-thread',
+      parent_thread_id: 'parent-thread',
+      forked_from_id: 'parent-thread',
+      thread_source: 'subagent',
+      agent_path: task,
+    }),
+    meta({ id: 'parent-thread' }),
+    event('task_started', 1, {
+      turn_id: 'unseen-parent-turn',
+      ...(startedAt === null ? {} : { started_at: startedAt }),
+    }),
+    event('user_message', 2, { message: 'Do these two steps in order, then report.' }),
+    {
+      type: 'token_usage_record',
+      timestamp: at(2),
+      payload: { thread_id: 'child-thread', turn_id: 'unseen-parent-turn', response_id: 'copied-parent-bill' },
+    },
+    event('turn_aborted', 3, { turn_id: 'unseen-parent-turn' }),
+  ];
+  const file = writeRollout([
+    ...inherited,
+    event('task_started', 4, { turn_id: 'child-turn', started_at: ms(4) }),
+    item('agent_message', 5, {
+      author: '/root',
+      recipient: task,
+      content: [
+        {
+          type: 'input_text',
+          text: `Message Type: NEW_TASK\nTask name: ${task}\nSender: /root\nPayload:\n${startedAt === ms(-1) ? 'Wait for the assignment signal.' : ''}`,
+        },
+        { type: 'encrypted_content', encrypted_content: 'ciphertext' },
+      ],
+    }),
+  ]);
+  const bytes = bounded ? Buffer.byteLength(inherited.map((record) => JSON.stringify(record)).join('\n')) : undefined;
+  const expected = startedAt === ms(-1) ? 'Wait for the assignment signal.' : task;
+  assert.deepEqual(readCodexSessionTitlePair(file, bytes), { short: expected, full: expected });
+});
+
 test('a Codex subagent turn keeps readable assignment instructions', () => {
   const task = '/root/implement_parser';
   const file = writeRollout([
@@ -13507,6 +13555,32 @@ test('rounded native ownership retains known context through cloned spend and fo
   assert.deepEqual(restored.pushLine(JSON.stringify(bill)), expected);
   assert.equal(restored.snapshot().currentTurnEndedAt, ms(18) + 5);
   fs.appendFileSync(file, JSON.stringify(bill) + '\n');
+  assert.equal(readCodexSessionTitle(file), `${own} prompt`);
+  for (const agentPath of ['/root/reviewer', undefined]) {
+    const titleRecords = structuredClone(records);
+    const opening = titleRecords[0] as { payload: { source: { subagent: { thread_spawn: { agent_path?: string } } } } };
+    opening.payload.source.subagent.thread_spawn.agent_path = agentPath;
+    const titleFile = writeRollout(titleRecords);
+    assert.equal(
+      readCodexSessionTitle(titleFile),
+      agentPath ?? null,
+      'an unconfirmed native prompt supplied its title',
+    );
+    for (const foreign of ['sess', 'foreign']) {
+      const foreignFile = writeRollout([
+        ...titleRecords,
+        { ...bill, payload: { ...bill.payload, thread_id: foreign } },
+      ]);
+      assert.equal(readCodexSessionTitle(foreignFile), agentPath ?? null, 'a foreign bill confirmed a native title');
+    }
+    assert.equal(readCodexSessionTitle(writeRollout([...titleRecords, bill])), `${own} prompt`);
+    const copied = [titleRecords[0], meta({ id: 'parent-thread' }), ...titleRecords.slice(1), bill];
+    assert.equal(
+      readCodexSessionTitle(writeRollout(copied)),
+      agentPath ?? null,
+      'a copied parent bill confirmed a title',
+    );
+  }
   const resumedDispatch = scanCodexDispatchReferences(file, child, structuredClone(initialDispatch.cursor));
   assert.deepEqual(resumedDispatch.references, scanCodexDispatchReferences(file, child).references);
   assert.deepEqual(

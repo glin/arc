@@ -1128,7 +1128,7 @@ export function staleMetas(
   return [...cached].filter((file) => !seen.has(file) && absent(file));
 }
 
-// Read the first typed prompt as a fallback session title.
+// Read the session's first prompt or assignment, excluding copied parent history.
 // The index later supplies the thread name independently of rollout activity.
 export function readCodexSessionTitle(file: string, bytes = CODEX_TITLE_BYTES): string | null {
   return readCodexSessionTitlePair(file, bytes).short;
@@ -1141,21 +1141,79 @@ export function readCodexSessionTitlePair(
   const lines = headLines(file, bytes);
   const opening = lines.length ? parseRecord(lines[0]) : null;
   const agentPath = opening?.kind === 'session_meta' ? codexAgentPath(opening.payload) : null;
-  for (const line of lines) {
-    if (!carriesUserMessage(line) && !carriesDelegation(line)) {
+  const openingId =
+    opening?.kind === 'session_meta' ? (str(opening.payload.id) ?? str(opening.payload.session_id)) : null;
+  const openingTimestamp =
+    opening?.kind === 'session_meta' ? codexReplayBoundaryAt(opening.at || null, opening.payload) : null;
+  const nativeSpawnedAt =
+    opening?.kind === 'session_meta' ? nativeSpawnPayloadAt(opening.at || null, opening.payload) : null;
+  const ownership = emptyCodexUsageReducerState(null, openingTimestamp, openingId, agentPath, nativeSpawnedAt);
+  const candidates: Array<{ source: string; turnId: string | null; confirmed: boolean }> = [];
+  for (const [index, line] of lines.entries()) {
+    if (
+      !carriesUserMessage(line) &&
+      !carriesDelegation(line) &&
+      !/(?:session_meta|task_started|turn_context|token_usage_record)/.test(line)
+    ) {
       continue;
     }
     const record = parseRecord(line);
     if (!record) {
       continue;
     }
-    const source = codexPrompt(userMessage(record) ?? '') || codexDelegation(record, agentPath)?.text || '';
-    const short = normalizeSessionTitle(source);
-    if (short) {
-      return { short, full: normalizeFullSessionTitle(source) };
+    if (record.kind === 'session_meta') {
+      const id = str(record.payload.id) ?? str(record.payload.session_id);
+      if (index > 0 && id && openingId) ownership.foreignSessionMeta = id !== openingId;
+      continue;
     }
+    if (record.kind === 'task_started') {
+      const foreign = ownership.foreignSessionMeta;
+      beginCodexTurn(ownership, record.payload);
+      // A recent inherited start supplies no independent child identity.
+      if (foreign) {
+        ownership.foreignSessionMeta = true;
+        if (ownership.currentTurnId) delete ownership.pendingOwnership[ownership.currentTurnId];
+      }
+      continue;
+    }
+    if (record.kind === 'turn_context') {
+      applyCodexTurnDate(ownership, record.payload);
+      continue;
+    }
+    if (record.kind === 'token_usage_record') {
+      const id = str(record.payload.turn_id);
+      if (id && codexTurnOwnershipConfirmed(ownership, record.payload, id)) {
+        delete ownership.pendingOwnership[id];
+        for (const candidate of candidates) if (candidate.turnId === id) candidate.confirmed = true;
+        if (ownership.currentTurnId === id && !ownership.currentTurnRepeated) ownership.currentTurnCopied = false;
+        if (candidates[0]?.confirmed)
+          return {
+            short: normalizeSessionTitle(candidates[0].source),
+            full: normalizeFullSessionTitle(candidates[0].source),
+          };
+      }
+      continue;
+    }
+    const delegation = codexDelegation(record, agentPath);
+    if (delegation && !ownership.currentTurnCopied) ownership.foreignSessionMeta = false;
+    if (ownership.foreignSessionMeta) continue;
+    const id = ownership.currentTurnId;
+    if (ownership.currentTurnCopied && !(id && ownership.pendingOwnership[id])) continue;
+    const source = codexPrompt(userMessage(record) ?? '') || delegation?.text || '';
+    if (normalizeSessionTitle(source)) candidates.push({ source, turnId: id, confirmed: !ownership.currentTurnCopied });
+    if (candidates[0]?.confirmed)
+      return {
+        short: normalizeSessionTitle(candidates[0].source),
+        full: normalizeFullSessionTitle(candidates[0].source),
+      };
   }
-  return { short: null, full: null };
+  const first = candidates.find(
+    (candidate) => candidate.confirmed && !(candidate.turnId && ownership.datedCopiedTurnIds[candidate.turnId]),
+  );
+  if (first) {
+    return { short: normalizeSessionTitle(first.source), full: normalizeFullSessionTitle(first.source) };
+  }
+  return { short: normalizeSessionTitle(agentPath ?? ''), full: normalizeFullSessionTitle(agentPath ?? '') };
 }
 
 export interface CodexSessionActivity {
@@ -1834,17 +1892,27 @@ function pruneCodexReplayLedger(state: CodexUsageReducerState, replayFloor: numb
   }
 }
 
+function codexTurnReplayClock(
+  startedAt: number | null,
+  openingTimestamp: number | null,
+  nativeSpawnedAt: number | null,
+): { copied: boolean; clearsForeign: boolean } {
+  const copied =
+    startedAt !== null &&
+    openingTimestamp !== null &&
+    (startedAt < openingTimestamp - CODEX_REPLAY_CLOCK_SLACK_MS ||
+      (nativeSpawnedAt !== null && startedAt === nativeSpawnedAt));
+  return { copied, clearsForeign: startedAt !== null && !copied };
+}
+
 function beginCodexTurn(state: CodexUsageReducerState, payload: Record<string, unknown>, sourceStart?: number): void {
   const turnId = str(payload.turn_id);
   const repeated = turnId !== null && Object.hasOwn(state.seenTurnIds, turnId);
   const evidenceOffset = turnId === null ? undefined : state.seenTurnOffsets[turnId];
   const startedAt = recordedTurnStart(payload);
-  const copiedByClock =
-    startedAt !== null &&
-    state.openingTimestamp !== null &&
-    (startedAt < state.openingTimestamp - CODEX_REPLAY_CLOCK_SLACK_MS ||
-      (state.nativeSpawnedAt !== null && startedAt === state.nativeSpawnedAt));
-  if (startedAt !== null && !copiedByClock) {
+  const clock = codexTurnReplayClock(startedAt, state.openingTimestamp, state.nativeSpawnedAt);
+  const copiedByClock = clock.copied;
+  if (clock.clearsForeign) {
     state.foreignSessionMeta = false;
   }
   state.currentTurnId = turnId;
@@ -1873,6 +1941,20 @@ function beginCodexTurn(state: CodexUsageReducerState, payload: Record<string, u
       state.copiedTurnIds[turnId] = true;
     }
   }
+}
+
+function codexTurnOwnershipConfirmed(
+  state: CodexUsageReducerState,
+  payload: Record<string, unknown>,
+  turnId: string,
+): boolean {
+  return !!(
+    state.pendingOwnership[turnId] &&
+    !state.foreignSessionMeta &&
+    str(payload.thread_id) === state.openingSessionId &&
+    str(payload.response_id) &&
+    !state.datedCopiedTurnIds[turnId]
+  );
 }
 
 function discardPendingCodexRequests(state: CodexUsageReducerState, turnId: string): void {
@@ -2299,15 +2381,7 @@ function reduceCodexUsageEventsInner(state: CodexUsageReducerState, record: Code
         }
       }
     }
-    if (
-      !turnId ||
-      !state.pendingOwnership[turnId] ||
-      state.foreignSessionMeta ||
-      str(payload.thread_id) !== state.openingSessionId ||
-      !str(payload.response_id) ||
-      state.datedCopiedTurnIds[turnId]
-    )
-      return corrections;
+    if (!turnId || !codexTurnOwnershipConfirmed(state, payload, turnId)) return corrections;
     delete state.pendingOwnership[turnId];
     if (state.currentTurnId !== turnId || !state.currentTurnRepeated) delete state.copiedTurnIds[turnId];
     if (state.currentTurnId === turnId && !state.currentTurnRepeated) {
@@ -3863,12 +3937,9 @@ export function codexDispatchRecord(
   if (kind === 'task_started') {
     const id = str(payload.turn_id);
     const startedAt = recordedTurnStart(payload);
-    const oldClock =
-      startedAt !== null &&
-      cursor.openingTimestamp !== null &&
-      (startedAt < cursor.openingTimestamp - CODEX_REPLAY_CLOCK_SLACK_MS ||
-        (cursor.nativeSpawnedAt !== null && startedAt === cursor.nativeSpawnedAt));
-    if (startedAt !== null && !oldClock) cursor.foreignSessionMeta = false;
+    const clock = codexTurnReplayClock(startedAt, cursor.openingTimestamp, cursor.nativeSpawnedAt);
+    const oldClock = clock.copied;
+    if (clock.clearsForeign) cursor.foreignSessionMeta = false;
     cursor.currentTurnId = id;
     cursor.currentOccurrence++;
     cursor.currentTurnClassified = false;
