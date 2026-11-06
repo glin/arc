@@ -1,5 +1,6 @@
 import { composerView, pickMenu, sessionLauncherView } from '../src/composerview.ts';
 import { labelCounts } from '../src/turnlabels.ts';
+import { modelLabels } from '../src/turnformat.ts';
 import { formatRelative, railSessions, toCard } from '../src/turnview.ts';
 import {
   dispatchedAgentCard,
@@ -1667,8 +1668,12 @@ export function demoSessionCostParts(root: string): SessionCostUsage[] {
   return parts;
 }
 
+// Display names from the demo model catalog, built the way the panel host builds them.
+export const DEMO_MODEL_LABELS = modelLabels([DEMO_MODELS.claude, DEMO_MODELS.codex]);
+
 export function demoSessionOverheads(id: string) {
   return {
+    labels: DEMO_MODEL_LABELS,
     compactionCount: DEMO_COMPACTIONS[id]?.length ?? 0,
     expiry:
       id === 'arc-read-state'
@@ -1861,7 +1866,7 @@ export function demoPayload(sessionId: string): Record<string, unknown> {
   }
   const item = DEMO_TURNS[selected][0];
   const commentScene = readmePayload('comment') as { comments: TurnComment[]; usage: { composer: { draft: string } } };
-  const commentCard = toCard(item, true, CAPTURE_TIME);
+  const commentCard = toCard(item, true, CAPTURE_TIME, [], null, false, new Set(), [], null, DEMO_MODEL_LABELS);
   const comments =
     selected === 'delegated-cost'
       ? commentScene.comments.map((comment) => ({
@@ -1959,6 +1964,7 @@ export function demoPayload(sessionId: string): Record<string, unknown> {
                   ? demoCodexExpiry
                   : null,
           ),
+          DEMO_MODEL_LABELS,
         );
         if (selected === 'arc-demo-dispatch' || (selected === 'arc-read-state' && item === demoReadStateTurn)) {
           const review = DEMO_TURNS[selected === 'arc-read-state' ? 'arc-demo-sketch' : 'arc-demo-review'][0];
@@ -2133,16 +2139,21 @@ export function readmePayload(scene: (typeof README_SCENES)[number] = 'main'): R
     CAPTURE_TIME,
     scene === 'review' ? new Map([['arc-read-state', 1]]) : new Map(),
   );
+  const catalogModel = (agent: 'claude' | 'codex', value: string) => {
+    const entry = DEMO_MODELS[agent].find((model) => model.value === value);
+    if (!entry) throw new Error(`Demo model catalog has no ${value}.`);
+    return entry;
+  };
   const claudeModel = {
     value: 'opus',
     resolvedModel: selected.model ?? undefined,
-    label: selected === nextTurn ? 'Fable 5.1' : 'Opus 5.5',
+    label: catalogModel('claude', selected === nextTurn ? 'fable' : 'opus').label,
     description: '',
     efforts: [{ value: 'high', label: 'High', description: '' }],
   };
   const codexModel = {
     value: selected === cacheTurn ? 'gpt-6.1-sol' : 'gpt-6-astra',
-    label: selected === cacheTurn ? 'GPT-6.1 Sol' : 'GPT-6 Astra',
+    label: catalogModel('codex', selected === cacheTurn ? 'gpt-6.1-sol' : 'gpt-6-astra').label,
     description: '',
     efforts: [{ value: 'high', label: 'High', description: '' }],
   };
@@ -2157,6 +2168,7 @@ export function readmePayload(scene: (typeof README_SCENES)[number] = 'main'): R
     scene === 'review' ? new Set(['sol-implementation']) : new Set(),
     [],
     turnCacheExpiryWarning(selected, scene === 'cache-expiry' || scene === 'cost' ? expiryFacts : null),
+    DEMO_MODEL_LABELS,
   );
   const comments: TurnComment[] =
     scene === 'comment' || scene === 'comment-editor'
@@ -2210,9 +2222,10 @@ export function readmePayload(scene: (typeof README_SCENES)[number] = 'main'): R
     cards: [
       { ...card, summaryHtml: renderRichMarkdown(selected.summary) },
       ...(scene === 'cache-expiry'
-        ? expiryHistory
-            .slice(1)
-            .map((item) => ({ ...toCard(item, true, CAPTURE_TIME), summaryHtml: renderRichMarkdown(item.summary) }))
+        ? expiryHistory.slice(1).map((item) => ({
+            ...toCard(item, true, CAPTURE_TIME, [], null, false, new Set(), [], null, DEMO_MODEL_LABELS),
+            summaryHtml: renderRichMarkdown(item.summary),
+          }))
         : []),
     ],
     sessions: rows.map((row) => ({ ...row, shown: row.id === selected.sessionId })),

@@ -22,6 +22,7 @@ import {
   demoReaderParents,
   DEMO_COMPACTIONS,
   demoSessionCostParts,
+  DEMO_MODEL_LABELS,
 } from './readme-fixture.ts';
 
 // Only invented fixture identities enter the downloadable graph.
@@ -165,7 +166,7 @@ export async function writeDemoExports(destination: string): Promise<Record<stri
           },
         });
       }
-      await projectSessionSite(model, writer, assets);
+      await projectSessionSite(model, writer, assets, DEMO_MODEL_LABELS);
       const html = (await fs.readFile(path.join(writer.staging, 'index.html'), 'utf8')).replace(
         /<link rel="stylesheet" href="\.\/a-[a-z0-9]+\.css">/,
         `<style>${assets.stylesheet}</style>`,
