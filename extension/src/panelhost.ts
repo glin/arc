@@ -13060,7 +13060,10 @@ export class PanelProvider implements vscode.Disposable {
       )
       .catch(() => 'failed' as const);
     // A cancelled request answers null.
-    if (!result) return false;
+    if (!result) {
+      if (signal.aborted) this.performanceCounters?.recordDiscoveryAbort?.();
+      return false;
+    }
     // A spend-only request always answers with a spend reply.
     const reply =
       result === 'failed'

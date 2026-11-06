@@ -230,8 +230,8 @@ function withSavedFacts([file, entry]: [string, ClaudeChildReferenceCacheEntry])
 }
 const DISPATCH_METADATA_BYTES = 256 * 1024;
 export const CODEX_DISPATCH_REQUEST_BYTES = 8 * 1024 * 1024;
-// The receipt scan's allowance in each discovery request. Each step is one filesystem operation and yields to the worker's
-// other messages, so window reads run between steps.
+// The receipt scan's allowance in each discovery request. Each step advances the scan by at most one store entry and one file
+// check, and yields to the worker's other messages, so window reads run between steps.
 const RECEIPT_SLICE_MS = 250;
 const RECEIPT_STEPS = 4096;
 let discoveryEpoch: DiscoveryCheckpoint | null = null;
@@ -261,6 +261,17 @@ const RECEIPT_SCAN_OPEN_CHARGES = {
   refusal: 'receiptScanOpensAfterRefusal',
   completion: 'receiptScanOpensAfterCompletion',
 } as const;
+// Receipt scans that no reply counted yet. The worker counts them in its next reply to an uncancelled discovery request, so a
+// scan that opened in a cancelled request still counts.
+const unrecordedReceiptOpens: Array<
+  (typeof RECEIPT_SCAN_OPEN_CHARGES)[keyof typeof RECEIPT_SCAN_OPEN_CHARGES] | 'receiptScanOpensNewWorker'
+> = [];
+function recordReceiptOpens(charges: DiscoveryCharges): void {
+  for (const cause of unrecordedReceiptOpens.splice(0)) {
+    charges.receiptScanOpens!++;
+    charges[cause]!++;
+  }
+}
 function closeReceiptScan(cause: 'epoch' | 'store' | 'refusal'): void {
   if (receiptScan) receiptScanClosed = cause;
   receiptScan?.controller.abort();
@@ -794,8 +805,9 @@ async function execute(
       charges[sameRevision(entry, revision) ? 'transcriptRescansMetadata' : 'transcriptRescansChanged']!++;
     };
     let continuation = false;
-    // The membership branches that asked for another pass in this request. A complete reply counts each one.
-    const unsettled = { unfinished: false, unread: false, changed: false, parents: false };
+    // The membership branches that asked for another pass in this request. A complete reply counts each one. The worker skips
+    // the unread check once another branch asked, so the count adds no file check.
+    const unsettled = { unfinished: false, deferred: false, unread: false, changed: false, parents: false };
     let incomplete = false;
     let admitting = seeding;
     const candidates = new Map<string, import('./transcript').SessionFile>();
@@ -898,6 +910,7 @@ async function execute(
       for (const [file, entry] of entries) claudeChildReferences.set(file, entry);
       for (const [file, entry] of entries) if (!entry.complete && !entry.visitedEof) completed.delete(file);
       epoch.completed = [...completed];
+      if (!signal.aborted) recordReceiptOpens(charges);
       return {
         kind: 'claude-children-progress' as const,
         referenceEntries: entries.map(withSavedFacts),
@@ -1010,6 +1023,7 @@ async function execute(
         if (parent.agent === 'codex' && !signal.aborted) {
           epoch.position = rows.findIndex(([file]) => file === key);
           continuation = true;
+          unsettled.deferred = true;
           break;
         }
         if (!signal.aborted) charges.transcriptPassEnds++;
@@ -1183,7 +1197,7 @@ async function execute(
       if (completed.has(file)) continue;
       const entry = claudeChildReferences.get(file);
       if (!entry) {
-        if (!unsettled.unread && !checkMissing(file)) {
+        if (!continuation && !checkMissing(file)) {
           continuation = true;
           unsettled.unread = true;
         }
@@ -1195,7 +1209,18 @@ async function execute(
         completionChanges.set(file, false);
         claudeChildReferences.set(file, { ...entry, complete: false, relationshipComplete: false });
         continuation = true;
-        unsettled.changed = true;
+        // A source that kept its identity and revision and stays unfinished waits for the allowance of a later request.
+        const parent = candidates.get(file)!;
+        if (
+          current &&
+          entry.parserVersion === CLAUDE_CHILD_REFERENCE_PARSER_VERSION &&
+          entry.source === parent.agent &&
+          entry.sessionId === parent.sessionId &&
+          entry.childTranscript === (parent.childTranscript === true) &&
+          sameRevision(entry, current)
+        )
+          unsettled.deferred = true;
+        else unsettled.changed = true;
         if (candidates.get(file)!.agent === 'claude') {
           charges.otherPassEnds++;
           return pending();
@@ -1208,18 +1233,25 @@ async function execute(
     for (const [file, entry] of boundedEntries) if (!entry.complete && !entry.visitedEof) completed.delete(file);
     claudeChildReferences.clear();
     for (const [file, entry] of boundedEntries) claudeChildReferences.set(file, entry);
-    const parentKeys = (parents: typeof epoch.parents) =>
-      JSON.stringify(
-        parents.map(({ file, sessionId, agent, childTranscript }) => ({ file, sessionId, agent, childTranscript })),
-      );
-    unsettled.parents = parentKeys(epoch.parents) !== parentKeys(request.parents);
+    unsettled.parents =
+      epoch.parents.length !== request.parents.length ||
+      epoch.parents.some((parent, index) => {
+        const other = request.parents[index];
+        return (
+          parent.file !== other.file ||
+          parent.sessionId !== other.sessionId ||
+          parent.agent !== other.agent ||
+          parent.childTranscript !== other.childTranscript
+        );
+      });
     continuation ||= unsettled.parents;
     // A replaced store directory starts the scan again from its first entry, here and before publication. Other store changes
     // keep the scan's position.
     if (receiptScan && receiptStoreIdentity(receiptScan.store) !== receiptScan.storeIdentity) closeReceiptScan('store');
     if (!receiptScan) {
-      charges.receiptScanOpens!++;
-      charges[receiptScanClosed ? RECEIPT_SCAN_OPEN_CHARGES[receiptScanClosed] : 'receiptScanOpensNewWorker']!++;
+      unrecordedReceiptOpens.push(
+        receiptScanClosed ? RECEIPT_SCAN_OPEN_CHARGES[receiptScanClosed] : 'receiptScanOpensNewWorker',
+      );
       const controller = new AbortController();
       const store = new DispatchReceipts();
       const scan: ReceiptScan = {
@@ -1319,7 +1351,9 @@ async function execute(
     );
     const spend = collectDispatchFacts(request, references, admittedReferences, charges);
     heldDispatchReferences = { scope: JSON.stringify(epoch.repositoryRoots), references, admittedReferences };
+    recordReceiptOpens(charges);
     if (unsettled.unfinished) charges.unsettledUnfinishedSources!++;
+    if (unsettled.deferred) charges.unsettledDeferredSources!++;
     if (unsettled.unread) charges.unsettledUnreadSources!++;
     if (unsettled.changed) charges.unsettledChangedSources!++;
     if (unsettled.parents) charges.unsettledParentChanges!++;
@@ -1731,6 +1765,7 @@ function emptyDiscoveryCharges(): DiscoveryCharges {
     receiptScanOpensAfterRefusal: 0,
     receiptScanOpensAfterCompletion: 0,
     unsettledUnfinishedSources: 0,
+    unsettledDeferredSources: 0,
     unsettledUnreadSources: 0,
     unsettledChangedSources: 0,
     unsettledParentChanges: 0,

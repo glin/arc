@@ -208,7 +208,10 @@ test('receipt scan replies follow the step allowance, restart after a parent cha
       step +
         "charges.receiptStepCount = (charges.receiptStepCount ?? 0) + 1; receiptStepPort.postMessage({ repeatedCoverage: 'receipt-step' });",
     );
-  const scan = async (uncapped: boolean, options: { addParent?: boolean; cancelEverySecond?: boolean } = {}) => {
+  const scan = async (
+    uncapped: boolean,
+    options: { addParent?: boolean; cancelEverySecond?: boolean; cancelFirst?: boolean } = {},
+  ) => {
     let cancel: AbortController | undefined;
     const worker = new ProgressiveWorker(workerSource(uncapped), undefined, (message) => {
       if (message === 'receipt-step') cancel?.abort();
@@ -216,11 +219,14 @@ test('receipt scan replies follow the step allowance, restart after a parent cha
     const { host, replies } = await receiptDiscoveryHost(worker, [root], fx.catalog);
     const counters = new PanelPerformanceCounters(0, 'receipt-allowance');
     host.performanceCounters = counters;
-    const counts = { answered: 0, entries: 0, steps: 0, unsettled: 0, cancelled: 0 };
+    const counts = { answered: 0, entries: 0, steps: 0, unsettled: 0, cancelled: 0, firstOpens: undefined as unknown };
     try {
       for (let request = 1; request <= 200; request++) {
         host.refreshGeneration = request;
-        cancel = options.cancelEverySecond && request % 2 === 0 ? new AbortController() : undefined;
+        cancel =
+          (options.cancelEverySecond && request % 2 === 0) || (options.cancelFirst && request === 1)
+            ? new AbortController()
+            : undefined;
         if (cancel) counts.cancelled++;
         replies.last = null;
         await host.prepareClaudeChildren(request, (cancel ?? new AbortController()).signal);
@@ -233,6 +239,7 @@ test('receipt scan replies follow the step allowance, restart after a parent cha
         assert.ok(!cancel, 'a cancelled request posted a reply');
         assert.ok(reply.kind === 'claude-children' || reply.kind === 'claude-children-progress', reply.kind);
         counts.answered++;
+        counts.firstOpens ??= reply.charges?.receiptScanOpens;
         counts.entries += reply.charges?.receiptEntries ?? 0;
         counts.steps += (reply.charges as { receiptStepCount?: number } | undefined)?.receiptStepCount ?? 0;
         if (reply.kind !== 'claude-children') continue;
@@ -255,7 +262,10 @@ test('receipt scan replies follow the step allowance, restart after a parent cha
       afterCompletion: discovery.receiptScanOpensAfterCompletion,
       parentChanges: discovery.unsettledParentChanges,
       otherBranches:
-        discovery.unsettledUnfinishedSources! + discovery.unsettledUnreadSources! + discovery.unsettledChangedSources!,
+        discovery.unsettledUnfinishedSources! +
+        discovery.unsettledDeferredSources! +
+        discovery.unsettledUnreadSources! +
+        discovery.unsettledChangedSources!,
       aborts: discovery.discoveryAborts,
       // The dispatched windows and the root visits to the first settled reply.
       spendPasses: discovery.dispatchSpendPasses,
@@ -308,6 +318,21 @@ test('receipt scan replies follow the step allowance, restart after a parent cha
     parentChanges: 0,
     otherBranches: 0,
     aborts: cancelled.cancelled,
+    spendPasses: 1,
+    spendVisits: 2,
+  });
+  // The request that opened the scan is cancelled at its first receipt step. The scan survives, and the next answered reply
+  // counts its open.
+  const openCancelled = await scan(false, { cancelFirst: true });
+  assert.equal(openCancelled.cancelled, 1);
+  assert.equal(openCancelled.firstOpens, 1, 'the first answered reply did not count the open');
+  assert.deepEqual(openCancelled.charges, {
+    opens: 1,
+    newWorker: 1,
+    afterCompletion: 0,
+    parentChanges: 0,
+    otherBranches: 0,
+    aborts: 1,
     spendPasses: 1,
     spendVisits: 2,
   });
@@ -4015,6 +4040,93 @@ test('an unreached same-size Codex rewrite retains dispatch references until com
     assert.equal(reached.value.referenceEntries[0][1].sourceGeneration, old.sourceGeneration! + 1);
     assert.deepEqual(reached.value.references, []);
     assert.deepEqual(reached.value.dispatchFacts, []);
+  } finally {
+    worker.stop();
+  }
+});
+
+// A Codex parent that the request allowance leaves unread asks for another pass under the deferred branch. The unread check
+// adds no file check once another branch asked.
+test('a Codex parent past the quantum cap counts as deferred without an unread check', async () => {
+  const directory = tempDir('relationship-codex-quantum-cap-');
+  const line = (record: object) => JSON.stringify(record) + '\n';
+  const parents = Array.from({ length: 9 }, (_, index) => {
+    const file = path.join(directory, `parent-${index}.jsonl`);
+    fs.writeFileSync(file, line({ type: 'session_meta', payload: { id: `parent-${index}`, cwd: directory } }));
+    fs.utimesSync(file, 100, 100);
+    return {
+      file,
+      sessionId: `parent-${index}`,
+      agent: 'codex' as const,
+      ...revisionOf(fs.statSync(file, { bigint: true })),
+    };
+  });
+  const worker = new ProgressiveWorker('performance.now=()=>0;' + source);
+  try {
+    const reply = await worker.run(
+      { kind: 'claude-children', parents, repositoryRoots: [directory] },
+      1,
+      new AbortController().signal,
+    );
+    assert.ok(reply?.value.kind === 'claude-children');
+    const charges = reply.value.charges!;
+    // One stat of each parent before its allowance check, the same count as before the branch counters.
+    assert.equal(charges.parentChecks, 9);
+    assert.equal(reply.value.complete, true);
+    assert.equal(reply.value.membershipSettled, false);
+    assert.equal(charges.quanta, 8);
+    assert.deepEqual(
+      {
+        deferred: charges.unsettledDeferredSources,
+        unfinished: charges.unsettledUnfinishedSources,
+        unread: charges.unsettledUnreadSources,
+        changed: charges.unsettledChangedSources,
+        parents: charges.unsettledParentChanges,
+      },
+      { deferred: 1, unfinished: 0, unread: 0, changed: 0, parents: 0 },
+    );
+  } finally {
+    worker.stop();
+  }
+});
+
+// A Codex parent that a request leaves unfinished, and that keeps its revision, waits for a later allowance. It is not a
+// changed source.
+test('an unchanged unfinished Codex parent counts as deferred, not changed', async () => {
+  const directory = tempDir('relationship-codex-deferred-');
+  const file = path.join(directory, 'parent.jsonl');
+  const line = (record: object) => JSON.stringify(record) + '\n';
+  fs.writeFileSync(
+    file,
+    line({ type: 'session_meta', payload: { id: 'parent', cwd: directory } }) +
+      line({ type: 'ignored', text: 'x'.repeat(1024) }).repeat(192),
+  );
+  fs.utimesSync(file, 100, 100);
+  const request = (discoveryBytes: number) => ({
+    kind: 'claude-children' as const,
+    parents: [
+      { file, sessionId: 'parent', agent: 'codex' as const, ...revisionOf(fs.statSync(file, { bigint: true })) },
+    ],
+    repositoryRoots: [directory],
+    discoveryBytes,
+  });
+  const branches = (charges: import('./progressiveworker').DiscoveryCharges) => ({
+    deferred: charges.unsettledDeferredSources,
+    unfinished: charges.unsettledUnfinishedSources,
+    changed: charges.unsettledChangedSources,
+  });
+  const worker = new ProgressiveWorker('performance.now=()=>0;' + source);
+  try {
+    const partial = await worker.run(request(65536), 1, new AbortController().signal);
+    assert.ok(partial?.value.kind === 'claude-children');
+    assert.equal(partial.value.membershipSettled, false);
+    assert.deepEqual(branches(partial.value.charges!), { deferred: 0, unfinished: 1, changed: 0 });
+    const unreached = await worker.run(request(16 * 1024), 2, new AbortController().signal);
+    assert.ok(unreached?.value.kind === 'claude-children');
+    assert.equal(unreached.value.complete, true);
+    assert.equal(unreached.value.membershipSettled, false);
+    assert.equal(unreached.value.charges!.readBytes, 0);
+    assert.deepEqual(branches(unreached.value.charges!), { deferred: 1, unfinished: 0, changed: 0 });
   } finally {
     worker.stop();
   }

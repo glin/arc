@@ -288,8 +288,10 @@ export interface DiscoveryCharges extends Record<import('./codex').CodexDispatch
   receiptScanOpensAfterStore?: number;
   receiptScanOpensAfterRefusal?: number;
   receiptScanOpensAfterCompletion?: number;
-  // A complete reply that leaves membership unsettled counts each branch that asked for another pass.
+  // A complete reply that leaves membership unsettled counts each branch that asked for another pass. The worker skips the
+  // unread check once another branch asked.
   unsettledUnfinishedSources?: number;
+  unsettledDeferredSources?: number;
   unsettledUnreadSources?: number;
   unsettledChangedSources?: number;
   unsettledParentChanges?: number;

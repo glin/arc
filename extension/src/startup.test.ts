@@ -15344,6 +15344,22 @@ test('a dispatched file that moves after members settle reads its spend without 
   }
 });
 
+test('a cancelled spend-only request counts as a discovery abort', async () => {
+  const { provider, counters } = partialSpendHarness(true);
+  const controller = new AbortController();
+  let sent: ProgressiveRequest | undefined;
+  // A cancelled request answers null once its signal aborts.
+  provider.progressiveWorker.run = (request: ProgressiveRequest, _generation: number, signal: AbortSignal) => {
+    sent = request;
+    return new Promise((resolve) => signal.addEventListener('abort', () => resolve(null), { once: true }));
+  };
+  const refined = provider.refineDispatchedSpend(provider.refreshGeneration, controller.signal);
+  assert.ok(sent?.kind === 'claude-children' && sent.spendOnly);
+  controller.abort();
+  assert.equal(await refined, false);
+  assert.equal(counters.snapshot().discovery.discoveryAborts, 1);
+});
+
 for (const failure of ['held-false', 'reject'] as const)
   test(`a spend-only request that ${failure === 'reject' ? 'fails' : 'finds no held reply'} sends discovery back to a full pass`, async () => {
     vi.useFakeTimers();
