@@ -320,31 +320,31 @@ const changesTurn: Turn = turn({
           model: 'claude-sonnet-5-5',
           usage: {
             requests: 8,
-            input: 42_000,
+            input: 12_000,
             cacheWrite1h: 0,
-            cacheWrite5m: 160_000,
-            cacheRead: 1_280_000,
-            output: 46_000,
+            cacheWrite5m: 60_000,
+            cacheRead: 328_000,
+            output: 20_000,
             thinking: 0,
           },
         },
       ],
       durationMs: 94_000,
-      tokens: 1_528_000,
+      tokens: 420_000,
       toolUses: 9,
       artifacts: { files: [], commits: [], complete: true, revision: 'changes-check' },
     }),
   ],
   usage: {
-    requests: 12,
-    input: 54_000,
-    cacheWrite1h: 0,
-    cacheWrite5m: 240_000,
-    cacheRead: 1_720_000,
-    output: 62_000,
+    requests: 3,
+    input: 4_000,
+    cacheWrite1h: 165_500,
+    cacheWrite5m: 0,
+    cacheRead: 328_000,
+    output: 6_000,
     thinking: 0,
   },
-  contextTokens: 52_000,
+  contextTokens: 168_000,
   contextWindow: 1_000_000,
   toolUses: 22,
   toolCounts: { edits: 3, reads: 8, searches: 3, commands: 6, agents: 1, coordination: 1, web: 0, other: 0 },
@@ -401,12 +401,18 @@ const expiryUsage = {
   output: 2_300,
   thinking: 0,
 };
+// The main agent makes three requests. The first starts the subagent and rewrites the expired cache, which is the request the expiry evidence holds. The second reads the subagent result and the third writes the answer, so both read the rewritten cache.
+const expiryTurnUsage = changesTurn.usage;
 const expiryTurn: Turn = {
   ...changesTurn,
-  usage: expiryUsage,
-  contextTokens: 162_000,
-  outputRate: { output: 2_300, milliseconds: 23_000 },
+  usage: expiryTurnUsage,
+  contextTokens: 168_000,
+  outputRate: { output: 6_000, milliseconds: 60_000 },
 };
+// The cache expiry evidence reads the request that crossed the lifetime, which is the first request of a turn.
+function firstRequestUsage(item: Turn): Turn['usage'] {
+  return item.promptId === expiryTurn.promptId ? expiryUsage : item.usage;
+}
 const expiryHistory: Turn[] = [
   expiryTurn,
   { ...beforeExpiry, usage: expiryUsage, contextTokens: 162_000 },
@@ -436,7 +442,7 @@ const expiryHistory: Turn[] = [
     inferenceClass: null,
     serviceTier: null,
     readBack: false,
-    outputTokens: item.usage.output,
+    outputTokens: firstRequestUsage(item).output,
   },
 }));
 const expiryRequest: ProjectUsageBucket = {
@@ -475,16 +481,16 @@ for (let index = expiryHistory.length - 2; index >= 0; index--) {
     requestKey: `claude:${item.openingResponseId}`,
     visibleTurnId: item.promptId,
     timestamp: item.startedAt,
-    inputTokens: item.usage.input + item.usage.cacheWrite1h,
+    inputTokens: firstRequestUsage(item).input + firstRequestUsage(item).cacheWrite1h,
   });
-  const verdict = classifyCacheExpiry(carry(previous), carry(current), current.usage);
+  const verdict = classifyCacheExpiry(carry(previous), carry(current), firstRequestUsage(current));
   if (verdict.kind !== 'return') throw new Error('The README return request did not cross its cache lifetime.');
   expiryFacts.counts[verdict.lifetime]++;
   expiryFacts.longestGapMs = Math.max(expiryFacts.longestGapMs ?? 0, verdict.gapMs);
   expiryFacts.returns.push({
     lifetime: verdict.lifetime,
     gapMs: verdict.gapMs,
-    request: { ...expiryRequest, usage: current.usage },
+    request: { ...expiryRequest, usage: firstRequestUsage(current) },
     visibleTurnId: current.promptId,
     requestKey: carry(current).requestKey,
     previousInputSide: carry(previous).inputTokens,
@@ -1164,7 +1170,7 @@ export const DEMO_TURNS: Record<string, Turn[]> = {
       sessionId: 'delegated-cost',
       sessionTitle: 'Count delegated work once',
       promptId: 'delegated-cost-turn',
-      outputRate: expiryTurn.outputRate,
+      outputRate: { output: 2_300, milliseconds: 23_000 },
       outputRateBasis: 'request',
       startedAt: expiryTurn.startedAt,
       endedAt: CAPTURE_TIME - 4 * 60_000,
@@ -1172,7 +1178,7 @@ export const DEMO_TURNS: Record<string, Turn[]> = {
       summary: `The session cost separates main-agent usage from delegated usage.\n\n${changesTurn.summary}`,
       model: 'claude-opus-5-5',
       effort: 'high',
-      contextTokens: expiryTurn.contextTokens,
+      contextTokens: 162_000,
       contextWindow: 1_000_000,
       contextRequest: {
         at: CAPTURE_TIME - 4 * 60_000,
