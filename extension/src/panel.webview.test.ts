@@ -12280,9 +12280,10 @@ test("the host counts a dispatched session in its parent's cost once and files i
   );
   assert.equal(loose.projectSpendRevision, drawn.projectSpendRevision, 'an edge with no row moved the spend revision');
 
-  // A dispatched child is an agent run unless this window started it.
+  // A dispatched child with settled person evidence is an agent run unless this window started it.
   const rows = [session('parent'), session('child')];
   const edges = drawn.sessionParentEdges(rows).edges;
+  drawn.dispatchFacts.set('child', { person: false });
   assert.equal(drawn.agentRunFor(rows[1], edges), true, "a dispatched session was filed as the reader's own");
   assert.equal(drawn.agentRunFor(rows[0], edges), false, 'the session that dispatched a child was filed as a run');
   drawn.startedHere.add('child');
@@ -20361,7 +20362,12 @@ test('queued browser preferences and reset preserve initial-name operations whil
     release = resolve;
   });
   const blocker = f.provider.readOwner().operations.serialize(() => held);
-  const preferences = f.provider.saveState({ initialNames: { forged: record('forged', false) } });
+  const preferences = f.provider.saveState({
+    initialNames: { forged: record('forged', false) },
+    promptedPending: ['forged'],
+  });
+  f.provider.saved.promptedPending = Array.from({ length: 503 }, (_, index) => `pending-${index}`);
+  const provisional = [...f.provider.saved.promptedPending];
   f.provider.saved.initialNames = { unsent: record('unsent', false), submitted: record('submitted', true) };
   const retained = structuredClone(f.provider.saved.initialNames);
   try {
@@ -20369,10 +20375,14 @@ test('queued browser preferences and reset preserve initial-name operations whil
     await blocker;
     await preferences;
     assert.deepEqual(f.provider.saved.initialNames, retained);
+    assert.deepEqual(f.provider.saved.promptedPending, provisional);
+    assert.deepEqual(f.writes.at(-1).promptedPending, provisional);
     assert.deepEqual(f.writes.at(-1).initialNames, retained);
     assert.equal('initialNames' in webviewPanelState(f.provider.saved), false);
     await f.provider.forgetState();
     assert.deepEqual(f.provider.saved.initialNames, retained);
+    assert.deepEqual(f.provider.saved.promptedPending, provisional);
+    assert.deepEqual(f.writes.at(-1).promptedPending, provisional);
     assert.deepEqual(f.writes.at(-1).initialNames, retained);
     const listener = vi.spyOn(PanelProvider.prototype as any, 'wireEditorListeners').mockImplementation(() => {});
     let fresh: any;
@@ -20858,6 +20868,7 @@ test.each([false, true])('/clear publishes the copied setup and preserves delega
   const saved = normalizePanelState(null);
   if (agentRun) saved.agentRuns = ['old'];
   if (agentRun) saved.prompted = ['old'];
+  saved.promptedPending = ['old'];
   saved.labels = setSessionLabels(saved.labels, 'old', ['keep']);
   const queuedAsset: StoredPromptAsset = {
     id: '11111111-1111-4111-8111-111111111111',
@@ -20921,6 +20932,7 @@ test.each([false, true])('/clear publishes the copied setup and preserves delega
     agentRun,
     'the successor of a prompted agent run went back to Run by agents',
   );
+  assert.deepEqual(host.saved.promptedPending, ['old', 'new']);
   assert.equal(host.startedHere.has('new'), !agentRun);
   assert.equal(
     host.hostSessions.get(mappedHost),
@@ -30036,6 +30048,7 @@ test('resetting workspace state invalidates every panel selection and preserves 
     }
     provider.saved.readerParents = { child: 'parent' };
     provider.saved.prompted = ['taken'];
+    provider.saved.promptedPending = ['unsettled'];
     for (let index = 0; index < 256; index++)
       await provider
         .readOwner()
@@ -30045,6 +30058,7 @@ test('resetting workspace state invalidates every panel selection and preserves 
     assert.deepEqual(provider.saved.readerParents, { child: 'parent' });
     assert.deepEqual(provider.saved.agentRuns, ['tagged']);
     assert.deepEqual(provider.saved.prompted, ['taken'], 'Forget State returned a prompted session to Run by agents');
+    assert.deepEqual(provider.saved.promptedPending, ['unsettled']);
     assert.deepEqual(provider.saved.started, ['untagged']);
     const restored: any = Object.assign(Object.create(PanelProvider.prototype), {
       saved: normalizePanelState(stored),
@@ -30052,6 +30066,7 @@ test('resetting workspace state invalidates every panel selection and preserves 
       metaFor: () => ({ agentRun: false }),
     });
     assert.deepEqual(restored.saved.prompted, ['taken'], 'a reload returned a prompted session to Run by agents');
+    assert.deepEqual(restored.saved.promptedPending, ['unsettled']);
     for (const reader of [provider, restored]) {
       assert.equal(
         reader.agentRunFor({ sessionId: 'tagged' }, new Map()),
@@ -44412,5 +44427,152 @@ test('native link opening consumes only the invoking panel token and exact typed
     sourceMatch(panelHostSource, /if \(this\.linkMenuArm\?\.host === host\) this\.linkMenuArm = null/);
   } finally {
     vi.useRealTimers();
+  }
+});
+
+test.each([false, true, null] as const)(
+  'pending discovery preserves transcript classification %s without a dispatch edge',
+  async (guess) => {
+    const { railShownCards } = await import('./view/rail.ts');
+    const now = Date.UTC(2026, 10, 3, 12);
+    const session = { agent: 'codex' as const, file: 'reader.jsonl', sessionId: 'reader', size: 1, mtimeMs: 1 };
+    const provider: any = Object.assign(Object.create(PanelProvider.prototype), {
+      saved: {},
+      startedHere: new Set(),
+      dispatchFacts: new Map(),
+      dispatchDiscoveryPending: true,
+      metaFor: () => ({ ...session, agentRun: guess }),
+    });
+    const classified = provider.agentRunFor(session, new Map());
+    assert.equal(classified, guess);
+    const cards = railSessions(
+      [
+        {
+          id: 'reader',
+          label: 'Reader work',
+          agent: 'Codex',
+          when: '',
+          at: now - 1,
+          relative: '',
+          agentRun: classified,
+        },
+      ],
+      new Map(),
+      new Map(),
+      new Map(),
+      new Set(),
+      null,
+      new Set(),
+      new Map(),
+      {},
+      {},
+      {},
+      {},
+      new Map(),
+      now,
+    );
+    assert.deepEqual(
+      railShownCards(cards, { query: 'is:active -is:archived -is:agentrun' }, now).map((card) => card.id),
+      guess === false ? ['reader'] : [],
+    );
+    if (guess === false) {
+      assert.equal(cards[0].agentWord, cards[0].agent);
+      assert.ok(railBuckets(cards, now).buckets.every((bucket) => bucket.id !== 'agent'));
+    }
+    assert.equal(
+      provider.agentRunFor(session, new Map([['reader', { parent: 'parent', relation: 'dispatched' }]])),
+      null,
+    );
+  },
+);
+
+test('a prompt during pending discovery retains ownership without evicting provisional or confirmed takeovers', async () => {
+  const { provider, session, submit, answered } = promptedRunProvider(false, 'codex');
+  const pending = Array.from({ length: 503 }, (_, index) => `pending-${index}`);
+  Object.assign(provider, {
+    startedHere: new Set(),
+    dispatchDiscoveryPending: true,
+    sessionParentEdgeSet: { edges: new Map() },
+    metaFor: () => ({ size: 1, mtimeMs: 1, agentRun: false }),
+    dispatchFacts: new Map(),
+  });
+  provider.saved.promptedPending = pending;
+  provider.saved.prompted = ['confirmed'];
+  await submit('Continue this work', 'pending-reader-prompt');
+  await vi.waitFor(() => assert.deepEqual(answered, [session]));
+  assert.deepEqual(provider.saved.promptedPending, [...pending, session]);
+  assert.deepEqual(provider.saved.prompted, ['confirmed']);
+  const source = { sessionId: session, childTranscript: false };
+  const edge = new Map([[session, { parent: 'parent', relation: 'dispatched' }]]);
+  assert.equal(provider.agentRunFor(source, edge), false);
+  assert.equal(provider.agentRunFor({ ...source, childTranscript: true }, edge), true);
+  provider.noteSessionMoved(session, 'provisional-successor', 'codex', null);
+  assert.deepEqual(provider.saved.promptedPending, [...pending, session, 'provisional-successor']);
+  assert.equal(provider.agentRunFor({ ...source, sessionId: 'provisional-successor' }, new Map()), false);
+});
+
+test('a prompt to a reader-owned dispatch during pending discovery records no takeover', async () => {
+  const { provider, session, submit, answered } = promptedRunProvider(false);
+  Object.assign(provider, {
+    startedHere: new Set(),
+    dispatchDiscoveryPending: true,
+    sessionParentEdgeSet: { edges: new Map([[session, { parent: 'parent', relation: 'dispatched', owned: true }]]) },
+  });
+  await submit('Continue', 'reader-owned-prompt');
+  await vi.waitFor(() => assert.deepEqual(answered, [session]));
+  assert.equal(provider.saved.prompted, undefined);
+  assert.equal(provider.saved.promptedPending, undefined);
+});
+
+test('retained prompt ownership classifies and exports accumulated sessions with one membership read', async () => {
+  const sessionexport = await import('./sessionexport.js');
+  const pending = Array.from({ length: 10_000 }, (_, i) => `pending-${i}`);
+  let reads = 0;
+  const tracked = new Proxy(pending, {
+    get(target, key, receiver) {
+      if (typeof key === 'string' && /^\d+$/.test(key)) reads++;
+      return Reflect.get(target, key, receiver);
+    },
+  });
+  const sessions = Array.from({ length: 1_000 }, (_, i) => ({
+    agent: 'codex' as const,
+    file: `row-${i}.jsonl`,
+    sessionId: `row-${i}`,
+    size: 1,
+    mtimeMs: 1,
+  }));
+  sessions.push({ ...sessions[0], sessionId: pending[0] });
+  const provider: any = Object.assign(Object.create(PanelProvider.prototype), {
+    saved: { promptedPending: tracked },
+    catalog: { sessions },
+    hidden: new Set(),
+    startedHere: new Set(),
+    dispatchFacts: new Map(),
+    dispatchDiscoveryPending: false,
+    metaFor: () => ({ size: 1, mtimeMs: 1, agentRun: true }),
+    panelSession: (id: string) => id,
+    sessionLabel: () => ({ fullLabel: 'Saved work' }),
+    sessionParentEdges: () => ({ edges: new Map() }),
+    diagnostics: { enabled: () => false },
+  });
+  for (const session of sessions) {
+    assert.equal(provider.agentRunFor(session, new Map()), session.sessionId !== pending[0]);
+  }
+  const capture = vi.spyOn(sessionexport, 'exportSavedSession').mockResolvedValue(undefined);
+  try {
+    await provider.exportSession(sessions[0].sessionId);
+    assert.deepEqual(capture.mock.calls[0][2].readerState?.prompted, [{ agent: 'codex', sessionId: pending[0] }]);
+    assert.ok(reads <= pending.length, `${reads} pending IDs were read for one unchanged membership`);
+    provider.saved = normalizePanelState({ promptedPending: [sessions[0].sessionId] });
+    assert.equal(provider.agentRunFor(sessions[0], new Map()), false);
+    assert.equal(provider.agentRunFor(sessions.at(-1), new Map()), true);
+    await provider.exportSession(sessions[0].sessionId);
+    assert.deepEqual(capture.mock.calls.at(-1)![2].readerState?.prompted, [
+      { agent: 'codex', sessionId: sessions[0].sessionId },
+    ]);
+    provider.saved = normalizePanelState(null);
+    assert.equal(provider.agentRunFor(sessions[0], new Map()), true);
+  } finally {
+    capture.mockRestore();
   }
 });

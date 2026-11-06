@@ -2192,3 +2192,13 @@ test('saved agent messages retain complete text and always recover without live 
   });
   assert.equal(malformed.target[0].delivery.phase, 'recovery');
 });
+
+test('provisional prompt ownership keeps every unresolved identity after normalization', () => {
+  const pending = Array.from({ length: 503 }, (_, index) => `pending-${index}`);
+  const confirmed = Array.from({ length: SESSION_LIMIT }, (_, index) => `confirmed-${index}`);
+  const state = normalizePanelState({ prompted: confirmed, promptedPending: [7, ...pending, pending[0], null] });
+  assert.deepEqual(state.promptedPending, pending);
+  assert.deepEqual(state.prompted, confirmed);
+  assert.deepEqual(normalizePanelState(state).promptedPending, pending);
+  assert.equal(normalizePanelState({ promptedPending: 'invalid' }).promptedPending, undefined);
+});

@@ -1112,7 +1112,7 @@ export function syntheticDraftRows(drafts: readonly RailDraftRow[]): (RailDraftR
 // A child transcript is always an agent run.
 // Reader-started sessions and reader-owned dispatches are not agent runs.
 // Other dispatches count as agent runs. A dispatch whose reader ownership is unknown has unknown classification.
-// Remaining sessions retain the transcript classification.
+// Sessions without a discovered dispatch edge retain their transcript classification while discovery continues.
 export function agentRunAnswer(
   guessed: boolean,
   sessionId: string,
@@ -1144,8 +1144,7 @@ export function agentRunAnswer(
     return false;
   }
   if (dispatched && readerOwned === null) return null;
-  if (dispatched === null)
-    return guessed === false && readerOwned ? false : guessed === true && !readerOwned ? true : null;
+  if (dispatched === null) return readerOwned === true ? false : guessed;
   return dispatched || guessed;
 }
 
