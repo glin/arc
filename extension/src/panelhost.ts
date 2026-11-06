@@ -9663,7 +9663,7 @@ export class PanelProvider implements vscode.Disposable {
           metadataAfterRender,
           changedPaths: this.targetedRefreshPaths,
         },
-        !!this.catalogWalkRunning || !!this.codexPriming,
+        this.catalogWalkRunning ?? this.codexPriming,
       );
       this.performanceCounters.recordRefreshStage('coalesced');
       // A merge of different requesters runs as `coalesced`, so each waiting request also counts under its own name.
@@ -9727,7 +9727,7 @@ export class PanelProvider implements vscode.Disposable {
             this.codexColdPass = null;
             this.codexPriming = null;
             // A pass that lists no catalog hands back the broad walk it folded, so the waiting request walks.
-            this.pendingRefresh = settleWalkFold(this.pendingRefresh, listed);
+            this.pendingRefresh = settleWalkFold(this.pendingRefresh, priming, listed);
           }
         }
         if (!this.anyVisible()) {
@@ -12368,10 +12368,10 @@ export class PanelProvider implements vscode.Disposable {
   private async walkCatalog(signal: AbortSignal, generation: number): Promise<SessionFile[] | null> {
     const root = codexSessionsRoot();
     // The walk serves every waiting request that walks and names no file, so none of them walks again after it.
-    if (this.pendingRefresh) this.pendingRefresh = mergeRefreshRequests(null, this.pendingRefresh, true);
+    const running = { signal, overdue: false };
+    if (this.pendingRefresh) this.pendingRefresh = mergeRefreshRequests(null, this.pendingRefresh, running);
     // The backstop clock starts when the walk starts, also after an earlier walk that never completed.
     this.catalogWalkPendingAt = Date.now();
-    const running = { signal, overdue: false };
     this.catalogWalkRunning = running;
     const walk = new AbortController();
     let deadline: ReturnType<typeof setTimeout> | undefined;
@@ -12405,7 +12405,7 @@ export class PanelProvider implements vscode.Disposable {
       this.anyVisible() &&
       codexSessionsRoot() === root;
     // A walk that ends without a catalog hands back the broad walk it folded, so the waiting request walks.
-    this.pendingRefresh = settleWalkFold(this.pendingRefresh, listed);
+    this.pendingRefresh = settleWalkFold(this.pendingRefresh, running, listed);
     if (!listed) return null;
     // Scope resolves again after the walk. A scope that became unresolved lists nothing and discards the walk.
     return this.allSessions(false, true, walked);

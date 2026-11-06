@@ -8559,6 +8559,43 @@ test('a walk past its own deadline leaves the broad request behind it to walk, a
   }
 });
 
+test('a cancelled walk keeps the fold of the walk that replaced it, so the broad request behind the new walk reuses its catalog', async () => {
+  vi.useFakeTimers(STREAM_TIMERS);
+  try {
+    const { provider, walks, files, writeRollout } = heldWalkHarness();
+    const first = writeRollout('first');
+    const accepted = provider.refresh(true);
+    await untilWalkSettles(() => walks.length === 1, 'the first refresh did not start its walk');
+    walks[0].release();
+    await accepted;
+    await untilWalkSettles(() => provider.refreshController === null, 'the first refresh did not finish');
+    const cancelled = provider.refresh(true);
+    await untilWalkSettles(() => walks.length === 2, 'the second refresh did not start its walk');
+    // A scope replacement aborts walk A and starts walk B before A resumes, and a broad request queues behind B.
+    provider.abandonCatalogRefresh(true);
+    const replacement = provider.refreshFrom('repository-scope', true);
+    assert.equal(walks.length, 3, 'the replacement refresh did not start its walk');
+    void provider.refresh(true);
+    await cancelled;
+    assert.equal(
+      provider.pendingRefresh?.reuseCatalog,
+      true,
+      'the cancelled walk handed back the fold of the walk that replaced it',
+    );
+    walks[2].release();
+    await replacement;
+    await untilWalkSettles(
+      () => provider.refreshController === null && provider.pendingRefresh === null,
+      'the request behind the replacement walk did not finish',
+    );
+    assert.equal(walks.length, 3, 'the request behind the replacement walk walked again');
+    assert.deepEqual(files(), [first]);
+    walks[1].release();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 test('polls and broad requests during the cold pass request no walk, and the request behind the pass reuses its catalog', async () => {
   vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
   try {
