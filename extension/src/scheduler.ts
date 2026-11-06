@@ -584,6 +584,9 @@ export function watcherRefreshDecision(
 // hold every later refresh. A catalog walk that runs when the deadline passes is not abandoned. The
 // refresh gets a full deadline again when that walk ends.
 export const CATALOG_REFRESH_DEADLINE_MS = 30_000;
+// While spend-only replies keep asking for another pass, a moved dispatched figure refreshes the catalog at most once in
+// this time.
+export const DISPATCH_FIGURES_REFRESH_MS = 2_000;
 
 // How long one catalog walk runs. A walk that runs longer stops, and its refresh ends without a new
 // catalog, so a walk that never ends cannot hold every later refresh.

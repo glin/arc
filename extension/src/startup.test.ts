@@ -269,6 +269,7 @@ import {
   IntegrityScheduler,
   CATALOG_REFRESH_DEADLINE_MS,
   CATALOG_WALK_DEADLINE_MS,
+  DISPATCH_FIGURES_REFRESH_MS,
   mergeRefreshRequests,
   settleWalkFold,
   PendingWatcherWake,
@@ -2628,6 +2629,7 @@ function harness(pendingRefresh = false, registerRefreshHandler = true, extraMet
     'orderSessionCatalog',
     'mergeRefreshRequests',
     'CATALOG_REFRESH_DEADLINE_MS',
+    'DISPATCH_FIGURES_REFRESH_MS',
     'SessionLoadingLine',
     compiled,
   )(
@@ -2637,6 +2639,7 @@ function harness(pendingRefresh = false, registerRefreshHandler = true, extraMet
     orderSessionCatalog,
     mergeRefreshRequests,
     CATALOG_REFRESH_DEADLINE_MS,
+    DISPATCH_FIGURES_REFRESH_MS,
     SessionLoadingLine,
   );
   const provider = guardedHarness(new module.exports.Harness());
@@ -2990,6 +2993,7 @@ function completeDiscoveryHarness(
     'mergeRefreshRequests',
     'settleWalkFold',
     'CATALOG_REFRESH_DEADLINE_MS',
+    'DISPATCH_FIGURES_REFRESH_MS',
     'CATALOG_WALK_DEADLINE_MS',
     'derivedTitleStats',
     'withMetadataCoverage',
@@ -3039,6 +3043,7 @@ function completeDiscoveryHarness(
     mergeRefreshRequests,
     settleWalkFold,
     CATALOG_REFRESH_DEADLINE_MS,
+    DISPATCH_FIGURES_REFRESH_MS,
     CATALOG_WALK_DEADLINE_MS,
     derivedTitleStats,
     withMetadataCoverage,
@@ -15429,8 +15434,13 @@ test('incomplete discovery replies continue without a catalog refresh, and the c
 });
 
 // A complete reply asks for another pass. `membersSettled` says whether only dispatched spend waits for it. `spendFailure`
-// makes the first spend-only request fail or find no held reply.
-function partialSpendHarness(membersSettled: boolean, spendFailure?: 'held-false' | 'reject') {
+// makes the first spend-only request fail or find no held reply. `spendReplies` is the spend-only reply that finishes the
+// root, and `moving` moves the root's drawn figure in every spend-only reply.
+function partialSpendHarness(
+  membersSettled: boolean,
+  spendFailure?: 'held-false' | 'reject',
+  { spendReplies = 3, moving = false } = {},
+) {
   const { provider, discovery } = exhaustedLoadingHarness();
   const counters = new PanelPerformanceCounters(1000);
   provider.performanceCounters = counters;
@@ -15473,14 +15483,16 @@ function partialSpendHarness(membersSettled: boolean, spendFailure?: 'held-false
       // The reference row that the derived cache saves for the root.
       if (!provider.claudeChildReferenceEntries.has('codex-root.jsonl'))
         provider.claudeChildReferenceEntries.set('codex-root.jsonl', { sessionId: 'codex-root' });
-      // The third spend-only pass finishes the root and returns its saved facts.
-      const continuation = ++spendPasses < 3;
+      // The last spend-only pass finishes the root and returns its saved facts.
+      const continuation = ++spendPasses < spendReplies;
       return {
         generation,
         value: {
           kind: 'dispatch-spend',
           held: true,
-          dispatchFacts: facts(continuation),
+          dispatchFacts: moving
+            ? facts(continuation).map((one) => ({ ...one, toolUses: spendPasses }))
+            : facts(continuation),
           continuation,
           savedDispatch: continuation ? [] : [['codex-root.jsonl', { facts: facts(false)[0] }]],
           charges: {},
@@ -15535,6 +15547,30 @@ test('a complete reply that waits only for dispatched spend publishes, and spend
       'the settled facts did not reach the saved reference row',
     );
     assert.ok(provider.sessionReadDiscoveryRevision, 'refining spend withdrew the published catalog');
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
+
+// Each moved spend-only reply used to refresh the whole catalog, and that refresh scheduled the next pass.
+test('moved spend-only replies within 2 s refresh the catalog once, and the reply that ends the tail refreshes it again', async () => {
+  vi.useFakeTimers();
+  try {
+    const { provider, counters, requests } = partialSpendHarness(true, undefined, { spendReplies: 4, moving: true });
+    provider.refreshFrom('startup', true);
+    const done = () => !provider.dispatchSpendPending && requests.length > 4 && provider.refreshController === null;
+    // Each step runs the timers due and the work they release. The step bound is the test's deadline, far below 2 s.
+    for (let step = 0; step < 500 && !done(); step++) await vi.advanceTimersByTimeAsync(1);
+    assert.ok(done(), `dispatched spend never settled after requests ${requests.join(', ')}`);
+    assert.deepEqual(requests, ['discovery', 'spend', 'spend', 'spend', 'spend']);
+    const { refreshes, work } = counters.snapshot();
+    assert.deepEqual(
+      { refreshes: refreshes['dispatch-discovery']?.count, held: work.dispatchFiguresHeld },
+      { refreshes: 2, held: 2 },
+      'each moved reply refreshed the catalog',
+    );
+    assert.equal(provider.dispatchFacts.get('codex-root')?.toolUses, 4, 'the last reply did not reach the row');
   } finally {
     vi.clearAllTimers();
     vi.useRealTimers();

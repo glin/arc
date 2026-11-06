@@ -647,6 +647,7 @@ import {
   IntegrityScheduler,
   CATALOG_REFRESH_DEADLINE_MS,
   CATALOG_WALK_DEADLINE_MS,
+  DISPATCH_FIGURES_REFRESH_MS,
   mergeRefreshRequests,
   settleWalkFold,
   listedFilesFor,
@@ -1569,6 +1570,10 @@ export class PanelProvider implements vscode.Disposable {
   // True while members are settled and only dispatched spend or person facts wait for another pass. The catalog publishes
   // meanwhile, and spend-only requests refine the dispatched facts.
   private dispatchSpendPending = false;
+  // True when a spend-only reply moved a dispatched figure that no catalog refresh has drawn yet, and the time of the last
+  // figure refresh during the current spend-only tail.
+  private dispatchFiguresHeld = false;
+  private dispatchFiguresRefreshedAt?: number;
   // The repository scope of a complete discovery reply whose catalog is not yet published, and the session files of the catalog it
   // answered. An incomplete reply or a scope change clears it. The next catalog publication under that scope turns it into the
   // completion stamp only when the reply answered every published session.
@@ -10501,9 +10506,18 @@ export class PanelProvider implements vscode.Disposable {
     let refresh = false;
     try {
       if (!this.dispatchDiscoveryPending) {
-        // Settled members publish meanwhile. A catalog refresh follows only when a drawn dispatched figure moved.
+        // Settled members publish meanwhile. A catalog refresh draws a moved dispatched figure. While replies ask for more,
+        // it runs at most once every DISPATCH_FIGURES_REFRESH_MS. The reply that ends the tail runs it when any figure moved
+        // after the last refresh.
         const moved = await this.refineDispatchedSpend(generation, controller.signal);
-        refresh = moved && !controller.signal.aborted && generation === this.refreshGeneration;
+        if (controller.signal.aborted || generation !== this.refreshGeneration) return;
+        this.dispatchFiguresHeld ||= moved;
+        const due =
+          this.dispatchFiguresRefreshedAt === undefined ||
+          performance.now() - this.dispatchFiguresRefreshedAt >= DISPATCH_FIGURES_REFRESH_MS;
+        // A reply that sends discovery back to a full pass leaves the held figures to the refresh after that pass.
+        refresh = this.dispatchFiguresHeld && !this.dispatchDiscoveryPending && (!this.dispatchSpendPending || due);
+        if (moved && !refresh) this.performanceCounters.recordWork('dispatchFiguresHeld');
         return;
       }
       const discovered = await this.prepareClaudeChildren(generation, controller.signal);
@@ -10532,6 +10546,8 @@ export class PanelProvider implements vscode.Disposable {
       if (owned && refresh) {
         // The follow-up refresh runs before a waiting request. It accepts a complete reply before any further request, and it
         // sends the next request itself after a reply that added a started session.
+        this.dispatchFiguresHeld = false;
+        this.dispatchFiguresRefreshedAt = this.dispatchSpendPending ? performance.now() : undefined;
         this.refreshFrom('dispatch-discovery', false, true);
       } else if (owned) {
         this.runPendingRefresh();
