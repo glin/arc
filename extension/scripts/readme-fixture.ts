@@ -288,7 +288,7 @@ const changesTurn: Turn = turn({
   prompt: 'Let me open a changed file or the full turn diff from the review card. Cover restored session tabs.',
   summary: 'File names and Open the changes remain available after restoring a session tab.',
   model: 'claude-opus-5-5',
-  outputRate: { output: 6_000, milliseconds: 60_000 },
+  outputRate: { output: 14_000, milliseconds: 140_000 },
   outputRateBasis: 'request',
   files: [
     file('extension/src/webview/card-rows.ts', 27, 8),
@@ -319,32 +319,32 @@ const changesTurn: Turn = turn({
         {
           model: 'claude-sonnet-5-5',
           usage: {
-            requests: 8,
-            input: 12_000,
+            requests: 24,
+            input: 22_000,
             cacheWrite1h: 0,
-            cacheWrite5m: 60_000,
-            cacheRead: 328_000,
-            output: 20_000,
+            cacheWrite5m: 170_000,
+            cacheRead: 1_500_000,
+            output: 66_000,
             thinking: 0,
           },
         },
       ],
-      durationMs: 94_000,
-      tokens: 420_000,
-      toolUses: 9,
+      durationMs: 260_000,
+      tokens: 1_758_000,
+      toolUses: 23,
       artifacts: { files: [], commits: [], complete: true, revision: 'changes-check' },
     }),
   ],
   usage: {
-    requests: 3,
-    input: 4_000,
-    cacheWrite1h: 165_500,
+    requests: 5,
+    input: 6_000,
+    cacheWrite1h: 175_000,
     cacheWrite5m: 0,
-    cacheRead: 328_000,
-    output: 6_000,
+    cacheRead: 680_000,
+    output: 14_000,
     thinking: 0,
   },
-  contextTokens: 168_000,
+  contextTokens: 175_000,
   contextWindow: 1_000_000,
   toolUses: 22,
   toolCounts: { edits: 3, reads: 8, searches: 3, commands: 6, agents: 1, coordination: 1, web: 0, other: 0 },
@@ -401,13 +401,13 @@ const expiryUsage = {
   output: 2_300,
   thinking: 0,
 };
-// The main agent makes three requests. The first starts the subagent and rewrites the expired cache, which is the request the expiry evidence holds. The second reads the subagent result and the third writes the answer, so both read the rewritten cache.
+// The main agent makes five requests. The first starts the subagent and rewrites the expired cache, which is the request the expiry evidence holds. The other four read the rewritten cache while the context grows from about 160k to 175k tokens.
 const expiryTurnUsage = changesTurn.usage;
 const expiryTurn: Turn = {
   ...changesTurn,
   usage: expiryTurnUsage,
-  contextTokens: 168_000,
-  outputRate: { output: 6_000, milliseconds: 60_000 },
+  contextTokens: 175_000,
+  outputRate: { output: 14_000, milliseconds: 140_000 },
 };
 // The cache expiry evidence reads the request that crossed the lifetime, which is the first request of a turn.
 function firstRequestUsage(item: Turn): Turn['usage'] {
