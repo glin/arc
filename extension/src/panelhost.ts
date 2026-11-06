@@ -646,6 +646,7 @@ import {
   BoundedTrailingScheduler,
   IntegrityScheduler,
   CATALOG_REFRESH_DEADLINE_MS,
+  CATALOG_WALK_DEADLINE_MS,
   mergeRefreshRequests,
   listedFilesFor,
   PendingWatcherWake,
@@ -2183,6 +2184,9 @@ export class PanelProvider implements vscode.Disposable {
   private pollInFlight: number | null = null;
   private catalogWalk: CatalogWalkTimes | null = null;
   private catalogWalkPendingAt: number | null = null;
+  // The catalog walk that runs now, with the signal of its refresh. `overdue` is true when the refresh deadline passed
+  // during the walk.
+  private catalogWalkRunning: { signal: AbortSignal; overdue: boolean } | null = null;
   private lastSignature = '';
   private lastSpendSourceSignature = '';
   // The rows lastSpendSourceSignature signed, so a targeted offer can name every row that moved since.
@@ -3742,14 +3746,19 @@ export class PanelProvider implements vscode.Disposable {
     this.poll = setInterval(() => void this.pollCatalog(), POLL_INTERVAL_MILLISECONDS);
   }
 
-  // A poll walks the catalog only when a directory the last walk enumerated moved, or when the backstop is due. A moved
-  // `subagents` directory revalidates the session that owns it, and that refresh sends child discovery. Any other poll
+  // A poll walks the catalog only when no walk runs, and a directory the last walk enumerated moved or the backstop is due.
+  // A moved `subagents` directory revalidates the session that owns it, and that refresh sends child discovery. Any other poll
   // refreshes from the held catalog, which revalidates the selected session and redraws.
   private async pollCatalog(): Promise<void> {
     if (this.pollInFlight) {
       // Stats that never answer, such as on a lost network share, still leave the backstop walk.
       const since = (time: number | null | undefined) => Date.now() - (time ?? 0) >= POLL_BACKSTOP_WALK_MS;
-      if (since(this.pollInFlight) && since(this.catalogWalk?.startedAt) && since(this.catalogWalkPendingAt))
+      if (
+        !this.catalogWalkRunning &&
+        since(this.pollInFlight) &&
+        since(this.catalogWalk?.startedAt) &&
+        since(this.catalogWalkPendingAt)
+      )
         this.refreshFrom('poll:backstop');
       return;
     }
@@ -3766,7 +3775,8 @@ export class PanelProvider implements vscode.Disposable {
       );
       this.performanceCounters.recordWork('pollDirectoryStats', gate.stats);
       if (!this.watching) return;
-      if (decision.kind === 'walk') {
+      // A walk that runs lists every directory again, so a poll during it asks for no walk.
+      if (decision.kind === 'walk' && !this.catalogWalkRunning) {
         this.refreshFrom(`poll:${decision.cause}`);
         return;
       }
@@ -9603,17 +9613,21 @@ export class PanelProvider implements vscode.Disposable {
   async refresh(force = false, reuseCatalog = false, metadataAfterRender = false, selectedOnly = false): Promise<void> {
     // Merge concurrent catalog refresh triggers into one pending request so active reads can finish.
     if (!selectedOnly && (this.refreshController || this.codexPriming)) {
-      this.pendingRefresh = mergeRefreshRequests(this.pendingRefresh, {
-        reason: this.refreshReason,
-        force,
-        reuseCatalog,
-        metadataAfterRender,
-        changedPaths: this.targetedRefreshPaths,
-      });
+      this.pendingRefresh = mergeRefreshRequests(
+        this.pendingRefresh,
+        {
+          reason: this.refreshReason,
+          force,
+          reuseCatalog,
+          metadataAfterRender,
+          changedPaths: this.targetedRefreshPaths,
+        },
+        !!this.catalogWalkRunning,
+      );
       this.performanceCounters.recordRefreshStage('coalesced');
       // A merge of different requesters runs as `coalesced`, so each waiting request also counts under its own name.
       this.performanceCounters.recordWork(`coalesced:${this.refreshReason}`);
-      if (this.refreshOverdue) {
+      if (this.refreshOverdue && !this.catalogWalkRunning) {
         this.runPendingRefresh();
       }
       return;
@@ -10405,7 +10419,8 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   // The catalog refresh slot. A catalog refresh requested while the slot is held waits behind its holder, and a holder
-  // past the deadline is abandoned for the waiting request.
+  // past the deadline is abandoned for the waiting request. A holder whose catalog walk runs at the deadline is not
+  // abandoned, and `walkCatalog` claims the slot again when the walk ends.
   private claimCatalogRefresh(controller: AbortController): void {
     this.refreshController = controller;
     this.refreshOverdue = false;
@@ -10415,6 +10430,10 @@ export class PanelProvider implements vscode.Disposable {
     this.refreshDeadline = setTimeout(() => {
       this.refreshDeadline = null;
       if (this.refreshController !== controller) {
+        return;
+      }
+      if (this.catalogWalkRunning?.signal === controller.signal) {
+        this.catalogWalkRunning.overdue = true;
         return;
       }
       this.refreshOverdue = true;
@@ -12276,10 +12295,43 @@ export class PanelProvider implements vscode.Disposable {
 
   // List the catalog from an asynchronous walk of the Codex rollout tree, after held and targeted reuse missed.
   // Selection and other messages run during the walk. The answer is null when the refresh became obsolete
-  // during the walk: canceled, superseded, hidden, or moved to another rollout root.
+  // during the walk: canceled, superseded, hidden, or moved to another rollout root. It is also null when the walk
+  // reached `CATALOG_WALK_DEADLINE_MS`. The refresh deadline does not abandon a refresh while its walk runs.
   private async walkCatalog(signal: AbortSignal, generation: number): Promise<SessionFile[] | null> {
     const root = codexSessionsRoot();
-    const enumeration = await enumerateRolloutFilesAsync(root, signal);
+    // The walk serves every waiting request that walks and names no file, so none of them walks again after it.
+    if (this.pendingRefresh) this.pendingRefresh = mergeRefreshRequests(null, this.pendingRefresh, true);
+    // The backstop clock starts when the walk starts, also after an earlier walk that never completed.
+    this.catalogWalkPendingAt = Date.now();
+    const running = { signal, overdue: false };
+    this.catalogWalkRunning = running;
+    const walk = new AbortController();
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    let stop = () => {};
+    let enumeration: SourceEnumeration | null | 'deadline';
+    try {
+      enumeration = await Promise.race([
+        enumerateRolloutFilesAsync(root, walk.signal),
+        new Promise<null | 'deadline'>((resolve) => {
+          stop = () => resolve(null);
+          if (signal.aborted) stop();
+          signal.addEventListener('abort', stop);
+          deadline = setTimeout(() => resolve('deadline'), CATALOG_WALK_DEADLINE_MS);
+        }),
+      ]);
+    } finally {
+      walk.abort();
+      clearTimeout(deadline);
+      signal.removeEventListener('abort', stop);
+      if (this.catalogWalkRunning === running) this.catalogWalkRunning = null;
+      // A refresh whose deadline passed during its walk gets a full deadline for the work after the walk.
+      const holder = this.refreshController;
+      if (holder?.signal === signal && (running.overdue || this.refreshOverdue)) this.claimCatalogRefresh(holder);
+    }
+    if (enumeration === 'deadline') {
+      this.performanceCounters?.recordRefreshStage('walkDeadline');
+      return null;
+    }
     if (
       !enumeration ||
       signal.aborted ||

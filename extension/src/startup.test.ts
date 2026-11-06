@@ -268,6 +268,7 @@ import {
   BoundedTrailingScheduler,
   IntegrityScheduler,
   CATALOG_REFRESH_DEADLINE_MS,
+  CATALOG_WALK_DEADLINE_MS,
   mergeRefreshRequests,
   PendingWatcherWake,
   PollDirectoryGate,
@@ -2987,6 +2988,7 @@ function completeDiscoveryHarness(
     'onlyGrew',
     'mergeRefreshRequests',
     'CATALOG_REFRESH_DEADLINE_MS',
+    'CATALOG_WALK_DEADLINE_MS',
     'derivedTitleStats',
     'withMetadataCoverage',
     'railEnrichmentNeeds',
@@ -3034,6 +3036,7 @@ function completeDiscoveryHarness(
     onlyGrew,
     mergeRefreshRequests,
     CATALOG_REFRESH_DEADLINE_MS,
+    CATALOG_WALK_DEADLINE_MS,
     derivedTitleStats,
     withMetadataCoverage,
     railEnrichmentNeeds,
@@ -8396,6 +8399,151 @@ test.each(['canceled refresh', 'newer generation', 'hidden panel', 'changed root
   },
 );
 
+// Polls a held-walk harness under fake timers. Each turn runs the timers that are due and lets file reads answer.
+async function untilWalkSettles(condition: () => boolean, message: string): Promise<void> {
+  const deadline = performance.now() + 10_000;
+  while (!condition()) {
+    assert.ok(performance.now() < deadline, message);
+    await vi.advanceTimersByTimeAsync(0);
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
+
+function recordedRefreshStages(provider: any): string[] {
+  const stages: string[] = [];
+  provider.performanceCounters.recordRefreshStage = (stage: string) => stages.push(stage);
+  return stages;
+}
+
+test('a refresh past its deadline with a walk in progress completes the walk, and the request behind it does not walk again', async () => {
+  vi.useFakeTimers(STREAM_TIMERS);
+  try {
+    const { provider, walks, files, writeRollout } = heldWalkHarness();
+    const file = writeRollout('first');
+    const stages = recordedRefreshStages(provider);
+    const refresh = provider.refresh(true);
+    await untilWalkSettles(() => walks.length === 1, 'the refresh did not start its walk');
+    const walking: AbortController = provider.refreshController;
+    provider.refreshFrom('poll:backstop');
+    await vi.advanceTimersByTimeAsync(CATALOG_REFRESH_DEADLINE_MS + 1);
+    assert.equal(walking.signal.aborted, false, 'the refresh deadline abandoned a refresh while its walk ran');
+    assert.equal(walks.length, 1, 'the waiting request started a second walk while the first walk ran');
+    walks[0].release();
+    await refresh;
+    await untilWalkSettles(
+      () => provider.refreshController === null && provider.pendingRefresh === null,
+      'the request that waited behind the walk did not run after it',
+    );
+    assert.deepEqual(files(), [file]);
+    assert.equal(walks.length, 1, 'the request that waited behind the walk started the walk again');
+    assert.deepEqual(
+      stages.filter((stage) => stage !== 'coalesced' && stage !== 'unchanged' && stage !== 'rendered'),
+      ['started', 'started'],
+    );
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('a poll during a walk requests no walk', async () => {
+  vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+  try {
+    const { provider, walks, writeRollout } = heldWalkHarness(
+      { PollDirectoryGate, POLL_BACKSTOP_WALK_MS, sessionDirectoryOwners },
+      ['pollCatalog', 'pollDirectories'],
+    );
+    writeRollout('first');
+    const work: string[] = [];
+    provider.performanceCounters.recordWork = (name: string) => work.push(name);
+    provider.watching = true;
+    provider.pollGate = new PollDirectoryGate(async () => ({ mtimeMs: 0, print: '0' }));
+    const first = provider.refresh(true);
+    await untilWalkSettles(() => walks.length === 1, 'the first refresh did not start its walk');
+    walks[0].release();
+    await first;
+    await untilWalkSettles(() => provider.refreshController === null, 'the first refresh did not finish');
+    const second = provider.refresh(true);
+    await untilWalkSettles(() => walks.length === 2, 'the second refresh did not start its walk');
+    // The walk runs past the backstop interval, and a poll's stats hang past it too.
+    await vi.advanceTimersByTimeAsync(POLL_BACKSTOP_WALK_MS + 1);
+    work.length = 0;
+    await provider.pollCatalog();
+    provider.pollInFlight = Date.now() - POLL_BACKSTOP_WALK_MS - 1;
+    await provider.pollCatalog();
+    provider.pollInFlight = null;
+    assert.deepEqual(
+      work.filter((name) => name.startsWith('coalesced:poll:')),
+      [],
+      'a poll during a running walk asked for another walk',
+    );
+    assert.equal(walks.length, 2, 'a poll during a running walk started another walk');
+    walks[1].release();
+    await second;
+    await untilWalkSettles(() => provider.refreshController === null, 'the second refresh did not finish');
+    assert.equal(walks.length, 2, 'the poll that waited behind the walk started another walk');
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('a walk past its own deadline is abandoned and counted, and the request behind it runs', async () => {
+  vi.useFakeTimers(STREAM_TIMERS);
+  try {
+    const { provider, walks, writeRollout } = heldWalkHarness();
+    const file = writeRollout('first');
+    const stages = recordedRefreshStages(provider);
+    const refresh = provider.refresh(true);
+    await untilWalkSettles(() => walks.length === 1, 'the refresh did not start its walk');
+    const walking: AbortController = provider.refreshController;
+    provider.refreshFrom('watcher', false, false, [file]);
+    await vi.advanceTimersByTimeAsync(CATALOG_WALK_DEADLINE_MS - 1);
+    assert.equal(stages.includes('walkDeadline'), false, 'the walk stopped before its own deadline');
+    await vi.advanceTimersByTimeAsync(1);
+    await untilWalkSettles(() => walks.length === 2, 'the request that waited behind the stopped walk did not run');
+    assert.equal(
+      stages.filter((stage) => stage === 'walkDeadline').length,
+      1,
+      'the walk that reached its own deadline was not counted',
+    );
+    assert.notEqual(provider.refreshController, walking, 'the refresh of the stopped walk still holds the slot');
+    for (const walk of walks) walk.release();
+    await refresh;
+    await untilWalkSettles(
+      () => provider.refreshController === null,
+      'the request behind the stopped walk did not finish',
+    );
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('a discovery continuation pending behind a walk runs after the walk', async () => {
+  vi.useFakeTimers(STREAM_TIMERS);
+  try {
+    const { provider, walks, writeRollout } = heldWalkHarness();
+    writeRollout('first');
+    let refined = 0;
+    provider.refineDispatchedSpend = async () => {
+      refined++;
+      provider.dispatchSpendPending = false;
+      return false;
+    };
+    const refresh = provider.refresh(true);
+    await untilWalkSettles(() => walks.length === 1, 'the refresh did not start its walk');
+    provider.dispatchDiscoveryPending = false;
+    provider.dispatchSpendPending = true;
+    provider.refreshFrom('poll:backstop');
+    await vi.advanceTimersByTimeAsync(CATALOG_REFRESH_DEADLINE_MS + 1);
+    walks[0].release();
+    await refresh;
+    await untilWalkSettles(() => refined > 0, 'the spend-only pass that waited behind the walk did not run after it');
+    assert.equal(walks.length, 1);
+    for (const walk of walks.slice(1)) walk.release();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 test.each(['an abandoned refresh', 'a rollout root change', 'the last panel closing and reopening'])(
   'a cold opening pass finished after %s never becomes the catalog',
   async (change) => {
@@ -8636,7 +8784,7 @@ test('each catalog walk names its requester, and the re-list after a replaced fi
     'walk:requested:startup': 1,
     'walk:requested:transcript': 1,
   });
-  // Requests that wait behind a running refresh each count under their own name.
+  // Requests that wait behind a running walk each count under their own name, and reuse the catalog that the walk lists.
   provider.performanceCounters = counters = new PanelPerformanceCounters();
   replaced = [];
   const refresh = provider.refresh;
@@ -8667,7 +8815,6 @@ test('each catalog walk names its requester, and the re-list after a replaced fi
     {
       'coalesced:child:tool': 1,
       'coalesced:poll': 2,
-      'walk:requested:coalesced': 1,
       'walk:requested:trigger': 1,
     },
   );

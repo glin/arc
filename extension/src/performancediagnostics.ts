@@ -121,8 +121,9 @@ export const DISPATCH_ROOT_RECORDS = 20;
 
 export type StartupMilestone = 'shellReady' | 'catalogReady' | 'railReady' | 'firstCard' | 'completeRender';
 
-// Catalog refresh stages include started work, coalesced requests, unchanged content, posted renders, and deadline abandonment.
-export type RefreshStage = 'started' | 'coalesced' | 'unchanged' | 'rendered' | 'abandoned';
+// Catalog refresh stages include started work, coalesced requests, unchanged content, posted renders, deadline abandonment,
+// and catalog walks stopped at their own deadline.
+export type RefreshStage = 'started' | 'coalesced' | 'unchanged' | 'rendered' | 'abandoned' | 'walkDeadline';
 
 function operationCounts(): OperationCounts {
   return { count: 0, totalDurationMs: 0, maximumDurationMs: 0, lastDurationMs: 0 };
@@ -397,6 +398,7 @@ export class PanelPerformanceCounters {
     unchanged: 0,
     rendered: 0,
     abandoned: 0,
+    walkDeadline: 0,
   };
   private readonly messages = new Map<string, MessageCounts>();
   private nextPanelId = 0;

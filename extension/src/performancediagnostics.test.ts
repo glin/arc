@@ -185,7 +185,7 @@ test('performance counters correlate posts and replies for every open panel', ()
       poll: { count: 1, totalDurationMs: 3, maximumDurationMs: 3, lastDurationMs: 3 },
       watcher: { count: 2, totalDurationMs: 20, maximumDurationMs: 12, lastDurationMs: 12 },
     },
-    refreshStages: { started: 1, coalesced: 2, unchanged: 1, rendered: 1, abandoned: 0 },
+    refreshStages: { started: 1, coalesced: 2, unchanged: 1, rendered: 1, abandoned: 0, walkDeadline: 0 },
     messages: {
       rail: {
         count: 3,
@@ -288,6 +288,7 @@ test('the saved snapshot carries refresh stages, discovery, decisions, row posts
     unchanged: 1,
     rendered: 0,
     abandoned: 0,
+    walkDeadline: 0,
   });
   assert.equal((projected.counters.discovery as { continuations: number }).continuations, 0);
   // The decision counts once, and each of its two unknown paths counts under its shape and extension.

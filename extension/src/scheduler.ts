@@ -581,8 +581,13 @@ export function watcherRefreshDecision(
 
 // How long a catalog refresh holds the triggers that wait behind it. After this, the next waiting
 // trigger abandons the refresh in flight and runs, so a worker request that never answers cannot
-// hold every later refresh. A walk that answers within this time is never abandoned.
+// hold every later refresh. A catalog walk that runs when the deadline passes is not abandoned. The
+// refresh gets a full deadline again when that walk ends.
 export const CATALOG_REFRESH_DEADLINE_MS = 30_000;
+
+// How long one catalog walk runs. A walk that runs longer stops, and its refresh ends without a new
+// catalog, so a walk that never ends cannot hold every later refresh.
+export const CATALOG_WALK_DEADLINE_MS = 120_000;
 
 export interface RefreshRequest {
   reason: string;
@@ -597,9 +602,18 @@ export interface RefreshRequest {
 // does everything that either request asked for. A request that reuses the held catalog asks
 // for no walk, and the files it names stay named. Targeted requests revalidate the union of
 // their files, and a broad request that names no file makes the result broad. A render before
-// metadata stays only when both accept it.
-export function mergeRefreshRequests(pending: RefreshRequest | null, next: RefreshRequest): RefreshRequest {
-  const requests = pending ? [pending, next] : [next];
+// metadata stays only when both accept it. While a catalog walk runs, a request that walks and
+// names no file reuses the catalog that the walk lists, so it does not start another walk.
+export function mergeRefreshRequests(
+  pending: RefreshRequest | null,
+  next: RefreshRequest,
+  walkRunning = false,
+): RefreshRequest {
+  const requests = (pending ? [pending, next] : [next]).map((request) =>
+    walkRunning && !request.reuseCatalog && !request.changedPaths?.length
+      ? { ...request, reuseCatalog: true }
+      : request,
+  );
   const reuseCatalog = requests.every((request) => request.reuseCatalog);
   const walking = requests.filter((request) => !request.reuseCatalog);
   const named = [...new Set(requests.flatMap((request) => request.changedPaths ?? []))];
