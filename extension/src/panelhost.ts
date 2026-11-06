@@ -3949,7 +3949,9 @@ export class PanelProvider implements vscode.Disposable {
         }))
       : [];
     if (decision.ownedPaths) this.performanceCounters.recordWork('watcher:sessionDirectory', decision.ownedPaths);
-    this.refreshFrom(reason, batch.drawRequired, false, decision.kind === 'targeted' ? decision.changedPaths : null);
+    const grown = decision.kind === 'targeted' && this.onlyGrownMembers(decision);
+    if (grown) this.performanceCounters.recordWork('watcher:grownMembers');
+    this.refreshFrom(reason, batch.drawRequired, grown, decision.kind === 'targeted' ? decision.changedPaths : null);
     this.performanceCounters.recordWatcherOperation(
       {
         reason,
@@ -3964,6 +3966,34 @@ export class PanelProvider implements vscode.Disposable {
       unknownPaths,
       decision.walkListedPaths,
     );
+  }
+
+  // True when members are settled and every path of a targeted wake is a dispatched member's file that keeps the device,
+  // inode and no smaller size than its held facts. Its refresh reuses the held catalog, so the spend-only pass reads the
+  // grown files with no discovery epoch. A spawn record appended inside a grown file waits for the next full pass. The
+  // decision walks for a created path that no listed session owns, and `ownedPaths` counts one that a session owns.
+  private onlyGrownMembers(decision: { changedPaths: string[]; ownedPaths: number; walkListedPaths: number }): boolean {
+    if (!this.claudeChildrenDiscovered || this.dispatchDiscoveryPending) return false;
+    if (decision.ownedPaths || decision.walkListedPaths || !decision.changedPaths.length) return false;
+    const members = new Map(
+      this.claudeChildReferences.flatMap((reference) =>
+        reference.kind === 'dispatch' && reference.file
+          ? [[normalizeFsPath(reference.file), reference.sessionId] as const]
+          : [],
+      ),
+    );
+    return decision.changedPaths.every((file) => {
+      const sessionId = members.get(normalizeFsPath(file));
+      const held = sessionId === undefined ? undefined : this.dispatchFacts.get(sessionId)?.revision;
+      if (!held) return false;
+      let now: FileRevision;
+      try {
+        now = fileRevisionOf(fs.statSync(file, { bigint: true }));
+      } catch {
+        return false;
+      }
+      return String(now.dev) === String(held.dev) && String(now.ino) === String(held.ino) && now.size >= held.size;
+    });
   }
 
   // The last walk, when it listed the current repository roots.

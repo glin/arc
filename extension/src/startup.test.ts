@@ -2822,6 +2822,7 @@ function completeDiscoveryHarness(
   if (names.includes('allSessions')) names.push('walkedSessions');
   if (names.includes('walkedSessions') || names.includes('runPendingWatch')) names.push('noteCompressedRollouts');
   if (names.includes('allSessions') || names.includes('runPendingWatch')) names.push('currentWalkedCatalog');
+  if (names.includes('runPendingWatch')) names.push('onlyGrownMembers');
   if (names.includes('prepareClaudeChildren')) names.push('startedSources', 'applyDispatchFacts');
   names.push('walkCatalog');
   const body = owner.members
@@ -15435,13 +15436,13 @@ test('incomplete discovery replies continue without a catalog refresh, and the c
 
 // A complete reply asks for another pass. `membersSettled` says whether only dispatched spend waits for it. `spendFailure`
 // makes the first spend-only request fail or find no held reply. `spendReplies` is the spend-only reply that finishes the
-// root, and `moving` moves the root's drawn figure in every spend-only reply.
+// root, and `moving` moves the root's drawn figure in every spend-only reply. `methods` and `scope` reach the host harness.
 function partialSpendHarness(
   membersSettled: boolean,
   spendFailure?: 'held-false' | 'reject',
-  { spendReplies = 3, moving = false } = {},
+  { spendReplies = 3, moving = false, methods = [] as string[], scope = {} } = {},
 ) {
-  const { provider, discovery } = exhaustedLoadingHarness();
+  const { provider, discovery } = exhaustedLoadingHarness(methods, scope);
   const counters = new PanelPerformanceCounters(1000);
   provider.performanceCounters = counters;
   const run = provider.progressiveWorker.run;
@@ -15608,6 +15609,110 @@ test('a dispatched file that moves after members settle reads its spend without 
     vi.useRealTimers();
   }
 });
+
+// A dispatched Claude session whose file the watcher names after members settle. `stats` stands in for the member's
+// file, so a case grows, shrinks or replaces it with no disk write. A refresh lists the member with its current stat, as a
+// targeted revalidation does. Each later spend-only reply carries the member's facts with five tool uses.
+// Each append to a dispatched child used to open a discovery epoch, which scanned the receipt store and read the dispatched
+// spend of every root again.
+const fullPass = 'a full discovery request';
+for (const [change, subject, outcome] of [
+  ['grown', 'a grown dispatched member', 'one spend-only request and no discovery request, and its figure moves'],
+  ['newFile', 'a new file in the session directory of a grown member', fullPass],
+  ['shrunk', 'a shrunk member file', fullPass],
+  ['reidentified', 'a member file with a new inode', fullPass],
+  ['unsettled', 'a grown member while members are unsettled', fullPass],
+] as const)
+  test(`${subject} sends ${outcome}`, async () => {
+    vi.useFakeTimers();
+    try {
+      const file = 'projects/repo/claude-a.jsonl';
+      const held = { size: 10, mtimeMs: 10, dev: 1, ino: 7 };
+      const stats = new Map([[file, held]]);
+      const statSync = (target: string, options: object) => stats.get(target) ?? fs.statSync(target, options);
+      const { provider, counters, requests } = partialSpendHarness(true, undefined, {
+        methods: ['runPendingWatch', 'unknownPathShapeOf'],
+        scope: {
+          fs: { ...fs, statSync },
+          watcherRefreshDecision,
+          sessionDirectoryOwners,
+          unknownPathShapes,
+          unknownPathExtension,
+        },
+      });
+      const quiet = (count: number) =>
+        !provider.dispatchSpendPending && requests.length >= count && provider.refreshController === null;
+      const settle = async (count: number) => {
+        // Each step runs the timers due and the work they release. The step bound is the test's deadline.
+        for (let step = 0; step < 500 && !quiet(count); step++) await vi.advanceTimersByTimeAsync(1);
+        assert.ok(quiet(count), `discovery never settled after requests ${requests.join(', ')}`);
+      };
+      provider.refreshFrom('startup', true);
+      await settle(4);
+      const settled = provider.dispatchFacts.get('codex-root');
+      const facts = (revision: object, toolUses: number) => ({ ...settled, sessionId: 'claude-a', revision, toolUses });
+      const listed = provider.allSessions;
+      provider.allSessions = (reuse: boolean) => {
+        provider.catalog.sessions = provider.catalog.sessions.map((row: { file: string }) =>
+          row.file === file ? { ...row, ...stats.get(file) } : row,
+        );
+        return listed(reuse);
+      };
+      const run = provider.progressiveWorker.run;
+      provider.progressiveWorker.run = async (request: ProgressiveRequest, generation: number, signal: AbortSignal) => {
+        const reply = await run(request, generation, signal);
+        if (request.kind !== 'claude-children' || !request.spendOnly || !reply?.value?.held) return reply;
+        return {
+          ...reply,
+          value: { ...reply.value, dispatchFacts: [...reply.value.dispatchFacts, facts(stats.get(file)!, 5)] },
+        };
+      };
+      const row = { file, sessionId: 'claude-a', agent: 'claude', activity: 60, ...held };
+      provider.catalog.sessions = [...provider.catalog.sessions, row];
+      provider.titles.set(file, { ...provider.titles.get(provider.catalog.sessions[0].file), ...row });
+      provider.claudeChildReferences = [
+        { kind: 'dispatch', sessionId: 'claude-a', file, parentSessionId: 'parent', toolUseIds: [] },
+      ];
+      provider.dispatchFacts.set('claude-a', facts(held, 1));
+      const grown = { ...held, size: 20, mtimeMs: 20 };
+      stats.set(
+        file,
+        change === 'shrunk' ? { ...held, size: 5 } : change === 'reidentified' ? { ...grown, ino: 8 } : grown,
+      );
+      if (change === 'unsettled') provider.dispatchDiscoveryPending = true;
+      // A new child transcript in the member's session directory names the member, as the watcher decision does.
+      const created = change === 'newFile' ? ['projects/repo/claude-a/subagents/agent-new.jsonl'] : [];
+      const batch = { eventCount: 1, changedPaths: [file, ...created], createdPaths: created, compressedPaths: [] };
+      provider.pendingWatch = {
+        take: () => ({
+          ...batch,
+          broadRequired: false,
+          broadReasons: [],
+          drawRequired: false,
+          reasons: ['transcript'],
+        }),
+      };
+      const before = { ...counters.snapshot().work };
+      provider.runPendingWatch({ cause: 'quiet', firstAt: 0, lastAt: 0, firedAt: 0 });
+      await settle(5);
+      const work = counters.snapshot().work;
+      const added = (count: string) => (work[count] ?? 0) - (before[count] ?? 0);
+      const reused = change === 'grown';
+      assert.deepEqual(
+        {
+          requests: requests.slice(4, 5),
+          routed: added('watcher:grownMembers'),
+          walked: added('discoveryRequest:walked'),
+        },
+        { requests: [reused ? 'spend' : 'discovery'], routed: reused ? 1 : 0, walked: reused ? 0 : 1 },
+        reused ? 'the grown member sent a discovery request' : 'the watcher refresh reused the catalog',
+      );
+      if (reused) assert.equal(provider.dispatchFacts.get('claude-a')?.toolUses, 5, 'the member figure did not move');
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
 
 test('a cancelled spend-only request counts as a discovery abort', async () => {
   const { provider, counters } = partialSpendHarness(true);
