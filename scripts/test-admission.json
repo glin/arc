@@ -135,9 +135,9 @@
     "matricesSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
   },
   "extension/src/progressiveworker.test.ts": {
-    "reason": "Worker protocol, cancellation, host death, bounded transcript reads, compressed rollout opens with one decode at a time, its cancellation, a stale window over a body released during its hash check or its read, a release of another path that keeps the held body, a read of a released path that waits for the reads of the released body, and a waiting read whose file the host released that keeps no body, and scoped subagent edit reads must survive the actual worker boundary. A new worker must read again a finished transcript whose saved cut no longer qualifies, and count why. A complete reply that leaves membership unsettled must count the branch that asked for another pass without an added file check, and a receipt scan that opened in a cancelled request must count in the next answered reply. A spend-only pass must end at its first root wait, return the later roots with their held facts, and start the next pass at the next root.",
-    "cases": 171,
-    "matricesSha256": "439b41f50a3b19ed0ff84606c47e1df617b8d34c90ec0d660f4745d6a5019878"
+    "reason": "Worker protocol, cancellation, host death, bounded transcript reads, compressed rollout opens with one decode at a time, its cancellation, a stale window over a body released during its hash check or its read, a release of another path that keeps the held body, a read of a released path that waits for the reads of the released body, and a waiting read whose file the host released that keeps no body, and scoped subagent edit reads must survive the actual worker boundary. A new worker must read again a finished transcript whose saved cut no longer qualifies, and count why. A complete reply that leaves membership unsettled must count the branch that asked for another pass without an added file check, and a receipt scan that opened in a cancelled request must count in the next answered reply. A spend-only pass must end at its first root wait, return the later roots with their held facts, and start the next pass at the next root. A held root must ask for another pass when the root that spent the slice finished, so that pass reads its grown file.",
+    "cases": 172,
+    "matricesSha256": "1d13fa7d7d28a556125f403b95d01b3234f68eaf003743b4de792dfd46191de1"
   },
   "extension/src/projectsetups.test.ts": {
     "reason": "Real Git worktrees and canonical filesystem aliases must share project identity while clones stay distinct.",

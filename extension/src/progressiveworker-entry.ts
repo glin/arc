@@ -1875,7 +1875,8 @@ function collectDispatchFacts(
       if (reference.kind !== 'dispatch' || !reference.file) continue;
       closeRoot();
       // Once a spend-only pass spends its slice, each later root with held facts returns them with no stat, spend tree or
-      // person check. A root whose file changed keeps its old facts until a later pass reaches it.
+      // person check. A root whose file changed keeps its old facts until a later pass reaches it, so every held root asks
+      // for another pass. That pass starts at the first held root and passes over the unchanged ones as settled.
       if (spendOnly && sliceSpent()) {
         reachedAfterSlice ??= reference.sessionId;
         const heldFacts = dispatchFacts.get(reference.file);
@@ -1884,7 +1885,7 @@ function collectDispatchFacts(
           heldFacts.sourceGeneration === claudeChildReferences.get(normalizeFsPath(reference.file))?.sourceGeneration
         ) {
           charges.dispatchSpendHeldRoots!++;
-          continuation ||= !heldFacts.settled;
+          continuation = true;
           dispatched.push(heldFacts.facts);
           continue;
         }
