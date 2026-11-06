@@ -223,6 +223,8 @@ export interface PanelState {
   // Agent runs the reader prompted from the Prompt box, oldest first. A prompt ends Run by agents filing
   // without changing `agentRuns`, so the prompt-cache request of the launch stays the same.
   prompted?: string[];
+  // Reader prompts whose dispatch evidence has not settled. No count limit applies while evidence remains unresolved.
+  promptedPending?: string[];
   // Normalized descriptors for extension-staged files held with each draft. The bytes stay
   // in global storage and never enter this state.
   assets: Record<string, StoredPromptAsset[]>;
@@ -367,6 +369,9 @@ export function normalizePanelState(raw: unknown, heldRailFilters?: readonly Sav
     started: ids(src.started, SESSION_LIMIT),
     ...(ids(src.agentRuns, SESSION_LIMIT).length ? { agentRuns: ids(src.agentRuns, SESSION_LIMIT) } : {}),
     ...(ids(src.prompted, SESSION_LIMIT).length ? { prompted: ids(src.prompted, SESSION_LIMIT) } : {}),
+    ...(ids(src.promptedPending, Number.POSITIVE_INFINITY).length
+      ? { promptedPending: [...new Set(ids(src.promptedPending, Number.POSITIVE_INFINITY))] }
+      : {}),
     assets: normalizePromptAssetBook(src.assets),
     queues: normalizeQueuedSubmissions(src.queues),
   };

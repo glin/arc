@@ -2839,7 +2839,10 @@ test('read-only Bedrock reuse keeps the session list cache mark on its latest re
 
 test('agent-run answers retain unknown evidence while honoring reader and native child ownership', () => {
   assert.equal(agentRunAnswer(null, 'unknown', new Set(), false, false), null);
-  assert.equal(agentRunAnswer(false, 'unknown', new Set(), false, null), null);
+  assert.equal(agentRunAnswer(false, 'unknown', new Set(), false, null), false);
+  assert.equal(agentRunAnswer(true, 'unknown', new Set(), false, null), true);
+  assert.equal(agentRunAnswer(null, 'unknown', new Set(), false, null), null);
+  assert.equal(agentRunAnswer(true, 'reader', new Set(), false, null, true), false);
   assert.equal(agentRunAnswer(null, 'reader', new Set(['reader']), false, null), false);
   assert.equal(agentRunAnswer(null, 'child', new Set(['child']), true, null), true);
   assert.equal(agentRunAnswer(false, 'reader', new Set(), false, true, true), false);

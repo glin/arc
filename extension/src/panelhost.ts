@@ -2312,6 +2312,7 @@ export class PanelProvider implements vscode.Disposable {
 
   // Live panel state shared by attached hosts and persisted through the memento.
   private saved: PanelState = normalizePanelState(null);
+  private promptedPendingMembership?: { source: PanelState['promptedPending']; ids: ReadonlySet<string> };
   private windowStateHandler: ((state: WindowState) => void) | null = null;
   private sessionWriteQueue: Promise<unknown> = Promise.resolve();
   private filterRequests?: SessionFilterRequests;
@@ -6162,6 +6163,8 @@ export class PanelProvider implements vscode.Disposable {
     }
     if (this.saved.prompted?.includes(source))
       this.saved.prompted = [...new Set([...this.saved.prompted, successor])].slice(-SESSION_LIMIT);
+    if (this.saved.promptedPending?.includes(source))
+      this.saved.promptedPending = [...new Set([...this.saved.promptedPending, successor])];
     // Copy labels to the successor. Refresh the source's insertion order first so capacity eviction does not remove it.
     const labels = labelsOf(this.saved.labels, source);
     if (labels.length) {
@@ -7590,21 +7593,24 @@ export class PanelProvider implements vscode.Disposable {
     void this.persistHostState().catch(() => {});
   }
 
-  // Record that the reader sent input from the Prompt box to a session filed as an agent run or not yet classified,
-  // or connected Remote Control to it. `sendPrompt` records a queued submission when it enters the queue.
-  // An immediate send, `/compact`, or `/clear` records only after the agent accepts it.
-  // An Arc agent-run launch is recorded even while its pending row files it as the reader's own.
-  // Another session is recorded when its published row files it as an agent run or leaves it unclassified.
-  // A reader session whose classification is still unknown can therefore enter the list and push an older entry out of the bound.
-  // `successors` lists the sessions that a typed `/clear` or Codex `/new` moved to before the agent accepted it.
-  // They inherit the record whatever their own rows say. `noteSessionMoved` passes a record to the successor of a later move.
-  // `agentRuns` keeps the session, so `isAgentRunLaunch` and the prompt-cache request of its resumes do not change.
+  // A prompt or Remote Control connection retains reader ownership of an agent run or an unclassified session.
+  // A false transcript answer during pending discovery retains provisional ownership until dispatch evidence settles it.
+  // Complete coverage without an edge keeps that ownership because launch evidence can arrive later.
+  // Queued submissions record ownership on acceptance. Immediate sends and typed commands wait for agent acceptance.
+  // Successors inherit ownership without changing the launch record or its prompt-cache request.
   private notePrompted(session: string, successors: readonly string[] = []): void {
-    if (this.saved.prompted?.includes(session)) return;
+    if (this.saved.prompted?.includes(session) || this.saved.promptedPending?.includes(session)) return;
     const row = this.sessionRows.find((entry) => entry.id === session);
-    if (!this.isAgentRunLaunch(session) && (!row || row.agentRun === false)) return;
+    const provisional =
+      row?.agentRun === false &&
+      this.dispatchDiscoveryPending &&
+      !this.startedHere.has(session) &&
+      this.sessionParentEdgeSet?.edges.get(session)?.relation !== 'dispatched' &&
+      !this.isAgentRunLaunch(session);
+    if (!provisional && !this.isAgentRunLaunch(session) && (!row || row.agentRun === false)) return;
     const recorded = [session, ...successors];
-    this.saved.prompted = [...new Set([...(this.saved.prompted ?? []), ...recorded])].slice(-SESSION_LIMIT);
+    if (provisional) this.saved.promptedPending = [...new Set([...(this.saved.promptedPending ?? []), ...recorded])];
+    else this.saved.prompted = [...new Set([...(this.saved.prompted ?? []), ...recorded])].slice(-SESSION_LIMIT);
     void this.persistHostState().catch(() => {});
     // Patch the published rows and post the session list, so the cards change before the next catalog refresh.
     const edges = this.sessionParentEdgeSet?.edges ?? new Map();
@@ -9256,7 +9262,12 @@ export class PanelProvider implements vscode.Disposable {
           archived: sources.filter((source) => this.hidden.has(source.sessionId)).map(identity),
           startedHere: sources.filter((source) => this.startedHere.has(source.sessionId)).map(identity),
           agentRuns: sources.filter((source) => this.saved.agentRuns?.includes(source.sessionId)).map(identity),
-          prompted: sources.filter((source) => this.saved.prompted?.includes(source.sessionId)).map(identity),
+          prompted: sources
+            .filter(
+              (source) =>
+                this.saved.prompted?.includes(source.sessionId) || this.pendingPrompted().has(source.sessionId),
+            )
+            .map(identity),
         },
         capturedAt: Date.now(),
         ...(this.diagnostics.enabled()
@@ -9359,6 +9370,7 @@ export class PanelProvider implements vscode.Disposable {
     const submittedPrompts = this.saved.submittedPrompts;
     const agentRuns = this.saved.agentRuns;
     const prompted = this.saved.prompted;
+    const promptedPending = this.saved.promptedPending;
     const initialNames = this.saved.initialNames;
     this.preferenceResetRevision = (this.preferenceResetRevision ?? 0) + 1;
     for (const waiter of this.filterReady ?? []) {
@@ -9385,6 +9397,7 @@ export class PanelProvider implements vscode.Disposable {
     this.saved.started = [...this.startedHere].slice(-SESSION_LIMIT);
     this.saved.agentRuns = agentRuns;
     this.saved.prompted = prompted;
+    this.saved.promptedPending = promptedPending;
     this.saved.initialNames = initialNames;
     this.saved.assets = normalizePromptAssetBook(this.assets);
     // Waiting submissions are user-authored content, like the draft and its files above.
@@ -10458,7 +10471,7 @@ export class PanelProvider implements vscode.Disposable {
         return;
       }
       const discovered = await this.prepareClaudeChildren(generation, controller.signal);
-      // An incomplete reply lists the accepted sessions, and adds a session this panel started once its source qualifies.
+      // An incomplete reply lists the accepted sessions, and adds a session once its source qualifies.
       const accepted = new Set((this.authoritativeCatalog ?? []).map((session) => session.file));
       const listed = this.catalog?.sessions ?? [];
       refresh =
@@ -10482,7 +10495,7 @@ export class PanelProvider implements vscode.Disposable {
       this.performanceCounters.recordRefresh('discovery-continuation', performance.now() - started);
       if (owned && refresh) {
         // The follow-up refresh runs before a waiting request. It accepts a complete reply before any further request, and it
-        // sends the next request itself after a reply that added a started session.
+        // sends the next request itself after a reply that added a qualified session.
         this.refreshFrom('dispatch-discovery', false, true);
       } else if (owned) {
         this.runPendingRefresh();
@@ -12909,13 +12922,12 @@ export class PanelProvider implements vscode.Disposable {
       this.publishSessionQueryContext();
       this.discoveryComplete = undefined;
       this.checkpointDerivedCache();
-      // Published rows stay the accepted ones while discovery continues. Before a first accepted catalog, the
+      // Qualified walked sources join accepted rows while discovery continues. Before a first accepted catalog, the
       // walked rows stay held, so the refresh that sends the next continuation reuses them instead of walking again.
       if (this.catalog) {
         const accepted = this.authoritativeCatalog;
-        // A session this panel started joins the accepted rows once its own source qualifies, so its name and recorded
-        // responses replace the temporary ones without waiting for unrelated discovery.
-        const started = accepted ? this.startedSources(this.catalog.sessions, accepted) : [];
+        // New sessions take their names and recorded responses without waiting for unrelated discovery.
+        const started = accepted ? this.qualifiedPendingSources(this.catalog.sessions, accepted) : [];
         this.catalog = {
           ...this.catalog,
           sessions: started.length ? [...accepted!, ...started] : (accepted ?? this.catalog.sessions),
@@ -12930,6 +12942,7 @@ export class PanelProvider implements vscode.Disposable {
     this.dispatchSpendPending = progress.continuation && progress.membershipSettled === true;
     this.applyDispatchFacts(progress.dispatchFacts ?? []);
     this.claudeChildren = progress.children;
+    this.settlePromptedPending();
     this.claudeChildrenDiscovered = true;
     const currentFiles = new Set(progress.referenceEntries.map(([file]) => file));
     for (const file of this.claudeChildReferenceEntries.keys())
@@ -13088,26 +13101,25 @@ export class PanelProvider implements vscode.Disposable {
     return this.dispatchFiguresRevision !== revision;
   }
 
-  // Walked sources of sessions this panel started and still awaits. Each is the only walked source of its session ID, a member
-  // of the walk without a collision, with a supported file identity, and inside repository scope. A later complete discovery
-  // reply either lists such a source among its roots or asks for another pass.
-  private startedSources(walked: readonly SessionFile[], accepted: readonly SessionFile[]): SessionFile[] {
-    const started: SessionFile[] = [];
-    for (const pending of Object.values(this.awaitingSessionRecords)) {
-      const source = walked.find((one) => one.sessionId === pending.sessionId);
-      if (
-        source &&
+  // Each new source must have one walked identity, enumerated membership, repository scope, and no accepted ID.
+  // An awaiting session also requires its expected provider. Child transcripts wait for complete discovery.
+  private qualifiedPendingSources(walked: readonly SessionFile[], accepted: readonly SessionFile[]): SessionFile[] {
+    const acceptedIds = new Set(accepted.map((source) => source.sessionId));
+    const counts = new Map<string, number>();
+    for (const source of walked) counts.set(source.sessionId, (counts.get(source.sessionId) ?? 0) + 1);
+    return walked.filter((source) => {
+      const pending = this.awaitingSessionRecords[source.sessionId];
+      return (
         source.childTranscript !== true &&
         supportedFileIdentity(source) &&
         (!source.cwd || isInside(source.cwd, this.repositoryScopeRoots)) &&
         !this.enumeratedAmbiguousIds?.has(source.sessionId) &&
         this.enumeratedMembers?.has(sessionCoverageMember(source)) &&
-        pendingResponseSessionAdmitted(pending, walked) &&
-        !accepted.some((one) => one.sessionId === source.sessionId)
-      )
-        started.push(source);
-    }
-    return started;
+        counts.get(source.sessionId) === 1 &&
+        (!pending || pending.agent === source.agent) &&
+        !acceptedIds.has(source.sessionId)
+      );
+    });
   }
 
   private acceptSessionCoverage(current: SessionFile[], scope: string): SessionFile[] {
@@ -13999,7 +14011,11 @@ export class PanelProvider implements vscode.Disposable {
   // Apply reader-started and parent ownership to cached agent-run classification without changing the shared metadata fact.
   // A child transcript stays an agent run. A session the reader prompted from the Prompt box is the reader's own.
   private agentRunFor(session: SessionFile, edges: ReadonlyMap<string, SessionParentEdge>): boolean | null {
-    if (session.childTranscript !== true && this.saved.prompted?.includes(session.sessionId)) return false;
+    if (
+      session.childTranscript !== true &&
+      (this.saved.prompted?.includes(session.sessionId) || this.pendingPrompted().has(session.sessionId))
+    )
+      return false;
     if (this.saved.agentRuns?.includes(session.sessionId)) return true;
     const edge = edges.get(session.sessionId);
     const dispatched = edge?.relation === 'dispatched';
@@ -14015,9 +14031,7 @@ export class PanelProvider implements vscode.Disposable {
         meta.agentRunScan?.end !== session.size)
         ? null
         : meta.agentRun;
-    const facts = dispatched ? this.dispatchFacts.get(session.sessionId) : undefined;
-    // An unowned dispatch whose person scan has not reached the end of its file can still turn out reader-owned.
-    const readerOwned = edge?.owned === true || facts?.person === true ? true : facts?.personPending ? null : false;
+    const readerOwned = this.dispatchReaderOwned(session.sessionId, edge);
     return agentRunAnswer(
       guessed,
       session.sessionId,
@@ -14026,6 +14040,38 @@ export class PanelProvider implements vscode.Disposable {
       dispatched ? true : this.dispatchDiscoveryPending ? null : false,
       dispatched && readerOwned,
     );
+  }
+
+  // Absent or unfinished person facts leave dispatch ownership unknown unless explicit reader evidence exists.
+  private dispatchReaderOwned(session: string, edge: SessionParentEdge | undefined): boolean | null {
+    const facts = edge?.relation === 'dispatched' ? this.dispatchFacts.get(session) : undefined;
+    return edge?.owned === true || facts?.person === true ? true : !facts || facts.personPending ? null : false;
+  }
+
+  private pendingPrompted(): ReadonlySet<string> {
+    const source = this.saved.promptedPending;
+    if (!this.promptedPendingMembership || this.promptedPendingMembership.source !== source)
+      this.promptedPendingMembership = { source, ids: new Set(source) };
+    return this.promptedPendingMembership.ids;
+  }
+
+  // No edge leaves provisional ownership intact, including after complete relationship coverage.
+  private settlePromptedPending(): void {
+    if (!this.saved.promptedPending?.length) return;
+    const edges = this.sessionParentsOf();
+    const pending: string[] = [];
+    const promoted: string[] = [];
+    for (const session of this.saved.promptedPending) {
+      const edge = edges.get(session);
+      const owned = edge?.relation === 'dispatched' ? this.dispatchReaderOwned(session, edge) : null;
+      if (owned === null) pending.push(session);
+      else if (!owned) promoted.push(session);
+    }
+    if (pending.length === this.saved.promptedPending.length) return;
+    this.saved.promptedPending = pending;
+    if (promoted.length)
+      this.saved.prompted = [...new Set([...(this.saved.prompted ?? []), ...promoted])].slice(-SESSION_LIMIT);
+    void this.persistHostState().catch(() => {});
   }
 
   // The tail outcome with the open children the lifetime facts and the parsed window hold.
@@ -16958,6 +17004,7 @@ export class PanelProvider implements vscode.Disposable {
       started: current.started,
       agentRuns: current.agentRuns,
       prompted: current.prompted,
+      promptedPending: current.promptedPending,
       initialNames: current.initialNames,
       labels: current.labels,
       readerParents: current.readerParents,
@@ -16990,6 +17037,7 @@ export class PanelProvider implements vscode.Disposable {
               started: current.started,
               agentRuns: current.agentRuns,
               prompted: current.prompted,
+              promptedPending: current.promptedPending,
               initialNames: current.initialNames,
               labels: current.labels,
               readerParents: current.readerParents,

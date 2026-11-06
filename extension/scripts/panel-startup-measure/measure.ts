@@ -15,6 +15,14 @@ import {
   linkTree,
   soakMeasures,
   startDispatch,
+  seedDispatch,
+  instrumentMatchedWork,
+  matchedReadiness,
+  missingMatchedEvidence,
+  type DispatchSimulation,
+  type MatchedEvidence,
+  type MatchedObservation,
+  type MatchedTurn,
   type HostMemory,
 } from './soak';
 import {
@@ -64,6 +72,8 @@ let selectionRequested = false;
 let responseRequested = false;
 let expectedSelection: { session: string; key?: string; prompt?: string; summary?: string } | null = null;
 let soakRequested = false;
+let existingRolloutRequested = false;
+let seededDispatch: DispatchSimulation | null = null;
 // A warm-up hold reads its measures through the soak overlay.
 let warmUntilRequested = false;
 // The variables that the isolated editor driver keeps from the editor, loaded at startup.
@@ -90,6 +100,14 @@ function isolatedEnvironment(run: string = MEASUREMENT_RUN): NodeJS.ProcessEnv {
     ARC_MEASURE_RUN: run,
     ...(selectionRequested ? { ARC_MEASURE_TRACE: path.join(SCRATCH, 'selection-trace') } : {}),
     ...(soakRequested || warmUntilRequested ? { ARC_MEASURE_SOAK: SOAK } : {}),
+    ...(existingRolloutRequested && seededDispatch
+      ? {
+          ARC_MEASURE_MATCHED: JSON.stringify({
+            ...seededDispatch,
+            parentId: path.basename(seededDispatch.parent, '.jsonl'),
+          }),
+        }
+      : {}),
   };
 }
 const WARM_USER_DATA = path.join(SCRATCH, 'warm-user-data');
@@ -113,6 +131,7 @@ export interface Options {
   buildCache: string | null;
   countCompressed: string | null;
   minimumFreeGb: number;
+  existingRollout: boolean;
 }
 
 export interface WarmCondition {
@@ -180,10 +199,15 @@ export function readOptions(argv: string[]): Options {
     countCompressed: null,
     // 1.5 times the largest extension host peak working set that saved measurements record.
     minimumFreeGb: 5.4,
+    existingRollout: false,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const flag = argv[i];
     const value = argv[i + 1];
+    if (flag === '--existing-rollout') {
+      options.existingRollout = true;
+      continue;
+    }
     if (flag === '--warm-up') {
       options.warmUp = true;
       continue;
@@ -240,6 +264,7 @@ export function readOptions(argv: string[]): Options {
   if (!Number.isFinite(options.minimumFreeGb) || options.minimumFreeGb < 0)
     stop('--min-free-gb takes a number of gigabytes.');
   if (options.soakMinutes > 0 && options.selection) stop('--soak runs without --selection and --response.');
+  if (options.existingRollout && options.soakMinutes <= 0) stop('--existing-rollout requires --soak.');
   return options;
 }
 
@@ -390,6 +415,13 @@ function seedProfile(): void {
     linkTree(fixture.projects, SOAK_PROJECTS);
     linkTree(fixture.codex, SOAK_CODEX);
     fs.mkdirSync(SOAK, { recursive: true });
+    if (existingRolloutRequested)
+      seededDispatch = seedDispatch(
+        SOAK_PROJECTS,
+        SOAK_CODEX,
+        fixture.workspace,
+        Math.trunc(fs.statSync(fixture.state).mtimeMs) + 60_000,
+      );
   }
   if (warmUntilRequested) fs.mkdirSync(SOAK, { recursive: true });
   for (const profile of [USER_DATA, WARM_USER_DATA]) {
@@ -1163,14 +1195,57 @@ async function soak(minutes: number, launch: Launch): Promise<{ complete: boolea
     snapshots.push({ name, at: new Date().toISOString(), measures: snapshot ? soakMeasures(snapshot) : null });
     return snapshot;
   };
-  const first = await take('000-start');
-  const simulation = startDispatch(SOAK_PROJECTS, SOAK_CODEX, fixture.workspace);
+  let first = await take('000-start');
+  const observation = (snapshot: Record<string, unknown> | null) =>
+    (snapshot?.matchedWork as MatchedObservation | null | undefined) ?? null;
+  if (existingRolloutRequested) {
+    const deadline = Date.now() + 120_000;
+    let index = 0;
+    while (
+      matchedReadiness(observation(first), seededDispatch!.childId, expectedSelection?.session).length &&
+      Date.now() < deadline &&
+      launch.failure === null
+    ) {
+      await delay(Math.min(1000, Math.max(0, deadline - Date.now())));
+      first = await take(`ready-${++index}`);
+    }
+    const missing = matchedReadiness(observation(first), seededDispatch!.childId, expectedSelection?.session);
+    if (missing.length) return { complete: false, note: `Existing rollout readiness lacks ${missing.join(', ')}.` };
+  }
+  const simulation = seededDispatch ?? startDispatch(SOAK_PROJECTS, SOAK_CODEX, fixture.workspace);
+  const seed = {
+    parentSha256: existingRolloutRequested
+      ? createHash('sha256').update(fs.readFileSync(simulation.parent)).digest('hex')
+      : '',
+    childSha256: existingRolloutRequested
+      ? createHash('sha256').update(fs.readFileSync(simulation.child)).digest('hex')
+      : '',
+  };
+  const physical = existingRolloutRequested
+    ? Object.fromEntries(
+        [simulation.parent, simulation.child].map((file) => {
+          const stat = fs.statSync(file);
+          return [file, { dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs }];
+        }),
+      )
+    : null;
+  const turns: MatchedTurn[] = [];
   const start = Date.now();
   const end = start + minutes * 60_000;
   const appender = (async () => {
     for (let turn = 1; turn <= scheduledAppends(minutes) && launch.failure === null; turn++) {
       await delay(Math.max(0, start + turn * CHILD_TURN_MS - Date.now()));
       appendDispatchTurn(simulation, fixture.workspace);
+      if (existingRolloutRequested) {
+        const stat = fs.statSync(simulation.child);
+        turns.push({
+          turn,
+          size: stat.size,
+          mtimeMs: stat.mtimeMs,
+          activity: simulation.seedClock! + (turn + simulation.initialTurns!) * CHILD_TURN_MS + 6,
+          sha256: createHash('sha256').update(fs.readFileSync(simulation.child)).digest('hex'),
+        });
+      }
     }
   })();
   for (let minute = 1; start + minute * 60_000 < end && launch.failure === null; minute++) {
@@ -1182,16 +1257,30 @@ async function soak(minutes: number, launch: Launch): Promise<{ complete: boolea
   const last = await take('999-end');
   const startMeasures = first ? soakMeasures(first) : null;
   const endMeasures = last ? soakMeasures(last) : null;
+  const matched: MatchedEvidence | undefined = existingRolloutRequested
+    ? {
+        ready: observation(first),
+        end: observation(last),
+        turns,
+        childId: simulation.childId,
+        parentId: path.basename(simulation.parent, '.jsonl'),
+        seed,
+      }
+    : undefined;
   runRecord.soak = {
     minutes,
     snapshots,
     start: startMeasures,
     end: endMeasures,
+    ...(matched ? { mode: 'existing-rollout', matched } : {}),
     dispatch: {
       childId: simulation.childId,
       appends: simulation.appends,
       scheduled: scheduledAppends(minutes),
       bytes: simulation.bytes,
+      ...(matched
+        ? { parent: simulation.parent, child: simulation.child, seedClock: simulation.seedClock, seed, physical }
+        : {}),
     },
     limits: [
       'The dispatched child is a synthetic Codex rollout that a synthetic Claude parent names. No agent process runs, and no dispatch receipt exists.',
@@ -1208,6 +1297,10 @@ async function soak(minutes: number, launch: Launch): Promise<{ complete: boolea
       complete: false,
       note: `The soak appended ${simulation.appends} of ${scheduledAppends(minutes)} scheduled child turns.`,
     };
+  if (matched) {
+    const missing = missingMatchedEvidence(matched, scheduledAppends(minutes));
+    if (missing.length) return { complete: false, note: `Existing rollout evidence lacks ${missing.join(', ')}.` };
+  }
   return { complete: true, note: null };
 }
 
@@ -1348,6 +1441,8 @@ export interface BuildKey {
   selection: boolean;
   response: boolean;
   snapshots: boolean;
+  existingRollout: boolean;
+  overlays: string;
 }
 
 export interface Build {
@@ -1373,12 +1468,22 @@ export function cachedBuild(directory: string, key: BuildKey): Build | null {
 }
 
 // The build key of a run: its source commit and the overlays its options add.
-export function buildKeyOf(options: Options, source: string): BuildKey {
+export function buildKeyOf(
+  options: Options,
+  source: string,
+  readOverlay: (file: string) => Buffer = fs.readFileSync,
+): BuildKey {
   return {
     source,
     selection: options.selection,
     response: options.response,
     snapshots: options.soakMinutes > 0 || options.warmUntil.length > 0,
+    existingRollout: options.existingRollout,
+    overlays: createHash('sha256')
+      .update(readOverlay(__filename))
+      .update(readOverlay(path.join(__dirname, 'soak.ts')))
+      .update(readOverlay(path.join(__dirname, 'selection.ts')))
+      .digest('hex'),
   };
 }
 
@@ -1719,6 +1824,13 @@ async function loadScrubbedVariables(): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  if (process.argv.includes('--help')) {
+    process.stdout.write(
+      'Usage: measure.ts --fixture <manifest> [--commit <revision>] [--warm-up] [--soak <minutes>] [--existing-rollout] [--timeout <seconds>] [--min-free-gb <GB>] [--build-cache <directory>] [--keep]\nExisting rollout seeds a private prompted child before warm-up and startup. Missing completed-work evidence is inconclusive.\n',
+    );
+    fs.rmdirSync(SCRATCH);
+    return;
+  }
   const options = readOptions(process.argv.slice(2));
   if (options.countCompressed) {
     const root = path.dirname(fs.realpathSync(options.countCompressed));
@@ -1735,6 +1847,7 @@ async function main(): Promise<void> {
   }
   selectionRequested = options.selection;
   soakRequested = options.soakMinutes > 0;
+  existingRolloutRequested = options.existingRollout;
   responseRequested = options.response;
   warmUntilRequested = options.warmUntil.length > 0;
   await loadScrubbedVariables();
@@ -1757,6 +1870,7 @@ async function main(): Promise<void> {
       if (selectionRequested) instrumentSelection(tree);
       if (responseRequested) instrumentResponse(tree);
       if (key.snapshots) instrumentSoak(tree);
+      if (key.existingRollout) instrumentMatchedWork(tree);
       npm(['run', 'build'], path.join(tree, 'extension'));
       npm(['run', 'package'], path.join(tree, 'extension'));
       const bundle = fs.readFileSync(path.join(tree, 'extension', 'dist', 'extension.js'));
@@ -1799,6 +1913,8 @@ async function main(): Promise<void> {
             }
           : {}),
         warmUp: options.warmUp,
+        existingRollout: options.existingRollout,
+        buildKey: key,
         warmUntil: options.warmUntil,
         buildCache: options.buildCache,
         route: 'created',

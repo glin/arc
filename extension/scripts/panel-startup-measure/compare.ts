@@ -5,7 +5,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { arcHome } from '../../src/store.ts';
-import { REQUIRED_DISCOVERY_MEASURES } from './soak';
+import { REQUIRED_DISCOVERY_MEASURES, missingMatchedEvidence, unmatchedWork, type MatchedEvidence } from './soak';
 
 // A candidate regresses when its value exceeds the baseline by this ratio and by the floor of its kind.
 export const MARGINS = { time: 1.5, count: 1.5, bytes: 1.5, memory: 1.25 } as const;
@@ -43,7 +43,12 @@ interface RunResult {
   note?: string | null;
   startupRecord?: { stages?: Record<string, number> } | null;
   memory?: { peakWorkingSetBytes?: number | null; sampledMaximumWorkingSetBytes?: number | null };
-  soak?: { end?: Record<string, number> | null };
+  soak?: {
+    end?: Record<string, number> | null;
+    mode?: string;
+    matched?: MatchedEvidence;
+    dispatch?: { scheduled: number };
+  };
   // The snapshot that the runner takes after a `--warm-until` hold ends.
   warmUp?: { hold?: { snapshot?: Record<string, number> | null } | null } | null;
   // The measures the runner computes from files after the editor exits.
@@ -367,6 +372,12 @@ export interface ComparisonDependencies {
 
 // Run one comparison from its command line arguments, and answer the exit status.
 export async function runComparison(args: string[], dependencies: ComparisonDependencies = {}): Promise<number> {
+  if (args.includes('--help')) {
+    process.stdout.write(
+      'Usage: compare.ts --fixture <manifest> --baseline <revision> --candidate <revision> [--existing-rollout] [--repeat <count>] [--soak <minutes>] [--timeout <seconds>] [--output <directory>] [--keep]\nDefaults: new session, 10 minute soak, 900 second startup timeout. Existing rollout requires matched readiness and completed work in both builds.\n',
+    );
+    return 0;
+  }
   const value = (flag: string) => {
     const index = args.indexOf(flag);
     return index >= 0 ? args[index + 1] : undefined;
@@ -426,7 +437,8 @@ export async function runComparison(args: string[], dependencies: ComparisonDepe
           timeout,
           '--build-cache',
           buildDirectory,
-          ...(side === 'candidate' ? warmUntil : []),
+          ...(args.includes('--existing-rollout') ? ['--existing-rollout'] : []),
+          ...(side === 'candidate' || args.includes('--existing-rollout') ? warmUntil : []),
           ...(args.includes('--keep') ? ['--keep'] : []),
         ],
         path.join(output, `${side}${suffix}.log`),
@@ -451,11 +463,38 @@ export async function runComparison(args: string[], dependencies: ComparisonDepe
     baseline: missingMeasures(baselineResults, {}, margins),
     candidate: missingMeasures(candidateResults, bounds, margins),
   };
+  const matchedMode =
+    args.includes('--existing-rollout') ||
+    [...baselineResults, ...candidateResults].some((result) => result.soak?.mode === 'existing-rollout');
+  const matchedMissing: string[] = [];
+  if (matchedMode) {
+    for (const [side, runs] of [
+      ['baseline', baselineResults],
+      ['candidate', candidateResults],
+    ] as const)
+      for (const [index, result] of runs.entries()) {
+        if (result.soak?.mode !== 'existing-rollout')
+          matchedMissing.push(`${side} ${index + 1}: existing rollout mode`);
+        matchedMissing.push(
+          ...missingMatchedEvidence(result.soak?.matched, result.soak?.dispatch?.scheduled ?? 19).map(
+            (name) => `${side} ${index + 1}: ${name}`,
+          ),
+        );
+      }
+    if (baselineResults.length !== candidateResults.length) matchedMissing.push('paired repetitions');
+    for (let index = 0; index < Math.max(baselineResults.length, candidateResults.length); index++)
+      matchedMissing.push(
+        ...unmatchedWork(baselineResults[index]?.soak?.matched, candidateResults[index]?.soak?.matched).map(
+          (name) => `pair ${index + 1}: ${name}`,
+        ),
+      );
+  }
   // A repetition that fails or times out leaves the comparison incomplete.
   const complete =
     [...baselineResults, ...candidateResults].every((result) => result.complete === true) &&
     !missing.baseline.length &&
-    !missing.candidate.length;
+    !missing.candidate.length &&
+    !matchedMissing.length;
   const regressions = measures.filter((m) => m.regressed).map((m) => m.name);
   const table = markdownTable(measures, baselineLabel, candidateLabel);
   const sideReport = (label: string, runs: RunResult[]) => ({
@@ -479,6 +518,7 @@ export async function runComparison(args: string[], dependencies: ComparisonDepe
       measureMargins: margins,
       measures,
       missing,
+      ...(matchedMode ? { mode: 'existing-rollout', matchedMissing } : {}),
       regressions,
       complete,
     },

@@ -462,7 +462,7 @@ export type MetadataGenerations = Readonly<Record<AgentKind, number>>;
 // The initial metadata budget, `INITIAL_RAIL_READ_BYTES`, spreads large workspace rebuilds across refreshes.
 // Targeted invalidation avoids a full rebuild when affected entries are identifiable at load.
 // Codex opening rows use `CODEX_META_VERSION` from codexopenings.ts and survive these generation changes.
-export const METADATA_GENERATIONS: MetadataGenerations = { claude: 71, codex: 72 };
+export const METADATA_GENERATIONS: MetadataGenerations = { claude: 71, codex: 73 };
 
 // The agent generations that each shared `metadataVersion` of `derived-session-cache-v1.json` matches.
 // Shared version 71 changed only Codex pricing, so Claude entries of version 70 match Claude generation 71.
