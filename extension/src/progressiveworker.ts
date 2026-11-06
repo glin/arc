@@ -300,6 +300,8 @@ export interface DiscoveryCharges extends Record<import('./codex').CodexDispatch
   dispatchSpendPasses?: number;
   dispatchSpendOnlyPasses?: number;
   dispatchSpendSettledSkips?: number;
+  // Each root that a spend-only pass returns with its held facts and no visit, because the pass spent its spend slice first.
+  dispatchSpendHeldRoots?: number;
   // Each finished source that a discovery epoch reads again. A changed source moved its size, time or identity. A metadata
   // rescan kept them and moved only its change time or its saved evidence.
   transcriptRescans?: number;

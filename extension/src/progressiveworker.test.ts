@@ -13088,6 +13088,106 @@ for (const [budgetKiB, unfinishedWork] of [
     }
   });
 
+// A frozen clock holds the slice still, so a 64 KiB budget ends each pass inside the first root that reads.
+test('a spend-only pass ends at its first root wait, returns the later roots with their held facts, and the next pass starts at the next root', async () => {
+  const directory = tempDir('spend-only-held-roots-');
+  const parentFile = path.join(directory, 'parent.jsonl');
+  const now = Date.now() + 7_200_000;
+  const rootIds = Array.from({ length: 4 }, (_, index) => `${index}ccccccc-4444-4444-4444-444444444444`);
+  fs.writeFileSync(
+    parentFile,
+    rootIds
+      .flatMap((sessionId, index) =>
+        claudeDispatchTranscript(
+          'python child.py --arc-dispatch',
+          `ARC_DISPATCH_SESSION={"agent":"codex","session_id":"${sessionId}","owned":true}`,
+          `dispatch-${index}`,
+        ),
+      )
+      .map((record) => JSON.stringify(record) + '\n')
+      .join(''),
+  );
+  const record = (type: string, payload: object) => JSON.stringify({ type, timestamp: timestamp(1), payload }) + '\n';
+  // Each root of about 330 KB needs several 64 KiB slices.
+  for (const rootId of rootIds)
+    fs.writeFileSync(
+      path.join(directory, rootId + '.jsonl'),
+      record('session_meta', { id: rootId, cwd: directory, source: 'exec' }) +
+        record('event_msg', { type: 'task_started', turn_id: 'work' }) +
+        record('turn_context', { turn_id: 'work', model: 'gpt-6.1-sol' }) +
+        record('event_msg', { type: 'user_message', message: 'work' }) +
+        Array.from({ length: 5 }, () => record('ignored', { text: 'x'.repeat(65500) })).join('') +
+        record('event_msg', { type: 'task_complete', turn_id: 'work' }),
+    );
+  const session = (sessionId: string, agent: 'claude' | 'codex') => {
+    const file = path.join(directory, sessionId + '.jsonl');
+    return { file, sessionId, agent, ...revisionOf(fs.statSync(file, { bigint: true })) };
+  };
+  const request = () => ({
+    kind: 'claude-children' as const,
+    parents: [session('parent', 'claude')],
+    catalog: [session('parent', 'claude'), ...rootIds.map((sessionId) => session(sessionId, 'codex'))],
+    codexChildren: [],
+    repositoryRoots: [directory],
+  });
+  const worker = new ProgressiveWorker(
+    `performance.now = () => 0; Date.now = () => ${now};` + dispatchWorkerSource(64),
+  );
+  const signal = new AbortController().signal;
+  const fullPass = async () => {
+    for (let pass = 0; pass < 8; pass++) {
+      const result = await worker.run(request(), 1, signal);
+      if (result?.value.kind === 'claude-children') return result.value;
+    }
+    throw new Error('discovery never returned a complete reply');
+  };
+  const spendPass = async () => {
+    const result = await worker.run({ ...request(), spendOnly: true }, 1, signal);
+    assert.ok(result?.value.kind === 'dispatch-spend' && result.value.held, 'a spend-only request ran discovery');
+    return result.value;
+  };
+  try {
+    const published = await fullPass();
+    assert.equal(published.membershipSettled, true);
+    assert.equal(published.continuation, true, 'a root settled in the first pass');
+    const before = new Map(published.dispatchFacts.map((facts) => [facts.sessionId, facts]));
+    const first = await spendPass();
+    assert.deepEqual(
+      {
+        visited: Object.keys(first.dispatchRoots),
+        visits: first.charges.dispatchSpendVisits,
+        held: first.charges.dispatchSpendHeldRoots,
+        continuation: first.continuation,
+      },
+      { visited: [rootIds[0]], visits: 1, held: rootIds.length - 1, continuation: true },
+      'the pass visited the roots behind its spent slice',
+    );
+    assert.deepEqual(
+      first.dispatchFacts.map((facts) => facts.sessionId),
+      rootIds,
+      'the reply left reference order',
+    );
+    for (const sessionId of rootIds.slice(1))
+      assert.deepEqual(
+        first.dispatchFacts.find((facts) => facts.sessionId === sessionId),
+        before.get(sessionId),
+        `held root ${sessionId} changed its facts`,
+      );
+    const second = await spendPass();
+    assert.deepEqual(
+      { visited: Object.keys(second.dispatchRoots), held: second.charges.dispatchSpendHeldRoots },
+      { visited: [rootIds[1]], held: rootIds.length - 1 },
+      'the next pass did not start at the next root',
+    );
+    const full = await fullPass();
+    assert.equal(full.charges!.dispatchSpendVisits, rootIds.length, 'a full pass did not visit every root');
+    assert.equal(full.charges!.dispatchSpendHeldRoots, 0);
+  } finally {
+    worker.stop();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('dispatched spend aggregates settle across passes beside a running Codex root and read each file once', async () => {
   const directory = tempDir('spend-aggregate-passes-');
   const parentFile = path.join(directory, 'parent.jsonl');

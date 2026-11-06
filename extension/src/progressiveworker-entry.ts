@@ -1772,6 +1772,7 @@ function emptyDiscoveryCharges(): DiscoveryCharges {
     dispatchSpendPasses: 0,
     dispatchSpendOnlyPasses: 0,
     dispatchSpendSettledSkips: 0,
+    dispatchSpendHeldRoots: 0,
     transcriptRescans: 0,
     transcriptRescansChanged: 0,
     transcriptRescansMetadata: 0,
@@ -1813,6 +1814,9 @@ function emptyDiscoveryCharges(): DiscoveryCharges {
   };
 }
 
+// The root where the next spend-only pass starts, so the spend slice rotates across passes.
+let nextDispatchSpendRoot: string | null = null;
+
 // Reads the spend and person facts of every admitted dispatched session. A pass that leaves any of that work unfinished
 // returns `continuation`. It changes no catalog member or relationship, so a spend-only request can run it alone.
 function collectDispatchFacts(
@@ -1831,10 +1835,33 @@ function collectDispatchFacts(
   let continuation = false;
   charges.dispatchSpendPasses!++;
   const dispatched: DispatchSessionFacts[] = [];
-  const seen = new Set<string>();
   const dispatchRoots: Record<string, DispatchRootCharges> = {};
   // Each request caps Codex spend reads independently of relationship discovery and of the other dispatch visits.
-  const dispatchBudget = { bytes: CODEX_DISPATCH_REQUEST_BYTES, ms: RELATIONSHIP_SLICE_MS };
+  const dispatchBudget: { bytes: number; ms: number; advanced?: boolean } = {
+    bytes: CODEX_DISPATCH_REQUEST_BYTES,
+    ms: RELATIONSHIP_SLICE_MS,
+  };
+  // The slice is spent when the budget refuses the next Codex spend read, which `readCodexDispatchedSpendQuantum` counts as
+  // a root wait.
+  const sliceSpent = () => dispatchBudget.bytes <= 0 || (dispatchBudget.advanced === true && dispatchBudget.ms <= 0);
+  // Each dispatched session counts once, at its first admitted reference.
+  const roots: (typeof admittedReferences)[number][] = [];
+  const seen = new Set<string>();
+  for (const reference of admittedReferences) {
+    if (reference.kind !== 'dispatch' || !reference.file || seen.has(reference.sessionId)) continue;
+    seen.add(reference.sessionId);
+    roots.push(reference);
+  }
+  // A spend-only pass starts at the first root that the previous spend-only pass reached after its slice was spent, so each
+  // pending root takes the slice in turn. A full pass starts at the first root.
+  const start = spendOnly
+    ? Math.max(
+        0,
+        roots.findIndex((reference) => reference.sessionId === nextDispatchSpendRoot),
+      )
+    : 0;
+  const order = start ? [...roots.slice(start), ...roots.slice(0, start)] : roots;
+  let reachedAfterSlice: string | null = null;
   const dispatchReads = openReadWindow();
   // The open root takes every read from the start of its visit to the start of the next root's visit.
   let openRoot: { root: DispatchRootCharges; before: number } | null = null;
@@ -1844,12 +1871,24 @@ function collectDispatchFacts(
   };
   try {
     const subagentMetas = claudeSubagentMetaReader();
-    for (const reference of admittedReferences) {
-      if (reference.kind !== 'dispatch' || !reference.file || seen.has(reference.sessionId)) {
-        continue;
-      }
+    for (const reference of order) {
+      if (reference.kind !== 'dispatch' || !reference.file) continue;
       closeRoot();
-      seen.add(reference.sessionId);
+      // Once a spend-only pass spends its slice, each later root with held facts returns them with no stat, spend tree or
+      // person check. A root whose file changed keeps its old facts until a later pass reaches it.
+      if (spendOnly && sliceSpent()) {
+        reachedAfterSlice ??= reference.sessionId;
+        const heldFacts = dispatchFacts.get(reference.file);
+        if (
+          heldFacts &&
+          heldFacts.sourceGeneration === claudeChildReferences.get(normalizeFsPath(reference.file))?.sourceGeneration
+        ) {
+          charges.dispatchSpendHeldRoots!++;
+          continuation ||= !heldFacts.settled;
+          dispatched.push(heldFacts.facts);
+          continue;
+        }
+      }
       const revision = revisionOf(reference.file);
       const heldValue = revision ? (dispatchFacts.get(reference.file) ?? seededDispatch(reference.file)) : undefined;
       const sourceGeneration = claudeChildReferences.get(normalizeFsPath(reference.file))?.sourceGeneration;
@@ -2131,12 +2170,18 @@ function collectDispatchFacts(
       });
       dispatched.push(facts);
     }
+    if (spendOnly) nextDispatchSpendRoot = reachedAfterSlice ?? order[0]?.sessionId ?? null;
   } finally {
     closeRoot();
     const dispatchTally = closeReadWindow(dispatchReads);
     charges.dispatchSpendFiles += dispatchTally.files;
     charges.dispatchSpendBytes += dispatchTally.bytes;
     charges.dispatchSpendMs += dispatchTally.ms;
+  }
+  // A rotated pass returns its facts in reference order.
+  if (start) {
+    const position = new Map(roots.map((reference, index) => [reference.sessionId, index]));
+    dispatched.sort((left, right) => (position.get(left.sessionId) ?? 0) - (position.get(right.sessionId) ?? 0));
   }
   const currentFiles = new Set(
     references.flatMap((reference) => (reference.kind === 'dispatch' && reference.file ? [reference.file] : [])),
