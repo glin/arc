@@ -173,7 +173,9 @@ async function usageCrop(page: Page, file: string): Promise<void> {
   const detail = await page.locator('#usagepop').boundingBox();
   if (!bar || !figures || !detail) throw new Error('The usage bar is not visible.');
   const left = Math.max(0, Math.floor(Math.min(bar.x, detail.x) - 2));
-  const top = Math.floor(detail.y);
+  // Hide the page content so a crop that starts above the border keeps the whole top border and corners without page text.
+  await page.addStyleTag({ content: '#list, #rail, #composer { visibility: hidden !important; }' });
+  const top = Math.max(0, Math.floor(detail.y) - 3);
   await writeLosslessWebp(page, file, {
     clip: {
       x: left,

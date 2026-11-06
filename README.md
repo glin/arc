@@ -63,25 +63,25 @@ Full file diffs for Claude need the optional [Claude hooks](#claude-hooks).
 
 ## Cost on every turn
 
-Every turn shows its estimated cost. Open it to see the main agent and each subagent separately.
+Every turn shows its estimated cost. Open it to see the main agent and delegated work separately, each with its cost, models and cache reuse.
 
-<a href="docs/images/readme-cost.webp"><img src="docs/images/readme-cost.webp" alt="Cost details for Claude Opus 5.5 and a Sonnet 5.5 subagent" width="480"></a>
+<a href="docs/images/readme-cost.webp"><img src="docs/images/readme-cost.webp" alt="Cost details with a cache expiry warning, a split bar of main agent and delegated cost, and Main agent and Delegated sections for Opus 5.5 and a Sonnet 5.5 subagent" width="520"></a>
 
 Above the prompt box, Arc shows the next turn's starting price with a warm or cold cache, and the remaining cache time.
 
 <a href="docs/images/readme-next-turn.webp"><img src="docs/images/readme-next-turn.webp" alt="Cached and uncached next-turn prices with cache time above the prompt box" width="540"></a>
 
-When a cache expires between turns, the cost detail shows the extra cost of resending the context.
+When a cache expires between turns, the cache expiry detail shows how long the gap was and the cost it added.
 
-<a href="docs/images/readme-cache-expiry.webp"><img src="docs/images/readme-cache-expiry.webp" alt="Extra cost of resending context after cache expiry" width="541"></a>
+<a href="docs/images/readme-cache-expiry.webp"><img src="docs/images/readme-cache-expiry.webp" alt="Cache expiry detail with the affected requests, cache lifetimes, cost added, and longest qualifying gap" width="541"></a>
 
 Arc warns when a session reuses little of its cache.
 
-<a href="docs/images/readme-cache.webp"><img src="docs/images/readme-cache.webp" alt="Low cache reuse warning and cache costs" width="480"></a>
+<a href="docs/images/readme-cache.webp"><img src="docs/images/readme-cache.webp" alt="Low cache reuse warning above a Main agent section with its cache write, output, and input costs" width="520"></a>
 
 Project cost shows Claude and Codex totals for today, 7 days, and 30 days. The usage bar shows each agent's plan limits and reset times.
 
-<a href="docs/images/readme-project-cost.webp"><img src="docs/images/readme-project-cost.webp" alt="Project cost with estimated totals for Claude, Codex, and both agents over today, 7 days, and 30 days" width="340"></a> <a href="docs/images/readme-usage.webp"><img src="docs/images/readme-usage.webp" alt="Usage bar with Claude and Codex limits, open to each agent's plan, 5h and 7d use, and reset times" width="308"></a>
+<a href="docs/images/readme-project-cost.webp"><img src="docs/images/readme-project-cost.webp" alt="Project cost with estimated totals for Claude, Codex, and both agents over today, 7 days, and 30 days" width="340"></a> <a href="docs/images/readme-usage.webp"><img src="docs/images/readme-usage.webp" alt="Usage bar with Claude and Codex limits, open to each agent's plan, 5h and 7d use, and reset times" width="297"></a>
 
 Costs are estimates from published list prices for Claude and GPT models, direct or on Amazon Bedrock. They are not a subscription bill. [`arc cost`](docs/cli.md#read-a-cost-report) gives the same estimates from saved transcripts.
 
