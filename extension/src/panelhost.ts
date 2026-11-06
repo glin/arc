@@ -12181,6 +12181,8 @@ export class PanelProvider implements vscode.Disposable {
     const sources = this.sessionSpendSources ?? this.claudeSpendSources;
     if (this.projectSpendCostQueue === null) {
       this.projectSpendCostQueue = [];
+      // Each key's dependency count, from the first owner with that key, orders the queue.
+      const lengths = new Map<string, number>();
       for (const owner of sources.filter((source) => !source.dispatchedFrom && !source.dispatchedVia)) {
         const key = normalizeSpendFile(owner.file);
         const at = this.projectSpendFiles.findIndex((file) => file.file === key);
@@ -12188,6 +12190,7 @@ export class PanelProvider implements vscode.Disposable {
         const capture = (record?.parserState as ClaudeUsageReducerState | undefined)?.costState;
         if (!record || !capture?.snapshots.length) continue;
         const dependencies = claudeCostStateDependencies(owner, sources, this.projectSpendFiles);
+        if (!lengths.has(key)) lengths.set(key, dependencies?.length ?? 0);
         const identity = dependencies ? costStateIdentity(dependencies.map(costStateDependency)) : null;
         if (record.costStateSupplement?.identity !== identity && record.costStateSupplement) {
           const { costStateSupplement: _supplement, ...baseline } = record;
@@ -12205,15 +12208,7 @@ export class PanelProvider implements vscode.Disposable {
         )
           this.projectSpendCostQueue.push(key);
       }
-      this.projectSpendCostQueue.sort((left, right) => {
-        const length = (key: string) => {
-          const owner = sources.find(
-            (source) => !source.dispatchedFrom && !source.dispatchedVia && normalizeSpendFile(source.file) === key,
-          );
-          return owner ? (claudeCostStateDependencies(owner, sources, this.projectSpendFiles)?.length ?? 0) : 0;
-        };
-        return length(left) - length(right);
-      });
+      this.projectSpendCostQueue.sort((left, right) => (lengths.get(left) ?? 0) - (lengths.get(right) ?? 0));
     }
     const key = this.projectSpendCostQueue.shift();
     if (!key) return false;

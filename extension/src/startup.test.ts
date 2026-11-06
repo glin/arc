@@ -17158,6 +17158,51 @@ test('a rail post words the rail again when midnight moves a running start to ye
   }
 });
 
+test('the Claude cost-state queue reads each owner dependencies once and orders owners by dependency count', () => {
+  vi.useFakeTimers();
+  try {
+    const folder = tempDir('startup-cost-order-');
+    const counts: Record<string, number> = { a: 3, b: 1, c: 2, d: 1, e: 3 };
+    const file = (name: string) => path.join(folder, `${name}.jsonl`);
+    const sources = [
+      ...Object.keys(counts).map((name) => ({ sessionId: name, file: file(name), primary: true })),
+      { sessionId: 'f', file: file('f'), primary: true, dispatchedFrom: 'a' },
+    ];
+    const reads: string[] = [];
+    let order: string[] = [];
+    const provider = completeDiscoveryHarness(undefined, false, ['indexNextClaudeCostState'], {
+      normalizeSpendFile,
+      costStateDependency: (record: SpendFileIndex) => record.file,
+      costStateIdentity: (files: string[]) => files.join('|'),
+      claudeCostStateDependencies: (owner: { sessionId: string }) => {
+        reads.push(owner.sessionId);
+        return Array.from({ length: counts[owner.sessionId] }, (_, at) => ({ file: `${owner.sessionId}-${at}` }));
+      },
+      reconcileClaudeCostState: () => {
+        order = [...provider.projectSpendCostQueue];
+        return { invalidated: false, complete: false, progress: {} };
+      },
+    });
+    provider.projectSpendFiles = [...Object.keys(counts), 'f'].map((name) => ({
+      file: normalizeSpendFile(file(name)),
+      parserState: { costState: { snapshots: [{}] } },
+    }));
+    provider.projectSpendRevision = 0;
+    provider.projectSpendCostQueue = null;
+    provider.claudeSpendSources = sources;
+    provider.scheduleProjectSpendSave = vi.fn<() => void>();
+    provider.claudeChildrenDiscovered = true;
+    assert.equal(provider.indexNextClaudeCostState(), true);
+    // The first queued owner is read once more when its slice runs.
+    assert.deepEqual(reads, ['a', 'b', 'c', 'd', 'e', 'b']);
+    const sorted = ['b', 'd', 'c', 'a', 'e'].map((name) => normalizeSpendFile(file(name)));
+    assert.deepEqual(order, sorted.slice(1));
+    assert.deepEqual(provider.projectSpendCostQueue, sorted);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 test('background spend publishes Claude usage only after native children finish indexing', async () => {
   const folder = tempDir('startup-background-cost-');
   const parent = path.join(folder, 'parent.jsonl');
