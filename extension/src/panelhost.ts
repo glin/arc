@@ -648,6 +648,7 @@ import {
   CATALOG_REFRESH_DEADLINE_MS,
   CATALOG_WALK_DEADLINE_MS,
   mergeRefreshRequests,
+  settleWalkFold,
   listedFilesFor,
   PendingWatcherWake,
   PollDirectoryGate,
@@ -3755,6 +3756,7 @@ export class PanelProvider implements vscode.Disposable {
       const since = (time: number | null | undefined) => Date.now() - (time ?? 0) >= POLL_BACKSTOP_WALK_MS;
       if (
         !this.catalogWalkRunning &&
+        !this.codexPriming &&
         since(this.pollInFlight) &&
         since(this.catalogWalk?.startedAt) &&
         since(this.catalogWalkPendingAt)
@@ -3775,8 +3777,8 @@ export class PanelProvider implements vscode.Disposable {
       );
       this.performanceCounters.recordWork('pollDirectoryStats', gate.stats);
       if (!this.watching) return;
-      // A walk that runs lists every directory again, so a poll during it asks for no walk.
-      if (decision.kind === 'walk' && !this.catalogWalkRunning) {
+      // A walk or the cold pass lists every directory again, so a poll during either asks for no walk.
+      if (decision.kind === 'walk' && !this.catalogWalkRunning && !this.codexPriming) {
         this.refreshFrom(`poll:${decision.cause}`);
         return;
       }
@@ -9622,7 +9624,7 @@ export class PanelProvider implements vscode.Disposable {
           metadataAfterRender,
           changedPaths: this.targetedRefreshPaths,
         },
-        !!this.catalogWalkRunning,
+        !!this.catalogWalkRunning || !!this.codexPriming,
       );
       this.performanceCounters.recordRefreshStage('coalesced');
       // A merge of different requesters runs as `coalesced`, so each waiting request also counts under its own name.
@@ -9662,10 +9664,13 @@ export class PanelProvider implements vscode.Disposable {
         const controller = new AbortController();
         const cold = { controller, reads: coldReads };
         this.codexColdPass = cold;
+        // The poll compares directory times with the start of the pass, which walks the rollout tree.
+        this.catalogWalkPendingAt ??= Date.now();
         const priming = coldReads(controller.signal);
         if (this.codexColdPass === cold) {
           this.codexPriming = priming;
         }
+        let listed = false;
         try {
           const pass = await priming;
           // Mark cold-pass metadata for persistence because its reads precede the catalog's revision comparison.
@@ -9676,11 +9681,14 @@ export class PanelProvider implements vscode.Disposable {
             return;
           }
           primedEnumeration = pass.enumeration;
+          listed = coldRoot === codexSessionsRoot() && this.anyVisible();
         } finally {
           // A canceled pass already handed both fields to the refresh that replaces it.
           if (this.codexColdPass === cold) {
             this.codexColdPass = null;
             this.codexPriming = null;
+            // A pass that lists no catalog hands back the broad walk it folded, so the waiting request walks.
+            this.pendingRefresh = settleWalkFold(this.pendingRefresh, listed);
           }
         }
         if (!this.anyVisible()) {
@@ -12328,21 +12336,19 @@ export class PanelProvider implements vscode.Disposable {
       const holder = this.refreshController;
       if (holder?.signal === signal && (running.overdue || this.refreshOverdue)) this.claimCatalogRefresh(holder);
     }
-    if (enumeration === 'deadline') {
-      this.performanceCounters?.recordRefreshStage('walkDeadline');
-      return null;
-    }
-    if (
-      !enumeration ||
-      signal.aborted ||
-      generation !== this.refreshGeneration ||
-      !this.anyVisible() ||
-      codexSessionsRoot() !== root
-    ) {
-      return null;
-    }
+    if (enumeration === 'deadline') this.performanceCounters?.recordRefreshStage('walkDeadline');
+    const walked = enumeration === 'deadline' ? null : enumeration;
+    const listed =
+      !!walked &&
+      !signal.aborted &&
+      generation === this.refreshGeneration &&
+      this.anyVisible() &&
+      codexSessionsRoot() === root;
+    // A walk that ends without a catalog hands back the broad walk it folded, so the waiting request walks.
+    this.pendingRefresh = settleWalkFold(this.pendingRefresh, listed);
+    if (!listed) return null;
     // Scope resolves again after the walk. A scope that became unresolved lists nothing and discards the walk.
-    return this.allSessions(false, true, enumeration);
+    return this.allSessions(false, true, walked);
   }
 
   // Add the compressed rollouts that a walk listed or a wake batch named. A complete walk also removes every name it no

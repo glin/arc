@@ -270,6 +270,7 @@ import {
   CATALOG_REFRESH_DEADLINE_MS,
   CATALOG_WALK_DEADLINE_MS,
   mergeRefreshRequests,
+  settleWalkFold,
   PendingWatcherWake,
   PollDirectoryGate,
   POLL_BACKSTOP_WALK_MS,
@@ -2987,6 +2988,7 @@ function completeDiscoveryHarness(
     'startSessionHistory',
     'onlyGrew',
     'mergeRefreshRequests',
+    'settleWalkFold',
     'CATALOG_REFRESH_DEADLINE_MS',
     'CATALOG_WALK_DEADLINE_MS',
     'derivedTitleStats',
@@ -3035,6 +3037,7 @@ function completeDiscoveryHarness(
     startSessionHistory,
     onlyGrew,
     mergeRefreshRequests,
+    settleWalkFold,
     CATALOG_REFRESH_DEADLINE_MS,
     CATALOG_WALK_DEADLINE_MS,
     derivedTitleStats,
@@ -8512,6 +8515,85 @@ test('a walk past its own deadline is abandoned and counted, and the request beh
       () => provider.refreshController === null,
       'the request behind the stopped walk did not finish',
     );
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('a walk past its own deadline leaves the broad request behind it to walk, and the panel lists a session added during the walk', async () => {
+  vi.useFakeTimers(STREAM_TIMERS);
+  try {
+    const { provider, walks, files, writeRollout } = heldWalkHarness();
+    const first = writeRollout('first');
+    const accepted = provider.refresh(true);
+    await untilWalkSettles(() => walks.length === 1, 'the first refresh did not start its walk');
+    walks[0].release();
+    await accepted;
+    await untilWalkSettles(() => provider.refreshController === null, 'the first refresh did not finish');
+    assert.deepEqual(files(), [first]);
+    const refresh = provider.refresh(true);
+    await untilWalkSettles(() => walks.length === 2, 'the second refresh did not start its walk');
+    const added = writeRollout('added');
+    provider.refreshFrom('poll:directory');
+    await vi.advanceTimersByTimeAsync(CATALOG_WALK_DEADLINE_MS);
+    await untilWalkSettles(
+      () => walks.length === 3,
+      'the broad request that waited behind the stopped walk reused the old catalog',
+    );
+    walks[2].release();
+    await refresh;
+    await untilWalkSettles(
+      () => provider.refreshController === null && provider.pendingRefresh === null,
+      'the request behind the stopped walk did not finish',
+    );
+    assert.deepEqual(files(), [added, first].sort(), 'the panel did not list the session added during the walk');
+    walks[1].release();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('polls and broad requests during the cold pass request no walk, and the request behind the pass reuses its catalog', async () => {
+  vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+  try {
+    const { provider, root, walks, files, writeRollout } = heldWalkHarness(
+      { PollDirectoryGate, POLL_BACKSTOP_WALK_MS, sessionDirectoryOwners },
+      ['pollCatalog', 'pollDirectories'],
+    );
+    const file = writeRollout('first');
+    const held: (() => void)[] = [];
+    provider.codexColdReads = (signal: AbortSignal) =>
+      coldOpeningPass(provider.codexMetas, root, signal).then(
+        (pass) => new Promise((resolve) => held.push(() => resolve(pass))),
+      );
+    const work: string[] = [];
+    provider.performanceCounters.recordWork = (name: string) => work.push(name);
+    provider.watching = true;
+    provider.pollGate = new PollDirectoryGate(async () => ({ mtimeMs: 0, print: '0' }));
+    const refresh = provider.refresh(true);
+    await vi.waitFor(() => assert.equal(held.length, 1, 'the cold pass did not finish its walk'));
+    // The pass runs past the backstop interval, and a poll's stats hang past it too.
+    await vi.advanceTimersByTimeAsync(POLL_BACKSTOP_WALK_MS + 1);
+    await provider.pollCatalog();
+    provider.pollInFlight = Date.now() - POLL_BACKSTOP_WALK_MS - 1;
+    await provider.pollCatalog();
+    provider.pollInFlight = null;
+    provider.refreshFrom('createOrRename');
+    assert.deepEqual(
+      work.filter((name) => name.startsWith('coalesced:poll:')),
+      [],
+      'a poll during the cold pass asked for a walk',
+    );
+    held[0]();
+    await refresh;
+    await vi.waitFor(() =>
+      assert.ok(
+        provider.refreshController === null && provider.pendingRefresh === null,
+        'the request behind the cold pass did not finish',
+      ),
+    );
+    assert.deepEqual(files(), [file]);
+    assert.equal(walks.length, 0, 'the request that waited behind the cold pass walked the tree again');
   } finally {
     vi.useRealTimers();
   }

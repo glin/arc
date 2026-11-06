@@ -596,6 +596,8 @@ export interface RefreshRequest {
   metadataAfterRender: boolean;
   // Null or empty asks for the broad catalog walk unless the request reuses the held catalog.
   changedPaths: string[] | null;
+  // True when a running walk folded a broad walk into this request. `settleWalkFold` ends the fold when the walk ends.
+  walkFolded?: boolean;
 }
 
 // Folds a refresh request into the one that waits behind the refresh in flight. The result
@@ -611,9 +613,10 @@ export function mergeRefreshRequests(
 ): RefreshRequest {
   const requests = (pending ? [pending, next] : [next]).map((request) =>
     walkRunning && !request.reuseCatalog && !request.changedPaths?.length
-      ? { ...request, reuseCatalog: true }
+      ? { ...request, reuseCatalog: true, walkFolded: true }
       : request,
   );
+  const walkFolded = requests.some((request) => request.walkFolded);
   const reuseCatalog = requests.every((request) => request.reuseCatalog);
   const walking = requests.filter((request) => !request.reuseCatalog);
   const named = [...new Set(requests.flatMap((request) => request.changedPaths ?? []))];
@@ -625,7 +628,16 @@ export function mergeRefreshRequests(
     reuseCatalog,
     metadataAfterRender: requests.every((request) => request.metadataAfterRender),
     changedPaths,
+    ...(walkFolded ? { walkFolded } : {}),
   };
+}
+
+// Ends the fold of the walk that just ended. A walk that listed the catalog keeps the fold. A walk that ended without a
+// catalog hands the broad walk back, so the waiting request walks.
+export function settleWalkFold(pending: RefreshRequest | null, listed: boolean): RefreshRequest | null {
+  if (!pending?.walkFolded) return pending;
+  const { walkFolded: _folded, ...request } = pending;
+  return listed ? request : { ...request, reuseCatalog: false, changedPaths: null };
 }
 
 // Live child events that change no fact a file records. Their refresh names no file, so it revalidates only the held
