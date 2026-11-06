@@ -340,11 +340,11 @@ const changesTurn: Turn = turn({
     input: 6_000,
     cacheWrite1h: 175_000,
     cacheWrite5m: 0,
-    cacheRead: 680_000,
+    cacheRead: 728_000,
     output: 14_000,
     thinking: 0,
   },
-  contextTokens: 175_000,
+  contextTokens: 190_000,
   contextWindow: 1_000_000,
   toolUses: 22,
   toolCounts: { edits: 3, reads: 8, searches: 3, commands: 6, agents: 1, coordination: 1, web: 0, other: 0 },
@@ -401,12 +401,12 @@ const expiryUsage = {
   output: 2_300,
   thinking: 0,
 };
-// The main agent makes five requests. The first starts the subagent and rewrites the expired cache, which is the request the expiry evidence holds. The other four read the rewritten cache while the context grows from about 160k to 175k tokens.
+// The main agent makes five requests. The first starts the subagent and rewrites the expired cache, which is the request the expiry evidence holds. The other four read the rewritten cache while the context grows from about 160k to 190k tokens.
 const expiryTurnUsage = changesTurn.usage;
 const expiryTurn: Turn = {
   ...changesTurn,
   usage: expiryTurnUsage,
-  contextTokens: 175_000,
+  contextTokens: 190_000,
   outputRate: { output: 14_000, milliseconds: 140_000 },
 };
 // The cache expiry evidence reads the request that crossed the lifetime, which is the first request of a turn.
@@ -517,15 +517,15 @@ const cacheTurn: Turn = turn({
   prompt: 'Find why this long Arc test run spent so much on input. Show cache writes and reads.',
   summary:
     'This run recorded repeated cache writes with little reuse. The cost detail shows how much went to cache writes.',
-  model: 'openai.gpt-6-sol',
+  model: 'gpt-6.1-sol',
   outputRate: { output: 12_000, milliseconds: 480_000 },
-  provider: 'amazon-bedrock',
+  provider: 'openai',
   effort: 'medium',
   usage: { ...cacheUsage, byContextBand: { short: { ...cacheUsage } } },
   usageParts: [
     {
-      model: 'openai.gpt-6-sol',
-      provider: 'amazon-bedrock',
+      model: 'gpt-6.1-sol',
+      provider: 'openai',
       contextWindow: 258_400,
       contextBand: 'short',
       inferenceClass: null,
@@ -2141,8 +2141,8 @@ export function readmePayload(scene: (typeof README_SCENES)[number] = 'main'): R
     efforts: [{ value: 'high', label: 'High', description: '' }],
   };
   const codexModel = {
-    value: selected === cacheTurn ? 'openai.gpt-6-sol' : 'gpt-6-astra',
-    label: selected === cacheTurn ? 'GPT-6 Sol' : 'GPT-6 Astra',
+    value: selected === cacheTurn ? 'gpt-6.1-sol' : 'gpt-6-astra',
+    label: selected === cacheTurn ? 'GPT-6.1 Sol' : 'GPT-6 Astra',
     description: '',
     efforts: [{ value: 'high', label: 'High', description: '' }],
   };
