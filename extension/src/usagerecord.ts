@@ -16,6 +16,7 @@ const DAY_MS = 86_400_000;
 const FORMAT = 'arc-usage-gzip-v1\n';
 const MAX_STRING_LENGTH = 256;
 const MAX_LIMITS = 64;
+const METADATA_BYTES = 1024;
 
 export interface UsageSlotMetadata {
   v: 1;
@@ -345,14 +346,14 @@ export class UsageRecorder {
 
   private async metadata(file: string, slot: string, sizes: Map<string, number>): Promise<UsageSlotMetadata | null> {
     if (!sizes.has(`${slot}.json`)) return null;
-    if (sizes.get(`${slot}.json`)! > 1024) throw new Error('Oversized usage metadata');
+    if (sizes.get(`${slot}.json`)! > METADATA_BYTES) throw new Error('Oversized usage metadata');
     return checkedMetadata(JSON.parse(await this.filesystem.readFile(file, 'utf8')), slot);
   }
 
   private async publish(slot: string, value: UsageSlotMetadata, sizes: Map<string, number>): Promise<void> {
     const bytes = Buffer.from(`${JSON.stringify(value)}\n`);
     const overhead = (sizes.get(`${slot}.json`) ?? 0) + (sizes.get(`${slot}.lock`) ?? 0);
-    if (bytes.length > 1024 || overhead + bytes.length > USAGE_OVERHEAD_BYTES || sizes.has(`${slot}.tmp`))
+    if (bytes.length > METADATA_BYTES || overhead + bytes.length > USAGE_OVERHEAD_BYTES || sizes.has(`${slot}.tmp`))
       throw new Error('Usage publication exceeds quota');
     const temporary = path.join(this.directory, `${slot}.tmp`);
     await this.finish(await this.filesystem.open(temporary, 'wx'), bytes, 0, true);
@@ -471,12 +472,21 @@ function errorCode(error: unknown): string {
   return code ? ` (${code})` : '';
 }
 
-async function optionalText(filesystem: typeof fs.promises, file: string): Promise<string | null> {
+// Opens the file once and reads at most one byte past the cap. A result longer than the cap marks an oversized file.
+async function boundedBytes(filesystem: typeof fs.promises, file: string, cap: number): Promise<Buffer | null> {
+  let handle: FileHandle;
   try {
-    return await filesystem.readFile(file, 'utf8');
+    handle = await filesystem.open(file, 'r');
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
     throw error;
+  }
+  try {
+    const bytes = Buffer.alloc(cap + 1);
+    const { bytesRead } = await handle.read(bytes, 0, cap + 1, 0);
+    return bytes.subarray(0, bytesRead);
+  } finally {
+    await handle.close();
   }
 }
 
@@ -551,21 +561,21 @@ function slotRecords(raw: Buffer): SlotRecords {
 async function readSlot(directory: string, slot: string, filesystem: typeof fs.promises): Promise<SlotRecords | null> {
   const metadataFile = path.join(directory, `${slot}.json`);
   const payloadFile = path.join(directory, `${slot}.gz`);
-  const metadataText = () =>
-    optionalText(filesystem, metadataFile).catch((error: unknown) => {
+  const metadataBytes = () =>
+    boundedBytes(filesystem, metadataFile, METADATA_BYTES).catch((error: unknown) => {
       throw new SlotProblem(`${slot}.json`, `Unreadable usage metadata${errorCode(error)}`);
     });
-  let text = await metadataText();
+  let bytes = await metadataBytes();
   for (let attempt = 1; ; attempt++) {
-    if (text === null) {
+    if (bytes === null) {
       if (await payloadPresent(filesystem, payloadFile, slot))
         throw new SlotProblem(`${slot}.json`, 'Missing usage metadata');
       return null;
     }
-    if (Buffer.byteLength(text) > 1024) throw new SlotProblem(`${slot}.json`, 'Oversized usage metadata');
+    if (bytes.length > METADATA_BYTES) throw new SlotProblem(`${slot}.json`, 'Oversized usage metadata');
     let value: UsageSlotMetadata;
     try {
-      value = checkedMetadata(JSON.parse(text), slot);
+      value = checkedMetadata(JSON.parse(bytes.toString('utf8')), slot);
     } catch {
       throw new SlotProblem(`${slot}.json`, 'Invalid usage metadata');
     }
@@ -574,13 +584,13 @@ async function readSlot(directory: string, slot: string, filesystem: typeof fs.p
       throw new SlotProblem(`${slot}.gz`, `Unreadable usage payload${errorCode(error)}`);
     });
     const raw = payload && (await inflated(payload, value.raw));
-    const again = await metadataText();
-    if (again === text) {
+    const again = await metadataBytes();
+    if (again?.equals(bytes)) {
       if (!raw || raw.length !== value.raw) throw new SlotProblem(`${slot}.gz`, 'Unreadable usage payload');
       return slotRecords(raw);
     }
     if (attempt >= READ_ATTEMPTS) throw new SlotProblem(`${slot}.json`, 'Usage slot changed during every read');
-    text = again;
+    bytes = again;
   }
 }
 
@@ -592,13 +602,13 @@ export async function readUsageRecords(
   filesystem: typeof fs.promises = fs.promises,
 ): Promise<UsageReadResult> {
   const result: UsageReadResult = { readSlots: 0, problems: [] };
-  const format = await optionalText(filesystem, path.join(directory, 'format'));
+  const format = await boundedBytes(filesystem, path.join(directory, 'format'), METADATA_BYTES);
   if (format === null) {
     if ((await optionalEntries(filesystem, directory)).length)
       result.problems.push({ file: 'format', message: 'Missing usage format' });
     return result;
   }
-  if (format !== FORMAT) {
+  if (format.toString('utf8') !== FORMAT) {
     result.problems.push({ file: 'format', message: 'Unsupported usage format' });
     return result;
   }

@@ -800,6 +800,43 @@ test('a reader counts the invalid and unsupported lines it skips in each slot', 
   });
 });
 
+test('a reader reads each metadata and format file through one open and one bounded read', async () => {
+  const { root } = await populated();
+  const files = slotFiles(root);
+  const format = path.join(root, 'format');
+  const reads: string[] = [];
+  const filesystem = filesystemWithHandles(
+    (handle, file) =>
+      new Proxy(handle, {
+        get(target, key) {
+          if (key === 'read' && file !== files.data)
+            return (...args: Parameters<FileHandle['read']>) => {
+              reads.push(`${path.basename(file)} ${String(args[2])}`);
+              return target.read(...args);
+            };
+          const value = Reflect.get(target, key, target);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      }),
+  );
+  filesystem.readFile = async () => {
+    throw new Error('Unbounded usage read');
+  };
+  fs.writeFileSync(files.meta, `${' '.repeat(2 * 1024 * 1024)}{}`);
+  assert.deepEqual(await readBack(root, filesystem), {
+    utilizations: [],
+    result: { readSlots: 0, problems: [{ file: `${files.slot}.json`, message: 'Oversized usage metadata' }] },
+  });
+  assert.deepEqual(reads, ['format 1025', `${files.slot}.json 1025`]);
+  reads.length = 0;
+  fs.writeFileSync(format, `arc-usage-gzip-v1\n${' '.repeat(2 * 1024 * 1024)}`);
+  assert.deepEqual(await readBack(root, filesystem), {
+    utilizations: [],
+    result: { readSlots: 0, problems: [{ file: 'format', message: 'Unsupported usage format' }] },
+  });
+  assert.deepEqual(reads, ['format 1025']);
+});
+
 test('linked directories and nonregular recognized entries refuse new recording', async () => {
   const parent = tempDir('bounded-links-');
   const target = path.join(parent, 'target');
