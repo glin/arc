@@ -2847,6 +2847,72 @@ for (const terminal of ['throw', 'exit'] as const) {
   });
 }
 
+// The host counts each discovery request and reply at the worker boundary, so a build comparison can split a request's
+// cost into its post, its JSON size, its reply's JSON size, its round trip, and the host's time before the next request.
+test('discovery requests and replies count their sizes, round trips and the host gap between a reply and the next request', async () => {
+  const stub = `const port = require('node:worker_threads').parentPort;
+    port.on('message', (message) => {
+      if (!message.request) return;
+      const send = (value, progress) => port.postMessage({ id: message.id, ...(progress ? { progress: true } : {}), result: { generation: message.generation, value } });
+      const partial = { kind: 'claude-children-progress', referenceEntries: [], checkpoint: null, continuation: true, charges: { readBytes: 0 } };
+      if (message.request.kind !== 'claude-children') return send({ kind: 'stale' });
+      send(partial, true);
+      send(message.request.last ? { kind: 'claude-children', references: [], children: [], referenceEntries: [], dispatchFacts: [], complete: true, continuation: false } : partial);
+    });`;
+  for (const measured of [true, false]) {
+    const counters = new PanelPerformanceCounters(0, 'discovery-transport');
+    const worker = new ProgressiveWorker(
+      stub,
+      () => measured,
+      undefined,
+      undefined,
+      (sample) => counters.recordDiscoveryTransport(sample),
+    );
+    const replies: unknown[] = [];
+    const requests: unknown[] = [];
+    try {
+      const run = async (generation: number, last: boolean) => {
+        const request = {
+          kind: 'claude-children',
+          parents: [],
+          repositoryRoots: [],
+          referenceEntries: [],
+          last,
+        } as never;
+        requests.push({ id: generation, generation, request });
+        const result = await worker.run(request, generation, new AbortController().signal, (progress) =>
+          replies.push({ id: generation, progress: true, result: progress }),
+        );
+        replies.push({ id: generation, result });
+      };
+      // The second and third requests follow replies that asked for another pass. The fourth follows a complete reply,
+      // and the window request is not discovery.
+      await run(1, false);
+      await run(2, false);
+      await run(3, true);
+      await run(4, true);
+      await worker.run(
+        { kind: 'codex-context', session: { file: 'f', sessionId: 's', agent: 'codex', size: 0, mtimeMs: 0 } },
+        5,
+        new AbortController().signal,
+      );
+      const discovery = counters.snapshot().discovery;
+      const bytes = (values: unknown[]) =>
+        measured ? values.reduce<number>((sum, value) => sum + Buffer.byteLength(JSON.stringify(value), 'utf8'), 0) : 0;
+      assert.equal(discovery.discoveryRequests, 4);
+      assert.equal(discovery.discoveryReplies, 8);
+      assert.equal(discovery.discoveryReplyGaps, 2);
+      assert.equal(discovery.discoveryRequestJsonBytes, bytes(requests));
+      assert.equal(discovery.discoveryReplyJsonBytes, bytes(replies));
+      assert.ok(discovery.discoveryRoundTripMs > 0, JSON.stringify(discovery));
+      assert.ok(Number.isFinite(discovery.discoveryReplyGapMs) && discovery.discoveryReplyGapMs >= 0);
+      assert.ok(Number.isFinite(discovery.discoveryRequestPostMs) && discovery.discoveryRequestPostMs >= 0);
+    } finally {
+      worker.stop();
+    }
+  }
+});
+
 test('cancelled generation and disposal do not report a worker crash', async () => {
   const failures: unknown[] = [];
   const worker = new ProgressiveWorker(

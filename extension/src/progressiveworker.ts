@@ -646,6 +646,12 @@ export function workerErrorIdentity(error: unknown): { name: string; code: strin
   return { name: identifier(value.name) ?? 'Error', code: identifier(value.code) };
 }
 
+// One discovery message that crossed the worker boundary, as the host saw it. `jsonBytes` is a content proxy that is
+// present only while JSON measurement is on.
+export type DiscoveryTransportSample =
+  | { kind: 'request'; postMs: number; jsonBytes?: number; gapMs?: number }
+  | { kind: 'reply'; final: boolean; jsonBytes?: number; roundTripMs?: number };
+
 /** One execution boundary. The provider owns checkpoints and admitted pages. */
 export class ProgressiveWorker {
   readonly transport = { requests: 0, replies: 0, postMs: 0, jsonMs: 0, requestJsonBytes: 0, replyJsonBytes: 0 };
@@ -656,6 +662,8 @@ export class ProgressiveWorker {
   private nextId = 0;
   private discoveryActive = false;
   private discoveryWaiter?: { start(): void; cancel(): void };
+  // When the last final discovery reply that asked for another pass arrived. The next discovery request reads and clears it.
+  private discoveryReplyAt?: number;
   private state: 'idle' | 'running' | 'cancelled' | 'failed' = 'idle';
   private lastFailure: WorkerFailure | null = null;
   private workerMemory: WorkerMemory | null = null;
@@ -670,6 +678,8 @@ export class ProgressiveWorker {
       generation: number;
       kind: ProgressiveRequest['kind'];
       started: number;
+      // When the host began to post the request.
+      posted?: number;
       window?: { agent: SessionFile['agent']; entered: number | null };
       resolve(value: ProgressiveResult | null): void;
       reject(error: Error): void;
@@ -684,6 +694,7 @@ export class ProgressiveWorker {
     // Hears each file whose repeated-record map in the worker reaches the end of the file.
     private readonly onRepeatedCoverage?: (file: string) => void,
     private readonly onFailure?: (failure: WorkerFailure) => void,
+    private readonly onDiscoveryTransport?: (sample: DiscoveryTransportSample) => void,
   ) {}
 
   snapshot(): {
@@ -758,13 +769,42 @@ export class ProgressiveWorker {
     return failure;
   }
 
-  private countTransport(value: unknown, reply: boolean): void {
+  private countTransport(value: unknown, reply: boolean): number | undefined {
     this.transport[reply ? 'replies' : 'requests']++;
-    if (!this.measureJson()) return;
+    if (!this.measureJson()) return undefined;
     const started = performance.now();
     const bytes = Buffer.byteLength(JSON.stringify(value), 'utf8');
     this.transport.jsonMs += performance.now() - started;
     this.transport[reply ? 'replyJsonBytes' : 'requestJsonBytes'] += bytes;
+    return bytes;
+  }
+
+  // The round trip runs from the start of the post to the reply's arrival, before its JSON measurement. A final discovery
+  // reply asks for another pass when it is partial or when it continues. The gap to the next request starts after the
+  // reply's JSON measurement, so measurement adds to neither part.
+  private discoveryReply(
+    held: { kind: ProgressiveRequest['kind']; posted?: number },
+    result: ProgressiveResult | undefined,
+    jsonBytes: number | undefined,
+    final: boolean,
+    arrived: number,
+  ): void {
+    if (held.kind !== 'claude-children') return;
+    this.onDiscoveryTransport?.({
+      kind: 'reply',
+      final,
+      ...(jsonBytes === undefined ? {} : { jsonBytes }),
+      ...(final && held.posted !== undefined ? { roundTripMs: arrived - held.posted } : {}),
+    });
+    if (!final) return;
+    const value = result?.value;
+    const more =
+      value?.kind === 'claude-children-progress' ||
+      value?.kind === 'claude-children-delta' ||
+      ((value?.kind === 'claude-children' || value?.kind === 'dispatch-spend') &&
+        'continuation' in value &&
+        value.continuation);
+    this.discoveryReplyAt = more ? performance.now() : undefined;
   }
 
   retainMetadataRecovery(sessionIds: string[]): void {
@@ -889,7 +929,8 @@ export class ProgressiveWorker {
             }
             return;
           }
-          this.countTransport(message, true);
+          const arrived = performance.now();
+          const replyBytes = this.countTransport(message, true);
           const memory = message.result?.workerMemory;
           if (memory) {
             this.workerMemory = {
@@ -903,9 +944,11 @@ export class ProgressiveWorker {
             this.workerMemoryRequestId = message.id;
           }
           if (message.progress) {
+            this.discoveryReply(held, message.result, replyBytes, false, arrived);
             if (message.result) held.progress?.(message.result);
             return;
           }
+          if (!message.error) this.discoveryReply(held, message.result, replyBytes, true, arrived);
           if (message.error) this.failure('request', message.error);
           this.settleWindow(
             message.id,
@@ -1010,8 +1053,15 @@ export class ProgressiveWorker {
           ? { ...request, hidden: request.pages.flatMap((page) => page.turns).map(hiddenTurnFields) }
           : request;
       const message = { id, generation, request: transported, repeated };
-      this.countTransport(message, false);
+      const requestBytes = this.countTransport(message, false);
       const started = performance.now();
+      const gapMs =
+        request.kind === 'claude-children' && this.discoveryReplyAt !== undefined
+          ? started - this.discoveryReplyAt
+          : undefined;
+      if (request.kind === 'claude-children') this.discoveryReplyAt = undefined;
+      const posting = this.pending.get(id);
+      if (posting) posting.posted = started;
       try {
         this.worker!.postMessage(message);
       } catch (error) {
@@ -1022,7 +1072,15 @@ export class ProgressiveWorker {
         signal.removeEventListener('abort', abort);
         reject(error);
       }
-      this.transport.postMs += performance.now() - started;
+      const postMs = performance.now() - started;
+      this.transport.postMs += postMs;
+      if (request.kind === 'claude-children')
+        this.onDiscoveryTransport?.({
+          kind: 'request',
+          postMs,
+          ...(requestBytes === undefined ? {} : { jsonBytes: requestBytes }),
+          ...(gapMs === undefined ? {} : { gapMs }),
+        });
     });
   }
 

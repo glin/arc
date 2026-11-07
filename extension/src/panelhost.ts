@@ -1458,6 +1458,7 @@ export class PanelProvider implements vscode.Disposable {
       this.diagnostics.warn('workerFailure', { ...failure });
       this.health?.sample('unknown', false);
     },
+    (sample) => this.performanceCounters?.recordDiscoveryTransport?.(sample),
   );
   private readonly commitRepositoryReservations = new CommitRepositoryReservations();
   private readonly commitRepositoryReplies = new Map<string, { key: string; reply: CommitRepositoryReply }>();

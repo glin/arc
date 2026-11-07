@@ -84,6 +84,14 @@ export interface PerformanceCounterSnapshot {
     publications: number;
     partialPublications: number;
     discoveryAborts: number;
+    discoveryRequests: number;
+    discoveryRequestPostMs: number;
+    discoveryRequestJsonBytes: number;
+    discoveryReplies: number;
+    discoveryReplyJsonBytes: number;
+    discoveryRoundTripMs: number;
+    discoveryReplyGaps: number;
+    discoveryReplyGapMs: number;
   };
   sourceId: string;
   startedAt: string;
@@ -344,6 +352,14 @@ export class PanelPerformanceCounters {
     publications: 0,
     partialPublications: 0,
     discoveryAborts: 0,
+    discoveryRequests: 0,
+    discoveryRequestPostMs: 0,
+    discoveryRequestJsonBytes: 0,
+    discoveryReplies: 0,
+    discoveryReplyJsonBytes: 0,
+    discoveryRoundTripMs: 0,
+    discoveryReplyGaps: 0,
+    discoveryReplyGapMs: 0,
   };
   // A complete reply that asks for no further pass counts as a publication. One that asks for a pass only for dispatched
   // spend publishes its settled members and counts as a partial publication. Every other reply counts as a continuation.
@@ -376,6 +392,22 @@ export class PanelPerformanceCounters {
   // A discovery request that the host aborted before the worker replied.
   recordDiscoveryAbort(): void {
     this.discovery.discoveryAborts++;
+  }
+  // One discovery request or reply at the worker boundary.
+  recordDiscoveryTransport(sample: import('./progressiveworker').DiscoveryTransportSample): void {
+    if (sample.kind === 'request') {
+      this.discovery.discoveryRequests++;
+      this.discovery.discoveryRequestPostMs += finiteDuration(sample.postMs);
+      this.discovery.discoveryRequestJsonBytes += sample.jsonBytes ?? 0;
+      if (sample.gapMs !== undefined) {
+        this.discovery.discoveryReplyGaps++;
+        this.discovery.discoveryReplyGapMs += finiteDuration(sample.gapMs);
+      }
+      return;
+    }
+    this.discovery.discoveryReplies++;
+    this.discovery.discoveryReplyJsonBytes += sample.jsonBytes ?? 0;
+    if (sample.roundTripMs !== undefined) this.discovery.discoveryRoundTripMs += finiteDuration(sample.roundTripMs);
   }
   private readonly dispatchRoots = new Map<string, DispatchRootCharges>();
   private watcherOperationCount = 0;
