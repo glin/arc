@@ -10,6 +10,7 @@ import {
   RELATIONSHIP_SLICE_MS,
   replacedCatalogFiles,
   scanClaudeChildSessionReferences,
+  changedClaudeChildReferences,
   type ClaudeRelationshipCursor,
 } from './transcript';
 
@@ -7146,6 +7147,30 @@ test('Claude child discovery reaches a nested child whose launch result is text 
       ['a17339eacb3e8a85d', 'child-1', ['launch-bg']],
     ],
   );
+});
+
+// Links that share one child ID, in the same order, with the first link's tool use IDs changed. Each comparison reads the
+// parent ID of the link that the settled reply holds, so the reads count the comparisons.
+test('the changed link count compares many links of one child ID in linear time', () => {
+  const count = 4096;
+  const links = Array.from({ length: count }, (_, at) => ({
+    kind: 'subagent' as const,
+    parentSessionId: `parent-${at}`,
+    sessionId: 'shared-child',
+    file: `projects/parent-${at}/subagents/agent-shared-child.jsonl`,
+    toolUseIds: [`tool-${at}`],
+  }));
+  let comparisons = 0;
+  const counted = (link: (typeof links)[number]) =>
+    new Proxy(link, {
+      get(target, key, receiver) {
+        if (key === 'parentSessionId') comparisons++;
+        return Reflect.get(target, key, receiver);
+      },
+    });
+  const settled = [{ ...links[0], toolUseIds: ['tool-changed'] }, ...links.slice(1)].map(counted);
+  assert.equal(changedClaudeChildReferences(links, settled), 1);
+  assert.ok(comparisons <= 3 * count, `the comparison made ${comparisons} comparisons for ${count} links`);
 });
 
 test('Claude child discovery validates each reference once across many parents and children', () => {

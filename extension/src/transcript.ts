@@ -982,7 +982,8 @@ export function sameClaudeChildReference(
 }
 
 // The number of links in `before` that `after` holds with a changed field or does not hold. Lists in the same order compare
-// in one pass.
+// in one pass. Each child ID's links in `after` keep a cursor after the last match, so links in the same order compare once
+// each, and a link without a match compares at most once with each link of its child ID.
 export function changedClaudeChildReferences(
   before: readonly ClaudeChildSessionReference[],
   after: readonly ClaudeChildSessionReference[],
@@ -990,16 +991,27 @@ export function changedClaudeChildReferences(
   let at = 0;
   while (at < before.length && at < after.length && sameClaudeChildReference(before[at], after[at])) at++;
   if (at === before.length) return 0;
-  const bySession = new Map<string, ClaudeChildSessionReference[]>();
+  const bySession = new Map<string, { readonly links: ClaudeChildSessionReference[]; next: number }>();
   for (const reference of after) {
     const held = bySession.get(reference.sessionId);
-    if (held) held.push(reference);
-    else bySession.set(reference.sessionId, [reference]);
+    if (held) held.links.push(reference);
+    else bySession.set(reference.sessionId, { links: [reference], next: 0 });
   }
   let changed = 0;
   for (; at < before.length; at++) {
     const reference = before[at];
-    if (!bySession.get(reference.sessionId)?.some((peer) => sameClaudeChildReference(reference, peer))) changed++;
+    const bucket = bySession.get(reference.sessionId);
+    let found = -1;
+    if (bucket)
+      for (let step = 0; step < bucket.links.length; step++) {
+        const index = (bucket.next + step) % bucket.links.length;
+        if (sameClaudeChildReference(reference, bucket.links[index])) {
+          found = index;
+          break;
+        }
+      }
+    if (found < 0) changed++;
+    else bucket!.next = found + 1;
   }
   return changed;
 }
