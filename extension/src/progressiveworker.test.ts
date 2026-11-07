@@ -72,12 +72,12 @@ test.each(['claude', 'codex'] as const)(
       const root = tempDir('receipt-worker-');
       const fx = receiptDispatchFixture(root, parentAgent, childAgent);
       fs.mkdirSync(fx.receipts.root, { recursive: true });
-      // An empty launch directory costs about four receipt steps, so the store takes more than one request's allowance.
+      // An empty launch directory costs about four receipt steps, so the store takes more than one request's 256 steps.
       for (let index = 0; index < 1200; index++)
         fs.mkdirSync(path.join(fx.receipts.root, `${index.toString(16).padStart(8, '0')}-1111-2222-3333-444444444444`));
       fx.launch(fx.parent, fx.child, true, true, 36 * 1024);
       fx.launch(fx.child, fx.grandchild, true, true, 36 * 1024);
-      const workerSource = `process.env.ARC_HOME=${JSON.stringify(fx.home)};` + source;
+      const workerSource = `process.env.ARC_HOME=${JSON.stringify(fx.home)};` + narrowReceiptAllowance(source);
       const check = async (throughHost: boolean) => {
         const worker = new ProgressiveWorker(workerSource);
         const discovery = throughHost ? await receiptDiscoveryHost(worker, [root], fx.catalog) : undefined;
@@ -107,7 +107,14 @@ test.each(['claude', 'codex'] as const)(
                 );
             assert.ok(result);
             assert.equal(result.generation, generation);
-            assert.ok(result.value.kind === 'claude-children' || result.value.kind === 'claude-children-progress');
+            const partial =
+              result.value.kind === 'claude-children-progress' || result.value.kind === 'claude-children-delta';
+            assert.ok(
+              result.value.kind === 'claude-children' ||
+                result.value.kind === 'claude-children-progress' ||
+                result.value.kind === 'claude-children-delta',
+              result.value.kind,
+            );
             if ('charges' in result.value && result.value.charges) {
               assert.ok(
                 result.value.charges.readBytes <= (host ? 8 * 1024 * 1024 : 32 * 1024),
@@ -119,7 +126,7 @@ test.each(['claude', 'codex'] as const)(
                 result.value.charges.transcriptPassEnds +
                   result.value.charges.receiptPassEnds +
                   result.value.charges.otherPassEnds,
-                result.value.kind === 'claude-children-progress' ? 1 : 0,
+                partial ? 1 : 0,
                 JSON.stringify(result.value.charges),
               );
               // No read fails here, so no incomplete pass counts as other.
@@ -127,7 +134,7 @@ test.each(['claude', 'codex'] as const)(
               receiptEnds += result.value.charges.receiptPassEnds;
             }
             entries += result.value.charges?.receiptEntries ?? 0;
-            if (result.value.kind === 'claude-children-progress' || host?.dispatchDiscoveryPending) {
+            if (partial || host?.dispatchDiscoveryPending) {
               continue;
             }
             assert.equal(result.value.kind, 'claude-children');
@@ -198,16 +205,20 @@ test('receipt scan replies follow the step allowance, restart after a parent cha
   const cap = /receiptSteps >= \w+/;
   assert.ok(source.includes(step));
   assert.match(source, cap);
+  // The capped scan takes 4,096 steps in each request, so the store takes more than one request.
+  const steps = 4096;
   // The frozen clock holds the receipt deadline still, so only the step allowance or the store's end ends a pass. Each
   // step counts in the reply's charges and tells the host, which lets a test cancel a request inside the receipt loop.
   const workerSource = (uncapped: boolean) =>
     `process.env.ARC_HOME=${JSON.stringify(fx.home)};performance.now = () => 0;` +
     "const receiptStepPort = require('node:worker_threads').parentPort;" +
-    (uncapped ? source.replace(cap, 'receiptSteps >= Infinity') : source).replace(
-      step,
-      step +
-        "charges.receiptStepCount = (charges.receiptStepCount ?? 0) + 1; receiptStepPort.postMessage({ repeatedCoverage: 'receipt-step' });",
-    );
+    source
+      .replace(cap, `receiptSteps >= ${uncapped ? 'Infinity' : steps}`)
+      .replace(
+        step,
+        step +
+          "charges.receiptStepCount = (charges.receiptStepCount ?? 0) + 1; receiptStepPort.postMessage({ repeatedCoverage: 'receipt-step' });",
+      );
   const scan = async (
     uncapped: boolean,
     options: { addParent?: boolean; cancelEverySecond?: boolean; cancelFirst?: boolean } = {},
@@ -237,7 +248,12 @@ test('receipt scan replies follow the step allowance, restart after a parent cha
           continue;
         }
         assert.ok(!cancel, 'a cancelled request posted a reply');
-        assert.ok(reply.kind === 'claude-children' || reply.kind === 'claude-children-progress', reply.kind);
+        assert.ok(
+          reply.kind === 'claude-children' ||
+            reply.kind === 'claude-children-progress' ||
+            reply.kind === 'claude-children-delta',
+          reply.kind,
+        );
         counts.answered++;
         counts.firstOpens ??= reply.charges?.receiptScanOpens;
         counts.entries += reply.charges?.receiptEntries ?? 0;
@@ -274,7 +290,7 @@ test('receipt scan replies follow the step allowance, restart after a parent cha
   };
   const whole = await scan(true);
   assert.equal(whole.answered, 1, JSON.stringify(whole));
-  const replies = Math.ceil(whole.steps / 4096);
+  const replies = Math.ceil(whole.steps / steps);
   assert.ok(replies > 1, `one scan of ${whole.steps} steps fits one allowance`);
   const fixed = await scan(false);
   assert.ok(fixed.answered >= replies && fixed.answered <= replies + 2, JSON.stringify({ whole, fixed }));
@@ -384,7 +400,7 @@ test('a window read sent during a receipt pass completes before the pass ends', 
   const root = tempDir('receipt-worker-window-');
   const fx = receiptDispatchFixture(root, 'claude', 'codex');
   fs.mkdirSync(fx.receipts.root, { recursive: true });
-  // An empty launch directory costs about four receipt steps, so the pass runs its whole step allowance.
+  // An empty launch directory costs about four receipt steps, so the pass runs all of its 256 steps.
   for (let index = 0; index < 1200; index++)
     fs.mkdirSync(path.join(fx.receipts.root, `${index.toString(16).padStart(8, '0')}-1111-2222-3333-444444444444`));
   const step = 'receiptSteps++;';
@@ -397,7 +413,7 @@ test('a window read sent during a receipt pass completes before the pass ends', 
   const worker = new ProgressiveWorker(
     `process.env.ARC_HOME=${JSON.stringify(fx.home)};` +
       "const receiptStepPort = require('node:worker_threads').parentPort;" +
-      source
+      narrowReceiptAllowance(source)
         .replace(deadline, 'const receiptDeadline = Infinity;')
         .replace(step, step + "receiptStepPort.postMessage({ repeatedCoverage: 'receipt-step' });"),
     undefined,
@@ -437,6 +453,70 @@ test('a window read sent during a receipt pass completes before the pass ends', 
 });
 
 // A panel host whose discovery requests reach the worker, with the last worker reply kept for the test.
+// A receipt slice changes no reference entry, so each receipt reply after the first whole reply is a delta without rows. A
+// host whose checkpoint is behind the worker, or whose sequence differs from the worker's last reply, gets a whole reply.
+test('receipt replies after a whole reply are deltas until the host checkpoint differs from the last reply', async () => {
+  const root = tempDir('receipt-worker-delta-');
+  const fx = receiptDispatchFixture(root, 'claude', 'codex');
+  fs.mkdirSync(fx.receipts.root, { recursive: true });
+  for (let index = 0; index < 900; index++)
+    fs.mkdirSync(path.join(fx.receipts.root, `${index.toString(16).padStart(8, '0')}-1111-2222-3333-444444444444`));
+  fx.launch(fx.parent, fx.child, true, true, 36 * 1024);
+  fx.launch(fx.child, fx.grandchild, true, true, 36 * 1024);
+  const worker = new ProgressiveWorker(
+    `process.env.ARC_HOME=${JSON.stringify(fx.home)};` + narrowReceiptAllowance(source),
+  );
+  const { host, replies } = await receiptDiscoveryHost(worker, [root], fx.catalog);
+  const kinds: string[] = [];
+  const receiptReplies = () => kinds.filter((kind) => kind !== 'claude-children').length;
+  let behind: number | undefined;
+  let ahead: number | undefined;
+  try {
+    for (let request = 1; request <= 100; request++) {
+      host.refreshGeneration = request;
+      assert.equal(await host.prepareClaudeChildren(request, new AbortController().signal), true);
+      const reply = replies.last?.value;
+      assert.ok(reply);
+      kinds.push(reply.kind);
+      if (reply.kind === 'claude-children-delta') {
+        assert.deepEqual(reply.referenceEntries, []);
+        assert.deepEqual(reply.completed, []);
+        assert.equal(reply.charges.receiptPassEnds, 1);
+        assert.equal(host.discoveryCheckpoint.sequence, reply.sequence);
+      }
+      if (reply.kind === 'claude-children' && !host.dispatchDiscoveryPending) break;
+      // The host drops back one sequence, as when it refused the last reply, and later moves one ahead.
+      if (receiptReplies() === 3) {
+        behind = kinds.length;
+        host.discoveryCheckpoint.sequence--;
+      } else if (receiptReplies() === 5) {
+        ahead = kinds.length;
+        host.discoveryCheckpoint.sequence++;
+      }
+    }
+    assert.ok(ahead !== undefined && kinds.length > ahead + 2, JSON.stringify(kinds));
+    assert.equal(kinds[0], 'claude-children-progress', JSON.stringify(kinds));
+    assert.equal(kinds[behind!], 'claude-children-progress', JSON.stringify(kinds));
+    assert.equal(kinds[ahead], 'claude-children-progress', JSON.stringify(kinds));
+    const deltas = kinds.flatMap((kind, index) => (kind === 'claude-children-delta' ? [index] : []));
+    assert.deepEqual(
+      deltas,
+      kinds.flatMap((kind, index) =>
+        kind !== 'claude-children' && index !== 0 && index !== behind && index !== ahead ? [index] : [],
+      ),
+      JSON.stringify(kinds),
+    );
+    const complete = replies.last!.value;
+    assert.equal(complete.kind, 'claude-children');
+    if (complete.kind !== 'claude-children') return;
+    const parents = sessionParentIndex(complete.references);
+    assert.equal(parents.get(fx.child.sessionId)?.parent, fx.parent.sessionId);
+    assert.equal(parents.get(fx.grandchild.sessionId)?.parent, fx.child.sessionId);
+  } finally {
+    worker.stop();
+  }
+});
+
 async function receiptDiscoveryHost(
   worker: ProgressiveWorker,
   roots: string[],

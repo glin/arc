@@ -232,9 +232,16 @@ const DISPATCH_METADATA_BYTES = 256 * 1024;
 export const CODEX_DISPATCH_REQUEST_BYTES = 8 * 1024 * 1024;
 // The receipt scan's allowance in each discovery request. Each step advances the scan by at most one store entry and one file
 // check, and yields to the worker's other messages, so window reads run between steps.
-const RECEIPT_SLICE_MS = 250;
-const RECEIPT_STEPS = 4096;
+const RECEIPT_SLICE_MS = 1500;
+const RECEIPT_STEPS = 65536;
 let discoveryEpoch: DiscoveryCheckpoint | null = null;
+// The reference rows of this worker's last discovery reply, by key, with the epoch and sequence of that reply. A row keeps
+// its entry and the head and dispatch facts that the reply added to it.
+let sentReferences: {
+  epoch: string;
+  sequence: number;
+  rows: Map<string, { entry: ClaudeChildReferenceCacheEntry; head: unknown; dispatch: unknown }>;
+} | null = null;
 interface ReceiptScan {
   epoch: string | undefined;
   store: DispatchReceipts;
@@ -758,6 +765,10 @@ async function execute(
       };
     }
     const epoch = discoveryEpoch;
+    // The host's checkpoint as the request carried it. A receipt reply is a delta only while the epoch is that checkpoint.
+    const hostCheckpoint =
+      epoch === request.discovery ? { sequence: epoch.sequence, completed: epoch.completed } : null;
+    let replied = false;
     if (receiptScan && receiptScan.epoch !== epoch.epoch) closeReceiptScan('epoch');
     // A new worker checks saved completions as their sources become reachable.
     const seeding = heldEpoch?.epoch !== epoch.epoch;
@@ -882,15 +893,31 @@ async function execute(
         charges.childHeadMs += tally.ms;
       }
     };
-    // A delta without a source carries completion changes alone, such as the seed's.
-    const pending = (source?: string, delta = source !== undefined) => {
+    // A delta without a source carries completion changes alone, such as the seed's. A receipt delta carries `rows`.
+    const pending = (
+      source?: string,
+      delta = source !== undefined,
+      rows?: Array<[string, ClaudeChildReferenceCacheEntry]>,
+    ) => {
       charges.passMs = performance.now() - passStarted;
       epoch.sequence++;
+      replied = true;
       // Request boundaries return whole checkpoints. Quanta reuse the host's frozen header.
       if (delta) {
+        const referenceEntries = rows ?? (source ? [withSavedFacts([source, claudeChildReferences.get(source)!])] : []);
+        const sent = sentReferences;
+        if (sent && sent.epoch === epoch.epoch) {
+          sent.sequence = epoch.sequence;
+          for (const [file, row] of referenceEntries)
+            sent.rows.set(file, {
+              entry: claudeChildReferences.get(file)!,
+              head: row.head,
+              dispatch: row.dispatch,
+            });
+        }
         const value = {
           kind: 'claude-children-delta' as const,
-          referenceEntries: source ? [withSavedFacts([source, claudeChildReferences.get(source)!])] : [],
+          referenceEntries,
           checkpoint: header,
           epoch: epoch.epoch!,
           parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
@@ -911,9 +938,20 @@ async function execute(
       for (const [file, entry] of entries) if (!entry.complete && !entry.visitedEof) completed.delete(file);
       epoch.completed = [...completed];
       if (!signal.aborted) recordReceiptOpens(charges);
+      const referenceEntries = entries.map(withSavedFacts);
+      sentReferences = {
+        epoch: epoch.epoch!,
+        sequence: epoch.sequence,
+        rows: new Map(
+          referenceEntries.map(([file, row], index) => [
+            file,
+            { entry: entries[index][1], head: row.head, dispatch: row.dispatch },
+          ]),
+        ),
+      };
       return {
         kind: 'claude-children-progress' as const,
-        referenceEntries: entries.map(withSavedFacts),
+        referenceEntries,
         checkpoint: epoch,
         continuation: true as const,
         charges,
@@ -1271,6 +1309,34 @@ async function execute(
       receiptScan = scan;
     }
     const activeReceipts = receiptScan;
+    // A receipt slice changes no reference entry. When this request sent no earlier reply and the host's checkpoint is the
+    // one that this worker's last reply left, the reply is a delta with the rows and completions that differ from that reply.
+    // Otherwise it is a whole progress reply.
+    const receiptReply = () => {
+      const sent = sentReferences;
+      if (
+        replied ||
+        !hostCheckpoint ||
+        !sent ||
+        sent.epoch !== epoch.epoch ||
+        sent.sequence !== hostCheckpoint.sequence
+      )
+        return pending();
+      const rows: Array<[string, ClaudeChildReferenceCacheEntry]> = [];
+      for (const [file, entry] of claudeChildReferences) {
+        const row = withSavedFacts([file, entry]);
+        const held = sent.rows.get(file);
+        if (!held || held.entry !== entry || held.head !== row[1].head || held.dispatch !== row[1].dispatch)
+          rows.push(row);
+      }
+      const hostCompleted = new Set(hostCheckpoint.completed);
+      completionChanges.clear();
+      for (const file of completed) if (!hostCompleted.has(file)) completionChanges.set(file, true);
+      for (const file of hostCompleted) if (!completed.has(file)) completionChanges.set(file, false);
+      epoch.completed = [...completed];
+      if (!signal.aborted) recordReceiptOpens(charges);
+      return pending(undefined, true, rows);
+    };
     const receiptDeadline = performance.now() + RECEIPT_SLICE_MS;
     let receiptSteps = 0;
     // The deadline ends the loop only after a step, so a worker paused past the deadline in every request still advances.
@@ -1281,7 +1347,7 @@ async function execute(
         (receiptSteps > 0 && performance.now() >= receiptDeadline)
       ) {
         charges.receiptPassEnds++;
-        return pending();
+        return receiptReply();
       }
       // A recorded launch whose identities changed catalog rows is read again before the scan completes.
       const retryId = activeReceipts.retry ? undefined : activeReceipts.retries.shift();
@@ -1358,6 +1424,8 @@ async function execute(
     if (unsettled.changed) charges.unsettledChangedSources!++;
     if (unsettled.parents) charges.unsettledParentChanges!++;
     charges.passMs = performance.now() - passStarted;
+    // The host clears its checkpoint on a complete reply, so the next request starts from whole replies.
+    sentReferences = null;
     return {
       kind: 'claude-children',
       checkpoint: { ...epoch, completed: [...completed], sequence: epoch.sequence + 1 },
