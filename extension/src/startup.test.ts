@@ -2828,7 +2828,7 @@ function completeDiscoveryHarness(
   if (names.includes('allSessions')) names.push('walkedSessions');
   if (names.includes('walkedSessions') || names.includes('runPendingWatch')) names.push('noteCompressedRollouts');
   if (names.includes('allSessions') || names.includes('runPendingWatch')) names.push('currentWalkedCatalog');
-  if (names.includes('runPendingWatch')) names.push('onlyGrownMembers');
+  if (names.includes('runPendingWatch')) names.push('grownMemberMiss');
   if (names.includes('prepareClaudeChildren')) names.push('startedSources', 'applyDispatchFacts');
   names.push('walkCatalog');
   const body = owner.members
@@ -16057,15 +16057,21 @@ test('a dispatched file that moves after members settle reads its spend without 
 // A dispatched Claude session whose file the watcher names after members settle. `stats` stands in for the member's
 // file, so a case grows, shrinks or replaces it with no disk write. A refresh lists the member with its current stat, as a
 // targeted revalidation does. Each later spend-only reply carries the member's facts with five tool uses.
+// Each case that leaves the route counts the gate that failed.
 // Each append to a dispatched child used to open a discovery epoch, which scanned the receipt store and read the dispatched
 // spend of every root again.
 const fullPass = 'a full discovery request';
-for (const [change, subject, outcome] of [
-  ['grown', 'a grown dispatched member', 'one spend-only request and no discovery request, and its figure moves'],
-  ['newFile', 'a new file in the session directory of a grown member', fullPass],
-  ['shrunk', 'a shrunk member file', fullPass],
-  ['reidentified', 'a member file with a new inode', fullPass],
-  ['unsettled', 'a grown member while members are unsettled', fullPass],
+for (const [change, subject, outcome, miss] of [
+  ['grown', 'a grown dispatched member', 'one spend-only request and no discovery request, and its figure moves', null],
+  ['newFile', 'a new file in the session directory of a grown member', fullPass, 'ownedPath'],
+  ['shrunk', 'a shrunk member file', fullPass, 'shrunk'],
+  ['reidentified', 'a member file with a new inode', fullPass, 'identityChanged'],
+  ['unsettled', 'a grown member while members are unsettled', fullPass, 'membersUnsettled'],
+  ['undiscovered', 'a grown member before children are discovered', fullPass, 'undiscovered'],
+  ['walkListed', 'a grown member beside a file that only the last walk lists', fullPass, 'walkListed'],
+  ['notMember', 'a grown listed session that no dispatch names', fullPass, 'notMember'],
+  ['noHeldFacts', 'a grown member with no held facts', fullPass, 'noHeldFacts'],
+  ['statFailed', 'a member file that cannot be read', fullPass, 'statFailed'],
 ] as const)
   test(`${subject} sends ${outcome}`, async () => {
     vi.useFakeTimers();
@@ -16073,7 +16079,11 @@ for (const [change, subject, outcome] of [
       const file = 'projects/repo/claude-a.jsonl';
       const held = { size: 10, mtimeMs: 10, dev: 1, ino: 7 };
       const stats = new Map([[file, held]]);
-      const statSync = (target: string, options: object) => stats.get(target) ?? fs.statSync(target, options);
+      let unreadable = false;
+      const statSync = (target: string, options: object) => {
+        if (unreadable && target === file) throw Object.assign(new Error('EACCES'), { code: 'EACCES' });
+        return stats.get(target) ?? fs.statSync(target, options);
+      };
       const { provider, counters, requests } = partialSpendHarness(true, undefined, {
         methods: ['runPendingWatch', 'unknownPathShapeOf'],
         scope: {
@@ -16124,9 +16134,27 @@ for (const [change, subject, outcome] of [
         change === 'shrunk' ? { ...held, size: 5 } : change === 'reidentified' ? { ...grown, ino: 8 } : grown,
       );
       if (change === 'unsettled') provider.dispatchDiscoveryPending = true;
+      if (change === 'undiscovered') provider.claudeChildrenDiscovered = false;
+      if (change === 'noHeldFacts') provider.dispatchFacts.delete('claude-a');
+      if (change === 'statFailed') unreadable = true;
       // A new child transcript in the member's session directory names the member, as the watcher decision does.
       const created = change === 'newFile' ? ['projects/repo/claude-a/subagents/agent-new.jsonl'] : [];
-      const batch = { eventCount: 1, changedPaths: [file, ...created], createdPaths: created, compressedPaths: [] };
+      const walkListed = 'projects/repo/claude-b.jsonl';
+      if (change === 'walkListed') {
+        const scope = JSON.stringify(provider.repositoryScopeRoots ?? []);
+        provider.walkedCatalog = {
+          scope,
+          sessions: [...provider.catalog.sessions, { ...row, file: walkListed }],
+          parents: [],
+        };
+      }
+      const changed =
+        change === 'notMember'
+          ? [provider.catalog.sessions[0].file]
+          : change === 'walkListed'
+            ? [file, walkListed]
+            : [file, ...created];
+      const batch = { eventCount: 1, changedPaths: changed, createdPaths: created, compressedPaths: [] };
       provider.pendingWatch = {
         take: () => ({
           ...batch,
@@ -16152,6 +16180,10 @@ for (const [change, subject, outcome] of [
         reused ? 'the grown member sent a discovery request' : 'the watcher refresh reused the catalog',
       );
       if (reused) assert.equal(provider.dispatchFacts.get('claude-a')?.toolUses, 5, 'the member figure did not move');
+      const misses = Object.keys(work)
+        .filter((count) => count.startsWith('watcher:grownMemberMiss:') && added(count))
+        .map((count) => [count, added(count)]);
+      assert.deepEqual(misses, miss ? [[`watcher:grownMemberMiss:${miss}`, 1]] : [], 'the wake counted another gate');
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();

@@ -786,6 +786,19 @@ type DispatchedCostsCaller =
   | 'spendRefined'
   | 'historyCutoff';
 
+// The gate that kept a targeted watcher wake off the grown member route, named in the performance counters.
+type GrownMemberMiss =
+  | 'undiscovered'
+  | 'membersUnsettled'
+  | 'ownedPath'
+  | 'walkListed'
+  | 'noPaths'
+  | 'notMember'
+  | 'noHeldFacts'
+  | 'statFailed'
+  | 'identityChanged'
+  | 'shrunk';
+
 // Escape less-than signs in JSON embedded in a script element. An unescaped
 // closing script tag ends the element even when it occurs inside a JSON string.
 function scriptJson(value: unknown): string {
@@ -4009,8 +4022,10 @@ export class PanelProvider implements vscode.Disposable {
         }))
       : [];
     if (decision.ownedPaths) this.performanceCounters.recordWork('watcher:sessionDirectory', decision.ownedPaths);
-    const grown = decision.kind === 'targeted' && this.onlyGrownMembers(decision);
+    const miss = decision.kind === 'targeted' ? this.grownMemberMiss(decision) : null;
+    const grown = decision.kind === 'targeted' && miss === null;
     if (grown) this.performanceCounters.recordWork('watcher:grownMembers');
+    if (miss) this.performanceCounters.recordWork(`watcher:grownMemberMiss:${miss}`);
     this.refreshFrom(reason, batch.drawRequired, grown, decision.kind === 'targeted' ? decision.changedPaths : null);
     this.performanceCounters.recordWatcherOperation(
       {
@@ -4028,13 +4043,21 @@ export class PanelProvider implements vscode.Disposable {
     );
   }
 
-  // True when members are settled and every path of a targeted wake is a dispatched member's file that keeps the device,
+  // Null when members are settled and every path of a targeted wake is a dispatched member's file that keeps the device,
   // inode and no smaller size than its held facts. Its refresh reuses the held catalog, so the spend-only pass reads the
   // grown files with no discovery epoch. A spawn record appended inside a grown file waits for the next full pass. The
   // decision walks for a created path that no listed session owns, and `ownedPaths` counts one that a session owns.
-  private onlyGrownMembers(decision: { changedPaths: string[]; ownedPaths: number; walkListedPaths: number }): boolean {
-    if (!this.claudeChildrenDiscovered || this.dispatchDiscoveryPending) return false;
-    if (decision.ownedPaths || decision.walkListedPaths || !decision.changedPaths.length) return false;
+  // Otherwise the first gate that fails, checked in order and for the first path that fails one.
+  private grownMemberMiss(decision: {
+    changedPaths: string[];
+    ownedPaths: number;
+    walkListedPaths: number;
+  }): GrownMemberMiss | null {
+    if (!this.claudeChildrenDiscovered) return 'undiscovered';
+    if (this.dispatchDiscoveryPending) return 'membersUnsettled';
+    if (decision.ownedPaths) return 'ownedPath';
+    if (decision.walkListedPaths) return 'walkListed';
+    if (!decision.changedPaths.length) return 'noPaths';
     const members = new Map(
       this.claudeChildReferences.flatMap((reference) =>
         reference.kind === 'dispatch' && reference.file
@@ -4042,18 +4065,21 @@ export class PanelProvider implements vscode.Disposable {
           : [],
       ),
     );
-    return decision.changedPaths.every((file) => {
+    for (const file of decision.changedPaths) {
       const sessionId = members.get(normalizeFsPath(file));
-      const held = sessionId === undefined ? undefined : this.dispatchFacts.get(sessionId)?.revision;
-      if (!held) return false;
+      if (sessionId === undefined) return 'notMember';
+      const held = this.dispatchFacts.get(sessionId)?.revision;
+      if (!held) return 'noHeldFacts';
       let now: FileRevision;
       try {
         now = fileRevisionOf(fs.statSync(file, { bigint: true }));
       } catch {
-        return false;
+        return 'statFailed';
       }
-      return String(now.dev) === String(held.dev) && String(now.ino) === String(held.ino) && now.size >= held.size;
-    });
+      if (String(now.dev) !== String(held.dev) || String(now.ino) !== String(held.ino)) return 'identityChanged';
+      if (now.size < held.size) return 'shrunk';
+    }
+    return null;
   }
 
   // The last walk, when it listed the current repository roots.
