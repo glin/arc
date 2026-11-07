@@ -424,6 +424,25 @@ export class UsageRecorder {
 
 const READ_ATTEMPTS = 3;
 
+export interface UsageReadProblem {
+  file: string;
+  message: string;
+}
+
+export interface UsageReadResult {
+  readSlots: number;
+  problems: UsageReadProblem[];
+}
+
+class SlotProblem extends Error {
+  constructor(
+    readonly file: string,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
 function usageRecord(text: string): UsageRecordLine | null {
   let value: Partial<UsageRecordLine> | null;
   try {
@@ -446,11 +465,25 @@ function usageRecord(text: string): UsageRecordLine | null {
   return value as UsageRecordLine;
 }
 
+function errorCode(error: unknown): string {
+  const code = (error as NodeJS.ErrnoException).code;
+  return code ? ` (${code})` : '';
+}
+
 async function optionalText(filesystem: typeof fs.promises, file: string): Promise<string | null> {
   try {
     return await filesystem.readFile(file, 'utf8');
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+async function optionalEntries(filesystem: typeof fs.promises, directory: string): Promise<string[]> {
+  try {
+    return await filesystem.readdir(directory);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
     throw error;
   }
 }
@@ -483,44 +516,80 @@ function inflated(payload: Buffer, raw: number): Promise<Buffer | null> {
   });
 }
 
+function slotRecords(raw: Buffer): UsageRecordLine[] {
+  const records: UsageRecordLine[] = [];
+  for (const line of raw.toString('utf8').split('\n')) {
+    const record = line && usageRecord(line);
+    if (record) records.push(record);
+  }
+  return records;
+}
+
 // Reads the committed prefix of one slot. A writer that replaces the slot during the read
-// changes its metadata, and the reader reads that slot again.
+// changes its metadata, and the reader reads that slot again. Each file stays open for one bounded read.
 async function readSlot(
   directory: string,
   slot: string,
   filesystem: typeof fs.promises,
-  visit: (record: UsageRecordLine) => void,
-): Promise<void> {
+): Promise<UsageRecordLine[] | null> {
   const metadataFile = path.join(directory, `${slot}.json`);
+  const metadataText = () =>
+    optionalText(filesystem, metadataFile).catch((error: unknown) => {
+      throw new SlotProblem(`${slot}.json`, `Unreadable usage metadata${errorCode(error)}`);
+    });
+  let text = await metadataText();
   for (let attempt = 1; ; attempt++) {
-    const text = await optionalText(filesystem, metadataFile);
-    if (text === null) return;
-    if (Buffer.byteLength(text) > 1024) throw new Error('Oversized usage metadata');
-    const value = checkedMetadata(JSON.parse(text), slot);
-    if (!value.compressed) return;
-    const payload = await payloadPrefix(filesystem, path.join(directory, `${slot}.gz`), value.compressed);
-    const raw = payload && (await inflated(payload, value.raw));
-    if (raw && raw.length === value.raw) {
-      for (const line of raw.toString('utf8').split('\n')) {
-        const record = line && usageRecord(line);
-        if (record) visit(record);
-      }
-      return;
+    if (text === null) return null;
+    if (Buffer.byteLength(text) > 1024) throw new SlotProblem(`${slot}.json`, 'Oversized usage metadata');
+    let value: UsageSlotMetadata;
+    try {
+      value = checkedMetadata(JSON.parse(text), slot);
+    } catch {
+      throw new SlotProblem(`${slot}.json`, 'Invalid usage metadata');
     }
-    if (attempt >= READ_ATTEMPTS || (await optionalText(filesystem, metadataFile)) === text)
-      throw new Error(`Unreadable usage payload: ${slot}.gz`);
+    if (!value.compressed) return [];
+    const payload = await payloadPrefix(filesystem, path.join(directory, `${slot}.gz`), value.compressed).catch(
+      (error: unknown) => {
+        throw new SlotProblem(`${slot}.gz`, `Unreadable usage payload${errorCode(error)}`);
+      },
+    );
+    const raw = payload && (await inflated(payload, value.raw));
+    if (raw && raw.length === value.raw) return slotRecords(raw);
+    const again = await metadataText();
+    if (again === text) throw new SlotProblem(`${slot}.gz`, 'Unreadable usage payload');
+    if (attempt >= READ_ATTEMPTS) throw new SlotProblem(`${slot}.json`, 'Usage slot changed during every read');
+    text = again;
   }
 }
 
-// Visits every committed record in the bounded store. A missing store or format file holds no records.
+// Visits every committed record in the bounded store and reports each file it cannot read.
+// A missing or empty store holds no records.
 export async function readUsageRecords(
   directory: string,
   visit: (record: UsageRecordLine) => void,
   filesystem: typeof fs.promises = fs.promises,
-): Promise<void> {
+): Promise<UsageReadResult> {
+  const result: UsageReadResult = { readSlots: 0, problems: [] };
   const format = await optionalText(filesystem, path.join(directory, 'format'));
-  if (format === null) return;
-  if (format !== FORMAT) throw new Error('Unsupported usage format');
-  for (let index = 0; index < USAGE_SLOT_COUNT; index++)
-    await readSlot(directory, String(index).padStart(2, '0'), filesystem, visit);
+  if (format === null) {
+    if ((await optionalEntries(filesystem, directory)).length)
+      result.problems.push({ file: 'format', message: 'Missing usage format' });
+    return result;
+  }
+  if (format !== FORMAT) {
+    result.problems.push({ file: 'format', message: 'Unsupported usage format' });
+    return result;
+  }
+  for (let index = 0; index < USAGE_SLOT_COUNT; index++) {
+    try {
+      const records = await readSlot(directory, String(index).padStart(2, '0'), filesystem);
+      if (!records) continue;
+      result.readSlots++;
+      for (const record of records) visit(record);
+    } catch (error) {
+      if (!(error instanceof SlotProblem)) throw error;
+      result.problems.push({ file: error.file, message: error.message });
+    }
+  }
+  return result;
 }

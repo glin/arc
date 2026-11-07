@@ -101,9 +101,12 @@ async function run(): Promise<void> {
       }
       return;
     }
-    case 'usage':
-      process.stdout.write(`${await runUsage(commandArgs)}\n`);
+    case 'usage': {
+      const { output, status } = await runUsage(commandArgs);
+      process.stdout.write(`${output}\n`);
+      process.exitCode = status;
       return;
+    }
     case 'windows':
       process.stdout.write(`${await runWindows(commandArgs)}\n`);
       return;
