@@ -10,6 +10,7 @@ import * as path from 'node:path';
 import { buildSync } from 'esbuild';
 import { once } from 'node:events';
 import { createDiagnosticsLog } from './diagnosticslog';
+import { declarationSource, sourceMatch } from '../test/source-contract.ts';
 import { PanelPerformanceCounters } from './performancediagnostics';
 import type { HistoryPage } from './historypages';
 import {
@@ -587,6 +588,54 @@ test('a receipt delta carries the row of a Codex parent that the final check mar
   } finally {
     worker.stop();
   }
+});
+
+// A receipt delta omits each row that matches the worker's last reply, so the host must hold every row of that reply while
+// its checkpoint carries the reply's sequence. Each host write that drops rows also replaces or clears the checkpoint.
+test('every host write that drops reference rows also replaces or clears the discovery checkpoint', () => {
+  const host = fs.readFileSync(path.join(__dirname, 'panelhost.ts'), 'utf8');
+  const writers = [
+    ...host.matchAll(/this\.claudeChildReferenceEntries(?:\s*=(?!=)[^;]*|\.(?:set|delete|clear)\([^)]*\))/g),
+  ].map(([writer]) => writer.replace(/\s+/g, ' '));
+  assert.deepEqual(
+    writers,
+    [
+      'this.claudeChildReferenceEntries = cached.claudeChildReferences',
+      'this.claudeChildReferenceEntries = new Map()',
+      'this.claudeChildReferenceEntries = acknowledged',
+      'this.claudeChildReferenceEntries.delete(file)',
+      'this.claudeChildReferenceEntries = entries',
+    ],
+    'a new write of the host reference rows must keep the rows and the discovery checkpoint together',
+  );
+  // The derived cache sets the rows and the checkpoint together.
+  sourceMatch(
+    host,
+    /this\.claudeChildReferenceEntries = cached\.claudeChildReferences;\s*this\.discoveryCheckpoint = cached\.discovery;/,
+  );
+  // A workspace change clears the checkpoint with the rows, and cancels the request in flight.
+  const folders = declarationSource(host, 'workspaceFoldersChanged');
+  sourceMatch(
+    folders,
+    /this\.discoveryCheckpoint = undefined;[^]*this\.claudeChildReferenceEntries = new Map\(\);[^]*this\.abandonCatalogRefresh\(\);/,
+  );
+  // An accepted reply starts empty rows only under a new scope, and its checkpoint replaces the held one. A complete reply
+  // removes rows and clears the checkpoint.
+  const discovery = declarationSource(host, 'prepareClaudeChildren');
+  sourceMatch(
+    discovery,
+    /const acknowledged = sameScope \? this\.claudeChildReferenceEntries : new Map<string, ClaudeChildReferenceCacheEntry>\(\);/,
+  );
+  sourceMatch(discovery, /this\.discoveryCheckpoint = progress\.kind !== 'claude-children' \? checkpoint : undefined;/);
+  sourceMatch(
+    discovery,
+    /this\.claudeChildReferences = progress\.references;[^]*if \(!currentFiles\.has\(file\)\) this\.claudeChildReferenceEntries\.delete\(file\);/,
+  );
+  // Saved spend facts rewrite rows that the host holds and add or drop none.
+  sourceMatch(
+    declarationSource(host, 'refineDispatchedSpend'),
+    /const entries = new Map\(this\.claudeChildReferenceEntries\);[^]*const row = entries\.get\(file\);\s*if \(!row\) continue;/,
+  );
 });
 
 // A panel host whose discovery requests reach the worker, with the last worker reply kept for the test.
