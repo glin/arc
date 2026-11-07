@@ -45,8 +45,11 @@ function span(ms: number): string {
   return ms >= 0 ? `in ${parts.join(' ')}` : `${parts.join(' ')} ago`;
 }
 
-function iso(ms: number): string {
-  return new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
+// A time outside the range of a JavaScript date prints as unknown.
+function moment(ms: number | null, now: number): string {
+  const date = ms === null ? null : new Date(ms);
+  if (!date || Number.isNaN(date.getTime())) return 'unknown';
+  return `${date.toISOString().replace(/\.\d{3}Z$/, 'Z')} (${span(ms! - now)})`;
 }
 
 function usageText(records: UsageRecordLine[], now: number): string {
@@ -57,8 +60,8 @@ function usageText(records: UsageRecordLine[], now: number): string {
       label(record.agent),
       label(record.scope ? `${record.window} ${record.scope}` : record.window),
       record.utilization === null ? 'unknown' : `${Number((record.utilization * 100).toFixed(1))}%`,
-      record.resetsAt === null ? 'unknown' : `${iso(record.resetsAt * 1000)} (${span(record.resetsAt * 1000 - now)})`,
-      `${iso(record.readAt)} (${span(record.readAt - now)})${record.complete ? '' : ' incomplete'}`,
+      moment(record.resetsAt === null ? null : record.resetsAt * 1000, now),
+      `${moment(record.readAt, now)}${record.complete ? '' : ' incomplete'}`,
     ]),
   ];
   const widths = cells[0].map((_, column) => Math.max(...cells.map((cell) => cell[column].length)));

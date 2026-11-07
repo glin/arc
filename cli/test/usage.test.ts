@@ -140,6 +140,14 @@ test('usage prints the readable slots and names each unreadable slot', async () 
   assert.equal(JSON.parse(none.output).problems.length, 3);
 });
 
+test('usage prints a reset time outside the date range as unknown and keeps the number in JSON', async () => {
+  const root = await home([
+    ['claude', reading(NOW - MINUTE, true, [{ ...limit('seven_day', 0.5), resetsAtSeconds: 8.64e12 + 1 }])],
+  ]);
+  assert.match(await usage(root), /^claude +seven_day +50% +unknown +2026-11-06T11:59:00Z \(1m ago\)$/m);
+  assert.equal(JSON.parse(await usage(root, '--json')).readings[0].resetsAt, 8.64e12 + 1);
+});
+
 test('usage reports slot files without a format file as a missing format', async () => {
   const root = await home([['claude', reading(NOW - MINUTE, true, [limit('seven_day', 0.5)])]]);
   const directory = storeOf(root);
