@@ -11888,7 +11888,7 @@ test('derived session caches load, trim against the walk, and checkpoint after f
   sourceMatch(disposeBody, /this\.writeDerivedCache\(\)/, 'shutdown does not flush a checkpoint that is still waiting');
   sourceMatch(
     panelHostSource,
-    /saveDerivedCache\(file, this\.titles, this\.claudeChildReferenceEntries, this\.carriedNames, undefined, this\.discoveryCheckpoint, this\.commitRepositories\.snapshot\(\)\)/,
+    /saveDerivedCache\(file, this\.titles, this\.claudeChildReferenceEntries, this\.carriedNames, undefined, this\.discoveryCheckpoint, this\.commitRepositories\.snapshot\(\), undefined, this\.savedLinks\)/,
     'the derived cache has no durable write path',
   );
   sourceMatch(
