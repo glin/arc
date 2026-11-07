@@ -662,7 +662,8 @@ export class ProgressiveWorker {
   private nextId = 0;
   private discoveryActive = false;
   private discoveryWaiter?: { start(): void; cancel(): void };
-  // When the last final discovery reply that asked for another pass arrived. The next discovery request reads and clears it.
+  // When the last final discovery reply that asked for another pass arrived, on the clock of `unmeasuredNow`. The next
+  // discovery request reads and clears it, and so do `stop` and `endDiscoveryReplyGap`.
   private discoveryReplyAt?: number;
   private state: 'idle' | 'running' | 'cancelled' | 'failed' = 'idle';
   private lastFailure: WorkerFailure | null = null;
@@ -678,7 +679,7 @@ export class ProgressiveWorker {
       generation: number;
       kind: ProgressiveRequest['kind'];
       started: number;
-      // When the host began to post the request.
+      // When the host began to post the request, on the clock of `unmeasuredNow`.
       posted?: number;
       window?: { agent: SessionFile['agent']; entered: number | null };
       resolve(value: ProgressiveResult | null): void;
@@ -779,9 +780,15 @@ export class ProgressiveWorker {
     return bytes;
   }
 
-  // The round trip runs from the start of the post to the reply's arrival, before its JSON measurement. A final discovery
-  // reply asks for another pass when it is partial or when it continues. The gap to the next request starts after the
-  // reply's JSON measurement, so measurement adds to neither part.
+  // The host clock less the time of every JSON measurement so far. A span on this clock excludes each measurement inside it.
+  private unmeasuredNow(): number {
+    return performance.now() - this.transport.jsonMs;
+  }
+
+  // The round trip runs from the start of the post to the arrival of the final reply, error replies included. The gap runs
+  // from the arrival of a final reply that asks for another pass to the start of the next discovery request. Both spans use
+  // the clock of `unmeasuredNow`, so JSON measurement adds to neither. A final reply asks for another pass when it is
+  // partial or when it continues. An error reply asks for none.
   private discoveryReply(
     held: { kind: ProgressiveRequest['kind']; posted?: number },
     result: ProgressiveResult | undefined,
@@ -804,7 +811,13 @@ export class ProgressiveWorker {
       ((value?.kind === 'claude-children' || value?.kind === 'dispatch-spend') &&
         'continuation' in value &&
         value.continuation);
-    this.discoveryReplyAt = more ? performance.now() : undefined;
+    this.discoveryReplyAt = more ? arrived : undefined;
+  }
+
+  // The host stops handling the last discovery reply and waits, such as for a visible panel. The time until the next
+  // discovery request is then no reply gap.
+  endDiscoveryReplyGap(): void {
+    this.discoveryReplyAt = undefined;
   }
 
   retainMetadataRecovery(sessionIds: string[]): void {
@@ -929,7 +942,7 @@ export class ProgressiveWorker {
             }
             return;
           }
-          const arrived = performance.now();
+          const arrived = this.unmeasuredNow();
           const replyBytes = this.countTransport(message, true);
           const memory = message.result?.workerMemory;
           if (memory) {
@@ -948,7 +961,7 @@ export class ProgressiveWorker {
             if (message.result) held.progress?.(message.result);
             return;
           }
-          if (!message.error) this.discoveryReply(held, message.result, replyBytes, true, arrived);
+          this.discoveryReply(held, message.error ? undefined : message.result, replyBytes, true, arrived);
           if (message.error) this.failure('request', message.error);
           this.settleWindow(
             message.id,
@@ -1053,15 +1066,16 @@ export class ProgressiveWorker {
           ? { ...request, hidden: request.pages.flatMap((page) => page.turns).map(hiddenTurnFields) }
           : request;
       const message = { id, generation, request: transported, repeated };
-      const requestBytes = this.countTransport(message, false);
-      const started = performance.now();
+      const unmeasured = this.unmeasuredNow();
       const gapMs =
         request.kind === 'claude-children' && this.discoveryReplyAt !== undefined
-          ? started - this.discoveryReplyAt
+          ? unmeasured - this.discoveryReplyAt
           : undefined;
       if (request.kind === 'claude-children') this.discoveryReplyAt = undefined;
+      const requestBytes = this.countTransport(message, false);
+      const started = performance.now();
       const posting = this.pending.get(id);
-      if (posting) posting.posted = started;
+      if (posting) posting.posted = this.unmeasuredNow();
       try {
         this.worker!.postMessage(message);
       } catch (error) {
@@ -1086,6 +1100,7 @@ export class ProgressiveWorker {
 
   stop(): void {
     this.state = 'cancelled';
+    this.discoveryReplyAt = undefined;
     this.discoveryWaiter?.cancel();
     this.discoveryWaiter = undefined;
     const worker = this.worker;

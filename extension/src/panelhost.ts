@@ -10524,6 +10524,7 @@ export class PanelProvider implements vscode.Disposable {
     return true;
   }
 
+  // A continuation that waits, such as for a visible panel, ends the reply gap that the worker counts.
   private scheduleDiscoveryContinuation(): void {
     if (
       (this.dispatchDiscoveryPending || this.dispatchSpendPending) &&
@@ -10531,7 +10532,7 @@ export class PanelProvider implements vscode.Disposable {
       this.anyVisible()
     ) {
       setTimeout(() => void this.continueDiscovery(), 0);
-    }
+    } else this.progressiveWorker.endDiscoveryReplyGap?.();
   }
 
   // Sends the next discovery request from the held catalog and the previous reply's cursor, without a catalog refresh. The
@@ -10542,8 +10543,10 @@ export class PanelProvider implements vscode.Disposable {
       !(this.dispatchDiscoveryPending || this.dispatchSpendPending) ||
       this.startupFailureGeneration === this.refreshGeneration ||
       !this.anyVisible()
-    )
+    ) {
+      this.progressiveWorker.endDiscoveryReplyGap?.();
       return;
+    }
     // The holder of the slot sends discovery itself or schedules the next continuation when it ends. A request queued
     // behind it would run as one more catalog refresh after every continuation.
     if (this.refreshController) return;
