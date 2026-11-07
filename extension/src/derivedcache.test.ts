@@ -4,7 +4,7 @@ import assert from 'node:assert';
 import * as fs from 'node:fs';
 import { tempDir } from './temproot.ts';
 import * as path from 'node:path';
-import { normalizeFsPath, scanClaudeRelationshipQuantum, RelationshipReader } from './transcript';
+import { normalizeFsPath, scanClaudeRelationshipQuantum, RelationshipReader, revisionOf } from './transcript';
 import { scanCodexDispatchReferencesAsync } from './codex';
 import { commitSourceStamp } from './transcript';
 import {
@@ -2737,7 +2737,7 @@ test('literal native child-reference generation 22 discards an excluded dispatch
   );
   const scan = scanCodexDispatchReferences(file, 'native');
   assert.equal(scan.references.length, 1);
-  const stat = fs.statSync(file);
+  const stat = revisionOf(fs.statSync(file, { bigint: true }));
   const cursor = {
     ...scan.cursor,
     openingTimestamp: Date.parse('2026-09-20T10:00:10Z'),

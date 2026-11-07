@@ -18,6 +18,7 @@ import {
   HEX_SHA,
   normalizeFsPath,
   projectSlug,
+  revisionOf,
 } from './transcript.ts';
 import { type GitRunner, IDENTITY_ARGS, exactCommitArgs } from './gitcommits.ts';
 
@@ -175,7 +176,7 @@ export function receiptDispatchFixture(root: string, parentAgent: 'claude' | 'co
           ];
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
-    const stat = fs.statSync(file);
+    const stat = revisionOf(fs.statSync(file, { bigint: true }));
     return {
       file,
       sessionId: id,

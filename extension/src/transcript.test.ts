@@ -1,7 +1,7 @@
 import { webLinkUrl, linkBrowserKind, parseLinkDestination } from './domain/link-path';
 import { test, vi } from 'vitest';
 import { agentRunAnswer } from './turnrail';
-import { enumerateClaudeChildSources, enumerateSessionFiles, enumerateSessionFilesFor } from './transcript';
+import { enumerateClaudeChildSources, enumerateSessionFiles, enumerateSessionFilesFor, revisionOf } from './transcript';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { EXPORT_LIMITS, ExportLimitError } from './exportlimits.ts';
 import {
@@ -2951,7 +2951,7 @@ test('Claude semantic pages reconstruct UTF-8 records split across chunks', () =
   assert.equal(result.page?.turns[0].prompt, 'emoji 🌍 survives');
   assert.equal(result.page?.source, 'claude');
   assert.equal(result.page?.sessionId, 'sess');
-  const stat = fs.statSync(file);
+  const stat = revisionOf(fs.statSync(file, { bigint: true }));
   assert.deepEqual(result.page?.revision, {
     size: stat.size,
     mtimeMs: stat.mtimeMs,

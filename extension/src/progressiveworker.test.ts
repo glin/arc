@@ -10846,8 +10846,7 @@ test('an agent-run scan whose transcript grew while it ran keeps its cursor', as
   try {
     const file = path.join(directory, 'session.jsonl');
     fs.writeFileSync(file, jsonLines(reviewRun()));
-    const revision = (stat: fs.Stats) => ({ size: stat.size, mtimeMs: stat.mtimeMs, dev: stat.dev, ino: stat.ino });
-    const before = revision(fs.statSync(file));
+    const before = revisionOf(fs.statSync(file, { bigint: true }));
     const session = {
       file,
       size: before.size,
@@ -10862,12 +10861,12 @@ test('an agent-run scan whose transcript grew while it ran keeps its cursor', as
 
     // Claude Code appends a record while the scan runs, so the whole read comes back stale.
     fs.appendFileSync(file, jsonLines([{ type: 'system', subtype: 'turn_duration', timestamp: timestamp(93) }]));
-    const grown = revision(fs.statSync(file));
+    const grown = revisionOf(fs.statSync(file, { bigint: true }));
     const kept = scanKeptThroughGrowth({ kind: 'starts', agentRunScan: scan }, before, grown);
     assert.deepEqual(kept, scan, 'a scan whose transcript only grew lost its cursor');
     // A Windows file id can exceed 2^53, where adding one leaves the number unchanged.
     assert.equal(
-      scanKeptThroughGrowth({ kind: 'starts', agentRunScan: scan }, before, { ...grown, dev: grown.dev + 1 }),
+      scanKeptThroughGrowth({ kind: 'starts', agentRunScan: scan }, before, { ...grown, dev: `${grown.dev}1` }),
       undefined,
       'a scan of a replaced transcript kept its cursor',
     );

@@ -3540,8 +3540,7 @@ test('a restored session waits for the published catalog before it opens', async
     provider.hostSessions = new Map([[provider.hosts[0], fixture.sessionId]]);
     provider.discovery = new Promise(() => {});
     provider.revisionOf = (source: any) => {
-      const stat = fs.statSync(source.file);
-      return { size: stat.size, mtimeMs: stat.mtimeMs, dev: stat.dev, ino: stat.ino };
+      return fileRevisionOf(fs.statSync(source.file, { bigint: true }));
     };
     provider.progressiveCurrent = (source: any) => Boolean(provider.cache.get(source.file));
     let requests = 0;
@@ -3724,8 +3723,7 @@ for (const [cause, stale] of [
     provider._showing = fixture.sessionId;
     provider.hostSessions = new Map([[provider.hosts[0], fixture.sessionId]]);
     provider.revisionOf = (source: any) => {
-      const stat = fs.statSync(source.file);
-      return { size: stat.size, mtimeMs: stat.mtimeMs, dev: stat.dev, ino: stat.ino };
+      return fileRevisionOf(fs.statSync(source.file, { bigint: true }));
     };
     provider.progressiveCurrent = (source: any) => Boolean(provider.cache.get(source.file));
     let requests = 0;
@@ -3966,8 +3964,7 @@ test('selected delivery rejects changed host ownership and scope after the worke
     provider.hosts.push(peer);
     provider.hostSessions.set(peer, 'peer-selected');
     provider.revisionOf = (source: any) => {
-      const stat = fs.statSync(source.file);
-      return { size: stat.size, mtimeMs: stat.mtimeMs, dev: stat.dev, ino: stat.ino };
+      return fileRevisionOf(fs.statSync(source.file, { bigint: true }));
     };
     let finish!: (result: ProgressiveResult) => void;
     provider.progressiveWorker = {
@@ -4488,8 +4485,7 @@ test('two visible hosts accept their own concurrent selected windows while a lat
   ]);
   provider._showing = secondId;
   provider.revisionOf = (source: any) => {
-    const stat = fs.statSync(source.file);
-    return { size: stat.size, mtimeMs: stat.mtimeMs, dev: stat.dev, ino: stat.ino };
+    return fileRevisionOf(fs.statSync(source.file, { bigint: true }));
   };
   const completions = new Map<string, () => void>();
   provider.progressiveWorker = {
