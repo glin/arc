@@ -80,8 +80,8 @@ export interface RailPayload {
 // Change identities when identity-compared input contents change.
 export interface RailInputKey {
   readonly held: readonly unknown[];
-  readonly print: string;
   // Where each field's values end in `held`, and each field's print, in RAIL_INPUT_HOLDS order. A held field has a null print.
+  // Each print is the field's only serialization. Equality and the changed-field counts both compare it.
   readonly heldEnds: readonly number[];
   readonly prints: readonly (string | null)[];
 }
@@ -136,7 +136,7 @@ export function railInputKey(input: RailPayloadInput): RailInputKey {
       held.push(value);
       prints.push(null);
     } else if (hold === 'day') {
-      prints.push(JSON.stringify(railWordingDay(value as number)));
+      prints.push(railWordingDay(value as number));
     } else if (hold === 'each') {
       const items = value as readonly unknown[];
       held.push(items.length);
@@ -149,8 +149,7 @@ export function railInputKey(input: RailPayloadInput): RailInputKey {
     }
     heldEnds.push(held.length);
   }
-  // A JSON print holds no line break, so the joined prints are equal only when every field's print is equal.
-  return { held, print: prints.filter((print) => print !== null).join('\n'), heldEnds, prints };
+  return { held, heldEnds, prints };
 }
 
 // The input fields whose part of the key differs between two keys, in RAIL_INPUT_HOLDS order.
@@ -170,7 +169,7 @@ export function railInputChanges(before: RailInputKey, now: RailInputKey): strin
 export function sameRailInputs(before: RailInputKey | null, now: RailInputKey): boolean {
   return (
     before !== null &&
-    before.print === now.print &&
+    before.prints.every((print, at) => print === now.prints[at]) &&
     before.held.length === now.held.length &&
     before.held.every((value, at) => value === now.held[at])
   );
