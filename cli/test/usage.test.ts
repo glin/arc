@@ -161,6 +161,19 @@ test('usage reports slot files without a format file as a missing format', async
   ]);
 });
 
+test('usage reports a slot payload without its metadata file as missing metadata', async () => {
+  const root = await home([['claude', reading(NOW - MINUTE, true, [limit('seven_day', 0.5)])]]);
+  const directory = storeOf(root);
+  fs.rmSync(path.join(directory, `${slotOf(NOW)}.json`));
+  assert.deepEqual(await run(root), {
+    output: `Problems in ${directory}:\n  ${slotOf(NOW)}.json: Missing usage metadata.`,
+    status: 1,
+  });
+  assert.deepEqual(JSON.parse(await usage(root, '--json')).problems, [
+    { file: `${slotOf(NOW)}.json`, message: 'Missing usage metadata' },
+  ]);
+});
+
 test('usage JSON keeps the saved record fields with a schema version and build commit', async () => {
   const root = await home([['claude', reading(NOW - MINUTE, true, [limit('seven_day', 0.5)])]]);
   const output = JSON.parse(await usage(root, '--json'));

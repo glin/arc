@@ -489,6 +489,16 @@ async function optionalEntries(filesystem: typeof fs.promises, directory: string
   }
 }
 
+async function payloadPresent(filesystem: typeof fs.promises, file: string, slot: string): Promise<boolean> {
+  try {
+    await filesystem.lstat(file);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw new SlotProblem(`${slot}.gz`, `Unreadable usage payload${errorCode(error)}`);
+  }
+}
+
 async function payloadPrefix(filesystem: typeof fs.promises, file: string, length: number): Promise<Buffer | null> {
   let handle: FileHandle;
   try {
@@ -540,13 +550,18 @@ function slotRecords(raw: Buffer): SlotRecords {
 // Each file stays open for one bounded read.
 async function readSlot(directory: string, slot: string, filesystem: typeof fs.promises): Promise<SlotRecords | null> {
   const metadataFile = path.join(directory, `${slot}.json`);
+  const payloadFile = path.join(directory, `${slot}.gz`);
   const metadataText = () =>
     optionalText(filesystem, metadataFile).catch((error: unknown) => {
       throw new SlotProblem(`${slot}.json`, `Unreadable usage metadata${errorCode(error)}`);
     });
   let text = await metadataText();
   for (let attempt = 1; ; attempt++) {
-    if (text === null) return null;
+    if (text === null) {
+      if (await payloadPresent(filesystem, payloadFile, slot))
+        throw new SlotProblem(`${slot}.json`, 'Missing usage metadata');
+      return null;
+    }
     if (Buffer.byteLength(text) > 1024) throw new SlotProblem(`${slot}.json`, 'Oversized usage metadata');
     let value: UsageSlotMetadata;
     try {
@@ -555,11 +570,9 @@ async function readSlot(directory: string, slot: string, filesystem: typeof fs.p
       throw new SlotProblem(`${slot}.json`, 'Invalid usage metadata');
     }
     if (!value.compressed) return { records: [], skipped: 0 };
-    const payload = await payloadPrefix(filesystem, path.join(directory, `${slot}.gz`), value.compressed).catch(
-      (error: unknown) => {
-        throw new SlotProblem(`${slot}.gz`, `Unreadable usage payload${errorCode(error)}`);
-      },
-    );
+    const payload = await payloadPrefix(filesystem, payloadFile, value.compressed).catch((error: unknown) => {
+      throw new SlotProblem(`${slot}.gz`, `Unreadable usage payload${errorCode(error)}`);
+    });
     const raw = payload && (await inflated(payload, value.raw));
     const again = await metadataText();
     if (again === text) {
