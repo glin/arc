@@ -201,8 +201,8 @@ test.each(['claude', 'codex'] as const)(
 // The receipt scan resumes across continuations, so the step allowance of one request sets how many replies one scan takes.
 // An unsettled complete reply starts a new epoch and a new scan. A cancelled request keeps the scan's position. A targeted
 // refresh lists the same parents in activity order and a walk lists them in enumeration order, so a request can carry the
-// epoch's parents in another order.
-test('receipt scan replies follow the step allowance, restart after a parent change, settle after a parent reorder, and resume after cancellation', async () => {
+// epoch's parents in another order, with a parent named twice, or in another path form.
+test('receipt scan replies follow the step allowance, restart after a parent change, settle after the same parents in another listing, and resume after cancellation', async () => {
   const root = tempDir('receipt-worker-allowance-');
   const fx = receiptDispatchFixture(root, 'claude', 'codex');
   // Each read of these launches stops at the catalog lookup, because no catalog lists their sessions.
@@ -234,7 +234,12 @@ test('receipt scan replies follow the step allowance, restart after a parent cha
       );
   const scan = async (
     uncapped: boolean,
-    options: { addParent?: boolean; reorderParents?: boolean; cancelEverySecond?: boolean; cancelFirst?: boolean } = {},
+    options: {
+      addParent?: boolean;
+      relist?: (host: Record<string, any>) => void;
+      cancelEverySecond?: boolean;
+      cancelFirst?: boolean;
+    } = {},
   ) => {
     let cancel: AbortController | undefined;
     const worker = new ProgressiveWorker(workerSource(uncapped), undefined, (message) => {
@@ -255,7 +260,7 @@ test('receipt scan replies follow the step allowance, restart after a parent cha
         replies.last = null;
         await host.prepareClaudeChildren(request, (cancel ?? new AbortController()).signal);
         if (request === 1 && options.addParent) host.claudeParents = [...fx.catalog, added];
-        if (request === 1 && options.reorderParents) host.claudeParents = [...fx.catalog].reverse();
+        if (request === 1) options.relist?.(host);
         const reply = (replies.last as ProgressiveResult | null)?.value;
         if (!reply) {
           assert.ok(cancel?.signal.aborted, 'an uncancelled request posted no reply');
@@ -338,11 +343,44 @@ test('receipt scan replies follow the step allowance, restart after a parent cha
     spendPasses: 2,
     spendVisits: 4,
   });
-  assert.ok(fx.catalog.length > 1);
-  const reordered = await scan(false, { reorderParents: true });
-  assert.equal(reordered.unsettled, 0, JSON.stringify(reordered));
-  assert.equal(reordered.entries, whole.entries);
-  assert.deepEqual(reordered.charges, fixed.charges);
+  // The targeted listing orders the parents by activity, which here runs against the walk's enumeration order.
+  const targeted = (host: Record<string, any>) => {
+    const folders = [root];
+    Object.assign(host, {
+      folders: () => folders,
+      repositoryScope: { snapshot: () => ({ ready: true, roots: folders, revision: 'scope' }) },
+      publishWindowState() {},
+      hasHumanPrompt: () => true,
+      activityFor: (session: { file: string }) => fx.catalog.findIndex((row) => row.file === session.file),
+      targetedRefreshPaths: [fx.parent.file],
+      catalog: { folders: `${root}\0scope`, sessions: fx.catalog },
+      walkedCatalog: { scope: JSON.stringify(folders), sessions: fx.catalog, parents: fx.catalog },
+    });
+    host.allSessions(true);
+    assert.deepEqual(
+      host.claudeParents.map((row: { file: string }) => row.file),
+      fx.catalog.map((row) => row.file).reverse(),
+      'the targeted listing kept the walk order',
+    );
+  };
+  // Each path in the other separator, and each absent child transcript flag as false.
+  const otherForm = (row: (typeof fx.catalog)[number]) => ({
+    ...row,
+    file: row.file.includes('\\') ? row.file.replace(/\\/g, '/') : row.file.replace(/\//g, '\\'),
+    childTranscript: false,
+  });
+  for (const [listing, relist] of [
+    ['targeted listing', targeted],
+    ['repeated parent', (host: Record<string, any>) => (host.claudeParents = [...fx.catalog, fx.catalog[0]])],
+    ['path form and absent flag', (host: Record<string, any>) => (host.claudeParents = fx.catalog.map(otherForm))],
+  ] as const) {
+    const relisted = await scan(false, { relist });
+    // A reply inside the epoch carries the new listing, so the comparison runs on it.
+    assert.ok(relisted.answered > 1, `${listing}: ${JSON.stringify(relisted)}`);
+    assert.equal(relisted.unsettled, 0, `${listing}: ${JSON.stringify(relisted)}`);
+    assert.equal(relisted.entries, whole.entries, listing);
+    assert.deepEqual(relisted.charges, fixed.charges, listing);
+  }
   const cancelled = await scan(false, { cancelEverySecond: true });
   assert.ok(cancelled.answered <= fixed.answered, JSON.stringify({ fixed, cancelled }));
   assert.ok(cancelled.cancelled > 0);

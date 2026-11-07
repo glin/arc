@@ -242,6 +242,10 @@ let sentReferences: {
   sequence: number;
   rows: Map<string, { entry: ClaudeChildReferenceCacheEntry; head: unknown; dispatch: unknown }>;
 } | null = null;
+// A source's identity in a discovery epoch. A NUL separates the fields, because no path holds one.
+function discoverySourceKey(row: SessionFile): string {
+  return `${normalizeFsPath(row.file)}\0${row.sessionId}\0${row.agent}\0${row.childTranscript === true}`;
+}
 interface ReceiptScan {
   epoch: string | undefined;
   store: DispatchReceipts;
@@ -697,15 +701,13 @@ async function execute(
     ) {
       // A root change continues the epoch. Retained sources keep their rows and captured cuts, and new sources join it.
       const held = discoveryEpoch;
-      const sourceKey = (row: SessionFile) =>
-        JSON.stringify([normalizeFsPath(row.file), row.sessionId, row.agent, row.childTranscript === true]);
       const retained = (rows: readonly SessionFile[], next: readonly SessionFile[]) => {
-        const old = new Map(rows.map((row) => [sourceKey(row), row]));
-        return next.map((row) => old.get(sourceKey(row)) ?? row);
+        const old = new Map(rows.map((row) => [discoverySourceKey(row), row]));
+        return next.map((row) => old.get(discoverySourceKey(row)) ?? row);
       };
       const parents = retained(held.parents, request.parents);
       const catalog = retained(held.catalog, request.catalog ?? request.parents);
-      const kept = new Set(parents.map(sourceKey));
+      const kept = new Set(parents.map(discoverySourceKey));
       const parentFiles = new Set(parents.map((row) => normalizeFsPath(row.file)));
       // Removed parents leave the completions. A child with a reference entry keeps its completion and captured cut. A child
       // that returns without an entry, or a missing file, checks its completion again.
@@ -713,7 +715,7 @@ async function execute(
       const completedFiles = new Set<string>();
       for (const key of held.completed) {
         const parent = heldParents.get(key);
-        if (parent ? kept.has(sourceKey(parent)) : claudeChildReferences.has(key)) completedFiles.add(key);
+        if (parent ? kept.has(discoverySourceKey(parent)) : claudeChildReferences.has(key)) completedFiles.add(key);
         else released.push(key);
       }
       const inRoots = (cwd: string | null | undefined) => !!cwd && isInside(cwd, [...request.repositoryRoots]);
@@ -1263,15 +1265,12 @@ async function execute(
     for (const [file, entry] of boundedEntries) if (!entry.complete && !entry.visitedEof) completed.delete(file);
     claudeChildReferences.clear();
     for (const [file, entry] of boundedEntries) claudeChildReferences.set(file, entry);
-    // A walk and a targeted refresh list the same parents in different orders. The epoch reads its own parents, so only a
-    // parent that joins, leaves or changes identity asks for another pass.
-    const parentKeys = (rows: readonly SessionFile[]) =>
-      rows.map((row) => JSON.stringify([row.file, row.sessionId, row.agent, row.childTranscript ?? null])).sort();
-    const epochParents = parentKeys(epoch.parents);
-    const requestParents = parentKeys(request.parents);
+    // A walk and a targeted refresh list the same parents in different orders, and a listing can name a parent twice. The
+    // epoch reads its own parents, so only a parent that joins, leaves or changes identity asks for another pass.
+    const epochParents = new Set(epoch.parents.map(discoverySourceKey));
+    const requestParents = new Set(request.parents.map(discoverySourceKey));
     unsettled.parents =
-      epochParents.length !== requestParents.length ||
-      epochParents.some((parent, index) => parent !== requestParents[index]);
+      epochParents.size !== requestParents.size || [...requestParents].some((key) => !epochParents.has(key));
     continuation ||= unsettled.parents;
     // A replaced store directory starts the scan again from its first entry, here and before publication. Other store changes
     // keep the scan's position.
