@@ -438,6 +438,8 @@ export type ProgressiveValue =
       dispatchRoots?: Record<string, DispatchRootCharges>;
       roots?: SessionFile[];
       scope?: string[];
+      // The device and inode of the receipt store directory that the receipt scan read. Empty when the store was missing.
+      receiptStore?: string;
       checkpoint?: DiscoveryCheckpoint;
     }
   | {

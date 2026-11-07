@@ -146,6 +146,16 @@ test.each(['claude', 'codex'] as const)(
               fx.parent.sessionId,
               JSON.stringify(result.value.references),
             );
+            const store = fs.statSync(fx.receipts.root, { bigint: true });
+            assert.equal(
+              result.value.receiptStore,
+              `${store.dev}:${store.ino}`,
+              'the reply did not name its receipt store',
+            );
+            if (host) {
+              assert.deepEqual(host.savedLinks?.references, result.value.references, 'the host saved no settled links');
+              assert.equal(host.savedLinks?.receiptStore, result.value.receiptStore);
+            }
             assert.equal(
               agentRunAnswer(false, fx.child.sessionId, new Set(), false, true, parents.get(fx.child.sessionId)?.owned),
               true,

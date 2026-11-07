@@ -239,6 +239,7 @@ import {
   MAX_CLAUDE_CHILD_REFERENCE_FILES,
   CLAUDE_METADATA_TAIL_BYTES,
   MAX_CLAUDE_CHILD_REFERENCES_PER_FILE,
+  MAX_SAVED_DISCOVERY_LINKS,
   DerivedCacheCheckpointState,
   carryDerivedTitleFacts,
   derivedTitleCacheCurrent,
@@ -267,9 +268,18 @@ const VERSION = METADATA_GENERATIONS.claude;
 // Test sessions live outside both source roots. These helpers qualify every entry as a Claude session.
 const claudeSession = () => 'claude' as const;
 function saveClaudeCache(...args: Parameters<typeof saveDerivedCache>): void {
-  const [file, titles, references = [], names = [], replace, discovery, repositories = [], agentOf = claudeSession] =
-    args;
-  saveDerivedCache(file, titles, references, names, replace, discovery, repositories, agentOf);
+  const [
+    file,
+    titles,
+    references = [],
+    names = [],
+    replace,
+    discovery,
+    repositories = [],
+    agentOf = claudeSession,
+    links,
+  ] = args;
+  saveDerivedCache(file, titles, references, names, replace, discovery, repositories, agentOf, links);
 }
 function loadClaudeCache(file: string, sources: string | DerivedCacheSources = {}): DerivedCache {
   return loadDerivedCache(file, {
@@ -277,6 +287,58 @@ function loadClaudeCache(file: string, sources: string | DerivedCacheSources = {
     ...(typeof sources === 'string' ? { legacy: sources } : sources),
   });
 }
+
+test('the derived cache keeps the saved discovery links and drops a malformed or oversized set', () => {
+  const cache = path.join(folder(), 'cache.json');
+  const child = '/repo/parent/subagents/agent-child.jsonl';
+  const links = {
+    savedAt: 1000,
+    scope: JSON.stringify(['/repo']),
+    compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
+    receiptStore: '1:2',
+    references: [
+      { kind: 'subagent' as const, parentSessionId: 'parent', sessionId: 'child', file: child, toolUseIds: ['tool'] },
+      {
+        kind: 'dispatch' as const,
+        agent: 'codex' as const,
+        parentSessionId: 'parent',
+        sessionId: '0199a1b2-0000-7000-8000-000000000001',
+        file: '/codex/rollout.jsonl',
+        toolUseIds: ['call'],
+        name: null,
+        owned: true,
+      },
+    ],
+    children: [
+      {
+        agent: 'claude' as const,
+        file: child,
+        sessionId: 'child',
+        parentSessionId: 'parent',
+        toolUseIds: ['tool'],
+        childTranscript: true as const,
+        agentRun: true as const,
+        cwd: '/repo',
+        size: 10,
+        mtimeMs: 5,
+        dev: '1',
+        ino: '2',
+      },
+    ],
+  };
+  saveClaudeCache(cache, [], [], [], undefined, undefined, [], undefined, links);
+  assert.deepEqual(loadClaudeCache(cache).links, links, 'the saved links did not survive a restart');
+  saveClaudeCache(cache, [], [], [], undefined, undefined, [], undefined, {
+    ...links,
+    children: [{ ...links.children[0], cwd: '' }],
+  });
+  assert.equal(loadClaudeCache(cache).links, undefined, 'a child row without a working directory kept the set');
+  saveClaudeCache(cache, [], [], [], undefined, undefined, [], undefined, {
+    ...links,
+    references: Array.from({ length: MAX_SAVED_DISCOVERY_LINKS }, () => links.references[0]),
+  });
+  assert.equal(loadClaudeCache(cache).links, undefined, 'a link set over the limit was saved');
+});
 
 test('durable prefix validation rejects inconsistent stamps offsets framing and oversized evidence', async () => {
   const directory = folder();

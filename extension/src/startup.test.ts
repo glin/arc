@@ -115,6 +115,7 @@ import {
   withRailEnrichment,
   withMetadataCoverage,
   withSessionName,
+  SAVED_DISCOVERY_LINKS_MAX_AGE_MS,
 } from './derivedcache';
 import {
   aggregateUsageEvents,
@@ -2443,6 +2444,7 @@ afterEach(() => {
 // fault stopped fails at once when it awaits through raceHarnessFault. Discovery reads the instance methods of the class by identifier or string name.
 // Getters and properties that hold a function are not covered. A computed method name fails the discovery.
 const OPTIONAL_PANEL_PROVIDER_STUBS = `
+      publishCachedLinks() { return null; }
       updateProjectSpendIntegrity() {}
       publishProjectSpendCoverage() {}
       defaultContext() { return undefined; }
@@ -9467,6 +9469,227 @@ test('the first rail after a derived cache version bump draws every stored name,
     },
     'the first rail after a version bump drew a session it has not reread as Session and an id',
   );
+});
+
+// A warm start whose derived cache holds the links of the last settled discovery reply. The census lists the child transcript
+// at a grown size, and the walk lists a second Claude parent that a verified reply can move the child to.
+function cachedLinksHarness(change: (fixture: any) => void = () => {}) {
+  const now = 1_000_000_000_000;
+  const fixture: any = { census: [] };
+  const harness = bumpedCatalogHarness(
+    {
+      SAVED_DISCOVERY_LINKS_MAX_AGE_MS,
+      enumerateClaudeChildSources: () => ({
+        sessions: fixture.census,
+        files: fixture.census.map((source: SessionFile) => source.file),
+        directories: ['fixture'],
+        status: 'complete',
+        uncertain: [],
+      }),
+    },
+    false,
+    ['publishCachedLinks', 'membershipOf', 'physicalMembershipOf'],
+  );
+  const { provider, claude, child, claudeWalk } = harness;
+  const other = { ...claude, file: 'fixture/other.jsonl', sessionId: '6f2c1d9e-0000-4000-8000-000000000003' };
+  claudeWalk.push(other);
+  const link = {
+    kind: 'subagent' as const,
+    parentSessionId: claude.sessionId,
+    sessionId: child.sessionId,
+    file: child.file,
+    toolUseIds: ['tool-1'],
+  };
+  const savedChild = {
+    ...child,
+    parentSessionId: claude.sessionId,
+    toolUseIds: ['tool-1'],
+    agentRun: true as const,
+    cwd: 'project',
+  };
+  fixture.census = [{ ...child, cwd: 'project', agentRun: true, size: 1200 }];
+  fixture.saved = {
+    savedAt: now - 1000,
+    scope: JSON.stringify(['project']),
+    compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
+    receiptStore: 'store-1',
+    references: [link],
+    children: [savedChild],
+  };
+  fixture.store = 'store-1';
+  change(fixture);
+  const work = new Map<string, number>();
+  const requests: ProgressiveRequest[] = [];
+  const reply = fixture.reply;
+  Object.assign(provider, {
+    savedLinks: fixture.saved,
+    receiptStoreIdentity: () => fixture.store,
+    performanceCounters: {
+      ...provider.performanceCounters,
+      recordWork: (name: string, count = 1) => work.set(name, (work.get(name) ?? 0) + count),
+    },
+  });
+  const run = provider.progressiveWorker.run;
+  provider.progressiveWorker.run = (request: ProgressiveRequest, generation: number, ...rest: unknown[]) => {
+    requests.push(request);
+    return reply ? Promise.resolve({ generation, value: reply(request) }) : run(request, generation, ...rest);
+  };
+  return { ...harness, other, link, savedChild, work, requests, now };
+}
+
+test('a warm start publishes its first catalog from the saved links before the worker replies, with discovery pending', async () => {
+  vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+  try {
+    const { provider, claude, child, link, work, requests, now } = cachedLinksHarness();
+    vi.setSystemTime(now);
+    await provider.refresh(true);
+    assert.equal(requests.length, 0, 'the first catalog waited for a discovery reply');
+    assert.equal(work.get('cachedLinks:published'), 1, 'the publication from saved links was not counted');
+    const row = provider.authoritativeCatalog.find((session: SessionFile) => session.file === child.file);
+    assert.ok(row, 'the first accepted catalog lacks the saved child row');
+    assert.equal(row.parentSessionId, claude.sessionId);
+    assert.equal(row.size, 1200, 'the saved child row kept its saved size instead of the walked one');
+    assert.deepEqual(provider.claudeChildReferences, [link]);
+    assert.equal(
+      provider.dispatchDiscoveryPending,
+      true,
+      'discovery was not pending after a publication from saved links',
+    );
+    assert.equal(
+      provider.sessionReadDiscoveryRevision,
+      undefined,
+      'unverified links granted the session read revision',
+    );
+    assert.equal(provider.membershipCoverage.status, 'incomplete', 'unverified links completed membership coverage');
+    assert.equal(provider.membershipOf('removed-session'), 'unknown', 'unverified links proved a session absent');
+    assert.equal(
+      provider.physicalMembershipOf('projects/removed-child.jsonl'),
+      'unknown',
+      'unverified links proved a child file absent',
+    );
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('the verified reply replaces a saved link that moved, moves the child row and counts the stale link', async () => {
+  vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+  try {
+    let verified: any;
+    const { provider, child, other, work, requests, now } = cachedLinksHarness((fixture) => {
+      fixture.reply = (request: ProgressiveRequest) => verified(request);
+    });
+    const moved = {
+      kind: 'subagent' as const,
+      parentSessionId: other.sessionId,
+      sessionId: child.sessionId,
+      file: child.file,
+      toolUseIds: ['tool-2'],
+    };
+    const movedChild = {
+      ...child,
+      size: 1200,
+      parentSessionId: other.sessionId,
+      toolUseIds: ['tool-2'],
+      agentRun: true,
+      cwd: 'project',
+    };
+    verified = (request: ProgressiveRequest) => ({
+      compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
+      kind: 'claude-children',
+      roots: request.kind === 'claude-children' ? request.parents : [],
+      complete: true,
+      continuation: false,
+      membershipSettled: true,
+      references: [moved],
+      dispatchFacts: [],
+      children: [movedChild],
+      referenceEntries: [],
+      receiptStore: 'store-2',
+    });
+    vi.setSystemTime(now);
+    await provider.refresh(true);
+    assert.equal(requests.length, 0);
+    await vi.runOnlyPendingTimersAsync();
+    assert.equal(requests.length, 1, 'the continuation sent no discovery request to verify the saved links');
+    assert.deepEqual(provider.claudeChildReferences, [moved]);
+    const rows = provider.catalog.sessions.filter((session: SessionFile) => session.file === child.file);
+    assert.equal(rows.length, 1, 'the verified reply left the child row twice or dropped it');
+    assert.equal(rows[0].parentSessionId, other.sessionId, 'the child row stayed under its saved parent');
+    assert.equal(provider.dispatchDiscoveryPending, false, 'the verified reply left discovery pending');
+    assert.equal(work.get('cachedLinks:changed'), 1, 'the stale saved link was not counted');
+    assert.deepEqual(
+      { ...provider.savedLinks, savedAt: undefined },
+      {
+        savedAt: undefined,
+        scope: JSON.stringify(['project']),
+        compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
+        receiptStore: 'store-2',
+        references: [moved],
+        children: [movedChild],
+      },
+      'the settled reply did not replace the saved links',
+    );
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('a complete reply that leaves members unsettled saves no links', async () => {
+  const { provider, claude } = bumpedCatalogHarness();
+  provider.refreshGeneration = 4;
+  provider.claudeParents = [claude];
+  provider.progressiveWorker.run = (request: ProgressiveRequest, generation: number) =>
+    Promise.resolve({
+      generation,
+      value: {
+        compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
+        kind: 'claude-children',
+        roots: request.kind === 'claude-children' ? request.parents : [],
+        complete: true,
+        continuation: true,
+        references: [],
+        dispatchFacts: [],
+        children: [],
+        referenceEntries: [],
+        receiptStore: 'store-1',
+      },
+    });
+  assert.equal(await provider.prepareClaudeChildren(4, new AbortController().signal), true);
+  assert.equal(provider.dispatchDiscoveryPending, true);
+  assert.equal(provider.savedLinks, undefined, 'an unsettled reply saved its links for the next start');
+});
+
+test.each([
+  ['missing', (fixture: any) => (fixture.saved = undefined)],
+  ['scope', (fixture: any) => (fixture.saved.scope = JSON.stringify(['elsewhere']))],
+  ['generation', (fixture: any) => (fixture.saved.compatibility = 'older')],
+  ['age', (fixture: any) => (fixture.saved.savedAt -= SAVED_DISCOVERY_LINKS_MAX_AGE_MS)],
+  ['age', (fixture: any) => (fixture.saved.savedAt += 60_000)],
+  ['store', (fixture: any) => (fixture.store = 'store-2')],
+  ['child', (fixture: any) => (fixture.census = [])],
+  ['child', (fixture: any) => (fixture.census = [{ ...fixture.census[0], ino: 3 }])],
+  ['child', (fixture: any) => (fixture.saved.references[0].file = 'fixture/gone.jsonl')],
+  ['parent', (fixture: any) => (fixture.saved.references[0].parentSessionId = 'gone')],
+  ['parent', (fixture: any) => (fixture.saved.children[0].parentSessionId = 'gone')],
+])('a saved link set refused for %s leaves the first catalog to the discovery reply', async (reason, change) => {
+  vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+  try {
+    const { provider, work, requests, now } = cachedLinksHarness((fixture) => {
+      fixture.saved = structuredClone(fixture.saved);
+      change(fixture);
+    });
+    vi.setSystemTime(now);
+    await provider.refresh(true);
+    assert.deepEqual(
+      [...work].filter(([name]) => name.startsWith('cachedLinks:')),
+      [[`cachedLinks:refused:${reason}`, 1]],
+    );
+    assert.equal(requests.length, 1, 'the refused link set skipped the discovery request');
+    assert.equal(provider.dispatchDiscoveryPending, false);
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 // Removing a session from the catalog removes its carried name and retains names for listed sessions.

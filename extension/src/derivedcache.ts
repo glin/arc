@@ -26,6 +26,7 @@ import {
   sessionStatFactsOf,
   type AgentKind,
   type AgentRunScan,
+  type ClaudeChildSessionFile,
   type ClaudeChildSessionReference,
   type FileRevision,
   type SessionFile,
@@ -369,7 +370,27 @@ export interface DerivedCache {
   claudeChildReferences: Map<string, ClaudeChildReferenceCacheEntry>;
   // Names carried across a metadata generation change until a metadata read supplies a title entry.
   carriedNames: Map<string, CarriedName>;
+  links?: SavedDiscoveryLinks;
 }
+
+// The merged links and child rows of the last complete discovery reply that settled membership. A later start publishes its
+// first catalog from them while discovery stays pending.
+export interface SavedDiscoveryLinks {
+  // `Date.now()` when the reply settled.
+  savedAt: number;
+  // The repository roots of the reply, as JSON.
+  scope: string;
+  // `discoveryCompatibility` of the relationship parser version that produced the links.
+  compatibility: string;
+  // The device and inode of the receipt store directory that the reply's receipt scan read. Empty when the store was missing.
+  receiptStore: string;
+  references: ClaudeChildSessionReference[];
+  children: ClaudeChildSessionFile[];
+}
+// A larger link set is not saved.
+export const MAX_SAVED_DISCOVERY_LINKS = 65_536;
+// An older link set publishes no first catalog.
+export const SAVED_DISCOVERY_LINKS_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 export interface CarriedName {
   label: string;
@@ -452,6 +473,7 @@ interface StoredCache {
   titles: StoredTitle[];
   claudeChildReferences: StoredChildReferences[];
   carriedNames: StoredCarriedName[];
+  links?: SavedDiscoveryLinks;
 }
 
 export type MetadataGenerations = Readonly<Record<AgentKind, number>>;
@@ -961,6 +983,50 @@ function childReference(value: unknown, parentSessionId: string): value is Claud
   );
 }
 
+// A merged link names its own parent. A resolved dispatch link also names the dispatched session's file.
+function savedLink(value: unknown): value is ClaudeChildSessionReference {
+  if (!record(value) || !nonEmptyText(value.parentSessionId)) return false;
+  if (value.kind === undefined || value.kind === 'subagent')
+    return childReference({ ...value, kind: 'subagent' }, value.parentSessionId);
+  return (
+    (value.file === null || fileName(value.file)) && childReference({ ...value, file: null }, value.parentSessionId)
+  );
+}
+
+function savedChild(value: unknown): value is ClaudeChildSessionFile {
+  return (
+    record(value) &&
+    value.agent === 'claude' &&
+    fileName(value.file) &&
+    nonEmptyText(value.sessionId) &&
+    nonEmptyText(value.parentSessionId) &&
+    nonEmptyText(value.cwd) &&
+    value.childTranscript === true &&
+    value.agentRun === true &&
+    Array.isArray(value.toolUseIds) &&
+    value.toolUseIds.every(nonEmptyText) &&
+    nonNegative(value.size) &&
+    nonNegative(value.mtimeMs) &&
+    (value.dev === undefined || fileIdentityValue(value.dev)) &&
+    (value.ino === undefined || fileIdentityValue(value.ino))
+  );
+}
+
+function savedDiscoveryLinks(value: unknown): value is SavedDiscoveryLinks {
+  return (
+    record(value) &&
+    finite(value.savedAt) &&
+    text(value.scope) &&
+    text(value.compatibility) &&
+    text(value.receiptStore) &&
+    Array.isArray(value.references) &&
+    Array.isArray(value.children) &&
+    value.references.length + value.children.length <= MAX_SAVED_DISCOVERY_LINKS &&
+    value.references.every(savedLink) &&
+    value.children.every(savedChild)
+  );
+}
+
 function codexDispatchCursor(value: unknown, parentSessionId: string, size: number): boolean {
   if (!record(value)) return false;
   return (
@@ -1304,6 +1370,7 @@ export function loadDerivedCache(
     }
     loaded.reuse.format = format as number;
     loaded.codexMetas = legacy ? storedCodexMetas(parsed) : new Map();
+    if (format === 2 && savedDiscoveryLinks(parsed.links)) loaded.links = parsed.links;
     carryNames(loaded.carriedNames, parsed.carriedNames, (row) => row);
     loaded.reuse.storedGeneration = legacy
       ? parsed.version
@@ -1427,6 +1494,7 @@ export function saveDerivedCache(
   discovery?: import('./progressiveworker').DiscoveryCheckpoint,
   commitRepositories: Iterable<VerifiedCommitRepository> = [],
   agentOf: (file: string) => AgentKind | null = sourceAgentOf,
+  links?: SavedDiscoveryLinks,
 ): void {
   const unqualified = new Map<string, CarriedName>();
   const titleRows: StoredTitle[] = [];
@@ -1472,6 +1540,7 @@ export function saveDerivedCache(
       .filter(([entryFile, name]) => !titled.has(entryFile) && carriedName(name))
       .map(([entryFile, name]) => ({ file: entryFile, label: name.label, fullLabel: name.fullLabel }))
       .sort((a, b) => a.file.localeCompare(b.file)),
+    links: links && links.references.length + links.children.length <= MAX_SAVED_DISCOVERY_LINKS ? links : undefined,
   };
   writeFileAtomically(file, JSON.stringify(data), replace);
 }

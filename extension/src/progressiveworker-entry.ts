@@ -286,14 +286,6 @@ function closeReceiptScan(cause: 'epoch' | 'store' | 'refusal'): void {
   receiptScan?.retry?.return(null);
   receiptScan = null;
 }
-function receiptStoreIdentity(store: DispatchReceipts): string {
-  try {
-    const stat = fs.statSync(store.root, { bigint: true });
-    return `${stat.dev}:${stat.ino}`;
-  } catch {
-    return '';
-  }
-}
 const catalogIdentity = (agent: string, sessionId: string) => JSON.stringify([agent, sessionId]);
 // Names the identities whose catalog rows differ between two catalogs, by file and child flag.
 function changedCatalogIdentities(before: readonly SessionFile[], after: readonly SessionFile[]): Set<string> {
@@ -1285,7 +1277,7 @@ async function execute(
     continuation ||= unsettled.parents;
     // A replaced store directory starts the scan again from its first entry, here and before publication. Other store changes
     // keep the scan's position.
-    if (receiptScan && receiptStoreIdentity(receiptScan.store) !== receiptScan.storeIdentity) closeReceiptScan('store');
+    if (receiptScan && receiptScan.store.storeIdentity() !== receiptScan.storeIdentity) closeReceiptScan('store');
     if (!receiptScan) {
       unrecordedReceiptOpens.push(
         receiptScanClosed ? RECEIPT_SCAN_OPEN_CHARGES[receiptScanClosed] : 'receiptScanOpensNewWorker',
@@ -1293,7 +1285,7 @@ async function execute(
       const controller = new AbortController();
       const store = new DispatchReceipts();
       const scan: ReceiptScan = {
-        storeIdentity: receiptStoreIdentity(store),
+        storeIdentity: store.storeIdentity(),
         epoch: epoch.epoch,
         store,
         controller,
@@ -1391,7 +1383,7 @@ async function execute(
     }
     if (signal.aborted) return { kind: 'stale' };
     // Links read from a replaced store never publish with retries read from its replacement.
-    if (receiptStoreIdentity(activeReceipts.store) !== activeReceipts.storeIdentity) {
+    if (activeReceipts.store.storeIdentity() !== activeReceipts.storeIdentity) {
       closeReceiptScan('store');
       charges.receiptPassEnds++;
       return pending();
@@ -1440,6 +1432,7 @@ async function execute(
       dispatchRoots: spend.dispatchRoots,
       roots: epoch.parents,
       scope: epoch.repositoryRoots,
+      receiptStore: activeReceipts.storeIdentity,
     };
   }
   if ((request.kind === 'starts' || request.kind === 'metadata') && isCompressedRollout(request.session.file)) {

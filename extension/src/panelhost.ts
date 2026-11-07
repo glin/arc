@@ -1,5 +1,6 @@
 import { parseLinkDestination, linkBrowserKind, type LinkDestination, type LinkOpening } from './domain/link-path';
 import { compatibleDiscovery, discoveryCompatibility } from './progressiveworker';
+import { DispatchReceipts } from './dispatchreceipts';
 import {
   sessionCoverageMember,
   reconcileSessionCollisions,
@@ -619,6 +620,8 @@ import {
   withSessionName,
   type CarriedName,
   type ClaudeChildReferenceCacheEntry,
+  type SavedDiscoveryLinks,
+  SAVED_DISCOVERY_LINKS_MAX_AGE_MS,
 } from './derivedcache';
 import { drawnSessionCards } from './sessiondetails';
 import {
@@ -1646,6 +1649,15 @@ export class PanelProvider implements vscode.Disposable {
   private claudeChildren: ClaudeChildSessionFile[] = [];
   // Defer child-sensitive cache pruning until the first Claude child discovery completes.
   private claudeChildrenDiscovered = false;
+  // The links of the last settled discovery reply, saved with the derived cache. The first catalog of an activation can publish
+  // from the set that the previous activation saved.
+  private savedLinks?: SavedDiscoveryLinks;
+  // True once the first catalog of this activation published from the saved links or refused them.
+  private cachedLinksOffered = false;
+  // The saved links that the first catalog published, until a settled reply verifies them.
+  private cachedLinks?: readonly ClaudeChildSessionReference[];
+  // Every child transcript that the last walk's census listed, with its working directory when its opening named one.
+  private walkedChildSources: SessionFile[] = [];
   // The selected session ID, restored from panel state and reconciled by `pickShowing`.
   private showing: string | null = null;
   // Archived session IDs filter host reads. Panel state persists the set without deleting session data.
@@ -3574,6 +3586,7 @@ export class PanelProvider implements vscode.Disposable {
       }
       this.claudeChildReferenceEntries = cached.claudeChildReferences;
       this.discoveryCheckpoint = cached.discovery;
+      this.savedLinks = cached.links;
       this.carriedNames = cached.carriedNames;
       this.commitRepositories.load(cached.commitRepositories ?? []);
       this.derivedMigrationPending = cached.migrationPending === true;
@@ -9926,11 +9939,24 @@ export class PanelProvider implements vscode.Disposable {
         );
         this.startupHistory?.stage('relationshipsStarted');
         const listed = new Map(all.map((session) => [session.file, session]));
-        const discovered = await this.prepareClaudeChildren(generation, controller.signal, humanPromptWork);
-        if (!discovered || controller.signal.aborted || generation !== this.refreshGeneration) {
-          return;
+        // The first catalog of an activation can publish from the links the previous activation saved, before the worker's first
+        // reply. Discovery stays pending, and the continuation after this refresh sends the request that verifies the links.
+        const cachedFirst =
+          this.authoritativeCatalog === null &&
+          !this.claudeChildrenDiscovered &&
+          this.walkedCatalog?.scope === JSON.stringify(this.repositoryScopeRoots)
+            ? this.publishCachedLinks(all)
+            : null;
+        if (cachedFirst) {
+          all = cachedFirst;
+          if (this.catalog) this.catalog = { ...this.catalog, sessions: all };
+        } else {
+          const discovered = await this.prepareClaudeChildren(generation, controller.signal, humanPromptWork);
+          if (!discovered || controller.signal.aborted || generation !== this.refreshGeneration) {
+            return;
+          }
+          all = this.catalog?.sessions ?? all;
         }
-        all = this.catalog?.sessions ?? all;
         // While discovery continues, the list keeps the accepted sessions. An accepted source that this refresh lists with the
         // same device and inode and no smaller size takes the listed revision, so its metadata read follows the file before
         // discovery completes.
@@ -10712,6 +10738,8 @@ export class PanelProvider implements vscode.Disposable {
           undefined,
           this.discoveryCheckpoint,
           this.commitRepositories.snapshot(),
+          undefined,
+          this.savedLinks,
         );
       const published = this.workspaceCache
         ? this.workspaceCache.write(write, this.cacheShutdownFlushing, file)
@@ -12690,6 +12718,7 @@ export class PanelProvider implements vscode.Disposable {
       codexEnumeration,
     );
     const census = enumerateClaudeChildSources([...claude, ...this.claudeChildren]);
+    this.walkedChildSources = census.sessions;
     const childSources = census.sessions.filter((source) => !source.cwd || inRoots(source.cwd));
     claudeListing.files = [...claudeListing.files, ...census.files];
     claudeListing.directories = [...(claudeListing.directories ?? []), ...(census.directories ?? [])];
@@ -13096,6 +13125,31 @@ export class PanelProvider implements vscode.Disposable {
     this.applyDispatchFacts(progress.dispatchFacts ?? []);
     this.claudeChildren = progress.children;
     this.claudeChildrenDiscovered = true;
+    if (!this.dispatchDiscoveryPending) {
+      // A settled reply verifies the links that the first catalog published from the saved set, and replaces the saved set.
+      if (this.cachedLinks) {
+        const key = (reference: ClaudeChildSessionReference) =>
+          JSON.stringify([
+            reference.kind ?? 'subagent',
+            reference.parentSessionId,
+            reference.sessionId,
+            reference.file,
+          ]);
+        const verified = new Set(progress.references.map(key));
+        const stale = this.cachedLinks.filter((reference) => !verified.has(key(reference))).length;
+        if (stale) this.performanceCounters?.recordWork?.('cachedLinks:changed', stale);
+        this.cachedLinks = undefined;
+      }
+      if (progress.receiptStore !== undefined)
+        this.savedLinks = {
+          savedAt: Date.now(),
+          scope: JSON.stringify(this.repositoryScopeRoots),
+          compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
+          receiptStore: progress.receiptStore,
+          references: progress.references,
+          children: progress.children,
+        };
+    }
     const currentFiles = new Set(progress.referenceEntries.map(([file]) => file));
     for (const file of this.claudeChildReferenceEntries.keys())
       if (!currentFiles.has(file)) this.claudeChildReferenceEntries.delete(file);
@@ -13169,6 +13223,66 @@ export class PanelProvider implements vscode.Disposable {
       this.derivedCacheCheckpointState.markChanged();
     }
     return true;
+  }
+
+  // The catalog of a first acceptance built from the walked rows and the links that the previous activation saved, or null when
+  // the saved set is unusable. The links and child rows take effect with discovery pending, so they supply no absence proof and no
+  // delivery authority until a settled reply replaces them. Each activation offers the saved set once, and counts the outcome.
+  private publishCachedLinks(walked: readonly SessionFile[]): SessionFile[] | null {
+    if (this.cachedLinksOffered) return null;
+    this.cachedLinksOffered = true;
+    const refuse = (reason: string): null => {
+      this.performanceCounters.recordWork(`cachedLinks:refused:${reason}`);
+      return null;
+    };
+    const saved = this.savedLinks;
+    if (!saved) return refuse('missing');
+    if (saved.scope !== JSON.stringify(this.repositoryScopeRoots)) return refuse('scope');
+    if (saved.compatibility !== discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION))
+      return refuse('generation');
+    const age = Date.now() - saved.savedAt;
+    if (age < 0 || age > SAVED_DISCOVERY_LINKS_MAX_AGE_MS) return refuse('age');
+    const parents = new Map((this.claudeParents ?? []).map((source) => [normalizeFsPath(source.file), source]));
+    const childSources = new Map(this.walkedChildSources.map((source) => [normalizeFsPath(source.file), source]));
+    const sessionIds = new Set([...parents.values(), ...childSources.values()].map((source) => source.sessionId));
+    const children: ClaudeChildSessionFile[] = [];
+    for (const child of saved.children) {
+      const source = childSources.get(normalizeFsPath(child.file));
+      if (
+        !source?.cwd ||
+        source.sessionId !== child.sessionId ||
+        String(source.dev) !== String(child.dev) ||
+        String(source.ino) !== String(child.ino) ||
+        source.cwd !== child.cwd ||
+        !isInside(source.cwd, this.repositoryScopeRoots)
+      )
+        return refuse('child');
+      if (!sessionIds.has(child.parentSessionId)) return refuse('parent');
+      // The row takes the walked revision, so its metadata follows the file.
+      children.push({ ...child, size: source.size, mtimeMs: source.mtimeMs });
+    }
+    for (const reference of saved.references) {
+      if (!sessionIds.has(reference.parentSessionId)) return refuse('parent');
+      const file = reference.file === null ? null : normalizeFsPath(reference.file);
+      if (file !== null && !parents.has(file) && !childSources.has(file)) return refuse('child');
+    }
+    if (this.receiptStoreIdentity() !== saved.receiptStore) return refuse('store');
+    this.claudeChildReferences = saved.references;
+    this.claudeChildren = children;
+    this.cachedLinks = saved.references;
+    this.dispatchDiscoveryPending = true;
+    this.sessionQueryDiscoveryPending = true;
+    this.discoveryComplete = undefined;
+    this.publishSessionQueryContext();
+    this.performanceCounters.recordWork('cachedLinks:published');
+    return orderSessionCatalog(
+      [...walked.filter((session) => session.childTranscript !== true), ...children],
+      (session) => this.activityFor(session),
+    );
+  }
+
+  private receiptStoreIdentity(): string {
+    return new DispatchReceipts().storeIdentity();
   }
 
   // Replaces the dispatched facts, and moves the figures revision when a drawn figure changed.

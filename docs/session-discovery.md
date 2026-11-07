@@ -14,6 +14,18 @@ Admission shares read and filesystem-check allowances across Claude sources and 
 
 After a catalog is accepted, the published rows stay that catalog's sessions while relationship discovery continues. A refresh can list an accepted source again with the same device and inode and no smaller size. That source takes the listed revision, so its metadata follows the file. A walked source of a session that this panel started and still awaits joins them. That source must be the only walked source of its session ID and a walk member without a collision. It must also have a supported file identity, lie inside repository scope, and be absent from the accepted rows. Child transcripts wait for discovery, and discovery stays incomplete.
 
+The first catalog of an activation can publish before the worker's first reply, from the links and child rows that the last settled complete reply saved in the [derived cache](session-history.md#cache-ownership). The host refuses the saved set when one of these holds, and the start then waits for the discovery reply:
+
+- `missing`: the derived cache holds no saved set.
+- `scope`: the set names other repository roots.
+- `generation`: the set names another discovery compatibility, which covers the relationship parser version.
+- `age`: the set is more than 24 hours old, or its time is later than the current time.
+- `child`: the walk's child census does not list a saved child row with the same session ID, device, inode and working directory inside scope. A link whose file is neither a walked root nor a listed child transcript also refuses the set.
+- `parent`: the parent session of a link or a saved child row is neither a walked root nor a listed child transcript.
+- `store`: the receipt store directory has another device and inode.
+
+The published catalog holds the walked rows and the saved child rows at their walked revisions. Discovery stays pending, so the catalog sets no session read revision, its coverage stays incomplete, and its rows supply no absence proof. The continuation after that refresh sends the discovery request, and the receipt scan runs as on any start. The reply that settles membership replaces the links and the child rows and clears the pending state. A child row whose saved link that reply drops moves to its verified parent in the same publication.
+
 Agent runs remain discoverable but fold away unless pinned or selected. Classification must preserve visibility for sessions that edit workspace files or whose opening turn remains active. Unknown classification matches neither polarity of an agent-run predicate. A dispatched Codex session without a reader-owned launch has unknown classification until its person scan reaches the end of its file. Malformed small transcripts remain unknown. Complete records before an unfinished final fragment still supply classification evidence.
 
 ## Repository scope

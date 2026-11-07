@@ -436,6 +436,15 @@ export class DispatchReceipts {
     this.root = paths.join(paths.resolve(home), 'dispatch');
     this.replace = retryingReplace(replacement);
   }
+  // The device and inode of the store directory, or an empty string when the directory cannot be read.
+  storeIdentity(): string {
+    try {
+      const stat = fs.statSync(this.root, { bigint: true });
+      return `${stat.dev}:${stat.ino}`;
+    } catch {
+      return '';
+    }
+  }
   private relationshipCacheFile(id: string): string {
     const paths = this.platform === 'win32' ? path.win32 : path.posix;
     return paths.join(paths.dirname(this.root), 'cache', 'dispatch-relationships', `${id}.json`);
