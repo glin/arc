@@ -246,6 +246,9 @@ let sentReferences: {
 function discoverySourceKey(row: SessionFile): string {
   return `${normalizeFsPath(row.file)}\0${row.sessionId}\0${row.agent}\0${row.childTranscript === true}`;
 }
+// The parent keys of the current epoch. The worker builds them when an epoch starts and when a root change replaces its
+// parents. The host returns the epoch's own checkpoint, so an adopted checkpoint of the same epoch keeps them.
+let epochParentKeys: { epoch: string | undefined; keys: Set<string> } | null = null;
 interface ReceiptScan {
   epoch: string | undefined;
   store: DispatchReceipts;
@@ -737,6 +740,7 @@ async function execute(
         receiptScan.catalog = catalog;
       }
       const { protectedFile: _protectedFile, ...rest } = held;
+      epochParentKeys = null;
       discoveryEpoch = {
         ...rest,
         parents,
@@ -1267,7 +1271,9 @@ async function execute(
     for (const [file, entry] of boundedEntries) claudeChildReferences.set(file, entry);
     // A walk and a targeted refresh list the same parents in different orders, and a listing can name a parent twice. The
     // epoch reads its own parents, so only a parent that joins, leaves or changes identity asks for another pass.
-    const epochParents = new Set(epoch.parents.map(discoverySourceKey));
+    if (!epochParentKeys || !epoch.epoch || epochParentKeys.epoch !== epoch.epoch)
+      epochParentKeys = { epoch: epoch.epoch, keys: new Set(epoch.parents.map(discoverySourceKey)) };
+    const epochParents = epochParentKeys.keys;
     const requestParents = new Set(request.parents.map(discoverySourceKey));
     unsettled.parents =
       epochParents.size !== requestParents.size || [...requestParents].some((key) => !epochParents.has(key));
@@ -1397,6 +1403,7 @@ async function execute(
     }
     discoveryPosition = epoch.position;
     discoveryEpoch = null;
+    epochParentKeys = null;
     receiptScan = null;
     receiptScanClosed = 'completion';
     const references = [...transcriptReferences, ...activeReceipts.references.values()];
