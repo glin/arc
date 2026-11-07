@@ -800,6 +800,56 @@ test('a reader counts the invalid and unsupported lines it skips in each slot', 
   });
 });
 
+function refusingOpens(files: string[], refusals: number) {
+  const opens = new Map<string, number>();
+  const filesystem: typeof fs.promises = {
+    ...fs.promises,
+    open: async (...args: Parameters<typeof fs.promises.open>) => {
+      const file = String(args[0]);
+      const count = (opens.get(file) ?? 0) + 1;
+      opens.set(file, count);
+      if (files.includes(file) && count <= refusals) throw refusal('EPERM');
+      return fs.promises.open(...args);
+    },
+  };
+  return { filesystem, opens };
+}
+
+test('a reader retries an open that a delete-pending slot file refuses and reports a refusal that never stops', async () => {
+  const { root } = await populated();
+  const files = slotFiles(root);
+  vi.useFakeTimers({ toFake: ['setTimeout'] });
+  try {
+    const settled = async (filesystem: typeof fs.promises) => {
+      let read: Awaited<ReturnType<typeof readBack>> | undefined;
+      void readBack(root, filesystem).then((value) => {
+        read = value;
+      });
+      await vi.waitFor(() => assert.ok(read));
+      return read!;
+    };
+    const brief = refusingOpens([files.meta, files.data], 2);
+    assert.deepEqual(await settled(brief.filesystem), {
+      utilizations: [0.2],
+      result: { readSlots: 1, problems: [] },
+    });
+    assert.deepEqual([brief.opens.get(files.meta), brief.opens.get(files.data)], [4, 3]);
+    for (const [file, message] of [
+      [files.meta, 'Unreadable usage metadata (EPERM)'],
+      [files.data, 'Unreadable usage payload (EPERM)'],
+    ]) {
+      const endless = refusingOpens([file], Infinity);
+      assert.deepEqual(await settled(endless.filesystem), {
+        utilizations: [],
+        result: { readSlots: 0, problems: [{ file: path.basename(file), message }] },
+      });
+      assert.equal(endless.opens.get(file), 7);
+    }
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 test('a reader reads each metadata and format file through one open and one bounded read', async () => {
   const { root } = await populated();
   const files = slotFiles(root);

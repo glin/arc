@@ -132,7 +132,8 @@ const REFUSAL_CODES = new Set(['EPERM', 'EACCES', 'EBUSY']);
 const REFUSAL_DELAYS_MS = [5, 10, 20, 40, 80, 160];
 
 // On Windows, a reader's open handle refuses a rename over the file, and on some file systems an unlink
-// or the recreation of the unlinked name. The reader closes its handle after one bounded read.
+// or the recreation of the unlinked name. A name that a writer unlinked while a reader held it open refuses
+// a new open until that handle closes. The reader closes its handle after one bounded read.
 async function retryRefusal<T>(operation: () => Promise<T>): Promise<T> {
   for (let attempt = 0; ; attempt++) {
     try {
@@ -476,7 +477,7 @@ function errorCode(error: unknown): string {
 async function boundedBytes(filesystem: typeof fs.promises, file: string, cap: number): Promise<Buffer | null> {
   let handle: FileHandle;
   try {
-    handle = await filesystem.open(file, 'r');
+    handle = await retryRefusal(() => filesystem.open(file, 'r'));
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
     throw error;
@@ -512,7 +513,7 @@ async function payloadPresent(filesystem: typeof fs.promises, file: string, slot
 async function payloadPrefix(filesystem: typeof fs.promises, file: string, length: number): Promise<Buffer | null> {
   let handle: FileHandle;
   try {
-    handle = await filesystem.open(file, 'r');
+    handle = await retryRefusal(() => filesystem.open(file, 'r'));
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
     throw error;
