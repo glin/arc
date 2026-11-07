@@ -452,7 +452,6 @@ test('a window read sent during a receipt pass completes before the pass ends', 
   }
 });
 
-// A panel host whose discovery requests reach the worker, with the last worker reply kept for the test.
 // A receipt slice changes no reference entry, so each receipt reply after the first whole reply is a delta without rows. A
 // host whose checkpoint is behind the worker, or whose sequence differs from the worker's last reply, gets a whole reply.
 test('receipt replies after a whole reply are deltas until the host checkpoint differs from the last reply', async () => {
@@ -517,6 +516,80 @@ test('receipt replies after a whole reply are deltas until the host checkpoint d
   }
 });
 
+// A Codex parent that finds no request bytes above the reserve is read in no quantum, so its request sends no progress reply.
+// The final check still marks the changed parent unfinished, and the receipt delta carries that row to the host.
+test('a receipt delta carries the row of a Codex parent that the final check marked unfinished', async () => {
+  const root = tempDir('receipt-worker-delta-rows-');
+  const fx = receiptDispatchFixture(root, 'claude', 'codex');
+  fs.mkdirSync(fx.receipts.root, { recursive: true });
+  for (let index = 0; index < 900; index++)
+    fs.mkdirSync(path.join(fx.receipts.root, `${index.toString(16).padStart(8, '0')}-1111-2222-3333-444444444444`));
+  fx.launch(fx.parent, fx.child, true, true);
+  const codex = normalizeFsPath(fx.child.file);
+  const environment = `process.env.ARC_HOME=${JSON.stringify(fx.home)};`;
+  // A first worker settles discovery, and the host keeps its rows.
+  let saved = new Map<string, any>();
+  {
+    const worker = new ProgressiveWorker(environment + source);
+    const { host, replies } = await receiptDiscoveryHost(worker, [root], fx.catalog);
+    try {
+      for (let request = 1; request <= 50 && !saved.size; request++) {
+        host.refreshGeneration = request;
+        await host.prepareClaudeChildren(request, new AbortController().signal);
+        const reply = replies.last?.value;
+        if (reply?.kind === 'claude-children' && reply.membershipSettled)
+          saved = new Map(host.claudeChildReferenceEntries);
+      }
+    } finally {
+      worker.stop();
+    }
+  }
+  assert.equal(saved.get(codex)?.complete, true, 'discovery never settled the Codex parent');
+  fs.appendFileSync(
+    fx.child.file,
+    JSON.stringify({ type: 'event_msg', timestamp: '2026-01-01T00:00:04Z', payload: { type: 'agent_message' } }) + '\n',
+  );
+  // A new worker admits the saved rows. Every request leaves the changed Codex parent no bytes above the reserve.
+  const worker = new ProgressiveWorker(environment + narrowReceiptBudget(source));
+  const { host, replies } = await receiptDiscoveryHost(worker, [root], fx.catalog);
+  host.claudeChildReferenceEntries = new Map(saved);
+  const run = worker.run.bind(worker);
+  worker.run = (request, ...rest) =>
+    run(request.kind === 'claude-children' ? { ...request, discoveryBytes: 16 * 1024 } : request, ...rest);
+  const kinds: string[] = [];
+  try {
+    for (let request = 1; request <= 4; request++) {
+      host.refreshGeneration = request;
+      assert.equal(await host.prepareClaudeChildren(request, new AbortController().signal), true);
+      const reply = replies.last?.value;
+      assert.ok(reply);
+      kinds.push(reply.kind);
+      if (reply.kind !== 'claude-children-delta') continue;
+      assert.equal(reply.charges.receiptPassEnds, 1);
+      assert.equal(reply.charges.quanta, 0);
+      assert.deepEqual(
+        reply.referenceEntries.map(([file]) => file),
+        [codex],
+      );
+      const [[, row]] = reply.referenceEntries;
+      assert.equal(row.complete, false);
+      assert.equal(row.relationshipComplete, false);
+      assert.deepEqual(reply.completed, []);
+      assert.deepEqual(host.claudeChildReferenceEntries.get(codex), row);
+      assert.equal(host.discoveryCheckpoint.completed.includes(codex), false);
+    }
+    assert.deepEqual(kinds, [
+      'claude-children-progress',
+      'claude-children-delta',
+      'claude-children-delta',
+      'claude-children-delta',
+    ]);
+  } finally {
+    worker.stop();
+  }
+});
+
+// A panel host whose discovery requests reach the worker, with the last worker reply kept for the test.
 async function receiptDiscoveryHost(
   worker: ProgressiveWorker,
   roots: string[],
