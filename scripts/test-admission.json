@@ -216,8 +216,8 @@
   },
   "extension/src/usagerecord.test.ts": {
     "reason": "Independent host processes must serialize near-cap usage writes while different day slots remain independent.",
-    "cases": 20,
-    "matricesSha256": "e58d9afdc9625ad44fe51d83443f37758e64a3b844b1f84ea769c30926256e9b"
+    "cases": 24,
+    "matricesSha256": "e440d64f9e8a7b33b32680a0a96dba18fb9ec0f02fe5be14d899f7814bc8c813"
   },
   "extension/src/web-demo-publish.test.ts": {
     "reason": "The publish script must commit the built site through real Git processes on fixture repositories. It must leave the checkout unchanged and refuse unsafe source and branch states.",
