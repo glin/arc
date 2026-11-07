@@ -3790,7 +3790,7 @@ function cachedLinksReadFixture(opening: string, agentId: boolean) {
   f.provider.authoritativeCatalogScope = scope;
   assert.deepEqual(work, ['cachedLinks:published']);
   assert.equal(f.provider.dispatchDiscoveryPending, true);
-  return { ...f, parent, childId, childFile, link };
+  return { ...f, parent, childId, childFile, link, savedChild: f.provider.savedLinks.children[0] };
 }
 
 test.each([
@@ -3835,6 +3835,105 @@ test('a window request for a parent published from saved links carries no saved 
     f.provider.agentFile(f.parent, agent, () => []),
     null,
     'a file action resolved through a saved link',
+  );
+});
+
+// Delivers a settled complete discovery reply to the fixture's provider, under the roots it holds when the reply arrives.
+async function settleCachedLinksFixture(f: ReturnType<typeof cachedLinksReadFixture>, listed: boolean) {
+  const reply = {
+    compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
+    kind: 'claude-children',
+    complete: true,
+    continuation: false,
+    membershipSettled: true,
+    references: listed ? [f.link] : [],
+    dispatchFacts: [],
+    children: listed ? [f.savedChild] : [],
+    referenceEntries: [],
+    receiptStore: 'store-1',
+  };
+  f.provider.refreshGeneration = 4;
+  // The reply's acknowledgment, prompt admission and spend steps keep their own tests.
+  Object.assign(f.provider, {
+    claudeChildReferenceEntries: f.provider.claudeChildReferenceEntries ?? new Map(),
+    claudeChildStatWrites: f.provider.claudeChildStatWrites ?? new Map(),
+    derivedCacheCheckpointState: { markChanged() {} },
+    startupProgressAt: Number.POSITIVE_INFINITY,
+    prepareHumanPrompts: async (roots: unknown[]) => roots,
+    updateSessionSpendSources() {},
+    dispatchedDiscoveryWaiting: () => false,
+    pruneDerivedTitles: () => false,
+  });
+  f.provider.progressiveWorker = {
+    run: (request: any, generation: number) =>
+      Promise.resolve({ generation, value: { ...reply, roots: request.parents ?? [] } }),
+  };
+  assert.equal(await f.provider.prepareClaudeChildren(4, new AbortController().signal), true);
+  assert.equal(f.provider.dispatchDiscoveryPending, false, 'the reply did not settle discovery');
+}
+
+// The session page row of the fixture's child, and the export input of the child with the child archived.
+function cachedLinksExportAndPage(f: ReturnType<typeof cachedLinksReadFixture>) {
+  Object.assign(f.provider, {
+    hosts: [],
+    pendingWatch: { snapshot: () => ({ eventCount: 0, broadRequired: false }) },
+    titles: new Map(),
+    cache: new Map(),
+    running: new Set(),
+    asks: [],
+    startedHere: new Set(),
+    sessionLabel: () => ({ label: 'Session', fullLabel: 'Session' }),
+  });
+  const page = f.provider.readSessionRequest({ method: 'sessions', requester: null, params: {} });
+  const row = page.sessions.find((entry: { id: string }) => entry.id === f.childId);
+  assert.ok(row, 'the session page lacks the child row');
+  const sources = f.provider.authoritativeCatalog;
+  const source = sources.find((entry: { sessionId: string }) => entry.sessionId === f.childId);
+  const exported = f.provider.exportSelection(source, sources);
+  return {
+    pageParent: row.parent,
+    exportParent: exported.root.parentSessionId,
+    archivedParent: exported.readerState.archived[0]?.parentSessionId,
+  };
+}
+
+test('export and the session page record no saved parent before the settled reply, and the verified parent after it', async () => {
+  const f = cachedLinksReadFixture('6f2c1d9e-0000-4000-8000-000000000001', true);
+  f.provider.hidden = new Set([f.childId]);
+  // The refresh that accepts the first catalog draws the session list's parent edges.
+  f.provider.sessionParentEdges(f.provider.authoritativeCatalog);
+  assert.equal(f.provider.sessionParentsOf().get(f.childId)?.parent, f.parent.sessionId);
+  assert.deepEqual(
+    cachedLinksExportAndPage(f),
+    { pageParent: null, exportParent: undefined, archivedParent: undefined },
+    'export or the session page recorded a parent that only the saved links supply',
+  );
+  await settleCachedLinksFixture(f, true);
+  assert.deepEqual(cachedLinksExportAndPage(f), {
+    pageParent: { id: f.parent.sessionId, relation: 'subagent' },
+    exportParent: f.parent.sessionId,
+    archivedParent: f.parent.sessionId,
+  });
+});
+
+test('a child row published from saved links and refused before the settled reply reads after the reply lists it under that parent', async () => {
+  const f = cachedLinksReadFixture('6f2c1d9e-0000-4000-8000-000000000001', false);
+  const read = () =>
+    f.provider.readSessionRequest({
+      id: 'lookup-child',
+      method: 'session',
+      params: { sessionId: f.childId, turns: 1 },
+      requester: 'reader',
+      requesterProvider: 'claude',
+    });
+  assert.equal(read().state, 'stale', 'the saved parent qualified the child before the settled reply');
+  await settleCachedLinksFixture(f, true);
+  const reply = read();
+  assert.equal(reply.state, 'current', JSON.stringify(reply.notes));
+  assert.equal(reply.turns[0].summary, 'answer 1');
+  assert.ok(
+    f.provider.currentReadSource({ provider: 'claude', sessionId: f.childId }),
+    'delivery refused a child that the settled reply lists under its parent',
   );
 });
 

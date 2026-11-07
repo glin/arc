@@ -104,7 +104,7 @@ import { baselineUri, turnFileUri, PATCH_SCHEME } from './uris';
 import { readSetting, writeSetting } from './config';
 import { saveTimelineLayout } from './view/timeline-layout';
 import { exportSavedSession, savedExportSource, writeSavedSession } from './sessionexport';
-import type { ExportIdentity } from './domain/export-model';
+import type { ExportIdentity, ExportReaderState } from './domain/export-model';
 import { RAIL_FOLDS } from './view/rail';
 import { settingName } from './settings';
 import { ARC_IDENTITY, MULTI_ROOT_SPEND_WORKSPACE_PREFIX } from './identity';
@@ -1666,9 +1666,10 @@ export class PanelProvider implements vscode.Disposable {
   // A usable saved set that a catalog refresh found, which the acceptance of that refresh's generation publishes.
   private cachedLinksCandidate?: { readonly generation: number; readonly catalog: CachedLinksCatalog };
   // The saved links and child rows that the first catalog published, under the roots of that catalog. Until the first complete
-  // reply, only the session list's parent edges use them. Reads, the worker's input and file actions use `claudeChildReferences`
-  // and `claudeChildren`, which stay empty until that reply. `settled` marks a settled reply under the same roots, and the next
-  // acceptance drops each published child row that the reply does not list.
+  // reply, the session list's parent edges and agent run classification use them. Export, the channel's session page, reads,
+  // the worker's input and file actions use `claudeChildReferences` and `claudeChildren`, which stay empty until that reply.
+  // `settled` marks a settled reply under the same roots, and the next acceptance drops each published child row that the reply
+  // does not list.
   private cachedLinks?: {
     readonly scope: string;
     readonly references: readonly ClaudeChildSessionReference[];
@@ -3277,7 +3278,9 @@ export class PanelProvider implements vscode.Disposable {
       cursor = check.body;
     }
     const limit = request.params.limit ?? SESSION_PAGE_LIMITS.rows;
-    const edges = this.sessionParentEdgeSet?.edges ?? new Map<string, SessionParentEdge>();
+    const edges = this.savedLinksDrawn()
+      ? this.verifiedParentEdges(index?.sources.map(({ session }) => session) ?? [])
+      : (this.sessionParentEdgeSet?.edges ?? new Map<string, SessionParentEdge>());
     const ids = index?.ids ?? new Set<string>();
     const visible = this.anyVisible();
     const pending = this.pendingWatch.snapshot();
@@ -9344,28 +9347,16 @@ export class PanelProvider implements vscode.Disposable {
     const sources = this.catalog?.sessions ?? [];
     const source = savedExportSource(session, sources);
     const title = source ? this.sessionLabel(source).fullLabel : session;
-    const parents = this.sessionParentEdges(sources).edges;
     // The page names models with the display names the window holds when the export starts.
     const labels = this.modelLabels;
-    const identity = (source: SessionFile): ExportIdentity => ({
-      agent: source.agent,
-      sessionId: source.sessionId,
-      ...(source.childTranscript && parents.get(source.sessionId)
-        ? { parentSessionId: parents.get(source.sessionId)!.parent }
-        : {}),
-    });
+    const { root, readerState } = this.exportSelection(source, sources);
     return exportSavedSession(
-      source && { ...source, ...(source.childTranscript ? { parentSessionId: identity(source).parentSessionId } : {}) },
+      root,
       title,
       {
         roots: { claude: projectsRoot(), codex: codexSessionsRoot() },
         readerParents: { ...this.saved.readerParents },
-        readerState: {
-          archived: sources.filter((source) => this.hidden.has(source.sessionId)).map(identity),
-          startedHere: sources.filter((source) => this.startedHere.has(source.sessionId)).map(identity),
-          agentRuns: sources.filter((source) => this.saved.agentRuns?.includes(source.sessionId)).map(identity),
-          prompted: sources.filter((source) => this.saved.prompted?.includes(source.sessionId)).map(identity),
-        },
+        readerState,
         capturedAt: Date.now(),
         ...(this.diagnostics.enabled()
           ? {
@@ -9416,6 +9407,33 @@ export class PanelProvider implements vscode.Disposable {
         },
       },
     );
+  }
+
+  // The exported root and the reader state of `sources`, each child qualified by the parent that a discovery reply verified.
+  private exportSelection(
+    source: SessionFile | null,
+    sources: readonly SessionFile[],
+  ): { root: SessionFile | null; readerState: ExportReaderState } {
+    const parents = this.verifiedParentEdges(sources);
+    const identity = (source: SessionFile): ExportIdentity => ({
+      agent: source.agent,
+      sessionId: source.sessionId,
+      ...(source.childTranscript && parents.get(source.sessionId)
+        ? { parentSessionId: parents.get(source.sessionId)!.parent }
+        : {}),
+    });
+    return {
+      root: source && {
+        ...source,
+        ...(source.childTranscript ? { parentSessionId: identity(source).parentSessionId } : {}),
+      },
+      readerState: {
+        archived: sources.filter((source) => this.hidden.has(source.sessionId)).map(identity),
+        startedHere: sources.filter((source) => this.startedHere.has(source.sessionId)).map(identity),
+        agentRuns: sources.filter((source) => this.saved.agentRuns?.includes(source.sessionId)).map(identity),
+        prompted: sources.filter((source) => this.saved.prompted?.includes(source.sessionId)).map(identity),
+      },
+    };
   }
 
   public async copySessionId(session: string): Promise<void> {
@@ -14194,7 +14212,7 @@ export class PanelProvider implements vscode.Disposable {
   // Cache parent relationships until reference or child collections change. Before the first complete reply, a catalog published
   // from saved links draws its parent edges from them.
   private sessionParentsOf(): ReadonlyMap<string, SessionParentEdge> {
-    const published = this.claudeChildrenDiscovered ? undefined : this.cachedLinks;
+    const published = this.savedLinksDrawn() ? this.cachedLinks : undefined;
     const references = published?.references ?? this.claudeChildReferences;
     const children = published?.children ?? this.claudeChildren;
     const codex = this.codexSubagents;
@@ -14205,6 +14223,22 @@ export class PanelProvider implements vscode.Disposable {
     const parents = sessionParentIndex(references ?? [], children ?? [], codex ?? []);
     this.sessionParents = { references, children, codex, parents };
     return parents;
+  }
+
+  // True while the session list draws its parent edges from saved links that no complete reply verified.
+  private savedLinksDrawn(): boolean {
+    return !this.claudeChildrenDiscovered && this.cachedLinks !== undefined;
+  }
+
+  // The parent edges among `sessions` that a discovery reply verified. Export and the channel's session page use them, so
+  // neither records a parent that only saved links supply.
+  private verifiedParentEdges(sessions: readonly SessionFile[]): ReadonlyMap<string, SessionParentEdge> {
+    if (!this.savedLinksDrawn()) return this.sessionParentEdges(sessions).edges;
+    return sessionParentEdgeSet(
+      null,
+      sessionParentIndex(this.claudeChildReferences ?? [], this.claudeChildren ?? [], this.codexSubagents ?? []),
+      sessions,
+    ).edges;
   }
 
   // Retain parent edges whose endpoints have catalog rows. Dispatched edges supply separate ownership and spend relationships.

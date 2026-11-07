@@ -2777,6 +2777,7 @@ function completeDiscoveryHarness(
     'scheduleProjectSpendHydration',
     'scheduleNextProjectSpendFile',
     'sessionParentsOf',
+    'savedLinksDrawn',
     'sessionParentEdges',
     'acceptSessionCoverage',
     'membershipOf',
