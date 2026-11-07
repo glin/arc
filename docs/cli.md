@@ -231,9 +231,11 @@ arc usage
 arc usage --agent claude --json
 ```
 
-Arc saves each account usage reading in `${ARC_HOME:-~/.arc}/usage/bounded-v1/`. `usage` prints the newest complete reading for each agent, window, and scope. When a window has no complete reading, `usage` prints its newest reading and marks it `incomplete`. A reading without a window, such as a money cap alone, is left out. Text shows the share used, the reset time in UTC with the time left, and the read time with its age.
+Arc saves each account usage reading in `${ARC_HOME:-~/.arc}/usage/bounded-v1/`. `usage` prints the newest complete reading for each agent, window, and scope. When a window has no complete reading, `usage` prints its newest reading and marks it `incomplete`. A reading without a window, such as a money cap alone, is left out. Text shows the share used, the reset time in UTC with the time left, and the read time with its age. A time outside the JavaScript date range prints as `unknown`.
 
-`--json` prints `schemaVersion: 1`, `buildCommit`, the store `directory`, and `readings` with the saved field names. `utilization` is a share from 0 to 1. `resetsAt` is in seconds and `readAt` is in milliseconds since the epoch. An empty or missing store prints one sentence and exits 0. `--home PATH` reads another Arc home folder.
+`--json` prints `schemaVersion: 1`, `buildCommit`, the store `directory`, `readings` with the saved field names, and `problems`. `utilization` is a share from 0 to 1. `resetsAt` is in seconds and `readAt` is in milliseconds since the epoch. JSON keeps each saved time as its number.
+
+`usage` reads every slot it can and reports each problem with the store `file` and a `message`. Problems include slot files without a `format` file, an unsupported `format` file, unreadable slot metadata or payload, a slot that changes during every read, and skipped invalid lines. A skipped-lines problem also carries `skippedLines`. Text lists the problems below the readings. `usage` exits 1 when the store has problems and no slot reads, or when the store folder or its `format` file is unreadable. An empty or missing store prints one sentence and exits 0. `--home PATH` reads another Arc home folder.
 
 ## Status line
 

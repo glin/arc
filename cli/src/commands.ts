@@ -745,12 +745,12 @@ const definitions: readonly Command[] = [
         readJsonFlag,
       ],
       output: [
-        'Text shows one line for each agent, window, and scope: the share used, the reset time in UTC, and the read time. A reading without a complete answer ends in incomplete.',
-        'JSON readings keep the saved field names. utilization is a share from 0 to 1. resetsAt is in seconds and readAt is in milliseconds since the epoch. Stdin is unused.',
+        'Text shows one line for each agent, window, and scope: the share used, the reset time in UTC, and the read time. A reading without a complete answer ends in incomplete. A time outside the date range prints as unknown. Store problems follow the readings.',
+        'JSON prints schemaVersion, buildCommit, the store directory, readings with the saved field names, and problems with the file and message of each store problem. utilization is a share from 0 to 1. resetsAt is in seconds and readAt is in milliseconds since the epoch. Stdin is unused.',
       ],
       refusals: [
         'Unknown options, missing values, and an agent other than claude or codex fail.',
-        'An unreadable or unsupported usage store fails. An empty or missing store prints that no saved usage exists and succeeds.',
+        'An unreadable store folder or format file fails. A store with problems and no readable slot prints its problems and exits 1. An empty or missing store prints that no saved usage exists and succeeds.',
       ],
       example: 'arc usage --agent claude',
     },
