@@ -12,6 +12,7 @@ import type { FileHandle } from 'node:fs/promises';
 import { UsageReading } from './agentwire';
 import { tempDir } from './temproot';
 import {
+  readUsageRecords,
   UsageRecorder,
   usageRecordLines,
   USAGE_PAYLOAD_BYTES,
@@ -739,6 +740,64 @@ test('a reader handle open on the slot metadata delays publication until the han
   assert.equal(fs.existsSync(files.lock), false);
   assert.equal(metadata(root).compressed, fs.statSync(files.data).size);
   assert.equal(gunzipSync(fs.readFileSync(files.data)).toString('utf8').split('\n').filter(Boolean).length, 2);
+});
+
+function appendingReader(root: string, appends: number) {
+  const files = slotFiles(root);
+  let appended = 0;
+  const filesystem: typeof fs.promises = {
+    ...fs.promises,
+    open: async (...args: Parameters<typeof fs.promises.open>) => {
+      if (String(args[0]) === files.data && appended < appends) {
+        appended++;
+        const writer = new UsageRecorder(root, { now: () => READ_AT });
+        writer.record('claude', sample(READ_AT + appended, 0.5 + appended / 10));
+        await writer.drain();
+      }
+      return fs.promises.open(...args);
+    },
+  };
+  return filesystem;
+}
+
+async function readBack(root: string, filesystem: typeof fs.promises = fs.promises) {
+  const utilizations: (number | null)[] = [];
+  const result = await readUsageRecords(root, (record) => utilizations.push(record.utilization), filesystem);
+  return { utilizations, result };
+}
+
+test('a reader reads a slot again when an append changes its metadata during the payload read', async () => {
+  const { root } = await populated();
+  assert.deepEqual(await readBack(root, appendingReader(root, 1)), {
+    utilizations: [0.2, 0.6],
+    result: { readSlots: 1, problems: [] },
+  });
+  const { slot } = slotFiles(root);
+  assert.deepEqual(await readBack(root, appendingReader(root, 3)), {
+    utilizations: [],
+    result: { readSlots: 0, problems: [{ file: `${slot}.json`, message: 'Usage slot changed during every read' }] },
+  });
+});
+
+test('a reader counts the invalid and unsupported lines it skips in each slot', async () => {
+  const { root } = await populated();
+  const files = slotFiles(root);
+  const valid = usageRecordLines('claude', sample(READ_AT, 0.3))[0];
+  const unsupported = JSON.stringify({ ...JSON.parse(valid), v: 2 });
+  const raw = Buffer.from([valid, '{"v":1,', unsupported, ''].join('\n'));
+  const payload = gzipSync(raw);
+  fs.writeFileSync(files.data, payload);
+  fs.writeFileSync(
+    files.meta,
+    `${JSON.stringify({ v: 1, day: files.day, generation: randomUUID(), compressed: payload.length, raw: raw.length })}\n`,
+  );
+  assert.deepEqual(await readBack(root), {
+    utilizations: [0.3],
+    result: {
+      readSlots: 1,
+      problems: [{ file: `${files.slot}.gz`, message: 'Skipped 2 invalid usage lines', skippedLines: 2 }],
+    },
+  });
 });
 
 test('linked directories and nonregular recognized entries refuse new recording', async () => {

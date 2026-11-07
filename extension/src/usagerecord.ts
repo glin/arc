@@ -427,6 +427,7 @@ const READ_ATTEMPTS = 3;
 export interface UsageReadProblem {
   file: string;
   message: string;
+  skippedLines?: number;
 }
 
 export interface UsageReadResult {
@@ -516,22 +517,28 @@ function inflated(payload: Buffer, raw: number): Promise<Buffer | null> {
   });
 }
 
-function slotRecords(raw: Buffer): UsageRecordLine[] {
-  const records: UsageRecordLine[] = [];
-  for (const line of raw.toString('utf8').split('\n')) {
-    const record = line && usageRecord(line);
-    if (record) records.push(record);
-  }
-  return records;
+interface SlotRecords {
+  records: UsageRecordLine[];
+  skipped: number;
 }
 
-// Reads the committed prefix of one slot. A writer that replaces the slot during the read
-// changes its metadata, and the reader reads that slot again. Each file stays open for one bounded read.
-async function readSlot(
-  directory: string,
-  slot: string,
-  filesystem: typeof fs.promises,
-): Promise<UsageRecordLine[] | null> {
+// Every committed batch ends in a newline, so only the empty text after the last newline is no line.
+function slotRecords(raw: Buffer): SlotRecords {
+  const result: SlotRecords = { records: [], skipped: 0 };
+  const lines = raw.toString('utf8').split('\n');
+  if (lines.at(-1) === '') lines.pop();
+  for (const line of lines) {
+    const record = usageRecord(line);
+    if (record) result.records.push(record);
+    else result.skipped++;
+  }
+  return result;
+}
+
+// Reads the committed prefix of one slot. The reader reads the metadata before and after the payload.
+// A writer that appends to or replaces the slot changes its metadata, and the reader reads that slot again.
+// Each file stays open for one bounded read.
+async function readSlot(directory: string, slot: string, filesystem: typeof fs.promises): Promise<SlotRecords | null> {
   const metadataFile = path.join(directory, `${slot}.json`);
   const metadataText = () =>
     optionalText(filesystem, metadataFile).catch((error: unknown) => {
@@ -547,16 +554,18 @@ async function readSlot(
     } catch {
       throw new SlotProblem(`${slot}.json`, 'Invalid usage metadata');
     }
-    if (!value.compressed) return [];
+    if (!value.compressed) return { records: [], skipped: 0 };
     const payload = await payloadPrefix(filesystem, path.join(directory, `${slot}.gz`), value.compressed).catch(
       (error: unknown) => {
         throw new SlotProblem(`${slot}.gz`, `Unreadable usage payload${errorCode(error)}`);
       },
     );
     const raw = payload && (await inflated(payload, value.raw));
-    if (raw && raw.length === value.raw) return slotRecords(raw);
     const again = await metadataText();
-    if (again === text) throw new SlotProblem(`${slot}.gz`, 'Unreadable usage payload');
+    if (again === text) {
+      if (!raw || raw.length !== value.raw) throw new SlotProblem(`${slot}.gz`, 'Unreadable usage payload');
+      return slotRecords(raw);
+    }
     if (attempt >= READ_ATTEMPTS) throw new SlotProblem(`${slot}.json`, 'Usage slot changed during every read');
     text = again;
   }
@@ -582,10 +591,17 @@ export async function readUsageRecords(
   }
   for (let index = 0; index < USAGE_SLOT_COUNT; index++) {
     try {
-      const records = await readSlot(directory, String(index).padStart(2, '0'), filesystem);
-      if (!records) continue;
+      const slot = String(index).padStart(2, '0');
+      const read = await readSlot(directory, slot, filesystem);
+      if (!read) continue;
       result.readSlots++;
-      for (const record of records) visit(record);
+      for (const record of read.records) visit(record);
+      if (read.skipped)
+        result.problems.push({
+          file: `${slot}.gz`,
+          message: `Skipped ${read.skipped} invalid usage ${read.skipped === 1 ? 'line' : 'lines'}`,
+          skippedLines: read.skipped,
+        });
     } catch (error) {
       if (!(error instanceof SlotProblem)) throw error;
       result.problems.push({ file: error.file, message: error.message });
