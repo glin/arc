@@ -2,7 +2,7 @@ import { linkBrowserKind, parseLinkDestination } from './domain/link-path';
 import { isDeepStrictEqual } from 'node:util';
 import { CommandCatalogs } from './commandcatalog';
 import { isCompressedRollout } from './compressedrollouts.ts';
-import { commitSourceStamp, recordCommits as recordTranscriptCommits } from './transcript';
+import { claudeChildFileFor, commitSourceStamp, recordCommits as recordTranscriptCommits } from './transcript';
 import {
   startingWorktree,
   RepositoryScope,
@@ -3694,6 +3694,149 @@ test.each(['claude', 'codex'] as const)(
     fs.unlinkSync(f.alias);
   },
 );
+
+// A first catalog published from saved links, accepted before the worker's first reply. The saved set places one child
+// transcript under `parent`. The child's opening names the session ID `opening` and, when `agentId` holds, its own agent ID.
+function cachedLinksReadFixture(opening: string, agentId: boolean) {
+  const f = orderedHostReadFixture();
+  const directory = tempDir('cached-links-read-');
+  const scope = JSON.stringify([directory]);
+  const parentId = '6f2c1d9e-0000-4000-8000-000000000001';
+  const childId = 'a1b2c3d4e5f6a7b8c';
+  const parentFile = path.join(directory, `${parentId}.jsonl`);
+  const childFile = path.join(directory, parentId, 'subagents', `agent-${childId}.jsonl`);
+  fs.mkdirSync(path.dirname(childFile), { recursive: true });
+  fs.writeFileSync(parentFile, '');
+  const records = [
+    {
+      type: 'user',
+      sessionId: opening,
+      ...(agentId ? { agentId: childId } : {}),
+      isSidechain: true,
+      promptId: 'turn-1',
+      cwd: directory,
+      timestamp: '2026-10-08T12:00:01Z',
+      message: { role: 'user', content: 'prompt 1' },
+    },
+    {
+      type: 'assistant',
+      timestamp: '2026-10-08T12:00:01Z',
+      message: {
+        id: 'reply-1',
+        role: 'assistant',
+        model: 'claude-opus-5-5',
+        content: [{ type: 'text', text: 'answer 1' }],
+        stop_reason: 'end_turn',
+        usage: { input_tokens: 1, output_tokens: 1 },
+      },
+    },
+  ];
+  fs.writeFileSync(childFile, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+  const revision = (file: string) => revisionOf(fs.statSync(file, { bigint: true }));
+  const parent = {
+    agent: 'claude' as const,
+    sessionId: parentId,
+    cwd: directory,
+    file: parentFile,
+    ...revision(parentFile),
+  };
+  const walkedChild = {
+    agent: 'claude' as const,
+    sessionId: childId,
+    cwd: directory,
+    file: childFile,
+    childTranscript: true,
+    ...revision(childFile),
+  };
+  const link = {
+    kind: 'subagent' as const,
+    parentSessionId: parentId,
+    sessionId: childId,
+    file: childFile,
+    toolUseIds: ['tool-1'],
+  };
+  const work: string[] = [];
+  Object.assign(f.provider, {
+    folders: () => [directory],
+    repositoryScopeReady: true,
+    repositoryScopeRoots: [directory],
+    repositoryScope: { snapshot: () => ({ roots: [directory], ready: true }) },
+    claudeParents: [parent],
+    walkedChildSources: [walkedChild],
+    claudeChildren: [],
+    claudeChildReferences: [],
+    claudeChildrenDiscovered: false,
+    cachedLinksOffered: false,
+    codexSubagents: [],
+    savedLinks: {
+      savedAt: Date.now() - 1000,
+      scope,
+      compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
+      receiptStore: 'store-1',
+      references: [link],
+      children: [{ ...walkedChild, parentSessionId: parentId, toolUseIds: ['tool-1'], agentRun: true }],
+    },
+    receiptStoreIdentity: () => 'store-1',
+    activityFor: () => 0,
+    performanceCounters: { recordWork: (name: string) => work.push(name) },
+    enumeratedMembers: new Set([sessionCoverageMember(parent), sessionCoverageMember(walkedChild)]),
+    enumeratedAdmissionComplete: true,
+  });
+  // The steps of the refresh that accepts the first catalog.
+  const published = f.provider.publishCachedLinks([parent, walkedChild]);
+  assert.ok(published, `the saved links were refused: ${work.join(', ')}`);
+  f.provider.installCachedLinks(published, scope);
+  f.provider.authoritativeCatalog = f.provider.acceptSessionCoverage(published.sessions, scope);
+  f.provider.authoritativeCatalogScope = scope;
+  assert.deepEqual(work, ['cachedLinks:published']);
+  assert.equal(f.provider.dispatchDiscoveryPending, true);
+  return { ...f, parent, childId, childFile, link };
+}
+
+test.each([
+  ['names the saved parent', 'parent', false, 'stale'],
+  ['names another parent', 'other', false, 'stale'],
+  ['names its own agent ID', 'parent', true, 'current'],
+] as const)(
+  'a detailed read of a child row published from saved links, whose opening %s, qualifies from the opening alone',
+  (_case, opening, agentId, state) => {
+    const f = cachedLinksReadFixture(opening === 'parent' ? '6f2c1d9e-0000-4000-8000-000000000001' : 'other', agentId);
+    const reply = f.provider.readSessionRequest({
+      id: 'lookup-child',
+      method: 'session',
+      params: { sessionId: f.childId, turns: 1 },
+      requester: 'reader',
+      requesterProvider: 'claude',
+    });
+    assert.equal(reply.state, state, JSON.stringify(reply.notes));
+    if (state === 'stale') {
+      assert.deepEqual(reply.turns, [], 'the saved parent established the identity of an unverified child');
+      assert.equal(
+        f.provider.currentReadSource({ provider: 'claude', sessionId: f.childId }),
+        null,
+        'delivery resolved an unverified child through its saved parent',
+      );
+    } else assert.equal(reply.turns[0].summary, 'answer 1');
+  },
+);
+
+test('a window request for a parent published from saved links carries no saved link to the worker', () => {
+  const f = cachedLinksReadFixture('6f2c1d9e-0000-4000-8000-000000000001', true);
+  const input = f.provider.progressiveInput(f.parent);
+  assert.deepEqual(input.claudeChildReferences, [], 'the window input carried a saved link before the settled reply');
+  assert.deepEqual(input.claudeChildren, [], 'the window input carried a saved child row before the settled reply');
+  const agent = { id: f.childId, toolUseId: 'tool-1' };
+  assert.equal(
+    claudeChildFileFor(input.claudeChildReferences, f.parent, agent),
+    null,
+    'the worker resolved child spend through a saved link',
+  );
+  assert.equal(
+    f.provider.agentFile(f.parent, agent, () => []),
+    null,
+    'a file action resolved through a saved link',
+  );
+});
 
 test.each(['storage', 'publication'])(
   'queued production receipts refuse bytes appended during earlier %s',

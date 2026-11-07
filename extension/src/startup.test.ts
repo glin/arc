@@ -52,6 +52,7 @@ import {
   humanPromptScanSteps,
   promptScanLists,
   readClaudeChildSessionReferences,
+  changedClaudeChildReferences,
 } from './transcript';
 import { createHash, randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
@@ -2727,6 +2728,7 @@ function completeDiscoveryHarness(
     RepositoryCommits,
     claudeSubagentMetaReader,
     claudeChildFileFor,
+    changedClaudeChildReferences,
     codexSubagentFor,
     compatibleDiscovery,
     discoveryCompatibility,
@@ -9486,12 +9488,12 @@ function cachedLinksHarness(change: (fixture: any) => void = () => {}) {
         sessions: fixture.census,
         files: fixture.census.map((source: SessionFile) => source.file),
         directories: ['fixture'],
-        status: 'complete',
-        uncertain: [],
+        status: fixture.censusUncertain ? 'incomplete' : 'complete',
+        uncertain: fixture.censusUncertain ?? [],
       }),
     },
     false,
-    ['publishCachedLinks', 'membershipOf', 'physicalMembershipOf'],
+    ['publishCachedLinks', 'installCachedLinks', 'membershipOf', 'physicalMembershipOf'],
   );
   const { provider, claude, child, claudeWalk } = harness;
   const other = { ...claude, file: 'fixture/other.jsonl', sessionId: '6f2c1d9e-0000-4000-8000-000000000003' };
@@ -9552,7 +9554,21 @@ test('a warm start publishes its first catalog from the saved links before the w
     assert.ok(row, 'the first accepted catalog lacks the saved child row');
     assert.equal(row.parentSessionId, claude.sessionId);
     assert.equal(row.size, 1200, 'the saved child row kept its saved size instead of the walked one');
-    assert.deepEqual(provider.claudeChildReferences, [link]);
+    assert.equal(
+      provider.sessionParentsOf().get(child.sessionId)?.parent,
+      claude.sessionId,
+      'the session list did not draw the saved link',
+    );
+    assert.equal(work.get('discoveryRequest:walked'), undefined, 'a refresh that sent no request counted one');
+    assert.deepEqual(
+      provider.claudeChildReferences ?? [],
+      [],
+      'the saved links fed the verified links before the reply',
+    );
+    assert.deepEqual(provider.claudeChildren, [], 'the saved child rows fed the verified child rows before the reply');
+    assert.deepEqual(link, provider.savedLinks.references[0]);
+    assert.equal(provider.completeCatalogScope, undefined, 'the list completed before the settled reply');
+    assert.deepEqual(provider.sessionLoadingBlocker(provider.refreshGeneration), { reason: 'discovery pending' });
     assert.equal(
       provider.dispatchDiscoveryPending,
       true,
@@ -9616,9 +9632,12 @@ test('the verified reply replaces a saved link that moved, moves the child row a
     await vi.runOnlyPendingTimersAsync();
     assert.equal(requests.length, 1, 'the continuation sent no discovery request to verify the saved links');
     assert.deepEqual(provider.claudeChildReferences, [moved]);
-    const rows = provider.catalog.sessions.filter((session: SessionFile) => session.file === child.file);
+    // The follow-up refresh accepts the settled reply.
+    await vi.waitFor(() => assert.ok(provider.completeCatalogScope, 'the follow-up refresh accepted no settled reply'));
+    const rows = provider.authoritativeCatalog.filter((session: SessionFile) => session.file === child.file);
     assert.equal(rows.length, 1, 'the verified reply left the child row twice or dropped it');
     assert.equal(rows[0].parentSessionId, other.sessionId, 'the child row stayed under its saved parent');
+    assert.equal(provider.sessionParentsOf().get(child.sessionId)?.parent, other.sessionId);
     assert.equal(provider.dispatchDiscoveryPending, false, 'the verified reply left discovery pending');
     assert.equal(work.get('cachedLinks:changed'), 1, 'the stale saved link was not counted');
     assert.deepEqual(
@@ -9638,10 +9657,18 @@ test('the verified reply replaces a saved link that moved, moves the child row a
   }
 });
 
-test('a complete reply that leaves members unsettled saves no links', async () => {
-  const { provider, claude } = bumpedCatalogHarness();
+test('only a complete reply that settles members saves its links', async () => {
+  const { provider, claude, child } = bumpedCatalogHarness();
   provider.refreshGeneration = 4;
   provider.claudeParents = [claude];
+  const link = {
+    kind: 'subagent' as const,
+    parentSessionId: claude.sessionId,
+    sessionId: child.sessionId,
+    file: child.file,
+    toolUseIds: ['tool-1'],
+  };
+  let settled = false;
   provider.progressiveWorker.run = (request: ProgressiveRequest, generation: number) =>
     Promise.resolve({
       generation,
@@ -9650,8 +9677,9 @@ test('a complete reply that leaves members unsettled saves no links', async () =
         kind: 'claude-children',
         roots: request.kind === 'claude-children' ? request.parents : [],
         complete: true,
-        continuation: true,
-        references: [],
+        continuation: !settled,
+        membershipSettled: settled,
+        references: [link],
         dispatchFacts: [],
         children: [],
         referenceEntries: [],
@@ -9661,6 +9689,11 @@ test('a complete reply that leaves members unsettled saves no links', async () =
   assert.equal(await provider.prepareClaudeChildren(4, new AbortController().signal), true);
   assert.equal(provider.dispatchDiscoveryPending, true);
   assert.equal(provider.savedLinks, undefined, 'an unsettled reply saved its links for the next start');
+  settled = true;
+  assert.equal(await provider.prepareClaudeChildren(4, new AbortController().signal), true);
+  assert.equal(provider.dispatchDiscoveryPending, false);
+  assert.deepEqual(provider.savedLinks?.references, [link], 'the settled reply saved no links');
+  assert.equal(provider.savedLinks?.receiptStore, 'store-1');
 });
 
 test.each([
@@ -9674,6 +9707,7 @@ test.each([
   ['child', (fixture: any) => (fixture.census = [{ ...fixture.census[0], ino: 3 }])],
   ['child', (fixture: any) => (fixture.saved.references[0].file = 'fixture/gone.jsonl')],
   ['parent', (fixture: any) => (fixture.saved.references[0].parentSessionId = 'gone')],
+  ['child', (fixture: any) => (fixture.census = [{ ...fixture.census[0], size: fixture.saved.children[0].size - 1 }])],
   ['parent', (fixture: any) => (fixture.saved.children[0].parentSessionId = 'gone')],
 ])('a saved link set refused for %s leaves the first catalog to the discovery reply', async (reason, change) => {
   vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
@@ -9690,6 +9724,121 @@ test.each([
     );
     assert.equal(requests.length, 1, 'the refused link set skipped the discovery request');
     assert.equal(provider.dispatchDiscoveryPending, false);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+// A settled reply that the continuation after the first refresh receives.
+function settledLinksReply(references: unknown[], children: unknown[]) {
+  return (request: ProgressiveRequest) => ({
+    compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
+    kind: 'claude-children',
+    roots: request.kind === 'claude-children' ? request.parents : [],
+    complete: true,
+    continuation: false,
+    membershipSettled: true,
+    references,
+    dispatchFacts: [],
+    children,
+    referenceEntries: [],
+    receiptStore: 'store-1',
+  });
+}
+
+test.each([
+  ['keeps', (link: any) => [link], undefined],
+  ['changes the tool use IDs of', (link: any) => [{ ...link, toolUseIds: ['tool-2'] }], 1],
+  ['drops', () => [], 1],
+])('the settled reply that %s a published link counts it as changed', async (_case, verified, changed) => {
+  vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+  try {
+    const { provider, work, requests, now } = cachedLinksHarness((fixture) => {
+      fixture.reply = settledLinksReply(verified(fixture.saved.references[0]), []);
+    });
+    vi.setSystemTime(now);
+    await provider.refresh(true);
+    await vi.runOnlyPendingTimersAsync();
+    assert.equal(requests.length, 1);
+    assert.equal(provider.dispatchDiscoveryPending, false);
+    assert.equal(work.get('cachedLinks:changed'), changed);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('a settled reply under other roots counts no published link as changed', async () => {
+  vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+  try {
+    const { provider, work, requests, now } = cachedLinksHarness((fixture) => {
+      fixture.reply = settledLinksReply([], []);
+    });
+    vi.setSystemTime(now);
+    await provider.refresh(true);
+    provider.repositoryScopeRoots = ['elsewhere'];
+    await vi.runOnlyPendingTimersAsync();
+    assert.equal(requests.length, 1);
+    assert.equal(provider.dispatchDiscoveryPending, false);
+    assert.equal(
+      work.get('cachedLinks:changed'),
+      undefined,
+      'the reply of other roots was compared with the published links',
+    );
+    assert.equal(provider.cachedLinks, undefined);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('the acceptance of a settled reply drops a published child row that the reply does not list, under an uncertain census', async () => {
+  vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+  try {
+    const { provider, child, requests, now } = cachedLinksHarness((fixture) => {
+      fixture.censusUncertain = [fixture.census[0].file];
+      fixture.reply = settledLinksReply([], []);
+    });
+    vi.setSystemTime(now);
+    await provider.refresh(true);
+    assert.ok(provider.authoritativeCatalog.some((session: SessionFile) => session.file === child.file));
+    await vi.runOnlyPendingTimersAsync();
+    assert.equal(requests.length, 1);
+    await vi.waitFor(() =>
+      assert.ok(
+        provider.claudeChildrenDiscovered && provider.discoveryComplete === undefined,
+        'the follow-up refresh accepted no settled reply',
+      ),
+    );
+    assert.equal(provider.membershipCoverage.status, 'incomplete', 'the census was not uncertain');
+    assert.deepEqual(
+      provider.authoritativeCatalog.filter((session: SessionFile) => session.file === child.file),
+      [],
+      'a child row that only the saved links published outlived the settled reply',
+    );
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('a refresh that stops before acceptance counts no publication and leaves the saved links to the next refresh', async () => {
+  vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+  try {
+    const { provider, child, work, requests, now } = cachedLinksHarness();
+    vi.setSystemTime(now);
+    const prepareMetadata = provider.prepareMetadata;
+    provider.prepareMetadata = () => Promise.resolve(false);
+    await provider.refresh(true);
+    assert.equal(provider.authoritativeCatalog, null);
+    assert.equal(
+      work.get('cachedLinks:published'),
+      undefined,
+      'a publication that never reached acceptance was counted',
+    );
+    assert.ok(!provider.dispatchDiscoveryPending, 'a stopped refresh left discovery pending');
+    provider.prepareMetadata = prepareMetadata;
+    await provider.refresh(true);
+    assert.equal(work.get('cachedLinks:published'), 1, 'the next refresh did not publish from the saved links');
+    assert.equal(requests.length, 0);
+    assert.ok(provider.authoritativeCatalog.some((session: SessionFile) => session.file === child.file));
   } finally {
     vi.useRealTimers();
   }

@@ -158,6 +158,7 @@ import {
   type SessionStatCompactionFacts,
   type SessionStatTurnFacts,
   normalizeSessionTitle,
+  changedClaudeChildReferences,
   sameCommitSha,
   sessionOutcomeOf,
   sessionStatFactsOf,
@@ -1425,6 +1426,13 @@ interface HeldDefaults {
   revision: number;
 }
 
+// A first catalog that the saved links of the previous activation can publish.
+interface CachedLinksCatalog {
+  readonly references: readonly ClaudeChildSessionReference[];
+  readonly children: readonly ClaudeChildSessionFile[];
+  readonly sessions: SessionFile[];
+}
+
 export class PanelProvider implements vscode.Disposable {
   private submissionWrites: Promise<void> = Promise.resolve();
   private submissionsInFlight = new Set<string>();
@@ -1655,8 +1663,18 @@ export class PanelProvider implements vscode.Disposable {
   private savedLinks?: SavedDiscoveryLinks;
   // True once the first catalog of this activation published from the saved links or refused them.
   private cachedLinksOffered = false;
-  // The saved links that the first catalog published, until a settled reply verifies them.
-  private cachedLinks?: readonly ClaudeChildSessionReference[];
+  // A usable saved set that a catalog refresh found, which the acceptance of that refresh's generation publishes.
+  private cachedLinksCandidate?: { readonly generation: number; readonly catalog: CachedLinksCatalog };
+  // The saved links and child rows that the first catalog published, under the roots of that catalog. Until the first complete
+  // reply, only the session list's parent edges use them. Reads, the worker's input and file actions use `claudeChildReferences`
+  // and `claudeChildren`, which stay empty until that reply. `settled` marks a settled reply under the same roots, and the next
+  // acceptance drops each published child row that the reply does not list.
+  private cachedLinks?: {
+    readonly scope: string;
+    readonly references: readonly ClaudeChildSessionReference[];
+    readonly children: readonly ClaudeChildSessionFile[];
+    settled?: boolean;
+  };
   // Every child transcript that the last walk's census listed, with its working directory when its opening named one.
   private walkedChildSources: SessionFile[] = [];
   // The selected session ID, restored from panel state and reconciled by `pickShowing`.
@@ -2520,7 +2538,7 @@ export class PanelProvider implements vscode.Disposable {
       : [];
     if (matches.length !== 1 || matches[0].agent !== record.provider || !this.sessionReadAdmitted(matches[0]))
       return null;
-    const facts = this.agentReadSources.resolve(matches[0], () => this.readScopeKey(), roots);
+    const facts = this.agentReadSources.resolve(this.readSource(matches[0]), () => this.readScopeKey(), roots);
     if (facts) {
       this.admittedReadSources.delete(record.sessionId);
       this.admittedReadSources.set(record.sessionId, facts);
@@ -3215,7 +3233,7 @@ export class PanelProvider implements vscode.Disposable {
       if (!this.sessionReadAdmitted(matches[0]))
         throw new Error('The session membership is unavailable or ambiguous. Retry after session discovery.');
       const result = boundedSessionRead(
-        matches[0],
+        this.readSource(matches[0]),
         request.params.turns!,
         scopeKey,
         request.requester,
@@ -9935,23 +9953,24 @@ export class PanelProvider implements vscode.Disposable {
         !selectedOnly &&
         (!reuseCatalog || (!replyHeld && ((dispatchChanged && !spendOnly) || this.dispatchDiscoveryPending)))
       ) {
-        this.performanceCounters.recordWork(
-          `discoveryRequest:${!reuseCatalog ? 'walked' : this.dispatchDiscoveryPending ? 'membersPending' : 'dispatchChanged'}`,
-        );
         this.startupHistory?.stage('relationshipsStarted');
         const listed = new Map(all.map((session) => [session.file, session]));
         // The first catalog of an activation can publish from the links the previous activation saved, before the worker's first
         // reply. Discovery stays pending, and the continuation after this refresh sends the request that verifies the links.
         const cachedFirst =
+          !metadataAfterRender &&
           this.authoritativeCatalog === null &&
           !this.claudeChildrenDiscovered &&
           this.walkedCatalog?.scope === JSON.stringify(this.repositoryScopeRoots)
             ? this.publishCachedLinks(all)
             : null;
+        this.cachedLinksCandidate = cachedFirst ? { generation, catalog: cachedFirst } : undefined;
         if (cachedFirst) {
-          all = cachedFirst;
-          if (this.catalog) this.catalog = { ...this.catalog, sessions: all };
+          all = cachedFirst.sessions;
         } else {
+          this.performanceCounters.recordWork(
+            `discoveryRequest:${!reuseCatalog ? 'walked' : this.dispatchDiscoveryPending ? 'membersPending' : 'dispatchChanged'}`,
+          );
           const discovered = await this.prepareClaudeChildren(generation, controller.signal, humanPromptWork);
           if (!discovered || controller.signal.aborted || generation !== this.refreshGeneration) {
             return;
@@ -9985,6 +10004,10 @@ export class PanelProvider implements vscode.Disposable {
       all = orderSessionCatalog(all, (session) => this.activityFor(session));
       if (!selectedOnly && !metadataAfterRender) {
         const catalogScope = JSON.stringify(this.repositoryScopeRoots);
+        const cachedFirst = this.cachedLinksCandidate;
+        this.cachedLinksCandidate = undefined;
+        if (cachedFirst && cachedFirst.generation === this.refreshGeneration)
+          this.installCachedLinks(cachedFirst.catalog, catalogScope);
         all = this.acceptSessionCoverage(all, catalogScope);
         this.authoritativeCatalog = all;
         this.scopeSessionDirectories?.clear();
@@ -13133,19 +13156,15 @@ export class PanelProvider implements vscode.Disposable {
     this.claudeChildren = progress.children;
     this.claudeChildrenDiscovered = true;
     if (!this.dispatchDiscoveryPending) {
-      // A settled reply verifies the links that the first catalog published from the saved set, and replaces the saved set.
-      if (this.cachedLinks) {
-        const key = (reference: ClaudeChildSessionReference) =>
-          JSON.stringify([
-            reference.kind ?? 'subagent',
-            reference.parentSessionId,
-            reference.sessionId,
-            reference.file,
-          ]);
-        const verified = new Set(progress.references.map(key));
-        const stale = this.cachedLinks.filter((reference) => !verified.has(key(reference))).length;
-        if (stale) this.performanceCounters?.recordWork?.('cachedLinks:changed', stale);
-        this.cachedLinks = undefined;
+      // A settled reply verifies the links that the first catalog published from the saved set, and replaces the saved set. A
+      // reply under other roots verifies nothing that the catalog published.
+      const cached = this.cachedLinks;
+      if (cached && !cached.settled) {
+        if (cached.scope === JSON.stringify(this.repositoryScopeRoots)) {
+          const stale = changedClaudeChildReferences(cached.references, progress.references);
+          if (stale) this.performanceCounters?.recordWork?.('cachedLinks:changed', stale);
+          cached.settled = true;
+        } else this.cachedLinks = undefined;
       }
       if (progress.receiptStore !== undefined)
         this.savedLinks = {
@@ -13233,12 +13252,12 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   // The catalog of a first acceptance built from the walked rows and the links that the previous activation saved, or null when
-  // the saved set is unusable. The links and child rows take effect with discovery pending, so they supply no absence proof and no
-  // delivery authority until a settled reply replaces them. Each activation offers the saved set once, and counts the outcome.
-  private publishCachedLinks(walked: readonly SessionFile[]): SessionFile[] | null {
+  // the saved set is unusable. A refusal is counted and ends the offer for this activation. `installCachedLinks` takes a usable
+  // set at the acceptance, so a refresh that stops before it offers the set again.
+  private publishCachedLinks(walked: readonly SessionFile[]): CachedLinksCatalog | null {
     if (this.cachedLinksOffered) return null;
-    this.cachedLinksOffered = true;
     const refuse = (reason: string): null => {
+      this.cachedLinksOffered = true;
       this.performanceCounters.recordWork(`cachedLinks:refused:${reason}`);
       return null;
     };
@@ -13260,6 +13279,7 @@ export class PanelProvider implements vscode.Disposable {
         source.sessionId !== child.sessionId ||
         String(source.dev) !== String(child.dev) ||
         String(source.ino) !== String(child.ino) ||
+        source.size < child.size ||
         source.cwd !== child.cwd ||
         !isInside(source.cwd, this.repositoryScopeRoots)
       )
@@ -13274,18 +13294,27 @@ export class PanelProvider implements vscode.Disposable {
       if (file !== null && !parents.has(file) && !childSources.has(file)) return refuse('child');
     }
     if (this.receiptStoreIdentity() !== saved.receiptStore) return refuse('store');
-    this.claudeChildReferences = saved.references;
-    this.claudeChildren = children;
-    this.cachedLinks = saved.references;
+    return {
+      references: saved.references,
+      children,
+      sessions: orderSessionCatalog(
+        [...walked.filter((session) => session.childTranscript !== true), ...children],
+        (session) => this.activityFor(session),
+      ),
+    };
+  }
+
+  // Accepts a first catalog from saved links with discovery pending, so the links supply no absence proof, no read revision and
+  // no delivery authority. The verified collections stay empty until the first complete reply.
+  private installCachedLinks(published: CachedLinksCatalog, scope: string): void {
+    this.cachedLinksOffered = true;
+    this.cachedLinks = { scope, references: published.references, children: published.children };
+    if (this.catalog) this.catalog = { ...this.catalog, sessions: published.sessions };
     this.dispatchDiscoveryPending = true;
     this.sessionQueryDiscoveryPending = true;
     this.discoveryComplete = undefined;
     this.publishSessionQueryContext();
     this.performanceCounters.recordWork('cachedLinks:published');
-    return orderSessionCatalog(
-      [...walked.filter((session) => session.childTranscript !== true), ...children],
-      (session) => this.activityFor(session),
-    );
   }
 
   private receiptStoreIdentity(): string {
@@ -13466,14 +13495,36 @@ export class PanelProvider implements vscode.Disposable {
       complete = false;
       this.membershipCoverage.status = 'incomplete';
     }
+    // The acceptance after a settled reply drops each child row that only the saved links published.
+    const unverified =
+      this.cachedLinks?.settled && this.cachedLinks.scope === scope
+        ? new Set(this.cachedLinks.children.map((child) => normalizeFsPath(child.file)))
+        : undefined;
+    if (this.cachedLinks?.settled) this.cachedLinks = undefined;
     if (complete || this.authoritativeCatalogScope !== scope) return current;
     return [
       ...current,
       ...(this.authoritativeCatalog ?? []).filter(
         (source) =>
-          !currentMembers.has(sessionCoverageMember(source)) && this.physicalMembershipOf(source.file) !== 'absent',
+          !currentMembers.has(sessionCoverageMember(source)) &&
+          !unverified?.has(normalizeFsPath(source.file)) &&
+          this.physicalMembershipOf(source.file) !== 'absent',
       ),
     ];
+  }
+
+  // The source that a read qualifies. Until a complete reply lists a child row with the same parent, a child row that the saved
+  // links published reads without that parent, so its own opening must name its identity.
+  private readSource(source: SessionFile): SessionFile {
+    const cached = this.cachedLinks;
+    if (!cached || source.childTranscript !== true || !('parentSessionId' in source)) return source;
+    const file = normalizeFsPath(source.file);
+    if (!cached.children.some((child) => normalizeFsPath(child.file) === file)) return source;
+    const parent = (source as ClaudeChildSessionFile).parentSessionId;
+    if (this.claudeChildren.some((child) => child.parentSessionId === parent && normalizeFsPath(child.file) === file))
+      return source;
+    const { parentSessionId: _parent, ...own } = source as ClaudeChildSessionFile;
+    return own;
   }
 
   private membershipOf(
@@ -14140,10 +14191,12 @@ export class PanelProvider implements vscode.Disposable {
     return { label, fullLabel: this.fullTitleFor(session) || label };
   }
 
-  // Cache parent relationships until reference or child collections change.
+  // Cache parent relationships until reference or child collections change. Before the first complete reply, a catalog published
+  // from saved links draws its parent edges from them.
   private sessionParentsOf(): ReadonlyMap<string, SessionParentEdge> {
-    const references = this.claudeChildReferences;
-    const children = this.claudeChildren;
+    const published = this.claudeChildrenDiscovered ? undefined : this.cachedLinks;
+    const references = published?.references ?? this.claudeChildReferences;
+    const children = published?.children ?? this.claudeChildren;
     const codex = this.codexSubagents;
     const held = this.sessionParents;
     if (held && held.references === references && held.children === children && held.codex === codex) {

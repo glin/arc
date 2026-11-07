@@ -963,6 +963,47 @@ export function isClaudeSubagentReference(
   return reference.kind !== 'dispatch';
 }
 
+// True when two links agree on every field.
+export function sameClaudeChildReference(
+  left: ClaudeChildSessionReference,
+  right: ClaudeChildSessionReference,
+): boolean {
+  if (
+    (left.kind ?? 'subagent') !== (right.kind ?? 'subagent') ||
+    left.parentSessionId !== right.parentSessionId ||
+    left.sessionId !== right.sessionId ||
+    left.file !== right.file ||
+    left.toolUseIds.length !== right.toolUseIds.length ||
+    left.toolUseIds.some((id, at) => id !== right.toolUseIds[at])
+  )
+    return false;
+  if (left.kind !== 'dispatch' || right.kind !== 'dispatch') return true;
+  return left.agent === right.agent && left.name === right.name && left.owned === right.owned;
+}
+
+// The number of links in `before` that `after` holds with a changed field or does not hold. Lists in the same order compare
+// in one pass.
+export function changedClaudeChildReferences(
+  before: readonly ClaudeChildSessionReference[],
+  after: readonly ClaudeChildSessionReference[],
+): number {
+  let at = 0;
+  while (at < before.length && at < after.length && sameClaudeChildReference(before[at], after[at])) at++;
+  if (at === before.length) return 0;
+  const bySession = new Map<string, ClaudeChildSessionReference[]>();
+  for (const reference of after) {
+    const held = bySession.get(reference.sessionId);
+    if (held) held.push(reference);
+    else bySession.set(reference.sessionId, [reference]);
+  }
+  let changed = 0;
+  for (; at < before.length; at++) {
+    const reference = before[at];
+    if (!bySession.get(reference.sessionId)?.some((peer) => sameClaudeChildReference(reference, peer))) changed++;
+  }
+  return changed;
+}
+
 export interface ClaudeChildReferenceScan {
   complete: boolean;
   references: ClaudeChildSessionReference[];
