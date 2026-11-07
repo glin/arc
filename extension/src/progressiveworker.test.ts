@@ -199,8 +199,10 @@ test.each(['claude', 'codex'] as const)(
 );
 
 // The receipt scan resumes across continuations, so the step allowance of one request sets how many replies one scan takes.
-// An unsettled complete reply starts a new epoch and a new scan. A cancelled request keeps the scan's position.
-test('receipt scan replies follow the step allowance, restart after a parent change, and resume after cancellation', async () => {
+// An unsettled complete reply starts a new epoch and a new scan. A cancelled request keeps the scan's position. A targeted
+// refresh lists the same parents in activity order and a walk lists them in enumeration order, so a request can carry the
+// epoch's parents in another order.
+test('receipt scan replies follow the step allowance, restart after a parent change, settle after a parent reorder, and resume after cancellation', async () => {
   const root = tempDir('receipt-worker-allowance-');
   const fx = receiptDispatchFixture(root, 'claude', 'codex');
   // Each read of these launches stops at the catalog lookup, because no catalog lists their sessions.
@@ -232,7 +234,7 @@ test('receipt scan replies follow the step allowance, restart after a parent cha
       );
   const scan = async (
     uncapped: boolean,
-    options: { addParent?: boolean; cancelEverySecond?: boolean; cancelFirst?: boolean } = {},
+    options: { addParent?: boolean; reorderParents?: boolean; cancelEverySecond?: boolean; cancelFirst?: boolean } = {},
   ) => {
     let cancel: AbortController | undefined;
     const worker = new ProgressiveWorker(workerSource(uncapped), undefined, (message) => {
@@ -253,6 +255,7 @@ test('receipt scan replies follow the step allowance, restart after a parent cha
         replies.last = null;
         await host.prepareClaudeChildren(request, (cancel ?? new AbortController()).signal);
         if (request === 1 && options.addParent) host.claudeParents = [...fx.catalog, added];
+        if (request === 1 && options.reorderParents) host.claudeParents = [...fx.catalog].reverse();
         const reply = (replies.last as ProgressiveResult | null)?.value;
         if (!reply) {
           assert.ok(cancel?.signal.aborted, 'an uncancelled request posted no reply');
@@ -335,6 +338,11 @@ test('receipt scan replies follow the step allowance, restart after a parent cha
     spendPasses: 2,
     spendVisits: 4,
   });
+  assert.ok(fx.catalog.length > 1);
+  const reordered = await scan(false, { reorderParents: true });
+  assert.equal(reordered.unsettled, 0, JSON.stringify(reordered));
+  assert.equal(reordered.entries, whole.entries);
+  assert.deepEqual(reordered.charges, fixed.charges);
   const cancelled = await scan(false, { cancelEverySecond: true });
   assert.ok(cancelled.answered <= fixed.answered, JSON.stringify({ fixed, cancelled }));
   assert.ok(cancelled.cancelled > 0);

@@ -1263,17 +1263,15 @@ async function execute(
     for (const [file, entry] of boundedEntries) if (!entry.complete && !entry.visitedEof) completed.delete(file);
     claudeChildReferences.clear();
     for (const [file, entry] of boundedEntries) claudeChildReferences.set(file, entry);
+    // A walk and a targeted refresh list the same parents in different orders. The epoch reads its own parents, so only a
+    // parent that joins, leaves or changes identity asks for another pass.
+    const parentKeys = (rows: readonly SessionFile[]) =>
+      rows.map((row) => JSON.stringify([row.file, row.sessionId, row.agent, row.childTranscript ?? null])).sort();
+    const epochParents = parentKeys(epoch.parents);
+    const requestParents = parentKeys(request.parents);
     unsettled.parents =
-      epoch.parents.length !== request.parents.length ||
-      epoch.parents.some((parent, index) => {
-        const other = request.parents[index];
-        return (
-          parent.file !== other.file ||
-          parent.sessionId !== other.sessionId ||
-          parent.agent !== other.agent ||
-          parent.childTranscript !== other.childTranscript
-        );
-      });
+      epochParents.length !== requestParents.length ||
+      epochParents.some((parent, index) => parent !== requestParents[index]);
     continuation ||= unsettled.parents;
     // A replaced store directory starts the scan again from its first entry, here and before publication. Other store changes
     // keep the scan's position.
