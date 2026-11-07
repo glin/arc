@@ -157,6 +157,7 @@ import {
 import {
   messageFieldBytes,
   railInputKey,
+  railInputChanges,
   railMessage,
   railPayload,
   railWordingDay,
@@ -3002,6 +3003,7 @@ function completeDiscoveryHarness(
     'withMetadataCoverage',
     'railEnrichmentNeeds',
     'railInputKey',
+    'railInputChanges',
     'railWordingDay',
     'RowDeltaReceiver',
     'RowDeltaSender',
@@ -3052,6 +3054,7 @@ function completeDiscoveryHarness(
     withMetadataCoverage,
     railEnrichmentNeeds,
     railInputKey,
+    railInputChanges,
     railWordingDay,
     RowDeltaReceiver,
     RowDeltaSender,
@@ -12627,6 +12630,37 @@ test('an oversized full refresh records the largest ready-host message after eac
     measured[0],
     'rail diagnostics did not retain the largest render from the delivery',
   );
+});
+
+test('a session list post counts its caller and each input that differs from the last post', () => {
+  const provider = railPostHarness([]);
+  const work = new Map<string, number>();
+  provider.performanceCounters = {
+    ...provider.performanceCounters,
+    recordWork: (name: string, count = 1) => work.set(name, (work.get(name) ?? 0) + count),
+  };
+  const posts = () => [...work].filter(([name]) => name.startsWith('railPost'));
+  provider.postRail(true, 'opening');
+  assert.deepEqual(posts(), [
+    ['railPost:opening', 1],
+    ['railPostInput:opening:first', 1],
+  ]);
+  work.clear();
+  provider.sessionRows = [{ id: 'session-a' }];
+  provider.pinnedTop = ['session-a'];
+  provider.postRail(true, 'membership');
+  assert.deepEqual(
+    posts(),
+    [
+      ['railPost:membership', 1],
+      ['railPostInput:membership:sessions', 1],
+      ['railPostInput:membership:pinnedTop', 1],
+    ],
+    'the counter named an input that did not change, or missed one that did',
+  );
+  work.clear();
+  provider.postRail(true, 'unchanged');
+  assert.deepEqual(posts(), [], 'a skipped post counted as a post');
 });
 
 test('a rail update serializes once for each actual ready-host post', () => {

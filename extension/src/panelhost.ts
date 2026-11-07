@@ -694,6 +694,7 @@ import {
   RailPayloadInput,
   messageFieldBytes,
   railInputKey,
+  railInputChanges,
   railMessage,
   railPayload,
   railWordingDay,
@@ -2446,7 +2447,7 @@ export class PanelProvider implements vscode.Disposable {
         ) {
           if (countsChanged) this.railRevision++;
           this.railSeedSkipped = true;
-        } else this.postRail(countsChanged, counts);
+        } else this.postRail(countsChanged, 'readOwner', counts);
         previousState = state;
         previous = signature;
       },
@@ -2864,7 +2865,7 @@ export class PanelProvider implements vscode.Disposable {
         errors.push(stored.error ?? 'The initial session name was not saved.');
     }
     void this.post({ type: 'labelsChanged', session });
-    this.postRail(true);
+    this.postRail(true, 'handleSessionRequest');
     this.refreshFrom('session-request', true);
     return {
       version: 1,
@@ -2956,12 +2957,12 @@ export class PanelProvider implements vscode.Disposable {
       await this.persistHostState();
     } catch (error) {
       if (this.saved.labels === next) this.saved.labels = previous;
-      this.postRail(true);
+      this.postRail(true, 'changeSessionLabels');
       await this.post(this.labelEditorReply(session, browserSession));
       await this.post({ type: 'labelsChanged', session: browserSession });
       throw error;
     }
-    this.postRail(true);
+    this.postRail(true, 'changeSessionLabels');
     await this.post(this.labelEditorReply(session, browserSession));
     await this.post({ type: 'labelsChanged', session: browserSession });
   }
@@ -5175,7 +5176,7 @@ export class PanelProvider implements vscode.Disposable {
     }
     this.asks = next;
     void this.post({ type: 'usage', usage: this.usagePayload() });
-    this.postRail(true);
+    this.postRail(true, 'setAsks');
   }
 
   // Replace model catalogs and their pending state, then refresh the panel. Each agent's catalog
@@ -5205,7 +5206,7 @@ export class PanelProvider implements vscode.Disposable {
   // Redraw the drawn turn cards and the session list with new model display names. Both draw
   // from held turns and held figures, so the redraw reads no file and lists no session.
   private redrawModelNames(): void {
-    this.postRail(true, undefined, false);
+    this.postRail(true, 'redrawModelNames', undefined, false);
     if (!this.cards?.length) return;
     const turns = new Map<string, Turn>();
     for (const card of this.cards) {
@@ -7290,7 +7291,7 @@ export class PanelProvider implements vscode.Disposable {
     this.saved.draftCommentIds = normalizeDraftCommentIds(this.draftCommentIds);
     void this.persistHostState().catch(() => {});
     void this.post({ type: 'usage', usage: this.usagePayload() });
-    this.postRail(true);
+    this.postRail(true, 'writeAssets');
   }
 
   private attachmentTarget(session: string): string | null {
@@ -7656,7 +7657,7 @@ export class PanelProvider implements vscode.Disposable {
       this.rememberDrafts();
     }
     if (moved) {
-      this.postRail(true);
+      this.postRail(true, 'holdDraft');
     }
     return moved;
   }
@@ -7706,7 +7707,7 @@ export class PanelProvider implements vscode.Disposable {
     this.sessionRows = this.sessionRows.map((entry) =>
       answers.has(entry.id) ? { ...entry, agentRun: answers.get(entry.id) ?? false } : entry,
     );
-    this.postRail(true);
+    this.postRail(true, 'notePrompted');
   }
 
   private importPromptRecovery(snapshot: unknown): Promise<void> {
@@ -8375,7 +8376,7 @@ export class PanelProvider implements vscode.Disposable {
     void this.persistHostState().catch(() => {});
     // Update every attached host's comment copy.
     void this.post({ type: 'notes', comments: this.saved.comments });
-    this.postRail(true);
+    this.postRail(true, 'dropCarriedComments');
   }
 
   private dropCarriedAssets(
@@ -9278,7 +9279,7 @@ export class PanelProvider implements vscode.Disposable {
       this.onArchivedSessionsChange?.(this.hidden);
     }
     if (hiddenChanged || pinnedChanged) {
-      this.postRail(true);
+      this.postRail(true, 'updateSessionMembership');
     }
     return (write.persisted = persisted
       .catch((error) => {
@@ -9291,7 +9292,7 @@ export class PanelProvider implements vscode.Disposable {
           this.saved.hidden = [...this.hidden];
           this.saved.pinnedTop = [...this.pinnedTop];
           if (hiddenChanged) this.onArchivedSessionsChange?.(this.hidden);
-          this.postRail(true);
+          this.postRail(true, 'updateSessionMembership');
         }
         throw error;
       })
@@ -9616,7 +9617,7 @@ export class PanelProvider implements vscode.Disposable {
       return;
     }
     this.railSeedSkipped = false;
-    this.postRail(false);
+    this.postRail(false, 'settleRailSeed');
   }
 
   private anyVisible(): boolean {
@@ -11283,7 +11284,7 @@ export class PanelProvider implements vscode.Disposable {
     const pendingMoved =
       this.lifetimeFigures.pendingMoved(holds) ||
       (this.railPendingAnswers !== null && this.lifetimeFigures.pendingMoved(holds, this.railPendingAnswers));
-    if (pendingMoved) this.postRail(true);
+    if (pendingMoved) this.postRail(true, 'postRailIfSpendPendingMoved');
     if (costInputsMoved || pendingMoved) this.postDispatchedCostsIfMoved(caller);
   }
 
@@ -11330,8 +11331,10 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   // Update session-list content from retained facts without parsing transcripts. Unchanged revisions and payload inputs skip the update.
+  // `caller` names the requester in the counters of a post.
   private postRail(
     inputsChanged: boolean,
+    caller = 'unnamed',
     knownCounts?: ReadonlyMap<string, NewCount>,
     refreshCatalogFacts = true,
   ): void {
@@ -11370,6 +11373,10 @@ export class PanelProvider implements vscode.Disposable {
       return;
     }
     this.performanceCounters?.recordWork('railPayloadBuilt');
+    this.performanceCounters?.recordWork(`railPost:${caller}`);
+    const changes = this.lastRailKey ? railInputChanges(this.lastRailKey, key) : ['first'];
+    if (this.lastRailKey && adoptionsJson !== this.lastRailAdoptionsJson) changes.push('sessionAdoptions');
+    for (const change of changes) this.performanceCounters?.recordWork(`railPostInput:${caller}:${change}`);
     const sharedRail = railPayload(input);
     let largestRailBytes: number | null = null;
     for (const host of this.hosts) {
@@ -11581,7 +11588,7 @@ export class PanelProvider implements vscode.Disposable {
     this.scheduleProjectSpendIndex(trustedListedRevisions(catalog, this.catalogWalked, this.showing), null);
     this.postProjectSpend();
     // Hydration adds lifetime figures without replacing catalog-derived order or status.
-    this.postRail(true, undefined, false);
+    this.postRail(true, 'hydrateProjectSpend', undefined, false);
     this.postDispatchedCostsIfMoved('hydrate');
   }
 
@@ -11817,7 +11824,7 @@ export class PanelProvider implements vscode.Disposable {
     // Defer the owed session-list update until indexing completes so it publishes settled lifetime figures.
     if (this.projectSpendRailOwed && !this.projectSpendIndexing) {
       this.projectSpendRailOwed = false;
-      this.postRail(true);
+      this.postRail(true, 'commitProjectSpendCheckpoint');
       this.postDispatchedCostsIfMoved('checkpoint');
     }
   }
@@ -12407,7 +12414,7 @@ export class PanelProvider implements vscode.Disposable {
       const railOwed = this.projectSpendRailOwed || displayMoved;
       this.projectSpendRailOwed = false;
       if (railOwed) {
-        this.postRail(true);
+        this.postRail(true, 'finishProjectSpendIndex');
         this.postDispatchedCostsIfMoved('indexFinished');
       } else {
         this.postRailIfSpendPendingMoved('indexIdle');
@@ -16916,7 +16923,7 @@ export class PanelProvider implements vscode.Disposable {
           // The composer derives its annotation chip and empty-prompt send state from the same
           // comments. They travel in the usage payload, so publish that view with the card marks.
           void this.post({ type: 'usage', usage: this.usagePayload() });
-          this.postRail(true);
+          this.postRail(true, 'onMessage');
         },
         armSelectedText: (msg) => {
           this.selectedTextMenuArm = {
@@ -17001,12 +17008,12 @@ export class PanelProvider implements vscode.Disposable {
         setViews: (msg) => {
           this.saved.views = normalizeSavedViews(msg.views);
           void this.persistHostState().catch(() => {});
-          this.postRail(true);
+          this.postRail(true, 'onMessage');
         },
         setRailFilters: (msg) => {
           this.saved.railFilters = normalizeSavedRailFilters(msg.railFilters);
           void this.persistHostState().catch(() => {});
-          this.postRail(true);
+          this.postRail(true, 'onMessage');
         },
         // Apply one operation to the provider-owned sets. A panel can act before it receives a
         // peer's update without replacing that peer's membership state with an older snapshot.

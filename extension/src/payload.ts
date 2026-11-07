@@ -81,6 +81,9 @@ export interface RailPayload {
 export interface RailInputKey {
   readonly held: readonly unknown[];
   readonly print: string;
+  // Where each field's values end in `held`, and each field's print, in RAIL_INPUT_HOLDS order. A held field has a null print.
+  readonly heldEnds: readonly number[];
+  readonly prints: readonly (string | null)[];
 }
 
 // Comparison policy for every session list input field.
@@ -124,25 +127,44 @@ function printable(value: unknown): unknown {
 
 export function railInputKey(input: RailPayloadInput): RailInputKey {
   const held: unknown[] = [];
-  const printed: unknown[] = [];
+  const heldEnds: number[] = [];
+  const prints: (string | null)[] = [];
   for (const field of Object.keys(RAIL_INPUT_HOLDS) as (keyof RailPayloadInput)[]) {
     const value = input[field];
     const hold = RAIL_INPUT_HOLDS[field];
     if (hold === 'same') {
       held.push(value);
+      prints.push(null);
     } else if (hold === 'day') {
-      printed.push(railWordingDay(value as number));
+      prints.push(JSON.stringify(railWordingDay(value as number)));
     } else if (hold === 'each') {
       const items = value as readonly unknown[];
       held.push(items.length);
       for (const item of items) {
         held.push(item);
       }
+      prints.push(null);
     } else {
-      printed.push(printable(value));
+      prints.push(JSON.stringify(printable(value)));
     }
+    heldEnds.push(held.length);
   }
-  return { held, print: JSON.stringify(printed) };
+  // A JSON print holds no line break, so the joined prints are equal only when every field's print is equal.
+  return { held, print: prints.filter((print) => print !== null).join('\n'), heldEnds, prints };
+}
+
+// The input fields whose part of the key differs between two keys, in RAIL_INPUT_HOLDS order.
+export function railInputChanges(before: RailInputKey, now: RailInputKey): string[] {
+  return Object.keys(RAIL_INPUT_HOLDS).filter((_field, at) => {
+    if (before.prints[at] !== now.prints[at]) return true;
+    const start = at ? before.heldEnds[at - 1] : 0;
+    const nowStart = at ? now.heldEnds[at - 1] : 0;
+    const length = before.heldEnds[at] - start;
+    if (length !== now.heldEnds[at] - nowStart) return true;
+    for (let offset = 0; offset < length; offset++)
+      if (before.held[start + offset] !== now.held[nowStart + offset]) return true;
+    return false;
+  });
 }
 
 export function sameRailInputs(before: RailInputKey | null, now: RailInputKey): boolean {

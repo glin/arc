@@ -11966,7 +11966,7 @@ test('the first authoritative render precedes Project cost restoration and prici
   );
   sourceMatch(
     hydration,
-    /this\.postProjectSpend\(\);[\s\S]*this\.postRail\(true, undefined, false\);/,
+    /this\.postProjectSpend\(\);[\s\S]*this\.postRail\(true, 'hydrateProjectSpend', undefined, false\);/,
     'hydration does not update Project cost and every lifetime figure from the held catalog',
   );
   sourceDoesNotMatch(
@@ -25130,7 +25130,7 @@ test('the rail card and the session heading both offer pinning, and none of it i
   );
   sourceMatch(
     panelHostSource,
-    /const target = this\.panelSession\(session\);[\s\S]*this\.saved\.pinnedTop = \[\.\.\.this\.pinnedTop\];[\s\S]*this\.postRail\(true\);/,
+    /const target = this\.panelSession\(session\);[\s\S]*this\.saved\.pinnedTop = \[\.\.\.this\.pinnedTop\];[\s\S]*this\.postRail\(true, '\w+'\);/,
     'the pin commands do not update and publish the provider-owned durable set',
   );
   sourceMatch(
@@ -26021,7 +26021,7 @@ test('a prompt goes to the session the composer names, and nowhere else', () => 
   );
   sourceMatch(
     taken,
-    /this\.postRail\(true\);/,
+    /this\.postRail\(true, '\w+'\);/,
     'the rail keeps showing comments that a delivered prompt has taken away',
   );
   // The send callback returns a PromptDelivery answer.
@@ -31038,7 +31038,7 @@ test('the unsent prompts reach storage and come back out of it', () => {
   );
   sourceMatch(
     heldBody,
-    /if \(moved\) \{ this\.postRail\(true\); \}/,
+    /if \(moved\) \{ this\.postRail\(true, '\w+'\); \}/,
     'a prompt can appear or disappear without rewording its rail card',
   );
   sourceMatch(
