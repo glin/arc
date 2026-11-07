@@ -127,6 +127,23 @@ function checkedMetadata(value: UsageSlotMetadata, slot: string): UsageSlotMetad
   return value;
 }
 
+const REFUSAL_CODES = new Set(['EPERM', 'EACCES', 'EBUSY']);
+const REFUSAL_DELAYS_MS = [5, 10, 20, 40, 80, 160];
+
+// On Windows, a reader's open handle refuses a rename over the file, and on some file systems an unlink
+// or the recreation of the unlinked name. The reader closes its handle after one bounded read.
+async function retryRefusal<T>(operation: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await operation();
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (attempt >= REFUSAL_DELAYS_MS.length || !code || !REFUSAL_CODES.has(code)) throw error;
+      await new Promise((resolve) => setTimeout(resolve, REFUSAL_DELAYS_MS[attempt]));
+    }
+  }
+}
+
 export class UsageRecorder {
   private readonly filesystem: typeof fs.promises;
   private readonly now: () => number;
@@ -339,7 +356,7 @@ export class UsageRecorder {
       throw new Error('Usage publication exceeds quota');
     const temporary = path.join(this.directory, `${slot}.tmp`);
     await this.finish(await this.filesystem.open(temporary, 'wx'), bytes, 0, true);
-    await this.filesystem.rename(temporary, path.join(this.directory, `${slot}.json`));
+    await retryRefusal(() => this.filesystem.rename(temporary, path.join(this.directory, `${slot}.json`)));
     sizes.set(`${slot}.json`, bytes.length);
   }
 
@@ -381,8 +398,8 @@ export class UsageRecorder {
         return;
       }
       if (value?.day !== day) {
-        if (value) await this.filesystem.unlink(data);
-        await this.finish(await this.filesystem.open(data, 'wx'), Buffer.alloc(0), 0, true);
+        if (value) await retryRefusal(() => this.filesystem.unlink(data));
+        await this.finish(await retryRefusal(() => this.filesystem.open(data, 'wx')), Buffer.alloc(0), 0, true);
         value = { v: 1, day, generation: randomUUID(), compressed: 0, raw: 0 };
         await this.publish(slot, value, sizes);
         sizes.set(`${slot}.gz`, 0);

@@ -664,6 +664,83 @@ test('UTC epoch dates and the thirtieth-day boundary retain only expired generat
   assert.equal(metadata(root, -1).day, 29);
 });
 
+function refusal(code: string): NodeJS.ErrnoException {
+  return Object.assign(new Error(`${code}: operation not permitted`), { code });
+}
+
+test('a refused rename, unlink, or recreation retries and leaves the slot open to later readings', async () => {
+  const { root } = await populated();
+  const files = slotFiles(root);
+  const refused: string[] = [];
+  const refuseOnce = (name: string) => {
+    if (refused.includes(name)) return;
+    refused.push(name);
+    throw refusal(name === 'unlink' ? 'EBUSY' : 'EPERM');
+  };
+  const filesystem: typeof fs.promises = {
+    ...fs.promises,
+    rename: async (...args: Parameters<typeof fs.promises.rename>) => {
+      refuseOnce('rename');
+      return fs.promises.rename(...args);
+    },
+    unlink: async (file: fs.PathLike) => {
+      if (String(file) === files.data) refuseOnce('unlink');
+      return fs.promises.unlink(file);
+    },
+    open: async (...args: Parameters<typeof fs.promises.open>) => {
+      if (String(args[0]) === files.data && args[1] === 'wx') refuseOnce('open');
+      return fs.promises.open(...args);
+    },
+  };
+  const same = new UsageRecorder(root, { now: () => READ_AT, filesystem });
+  same.record('claude', sample(READ_AT, 0.4));
+  await same.drain();
+  assert.deepEqual(refused, ['rename']);
+  assert.equal(fs.existsSync(files.lock), false);
+  assert.equal(fs.existsSync(files.temporary), false);
+  assert.equal(metadata(root).compressed, fs.statSync(files.data).size);
+  const expiredAt = READ_AT + 30 * 86_400_000;
+  const replacing = new UsageRecorder(root, { now: () => expiredAt, filesystem });
+  replacing.record('claude', sample(expiredAt, 0.6));
+  await replacing.drain();
+  assert.deepEqual(refused, ['rename', 'unlink', 'open']);
+  assert.equal(metadata(root, expiredAt).day, files.day + 30);
+  assert.equal(fs.existsSync(files.lock), false);
+  assert.deepEqual(
+    gunzipSync(fs.readFileSync(files.data)).toString('utf8'),
+    usageRecordLines('claude', sample(expiredAt, 0.6)).join('\n') + '\n',
+  );
+});
+
+test('a reader handle open on the slot metadata delays publication until the handle closes', async () => {
+  const { root } = await populated();
+  const files = slotFiles(root);
+  let reader: FileHandle | null = await fs.promises.open(files.meta, 'r');
+  const refusals: string[] = [];
+  const filesystem: typeof fs.promises = {
+    ...fs.promises,
+    rename: async (...args: Parameters<typeof fs.promises.rename>) => {
+      try {
+        return await fs.promises.rename(...args);
+      } catch (error) {
+        refusals.push((error as NodeJS.ErrnoException).code ?? '');
+        await reader?.close();
+        reader = null;
+        throw error;
+      }
+    },
+  };
+  const recorder = new UsageRecorder(root, { now: () => READ_AT, filesystem });
+  recorder.record('claude', sample(READ_AT, 0.4));
+  await recorder.drain();
+  await reader?.close();
+  // Windows refuses a rename over an open file. Other platforms replace it at once.
+  assert.deepEqual(refusals, process.platform === 'win32' ? ['EPERM'] : []);
+  assert.equal(fs.existsSync(files.lock), false);
+  assert.equal(metadata(root).compressed, fs.statSync(files.data).size);
+  assert.equal(gunzipSync(fs.readFileSync(files.data)).toString('utf8').split('\n').filter(Boolean).length, 2);
+});
+
 test('linked directories and nonregular recognized entries refuse new recording', async () => {
   const parent = tempDir('bounded-links-');
   const target = path.join(parent, 'target');
