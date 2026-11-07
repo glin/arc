@@ -713,6 +713,40 @@ test('a refused rename, unlink, or recreation retries and leaves the slot open t
   );
 });
 
+test('a rename refusal that never stops ends after seven tries and keeps the slot lock', async () => {
+  const { root } = await populated();
+  const files = slotFiles(root);
+  const prior = metadata(root);
+  let renames = 0;
+  const filesystem: typeof fs.promises = {
+    ...fs.promises,
+    rename: async () => {
+      renames++;
+      throw refusal('EPERM');
+    },
+  };
+  vi.useFakeTimers({ toFake: ['setTimeout'] });
+  try {
+    const recorder = new UsageRecorder(root, { now: () => READ_AT, filesystem });
+    recorder.record('claude', sample(READ_AT, 0.4));
+    let drained = false;
+    void recorder.drain().then(() => {
+      drained = true;
+    });
+    await vi.waitFor(() => assert.equal(drained, true));
+  } finally {
+    vi.useRealTimers();
+  }
+  assert.equal(renames, 7);
+  assert.deepEqual(metadata(root), prior);
+  assert.equal(fs.existsSync(files.lock), true);
+  assert.equal(fs.existsSync(files.temporary), true);
+  const other = new UsageRecorder(root, { now: () => READ_AT });
+  other.record('claude', sample(READ_AT, 0.6));
+  await other.drain();
+  assert.deepEqual(metadata(root), prior);
+});
+
 test('a reader handle open on the slot metadata delays publication until the handle closes', async () => {
   const { root } = await populated();
   const files = slotFiles(root);
