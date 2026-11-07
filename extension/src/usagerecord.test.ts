@@ -894,9 +894,9 @@ test('a reader reads each metadata and format file through one open and one boun
       new Proxy(handle, {
         get(target, key) {
           if (key === 'read' && file !== files.data)
-            return (...args: Parameters<FileHandle['read']>) => {
-              reads.push(`${path.basename(file)} ${String(args[2])}`);
-              return target.read(...args);
+            return (buffer: Buffer, offset: number, length: number, position: number | null) => {
+              reads.push(`${path.basename(file)} ${length}`);
+              return target.read(buffer, offset, length, position);
             };
           const value = Reflect.get(target, key, target);
           return typeof value === 'function' ? value.bind(target) : value;
