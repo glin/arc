@@ -750,7 +750,7 @@ const definitions: readonly Command[] = [
       ],
       refusals: [
         'Unknown options, missing values, and an agent other than claude or codex fail.',
-        'An unreadable store folder or format file fails. A store with problems and no readable slot prints its problems and exits 1. An empty or missing store prints that no saved usage exists and succeeds.',
+        'An unreadable store folder or format file fails. A store with problems and no readable slot prints its problems and exits 1. An empty or missing store succeeds, and its text output says that no saved usage exists.',
       ],
       example: 'arc usage --agent claude',
     },
