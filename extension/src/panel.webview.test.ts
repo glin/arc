@@ -3937,6 +3937,30 @@ test('a child row published from saved links and refused before the settled repl
   );
 });
 
+test('a settled reply under other roots leaves a saved child row qualified without its saved parent when the roots return', async () => {
+  const f = cachedLinksReadFixture('6f2c1d9e-0000-4000-8000-000000000001', false);
+  const roots = f.provider.repositoryScopeRoots;
+  const read = () =>
+    f.provider.readSessionRequest({
+      id: 'lookup-child',
+      method: 'session',
+      params: { sessionId: f.childId, turns: 1 },
+      requester: 'reader',
+      requesterProvider: 'claude',
+    });
+  assert.equal(read().state, 'stale');
+  f.provider.repositoryScopeRoots = [path.join(roots[0], 'elsewhere')];
+  await settleCachedLinksFixture(f, false);
+  f.provider.repositoryScopeRoots = roots;
+  assert.ok(
+    f.provider.sessionReadAdmitted(f.provider.authoritativeCatalog.find((row: any) => row.file === f.childFile)),
+  );
+  const reply = read();
+  assert.equal(reply.state, 'stale', 'the saved parent qualified the child after a reply under other roots');
+  assert.deepEqual(reply.turns, []);
+  assert.equal(f.provider.currentReadSource({ provider: 'claude', sessionId: f.childId }), null);
+});
+
 test.each(['storage', 'publication'])(
   'queued production receipts refuse bytes appended during earlier %s',
   async (phase) => {

@@ -1668,8 +1668,8 @@ export class PanelProvider implements vscode.Disposable {
   // The saved links and child rows that the first catalog published, under the roots of that catalog. Until the first complete
   // reply, the session list's parent edges and agent run classification use them. Export, the channel's session page, reads,
   // the worker's input and file actions use `claudeChildReferences` and `claudeChildren`, which stay empty until that reply.
-  // `settled` marks a settled reply under the same roots, and the next acceptance drops each published child row that the reply
-  // does not list.
+  // `settled` marks a settled reply under any roots. The next acceptance under the same roots drops each published child row
+  // that the reply does not list. The first acceptance after that reply clears the field under any roots.
   private cachedLinks?: {
     readonly scope: string;
     readonly references: readonly ClaudeChildSessionReference[];
@@ -13175,14 +13175,15 @@ export class PanelProvider implements vscode.Disposable {
     this.claudeChildrenDiscovered = true;
     if (!this.dispatchDiscoveryPending) {
       // A settled reply verifies the links that the first catalog published from the saved set, and replaces the saved set. A
-      // reply under other roots verifies nothing that the catalog published.
+      // reply under other roots verifies nothing that the catalog published and counts nothing. The published child rows keep
+      // their saved parents in the catalog until the next acceptance, so reads keep qualifying them without those parents.
       const cached = this.cachedLinks;
       if (cached && !cached.settled) {
         if (cached.scope === JSON.stringify(this.repositoryScopeRoots)) {
           const stale = changedClaudeChildReferences(cached.references, progress.references);
           if (stale) this.performanceCounters?.recordWork?.('cachedLinks:changed', stale);
-          cached.settled = true;
-        } else this.cachedLinks = undefined;
+        }
+        cached.settled = true;
       }
       if (progress.receiptStore !== undefined)
         this.savedLinks = {
