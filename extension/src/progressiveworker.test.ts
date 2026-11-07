@@ -77,7 +77,7 @@ test.each(['claude', 'codex'] as const)(
         fs.mkdirSync(path.join(fx.receipts.root, `${index.toString(16).padStart(8, '0')}-1111-2222-3333-444444444444`));
       fx.launch(fx.parent, fx.child, true, true, 36 * 1024);
       fx.launch(fx.child, fx.grandchild, true, true, 36 * 1024);
-      const workerSource = `process.env.ARC_HOME=${JSON.stringify(fx.home)};` + narrowReceiptAllowance(source);
+      const workerSource = `process.env.ARC_HOME=${JSON.stringify(fx.home)};` + narrowReceiptBudget(source);
       const check = async (throughHost: boolean) => {
         const worker = new ProgressiveWorker(workerSource);
         const discovery = throughHost ? await receiptDiscoveryHost(worker, [root], fx.catalog) : undefined;
@@ -413,7 +413,7 @@ test('a window read sent during a receipt pass completes before the pass ends', 
   const worker = new ProgressiveWorker(
     `process.env.ARC_HOME=${JSON.stringify(fx.home)};` +
       "const receiptStepPort = require('node:worker_threads').parentPort;" +
-      narrowReceiptAllowance(source)
+      narrowReceiptBudget(source)
         .replace(deadline, 'const receiptDeadline = Infinity;')
         .replace(step, step + "receiptStepPort.postMessage({ repeatedCoverage: 'receipt-step' });"),
     undefined,
@@ -464,7 +464,7 @@ test('receipt replies after a whole reply are deltas until the host checkpoint d
   fx.launch(fx.parent, fx.child, true, true, 36 * 1024);
   fx.launch(fx.child, fx.grandchild, true, true, 36 * 1024);
   const worker = new ProgressiveWorker(
-    `process.env.ARC_HOME=${JSON.stringify(fx.home)};` + narrowReceiptAllowance(source),
+    `process.env.ARC_HOME=${JSON.stringify(fx.home)};` + narrowReceiptBudget(source),
   );
   const { host, replies } = await receiptDiscoveryHost(worker, [root], fx.catalog);
   const kinds: string[] = [];
@@ -562,7 +562,7 @@ async function receiptDiscoveryHost(
 }
 
 // Tests of events inside a receipt scan read a small store over several requests, so each request gets 256 receipt steps.
-function narrowReceiptAllowance(code: string): string {
+function narrowReceiptBudget(code: string): string {
   const allowance = 'receiptSteps >= RECEIPT_STEPS';
   assert.equal(code.split(allowance).length - 1, 1, 'The receipt step allowance did not match');
   return code.replace(allowance, 'receiptSteps >= 256');
@@ -609,7 +609,7 @@ test.each(['added', 'removed', 'requester removed', 'added before the launches a
       const worker = new ProgressiveWorker(
         `process.env.ARC_HOME=${JSON.stringify(fx.home)};performance.now=()=>0;` +
           launchesFirst(fx.receipts.root, early) +
-          narrowReceiptAllowance(source),
+          narrowReceiptBudget(source),
         undefined,
         (file) => {
           if (file === 'receipt-store-opened') storeOpened = true;
@@ -730,7 +730,7 @@ test.each(['during each forward read', 'on their own clock'])(
     const clock = writer === 'on their own clock';
     const requestStart = 'requests.set(message.id, controller);';
     assert.equal(source.split(requestStart).length - 1, 1, 'Worker request instrumentation did not match');
-    const instrumented = narrowReceiptAllowance(source).replace(
+    const instrumented = narrowReceiptBudget(source).replace(
       requestStart,
       `${requestStart} if (message.request.kind === 'claude-children') entryActive = { id: message.id, generation: message.generation, armed: entryOpened && message.generation % 2 === 0 };`,
     );
@@ -835,7 +835,7 @@ test.each(['during the scan', 'after the last store entry'])(
         receiptEntries(fx.receipts.root) +
         replacedStore(fx.receipts.root, marker) +
         (when === 'during the scan' ? '' : replacedAtStoreEnd(fx.receipts.root, marker, launchId)) +
-        narrowReceiptAllowance(source),
+        narrowReceiptBudget(source),
       undefined,
       (file) => {
         if (file === 'receipt-store-opened') openings++;
@@ -2576,7 +2576,7 @@ test('a Claude child whose root leaves and returns within one epoch keeps its ow
   ];
   // A frozen clock ends each pass on its receipt step allowance.
   const worker = new ProgressiveWorker(
-    `process.env.ARC_HOME=${JSON.stringify(arcHome)};performance.now=()=>0;` + narrowReceiptAllowance(source),
+    `process.env.ARC_HOME=${JSON.stringify(arcHome)};performance.now=()=>0;` + narrowReceiptBudget(source),
   );
   const request = (roots: string[]) => ({
     kind: 'claude-children' as const,

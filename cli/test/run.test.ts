@@ -3128,7 +3128,7 @@ test('oversized selected MCP settings refuse before launch reservation and provi
         receipts,
       },
     ),
-    /launch settings exceed the dispatch receipt allowance/,
+    /launch settings are too large for one dispatch receipt/,
   );
   assert.deepEqual(fs.readdirSync(receipts.root), []);
   assert.equal(fs.existsSync(report), false);
@@ -3157,7 +3157,7 @@ test('complete serialized launch receipts enforce the byte boundary including se
   assert.deepEqual(receipts.launch(under.launchId), under);
   const before = fs.readdirSync(receipts.root).sort();
   input.standalone.args[0] += '\n';
-  assert.throws(() => receipts.reserve(input), /launch settings exceed the dispatch receipt allowance/);
+  assert.throws(() => receipts.reserve(input), /launch settings are too large for one dispatch receipt/);
   assert.deepEqual(fs.readdirSync(receipts.root).sort(), before);
   assert.equal(fs.existsSync(input.alias), false);
   assert.equal(fs.existsSync(input.standalone.logAlias), false);

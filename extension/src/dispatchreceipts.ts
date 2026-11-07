@@ -791,7 +791,7 @@ export class DispatchReceipts {
     };
     const receipt = JSON.stringify(launch);
     if (Buffer.byteLength(receipt) > JSON_BYTES)
-      throw new Error('The launch settings exceed the dispatch receipt allowance. Reduce the selected configuration.');
+      throw new Error('The launch settings are too large for one dispatch receipt. Reduce the selected configuration.');
     this.checkStatusEnvelope(
       launch,
       launch.standalone
