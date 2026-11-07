@@ -10231,16 +10231,21 @@ test(
         children: '',
         sessionParents: '',
       });
+      // Runs the continuations and the refreshes they start until discovery and dispatched spend stop asking for a pass.
+      const settle = async () => {
+        for (let i = 0; i < 8 && (provider.dispatchDiscoveryPending || provider.dispatchSpendPending); i++) {
+          const before = fixture.continuations.length + fixture.refreshes.length;
+          await vi.advanceTimersToNextTimerAsync();
+          assert.ok(fixture.continuations.length + fixture.refreshes.length > before);
+          await fixture.continuations.at(-1);
+          await fixture.refreshes.at(-1);
+        }
+        assert.equal(provider.dispatchDiscoveryPending || provider.dispatchSpendPending, false);
+      };
       await provider.refresh(false, true);
       assert.equal(fixture.collections(), 0);
       assert.equal(fixture.posted.filter((message) => message.type === 'render').length, 0);
-      for (let i = 0; i < 8 && (provider.dispatchDiscoveryPending || provider.dispatchSpendPending); i++) {
-        const before = fixture.continuations.length + fixture.refreshes.length;
-        await vi.advanceTimersToNextTimerAsync();
-        assert.ok(fixture.continuations.length + fixture.refreshes.length > before);
-        await fixture.continuations.at(-1);
-        await fixture.refreshes.at(-1);
-      }
+      await settle();
       assert.equal(fixture.collections(), 1);
       const renders = fixture.posted.filter((message) => message.type === 'render');
       assert.equal(renders.length, 1);
@@ -10255,20 +10260,31 @@ test(
       await provider.refresh(false, true);
       assert.equal(fixture.collections(), 1);
       assert.equal(fixture.posted.filter((message) => message.type === 'render').length, 1);
-      // An unchanged unknown source becomes eligible at its accepted deadline.
+      // An unchanged unknown source becomes eligible at its accepted deadline. With members settled, the refresh that lists
+      // the grown file draws its held figures and sends no full pass. The spend-only pass that follows reads the grown file,
+      // and the moved figure posts in one more refresh.
       fs.appendFileSync(childFile, record('event_msg', 6, { type: 'task_started', turn_id: 'resumed' }));
       Object.assign(sessions[1], { size: fs.statSync(childFile).size, mtimeMs: fs.statSync(childFile).mtimeMs });
       await provider.refresh(false, true);
       assert.equal(provider.dispatchDiscoveryPending, false);
+      assert.equal(provider.dispatchSpendPending, true);
+      assert.equal(provider.dispatchFacts.get(id).spend.found, true);
+      assert.equal(fixture.collections(), 2);
+      await settle();
       assert.equal(provider.dispatchFacts.get(id).spend.found, false);
       const deadline = provider.dispatchFacts.get(id).refreshAt;
       assert.notEqual(deadline, null);
       assert.ok(deadline > Date.now());
       const beforeDeadline = fixture.collections();
-      assert.equal(beforeDeadline, 2);
+      assert.equal(beforeDeadline, 3);
+      const movedRender = fixture.posted.filter((message) => message.type === 'render');
+      assert.equal(movedRender.length, 3);
+      for (const card of movedRender[2].cards as CardView[])
+        assert.ok(!card.dispatched?.[0].figures.some((figure) => figure.metric === 'cost'));
       fs.writeFileSync(clock, String(deadline + 1));
       vi.setSystemTime(deadline + 1);
       await provider.refresh(false, true);
+      await settle();
       assert.equal(provider.dispatchFacts.get(id).spend.found, true);
       assert.equal(fixture.collections(), beforeDeadline + 1);
       const refreshedRender = fixture.posted.filter((message) => message.type === 'render').at(-1);
