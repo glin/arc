@@ -45,7 +45,7 @@ import {
 } from './sessionwrites';
 import { resolveResponseSession, pendingResponseSessionAdmitted, parseSessionLink } from './domain/session-link';
 import { nativeCitationPath } from './domain/file-citation';
-import { externalOpenEligible } from './externalopen';
+import { externalOpenEligible, externalOpenPath } from './externalopen';
 import {
   boundedSessionRead,
   AgentReadSources,
@@ -950,7 +950,31 @@ async function openLink(
           void vscode.window.showInformationMessage(`Arc: ${target} is a folder.`);
           return;
         }
-        await vscode.commands.executeCommand('revealInExplorer', uri);
+        // The Explorer view selects only folders inside a workspace folder and ignores any other folder.
+        if (
+          isInside(
+            uri.fsPath,
+            folders.map((f) => f.uri.fsPath),
+          )
+        ) {
+          await vscode.commands.executeCommand('revealInExplorer', uri);
+          return;
+        }
+        // A remote window's file manager runs on the local machine, not on the machine that holds the folder.
+        if (vscode.env.remoteName !== undefined) {
+          failure ??= `Arc: ${uri.fsPath} is outside the workspace and needs a local desktop window.`;
+          continue;
+        }
+        // Finder launches a bundle folder that it opens, and a symbolic link can name a bundle under any name.
+        // On macOS a folder with a listed launcher suffix or a final symbolic link is selected in its parent.
+        if (
+          process.platform === 'darwin' &&
+          (stat.type & vscode.FileType.SymbolicLink || !externalOpenPath(uri.fsPath))
+        ) {
+          await vscode.commands.executeCommand('revealFileInOS', uri);
+          return;
+        }
+        if (!(await vscode.env.openExternal(uri))) throw new Error('The file manager did not open the folder.');
         return;
       }
       if (literal === 'directory') {

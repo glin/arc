@@ -27,7 +27,7 @@ import { inlineText } from './webview/inline-text.ts';
 import type { QueuedSubmission, TurnComment } from './turnview.ts';
 import { resolveResponseSession, pendingResponseSessionAdmitted, sessionLinkContext } from './domain/session-link';
 import { nativeCitationPath } from './domain/file-citation';
-import { externalOpenEligible, type ExternalOpenFs } from './externalopen';
+import { externalOpenEligible, externalOpenPath, type ExternalOpenFs } from './externalopen';
 import { contributedFileSides } from './patchview';
 import * as crypto from 'node:crypto';
 import { codexSubagentFor, type CodexSubagentFile } from './codex';
@@ -143,7 +143,7 @@ function externalLinkFiles() {
 }
 
 test('response citation presses open external literal files without workspace or snapshot routing', async () => {
-  const { linkCandidates, linkLocation, linkTargetIsVideo } = await import('./transcript.js');
+  const { linkCandidates, linkLocation, linkTargetIsVideo, isInside } = await import('./transcript.js');
   const opened: Array<{ path: string; options: Record<string, unknown> }> = [];
   const commands: unknown[][] = [];
   const notices: string[] = [];
@@ -171,7 +171,7 @@ test('response citation presses open external literal files without workspace or
     },
     env: {
       openExternal: async (file: { fsPath: string }) => {
-        assert.equal(binary.events.at(-1), `close:${file.fsPath}`);
+        if (kind === 1) assert.equal(binary.events.at(-1), `close:${file.fsPath}`);
         external.push(file);
         return true;
       },
@@ -212,6 +212,8 @@ test('response citation presses open external literal files without workspace or
     'linkTargetIsMarkdown',
     'linkTargetIsVideo',
     'externalOpenEligible',
+    'isInside',
+    'externalOpenPath',
     `${source}\nreturn openLink;`,
   )(
     host,
@@ -225,6 +227,8 @@ test('response citation presses open external literal files without workspace or
     (file: string) => file.endsWith('.md'),
     linkTargetIsVideo,
     (file: string) => externalOpenEligible(file, process.platform, binary.io),
+    isInside,
+    externalOpenPath,
   );
   for (const name of ['one%20.csv', 'one .csv', 'one#L10', 'one:10', 'Case.csv', 'case.csv', 'guide.md#appendix']) {
     const file = `${outside}/${name}`;
@@ -270,12 +274,17 @@ test('response citation presses open external literal files without workspace or
   assert.equal(commands.length, 0);
   for (const name of ['tree#L10', 'tree é space', ...(process.platform === 'win32' ? [] : ['tree:42'])]) {
     const folder = `${outside}/${name}`;
+    const beforeExternal = external.length;
     await open(folder, 1, 'directory');
     assert.equal(checked.at(-1), folder);
-    const reveal = commands.pop()!;
-    assert.equal(reveal[0], 'revealInExplorer');
-    assert.equal((reveal[1] as { fsPath: string }).fsPath, folder);
+    assert.equal(external.length, beforeExternal + 1, 'a folder outside the workspace did not reach the file manager');
+    assert.equal((external.at(-1) as { fsPath: string }).fsPath, folder);
+    assert.deepEqual(commands, []);
   }
+  await open(`${root}/tree`, 1, 'directory');
+  const reveal = commands.pop()!;
+  assert.equal(reveal[0], 'revealInExplorer');
+  assert.equal((reveal[1] as { fsPath: string }).fsPath, `${root}/tree`);
   const routedDirectory: unknown[][] = [];
   const directoryHandler = new Function(
     'openLink',
@@ -407,7 +416,7 @@ test('registered checkout identity changes reach the host metadata refresh callb
 });
 
 test('clicked local links open outside workspace folders through their existing editor routes', async () => {
-  const { linkCandidates, linkLocation, linkTargetIsVideo } = await import('./transcript.js');
+  const { linkCandidates, linkLocation, linkTargetIsVideo, isInside } = await import('./transcript.js');
   const source = ts.transpileModule(declarationSource(panelHostSource, 'openLink'), {
     compilerOptions: { target: ts.ScriptTarget.ES2022 },
   }).outputText;
@@ -465,7 +474,7 @@ test('clicked local links open outside workspace folders through their existing 
         parse: (href: string) => href,
         joinPath: (base: ReturnType<typeof uri>, file: string) => uri(paths.join(base.fsPath, file)),
       },
-      FileType: { Directory: 2, File: 1 },
+      FileType: { Directory: 2, File: 1, SymbolicLink: 64 },
       workspace: {
         workspaceFolders: roots.map((root) => ({ uri: uri(root) })),
         fs: {
@@ -530,6 +539,8 @@ test('clicked local links open outside workspace folders through their existing 
       'linkTargetIsMarkdown',
       'linkTargetIsVideo',
       'externalOpenEligible',
+      'isInside',
+      'externalOpenPath',
       `${source}\nreturn openLink;`,
     )(
       { platform },
@@ -544,6 +555,16 @@ test('clicked local links open outside workspace folders through their existing 
       (file: string) => /\.(md|markdown)$/i.test(file),
       linkTargetIsVideo,
       (file: string) => externalOpenEligible(file, platform, binary.io),
+      (target: string, folders: string[]) => {
+        const actual = Object.getOwnPropertyDescriptor(process, 'platform')!;
+        Object.defineProperty(process, 'platform', { ...actual, value: platform });
+        try {
+          return isInside(target, folders);
+        } finally {
+          Object.defineProperty(process, 'platform', actual);
+        }
+      },
+      externalOpenPath,
     );
     for (const folder of [
       ...['tree#L10', 'tree é space', ...(platform === 'win32' ? [] : ['tree:42'])].map((name) =>
@@ -555,13 +576,100 @@ test('clicked local links open outside workspace folders through their existing 
     ]) {
       existing.set(folder, 2);
       const before = opened.length;
+      const beforeExternal = external.length;
+      const beforeCommands = commands.length;
       await open(folder, 1, 'directory');
       assert.equal(checked.at(-1), folder);
-      const reveal = commands.pop()!;
-      assert.equal(reveal[0], 'revealInExplorer');
-      assert.equal((reveal[1] as { fsPath: string }).fsPath, folder);
+      assert.equal(external.length, beforeExternal + 1, `${platform}: ${folder} did not reach the file manager`);
+      assert.equal(external.at(-1), folder);
+      assert.equal(commands.length, beforeCommands);
       assert.equal(opened.length, before);
+      assert.deepEqual(notices, []);
     }
+    const mixedCase = paths.join(roots[0].toUpperCase(), 'Mixed Tree');
+    const insideFolders = new Map([
+      [paths.normalize(roots[0]), true],
+      [paths.join(roots[1], 'tree'), true],
+      [mixedCase, platform === 'win32'],
+      [paths.join(paths.dirname(roots[0]), 'App Sibling'), false],
+    ]);
+    for (const [folder, inside] of insideFolders) {
+      existing.set(folder, 2);
+      const beforeExternal = external.length;
+      const beforeCommands = commands.length;
+      await open(folder, 1);
+      assert.deepEqual(notices, []);
+      if (inside) {
+        assert.equal(commands.length, beforeCommands + 1, `${platform}: ${folder} did not reach the Explorer view`);
+        assert.equal(commands.at(-1)![0], 'revealInExplorer');
+        assert.equal((commands.at(-1)![1] as ReturnType<typeof uri>).fsPath, folder);
+        assert.equal(external.length, beforeExternal);
+      } else {
+        assert.equal(commands.length, beforeCommands, `${platform}: ${folder} reached the Explorer view`);
+        assert.equal(external.length, beforeExternal + 1);
+        assert.equal(external.at(-1), folder);
+      }
+    }
+    const selectsInParent = { win32: false, darwin: true, linux: false }[platform];
+    for (const [name, type] of [
+      ['Tool.app', 2],
+      ['three.js', 2],
+      ['Linked', 66],
+    ] as const) {
+      const folder = paths.join(paths.dirname(text), name);
+      existing.set(folder, type);
+      const beforeFolder = external.length;
+      const beforeFolderCommands = commands.length;
+      await open(folder, 1);
+      assert.deepEqual(notices, []);
+      if (selectsInParent) {
+        assert.equal(external.length, beforeFolder, `${platform}: ${name} reached the file manager as a folder`);
+        assert.equal(commands.length, beforeFolderCommands + 1);
+        assert.equal(commands.at(-1)![0], 'revealFileInOS');
+        assert.equal((commands.at(-1)![1] as ReturnType<typeof uri>).fsPath, folder);
+      } else {
+        assert.equal(commands.length, beforeFolderCommands, `${platform}: ${name} opened its parent folder`);
+        assert.equal(external.length, beforeFolder + 1, `${platform}: ${name} did not reach the file manager`);
+        assert.equal(external.at(-1), folder);
+      }
+    }
+    const outsideFolder = paths.join(paths.dirname(text), 'refused');
+    existing.set(outsideFolder, 2);
+    for (const refusal of [false, new Error('file manager unavailable')]) {
+      openErrors.set(outsideFolder, refusal);
+      await open(outsideFolder, 1);
+      const detail = refusal instanceof Error ? refusal.message : 'The file manager did not open the folder.';
+      assert.equal(notices.pop(), `Arc: did not open ${outsideFolder}. ${detail}`);
+    }
+    openErrors.delete(outsideFolder);
+    const otherLib = paths.join(paths.dirname(text), 'Lib');
+    const relativeFolders = [paths.join(roots[0], '..', 'Lib', 'tree'), paths.join(otherLib, '..', 'Lib', 'tree')];
+    host.workspace.workspaceFolders = [roots[0], otherLib].map((root) => ({ uri: uri(root) }));
+    host.env.remoteName = 'ssh-remote';
+    for (const folder of relativeFolders) existing.set(folder, 2);
+    checked.length = 0;
+    const beforeRemote = external.length;
+    const beforeRemoteCommands = commands.length;
+    await open('../Lib/tree', 1);
+    assert.deepEqual(checked, relativeFolders);
+    assert.deepEqual(notices, [], `${platform}: a remote outside folder hid a later inside candidate`);
+    assert.equal(commands.length, beforeRemoteCommands + 1);
+    assert.equal(commands.at(-1)![0], 'revealInExplorer');
+    assert.equal((commands.at(-1)![1] as ReturnType<typeof uri>).fsPath, relativeFolders[1]);
+    existing.delete(relativeFolders[1]);
+    await open('../Lib/tree', 1);
+    assert.equal(
+      notices.pop(),
+      `Arc: ${relativeFolders[0]} is outside the workspace and needs a local desktop window.`,
+    );
+    assert.equal(
+      external.length,
+      beforeRemote,
+      `${platform}: a remote window sent an outside folder to the file manager`,
+    );
+    assert.equal(commands.length, beforeRemoteCommands + 1);
+    host.env.remoteName = undefined;
+    host.workspace.workspaceFolders = roots.map((root) => ({ uri: uri(root) }));
     const video = paths.join(paths.dirname(text), 'Story 100%.MP4');
     existing.set(video, 1);
     binary.files.set(video, Buffer.from([66, 76, 69, 78, 68, 69, 82, 0, 118]));
@@ -713,7 +821,7 @@ test('clicked local links open outside workspace folders through their existing 
     }
     await open(video, 2, true);
     assert.equal(external.at(-1), video);
-    const videoFolder = paths.join(paths.dirname(text), 'folder.mp4');
+    const videoFolder = paths.join(roots[0], 'folder.mp4');
     for (const type of [2, 66]) {
       existing.set(videoFolder, type);
       const beforeFolder = external.length;
@@ -797,13 +905,18 @@ test('clicked local links open outside workspace folders through their existing 
     await open('Only.ts', 2);
     assert.deepEqual(checked, [paths.join(roots[0], 'Only.ts'), lib]);
     assert.equal(opened.at(-1)!.file.fsPath, lib);
+    const htmlFolder = paths.join(paths.dirname(text), 'Folder.html');
+    existing.set(htmlFolder, 2);
+    const beforeHtmlFolder = commands.length;
+    await open(htmlFolder, 2);
+    assert.equal(external.pop(), htmlFolder, `${platform}: an HTML-named folder bypassed the folder route`);
+    assert.equal(commands.length, beforeHtmlFolder);
     for (const [name, command] of [
-      ['Folder.html', 'revealInExplorer'],
       ['image.png', 'vscode.open'],
       ['page.html', 'workbench.action.browser.open'],
     ] as const) {
       const file = paths.join(paths.dirname(text), name);
-      existing.set(file, name === 'Folder.html' ? 2 : 1);
+      existing.set(file, 1);
       await open(file, 2);
       assert.equal(commands.at(-1)![0], command);
       assert.equal(
