@@ -222,6 +222,19 @@ A null cost never counts as zero. These estimates use [supported list prices](co
 
 Run `arc cost --help` for model, tool, text-boundary, and Agent-window options. [Cost output](cli-reference.md#cost-reports) defines coverage, quantities, supplementary results, and custom source roots.
 
+## Read saved usage
+
+Usage reports read saved account usage without an Arc window:
+
+```sh
+arc usage
+arc usage --agent claude --json
+```
+
+Arc saves each account usage reading in `${ARC_HOME:-~/.arc}/usage/bounded-v1/`. `usage` prints the newest complete reading for each agent, window, and scope. When a window has no complete reading, `usage` prints its newest reading and marks it `incomplete`. A reading without a window, such as a money cap alone, is left out. Text shows the share used, the reset time in UTC with the time left, and the read time with its age.
+
+`--json` prints `schemaVersion: 1`, `buildCommit`, the store `directory`, and `readings` with the saved field names. `utilization` is a share from 0 to 1. `resetsAt` is in seconds and `readAt` is in milliseconds since the epoch. An empty or missing store prints one sentence and exits 0. `--home PATH` reads another Arc home folder.
+
 ## Status line
 
 [Configure Claude Code](../cli/README.md#status-line-setup) to run `arc statusline`. It reads one JSON object from stdin.

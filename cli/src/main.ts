@@ -1,5 +1,6 @@
 import { renderNextTurn, renderStatus, snapshotFromClaude } from './status.ts';
 import { runCost } from './cost.ts';
+import { runUsage } from './usage.ts';
 import { runWindows } from './windows.ts';
 import { runSessions } from './sessions.ts';
 import { runCollect } from './collect.ts';
@@ -100,6 +101,9 @@ async function run(): Promise<void> {
       }
       return;
     }
+    case 'usage':
+      process.stdout.write(`${await runUsage(commandArgs)}\n`);
+      return;
     case 'windows':
       process.stdout.write(`${await runWindows(commandArgs)}\n`);
       return;

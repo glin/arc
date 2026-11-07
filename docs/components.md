@@ -226,5 +226,5 @@ Paths are relative to `extension/src/`. [Architecture](architecture.md) owns pac
 | `view/tokens.ts` | Browser-safe compact token-count formatter shared by host and panel renderers | no |
 | `view/usage.ts` | Browser-safe display contracts for collapsed and expanded usage figures | no |
 | `usageview.ts` | Normalizes reported account limits, owns current-process admission and retained account exclusion, and prepares usage-bar rows | no |
-| `usagerecord.ts` | Bounds normalized account-reading admission and asynchronously publishes committed gzip prefixes under exclusive daily-slot ownership | no |
+| `usagerecord.ts` | Bounds normalized account-reading admission, asynchronously publishes committed gzip prefixes under exclusive daily-slot ownership, and reads committed prefixes back for `arc usage` | no |
 | `mcpview.ts` | Normalizes reported MCP server state and available actions | no |

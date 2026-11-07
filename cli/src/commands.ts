@@ -1,5 +1,5 @@
 type Flag = readonly [syntax: string, description: string];
-type Section = 'Reading' | 'Starting and sending' | 'Curating' | 'Compaction' | 'Cost' | 'Setup' | 'Dispatch';
+type Section = 'Reading' | 'Starting and sending' | 'Curating' | 'Compaction' | 'Cost' | 'Usage' | 'Setup' | 'Dispatch';
 type Route =
   | 'collect'
   | 'statusline'
@@ -9,6 +9,7 @@ type Route =
   | 'compact'
   | 'label'
   | 'cost'
+  | 'usage'
   | 'skills'
   | 'run'
   | 'dispatch';
@@ -731,6 +732,29 @@ const definitions: readonly Command[] = [
       example: 'arc cost ./session.jsonl --source-only --by-model',
     },
   },
+  {
+    name: 'usage',
+    section: 'Usage',
+    route: 'usage',
+    help: {
+      summary: 'Print the saved Claude and Codex account usage from disk without a running window.',
+      synopsis: 'arc usage [--agent claude|codex] [--home PATH] [--json]',
+      flags: [
+        ['--agent AGENT', 'Print only claude or codex readings.'],
+        ['--home PATH', 'Read this Arc home folder before ARC_HOME and ~/.arc.'],
+        readJsonFlag,
+      ],
+      output: [
+        'Text shows one line for each agent, window, and scope: the share used, the reset time in UTC, and the read time. A reading without a complete answer ends in incomplete.',
+        'JSON readings keep the saved field names. utilization is a share from 0 to 1. resetsAt is in seconds and readAt is in milliseconds since the epoch. Stdin is unused.',
+      ],
+      refusals: [
+        'Unknown options, missing values, and an agent other than claude or codex fail.',
+        'An unreadable or unsupported usage store fails. An empty or missing store prints that no saved usage exists and succeeds.',
+      ],
+      example: 'arc usage --agent claude',
+    },
+  },
 ];
 
 export function checkCommandHelp(commands: readonly Command[]): void {
@@ -843,6 +867,7 @@ export function renderOverviewHelp(): string {
     'Curating',
     'Compaction',
     'Cost',
+    'Usage',
     'Dispatch',
     'Setup',
   ];
