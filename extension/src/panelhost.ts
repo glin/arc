@@ -1659,6 +1659,8 @@ export class PanelProvider implements vscode.Disposable {
   // The rollouts whose openings the saved records supplied when this activation started.
   private savedCodexOpeningFiles: readonly string[] = [];
   private railPaintArrived = false;
+  // Whether a Claude opening could not be read by the last walk that listed the Claude sources.
+  private claudeWalkOpeningUnavailable = false;
   private sourceEnumerations?: { claude: SourceEnumeration; codex: SourceEnumeration };
   private membershipCoverage?: SessionCoverage;
   private physicalCoverage?: { claude: SessionCoverage; codex: SessionCoverage };
@@ -10054,6 +10056,7 @@ export class PanelProvider implements vscode.Disposable {
     let controller: AbortController | null = null;
     let primed = false;
     let primedEnumeration: SourceEnumeration | undefined;
+    let codexRelist: SourceEnumeration | undefined;
     let generation = this.refreshGeneration;
     try {
       if (!this.anyVisible()) {
@@ -10132,16 +10135,17 @@ export class PanelProvider implements vscode.Disposable {
       if (!selectedOnly && !primedEnumeration) {
         const finished = this.finishedColdPass;
         if (finished) {
-          // The finished walk replaces the saved openings, so this refresh lists it whatever it asked to reuse.
+          // The finished walk replaces the saved openings. A refresh that reuses the held catalog lists only the Codex rollouts.
           this.finishedColdPass = null;
           if (this.coldPassPaintWait) clearTimeout(this.coldPassPaintWait);
           this.coldPassPaintWait = null;
           if (finished.root === codexSessionsRoot()) {
-            primedEnumeration = finished.enumeration;
             this.catalogWalkPendingAt = finished.startedAt;
-            this.targetedRefreshPaths = null;
-            reuseCatalog = false;
-            walkReasons = [refreshReason];
+            if (reuseCatalog) codexRelist = finished.enumeration;
+            else {
+              primedEnumeration = finished.enumeration;
+              walkReasons = [refreshReason];
+            }
           }
         } else if (this.codexColdPass?.listing) {
           primedEnumeration = this.codexColdPass.listing;
@@ -10180,16 +10184,26 @@ export class PanelProvider implements vscode.Disposable {
         },
       };
       const deferredWalk = { needed: false };
+      const codexRelisted = codexRelist ? this.relistHeldCodex(codexRelist, enumerationParts) : null;
+      if (codexRelist && !codexRelisted) {
+        primedEnumeration = codexRelist;
+        reuseCatalog = false;
+        walkReasons = [refreshReason];
+      }
+      // A request merged into the relist still revalidates the paths that it names.
+      const codexOnly = codexRelisted !== null && !this.targetedRefreshPaths?.length;
       let all = selectedOnly
         ? (this.authoritativeCatalog ?? [])
-        : this.allSessions(
-            reuseCatalog,
-            true,
-            primedEnumeration,
-            deferredWalk,
-            `requested:${refreshReason}`,
-            enumerationParts,
-          );
+        : codexOnly
+          ? codexRelisted
+          : this.allSessions(
+              reuseCatalog,
+              true,
+              primedEnumeration,
+              deferredWalk,
+              `requested:${refreshReason}`,
+              enumerationParts,
+            );
       // A held catalog or a supplied enumeration listed above without an await.
       if (!selectedOnly && deferredWalk.needed) {
         const walked = await this.walkCatalog(controller.signal, generation, enumerationParts);
@@ -10236,7 +10250,8 @@ export class PanelProvider implements vscode.Disposable {
           )
         : null;
       // Without repository scope, a catalog refresh keeps the held catalog and reaches the scope check without yielding.
-      if (selectedOnly || this.repositoryScopeReady) {
+      // A Codex-only relist keeps the admission of its held Claude rows, and a Codex row needs no prompt check.
+      if (!codexOnly && (selectedOnly || this.repositoryScopeReady)) {
         const promptsStarted = performance.now();
         const prepared = await this.prepareHumanPrompts(
           switched ? all.filter((session) => switched.has(session.sessionId)) : all,
@@ -10305,9 +10320,10 @@ export class PanelProvider implements vscode.Disposable {
         );
         const heldSources = all.filter(
           (session) =>
-            session.childTranscript === true ||
             session.agent === 'codex' ||
-            (!this.catalogWalked && !checkedPaths.has(normalizeFsPath(session.file))),
+            (!codexOnly &&
+              (session.childTranscript === true ||
+                (!this.catalogWalked && !checkedPaths.has(normalizeFsPath(session.file))))),
         );
         const changed = await replacedCatalogFiles(heldSources, controller.signal);
         if (controller.signal.aborted || generation !== this.refreshGeneration) return;
@@ -11140,7 +11156,7 @@ export class PanelProvider implements vscode.Disposable {
       this.codexColdReads = finished.reads;
       return;
     }
-    this.refreshFrom('cold-pass');
+    this.refreshFrom('cold-pass', false, true);
   }
 
   // Runs the merged request that waits behind the catalog refresh. A refresh still in flight here
@@ -13158,6 +13174,21 @@ export class PanelProvider implements vscode.Disposable {
     return this.walkedSessions(scope.roots, workspaceFolders, folderPrint, deferHumanPrompts, codexEnumeration, parts);
   }
 
+  // Lists the Codex rollouts of a finished cold pass beside the Claude rows the catalog holds, and reads no Claude source.
+  // Answers null when the held catalog does not cover the current folders, so the caller lists every source.
+  private relistHeldCodex(enumeration: SourceEnumeration, parts?: CatalogEnumerationParts): SessionFile[] | null {
+    const workspaceFolders = this.folders();
+    const scope = this.repositoryScope.snapshot(workspaceFolders);
+    const folderPrint = `${workspaceFolders.join('\n')}\0${scope.revision}`;
+    const walk = this.currentWalkedCatalog();
+    if (!scope.ready || this.catalog?.folders !== folderPrint || !walk || !this.sourceEnumerations) return null;
+    const heldClaude = {
+      ...this.sourceEnumerations.claude,
+      sessions: walk.parents.filter((session) => session.agent === 'claude'),
+    };
+    return this.walkedSessions(scope.roots, workspaceFolders, folderPrint, true, enumeration, parts, heldClaude);
+  }
+
   private walkedSessions(
     roots: string[],
     workspaceFolders: string[],
@@ -13165,6 +13196,8 @@ export class PanelProvider implements vscode.Disposable {
     deferHumanPrompts: boolean,
     codexEnumeration?: SourceEnumeration,
     parts?: CatalogEnumerationParts,
+    // The last walk's Claude listing. With it, this call reads no Claude source and keeps the held Claude rows and their admission.
+    heldClaude?: SourceEnumeration & { sessions: SessionFile[] },
   ): SessionFile[] {
     const time: ListingTimer = parts?.time ?? ((_part, run) => run());
     const codexRevision = this.codexMetas.revision;
@@ -13184,62 +13217,65 @@ export class PanelProvider implements vscode.Disposable {
     };
     const sourceObservations: SessionCollisionObservation[] = [];
     const qualifiedCodexStats = new Map<string, ReturnType<typeof readRolloutStat>>();
-    let claudeOpeningUnavailable = false;
-    const claudeListing = enumerateSessionFilesFor(
-      projectsRoot(),
-      roots,
-      (file, session) => {
-        if (collides('claude', file)) {
-          const qualified = time('openings:collisions', () => {
-            const opening = readQualifiedSessionCwd(file, countCollisionRead);
-            if (
-              opening &&
-              sameSessionRevision(session, opening.revision) &&
-              sessionCoverageMember(session) === sessionCoverageMember({ ...session, ...opening.revision })
-            ) {
-              this.cwds.set(file, {
-                cwd: opening.value,
-                mtimeMs: opening.revision.mtimeMs,
-                size: opening.revision.size,
-                unavailable: false,
-              });
-              sourceObservations.push({
-                ...physicalContext,
-                source: { ...session, cwd: opening.value },
-                excluded: !inRoots(opening.value),
-              });
-              return opening.value;
-            }
-            claudeOpeningUnavailable = true;
-            return null;
-          });
-          if (qualified !== null) return qualified;
-        }
-        return time('openings:parents', () => {
-          const hit = this.cwds.get(file);
-          if (hit?.cwd) {
-            return hit.cwd;
-          }
-          if (hit && sameSessionRevision(hit, session)) {
-            claudeOpeningUnavailable ||= hit.unavailable === true;
-            return hit.cwd;
-          }
-          let unavailable = false;
-          const cwd = scanSessionCwd(
-            file,
-            () => {
-              unavailable = true;
+    let claudeOpeningUnavailable = heldClaude ? this.claudeWalkOpeningUnavailable : false;
+    const claudeListing =
+      heldClaude ??
+      enumerateSessionFilesFor(
+        projectsRoot(),
+        roots,
+        (file, session) => {
+          if (collides('claude', file)) {
+            const qualified = time('openings:collisions', () => {
+              const opening = readQualifiedSessionCwd(file, countCollisionRead);
+              if (
+                opening &&
+                sameSessionRevision(session, opening.revision) &&
+                sessionCoverageMember(session) === sessionCoverageMember({ ...session, ...opening.revision })
+              ) {
+                this.cwds.set(file, {
+                  cwd: opening.value,
+                  mtimeMs: opening.revision.mtimeMs,
+                  size: opening.revision.size,
+                  unavailable: false,
+                });
+                sourceObservations.push({
+                  ...physicalContext,
+                  source: { ...session, cwd: opening.value },
+                  excluded: !inRoots(opening.value),
+                });
+                return opening.value;
+              }
               claudeOpeningUnavailable = true;
-            },
-            countParentRead,
-          );
-          this.cwds.set(file, { cwd, mtimeMs: session.mtimeMs, size: session.size, unavailable });
-          return cwd;
-        });
-      },
-      workspaceFolders,
-      time,
-    );
+              return null;
+            });
+            if (qualified !== null) return qualified;
+          }
+          return time('openings:parents', () => {
+            const hit = this.cwds.get(file);
+            if (hit?.cwd) {
+              return hit.cwd;
+            }
+            if (hit && sameSessionRevision(hit, session)) {
+              claudeOpeningUnavailable ||= hit.unavailable === true;
+              return hit.cwd;
+            }
+            let unavailable = false;
+            const cwd = scanSessionCwd(
+              file,
+              () => {
+                unavailable = true;
+                claudeOpeningUnavailable = true;
+              },
+              countParentRead,
+            );
+            this.cwds.set(file, { cwd, mtimeMs: session.mtimeMs, size: session.size, unavailable });
+            return cwd;
+          });
+        },
+        workspaceFolders,
+        time,
+      );
+    this.claudeWalkOpeningUnavailable = claudeOpeningUnavailable;
     const claude = claudeListing.sessions;
     const countCodexOpeningRead = () => this.performanceCounters?.recordWork('openingsRead:codex');
     // A hidden panel ignores watcher events, so a walk then stats every rollout and holds none.
@@ -13282,25 +13318,27 @@ export class PanelProvider implements vscode.Disposable {
       undefined,
       codexEnumeration,
     );
-    const census = enumerateClaudeChildSources(
-      [...claude, ...this.claudeChildren],
-      time,
-      () => this.performanceCounters?.recordWork('openingsRead:children'),
-      this.walkedChildSources,
-    );
-    this.walkedChildSources = census.sessions;
-    const childSources = census.sessions.filter((source) => !source.cwd || inRoots(source.cwd));
-    claudeListing.files = [...claudeListing.files, ...census.files];
-    claudeListing.directories = [...(claudeListing.directories ?? []), ...(census.directories ?? [])];
-    claudeListing.uncertain = [...claudeListing.uncertain, ...census.uncertain];
-    if (census.status !== 'complete') claudeListing.status = 'incomplete';
-    for (const source of census.sessions)
-      if (source.cwd)
-        sourceObservations.push({
-          ...physicalContext,
-          source,
-          excluded: !inRoots(source.cwd),
-        });
+    if (!heldClaude) {
+      const census = enumerateClaudeChildSources(
+        [...claude, ...this.claudeChildren],
+        time,
+        () => this.performanceCounters?.recordWork('openingsRead:children'),
+        this.walkedChildSources,
+      );
+      this.walkedChildSources = census.sessions;
+      claudeListing.files = [...claudeListing.files, ...census.files];
+      claudeListing.directories = [...(claudeListing.directories ?? []), ...(census.directories ?? [])];
+      claudeListing.uncertain = [...claudeListing.uncertain, ...census.uncertain];
+      if (census.status !== 'complete') claudeListing.status = 'incomplete';
+      for (const source of census.sessions)
+        if (source.cwd)
+          sourceObservations.push({
+            ...physicalContext,
+            source,
+            excluded: !inRoots(source.cwd),
+          });
+    }
+    const childSources = (this.walkedChildSources ?? []).filter((source) => !source.cwd || inRoots(source.cwd));
     this.sourceEnumerations = { claude: claudeListing, codex: listing.enumeration };
     this.noteCompressedRollouts(listing.enumeration.compressed ?? [], listing.enumeration);
     // Only a cached file that the walk missed needs this, so a refresh with none builds no path sets.
@@ -13333,11 +13371,14 @@ export class PanelProvider implements vscode.Disposable {
     if (this.codexMetas.revision !== codexRevision) {
       this.derivedCacheCheckpointState.markChanged(true);
     }
-    this.enumeratedSpendSources = {
-      claude: discoverClaudeSessionSpendSources(claude, this.subagentDirectories),
-      codex: listing.sources,
-      children: listing.subagents,
-    };
+    this.enumeratedSpendSources =
+      heldClaude && this.enumeratedSpendSources
+        ? { ...this.enumeratedSpendSources, codex: listing.sources, children: listing.subagents }
+        : {
+            claude: discoverClaudeSessionSpendSources(claude, this.subagentDirectories),
+            codex: listing.sources,
+            children: listing.subagents,
+          };
     const codex = listing.sessions;
     this.claudeParents = [...claude, ...codex];
     this.walkedClaude = claude.map((s) => s.file);
@@ -13351,7 +13392,7 @@ export class PanelProvider implements vscode.Disposable {
           const scan = this.humanScans.get(source.file);
           return scan?.found || scan?.complete === true;
         }));
-    this.subagentDirectories.sweep();
+    if (!heldClaude) this.subagentDirectories.sweep();
     // Order the catalog by recorded activity before initializing stable session-list placement.
     const walked = new Set([
       ...listing.walked,
@@ -13404,6 +13445,18 @@ export class PanelProvider implements vscode.Disposable {
     };
     this.catalogWalkPendingAt = null;
     this.walkedCatalog = { scope: JSON.stringify(roots), sessions: walkedSessions, parents: this.claudeParents };
+    if (heldClaude) {
+      // The walked rows list every Claude parent, and the held catalog lists only the parents that prompt admission kept.
+      const held = orderSessionCatalog(
+        [...(this.catalog?.sessions ?? []).filter((session) => session.agent !== 'codex'), ...codex],
+        (session) => this.activityFor(session),
+      );
+      this.catalog = { folders: folderPrint, sessions: held };
+      this.catalogWalked = true;
+      this.performanceCounters?.recordWork('catalogWalk');
+      this.performanceCounters?.recordWork('codexRelist');
+      return held;
+    }
     this.catalog = { folders: folderPrint, sessions: walkedSessions };
     this.catalogWalked = true;
     this.performanceCounters?.recordWork('catalogWalk');

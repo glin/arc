@@ -4158,10 +4158,12 @@ test('command-only admission removes pending rows through every catalog path and
   const refreshBody = methodBody('async refresh(');
   const selected = compile(
     'selected',
-    refreshBody.slice(
-      refreshBody.indexOf('let all = selectedOnly'),
-      refreshBody.indexOf("this.performanceCounters.recordRefresh('catalog-enumeration'"),
-    ) + '\nreturn all;',
+    'const codexOnly = false; ' +
+      refreshBody.slice(
+        refreshBody.indexOf('let all = selectedOnly'),
+        refreshBody.indexOf("this.performanceCounters.recordRefresh('catalog-enumeration'"),
+      ) +
+      '\nreturn all;',
     'selectedOnly = true, reuseCatalog = true, controller = new AbortController(), generation = this.refreshGeneration, previousSelection = this.previousSelection ?? null, enumerationParts = { ms: { prompts: 0 }, time: (_part, run) => run() }, catalogStarted = 0',
   );
   const childrenBody = methodBody('private async prepareClaudeChildren(');
@@ -4577,7 +4579,7 @@ test('a catalog refresh admits settled sessions without a file check after a wal
   );
   const runSource = ts.transpileModule(
     `async function run(selectedOnly = false) {
-    const reuseCatalog = true; let generation, controller, primedEnumeration, refreshReason;
+    const reuseCatalog = true; let generation, controller, primedEnumeration, codexRelist, refreshReason;
     ${segment}
     clearTimeout(this.refreshDeadline);
     return all;
@@ -4769,7 +4771,7 @@ test('refresh human admission shares read and source allowances and resumes canc
   );
   const runSource = ts.transpileModule(
     `async function run(selectedOnly = false) {
-    const reuseCatalog = false; const previousSelection = this.previousSelection ?? null; let generation, controller, primedEnumeration, refreshReason;
+    const reuseCatalog = false; const previousSelection = this.previousSelection ?? null; let generation, controller, primedEnumeration, codexRelist, refreshReason;
     ${segment}
     clearTimeout(this.refreshDeadline);
     return all;
@@ -21403,7 +21405,7 @@ function methodBody(marker: string): string {
   const extracted = body.slice(1, -1);
   if (marker === 'private allSessions(') {
     return `const codexEnumeration = arguments[2]; const deferWalk = arguments[3]; const parts = arguments[5];
-      this.walkedSessions = function(roots, workspaceFolders, folderPrint, deferHumanPrompts, codexEnumeration, parts) {
+      this.walkedSessions = function(roots, workspaceFolders, folderPrint, deferHumanPrompts, codexEnumeration, parts, heldClaude) {
         ${methodBody('private walkedSessions(')}
       };
       ${extracted}`;
@@ -32792,9 +32794,9 @@ test('selection and accepted worker results avoid unnecessary catalog walks', ()
   const reusing = [...panelHostSource.matchAll(/this\.refresh(?:From|As)\('[^']+', (?:true|false), true\b/g)];
   assert.equal(
     reusing.length,
-    19,
+    20,
     `${reusing.length} refresh callers reuse the held catalog. Selection, older-page loading, ` +
-      'the accepted selected-worker follow-up, row delta recovery, repeated-record coverage and a poll at unchanged ' +
+      'the accepted selected-worker follow-up, row delta recovery, repeated-record coverage, the listing after the cold opening pass and a poll at unchanged ' +
       'directories must not repeat catalog enumeration.',
   );
   const refreshAt = panelHostSource.indexOf('async refresh(');
@@ -44125,7 +44127,7 @@ test.each([false, true])(
   async (admitted) => {
     const enumeration = methodBody('private walkedSessions(');
     const quarantineSource = ts.transpileModule(
-      `function quarantine(claude, codex, scope, sourceObservations = [], childSources = []) { const roots = scope.roots; const physicalContext = { domain: "physical", scope: JSON.stringify(scope.roots), revision: String(this.coverageRevision) }; const walkedSessions = [...claude, ...codex]; ${enumeration.slice(enumeration.indexOf('this.enumeratedMembers ='), enumeration.indexOf('this.catalog = { folders: folderPrint', enumeration.indexOf('this.enumeratedMembers =')))} }`,
+      `function quarantine(claude, codex, scope, sourceObservations = [], childSources = [], heldClaude) { const roots = scope.roots; const physicalContext = { domain: "physical", scope: JSON.stringify(scope.roots), revision: String(this.coverageRevision) }; const walkedSessions = [...claude, ...codex]; ${enumeration.slice(enumeration.indexOf('this.enumeratedMembers ='), enumeration.indexOf('this.catalog = { folders: folderPrint', enumeration.indexOf('this.enumeratedMembers =')))} }`,
       { compilerOptions: { target: ts.ScriptTarget.ES2022 } },
     ).outputText;
     const quarantine = new Function(

@@ -9120,11 +9120,13 @@ test.each(['closing', 'closing and reopening'])(
 );
 
 // A warm start's cold pass waits at a gate, so only the saved openings can supply the first list.
-function warmStartHarness() {
-  const harness = heldWalkHarness({ COLD_PASS_PAINT_LIMIT_MS }, [
+function warmStartHarness(scope: Record<string, unknown> = {}, extraMethods: string[] = []) {
+  const harness = heldWalkHarness({ COLD_PASS_PAINT_LIMIT_MS, ...scope }, [
     'settleBackgroundColdPass',
     'listFinishedColdPass',
     'browserPainted',
+    'relistHeldCodex',
+    ...extraMethods,
   ]);
   const { provider, root } = harness;
   let release!: () => void;
@@ -9221,6 +9223,71 @@ test('the listing after a warm cold pass waits for the first paint, and the pain
   } finally {
     vi.useRealTimers();
   }
+});
+
+test('the refresh after a warm cold pass adds the rollouts it found and reads no Claude source', async () => {
+  const claudeListings = { count: 0 };
+  const claudeWalk: SessionFile[] = [];
+  const { provider, release, seed, writeRollout, files, root } = warmStartHarness(
+    {
+      humanPromptScanSteps,
+      promptScanLists,
+      enumerateSessionFilesFor: () => {
+        claudeListings.count++;
+        return {
+          sessions: [...claudeWalk],
+          files: claudeWalk.map((source) => source.file),
+          status: 'complete',
+          uncertain: [],
+        };
+      },
+    },
+    ['prepareHumanPrompts'],
+  );
+  const claudeFile = path.join(root, 'claude.jsonl');
+  fs.writeFileSync(
+    claudeFile,
+    `${JSON.stringify({ type: 'user', sessionId: 'claude', cwd: provider.folders()[0], message: { content: 'hello' } })}\n`,
+  );
+  const stat = fs.statSync(claudeFile);
+  claudeWalk.push({
+    agent: 'claude',
+    file: claudeFile,
+    sessionId: 'claude',
+    cwd: provider.folders()[0],
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    dev: stat.dev,
+    ino: stat.ino,
+  });
+  provider.humanScans = new Map();
+  let counters = new PanelPerformanceCounters();
+  provider.performanceCounters = counters;
+  provider.railPaintArrived = true;
+  const seeded = seed('seeded');
+  const unseeded = writeRollout('unseeded');
+  await provider.refresh(true);
+  assert.deepEqual(files(), [claudeFile, seeded].sort());
+  assert.equal(claudeListings.count, 1);
+  assert.ok(counters.snapshot().work['humanPromptStat:unscanned'], 'the first listing checked no prompt');
+
+  provider.performanceCounters = counters = new PanelPerformanceCounters();
+  release();
+  await vi.waitFor(() => assert.deepEqual(files(), [claudeFile, seeded, unseeded].sort()));
+  await vi.waitFor(() => assert.equal(provider.refreshController, null));
+  const work = counters.snapshot().work;
+  assert.equal(claudeListings.count, 1, 'the refresh after the pass listed the Claude sources again');
+  assert.equal(work.codexRelist, 1);
+  assert.deepEqual(
+    Object.entries(work)
+      .filter(
+        ([name, count]) =>
+          count > 0 && (name.startsWith('humanPrompt') || name.startsWith('walk:') || name === 'openingsRead:parents'),
+      )
+      .map(([name]) => name),
+    [],
+    'the refresh after the pass repeated Claude listing or prompt admission work',
+  );
 });
 
 test('a selection held on a rollout without a saved opening survives the list before its opening is read', async () => {
