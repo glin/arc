@@ -240,6 +240,8 @@ import {
   CLAUDE_METADATA_TAIL_BYTES,
   MAX_CLAUDE_CHILD_REFERENCES_PER_FILE,
   MAX_SAVED_DISCOVERY_LINKS,
+  MAX_SAVED_PROMPT_SCANS,
+  PROMPT_SCAN_RULES_VERSION,
   DerivedCacheCheckpointState,
   carryDerivedTitleFacts,
   derivedTitleCacheCurrent,
@@ -278,8 +280,9 @@ function saveClaudeCache(...args: Parameters<typeof saveDerivedCache>): void {
     repositories = [],
     agentOf = claudeSession,
     links,
+    promptScans,
   ] = args;
-  saveDerivedCache(file, titles, references, names, replace, discovery, repositories, agentOf, links);
+  saveDerivedCache(file, titles, references, names, replace, discovery, repositories, agentOf, links, promptScans);
 }
 function loadClaudeCache(file: string, sources: string | DerivedCacheSources = {}): DerivedCache {
   return loadDerivedCache(file, {
@@ -338,6 +341,73 @@ test('the derived cache keeps the saved discovery links and drops a malformed or
     references: Array.from({ length: MAX_SAVED_DISCOVERY_LINKS }, () => links.references[0]),
   });
   assert.equal(loadClaudeCache(cache).links, undefined, 'a link set over the limit was saved');
+});
+
+// A complete prompt scan travels with the revision it read and the prompt rules version. An unfinished scan, a scan with
+// an unresolved command, a scan of another rules version and a file written before saved scans existed load none.
+test('the derived cache keeps complete prompt scans of the current rules version and only those', () => {
+  const cache = path.join(folder(), 'cache.json');
+  const source = (mtimeMs: number) => ({ size: 400, mtimeMs, dev: '7', ino: '9' });
+  const found = { bytes: 120, found: true, complete: true, source: source(5) };
+  const noPrompt = { bytes: 400, found: false, complete: true, source: source(6) };
+  saveClaudeCache(cache, [], [], [], undefined, undefined, [], undefined, undefined, [
+    ['/repo/found.jsonl', found],
+    ['/repo/silent.jsonl', noPrompt],
+    ['/repo/unfinished.jsonl', { bytes: 100, found: false, complete: false, source: source(7) }],
+    ['/repo/short.jsonl', { bytes: 100, found: false, complete: true, source: source(8) }],
+    [
+      '/repo/command.jsonl',
+      { bytes: 400, found: false, complete: true, source: source(9), command: { withdrawn: false } as never },
+    ],
+    [
+      '/repo/unidentified.jsonl',
+      { bytes: 120, found: true, complete: true, source: { size: 400, mtimeMs: 10 } as never },
+    ],
+  ]);
+  assert.deepEqual(
+    [...(loadClaudeCache(cache).promptScans ?? [])].sort(([a], [b]) => a.localeCompare(b)),
+    [
+      ['/repo/found.jsonl', found],
+      ['/repo/silent.jsonl', noPrompt],
+    ],
+    'a complete scan was lost, or a scan that is not complete and identified was saved',
+  );
+
+  const stored = JSON.parse(fs.readFileSync(cache, 'utf8'));
+  assert.equal(stored.promptScans.rulesVersion, PROMPT_SCAN_RULES_VERSION);
+  fs.writeFileSync(
+    cache,
+    JSON.stringify({ ...stored, promptScans: { ...stored.promptScans, rulesVersion: PROMPT_SCAN_RULES_VERSION + 1 } }),
+  );
+  assert.equal(loadClaudeCache(cache).promptScans?.size, 0, 'scans of another rules version were loaded');
+
+  // A file that a build without saved scans wrote has no scan field. It loads its other content and no scan.
+  const { promptScans: _promptScans, ...older } = stored;
+  fs.writeFileSync(cache, JSON.stringify({ ...older, titles: [] }));
+  const loaded = loadClaudeCache(cache);
+  assert.equal(loaded.reuse?.reason, 'reused', 'the older cache file was not reused');
+  assert.equal(loaded.promptScans?.size, 0, 'an older cache file loaded a scan');
+});
+
+test('the derived cache keeps the saved prompt scans of the most recently modified files up to its limit', () => {
+  const cache = path.join(folder(), 'cache.json');
+  const scans = Array.from({ length: MAX_SAVED_PROMPT_SCANS + 2 }, (_, index) => [
+    `/repo/${index}.jsonl`,
+    { bytes: 1, found: true, complete: true, source: { size: 10, mtimeMs: index, dev: 1, ino: index + 1 } },
+  ]) as [
+    string,
+    {
+      bytes: number;
+      found: boolean;
+      complete: boolean;
+      source: { size: number; mtimeMs: number; dev: number; ino: number };
+    },
+  ][];
+  saveClaudeCache(cache, [], [], [], undefined, undefined, [], undefined, undefined, scans);
+  const kept = loadClaudeCache(cache).promptScans!;
+  assert.equal(kept.size, MAX_SAVED_PROMPT_SCANS);
+  assert.equal(kept.has('/repo/0.jsonl') || kept.has('/repo/1.jsonl'), false, 'an oldest scan was kept past the limit');
+  assert.equal(kept.has(`/repo/${MAX_SAVED_PROMPT_SCANS + 1}.jsonl`), true, 'the newest scan was dropped');
 });
 
 test('durable prefix validation rejects inconsistent stamps offsets framing and oversized evidence', async () => {

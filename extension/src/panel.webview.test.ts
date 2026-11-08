@@ -4289,6 +4289,107 @@ test('command-only admission removes pending rows through every catalog path and
   }
 });
 
+// A complete scan that the derived cache saved settles a row at the same size, modification time, device and inode on
+// the first refresh of an activation, without a file check. A saved scan of another revision is dropped, and the file is
+// scanned again from its start. Each saved scan below claims the opposite of its file, so admission shows which one ran.
+test('a saved prompt scan settles a row at its revision without a file check and a stale one rescans', async () => {
+  const { humanPromptScanSteps, promptScanLists, sameSessionRevision, scanForHumanPrompt } =
+    await import('./transcript.ts');
+  const directory = tempDir('human-admission-saved-');
+  const human = { type: 'user', message: { role: 'user', content: 'actual task' } };
+  const peer = { type: 'user', origin: { kind: 'peer' }, message: { content: 'x'.repeat(1024) } };
+  const write = (name: string, rows: unknown[]) => {
+    const file = path.join(directory, `${name}.jsonl`);
+    fs.writeFileSync(file, rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
+    return file;
+  };
+  const row = (file: string, sessionId: string) => ({
+    agent: 'claude' as const,
+    sessionId,
+    file,
+    ...revisionOf(fs.statSync(file, { bigint: true })),
+  });
+  const savedOf = (session: ReturnType<typeof row>, found: boolean, source: object = {}) => ({
+    bytes: found ? 0 : session.size,
+    found,
+    complete: true,
+    source: { size: session.size, mtimeMs: session.mtimeMs, dev: session.dev, ino: session.ino, ...source },
+  });
+  const silent = row(write('silent', [peer]), 'silent');
+  const prompted = row(write('prompted', [human, peer]), 'prompted');
+  const staleTime = row(write('stale-time', [peer]), 'stale-time');
+  const staleInode = row(write('stale-inode', [peer]), 'stale-inode');
+  let stats = 0;
+  const dependencies = {
+    isCompressedRollout,
+    fs: {
+      statSync: (...args: any[]) => {
+        stats++;
+        return (fs.statSync as any)(...args);
+      },
+    },
+    fileRevisionOf: revisionOf,
+    sameSessionRevision,
+    humanPromptScanSteps,
+    scanForHumanPrompt,
+    promptScanLists,
+    setImmediate,
+  };
+  const compiled = ts.transpileModule(
+    `class Prepared { ${declarationSource(panelHostSource, 'prepareHumanPrompts')} }`,
+    { compilerOptions: { target: ts.ScriptTarget.ES2022 } },
+  ).outputText;
+  const prepare = new Function(
+    ...Object.keys(dependencies),
+    `${compiled}\nreturn Prepared.prototype.prepareHumanPrompts;`,
+  )(...Object.values(dependencies));
+  const work: string[] = [];
+  let changes = 0;
+  const provider: any = {
+    humanScans: new Map(),
+    savedPromptScans: new Map([
+      [silent.file, savedOf(silent, true)],
+      [prompted.file, savedOf(prompted, false)],
+    ]),
+    refreshGeneration: 0,
+    performanceCounters: { recordWork: (name: string) => work.push(name) },
+    derivedCacheCheckpointState: { markChanged: () => changes++ },
+  };
+  const signal = () => new AbortController().signal;
+  const files = (admitted: { file: string }[]) => admitted.map((source) => source.file);
+
+  assert.deepEqual(
+    files(await prepare.call(provider, [silent, prompted], false, signal(), undefined, 0, undefined, 'skip')),
+    [silent.file],
+    'admission did not follow the saved scans',
+  );
+  assert.equal(stats, 2, 'the saved scan that found a prompt was checked, or the one without a prompt was not');
+  assert.deepEqual(
+    work,
+    ['humanPromptSettled', 'humanPromptStat:noPrompt', 'humanPromptStat:noPrompt'],
+    'a saved scan at its revision counted as unscanned',
+  );
+  assert.equal(provider.savedPromptScans.size, 0, 'an adopted saved scan stayed in the saved set');
+  assert.equal(changes, 0, 'a saved scan that a check confirmed changed the derived cache');
+
+  provider.savedPromptScans = new Map([
+    [staleTime.file, savedOf(staleTime, true, { mtimeMs: staleTime.mtimeMs - 1 })],
+    [staleInode.file, savedOf(staleInode, true, { ino: `${staleInode.ino}0` })],
+  ]);
+  stats = 0;
+  work.length = 0;
+  assert.deepEqual(
+    files(await prepare.call(provider, [staleTime, staleInode], false, signal(), undefined, 0, undefined, 'skip')),
+    [],
+    'a saved scan of another revision admitted its row',
+  );
+  assert.ok(stats >= 2, 'a file with a stale saved scan was not checked');
+  assert.deepEqual(work, Array(stats).fill('humanPromptStat:unscanned'), 'a stale saved scan settled its row');
+  assert.equal(provider.savedPromptScans.size, 0, 'a stale saved scan stayed in the saved set');
+  assert.equal(provider.humanScans.get(staleTime.file)?.found, false, 'the stale file was not scanned again');
+  assert.equal(changes, 2, 'a new complete scan did not change the derived cache');
+});
+
 // A catalog refresh knows nothing new about a file whose complete scan found a prompt at the revision the refresh
 // listed, after a walk or with the held catalog, so admission takes that session without a file check. Each file
 // check names its cause.
@@ -12167,7 +12268,7 @@ test('derived session caches load, trim against the walk, and checkpoint after f
   sourceMatch(disposeBody, /this\.writeDerivedCache\(\)/, 'shutdown does not flush a checkpoint that is still waiting');
   sourceMatch(
     panelHostSource,
-    /saveDerivedCache\(file, this\.titles, this\.claudeChildReferenceEntries, this\.carriedNames, undefined, this\.discoveryCheckpoint, this\.commitRepositories\.snapshot\(\), undefined, this\.savedLinks\)/,
+    /saveDerivedCache\(file, this\.titles, this\.claudeChildReferenceEntries, this\.carriedNames, undefined, this\.discoveryCheckpoint, this\.commitRepositories\.snapshot\(\), undefined, this\.savedLinks, \[\.\.\.\(this\.savedPromptScans \?\? \[\]\), \.\.\.\(this\.humanScans \?\? \[\]\)\]\)/,
     'the derived cache has no durable write path',
   );
   sourceMatch(

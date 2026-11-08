@@ -29,6 +29,7 @@ import {
   type ClaudeChildSessionFile,
   type ClaudeChildSessionReference,
   type FileRevision,
+  type HumanPromptScan,
   type SessionFile,
   type SessionRead,
   type SessionStatFacts,
@@ -371,6 +372,8 @@ export interface DerivedCache {
   // Names carried across a metadata generation change until a metadata read supplies a title entry.
   carriedNames: Map<string, CarriedName>;
   links?: SavedDiscoveryLinks;
+  // Complete prompt scans of Claude transcripts by file, each at the revision it read. See `savedPromptScanOf`.
+  promptScans?: Map<string, HumanPromptScan>;
 }
 
 // The merged links and child rows of the last complete discovery reply that settled membership. A later start publishes its
@@ -395,6 +398,75 @@ export const SAVED_DISCOVERY_LINKS_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 export interface CarriedName {
   label: string;
   fullLabel: string;
+}
+
+// Versions the prompt rules of saved prompt scans. Bump it when a change to `scanPromptLines` or `promptScanLists` in
+// transcript.ts can change what a complete scan finds. A saved scan of another version is not loaded.
+export const PROMPT_SCAN_RULES_VERSION = 1;
+// The derived cache keeps the saved prompt scans of the most recently modified files up to this count.
+export const MAX_SAVED_PROMPT_SCANS = 10_000;
+
+// The saved form of a complete prompt scan, or null when the scan cannot be saved. A saved scan holds whether it found a
+// prompt, its complete-line cursor, and the size, modification time, device and inode of the file it read. A scan that
+// is unfinished, holds an unresolved command or a pending line, or read a file without a device and inode is not saved.
+// A complete scan that found no prompt reached the end of its file.
+export function savedPromptScanOf(scan: HumanPromptScan): HumanPromptScan | null {
+  const source = scan.source;
+  if (scan.complete !== true || scan.pending || scan.command || !source) return null;
+  if (!fileIdentityValue(source.dev) || !fileIdentityValue(source.ino)) return null;
+  if (!Number.isSafeInteger(source.size) || source.size < 0 || !Number.isFinite(source.mtimeMs)) return null;
+  if (!Number.isSafeInteger(scan.bytes) || scan.bytes < 0 || scan.bytes > source.size) return null;
+  if (!scan.found && scan.bytes !== source.size) return null;
+  return {
+    bytes: scan.bytes,
+    found: scan.found,
+    complete: true,
+    source: { size: source.size, mtimeMs: source.mtimeMs, dev: source.dev, ino: source.ino },
+  };
+}
+
+interface StoredPromptScan {
+  file: string;
+  found: boolean;
+  bytes: number;
+  size: number;
+  mtimeMs: number;
+  dev: number | string;
+  ino: number | string;
+}
+
+interface StoredPromptScans {
+  rulesVersion: number;
+  scans: StoredPromptScan[];
+}
+
+// The saved scans of a stored cache. Scans of another rules version, and rows that are not a complete scan, load nothing.
+function storedPromptScans(value: unknown): Map<string, HumanPromptScan> {
+  const scans = new Map<string, HumanPromptScan>();
+  if (!record(value) || value.rulesVersion !== PROMPT_SCAN_RULES_VERSION || !Array.isArray(value.scans)) return scans;
+  for (const row of value.scans) {
+    if (!record(row) || !fileName(row.file) || typeof row.found !== 'boolean') continue;
+    const scan = savedPromptScanOf({
+      bytes: row.bytes as number,
+      found: row.found,
+      complete: true,
+      source: {
+        size: row.size as number,
+        mtimeMs: row.mtimeMs as number,
+        dev: row.dev as number | string,
+        ino: row.ino as number | string,
+      },
+    });
+    if (scan) scans.set(row.file, scan);
+  }
+  return new Map(limitPromptScans(scans));
+}
+
+// The scans of the most recently modified files, up to `MAX_SAVED_PROMPT_SCANS`.
+function limitPromptScans(scans: ReadonlyMap<string, HumanPromptScan>): [string, HumanPromptScan][] {
+  return [...scans]
+    .sort(([a, left], [b, right]) => right.source!.mtimeMs - left.source!.mtimeMs || a.localeCompare(b))
+    .slice(0, MAX_SAVED_PROMPT_SCANS);
 }
 
 export const CLAUDE_CHILD_REFERENCE_PARSER_VERSION = 26;
@@ -474,6 +546,7 @@ interface StoredCache {
   claudeChildReferences: StoredChildReferences[];
   carriedNames: StoredCarriedName[];
   links?: SavedDiscoveryLinks;
+  promptScans?: StoredPromptScans;
 }
 
 export type MetadataGenerations = Readonly<Record<AgentKind, number>>;
@@ -1381,6 +1454,7 @@ export function loadDerivedCache(
     loaded.reuse.format = format as number;
     loaded.codexMetas = legacy ? storedCodexMetas(parsed) : new Map();
     if (format === 2 && savedDiscoveryLinks(parsed.links)) loaded.links = parsed.links;
+    if (format === 2) loaded.promptScans = storedPromptScans(parsed.promptScans);
     carryNames(loaded.carriedNames, parsed.carriedNames, (row) => row);
     loaded.reuse.storedGeneration = legacy
       ? parsed.version
@@ -1505,7 +1579,14 @@ export function saveDerivedCache(
   commitRepositories: Iterable<VerifiedCommitRepository> = [],
   agentOf: (file: string) => AgentKind | null = sourceAgentOf,
   links?: SavedDiscoveryLinks,
+  // A later scan of the same file replaces an earlier one. A scan that `savedPromptScanOf` refuses replaces nothing.
+  promptScans: Iterable<[string, HumanPromptScan]> = [],
 ): void {
+  const savedScans = new Map<string, HumanPromptScan>();
+  for (const [scanFile, scan] of promptScans) {
+    const saved = savedPromptScanOf(scan);
+    if (saved) savedScans.set(scanFile, saved);
+  }
   const unqualified = new Map<string, CarriedName>();
   const titleRows: StoredTitle[] = [];
   for (const [entryFile, entry] of titles) {
@@ -1551,6 +1632,12 @@ export function saveDerivedCache(
       .map(([entryFile, name]) => ({ file: entryFile, label: name.label, fullLabel: name.fullLabel }))
       .sort((a, b) => a.file.localeCompare(b.file)),
     links: links && links.references.length + links.children.length <= MAX_SAVED_DISCOVERY_LINKS ? links : undefined,
+    promptScans: {
+      rulesVersion: PROMPT_SCAN_RULES_VERSION,
+      scans: limitPromptScans(savedScans)
+        .map(([scanFile, scan]) => ({ file: scanFile, found: scan.found, bytes: scan.bytes, ...scan.source! }))
+        .sort((a, b) => a.file.localeCompare(b.file)),
+    },
   };
   writeFileAtomically(file, JSON.stringify(data), replace);
 }

@@ -1634,6 +1634,8 @@ export class PanelProvider implements vscode.Disposable {
   private threadNames: ThreadNames = { stamp: '', names: new Map(), fullNames: new Map() };
   // Incremental human-prompt scan cursors for peer-wake filtering. A found prompt remains cached.
   private humanScans = new Map<string, HumanPromptScan>();
+  // Complete prompt scans that the derived cache saved and no refresh has checked yet in this activation.
+  private savedPromptScans = new Map<string, HumanPromptScan>();
   // All listed Claude transcripts before peer-wake filtering. Cache trimming uses this list to retain filtered sessions' scan state.
   private walkedClaude: string[] = [];
   private claudeParents: SessionFile[] = [];
@@ -3648,6 +3650,7 @@ export class PanelProvider implements vscode.Disposable {
       this.claudeChildReferenceEntries = cached.claudeChildReferences;
       this.discoveryCheckpoint = cached.discovery;
       this.savedLinks = cached.links;
+      this.savedPromptScans = cached.promptScans ?? new Map();
       this.carriedNames = cached.carriedNames;
       this.commitRepositories.load(cached.commitRepositories ?? []);
       this.derivedMigrationPending = cached.migrationPending === true;
@@ -10916,6 +10919,7 @@ export class PanelProvider implements vscode.Disposable {
           this.commitRepositories.snapshot(),
           undefined,
           this.savedLinks,
+          [...(this.savedPromptScans ?? []), ...(this.humanScans ?? [])],
         );
       const published = this.workspaceCache
         ? this.workspaceCache.write(write, this.cacheShutdownFlushing, file)
@@ -13789,6 +13793,21 @@ export class PanelProvider implements vscode.Disposable {
       }
       // The prompt check reads plain transcripts only, so it skips a compressed file without a read.
       if (isCompressedRollout(session.file)) continue;
+      // A saved scan serves a row with the same size, modification time, device and inode as the file it read.
+      // A saved scan of another revision is dropped, so the file is scanned again from its start.
+      const saved = this.humanScans.has(session.file) ? undefined : this.savedPromptScans?.get(session.file);
+      if (saved) {
+        this.savedPromptScans.delete(session.file);
+        if (
+          saved.source &&
+          sameSessionRevision(saved.source, session) &&
+          session.dev !== undefined &&
+          session.ino !== undefined &&
+          String(saved.source.dev) === String(session.dev) &&
+          String(saved.source.ino) === String(session.ino)
+        )
+          this.humanScans.set(session.file, saved);
+      }
       // The file check's cause: a recheck checks every candidate, and a catalog refresh checks a file whose listed revision
       // moved, whose complete scan found no prompt, or that has no complete scan of the listed revision.
       let cause: 'walk' | 'moved' | 'noPrompt' | 'unscanned' = 'walk';
@@ -13887,7 +13906,21 @@ export class PanelProvider implements vscode.Disposable {
           source: current,
           complete: step.value.complete && (step.value.found || current.size === revision.size),
         };
+        const held = this.humanScans.get(session.file);
         this.humanScans.set(session.file, scan);
+        // The derived cache saves complete scans, so a complete scan with another answer or revision changes it.
+        if (
+          scan.complete &&
+          !(
+            held?.complete === true &&
+            held.found === scan.found &&
+            held.source &&
+            sameSessionRevision(held.source, current) &&
+            String(held.source.dev) === String(current.dev) &&
+            String(held.source.ino) === String(current.ino)
+          )
+        )
+          this.derivedCacheCheckpointState?.markChanged();
         if (!scan.found && scan.complete !== true) {
           this.enumeratedAdmissionComplete = false;
           work.unknown.add(session.file);
@@ -15848,6 +15881,11 @@ export class PanelProvider implements vscode.Disposable {
       for (const file of [...this.humanScans.keys()]) {
         if (!present.has(file) && this.physicalMembershipOf(file) === 'absent') {
           this.humanScans.delete(file);
+        }
+      }
+      for (const file of [...(this.savedPromptScans?.keys() ?? [])]) {
+        if (!present.has(file) && this.physicalMembershipOf(file) === 'absent') {
+          this.savedPromptScans.delete(file);
         }
       }
     }
