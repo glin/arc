@@ -16206,6 +16206,70 @@ for (const [change, subject, outcome, miss] of [
     }
   });
 
+// Repeated-record coverage of a listed file after discovery completes. Each coverage event used to send a walked discovery
+// request, and the first request after a completed pass opens a new receipt scan of the whole store. A spend-only request
+// opens no receipt scan. A covered dispatched member still reads its activity again in a spend-only pass.
+for (const [subject, member, outcome] of [
+  ['a listed session', false, []],
+  ['a dispatched member', true, ['spend']],
+] as const)
+  test(`repeated-record coverage of ${subject} after discovery completes sends no discovery request`, async () => {
+    vi.useFakeTimers();
+    try {
+      const { provider, counters, requests } = partialSpendHarness(true, undefined, { methods: ['repeatedCoverage'] });
+      // Each step runs the timers due and the work they release. The step bound is the test's deadline.
+      const settle = async () => {
+        for (let step = 0; step < 500 && (step === 0 || provider.refreshController !== null); step++)
+          await vi.advanceTimersByTimeAsync(1);
+        assert.equal(provider.refreshController, null, `the refresh never ended after requests ${requests.join(', ')}`);
+      };
+      provider.refreshFrom('startup', true);
+      for (let step = 0; step < 500 && (provider.dispatchSpendPending || requests.length < 4); step++)
+        await vi.advanceTimersByTimeAsync(1);
+      await settle();
+      assert.deepEqual(requests, ['discovery', 'spend', 'spend', 'spend']);
+      const file = 'projects/repo/claude-a.jsonl';
+      const revision = { size: 10, mtimeMs: 10, dev: 1, ino: 7 };
+      const row = { file, sessionId: 'claude-a', agent: 'claude', activity: 60, ...revision };
+      provider.catalog.sessions = [...provider.catalog.sessions, row];
+      provider.titles.set(file, { ...provider.titles.get(provider.catalog.sessions[0].file), ...row });
+      if (member) {
+        provider.claudeChildReferences = [
+          { kind: 'dispatch', sessionId: 'claude-a', file, parentSessionId: 'parent', toolUseIds: [] },
+        ];
+        // Facts read before the map covered the file, at the listed revision, with no expiry.
+        const facts = { ...provider.dispatchFacts.get('codex-root'), sessionId: 'claude-a', revision, refreshAt: null };
+        provider.dispatchFacts.set('claude-a', facts);
+        // The worker answers the spend pass with the member's facts read again under the covering map.
+        const run = provider.progressiveWorker.run;
+        provider.progressiveWorker.run = async (
+          request: ProgressiveRequest,
+          generation: number,
+          signal: AbortSignal,
+        ) => {
+          const reply = await run(request, generation, signal);
+          if (request.kind !== 'claude-children' || !request.spendOnly || !reply?.value?.held) return reply;
+          return { ...reply, value: { ...reply.value, dispatchFacts: [...reply.value.dispatchFacts, facts] } };
+        };
+      }
+      provider.corpus ??= new Map();
+      const before = { ...counters.snapshot().work };
+      provider.repeatedCoverage(file);
+      await settle();
+      const work = counters.snapshot().work;
+      const added = (count: string) => (work[count] ?? 0) - (before[count] ?? 0);
+      assert.deepEqual(
+        { requests: requests.slice(4), walked: added('discoveryRequest:walked') },
+        { requests: outcome, walked: 0 },
+        'the coverage refresh sent a discovery request',
+      );
+      assert.equal(provider.titles.get(file)?.size, -1, 'the covered file kept its metadata facts');
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
 test('a cancelled spend-only request counts as a discovery abort', async () => {
   const { provider, counters } = partialSpendHarness(true);
   const controller = new AbortController();

@@ -4439,11 +4439,20 @@ export class PanelProvider implements vscode.Disposable {
   // A bounded read skips records the repeated-record map does not reach yet. When the map of the extension
   // host or of the progressive worker reaches the end of a file, drop the search entries and session-list
   // facts read from that file, and draw once. The held facts stay on screen until the new read replaces them.
+  // Coverage changes no membership, so the refresh reuses the held catalog and sends no discovery request of its own. The
+  // worker reads the activity of a covered dispatched member again in its next spend pass, so the member's held facts
+  // expire, and the refresh sends that pass while members stay settled.
   private repeatedCoverage(file: string): void {
     this.corpus.delete(file);
     const held = this.titles.get(file);
     if (held) this.titles.set(file, { ...held, size: -1 });
-    this.refreshFrom('repeated-record-coverage', true, false, [file]);
+    const covered = normalizeFsPath(file);
+    for (const reference of this.claudeChildReferences ?? []) {
+      if (reference.kind !== 'dispatch' || !reference.file || normalizeFsPath(reference.file) !== covered) continue;
+      const facts = this.dispatchFacts.get(reference.sessionId);
+      if (facts) this.dispatchFacts.set(reference.sessionId, { ...facts, refreshAt: 0 });
+    }
+    this.refreshFrom('repeated-record-coverage', true, true, [file]);
   }
 
   // Builds the repository scope over a Git runner. A change of its roots runs repositoryScopeChanged, and each decision it makes about a
