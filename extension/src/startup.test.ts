@@ -16131,7 +16131,10 @@ for (const [change, subject, outcome, miss] of [
         file,
         change === 'shrunk' ? { ...held, size: 5 } : change === 'reidentified' ? { ...grown, ino: 8 } : grown,
       );
-      if (change === 'unsettled') provider.dispatchDiscoveryPending = true;
+      if (change === 'unsettled') {
+        provider.dispatchDiscoveryPending = true;
+        provider.dispatchDiscoveryPendingWriter = 'partialReply';
+      }
       if (change === 'undiscovered') provider.claudeChildrenDiscovered = false;
       if (change === 'noHeldFacts') provider.dispatchFacts.delete('claude-a');
       if (change === 'statFailed') unreadable = true;
@@ -16173,15 +16176,30 @@ for (const [change, subject, outcome, miss] of [
           requests: requests.slice(4, 5),
           routed: added('watcher:grownMembers'),
           walked: added('discoveryRequest:walked'),
+          walkedBy: added('discoveryRequest:walked:transcript'),
         },
-        { requests: [reused ? 'spend' : 'discovery'], routed: reused ? 1 : 0, walked: reused ? 0 : 1 },
+        {
+          requests: [reused ? 'spend' : 'discovery'],
+          routed: reused ? 1 : 0,
+          walked: reused ? 0 : 1,
+          walkedBy: reused ? 0 : 1,
+        },
         reused ? 'the grown member sent a discovery request' : 'the watcher refresh reused the catalog',
       );
       if (reused) assert.equal(provider.dispatchFacts.get('claude-a')?.toolUses, 5, 'the member figure did not move');
       const misses = Object.keys(work)
         .filter((count) => count.startsWith('watcher:grownMemberMiss:') && added(count))
         .map((count) => [count, added(count)]);
-      assert.deepEqual(misses, miss ? [[`watcher:grownMemberMiss:${miss}`, 1]] : [], 'the wake counted another gate');
+      assert.deepEqual(
+        misses,
+        miss
+          ? [
+              [`watcher:grownMemberMiss:${miss}`, 1],
+              ...(miss === 'membersUnsettled' ? [['watcher:grownMemberMiss:membersUnsettled:partialReply', 1]] : []),
+            ]
+          : [],
+        'the wake counted another gate',
+      );
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();

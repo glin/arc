@@ -525,13 +525,21 @@ test('a trigger that waits behind a refresh keeps the strongest request', () => 
   );
   assert.deepEqual(
     mergeRefreshRequests(watcherA, poll),
-    request({ reason: 'coalesced' }),
+    request({ reason: 'coalesced', walkReasons: ['poll', 'watcher'] }),
     'a poll behind a watcher batch lost its broad walk',
   );
   assert.deepEqual(
     mergeRefreshRequests(selection, watcherA),
-    request({ reason: 'coalesced', force: true, changedPaths: ['a.jsonl'] }),
+    request({ reason: 'coalesced', force: true, changedPaths: ['a.jsonl'], walkReasons: ['watcher'] }),
     'a forced repaint that reuses the catalog widened a targeted batch or lost its repaint',
+  );
+  assert.deepEqual(
+    mergeRefreshRequests(
+      mergeRefreshRequests(request({ reason: 'enrichment' }), selection),
+      request({ reason: 'repeated-record-coverage', reuseCatalog: true }),
+    ).walkReasons,
+    ['enrichment'],
+    'a coalesced refresh lost the requester that asked it to list the catalog again',
   );
   assert.deepEqual(
     mergeRefreshRequests(selection, request({ reason: 'direct', force: true, reuseCatalog: true })),

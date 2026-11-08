@@ -601,6 +601,8 @@ export interface RefreshRequest {
   changedPaths: string[] | null;
   // The running walk that folded a broad walk into this request. `settleWalkFold` ends the fold when that walk ends.
   walkFolded?: object;
+  // The reasons of the merged requesters that asked to list the catalog again, set when the merge runs as `coalesced`.
+  walkReasons?: string[];
 }
 
 // Folds a refresh request into the one that waits behind the refresh in flight. The result
@@ -609,7 +611,8 @@ export interface RefreshRequest {
 // their files, and a broad request that names no file makes the result broad. A render before
 // metadata stays only when both accept it. While a catalog walk runs, a request that walks and
 // names no file reuses the catalog that the walk lists, so it does not start another walk. The running walk also takes
-// over a fold from an earlier walk, because its catalog serves that request too.
+// over a fold from an earlier walk, because its catalog serves that request too. A merge of different requesters keeps the
+// reasons of the requesters that list the catalog again, so the counters can name them.
 export function mergeRefreshRequests(
   pending: RefreshRequest | null,
   next: RefreshRequest,
@@ -621,18 +624,27 @@ export function mergeRefreshRequests(
       : request,
   );
   const walkFolded = requests.find((request) => request.walkFolded)?.walkFolded;
+  const reason = pending && pending.reason !== next.reason ? 'coalesced' : next.reason;
+  const walkReasons = [
+    ...new Set(
+      requests.flatMap((request) =>
+        !request.reuseCatalog || request.walkFolded ? (request.walkReasons ?? [request.reason]) : [],
+      ),
+    ),
+  ].sort();
   const reuseCatalog = requests.every((request) => request.reuseCatalog);
   const walking = requests.filter((request) => !request.reuseCatalog);
   const named = [...new Set(requests.flatMap((request) => request.changedPaths ?? []))];
   const changedPaths =
     named.length && (reuseCatalog || walking.every((request) => request.changedPaths?.length)) ? named : null;
   return {
-    reason: pending && pending.reason !== next.reason ? 'coalesced' : next.reason,
+    reason,
     force: requests.some((request) => request.force),
     reuseCatalog,
     metadataAfterRender: requests.every((request) => request.metadataAfterRender),
     changedPaths,
     ...(walkFolded ? { walkFolded } : {}),
+    ...(reason === 'coalesced' && walkReasons.length ? { walkReasons } : {}),
   };
 }
 

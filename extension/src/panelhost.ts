@@ -787,6 +787,16 @@ type DispatchedCostsCaller =
   | 'spendRefined'
   | 'historyCutoff';
 
+// The writer that last set members pending, named in the performance counters of a grown member miss.
+type DiscoveryPendingWriter =
+  | 'none'
+  | 'partialReply'
+  | 'unsettledReply'
+  | 'acceptedUnsettled'
+  | 'catalogMismatch'
+  | 'cachedLinks'
+  | 'spendUnheld';
+
 // The gate that kept a targeted watcher wake off the grown member route, named in the performance counters.
 type GrownMemberMiss =
   | 'undiscovered'
@@ -1620,6 +1630,8 @@ export class PanelProvider implements vscode.Disposable {
   private claudeParents: SessionFile[] = [];
   // True while catalog members or their relationships wait for another discovery pass.
   private dispatchDiscoveryPending = false;
+  // The last writer that set `dispatchDiscoveryPending`, which the grown member miss counter names.
+  private dispatchDiscoveryPendingWriter: DiscoveryPendingWriter = 'none';
   // True while members are settled and only dispatched spend or person facts wait for another pass. The catalog publishes
   // meanwhile, and spend-only requests refine the dispatched facts.
   private dispatchSpendPending = false;
@@ -2156,6 +2168,8 @@ export class PanelProvider implements vscode.Disposable {
   private readonly watchScheduler: BoundedTrailingScheduler;
   private refreshReason = 'direct';
   private targetedRefreshPaths: string[] | null = null;
+  // The reasons of the merged requesters that asked a `coalesced` refresh to list the catalog again.
+  private refreshWalkReasons: string[] | null = null;
   private watching = false;
   // Sessions running in children owned by `extension.ts`, keyed by `runningKey`.
   private running = new Set<string>();
@@ -4029,6 +4043,10 @@ export class PanelProvider implements vscode.Disposable {
     const grown = decision.kind === 'targeted' && miss === null;
     if (grown) this.performanceCounters.recordWork('watcher:grownMembers');
     if (miss) this.performanceCounters.recordWork(`watcher:grownMemberMiss:${miss}`);
+    if (miss === 'membersUnsettled')
+      this.performanceCounters.recordWork(
+        `watcher:grownMemberMiss:membersUnsettled:${this.dispatchDiscoveryPendingWriter}`,
+      );
     this.refreshFrom(reason, batch.drawRequired, grown, decision.kind === 'targeted' ? decision.changedPaths : null);
     this.performanceCounters.recordWatcherOperation(
       {
@@ -9746,16 +9764,20 @@ export class PanelProvider implements vscode.Disposable {
     changedPaths: string[] | null,
     metadataAfterRender: boolean,
     selectedOnly: boolean,
+    walkReasons: string[] | null = null,
   ): Promise<void> {
     const previousReason = this.refreshReason;
     const previousPaths = this.targetedRefreshPaths;
+    const previousWalkReasons = this.refreshWalkReasons;
     this.refreshReason = reason;
     this.targetedRefreshPaths = changedPaths;
+    this.refreshWalkReasons = walkReasons;
     try {
       return this.refresh(force, reuseCatalog, metadataAfterRender, selectedOnly);
     } finally {
       this.refreshReason = previousReason;
       this.targetedRefreshPaths = previousPaths;
+      this.refreshWalkReasons = previousWalkReasons;
     }
   }
 
@@ -9770,6 +9792,7 @@ export class PanelProvider implements vscode.Disposable {
           reuseCatalog,
           metadataAfterRender,
           changedPaths: this.targetedRefreshPaths,
+          ...(this.refreshWalkReasons ? { walkReasons: this.refreshWalkReasons } : {}),
         },
         this.catalogWalkRunning ?? this.codexPriming,
       );
@@ -9785,6 +9808,9 @@ export class PanelProvider implements vscode.Disposable {
     const previousSelection = this.previousSelection;
     const refreshReason = this.refreshReason;
     const targetedRefreshPaths = this.targetedRefreshPaths;
+    // The requesters that a walked discovery request names. A refresh that asked to reuse the held catalog lists it again only
+    // after a held file went missing or changed identity.
+    const walkReasons = reuseCatalog ? ['replacedFiles'] : (this.refreshWalkReasons ?? [refreshReason]);
     let controller: AbortController | null = null;
     let primed = false;
     let primedEnumeration: SourceEnumeration | undefined;
@@ -10022,6 +10048,8 @@ export class PanelProvider implements vscode.Disposable {
           this.performanceCounters.recordWork(
             `discoveryRequest:${!reuseCatalog ? 'walked' : this.dispatchDiscoveryPending ? 'membersPending' : 'dispatchChanged'}`,
           );
+          if (!reuseCatalog)
+            for (const reason of walkReasons) this.performanceCounters.recordWork(`discoveryRequest:walked:${reason}`);
           const discovered = await this.prepareClaudeChildren(generation, controller.signal, humanPromptWork);
           if (!discovered || controller.signal.aborted || generation !== this.refreshGeneration) {
             return;
@@ -10072,12 +10100,16 @@ export class PanelProvider implements vscode.Disposable {
               ? sessionDiscoveryMembership(catalogScope, all, revisions)
               : undefined;
           this.sessionQueryDiscoveryPending = !this.sessionReadDiscoveryRevision;
-          if (revisions && !this.sessionReadDiscoveryRevision) this.dispatchDiscoveryPending = true;
+          if (revisions && !this.sessionReadDiscoveryRevision) {
+            this.dispatchDiscoveryPending = true;
+            this.dispatchDiscoveryPendingWriter = 'acceptedUnsettled';
+          }
         } else if (answered) {
           // The catalog was listed again with a session the complete reply never answered. Discovery runs again before the list
           // completes, and the follow-up refresh this schedules lets the line clear.
           const discoveryWaiting = this.dispatchedDiscoveryWaiting();
           this.dispatchDiscoveryPending = true;
+          this.dispatchDiscoveryPendingWriter = 'catalogMismatch';
           this.publishSessionQueryContext();
           if (this.dispatchedDiscoveryWaiting() !== discoveryWaiting)
             this.postDispatchedCostsIfMoved('refreshDiscovery');
@@ -10727,12 +10759,14 @@ export class PanelProvider implements vscode.Disposable {
       this.performanceCounters.recordRefreshStage('abandoned');
     }
     this.pendingRefresh = null;
-    this.refreshFrom(
+    void this.refreshAs(
       pending.reason,
       pending.force,
       pending.reuseCatalog,
       pending.changedPaths,
       pending.metadataAfterRender,
+      false,
+      pending.walkReasons ?? null,
     );
   }
 
@@ -13186,6 +13220,7 @@ export class PanelProvider implements vscode.Disposable {
     const discoveryWaiting = this.dispatchedDiscoveryWaiting();
     if (progress.kind !== 'claude-children' || !progress.complete) {
       this.dispatchDiscoveryPending = true;
+      this.dispatchDiscoveryPendingWriter = 'partialReply';
       this.publishSessionQueryContext();
       this.discoveryComplete = undefined;
       this.checkpointDerivedCache();
@@ -13207,6 +13242,7 @@ export class PanelProvider implements vscode.Disposable {
     this.claudeChildReferences = progress.references;
     this.startupHistory?.stage('relationshipsComplete');
     this.dispatchDiscoveryPending = progress.continuation && progress.membershipSettled !== true;
+    if (this.dispatchDiscoveryPending) this.dispatchDiscoveryPendingWriter = 'unsettledReply';
     this.dispatchSpendPending = progress.continuation && progress.membershipSettled === true;
     this.applyDispatchFacts(progress.dispatchFacts ?? []);
     this.claudeChildren = progress.children;
@@ -13368,6 +13404,7 @@ export class PanelProvider implements vscode.Disposable {
     this.cachedLinks = { scope, references: published.references, children: published.children };
     if (this.catalog) this.catalog = { ...this.catalog, sessions: published.sessions };
     this.dispatchDiscoveryPending = true;
+    this.dispatchDiscoveryPendingWriter = 'cachedLinks';
     this.sessionQueryDiscoveryPending = true;
     this.discoveryComplete = undefined;
     this.publishSessionQueryContext();
@@ -13433,6 +13470,7 @@ export class PanelProvider implements vscode.Disposable {
     if (!reply.held) {
       this.dispatchSpendPending = false;
       this.dispatchDiscoveryPending = true;
+      this.dispatchDiscoveryPendingWriter = 'spendUnheld';
       this.publishSessionQueryContext();
       return false;
     }
