@@ -1019,16 +1019,21 @@ export interface ColdOpeningPass {
 
 // A canceled pass answers a null enumeration and reads no opening record after the signal fires.
 // Its `read` still reports the records read before cancellation, so the caller can persist them.
+// `onStage` names the end of the walk and the end of the opening reads of a pass that was not canceled.
 export async function coldOpeningPass(
   cache: CodexMetaCache,
   root: string,
   signal?: AbortSignal,
+  onStage?: (stage: 'coldPassEnumerated' | 'coldPassPrimed') => void,
 ): Promise<ColdOpeningPass> {
   const enumeration = await enumerateRolloutFilesAsync(root, signal);
   if (!enumeration) return { walked: [], enumeration: null, read: false };
+  onStage?.('coldPassEnumerated');
   const walked = [...enumeration.files];
   const read = await cache.prime(walked, undefined, undefined, undefined, signal);
-  return signal?.aborted ? { walked: [], enumeration: null, read } : { walked, enumeration, read };
+  if (signal?.aborted) return { walked: [], enumeration: null, read };
+  onStage?.('coldPassPrimed');
+  return { walked, enumeration, read };
 }
 
 // A rollout is a visible session row when its opening names a working directory inside the folders, its thread is not

@@ -665,6 +665,9 @@ export function childEventNamesFiles(kind: string): boolean {
   return !DRAW_ONLY_CHILD_EVENTS.has(kind);
 }
 
+// The longest that a warm start's finished cold pass waits for the first list to paint before it lists its walk.
+export const COLD_PASS_PAINT_LIMIT_MS = 5_000;
+
 // How long after the last catalog walk started the poll walks with no moved directory. The walk finds growth in a
 // directory that no watcher covers, and a new file in a directory that the stat list misses.
 export const POLL_BACKSTOP_WALK_MS = 60_000;

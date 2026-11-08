@@ -277,6 +277,7 @@ import {
   DISPATCH_FIGURES_REFRESH_MS,
   mergeRefreshRequests,
   settleWalkFold,
+  COLD_PASS_PAINT_LIMIT_MS,
   PendingWatcherWake,
   PollDirectoryGate,
   POLL_BACKSTOP_WALK_MS,
@@ -9114,6 +9115,131 @@ test.each(['closing', 'closing and reopening'])(
     }
   },
 );
+
+// A warm start's cold pass waits at a gate, so only the saved openings can supply the first list.
+function warmStartHarness() {
+  const harness = heldWalkHarness({ COLD_PASS_PAINT_LIMIT_MS }, [
+    'settleBackgroundColdPass',
+    'listFinishedColdPass',
+    'browserPainted',
+  ]);
+  const { provider, root } = harness;
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  const stages: string[] = [];
+  let passSettled = false;
+  provider.startupHistory = { stage: (name: string) => stages.push(name) };
+  provider.codexColdReads = (signal: AbortSignal) =>
+    gate
+      .then(() => coldOpeningPass(provider.codexMetas, root, signal, (stage) => stages.push(stage)))
+      .then((pass) => {
+        passSettled = true;
+        return pass;
+      });
+  // `get` reads the rollout's opening once, and the cache then holds it as a saved opening.
+  const seed = (id: string) => {
+    const file = harness.writeRollout(id);
+    provider.codexMetas.get(file);
+    provider.savedCodexOpeningFiles = [...provider.codexMetas.keys()];
+    return file;
+  };
+  return { ...harness, stages, release, seed, settled: () => passSettled };
+}
+
+test('a warm start lists its saved openings before the cold pass completes', async () => {
+  const { provider, stages, release, seed, files, settled } = warmStartHarness();
+  provider.railPaintArrived = true;
+  const seeded = seed('seeded');
+  const refresh = provider.refresh(true);
+  await vi.waitFor(() => assert.deepEqual(files(), [seeded], 'the list waited for the cold pass'));
+  await refresh;
+  assert.equal(settled(), false, 'the pass finished before the list');
+  assert.ok(stages.includes('openingsEnumerated'));
+  assert.ok(!stages.includes('coldPassEnumerated'));
+  release();
+  await vi.waitFor(() => assert.ok(provider.codexPriming === null && settled()));
+  assert.ok(stages.indexOf('coldPassEnumerated') < stages.indexOf('coldPassPrimed'));
+  assert.ok(stages.indexOf('openingsEnumerated') < stages.indexOf('coldPassEnumerated'));
+});
+
+test('a cold start waits for its cold pass before it lists', async () => {
+  const { provider, release, writeRollout, files, settled } = warmStartHarness();
+  const only = writeRollout('only');
+  const listedAfterPass: boolean[] = [];
+  const allSessions = provider.allSessions;
+  provider.allSessions = function (...args: unknown[]) {
+    listedAfterPass.push(settled());
+    return allSessions.apply(this, args);
+  };
+  const refresh = provider.refresh(true);
+  await vi.waitFor(() => assert.ok(provider.codexPriming));
+  release();
+  await refresh;
+  assert.equal(listedAfterPass[0], true, 'a cold start listed before its pass finished');
+  assert.deepEqual(files(), [only]);
+});
+
+test('a rollout without a saved opening joins the list after its opening is read, with its opening', async () => {
+  const { provider, release, seed, writeRollout, files } = warmStartHarness();
+  provider.railPaintArrived = true;
+  const seeded = seed('seeded');
+  const unseeded = writeRollout('unseeded');
+  await provider.refresh(true);
+  assert.deepEqual(files(), [seeded], 'a rollout without a saved opening reached the first list');
+  release();
+  await vi.waitFor(() => assert.deepEqual(files(), [seeded, unseeded].sort()));
+  const row = provider.authoritativeCatalog.find((session: SessionFile) => session.file === unseeded);
+  assert.equal(row.cwd, provider.folders()[0], 'the rollout joined the list with an empty opening');
+});
+
+test('the listing after a warm cold pass waits for the first paint, and the paint limit ends the wait', async () => {
+  vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+  try {
+    const painted = warmStartHarness();
+    const seeded = painted.seed('seeded');
+    const unseeded = painted.writeRollout('unseeded');
+    const host = {};
+    painted.provider.readyHosts = new Set([host]);
+    await painted.provider.refresh(true);
+    painted.release();
+    await vi.waitFor(() => assert.ok(painted.provider.finishedColdPass, 'the finished pass was not held'));
+    assert.deepEqual(painted.files(), [seeded], 'the listing moved the generation before the first paint');
+    painted.provider.browserPainted(host, painted.provider.refreshGeneration, 'railReady', true);
+    await vi.waitFor(() => assert.deepEqual(painted.files(), [seeded, unseeded].sort()));
+
+    const hidden = warmStartHarness();
+    const held = hidden.seed('held');
+    const late = hidden.writeRollout('late');
+    await hidden.provider.refresh(true);
+    hidden.release();
+    await vi.waitFor(() => assert.ok(hidden.provider.finishedColdPass, 'the finished pass was not held'));
+    await vi.advanceTimersByTimeAsync(COLD_PASS_PAINT_LIMIT_MS + 1);
+    await vi.waitFor(() => assert.deepEqual(hidden.files(), [held, late].sort()));
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('a selection held on a rollout without a saved opening survives the list before its opening is read', async () => {
+  const { provider, release, seed, writeRollout, files } = warmStartHarness();
+  provider.railPaintArrived = true;
+  const seeded = seed('seeded');
+  const unseeded = writeRollout('unseeded');
+  provider.showing = 'unseeded';
+  const warn = vi.spyOn(console, 'warn');
+  try {
+    await provider.refresh(true);
+    await provider.refresh(true, true, false, true);
+    assert.deepEqual(files(), [seeded]);
+    assert.equal(provider.showing, 'unseeded', 'the list moved the selection off a rollout it cannot rule out');
+    assert.deepEqual(warn.mock.calls, [], 'the selection on a row without an opening threw');
+    release();
+    await vi.waitFor(() => assert.deepEqual(files(), [seeded, unseeded].sort()));
+    assert.equal(provider.showing, 'unseeded');
+  } finally {
+    warn.mockRestore();
+  }
+});
 
 test('targeted reuse avoids the broad walk, and a failed reuse performs exactly one walk', async () => {
   const { provider, walks, files, writeRollout, releaseAll } = heldWalkHarness();

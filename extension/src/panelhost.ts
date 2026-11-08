@@ -679,6 +679,7 @@ import {
   DISPATCH_FIGURES_REFRESH_MS,
   mergeRefreshRequests,
   settleWalkFold,
+  COLD_PASS_PAINT_LIMIT_MS,
   listedFilesFor,
   PendingWatcherWake,
   PollDirectoryGate,
@@ -1638,13 +1639,26 @@ export class PanelProvider implements vscode.Disposable {
   private codexOpenings: CodexOpeningsWriter | null = null;
   // The first catalog refresh primes opening metadata before listing sessions. Refresh and search requests wait for this pass.
   private codexColdReads: ((signal: AbortSignal) => Promise<ColdOpeningPass>) | null = (signal) =>
-    coldOpeningPass(this.codexMetas, codexSessionsRoot(), signal);
+    coldOpeningPass(this.codexMetas, codexSessionsRoot(), signal, (stage) => this.startupHistory?.stage(stage));
   private codexPriming: Promise<ColdOpeningPass> | null = null;
   // The cold pass in flight. Abandoning the catalog refresh aborts it and returns `reads` to `codexColdReads`.
+  // On a warm start `listing` holds the saved openings, which list the catalog while the pass runs behind it.
   private codexColdPass: {
     controller: AbortController;
     reads: (signal: AbortSignal) => Promise<ColdOpeningPass>;
+    listing?: SourceEnumeration;
   } | null = null;
+  // The walk of a warm start's finished pass, held until the first list has painted.
+  private finishedColdPass: {
+    enumeration: SourceEnumeration;
+    root: string;
+    startedAt: number;
+    reads: (signal: AbortSignal) => Promise<ColdOpeningPass>;
+  } | null = null;
+  private coldPassPaintWait: ReturnType<typeof setTimeout> | null = null;
+  // The rollouts whose openings the saved records supplied when this activation started.
+  private savedCodexOpeningFiles: readonly string[] = [];
+  private railPaintArrived = false;
   private sourceEnumerations?: { claude: SourceEnumeration; codex: SourceEnumeration };
   private membershipCoverage?: SessionCoverage;
   private physicalCoverage?: { claude: SessionCoverage; codex: SessionCoverage };
@@ -3745,6 +3759,7 @@ export class PanelProvider implements vscode.Disposable {
     if (this.codexOpeningsFile) {
       const openings = codexOpeningsAtStartup(this.codexOpeningsFile, cached?.codexMetas);
       this.codexMetas.load(openings.rows);
+      this.savedCodexOpeningFiles = [...this.codexMetas.keys()];
       this.codexOpenings = new CodexOpeningsWriter(this.codexOpeningsFile, this.codexMetas, openings.seeded, () => {
         if (this.derivedMigrationPending) this.checkpointDerivedCache();
       });
@@ -3792,6 +3807,8 @@ export class PanelProvider implements vscode.Disposable {
     this.fileAction?.abort();
     this.recordedReplies?.clear();
     if (this.disposed) return;
+    if (this.coldPassPaintWait) clearTimeout(this.coldPassPaintWait);
+    this.coldPassPaintWait = null;
     this.readerPages = undefined;
     this.filterRequests?.dispose();
     for (const waiter of this.filterReady ?? [])
@@ -4900,6 +4917,10 @@ export class PanelProvider implements vscode.Disposable {
     stage: 'railReady' | 'firstCard' | 'completeRender',
     usableRows = false,
   ): void {
+    if (stage === 'railReady' && this.readyHosts.has(host)) {
+      this.railPaintArrived = true;
+      if (this.finishedColdPass) this.listFinishedColdPass();
+    }
     if (!this.readyHosts.has(host) || generation !== this.refreshGeneration) {
       return;
     }
@@ -10001,7 +10022,7 @@ export class PanelProvider implements vscode.Disposable {
 
   async refresh(force = false, reuseCatalog = false, metadataAfterRender = false, selectedOnly = false): Promise<void> {
     // Merge concurrent catalog refresh triggers into one pending request so active reads can finish.
-    if (!selectedOnly && (this.refreshController || this.codexPriming)) {
+    if (!selectedOnly && (this.refreshController || (this.codexPriming && !this.codexColdPass?.listing))) {
       this.pendingRefresh = mergeRefreshRequests(
         this.pendingRefresh,
         {
@@ -10053,42 +10074,77 @@ export class PanelProvider implements vscode.Disposable {
         const coldRoot = codexSessionsRoot();
         // The pass owns its cancellation before it walks, because the refresh controller exists only after the pass.
         const controller = new AbortController();
-        const cold = { controller, reads: coldReads };
+        // Saved openings list the first catalog of a warm start. A cold start has none and waits for the pass.
+        const seeded =
+          this.authoritativeCatalog === null && !this.claudeChildrenDiscovered
+            ? (this.savedCodexOpeningFiles?.filter((file) => isInside(file, [coldRoot])) ?? [])
+            : [];
+        const cold: NonNullable<typeof this.codexColdPass> = {
+          controller,
+          reads: coldReads,
+          ...(seeded.length
+            ? { listing: { status: 'incomplete' as const, files: seeded, uncertain: [coldRoot] } }
+            : {}),
+        };
         this.codexColdPass = cold;
         // The poll compares directory times with the start of the pass, which walks the rollout tree.
         this.catalogWalkPendingAt ??= Date.now();
+        const coldStartedAt = this.catalogWalkPendingAt;
         const priming = coldReads(controller.signal);
         if (this.codexColdPass === cold) {
           this.codexPriming = priming;
         }
-        let listed = false;
-        try {
-          const pass = await priming;
-          // Mark cold-pass metadata for persistence because its reads precede the catalog's revision comparison.
-          if (pass.read) {
-            this.derivedCacheCheckpointState.markChanged(true);
+        if (cold.listing) {
+          void this.settleBackgroundColdPass(cold, priming, coldRoot, coldStartedAt);
+        } else {
+          let listed = false;
+          try {
+            const pass = await priming;
+            // Mark cold-pass metadata for persistence because its reads precede the catalog's revision comparison.
+            if (pass.read) {
+              this.derivedCacheCheckpointState.markChanged(true);
+            }
+            if (pass.enumeration === null) {
+              return;
+            }
+            primedEnumeration = pass.enumeration;
+            listed = coldRoot === codexSessionsRoot() && this.anyVisible();
+          } finally {
+            // A canceled pass already handed both fields to the refresh that replaces it.
+            if (this.codexColdPass === cold) {
+              this.codexColdPass = null;
+              this.codexPriming = null;
+              // A pass that lists no catalog hands back the broad walk it folded, so the waiting request walks.
+              this.pendingRefresh = settleWalkFold(this.pendingRefresh, priming, listed);
+            }
           }
-          if (pass.enumeration === null) {
+          if (!this.anyVisible()) {
             return;
           }
-          primedEnumeration = pass.enumeration;
-          listed = coldRoot === codexSessionsRoot() && this.anyVisible();
-        } finally {
-          // A canceled pass already handed both fields to the refresh that replaces it.
-          if (this.codexColdPass === cold) {
-            this.codexColdPass = null;
-            this.codexPriming = null;
-            // A pass that lists no catalog hands back the broad walk it folded, so the waiting request walks.
-            this.pendingRefresh = settleWalkFold(this.pendingRefresh, priming, listed);
+          // An abandoned refresh, a closed last panel or a moved rollout root makes the pass's walk obsolete.
+          // Its opening reads stay cached, and the pending refresh walks the tree again.
+          if (this.refreshGeneration !== coldGeneration || coldRoot !== codexSessionsRoot()) {
+            return;
           }
         }
-        if (!this.anyVisible()) {
-          return;
-        }
-        // An abandoned refresh, a closed last panel or a moved rollout root makes the pass's walk obsolete.
-        // Its opening reads stay cached, and the pending refresh walks the tree again.
-        if (this.refreshGeneration !== coldGeneration || coldRoot !== codexSessionsRoot()) {
-          return;
+      }
+      if (!selectedOnly && !primedEnumeration) {
+        const finished = this.finishedColdPass;
+        if (finished) {
+          // The finished walk replaces the saved openings, so this refresh lists it whatever it asked to reuse.
+          this.finishedColdPass = null;
+          if (this.coldPassPaintWait) clearTimeout(this.coldPassPaintWait);
+          this.coldPassPaintWait = null;
+          if (finished.root === codexSessionsRoot()) {
+            primedEnumeration = finished.enumeration;
+            this.catalogWalkPendingAt = finished.startedAt;
+            this.targetedRefreshPaths = null;
+            reuseCatalog = false;
+            walkReasons = [refreshReason];
+          }
+        } else if (this.codexColdPass?.listing) {
+          primedEnumeration = this.codexColdPass.listing;
+          this.performanceCounters.recordWork('seededListing');
         }
       }
       generation = selectedOnly ? this.refreshGeneration : ++this.refreshGeneration;
@@ -10967,7 +11023,7 @@ export class PanelProvider implements vscode.Disposable {
     // The holder of the slot sends discovery itself or schedules the next continuation when it ends. A request queued
     // behind it would run as one more catalog refresh after every continuation.
     if (this.refreshController) return;
-    if (this.codexPriming || !this.catalog || !this.repositoryScopeReady) {
+    if ((this.codexPriming && !this.codexColdPass?.listing) || !this.catalog || !this.repositoryScopeReady) {
       this.refreshFrom('dispatch-discovery', false, true);
       return;
     }
@@ -11031,6 +11087,59 @@ export class PanelProvider implements vscode.Disposable {
     }
   }
 
+  // Ends the cold pass of a warm start, which runs behind the list that the saved openings supplied.
+  // A pass that an abandoned refresh canceled has already handed its reads to the next refresh.
+  private async settleBackgroundColdPass(
+    cold: NonNullable<typeof this.codexColdPass>,
+    priming: Promise<ColdOpeningPass>,
+    root: string,
+    startedAt: number,
+  ): Promise<void> {
+    let pass: ColdOpeningPass | null = null;
+    try {
+      pass = await priming;
+    } catch (error) {
+      console.warn('Arc: session reading failed.', error);
+    }
+    if (pass?.read) this.derivedCacheCheckpointState.markChanged(true);
+    if (this.codexColdPass !== cold) return;
+    this.codexColdPass = null;
+    this.codexPriming = null;
+    const sameRoot = root === codexSessionsRoot();
+    const listed = pass?.enumeration != null && sameRoot && this.anyVisible();
+    this.pendingRefresh = settleWalkFold(this.pendingRefresh, priming, listed);
+    if (pass?.enumeration && listed) {
+      this.finishedColdPass = { enumeration: pass.enumeration, root, startedAt, reads: cold.reads };
+      this.listFinishedColdPass();
+      return;
+    }
+    // A hidden panel runs the pass again when it next refreshes. A moved root or a failed pass walks.
+    if (pass && sameRoot) this.codexColdReads = cold.reads;
+    this.refreshFrom('cold-pass');
+  }
+
+  // The listing that follows the pass moves the refresh generation, and a paint of an older generation records nothing.
+  // So it waits for the first list to paint. A hidden page paints nothing, so the wait ends at a limit.
+  private listFinishedColdPass(limitReached = false): void {
+    const finished = this.finishedColdPass;
+    if (!finished) return;
+    if (!this.railPaintArrived && !limitReached) {
+      this.coldPassPaintWait ??= setTimeout(() => {
+        this.coldPassPaintWait = null;
+        this.listFinishedColdPass(true);
+      }, COLD_PASS_PAINT_LIMIT_MS);
+      return;
+    }
+    if (this.coldPassPaintWait) clearTimeout(this.coldPassPaintWait);
+    this.coldPassPaintWait = null;
+    if (!this.anyVisible()) {
+      this.finishedColdPass = null;
+      this.codexColdReads = finished.reads;
+      return;
+    }
+    this.refreshFrom('cold-pass');
+  }
+
   // Runs the merged request that waits behind the catalog refresh. A refresh still in flight here
   // is past its deadline, and it is abandoned first.
   private runPendingRefresh(): void {
@@ -11075,6 +11184,13 @@ export class PanelProvider implements vscode.Disposable {
       this.codexPriming = null;
       this.codexColdReads = cold.reads;
       cold.controller.abort();
+    }
+    const finished = this.finishedColdPass;
+    if (finished) {
+      this.finishedColdPass = null;
+      this.codexColdReads ??= finished.reads;
+      if (this.coldPassPaintWait) clearTimeout(this.coldPassPaintWait);
+      this.coldPassPaintWait = null;
     }
     this.pendingRefresh = null;
     this.refreshOverdue = false;
