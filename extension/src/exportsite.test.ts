@@ -23,6 +23,7 @@ import { createClaudeSessionReducer } from './transcript';
 import { createCodexSessionReducer } from './codex';
 import { readCodexSession } from './codex';
 import { codexLeadingCompactionRecords } from './turnfixtures';
+import { toCompactionCard } from './turncard';
 
 test('an exported compaction reads the held catalog name and keeps the recorded model', async () => {
   const folder = tempDir('compaction-names-');
@@ -31,8 +32,8 @@ test('an exported compaction reads the held catalog name and keeps the recorded 
     const model = await sessionSiteFixture(writer);
     model.modelLabels = { 'gpt-5.6-sol': 'GPT-5.6-Sol Captured' };
     const session = model.sessions[0];
-    const compact = projectCompaction(compaction({ model: 'gpt-5.6-sol', sessionId: session.key }), 'boundary');
-    assert.equal(compact.model, 'gpt-5.6-sol');
+    const recorded = compaction({ model: 'gpt-5.6-sol', sessionId: session.key });
+    const compact = projectCompaction(recorded, 'boundary');
     const prior = projectTurn(turn({ startedAt: 1, endedAt: 2 }), 'prior', {}, [], session.key, new Map());
     session.pages = [await writer.spool({ key: 'page', session: session.key, turns: [prior], compactions: [compact] })];
     await projectSessionSite(model, writer, { script: '', stylesheet: '' });
@@ -42,6 +43,9 @@ test('an exported compaction reads the held catalog name and keeps the recorded 
       .cards!.map((entry) => (data.get(entry.id) as { card: CardView }).card)
       .find((value) => value.key === 'boundary');
     assert.match(JSON.stringify(card), /GPT-5\.6-Sol Captured/);
+    // The published page holds no model field for a compaction. Its prices come from the recorded model, so a renamed model changes them.
+    const labels = new Map(Object.entries(model.modelLabels));
+    assert.equal(card!.chips![0].detail, toCompactionCard(recorded, model.capturedAt, labels).chips[0].detail);
   } finally {
     await writer.dispose();
   }
