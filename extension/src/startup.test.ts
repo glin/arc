@@ -12850,7 +12850,7 @@ test('a session list post counts its caller and each input that differs from the
   assert.deepEqual(posts(), [], 'a skipped post counted as a post');
 });
 
-// A render post had no caller counter, so a capture could not name the refresh that sent a large render delta.
+// A capture names the refresh that sent a large render delta by its render post counters.
 test('a render post counts its caller and each session list input that differs from the last post', async () => {
   vi.useFakeTimers();
   try {
@@ -16291,9 +16291,9 @@ for (const [change, subject, outcome, miss] of [
     }
   });
 
-// An enrichment read refused because its file moved after the catalog listed it. Its follow-up refresh used to list the
-// catalog again and send a walked discovery request, which opens a new receipt scan after a completed pass. Naming the
-// moved file lets the held catalog list its current revision, which the next enrichment read needs.
+// An enrichment read refused because its file moved after the catalog listed it. A follow-up refresh that lists the catalog
+// again sends a walked discovery request, which opens a new receipt scan after a completed pass. Naming the moved file lets
+// the held catalog list its current revision, which the next enrichment read needs.
 test('an enrichment refresh after a moved file names that file and sends no discovery request', async () => {
   vi.useFakeTimers();
   try {

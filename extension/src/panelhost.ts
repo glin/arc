@@ -9897,8 +9897,8 @@ export class PanelProvider implements vscode.Disposable {
         const walked = await this.walkCatalog(controller.signal, generation);
         if (!walked) return;
         all = walked;
-        // Every walk restarts the poll's backstop clock. A refresh that the held catalog could not serve sends the discovery
-        // request of a walk, so the backstop never waits behind a walk that sent none.
+        // A walk restarts the poll's backstop clock, so a refresh that the held catalog could not serve sends the discovery
+        // request that a walk sends.
         if (reuseCatalog) {
           reuseCatalog = false;
           walkReasons = [refreshReason];
