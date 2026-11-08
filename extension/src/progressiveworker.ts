@@ -280,6 +280,11 @@ export interface DiscoveryCharges extends Record<import('./codex').CodexDispatch
   receiptEntries?: number;
   receiptChecks?: number;
   receiptBytes?: number;
+  // Launches whose read reached the lookup of both catalog rows, and launches that stopped at a requester outside the catalog.
+  receiptLaunchesRead?: number;
+  receiptLaunchesRejectedAtRequester?: number;
+  // The event-loop turns that the receipt scan took.
+  receiptScanTurns?: number;
   // Each receipt scan that opened in the request, split by why the worker's previous scan closed. A scan with no earlier
   // scan in its worker counts as a new worker.
   receiptScanOpens?: number;

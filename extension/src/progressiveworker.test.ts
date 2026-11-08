@@ -603,6 +603,40 @@ test('a window read queued during a receipt turn enters the worker within one ba
   }
 });
 
+test('the receipt counters record launches read, launches rejected at the requester, and scan turns', async () => {
+  const root = tempDir('receipt-worker-counters-');
+  const fx = receiptDispatchFixture(root, 'claude', 'codex');
+  fs.mkdirSync(fx.receipts.root, { recursive: true });
+  fx.launch(fx.parent, fx.child);
+  fx.launch(fx.grandchild, fx.child);
+  const catalog = [fx.parent, fx.child];
+  const worker = new ProgressiveWorker(`process.env.ARC_HOME=${JSON.stringify(fx.home)};` + source);
+  try {
+    let launchesRead = 0;
+    let launchesRejected = 0;
+    let turns = 0;
+    let complete = false;
+    for (let pass = 0; pass < 50 && !complete; pass++) {
+      const result = await worker.run(
+        { kind: 'claude-children', parents: catalog, catalog, repositoryRoots: [root] },
+        pass + 1,
+        new AbortController().signal,
+      );
+      const charges = result?.value.charges;
+      launchesRead += charges?.receiptLaunchesRead ?? 0;
+      launchesRejected += charges?.receiptLaunchesRejectedAtRequester ?? 0;
+      turns += charges?.receiptScanTurns ?? 0;
+      complete = result?.value.kind === 'claude-children';
+    }
+    assert.ok(complete, 'receipt discovery never completed');
+    assert.equal(launchesRead, 1);
+    assert.equal(launchesRejected, 1);
+    assert.ok(turns >= 1, `${turns} scan turns`);
+  } finally {
+    worker.stop();
+  }
+});
+
 test('the receipt slice deadline ends a pass inside a batch of steps', async () => {
   const root = tempDir('receipt-worker-deadline-');
   const fx = receiptDispatchFixture(root, 'claude', 'codex');

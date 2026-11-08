@@ -1374,6 +1374,8 @@ async function execute(
       if (launchId !== undefined) {
         const identities = step.value.identities;
         activeReceipts.references.delete(launchId);
+        if (identities?.child) charges.receiptLaunchesRead!++;
+        else if (identities) charges.receiptLaunchesRejectedAtRequester!++;
         if (identities)
           activeReceipts.launches.set(launchId, [
             catalogIdentity(identities.requester.agent, identities.requester.sessionId),
@@ -1390,6 +1392,7 @@ async function execute(
       receiptSteps++;
       if (++turnSteps >= RECEIPT_TURN_STEPS || windowReads.size > 0) {
         turnSteps = 0;
+        charges.receiptScanTurns!++;
         await receiptScanTurn();
       }
     }
@@ -1832,6 +1835,9 @@ function emptyDiscoveryCharges(): DiscoveryCharges {
     receiptEntries: 0,
     receiptChecks: 0,
     receiptBytes: 0,
+    receiptLaunchesRead: 0,
+    receiptLaunchesRejectedAtRequester: 0,
+    receiptScanTurns: 0,
     receiptScanOpens: 0,
     receiptScanOpensNewWorker: 0,
     receiptScanOpensAfterEpoch: 0,
