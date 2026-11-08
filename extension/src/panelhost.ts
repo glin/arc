@@ -10083,7 +10083,15 @@ export class PanelProvider implements vscode.Disposable {
       // The catalog build is the rest of it.
       let timing = false;
       const enumerationParts: CatalogEnumerationParts = {
-        ms: { listing: 0, stats: 0, openings: 0, prompts: 0 },
+        ms: {
+          listing: 0,
+          stats: 0,
+          'openings:parents': 0,
+          'openings:codex': 0,
+          'openings:collisions': 0,
+          'openings:children': 0,
+          prompts: 0,
+        },
         time: (part, run) => {
           if (timing) return run();
           timing = true;
@@ -10192,10 +10200,13 @@ export class PanelProvider implements vscode.Disposable {
       const enumerationMs = performance.now() - catalogStarted;
       this.performanceCounters.recordRefresh('catalog-enumeration', enumerationMs);
       let timedMs = 0;
+      let openingsMs = 0;
       for (const [part, ms] of Object.entries(enumerationParts.ms)) {
         timedMs += ms;
+        if (part.startsWith('openings:')) openingsMs += ms;
         this.performanceCounters.recordRefresh(`catalog-enumeration:${part}`, ms);
       }
+      this.performanceCounters.recordRefresh('catalog-enumeration:openings', openingsMs);
       this.performanceCounters.recordRefresh('catalog-enumeration:build', Math.max(0, enumerationMs - timedMs));
       if (this.repositoryScopeReady) {
         this.startupHistory?.stage('openingsEnumerated');
@@ -13034,9 +13045,10 @@ export class PanelProvider implements vscode.Disposable {
     const claudeListing = enumerateSessionFilesFor(
       projectsRoot(),
       roots,
-      (file, session) =>
-        time('openings', () => {
-          if (collides('claude', file)) {
+      (file, session) => {
+        if (collides('claude', file)) {
+          const qualified = time('openings:collisions', () => {
+            this.performanceCounters?.recordWork('openingsRead:collisions');
             const opening = readQualifiedSessionCwd(file);
             if (
               opening &&
@@ -13057,7 +13069,11 @@ export class PanelProvider implements vscode.Disposable {
               return opening.value;
             }
             claudeOpeningUnavailable = true;
-          }
+            return null;
+          });
+          if (qualified !== null) return qualified;
+        }
+        return time('openings:parents', () => {
           const hit = this.cwds.get(file);
           if (hit?.cwd) {
             return hit.cwd;
@@ -13067,48 +13083,53 @@ export class PanelProvider implements vscode.Disposable {
             return hit.cwd;
           }
           let unavailable = false;
+          this.performanceCounters?.recordWork('openingsRead:parents');
           const cwd = scanSessionCwd(file, () => {
             unavailable = true;
             claudeOpeningUnavailable = true;
           });
           this.cwds.set(file, { cwd, mtimeMs: session.mtimeMs, size: session.size, unavailable });
           return cwd;
-        }),
+        });
+      },
       workspaceFolders,
       time,
     );
     const claude = claudeListing.sessions;
+    const countCodexOpeningRead = () => this.performanceCounters?.recordWork('openingsRead:codex');
     // A hidden panel ignores watcher events, so a walk then stats every rollout and holds none.
     const listing = codexSessionFiles(
       codexSessionsRoot(),
       roots,
-      (file) =>
-        time('openings', () => {
-          if (isCompressedRollout(file)) return null;
-          if (collides('codex', file)) {
+      (file) => {
+        if (isCompressedRollout(file)) return null;
+        if (collides('codex', file)) {
+          const qualified = time('openings:collisions', () => {
+            this.performanceCounters?.recordWork('openingsRead:collisions');
             const opening = readQualifiedCodexOpening(file);
-            if (opening) {
-              const source: SessionFile = {
-                agent: 'codex',
-                file,
-                sessionId: opening.value.sessionId!,
-                cwd: opening.value.cwd!,
-                ...opening.revision,
-              };
-              this.codexMetas.install(file, opening.value);
-              this.codexStats.delete(file);
-              sourceObservations.push({
-                ...physicalContext,
-                source,
-                excluded: !inRoots(source.cwd!),
-                hidden: isHiddenThread(opening.value),
-              });
-              qualifiedCodexStats.set(file, { ...opening.revision, isFile: true });
-              return opening.value;
-            }
-          }
-          return this.codexMetas.get(file);
-        }),
+            if (!opening) return null;
+            const source: SessionFile = {
+              agent: 'codex',
+              file,
+              sessionId: opening.value.sessionId!,
+              cwd: opening.value.cwd!,
+              ...opening.revision,
+            };
+            this.codexMetas.install(file, opening.value);
+            this.codexStats.delete(file);
+            sourceObservations.push({
+              ...physicalContext,
+              source,
+              excluded: !inRoots(source.cwd!),
+              hidden: isHiddenThread(opening.value),
+            });
+            qualifiedCodexStats.set(file, { ...opening.revision, isFile: true });
+            return opening.value;
+          });
+          if (qualified) return qualified;
+        }
+        return time('openings:codex', () => this.codexMetas.get(file, countCodexOpeningRead));
+      },
       (file) =>
         time(
           'stats',
@@ -13117,7 +13138,9 @@ export class PanelProvider implements vscode.Disposable {
       undefined,
       codexEnumeration,
     );
-    const census = enumerateClaudeChildSources([...claude, ...this.claudeChildren], time);
+    const census = enumerateClaudeChildSources([...claude, ...this.claudeChildren], time, () =>
+      this.performanceCounters?.recordWork('openingsRead:children'),
+    );
     this.walkedChildSources = census.sessions;
     const childSources = census.sessions.filter((source) => !source.cwd || inRoots(source.cwd));
     claudeListing.files = [...claudeListing.files, ...census.files];

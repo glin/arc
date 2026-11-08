@@ -8263,6 +8263,14 @@ test('a catalog walk records each part of the enumeration time, and the parts su
   const advance = (ms: number) => {
     clock += ms;
   };
+  const collidedClaude: SessionFile = {
+    agent: 'claude',
+    file: 'collided.jsonl',
+    sessionId: 'collided',
+    size: 1,
+    mtimeMs: 1,
+  };
+  const collidedCodexFile = 'rollout-collided.jsonl';
   const { provider, claude, codex } = bumpedCatalogHarness({
     performance: { now: () => clock },
     enumerateRolloutFilesAsync: async () => {
@@ -8283,11 +8291,20 @@ test('a catalog walk records each part of the enumeration time, and the parts su
         time('listing', () => advance(1));
       });
       cwdOf(claude.file, claude);
+      cwdOf(collidedClaude.file, collidedClaude);
       return { sessions: [claude], files: [claude.file], status: 'complete', uncertain: [] };
     },
     scanSessionCwd: () => {
       advance(7);
       return '/project';
+    },
+    readQualifiedSessionCwd: () => {
+      advance(5);
+      return null;
+    },
+    readQualifiedCodexOpening: () => {
+      advance(3);
+      return null;
     },
     fs: {
       ...fs,
@@ -8300,8 +8317,18 @@ test('a catalog walk records each part of the enumeration time, and the parts su
     fileRevisionOf: () => ({ size: claude.size, mtimeMs: claude.mtimeMs, dev: claude.dev, ino: claude.ino }),
     revalidatedCatalog,
     revalidatedCatalogPaths,
-    enumerateClaudeChildSources: (_parents: SessionFile[], time: (part: string, run: () => unknown) => unknown) => {
+    enumerateClaudeChildSources: (
+      _parents: SessionFile[],
+      time: (part: string, run: () => unknown) => unknown,
+      countRead: () => void,
+    ) => {
       time('listing', () => advance(1));
+      countRead();
+      // A call inside a timed call counts only in the outer part.
+      time('openings:children', () => {
+        advance(1);
+        time('stats', () => advance(1));
+      });
       return { sessions: [], files: [], directories: [], status: 'complete', uncertain: [] };
     },
     codexSessionFiles: (
@@ -8311,6 +8338,7 @@ test('a catalog walk records each part of the enumeration time, and the parts su
       statOf: (file: string) => unknown,
     ) => {
       metaOf(codex.file);
+      metaOf(collidedCodexFile);
       statOf(codex.file);
       return {
         walked: [codex.file],
@@ -8331,22 +8359,30 @@ test('a catalog walk records each part of the enumeration time, and the parts su
     },
   });
   provider.codexColdReads = null;
-  provider.codexMetas = {
-    keys: () => [],
-    revision: 1,
-    get: () => {
+  provider.codexMetas = new CodexMetaCache(
+    () => {
       advance(6);
       return null;
     },
+    () => null,
+  );
+  // One Claude file and one rollout collide, and each qualified read fails, so each also pays its source's own reader.
+  provider.enumeratedCollisions = {
+    sources: [
+      { agent: 'claude', file: collidedClaude.file, sessionId: 'collided' },
+      { agent: 'codex', file: collidedCodexFile, sessionId: 'collided' },
+    ],
   };
   provider.prepareHumanPrompts = async (sessions: SessionFile[]) => {
     advance(11);
     return sessions;
   };
   const refreshes = new Map<string, number[]>();
+  const work = new Map<string, number>();
   provider.performanceCounters = {
     ...provider.performanceCounters,
     recordRefresh: (name: string, ms: number) => refreshes.set(name, [...(refreshes.get(name) ?? []), ms]),
+    recordWork: (name: string, count = 1) => work.set(name, (work.get(name) ?? 0) + count),
   };
 
   await provider.refresh(true);
@@ -8354,10 +8390,31 @@ test('a catalog walk records each part of the enumeration time, and the parts su
   const parts = ['listing', 'stats', 'openings', 'prompts', 'build'];
   assert.deepEqual(
     Object.fromEntries(parts.map((part) => [part, refreshes.get(`catalog-enumeration:${part}`)])),
-    { listing: [9], stats: [6], openings: [13], prompts: [11], build: [13] },
+    { listing: [9], stats: [6], openings: [36], prompts: [11], build: [13] },
     'a part of the walk was not timed, or its time went to another part',
   );
-  assert.deepEqual(refreshes.get('catalog-enumeration'), [52]);
+  assert.deepEqual(refreshes.get('catalog-enumeration'), [75]);
+  const sources = ['parents', 'codex', 'collisions', 'children'];
+  assert.deepEqual(
+    Object.fromEntries(sources.map((source) => [source, refreshes.get(`catalog-enumeration:openings:${source}`)])),
+    { parents: [14], codex: [12], collisions: [8], children: [2] },
+    'an opening reader was not timed, or its time went to another reader',
+  );
+  assert.equal(
+    sources.reduce((sum, source) => sum + refreshes.get(`catalog-enumeration:openings:${source}`)![0], 0),
+    refreshes.get('catalog-enumeration:openings')![0],
+    'the opening readers do not sum to the openings part',
+  );
+  assert.deepEqual(
+    Object.fromEntries(sources.map((source) => [source, work.get(`openingsRead:${source}`)])),
+    { parents: 2, codex: 2, collisions: 2, children: 1 },
+    'an opening reader did not count one read per file',
+  );
+
+  // A rollout that the cache holds an answer for reads nothing on the next walk.
+  work.delete('openingsRead:codex');
+  await provider.refresh(true);
+  assert.equal(work.get('openingsRead:codex'), undefined, 'a held opening counted a read');
   assert.equal(
     parts.reduce((sum, part) => sum + refreshes.get(`catalog-enumeration:${part}`)![0], 0),
     refreshes.get('catalog-enumeration')![0],

@@ -210,8 +210,8 @@ export class CodexMetaCache {
     private now: () => number = () => performance.now(),
   ) {}
 
-  // A compressed rollout gets no opening read, and its name gets no entry.
-  get(file: string): CodexSessionMeta | null {
+  // A compressed rollout gets no opening read, and its name gets no entry. `onRead` runs once for each opening read.
+  get(file: string, onRead?: () => void): CodexSessionMeta | null {
     if (isCompressedRollout(file)) return null;
     const hit = this.entries.get(file);
     if (hit?.meta) {
@@ -230,6 +230,7 @@ export class CodexMetaCache {
         return null;
       }
     }
+    onRead?.();
     const meta = this.readMeta(file);
     // Refused reads keep an attempt time and retry interval instead of a file-size marker.
     if (meta === undefined) {

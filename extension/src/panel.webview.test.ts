@@ -12493,7 +12493,7 @@ test('both agents reach one list, and each session is read and named by its own 
   // Retain rollout metadata and trim its cache against walked files.
   sourceMatch(
     merge,
-    /this\.codexMetas\.get\(file\)/,
+    /this\.codexMetas\.get\(file, countCodexOpeningRead\)/,
     'the panel keeps no opening record, so it reads every head again on every poll',
   );
   sourceMatch(

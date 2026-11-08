@@ -3929,8 +3929,10 @@ export function sessionFilesFor(
   return enumerateSessionFilesFor(root, folders, cwdOf, missingCwdFolders).sessions;
 }
 
+// The reader that an opening read of a catalog listing belongs to.
+export type OpeningSource = 'parents' | 'codex' | 'collisions' | 'children';
 // The part of a catalog listing that a filesystem call belongs to: a directory read, a file stat, or an opening read.
-export type ListingPart = 'listing' | 'stats' | 'openings';
+export type ListingPart = 'listing' | 'stats' | `openings:${OpeningSource}`;
 // Runs one filesystem call of a listing and returns its result, so a caller can time each part.
 export type ListingTimer = <T>(part: ListingPart, run: () => T) => T;
 const untimed: ListingTimer = (_part, run) => run();
@@ -4044,6 +4046,7 @@ export function enumerateSessionFiles(
 export function enumerateClaudeChildSources(
   parents: readonly SessionFile[],
   time: ListingTimer = untimed,
+  countRead?: () => void,
 ): SourceEnumeration & { sessions: SessionFile[] } {
   const census: SourceEnumeration & { sessions: SessionFile[] } = {
     status: 'complete',
@@ -4082,7 +4085,8 @@ export function enumerateClaudeChildSources(
     }
     for (const source of listing.sessions) {
       if (!source.sessionId.startsWith('agent-')) continue;
-      const opening = time('openings', () => readQualifiedSessionCwd(source.file));
+      countRead?.();
+      const opening = time('openings:children', () => readQualifiedSessionCwd(source.file));
       if (
         !opening ||
         source.dev !== opening.revision.dev ||
