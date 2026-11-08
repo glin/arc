@@ -9949,14 +9949,16 @@ export class PanelProvider implements vscode.Disposable {
         !this.awaitingSessionRecords[this.showing]
       ) {
         all =
-          revalidatedCatalog(this.authoritativeCatalog, this.showing, (file) => {
-            try {
-              const stat = fileRevisionOf(fs.statSync(file, { bigint: true }));
-              return { mtimeMs: stat.mtimeMs, size: stat.size };
-            } catch {
-              return null;
-            }
-          }) ?? this.authoritativeCatalog;
+          revalidatedCatalog(this.authoritativeCatalog, this.showing, (file) =>
+            enumerationParts.time('stats', () => {
+              try {
+                const stat = fileRevisionOf(fs.statSync(file, { bigint: true }));
+                return { mtimeMs: stat.mtimeMs, size: stat.size };
+              } catch {
+                return null;
+              }
+            }),
+          ) ?? this.authoritativeCatalog;
       }
       const admissionCandidates = all;
       const admissionSelection = selectedOnly ? this.selectionGeneration : undefined;
@@ -12685,7 +12687,7 @@ export class PanelProvider implements vscode.Disposable {
   // With `deferWalk`, a missed reuse that has no supplied Codex enumeration sets `deferWalk.needed` and lists
   // nothing, so the caller can walk the rollout tree asynchronously.
   // `walkCause` names a walk that runs because the caller did not ask for reuse. A caller that may walk must name it.
-  // `parts` times the filesystem calls of a walk.
+  // `parts` times the filesystem calls of a walk and the file stats that check the held catalog again.
   private allSessions(
     reuseCatalog = false,
     deferHumanPrompts = false,
@@ -12703,6 +12705,7 @@ export class PanelProvider implements vscode.Disposable {
       return [];
     }
     this.startupHistory?.stage('scopeResolved');
+    const time: ListingTimer = parts?.time ?? ((_part, run) => run());
     const folderPrint = `${workspaceFolders.join('\n')}\0${scope.revision}`;
     let namedFileChanged = false;
     if (this.targetedRefreshPaths?.length && this.catalog && this.catalog.folders === folderPrint) {
@@ -12711,13 +12714,14 @@ export class PanelProvider implements vscode.Disposable {
         ? this.catalog.sessions.filter((session) => session.sessionId === this.showing).map((session) => session.file)
         : [];
       const named = [...new Set([...this.targetedRefreshPaths, ...selected])];
-      const statOf = (file: string) => {
-        try {
-          return fileRevisionOf(fs.statSync(file, { bigint: true }));
-        } catch {
-          return null;
-        }
-      };
+      const statOf = (file: string) =>
+        time('stats', () => {
+          try {
+            return fileRevisionOf(fs.statSync(file, { bigint: true }));
+          } catch {
+            return null;
+          }
+        });
       // A named file that the last walk listed and the held catalog lacks revalidates its walked row, and the row joins
       // the listing as it does after a walk. Prompt admission then decides it as in a walk, and discovery progress keeps
       // only accepted rows. Each walked parent stays in the next discovery request.
@@ -12768,14 +12772,16 @@ export class PanelProvider implements vscode.Disposable {
       const held =
         !this.showing || this.newDrafts?.[this.showing]
           ? [...this.catalog.sessions]
-          : revalidatedCatalog(this.catalog.sessions, this.showing, (file) => {
-              try {
-                return fileRevisionOf(fs.statSync(file, { bigint: true }));
-              } catch {
-                selectedFileGone = true;
-                return null;
-              }
-            });
+          : revalidatedCatalog(this.catalog.sessions, this.showing, (file) =>
+              time('stats', () => {
+                try {
+                  return fileRevisionOf(fs.statSync(file, { bigint: true }));
+                } catch {
+                  selectedFileGone = true;
+                  return null;
+                }
+              }),
+            );
       // Reorder reused catalog rows after updating file revisions.
       if (held) {
         const admitted = deferHumanPrompts

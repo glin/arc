@@ -8266,14 +8266,34 @@ test('a catalog walk records each part of the enumeration time, and the parts su
     enumerateSessionFilesFor: (
       _root: string,
       _folders: string[],
-      _cwdOf: unknown,
+      cwdOf: (file: string, session: SessionFile) => unknown,
       _missing: unknown,
       time: (part: string, run: () => unknown) => unknown,
     ) => {
       time('listing', () => advance(3));
-      time('stats', () => advance(2));
+      // A call inside a timed call counts only in the outer part.
+      time('stats', () => {
+        advance(1);
+        time('listing', () => advance(1));
+      });
+      cwdOf(claude.file, claude);
       return { sessions: [claude], files: [claude.file], status: 'complete', uncertain: [] };
     },
+    scanSessionCwd: () => {
+      advance(7);
+      return '/project';
+    },
+    fs: {
+      ...fs,
+      // The fixture files do not exist, so the stat returns a placeholder that `fileRevisionOf` reads as the held revision.
+      statSync: () => {
+        advance(8);
+        return {};
+      },
+    },
+    fileRevisionOf: () => ({ size: claude.size, mtimeMs: claude.mtimeMs, dev: claude.dev, ino: claude.ino }),
+    revalidatedCatalog,
+    revalidatedCatalogPaths,
     enumerateClaudeChildSources: (_parents: SessionFile[], time: (part: string, run: () => unknown) => unknown) => {
       time('listing', () => advance(1));
       return { sessions: [], files: [], directories: [], status: 'complete', uncertain: [] };
@@ -8328,14 +8348,36 @@ test('a catalog walk records each part of the enumeration time, and the parts su
   const parts = ['listing', 'stats', 'openings', 'prompts', 'build'];
   assert.deepEqual(
     Object.fromEntries(parts.map((part) => [part, refreshes.get(`catalog-enumeration:${part}`)])),
-    { listing: [9], stats: [6], openings: [6], prompts: [11], build: [13] },
+    { listing: [9], stats: [6], openings: [13], prompts: [11], build: [13] },
     'a part of the walk was not timed, or its time went to another part',
   );
-  assert.deepEqual(refreshes.get('catalog-enumeration'), [45]);
+  assert.deepEqual(refreshes.get('catalog-enumeration'), [52]);
   assert.equal(
     parts.reduce((sum, part) => sum + refreshes.get(`catalog-enumeration:${part}`)![0], 0),
     refreshes.get('catalog-enumeration')![0],
     'the parts do not sum to the enumeration time',
+  );
+
+  // The file stats of a refresh that reuses the held catalog, of a refresh that names files, and of a selected-only
+  // refresh each check the selected file again, and each counts under the stats part.
+  provider.showing = claude.sessionId;
+  const statsOf = async (refresh: () => Promise<void>) => {
+    refreshes.clear();
+    await refresh();
+    return refreshes.get('catalog-enumeration:stats');
+  };
+  assert.deepEqual(
+    await statsOf(() => provider.refresh(true, true)),
+    [8],
+    'the stat of a refresh that reuses the held catalog was not timed',
+  );
+  provider.targetedRefreshPaths = [claude.file];
+  assert.deepEqual(await statsOf(() => provider.refresh(true, true)), [8], 'the stat of a named file was not timed');
+  provider.targetedRefreshPaths = null;
+  assert.deepEqual(
+    await statsOf(() => provider.refresh(true, false, false, true)),
+    [8],
+    'the stat of a selected-only refresh was not timed',
   );
 });
 
