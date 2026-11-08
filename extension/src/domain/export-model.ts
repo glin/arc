@@ -91,6 +91,8 @@ export interface ExportBlock {
   at: number;
   sourceOrder: number | null;
   notResponse: 'repeat-notice' | 'no-response-requested' | 'after-handback' | null;
+  // Present on the opening prompt of a turn a scheduled wake opened.
+  origin?: 'scheduled';
 }
 export interface ExportTurn {
   // Opaque native-turn identity for compaction placement.

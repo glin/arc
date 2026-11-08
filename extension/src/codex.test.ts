@@ -19443,3 +19443,22 @@ test('own speed drops retracted copied requests and corrected compaction identit
     { model: 'gpt-5.6-sol', provider: 'openai', serviceTier: 'default' },
   ]);
 });
+
+test('a Codex user record with loop wake fields stays an ordinary Codex record', () => {
+  const opening = event('user_message', 1, { message: 'Ask' });
+  const started = event('task_started', 1, { turn_id: 't1' });
+  const answer = event('agent_message', 2, { message: 'Done' });
+  const closed = event('task_complete', 3, { turn_id: 't1' });
+  const plain = [meta(), started, opening, answer, closed];
+  const marked = [
+    meta(),
+    started,
+    { ...opening, isMeta: true, wakeupSource: 'loop_wakeup', turnOrigin: 'scheduled' },
+    answer,
+    closed,
+  ];
+  const turnsOf = (records: object[]) =>
+    readCodexSession(writeRollout(records), 'sess').turns.map((one) => [one.prompt, one.origin]);
+  assert.deepEqual(turnsOf(marked), turnsOf(plain));
+  assert.deepEqual(turnsOf(plain), [['Ask', undefined]]);
+});

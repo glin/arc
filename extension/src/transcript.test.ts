@@ -1,4 +1,5 @@
 import { webLinkUrl, linkBrowserKind, parseLinkDestination } from './domain/link-path';
+import { claudeLoopWake, claudeWakeupCall, claudeWakeupSequence } from './turnfixtures.ts';
 import { test, vi } from 'vitest';
 import { agentRunAnswer } from './turnrail';
 import {
@@ -18785,4 +18786,275 @@ test('a prompt without a leading slash keeps the exact comparison', () => {
   assert.equal(launchPromptMatches('Review this.', 'Review this.'), true);
   assert.equal(launchPromptMatches('Review this.', 'Review this.\n'), false);
   assert.equal(launchPromptMatches('<command-name>/x</command-name>', 'x'), false);
+});
+
+const wakeTyped = (text: string, second: number) => ({
+  type: 'user',
+  uuid: `typed-${second}`,
+  promptId: `typed-${second}`,
+  timestamp: at(second),
+  message: { role: 'user', content: text },
+});
+
+test('a ScheduleWakeup call closes the turn at the call in every reader and a loop wake opens the next turn', () => {
+  const records = claudeWakeupSequence(at);
+  const wake = records.findIndex((record) => record.wakeupSource === 'loop_wakeup');
+  const turns = readSession(writeTranscript(records), 'sess').turns;
+  assert.deepEqual(
+    turns.map((turn) => ({
+      origin: turn.origin,
+      id: turn.promptId,
+      startedAt: turn.startedAt,
+      endedAt: turn.endedAt,
+      finished: turn.finished,
+      summary: turn.summary,
+      updates: turn.updates.length,
+      steps: turn.steps.map((step) => [step.name, step.status]),
+    })),
+    [
+      {
+        origin: undefined,
+        id: 'typed',
+        startedAt: ms(0),
+        endedAt: ms(10),
+        finished: true,
+        summary: 'Yes, restart now.',
+        updates: 0,
+        steps: [['ScheduleWakeup', 'done']],
+      },
+      {
+        origin: 'scheduled',
+        id: 'wake:wake-1',
+        startedAt: ms(1000),
+        endedAt: ms(1010),
+        finished: true,
+        summary: 'Still waiting.',
+        updates: 0,
+        steps: [['ScheduleWakeup', 'done']],
+      },
+    ],
+  );
+  for (const part of [records.slice(0, wake), records]) {
+    const file = writeTranscript(part);
+    const newest = readSession(file, 'sess').turns.at(-1)!;
+    const usage = createClaudeUsageLineReducer();
+    for (const record of part) usage.pushLine(JSON.stringify(record));
+    for (const outcome of [readSessionMeta(file).outcome, usage.newestTurnOutcome()]) {
+      assert.equal(outcome?.finished, true);
+      assert.equal(outcome?.endedAt, newest.endedAt);
+      assert.equal(outcome?.startedAt, newest.startedAt);
+    }
+  }
+  assert.deepEqual(readSessionTurnStarts(writeTranscript(records)), {
+    starts: [ms(0), ms(1000)],
+    scheduled: [ms(1000)],
+    whole: true,
+  });
+});
+
+test('a failed ScheduleWakeup call restores the running turn and its commentary across a read boundary', () => {
+  const opening = wakeTyped('watch the build', 0);
+  const [text, call, failure] = claudeWakeupCall('failed-call', 'Waiting for the build.', at(5), at(6), true);
+  const first = createClaudeSessionReducer('sess');
+  for (const record of [opening, text, call]) first.pushLine(JSON.stringify(record));
+  const stopped = first.read().turns[0];
+  assert.equal(stopped.finished, true, 'a read that stops before the result shows the turn done');
+  assert.equal(stopped.summary, 'Waiting for the build.');
+  assert.deepEqual(stopped.updates, []);
+  const resumed = createClaudeSessionReducer('sess', {}, first.snapshot());
+  resumed.pushLine(JSON.stringify(failure));
+  const turn = resumed.read().turns[0];
+  assert.equal(turn.finished, false);
+  assert.equal(turn.summary, '');
+  assert.deepEqual(
+    turn.updates.map((update) => [update.kind, update.text]),
+    [['commentary', 'Waiting for the build.']],
+  );
+  assert.equal(turn.steps[0].status, 'failed');
+  const whole = createClaudeSessionReducer('sess');
+  for (const record of [opening, text, call, failure]) whole.pushLine(JSON.stringify(record));
+  assert.deepEqual(resumed.read(), whole.read());
+  const file = writeTranscript([opening, text, call, failure]);
+  const usage = createClaudeUsageLineReducer();
+  for (const record of [opening, text, call, failure]) usage.pushLine(JSON.stringify(record));
+  assert.equal(readSessionMeta(file).outcome?.finished, false);
+  assert.equal(usage.newestTurnOutcome()?.finished, false);
+});
+
+test('a task notice during the wait raises the end, and model work after it resumes the turn until the next call', () => {
+  const notice = {
+    type: 'user',
+    uuid: 'notice',
+    timestamp: at(50),
+    origin: { kind: 'task-notification' },
+    message: {
+      role: 'user',
+      content:
+        '<task-notification><task-id>t</task-id><tool-use-id>x</tool-use-id><status>completed</status></task-notification>',
+    },
+  };
+  const work = assistantText('More work.', 60, undefined, undefined, 'tool_use');
+  const records = [
+    wakeTyped('watch', 0),
+    ...claudeWakeupCall('call-a', 'Waiting.', at(10), at(11)),
+    notice,
+    work,
+    ...claudeWakeupCall('call-b', 'Done with the check.', at(70), at(71)),
+  ];
+  const read = (part: unknown[]) => readSession(writeTranscript(part as object[]), 'sess').turns[0];
+  const afterNotice = read(records.slice(0, 5));
+  assert.equal(afterNotice.finished, true);
+  assert.equal(afterNotice.endedAt, ms(50));
+  assert.equal(read(records.slice(0, 6)).finished, false);
+  const final = read(records);
+  assert.equal(final.finished, true);
+  assert.equal(final.endedAt, ms(70));
+  assert.equal(final.summary, 'Done with the check.');
+  const otherReaders = (part: unknown[]) => {
+    const usage = createClaudeUsageLineReducer();
+    for (const record of part) usage.pushLine(JSON.stringify(record));
+    return [readSessionMeta(writeTranscript(part as object[])).outcome, usage.newestTurnOutcome()].map((outcome) => [
+      outcome?.finished,
+      outcome?.endedAt,
+    ]);
+  };
+  const both = (finished: boolean, endedAt: number) => [
+    [finished, endedAt],
+    [finished, endedAt],
+  ];
+  assert.deepEqual(otherReaders(records.slice(0, 5)), both(true, ms(50)));
+  assert.deepEqual(otherReaders(records.slice(0, 6)), both(false, ms(60)));
+  assert.deepEqual(otherReaders(records), both(true, ms(70)));
+});
+
+test('a reply to a repeat notice during the wait stays out of the headline when a wakeup call closes it', () => {
+  const [turn] = readSession(
+    writeTranscript([
+      wakeTyped('watch the subagent', 0),
+      peerHandback(HANDBACK_FROM, 5),
+      ...claudeWakeupCall('call-a', 'The report is in.', at(10), at(11)),
+      completionNotice(HANDBACK_FROM, 50),
+      ...claudeWakeupCall('call-b', 'Already handled.', at(60), at(61)),
+    ]),
+    'sess',
+  ).turns;
+  assert.equal(toCard(turn, true, ms(100)).summary, 'The report is in.');
+  assert.deepEqual(
+    turn.answers.map((answer) => [answer.text, answer.notResponse]),
+    [
+      ['The report is in.', undefined],
+      ['Already handled.', 'repeat-notice'],
+    ],
+  );
+});
+
+test('a failed wakeup call leaves its handback unanswered and counts as work before a later notice', () => {
+  const closing = 'Closing note.';
+  const summaryOf = (records: object[]) => readSession(writeTranscript(records), 'sess').turns[0].summary;
+  const unanswered = summaryOf([
+    wakeTyped('watch the subagent', 0),
+    assistantAnswer('Started the subagent.', 2),
+    peerHandback(HANDBACK_FROM, 3),
+    ...claudeWakeupCall('call-a', 'The call fails.', at(4), at(5), true),
+    completionNotice(HANDBACK_FROM, 6),
+    assistantAnswer(closing, 7),
+  ]);
+  assert.equal(unanswered, closing);
+  const worked = summaryOf([
+    wakeTyped('watch the subagent', 0),
+    peerHandback(HANDBACK_FROM, 3),
+    assistantAnswer('The report is in.', 4),
+    ...claudeWakeupCall('call-a', 'The call fails.', at(5), at(6), true),
+    completionNotice(HANDBACK_FROM, 7),
+    assistantAnswer(closing, 8),
+  ]);
+  assert.equal(worked, closing);
+});
+
+test('an unanswered wake stays out of the next typed prompt and a held prompt stays out of the wake', () => {
+  const unanswered = readSession(
+    writeTranscript([claudeLoopWake('Loop tick', at(0), 'lone'), wakeTyped('a question', 5)]),
+    'sess',
+  ).turns;
+  assert.deepEqual(
+    unanswered.map((turn) => [turn.origin, turn.prompt]),
+    [
+      ['scheduled', 'Loop tick'],
+      [undefined, 'a question'],
+    ],
+  );
+  const held = readSession(
+    writeTranscript([
+      wakeTyped('no reply yet', 0),
+      claudeLoopWake('Loop tick', at(5), 'after-held'),
+      ...claudeWakeupCall('tick', 'Ticked.', at(6), at(7)),
+    ]),
+    'sess',
+  ).turns;
+  assert.deepEqual(
+    held.map((turn) => [turn.origin, turn.prompt, turn.startedAt]),
+    [
+      [undefined, 'no reply yet', ms(0)],
+      ['scheduled', 'Loop tick', ms(5)],
+    ],
+  );
+});
+
+test('a dispatched turn ended by a wakeup call reads finished with its text as the final response', () => {
+  const file = writeTranscript([wakeTyped('do it', 0), ...claudeWakeupCall('d', 'All set.', at(4), at(5))]);
+  const turn = readSession(file, 'sess', { dispatchResponse: true }).turns[0];
+  assert.equal(turn.finished, true);
+  assert.deepEqual(turn.finalResponse, { text: 'All set.', sourceId: 'd-message' });
+});
+
+test('a wakeup call with no text before it finishes the turn with no response', () => {
+  const turn = readSession(
+    writeTranscript([wakeTyped('wait', 0), ...claudeWakeupCall('silent', null, at(4), at(5))]),
+    'sess',
+  ).turns[0];
+  assert.equal(turn.finished, true);
+  assert.equal(turn.summary, '');
+  assert.deepEqual(turn.answers, []);
+});
+
+test('only the loop wake marker opens a scheduled turn', () => {
+  for (const extra of [{}, { turnOrigin: 'scheduled' }]) {
+    const turns = readSession(
+      writeTranscript([
+        wakeTyped('open', 0),
+        {
+          type: 'user',
+          uuid: 'meta',
+          timestamp: at(5),
+          isMeta: true,
+          message: { role: 'user', content: 'note' },
+          ...extra,
+        },
+      ]),
+      'sess',
+    ).turns;
+    assert.equal(turns.length, 1);
+    assert.equal(turns[0].origin, undefined);
+  }
+  const sidechain = { ...claudeLoopWake('Loop tick', at(5), 'side'), isSidechain: true };
+  assert.equal(readSession(writeTranscript([wakeTyped('open', 0), sidechain]), 'sess').turns.length, 1);
+});
+
+test('scheduled turns leave ownership and agent-run filing as the same session without them', () => {
+  // A background session is filed as an agent run only with exactly one prompt, so a wake read as a prompt changes the filing.
+  const records: Record<string, unknown>[] = [...claudeWakeupSequence(at), assistantAnswer('All done.', 1020)].map(
+    (record) => ({
+      ...record,
+      sessionKind: 'bg',
+    }),
+  );
+  const without = records.filter((record) => record.wakeupSource !== 'loop_wakeup');
+  const verdict = (part: object[]) => {
+    const file = writeTranscript(part);
+    const size = fs.statSync(file).size;
+    return agentRunOfScan(scanForAgentRun(file, size), size);
+  };
+  assert.equal(verdict(without), true);
+  assert.equal(verdict(records), true);
+  assert.equal(readSessionMeta(writeTranscript(records)).title, readSessionMeta(writeTranscript(without)).title);
 });

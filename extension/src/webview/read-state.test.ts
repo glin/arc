@@ -317,3 +317,37 @@ test('session read state uses its newest timestamp and preserves neighbours', ()
   state.setSession('s', false);
   assert.equal(state.isRead(cards[1]), false);
 });
+
+test('a scheduled turn reads as read and cannot be marked', () => {
+  const scheduled: ReadCard = { ...card('s:20', 's', 20), origin: 'scheduled' };
+  const state = createReadState({
+    initial: {},
+    open: new Set(),
+    cards: () => [scheduled],
+    newestTurnAt: () => 20,
+    save: () => {},
+    refreshSelection: () => {},
+  });
+  assert.equal(state.isRead(scheduled), true);
+  assert.equal(state.canMark(scheduled), false);
+});
+
+test('a session marked unread beside a scheduled card lets the reader open a turn again', () => {
+  const reader = card('s:10');
+  const scheduled: ReadCard = { ...card('s:20', 's', 20), origin: 'scheduled' };
+  const state = createReadState({
+    initial: {},
+    open: new Set(),
+    cards: () => [reader, scheduled],
+    newestTurnAt: () => 20,
+    save: () => {},
+    refreshSelection: () => {},
+    operate: (operation) => state.admit(operation.id, true),
+  });
+  state.synchronize({ revision: 1, read: [], readTo: { s: 20 }, since: 0, agentRead: [] });
+  state.setSession('s', false);
+  state.synchronize({ revision: 2, read: [], readTo: { s: 0 }, since: 0, agentRead: [] });
+  assert.equal(state.isRead(reader), false);
+  assert.equal(state.mark(reader.key), true);
+  state.dispose();
+});

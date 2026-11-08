@@ -5990,7 +5990,7 @@ function turnStartsIn(lines: string[], agentPath: string | null): number[] {
 
 export function readCodexTurnStarts(file: string, bytes = TURN_START_BYTES): TurnStarts {
   const agentPath = readCodexSessionMeta(file)?.agentPath ?? null;
-  return readTurnStartsFromTail(file, (lines) => turnStartsIn(lines, agentPath), bytes);
+  return readTurnStartsFromTail(file, (lines) => ({ starts: turnStartsIn(lines, agentPath) }), bytes);
 }
 
 export interface CodexReadOptions extends ReadOptions {

@@ -1477,6 +1477,19 @@ test('derived cache rejects malformed bounded starts and folded labels', () => {
   assert.equal(loadClaudeCache(file).titles.size, 0);
 });
 
+test('derived cache keeps a saved list of scheduled starts and rejects a malformed one', () => {
+  const file = path.join(folder(), 'cache.json');
+  const starts = { starts: [10, 20], whole: true, scheduled: [20] };
+  saveClaudeCache(file, [['/session.jsonl', { ...title, starts }]]);
+  assert.deepEqual(loadClaudeCache(file).titles.get('/session.jsonl')?.starts, starts);
+  const saved = fs.readFileSync(file, 'utf8');
+  assert.ok(saved.includes('"scheduled":[20]'));
+  for (const scheduled of ['5', '["later"]']) {
+    fs.writeFileSync(file, saved.replace('"scheduled":[20]', `"scheduled":${scheduled}`));
+    assert.equal(loadClaudeCache(file).titles.size, 0);
+  }
+});
+
 test('derived cache round trips request pricing bands', () => {
   const file = path.join(folder(), 'cache.json');
   const counts = {

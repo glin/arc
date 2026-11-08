@@ -315,6 +315,7 @@ export function exportTurn(value: ExportTurn, agent: 'claude' | 'codex', session
     startedAt: value.startedAt,
     endedAt: value.endedAt,
     prompt,
+    ...(opening.some((block) => block.origin === 'scheduled') ? { origin: 'scheduled' as const } : {}),
     summary,
     answers: answers.map((block) => ({
       text: block.text,

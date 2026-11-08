@@ -93,7 +93,7 @@ export function newCounts(
   const readSet = new Set(read);
   const out = new Map<string, NewCount>();
   for (const [id, count] of newBySession(parsed, readSet, readTo, since, agentRead)) {
-    const session = parsed.filter((turn) => turn.sessionId === id && turn.kind === 'turn');
+    const session = readerTurns(parsed, id);
     const acknowledged = session.some(
       (turn) => turn.promptId !== undefined && agentRead.get(turn.key) === turn.promptId,
     );
@@ -105,13 +105,17 @@ export function newCounts(
     if (!window.starts.length) {
       continue;
     }
-    const starts = window.starts.map((startedAt) => ({
-      key: turnKey({ sessionId: id, startedAt }),
-      sessionId: id,
-      startedAt,
-      kind: 'turn',
-    }));
-    const mapped = mappedWindows.get(id);
+    // Scheduled starts are removed before counting. A read turn hides older unread ones, and these are never read.
+    const scheduled = new Set(window.scheduled);
+    const starts = window.starts
+      .filter((startedAt) => !scheduled.has(startedAt))
+      .map((startedAt) => ({
+        key: turnKey({ sessionId: id, startedAt }),
+        sessionId: id,
+        startedAt,
+        kind: 'turn',
+      }));
+    const mapped = mappedWindows.get(id)?.filter((turn) => !scheduled.has(turn.startedAt));
     const mappedByKey = new Map(mapped?.map((turn) => [turn.key, turn]));
     const promptIds = new Set(mapped?.map((turn) => turn.promptId));
     const mappedComplete =
@@ -130,7 +134,7 @@ export function newCounts(
           other.promptId.length > 0
         );
       });
-    const session = parsed.filter((turn) => turn.sessionId === id && turn.kind === 'turn');
+    const session = readerTurns(parsed, id);
     if (
       out.has(id) &&
       !session.some((turn) => turn.promptId !== undefined && agentRead.get(turn.key) === turn.promptId)
@@ -155,6 +159,10 @@ export function newCounts(
     out.set(id, { count, atLeast: !window.whole && !anyRead });
   }
   return out;
+}
+
+function readerTurns<T extends ReadableTurn & { kind: string }>(parsed: readonly T[], sessionId: string): T[] {
+  return parsed.filter((turn) => turn.sessionId === sessionId && turn.kind === 'turn' && turn.origin !== 'scheduled');
 }
 
 // Returns newest known turn starts from parsed sessions and fallback windows.

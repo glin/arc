@@ -6,7 +6,7 @@
 
 `view/comments.ts` defines stored parts and comment fields. `turncomments.ts` owns normalization and limits.
 
-Card parts identify the opening prompt, later prompts, summary, answer blocks, and agent messages during the turn. Message parts use message ids. Renaming stored parts requires compatibility with existing workspace comments. The opening-input heading before the response is not a part and never shifts stored response offsets. Comments on the `You asked` or `Assigned task` heading after the response use summary. Moving the input before the response draws those comments on the corresponding input. Without a first prompt, they draw on the first ask and unfold the asks. Quotes matching summary or answer text draw there instead of on the heading. Without a first prompt, the first ask becomes the prompt block and stores its comments under prompt.
+Card parts identify the opening prompt, later prompts, summary, answer blocks, and agent messages during the turn. Message parts use message ids. Renaming stored parts requires compatibility with existing workspace comments. The opening-input heading before the response is not a part and never shifts stored response offsets. Comments on the `You asked`, `Assigned task`, or `Scheduled wake` heading after the response use summary. Moving the input before the response draws those comments on the corresponding input. Without a first prompt, they draw on the first ask and unfold the asks. Quotes matching summary or answer text draw there instead of on the heading. Without a first prompt, the first ask becomes the prompt block and stores its comments under prompt.
 
 Shared panel state keeps comments through repaints, hidden panels, and restored tabs.
 

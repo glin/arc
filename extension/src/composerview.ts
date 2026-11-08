@@ -2990,6 +2990,15 @@ export function promptHistory(
   return kept;
 }
 
+// Adds what the reader said in one turn to held recall. A scheduled wake's opening text is not the reader's words.
+export function recallPromptsOf(
+  held: readonly string[],
+  turn: Pick<Turn, 'prompt' | 'startedAt' | 'promptParts' | 'laterPrompts' | 'origin'>,
+): string[] {
+  const opening = turn.origin === 'scheduled' ? [] : (turn.promptParts ?? [{ text: turn.prompt, at: turn.startedAt }]);
+  return promptsAcross(held, opening, turn.laterPrompts);
+}
+
 // Add a turn's prompts to recorded history until the limit is reached. Exclude oversized, blank, and repeated cleaned prompts.
 export function promptsAcross(
   held: readonly string[],

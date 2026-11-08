@@ -231,7 +231,7 @@ export function createReadState(options: ReadStateOptions): ReadStateOwner {
         if (
           readTo.get(id) === 0 &&
           ![...read].some((key) => key.startsWith(`${id}:`)) &&
-          !options.cards().some((card) => card.sessionId === id && owner.isRead(card))
+          !options.cards().some((card) => card.sessionId === id && card.origin !== 'scheduled' && owner.isRead(card))
         )
           pendingUnreadSessions.delete(id);
       }
@@ -249,7 +249,7 @@ export function createReadState(options: ReadStateOptions): ReadStateOwner {
       };
     },
     isRead(card) {
-      return isTurnRead(card, read, readTo, since, agentRead);
+      return card.origin === 'scheduled' || isTurnRead(card, read, readTo, since, agentRead);
     },
     canMark(card) {
       return canMarkRead(card);

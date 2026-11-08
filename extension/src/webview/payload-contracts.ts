@@ -68,6 +68,7 @@ export interface CardView extends Record<string, unknown> {
   prompt: string;
   delegation: string;
   promptHeading: string;
+  origin?: 'scheduled';
   promptNotice: string;
   summary: string;
   summaryHtml?: string;

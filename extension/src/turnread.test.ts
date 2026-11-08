@@ -1,6 +1,9 @@
 // Turn read state and session unread counts. Cross-module wording checks live in turnview.test.ts.
 
 import { test } from 'vitest';
+import { newestTurnStarts } from './turnread.ts';
+import { readSession, readSessionTurnStarts } from './transcript.ts';
+import { claudeLoopWake, claudeWakeupSequence } from './turnfixtures.ts';
 import assert from 'node:assert';
 import * as fs from 'node:fs';
 import { tempDir } from './temproot.ts';
@@ -384,4 +387,82 @@ test('a session nobody parsed still says how much is new in it', () => {
     count: 1,
     atLeast: false,
   });
+});
+
+const wakeupAt = (second: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, second)).toISOString();
+const wakeupMs = (second: number) => Date.parse(wakeupAt(second));
+
+function wakeupFile(records: object[]): string {
+  const file = path.join(tempDir('wakeup-read-'), 'sess.jsonl');
+  fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+  return file;
+}
+
+test('a scheduled turn is never unread, the mark stays with the reader turn, and the watermark passes the wake', () => {
+  const file = wakeupFile(claudeWakeupSequence(wakeupAt));
+  const starts = readSessionTurnStarts(file);
+  const windows = new Map([['sess', starts]]);
+  const readerKey = turnKey({ sessionId: 'sess', startedAt: wakeupMs(0) });
+  assert.deepEqual(newCounts([], windows, [], new Map()).get('sess'), { count: 1, atLeast: false });
+  assert.deepEqual(newCounts([], windows, [readerKey], new Map()).get('sess'), { count: 0, atLeast: false });
+  assert.equal(newestTurnStarts([], windows).get('sess'), wakeupMs(1000));
+  // A complete mapped window keeps working with a scheduled turn present.
+  const turns = readSession(file, 'sess').turns;
+  const mapped = turns.map((turn) => ({
+    key: turnKey(turn),
+    sessionId: 'sess',
+    startedAt: turn.startedAt,
+    promptId: turn.promptId,
+    kind: 'turn',
+    finished: true,
+  }));
+  assert.deepEqual(
+    newCounts([], windows, [], new Map(), 0, new Map([[readerKey, 'typed']]), new Map([['sess', mapped]])).get('sess'),
+    { count: 0, atLeast: false },
+  );
+  // The parsed path agrees with the scan.
+  const parsed = turns.map((turn) => ({
+    key: turnKey(turn),
+    sessionId: 'sess',
+    startedAt: turn.startedAt,
+    kind: 'turn',
+    origin: turn.origin,
+  }));
+  assert.deepEqual(newCounts(parsed, new Map(), [], new Map()).get('sess'), { count: 1, atLeast: false });
+  // A stale read mark on a scheduled turn does not hide the older reader turn.
+  const scheduledKey = turnKey({ sessionId: 'sess', startedAt: wakeupMs(1000) });
+  assert.deepEqual(newCounts(parsed, new Map(), [scheduledKey], new Map()).get('sess'), { count: 1, atLeast: false });
+});
+
+test('a partial read that holds only scheduled starts widens to the unread reader turn behind them', () => {
+  const opening = {
+    type: 'user',
+    uuid: 'typed',
+    promptId: 'typed',
+    timestamp: wakeupAt(0),
+    message: { role: 'user', content: 'read me' },
+  };
+  const records = [
+    opening,
+    claudeLoopWake('Loop tick one', wakeupAt(100), 'wake-1'),
+    claudeLoopWake('Loop tick two', wakeupAt(200), 'wake-2'),
+  ];
+  const file = wakeupFile(records);
+  // A line past the repeated-record map reads as repeated, so a whole read first covers the file.
+  readSessionTurnStarts(file);
+  // The first window holds the whole newest wake line and a cut piece of the line before it.
+  const bytes = JSON.stringify(records[2]).length + 10;
+  const widened = readSessionTurnStarts(file, bytes);
+  assert.deepEqual(widened, {
+    starts: [wakeupMs(0), wakeupMs(100), wakeupMs(200)],
+    scheduled: [wakeupMs(100), wakeupMs(200)],
+    whole: true,
+  });
+  assert.equal(newCounts([], new Map([['sess', widened]]), [], new Map()).get('sess')?.count, 1);
+  assert.equal(newestTurnStarts([], new Map([['sess', widened]])).get('sess'), wakeupMs(200));
+});
+
+test('a window of only scheduled starts counts nothing and is not a known zero', () => {
+  const windows = new Map([['sess', { starts: [10, 20], scheduled: [10, 20], whole: false }]]);
+  assert.deepEqual(newCounts([], windows, [], new Map()).get('sess'), { count: 0, atLeast: true });
 });

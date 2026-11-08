@@ -743,3 +743,15 @@ test('content prefix matching reads hidden catalog identities and suspends incom
     ['other'],
   );
 });
+
+test('a hit on a scheduled wake reads as scheduled and a hit on the reader words in that turn reads as theirs', () => {
+  const wake = turn({
+    prompt: 'Loop tick',
+    origin: 'scheduled',
+    laterPrompts: [{ text: 'change the plan', at: 5, stepsBefore: 0 }],
+  });
+  const entries = [entry({ prompt: searchablePrompt(wake), scheduledPrompt: wake.prompt })];
+  assert.equal(searchTurns(entries, 'find: tick')[0].where, 'scheduled');
+  assert.equal(searchTurns(entries, 'find: plan')[0].where, 'prompt');
+  assert.ok(!searchablePrompt(wake).includes('Loop tick'));
+});

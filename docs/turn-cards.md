@@ -18,6 +18,8 @@ Card layouts and chip popovers share `DetailRowList` in [`webview/card-rows.ts`]
 
 `PromptLead`, `PromptSection`, and `PromptBlock` in [`webview/card.ts`](../extension/src/webview/card.ts) own prompt disclosures. Preserve their comment anchors when changing placement.
 
+A [scheduled turn](glossary.md) replaces the `You asked` heading with `Scheduled wake`. A running scheduled turn headlines `Still working.` instead of the wake text. It is never unread and cannot be marked read, because a scheduled wake opens it and the reader's own turns carry the unread state.
+
 [Card sources](timeline.md#card-sources) owns live activity reconciliation. [Snapshots and diffs](snapshots.md#diff-selection) owns file evidence. Do not infer missing state from a figure's absence or an incomplete child record.
 
 ## Activity

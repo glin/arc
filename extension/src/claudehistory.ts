@@ -282,7 +282,7 @@ function titleRank(source: RecordedTitleSource | undefined): number {
 
 function claudeParserKey(opts: ReadOptions): string {
   return JSON.stringify({
-    version: 15,
+    version: 16,
     recoveredModelAttachment: opts.recoveredModelAttachment ?? null,
     tailBytes: opts.tailBytes ?? DEFAULT_TAIL_BYTES,
     maxTurns: opts.maxTurns ?? 40,

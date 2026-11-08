@@ -1,6 +1,8 @@
 // Turn-card tests keep local builders here. Shared builders live in turnfixtures.ts, and cross-module tests live in turnview.test.ts.
 
 import { test, vi } from 'vitest';
+import { formatDuration } from './view/time.ts';
+import { claudeWakeupSequence } from './turnfixtures.ts';
 import { ChildCacheExpiryAttribution } from './childcacheexpiry.ts';
 import { turnKey } from './domain/read.ts';
 import {
@@ -8899,7 +8901,7 @@ test("every field a card carries is either compared or the clock's, and none is 
   // Turn and compaction payload fields belong to exactly one content or time list.
 
   const turnPayload = {
-    ...toCard(turn({ summary: 'Ran `npm test` and it passed.' }), true, NOW),
+    ...toCard(turn({ summary: 'Ran `npm test` and it passed.', origin: 'scheduled' }), true, NOW),
     summaryHtml: '<p>s</p>',
     at: 1,
     dispatched: [],
@@ -14018,4 +14020,41 @@ test('own speed uncertainty includes children and excludes other usage scopes', 
     outputTokens: 0,
   };
   assert.equal(notes(), true);
+});
+
+test('a turn ended by a wakeup call shows its text and its own run time, and the wake opens a scheduled card', () => {
+  const at = (second: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, second)).toISOString();
+  const records = claudeWakeupSequence(at);
+  const file = path.join(tempDir('wakeup-card-'), 'sess.jsonl');
+  fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+  const whole = readSession(file, 'sess');
+  const stepwise = createClaudeSessionReducer('sess');
+  const wake = records.findIndex((record) => record.wakeupSource === 'loop_wakeup');
+  for (const record of records.slice(0, wake)) stepwise.pushLine(JSON.stringify(record));
+  const resumed = createClaudeSessionReducer('sess', {}, stepwise.snapshot());
+  for (const record of records.slice(wake)) resumed.pushLine(JSON.stringify(record));
+  const all = createClaudeSessionReducer('sess');
+  for (const record of records) all.pushLine(JSON.stringify(record));
+  assert.deepEqual(resumed.read(), all.read());
+  for (const read of [whole, resumed.read()]) {
+    const [first, second] = read.turns.map((turn, index) => toCard(turn, index === read.turns.length - 1, NOW));
+    assert.equal(read.turns.length, 2);
+    assert.equal(first.headline, 'Yes, restart now.');
+    assert.equal(first.status, 'done');
+    assert.equal(first.duration, formatDuration(10_000));
+    assert.equal(first.promptHeading, 'You asked');
+    assert.ok(!JSON.stringify(first.activity).includes('running'), 'the wakeup call settled at the call');
+    assert.equal(second.promptHeading, 'Scheduled wake');
+    assert.equal(second.origin, 'scheduled');
+    assert.equal(second.headline, 'Still waiting.');
+    assert.equal(second.duration, formatDuration(10_000));
+  }
+});
+
+test('a running scheduled turn headlines the stock working text, not the wake text', () => {
+  assert.equal(
+    headlineFor({ summary: '', error: null, prompt: 'Loop tick', origin: 'scheduled' }, 'running'),
+    'Still working.',
+  );
+  assert.equal(headlineFor({ summary: '', error: null, prompt: 'Loop tick' }, 'running'), 'Loop tick');
 });

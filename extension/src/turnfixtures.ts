@@ -2187,3 +2187,74 @@ export async function clockWriter(
     return result as number[];
   };
 }
+
+// The records of one turn ending in a `ScheduleWakeup` call: the text block and the call share
+// one message id, on separate lines, and a result line follows. Pass `null` for no text block.
+export function claudeWakeupCall(
+  id: string,
+  text: string | null,
+  callAt: string,
+  resultAt: string,
+  failed = false,
+): Record<string, unknown>[] {
+  const line = (index: number, content: object) => ({
+    type: 'assistant',
+    uuid: `${id}-line-${index}`,
+    timestamp: callAt,
+    message: {
+      id: `${id}-message`,
+      role: 'assistant',
+      model: 'claude-opus-5',
+      stop_reason: 'tool_use',
+      content: [content],
+    },
+  });
+  return [
+    ...(text === null ? [] : [line(0, { type: 'text', text })]),
+    line(1, { type: 'tool_use', id, name: 'ScheduleWakeup', input: { delaySeconds: 60, reason: 'waiting' } }),
+    {
+      type: 'user',
+      uuid: `${id}-result`,
+      timestamp: resultAt,
+      message: {
+        role: 'user',
+        content: [
+          { type: 'tool_result', tool_use_id: id, content: 'Scheduled.', ...(failed ? { is_error: true } : {}) },
+        ],
+      },
+      toolUseResult: failed ? 'Error: no scheduler' : { scheduledFor: 1, clampedDelaySeconds: 60, wasClamped: false },
+    },
+  ];
+}
+
+// The user-role record Claude Code writes when a `ScheduleWakeup` timer fires.
+export function claudeLoopWake(text: string, at: string, uuid: string): Record<string, unknown> {
+  return {
+    type: 'user',
+    uuid,
+    promptId: `prompt-${uuid}`,
+    timestamp: at,
+    isMeta: true,
+    promptSource: 'system',
+    wakeupSource: 'loop_wakeup',
+    turnOrigin: 'scheduled',
+    turnPosition: { promptIndex: 1, turnIndex: 0 },
+    message: { role: 'user', content: text },
+  };
+}
+
+// The reported sequence: a typed prompt, a turn ended by a wakeup call, the idle wait, then a wake and a tick that ends the same way.
+export function claudeWakeupSequence(at: (second: number) => string): Record<string, unknown>[] {
+  return [
+    {
+      type: 'user',
+      uuid: 'typed',
+      promptId: 'typed',
+      timestamp: at(0),
+      message: { role: 'user', content: 'can we restart now' },
+    },
+    ...claudeWakeupCall('call-1', 'Yes, restart now.', at(10), at(11)),
+    claudeLoopWake('Loop tick', at(1000), 'wake-1'),
+    ...claudeWakeupCall('call-2', 'Still waiting.', at(1010), at(1011)),
+  ];
+}

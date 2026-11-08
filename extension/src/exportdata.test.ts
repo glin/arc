@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { claudeLoopWake, claudeWakeupCall, claudeWakeupSequence, NOW } from './turnfixtures.ts';
 import { withReadMetrics, type ReadMetrics } from './readmeter';
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
@@ -1971,5 +1972,41 @@ test('old dispatched exports explain missing own speed despite known billing tie
     } finally {
       await writer.dispose();
     }
+  }
+});
+
+test('two scheduled turns on one page export apart and their opening prompts carry the scheduled label', async () => {
+  const f = fixture();
+  const records = [
+    ...claudeWakeupSequence(at),
+    claudeLoopWake('Loop tick two', at(2000), 'wake-2'),
+    ...claudeWakeupCall('call-3', 'Ticked again.', at(2010), at(2011)),
+  ];
+  const file = f.claudeSession('looped', records);
+  const writer = await ExportTransaction.create(f.output);
+  try {
+    const stat = fs.statSync(file);
+    const captured = await captureSessionExport(
+      { ...f.options, root: { agent: 'claude', file, sessionId: 'looped', size: stat.size, mtimeMs: stat.mtimeMs } },
+      writer,
+    );
+    const pages = await Promise.all(captured.model.sessions[0].pages.map((key) => writer.readSpool<ExportPage>(key)));
+    const turns = pages.flatMap((page) => page.turns);
+    const scheduled = turns.filter((value) => value.blocks.some((block) => block.origin === 'scheduled'));
+    assert.deepEqual(scheduled.map((value) => value.blocks.find((block) => block.kind === 'prompt')?.text).sort(), [
+      'Loop tick',
+      'Loop tick two',
+    ]);
+    const asked = turns.find((value) => !value.blocks.some((block) => block.origin === 'scheduled'))!;
+    assert.deepEqual(
+      asked.blocks.map((block) => block.kind),
+      ['prompt', 'answer'],
+    );
+    assert.deepEqual(
+      scheduled.map((value) => toCard(exportTurn(value, 'claude', 'looped'), false, NOW).promptHeading),
+      ['Scheduled wake', 'Scheduled wake'],
+    );
+  } finally {
+    await writer.dispose();
   }
 });

@@ -404,7 +404,7 @@ import {
   queuedSubmission,
   promptHistory,
   sentAfter,
-  promptsAcross,
+  recallPromptsOf,
   prunedSentPrompts,
   sentPromptsToSave,
   commentsForQueuedSubmission,
@@ -16396,14 +16396,7 @@ export class PanelProvider implements vscode.Disposable {
       if (!this.newestBySession.has(t.sessionId)) {
         this.newestBySession.set(t.sessionId, t);
       }
-      this.promptsBySession.set(
-        t.sessionId,
-        promptsAcross(
-          this.promptsBySession.get(t.sessionId) ?? [],
-          t.promptParts ?? [{ text: t.prompt, at: t.startedAt }],
-          t.laterPrompts,
-        ),
-      );
+      this.promptsBySession.set(t.sessionId, recallPromptsOf(this.promptsBySession.get(t.sessionId) ?? [], t));
     }
     // Prune recorded submissions from persisted recall. Keep the in-memory submitted text for this provider's remaining lifetime.
     // The in-memory book keeps recorded prompts, so compare the pruned book with the stored book. A book whose save is in flight
@@ -16840,6 +16833,7 @@ export class PanelProvider implements vscode.Disposable {
         startedAt: turn.startedAt,
         // Include initial and later prompts, plus earlier and final responses, in searchable text.
         prompt: searchablePrompt(turn),
+        ...(turn.origin === 'scheduled' ? { scheduledPrompt: turn.prompt } : {}),
         summary: searchableSummary(turn),
         // Report whether this search read reached the transcript's beginning, independently of retained timeline pages.
         whole: read.readBytes >= session.size,

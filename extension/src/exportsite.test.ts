@@ -2031,3 +2031,29 @@ test('dispatched cost notes use own tiers when a descendant has the largest mode
     }
   }
 });
+
+test('an exported scheduled turn keeps the scheduled heading', async () => {
+  const folder = tempDir('scheduled-export-');
+  const writer = await ExportTransaction.create(folder);
+  try {
+    const model = await sessionSiteFixture(writer);
+    const session = model.sessions[0];
+    const scheduled = projectTurn(
+      turn({ startedAt: 1, endedAt: 2, prompt: 'Loop tick', origin: 'scheduled' }),
+      'wake',
+      {},
+      [],
+      session.key,
+      new Map(),
+    );
+    session.pages = [await writer.spool({ key: 'page', session: session.key, turns: [scheduled], compactions: [] })];
+    await projectSessionSite(model, writer, { script: '', stylesheet: '' });
+    const { manifest, data } = exportedSiteData((await writer.publish(async () => {})).directory);
+    const card = manifest.sessions[0].pages[0]
+      .cards!.map((entry) => (data.get(entry.id) as { card: CardView }).card)
+      .find((value) => value.key === 'wake');
+    assert.equal(card?.promptHeading, 'Scheduled wake');
+  } finally {
+    await writer.dispose();
+  }
+});

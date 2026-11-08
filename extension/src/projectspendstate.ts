@@ -72,6 +72,7 @@ const CLAUDE_STATE_KEYS = {
   currentTurnQueued: true,
   currentTurnQueuedBefore: true,
   currentTurnToolEnded: true,
+  currentTurnWakeup: true,
   currentTurnOutcome: true,
   requestEvents: true,
   modelProfile: true,
@@ -534,6 +535,13 @@ function claudeState(value: unknown, retain = RETAINED_REQUESTS): value is Claud
         timestamp(value.currentTurnQueuedBefore.endedAt))
     ) ||
     !(value.currentTurnToolEnded === undefined || typeof value.currentTurnToolEnded === 'boolean') ||
+    !(
+      value.currentTurnWakeup === undefined ||
+      value.currentTurnWakeup === null ||
+      (record(value.currentTurnWakeup) &&
+        typeof value.currentTurnWakeup.id === 'string' &&
+        typeof value.currentTurnWakeup.finished === 'boolean')
+    ) ||
     !(value.currentTurnOutcome === null || turnOutcome(value.currentTurnOutcome))
   ) {
     return false;

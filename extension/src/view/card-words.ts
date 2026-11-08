@@ -123,6 +123,8 @@ export const CARD_ACTIONS = {
     sessionPart: 'in the part of this session that search reads',
   },
   searchPrompt: 'you asked',
+  // A search hit in a scheduled wake's text, which the reader did not type.
+  searchScheduled: 'scheduled wake',
   searchSummary: 'it answered',
   // Archiving keeps the session data and moves its presentation to the Archived section.
   hideSession: 'Archive this session',

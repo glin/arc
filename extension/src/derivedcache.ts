@@ -566,7 +566,7 @@ export type MetadataGenerations = Readonly<Record<AgentKind, number>>;
 // The initial metadata budget, `INITIAL_RAIL_READ_BYTES`, spreads large workspace rebuilds across refreshes.
 // Targeted invalidation avoids a full rebuild when affected entries are identifiable at load.
 // Codex opening rows use `CODEX_META_VERSION` from codexopenings.ts and survive these generation changes.
-export const METADATA_GENERATIONS: MetadataGenerations = { claude: 73, codex: 73 };
+export const METADATA_GENERATIONS: MetadataGenerations = { claude: 74, codex: 73 };
 
 // The agent generations that each shared `metadataVersion` of `derived-session-cache-v1.json` matches.
 // Each pair names the agent generation of the stored facts.
@@ -767,7 +767,13 @@ function outcome(value: unknown): value is TurnOutcome | null {
 }
 
 function turnStarts(value: unknown): value is TurnStarts {
-  return record(value) && Array.isArray(value.starts) && value.starts.every(finite) && typeof value.whole === 'boolean';
+  return (
+    record(value) &&
+    Array.isArray(value.starts) &&
+    value.starts.every(finite) &&
+    typeof value.whole === 'boolean' &&
+    (value.scheduled === undefined || (Array.isArray(value.scheduled) && value.scheduled.every(finite)))
+  );
 }
 
 function nonNegative(value: unknown): value is number {

@@ -56,13 +56,13 @@
   },
   "extension/src/codex.test.ts": {
     "reason": "Real Git worktree ownership and descendant source resolution must agree with recorded Codex session relationships. Terra provider coverage adds in-process request fixtures without additional subprocesses. Compressed rollout names use filesystem fixtures without additional subprocesses. Compaction ownership and retention fixtures use in-process reducers and existing source fixtures. Source reads must retain distinct own tiers despite descendant tiers, incomplete billing, and repeated requests. A qualified opening read must count once, and a failed open or a refused identity must count nothing, on transcripts and rollouts. The opening cache must count a read only for a file that it reads, and never for a held opening, a refused wait or an unchanged size.",
-    "cases": 507,
-    "matricesSha256": "efba9d149d8311b2811b1bad66664e83eb749821bca2f2fdd3bdf641dd9cae6b"
+    "cases": 508,
+    "matricesSha256": "3c532cb89314d8674507f8ff5b6a85c78ec99d9652d85c7a6071cbcd651c0d3a"
   },
   "extension/src/derivedcache.test.ts": {
     "reason": "Independent writers and host death must preserve shared cache rows and release stale filesystem locks. Terra generation recovery adds in-process provider fixtures without additional writers. Agent generation migration reads a previous cache file beside the current file and keeps the previous file for rollback. Task completion checks use in-process fixtures to preserve task identities and reject saved child closures. Saved discovery links must survive a restart, and a malformed or oversized set must not. Dispatched facts must retain own tier identities through saved cache restoration. Saved prompt scans must survive a restart only at the current rules version and within their limit. The found scan of an answered prompt must be saved, and the rules version must move with the source of the prompt rules.",
-    "cases": 99,
-    "matricesSha256": "a724b0a77f1ba4cce9a1c90dc3a5bee2fc22171bb9fe016c6361180c8883e432"
+    "cases": 100,
+    "matricesSha256": "f269f2d00cb2b5fa04c1bc2b7e13704cc8560d37b30e1f0e9664859ed2dd16b1"
   },
   "extension/src/exportsite.browser.test.ts": {
     "reason": "An offline exported session must retain interactive navigation and safe local browser behavior.",
@@ -71,8 +71,8 @@
   },
   "extension/src/exportsite.test.ts": {
     "reason": "The production export bundle must retain complete responses and remove host-only actions from portable output. Preparatory compaction pagination uses the existing export bundle. Static cost figures must preserve captured model names and speed identities. Dispatched cost notes use the source's own tiers and retain unknown own evidence across models.",
-    "cases": 42,
-    "matricesSha256": "2d05df1ed6d8461013ca5cb6f32fde3e3f84262e21f33a103fcf4a7eeca59701"
+    "cases": 43,
+    "matricesSha256": "40b2b518dddc97167c01f34dd1d92e9b99b029fe1a0becb44c36dc1263b8c8c4"
   },
   "extension/src/gitcommits.test.ts": {
     "reason": "A real fast-forward must retain its reflog details. Verified foreign child commits must retain their repository across cache reload and worktree removal. A removed commit directory must open only in a containing repository that holds the commit.",

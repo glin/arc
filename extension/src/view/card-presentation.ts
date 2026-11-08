@@ -37,6 +37,7 @@ export const CARD_CONTENT_FIELDS: readonly string[] = [
   'promptId',
   'delegation',
   'promptHeading',
+  'origin',
   'promptNotice',
   'summary',
   'summaryHtml',

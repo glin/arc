@@ -14,7 +14,9 @@ Keep each call's `ordinal` and each message's `stepsBefore` position when trimmi
 
 ### Claude turn boundaries
 
-A tool-use response does not close a Claude turn. A result marked `toolEndsTurn: true` closes it, including a `SubagentHandback` result. Preserve that result through line filters, including child tails without a prompt. Later model work or a coordinator or peer message resumes the turn. A later stop reason closes it again.
+A tool-use response does not close a Claude turn, unless it calls `ScheduleWakeup`. A result marked `toolEndsTurn: true` closes it, including a `SubagentHandback` result. Preserve that result through line filters, including child tails without a prompt. Later model work or a coordinator or peer message resumes the turn. A later stop reason closes it again.
+
+A `ScheduleWakeup` call closes a Claude turn at the call, and the text blocks of its message become the response. A failed result for that call reopens the turn and returns the text to commentary. A meta user record with `wakeupSource: loop_wakeup` opens a new turn. Arc files that turn as scheduled. A task notice during the wait raises the end time and leaves the turn finished. Later model work or a coordinator or peer message resumes the turn. The turn's duration then includes the wait. The next wakeup call closes it again.
 
 A plain `/compact` command closes without a turn when its manual boundary records finite positive input and summary sizes. The boundary's clock must equal or follow the command's clock and belong to the main chain. Model work after that boundary makes the command a turn again. Queued prompts remain independently reviewable, and the preceding turn keeps its outcome.
 
@@ -64,7 +66,7 @@ Classify vendor records from structured fields before returning the shared model
 
 ### Messages and handbacks
 
-Narration and clear reasoning summaries are ordered Activity messages, separate from tool steps. Claude contributes assistant text stopped for tool use. Codex contributes commentary-phase messages and clear reasoning summaries. Final answers remain responses.
+Narration and clear reasoning summaries are ordered Activity messages, separate from tool steps. Claude contributes assistant text stopped for tool use, except the text before a `ScheduleWakeup` call, which supplies the response as `SubagentHandback.message` does. Codex contributes commentary-phase messages and clear reasoning summaries. Final answers remain responses.
 
 `recordUpdate` in [`codex.ts`](../extension/src/codex.ts) joins commentary envelopes while retaining the first row's position and clock.
 

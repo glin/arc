@@ -205,7 +205,7 @@ export interface SearchHit {
   sessionTitle: string;
   agent: string;
   when: string;
-  where: 'prompt' | 'summary';
+  where: 'prompt' | 'scheduled' | 'summary';
   snippet: string;
   ranges?: readonly (readonly [number, number])[];
 }

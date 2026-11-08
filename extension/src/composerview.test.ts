@@ -1,4 +1,5 @@
 import { pickedEffort } from './agenthost';
+import { recallPromptsOf } from './composerview.ts';
 import {
   modelPicks,
   modelAfterPick,
@@ -9437,4 +9438,18 @@ test('a failed speed save leaves a sibling write in place and publishes no speed
   assert.equal(sessionSettings(store.read(), 'sibling').permissionMode, 'plan');
   assert.equal(sessionSettings(saves.at(-1)!, 'target').serviceTier, undefined);
   assert.equal(sessionSettings(saves.at(-1)!, 'sibling').permissionMode, 'plan');
+});
+
+test('prompt recall after a scheduled turn returns what the reader typed and never the wake text', () => {
+  assert.deepEqual(
+    recallPromptsOf([], {
+      prompt: 'Loop tick',
+      startedAt: 1,
+      promptParts: [{ text: 'Loop tick', at: 1, stepsBefore: 0 }],
+      laterPrompts: [{ text: 'also check the docs', at: 2, stepsBefore: 0 }],
+      origin: 'scheduled',
+    }),
+    ['also check the docs'],
+  );
+  assert.deepEqual(recallPromptsOf([], { prompt: 'a typed ask', startedAt: 1, laterPrompts: [] }), ['a typed ask']);
 });

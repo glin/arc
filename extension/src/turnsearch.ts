@@ -49,9 +49,11 @@ export function searchableSummary(turn: Pick<Turn, 'answers' | 'summary'>): stri
   return texts.join('\n\n');
 }
 
-// Joins the first prompt and later prompts for search.
-export function searchablePrompt(turn: Pick<Turn, 'prompt' | 'laterPrompts'>): string {
-  return [turn.prompt, ...turn.laterPrompts.map((a) => a.text)].filter(Boolean).join('\n\n');
+// Joins the first prompt and later prompts for search. A scheduled wake's text is indexed apart, in `SearchEntry.scheduledPrompt`.
+export function searchablePrompt(turn: Pick<Turn, 'prompt' | 'laterPrompts' | 'origin'>): string {
+  return [turn.origin === 'scheduled' ? '' : turn.prompt, ...turn.laterPrompts.map((a) => a.text)]
+    .filter(Boolean)
+    .join('\n\n');
 }
 
 // Matches session text, labels, archived state, and agent-run state against a search entry.
@@ -84,6 +86,8 @@ export interface SearchEntry {
   agent: string;
   startedAt: number;
   prompt: string;
+  // The text of a scheduled wake. A hit here is reported apart from words the reader typed.
+  scheduledPrompt?: string;
   summary: string;
   // Whether the search read reached the transcript's beginning.
   // Search reads its own window, separate from the ordinary tail and loaded history pages. Describe incomplete results as scoped, not session-wide.
@@ -104,7 +108,7 @@ export interface SearchHit {
   agent: string;
   startedAt: number;
   when: string; // Host-formatted turn time.
-  where: 'prompt' | 'summary';
+  where: 'prompt' | 'scheduled' | 'summary';
   snippet: string; // The line containing the query match.
   // Character positions of each searched word within the snippet. The panel marks these ranges without duplicating the matching rule.
   ranges: [number, number][];
@@ -217,8 +221,12 @@ export function searchTurns(
     ? entries.filter((e) => searchableTerms.every((t) => termHolds(t, e)))
     : entries;
   for (const entry of narrowed) {
-    for (const half of halves) {
-      const text = half === 'prompt' ? entry.prompt : entry.summary;
+    // A scheduled wake's text searches with the prompt half and reports its own place.
+    const places = halves.flatMap((half): SearchHit['where'][] =>
+      half === 'prompt' ? ['prompt', 'scheduled'] : ['summary'],
+    );
+    for (const place of places) {
+      const text = place === 'prompt' ? entry.prompt : place === 'scheduled' ? entry.scheduledPrompt : entry.summary;
       if (!text) {
         continue;
       }
@@ -237,7 +245,7 @@ export function searchTurns(
         agent: entry.agent,
         startedAt: entry.startedAt,
         when: formatWhen(entry.startedAt, now),
-        where: half,
+        where: place,
         snippet,
         ranges: snippetRanges(snippet, find),
       });

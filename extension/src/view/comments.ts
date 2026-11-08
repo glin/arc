@@ -191,7 +191,7 @@ function matchIn(flat: readonly string[], want: string, contains: boolean, offse
 
 // The headings over opening input. After the response one is drawn text, and a comment on it
 // is stored under `summary`.
-export const PROMPT_HEADINGS = ['You asked', 'Assigned task'] as const;
+export const PROMPT_HEADINGS = ['You asked', 'Scheduled wake', 'Assigned task'] as const;
 
 // Whether a stored quote reads as words of the prompt heading.
 export function quotesPromptHeading(quote: string): boolean {

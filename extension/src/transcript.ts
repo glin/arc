@@ -768,6 +768,9 @@ export function presentedStepDetail(name: string, input: Record<string, unknown>
   };
 }
 
+// Who opened a turn, when it was not the reader.
+export type TurnOrigin = 'scheduled';
+
 export interface Turn {
   agent: AgentKind;
   sessionId: string;
@@ -784,6 +787,8 @@ export interface Turn {
   endedAt: number; // epoch ms of the last assistant activity in the turn
   processEndedAt?: number; // epoch ms when the Claude process invocation ended
   prompt: string; // what the user typed, with IDE and command wrappers stripped
+  // Present only on a turn a scheduled wake opened. The prompt then holds the wake's text, not words the reader typed.
+  origin?: TurnOrigin;
   delegation?: TurnDelegation;
   // Original prompt submissions in time order, retained separately when unanswered prompts join a successor turn.
   // Prompt recall returns one submission at a time. Timestamps order these submissions against `laterPrompts`.
@@ -1511,13 +1516,19 @@ export const TURN_START_MAX_BYTES = 16 * 1024 * 1024;
 export interface TurnStarts {
   starts: number[];
   whole: boolean;
+  // The members of `starts` that a scheduled wake opened. Absent when there are none.
+  scheduled?: number[];
 }
 
-// Widens one tail read until it finds a turn start or reaches the ceiling.
+// The starts one window of lines holds, before the read knows whether it reached byte zero.
+export type FoundTurnStarts = Pick<TurnStarts, 'starts' | 'scheduled'>;
+
+// Widens one tail read until it finds a turn the reader opened or reaches the ceiling.
+// A scheduled start cannot be unread, so a window holding only those keeps widening.
 // Only reaching byte zero makes the returned count complete.
 export function readTurnStartsFromTail(
   file: string,
-  startsIn: (lines: string[]) => number[],
+  startsIn: (lines: string[]) => FoundTurnStarts,
   bytes = TURN_START_BYTES,
   // Set for a Claude transcript, whose repeated records the window skips.
   claude = false,
@@ -1552,15 +1563,9 @@ export function readTurnStartsFromTail(
       // The scanners reject partial JSON records.
       const split = body.toString('utf8').split('\n');
       const lines = claude ? blankClaudeRepeated(file, split, start, size, size - start) : split;
-      const starts = startsIn(lines);
-      if (starts.length) {
-        return { starts, whole: start === 0 };
-      }
-      if (start === 0) {
-        return { starts: [], whole: true };
-      }
-      if (targetBytes >= maxBytes) {
-        return { starts: [], whole: false };
+      const found = startsIn(lines);
+      if (found.starts.length > (found.scheduled?.length ?? 0) || start === 0 || targetBytes >= maxBytes) {
+        return { ...found, whole: start === 0 };
       }
 
       targetBytes = Math.min(size, maxBytes, targetBytes * 2);
@@ -1633,8 +1638,9 @@ function advancePromptPair(
 // to it, or a manual compaction boundary for `/compact`, withdraws its start. Model work restores
 // the start only after a compaction. A prompt the reader queues before or after that answer starts
 // a turn of its own in the command's place.
-function sessionTurnStartsIn(lines: string[], childTranscript = false): number[] {
+function sessionTurnStartsIn(lines: string[], childTranscript = false): FoundTurnStarts {
   const starts: number[] = [];
+  const scheduled: number[] = [];
   let command:
     | (ClaudePromptPair & {
         index: number;
@@ -1655,7 +1661,14 @@ function sessionTurnStartsIn(lines: string[], childTranscript = false): number[]
     try {
       const o = JSON.parse(line) as Record<string, unknown>;
       if (!o || typeof o !== 'object' || (o.isSidechain && !childTranscript)) continue;
-      if (o.type === 'user' && isTypedPrompt(o, childTranscript)) {
+      if (o.type === 'user' && isClaudeLoopWake(o, childTranscript)) {
+        // A wake is not a command, so no local answer can withdraw it.
+        command = null;
+        const at = Date.parse(String(o.timestamp));
+        if (!Number.isFinite(at)) continue;
+        starts.push(at);
+        scheduled.push(at);
+      } else if (o.type === 'user' && isTypedPrompt(o, childTranscript)) {
         command = null;
         const at = Date.parse(String(o.timestamp));
         if (!Number.isFinite(at)) continue;
@@ -1679,7 +1692,7 @@ function sessionTurnStartsIn(lines: string[], childTranscript = false): number[]
       /* a partial line has no turn start */
     }
   }
-  return starts;
+  return scheduled.length ? { starts, scheduled } : { starts };
 }
 
 // Complete-line cursor and confirmed human evidence. Pending and withdrawn pairs resume on append.
@@ -3227,6 +3240,35 @@ function claudeWakeOrigin(origin: unknown): ClaudeWakeOrigin | null {
     : null;
 }
 
+// The call id of a `ScheduleWakeup` call in an assistant record, empty when the call has no id.
+// Null when the record holds no such call. The harness allows no text after this call, so it ends the turn.
+function claudeWakeupCall(record: Record<string, unknown>): string | null {
+  const content = (record.message as { content?: unknown } | undefined)?.content;
+  if (!Array.isArray(content)) {
+    return null;
+  }
+  for (const b of content) {
+    const block = b as { type?: unknown; name?: unknown; id?: unknown } | null;
+    if (block?.type === 'tool_use' && block.name === 'ScheduleWakeup') {
+      return typeof block.id === 'string' ? block.id : '';
+    }
+  }
+  return null;
+}
+
+// Whether a user record holds a failed result for the named tool call.
+function failedToolResult(record: Record<string, unknown>, callId: string): boolean {
+  const content = (record.message as { content?: unknown } | undefined)?.content;
+  return (
+    callId !== '' &&
+    Array.isArray(content) &&
+    content.some((b) => {
+      const block = b as { type?: unknown; tool_use_id?: unknown; is_error?: unknown } | null;
+      return block?.type === 'tool_result' && block.tool_use_id === callId && block.is_error === true;
+    })
+  );
+}
+
 // True for a coordinator or peer message. The turn it wakes continues.
 function claudeWakeMessage(record: Record<string, unknown>): boolean {
   return record.type === 'user' && !!record.isMeta && claudeWakeOrigin(record.origin) !== null;
@@ -3456,6 +3498,8 @@ function outcomeIn(
   let queuedBeforeAnswer = null as { startedAt: number; endedAt: number } | null;
   // Whether a result that ends the turn finished the outcome. A wake or later model work resumes it.
   let toolEnded = false;
+  // The `ScheduleWakeup` call that finished the outcome. A failed result for it undoes the finish.
+  let wakeup = null as { id: string; finished: boolean } | null;
   let open: readonly string[] = [];
   let commands: readonly BackgroundCommand[] = [];
   const tasks = new Map<string, string>();
@@ -3492,7 +3536,8 @@ function outcomeIn(
       continue;
     }
     const type = o.type;
-    if (type === 'user' && isTypedPrompt(o, childTranscript)) {
+    const loopWake = type === 'user' && isClaudeLoopWake(o, childTranscript);
+    if (loopWake || (type === 'user' && isTypedPrompt(o, childTranscript))) {
       const startedAt = stamp(o.timestamp);
       previous = { outcome, modelAnswered };
       previousLocalStopAt = withdrawn && !queuedSinceAnswer ? localStopAt : undefined;
@@ -3501,8 +3546,10 @@ function outcomeIn(
       queuedBeforeAnswer = null;
       outcome = { finished: false, error: false, interrupted: false, endedAt: startedAt, startedAt };
       toolEnded = false;
-      command = claudeRecordId(o);
-      compact = claudeCompactPrompt(o);
+      wakeup = null;
+      // A wake is not a command, so no local answer can withdraw it.
+      command = loopWake ? null : claudeRecordId(o);
+      compact = loopWake ? false : claudeCompactPrompt(o);
       modelAnswered = false;
       continue;
     }
@@ -3642,6 +3689,11 @@ function outcomeIn(
         modelAnswered = true;
         continue;
       }
+      if (toolEnded && wakeup && failedToolResult(o, wakeup.id)) {
+        outcome.finished = wakeup.finished;
+        toolEnded = false;
+        wakeup = null;
+      }
       if (toolEnded && claudeWakeMessage(o)) {
         outcome.finished = false;
         outcome.endedAt = Math.max(outcome.endedAt, at);
@@ -3682,6 +3734,13 @@ function outcomeIn(
       toolEnded = false;
     } else if ((o.message as { stop_reason?: unknown } | undefined)?.stop_reason) {
       outcome.finished = finishedATurn(o);
+    }
+    // The stop rule reads the call's own `tool_use` stop as unfinished, so the call finishes the turn after it.
+    const wakeupCall = claudeWakeupCall(o);
+    if (wakeupCall !== null) {
+      wakeup = { id: wakeupCall, finished: outcome.finished };
+      outcome.finished = true;
+      toolEnded = true;
     }
   }
   if (outcome && open.length > 0) {
@@ -6612,6 +6671,15 @@ export function stripCompactPreamble(text: string): string {
   return text.replace(COMPACT_PREAMBLE, '').trim();
 }
 
+// True for the user record Claude Code writes when a `ScheduleWakeup` timer fires. It opens a
+// scheduled turn. `turnOrigin` alone does not qualify, because only this marker names the wake.
+// The record passes the typed-prompt guards for sidechains, compaction, and empty text.
+function isClaudeLoopWake(o: Record<string, unknown>, childTranscript = false): boolean {
+  return (
+    o.isMeta === true && o.wakeupSource === 'loop_wakeup' && isTypedPrompt({ ...o, isMeta: false }, childTranscript)
+  );
+}
+
 // The harness records a stop as a user message. It ends the turn's work but does not
 // begin a new one, so it must not be read as a prompt.
 const INTERRUPTED = /^\[Request interrupted by user/;
@@ -8348,6 +8416,9 @@ export interface ClaudeUsageReducerState {
   // Whether a result that ends the turn finished currentTurnOutcome. A wake or later model work
   // in the same turn resumes it. Absent or false otherwise.
   currentTurnToolEnded?: boolean;
+  // The `ScheduleWakeup` call that finished currentTurnOutcome, kept until the turn closes.
+  // A failed result for the same call restores `finished`. Absent or null otherwise.
+  currentTurnWakeup?: { id: string; finished: boolean } | null;
   // The index behind currentTurnOutcome.closedChildren. It is rebuilt once after a restore
   // and omitted from snapshots, like seenRequests above.
   closedChildIndex?: Map<string, number>;
@@ -8464,6 +8535,7 @@ function restoreClaudeTurn(state: ClaudeUsageReducerState, turn: ClaudePreviousT
   state.currentTurnQueued = false;
   state.currentTurnQueuedBefore = null;
   state.currentTurnToolEnded = false;
+  state.currentTurnWakeup = null;
 }
 
 // Anything that answers the current turn also means no local command answer can withdraw it.
@@ -8853,7 +8925,8 @@ function reduceClaudeTurnRecord(
     };
     return;
   }
-  if (record.type === 'user' && isTypedPrompt(record, childTranscript)) {
+  const loopWake = record.type === 'user' && isClaudeLoopWake(record, childTranscript);
+  if (loopWake || (record.type === 'user' && isTypedPrompt(record, childTranscript))) {
     const handedStop = state.currentTurnQueued ? undefined : state.currentTurnWithdrawn?.localStopAt;
     state.currentTurnPrevious = copyPreviousTurn(currentClaudeTurn(state));
     if (state.currentTurnPrevious && handedStop !== undefined) {
@@ -8864,6 +8937,7 @@ function reduceClaudeTurnRecord(
     state.currentTurnQueued = false;
     state.currentTurnQueuedBefore = null;
     state.currentTurnToolEnded = false;
+    state.currentTurnWakeup = null;
     if (state.openTurn && state.openTurnAnswered) {
       state.closedTurns++;
     }
@@ -8873,8 +8947,9 @@ function reduceClaudeTurnRecord(
     const at = stamp(record.timestamp);
     state.currentTurnStartedAt = at;
     state.currentTurnEndedAt = at;
-    state.currentTurnCommand = claudeRecordId(record);
-    state.currentTurnCompact = claudeCompactPrompt(record);
+    // A wake is not a command, so no local answer can withdraw it.
+    state.currentTurnCommand = loopWake ? null : claudeRecordId(record);
+    state.currentTurnCompact = loopWake ? false : claudeCompactPrompt(record);
     // A typed prompt does not close a background child, so its id moves to the new turn.
     const openChildren = state.currentTurnOutcome?.openChildren;
     const closedChildren = state.currentTurnOutcome?.closedChildren;
@@ -8999,6 +9074,16 @@ function reduceClaudeTurnRecord(
       }
       return;
     }
+    if (
+      state.currentTurnToolEnded &&
+      state.currentTurnWakeup &&
+      state.currentTurnOutcome &&
+      failedToolResult(record, state.currentTurnWakeup.id)
+    ) {
+      state.currentTurnOutcome.finished = state.currentTurnWakeup.finished;
+      state.currentTurnToolEnded = false;
+      state.currentTurnWakeup = null;
+    }
     if (state.currentTurnToolEnded && claudeWakeMessage(record) && state.currentTurnOutcome) {
       state.currentTurnOutcome.finished = false;
       state.currentTurnOutcome.endedAt = Math.max(state.currentTurnOutcome.endedAt, at);
@@ -9052,6 +9137,13 @@ function reduceClaudeTurnRecord(
     state.currentTurnToolEnded = false;
   } else if (message?.stop_reason && state.currentTurnOutcome) {
     state.currentTurnOutcome.finished = finishedATurn(record);
+  }
+  const wakeupCall = claudeWakeupCall(record);
+  if (wakeupCall !== null && state.currentTurnOutcome) {
+    // The stop rule reads the call's own `tool_use` stop as unfinished, so the call finishes the turn after it.
+    state.currentTurnWakeup = { id: wakeupCall, finished: state.currentTurnOutcome.finished };
+    state.currentTurnOutcome.finished = true;
+    state.currentTurnToolEnded = true;
   }
 }
 
@@ -9749,6 +9841,7 @@ export function createClaudeUsageLineReducer(
               ? { currentTurnQueuedBefore: { ...restored.currentTurnQueuedBefore } }
               : {}),
             ...(restored.currentTurnToolEnded ? { currentTurnToolEnded: true } : {}),
+            ...(restored.currentTurnWakeup ? { currentTurnWakeup: { ...restored.currentTurnWakeup } } : {}),
             taskEvidence: restored.taskEvidence ? structuredClone(restored.taskEvidence) : undefined,
             currentTurnOutcome: copyTurnOutcome(restored.currentTurnOutcome),
             // Only child reads retain request events for replacement. Parent reads discard repeated request keys.
@@ -9840,6 +9933,7 @@ export function createClaudeUsageLineReducer(
             ...(state.currentTurnQueued ? { currentTurnQueued: true } : {}),
             ...(state.currentTurnQueuedBefore ? { currentTurnQueuedBefore: { ...state.currentTurnQueuedBefore } } : {}),
             ...(state.currentTurnToolEnded ? { currentTurnToolEnded: true } : {}),
+            ...(state.currentTurnWakeup ? { currentTurnWakeup: { ...state.currentTurnWakeup } } : {}),
             taskEvidence: state.taskEvidence ? structuredClone(state.taskEvidence) : undefined,
             currentTurnOutcome: copyTurnOutcome(state.currentTurnOutcome),
             ...(state.requestEvents ? { requestEvents: { ...state.requestEvents } } : {}),
@@ -10443,7 +10537,12 @@ export function readSession(file: string, sessionId: string, opts: ReadOptions =
   if (!opts.turnsOnly) {
     withClaudeFirstRequest(file, read.compactions, opts.childTranscript === true);
   }
-  if (opts.prepareNewestTurnDiscovery && !tail.whole && tail.cursor && sessionTurnStartsIn(tail.lines).length === 0) {
+  if (
+    opts.prepareNewestTurnDiscovery &&
+    !tail.whole &&
+    tail.cursor &&
+    sessionTurnStartsIn(tail.lines).starts.length === 0
+  ) {
     read.newestTurnCursor = tail.cursor;
   }
   return read;
@@ -10594,6 +10693,8 @@ export interface ClaudeSessionParserState {
   // call. A hand-back compares its report with this reply only, or null when there is none.
   closingReply: number | null;
   repeatNotice: boolean;
+  // The message whose text line ended a repeat notice. A `ScheduleWakeup` call in that message closes the text under it.
+  repeatTextReply: string | null;
   repeatReplyId: string | null;
   workedSinceReply: boolean;
   toolOwnerById: Map<string, Turn | SourcedBuilding>;
@@ -10640,6 +10741,8 @@ export interface ClaudeSessionParserState {
   // Whether a result that ends the turn finished `cur`. A wake or later model work in the same
   // turn resumes it.
   curToolEnded: boolean;
+  // The `ScheduleWakeup` call that ended the current turn and the turn fields it replaced, until the turn closes.
+  curWakeup: ClaudeWakeupClose | null;
   queued: TurnAsk[];
   pending: { held: SourcedBuilding | null };
   suppliedTitle: string | null;
@@ -10714,6 +10817,7 @@ function emptyClaudeSessionParserState(opts: ReadOptions): ClaudeSessionParserSt
     handedBack: false,
     closingReply: null,
     repeatNotice: false,
+    repeatTextReply: null,
     repeatReplyId: null,
     workedSinceReply: false,
     toolOwnerById: new Map(),
@@ -10737,6 +10841,7 @@ function emptyClaudeSessionParserState(opts: ReadOptions): ClaudeSessionParserSt
     curCarried: null,
     curInferredStop: null,
     curToolEnded: false,
+    curWakeup: null,
     queued: [],
     pending: { held: null },
     suppliedTitle,
@@ -10747,6 +10852,18 @@ function emptyClaudeSessionParserState(opts: ReadOptions): ClaudeSessionParserSt
     titleAt: null,
     titleRecord: null,
   };
+}
+
+// What a `ScheduleWakeup` call replaced when it ended the turn. A failed result for the call restores it.
+interface ClaudeWakeupClose {
+  id: string;
+  finished: boolean;
+  summary: string;
+  answers: TurnAnswer[];
+  recordedAnswers: TurnAnswer[] | undefined;
+  finalResponse: Turn['finalResponse'];
+  closingReply: number | null;
+  commentary: { update: TurnUpdate; index: number }[];
 }
 
 function emitClaudeTurn(state: ClaudeSessionParserState, turn: SourcedBuilding, maxTurns: number): void {
@@ -11350,13 +11467,15 @@ function closeClaudeTurn(state: ClaudeSessionParserState, maxTurns: number): boo
     } else {
       state.pending.held = card;
     }
-  } else if (answered) {
+  } else if (answered || turn.origin === 'scheduled') {
+    // A wake with no reply is emitted as well, so its text never joins a later typed prompt.
     emitClaudeTurn(state, turn, maxTurns);
     state.pending.held = null;
     emitted = true;
   } else {
     state.pending.held = turn;
   }
+  state.curWakeup = null;
   state.cur = null;
   state.currentModelSource = null;
   state.awaited = [];
@@ -11844,7 +11963,8 @@ function reduceClaudeSessionLine(
     return;
   }
 
-  if (isUser && isTypedPrompt(o, opts.childTranscript)) {
+  const loopWake = isUser && isClaudeLoopWake(o, opts.childTranscript);
+  if (loopWake || (isUser && isTypedPrompt(o, opts.childTranscript))) {
     // A command the CLI answered by itself leaves no card. The next prompt takes over the turn
     // before that command, and the stop the answer inferred for it.
     const handing = state.curLocalAnswer && state.cur !== null && !claudeModelWorked(state.cur);
@@ -11854,6 +11974,12 @@ function reduceClaudeSessionLine(
     const handed = !emitted && state.pending.held === null;
     const previous = emitted ? (state.turnRanges.at(-1)?.start ?? null) : handed ? handedPrevious : null;
     const at = stamp(o.timestamp);
+    // A wake takes no words from the reader, so a held prompt gets a card of its own. Any later
+    // emission would otherwise clear it.
+    if (loopWake && state.pending.held) {
+      emitClaudeTurn(state, state.pending.held, maxTurns);
+      state.pending.held = null;
+    }
     // A held prompt got no reply of its own, so it belongs to this turn.
     const carried = state.pending.held;
     // Carry later prompts from the unanswered turn into its successor.
@@ -11865,8 +11991,9 @@ function reduceClaudeSessionLine(
       state.pending.held = null;
     }
     const rawText = textOf((o.message as { content?: unknown }).content);
+    // Queued words wait for the next prompt the reader sends, because a wake is not theirs.
     const asked = [
-      ...state.queued,
+      ...(loopWake ? [] : state.queued),
       { text: opts.captureSessionText ? extractPrompt(rawText, true) : cleanPrompt(rawText), at, stepsBefore: 0 },
     ];
     // `handbacks` stays for the whole session: a subagent's second completion notice can
@@ -11874,16 +12001,19 @@ function reduceClaudeSessionLine(
     setClaudeRepeatNotice(state, false);
     state.handedBack = false;
     state.closingReply = null;
-    state.queued = [];
+    if (!loopWake) state.queued = [];
     const next: SourcedBuilding = {
       agent: 'claude',
       sessionId,
       sessionTitle: opts.sessionTitle ?? null,
-      promptId: String(o.promptId || ''),
+      promptId: loopWake
+        ? `wake:${typeof o.uuid === 'string' && o.uuid ? o.uuid : `at-${at}`}`
+        : String(o.promptId || ''),
       startedAt: at,
       endedAt: at,
       prompt: asked.map((one) => one.text).join('\n\n'),
       promptParts: asked,
+      ...(loopWake ? { origin: 'scheduled' as const } : {}),
       summary: '',
       answers: [],
       model: null,
@@ -11915,7 +12045,8 @@ function reduceClaudeSessionLine(
     setSourceRange(next, carried?.[SOURCE_START] ?? sourceStart, sourceEnd);
     setMembershipStart(next, sourceStart);
     state.cur = next;
-    state.curCommand = o.isSidechain && rawText.trim() === '/compact' ? null : claudeRecordId(o);
+    // A wake is not a command, so no local answer can withdraw it.
+    state.curCommand = loopWake || (o.isSidechain && rawText.trim() === '/compact') ? null : claudeRecordId(o);
     state.curLocalAnswer = false;
     state.curCompacted = false;
     state.curPrevious = previous;
@@ -12045,6 +12176,9 @@ function reduceClaudeSessionLine(
             });
           }
           continue;
+        }
+        if (state.curToolEnded && state.curWakeup?.id === toolId) {
+          restoreClaudeWakeupTurn(state, cur, state.curWakeup);
         }
         withdrawClaudeSkillUse(state, toolId);
         failed = true;
@@ -12340,7 +12474,13 @@ function reduceClaudeSessionLine(
             state.toolOwnerById.delete(block.id);
             state.toolOwnerById.set(block.id, cur);
           }
-          state.awaited.push(step);
+          // The step settles at the call, because the wake closes the turn before any later content.
+          // The turn's completion is provisional until the call's result arrives. A failed result reopens the turn.
+          if (block.name === 'ScheduleWakeup') {
+            setTurnStepStatus(cur, step, 'done');
+          } else {
+            state.awaited.push(step);
+          }
           cur.stepKinds.push(block.name === 'Skill' ? SKILL_STEP_KIND : (TOOL_KIND[block.name] ?? 'other'));
           cur.steps.push(step);
           if (!opts.captureSessionText && cur.steps.length > TURN_STEP_LIMIT) {
@@ -12402,6 +12542,20 @@ function reduceClaudeSessionLine(
           state.launched.set(block.id, row);
           noteSubagentLaunch(state.subagents, block.id);
           cur.agents.push(row);
+        }
+        if (
+          block.name === 'ScheduleWakeup' &&
+          endClaudeTurnAtWakeup(
+            state,
+            cur,
+            block.id ?? '',
+            message.id || (typeof o.uuid === 'string' && o.uuid ? o.uuid : `at-${stamp(o.timestamp)}`),
+            replyId,
+            sourceStart,
+            opts,
+          )
+        ) {
+          closedReply = true;
         }
         // A nonempty SubagentHandback message supplies the response and marks subsequent replies as nonresponses until another prompt or message.
         // Compare only the latest eligible closing reply. Containing texts keep the longer answer, with the report winning ties.
@@ -12486,27 +12640,10 @@ function reduceClaudeSessionLine(
           cur.summary = text;
           responseBlocks.push(text);
         }
-        // A text block with a stop reason closes an answer. Ordinary later blocks replace an answer already closed by this line.
-        // A newly marked nonresponse preserves the preceding eligible response as a separate answer.
         if (closes) {
-          const answer: TurnAnswer = { text, at: stamp(o.timestamp), stepsBefore: cur.stepCount };
-          if (notResponse) {
-            answer.notResponse = notResponse;
-          }
-          const keepsLast =
-            opts.captureSessionText || (notResponse && !cur.answers[cur.answers.length - 1]?.notResponse);
-          if (answeredLine && !keepsLast) {
-            cur.answers[cur.answers.length - 1] = answer;
-          } else {
-            cur.answers.push(answer);
-          }
+          closeClaudeAnswer(state, cur, text, stamp(o.timestamp), cur.stepCount, notResponse, answeredLine, opts);
           answeredLine = true;
           closedReply = true;
-          if (notResponse) {
-            cur.summary = claudeResponseText(cur);
-          } else {
-            state.closingReply = cur.answers.length - 1;
-          }
         }
       }
     }
@@ -12569,6 +12706,9 @@ function reduceClaudeSessionLine(
     (Array.isArray(message.content) &&
       message.content.some((block) => (block as { type?: unknown } | null)?.type === 'tool_use'))
   ) {
+    if (state.repeatNotice && replyId !== null) {
+      state.repeatTextReply = replyId;
+    }
     setClaudeRepeatNotice(state, false);
     state.workedSinceReply = true;
   }
@@ -12709,6 +12849,116 @@ function claudeNotResponse(
     return 'no-response-requested';
   }
   return null;
+}
+
+// Closes one answer in `cur` from a text block. An ordinary later block replaces an answer already
+// closed by the same line. A newly marked nonresponse keeps the preceding eligible response as a
+// separate answer.
+function closeClaudeAnswer(
+  state: ClaudeSessionParserState,
+  cur: SourcedBuilding,
+  text: string,
+  at: number,
+  stepsBefore: number,
+  notResponse: TurnAnswer['notResponse'] | null,
+  answeredLine: boolean,
+  opts: ReadOptions,
+): void {
+  const answer: TurnAnswer = { text, at, stepsBefore };
+  if (notResponse) {
+    answer.notResponse = notResponse;
+  }
+  const keepsLast = opts.captureSessionText || (notResponse && !cur.answers[cur.answers.length - 1]?.notResponse);
+  if (answeredLine && !keepsLast) {
+    cur.answers[cur.answers.length - 1] = answer;
+  } else {
+    cur.answers.push(answer);
+  }
+  if (notResponse) {
+    cur.summary = claudeResponseText(cur);
+  } else {
+    state.closingReply = cur.answers.length - 1;
+  }
+}
+
+// Ends a turn at its `ScheduleWakeup` call. The harness allows no text after the call, so the
+// commentary blocks of the same message are the closing response. Each block keeps the place it
+// had before the call, and a failed result for the call undoes all of this. Returns whether the
+// text closed a reply, which applies the closed-reply rules of an ordinary closing message.
+function endClaudeTurnAtWakeup(
+  state: ClaudeSessionParserState,
+  cur: SourcedBuilding,
+  callId: string,
+  messageBase: string,
+  replyId: string | null,
+  sourceStart: number,
+  opts: ReadOptions,
+): boolean {
+  const prefix = `${messageBase}:text:`;
+  const commentary = cur.updates.flatMap((update, index) =>
+    update.kind === 'commentary' && update.sourceId.startsWith(prefix) ? [{ update, index }] : [],
+  );
+  state.curWakeup = {
+    id: callId,
+    finished: cur.finished,
+    summary: cur.summary,
+    answers: [...cur.answers],
+    recordedAnswers: cur.recordedAnswers && [...cur.recordedAnswers],
+    finalResponse: cur.finalResponse,
+    closingReply: state.closingReply,
+    commentary,
+  };
+  // The text line ended the notice before this call arrived, so the close reads it as that line saw it.
+  if (replyId !== null && state.repeatTextReply === replyId) {
+    state.repeatNotice = true;
+  }
+  const moved = new Set(commentary.map(({ update }) => update));
+  cur.updates = cur.updates.filter((update) => !moved.has(update));
+  const response: string[] = [];
+  let answeredLine = false;
+  for (const { update } of commentary) {
+    const notResponse = claudeNotResponse(state, cur, update.text);
+    if (opts.captureSessionText) {
+      (cur.recordedAnswers ??= []).push({
+        text: update.text,
+        at: update.at,
+        stepsBefore: update.stepsBefore,
+        sourceOrder: update.sourceOrder ?? sourceStart,
+        ...(notResponse ? { notResponse } : {}),
+      });
+    }
+    if (!notResponse) {
+      cur.summary = update.text;
+      response.push(update.text);
+    }
+    closeClaudeAnswer(state, cur, update.text, update.at, update.stepsBefore, notResponse, answeredLine, opts);
+    answeredLine = true;
+  }
+  if (opts.dispatchResponse && response.length) {
+    cur.finalResponse = { text: response.join('\n'), sourceId: replyId };
+  }
+  cur.finished = true;
+  state.curToolEnded = true;
+  return commentary.length > 0;
+}
+
+// Undoes `endClaudeTurnAtWakeup` after its call failed: the turn runs on, and the text is commentary again.
+function restoreClaudeWakeupTurn(state: ClaudeSessionParserState, cur: SourcedBuilding, held: ClaudeWakeupClose): void {
+  cur.finished = held.finished;
+  cur.summary = held.summary;
+  cur.answers = held.answers;
+  if (held.recordedAnswers) cur.recordedAnswers = held.recordedAnswers;
+  else delete cur.recordedAnswers;
+  if (held.finalResponse) cur.finalResponse = held.finalResponse;
+  else delete cur.finalResponse;
+  for (const { update, index } of held.commentary) {
+    cur.updates.splice(Math.min(index, cur.updates.length), 0, update);
+  }
+  state.closingReply = held.closingReply;
+  // A failed call is still the agent's own work, so no later notice repeats a handback this close answered.
+  state.workedSinceReply = true;
+  state.curToolEnded = false;
+  state.curWakeup = null;
 }
 
 // The text of the newest answer that is a response, or empty when the turn closed none.
@@ -12976,6 +13226,7 @@ export function createClaudeSessionReducer(
   state.handedBack ??= false;
   state.closingReply ??= null;
   state.repeatNotice ??= false;
+  state.repeatTextReply ??= null;
   state.repeatReplyId ??= null;
   state.workedSinceReply ??= false;
   state.curCommand ??= null;
@@ -12987,6 +13238,7 @@ export function createClaudeSessionReducer(
   state.curCarried ??= null;
   state.curInferredStop ??= null;
   state.curToolEnded ??= false;
+  state.curWakeup ??= null;
   // A reader that classifies its lines through the file's repeated-record map passes the
   // classifier. Otherwise the reducer skips a line whose identity matches a line it already read,
   // which is a repeated record wherever the window starts.

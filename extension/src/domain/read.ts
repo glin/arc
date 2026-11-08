@@ -5,6 +5,8 @@ export interface ReadableTurn {
   sessionId: string;
   startedAt: number;
   promptId?: string;
+  // A scheduled wake's turn is addressed to no reader, so it never reads as unread and is never marked.
+  origin?: 'scheduled';
 }
 
 export function turnKey(turn: { sessionId: string; startedAt: number }): string {
@@ -28,8 +30,8 @@ export function isTurnRead(
   return mark > 0 && card.startedAt <= mark;
 }
 
-export function canMarkRead(card: { kind: string; live?: boolean }): boolean {
-  return card.kind === 'turn' && !card.live;
+export function canMarkRead(card: { kind: string; live?: boolean; origin?: 'scheduled' }): boolean {
+  return card.kind === 'turn' && !card.live && card.origin !== 'scheduled';
 }
 
 // Counts unread turns newer than the latest read turn in each session.
@@ -45,7 +47,8 @@ export function newBySession(
   const newestRead = new Map<string, number>();
   // Use the same read rule when locating the latest read turn.
   for (const c of cards) {
-    if (c.kind !== 'turn' || !isTurnRead(c, readSet, readTo, since)) {
+    // A read turn hides older unread ones, so a scheduled turn never sets the boundary.
+    if (c.kind !== 'turn' || c.origin === 'scheduled' || !isTurnRead(c, readSet, readTo, since)) {
       continue;
     }
     const best = newestRead.get(c.sessionId);
@@ -61,7 +64,7 @@ export function newBySession(
     if (!counts.has(c.sessionId)) {
       counts.set(c.sessionId, 0);
     }
-    if (isTurnRead(c, readSet, readTo, since, agentRead)) {
+    if (c.origin === 'scheduled' || isTurnRead(c, readSet, readTo, since, agentRead)) {
       continue;
     }
     const boundary = newestRead.get(c.sessionId);

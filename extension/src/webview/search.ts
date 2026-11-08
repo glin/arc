@@ -17,6 +17,7 @@ interface SearchWords {
   searchWorking: string;
   searchWorkingScoped: string;
   searchPrompt: string;
+  searchScheduled: string;
   searchSummary: string;
 }
 
@@ -98,7 +99,15 @@ function Results({ hits, scope, press }: { hits: readonly SearchHit[]; scope: st
           ]),
           h('div', { class: 'resultmeta' }, [
             h('span', {}, hit.agent),
-            h('span', {}, hit.where === 'prompt' ? searchWords().searchPrompt : searchWords().searchSummary),
+            h(
+              'span',
+              {},
+              hit.where === 'prompt'
+                ? searchWords().searchPrompt
+                : hit.where === 'scheduled'
+                  ? searchWords().searchScheduled
+                  : searchWords().searchSummary,
+            ),
           ]),
           snippetLine(hit.snippet, hit.ranges ?? []),
         ],

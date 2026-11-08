@@ -529,6 +529,8 @@ export interface TurnCard {
   prompt: string;
   delegation: string;
   promptHeading: string;
+  // Present only on a turn a scheduled wake opened.
+  origin?: 'scheduled';
   promptNotice: string;
   summary: string;
   // Newest-first earlier answers, retained as indexes for comment anchors.
@@ -4507,7 +4509,7 @@ export function averageContextPerRequest(usage: Turn['usage']): number | null {
 // Selects a summary headline, error, running prompt, or stock ending text.
 // Callers share the readable rich-text summary and its selected headline source with inline headline rendering.
 export function headlineFor(
-  turn: Pick<Turn, 'summary' | 'error' | 'prompt'>,
+  turn: Pick<Turn, 'summary' | 'error' | 'prompt' | 'origin'>,
   status: TurnStatus,
   readableSummary: string = readableRichText(turn.summary),
   source: HeadlineSource | null = headlineSourceOf(readableSummary),
@@ -4521,7 +4523,7 @@ export function headlineFor(
   }
   // A running turn without a summary displays its prompt, or a stock working message.
   if (status === 'running') {
-    return turn.prompt.trim() ? firstLine(turn.prompt) : 'Still working.';
+    return turn.prompt.trim() && turn.origin !== 'scheduled' ? firstLine(turn.prompt) : 'Still working.';
   }
   if (status === 'interrupted') {
     return 'Stopped by you before it answered.';
@@ -5316,7 +5318,15 @@ export function toCard(
     ...(headlineHtml ? { headlineHtml } : {}),
     prompt: turn.prompt,
     delegation: turn.delegation?.text || '',
-    promptHeading: turn.prompt ? 'You asked' : turn.delegation ? 'Assigned task' : 'You asked',
+    promptHeading:
+      turn.origin === 'scheduled'
+        ? 'Scheduled wake'
+        : turn.prompt
+          ? 'You asked'
+          : turn.delegation
+            ? 'Assigned task'
+            : 'You asked',
+    ...(turn.origin ? { origin: turn.origin } : {}),
     promptNotice:
       !turn.prompt && turn.delegation && !turn.delegation.complete
         ? 'Full instructions unavailable in this session'

@@ -499,6 +499,11 @@ function blocksOf(turn: Turn, key: string): ExportBlock[] {
       return a.sourceOrder - b.sourceOrder || a.sequence - b.sequence;
     return a.at - b.at || a.sequence - b.sequence;
   });
+  if (turn.origin) {
+    for (const entry of entries) {
+      if (entry.kind === 'prompt' && entry.opening) entry.origin = turn.origin;
+    }
+  }
   return entries.map(({ sequence: _sequence, ...block }, index) => ({ key: `${key}-b${index + 1}`, ...block }));
 }
 
