@@ -6975,15 +6975,20 @@ export class PanelProvider implements vscode.Disposable {
       const blocked = check();
       if (blocked) return refuse(blocked);
       const idle = binding.idle();
+      // A slash command, and a Codex skill mention, keeps its native form only as a new turn, never as live input.
+      const waitsForTurn =
+        idle !== 'busy'
+          ? null
+          : isSlashPrompt(text)
+            ? 'A slash command waits for the current turn.'
+            : binding.agent === 'codex' && text.trimStart().startsWith('$')
+              ? 'A skill waits for the current turn.'
+              : null;
       const queueReason =
         waiting() ??
         (idle === null
           ? null
-          : idle === 'busy' && isSlashPrompt(text)
-            ? 'A slash command waits for the current turn.'
-            : binding.liveReason
-              ? binding.liveReason()
-              : 'The session cannot receive live input.');
+          : (waitsForTurn ?? (binding.liveReason ? binding.liveReason() : 'The session cannot receive live input.')));
       if (queueReason) {
         const queued = await this.queueAgentMessage(request, binding, true);
         return queued.status === 'queued' ? { ...queued, reason: `${queueReason} ${queued.reason}` } : queued;

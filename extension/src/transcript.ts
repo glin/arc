@@ -6118,7 +6118,8 @@ export function cleanPrompt(raw: string): string {
 
 // Applies the tag and whitespace rules of cleanPrompt to both sides of a launch comparison.
 // cleanPrompt keeps its own copy, because the saved prompt scan rules version covers its source.
-function tidyPrompt(text: string): string {
+// A test holds the two copies to the same output.
+export function tidyPrompt(text: string): string {
   return text
     .replace(/<\/?[a-z][a-z0-9-]{0,38}>/gi, ' ')
     .replace(/[^\S\n]+/g, ' ')

@@ -5474,6 +5474,7 @@ test('window starts adopt both providers and classifications without changing th
       };
       let save!: () => void;
       let calls = 0;
+      const deliveredPrompts: string[] = [];
       Object.assign(provider, {
         saved: normalizePanelState({
           showing: 'reader',
@@ -5513,9 +5514,10 @@ test('window starts adopt both providers and classifications without changing th
           messages.push({ type: 'initialName' });
         },
         onSendDraftPrompt: async (draft: NewSessionDraft, prompt: { text: string }) => {
-          calls++;
+          deliveredPrompts.push(prompt.text);
           assert.deepEqual(draft.profile, profile);
-          assert.equal(prompt.text, 'work');
+          if (prompt.text !== 'work') throw new Error('The fixture delivers only the work prompt.');
+          calls++;
           return { delivered: true, session: 'accepted', turnId: 7, reason: '' };
         },
       });
@@ -5571,12 +5573,12 @@ test('window starts adopt both providers and classifications without changing th
           provider.handleSessionRequest({ ...request, params: { ...request.params, prompt } }),
           /nonempty prompt/,
         );
-      // The launch reaches delivery, which this fixture's prompt assertion refuses. It does not count as a delivered start.
+      // A slash prompt passes the launch checks and reaches delivery, where the fixture refuses it.
       await assert.rejects(
         provider.handleSessionRequest({ ...request, params: { ...request.params, prompt: '/clear' } }),
-        /'\/clear' == 'work'/,
+        /delivers only the work prompt/,
       );
-      calls -= 1;
+      assert.deepEqual(deliveredPrompts, ['work', '/clear']);
       await assert.rejects(
         provider.handleSessionRequest({
           ...request,
@@ -5603,6 +5605,7 @@ test('window starts adopt both providers and classifications without changing th
       await refusedWith({ setupProject: null }, /not loaded this window's setups/);
       await refusedWith({ pendingModels: [agent] }, /still loading that provider's models\. Run arc setups/);
       assert.equal(calls, 1);
+      assert.deepEqual(deliveredPrompts, ['work', '/clear'], 'a refused launch never reaches delivery');
       assert.equal(
         messages.some((message) => message.type === 'labelsChanged'),
         true,

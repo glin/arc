@@ -1041,6 +1041,7 @@ import {
   headlineMarkdownOf,
   headlineOf,
   cleanPrompt,
+  tidyPrompt,
   launchPromptMatches,
   projectSlug,
   transcriptDirsFor,
@@ -7534,6 +7535,18 @@ test('cleanPrompt strips IDE context and slash-command scaffolding', () => {
     '/write-ppm-docs review the plugin pages',
     'the command and everything typed after it are cut out of the card',
   );
+});
+
+test('the launch comparison applies the tag and whitespace rules of cleanPrompt', () => {
+  for (const text of [
+    '  spaced \t out  ',
+    'one <b>two</b> three',
+    'a\n\n\nb',
+    '/ship <plan-file>x.md</plan-file>\r\n\r\n\r\n\r\nthen\t<c>go</c>',
+    'a\n \n\n\n\n b <1> </x-y-z> c\n\n',
+    '',
+  ])
+    assert.equal(tidyPrompt(text), cleanPrompt(text), JSON.stringify(text));
 });
 
 test('literal Claude capture removes known scaffolding and preserves admitted user text', () => {

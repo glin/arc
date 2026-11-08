@@ -50,7 +50,7 @@ export class HostedDispatch {
       nativeTurn: string | null,
     ) => SavedDispatchResponse | null,
   ) {}
-  register(launchId: string, child: DispatchChild, prompt: string | null = null): void {
+  register(launchId: string, child: DispatchChild, prompt: string | null): void {
     const launch = this.receipts.launch(launchId);
     if (this.assignments.has(launchId)) throw new Error('This dispatch launch already has a worker.');
     this.assignments.set(launchId, {

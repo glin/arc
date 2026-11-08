@@ -20468,7 +20468,7 @@ for (const agent of ['claude', 'codex'] as const) {
       /different request/,
     );
   });
-  test(`${agent} slash messages wait for the turn instead of reaching a working session as live input`, async () => {
+  test(`${agent} slash messages wait for the turn instead of reaching a working session as live input, and skill mentions ${agent === 'codex' ? 'wait too' : 'still reach it live'}`, async () => {
     const f = agentMessageHost(agent);
     const text = '/ship plan.md';
     const request = { ...f.request, params: { ...f.request.params, prompt: text, delivery: 'auto' as const } };
@@ -20480,6 +20480,25 @@ for (const agent of ['claude', 'codex'] as const) {
     f.setBusy(false);
     f.host.flushQueue('target');
     await vi.waitFor(() => assert.deepEqual(f.reads, [text]));
+    const skillHost = agentMessageHost(agent);
+    const mention = '  $ship plan.md';
+    const skillResult = await skillHost.host.sendAgentMessage(
+      { ...skillHost.request, params: { ...skillHost.request.params, prompt: mention, delivery: 'auto' as const } },
+      skillHost.binding(),
+    );
+    if (agent === 'codex') {
+      assert.equal(skillResult.status, 'queued');
+      assert.match(skillResult.reason, /^A skill waits for the current turn\. /);
+      assert.deepEqual(skillHost.reads, []);
+      assert.equal(skillHost.host.queues.target[0].text, mention);
+      skillHost.setBusy(false);
+      skillHost.host.flushQueue('target');
+      await vi.waitFor(() => assert.deepEqual(skillHost.reads, [mention]));
+    } else {
+      assert.equal(skillResult.status, 'accepted');
+      assert.equal(skillResult.delivery, 'live');
+      assert.deepEqual(skillHost.reads, [mention]);
+    }
   });
   test(`${agent} slash messages to a session that is not busy keep the live input reason`, async () => {
     const f = agentMessageHost(agent);

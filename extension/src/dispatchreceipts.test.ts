@@ -2393,7 +2393,7 @@ test('native failure, input requests and unknown process exit remain distinct', 
       dispatchRootActive: () => true,
       state: () => ({ sessionId: session, exited: mode === 'exit' }),
     };
-    host.register(launch.launchId, child);
+    host.register(launch.launchId, child, null);
     host.submitted(launch.launchId, 1);
     if (mode === 'failed') {
       host.observe(child, { kind: 'text', text: 'Failure', sourceId: 'response' }, 1);
@@ -2442,7 +2442,7 @@ test('wait deadline and disconnection retain the exact worker and receipt', asyn
   await vi.advanceTimersByTimeAsync(100);
   assert.equal(((await deadline) as { state: string }).state, 'deadline');
   assert.equal(receipts.launch(launch.launchId).launchId, launch.launchId);
-  assert.throws(() => host.register(launch.launchId, child));
+  assert.throws(() => host.register(launch.launchId, child, null));
 });
 test('retained launches continue admission after 256 unconsumed receipts', () => {
   const { receipts, launch } = fixture();

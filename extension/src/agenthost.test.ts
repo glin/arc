@@ -3129,7 +3129,7 @@ test.each(['none', 'later', 'expired', 'idle', 'failed'] as const)(
       const child = children[0];
       child.answerHandshake();
       const session = await opening;
-      dispatch.register(launch.launchId, session);
+      dispatch.register(launch.launchId, session, null);
       const first = await session.prompt('review', (id) => dispatch.submitted(launch.launchId, id));
       dispatch.accepted(launch.launchId, session.nativeTurnIdentity(first));
       child.say(

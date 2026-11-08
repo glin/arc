@@ -56,6 +56,27 @@ test('optional commands retain supplying child generations across idle catalogs,
   assert.equal(catalogs.childCommands(sources).second[0].path, '/two/SKILL.md');
 });
 
+test('a command list republished with only its built-in flag changed publishes again', () => {
+  const catalogs = new CommandCatalogs();
+  const entry = (builtin?: boolean): PromptEntry => ({ ...native, ...(builtin === undefined ? {} : { builtin }) });
+  catalogs.publish([], { agent: 'claude', commands: [entry()], complete: true });
+  assert.equal(catalogs.publish([], { agent: 'claude', commands: [entry()], complete: true }), null);
+  const flagged = catalogs.publish([], { agent: 'claude', commands: [entry(true)], complete: true });
+  assert.equal(flagged?.claude[0].builtin, true);
+  assert.equal(catalogs.publish([], { agent: 'claude', commands: [entry(true)], complete: true }), null);
+  assert.equal(
+    catalogs.publish([], { agent: 'claude', commands: [entry(false)], complete: true })?.claude[0].builtin,
+    false,
+  );
+  const supplied = (builtin?: boolean): PromptEntry => ({ ...entry(builtin), sessionSkillRelease: 'one' });
+  const sources = [{ agent: 'claude', key: 'one', usageSource: 1, sessionId: 'first', commands: [supplied()] }];
+  const publishSupplied = (builtin?: boolean) =>
+    catalogs.publish(sources, { ...sources[0], commands: [supplied(builtin)], complete: true });
+  publishSupplied();
+  assert.equal(publishSupplied(), null);
+  assert.notEqual(publishSupplied(true), null, 'a supplied command that gains the flag is a change');
+});
+
 test('a complete live command catalog wins over older sibling state and publishes once', () => {
   const catalogs = new CommandCatalogs();
   const sibling = { agent: 'codex', commands: [native, skill('old')] };
