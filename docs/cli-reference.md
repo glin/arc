@@ -162,7 +162,7 @@ Prompt files must be regular, nonempty, and at most 48 KiB. A slash command pass
 | Start `accepted` or `accepted-with-errors` | Launch accepted. Includes session ID, provider, requested setup, classification, attribution, `link`, and save errors. |
 | Curation `applied` | Metadata change accepted. Rejected saves produce errors. |
 | Curation `dry-run` | Admission checked without writes. |
-| `refused` | Request refused, with its reason. |
+| `refused` | Request refused, with its reason. A start that the window refuses before it delivers the prompt, such as while the provider's models load, returns `refused` and no worker started. A failure after delivery began prints an `arc:` error instead. |
 | `unknown` | Delivery is uncertain. Retain the request ID and original activation. |
 
 Start JSON includes additive `metadata.labels` and `metadata.pinned` results. Their `state` is `saved` only after persistence succeeds, otherwise `uncertain`. Labels include normalized `values`, and pin state includes `value`. Requested names include `metadata.name.requested` and a `state` of `pending`, `saved`, `failed`, `cancelled`, or `uncertain`. A known naming error also includes `error`. Durable pending naming permits `accepted`. Known metadata failure produces `accepted-with-errors`. Detailed session JSON exposes retained name state after ordinary catalog admission. Catalog visibility remains eventual. The start result supplies no catalog membership or observed model evidence.

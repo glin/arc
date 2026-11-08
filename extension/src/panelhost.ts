@@ -855,6 +855,17 @@ function scriptJson(value: unknown): string {
   return JSON.stringify(value).replace(/</g, '\\u003c');
 }
 
+// The reply to a launch that started no worker. The reason names why. A refusal before the dispatch receipt is reserved carries no launch ID. A dispatch that delivery refuses carries its launch ID.
+function launchRefusal(request: import('./sessionrequests').SessionRequest, reason: string, launchId?: string) {
+  return {
+    version: 1,
+    status: 'refused',
+    reason,
+    requester: request.requester,
+    ...(launchId ? { launchId } : {}),
+  };
+}
+
 function messageBytes(value: unknown): Uint8Array | null {
   if (value instanceof Uint8Array) {
     return value;
@@ -2819,40 +2830,49 @@ export class PanelProvider implements vscode.Disposable {
     }
     const folders = this.folders();
     const scope = this.repositoryScope.snapshot(folders);
-    if (this.disposed) throw new Error('This Arc window is closed. Run arc windows and select a live window.');
+    // A start that fails a check before delivery answers with the refused reply. A listing keeps the thrown error.
+    const refuse = (reason: string): unknown => {
+      if (request.method !== 'start') throw new Error(reason);
+      return launchRefusal(request, reason);
+    };
+    if (this.disposed) return refuse('This Arc window is closed. Run arc windows and select a live window.');
     if (!folders[0])
-      throw new Error('This Arc window has no folder open. Open a project folder in it, or select another window.');
-    if (!scope.ready) throw new Error("Arc is still loading this window's folders. Wait for it to finish and retry.");
-    if (!this.readyHosts.size)
-      throw new Error('The Arc panel is not open in this window. Open the Arc panel and retry.');
+      return refuse('This Arc window has no folder open. Open a project folder in it, or select another window.');
+    if (!scope.ready) return refuse("Arc is still loading this window's folders. Wait for it to finish and retry.");
+    if (!this.readyHosts.size) return refuse('The Arc panel is not open in this window. Open the Arc panel and retry.');
     if (!this.setupProject)
-      throw new Error("Arc has not loaded this window's setups yet. Wait for it to finish and retry.");
+      return refuse("Arc has not loaded this window's setups yet. Wait for it to finish and retry.");
     const { view } = this.launcherFor();
     if (request.method === 'setups') return setupListing(view, this.setupProject);
     const params = request.params;
     const text = params.prompt!;
-    if (!text.trim()) throw new Error('Supply a nonempty prompt.');
+    if (!text.trim()) return refuse('Supply a nonempty prompt.');
     const profile = launcherProfile(view, params.setup!);
     if (!profile)
-      throw new Error(
+      return refuse(
         'This window does not offer that setup. Run arc setups and choose a returned key or offered value.',
       );
     if (this.pendingModels.includes(profile.agent))
-      throw new Error("Arc is still loading that provider's models. Run arc setups until it lists them, then retry.");
-    if (!this.onSendDraftPrompt || !this.memento) throw new Error('Session delivery or saving is unavailable.');
-    const policy = launchPolicy(profile.agent, params.readOnly === true, params.readTools, profile.permissionMode);
+      return refuse("Arc is still loading that provider's models. Run arc setups until it lists them, then retry.");
+    if (!this.onSendDraftPrompt || !this.memento) return refuse('Session delivery or saving is unavailable.');
+    let policy: ReturnType<typeof launchPolicy>;
+    try {
+      policy = launchPolicy(profile.agent, params.readOnly === true, params.readTools, profile.permissionMode);
+    } catch (error) {
+      return refuse(error instanceof Error ? error.message : String(error));
+    }
     const tierRefusal = params.serviceTier === undefined ? null : serviceTierRefusal(params.serviceTier, profile.agent);
-    if (tierRefusal) throw new Error(tierRefusal);
+    if (tierRefusal) return refuse(tierRefusal);
     const lifetimeRefusal = params.cacheLifetime ? cacheLifetimeRefusal(params.cacheLifetime, profile.agent) : null;
-    if (lifetimeRefusal) throw new Error(lifetimeRefusal);
+    if (lifetimeRefusal) return refuse(lifetimeRefusal);
+    let cwd: string;
+    try {
+      cwd = scopedLaunchCwd(params.cwd, folders, scope.roots);
+    } catch (error) {
+      return refuse(error instanceof Error ? error.message : String(error));
+    }
     const draft = {
-      ...newSessionDraft(
-        `${DRAFT_SESSION_PREFIX}${crypto.randomUUID()}`,
-        scopedLaunchCwd(params.cwd, folders, scope.roots),
-        null,
-        Date.now(),
-        profile,
-      ),
+      ...newSessionDraft(`${DRAFT_SESSION_PREFIX}${crypto.randomUUID()}`, cwd, null, Date.now(), profile),
       policy,
       agentRun: params.agentRun,
       ...(params.cacheLifetime ? { cacheLifetime: params.cacheLifetime } : {}),
@@ -2860,18 +2880,11 @@ export class PanelProvider implements vscode.Disposable {
     };
     const start = guardedStartContext(request);
     if (params.dispatch) {
-      if (!this.onReserveDispatch) throw new Error('Dispatch receipt storage is unavailable.');
+      if (!this.onReserveDispatch) return refuse('Dispatch receipt storage is unavailable.');
       start.launchId = this.onReserveDispatch(request, draft);
     }
     const delivery = await this.onSendDraftPrompt(draft, { text, assets: [] }, undefined, start);
-    if (!delivery.delivered || !delivery.session)
-      return {
-        version: 1,
-        status: 'refused',
-        reason: delivery.reason,
-        requester: request.requester,
-        ...(start.launchId ? { launchId: start.launchId } : {}),
-      };
+    if (!delivery.delivered || !delivery.session) return launchRefusal(request, delivery.reason, start.launchId);
     const session = delivery.session;
     const errors: string[] = delivery.reason ? [delivery.reason] : [];
     const metadata: {

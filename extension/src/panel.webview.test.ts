@@ -5331,6 +5331,16 @@ test('window session reads leave reader state and live capabilities unchanged an
 });
 
 // These host cases catch reader-state loss and premature durable replies. They reuse the live-provider fixture without browser startup.
+// A launch refused before delivery answers with the refused reply, so the caller knows that no worker started.
+async function assertLaunchRefused(reply: Promise<unknown>, pattern: RegExp, requester: string | null = null) {
+  const result: any = await reply;
+  // The dispatch caller rejects a refusal that carries any other key.
+  assert.deepEqual(Object.keys(result).sort(), ['reason', 'requester', 'status', 'version']);
+  assert.equal(result.status, 'refused');
+  assert.match(result.reason, pattern);
+  assert.equal(result.requester, requester);
+}
+
 test('window setups advertise launchable keys and exact choices while unavailable and pending starts refuse', async () => {
   const provider: any = liveProviderFixture(livePress({ sessionId: 'reader', agent: 'claude' })).provider;
   const catalog = {
@@ -5402,7 +5412,7 @@ test('window setups advertise launchable keys and exact choices while unavailabl
     provider.handleSessionRequest({ method: 'start', requester: null, params: { prompt: 'review', setup } });
   for (const row of listing.setups) {
     const setup = { kind: 'row' as const, key: row.key };
-    if (row.missingValue) await assert.rejects(start(setup), /does not offer that setup/);
+    if (row.missingValue) await assertLaunchRefused(start(setup), /does not offer that setup/);
     else {
       await start(setup);
       assert.deepEqual(delivered.at(-1), launcherProfile(view, setup));
@@ -5427,20 +5437,20 @@ test('window setups advertise launchable keys and exact choices while unavailabl
   await start({ kind: 'custom', ...profile, model: 'opus[1m]' });
   assert.equal(delivered.at(-1)?.model, 'opus[1m]');
   const count = delivered.length;
-  await assert.rejects(start({ kind: 'custom', ...profile, effort: 'low' }), /does not offer that setup/);
+  await assertLaunchRefused(start({ kind: 'custom', ...profile, effort: 'low' }), /does not offer that setup/);
   view = { ...view, inherited: { ...view.primary!, key: 'current', profile: { ...profile, model: 'retired' } } };
   view.primary = view.inherited;
   const unavailable = await provider.handleSessionRequest({ method: 'setups', params: {}, requester: null });
   assert.equal(unavailable.primary, 'current');
   assert.equal(unavailable.setups[0].missingValue, 'model');
-  await assert.rejects(start({ kind: 'row', key: 'current' }), /does not offer that setup/);
+  await assertLaunchRefused(start({ kind: 'row', key: 'current' }), /does not offer that setup/);
   view = sessionLauncherView(null, [profile], {}, [], {}, ['claude']);
   provider.pendingModels = ['claude'];
   const pending = await provider.handleSessionRequest({ method: 'setups', params: {}, requester: null });
   assert.equal(pending.agents[0].modelsPending, true);
   assert.ok(pending.agents[0].permissions.includes('auto'));
-  await assert.rejects(start({ kind: 'row', key: pending.primary }), /still loading/);
-  await assert.rejects(start({ kind: 'custom', ...profile }), /still loading/);
+  await assertLaunchRefused(start({ kind: 'row', key: pending.primary }), /still loading that provider's models/);
+  await assertLaunchRefused(start({ kind: 'custom', ...profile }), /still loading that provider's models/);
   assert.equal(delivered.length, count);
   view = sessionLauncherView(null, [], {});
   const empty = await provider.handleSessionRequest({ method: 'setups', params: {}, requester: null });
@@ -5569,9 +5579,10 @@ test('window starts adopt both providers and classifications without changing th
       );
       assert.equal(calls, 1);
       for (const prompt of ['', '  '])
-        await assert.rejects(
+        await assertLaunchRefused(
           provider.handleSessionRequest({ ...request, params: { ...request.params, prompt } }),
           /nonempty prompt/,
+          'attribution',
         );
       // A slash prompt passes the launch checks and reaches delivery, where the fixture refuses it.
       await assert.rejects(
@@ -5579,18 +5590,19 @@ test('window starts adopt both providers and classifications without changing th
         /delivers only the work prompt/,
       );
       assert.deepEqual(deliveredPrompts, ['work', '/clear']);
-      await assert.rejects(
+      await assertLaunchRefused(
         provider.handleSessionRequest({
           ...request,
           params: { ...request.params, setup: { kind: 'custom', ...profile, model: 'unknown' } },
         }),
         /does not offer that setup\. Run arc setups/,
+        'attribution',
       );
       const refusedWith = async (patch: Record<string, unknown>, pattern: RegExp) => {
         const held = Object.fromEntries(Object.keys(patch).map((key) => [key, provider[key]]));
         Object.assign(provider, patch);
         try {
-          await assert.rejects(provider.handleSessionRequest(request), pattern);
+          await assertLaunchRefused(provider.handleSessionRequest(request), pattern, 'attribution');
         } finally {
           Object.assign(provider, held);
         }
@@ -5653,7 +5665,7 @@ test('window read-only starts deliver both setup providers and exact immutable p
     }
 });
 
-test('window dispatch starts reserve a launch receipt before worker delivery and refuse unavailable reservation', async () => {
+test('window dispatch starts reserve a launch receipt before worker delivery, refuse unavailable reservation, and throw once delivery began', async () => {
   const provider: any = liveProviderFixture(livePress({ sessionId: 'reader', agent: 'codex' })).provider;
   const profile: SessionProfile = { agent: 'codex', model: '', effort: '', permissionMode: '', source: 'recent' };
   const view = sessionLauncherView(null, [profile], {});
@@ -5683,8 +5695,34 @@ test('window dispatch starts reserve a launch receipt before worker delivery and
   assert.deepEqual(order, ['reserved', 'delivery']);
   assert.equal(result.launchId, 'launch');
   provider.onReserveDispatch = null;
-  await assert.rejects(provider.handleSessionRequest(request), /receipt storage/);
+  await assertLaunchRefused(provider.handleSessionRequest(request), /receipt storage/);
   assert.deepEqual(order, ['reserved', 'delivery']);
+  // A launch that waits for models is refused with the refused reply, the unchanged reason and the requester, and nothing is delivered.
+  let deliveries = 0;
+  provider.onSendDraftPrompt = async () => {
+    deliveries++;
+    throw new Error('worker handoff failed');
+  };
+  const plain = {
+    method: 'start',
+    requester: 'coordinator',
+    params: { prompt: 'review', setup: { kind: 'custom', ...profile } },
+  };
+  provider.pendingModels = ['codex'];
+  await assertLaunchRefused(
+    provider.handleSessionRequest(plain),
+    /^Arc is still loading that provider's models\. Run arc setups until it lists them, then retry\.$/,
+    'coordinator',
+  );
+  assert.equal(deliveries, 0);
+  // The setup listing is not a launch, so its callers keep the thrown error.
+  provider.pendingModels = [];
+  provider.setupProject = null;
+  await assert.rejects(provider.handleSessionRequest({ ...plain, method: 'setups', params: {} }), /not loaded/);
+  provider.setupProject = 'project';
+  // A failure after delivery began cannot show that no worker started, so it keeps its thrown error.
+  await assert.rejects(provider.handleSessionRequest(plain), /worker handoff failed/);
+  assert.equal(deliveries, 1);
 });
 
 test('window starts carry a requested cache lifetime onto Claude drafts and refuse Codex setups before delivery', async () => {
@@ -5713,7 +5751,7 @@ test('window starts carry a requested cache lifetime onto Claude drafts and refu
           params: { prompt: 'review', setup, agentRun: true, ...params },
         });
       if (agent === 'codex') {
-        await assert.rejects(start({ cacheLifetime: '1h' }), /--cache-lifetime applies only to Claude launches/);
+        await assertLaunchRefused(start({ cacheLifetime: '1h' }), /--cache-lifetime applies only to Claude launches/);
         assert.equal(drafts.length, 0);
         continue;
       }
@@ -5749,7 +5787,7 @@ test('window read-only starts refuse named setup read tools and permission overr
         return { delivered: false, reason: 'delivery stopped by fixture' };
       },
     });
-    await assert.rejects(
+    await assertLaunchRefused(
       provider.handleSessionRequest({
         method: 'start',
         requester: null,
@@ -5799,7 +5837,7 @@ test('window read-only starts admit canonical registered worktree cwd and refuse
     assert.equal(drafts.length, 1);
     assert.equal(drafts[0].cwd, fs.realpathSync(nested));
     for (const cwd of [foreign, redirect]) {
-      await assert.rejects(
+      await assertLaunchRefused(
         provider.handleSessionRequest({ ...request, params: { ...request.params, cwd } }),
         /outside/,
       );
@@ -45263,7 +45301,7 @@ test('programmatic service tiers validate setup providers and persist only the l
           params: { prompt: 'Review', setup, agentRun: false, ...(serviceTier === undefined ? {} : { serviceTier }) },
         });
       if (agent === 'claude') {
-        await assert.rejects(start('fast'), /only to Codex/);
+        await assertLaunchRefused(start('fast'), /only to Codex/);
         assert.equal(drafts.length, 0);
       } else {
         const result = await start('fast');
