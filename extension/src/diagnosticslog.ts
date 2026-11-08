@@ -653,6 +653,9 @@ export class StartupHistory {
   private hiddenSince: number | null = null;
   private hiddenCount = 0;
   private hiddenMs = 0;
+  // Hidden time from `catalogReady` to `railPaintArrived`. A hidden page runs no animation frames, so it delays that paint.
+  private hiddenAtCatalog: number | null = null;
+  private hiddenCatalogToPaintMs: number | null = null;
 
   constructor(
     private readonly directory: string,
@@ -678,6 +681,9 @@ export class StartupHistory {
   stage(name: string, at = this.now()): void {
     if (this.background) return;
     this.stages[name] ??= at;
+    if (name === 'catalogReady') this.hiddenAtCatalog ??= this.hiddenTotalMs(at);
+    if (name === 'railPaintArrived' && this.hiddenAtCatalog !== null)
+      this.hiddenCatalogToPaintMs ??= this.hiddenTotalMs(at) - this.hiddenAtCatalog;
     if (name === 'panelOpened' && this.panelStarted === null) {
       this.panelStarted = at;
       this.sample();
@@ -715,6 +721,10 @@ export class StartupHistory {
     this.deadline = null;
   }
 
+  private hiddenTotalMs(at: number): number {
+    return this.hiddenMs + (this.hiddenSince === null ? 0 : at - this.hiddenSince);
+  }
+
   private stopSamples(): void {
     if (this.samples) clearInterval(this.samples);
     this.samples = null;
@@ -746,7 +756,8 @@ export class StartupHistory {
           stages: { ...this.stages },
           hidden: {
             count: this.hiddenCount,
-            ms: this.hiddenMs + (this.hiddenSince === null ? 0 : at - this.hiddenSince),
+            ms: this.hiddenTotalMs(at),
+            catalogToPaintMs: this.hiddenCatalogToPaintMs,
           },
           memory: {
             scope: 'extension-host process including all extensions and worker threads',

@@ -1,4 +1,5 @@
 import { startingWorktree } from './repositoryscope';
+import { StartupHistory } from './diagnosticslog';
 import * as spendConsumers from './projectspend';
 import * as cardConsumers from './turncard';
 import { normalizePromptAssetBook } from './promptassets';
@@ -12946,6 +12947,60 @@ test('opening a session leaves the rail to the render that selection asked for',
 
   await provider.readSession('session-a', 30);
   assert.equal(provider.rails().length, 2, 'a read mark made once the selection settled never reaches the rail');
+});
+
+test('the startup record marks the metadata return, the first render post and the first paint arrival', async () => {
+  const provider = paintHarness(['browserPainted']);
+  const stages: string[] = [];
+  provider.startupHistory = { stage: (name: string) => stages.push(name) };
+  const host = provider.hosts[0];
+  provider.readyHosts = new Set([host]);
+  await provider.refresh(true);
+  provider.browserPainted(host, provider.refreshGeneration, 'railReady', true);
+  const order = ['metadataPrepared', 'firstRenderPosted', 'railPaintArrived'].map((name) => stages.indexOf(name));
+  assert.ok(
+    order.every((at) => at >= 0),
+    `a stage was not recorded: ${stages.join(', ')}`,
+  );
+  assert.deepEqual(
+    [...order].sort((a, b) => a - b),
+    order,
+  );
+});
+
+test('the startup record times the panel hidden between the list and its first paint', async () => {
+  const directory = tempDir('startup-hidden-gap-');
+  let clock = 0;
+  const history = new StartupHistory(
+    directory,
+    () => ({}),
+    () => clock,
+    0,
+  );
+  try {
+    history.stage('panelOpened');
+    history.visibility(false, 5);
+    history.visibility(true, 8);
+    clock = 10;
+    history.stage('catalogReady');
+    history.visibility(false, 11);
+    history.visibility(true, 14);
+    clock = 20;
+    history.stage('railPaintArrived');
+    clock = 25;
+    history.stage('completeRender');
+    await vi.waitFor(() => assert.equal(fs.readdirSync(directory).length, 1));
+    const file = path.join(directory, fs.readdirSync(directory)[0]);
+    let record: any;
+    await vi.waitFor(() => {
+      record = JSON.parse(fs.readFileSync(file, 'utf8').trim().split('\n').at(-1)!);
+      assert.equal(record.outcome, 'background-complete');
+    });
+    assert.equal(record.hidden.ms, 6);
+    assert.equal(record.hidden.catalogToPaintMs, 3, 'hidden time before the list reached the gap');
+  } finally {
+    history.dispose();
+  }
 });
 
 test('session selection reads cached spend signatures without enumerating sources', async () => {

@@ -670,7 +670,11 @@ test('startup history counts the time with no visible panel after the first pane
     await vi.waitFor(() => {
       const lines = fs.readdirSync(directory).flatMap((file) => readLines(path.join(directory, file)));
       // The record counts the closed interval and the open one up to the record. A repeated hide adds nothing.
-      assert.deepEqual(lines.find((line) => line.outcome === 'background-complete')?.hidden, { count: 2, ms: 25 });
+      assert.deepEqual(lines.find((line) => line.outcome === 'background-complete')?.hidden, {
+        count: 2,
+        ms: 25,
+        catalogToPaintMs: null,
+      });
     });
   } finally {
     history.dispose();

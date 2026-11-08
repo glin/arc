@@ -4918,6 +4918,7 @@ export class PanelProvider implements vscode.Disposable {
     usableRows = false,
   ): void {
     if (stage === 'railReady' && this.readyHosts.has(host)) {
+      this.startupHistory?.stage('railPaintArrived');
       this.railPaintArrived = true;
       if (this.finishedColdPass) this.listFinishedColdPass();
     }
@@ -10406,6 +10407,7 @@ export class PanelProvider implements vscode.Disposable {
       if (!metadataAfterRender && !(await this.prepareMetadata(all, generation, controller.signal))) {
         return;
       }
+      if (!selectedOnly && !metadataAfterRender) this.startupHistory?.stage('metadataPrepared');
       if (controller.signal.aborted || generation !== this.refreshGeneration) {
         return;
       }
@@ -10892,6 +10894,7 @@ export class PanelProvider implements vscode.Disposable {
           },
           () => {},
         );
+        if (!selectedOnly) this.startupHistory?.stage('firstRenderPosted');
         if (hostSession) {
           this.hostPreviousSessions?.set(host, hostSession);
         }
