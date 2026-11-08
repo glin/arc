@@ -8316,7 +8316,7 @@ function selectCommitSession(provider: any, session: any, turns: any[]) {
 test('the cold opening pass records its walk and its opening reads in the startup record', () => {
   assert.match(
     panelHostSource,
-    /coldOpeningPass\(this\.codexMetas, codexSessionsRoot\(\), signal, \(stage\) => this\.startupHistory\?\.stage\(stage\)\)/,
+    /coldOpeningPass\(this\.codexMetas, codexSessionsRoot\(\), signal, \(stage\) =>\s*this\.performanceCounters\.recordStartup\(stage, performance\.now\(\)\)/,
   );
 });
 
@@ -35193,7 +35193,7 @@ test('a first card drawn after the first draw finished reports no slow start', (
     );
     assert.deepEqual(
       empty.logged.map(([, record]) => record.milestone),
-      ['railReady', 'completeRender', 'firstCard'],
+      ['railPaintArrived', 'railReady', 'completeRender', 'firstCard'],
       'the log lost a milestone',
     );
   } finally {

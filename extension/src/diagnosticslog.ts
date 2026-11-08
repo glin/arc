@@ -678,8 +678,19 @@ export class StartupHistory {
     }
   }
 
+  get catalogToPaintMs(): number | null {
+    return this.hiddenCatalogToPaintMs;
+  }
+
   stage(name: string, at = this.now()): void {
-    if (this.background) return;
+    if (this.background) {
+      // A cold pass can outlast the first draw, so its stages reach a later record.
+      if ((name === 'coldPassEnumerated' || name === 'coldPassPrimed') && this.stages[name] === undefined) {
+        this.stages[name] = at;
+        if (name === 'coldPassPrimed') this.write('cold-pass-complete');
+      }
+      return;
+    }
     this.stages[name] ??= at;
     if (name === 'catalogReady') this.hiddenAtCatalog ??= this.hiddenTotalMs(at);
     if (name === 'railPaintArrived' && this.hiddenAtCatalog !== null)

@@ -115,7 +115,7 @@ export interface PerformanceCounterSnapshot {
   ledgerSaveCount: number;
   lastWatcherOperation: WatcherOperation | null;
   lastLedgerSave: LedgerSaveOperation | null;
-  startup?: { id: number; milestones: Partial<Record<StartupMilestone, number>> };
+  startup?: { id: number; milestones: Partial<Record<StartupStage, number>> };
   // Dispatched spend by root session ID, summed over complete discovery replies. The roots with the most bytes keep
   // their own record, and `other` sums the rest with their count, so the snapshot stays within a fixed size.
   dispatchRoots: Record<string, DispatchRootRecord>;
@@ -128,6 +128,14 @@ export type DispatchRootRecord =
 export const DISPATCH_ROOT_RECORDS = 20;
 
 export type StartupMilestone = 'shellReady' | 'catalogReady' | 'railReady' | 'firstCard' | 'completeRender';
+// The stages that split a milestone. They reach the same route as a milestone and carry no threshold.
+export type StartupStage =
+  | StartupMilestone
+  | 'coldPassEnumerated'
+  | 'coldPassPrimed'
+  | 'metadataPrepared'
+  | 'firstRenderPosted'
+  | 'railPaintArrived';
 
 // Catalog refresh stages include started work, coalesced requests, unchanged content, posted renders, deadline abandonment,
 // and catalog walks stopped at their own deadline.
@@ -442,7 +450,7 @@ export class PanelPerformanceCounters {
   private readonly panelReplies = new Map<string, Map<string, OperationCounts>>();
   private lastWatcherOperation: WatcherOperation | null = null;
   private lastLedgerSave: LedgerSaveOperation | null = null;
-  private startup: { id: number; milestones: Partial<Record<StartupMilestone, number>> } | null = null;
+  private startup: { id: number; milestones: Partial<Record<StartupStage, number>> } | null = null;
 
   constructor(
     startedAt = Date.now(),
@@ -464,7 +472,7 @@ export class PanelPerformanceCounters {
     this.captureCount++;
   }
 
-  recordStartup(milestone: StartupMilestone, at: number): void {
+  recordStartup(milestone: StartupStage, at: number): void {
     this.startup ??= { id: 1, milestones: {} };
     // Retain the first occurrence of each startup milestone.
     if (this.startup.milestones[milestone] !== undefined) {

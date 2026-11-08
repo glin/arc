@@ -9135,6 +9135,7 @@ function warmStartHarness(scope: Record<string, unknown> = {}, extraMethods: str
   const stages: string[] = [];
   let passSettled = false;
   provider.startupHistory = { stage: (name: string) => stages.push(name) };
+  provider.performanceCounters.recordStartup = (name: string) => stages.push(name);
   provider.codexColdReads = (signal: AbortSignal) =>
     gate
       .then(() => coldOpeningPass(provider.codexMetas, root, signal, (stage) => stages.push(stage)))
@@ -13120,7 +13121,7 @@ test('opening a session leaves the rail to the render that selection asked for',
 test('the startup record marks the metadata return, the first render post and the first paint arrival', async () => {
   const provider = paintHarness(['browserPainted']);
   const stages: string[] = [];
-  provider.startupHistory = { stage: (name: string) => stages.push(name) };
+  provider.performanceCounters.recordStartup = (name: string) => stages.push(name);
   const host = provider.hosts[0];
   provider.readyHosts = new Set([host]);
   await provider.refresh(true);
@@ -13134,6 +13135,89 @@ test('the startup record marks the metadata return, the first render post and th
     [...order].sort((a, b) => a - b),
     order,
   );
+});
+
+test('metadata prepared after the render still marks its stage in the startup record', async () => {
+  const provider = paintHarness();
+  const stages: string[] = [];
+  provider.performanceCounters.recordStartup = (name: string) => stages.push(name);
+  await provider.refresh(true, false, true);
+  assert.ok(stages.includes('metadataPrepared'), `metadata after the render was not recorded: ${stages.join(', ')}`);
+});
+
+test('the new startup stages reach the diagnostics log and the startup record', async () => {
+  const directory = tempDir('startup-route-');
+  const provider = paintHarness(['browserPainted', 'routePerformanceEvent']);
+  const history = new StartupHistory(directory, () => ({}));
+  const logged: Record<string, unknown>[] = [];
+  provider.startupHistory = history;
+  provider.panelStartedAt = 0;
+  provider.startupThresholds = { check: () => null };
+  provider.diagnostics = {
+    enabled: () => true,
+    log: (event: string, record: Record<string, unknown>) => logged.push({ event, ...record }),
+    warn() {},
+    file() {
+      return null;
+    },
+  };
+  provider.performanceCounters = new PanelPerformanceCounters(Date.now(), {
+    enabled: () => true,
+    emit: (event: string, record: Record<string, unknown>) => provider.routePerformanceEvent(event, record),
+  });
+  try {
+    history.stage('panelOpened');
+    const host = provider.hosts[0];
+    provider.readyHosts = new Set([host]);
+    await provider.refresh(true);
+    provider.browserPainted(host, provider.refreshGeneration, 'railReady', true);
+    for (const name of ['metadataPrepared', 'firstRenderPosted', 'railPaintArrived']) {
+      assert.ok(
+        logged.some((line) => line.event === 'startup' && line.milestone === name),
+        `the diagnostics log missed ${name}`,
+      );
+      assert.ok((history as any).stages[name] !== undefined, `the startup record missed ${name}`);
+    }
+    assert.equal(
+      logged.find((line) => line.milestone === 'railPaintArrived')?.hiddenCatalogToPaintMs,
+      0,
+      'the diagnostics log missed the hidden gap',
+    );
+  } finally {
+    history.dispose();
+    provider.performanceCounters.dispose();
+  }
+});
+
+test('a cold pass that ends after the first draw writes a later record with its stages', async () => {
+  const directory = tempDir('startup-late-pass-');
+  let clock = 0;
+  const history = new StartupHistory(
+    directory,
+    () => ({}),
+    () => clock,
+    0,
+  );
+  try {
+    history.stage('panelOpened');
+    clock = 10;
+    history.stage('completeRender');
+    clock = 20;
+    history.stage('coldPassEnumerated');
+    clock = 30;
+    history.stage('coldPassPrimed');
+    await vi.waitFor(() => assert.equal(fs.readdirSync(directory).length, 1));
+    const file = path.join(directory, fs.readdirSync(directory)[0]);
+    let record: any;
+    await vi.waitFor(() => {
+      record = JSON.parse(fs.readFileSync(file, 'utf8').trim().split('\n').at(-1)!);
+      assert.equal(record.outcome, 'cold-pass-complete');
+    });
+    assert.equal(record.stages.coldPassEnumerated, 20);
+    assert.equal(record.stages.coldPassPrimed, 30);
+  } finally {
+    history.dispose();
+  }
 });
 
 test('the startup record times the panel hidden between the list and its first paint', async () => {

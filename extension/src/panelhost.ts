@@ -1639,7 +1639,9 @@ export class PanelProvider implements vscode.Disposable {
   private codexOpenings: CodexOpeningsWriter | null = null;
   // The first catalog refresh primes opening metadata before listing sessions. Refresh and search requests wait for this pass.
   private codexColdReads: ((signal: AbortSignal) => Promise<ColdOpeningPass>) | null = (signal) =>
-    coldOpeningPass(this.codexMetas, codexSessionsRoot(), signal, (stage) => this.startupHistory?.stage(stage));
+    coldOpeningPass(this.codexMetas, codexSessionsRoot(), signal, (stage) =>
+      this.performanceCounters.recordStartup(stage, performance.now()),
+    );
   private codexPriming: Promise<ColdOpeningPass> | null = null;
   // The cold pass in flight. Abandoning the catalog refresh aborts it and returns `reads` to `codexColdReads`.
   // On a warm start `listing` holds the saved openings, which list the catalog while the pass runs behind it.
@@ -4245,6 +4247,8 @@ export class PanelProvider implements vscode.Disposable {
   private routePerformanceEvent(event: string, record: Record<string, unknown>): void {
     if (event === 'startup' && typeof record.milestone === 'string' && typeof record.elapsedMs === 'number') {
       this.startupHistory?.stage(record.milestone, record.elapsedMs);
+      if (record.milestone === 'railPaintArrived')
+        record = { ...record, hiddenCatalogToPaintMs: this.startupHistory?.catalogToPaintMs ?? null };
     }
     if (event !== 'startup' || typeof record.elapsedMs !== 'number') {
       this.diagnostics.log(event, record);
@@ -4931,7 +4935,7 @@ export class PanelProvider implements vscode.Disposable {
       return;
     }
     if (stage === 'railReady') {
-      this.startupHistory?.stage('railPaintArrived');
+      this.performanceCounters.recordStartup('railPaintArrived', performance.now());
       this.railPaintArrived = true;
     }
     if (generation === this.refreshGeneration || generation === this.coldPassDrawGeneration) {
@@ -10435,7 +10439,8 @@ export class PanelProvider implements vscode.Disposable {
       if (!metadataAfterRender && !(await this.prepareMetadata(all, generation, controller.signal))) {
         return;
       }
-      if (!selectedOnly && !metadataAfterRender) this.startupHistory?.stage('metadataPrepared');
+      if (!selectedOnly && !metadataAfterRender)
+        this.performanceCounters?.recordStartup('metadataPrepared', performance.now());
       if (controller.signal.aborted || generation !== this.refreshGeneration) {
         return;
       }
@@ -10922,7 +10927,7 @@ export class PanelProvider implements vscode.Disposable {
           },
           () => {},
         );
-        if (!selectedOnly) this.startupHistory?.stage('firstRenderPosted');
+        if (!selectedOnly) this.performanceCounters.recordStartup('firstRenderPosted', performance.now());
         if (!selectedOnly && (this.codexColdPass?.listing || this.finishedColdPass)) this.armColdPassPaintLimit();
         if (hostSession) {
           this.hostPreviousSessions?.set(host, hostSession);
@@ -10955,6 +10960,7 @@ export class PanelProvider implements vscode.Disposable {
       if (metadataAfterRender && !(await this.prepareMetadata(all, generation, controller.signal))) {
         return;
       }
+      if (metadataAfterRender) this.performanceCounters?.recordStartup('metadataPrepared', performance.now());
       if (controller.signal.aborted || generation !== this.refreshGeneration) {
         return;
       }
