@@ -4,7 +4,13 @@ import assert from 'node:assert';
 import * as fs from 'node:fs';
 import { tempDir } from './temproot.ts';
 import * as path from 'node:path';
-import { normalizeFsPath, scanClaudeRelationshipQuantum, RelationshipReader, revisionOf } from './transcript';
+import {
+  normalizeFsPath,
+  scanClaudeRelationshipQuantum,
+  RelationshipReader,
+  revisionOf,
+  scanForHumanPrompt,
+} from './transcript';
 import { scanCodexDispatchReferencesAsync, readCodexAgentSpend } from './codex';
 import { commitSourceStamp } from './transcript';
 import {
@@ -387,6 +393,40 @@ test('the derived cache keeps complete prompt scans of the current rules version
   const loaded = loadClaudeCache(cache);
   assert.equal(loaded.reuse?.reason, 'reused', 'the older cache file was not reused');
   assert.equal(loaded.promptScans?.size, 0, 'an older cache file loaded a scan');
+});
+
+// A typed prompt with a record id opens a command, and the model's answer confirms it. The complete scan then holds the
+// found prompt beside that command, and the derived cache saves the found prompt without the command.
+test('the derived cache saves the found prompt scan of a transcript whose typed prompt the model answered', () => {
+  const directory = folder();
+  const transcript = path.join(directory, 'answered.jsonl');
+  const at = '2026-11-07T10:00:00.000Z';
+  fs.writeFileSync(
+    transcript,
+    [
+      { type: 'user', uuid: 'prompt', timestamp: at, message: { role: 'user', content: 'actual task' } },
+      {
+        type: 'assistant',
+        uuid: 'answer',
+        parentUuid: 'prompt',
+        timestamp: at,
+        message: { model: 'claude-test', role: 'assistant', content: [{ type: 'text', text: 'done' }] },
+      },
+    ]
+      .map((row) => JSON.stringify(row) + '\n')
+      .join(''),
+  );
+  const source = revisionOf(fs.statSync(transcript, { bigint: true }));
+  const scan = { ...scanForHumanPrompt(transcript, source.size), source };
+  assert.equal(scan.found, true, 'the fixture scan found no prompt');
+  assert.ok(scan.command, 'the fixture scan holds no command, so it does not reach the save rule under test');
+  const cache = path.join(directory, 'cache.json');
+  saveClaudeCache(cache, [], [], [], undefined, undefined, [], undefined, undefined, [[transcript, scan]]);
+  assert.deepEqual(
+    loadClaudeCache(cache).promptScans?.get(transcript),
+    { bytes: scan.bytes, found: true, complete: true, source },
+    'the found scan of an answered prompt was not saved',
+  );
 });
 
 test('the derived cache keeps the saved prompt scans of the most recently modified files up to its limit', () => {

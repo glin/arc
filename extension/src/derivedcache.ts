@@ -408,11 +408,12 @@ export const MAX_SAVED_PROMPT_SCANS = 10_000;
 
 // The saved form of a complete prompt scan, or null when the scan cannot be saved. A saved scan holds whether it found a
 // prompt, its complete-line cursor, and the size, modification time, device and inode of the file it read. A scan that
-// is unfinished, holds an unresolved command or a pending line, or read a file without a device and inode is not saved.
-// A complete scan that found no prompt reached the end of its file.
+// is unfinished, holds a pending line, or read a file without a device and inode is not saved. A scan that found no
+// prompt and holds a command is not saved, because a later compaction can restore a withdrawn command. A scan that found
+// a prompt is final, so it is saved without its command. A complete scan that found no prompt reached the end of its file.
 export function savedPromptScanOf(scan: HumanPromptScan): HumanPromptScan | null {
   const source = scan.source;
-  if (scan.complete !== true || scan.pending || scan.command || !source) return null;
+  if (scan.complete !== true || scan.pending || (scan.command && !scan.found) || !source) return null;
   if (!fileIdentityValue(source.dev) || !fileIdentityValue(source.ino)) return null;
   if (!Number.isSafeInteger(source.size) || source.size < 0 || !Number.isFinite(source.mtimeMs)) return null;
   if (!Number.isSafeInteger(scan.bytes) || scan.bytes < 0 || scan.bytes > source.size) return null;
