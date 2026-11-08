@@ -6621,6 +6621,13 @@ button.railfilterlabel:focus-visible {
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
+/* A token figure in an entry's aligned rows takes the dollars column's place and alignment. */
+.chippop .tokens {
+  min-width: 4.5ch;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
 /* The "Included above" footnote: a muted heading, then one line per overhead. */
 .chippop .included {
   row-gap: 0.5em;
@@ -6637,6 +6644,26 @@ button.railfilterlabel:focus-visible {
 }
 .chippop .costgrid ~ .chippopnotes {
   margin-top: 0.8em;
+}
+/* An entry's share: a meter under its head, then aligned rows with no bars. A long name ends in an
+   ellipsis, and the row's title holds the whole name. The grid sits inside a list item, so it
+   keeps close to the meter. */
+.chippop .chippopitem > .sharemeter {
+  height: 6px;
+  margin: 0.35em 0 0.1em;
+}
+.chippop .costgrid.sharerows {
+  grid-template-columns: minmax(0, 24em) auto auto 1fr;
+  margin-top: 0.35em;
+}
+.chippop .sharerows .context-category-label {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.chippop .sharerows .costmore {
+  margin-top: 0.15em;
 }
 /* A narrow popover keeps the split labels on one line and drops the bar under them. The rows
    keep their fields on one line and each bar spans the full width under its row. The popover is
@@ -6662,6 +6689,9 @@ button.railfilterlabel:focus-visible {
   }
   .chippop .costrow .sbbar {
     grid-column: 1 / -1;
+  }
+  .chippop .costgrid.sharerows {
+    grid-template-columns: minmax(0, 1fr) auto auto;
   }
 }
 .context-table {

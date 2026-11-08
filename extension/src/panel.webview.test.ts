@@ -10176,10 +10176,13 @@ test.each([
       assert.equal(detailRowsFor(card, 'dispatched')?.kind, 'dispatched');
       if (childAgent === 'codex') {
         const figure = card.dispatched[0].figures.find((value: { metric: string }) => value.metric === 'cost');
-        const line = figure.record.entries.find((entry: { label: string }) => entry.label === 'Output').lines[0];
-        assert.ok(line.text.includes('tok/s'));
-        assert.ok(line.title.includes('Request time'));
-        assert.ok(line.title.includes('gpt-6-sol'));
+        // The speed sits in the Output row's title.
+        const title: string = figure.record.cost.tabs[0].parts
+          .flatMap((part: { rows: { label: string; title: string }[] }) => part.rows)
+          .find((row: { label: string }) => row.label === 'Output').title;
+        assert.ok(title.includes('tok/s'));
+        assert.ok(title.includes('Request time'));
+        assert.ok(title.includes('gpt-6-sol'));
       }
       provider.sessionParentEdges(provider.catalog.sessions);
       provider.authoritativeCatalog = sessions;

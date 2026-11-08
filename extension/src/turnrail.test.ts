@@ -823,7 +823,10 @@ test('the session list context hover excludes subagent results when compaction d
     label: 'Subagent results',
     value: '5% (4k)',
     valueTitle: '4,000 tokens, estimate',
-    lines: ['Reviewer: 4k tokens (5%)'],
+    breakdown: {
+      share: 0.05,
+      rows: [{ label: 'Reviewer', value: '4,000', percent: '5%', title: 'Reviewer: 4,000 tokens, estimate' }],
+    },
   });
   assert.ok(context.detailList?.notes?.includes('Estimated from text size.'));
 });

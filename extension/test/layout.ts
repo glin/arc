@@ -1182,24 +1182,55 @@ export const NEXT_TURN = `(() => {
 
 // Finished-subagent tooltip with duration and tool count.
 export const REVIEW_CHILD_HINT = '3m · 23 tools';
-// Cost-popover entries with usage details.
-export const REVIEW_COST_ENTRIES = [
-  {
-    label: 'Cost by usage · opus-5',
-    value: '$0.31',
-    lines: [
-      { text: 'Output: $0.11', cost: true },
-      { text: 'Uncached input: $0.62', cost: true },
-    ],
-  },
-];
-// Plain-text cost detail for a popover without entries.
+// A subagent's own cost in the cost form: one model section, its fact line and one row per usage category.
+export const REVIEW_COST_FORM = {
+  warnings: [],
+  sections: [
+    {
+      label: 'Opus 5',
+      detail: 'high',
+      title: '$0.31, 4 requests.',
+      facts: {
+        parts: ['4 requests', '90% cached', '20k average input'],
+        title: '72,000 of 80,000 input tokens served from the cache.',
+      },
+    },
+  ],
+  tabs: [
+    {
+      name: 'Usage',
+      parts: [
+        {
+          rows: [
+            {
+              label: 'Uncached input',
+              percent: '65%',
+              share: 0.65,
+              value: '$0.20',
+              title: '$0.20, 8,000 tokens',
+            },
+            {
+              label: 'Output',
+              percent: '35%',
+              share: 0.35,
+              value: '$0.11',
+              title: '$0.11, 4,400 tokens',
+            },
+          ],
+        },
+      ],
+    },
+  ],
+  included: [],
+};
+// Plain-text cost detail of the cost form.
 export const REVIEW_COST_RECORD = [
   '$0.31 spent',
   '',
-  'Cost by usage · opus-5: $0.31',
-  '  Output: $0.11',
-  '  Uncached input: $0.62',
+  'Opus 5 · high',
+  '  4 requests · 90% cached · 20k average input',
+  '  Uncached input: $0.20 (65%)',
+  '  Output: $0.11 (35%)',
 ].join('\n');
 // Commit and file filters identify rows in the long fixture card.
 // The final path represents a file contributed by a subagent.
@@ -1222,7 +1253,11 @@ export function subagentRows(now: number) {
           metric: 'cost',
           compactLabel: '$0.31',
           name: '$0.31 spent',
-          record: { heading: { label: '$0.31 spent' }, entries: REVIEW_COST_ENTRIES },
+          record: {
+            heading: { label: '$0.31 spent' },
+            entries: [],
+            cost: REVIEW_COST_FORM,
+          },
           detail: REVIEW_COST_RECORD,
         },
         {

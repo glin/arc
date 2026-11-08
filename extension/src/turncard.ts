@@ -146,6 +146,18 @@ export interface StatDetailEntry {
   warning?: boolean;
   // Draws the label as a muted group heading with no bullet, such as "Included above".
   group?: true;
+  // A meter under the head that fills to the entry's share of its whole, then aligned rows with
+  // no bars. Rows past `more.shown` wait behind the View more expander. The lines follow the rows.
+  breakdown?: ShareBreakdown;
+}
+
+// The Subagent results entry's meter and rows. `share` is the meter's fill, from 0 to 1, and an
+// entry with no tokens has no meter. `rest` stands for the rows past `more.shown` in plain text.
+export interface ShareBreakdown {
+  share?: number;
+  rows: Omit<CostDetailRow, 'count' | 'share'>[];
+  more?: CostDetailPart['more'];
+  rest?: Pick<CostDetailRow, 'label' | 'value' | 'percent'>;
 }
 
 export type StatDetailLine =
@@ -169,8 +181,8 @@ export interface StatDetailList {
   footer?: string[];
   // Standing explanations, drawn under a closed "About these figures" disclosure.
   notes?: string[];
-  // The tabbed form the two cost popovers draw in place of the entries. The entries still
-  // supply the plain-text detail.
+  // The cost form, drawn in place of the entries. The turn and session cost popovers keep their
+  // entries for the plain-text detail. A list with no entries takes that text from this form.
   cost?: CostDetailView;
 }
 
@@ -191,7 +203,8 @@ export interface CostDetailRow {
 export interface CostDetailPart {
   rows: CostDetailRow[];
   more?: { shown: number; open: string; close: string };
-  // The quiet line a section with no rows shows where its rows would be.
+  // The quiet line under a section's rows that names recorded dollars with no split. A section with
+  // no rows shows it where its rows would be.
   empty?: string;
 }
 
@@ -201,10 +214,11 @@ export interface CostDetailTab {
   parts: CostDetailPart[];
 }
 
-// A section heading: the role, its model or agent count in the quiet tone, and its dollars.
-// The fact line under it names the section's requests, cached-input share and average input.
+// A section heading: the role or model, its model, effort or agent count in the quiet tone, and its
+// dollars. The fact line under it names the section's requests, cached-input share and average
+// input, or a compaction's context and summary sizes.
 export interface CostDetailSection {
-  label: 'Main agent' | 'Delegated';
+  label: string;
   detail: string;
   // Absent when the popover has no delegated work, because the head's total is that figure.
   value?: string;
@@ -1013,14 +1027,6 @@ const AGENT_NESTED_COST_SO_FAR = 'Some nested subagents are still running or lef
 const AGENT_CLI_COST_MISSING = 'Claude CLI did not report the full cost of this run.';
 // Cost note for a Codex child total that excludes nested subagents.
 const AGENT_CODEX_NESTED_COST_MISSING = 'This cost leaves out the subagents that this subagent started.';
-// Coverage notes do not form priced cost entries.
-const COST_NOTES = new Set([
-  AGENT_COST_SO_FAR,
-  AGENT_COST_NO_ENDING,
-  AGENT_NESTED_COST_SO_FAR,
-  AGENT_CLI_COST_MISSING,
-  AGENT_CODEX_NESTED_COST_MISSING,
-]);
 // What a partial record says about its own reach, on the figure that draws that record.
 const AGENT_RECORD_CUT_SHORT = "This child session's record ended early, so this list holds only what Arc read.";
 
@@ -1051,56 +1057,6 @@ function hintDetailLine(line: StatDetailLine): string {
     return line;
   }
   return 'text' in line ? line.text : `${line.lead}${line.trail}`;
-}
-
-// Cost breakdown for a child figure, excluding its displayed total.
-// Coverage-only blocks become standalone lines without headings. Compaction notes go to `notes`.
-function agentCostEntries(
-  agent: TurnAgent,
-  runner: AgentKind,
-  noEnding: boolean,
-  notes: string[],
-  row: TimedRow,
-): StatDetailEntry[] {
-  if (!agent.spend.length) {
-    return [];
-  }
-  const entries: StatDetailEntry[] = [];
-  for (const entry of childCostEntries(agent, true, 'Cost by usage', runner, noEnding, notes)) {
-    const lines = entry.lines ?? [];
-    if (!lines.length) {
-      continue;
-    }
-    if (lines.every((line) => COST_NOTES.has(hintDetailLine(line)))) {
-      entries.push(...lines.map((line) => ({ label: hintDetailLine(line) })));
-      continue;
-    }
-    entries.push(entry);
-  }
-  // Include usage from every spend part, including unpriced parts.
-  const total = emptyUsage();
-  for (const spend of agent.spend) {
-    addUsage(total, spend.usage);
-  }
-  const usage = usageDetailEntries(
-    total,
-    [],
-    agent.outputRateModel ? agent.outputRate : undefined,
-    runner,
-    agent.outputRateModel,
-    cacheDetailUsage(
-      total,
-      agent.spend.flatMap<Pick<SessionCostUsage, 'usage' | 'usageOrigin'>>((spend) =>
-        spend.usageParts?.length ? spend.usageParts : [spend],
-      ),
-    ),
-    agentRateBasis(runner),
-    row,
-  );
-  if (usage.length) {
-    entries.push({ ...usage[0], separateBefore: true }, ...usage.slice(1));
-  }
-  return entries;
 }
 
 // Plain-text commit record with subjects when available and hashes otherwise.
@@ -1159,7 +1115,7 @@ function agentDisplay(
 }
 
 // Builds a figure's popover record and plain-text detail.
-// Empty entries without a layout produce neither.
+// A list with no entries, no layout and no cost form produces neither.
 // `flat` supplies text for row layouts. `headingLabel` overrides only the popover heading.
 // Partial records append a coverage footer.
 function figureRecord(
@@ -1169,7 +1125,7 @@ function figureRecord(
   flat?: string[],
   headingLabel: string = name,
 ): Pick<AgentFigure, 'record' | 'detail'> {
-  if (!list.entries.length && !list.layout) {
+  if (!list.entries.length && !list.layout && !list.cost) {
     return {};
   }
   const record: StatDetailList = {
@@ -1183,17 +1139,133 @@ function figureRecord(
   };
 }
 
-// A child cost record, with its compaction notes folded under the notes disclosure.
+// A child's own cost in the cost form. Each model is one section, largest first, with its fact
+// line and one row per usage category with a cost. Every row's share is of the child's whole
+// cost, and its title carries the token count. A single model's heading carries no dollars,
+// because the popover heading states them. Coverage lines stay visible in the footer. Recorded
+// list prices and compaction estimates fold under the notes disclosure.
 function costRecordList(
   agent: TurnAgent,
-  partial: boolean,
+  priced: AgentCost,
   runner: AgentKind,
   noEnding: boolean,
   row: TimedRow,
+  running: boolean,
+  labels?: ModelLabels,
 ): Omit<StatDetailList, 'heading'> {
   const notes: string[] = [];
-  const entries = agentCostEntries(agent, runner, noEnding, notes, row);
-  return notes.length ? { entries, notes } : { entries };
+  const footer: string[] = [];
+  const pricingNotes = new Set(agent.spend.flatMap((part) => recordedCostNote(part.costBasis) ?? []));
+  for (const entry of childCostEntries(agent, true, 'Cost by usage', runner, noEnding, notes)) {
+    for (const line of entry.lines ?? []) {
+      if (typeof line === 'object' && 'cost' in line && line.cost) continue;
+      const text = hintDetailLine(line);
+      const into = pricingNotes.has(text) ? notes : footer;
+      if (!into.includes(text)) into.push(text);
+    }
+  }
+  // A part priced as a whole from its usage gets its categories here, from the same inputs.
+  const costs = priced.costs.map((cost) =>
+    cost.categories.length || !cost.publiclyPriced || cost.dollars === null
+      ? cost
+      : {
+          ...cost,
+          categories: pricedUsageCategories(
+            cost.part.usage,
+            cost.part.model,
+            cost.part.provider,
+            cost.part.contextWindow ?? null,
+          ),
+        },
+  );
+  const byModel = new Map<string, PricedSessionCost[]>();
+  for (const cost of costs) {
+    const key = modelTierKey(cost.part);
+    byModel.set(key, [...(byModel.get(key) ?? []), cost]);
+  }
+  const whole = priced.dollars ?? 0;
+  const own = normalizeModelIdentity(agentModel(agent));
+  const measured = agent.outputRateModel ? normalizeModelIdentity(agent.outputRateModel) : null;
+  const groups = [...byModel.values()]
+    .map((held) => ({ held, dollars: dollarsOf(held) }))
+    .sort((a, b) => b.dollars - a.dollars);
+  const several = groups.length > 1;
+  const sections: CostDetailSection[] = [];
+  const parts: CostDetailPart[] = [];
+  for (const { held, dollars } of groups) {
+    const model = normalizeModelIdentity(held[0].part.model);
+    const usage = emptyUsage();
+    for (const cost of held) addUsage(usage, cost.part.usage);
+    const requests = usage.requests ?? 0;
+    const unpriced = held.every((cost) => cost.dollars === null);
+    // Incomplete usage keeps the cached share muted, as in the Main agent section. A running or partly
+    // read child, an incomplete request, and cache writes without a recorded lifetime count.
+    const short =
+      running ||
+      priced.unattributed ||
+      agent.spend.some(
+        (part) =>
+          normalizeModelIdentity(part.model) === model &&
+          (Boolean(part.usageParts?.some((usage) => usage.incomplete)) ||
+            (!(recordedCostBasis(part.costBasis) && part.recordedCost !== undefined) &&
+              (part.unclassifiedCacheWrite ?? 0) > 0)),
+      );
+    const facts = costFacts(held, 'main', short);
+    // A recorded list price has no split by usage, so the rows and their titles cover the other parts.
+    const listed = held.filter((cost) => !cost.publiclyPriced && cost.dollars !== null);
+    const rows = costUsageRows(
+      held.filter((cost) => cost.categories.length),
+      whole,
+      "this subagent's cost",
+    );
+    // The measured output speed and the thinking inside the output join the Output row's title. A
+    // section with no Output row carries them on its heading's title.
+    const output = [
+      model === measured && agent.outputRateModel
+        ? outputRateTitle(agent.outputRate, runner, agent.outputRateModel, agentRateBasis(runner) ?? 'stream', row)
+        : null,
+      usage.thinking && usage.output
+        ? `Thinking: ${detailedTokens(usage.thinking)} tokens (${Math.round((usage.thinking / usage.output) * 100)}% of output), included in output`
+        : null,
+    ].filter((line): line is string => !!line);
+    const outputRow = rows.some((shown) => shown.label === 'Output');
+    sections.push({
+      label:
+        held[0].part.model === 'codex-auto-review'
+          ? autoReviewUsageIdentity(held[0].part.provider).label
+          : modelWithSpeed(held[0].part, labels),
+      // The effort belongs to the child's own model.
+      detail: (!several || model === own) && agent.effort ? agent.effort : '',
+      ...(several
+        ? {
+            value: unpriced
+              ? 'cost unavailable'
+              : `${formatCost(dollars) ?? '$0'}${held.some((cost) => cost.partial) ? '+' : ''}`,
+          }
+        : {}),
+      title: [
+        `${[unpriced ? 'Cost unavailable' : centsCost(dollars), ...(requests ? [requestCount(requests)] : [])].join(', ')}.`,
+        ...(outputRow ? [] : output),
+      ].join('\n'),
+      ...(facts ? { facts } : {}),
+    });
+    parts.push({
+      rows: rows.map((shown) =>
+        shown.label === 'Output' && output.length ? { ...shown, title: [shown.title, ...output].join('\n') } : shown,
+      ),
+      ...(listed.length
+        ? {
+            empty: rows.length ? `No breakdown recorded for ${centsCost(dollarsOf(listed))}` : 'No breakdown recorded',
+          }
+        : {}),
+    });
+  }
+  return {
+    entries: [],
+    cost: { warnings: [], sections, tabs: [{ name: 'Usage', parts }], included: [] },
+    ...(footer.length ? { footer } : {}),
+    ...(notes.length ? { notes } : {}),
+  };
 }
 
 // A Claude child has no observed stream, so its own request records time it.
@@ -1345,6 +1417,7 @@ function agentFigures(
   now: number,
   runner: AgentKind,
   row: TimedRow,
+  labels?: ModelLabels,
 ): AgentFigure[] {
   const figures: AgentFigure[] = [];
   const priced = spendCost(agent);
@@ -1361,7 +1434,7 @@ function agentFigures(
       metric: 'cost',
       compactLabel: `${cost}${partial ? '+' : ''}`,
       name,
-      ...figureRecord(name, costRecordList(agent, partial, runner, noEnding, row), false),
+      ...figureRecord(name, costRecordList(agent, priced, runner, noEnding, row, running, labels), false),
     });
   }
   if (running) {
@@ -1436,6 +1509,7 @@ function agentCard(
   now: number,
   runner: AgentKind = 'claude',
   row: TimedRow = 'subagent',
+  labels?: ModelLabels,
 ): AgentCard {
   const display = agentDisplay(agent, turnRunning, sessionLive);
   // Only a child with live-process evidence counts up. An open child draws no time.
@@ -1447,7 +1521,7 @@ function agentCard(
       ? { speed: modelSpeed(agentModel(agent), agent.ownModelTiers) }
       : {}),
     effort: agent.effort,
-    figures: agentFigures(agent, display.state, rowPaths, now, runner, row),
+    figures: agentFigures(agent, display.state, rowPaths, now, runner, row, labels),
     state: display.state,
     stateWord: display.stateWord,
     since: display.state === 'running' ? agent.startedAt || launch?.step.at || null : null,
@@ -1908,6 +1982,25 @@ const TIMED_ROW_NAMES: Record<TimedRow, string> = {
 };
 
 // Shared usage breakdown for turn token figures and child cost records.
+// The measured output speed and what its clock covers, or null without a measurement.
+function outputRateTitle(
+  measurement: OutputRate | undefined,
+  provider: AgentKind,
+  measuredModel: string | undefined,
+  basis: OutputRateBasis,
+  row: TimedRow,
+): string | null {
+  const rate = outputRateText(measurement);
+  if (!rate) return null;
+  const title =
+    provider === 'claude'
+      ? basis === 'request'
+        ? 'Output tokens per second. Actual output includes thinking. Request time includes the wait for the first response event. Untimed responses are excluded.'
+        : 'Output tokens per second. Actual output includes thinking. Observed response time excludes untimed responses.'
+      : 'Output tokens per second. Actual output includes reasoning. Request time includes preparation and hooks. Blocking local tool waits and untimed responses are excluded.';
+  return `${rate}. ${title}${measuredModel ? ` Measured model: ${measuredModel}. Only this ${TIMED_ROW_NAMES[row]} is timed. Usage totals include any delegated work.` : ''}`;
+}
+
 function usageDetailEntries(
   u: Turn['usage'],
   lead: StatDetailEntry[] = [],
@@ -1925,19 +2018,8 @@ function usageDetailEntries(
   }
   if (u.output) {
     const rate = outputRateText(measurement);
-    const title =
-      provider === 'claude'
-        ? basis === 'request'
-          ? 'Output tokens per second. Actual output includes thinking. Request time includes the wait for the first response event. Untimed responses are excluded.'
-          : 'Output tokens per second. Actual output includes thinking. Observed response time excludes untimed responses.'
-        : 'Output tokens per second. Actual output includes reasoning. Request time includes preparation and hooks. Blocking local tool waits and untimed responses are excluded.';
     const lines: StatDetailLine[] = rate
-      ? [
-          {
-            text: rate,
-            title: `${rate}. ${title}${measuredModel ? ` Measured model: ${measuredModel}. Only this ${TIMED_ROW_NAMES[row]} is timed. Usage totals include any delegated work.` : ''}`,
-          },
-        ]
+      ? [{ text: rate, title: outputRateTitle(measurement, provider, measuredModel, basis, row) ?? rate }]
       : [];
     if (u.thinking)
       lines.push(
@@ -3265,15 +3347,40 @@ function flatDetailEntry(entry: StatDetailEntry): string[] {
           }`
         : ''
     }`,
+    // The rows a closed entry shows, then one line for the rows behind its expander.
+    ...[
+      ...(entry.breakdown?.rows ?? []).slice(0, entry.breakdown?.more?.shown),
+      ...(entry.breakdown?.rest ? [entry.breakdown.rest] : []),
+    ].map((row) => `  ${row.label}: ${row.value} tokens (${row.percent})`),
     ...(entry.lines ?? []).flatMap((line) => flatLine(line, '  ')),
   ];
 }
 
+// The cost form's first tab as plain text: each section heading, its fact line, its rows, and its
+// quiet line.
+function flatCostView(cost: CostDetailView): string[] {
+  return cost.sections.flatMap((section, at) => {
+    const part = cost.tabs[0]?.parts[at];
+    return [
+      ...(at ? [''] : []),
+      `${[section.label, section.detail].filter(Boolean).join(' · ')}${section.value ? `: ${section.value}` : ''}`,
+      ...(section.facts ? [`  ${section.facts.parts.join(' · ')}`] : []),
+      ...(part?.rows ?? []).map((row) => `  ${row.label}: ${row.value} (${row.percent})`),
+      ...(part?.empty ? [`  ${part.empty}`] : []),
+    ];
+  });
+}
+
 function flatDetailList(list: StatDetailList): string[] {
+  // A list that holds only the cost form takes its text from that form.
+  const body =
+    !list.entries.length && list.cost
+      ? flatCostView(list.cost)
+      : list.entries.flatMap((entry) => [...(entry.separateBefore ? [''] : []), ...flatDetailEntry(entry)]);
   return [
     ...(list.heading ? flatDetailEntry(list.heading) : []),
-    ...(list.heading && list.entries.length ? [''] : []),
-    ...list.entries.flatMap((entry) => [...(entry.separateBefore ? [''] : []), ...flatDetailEntry(entry)]),
+    ...(list.heading && body.length ? [''] : []),
+    ...body,
     ...(list.footer ?? []),
     ...(list.notes ?? []),
   ];
@@ -3638,8 +3745,52 @@ function exactCompactionCost(
   );
 }
 
+// A compaction's cost as one section: the model, the fact line of context sent and summary
+// written, and one row per usage category. The rows price the request's usage with the inputs the
+// chip's figure uses, so they add up to it.
+function compactionCostView(
+  usage: Turn['usage'],
+  dollars: number,
+  model: string | null,
+  provider: string | null,
+  contextWindow: number | null,
+  priceContext: UsagePriceContext,
+  labels?: ModelLabels,
+): CostDetailView {
+  // One request, so a model with a request band prices every category in the request's band.
+  const request = { ...usage, requests: 1 };
+  const sent = requestInputOf(usage);
+  const cost: PricedSessionCost = {
+    part: { agent: null, role: 'main', model, provider, contextWindow, usage: request },
+    dollars,
+    partial: false,
+    categories: pricedUsageCategories(request, model, provider, contextWindow, priceContext),
+    unallocatedRecordedCost: false,
+    publiclyPriced: true,
+  };
+  const rows = costUsageRows([cost], dollars, "this compaction's cost").map((row) =>
+    row.label === 'Output' ? { ...row, label: 'Summary written' } : row,
+  );
+  return {
+    warnings: [],
+    sections: [
+      {
+        label: 'Compaction',
+        detail: modelWithSpeed({ model, provider, serviceTier: priceContext.serviceTier }, labels),
+        title: `${centsCost(dollars)}, 1 request.`,
+        facts: {
+          parts: [`${formatTokens(sent)} of context sent`, `${formatTokens(usage.output)} summary written`],
+          title: `${sent.toLocaleString('en-US')} input tokens sent in the one request, ${usage.cacheRead.toLocaleString('en-US')} of them served from the cache. ${usage.output.toLocaleString('en-US')} summary tokens written.`,
+        },
+      },
+    ],
+    tabs: [{ name: 'Usage', parts: [{ rows }] }],
+    included: [],
+  };
+}
+
 // A compaction draws the same row whether it is open or shut, as every card does.
-function compactionChips(c: Compaction): StatChip[] {
+function compactionChips(c: Compaction, labels?: ModelLabels): StatChip[] {
   const chips: StatChip[] = [];
   const exactUsage = c.usage;
   const exactCost = exactUsage
@@ -3664,27 +3815,48 @@ function compactionChips(c: Compaction): StatChip[] {
     summaryChars: c.summaryChars ?? null,
   };
   const estimated = exactUsage ? null : compactionEstimate(estimateInput);
-  const cost = formatCost(exactUsage ? exactCost : estimateCompactionCost(estimateInput));
-  if (cost) {
+  const dollars = exactUsage ? exactCost : estimateCompactionCost(estimateInput);
+  const cost = formatCost(dollars);
+  // An estimate prices its usage as `estimateCompactionCost` does: no provider or window, and the
+  // previous request's inference class and service tier.
+  const view =
+    dollars === null
+      ? null
+      : exactUsage
+        ? compactionCostView(
+            exactUsage,
+            dollars,
+            c.model,
+            c.provider ?? null,
+            c.contextWindow ?? null,
+            { inferenceClass: c.inferenceClass ?? null, serviceTier: c.serviceTier ?? null },
+            labels,
+          )
+        : estimated
+          ? compactionCostView(
+              estimated.usage,
+              dollars,
+              c.model,
+              null,
+              null,
+              {
+                inferenceClass: c.previousRequest?.inferenceClass ?? null,
+                serviceTier: c.previousRequest?.serviceTier ?? null,
+              },
+              labels,
+            )
+          : null;
+  if (cost && view) {
     // The usage stays visible. The pricing basis folds into the notes.
     const detailList: StatDetailList = exactUsage
       ? {
-          entries: [
-            {
-              label: `${formatTokens(exactUsage.input)} uncached, ${formatTokens(exactUsage.cacheRead)} cached, ${formatTokens(exactUsage.output)} output.`,
-            },
-            ...(exactUsage.cacheWrite30m
-              ? [{ label: `30-minute cache writes: ${detailedTokens(exactUsage.cacheWrite30m)} tokens.` }]
-              : []),
-          ],
+          entries: [],
+          cost: view,
           notes: ['Exact request usage priced at the recorded model and provider context.', COST_ESTIMATE_NOTE],
         }
       : {
-          entries: [
-            {
-              label: `${formatTokens(estimated ? requestInputOf(estimated.usage) : c.contextBefore)} of context sent, ${formatTokens(estimated ? estimated.usage.output : c.contextAfter)} summary written.`,
-            },
-          ],
+          entries: [],
+          cost: view,
           // The sentence that calls a Claude cost an estimate stays visible.
           ...(estimated && estimated.basis !== 'read' ? { footer: [CLAUDE_COMPACTION_ESTIMATE] } : {}),
           notes: [...compactionEstimateLines(estimated), COST_ESTIMATE_NOTE],
@@ -3737,7 +3909,7 @@ export function orderTimelineEntries<
   ]);
 }
 
-export function toCompactionCard(c: Compaction, now: number = Date.now()): CompactionCard {
+export function toCompactionCard(c: Compaction, now: number = Date.now(), labels?: ModelLabels): CompactionCard {
   const trigger = compactionTriggerLabel(c.trigger);
   const why =
     c.trigger === 'auto'
@@ -3779,7 +3951,7 @@ export function toCompactionCard(c: Compaction, now: number = Date.now()): Compa
     durationDetail,
     label: headLabel('Compaction', [relative, duration ? `${durationWord('done')} ${duration}` : null], headline),
     headline,
-    chips: compactionChips(c),
+    chips: compactionChips(c, labels),
     summary: c.summary,
   };
 }
@@ -3825,7 +3997,8 @@ type ContextTurn = Pick<Turn, 'contextWindow' | 'model' | 'provider' | 'contextT
 
 const SUBAGENT_RESULTS_LABEL = 'Subagent results';
 const SUBAGENT_RESULTS_ESTIMATE_NOTE = 'Estimated from text size.';
-const SUBAGENT_RESULT_LINES = 5;
+// Rows past the third wait behind the View more expander.
+const SUBAGENT_RESULT_ROWS = 3;
 
 // A share of context in whole percent at 10% or more, and with one decimal below it.
 function subagentSharePercent(tokens: number, context: number): string {
@@ -3836,29 +4009,59 @@ function subagentSharePercent(tokens: number, context: number): string {
   return percent >= 10 ? `${Math.round(percent)}%` : `${Number(percent.toFixed(1))}%`;
 }
 
-// How much of the context holds text that subagents returned, with one line per subagent.
+// How much of the context holds text that subagents returned: a meter for that share, then one
+// aligned row per subagent in the figure's order, three shown and the rest behind the expander.
 function subagentContextEntry(figure: SubagentContextFigure | undefined, context: number): StatDetailEntry | null {
   if (!figure || !context) {
     return null;
   }
-  const part = (tokens: number) => `${formatTokens(tokens)} tokens (${subagentSharePercent(tokens, context)})`;
-  const shown = figure.agents.slice(0, SUBAGENT_RESULT_LINES);
-  const rest = figure.agents.slice(SUBAGENT_RESULT_LINES);
-  const restTokens = rest.reduce((sum, line) => sum + line.tokens, 0);
-  const share = `${subagentSharePercent(figure.tokens, context)} (${formatTokens(figure.tokens)})`;
+  const breakdown = subagentResultsBreakdown(figure, context);
+  const lines = [
+    ...(figure.removed ? ['The latest compaction removed earlier results.'] : []),
+    ...(figure.partial ? ['Part of the session record was not read.'] : []),
+  ];
   return {
     label: SUBAGENT_RESULTS_LABEL,
-    value: share,
+    value: `${subagentSharePercent(figure.tokens, context)} (${formatTokens(figure.tokens)})`,
     valueTitle:
       figure.removed && figure.tokens === 0
         ? 'No subagent results in context'
         : `${figure.tokens.toLocaleString()} tokens, estimate`,
-    lines: [
-      ...shown.map((line) => `${line.name}: ${part(line.tokens)}`),
-      ...(rest.length ? [`${rest.length} more: ${part(restTokens)}`] : []),
-      ...(figure.removed ? ['The latest compaction removed earlier results.'] : []),
-      ...(figure.partial ? ['Part of the session record was not read.'] : []),
-    ],
+    ...(breakdown ? { breakdown } : {}),
+    ...(lines.length ? { lines } : {}),
+  };
+}
+
+// The Subagent results meter and rows. No tokens draw no meter, and no subagents draw no rows.
+function subagentResultsBreakdown(figure: SubagentContextFigure, context: number): ShareBreakdown | null {
+  if (!figure.tokens && !figure.agents.length) {
+    return null;
+  }
+  const hidden = figure.agents.slice(SUBAGENT_RESULT_ROWS);
+  const rest = hidden.length;
+  const restTokens = hidden.reduce((sum, line) => sum + line.tokens, 0);
+  return {
+    ...(figure.tokens > 0 ? { share: Math.min(1, figure.tokens / context) } : {}),
+    rows: figure.agents.map((line) => ({
+      label: line.name,
+      value: detailedTokens(line.tokens),
+      percent: subagentSharePercent(line.tokens, context),
+      title: `${line.name}: ${line.tokens.toLocaleString('en-US')} tokens, estimate`,
+    })),
+    ...(rest > 0
+      ? {
+          more: {
+            shown: SUBAGENT_RESULT_ROWS,
+            open: `View ${rest} more subagent${rest === 1 ? '' : 's'}`,
+            close: 'Show fewer subagents',
+          },
+          rest: {
+            label: `${rest} more`,
+            value: detailedTokens(restTokens),
+            percent: subagentSharePercent(restTokens, context),
+          },
+        }
+      : {}),
   };
 }
 
@@ -5011,7 +5214,7 @@ export function toCard(
   const launches = agentLaunches(turn);
   const rowPaths = fileRowPathsByKey(changed);
   const agentCards = turn.agents.map((agent) =>
-    agentCard(agent, status === 'running', live, launches, rowPaths, now, turn.agent),
+    agentCard(agent, status === 'running', live, launches, rowPaths, now, turn.agent, 'subagent', labels),
   );
   const { commits: commitCards, landings: landingCards, rows: commitRows } = commitRowsOf(turn, now, folders);
   const subagentCommitCount = commitCards.filter((commit) => Boolean(commit.madeBy)).length;

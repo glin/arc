@@ -2170,6 +2170,68 @@ export const SUBAGENT_CONTEXT_CASES: Record<SubagentContextCase, SubagentContext
   missing: undefined,
 };
 
+// A turn whose subagents draw each case of a subagent's own cost: one model, two models, and a
+// total Claude CLI recorded at list price. Two compaction cards follow, one estimated and one
+// priced from its recorded request.
+export function costBreakdownPayload(): Record<string, unknown> {
+  const payload = renderPayload();
+  const [, sonnet, haiku] = LONG_AGENTS;
+  const agents: TurnAgent[] = [
+    sonnet,
+    {
+      ...sonnet,
+      id: 'agent-models',
+      childSessionId: undefined,
+      description: 'Review the fold change and hand the file reads to a smaller model',
+      spend: [...sonnet.spend, ...haiku.spend],
+      commits: [],
+      artifacts: { files: [], commits: [], complete: true, revision: 'fixture-models' },
+    },
+    {
+      ...haiku,
+      id: 'agent-list',
+      description: 'Run the Claude CLI review of the fold head',
+      agentType: 'claude-cli',
+      spend: [{ ...haiku.spend[0], recordedCost: 0.42, costBasis: 'list' }],
+    },
+  ];
+  const exact: Compaction = {
+    sessionId: 's1',
+    at: NOW - 300_000,
+    contextBefore: 250_451,
+    contextAfter: 7_591,
+    droppedTokens: 242_860,
+    durationMs: 31_000,
+    trigger: 'auto',
+    model: 'gpt-6-astra',
+    provider: 'openai',
+    contextWindow: 258_400,
+    serviceTier: 'standard',
+    usage: {
+      requests: 1,
+      input: 220_801,
+      cacheWrite1h: 0,
+      cacheWrite5m: 0,
+      cacheWrite30m: 1_234,
+      cacheRead: 28_416,
+      output: 7_591,
+      thinking: 0,
+    },
+    summary: '',
+  };
+  return {
+    ...payload,
+    cards: [
+      toCard({ ...FIXTURE_TURNS[LONG_TURN_INDEX], agents }, false, NOW),
+      {
+        ...toCompactionCard(COMPACTION_SUMMARIES[0], NOW),
+        summaryHtml: renderRichMarkdown(COMPACTION_SUMMARIES[0].summary),
+      },
+      { ...toCompactionCard(exact, NOW), summaryHtml: '' },
+    ],
+  };
+}
+
 // Popovers use the same builders as the panel, with a partial history and recorded cache lifetimes.
 // A subagent results case gives both turns its figure and draws the session context chip from them.
 export function statPopoverPayload(subagents?: SubagentContextCase): Record<string, unknown> {

@@ -9227,7 +9227,7 @@ test('a running Claude background child row names the model it ran beside its co
   assert.equal(row.model, 'opus-5-5', 'the running row named the Agent call alias');
   const [cost] = row.figures;
   assert.equal(cost?.compactLabel, '$0.72+');
-  assert.match(cost?.detail ?? '', /Cost by usage · opus-5-5: \$0\.72/);
+  assert.match(cost?.detail ?? '', /^At least \$0\.72 spent\n\nOpus 5\.5\b/);
 });
 
 test('a Claude child viewed as its own session prices its nested launch from the shared meta folder', async () => {

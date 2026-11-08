@@ -5391,6 +5391,87 @@ test('the Delegated section folds models past the third behind the View more exp
   }
 });
 
+// The context figure's Subagent results rows past the third wait behind the View more expander.
+// Tab reaches the expander in a pinned popover, and the figure's description names the shown rows.
+test('the Subagent results expander takes a Tab stop and the description follows the shown rows', async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('Edge or Chrome is required');
+    return;
+  }
+  const page = await browser.newPage();
+  try {
+    await page.setContent(themed(pageHtml()));
+    await page.setViewportSize({ width: 1350, height: 900 });
+    await post(page, statPopoverPayload('many'));
+    const selector = '.chips .statchip[data-metric="context"]';
+    const state = () =>
+      page.evaluate((figureSelector) => {
+        const pop = document.querySelector<HTMLElement>('#chippop');
+        const figure = document.querySelector<HTMLElement>(figureSelector);
+        // The described text, without the parts a closed expander hides.
+        const shownText = (node: Node): string =>
+          node instanceof HTMLElement && node.hidden
+            ? ''
+            : node.nodeType === Node.TEXT_NODE
+              ? (node.textContent ?? '')
+              : Array.from(node.childNodes).map(shownText).join(' ');
+        const described = (figure?.getAttribute('aria-describedby') ?? '')
+          .split(' ')
+          .map((id) => document.getElementById(id))
+          .map((node) => (node ? shownText(node) : ''))
+          .join(' ');
+        const rows = Array.from(pop?.querySelectorAll<HTMLElement>('.sharerows .costrow') ?? []);
+        return {
+          pinned: Boolean(pop?.classList.contains('pinned')),
+          shown: rows.filter((row) => !row.hidden).length,
+          summary: pop?.querySelector('.sharerows .costmore summary')?.textContent,
+          onSummary: document.activeElement === pop?.querySelector('.sharerows .costmore summary'),
+          first: described.includes('Survey every caller of renderPayload'),
+          fourth: described.includes('Read the oversized tool output'),
+        };
+      }, selector);
+    await page.locator(selector).first().focus();
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => !!document.querySelector('#chippop.pinned .sharerows .costmore summary'));
+    assert.deepEqual(await state(), {
+      pinned: true,
+      shown: 3,
+      summary: 'View 9 more subagents',
+      onSummary: false,
+      first: true,
+      fourth: false,
+    });
+    // The expander is the first Tab stop in the pinned popover.
+    await page
+      .locator(selector)
+      .first()
+      .evaluate((figure) => figure.after(document.createElement('button')));
+    await page.keyboard.press('Tab');
+    await page.waitForFunction(() => document.activeElement?.matches('#chippop .sharerows .costmore summary') === true);
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() =>
+      document.querySelector('#chippop .sharerows .costmore details')?.hasAttribute('open'),
+    );
+    assert.deepEqual(await state(), {
+      pinned: true,
+      shown: 12,
+      summary: 'Show fewer subagents',
+      onSummary: true,
+      first: true,
+      fourth: true,
+    });
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(
+      () => !document.querySelector('#chippop .sharerows .costmore details')?.hasAttribute('open'),
+    );
+    const closed = await state();
+    assert.deepEqual([closed.shown, closed.summary, closed.fourth], [3, 'View 9 more subagents', false]);
+  } finally {
+    await page.close();
+  }
+});
+
 test('cache-write warnings share cost faces and retain pinned detail through updates', async (t) => {
   const browser = await browserOrNone();
   if (!browser) {

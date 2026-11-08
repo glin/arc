@@ -37,6 +37,7 @@ import {
   draftRenderPayload,
   launcherPinsPayload,
   compactionSummaryPayload,
+  costBreakdownPayload,
   cacheWriteWarningPayload,
   costOverheadsPayload,
   waitWarningPayload,
@@ -68,6 +69,13 @@ export interface Shot {
   escape?: boolean | number; // Number of Escape presses before other actions. `true` presses once.
   click?: string; // Control selector to press.
   costTab?: 'Tools'; // Cost popover tab to select after the click pins it.
+  press?: string[]; // Controls to press in order after the click and before capture.
+  // Control to focus after the presses. The capture blurs the focused control, and a blur inside a
+  // popover closes it, so a capture after a press returns focus to the popover's figure.
+  refocus?: string;
+  // Keep the focus through the capture, for a nested popover that a blur anywhere would close.
+  keepFocus?: boolean;
+  costBreakdowns?: boolean; // Load the subagent and compaction cost fixture.
   costHover?: string; // Cost figure to hover until its unpinned popover opens.
   hover?: string; // Control selector to hover until its hint opens.
   after?: string; // Control selector to press after capture.
@@ -242,6 +250,37 @@ export const SHOTS: Shot[] = [
     subagentContext: 'board',
     click: '.sessionstats .statchip:has-text("ctx")',
   },
+  // The Subagent results expander opens to every subagent, with four and with twelve, at both
+  // widths. The closed shots the lists above take are not repeated.
+  ...(['turn', 'session'] as const).flatMap((scope) =>
+    (['board', 'many'] as const).flatMap((subagentContext) =>
+      [1350, 340].flatMap((width) =>
+        [false, true].flatMap((open): Shot[] => {
+          const size = width === 1350 ? 'wide' : 'narrow';
+          const name = `${size}-stat${scope === 'turn' ? '-turn' : ''}-context-subagents-${subagentContext}`;
+          const taken = !open && (subagentContext === 'board' || (size === 'wide' && scope === 'turn'));
+          return taken
+            ? []
+            : [
+                {
+                  name: open ? `${name}-open` : name,
+                  width,
+                  escape: true,
+                  stats: true,
+                  subagentContext,
+                  click: `${scope === 'turn' ? '.chips' : '.sessionstats'} .statchip:has-text("ctx")`,
+                  ...(open
+                    ? {
+                        press: ['#chippop .sharerows .costmore summary'],
+                        refocus: `${scope === 'turn' ? '.chips' : '.sessionstats'} .statchip:has-text("ctx")`,
+                      }
+                    : {}),
+                },
+              ];
+        }),
+      ),
+    ),
+  ),
   {
     name: 'narrow-stat-context',
     width: 340,
@@ -403,6 +442,35 @@ export const SHOTS: Shot[] = [
     openCard: LONG_CARD_HEAD,
     click: LONG_CARD_COST_CHIP,
   })),
+  // A subagent's own cost popover for one model, two models and a recorded list price, and a
+  // compaction's cost popover for an estimate and a recorded request, at both widths. They load
+  // their own cards, so they follow the long card's captures.
+  ...[1350, 340].flatMap((width): Shot[] => {
+    const size = width === 1350 ? 'wide' : 'narrow';
+    const height = width === 1350 ? 1650 : 2650;
+    const agents = '#list .turn .statchip[data-metric="agents"]';
+    return [
+      ...(['single', 'models', 'list'] as const).map((child, at) => ({
+        name: `${size}-agent-cost-${child}`,
+        width,
+        height,
+        escape: 2,
+        costBreakdowns: true,
+        openCard: '#list .turn h3.cardheading button.head',
+        click: agents,
+        press: [`#chippop .agentrow:nth-child(${at + 1}) .railstatchip[data-metric="cost"]`],
+        keepFocus: true,
+      })),
+      ...(['estimated', 'exact'] as const).map((compaction, at) => ({
+        name: `${size}-compaction-cost-${compaction}`,
+        width,
+        height,
+        escape: 2,
+        costBreakdowns: true,
+        click: `#list section.compaction >> nth=${at} >> .statchip[data-metric="cost"]`,
+      })),
+    ];
+  }),
   // Capture the long turn after its main agent finishes while two subagents run.
   {
     name: 'wide-long-card-subagents',
@@ -1205,6 +1273,10 @@ export async function shoot(
       await page.evaluate(SETTLED);
     }
   }
+  if (shot.costBreakdowns) {
+    await page.evaluate(`window.postMessage(${JSON.stringify(costBreakdownPayload())}, '*')`);
+    await page.evaluate(SETTLED);
+  }
   if (shot.stats !== undefined) {
     const payload = shot.stats ? statPopoverPayload(shot.subagentContext) : renderPayload();
     await page.evaluate(`window.postMessage(${JSON.stringify(payload)}, '*')`);
@@ -1477,6 +1549,19 @@ export async function shoot(
     }
     await page.evaluate(SETTLED);
   }
+  for (const control of shot.press ?? []) {
+    try {
+      await page.locator(control).first().click({ timeout: 5_000 });
+    } catch (error) {
+      console.log(`${shot.name}.webp not written: ${control}: ${String(error)}`);
+      return;
+    }
+    await page.evaluate(SETTLED);
+  }
+  if (shot.refocus) {
+    await page.locator(shot.refocus).first().focus();
+    await page.evaluate(SETTLED);
+  }
   if (shot.costTab) {
     // Select the tab from the keyboard, as a reader moves along the strip.
     const tabs = ['Usage', 'Tools'];
@@ -1608,7 +1693,7 @@ export async function shoot(
     await page.mouse.move(0, 0);
   }
   await page.evaluate(`
-    document.activeElement instanceof HTMLElement && document.activeElement.blur();
+    ${shot.keepFocus ? '' : 'document.activeElement instanceof HTMLElement && document.activeElement.blur();'}
     document.querySelectorAll('.turn').forEach((card) => card.classList.add('is-read'));
   `);
   await page.evaluate(SETTLED);

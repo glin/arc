@@ -29,6 +29,9 @@ A reader skims a breakdown before reading it. Each figure must be findable at a 
 - Show the hierarchy. A section heading uses a stronger text role than its rows. A divider or spacing separates sections that describe different subjects.
 - Place a fact line inside the section it describes. A line under a shared chart reads as a fact about every part of that chart.
 - Omit a chart that has one part. A split bar at 100 percent shows nothing.
+- Pick the mark by the reader's question. A meter shows the share one part takes of one whole. Rows with bars compare parts of real size. Aligned rows without bars list parts whose digits already carry the comparison. One popover carries one kind of mark.
+- Keep every visible figure in a row of one kind. A cost row shows dollars and its share, and its hover gives the token count.
+- Show the first three rows of a long list and fold the rest behind a `View N more` expander, which opens to `Show fewer`.
 
 Follow the [project UI rules](../extension/CLAUDE.md#ui-work) for text ownership, relative sizing, and shared treatments. Read production markup before reusing a CSS class.
 

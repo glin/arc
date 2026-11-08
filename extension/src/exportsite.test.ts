@@ -781,12 +781,11 @@ test('an exported Claude subagent row shows the speed its request-timed turns me
     const { manifest, data } = exportedSiteData((await writer.publish(async () => {})).directory);
     const card = (data.get(manifest.sessions[0].pages[0].cards![0].id) as { card: CardView }).card;
     const cost = card.agents![0].figures.find((figure) => figure.metric === 'cost');
-    const record = cost?.record as { entries: { label: string; lines?: unknown[] }[] } | undefined;
-    const line = record?.entries.find((entry) => entry.label === 'Output')?.lines?.[0] as
-      | { text: string; title?: string }
-      | undefined;
-    assert.equal(line?.text, '150.0 tok/s', JSON.stringify(cost));
-    assert.match(line?.title ?? '', /Request time includes the wait for the first response event/);
+    // The speed sits in the Output row's title.
+    const record = cost?.record as { cost?: { tabs: { parts: { rows: { label: string; title: string }[] }[] }[] } };
+    const output = record?.cost?.tabs[0].parts[0].rows.find((row) => row.label === 'Output');
+    assert.match(output?.title ?? '', /\n150\.0 tok\/s\. /, JSON.stringify(cost));
+    assert.match(output?.title ?? '', /Request time includes the wait for the first response event/);
   } finally {
     await writer.dispose();
   }

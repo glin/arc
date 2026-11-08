@@ -52,6 +52,8 @@ interface DetailHead {
   group?: boolean;
   // Turn the label into a button when the list declares actions.
   nameAction?: DetailNameAction;
+  // A meter under the head that fills to `share`, then aligned rows with no bars, before the lines.
+  breakdown?: { share?: number; rows: AlignedRowView[]; more?: MoreView };
 }
 
 type DetailLine =
@@ -75,16 +77,28 @@ const KIND_CLASS: Record<'description' | 'path' | 'muted', string> = {
   muted: 'chippopmuted',
 };
 
-interface CostRowView {
+// The fields of every aligned row. A breakdown row has only these.
+interface AlignedRowView {
   label: string;
-  count?: string;
   percent: string;
-  share: number;
   value: string;
   title: string;
 }
 
-// The tabbed form of the two cost popovers, as `turncard.ts` builds it.
+interface CostRowView extends AlignedRowView {
+  count?: string;
+  share: number;
+}
+
+// Rows past `shown` wait behind the View more expander, which reads `open` or `close`.
+interface MoreView {
+  shown: number;
+  open: string;
+  close: string;
+}
+
+// The cost form, as `turncard.ts` builds it for the turn and session cost popovers, a subagent's own
+// cost and a compaction's cost.
 export interface CostDetailView {
   warnings: { text: string; quiet?: string; title?: string }[];
   split?: {
@@ -101,7 +115,7 @@ export interface CostDetailView {
   }[];
   tabs: {
     name: string;
-    parts: { rows: CostRowView[]; more?: { shown: number; open: string; close: string }; empty?: string }[];
+    parts: { rows: CostRowView[]; more?: MoreView; empty?: string }[];
   }[];
   included: { label: string; value: string; title?: string }[];
 }
@@ -279,8 +293,8 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
   let pinned = false;
   // The cost tab the reader chose. It holds while the popover stays pinned. Empty selects the first tab.
   let costTab = '';
-  // Whether the reader opened the delegated models past the third. It holds as the cost tab does.
-  let costMore = false;
+  // Whether the reader opened the rows behind the View more expander. It holds as the cost tab does.
+  let moreOpen = false;
   let pointerOnAnchor = false;
   let pointerOnDetail = false;
   let rowsHost: HTMLElement | null = null;
@@ -494,9 +508,9 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
   };
   // Arrow keys reach label actions, record-row buttons, the Context action, and the worktree link.
   const POP_PRESSES = '.chippopnamelink, .chippoprows button, .context-bound button, .sessionworktreelink';
-  // The Tab walk holds presses, row figure stops, rows without links, the Context
-  // disclosures and the notes disclosure. The arrow keys walk presses alone.
-  const POP_TAB_STOPS = `${POP_PRESSES}, .chippoprows [tabindex="0"], .poptabs [tabindex="0"], .context-messages summary, .context-measurement summary, .chippopnotes summary`;
+  // The Tab walk holds presses, row figure stops, rows without links, the cost tabs, the View more
+  // expander, the Context disclosures and the notes disclosure. The arrow keys walk presses alone.
+  const POP_TAB_STOPS = `${POP_PRESSES}, .chippoprows [tabindex="0"], .poptabs [tabindex="0"], .costmore summary, .context-messages summary, .context-measurement summary, .chippopnotes summary`;
   // Every action the reader can reach inside the popover, in reading order.
   const actionButtons = () => Array.from(pop.querySelectorAll<HTMLElement>(POP_PRESSES));
   // Every stop Tab takes inside the popover, in reading order.
@@ -540,8 +554,79 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
     disclosure.appendChild(list);
     pop.appendChild(disclosure);
   };
+  // One aligned row: name, the agent count when counted, the figure, the quiet percent, and a bar
+  // under them when the row has a share. The hover text is the row's native title.
+  const costRow = (
+    row: AlignedRowView & { count?: string; share?: number },
+    { counted = false, figure = 'dollars' }: { counted?: boolean; figure?: 'dollars' | 'tokens' } = {},
+  ) => {
+    const item = el('li', 'costrow');
+    item.title = row.title;
+    const parts = [
+      el('span', 'context-category-label', row.label),
+      ...(counted ? [el('span', 'costcount chippopscale', row.count ?? '')] : []),
+      el('span', `chippopvalue ${figure}`, row.value),
+      el('span', 'chippopscale pct', row.percent),
+    ];
+    if (row.share !== undefined) {
+      const bar = el('div', 'sbbar context-meter');
+      bar.setAttribute('aria-hidden', 'true');
+      const fill = el('i');
+      fill.style.width = `${row.share * 100}%`;
+      bar.append(fill);
+      parts.push(bar);
+    }
+    item.append(...inlineText(parts));
+    return item;
+  };
+  // The View more expander closes a list of rows. Rows past `more.shown` hide while it is closed.
+  // A press in a hover pins the popover. The open state holds for the popover through a redraw,
+  // so a live update keeps the reader's choice, and a new anchor starts it closed.
+  const appendMore = (list: HTMLElement, rows: HTMLElement[], more: MoreView) => {
+    const folded = rows.slice(more.shown);
+    const item = el('li', 'costmore');
+    const disclosure = el('details', 'projectspendpricing');
+    const summary = el('summary');
+    const show = () => {
+      disclosure.open = moreOpen;
+      summary.textContent = moreOpen ? more.close : more.open;
+      for (const row of folded) row.hidden = !moreOpen;
+    };
+    summary.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      moreOpen = !moreOpen;
+      if (!pinned && anchor) pin(anchor);
+      show();
+      if (anchor && !pop.hidden) place(anchor);
+    });
+    disclosure.append(summary);
+    item.append(disclosure);
+    list.append(item);
+    show();
+  };
+  // An entry's meter and its aligned rows, which line up on one grid with no bars. An entry with
+  // no share has no meter.
+  const appendBreakdown = (item: HTMLElement, breakdown: NonNullable<DetailHead['breakdown']>) => {
+    if (breakdown.share !== undefined) {
+      const meter = el('div', 'sbbar context-meter sharemeter');
+      meter.setAttribute('aria-hidden', 'true');
+      const fill = el('i');
+      fill.style.width = `${Math.min(1, Math.max(0, breakdown.share)) * 100}%`;
+      meter.append(fill);
+      item.append(meter);
+    }
+    const grid = el('div', 'costgrid nocount sharerows');
+    const list = el('ul', 'context-categories costrows costsection');
+    list.setAttribute('role', 'list');
+    const rows = breakdown.rows.map((row) => costRow(row, { figure: 'tokens' }));
+    list.append(...rows);
+    if (breakdown.more) appendMore(list, rows, breakdown.more);
+    grid.append(list);
+    item.append(grid);
+  };
   // The cost form: warnings, the split bar, the tab strip, and each tab's panel. A panel holds the
-  // Main agent and Delegated sections and the "Included above" footnote on one grid, so dollars,
+  // sections, such as Main agent and Delegated, and the "Included above" footnote on one grid, so dollars,
   // bars and percents line up across them. Only the selected tab's panel shows. A hover opens on
   // the first tab, and choosing a tab or the View more expander in a hover pins the popover.
   const drawCost = (cost: CostDetailView) => {
@@ -645,26 +730,6 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
       });
       pop.appendChild(strip);
     }
-    const costRow = (row: CostRowView, counted: boolean) => {
-      const item = el('li', 'costrow');
-      item.title = row.title;
-      const bar = el('div', 'sbbar context-meter');
-      bar.setAttribute('aria-hidden', 'true');
-      const fill = el('i');
-      fill.style.width = `${row.share * 100}%`;
-      bar.append(fill);
-      // Name, agent count, dollars and percent on one line, and the bar under them.
-      item.append(
-        ...inlineText([
-          el('span', 'context-category-label', row.label),
-          ...(counted ? [el('span', 'costcount chippopscale', row.count ?? '')] : []),
-          el('span', 'chippopvalue dollars', row.value),
-          el('span', 'chippopscale pct', row.percent),
-          bar,
-        ]),
-      );
-      return item;
-    };
     cost.tabs.forEach((tab, at) => {
       // A count column shows only on a tab with a counted row, so a tab without one keeps its columns close.
       const counted = tab.parts.some((part) => part.rows.some((row) => row.count));
@@ -714,34 +779,10 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
           facts.append(text);
           list.append(facts);
         }
-        const rows = part.rows.map((row) => costRow(row, counted));
+        const rows = part.rows.map((row) => costRow(row, { counted }));
         list.append(...rows);
-        if (!rows.length && part.empty) list.append(el('li', 'costempty chippopscale', part.empty));
-        const more = part.more;
-        if (more) {
-          const folded = rows.slice(more.shown);
-          const item = el('li', 'costmore');
-          const disclosure = el('details', 'projectspendpricing');
-          const summary = el('summary');
-          // The open state outlives a redraw, so a live update keeps the reader's choice.
-          const show = () => {
-            disclosure.open = costMore;
-            summary.textContent = costMore ? more.close : more.open;
-            for (const row of folded) row.hidden = !costMore;
-          };
-          summary.addEventListener('click', (event) => {
-            event.preventDefault();
-            event.stopPropagation();
-            costMore = !costMore;
-            if (!pinned && anchor) pin(anchor);
-            show();
-            if (anchor && !pop.hidden) place(anchor);
-          });
-          disclosure.append(summary);
-          item.append(disclosure);
-          list.append(item);
-          show();
-        }
+        if (part.empty) list.append(el('li', 'costempty chippopscale', part.empty));
+        if (part.more) appendMore(list, rows, part.more);
         panel.append(list);
       });
       if (cost.included.length) {
@@ -891,6 +932,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
           }
           const head = detailHead(entry, 'chippopitemhead', withActions);
           item.appendChild(head);
+          if (entry.breakdown) appendBreakdown(item, entry.breakdown);
           appendLines(item, entry.lines, withActions);
           list.appendChild(item);
         }
@@ -1012,7 +1054,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
       contextMeasurementOpen = false;
       contextMessagesOpen = false;
       costTab = '';
-      costMore = false;
+      moreOpen = false;
     }
     anchor = node;
     // Draw available actions on hover as well as when pinned.
@@ -1068,7 +1110,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
     anchor = null;
     pinned = false;
     costTab = '';
-    costMore = false;
+    moreOpen = false;
     focusBack = null;
     drawnPrint = null;
     drawnActions = false;

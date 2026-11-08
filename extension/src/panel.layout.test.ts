@@ -647,7 +647,8 @@ test("a subagent's duration record draws like its cost record", { timeout: 60_00
     assert.deepEqual(ran.labels, ['Calls by tool', 'Failed calls', 'Started', 'Ended']);
     const cost = await open('cost');
     assert.equal(cost.heading, '$0.33 spent');
-    for (const [part, style] of Object.entries(ran.style)) {
+    // The cost record draws the cost form, so the two records share the popover and its heading.
+    for (const [part, style] of Object.entries(ran.style).filter(([part]) => part === 'pop' || part === 'heading')) {
       assert.ok(style, `the duration record draws no ${part}`);
       assert.deepEqual(
         style,
@@ -912,26 +913,27 @@ test(
         false,
         'the cost figure opened no record of its own',
       );
-      // Nested cost details use structured heading, value, and supporting lines.
+      // The nested cost record draws the cost form: its model section, then one row per usage
+      // category, each with its dollars after its label.
 
       assert.deepEqual(
         await page.evaluate(`(() => {
       const pop = document.querySelector('#chippopnested');
-      const item = pop.querySelector('.chippopitem');
-      const label = item.querySelector('.chippoplabel');
-      const value = item.querySelector('.chippopvalue');
-      const line = item.querySelector('.chippopsubitem');
+      const sections = pop.querySelectorAll('.costsection');
+      const rows = [...pop.querySelectorAll('.costsection .costrow:not(.costhead)')];
       return [
         pop.querySelector('.chippophead .chippoplabel').textContent,
-        label.textContent,
-        value.textContent,
-        value.getBoundingClientRect().left > label.getBoundingClientRect().right,
-        line.textContent,
-        line.getBoundingClientRect().left > label.getBoundingClientRect().left,
+        pop.querySelectorAll('.chippopitem').length,
+        sections.length,
+        sections[0].querySelectorAll('.costhead').length,
+        rows.length,
+        rows.every((row) =>
+          row.querySelector('.chippopvalue').getBoundingClientRect().left >
+            row.querySelector('.context-category-label').getBoundingClientRect().right),
       ];
     })()`),
-        ['$0.31 spent', 'Cost by usage · opus-5', '$0.31', true, 'Output: $0.11', true],
-        'the cost record is not drawn in the shape the card draws its own',
+        ['$0.31 spent', 0, 1, 1, 2, true],
+        'the cost record is not drawn in the cost form',
       );
       // Equal z-index values place the later body-mounted popover above the earlier one.
 

@@ -223,6 +223,18 @@ test('turn token detail places qualified measurement under Output before Thinkin
   }
 });
 
+// A cost record's rows in reading order, each with its section's label.
+const costRecordRows = (record: StatDetailList | undefined) =>
+  (record?.cost?.sections ?? []).flatMap((section, at) =>
+    (record?.cost?.tabs[0]?.parts[at]?.rows ?? []).map((row) => ({ section: section.label, ...row })),
+  );
+
+// The Output row's title lines after its dollars line, where a measured speed and the thinking go.
+const outputRowTitle = (record: StatDetailList | undefined, section?: RegExp) =>
+  costRecordRows(record)
+    .filter((row) => row.label === 'Output' && (!section || section.test(row.section)))
+    .map((row) => row.title.split('\n').slice(1))[0];
+
 test('child usage measurement keeps measured identity separate from its displayed model', () => {
   for (const priced of [false, true]) {
     const child = agent({
@@ -241,12 +253,23 @@ test('child usage measurement keeps measured identity separate from its displaye
     const row = toCard(turn({ agent: 'codex', agents: [child] }), false, NOW).agents[0];
     if (priced) assert.equal(row.model?.toLowerCase(), 'gpt-6-astra');
     const figure = row.figures.find((value) => value.metric === (priced ? 'cost' : 'tokens'))!;
-    const line = figure.record!.entries.find((entry) => entry.label === 'Output')!.lines![0];
-    assert.ok(typeof line === 'object' && 'text' in line);
-    assert.equal(line.text, '8.4 tok/s');
-    assert.ok(line.title?.includes('gpt-6.1-sol'));
-    assert.ok(line.title?.includes('Only this subagent'));
-    assert.ok(figure.detail?.includes('8.4 tok/s'));
+    if (priced) {
+      // The speed joins the Output row of the measured model's section alone.
+      const timed = costRecordRows(figure.record).filter((held) => held.title.includes('tok/s'));
+      assert.deepEqual(
+        timed.map((held) => held.label),
+        ['Output'],
+      );
+      assert.match(timed[0].section, /sol/i);
+      assert.match(timed[0].title, /\n8\.4 tok\/s\. .*gpt-6\.1-sol\. Only this subagent/);
+    } else {
+      const line = figure.record!.entries.find((entry) => entry.label === 'Output')!.lines![0];
+      assert.ok(typeof line === 'object' && 'text' in line);
+      assert.equal(line.text, '8.4 tok/s');
+      assert.ok(line.title?.includes('gpt-6.1-sol'));
+      assert.ok(line.title?.includes('Only this subagent'));
+      assert.ok(figure.detail?.includes('8.4 tok/s'));
+    }
     assert.ok(
       !JSON.stringify(toCard(turn({ agents: [{ ...child, outputRateModel: undefined }] }), false, NOW)).includes(
         'tok/s',
@@ -267,14 +290,17 @@ test('dispatched Codex usage retains qualified measurement in priced and unprice
     };
     const row = dispatchedAgentCard('child', 'Review the card', spend, 'done', 1000, 65000, 2, [], NOW, 'codex');
     const figure = row.figures.find((value) => value.metric === (priced ? 'cost' : 'tokens'))!;
-    const line = figure.record!.entries.find((entry) => entry.label === 'Output')!.lines![0];
-    assert.ok(typeof line === 'object' && 'text' in line);
-    assert.equal(line.text, '8.4 tok/s');
-    assert.equal(
-      line.title,
-      '8.4 tok/s. Output tokens per second. Actual output includes reasoning. Request time includes preparation and hooks. Blocking local tool waits and untimed responses are excluded. Measured model: gpt-6.1-sol. Only this dispatched session is timed. Usage totals include any delegated work.',
-    );
-    assert.ok(figure.detail?.includes('8.4 tok/s'));
+    const speed =
+      '8.4 tok/s. Output tokens per second. Actual output includes reasoning. Request time includes preparation and hooks. Blocking local tool waits and untimed responses are excluded. Measured model: gpt-6.1-sol. Only this dispatched session is timed. Usage totals include any delegated work.';
+    if (priced) {
+      assert.deepEqual(outputRowTitle(figure.record), [speed]);
+    } else {
+      const line = figure.record!.entries.find((entry) => entry.label === 'Output')!.lines![0];
+      assert.ok(typeof line === 'object' && 'text' in line);
+      assert.equal(line.text, '8.4 tok/s');
+      assert.equal(line.title, speed);
+      assert.ok(figure.detail?.includes('8.4 tok/s'));
+    }
     const unqualified = dispatchedAgentCard(
       'child',
       'Review the card',
@@ -4090,15 +4116,10 @@ test('a subagent row draws model, effort and its figures, and leaves the tool us
     ],
   );
   assert.deepEqual(
-    card.agents[0].figures[0].record?.entries.slice(0, 1).map((entry) => [entry.label, entry.value]),
-    [['Cost by usage · haiku-4-5', '$0.08']],
+    card.agents[0].figures[0].record?.cost?.sections.map((section) => [section.label, section.detail, section.value]),
+    [['Haiku 4.5', 'high', undefined]],
   );
 });
-
-// Extract detail-line text without its adjacent cost and cache fields.
-
-const lineText = (line: StatDetailLine): string =>
-  typeof line === 'string' ? line : 'text' in line ? line.text : `${line.lead}${line.trail}`;
 
 // Each child figure carries its own detail. The row tooltip retains the run information.
 
@@ -4171,27 +4192,15 @@ test('each subagent figure carries its own record and the row keeps the run line
   );
   // The cost detail separates values from their breakdown and ends with usage totals.
 
+  assert.deepEqual(drawn[0].record?.entries, []);
   assert.deepEqual(
-    drawn[0].record?.entries.map((entry) => [entry.label, entry.value]),
+    costRecordRows(drawn[0].record).map((row) => [row.label, row.value]),
     [
-      ['Cost by usage · sonnet-5', '$0.33'],
-      ['Input', '658k tokens'],
-      ['Output', '9,400 tokens'],
-      ['Model requests', '18'],
-      ['Input breakdown', undefined],
+      ['Cached input reads', '$0.12'],
+      ['5-minute cache writes', '$0.10'],
+      ['Output', '$0.09'],
+      ['Uncached input', '$0.01'],
     ],
-  );
-  assert.deepEqual((drawn[0].record?.entries[0].lines ?? []).map(lineText), [
-    'Output: $0.09',
-    'Cached input reads: $0.12',
-    'Uncached input: $0.01',
-    '5-minute cache writes: $0.10',
-  ]);
-  // Cached-read detail retains its structured cache share.
-
-  assert.equal(
-    (drawn[0].record?.entries[0].lines ?? []).filter((line) => typeof line === 'object' && 'cacheHit' in line).length,
-    1,
   );
   // Commit and file figures select card rows by their SHAs and paths.
 
@@ -4311,19 +4320,21 @@ test('each subagent figure carries its own record and the row keeps the run line
     NOW,
   );
   const partialCost = partialSpend.agents[0].figures.find((figure) => figure.metric === 'cost');
-  // Usage totals include both priced and unpriced parts.
-
+  // The figure keeps its lower-bound mark, the unpriced model keeps its section, and the coverage
+  // line stays visible.
+  assert.equal(partialCost?.name, 'At least <$0.01 spent');
   assert.deepEqual(
-    partialCost?.record?.entries.map((entry) => [entry.label, entry.value]),
+    partialCost?.record?.cost?.sections.map((section) => [section.label === 'Sonnet 5', section.value]),
     [
-      ['Cost by usage · sonnet-5', '<$0.01'],
-      ['Some nested subagents are still running or left no record. This is the cost so far.', undefined],
-      ['Input', '2,000 tokens'],
-      ['Output', '1,000 tokens'],
-      ['Model requests', '4'],
-      ['Input breakdown', undefined],
+      [true, '<$0.01'],
+      [false, 'cost unavailable'],
     ],
-    'a block with nothing priced under it heads a lone note',
+  );
+  assert.ok(
+    partialCost?.record?.footer?.includes(
+      'Some nested subagents are still running or left no record. This is the cost so far.',
+    ),
+    JSON.stringify(partialCost?.record?.footer),
   );
 
   // The scrollable commits popover includes every recorded commit.
@@ -4597,7 +4608,7 @@ test('a subagent cost record folds its compaction note, and the turn cost keeps 
   );
 });
 
-test('a priced child keeps its requests and its token totals in the cost record', () => {
+test("a priced child's cost record names its model, one fact line and one dollar row per usage category", () => {
   const card = toCard(
     turn({
       agents: [
@@ -4654,22 +4665,53 @@ test('a priced child keeps its requests and its token totals in the cost record'
     ],
   );
   const cost = figures[0];
-  // The usage blocks close the cost record, parted from the money by one rule.
+  // Every visible figure in a row is a cost, largest first. The token counts sit in the row titles
+  // and the fact line, and the bar fills to the row's share of the child's cost.
+  assert.deepEqual(cost.record?.entries, []);
   assert.deepEqual(
-    cost.record?.entries.slice(-4).map((entry) => [entry.label, entry.value]),
+    cost.record?.cost?.sections.map((section) => [section.label, section.detail, section.value, section.facts?.parts]),
+    [['Sonnet 5', '', undefined, ['18 requests', '93% cached', '37k average input']]],
+  );
+  assert.deepEqual(
+    costRecordRows(cost.record).map((row) => [
+      row.label,
+      row.value,
+      row.percent,
+      Math.round(row.share * 100),
+      row.title,
+    ]),
     [
-      ['Input', '658k tokens'],
-      ['Output', '9,400 tokens'],
-      ['Model requests', '18'],
-      ['Input breakdown', undefined],
+      [
+        'Cached input reads',
+        '$0.12',
+        '37%',
+        37,
+        "$0.12, 610,000 tokens at the cache-read rate, 37% of this subagent's cost, 93% of input tokens served from the cache",
+      ],
+      ['5-minute cache writes', '$0.10', '32%', 32, "$0.10, 42,000 tokens, 32% of this subagent's cost"],
+      ['Output', '$0.09', '28%', 28, "$0.09, 9,400 tokens, 28% of this subagent's cost"],
+      ['Uncached input', '$0.01', '4%', 4, "$0.01, 6,000 tokens, 4% of this subagent's cost"],
     ],
   );
-  assert.equal(cost.record?.entries.at(-4)?.separateBefore, true);
-  assert.deepEqual(cost.record?.entries.at(-1)?.lines, [
-    'Cached input reads: 610k tokens (93% of input)',
-    'Uncached input: 6,000 tokens',
-    '5-minute cache writes: 42k tokens',
-  ]);
+  // No tab strip, no split bar and no "Included above".
+  assert.deepEqual(
+    [cost.record?.cost?.tabs.length, cost.record?.cost?.split, cost.record?.cost?.included],
+    [1, undefined, []],
+  );
+  // The plain-text detail states each figure once.
+  assert.equal(
+    cost.detail,
+    [
+      '$0.33 spent',
+      '',
+      'Sonnet 5',
+      '  18 requests · 93% cached · 37k average input',
+      '  Cached input reads: $0.12 (37%)',
+      '  5-minute cache writes: $0.10 (32%)',
+      '  Output: $0.09 (28%)',
+      '  Uncached input: $0.01 (4%)',
+    ].join('\n'),
+  );
   // Without spend detail, the child's recorded token count has no popover.
 
   const counted = toCard(turn({ agents: [agent({ durationMs: 60_000, toolUses: 4, tokens: 12_400 })] }), false, NOW);
@@ -4916,7 +4958,8 @@ test('a completed subagent carries cost, commits, and files while a running one 
     stateWord: '',
     since: null,
     figures: [
-      // Recorded list-price totals state their basis without a usage-cost breakdown. Request count follows a separator.
+      // A recorded list-price total keeps its dollars and has no split by usage. Its basis folds
+      // into the notes.
 
       {
         metric: 'cost',
@@ -4924,22 +4967,29 @@ test('a completed subagent carries cost, commits, and files while a running one 
         name: '$1.23 spent',
         record: {
           heading: { label: '$1.23 spent' },
-          entries: [
-            {
-              label: 'Cost by usage · haiku-4-5',
-              value: '$1.23',
-              lines: ['Total recorded by Claude CLI at list price'],
-            },
-            { label: 'Model requests', separateBefore: true, value: '1' },
-          ],
+          entries: [],
+          cost: {
+            warnings: [],
+            sections: [
+              {
+                label: 'Haiku 4.5',
+                detail: 'high',
+                title: '$1.23, 1 request.',
+                facts: { parts: ['1 request'], title: '0 of 0 input tokens served from the cache.' },
+              },
+            ],
+            tabs: [{ name: 'Usage', parts: [{ rows: [], empty: 'No breakdown recorded' }] }],
+            included: [],
+          },
+          notes: ['Total recorded by Claude CLI at list price'],
         },
         detail: [
           '$1.23 spent',
           '',
-          'Cost by usage · haiku-4-5: $1.23',
-          '  Total recorded by Claude CLI at list price',
-          '',
-          'Model requests: 1',
+          'Haiku 4.5 · high',
+          '  1 request',
+          '  No breakdown recorded',
+          'Total recorded by Claude CLI at list price',
         ].join('\n'),
       },
       // Commit figures retain SHAs without subjects. Their row layout enables actions so the popover exposes commit controls.
@@ -6610,18 +6660,283 @@ test('turn and compaction chips keep semantic identities while optional roles ch
   );
 });
 
-test('a compaction cost figure keeps its usage visible and folds its pricing basis into the notes', () => {
+test('a compaction cost figure names its model, the context sent and the summary written, and prices each part', () => {
   const cost = toCompactionCard(compaction(), NOW).chips.find((chip) => chip.metric === 'cost')!;
-  assert.match(cost.detailList?.entries[0]?.label ?? '', /of context sent, .* summary written\.$/);
+  const list = cost.detailList!;
+  assert.deepEqual(list.entries, []);
+  assert.deepEqual(
+    list.cost?.sections.map((section) => [section.label, section.detail, section.value, section.facts]),
+    [
+      [
+        'Compaction',
+        'Opus 5',
+        undefined,
+        {
+          parts: ['631k of context sent', '14k summary written'],
+          title:
+            '631,292 input tokens sent in the one request, 629,292 of them served from the cache. 14,172 summary tokens written.',
+        },
+      ],
+    ],
+  );
+  // One row per usage category with a cost, largest first, and the output named for what it wrote.
+  assert.deepEqual(
+    list.cost?.tabs[0].parts[0].rows.map((row) => [row.label, row.percent, row.title.replace(/^[$][0-9.]+, /, '')]),
+    [
+      ['Summary written', '52%', "14,172 tokens, 52% of this compaction's cost"],
+      [
+        'Cached input reads',
+        '46%',
+        "629,292 tokens at the cache-read rate, 46% of this compaction's cost, 100% of input tokens served from the cache",
+      ],
+      ['Uncached input', '1%', "2,000 tokens, 1% of this compaction's cost"],
+    ],
+  );
   // The reader sees that a Claude compaction cost is modelled without opening the notes.
-  assert.deepEqual(cost.detailList?.footer, [
-    'Claude Code records no usage for a compaction, so this cost is an estimate.',
+  assert.deepEqual(list.footer, ['Claude Code records no usage for a compaction, so this cost is an estimate.']);
+  assert.equal(list.notes?.at(-1), 'Estimated from published model rates. Your actual charge may differ.');
+  assert.match(list.notes?.[0] ?? '', /^Estimated as /, 'the estimate basis joins the notes');
+  assert.equal(cost.detail.split('\n')[0], 'Compaction · Opus 5');
+  assert.ok(cost.detail.endsWith([...list.footer!, ...list.notes!].join('\n')), cost.detail);
+});
+
+// The rows price each category with the inputs the figure uses, here a priority tier at twice the
+// standard rate, so they add up to the figure within one cent.
+test("a compaction's cost rows add up to its figure for an exact and an estimated compaction", () => {
+  const usage = {
+    requests: 1,
+    input: 40_000,
+    cacheWrite1h: 0,
+    cacheWrite5m: 0,
+    cacheRead: 300_000,
+    output: 30_000,
+    thinking: 0,
+  };
+  const exact = { model: 'gpt-6-astra', provider: 'openai', usage };
+  const estimated = {
+    model: 'gpt-6-astra',
+    contextBefore: 400_000,
+    contextAfter: 30_000,
+    previousRequest: { tokens: 400_000, at: null, lifetime: null },
+  };
+  const chipOf = (over: Partial<Compaction>) =>
+    toCompactionCard(compaction(over), NOW).chips.find((chip) => chip.metric === 'cost');
+  for (const [over, tiered] of [
+    [exact, { ...exact, serviceTier: 'priority' }],
+    [estimated, { ...estimated, previousRequest: { ...estimated.previousRequest, serviceTier: 'priority' } }],
+  ] as [Partial<Compaction>, Partial<Compaction>][]) {
+    const chip = chipOf(tiered);
+    assert.ok(chip?.detailList?.cost, `no cost form for ${JSON.stringify(tiered)}`);
+    assert.notEqual(chip.label, chipOf(over)?.label, 'the fixture tier changes the figure');
+    const dollars = Number(chip.label.slice(1));
+    // Each row's share is its dollars over the figure's, so the shares of rows that add up to the figure make one.
+    const rows = chip.detailList.cost.tabs[0].parts[0].rows;
+    const sum = rows.reduce((total, row) => total + row.share, 0);
+    assert.ok(Math.abs(sum - 1) * dollars <= 0.01, `the rows add up to ${sum} of ${chip.label}`);
+  }
+});
+
+// D9 and D12: a child that used two models draws one section per model, largest first.
+test('a subagent that used two models draws one section per model, each with its dollars', () => {
+  const sonnet = {
+    requests: 10,
+    input: 400_000,
+    cacheWrite1h: 0,
+    cacheWrite5m: 0,
+    cacheRead: 100_000,
+    output: 20_000,
+    thinking: 4_000,
+  };
+  const haiku = {
+    requests: 4,
+    input: 2_000,
+    cacheWrite1h: 0,
+    cacheWrite5m: 0,
+    cacheRead: 40_000,
+    output: 3_000,
+    thinking: 0,
+  };
+  const card = toCard(
+    turn({
+      agents: [
+        agent({
+          model: 'claude-haiku-4-5',
+          effort: 'high',
+          spendFound: true,
+          spend: [
+            { model: 'claude-haiku-4-5', usage: haiku },
+            { model: 'claude-sonnet-5', usage: sonnet },
+          ],
+        }),
+      ],
+    }),
+    false,
+    NOW,
+  );
+  const record = card.agents[0].figures.find((figure) => figure.metric === 'cost')?.record;
+  // The effort belongs to the child's own model. The larger section leads.
+  assert.deepEqual(
+    record?.cost?.sections.map((section) => [section.label, section.detail, section.value]),
+    [
+      ['Sonnet 5', '', '$1.02'],
+      ['Haiku 4.5', 'high', '$0.02'],
+    ],
+  );
+  // A low cached share on the child's own usage warns on its fact line, as the Main agent's does.
+  assert.deepEqual(
+    record?.cost?.sections.map((section) => [section.facts?.parts, section.facts?.warning]),
+    [
+      [['10 requests', '20% cached', '50k average input'], 1],
+      [['4 requests', '95% cached', '11k average input'], undefined],
+    ],
+  );
+  // Every share is of the child's whole cost, so the rows of both sections add up to one.
+  const shares = costRecordRows(record).reduce((total, row) => total + row.share, 0);
+  assert.ok(Math.abs(shares - 1) < 1e-9, String(shares));
+  assert.deepEqual(outputRowTitle(record, /Sonnet/), ['Thinking: 4,000 tokens (20% of output), included in output']);
+});
+
+// D12: incomplete child usage keeps the cached share muted, as the Main agent section does.
+test('a subagent section keeps a low cached share muted while its usage is incomplete', () => {
+  const usage = {
+    ...emptyUsage(),
+    requests: 10,
+    input: 400_000,
+    cacheRead: 100_000,
+    output: 20_000,
+  };
+  const warnings = (child: Partial<TurnAgent>) =>
+    toCard(turn({ agents: [agent({ spendFound: true, ...child })] }), false, NOW)
+      .agents[0].figures.find((figure) => figure.metric === 'cost')
+      ?.record?.cost?.sections.map((section) => [section.facts?.parts[1], section.facts?.warning]);
+  const spend = [{ model: 'claude-sonnet-5', usage }];
+  assert.deepEqual(warnings({ spend }), [['20% cached', 1]]);
+  for (const child of [
+    { status: 'running' as const, spend },
+    { spendPartial: true, spend },
+    {
+      spend: [{ model: 'claude-sonnet-5', usage, unclassifiedCacheWrite: 5_000 }],
+    },
+  ]) {
+    assert.deepEqual(warnings(child), [['20% cached', undefined]], JSON.stringify(child));
+  }
+});
+
+// D13: the measured speed keeps a home when its model's section has no Output row.
+test('a subagent section with no Output row carries the measured speed on its heading', () => {
+  const usage = { ...emptyUsage(), requests: 4, input: 1000, output: 168 };
+  const timed = (record: StatDetailList | undefined) =>
+    (record?.cost?.sections ?? [])
+      .filter((section) => section.title.includes('tok/s'))
+      .map((section) => [section.label, section.title.split('\n')[0]]);
+  // A recorded list price has no rows.
+  const listed = toCard(
+    turn({
+      agents: [
+        agent({
+          spendFound: true,
+          outputRate: { output: 168, milliseconds: 20000 },
+          outputRateModel: 'claude-haiku-4-5',
+          spend: [
+            {
+              model: 'claude-haiku-4-5',
+              recordedCost: 1.23,
+              costBasis: 'list',
+              usage,
+            },
+          ],
+        }),
+      ],
+    }),
+    false,
+    NOW,
+  ).agents[0].figures.find((figure) => figure.metric === 'cost')?.record;
+  assert.deepEqual(timed(listed), [['Haiku 4.5', '$1.23, 4 requests.']]);
+  // An unpriced measured model gives the child a cost figure for its other model, and no tokens figure.
+  const row = toCard(
+    turn({
+      agent: 'codex',
+      agents: [
+        agent({
+          model: null,
+          spendFound: true,
+          outputRate: { output: 168, milliseconds: 20000 },
+          outputRateModel: 'unknown-sol',
+          spend: [
+            { model: 'unknown-sol', usage },
+            {
+              model: 'gpt-6-astra',
+              usage: { ...emptyUsage(), input: 100000, output: 1000 },
+            },
+          ],
+        }),
+      ],
+    }),
+    false,
+    NOW,
+  ).agents[0];
+  assert.deepEqual(
+    row.figures.map((figure) => figure.metric),
+    ['cost'],
+  );
+  const record = row.figures[0].record;
+  assert.deepEqual(timed(record), [['unknown-sol', 'Cost unavailable, 4 requests.']]);
+  assert.equal(record?.cost?.sections[1].value, 'cost unavailable');
+  assert.ok(!costRecordRows(record).some((held) => held.title.includes('tok/s')));
+});
+
+// D11: a model section with a recorded list price and split usage names the dollars its rows leave out.
+test('a subagent model section with a recorded list price and split usage says its split is incomplete', () => {
+  const listed = {
+    ...emptyUsage(),
+    requests: 2,
+    input: 40_000,
+    output: 50_000,
+  };
+  const split = { ...emptyUsage(), requests: 3, input: 20_000, output: 3_000 };
+  const record = toCard(
+    turn({
+      agents: [
+        agent({
+          spendFound: true,
+          spend: [
+            {
+              model: 'claude-haiku-4-5',
+              recordedCost: 1.23,
+              costBasis: 'list',
+              usage: listed,
+            },
+            { model: 'claude-haiku-4-5', usage: split },
+          ],
+        }),
+      ],
+    }),
+    false,
+    NOW,
+  ).agents[0].figures.find((figure) => figure.metric === 'cost')?.record;
+  assert.equal(record?.cost?.sections.length, 1);
+  assert.equal(record?.cost?.tabs[0].parts[0].empty, 'No breakdown recorded for $1.23');
+  // The row titles count the split usage alone.
+  const titles = costRecordRows(record).map((held) => [held.label, held.title.match(/([\d,]+) tokens/)?.[1]]);
+  assert.deepEqual(titles, [
+    ['Uncached input', '20,000'],
+    ['Output', '3,000'],
+    ['Cached input reads', '0'],
   ]);
-  assert.equal(cost.detailList?.notes?.at(-1), 'Estimated from published model rates. Your actual charge may differ.');
-  assert.match(cost.detailList?.notes?.[0] ?? '', /^Estimated as /, 'the estimate basis joins the notes');
-  assert.equal(
-    cost.detail,
-    [cost.detailList!.entries[0].label, ...cost.detailList!.footer!, ...cost.detailList!.notes!].join('\n'),
+  assert.match(
+    toCard(
+      turn({
+        agents: [
+          agent({
+            spendFound: true,
+            spend: [{ model: 'claude-haiku-4-5', usage: split }],
+          }),
+        ],
+      }),
+      false,
+      NOW,
+    ).agents[0].figures[0].detail ?? '',
+    /^(?!.*No breakdown)/s,
   );
 });
 
@@ -6767,30 +7082,53 @@ test('a completed current Codex child spend appears once in the card and parent 
           name: '$1.00 spent',
           record: {
             heading: { label: '$1.00 spent' },
-            entries: [
-              {
-                label: 'Cost by usage · haiku-4-5',
-                value: '$1.00',
-                lines: [
-                  { text: 'Cached input reads: $0', cost: true, cacheHit: { percent: 0, warning: false } },
-                  { text: 'Uncached input: $1.00', cost: true },
-                ],
-              },
-              { label: 'Input', separateBefore: true, value: '1M tokens' },
-              { label: 'Input breakdown', separateBefore: true, lines: ['Uncached input: 1M tokens'] },
-            ],
+            entries: [],
+            cost: {
+              warnings: [],
+              sections: [
+                {
+                  label: 'Haiku 4.5',
+                  detail: '',
+                  title: '$1.00.',
+                  facts: { parts: ['0% cached'], title: '0 of 1,000,000 input tokens served from the cache.' },
+                },
+              ],
+              tabs: [
+                {
+                  name: 'Usage',
+                  parts: [
+                    {
+                      rows: [
+                        {
+                          label: 'Uncached input',
+                          percent: '100%',
+                          share: 1,
+                          value: '$1.00',
+                          title: "$1.00, 1,000,000 tokens, 100% of this subagent's cost",
+                        },
+                        {
+                          label: 'Cached input reads',
+                          percent: '0%',
+                          share: 0,
+                          value: '$0',
+                          title:
+                            "$0.00, 0 tokens at the cache-read rate, 0% of this subagent's cost, 0% of input tokens served from the cache",
+                        },
+                      ],
+                    },
+                  ],
+                },
+              ],
+              included: [],
+            },
           },
           detail: [
             '$1.00 spent',
             '',
-            'Cost by usage · haiku-4-5: $1.00',
-            '  Cached input reads: $0 (0% cached)',
-            '  Uncached input: $1.00',
-            '',
-            'Input: 1M tokens',
-            '',
-            'Input breakdown',
-            '  Uncached input: 1M tokens',
+            'Haiku 4.5',
+            '  0% cached',
+            '  Uncached input: $1.00 (100%)',
+            '  Cached input reads: $0 (0%)',
           ].join('\n'),
         },
       ],
@@ -6958,9 +7296,9 @@ test('a partial Codex child says its own subagents are left out, on the row and 
   assert.match(detail, /This cost leaves out the subagents that this subagent started/);
   assert.doesNotMatch(detail, /still running or left no record/);
   const row = toCard(t, false, NOW).agents[0].figures.find((figure) => figure.metric === 'cost');
-  const text = JSON.stringify(row?.record?.entries ?? []);
-  assert.match(text, /This cost leaves out the subagents that this subagent started/);
-  assert.doesNotMatch(text, /left no record/);
+  // The coverage line stays visible under the rows.
+  assert.deepEqual(row?.record?.footer, ['This cost leaves out the subagents that this subagent started.']);
+  assert.doesNotMatch(JSON.stringify(row?.record ?? {}), /left no record/);
 });
 
 // The main transcript launches a flat-folder child chain through depth. Metadata identifies each child's launcher. Each transcript bills one million Haiku input tokens.
@@ -7534,24 +7872,22 @@ function timedAgentTurn(model: string): { turn: Turn; child: string; at: (second
 const childRequestTitle = (model: string) =>
   `100.0 tok/s. Output tokens per second. Actual output includes thinking. Request time includes the wait for the first response event. Untimed responses are excluded. Measured model: ${model}. Only this subagent is timed. Usage totals include any delegated work.`;
 
-const outputSpeedLine = (row: ReturnType<typeof toCard>['agents'][number], metric: string) =>
-  row.figures.find((figure) => figure.metric === metric)?.record?.entries.find((entry) => entry.label === 'Output')
-    ?.lines?.[0];
+// A priced child's speed sits in its Output row's title. An unpriced child's sits on its Output line.
+const outputSpeedTitle = (row: ReturnType<typeof toCard>['agents'][number], metric: string) => {
+  const record = row.figures.find((figure) => figure.metric === metric)?.record;
+  if (metric === 'cost') return outputRowTitle(record)?.[0];
+  const line = record?.entries.find((entry) => entry.label === 'Output')?.lines?.[0];
+  return typeof line === 'object' && 'text' in line && line.text === '100.0 tok/s' ? line.title : undefined;
+};
 
 test('a Claude subagent row shows the output speed its own request records measure', () => {
   const row = toCard(timedAgentTurn('claude-haiku-4-5').turn, false, NOW).agents[0];
-  assert.deepEqual(outputSpeedLine(row, 'cost'), {
-    text: '100.0 tok/s',
-    title: childRequestTitle('claude-haiku-4-5'),
-  });
+  assert.equal(outputSpeedTitle(row, 'cost'), childRequestTitle('claude-haiku-4-5'));
 });
 
 test('a Claude subagent row drops its output speed once the subagent times a second model', () => {
   const { turn, child, at } = timedAgentTurn('claude-haiku-4-5');
-  assert.deepEqual(outputSpeedLine(toCard(turn, false, NOW).agents[0], 'cost'), {
-    text: '100.0 tok/s',
-    title: childRequestTitle('claude-haiku-4-5'),
-  });
+  assert.equal(outputSpeedTitle(toCard(turn, false, NOW).agents[0], 'cost'), childRequestTitle('claude-haiku-4-5'));
   fs.appendFileSync(
     child,
     timedResponse('claude-sonnet-4-5', true, (second) => at(second + 30), '-second')
@@ -7567,10 +7903,7 @@ test('a Claude subagent row drops its output speed once the subagent times a sec
 test('an unpriced Claude subagent row names request time in its tokens figure', () => {
   const row = toCard(timedAgentTurn('claude-unpriced-9').turn, false, NOW).agents[0];
   assert.ok(!row.figures.some((figure) => figure.metric === 'cost'));
-  assert.deepEqual(outputSpeedLine(row, 'tokens'), {
-    text: '100.0 tok/s',
-    title: childRequestTitle('claude-unpriced-9'),
-  });
+  assert.equal(outputSpeedTitle(row, 'tokens'), childRequestTitle('claude-unpriced-9'));
 });
 
 // The dispatched row's speed names the dispatched session, never a subagent.
@@ -7597,7 +7930,7 @@ test('a dispatched Claude session row shows the output speed its own request rec
       row.figures.some((figure) => figure.metric === 'cost'),
       metric === 'cost',
     );
-    assert.deepEqual(outputSpeedLine(row, metric), { text: '100.0 tok/s', title: dispatchedRequestTitle(model) });
+    assert.equal(outputSpeedTitle(row, metric), dispatchedRequestTitle(model));
   }
 });
 
@@ -8239,7 +8572,7 @@ test('a compaction says why it ran, what it cost and how long it took', () => {
     card.chips.map((c) => c.label),
     ['$0.68', '615k dropped'],
   );
-  assert.equal(card.chips[0].detail.split('\n')[0], '631k of context sent, 14k summary written.');
+  assert.equal(card.chips[0].detail.split('\n')[1], '  631k of context sent · 14k summary written');
   assert.match(card.chips[0].detail, /Claude Code records no usage for a compaction, so this cost is an estimate\./);
   assert.match(card.chips[0].detail, /Estimated from published model rates\. Your actual charge may differ/);
   // A compaction draws the same row whether it is open or shut.
@@ -10096,52 +10429,66 @@ test('indexed lifetime cost prices aggregated Auto Review volume without changin
           name: '$0.04 spent',
           record: {
             heading: { label: '$0.04 spent' },
-            entries: [
-              {
-                label: 'Cost by usage · Codex Auto Review',
-                value: '$0.04',
-                lines: costLines(
-                  'Output: $0.03',
-                  'Cached input reads: <$0.01 (57% cached · 3 requests · 4,667 avg input)',
-                  'Uncached input: $0.01',
-                ),
-              },
-              { label: 'Input', separateBefore: true, value: '14k tokens' },
-              {
-                label: 'Output',
-                value: '2,000 tokens',
-                lines: ['Thinking: 400 tokens (20% of output), included in output'],
-              },
-              { label: 'Model requests', value: '3', lines: ['Average input per request: 4,667 tokens'] },
-              {
-                label: 'Input breakdown',
-                separateBefore: true,
-                lines: [
-                  'Cached input reads: 8,000 tokens (57% of input)',
-                  'Uncached input: 5,000 tokens',
-                  '30-minute cache writes: 1,000 tokens',
-                ],
-              },
-            ],
+            entries: [],
+            cost: {
+              warnings: [],
+              sections: [
+                {
+                  label: 'Codex Auto Review',
+                  detail: '',
+                  title: '$0.04, 3 requests.',
+                  facts: {
+                    parts: ['3 requests', '57% cached', '5k average input'],
+                    title:
+                      '8,000 of 14,000 input tokens served from the cache. 4,667 input tokens per request on average.',
+                  },
+                },
+              ],
+              tabs: [
+                {
+                  name: 'Usage',
+                  parts: [
+                    {
+                      rows: [
+                        {
+                          label: 'Output',
+                          percent: '67%',
+                          share: 0.6741573033707864,
+                          value: '$0.03',
+                          title:
+                            "$0.03, 2,000 tokens, 67% of this subagent's cost\nThinking: 400 tokens (20% of output), included in output",
+                        },
+                        {
+                          label: 'Uncached input',
+                          percent: '28%',
+                          share: 0.28089887640449435,
+                          value: '$0.01',
+                          title: "$0.01, 5,000 tokens, 28% of this subagent's cost",
+                        },
+                        {
+                          label: 'Cached input reads',
+                          percent: '4%',
+                          share: 0.0449438202247191,
+                          value: '<$0.01',
+                          title:
+                            "$0.00, 8,000 tokens at the cache-read rate, 4% of this subagent's cost, 57% of input tokens served from the cache",
+                        },
+                      ],
+                    },
+                  ],
+                },
+              ],
+              included: [],
+            },
           },
           detail: [
             '$0.04 spent',
             '',
-            'Cost by usage · Codex Auto Review: $0.04',
-            '  Output: $0.03',
-            '  Cached input reads: <$0.01 (57% cached · 3 requests · 4,667 avg input)',
-            '  Uncached input: $0.01',
-            '',
-            'Input: 14k tokens',
-            'Output: 2,000 tokens',
-            '  Thinking: 400 tokens (20% of output), included in output',
-            'Model requests: 3',
-            '  Average input per request: 4,667 tokens',
-            '',
-            'Input breakdown',
-            '  Cached input reads: 8,000 tokens (57% of input)',
-            '  Uncached input: 5,000 tokens',
-            '  30-minute cache writes: 1,000 tokens',
+            'Codex Auto Review',
+            '  3 requests · 57% cached · 5k average input',
+            '  Output: $0.03 (67%)',
+            '  Uncached input: $0.01 (28%)',
+            '  Cached input reads: <$0.01 (4%)',
           ].join('\n'),
         },
       ],
@@ -12634,8 +12981,8 @@ test('a compaction card words the estimate it priced', () => {
     /Estimated as 232k of uncached input, because the cache had expired and the context was sent again without it\./,
   );
   // The summary written is the output the estimate priced, the stored summary text where one is paired.
-  assert.match(detail({ previousRequest: lapsed, summaryChars: 22_000 }), /of context sent, 10k summary written\./);
-  assert.match(coldUnknown, /of context sent, 14k summary written\./);
+  assert.match(detail({ previousRequest: lapsed, summaryChars: 22_000 }), /of context sent · 10k summary written/);
+  assert.match(coldUnknown, /of context sent · 14k summary written/);
   // Another model is priced as one cache read of the recorded context.
   const other = detail({ model: 'gpt-5.5', contextBefore: 400_000, contextAfter: 10_000 });
   assert.match(other, /Estimated as a cache read of the whole context/);
@@ -12970,16 +13317,37 @@ test('the context chip shows the subagent results in context at the end of each 
   );
   const { entries, entry } = subagentResultsEntry(card.chips);
   assert.equal(entries.at(-1), entry, 'the entry is last');
+  // A meter fills to the share the value prints, and one aligned row per subagent follows it.
   assert.deepEqual(entry, {
     label: 'Subagent results',
     value: '10% (12k)',
     valueTitle: '12,400 tokens, estimate',
-    lines: [
-      'Fix the stale cache key in the usage reducer: 4k tokens (3.2%)',
-      'Review the parser: 1k tokens (0.8%)',
-      'Find the fixtures: 800 tokens (0.7%)',
-    ],
+    breakdown: {
+      share: 12_400 / 120_000,
+      rows: [
+        {
+          label: 'Fix the stale cache key in the usage reducer',
+          value: '3,800',
+          percent: '3.2%',
+          title: 'Fix the stale cache key in the usage reducer: 3,800 tokens, estimate',
+        },
+        {
+          label: 'Review the parser',
+          value: '1,000',
+          percent: '0.8%',
+          title: 'Review the parser: 1,000 tokens, estimate',
+        },
+        { label: 'Find the fixtures', value: '800', percent: '0.7%', title: 'Find the fixtures: 800 tokens, estimate' },
+      ],
+    },
   });
+  assert.ok(
+    card.chips
+      .find((chip) => chip.metric === 'context')
+      ?.detail.includes(
+        'Subagent results: 10% (12k)\n  Fix the stale cache key in the usage reducer: 3,800 tokens (3.2%)',
+      ),
+  );
 
   const none = toCard(turn({ contextTokens: 120_000, contextWindow: 200_000 }), false, Date.now());
   assert.equal(subagentResultsEntry(none.chips).entry, undefined, 'a session without subagents shows no entry');
@@ -13011,7 +13379,7 @@ test('the context chip shows the subagent results in context at the end of each 
   }
 });
 
-test('the subagent results entry caps its lines, marks a partial figure and reports a compaction', () => {
+test('the subagent results entry folds rows past the third, marks a partial figure and reports a compaction', () => {
   const agents = Array.from({ length: 12 }, (_, index) => ({
     name: `Subagent ${index + 1}`,
     tokens: 2000 - index * 100,
@@ -13028,15 +13396,32 @@ test('the subagent results entry caps its lines, marks a partial figure and repo
   const { entry } = subagentResultsEntry(many.chips);
   assert.equal(entry?.value, '16% (19k)');
   assert.equal(entry?.valueTitle, '18,600 tokens, estimate');
-  assert.deepEqual(entry?.lines, [
-    'Subagent 1: 2k tokens (1.7%)',
-    'Subagent 2: 2k tokens (1.6%)',
-    'Subagent 3: 2k tokens (1.5%)',
-    'Subagent 4: 2k tokens (1.4%)',
-    'Subagent 5: 2k tokens (1.3%)',
-    '7 more: 8k tokens (7%)',
-    'Part of the session record was not read.',
-  ]);
+  assert.equal(entry?.breakdown?.share, 18_600 / 120_000);
+  assert.deepEqual(
+    entry?.breakdown?.rows.slice(0, 4).map((row) => [row.label, row.value, row.percent]),
+    [
+      ['Subagent 1', '2,000', '1.7%'],
+      ['Subagent 2', '1,900', '1.6%'],
+      ['Subagent 3', '1,800', '1.5%'],
+      ['Subagent 4', '1,700', '1.4%'],
+    ],
+  );
+  assert.equal(entry?.breakdown?.rows.length, 12);
+  assert.deepEqual(entry?.breakdown?.more, { shown: 3, open: 'View 9 more subagents', close: 'Show fewer subagents' });
+  assert.deepEqual(entry?.lines, ['Part of the session record was not read.']);
+  const four = toCard(
+    turn({
+      contextTokens: 120_000,
+      contextWindow: 200_000,
+      subagentContext: { tokens: 7_400, partial: false, removed: false, agents: agents.slice(0, 4) },
+    }),
+    false,
+    Date.now(),
+  );
+  assert.equal(subagentResultsEntry(four.chips).entry?.breakdown?.more?.open, 'View 1 more subagent');
+  const three = { tokens: 5_700, partial: false, removed: false, agents: agents.slice(0, 3) };
+  const shown = toCard(turn({ contextTokens: 120_000, contextWindow: 200_000, subagentContext: three }), false, NOW);
+  assert.equal(subagentResultsEntry(shown.chips).entry?.breakdown?.more, undefined, 'three rows need no expander');
 
   const compacted = toCard(
     turn({
@@ -13052,6 +13437,63 @@ test('the subagent results entry caps its lines, marks a partial figure and repo
   assert.deepEqual(subagentResultsEntry(compacted.chips).entry?.lines, [
     'The latest compaction removed earlier results.',
   ]);
+  // No tokens draw no meter, and no subagents draw no rows.
+  assert.equal(subagentResultsEntry(compacted.chips).entry?.breakdown, undefined);
+  const emptied = toCard(
+    turn({
+      contextTokens: 30_000,
+      contextWindow: 200_000,
+      subagentContext: {
+        tokens: 0,
+        partial: false,
+        removed: true,
+        agents: [{ name: 'Reviewer', tokens: 0 }],
+      },
+    }),
+    false,
+    NOW,
+  );
+  assert.deepEqual(subagentResultsEntry(emptied.chips).entry?.breakdown, {
+    rows: [
+      {
+        label: 'Reviewer',
+        value: '0',
+        percent: '0%',
+        title: 'Reviewer: 0 tokens, estimate',
+      },
+    ],
+  });
+});
+
+// The plain-text detail lists the rows the closed entry shows and one line for the rest.
+test('the subagent results plain text lists the shown rows and one line for the rest', () => {
+  const agents = Array.from({ length: 12 }, (_, index) => ({
+    name: `Subagent ${index + 1}`,
+    tokens: 2000 - index * 100,
+  }));
+  const card = toCard(
+    turn({
+      contextTokens: 120_000,
+      contextWindow: 200_000,
+      subagentContext: {
+        tokens: 18_600,
+        partial: false,
+        removed: false,
+        agents,
+      },
+    }),
+    false,
+    NOW,
+  );
+  const detail = card.chips.find((chip) => chip.metric === 'context')?.detail ?? '';
+  const lines = detail.split('\n').filter((line) => /^ {2}(Subagent \d+|\d+ more):/.test(line));
+  assert.deepEqual(lines, [
+    '  Subagent 1: 2,000 tokens (1.7%)',
+    '  Subagent 2: 1,900 tokens (1.6%)',
+    '  Subagent 3: 1,800 tokens (1.5%)',
+    '  9 more: 12k tokens (9.8%)',
+  ]);
+  assert.equal(subagentResultsEntry(card.chips).entry?.breakdown?.rows.length, 12);
 });
 
 test('the session heading context chip shows the current subagent results last', () => {
@@ -13070,7 +13512,11 @@ test('the session heading context chip shows the current subagent results last',
   const { entries, entry } = subagentResultsEntry(chips);
   assert.equal(entries.at(-1), entry, 'the entry stays after the latest compaction');
   assert.equal(entry?.value, '5% (4k)', 'the share is of the current context');
-  assert.deepEqual(entry?.lines, ['Reviewer: 4k tokens (5%)']);
+  assert.deepEqual(
+    entry?.breakdown?.rows.map((row) => [row.label, row.value, row.percent]),
+    [['Reviewer', '4,000', '5%']],
+  );
+  assert.equal(entry?.breakdown?.share, 4000 / 80_000, 'the meter fills to the share of the current context');
   assert.equal(chips.find((chip) => chip.metric === 'context')?.detailList?.notes?.at(-1), 'Estimated from text size.');
 
   const after = sessionStats([newest], [compaction({ at: 5000, contextAfter: 20_000 })]);
@@ -13089,7 +13535,10 @@ test('the session heading keeps the subagent results a later compaction retained
   const chips = sessionStats([newest], [compaction({ at: 5000, contextAfter: 20_000, subagentContext: kept })]);
   const { entry } = subagentResultsEntry(chips);
   assert.equal(entry?.value, '0.1% (27)');
-  assert.deepEqual(entry?.lines, ['Reviewer: 27 tokens (0.1%)']);
+  assert.deepEqual(
+    entry?.breakdown?.rows.map((row) => [row.label, row.value, row.percent]),
+    [['Reviewer', '27', '0.1%']],
+  );
 });
 
 test('the session list hover text leaves out the subagent results', () => {
