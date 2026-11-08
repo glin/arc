@@ -10389,6 +10389,8 @@ export class PanelProvider implements vscode.Disposable {
       const railKey = railInputKey(railInput);
       const railPending = this.lifetimeFigures.answers();
       const railAdoptions = sessionAdoptions(this.sessionAliases);
+      // A selection settles no adoptions and reads no serialized form, so only a catalog render serializes them.
+      const railAdoptionsJson = selectedOnly ? '' : JSON.stringify(railAdoptions);
       // Resource URIs and icon fonts are resolved separately for each host.
       const light = isLightColourTheme();
       if (!selectedOnly) {
@@ -10398,8 +10400,7 @@ export class PanelProvider implements vscode.Disposable {
         if (this.hosts.length) {
           this.performanceCounters.recordWork(`renderPost:${refreshReason}`);
           const changes = this.lastRailKey ? railInputChanges(this.lastRailKey, railKey) : ['first'];
-          if (this.lastRailKey && JSON.stringify(railAdoptions) !== this.lastRailAdoptionsJson)
-            changes.push('sessionAdoptions');
+          if (this.lastRailKey && railAdoptionsJson !== this.lastRailAdoptionsJson) changes.push('sessionAdoptions');
           for (const change of changes)
             this.performanceCounters.recordWork(`renderPostInput:${refreshReason}:${change}`);
         }
@@ -10592,7 +10593,7 @@ export class PanelProvider implements vscode.Disposable {
         // A selection omits peer rows, labels and adoptions, so it cannot settle their keys.
         this.lastRailMessageType = largestRenderBytes === null ? null : 'render';
         this.lastRailMessageSerializedBytes = largestRenderBytes;
-        this.lastRailAdoptionsJson = JSON.stringify(railAdoptions);
+        this.lastRailAdoptionsJson = railAdoptionsJson;
         this.lastRailKey = railKey;
         this.railPendingAnswers = railPending;
         this.lastRailRevision = this.railRevision;
