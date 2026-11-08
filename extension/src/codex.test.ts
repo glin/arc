@@ -15640,6 +15640,62 @@ test('a qualified opening read counts once, and a failed open or a refused ident
   }
 });
 
+test('the opening cache counts a read only for a file that it reads', () => {
+  const root = sessionsRoot([{ day: '2026/08/25', name: ROLLOUT(UUID_A), records: [meta({ id: UUID_A })] }]);
+  const rollout = path.join(root, '2026', '08', '25', ROLLOUT(UUID_A));
+  let reads = 0;
+  const count = () => {
+    reads += 1;
+  };
+  const held = new CodexMetaCache();
+  assert.equal(held.get(rollout, count)?.sessionId, UUID_A);
+  assert.equal(reads, 1, 'a read of a rollout counted no read');
+  assert.equal(held.get(rollout, count)?.sessionId, UUID_A);
+  assert.equal(reads, 1, 'a held opening counted a read');
+  reads = 0;
+  assert.equal(held.get(path.join(root, 'missing.jsonl'), count), null);
+  assert.equal(reads, 0, 'a failed open counted a read');
+
+  let clock = 1_000;
+  let asked = 0;
+  const refused = new CodexMetaCache(
+    (_file, onRead) => {
+      asked += 1;
+      onRead?.();
+      return undefined;
+    },
+    () => null,
+    () => clock,
+  );
+  refused.get(rollout, count);
+  assert.deepEqual([asked, reads], [1, 1], 'a refused read counted no read');
+  clock += REFUSED_OPENING_FIRST_RETRY_MS - 1;
+  refused.get(rollout, count);
+  assert.deepEqual([asked, reads], [1, 1], 'a refused opening inside its wait counted a read');
+  clock += 1;
+  refused.get(rollout, count);
+  assert.deepEqual([asked, reads], [2, 2], 'the retry after the wait counted no read');
+
+  // A head with no opening record retries once, then waits for its size to change.
+  let size = 5;
+  const noRecord = new CodexMetaCache(
+    (_file, onRead) => {
+      onRead?.();
+      return null;
+    },
+    () => size,
+  );
+  reads = 0;
+  noRecord.get(rollout, count);
+  noRecord.get(rollout, count);
+  assert.equal(reads, 2, 'the retry of a head with no record counted no read');
+  noRecord.get(rollout, count);
+  assert.equal(reads, 2, 'an unchanged size counted a read');
+  size = 9;
+  noRecord.get(rollout, count);
+  assert.equal(reads, 3, 'a read after growth counted no read');
+});
+
 test.skipIf(!zstdEncode)('no foreground opening read reaches a compressed rollout head', async () => {
   const root = sessionsRoot([{ day: '2026/08/25', name: ROLLOUT(UUID_A), records: [meta({ id: UUID_A })] }]);
   const plain = path.join(root, '2026', '08', '25', ROLLOUT(UUID_A));
