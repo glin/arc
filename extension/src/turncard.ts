@@ -93,7 +93,7 @@ import {
   modelWithSpeed,
   speedName,
   type ModelTierIdentity,
-  shortModel,
+  compactModel,
   type ModelLabels,
 } from './turnformat';
 import { turnKey } from './turnread';
@@ -1076,6 +1076,7 @@ function agentDisplay(
   agent: TurnAgent,
   turnRunning: boolean,
   sessionLive: AgentLive,
+  labels?: ModelLabels,
 ): {
   hintDetail: string;
   state: AgentState;
@@ -1083,7 +1084,7 @@ function agentDisplay(
   summary: string;
   open: boolean;
 } {
-  const model = shortModel(agentModel(agent));
+  const model = compactModel(agentModel(agent), labels);
   const time = agent.durationMs != null ? formatDuration(agent.durationMs) : null;
   // Omit zero tool counts from the child's figures.
   const tools = agent.toolUses ? `${agent.toolUses} tools` : null;
@@ -1156,7 +1157,7 @@ function costRecordList(
   const notes: string[] = [];
   const footer: string[] = [];
   const pricingNotes = new Set(agent.spend.flatMap((part) => recordedCostNote(part.costBasis) ?? []));
-  for (const entry of childCostEntries(agent, true, 'Cost by usage', runner, noEnding, notes)) {
+  for (const entry of childCostEntries(agent, true, 'Cost by usage', runner, noEnding, notes, labels)) {
     for (const line of entry.lines ?? []) {
       if (typeof line === 'object' && 'cost' in line && line.cost) continue;
       const text = hintDetailLine(line);
@@ -1511,12 +1512,12 @@ function agentCard(
   row: TimedRow = 'subagent',
   labels?: ModelLabels,
 ): AgentCard {
-  const display = agentDisplay(agent, turnRunning, sessionLive);
+  const display = agentDisplay(agent, turnRunning, sessionLive, labels);
   // Only a child with live-process evidence counts up. An open child draws no time.
   const launch = display.state === 'running' && agent.toolUseId ? launches.get(agent.toolUseId) : undefined;
   return {
     description: agent.description,
-    model: shortModel(agentModel(agent)),
+    model: compactModel(agentModel(agent), labels),
     ...(modelSpeed(agentModel(agent), agent.ownModelTiers)
       ? { speed: modelSpeed(agentModel(agent), agent.ownModelTiers) }
       : {}),
@@ -1580,6 +1581,7 @@ export function dispatchedAgentCard(
   now: number = Date.now(),
   runner: AgentKind = 'claude',
   row: TimedRow = 'dispatched',
+  labels?: ModelLabels,
 ): AgentCard {
   const agent: TurnAgent = {
     id: sessionId,
@@ -1616,6 +1618,7 @@ export function dispatchedAgentCard(
     now,
     runner,
     row,
+    labels,
   );
   return { ...card, kind: 'dispatch', files, commits, since: state === 'running' ? startedAt : null };
 }
@@ -1643,9 +1646,9 @@ function agentLaunches(turn: Turn): Map<string, AgentLaunch> {
   return launches;
 }
 
-function agentOutcome(agent: TurnAgent): string {
+function agentOutcome(agent: TurnAgent, labels?: ModelLabels): string {
   const parts: string[] = [];
-  const model = shortModel(agentModel(agent));
+  const model = compactModel(agentModel(agent), labels);
   if (model) {
     parts.push(model);
   }
@@ -2702,11 +2705,15 @@ function hasPricedCacheRead(
   return dollars !== null && dollars > 0;
 }
 
-function costLabelWithModels(label: string, models: readonly (string | null | ModelTierIdentity)[]): string {
+function costLabelWithModels(
+  label: string,
+  models: readonly (string | null | ModelTierIdentity)[],
+  labels?: ModelLabels,
+): string {
   const names = [
     ...new Set(
       models.map((part) =>
-        modelWithSpeed(typeof part === 'object' && part !== null ? part : { model: part }, undefined, true),
+        modelWithSpeed(typeof part === 'object' && part !== null ? part : { model: part }, labels, true),
       ),
     ),
   ];
@@ -2723,6 +2730,7 @@ function costEntry(
   costBasis?: string,
   unclassifiedCacheWrite = 0,
   finished = true,
+  labels?: ModelLabels,
 ): StatDetailEntry {
   const recordedTotal = recordedCostBasis(costBasis) && recordedCost !== undefined ? recordedCost : undefined;
   // Reuse this price when calculating the input-cost warning below.
@@ -2744,7 +2752,7 @@ function costEntry(
     }
   }
   return {
-    label: costLabelWithModels(name, [model]),
+    label: costLabelWithModels(name, [model], labels),
     value: cost || 'cost unavailable',
     lines,
   };
@@ -2761,12 +2769,17 @@ function recordedCostNote(basis: string | undefined): string | null {
   return null;
 }
 
-function exactCostEntry(name: string, parts: readonly SessionCostUsage[], finished = true): StatDetailEntry {
+function exactCostEntry(
+  name: string,
+  parts: readonly SessionCostUsage[],
+  finished = true,
+  labels?: ModelLabels,
+): StatDetailEntry {
   const costs = parts.map(priceSessionCost);
   return {
-    label: costLabelWithModels(name, parts),
+    label: costLabelWithModels(name, parts, labels),
     value: sessionCostValue(costs),
-    lines: usageCategoryLines(costs, finished),
+    lines: usageCategoryLines(costs, finished, false, labels),
   };
 }
 
@@ -2812,6 +2825,7 @@ function childCostEntries(
   noEnding = false,
   // Receives each block's compaction note, led by the block label. Without it the note stays a block line.
   notes?: string[],
+  labels?: ModelLabels,
 ): StatDetailEntry[] {
   // A child that is still running, or whose own turn has not ended, reports a lower bound.
   const finished = turnFinished && !agentSpendIsOpen(agent.status);
@@ -2863,7 +2877,7 @@ function childCostEntries(
           role: 'delegated',
           ...usagePart,
         }));
-        const entry = exactCostEntry(name, parts, finished);
+        const entry = exactCostEntry(name, parts, finished, labels);
         // Each model's block names the compactions that model ran, in the session total's words.
         const compactionNote = compactionEstimateNote(parts.map(priceSessionCost));
         if (compactionNote && notes) {
@@ -2884,6 +2898,7 @@ function childCostEntries(
           part.costBasis,
           part.unclassifiedCacheWrite,
           finished,
+          labels,
         ),
       ];
     }
@@ -3003,7 +3018,7 @@ function costDetailList(
   // Build the main-agent entry only when its cost block or warning label needs it.
   const mainEntry = (): StatDetailEntry =>
     mainParts.length
-      ? exactCostEntry('Main agent', mainParts, finished)
+      ? exactCostEntry('Main agent', mainParts, finished, labels)
       : costEntry(
           'Main agent',
           turn.model,
@@ -3014,6 +3029,7 @@ function costDetailList(
           undefined,
           0,
           finished,
+          labels,
         );
   const entries =
     turn.agents.length || shares.length
@@ -3027,6 +3043,7 @@ function costDetailList(
               turn.agent,
               noEnding(agent),
               childCompactionNotes,
+              labels,
             );
             if (childEntries[0]) {
               withCostWarnings(
@@ -3040,14 +3057,14 @@ function costDetailList(
           ...shares.map((share): StatDetailEntry => ({
             label: share.cost.name,
             value: `${formatCost(share.dollars) ?? ZERO_COST}${share.partial ? '+' : ''}`,
-            ...(share.printed ? {} : { lines: delegatedCostLines(share.costs) }),
+            ...(share.printed ? {} : { lines: delegatedCostLines(share.costs, undefined, labels) }),
           })),
         ]
       : mainParts.length
-        ? [exactCostEntry('Cost by usage', mainParts, finished)]
+        ? [exactCostEntry('Cost by usage', mainParts, finished, labels)]
         : [
             {
-              label: costLabelWithModels('Cost by usage', [turn.model]),
+              label: costLabelWithModels('Cost by usage', [turn.model], labels),
               lines: usageCostDetail(turn.usage, turn.model, turn.provider ?? null, turn.contextWindow, { finished }),
             },
           ];
@@ -3641,8 +3658,9 @@ function agentDetailList(
   record?: true,
   // The live carried subagents, which the newest card counts beside its own.
   carried = 0,
+  labels?: ModelLabels,
 ): StatDetailList {
-  const displays = agents.map((agent) => agentDisplay(agent, turnRunning, sessionLive));
+  const displays = agents.map((agent) => agentDisplay(agent, turnRunning, sessionLive, labels));
   const carriedLine = carriedAgentsLine(carried);
   const running = displays.filter((display) => display.state === 'running').length + carried;
   // Include carried children in the total heading and describe their origin separately in the footer.
@@ -4085,6 +4103,7 @@ function contextChip(
   turn: ContextTurn,
   when = 'Context at the end of the turn',
   subagents = turn.subagentContext,
+  labels?: ModelLabels,
 ): StatChip | null {
   if (!turn.contextTokens) {
     return null;
@@ -4109,7 +4128,7 @@ function contextChip(
     ...(window && share !== null
       ? turn.contextWindow
         ? { notes: ['Recorded context window size.'] }
-        : { footer: [`Window size from the model fallback for ${shortModel(turn.model)}.`] }
+        : { footer: [`Window size from the model fallback for ${compactModel(turn.model, labels)}.`] }
       : {}),
   };
   if (subagentEntry) {
@@ -4313,7 +4332,7 @@ function chipsOf(
           : {}),
     });
   }
-  const ctxChip = contextChip(turn);
+  const ctxChip = contextChip(turn, undefined, undefined, labels);
   if (ctxChip) {
     chips.push(ctxChip);
   }
@@ -4443,7 +4462,7 @@ function chipsOf(
   }
   // Subagent figures follow totals that already include their costs, files, and commits.
   if (turn.agents.length || carried > 0) {
-    const displays = turn.agents.map((a) => agentDisplay(a, status === 'running', sessionLive));
+    const displays = turn.agents.map((a) => agentDisplay(a, status === 'running', sessionLive, labels));
     const carriedLine = carriedAgentsLine(carried);
     const detail = [
       ...turn.agents.map((a, index) => [a.description, displays[index].summary].filter(Boolean).join('\n  ')),
@@ -4468,7 +4487,7 @@ function chipsOf(
       label: `${count} subagent${count === 1 ? '' : 's'}`,
       ...(live > 0 ? { running: live } : {}),
       detail,
-      detailList: agentDetailList(turn.agents, status === 'running', sessionLive, true, carried),
+      detailList: agentDetailList(turn.agents, status === 'running', sessionLive, true, carried, labels),
       ...(!cost ? { name: detail, headDetail: true as const } : {}),
     });
   }
@@ -4908,6 +4927,8 @@ export function logOf(
   pending: TurnAsk | null = null,
   running: boolean = true,
   now: number = Date.now(),
+  // Display names from the CLIs' model lists, which the child rows' model names read first.
+  labels?: ModelLabels,
 ): { rows: ActivityRow[]; messages: SaidCard[]; counts: string[] } {
   const launches = agentLaunches(turn);
   const stepRow = (step: TurnStep): ActivityRow => ({
@@ -4923,7 +4944,7 @@ export function logOf(
       stepFigure(step) ||
       (() => {
         const launch = step.id ? launches.get(step.id) : undefined;
-        return launch?.step === step ? agentOutcome(launch.agent) : '';
+        return launch?.step === step ? agentOutcome(launch.agent, labels) : '';
       })(),
     // Start the elapsed clock only for a running step on a running turn.
     since: running && step.status === 'running' ? step.at : null,
@@ -5174,7 +5195,7 @@ export function toCard(
     status === 'running' ? now : status === 'stopped' ? (turn.processEndedAt ?? turn.endedAt) : turn.endedAt;
   const duration = formatDuration(durationEnd - turn.startedAt);
   const lastRelative = formatRelative(turn.endedAt, now);
-  const model = shortModel(turn.model);
+  const model = compactModel(turn.model, labels);
   const speed = modelSpeed(turn.model, ownTurnModelTiers(turn));
   const readableSummary = readableRichText(turn.summary);
   const headlineSource = headlineSourceOf(readableSummary);
@@ -5189,7 +5210,7 @@ export function toCard(
   const asked = pending ? [...turn.laterPrompts, pending] : turn.laterPrompts;
   const waiting = waitingFrom(rows);
   // Share Activity rows and counts across visible and accessible projections.
-  const log = logOf(turn, pending, status === 'running', now);
+  const log = logOf(turn, pending, status === 'running', now, labels);
   const activityCounts: ToolCounts = {
     edits: 0,
     reads: 0,
@@ -5782,13 +5803,13 @@ function autoReviewUsageIdentity(provider: string | null | undefined, serviceTie
   };
 }
 
-function usageIdentity(part: SessionCostUsage): UsageIdentity {
+function usageIdentity(part: SessionCostUsage, labels?: ModelLabels): UsageIdentity {
   const agent = displayAgentName(part.agent);
   const provider = part.provider ? displayProviderName(part.provider) : null;
   if (part.model === 'codex-auto-review') {
     return autoReviewUsageIdentity(part.provider, part.serviceTier);
   }
-  const model = modelWithSpeed(part, undefined, true);
+  const model = modelWithSpeed(part, labels, true);
   const key = JSON.stringify([part.agent ?? null, modelTierKey(part)]);
   if (!agent && !part.model && !provider) {
     return { key, label: 'Model and provider not recorded' };
@@ -5905,13 +5926,16 @@ function unavailableReasons(cost: PricedSessionCost): string[] {
   return reasons;
 }
 
-function unavailableUsage(costs: readonly PricedSessionCost[]): Map<string, UnavailableUsageIdentity> {
+function unavailableUsage(
+  costs: readonly PricedSessionCost[],
+  labels?: ModelLabels,
+): Map<string, UnavailableUsageIdentity> {
   const identities = new Map<string, UnavailableUsageIdentity>();
   for (const cost of costs) {
     if (!cost.partial) {
       continue;
     }
-    const identity = usageIdentity(cost.part);
+    const identity = usageIdentity(cost.part, labels);
     const held = identities.get(identity.key) ?? { ...identity, reasons: new Set<string>() };
     for (const reason of unavailableReasons(cost)) {
       held.reasons.add(reason);
@@ -6009,9 +6033,10 @@ function usageCategoryLines(
   costs: readonly PricedSessionCost[],
   finished = true,
   incomplete = false,
+  labels?: ModelLabels,
 ): StatDetailLine[] {
   const lines = pricedUsageCategoryLines(costs, finished, incomplete);
-  const unavailable = unavailableUsage(costs);
+  const unavailable = unavailableUsage(costs, labels);
   if (unavailable.size > 0) {
     lines.push(...unavailableUsageLines(unavailable));
   }
@@ -6024,8 +6049,8 @@ interface SessionCostIdentityGroup {
   costs: PricedSessionCost[];
 }
 
-function roleUsageIdentity(part: SessionCostUsage, role: 'main' | 'delegated'): UsageIdentity {
-  const identity = usageIdentity(part);
+function roleUsageIdentity(part: SessionCostUsage, role: 'main' | 'delegated', labels?: ModelLabels): UsageIdentity {
+  const identity = usageIdentity(part, labels);
   if (role === 'delegated') {
     return identity;
   }
@@ -6033,7 +6058,7 @@ function roleUsageIdentity(part: SessionCostUsage, role: 'main' | 'delegated'): 
   const provider = part.provider ? displayProviderName(part.provider) : null;
   const standardProvider =
     (agent === 'Codex' && provider === 'OpenAI') || (agent === 'Claude' && provider === 'Anthropic');
-  const label = ['Main agent', modelWithSpeed(part, undefined, true), provider && !standardProvider ? provider : null]
+  const label = ['Main agent', modelWithSpeed(part, labels, true), provider && !standardProvider ? provider : null]
     .filter((held): held is string => Boolean(held))
     .join(' · ');
   return { key: identity.key, label };
@@ -6047,10 +6072,11 @@ function sessionCostIdentityEntries(
   costs: readonly PricedSessionCost[],
   role: 'main' | 'delegated',
   incomplete: (costs: readonly PricedSessionCost[]) => boolean = () => false,
+  labels?: ModelLabels,
 ): StatDetailEntry[] {
   const byIdentity = new Map<string, SessionCostIdentityGroup>();
   for (const cost of costs) {
-    const identity = roleUsageIdentity(cost.part, role);
+    const identity = roleUsageIdentity(cost.part, role, labels);
     const held = byIdentity.get(identity.key) ?? {
       key: identity.key,
       label: identity.label,
@@ -6129,6 +6155,7 @@ function delegatedCacheRateDetail(allCosts: readonly PricedSessionCost[]): { cac
 function delegatedCostLines(
   costs: readonly PricedSessionCost[],
   incomplete: (costs: readonly PricedSessionCost[]) => boolean = () => false,
+  labels?: ModelLabels,
 ): StatDetailLine[] {
   const byIdentity = new Map<
     string,
@@ -6143,7 +6170,7 @@ function delegatedCostLines(
     }
   >();
   for (const cost of costs) {
-    const identity = usageIdentity(cost.part);
+    const identity = usageIdentity(cost.part, labels);
     const held = byIdentity.get(identity.key) ?? {
       label: identity.label,
       dollars: 0,
@@ -6740,8 +6767,16 @@ export interface SessionOverheads {
 }
 
 // Groups delegated work without a named scope, marking missing usage as partial.
-function otherDelegatedEntry(costs: readonly PricedSessionCost[], short: boolean): StatDetailEntry {
-  return { label: 'Other delegated work', value: sessionCostValue(costs, short), lines: delegatedCostLines(costs) };
+function otherDelegatedEntry(
+  costs: readonly PricedSessionCost[],
+  short: boolean,
+  labels?: ModelLabels,
+): StatDetailEntry {
+  return {
+    label: 'Other delegated work',
+    value: sessionCostValue(costs, short),
+    lines: delegatedCostLines(costs, undefined, labels),
+  };
 }
 
 export function sessionCostProjection(
@@ -6759,7 +6794,7 @@ export function sessionCostProjection(
   const costs = parts.map(priceSessionCost);
   const totals: readonly SessionCostTotal[] = incomplete ? [...costs, { dollars: null, partial: true }] : costs;
   const total = captured?.combined ?? sessionCostTotalOf(totals);
-  const unavailable = unavailableUsage(costs);
+  const unavailable = unavailableUsage(costs, overheads.labels);
   const scope = 'Includes the main session and delegated work.';
   const chip = costStat(captured ? [total] : totals, scope, () =>
     [...unavailableUsageLines(unavailable), UNAVAILABLE_COST_NOTE].join('\n'),
@@ -6805,9 +6840,10 @@ export function sessionCostProjection(
                   label: costLabelWithModels(
                     'Main agent',
                     main.map((cost) => cost.part),
+                    overheads.labels,
                   ),
                   value: sessionCostValue(captured ? [captured.main] : main, captured ? false : mainShort),
-                  lines: usageCategoryLines(main, true, mainShort),
+                  lines: usageCategoryLines(main, true, mainShort, overheads.labels),
                 },
                 warnings.filter((warning) => warning.scope === 'main'),
               ),
@@ -6815,12 +6851,12 @@ export function sessionCostProjection(
           : []),
         ...[...delegatedScopes].map(([id, held], index) => {
           const scopeCosts = held.map(priceSessionCost);
-          const identities = [...new Set(held.map((part) => usageIdentity(part).label))];
+          const identities = [...new Set(held.map((part) => usageIdentity(part, overheads.labels).label))];
           return withCostWarnings(
             {
               label: `Subagent ${index + 1} · ${identities.join(', ')}`,
               value: sessionCostValue(scopeCosts, scopeShort(id)),
-              lines: usageCategoryLines(scopeCosts, true, scopeShort(id)),
+              lines: usageCategoryLines(scopeCosts, true, scopeShort(id), overheads.labels),
             },
             warnings.filter((warning) => warning.scope === 'delegated' && warning.id === id),
           );
@@ -6830,6 +6866,7 @@ export function sessionCostProjection(
               otherDelegatedEntry(
                 delegated.filter((cost) => cost.part.scopeId === undefined),
                 short,
+                overheads.labels,
               ),
             ]
           : []),
@@ -6837,10 +6874,10 @@ export function sessionCostProjection(
     : delegated.length || short || mainShort
       ? hasAutoReview
         ? [
-            ...sessionCostIdentityEntries(main, 'main', () => mainShort),
+            ...sessionCostIdentityEntries(main, 'main', () => mainShort, overheads.labels),
             ...(mainShort && !main.length ? [{ label: 'Main agent', value: 'cost unavailable' }] : []),
-            ...sessionCostIdentityEntries(delegated, 'delegated', delegatedShort),
-            ...(short ? [otherDelegatedEntry([], short)] : []),
+            ...sessionCostIdentityEntries(delegated, 'delegated', delegatedShort, overheads.labels),
+            ...(short ? [otherDelegatedEntry([], short, overheads.labels)] : []),
           ]
         : [
             ...(main.length || mainShort
@@ -6849,9 +6886,10 @@ export function sessionCostProjection(
                     label: costLabelWithModels(
                       'Main agent',
                       main.map((cost) => cost.part),
+                      overheads.labels,
                     ),
                     value: sessionCostValue(captured ? [captured.main] : main, captured ? false : mainShort),
-                    lines: usageCategoryLines(main, true, mainShort),
+                    lines: usageCategoryLines(main, true, mainShort, overheads.labels),
                   },
                 ]
               : []),
@@ -6860,7 +6898,7 @@ export function sessionCostProjection(
                   {
                     label: 'Delegated work',
                     value: sessionCostValue(captured ? [captured.delegated] : delegated, captured ? false : short),
-                    lines: delegatedCostLines(delegated, delegatedShort),
+                    lines: delegatedCostLines(delegated, delegatedShort, overheads.labels),
                   },
                 ]
               : []),
@@ -6870,8 +6908,9 @@ export function sessionCostProjection(
             label: costLabelWithModels(
               'Cost by usage',
               main.map((cost) => cost.part),
+              overheads.labels,
             ),
-            lines: usageCategoryLines(main),
+            lines: usageCategoryLines(main, true, false, overheads.labels),
           },
         ];
   const compactionCount = overheads.compactionCount ?? 0;

@@ -169,7 +169,7 @@ test('whole-session cost metadata nests warnings under their owning scopes even 
   );
   const entries = chip.detailList!.entries;
   assert.equal(entries.length, 3);
-  assert.equal(entries[0].label, 'Main agent · sonnet-5');
+  assert.equal(entries[0].label, 'Main agent · Sonnet 5');
   assert.match(entries[1].label, /^Subagent 1/);
   assert.match(entries[2].label, /^Subagent 2/);
   assert.deepEqual(entries[0].lines?.[0], {
@@ -267,7 +267,7 @@ test('routine cache rates use each scope input totals and leave short or unknown
   assert.match(chip.detail, /90% cached/);
   const delegated = chip.detailList!.entries[1].lines![0];
   assert.deepEqual(delegated, {
-    text: 'sonnet-5 · provider not recorded: <$0.01',
+    text: 'Sonnet 5 · provider not recorded: <$0.01',
     cacheHit: { percent: 10, warning: false, requestScale: [5, 20] },
   });
   const incomplete = sessionCostProjection([
@@ -423,7 +423,7 @@ test('the wait-share line leads the session entries before the cache line and si
     warning: true,
   });
   const entry = chip.detailList!.entries[1];
-  assert.equal(entry.label, 'Main agent · sonnet-5');
+  assert.equal(entry.label, 'Main agent · Sonnet 5');
   assert.deepEqual(entry.lines?.[0], {
     text: 'Low cache reuse in this session: $8.00 of $8.02 went to cache writes',
     warning: true,
@@ -449,7 +449,7 @@ test('the wait-share line leads the session entries before the cache line and si
       "Waiting on subagents took 50% of the main agent's cost: $2.00 of $4.00 went to 5 waits, 1 of them timed out",
     warning: true,
   });
-  assert.equal(alone.detailList!.entries[1].label, 'Cost by usage · sonnet-5');
+  assert.equal(alone.detailList!.entries[1].label, 'Cost by usage · Sonnet 5');
   assert.deepEqual(
     alone.warnings?.map((warning) => warning.scope),
     ['wait'],
@@ -471,7 +471,7 @@ test('a wait-share line without a cache warning keeps the delegated work entry',
     entries.map((entry) => entry.label),
     [
       "Waiting on subagents took 50% of the main agent's cost: $2.00 of $4.00 went to 5 waits, 0 of them timed out",
-      'Main agent · sonnet-5',
+      'Main agent · Sonnet 5',
       'Delegated work',
     ],
   );

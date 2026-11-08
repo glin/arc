@@ -35,12 +35,12 @@ import {
   MAX_PROMPT_ASSET_BYTES,
   MAX_PROMPT_ASSET_TOTAL_BYTES,
 } from './promptassets';
-import { formatMegabytes, speedName } from './turnformat';
+import { compactModel, formatMegabytes, modelLabels, shortModel, speedName, type ModelLabels } from './turnformat';
 import { PermissionMode, type RemoteControlResult } from './claudewire';
 // `mcpview.ts` prepares the Servers control and menu. This module places the control
 // on the row. Type-only imports there prevent a runtime dependency cycle.
 import { mcpMenu, mcpPick } from './mcpview';
-import { WINDOW_SUFFIX, modelWindowOf, sameModelIdentity } from './domain/model-identity';
+import { WINDOW_SUFFIX, modelWindowOf, normalizeModelIdentity, sameModelIdentity } from './domain/model-identity';
 import { AgentKind, Turn, cleanPrompt } from './transcript';
 import { LINE_BREAK, matchCommandNames, remoteControlRequest, renameRequest } from './domain/composer-editing';
 import { isLocalLinkPath } from './domain/link-path';
@@ -73,7 +73,6 @@ import {
   PROMPT_HISTORY_ENTRY_CHARS,
   QUEUED_SUBMISSION_LIMIT,
   QueuedSubmission,
-  shortModel,
   STATUS_WORDS,
   TurnComment,
   wholePercent,
@@ -653,6 +652,9 @@ export interface ComposerState {
   session: string;
   // Empty until the agent has been asked what it runs.
   models: readonly ModelChoice[];
+  // The display names the host holds from every model list, including Codex's saved list. Model
+  // names in the prompt box read these. Without them, the names come from `models`.
+  modelLabels?: ModelLabels;
   defaults?: DefaultContext;
   // The agent's reported prompt entries in catalog order. Empty before the catalog
   // arrives or when the agent publishes none.
@@ -2006,11 +2008,12 @@ function nextTurnFaces(
   warmMoney: string,
   coldMoney: string,
   coldOnly: boolean,
+  labels?: ModelLabels,
 ): Pick<ComposerNextTurn, 'warm' | 'cold'> {
   const tier = lifetimeTier ? TIER_WORDS[lifetimeTier] : null;
   const modelTier = lifetimeTier ?? cacheLifetimeFor(basis.model, basis.provider);
   const statusTitle = modelTier
-    ? `${shortModel(basis.model) ?? 'Model'} cache lifetime: ${TIER_WORDS[modelTier].bought}`
+    ? `${compactModel(basis.model, labels) ?? 'Model'} cache lifetime: ${TIER_WORDS[modelTier].bought}`
     : null;
   if (!tier && (basis.afterCompaction || coldOnly)) {
     const compacted: NextTurnFace = {
@@ -2040,7 +2043,7 @@ function nextTurnFaces(
       },
     };
   }
-  const lifetime = `${shortModel(basis.model) ?? 'Model'} cache lifetime: ${tier.bought}`;
+  const lifetime = `${compactModel(basis.model, labels) ?? 'Model'} cache lifetime: ${tier.bought}`;
   const warm: NextTurnFace = {
     state: 'warm',
     lead: NEXT_TURN_LEAD,
@@ -2110,7 +2113,7 @@ export function prospectiveNextTurn(state: ComposerState): ProspectiveNextTurn |
 }
 
 // Omit the next-turn figure without a request basis or a usable formatted price.
-function nextTurnFigure(prospective: ProspectiveNextTurn | null): ComposerNextTurn | null {
+function nextTurnFigure(prospective: ProspectiveNextTurn | null, labels?: ModelLabels): ComposerNextTurn | null {
   if (!prospective) {
     return null;
   }
@@ -2144,7 +2147,7 @@ function nextTurnFigure(prospective: ProspectiveNextTurn | null): ComposerNextTu
     afterCompaction: basis.afterCompaction,
     tolerance: CONSERVATIVE_CACHE_BOUNDARY_MS,
     nearBoundary: Math.max(CONSERVATIVE_CACHE_BOUNDARY_MS, CACHE_SPAN_MINIMUM_SECONDS * 1000),
-    ...nextTurnFaces(basis, lifetimeTier, coldAt, warmMoney, coldMoney, coldOnly !== null),
+    ...nextTurnFaces(basis, lifetimeTier, coldAt, warmMoney, coldMoney, coldOnly !== null, labels),
   };
 }
 
@@ -2406,8 +2409,16 @@ export function pickMenu(control: string, state: ComposerState | null): Menu | n
   return null;
 }
 
+// The compact name of the recorded model when no menu row answers for it. A reply ID that the catalog
+// lists in more than one window keeps its `shortModel` form, because a display name there claims the plain window.
+function recordedModelName(state: ComposerState, labels: ModelLabels): string {
+  const { confirmedModel: reply, confirmedModelAttachment: attachment } = state.settings;
+  const severalWindows = !attachment && !modelRan(state.models, reply) && modelAttached(state.models, reply) !== null;
+  return (severalWindows ? shortModel(reply) : compactModel(reply, labels)) ?? '';
+}
+
 // Disable the model control when its menu has no rows.
-function modelPick(state: ComposerState, name: string): ComposerPick {
+function modelPick(state: ComposerState, name: string, labels: ModelLabels): ComposerPick {
   const selected = state.settings.selectedModel;
   const chosen = chosenModel(state.models, selected);
   // Resolve the label from the selected or recorded model, then the catalog fallback. Empty selections need `||` to reach a nonempty label.
@@ -2415,7 +2426,7 @@ function modelPick(state: ComposerState, name: string): ComposerPick {
   const confirmedChoice = recordedModel(state);
   const readConfirmed = !selected || (!pending && state.settings.pendingModel !== null);
   const running = readConfirmed ? confirmedChoice : null;
-  const recorded = readConfirmed ? (shortModel(state.settings.confirmedModel) ?? '') : '';
+  const recorded = readConfirmed ? recordedModelName(state, labels) : '';
   // An unconfirmed selection keeps its own label, including a stored value absent from the catalog.
   const baseLabel =
     (readConfirmed ? running?.label || recorded : chosen?.label || selected) ||
@@ -3720,7 +3731,13 @@ function liveStatus(kind: LiveKind, state: LiveState, name: string, waiting: boo
 }
 
 // Build a temporary timeline card from the submission, current settings, and response state.
-function liveCard(state: ComposerState, press: LivePress, name: string, now: number): ComposerLive {
+function liveCard(
+  state: ComposerState,
+  press: LivePress,
+  name: string,
+  now: number,
+  labels: ModelLabels,
+): ComposerLive {
   const which = liveState(press, state.running);
   // A prompt waits when the session runs but it has neither started nor received reply text.
   const waiting = press.kind === 'prompt' && which === 'running' && !press.started && press.reply === '';
@@ -3729,8 +3746,9 @@ function liveCard(state: ComposerState, press: LivePress, name: string, now: num
   const failed = press.failed;
   const tone = which === 'sent' ? 'running' : which;
   // Prefer the selected model, then the confirmed model. Without either, leave the model label empty.
+  // A picker alias names the current selection here, so the model list name applies to it.
   const identity = state.settings.selectedModel || state.settings.confirmedModel;
-  const model = shortModel(identity) ?? '';
+  const model = (identity && labels.get(normalizeModelIdentity(identity))) || (compactModel(identity, labels) ?? '');
   const confirmed = Boolean(
     identity && state.settings.confirmedModel && sameModelIdentity(identity, state.settings.confirmedModel),
   );
@@ -3797,12 +3815,12 @@ function liveCard(state: ComposerState, press: LivePress, name: string, now: num
 
 // Draw visible temporary cards newest first. Different submission kinds retain separate cards.
 // An automatic compaction draws below them in the running state, without controls.
-function liveCards(state: ComposerState, name: string, now: number): ComposerLive[] {
+function liveCards(state: ComposerState, name: string, now: number, labels: ModelLabels): ComposerLive[] {
   const cards: ComposerLive[] = [];
   for (const press of state.live) {
     // Mid-turn prompts use the running turn's card. Failed deliveries retain a separate notice.
     if (press.midTurn && !press.failed) continue;
-    cards.unshift(liveCard(state, press, name, now));
+    cards.unshift(liveCard(state, press, name, now, labels));
   }
   const automatic = state.automaticCompaction;
   if (automatic) {
@@ -3819,7 +3837,7 @@ function liveCards(state: ComposerState, name: string, now: number): ComposerLiv
       failed: false,
       reason: '',
     };
-    cards.push(liveCard({ ...state, running: true }, press, name, now));
+    cards.push(liveCard({ ...state, running: true }, press, name, now, labels));
   }
   return cards;
 }
@@ -4017,9 +4035,10 @@ export function composerView(state: ComposerState | null, now: number = Date.now
     return null;
   }
   const name = agentName(state.agent);
+  const labels = state.modelLabels ?? modelLabels([state.models]);
   const picks = state.profile
     ? draftProfilePicks(state, state.profile)
-    : [modelPick(state, name), effortPick(state, name), askModePick(state)];
+    : [modelPick(state, name, labels), effortPick(state, name), askModePick(state)];
   // Append the MCP control after the setup controls when server state is available.
   const servers = mcpControl(state, state.profile ? agentName(state.profile.agent) : name);
   if (servers) {
@@ -4048,7 +4067,7 @@ export function composerView(state: ComposerState | null, now: number = Date.now
           return figure ? { ...figure, generation: state.contextGeneration ?? 0 } : null;
         })(),
     // Drafts display no next-turn estimate from their source session.
-    nextTurn: state.profile ? null : nextTurnFigure(prospectiveNextTurn(state)),
+    nextTurn: state.profile ? null : nextTurnFigure(prospectiveNextTurn(state), labels),
     picks,
     // Drafts and agent runs never hold a connection, so the host map has no entry for them.
     remoteControl: remoteControlControl(state),
@@ -4075,7 +4094,7 @@ export function composerView(state: ComposerState | null, now: number = Date.now
       .filter((entry) => entry.text.trim() || entry.assets.length || entry.commentIds.length)
       .map((entry) => queuedPrompt(state, entry, name, now)),
     history: [...state.history],
-    live: liveCards(state, name, now),
+    live: liveCards(state, name, now, labels),
     asks: (state.asks ?? []).map((ask) => askCard(ask, name)),
     sendOverAsk: sendOverAskLine(state),
   };

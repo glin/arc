@@ -1232,7 +1232,7 @@ test('a rail card keeps warning metadata, full detail, and every condition in it
   assert.equal(cost.warnings?.length, 1);
   assert.match(
     cost.detail,
-    /Main agent · sonnet-5: \$8\.02\n  Low cache reuse in this session: \$8\.00 of \$8\.02 went to cache writes\n  Cached input reads: \$0\.02 \(5% cached · 5 requests · 420k avg input\)/,
+    /Main agent · Sonnet 5: \$8\.02\n  Low cache reuse in this session: \$8\.00 of \$8\.02 went to cache writes\n  Cached input reads: \$0\.02 \(5% cached · 5 requests · 420k avg input\)/,
   );
   assert.match(railCardName(card), /whole session cost \$8\.02, Low cache reuse in this session/);
 });

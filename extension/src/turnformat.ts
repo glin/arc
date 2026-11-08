@@ -32,7 +32,7 @@ export function formatDay(at: number, now: number = Date.now()): string | null {
   return `${MONTHS[d.getMonth()]} ${d.getDate()}`;
 }
 
-// Removes the Claude model prefix and trailing snapshot date.
+// Removes the Claude model prefix and trailing snapshot date. The CLI status line reads this form.
 export function shortModel(model: string | null): string | null {
   if (!model) {
     return null;
@@ -87,7 +87,7 @@ export function modelTierKey(part: ModelTierIdentity): string {
 }
 
 export function modelWithSpeed(part: ModelTierIdentity, labels?: ModelLabels, short = false): string {
-  const model = short ? (shortModel(part.model) ?? 'model not recorded') : friendlyModel(part.model, labels);
+  const model = short ? (compactModel(part.model, labels) ?? 'model not recorded') : friendlyModel(part.model, labels);
   const speed = speedName(part.provider, part.serviceTier);
   return speed && speed !== 'Standard' ? `${model} · ${speed}` : model;
 }
@@ -131,10 +131,43 @@ export function sameModelLabels(left: ModelLabels, right: ModelLabels): boolean 
   return left.size === right.size && [...left].every(([key, label]) => right.get(key) === label);
 }
 
+// A context suffix such as `[1m]` and a snapshot date name the same model.
+const bareModel = (model: string): string =>
+  model
+    .replace(/\[[^\]]*\]$/, '')
+    .replace(/-\d{8}$/, '')
+    .replace(/-\d{4}-\d{2}-\d{2}$/, '');
+
+// The spelling the Codex model list uses for an OpenAI GPT ID without a display name, so
+// `gpt-6.1-sol` reads `GPT-6.1-Sol`. Null for any other ID.
+function gptModelName(model: string): string | null {
+  const gpt = /^gpt-(\d+(?:\.\d+)?)((?:-[a-z]+)*)$/.exec(bareModel(model));
+  if (!gpt) return null;
+  return [`GPT-${gpt[1]}`, ...gpt[2].split('-').filter(Boolean).map(MODEL_WORD)].join('-');
+}
+
+// A model's compact name, for turn headers, child rows and the prompt box. An ID that starts with
+// `claude-` reads its reading name, as `Opus 5.5`, or its `shortModel` form when nothing names it.
+// A GPT ID reads the display name a CLI's model list gives it, then the `gptModelName` spelling.
+// Any other model reads its `shortModel` form, so a bare alias such as `opus` stays as recorded and
+// never claims the model the list maps that alias to today.
+export function compactModel(model: string | null | undefined, labels?: ModelLabels): string | null {
+  if (!model) {
+    return null;
+  }
+  if (model.startsWith('claude-')) {
+    const name = friendlyModel(model, labels);
+    return name === model ? shortModel(model) : name;
+  }
+  if (!/^gpt-/i.test(model)) {
+    return shortModel(model);
+  }
+  return labels?.get(normalizeModelIdentity(model)) ?? gptModelName(model) ?? model;
+}
+
 // A model's reading name. The display name a CLI's model list gives it comes first. Otherwise
-// `claude-opus-5-5-20261001` reads `Opus 5.5`, `gpt-6.1-sol` reads `GPT-6.1 Sol` and
-// `gpt-6-astra` reads `GPT-6 Astra`. Any other model reads its recorded ID, and a missing model
-// reads `Model not recorded`.
+// `claude-opus-5-5-20261001` reads `Opus 5.5` and `gpt-6.1-sol` reads `GPT-6.1-Sol`. Any other
+// model reads its recorded ID, and a missing model reads `Model not recorded`.
 export function friendlyModel(model: string | null | undefined, labels?: ModelLabels): string {
   if (!model) {
     return 'Model not recorded';
@@ -143,26 +176,17 @@ export function friendlyModel(model: string | null | undefined, labels?: ModelLa
   if (listed) {
     return listed;
   }
-  // A context suffix such as `[1m]` and a snapshot date name the same model.
-  const bare = model
-    .replace(/\[[^\]]*\]$/, '')
-    .replace(/-\d{8}$/, '')
-    .replace(/-\d{4}-\d{2}-\d{2}$/, '');
+  const bare = bareModel(model);
   // Newer Claude IDs put the family first, as `claude-opus-5-5`. Older ones put it last, as `claude-3-5-haiku`.
-  const named = /^claude-(opus|sonnet|haiku)-(\d+)(?:-(\d+))?$/.exec(bare);
-  const versioned = /^claude-(\d+)(?:-(\d+))?-(opus|sonnet|haiku)$/.exec(bare);
+  const named = /^claude-(opus|sonnet|haiku|fable|mythos)-(\d+)(?:-(\d+))?$/.exec(bare);
+  const versioned = /^claude-(\d+)(?:-(\d+))?-(opus|sonnet|haiku|fable|mythos)$/.exec(bare);
   if (named || versioned) {
     const [family, major, minor] = named
       ? [named[1], named[2], named[3]]
       : [versioned![3], versioned![1], versioned![2]];
     return `${MODEL_WORD(family)} ${major}${minor ? `.${minor}` : ''}`;
   }
-  const gpt = /^gpt-(\d+(?:\.\d+)?)((?:-[a-z]+)*)$/.exec(bare);
-  if (gpt) {
-    const words = gpt[2].split('-').filter(Boolean).map(MODEL_WORD);
-    return [`GPT-${gpt[1]}`, ...words].join(' ');
-  }
-  return model;
+  return gptModelName(model) ?? model;
 }
 
 // Formats binary megabytes with one decimal below 10 MB and whole numbers above it.

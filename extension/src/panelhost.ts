@@ -5176,6 +5176,7 @@ export class PanelProvider implements vscode.Disposable {
       comments: this.saved.comments,
       session: row.label,
       models: this.models[row.agentKey] ?? [],
+      modelLabels: this.modelLabels,
       defaults: this.defaultContext?.(
         row.agentKey,
         this.cwdForSession(row.agentKey, row.id),
@@ -16417,6 +16418,8 @@ export class PanelProvider implements vscode.Disposable {
           folders,
           now,
           reference.kind === 'dispatch' ? reference.agent : turn.agent,
+          undefined,
+          this.modelLabels,
         );
       },
     );

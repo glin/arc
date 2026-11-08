@@ -5165,8 +5165,8 @@ test('the session cost popover leads with its warning, splits into sections, sho
       for (const end of shape.rowEnds) assert.equal(end, 'sbbar context-meter');
       // Both tabs draw the Main agent and Delegated sections.
       assert.deepEqual(shape.sections, [
-        ['Main agent GPT-6.1 Sol', 'Delegated 3 agents'],
-        ['Main agent GPT-6.1 Sol', 'Delegated 3 agents'],
+        ['Main agent GPT-6.1-Sol', 'Delegated 3 agents'],
+        ['Main agent GPT-6.1-Sol', 'Delegated 3 agents'],
       ]);
       // Each tab draws one row per figure: three usage categories and two delegated models, then
       // the five merged main agent tool rows and four delegated tool rows.
@@ -5348,7 +5348,7 @@ test('the Delegated section folds models past the third behind the View more exp
     await page.locator('.chippop:not([hidden]) .costmore summary').waitFor();
     assert.deepEqual(await state(), {
       pinned: false,
-      shown: ['Model not recorded', 'GPT-6.1 Sol', 'Opus 5.5'],
+      shown: ['Model not recorded', 'GPT-6.1-Sol', 'Opus 5.5'],
       summary: 'View 2 more models',
       open: false,
     });

@@ -15,6 +15,7 @@ import { launcherCustomRequest, setupListing } from './view/launcher';
 import { normalizePinnedSetups, pinValues } from './domain/session-setups';
 
 import assert from 'node:assert';
+import { modelLabels } from './turnformat';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import {
@@ -7471,7 +7472,7 @@ test('the line names one figure and its cached status while it is warm', () => {
   assert.deepEqual(figure.warm.trail, {
     lead: ', cached for another ',
     count: 'left',
-    title: 'opus-5 cache lifetime: 1 hour',
+    title: 'Opus 5 cache lifetime: 1 hour',
     near: { lead: ', cached for under ', value: '2m', trail: '' },
     trail: '',
   });
@@ -7489,7 +7490,7 @@ test('the line calls a cold cache uncached', () => {
   assert.ok(figure?.cold);
   assert.equal(figure.cold.price, '$6.20');
   assert.equal(figure.cold.trail, ', uncached');
-  assert.equal(figure.cold.statusTitle, 'opus-5 cache lifetime: 1 hour');
+  assert.equal(figure.cold.statusTitle, 'Opus 5 cache lifetime: 1 hour');
 });
 
 test('the uncertain boundary and missing lifetime quote the conservative price', () => {
@@ -7612,7 +7613,7 @@ test('a cache that has only been written says so, so the first turn does not rea
 test('the words follow the lifetime the record names, not the hour alone', () => {
   const figure = nextTurnOf({ tier: '5m' });
   assert.equal(figure?.coldAt, AT + 300_000 - figure!.tolerance);
-  assert.equal((figure!.warm!.trail as { title: string }).title, 'opus-5 cache lifetime: 5 minutes');
+  assert.equal((figure!.warm!.trail as { title: string }).title, 'Opus 5 cache lifetime: 5 minutes');
 });
 
 test('no line at all where the panel cannot work the starting price out', () => {
@@ -7935,7 +7936,7 @@ test('recorded models resolve in every catalog shape without naming a current mo
   // A resolved model with a deployment suffix still answers to its alias. A different model never does.
   const suffixed = [row('opus', 'claude-opus-9-2-v1:0', 'Opus 9.2'), row('claude-opus-9', 'claude-opus-9', 'Opus 9')];
   assert.deepEqual(finishedTurnLabels(suffixed, null, 'claude-opus-9-2'), ['Opus 9.2', 'high']);
-  assert.deepEqual(finishedTurnLabels(suffixed, 'claude-opus-8-1[1m]', 'claude-opus-8-1'), ['opus-8-1', 'high']);
+  assert.deepEqual(finishedTurnLabels(suffixed, 'claude-opus-8-1[1m]', 'claude-opus-8-1'), ['Opus 8.1', 'high']);
 });
 
 test('a saved pick on the recorded model keeps the next-turn cache warm with or without resolved models', () => {
@@ -8808,6 +8809,101 @@ test('saved service tier survives reload and accepted settings without leaking t
   assert.equal(sessionSettings(book, 'one').serviceTier, 'priority');
   assert.equal(sessionSettings(book, 'two').serviceTier, undefined);
   assert.equal(sessionSettings({}, 'old').serviceTier, undefined);
+});
+
+// A Codex model the prompt box names outside its menu rows reads the model list spelling or the
+// hyphenated GPT spelling, never the lowercase recorded ID.
+test('the prompt box names a GPT model with the model list spelling outside its menu rows', () => {
+  const listed = composerState({
+    agent: 'codex',
+    models: [{ value: 'gpt-6.1-sol', label: 'GPT-6.1-Sol Listed', description: '', efforts: [] }],
+    model: '',
+    nextTurn: {
+      ...FLOOR_BASIS,
+      model: 'gpt-6.1-sol',
+      provider: 'openai',
+      tokens: 100000,
+      window: 1050000,
+      tier: '30m',
+      serviceTier: 'default',
+    },
+  });
+  const figure = JSON.stringify(composerView(listed)!.nextTurn);
+  assert.match(figure, /GPT-6\.1-Sol Listed cache lifetime: /);
+  assert.doesNotMatch(figure, /gpt-6\.1-sol cache lifetime/);
+  const unlisted = composerState({ agent: 'codex', models: [], model: '' });
+  unlisted.settings = { ...unlisted.settings, confirmedModel: 'gpt-6.1-sol' };
+  const pick = composerView(unlisted)!.picks.find((item) => item.control === 'model')!;
+  assert.match(pick.label, /^GPT-6\.1-Sol\b/);
+  // The host's held names include Codex's saved list, which names a model the menu rows lack.
+  // The recorded-model fallback, the live card and the cache lifetime titles read them.
+  const held = modelLabels([[{ value: 'gpt-6.1-sol', label: 'GPT-6.1-Sol Cached' }]]);
+  const cached = composerState({
+    agent: 'codex',
+    models: [],
+    model: '',
+    nextTurn: {
+      ...FLOOR_BASIS,
+      model: 'gpt-6.1-sol',
+      provider: 'openai',
+      tokens: 100000,
+      window: 1050000,
+      tier: '30m',
+    },
+  });
+  cached.modelLabels = held;
+  cached.settings = { ...cached.settings, confirmedModel: 'gpt-6.1-sol' };
+  cached.live = [
+    {
+      sessionId: cached.sessionId,
+      agent: 'codex',
+      kind: 'prompt',
+      text: 'Go',
+      at: Date.now(),
+      reply: '',
+      midTurn: false,
+      ran: false,
+      started: true,
+      failed: false,
+      reason: '',
+    },
+  ];
+  const view = composerView(cached)!;
+  assert.match(view.picks.find((item) => item.control === 'model')!.label, /^GPT-6\.1-Sol Cached\b/);
+  assert.equal(view.live[0].model, 'GPT-6.1-Sol Cached');
+  assert.match(JSON.stringify(view.nextTurn), /GPT-6\.1-Sol Cached cache lifetime: /);
+});
+
+// A picker alias names the current selection, so a live card reads the name the settled card will.
+test('a live card names a selected alias with the model list name', () => {
+  const live = (models: ModelChoice[]) => {
+    const state = composerState({ models, model: 'fable' });
+    state.live = [
+      {
+        sessionId: state.sessionId,
+        agent: 'claude',
+        kind: 'prompt',
+        text: 'Go',
+        at: Date.now(),
+        reply: '',
+        midTurn: false,
+        ran: false,
+        started: true,
+        failed: false,
+        reason: '',
+      },
+    ];
+    return composerView(state)!.live[0].model;
+  };
+  const listed = {
+    value: 'fable',
+    resolvedModel: 'claude-fable-5-1',
+    label: 'Fable 5.1',
+    description: '',
+    efforts: [],
+  };
+  assert.equal(live([listed]), 'Fable 5.1');
+  assert.equal(live([]), 'fable', 'an alias no list names stays as recorded');
 });
 
 test('prospective prices use explicit speed selections before a simultaneous model change', () => {

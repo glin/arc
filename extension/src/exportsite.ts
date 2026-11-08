@@ -911,6 +911,7 @@ export async function projectSessionSite(
                         model.capturedAt,
                         target.agent,
                         edge.kind === 'reader-started' ? 'session' : edge.kind,
+                        labels,
                       ),
                     ],
                   }).agents![0]

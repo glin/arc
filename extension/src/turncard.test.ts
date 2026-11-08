@@ -1335,7 +1335,7 @@ test('the cost popovers lead with the wait warning, and their Waits rows count t
   assert.deepEqual(
     split.sections.map((section) => [section.label, section.detail]),
     [
-      ['Main agent', 'GPT-6.1 Sol'],
+      ['Main agent', 'GPT-6.1-Sol'],
       ['Delegated', '3 agents'],
     ],
   );
@@ -1348,8 +1348,8 @@ test('the cost popovers lead with the wait warning, and their Waits rows count t
   assert.deepEqual(
     models.rows.map((row) => [row.label, row.count]),
     [
-      ['GPT-6.1 Sol', '2 agents'],
-      ['GPT-6 Astra', '1 agent'],
+      ['GPT-6.1-Sol', '2 agents'],
+      ['GPT-6-Astra', '1 agent'],
     ],
   );
   assert.equal(models.more, undefined);
@@ -1556,7 +1556,7 @@ test('the cost popovers name models with the display names their CLIs list', () 
     'claude-mystery-1',
   ]);
   const plain = toCard(shown, false, NOW).chips.find((chip) => chip.metric === 'cost')!.detailList!.cost!;
-  assert.equal(plain.sections[0].detail, 'claude-fable-5-1', 'a popover without lists named a model');
+  assert.equal(plain.sections[0].detail, 'Fable 5.1', 'a popover without lists lost the family name');
   const session = sessionCostProjection(
     [main, delegated('claude-fable-5-1', 'claude'), delegated('gpt-6.1-sol', 'codex')],
     false,
@@ -1564,6 +1564,128 @@ test('the cost popovers name models with the display names their CLIs list', () 
   ).stats[0].detailList!.cost!;
   assert.equal(session.sections[0].detail, 'Fable 5.1');
   assert.deepEqual(session.tabs[0].parts[1].rows.map((row) => row.label).sort(), ['Fable 5.1', 'GPT-6.1-Sol']);
+});
+
+// The compact names on a card read the model list's spelling, then the hyphenated GPT spelling.
+test('a GPT turn names its models with the model list spelling in the header, child rows and log', () => {
+  const labels = modelLabels([[{ value: 'gpt-6-astra', label: 'GPT-6 Astra Listed' }]]);
+  const shown = turn({
+    agent: 'codex',
+    model: 'gpt-6.1-sol',
+    steps: [step({ name: 'spawn_agent', id: 'agent-1', detail: 'Audit the parser' })],
+    stepCount: 1,
+    agents: [agent({ toolUseId: 'agent-1', model: 'gpt-6-astra', effort: 'high', spend: [] })],
+  });
+  const listed = toCard(shown, true, NOW, [], null, false, new Set(), [], null, labels);
+  assert.equal(listed.model, 'GPT-6.1-Sol');
+  assert.equal(listed.agents[0].model, 'GPT-6 Astra Listed');
+  assert.equal(logOf(shown, null, true, NOW, labels).rows[0].figure, 'GPT-6 Astra Listed · high');
+  assert.match(listed.chips.find((chip) => chip.metric === 'agents')!.detail, /GPT-6 Astra Listed · high/);
+  const plain = toCard(shown, true, NOW);
+  assert.equal(plain.model, 'GPT-6.1-Sol');
+  assert.equal(plain.agents[0].model, 'GPT-6-Astra');
+});
+
+// A Claude turn header reads the name the model picker shows, with or without a model list.
+test('a Claude turn header reads the model name with and without a model list', () => {
+  const labels = modelLabels([
+    [
+      { value: 'fable', resolvedModel: 'claude-fable-5-1', label: 'Fable 5.1' },
+      { value: 'opus', resolvedModel: 'claude-opus-5-5', label: 'Opus 5.5' },
+    ],
+  ]);
+  for (const [model, name] of [
+    ['claude-fable-5-1', 'Fable 5.1'],
+    ['claude-opus-5-5', 'Opus 5.5'],
+  ]) {
+    const shown = turn({ model });
+    assert.equal(
+      toCard(shown, true, NOW, [], null, false, new Set(), [], null, labels).model,
+      name,
+      `${model} with a list`,
+    );
+    assert.equal(toCard(shown, true, NOW).model, name, `${model} without a list`);
+  }
+});
+
+// A model list can spell a GPT model differently from the hyphenated fallback. Every name on the
+// card, its child rows and their popovers, and the session figures then reads the list's spelling,
+// including a main agent without usage parts, a child without usage parts and usage without a price.
+test('a listed GPT spelling reaches child cost records, main fallback, unpriced usage and session context', () => {
+  const labels = modelLabels([[{ value: 'gpt-5.6-sol', label: 'GPT-5.6-Sol Listed' }]]);
+  const usage = tokenUsage({ requests: 1, input: 1_000_000 });
+  const part = {
+    model: 'gpt-5.6-sol',
+    provider: 'openai',
+    contextWindow: 272_000,
+    contextBand: 'short' as const,
+    inferenceClass: null,
+    serviceTier: 'default',
+    usage,
+  };
+  const unpriced = { ...part, serviceTier: 'unsupported' };
+  const shown = turn({
+    agent: 'codex',
+    model: 'gpt-5.6-sol',
+    provider: 'openai',
+    usage,
+    contextTokens: 200_000,
+    contextWindow: null,
+    agents: [
+      agent({
+        model: 'gpt-5.6-sol',
+        spendFound: true,
+        spend: [{ model: 'gpt-5.6-sol', provider: 'openai', usage, usageParts: [part, unpriced] }],
+      }),
+      agent({
+        description: 'Check the writer',
+        model: 'gpt-5.6-sol',
+        spendFound: true,
+        spend: [{ model: 'gpt-5.6-sol', provider: 'openai', contextWindow: 272_000, usage }],
+      }),
+    ],
+  });
+  // Only the raw ID and the listed spelling remain once the list names the model.
+  const fallback = /GPT-5\.6-Sol(?! Listed)/;
+  const listed = toCard(shown, false, NOW, [], null, false, new Set(), [], null, labels);
+  assert.doesNotMatch(JSON.stringify(listed), fallback);
+  const childCost = listed.agents[0].figures.find((figure) => figure.metric === 'cost')!;
+  assert.match(JSON.stringify(childCost.record), /"label":"GPT-5\.6-Sol Listed"/);
+  assert.match(JSON.stringify(childCost.record), /Cost unavailable for GPT-5\.6-Sol Listed/);
+  const secondCost = listed.agents[1].figures.find((figure) => figure.metric === 'cost')!;
+  assert.match(JSON.stringify(secondCost.record), /"label":"GPT-5\.6-Sol Listed"/);
+  const cost = JSON.stringify(listed.chips.find((chip) => chip.metric === 'cost')!.detailList);
+  assert.match(cost, /Main agent · GPT-5\.6-Sol Listed/);
+  assert.match(cost, /Check the writer · GPT-5\.6-Sol Listed/);
+  assert.match(listed.chips.find((chip) => chip.label.includes(' ctx '))!.detail, /fallback for GPT-5\.6-Sol Listed/);
+  // Without a list, the same card reads the hyphenated fallback.
+  assert.match(JSON.stringify(toCard(shown, false, NOW)), /Main agent · GPT-5\.6-Sol"/);
+  const session = sessionCostProjection(
+    [
+      { agent: 'codex', role: 'main', ...part },
+      { agent: 'codex', role: 'main', ...unpriced },
+      { agent: 'codex', role: 'delegated', ...unpriced },
+      { agent: 'codex', role: 'delegated', scopeId: 'scope', ...part },
+      { agent: 'codex', role: 'delegated', scopeId: 'scope', ...unpriced },
+    ],
+    false,
+    { labels },
+  ).stats[0];
+  assert.doesNotMatch(JSON.stringify(session), fallback);
+  assert.match(session.partialDetail!, /Cost unavailable for Codex · GPT-5\.6-Sol Listed/);
+  assert.match(
+    JSON.stringify(session.detailList),
+    /Delegated work[\s\S]*Codex · GPT-5\.6-Sol Listed · OpenAI: cost unavailable/,
+  );
+  const mainOnly = sessionCostProjection(
+    [
+      { agent: 'codex', role: 'main', ...part },
+      { agent: 'codex', role: 'main', ...unpriced },
+    ],
+    false,
+    { labels },
+  ).stats[0];
+  assert.match(JSON.stringify(mainOnly.detailList), /Cost unavailable for Codex · GPT-5\.6-Sol Listed/);
 });
 
 // A turn's delegated tool rows read the tool kinds its subagents' usage parts carry, whether the
@@ -2222,8 +2344,8 @@ test('mixed exact main and child identities keep the cost chip and warning evide
       ['delegated', 8.8, 8.922],
     ],
   );
-  assert.match(cost.detail, /Main agent · sonnet-5, haiku-4-5: \$8\.92/);
-  assert.match(cost.detail, /Audit the parser · sonnet-5, haiku-4-5: \$8\.92/);
+  assert.match(cost.detail, /Main agent · Sonnet 5, Haiku 4\.5: \$8\.92/);
+  assert.match(cost.detail, /Audit the parser · Sonnet 5, Haiku 4\.5: \$8\.92/);
 });
 
 test('nested delegated costs keep the direct child warning eligible while the total remains a floor', () => {
@@ -2403,8 +2525,8 @@ test('exact direct child detail stays consistent beside a recorded nested result
   );
   const cost = card.chips.find((chip) => chip.metric === 'cost')!;
   assert.equal(cost.label, '$11');
-  assert.match(cost.detail, /Audit the parser · sonnet-5: \$8\.02/);
-  assert.match(cost.detail, /Audit the parser .* opus-5: \$3\.24/);
+  assert.match(cost.detail, /Audit the parser · Sonnet 5: \$8\.02/);
+  assert.match(cost.detail, /Audit the parser .* Opus 5: \$3\.24/);
 });
 
 // Context bands carry a level, a word, and tooltip text because color alone conveys no accessible information.
@@ -2753,8 +2875,8 @@ test('a card names the agent that recorded it, in the badge and in what it is an
   assert.equal(codex.agent, 'Codex');
   // The card's accessible name includes the agent word alongside its model.
 
-  assert.match(codex.label, /Codex gpt-5\.6-sol high/);
-  assert.match(claude.label, /Claude opus-5/);
+  assert.match(codex.label, /Codex GPT-5\.6-Sol high/);
+  assert.match(claude.label, /Claude Opus 5/);
 });
 
 test('a Codex turn that ran commands and recorded no files is marked as a gap, and a Claude one is not', () => {
@@ -2816,7 +2938,7 @@ test('the window a turn recorded beats the one the price table would have guesse
   const fallback = tabled.chips.find((c) => c.label.includes(' ctx '));
   assert.equal(fallback?.label, '74% of 272k ctx (200k)');
   assert.equal(fallback?.level, 'filling', 'the two windows no longer put the share in two bands');
-  assert.match(fallback?.detail ?? '', /74% of 272k[\s\S]*model fallback for gpt-5\.6-sol/);
+  assert.match(fallback?.detail ?? '', /74% of 272k[\s\S]*model fallback for GPT-5\.6-Sol/);
 });
 
 // Quiet-window checks use the fixture turn's end time.
@@ -2982,7 +3104,7 @@ test('a launch row carries the outcome recorded for its subagent', () => {
       ],
     }),
   ).rows;
-  assert.equal(rows[0].figure, ['gpt-5.6-sol', '4m', '38 tools', '38k'].join(' \u00b7 '));
+  assert.equal(rows[0].figure, ['GPT-5.6-Sol', '4m', '38 tools', '38k'].join(' \u00b7 '));
 });
 
 test('a launch row omits a zero tool count rather than drawing it', () => {
@@ -3004,7 +3126,7 @@ test('a launch row omits a zero tool count rather than drawing it', () => {
       ],
     }),
   ).rows;
-  assert.equal(rows[0].figure, ['gpt-5.6-sol', '4m', '38k'].join(' \u00b7 '));
+  assert.equal(rows[0].figure, ['GPT-5.6-Sol', '4m', '38k'].join(' \u00b7 '));
 });
 
 test('the card tally includes calls beyond the activity step window', () => {
@@ -3458,7 +3580,7 @@ test('a card carries the figures the panel shows, and omits the ones with nothin
   );
 
   assert.equal(card.duration, '12m');
-  assert.equal(card.model, 'opus-5');
+  assert.equal(card.model, 'Opus 5');
   assert.equal(card.effort, 'xhigh');
   // Commit rows carry the navigation and display fields consumed by the panel.
 
@@ -3491,7 +3613,7 @@ test('a card carries the figures the panel shows, and omits the ones with nothin
   assert.equal(card.toolMix, '40 run · 20 edit · 8 read');
   assert.deepEqual(card.agents[0], {
     description: 'Audit the parser',
-    model: 'haiku-4-5',
+    model: 'Haiku 4.5',
     effort: null,
     // A child without spend detail shows duration followed by its recorded token count.
 
@@ -3532,7 +3654,7 @@ test('a card carries the figures the panel shows, and omits the ones with nothin
     'the tool count is drawn twice on one open card, once as a chip and once as a heading',
   );
   assert.equal(card.toolMix, '40 run · 20 edit · 8 read', 'the heading has no mix left to draw');
-  assert.deepEqual(card.chips[5].detail.split('\n'), ['Audit the parser', '  haiku-4-5 · 2m · 20 tools · 70k']);
+  assert.deepEqual(card.chips[5].detail.split('\n'), ['Audit the parser', '  Haiku 4.5 · 2m · 20 tools · 70k']);
   // The commits figure tooltip lists the same commits as its popover.
 
   assert.equal(card.chips[4].detail, ['1 commit: +12', '', '00facf2a: Add the timeline'].join('\n'));
@@ -3861,7 +3983,7 @@ test('the context chip leads with the share of the window, once that window is k
   assert.deepEqual(chip.detail.split('\n'), [
     'Context window used: 20% of 1M',
     'Context at the end of the turn: 204,000 tokens',
-    'Window size from the model fallback for opus-5.',
+    'Window size from the model fallback for Opus 5.',
   ]);
 });
 
@@ -4097,7 +4219,7 @@ test('a subagent row draws model, effort and its figures, and leaves the tool us
     ]),
     [
       [
-        'haiku-4-5',
+        'Haiku 4.5',
         'high',
         [
           ['cost', '$0.08'],
@@ -4109,10 +4231,10 @@ test('a subagent row draws model, effort and its figures, and leaves the tool us
         '23 tools',
       ],
       // A running child's time is the running word's figure, taken from its launch step.
-      ['haiku-4-5', null, [], 'running', 'running', launched, '4 tools'],
-      ['haiku-4-5', null, [], 'running', 'running', null, ''],
+      ['Haiku 4.5', null, [], 'running', 'running', launched, '4 tools'],
+      ['Haiku 4.5', null, [], 'running', 'running', null, ''],
       // A running child with recorded spend draws its cost so far, marked as a lower bound.
-      ['haiku-4-5', null, [['cost', '$0.08+']], 'running', 'running', launched + 60_000, '31 tools'],
+      ['Haiku 4.5', null, [['cost', '$0.08+']], 'running', 'running', launched + 60_000, '31 tools'],
     ],
   );
   assert.deepEqual(
@@ -4952,7 +5074,7 @@ test('a completed subagent carries cost, commits, and files while a running one 
   );
   assert.deepEqual(card.agents[0], {
     description: 'Audit the parser',
-    model: 'haiku-4-5',
+    model: 'Haiku 4.5',
     effort: 'high',
     state: 'done',
     stateWord: '',
@@ -5618,7 +5740,7 @@ test('a completed subagent detail puts its recorded effort before its usage', ()
     entries: [
       {
         label: 'Audit the parser',
-        lines: ['gpt-5.6-sol \u00b7 high \u00b7 69 requests \u00b7 8.4M in \u00b7 17k out'],
+        lines: ['GPT-5.6-Sol \u00b7 high \u00b7 69 requests \u00b7 8.4M in \u00b7 17k out'],
       },
     ],
   });
@@ -5677,7 +5799,7 @@ test('a subagent whose call named no model takes it from what the child billed',
     true,
     NOW,
   );
-  assert.equal(card.agents[0].model, 'opus-5');
+  assert.equal(card.agents[0].model, 'Opus 5');
 });
 
 test('a subagent that changed model names the one it spent most under', () => {
@@ -5693,7 +5815,7 @@ test('a subagent that changed model names the one it spent most under', () => {
     true,
     NOW,
   );
-  assert.equal(card.agents[0].model, 'opus-5');
+  assert.equal(card.agents[0].model, 'Opus 5');
 });
 
 test('a subagent row names the model the child ran, not the alias on the call or a nested model', () => {
@@ -5712,11 +5834,11 @@ test('a subagent row names the model the child ran, not the alias on the call or
     ],
   });
   const card = toCard(launched, true, NOW);
-  assert.equal(card.agents[0].model, 'opus-5-5');
-  assert.equal(logOf(launched).rows[0].figure, 'opus-5-5 · high');
+  assert.equal(card.agents[0].model, 'Opus 5.5');
+  assert.equal(logOf(launched).rows[0].figure, 'Opus 5.5 · high');
   assert.equal(
     card.chips.find((chip) => chip.metric === 'agents')?.detail.split('\n')[1],
-    '  opus-5-5 · high · 90k in',
+    '  Opus 5.5 · high · 90k in',
   );
   // A child with no recorded spend keeps the model named on the call.
   const unpriced = toCard(turn({ agents: [agent({ model: 'opus', spend: [] })] }), true, NOW);
@@ -5736,7 +5858,7 @@ test('billed usage that names no model never outweighs usage that does', () => {
     true,
     NOW,
   );
-  assert.equal(card.agents[0].model, 'opus-5');
+  assert.equal(card.agents[0].model, 'Opus 5');
 });
 
 test('a launch row reads the model the same way the card does', () => {
@@ -5753,7 +5875,7 @@ test('a launch row reads the model the same way the card does', () => {
       ],
     }),
   ).rows;
-  assert.equal(rows[0].figure, 'opus-5');
+  assert.equal(rows[0].figure, 'Opus 5');
 });
 
 test('a running turn counts from its start to now, a finished one to its last activity', () => {
@@ -6576,10 +6698,10 @@ test('the cost chip includes child transcripts and its hover breaks the total do
   const expectedDetail = [
     'Estimated total: $6.00',
     '',
-    'Main agent · opus-5: $5.00',
+    'Main agent · Opus 5: $5.00',
     '  Cached input reads: $0 (0% cached)',
     '  Uncached input: $5.00',
-    'Audit the parser · haiku-4-5: $1.00',
+    'Audit the parser · Haiku 4.5: $1.00',
     '  Cached input reads: $0 (0% cached)',
     '  Uncached input: $1.00',
     'Speed was not fully recorded.',
@@ -6591,12 +6713,12 @@ test('the cost chip includes child transcripts and its hover breaks the total do
     heading: { label: 'Estimated total', value: '$6.00' },
     entries: [
       {
-        label: 'Main agent · opus-5',
+        label: 'Main agent · Opus 5',
         value: '$5.00',
         lines: costLines('Cached input reads: $0 (0% cached)', 'Uncached input: $5.00'),
       },
       {
-        label: 'Audit the parser · haiku-4-5',
+        label: 'Audit the parser · Haiku 4.5',
         value: '$1.00',
         lines: costLines('Cached input reads: $0 (0% cached)', 'Uncached input: $1.00'),
       },
@@ -6604,10 +6726,10 @@ test('the cost chip includes child transcripts and its hover breaks the total do
     notes: ['Speed was not fully recorded.', 'Estimated from published model rates. Your actual charge may differ.'],
   });
   assert.equal(cost?.headDetail, true);
-  assert.match(cost!.name!, /Audit the parser .* haiku-4-5: \$1\.00/);
+  assert.match(cost!.name!, /Audit the parser .* Haiku 4\.5: \$1\.00/);
   assert.match(
     card.label,
-    /Audit the parser .* haiku-4-5: \$1\.00/,
+    /Audit the parser .* Haiku 4\.5: \$1\.00/,
     'the existing roving card control does not announce the child breakdown',
   );
   assert.equal(agentTokensOf(t), 1_000_000, 'the child row kept the final-context count instead of its billed usage');
@@ -6623,7 +6745,7 @@ test('the cost chip includes child transcripts and its hover breaks the total do
     layout: 'agents',
     actions: true,
     heading: { label: '1 subagent in this turn' },
-    entries: [{ label: 'Audit the parser', lines: ['haiku-4-5 · 1M in'] }],
+    entries: [{ label: 'Audit the parser', lines: ['Haiku 4.5 · 1M in'] }],
   });
 });
 
@@ -7070,7 +7192,7 @@ test('a completed current Codex child spend appears once in the card and parent 
   assert.deepEqual(card.agents, [
     {
       description: 'Laplace',
-      model: 'gpt-5.6-sol',
+      model: 'GPT-5.6-Sol',
       effort: null,
       state: 'done',
       stateWord: '',
@@ -7142,7 +7264,7 @@ test('a completed current Codex child spend appears once in the card and parent 
     layout: 'agents',
     actions: true,
     heading: { label: '1 subagent in this turn' },
-    entries: [{ label: 'Laplace', lines: ['gpt-5.6-sol \u00b7 1M in'] }],
+    entries: [{ label: 'Laplace', lines: ['GPT-5.6-Sol \u00b7 1M in'] }],
   });
 });
 
@@ -7165,7 +7287,7 @@ test('a Claude CLI child uses its recorded list cost without inventing a cache l
     ],
   });
   assert.equal(costChip(toCard(t, false, NOW)), '$3.24');
-  assert.match(costDetail(t).join('\n'), /Claude CLI .* opus-5: \$3\.24/);
+  assert.match(costDetail(t).join('\n'), /Claude CLI .* Opus 5: \$3\.24/);
   assert.match(costDetail(t).join('\n'), /Cache writes without a recorded lifetime: 100 tokens/);
   assert.match(costDetail(t).join('\n'), /Total recorded by Claude CLI at list price/);
   assert.equal(agentTokensOf(t), 460);
@@ -7218,7 +7340,7 @@ test('a child mixed across direct OpenAI request bands keeps both prices', () =>
     ],
   });
   assert.equal(costChip(toCard(t, false, NOW)), '$4.50');
-  assert.match(costDetail(t).join('\n'), /Audit the parser .* gpt-5\.5: \$4\.50/);
+  assert.match(costDetail(t).join('\n'), /Audit the parser .* GPT-5\.5: \$4\.50/);
 });
 
 test('a child that launched nested work leaves the cost total explicitly partial', () => {
@@ -7388,7 +7510,11 @@ test('a subagent that launched its own subagent carries their spend in the turn 
 test('a three-level subagent chain folds every level into the first row', () => {
   const t = nestedAgentTurn(3);
   assert.equal(costChip(toCard(t, false, NOW)), '$4.00');
-  assert.match(costDetail(t).join('\n'), /^agent · haiku-4-5: \$3\.00$/m, 'the first row carries both levels below it');
+  assert.match(
+    costDetail(t).join('\n'),
+    /^agent · Haiku 4\.5: \$3\.00$/m,
+    'the first row carries both levels below it',
+  );
 });
 
 test('a nested launch with no meta file or no transcript keeps the turn cost a floor', () => {
@@ -7636,7 +7762,7 @@ test('a subagent resumed in a later turn shows in both turn cards, each priced b
     const [first, second, third, fourth] = turns;
     assert.deepEqual(warned(turns), [false, false, true, false], 'the warning sits on the turn that rebuilt the cache');
     assert.equal(costChip(toCard(first, false, NOW)), '$2.00', 'the launching turn kept the resumed requests');
-    assert.deepEqual(subagentLines(first), ['agent · haiku-4-5: $2.00']);
+    assert.deepEqual(subagentLines(first), ['agent · Haiku 4.5: $2.00']);
     assert.deepEqual(
       [second.agents.length, fourth.agents.length],
       [0, 0],
@@ -7646,7 +7772,7 @@ test('a subagent resumed in a later turn shows in both turn cards, each priced b
     assert.equal(costChip(toCard(third, false, NOW)), '$2.90', 'the resuming turn total left out the subagent');
     assert.deepEqual(
       subagentLines(third),
-      ['agent · haiku-4-5: $2.90'],
+      ['agent · Haiku 4.5: $2.90'],
       'the resuming turn cost list left out a request',
     );
   };
@@ -7693,7 +7819,7 @@ test('a child that compacts on a model it billed nothing on still prices the est
   const { turns } = resumedAgentSession('SendMessage', true, true, { launchUsage: 'zero', at: 15 });
   const [first, , third] = turns;
   assert.equal(costChip(toCard(first, false, NOW)), '$0.02', 'the estimate left the card total');
-  assert.deepEqual(subagentLines(first).slice(0, 1), ['agent · haiku-4-5: $0.02']);
+  assert.deepEqual(subagentLines(first).slice(0, 1), ['agent · Haiku 4.5: $0.02']);
   assert.equal(third.agents.length, 0, 'the child made no request in the resuming turn');
 });
 
@@ -7705,7 +7831,7 @@ test('a resuming turn whose only subagent request is a compaction estimate keeps
     assert.equal(costChip(toCard(first, false, NOW)), '$2.00');
     assert.equal(third.agents.length, 1, 'the resuming turn lists the subagent once');
     assert.equal(costChip(toCard(third, false, NOW)), '$2.01', 'the share lost the estimate');
-    assert.deepEqual(subagentLines(third).slice(0, 1), ['agent · haiku-4-5: $2.01']);
+    assert.deepEqual(subagentLines(third).slice(0, 1), ['agent · Haiku 4.5: $2.01']);
   };
   check();
   refreshClaudeAgentFacts(turns, lookup, undefined);
@@ -7721,13 +7847,13 @@ test('retained history pages refreshed apart never price a subagent onto a turn 
   assert.equal(third.agents.length, 0);
   assert.deepEqual(
     subagentLines(first),
-    ['agent · haiku-4-5: $4.90'],
+    ['agent · Haiku 4.5: $4.90'],
     'requests outside the page stay on the launching row',
   );
   refreshClaudeAgentFacts(turns, lookup, undefined, false);
   assert.deepEqual(
     [first, second, third, fourth].map(subagentLines),
-    [['agent · haiku-4-5: $2.00'], [], ['agent · haiku-4-5: $2.90'], []],
+    [['agent · Haiku 4.5: $2.00'], [], ['agent · Haiku 4.5: $2.90'], []],
     'pages refreshed together place each request in its own turn',
   );
 });
@@ -7739,8 +7865,8 @@ test('a child write refreshing the newest window keeps a request after the resum
   const [first, second, third] = turns;
   assert.deepEqual(warned(turns), [false, false, true], 'the warning sits on the turn that rebuilt the cache');
   assert.deepEqual(subagentLines(second), []);
-  assert.deepEqual(subagentLines(first), ['agent · haiku-4-5: $2.00'], 'the launching row took the later request');
-  assert.deepEqual(subagentLines(third), ['agent · haiku-4-5: $2.90'], 'the resuming row lost the later request');
+  assert.deepEqual(subagentLines(first), ['agent · Haiku 4.5: $2.00'], 'the launching row took the later request');
+  assert.deepEqual(subagentLines(third), ['agent · Haiku 4.5: $2.90'], 'the resuming row lost the later request');
   assert.equal(costChip(toCard(third, false, NOW)), '$2.90', 'the resuming turn total left out the later request');
 });
 
@@ -7763,7 +7889,7 @@ test('a subagent launched on a retained page and resumed in the newest window pr
   assert.deepEqual(warned(shown), [false, false, true, false], 'the warning sits on the turn that rebuilt the cache');
   assert.deepEqual(
     shown.map(subagentLines),
-    [['agent · haiku-4-5: $2.00'], [], ['agent · haiku-4-5: $2.90'], []],
+    [['agent · Haiku 4.5: $2.00'], [], ['agent · Haiku 4.5: $2.90'], []],
     'the resuming card lost the requests the warning places on it',
   );
   assert.equal(costChip(toCard(window[0], false, NOW)), '$2.90', 'the resuming turn total left out the subagent');
@@ -7780,7 +7906,7 @@ test('a launching turn whose subagent made no request in it shows no billed usag
   const [first, , third] = resumedAgentSession('SendMessage', false).turns;
   assert.equal(agentTokensOf(first), 0, 'the launching row fell back to the subagent result token count');
   assert.ok(costDetail(first).includes('agent: no billed usage'), 'the launching row lost its zero share');
-  assert.deepEqual(subagentLines(third), ['agent · haiku-4-5: $2.90']);
+  assert.deepEqual(subagentLines(third), ['agent · Haiku 4.5: $2.90']);
 });
 
 // A timed response: a request record, then two content blocks of one response. The first block
@@ -7946,7 +8072,7 @@ test('a completed child with no billed response is an exact zero', () => {
     layout: 'agents',
     actions: true,
     heading: { label: '1 subagent in this turn' },
-    entries: [{ label: 'Audit the parser', lines: ['haiku-4-5'] }],
+    entries: [{ label: 'Audit the parser', lines: ['Haiku 4.5'] }],
   });
   assert.doesNotMatch(
     card.chips.find((chip) => chip.label === '1 subagent')?.detail ?? '',
@@ -8217,7 +8343,7 @@ test('the cost detail follows the shared usage category order', () => {
   assert.deepEqual(lines, [
     'Estimated total: $7.10',
     '',
-    'Cost by usage · opus-5',
+    'Cost by usage · Opus 5',
     '  Output: $5.15',
     '  Cached input reads: $1.50 (98% cached)',
     '  Uncached input: <$0.01',
@@ -8263,7 +8389,7 @@ test('turn and session cost detail share the exact main-model label', () => {
   const sessionChip = sessionCostStats([{ agent: 'codex', role: 'main', ...usagePart }])[0];
 
   assert.equal(turnChip.detailList?.entries[0].label, sessionChip.detailList?.entries[0].label);
-  assert.equal(turnChip.detailList?.entries[0].label, 'Cost by usage · gpt-5.5');
+  assert.equal(turnChip.detailList?.entries[0].label, 'Cost by usage · GPT-5.5');
 
   const unknownUsage = {
     requests: 1,
@@ -8310,7 +8436,7 @@ test('turn and session cost detail share the exact main-model label', () => {
   ])[0];
 
   assert.equal(mixedTurnChip.detailList?.entries[0].label, mixedSessionChip.detailList?.entries[0].label);
-  assert.equal(mixedTurnChip.detailList?.entries[0].label, 'Cost by usage · gpt-5.5, model not recorded');
+  assert.equal(mixedTurnChip.detailList?.entries[0].label, 'Cost by usage · GPT-5.5, model not recorded');
 });
 
 test('failed calls stay in Activity and out of the header', () => {
@@ -8459,7 +8585,7 @@ test('the spoken name of a card says its marks in words, and carries no pictogra
   );
   assert.equal(
     card.label,
-    'Turn, finished, 5 hours ago, ran in 12m, started 2:32 PM, Claude opus-5, done, committed. The batch landed.',
+    'Turn, finished, 5 hours ago, ran in 12m, started 2:32 PM, Claude Opus 5, done, committed. The batch landed.',
   );
   // Accessible card names use mark words instead of pictographs.
 
@@ -9764,7 +9890,7 @@ test('a head row is announced by everything it shows, since its glyph says nothi
   // because the duration hover reveals it to a reader who can see.
   assert.equal(
     card.label,
-    'Turn, finished, 5 hours ago, ran in 12m, started 2:32 PM, Claude opus-5 xhigh. Fixed the parser.',
+    'Turn, finished, 5 hours ago, ran in 12m, started 2:32 PM, Claude Opus 5 xhigh. Fixed the parser.',
   );
   // Accessible card names include status words independently of visible color.
 
@@ -10067,7 +10193,7 @@ test('indexed lifetime cost names the main agent model in its detail', () => {
     },
   ])[0];
 
-  assert.equal(chip.detailList?.entries[0].label, 'Cost by usage · gpt-5.5');
+  assert.equal(chip.detailList?.entries[0].label, 'Cost by usage · GPT-5.5');
 });
 
 test('indexed lifetime cost rolls every priced bucket into one ordered usage breakdown', () => {
@@ -10144,7 +10270,7 @@ test('indexed lifetime cost rolls every priced bucket into one ordered usage bre
   assert.equal(chip.compactLabel, '$6.13');
   assert.deepEqual(flatForm(chip.detailList), {
     heading: { label: 'Estimated total', value: '$6.13' },
-    entries: [{ label: 'Cost by usage · gpt-5.5, opus-5, gpt-5.6', lines: costLines(...lineTexts) }],
+    entries: [{ label: 'Cost by usage · GPT-5.5, Opus 5, GPT-5.6', lines: costLines(...lineTexts) }],
     footer: [],
     notes: [
       CACHED_INPUT_READ_EXPLANATION,
@@ -10157,7 +10283,7 @@ test('indexed lifetime cost rolls every priced bucket into one ordered usage bre
     [
       'Estimated total: $6.13',
       '',
-      'Cost by usage · gpt-5.5, opus-5, gpt-5.6',
+      'Cost by usage · GPT-5.5, Opus 5, GPT-5.6',
       ...lineTexts.map((line) => `  ${line}`),
       CACHED_INPUT_READ_EXPLANATION,
       'Includes the main session and delegated work.',
@@ -10222,17 +10348,17 @@ test('indexed lifetime cost separates the main agent from rolled-up delegated wo
     heading: { label: 'Estimated total', value: '$3.50+' },
     entries: [
       {
-        label: 'Main agent · opus-5',
+        label: 'Main agent · Opus 5',
         value: '$1.00',
         lines: costLines('Output: $0.50', 'Cached input reads: $0 (0% cached)', 'Uncached input: $0.50'),
       },
       {
-        label: 'Main agent · gpt-5.6-sol',
+        label: 'Main agent · GPT-5.6-Sol',
         value: 'cost unavailable',
         lines: ['Unsupported service-tier price unavailable.'],
       },
       {
-        label: 'Claude · opus-5',
+        label: 'Claude · Opus 5',
         value: '$2.50',
         lines: ['Some recorded cost cannot be split by usage.'],
       },
@@ -10325,7 +10451,7 @@ test('indexed lifetime cost prices aggregated Auto Review volume without changin
   assert.equal(chip.compactLabel, '$3.54');
   assert.deepEqual(chip.detailList?.entries, [
     {
-      label: 'Main agent · opus-5',
+      label: 'Main agent · Opus 5',
       value: '$1.00',
       lines: costLines(
         'Output: $0.50',
@@ -10334,7 +10460,7 @@ test('indexed lifetime cost prices aggregated Auto Review volume without changin
       ),
     },
     {
-      label: 'Claude · haiku-4-5',
+      label: 'Claude · Haiku 4.5',
       value: '$2.50',
       lines: ['Some recorded cost cannot be split by usage.'],
     },
@@ -10552,14 +10678,14 @@ test('lifetime cost retains raw dated identities when their reading names match'
     },
   ])[0];
 
-  assert.equal(chip.detailList?.entries[0].label, 'Main agent · opus-5');
+  assert.equal(chip.detailList?.entries[0].label, 'Main agent · Opus 5');
   assert.deepEqual(chip.detailList?.entries[1].lines, [
     {
-      text: 'Claude · haiku-4-5: $3.00',
+      text: 'Claude · Haiku 4.5: $3.00',
       cacheHit: { percent: 0, warning: false },
     },
     {
-      text: 'Claude · haiku-4-5: $2.00',
+      text: 'Claude · Haiku 4.5: $2.00',
       cacheHit: { percent: 0, warning: false },
     },
   ]);
@@ -10805,7 +10931,7 @@ test('indexed lifetime cost explains an unavailable tier beside priced usage fro
   assert.equal(chip.compactLabel, '$4.00+');
   assert.deepEqual(chip.detailList?.entries[0].lines, [
     ...costLines('Uncached input: $4.00'),
-    'Cost unavailable for Codex · gpt-5.6-sol · OpenAI: unsupported service-tier price unavailable.',
+    'Cost unavailable for Codex · GPT-5.6-Sol · OpenAI: unsupported service-tier price unavailable.',
   ]);
 });
 
@@ -10876,7 +11002,7 @@ test('indexed lifetime cost prices inference classes and rejects unsupported ser
   assert.deepEqual(chip.detailList?.entries[0].lines?.[0], costLines('Uncached input: $3.80')[0]);
   assert.match(
     chip.detail,
-    /Cost unavailable for sonnet-4-6 · provider not recorded: priority service-tier price unavailable\./,
+    /Cost unavailable for Sonnet 4\.6 · provider not recorded: priority service-tier price unavailable\./,
   );
 });
 
@@ -11123,7 +11249,7 @@ test('unclassified cache writes keep a lifetime category total partial without i
   assert.equal(chip.compactLabel, '$1.00+');
   assert.deepEqual(chip.detailList?.heading, { label: 'Estimated total', value: '$1.00+' });
   assert.match(chip.detail, /Output: \$0\.50\n  Uncached input: \$0\.50/);
-  assert.match(chip.detail, /Cost unavailable for opus-5 · provider not recorded: cache-write duration not recorded\./);
+  assert.match(chip.detail, /Cost unavailable for Opus 5 · provider not recorded: cache-write duration not recorded\./);
   assert.doesNotMatch(chip.detail, /cache writes: \$/i);
 });
 
@@ -13372,7 +13498,7 @@ test('the context chip shows the subagent results in context at the end of each 
         assert.deepEqual(list.notes, notes.length ? notes : undefined);
         assert.deepEqual(
           list.footer,
-          context.model === 'claude-sonnet-5' ? ['Window size from the model fallback for sonnet-5.'] : undefined,
+          context.model === 'claude-sonnet-5' ? ['Window size from the model fallback for Sonnet 5.'] : undefined,
         );
       }
     }
@@ -13715,8 +13841,8 @@ test('a child keeps its own speed while its same-model descendant prices separat
   assert.deepEqual(
     rows.map((row) => [row.label, row.value, row.count]),
     [
-      ['GPT-6.1 Sol · Fast', '$0.40', '1 agent'],
-      ['GPT-6.1 Sol', '$0.20', '1 agent'],
+      ['GPT-6.1-Sol · Fast', '$0.40', '1 agent'],
+      ['GPT-6.1-Sol', '$0.20', '1 agent'],
     ],
   );
   child.ownModelTiers = [{ model, provider: 'openai', serviceTier: 'ultrafast' }];

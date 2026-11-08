@@ -9216,7 +9216,7 @@ test('a Claude child row names its own model when a nested subagent read more un
     agent.spend.some((part) => part.model === 'claude-haiku-4-5'),
     'the nested subagent spend did not reach the row',
   );
-  assert.equal(row.model, 'opus-5-5', 'the row named a model only a nested subagent ran');
+  assert.equal(row.model, 'Opus 5.5', 'the row named a model only a nested subagent ran');
   assert.equal(row.effort, 'high');
 });
 
@@ -9224,7 +9224,7 @@ test('a running Claude background child row names the model it ran beside its co
   const { agent, row } = await undiscoveredBackgroundChild('launch-child', { running: true });
   assert.equal(agent.status, 'running', 'the fixture child finished');
   assert.equal(agent.model, 'opus');
-  assert.equal(row.model, 'opus-5-5', 'the running row named the Agent call alias');
+  assert.equal(row.model, 'Opus 5.5', 'the running row named the Agent call alias');
   const [cost] = row.figures;
   assert.equal(cost?.compactLabel, '$0.72+');
   assert.match(cost?.detail ?? '', /^At least \$0\.72 spent\n\nOpus 5\.5\b/);
@@ -9235,7 +9235,7 @@ test('a Claude child viewed as its own session prices its nested launch from the
   assert.equal(agent.id, 'grandchild');
   assert.equal(agent.spendFound, true, 'the nested child transcript was not found without a discovery reference');
   assert.match(row.figures[0]?.compactLabel ?? '', /^\$/, 'the row fell back to the notice token count');
-  assert.equal(row.model, 'haiku-4-5');
+  assert.equal(row.model, 'Haiku 4.5');
 });
 
 test('a Claude child meta file that names another launch attaches no spend', async () => {

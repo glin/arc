@@ -764,10 +764,10 @@ test('the next-turn line keeps one height through every state it can wear', { ti
         /^Next turn starts at \$[\d.]+, uncached$/,
         `the cold line reads "${seen.cold.text}" at ${width}px`,
       );
-      assert.equal(seen.warm.statusTitle, 'opus-5 cache lifetime: 1 hour', 'the cached status names no model lifetime');
+      assert.equal(seen.warm.statusTitle, 'Opus 5 cache lifetime: 1 hour', 'the cached status names no model lifetime');
       assert.equal(
         seen.cold.statusTitle,
-        'opus-5 cache lifetime: 1 hour',
+        'Opus 5 cache lifetime: 1 hour',
         'the uncached status names no model lifetime',
       );
       assert.match(seen.warm.name ?? '', /cached for another/, 'the warm name does not carry its state');
@@ -898,7 +898,7 @@ test('pressing the next-turn price opens its working inside the panel', { timeou
       );
       assert.equal(
         pop.statusTitle,
-        'opus-5 cache lifetime: 1 hour',
+        'Opus 5 cache lifetime: 1 hour',
         `the working's cold status names no model lifetime at ${width}px`,
       );
       assert.deepEqual(
@@ -1350,7 +1350,7 @@ test(
         'the remaining figure is not the boundary less the browser clock',
       );
       assert.equal(shown.text, '43m');
-      assert.equal(shown.title, 'opus-5 cache lifetime: 1 hour');
+      assert.equal(shown.title, 'Opus 5 cache lifetime: 1 hour');
       // Set the remaining lifetime two seconds past a minute boundary. After rendering, the ticker must update it without another payload.
 
       const nearly =

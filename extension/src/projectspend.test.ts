@@ -3838,9 +3838,9 @@ test.each(['ordinary', 'warning', 'identity', 'review'] as const)(
       assert.ok(main, `${layout}: ${JSON.stringify(entries)}`);
       if (layout === 'ordinary') {
         const lines = entries.find((entry) => entry.label === 'Delegated work')!.lines!;
-        const child = lines.find((line) => typeof line === 'object' && 'text' in line && line.text.includes('opus-5'))!;
+        const child = lines.find((line) => typeof line === 'object' && 'text' in line && line.text.includes('Opus 5'))!;
         const peer = lines.find(
-          (line) => typeof line === 'object' && 'text' in line && line.text.includes('sonnet-5'),
+          (line) => typeof line === 'object' && 'text' in line && line.text.includes('Sonnet 5'),
         )!;
         return {
           main,
@@ -3855,7 +3855,7 @@ test.each(['ordinary', 'warning', 'identity', 'review'] as const)(
             ? entry.label === 'Codex Auto Review'
             : entry.label.startsWith('Claude'),
       )!;
-      const peer = entries.find((entry) => entry.label.includes('sonnet-5'))!;
+      const peer = entries.find((entry) => entry.label.includes('Sonnet 5'))!;
       return { main, child, peer: peer.lines! };
     };
     const cacheFacts = (lines: NonNullable<ReturnType<typeof details>['main']['lines']>) =>

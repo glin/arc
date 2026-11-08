@@ -10744,7 +10744,7 @@ test(
       assert.equal(cards.length, 2);
       for (const card of cards) {
         assert.ok(card.dispatched);
-        assert.equal(card.dispatched[0].model, 'gpt-6.1-sol');
+        assert.equal(card.dispatched[0].model, 'GPT-6.1-Sol');
         assert.equal(card.dispatched[0].effort, 'high');
         assert.ok(card.dispatched[0].figures.some((figure) => figure.metric === 'cost'));
       }
@@ -13435,8 +13435,19 @@ test("the host counts a dispatched session in its parent's cost once and files i
   }
   {
     // Codex's own saved model list reaches the names through the catalog publication, and the
-    // live catalog names a model before it.
-    const host = cardHost([]) as CardHost & { setModels(...args: unknown[]): void };
+    // live catalog names a model before it. The header, the cost detail, the dispatched row and
+    // its cost record all read the list's spelling, never the hyphenated fallback beside it.
+    const host = cardHost([
+      {
+        kind: 'dispatch',
+        agent: 'codex',
+        parentSessionId: 'parent',
+        sessionId: 'astra-child',
+        toolUseIds: ['launch'],
+        name: 'Child work',
+        owned: false,
+      },
+    ]) as CardHost & { setModels(...args: unknown[]): void };
     Object.assign(host, { refreshFrom() {}, hosts: [] });
     const extensionSource = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
     const publishCode = esbuild.transformSync(
@@ -13471,12 +13482,31 @@ test("the host counts a dispatched session in its parent's cost once and files i
       output: 100,
       thinking: 0,
     };
+    Object.assign(host, {
+      dispatchFacts: new Map([
+        [
+          'astra-child',
+          {
+            spend: {
+              found: true,
+              partial: false,
+              effort: 'high',
+              models: [{ model: 'gpt-6-astra', provider: 'openai', usage }],
+            },
+            startedAt: NOW - 1000,
+            endedAt: NOW,
+            toolUses: 2,
+          },
+        ],
+      ]),
+    });
     const astra = fixtureTurn({
       sessionId: 'parent',
       startedAt: Date.parse('2026-08-31T09:00:00'),
       files: [],
       commits: [],
       agents: [],
+      dispatchToolUseIds: ['launch'],
       model: 'gpt-6-astra',
       usage,
       usageParts: [
@@ -13494,11 +13524,23 @@ test("the host counts a dispatched session in its parent's cost once and files i
     const named = () =>
       (costOf(cardOf(host, astra)) as unknown as { detailList: { cost: { sections: { detail?: string }[] } } })
         .detailList.cost.sections[0].detail;
+    type Dispatched = { model: string | null; figures: { metric: string; record?: unknown }[] };
+    const dispatchedRow = () => (cardOf(host, astra) as unknown as { dispatched: Dispatched[] }).dispatched[0];
     publishPicks();
     assert.equal(named(), 'GPT-6-Astra file', "Codex's saved model list named no card part");
+    const saved = cardOf(host, astra) as unknown as { model: string };
+    assert.equal(saved.model, 'GPT-6-Astra file', "Codex's saved model list named no header");
+    assert.equal(dispatchedRow().model, 'GPT-6-Astra file', "Codex's saved model list named no dispatched row");
+    assert.match(
+      JSON.stringify(dispatchedRow().figures.find((figure) => figure.metric === 'cost')!.record),
+      /"label":"GPT-6-Astra file"/,
+    );
+    assert.doesNotMatch(JSON.stringify(saved), /GPT-6-Astra(?! file)/, 'a card part read the fallback spelling');
     lists = { codex: [{ value: 'gpt-6-astra', label: 'GPT-6 Astra live', description: '', efforts: [] }] };
     publishPicks();
     assert.equal(named(), 'GPT-6 Astra live', "Codex's saved model list named a model before the live catalog");
+    assert.equal(dispatchedRow().model, 'GPT-6 Astra live', 'a later catalog never reached the dispatched row');
+    assert.doesNotMatch(JSON.stringify(cardOf(host, astra)), /GPT-6-Astra/, 'a card part kept an older spelling');
   }
 });
 
@@ -22541,6 +22583,7 @@ function stateForRow(
     askLevels?: Record<string, string>;
     codexEffectiveModes?: Record<string, unknown>;
     claudeEffectiveModes?: Record<string, string>;
+    modelLabels?: Map<string, string>;
   } = {},
 ): ComposerState {
   const read = new Function(
@@ -22594,6 +22637,7 @@ function stateForRow(
     running: new Set(),
     saved: { comments: [] },
     models: {},
+    modelLabels: overrides.modelLabels,
     commandLists: overrides.commandLists ?? {},
     sessionCommandLists: overrides.sessionCommandLists ?? {},
     claudeSkillPaths: new Map<string, string | null>(),
@@ -35398,7 +35442,18 @@ test(
       const read = provider.cache.get(file).read;
       const runtime = composerRuntimeBySession(read.turns, new Map(), new Map([['source', read.lastReportedModel]]));
       const state = stateForRow([{ id: 'source', label: 'Source', agentKey: 'codex' }], {}, 'source', { runtime });
-      assert.equal(composerView(state)!.picks.find((pick) => pick.control === 'model')!.label, 'gpt-6-astra');
+      assert.equal(composerView(state)!.picks.find((pick) => pick.control === 'model')!.label, 'GPT-6-Astra');
+      // Codex's saved list names the recorded model although the selectable rows are empty.
+      const cached = stateForRow(
+        [{ id: 'source', label: 'Source', agentKey: 'codex' }],
+        {},
+        'source',
+        { runtime },
+        {
+          modelLabels: new Map([['gpt-6-astra', 'GPT-6-Astra Cached']]),
+        },
+      );
+      assert.equal(composerView(cached)!.picks.find((pick) => pick.control === 'model')!.label, 'GPT-6-Astra Cached');
       assert.equal(state.context, null);
       assert.equal(state.nextTurn, null);
     } finally {

@@ -13,6 +13,7 @@ import {
   friendlyModel,
   modelLabels,
   shortModel,
+  compactModel,
   modelSpeed,
   recordedModelSpeed,
   modelTierKey,
@@ -87,6 +88,39 @@ test('the model shows the part that tells two of them apart', () => {
   assert.equal(shortModel(null), null);
 });
 
+test('a compact model name reads the model list name for Claude and GPT IDs and keeps other IDs compact', () => {
+  const labels = modelLabels([
+    [{ value: 'gpt-6.1-sol', label: 'GPT-6.1-Sol Listed' }],
+    [
+      { value: 'opus', resolvedModel: 'claude-opus-5-5', label: 'Opus 5.5' },
+      { value: 'fable', resolvedModel: 'claude-fable-5-1', label: 'Fable Listed' },
+    ],
+  ]);
+  for (const [model, listed, plain] of [
+    ['gpt-6.1-sol', 'GPT-6.1-Sol Listed', 'GPT-6.1-Sol'],
+    ['gpt-6.1-sol-2026-10-01', 'GPT-6.1-Sol Listed', 'GPT-6.1-Sol'],
+    ['gpt-5.1-codex-max', 'GPT-5.1-Codex-Max', 'GPT-5.1-Codex-Max'],
+    ['GPT-6.1-SOL-custom', 'GPT-6.1-SOL-custom', 'GPT-6.1-SOL-custom'],
+    ['claude-opus-5-5', 'Opus 5.5', 'Opus 5.5'],
+    ['claude-opus-5-5-20261001', 'Opus 5.5', 'Opus 5.5'],
+    ['claude-opus-5-5[1m]', 'Opus 5.5', 'Opus 5.5'],
+    ['claude-fable-5-1', 'Fable Listed', 'Fable 5.1'],
+    ['claude-fable-5-1-20261001', 'Fable Listed', 'Fable 5.1'],
+    ['claude-mythos-5-1', 'Mythos 5.1', 'Mythos 5.1'],
+    ['claude-3-5-haiku-20241022', 'Haiku 3.5', 'Haiku 3.5'],
+    ['claude-mystery-1', 'mystery-1', 'mystery-1'],
+    ['claude-mystery-1-20261001', 'mystery-1', 'mystery-1'],
+    ['global.anthropic.claude-opus-5-5', 'global.anthropic.claude-opus-5-5', 'global.anthropic.claude-opus-5-5'],
+    ['opus', 'opus', 'opus'],
+    ['codex-auto-review', 'codex-auto-review', 'codex-auto-review'],
+    ['acme-deployment-7', 'acme-deployment-7', 'acme-deployment-7'],
+  ] as const) {
+    assert.equal(compactModel(model, labels), listed, model);
+    assert.equal(compactModel(model), plain, model);
+  }
+  assert.equal(compactModel(null, labels), null);
+});
+
 test('a model reads its family and version, and an unknown model reads its recorded ID', () => {
   for (const [model, name] of [
     ['claude-opus-5-5', 'Opus 5.5'],
@@ -95,9 +129,11 @@ test('a model reads its family and version, and an unknown model reads its recor
     ['claude-sonnet-5', 'Sonnet 5'],
     ['claude-haiku-4-5-20251001', 'Haiku 4.5'],
     ['claude-3-5-haiku-20241022', 'Haiku 3.5'],
-    ['gpt-6.1-sol', 'GPT-6.1 Sol'],
-    ['gpt-6-astra', 'GPT-6 Astra'],
-    ['gpt-5.1-codex-max', 'GPT-5.1 Codex Max'],
+    ['claude-fable-5-1', 'Fable 5.1'],
+    ['claude-mythos-5-1', 'Mythos 5.1'],
+    ['gpt-6.1-sol', 'GPT-6.1-Sol'],
+    ['gpt-6-astra', 'GPT-6-Astra'],
+    ['gpt-5.1-codex-max', 'GPT-5.1-Codex-Max'],
     ['gpt-6', 'GPT-6'],
     ['codex-auto-review', 'codex-auto-review'],
     ['claude-mystery-1', 'claude-mystery-1'],
@@ -140,12 +176,12 @@ test('a model no list names keeps its pattern name or its recorded ID', () => {
     ['claude-opus-5-5', 'Opus 5.5'],
     // An entry whose label repeats its value has no display name.
     ['claude-haiku-4-5', 'Haiku 4.5'],
-    ['gpt-6-astra', 'GPT-6 Astra'],
+    ['gpt-6-astra', 'GPT-6-Astra'],
     ['claude-mystery-1', 'claude-mystery-1'],
   ] as const) {
     assert.equal(friendlyModel(model, labels), name, model);
   }
-  assert.equal(friendlyModel('claude-fable-5-1'), 'claude-fable-5-1');
+  assert.equal(friendlyModel('claude-fable-5-1'), 'Fable 5.1');
   assert.equal(friendlyModel(null, labels), 'Model not recorded');
 });
 

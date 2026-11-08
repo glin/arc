@@ -1983,6 +1983,8 @@ test('dispatched cost notes use own tiers when a descendant has the largest mode
       model.relationships = [
         { ...model.relationships[0], kind: 'dispatched', ownership: 'delegated', requestedByReader: false },
       ];
+      // Captured names that differ from the hyphenated fallback reach the dispatched row and its records.
+      model.modelLabels = { 'gpt-6.1-sol': 'GPT-6.1-Sol Captured', 'gpt-6-astra': 'GPT-6-Astra Captured' };
       await projectSessionSite(model, writer, { script: '', stylesheet: '' });
       const { manifest, data } = exportedSiteData((await writer.publish(async () => {})).directory);
       const card = (data.get(manifest.sessions[0].pages[0].cards![0].id) as { card: CardView }).card;
@@ -1994,6 +1996,9 @@ test('dispatched cost notes use own tiers when a descendant has the largest mode
       );
       assert.equal(cost.heading!.value, formatCost(sessionCostProjection([own, own, descendant]).total.dollars));
       assert.equal(card.dispatched!.length, 1);
+      assert.equal(card.dispatched![0].model, 'GPT-6-Astra Captured', evidence);
+      assert.match(JSON.stringify(card.dispatched![0].figures), /GPT-6-Astra Captured/, evidence);
+      assert.doesNotMatch(JSON.stringify(card), /GPT-6\.1-Sol(?! Captured)|GPT-6-Astra(?! Captured)/, evidence);
     } finally {
       await writer.dispose();
     }

@@ -18,7 +18,7 @@ Pins and recents belong to the launch project, using the first folder in a multi
 
 ## Session controls
 
-The Model control keeps its visible model name. Its existing detail distinguishes recorded speed from an explicit selection for the next turn. Unknown or interrupted-model evidence never borrows another model's speed. The live card carries speed separately and displays it only for its confirmed model. [Context evidence](accounting.md#context-evidence) owns the prospective pricing basis.
+The Model control keeps its visible model name. Its existing detail distinguishes recorded speed from an explicit selection for the next turn. Unknown or interrupted-model evidence never borrows another model's speed. The live card carries speed separately and displays it only for its confirmed model. [Context evidence](accounting.md#context-evidence) owns the prospective pricing basis. A recorded model outside the menu rows uses the [compact model name](turn-cards.md#card-sources).
 
 Setup fields use the shared [combobox contract](panel-accessibility.md#keyboard-and-screen-reader-contract). Choosing the already selected row preserves saved launch values. Choosing a different default Model omits model and effort overrides. Choosing a different default Effort omits only effort.
 
