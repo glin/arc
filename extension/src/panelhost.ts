@@ -13807,7 +13807,7 @@ export class PanelProvider implements vscode.Disposable {
         };
       }
       if (this.dispatchedDiscoveryWaiting() !== discoveryWaiting) this.postDispatchedCostsIfMoved('childrenProgress');
-      return this.authoritativeCatalog !== null;
+      return this.authoritativeCatalog !== null || this.publishesWalkedRows();
     }
     this.claudeChildReferences = progress.references;
     this.startupHistory?.stage('relationshipsComplete');
@@ -13911,6 +13911,16 @@ export class PanelProvider implements vscode.Disposable {
     if (this.pruneDerivedTitles(walked)) {
       this.derivedCacheCheckpointState.markChanged();
     }
+    return true;
+  }
+
+  // Whether a partial reply publishes the first catalog from the walked rows, because the activation has no saved links to
+  // publish. Child transcripts join when the complete reply arrives. Discovery stays pending, as it does after saved links.
+  private publishesWalkedRows(): boolean {
+    if (!this.catalog || !this.cachedLinksOffered || this.cachedLinks) return false;
+    const rows = this.catalog.sessions.filter((session) => session.childTranscript !== true);
+    if (!rows.length) return false;
+    this.catalog = { ...this.catalog, sessions: rows };
     return true;
   }
 

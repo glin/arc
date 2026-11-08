@@ -10494,7 +10494,7 @@ function cachedLinksHarness(change: (fixture: any) => void = () => {}) {
       }),
     },
     false,
-    ['publishCachedLinks', 'installCachedLinks', 'membershipOf', 'physicalMembershipOf'],
+    ['publishCachedLinks', 'installCachedLinks', 'publishesWalkedRows', 'membershipOf', 'physicalMembershipOf'],
   );
   const { provider, claude, child, claudeWalk } = harness;
   const other = { ...claude, file: 'fixture/other.jsonl', sessionId: '6f2c1d9e-0000-4000-8000-000000000003' };
@@ -10748,6 +10748,85 @@ test.each([
     );
     assert.equal(requests.length, 1, 'the refused link set skipped the discovery request');
     assert.equal(provider.dispatchDiscoveryPending, false);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+// A progress reply of a discovery request whose receipt scan continues.
+function partialLinksReply(request: ProgressiveRequest) {
+  const rows = request.kind === 'claude-children' ? request.parents : [];
+  return {
+    kind: 'claude-children-progress',
+    checkpoint: {
+      compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
+      parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
+      parents: rows,
+      catalog: rows,
+      repositoryRoots: ['project'],
+      completed: [],
+      position: 0,
+      sequence: 1,
+    },
+    referenceEntries: [],
+    continuation: true,
+  };
+}
+
+test('a cold start with no saved links lists the walked rows at the first partial reply and adds the children at the complete reply', async () => {
+  vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+  try {
+    let answer: (request: ProgressiveRequest) => unknown = partialLinksReply;
+    const { provider, claude, child, link, savedChild, work, requests, now } = cachedLinksHarness((fixture) => {
+      fixture.saved = undefined;
+      fixture.reply = (request: ProgressiveRequest) => answer(request);
+    });
+    vi.setSystemTime(now);
+    await provider.refresh(true);
+    assert.equal(work.get('cachedLinks:refused:missing'), 1);
+    assert.equal(requests.length, 1, 'the first catalog did not wait for one discovery reply');
+    assert.ok(
+      provider.authoritativeCatalog?.some((session: SessionFile) => session.sessionId === claude.sessionId),
+      'the first partial reply published no walked row',
+    );
+    assert.equal(
+      provider.authoritativeCatalog.some((session: SessionFile) => session.file === child.file),
+      false,
+      'a child transcript listed before the complete reply',
+    );
+    assert.equal(provider.sessionParentsOf().get(child.sessionId), undefined, 'an edge drew before its reply');
+    assert.deepEqual(provider.sessionLoadingBlocker(provider.refreshGeneration), { reason: 'discovery pending' });
+    assert.equal(provider.dispatchDiscoveryPending, true);
+    assert.equal(provider.completeCatalogScope, undefined, 'the list completed before the complete reply');
+    answer = settledLinksReply([link], [savedChild]);
+    await vi.runOnlyPendingTimersAsync();
+    await vi.waitFor(() => assert.ok(provider.completeCatalogScope, 'the complete reply was not accepted'));
+    const row = provider.authoritativeCatalog.find((session: SessionFile) => session.file === child.file);
+    assert.equal(row?.parentSessionId, claude.sessionId, 'the complete reply did not add the child row');
+    assert.equal(provider.sessionParentsOf().get(child.sessionId)?.parent, claude.sessionId);
+    assert.equal(provider.dispatchDiscoveryPending, false);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('a start from saved links keeps its published rows and saved edges through a partial reply', async () => {
+  vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+  try {
+    const { provider, claude, child, work, requests, now } = cachedLinksHarness((fixture) => {
+      fixture.reply = partialLinksReply;
+    });
+    vi.setSystemTime(now);
+    await provider.refresh(true);
+    assert.equal(work.get('cachedLinks:published'), 1);
+    assert.equal(requests.length, 0);
+    const files = () => provider.authoritativeCatalog.map((session: SessionFile) => session.file).sort();
+    const published = files();
+    await vi.runOnlyPendingTimersAsync();
+    assert.ok(requests.length >= 1, 'the continuation sent no discovery request');
+    assert.deepEqual(files(), published, 'a partial reply changed the rows published from saved links');
+    assert.equal(provider.sessionParentsOf().get(child.sessionId)?.parent, claude.sessionId);
+    assert.deepEqual(provider.sessionLoadingBlocker(provider.refreshGeneration), { reason: 'discovery pending' });
   } finally {
     vi.useRealTimers();
   }
