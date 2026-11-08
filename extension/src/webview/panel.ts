@@ -55,6 +55,7 @@ import { sameSessionQueryContext, type SessionQueryContext } from '../domain/ses
 import { MAX_PROMPT_ASSETS, MAX_PROMPT_ASSET_BYTES, MAX_PROMPT_ASSET_TOTAL_BYTES } from '../domain/prompt-assets.ts';
 import { CARD_ACTIONS } from '../view/card-words.ts';
 import type { SavedStateService } from './state.ts';
+import { startPageUsageMetrics } from './panel-usage-metrics.ts';
 
 export interface GlobalEventPort {
   document(
@@ -68,6 +69,8 @@ export interface GlobalEventPort {
 export interface PanelKernel {
   readerPageId?: string;
   readOnly?: boolean;
+  // The host turns panel usage metrics on only when their folder exists.
+  usageMetrics?: boolean;
   dom: PanelDom;
   events: GlobalEventPort;
   savedState: SavedStateService;
@@ -100,6 +103,15 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
   const vscode = Object.freeze({ postMessage: kernel.sendToHost });
   const onDocument = kernel.events.document;
   const onWindow = kernel.events.window;
+  const usageMetrics = startPageUsageMetrics(
+    Boolean(kernel.usageMetrics && !kernel.readOnly),
+    kernel.sendToHost,
+    {
+      setTimeout: (callback, ms) => setTimeout(callback, ms),
+      clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+    },
+    onWindow,
+  );
   onDocument('keydown', (raw) => {
     const event = raw as KeyboardEvent;
     const copyModifier = /^Mac/.test(navigator.platform)
@@ -607,6 +619,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
       groupBy: initialRailGroupBy,
       density: initialRailDensity,
     },
+    usageMetrics,
     sendToHost(message) {
       vscode.postMessage(message);
     },
@@ -1526,6 +1539,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
     readerPageId: readState.pageId,
     receiveHostMessage,
     dispose() {
+      usageMetrics?.flush();
       readState.dispose();
       visibility.dispose();
     },

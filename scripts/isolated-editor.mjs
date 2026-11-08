@@ -1357,7 +1357,9 @@ export async function prepareBaseline(session, { repository, baseline, baselineC
   const environment = { GIT_INDEX_FILE: index };
   git(top, ['read-tree', commit], environment);
   // Review fixtures hold paths too long for a Windows run directory, and the build needs none of them.
-  git(top, ['rm', '--cached', '-r', '-q', '--ignore-unmatch', '--', ...BASELINE_EXCLUDED], environment);
+  // `git rm` compares the private index with HEAD and the working tree, so a revision older than HEAD needs `--force`.
+  // `--cached` limits the removal to the private index.
+  git(top, ['rm', '--cached', '--force', '-r', '-q', '--ignore-unmatch', '--', ...BASELINE_EXCLUDED], environment);
   git(top, ['checkout-index', '--all', `--prefix=${tree.replaceAll('\\', '/')}/`], environment);
   fs.rmSync(index, { force: true });
   for (const name of BASELINE_LINKS) {

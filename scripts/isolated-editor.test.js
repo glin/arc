@@ -1965,7 +1965,7 @@ describe('isolated editor restore check', () => {
   });
 
   test(
-    'exports a revision without the repository index or review fixtures, links the dependencies, and builds it',
+    'exports a revision older than HEAD without the repository index or review fixtures, links the dependencies, and builds it',
     SUBPROCESS,
     async () => {
       const repository = path.join(scratch(), 'source repo');
@@ -1992,12 +1992,16 @@ describe('isolated editor restore check', () => {
       git('add', 'extension/package.json', 'extension/esbuild.mjs', 'evals/fixture.txt');
       git('commit', '-q', '-m', 'one');
       const commit = git('rev-parse', 'HEAD');
+      // The exported revision holds an excluded file that differs from both HEAD and the working tree.
+      fs.writeFileSync(path.join(repository, 'evals', 'fixture.txt'), 'changed after the baseline');
+      git('add', 'evals/fixture.txt');
+      git('commit', '-q', '-m', 'two');
       fs.writeFileSync(path.join(repository, 'extension', 'esbuild.mjs'), 'throw new Error("working tree edit");');
       const session = {};
       editor.createRun({ scratch: path.join(scratch(), 'export parent') }, session);
       const baseline = await editor.prepareBaseline(session, {
         repository,
-        baselineCommit: 'HEAD',
+        baselineCommit: commit,
       });
       const tree = path.join(session.layout.root, editor.BASELINE_DIRECTORY);
       assert.deepEqual(baseline, { repository: tree, label: commit });

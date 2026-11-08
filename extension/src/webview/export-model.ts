@@ -77,6 +77,7 @@ export const EXPORT_HOST_POLICY = {
   setLayout: 'local',
   exportSession: 'blocked',
   saveState: 'local',
+  panelUsageMetrics: 'blocked',
   search: 'blocked',
   loadOlder: 'local',
   openLink: 'blocked',

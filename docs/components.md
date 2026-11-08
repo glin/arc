@@ -65,9 +65,11 @@ Paths are relative to `extension/src/`. [Architecture](architecture.md) owns pac
 | `webview/session-rename.ts` | Session rename editor form, and the rule that lets only the answer to the waiting request change it | no |
 | `webview/text-field.ts` | Shared single-line text box with a clear button | no |
 | `webview/protocol.ts` | The message contract both sides read: one union and one parser for each direction, and a dispatcher that names every message | no |
+| `webview/panel-usage-metrics.ts` | The page's share of panel usage metrics: consumed key chords, View menu choices, committed queries, and their throttled post to the host | no |
 | `webview/row-deltas.ts` | Session row deltas in render and session list messages: row prints and order edits for each panel on the host, held rows and revision checks in the panel | no |
 | `webview/retained-visibility.ts` | Retained-page opacity, revision and observation generations, viewport observation, resize invalidation, paint-boundary release, and retained focus | no |
 | `panelvisibility.ts` | Per-panel visibility revisions and lifetime cleanup | no |
+| `panelusage.ts` | Panel usage metrics: the counts, the message types it skips, one daily file for each window, repeated query checks across tabs, the query limit, throttled writes, and day-folder expiry | no |
 | `webview/state.ts` | Saved panel state shape, submitted-prompt identity and ordering, reconciliation, synchronous browser protection, local reset saves, and writes to the host memento | no |
 | `webview/timeline-renderer.ts` | Preact session sections and headings, bulk turn disclosure, heading actions and metadata, keyed cards, Activity publication, reading position, selection deferral, and focus recovery | no |
 | `webview/tsconfig.json` | Browser TypeScript project with browser platform libraries | not TypeScript |

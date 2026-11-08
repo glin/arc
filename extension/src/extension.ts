@@ -29,7 +29,8 @@ import { relativePath, nativePath, linkTarget, resolveLink, projectsRoot, sessio
 import { nativeCitationPath } from './domain/file-citation';
 import { sessionRenameTitle } from './sessionrename';
 import { watchInitialCodexName } from './codex';
-import { registerPanel, PanelProvider } from './panelhost';
+import { commandRegistrar, registerPanel, PanelProvider } from './panelhost';
+import { openPanelUsageMetrics } from './panelusage';
 import { readSetting } from './config';
 import { STORED_STATE_KEYS } from './identity';
 import { nodeGitRunner } from './gitcommits';
@@ -246,15 +247,27 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
   context.subscriptions.push(watcher);
 
+  // Panel usage metrics record only while their folder exists. One stat decides it for this window.
+  const usageMetrics = openPanelUsageMetrics(arcHome());
+  if (usageMetrics) context.subscriptions.push(usageMetrics);
+  const registerCommand = commandRegistrar(usageMetrics);
+
   // Register the panel that displays recorded turns.
   let snapshotOffer: ClaudePluginOffer | undefined;
-  const panel = registerPanel(context, root, workspaceCache, activationAt, (diagnostics) => {
-    sessionDiagnostics = sessionComponentsDiagnostics(diagnostics);
-    const sink: WindowTransportSink = (event, record) => diagnostics.warn(event, record);
-    channel?.setDiagnostics(sink);
-    if (channelConstructionError)
-      reportWindowTransport(sink, 'channelConstructionRejected', { errorCode: channelConstructionError });
-  });
+  const panel = registerPanel(
+    context,
+    root,
+    workspaceCache,
+    activationAt,
+    (diagnostics) => {
+      sessionDiagnostics = sessionComponentsDiagnostics(diagnostics);
+      const sink: WindowTransportSink = (event, record) => diagnostics.warn(event, record);
+      channel?.setDiagnostics(sink);
+      if (channelConstructionError)
+        reportWindowTransport(sink, 'channelConstructionRejected', { errorCode: channelConstructionError });
+    },
+    usageMetrics,
+  );
   const questionEvidence = new QuestionEvidenceReader();
   channel?.setRequestHandler((request) => panel.handleSessionRequest(request));
   panel.setWindowStateHandler((state) => {
@@ -282,7 +295,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push(watcher.onDidChange(onTrigger), watcher.onDidCreate(onTrigger));
 
   const reg = (id: string, fn: (...a: unknown[]) => void) => {
-    context.subscriptions.push(vscode.commands.registerCommand(id, fn));
+    context.subscriptions.push(registerCommand(id, fn));
   };
 
   // Path commands accept the context object attached to a file row or summary link.
@@ -908,7 +921,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     snapshotOffer?.invalidate();
   };
   context.subscriptions.push(
-    vscode.commands.registerCommand('arc.setupClaudeSnapshots', () => {
+    registerCommand('arc.setupClaudeSnapshots', () => {
       if (toolProblem) return vscode.window.showErrorMessage(`Arc: ${toolProblem}`);
       return snapshotOffer?.check(true);
     }),

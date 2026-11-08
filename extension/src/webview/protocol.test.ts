@@ -82,6 +82,9 @@ import {
   dispatchPanelToHost,
   parseHostToPanel,
   parsePanelToHost,
+  USAGE_COUNT_LIMIT,
+  USAGE_MESSAGE_ENTRIES,
+  USAGE_NAME_LIMIT,
 } from './protocol.ts';
 
 const LIVE_FILE: Extract<HostToPanel, { type: 'live' }>['live'][number]['files'][number] = {
@@ -667,6 +670,14 @@ const PANEL: Array<{ raw: Record<string, unknown>; parsed: PanelToHost }> = [
     raw: { type: 'saveState', state: { open: ['s1:1'] } },
     parsed: { type: 'saveState', state: { open: ['s1:1'] } },
   },
+  {
+    raw: { type: 'panelUsageMetrics', counts: { 'key:Ctrl+Enter': 2, 'view:sort=cost-desc': 1 }, queries: ['label:x'] },
+    parsed: {
+      type: 'panelUsageMetrics',
+      counts: { 'key:Ctrl+Enter': 2, 'view:sort=cost-desc': 1 },
+      queries: ['label:x'],
+    },
+  },
   { raw: { type: 'search', text: 'label:perf' }, parsed: { type: 'search', text: 'label:perf' } },
   {
     raw: { type: 'loadOlder', session: 's1', token: 's1:0:40' },
@@ -825,6 +836,7 @@ function panelRecorder(seen: string[]): PanelToHostHandlers<void> {
     setLayout: take('setLayout'),
     exportSession: take('exportSession'),
     saveState: take('saveState'),
+    panelUsageMetrics: take('panelUsageMetrics'),
     search: take('search'),
     loadOlder: take('loadOlder'),
     openLink: take('openLink'),
@@ -912,6 +924,28 @@ test('the inventory covers every variant both dispatchers name', () => {
     Object.keys(panelRecorder([])).sort(),
     'a message the panel sends has no sample, or a sample names no variant',
   );
+});
+
+test('a panel usage metrics message refuses a malformed or oversized body', () => {
+  const valid = { type: 'panelUsageMetrics', counts: { 'key:Escape': 1 }, queries: ['is:running', 'is:running'] };
+  assert.ok(parsePanelToHost(valid));
+  const many = (prefix: string) =>
+    Object.fromEntries(Array.from({ length: USAGE_MESSAGE_ENTRIES + 1 }, (_, at) => [`${prefix}${at}`, 1]));
+  for (const raw of [
+    { ...valid, extra: 1 },
+    { type: 'panelUsageMetrics', counts: { 'key:Escape': 1 } },
+    { ...valid, counts: { 'msg:archive': 1 } },
+    { ...valid, counts: { 'key:Escape': 0 } },
+    { ...valid, counts: { 'key:Escape': 1.5 } },
+    { ...valid, counts: { 'key:Escape': USAGE_COUNT_LIMIT + 1 } },
+    { ...valid, queries: [''] },
+    { ...valid, queries: ['x'.repeat(USAGE_NAME_LIMIT + 1)] },
+    { ...valid, queries: { 'is:running': 1 } },
+    { ...valid, queries: [1] },
+    { ...valid, counts: many('key:') },
+    { ...valid, queries: Array.from({ length: USAGE_MESSAGE_ENTRIES + 1 }, (_, at) => `q${at}`) },
+  ])
+    assert.equal(parsePanelToHost(raw), null, JSON.stringify(raw).slice(0, 80));
 });
 
 test('extra fields are dropped, and the render payload is handed back whole', () => {

@@ -473,6 +473,8 @@ export type PanelToHost =
   | { type: 'setLayout'; key: 'promptPosition'; value: PromptPosition }
   | { type: 'exportSession'; session: string }
   | { type: 'saveState'; state: unknown }
+  // Panel usage metrics: the counts since the page last posted, and its committed queries in commit order.
+  | { type: 'panelUsageMetrics'; counts: Record<string, number>; queries: string[] }
   | { type: 'search'; text: string; retained?: boolean }
   | { type: 'loadOlder'; session: string; token: string }
   | { type: 'openLink'; href: string; beside: boolean }
@@ -1045,6 +1047,33 @@ function validQueryContext(value: unknown): boolean {
   );
 }
 
+// One panel usage metrics message holds at most this many counts and queries.
+// USAGE_NAME_LIMIT bounds the length of each name, and USAGE_COUNT_LIMIT bounds each count.
+export const USAGE_MESSAGE_ENTRIES = 200;
+export const USAGE_NAME_LIMIT = 256;
+export const USAGE_COUNT_LIMIT = 1_000_000;
+
+// Count names start with `key:` or `view:`. Every count is a positive integer.
+function usageCountEntries(raw: unknown): Record<string, number> | null {
+  const entries = record(raw);
+  if (!entries) return null;
+  const pairs = Object.entries(entries);
+  if (pairs.length > USAGE_MESSAGE_ENTRIES) return null;
+  for (const [name, count] of pairs) {
+    if (name.length > USAGE_NAME_LIMIT || !/^(?:key|view):./.test(name)) return null;
+    if (!Number.isSafeInteger(count) || (count as number) < 1 || (count as number) > USAGE_COUNT_LIMIT) return null;
+  }
+  return Object.fromEntries(pairs) as Record<string, number>;
+}
+
+// Committed queries, in commit order. Query text is free, but never empty.
+function usageQueries(raw: unknown): string[] | null {
+  if (!Array.isArray(raw) || raw.length > USAGE_MESSAGE_ENTRIES) return null;
+  return raw.every((query) => typeof query === 'string' && query.length > 0 && query.length <= USAGE_NAME_LIMIT)
+    ? (raw as string[])
+    : null;
+}
+
 export function parsePanelToHost(raw: unknown): PanelToHost | null {
   const m = record(raw);
   if (!m) {
@@ -1361,6 +1390,12 @@ export function parsePanelToHost(raw: unknown): PanelToHost | null {
     case 'saveState':
       // normalizePanelState accepts unknown state values.
       return { type: 'saveState', state: m.state };
+    case 'panelUsageMetrics': {
+      if (Object.keys(m).sort().join(',') !== 'counts,queries,type') return null;
+      const counts = usageCountEntries(m.counts);
+      const queries = usageQueries(m.queries);
+      return counts && queries ? { type: 'panelUsageMetrics', counts, queries } : null;
+    }
     case 'search':
       return { type: 'search', text: textOr(m.text, ''), ...(m.retained === true ? { retained: true } : {}) };
     case 'loadOlder':
@@ -1645,6 +1680,8 @@ export function dispatchPanelToHost<R>(message: PanelToHost, handlers: PanelToHo
       return handlers.exportSession(message);
     case 'saveState':
       return handlers.saveState(message);
+    case 'panelUsageMetrics':
+      return handlers.panelUsageMetrics(message);
     case 'search':
       return handlers.search(message);
     case 'loadOlder':

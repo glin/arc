@@ -165,6 +165,7 @@ import {
 import { RailStats } from './stat-chip.ts';
 import { railHoverCard } from './rail-hover.ts';
 import type { Clock } from './clock.ts';
+import type { PageUsageMetrics } from './panel-usage-metrics.ts';
 import type { RailCacheMark, RailCardView, RailStat } from './payload-contracts.ts';
 
 interface RailEvents {
@@ -318,6 +319,8 @@ interface RailOptions {
     density: unknown;
   };
   sendToHost(message: PanelToHost): void;
+  // Present only while panel usage metrics are on.
+  usageMetrics?: PageUsageMetrics;
   save(): void;
   selectionWithin(node: HTMLElement | null): boolean;
   fallbackFocus(): HTMLElement | null;
@@ -1829,6 +1832,19 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     showRuns: railShowRuns,
   });
   let railFilterOpen = false;
+  // Whether a View menu setting changed since the menu opened, and whether the reader edited the query in the filter box since it last counted.
+  let railFilterChanged = false;
+  let filterTyped = false;
+  // A View menu choice counts as `view:<setting>=<value>`. A future setting adds one call.
+  const countViewChoice = (setting: string, value: string) => {
+    railFilterChanged = true;
+    options.usageMetrics?.view(setting, value);
+  };
+  const countTypedQuery = () => {
+    if (!filterTyped || naming) return;
+    filterTyped = false;
+    options.usageMetrics?.query(filter);
+  };
   let railFilterSearch = '';
   let railFilterButton: HTMLButtonElement | null = null;
   let railFilterSearchInput: HTMLInputElement | null = null;
@@ -1864,7 +1880,9 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
   const narrowing = (): RailNarrowing => ({ query: filter, queryContext });
   // Every query change goes through here and empties the kept set immediately.
   // Changing the query and putting it back before the next draw also starts the set again.
-  const setRailQuery = (query: string) => {
+  const setRailQuery = (query: string, typed = false) => {
+    // Only the reader's edit in the filter box marks a query for the metrics. Every other assignment clears the mark.
+    filterTyped = typed;
     if (query !== filter) {
       railKept = null;
       filteredFolds.clear();
@@ -2049,7 +2067,9 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       return;
     }
     const written = replaceToken(filterInput.value, row.start, row.end, row.token);
-    setRailQuery(boundedRailFilterQuery(written.query));
+    const completed = boundedRailFilterQuery(written.query);
+    // A suggestion row edits the query as typing does. A row that changes nothing leaves the mark as it was.
+    setRailQuery(completed, filterTyped || completed !== filter);
     filterInput.value = filter;
     filterShutOn = row.whole ? { start: row.start, text: row.token } : null;
     filterAt = 0;
@@ -2219,6 +2239,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     placeRailFilterPop();
   };
   const closeRailFilterPicker = (returnFocus: boolean) => {
+    if (railFilterOpen && !railFilterChanged) options.usageMetrics?.count('view:menu-closed-unchanged');
     railFilterOpen = false;
     railFilterSearch = '';
     railFilterNameMode = null;
@@ -2264,6 +2285,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     if (naming) {
       return;
     }
+    options.usageMetrics?.view('lens', kind);
     setLiveRailFilter(
       { ...liveRailFilter(), query: pressRailLens(filter, kind, railActiveWindow(railActiveChoice)) },
       railFilterId,
@@ -2271,6 +2293,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     restoreRailCountFocus();
   };
   const postRailFilters = (next: SavedRailFilter[]) => {
+    railFilterChanged = true;
     railFilters = next;
     options.sendToHost({ type: 'setRailFilters', railFilters: next });
   };
@@ -2421,6 +2444,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
             closeSessionRename(false);
           }
           railFilterOpen = true;
+          railFilterChanged = false;
           railFilterSearch = '';
           railFilterNameMode = null;
           railFilterDeleteArmed = false;
@@ -2489,7 +2513,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
                         drawTop();
                         return;
                       }
-                      setRailQuery(boundedRailFilterQuery(typed));
+                      setRailQuery(boundedRailFilterQuery(typed), true);
                       if (filter !== typed) {
                         (event.currentTarget as HTMLInputElement).value = filter;
                       }
@@ -2519,6 +2543,10 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
                       if (filterKeydown(event)) {
                         return;
                       }
+                      if (event.key === 'Enter') {
+                        countTypedQuery();
+                        return;
+                      }
                       if (event.key === 'Escape') {
                         event.preventDefault();
                         event.stopPropagation();
@@ -2532,6 +2560,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
                     },
                     onFocus: drawFilterPop,
                     onBlur: () => {
+                      countTypedQuery();
                       filterShutOn = null;
                       drawFilterPop();
                     },
@@ -3706,10 +3735,13 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       }
       // Switching filters or restoring a Custom query clears naming and armed deletion.
       // Pressing the selected, unchanged filter preserves its typed name and delete state.
-      if (id !== railFilterId || !railFilterSelected()) {
+      const changesFilter = id !== railFilterId || !railFilterSelected();
+      if (changesFilter) {
         railFilterDeleteArmed = false;
         railFilterNameMode = null;
       }
+      // Saved filter names are reader text, so the metrics record only which kind was chosen.
+      if (changesFilter) countViewChoice('filter', id === ALL_RAIL_FILTER_ID ? 'all' : 'saved');
       setLiveRailFilter(selected, id);
       drawRailFilterPop(`railfilterpick:${id}`);
     },
@@ -3721,6 +3753,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       if (!RAIL_SORTS.includes(value as RailSort)) {
         return;
       }
+      if (value !== railSort) countViewChoice('sort', value);
       selectRailFilterSort(value as RailSort);
     },
     // Set the selected status lens while preserving other terms, sort, and saved-filter identity. Keep the menu open on that value.
@@ -3731,6 +3764,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       }
       const query = withRailLens(filter, lens, railActiveWindow(railActiveChoice));
       if (query !== filter) {
+        countViewChoice('lens', value);
         setLiveRailFilter({ ...liveRailFilter(), query }, railFilterId);
       }
       drawRailFilterPop(`raillens:${value}`);
@@ -3742,6 +3776,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
         return;
       }
       railGroupBy = next;
+      countViewChoice('group', next);
       options.save();
       drawList();
       drawRailFilterPop(`railgroupby:${next}`);
@@ -3754,6 +3789,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       }
       railDensity = next;
       nav.dataset.density = next;
+      countViewChoice('rows', next);
       options.save();
       drawList();
       drawRailFilterPop(`raildensity:${next}`);
@@ -3767,6 +3803,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       } else {
         return;
       }
+      railFilterChanged = true;
       options.save();
       drawTop();
       drawList();
@@ -3780,12 +3817,14 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
         return;
       }
       railQuickFilters = withRailHeadLensToggled(railQuickFilters, lens);
+      railFilterChanged = true;
       options.save();
       drawTop();
       drawRailFilterPop(`railheadlens:${lens}`);
     },
     toggleRailFilterLabel(value) {
       setRailQuery(boundedRailFilterQuery(toggleRailFilterTerm(filter, 'labels', value)));
+      railFilterChanged = true;
       if (filterInput) {
         filterInput.value = filter;
       }
@@ -4103,6 +4142,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
         return;
       }
       railActiveChoice = next;
+      countViewChoice('window', next);
       const query = withRailActiveWindow(filter, railActiveWindow(next));
       if (query !== filter) {
         setLiveRailFilter({ ...liveRailFilter(), query }, railFilterId);

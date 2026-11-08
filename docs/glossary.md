@@ -77,6 +77,7 @@ A **read-only launch policy** retains launch restrictions through session contin
 | **Active window** | How far back the Active lens reaches: 1 hour, 3 hours, 6 hours, 12 hours, Today, or 2 days. | The panel saves it as `railActiveWindow`. It defaults to 1 hour, and the panel offers no control to change it. Use `RailActiveWindow` in code. |
 | **Needs you** | A session waiting for the reader, named on its card and prompt box and ranked first by `Needs you first`. | Its query term is `is:needsyou`, which keeps sessions matching `is:active` that need input or are unread. No filter button writes it. |
 | **Comment** | A reader-authored note attached to a turn or a quoted part of a response and sent back with a later prompt. | Do not call it a **note** in new product copy or domain code. |
+| **Panel usage metrics** | Arc's internal daily counts of the panel controls, keys, commands, and queries the owner uses. | Arc records them only while the `panel-usage` folder exists in the Arc home folder. The full name stays distinct from `PanelUsage`, the account usage bar's type. Product copy never names them. |
 
 ## Cost, context, and caching
 

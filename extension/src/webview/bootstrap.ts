@@ -36,6 +36,10 @@ export function startBrowserPanel(options: BrowserPanelStartOptions = {}): Brows
   const panel = startPanel({
     dom: panelDom(document),
     readOnly: ports.readOnly,
+    usageMetrics:
+      typeof SAVED_STATE === 'object' &&
+      SAVED_STATE !== null &&
+      (SAVED_STATE as { usageMetrics?: unknown }).usageMetrics === true,
     events: globalEvents,
     savedState,
     sendToHost: ports.host.send,

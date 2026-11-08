@@ -5,6 +5,7 @@ import * as path from 'node:path';
 import ts from 'typescript';
 import { sourceDoesNotMatch, sourceMatch } from '../test/source-contract.ts';
 import { ARC_IDENTITY, STORED_STATE_KEYS } from './identity.ts';
+import { inventorySourceTree } from '../test/source-tree.ts';
 
 test('project setups have a versioned storage prefix and retain the legacy pin key', () => {
   assert.equal(STORED_STATE_KEYS.pinnedSetups, 'arc.pinnedSetups');
@@ -64,6 +65,22 @@ test('every contributed command registers under its Arc id', () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
   const contributed = manifest.contributes.commands.map((command: { command: string }) => command.command);
   assert.deepEqual([...registered].sort(), [...contributed].sort());
+});
+
+// Panel usage metrics count each Arc command run in one helper. A registration outside it runs uncounted.
+test('every Arc command registers through the counting helper in panelhost.ts', () => {
+  const call = /\bcommands\s*\.\s*registerCommand\b/g;
+  const found = inventorySourceTree(__dirname)
+    .components.filter((name) => name.endsWith('.ts'))
+    .flatMap((name) => {
+      const source = fs.readFileSync(path.join(__dirname, name), 'utf8');
+      return [...source.matchAll(call)].map((match) => ({ name, source, at: match.index }));
+    });
+  assert.equal(found.length, 1, found.map((one) => one.name).join(', '));
+  const [only] = found;
+  const helper = only.source.indexOf('export function commandRegistrar(');
+  assert.equal(only.name, 'panelhost.ts');
+  assert.ok(helper >= 0 && only.at > helper && only.at < only.source.indexOf('\n}\n', helper));
 });
 
 test('shipping sources take Arc identifiers from the identity contract', () => {

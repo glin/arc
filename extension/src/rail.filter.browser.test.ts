@@ -2220,3 +2220,160 @@ test(
     }
   },
 );
+
+// What the page has posted, after a closing page sends what it still held.
+async function usagePosts(page: Page): Promise<{ counts: Record<string, number>; queries: string[] }> {
+  await page.evaluate(`window.dispatchEvent(new Event('pagehide'))`);
+  const posted = (await page.evaluate(`window.__posted.filter((m) => m.type === 'panelUsageMetrics')`)) as {
+    counts: Record<string, number>;
+    queries: string[];
+  }[];
+  const counts: Record<string, number> = {};
+  const queries: string[] = [];
+  for (const message of posted) {
+    for (const [key, value] of Object.entries(message.counts)) counts[key] = (counts[key] ?? 0) + value;
+    queries.push(...message.queries);
+  }
+  return { counts, queries };
+}
+
+test(
+  'panel usage metrics count View menu choices and consumed keys, and post each committed query',
+  { timeout: 60_000 },
+  async (t) => {
+    const browser = await browserOrNone();
+    if (!browser) {
+      t.skip('no installed browser');
+      return;
+    }
+    try {
+      const page = await browser.newPage();
+      await openPage(page, payload(), FIXTURE_CLOCK, { usageMetrics: true, railFilter: '' });
+      const funnel = page.locator('[data-control="railfilters"]');
+      await funnel.click();
+      // Escape inside the open menu closes it, and the menu's handler consumes the key.
+      await page.keyboard.press('Escape');
+      await page.waitForFunction(`document.getElementById('railfilterpop').hidden`);
+      await funnel.click();
+      await page.locator('[data-control="railgroupby:label"]').click();
+      await funnel.click();
+      await page.locator('[data-control="railsearch"]').click();
+      const box = page.locator('.railfilter');
+      await box.pressSequentially('label:composer');
+      await box.press('Enter');
+      await box.press('Enter');
+      await box.fill('');
+      await box.pressSequentially('label:composer');
+      await box.press('Tab');
+      const { counts, queries } = await usagePosts(page);
+      assert.equal(counts['view:menu-closed-unchanged'], 1, JSON.stringify(counts));
+      assert.equal(counts['view:group=label'], 1, JSON.stringify(counts));
+      assert.ok(counts['key:Escape'] >= 1, JSON.stringify(counts));
+      // Typed characters reach the filter box unconsumed, so none counts as a chord.
+      assert.deepEqual(
+        Object.keys(counts).filter((key) => /^key:.$/.test(key)),
+        [],
+      );
+      // The second Enter commits nothing new, and the host drops the repeat of the retyped query.
+      assert.deepEqual(queries, ['label:composer', 'label:composer']);
+    } finally {
+      await browser.close();
+    }
+  },
+);
+
+test('a query that only a suggestion row completes counts as a committed query', { timeout: 60_000 }, async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('no installed browser');
+    return;
+  }
+  try {
+    const page = await browser.newPage();
+    await openPage(page, payload(), FIXTURE_CLOCK, { usageMetrics: true, railFilter: '' });
+    await page.locator('[data-control="railsearch"]').click();
+    const box = page.locator('.railfilter');
+    await box.pressSequentially('label:comp');
+    await page.locator('.filterrow.on').waitFor();
+    await box.press('Enter');
+    await page.waitForFunction(`document.querySelector('.railfilter').value === 'label:composer'`);
+    await box.blur();
+    assert.deepEqual((await usagePosts(page)).queries, ['label:composer']);
+  } finally {
+    await browser.close();
+  }
+});
+
+test('a query the host assigns over typed text never counts as a committed query', { timeout: 60_000 }, async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('no installed browser');
+    return;
+  }
+  try {
+    const page = await browser.newPage();
+    await openPage(page, payload(), FIXTURE_CLOCK, { usageMetrics: true, railFilter: '' });
+    await page.locator('[data-control="railsearch"]').click();
+    const box = page.locator('.railfilter');
+    await box.pressSequentially('label:typed');
+    await postToPage(page, {
+      type: 'applySessionFilter',
+      request: 'usage-external',
+      query: 'label:external',
+      deadline: FIXTURE_CLOCK + 30_000,
+    });
+    await page.waitForFunction(
+      "window.__posted.some(message => message.type === 'sessionFilterApplied' && message.request === 'usage-external')",
+    );
+    await box.blur();
+    assert.deepEqual((await usagePosts(page)).queries, []);
+  } finally {
+    await browser.close();
+  }
+});
+
+test('reselecting the current sort or saved filter leaves the View menu unchanged', { timeout: 60_000 }, async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('no installed browser');
+    return;
+  }
+  try {
+    const page = await browser.newPage();
+    await openPage(page, payload(), FIXTURE_CLOCK, { usageMetrics: true, railFilter: '' });
+    const funnel = page.locator('[data-control="railfilters"]');
+    await funnel.click();
+    await page.locator('[data-control="railfilterpick:all"]').click();
+    await page.locator('[data-control^="railfilter-order:"][aria-checked="true"]').click();
+    await page.locator('[data-control^="railfilter-order:"][aria-checked="true"]').click();
+    await funnel.click();
+    await page.waitForFunction(`document.getElementById('railfilterpop').hidden`);
+    const { counts } = await usagePosts(page);
+    assert.equal(counts['view:menu-closed-unchanged'], 1, JSON.stringify(counts));
+    assert.deepEqual(
+      Object.keys(counts).filter((key) => key.startsWith('view:sort=') || key.startsWith('view:filter=')),
+      [],
+    );
+  } finally {
+    await browser.close();
+  }
+});
+
+test('a page whose shell lacks the recording option posts no usage metrics', { timeout: 60_000 }, async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('no installed browser');
+    return;
+  }
+  try {
+    const page = await browser.newPage();
+    await openPage(page, payload(), FIXTURE_CLOCK, { railFilter: '' });
+    await page.locator('[data-control="railfilters"]').click();
+    await page.keyboard.press('Escape');
+    await page.waitForFunction(`document.getElementById('railfilterpop').hidden`);
+    await page.evaluate(`window.dispatchEvent(new Event('pagehide'))`);
+    assert.equal(await page.evaluate(`window.__posted.filter((m) => m.type === 'panelUsageMetrics').length`), 0);
+  } finally {
+    await browser.close();
+  }
+});

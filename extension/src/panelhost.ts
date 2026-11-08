@@ -498,6 +498,7 @@ import {
 } from './promptassets';
 import { fillPanelText, panelValues } from './paneltext';
 import { dispatchPanelToHost, parsePanelToHost } from './webview/protocol.ts';
+import type { PanelUsageMetrics } from './panelusage.ts';
 import {
   HostReadPersistence,
   ReadPersistenceUnknownError,
@@ -1461,6 +1462,8 @@ export class PanelProvider implements vscode.Disposable {
   private clearingDraftRevision: { session: string; revision: number } | null = null;
   private panelRecoveryWaiters = new Map<string, { resolve(): void; reject(error: unknown): void }>();
   private disposed = false;
+  // Panel usage metrics, present only while their folder existed at activation.
+  usageMetrics: PanelUsageMetrics | undefined;
   private attachmentHandoffs = new Set<AbortController>();
   // Attached panel hosts, including tabs restored while another panel is open.
   private hosts: PanelHost[] = [];
@@ -16721,6 +16724,7 @@ export class PanelProvider implements vscode.Disposable {
       console.warn('Arc: a message from the panel was not understood, so nothing was done.', named);
       return;
     }
+    this.usageMetrics?.message(message);
     if (message.type === 'health') {
       const panel = this.healthPanel(host);
       if (message.sequence > panel.ack && message.sequence <= panel.sent) {
@@ -17159,6 +17163,7 @@ export class PanelProvider implements vscode.Disposable {
         },
         sessionFilterApplied: (msg) => this.receiveSessionFilter(msg, host),
         saveState: (msg) => this.saveState(msg.state).catch(() => {}),
+        panelUsageMetrics: (msg) => this.usageMetrics?.merge(msg.counts, msg.queries),
         // Classify typed queries through `isSearch` before reading session content.
         search: (msg) => {
           const query = msg.text;
@@ -17439,6 +17444,7 @@ export class PanelProvider implements vscode.Disposable {
         ...webviewPanelState(this.saved),
         readerPageId,
         recoveryOrigin: this.recoveryOrigin,
+        ...(this.usageMetrics ? { usageMetrics: true } : {}),
       }),
       style: STYLE,
       script: SCRIPT,
@@ -17449,13 +17455,29 @@ export class PanelProvider implements vscode.Disposable {
 
 function healthPostSettled(): void {}
 
+// Every Arc command registers through the function this returns, so panel usage metrics count `cmd:<id>` for each run.
+// `identity.test.ts` fails when a source file registers a command another way.
+export function commandRegistrar(
+  usageMetrics: PanelUsageMetrics | undefined,
+): (id: string, run: (...args: unknown[]) => unknown) => vscode.Disposable {
+  return (id, run) => {
+    const key = `cmd:${id}`;
+    return vscode.commands.registerCommand(id, (...args: unknown[]) => {
+      usageMetrics?.count(key);
+      return run(...args);
+    });
+  };
+}
+
 export function registerPanel(
   context: vscode.ExtensionContext,
   storeRootDir: string,
   workspaceCache: WorkspaceCachePartition,
   activationAt = performance.now(),
   observeDiagnostics?: (diagnostics: DiagnosticsLog) => void,
+  usageMetrics?: PanelUsageMetrics,
 ): PanelProvider {
+  const registerCommand = commandRegistrar(usageMetrics);
   const output = vscode.window.createOutputChannel('Arc');
   output.appendLine(
     `Arc reads Claude sessions from ${projectsRoot()}. Arc reads Codex sessions from ${codexSessionsRoot()}.`,
@@ -17501,21 +17523,22 @@ export function registerPanel(
     path.join(workspaceCache.root, 'derived-session-cache.json'),
     path.join(workspaceCache.root, 'derived-session-cache-v1.json'),
   );
+  provider.usageMetrics = usageMetrics;
   context.subscriptions.push(
     provider,
     vscode.workspace.registerTextDocumentContentProvider(PATCH_SCHEME, {
       provideTextDocumentContent: (uri) => provider.patches.get(uri.toString()) ?? '',
     }),
     // Accept an optional output path. Non-string command arguments use the default destination.
-    vscode.commands.registerCommand('arc.savePerformanceDiagnostics', (target?: unknown) =>
+    registerCommand('arc.savePerformanceDiagnostics', (target?: unknown) =>
       provider.savePerformanceDiagnostics(typeof target === 'string' ? target : undefined),
     ),
-    vscode.commands.registerCommand('arc.openDiagnosticsLog', () => provider.openDiagnosticsLog()),
-    vscode.commands.registerCommand('arc.showProjectSpend', () => provider.showProjectSpend()),
-    vscode.commands.registerCommand('arc.newSession', () => provider.newSession()),
+    registerCommand('arc.openDiagnosticsLog', () => provider.openDiagnosticsLog()),
+    registerCommand('arc.showProjectSpend', () => provider.showProjectSpend()),
+    registerCommand('arc.newSession', () => provider.newSession()),
     // Register commands that create the editor panel and its beside variant.
-    vscode.commands.registerCommand('arc.openInEditor', () => provider.openInEditor()),
-    vscode.commands.registerCommand('arc.openBeside', () => provider.openInEditor(vscode.ViewColumn.Beside)),
+    registerCommand('arc.openInEditor', () => provider.openInEditor()),
+    registerCommand('arc.openBeside', () => provider.openInEditor(vscode.ViewColumn.Beside)),
     // Reattach editor-restored webview tabs after a window reload.
     vscode.window.registerWebviewPanelSerializer(PANEL_TYPE, {
       deserializeWebviewPanel: async (panel, state) => {

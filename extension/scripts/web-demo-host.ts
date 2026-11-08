@@ -61,6 +61,7 @@ export const DEMO_HOST_POLICY = {
   setLayout: 'handled',
   exportSession: 'handled',
   saveState: 'handled',
+  panelUsageMetrics: 'noop',
   search: 'noop',
   loadOlder: 'noop',
   openLink: 'noop',

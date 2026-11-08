@@ -7431,6 +7431,8 @@ test('channel construction failure leaves panel activation and provider registra
     LaunchPolicyStore,
     path,
     arcHome: () => '/Arc',
+    openPanelUsageMetrics: () => undefined,
+    commandRegistrar: () => () => ({}),
     storeRoot: () => '/Arc/Store',
     cacheRoot: () => '/Arc/Cache',
     normalizedWorkspaceIdentity: () => 'workspace',
@@ -11111,6 +11113,14 @@ const browserComposerPresentationSource = fs.readFileSync(
 );
 const queueLiveSource = fs.readFileSync(path.join(__dirname, 'webview', 'queue-live.ts'), 'utf8');
 const railSource = fs.readFileSync(path.join(__dirname, 'webview', 'rail.ts'), 'utf8');
+// No control calls setActiveWindow, so a source scan is the only check that reaches its count.
+test('the rail counts an Active window choice once, only after the choice changes', () => {
+  sourceMatch(
+    railSource,
+    /setActiveWindow\(value: string\) \{(?:(?!countViewChoice)[^])*?next === railActiveChoice\) \{\s*return;\s*\}\s*railActiveChoice = next;\s*countViewChoice\('window', next\);/,
+    'the Active window choice no longer counts once after the unchanged choice returns',
+  );
+});
 
 test('pinned agent-run session cards keep the provider visible and the run by an agent word', () => {
   const [source] = sourceNodes(railSource, (node) => ts.isFunctionDeclaration(node) && node.name?.text === 'RailRow');
@@ -13913,7 +13923,7 @@ test('the panel prefers the shared state, so a tab opens where the last one left
   // The projection excludes host-owned labels.
   sourceMatch(
     panelHostSource,
-    /savedStateJson: scriptJson\(\{ \.\.\.webviewPanelState\(this\.saved\), readerPageId, recoveryOrigin: this\.recoveryOrigin \}\)/,
+    /savedStateJson: scriptJson\(\{ \.\.\.webviewPanelState\(this\.saved\), readerPageId, recoveryOrigin: this\.recoveryOrigin, \.\.\.\(this\.usageMetrics \? \{ usageMetrics: true \} : \{\}\),? \}\)/,
     'the shared state is not injected into the page, so a new host starts blank',
   );
   sourceMatch(
@@ -36531,6 +36541,7 @@ test('provider registration routes retained-tab counts and build identity into d
     HOST_BUILD_IDENTITY: JSON.stringify({ sourceCommit: 'a'.repeat(40), dirty: false, builtAt: 17 }),
     PATCH_SCHEME: 'patch',
     PANEL_TYPE: 'arc.panel',
+    commandRegistrar: () => () => ({}),
     vscode: {
       workspace: { workspaceFolders: [], registerTextDocumentContentProvider() {} },
       window: { createOutputChannel: () => ({ appendLine() {} }), registerWebviewPanelSerializer() {} },
@@ -36557,6 +36568,61 @@ test('provider registration routes retained-tab counts and build identity into d
     assert.equal(record.panels.ready, 1);
   } finally {
     health?.dispose();
+  }
+});
+
+test('commandRegistrar counts each run, passes its arguments, returns the handler result, and counts nothing when off', async () => {
+  const { commandRegistrar } = await import('./panelhost.ts');
+  const commands = vscode.commands as unknown as { registerCommand?: unknown };
+  const original = commands.registerCommand;
+  const registered = new Map<string, (...args: unknown[]) => unknown>();
+  commands.registerCommand = (id: string, run: (...args: unknown[]) => unknown) => {
+    registered.set(id, run);
+    return { dispose() {} };
+  };
+  try {
+    const counted: string[] = [];
+    const seen: unknown[][] = [];
+    commandRegistrar({ count: (key: string) => counted.push(key) } as never)('arc.example', (...args) => {
+      seen.push(args);
+      return 'result';
+    });
+    assert.equal(registered.get('arc.example')!('one', 2), 'result');
+    assert.deepEqual(seen, [['one', 2]]);
+    assert.deepEqual(counted, ['cmd:arc.example']);
+    commandRegistrar(undefined)('arc.off', () => 'off');
+    assert.equal(registered.get('arc.off')!(), 'off');
+    assert.deepEqual(counted, ['cmd:arc.example']);
+  } finally {
+    commands.registerCommand = original;
+  }
+});
+
+test('the panel counts only messages the parser accepts and merges the page usage metrics', async () => {
+  const host = {};
+  const seen: string[] = [];
+  const merged: unknown[][] = [];
+  const provider: any = Object.assign(Object.create(PanelProvider.prototype), {
+    usageMetrics: {
+      message: (message: { type: string }) => seen.push(message.type),
+      merge: (counts: unknown, queries: unknown) => merged.push([counts, queries]),
+    },
+    panelSession: (session: string) => session,
+    readyHosts: new Set([host]),
+    hosts: [host],
+  });
+  const warn = console.warn;
+  console.warn = () => {};
+  try {
+    await provider.onMessage({ type: 'notAPanelMessage' }, host);
+    await provider.onMessage({ type: 'panelUsageMetrics', counts: { 'key:Escape': 1 }, queries: ['bad', ''] }, host);
+    assert.deepEqual(seen, []);
+    assert.deepEqual(merged, []);
+    await provider.onMessage({ type: 'panelUsageMetrics', counts: { 'key:Escape': 2 }, queries: ['is:running'] }, host);
+    assert.deepEqual(seen, ['panelUsageMetrics']);
+    assert.deepEqual(merged, [[{ 'key:Escape': 2 }, ['is:running']]]);
+  } finally {
+    console.warn = warn;
   }
 });
 
