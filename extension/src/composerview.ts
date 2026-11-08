@@ -42,7 +42,14 @@ import { PermissionMode, type RemoteControlResult } from './claudewire';
 import { mcpMenu, mcpPick } from './mcpview';
 import { WINDOW_SUFFIX, modelWindowOf, normalizeModelIdentity, sameModelIdentity } from './domain/model-identity';
 import { AgentKind, Turn, cleanPrompt } from './transcript';
-import { LINE_BREAK, matchCommandNames, remoteControlRequest, renameRequest } from './domain/composer-editing';
+import {
+  fastRequest,
+  LINE_BREAK,
+  matchCommandNames,
+  remoteControlRequest,
+  renameRequest,
+} from './domain/composer-editing';
+import type { ServiceTierEvidence } from './view/model-picks';
 import { isLocalLinkPath } from './domain/link-path';
 import { completedQuestionAnswer } from './domain/ask-answer';
 import { escapeHtml, renderRichMarkdown, renderInlineMarkdown, visibleTextOf } from './richtext';
@@ -51,6 +58,7 @@ export {
   matchCommandNames,
   pathToken,
   promptToken,
+  fastRequest,
   remoteControlRequest,
   renameRequest,
 } from './domain/composer-editing';
@@ -619,6 +627,82 @@ export async function acceptedPermissionMode(
       }),
     );
   }
+}
+
+// A typed Codex /fast. Refusals retain the typed text and show `notice` in the prompt box.
+export type FastToggleResult = { outcome: 'changed'; tier: ServiceTier } | { outcome: 'refused'; notice: string };
+
+export const FAST_ARGUMENTS = 'Speed not changed. Send /fast by itself, with nothing after it.';
+export const FAST_SAVE_FAILED = 'Speed not changed. Arc could not save the speed for this session.';
+export const FAST_UNRESOLVED = 'Speed not changed. Wait for the last prompt or session change to finish.';
+const FAST_UNREADABLE = "Speed not changed. Arc could not read this session's current speed.";
+const FAST_EVIDENCE_REFUSALS: Record<'malformed' | 'conflicting' | 'unsupported', string> = {
+  malformed: 'Speed not changed. Codex reported a speed setting Arc cannot read.',
+  conflicting: 'Speed not changed. Codex settings name different speeds for this session.',
+  unsupported: 'Speed not changed. Codex reported a speed Arc does not know.',
+};
+
+// Fast turns off. Any other speed moves to Fast, so Ultrafast reaches Standard on the second toggle.
+export function nextFastSelection(current: ServiceTier): ServiceTier {
+  return current === 'priority' ? 'default' : 'priority';
+}
+
+export interface FastToggleSteps {
+  session: string;
+  read(): SessionSettingBook;
+  // Durably stores the selection for this session, then updates what `read` returns.
+  commit(tier: ServiceTier): Promise<void>;
+  // The agent's report of the speed in use when the session names none.
+  evidence(): Promise<ServiceTierEvidence | null>;
+  // Checks the speed. A live child returns the function that publishes it, and a session without a child returns null.
+  stage(tier: ServiceTier): Promise<(() => boolean) | null>;
+  // Replaces a child that cannot adopt the saved speed. The next prompt starts from the saved book.
+  retire(): Promise<void>;
+}
+
+// Validate, save, then publish. A refused change or a failed save leaves the book and child as they were. After the
+// save, the book is authoritative, so a child that cannot adopt the speed is retired rather than the book rolled back.
+export async function toggleFastSelection(steps: FastToggleSteps): Promise<FastToggleResult> {
+  const refused = (notice: string): FastToggleResult => ({ outcome: 'refused', notice });
+  let current = sessionSettings(steps.read(), steps.session).serviceTier;
+  if (current === undefined) {
+    const evidence = await steps.evidence().catch(() => null);
+    if (!evidence) return refused(FAST_UNREADABLE);
+    if (evidence.status !== 'absent' && evidence.status !== 'known')
+      return refused(FAST_EVIDENCE_REFUSALS[evidence.status]);
+    current = evidence.status === 'known' ? evidence.tier : 'default';
+  }
+  const tier = nextFastSelection(current);
+  let adopt: (() => boolean) | null;
+  try {
+    adopt = await steps.stage(tier);
+  } catch (error) {
+    return refused(`Speed not changed. ${error instanceof Error ? error.message : 'Codex refused the speed.'}`);
+  }
+  try {
+    await steps.commit(tier);
+  } catch {
+    return refused(FAST_SAVE_FAILED);
+  }
+  if (adopt && !adopt()) await steps.retire().catch(() => {});
+  return { outcome: 'changed', tier };
+}
+
+// Whether the catalog row offers a speed. Null means that the agent did not say.
+export function tierOffered(model: ModelChoice | null | undefined, tier: ServiceTier): boolean | null {
+  return model?.serviceTiers ? model.serviceTiers.includes(tier) : null;
+}
+
+export function fastModelChoice(models: readonly ModelChoice[], model: string): ModelChoice | null {
+  return chosenModel(models, model) ?? modelRan(models, model);
+}
+
+// Delivery that has left the queue, or a session transition, leaves no session to bind a speed change to.
+export function fastUnresolved(state: ComposerState): boolean {
+  return (
+    state.clearing ||
+    state.queued.some((entry) => entry.delivery.phase !== 'queued' && entry.delivery.phase !== 'draft-recovery')
+  );
 }
 
 export interface ComposerContext {
@@ -2624,8 +2708,8 @@ export type SendMeaning = 'send' | 'queue' | 'nothing';
 
 export function sendAction(state: ComposerState): SendMeaning {
   const typed = state.onScreen.trim();
-  // The host runs a Remote Control toggle at once, beside running work and the queue.
-  if (remoteControlRequest(state.agent, typed) !== null) return 'send';
+  // The host runs Remote Control and Fast toggles at once, beside running work and the queue.
+  if (remoteControlRequest(state.agent, typed) !== null || fastRequest(state.agent, typed) !== null) return 'send';
   // Codex compaction and clear controls hold new submissions in the panel queue.
   const compacting =
     state.agent === 'codex' &&
@@ -3848,11 +3932,19 @@ function sendName(state: ComposerState, name: string, enabled: boolean): string 
     state.agent === 'codex' &&
     state.live.some((press) => (press.kind === 'compact' || press.kind === 'clear') && !press.failed);
   // A Codex `/rename` runs at once beside the session control, so it waits in no queue.
-  if (compacting && enabled && renameRequest(state.agent, state.onScreen) === null) {
+  if (
+    compacting &&
+    enabled &&
+    renameRequest(state.agent, state.onScreen) === null &&
+    fastRequest(state.agent, state.onScreen) === null
+  ) {
     return `Queue this prompt for ${name}. Arc will send it after the session control. ${SEND_HINT}.`;
   }
   if (remoteControlRequest(state.agent, state.onScreen) === 'toggle') {
     return `Turn Claude Remote Control on or off for ${name}. ${SEND_HINT}.`;
+  }
+  if (fastRequest(state.agent, state.onScreen) === 'toggle') {
+    return `Turn Fast on or off for ${name}. ${SEND_HINT}.`;
   }
   const comments = state.onScreen.trim() ? 0 : commentsForActiveSubmission(state).length;
   const files = state.onScreen.trim() ? 0 : (state.assets?.length ?? 0);
@@ -3887,10 +3979,11 @@ function sendOverAskLine(state: ComposerState): string {
   if (stopping || !enabled) {
     return '';
   }
-  // Panel commands, Codex rename requests, and Remote Control toggles do not answer pending requests.
+  // Panel commands, Codex rename and Fast requests, and Remote Control toggles do not answer pending requests.
   if (
     panelCommand(state.onScreen) ||
     renameRequest(state.agent, state.onScreen) !== null ||
+    fastRequest(state.agent, state.onScreen) !== null ||
     remoteControlRequest(state.agent, state.onScreen) !== null
   ) {
     return '';
@@ -3917,7 +4010,7 @@ function composerBox(state: ComposerState, name: string): ComposerBox {
       state.agent,
       name,
       running,
-      availableCommands(state.commands, state.agent).length > 0,
+      sessionCommands(state).length > 0,
       state.commands.some((entry) => entry.kind === 'skill'),
     ),
     dropPlaceholder: 'Drop to attach',
@@ -4071,7 +4164,7 @@ export function composerView(state: ComposerState | null, now: number = Date.now
     picks,
     // Drafts and agent runs never hold a connection, so the host map has no entry for them.
     remoteControl: remoteControlControl(state),
-    commands: promptEntries(state.agent, availableCommands(state.commands, state.agent)),
+    commands: promptEntries(state.agent, sessionCommands(state)),
     claudeSkills: state.claudeSkills,
     completionName: `Completions available for ${name}`,
     box: composerBox(state, name),
@@ -4851,6 +4944,35 @@ export function availableCommands(commands: readonly ComposerPromptEntry[], agen
     }
   }
   return available;
+}
+
+// The local row offers `/fast` when the next turn's model offers Fast, or when the session needs it to turn Fast off.
+function fastCommandOffered(state: ComposerState): boolean {
+  if (state.agent !== 'codex') return false;
+  const selected = state.settings.serviceTier;
+  if (selected === 'priority') return true;
+  if (selected === undefined && ['priority', 'fast'].includes(state.settings.confirmedServiceTier ?? '')) return true;
+  const model =
+    chosenModel(state.models, state.settings.selectedModel) ??
+    recordedModel(state) ??
+    state.models.find((item) => item.isDefault);
+  return tierOffered(model, 'priority') === true;
+}
+
+// One session's prompt entries. The local `/fast` row depends on that session's model and speed.
+function sessionCommands(state: ComposerState): ComposerPromptEntry[] {
+  const commands = availableCommands(state.commands, state.agent);
+  if (
+    fastCommandOffered(state) &&
+    !commands.some((item) => item.kind !== 'skill' && item.name.toLowerCase() === 'fast')
+  )
+    commands.push({
+      kind: 'command',
+      name: 'fast',
+      description: 'Turn Fast on or off for the next turn',
+      argumentHint: '',
+    });
+  return commands;
 }
 
 // The reason a queued Remote Control command with arguments waits for the reader.

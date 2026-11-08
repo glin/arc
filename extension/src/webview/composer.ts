@@ -8,6 +8,7 @@ import {
   PATH_COMPLETION_DEBOUNCE_MS,
   pathToken,
   promptToken,
+  fastRequest,
   remoteControlRequest,
   renameRequest,
   undoBreak,
@@ -365,10 +366,15 @@ function attachLineClipboard(box: HTMLTextAreaElement): void {
   });
 }
 
-// Codex `/rename` and Claude Remote Control send no attachments and do not wait for staging.
+// Codex `/rename`, Codex `/fast`, and Claude Remote Control send no attachments and do not wait for staging.
 // All other drafts wait, including Claude `/rename`, which runs as a prompt.
 export function sendWaitsForStaging(agent: string, text: string, staging: boolean): boolean {
-  return staging && renameRequest(agent, text) === null && remoteControlRequest(agent, text) === null;
+  return (
+    staging &&
+    renameRequest(agent, text) === null &&
+    remoteControlRequest(agent, text) === null &&
+    fastRequest(agent, text) === null
+  );
 }
 
 export function createComposerRenderer(options: ComposerOptions): ComposerRenderer {

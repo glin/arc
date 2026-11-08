@@ -1,5 +1,5 @@
-import { canonicalServiceTier, type RequestedServiceTier, type ServiceTier } from './launchpolicy';
-import { unavailableDefaults, type AppliedDefaults } from './view/model-picks';
+import { canonicalServiceTier, isServiceTier, type RequestedServiceTier, type ServiceTier } from './launchpolicy';
+import { unavailableDefaults, type AppliedDefaults, type ServiceTierEvidence } from './view/model-picks';
 import type { ListedModel } from './domain/model-catalog';
 import { SessionNameUncertain } from './sessionrename';
 import { promptToken } from './domain/composer-editing';
@@ -424,6 +424,8 @@ export class CodexWire {
   // Null overrides leave the thread's current settings unchanged.
   private model: string | null = null;
   private serviceTier: ServiceTier | undefined;
+  private appliedTier: ServiceTierEvidence | undefined;
+  private tierStale = false;
   private tierModel: string | null = null;
   private effectiveModel: string | null = null;
   private effectiveModelRequestId = 0;
@@ -498,6 +500,7 @@ export class CodexWire {
 
   // Limits applied-default reads to server versions that pass `codexDefaultsQualified`.
   private defaultsQualified = false;
+  private tierReadingQualified = false;
 
   async initialize(): Promise<Json> {
     const result = await this.request('initialize', {
@@ -507,6 +510,11 @@ export class CodexWire {
       capabilities: { experimentalApi: true },
     });
     this.defaultsQualified = codexDefaultsQualified(str(result.userAgent));
+    this.tierReadingQualified = codexDefaultsQualified(
+      str(result.userAgent),
+      CODEX_DEFAULTS_REFUSED,
+      CODEX_TIER_READING_FLOOR,
+    );
     this.notify('initialized', {});
     return result;
   }
@@ -763,22 +771,48 @@ export class CodexWire {
   private async checkServiceTier(tier: ServiceTier, model: string | null): Promise<void> {
     if (tier === 'default') return;
     const catalog = await this.models();
-    const entry = arr(catalog?.data)
+    if (!catalog) throw new Error(`Codex did not report its models, so Arc cannot confirm service tier ${tier}.`);
+    const entry = arr(catalog.data)
       .map(obj)
       .find((item) => item && (item.id === model || item.model === model));
-    // Legacy catalogs name Fast in additionalSpeedTiers. A present serviceTiers list takes precedence.
-    const offered =
-      entry &&
-      (Array.isArray(entry.serviceTiers)
-        ? entry.serviceTiers.map((item: unknown) => str(obj(item)?.id))
-        : arr(entry.additionalSpeedTiers).map(str));
-    if (!model || !offered?.some((id: string | null) => (id === 'fast' ? 'priority' : id) === tier))
+    if (!model || !(entry && offeredServiceTiers(entry))?.includes(tier))
       throw new Error(`Codex does not offer service tier ${tier} for ${model || 'the selected model'}.`);
   }
 
   private async prepareServiceTier(options?: Pick<CodexSpawnOptions, 'model' | 'serviceTier'>): Promise<void> {
     if (options?.serviceTier !== undefined && options.model)
       await this.checkServiceTier(canonicalServiceTier(options.serviceTier), options.model);
+  }
+
+  // A thread reply reports the speed and model that the thread applies when no turn overrides them.
+  private noteThreadSettings(result: Json): void {
+    if ('serviceTier' in result) this.appliedTier = tierEvidence(result.serviceTier);
+    const model = str(result.model);
+    if (model) this.effectiveModel = model;
+  }
+
+  // Reads the speed the next turn uses when the session names none. A control read starts no turn.
+  async nextServiceTier(): Promise<ServiceTierEvidence | null> {
+    if (this.serviceTier !== undefined) return { status: 'known', tier: this.serviceTier };
+    if (this.tierReadingQualified && this.appliedTier?.status === 'known') return this.appliedTier;
+    return (await this.appliedDefaults(this.cwd, '')).serviceTier ?? null;
+  }
+
+  // Checks a next-turn speed and leaves this adapter unchanged. The caller saves the selection, then calls the returned
+  // function to publish it. A false answer means that this adapter must not send again, so `prompt` refuses from then on.
+  async stageServiceTier(tier: ServiceTier): Promise<() => boolean> {
+    const thread = this.thread;
+    const model = this.model ?? this.effectiveModel;
+    await this.checkServiceTier(tier, model);
+    return () => {
+      if (this.closed || this.thread !== thread) {
+        this.tierStale = true;
+        return false;
+      }
+      this.serviceTier = tier;
+      this.tierModel = model;
+      return true;
+    };
   }
 
   private async acceptServiceTier(
@@ -819,6 +853,7 @@ export class CodexWire {
       beforeWrite,
       writeAttempted,
     );
+    this.noteThreadSettings(result);
     if (options?.serviceTier !== undefined) await this.acceptServiceTier(result, options);
     const threadId = this.adoptThread(result);
     if (name) {
@@ -853,6 +888,7 @@ export class CodexWire {
       ...(options?.approvalsReviewer ? { approvalsReviewer: options.approvalsReviewer } : {}),
       ...(options?.sandbox ? { sandbox: options.sandbox } : {}),
     });
+    this.noteThreadSettings(result);
     if (options?.serviceTier !== undefined) await this.acceptServiceTier(result, options);
     return this.adoptThread(result);
   }
@@ -886,6 +922,7 @@ export class CodexWire {
       beforeWrite,
       writeAttempted,
     );
+    this.noteThreadSettings(result);
     if (options?.serviceTier !== undefined) await this.acceptServiceTier(result, options);
     return this.adoptThread(result);
   }
@@ -1032,7 +1069,8 @@ export class CodexWire {
       }
       if (stopped) throw new Error('the prompt was stopped before it reached the agent');
       if (this.optionalFailure) throw this.optionalFailure;
-      if (this.closed || threadId !== this.thread) throw new Error('the Codex session changed before delivery');
+      if (this.closed || threadId !== this.thread || this.tierStale)
+        throw new Error('the Codex session changed before delivery');
       return this.startPrompt(prompt, token, threadId, model, guard, beforeWrite, writeAttempted);
     } finally {
       this.pendingPrompts.delete(cancel);
@@ -1279,8 +1317,16 @@ export class CodexWire {
       return unavailableDefaults('This Codex version has no confirmed default-settings behavior.');
     const snapshot = await this.appliedDefaultsSnapshot(cwd);
     return snapshot
-      ? readAppliedDefaults(snapshot.configuration, snapshot.catalog, snapshot.policy, model)
+      ? this.withTierEvidence(
+          readAppliedDefaults(snapshot.configuration, snapshot.catalog, snapshot.policy, model),
+          snapshot,
+        )
       : unavailableDefaults('Codex did not report its configuration or policy.');
+  }
+
+  private withTierEvidence(applied: AppliedDefaults, snapshot: CodexDefaultsSnapshot): AppliedDefaults {
+    if (!this.tierReadingQualified || applied.status !== 'ready') return applied;
+    return { ...applied, serviceTier: readServiceTierEvidence(snapshot.configuration, snapshot.policy) };
   }
 
   async appliedDefaultsSnapshot(cwd: string): Promise<CodexDefaultsSnapshot | null> {
@@ -1303,7 +1349,10 @@ export class CodexWire {
       return {
         configuration: safe,
         catalog,
-        policy: { requirements: requirements.requirements === null ? null : {} },
+        policy: {
+          requirements:
+            requirements.requirements === null ? null : safeTierRequirements(requirements.requirements as Json),
+        },
       };
     } catch {
       return null;
@@ -2558,6 +2607,7 @@ export function readModels(payload: unknown, readAt: number): ModelList | null {
       label: str(model.displayName) ?? value,
       description: str(model.description) ?? '',
       efforts,
+      ...(offeredServiceTiers(model) ? { serviceTiers: offeredServiceTiers(model) } : {}),
     });
   }
   if (!models.length) {
@@ -2624,6 +2674,10 @@ export function turnOutcome(turn: Json | null): TurnOutcome {
 // replies were confirmed to describe the model and effort a new thread applies.
 const CODEX_DEFAULTS_FLOOR = parseVersion('0.159.2')!;
 
+// The first Codex version whose thread replies and `service_tier` and `models.newThread.serviceTier` settings were
+// confirmed to describe the speed a new thread applies.
+const CODEX_TIER_READING_FLOOR = parseVersion('0.167.0')!;
+
 // Codex versions at or above the floor whose replies misdescribe the applied defaults.
 // `last` is the last refused version. A range without `last` refuses every later release,
 // because a change of reply meaning carries forward until native evidence shows a fix.
@@ -2641,10 +2695,11 @@ export const CODEX_DEFAULTS_REFUSED: readonly CodexVersionRange[] = [];
 export function codexDefaultsQualified(
   userAgent: string | null | undefined,
   refused: readonly CodexVersionRange[] = CODEX_DEFAULTS_REFUSED,
+  floor = CODEX_DEFAULTS_FLOOR,
 ): boolean {
   const token = /^[^\s/]+\/(\S+)/.exec(userAgent?.trim() ?? '');
   const version = token ? parseVersion(token[1]) : null;
-  if (!version || compareVersion(version, CODEX_DEFAULTS_FLOOR) < 0) return false;
+  if (!version || compareVersion(version, floor) < 0) return false;
   return !refused.some((range) => {
     const first = parseVersion(range.first);
     const last = range.last === undefined ? null : parseVersion(range.last);
@@ -2672,7 +2727,66 @@ export function readDefaultConfiguration(configuration: unknown): { config: Json
     if (value !== undefined && value !== null && typeof value !== 'string') return null;
     safe[key] = value;
   }
+  if ('service_tier' in config) safe.service_tier = safeTierValue(config.service_tier);
   return { config: safe };
+}
+
+// Retains a speed setting without other text from the reply. A value of another type stays visibly malformed.
+function safeTierValue(value: unknown): string | null | false {
+  return typeof value === 'string' || value === null ? value : false;
+}
+
+function safeTierRequirements(requirements: Json): Json {
+  const held = requirements.models;
+  if (held === undefined || held === null) return {};
+  const models = obj(held);
+  if (!models) return { models: false };
+  if (models.newThread === undefined || models.newThread === null) return {};
+  const newThread = obj(models.newThread);
+  if (!newThread) return { models: { newThread: false } };
+  return 'serviceTier' in newThread
+    ? { models: { newThread: { serviceTier: safeTierValue(newThread.serviceTier) } } }
+    : {};
+}
+
+function tierEvidence(value: unknown): ServiceTierEvidence {
+  if (value === undefined || value === null) return { status: 'absent' };
+  if (typeof value !== 'string') return { status: 'malformed' };
+  return isServiceTier(value) ? { status: 'known', tier: canonicalServiceTier(value) } : { status: 'unsupported' };
+}
+
+// Combines the configured speed with the managed default for new threads. Two different named speeds conflict.
+export function readServiceTierEvidence(configuration: unknown, policy: unknown): ServiceTierEvidence {
+  const config = obj(obj(configuration)?.config);
+  if (!config) return { status: 'malformed' };
+  const configured = tierEvidence(config.service_tier);
+  const requirements = obj(obj(policy)?.requirements);
+  const held = requirements?.models;
+  let managed: ServiceTierEvidence = { status: 'absent' };
+  if (held !== undefined && held !== null) {
+    const models = obj(held);
+    const newThread = models?.newThread;
+    if (!models) managed = { status: 'malformed' };
+    else if (newThread !== undefined && newThread !== null)
+      managed = obj(newThread) ? tierEvidence(obj(newThread)!.serviceTier) : { status: 'malformed' };
+  }
+  if (managed.status === 'absent') return configured;
+  if (configured.status === 'absent') return managed;
+  if (configured.status !== 'known') return configured;
+  if (managed.status !== 'known') return managed;
+  return configured.tier === managed.tier ? managed : { status: 'conflicting' };
+}
+
+// The canonical speeds a model-list entry offers. A present `serviceTiers` list takes precedence over the legacy
+// `additionalSpeedTiers` list. Legacy `fast` means `priority`. An entry with neither list reports nothing.
+function offeredServiceTiers(entry: Json): string[] | undefined {
+  const canonical = (id: string | null) => (id === 'fast' ? 'priority' : id);
+  const listed = Array.isArray(entry.serviceTiers)
+    ? entry.serviceTiers.map((item: unknown) => canonical(str(obj(item)?.id)))
+    : Array.isArray(entry.additionalSpeedTiers)
+      ? entry.additionalSpeedTiers.map((item: unknown) => canonical(str(item)))
+      : undefined;
+  return listed?.filter((id: string | null): id is string => Boolean(id));
 }
 
 export function readAppliedDefaults(

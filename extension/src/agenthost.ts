@@ -6,7 +6,7 @@ import {
   type LaunchPolicy,
 } from './launchpolicy';
 import { MEASUREMENT_ENVIRONMENT } from './identity';
-import { unavailableDefaults, type AppliedDefaults } from './view/model-picks';
+import { unavailableDefaults, type AppliedDefaults, type ServiceTierEvidence } from './view/model-picks';
 import { CONTEXT_FRAME_BYTES, CONTEXT_PREFIX_BYTES, type ContextFrameGate } from './contextframe';
 // Owns this window's agent children, stdout framing, session ownership, and shutdown.
 // Wire adapters handle each provider's protocol. Process operations use an injected spawner.
@@ -341,6 +341,11 @@ export interface Driver {
   // The provider's model catalog. The control read uses no model tokens.
   models?(): Promise<ModelList | null>;
   appliedDefaults?(): Promise<AppliedDefaults>;
+  // Reads the speed the next Codex turn uses when the session names none. The read starts no turn.
+  nextServiceTier?(): Promise<ServiceTierEvidence | null>;
+  // Checks a next-turn speed and leaves the driver unchanged. The returned function publishes the speed.
+  // A false answer means that the child cannot adopt it and must be replaced.
+  stageServiceTier?(tier: import('./launchpolicy').ServiceTier): Promise<() => boolean>;
   // Changes the session's permission mode. Claude applies a control request immediately.
   // Codex stores approval fields for the next prompt. Completion acknowledges the setting rather than a recorded turn.
   setAskMode?(mode: AskMode): Promise<void>;
@@ -771,6 +776,15 @@ export function codexPlan(
           await wire.setModel(model);
         },
         setEffort: (effort) => wire.setEffort(effort),
+        nextServiceTier: () => wire.nextServiceTier(),
+        stageServiceTier: async (tier) => {
+          const adopt = await wire.stageServiceTier(tier);
+          return () => {
+            const adopted = adopt();
+            if (adopted) options.serviceTier = tier;
+            return adopted;
+          };
+        },
         rename: (threadId, title) => wire.renameThread(threadId, title),
       };
     },
@@ -1827,6 +1841,15 @@ export class AgentSession {
 
   async models(): Promise<ModelList | null> {
     return this.driver.models ? await this.driver.models() : null;
+  }
+
+  async nextServiceTier(): Promise<ServiceTierEvidence | null> {
+    return this.driver.nextServiceTier ? await this.driver.nextServiceTier() : null;
+  }
+
+  async stageServiceTier(tier: import('./launchpolicy').ServiceTier): Promise<() => boolean> {
+    if (!this.driver.stageServiceTier) throw new Error('This agent has no speed control.');
+    return await this.driver.stageServiceTier(tier);
   }
 
   // How much this session's agent asks before it acts, from now on.

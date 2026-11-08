@@ -19,6 +19,8 @@ export interface ModelChoice {
   label: string;
   description: string;
   efforts: EffortChoice[];
+  // Canonical optional speeds the agent offers for this model. Missing means the agent did not say. Empty means none.
+  serviceTiers?: readonly string[];
 }
 
 // One entry of a model list that a CLI publishes: the value it takes, the model it resolves to,

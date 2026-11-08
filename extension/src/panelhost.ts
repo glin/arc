@@ -77,7 +77,12 @@ import {
   type SessionPageSource,
 } from './sessionreads';
 import { claudeRelationshipKey, selectedDependencies } from './selectedsource';
-import { LOADING_DEFAULTS, type AppliedDefaults, type DefaultContext } from './view/model-picks';
+import {
+  LOADING_DEFAULTS,
+  type AppliedDefaults,
+  type DefaultContext,
+  type ServiceTierEvidence,
+} from './view/model-picks';
 import type { ClaudeForwardCheckpoint } from './claudehistory';
 import * as vscode from 'vscode';
 import { costStateDependency, costStateIdentity, reconcileClaudeCostState } from './claudecoststate';
@@ -363,6 +368,15 @@ import {
   pathEntries,
   pickMenu,
   panelCommand,
+  fastRequest,
+  FAST_ARGUMENTS,
+  FAST_SAVE_FAILED,
+  FAST_UNRESOLVED,
+  fastModelChoice,
+  fastUnresolved,
+  tierOffered,
+  toggleFastSelection,
+  type FastToggleResult,
   renameRequest,
   REMOTE_CONTROL_ARGUMENTS,
   remoteControlLink,
@@ -1856,6 +1870,10 @@ export class PanelProvider implements vscode.Disposable {
   // Toggles Remote Control on the session's running Claude process. `observer` receives later results.
   // Every result comes with the session id the process holds when it arrives, which a Claude `/clear`
   // changes, or null when that process has exited or retired.
+  // Runs a typed Codex /fast for a session outside a draft. The extension owns the settings book and the running child.
+  public onFastToggle: ((session: string, cwd: string | null, model: string) => Promise<FastToggleResult>) | undefined;
+  // Reads a Codex speed setting without a session or turn.
+  public onReadFastEvidence: ((cwd: string | null, model: string) => Promise<ServiceTierEvidence | null>) | undefined;
   public onRemoteControl:
     | ((
         session: string,
@@ -2154,6 +2172,8 @@ export class PanelProvider implements vscode.Disposable {
   private boxText: Record<string, string> = {};
   // Pending typed rename revisions. A failed rename restores text only while that revision still owns the draft.
   private typedRenames = new Map<string, number>();
+  // Typed Fast toggles in progress, by session. Prompt admission waits for the count to reach zero.
+  private fastToggles = new Map<string, number>();
   // Pending prompt and compaction activity by session, ordered oldest first. `pressesAfter` reconciles it with recorded turns.
   private live: Record<string, LivePress[]> = {};
   // Compactions a live child runs on its own, by session, with their start time and active items. A Claude
@@ -5989,24 +6009,27 @@ export class PanelProvider implements vscode.Disposable {
       profile.model !== next.model ||
       profile.effort !== next.effort ||
       profile.permissionMode !== next.permissionMode;
-    this.newDrafts[session] = newSessionDraft(
-      draft.draftId,
-      draft.cwd,
-      draft.sourceSession,
-      draft.createdAt,
-      next,
-      draft.origin,
-      draft.handChanged || changed,
-    );
-    this.picks = withSessionSettings(
-      this.picks,
-      session,
-      sessionSettingsForProfile(
+    const tier = draft.serviceTier === undefined ? {} : { serviceTier: draft.serviceTier };
+    this.newDrafts[session] = {
+      ...newSessionDraft(
+        draft.draftId,
+        draft.cwd,
+        draft.sourceSession,
+        draft.createdAt,
+        next,
+        draft.origin,
+        draft.handChanged || changed,
+      ),
+      ...tier,
+    };
+    this.picks = withSessionSettings(this.picks, session, {
+      ...sessionSettingsForProfile(
         next,
         this.models[next.agent],
         this.defaultContext?.(next.agent, draft.cwd, next.model),
       ),
-    );
+      ...tier,
+    });
     if (changed) {
       this.onDraftProfileChanged?.(draft);
       delete this.mcpServers[session];
@@ -6878,6 +6901,7 @@ export class PanelProvider implements vscode.Disposable {
         this.enumeratedAmbiguousIds?.has(session) ||
         !state ||
         state.clearing ||
+        this.fastToggles?.has(session) ||
         this.clearSettlements.has(session) ||
         !binding.current() ||
         binding.agent !== state.agent ||
@@ -7199,7 +7223,7 @@ export class PanelProvider implements vscode.Disposable {
       }
       return;
     }
-    if (state.running || state.clearing || !state.queued.length) {
+    if (state.running || state.clearing || !state.queued.length || this.fastToggles?.has(session)) {
       return;
     }
     const [next, ...rest] = state.queued;
@@ -8033,6 +8057,22 @@ export class PanelProvider implements vscode.Disposable {
       this.holdDraft(state.sessionId, '');
       if (recoveryId) this.confirmPromptOwner(recoveryId, state.sessionId, true);
       void this.remoteControlFromComposer(state.sessionId);
+      return;
+    }
+    // Run a Codex Fast toggle outside prompt delivery, before staging, comments, questions, and queueing.
+    const fast = fastRequest(state.agent, text);
+    if (fast === 'arguments') {
+      void this.post({ type: 'restoreDraft', session: browserSession, text, revision, notice: FAST_ARGUMENTS });
+      return;
+    }
+    if (fast === 'toggle') {
+      this.holdDraft(state.sessionId, '');
+      if (recoveryId) this.confirmPromptOwner(recoveryId, state.sessionId, true);
+      void this.fastFromComposer(state, text, browserSession, revision);
+      return;
+    }
+    if (this.fastToggles?.has(state.sessionId)) {
+      void this.post({ type: 'restoreDraft', session: browserSession, text, revision, notice: sendRefusal('sending') });
       return;
     }
     if (this.assetHandoffs.has(state.sessionId)) {
@@ -9267,6 +9307,68 @@ export class PanelProvider implements vscode.Disposable {
       void this.post({ type: 'restoreDraft', session: browserSession, text, revision });
     }
     void vscode.window.showErrorMessage(`Arc: ${result.error}`);
+  }
+
+  // Runs a typed /fast. The browser cleared the line at Send, so only a refusal restores it, and only while the reader
+  // has not typed since.
+  private async fastFromComposer(state: ComposerState, text: string, source: string, revision: number): Promise<void> {
+    const session = state.sessionId;
+    if ((this.draftRevisions?.get(session) ?? 0) <= revision) this.typedRenames.set(session, revision);
+    this.fastToggles ??= new Map();
+    this.fastToggles.set(session, (this.fastToggles.get(session) ?? 0) + 1);
+    let result: FastToggleResult;
+    try {
+      result = await this.runFastToggle(state);
+    } catch {
+      result = { outcome: 'refused', notice: FAST_SAVE_FAILED };
+    } finally {
+      const remaining = (this.fastToggles.get(session) ?? 1) - 1;
+      if (remaining > 0) this.fastToggles.set(session, remaining);
+      else this.fastToggles.delete(session);
+    }
+    const untouched = this.typedRenames.get(session) === revision;
+    if (untouched) this.typedRenames.delete(session);
+    if (result.outcome === 'refused') {
+      if (untouched) {
+        this.holdDraft(session, text);
+        void this.post({ type: 'restoreDraft', session: source, text, revision, notice: result.notice });
+      } else {
+        void vscode.window.showInformationMessage(`Arc: ${result.notice}`);
+      }
+    }
+    this.flushQueue(session);
+  }
+
+  private async runFastToggle(state: ComposerState): Promise<FastToggleResult> {
+    const session = state.sessionId;
+    const delivering = this.readerDeliveries?.has(session) || this.assetHandoffs.has(session);
+    if (fastUnresolved(state) || delivering || this.queueHandoffInProgress(state))
+      return { outcome: 'refused', notice: FAST_UNRESOLVED };
+    const cwd = this.cwdForSession(state.agent, session);
+    const draft = this.newDrafts[session];
+    const model = state.settings.selectedModel || state.settings.confirmedModel || draft?.profile.model || '';
+    if (!draft) {
+      return this.onFastToggle
+        ? await this.onFastToggle(session, cwd, model)
+        : { outcome: 'refused', notice: FAST_UNRESOLVED };
+    }
+    // A draft has no child and no durable session. Its speed reaches the launch through the draft itself.
+    return await toggleFastSelection({
+      session,
+      read: () => this.picks,
+      commit: async (serviceTier) => {
+        this.newDrafts[session] = { ...this.newDrafts[session], serviceTier };
+        this.picks = withSessionSettings(this.picks, session, { ...sessionSettings(this.picks, session), serviceTier });
+        void this.post({ type: 'usage', usage: this.usagePayload() });
+      },
+      evidence: async () => (await this.onReadFastEvidence?.(cwd, model)) ?? null,
+      stage: async (tier) => {
+        if (tier !== 'default' && tierOffered(fastModelChoice(this.models[state.agent] ?? [], model), tier) === false)
+          throw new Error(`Codex does not offer service tier ${tier} for ${model || 'the selected model'}.`);
+        return null;
+      },
+      retire: async () => {},
+    });
   }
 
   // Observe confirmed Claude names at the final byte so later rename records supersede them. Codex names reload from the session index.

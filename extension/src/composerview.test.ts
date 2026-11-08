@@ -98,6 +98,11 @@ import {
   clearSubmission,
   renameRequest,
   remoteControlRequest,
+  fastRequest,
+  toggleFastSelection,
+  nextFastSelection,
+  fastUnresolved,
+  tierOffered,
   remoteControlLink,
   remoteControlNotice,
   clearAction,
@@ -9139,4 +9144,162 @@ test('interrupted reported models inherit no earlier speed', () => {
   });
   assert.equal(composerView(state)!.live[0].speed, undefined);
   assert.doesNotMatch(composerView(state)!.picks[0].detail, /Fast|Ultrafast/);
+});
+
+test('only a bare Codex /fast is the control, and other forms stay prompt text', () => {
+  for (const text of ['/fast', '  /FAST  ', '/Fast\n']) assert.equal(fastRequest('codex', text), 'toggle', text);
+  for (const text of ['/fast now', '/fast\nplease']) assert.equal(fastRequest('codex', text), 'arguments', text);
+  for (const text of [
+    '/faster',
+    '/fast/file',
+    '$fast',
+    'use /fast',
+    '`/fast`',
+    '"/fast"',
+    '\\/fast',
+    '```\n/fast\n```',
+  ])
+    assert.equal(fastRequest('codex', text), null, text);
+  assert.equal(fastRequest('claude', '/fast'), null);
+});
+
+test('/fast sends beside running work and open questions without answering them', () => {
+  const running = composerState({ agent: 'codex', draft: '/fast', onScreen: '/fast', running: true });
+  assert.equal(sendAction(running), 'send');
+  const asked = composerView(composerState({ agent: 'codex', draft: '/fast', onScreen: '/fast', asks: [QUESTION] }))!;
+  assert.equal(asked.sendOverAsk, '');
+  assert.doesNotMatch(asked.box.actionName ?? '', /answers the request/);
+});
+
+test('/fast toggles Standard and Fast both ways and takes Ultrafast through Fast', () => {
+  assert.equal(nextFastSelection('default'), 'priority');
+  assert.equal(nextFastSelection('priority'), 'default');
+  assert.equal(nextFastSelection('ultrafast'), 'priority');
+});
+
+function fastSteps(start: SessionSettingBook = {}) {
+  let book = start;
+  const log: string[] = [];
+  const steps = {
+    session: 'one',
+    read: () => book,
+    commit: async (tier: 'default' | 'priority' | 'ultrafast') => {
+      log.push(`commit ${tier}`);
+      book = { ...book, one: { ...EMPTY_SESSION_SETTINGS, ...book.one, serviceTier: tier } };
+    },
+    evidence: async () => {
+      log.push('read');
+      return { status: 'absent' } as const;
+    },
+    stage: async (tier: string) => {
+      log.push(`stage ${tier}`);
+      return () => {
+        log.push(`publish ${tier}`);
+        return true;
+      };
+    },
+    retire: async () => {
+      log.push('retire');
+    },
+  };
+  return { steps, log, book: () => book };
+}
+
+test('/fast validates, saves, then publishes, and two toggles restore the first selection', async () => {
+  const { steps, log, book } = fastSteps({ sibling: { ...EMPTY_SESSION_SETTINGS, serviceTier: 'ultrafast' } });
+  assert.deepEqual(await toggleFastSelection(steps), { outcome: 'changed', tier: 'priority' });
+  assert.deepEqual(log, ['read', 'stage priority', 'commit priority', 'publish priority']);
+  log.length = 0;
+  assert.deepEqual(await toggleFastSelection(steps), { outcome: 'changed', tier: 'default' });
+  assert.deepEqual(log, ['stage default', 'commit default', 'publish default']);
+  assert.equal(book().one.serviceTier, 'default');
+  assert.equal(book().sibling.serviceTier, 'ultrafast', 'a sibling session kept its speed');
+});
+
+test('/fast leaves the book and the child alone when the save fails', async () => {
+  const { steps, log, book } = fastSteps();
+  const outcome = await toggleFastSelection({
+    ...steps,
+    commit: async () => {
+      throw new Error('disk');
+    },
+  });
+  assert.equal(outcome.outcome, 'refused');
+  assert.deepEqual(log, ['read', 'stage priority']);
+  assert.deepEqual(book(), {});
+});
+
+test('/fast keeps the saved speed and retires a child that cannot adopt it', async () => {
+  const { steps, log, book } = fastSteps();
+  const outcome = await toggleFastSelection({ ...steps, stage: async () => () => false });
+  assert.deepEqual(outcome, { outcome: 'changed', tier: 'priority' });
+  assert.deepEqual(log, ['read', 'commit priority', 'retire']);
+  assert.equal(book().one.serviceTier, 'priority');
+});
+
+test.each(['malformed', 'conflicting', 'unsupported'] as const)(
+  '/fast refuses %s speed evidence without a saved change',
+  async (status) => {
+    const { steps, log } = fastSteps();
+    const outcome = await toggleFastSelection({ ...steps, evidence: async () => ({ status }) });
+    assert.equal(outcome.outcome, 'refused');
+    assert.deepEqual(log, []);
+  },
+);
+
+test('/fast refuses a failed reading and a refused model without a saved change', async () => {
+  const { steps, log, book } = fastSteps();
+  assert.equal((await toggleFastSelection({ ...steps, evidence: async () => null })).outcome, 'refused');
+  const noOffer = await toggleFastSelection({
+    ...steps,
+    stage: async () => {
+      throw new Error('Codex does not offer service tier priority for model-a.');
+    },
+  });
+  assert.deepEqual(noOffer, {
+    outcome: 'refused',
+    notice: 'Speed not changed. Codex does not offer service tier priority for model-a.',
+  });
+  assert.deepEqual(log, ['read']);
+  assert.deepEqual(book(), {});
+});
+
+test('/fast reads an explicit Standard and managed Fast as different selections', async () => {
+  const standard = fastSteps();
+  const fast = fastSteps();
+  const known = (tier: 'default' | 'priority') => async () => ({ status: 'known', tier }) as const;
+  assert.deepEqual(await toggleFastSelection({ ...standard.steps, evidence: known('default') }), {
+    outcome: 'changed',
+    tier: 'priority',
+  });
+  assert.deepEqual(await toggleFastSelection({ ...fast.steps, evidence: known('priority') }), {
+    outcome: 'changed',
+    tier: 'default',
+  });
+});
+
+test('a session in transition or with unresolved delivery refuses /fast', () => {
+  const entry = (phase: string) => ({ delivery: { phase } }) as unknown as ComposerState['queued'][number];
+  assert.equal(fastUnresolved(composerState({ agent: 'codex' })), false);
+  assert.equal(fastUnresolved(composerState({ agent: 'codex', queued: [entry('queued')] })), false);
+  assert.equal(fastUnresolved(composerState({ agent: 'codex', clearing: true })), true);
+  for (const phase of ['recovery', 'unknown', 'reset-in-flight', 'source-delivery'])
+    assert.equal(fastUnresolved(composerState({ agent: 'codex', queued: [entry(phase)] })), true, phase);
+});
+
+test('the /fast completion row follows the session model and the need to switch Fast off', () => {
+  const row = (serviceTiers: readonly string[] | undefined, tier?: 'priority' | 'default', agent = 'codex') => {
+    const models = [
+      { value: 'model-a', label: 'A', description: '', efforts: [], ...(serviceTiers ? { serviceTiers } : {}) },
+    ];
+    const state = composerState({ agent: agent as 'codex', models });
+    state.settings = { ...state.settings, selectedModel: 'model-a', ...(tier ? { serviceTier: tier } : {}) };
+    return composerView(state)!.commands.some((entry) => entry.command === 'fast');
+  };
+  assert.equal(row(['priority']), true);
+  assert.equal(row([]), false, 'an explicit empty list offers no Fast');
+  assert.equal(row(undefined), false, 'a missing list is unknown');
+  assert.equal(row([], 'priority'), true, 'switching Fast off stays available');
+  assert.equal(row(['priority'], undefined, 'claude'), false);
+  assert.equal(tierOffered(null, 'priority'), null);
 });

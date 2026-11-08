@@ -11,6 +11,7 @@ import {
   readModels,
   readAppliedDefaults,
   readDefaultConfiguration,
+  readServiceTierEvidence,
   codexDefaultsQualified,
   turnOutcome,
 } from './codexwire.ts';
@@ -4865,4 +4866,154 @@ test.each([
     );
   }
   h.wire.close('finished');
+});
+
+async function fastThread(
+  userAgent = 'codex_cli_rs/0.167.0',
+  answer: unknown = { thread: { id: THREAD }, model: 'model-a' },
+) {
+  const h = harness();
+  const opening = h.wire.initialize();
+  reply(h, { userAgent });
+  await opening;
+  const started = h.wire.startThread({ cwd: 'C:/ws', model: 'model-a' });
+  await vi.waitFor(() => assert.equal(h.parsed().at(-1).method, 'thread/start'));
+  reply(h, answer);
+  await started;
+  return h;
+}
+
+async function turn(h: ReturnType<typeof harness>, text: string): Promise<Record<string, unknown>> {
+  const sending = h.wire.prompt(text);
+  await vi.waitFor(() => assert.equal(h.parsed().at(-1).method, 'turn/start'));
+  const params = h.parsed().at(-1).params;
+  reply(h, { turn: { id: TURN } });
+  await sending;
+  h.wire.receive(TURN_COMPLETED);
+  return params;
+}
+
+test('a staged speed changes no turn until it is published, then reaches turn/start without command text', async () => {
+  const h = await fastThread();
+  const staging = h.wire.stageServiceTier('priority');
+  await vi.waitFor(() => assert.equal(h.parsed().at(-1).method, 'model/list'));
+  reply(h, { data: [{ id: 'model-a', serviceTiers: [{ id: 'priority' }] }] });
+  const adopt = await staging;
+  assert.equal((await turn(h, 'before')).serviceTier, undefined, 'staging changed the adapter');
+  assert.equal(adopt(), true);
+  const next = await turn(h, 'after');
+  assert.equal(next.serviceTier, 'priority');
+  assert.deepEqual(next.input, [{ type: 'text', text: 'after' }]);
+  const off = await h.wire.stageServiceTier('default');
+  assert.equal(off(), true);
+  assert.equal((await turn(h, 'off')).serviceTier, 'default', 'Standard travels as an explicit choice');
+  h.wire.close('test complete');
+});
+
+test('a bare /fast that reached the wire would be model text, so only the host can intercept it', async () => {
+  const h = await fastThread();
+  assert.deepEqual((await turn(h, '/fast')).input, [{ type: 'text', text: '/fast' }]);
+  h.wire.close('test complete');
+});
+
+test('a retired adapter cannot adopt a staged speed and refuses to send', async () => {
+  const h = await fastThread();
+  const adopt = await h.wire.stageServiceTier('default');
+  h.wire.close('retired');
+  assert.equal(adopt(), false);
+  await assert.rejects(h.wire.prompt('later'));
+});
+
+test('staging refuses an unsupported model and reports a catalog read failure honestly', async () => {
+  const h = await fastThread();
+  const unsupported = assert.rejects(h.wire.stageServiceTier('priority'), /does not offer service tier priority/);
+  await vi.waitFor(() => assert.equal(h.parsed().at(-1).method, 'model/list'));
+  reply(h, { data: [{ id: 'model-a', serviceTiers: [] }] });
+  await unsupported;
+  const failed = assert.rejects(h.wire.stageServiceTier('priority'), /did not report its models/);
+  await vi.waitFor(() => assert.equal(h.parsed().filter((m) => m.method === 'model/list').length, 2));
+  const last = h
+    .parsed()
+    .filter((m) => m.method === 'model/list')
+    .at(-1);
+  h.wire.receive(JSON.stringify({ id: last.id, error: { code: -32603, message: 'no catalog' } }));
+  await failed;
+  assert.equal((await turn(h, 'unchanged')).serviceTier, undefined);
+  h.wire.close('test complete');
+});
+
+test('a thread reply is applied speed evidence on a qualified server only', async () => {
+  const answer = { thread: { id: THREAD }, model: 'model-a', serviceTier: 'fast' };
+  const qualified = await fastThread('codex_cli_rs/0.167.0', answer);
+  const count = qualified.sent.length;
+  assert.deepEqual(await qualified.wire.nextServiceTier(), { status: 'known', tier: 'priority' });
+  assert.equal(qualified.sent.length, count, 'applied evidence needs no read');
+  qualified.wire.close('test complete');
+  const older = await fastThread('codex_cli_rs/0.166.0', answer);
+  const reading = older.wire.nextServiceTier();
+  await vi.waitFor(() => assert.ok(older.parsed().some((m) => m.method === 'configRequirements/read')));
+  for (const message of older
+    .parsed()
+    .filter((m) => ['config/read', 'configRequirements/read', 'model/list'].includes(m.method)))
+    older.wire.receive(
+      JSON.stringify({
+        id: message.id,
+        result:
+          message.method === 'config/read'
+            ? { config: { service_tier: 'priority' } }
+            : message.method === 'model/list'
+              ? { data: [{ id: 'model-a', model: 'model-a', isDefault: true }] }
+              : { requirements: null },
+      }),
+    );
+  assert.equal(await reading, null, 'the older version establishes no speed contract');
+  older.wire.close('test complete');
+});
+
+test('native speed settings stay distinct and retain managed defaults', () => {
+  const read = (config: unknown, requirements: unknown = null) =>
+    readServiceTierEvidence({ config: config as object }, { requirements });
+  assert.deepEqual(read({}), { status: 'absent' });
+  assert.deepEqual(read({ service_tier: null }), { status: 'absent' });
+  assert.deepEqual(read({ service_tier: 'default' }), { status: 'known', tier: 'default' });
+  assert.deepEqual(read({ service_tier: 'fast' }), { status: 'known', tier: 'priority' });
+  assert.deepEqual(read({ service_tier: 7 }), { status: 'malformed' });
+  assert.deepEqual(read({ service_tier: 'flex' }), { status: 'unsupported' });
+  const managed = (serviceTier: unknown) => ({ models: { newThread: { serviceTier } } });
+  assert.deepEqual(read({}, managed('priority')), { status: 'known', tier: 'priority' });
+  assert.deepEqual(read({ service_tier: 'priority' }, managed('fast')), { status: 'known', tier: 'priority' });
+  assert.deepEqual(read({ service_tier: 'default' }, managed('priority')), { status: 'conflicting' });
+  assert.deepEqual(read({}, managed(1)), { status: 'malformed' });
+  assert.deepEqual(read({}, { models: 'bad' }), { status: 'malformed' });
+  assert.deepEqual(readDefaultConfiguration({ config: { model: 'm', service_tier: 3 } }), {
+    config: { model: 'm', service_tier: false },
+  });
+});
+
+test('model capabilities keep serviceTiers precedence, legacy aliases, and unknown catalogs', () => {
+  const read = (extra: object) => readModels({ data: [{ id: 'm', ...extra }] }, 0)!.models[0].serviceTiers;
+  assert.deepEqual(read({ serviceTiers: [{ id: 'priority' }, { id: 'ultrafast' }] }), ['priority', 'ultrafast']);
+  assert.deepEqual(read({ serviceTiers: [], additionalSpeedTiers: ['fast'] }), []);
+  assert.deepEqual(read({ additionalSpeedTiers: ['fast'] }), ['priority']);
+  assert.equal(read({}), undefined);
+});
+
+test('explicit $fast still attaches a native skill named fast', async () => {
+  const h = harness();
+  const opening = h.wire.initialize();
+  reply(h, { userAgent: 'codex_cli_rs/0.167.0' });
+  await opening;
+  const listing = h.wire.commands();
+  await vi.waitFor(() => assert.equal(h.parsed().at(-1).method, 'skills/list'));
+  reply(h, { data: [{ cwd: 'C:\\ws', skills: [{ name: 'fast', path: 'C:/skills/fast/SKILL.md', enabled: true }] }] });
+  await listing;
+  const started = h.wire.startThread({ cwd: 'C:/ws' });
+  await vi.waitFor(() => assert.equal(h.parsed().at(-1).method, 'thread/start'));
+  reply(h, { thread: { id: THREAD } });
+  await started;
+  assert.deepEqual((await turn(h, '$fast go')).input, [
+    { type: 'text', text: '$fast go' },
+    { type: 'skill', name: 'fast', path: 'C:/skills/fast/SKILL.md' },
+  ]);
+  h.wire.close('test complete');
 });

@@ -246,6 +246,18 @@ export function remoteControlRequest(agent: string, text: string): 'toggle' | 'a
   return matched[0].length === trimmed.length ? 'toggle' : 'arguments';
 }
 
+// Codex `/fast` turns Fast on or off for the session's next turns. `toggle` is the bare command, ignoring case and
+// surrounding whitespace. `arguments` is any other text after the name, including a line break, and the host refuses it.
+// Paths such as `/fast/file` and longer names such as `/faster` stay prompt text. Claude answers null. The native `$fast`
+// skill form never matches.
+export function fastRequest(agent: string, text: string): 'toggle' | 'arguments' | null {
+  const trimmed = text.trim();
+  if (agent !== 'codex') return null;
+  const matched = /^\/fast(?=\s|$)/i.exec(trimmed);
+  if (!matched) return null;
+  return matched[0].length === trimmed.length ? 'toggle' : 'arguments';
+}
+
 export function promptToken(agent: string, text: string, caret: number): PromptToken | null {
   const at = Math.max(0, Math.min(caret, text.length));
   let start = at;

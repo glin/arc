@@ -2632,6 +2632,7 @@ import {
   clearSubmission,
   compactSubmission,
   renameRequest,
+  fastRequest,
   remoteControlRequest,
   remoteControlLink,
   REMOTE_CONTROL_ARGUMENTS,
@@ -20285,6 +20286,7 @@ test('rejected sends and queued edits reply to the retained browser identity', a
   const sendPrompt = new Function(
     'vscode',
     'renameRequest',
+    'fastRequest',
     'remoteControlRequest',
     `return function (text, session, revision, browserSession = session, captured, capturedAssets, capturedDraft, recoveryId) {\n${methodBody('private sendPrompt(')}\n};`,
   )(
@@ -20294,6 +20296,7 @@ test('rejected sends and queued edits reply to the retained browser identity', a
       },
     },
     renameRequest,
+    fastRequest,
     remoteControlRequest,
   );
   const rejected = {
@@ -45538,4 +45541,66 @@ test('native link opening consumes only the invoking panel token and exact typed
   } finally {
     vi.useRealTimers();
   }
+});
+
+function typedFastProvider(toggle: () => Promise<Record<string, unknown>>) {
+  const typed = typedRenameProvider('codex');
+  const calls: string[] = [];
+  Object.assign(typed.provider, {
+    onFastToggle: async (session: string) => {
+      calls.push(session);
+      return await toggle();
+    },
+  });
+  typed.provider.drafts[typed.session] = '/fast';
+  return { ...typed, calls, restored: () => typed.posted.filter((message) => message.type === 'restoreDraft') };
+}
+
+test('a typed /fast changes the session speed, runs no model turn, and clears only its text', async () => {
+  const { provider, session, sent, calls, restored } = typedFastProvider(async () => ({
+    outcome: 'changed',
+    tier: 'priority',
+  }));
+  provider.sendPrompt('  /FAST  ', session, 1);
+  await vi.waitFor(() => assert.deepEqual(calls, [session]));
+  await vi.waitFor(() => assert.equal(provider.fastToggles.has(session), false));
+  assert.deepEqual(sent, [], 'the typed /fast went to the model as a prompt');
+  assert.equal(provider.drafts[session], '');
+  assert.deepEqual(restored(), []);
+});
+
+test('a refused /fast restores its text with the reason and sends nothing', async () => {
+  const notice = 'Speed not changed. Codex settings name different speeds for this session.';
+  const { provider, session, sent, restored } = typedFastProvider(async () => ({ outcome: 'refused', notice }));
+  provider.sendPrompt('/fast', session, 1);
+  await vi.waitFor(() => assert.equal(restored().length, 1));
+  assert.deepEqual(sent, []);
+  assert.equal(restored()[0].text, '/fast');
+  assert.equal(restored()[0].notice, notice);
+  assert.equal(provider.drafts[session], '/fast');
+});
+
+test('/fast with arguments shows its usage and calls no control', async () => {
+  const { provider, session, sent, calls, restored } = typedFastProvider(async () => ({
+    outcome: 'changed',
+    tier: 'priority',
+  }));
+  provider.sendPrompt('/fast now', session, 1);
+  await vi.waitFor(() => assert.equal(restored().length, 1));
+  assert.match(String(restored()[0].notice), /by itself/);
+  assert.deepEqual(calls, []);
+  assert.deepEqual(sent, []);
+});
+
+test('a prompt sent during a /fast change stays out of delivery', async () => {
+  let finish: (value: Record<string, unknown>) => void = () => {};
+  const { provider, session, sent, restored } = typedFastProvider(() => new Promise((resolve) => (finish = resolve)));
+  provider.sendPrompt('/fast', session, 1);
+  await vi.waitFor(() => assert.equal(provider.fastToggles.has(session), true));
+  provider.sendPrompt('Ship it', session, 2);
+  await vi.waitFor(() => assert.equal(restored().length, 1));
+  assert.deepEqual(sent, []);
+  assert.equal(restored()[0].text, 'Ship it');
+  finish({ outcome: 'changed', tier: 'priority' });
+  await vi.waitFor(() => assert.equal(provider.fastToggles.has(session), false));
 });

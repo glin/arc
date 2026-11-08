@@ -34,6 +34,8 @@ Draft setup comes only from its profile, ignoring session picks and per-agent pe
 
 An explicit programmatic service tier belongs to its launched session in the saved session-settings store. Reload, model and permission changes, child replacement, resume, clear, and fork retain it. Omitted selections remain absent. Independent sessions inherit no sibling tier.
 
+A typed Codex [`/fast`](prompt-delivery.md#local-controls) stores its selection in the same store. A draft holds it until adoption and starts no session. The command changes `priority` to an explicit `default`, and it changes Standard and Ultrafast to `priority`. Model and effort stay unchanged. Without a saved selection, the command reads the child's applied speed, then Codex settings through a control read. An absent speed reads as Standard. A malformed, conflicting, or unsupported reading, or a failed read, refuses with no saved change. A later model without Fast refuses delivery until the reader selects Standard or a supported model.
+
 ## MCP controls
 
 Opening Servers reuses a running Claude draft child through pending server startup and first-prompt delivery. Drafts and recorded sessions keep separate readings.

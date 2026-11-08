@@ -9,7 +9,16 @@ export interface AppliedDefaults {
   effort: string | null;
   effortStatus?: 'unavailable';
   reason: string;
+  // Present only when the agent's settings reply qualifies as speed evidence.
+  serviceTier?: ServiceTierEvidence;
 }
+
+// The speed an agent's own settings report for a session that names none. `absent` is no named speed.
+// `known` with `default` is an explicit Standard. Other statuses establish no speed.
+export type ServiceTierEvidence =
+  | { status: 'absent' }
+  | { status: 'known'; tier: 'default' | 'priority' | 'ultrafast' }
+  | { status: 'malformed' | 'conflicting' | 'unsupported' };
 
 export interface DefaultContext {
   revision?: number;

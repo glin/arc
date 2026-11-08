@@ -46,6 +46,12 @@ test('the send press checks sendWaitsForStaging before it posts sendPrompt', () 
   );
 });
 
+test('a Codex /fast sends while a file stages', () => {
+  assert.equal(sendWaitsForStaging('codex', ' /FAST ', true), false);
+  assert.equal(sendWaitsForStaging('codex', 'use /fast', true), true);
+  assert.equal(sendWaitsForStaging('claude', '/fast', true), true);
+});
+
 test('a Claude Remote Control toggle sends while a file stages', () => {
   assert.equal(sendWaitsForStaging('claude', '/rc', true), false);
   assert.equal(sendWaitsForStaging('claude', '/remote-control', true), false);

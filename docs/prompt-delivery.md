@@ -52,6 +52,10 @@ Continuation handoffs move submissions to the new session. Queued handoff failur
 
 Remote Control refuses trailing text, including newlines. Fresh refusal restores the line. Queued refusal retains the entry and blocks later entries until Edit or Drop. Queued toggles return comments and files to the prompt box. Files that do not fit leave the entry queued and block later entries.
 
+A bare Codex `/fast`, ignoring case and surrounding whitespace, turns Fast on or off for the session's next turns. [`domain/composer-editing.ts`](../extension/src/domain/composer-editing.ts) shares its recognition between browser and host. Text after the name refuses with usage. Embedded, quoted, escaped, fenced, and partial forms remain ordinary input. Claude sessions keep their own commands.
+
+The `/fast` control bypasses running work, staging, open requests, comment claims, and the queue, and clears only its own text. A refusal restores the text and shows the reason in the prompt box notice. It refuses during a session transition, a queue handoff, or an unresolved delivery. A running turn keeps its captured settings, and a queued prompt takes the setting current at admission. While the change runs, Send returns to the prompt box and the queue waits.
+
 [`composerview.ts`](../extension/src/composerview.ts)'s `remoteControlLink` admits only HTTPS links without whitespace or Markdown link delimiters. Notifications percent-encode square brackets in rejected URLs because VS Code ignores Markdown escapes. [Remote Control](agent-protocols.md#claude-remote-control) owns eligibility refusals.
 
 ## Delivery and recovery contracts

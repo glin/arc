@@ -7,7 +7,7 @@ import { payloadSha256, requesterOf } from './sessionwrites';
 import { MEASUREMENT_ENVIRONMENT } from './identity';
 import { askIdleDefaults } from './agenthost';
 import type { HostedSessionObservation } from './sessionreads';
-import { unavailableDefaults, type AppliedDefaults } from './view/model-picks';
+import { unavailableDefaults, type AppliedDefaults, type ServiceTierEvidence } from './view/model-picks';
 import * as vscode from 'vscode';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -98,6 +98,10 @@ import {
   failedCompactionDelivery,
   failedClearDelivery,
   acceptedSessionSettings,
+  fastModelChoice,
+  type SessionSettingSelection,
+  tierOffered,
+  toggleFastSelection,
   acceptedPermissionMode,
   SessionSettingBook,
   sessionSettings,
@@ -952,8 +956,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const settingBook = (): SessionSettingBook => currentSettingBook;
   const persistSettingBook = (book: SessionSettingBook): Promise<void> => {
     currentSettingBook = book;
-    return sessionSettingsWrites.write(() => context.workspaceState.update(SESSION_SETTINGS_KEY, book));
+    return sessionSettingsWrites.write(() => context.workspaceState.update(SESSION_SETTINGS_KEY, currentSettingBook));
   };
+  // Writes before publishing, for a change that the running child must see only after it is durable.
+  const commitSessionSetting = (session: string, fields: Partial<SessionSettingSelection>): Promise<void> =>
+    sessionSettingsWrites.write(async () => {
+      const next = withSessionSettings(currentSettingBook, session, {
+        ...sessionSettings(currentSettingBook, session),
+        ...fields,
+      });
+      await context.workspaceState.update(SESSION_SETTINGS_KEY, next);
+      currentSettingBook = next;
+    });
   const persistSessionSettings = (session: string, settings: ReturnType<typeof sessionSettings>): Promise<void> =>
     persistSettingBook(withSessionSettings(settingBook(), session, settings));
   function askModeFor(agent: string, session?: string): AskMode | undefined {
@@ -2134,15 +2148,71 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     activeMcpOwner = null;
   };
 
+  // Reads a Codex speed setting for a session without a running child. The child starts no thread or turn.
+  const readIdleFastEvidence = async (cwd: string | null, model: string): Promise<ServiceTierEvidence | null> => {
+    if (!cwd) return null;
+    const launch = codexLaunch(readSetting('codexPath'), thisMachine());
+    if (launch.problem) return null;
+    return (
+      (await askIdleDefaults(codexIdlePlan(launch, { cwd, model, clientInfo: CLIENT_INFO }), spawner)).serviceTier ??
+      null
+    );
+  };
+
+  // One settings change runs at a time for each session, so a speed toggle and a model pick cannot interleave.
+  const settingTurns = new Map<string, Promise<unknown>>();
+  const inSettingTurn = <T>(session: string, work: () => Promise<T>): Promise<T> => {
+    const turn = (settingTurns.get(session) ?? Promise.resolve()).catch(() => {}).then(work);
+    settingTurns.set(session, turn);
+    void turn
+      .catch(() => {})
+      .finally(() => {
+        if (settingTurns.get(session) === turn) settingTurns.delete(session);
+      });
+    return turn;
+  };
+
+  panel.onReadFastEvidence = readIdleFastEvidence;
+  panel.onFastToggle = (session, cwd, model) =>
+    inSettingTurn(session, async () => {
+      const child = () => host.find('codex', session);
+      const result = await toggleFastSelection({
+        session,
+        read: settingBook,
+        commit: (serviceTier) => commitSessionSetting(session, { serviceTier }),
+        evidence: async () => {
+          const live = child();
+          const applied = live ? await host.withActivity(live.key, (active) => active.nextServiceTier()) : null;
+          return applied ?? (await readIdleFastEvidence(cwd, model));
+        },
+        stage: async (tier) => {
+          const live = child();
+          if (live) return await host.withActivity(live.key, (active) => active.stageServiceTier(tier));
+          if (
+            tier !== 'default' &&
+            tierOffered(fastModelChoice(models.get('codex')?.models ?? [], model), tier) === false
+          )
+            throw new Error(`Codex does not offer service tier ${tier} for ${model || 'the selected model'}.`);
+          return null;
+        },
+        retire: async () => {
+          const live = child();
+          if (live) await host.retireSession(live.key);
+        },
+      });
+      if (result.outcome === 'changed') publishPicks();
+      return result;
+    });
+
   panel.onPicked = (agent, session, control, value, settledModel, cwd) =>
     reportFailures(async () => {
       const which = agent as AgentName;
       if (control === 'askmode') {
         await acceptedAskModePick(which, value, (mode) => setAskModeFor(which, mode, session));
       } else if (control === 'model') {
-        await setModelFor(which, session, value);
+        await inSettingTurn(session, () => setModelFor(which, session, value));
       } else if (control === 'effort') {
-        await setEffortFor(which, session, value, settledModel);
+        await inSettingTurn(session, () => setEffortFor(which, session, value, settledModel));
       } else if (control === 'mcp') {
         await setMcpFor(which, session, cwd, value);
       }
