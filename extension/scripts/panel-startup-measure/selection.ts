@@ -442,8 +442,8 @@ export function instrumentSelection(tree: string): void {
   for (const [needle, mark] of stages) patch('panelhost.ts', needle, `${mark}\n${needle}`);
   patch(
     'panelhost.ts',
-    "      this.performanceCounters.recordRefresh('catalog-enumeration', performance.now() - catalogStarted);",
-    `      this.performanceCounters.recordRefresh('catalog-enumeration', performance.now() - catalogStarted);
+    "      this.performanceCounters.recordRefresh('catalog-enumeration', enumerationMs);",
+    `      this.performanceCounters.recordRefresh('catalog-enumeration', enumerationMs);
       __arcStage('prompts', {candidates: admissionCandidates.length, admitted: all.length});`,
   );
   patch(
