@@ -189,6 +189,11 @@
     "cases": 33,
     "matricesSha256": "167137d07d8b4d7abdd63617503497e6a3c0345fc8fe454a7332272f3e6b517d"
   },
+  "extension/src/startup.budget.test.ts": {
+    "reason": "A session list script must stay within its recorded read, walk and post counts through a real panel host and a real discovery worker across a cold start, a warm start, watcher events and polls.",
+    "cases": 1,
+    "matricesSha256": "b85fa3b4d526ebf4b7ab054055b4f89e1838628af0a8bdb24e0a96a1d362aa50"
+  },
   "extension/src/startup.browser.test.ts": {
     "reason": "Startup and restored panel rendering must preserve usable browser state and focus.",
     "cases": 9,
