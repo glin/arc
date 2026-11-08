@@ -84,7 +84,7 @@ import {
   codexSpendIndex,
   readCodexSessionMeta,
 } from './codex';
-import { CodexOpeningsWriter, loadCodexOpenings } from './codexopenings';
+import { CODEX_META_VERSION, CodexOpeningsWriter, codexOpeningsAtStartup, loadCodexOpenings } from './codexopenings';
 import { tempDir } from './temproot.ts';
 import { claudeBackgroundHint, claudeBackgroundTranscript } from './agenthost';
 import { buildSync, transformSync } from 'esbuild';
@@ -9176,6 +9176,25 @@ test('a warm start lists its saved openings before the cold pass completes', asy
   await vi.waitFor(() => assert.ok(provider.codexPriming === null && settled()));
   assert.ok(stages.indexOf('coldPassEnumerated') < stages.indexOf('coldPassPrimed'));
   assert.ok(stages.indexOf('openingsEnumerated') < stages.indexOf('coldPassEnumerated'));
+});
+
+test('a start with only the machine-wide openings file lists before its cold pass completes', async () => {
+  const { provider, release, writeRollout, files, settled } = warmStartHarness();
+  provider.railPaintArrived = true;
+  const file = writeRollout('machine-wide');
+  const shared = path.join(tempDir('machine-wide-openings-'), 'codex-openings.json');
+  fs.writeFileSync(
+    shared,
+    JSON.stringify({ codexMetaVersion: CODEX_META_VERSION, codexMetas: [{ file, meta: readCodexSessionMeta(file) }] }),
+  );
+  const openings = codexOpeningsAtStartup(shared, undefined);
+  provider.codexMetas.load(openings.rows);
+  provider.savedCodexOpeningFiles = [...provider.codexMetas.keys()];
+  await provider.refresh(true);
+  assert.deepEqual(files(), [file], 'a start with machine-wide openings waited for the pass');
+  assert.equal(settled(), false);
+  release();
+  await vi.waitFor(() => assert.ok(settled()));
 });
 
 test('a cold start waits for its cold pass before it lists', async () => {
