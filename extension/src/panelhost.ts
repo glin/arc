@@ -15536,6 +15536,11 @@ export class PanelProvider implements vscode.Disposable {
           }
         } else if (this.history.get(sessionId) === history) {
           const pages = updated.value.pages.slice(0, history.pages.length);
+          // A reply that returns the drawn pages and the drawn window changes no card.
+          roundTrip =
+            !isDeepStrictEqual(pages, history.pages) ||
+            (window !== undefined &&
+              !isDeepStrictEqual(updated.value.pages[history.pages.length]?.turns, window.read.turns));
           this.history.set(sessionId, { ...history, pages });
           // Key the accepted pages with the captured child revisions, rather than the pages sent to the worker.
           this.historyStructuralKeys.set(
@@ -15556,8 +15561,13 @@ export class PanelProvider implements vscode.Disposable {
       if (cached && this.progressiveCurrent(session)) {
         cached.usedAt = Date.now();
         if (cached.agentKey !== this.agentSpendKey(session, cached.read)) {
-          roundTrip = true;
+          const drawnTurns = cached.read.turns;
+          const drawnPages = this.history.get(sessionId)?.pages;
           await this.refreshAgentFacts(session, cached, generation, controller.signal);
+          // Refreshed facts that leave the turns as drawn change no card, so the selection needs no second post.
+          roundTrip ||=
+            !isDeepStrictEqual(cached.read.turns, drawnTurns) ||
+            !isDeepStrictEqual(this.history.get(sessionId)?.pages, drawnPages);
           // Recheck the parent after child-spend refresh. A parent append requires a new selected window.
           const refreshed = this.currentSelectedSession(work);
           if (!refreshed) {

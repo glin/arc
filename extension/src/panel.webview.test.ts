@@ -8311,6 +8311,32 @@ function selectCommitSession(provider: any, session: any, turns: any[]) {
   return drawn;
 }
 
+// The selection posts first. The `selected-window` pass this counts adds the second post.
+test.each([
+  ['stays current', false, 0],
+  ['changes', true, 1],
+] as const)('a selection whose retained window %s posts again only for a change', async (_name, changes, seconds) => {
+  const { provider, sessions } = commitAllowanceHost(1);
+  const { session } = sessions[0];
+  const turns = [turn({ commits: [] })];
+  const drawn = selectCommitSession(provider, session, turns);
+  provider.agentSpendKey = () => 'moved';
+  provider.progressiveInput = () => ({});
+  provider.progressiveWorker = {
+    run: async (_request: any, generation: number) => ({
+      generation,
+      revision: provider.revisionOf(session),
+      value: {
+        kind: 'retained',
+        pages: [{ turns: changes ? [{ ...turns[0], text: 'changed' }] : turns, compactions: [], bytes: 0 }],
+      },
+    }),
+  };
+  await provider.completeSelectedWindow(session.sessionId, 1);
+  await vi.waitFor(() => assert.equal(provider.selectionWork, null));
+  assert.equal(drawn.refreshes, seconds, 'the selected-window pass ran for the wrong kind of window');
+});
+
 test('an unchanged pending commit reply does not redraw the selected session', async () => {
   const { provider, parent, sessions, reply, resolve } = commitAllowanceHost(1);
   const drawn = selectCommitSession(provider, sessions[0].session, sessions[0].turns);
