@@ -15,40 +15,83 @@ export const PANEL_USAGE_VERSION = 1;
 export const USAGE_WRITE_MS = 60_000;
 // A file keeps this many distinct queries. Further queries add to `other`.
 export const USAGE_QUERY_LIMIT = 200;
+// A file keeps this many distinct count keys. The host drops a new key past this limit, and existing keys keep counting.
+export const USAGE_KEY_LIMIT = 500;
 // Day folders more than this many local days old are deleted.
 export const USAGE_RETENTION_DAYS = 90;
 
-// Message types the panel posts on a timer, a redraw, a resize, a reply, a keystroke, or ahead of a
-// reader action. Every other accepted message counts as `msg:<type>`.
-export const UNCOUNTED_MESSAGES: ReadonlySet<PanelToHost['type']> = new Set<PanelToHost['type']>([
-  'health',
-  'panelUsageMetrics',
-  'saveState',
-  'ready',
-  'painted',
-  'rowsGap',
-  'initialize',
-  'developmentReload',
-  'perf',
-  'readerRead',
-  'sessionFilterApplied',
-  'contextDetail',
-  'requestDefaults',
-  'draft',
-  'pathCompletion',
-  'search',
-  'loadOlder',
-  'importPromptRecovery',
-  'acceptQueuedEdit',
-  'fileReadError',
-  'fileRejected',
-  'beginFileStaging',
-  'armSelectedText',
-  'selectedTextHandoff',
-  'armLinkMenu',
-  'armSessionDetails',
-  'armComposer',
-]);
+// Whether each message type counts as `msg:<type>` once the host accepts it. A type marked false is one the panel
+// posts by itself. A timer, a redraw, a resize, a reply, or a keystroke posts it, or it precedes a reader action.
+// The compiler refuses a message type this map omits.
+const MESSAGE_COUNTED: Record<PanelToHost['type'], boolean> = {
+  refresh: true,
+  goBack: true,
+  goForward: true,
+  newSession: true,
+  pinSetup: true,
+  unpinSetup: true,
+  refreshUsage: true,
+  openControl: true,
+  pick: true,
+  answerAsk: true,
+  dropUris: true,
+  attachFiles: true,
+  removeFile: true,
+  sendPrompt: true,
+  compact: true,
+  dismissLive: true,
+  restoreLive: true,
+  stopTurn: true,
+  dequeue: true,
+  editQueued: true,
+  copy: true,
+  note: true,
+  showReaderParent: true,
+  showSession: true,
+  labelEditor: true,
+  setLabels: true,
+  setViews: true,
+  renameSession: true,
+  setRailFilters: true,
+  sessionMembership: true,
+  setLayout: true,
+  exportSession: true,
+  openLink: true,
+  openDirectory: true,
+  openVisualization: true,
+  openImage: true,
+  openTurnDiff: true,
+  openCommit: true,
+  openFile: true,
+  openSkill: true,
+  health: false,
+  panelUsageMetrics: false,
+  saveState: false,
+  ready: false,
+  painted: false,
+  rowsGap: false,
+  initialize: false,
+  developmentReload: false,
+  perf: false,
+  readerRead: false,
+  sessionFilterApplied: false,
+  contextDetail: false,
+  requestDefaults: false,
+  draft: false,
+  pathCompletion: false,
+  search: false,
+  loadOlder: false,
+  importPromptRecovery: false,
+  acceptQueuedEdit: false,
+  fileReadError: false,
+  fileRejected: false,
+  beginFileStaging: false,
+  armSelectedText: false,
+  selectedTextHandoff: false,
+  armLinkMenu: false,
+  armSessionDetails: false,
+  armComposer: false,
+};
 
 export interface PanelUsageMetricsFile {
   v: typeof PANEL_USAGE_VERSION;
@@ -119,6 +162,8 @@ export class PanelUsageMetrics {
   // Serialized bodies waiting for a successful write, by day. A rollover can leave two.
   private readonly pending = new Map<string, string>();
   private writing: Promise<void> = Promise.resolve();
+  // The flush that waits in the queue and has not started its write.
+  private queuedFlush: Promise<void> | undefined;
   private temporaryFiles = 0;
   private listPublished = false;
   private nextExpiryAt = 0;
@@ -139,14 +184,14 @@ export class PanelUsageMetrics {
     try {
       if (this.disposed) return;
       this.rollDay(this.now());
-      this.counts.set(key, (this.counts.get(key) ?? 0) + 1);
-      this.changed();
+      if (this.addCount(key, 1)) this.changed();
     } catch {
       /* Counting never interrupts the action it counts. */
     }
   }
 
   // Counts one accepted panel message by its type. The message's other fields never reach the file.
+  // A label editor refresh follows a host change to the labels, so no reader action started it.
   // The first session list paint turns expiry on, so expiry never runs on the activation path.
   message(message: PanelToHost): void {
     if (message.type === 'painted' && message.stage === 'railReady') {
@@ -154,7 +199,8 @@ export class PanelUsageMetrics {
       void this.expireDue();
       return;
     }
-    if (!UNCOUNTED_MESSAGES.has(message.type)) this.count(`msg:${message.type}`);
+    if (message.type === 'labelEditor' && message.refresh) return;
+    if (MESSAGE_COUNTED[message.type]) this.count(`msg:${message.type}`);
   }
 
   // Adds the counts one panel page posted and its committed queries in commit order. All tabs of a
@@ -165,8 +211,7 @@ export class PanelUsageMetrics {
       this.rollDay(this.now());
       let added = false;
       for (const [key, value] of Object.entries(counts)) {
-        this.counts.set(key, (this.counts.get(key) ?? 0) + value);
-        added = true;
+        added = this.addCount(key, value) || added;
       }
       for (const query of queries) {
         if (query === this.lastQuery) continue;
@@ -197,12 +242,22 @@ export class PanelUsageMetrics {
     return path.join(this.directory, day, `${this.windowId}.json`);
   }
 
-  // Writes now when a count changed. Resolves after the write settles. A failed write keeps the counts
-  // for the next try. A write after the first session list paint also runs the day's expiry.
+  // Writes now when a count changed. Resolves after the write settles. A failed write keeps the counts,
+  // and a timer tries again while the `panel-usage` folder exists. A write after the first session list
+  // paint also runs the day's expiry.
   flush(): Promise<void> {
     this.clearTimer();
     this.capture();
-    this.writing = this.writing.then(() => this.writePending()).then(() => this.expireAfterWrite());
+    // A queued write reads the pending bodies when it starts, so it carries this capture too.
+    if (this.queuedFlush) return this.queuedFlush;
+    this.queuedFlush = this.writing
+      .then(() => {
+        this.queuedFlush = undefined;
+        return this.writePending();
+      })
+      .then(() => this.retryPending())
+      .then(() => this.expireAfterWrite());
+    this.writing = this.queuedFlush;
     return this.writing;
   }
 
@@ -236,6 +291,11 @@ export class PanelUsageMetrics {
         this.pending.delete(day);
       } catch {
         /* A failed write shows the reader nothing. */
+        try {
+          fs.rmSync(temporary, { force: true });
+        } catch {
+          /* Disposal continues with the other days. */
+        }
       }
     }
   }
@@ -247,6 +307,11 @@ export class PanelUsageMetrics {
 
   private changed(): void {
     this.dirty = true;
+    this.schedule();
+  }
+
+  // A new count, or a failed write, arms the same timer, so retries keep to the write interval.
+  private schedule(): void {
     if (this.timer !== undefined) return;
     const wait = Math.max(0, this.lastWriteAt + USAGE_WRITE_MS - this.now());
     this.timer = setTimeout(() => {
@@ -254,6 +319,13 @@ export class PanelUsageMetrics {
       void this.flush();
     }, wait);
     (this.timer as { unref?: () => void }).unref?.();
+  }
+
+  private addCount(key: string, value: number): boolean {
+    const held = this.counts.get(key);
+    if (held === undefined && this.counts.size >= USAGE_KEY_LIMIT) return false;
+    this.counts.set(key, (held ?? 0) + value);
+    return true;
   }
 
   private clearTimer(): void {
@@ -283,16 +355,17 @@ export class PanelUsageMetrics {
   // Moves the changed counts into the pending writes.
   private capture(): void {
     const now = this.now();
-    const hadChange = this.dirty;
     this.rollDay(now);
     if (this.dirty) {
       this.pending.set(this.day, JSON.stringify(this.snapshot()));
       this.dirty = false;
     }
-    if (hadChange) this.lastWriteAt = now;
+    // A count that arrives while this write waits in the queue keeps to the write interval.
+    if (this.pending.size > 0) this.lastWriteAt = now;
   }
 
   private async writePending(): Promise<void> {
+    if (this.pending.size === 0) return;
     for (const [day, body] of [...this.pending]) {
       if (this.disposed) return;
       const file = this.fileFor(day);
@@ -309,9 +382,27 @@ export class PanelUsageMetrics {
         fs.renameSync(temporary, file);
         if (this.pending.get(day) === body) this.pending.delete(day);
       } catch {
-        /* A failed write shows the reader nothing and keeps the body for the next try. */
+        /* A failed write shows the reader nothing and keeps the body for the timer's next try. */
         await fs.promises.rm(temporary, { force: true }).catch(() => {});
       }
+    }
+    // Expiry can hold the queue past the write interval, so the interval runs from this attempt.
+    this.lastWriteAt = this.now();
+  }
+
+  // Retries a failed write once the write interval passes. The timer stops at dispose and while the
+  // `panel-usage` folder is missing, because deleting that folder stops recording. The next count tries again.
+  private async retryPending(): Promise<void> {
+    if (this.disposed || this.pending.size === 0 || (await this.folderMissing())) return;
+    if (!this.disposed) this.schedule();
+  }
+
+  private async folderMissing(): Promise<boolean> {
+    try {
+      return !(await fs.promises.stat(this.directory)).isDirectory();
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      return code === 'ENOENT' || code === 'ENOTDIR';
     }
   }
 

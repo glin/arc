@@ -1,6 +1,10 @@
 // The panel page's share of panel usage metrics. It counts consumed key chords, View menu
 // choices, and committed queries, and posts them to the host at most once every few seconds.
 // The page creates it only when the host reports that recording is on.
+//
+// VS Code's webview script cancels chords such as Ctrl+V from its own window keydown listener. A chord
+// counts only when a panel listener cancelled the event before the document's keydown listeners finished.
+// A panel handler must cancel in the capture phase or at the document, never in a window bubble listener.
 
 import { USAGE_MESSAGE_ENTRIES, type PanelToHost } from './protocol.ts';
 
@@ -12,9 +16,11 @@ export interface PageUsageMetrics {
   view(setting: string, value: string): void;
   // A committed filter box query. The host drops a query that repeats the last one the window counted.
   query(text: string): void;
-  // Every keydown, from one window listener in the capture phase. The chord counts once its dispatch has
-  // finished with a panel handler having consumed it, so a handler that stops propagation still counts.
+  // Every keydown, from one window listener in the capture phase. The chord counts when the event is cancelled
+  // at the end of the document's listeners. When a handler stops propagation first, the event's own state decides.
   key(event: ChordEvent): void;
+  // The document's listeners have finished with this keydown, and no window bubble-phase listener has run yet.
+  keyAtDocument(event: ChordEvent): void;
   // Posts what has not been posted yet.
   flush(): void;
 }
@@ -32,6 +38,11 @@ export interface ChordEvent {
   metaKey: boolean;
   defaultPrevented: boolean;
   isComposing: boolean;
+}
+
+export interface DocumentKeydown {
+  addEventListener(type: 'keydown', listener: (event: unknown) => void): void;
+  removeEventListener(type: 'keydown', listener: (event: unknown) => void): void;
 }
 
 const MODIFIER_KEYS = new Set(['Control', 'Alt', 'Shift', 'Meta', 'AltGraph', 'CapsLock', 'Dead', 'Unidentified', '']);
@@ -60,10 +71,15 @@ export function createPageUsageMetrics(
   let timer: unknown = null;
   // The newest keydown. Its dispatch has finished by the time the next keydown or a flush reads it.
   let held: ChordEvent | null = null;
+  // Whether the held keydown was cancelled when the document's listeners finished. Null when a panel
+  // handler stopped propagation first, because the window listeners then never run.
+  let heldAtDocument: boolean | null = null;
   const settle = () => {
     const event = held;
+    const consumed = heldAtDocument ?? event?.defaultPrevented;
     held = null;
-    if (!event?.defaultPrevented || event.isComposing) return;
+    heldAtDocument = null;
+    if (!event || !consumed || event.isComposing) return;
     const chord = chordName(event);
     if (chord) counts.set(`key:${chord}`, (counts.get(`key:${chord}`) ?? 0) + 1);
   };
@@ -102,6 +118,9 @@ export function createPageUsageMetrics(
       held = event;
       schedule(counts.size + 1);
     },
+    keyAtDocument(event) {
+      if (event === held) heldAtDocument = event.defaultPrevented;
+    },
     query(text) {
       const trimmed = text.trim();
       if (!trimmed) return;
@@ -112,16 +131,27 @@ export function createPageUsageMetrics(
   };
 }
 
-// Creates the page's metrics when the host's shell turned recording on, and installs their one key listener.
-// The capture phase sees every key, including one whose handler stops propagation.
+// Creates the page's metrics when the host's shell turned recording on, and installs their key listeners on the
+// window and the document. The capture phase sees every key, including one whose handler stops propagation.
 export function startPageUsageMetrics(
   enabled: boolean,
   post: (message: PanelToHost) => void,
   timers: UsageMetricsTimers,
   onWindow: (type: string, listener: (event: unknown) => void, capture: boolean) => void,
+  documentKeydown: DocumentKeydown,
 ): PageUsageMetrics | undefined {
   if (!enabled) return undefined;
   const metrics = createPageUsageMetrics(post, timers);
-  onWindow('keydown', (event) => metrics.key(event as ChordEvent), true);
+  const atDocument = (event: unknown) => metrics.keyAtDocument(event as ChordEvent);
+  onWindow(
+    'keydown',
+    (event) => {
+      metrics.key(event as ChordEvent);
+      // Adding the listener again during the capture phase makes it the document's last listener for this key.
+      documentKeydown.removeEventListener('keydown', atDocument);
+      documentKeydown.addEventListener('keydown', atDocument);
+    },
+    true,
+  );
   return metrics;
 }

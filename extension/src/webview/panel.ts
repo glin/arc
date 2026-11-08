@@ -111,6 +111,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
       clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
     },
     onWindow,
+    document,
   );
   onDocument('keydown', (raw) => {
     const event = raw as KeyboardEvent;

@@ -1854,8 +1854,9 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     showRuns: railShowRuns,
   });
   let railFilterOpen = false;
-  // Whether a View menu setting changed since the menu opened, and whether the reader edited the query in the filter box since it last counted.
+  // Whether a View menu setting changed since the menu opened.
   let railFilterChanged = false;
+  // Whether the reader edited the query in the filter box since it last counted.
   let filterTyped = false;
   // A View menu choice counts as `view:<setting>=<value>`. A future setting adds one call.
   const countViewChoice = (setting: string, value: string) => {
@@ -4386,7 +4387,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     },
     labelsChanged(session) {
       if (labelsOpen && labelsOpen.session !== current(session)) {
-        options.sendToHost({ type: 'labelEditor', session: labelsOpen.session });
+        options.sendToHost({ type: 'labelEditor', session: labelsOpen.session, refresh: true });
       }
     },
     // Move open and pending label-editor state to the durable session id. Preserve the anchor until redraw replaces it.

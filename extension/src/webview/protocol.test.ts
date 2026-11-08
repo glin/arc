@@ -926,6 +926,18 @@ test('the inventory covers every variant both dispatchers name', () => {
   );
 });
 
+test('a label editor refresh keeps its refresh mark through the parser', () => {
+  assert.deepEqual(parsePanelToHost({ type: 'labelEditor', session: 's1', refresh: true }), {
+    type: 'labelEditor',
+    session: 's1',
+    refresh: true,
+  });
+  assert.deepEqual(parsePanelToHost({ type: 'labelEditor', session: 's1', refresh: 'yes' }), {
+    type: 'labelEditor',
+    session: 's1',
+  });
+});
+
 test('a panel usage metrics message refuses a malformed or oversized body', () => {
   const valid = { type: 'panelUsageMetrics', counts: { 'key:Escape': 1 }, queries: ['is:running', 'is:running'] };
   assert.ok(parsePanelToHost(valid));

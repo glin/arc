@@ -910,6 +910,13 @@ test('rail metadata and label editor updates leave turn cards untouched', { time
       );
       await page.evaluate(SETTLED);
       await post({ type: 'labelsChanged', session: 'bulk1' });
+      assert.deepEqual(
+        await page.evaluate(`window.__posted.filter((message) => message.type === 'labelEditor').slice(-2)`),
+        [
+          { type: 'labelEditor', session: 'bulk0' },
+          { type: 'labelEditor', session: 'bulk0', refresh: true },
+        ],
+      );
       await post({
         type: 'labelEditor',
         session: 'bulk0',

@@ -461,7 +461,8 @@ export type PanelToHost =
   | { type: 'armComposer' }
   | { type: 'showReaderParent'; session: string }
   | { type: 'showSession'; session: string; parent?: true; responseLink?: true }
-  | { type: 'labelEditor'; session: string }
+  // `refresh` marks a post that follows a host change to the labels, not a reader opening the editor.
+  | { type: 'labelEditor'; session: string; refresh?: true }
   | { type: 'setLabels'; session: string; names: string[] }
   | { type: 'setViews'; views: SavedView[] }
   // `request` names this rename, so the panel can tell its answer from an earlier one's.
@@ -1344,7 +1345,9 @@ export function parsePanelToHost(raw: unknown): PanelToHost | null {
           }
         : null;
     case 'labelEditor':
-      return isString(m.session) ? { type: 'labelEditor', session: m.session } : null;
+      return isString(m.session)
+        ? { type: 'labelEditor', session: m.session, ...(m.refresh === true ? { refresh: true } : {}) }
+        : null;
     case 'setLabels':
       // Drop non-string names and pass the remaining complete label list to the host.
       return isString(m.session) && Array.isArray(m.names)

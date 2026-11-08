@@ -9,6 +9,7 @@ import {
   PANEL_USAGE_DIRECTORY,
   PanelUsageMetrics,
   usageDayName,
+  USAGE_KEY_LIMIT,
   USAGE_QUERY_LIMIT,
   USAGE_WRITE_MS,
   type PanelUsageMetricsFile,
@@ -40,6 +41,19 @@ function usageHome(): { home: string; directory: string } {
 
 function readUsage(file: string): PanelUsageMetricsFile {
   return JSON.parse(fs.readFileSync(file, 'utf8'));
+}
+
+// File promises run on the real event loop. This polls real loop turns without moving the fake clock.
+async function untilSettled(condition: () => boolean): Promise<void> {
+  const deadline = performance.now() + 10_000;
+  while (!condition()) {
+    assert.ok(performance.now() < deadline, 'the write did not settle');
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
+
+function temporaryFiles(file: string): string[] {
+  return fs.readdirSync(path.dirname(file)).filter((name) => name.endsWith('.tmp'));
 }
 
 test('with no panel-usage folder, Arc keeps no metrics and creates nothing', () => {
@@ -177,6 +191,100 @@ test('dispose publishes over a write still in flight, and that write leaves no t
   );
 });
 
+test('a rename that fails during dispose leaves no temporary file', () => {
+  vi.setSystemTime(new Date(2026, 10, 7, 10, 0, 0));
+  const { home } = usageHome();
+  const metrics = openPanelUsageMetrics(home, { windowId: 'w1' })!;
+  const file = metrics.fileFor('2026-11-07');
+  // A folder where the file belongs makes the rename fail after the temporary file is written.
+  fs.mkdirSync(file, { recursive: true });
+  metrics.count('msg:goBack');
+  metrics.dispose();
+  assert.deepEqual(temporaryFiles(file), []);
+});
+
+test('a failed write retries on the write interval with no new count, and the retry stops at dispose', async () => {
+  vi.setSystemTime(new Date(2026, 10, 7, 10, 0, 0));
+  const { home } = usageHome();
+  const metrics = openPanelUsageMetrics(home, { windowId: 'w1' })!;
+  const file = metrics.fileFor('2026-11-07');
+  fs.mkdirSync(file, { recursive: true });
+  const attempts = vi.spyOn(fs.promises, 'mkdir');
+  const timers = vi.spyOn(globalThis, 'setTimeout');
+  metrics.count('msg:goBack');
+  await metrics.flush();
+  assert.equal(attempts.mock.calls.length, 1);
+  assert.equal(vi.getTimerCount(), 1, 'the failed write armed no retry');
+  const retry = timers.mock.results.at(-1)!.value as NodeJS.Timeout;
+  assert.equal(retry.hasRef(), false, 'the retry timer holds the host open');
+
+  await vi.advanceTimersByTimeAsync(USAGE_WRITE_MS - 1);
+  assert.equal(attempts.mock.calls.length, 1, 'the retry came within a minute of the failed write');
+  await vi.advanceTimersByTimeAsync(1);
+  await untilSettled(() => attempts.mock.calls.length === 2 && vi.getTimerCount() === 1);
+
+  // The file's place clears, and the next retry writes with no new count.
+  fs.rmdirSync(file);
+  await vi.advanceTimersByTimeAsync(USAGE_WRITE_MS - 1);
+  assert.equal(fs.existsSync(file), false, 'a repeated failure retried within a minute');
+  await vi.advanceTimersByTimeAsync(1);
+  await untilSettled(() => fs.existsSync(file) && vi.getTimerCount() === 0);
+  assert.deepEqual(readUsage(file).counts, { 'msg:goBack': 1 });
+  attempts.mockRestore();
+  timers.mockRestore();
+
+  // A write that fails again at dispose leaves no timer behind.
+  fs.rmSync(file);
+  fs.mkdirSync(file);
+  metrics.count('msg:goForward');
+  await metrics.flush();
+  assert.equal(vi.getTimerCount(), 1);
+  metrics.dispose();
+  assert.equal(vi.getTimerCount(), 0, 'a retry timer outlived dispose');
+  assert.deepEqual(temporaryFiles(file), []);
+});
+
+test('expiry held past the write interval leaves one failed attempt, and its retry waits a full interval', async () => {
+  vi.setSystemTime(new Date(2026, 10, 7, 23, 59, 0));
+  const { home } = usageHome();
+  const metrics = openPanelUsageMetrics(home, { windowId: 'w1' })!;
+  metrics.message({ type: 'painted', stage: 'railReady' } as PanelToHost);
+
+  // The first write after midnight succeeds, then that day's expiry holds the write queue.
+  let release!: (names: string[]) => void;
+  const held = new Promise<string[]>((resolve) => {
+    release = resolve;
+  });
+  const listing = vi.spyOn(fs.promises, 'readdir').mockImplementation((() => held) as never);
+  vi.setSystemTime(new Date(2026, 10, 8, 0, 0, 1));
+  metrics.count('msg:goBack');
+  void metrics.flush();
+  await untilSettled(() => listing.mock.calls.length === 1);
+
+  // Every later write fails, because a folder takes the file's place.
+  const file = metrics.fileFor('2026-11-08');
+  fs.rmSync(file);
+  fs.mkdirSync(file);
+  const attempts = vi.spyOn(fs.promises, 'mkdir');
+  metrics.count('msg:goForward');
+  await vi.advanceTimersByTimeAsync(USAGE_WRITE_MS);
+  metrics.count('msg:refresh');
+  await vi.advanceTimersByTimeAsync(USAGE_WRITE_MS);
+  await vi.advanceTimersByTimeAsync(USAGE_WRITE_MS);
+  assert.equal(attempts.mock.calls.length, 0, 'a write ran while expiry held the queue');
+
+  release([]);
+  await untilSettled(() => attempts.mock.calls.length >= 1 && vi.getTimerCount() === 1);
+  assert.equal(attempts.mock.calls.length, 1, 'the writes queued during the hold each made an attempt');
+  await vi.advanceTimersByTimeAsync(USAGE_WRITE_MS - 1);
+  assert.equal(attempts.mock.calls.length, 1, 'the retry came within a minute of the failed attempt');
+  await vi.advanceTimersByTimeAsync(1);
+  await untilSettled(() => attempts.mock.calls.length === 2);
+  listing.mockRestore();
+  attempts.mockRestore();
+  metrics.dispose();
+});
+
 test('a deleted panel-usage folder stays deleted while the window keeps running', async () => {
   const { home, directory } = usageHome();
   const metrics = openPanelUsageMetrics(home, { windowId: 'w1' })!;
@@ -184,6 +292,16 @@ test('a deleted panel-usage folder stays deleted while the window keeps running'
   metrics.count('msg:goBack');
   await metrics.flush();
   assert.equal(fs.existsSync(directory), false, 'a write recreated the folder');
+  assert.equal(vi.getTimerCount(), 0, 'a missing folder kept the retry timer running');
+
+  // The next count tries again, and the retry timer stays off.
+  const attempts = vi.spyOn(fs.promises, 'mkdir');
+  metrics.count('msg:goBack');
+  await vi.advanceTimersByTimeAsync(USAGE_WRITE_MS);
+  await untilSettled(() => attempts.mock.calls.length === 1 && vi.getTimerCount() === 0);
+  attempts.mockRestore();
+  assert.equal(fs.existsSync(directory), false, 'the next count recreated the folder');
+
   metrics.count('msg:goBack');
   metrics.dispose();
   assert.equal(fs.existsSync(directory), false, 'the write on dispose recreated the folder');
@@ -249,6 +367,33 @@ test('the 201st distinct query adds to other', async () => {
   assert.equal(written.queries['label:q0'], 3);
   assert.equal(written.queries['label:late'], undefined);
   assert.equal(written.other, 2);
+  metrics.dispose();
+});
+
+test('a new count key past the limit is dropped, and existing keys keep counting', async () => {
+  const { home } = usageHome();
+  const metrics = openPanelUsageMetrics(home, { windowId: 'w1' })!;
+  for (let at = 0; at < USAGE_KEY_LIMIT; at += 1) metrics.count(`msg:k${at}`);
+  metrics.count('msg:late');
+  metrics.merge({ 'msg:lateMerge': 3, 'msg:k0': 2 }, []);
+  metrics.count('msg:k1');
+  await metrics.flush();
+  const { counts } = readUsage(metrics.fileFor(usageDayName(Date.now())));
+  assert.equal(Object.keys(counts).length, USAGE_KEY_LIMIT);
+  assert.equal(counts['msg:k0'], 3);
+  assert.equal(counts['msg:k1'], 2);
+  assert.equal(counts['msg:late'], undefined);
+  assert.equal(counts['msg:lateMerge'], undefined);
+  metrics.dispose();
+});
+
+test('a label editor refresh does not count, and a reader opening the editor does', async () => {
+  const { home } = usageHome();
+  const metrics = openPanelUsageMetrics(home, { windowId: 'w1' })!;
+  metrics.message({ type: 'labelEditor', session: 's1', refresh: true });
+  metrics.message({ type: 'labelEditor', session: 's1' });
+  await metrics.flush();
+  assert.deepEqual(readUsage(metrics.fileFor(usageDayName(Date.now()))).counts, { 'msg:labelEditor': 1 });
   metrics.dispose();
 });
 
@@ -438,6 +583,7 @@ test('the page posts at most once every 5 seconds, and queries keep their commit
 test('a page whose shell lacks the recording option installs no listener and posts nothing', () => {
   const listeners: unknown[] = [];
   const posted: PanelToHost[] = [];
+  const noDocument = { addEventListener() {}, removeEventListener() {} };
   const off = startPageUsageMetrics(
     false,
     (message) => posted.push(message),
@@ -445,6 +591,7 @@ test('a page whose shell lacks the recording option installs no listener and pos
     (...args) => {
       listeners.push(args);
     },
+    noDocument,
   );
   assert.equal(off, undefined);
   assert.deepEqual(listeners, []);
@@ -459,8 +606,48 @@ test('a page whose shell lacks the recording option installs no listener and pos
       assert.equal(capture, true);
       keydown = listener;
     },
+    noDocument,
   )!;
   keydown!(chord('Enter', { ctrlKey: true }));
   on.flush();
   assert.equal(posted.length, 1);
+});
+
+// The order a keydown visits the page's listeners: window capture, panel handlers, the document's
+// listeners, then VS Code's own window listener, which cancels chords such as Ctrl+V.
+test('a chord counts when a panel listener cancels it, not when the webview script does', () => {
+  const posted: PanelToHost[] = [];
+  const documentListeners = new Set<(event: unknown) => void>();
+  let capture: ((event: unknown) => void) | undefined;
+  const metrics = startPageUsageMetrics(
+    true,
+    (message) => posted.push(message),
+    pageTimers,
+    (_type, listener) => {
+      capture = listener;
+    },
+    {
+      addEventListener: (_type, listener) => documentListeners.add(listener),
+      removeEventListener: (_type, listener) => documentListeners.delete(listener),
+    },
+  )!;
+  const cancel = (event: ChordEvent) => {
+    event.defaultPrevented = true;
+  };
+  const press = (event: ChordEvent, panelHandler?: (event: ChordEvent) => void) => {
+    capture!(event);
+    panelHandler?.(event);
+    if (panelHandler === stopAfterCancel) return;
+    for (const listener of [...documentListeners]) listener(event);
+    if (event.key === 'V') cancel(event);
+  };
+  const stopAfterCancel = (event: ChordEvent) => cancel(event);
+  press(chord('v', { ctrlKey: true, defaultPrevented: false, key: 'V' }));
+  // A panel handler that stops propagation reaches neither the document nor VS Code's listener.
+  press(chord('Z', { ctrlKey: true, defaultPrevented: false }), stopAfterCancel);
+  // A document listener added after the metrics' listener still runs first, and its cancel counts.
+  documentListeners.add((event) => cancel(event as ChordEvent));
+  press(chord('K', { ctrlKey: true, defaultPrevented: false }));
+  metrics.flush();
+  assert.deepEqual(posted, [{ type: 'panelUsageMetrics', counts: { 'key:Ctrl+Z': 1, 'key:Ctrl+K': 1 }, queries: [] }]);
 });

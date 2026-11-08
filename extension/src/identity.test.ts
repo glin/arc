@@ -69,18 +69,45 @@ test('every contributed command registers under its Arc id', () => {
 
 // Panel usage metrics count each Arc command run in one helper. A registration outside it runs uncounted.
 test('every Arc command registers through the counting helper in panelhost.ts', () => {
-  const call = /\bcommands\s*\.\s*registerCommand\b/g;
+  const names = new Set(['registerCommand', 'registerTextEditorCommand']);
+  // The name a node reads: a property, a bracketed string, or a key taken out by destructuring.
+  const readName = (node: ts.Node): string | undefined => {
+    if (ts.isPropertyAccessExpression(node)) return node.name.text;
+    if (ts.isElementAccessExpression(node) && ts.isStringLiteralLike(node.argumentExpression)) {
+      return node.argumentExpression.text;
+    }
+    if (ts.isBindingElement(node) && ts.isObjectBindingPattern(node.parent)) {
+      const key = node.propertyName ?? node.name;
+      return ts.isIdentifier(key) || ts.isStringLiteralLike(key) ? key.text : undefined;
+    }
+    return undefined;
+  };
   const found = inventorySourceTree(__dirname)
     .components.filter((name) => name.endsWith('.ts'))
     .flatMap((name) => {
-      const source = fs.readFileSync(path.join(__dirname, name), 'utf8');
-      return [...source.matchAll(call)].map((match) => ({ name, source, at: match.index }));
+      const file = ts.createSourceFile(
+        name,
+        fs.readFileSync(path.join(__dirname, name), 'utf8'),
+        ts.ScriptTarget.Latest,
+        true,
+      );
+      const matches: { name: string; node: ts.Node }[] = [];
+      const visit = (node: ts.Node): void => {
+        const read = readName(node);
+        if (read !== undefined && names.has(read)) matches.push({ name, node });
+        ts.forEachChild(node, visit);
+      };
+      visit(file);
+      return matches;
     });
   assert.equal(found.length, 1, found.map((one) => one.name).join(', '));
   const [only] = found;
-  const helper = only.source.indexOf('export function commandRegistrar(');
   assert.equal(only.name, 'panelhost.ts');
-  assert.ok(helper >= 0 && only.at > helper && only.at < only.source.indexOf('\n}\n', helper));
+  let owner: ts.Node | undefined = only.node;
+  while (owner && !(ts.isFunctionDeclaration(owner) && owner.name?.text === 'commandRegistrar')) {
+    owner = owner.parent;
+  }
+  assert.ok(owner, 'the registration sits outside commandRegistrar');
 });
 
 test('shipping sources take Arc identifiers from the identity contract', () => {

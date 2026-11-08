@@ -2524,7 +2524,9 @@ test(
         Object.keys(counts).filter((key) => /^key:.$/.test(key)),
         [],
       );
-      // The second Enter commits nothing new, and the host drops the repeat of the retyped query.
+      // The first Enter takes the open suggestion row and commits nothing. The second Enter commits the query.
+      // The suggestion list stays shut for the retyped query, so Tab leaves the box and its blur commits it again.
+      // The page posts both commits, and the assertion reads those posts.
       assert.deepEqual(queries, ['label:composer', 'label:composer']);
     } finally {
       await browser.close();
