@@ -271,14 +271,15 @@ export interface DispatchRelationshipAllowance {
   checks: number;
 }
 // The requester and dispatched session that a receipt names, which its catalog lookup matches by provider and session ID.
+// A launch rejected at its requester names no dispatched session, because its read stopped before the accepted record.
 export interface DispatchRelationshipIdentities {
   requester: { agent: 'claude' | 'codex'; sessionId: string };
-  child: { agent: 'claude' | 'codex'; sessionId: string };
+  child?: { agent: 'claude' | 'codex'; sessionId: string };
 }
 export interface DispatchRelationshipStep extends DispatchRelationshipAllowance {
   reference?: ClaudeDispatchSessionReference;
   refusal?: { error: unknown } & ({ launchId: string } | { storeOpened: boolean });
-  // The final step of one launch names it. Identities are present when its read reached the catalog lookup.
+  // The final step of one launch names it. Identities are present when its read reached a catalog lookup.
   launchId?: string;
   identities?: DispatchRelationshipIdentities;
 }
@@ -639,6 +640,16 @@ export class DispatchReceipts {
       typeof options.agentRun !== 'boolean'
     )
       return null;
+    const requester = { agent: launch.requester.provider, sessionId: launch.requester.id };
+    const sessions = () => (typeof catalog === 'function' ? catalog() : catalog);
+    const requesterRows = (rows: readonly SessionFile[]) =>
+      rows.filter((value) => value.agent === requester.agent && value.sessionId === requester.sessionId);
+    // The catalog lookup needs one row for the requester, so the read ends here without one. The final step names the
+    // requester, and a later catalog that changes its rows reads the launch again.
+    if (requesterRows(sessions()).length !== 1) {
+      reader.identities = { requester };
+      return null;
+    }
     const binding = function* (kind: 'accepted' | 'startup'): RelationshipScan<Record<string, unknown>> {
       const boundFile = paths.join(directory, `${kind}.json`);
       const boundText = yield* reader.read(boundFile);
@@ -686,16 +697,11 @@ export class DispatchReceipts {
       return null;
     // The receipt check reads plain transcripts only. A compressed child transcript counts as missing.
     if (isCompressedRollout(startup.file)) return null;
-    reader.identities = {
-      requester: { agent: launch.requester.provider, sessionId: launch.requester.id },
-      child: { agent: options.provider, sessionId: accepted.sessionId },
-    };
+    reader.identities = { requester, child: { agent: options.provider, sessionId: accepted.sessionId } };
     const lookup = () => {
-      const sessions = typeof catalog === 'function' ? catalog() : catalog;
-      const parents = sessions.filter(
-        (value) => value.agent === launch.requester!.provider && value.sessionId === launch.requester!.id,
-      );
-      const children = sessions.filter(
+      const rows = sessions();
+      const parents = requesterRows(rows);
+      const children = rows.filter(
         (value) => value.agent === options.provider && value.sessionId === accepted.sessionId,
       );
       return parents.length === 1 && children.length === 1 ? { parent: parents[0], child: children[0] } : null;

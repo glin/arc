@@ -751,7 +751,7 @@ function narrowReceiptBudget(code: string): string {
 const launchesFirst = (store: string, last = false) =>
   `const orderFs=require('node:fs'),orderPort=require('node:worker_threads').parentPort,orderOpen=orderFs.opendirSync;let orderOpens=0;orderFs.opendirSync=function(p,...a){const dir=orderOpen.call(this,p,...a);if(String(p)!==${JSON.stringify(store)})return dir;orderPort.postMessage({repeatedCoverage:++orderOpens>1?'receipt-store-reopened':'receipt-store-opened'});const entries=[];for(let entry;(entry=dir.readSync());)entries.push(entry);const launch=(entry)=>entry.isDirectory()&&!entry.name.endsWith('-1111-2222-3333-444444444444');entries.sort((a,b)=>${last ? 1 : -1}*(Number(launch(a))-Number(launch(b))));let seen=0;const launches=entries.filter(launch).length;let reported=false;return{readSync(){const entry=entries.shift()??null;if(entry&&launch(entry))seen++;if(!reported&&(!entry||seen===launches&&(${last}||!launch(entry)))){reported=true;orderPort.postMessage({repeatedCoverage:'receipt-launches-read'});}return entry;},closeSync(){dir.closeSync();}};};`;
 
-test.each(['added', 'removed', 'requester removed', 'added before the launches are read'] as const)(
+test.each(['added', 'requester added', 'removed', 'requester removed', 'added before the launches are read'] as const)(
   'receipt discovery completes while repository roots change, with a session %s',
   async (variant) => {
     // The early variant changes the roots before the scan lists any launch, so each launch looks up the new catalog.
@@ -765,15 +765,25 @@ test.each(['added', 'removed', 'requester removed', 'added before the launches a
         fs.mkdirSync(path.join(fx.receipts.root, `${index.toString(16).padStart(8, '0')}-1111-2222-3333-444444444444`));
       fx.launch(fx.parent, fx.child);
       fx.launch(fx.child, fx.grandchild);
-      const before = change === 'added' ? [fx.parent, fx.child] : fx.catalog;
+      const before =
+        change === 'added'
+          ? [fx.parent, fx.child]
+          : change === 'requester added'
+            ? [fx.child, fx.grandchild]
+            : fx.catalog;
       const after = {
         added: fx.catalog,
+        'requester added': fx.catalog,
         removed: [fx.parent, fx.child],
         'requester removed': [fx.child, fx.grandchild],
       }[change];
       // Each receipt link whose requester and dispatched session are both in the final catalog.
       const links = {
         added: [
+          [fx.child.sessionId, fx.parent.sessionId],
+          [fx.grandchild.sessionId, fx.child.sessionId],
+        ],
+        'requester added': [
           [fx.child.sessionId, fx.parent.sessionId],
           [fx.grandchild.sessionId, fx.child.sessionId],
         ],

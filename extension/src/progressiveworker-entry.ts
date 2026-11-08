@@ -255,7 +255,7 @@ interface ReceiptScan {
   // Receipt lookups read this catalog, which follows the epoch when its repository roots change.
   catalog: SessionFile[];
   steps: ReturnType<DispatchReceipts['relationships']>;
-  // Each visited launch whose read reached the catalog lookup, with the identities it looked up, found or not.
+  // Each visited launch whose read reached a catalog lookup, with the identities it looked up, found or not.
   launches: Map<string, string[]>;
   references: Map<string, import('./transcript').ClaudeDispatchSessionReference>;
   retries: string[];
@@ -1371,7 +1371,7 @@ async function execute(
         if (identities)
           activeReceipts.launches.set(launchId, [
             catalogIdentity(identities.requester.agent, identities.requester.sessionId),
-            catalogIdentity(identities.child.agent, identities.child.sessionId),
+            ...(identities.child ? [catalogIdentity(identities.child.agent, identities.child.sessionId)] : []),
           ]);
         else activeReceipts.launches.delete(launchId);
       }

@@ -898,10 +898,74 @@ test('publication rechecks changed catalog scope', () => {
   const fx = relationshipFixture();
   let lookups = 0;
   assert.deepEqual(
-    drainRelationships(fx.receipts.relationships(() => (++lookups === 1 ? fx.catalog : [fx.catalog[0]]))),
+    drainRelationships(fx.receipts.relationships(() => (++lookups <= 2 ? fx.catalog : [fx.catalog[0]]))),
     [],
   );
   assert.equal(drainRelationships(fx.receipts.relationships(fx.catalog)).length, 1);
+});
+
+// Reads one launch to its final step and adds up the filesystem checks the scan reported.
+function readOneLaunch(scan: Generator<DispatchRelationshipStep, unknown, DispatchRelationshipAllowance>) {
+  let checks = 0;
+  let last: DispatchRelationshipStep | undefined;
+  for (let steps = 0; steps < 100_000; steps++) {
+    const next = scan.next({ bytes: 64 * 1024, entries: 1, checks: 1 });
+    if (next.done) return { checks, last };
+    checks += next.value.checks;
+    if (next.value.launchId) last = next.value;
+  }
+  return assert.fail('The bounded receipt read did not finish.');
+}
+
+test('a launch whose requester is outside the catalog stops at the requester reads and names only the requester', () => {
+  const fx = relationshipFixture();
+  const id = fx.launch.launchId;
+  const open = vi.spyOn(fs, 'openSync');
+  const lstat = vi.spyOn(fs, 'lstatSync');
+  syncBuiltinESMExports();
+  const rejected = readOneLaunch(fx.receipts.relationship(id, [fx.catalog[1]]));
+  assert.deepEqual(
+    open.mock.calls.map(([file]) => path.basename(String(file))),
+    [`${id}.json`, 'receipt.json'],
+    'the read opened a file after the requester was known',
+  );
+  const later = lstat.mock.calls
+    .map(([file]) => path.basename(String(file)))
+    .filter((name) => /accepted|startup/.test(name));
+  assert.deepEqual(later, [], 'the read checked a binding after the requester was known');
+  assert.deepEqual(rejected.last?.identities, {
+    requester: { agent: fx.catalog[0].agent, sessionId: fx.catalog[0].sessionId },
+  });
+  assert.equal(rejected.last?.reference, undefined);
+  vi.restoreAllMocks();
+  syncBuiltinESMExports();
+  const full = readOneLaunch(fx.receipts.relationship(id, fx.catalog));
+  assert.ok(rejected.checks * 2 < full.checks, `${rejected.checks} checks against ${full.checks} for a full read`);
+});
+
+test('a launch rejected at its requester links once a later catalog holds the requester', () => {
+  const fx = relationshipFixture();
+  let catalog = [fx.catalog[1]];
+  const id = fx.launch.launchId;
+  assert.equal(readOneLaunch(fx.receipts.relationship(id, () => catalog)).last?.reference, undefined);
+  catalog = fx.catalog;
+  const retried = readOneLaunch(fx.receipts.relationship(id, () => catalog)).last;
+  assert.equal(retried?.reference?.sessionId, fx.catalog[1].sessionId);
+  assert.equal(retried?.identities?.child?.sessionId, fx.catalog[1].sessionId);
+});
+
+test('a launch whose requester is in the catalog reads its bindings and names both identities', () => {
+  const fx = relationshipFixture();
+  const open = vi.spyOn(fs, 'openSync');
+  syncBuiltinESMExports();
+  const read = readOneLaunch(fx.receipts.relationship(fx.launch.launchId, fx.catalog));
+  const opened = open.mock.calls.map(([file]) => path.basename(String(file)));
+  assert.ok(opened.includes('accepted.json') && opened.includes('startup.json'), opened.join(', '));
+  assert.ok(read.last?.reference);
+  assert.deepEqual(read.last?.identities, {
+    requester: { agent: fx.catalog[0].agent, sessionId: fx.catalog[0].sessionId },
+    child: { agent: fx.catalog[1].agent, sessionId: fx.catalog[1].sessionId },
+  });
 });
 
 test('the final step of each launch names it and the identities its catalog lookup matched', () => {
