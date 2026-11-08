@@ -509,6 +509,127 @@ test('a window read sent during a receipt pass completes before the pass ends', 
   }
 });
 
+// The receipt scan runs a batch of steps in each event-loop turn. A frozen clock leaves only the step limit to end the pass.
+test('a receipt pass takes one event-loop turn for each batch of steps', async () => {
+  const root = tempDir('receipt-worker-turns-');
+  const fx = receiptDispatchFixture(root, 'claude', 'codex');
+  fs.mkdirSync(fx.receipts.root, { recursive: true });
+  for (let index = 0; index < 1200; index++)
+    fs.mkdirSync(path.join(fx.receipts.root, `${index.toString(16).padStart(8, '0')}-1111-2222-3333-444444444444`));
+  const step = 'receiptSteps++;';
+  const turn = 'await receiptScanTurn();';
+  assert.ok(source.includes(step) && source.includes(turn));
+  const worker = new ProgressiveWorker(
+    `process.env.ARC_HOME=${JSON.stringify(fx.home)};performance.now=()=>0;` +
+      narrowReceiptBudget(source)
+        .replace(step, step + 'charges.receiptStepCount=(charges.receiptStepCount??0)+1;')
+        .replace(turn, 'charges.receiptTurnCount=(charges.receiptTurnCount??0)+1;' + turn),
+  );
+  try {
+    const pass = await worker.run(
+      { kind: 'claude-children', parents: fx.catalog, catalog: fx.catalog, repositoryRoots: [root] },
+      1,
+      new AbortController().signal,
+    );
+    const charges = pass?.value.charges as { receiptStepCount?: number; receiptTurnCount?: number } | undefined;
+    assert.equal(charges?.receiptStepCount, 256);
+    assert.equal(charges?.receiptTurnCount, 32);
+  } finally {
+    worker.stop();
+  }
+});
+
+// The window request is queued before the step that the worker holds, so the worker takes it at the end of that step's batch.
+test('a window read queued during a receipt turn enters the worker within one batch of steps', async () => {
+  const root = tempDir('receipt-worker-window-batch-');
+  const fx = receiptDispatchFixture(root, 'claude', 'codex');
+  fs.mkdirSync(fx.receipts.root, { recursive: true });
+  for (let index = 0; index < 1200; index++)
+    fs.mkdirSync(path.join(fx.receipts.root, `${index.toString(16).padStart(8, '0')}-1111-2222-3333-444444444444`));
+  const posted = path.join(root, 'window-posted');
+  const step = 'receiptSteps++;';
+  const prelude = `let noted=0,turns=0,gated=false,baseline=0,enteredAt=0,enteredTurns=0;globalThis.noteReceiptTurn=()=>turns++;const gatePort=require('node:worker_threads').parentPort,gateFs=require('node:fs'),gatePost=gatePort.postMessage.bind(gatePort);
+    globalThis.noteReceiptStep=()=>{noted++;if(noted===3&&!gated){gated=true;gatePort.postMessage({repeatedCoverage:'receipt-gate'});const end=Date.now()+30000;while(!gateFs.existsSync(${JSON.stringify(posted)})&&Date.now()<end);baseline=noted;}};
+    gatePort.postMessage=function(message){if(message.windowEntered){enteredAt=noted;enteredTurns=turns;gatePost({repeatedCoverage:'window-entered:'+(noted-baseline)});}if(message.result?.value?.kind==='window')gatePost({repeatedCoverage:'window-answered:'+(noted-enteredAt)+':'+(turns-enteredTurns)});return gatePost(message);};`;
+  let reachedGate!: () => void;
+  const gate = new Promise<void>((resolve) => (reachedGate = resolve));
+  let entered: number | undefined;
+  let answered: number[] | undefined;
+  const worker = new ProgressiveWorker(
+    `process.env.ARC_HOME=${JSON.stringify(fx.home)};` +
+      prelude +
+      narrowReceiptBudget(source)
+        .replace(/const receiptDeadline = performance\.now\(\) \+ \w+;/, 'const receiptDeadline = Infinity;')
+        .replace(step, step + 'noteReceiptStep();')
+        .replace('await receiptScanTurn();', 'noteReceiptTurn();await receiptScanTurn();'),
+    undefined,
+    (message) => {
+      if (message === 'receipt-gate') reachedGate();
+      else if (message.startsWith('window-entered:')) entered = Number(message.slice('window-entered:'.length));
+      else if (message.startsWith('window-answered:')) answered = message.split(':').slice(1).map(Number);
+    },
+  );
+  try {
+    const discovery = worker.run(
+      { kind: 'claude-children', parents: fx.catalog, catalog: fx.catalog, repositoryRoots: [root] },
+      1,
+      new AbortController().signal,
+    );
+    await gate;
+    const { file, sessionId, agent, size, mtimeMs } = fx.parent;
+    const window = worker.run(
+      {
+        kind: 'window',
+        input: {
+          session: { file, sessionId, agent, size, mtimeMs },
+          folders: [root],
+          children: [],
+          maxTurns: 40,
+          tailBytes: 65536,
+        },
+      },
+      2,
+      new AbortController().signal,
+    );
+    fs.writeFileSync(posted, '');
+    assert.equal((await window)?.value.kind, 'window');
+    assert.ok(entered !== undefined && entered <= 8, `the window read entered after ${entered} more receipt steps`);
+    // Each step during the read takes its own turn, so a step runs behind each file call of the read.
+    assert.ok(answered, 'the window answer was not reported');
+    assert.ok(answered[0] <= answered[1] + 1, `${answered[0]} steps ran in ${answered[1]} turns during the read`);
+    await discovery;
+  } finally {
+    worker.stop();
+  }
+});
+
+test('the receipt slice deadline ends a pass inside a batch of steps', async () => {
+  const root = tempDir('receipt-worker-deadline-');
+  const fx = receiptDispatchFixture(root, 'claude', 'codex');
+  fs.mkdirSync(fx.receipts.root, { recursive: true });
+  for (let index = 0; index < 1200; index++)
+    fs.mkdirSync(path.join(fx.receipts.root, `${index.toString(16).padStart(8, '0')}-1111-2222-3333-444444444444`));
+  const step = 'receiptSteps++;';
+  assert.ok(source.includes(step));
+  // Each step moves the clock past half of the slice budget, so the deadline falls after the second step of the first batch.
+  const worker = new ProgressiveWorker(
+    `process.env.ARC_HOME=${JSON.stringify(fx.home)};let receiptClock=0;performance.now=()=>receiptClock;` +
+      source.replace(step, step + 'receiptClock+=1000;charges.receiptStepCount=(charges.receiptStepCount??0)+1;'),
+  );
+  try {
+    const pass = await worker.run(
+      { kind: 'claude-children', parents: fx.catalog, catalog: fx.catalog, repositoryRoots: [root] },
+      1,
+      new AbortController().signal,
+    );
+    assert.equal(pass?.value.kind, 'claude-children-progress');
+    assert.equal(pass.value.charges?.receiptPassEnds, 1);
+    assert.equal((pass.value.charges as { receiptStepCount?: number }).receiptStepCount, 2);
+  } finally {
+    worker.stop();
+  }
+});
+
 // A receipt slice changes no reference entry, so each receipt reply after the first whole reply is a delta without rows. A
 // host whose checkpoint is behind the worker, or whose sequence differs from the worker's last reply, gets a whole reply.
 test('receipt replies after a whole reply are deltas until the host checkpoint differs from the last reply', async () => {

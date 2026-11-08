@@ -230,10 +230,15 @@ function withSavedFacts([file, entry]: [string, ClaudeChildReferenceCacheEntry])
 }
 const DISPATCH_METADATA_BYTES = 256 * 1024;
 export const CODEX_DISPATCH_REQUEST_BYTES = 8 * 1024 * 1024;
-// The receipt scan's allowance in each discovery request. Each step advances the scan by at most one store entry and one file
-// check, and yields to the worker's other messages, so window reads run between steps.
+// The receipt scan's limits in each discovery request. Each step advances the scan by at most one store entry and one file
+// check.
 const RECEIPT_SLICE_MS = 1500;
 const RECEIPT_STEPS = 65536;
+// The steps that one event-loop turn of the receipt scan runs. A receipt filesystem call costs at most about 0.5 ms on a large
+// store, so a window read waits at most about 4 ms behind a turn. While a window read runs, each step takes its own turn, so
+// each file call of the read waits behind one step.
+const RECEIPT_TURN_STEPS = 8;
+const receiptScanTurn = () => new Promise<void>((resolve) => setImmediate(resolve));
 let discoveryEpoch: DiscoveryCheckpoint | null = null;
 // The reference rows of this worker's last discovery reply, by key, with the epoch and sequence of that reply. A row keeps
 // its entry and the head and dispatch facts that the reply added to it.
@@ -1334,6 +1339,7 @@ async function execute(
     };
     const receiptDeadline = performance.now() + RECEIPT_SLICE_MS;
     let receiptSteps = 0;
+    let turnSteps = 0;
     // The deadline ends the loop only after a step, so a worker paused past the deadline in every request still advances.
     while (!signal.aborted) {
       if (
@@ -1382,7 +1388,10 @@ async function execute(
       if (step.value.refusal && ('launchId' in step.value.refusal || step.value.refusal.storeOpened))
         activeReceipts.competitionRefused = true;
       receiptSteps++;
-      await new Promise<void>((resolve) => setImmediate(resolve));
+      if (++turnSteps >= RECEIPT_TURN_STEPS || windowReads.size > 0) {
+        turnSteps = 0;
+        await receiptScanTurn();
+      }
     }
     if (signal.aborted) return { kind: 'stale' };
     // Links read from a replaced store never publish with retries read from its replacement.
