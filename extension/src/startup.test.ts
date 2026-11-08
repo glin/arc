@@ -8604,7 +8604,7 @@ test('a cold handoff accepts the catalog without enumerating the rollout directo
 });
 
 // A real Codex listing over a temporary rollout root, with every asynchronous walk held until the test releases it.
-function heldWalkHarness(scope: Record<string, unknown> = {}, extraMethods: string[] = []) {
+function heldWalkHarness(scope: Record<string, unknown> = {}, extraMethods: string[] = [], realSelectedWindow = false) {
   const root = tempDir('enumeration-async-');
   const workspace = path.join(root, 'project');
   fs.mkdirSync(workspace);
@@ -8642,7 +8642,7 @@ function heldWalkHarness(scope: Record<string, unknown> = {}, extraMethods: stri
         }),
       ...scope,
     },
-    false,
+    realSelectedWindow,
     extraMethods,
   );
   claudeWalk.splice(0);
@@ -9120,15 +9120,23 @@ test.each(['closing', 'closing and reopening'])(
 );
 
 // A warm start's cold pass waits at a gate, so only the saved openings can supply the first list.
-function warmStartHarness(scope: Record<string, unknown> = {}, extraMethods: string[] = []) {
-  const harness = heldWalkHarness({ COLD_PASS_PAINT_LIMIT_MS, ...scope }, [
-    'settleBackgroundColdPass',
-    'listFinishedColdPass',
-    'browserPainted',
-    'relistHeldCodex',
-    'armColdPassPaintLimit',
-    ...extraMethods,
-  ]);
+function warmStartHarness(
+  scope: Record<string, unknown> = {},
+  extraMethods: string[] = [],
+  realSelectedWindow = false,
+) {
+  const harness = heldWalkHarness(
+    { COLD_PASS_PAINT_LIMIT_MS, ...scope },
+    [
+      'settleBackgroundColdPass',
+      'listFinishedColdPass',
+      'browserPainted',
+      'relistHeldCodex',
+      'armColdPassPaintLimit',
+      ...extraMethods,
+    ],
+    realSelectedWindow,
+  );
   const { provider, root } = harness;
   let release!: () => void;
   const gate = new Promise<void>((resolve) => (release = resolve));
@@ -9391,7 +9399,9 @@ test('a host hidden past the paint limit drops the held walk and runs the pass a
 });
 
 test('a selection held on a rollout without a saved opening survives the list before its opening is read', async () => {
-  const { provider, release, seed, writeRollout, files } = warmStartHarness();
+  const { provider, release, seed, writeRollout, files } = warmStartHarness({}, [], true);
+  provider.progressiveCurrent = () => true;
+  provider.acceptSelectedMetadataRead = () => {};
   provider.railPaintArrived = true;
   const seeded = seed('seeded');
   const unseeded = writeRollout('unseeded');
@@ -9400,6 +9410,7 @@ test('a selection held on a rollout without a saved opening survives the list be
   try {
     await provider.refresh(true);
     await provider.refresh(true, true, false, true);
+    await provider.completeSelectedWindow('unseeded', provider.selectionGeneration);
     assert.deepEqual(files(), [seeded]);
     assert.equal(provider.showing, 'unseeded', 'the list moved the selection off a rollout it cannot rule out');
     assert.deepEqual(warn.mock.calls, [], 'the selection on a row without an opening threw');
@@ -13253,6 +13264,73 @@ test('the startup record times the panel hidden between the list and its first p
   } finally {
     history.dispose();
   }
+});
+
+// The selection posts first. A window that the worker changes adds the second post.
+test.each([
+  ['agent facts leave the turns as drawn', 'facts', false, 1],
+  ['agent facts change the turns', 'facts', true, 2],
+  ['retained pages return as drawn', 'retained', false, 1],
+  ['retained pages change', 'retained', true, 2],
+  ['the file changed', 'file', true, 2],
+] as const)('a selection posts once unless its window moves when %s', async (_name, kind, changes, expected) => {
+  const provider = streamedCatalogHarness(true);
+  const session = provider.partial[0];
+  const turns = [{ id: 'turn', text: 'drawn' }];
+  const changed = [{ id: 'turn', text: 'changed' }];
+  provider.cache.set(session.file, { read: { turns }, agentKey: 'agents', revision: provider.revisionOf(session) });
+  provider.agentSpendKey = () => (kind === 'facts' ? 'moved' : 'agents');
+  let current = kind !== 'file';
+  provider.progressiveCurrent = () => current;
+  provider.progressiveInput = () => ({});
+  provider.acceptSelectedMetadataRead = () => {};
+  provider.updateHistoryAfterAcceptedWindow = () => {};
+  provider.commitRepositoryContexts = () => [];
+  provider.hydrateCommitRepositories = async () => false;
+  provider.refreshAgentFacts = async (_session: unknown, entry: { read: { turns: unknown[] }; agentKey: string }) => {
+    entry.agentKey = 'moved';
+    if (changes) entry.read = { turns: changed };
+  };
+  if (kind === 'retained') {
+    provider.history.set(session.sessionId, { pages: [{ turns, compactions: [], bytes: 0 }] });
+    provider.historyStructuralKeys.set(session.sessionId, 'before');
+    provider.historyAgentKey = () => 'moved';
+    provider.jointSplitWindow = () => undefined;
+    provider.acceptJointSplitWindow = () => {};
+  }
+  provider.progressiveWorker = {
+    run: async (request: { kind: string }, generation: number) => {
+      current = true;
+      return {
+        generation,
+        revision: provider.revisionOf(session),
+        value:
+          request.kind === 'retained'
+            ? { kind: 'retained', pages: [{ turns: changes ? changed : turns, compactions: [], bytes: 0 }] }
+            : {
+                kind: 'window',
+                read: { turns: changed },
+                agentKey: 'agents',
+                structuralKey: '',
+                checkpoint: null,
+                retainedBytes: 1,
+                checkpointBytes: 0,
+              },
+      };
+    },
+  };
+  const refresh = provider.refresh;
+  const started: Promise<void>[] = [];
+  provider.refresh = (...args: unknown[]) => {
+    const run = refresh.apply(provider, args);
+    started.push(run);
+    return run;
+  };
+  const posts = () => provider.messages.filter((message: { type: string }) => message.type === 'selection').length;
+  await provider.refresh(true, true, false, true);
+  await provider.completeSelectedWindow(session.sessionId, provider.selectionGeneration);
+  await Promise.all(started);
+  assert.equal(posts(), expected, 'the selection posted the wrong number of times');
 });
 
 test('session selection reads cached spend signatures without enumerating sources', async () => {
