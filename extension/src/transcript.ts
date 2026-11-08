@@ -3929,11 +3929,18 @@ export function sessionFilesFor(
   return enumerateSessionFilesFor(root, folders, cwdOf, missingCwdFolders).sessions;
 }
 
+// The part of a catalog listing that a filesystem call belongs to: a directory read, a file stat, or an opening read.
+export type ListingPart = 'listing' | 'stats' | 'openings';
+// Runs one filesystem call of a listing and returns its result, so a caller can time each part.
+export type ListingTimer = <T>(part: ListingPart, run: () => T) => T;
+const untimed: ListingTimer = (_part, run) => run();
+
 export function enumerateSessionFilesFor(
   root: string,
   folders: string[],
   cwdOf: (file: string, session: SessionFile) => string | null = (file) => readSessionCwd(file),
   missingCwdFolders: string[] = folders,
+  time: ListingTimer = untimed,
 ): SourceEnumeration & { sessions: SessionFile[] } {
   const evidence: SourceEnumeration & { sessions: SessionFile[] } = {
     status: 'complete',
@@ -3946,7 +3953,7 @@ export function enumerateSessionFilesFor(
   if (folders.length === 0) return evidence;
   let dirs: string[] = [];
   try {
-    dirs = fs.readdirSync(root);
+    dirs = time('listing', () => fs.readdirSync(root));
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { ...evidence, missingRoot: true };
     return { ...evidence, status: 'unavailable', uncertain: [root] };
@@ -3960,7 +3967,7 @@ export function enumerateSessionFilesFor(
     if (!slugs.some((slug) => projectDirectoryMatches(name, slug))) {
       continue;
     }
-    const listing = enumerateSessionFiles(path.join(root, d));
+    const listing = enumerateSessionFiles(path.join(root, d), time);
     (evidence.files as string[]).push(...listing.files);
     (evidence.directories as string[]).push(...(listing.directories ?? []));
     (evidence.uncertain as string[]).push(...listing.uncertain);
@@ -3981,7 +3988,10 @@ export function listSessionFiles(dir: string): SessionFile[] {
   return enumerateSessionFiles(dir).sessions;
 }
 
-export function enumerateSessionFiles(dir: string): SourceEnumeration & { sessions: SessionFile[] } {
+export function enumerateSessionFiles(
+  dir: string,
+  time: ListingTimer = untimed,
+): SourceEnumeration & { sessions: SessionFile[] } {
   const evidence: SourceEnumeration & { sessions: SessionFile[] } = {
     status: 'complete',
     root: dir,
@@ -3992,7 +4002,7 @@ export function enumerateSessionFiles(dir: string): SourceEnumeration & { sessio
   };
   let names: string[] = [];
   try {
-    names = fs.readdirSync(dir);
+    names = time('listing', () => fs.readdirSync(dir));
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { ...evidence, missingRoot: true };
     return { ...evidence, status: 'unavailable', uncertain: [dir] };
@@ -4005,7 +4015,7 @@ export function enumerateSessionFiles(dir: string): SourceEnumeration & { sessio
     }
     const file = path.join(dir, name);
     try {
-      const stat = fs.statSync(file, { bigint: true });
+      const stat = time('stats', () => fs.statSync(file, { bigint: true }));
       if (!stat.isFile()) continue;
       (evidence.files as string[]).push(file);
       if (stat.size > BigInt(Number.MAX_SAFE_INTEGER)) {
@@ -4033,6 +4043,7 @@ export function enumerateSessionFiles(dir: string): SourceEnumeration & { sessio
 // Physical child identities reserve competition even without accepted relationship edges.
 export function enumerateClaudeChildSources(
   parents: readonly SessionFile[],
+  time: ListingTimer = untimed,
 ): SourceEnumeration & { sessions: SessionFile[] } {
   const census: SourceEnumeration & { sessions: SessionFile[] } = {
     status: 'complete',
@@ -4051,7 +4062,7 @@ export function enumerateClaudeChildSources(
       ),
   );
   for (const directory of directories) {
-    const listing = enumerateSessionFiles(directory);
+    const listing = enumerateSessionFiles(directory, time);
     (census.directories as string[]).push(directory);
     (census.files as string[]).push(...listing.files);
     (census.uncertain as string[]).push(...listing.uncertain);
@@ -4071,7 +4082,7 @@ export function enumerateClaudeChildSources(
     }
     for (const source of listing.sessions) {
       if (!source.sessionId.startsWith('agent-')) continue;
-      const opening = readQualifiedSessionCwd(source.file);
+      const opening = time('openings', () => readQualifiedSessionCwd(source.file));
       if (
         !opening ||
         source.dev !== opening.revision.dev ||

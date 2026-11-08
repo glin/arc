@@ -8250,6 +8250,95 @@ test.each(['unresolved scope', 'reused catalog', 'targeted catalog'])(
   },
 );
 
+// A walk records the directory reads, file stats, opening reads and prompt checks of the catalog enumeration as parts of
+// its time, and the catalog build as the rest. A controlled clock moves only inside each part.
+test('a catalog walk records each part of the enumeration time, and the parts sum to the enumeration', async () => {
+  let clock = 0;
+  const advance = (ms: number) => {
+    clock += ms;
+  };
+  const { provider, claude, codex } = bumpedCatalogHarness({
+    performance: { now: () => clock },
+    enumerateRolloutFilesAsync: async () => {
+      advance(5);
+      return { status: 'complete', files: [codex.file], uncertain: [] };
+    },
+    enumerateSessionFilesFor: (
+      _root: string,
+      _folders: string[],
+      _cwdOf: unknown,
+      _missing: unknown,
+      time: (part: string, run: () => unknown) => unknown,
+    ) => {
+      time('listing', () => advance(3));
+      time('stats', () => advance(2));
+      return { sessions: [claude], files: [claude.file], status: 'complete', uncertain: [] };
+    },
+    enumerateClaudeChildSources: (_parents: SessionFile[], time: (part: string, run: () => unknown) => unknown) => {
+      time('listing', () => advance(1));
+      return { sessions: [], files: [], directories: [], status: 'complete', uncertain: [] };
+    },
+    codexSessionFiles: (
+      _root: string,
+      _folders: string[],
+      metaOf: (file: string) => unknown,
+      statOf: (file: string) => unknown,
+    ) => {
+      metaOf(codex.file);
+      statOf(codex.file);
+      return {
+        walked: [codex.file],
+        sessions: [codex],
+        subagents: [],
+        sources: [],
+        enumeration: { status: 'complete', files: [codex.file], uncertain: [] },
+        admission: 'complete',
+      };
+    },
+    readRolloutStat: () => {
+      advance(4);
+      return null;
+    },
+    discoverClaudeSessionSpendSources: () => {
+      advance(13);
+      return [];
+    },
+  });
+  provider.codexColdReads = null;
+  provider.codexMetas = {
+    keys: () => [],
+    revision: 1,
+    get: () => {
+      advance(6);
+      return null;
+    },
+  };
+  provider.prepareHumanPrompts = async (sessions: SessionFile[]) => {
+    advance(11);
+    return sessions;
+  };
+  const refreshes = new Map<string, number[]>();
+  provider.performanceCounters = {
+    ...provider.performanceCounters,
+    recordRefresh: (name: string, ms: number) => refreshes.set(name, [...(refreshes.get(name) ?? []), ms]),
+  };
+
+  await provider.refresh(true);
+
+  const parts = ['listing', 'stats', 'openings', 'prompts', 'build'];
+  assert.deepEqual(
+    Object.fromEntries(parts.map((part) => [part, refreshes.get(`catalog-enumeration:${part}`)])),
+    { listing: [9], stats: [6], openings: [6], prompts: [11], build: [13] },
+    'a part of the walk was not timed, or its time went to another part',
+  );
+  assert.deepEqual(refreshes.get('catalog-enumeration'), [45]);
+  assert.equal(
+    parts.reduce((sum, part) => sum + refreshes.get(`catalog-enumeration:${part}`)![0], 0),
+    refreshes.get('catalog-enumeration')![0],
+    'the parts do not sum to the enumeration time',
+  );
+});
+
 test('a cold handoff accepts the catalog without enumerating the rollout directory twice', async () => {
   const root = tempDir('enumeration-single-walk-');
   const { provider, claudeWalk } = bumpedCatalogHarness({

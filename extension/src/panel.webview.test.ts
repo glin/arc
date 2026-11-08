@@ -4160,7 +4160,7 @@ test('command-only admission removes pending rows through every catalog path and
       refreshBody.indexOf('let all = selectedOnly'),
       refreshBody.indexOf("this.performanceCounters.recordRefresh('catalog-enumeration'"),
     ) + '\nreturn all;',
-    'selectedOnly = true, reuseCatalog = true, controller = new AbortController(), generation = this.refreshGeneration, previousSelection = this.previousSelection ?? null',
+    'selectedOnly = true, reuseCatalog = true, controller = new AbortController(), generation = this.refreshGeneration, previousSelection = this.previousSelection ?? null, enumerationParts = { ms: { prompts: 0 } }, catalogStarted = 0',
   );
   const childrenBody = methodBody('private async prepareClaudeChildren(');
   const discovery = compile(
@@ -12351,7 +12351,7 @@ test('both agents reach one list, and each session is read and named by its own 
   );
   sourceMatch(
     merge,
-    /enumerateSessionFilesFor\(projectsRoot\(\), roots,[\s\S]*workspaceFolders\);/,
+    /enumerateSessionFilesFor\(projectsRoot\(\), roots,[\s\S]*workspaceFolders, time\);/,
     'Claude discovery either omits worktree roots or trusts a missing cwd outside the open folder',
   );
   sourceMatch(
@@ -13408,7 +13408,7 @@ test('Claude child sessions own lifetime figures while project files stay dedupl
   );
   sourceMatch(
     panelHostSource,
-    /\(file\) => qualifiedCodexStats\.get\(file\) \?\? \(this\.watching \? this\.codexStats\.get\(file\) : readRolloutStat\(file\)\)/,
+    /\(\) => qualifiedCodexStats\.get\(file\) \?\? \(this\.watching \? this\.codexStats\.get\(file\) : readRolloutStat\(file\)\)/,
     'a walk while the panel is hidden reused a rollout stat no watcher kept current',
   );
 });
@@ -21174,8 +21174,8 @@ function methodBody(marker: string): string {
   assert.ok(body !== undefined, `${marker} has no body this guard can read`);
   const extracted = body.slice(1, -1);
   if (marker === 'private allSessions(') {
-    return `const codexEnumeration = arguments[2]; const deferWalk = arguments[3];
-      this.walkedSessions = function(roots, workspaceFolders, folderPrint, deferHumanPrompts, codexEnumeration) {
+    return `const codexEnumeration = arguments[2]; const deferWalk = arguments[3]; const parts = arguments[5];
+      this.walkedSessions = function(roots, workspaceFolders, folderPrint, deferHumanPrompts, codexEnumeration, parts) {
         ${methodBody('private walkedSessions(')}
       };
       ${extracted}`;

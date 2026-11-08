@@ -120,6 +120,8 @@ import {
   projectsRoot,
   enumerateSessionFilesFor,
   enumerateClaudeChildSources,
+  type ListingPart,
+  type ListingTimer,
   readSession,
   scanSessionCwd,
   readQualifiedSessionCwd,
@@ -725,6 +727,13 @@ import { panelShell } from './paneldevelopment';
 // and first-touch snapshots. The webview supports variable-height turn cards.
 
 // The members of the built-in Git extension's API, version 1, that Arc reads.
+// The wall time of each part of one catalog enumeration that the counters time on their own, in milliseconds.
+// `time` adds the duration of one call to its part. A call inside another timed call adds nothing.
+interface CatalogEnumerationParts {
+  ms: Record<ListingPart | 'prompts', number>;
+  time: ListingTimer;
+}
+
 interface GitExtensionExports {
   getAPI?(version: 1): { readonly repositories: ReadonlyArray<{ readonly rootUri: vscode.Uri }> };
 }
@@ -9888,13 +9897,37 @@ export class PanelProvider implements vscode.Disposable {
         this.claimCatalogRefresh(controller);
       }
       const catalogStarted = performance.now();
+      // The counters time the directory reads, file stats, opening reads and prompt checks of the enumeration.
+      // The catalog build is the rest of it.
+      let timing = false;
+      const enumerationParts: CatalogEnumerationParts = {
+        ms: { listing: 0, stats: 0, openings: 0, prompts: 0 },
+        time: (part, run) => {
+          if (timing) return run();
+          timing = true;
+          const started = performance.now();
+          try {
+            return run();
+          } finally {
+            enumerationParts.ms[part] += performance.now() - started;
+            timing = false;
+          }
+        },
+      };
       const deferredWalk = { needed: false };
       let all = selectedOnly
         ? (this.authoritativeCatalog ?? [])
-        : this.allSessions(reuseCatalog, true, primedEnumeration, deferredWalk, `requested:${refreshReason}`);
+        : this.allSessions(
+            reuseCatalog,
+            true,
+            primedEnumeration,
+            deferredWalk,
+            `requested:${refreshReason}`,
+            enumerationParts,
+          );
       // A held catalog or a supplied enumeration listed above without an await.
       if (!selectedOnly && deferredWalk.needed) {
-        const walked = await this.walkCatalog(controller.signal, generation);
+        const walked = await this.walkCatalog(controller.signal, generation, enumerationParts);
         if (!walked) return;
         all = walked;
         // A walk restarts the poll's backstop clock, so a refresh that the held catalog could not serve sends the discovery
@@ -9937,6 +9970,7 @@ export class PanelProvider implements vscode.Disposable {
         : null;
       // Without repository scope, a catalog refresh keeps the held catalog and reaches the scope check without yielding.
       if (selectedOnly || this.repositoryScopeReady) {
+        const promptsStarted = performance.now();
         const prepared = await this.prepareHumanPrompts(
           switched ? all.filter((session) => switched.has(session.sessionId)) : all,
           false,
@@ -9946,6 +9980,7 @@ export class PanelProvider implements vscode.Disposable {
           admissionSelection,
           selectedOnly ? 'recheck' : 'skip',
         );
+        enumerationParts.ms.prompts += performance.now() - promptsStarted;
         if (
           controller.signal.aborted ||
           generation !== this.refreshGeneration ||
@@ -9970,7 +10005,14 @@ export class PanelProvider implements vscode.Disposable {
           if (admitted.length !== this.authoritativeCatalog.length) this.authoritativeCatalog = admitted;
         }
       }
-      this.performanceCounters.recordRefresh('catalog-enumeration', performance.now() - catalogStarted);
+      const enumerationMs = performance.now() - catalogStarted;
+      this.performanceCounters.recordRefresh('catalog-enumeration', enumerationMs);
+      let timedMs = 0;
+      for (const [part, ms] of Object.entries(enumerationParts.ms)) {
+        timedMs += ms;
+        this.performanceCounters.recordRefresh(`catalog-enumeration:${part}`, ms);
+      }
+      this.performanceCounters.recordRefresh('catalog-enumeration:build', Math.max(0, enumerationMs - timedMs));
       if (this.repositoryScopeReady) {
         this.startupHistory?.stage('openingsEnumerated');
       }
@@ -12566,7 +12608,11 @@ export class PanelProvider implements vscode.Disposable {
   // Selection and other messages run during the walk. The answer is null when the refresh became obsolete
   // during the walk: canceled, superseded, hidden, or moved to another rollout root. It is also null when the walk
   // reached `CATALOG_WALK_DEADLINE_MS`. The refresh deadline does not abandon a refresh while its walk runs.
-  private async walkCatalog(signal: AbortSignal, generation: number): Promise<SessionFile[] | null> {
+  private async walkCatalog(
+    signal: AbortSignal,
+    generation: number,
+    parts?: CatalogEnumerationParts,
+  ): Promise<SessionFile[] | null> {
     const root = codexSessionsRoot();
     // The walk serves every waiting request that walks and names no file, so none of them walks again after it.
     const running = { signal, overdue: false };
@@ -12578,6 +12624,7 @@ export class PanelProvider implements vscode.Disposable {
     let deadline: ReturnType<typeof setTimeout> | undefined;
     let stop = () => {};
     let enumeration: SourceEnumeration | null | 'deadline';
+    const listingStarted = performance.now();
     try {
       enumeration = await Promise.race([
         enumerateRolloutFilesAsync(root, walk.signal),
@@ -12589,6 +12636,7 @@ export class PanelProvider implements vscode.Disposable {
         }),
       ]);
     } finally {
+      if (parts) parts.ms.listing += performance.now() - listingStarted;
       walk.abort();
       clearTimeout(deadline);
       signal.removeEventListener('abort', stop);
@@ -12609,7 +12657,7 @@ export class PanelProvider implements vscode.Disposable {
     this.pendingRefresh = settleWalkFold(this.pendingRefresh, running, listed);
     if (!listed) return null;
     // Scope resolves again after the walk. A scope that became unresolved lists nothing and discards the walk.
-    return this.allSessions(false, true, walked);
+    return this.allSessions(false, true, walked, undefined, undefined, parts);
   }
 
   // Add the compressed rollouts that a walk listed or a wake batch named. A complete walk also removes every name it no
@@ -12626,12 +12674,14 @@ export class PanelProvider implements vscode.Disposable {
   // With `deferWalk`, a missed reuse that has no supplied Codex enumeration sets `deferWalk.needed` and lists
   // nothing, so the caller can walk the rollout tree asynchronously.
   // `walkCause` names a walk that runs because the caller did not ask for reuse. A caller that may walk must name it.
+  // `parts` times the filesystem calls of a walk.
   private allSessions(
     reuseCatalog = false,
     deferHumanPrompts = false,
     codexEnumeration?: SourceEnumeration,
     deferWalk?: { needed: boolean },
     walkCause = 'unnamed',
+    parts?: CatalogEnumerationParts,
   ): SessionFile[] {
     const workspaceFolders = this.folders();
     const scope = this.repositoryScope.snapshot(workspaceFolders);
@@ -12757,7 +12807,7 @@ export class PanelProvider implements vscode.Disposable {
       deferWalk.needed = true;
       return [];
     }
-    return this.walkedSessions(scope.roots, workspaceFolders, folderPrint, deferHumanPrompts, codexEnumeration);
+    return this.walkedSessions(scope.roots, workspaceFolders, folderPrint, deferHumanPrompts, codexEnumeration, parts);
   }
 
   private walkedSessions(
@@ -12766,7 +12816,9 @@ export class PanelProvider implements vscode.Disposable {
     folderPrint: string,
     deferHumanPrompts: boolean,
     codexEnumeration?: SourceEnumeration,
+    parts?: CatalogEnumerationParts,
   ): SessionFile[] {
+    const time: ListingTimer = parts?.time ?? ((_part, run) => run());
     const codexRevision = this.codexMetas.revision;
     const collisionFiles = new Set(
       this.enumeratedCollisions?.sources.map((source) => source.agent + '\0' + normalizeFsPath(source.file)),
@@ -12786,7 +12838,7 @@ export class PanelProvider implements vscode.Disposable {
     const claudeListing = enumerateSessionFilesFor(
       projectsRoot(),
       roots,
-      (file, session) => {
+      (file, session) => time('openings', () => {
         if (collides('claude', file)) {
           const opening = readQualifiedSessionCwd(file);
           if (
@@ -12824,15 +12876,16 @@ export class PanelProvider implements vscode.Disposable {
         });
         this.cwds.set(file, { cwd, mtimeMs: session.mtimeMs, size: session.size, unavailable });
         return cwd;
-      },
+      }),
       workspaceFolders,
+      time,
     );
     const claude = claudeListing.sessions;
     // A hidden panel ignores watcher events, so a walk then stats every rollout and holds none.
     const listing = codexSessionFiles(
       codexSessionsRoot(),
       roots,
-      (file) => {
+      (file) => time('openings', () => {
         if (isCompressedRollout(file)) return null;
         if (collides('codex', file)) {
           const opening = readQualifiedCodexOpening(file);
@@ -12857,12 +12910,16 @@ export class PanelProvider implements vscode.Disposable {
           }
         }
         return this.codexMetas.get(file);
-      },
-      (file) => qualifiedCodexStats.get(file) ?? (this.watching ? this.codexStats.get(file) : readRolloutStat(file)),
+      }),
+      (file) =>
+        time(
+          'stats',
+          () => qualifiedCodexStats.get(file) ?? (this.watching ? this.codexStats.get(file) : readRolloutStat(file)),
+        ),
       undefined,
       codexEnumeration,
     );
-    const census = enumerateClaudeChildSources([...claude, ...this.claudeChildren]);
+    const census = enumerateClaudeChildSources([...claude, ...this.claudeChildren], time);
     this.walkedChildSources = census.sessions;
     const childSources = census.sessions.filter((source) => !source.cwd || inRoots(source.cwd));
     claudeListing.files = [...claudeListing.files, ...census.files];
