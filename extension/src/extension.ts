@@ -98,9 +98,8 @@ import {
   failedCompactionDelivery,
   failedClearDelivery,
   acceptedSessionSettings,
-  fastModelChoice,
-  type SessionSettingSelection,
-  tierOffered,
+  fastTierRefusal,
+  sessionSettingStore,
   toggleFastSelection,
   acceptedPermissionMode,
   SessionSettingBook,
@@ -950,24 +949,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const SESSION_SETTINGS_KEY = STORED_STATE_KEYS.sessionSettings;
   const SKILLS_KEY = STORED_STATE_KEYS.claudeSkills;
   const stored = (key: string): Record<string, string> => context.workspaceState.get<Record<string, string>>(key) ?? {};
-  let currentSettingBook: SessionSettingBook = {
-    ...(context.workspaceState.get<SessionSettingBook>(SESSION_SETTINGS_KEY) ?? {}),
-  };
-  const settingBook = (): SessionSettingBook => currentSettingBook;
-  const persistSettingBook = (book: SessionSettingBook): Promise<void> => {
-    currentSettingBook = book;
-    return sessionSettingsWrites.write(() => context.workspaceState.update(SESSION_SETTINGS_KEY, currentSettingBook));
-  };
-  // Writes before publishing, for a change that the running child must see only after it is durable.
-  const commitSessionSetting = (session: string, fields: Partial<SessionSettingSelection>): Promise<void> =>
-    sessionSettingsWrites.write(async () => {
-      const next = withSessionSettings(currentSettingBook, session, {
-        ...sessionSettings(currentSettingBook, session),
-        ...fields,
-      });
-      await context.workspaceState.update(SESSION_SETTINGS_KEY, next);
-      currentSettingBook = next;
-    });
+  const settingStore = sessionSettingStore(
+    { ...(context.workspaceState.get<SessionSettingBook>(SESSION_SETTINGS_KEY) ?? {}) },
+    (book) => context.workspaceState.update(SESSION_SETTINGS_KEY, book),
+    sessionSettingsWrites,
+  );
+  const settingBook = settingStore.read;
+  const persistSettingBook = settingStore.persist;
+  const commitSessionSetting = settingStore.commit;
   const persistSessionSettings = (session: string, settings: ReturnType<typeof sessionSettings>): Promise<void> =>
     persistSettingBook(withSessionSettings(settingBook(), session, settings));
   function askModeFor(agent: string, session?: string): AskMode | undefined {
@@ -2188,11 +2177,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         stage: async (tier) => {
           const live = child();
           if (live) return await host.withActivity(live.key, (active) => active.stageServiceTier(tier));
-          if (
-            tier !== 'default' &&
-            tierOffered(fastModelChoice(models.get('codex')?.models ?? [], model), tier) === false
-          )
-            throw new Error(`Codex does not offer service tier ${tier} for ${model || 'the selected model'}.`);
+          const refusal = fastTierRefusal(models.get('codex')?.models ?? [], model, tier);
+          if (refusal) throw new Error(refusal);
           return null;
         },
         retire: async () => {

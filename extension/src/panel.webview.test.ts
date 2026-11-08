@@ -1861,7 +1861,7 @@ import { readCodexContext } from './codexcontext';
 import { normalizeContext, unavailableContext } from './domain/context-detail';
 import { drawContextDetail } from './webview/context-detail';
 
-import { afterAll, beforeAll, test, vi } from 'vitest';
+import { onTestFinished, afterAll, beforeAll, test, vi } from 'vitest';
 import { SessionNames } from './sessionnames.ts';
 import {
   carryDerivedTitleFacts,
@@ -2601,6 +2601,7 @@ import {
   sessionSettings,
   withSessionSettings,
   sessionSettingsForProfile,
+  prospectiveNextTurn,
   draftProfileAfterPick,
   draftStarted,
   newSessionDraft,
@@ -45603,4 +45604,175 @@ test('a prompt sent during a /fast change stays out of delivery', async () => {
   assert.equal(restored()[0].text, 'Ship it');
   finish({ outcome: 'changed', tier: 'priority' });
   await vi.waitFor(() => assert.equal(provider.fastToggles.has(session), false));
+});
+
+function draftFastProvider(
+  models: object[] = [{ value: 'model-a', label: 'A', description: '', efforts: [], serviceTiers: ['priority'] }],
+  tier?: string,
+) {
+  const typed = typedRenameProvider('codex');
+  const { provider, session } = typed;
+  const profile = {
+    agent: 'codex',
+    model: 'model-a',
+    effort: '',
+    permissionMode: '',
+    source: 'recent',
+  } as SessionProfile;
+  const draft = newSessionDraft(session, 'C:/ws', null, 1, profile);
+  const reads: Array<(value: unknown) => void> = [];
+  Object.assign(provider, {
+    newDrafts: { [session]: tier ? { ...draft, serviceTier: tier } : draft },
+    draftProfiles: { [session]: profile },
+    picks: { [session]: { ...sessionSettingsForProfile(profile), ...(tier ? { serviceTier: tier } : {}) } },
+    models: { codex: models, claude: [] },
+    defaultContext: undefined,
+    refreshFrom() {},
+    refreshUsageHandler() {},
+    onReadFastEvidence: () => new Promise((resolve) => reads.push(resolve)),
+  });
+  provider.drafts[session] = '/fast';
+  const restored = () => typed.posted.filter((message) => message.type === 'restoreDraft');
+  const settled = () => vi.waitFor(() => assert.equal(provider.fastToggles.has(session), false));
+  return { ...typed, reads, restored, settled };
+}
+
+test('a draft runs one /fast at a time, so two presses read one starting speed', async () => {
+  const { provider, session, reads, restored, settled, sent } = draftFastProvider();
+  provider.sendPrompt('/fast', session, 1);
+  await vi.waitFor(() => assert.equal(reads.length, 1));
+  provider.sendPrompt('/fast', session, 2);
+  await vi.waitFor(() => assert.equal(restored().length, 1));
+  assert.match(String(restored()[0].notice), /Wait for/);
+  reads[0]({ status: 'absent' });
+  await settled();
+  assert.equal(reads.length, 1, 'a second press read the speed again');
+  assert.equal(provider.newDrafts[session].serviceTier, 'priority');
+  assert.deepEqual(sent, []);
+});
+
+test('a draft setup change during the speed reading leaves the speed unchanged', async () => {
+  const { provider, session, reads, restored, settled } = draftFastProvider([
+    { value: 'model-a', label: 'A', description: '', efforts: [], serviceTiers: ['priority'] },
+    { value: 'model-b', label: 'B', description: '', efforts: [], serviceTiers: [] },
+  ]);
+  provider.sendPrompt('/fast', session, 1);
+  await vi.waitFor(() => assert.equal(reads.length, 1));
+  provider.pickOnDraft(session, 'model', 'model-b');
+  assert.equal(provider.newDrafts[session].profile.model, 'model-b');
+  reads[0]({ status: 'absent' });
+  await settled();
+  assert.equal(provider.newDrafts[session].serviceTier, undefined, 'Fast was saved against the changed model');
+  assert.equal(provider.picks[session].serviceTier, undefined);
+  assert.match(String(restored()[0].notice), /draft changed/);
+  assert.equal(provider.drafts[session], '/fast');
+});
+
+test('leaving a draft during and after /fast retains the draft and its speed', async () => {
+  const { provider, session, reads, settled } = draftFastProvider();
+  provider.sendPrompt('/fast', session, 1);
+  await vi.waitFor(() => assert.equal(reads.length, 1));
+  assert.equal(provider.drafts[session], '');
+  assert.equal(provider.abandonDraft(session, false), false, 'leaving dropped a draft with a running control');
+  reads[0]({ status: 'absent' });
+  await settled();
+  const accepted = provider.newDrafts[session];
+  assert.equal(accepted.serviceTier, 'priority');
+  assert.equal(accepted.draftId, session, 'the late reading rebuilt the draft');
+  assert.equal(accepted.handChanged, true);
+  assert.equal(provider.abandonDraft(session, false), false, 'leaving dropped a draft with an accepted speed');
+  assert.equal(provider.newDrafts[session], accepted);
+});
+
+test('a draft removed or replaced during the speed reading is not recreated', async () => {
+  const notices: string[] = [];
+  const original = vscode.window.showInformationMessage;
+  Object.assign(vscode.window, { showInformationMessage: (message: string) => notices.push(message) });
+  onTestFinished(() => {
+    Object.assign(vscode.window, { showInformationMessage: original });
+  });
+  const removed = draftFastProvider();
+  removed.provider.sendPrompt('/fast', removed.session, 1);
+  await vi.waitFor(() => assert.equal(removed.reads.length, 1));
+  delete removed.provider.newDrafts[removed.session];
+  removed.reads[0]({ status: 'absent' });
+  await removed.settled();
+  assert.match(notices.join(' '), /draft changed/);
+  assert.equal(removed.provider.newDrafts[removed.session], undefined, 'a late reading recreated a removed draft');
+  assert.equal(removed.provider.picks[removed.session].serviceTier, undefined);
+  assert.deepEqual(removed.restored(), [], 'a removed draft has no prompt box to restore into');
+  assert.equal(removed.provider.drafts[removed.session], '');
+
+  const replaced = draftFastProvider();
+  replaced.provider.sendPrompt('/fast', replaced.session, 1);
+  await vi.waitFor(() => assert.equal(replaced.reads.length, 1));
+  const successor = newSessionDraft(
+    replaced.session,
+    'C:/ws',
+    null,
+    2,
+    replaced.provider.newDrafts[replaced.session].profile,
+  );
+  replaced.provider.newDrafts[replaced.session] = successor;
+  replaced.reads[0]({ status: 'absent' });
+  await replaced.settled();
+  assert.equal(replaced.provider.newDrafts[replaced.session], successor, 'the speed landed on a draft it never read');
+  assert.equal(replaced.provider.picks[replaced.session].serviceTier, undefined);
+  assert.match(String(replaced.restored()[0].notice), /draft changed/);
+});
+
+test('a draft needs a positive catalog report before Fast turns on, and always turns Fast off', async () => {
+  const noList = { value: 'model-a', label: 'A', description: '', efforts: [] };
+  for (const [name, models, notice] of [
+    ['no row', [{ value: 'other', label: 'O', description: '', efforts: [] }], /has not reported/],
+    ['no list', [noList], /has not reported/],
+    ['empty list', [{ ...noList, serviceTiers: [] }], /does not offer/],
+  ] as const) {
+    const { provider, session, reads, restored, settled } = draftFastProvider([...models]);
+    provider.sendPrompt('/fast', session, 1);
+    await vi.waitFor(() => assert.equal(reads.length, 1));
+    reads[0]({ status: 'absent' });
+    await settled();
+    assert.equal(provider.newDrafts[session].serviceTier, undefined, `${name}: Fast was accepted without a report`);
+    assert.match(String(restored()[0].notice), notice, name);
+  }
+  const off = draftFastProvider([noList], 'priority');
+  off.provider.sendPrompt('/fast', off.session, 1);
+  await off.settled();
+  assert.equal(off.provider.newDrafts[off.session].serviceTier, 'default', 'an unknown model blocked turning Fast off');
+  assert.deepEqual(off.restored(), []);
+});
+
+test('a Fast Codex draft that moves to Claude carries no speed into the setup or the price', async () => {
+  const { provider, session, reads, settled } = draftFastProvider();
+  provider.sendPrompt('/fast', session, 1);
+  await vi.waitFor(() => assert.equal(reads.length, 1));
+  reads[0]({ status: 'absent' });
+  await settled();
+  assert.equal(provider.picks[session].serviceTier, 'priority');
+  provider.models.claude = [{ value: 'opus', label: 'Opus', description: '', efforts: [] }];
+  provider.pickOnDraft(session, 'agent', 'claude');
+  assert.equal(provider.newDrafts[session].profile.agent, 'claude');
+  assert.equal(provider.newDrafts[session].serviceTier, undefined, 'the Claude draft carried a Codex speed');
+  assert.equal(provider.picks[session].serviceTier, undefined);
+  const settings = { ...provider.picks[session], confirmedModel: null };
+  const basis = {
+    tokens: 1,
+    outputTokens: 0,
+    window: 200_000,
+    model: 'claude-opus-5',
+    provider: null,
+    tier: null,
+    lastRequestAt: 0,
+    inferenceClass: null,
+    serviceTier: null,
+    readBack: false,
+    afterCompaction: false,
+  };
+  assert.equal(
+    prospectiveNextTurn({ agent: 'claude', models: [], settings, nextTurn: basis } as never)!.basis.serviceTier,
+    null,
+  );
+  // Adoption stores the composer state settings, so a speed cannot return through them.
+  assert.equal(provider.stateFor(session).settings.serviceTier, undefined, 'adoption would keep a Codex speed');
 });

@@ -371,10 +371,10 @@ import {
   fastRequest,
   FAST_ARGUMENTS,
   FAST_SAVE_FAILED,
+  FAST_DRAFT_CHANGED,
   FAST_UNRESOLVED,
-  fastModelChoice,
+  fastTierRefusal,
   fastUnresolved,
-  tierOffered,
   toggleFastSelection,
   type FastToggleResult,
   renameRequest,
@@ -5801,7 +5801,7 @@ export class PanelProvider implements vscode.Disposable {
       },
       draftId,
       this.newDrafts[draftId]?.handChanged,
-      this.staging.has(draftId),
+      this.staging.has(draftId) || (this.fastToggles?.has(draftId) ?? false),
     );
     if (!next) {
       return false;
@@ -6009,7 +6009,8 @@ export class PanelProvider implements vscode.Disposable {
       profile.model !== next.model ||
       profile.effort !== next.effort ||
       profile.permissionMode !== next.permissionMode;
-    const tier = draft.serviceTier === undefined ? {} : { serviceTier: draft.serviceTier };
+    // Speed belongs to Codex. A draft that moves to Claude has no speed to carry.
+    const tier = next.agent === 'codex' && draft.serviceTier !== undefined ? { serviceTier: draft.serviceTier } : {};
     this.newDrafts[session] = {
       ...newSessionDraft(
         draft.draftId,
@@ -9313,6 +9314,7 @@ export class PanelProvider implements vscode.Disposable {
   // has not typed since.
   private async fastFromComposer(state: ComposerState, text: string, source: string, revision: number): Promise<void> {
     const session = state.sessionId;
+    const draft = this.newDrafts[session];
     if ((this.draftRevisions?.get(session) ?? 0) <= revision) this.typedRenames.set(session, revision);
     this.fastToggles ??= new Map();
     this.fastToggles.set(session, (this.fastToggles.get(session) ?? 0) + 1);
@@ -9329,7 +9331,8 @@ export class PanelProvider implements vscode.Disposable {
     const untouched = this.typedRenames.get(session) === revision;
     if (untouched) this.typedRenames.delete(session);
     if (result.outcome === 'refused') {
-      if (untouched) {
+      // A removed draft has no prompt box to restore the command into.
+      if (untouched && (!draft || this.newDrafts[session])) {
         this.holdDraft(session, text);
         void this.post({ type: 'restoreDraft', session: source, text, revision, notice: result.notice });
       } else {
@@ -9346,25 +9349,35 @@ export class PanelProvider implements vscode.Disposable {
       return { outcome: 'refused', notice: FAST_UNRESOLVED };
     const cwd = this.cwdForSession(state.agent, session);
     const draft = this.newDrafts[session];
-    const model = state.settings.selectedModel || state.settings.confirmedModel || draft?.profile.model || '';
+    const model =
+      state.settings.selectedModel ||
+      state.settings.confirmedModel ||
+      draft?.profile.model ||
+      state.defaults?.base?.model ||
+      '';
     if (!draft) {
       return this.onFastToggle
         ? await this.onFastToggle(session, cwd, model)
         : { outcome: 'refused', notice: FAST_UNRESOLVED };
     }
+    // Two commands would read the same starting speed and both select Fast, so a draft runs one at a time.
+    if ((this.fastToggles?.get(session) ?? 0) > 1) return { outcome: 'refused', notice: FAST_UNRESOLVED };
     // A draft has no child and no durable session. Its speed reaches the launch through the draft itself.
     return await toggleFastSelection({
       session,
       read: () => this.picks,
       commit: async (serviceTier) => {
-        this.newDrafts[session] = { ...this.newDrafts[session], serviceTier };
+        // An accepted speed is a setup change, so leaving the draft retains it.
+        this.newDrafts[session] = { ...draft, handChanged: true, serviceTier };
         this.picks = withSessionSettings(this.picks, session, { ...sessionSettings(this.picks, session), serviceTier });
         void this.post({ type: 'usage', usage: this.usagePayload() });
       },
       evidence: async () => (await this.onReadFastEvidence?.(cwd, model)) ?? null,
       stage: async (tier) => {
-        if (tier !== 'default' && tierOffered(fastModelChoice(this.models[state.agent] ?? [], model), tier) === false)
-          throw new Error(`Codex does not offer service tier ${tier} for ${model || 'the selected model'}.`);
+        // Setup changes and adoption replace the draft object while the speed reading runs. The commit follows this check without a reading between them.
+        if (this.newDrafts[session] !== draft) throw new Error(FAST_DRAFT_CHANGED);
+        const refusal = fastTierRefusal(this.models[state.agent] ?? [], model, tier);
+        if (refusal) throw new Error(refusal);
         return null;
       },
       retire: async () => {},

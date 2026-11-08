@@ -12,7 +12,7 @@ Claude commands lack ownership metadata. Classify them with the working director
 
 [`composerview.ts`](../extension/src/composerview.ts)'s `availableCommands` adds `/remote-control` and `/rc` because Claude's published catalog omits them. [`claudeskillpath.ts`](../extension/src/claudeskillpath.ts) resolves missing definition paths, with project skills before the reader's Claude skills folder.
 
-[`composerview.ts`](../extension/src/composerview.ts)'s `sessionCommands` adds a local `/fast` row to one Codex session when the next turn's model offers Fast, or when that session has Fast selected. A model without a reported speed list gets no row. A native skill named `fast` keeps its `$fast` form, and the bare `/fast` spelling is the [local control](prompt-delivery.md#local-controls).
+[`composerview.ts`](../extension/src/composerview.ts)'s `sessionCommands` adds a local `/fast` row to one Codex session when the next turn's model offers Fast, when the session's accepted selection is Fast, or when no selection exists and a qualified Codex reading reports Fast. A model without a reported speed list otherwise gets no row, and a speed that an earlier turn returned does not count. A native skill named `fast` keeps its `$fast` form, and the bare `/fast` spelling is the [local control](prompt-delivery.md#local-controls).
 
 [`commandcatalog.ts`](../extension/src/commandcatalog.ts) separates agent-wide ordinary catalogs from optional entries bound to one child generation and immutable release. Idle or sibling children supply no optional entry to another session. Provisional drafts use their retained child. Reload starts completion empty until a session answers.
 

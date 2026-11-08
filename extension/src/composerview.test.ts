@@ -100,6 +100,8 @@ import {
   remoteControlRequest,
   fastRequest,
   toggleFastSelection,
+  fastTierRefusal,
+  sessionSettingStore,
   nextFastSelection,
   fastUnresolved,
   tierOffered,
@@ -163,6 +165,8 @@ import {
   prospectiveNextTurn,
 } from './composerview.ts';
 import { Ask, readModels } from './claudewire.ts';
+import { readModels as readCodexModels } from './codexwire.ts';
+import { UsageWriteQueue } from './usageview.ts';
 import { formatCacheSpan } from './view/time.ts';
 import { McpServer, ModelChoice, PromptEntry, QuestionAsk } from './agentwire.ts';
 import { createClaudeSessionReducer } from './transcript.ts';
@@ -9302,4 +9306,135 @@ test('the /fast completion row follows the session model and the need to switch 
   assert.equal(row([], 'priority'), true, 'switching Fast off stays available');
   assert.equal(row(['priority'], undefined, 'claude'), false);
   assert.equal(tierOffered(null, 'priority'), null);
+});
+
+test('the /fast row counts only a current speed, never a speed an earlier turn returned', () => {
+  const models = [{ value: 'model-a', label: 'A', description: '', efforts: [], serviceTiers: [] as string[] }];
+  const row = (
+    over: Partial<ComposerState['settings']>,
+    reading?: { status: 'known'; tier: 'priority' | 'default' },
+  ) => {
+    const state = composerState({
+      agent: 'codex',
+      models,
+      ...(reading
+        ? {
+            defaults: { base: { status: 'ready', model: 'model-a', effort: 'high', reason: '', serviceTier: reading } },
+          }
+        : {}),
+    });
+    state.settings = { ...state.settings, selectedModel: 'model-a', ...over };
+    return composerView(state)!.commands.some((entry) => entry.command === 'fast');
+  };
+  const reported = { confirmedServiceTier: 'priority' };
+  assert.equal(row(reported), false, 'a returned Fast on a model without Fast is not a current selection');
+  assert.equal(row({ ...reported, serviceTier: 'default' }), false, 'an accepted Standard leaves nothing to turn off');
+  assert.equal(row(reported, { status: 'known', tier: 'priority' }), true, 'the row turns off a configured Fast');
+  assert.equal(row(reported, { status: 'known', tier: 'default' }), false);
+  models[0].serviceTiers = ['priority'];
+  assert.equal(row({ ...reported, serviceTier: 'default' }), true, 'a model with Fast keeps the row');
+});
+
+test('sessions without a child need a positive report before Fast turns on', () => {
+  const row = (extra: object) => [{ value: 'model-a', label: 'A', description: '', efforts: [], ...extra }];
+  const legacy = readCodexModels({ data: [{ id: 'model-a', additionalSpeedTiers: ['fast'] }] }, 0)!.models;
+  const empty = readCodexModels({ data: [{ id: 'model-a', serviceTiers: [] }] }, 0)!.models;
+  assert.match(fastTierRefusal([], 'model-a', 'priority')!, /has not reported/);
+  assert.match(fastTierRefusal(row({}), 'model-a', 'priority')!, /has not reported/);
+  assert.match(fastTierRefusal(empty, 'model-a', 'priority')!, /does not offer/);
+  assert.equal(fastTierRefusal(row({ serviceTiers: ['priority'] }), 'model-a', 'priority'), null);
+  assert.equal(fastTierRefusal(legacy, 'model-a', 'priority'), null);
+  assert.equal(fastTierRefusal(row({ serviceTiers: ['priority'], isDefault: true }), '', 'priority'), null);
+  for (const models of [[], row({}), empty]) assert.equal(fastTierRefusal(models, 'model-a', 'default'), null);
+});
+
+test('a draft Model control reads the accepted speed, and any estimate uses the same selection', () => {
+  const models = [
+    { value: 'gpt-6.1-sol', resolvedModel: 'gpt-6.1-sol', label: 'GPT-6.1-Sol', description: 'Balanced', efforts: [] },
+  ];
+  const profile = draftProfile({ agent: 'codex', model: 'gpt-6.1-sol', effort: '', permissionMode: '' });
+  const state = composerState({ agent: 'codex', models, model: 'gpt-6.1-sol', effort: '', askMode: '', profile });
+  const model = () => composerView(state)!.picks.find((pick) => pick.control === 'model')!;
+  assert.equal(model().detail, 'Balanced');
+  assert.equal(composerView(state)!.nextTurn, null, 'a draft has no price basis');
+  state.settings = { ...state.settings, serviceTier: 'priority' };
+  assert.equal(model().detail, 'Fast selected for the next turn. Balanced');
+  assert.match(model().name, /Fast selected for the next turn/);
+  assert.equal(composerView(state)!.nextTurn, null, 'an accepted speed adds no estimate');
+  state.settings = { ...state.settings, serviceTier: 'default' };
+  assert.equal(model().detail, 'Standard selected for the next turn. Balanced');
+  state.nextTurn = { ...FLOOR_BASIS, model: 'gpt-6.1-sol', provider: 'openai', serviceTier: 'priority' };
+  assert.equal(prospectiveNextTurn(state)!.basis.serviceTier, 'default');
+});
+
+test('a write that lands while a speed is saving keeps both changes, in memory and on disk', async () => {
+  const saves: SessionSettingBook[] = [];
+  let release: () => void = () => {};
+  let hold = true;
+  const store = sessionSettingStore(
+    { sibling: { ...sessionSettings({}, 'sibling'), permissionMode: 'ask' } },
+    (book) => {
+      saves.push(book);
+      if (!hold) return Promise.resolve();
+      hold = false;
+      return new Promise<void>((resolve) => (release = resolve));
+    },
+    new UsageWriteQueue(),
+  );
+  const commit = store.commit('target', { serviceTier: 'priority' });
+  await vi.waitFor(() => assert.equal(saves.length, 1));
+  assert.equal(
+    sessionSettings(store.read(), 'target').serviceTier,
+    undefined,
+    'a speed is published before it is saved',
+  );
+  const permission = acceptedPermissionMode(
+    store.read,
+    store.persist,
+    [{ session: 'target', accept: async () => {} }],
+    'plan',
+  );
+  await vi.waitFor(() => assert.equal(sessionSettings(store.read(), 'target').permissionMode, 'plan'));
+  release();
+  await commit;
+  await permission;
+  const latest = store.read();
+  assert.equal(sessionSettings(latest, 'target').serviceTier, 'priority');
+  assert.equal(
+    sessionSettings(latest, 'target').permissionMode,
+    'plan',
+    'the permission written during the save was lost',
+  );
+  assert.equal(sessionSettings(latest, 'sibling').permissionMode, 'ask');
+  const durable = saves.at(-1)!;
+  assert.equal(sessionSettings(durable, 'target').serviceTier, 'priority', 'the speed never reached disk');
+  assert.equal(sessionSettings(durable, 'target').permissionMode, 'plan', 'the permission never reached disk');
+});
+
+test('a failed speed save leaves a sibling write in place and publishes no speed', async () => {
+  let reject: (error: Error) => void = () => {};
+  let hold = true;
+  const saves: SessionSettingBook[] = [];
+  const store = sessionSettingStore(
+    {},
+    (book) => {
+      saves.push(book);
+      if (!hold) return Promise.resolve();
+      hold = false;
+      return new Promise<void>((_resolve, fail) => (reject = fail));
+    },
+    new UsageWriteQueue(),
+  );
+  const commit = store.commit('target', { serviceTier: 'priority' });
+  await vi.waitFor(() => assert.equal(saves.length, 1));
+  const sibling = store.persist(
+    withSessionSettings(store.read(), 'sibling', { ...sessionSettings({}, 'sibling'), permissionMode: 'plan' }),
+  );
+  reject(new Error('disk full'));
+  await assert.rejects(commit, /disk full/);
+  await sibling;
+  assert.equal(sessionSettings(store.read(), 'target').serviceTier, undefined);
+  assert.equal(sessionSettings(store.read(), 'sibling').permissionMode, 'plan');
+  assert.equal(sessionSettings(saves.at(-1)!, 'target').serviceTier, undefined);
+  assert.equal(sessionSettings(saves.at(-1)!, 'sibling').permissionMode, 'plan');
 });

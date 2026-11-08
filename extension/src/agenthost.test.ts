@@ -1,6 +1,8 @@
 import { afterEach, onTestFinished, test, vi } from 'vitest';
 import assert from 'node:assert';
 import { CONTEXT_FRAME_BYTES, contextFrameId } from './contextframe';
+import { sessionSettingStore } from './composerview';
+import { UsageWriteQueue } from './usageview';
 import * as fs from 'node:fs';
 import fsBuiltin from 'node:fs';
 import osBuiltin from 'node:os';
@@ -13310,4 +13312,80 @@ test('hosted launch: a /compact whose result names its local command ends a wait
     outcome: 'succeeded',
   });
   assert.equal(receipts.latest(launch.launchId)!.report, null);
+});
+
+test('a /fast through the managed child reaches later turns, clear, and a replacement built from the book', async () => {
+  const { host, children } = fakeHost();
+  const store = sessionSettingStore({}, () => Promise.resolve(), new UsageWriteQueue());
+  const opening = host.session(
+    'tier-session',
+    codexPlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT, model: 'model-a' }),
+  );
+  const child = children[0];
+  child.reply({ userAgent: 'codex' });
+  await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'skills/list'));
+  child.reply({ data: [] });
+  await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'thread/start'));
+  child.reply({ thread: { id: 'saved-thread' }, model: 'model-a' });
+  const session = await opening;
+  const staging = host.withActivity('tier-session', (active) => active.stageServiceTier('priority'));
+  await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'model/list'));
+  child.reply({ data: [{ id: 'model-a', serviceTiers: [{ id: 'priority' }] }] });
+  const adopt = (await staging)!;
+  await store.commit('tier-session', { serviceTier: 'priority' });
+  assert.equal(adopt(), true);
+
+  const sending = session.prompt('Continue');
+  await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'turn/start'));
+  assert.equal((child.sent().at(-1)!.params as Record<string, unknown>).serviceTier, 'priority');
+  child.reply({ turn: { id: 'turn-1' } });
+  await sending;
+  child.say(
+    JSON.stringify({
+      method: 'turn/completed',
+      params: { threadId: 'saved-thread', turn: { id: 'turn-1', status: 'completed' } },
+    }) + '\n',
+  );
+
+  const clearing = session.clear();
+  await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'model/list'));
+  child.reply({ data: [{ id: 'model-a', serviceTiers: [{ id: 'priority' }] }] });
+  await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'thread/start'));
+  assert.equal(
+    (child.sent().at(-1)!.params as Record<string, unknown>).serviceTier,
+    'priority',
+    'clear launched the thread without the speed the reader selected',
+  );
+  child.reply({ thread: { id: 'cleared-thread' }, model: 'model-a', serviceTier: 'priority' });
+  await clearing;
+
+  const retiring = host.retireSession('tier-session');
+  child.exit(0);
+  await retiring;
+  const stored = sessionSettings(store.read(), 'tier-session').serviceTier;
+  const replaced = host.session(
+    'tier-session',
+    codexPlan(CODEX, {
+      cwd: WS,
+      clientInfo: CODEX_CLIENT,
+      model: 'model-a',
+      resume: 'saved-thread',
+      serviceTier: stored,
+    }),
+  );
+  const next = children[1];
+  next.reply({ userAgent: 'codex' });
+  await vi.waitFor(() => assert.equal(next.sent().at(-1)?.method, 'skills/list'));
+  next.reply({ data: [] });
+  await vi.waitFor(() => assert.equal(next.sent().at(-1)?.method, 'model/list'));
+  next.reply({ data: [{ id: 'model-a', serviceTiers: [{ id: 'priority' }] }] });
+  await vi.waitFor(() => assert.equal(next.sent().at(-1)?.method, 'thread/resume'));
+  assert.equal(
+    (next.sent().at(-1)!.params as Record<string, unknown>).serviceTier,
+    'priority',
+    'the replacement lost the stored speed',
+  );
+  next.reply({ thread: { id: 'saved-thread' }, model: 'model-a', serviceTier: 'priority' });
+  await replaced;
+  next.exit(0);
 });

@@ -629,12 +629,45 @@ export async function acceptedPermissionMode(
   }
 }
 
+export interface SessionSettingStore {
+  read(): SessionSettingBook;
+  // Publishes first, for a change the child already accepted.
+  persist(book: SessionSettingBook): Promise<void>;
+  // Saves first, for a change the running child must see only after it is durable.
+  commit(session: string, fields: Partial<SessionSettingSelection>): Promise<void>;
+}
+
+// One settings book with both write orders. Every write runs in the same queue and saves the latest book.
+export function sessionSettingStore(
+  initial: SessionSettingBook,
+  save: (book: SessionSettingBook) => PromiseLike<void>,
+  queue: { write(task: () => PromiseLike<void>): Promise<void> },
+): SessionSettingStore {
+  let current = initial;
+  const merged = (book: SessionSettingBook, session: string, fields: Partial<SessionSettingSelection>) =>
+    withSessionSettings(book, session, { ...sessionSettings(book, session), ...fields });
+  return {
+    read: () => current,
+    persist(book) {
+      current = book;
+      return queue.write(() => save(current));
+    },
+    commit: (session, fields) =>
+      queue.write(async () => {
+        await save(merged(current, session, fields));
+        // A change published during the save lacks these fields. Its own queued save stores the merged book.
+        current = merged(current, session, fields);
+      }),
+  };
+}
+
 // A typed Codex /fast. Refusals retain the typed text and show `notice` in the prompt box.
 export type FastToggleResult = { outcome: 'changed'; tier: ServiceTier } | { outcome: 'refused'; notice: string };
 
 export const FAST_ARGUMENTS = 'Speed not changed. Send /fast by itself, with nothing after it.';
 export const FAST_SAVE_FAILED = 'Speed not changed. Arc could not save the speed for this session.';
 export const FAST_UNRESOLVED = 'Speed not changed. Wait for the last prompt or session change to finish.';
+export const FAST_DRAFT_CHANGED = 'The draft changed while Arc read its speed. Send /fast again.';
 const FAST_UNREADABLE = "Speed not changed. Arc could not read this session's current speed.";
 const FAST_EVIDENCE_REFUSALS: Record<'malformed' | 'conflicting' | 'unsupported', string> = {
   malformed: 'Speed not changed. Codex reported a speed setting Arc cannot read.',
@@ -694,7 +727,23 @@ export function tierOffered(model: ModelChoice | null | undefined, tier: Service
 }
 
 export function fastModelChoice(models: readonly ModelChoice[], model: string): ModelChoice | null {
-  return chosenModel(models, model) ?? modelRan(models, model);
+  return (
+    chosenModel(models, model) ??
+    modelRan(models, model) ??
+    (model ? null : (models.find((item) => item.isDefault) ?? null))
+  );
+}
+
+// Why a session without a child cannot select a speed. Standard needs no catalog entry. Other speeds need the catalog's
+// positive report, because a catalog that names no list leaves support unknown.
+export function fastTierRefusal(models: readonly ModelChoice[], model: string, tier: ServiceTier): string | null {
+  if (tier === 'default') return null;
+  const offered = tierOffered(fastModelChoice(models, model), tier);
+  if (offered === true) return null;
+  const name = model || 'the selected model';
+  return offered === false
+    ? `Codex does not offer service tier ${tier} for ${name}.`
+    : `Codex has not reported the speeds that ${name} offers.`;
 }
 
 // Delivery that has left the queue, or a session transition, leaves no session to bind a speed change to.
@@ -4064,6 +4113,10 @@ function draftProfilePicks(state: ComposerState, profile: SessionProfile): Compo
   };
   // Distinguish a resolved model with no effort setting from an unresolved effort default.
   const applied = defaultsForModel(state.models, profile.model, state.defaults);
+  const speedNote =
+    state.settings.serviceTier === undefined
+      ? ''
+      : `${speedName(profile.agent === 'codex' ? 'openai' : null, state.settings.serviceTier)} selected for the next turn.`;
   const noEffortToSet =
     noEffort &&
     !!resolvedChoice(state.models, profile.model, state.defaults) &&
@@ -4080,8 +4133,13 @@ function draftProfilePicks(state: ComposerState, profile: SessionProfile): Compo
     {
       control: 'model',
       label: modelLabel,
-      name: `Model: ${modelLabel}${DRAFT_SCOPE} ${nameEnding('Press to start it on another model.', models.empty)}`,
-      detail: state.defaults?.base?.reason || model?.description || `Which model ${name} runs this draft on`,
+      name: `Model: ${modelLabel}${DRAFT_SCOPE} ${speedNote}${speedNote ? ' ' : ''}${nameEnding('Press to start it on another model.', models.empty)}`,
+      detail: [
+        speedNote,
+        state.defaults?.base?.reason || model?.description || `Which model ${name} runs this draft on`,
+      ]
+        .filter(Boolean)
+        .join(' '),
       disabled: starting || noModel,
       caution: false,
     },
@@ -4946,17 +5004,20 @@ export function availableCommands(commands: readonly ComposerPromptEntry[], agen
   return available;
 }
 
-// The local row offers `/fast` when the next turn's model offers Fast, or when the session needs it to turn Fast off.
+// The local row offers `/fast` when the next turn's model offers Fast, or when the session's current speed is Fast.
+// A returned speed describes an earlier turn, so only the accepted selection or a qualified reading counts as current.
 function fastCommandOffered(state: ComposerState): boolean {
   if (state.agent !== 'codex') return false;
   const selected = state.settings.serviceTier;
   if (selected === 'priority') return true;
-  if (selected === undefined && ['priority', 'fast'].includes(state.settings.confirmedServiceTier ?? '')) return true;
   const model =
     chosenModel(state.models, state.settings.selectedModel) ??
     recordedModel(state) ??
     state.models.find((item) => item.isDefault);
-  return tierOffered(model, 'priority') === true;
+  if (tierOffered(model, 'priority') === true) return true;
+  if (selected !== undefined) return false;
+  const reading = defaultsForModel(state.models, state.settings.selectedModel, state.defaults)?.serviceTier;
+  return reading?.status === 'known' && reading.tier === 'priority';
 }
 
 // One session's prompt entries. The local `/fast` row depends on that session's model and speed.
