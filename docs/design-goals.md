@@ -28,6 +28,8 @@ The reader reviews completed work rather than approving each edit as it happens.
 
 A session has several reading levels: a short heading, turns, activity, and detailed records. The reader opens detail when it helps a decision. Newest turns appear first because the reader usually returns after work has happened.
 
+A figure on a chip or row must tell the reader something essential about the conversation, or inform what the reader does next. A figure that is only interesting stays in the detail behind a chip. Before adding a figure, name the reader decision it informs.
+
 Read and unread state, archive, pins, labels, and saved views help the reader track attention across sessions. A group connects sessions that serve one piece of work inside the current project. These are reader-owned labels rather than facts inferred from file names or agent summaries. A session list filter that an agent sets at the reader's request belongs in Arc. The filter changes no label, pin, or archive state, and the reader can change or clear it.
 
 Comments remain attached to the turn or selected passage they answer. Sending a later prompt carries unsent comments to that session. A review that finds a problem can therefore produce a directed response in place.
