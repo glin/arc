@@ -10203,7 +10203,11 @@ export class PanelProvider implements vscode.Disposable {
       let openingsMs = 0;
       for (const [part, ms] of Object.entries(enumerationParts.ms)) {
         timedMs += ms;
-        if (part.startsWith('openings:')) openingsMs += ms;
+        if (part.startsWith('openings:')) {
+          openingsMs += ms;
+          // A source with no reads holds 0, so the comparison can tell it from a build that does not count reads.
+          this.performanceCounters.recordWork(`openingsRead:${part.slice('openings:'.length)}`, 0);
+        }
         this.performanceCounters.recordRefresh(`catalog-enumeration:${part}`, ms);
       }
       this.performanceCounters.recordRefresh('catalog-enumeration:openings', openingsMs);

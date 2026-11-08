@@ -2124,6 +2124,22 @@ test('the opening read counts of a saved snapshot reach the report and never fai
   assert.equal(measuresOf(held).get('openingsRead:children')?.value, 9);
 });
 
+test('a launch whose readers read nothing reports 0 for every source, and an older build reports none', async () => {
+  const { provider } = bumpedCatalogHarness();
+  provider.performanceCounters = new PanelPerformanceCounters();
+  await provider.refresh(true);
+  const counting = soakMeasures({ counters: provider.performanceCounters.snapshot() });
+  assert.deepEqual(Object.fromEntries(OPENING_READ_COUNTERS.map((name) => [name, counting[name]])), {
+    'openingsRead:parents': 0,
+    'openingsRead:codex': 0,
+    'openingsRead:collisions': 0,
+    'openingsRead:children': 0,
+  });
+  const older = soakMeasures({ counters: { work: { catalogWalk: 1 } } });
+  const table = markdownTable(compareResults([runnerResult(older)], [runnerResult(counting)]), 'baseline', 'candidate');
+  for (const name of OPENING_READ_COUNTERS) assert.ok(table.includes(`| ${name} | not reported | 0 |`), name);
+});
+
 test('refresh rows read the hold snapshot when the run holds', () => {
   const bounds = boundsOf(['--limit', 'refreshMaxMs:compressed-facts=50']);
   const launch = runnerResult({
@@ -8491,7 +8507,7 @@ test('a catalog walk records each part of the enumeration time, and the parts su
   // A rollout that the cache holds an answer for reads nothing on the next walk.
   work.delete('openingsRead:codex');
   await provider.refresh(true);
-  assert.equal(work.get('openingsRead:codex'), undefined, 'a rollout that the cache answers for counted a read');
+  assert.equal(work.get('openingsRead:codex'), 0, 'a rollout that the cache answers for counted a read');
 
   // A walk whose readers all stop before their first read counts no read for any of them.
   readsRefused = true;
@@ -8509,7 +8525,7 @@ test('a catalog walk records each part of the enumeration time, and the parts su
   );
   assert.deepEqual(
     ['parents', 'codex', 'collisions'].map((source) => work.get(`openingsRead:${source}`)),
-    [undefined, undefined, undefined],
+    [0, 0, 0],
     'a reader that stopped before its first read counted a read',
   );
 

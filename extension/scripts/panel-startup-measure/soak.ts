@@ -298,8 +298,9 @@ export const NAMED_COUNTERS = [
 ] as const;
 const WORK_COUNTERS: Readonly<Record<string, string>> = { catalogWalks: 'catalogWalk' };
 
-// The opening reads of each source. A snapshot that holds none of them comes from a build that does not count them, and
-// reports no row, so the comparison shows it as not reported. A snapshot that holds one reports all four.
+// The opening reads of each source. A finished catalog enumeration records all four, with 0 for a source with no reads.
+// A snapshot that holds none of them comes from a build that does not count them, or from a launch before its first
+// finished enumeration. Such a snapshot reports no row, so the comparison shows "not reported".
 export const OPENING_READ_COUNTERS = [
   'openingsRead:parents',
   'openingsRead:codex',
@@ -341,6 +342,7 @@ export function soakMeasures(snapshot: {
     const value = measure.startsWith('refreshCount:') ? undefined : work[WORK_COUNTERS[measure] ?? measure];
     out[measure] = typeof value === 'number' ? value : 0;
   }
+  // A snapshot during the first enumeration holds only the sources that read so far, and the other sources report 0.
   if (OPENING_READ_COUNTERS.some((name) => typeof work[name] === 'number'))
     for (const name of OPENING_READ_COUNTERS) out[name] = work[name] ?? 0;
   for (const [name, value] of Object.entries(snapshot.counters?.gauges ?? {}))
