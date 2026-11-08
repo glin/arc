@@ -9133,6 +9133,7 @@ function warmStartHarness(
       'browserPainted',
       'relistHeldCodex',
       'armColdPassPaintLimit',
+      'noteColdPassNamedPaths',
       ...extraMethods,
     ],
     realSelectedWindow,
@@ -9354,6 +9355,30 @@ test('a host that turns visible before the paint limit lists the held walk at th
   } finally {
     vi.useRealTimers();
   }
+});
+
+test('a rollout named while the cold pass runs joins the list with the walk of the pass', async () => {
+  const { provider, seed, root, writeRollout, files } = warmStartHarness();
+  let finishPass!: () => void;
+  const passHeld = new Promise<void>((resolve) => (finishPass = resolve));
+  let walked = false;
+  provider.codexColdReads = async (signal: AbortSignal) => {
+    const pass = await coldOpeningPass(provider.codexMetas, root, signal);
+    walked = true;
+    await passHeld;
+    return pass;
+  };
+  provider.railPaintArrived = true;
+  const seeded = seed('seeded');
+  await provider.refresh(true);
+  await vi.waitFor(() => assert.ok(walked, 'the pass did not reach its walk'));
+  const fresh = writeRollout('fresh');
+  await provider.refreshAs('watch', true, true, [fresh], false, false);
+  assert.deepEqual(files(), [seeded]);
+  finishPass();
+  await vi.waitFor(() =>
+    assert.deepEqual(files(), [seeded, fresh].sort(), 'the named rollout waited for the next poll'),
+  );
 });
 
 test('a complete walk before the paint keeps the rollouts it found when the finished pass is listed', async () => {

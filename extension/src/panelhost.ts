@@ -1649,6 +1649,8 @@ export class PanelProvider implements vscode.Disposable {
     controller: AbortController;
     reads: (signal: AbortSignal) => Promise<ColdOpeningPass>;
     listing?: SourceEnumeration;
+    // Rollouts that a refresh named while the pass ran. Its walk can predate them.
+    namedPaths?: Set<string>;
   } | null = null;
   // The walk of a warm start's finished pass, held until the first list has painted.
   private finishedColdPass: {
@@ -1658,6 +1660,7 @@ export class PanelProvider implements vscode.Disposable {
     reads: (signal: AbortSignal) => Promise<ColdOpeningPass>;
     // True once the first paint or the paint limit lets a refresh take this walk.
     released?: boolean;
+    namedPaths?: Set<string>;
     // The catalog walk count when the pass ended. A later complete walk lists more than this walk.
     walkGeneration: number;
   } | null = null;
@@ -10156,16 +10159,28 @@ export class PanelProvider implements vscode.Disposable {
             (this.catalogWalk?.generation ?? 0) > finished.walkGeneration &&
             this.sourceEnumerations?.codex.status === 'complete';
           if (finished.root === codexSessionsRoot() && !superseded) {
+            this.noteColdPassNamedPaths(finished);
+            const walked = new Set(finished.enumeration.files.map(normalizeFsPath));
+            const named = [...(finished.namedPaths ?? [])].filter((file) => !walked.has(normalizeFsPath(file)));
+            const enumeration = named.length
+              ? { ...finished.enumeration, files: [...finished.enumeration.files, ...named] }
+              : finished.enumeration;
             this.catalogWalkPendingAt = finished.startedAt;
-            if (reuseCatalog) codexRelist = finished.enumeration;
-            else {
-              primedEnumeration = finished.enumeration;
+            if (reuseCatalog) {
+              codexRelist = enumeration;
+              const others = this.targetedRefreshPaths?.filter((file) => !isInside(file, [finished.root]));
+              this.targetedRefreshPaths = others?.length ? others : null;
+            } else {
+              primedEnumeration = enumeration;
               walkReasons = [refreshReason];
             }
           }
         } else if (this.codexColdPass?.listing) {
+          this.noteColdPassNamedPaths(this.codexColdPass);
           primedEnumeration = this.codexColdPass.listing;
           this.performanceCounters.recordWork('seededListing');
+        } else if (finished) {
+          this.noteColdPassNamedPaths(finished);
         }
       }
       generation = selectedOnly ? this.refreshGeneration : ++this.refreshGeneration;
@@ -11152,6 +11167,7 @@ export class PanelProvider implements vscode.Disposable {
         root,
         startedAt,
         reads: cold.reads,
+        ...(cold.namedPaths ? { namedPaths: cold.namedPaths } : {}),
         walkGeneration: this.catalogWalk?.generation ?? 0,
       };
       this.listFinishedColdPass();
@@ -11177,6 +11193,12 @@ export class PanelProvider implements vscode.Disposable {
     }
     finished.released = true;
     this.refreshFrom('cold-pass', false, true);
+  }
+
+  private noteColdPassNamedPaths(pass: { namedPaths?: Set<string> }): void {
+    const root = codexSessionsRoot();
+    for (const file of this.targetedRefreshPaths ?? [])
+      if (isInside(file, [root])) (pass.namedPaths ??= new Set()).add(file);
   }
 
   private armColdPassPaintLimit(): void {
