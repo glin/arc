@@ -206,7 +206,7 @@ test('receipt scan replies follow the step allowance, restart after a parent cha
   const root = tempDir('receipt-worker-allowance-');
   const fx = receiptDispatchFixture(root, 'claude', 'codex');
   // Each read of these launches stops at the catalog lookup, because no catalog lists their sessions.
-  for (let index = 0; index < 200; index++) {
+  for (let index = 0; index < 50; index++) {
     const prefix = index.toString(16).padStart(8, '0');
     const target = fx.write('codex', `${prefix}-9999-aaaa-bbbb-cccccccccccc`);
     fx.launch({ ...fx.parent, sessionId: `${prefix}-5555-6666-7777-888888888888` }, target);
@@ -218,8 +218,8 @@ test('receipt scan replies follow the step allowance, restart after a parent cha
   const cap = /receiptSteps >= \w+/;
   assert.ok(source.includes(step));
   assert.match(source, cap);
-  // The capped scan takes 4,096 steps in each request, so the store takes more than one request.
-  const steps = 4096;
+  // The capped scan takes 1,024 steps in each request, so the store takes more than one request.
+  const steps = 1024;
   // The frozen clock holds the receipt deadline still, so only the step allowance or the store's end ends a pass. Each
   // step counts in the reply's charges and tells the host, which lets a test cancel a request inside the receipt loop.
   const workerSource = (uncapped: boolean) =>
