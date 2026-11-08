@@ -1033,6 +1033,7 @@ import {
   headlineMarkdownOf,
   headlineOf,
   cleanPrompt,
+  launchPromptMatches,
   projectSlug,
   transcriptDirsFor,
   sessionFilesFor,
@@ -18513,4 +18514,32 @@ test('repeated Claude requests retain distinct raw own identities', () => {
     { model: 'claude-opus-5', provider: null, serviceTier: 'standard' },
     { model: 'claude-opus-5', provider: null, serviceTier: 'fast' },
   ]);
+});
+
+test.each([
+  [
+    'a skill with arguments',
+    '<command-message>probe-skill</command-message>\n<command-name>/probe-skill</command-name>\n<command-args>second</command-args>',
+    '/probe-skill second',
+  ],
+  [
+    'a custom command without arguments',
+    '<command-message>probe-command</command-message>\n<command-name>/probe-command</command-name>',
+    '/probe-command',
+  ],
+  [
+    'a harness command',
+    '<command-name>/clear</command-name>\n            <command-message>clear</command-message>\n            <command-args></command-args>',
+    '/clear',
+  ],
+  ['a prompt file that ends in a newline', '/probe-skill second', '/probe-skill second\n\n'],
+])('a launch prompt matches the saved form of %s', (_name, saved, prompt) => {
+  assert.equal(launchPromptMatches(saved, prompt), true);
+  assert.equal(launchPromptMatches(saved, `${prompt.trim()} other`), false);
+});
+
+test('a prompt without a leading slash keeps the exact comparison', () => {
+  assert.equal(launchPromptMatches('Review this.', 'Review this.'), true);
+  assert.equal(launchPromptMatches('Review this.', 'Review this.\n'), false);
+  assert.equal(launchPromptMatches('<command-name>/x</command-name>', 'x'), false);
 });

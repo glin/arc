@@ -2,6 +2,7 @@ import type { WireEvent, NativeEvent } from './agentwire';
 import type { DispatchLaunch, DispatchEvent } from './dispatchreceipts';
 import { DispatchReceipts } from './dispatchreceipts';
 import { payloadSha256, type SessionWriteParams } from './sessionwrites';
+import { isSlashPrompt, launchPromptMatches } from './transcript';
 
 export interface DispatchChild {
   key: string;
@@ -21,6 +22,7 @@ export interface SavedDispatchResponse {
 interface Assignment {
   launch: DispatchLaunch;
   child: DispatchChild;
+  prompt: string | null;
   submission: number | null;
   session: string | null;
   nativeTurn: string | null;
@@ -48,12 +50,13 @@ export class HostedDispatch {
       nativeTurn: string | null,
     ) => SavedDispatchResponse | null,
   ) {}
-  register(launchId: string, child: DispatchChild): void {
+  register(launchId: string, child: DispatchChild, prompt: string | null = null): void {
     const launch = this.receipts.launch(launchId);
     if (this.assignments.has(launchId)) throw new Error('This dispatch launch already has a worker.');
     this.assignments.set(launchId, {
       launch,
       child,
+      prompt,
       submission: null,
       session: null,
       nativeTurn: null,
@@ -116,8 +119,17 @@ export class HostedDispatch {
         }
         if (submission === undefined || submission !== assignment.submission) continue;
         const session = child.state().sessionId;
-        if (!session || (assignment.session && assignment.session !== session)) continue;
-        assignment.session = session;
+        if (!session) continue;
+        // `/clear` moves the child to a new session. The launch keeps the session it started with, and only the
+        // command's own ending still belongs to it.
+        const commandEnding =
+          event.kind === 'turnEnd' &&
+          !!event.commandOnly &&
+          assignment.prompt !== null &&
+          isSlashPrompt(assignment.prompt);
+        const moved = assignment.session !== null && assignment.session !== session;
+        if (moved && !commandEnding) continue;
+        if (!moved) assignment.session = session;
         if (event.kind === 'text') {
           assignment.blocks.clear();
           assignment.blocks.set(event.sourceId ?? '', event.text);
@@ -145,7 +157,9 @@ export class HostedDispatch {
                   ? 'failed'
                   : event.outcome.status === 'interrupted'
                     ? 'interrupted'
-                    : 'unknown',
+                    : commandEnding
+                      ? 'succeeded'
+                      : 'unknown',
               availability: 'unavailable',
               nativeEnding: null,
               askId: null,
@@ -239,7 +253,8 @@ export class HostedDispatch {
     const consistent =
       saved &&
       (saved.finished || saved.failed || saved.interrupted) &&
-      payloadSha256(saved.prompt) === assignment.launch.promptSha256 &&
+      (payloadSha256(saved.prompt) === assignment.launch.promptSha256 ||
+        (assignment.prompt !== null && launchPromptMatches(saved.prompt, assignment.prompt))) &&
       saved.text === text &&
       (assignment.child.agent !== 'codex' || saved.promptId === assignment.nativeTurn) &&
       (assignment.child.agent === 'codex' ||

@@ -411,8 +411,9 @@ function smallBounds() {
 function frozenRuntime() {
   return { now: () => 0, identity: async () => null, yield: () => Promise.resolve() };
 }
-function claudePrintFixture(ownedConfig = false) {
+function claudePrintFixture(ownedConfig = false, prompt?: string) {
   const { home, args } = fixture();
+  if (prompt) fs.writeFileSync(path.join(home, 'prompt.txt'), prompt);
   if (ownedConfig) fs.mkdirSync(path.join(home, '.git'));
   const parsed = parseRun([...withProvider(args, 'claude'), '--read-only'], {
     CLAUDE_BIN: process.execPath,
@@ -3453,7 +3454,7 @@ test('unsupported completion, widened policy, worktree flags and malformed UTF-8
     assert.throws(() => parseRun([...args, ...tail]));
   fs.writeFileSync(prompt, Buffer.from([0xc3, 0x28]));
   assert.throws(() => parseRun(args));
-  fs.writeFileSync(prompt, '/compact');
+  fs.writeFileSync(prompt, ' \n');
   assert.throws(() => parseRun(args));
 });
 test('process exit never substitutes for final native evidence and reports must agree', () => {
@@ -7817,4 +7818,362 @@ test('standalone provider commands refuse missing, misplaced, extra, and legacy 
     });
     assert.equal(parsed.options.provider, provider);
   }
+});
+
+test.each(['/clear', '/model opus', '/ship plan.md\n'])('arc run admits the slash prompt %j', (prompt) => {
+  const { home, args } = fixture();
+  fs.writeFileSync(path.join(home, 'prompt.txt'), prompt);
+  assert.ok(parseRun(withProvider(args, 'claude')).options);
+});
+
+test('arc run refuses an empty prompt', () => {
+  const { home, args } = fixture();
+  fs.writeFileSync(path.join(home, 'prompt.txt'), ' \n');
+  assert.throws(() => parseRun(withProvider(args, 'claude')), /Supply a nonempty prompt\./);
+});
+
+const movedSession = 'bbbbbbbb-1111-2222-3333-444444444444';
+const commandRow = (name: string) =>
+  `<command-name>/${name}</command-name>\n            <command-message>${name}</command-message>\n            <command-args></command-args>`;
+const caveatRow = {
+  type: 'user',
+  isMeta: true,
+  uuid: 'caveat',
+  message: { role: 'user', content: '<local-command-caveat>Caveat: run by the reader.</local-command-caveat>' },
+};
+const localOutputRow = (text: string) => ({
+  type: 'user',
+  uuid: 'output',
+  parentUuid: 'prompt',
+  message: { role: 'user', content: `<local-command-stdout>${text}</local-command-stdout>` },
+});
+const unfinishedAnswer = () => {
+  const answer = claudeAnswer('Working on it');
+  return { ...answer, message: { ...answer.message, stop_reason: 'tool_use' } };
+};
+
+function commandEnding(sessionId: string, fields: object = {}) {
+  return (
+    JSON.stringify({
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      num_turns: 0,
+      session_id: sessionId,
+      result: '',
+      ...fields,
+    }) + '\n'
+  );
+}
+
+async function printEnding(prompt: string, output: (hint: string) => string) {
+  const { home, args } = fixture();
+  fs.writeFileSync(path.join(home, 'prompt.txt'), prompt);
+  const { options } = parseRun([...withProvider(args, 'claude'), '--read-only'], {
+    ...process.env,
+    ARC_PROJECTS_ROOT: path.join(home, 'projects'),
+  });
+  const receipts = new DispatchReceipts(home);
+  const launch = admit(receipts, options, { prompt, completion: 'manual' });
+  observe(receipts, launch.launchId, { exitCode: 0, monitor: 'timed-out' });
+  fs.writeFileSync(receipts.artifact(launch.launchId, 'stdout.log'), output(options.sessionHint!));
+  await superviseStandalone(new DispatchReceipts(home), launch.launchId, true, undefined, frozenRuntime());
+  return { receipts, id: launch.launchId, event: receipts.latest(launch.launchId)!, hint: options.sessionHint! };
+}
+
+test('a print launch whose /clear moves the session ends succeeded and keeps its starting session', async () => {
+  const { receipts, id, event, hint } = await printEnding('/clear\n', () => commandEnding(movedSession));
+  assert.equal(event.outcome, 'succeeded');
+  assert.equal(event.availability, 'unavailable');
+  assert.equal(event.report, null);
+  assert.equal(receipts.observation(id)?.sessionId, hint);
+  assert.equal((event.nativeEnding as { sessionId: string }).sessionId, hint);
+});
+
+test('a print launch of a command the harness rejects keeps the harness text', async () => {
+  const { event, receipts, id } = await printEnding('/help\n', (hint) =>
+    commandEnding(hint, { result: "/help isn't available in this environment." }),
+  );
+  assert.equal(event.outcome, 'succeeded');
+  assert.equal(
+    (receipts.result(id, event.eventId) as { text: string }).text,
+    "/help isn't available in this environment.",
+  );
+});
+
+test('a zero-turn result of a launch without a slash prompt keeps its identity conflict', async () => {
+  const { event } = await printEnding('Review this folder.\n', () => commandEnding(movedSession));
+  assert.equal(event, null);
+});
+
+test('a print launch of a local command starts past the caveat row before its command row', async () => {
+  const { home, options, file, receipts, launch, child } = claudePrintFixture(false, '/cost\n');
+  const fields = { sessionId: options.sessionHint, cwd: home };
+  vi.mocked(childProcess.spawn).mockImplementationOnce(() => {
+    fs.writeFileSync(
+      file,
+      jsonLines([
+        { ...caveatRow, ...fields },
+        { ...claudeUser(commandRow('cost')), ...fields },
+      ]),
+    );
+    return child;
+  });
+  const supervised = superviseStandalone(receipts, launch.launchId, false, undefined, {
+    now: Date.now,
+    identity: async () => null,
+    yield: async () => {},
+  });
+  await vi.waitFor(() => assert.equal(receipts.standaloneSession(launch.launchId), options.sessionHint));
+  child.emit('close', 0, null);
+  await supervised;
+});
+
+test('a provider error with zero turns keeps its failure on the print route', async () => {
+  const { event } = await printEnding('/clear\n', (hint) =>
+    commandEnding(hint, { subtype: 'error_during_execution', is_error: true }),
+  );
+  assert.equal(event.outcome, 'failed');
+});
+
+const registryRow = (fields: object = {}) => ({
+  id: session.slice(0, 8),
+  sessionId: session,
+  state: 'working',
+  status: 'idle',
+  ...fields,
+});
+
+async function backgroundEnding(
+  prompt: string,
+  rows: object[] | null,
+  polls: object[][],
+  recovery = true,
+  late?: { poll: number; rows: object[] },
+) {
+  let waits = 0;
+  let clock = 0;
+  const { home } = fixture();
+  const { receipts, launch, options } = backgroundFixture(
+    false,
+    { ...process.env, ARC_PROJECTS_ROOT: path.join(home, 'projects') },
+    prompt,
+  );
+  const owned = rows?.map((row) => ({ sessionId: session, cwd: options.cwd, ...row }));
+  if (recovery) {
+    receipts.background(launch.launchId, session.slice(0, 8));
+    observe(receipts, launch.launchId);
+    if (owned) transcript(options, owned);
+  } else {
+    fs.mkdirSync(path.join(options.env!.ARC_PROJECTS_ROOT!, projectSlug(options.cwd)), { recursive: true });
+    const child = providerChild();
+    vi.spyOn(child, 'unref').mockImplementation(() => {});
+    vi.mocked(childProcess.spawn).mockImplementationOnce((_command, _args, settings) => {
+      if (owned) transcript(options, owned);
+      fs.writeSync((settings.stdio as number[])[1], `backgrounded · ${session.slice(0, 8)} · ${options.name}\n`);
+      queueMicrotask(() => child.emit('close', 0, null));
+      return child;
+    });
+  }
+  const registry = nativeRegistry();
+  registry.mockImplementation(() => {
+    if (late && registry.mock.calls.length === late.poll)
+      transcript(
+        options,
+        late.rows.map((row) => ({ sessionId: session, cwd: options.cwd, ...row })),
+      );
+    const reply = polls[Math.min(registry.mock.calls.length - 1, polls.length - 1)];
+    return registryReply(JSON.stringify(reply));
+  });
+  await superviseStandalone(receipts, launch.launchId, recovery, undefined, {
+    ...frozenRuntime(),
+    now: () => clock,
+    // Fails on an observation that never ends instead of spinning on a held clock.
+    wait: async (ms: number) => {
+      clock += ms;
+      if (++waits > 8) throw new Error('The background observation did not end.');
+    },
+  });
+  const event = receipts.latest(launch.launchId)!;
+  return { receipts, id: launch.launchId, event, calls: registry.mock.calls.length, clock, waits };
+}
+
+test('a background launch whose /clear moves the registry session ends succeeded and keeps its starting session', async () => {
+  const { receipts, id, event } = await backgroundEnding('/clear\n', null, [
+    [registryRow({ status: 'busy' })],
+    [registryRow({ sessionId: movedSession })],
+  ]);
+  assert.equal(event.outcome, 'succeeded');
+  assert.equal(event.availability, 'unavailable');
+  assert.equal(event.report, null);
+  assert.equal(receipts.observation(id)?.sessionId, session);
+});
+
+test('a /clear that moves the registry row before the first read ends at once with the moved session', async () => {
+  const { receipts, id, event, calls } = await backgroundEnding('/clear\n', null, [
+    [registryRow({ sessionId: movedSession })],
+  ]);
+  assert.equal(event.outcome, 'succeeded');
+  assert.equal(event.report, null);
+  assert.equal(calls, 1);
+  assert.equal(receipts.observation(id)?.sessionId, movedSession);
+});
+
+test('a launched /clear with a ready source baseline ends without waiting for a transcript', async () => {
+  const { receipts, id, event, waits } = await backgroundEnding(
+    '/clear\n',
+    null,
+    [[registryRow({ status: 'busy' })], [registryRow({ sessionId: movedSession })]],
+    false,
+  );
+  assert.equal(receipts.sourceBaseline(id)?.state, 'ready');
+  assert.equal(event.outcome, 'succeeded');
+  assert.equal(waits, 1);
+});
+
+test('a launched local command qualifies its transcript past the caveat row', async () => {
+  const { receipts, id, event, calls } = await backgroundEnding(
+    '/cost\n',
+    [caveatRow, claudeUser(commandRow('cost')), localOutputRow('Total cost: $0.00')],
+    [[registryRow()]],
+    false,
+  );
+  assert.ok(receipts.startup(id));
+  assert.equal(event.outcome, 'succeeded');
+  assert.equal(event.report, null);
+  assert.equal(calls, 1);
+});
+
+test.each([{ state: 'working' }, { state: undefined }])(
+  'a command with no saved output ends succeeded after the idle window with %j',
+  async (shape) => {
+    const { event, clock } = await backgroundEnding(
+      '/mcp\n',
+      [caveatRow, claudeUser(commandRow('mcp'))],
+      [[registryRow(shape)]],
+    );
+    assert.equal(event.outcome, 'succeeded');
+    assert.equal(event.report, null);
+    assert.ok(clock >= 45_000);
+  },
+);
+
+test('a command the harness rejects with no saved row ends succeeded after the idle window', async () => {
+  const { event, clock } = await backgroundEnding('/help\n', null, [[registryRow()]]);
+  assert.equal(event.outcome, 'succeeded');
+  assert.equal(event.availability, 'unavailable');
+  assert.equal(event.report, null);
+  assert.ok(clock >= 45_000);
+});
+
+const terminalStates = [
+  ['failed', 'failed'],
+  ['error', 'failed'],
+  ['stopped', 'interrupted'],
+  ['killed', 'interrupted'],
+];
+// Readings at 0, 2, 6, 14 and 30 seconds stay inside the idle window, and the terminal reading arrives at 60 seconds.
+const idleThenTerminal = (fields: object) => [
+  ...Array.from({ length: 5 }, () => [registryRow()]),
+  [registryRow(fields)],
+];
+
+test.each(terminalStates)(
+  'a slash launch whose row ends %s with status idle after the idle window ends %s',
+  async (state, outcome) => {
+    const { event, clock } = await backgroundEnding('/help\n', null, idleThenTerminal({ state }));
+    assert.equal(event.outcome, outcome);
+    assert.ok(clock >= 45_000);
+  },
+);
+
+test.each(terminalStates)(
+  'a slash launch with local output whose row ends %s with status idle ends %s',
+  async (state, outcome) => {
+    const { event, clock } = await backgroundEnding('/cost\n', null, idleThenTerminal({ state }), true, {
+      poll: 6,
+      rows: [caveatRow, claudeUser(commandRow('cost')), localOutputRow('Total cost: $0.00')],
+    });
+    assert.equal(event.outcome, outcome);
+    assert.ok(clock >= 45_000);
+  },
+);
+
+test.each(terminalStates)(
+  'a slash launch whose moved row ends %s with status idle ends %s and keeps its starting session',
+  async (state, outcome) => {
+    const { receipts, id, event, clock } = await backgroundEnding(
+      '/clear\n',
+      null,
+      idleThenTerminal({ state, sessionId: movedSession }),
+    );
+    assert.equal(event.outcome, outcome);
+    assert.ok(clock >= 45_000);
+    assert.equal(receipts.observation(id)?.sessionId, session);
+  },
+);
+
+test('a busy reading restarts the idle window of a slash launch', async () => {
+  const idle = [registryRow()];
+  const { event } = await backgroundEnding('/help\n', null, [
+    idle,
+    idle,
+    idle,
+    [registryRow({ status: 'busy' })],
+    idle,
+    [registryRow({ state: 'failed' })],
+  ]);
+  assert.equal(event.outcome, 'failed');
+});
+
+test('a slash launch that waits for its model is not ended by an idle registry row', async () => {
+  const skill =
+    '<command-message>probe-skill</command-message>\n<command-name>/probe-skill</command-name>\n<command-args>second</command-args>';
+  const { event } = await backgroundEnding(
+    '/probe-skill second\n',
+    [claudeUser(skill)],
+    [[registryRow()], [registryRow({ state: 'failed' })]],
+  );
+  assert.equal(event.outcome, 'failed');
+});
+
+test.each([
+  ['in place', session],
+  ['moved', movedSession],
+])(
+  'a running skill %s is not ended by an idle window while its transcript shows the model',
+  async (_name, sessionId) => {
+    const skill = '<command-message>probe-skill</command-message>\n<command-name>/probe-skill</command-name>';
+    const idle = [registryRow({ sessionId })];
+    const { event, clock } = await backgroundEnding(
+      '/probe-skill\n',
+      [claudeUser(skill), unfinishedAnswer()],
+      [[registryRow()], idle, idle, idle, idle, idle, idle, [registryRow({ state: 'failed' })]],
+    );
+    assert.ok(clock >= 45_000);
+    assert.equal(event.outcome, 'failed');
+  },
+);
+
+const ordinaryPolls = (sessionId: string) => [
+  [registryRow()],
+  [registryRow({ sessionId })],
+  [registryRow({ sessionId, state: 'failed' })],
+];
+
+test('an idle background row without a slash launch keeps its current path', async () => {
+  const { receipts, id, event } = await backgroundEnding(
+    'Review this folder.',
+    [claudeUser('Review this folder.')],
+    ordinaryPolls(session),
+  );
+  assert.equal(event.outcome, 'failed');
+  assert.equal(receipts.observation(id)?.sessionId, session);
+});
+
+test('a reader /clear after attaching does not end a launch without a slash prompt', async () => {
+  await assert.rejects(
+    backgroundEnding('Review this folder.', [claudeUser('Review this folder.')], ordinaryPolls(movedSession)),
+    /accepted dispatch turn cannot change/,
+  );
 });

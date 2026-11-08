@@ -13127,3 +13127,116 @@ test('hosted explicit tier survives clear, retirement, resume and fork with read
     child.exit(0);
   }
 });
+
+const started = 'aaaaaaaa-1111-2222-3333-444444444444';
+const moved = 'bbbbbbbb-1111-2222-3333-444444444444';
+const result = (session: string, fields: object = {}) =>
+  JSON.stringify({
+    type: 'result',
+    subtype: 'success',
+    session_id: session,
+    uuid: 'command-result',
+    result_index: 1,
+    num_turns: 0,
+    parent_tool_use_id: null,
+    is_error: false,
+    terminal_reason: 'completed',
+    result: '',
+    ...fields,
+  }) + '\n';
+async function launched(prompt: string) {
+  const origin = 'a'.repeat(24);
+  const receipts = new DispatchReceipts(tempDir('arc-command-dispatch-'));
+  const launch = receipts.reserve({
+    origin,
+    requester: null,
+    policy: null,
+    promptSha256: payloadSha256(prompt),
+    completion: 'wait',
+    alias: null,
+  });
+  const dispatch = new HostedDispatch(receipts, () => null);
+  const { host, children } = fakeHost(undefined, () => 1000, {
+    onEvent: ({ key, event, turnId, dispatchTurnId }) => {
+      const child = host.get(key);
+      if (child) dispatch.observe(child, event, dispatchTurnId ?? turnId);
+    },
+  });
+  const opening = host.session('one', claudePlan(CLAUDE, { cwd: WS, sessionId: started }));
+  children[0].answerHandshake();
+  const session = await opening;
+  dispatch.register(launch.launchId, session, prompt);
+  const turn = await session.prompt(prompt, (id) => dispatch.submitted(launch.launchId, id));
+  dispatch.accepted(launch.launchId, session.nativeTurnIdentity(turn));
+  return { dispatch, receipts, launch, origin, child: children[0], session };
+}
+
+test('hosted launch: a /clear that moves the child ends the launch succeeded with no deadline wait', async () => {
+  const { dispatch, receipts, launch, origin, child, session } = await launched('/clear\n');
+  const waiting = dispatch.request(
+    origin,
+    { dispatchAction: 'wait', launchId: launch.launchId, deadlineMs: 600_000 },
+    new AbortController().signal,
+  );
+  child.say(JSON.stringify({ type: 'system', subtype: 'init', session_id: moved }) + '\n');
+  child.say(result(moved));
+  assert.equal(session.state().sessionId, moved);
+  assert.deepEqual(await waiting, {
+    launchId: launch.launchId,
+    state: 'observed',
+    eventId: receipts.latest(launch.launchId)!.eventId,
+    outcome: 'succeeded',
+  });
+  assert.equal(receipts.latest(launch.launchId)!.report, null);
+  assert.equal(receipts.latest(launch.launchId)!.availability, 'unavailable');
+});
+
+test('hosted launch: a zero-turn provider error keeps its failure', async () => {
+  const { receipts, launch, child } = await launched('/clear\n');
+  child.say(result(started, { subtype: 'error_during_execution', is_error: true, terminal_reason: 'error' }));
+  assert.equal(receipts.latest(launch.launchId)?.outcome, 'failed');
+});
+
+test('hosted launch: a command turn that reports model turns is not a command-only ending', async () => {
+  const { receipts, launch, child } = await launched('/probe-skill\n');
+  child.say(result(started, { num_turns: 1 }));
+  assert.equal(receipts.latest(launch.launchId)?.availability, 'pending');
+});
+
+test('hosted launch: a zero-turn result of a launch without a slash prompt is not a command ending', async () => {
+  const { receipts, launch, child } = await launched('Review this.\n');
+  child.say(result(started));
+  assert.equal(receipts.latest(launch.launchId)?.outcome, 'unknown');
+});
+
+test('hosted launch: a launch without a slash prompt drops the ending of a moved session', async () => {
+  const { receipts, launch, child } = await launched('Review this.\n');
+  const assistant = { id: 'r', role: 'assistant', content: [{ type: 'text', text: 'Partial' }] };
+  child.say(JSON.stringify({ type: 'assistant', session_id: started, message: assistant }) + '\n');
+  child.say(JSON.stringify({ type: 'system', subtype: 'init', session_id: moved }) + '\n');
+  child.say(result(moved));
+  assert.equal(receipts.latest(launch.launchId), null);
+});
+
+test('hosted launch: a zero-turn result with an error subtype and no error flag is not a command ending', async () => {
+  const { receipts, launch, child } = await launched('/clear\n');
+  child.say(result(started, { subtype: 'error_max_turns', terminal_reason: 'max_turns' }));
+  assert.notEqual(receipts.latest(launch.launchId)?.outcome, 'succeeded');
+});
+
+test('hosted launch: a /compact whose result names its local command ends a waited launch', async () => {
+  const { dispatch, receipts, launch, origin, child } = await launched('/compact\n');
+  const waiting = dispatch.request(
+    origin,
+    { dispatchAction: 'wait', launchId: launch.launchId, deadlineMs: 600_000 },
+    new AbortController().signal,
+  );
+  child.say(result(started, { local_command: 'compact' }));
+  assert.deepEqual(await waiting, {
+    launchId: launch.launchId,
+    state: 'observed',
+    eventId: receipts.latest(launch.launchId)!.eventId,
+    outcome: 'succeeded',
+  });
+  assert.equal(receipts.latest(launch.launchId)!.report, null);
+});

@@ -36,6 +36,8 @@ Every hosted child uses `--replay-user-messages`. Guarded follow-ups and continu
 
 An idle follow-up without its replay remains unknown after a result or idle report. Live input retains its receipt window across both. Exit or 120 seconds without a matching replay leaves delivery unknown. A slash replay transfers model ownership only after root model output names that input UUID.
 
+A launch whose command does no model work ends `succeeded` and keeps its starting session ID. The background route reports only a short ID. A command that moves the session before the first registry read therefore records the moved session ID.
+
 Positive model turns establish participating model completion. A zero-model result with usable retained participant generations settles only those inputs. Preserve unnamed inputs and unrelated model work. Without usable correlation or local command identity, apply generic completion. Local results settle their matching command and preserve a valid delayed replay. [Native ownership](session-compaction.md#native-turn-and-compaction-contracts) defines host attribution.
 
 ## Claude Remote Control

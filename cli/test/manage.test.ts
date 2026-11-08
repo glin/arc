@@ -566,9 +566,17 @@ test('start refuses invalid classification and launch flags before the host rece
       await assert.rejects(runManagement('start', ['codex', '--prompt-file', fixture.prompt, ...flags]));
       assert.equal(fixture.requests.length, 0, flags.join(' '));
     }
-    writeFileSync(fixture.prompt, '/clear');
-    await assert.rejects(runManagement('start', ['codex', '--prompt-file', fixture.prompt]), /prompt-box command/);
+    writeFileSync(fixture.prompt, ' \n');
+    await assert.rejects(
+      runManagement('start', ['codex', '--prompt-file', fixture.prompt]),
+      /Supply a nonempty prompt\./,
+    );
     assert.equal(fixture.requests.length, 0);
+    for (const prompt of ['/clear', '/model opus', '/ship plan.md\n']) {
+      writeFileSync(fixture.prompt, prompt);
+      await runManagement('start', ['codex', '--prompt-file', fixture.prompt]).catch(() => undefined);
+      assert.equal((fixture.requests.at(-1) as { params: { prompt: string } }).params.prompt, prompt);
+    }
   } finally {
     await fixture.close();
   }

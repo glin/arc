@@ -1278,6 +1278,7 @@ export class ClaudeWire {
             outcome: readOutcome(m),
             ...(localCommand ? { localCommand } : {}),
             ...(inputGenerations ? { inputGenerations } : {}),
+            ...(m.num_turns === 0 && str(m.subtype) === 'success' ? { commandOnly: true as const } : {}),
           });
         }
         return;

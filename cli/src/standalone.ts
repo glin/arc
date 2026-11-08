@@ -20,7 +20,10 @@ import {
 import { linuxProcessStart } from '../../extension/src/store.ts';
 import { payloadSha256 } from '../../extension/src/sessionwrites.ts';
 import {
+  claudeLocalAnswer,
   cleanPrompt,
+  isSlashPrompt,
+  launchPromptMatches,
   projectSlug,
   readQualifiedOpening,
   revisionOf,
@@ -33,6 +36,7 @@ import { enumerateRolloutFilesAsync, openingRecordOf, CODEX_OPENING_BYTES } from
 
 const execute = promisify(execFile);
 const REPORT_BYTES = 8 * 1024 * 1024;
+const REGISTRY_IDLE_MS = 45_000;
 const FRAME_BYTES = 49 * 1024 * 1024;
 const READ_BYTES = 64 * 1024;
 type ReadBounds = { frameBytes: number; readBytes: number; workBytes?: number };
@@ -118,6 +122,8 @@ export interface FinalObservation {
   availability: DispatchEvent['availability'];
   text: string | null;
   evidence: unknown;
+  // A slash launch that ended with no model work. It may leave no transcript to witness.
+  commandOnly?: true;
 }
 
 // Exec frames identify one invocation. They do not create a hosted submission identity.
@@ -136,6 +142,7 @@ export class StandaloneFrames {
     private readonly provider: 'claude' | 'codex',
     private readonly expected: string | null,
     private readonly frameBytes = FRAME_BYTES,
+    private readonly slashLaunch = false,
   ) {}
   snapshot() {
     return {
@@ -173,7 +180,15 @@ export class StandaloneFrames {
     if (this.provider === 'claude') {
       if (row.type !== 'result') return;
       this.count++;
-      this.identity(row.session_id);
+      // `/clear` moves the child to a new session and runs no model turn. The launch keeps the session it started with.
+      const movedByCommand =
+        this.slashLaunch &&
+        row.num_turns === 0 &&
+        row.subtype === 'success' &&
+        this.expected !== null &&
+        typeof row.session_id === 'string' &&
+        DISPATCH_ID.test(row.session_id);
+      this.identity(movedByCommand ? this.expected : row.session_id);
       if (this.count > 1 || typeof row.is_error !== 'boolean' || typeof row.subtype !== 'string') {
         this.invalid = true;
         return;
@@ -255,8 +270,9 @@ class FrameStream {
   constructor(
     options: StandaloneOptions,
     private readonly bounds: ReadBounds,
+    slashLaunch = false,
   ) {
-    this.frames = new StandaloneFrames(options.provider, options.sessionHint, bounds.frameBytes);
+    this.frames = new StandaloneFrames(options.provider, options.sessionHint, bounds.frameBytes, slashLaunch);
   }
   restore(state: ReturnType<StandaloneFrames['snapshot']>, pending?: { data: string; discarded: boolean }): void {
     this.frames.restore(state);
@@ -536,7 +552,7 @@ export function registryStep(
   if (['blocked', 'idle'].includes(status)) {
     state.blockedAt ??= now;
     return {
-      done: now - state.blockedAt >= 45_000,
+      done: now - state.blockedAt >= REGISTRY_IDLE_MS,
       outcome: 'needs-input',
       reason: `Claude requires attention (${status}).`,
       entry,
@@ -940,7 +956,7 @@ export async function nativeSourceWitness(
           } else if (end >= 0) {
             for (const line of bytes.subarray(0, bytes.lastIndexOf(10)).toString('utf8').split('\n')) {
               const row = JSON.parse(line);
-              if (row.type !== 'user') continue;
+              if (row.type !== 'user' || (row.isMeta && isSlashPrompt(prompt))) continue;
               const content = row.message?.content;
               const text =
                 typeof content === 'string'
@@ -957,7 +973,8 @@ export async function nativeSourceWitness(
                 !!row.uuid &&
                 typeof row.cwd === 'string' &&
                 fs.realpathSync.native(row.cwd) === baseline.cwd &&
-                text === prompt;
+                text !== null &&
+                launchPromptMatches(text, prompt);
               if (!matches) receipts.startupRefused(id, true);
               break;
             }
@@ -1122,7 +1139,7 @@ function claudeStartup(
         if (end < 0) return null;
         const row = JSON.parse(new TextDecoder('utf8', { fatal: true }).decode(opening.subarray(parsed, end)));
         parsed = end + 1;
-        if (row.type !== 'user') continue;
+        if (row.type !== 'user' || (row.isMeta && isSlashPrompt(prompt))) continue;
         const content = row.message?.content;
         const text =
           typeof content === 'string'
@@ -1139,7 +1156,8 @@ function claudeStartup(
           !!row.uuid &&
           typeof row.cwd === 'string' &&
           fs.realpathSync.native(row.cwd) === cwd &&
-          text === prompt;
+          text !== null &&
+          launchPromptMatches(text, prompt);
         refused = !accepted;
         if (accepted)
           retain({
@@ -1261,6 +1279,7 @@ export async function observeProcess(
   startupIdentity?: (() => string | null) | null,
   sharedWork?: ObservationWork,
   originalDeadline?: number,
+  slashLaunch = false,
 ): Promise<{
   exitCode: number | null;
   signal: string | null;
@@ -1268,7 +1287,7 @@ export async function observeProcess(
   backgroundOutput: string;
   timedOut?: boolean;
 }> {
-  const stream = new FrameStream(options, bounds);
+  const stream = new FrameStream(options, bounds, slashLaunch);
   const frames = stream.frames;
   let backgroundOutput = '';
   const feed = (chunk: Buffer) => {
@@ -1288,7 +1307,7 @@ export async function observeProcess(
       backgroundOutput += chunk.toString('utf8');
   });
   // The supervisor publishes startup identity. The launching command only reads it.
-  const startup = new FrameStream(options, bounds);
+  const startup = new FrameStream(options, bounds, slashLaunch);
   const startupCursor = { offset: 0, identity: '' };
   const identityTimer: ReturnType<typeof setInterval> | null =
     (readLogs && options.provider === 'codex' && !options.background) || startupIdentity
@@ -1417,7 +1436,7 @@ function savedBackground(
     if (
       !response?.finished ||
       !response.prompt ||
-      response.prompt !== cleanPrompt(prompt) ||
+      !launchPromptMatches(response.prompt, cleanPrompt(prompt)) ||
       !response.responseIds.length
     )
       return null;
@@ -1441,6 +1460,30 @@ function savedBackground(
   }
 }
 
+// What the saved transcript of a slash launch shows. A file Arc cannot read counts as model work, so the launch keeps
+// its normal path. A missing file counts as none, because a command that the harness rejects writes no transcript.
+function commandEvidence(
+  options: StandaloneOptions,
+  sessionId: string | null,
+): 'model work' | 'no model work' | 'local output' {
+  const root = options.env?.ARC_PROJECTS_ROOT;
+  if (!root) return 'model work';
+  if (!sessionId || !DISPATCH_ID.test(sessionId)) return 'no model work';
+  const file = path.join(root, projectSlug(options.cwd), `${sessionId}.jsonl`);
+  try {
+    if (fs.statSync(file).size > REPORT_BYTES) return 'model work';
+    const rows = fs
+      .readFileSync(file, 'utf8')
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    if (rows.some((row) => row.type === 'assistant')) return 'model work';
+    return rows.some((row) => claudeLocalAnswer(row)) ? 'local output' : 'no model work';
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ENOENT' ? 'no model work' : 'model work';
+  }
+}
+
 async function observeBackground(
   receipts: DispatchReceipts,
   id: string,
@@ -1458,6 +1501,8 @@ async function observeBackground(
   if (!backgroundId) throw new Error('The Claude background launch identity is unavailable.');
   const started = runtime.now();
   const state: RegistryClock = { started, seen: false, blockedAt: null, errors: 0 };
+  const slash = isSlashPrompt(prompt);
+  let idleSince: number | null = null;
   let delay = 2_000;
   while (runtime.now() < deadline && !work.cancelled) {
     const step = registryStep(state, await registry(options, deadline - runtime.now()), backgroundId, runtime.now());
@@ -1479,9 +1524,19 @@ async function observeBackground(
       }
     }
     if (runtime.now() >= deadline || work.cancelled) break;
+    let moved = false;
     if (step.entry && typeof step.entry.sessionId === 'string' && DISPATCH_ID.test(step.entry.sessionId)) {
-      await witness?.(step.entry.sessionId);
-      observation.sessionId = receipts.standaloneSession(id, step.entry.sessionId);
+      // `/clear` moves the row to a new session, and the row's short ID stays the starting session's prefix.
+      // The launch keeps the session it started with. A move before the first read leaves only the moved ID to bind.
+      const current = step.entry.sessionId;
+      moved =
+        slash &&
+        (!current.toLowerCase().startsWith(step.entry.id.toLowerCase().slice(0, 8)) ||
+          (observation.sessionId !== null && observation.sessionId !== current));
+      if (!moved || observation.sessionId === null) {
+        await witness?.(current);
+        observation.sessionId = receipts.standaloneSession(id, current);
+      }
     }
     // Registry PIDs alone establish no process ownership. No registry process is terminated.
     if (runtime.now() >= deadline || work.cancelled) break;
@@ -1490,6 +1545,27 @@ async function observeBackground(
       observation.monitor = 'finished';
       observation.reason = undefined;
       return saved;
+    }
+    const idle = step.entry?.status === 'idle' || step.entry?.state === 'idle';
+    idleSince = idle ? (idleSince ?? runtime.now()) : null;
+    // registryStep reads state before status, so a terminal state with status idle keeps its failure.
+    if (slash && idleSince !== null && (step.outcome === 'running' || step.outcome === 'needs-input')) {
+      const evidence = commandEvidence(options, observation.sessionId);
+      if (
+        evidence !== 'model work' &&
+        (moved || evidence === 'local output' || runtime.now() - idleSince >= REGISTRY_IDLE_MS)
+      ) {
+        observation.monitor = 'finished';
+        observation.reason = undefined;
+        return {
+          sessionId: observation.sessionId,
+          outcome: 'succeeded',
+          availability: 'unavailable',
+          text: null,
+          evidence: { provider: 'claude', sessionId: observation.sessionId, commandOnly: true },
+          commandOnly: true,
+        };
+      }
     }
     if (!(await publishObservation())) break;
     if (step.done) {
@@ -2086,7 +2162,7 @@ export async function superviseStandalone(
       const savedEnding = observation.reason?.startsWith(`${FOREGROUND_UNREFUSED} ${PROVIDER_MESSAGE}`)
         ? observation.reason
         : undefined;
-      const stream = new FrameStream(options, bounds);
+      const stream = new FrameStream(options, bounds, isSlashPrompt(prompt));
       const log = receipts.artifact(id, 'stdout.log');
       const deadline = observationDeadline;
       const saved = receipts.scan(id) as {
@@ -2396,6 +2472,7 @@ export async function superviseStandalone(
           startup,
           receipts.sourceBaseline(id)?.state === 'unavailable' ? undefined : observationWork,
           observationDeadline,
+          isSlashPrompt(prompt),
         );
         worker.stdin?.on('error', () => {
           /* Exit and final evidence determine the observation. */
@@ -2537,10 +2614,14 @@ export async function superviseStandalone(
         fs.closeSync(stderr);
       }
     }
-    const backgroundWitness = options.background && final.sessionId ? await settleWitness(final.sessionId) : null;
+    const backgroundWitness =
+      options.background && final.sessionId && !final.commandOnly ? await settleWitness(final.sessionId) : null;
     {
       if (
-        (options.background && receipts.sourceBaseline(id)?.state === 'ready' && backgroundWitness !== 'ready') ||
+        (options.background &&
+          !final.commandOnly &&
+          receipts.sourceBaseline(id)?.state === 'ready' &&
+          backgroundWitness !== 'ready') ||
         !(await startupContinuous(
           receipts,
           id,

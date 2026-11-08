@@ -5564,11 +5564,17 @@ test('window starts adopt both providers and classifications without changing th
         before,
       );
       assert.equal(calls, 1);
-      for (const prompt of ['', '  ', '/clear', '  /model'])
+      for (const prompt of ['', '  '])
         await assert.rejects(
           provider.handleSessionRequest({ ...request, params: { ...request.params, prompt } }),
           /nonempty prompt/,
         );
+      // The launch reaches delivery, which this fixture's prompt assertion refuses. It does not count as a delivered start.
+      await assert.rejects(
+        provider.handleSessionRequest({ ...request, params: { ...request.params, prompt: '/clear' } }),
+        /'\/clear' == 'work'/,
+      );
+      calls -= 1;
       await assert.rejects(
         provider.handleSessionRequest({
           ...request,

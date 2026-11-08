@@ -147,7 +147,7 @@ Each provider's `models` lists exact catalog values as `{value, efforts}`, with 
 
 Starts require a ready panel, project setup storage, and a loaded provider catalog. Unsupported settings refuse launch.
 
-Prompt files must be regular, nonempty, and at most 48 KiB. Slash commands refuse. Encoded requests above the 64 KiB channel limit refuse before connection. Explicit working directories resolve from the caller's directory and use their real filesystem destination.
+Prompt files must be regular, nonempty, and at most 48 KiB. A slash command passes to the harness unchanged. Encoded requests above the 64 KiB channel limit refuse before connection. Explicit working directories resolve from the caller's directory and use their real filesystem destination.
 
 `--agent-run` and `--agent-run=true` classify delegated work. Omission or `--agent-run=false` retains reader ownership and Prompt box continuation. Classification accepts only literal `true` or `false` and cannot repeat. Only `--arc-dispatch` prints the dispatch receipt. Reader-owned receipts include `owned: true`.
 

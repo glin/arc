@@ -1438,11 +1438,12 @@ function hosted(
     agent = 'codex',
     exited = false,
     submitted = true,
-  }: { agent?: 'claude' | 'codex'; exited?: boolean; submitted?: boolean } = {},
+    prompt = null,
+  }: { agent?: 'claude' | 'codex'; exited?: boolean; submitted?: boolean; prompt?: string | null } = {},
 ) {
   const host = new HostedDispatch(receipts, evidence);
   const child = { key: 'worker', agent, state: () => ({ sessionId: session, exited }) };
-  host.register(id, child);
+  host.register(id, child, prompt);
   if (submitted) host.submitted(id, 1);
   return { host, child };
 }
@@ -2925,3 +2926,21 @@ test.each(['darwin', 'linux', 'win32'] as const)(
       );
   },
 );
+
+test('a hosted skill launch reaches its report through the rewritten prompt row', () => {
+  const { receipts, launch } = fixture();
+  const saved = savedResponse('Skill report', {
+    prompt:
+      '<command-message>probe-skill</command-message>\n<command-name>/probe-skill</command-name>\n<command-args>second</command-args>',
+    responseIds: ['response'],
+  });
+  const { host, child } = hosted(receipts, launch.launchId, () => saved, {
+    agent: 'claude',
+    prompt: '/probe-skill second\n',
+  });
+  host.observe(child, { kind: 'text', text: 'Skill report', sourceId: 'response' }, 1);
+  host.observe(child, { kind: 'native', event: { ...ending, provider: 'claude', turnId: null, generation: 1 } }, 1);
+  const event = receipts.latest(launch.launchId)!;
+  assert.equal(event.availability, 'available');
+  assert.equal(event.outcome, 'succeeded');
+});

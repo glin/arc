@@ -251,7 +251,15 @@ export type WireEvent =
   | { kind: 'activity'; activity: WireActivity }
   | { kind: 'ask'; ask: Ask }
   | { kind: 'askResolved'; id: string; outcome?: 'answered' | 'declined' | 'cancelled' | 'unknown' | 'failed' }
-  | { kind: 'turnEnd'; outcome: TurnOutcome; nativeTurnId?: string; localCommand?: string; inputGenerations?: number[] }
+  | {
+      kind: 'turnEnd';
+      outcome: TurnOutcome;
+      nativeTurnId?: string;
+      localCommand?: string;
+      inputGenerations?: number[];
+      // The result succeeded with zero model turns, as a slash command that the harness handled does.
+      commandOnly?: true;
+    }
   // Claude's own report that it started work or has nothing left to do. A prompt that joins a
   // running turn gets no `result` of its own, so only `idle` shows that its work is over.
   // The wire emits it without `settledTurnIds`. The host adds the prompt and command turns the report closed.

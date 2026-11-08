@@ -99,7 +99,7 @@ arc setups --window WINDOW_ID --json
 arc start codex --prompt-file './review prompt.txt' --name 'Review branch' --label Review --pinned --window WINDOW_ID
 ```
 
-Use a returned `--setup KEY` instead of explicit provider settings. Prompt files accept at most 48 KiB. Empty prompts and slash commands refuse launch. Requested settings do not establish observed provider execution.
+Use a returned `--setup KEY` instead of explicit provider settings. Prompt files accept at most 48 KiB. Empty prompts refuse launch. A slash command passes to the harness unchanged. Requested settings do not establish observed provider execution.
 
 `--cwd DIR` selects an existing folder in the window's open project or registered worktrees. Omission uses its first folder. Arc creates no folder or worktree.
 

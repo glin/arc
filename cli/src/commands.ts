@@ -590,7 +590,7 @@ const definitions: readonly Command[] = [
       refusals: [
         'Classification accepts only literal true or false and cannot repeat across bare and equals forms.',
         '--setup cannot combine with explicit provider, model, effort, or permissions.',
-        'Empty prompts, slash commands, oversized files or encoded requests, and unsupported setups refuse launch.',
+        'Empty prompts, oversized files or encoded requests, and unsupported setups refuse launch.',
         'A guarded start refuses ambiguous native requester identity.',
         'Read-only starts refuse permission overrides. MCP read tools require Claude read-only and exact names.',
         '--cache-lifetime refuses other values and Codex setups.',

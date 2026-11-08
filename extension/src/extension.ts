@@ -1943,7 +1943,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     try {
       // Only a start that carries a requester echoes user messages, because guarded follow-ups use the echo as a receipt.
       const liveSession = await startFreshSession(draft, !!start?.requester);
-      if (start?.launchId) dispatch.register(start.launchId, liveSession);
+      if (start?.launchId) dispatch.register(start.launchId, liveSession, prompt.text);
       validateResolvedPromptAssets(prompt.assets);
       let prompted: AgentSession | null = null;
       const turnId = await withStartedSessionActivity(

@@ -6019,6 +6019,32 @@ export function cleanPrompt(raw: string): string {
     .trim();
 }
 
+// Applies the tag and whitespace rules of cleanPrompt to both sides of a launch comparison.
+// cleanPrompt keeps its own copy, because the saved prompt scan rules version covers its source.
+function tidyPrompt(text: string): string {
+  return text
+    .replace(/<\/?[a-z][a-z0-9-]{0,38}>/gi, ' ')
+    .replace(/[^\S\n]+/g, ' ')
+    .replace(/ *\n */g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+export function isSlashPrompt(prompt: string): boolean {
+  return prompt.trimStart().startsWith('/');
+}
+
+// Whether a saved prompt is this launch prompt. A slash launch also matches the row its command was rewritten to.
+// This rebuild keeps harness command names, which cleanPrompt removes, so a saved `/context` row still matches.
+export function launchPromptMatches(saved: string, prompt: string): boolean {
+  if (saved === prompt) return true;
+  if (!isSlashPrompt(prompt)) return false;
+  const rebuilt = saved
+    .replace(WRAPPED, ' ')
+    .replace(COMMAND_INVOCATION, (_all, name: string, args: string) => `${name} ${args}`);
+  return tidyPrompt(rebuilt) === tidyPrompt(prompt);
+}
+
 // Reader-queued prompt with prompt mode and no peer origin. Missing origin remains eligible.
 export function isReaderQueued(attachment: Record<string, unknown> | null | undefined): boolean {
   if (!attachment || attachment.type !== 'queued_command') {

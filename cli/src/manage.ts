@@ -313,7 +313,7 @@ export async function runManagement(command: string, args: string[]): Promise<st
         'Both CLAUDE_CODE_SESSION_ID and CODEX_THREAD_ID are set, so Arc cannot tell which session is asking. No session was started.',
       );
     const prompt = readPromptFile(options.get('--prompt-file')!);
-    if (guardedPromptRefusal(prompt)) throw new Error('Supply a nonempty prompt without a prompt-box command.');
+    if (!prompt.trim()) throw new Error('Supply a nonempty prompt.');
     const params: SessionWriteParams = {
       setup: key
         ? { kind: 'row', key }

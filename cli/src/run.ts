@@ -4,7 +4,7 @@ import * as os from 'node:os';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { readPromptFile } from './manage.ts';
-import { guardedPromptRefusal, payloadSha256 } from '../../extension/src/sessionwrites.ts';
+import { payloadSha256 } from '../../extension/src/sessionwrites.ts';
 import { requesterIdentity } from '../../extension/src/sessionrequests.ts';
 import {
   canonicalServiceTier,
@@ -123,7 +123,7 @@ export function parseRun(args: string[], env = process.env, platform = process.p
   for (const dir of [cwd, ...addDirs])
     if (!fs.statSync(dir).isDirectory()) throw new Error(`The launch directory is unavailable: ${dir}`);
   const prompt = readPromptFile(required('--prompt-file'));
-  if (guardedPromptRefusal(prompt)) throw new Error('Supply a nonempty prompt without a prompt-box command.');
+  if (!prompt.trim()) throw new Error('Supply a nonempty prompt.');
   const permission = values.get('--permissions') ?? '';
   const policy = launchPolicy(provider, flags.has('--read-only'), tools, permission);
   if (

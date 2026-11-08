@@ -2791,8 +2791,7 @@ export class PanelProvider implements vscode.Disposable {
     if (request.method === 'setups') return setupListing(view, this.setupProject);
     const params = request.params;
     const text = params.prompt!;
-    if (!text.trim() || text.trimStart().startsWith('/'))
-      throw new Error('Supply a nonempty prompt without a prompt-box command.');
+    if (!text.trim()) throw new Error('Supply a nonempty prompt.');
     const profile = launcherProfile(view, params.setup!);
     if (!profile)
       throw new Error(
