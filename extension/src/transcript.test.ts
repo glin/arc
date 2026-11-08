@@ -18214,6 +18214,17 @@ test('a child census reads a child replaced at its path with a new inode', () =>
   assert.equal(after.sessions[0].cwd, 'C:/Repo/Two');
 });
 
+test('a child census reads a child whose last row names another device', () => {
+  const { write, census } = childCensusFixture('child-census-device-');
+  write('Child', 'C:/Repo/One');
+  const first = census();
+  const row = first.sessions[0];
+  const device = typeof row.dev === 'number' ? row.dev + 1 : String(BigInt(row.dev!) + 1n);
+  const result = census([{ ...row, dev: device }]);
+  assert.equal(result.opened.length, 1, 'a row from another device kept its working directory');
+  assert.equal(result.sessions[0].dev, row.dev);
+});
+
 test('a child census reads a child whose last row holds no working directory', () => {
   const { write, census } = childCensusFixture('child-census-no-cwd-');
   write('Child', 'C:/Repo/One');
