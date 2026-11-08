@@ -119,7 +119,7 @@ import {
   withRailEnrichment,
   withMetadataCoverage,
   withSessionName,
-  SAVED_DISCOVERY_LINKS_MAX_AGE_MS,
+  savedLinksRefusal,
 } from './derivedcache';
 import {
   aggregateUsageEvents,
@@ -10484,7 +10484,7 @@ function cachedLinksHarness(change: (fixture: any) => void = () => {}) {
   const fixture: any = { census: [] };
   const harness = bumpedCatalogHarness(
     {
-      SAVED_DISCOVERY_LINKS_MAX_AGE_MS,
+      savedLinksRefusal,
       enumerateClaudeChildSources: () => ({
         sessions: fixture.census,
         files: fixture.census.map((source: SessionFile) => source.file),
@@ -10529,6 +10529,7 @@ function cachedLinksHarness(change: (fixture: any) => void = () => {}) {
   const reply = fixture.reply;
   Object.assign(provider, {
     savedLinks: fixture.saved,
+    savedLinksMalformed: fixture.malformed === true,
     receiptStoreIdentity: () => fixture.store,
     performanceCounters: {
       ...provider.performanceCounters,
@@ -10542,6 +10543,23 @@ function cachedLinksHarness(change: (fixture: any) => void = () => {}) {
   };
   return { ...harness, other, link, savedChild, work, requests, now };
 }
+
+test.each([
+  ['older than a day', (savedAt: number) => savedAt - 2 * 24 * 60 * 60 * 1000],
+  ['saved at a later time than the clock', (savedAt: number) => savedAt + 60_000],
+])('a saved link set %s publishes the first catalog', async (_case, moved) => {
+  vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+  try {
+    const { provider, work, now } = cachedLinksHarness((fixture) => {
+      fixture.saved = { ...fixture.saved, savedAt: moved(fixture.saved.savedAt) };
+    });
+    vi.setSystemTime(now);
+    await provider.refresh(true);
+    assert.equal(work.get('cachedLinks:published'), 1, [...work.keys()].join(', '));
+  } finally {
+    vi.useRealTimers();
+  }
+});
 
 test('a warm start publishes its first catalog from the saved links before the worker replies, with discovery pending', async () => {
   vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
@@ -10699,10 +10717,15 @@ test('only a complete reply that settles members saves its links', async () => {
 
 test.each([
   ['missing', (fixture: any) => (fixture.saved = undefined)],
+  [
+    'malformed',
+    (fixture: any) => {
+      fixture.saved = undefined;
+      fixture.malformed = true;
+    },
+  ],
   ['scope', (fixture: any) => (fixture.saved.scope = JSON.stringify(['elsewhere']))],
-  ['generation', (fixture: any) => (fixture.saved.compatibility = 'older')],
-  ['age', (fixture: any) => (fixture.saved.savedAt -= SAVED_DISCOVERY_LINKS_MAX_AGE_MS)],
-  ['age', (fixture: any) => (fixture.saved.savedAt += 60_000)],
+  ['incompatible', (fixture: any) => (fixture.saved.compatibility = 'older')],
   ['store', (fixture: any) => (fixture.store = 'store-2')],
   ['child', (fixture: any) => (fixture.census = [])],
   ['child', (fixture: any) => (fixture.census = [{ ...fixture.census[0], ino: 3 }])],

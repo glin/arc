@@ -647,7 +647,7 @@ import {
   type CarriedName,
   type ClaudeChildReferenceCacheEntry,
   type SavedDiscoveryLinks,
-  SAVED_DISCOVERY_LINKS_MAX_AGE_MS,
+  savedLinksRefusal,
 } from './derivedcache';
 import { drawnSessionCards } from './sessiondetails';
 import {
@@ -1774,6 +1774,7 @@ export class PanelProvider implements vscode.Disposable {
   // The links of the last settled discovery reply, saved with the derived cache. The first catalog of an activation can publish
   // from the set that the previous activation saved.
   private savedLinks?: SavedDiscoveryLinks;
+  private savedLinksMalformed = false;
   // True once the first catalog of this activation published from the saved links or refused them.
   private cachedLinksOffered = false;
   // A usable saved set that a catalog refresh found, which the acceptance of that refresh's generation publishes.
@@ -3735,6 +3736,7 @@ export class PanelProvider implements vscode.Disposable {
       this.claudeChildReferenceEntries = cached.claudeChildReferences;
       this.discoveryCheckpoint = cached.discovery;
       this.savedLinks = cached.links;
+      this.savedLinksMalformed = cached.linksMalformed === true;
       this.savedPromptScans = cached.promptScans ?? new Map();
       this.carriedNames = cached.carriedNames;
       this.commitRepositories.load(cached.commitRepositories ?? []);
@@ -13922,13 +13924,14 @@ export class PanelProvider implements vscode.Disposable {
       this.performanceCounters.recordWork(`cachedLinks:refused:${reason}`);
       return null;
     };
-    const saved = this.savedLinks;
-    if (!saved) return refuse('missing');
-    if (saved.scope !== JSON.stringify(this.repositoryScopeRoots)) return refuse('scope');
-    if (saved.compatibility !== discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION))
-      return refuse('generation');
-    const age = Date.now() - saved.savedAt;
-    if (age < 0 || age > SAVED_DISCOVERY_LINKS_MAX_AGE_MS) return refuse('age');
+    const refusal = savedLinksRefusal(
+      this.savedLinks,
+      this.savedLinksMalformed,
+      JSON.stringify(this.repositoryScopeRoots),
+      discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
+    );
+    if (refusal) return refuse(refusal);
+    const saved = this.savedLinks!;
     const parents = new Map((this.claudeParents ?? []).map((source) => [normalizeFsPath(source.file), source]));
     const childSources = new Map(this.walkedChildSources.map((source) => [normalizeFsPath(source.file), source]));
     const sessionIds = new Set([...parents.values(), ...childSources.values()].map((source) => source.sessionId));

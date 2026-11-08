@@ -247,6 +247,7 @@ import {
   MAX_CLAUDE_CHILD_REFERENCE_FILES,
   CLAUDE_METADATA_TAIL_BYTES,
   MAX_CLAUDE_CHILD_REFERENCES_PER_FILE,
+  savedLinksRefusal,
   MAX_SAVED_DISCOVERY_LINKS,
   MAX_SAVED_PROMPT_SCANS,
   PROMPT_SCAN_RULES_VERSION,
@@ -299,6 +300,32 @@ function loadClaudeCache(file: string, sources: string | DerivedCacheSources = {
   });
 }
 
+test('saved links load at any age and name why a start cannot use them', () => {
+  const compatibility = discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION);
+  const scope = JSON.stringify(['/repo']);
+  const cache = path.join(folder(), 'cache.json');
+  const links = { savedAt: 1000, scope, compatibility, receiptStore: '1:2', references: [], children: [] };
+  saveClaudeCache(cache, [], [], [], undefined, undefined, [], undefined, links);
+  const load = (file: string) => {
+    const loaded = loadClaudeCache(file);
+    return savedLinksRefusal(loaded.links, loaded.linksMalformed === true, scope, compatibility);
+  };
+  vi.useFakeTimers({ now: 1000 + 2 * 24 * 60 * 60 * 1000 });
+  try {
+    assert.equal(load(cache), null, 'a set older than a day was refused');
+  } finally {
+    vi.useRealTimers();
+  }
+  saveClaudeCache(cache, [], [], [], undefined, undefined, [], undefined, { ...links, compatibility: 'older' });
+  assert.equal(load(cache), 'incompatible');
+  assert.equal(load(path.join(folder(), 'absent.json')), 'missing');
+  saveClaudeCache(cache, [], [], [], undefined, undefined, [], undefined, {
+    ...links,
+    scope: JSON.stringify(['/other']),
+  });
+  assert.equal(load(cache), 'scope');
+});
+
 test('the derived cache keeps the saved discovery links and drops a malformed or oversized set', () => {
   const cache = path.join(folder(), 'cache.json');
   const child = '/repo/parent/subagents/agent-child.jsonl';
@@ -339,11 +366,13 @@ test('the derived cache keeps the saved discovery links and drops a malformed or
   };
   saveClaudeCache(cache, [], [], [], undefined, undefined, [], undefined, links);
   assert.deepEqual(loadClaudeCache(cache).links, links, 'the saved links did not survive a restart');
+  assert.equal(loadClaudeCache(cache).linksMalformed, undefined);
   saveClaudeCache(cache, [], [], [], undefined, undefined, [], undefined, {
     ...links,
     children: [{ ...links.children[0], cwd: '' }],
   });
   assert.equal(loadClaudeCache(cache).links, undefined, 'a child row without a working directory kept the set');
+  assert.equal(loadClaudeCache(cache).linksMalformed, true, 'a set that failed validation read as absent');
   saveClaudeCache(cache, [], [], [], undefined, undefined, [], undefined, {
     ...links,
     references: Array.from({ length: MAX_SAVED_DISCOVERY_LINKS }, () => links.references[0]),
