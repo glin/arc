@@ -74,7 +74,7 @@ export const REPORT_ONLY = new Set([
   'compressedStoreBytes',
   'refreshCount:compressed-facts',
 ]);
-export const REPORT_ONLY_PREFIXES = ['refreshMs:', 'refreshMaxMs:'] as const;
+export const REPORT_ONLY_PREFIXES = ['refreshMs:', 'refreshMaxMs:', 'refreshCount:catalog-enumeration:'] as const;
 
 export function isReportOnly(name: string): boolean {
   return REPORT_ONLY.has(name) || REPORT_ONLY_PREFIXES.some((prefix) => name.startsWith(prefix));

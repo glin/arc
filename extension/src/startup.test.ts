@@ -2061,6 +2061,35 @@ test('refresh rows report past the margin and fail past a limit', () => {
   assert.deepEqual([limited.reportOnly, limited.regressed], [false, true]);
 });
 
+test('every part row of the catalog enumeration reports and never fails', () => {
+  const parts = [
+    'listing',
+    'stats',
+    'openings',
+    'prompts',
+    'build',
+    'openings:parents',
+    'openings:codex',
+    'openings:collisions',
+    'openings:children',
+  ];
+  const nameOf = (part: string) => `refreshCount:catalog-enumeration:${part}`;
+  const measures = compareResults(
+    [runnerResult()],
+    [runnerResult(Object.fromEntries(parts.map((part) => [nameOf(part), 40])))],
+  );
+  for (const part of parts) {
+    const row = measures.find((measure) => measure.name === nameOf(part))!;
+    assert.deepEqual([row.baseline, row.candidate, row.reportOnly, row.regressed], [null, 40, true, false], part);
+  }
+  // The count of the enumeration itself keeps its margin.
+  const whole = compareResults(
+    [runnerResult({ 'refreshCount:catalog-enumeration': 1 })],
+    [runnerResult({ 'refreshCount:catalog-enumeration': 40 })],
+  ).find((measure) => measure.name === 'refreshCount:catalog-enumeration')!;
+  assert.deepEqual([whole.reportOnly, whole.regressed], [false, true]);
+});
+
 test('refresh rows read the hold snapshot when the run holds', () => {
   const bounds = boundsOf(['--limit', 'refreshMaxMs:compressed-facts=50']);
   const launch = runnerResult({

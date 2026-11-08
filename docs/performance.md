@@ -184,12 +184,12 @@ Run it from `extension`. Without `--baseline`, it measures the source commit of 
 
 `--margin <measure>=<ratio>` sets the ratio of one measure in place of the margin of its class. That row has no floor. The flag repeats. Each run of both sides must report a measure that `--margin` names.
 
-The measures that `REPORT_ONLY` in `compare.ts` names appear in the report and never regress. So do the measures whose names start with `refreshMs:` or `refreshMaxMs:`. A `--limit`, `--floor` or `--margin` that names such a measure gates it. When a run holds its warm-up, the comparison reads each `refreshMs:` and `refreshMaxMs:` row and `refreshCount:compressed-facts` from the snapshot after the hold. Otherwise it reads them from the end snapshot of the measured launch.
+The measures that `REPORT_ONLY` in `compare.ts` names appear in the report and never regress. So do the measures whose names start with `refreshMs:`, `refreshMaxMs:` or `refreshCount:catalog-enumeration:`. A `--limit`, `--floor` or `--margin` that names such a measure gates it. When a run holds its warm-up, the comparison reads each `refreshMs:` and `refreshMaxMs:` row and `refreshCount:compressed-facts` from the snapshot after the hold. Otherwise it reads them from the end snapshot of the measured launch.
 
 | Measures | Margin | Floor |
 | --- | --- | --- |
 | Times: first usable row, first pass, `passMs` | 1.5 | 1 second |
-| Counts: publications, continuations, dispatched spend visits, root restarts, catalog walks, refreshes by reason other than `compressed-facts` | 1.5 | 5 |
+| Counts: publications, continuations, dispatched spend visits, root restarts, catalog walks, refreshes by reason other than `compressed-facts` and the `catalog-enumeration:` parts | 1.5 | 5 |
 | Bytes: `readBytes`, `dispatchSpendBytes` | 1.5 | 1 MiB |
 | Peak extension host memory | 1.25 | 64 MiB |
 
