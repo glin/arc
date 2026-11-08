@@ -609,7 +609,7 @@ const NESTED_RECORD_STYLE = `(() => {
   };
 })()`;
 
-test("a subagent's duration record draws like its cost record", { timeout: 60_000 }, async (t) => {
+test("a subagent's duration popover and heading match its cost record's", { timeout: 60_000 }, async (t) => {
   const browser = await browserOrNone();
   if (!browser) {
     t.skip('no browser installed');

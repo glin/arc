@@ -4018,9 +4018,10 @@ const SUBAGENT_RESULTS_ESTIMATE_NOTE = 'Estimated from text size.';
 // Rows past the third wait behind the View more expander.
 const SUBAGENT_RESULT_ROWS = 3;
 
-// A share of context in whole percent at 10% or more, and with one decimal below it.
+// A share of context in whole percent at 10% or more, and with one decimal below it. An estimated
+// size past the recorded context prints 100%, where the meter stops.
 function subagentSharePercent(tokens: number, context: number): string {
-  const percent = (tokens / context) * 100;
+  const percent = Math.min(100, (tokens / context) * 100);
   if (percent === 0) {
     return '0%';
   }

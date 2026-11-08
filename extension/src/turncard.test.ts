@@ -13591,6 +13591,42 @@ test('the subagent results entry folds rows past the third, marks a partial figu
   });
 });
 
+// A size estimated from text can pass the recorded context. The printed shares then stop at 100%
+// like the meter, and the estimate marks stay.
+test('no subagent results share prints above 100% when the estimate exceeds the recorded context', () => {
+  const agents = [12_000, 11_000, 10_000, 6000, 5000].map((tokens, index) => ({
+    name: `Subagent ${index + 1}`,
+    tokens,
+  }));
+  const card = toCard(
+    turn({
+      contextTokens: 10_000,
+      contextWindow: 200_000,
+      subagentContext: { tokens: 44_000, partial: false, removed: false, agents },
+    }),
+    false,
+    NOW,
+  );
+  const { entry } = subagentResultsEntry(card.chips);
+  const chip = card.chips.find((held) => held.metric === 'context');
+  const breakdown = entry?.breakdown;
+  const rowPercents = breakdown?.rows.map((row) => row.percent);
+  const printed = [entry?.value, ...(rowPercents ?? []), breakdown?.rest?.percent, chip?.detail].join(' ');
+  const percents = (printed.match(/[0-9.]+%/g) ?? []).map((text) => Number.parseFloat(text));
+  assert.deepEqual(
+    percents.filter((percent) => percent > 100),
+    [],
+    printed,
+  );
+  assert.equal(breakdown?.share, 1);
+  assert.equal(entry?.value, '100% (44k)');
+  assert.deepEqual(rowPercents, ['100%', '100%', '100%', '60%', '50%']);
+  assert.equal(breakdown?.rest?.percent, '100%');
+  assert.equal(entry?.valueTitle, '44,000 tokens, estimate');
+  assert.equal(breakdown?.rows[0].title, 'Subagent 1: 12,000 tokens, estimate');
+  assert.ok(chip?.detailList?.notes?.includes('Estimated from text size.'));
+});
+
 // The plain-text detail lists the rows the closed entry shows and one line for the rest.
 test('the subagent results plain text lists the shown rows and one line for the rest', () => {
   const agents = Array.from({ length: 12 }, (_, index) => ({
