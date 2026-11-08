@@ -2878,6 +2878,7 @@ function completeDiscoveryHarness(
     'recordLoadingFailures',
     'sessionLoadingState',
     'sessionLoadingBlocker',
+    'publishesWalkedRows',
     'postSessionLoading',
     'sendSessionLoading',
     'withSourceCount',
@@ -10494,7 +10495,7 @@ function cachedLinksHarness(change: (fixture: any) => void = () => {}) {
       }),
     },
     false,
-    ['publishCachedLinks', 'installCachedLinks', 'publishesWalkedRows', 'membershipOf', 'physicalMembershipOf'],
+    ['publishCachedLinks', 'installCachedLinks', 'membershipOf', 'physicalMembershipOf'],
   );
   const { provider, claude, child, claudeWalk } = harness;
   const other = { ...claude, file: 'fixture/other.jsonl', sessionId: '6f2c1d9e-0000-4000-8000-000000000003' };

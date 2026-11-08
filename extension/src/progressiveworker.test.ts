@@ -531,9 +531,10 @@ test('a receipt pass takes one event-loop turn for each batch of steps', async (
       1,
       new AbortController().signal,
     );
-    const charges = pass?.value.charges as { receiptStepCount?: number; receiptTurnCount?: number } | undefined;
-    assert.equal(charges?.receiptStepCount, 256);
-    assert.equal(charges?.receiptTurnCount, 32);
+    assert.equal(pass?.value.kind, 'claude-children-progress');
+    const charges = pass.value.charges as { receiptStepCount?: number; receiptTurnCount?: number };
+    assert.equal(charges.receiptStepCount, 256);
+    assert.equal(charges.receiptTurnCount, 32);
   } finally {
     worker.stop();
   }
@@ -622,11 +623,12 @@ test('the receipt counters record launches read, launches rejected at the reques
         pass + 1,
         new AbortController().signal,
       );
-      const charges = result?.value.charges;
+      assert.ok(result?.value.kind === 'claude-children' || result?.value.kind === 'claude-children-progress');
+      const charges = result.value.charges;
       launchesRead += charges?.receiptLaunchesRead ?? 0;
       launchesRejected += charges?.receiptLaunchesRejectedAtRequester ?? 0;
       turns += charges?.receiptScanTurns ?? 0;
-      complete = result?.value.kind === 'claude-children';
+      complete = result.value.kind === 'claude-children';
     }
     assert.ok(complete, 'receipt discovery never completed');
     assert.equal(launchesRead, 1);
