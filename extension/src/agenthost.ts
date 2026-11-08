@@ -4,6 +4,7 @@ import {
   claudeCacheLifetime,
   CACHE_TTL_ENV,
   type LaunchPolicy,
+  type ServiceTier,
 } from './launchpolicy';
 import { MEASUREMENT_ENVIRONMENT } from './identity';
 import { unavailableDefaults, type AppliedDefaults, type ServiceTierEvidence } from './view/model-picks';
@@ -60,6 +61,11 @@ import {
   clearCommand,
   compactCommand,
   effortChoices,
+  fastTierRefusal,
+  sessionSettings,
+  toggleFastSelection,
+  type FastToggleResult,
+  type SessionSettingBook,
 } from './composerview';
 import { confirmClaudeRename, InitialNameCancelled } from './sessionrename';
 import {
@@ -3326,6 +3332,73 @@ export function modelChange(
     settings.pendingEffort = null;
   }
   return { effort, tellChild: live && effort !== held, settings };
+}
+
+// Runs one settings change at a time for each session, so a speed toggle and a model pick cannot interleave.
+export type SettingTurns = <T>(session: string, work: () => Promise<T>) => Promise<T>;
+
+export function settingTurns(): SettingTurns {
+  const turns = new Map<string, Promise<unknown>>();
+  return <T>(session: string, work: () => Promise<T>): Promise<T> => {
+    const turn = (turns.get(session) ?? Promise.resolve()).catch(() => {}).then(work);
+    turns.set(session, turn);
+    void turn
+      .catch(() => {})
+      .finally(() => {
+        if (turns.get(session) === turn) turns.delete(session);
+      });
+    return turn;
+  };
+}
+
+// The model the next launch of a saved session requests. An empty answer omits the model from that launch.
+export function sessionLaunchModel(book: SessionSettingBook, session: string, list: ModelList | null): string {
+  return pickedModel(sessionSettings(book, session).selectedModel, list);
+}
+
+export interface SessionFastToggleSteps {
+  turns: SettingTurns;
+  models: Pick<ModelBook, 'get' | 'lists'>;
+  read: () => SessionSettingBook;
+  commit: (session: string, serviceTier: ServiceTier) => Promise<void>;
+  // Reads a speed setting for a session without a running child.
+  idleEvidence: (cwd: string | null, model: string) => Promise<ServiceTierEvidence | null>;
+  host: Pick<AgentHost, 'find' | 'withActivity' | 'retireSession'>;
+  published: () => void;
+}
+
+// A typed /fast on a saved Codex session. `recordedModel` answers for a launch that omits its model. The model is
+// resolved inside the settings turn, so a model pick queued ahead of the command decides which speeds apply.
+export function sessionFastToggle(steps: SessionFastToggleSteps) {
+  return (session: string, cwd: string | null, recordedModel: () => string): Promise<FastToggleResult> =>
+    steps.turns(session, async () => {
+      const model = sessionLaunchModel(steps.read(), session, steps.models.get('codex')) || recordedModel();
+      const child = () => steps.host.find('codex', session);
+      const result = await toggleFastSelection({
+        session,
+        read: steps.read,
+        commit: (serviceTier) => steps.commit(session, serviceTier),
+        evidence: async () => {
+          const live = child();
+          const applied = live ? await steps.host.withActivity(live.key, (active) => active.nextServiceTier()) : null;
+          return applied ?? (await steps.idleEvidence(cwd, model));
+        },
+        stage: async (tier) => {
+          const live = child();
+          if (live) return await steps.host.withActivity(live.key, (active) => active.stageServiceTier(tier));
+          // The prompt box and its command list offer speeds from this same catalog.
+          const refusal = fastTierRefusal(steps.models.lists().codex ?? [], model, tier);
+          if (refusal) throw new Error(refusal);
+          return null;
+        },
+        retire: async () => {
+          const live = child();
+          if (live) await steps.host.retireSession(live.key);
+        },
+      });
+      if (result.outcome === 'changed') steps.published();
+      return result;
+    });
 }
 
 // Owns children started by this window. Other windows read their work from disk.

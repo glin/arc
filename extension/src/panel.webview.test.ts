@@ -45557,6 +45557,24 @@ function typedFastProvider(toggle: () => Promise<Record<string, unknown>>) {
   return { ...typed, calls, restored: () => typed.posted.filter((message) => message.type === 'restoreDraft') };
 }
 
+test('a typed /fast reads the recorded model when its settings turn runs', async () => {
+  let recorded = (): string => '';
+  const { provider, session } = typedFastProvider(async () => ({ outcome: 'changed', tier: 'priority' }));
+  provider.onFastToggle = async (_session: string, _cwd: string | null, read: () => string) => {
+    recorded = read;
+    return { outcome: 'changed', tier: 'priority' };
+  };
+  provider.sendPrompt('/fast', session, 1);
+  await vi.waitFor(() => assert.equal(provider.fastToggles.has(session), false));
+  provider.composerStateFor = () => ({
+    settings: { confirmedModel: 'later' },
+    defaults: { base: { model: 'default' } },
+  });
+  assert.equal(recorded(), 'later', 'the command kept the recorded model from before its settings turn');
+  provider.composerStateFor = () => ({ settings: { confirmedModel: null }, defaults: { base: { model: 'default' } } });
+  assert.equal(recorded(), 'default');
+});
+
 test('a typed /fast changes the session speed, runs no model turn, and clears only its text', async () => {
   const { provider, session, sent, calls, restored } = typedFastProvider(async () => ({
     outcome: 'changed',

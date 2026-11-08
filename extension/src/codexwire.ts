@@ -2674,8 +2674,8 @@ export function turnOutcome(turn: Json | null): TurnOutcome {
 // replies were confirmed to describe the model and effort a new thread applies.
 const CODEX_DEFAULTS_FLOOR = parseVersion('0.159.2')!;
 
-// The first Codex version whose thread replies and `service_tier` and `models.newThread.serviceTier` settings were
-// confirmed to describe the speed a new thread applies.
+// From this Codex version, Arc reads thread replies and the `service_tier` and `models.newThread.serviceTier` settings
+// as the speed a new thread applies.
 const CODEX_TIER_READING_FLOOR = parseVersion('0.167.0')!;
 
 // Codex versions at or above the floor whose replies misdescribe the applied defaults.

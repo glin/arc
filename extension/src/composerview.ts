@@ -4116,7 +4116,7 @@ function draftProfilePicks(state: ComposerState, profile: SessionProfile): Compo
   const speedNote =
     state.settings.serviceTier === undefined
       ? ''
-      : `${speedName(profile.agent === 'codex' ? 'openai' : null, state.settings.serviceTier)} selected for the next turn.`;
+      : `${speedName('openai', state.settings.serviceTier)} selected for the next turn.`;
   const noEffortToSet =
     noEffort &&
     !!resolvedChoice(state.models, profile.model, state.defaults) &&

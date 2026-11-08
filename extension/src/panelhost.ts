@@ -1871,7 +1871,9 @@ export class PanelProvider implements vscode.Disposable {
   // Every result comes with the session id the process holds when it arrives, which a Claude `/clear`
   // changes, or null when that process has exited or retired.
   // Runs a typed Codex /fast for a session outside a draft. The extension owns the settings book and the running child.
-  public onFastToggle: ((session: string, cwd: string | null, model: string) => Promise<FastToggleResult>) | undefined;
+  public onFastToggle:
+    | ((session: string, cwd: string | null, recordedModel: () => string) => Promise<FastToggleResult>)
+    | undefined;
   // Reads a Codex speed setting without a session or turn.
   public onReadFastEvidence: ((cwd: string | null, model: string) => Promise<ServiceTierEvidence | null>) | undefined;
   public onRemoteControl:
@@ -9349,17 +9351,20 @@ export class PanelProvider implements vscode.Disposable {
       return { outcome: 'refused', notice: FAST_UNRESOLVED };
     const cwd = this.cwdForSession(state.agent, session);
     const draft = this.newDrafts[session];
+    if (!draft) {
+      if (!this.onFastToggle) return { outcome: 'refused', notice: FAST_UNRESOLVED };
+      // The callback reads this after earlier settings changes for the session finish.
+      return await this.onFastToggle(session, cwd, () => {
+        const now = this.composerStateFor(session) ?? state;
+        return now.settings.confirmedModel || now.defaults?.base?.model || '';
+      });
+    }
     const model =
       state.settings.selectedModel ||
       state.settings.confirmedModel ||
-      draft?.profile.model ||
+      draft.profile.model ||
       state.defaults?.base?.model ||
       '';
-    if (!draft) {
-      return this.onFastToggle
-        ? await this.onFastToggle(session, cwd, model)
-        : { outcome: 'refused', notice: FAST_UNRESOLVED };
-    }
     // Two commands would read the same starting speed and both select Fast, so a draft runs one at a time.
     if ((this.fastToggles?.get(session) ?? 0) > 1) return { outcome: 'refused', notice: FAST_UNRESOLVED };
     // A draft has no child and no durable session. Its speed reaches the launch through the draft itself.

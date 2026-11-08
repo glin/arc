@@ -49,6 +49,9 @@ import {
   McpChange,
   McpPendingRefreshes,
   ModelBook,
+  sessionFastToggle,
+  sessionLaunchModel,
+  settingTurns,
   SavedDefaults,
   saveCatalog,
   savedCatalogs,
@@ -98,9 +101,7 @@ import {
   failedCompactionDelivery,
   failedClearDelivery,
   acceptedSessionSettings,
-  fastTierRefusal,
   sessionSettingStore,
-  toggleFastSelection,
   acceptedPermissionMode,
   SessionSettingBook,
   sessionSettings,
@@ -969,8 +970,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     return storedAskValue(agent, selected, stored(ASK_MODE_KEY)[agent]);
   }
   const modelFor = (agent: string, session?: string): string => {
-    const selected = session ? sessionSettings(settingBook(), session).selectedModel : (stored(MODEL_KEY)[agent] ?? '');
-    return pickedModel(selected, models.get(agent));
+    if (session) return sessionLaunchModel(settingBook(), session, models.get(agent));
+    return pickedModel(stored(MODEL_KEY)[agent] ?? '', models.get(agent));
   };
   const effortFor = (agent: string, session?: string): string => {
     if (!session) {
@@ -2148,47 +2149,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     );
   };
 
-  // One settings change runs at a time for each session, so a speed toggle and a model pick cannot interleave.
-  const settingTurns = new Map<string, Promise<unknown>>();
-  const inSettingTurn = <T>(session: string, work: () => Promise<T>): Promise<T> => {
-    const turn = (settingTurns.get(session) ?? Promise.resolve()).catch(() => {}).then(work);
-    settingTurns.set(session, turn);
-    void turn
-      .catch(() => {})
-      .finally(() => {
-        if (settingTurns.get(session) === turn) settingTurns.delete(session);
-      });
-    return turn;
-  };
+  const inSettingTurn = settingTurns();
 
   panel.onReadFastEvidence = readIdleFastEvidence;
-  panel.onFastToggle = (session, cwd, model) =>
-    inSettingTurn(session, async () => {
-      const child = () => host.find('codex', session);
-      const result = await toggleFastSelection({
-        session,
-        read: settingBook,
-        commit: (serviceTier) => commitSessionSetting(session, { serviceTier }),
-        evidence: async () => {
-          const live = child();
-          const applied = live ? await host.withActivity(live.key, (active) => active.nextServiceTier()) : null;
-          return applied ?? (await readIdleFastEvidence(cwd, model));
-        },
-        stage: async (tier) => {
-          const live = child();
-          if (live) return await host.withActivity(live.key, (active) => active.stageServiceTier(tier));
-          const refusal = fastTierRefusal(models.get('codex')?.models ?? [], model, tier);
-          if (refusal) throw new Error(refusal);
-          return null;
-        },
-        retire: async () => {
-          const live = child();
-          if (live) await host.retireSession(live.key);
-        },
-      });
-      if (result.outcome === 'changed') publishPicks();
-      return result;
-    });
+  panel.onFastToggle = sessionFastToggle({
+    turns: inSettingTurn,
+    models,
+    read: settingBook,
+    commit: (session, serviceTier) => commitSessionSetting(session, { serviceTier }),
+    idleEvidence: readIdleFastEvidence,
+    host,
+    published: publishPicks,
+  });
 
   panel.onPicked = (agent, session, control, value, settledModel, cwd) =>
     reportFailures(async () => {

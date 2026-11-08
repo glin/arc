@@ -1,7 +1,9 @@
 import { afterEach, onTestFinished, test, vi } from 'vitest';
 import assert from 'node:assert';
 import { CONTEXT_FRAME_BYTES, contextFrameId } from './contextframe';
-import { sessionSettingStore } from './composerview';
+import { sessionSettingStore, type FastToggleResult } from './composerview';
+import type { ServiceTier } from './launchpolicy';
+import type { ModelChoice } from './agentwire';
 import { UsageWriteQueue } from './usageview';
 import * as fs from 'node:fs';
 import fsBuiltin from 'node:fs';
@@ -49,6 +51,8 @@ import {
   checkCodexServiceTier,
   codexRenamePlan,
   modelChange,
+  sessionFastToggle,
+  settingTurns,
   openDraftMcp,
   pickedEffort,
   pickedModel,
@@ -8012,6 +8016,138 @@ test('an idle child that never comes up is reported, not left hanging', { timeou
   await tick();
   probe.children[0].exit(1, null);
   await assert.rejects(probe.answers, /stopped with code 1/);
+});
+
+function fastRow(value: string, serviceTiers?: string[], isDefault = false): ModelChoice {
+  return {
+    value,
+    label: value,
+    description: '',
+    efforts: [],
+    ...(serviceTiers ? { serviceTiers } : {}),
+    ...(isDefault ? { isDefault } : {}),
+  };
+}
+
+function refusal(result: FastToggleResult): string {
+  return result.outcome === 'refused' ? result.notice : '';
+}
+
+// The production callback for a saved Codex session without a running child.
+function idleFastToggle(models: ModelBook, selected: string) {
+  const turns = settingTurns();
+  let book = withSessionSettings({}, 's1', { ...sessionSettings({}, 's1'), selectedModel: selected });
+  const committed: ServiceTier[] = [];
+  const evidenceModels: string[] = [];
+  const toggle = sessionFastToggle({
+    turns,
+    models,
+    read: () => book,
+    commit: async (session, serviceTier) => {
+      committed.push(serviceTier);
+      book = withSessionSettings(book, session, { ...sessionSettings(book, session), serviceTier });
+    },
+    idleEvidence: async (_cwd, model) => {
+      evidenceModels.push(model);
+      return { status: 'absent' };
+    },
+    host: { find: () => null, withActivity: async () => null, retireSession: async () => {} },
+    published: () => {},
+  });
+  // Queues a model pick. The pick holds its settings turn until the returned function runs.
+  const pendingPick = (model: string): (() => void) => {
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    void turns('s1', async () => {
+      await gate;
+      const { settings } = modelChange('codex', model, '', models.get('codex'), false);
+      book = withSessionSettings(book, 's1', { ...sessionSettings(book, 's1'), ...settings });
+    });
+    return release;
+  };
+  return { toggle, committed, evidenceModels, pendingPick };
+}
+
+test('an idle /fast checks the catalog that the prompt box holds', async () => {
+  const carried = (rows: ModelChoice[]) => new ModelBook({ codex: { models: rows, readAt: 0 } });
+  const offered = carried([fastRow('model-a', ['priority'])]);
+  offered.noteSilent('codex');
+  const held = idleFastToggle(offered, 'model-a');
+  assert.deepEqual(await held.toggle('s1', 'ws', () => ''), { outcome: 'changed', tier: 'priority' });
+  assert.deepEqual(held.committed, ['priority'], 'a failed refresh refused a model the saved catalog offers');
+
+  const none = idleFastToggle(carried([fastRow('model-a', [])]), 'model-a');
+  assert.match(refusal(await none.toggle('s1', 'ws', () => '')), /does not offer service tier priority/);
+  const unknown = idleFastToggle(carried([fastRow('model-a')]), 'model-a');
+  assert.match(refusal(await unknown.toggle('s1', 'ws', () => '')), /has not reported/);
+  assert.deepEqual([...none.committed, ...unknown.committed], []);
+
+  const replaced = carried([fastRow('model-a', ['priority'])]);
+  replaced.note('codex', { models: [fastRow('model-a', [])], readAt: 1 });
+  const fresh = idleFastToggle(replaced, 'model-a');
+  assert.match(refusal(await fresh.toggle('s1', 'ws', () => '')), /does not offer/, 'a saved catalog beat a fresh one');
+});
+
+test('a model pick queued before an idle /fast decides which model the command checks', async () => {
+  const cases = [
+    {
+      name: 'A to B without Fast',
+      rows: [fastRow('model-a', ['priority']), fastRow('model-b', [])],
+      pick: 'model-b',
+      recorded: 'model-a',
+      checked: 'model-b',
+      refused: /does not offer service tier priority for model-b/,
+    },
+    {
+      name: 'A without Fast to B',
+      rows: [fastRow('model-a', []), fastRow('model-b', ['priority'])],
+      pick: 'model-b',
+      recorded: 'model-a',
+      checked: 'model-b',
+    },
+    {
+      name: 'A to the recorded model without Fast',
+      rows: [fastRow('model-a', ['priority']), fastRow('model-c', [])],
+      pick: '',
+      recorded: 'model-c',
+      checked: 'model-c',
+      refused: /does not offer service tier priority for model-c/,
+    },
+    {
+      name: 'A without Fast to the Codex default',
+      rows: [fastRow('model-a', []), fastRow('model-d', ['priority'], true)],
+      pick: '',
+      recorded: '',
+      checked: '',
+    },
+  ];
+  for (const { name, rows, pick, recorded, checked, refused } of cases) {
+    const models = new ModelBook();
+    models.note('codex', { models: rows, readAt: 0 });
+    const idle = idleFastToggle(models, 'model-a');
+    const release = idle.pendingPick(pick);
+    const toggled = idle.toggle('s1', 'ws', () => recorded);
+    release();
+    const result = await toggled;
+    assert.deepEqual(idle.evidenceModels, [checked], name);
+    if (refused) {
+      assert.equal(result.outcome, 'refused', name);
+      assert.match(refusal(result), refused, name);
+      assert.deepEqual(idle.committed, [], name);
+    } else {
+      assert.deepEqual(result, { outcome: 'changed', tier: 'priority' }, name);
+    }
+  }
+});
+
+test('an idle /fast follows the next launch when a fresh catalog retires the selected model', async () => {
+  const models = new ModelBook();
+  models.note('codex', { models: [fastRow('model-b', ['priority'])], readAt: 0 });
+  const idle = idleFastToggle(models, 'retired');
+  assert.equal((await idle.toggle('s1', 'ws', () => 'model-b')).outcome, 'changed');
+  assert.deepEqual(idle.evidenceModels, ['model-b']);
 });
 
 test('an agent that could not answer for its models is not asked again until the reader asks', () => {
