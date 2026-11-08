@@ -32564,10 +32564,10 @@ test('selection and accepted worker results avoid unnecessary catalog walks', ()
   const reusing = [...panelHostSource.matchAll(/this\.refresh(?:From|As)\('[^']+', (?:true|false), true\b/g)];
   assert.equal(
     reusing.length,
-    18,
+    19,
     `${reusing.length} refresh callers reuse the held catalog. Selection, older-page loading, ` +
-      'the accepted selected-worker follow-up, row delta recovery and a poll at unchanged directories must not ' +
-      'repeat catalog enumeration.',
+      'the accepted selected-worker follow-up, row delta recovery, repeated-record coverage and a poll at unchanged ' +
+      'directories must not repeat catalog enumeration.',
   );
   const refreshAt = panelHostSource.indexOf('async refresh(');
   const refresh = panelHostSource.slice(
