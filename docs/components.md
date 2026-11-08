@@ -118,6 +118,7 @@ Paths are relative to `extension/src/`. [Architecture](architecture.md) owns pac
 | `turnlabels.ts` | Session-label storage, membership, counts, abandoned-draft cleanup, and editor rows and re-exports shared label rules | no |
 | `turnplaces.ts` | Tracks visited sessions for Back and Forward navigation | no |
 | `turnfixtures.ts` | Shared test fixtures. Shipped code must not import it | no |
+| `budgetworkspace.ts` | Seeded generator of the count budget test workspace. Shipped code must not import it | no |
 | `panelfixture.ts` | The real page and a full render payload for browser tests and the screenshot script | no |
 | `temproot.ts` | Scratch directories beneath a suite root, plus private socket directories with explicit ownership and local cleanup. Shipped code must not import it | no |
 | `patchview.ts` | Builds both diff sides from recorded edits, and composes several contributors' edits only in a proven order | no |

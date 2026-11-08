@@ -13,7 +13,7 @@ import {
 } from '../test/source-tree.ts';
 
 const MAY_IMPORT_VSCODE = new Set(['extension.ts', 'panelhost.ts', 'uris.ts', 'config.ts']);
-const TEST_ONLY_COMPONENTS = new Set(['panelfixture.ts', 'temproot.ts', 'turnfixtures.ts']);
+const TEST_ONLY_COMPONENTS = new Set(['budgetworkspace.ts', 'panelfixture.ts', 'temproot.ts', 'turnfixtures.ts']);
 
 function inventory() {
   return inventorySourceTree(__dirname);
