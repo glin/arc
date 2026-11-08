@@ -20,6 +20,7 @@ function sameEntry(left: PromptEntry, right: PromptEntry): boolean {
     left.name === right.name &&
     left.description === right.description &&
     left.argumentHint === right.argumentHint &&
+    left.builtin === right.builtin &&
     left.path === right.path &&
     left.sessionSkillRelease === right.sessionSkillRelease
   );

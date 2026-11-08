@@ -32,7 +32,7 @@ Local command results carry `num_turns: 0` and null `stop_reason`. Model work re
 
 ### Guarded receipts
 
-Every hosted child uses `--replay-user-messages`. Guarded follow-ups and continuations carry a client UUID and start native submissions. Acceptance requires a root replay with that UUID, the same session, and exact text. Replay frames never enter display.
+Every hosted child uses `--replay-user-messages`. Guarded follow-ups and continuations carry a client UUID and start native submissions. Acceptance requires a root replay with that UUID, the same session, and exact text. A slash prompt also matches the replay Claude rewrites its command to. The replay's command name must equal the prompt's first word, and its arguments must equal the rest of the prompt with surrounding whitespace trimmed. A replay without command arguments matches only a prompt with no text after its command. Replay frames never enter display. A guarded slash send to a busy session refuses like any other guarded send. An unguarded slash prompt waits for the turn and never goes as live input.
 
 An idle follow-up without its replay remains unknown after a result or idle report. Live input retains its receipt window across both. Exit or 120 seconds without a matching replay leaves delivery unknown. A slash replay transfers model ownership only after root model output names that input UUID.
 

@@ -27,8 +27,16 @@ export class GuardChild {
   sessionId = 'worker';
   exited = false;
   lastError: string | null = null;
+  commands: { name: string; builtin?: boolean }[] = [];
+  skills: string[] = [];
   state() {
-    return { sessionId: this.sessionId, exited: this.exited, lastError: this.lastError };
+    return {
+      sessionId: this.sessionId,
+      exited: this.exited,
+      lastError: this.lastError,
+      commands: this.commands,
+      skills: this.skills,
+    };
   }
   guardedIdle() {
     return this.idle;

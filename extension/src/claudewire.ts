@@ -65,7 +65,7 @@ import {
 } from './agentwire';
 import { agentTakesAsset, validatePromptAssetBytes } from './promptassets';
 import { ClaudeResponseClock } from './outputrate';
-import { claudeTaskNotification } from './transcript';
+import { claudeTaskNotification, replayedPromptMatches } from './transcript';
 
 type ClaudePromptBlock = Record<string, unknown>;
 
@@ -209,6 +209,7 @@ function readCommands(v: unknown): PromptEntry[] {
       name,
       description: (c && str(c.description)) ?? '',
       argumentHint: (c && str(c.argumentHint)) ?? '',
+      ...(c?.builtin === true ? { builtin: true } : {}),
     });
   }
   return out;
@@ -517,15 +518,14 @@ const PROMPT_RECEIPTS = 16;
 // The origin Claude Code writes on a prompt a person typed. See `ClaudeWire.prompt`.
 const HUMAN_ORIGIN = { kind: 'human' } as const;
 
-// Whether a replayed user message holds exactly this text, as a string or as one text block.
+// Whether a replayed user message holds this text, as a string or as one text block. A slash prompt also
+// matches the replay its command was rewritten to. Any other prompt needs exactly its text.
 function replayedText(m: Json, text: string): boolean {
   const message = obj(m.message);
   const content = message?.content;
   const blocks = arr(content);
-  return (
-    message?.role === 'user' &&
-    (content === text || (blocks.length === 1 && obj(blocks[0])?.type === 'text' && obj(blocks[0])?.text === text))
-  );
+  const replayed = blocks.length === 1 && obj(blocks[0])?.type === 'text' ? obj(blocks[0])?.text : content;
+  return message?.role === 'user' && typeof replayed === 'string' && replayedPromptMatches(replayed, text);
 }
 
 export interface WireOptions {
@@ -892,10 +892,10 @@ export class ClaudeWire {
     return Promise.resolve();
   }
 
-  // A replay settles the guarded attempt only for the same UUID, session, root scope, and exact text.
+  // A replay settles the guarded attempt only for the same UUID, session, root scope, and matching text.
   // It reports a prompt's receipt for the same UUID and root scope, in the session the wire follows
   // now, which must be the session the wire knew at the write when it knew one. A guarded prompt's
-  // receipt also needs the exact text.
+  // receipt also needs matching text.
   private replay(m: Json): void {
     if (str(m.type) !== 'user' || (m.parent_tool_use_id !== undefined && m.parent_tool_use_id !== null)) return;
     const uuid = str(m.uuid);

@@ -34,6 +34,8 @@ export interface PromptEntry {
   name: string;
   description: string;
   argumentHint: string;
+  // Claude marks harness commands and bundled skills. A send to Claude reads it. The panel view drops it.
+  builtin?: boolean;
   path?: string;
   sessionSkillRelease?: string;
 }

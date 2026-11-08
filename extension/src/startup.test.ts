@@ -8,6 +8,7 @@ import {
   agentMessageBinding,
   guardedRefusal,
   guardedPromptRefusal,
+  slashSendRefusal,
   requesterOf,
   payloadSha256,
 } from './sessionwrites';
@@ -53,6 +54,7 @@ import {
   promptScanLists,
   readClaudeChildSessionReferences,
   changedClaudeChildReferences,
+  isSlashPrompt,
 } from './transcript';
 import { createHash, randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
@@ -19933,6 +19935,60 @@ test.each([
   }
 });
 
+// The agent message refusal for a slash command the target session does not publish.
+async function claudeAgentMessageRefusals(prompt: string) {
+  const f = agentMessageHost('claude');
+  f.setBusy(false);
+  const auto = await f.host.sendAgentMessage(
+    { ...f.request, params: { ...f.request.params, prompt, delivery: 'auto' as const } },
+    f.binding(),
+  );
+  const queued = await f.host.queueAgentMessage(
+    { ...f.request, id: 'window:queued', params: { ...f.request.params, prompt } },
+    f.binding(),
+  );
+  assert.deepEqual(f.reads, []);
+  assert.equal(f.host.queues.target, undefined);
+  return [auto, queued];
+}
+
+test('an agent message of a built-in command to a Claude session refuses and names the command', async () => {
+  const [auto, queued] = await claudeAgentMessageRefusals('/clear');
+  for (const [result, outcome] of [
+    [auto, /\/clear.* No message was sent\.$/],
+    [queued, /\/clear.* No message was queued\.$/],
+  ] as const) {
+    assert.equal(result.status, 'refused');
+    assert.match(result.reason, outcome);
+  }
+});
+
+test('an agent message of a slash command to Codex is delivered', async () => {
+  const f = agentMessageHost('codex');
+  f.setBusy(false);
+  const request = { ...f.request, params: { ...f.request.params, prompt: '/clear', delivery: 'auto' as const } };
+  assert.equal((await f.host.sendAgentMessage(request, f.binding())).delivery, 'turn');
+  assert.deepEqual(f.reads, ['/clear']);
+});
+
+test('a queued skill that the session withdraws refuses at delivery', async () => {
+  const f = agentMessageHost('claude');
+  // The command list is fixed at the handshake, so only a later init message can withdraw a skill.
+  const commands = [{ name: 'clear', builtin: true }];
+  f.publish(commands, ['review']);
+  const text = '/review plan.md';
+  const queued = await f.host.queueAgentMessage(
+    { ...f.request, params: { ...f.request.params, prompt: text } },
+    f.binding(),
+  );
+  assert.equal(queued.status, 'queued');
+  f.publish(commands, []);
+  f.setBusy(false);
+  f.host.flushQueue('target');
+  await vi.waitFor(() => assert.match(f.host.queues.target[0].reason, /\/review.* No message was sent\.$/));
+  assert.deepEqual(f.reads, []);
+});
+
 // Exercise the production host drain with a native receipt writer and no visible target selection.
 function agentMessageHost(agent: 'claude' | 'codex') {
   const file = ts.createSourceFile(
@@ -19977,6 +20033,8 @@ function agentMessageHost(agent: 'claude' | 'codex') {
     queuedSubmission,
     guardedRefusal,
     guardedPromptRefusal,
+    slashSendRefusal,
+    isSlashPrompt,
     requesterOf,
     payloadSha256,
     queueSubmissionAfter,
@@ -20017,10 +20075,12 @@ function agentMessageHost(agent: 'claude' | 'codex') {
   let receipt: ((attempt: GuardedAttempt) => void) | undefined;
   let beforeNative: (() => void) | undefined;
   let persist: (() => Promise<void>) | undefined;
+  let commands: { name: string; builtin?: boolean }[] = [{ name: 'clear', builtin: true }, { name: 'ship' }];
+  let skills: string[] = ['ship'];
   const child = {
     key: 'original-child',
     agent,
-    state: () => ({ sessionId: 'target', exited, lastError: null }),
+    state: () => ({ sessionId: 'target', exited, lastError: null, commands, skills }),
     guardedTurnEnds: () => 0,
     guardedIdle: () => (busy || asks || control ? 'busy' : null),
     guardedLiveReason: () => (asks || control ? 'Waiting for pending work.' : busy ? null : 'No running work.'),
@@ -20140,6 +20200,10 @@ function agentMessageHost(agent: 'claude' | 'codex') {
     text,
     request,
     binding,
+    publish: (nextCommands: typeof commands, nextSkills: string[]) => {
+      commands = nextCommands;
+      skills = nextSkills;
+    },
     setBusy: (value: boolean) => {
       busy = value;
     },
@@ -20227,6 +20291,36 @@ for (const agent of ['claude', 'codex'] as const) {
       book.runGuarded(request.id, f.request, () => assert.fail('changed mode wrote again')),
       /different request/,
     );
+  });
+  test(`${agent} slash messages wait for the turn instead of reaching a working session as live input`, async () => {
+    const f = agentMessageHost(agent);
+    const text = '/ship plan.md';
+    const request = { ...f.request, params: { ...f.request.params, prompt: text, delivery: 'auto' as const } };
+    const result = await f.host.sendAgentMessage(request, f.binding());
+    assert.equal(result.status, 'queued');
+    assert.match(result.reason, /^A slash command waits for the current turn\. /);
+    assert.deepEqual(f.reads, []);
+    assert.equal(f.host.queues.target[0].text, text);
+    f.setBusy(false);
+    f.host.flushQueue('target');
+    await vi.waitFor(() => assert.deepEqual(f.reads, [text]));
+  });
+  test(`${agent} slash messages to a session that is not busy keep the live input reason`, async () => {
+    const f = agentMessageHost(agent);
+    f.setBusy(false);
+    const request = {
+      ...f.request,
+      params: { ...f.request.params, prompt: '/ship plan.md', delivery: 'auto' as const },
+    };
+    const binding = {
+      ...f.binding(),
+      idle: () => 'unconfirmed',
+      liveReason: () => 'The agent is waiting for pending work.',
+    };
+    const result = await f.host.sendAgentMessage(request, binding);
+    assert.equal(result.status, 'queued');
+    assert.match(result.reason, /^The agent is waiting for pending work\. /);
+    assert.deepEqual(f.reads, []);
   });
   test(`${agent} ordinary sends start idle work and preserve pending-work and FIFO queue admission`, async () => {
     const idle = agentMessageHost(agent);

@@ -40801,7 +40801,7 @@ class GuardedPanelChild {
   readonly key = 'worker-key';
   readonly agent = 'claude';
   state() {
-    return { sessionId: 'worker', exited: false, lastError: null };
+    return { sessionId: 'worker', exited: false, lastError: null, commands: [], skills: [] };
   }
   guardedIdle() {
     return null;

@@ -32,6 +32,7 @@ import type { WindowState } from './sessionrequests';
 import {
   archiveRefusal,
   guardedPromptRefusal,
+  slashSendRefusal,
   guardedRefusal,
   payloadSha256,
   type AgentMessageBinding,
@@ -165,6 +166,7 @@ import {
   sessionOutcomeOf,
   sessionStatFactsOf,
   shortenTo,
+  isSlashPrompt,
 } from './transcript';
 import { onClaudeRepeatedCoverage } from './clauderepeated';
 import {
@@ -6882,7 +6884,7 @@ export class PanelProvider implements vscode.Disposable {
         binding.sessionId !== session
       )
         return 'The destination session is unavailable. No message was sent.';
-      return binding.refusal();
+      return binding.refusal() ?? slashSendRefusal(text, binding.sendTarget(), 'No message was sent.');
     };
     const waiting = () => {
       const state = this.stateFor(session)!;
@@ -6903,7 +6905,13 @@ export class PanelProvider implements vscode.Disposable {
       const idle = binding.idle();
       const queueReason =
         waiting() ??
-        (idle === null ? null : binding.liveReason ? binding.liveReason() : 'The session cannot receive live input.');
+        (idle === null
+          ? null
+          : idle === 'busy' && isSlashPrompt(text)
+            ? 'A slash command waits for the current turn.'
+            : binding.liveReason
+              ? binding.liveReason()
+              : 'The session cannot receive live input.');
       if (queueReason) {
         const queued = await this.queueAgentMessage(request, binding, true);
         return queued.status === 'queued' ? { ...queued, reason: `${queueReason} ${queued.reason}` } : queued;
@@ -6993,7 +7001,7 @@ export class PanelProvider implements vscode.Disposable {
         (!binding?.current() && this.backgroundRefusal(session, 'No message was queued.')) ||
           'The destination session is unavailable. No message was queued.',
       );
-    const blocked = binding.refusal();
+    const blocked = binding.refusal() ?? slashSendRefusal(text, binding.sendTarget(), 'No message was queued.');
     if (blocked) return refuse(blocked);
     const id = crypto.randomUUID();
     const queued = queueSubmissionAfter(state.queued, id, text, [], [], Date.now(), false, {
@@ -7144,6 +7152,8 @@ export class PanelProvider implements vscode.Disposable {
         facts.pendingControls > Number(this.pendingQueueDrains.has(session))
       )
         throw new Error('The destination changed before this message was sent.');
+      const withdrawn = slashSendRefusal(next.text, binding.sendTarget(), 'No message was sent.');
+      if (withdrawn) throw new Error(withdrawn);
     };
     try {
       await this.writeDrafts();

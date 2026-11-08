@@ -623,7 +623,7 @@ const definitions: readonly Command[] = [
       refusals: [
         'One session ID, prompt file, and explicit request ID are required.',
         'Missing or ambiguous native requester identity refuses input. With --observation, stale observations, unavailable ownership, or a busy session refuses input.',
-        'Empty prompts, slash commands, oversized files or encoded requests refuse.',
+        'Empty prompts, oversized files or encoded requests refuse. A slash command to a Claude session refuses unless the session publishes it as a skill or custom command.',
         windowRefusal,
       ],
       example:

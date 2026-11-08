@@ -2736,6 +2736,67 @@ test('Claude live receipts survive the original result and idle until their exac
   wire.close('done');
 });
 
+test('a Claude guarded slash prompt settles on the replay its command was rewritten to', () => {
+  vi.useFakeTimers();
+  try {
+    const skill =
+      '<command-message>probe-skill</command-message>\n<command-name>/probe-skill</command-name>\n<command-args>second</command-args>';
+    const noArgs = '<command-message>probe-command</command-message>\n<command-name>/probe-command</command-name>';
+    const builtIn =
+      '<command-name>/clear</command-name>\n            <command-message>clear</command-message>\n            <command-args></command-args>';
+    const invoked = (name: string, args: string) =>
+      `<command-message>${name.slice(1)}</command-message>\n<command-name>${name}</command-name>\n<command-args>${args}</command-args>`;
+    const argumentless = '<command-message>ship</command-message>\n<command-name>/ship</command-name>';
+    for (const [sent, content, outcome] of [
+      ['/ship <plan>', invoked('/ship', '<plan>'), 'accepted'],
+      ['/ship <plan>', argumentless, null],
+      ['/ship', invoked('/ship', 'plan.md'), null],
+      [
+        '/ship x <system-reminder>note</system-reminder>',
+        invoked('/ship', 'x <system-reminder>note</system-reminder>'),
+        'accepted',
+      ],
+      ['/ship x <system-reminder>note</system-reminder>', invoked('/ship', 'x'), null],
+      ['/ship </command-args> x', invoked('/ship', '</command-args> x'), 'accepted'],
+      ['/ship\nplan.md', invoked('/ship', 'plan.md'), 'accepted'],
+      ['/ship two  spaces', invoked('/ship', 'two spaces'), null],
+      ['/ship', invoked('/shipit', ''), null],
+      ['/probe-skill second', skill, 'accepted'],
+      ['/probe-skill second\n', skill, 'accepted'],
+      ['/probe-skill second', [{ type: 'text', text: skill }], 'accepted'],
+      ['/probe-command', noArgs, 'accepted'],
+      ['/clear', builtIn, 'accepted'],
+      ['/ship other-plan', '<command-message>ship</command-message>\n<command-name>/ship</command-name>', null],
+      ['/probe-skill first', skill, null],
+      ['/other second', skill, null],
+      ['Run the probe.', 'Run the probe.', 'accepted'],
+      ['Run the probe.\n', 'Run the probe.', null],
+      ['Run the probe.', skill, null],
+    ] as const) {
+      const wire = new ClaudeWire({ send: () => {}, emit: () => {}, sessionId: SESSION });
+      wire.receive(
+        JSON.stringify({ type: 'system', subtype: 'session_state_changed', state: 'idle', session_id: SESSION }),
+      );
+      const attempt = new GuardedAttempt('6f1c2a1e-0000-4000-8000-000000000002');
+      void wire.prompt({ text: sent, assets: [] }, attempt);
+      wire.receive(
+        JSON.stringify({
+          type: 'user',
+          isReplay: true,
+          session_id: SESSION,
+          parent_tool_use_id: null,
+          uuid: attempt.clientUuid,
+          message: { role: 'user', content },
+        }),
+      );
+      assert.equal(attempt.settled?.outcome ?? null, outcome, `${sent} against ${JSON.stringify(content)}`);
+      wire.close('done');
+    }
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 test('Claude guarded prompts settle only on the matching root replay, and replay frames stay out of display and session tracking', () => {
   vi.useFakeTimers();
   try {

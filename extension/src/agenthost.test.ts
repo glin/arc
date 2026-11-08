@@ -1961,6 +1961,77 @@ test('a session sends the handshake before anything else and keeps the command l
   );
 });
 
+test('a Claude session retains its command classification and its init skill list', async () => {
+  const { host, children } = fakeHost();
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  const child = children[0];
+  child.answerHandshake([
+    { name: 'clear', description: 'Clear', argumentHint: '', builtin: true },
+    { name: 'ship', description: 'Ship', argumentHint: '' },
+  ] as { name: string; description: string; argumentHint: string }[]);
+  const session = await starting;
+  assert.deepEqual(
+    session.state().commands.map((c) => [c.name, c.builtin]),
+    [
+      ['clear', true],
+      ['ship', undefined],
+    ],
+  );
+  assert.deepEqual(session.state().skills, []);
+  child.say(
+    JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sess-1', skills: ['ship', 'review'] }) + '\n',
+  );
+  assert.deepEqual(session.state().skills, ['ship', 'review']);
+});
+
+test('a guarded skill reaches model work through its rewritten replay and the output naming its input', async () => {
+  const fake = fakeHost();
+  const starting = fake.host.session('guarded', claudePlan(CLAUDE, { cwd: WS, sessionId: 'worker-session' }));
+  const child = fake.children[0];
+  child.answerHandshake();
+  const session = await starting;
+  await session.prompt('initial assignment');
+  child.say(sessionState('running'));
+  child.say(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'done' }) + '\n');
+  child.say(sessionState('idle'));
+  const attempt = await fake.host.withActivity('guarded', async (live) => {
+    const written = live.guardedPrompt('/ship plan.md', 'uuid-skill');
+    await written.written;
+    return written;
+  });
+  assert.ok(attempt);
+  child.say(
+    JSON.stringify({
+      type: 'user',
+      isReplay: true,
+      uuid: 'uuid-skill',
+      session_id: 'worker-session',
+      parent_tool_use_id: null,
+      message: {
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: '<command-message>ship</command-message>\n<command-name>/ship</command-name>\n<command-args>plan.md</command-args>',
+          },
+        ],
+      },
+    }) + '\n',
+  );
+  assert.equal((await attempt.receipt).outcome, 'accepted');
+  assert.equal(session.guardedLiveReason(), 'The agent is waiting for pending work.');
+  child.say(
+    JSON.stringify({
+      type: 'assistant',
+      session_id: 'worker-session',
+      parent_tool_use_id: null,
+      user_message_uuid: 'uuid-skill',
+      message: { role: 'assistant', content: [{ type: 'text', text: 'Working.' }] },
+    }) + '\n',
+  );
+  await vi.waitFor(() => assert.equal(session.guardedLiveReason(), null));
+});
+
 test('a listener told a session is ready can read its commands off it there and then', async () => {
   // A ready listener must read the command list immediately. Publish handshake commands before emitting ready.
 

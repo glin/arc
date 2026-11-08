@@ -13,6 +13,7 @@ import { requestWindow, requesterIdentity } from './sessionrequests.ts';
 import {
   ARCHIVE_COMPLETION_UNAVAILABLE,
   GUARDED_SEND_REASONS,
+  slashSendRefusal,
   SessionReadObservations,
   runSessionRead,
   SessionWriteRequests,
@@ -407,7 +408,7 @@ test(
   },
 );
 
-test('guarded sends refuse other coordinators, old activations, ambiguous requesters, and prompt-box commands with no write', async () => {
+test('guarded sends refuse other coordinators, old activations, ambiguous requesters, and empty prompts with no write', async () => {
   const { policy, coordinator, facts, writes, send } = guardFixture();
   assert.equal(policy.observe('worker', { provider: 'codex', id: 'coordinator' }, facts), null);
   assert.equal(policy.observe('worker', { provider: 'claude', id: 'other' }, facts), null);
@@ -419,8 +420,7 @@ test('guarded sends refuse other coordinators, old activations, ambiguous reques
   assert.equal((await send({ activation: 'reloaded' })).reason, GUARDED_SEND_REASONS.unrelated);
   assert.equal((await send({ sessionId: 'unrecorded' })).reason, GUARDED_SEND_REASONS.unrelated);
   assert.equal((await send({ requester: null })).reason, GUARDED_SEND_REASONS.requester);
-  for (const prompt of ['', '  \n', '/compact', '  /clear now'])
-    assert.equal((await send({ prompt })).reason, GUARDED_SEND_REASONS.prompt);
+  for (const prompt of ['', '  \n']) assert.equal((await send({ prompt })).reason, GUARDED_SEND_REASONS.prompt);
   assert.deepEqual(requesterIdentity({ CLAUDE_CODE_SESSION_ID: 'a', CODEX_THREAD_ID: 'b' }), {
     requester: 'a',
     provider: null,
@@ -453,6 +453,75 @@ test('guarded sends refuse other coordinators, old activations, ambiguous reques
     { ...wire, params: { ...sendParams, path: '/tmp/prompt' } },
   ])
     assert.equal(parseSessionRequest(invalid), null);
+});
+
+const PUBLISHED = {
+  agent: 'claude',
+  commands: [{ name: 'clear', builtin: true }, { name: 'code-review', builtin: true }, { name: 'ship' }],
+  skills: ['review', 'arc-session-tools:arc-sessions', 'code-review'],
+};
+
+test('a slash send to a Claude session passes only for a command the session publishes as its own', () => {
+  for (const outcome of ['No prompt was sent.', 'No message was sent.', 'No message was queued.'])
+    assert.ok(slashSendRefusal('/clear', PUBLISHED, outcome)?.endsWith(` ${outcome}`), outcome);
+  for (const text of [
+    '/ship plan.md',
+    '  /ship',
+    '/review\n',
+    '/arc-session-tools:arc-sessions',
+    '/code-review',
+    'Run the ship skill.',
+    '/tmp/notes.txt holds the plan',
+  ])
+    assert.equal(slashSendRefusal(text, PUBLISHED, 'No prompt was sent.'), null, text);
+  const unclassifiable = { agent: 'claude', commands: [{ name: 'ship' }], skills: ['review'] };
+  const nothingPublished = { agent: 'claude', commands: [], skills: ['review'] };
+  for (const [text, target, command] of [
+    ['/clear', PUBLISHED, '/clear'],
+    ['  /clear now', PUBLISHED, '/clear'],
+    ['/Ship', PUBLISHED, '/Ship'],
+    ['/arc-sessions', PUBLISHED, '/arc-sessions'],
+    ['/missing', PUBLISHED, '/missing'],
+    ['/ship', unclassifiable, '/ship'],
+    ['/review', unclassifiable, '/review'],
+    ['/review', nothingPublished, '/review'],
+  ] as const)
+    assert.ok(slashSendRefusal(text, target, 'No prompt was sent.')?.includes(command), `${text} passed`);
+  // Before the first init message only the command list speaks, so a skill that only init names refuses.
+  const noSkillsYet = { ...PUBLISHED, skills: [] };
+  assert.equal(slashSendRefusal('/ship', noSkillsYet, 'No prompt was sent.'), null);
+  assert.ok(slashSendRefusal('/code-review', noSkillsYet, 'No prompt was sent.')?.includes('/code-review'));
+  assert.ok(slashSendRefusal('/review', noSkillsYet, 'No prompt was sent.')?.includes('/review'));
+  for (const text of ['/clear', '/anything at all'])
+    assert.equal(
+      slashSendRefusal(text, { agent: 'codex', commands: [], skills: [] }, 'No prompt was sent.'),
+      null,
+      text,
+    );
+});
+
+test('a guarded slash send reaches a published skill, and a built-in refuses with the worker record usable', async () => {
+  const { policy, child, coordinator, facts, writes, send } = guardFixture();
+  child.commands = PUBLISHED.commands;
+  child.skills = PUBLISHED.skills;
+  const observation = policy.observe('worker', coordinator, facts)!;
+  const refused = await send({ prompt: '/clear', observation });
+  assert.equal(refused.status, 'refused');
+  assert.match(refused.reason, /\/clear.* No prompt was sent\.$/);
+  assert.equal(writes.length, 0);
+  const sending = send({ prompt: '/ship plan.md', observation });
+  await vi.waitFor(() => assert.equal(writes.length, 1));
+  writes[0].settle({ outcome: 'accepted', nativeTurnId: null, reason: '' });
+  assert.equal((await sending).status, 'accepted');
+});
+
+test('a guarded slash send to Codex passes without a command list', async () => {
+  const { child, writes, send } = guardFixture();
+  child.agent = 'codex';
+  const sending = send({ prompt: '/ship plan.md' });
+  await vi.waitFor(() => assert.equal(writes.length, 1));
+  writes[0].settle({ outcome: 'accepted', nativeTurnId: null, reason: '' });
+  assert.equal((await sending).status, 'accepted');
 });
 
 test('guarded sends consume observations, bind source, scope, turn and assignment, and refuse unexplained changes before input', async () => {

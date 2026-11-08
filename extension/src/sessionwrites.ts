@@ -1,7 +1,7 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import type { LauncherRequest } from './view/launcher';
 import type { SessionListingRow } from './sessionreads';
-import type { GuardedAttempt, GuardedReceipt } from './agentwire';
+import type { GuardedAttempt, GuardedReceipt, PromptEntry } from './agentwire';
 import {
   canonicalServiceTier,
   isServiceTier,
@@ -488,7 +488,7 @@ export const GUARDED_SEND_REASONS = {
   unrelated: 'The requesting session did not start this session in this Arc window. No prompt was sent.',
   requester:
     'Arc cannot tell which session is asking. Run send from one Claude Code or Codex session. No prompt was sent.',
-  prompt: 'Supply a nonempty prompt without a prompt-box command. No prompt was sent.',
+  prompt: 'Supply a nonempty prompt. No prompt was sent.',
   stale: 'The observation is stale. Read the session again and prepare a new follow-up. No prompt was sent.',
   unsettled: 'An earlier follow-up to this session is still unsettled. No prompt was sent.',
   blocked:
@@ -502,7 +502,14 @@ export const GUARDED_SEND_REASONS = {
 // The retained child as the policy reads it. `AgentSession` implements it.
 export interface GuardedChild {
   readonly key: string;
-  state(): { sessionId: string | null; exited: boolean; lastError: string | null };
+  readonly agent: string;
+  state(): {
+    sessionId: string | null;
+    exited: boolean;
+    lastError: string | null;
+    commands: SlashSendTarget['commands'];
+    skills: SlashSendTarget['skills'];
+  };
   guardedIdle(): string | null;
   // How many turns this child has ended. Source growth with a new turn end is tracked work, not an outside change.
   guardedTurnEnds(): number;
@@ -571,6 +578,8 @@ export interface AgentMessageBinding {
   current(): boolean;
   idle(): string | null;
   refusal(): string | null;
+  // The bound child's published commands, read when the slash rule runs.
+  sendTarget(): SlashSendTarget;
   invalidate(): void;
   reserve?(): (() => void) | null;
   liveReason?(): string | null;
@@ -614,7 +623,36 @@ const digest = (value: string | null) =>
   value === null ? '' : createHash('sha256').update(value).digest('base64url').slice(0, 22);
 
 export function guardedPromptRefusal(text: string): boolean {
-  return !text.trim() || text.trimStart().startsWith('/');
+  return !text.trim();
+}
+
+// What a slash send reads from its target.
+export interface SlashSendTarget {
+  agent: string;
+  commands: readonly Pick<PromptEntry, 'name' | 'builtin'>[];
+  skills: readonly string[];
+}
+
+function slashSendTarget(child: GuardedChild): SlashSendTarget {
+  const { commands, skills } = child.state();
+  return { agent: child.agent, commands, skills };
+}
+
+// The refusal for a prompt whose first word is a command this target does not publish, or null when it can go.
+// `outcome` is the sentence that tells the caller's reader what happened to the text.
+// Codex reads slash text as a prompt, so only Claude targets refuse. A Claude list that marks no built-in cannot
+// tell a skill from a harness command, so nothing passes. Names compare exactly.
+export function slashSendRefusal(text: string, target: SlashSendTarget, outcome: string): string | null {
+  const word = text.trimStart().split(/\s/, 1)[0];
+  if (!word.startsWith('/') || target.agent !== 'claude' || word.indexOf('/', 1) !== -1) return null;
+  const name = word.slice(1);
+  const classified = target.commands.some((entry) => entry.builtin === true);
+  const published =
+    classified &&
+    (target.commands.some((entry) => entry.name === name && entry.builtin !== true) || target.skills.includes(name));
+  return published
+    ? null
+    : `Arc cannot confirm that this session offers ${word} as a skill or custom command. ${outcome}`;
 }
 
 function sameRequester(a: RequesterIdentity, b: RequesterIdentity): boolean {
@@ -782,6 +820,8 @@ export class GuardedSends<C extends GuardedChild = GuardedChild> {
     const state = child?.state();
     if (!child || child !== worker.owner.child || !state || state.exited || state.sessionId !== request.sessionId)
       return GUARDED_SEND_REASONS.ownership;
+    const slash = slashSendRefusal(request.prompt, slashSendTarget(child), 'No prompt was sent.');
+    if (slash) return slash;
     if (facts?.writerConflict) {
       worker.conflict = true;
       return GUARDED_SEND_REASONS.ownership;
@@ -1000,7 +1040,6 @@ export function interveneOnReaderInput(
 
 // The live child as the delivery port reads it. `AgentSession` implements it.
 export interface GuardedWriter extends GuardedChild {
-  readonly agent: string;
   guardedLiveReason?(): string | null;
   guardedLive?(
     text: string,
@@ -1043,6 +1082,7 @@ export function agentMessageBinding<C extends GuardedWriter>(
     current,
     idle: () => child.guardedIdle(),
     refusal,
+    sendTarget: () => slashSendTarget(child),
     invalidate: () => policy.invalidate(session),
     reserve: () => policy.reserve(session),
     liveReason: () => (child.guardedLiveReason ? child.guardedLiveReason() : 'This agent cannot receive live input.'),

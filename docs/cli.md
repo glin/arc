@@ -130,7 +130,9 @@ A disconnected or timed-out write with uncertain delivery returns `unknown` and 
 
 ### Follow-ups
 
-`send` delivers literal reader-requested text when `--observation` is absent. The destination requires a live child in the selected scope. Eligible idle sessions start a prompt. Eligible running sessions receive live input. Add `--queue` or `-q` for intentional next-turn delivery. Older queued messages retain FIFO precedence. Open requests, pending work, and unsupported live delivery defer the message. `queued` confirms admission, not delivery.
+`send` delivers literal reader-requested text when `--observation` is absent. The destination requires a live child in the selected scope. Eligible idle sessions start a prompt. Eligible running sessions receive live input. Add `--queue` or `-q` for intentional next-turn delivery. Older queued messages retain FIFO precedence. Open requests, pending work, and unsupported live delivery defer the message. A slash command always waits for the turn and never arrives as live input. `queued` confirms admission, not delivery.
+
+A send to a Claude session refuses a leading slash command unless the session publishes it as a skill or custom command. Names compare exactly, including case. A session must start a turn before its `init` skill list exists, and a Claude version without the `builtin` flag refuses every slash command. A send to Codex passes any nonempty prompt.
 
 ```bash
 arc send SESSION_ID --prompt-file message.txt --request-id WINDOW_ID:message --window WINDOW_ID --json

@@ -266,7 +266,7 @@ export async function runManagement(command: string, args: string[]): Promise<st
       );
     if (!identity.provider) throw new Error('Run send from a Claude Code or Codex session. No prompt was sent.');
     const prompt = readPromptFile(options.get('--prompt-file')!);
-    if (guardedPromptRefusal(prompt)) throw new Error('Supply a nonempty prompt without a prompt-box command.');
+    if (guardedPromptRefusal(prompt)) throw new Error('Supply a nonempty prompt.');
     const params: SessionWriteParams = {
       sessionId: sessions[0],
       prompt,

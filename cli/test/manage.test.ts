@@ -611,8 +611,7 @@ test('send refuses invalid flags, identities and prompt content before the host 
     }
     vi.stubEnv('CLAUDE_CODE_SESSION_ID', 'coordinator');
     for (const [content, pattern] of [
-      ['/compact', /prompt-box command/],
-      [' \n', /prompt-box command/],
+      [' \n', /nonempty prompt/],
       ['x'.repeat(48 * 1024 + 1), /exceeds 48 KiB/],
       ['"'.repeat(40_000), /channel limit/],
     ] as const) {
@@ -620,6 +619,10 @@ test('send refuses invalid flags, identities and prompt content before the host 
       await assert.rejects(runManagement('send', args), pattern);
       assert.equal(fixture.requests.length, 0);
     }
+    // The window decides a slash command, because only it can read the target's list.
+    writeFileSync(fixture.prompt, '/ship plan.md\n');
+    await runManagement('send', args);
+    assert.equal((fixture.requests.at(-1) as { params: { prompt: string } }).params.prompt, '/ship plan.md\n');
   } finally {
     await fixture.close();
   }

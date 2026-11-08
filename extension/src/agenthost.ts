@@ -273,6 +273,8 @@ export interface SessionState {
   busy: boolean;
   asks: Ask[];
   commands: PromptEntry[];
+  // Claude's `init` skill list. Empty until the child's first `init` message.
+  skills: string[];
   lastError: string | null;
   ready: boolean;
   exited: boolean;
@@ -1202,6 +1204,7 @@ export class AgentSession {
   private readonly child: ChildLike;
   private readonly asks = new Map<string, Ask>();
   private commands: PromptEntry[] = [];
+  private skills: string[] = [];
   private commandVersion = 0;
   private busy = false;
   // Answers the driver is still sending to an ask that outlived its turn. The session counts
@@ -1356,6 +1359,7 @@ export class AgentSession {
       busy: this.busy || this.delivering.size > 0,
       asks: [...this.asks.values()],
       commands: this.commands,
+      skills: this.skills,
       lastError: this.lastError,
       ready: this.ready,
       exited: this.exited,
@@ -2261,6 +2265,9 @@ export class AgentSession {
     if (event.kind === 'ready' || event.kind === 'commands') {
       this.commands = event.commands;
       this.commandVersion += 1;
+    }
+    if (event.kind === 'skills') {
+      this.skills = event.skills;
     }
     if (event.kind === 'ask') {
       this.asks.set(event.ask.id, event.ask);

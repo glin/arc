@@ -6045,6 +6045,24 @@ export function launchPromptMatches(saved: string, prompt: string): boolean {
   return tidyPrompt(rebuilt) === tidyPrompt(prompt);
 }
 
+// Whether a replayed user message is this sent prompt. A slash prompt also matches the replay its command was
+// rewritten to. The replay's command name must equal the sent first word. Its arguments must equal the rest of the
+// sent prompt after trimming, with internal whitespace and tags as sent. Arguments end at the last closing tag, so an
+// argument may itself look like one. A replay with no arguments matches only a prompt with nothing after its command.
+export function replayedPromptMatches(replay: string, prompt: string): boolean {
+  if (replay === prompt) return true;
+  if (!isSlashPrompt(prompt)) return false;
+  const [invocation] = replay.matchAll(COMMAND_NAME);
+  const sent = prompt.trim();
+  const word = sent.split(/\s/, 1)[0];
+  if (invocation?.[1] !== word) return false;
+  const open = '<command-args>';
+  const start = replay.indexOf(open, invocation.index + invocation[0].length);
+  const end = replay.lastIndexOf('</command-args>');
+  const args = start < 0 || end < start ? '' : replay.slice(start + open.length, end);
+  return args.trim() === sent.slice(word.length).trim();
+}
+
 // Reader-queued prompt with prompt mode and no peer origin. Missing origin remains eligible.
 export function isReaderQueued(attachment: Record<string, unknown> | null | undefined): boolean {
   if (!attachment || attachment.type !== 'queued_command') {
