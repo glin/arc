@@ -7,6 +7,7 @@ import {
   enumerateSessionFilesFor,
   revisionOf,
   scanSessionCwd,
+  type ListingTimer,
 } from './transcript';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { EXPORT_LIMITS, ExportLimitError } from './exportlimits.ts';
@@ -18091,8 +18092,14 @@ function childCensusFixture(prefix: string) {
     }) as typeof fs.openSync);
     syncBuiltinESMExports();
     try {
-      const result = enumerateClaudeChildSources([parent], undefined, () => (counted += 1), last);
-      return { ...result, opened, counted: () => counted };
+      const timed: string[] = [];
+      const time: ListingTimer = (part, run) => {
+        timed.push(part);
+        return run();
+      };
+      const result = enumerateClaudeChildSources([parent], time, () => (counted += 1), last);
+      const timedReads = () => timed.filter((part) => part === 'openings:children').length;
+      return { ...result, opened, counted: () => counted, timedReads };
     } finally {
       spy.mockRestore();
       syncBuiltinESMExports();
@@ -18108,9 +18115,11 @@ test('a child census over unchanged children keeps every last row and opens no c
   const first = census();
   assert.deepEqual([...first.opened].sort(), [fileOf('Child-One'), fileOf('Child-Two')].sort());
   assert.equal(first.counted(), 2);
+  assert.equal(first.timedReads(), 2, 'a read of a child was not timed under its reader');
   const second = census(first.sessions);
   assert.deepEqual(second.opened, [], 'an unchanged child read its transcript again');
   assert.equal(second.counted(), 0, 'an unchanged child counted a read');
+  assert.equal(second.timedReads(), 0, 'a kept row was timed as a read');
   assert.equal(second.status, 'complete');
   assert.deepEqual(second.sessions, first.sessions, 'a kept row differs from the row a read returns');
 });
