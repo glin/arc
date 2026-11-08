@@ -96,25 +96,38 @@ function encodable(message: RowLists): boolean {
   );
 }
 
-// Count the fields of each carried row that differ from the held row with the same id.
-function railRowChanges(changed: readonly Row[], held: ReadonlyMap<string, Row>): Record<string, number> {
+// Whether two JSON values are equal. An object field whose value is undefined equals a missing field, as in JSON text.
+function sameValue(left: unknown, right: unknown): boolean {
+  if (left === right) return true;
+  if (typeof left !== 'object' || typeof right !== 'object' || left === null || right === null) return false;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false;
+    return left.every((item, index) => sameValue(item, right[index]));
+  }
+  const before = left as Record<string, unknown>;
+  const after = right as Record<string, unknown>;
+  for (const key in after) if (!sameValue(before[key], after[key])) return false;
+  for (const key in before) if (!(key in after) && before[key] !== undefined) return false;
+  return true;
+}
+
+// Count the fields of each carried row that differ from the held row with the same id. `held` is the `rail` list of the
+// last message.
+function railRowChanges(changed: readonly Row[], held: readonly Row[]): Record<string, number> {
   const fields: Record<string, number> = {};
   const count = (field: string) => {
     fields[field] = (fields[field] ?? 0) + 1;
   };
-  for (const row of changed) {
-    const before = held.get(row.id) as Record<string, unknown> | undefined;
-    if (!before) {
-      count('added');
-      continue;
-    }
-    const after = row as unknown as Record<string, unknown>;
-    for (const field of new Set([...Object.keys(before), ...Object.keys(after)])) {
-      const was = before[field];
-      const is = after[field];
-      if (was !== is && JSON.stringify(was) !== JSON.stringify(is)) count(field);
-    }
+  const carried = new Map(changed.map((row) => [row.id, row as unknown as Record<string, unknown>]));
+  for (const row of held) {
+    const after = carried.get(row.id);
+    if (!after) continue;
+    carried.delete(row.id);
+    const before = row as unknown as Record<string, unknown>;
+    for (const field in after) if (!sameValue(before[field], after[field])) count(field);
+    for (const field in before) if (!(field in after) && before[field] !== undefined) count(field);
   }
+  if (carried.size) fields.added = carried.size;
   return fields;
 }
 
@@ -157,8 +170,8 @@ export class RowDeltaSender {
   private revision: number | null = null;
   private sessions: (SentList & { revision: number }) | null = null;
   private rail: SentList | null = null;
-  // The `rail` rows of the last message, by id, to name the fields that the next message changes.
-  private railRows: Map<string, Row> | null = null;
+  // The `rail` list of the last message, to name the fields that the next message changes.
+  private railRows: readonly Row[] | null = null;
   private stats: Map<string, string> | null = null;
   // Prints of the inputs every row depends on, by name. A change sends a snapshot.
   private readonly globals = new Map<string, string>();
@@ -234,7 +247,7 @@ export class RowDeltaSender {
     if (rail.order) header.railOrder = rail.order;
     this.rail = rail.next;
     const railFields = whole || !this.railRows ? {} : railRowChanges(rail.changed, this.railRows);
-    this.railRows = new Map(message.rail.map((row) => [row.id, row]));
+    this.railRows = message.rail;
     const prints = new Map<string, string>();
     const stats: Record<string, unknown> = {};
     for (const [id, value] of Object.entries(message.stats)) {
