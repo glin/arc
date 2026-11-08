@@ -10388,6 +10388,16 @@ export class PanelProvider implements vscode.Disposable {
       const light = isLightColourTheme();
       if (!selectedOnly) {
         this.performanceCounters.recordRefreshStage('rendered');
+        // A render post counts its caller, the refresh reason, and each session list input that differs from the last render
+        // or session list post, in the style of `railPost:`.
+        if (this.hosts.length) {
+          this.performanceCounters.recordWork(`renderPost:${refreshReason}`);
+          const changes = this.lastRailKey ? railInputChanges(this.lastRailKey, railKey) : ['first'];
+          if (this.lastRailKey && JSON.stringify(railAdoptions) !== this.lastRailAdoptionsJson)
+            changes.push('sessionAdoptions');
+          for (const change of changes)
+            this.performanceCounters.recordWork(`renderPostInput:${refreshReason}:${change}`);
+        }
       }
       let largestRenderBytes: number | null = null;
       // The session list decides when the source count ends and when the loading line starts its hold, once for every panel.

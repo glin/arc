@@ -12811,6 +12811,52 @@ test('a session list post counts its caller and each input that differs from the
   assert.deepEqual(posts(), [], 'a skipped post counted as a post');
 });
 
+// A render post had no caller counter, so a capture could not name the refresh that sent a large render delta.
+test('a render post counts its caller and each session list input that differs from the last post', async () => {
+  vi.useFakeTimers();
+  try {
+    const { provider, counters, requests } = partialSpendHarness(true);
+    const posts = (since: Record<string, number>) =>
+      Object.entries(counters.snapshot().work)
+        .filter(([name, count]) => name.startsWith('renderPost') && count !== (since[name] ?? 0))
+        .map(([name, count]) => [name, count - (since[name] ?? 0)]);
+    // Each step runs the timers due and the work they release. The step bound is the test's deadline.
+    const settle = async () => {
+      for (let step = 0; step < 500 && (step === 0 || provider.refreshController !== null); step++)
+        await vi.advanceTimersByTimeAsync(1);
+      assert.equal(provider.refreshController, null, `the refresh never ended after requests ${requests.join(', ')}`);
+    };
+    provider.refreshFrom('startup', true);
+    for (let step = 0; step < 500 && (provider.dispatchSpendPending || requests.length < 4); step++)
+      await vi.advanceTimersByTimeAsync(1);
+    await settle();
+    assert.deepEqual(
+      posts({}).filter(([name]) => String(name).includes(':startup')),
+      [
+        ['renderPost:startup', 1],
+        ['renderPostInput:startup:first', 1],
+      ],
+    );
+    const before = { ...counters.snapshot().work };
+    provider.pinnedTop = [provider.catalog.sessions[0].sessionId];
+    provider.refreshFrom('pin', true, true);
+    await settle();
+    // A pin moves the pinned row, so the session rows differ too.
+    assert.deepEqual(
+      posts(before).sort(),
+      [
+        ['renderPost:pin', 1],
+        ['renderPostInput:pin:pinnedTop', 1],
+        ['renderPostInput:pin:sessions', 1],
+      ],
+      'the counter named an input that did not change, or missed one that did',
+    );
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
+
 test('a rail update serializes once for each actual ready-host post', () => {
   const provider = railPostHarness(['post', 'sendToHost']);
   const order: string[] = [];
