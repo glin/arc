@@ -400,8 +400,15 @@ export interface CarriedName {
   fullLabel: string;
 }
 
-// Versions the prompt rules of saved prompt scans. Bump it when a change to `scanPromptLines` or `promptScanLists` in
-// transcript.ts can change what a complete scan finds. A saved scan of another version is not loaded.
+// Versions the prompt rules of saved prompt scans. A saved scan of another version is not loaded. Bump it when a change
+// in transcript.ts can change what a complete scan finds. These functions decide that answer, with the patterns and
+// constants they read: `humanPromptScanSteps`, `completeLineSteps`, `scanPromptLines`, `promptScanLists`,
+// `claudePromptScanLineMayMatter`, `claudeSessionLineMayAffectRead`, `skipsOrdinaryToolResult`, `claudeRequestMarked`,
+// `isTypedPrompt`, `cleanPrompt`, `extractPrompt`, `localCommandOutputOnly`, `textOf`, `stamp`, `promptPair`,
+// `claudeRecordId`, `claudeCompactPrompt`, `advancePromptPair`, `readerQueuedAsk`, `isReaderQueued`, `claudeLocalAnswer`,
+// `claudeCompactAnswer`, `claudeModelWorks`, `claudeModelAnswered`, `failedATurn`, `interruptedATurn` and
+// `claudeProcessEndedAt`. The derived cache tests hash their source and fail when the hash moves without a bump.
+// Prompt rules hash at version 1: 08789871281954b0.
 export const PROMPT_SCAN_RULES_VERSION = 1;
 // The derived cache keeps the saved prompt scans of the most recently modified files up to this count.
 export const MAX_SAVED_PROMPT_SCANS = 10_000;

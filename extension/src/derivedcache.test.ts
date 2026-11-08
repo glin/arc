@@ -1,7 +1,9 @@
 import { discoveryCompatibility } from './progressiveworker';
 import { test, vi } from 'vitest';
 import assert from 'node:assert';
+import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
+import * as ts from 'typescript';
 import { tempDir } from './temproot.ts';
 import * as path from 'node:path';
 import {
@@ -427,6 +429,60 @@ test('the derived cache saves the found prompt scan of a transcript whose typed 
     { bytes: scan.bytes, found: true, complete: true, source },
     'the found scan of an answered prompt was not saved',
   );
+});
+
+// A saved scan keeps its answer until its file changes, so a change to any declaration that decides the answer must bump
+// the rules version. The hash covers every top-level declaration of transcript.ts that the scan reaches, without comments.
+test('the prompt scan rules version moves with the source of the prompt rules', () => {
+  const source = fs.readFileSync(path.join(__dirname, 'transcript.ts'), 'utf8');
+  const file = ts.createSourceFile('transcript.ts', source, ts.ScriptTarget.ES2022, true);
+  const declarations = new Map<string, ts.Statement[]>();
+  for (const statement of file.statements) {
+    if (ts.isFunctionDeclaration(statement) && statement.name)
+      declarations.set(statement.name.text, [...(declarations.get(statement.name.text) ?? []), statement]);
+    else if (ts.isVariableStatement(statement))
+      for (const declaration of statement.declarationList.declarations)
+        if (ts.isIdentifier(declaration.name)) declarations.set(declaration.name.text, [statement]);
+  }
+  const reached = new Set<string>();
+  const queue = ['humanPromptScanSteps', 'scanPromptLines', 'promptScanLists'];
+  while (queue.length) {
+    const name = queue.shift()!;
+    if (reached.has(name) || !declarations.has(name)) continue;
+    reached.add(name);
+    const visit = (node: ts.Node): void => {
+      if (ts.isIdentifier(node) && declarations.has(node.text)) queue.push(node.text);
+      ts.forEachChild(node, visit);
+    };
+    for (const statement of declarations.get(name)!) ts.forEachChild(statement, visit);
+  }
+  const printer = ts.createPrinter({ removeComments: true });
+  const hash = crypto
+    .createHash('sha256')
+    .update(
+      [...reached]
+        .sort()
+        .flatMap((name) =>
+          declarations.get(name)!.map((node) => printer.printNode(ts.EmitHint.Unspecified, node, file)),
+        )
+        .join('\n'),
+    )
+    .digest('hex')
+    .slice(0, 16);
+  const cacheSource = fs.readFileSync(path.join(__dirname, 'derivedcache.ts'), 'utf8');
+  const recorded = /\/\/ Prompt rules hash at version (\d+): ([0-9a-f]{16})\./.exec(cacheSource);
+  assert.ok(recorded, 'derivedcache.ts records no prompt rules hash beside PROMPT_SCAN_RULES_VERSION');
+  assert.ok(
+    Number(recorded[1]) === PROMPT_SCAN_RULES_VERSION && recorded[2] === hash,
+    `The prompt rules in transcript.ts changed. Bump PROMPT_SCAN_RULES_VERSION in derivedcache.ts to ${
+      PROMPT_SCAN_RULES_VERSION + 1
+    } and record "// Prompt rules hash at version ${PROMPT_SCAN_RULES_VERSION + 1}: ${hash}." beside it.`,
+  );
+  const comment = cacheSource.slice(cacheSource.lastIndexOf('\n\n', recorded.index), recorded.index);
+  const unnamed = [...reached].filter(
+    (name) => declarations.get(name)!.some(ts.isFunctionDeclaration) && !comment.includes(`\`${name}\``),
+  );
+  assert.deepEqual(unnamed, [], 'the comment on PROMPT_SCAN_RULES_VERSION does not name every prompt rule function');
 });
 
 test('the derived cache keeps the saved prompt scans of the most recently modified files up to its limit', () => {
