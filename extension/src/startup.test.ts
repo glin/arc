@@ -7958,6 +7958,7 @@ function bumpedDerivedCache() {
     agent: 'codex' as const,
     size: 1000,
     mtimeMs: 10,
+    dev: 1,
     ino: 2,
   };
   const claude = {
@@ -7966,6 +7967,7 @@ function bumpedDerivedCache() {
     agent: 'claude' as const,
     size: 1000,
     mtimeMs: 10,
+    dev: 1,
     ino: 2,
   };
   const child = {
@@ -7975,6 +7977,7 @@ function bumpedDerivedCache() {
     childTranscript: true,
     size: 1000,
     mtimeMs: 10,
+    dev: 1,
     ino: 2,
   };
   const ahead = Array.from({ length: 100 }, (_unused, index) => ({
@@ -7983,6 +7986,7 @@ function bumpedDerivedCache() {
     agent: 'codex' as const,
     size: 1024 * 1024,
     mtimeMs: 10,
+    dev: 1,
     ino: 2,
   }));
   const stored = (label: string) => ({
