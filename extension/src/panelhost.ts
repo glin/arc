@@ -10285,7 +10285,7 @@ export class PanelProvider implements vscode.Disposable {
             !controller.signal.aborted &&
             generation === this.refreshGeneration
           ) {
-            this.refreshFrom('enrichment', enrichment.changed, enrichment.catalogCurrent);
+            this.refreshFrom('enrichment', enrichment.changed, true, enrichment.stale.length ? enrichment.stale : null);
           }
         }
         return;
@@ -10612,7 +10612,7 @@ export class PanelProvider implements vscode.Disposable {
           !controller.signal.aborted &&
           generation === this.refreshGeneration
         ) {
-          this.refreshFrom('enrichment', enrichment.changed, enrichment.catalogCurrent);
+          this.refreshFrom('enrichment', enrichment.changed, true, enrichment.stale.length ? enrichment.stale : null);
         }
       }
     } catch (error) {
@@ -13942,10 +13942,12 @@ export class PanelProvider implements vscode.Disposable {
     sessions: SessionFile[],
     generation: number,
     signal: AbortSignal,
-  ): Promise<{ changed: boolean; catalogCurrent: boolean; progress: boolean }> {
+  ): Promise<{ changed: boolean; stale: string[]; progress: boolean }> {
     let remaining = INITIAL_RAIL_READ_BYTES;
     let changed = false;
-    let catalogCurrent = true;
+    // The files whose read the host refused because they moved after the catalog listed them. The follow-up refresh names
+    // them, so the held catalog lists their current revisions without a walk or a discovery request.
+    const stale: string[] = [];
     let progress = false;
     for (const session of sessions) {
       if (signal.aborted) {
@@ -13980,7 +13982,7 @@ export class PanelProvider implements vscode.Disposable {
         // A read the worker refused before opening the source spent nothing, so its charge returns to the pass.
         if (result.value.kind === 'stale' && result.value.unread) remaining += bytes;
         if (!acceptsProgressiveResult(result, this.refreshGeneration, this.revisionOf(session))) {
-          catalogCurrent = false;
+          stale.push(session.file);
           const current = this.titles.get(session.file);
           const kept =
             current &&
@@ -14026,7 +14028,7 @@ export class PanelProvider implements vscode.Disposable {
           continue;
         }
         if (!acceptsProgressiveResult(result, this.refreshGeneration, this.revisionOf(session))) {
-          catalogCurrent = false;
+          stale.push(session.file);
           if (generation !== this.refreshGeneration) break;
           continue;
         }
@@ -14139,10 +14141,11 @@ export class PanelProvider implements vscode.Disposable {
       } else {
         this.metadataRecoverySession = null;
         this.metadataRecoveryQueue.push(active.sessionId);
-        if (result && result.generation === generation && result.value.kind === 'stale') catalogCurrent = false;
+        if (result && result.generation === generation && result.value.kind === 'stale' && !stale.includes(active.file))
+          stale.push(active.file);
       }
     }
-    return { changed, catalogCurrent, progress };
+    return { changed, stale, progress };
   }
 
   // Only a discovery or catalog refresh failure marks the generation failed. A caller that already holds the list's blocker passes it.

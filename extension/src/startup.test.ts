@@ -2965,7 +2965,7 @@ function completeDiscoveryHarness(
       useRailPayload(build) { railPayload = build; }
       progressiveCurrent() { return false; } projectSpendPayload() { return null; } postProjectSpend() {} usagePayload() { return null; }
       themedFor(cards) { return cards; } checkpointDerivedCache() {} prepareProgressive() { return Promise.resolve(false); }
-      prepareRailEnrichment() { return Promise.resolve({ changed: false, catalogCurrent: true }); }
+      prepareRailEnrichment() { return Promise.resolve({ changed: false, stale: [] }); }
       revisionOf(session) { return { size: session.size, mtimeMs: session.mtimeMs, dev: session.dev ?? 1, ino: session.ino ?? 2 }; }
       structuralKey() { return ''; } agentFactsCurrent() { return true; } dropOlderHistory() { this.dropped++; }
       progressiveInput(session) { return { session, folders: [], children: [], maxTurns: 40, tailBytes: 1024 }; }
@@ -11925,7 +11925,7 @@ test('rejected expanded metadata keeps accepted rail progress for one bounded re
   });
 
   const first = await provider.prepareRailEnrichment([session], 1, new AbortController().signal);
-  assert.deepEqual(first, { changed: true, catalogCurrent: true, progress: false });
+  assert.deepEqual(first, { changed: true, stale: [], progress: false });
   assert.deepEqual(provider.titles.get(session.file).starts, { starts: [10], whole: true });
   assert.equal(
     provider.titles.get(session.file).agentRunScan,
@@ -11935,7 +11935,7 @@ test('rejected expanded metadata keeps accepted rail progress for one bounded re
 
   provider.refreshGeneration = 2;
   const retry = await provider.prepareRailEnrichment([session], 2, new AbortController().signal);
-  assert.deepEqual(retry, { changed: true, catalogCurrent: true, progress: false });
+  assert.deepEqual(retry, { changed: true, stale: [], progress: false });
   assert.deepEqual(
     requests.map((request) => request.kind),
     ['starts', 'metadata', 'metadata'],
@@ -11945,7 +11945,7 @@ test('rejected expanded metadata keeps accepted rail progress for one bounded re
 
   provider.refreshGeneration = 3;
   const settled = await provider.prepareRailEnrichment([session], 3, new AbortController().signal);
-  assert.deepEqual(settled, { changed: false, catalogCurrent: true, progress: false });
+  assert.deepEqual(settled, { changed: false, stale: [], progress: false });
   assert.equal(requests.length, 3, 'settled metadata scheduled another enrichment pass');
 });
 
@@ -12072,8 +12072,8 @@ test("a growing first session cannot strand a later session's row facts", async 
   assert.deepEqual(provider.titles.get(growing.file), growingEntry, 'the rejected read changed the growing session');
   assert.deepEqual(
     result,
-    { changed: true, catalogCurrent: false, progress: false },
-    'the follow-up pass reuses the catalog that the growing session outran',
+    { changed: true, stale: [growing.file], progress: false },
+    'the follow-up pass does not name the file that the growing session outran',
   );
 });
 
@@ -14268,7 +14268,7 @@ test.each([false, true])(
         });
         provider.prepareRailEnrichment = async (_sessions: unknown, generation: number, signal: AbortSignal) => {
           if (failed) provider.failSessionLoading(generation, signal);
-          return { changed: false, catalogCurrent: true };
+          return { changed: false, stale: [] };
         };
         await provider.refresh(false, true);
         assert.equal(provider.discoveryCheckpoint, undefined, 'final acknowledgment retained the checkpoint');
@@ -14357,7 +14357,7 @@ function exhaustedLoadingHarness(extraMethods: string[] = [], scope: Record<stri
     pruneDerivedTitles: () => false,
     repositoryScope: { snapshot() {} },
     allowThemeFiles() {},
-    prepareRailEnrichment: async () => ({ changed: false, catalogCurrent: true }),
+    prepareRailEnrichment: async () => ({ changed: false, stale: [] }),
   });
   const discovery: {
     pending: boolean;
@@ -16205,6 +16205,60 @@ for (const [change, subject, outcome, miss] of [
       vi.useRealTimers();
     }
   });
+
+// An enrichment read refused because its file moved after the catalog listed it. Its follow-up refresh used to list the
+// catalog again and send a walked discovery request, which opens a new receipt scan after a completed pass. Naming the
+// moved file lets the held catalog list its current revision, which the next enrichment read needs.
+test('an enrichment refresh after a moved file names that file and sends no discovery request', async () => {
+  vi.useFakeTimers();
+  try {
+    const { provider, counters, requests } = partialSpendHarness(true);
+    // Each step runs the timers due and the work they release. The step bound is the test's deadline.
+    const settle = async () => {
+      for (let step = 0; step < 500 && (step === 0 || provider.refreshController !== null); step++)
+        await vi.advanceTimersByTimeAsync(1);
+      assert.equal(provider.refreshController, null, `the refresh never ended after requests ${requests.join(', ')}`);
+    };
+    provider.refreshFrom('startup', true);
+    for (let step = 0; step < 500 && (provider.dispatchSpendPending || requests.length < 4); step++)
+      await vi.advanceTimersByTimeAsync(1);
+    await settle();
+    assert.deepEqual(requests, ['discovery', 'spend', 'spend', 'spend']);
+    const file = provider.catalog.sessions[0].file;
+    let outrun = true;
+    provider.prepareRailEnrichment = async () => {
+      const stale = outrun ? [file] : [];
+      outrun = false;
+      return { changed: stale.length > 0, stale, progress: false };
+    };
+    const listings: { reason: string; reuse: boolean; paths: string[] | null }[] = [];
+    const listed = provider.allSessions;
+    provider.allSessions = (reuse: boolean) => {
+      listings.push({ reason: provider.refreshReason, reuse, paths: provider.targetedRefreshPaths });
+      return listed(reuse);
+    };
+    const before = { ...counters.snapshot().work };
+    provider.refreshFrom('dispatch-discovery', false, true);
+    await settle();
+    const work = counters.snapshot().work;
+    assert.deepEqual(
+      listings.filter((listing) => listing.reason === 'enrichment'),
+      [{ reason: 'enrichment', reuse: true, paths: [file] }],
+      'the enrichment refresh did not name the moved file to the held catalog',
+    );
+    assert.deepEqual(
+      {
+        requests: requests.slice(4),
+        walked: (work['discoveryRequest:walked'] ?? 0) - (before['discoveryRequest:walked'] ?? 0),
+      },
+      { requests: [], walked: 0 },
+      'the enrichment refresh sent a discovery request',
+    );
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
 
 // Repeated-record coverage of a listed file after discovery completes. Each coverage event used to send a walked discovery
 // request, and the first request after a completed pass opens a new receipt scan of the whole store. A spend-only request

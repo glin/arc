@@ -26269,7 +26269,7 @@ test('initial session listing keeps every metadata read within 64 MiB before the
   );
   sourceMatch(
     enrichment,
-    /if \(!acceptsProgressiveResult\(result,[\s\S]*catalogCurrent = false;[\s\S]*return \{ changed, catalogCurrent, progress \};/,
+    /if \(!acceptsProgressiveResult\(result,[\s\S]*stale\.push\(session\.file\);[\s\S]*return \{ changed, stale, progress \};/,
     'stale expanded metadata does not request a catalog refresh after retaining safe scan progress',
   );
   sourceMatch(
@@ -32585,10 +32585,13 @@ test('selection and accepted worker results avoid unnecessary catalog walks', ()
     'an accepted selected result does not defer metadata until after its first-card post',
   );
   assert.equal(
-    (refresh.match(/this\.refreshFrom\('enrichment', enrichment\.changed, enrichment\.catalogCurrent\);/g) ?? [])
-      .length,
+    (
+      refresh.match(
+        /this\.refreshFrom\('enrichment', enrichment\.changed, true, enrichment\.stale\.length \? enrichment\.stale : null\);/g,
+      ) ?? []
+    ).length,
     2,
-    'rail enrichment cannot reuse a current catalog or replace one invalidated by stale metadata',
+    'rail enrichment cannot reuse the held catalog or name the files that stale metadata outran',
   );
   // Older-history loading requests an immediate selected-only refresh.
   const olderAt = panelHostSource.indexOf('private async loadOlderHistory(sessionId: string): Promise<void> {');
