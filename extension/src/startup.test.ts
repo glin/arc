@@ -9283,6 +9283,8 @@ test('the refresh after a warm cold pass adds the rollouts it found and reads no
   assert.ok(counters.snapshot().work['humanPromptStat:unscanned'], 'the first listing checked no prompt');
 
   provider.performanceCounters = counters = new PanelPerformanceCounters();
+  // A rollout that the discovery reply never answered starts a later discovery refresh, which this test does not count.
+  provider.scheduleDiscoveryContinuation = () => {};
   release();
   await vi.waitFor(() => assert.deepEqual(files(), [claudeFile, seeded, unseeded].sort()));
   await vi.waitFor(() => assert.equal(provider.refreshController, null));
@@ -9379,6 +9381,25 @@ test('a rollout named while the cold pass runs joins the list with the walk of t
   await vi.waitFor(() =>
     assert.deepEqual(files(), [seeded, fresh].sort(), 'the named rollout waited for the next poll'),
   );
+});
+
+test.each([
+  ['finds a new rollout', true],
+  ['finds nothing new', false],
+] as const)('the loading line stays until a cold pass that %s has listed', async (_name, findsRollout) => {
+  const { provider, release, seed, writeRollout, files } = warmStartHarness();
+  const seeded = seed('seeded');
+  const expected = findsRollout ? [seeded, writeRollout('unseeded')].sort() : [seeded];
+  await provider.refresh(true);
+  const scope = JSON.stringify(provider.repositoryScopeRoots);
+  assert.equal(provider.completeCatalogScope, undefined, 'a reply over the saved openings completed the list');
+  assert.deepEqual(provider.sessionLoadingBlocker(provider.refreshGeneration), { reason: 'discovery pending' });
+  release();
+  await vi.waitFor(() => assert.ok(provider.finishedColdPass, 'the finished pass was not held'));
+  assert.equal(provider.completeCatalogScope, undefined);
+  provider.browserPainted(provider.hosts[0], provider.refreshGeneration, 'railReady', true);
+  await vi.waitFor(() => assert.deepEqual(files(), expected));
+  await vi.waitFor(() => assert.equal(provider.completeCatalogScope, scope, 'the list never completed'));
 });
 
 test('a complete walk before the paint keeps the rollouts it found when the finished pass is listed', async () => {

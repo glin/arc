@@ -1674,6 +1674,8 @@ export class PanelProvider implements vscode.Disposable {
   private railPaintArrived = false;
   // Whether a Claude opening could not be read by the last walk that listed the Claude sources.
   private claudeWalkOpeningUnavailable = false;
+  // True while the catalog's Codex rows came from the saved openings, which name only part of the rollout tree.
+  private codexListingSeeded = false;
   private sourceEnumerations?: { claude: SourceEnumeration; codex: SourceEnumeration };
   private membershipCoverage?: SessionCoverage;
   private physicalCoverage?: { claude: SessionCoverage; codex: SessionCoverage };
@@ -10470,7 +10472,11 @@ export class PanelProvider implements vscode.Disposable {
         this.authoritativeCatalog = all;
         this.scopeSessionDirectories?.clear();
         this.authoritativeCatalogScope = catalogScope;
-        const answered = this.discoveryComplete?.scope === catalogScope ? this.discoveryComplete.files : undefined;
+        // A reply over the saved openings cannot complete the list. It waits for the refresh that lists the walk of the pass.
+        const answered =
+          !this.codexListingSeeded && this.discoveryComplete?.scope === catalogScope
+            ? this.discoveryComplete.files
+            : undefined;
         if (answered && all.every((session) => answered.has(session.file))) {
           this.completeCatalogScope = catalogScope;
           const revisions = this.discoveryComplete?.revisions;
@@ -10493,7 +10499,7 @@ export class PanelProvider implements vscode.Disposable {
           if (this.dispatchedDiscoveryWaiting() !== discoveryWaiting)
             this.postDispatchedCostsIfMoved('refreshDiscovery');
         }
-        this.discoveryComplete = undefined;
+        if (!this.codexListingSeeded) this.discoveryComplete = undefined;
         this.publishSessionQueryContext();
       }
       for (const session of Object.keys(this.awaitingSessionRecords)) {
@@ -13392,6 +13398,7 @@ export class PanelProvider implements vscode.Disposable {
     }
     const childSources = (this.walkedChildSources ?? []).filter((source) => !source.cwd || inRoots(source.cwd));
     this.sourceEnumerations = { claude: claudeListing, codex: listing.enumeration };
+    this.codexListingSeeded = codexEnumeration !== undefined && codexEnumeration === this.codexColdPass?.listing;
     this.noteCompressedRollouts(listing.enumeration.compressed ?? [], listing.enumeration);
     // Only a cached file that the walk missed needs this, so a refresh with none builds no path sets.
     let physical: SessionCoverage | undefined;
