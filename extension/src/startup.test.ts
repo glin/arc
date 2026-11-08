@@ -9010,7 +9010,15 @@ function pollWalkHarness() {
       unknownPathExtension,
       POLL_INTERVAL_MILLISECONDS: 5_000,
     },
-    ['startPolling', 'pollCatalog', 'pollDirectories', 'runPendingWatch', 'unknownPathShapeOf', 'refreshFromChild'],
+    [
+      'startPolling',
+      'pollCatalog',
+      'pollDirectories',
+      'runPendingWatch',
+      'unknownPathShapeOf',
+      'refreshFromChild',
+      'repeatedCoverage',
+    ],
   );
   const { provider } = harness;
   const counters = new PanelPerformanceCounters();
@@ -9324,6 +9332,37 @@ test('a new transcript in a directory the stat list misses lists at the backstop
     }
     assert.equal(polls, 12, `the transcript did not list exactly at the 60 s backstop: ${JSON.stringify(walks())}`);
     assert.deepEqual(walks(), { 'walk:requested:startup': 1, 'walk:requested:poll:backstop': 1 });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+// Coverage of a file that no catalog lists, such as a transcript outside repository scope, misses the held catalog and walks.
+// Each walk restarts the backstop clock. Only a discovery request finds a new receipt or a grown descendant of an unmoved
+// root. When the walk sends none, coverage every 30 s holds off every discovery request with no limit.
+test('coverage that walks every 30 s leaves no backstop window without a discovery request', async () => {
+  const { provider, start, poll, settle, walks, discoveries } = pollWalkHarness();
+  const outside = path.join(tempDir('coverage-outside-'), 'outside.jsonl');
+  fs.writeFileSync(outside, '{"type":"user"}\n');
+  try {
+    await start();
+    provider.corpus ??= new Map();
+    let sent = discoveries();
+    let quiet = 0;
+    let longest = 0;
+    for (let polls = 0; polls < 36; polls++) {
+      if (polls % 6 === 0) {
+        provider.repeatedCoverage(outside, 'host');
+        await settle();
+      }
+      await poll();
+      if (discoveries() > sent) {
+        sent = discoveries();
+        quiet = 0;
+      } else longest = Math.max(longest, ++quiet);
+    }
+    assert.ok(longest < 12, `${longest} polls passed with no discovery request: ${JSON.stringify(walks())}`);
+    assert.equal(walks()['walk:namedFileChanged'], 6, 'a coverage refresh did not walk');
   } finally {
     vi.useRealTimers();
   }

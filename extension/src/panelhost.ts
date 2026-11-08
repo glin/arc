@@ -9817,9 +9817,9 @@ export class PanelProvider implements vscode.Disposable {
     const previousSelection = this.previousSelection;
     const refreshReason = this.refreshReason;
     const targetedRefreshPaths = this.targetedRefreshPaths;
-    // The requesters that a walked discovery request names. A refresh that asked to reuse the held catalog lists it again only
-    // after a held file went missing or changed identity.
-    const walkReasons = reuseCatalog ? ['replacedFiles'] : (this.refreshWalkReasons ?? [refreshReason]);
+    // The requesters that a walked discovery request names. A refresh that asked to reuse the held catalog names
+    // `replacedFiles` when a held file went missing or changed identity, and its own reason when the held catalog missed.
+    let walkReasons = reuseCatalog ? ['replacedFiles'] : (this.refreshWalkReasons ?? [refreshReason]);
     let controller: AbortController | null = null;
     let primed = false;
     let primedEnumeration: SourceEnumeration | undefined;
@@ -9897,6 +9897,12 @@ export class PanelProvider implements vscode.Disposable {
         const walked = await this.walkCatalog(controller.signal, generation);
         if (!walked) return;
         all = walked;
+        // Every walk restarts the poll's backstop clock. A refresh that the held catalog could not serve sends the discovery
+        // request of a walk, so the backstop never waits behind a walk that sent none.
+        if (reuseCatalog) {
+          reuseCatalog = false;
+          walkReasons = [refreshReason];
+        }
       }
       const humanPromptWork = { bytes: 0, sources: 0, reads: 0, unknown: new Set<string>() };
       if (
