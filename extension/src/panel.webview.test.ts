@@ -8311,6 +8311,13 @@ function selectCommitSession(provider: any, session: any, turns: any[]) {
   return drawn;
 }
 
+test('the cold opening pass records its walk and its opening reads in the startup record', () => {
+  assert.match(
+    panelHostSource,
+    /coldOpeningPass\(this\.codexMetas, codexSessionsRoot\(\), signal, \(stage\) => this\.startupHistory\?\.stage\(stage\)\)/,
+  );
+});
+
 // The selection posts first. The `selected-window` pass this counts adds the second post.
 test.each([
   ['stays current', false, 0],
