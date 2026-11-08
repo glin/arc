@@ -12838,45 +12838,46 @@ export class PanelProvider implements vscode.Disposable {
     const claudeListing = enumerateSessionFilesFor(
       projectsRoot(),
       roots,
-      (file, session) => time('openings', () => {
-        if (collides('claude', file)) {
-          const opening = readQualifiedSessionCwd(file);
-          if (
-            opening &&
-            sameSessionRevision(session, opening.revision) &&
-            sessionCoverageMember(session) === sessionCoverageMember({ ...session, ...opening.revision })
-          ) {
-            this.cwds.set(file, {
-              cwd: opening.value,
-              mtimeMs: opening.revision.mtimeMs,
-              size: opening.revision.size,
-              unavailable: false,
-            });
-            sourceObservations.push({
-              ...physicalContext,
-              source: { ...session, cwd: opening.value },
-              excluded: !inRoots(opening.value),
-            });
-            return opening.value;
+      (file, session) =>
+        time('openings', () => {
+          if (collides('claude', file)) {
+            const opening = readQualifiedSessionCwd(file);
+            if (
+              opening &&
+              sameSessionRevision(session, opening.revision) &&
+              sessionCoverageMember(session) === sessionCoverageMember({ ...session, ...opening.revision })
+            ) {
+              this.cwds.set(file, {
+                cwd: opening.value,
+                mtimeMs: opening.revision.mtimeMs,
+                size: opening.revision.size,
+                unavailable: false,
+              });
+              sourceObservations.push({
+                ...physicalContext,
+                source: { ...session, cwd: opening.value },
+                excluded: !inRoots(opening.value),
+              });
+              return opening.value;
+            }
+            claudeOpeningUnavailable = true;
           }
-          claudeOpeningUnavailable = true;
-        }
-        const hit = this.cwds.get(file);
-        if (hit?.cwd) {
-          return hit.cwd;
-        }
-        if (hit && sameSessionRevision(hit, session)) {
-          claudeOpeningUnavailable ||= hit.unavailable === true;
-          return hit.cwd;
-        }
-        let unavailable = false;
-        const cwd = scanSessionCwd(file, () => {
-          unavailable = true;
-          claudeOpeningUnavailable = true;
-        });
-        this.cwds.set(file, { cwd, mtimeMs: session.mtimeMs, size: session.size, unavailable });
-        return cwd;
-      }),
+          const hit = this.cwds.get(file);
+          if (hit?.cwd) {
+            return hit.cwd;
+          }
+          if (hit && sameSessionRevision(hit, session)) {
+            claudeOpeningUnavailable ||= hit.unavailable === true;
+            return hit.cwd;
+          }
+          let unavailable = false;
+          const cwd = scanSessionCwd(file, () => {
+            unavailable = true;
+            claudeOpeningUnavailable = true;
+          });
+          this.cwds.set(file, { cwd, mtimeMs: session.mtimeMs, size: session.size, unavailable });
+          return cwd;
+        }),
       workspaceFolders,
       time,
     );
@@ -12885,32 +12886,33 @@ export class PanelProvider implements vscode.Disposable {
     const listing = codexSessionFiles(
       codexSessionsRoot(),
       roots,
-      (file) => time('openings', () => {
-        if (isCompressedRollout(file)) return null;
-        if (collides('codex', file)) {
-          const opening = readQualifiedCodexOpening(file);
-          if (opening) {
-            const source: SessionFile = {
-              agent: 'codex',
-              file,
-              sessionId: opening.value.sessionId!,
-              cwd: opening.value.cwd!,
-              ...opening.revision,
-            };
-            this.codexMetas.install(file, opening.value);
-            this.codexStats.delete(file);
-            sourceObservations.push({
-              ...physicalContext,
-              source,
-              excluded: !inRoots(source.cwd!),
-              hidden: isHiddenThread(opening.value),
-            });
-            qualifiedCodexStats.set(file, { ...opening.revision, isFile: true });
-            return opening.value;
+      (file) =>
+        time('openings', () => {
+          if (isCompressedRollout(file)) return null;
+          if (collides('codex', file)) {
+            const opening = readQualifiedCodexOpening(file);
+            if (opening) {
+              const source: SessionFile = {
+                agent: 'codex',
+                file,
+                sessionId: opening.value.sessionId!,
+                cwd: opening.value.cwd!,
+                ...opening.revision,
+              };
+              this.codexMetas.install(file, opening.value);
+              this.codexStats.delete(file);
+              sourceObservations.push({
+                ...physicalContext,
+                source,
+                excluded: !inRoots(source.cwd!),
+                hidden: isHiddenThread(opening.value),
+              });
+              qualifiedCodexStats.set(file, { ...opening.revision, isFile: true });
+              return opening.value;
+            }
           }
-        }
-        return this.codexMetas.get(file);
-      }),
+          return this.codexMetas.get(file);
+        }),
       (file) =>
         time(
           'stats',
