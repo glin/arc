@@ -4160,7 +4160,7 @@ test('command-only admission removes pending rows through every catalog path and
       refreshBody.indexOf('let all = selectedOnly'),
       refreshBody.indexOf("this.performanceCounters.recordRefresh('catalog-enumeration'"),
     ) + '\nreturn all;',
-    'selectedOnly = true, reuseCatalog = true, controller = new AbortController(), generation = this.refreshGeneration, previousSelection = this.previousSelection ?? null, enumerationParts = { ms: { prompts: 0 } }, catalogStarted = 0',
+    'selectedOnly = true, reuseCatalog = true, controller = new AbortController(), generation = this.refreshGeneration, previousSelection = this.previousSelection ?? null, enumerationParts = { ms: { prompts: 0 }, time: (_part, run) => run() }, catalogStarted = 0',
   );
   const childrenBody = methodBody('private async prepareClaudeChildren(');
   const discovery = compile(
