@@ -9126,6 +9126,7 @@ function warmStartHarness(scope: Record<string, unknown> = {}, extraMethods: str
     'listFinishedColdPass',
     'browserPainted',
     'relistHeldCodex',
+    'armColdPassPaintLimit',
     ...extraMethods,
   ]);
   const { provider, root } = harness;
@@ -9288,6 +9289,104 @@ test('the refresh after a warm cold pass adds the rollouts it found and reads no
     [],
     'the refresh after the pass repeated Claude listing or prompt admission work',
   );
+});
+
+test('a cold pass that ends before the first paint keeps the stages of that paint', async () => {
+  const { provider, release, seed, writeRollout, stages, files } = warmStartHarness();
+  const host = provider.hosts[0];
+  const seeded = seed('seeded');
+  const unseeded = writeRollout('unseeded');
+  const refresh = provider.refresh(true);
+  release();
+  await refresh;
+  await vi.waitFor(() => assert.ok(provider.finishedColdPass, 'the finished pass was not held'));
+  const drawn = provider.refreshGeneration;
+  provider.browserPainted(host, drawn, 'railReady', true);
+  assert.ok(provider.refreshGeneration > drawn, 'the paint did not start the listing');
+  assert.ok(stages.includes('firstUsableRow'), 'the listing dropped the first paint');
+  provider.browserPainted(host, drawn, 'firstCard');
+  assert.ok(stages.includes('selectedText'), 'the listing dropped the first card of that draw');
+  await vi.waitFor(() => assert.deepEqual(files(), [seeded, unseeded].sort()));
+});
+
+test('a watcher refresh before the first paint leaves the finished pass for the paint', async () => {
+  const { provider, release, seed, writeRollout, files } = warmStartHarness();
+  const seeded = seed('seeded');
+  const unseeded = writeRollout('unseeded');
+  await provider.refresh(true);
+  release();
+  await vi.waitFor(() => assert.ok(provider.finishedColdPass, 'the finished pass was not held'));
+  await provider.refreshAs('watch', true, true, [seeded], false, false);
+  assert.ok(provider.finishedColdPass, 'the watcher refresh took the held walk');
+  assert.deepEqual(files(), [seeded], 'the watcher refresh listed the walk before the paint');
+  provider.browserPainted(provider.hosts[0], provider.refreshGeneration, 'railReady', true);
+  await vi.waitFor(() => assert.deepEqual(files(), [seeded, unseeded].sort()));
+});
+
+test('a host that turns visible before the paint limit lists the held walk at the limit', async () => {
+  vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+  try {
+    const { provider, release, seed, writeRollout, files } = warmStartHarness();
+    const reads = vi.fn<(signal: AbortSignal) => Promise<unknown>>(provider.codexColdReads);
+    provider.codexColdReads = reads;
+    const seeded = seed('seeded');
+    const unseeded = writeRollout('unseeded');
+    await provider.refresh(true);
+    await vi.advanceTimersByTimeAsync(3_000);
+    release();
+    await vi.waitFor(() => assert.ok(provider.finishedColdPass, 'the finished pass was not held'));
+    await vi.advanceTimersByTimeAsync(1_000);
+    await provider.refreshAs('visible', true, true, [seeded], false, false);
+    assert.ok(provider.finishedColdPass, 'the refresh of the visible host took the held walk');
+    assert.deepEqual(files(), [seeded]);
+    await vi.advanceTimersByTimeAsync(COLD_PASS_PAINT_LIMIT_MS - 4_000);
+    await vi.waitFor(() => assert.deepEqual(files(), [seeded, unseeded].sort()));
+    assert.equal(reads.mock.calls.length, 1, 'the walk was dropped and the pass ran again');
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('a complete walk before the paint keeps the rollouts it found when the finished pass is listed', async () => {
+  const { provider, release, seed, writeRollout, files, releaseAll } = warmStartHarness();
+  const seeded = seed('seeded');
+  await provider.refresh(true);
+  release();
+  await vi.waitFor(() => assert.ok(provider.finishedColdPass, 'the finished pass was not held'));
+  const later = writeRollout('later');
+  await releaseAll(provider.refresh(true));
+  assert.ok(provider.finishedColdPass, 'the full refresh took the held walk');
+  assert.deepEqual(files(), [seeded, later].sort());
+  provider.browserPainted(provider.hosts[0], provider.refreshGeneration, 'railReady', true);
+  await vi.waitFor(() => assert.equal(provider.finishedColdPass, null));
+  await vi.waitFor(() => assert.equal(provider.refreshController, null));
+  assert.deepEqual(files(), [seeded, later].sort(), 'the older walk replaced the newer one');
+});
+
+test('a host hidden past the paint limit drops the held walk and runs the pass again', async () => {
+  vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+  try {
+    const { provider, release, seed, writeRollout, files } = warmStartHarness();
+    const reads = vi.fn<(signal: AbortSignal) => Promise<unknown>>(provider.codexColdReads);
+    provider.codexColdReads = reads;
+    const seeded = seed('seeded');
+    const unseeded = writeRollout('unseeded');
+    await provider.refresh(true);
+    release();
+    await vi.waitFor(() => assert.ok(provider.finishedColdPass, 'the finished pass was not held'));
+    let visible = false;
+    provider.anyVisible = () => visible;
+    await vi.advanceTimersByTimeAsync(COLD_PASS_PAINT_LIMIT_MS + 1);
+    assert.equal(provider.finishedColdPass, null, 'the limit kept the walk for a hidden host');
+    assert.equal(provider.codexColdReads, reads, 'the limit did not hand the pass to the next refresh');
+    assert.deepEqual(files(), [seeded]);
+    visible = true;
+    await provider.refresh(true);
+    await vi.waitFor(() => assert.deepEqual(files(), [seeded, unseeded].sort()));
+    assert.equal(reads.mock.calls.length, 2, 'the pass did not run again for the visible host');
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 test('a selection held on a rollout without a saved opening survives the list before its opening is read', async () => {

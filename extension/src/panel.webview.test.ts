@@ -32952,7 +32952,7 @@ test('a ready host stages worker-backed session data without clearing accepted c
   assert.notEqual(paintedAt, -1, 'panelhost.ts no longer receives browser paint acknowledgements');
   sourceMatch(
     painted,
-    /if \(!this\.readyHosts\.has\(host\) \|\| generation !== this\.refreshGeneration\) \{ return; \}/,
+    /if \(!this\.readyHosts\.has\(host\)\) \{ return; \}[\s\S]*if \(generation === this\.refreshGeneration \|\| generation === this\.coldPassDrawGeneration\) \{/,
     'a stale or unready browser can record startup completion',
   );
   sourceMatch(

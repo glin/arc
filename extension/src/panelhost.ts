@@ -1654,8 +1654,16 @@ export class PanelProvider implements vscode.Disposable {
     root: string;
     startedAt: number;
     reads: (signal: AbortSignal) => Promise<ColdOpeningPass>;
+    // True once the first paint or the paint limit lets a refresh take this walk.
+    released?: boolean;
+    // The catalog walk count when the pass ended. A later complete walk lists more than this walk.
+    walkGeneration: number;
   } | null = null;
   private coldPassPaintWait: ReturnType<typeof setTimeout> | null = null;
+  private coldPassPaintLimitReached = false;
+  // The generation whose draw answered first while the cold pass was outstanding. The relist moves the generation before the
+  // rest of that draw answers, and those answers still time the first draw.
+  private coldPassDrawGeneration: number | null = null;
   // The rollouts whose openings the saved records supplied when this activation started.
   private savedCodexOpeningFiles: readonly string[] = [];
   private railPaintArrived = false;
@@ -4919,29 +4927,32 @@ export class PanelProvider implements vscode.Disposable {
     stage: 'railReady' | 'firstCard' | 'completeRender',
     usableRows = false,
   ): void {
-    if (stage === 'railReady' && this.readyHosts.has(host)) {
+    if (!this.readyHosts.has(host)) {
+      return;
+    }
+    if (stage === 'railReady') {
       this.startupHistory?.stage('railPaintArrived');
       this.railPaintArrived = true;
-      if (this.finishedColdPass) this.listFinishedColdPass();
     }
-    if (!this.readyHosts.has(host) || generation !== this.refreshGeneration) {
-      return;
-    }
-    if (stage === 'railReady' && usableRows) this.startupHistory?.stage('firstUsableRow');
-    if (stage === 'firstCard') this.startupHistory?.stage('selectedText');
-    this.performanceCounters.recordStartup(stage, performance.now());
-    if (stage !== 'railReady') {
-      return;
-    }
-    for (const [source, route] of this.clearRoutes ?? []) {
-      if (route.hosts.get(host) !== generation) {
-        continue;
-      }
-      route.hosts.delete(host);
-      if (!route.hosts.size) {
-        this.clearRoutes.delete(source);
+    if (generation === this.refreshGeneration || generation === this.coldPassDrawGeneration) {
+      if (stage === 'railReady' && usableRows) this.startupHistory?.stage('firstUsableRow');
+      if (stage === 'firstCard') this.startupHistory?.stage('selectedText');
+      this.performanceCounters.recordStartup(stage, performance.now());
+      if (stage === 'railReady') {
+        if (this.codexColdPass?.listing || this.finishedColdPass) this.coldPassDrawGeneration = generation;
+        for (const [source, route] of this.clearRoutes ?? []) {
+          if (route.hosts.get(host) !== generation) {
+            continue;
+          }
+          route.hosts.delete(host);
+          if (!route.hosts.size) {
+            this.clearRoutes.delete(source);
+          }
+        }
       }
     }
+    // The paint is recorded first, because the listing that this starts moves the refresh generation.
+    if (stage === 'railReady' && this.finishedColdPass) this.listFinishedColdPass();
   }
 
   // Start delivery to every host before awaiting completion to preserve message call order.
@@ -10134,12 +10145,13 @@ export class PanelProvider implements vscode.Disposable {
       }
       if (!selectedOnly && !primedEnumeration) {
         const finished = this.finishedColdPass;
-        if (finished) {
+        if (finished?.released) {
           // The finished walk replaces the saved openings. A refresh that reuses the held catalog lists only the Codex rollouts.
           this.finishedColdPass = null;
-          if (this.coldPassPaintWait) clearTimeout(this.coldPassPaintWait);
-          this.coldPassPaintWait = null;
-          if (finished.root === codexSessionsRoot()) {
+          const superseded =
+            (this.catalogWalk?.generation ?? 0) > finished.walkGeneration &&
+            this.sourceEnumerations?.codex.status === 'complete';
+          if (finished.root === codexSessionsRoot() && !superseded) {
             this.catalogWalkPendingAt = finished.startedAt;
             if (reuseCatalog) codexRelist = finished.enumeration;
             else {
@@ -10911,6 +10923,7 @@ export class PanelProvider implements vscode.Disposable {
           () => {},
         );
         if (!selectedOnly) this.startupHistory?.stage('firstRenderPosted');
+        if (!selectedOnly && (this.codexColdPass?.listing || this.finishedColdPass)) this.armColdPassPaintLimit();
         if (hostSession) {
           this.hostPreviousSessions?.set(host, hostSession);
         }
@@ -11128,7 +11141,13 @@ export class PanelProvider implements vscode.Disposable {
     const listed = pass?.enumeration != null && sameRoot && this.anyVisible();
     this.pendingRefresh = settleWalkFold(this.pendingRefresh, priming, listed);
     if (pass?.enumeration && listed) {
-      this.finishedColdPass = { enumeration: pass.enumeration, root, startedAt, reads: cold.reads };
+      this.finishedColdPass = {
+        enumeration: pass.enumeration,
+        root,
+        startedAt,
+        reads: cold.reads,
+        walkGeneration: this.catalogWalk?.generation ?? 0,
+      };
       this.listFinishedColdPass();
       return;
     }
@@ -11138,17 +11157,11 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   // The listing that follows the pass moves the refresh generation, and a paint of an older generation records nothing.
-  // So it waits for the first list to paint. A hidden page paints nothing, so the wait ends at a limit.
-  private listFinishedColdPass(limitReached = false): void {
+  // So the walk waits for the first list to paint, or for the limit that counts from the first render post.
+  // A host that reports visible at the limit lists the walk. With no host visible the walk is dropped and the pass runs again.
+  private listFinishedColdPass(): void {
     const finished = this.finishedColdPass;
-    if (!finished) return;
-    if (!this.railPaintArrived && !limitReached) {
-      this.coldPassPaintWait ??= setTimeout(() => {
-        this.coldPassPaintWait = null;
-        this.listFinishedColdPass(true);
-      }, COLD_PASS_PAINT_LIMIT_MS);
-      return;
-    }
+    if (!finished || (!this.railPaintArrived && !this.coldPassPaintLimitReached)) return;
     if (this.coldPassPaintWait) clearTimeout(this.coldPassPaintWait);
     this.coldPassPaintWait = null;
     if (!this.anyVisible()) {
@@ -11156,7 +11169,17 @@ export class PanelProvider implements vscode.Disposable {
       this.codexColdReads = finished.reads;
       return;
     }
+    finished.released = true;
     this.refreshFrom('cold-pass', false, true);
+  }
+
+  private armColdPassPaintLimit(): void {
+    if (this.coldPassPaintWait || this.coldPassPaintLimitReached) return;
+    this.coldPassPaintWait = setTimeout(() => {
+      this.coldPassPaintWait = null;
+      this.coldPassPaintLimitReached = true;
+      this.listFinishedColdPass();
+    }, COLD_PASS_PAINT_LIMIT_MS);
   }
 
   // Runs the merged request that waits behind the catalog refresh. A refresh still in flight here
@@ -11210,6 +11233,7 @@ export class PanelProvider implements vscode.Disposable {
       this.codexColdReads ??= finished.reads;
       if (this.coldPassPaintWait) clearTimeout(this.coldPassPaintWait);
       this.coldPassPaintWait = null;
+      this.coldPassPaintLimitReached = false;
     }
     this.pendingRefresh = null;
     this.refreshOverdue = false;
