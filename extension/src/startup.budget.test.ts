@@ -59,13 +59,13 @@ beforeAll(async () => {
   vi.stubEnv('ARC_CODEX_ROOT', path.join(root, 'sessions'));
   const [{ budgetWorkspace, BUDGET_CLOCK }, host, worker, commits, repository, transcript, scheduler] =
     await Promise.all([
-      import('./budgetworkspace'),
-      import('./panelhost'),
-      import('./progressiveworker'),
-      import('./commitrepositories'),
-      import('./gitcommits'),
-      import('./transcript'),
-      import('./scheduler'),
+      import('./budgetworkspace.ts'),
+      import('./panelhost.ts'),
+      import('./progressiveworker.ts'),
+      import('./commitrepositories.ts'),
+      import('./gitcommits.ts'),
+      import('./transcript.ts'),
+      import('./scheduler.ts'),
     ]);
   modules = {
     PanelProvider: host.PanelProvider,
