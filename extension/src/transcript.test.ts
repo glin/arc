@@ -18052,6 +18052,169 @@ test('physical child census retains unreferenced identity competitors across sou
   assert.ok(read().directories?.includes(path.dirname(files[0])));
 });
 
+// A child census over one parent. It counts the opens of child transcripts, the first filesystem call of each read.
+function childCensusFixture(prefix: string) {
+  const at = new Date('2026-10-21T12:00:00Z');
+  const root = tempDir(prefix);
+  const parent = {
+    agent: 'claude' as const,
+    sessionId: 'Parent-Mixed',
+    file: path.join(root, 'Parent-Mixed.jsonl'),
+    size: 1,
+    mtimeMs: 1,
+  };
+  const directory = path.join(root, parent.sessionId, 'subagents');
+  fs.mkdirSync(directory, { recursive: true });
+  const fileOf = (name: string) => path.join(directory, `agent-${name}.jsonl`);
+  const bytes = (cwd: string) => JSON.stringify({ cwd }) + String.fromCharCode(10);
+  const stamp = (name: string) => fs.utimesSync(fileOf(name), at, at);
+  const write = (name: string, cwd: string) => {
+    fs.writeFileSync(fileOf(name), bytes(cwd));
+    stamp(name);
+  };
+  const census = (last?: ReturnType<typeof enumerateClaudeChildSources>['sessions']) => {
+    const native = createRequire(__filename)('node:fs') as typeof fs;
+    const open = native.openSync;
+    const opened: string[] = [];
+    let counted = 0;
+    const spy = vi.spyOn(native, 'openSync').mockImplementation(((target: fs.PathLike, ...args: any[]) => {
+      if (String(target).endsWith('.jsonl')) opened.push(String(target));
+      return (open as any)(target, ...args);
+    }) as typeof fs.openSync);
+    syncBuiltinESMExports();
+    try {
+      const result = enumerateClaudeChildSources([parent], undefined, () => (counted += 1), last);
+      return { ...result, opened, counted: () => counted };
+    } finally {
+      spy.mockRestore();
+      syncBuiltinESMExports();
+    }
+  };
+  return { root, directory, fileOf, bytes, write, stamp, census };
+}
+
+test('a child census over unchanged children keeps every last row and opens no child transcript', () => {
+  const { write, fileOf, census } = childCensusFixture('child-census-unchanged-');
+  write('Child-One', 'C:/Repo/One');
+  write('Child-Two', 'C:/Repo/Two');
+  const first = census();
+  assert.deepEqual([...first.opened].sort(), [fileOf('Child-One'), fileOf('Child-Two')].sort());
+  assert.equal(first.counted(), 2);
+  const second = census(first.sessions);
+  assert.deepEqual(second.opened, [], 'an unchanged child read its transcript again');
+  assert.equal(second.counted(), 0, 'an unchanged child counted a read');
+  assert.equal(second.status, 'complete');
+  assert.deepEqual(second.sessions, first.sessions, 'a kept row differs from the row a read returns');
+});
+
+test('a child census reads a child whose size or modification time moved', () => {
+  const { write, stamp, fileOf, bytes, census } = childCensusFixture('child-census-revision-');
+  write('Child', 'C:/Repo/One');
+  let last = census().sessions;
+  // A transcript whose first lines change after creation moves its size, so the new working directory arrives.
+  fs.writeFileSync(fileOf('Child'), bytes('C:/Repo/Moved-Out'));
+  stamp('Child');
+  let result = census(last);
+  assert.equal(result.opened.length, 1, 'a size change kept the last row');
+  assert.equal(result.sessions[0].cwd, 'C:/Repo/Moved-Out');
+  last = result.sessions;
+  // A write that keeps the size moves the modification time.
+  fs.utimesSync(fileOf('Child'), new Date('2026-10-22T12:00:00Z'), new Date('2026-10-22T12:00:00Z'));
+  result = census(last);
+  assert.equal(result.opened.length, 1, 'a modification time change kept the last row');
+  last = result.sessions;
+  fs.appendFileSync(fileOf('Child'), '{}' + String.fromCharCode(10));
+  result = census(last);
+  assert.equal(result.opened.length, 1, 'a grown file kept the last row');
+  assert.ok(result.sessions[0].size > last[0].size);
+});
+
+test('a child census reads a child replaced at its path with a new inode', () => {
+  const { write, stamp, fileOf, bytes, directory, census } = childCensusFixture('child-census-replaced-');
+  write('Child', 'C:/Repo/One');
+  const before = census();
+  const replacement = path.join(directory, 'replacement.tmp');
+  fs.writeFileSync(replacement, bytes('C:/Repo/Two'));
+  fs.renameSync(replacement, fileOf('Child'));
+  stamp('Child');
+  const after = census(before.sessions);
+  assert.notEqual(after.sessions[0].ino, before.sessions[0].ino, 'the replacement kept its inode');
+  assert.equal(after.sessions[0].size, before.sessions[0].size);
+  assert.equal(after.sessions[0].mtimeMs, before.sessions[0].mtimeMs);
+  assert.equal(after.opened.length, 1, 'a replaced file kept the last row');
+  assert.equal(after.sessions[0].cwd, 'C:/Repo/Two');
+});
+
+test('a child census reads a child whose last row holds no working directory', () => {
+  const { write, census } = childCensusFixture('child-census-no-cwd-');
+  write('Child', 'C:/Repo/One');
+  const first = census();
+  for (const row of [
+    { ...first.sessions[0], cwd: undefined },
+    { ...first.sessions[0], cwd: '' },
+  ]) {
+    const result = census([row]);
+    assert.equal(result.opened.length, 1, 'a row with no working directory skipped the read');
+    assert.equal(result.sessions[0].cwd, 'C:/Repo/One');
+  }
+});
+
+test('a child census reads a child whose file identity the filesystem does not support', () => {
+  const { write, fileOf, census } = childCensusFixture('child-census-identity-');
+  write('Child', 'C:/Repo/One');
+  const first = census();
+  const native = createRequire(__filename)('node:fs') as typeof fs;
+  const stat = native.statSync;
+  const spy = vi.spyOn(native, 'statSync').mockImplementation(((target: fs.PathLike, ...args: any[]) => {
+    const real = (stat as any)(target, ...args);
+    if (String(target) !== fileOf('Child')) return real;
+    return Object.assign(Object.create(Object.getPrototypeOf(real)), real, { ino: 0n });
+  }) as typeof fs.statSync);
+  syncBuiltinESMExports();
+  try {
+    const unsupported = revisionOf(native.statSync(fileOf('Child'), { bigint: true })).ino;
+    const result = census([{ ...first.sessions[0], ino: unsupported }]);
+    assert.equal(result.opened.length, 1, 'an unsupported identity kept the last row');
+  } finally {
+    spy.mockRestore();
+    syncBuiltinESMExports();
+  }
+});
+
+// The match is on the exact listed path, so the expectation is the same on Windows, macOS and Linux.
+test('a child census reads a child whose last row spells the path in another case', () => {
+  const { write, fileOf, census } = childCensusFixture('child-census-case-');
+  write('Child-Mixed', 'C:/Repo/One');
+  const first = census();
+  const respelled = fileOf('Child-Mixed').replace('Child-Mixed', 'child-mixed');
+  const result = census([{ ...first.sessions[0], file: respelled }]);
+  assert.equal(result.opened.length, 1, 'a row with another path spelling kept its working directory');
+});
+
+test('a child census keeps a recorded path through a renamed directory and an overwrite that restores the revision', () => {
+  const { root, write, stamp, fileOf, bytes, census } = childCensusFixture('child-census-limits-');
+  // A renamed working directory keeps the recorded path whether the census keeps the row or reads the transcript.
+  const workspace = path.join(root, 'Workspace');
+  fs.mkdirSync(workspace);
+  write('Renamed', workspace);
+  const before = census();
+  fs.renameSync(workspace, path.join(root, 'Workspace-Renamed'));
+  assert.equal(census(before.sessions).sessions[0].cwd, workspace);
+  assert.equal(census().sessions[0].cwd, workspace);
+  fs.unlinkSync(fileOf('Renamed'));
+
+  // An in-place overwrite that keeps the inode, size and modification time keeps the last row, the limit of `sameSessionRevision`.
+  write('Overwritten', 'C:/Repo/One');
+  const original = census();
+  fs.writeFileSync(fileOf('Overwritten'), bytes('C:/Repo/Two'));
+  stamp('Overwritten');
+  const kept = census(original.sessions);
+  assert.equal(kept.sessions[0].ino, original.sessions[0].ino, 'the overwrite moved the inode');
+  assert.deepEqual(kept.opened, []);
+  assert.equal(kept.sessions[0].cwd, 'C:/Repo/One');
+  assert.equal(census().sessions[0].cwd, 'C:/Repo/Two', 'a read of the overwritten file disagrees with the kept row');
+});
+
 // Claude subagent results cost about 2.79 UTF-8 bytes a token, frame included.
 const estimate = (text: string) => Math.ceil(Buffer.byteLength(text, 'utf8') / 2.79);
 // The system-reminder frame a request carries around a stored completion notice.

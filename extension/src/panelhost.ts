@@ -13138,8 +13138,11 @@ export class PanelProvider implements vscode.Disposable {
       undefined,
       codexEnumeration,
     );
-    const census = enumerateClaudeChildSources([...claude, ...this.claudeChildren], time, () =>
-      this.performanceCounters?.recordWork('openingsRead:children'),
+    const census = enumerateClaudeChildSources(
+      [...claude, ...this.claudeChildren],
+      time,
+      () => this.performanceCounters?.recordWork('openingsRead:children'),
+      this.walkedChildSources,
     );
     this.walkedChildSources = census.sessions;
     const childSources = census.sessions.filter((source) => !source.cwd || inRoots(source.cwd));

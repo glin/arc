@@ -4042,12 +4042,38 @@ export function enumerateSessionFiles(
   return { ...evidence, sessions: out.sort((a, b) => b.mtimeMs - a.mtimeMs) };
 }
 
+// The opening that the last census read for a child, while its path and file revision match exactly.
+// A transcript whose first lines change moves its size or modification time and misses this match.
+// A renamed working directory keeps the recorded path here, as a read of the transcript does.
+// An in-place overwrite that keeps the inode, size and modification time keeps the last row, the limit of `sameSessionRevision`.
+function lastCensusOpening(
+  last: SessionFile | undefined,
+  source: SessionFile,
+): { value: string; revision: FileRevision } | null {
+  if (
+    !last?.cwd ||
+    !supportedFileIdentity(source) ||
+    !supportedFileIdentity(last) ||
+    source.dev !== last.dev ||
+    source.ino !== last.ino ||
+    !sameSessionRevision(last, source)
+  )
+    return null;
+  return {
+    value: last.cwd,
+    revision: { size: source.size, mtimeMs: source.mtimeMs, dev: source.dev!, ino: source.ino! },
+  };
+}
+
 // Physical child identities reserve competition even without accepted relationship edges.
+// `lastRows` holds the rows of the last census, and an unchanged child keeps its row without a read.
 export function enumerateClaudeChildSources(
   parents: readonly SessionFile[],
   time: ListingTimer = untimed,
   countRead?: () => void,
+  lastRows: readonly SessionFile[] = [],
 ): SourceEnumeration & { sessions: SessionFile[] } {
+  const lastRowOf = new Map(lastRows.map((row) => [row.file, row]));
   const census: SourceEnumeration & { sessions: SessionFile[] } = {
     status: 'complete',
     files: [],
@@ -4085,8 +4111,9 @@ export function enumerateClaudeChildSources(
     }
     for (const source of listing.sessions) {
       if (!source.sessionId.startsWith('agent-')) continue;
-      countRead?.();
-      const opening = time('openings:children', () => readQualifiedSessionCwd(source.file));
+      const kept = lastCensusOpening(lastRowOf.get(source.file), source);
+      if (!kept) countRead?.();
+      const opening = kept ?? time('openings:children', () => readQualifiedSessionCwd(source.file));
       if (
         !opening ||
         source.dev !== opening.revision.dev ||

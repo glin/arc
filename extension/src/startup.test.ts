@@ -8271,6 +8271,7 @@ test('a catalog walk records each part of the enumeration time, and the parts su
     mtimeMs: 1,
   };
   const collidedCodexFile = 'rollout-collided.jsonl';
+  let censusLastRows: unknown;
   const { provider, claude, codex } = bumpedCatalogHarness({
     performance: { now: () => clock },
     enumerateRolloutFilesAsync: async () => {
@@ -8321,7 +8322,9 @@ test('a catalog walk records each part of the enumeration time, and the parts su
       _parents: SessionFile[],
       time: (part: string, run: () => unknown) => unknown,
       countRead: () => void,
+      lastRows: unknown,
     ) => {
+      censusLastRows = lastRows;
       time('listing', () => advance(1));
       countRead();
       // A call inside a timed call counts only in the outer part.
@@ -8415,6 +8418,12 @@ test('a catalog walk records each part of the enumeration time, and the parts su
   work.delete('openingsRead:codex');
   await provider.refresh(true);
   assert.equal(work.get('openingsRead:codex'), undefined, 'a held opening counted a read');
+
+  // The next walk hands the census the rows of the last census.
+  const lastCensusRows = [claude];
+  provider.walkedChildSources = lastCensusRows;
+  await provider.refresh(true);
+  assert.equal(censusLastRows, lastCensusRows, 'the walk did not pass the rows of the last census');
   assert.equal(
     parts.reduce((sum, part) => sum + refreshes.get(`catalog-enumeration:${part}`)![0], 0),
     refreshes.get('catalog-enumeration')![0],
