@@ -9870,6 +9870,7 @@ test('page-level subjects stay behind their typed owners', () => {
 // Vitest resolves vscode to the extension test stub.
 // Source checks cover host wiring and static boundaries.
 
+import { toCompactionCard } from './turncard';
 const panelHostSource = fs.readFileSync(path.join(__dirname, 'panelhost.ts'), 'utf8');
 
 test(
@@ -45654,6 +45655,91 @@ function draftFastProvider(
   const settled = () => vi.waitFor(() => assert.equal(provider.fastToggles.has(session), false));
   return { ...typed, reads, restored, settled };
 }
+
+test.each([
+  ['off to on', undefined, 'priority'],
+  ['on to off', 'priority', 'default'],
+] as const)(
+  'a draft Send saved during /fast %s launches and adopts the committed speed',
+  async (_name, start, after) => {
+    const { provider, session, reads, settled, restored } = draftFastProvider(undefined, start);
+    const adopted: Array<string | undefined> = [];
+    provider.adoptDraft = (
+      _draft: string,
+      _actual: string,
+      _submitted: unknown,
+      settings: { serviceTier?: string },
+    ) => {
+      adopted.push(settings.serviceTier);
+    };
+    const launched: Array<{ serviceTier?: string }> = [];
+    const went: string[] = [];
+    provider.onSendDraftPrompt = (draft: { serviceTier?: string }, going: { text: string }) => {
+      launched.push(draft);
+      went.push(going.text);
+      return Promise.resolve({ delivered: true, session: 'adopted-session' });
+    };
+    let saveDone = () => {};
+    const saving = new Promise<void>((resolve) => {
+      saveDone = resolve;
+    });
+    const retained: unknown[] = [];
+    const retain = provider.importPromptRecovery.bind(provider);
+    provider.importPromptRecovery = async (records: unknown[]) => {
+      retained.push(...records);
+      await saving;
+      return retain(records);
+    };
+    const host = { webview: {} };
+    provider.hosts = [host];
+    provider.sendPrompt('/fast', session, 1);
+    assert.equal(provider.fastToggles.has(session), true);
+    const attempt = { id: `race-${after}`, order: 1, source: session, revision: 2, text: 'launch this' };
+    const pending = provider.acceptSubmission('launch this', session, 2, session, host, attempt);
+    if (start === undefined) {
+      await vi.waitFor(() => assert.equal(reads.length, 1));
+      reads[0]({ status: 'absent' });
+    }
+    await settled();
+    assert.equal(provider.newDrafts[session].serviceTier, after);
+    saveDone();
+    await pending;
+    await vi.waitFor(() => assert.equal(adopted.length, 1));
+    assert.equal(launched[0].serviceTier, after, 'the launch used the speed captured before the save');
+    assert.deepEqual(adopted, [after], 'adoption restored the speed from before /fast');
+    assert.deepEqual(went, ['launch this']);
+    assert.deepEqual(retained[0], attempt, 'the prompt left durable recovery before its launch');
+    assert.deepEqual(restored(), [], 'the prompt returned to the prompt box');
+  },
+);
+
+test('a model name change redraws compaction cost names with the held catalog', () => {
+  const { provider } = queueRecoveryProvider();
+  const record = compaction({ model: 'gpt-5.6-sol', at: 1, summary: 'kept' });
+  const card = toCompactionCard(record, 2);
+  const posted: Array<{ cards: unknown[] }> = [];
+  Object.assign(provider, {
+    cards: [{ ...card, summaryHtml: '', sessionTitle: 'Session', at: 1 }],
+    compactionsByCard: new Map([[card.key, record]]),
+    hosts: [{ webview: {} }],
+    models: {},
+    modelLabelLists: [],
+    modelLabels: new Map(),
+    postRail() {},
+    refreshFrom() {},
+    themedFor: (cards: unknown[]) => cards,
+    sendToHost: (_host: unknown, message: { cards: unknown[] }) => posted.push(message),
+  });
+  provider.setModels(
+    { codex: [{ value: 'gpt-5.6-sol', label: 'GPT-5.6-Sol Listed', description: '', efforts: [] }] },
+    [],
+    [],
+  );
+  assert.equal(posted.length, 1, 'the name change did not redraw the compaction card');
+  assert.match(JSON.stringify(posted[0].cards[0]), /GPT-5\.6-Sol Listed/);
+  assert.match(panelHostSource, /toCompactionCard\(c, now, this\.modelLabels\)/);
+  assert.equal(panelHostSource.match(/toCompactionCard\(/g)?.length, 1);
+});
 
 test('a draft runs one /fast at a time, so two presses read one starting speed', async () => {
   const { provider, session, reads, restored, settled, sent } = draftFastProvider();

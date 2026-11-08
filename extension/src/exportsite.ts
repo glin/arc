@@ -705,9 +705,10 @@ function compactionCard(
   session: string,
   firstRequestCachedTokens: number | null,
   capturedAt: number,
+  labels: ModelLabels,
 ): CardView {
   const compaction = exportCompaction(value, session, firstRequestCachedTokens);
-  const card = exportCard(toCompactionCard(compaction, capturedAt));
+  const card = exportCard(toCompactionCard(compaction, capturedAt, labels));
   card.key = value.key;
   return card;
 }
@@ -862,7 +863,7 @@ export async function projectSessionSite(
         const card =
           'turn' in entry
             ? turnCard(entry.turn, session.agent, session.key, model.capturedAt, restored!, dispatched, labels)
-            : compactionCard(entry.compaction, session.key, session.firstRequestCachedTokens, model.capturedAt);
+            : compactionCard(entry.compaction, session.key, session.firstRequestCachedTokens, model.capturedAt, labels);
         newestAt = Math.max(newestAt, card.endedAt ?? card.startedAt);
         card.sessionTitle = title;
         if ('compaction' in entry)

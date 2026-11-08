@@ -11,7 +11,13 @@ import {
   type SourceEnumeration,
 } from './sessioncoverage';
 import { compressedRolloutsReadable, isCompressedRollout } from './compressedrollouts';
-import { canonicalServiceTier, serviceTierRefusal, cacheLifetimeRefusal, launchPolicy } from './launchpolicy';
+import {
+  canonicalServiceTier,
+  serviceTierRefusal,
+  cacheLifetimeRefusal,
+  launchPolicy,
+  type ServiceTier,
+} from './launchpolicy';
 import { scopedLaunchCwd, startingWorktree } from './repositoryscope';
 import { SessionFilterRequests, FILTER_LIMITS, type FilterOperation } from './sessionfilter';
 import {
@@ -792,6 +798,14 @@ const RECORDED_REPLY_RETRY_MS = 1_000;
 // Each source adapter owns the cursor for its next older page. The provider passes
 // it back to that adapter and drops it when the source revision changes.
 type HistoryCursor = ClaudeHistoryCursor | CodexHistoryCursor;
+
+// A copy of `value` with the session's current speed selection. No selection leaves the field absent.
+function carryServiceTier<T extends { serviceTier?: ServiceTier }>(value: T, tier: ServiceTier | undefined): T {
+  const copy = { ...value };
+  if (tier === undefined) delete copy.serviceTier;
+  else copy.serviceTier = tier;
+  return copy;
+}
 
 // Turns and compactions share the timeline. Both render their summary as Markdown.
 type RenderCard = (TurnCard | CompactionCard) & { summaryHtml: string };
@@ -1762,6 +1776,8 @@ export class PanelProvider implements vscode.Disposable {
   private models: Record<string, ModelChoice[]> = {};
   // Display names from every model list, built once per change of the lists. A card draw only looks them up.
   private modelLabels: ModelLabels = new Map();
+  // The record behind each drawn compaction card, so a model name change redraws its cost names without a read.
+  private compactionsByCard = new Map<string, Compaction>();
   // The lists `modelLabels` holds the names of. The same list objects keep the names without a read.
   private modelLabelLists: readonly (readonly ListedModel[])[] = [];
   private pendingModels: readonly string[] = [];
@@ -1867,15 +1883,15 @@ export class PanelProvider implements vscode.Disposable {
     | ((owner: string, agent: string, control: string, draft: NewSessionDraft | null, cwd: string | null) => void)
     | null = null;
   public onDraftRemoved: ((draft: NewSessionDraft) => void) | null = null;
-  // Toggles Remote Control on the session's running Claude process. `observer` receives later results.
-  // Every result comes with the session id the process holds when it arrives, which a Claude `/clear`
-  // changes, or null when that process has exited or retired.
   // Runs a typed Codex /fast for a session outside a draft. The extension owns the settings book and the running child.
   public onFastToggle:
     | ((session: string, cwd: string | null, recordedModel: () => string) => Promise<FastToggleResult>)
     | undefined;
   // Reads a Codex speed setting without a session or turn.
   public onReadFastEvidence: ((cwd: string | null, model: string) => Promise<ServiceTierEvidence | null>) | undefined;
+  // Toggles Remote Control on the session's running Claude process. `observer` receives later results.
+  // Every result comes with the session id the process holds when it arrives, which a Claude `/clear`
+  // changes, or null when that process has exited or retired.
   public onRemoteControl:
     | ((
         session: string,
@@ -5324,6 +5340,7 @@ export class PanelProvider implements vscode.Disposable {
   private redrawModelNames(): void {
     this.postRail(true, 'redrawModelNames', undefined, false);
     if (!this.cards?.length) return;
+    this.redrawCompactionNames();
     const turns = new Map<string, Turn>();
     for (const card of this.cards) {
       if (card.kind !== 'turn') continue;
@@ -5341,6 +5358,34 @@ export class PanelProvider implements vscode.Disposable {
       now,
     );
     this.postRedrawnCards(turns, () => (held ??= this.dispatchedTurnCosts()), expiryFacts, childCosts, now);
+  }
+
+  private redrawCompactionNames(): void {
+    const now = Date.now();
+    const changed: RenderCard[] = [];
+    this.cards.forEach((previous, index) => {
+      const compaction = previous.kind === 'compaction' ? this.compactionsByCard?.get(previous.key) : undefined;
+      if (!compaction) return;
+      const card = { ...previous, ...this.renderCompactionCard(compaction, previous.sessionTitle ?? '', now) };
+      this.cards[index] = card;
+      changed.push(card);
+    });
+    if (!changed.length) return;
+    const light = isLightColourTheme();
+    for (const host of this.hosts) {
+      void this.sendToHost(host, { type: 'activity', cards: this.themedFor(changed, host.webview, light) });
+    }
+  }
+
+  // Compaction cards carry the session title used by grouping.
+  private renderCompactionCard(
+    c: Compaction,
+    title: string,
+    now: number,
+  ): RenderCard & { at: number; preparesTurnId?: string } {
+    const card = toCompactionCard(c, now, this.modelLabels);
+    card.sessionTitle = title;
+    return { ...card, summaryHtml: renderRichMarkdown(c.summary), at: c.at, preparesTurnId: c.preparesTurnId };
   }
 
   // Update MCP server readings for each draft or session.
@@ -7979,8 +8024,10 @@ export class PanelProvider implements vscode.Disposable {
             restore(this.sendRefusalFor(session));
             return;
           }
+          // A /fast that finished while the prompt was saved decides the speed of this launch.
           const ready = {
             ...captured,
+            settings: carryServiceTier(captured.settings, current.settings.serviceTier),
             submittedRecoveryId: attempt.id,
             running: current.running,
             live: current.live,
@@ -7989,7 +8036,9 @@ export class PanelProvider implements vscode.Disposable {
             queueHandoffs: current.queueHandoffs,
             asks: current.asks,
           };
-          this.sendPrompt(text, session, revision, source, ready, assets, draft, attempt.id);
+          const held = draft && this.newDrafts[session];
+          const launchDraft = draft && held ? carryServiceTier(draft, held.serviceTier) : draft;
+          this.sendPrompt(text, session, revision, source, ready, assets, launchDraft, attempt.id);
           result = 'pending';
         } finally {
           this.promptOriginHost = previous;
@@ -16391,21 +16440,16 @@ export class PanelProvider implements vscode.Disposable {
     // Use filenames for workspace files and full paths for files outside the open folders.
     const folders = this.folders();
     const cards = this.drawTurnCards(listed, titleOf, now, folders);
+    this.compactionsByCard = new Map();
     // Omit compactions older than every displayed turn. Find the minimum timestamp because the budgeted list is not globally sorted.
     const oldest = listed.length ? listed.reduce((low, t) => Math.min(low, t.startedAt), Infinity) : 0;
     for (const c of compactions) {
       if (c.at < oldest) {
         continue;
       }
-      const card = toCompactionCard(c, now);
-      // Compaction cards also carry the session title used by grouping.
-      card.sessionTitle = titleOf(c.sessionId);
-      cards.push({
-        ...card,
-        summaryHtml: renderRichMarkdown(c.summary),
-        at: c.at,
-        preparesTurnId: c.preparesTurnId,
-      });
+      const card = this.renderCompactionCard(c, titleOf(c.sessionId), now);
+      this.compactionsByCard.set(card.key, c);
+      cards.push(card);
     }
     return groupBySession(orderTimelineEntries(cards));
   }

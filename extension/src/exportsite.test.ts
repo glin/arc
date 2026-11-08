@@ -24,6 +24,29 @@ import { createCodexSessionReducer } from './codex';
 import { readCodexSession } from './codex';
 import { codexLeadingCompactionRecords } from './turnfixtures';
 
+test('an exported compaction reads the held catalog name and keeps the recorded model', async () => {
+  const folder = tempDir('compaction-names-');
+  const writer = await ExportTransaction.create(folder);
+  try {
+    const model = await sessionSiteFixture(writer);
+    model.modelLabels = { 'gpt-5.6-sol': 'GPT-5.6-Sol Captured' };
+    const session = model.sessions[0];
+    const compact = projectCompaction(compaction({ model: 'gpt-5.6-sol', sessionId: session.key }), 'boundary');
+    assert.equal(compact.model, 'gpt-5.6-sol');
+    const prior = projectTurn(turn({ startedAt: 1, endedAt: 2 }), 'prior', {}, [], session.key, new Map());
+    session.pages = [await writer.spool({ key: 'page', session: session.key, turns: [prior], compactions: [compact] })];
+    await projectSessionSite(model, writer, { script: '', stylesheet: '' });
+    const { manifest, data } = exportedSiteData((await writer.publish(async () => {})).directory);
+    const page = manifest.sessions[0].pages[0];
+    const card = page
+      .cards!.map((entry) => (data.get(entry.id) as { card: CardView }).card)
+      .find((value) => value.key === 'boundary');
+    assert.match(JSON.stringify(card), /GPT-5\.6-Sol Captured/);
+  } finally {
+    await writer.dispose();
+  }
+});
+
 test('a leading compaction follows its prompt across semantic and rendered page boundaries', async () => {
   const folder = tempDir('leading-export-');
   const source = path.join(folder, 'rollout.jsonl');

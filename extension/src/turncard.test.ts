@@ -1611,7 +1611,7 @@ test('a Claude turn header reads the model name with and without a model list', 
 // A model list can spell a GPT model differently from the hyphenated fallback. Every name on the
 // card, its child rows and their popovers, and the session figures then reads the list's spelling,
 // including a main agent without usage parts, a child without usage parts and usage without a price.
-test('a listed GPT spelling reaches child cost records, main fallback, unpriced usage and session context', () => {
+test('a listed GPT spelling reaches child cost records, main fallback, unpriced usage and turn context', () => {
   const labels = modelLabels([[{ value: 'gpt-5.6-sol', label: 'GPT-5.6-Sol Listed' }]]);
   const usage = tokenUsage({ requests: 1, input: 1_000_000 });
   const part = {

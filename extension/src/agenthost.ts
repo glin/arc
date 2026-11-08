@@ -3385,7 +3385,11 @@ export function sessionFastToggle(steps: SessionFastToggleSteps) {
         },
         stage: async (tier) => {
           const live = child();
-          if (live) return await steps.host.withActivity(live.key, (active) => active.stageServiceTier(tier));
+          if (live) {
+            const adopt = await steps.host.withActivity(live.key, (active) => active.stageServiceTier(tier));
+            if (adopt) return adopt;
+          }
+          // A child retiring or exiting answers null without checking the speed. The next launch reads this catalog.
           // The prompt box and its command list offer speeds from this same catalog.
           const refusal = fastTierRefusal(steps.models.lists().codex ?? [], model, tier);
           if (refusal) throw new Error(refusal);

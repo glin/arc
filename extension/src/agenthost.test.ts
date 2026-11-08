@@ -8070,6 +8070,60 @@ function idleFastToggle(models: ModelBook, selected: string) {
   return { toggle, committed, evidenceModels, pendingPick };
 }
 
+// A stored Standard selection skips the speed reading, so the stage step is the first child operation of the command.
+test.each([
+  ['refuses', []],
+  ['accepts', ['priority']],
+] as const)('a /fast while its child retires %s through the held catalog', async (_name, offered) => {
+  const { host, children } = fakeHost();
+  const opening = host.session('retiring', codexPlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT, model: 'model-a' }));
+  const child = children[0];
+  child.reply({ userAgent: 'codex' });
+  await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'skills/list'));
+  child.reply({ data: [] });
+  await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'thread/start'));
+  child.reply({ thread: { id: 's1' }, model: 'model-a' });
+  await opening;
+  let book = withSessionSettings({}, 's1', {
+    ...sessionSettings({}, 's1'),
+    selectedModel: 'model-a',
+    serviceTier: 'default',
+  });
+  const committed: ServiceTier[] = [];
+  const toggle = sessionFastToggle({
+    turns: settingTurns(),
+    models: new ModelBook({ codex: { models: [fastRow('model-a', [...offered])], readAt: 0 } }),
+    read: () => book,
+    commit: async (session, serviceTier) => {
+      committed.push(serviceTier);
+      book = withSessionSettings(book, session, { ...sessionSettings(book, session), serviceTier });
+    },
+    idleEvidence: async () => ({ status: 'absent' }),
+    host,
+    published: () => {},
+  });
+  // A lease keeps the retirement pending, so the stage step finds the child and meets the retirement.
+  let endLease = () => {};
+  const lease = host.withActivity('retiring', () => new Promise<void>((resolve) => (endLease = resolve)));
+  const retiring = host.retireSession('retiring');
+  const activity = vi.spyOn(host, 'withActivity');
+  const toggled = toggle('s1', WS, () => '');
+  await vi.waitFor(() => assert.equal(activity.mock.calls.length, 1));
+  endLease();
+  await lease;
+  child.exit(0);
+  await retiring;
+  const result = await toggled;
+  if (offered.length) {
+    assert.deepEqual(result, { outcome: 'changed', tier: 'priority' });
+    assert.deepEqual(committed, ['priority']);
+  } else {
+    assert.equal(result.outcome, 'refused');
+    assert.deepEqual(committed, [], 'the retiring child reported an unchecked speed as accepted');
+    assert.equal(sessionSettings(book, 's1').serviceTier, 'default');
+  }
+});
+
 test('an idle /fast checks the catalog that the prompt box holds', async () => {
   const carried = (rows: ModelChoice[]) => new ModelBook({ codex: { models: rows, readAt: 0 } });
   const offered = carried([fastRow('model-a', ['priority'])]);
@@ -13448,6 +13502,40 @@ test('hosted launch: a /compact whose result names its local command ends a wait
     outcome: 'succeeded',
   });
   assert.equal(receipts.latest(launch.launchId)!.report, null);
+});
+
+test('explicit Standard reaches start, resume and a replacement launch and each turn', async () => {
+  const { host, children } = fakeHost();
+  const openStandard = async (index: number, method: 'start' | 'resume') => {
+    const opening = host.session(
+      `standard-${index}`,
+      codexPlan(CODEX, {
+        cwd: WS,
+        clientInfo: CODEX_CLIENT,
+        model: 'model-a',
+        serviceTier: 'default',
+        ...(method === 'resume' ? { resume: 'saved-thread' } : {}),
+      }),
+    );
+    const child = children[index];
+    child.reply({ userAgent: 'codex' });
+    await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'skills/list'));
+    child.reply({ data: [] });
+    await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, `thread/${method}`));
+    assert.equal((child.sent().at(-1)!.params as Record<string, unknown>).serviceTier, 'default');
+    child.reply({ thread: { id: 'saved-thread' }, model: 'model-a', serviceTier: 'default' });
+    return { child, opening };
+  };
+  for (const [index, method] of (['start', 'resume', 'resume'] as const).entries()) {
+    const { child, opening } = await openStandard(index, method);
+    const session = await opening;
+    const sending = session.prompt('Continue');
+    await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'turn/start'));
+    assert.equal((child.sent().at(-1)!.params as Record<string, unknown>).serviceTier, 'default');
+    child.reply({ turn: { id: 'turn-1' } });
+    await sending;
+    child.exit(0);
+  }
 });
 
 test('a /fast through the managed child reaches later turns, clear, and a replacement built from the book', async () => {
