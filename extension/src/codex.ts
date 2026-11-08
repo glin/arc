@@ -205,12 +205,12 @@ export class CodexMetaCache {
   private changed = 0;
 
   constructor(
-    private readMeta: (file: string) => CodexSessionMeta | null | undefined = readCodexOpening,
+    private readMeta: (file: string, onRead?: () => void) => CodexSessionMeta | null | undefined = readCodexOpening,
     private sizeOf: (file: string) => number | null = fileSize,
     private now: () => number = () => performance.now(),
   ) {}
 
-  // A compressed rollout gets no opening read, and its name gets no entry. `onRead` runs once for each opening read.
+  // A compressed rollout gets no opening read, and its name gets no entry. `onRead` runs once, before the first read of a file that opens.
   get(file: string, onRead?: () => void): CodexSessionMeta | null {
     if (isCompressedRollout(file)) return null;
     const hit = this.entries.get(file);
@@ -230,8 +230,7 @@ export class CodexMetaCache {
         return null;
       }
     }
-    onRead?.();
-    const meta = this.readMeta(file);
+    const meta = this.readMeta(file, onRead);
     // Refused reads keep an attempt time and retry interval instead of a file-size marker.
     if (meta === undefined) {
       const wait = hit && hit.meta === undefined ? REFUSED_OPENING_RETRY_MS : REFUSED_OPENING_FIRST_RETRY_MS;
@@ -397,10 +396,11 @@ function firstLineStep(buf: Buffer, have: number, read: number, want: number): s
 
 // Read the first line in growing windows up to `META_BYTES`. Decode only through its newline.
 // Accept an unterminated line when the file ends below the bound. Failed opens and reads throw.
-function firstLineOf(file: string): string | null {
+function firstLineOf(file: string, onRead?: () => void): string | null {
   let fd = -1;
   try {
     fd = fs.openSync(file, 'r');
+    onRead?.();
     return firstLineFromDescriptor(file, fd);
   } finally {
     if (fd >= 0) {
@@ -427,11 +427,18 @@ function firstLineFromDescriptor(file: string, fd: number): string | null {
   }
 }
 
-export function readQualifiedCodexOpening(file: string): { value: CodexSessionMeta; revision: FileRevision } | null {
-  return readQualifiedOpening(file, (fd) => {
-    const meta = openingRecordOf(firstLineFromDescriptor(file, fd));
-    return meta?.sessionId && meta.cwd ? meta : null;
-  });
+export function readQualifiedCodexOpening(
+  file: string,
+  onRead?: () => void,
+): { value: CodexSessionMeta; revision: FileRevision } | null {
+  return readQualifiedOpening(
+    file,
+    (fd) => {
+      const meta = openingRecordOf(firstLineFromDescriptor(file, fd));
+      return meta?.sessionId && meta.cwd ? meta : null;
+    },
+    onRead,
+  );
 }
 
 // Read the first line asynchronously. This read owns its `META_BYTES` buffer until settlement.
@@ -459,10 +466,10 @@ async function firstLineOfAsync(file: string, buf: Buffer): Promise<string | nul
 
 // Returns opening metadata, null for a head without it, or undefined for a refused read.
 // Changes to persisted fields or their deriving helpers require a `CODEX_META_VERSION` change in `codexopenings.ts`.
-function readCodexOpeningRecord(file: string): CodexSessionMeta | null | undefined {
+function readCodexOpeningRecord(file: string, onRead?: () => void): CodexSessionMeta | null | undefined {
   let line: string | null;
   try {
-    line = firstLineOf(file);
+    line = firstLineOf(file, onRead);
   } catch {
     return undefined;
   }
@@ -521,8 +528,8 @@ export function readCodexSessionMeta(file: string): CodexSessionMeta | null {
 
 // `readCodexSessionMeta` that answers undefined when the file system refuses the read, so
 // `CodexMetaCache` keeps a refused read apart from a head with no record.
-export function readCodexOpening(file: string): CodexSessionMeta | null | undefined {
-  return readCodexOpeningRecord(file);
+export function readCodexOpening(file: string, onRead?: () => void): CodexSessionMeta | null | undefined {
+  return readCodexOpeningRecord(file, onRead);
 }
 
 // `readCodexSessionMeta` off the extension host's main thread. `buf` holds `META_BYTES` and

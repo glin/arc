@@ -1389,10 +1389,12 @@ export function readSessionCwd(file: string): string | null {
   return scanSessionCwd(file);
 }
 
-export function scanSessionCwd(file: string, onUnreadable?: () => void): string | null {
+// `onRead` runs once, before the first read of the file. A failed open reads nothing and skips it.
+export function scanSessionCwd(file: string, onUnreadable?: () => void, onRead?: () => void): string | null {
   let fd = -1;
   try {
     fd = fs.openSync(file, 'r');
+    onRead?.();
     return cwdFromDescriptor(file, fd);
   } catch {
     onUnreadable?.();
@@ -1423,14 +1425,19 @@ function cwdFromDescriptor(file: string, fd: number): string | null {
   return null;
 }
 
-export function readQualifiedSessionCwd(file: string): { value: string; revision: FileRevision } | null {
-  return readQualifiedOpening(file, (fd) => cwdFromDescriptor(file, fd));
+export function readQualifiedSessionCwd(
+  file: string,
+  onRead?: () => void,
+): { value: string; revision: FileRevision } | null {
+  return readQualifiedOpening(file, (fd) => cwdFromDescriptor(file, fd), onRead);
 }
 
 // Opening metadata belongs to the descriptor and pathname only while their complete revisions agree.
+// `onRead` runs once, before the first read of the file. A failed open or a refused identity reads nothing and skips it.
 export function readQualifiedOpening<T>(
   file: string,
   read: (fd: number) => T | null,
+  onRead?: () => void,
 ): { value: T; revision: FileRevision } | null {
   let fd = -1;
   try {
@@ -1438,6 +1445,7 @@ export function readQualifiedOpening<T>(
     const before = fs.fstatSync(fd, { bigint: true });
     const revision = revisionOf(before);
     if (!before.isFile() || revision.size < 0 || !supportedFileIdentity(revision)) return null;
+    onRead?.();
     const value = read(fd);
     if (
       value === null ||
@@ -4112,8 +4120,7 @@ export function enumerateClaudeChildSources(
     for (const source of listing.sessions) {
       if (!source.sessionId.startsWith('agent-')) continue;
       const kept = lastCensusOpening(lastRowOf.get(source.file), source);
-      if (!kept) countRead?.();
-      const opening = kept ?? time('openings:children', () => readQualifiedSessionCwd(source.file));
+      const opening = kept ?? time('openings:children', () => readQualifiedSessionCwd(source.file, countRead));
       if (
         !opening ||
         source.dev !== opening.revision.dev ||

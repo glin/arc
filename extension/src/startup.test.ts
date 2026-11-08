@@ -8301,6 +8301,14 @@ test('a catalog walk records each part of the enumeration time, and the parts su
   };
   const collidedCodexFile = 'rollout-collided.jsonl';
   let censusLastRows: unknown;
+  // Each fake reader runs its counter where a real reader does, at its first read. While `readsRefused` holds, each
+  // reader stops before that read, as a failed open or a refused identity does.
+  let readsRefused = false;
+  const askedReaders = new Set<string>();
+  const readerOpens = (reader: string, onRead?: () => void) => {
+    askedReaders.add(reader);
+    if (!readsRefused) onRead?.();
+  };
   const { provider, claude, codex } = bumpedCatalogHarness({
     performance: { now: () => clock },
     enumerateRolloutFilesAsync: async () => {
@@ -8324,16 +8332,19 @@ test('a catalog walk records each part of the enumeration time, and the parts su
       cwdOf(collidedClaude.file, collidedClaude);
       return { sessions: [claude], files: [claude.file], status: 'complete', uncertain: [] };
     },
-    scanSessionCwd: () => {
+    scanSessionCwd: (_file: string, _onUnreadable: unknown, onRead?: () => void) => {
       advance(7);
+      readerOpens('parents', onRead);
       return '/project';
     },
-    readQualifiedSessionCwd: () => {
+    readQualifiedSessionCwd: (_file: string, onRead?: () => void) => {
       advance(5);
+      readerOpens('collisions:claude', onRead);
       return null;
     },
-    readQualifiedCodexOpening: () => {
+    readQualifiedCodexOpening: (_file: string, onRead?: () => void) => {
       advance(3);
+      readerOpens('collisions:codex', onRead);
       return null;
     },
     fs: {
@@ -8391,20 +8402,20 @@ test('a catalog walk records each part of the enumeration time, and the parts su
     },
   });
   provider.codexColdReads = null;
-  provider.codexMetas = new CodexMetaCache(
-    () => {
-      advance(6);
-      return null;
-    },
-    () => null,
-  );
+  const readFakeCodexOpening = (_file: string, onRead?: () => void) => {
+    advance(6);
+    readerOpens('codex', onRead);
+    return null;
+  };
+  provider.codexMetas = new CodexMetaCache(readFakeCodexOpening, () => null);
   // One Claude file and one rollout collide, and each qualified read fails, so each also pays its source's own reader.
-  provider.enumeratedCollisions = {
+  const collisions = {
     sources: [
       { agent: 'claude', file: collidedClaude.file, sessionId: 'collided' },
       { agent: 'codex', file: collidedCodexFile, sessionId: 'collided' },
     ],
   };
+  provider.enumeratedCollisions = collisions;
   provider.prepareHumanPrompts = async (sessions: SessionFile[]) => {
     advance(11);
     return sessions;
@@ -8446,7 +8457,27 @@ test('a catalog walk records each part of the enumeration time, and the parts su
   // A rollout that the cache holds an answer for reads nothing on the next walk.
   work.delete('openingsRead:codex');
   await provider.refresh(true);
-  assert.equal(work.get('openingsRead:codex'), undefined, 'a held opening counted a read');
+  assert.equal(work.get('openingsRead:codex'), undefined, 'a rollout that the cache answers for counted a read');
+
+  // A walk whose readers all stop before their first read counts no read for any of them.
+  readsRefused = true;
+  askedReaders.clear();
+  work.clear();
+  provider.cwds.clear();
+  provider.enumeratedCollisions = collisions;
+  provider.codexMetas = new CodexMetaCache(readFakeCodexOpening, () => null);
+  await provider.refresh(true);
+  readsRefused = false;
+  assert.deepEqual(
+    [...askedReaders].sort(),
+    ['codex', 'collisions:claude', 'collisions:codex', 'parents'],
+    'the walk did not ask every reader',
+  );
+  assert.deepEqual(
+    ['parents', 'codex', 'collisions'].map((source) => work.get(`openingsRead:${source}`)),
+    [undefined, undefined, undefined],
+    'a reader that stopped before its first read counted a read',
+  );
 
   // The next walk hands the census the rows of the last census.
   const lastCensusRows = [claude];

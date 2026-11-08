@@ -13034,6 +13034,8 @@ export class PanelProvider implements vscode.Disposable {
     // Without a collision, no file needs its path normalized to find that out.
     const collides = (agent: 'claude' | 'codex', file: string) =>
       collisionFiles.size > 0 && collisionFiles.has(agent + '\0' + normalizeFsPath(file));
+    const countCollisionRead = () => this.performanceCounters?.recordWork('openingsRead:collisions');
+    const countParentRead = () => this.performanceCounters?.recordWork('openingsRead:parents');
     const physicalContext = {
       domain: 'physical' as const,
       scope: JSON.stringify(roots),
@@ -13048,8 +13050,7 @@ export class PanelProvider implements vscode.Disposable {
       (file, session) => {
         if (collides('claude', file)) {
           const qualified = time('openings:collisions', () => {
-            this.performanceCounters?.recordWork('openingsRead:collisions');
-            const opening = readQualifiedSessionCwd(file);
+            const opening = readQualifiedSessionCwd(file, countCollisionRead);
             if (
               opening &&
               sameSessionRevision(session, opening.revision) &&
@@ -13083,11 +13084,14 @@ export class PanelProvider implements vscode.Disposable {
             return hit.cwd;
           }
           let unavailable = false;
-          this.performanceCounters?.recordWork('openingsRead:parents');
-          const cwd = scanSessionCwd(file, () => {
-            unavailable = true;
-            claudeOpeningUnavailable = true;
-          });
+          const cwd = scanSessionCwd(
+            file,
+            () => {
+              unavailable = true;
+              claudeOpeningUnavailable = true;
+            },
+            countParentRead,
+          );
           this.cwds.set(file, { cwd, mtimeMs: session.mtimeMs, size: session.size, unavailable });
           return cwd;
         });
@@ -13105,8 +13109,7 @@ export class PanelProvider implements vscode.Disposable {
         if (isCompressedRollout(file)) return null;
         if (collides('codex', file)) {
           const qualified = time('openings:collisions', () => {
-            this.performanceCounters?.recordWork('openingsRead:collisions');
-            const opening = readQualifiedCodexOpening(file);
+            const opening = readQualifiedCodexOpening(file, countCollisionRead);
             if (!opening) return null;
             const source: SessionFile = {
               agent: 'codex',

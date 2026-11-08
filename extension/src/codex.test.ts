@@ -15602,6 +15602,44 @@ test.skipIf(!zstdEncode)('only a lower-case compressed rollout name joins the wa
   }
 });
 
+test('a qualified opening read counts once, and a failed open or a refused identity counts nothing', () => {
+  const root = sessionsRoot([
+    { day: '2026/08/25', name: ROLLOUT(UUID_A), records: [meta({ id: UUID_A, cwd: 'C:/repo' })] },
+  ]);
+  const rollout = path.join(root, '2026', '08', '25', ROLLOUT(UUID_A));
+  const transcript = path.join(root, 'Parent.jsonl');
+  fs.writeFileSync(transcript, JSON.stringify({ type: 'user', cwd: 'C:/repo' }) + '\n');
+  const native = createRequire(__filename)('node:fs') as typeof fs;
+  const fstat = native.fstatSync;
+  const readers: { name: string; file: string; read: (file: string, onRead: () => void) => unknown }[] = [
+    { name: 'transcript', file: transcript, read: (file, onRead) => readQualifiedSessionCwd(file, onRead) },
+    { name: 'rollout', file: rollout, read: (file, onRead) => readQualifiedCodexOpening(file, onRead) },
+  ];
+  for (const { name, file, read } of readers) {
+    let reads = 0;
+    const count = () => {
+      reads += 1;
+    };
+    assert.ok(read(file, count), name);
+    assert.equal(reads, 1, `a read of the ${name} counted no read`);
+    reads = 0;
+    assert.equal(read(file + '.missing', count), null, name);
+    assert.equal(reads, 0, `a failed open of the ${name} counted a read`);
+    const spy = vi.spyOn(native, 'fstatSync').mockImplementation(((fd: number, ...args: any[]) => {
+      const real = (fstat as any)(fd, ...args);
+      return Object.assign(Object.create(Object.getPrototypeOf(real)), real, { ino: 0n });
+    }) as typeof fs.fstatSync);
+    syncBuiltinESMExports();
+    try {
+      assert.equal(read(file, count), null, name);
+      assert.equal(reads, 0, `a refused identity of the ${name} counted a read`);
+    } finally {
+      spy.mockRestore();
+      syncBuiltinESMExports();
+    }
+  }
+});
+
 test.skipIf(!zstdEncode)('no foreground opening read reaches a compressed rollout head', async () => {
   const root = sessionsRoot([{ day: '2026/08/25', name: ROLLOUT(UUID_A), records: [meta({ id: UUID_A })] }]);
   const plain = path.join(root, '2026', '08', '25', ROLLOUT(UUID_A));

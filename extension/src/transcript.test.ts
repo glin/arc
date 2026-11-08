@@ -1,7 +1,13 @@
 import { webLinkUrl, linkBrowserKind, parseLinkDestination } from './domain/link-path';
 import { test, vi } from 'vitest';
 import { agentRunAnswer } from './turnrail';
-import { enumerateClaudeChildSources, enumerateSessionFiles, enumerateSessionFilesFor, revisionOf } from './transcript';
+import {
+  enumerateClaudeChildSources,
+  enumerateSessionFiles,
+  enumerateSessionFilesFor,
+  revisionOf,
+  scanSessionCwd,
+} from './transcript';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { EXPORT_LIMITS, ExportLimitError } from './exportlimits.ts';
 import {
@@ -18053,6 +18059,7 @@ test('physical child census retains unreferenced identity competitors across sou
 });
 
 // A child census over one parent. It counts the opens of child transcripts, the first filesystem call of each read.
+// An open of a path in `unopenable` fails.
 function childCensusFixture(prefix: string) {
   const at = new Date('2026-10-21T12:00:00Z');
   const root = tempDir(prefix);
@@ -18072,13 +18079,14 @@ function childCensusFixture(prefix: string) {
     fs.writeFileSync(fileOf(name), bytes(cwd));
     stamp(name);
   };
-  const census = (last?: ReturnType<typeof enumerateClaudeChildSources>['sessions']) => {
+  const census = (last?: ReturnType<typeof enumerateClaudeChildSources>['sessions'], unopenable: string[] = []) => {
     const native = createRequire(__filename)('node:fs') as typeof fs;
     const open = native.openSync;
     const opened: string[] = [];
     let counted = 0;
     const spy = vi.spyOn(native, 'openSync').mockImplementation(((target: fs.PathLike, ...args: any[]) => {
       if (String(target).endsWith('.jsonl')) opened.push(String(target));
+      if (unopenable.includes(String(target))) throw Object.assign(new Error('EACCES'), { code: 'EACCES' });
       return (open as any)(target, ...args);
     }) as typeof fs.openSync);
     syncBuiltinESMExports();
@@ -18105,6 +18113,58 @@ test('a child census over unchanged children keeps every last row and opens no c
   assert.equal(second.counted(), 0, 'an unchanged child counted a read');
   assert.equal(second.status, 'complete');
   assert.deepEqual(second.sessions, first.sessions, 'a kept row differs from the row a read returns');
+});
+
+test('a child census counts no read for a failed open or a refused identity', () => {
+  const { write, fileOf, census } = childCensusFixture('child-census-unread-');
+  write('Child', 'C:/Repo/One');
+  const failed = census(undefined, [fileOf('Child')]);
+  assert.deepEqual(failed.opened, [fileOf('Child')]);
+  assert.equal(failed.status, 'incomplete');
+  assert.equal(failed.counted(), 0, 'a failed open counted a read');
+  const native = createRequire(__filename)('node:fs') as typeof fs;
+  const fstat = native.fstatSync;
+  const spy = vi.spyOn(native, 'fstatSync').mockImplementation(((fd: number, ...args: any[]) => {
+    const real = (fstat as any)(fd, ...args);
+    return Object.assign(Object.create(Object.getPrototypeOf(real)), real, { ino: 0n });
+  }) as typeof fs.fstatSync);
+  syncBuiltinESMExports();
+  try {
+    const refused = census();
+    assert.deepEqual(refused.opened, [fileOf('Child')]);
+    assert.equal(refused.status, 'incomplete');
+    assert.equal(refused.counted(), 0, 'a refused identity counted a read');
+  } finally {
+    spy.mockRestore();
+    syncBuiltinESMExports();
+  }
+  assert.equal(census().counted(), 1, 'a read of the transcript counted no read');
+});
+
+test('a parent opening scan counts one read, and a failed open counts none', () => {
+  const root = tempDir('parent-opening-count-');
+  const file = path.join(root, 'Parent.jsonl');
+  fs.writeFileSync(file, JSON.stringify({ cwd: 'C:/Repo/One' }) + String.fromCharCode(10));
+  let counted = 0;
+  let unreadable = 0;
+  const count = () => {
+    counted += 1;
+  };
+  assert.equal(scanSessionCwd(file, undefined, count), 'C:/Repo/One');
+  assert.equal(counted, 1, 'a read of the transcript counted no read');
+  counted = 0;
+  const missing = path.join(root, 'Missing.jsonl');
+  assert.equal(
+    scanSessionCwd(
+      missing,
+      () => {
+        unreadable += 1;
+      },
+      count,
+    ),
+    null,
+  );
+  assert.deepEqual([counted, unreadable], [0, 1], 'a failed open counted a read');
 });
 
 test('a child census reads a child whose size or modification time moved', () => {
