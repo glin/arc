@@ -41,6 +41,15 @@ export interface RowEncoding {
   rowsSent: number;
 }
 
+// The `rail` rows that one encoded message carried, and which of their fields differed from the rows the panel held.
+export interface RailRowChanges {
+  // Rows the message carried. A snapshot carries every row.
+  rows: number;
+  // For each field name, the carried rows whose value of that field differs from the held row. `added` counts the rows
+  // that the panel did not hold, and `stats` counts the sessions whose figures changed. A snapshot names no field.
+  fields: Record<string, number>;
+}
+
 export interface RowLists {
   sessions?: readonly Row[];
   rail: readonly Row[];
@@ -87,6 +96,28 @@ function encodable(message: RowLists): boolean {
   );
 }
 
+// Count the fields of each carried row that differ from the held row with the same id.
+function railRowChanges(changed: readonly Row[], held: ReadonlyMap<string, Row>): Record<string, number> {
+  const fields: Record<string, number> = {};
+  const count = (field: string) => {
+    fields[field] = (fields[field] ?? 0) + 1;
+  };
+  for (const row of changed) {
+    const before = held.get(row.id) as Record<string, unknown> | undefined;
+    if (!before) {
+      count('added');
+      continue;
+    }
+    const after = row as unknown as Record<string, unknown>;
+    for (const field of new Set([...Object.keys(before), ...Object.keys(after)])) {
+      const was = before[field];
+      const is = after[field];
+      if (was !== is && JSON.stringify(was) !== JSON.stringify(is)) count(field);
+    }
+  }
+  return fields;
+}
+
 function repeatsIds(rows: readonly Row[] | undefined): boolean {
   return rows !== undefined && new Set(rows.map((row) => row.id)).size !== rows.length;
 }
@@ -126,20 +157,26 @@ export class RowDeltaSender {
   private revision: number | null = null;
   private sessions: (SentList & { revision: number }) | null = null;
   private rail: SentList | null = null;
+  // The `rail` rows of the last message, by id, to name the fields that the next message changes.
+  private railRows: Map<string, Row> | null = null;
   private stats: Map<string, string> | null = null;
   // Prints of the inputs every row depends on, by name. A change sends a snapshot.
   private readonly globals = new Map<string, string>();
   private resetReason: RowResetReason | null = null;
   // What the last call to `encode` carried.
   lastEncoding: RowEncoding | null = null;
+  // The `rail` rows that the last call to `encode` carried. Null after a reset and after a message that is not keyed rows.
+  lastRailChanges: RailRowChanges | null = null;
 
   reset(reason: RowResetReason): void {
     this.revision = null;
     this.sessions = null;
     this.rail = null;
+    this.railRows = null;
     this.stats = null;
     this.globals.clear();
     this.resetReason = reason;
+    this.lastRailChanges = null;
   }
 
   // A message whose lists are not keyed rows posts unchanged, and the next message is a snapshot.
@@ -196,6 +233,8 @@ export class RowDeltaSender {
     rowsSent += rail.changed.length;
     if (rail.order) header.railOrder = rail.order;
     this.rail = rail.next;
+    const railFields = whole || !this.railRows ? {} : railRowChanges(rail.changed, this.railRows);
+    this.railRows = new Map(message.rail.map((row) => [row.id, row]));
     const prints = new Map<string, string>();
     const stats: Record<string, unknown> = {};
     for (const [id, value] of Object.entries(message.stats)) {
@@ -211,6 +250,9 @@ export class RowDeltaSender {
     this.lastEncoding = { whole, reason: wholeReason, rowsHeld, rowsSent };
     // Rows with a repeated id cannot be addressed by id, so the next message is a snapshot too.
     if (repeated) this.reset('repeatedIds');
+    const statsChanged = Object.keys(stats).length;
+    if (!whole && statsChanged) railFields.stats = statsChanged;
+    this.lastRailChanges = { rows: rail.changed.length, fields: railFields };
     return out as unknown as M & { rows: RowDeltaHeader };
   }
 }

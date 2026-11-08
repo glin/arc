@@ -12985,6 +12985,44 @@ test('a render post counts its caller and each session list input that differs f
   }
 });
 
+test('a session list post counts the rows it carried and each row field that differed from the held row', () => {
+  const provider = railPostHarness([]);
+  const work = new Map<string, number>();
+  provider.performanceCounters = {
+    ...provider.performanceCounters,
+    recordWork: (name: string, count = 1) => work.set(name, (work.get(name) ?? 0) + count),
+  };
+  const counted = () =>
+    [...work].filter(([name]) => name.startsWith('railPostRows') || name.startsWith('railPostField')).sort();
+  const quiet = { id: 'quiet', status: 'done', runningSince: null, label: 'Quiet' };
+  let rail: object[] = [{ id: 'running', status: 'running', runningSince: 10, label: 'Running' }, quiet];
+  let stats: Record<string, unknown> = { running: [{ cost: 1 }], quiet: [{ cost: 2 }] };
+  provider.useRailPayload(() => ({ rail, labels: [], views: [], railFilters: [], stats }));
+  provider.postRail(true, 'opening');
+  assert.deepEqual(counted(), [['railPostRows:opening', 2]], 'a snapshot named a field, or did not count its rows');
+
+  work.clear();
+  rail = [
+    { id: 'running', status: 'done', runningSince: null, label: 'Running' },
+    quiet,
+    { id: 'new', status: 'done', runningSince: null, label: 'New' },
+  ];
+  stats = { ...stats, quiet: [{ cost: 3 }] };
+  provider.sessionRows = [{ id: 'running' }];
+  provider.postRail(true, 'holdDraft');
+  assert.deepEqual(
+    counted(),
+    [
+      ['railPostField:holdDraft:added', 1],
+      ['railPostField:holdDraft:runningSince', 1],
+      ['railPostField:holdDraft:stats', 1],
+      ['railPostField:holdDraft:status', 1],
+      ['railPostRows:holdDraft', 2],
+    ],
+    'the counters named a field that did not change, missed one that did, or miscounted the carried rows',
+  );
+});
+
 test('a rail update serializes once for each actual ready-host post', () => {
   const provider = railPostHarness(['post', 'sendToHost']);
   const order: string[] = [];

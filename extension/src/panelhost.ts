@@ -11577,6 +11577,13 @@ export class PanelProvider implements vscode.Disposable {
           largestRailBytes = Math.max(largestRailBytes ?? 0, serializedBytes);
         }
       });
+      // The panel's row sender encoded this post without an await, so its record describes this post.
+      const changed = this.rowSender(host).lastRailChanges;
+      if (changed) {
+        this.performanceCounters?.recordWork(`railPostRows:${caller}`, changed.rows);
+        for (const [field, rows] of Object.entries(changed.fields))
+          this.performanceCounters?.recordWork(`railPostField:${caller}:${field}`, rows);
+      }
     }
     this.lastRailKey = key;
     this.railPendingAnswers = pendingAnswers;
