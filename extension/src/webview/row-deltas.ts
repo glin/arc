@@ -250,7 +250,7 @@ export class RowDeltaSender {
     this.lastEncoding = { whole, reason: wholeReason, rowsHeld, rowsSent };
     // Rows with a repeated id cannot be addressed by id, so the next message is a snapshot too.
     if (repeated) this.reset('repeatedIds');
-    const statsChanged = Object.keys(stats).length;
+    const statsChanged = Object.keys(stats).length + removed.length;
     if (!whole && statsChanged) railFields.stats = statsChanged;
     this.lastRailChanges = { rows: rail.changed.length, fields: railFields };
     return out as unknown as M & { rows: RowDeltaHeader };

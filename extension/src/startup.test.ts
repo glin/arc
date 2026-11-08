@@ -12995,15 +12995,20 @@ test('a session list post counts the rows it carried and each row field that dif
   const counted = () =>
     [...work].filter(([name]) => name.startsWith('railPostRows') || name.startsWith('railPostField')).sort();
   const quiet = { id: 'quiet', status: 'done', runningSince: null, label: 'Quiet' };
-  let rail: object[] = [{ id: 'running', status: 'running', runningSince: 10, label: 'Running' }, quiet];
+  const badge = () => ({ kind: 'cost', parts: [{ value: 1 }] });
+  let rail: object[] = [
+    { id: 'running', status: 'running', runningSince: 10, label: 'Running', badge: badge() },
+    quiet,
+  ];
   let stats: Record<string, unknown> = { running: [{ cost: 1 }], quiet: [{ cost: 2 }] };
   provider.useRailPayload(() => ({ rail, labels: [], views: [], railFilters: [], stats }));
   provider.postRail(true, 'opening');
   assert.deepEqual(counted(), [['railPostRows:opening', 2]], 'a snapshot named a field, or did not count its rows');
 
   work.clear();
+  // The running card's figure object is new but equal, so it names no field.
   rail = [
-    { id: 'running', status: 'done', runningSince: null, label: 'Running' },
+    { id: 'running', status: 'done', runningSince: null, label: 'Running', badge: badge() },
     quiet,
     { id: 'new', status: 'done', runningSince: null, label: 'New' },
   ];
@@ -13020,6 +13025,28 @@ test('a session list post counts the rows it carried and each row field that dif
       ['railPostRows:holdDraft', 2],
     ],
     'the counters named a field that did not change, missed one that did, or miscounted the carried rows',
+  );
+
+  // A nested change names its field, a dropped field counts, and a session whose figures the post removes counts once.
+  work.clear();
+  rail = [
+    { id: 'running', status: 'done', runningSince: null, badge: { kind: 'cost', parts: [{ value: 2 }] } },
+    quiet,
+    rail[2],
+  ];
+  const { quiet: _removed, ...kept } = stats;
+  stats = kept;
+  provider.sessionRows = [{ id: 'running' }, { id: 'quiet' }];
+  provider.postRail(true, 'holdDraft');
+  assert.deepEqual(
+    counted(),
+    [
+      ['railPostField:holdDraft:badge', 1],
+      ['railPostField:holdDraft:label', 1],
+      ['railPostField:holdDraft:stats', 1],
+      ['railPostRows:holdDraft', 1],
+    ],
+    'a nested field change, a dropped field or a removed figure entry was not counted',
   );
 });
 
