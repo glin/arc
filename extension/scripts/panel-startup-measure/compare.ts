@@ -74,20 +74,34 @@ export const REPORT_ONLY = new Set([
   'compressedStoreBytes',
   'refreshCount:compressed-facts',
 ]);
-export const REPORT_ONLY_PREFIXES = ['refreshMs:', 'refreshMaxMs:', 'refreshCount:catalog-enumeration:'] as const;
+export const REPORT_ONLY_PREFIXES = [
+  'refreshMs:',
+  'refreshMaxMs:',
+  'refreshCount:catalog-enumeration:',
+  'openingsRead:',
+] as const;
 
 export function isReportOnly(name: string): boolean {
   return REPORT_ONLY.has(name) || REPORT_ONLY_PREFIXES.some((prefix) => name.startsWith(prefix));
 }
 
 function kindOf(name: string): Kind {
-  return COUNTS.has(name) || name.startsWith('refreshCount:') ? 'count' : BYTES.has(name) ? 'bytes' : 'time';
+  return COUNTS.has(name) || name.startsWith('refreshCount:') || name.startsWith('openingsRead:')
+    ? 'count'
+    : BYTES.has(name)
+      ? 'bytes'
+      : 'time';
 }
 
-// The refresh rows that the comparison reads from the hold snapshot when the run holds, and from the end snapshot of
-// the measured launch otherwise.
+// The refresh rows and opening read rows that the comparison reads from the hold snapshot when the run holds, and from
+// the end snapshot of the measured launch otherwise.
 export function readFromHold(name: string): boolean {
-  return name.startsWith('refreshMs:') || name.startsWith('refreshMaxMs:') || name === 'refreshCount:compressed-facts';
+  return (
+    name.startsWith('refreshMs:') ||
+    name.startsWith('refreshMaxMs:') ||
+    name.startsWith('openingsRead:') ||
+    name === 'refreshCount:compressed-facts'
+  );
 }
 
 // Read the comparison's measures from one runner result.

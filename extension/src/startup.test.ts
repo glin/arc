@@ -347,6 +347,7 @@ import {
   compareResults,
   marginsOf,
   measuresOf,
+  markdownTable,
   missingMeasures,
   runComparison,
   type Repetition,
@@ -363,6 +364,7 @@ import {
   instrumentSoak,
   linkTree,
   NAMED_COUNTERS,
+  OPENING_READ_COUNTERS,
   soakMeasures,
   startDispatch,
 } from '../scripts/panel-startup-measure/soak';
@@ -2088,6 +2090,38 @@ test('every part row of the catalog enumeration reports and never fails', () => 
     [runnerResult({ 'refreshCount:catalog-enumeration': 40 })],
   ).find((measure) => measure.name === 'refreshCount:catalog-enumeration')!;
   assert.deepEqual([whole.reportOnly, whole.regressed], [false, true]);
+});
+
+test('the opening read counts of a saved snapshot reach the report and never fail', () => {
+  const counters = new PanelPerformanceCounters();
+  counters.recordWork('openingsRead:parents', 3);
+  counters.recordWork('openingsRead:children', 40);
+  const measures = soakMeasures({ counters: counters.snapshot() as any });
+  assert.deepEqual(Object.fromEntries(OPENING_READ_COUNTERS.map((name) => [name, measures[name]])), {
+    'openingsRead:parents': 3,
+    'openingsRead:codex': 0,
+    'openingsRead:collisions': 0,
+    'openingsRead:children': 40,
+  });
+  // A build that does not count opening reads holds no rows, so its side of the report reads "not reported".
+  const older = soakMeasures({ counters: { work: { catalogWalk: 1 } } });
+  assert.deepEqual(
+    OPENING_READ_COUNTERS.filter((name) => name in older),
+    [],
+    'a snapshot without opening reads reported a row',
+  );
+  const report = compareResults([runnerResult(older)], [runnerResult(measures)]);
+  for (const name of OPENING_READ_COUNTERS) {
+    const row = report.find((measure) => measure.name === name)!;
+    assert.deepEqual([row.kind, row.baseline, row.reportOnly, row.regressed], ['count', null, true, false], name);
+  }
+  assert.match(
+    markdownTable(report, 'baseline', 'candidate'),
+    /\| openingsRead:children \| not reported \| 40 \| n\/a \| report only \| reported \|/,
+  );
+  // A run that holds its warm-up reads the counts after the hold, as it reads the time rows they explain.
+  const held = { ...runnerResult(measures), warmUp: { hold: { snapshot: { 'openingsRead:children': 9 } } } };
+  assert.equal(measuresOf(held).get('openingsRead:children')?.value, 9);
 });
 
 test('refresh rows read the hold snapshot when the run holds', () => {

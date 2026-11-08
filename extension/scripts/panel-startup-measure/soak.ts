@@ -298,6 +298,15 @@ export const NAMED_COUNTERS = [
 ] as const;
 const WORK_COUNTERS: Readonly<Record<string, string>> = { catalogWalks: 'catalogWalk' };
 
+// The opening reads of each source. A snapshot that holds none of them comes from a build that does not count them, and
+// reports no row, so the comparison shows it as not reported. A snapshot that holds one reports all four.
+export const OPENING_READ_COUNTERS = [
+  'openingsRead:parents',
+  'openingsRead:codex',
+  'openingsRead:collisions',
+  'openingsRead:children',
+] as const;
+
 // The measures a soak snapshot supplies, in the units the comparison reads. Every gauge passes through by its own name.
 export function soakMeasures(snapshot: {
   counters?: {
@@ -332,6 +341,8 @@ export function soakMeasures(snapshot: {
     const value = measure.startsWith('refreshCount:') ? undefined : work[WORK_COUNTERS[measure] ?? measure];
     out[measure] = typeof value === 'number' ? value : 0;
   }
+  if (OPENING_READ_COUNTERS.some((name) => typeof work[name] === 'number'))
+    for (const name of OPENING_READ_COUNTERS) out[name] = work[name] ?? 0;
   for (const [name, value] of Object.entries(snapshot.counters?.gauges ?? {}))
     if (typeof value === 'number') out[name] = value;
   const loopDelay = snapshot.counters?.loopDelay;
