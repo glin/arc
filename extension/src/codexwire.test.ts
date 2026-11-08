@@ -16,6 +16,7 @@ import {
   turnOutcome,
 } from './codexwire.ts';
 import { WireEvent, Ask, RateLimit, GuardedAttempt } from './agentwire.ts';
+import { toggleFastSelection } from './composerview.ts';
 import { SessionNameUncertain } from './sessionrename.ts';
 import * as path from 'node:path';
 import { sessionComponentsDiagnostics, type SessionComponentsWithheld } from './sessionskills';
@@ -4969,6 +4970,130 @@ test('a thread reply is applied speed evidence on a qualified server only', asyn
   assert.equal(await reading, null, 'the older version establishes no speed contract');
   older.wire.close('test complete');
 });
+
+// Serves each settings read the wire sent and the test has not answered, so the replies take the real reading path.
+function settingsReplies(h: ReturnType<typeof harness>, config: object, requirements: unknown) {
+  const answered = new Set<number>();
+  return () => {
+    for (const message of h.parsed()) {
+      if (answered.has(message.id) || !SETTINGS_READS.includes(message.method)) continue;
+      answered.add(message.id);
+      const result =
+        message.method === 'config/read'
+          ? { config: { model: 'model-a', ...config } }
+          : message.method === 'model/list'
+            ? { data: [{ id: 'model-a', model: 'model-a', isDefault: true, serviceTiers: [{ id: 'priority' }] }] }
+            : { requirements };
+      h.wire.receive(JSON.stringify({ id: message.id, result }));
+    }
+  };
+}
+
+const SETTINGS_READS = ['config/read', 'model/list', 'configRequirements/read'];
+
+// Runs the production toggle against the adapter's own speed reading and staging.
+async function fastToggleOverWire(h: ReturnType<typeof harness>, answer: () => void) {
+  const saved: string[] = [];
+  const outcome = await toggleFastSelection({
+    session: 'one',
+    read: () => ({}),
+    commit: async (tier) => {
+      saved.push(tier);
+    },
+    evidence: () => {
+      const reading = h.wire.nextServiceTier();
+      answer();
+      return reading;
+    },
+    stage: (tier) => {
+      const staging = h.wire.stageServiceTier(tier);
+      answer();
+      return staging;
+    },
+    retire: async () => {},
+  });
+  return { outcome, saved };
+}
+
+test.each([
+  ['malformed', 7, 'Codex reported a speed setting Arc cannot read'],
+  ['unsupported', 'flex', 'Codex reported a speed Arc does not know'],
+])('/fast refuses a %s thread speed when readable configuration names none', async (status, serviceTier, notice) => {
+  const h = await fastThread(undefined, { thread: { id: THREAD }, model: 'model-a', serviceTier });
+  const answer = settingsReplies(h, {}, null);
+  const reading = h.wire.nextServiceTier();
+  answer();
+  assert.deepEqual(await reading, { status });
+  const { outcome, saved } = await fastToggleOverWire(h, answer);
+  assert.equal(outcome.outcome, 'refused');
+  assert.match(outcome.outcome === 'refused' ? outcome.notice : '', new RegExp(notice));
+  assert.deepEqual(saved, []);
+  assert.equal((await turn(h, 'unchanged')).serviceTier, undefined);
+  h.wire.close('test complete');
+});
+
+test('thread speed evidence yields to a selection and falls back only when absent or unqualified', async () => {
+  const unreadable = { thread: { id: THREAD }, model: 'model-a', serviceTier: 7 };
+  const selected = await fastThread(undefined, unreadable);
+  const adopt = await selected.wire.stageServiceTier('default');
+  assert.equal(adopt(), true);
+  assert.deepEqual(await selected.wire.nextServiceTier(), { status: 'known', tier: 'default' });
+  selected.wire.close('test complete');
+
+  const empty = await fastThread(undefined, { thread: { id: THREAD }, model: 'model-a', serviceTier: null });
+  const emptyAnswer = settingsReplies(empty, { service_tier: 'priority' }, null);
+  const fallback = empty.wire.nextServiceTier();
+  emptyAnswer();
+  assert.deepEqual(await fallback, { status: 'known', tier: 'priority' });
+  empty.wire.close('test complete');
+
+  const older = await fastThread('codex_cli_rs/0.166.0', unreadable);
+  const olderAnswer = settingsReplies(older, { service_tier: 'priority' }, null);
+  const unqualified = older.wire.nextServiceTier();
+  olderAnswer();
+  assert.equal(await unqualified, null, 'an unqualified reply supplies no evidence');
+  older.wire.close('test complete');
+
+  const broken = await fastThread();
+  const unknown = broken.wire.nextServiceTier();
+  for (const message of broken.parsed().filter((m) => SETTINGS_READS.includes(m.method)))
+    broken.wire.receive(JSON.stringify({ id: message.id, error: { code: -32603, message: 'no settings' } }));
+  assert.equal(await unknown, null, 'a failed read stays unknown and does not read as absent');
+  broken.wire.close('test complete');
+});
+
+const managedTier = (serviceTier: unknown) => ({ models: { newThread: { serviceTier } } });
+const QUALIFIED_SETTINGS: Array<[string, object, unknown, unknown, string | null]> = [
+  ['agreement', { service_tier: 'priority' }, managedTier('fast'), { status: 'known', tier: 'priority' }, 'default'],
+  ['conflict', { service_tier: 'default' }, managedTier('priority'), { status: 'conflicting' }, null],
+  ['malformed managed speed', { service_tier: 'priority' }, managedTier(7), { status: 'malformed' }, null],
+  ['unsupported managed speed', { service_tier: 'priority' }, managedTier('flex'), { status: 'unsupported' }, null],
+  ['malformed configured speed', { service_tier: 7 }, managedTier('priority'), { status: 'malformed' }, null],
+  ['managed-only priority', {}, managedTier('priority'), { status: 'known', tier: 'priority' }, 'default'],
+  ['malformed models', {}, { models: 'bad' }, { status: 'malformed' }, null],
+  ['malformed new thread policy', {}, { models: { newThread: 'bad' } }, { status: 'malformed' }, null],
+  ['no speed named', {}, null, { status: 'absent' }, 'priority'],
+];
+
+test.each(QUALIFIED_SETTINGS)(
+  'qualified Codex settings reach /fast through the wire: %s',
+  async (_name, config, requirements, evidence, chosen) => {
+    const h = await fastThread();
+    const answer = settingsReplies(h, config, requirements);
+    const applied = h.wire.appliedDefaults('C:/ws', '');
+    answer();
+    const defaults = await applied;
+    assert.equal(defaults.status, 'ready');
+    assert.deepEqual(defaults.serviceTier, evidence);
+    const reading = h.wire.nextServiceTier();
+    answer();
+    assert.deepEqual(await reading, evidence);
+    const { outcome, saved } = await fastToggleOverWire(h, answer);
+    assert.equal(outcome.outcome, chosen ? 'changed' : 'refused');
+    assert.deepEqual(saved, chosen ? [chosen] : []);
+    h.wire.close('test complete');
+  },
+);
 
 test('native speed settings stay distinct and retain managed defaults', () => {
   const read = (config: unknown, requirements: unknown = null) =>

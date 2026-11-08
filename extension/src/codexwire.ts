@@ -791,10 +791,11 @@ export class CodexWire {
     if (model) this.effectiveModel = model;
   }
 
-  // Reads the speed the next turn uses when the session names none. A control read starts no turn.
+  // Reads the speed the next turn uses when the session names none. A control read starts no turn. A thread reply that
+  // names a speed answers even when Arc cannot read that speed, and only a reply without a speed reads the configuration.
   async nextServiceTier(): Promise<ServiceTierEvidence | null> {
     if (this.serviceTier !== undefined) return { status: 'known', tier: this.serviceTier };
-    if (this.tierReadingQualified && this.appliedTier?.status === 'known') return this.appliedTier;
+    if (this.tierReadingQualified && this.appliedTier && this.appliedTier.status !== 'absent') return this.appliedTier;
     return (await this.appliedDefaults(this.cwd, '')).serviceTier ?? null;
   }
 
