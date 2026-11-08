@@ -2554,6 +2554,289 @@ test('a query that only a suggestion row completes counts as a committed query',
   }
 });
 
+// Query terms draw over the input at rest, and focus takes the terms away and gives back the input.
+test('blur shows query terms, and focus returns the same input with its caret', { timeout: 60_000 }, async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('no installed browser');
+    return;
+  }
+  try {
+    const page = await browser.newPage();
+    await openPage(page, payload(), FIXTURE_CLOCK, { railWidth: 480 });
+    const box = page.locator('.railfilter');
+    await box.fill('is:running -is:archived -is:agentrun -label:bug');
+    await page.evaluate(
+      `(() => { window.__filterInput = document.querySelector('.railfilter'); window.__filterInput.setSelectionRange(4, 4); })()`,
+    );
+    await box.blur();
+    await page.locator('.railterms').waitFor();
+    assert.deepEqual(await page.locator('.railterm:not(.railtermmore) .railtermtext').allTextContents(), [
+      CARD_ACTIONS.railNarrowToValues.running,
+      'not bug',
+    ]);
+    await box.focus();
+    await page.locator('.railterms').waitFor({ state: 'detached' });
+    assert.deepEqual(
+      await page.evaluate(`(() => {
+        const input = document.querySelector('.railfilter');
+        return {
+          same: input === window.__filterInput,
+          focused: document.activeElement === input,
+          caret: input.selectionStart,
+          role: input.getAttribute('role'),
+          controls: input.getAttribute('aria-controls'),
+        };
+      })()`),
+      { same: true, focused: true, caret: 4, role: 'combobox', controls: 'filterpop' },
+    );
+  } finally {
+    await browser.close();
+  }
+});
+
+test('a keyboard removal drops only its term and moves focus by the contract', { timeout: 60_000 }, async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('no installed browser');
+    return;
+  }
+  try {
+    const page = await browser.newPage();
+    await openPage(page, payload(), FIXTURE_CLOCK, { railWidth: 480 });
+    const box = page.locator('.railfilter');
+    await box.fill('label:one is:running -is:archived -is:agentrun label:two label:three');
+    await box.blur();
+    const held = () => page.evaluate(`document.activeElement.dataset.control`);
+    const queryIs = (value: string) =>
+      page.waitForFunction(`document.querySelector('.railfilter').value === ${JSON.stringify(value)}`);
+    await page.locator('[data-control="railterm-remove:0"]').focus();
+    await page.keyboard.press('ArrowRight');
+    assert.equal(await held(), 'railterm-remove:1');
+    await page.keyboard.press('Delete');
+    await queryIs('label:one label:two label:three');
+    assert.equal(await held(), 'railterm-remove:1', 'focus did not move to the next term');
+    await page.keyboard.press('Enter');
+    await queryIs('label:one label:three');
+    assert.equal(await held(), 'railterm-remove:1', 'focus did not move to the next term');
+    await page.keyboard.press('Space');
+    await queryIs('label:one');
+    assert.equal(await held(), 'railterm-remove:0', 'focus did not move to the previous term');
+    await page.keyboard.press('Delete');
+    await queryIs('');
+    await page.locator('.railterms').waitFor({ state: 'detached' });
+    assert.equal(
+      await page.evaluate(`document.activeElement === document.querySelector('.railfilter')`),
+      true,
+      'focus did not return to the input after the last term',
+    );
+  } finally {
+    await browser.close();
+  }
+});
+
+test('the more button unfolds the terms in place, and blur folds them', { timeout: 60_000 }, async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('no installed browser');
+    return;
+  }
+  try {
+    const page = await browser.newPage();
+    await openPage(page, payload(), FIXTURE_CLOCK);
+    const box = page.locator('.railfilter');
+    await box.fill('is:running -is:archived -is:agentrun label:composer label:another label:third');
+    await box.blur();
+    await page.waitForFunction(`document.querySelector('.railterm.folded:not(.railtermmore)') !== null`);
+    const more = page.locator('[data-control="railterm-more"]');
+    assert.match((await more.textContent()) ?? '', /^\+\d+$/);
+    assert.equal(await more.getAttribute('aria-expanded'), 'false');
+    const railTop = `parseFloat(document.getElementById('rail').style.getPropertyValue('--rail-top'))`;
+    await page.waitForFunction(`${railTop} > 0`);
+    const restingTop = (await page.evaluate(railTop)) as number;
+    await more.click();
+    await page.waitForFunction(`document.querySelector('.railterm.folded') === null`);
+    assert.equal(await more.getAttribute('aria-expanded'), 'true');
+    await page.waitForFunction(`${railTop} > ${restingTop}`);
+    await page.locator('[data-control="railterm-remove:0"]').focus();
+    const stops: unknown[] = [await page.evaluate(`document.activeElement.dataset.control`)];
+    for (let step = 0; step < 3; step++) {
+      await page.keyboard.press('ArrowRight');
+      stops.push(await page.evaluate(`document.activeElement.dataset.control`));
+    }
+    assert.deepEqual(
+      stops,
+      [0, 1, 2, 3].map((at) => `railterm-remove:${at}`),
+    );
+    await page.keyboard.press('Escape');
+    await page.waitForFunction(
+      `document.activeElement.dataset.control === 'railterm-more' && document.activeElement.getAttribute('aria-expanded') === 'false'`,
+    );
+    await page.waitForFunction(`${railTop} <= ${restingTop}`);
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(`document.querySelector('.railterm.folded') === null`);
+    await page.locator('[data-control="railfilters"]').focus();
+    await page.waitForFunction(`document.querySelector('.railterm.folded:not(.railtermmore)') !== null`);
+    assert.equal(await more.getAttribute('aria-expanded'), 'false');
+    assert.equal(
+      await box.inputValue(),
+      'is:running -is:archived -is:agentrun label:composer label:another label:third',
+    );
+  } finally {
+    await browser.close();
+  }
+});
+
+test('the more button passes focus on when every term comes to fit', { timeout: 60_000 }, async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('no installed browser');
+    return;
+  }
+  try {
+    const cases = [
+      { query: 'label:composer label:another label:third label:fourth', survivor: 'railterm-remove:3' },
+      { query: 'find:alphabetical find:betamaxxing find:gammaradiation find:deltawaves', survivor: null },
+    ];
+    for (const current of cases) {
+      const page = await browser.newPage();
+      await openPage(page, payload(), FIXTURE_CLOCK);
+      const box = page.locator('.railfilter');
+      await box.fill(current.query);
+      await box.blur();
+      const more = page.locator('[data-control="railterm-more"]');
+      await more.waitFor({ state: 'visible' });
+      await more.focus();
+      await page.evaluate(`document.getElementById('rail').style.flexBasis = '900px'`);
+      await page.waitForFunction(
+        current.survivor === null
+          ? `document.activeElement === document.querySelector('.railfilter')`
+          : `document.activeElement.dataset.control === ${JSON.stringify(current.survivor)}`,
+      );
+      assert.equal(await more.isVisible(), false, 'the more button still draws');
+      await page.close();
+    }
+  } finally {
+    await browser.close();
+  }
+});
+
+test(
+  'a press on plain text or the empty part of the term row focuses the input where its caret was',
+  { timeout: 60_000 },
+  async (t) => {
+    const browser = await browserOrNone();
+    if (!browser) {
+      t.skip('no installed browser');
+      return;
+    }
+    try {
+      const page = await browser.newPage();
+      await openPage(page, payload(), FIXTURE_CLOCK, { railWidth: 480 });
+      const box = page.locator('.railfilter');
+      await box.fill('find:alpha find:beta');
+      await page.evaluate(`document.querySelector('.railfilter').setSelectionRange(2, 2)`);
+      const held = () =>
+        page.evaluate(`(() => {
+        const input = document.querySelector('.railfilter');
+        return { focused: document.activeElement === input, caret: input.selectionStart };
+      })()`);
+      await box.blur();
+      const plain = page.locator('.railterm.plain').first();
+      await plain.waitFor();
+      await plain.click({ force: true });
+      await page.locator('.railterms').waitFor({ state: 'detached' });
+      assert.deepEqual(await held(), { focused: true, caret: 2 });
+      await box.blur();
+      await page.locator('.railterms').waitFor();
+      const row = await page.locator('.railterms').boundingBox();
+      assert.ok(row, 'the term row has no box');
+      await page.mouse.click(row.x + row.width * 0.7, row.y + row.height / 2);
+      await page.locator('.railterms').waitFor({ state: 'detached' });
+      assert.deepEqual(await held(), { focused: true, caret: 2 });
+    } finally {
+      await browser.close();
+    }
+  },
+);
+
+test('Backspace removes a query term on macOS and leaves it elsewhere', { timeout: 60_000 }, async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('no installed browser');
+    return;
+  }
+  try {
+    // Elsewhere the Delete after Backspace removes the first term, so a Backspace that removed one leaves an empty query.
+    const cases = [
+      { platform: 'MacIntel', keys: ['Backspace'] },
+      { platform: 'Win32', keys: ['Backspace', 'Delete'] },
+      { platform: 'Linux x86_64', keys: ['Backspace', 'Delete'] },
+    ];
+    for (const current of cases) {
+      const page = await browser.newPage();
+      await page.evaluate(`Object.defineProperty(navigator, 'platform', {
+        configurable: true, value: ${JSON.stringify(current.platform)}
+      })`);
+      await openPage(page, payload(), FIXTURE_CLOCK, { railWidth: 480 });
+      const box = page.locator('.railfilter');
+      await box.fill('label:one label:two');
+      await box.blur();
+      await page.locator('[data-control="railterm-remove:0"]').focus();
+      for (const key of current.keys) {
+        await page.keyboard.press(key);
+      }
+      await page.waitForFunction(`document.querySelector('.railfilter').value === 'label:two'`);
+      assert.equal(await box.inputValue(), 'label:two', current.platform);
+      await page.close();
+    }
+  } finally {
+    await browser.close();
+  }
+});
+
+test('the terms follow the window focus while the input stays the active element', { timeout: 60_000 }, async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('no installed browser');
+    return;
+  }
+  try {
+    const page = await browser.newPage();
+    await openPage(page, payload(), FIXTURE_CLOCK);
+    await page.locator('.railfilter').fill('label:one label:two');
+    await page.evaluate(`(() => { document.hasFocus = () => false; window.dispatchEvent(new Event('blur')); })()`);
+    await page.locator('.railterms').waitFor();
+    assert.equal(await page.evaluate(`document.activeElement === document.querySelector('.railfilter')`), true);
+    await page.evaluate(`(() => { document.hasFocus = () => true; window.dispatchEvent(new Event('focus')); })()`);
+    await page.locator('.railterms').waitFor({ state: 'detached' });
+  } finally {
+    await browser.close();
+  }
+});
+
+test('removing a query term counts as a view choice in the panel usage metrics', { timeout: 60_000 }, async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('no installed browser');
+    return;
+  }
+  try {
+    const page = await browser.newPage();
+    await openPage(page, payload(), FIXTURE_CLOCK, { usageMetrics: true, railFilter: '', railWidth: 480 });
+    await page.locator('[data-control="railsearch"]').click();
+    const box = page.locator('.railfilter');
+    await box.fill('label:one label:two');
+    await box.blur();
+    await page.locator('[data-control="railterm-remove:0"]').click();
+    await page.waitForFunction(`document.querySelector('.railfilter').value === 'label:two'`);
+    const { counts } = await usagePosts(page);
+    assert.equal(counts['view:term-removed'], 1, JSON.stringify(counts));
+  } finally {
+    await browser.close();
+  }
+});
+
 test('a query the host assigns over typed text never counts as a committed query', { timeout: 60_000 }, async (t) => {
   const browser = await browserOrNone();
   if (!browser) {

@@ -158,6 +158,12 @@ export const CARD_ACTIONS = {
   // The same cross over an empty box. The press gives the row back to the count, and the
   // name says so rather than offering to clear a query that has already gone.
   railFilterClose: 'Close the text filter',
+  // The filter box's query terms, drawn while its input does not hold focus.
+  railTermsName: 'Filter terms',
+  railTermRemove: 'Remove',
+  railTermNot: 'not',
+  railTermMoreOne: 'more term in the filter',
+  railTermMoreMany: 'more terms in the filter',
   // The button that hands the rail head row to the text box.
   railSearch: 'Filter sessions by text',
   railSearchHint: 'Filter by text',

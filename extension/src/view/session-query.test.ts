@@ -9,8 +9,29 @@ import {
   labelSuggestions,
   RAIL_MENU_LABEL_FOLD,
   railMenuLabelChips,
+  railQueryTerms,
+  railTermFold,
+  type RailQueryTerm,
+  type RailTermWords,
   whereNote,
+  withoutRailQueryTerm,
 } from './session-query.ts';
+import { RAIL_ACTIVE_WINDOWS, railActiveWindow, railLensWords } from '../domain/rail-filters.ts';
+import { activeWindowValue } from '../domain/session-query.ts';
+
+const TERM_WORDS: RailTermWords = {
+  lens: { running: 'Running', active: 'Active', unread: 'Unread', input: 'Needs input' },
+  windowPhrase: (window) => `within ${activeWindowValue(window)}`,
+  not: 'not',
+};
+
+function termShape(term: RailQueryTerm): [string, string | null, boolean] {
+  return [term.text, term.detail, term.removable];
+}
+
+function shapes(query: string): [string, string | null, boolean][] {
+  return railQueryTerms(query, TERM_WORDS).map(termShape);
+}
 
 test('label suggestions rank exact and prefix matches before substring matches', () => {
   const counts = [
@@ -120,4 +141,90 @@ test('an invalid cache-expiry value receives one stable correction', () => {
   );
   assert.equal(cacheExpiryNote('cache-expiry:>0'), null);
   assert.equal(cacheExpiryNote(''), null);
+});
+
+test('a held Active lens is one term at every window and hides the words it carries', () => {
+  for (const choice of RAIL_ACTIVE_WINDOWS) {
+    const window = railActiveWindow(choice);
+    const query = railLensWords('active', window);
+    const [term, ...rest] = railQueryTerms(query, TERM_WORDS);
+    assert.deepEqual(rest, []);
+    assert.deepEqual(termShape(term), ['Active', activeWindowValue(window), true]);
+    assert.equal(term.name, `Active within ${activeWindowValue(window)}`);
+    assert.equal(withoutRailQueryTerm(query, term), '');
+  }
+});
+
+test('a held Running lens is one term placed at its first word, even with its words spread apart', () => {
+  const query = 'label:a is:running label:b -is:archived label:c -is:agentrun';
+  const terms = railQueryTerms(query, TERM_WORDS);
+  assert.deepEqual(terms.map(termShape), [
+    ['a', null, true],
+    ['Running', null, true],
+    ['b', null, true],
+    ['c', null, true],
+  ]);
+  assert.equal(terms[1].name, 'Running');
+  assert.equal(withoutRailQueryTerm(query, terms[1]), 'label:a label:b label:c');
+});
+
+test('labels show their names, negated terms read not, and a quoted value loses its quotes', () => {
+  assert.deepEqual(shapes('label:composer -label:bug label:"release 0.4"'), [
+    ['composer', null, true],
+    ['not bug', null, true],
+    ['release 0.4', null, true],
+  ]);
+  const [negated] = railQueryTerms('-label:bug -is:running', TERM_WORDS);
+  assert.equal(negated.negated, true);
+  assert.deepEqual(shapes('-is:running'), [['not is:running', null, true]]);
+});
+
+test('every other parsed term shows its query text, and an OR group is one term', () => {
+  assert.deepEqual(shapes('agent:codex cost:>5 active:6h session:a OR session:b OR session:c fix'), [
+    ['agent:codex', null, true],
+    ['cost:>5', null, true],
+    ['active:6h', null, true],
+    ['session:a OR session:b OR session:c', null, true],
+    ['fix', null, true],
+  ]);
+});
+
+test('find text, what follows it, and words the parser does not read show plain with no remove', () => {
+  assert.deepEqual(shapes('label:a in:prompt is:bogus find: two words label:b'), [
+    ['a', null, true],
+    ['in:prompt', null, false],
+    ['is:bogus', null, false],
+    ['find:', null, false],
+    ['two', null, false],
+    ['words', null, false],
+    ['b', null, true],
+  ]);
+});
+
+test('removing a term leaves every other word in place, spelled as the reader wrote it', () => {
+  const query = 'label:"a b"   session:x OR session:y   is:running -is:archived -is:agentrun cost:>5';
+  const written = (at: number) => withoutRailQueryTerm(query, railQueryTerms(query, TERM_WORDS)[at]);
+  assert.equal(written(0), 'session:x OR session:y is:running -is:archived -is:agentrun cost:>5');
+  assert.equal(written(1), 'label:"a b" is:running -is:archived -is:agentrun cost:>5');
+  assert.equal(written(2), 'label:"a b" session:x OR session:y cost:>5');
+  assert.equal(written(3), 'label:"a b" session:x OR session:y is:running -is:archived -is:agentrun');
+});
+
+test('an Active word at another window stays beside the lens term it does not belong to', () => {
+  const query = 'active:6h is:active -is:archived -is:agentrun';
+  const terms = railQueryTerms(query, TERM_WORDS);
+  assert.deepEqual(terms.map(termShape), [
+    ['Active', '6h', true],
+    ['is:active', null, true],
+  ]);
+  assert.equal(withoutRailQueryTerm(query, terms[0]), 'is:active');
+});
+
+test('the fold keeps what fits, counts every hidden term, and always shows the first term', () => {
+  assert.deepEqual(railTermFold([], 100, 4, 20), { shown: 0, more: 0 });
+  assert.deepEqual(railTermFold([30, 30, 30], 98, 4, 20), { shown: 3, more: 0 });
+  assert.deepEqual(railTermFold([30, 30, 30], 97, 4, 20), { shown: 2, more: 1 });
+  assert.deepEqual(railTermFold([30, 30, 30, 30], 50, 4, 20), { shown: 1, more: 3 });
+  // A first term wider than the room still shows, because a line of `+N` alone names nothing.
+  assert.deepEqual(railTermFold([200, 30], 100, 4, 20), { shown: 1, more: 1 });
 });

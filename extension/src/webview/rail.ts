@@ -34,7 +34,12 @@ import {
   labelFilterToken,
   labelSuggestions,
   railMenuLabelChips,
+  railQueryTerms,
+  railTermFold,
+  withoutRailQueryTerm,
   type LabelSuggestionCount,
+  type RailQueryTerm,
+  type RailTermWords,
 } from '../view/session-query.ts';
 import {
   DEFAULT_RAIL_QUICK_FILTERS,
@@ -102,6 +107,7 @@ import {
   type RailGroupBy,
   type RailCountButton,
   type RailCountKind,
+  railActiveWindowPhrase,
   type RailCountWords,
   type RailCounts,
   type RailCountsOptions,
@@ -198,6 +204,11 @@ interface RailWords extends SessionRenameWords, RailHoverWords {
   railFilterHint: string;
   railFilterClear: string;
   railFilterClose: string;
+  railTermsName: string;
+  railTermRemove: string;
+  railTermNot: string;
+  railTermMoreOne: string;
+  railTermMoreMany: string;
   railSearch: string;
   railSearchHint: string;
   railCountActive: string;
@@ -1780,6 +1791,15 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
   // Count presses preserve this state. The panel does not save it.
   let filterRowOpen = false;
   let filterInput: HTMLInputElement | null = null;
+  // The query terms over the filter box: their row, how many fit on one line, whether the reader
+  // unfolded them, the buttons drawn in Tab order, and the one that holds the row's Tab stop.
+  let railTermRowNode: HTMLElement | null = null;
+  let railTermCount = Number.POSITIVE_INFINITY;
+  let railTermsUnfolded = false;
+  let railTermStops: (number | 'more')[] = [];
+  let railTermStop: number | 'more' = 0;
+  let railTermBox: Element | null = null;
+  let railTermFrame: number | null = null;
   let railNew: HTMLButtonElement | null = null;
   let railNewMenu: HTMLButtonElement | null = null;
   let labelInput: HTMLInputElement | null = null;
@@ -1891,6 +1911,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     if (query !== filter) {
       railKept = null;
       filteredFolds.clear();
+      railTermsUnfolded = false;
     }
     filter = query;
   };
@@ -2461,6 +2482,223 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
 
   // The action row opens its box for search or saved-view naming.
   const boxOpen = (): boolean => filterRowOpen || Boolean(naming);
+  const railTermWords: RailTermWords = {
+    lens: {
+      running: railCountWords.running,
+      active: railCountWords.active,
+      unread: railCountWords.unread,
+      input: railCountWords.input,
+    },
+    windowPhrase: (window) => railActiveWindowPhrase(window, railCountWords),
+    not: options.words.railTermNot,
+  };
+  // The query terms draw while the box is open and its input does not hold focus. Naming a view
+  // takes the input for the name. An input stays the active element after its window loses focus,
+  // so the window's focus counts too.
+  const railTermsDrawn = (): RailQueryTerm[] =>
+    boxOpen() && !naming && (document.activeElement !== filterInput || !document.hasFocus())
+      ? railQueryTerms(filter, railTermWords)
+      : [];
+  // Focus events can fire while a draw removes the focused element, so the redraw waits for that draw to end.
+  const redrawHeadSoon = () => queueMicrotask(() => drawTop(undefined, true));
+  const railTermControl = (stop: number | 'more'): string =>
+    stop === 'more' ? 'railterm-more' : `railterm-remove:${stop}`;
+  const focusRailTermStop = (stop: number | 'more') => found(topMount, railTermControl(stop))?.focus();
+  // One measure per head draw. A change of fit draws the head once more, and that draw measures the same fit.
+  const measureRailTerms = () => {
+    const row = railTermRowNode;
+    if (!row || railTermsUnfolded) {
+      return;
+    }
+    const style = getComputedStyle(row);
+    const room = row.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+    const more = row.querySelector('.railtermmore');
+    const terms = [...row.querySelectorAll('.railterm:not(.railtermmore)')];
+    const fold = railTermFold(
+      terms.map((term) => term.getBoundingClientRect().width),
+      room,
+      parseFloat(style.columnGap) || 0,
+      more ? more.getBoundingClientRect().width : 0,
+    );
+    if (fold.shown === Math.min(railTermCount, terms.length)) {
+      return;
+    }
+    const held = document.activeElement instanceof HTMLElement ? document.activeElement.dataset.control : undefined;
+    const heldTerm = held?.startsWith('railterm-remove:') ? Number(held.slice('railterm-remove:'.length)) : -1;
+    railTermCount = fold.shown;
+    drawTop(undefined, true);
+    if (heldTerm >= fold.shown) {
+      focusRailTermStop('more');
+    } else if (held === 'railterm-more' && !railTermStops.includes('more')) {
+      // The more button hid under the focus, so focus moves to a control that is still drawn.
+      const survivor = railTermStops.at(-1);
+      if (survivor === undefined) {
+        filterInput?.focus();
+      } else {
+        focusRailTermStop(survivor);
+      }
+    }
+  };
+  // Measures the box when its size changes, after the frame so a redraw never lands inside the observer.
+  const railTermWatch =
+    typeof ResizeObserver === 'function'
+      ? new ResizeObserver(() => {
+          if (railTermFrame === null) {
+            railTermFrame = requestAnimationFrame(() => {
+              railTermFrame = null;
+              measureRailTerms();
+            });
+          }
+        })
+      : null;
+  const removeRailTerm = (index: number) => {
+    const term = railQueryTerms(filter, railTermWords)[index];
+    if (!term?.removable) {
+      return;
+    }
+    options.usageMetrics?.count('view:term-removed');
+    setLiveRailFilter({ ...liveRailFilter(), query: withoutRailQueryTerm(filter, term) }, railFilterId);
+    // The removed term's index now names the term after it.
+    const next = railTermStops.find((stop) => stop === 'more' || stop >= index);
+    const previous = [...railTermStops].reverse().find((stop) => stop !== 'more' && stop < index);
+    const target = next ?? previous;
+    if (target === undefined) {
+      filterInput?.focus();
+      return;
+    }
+    focusRailTermStop(target);
+  };
+  const foldRailTerms = () => {
+    railTermsUnfolded = false;
+    drawTop(undefined, true);
+  };
+  const railTermKeydown = (event: KeyboardEvent) => {
+    const control = (event.target as HTMLElement).dataset?.control ?? '';
+    const stop: number | 'more' =
+      control === 'railterm-more' ? 'more' : Number(control.slice('railterm-remove:'.length));
+    const at = railTermStops.indexOf(stop);
+    if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+      event.preventDefault();
+      event.stopPropagation();
+      const move = railTermStops[at + (event.key === 'ArrowRight' ? 1 : -1)];
+      if (move !== undefined) {
+        focusRailTermStop(move);
+      }
+      return;
+    }
+    if (event.key === 'Escape') {
+      if (railTermsUnfolded) {
+        event.preventDefault();
+        event.stopPropagation();
+        foldRailTerms();
+        focusRailTermStop('more');
+      }
+      return;
+    }
+    const removes = event.key === 'Delete' || (event.key === 'Backspace' && /^Mac/.test(options.platform));
+    if (removes && stop !== 'more') {
+      event.preventDefault();
+      event.stopPropagation();
+      removeRailTerm(stop);
+    }
+  };
+  // One line of terms over the box. A term that does not fit stays in the row, hidden, so its width
+  // can still be measured, and the more button stays too for the same reason.
+  const railTermRow = (terms: readonly RailQueryTerm[]) => {
+    const folded = terms.length - Math.min(railTermCount, terms.length);
+    const drawn = railTermsUnfolded ? terms.length : terms.length - folded;
+    railTermStops = [
+      ...terms.flatMap((term, at) => (term.removable && at < drawn ? [at] : [])),
+      ...(folded > 0 ? (['more'] as const) : []),
+    ];
+    const roving = railTermStops.includes(railTermStop) ? railTermStop : railTermStops[0];
+    const moreName = `${folded} ${folded === 1 ? options.words.railTermMoreOne : options.words.railTermMoreMany}`;
+    return h(
+      'div',
+      {
+        class: 'railterms',
+        key: 'terms',
+        role: 'group',
+        'aria-label': options.words.railTermsName,
+        ref: (node: HTMLElement | null) => {
+          railTermRowNode = node;
+        },
+        onKeyDown: railTermKeydown,
+        onFocusIn: (event: FocusEvent) => {
+          const control = (event.target as HTMLElement).dataset?.control ?? '';
+          const stop = control === 'railterm-more' ? 'more' : Number(control.slice('railterm-remove:'.length));
+          if (stop !== railTermStop && !Number.isNaN(stop)) {
+            railTermStop = stop;
+            redrawHeadSoon();
+          }
+        },
+        onFocusOut: (event: FocusEvent) => {
+          const next = event.relatedTarget;
+          if (railTermsUnfolded && !(next instanceof Node && (event.currentTarget as HTMLElement).contains(next))) {
+            railTermsUnfolded = false;
+            redrawHeadSoon();
+          }
+        },
+      },
+      [
+        ...terms.map((term, at) =>
+          h(
+            'span',
+            {
+              class: `railterm${term.negated ? ' negated' : ''}${term.removable ? '' : ' plain'}${at < drawn ? '' : ' folded'}`,
+              key: `term:${at}:${term.text}`,
+            },
+            [
+              h(
+                'span',
+                {
+                  class: 'railtermtext',
+                  key: 'text',
+                  // A press on plain text passes through to the input, so it has no hover either.
+                  title: term.removable ? (term.detail ? `${term.text} · ${term.detail}` : term.text) : undefined,
+                },
+                inlineText([term.text, term.detail], ' · '),
+              ),
+              term.removable
+                ? h(
+                    'button',
+                    {
+                      class: 'railtermremove',
+                      type: 'button',
+                      key: 'remove',
+                      tabIndex: roving === at ? 0 : -1,
+                      'data-control': railTermControl(at),
+                      'aria-label': `${options.words.railTermRemove} ${term.name}`,
+                      'data-hint': `${options.words.railTermRemove} ${term.name}`,
+                      onClick: () => removeRailTerm(at),
+                    },
+                    options.cross,
+                  )
+                : null,
+            ],
+          ),
+        ),
+        h(
+          'button',
+          {
+            class: `railterm railtermmore${folded > 0 ? '' : ' folded'}`,
+            type: 'button',
+            key: 'more',
+            tabIndex: roving === 'more' ? 0 : -1,
+            'data-control': railTermControl('more'),
+            'aria-expanded': String(railTermsUnfolded),
+            'aria-label': moreName,
+            'data-hint': moreName,
+            onClick: () => {
+              railTermsUnfolded = !railTermsUnfolded;
+              drawTop(undefined, true);
+            },
+          },
+          `+${folded}`,
+        ),
+      ],
+    );
+  };
   // The count presentation stays until ordinary input's frame draws fresh figures.
   // Naming holds this presentation while the box takes the name.
   let drawnCountButtons: RailCountButton[] = [];
@@ -2490,6 +2728,8 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     // Invalid cache-expiry values have a separate note and DOM id from invalid cost values.
     const invalidCacheExpiry = naming ? null : cacheExpiryNote(filter);
     const open = boxOpen();
+    const railTerms = railTermsDrawn();
+    railTermStops = [];
     // Active reads current cache information within the query and shown buckets.
     // Naming holds the last drawn buttons, counts and cache information.
     if ((!naming && !keepCounts) || drawnCounts === null) {
@@ -2600,8 +2840,14 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
             open
               ? h(
                   'div',
-                  { class: 'railfilterbox', key: 'box' },
+                  {
+                    class: `railfilterbox${railTerms.length ? ' terms' : ''}${railTerms.length && railTermsUnfolded ? ' unfolded' : ''}`,
+                    key: 'box',
+                  },
+                  railTerms.length ? railTermRow(railTerms) : null,
+                  // The input stays mounted under the terms, so its element, caret, and combobox state survive focus.
                   h('input', {
+                    key: 'input',
                     type: 'text',
                     class: 'railfilter',
                     defaultValue: filter,
@@ -2681,10 +2927,25 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
                         return;
                       }
                     },
-                    onFocus: drawFilterPop,
+                    // A press on the empty part of the term row lands here and leaves the caret where it was.
+                    onMouseDown: (event: MouseEvent) => {
+                      if (railTermRowNode) {
+                        event.preventDefault();
+                        (event.currentTarget as HTMLInputElement).focus();
+                      }
+                    },
+                    onFocus: () => {
+                      if (railTermRowNode) {
+                        redrawHeadSoon();
+                      }
+                      drawFilterPop();
+                    },
                     onBlur: () => {
                       countTypedQuery();
                       filterShutOn = null;
+                      if (filter && !naming) {
+                        redrawHeadSoon();
+                      }
                       drawFilterPop();
                     },
                     onKeyUp: drawFilterPop,
@@ -2892,6 +3153,15 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     if (focusedCount && !focusedCount.isConnected) {
       restoreRailCountFocus();
     }
+    const box = filterInput?.parentElement ?? null;
+    if (box !== railTermBox) {
+      railTermWatch?.disconnect();
+      if (box) {
+        railTermWatch?.observe(box);
+      }
+      railTermBox = box;
+    }
+    measureRailTerms();
     if (railWindowOpen && !drawnCountButtons.some((each) => each.kind === 'active')) {
       const held = railWindowPop.contains(document.activeElement);
       railWindowOpen = false;
@@ -4774,6 +5044,13 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     labelArm = { session, node, at: Date.now() };
   });
   options.events.window('resize', () => owner.place());
+  const redrawTermsWithWindow = () => {
+    if (filter && !naming && document.activeElement === filterInput) {
+      redrawHeadSoon();
+    }
+  };
+  options.events.window('blur', redrawTermsWithWindow);
+  options.events.window('focus', redrawTermsWithWindow);
 
   if (typeof ResizeObserver === 'function') {
     // Measure the full header, including Project cost, for sticky group offsets and keyboard scroll padding.

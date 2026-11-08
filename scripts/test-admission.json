@@ -161,8 +161,8 @@
   },
   "extension/src/rail.filter.browser.test.ts": {
     "reason": "Session filters must update the rendered list through native input and keyboard events.",
-    "cases": 38,
-    "matricesSha256": "5fe1ae77b8facc27b2dc9e899ee811e722f6431cf7bd0ec7facebe6164aad796"
+    "cases": 46,
+    "matricesSha256": "38a6cb833b1de9a1a053f3422e74683f39344843c6f89fec2e367c4c07a6b7e3"
   },
   "extension/src/rail.rows.browser.test.ts": {
     "reason": "Session rows must preserve selection, context actions, and browser focus.",

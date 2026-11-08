@@ -16,6 +16,7 @@ import {
   sameQueryTerms,
   type ActiveWindow,
   type FilterTerm,
+  type QueryToken,
 } from './session-query.ts';
 import { cleanName } from './text.ts';
 import { VIEW_NAME_LIMIT, VIEW_QUERY_LIMIT } from './views.ts';
@@ -364,28 +365,40 @@ function withoutWords(query: string, drop: ReadonlySet<string | null>): string {
     .join(' ');
 }
 
-// The query without the words of the one lens it holds whole. A query that holds no lens, or
-// two lenses whole, comes back as it was. An Active word at a window other than the lens's
-// window stays, so `is:active` beside `active:6h` still keeps only the last hour.
-export function withoutRailLenses(query: string): string {
+// The words that make up the one lens the query holds whole, wherever they stand. An Active word
+// at a window other than the lens's window is not one of them, so `is:active` beside `active:6h`
+// stays and still keeps only the last hour. A query that holds no lens, or two whole, has none.
+export function railHeldLensTokens(query: string): QueryToken[] {
   const held = railQueryHeldLens(query);
   if (held === null) {
+    return [];
+  }
+  const lensKeys = new Set(railLensKeys(held));
+  const lensWindow = held === 'active' ? railQueryActiveWindow(query) : null;
+  return queryTokens(query).filter((token) => {
+    const text = query.slice(token.start, token.end);
+    const key = termKey(text);
+    if (key === null || !lensKeys.has(key)) {
+      return false;
+    }
+    if (key !== ACTIVE_WINDOW_KEY || lensWindow === null) {
+      return true;
+    }
+    const window = termActiveWindow(parseSessionQuery(text).terms[0]);
+    return window === null || activeWindowValue(window) === activeWindowValue(lensWindow);
+  });
+}
+
+// The query without the words of the one lens it holds whole. A query that holds no lens, or
+// two lenses whole, comes back as it was.
+export function withoutRailLenses(query: string): string {
+  if (railQueryHeldLens(query) === null) {
     return query;
   }
-  const drop = new Set(railLensKeys(held));
-  const lensWindow = held === 'active' ? railQueryActiveWindow(query) : null;
-  return queryWords(query)
-    .filter((word) => {
-      if (word.key === null || !drop.has(word.key)) {
-        return true;
-      }
-      if (word.key !== ACTIVE_WINDOW_KEY || lensWindow === null) {
-        return false;
-      }
-      const window = termActiveWindow(parseSessionQuery(word.text).terms[0]);
-      return window !== null && activeWindowValue(window) !== activeWindowValue(lensWindow);
-    })
-    .map((word) => word.text)
+  const lensWords = new Set(railHeldLensTokens(query).map((token) => token.start));
+  return queryTokens(query)
+    .filter((token) => !lensWords.has(token.start))
+    .map((token) => query.slice(token.start, token.end))
     .join(' ');
 }
 

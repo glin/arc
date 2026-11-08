@@ -286,6 +286,120 @@ body {
 .railfilterbox .railfilter {
   padding-right: 4.3em;
 }
+/* While the input does not hold focus the query's terms stand over it. The input keeps its box
+   and its text, drawn clear, so it stays mounted and its caret holds. The row lets a press through
+   its empty part to the input. */
+.railfilterbox.terms .railfilter {
+  color: transparent;
+}
+/* Forced colors replaces the color above, so the input opts out and names system colors itself. */
+@media (forced-colors: active) {
+  .railfilterbox.terms .railfilter {
+    forced-color-adjust: none;
+    background: Canvas;
+    border-color: CanvasText;
+  }
+}
+.railterms {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  box-sizing: border-box;
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 0.25em;
+  padding: 0 3.87em 0 0.2em;
+  overflow: hidden;
+  pointer-events: none;
+}
+/* An unfolded line grows the box. The input fills what the terms take, so a press on the empty
+   part still reaches it. */
+.railfilterbox.unfolded .railfilter {
+  position: absolute;
+  inset: 0;
+  height: 100%;
+}
+.railfilterbox.unfolded .railterms {
+  position: relative;
+  inset: auto;
+  flex-wrap: wrap;
+  overflow: visible;
+  padding-top: 0.2em;
+  padding-bottom: 0.2em;
+}
+.railterm {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  box-sizing: border-box;
+  min-width: 0;
+  max-width: calc(100% - 3em);
+  padding: 0 0.15em 0 0.4em;
+  border: 1px solid var(--vscode-focusBorder);
+  border-radius: 7px;
+  font-size: 0.9em;
+  line-height: 1.23;
+  color: var(--vscode-foreground);
+  background: var(--chipbg);
+  white-space: nowrap;
+  pointer-events: auto;
+}
+.railfilterbox.unfolded .railterm {
+  max-width: 100%;
+}
+.railterm.negated {
+  border-style: dashed;
+}
+.railterm.plain {
+  padding-right: 0.4em;
+  pointer-events: none;
+  border-color: transparent;
+  background: transparent;
+  color: var(--idle);
+}
+/* A term that does not fit keeps its width, for the measure, and leaves the line and the tab order. */
+.railterm.folded {
+  position: absolute;
+  visibility: hidden;
+}
+.railtermtext {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+button.railtermremove {
+  flex: none;
+  width: 1.25em;
+  height: 1.25em;
+  margin: 0 0 0 0.15em;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--idle);
+  font: inherit;
+  line-height: 1;
+  cursor: pointer;
+}
+button.railtermremove:hover {
+  color: var(--vscode-foreground);
+}
+button.railtermremove:focus-visible,
+button.railtermmore:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 0;
+}
+button.railtermmore {
+  padding: 0 0.4em;
+  border-color: var(--edge);
+  background: transparent;
+  color: var(--idle);
+  font-family: inherit;
+  cursor: pointer;
+}
+button.railtermmore:hover {
+  color: var(--vscode-foreground);
+}
 /* The rail head's region: the action row, any notes and the save-view offer under the box, then
    the filter buttons on their own row. */
 .railfilterrow {

@@ -97,6 +97,7 @@ export interface Shot {
   details?: boolean; // Open session details through a host message.
   rename?: 'heading' | 'rail'; // Open Rename session from the first session heading or session list card.
   filter?: string; // Text to type into the session list filter box.
+  railQuery?: string; // Query to fill into the session list filter box, then blur so its terms draw.
   railCount?: 'active'; // Session list header count to press.
   railLens?: 'unread' | 'input'; // Filter value to select before closing the View menu.
   headCounts?: boolean; // Load sessions that populate Running, Active, Unread, and Needs input counts.
@@ -587,6 +588,15 @@ export const SHOTS: Shot[] = [
     clip: '#rail',
     after: '[data-control="railclear"]',
   },
+  // Capture the query terms over the filter box at wide and default session list widths.
+  ...[480, RAIL_WIDTH_DEFAULT].map((railWidth): Shot => ({
+    name: `rail-head-terms-${railWidth}`,
+    width: 1350,
+    escape: true,
+    railWidth,
+    railQuery: 'active:6h -is:archived -is:agentrun label:composer -label:bug cost:>5',
+    clip: '#rail',
+  })),
   // Capture the session list header at several widths, at rest and with Active selected.
   // The resting fixture populates Running, Active, Unread, and Needs input counts.
   ...[480, 300, 247, 220].flatMap((railWidth): Shot[] => [
@@ -1506,6 +1516,15 @@ export async function shoot(
     // Type into the filter box to move the caret and trigger suggestions for its current word.
     await page.locator('.railfilter').first().click();
     await page.keyboard.type(shot.filter);
+    await page.evaluate(SETTLED);
+  }
+  if (shot.railQuery) {
+    if (!(await page.locator('.railfilter').count())) {
+      await page.locator('[data-control="railsearch"]').click();
+      await page.evaluate(SETTLED);
+    }
+    await page.locator('.railfilter').fill(shot.railQuery);
+    await page.locator('.railfilter').blur();
     await page.evaluate(SETTLED);
   }
   if (shot.raisedComposer) {
