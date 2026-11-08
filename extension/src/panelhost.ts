@@ -1491,7 +1491,7 @@ export class PanelProvider implements vscode.Disposable {
   private readonly progressiveWorker = new ProgressiveWorker(
     undefined,
     () => this.diagnostics.enabled(),
-    (file) => this.repeatedCoverage(file),
+    (file) => this.repeatedCoverage(file, 'worker'),
     (failure) => {
       this.diagnostics.warn('workerFailure', { ...failure });
       this.health?.sample('unknown', false);
@@ -4430,7 +4430,7 @@ export class PanelProvider implements vscode.Disposable {
     );
     // Refresh icon variants when the editor switches between light and dark themes.
     this.disposables.push(vscode.window.onDidChangeActiveColorTheme(() => this.refreshFrom('color-theme', true)));
-    const stopCoverage = onClaudeRepeatedCoverage((file) => this.repeatedCoverage(file));
+    const stopCoverage = onClaudeRepeatedCoverage((file) => this.repeatedCoverage(file, 'host'));
     this.disposables.push({ dispose: stopCoverage });
     // Update permitted webview resource roots when workspace folders change.
     this.disposables.push(vscode.workspace.onDidChangeWorkspaceFolders(() => this.workspaceFoldersChanged()));
@@ -4439,15 +4439,15 @@ export class PanelProvider implements vscode.Disposable {
   // A bounded read skips records the repeated-record map does not reach yet. When the map of the extension
   // host or of the progressive worker reaches the end of a file, drop the search entries and session-list
   // facts read from that file, and draw once. The held facts stay on screen until the new read replaces them.
-  // Coverage changes no membership, so the refresh reuses the held catalog and sends no discovery request of its own. The
-  // worker reads the activity of a covered dispatched member again in its next spend pass, so the member's held facts
-  // expire, and the refresh sends that pass while members stay settled.
-  private repeatedCoverage(file: string): void {
+  // Coverage changes no membership, so the refresh reuses the held catalog and sends no discovery request of its own. When
+  // the worker's map covers a dispatched member, the worker reads its activity again in its next spend pass. The member's
+  // held facts expire, and the refresh sends that pass while members stay settled. The host's own map changes no worker fact.
+  private repeatedCoverage(file: string, source: 'worker' | 'host'): void {
     this.corpus.delete(file);
     const held = this.titles.get(file);
     if (held) this.titles.set(file, { ...held, size: -1 });
     const covered = normalizeFsPath(file);
-    for (const reference of this.claudeChildReferences ?? []) {
+    for (const reference of source === 'worker' ? (this.claudeChildReferences ?? []) : []) {
       if (reference.kind !== 'dispatch' || !reference.file || normalizeFsPath(reference.file) !== covered) continue;
       const facts = this.dispatchFacts.get(reference.sessionId);
       if (facts) this.dispatchFacts.set(reference.sessionId, { ...facts, refreshAt: 0 });
@@ -10019,12 +10019,11 @@ export class PanelProvider implements vscode.Disposable {
           }
           const session = dispatchCatalog.get(reference.sessionId);
           const held = this.dispatchFacts?.get(reference.sessionId);
-          return (
-            !!session &&
-            (!held ||
-              !sameSessionRevision(held.revision, session) ||
-              (held.refreshAt !== null && held.refreshAt <= Date.now()))
-          );
+          const expired = !!held && held.refreshAt !== null && held.refreshAt <= Date.now();
+          // A member whose row prompt admission excludes has no listed revision to compare. Its expired facts still ask for
+          // a spend read.
+          if (!session) return expired;
+          return !held || !sameSessionRevision(held.revision, session) || expired;
         });
       // A held complete reply, such as one a discovery continuation applied, waits for a refresh to accept it. A refresh that
       // reuses the catalog accepts it before it sends another request.

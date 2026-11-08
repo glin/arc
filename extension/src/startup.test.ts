@@ -16345,12 +16345,15 @@ test('an enrichment refresh after a moved file names that file and sends no disc
   }
 });
 
-// Repeated-record coverage of a listed file after discovery completes. Each coverage event used to send a walked discovery
-// request, and the first request after a completed pass opens a new receipt scan of the whole store. A spend-only request
-// opens no receipt scan. A covered dispatched member still reads its activity again in a spend-only pass.
-for (const [subject, member, outcome] of [
-  ['a listed session', false, []],
-  ['a dispatched member', true, ['spend']],
+// Repeated-record coverage of a file after discovery completes. The first walked discovery request after a completed pass
+// opens a new receipt scan of the whole store, and a spend-only request opens none. A dispatched member that the worker's
+// map covers reads its activity again in a spend-only pass, with or without a catalog row. The host's own map leaves the
+// worker's facts as they are, so its coverage sends no spend-only request.
+for (const [subject, source, member, listed, outcome] of [
+  ['a listed session', 'worker', false, true, []],
+  ['a dispatched member', 'worker', true, true, ['spend']],
+  ['a dispatched member whose row prompt admission excludes', 'worker', true, false, ['spend']],
+  ['a dispatched member in the host map', 'host', true, true, []],
 ] as const)
   test(`repeated-record coverage of ${subject} after discovery completes sends no discovery request`, async () => {
     vi.useFakeTimers();
@@ -16367,18 +16370,23 @@ for (const [subject, member, outcome] of [
         await vi.advanceTimersByTimeAsync(1);
       await settle();
       assert.deepEqual(requests, ['discovery', 'spend', 'spend', 'spend']);
-      const file = 'projects/repo/claude-a.jsonl';
+      const file = 'projects/repo/claude-member.jsonl';
       const revision = { size: 10, mtimeMs: 10, dev: 1, ino: 7 };
-      const row = { file, sessionId: 'claude-a', agent: 'claude', activity: 60, ...revision };
-      provider.catalog.sessions = [...provider.catalog.sessions, row];
+      const row = { file, sessionId: 'claude-member', agent: 'claude', activity: 60, ...revision };
       provider.titles.set(file, { ...provider.titles.get(provider.catalog.sessions[0].file), ...row });
+      if (listed) provider.catalog.sessions = [...provider.catalog.sessions, row];
       if (member) {
         provider.claudeChildReferences = [
-          { kind: 'dispatch', sessionId: 'claude-a', file, parentSessionId: 'parent', toolUseIds: [] },
+          { kind: 'dispatch', sessionId: 'claude-member', file, parentSessionId: 'parent', toolUseIds: [] },
         ];
         // Facts read before the map covered the file, at the listed revision, with no expiry.
-        const facts = { ...provider.dispatchFacts.get('codex-root'), sessionId: 'claude-a', revision, refreshAt: null };
-        provider.dispatchFacts.set('claude-a', facts);
+        const facts = {
+          ...provider.dispatchFacts.get('codex-root'),
+          sessionId: 'claude-member',
+          revision,
+          refreshAt: null,
+        };
+        provider.dispatchFacts.set('claude-member', facts);
         // The worker answers the spend pass with the member's facts read again under the covering map.
         const run = provider.progressiveWorker.run;
         provider.progressiveWorker.run = async (
@@ -16393,7 +16401,7 @@ for (const [subject, member, outcome] of [
       }
       provider.corpus ??= new Map();
       const before = { ...counters.snapshot().work };
-      provider.repeatedCoverage(file);
+      provider.repeatedCoverage(file, source);
       await settle();
       const work = counters.snapshot().work;
       const added = (count: string) => (work[count] ?? 0) - (before[count] ?? 0);
