@@ -7,6 +7,7 @@ import type { Page } from 'playwright-core';
 import { browserOrNone, SETTLED } from '../test/browser.ts';
 import { FIXTURE_CLOCK, pageHtml, themed } from './panelfixture.ts';
 import { CARD_ACTIONS } from './turncard.ts';
+import { RAIL_MIN_WIDTH } from './view/rail.ts';
 import {
   ALL_RAIL_FILTER_ID,
   RAIL_ACTIVE_WINDOWS,
@@ -1333,6 +1334,34 @@ test(
   },
 );
 
+// Sessions at these ages in hours, each with no warm cache, pin, or archive.
+function activeWindowPayload(ages: readonly number[]) {
+  const base = payload();
+  base.rail = ages.map((age, n) => ({
+    ...base.rail[n],
+    at: FIXTURE_CLOCK - age * 60 * 60_000,
+    cache: null,
+    pinnedTop: false,
+    agentRun: false,
+    archived: false,
+  }));
+  base.views = [];
+  return base;
+}
+
+async function foldEverySection(page: Page): Promise<void> {
+  for (;;) {
+    const open = page.locator('#rail .railfold[aria-expanded="true"]');
+    if ((await open.count()) === 0) {
+      return;
+    }
+    // By key, because an open box's suggestions lie over the list.
+    await open.first().focus();
+    await page.keyboard.press('Enter');
+    await page.evaluate(SETTLED);
+  }
+}
+
 // A selected lens reads the clock with every session section folded.
 // The tick updates its shortcut and saved-view membership together.
 test(
@@ -1357,16 +1386,7 @@ test(
         views: ['${COMPOSER_VIEW}', '${RELEASE_VIEW}']
           .filter((bucket) => document.querySelector('[data-bucket="' + bucket + '"]')),
       }))()`);
-      for (;;) {
-        const open = page.locator('#rail .railfold[aria-expanded="true"]');
-        if ((await open.count()) === 0) {
-          break;
-        }
-        // By key, because the open box's suggestions lie over the list.
-        await open.first().focus();
-        await page.keyboard.press('Enter');
-        await page.evaluate(SETTLED);
-      }
+      await foldEverySection(page);
       assert.deepEqual(
         await state(),
         { box: 1, counts: 1, cards: 0, views: [COMPOSER_VIEW, RELEASE_VIEW] },
@@ -1937,6 +1957,236 @@ test(
     }
   },
 );
+
+// The caret on Active opens its window menu from the keyboard. A choice writes the window, moves
+// the held lens even when the choice is already the saved window, and returns focus to the caret.
+test('the Active window menu chooses a window from the keyboard', { timeout: 120_000 }, async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('no installed Edge or Chrome, so the Active window menu was not measured');
+    return;
+  }
+  try {
+    const base = activeWindowPayload([0, 2, 5, 8, 13, 20, 40]);
+    const page = await browser.newPage();
+    const failures: string[] = [];
+    page.on('pageerror', (error) => failures.push(String(error)));
+    await openPage(page, base, FIXTURE_CLOCK, {
+      railFilter: 'active:6h -is:archived -is:agentrun',
+      railFilterId: ALL_RAIL_FILTER_ID,
+      railQuickFilters: ['active'],
+      railActiveWindow: '3h',
+    });
+    const caret = page.locator('[data-control="railactivewindow"]');
+    const pop = page.locator('#railactivewindowpop');
+    const focused = async () => await page.evaluate(`document.activeElement?.dataset.control ?? null`);
+    const saved = async () => {
+      const state = (await page.evaluate(
+        `window.__posted.filter((m) => m.type === 'saveState').at(-1).state`,
+      )) as Record<string, unknown>;
+      return [state.railFilter, state.railActiveWindow];
+    };
+    assert.equal(await caret.getAttribute('aria-label'), 'Active window, 6 hours');
+    assert.equal(await caret.getAttribute('aria-expanded'), 'false');
+
+    // The menu checks the held window, not the saved one, and focus lands on the checked row.
+    await caret.focus();
+    await page.keyboard.press('ArrowDown');
+    await page.evaluate(SETTLED);
+    assert.equal(await pop.isVisible(), true, 'Down on the caret did not open the menu');
+    assert.equal(await caret.getAttribute('aria-expanded'), 'true');
+    assert.equal(await focused(), 'railactivewindow:6h', 'focus did not land on the checked row');
+    assert.deepEqual(
+      await page.evaluate(`[...document.querySelectorAll('#railactivewindowpop [role="radio"]')].map((node) => [
+        node.querySelector('.launchname').textContent,
+        node.querySelector('.railcountfig').textContent,
+        node.getAttribute('aria-checked'),
+        node.getAttribute('aria-label'),
+      ])`),
+      [
+        ['1 hour', '1', 'false', '1 hour, 1 session'],
+        ['3 hours', '2', 'false', '3 hours, 2 sessions'],
+        ['6 hours', '3', 'true', '6 hours, 3 sessions'],
+        ['12 hours', '4', 'false', '12 hours, 4 sessions'],
+        ['Today', '5', 'false', 'Today, 5 sessions'],
+        ['2 days', '7', 'false', '2 days, 7 sessions'],
+      ],
+    );
+
+    // Escape closes the menu without a change and returns focus to the caret.
+    await page.keyboard.press('Escape');
+    await page.evaluate(SETTLED);
+    assert.equal(await pop.isVisible(), false, 'Escape left the menu open');
+    assert.equal(await focused(), 'railactivewindow', 'Escape did not return focus to the caret');
+    assert.deepEqual(await saved(), ['active:6h -is:archived -is:agentrun', '3h'], 'Escape changed the window');
+
+    // The saved window still moves a held lens that holds another window.
+    await page.keyboard.press('Enter');
+    await page.evaluate(SETTLED);
+    assert.equal(await focused(), 'railactivewindow:6h');
+    await page.keyboard.press('ArrowUp');
+    assert.equal(await focused(), 'railactivewindow:3h', 'Up did not move to the row above');
+    await page.keyboard.press('Enter');
+    await page.evaluate(SETTLED);
+    assert.equal(await pop.isVisible(), false, 'choosing a row left the menu open');
+    assert.equal(await focused(), 'railactivewindow', 'choosing a row did not return focus to the caret');
+    assert.deepEqual(await saved(), ['active:3h -is:archived -is:agentrun', '3h'], 'the held lens did not move');
+    const button = page.locator('[data-control="railcount:active"]');
+    assert.equal(await button.locator('.railcountfig').textContent(), '2', 'the button did not count the new window');
+    assert.equal(await page.locator('.railcard').count(), 2, 'the list did not follow the new window');
+    assert.equal(await caret.getAttribute('aria-label'), 'Active window, 3 hours');
+
+    // Enter opens the menu, Down moves one row, and Enter saves the new window and moves the held lens.
+    await page.keyboard.press('Enter');
+    await page.evaluate(SETTLED);
+    assert.equal(await focused(), 'railactivewindow:3h');
+    await page.keyboard.press('ArrowDown');
+    assert.equal(await focused(), 'railactivewindow:6h', 'Down did not move to the row below');
+    await page.keyboard.press('Enter');
+    await page.evaluate(SETTLED);
+    assert.equal(await focused(), 'railactivewindow');
+    assert.deepEqual(await saved(), ['active:6h -is:archived -is:agentrun', '6h'], 'the choice was not saved');
+    assert.equal(await button.locator('.railcountfig').textContent(), '3');
+
+    // Forget State restores the default window.
+    await page.evaluate(`window.postMessage({ type: 'forgetState', since: 0 }, '*')`);
+    await page.waitForFunction(
+      `document.querySelector('[data-control="railactivewindow"]')?.getAttribute('aria-label') === 'Active window, 1 hour'`,
+    );
+    assert.deepEqual(failures, []);
+    await page.close();
+  } finally {
+    await browser.close();
+  }
+});
+
+// The caret focused, then the menu opened by key, with one session about to cross the 2-day edge.
+async function openActiveWindowMenuPage(page: Page, sessionAges: readonly number[]): Promise<void> {
+  await openPage(page, activeWindowPayload(sessionAges), FIXTURE_CLOCK, {
+    railQuickFilters: ['active'],
+    railActiveWindow: '1h',
+  });
+}
+
+async function pressActiveWindowCaret(page: Page): Promise<void> {
+  await page.locator('[data-control="railactivewindow"]').focus();
+  await page.keyboard.press('ArrowDown');
+  await page.evaluate(SETTLED);
+}
+
+const TWO_DAYS_FIGURE = '[data-control="railactivewindow:2d"] .railcountfig';
+const THIRTY_MINUTES = 30 * 60_000;
+
+// With every section shut, no tick advances the panel's clock for a 2-day count.
+test('the Active window menu counts at the current clock when it opens', { timeout: 60_000 }, async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('no installed Edge or Chrome, so the Active window menu was not measured');
+    return;
+  }
+  try {
+    const page = await browser.newPage();
+    await openActiveWindowMenuPage(page, [0, 47.75, 70]);
+    await foldEverySection(page);
+    await page.clock.setFixedTime(FIXTURE_CLOCK + THIRTY_MINUTES);
+    await pressActiveWindowCaret(page);
+    assert.equal(await page.locator(TWO_DAYS_FIGURE).textContent(), '1');
+  } finally {
+    await browser.close();
+  }
+});
+
+test('an open Active window menu refreshes its rows on the clock', { timeout: 60_000 }, async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('no installed Edge or Chrome, so the Active window menu was not measured');
+    return;
+  }
+  try {
+    const page = await browser.newPage();
+    await openActiveWindowMenuPage(page, [0, 47.75, 70]);
+    await pressActiveWindowCaret(page);
+    assert.equal(await page.locator(TWO_DAYS_FIGURE).textContent(), '2');
+    await page.clock.setFixedTime(FIXTURE_CLOCK + THIRTY_MINUTES);
+    await page.waitForFunction(`document.querySelector('${TWO_DAYS_FIGURE}')?.textContent === '1'`, undefined, {
+      timeout: 10_000,
+    });
+    assert.equal(await page.evaluate(`document.activeElement?.dataset.control`), 'railactivewindow:1h');
+  } finally {
+    await browser.close();
+  }
+});
+
+test('the Active window menu closes when the session list hides', { timeout: 60_000 }, async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('no installed Edge or Chrome, so the Active window menu was not measured');
+    return;
+  }
+  try {
+    const page = await browser.newPage();
+    await openActiveWindowMenuPage(page, [0, 47.75, 70]);
+    await pressActiveWindowCaret(page);
+    await page.setViewportSize({ width: RAIL_MIN_WIDTH - 1, height: 900 });
+    await page.waitForFunction(`document.querySelector('#railactivewindowpop').hidden`, undefined, {
+      timeout: 10_000,
+    });
+    assert.notEqual(await page.evaluate(`document.activeElement.tagName`), 'BODY', 'focus was lost with the menu');
+    assert.equal(await page.evaluate(`!!document.activeElement.closest('nav, [hidden]')`), false);
+  } finally {
+    await browser.close();
+  }
+});
+
+test('focus leaving the Active window menu closes it and stays on the destination', { timeout: 60_000 }, async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('no installed Edge or Chrome, so the Active window menu was not measured');
+    return;
+  }
+  try {
+    const page = await browser.newPage();
+    await openActiveWindowMenuPage(page, [0, 47.75, 70]);
+    const caret = page.locator('[data-control="railactivewindow"]');
+    const pop = page.locator('#railactivewindowpop');
+    const focused = async () => await page.evaluate(`document.activeElement?.dataset.control ?? null`);
+    const closed = async () => {
+      assert.equal(await caret.getAttribute('aria-expanded'), 'false');
+      assert.equal(await pop.isHidden(), true);
+    };
+    await pressActiveWindowCaret(page);
+    assert.equal(await focused(), 'railactivewindow:1h');
+    await page.keyboard.press('Tab');
+    await page.evaluate(SETTLED);
+    assert.equal(await focused(), 'railactivewindow:3h', 'Tab did not move between rows');
+    assert.equal(await caret.getAttribute('aria-expanded'), 'true', 'Tab inside the menu closed it');
+
+    await page.keyboard.press('End');
+    await page.keyboard.press('Tab');
+    await page.evaluate(SETTLED);
+    await closed();
+    assert.equal(
+      await page.evaluate(`document.activeElement !== document.body && !!document.activeElement.closest('#rail')`),
+      true,
+      'Tab from the last row left the session list',
+    );
+
+    await pressActiveWindowCaret(page);
+    await page.keyboard.press('Home');
+    await page.keyboard.press('Shift+Tab');
+    await page.evaluate(SETTLED);
+    await closed();
+    assert.equal(await focused(), 'railactivewindow', 'Shift+Tab from the first row did not reach the caret');
+
+    await pressActiveWindowCaret(page);
+    await page.locator('[data-control="railfilters"]').focus();
+    await page.evaluate(SETTLED);
+    await closed();
+    assert.equal(await focused(), 'railfilters', 'closing the menu moved focus from its destination');
+  } finally {
+    await browser.close();
+  }
+});
 
 // A count press leaves the box closed, so nothing is offered under it, and the magnifying glass
 // then shows the words the press wrote.

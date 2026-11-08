@@ -52,8 +52,11 @@ import {
   railCountButtons,
   railNarrowToRow,
   railCountPressed,
+  railActiveWindowCaretName,
+  railActiveWindowRows,
   railCounts,
   railHeadCounts,
+  railCountsMoved,
   railLensHolds,
   railSections,
   railKeptAfter,
@@ -95,6 +98,7 @@ import {
   RAIL_LENSES,
   RAIL_LENS_WORDS,
   pressRailLens,
+  withRailActiveWindow,
   withRailLens,
   railQueryHeldLens,
   type RailLens,
@@ -554,6 +558,130 @@ test('the Active count, name, and hint read the chosen window', () => {
   assert.equal(button.name, `Active in the last 3 hours, 2 sessions. ${HEAD_WORDS.cacheNone}`);
 });
 
+// Each Active window's count is what the Active button would count at that window, so the checked
+// menu row always equals the button's figure. The clock reads 3 AM, so a card from late yesterday
+// sits inside 12 hours and outside Today.
+test('each Active window count equals the Active count at that window', () => {
+  const hour = 60 * 60_000;
+  const now = new Date(2026, 5, 15, 3, 0).getTime();
+  const lateYesterday = new Date(2026, 5, 14, 23, 0).getTime();
+  const ui = { labels: ['ui'], status: 'done' as const };
+  const cards = [
+    testCard('warm', {
+      ...ui,
+      at: now - 72 * hour,
+      cache: { expiresAt: now + 30 * 60_000, nearlyGoneAt: now + 20 * 60_000 },
+    }),
+    testCard('recent', { ...ui, at: now - hour / 2 }),
+    testCard('late-yesterday', { ...ui, at: lateYesterday }),
+    testCard('older', { ...ui, at: now - 30 * hour }),
+    testCard('archived', { ...ui, at: now - hour / 2, archived: true }),
+    testCard('agent-run', { ...ui, at: now - hour / 2, agentRun: true, runByAgent: true }),
+    testCard('unlabelled', { status: 'done', at: now - hour / 2 }),
+  ];
+  const rail = { query: 'label:ui' };
+  const inQuery = (card: RailSectionCard) => (card.labels ?? []).includes('ui');
+  for (const chosen of RAIL_ACTIVE_WINDOWS) {
+    const { windows } = railHeadCounts(cards, RAIL_SHOWN_BUCKETS, now, rail, railActiveWindow(chosen));
+    assert.deepEqual(windows, { '1h': 2, '3h': 2, '6h': 3, '12h': 3, today: 2, '2d': 4 }, chosen);
+    for (const value of RAIL_ACTIVE_WINDOWS) {
+      const alone = railCounts(cards, RAIL_SHOWN_BUCKETS, now, { inQuery, activeWindow: railActiveWindow(value) });
+      assert.equal(windows?.[value], alone.active, `${chosen} counting ${value}`);
+    }
+  }
+});
+
+// A typed Active word that names the saved window stays in the query at every other window, so
+// the query a row counts inside depends on the row. The held lens moves and keeps nothing behind.
+test('each Active window row counts what the button counts after choosing it', () => {
+  const hour = 60 * 60_000;
+  const now = new Date(2026, 5, 15, 12, 0).getTime();
+  const cards = [0.5, 2, 5, 8, 30].map((age, n) =>
+    testCard(`s${n}`, { labels: ['ui'], status: 'done' as const, at: now - age * hour }),
+  );
+  const buttonAfter = (query: string, value: RailActiveWindow) => {
+    const window = railActiveWindow(value);
+    const moved = withRailActiveWindow(query, window);
+    return railHeadCounts(cards, RAIL_SHOWN_BUCKETS, now, { query: moved }, window).active;
+  };
+  const cases: [string, RailActiveWindow, Partial<Record<RailActiveWindow, number>>][] = [
+    ['is:active', '1h', { '1h': 1, '6h': 1 }],
+    ['is:active label:ui', '1h', { '2d': 1 }],
+    ['active:3h', '3h', { '3h': 2, '12h': 2 }],
+    ['active:3h -is:archived -is:agentrun', '3h', { '3h': 2, '12h': 4 }],
+    ['label:ui', '6h', { '2d': 5 }],
+  ];
+  for (const [query, saved, expected] of cases) {
+    const { windows } = railHeadCounts(cards, RAIL_SHOWN_BUCKETS, now, { query }, railActiveWindow(saved));
+    for (const value of RAIL_ACTIVE_WINDOWS) {
+      assert.equal(windows?.[value], buttonAfter(query, value), `${query} at ${saved}, row ${value}`);
+    }
+    for (const [value, count] of Object.entries(expected)) {
+      assert.equal(windows?.[value as RailActiveWindow], count, `${query} at ${saved}, row ${value}`);
+    }
+  }
+});
+
+// A 2-day count that moves on the clock redraws the rows of an open menu and leaves a closed header alone.
+test('a moving Active window count redraws only an open menu', () => {
+  const hour = 60 * 60_000;
+  const start = new Date(2026, 5, 15, 12, 0).getTime();
+  const cards = [
+    testCard('recent', { status: 'done' as const, at: start }),
+    testCard('edge', { status: 'done' as const, at: start - 47.75 * hour }),
+  ];
+  const counts = (at: number) => railHeadCounts(cards, RAIL_SHOWN_BUCKETS, at, { query: '' }, railActiveWindow('1h'));
+  const before = counts(start);
+  const later = counts(start + hour / 2);
+  assert.equal(before.windows?.['2d'], 2);
+  assert.equal(later.windows?.['2d'], 1);
+  assert.equal(before.active, later.active);
+  assert.equal(railCountsMoved(before, later, false), false);
+  assert.equal(railCountsMoved(before, later, true), true);
+});
+
+// The menu checks the window the button counts: the held lens's window, or else the saved one.
+// A held window outside the six checks no row.
+test('the Active window menu rows check the window the button counts and name their counts', () => {
+  const windows = { '1h': 1, '3h': 2, '6h': 8, '12h': 8, today: 3, '2d': 1234 };
+  const rows = (query: string, chosen: RailActiveWindow) =>
+    railActiveWindowRows(windows, query, railActiveWindow(chosen), HEAD_WORDS);
+  assert.deepEqual(
+    rows('', '6h').map((row) => [row.control, row.label, row.figure, row.checked, row.name]),
+    [
+      ['railactivewindow:1h', '1 hour', '1', false, '1 hour, 1 session'],
+      ['railactivewindow:3h', '3 hours', '2', false, '3 hours, 2 sessions'],
+      ['railactivewindow:6h', '6 hours', '8', true, '6 hours, 8 sessions'],
+      ['railactivewindow:12h', '12 hours', '8', false, '12 hours, 8 sessions'],
+      ['railactivewindow:today', 'Today', '3', false, 'Today, 3 sessions'],
+      ['railactivewindow:2d', '2 days', '1,234', false, '2 days, 1,234 sessions'],
+    ],
+  );
+  const checked = (query: string, chosen: RailActiveWindow) =>
+    rows(query, chosen)
+      .filter((row) => row.checked)
+      .map((row) => row.value);
+  assert.deepEqual(checked('active:3h -is:archived -is:agentrun', '6h'), ['3h']);
+  assert.deepEqual(checked('is:active -is:archived -is:agentrun', '6h'), ['1h']);
+  assert.deepEqual(checked('active:4h -is:archived -is:agentrun', '6h'), []);
+  assert.deepEqual(
+    railActiveWindowRows(null, '', railActiveWindow('today'), HEAD_WORDS).map((row) => [row.figure, row.name]),
+    [
+      ['', '1 hour'],
+      ['', '3 hours'],
+      ['', '6 hours'],
+      ['', '12 hours'],
+      ['', 'Today'],
+      ['', '2 days'],
+    ],
+  );
+  assert.equal(
+    railActiveWindowCaretName('active:4h -is:archived -is:agentrun', railActiveWindow('6h'), HEAD_WORDS),
+    'Active window, 4 hours',
+  );
+  assert.equal(railActiveWindowCaretName('', railActiveWindow('today'), HEAD_WORDS), 'Active window, Today');
+});
+
 // An `is:active` word beside a held Active lens at a wider window still keeps only the last hour,
 // in the list and in the Active count, as the query grammar reads it.
 test('is:active beside a held Active lens at a wider window keeps the last hour', () => {
@@ -904,6 +1032,8 @@ const HEAD_WORDS = {
   activeDay: CARD_ACTIONS.railActiveDay,
   activeDays: CARD_ACTIONS.railActiveDays,
   activeToday: CARD_ACTIONS.railActiveToday,
+  activeWindow: CARD_ACTIONS.railActiveWindow,
+  activeWindowToday: CARD_ACTIONS.railActiveWindowToday,
 };
 
 const ALL_LENS = { filterId: ALL_RAIL_FILTER_ID, query: '' };
@@ -948,15 +1078,17 @@ test('a lens count is pressed while the query holds its words, whatever wrote th
 
 test('a selected configured zero-match lens keeps its live count and clearing action', () => {
   const zero = { running: 0, warm: 0, expiring: 0, active: 0, unread: 0, input: 0 };
-  assert.deepEqual(railCountButtons(zero, ALL_LENS, HEAD_WORDS, RAIL_LENSES), []);
+  const onlyActive = (buttons: readonly { kind: RailLens }[]) => buttons.map((each) => each.kind);
+  assert.deepEqual(onlyActive(railCountButtons(zero, ALL_LENS, HEAD_WORDS, RAIL_LENSES)), ['active']);
   for (const lens of RAIL_LENSES) {
     for (const filterId of [ALL_RAIL_FILTER_ID, 'saved']) {
       const query = `label:ui ${RAIL_LENS_WORDS[lens]}`;
       const selected = { filterId, query };
       assert.deepEqual(railCountButtons(zero, selected, HEAD_WORDS, []), [], lens);
+      // Active draws at zero, so the reader can widen an empty window, whichever lens is held.
       const buttons = railCountButtons(zero, selected, HEAD_WORDS, RAIL_LENSES);
-      assert.equal(buttons.length, 1, lens);
-      const [button] = buttons;
+      assert.deepEqual(buttons.map((each) => each.kind).sort(), [...new Set(['active', lens])].sort(), lens);
+      const button = buttons.find((each) => each.kind === lens)!;
       assert.deepEqual(
         [button.kind, button.figure, button.pressed, button.hint, button.name],
         [
@@ -969,7 +1101,7 @@ test('a selected configured zero-match lens keeps its live count and clearing ac
       );
       const cleared = { ...selected, query: pressRailLens(query, lens) };
       assert.equal(cleared.query, 'label:ui');
-      assert.deepEqual(railCountButtons(zero, cleared, HEAD_WORDS, RAIL_LENSES), []);
+      assert.deepEqual(onlyActive(railCountButtons(zero, cleared, HEAD_WORDS, RAIL_LENSES)), ['active']);
     }
   }
 });
@@ -2043,10 +2175,13 @@ test('a hidden bucket leaves the label chip counts with the list', () => {
   ]);
 });
 
-test('zero-match rail shortcuts stay hidden while View choices remain label-only and selectable', () => {
+test('zero-match rail shortcuts stay hidden, except Active, while View choices remain label-only and selectable', () => {
   const zero = { running: 0, warm: 0, expiring: 0, active: 0, unread: 0, input: 0 };
   const buttons = railCountButtons(zero, ALL_LENS, HEAD_WORDS, RAIL_LENSES);
-  assert.deepEqual(buttons, []);
+  assert.deepEqual(
+    buttons.map((button) => [button.kind, button.figure]),
+    [['active', '0']],
+  );
   const values = railNarrowToRow('', CARD_ACTIONS.railNarrowToValues);
   assert.deepEqual(
     values.map((value) => value.value),

@@ -2819,14 +2819,14 @@ test('ending naming refreshes held cache information at the current time', { tim
     const paused = await pauseClock(page);
     await page.clock.setSystemTime(paused + 25_000);
     await page.keyboard.press('Escape');
-    assert.equal(await active.count(), 0, 'ending naming kept a zero-match shortcut');
+    assert.equal(await active.locator('.railcountfig').textContent(), '0', 'ending naming kept the held count');
     assert.deepEqual(failures, [], 'the panel threw while naming ended');
   } finally {
     await browser.close();
   }
 });
 
-test('a tick that empties Active removes its shortcut and focuses the funnel', { timeout: 60_000 }, async (t) => {
+test('a tick that empties Active keeps its button at zero and keeps focus', { timeout: 60_000 }, async (t) => {
   const browser = await browserOrNone();
   if (!browser) {
     t.skip('no Edge, Chrome or bundled Chromium on this machine, so nothing was measured');
@@ -2855,12 +2855,11 @@ test('a tick that empties Active removes its shortcut and focuses the funnel', {
     await active.focus();
     await pauseClock(page);
     await page.clock.runFor(25_000);
-    assert.equal(await active.count(), 0, 'the zero-match Active shortcut stayed on the rail');
-    const next = 'railfilters';
+    assert.equal(await active.locator('.railcountfig').textContent(), '0', 'the Active button left the header at zero');
     assert.equal(
       await page.evaluate(`document.activeElement?.dataset.control ?? null`),
-      next,
-      'the tick left focus on a removed shortcut',
+      'railcount:active',
+      'the tick moved focus off the Active button',
     );
     assert.deepEqual(failures, []);
   } finally {

@@ -174,6 +174,9 @@ export const CARD_ACTIONS = {
   railActiveDay: 'day',
   railActiveDays: 'days',
   railActiveToday: 'today',
+  // The Active window menu's heading and its Today row. The caret on the Active button opens it.
+  railActiveWindow: 'Active window',
+  railActiveWindowToday: 'Today',
   railCountUnreadHint: 'Show only the unread sessions',
   railCountInputHint: 'Show only the sessions where an agent needs your input',
   railCountPressedHint: 'Show every session again',

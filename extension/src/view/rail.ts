@@ -22,6 +22,7 @@ import {
   ACTIVE_HOUR,
   activeWindowHolds,
   activeWindowValue,
+  localDayStart,
   matchSessions,
   parseSessionQuery,
   railStatusRuns,
@@ -30,12 +31,16 @@ import {
 } from '../domain/session-query.ts';
 import {
   RAIL_KEEPING_LENSES,
+  RAIL_ACTIVE_WINDOWS,
+  railActiveRest,
   RAIL_LENSES,
   pressRailLens,
+  railActiveWindow,
   railHeldLensWords,
   railQueryActiveWindow,
   railQueryHeldLens,
   withoutRailLenses,
+  type RailActiveWindow,
   type RailLens,
 } from '../domain/rail-filters.ts';
 import type { SavedView } from '../domain/views.ts';
@@ -624,7 +629,12 @@ export interface RailCounts {
   // How many cards hold the Needs input lens: not archived, not run by an agent, and waiting on
   // the reader, the card state `is:input` reads.
   input: number;
+  // How many cards each Active window holds, in the scope that `active` counts. Present when
+  // the caller asks for it, which `railHeadCounts` does for the Active window menu.
+  windows?: RailWindowCounts;
 }
+
+export type RailWindowCounts = Readonly<Record<RailActiveWindow, number>>;
 
 export interface RailCountsOptions {
   showArchived: boolean;
@@ -635,10 +645,26 @@ export interface RailCountsOptions {
 export const RAIL_SHOWN_BUCKETS: RailCountsOptions = { showArchived: true, showRuns: true };
 
 // What the Active figures count inside. `inQuery` keeps the cards the rail's query keeps,
-// and a caller with no query leaves it out. `activeWindow` defaults to the hour.
+// and a caller with no query leaves it out. `activeWindow` defaults to the hour. `windowInQuery`
+// adds the count of every Active window to the result, one query per window in
+// `RAIL_ACTIVE_WINDOWS` order.
 export interface RailCountScope {
   inQuery?: (card: RailSectionCard) => boolean;
   activeWindow?: ActiveWindow;
+  windowInQuery?: readonly ((card: RailSectionCard) => boolean)[];
+}
+
+const RAIL_WINDOW_SPANS = RAIL_ACTIVE_WINDOWS.map(railActiveWindow);
+
+// The edge of each Active window at one clock, in `RAIL_ACTIVE_WINDOWS` order, computed once per
+// count so a Today window builds no `Date` per card. A fixed span keeps activity strictly newer
+// than its edge, and Today keeps activity at local midnight, as `activeWindowHolds` reads them.
+function railWindowEdges(now: number): { at: number; inclusive: boolean }[] {
+  return RAIL_WINDOW_SPANS.map((window) =>
+    window.unit === 'today'
+      ? { at: localDayStart(now), inclusive: true }
+      : { at: now - window.count * (window.unit === 'hour' ? 3_600_000 : 86_400_000), inclusive: false },
+  );
 }
 
 // Count lens matches within inQuery and the shown buckets. Running includes running, subagents and background statuses.
@@ -648,8 +674,12 @@ export function railCounts(
   cards: readonly RailSectionCard[],
   { showArchived, showRuns }: RailCountsOptions,
   now: number,
-  { inQuery = () => true, activeWindow = ACTIVE_HOUR }: RailCountScope = {},
+  { inQuery = () => true, activeWindow = ACTIVE_HOUR, windowInQuery }: RailCountScope = {},
 ): RailCounts {
+  const edges = windowInQuery ? railWindowEdges(now) : null;
+  const tallies = edges ? edges.map(() => 0) : null;
+  // Every window shares the query unless a typed Active word narrows some windows and not others.
+  const windowsShareQuery = windowInQuery?.every((keeps) => keeps === inQuery) ?? true;
   let running = 0;
   let warm = 0;
   let expiring = 0;
@@ -664,7 +694,26 @@ export function railCounts(
       continue;
     }
     // All lenses exclude agent runs and archived sessions, even when Show settings draw them.
-    if (card.runByAgent === null || card.runByAgent || card.archived || !inQuery(card)) {
+    if (card.runByAgent === null || card.runByAgent || card.archived) {
+      continue;
+    }
+    const inRest = inQuery(card);
+    if (!inRest && windowsShareQuery) {
+      continue;
+    }
+    const cache = railCacheState(card.cache ?? null, now);
+    if (edges && tallies && windowInQuery) {
+      for (let at = 0; at < edges.length; at++) {
+        const edge = edges[at];
+        if (
+          (cache !== null || card.at > edge.at || (edge.inclusive && card.at === edge.at)) &&
+          (windowsShareQuery ? inRest : windowInQuery[at](card))
+        ) {
+          tallies[at]++;
+        }
+      }
+    }
+    if (!inRest) {
       continue;
     }
     if (railStatusRuns(card.status)) {
@@ -676,9 +725,8 @@ export function railCounts(
     if (card.status === 'waiting') {
       input++;
     }
-    if (railCardActive(card, now, activeWindow)) {
+    if (activeWindowHolds(activeWindow, { at: card.at, clock: now }, cache !== null)) {
       active++;
-      const cache = railCacheState(card.cache ?? null, now);
       if (cache === 'nearly-gone') {
         expiring++;
       } else if (cache === 'warm') {
@@ -686,7 +734,37 @@ export function railCounts(
       }
     }
   }
-  return { running, warm, expiring, active, unread, input };
+  return {
+    running,
+    warm,
+    expiring,
+    active,
+    unread,
+    input,
+    ...(tallies
+      ? {
+          windows: Object.fromEntries(RAIL_ACTIVE_WINDOWS.map((choice, at) => [choice, tallies[at]])) as Record<
+            RailActiveWindow,
+            number
+          >,
+        }
+      : {}),
+  };
+}
+
+// Whether a clock tick redraws the head. Session counts and Active's visible cache information
+// change on the clock. The Active window counts move only an open menu, so a closed header
+// ignores them.
+export function railCountsMoved(drawn: RailCounts, at: RailCounts, windowsDrawn: boolean): boolean {
+  const state = (counts: RailCounts) => (counts.expiring > 0 ? 'nearly-gone' : counts.warm > 0 ? 'warm' : null);
+  return (
+    drawn.running !== at.running ||
+    drawn.active !== at.active ||
+    drawn.unread !== at.unread ||
+    drawn.input !== at.input ||
+    state(drawn) !== state(at) ||
+    (windowsDrawn && RAIL_ACTIVE_WINDOWS.some((window) => drawn.windows?.[window] !== at.windows?.[window]))
+  );
 }
 
 // Identify queries that read cache warmth or Active recency. Stamp cache warmth only when the query requires it.
@@ -818,7 +896,15 @@ export function railHeadCounts(
     const rest = withoutRailLenses(pressRailLens(rail.query, lens, activeWindow));
     let counts = byRest.get(rest);
     if (!counts) {
-      counts = railCountsInRest(cards, shown, at, rest, activeWindow, rail.queryContext);
+      counts = railCountsInRest(
+        cards,
+        shown,
+        at,
+        rest,
+        activeWindow,
+        lens === 'active' ? RAIL_WINDOW_SPANS.map((window) => railActiveRest(rail.query, window)) : null,
+        rail.queryContext,
+      );
       byRest.set(rest, counts);
     }
     return counts;
@@ -837,14 +923,39 @@ function railCountsInRest(
   at: number,
   rest: string,
   activeWindow: ActiveWindow,
+  windowRests: readonly string[] | null,
   queryContext?: SessionQueryContext,
 ): RailCounts {
+  const keptIn = new Map<string, (card: RailSectionCard) => boolean>();
+  const keepsFor = (words: string) => {
+    let keeps = keptIn.get(words);
+    if (!keeps) {
+      keeps = railRestKeeps(cards, at, words, queryContext);
+      keptIn.set(words, keeps);
+    }
+    return keeps;
+  };
+  const inQuery = keepsFor(rest);
+  return railCounts(cards, shown, at, {
+    inQuery,
+    activeWindow,
+    ...(windowRests ? { windowInQuery: windowRests.map((words) => keepsFor(words)) } : {}),
+  });
+}
+
+// Which cards these words keep, matched once however many windows read them.
+function railRestKeeps(
+  cards: readonly RailSectionCard[],
+  at: number,
+  rest: string,
+  queryContext?: SessionQueryContext,
+): (card: RailSectionCard) => boolean {
   if (!parseSessionQuery(rest).terms.length) {
-    return railCounts(cards, shown, at, { activeWindow });
+    return () => true;
   }
   const pool: RailClockCard<RailSectionCard>[] = railQueryReadsCache(rest) ? railClockCards(cards, at) : [...cards];
   const kept = new Set(matchSessions(pool, rest, queryContext, at).map((card) => card.id));
-  return railCounts(cards, shown, at, { inQuery: (card) => kept.has(card.id), activeWindow });
+  return (card) => kept.has(card.id);
 }
 
 // The lens a rail head count presses.
@@ -872,6 +983,9 @@ export interface RailCountWords {
   activeDay: string;
   activeDays: string;
   activeToday: string;
+  // The Active window menu's heading, and the name of its Today row.
+  activeWindow: string;
+  activeWindowToday: string;
 }
 
 // The Active window as words, such as "in the last hour", "in the last 6 hours", or "today".
@@ -882,6 +996,55 @@ export function railActiveWindowPhrase(window: ActiveWindow, words: RailCountWor
   const [one, many] =
     window.unit === 'hour' ? [words.activeHour, words.activeHours] : [words.activeDay, words.activeDays];
   return window.count === 1 ? `${words.activeWithin} ${one}` : `${words.activeWithin} ${window.count} ${many}`;
+}
+
+// The name of an Active window on its own, such as "1 hour", "6 hours", "Today", or "2 days".
+export function railActiveWindowName(window: ActiveWindow, words: RailCountWords): string {
+  if (window.unit === 'today') {
+    return words.activeWindowToday;
+  }
+  const [one, many] =
+    window.unit === 'hour' ? [words.activeHour, words.activeHours] : [words.activeDay, words.activeDays];
+  return `${window.count} ${window.count === 1 ? one : many}`;
+}
+
+// The caret's accessible name and hint: the menu it opens and the window the button counts.
+export function railActiveWindowCaretName(query: string, chosen: ActiveWindow, words: RailCountWords): string {
+  return `${words.activeWindow}, ${railActiveWindowName(railActiveCountWindow(query, chosen), words)}`;
+}
+
+export interface RailActiveWindowRow {
+  value: RailActiveWindow;
+  control: string;
+  label: string;
+  figure: string;
+  checked: boolean;
+  name: string;
+}
+
+// One row per Active window. The checked row is the window the button counts, so its count is
+// the button's figure. A held lens at a window outside the six, such as `active:4h`, checks no row.
+// Before the catalog publishes, rows carry no figure.
+export function railActiveWindowRows(
+  counts: RailWindowCounts | null,
+  query: string,
+  chosen: ActiveWindow,
+  words: RailCountWords,
+): RailActiveWindowRow[] {
+  const counted = activeWindowValue(railActiveCountWindow(query, chosen));
+  return RAIL_ACTIVE_WINDOWS.map((value) => {
+    const label = railActiveWindowName(railActiveWindow(value), words);
+    const count = counts?.[value];
+    const figure = count === undefined ? '' : count.toLocaleString('en-US');
+    return {
+      value,
+      control: `railactivewindow:${value}`,
+      label,
+      figure,
+      checked: counted === value,
+      name: count === undefined ? label : `${label}, ${figure} ${count === 1 ? words.session : words.sessions}`,
+    };
+  });
 }
 
 // What the rail is filtered by, as the head row reads it: the saved filter id and the live
@@ -911,6 +1074,7 @@ export function railCountPressed(kind: RailCountKind, lens: RailHeadLens): boole
 }
 
 // Configured shortcuts draw while selected or while their scoped session count is positive.
+// Active also draws at a count of 0 once counts arrive, so the reader can widen an empty window.
 // Before the catalog supplies counts, only a selected shortcut draws, without a figure, so a restored selection stays clearable.
 // Naming holds their counts and disables presses. Active adds its scoped cache information.
 // The Active label stays "Active" at every window. Its accessible name names the window. Its hint
@@ -936,7 +1100,9 @@ export function railCountButtons(
     input: words.input,
   };
   return RAIL_LENSES.filter(
-    (kind) => headLenses.includes(kind) && ((counts?.[kind] ?? 0) > 0 || railCountPressed(kind, lens)),
+    (kind) =>
+      headLenses.includes(kind) &&
+      ((counts?.[kind] ?? 0) > 0 || railCountPressed(kind, lens) || (kind === 'active' && counts !== null)),
   ).map((kind) => {
     const count = counts?.[kind];
     const figure = count === undefined ? '' : count.toLocaleString('en-US');

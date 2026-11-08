@@ -414,7 +414,7 @@ body {
   min-width: 0;
   flex-wrap: wrap;
   align-items: center;
-  gap: 0 0.5em;
+  gap: 0 0.25em;
   font-size: var(--t-small);
 }
 .railcounts:empty {
@@ -473,11 +473,37 @@ body {
   color: var(--need);
   fill: currentColor;
 }
+/* The Active count and its caret. The split draws no border of its own, so an unpressed
+   Active looks like its neighbours, and the pressed border stays on the count. */
+.railcountsplit {
+  display: inline-flex;
+  flex: none;
+  align-items: stretch;
+}
+.railcountsplit > .railcount {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+.railactivewindow {
+  width: 0.77em;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-top-right-radius: 3px;
+  border-bottom-right-radius: 3px;
+  background: transparent;
+  color: var(--vscode-foreground);
+  font: inherit;
+  font-size: inherit;
+  cursor: pointer;
+}
 /* The counts refuse presses while the reader names a view. */
-.railcount:disabled {
+.railcount:disabled,
+.railactivewindow:disabled {
   cursor: default;
 }
-.railcount:disabled:hover {
+.railcount:disabled:hover,
+.railactivewindow:disabled:hover {
   background: none;
 }
 /* The same hover chip `.railact:hover` and `.sessionmenu:hover` wear, so the tools read as
@@ -4916,6 +4942,17 @@ button.sbread:hover {
 #viewpop .railviewdelete {
   margin-right: auto;
 }
+#railactivewindowpop {
+  width: min(10.5em, calc(100vw - 12px));
+  padding-bottom: 0.333em;
+}
+.railactivewindowrow {
+  flex-direction: row;
+  align-items: baseline;
+}
+.railactivewindowrow .railcountfig {
+  margin-left: auto;
+}
 #railfilterpop {
   width: min(23em, calc(100vw - 12px));
   max-height: calc(100vh - 12px);
@@ -5320,14 +5357,19 @@ body {
 .railnewmenu {
   width: 1.878em;
   padding: 1px;
+}
+.railnewmenu,
+.railactivewindow {
   border-left: 1px solid var(--edge);
 }
 .railnew:hover,
-.railnewmenu:hover {
+.railnewmenu:hover,
+.railactivewindow:hover {
   background: var(--vscode-list-hoverBackground, rgba(128, 128, 128, 0.12));
 }
 .railnew:focus-visible,
-.railnewmenu:focus-visible {
+.railnewmenu:focus-visible,
+.railactivewindow:focus-visible {
   outline: 1px solid var(--vscode-focusBorder);
   outline-offset: -2px;
 }

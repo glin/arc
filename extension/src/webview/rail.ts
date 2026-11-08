@@ -56,6 +56,9 @@ import {
   railCacheName,
   railCacheTitle,
   railCardName,
+  railActiveWindowCaretName,
+  railActiveWindowRows,
+  railCountsMoved,
   railCountButtons,
   railHeadLensBoxes,
   withRailHeadLensToggled,
@@ -99,6 +102,7 @@ import {
   type RailGroupBy,
   type RailCountButton,
   type RailCountKind,
+  type RailCountWords,
   type RailCounts,
   type RailCountsOptions,
   type RailDrawnRow,
@@ -107,6 +111,7 @@ import {
   type RailSection,
   type RailTickRow,
 } from '../view/rail.ts';
+import { TAB_STOPS, walkOutOf } from './stat-detail.ts';
 import {
   findView,
   nextViewId,
@@ -212,6 +217,8 @@ interface RailWords extends SessionRenameWords, RailHoverWords {
   railActiveDay: string;
   railActiveDays: string;
   railActiveToday: string;
+  railActiveWindow: string;
+  railActiveWindowToday: string;
   railFilterEmpty: string;
   railFilterOffers: string;
   railFilterTake: string;
@@ -349,18 +356,6 @@ interface RailOptions {
 // Query matching reads cache warmth and recent activity against the browser clock. Attach cache
 // warmth to session list cards before matching. Matching reads recency from each card's `at`.
 type RailMatchCard = RailCardView & { cacheWarm?: boolean };
-
-// Session counts and Active's visible cache information change on the clock.
-function countsMoved(drawn: RailCounts, at: RailCounts): boolean {
-  const state = (counts: RailCounts) => (counts.expiring > 0 ? 'nearly-gone' : counts.warm > 0 ? 'warm' : null);
-  return (
-    drawn.running !== at.running ||
-    drawn.active !== at.active ||
-    drawn.unread !== at.unread ||
-    drawn.input !== at.input ||
-    state(drawn) !== state(at)
-  );
-}
 
 export interface RailSnapshot {
   filter: string;
@@ -1718,6 +1713,13 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
   railFilterPop.setAttribute('role', 'dialog');
   railFilterPop.setAttribute('aria-label', options.words.railFilters);
   document.body.appendChild(railFilterPop);
+  const railWindowPop = document.createElement('div');
+  railWindowPop.id = 'railactivewindowpop';
+  railWindowPop.className = 'pop';
+  railWindowPop.hidden = true;
+  railWindowPop.setAttribute('role', 'dialog');
+  railWindowPop.setAttribute('aria-label', options.words.railActiveWindow);
+  document.body.appendChild(railWindowPop);
 
   const media = window.matchMedia(`(min-width: ${RAIL_MIN_WIDTH}px)`);
   const folds = new Map<string, boolean>(
@@ -1853,6 +1855,9 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
   let railFilterDeleteArmed = false;
   // An outside press defers focus restoration until the browser finishes moving focus.
   let railFilterFocusBack = false;
+  let railWindowOpen = false;
+  let railWindowFocusBack = false;
+  let railWindowButton: HTMLButtonElement | null = null;
   // Whether the View menu draws every label chip rather than the most used twelve. It folds
   // again whenever the menu closes.
   let railFilterLabelsExpanded = false;
@@ -1897,6 +1902,30 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     const shown = railShownCards(drawnCards, rail, now, poolReadsCache(), railKept);
     railKept = railKeptAfter(rail, shown);
     return shown;
+  };
+  const railCountWords: RailCountWords = {
+    running: options.words.railNarrowToValues.running,
+    active: options.words.railCountActive,
+    unread: options.words.railNarrowToValues.unread,
+    input: options.words.railNarrowToValues.input,
+    cacheWarm: options.words.railCountCacheWarm,
+    cacheExpiring: options.words.railCountCacheExpiring,
+    cacheNone: options.words.railCountCacheNone,
+    session: options.words.railCountSession,
+    sessions: options.words.railCountSessions,
+    runningHint: options.words.railCountRunningHint,
+    activeHint: options.words.railCountActiveHint,
+    unreadHint: options.words.railCountUnreadHint,
+    inputHint: options.words.railCountInputHint,
+    pressedHint: options.words.railCountPressedHint,
+    activeWithin: options.words.railActiveWithin,
+    activeHour: options.words.railActiveHour,
+    activeHours: options.words.railActiveHours,
+    activeDay: options.words.railActiveDay,
+    activeDays: options.words.railActiveDays,
+    activeToday: options.words.railActiveToday,
+    activeWindow: options.words.railActiveWindow,
+    activeWindowToday: options.words.railActiveWindowToday,
   };
   // Cache information reads the newest payload. Cache readings share the current query and Show switches.
   let counted: {
@@ -2254,6 +2283,89 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       railFilterButton.focus();
     }
   };
+  // The menu over the session list that the caret on the Active button opens. Each row counts its
+  // window, and the checked row is the one the button counts.
+  const drawActiveWindowPop = (focusChecked = false) => {
+    railWindowPop.hidden = !railWindowOpen;
+    if (!railWindowOpen) {
+      render(null, railWindowPop);
+      return;
+    }
+    const rows = railActiveWindowRows(
+      countsKnown ? (drawnCounts?.windows ?? null) : null,
+      railFilterQuery(filter),
+      railActiveWindow(railActiveChoice),
+      railCountWords,
+    );
+    render(
+      h(Fragment, null, [
+        h('div', { class: 'launchhead', id: 'railactivewindowname', key: 'head' }, options.words.railActiveWindow),
+        h(
+          'div',
+          { role: 'radiogroup', 'aria-labelledby': 'railactivewindowname', key: 'rows' },
+          rows.map((row) =>
+            h(
+              'button',
+              {
+                type: 'button',
+                class: 'launchrow railfilterchoice railactivewindowrow',
+                role: 'radio',
+                key: row.value,
+                'aria-checked': String(row.checked),
+                'aria-label': row.name,
+                'data-control': row.control,
+                onClick: () => {
+                  owner.setActiveWindow(row.value);
+                  closeActiveWindowMenu(true);
+                },
+              },
+              inlineText([
+                h('span', { class: 'launchname' }, row.label),
+                row.figure ? h('span', { class: 'railcountfig' }, row.figure) : null,
+              ]),
+            ),
+          ),
+        ),
+      ]),
+      railWindowPop,
+    );
+    placeActiveWindowPop();
+    if (focusChecked) {
+      (
+        railWindowPop.querySelector<HTMLElement>('[aria-checked="true"]') ?? railWindowPop.querySelector('button')
+      )?.focus();
+    }
+  };
+  const placeActiveWindowPop = () => {
+    if (railWindowOpen && railWindowButton) {
+      placeFloat(window, railWindowPop, railWindowButton, { gap: 4, overflow: 'slide' });
+    }
+  };
+  const closeActiveWindowMenu = (returnFocus: boolean) => {
+    railWindowOpen = false;
+    drawActiveWindowPop();
+    drawTop();
+    if (returnFocus && railWindowButton?.isConnected) {
+      railWindowButton.focus();
+    }
+  };
+  const openActiveWindowMenu = () => {
+    if (labelsOpen) {
+      closeLabelEditor(false);
+    }
+    if (viewOpen) {
+      closeViewEditor(false);
+    }
+    if (renameOpen) {
+      closeSessionRename(false);
+    }
+    if (railFilterOpen) {
+      closeRailFilterPicker(false);
+    }
+    railWindowOpen = true;
+    drawTop();
+    drawActiveWindowPop(true);
+  };
   const setLiveRailFilter = (lens: RailFilterLens, id: string, draw = true) => {
     setRailQuery(railFilterQuery(lens.query));
     railSort = lens.sort;
@@ -2355,6 +2467,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
   // Naming holds existing counts. Refresh them at the current time when naming ends.
   let countsHeld = false;
   // Reuse supplied clock counts. keepCounts preserves displayed figures until the scheduled typing frame refreshes them.
+  // An open Active window menu counts at the current clock, because a closed header ignores a moving window count.
   const drawTop = (counted?: RailCounts, keepCounts = false) => {
     const view = launcherView;
     const primaryName = view
@@ -2380,38 +2493,45 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     // Active reads current cache information within the query and shown buckets.
     // Naming holds the last drawn buttons, counts and cache information.
     if ((!naming && !keepCounts) || drawnCounts === null) {
-      drawnCounts = counted ?? headCounts(countsHeld ? Date.now() : now);
+      drawnCounts = counted ?? headCounts(countsHeld || railWindowOpen ? Date.now() : now);
       drawnCountButtons = railCountButtons(
         countsKnown ? drawnCounts : null,
         { filterId: railFilterId, query: railFilterQuery(filter) },
-        {
-          running: options.words.railNarrowToValues.running,
-          active: options.words.railCountActive,
-          unread: options.words.railNarrowToValues.unread,
-          input: options.words.railNarrowToValues.input,
-          cacheWarm: options.words.railCountCacheWarm,
-          cacheExpiring: options.words.railCountCacheExpiring,
-          cacheNone: options.words.railCountCacheNone,
-          session: options.words.railCountSession,
-          sessions: options.words.railCountSessions,
-          runningHint: options.words.railCountRunningHint,
-          activeHint: options.words.railCountActiveHint,
-          unreadHint: options.words.railCountUnreadHint,
-          inputHint: options.words.railCountInputHint,
-          pressedHint: options.words.railCountPressedHint,
-          activeWithin: options.words.railActiveWithin,
-          activeHour: options.words.railActiveHour,
-          activeHours: options.words.railActiveHours,
-          activeDay: options.words.railActiveDay,
-          activeDays: options.words.railActiveDays,
-          activeToday: options.words.railActiveToday,
-        },
+        railCountWords,
         railQuickFilters,
         railActiveWindow(railActiveChoice),
       );
     }
     countsHeld = Boolean(naming);
     const counts = drawnCountButtons;
+    const windowCaret = railActiveWindowCaretName(
+      railFilterQuery(filter),
+      railActiveWindow(railActiveChoice),
+      railCountWords,
+    );
+    const countButton = (count: (typeof counts)[number]) =>
+      h(
+        'button',
+        {
+          type: 'button',
+          class: 'railcount',
+          key: count.control,
+          'data-control': count.control,
+          'aria-pressed': String(count.pressed),
+          'aria-label': count.name,
+          'data-hint': count.hint,
+          // Cache detail already appears in the accessible name. Show it in the hint without repeating the spoken description.
+          'data-hint-detail': count.cacheDetail ?? undefined,
+          'data-hint-description': count.cacheDetail ? '' : undefined,
+          disabled: Boolean(naming),
+          onClick: () => pressRailCount(count.kind),
+        },
+        inlineText([
+          h('span', { class: 'railcountname' }, count.label),
+          count.figure ? h('span', { class: 'railcountfig' }, count.figure) : null,
+          count.cacheState ? cacheIcon(count.cacheState, null, now) : null,
+        ]),
+      );
     const filtersButton = h(
       'button',
       {
@@ -2433,6 +2553,9 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
           if (!opening) {
             closeRailFilterPicker(true);
             return;
+          }
+          if (railWindowOpen) {
+            closeActiveWindowMenu(false);
           }
           if (labelsOpen) {
             closeLabelEditor(false);
@@ -2727,29 +2850,39 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
           h(
             'div',
             { class: 'railcounts', key: 'counts' },
+            // Active alone carries a caret, which opens its window menu. The menu mounts outside the split.
             counts.map((count) =>
-              h(
-                'button',
-                {
-                  type: 'button',
-                  class: 'railcount',
-                  key: count.control,
-                  'data-control': count.control,
-                  'aria-pressed': String(count.pressed),
-                  'aria-label': count.name,
-                  'data-hint': count.hint,
-                  // Cache detail already appears in the accessible name. Show it in the hint without repeating the spoken description.
-                  'data-hint-detail': count.cacheDetail ?? undefined,
-                  'data-hint-description': count.cacheDetail ? '' : undefined,
-                  disabled: Boolean(naming),
-                  onClick: () => pressRailCount(count.kind),
-                },
-                inlineText([
-                  h('span', { class: 'railcountname' }, count.label),
-                  count.figure ? h('span', { class: 'railcountfig' }, count.figure) : null,
-                  count.cacheState ? cacheIcon(count.cacheState, null, now) : null,
-                ]),
-              ),
+              count.kind === 'active'
+                ? h('span', { class: 'railcountsplit', key: count.control }, [
+                    countButton(count),
+                    h(
+                      'button',
+                      {
+                        type: 'button',
+                        class: 'railactivewindow',
+                        key: 'railactivewindow',
+                        'data-control': 'railactivewindow',
+                        ref: (node: HTMLButtonElement | null) => {
+                          railWindowButton = node;
+                        },
+                        'aria-haspopup': 'dialog',
+                        'aria-expanded': String(railWindowOpen),
+                        'aria-controls': 'railactivewindowpop',
+                        'aria-label': windowCaret,
+                        'data-hint': windowCaret,
+                        disabled: Boolean(naming),
+                        onClick: () => (railWindowOpen ? closeActiveWindowMenu(true) : openActiveWindowMenu()),
+                        onKeyDown: (event: KeyboardEvent) => {
+                          if (event.key === 'ArrowDown' && plainNavigationKey(event)) {
+                            event.preventDefault();
+                            openActiveWindowMenu();
+                          }
+                        },
+                      },
+                      options.twist.shut,
+                    ),
+                  ])
+                : countButton(count),
             ),
           ),
         ]),
@@ -2758,6 +2891,16 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     );
     if (focusedCount && !focusedCount.isConnected) {
       restoreRailCountFocus();
+    }
+    if (railWindowOpen && !drawnCountButtons.some((each) => each.kind === 'active')) {
+      const held = railWindowPop.contains(document.activeElement);
+      railWindowOpen = false;
+      drawActiveWindowPop();
+      if (held) {
+        restoreRailCountFocus();
+      }
+    } else if (railWindowOpen) {
+      drawActiveWindowPop();
     }
   };
 
@@ -3448,7 +3591,12 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     sash.hidden = !shown;
     options.onVisibilityChange(shown, media.matches);
     drawWidth();
-    if (!shown && (nav.contains(document.activeElement) || sash === document.activeElement)) {
+    // The Active window menu mounts outside the session list, so its focus moves with the session list's.
+    const menuHeld = railWindowPop.contains(document.activeElement);
+    if (!shown && railWindowOpen) {
+      closeActiveWindowMenu(false);
+    }
+    if (!shown && (menuHeld || nav.contains(document.activeElement) || sash === document.activeElement)) {
       const next = options.fallbackFocus();
       if (next) {
         next.focus();
@@ -3596,7 +3744,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       }
       // Refresh counts and Active's cache state on the clock. Naming holds both until it ends.
       const fresh = drawnCounts !== null && !naming ? headCounts(at) : null;
-      const headMoved = fresh !== null && drawnCounts !== null && countsMoved(drawnCounts, fresh);
+      const headMoved = fresh !== null && drawnCounts !== null && railCountsMoved(drawnCounts, fresh, railWindowOpen);
       const clockMoved =
         poolReadsCache() &&
         (railActiveEdgeCrossed(drawnCards, [filter, ...views.map((view) => view.query)], now, at) ||
@@ -3639,6 +3787,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       railFilterSearch = '';
       railFilterNameMode = null;
       railFilterDeleteArmed = false;
+      railWindowOpen = false;
       folds.clear();
       filteredFolds.clear();
       railRaised.clear();
@@ -3675,6 +3824,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       drawViewPop();
       drawRenamePop();
       drawRailFilterPop();
+      drawActiveWindowPop();
       drawList();
       options.onLayoutChange();
     },
@@ -4035,6 +4185,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       placeViewPop();
       placeRenamePop();
       placeRailFilterPop();
+      placeActiveWindowPop();
     },
     // Open the saved-view editor only for this panel's recent context-menu target. Close other popovers first.
     openViewEditor(view, mode) {
@@ -4138,12 +4289,20 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     setActiveWindow(value: string) {
       if (options.readOnly) return;
       const next = normalizeRailActiveWindow(value);
-      if (next !== value || next === railActiveChoice) {
+      if (next !== value) {
+        return;
+      }
+      // The saved window still moves a held lens that holds another window, such as `active:4h`.
+      const query = withRailActiveWindow(filter, railActiveWindow(next));
+      if (next === railActiveChoice && query !== filter) {
+        setLiveRailFilter({ ...liveRailFilter(), query }, railFilterId);
+        return;
+      }
+      if (next === railActiveChoice) {
         return;
       }
       railActiveChoice = next;
       countViewChoice('window', next);
-      const query = withRailActiveWindow(filter, railActiveWindow(next));
       if (query !== filter) {
         setLiveRailFilter({ ...liveRailFilter(), query }, railFilterId);
         return;
@@ -4400,6 +4559,44 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     event.preventDefault();
   });
 
+  railWindowPop.addEventListener('keydown', (event) => {
+    if (!railWindowOpen || event.isComposing || event.keyCode === 229) {
+      return;
+    }
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      closeActiveWindowMenu(true);
+      return;
+    }
+    const rows = [...railWindowPop.querySelectorAll<HTMLElement>('button')];
+    if (event.key === 'Tab') {
+      // The menu mounts at the end of the document, so its ends leave for the caret's neighbours in the header.
+      if (document.activeElement === (event.shiftKey ? rows[0] : rows.at(-1)) && railWindowButton) {
+        event.preventDefault();
+        const onward = event.shiftKey
+          ? railWindowButton
+          : walkOutOf([...document.querySelectorAll<HTMLElement>(TAB_STOPS)], railWindowButton, (stop) =>
+              railWindowPop.contains(stop),
+            );
+        closeActiveWindowMenu(false);
+        (onward ?? railWindowButton).focus();
+      }
+      return;
+    }
+    const next = navigationIndex(event.key, rows.indexOf(document.activeElement as HTMLElement), rows.length);
+    if (next !== null) {
+      event.preventDefault();
+      rows[next]?.focus();
+    }
+  });
+  // Focus moving to another control closes the menu and stays there. A window blur has no target and leaves it open.
+  railWindowPop.addEventListener('focusout', (event) => {
+    const to = event.relatedTarget as Node | null;
+    if (!railWindowOpen || !to || railWindowPop.contains(to) || railWindowButton?.contains(to)) {
+      return;
+    }
+    closeActiveWindowMenu(false);
+  });
   nav.addEventListener('keydown', (event) => {
     if (!plainNavigationKey(event)) return;
     const target = event.target as HTMLElement;
@@ -4473,18 +4670,28 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     }
   });
   options.events.document('selectionchange', () => owner.releaseSelection());
-  // After an outside press, preserve focus on the pressed control. Restore the funnel if focus remains on the body or closed menu.
-  const settleRailFilterFocus = () => {
-    if (!railFilterFocusBack) {
-      return;
-    }
-    railFilterFocusBack = false;
+  // After an outside press, preserve focus on the pressed control. Restore the menu's opener if focus remains on the body or the closed menu.
+  const settlePressFocus = (pop: HTMLElement, opener: HTMLButtonElement | null) => {
     const active = document.activeElement;
-    const lost = !active || active === document.body || railFilterPop.contains(active);
-    if (lost && !railFilterOpen && railFilterButton?.isConnected) {
-      // The pointer rests where the reader pressed, so the funnel takes focus without its hint.
-      options.quietHint(railFilterButton);
-      railFilterButton.focus();
+    const lost = !active || active === document.body || pop.contains(active);
+    if (lost && opener?.isConnected) {
+      // The pointer rests where the reader pressed, so the control takes focus without its hint.
+      options.quietHint(opener);
+      opener.focus();
+    }
+  };
+  const settleRailFilterFocus = () => {
+    if (railFilterFocusBack) {
+      railFilterFocusBack = false;
+      if (!railFilterOpen) {
+        settlePressFocus(railFilterPop, railFilterButton);
+      }
+    }
+    if (railWindowFocusBack) {
+      railWindowFocusBack = false;
+      if (!railWindowOpen) {
+        settlePressFocus(railWindowPop, railWindowButton);
+      }
     }
   };
   options.events.document('pointerup', () => {
@@ -4499,6 +4706,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     const target = event.target as HTMLElement | null;
     dragging = !!target && nav.contains(target);
     railFilterFocusBack = false;
+    railWindowFocusBack = false;
     if (labelsOpen) {
       const back = labelAnchor();
       if (!labelPop.contains(target) && !back?.contains?.(target)) {
@@ -4517,6 +4725,10 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     if (railFilterOpen && !railFilterPop.contains(target) && !railFilterButton?.contains?.(target)) {
       closeRailFilterPicker(false);
       railFilterFocusBack = true;
+    }
+    if (railWindowOpen && !railWindowPop.contains(target) && !railWindowButton?.contains?.(target)) {
+      closeActiveWindowMenu(false);
+      railWindowFocusBack = true;
     }
     if (labelsPending && !labelsPending.anchor?.contains?.(target)) {
       labelsPending = null;

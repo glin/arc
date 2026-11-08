@@ -72,6 +72,12 @@ Opening focuses Same setup as current, then the list stop, then Agent. Edit and 
 
 Agent, Model, Effort, and Permissions use shared select-only comboboxes. Each field retains DOM focus and one Tab stop. Arrows open options and move tentative selection without wrapping. Home and End reach boundaries. Page Up and Page Down move ten choices. Printable keys search names. Enter, Space, Alt+Up, Tab, or leaving accepts. Tab retains native movement. Escape or pressing the expanded trigger cancels. Hover never selects. Pressing an option accepts it. Disabling the focused field transfers focus forward to an enabled visible control, then backward if none follows.
 
+### Active window menu
+
+The caret on the Active button is a native button that exposes `aria-haspopup`, `aria-expanded`, and `aria-controls`. Its accessible name and hint name the menu and the window the button counts, such as "Active window, 6 hours". While the reader names a view, the caret is disabled like the count buttons. Enter, Space, or Down on the caret opens the menu and focuses the checked row. With no checked row, focus lands on the first row.
+
+The menu is a dialog holding one radio group of native buttons. Each row's accessible name includes its count, such as "6 hours, 8 sessions". Up, Down, Home, and End move between rows without wrapping. Enter or Space on a row chooses it, closes the menu, and returns focus to the caret. Escape closes the menu without a change and returns focus to the caret. An outside press closes the menu without a change. Tab from the last row closes the menu and moves focus to the control after the caret. Shift+Tab from the first row closes the menu and moves focus to the caret. Focus moving to any other control closes the menu and stays on that control. When the Active button leaves the header, the menu closes and focus follows the [Saved filters](rail-and-navigation.md#saved-filters) fallback. When the session list hides, the menu closes and focus moves to the panel's fallback outside the session list.
+
 ### Agent request focus
 
 The question tab strip stays outside the timeline walk. Tabs and the fold precede request actions. Focus movement after resolution excludes both. [Agent requests](agent-requests.md) owns question tabs and announcements. [Text editing](composer.md#text-editing) owns prompt recall.

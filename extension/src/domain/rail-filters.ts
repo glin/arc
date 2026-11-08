@@ -445,6 +445,13 @@ export function withRailActiveWindow(query: string, window: ActiveWindow): strin
   return railQueryHeldLens(query) === 'active' ? withRailLens(withoutRailLenses(query), 'active', window) : query;
 }
 
+// The query an Active count at this window matches inside: the words left once the reader has
+// chosen the window and pressed Active. Only a typed Active word that names the window makes the
+// result depend on the window, because the press then takes that word as its own.
+export function railActiveRest(query: string, window: ActiveWindow): string {
+  return withoutRailLenses(pressRailLens(withRailActiveWindow(query, window), 'active', window));
+}
+
 // Whether one parsed term names this value, whatever sign the reader gave it.
 function termNames(term: FilterTerm, field: 'labels', value: string): boolean {
   return term.field === field && labelKey(term.needle) === labelKey(value);
