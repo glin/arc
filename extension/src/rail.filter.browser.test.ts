@@ -7,7 +7,12 @@ import type { Page } from 'playwright-core';
 import { browserOrNone, SETTLED } from '../test/browser.ts';
 import { FIXTURE_CLOCK, pageHtml, themed } from './panelfixture.ts';
 import { CARD_ACTIONS } from './turncard.ts';
-import { ALL_RAIL_FILTER_ID, RAIL_FILTER_QUERY_LIMIT, RAIL_LENS_WORDS } from './domain/rail-filters.ts';
+import {
+  ALL_RAIL_FILTER_ID,
+  RAIL_ACTIVE_WINDOWS,
+  RAIL_FILTER_QUERY_LIMIT,
+  RAIL_LENS_WORDS,
+} from './domain/rail-filters.ts';
 import type { SavedRailFilter } from './domain/rail-filters.ts';
 import { IS_VALUES } from './domain/session-query.ts';
 import {
@@ -906,6 +911,9 @@ test(
         assert.equal(await box.isVisible(), true, 'closing the View menu hid Search');
         assert.equal(await box.inputValue(), query, 'closing the View menu changed the Search query');
 
+        // The box offers completions for the word at the caret, which sits at the start after the
+        // press wrote the query. Put it on the label word.
+        await box.evaluate((node: HTMLInputElement) => node.setSelectionRange(node.value.length, node.value.length));
         await box.focus();
         assert.equal(await page.locator('#filterpop').isVisible(), true, 'the label query opened no completions');
         await box.press('Escape');
@@ -1247,7 +1255,7 @@ test(
       const expiring = 'Some active sessions have a cache that is expiring.';
       assert.equal(
         await active.getAttribute('aria-label'),
-        `Active, 2 sessions. ${expiring}`,
+        `Active in the last hour, 2 sessions. ${expiring}`,
         'the Active name disagrees with the sessions inside the recency window',
       );
       // The bolt and the name say one cache state, whichever the clock reaches.
@@ -1305,7 +1313,7 @@ test(
       assert.equal(await active.locator('.railcountfig').textContent(), '1');
       assert.equal(
         await active.getAttribute('aria-label'),
-        'Active, 1 session. Some active sessions have a warm cache.',
+        'Active in the last hour, 1 session. Some active sessions have a warm cache.',
       );
       assert.equal(await page.evaluate(agrees), true, 'the clock moved the Active bolt and its name apart');
 
@@ -1375,7 +1383,10 @@ test(
       );
       assert.deepEqual(await state(), { box: 1, counts: 1, cards: 0, views: [] });
       assert.equal(await active.locator('.railcountfig').textContent(), '0');
-      assert.equal(await active.getAttribute('aria-label'), `Active, 0 sessions. ${CARD_ACTIONS.railCountCacheNone}`);
+      assert.equal(
+        await active.getAttribute('aria-label'),
+        `Active in the last hour, 0 sessions. ${CARD_ACTIONS.railCountCacheNone}`,
+      );
       assert.equal(await active.getAttribute('aria-pressed'), 'true');
       assert.equal(await active.isEnabled(), true);
       assert.equal(await active.evaluate((node) => node === document.activeElement), true);
@@ -1447,7 +1458,7 @@ test(
       };
       const every = await shown();
       const active = page.locator('[data-control="railcount:active"]');
-      const activeWords = 'is:active -is:archived -is:agentrun';
+      const activeWords = 'active:1h -is:archived -is:agentrun';
 
       await active.click();
       await page.evaluate(SETTLED);
@@ -1847,6 +1858,86 @@ test(
   },
 );
 
+// The panel restores the saved Active window. The button keeps the label Active at every window,
+// counts the sessions inside that window, and names the window. A press writes that window.
+test(
+  'the Active button reads Active and the count of the saved window at every window',
+  { timeout: 120_000 },
+  async (t) => {
+    const browser = await browserOrNone();
+    if (!browser) {
+      t.skip('no installed Edge or Chrome, so the Active window was not measured');
+      return;
+    }
+    try {
+      const base = payload();
+      const hour = 60 * 60_000;
+      // FIXTURE_CLOCK reads 2:42 PM local time, so today reaches back 14.7 hours, or 13.7 or 15.7 hours
+      // on a daylight-saving day. The 13-hour card falls inside today on every day.
+      const ages = [0, 2, 5, 8, 13, 20, 40];
+      base.rail = ages.map((age, n) => ({
+        ...base.rail[n],
+        at: FIXTURE_CLOCK - age * hour,
+        cache: null,
+        pinnedTop: false,
+        agentRun: false,
+        archived: false,
+      }));
+      base.views = [];
+      const windows: Record<(typeof RAIL_ACTIVE_WINDOWS)[number], [number, string]> = {
+        '1h': [1, 'in the last hour'],
+        '3h': [2, 'in the last 3 hours'],
+        '6h': [3, 'in the last 6 hours'],
+        '12h': [4, 'in the last 12 hours'],
+        today: [5, 'today'],
+        '2d': [7, 'in the last 2 days'],
+      };
+      for (const choice of RAIL_ACTIVE_WINDOWS) {
+        const [count, phrase] = windows[choice];
+        const page = await browser.newPage();
+        const failures: string[] = [];
+        page.on('pageerror', (error) => failures.push(String(error)));
+        await openPage(page, base, FIXTURE_CLOCK, {
+          railFilter: '',
+          railFilterId: ALL_RAIL_FILTER_ID,
+          railQuickFilters: ['active'],
+          railActiveWindow: choice,
+        });
+        const button = page.locator('[data-control="railcount:active"]');
+        assert.deepEqual(
+          [
+            await button.locator('.railcountname').textContent(),
+            await button.locator('.railcountfig').textContent(),
+            await button.getAttribute('aria-label'),
+          ],
+          [
+            'Active',
+            String(count),
+            `Active ${phrase}, ${count} ${count === 1 ? 'session' : 'sessions'}. ${CARD_ACTIONS.railCountCacheNone}`,
+          ],
+          choice,
+        );
+        await button.click();
+        await page.evaluate(SETTLED);
+        const saved = (await page.evaluate(
+          `window.__posted.filter((m) => m.type === 'saveState').at(-1).state`,
+        )) as Record<string, unknown>;
+        assert.deepEqual(
+          [saved.railFilter, saved.railActiveWindow],
+          [`active:${choice} -is:archived -is:agentrun`, choice],
+          choice,
+        );
+        assert.equal(await page.locator('.railcard').count(), count, `${choice} drew a different list than its count`);
+        assert.equal(await button.locator('.railcountfig').textContent(), String(count), choice);
+        assert.deepEqual(failures, []);
+        await page.close();
+      }
+    } finally {
+      await browser.close();
+    }
+  },
+);
+
 // A count press leaves the box closed, so nothing is offered under it, and the magnifying glass
 // then shows the words the press wrote.
 test('a count press leaves the box closed and the magnifying glass shows its words', { timeout: 60_000 }, async (t) => {
@@ -1874,7 +1965,7 @@ test('a count press leaves the box closed and the magnifying glass shows its wor
 
     await page.locator('[data-control="railsearch"]').click();
     await page.evaluate(SETTLED);
-    assert.equal(await page.locator('.railfilter').inputValue(), 'is:active -is:archived -is:agentrun');
+    assert.equal(await page.locator('.railfilter').inputValue(), 'active:1h -is:archived -is:agentrun');
 
     assert.deepEqual(failures, []);
   } finally {

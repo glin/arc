@@ -103,6 +103,7 @@ export interface SavedPanelState {
   // Legacy Quick filters fallback when railQuickFilters is absent. Saving omits this field.
   railHeadLenses?: unknown;
   railQuickFilters?: unknown;
+  railActiveWindow?: unknown;
   railWidth: number;
   composerHidden: boolean;
   promptFloor: number;
@@ -129,6 +130,7 @@ export interface SavedStateValues {
   railShowArchived?: unknown;
   railShowRuns?: unknown;
   railQuickFilters?: unknown;
+  railActiveWindow?: unknown;
   railWidth: number;
   composerHidden: boolean;
   promptFloor: number;
@@ -170,6 +172,7 @@ export function savedPanelState(values: SavedStateValues): SavedPanelState {
     ...(values.railShowArchived === undefined ? {} : { railShowArchived: values.railShowArchived }),
     ...(values.railShowRuns === undefined ? {} : { railShowRuns: values.railShowRuns }),
     ...(values.railQuickFilters === undefined ? {} : { railQuickFilters: values.railQuickFilters }),
+    ...(values.railActiveWindow === undefined ? {} : { railActiveWindow: values.railActiveWindow }),
     railWidth: values.railWidth,
     composerHidden: values.composerHidden,
     promptFloor: values.promptFloor,

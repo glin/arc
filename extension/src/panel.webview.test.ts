@@ -21132,7 +21132,7 @@ test('a browser save on a saved filter keeps its selection and lens words throug
     },
     {
       railFilterId: 'f1',
-      railFilter: 'is:active -is:archived -is:agentrun cost:>5',
+      railFilter: 'active:1h -is:archived -is:agentrun cost:>5',
       railSort: 'cost-desc',
       railFilters: [
         {
@@ -32407,6 +32407,12 @@ test('startup shows only the restored selected quick filter until the workspace 
     unreadHint: CARD_ACTIONS.railCountUnreadHint,
     inputHint: CARD_ACTIONS.railCountInputHint,
     pressedHint: CARD_ACTIONS.railCountPressedHint,
+    activeWithin: CARD_ACTIONS.railActiveWithin,
+    activeHour: CARD_ACTIONS.railActiveHour,
+    activeHours: CARD_ACTIONS.railActiveHours,
+    activeDay: CARD_ACTIONS.railActiveDay,
+    activeDays: CARD_ACTIONS.railActiveDays,
+    activeToday: CARD_ACTIONS.railActiveToday,
   };
   let countsKnown = false;
   let buttons: ReturnType<typeof railCountButtons> = [];

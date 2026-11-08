@@ -5,7 +5,18 @@
 
 import { labelKey } from './labels.ts';
 import { normalizeRailSort, type RailSort } from './rail-sort.ts';
-import { parseSessionQuery, queryTokens, quoteQueryValue, sameQueryTerms, type FilterTerm } from './session-query.ts';
+import {
+  ACTIVE_HOUR,
+  ACTIVE_PREFIX,
+  activeWindowValue,
+  parseActiveWindow,
+  parseSessionQuery,
+  queryTokens,
+  quoteQueryValue,
+  sameQueryTerms,
+  type ActiveWindow,
+  type FilterTerm,
+} from './session-query.ts';
 import { cleanName } from './text.ts';
 import { VIEW_NAME_LIMIT, VIEW_QUERY_LIMIT } from './views.ts';
 
@@ -37,13 +48,35 @@ const RESERVED_RAIL_FILTER_KEYS = new Set(RESERVED_RAIL_FILTER_NAMES.map((name) 
 export type RailLens = 'running' | 'active' | 'unread' | 'input';
 export const RAIL_LENSES: readonly RailLens[] = ['running', 'active', 'unread', 'input'];
 
-// Lens words exclude archived sessions and agent runs.
+// The windows the reader chooses for the Active lens, as `active:` values. The panel saves the
+// choice as `railActiveWindow`.
+export type RailActiveWindow = '1h' | '3h' | '6h' | '12h' | 'today' | '2d';
+export const RAIL_ACTIVE_WINDOWS: readonly RailActiveWindow[] = ['1h', '3h', '6h', '12h', 'today', '2d'];
+export const DEFAULT_RAIL_ACTIVE_WINDOW: RailActiveWindow = '1h';
+
+export function normalizeRailActiveWindow(raw: unknown): RailActiveWindow {
+  return RAIL_ACTIVE_WINDOWS.includes(raw as RailActiveWindow) ? (raw as RailActiveWindow) : DEFAULT_RAIL_ACTIVE_WINDOW;
+}
+
+export function railActiveWindow(choice: RailActiveWindow): ActiveWindow {
+  return parseActiveWindow(choice) ?? ACTIVE_HOUR;
+}
+
+const LENS_EXCLUSIONS = '-is:archived -is:agentrun';
+
+// Lens words exclude archived sessions and agent runs. Active holds the default window here.
+// `railLensWords` writes it for any window.
 export const RAIL_LENS_WORDS: Readonly<Record<RailLens, string>> = {
-  running: 'is:running -is:archived -is:agentrun',
-  active: 'is:active -is:archived -is:agentrun',
-  unread: 'is:unread -is:archived -is:agentrun',
-  input: 'is:input -is:archived -is:agentrun',
+  running: `is:running ${LENS_EXCLUSIONS}`,
+  active: `${ACTIVE_PREFIX}:${DEFAULT_RAIL_ACTIVE_WINDOW} ${LENS_EXCLUSIONS}`,
+  unread: `is:unread ${LENS_EXCLUSIONS}`,
+  input: `is:input ${LENS_EXCLUSIONS}`,
 };
+
+// The words a press of this lens writes. Only Active reads the window.
+export function railLensWords(lens: RailLens, window: ActiveWindow = ACTIVE_HOUR): string {
+  return lens === 'active' ? `${ACTIVE_PREFIX}:${activeWindowValue(window)} ${LENS_EXCLUSIONS}` : RAIL_LENS_WORDS[lens];
+}
 
 // Unread and Needs input retain sessions until the query changes. Running and Active retain no departed sessions.
 export const RAIL_KEEPING_LENSES: readonly RailLens[] = ['unread', 'input'];
@@ -55,7 +88,11 @@ export const RAIL_KEEPING_LENSES: readonly RailLens[] = ['unread', 'input'];
 // words count among them, so a query that build stored reads back whole.
 export const RAIL_FILTER_STORED_QUERY_LIMIT =
   RAIL_FILTER_QUERY_LIMIT +
-  Math.max(OLD_NEEDS_YOU_WORDS.length, ...RAIL_LENSES.map((lens) => RAIL_LENS_WORDS[lens].length)) +
+  Math.max(
+    OLD_NEEDS_YOU_WORDS.length,
+    ...RAIL_LENSES.map((lens) => RAIL_LENS_WORDS[lens].length),
+    ...RAIL_ACTIVE_WINDOWS.map((choice) => railLensWords('active', railActiveWindow(choice)).length),
+  ) +
   1;
 
 export function isRailLens(raw: unknown): raw is RailLens {
@@ -226,6 +263,22 @@ function foldRailLens(query: string, stored: unknown): string {
   return lens === null ? query : withRailLensWords(query, lens);
 }
 
+// The key every positive word naming an Active window shares, so the Active lens holds at any
+// window. `is:active` names the hour. Every parsed term's key starts with its sign or its field,
+// so no typed word, such as the invalid `active:window`, produces this key.
+const ACTIVE_WINDOW_KEY = '#active-window';
+
+// The window a positive Active word names, or null for any other term.
+function termActiveWindow(term: FilterTerm): ActiveWindow | null {
+  if (term.negated === true) {
+    return null;
+  }
+  if (term.field === 'status' && term.needle === 'active') {
+    return ACTIVE_HOUR;
+  }
+  return term.field === 'active' ? (term.activeWindow ?? null) : null;
+}
+
 // One query word as the parser reads it, sign included, or null for a word that is not a
 // single term, such as a `find:` word.
 function termKey(word: string): string | null {
@@ -234,6 +287,9 @@ function termKey(word: string): string | null {
     return null;
   }
   const [term] = terms;
+  if (termActiveWindow(term)) {
+    return ACTIVE_WINDOW_KEY;
+  }
   return `${term.negated === true ? '-' : ''}${term.field}:${term.needle}`;
 }
 
@@ -271,10 +327,29 @@ export function railQueryHeldLens(query: string): RailLens | null {
 // for this lens rather than Custom. A word the parser reads as no term, such as an unknown
 // status, is still a word beside the lens's words.
 export function railQueryLens(query: string): RailLens | null {
-  if (queryWords(query).some((word) => word.key === null)) {
+  const words = queryWords(query);
+  if (words.some((word) => word.key === null)) {
     return null;
   }
-  return RAIL_LENSES.find((lens) => sameQueryTerms(query, RAIL_LENS_WORDS[lens])) ?? null;
+  const keys = words.map((word) => word.key).sort();
+  return (
+    RAIL_LENSES.find((lens) => {
+      const wanted = railLensKeys(lens).sort();
+      return wanted.length === keys.length && wanted.every((key, at) => key === keys[at]);
+    }) ?? null
+  );
+}
+
+// The window of the Active lens the query holds, or null when it holds no Active lens. A query
+// holding two Active words reads the first.
+export function railQueryActiveWindow(query: string): ActiveWindow | null {
+  return railQueryHeldLens(query) === 'active' ? firstActiveWindow(query) : null;
+}
+
+// The words of the lens the query holds, at the window the query holds them.
+export function railHeldLensWords(query: string): string | null {
+  const lens = railQueryHeldLens(query);
+  return lens === null ? null : railLensWords(lens, railQueryActiveWindow(query) ?? ACTIVE_HOUR);
 }
 
 function railLensKeys(lens: RailLens): (string | null)[] {
@@ -290,29 +365,62 @@ function withoutWords(query: string, drop: ReadonlySet<string | null>): string {
 }
 
 // The query without the words of the one lens it holds whole. A query that holds no lens, or
-// two lenses whole, comes back as it was.
+// two lenses whole, comes back as it was. An Active word at a window other than the lens's
+// window stays, so `is:active` beside `active:6h` still keeps only the last hour.
 export function withoutRailLenses(query: string): string {
   const held = railQueryHeldLens(query);
-  return held === null ? query : withoutWords(query, new Set(railLensKeys(held)));
+  if (held === null) {
+    return query;
+  }
+  const drop = new Set(railLensKeys(held));
+  const lensWindow = held === 'active' ? railQueryActiveWindow(query) : null;
+  return queryWords(query)
+    .filter((word) => {
+      if (word.key === null || !drop.has(word.key)) {
+        return true;
+      }
+      if (word.key !== ACTIVE_WINDOW_KEY || lensWindow === null) {
+        return false;
+      }
+      const window = termActiveWindow(parseSessionQuery(word.text).terms[0]);
+      return window !== null && activeWindowValue(window) !== activeWindowValue(lensWindow);
+    })
+    .map((word) => word.text)
+    .join(' ');
+}
+
+// The window of the query's first positive Active word, or null when it holds none.
+function firstActiveWindow(query: string): ActiveWindow | null {
+  const word = queryWords(query).find((each) => each.key === ACTIVE_WINDOW_KEY);
+  return word ? termActiveWindow(parseSessionQuery(word.text).terms[0]) : null;
 }
 
 // The query with every word of this lens. The missing words lead, and every word the query
-// already holds stays where the reader put it.
-function withRailLensWords(query: string, lens: RailLens): string {
+// already holds stays where the reader put it, so an Active word at another window stays.
+// The lens reads the first Active word, so the Active window's word leads unless the first
+// Active word already names that window. A typed `is:active` or `active:3h` then narrows the
+// list beside the lens, and the lens reads the window the press wrote.
+function withRailLensWords(query: string, lens: RailLens, window: ActiveWindow = ACTIVE_HOUR): string {
   const held = new Set(queryWords(query).map((word) => word.key));
-  const words = queryWords(RAIL_LENS_WORDS[lens])
-    .filter((word) => !held.has(word.key))
+  const first = lens === 'active' ? firstActiveWindow(query) : null;
+  const atWindow = first !== null && activeWindowValue(first) === activeWindowValue(window);
+  const words = queryWords(railLensWords(lens, window))
+    .filter((word) => (word.key === ACTIVE_WINDOW_KEY ? !atWindow : !held.has(word.key)))
     .map((word) => word.text);
   return [...words, query.trim()].filter(Boolean).join(' ');
 }
 
 // Adds the selected lens terms and removes completed competing lenses.
 // Shared terms and unrelated query words remain. A null lens removes every completed lens.
-export function withRailLens(query: string, lens: RailLens | null): string {
+export function withRailLens(query: string, lens: RailLens | null, window: ActiveWindow = ACTIVE_HOUR): string {
   if (lens === null) {
     return withoutWords(query, new Set(railQueryLenses(query).flatMap((held) => railLensKeys(held))));
   }
-  const written = withRailLensWords(query, lens);
+  // A held Active lens keeps its own window. Choosing a window moves it.
+  if (lens === 'active' && railQueryHeldLens(query) === 'active') {
+    return query;
+  }
+  const written = withRailLensWords(query, lens, window);
   const keep = new Set(railLensKeys(lens));
   const drop = new Set(
     railQueryLenses(written)
@@ -325,8 +433,16 @@ export function withRailLens(query: string, lens: RailLens | null): string {
 
 // What a count press writes. A press on the lens the query holds removes its words, and a press
 // on any other lens sets it in place of any other. Every other word stays.
-export function pressRailLens(query: string, lens: RailLens): string {
-  return railQueryHeldLens(query) === lens ? withoutRailLenses(query) : withRailLens(query, lens);
+// An Active press writes the reader's chosen window.
+export function pressRailLens(query: string, lens: RailLens, window: ActiveWindow = ACTIVE_HOUR): string {
+  return railQueryHeldLens(query) === lens ? withoutRailLenses(query) : withRailLens(query, lens, window);
+}
+
+// The query after the reader chooses another Active window. A held Active lens moves to the new
+// window, and any other query keeps its words. An Active word the reader typed at another window
+// stays.
+export function withRailActiveWindow(query: string, window: ActiveWindow): string {
+  return railQueryHeldLens(query) === 'active' ? withRailLens(withoutRailLenses(query), 'active', window) : query;
 }
 
 // Whether one parsed term names this value, whatever sign the reader gave it.

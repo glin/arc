@@ -11,6 +11,8 @@ import {
   normalizeSavedRailFilters,
   type RailLens,
   type SavedRailFilter,
+  normalizeRailActiveWindow,
+  type RailActiveWindow,
 } from './domain/rail-filters.ts';
 import { READ_LIMIT } from './turnread';
 import { normalizeAgentRead, type AgentReadRecord } from './domain/read.ts';
@@ -200,6 +202,8 @@ export interface PanelState {
   railShowRuns: boolean;
   // Quick filters enabled on the session list header. Saved filters do not replace this setting.
   railQuickFilters: RailLens[];
+  // The window an Active press writes. Saved filters do not replace this setting.
+  railActiveWindow: RailActiveWindow;
   railWidth: number;
   composerHidden: boolean;
   promptFloor: number;
@@ -353,6 +357,7 @@ export function normalizePanelState(raw: unknown, heldRailFilters?: readonly Sav
     railShowArchived: normalizeRailShowArchived(src.railShowArchived),
     railShowRuns: normalizeRailShowRuns(src.railShowRuns),
     railQuickFilters: normalizeRailQuickFilters(src.railQuickFilters, src.railHeadLenses),
+    railActiveWindow: normalizeRailActiveWindow(src.railActiveWindow),
     railWidth: clampRailWidth(src.railWidth),
     composerHidden: src.composerHidden === true,
     promptFloor: clampPromptFloor(src.promptFloor, Number.POSITIVE_INFINITY),

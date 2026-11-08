@@ -18,12 +18,22 @@ export function createSessionLabelIndex() {
   };
 }
 
-import { matchSessions, parseSessionQuery, railStatusRuns, type SessionQueryContext } from '../domain/session-query.ts';
+import {
+  ACTIVE_HOUR,
+  activeWindowHolds,
+  activeWindowValue,
+  matchSessions,
+  parseSessionQuery,
+  railStatusRuns,
+  type ActiveWindow,
+  type SessionQueryContext,
+} from '../domain/session-query.ts';
 import {
   RAIL_KEEPING_LENSES,
   RAIL_LENSES,
-  RAIL_LENS_WORDS,
   pressRailLens,
+  railHeldLensWords,
+  railQueryActiveWindow,
   railQueryHeldLens,
   withoutRailLenses,
   type RailLens,
@@ -208,9 +218,6 @@ export function railCacheName(cache: RailCacheSpan | null, now: number): string 
   return words ? `${name}, ${words}` : name;
 }
 
-// The Active lens includes activity from the last hour, independently of cache lifetime.
-export const ACTIVE_WINDOW_MS = 60 * 60 * 1000;
-
 // The parts of a card the Active lens reads: when the session last recorded activity, and how
 // long its prompt cache has left.
 export interface RailActiveCard {
@@ -218,11 +225,11 @@ export interface RailActiveCard {
   cache?: RailCacheSpan | null;
 }
 
-// Whether a session sits inside the Active lens's recency window: its prompt cache is still
-// live, or it recorded activity inside the last hour. Read against the caller's own clock, so
-// the answer moves as the clock does and never as a stored fact.
-export function railCardActive(card: RailActiveCard, now: number): boolean {
-  return railCacheState(card.cache ?? null, now) !== null || now - card.at < ACTIVE_WINDOW_MS;
+// Whether a session sits inside an Active window: its prompt cache is still live, or it recorded
+// activity inside the window. Read against the caller's own clock, so the answer moves as the
+// clock does and never as a stored fact. The window defaults to the hour `is:active` reads.
+export function railCardActive(card: RailActiveCard, now: number, window: ActiveWindow = ACTIVE_HOUR): boolean {
+  return activeWindowHolds(window, { at: card.at, clock: now }, railCacheState(card.cache ?? null, now) !== null);
 }
 
 // The parts of a card the Active lens reads beyond recency: the reader's own filing.
@@ -232,8 +239,8 @@ export interface RailLensCard extends RailActiveCard {
 }
 
 // The Active lens excludes archived sessions and agent runs, matching its -is:archived and -is:agentrun terms.
-export function railLensHolds(card: RailLensCard, now: number): boolean {
-  return !card.archived && card.runByAgent !== null && !card.runByAgent && railCardActive(card, now);
+export function railLensHolds(card: RailLensCard, now: number, window: ActiveWindow = ACTIVE_HOUR): boolean {
+  return !card.archived && card.runByAgent !== null && !card.runByAgent && railCardActive(card, now, window);
 }
 
 // The parts of a rail card whose wording moves with the clock alone.
@@ -610,7 +617,7 @@ export interface RailCounts {
   warm: number;
   expiring: number;
   // How many cards hold the Active lens: not archived, not run by an agent, and inside the
-  // recency window `railCardActive` reads.
+  // Active window `railCardActive` reads.
   active: number;
   // How many cards hold the Unread lens: not archived, not run by an agent, and unread.
   unread: number;
@@ -628,9 +635,10 @@ export interface RailCountsOptions {
 export const RAIL_SHOWN_BUCKETS: RailCountsOptions = { showArchived: true, showRuns: true };
 
 // What the Active figures count inside. `inQuery` keeps the cards the rail's query keeps,
-// and a caller with no query leaves it out.
+// and a caller with no query leaves it out. `activeWindow` defaults to the hour.
 export interface RailCountScope {
   inQuery?: (card: RailSectionCard) => boolean;
+  activeWindow?: ActiveWindow;
 }
 
 // Count lens matches within inQuery and the shown buckets. Running includes running, subagents and background statuses.
@@ -640,7 +648,7 @@ export function railCounts(
   cards: readonly RailSectionCard[],
   { showArchived, showRuns }: RailCountsOptions,
   now: number,
-  { inQuery = () => true }: RailCountScope = {},
+  { inQuery = () => true, activeWindow = ACTIVE_HOUR }: RailCountScope = {},
 ): RailCounts {
   let running = 0;
   let warm = 0;
@@ -668,7 +676,7 @@ export function railCounts(
     if (card.status === 'waiting') {
       input++;
     }
-    if (railCardActive(card, now)) {
+    if (railCardActive(card, now, activeWindow)) {
       active++;
       const cache = railCacheState(card.cache ?? null, now);
       if (cache === 'nearly-gone') {
@@ -681,22 +689,56 @@ export function railCounts(
   return { running, warm, expiring, active, unread, input };
 }
 
-// Identify queries that read cache warmth or Active recency. Stamp these clock-derived fields only when the query requires them.
+// Identify queries that read cache warmth or Active recency. Stamp cache warmth only when the query requires it.
 export function railQueryReadsCache(query: string): boolean {
   return parseSessionQuery(query).terms.some(
     (term) =>
-      term.field === 'status' && (term.needle === 'warm' || term.needle === 'active' || term.needle === 'needsyou'),
+      term.field === 'active' ||
+      (term.field === 'status' && (term.needle === 'warm' || term.needle === 'active' || term.needle === 'needsyou')),
   );
 }
 
-// Card fields for cache warmth and Active recency at the supplied clock time.
-export type RailClockCard<Card> = Card & { cacheWarm?: boolean; active?: boolean };
+// Every Active window the query reads, sign and all. `is:active` and `is:needsyou` read the hour.
+// A tick redraws when a card crosses the edge of one of them.
+export function railQueryActiveWindows(query: string): ActiveWindow[] {
+  return parseSessionQuery(query).terms.flatMap((term) =>
+    term.field === 'active'
+      ? term.activeWindow
+        ? [term.activeWindow]
+        : []
+      : term.field === 'status' && (term.needle === 'active' || term.needle === 'needsyou')
+        ? [ACTIVE_HOUR]
+        : [],
+  );
+}
+
+// Whether a card crossed the edge of any Active window these queries read between two clock
+// readings. Each distinct window is read once.
+export function railActiveEdgeCrossed(
+  cards: readonly RailActiveCard[],
+  queries: readonly string[],
+  before: number,
+  after: number,
+): boolean {
+  const windows = new Map<string, ActiveWindow>();
+  for (const window of queries.flatMap(railQueryActiveWindows)) {
+    windows.set(activeWindowValue(window), window);
+  }
+  return cards.some((card) =>
+    [...windows.values()].some(
+      (window) => railCardActive(card, before, window) !== railCardActive(card, after, window),
+    ),
+  );
+}
+
+// Card fields for cache warmth at the supplied clock time. Matching reads recency from the
+// card's own `at` against the clock the caller passes.
+export type RailClockCard<Card> = Card & { cacheWarm?: boolean };
 
 export function railClockCards<Card extends RailActiveCard>(cards: readonly Card[], at: number): RailClockCard<Card>[] {
   return cards.map((card) => ({
     ...card,
     cacheWarm: railCacheState(card.cache ?? null, at) !== null,
-    active: railCardActive(card, at),
   }));
 }
 
@@ -725,11 +767,12 @@ export function railShownCards<Card extends RailSectionCard>(
 ): RailClockCard<Card>[] {
   const pool: RailClockCard<Card>[] = stamp ? railClockCards(cards, at) : [...cards];
   const lens = railQueryHeldLens(rail.query);
-  if (lens === null) {
-    return matchSessions(pool, rail.query, rail.queryContext);
+  const lensWords = railHeldLensWords(rail.query);
+  if (lens === null || lensWords === null) {
+    return matchSessions(pool, rail.query, rail.queryContext, at);
   }
-  const rest = matchSessions(pool, withoutRailLenses(rail.query), rail.queryContext);
-  const matched = new Set(matchSessions(rest, RAIL_LENS_WORDS[lens]).map((card) => card.id));
+  const rest = matchSessions(pool, withoutRailLenses(rail.query), rail.queryContext, at);
+  const matched = new Set(matchSessions(rest, lensWords, undefined, at).map((card) => card.id));
   const still = kept && kept.query === rail.query && railKeepingQuery(rail.query) ? kept.ids : null;
   return rest.filter(
     (card) =>
@@ -754,6 +797,12 @@ export function railKeptAfter(rail: RailNarrowing, shown: readonly { id: string 
   return { query: rail.query, ids: new Set(shown.map((card) => card.id)) };
 }
 
+// The window the Active count reads: the window of the Active lens the query holds, or else the
+// reader's chosen window, which a press writes.
+export function railActiveCountWindow(query: string, chosen: ActiveWindow): ActiveWindow {
+  return railQueryActiveWindow(query) ?? chosen;
+}
+
 // Count each lens inside the query that remains after its press.
 // Active uses these scoped cache counts for its cache indication.
 export function railHeadCounts(
@@ -761,13 +810,15 @@ export function railHeadCounts(
   shown: RailCountsOptions,
   at: number,
   rail: RailNarrowing,
+  chosenWindow: ActiveWindow = ACTIVE_HOUR,
 ): RailCounts {
+  const activeWindow = railActiveCountWindow(rail.query, chosenWindow);
   const byRest = new Map<string, RailCounts>();
   const countsFor = (lens: RailLens): RailCounts => {
-    const rest = withoutRailLenses(pressRailLens(rail.query, lens));
+    const rest = withoutRailLenses(pressRailLens(rail.query, lens, activeWindow));
     let counts = byRest.get(rest);
     if (!counts) {
-      counts = railCountsInRest(cards, shown, at, rest, rail.queryContext);
+      counts = railCountsInRest(cards, shown, at, rest, activeWindow, rail.queryContext);
       byRest.set(rest, counts);
     }
     return counts;
@@ -785,14 +836,15 @@ function railCountsInRest(
   shown: RailCountsOptions,
   at: number,
   rest: string,
+  activeWindow: ActiveWindow,
   queryContext?: SessionQueryContext,
 ): RailCounts {
   if (!parseSessionQuery(rest).terms.length) {
-    return railCounts(cards, shown, at);
+    return railCounts(cards, shown, at, { activeWindow });
   }
   const pool: RailClockCard<RailSectionCard>[] = railQueryReadsCache(rest) ? railClockCards(cards, at) : [...cards];
-  const kept = new Set(matchSessions(pool, rest, queryContext).map((card) => card.id));
-  return railCounts(cards, shown, at, { inQuery: (card) => kept.has(card.id) });
+  const kept = new Set(matchSessions(pool, rest, queryContext, at).map((card) => card.id));
+  return railCounts(cards, shown, at, { inQuery: (card) => kept.has(card.id), activeWindow });
 }
 
 // The lens a rail head count presses.
@@ -813,6 +865,23 @@ export interface RailCountWords {
   unreadHint: string;
   inputHint: string;
   pressedHint: string;
+  // The parts of the Active window phrase, such as "in the last 6 hours" or "today".
+  activeWithin: string;
+  activeHour: string;
+  activeHours: string;
+  activeDay: string;
+  activeDays: string;
+  activeToday: string;
+}
+
+// The Active window as words, such as "in the last hour", "in the last 6 hours", or "today".
+export function railActiveWindowPhrase(window: ActiveWindow, words: RailCountWords): string {
+  if (window.unit === 'today') {
+    return words.activeToday;
+  }
+  const [one, many] =
+    window.unit === 'hour' ? [words.activeHour, words.activeHours] : [words.activeDay, words.activeDays];
+  return window.count === 1 ? `${words.activeWithin} ${one}` : `${words.activeWithin} ${window.count} ${many}`;
 }
 
 // What the rail is filtered by, as the head row reads it: the saved filter id and the live
@@ -844,17 +913,27 @@ export function railCountPressed(kind: RailCountKind, lens: RailHeadLens): boole
 // Configured shortcuts draw while selected or while their scoped session count is positive.
 // Before the catalog supplies counts, only a selected shortcut draws, without a figure, so a restored selection stays clearable.
 // Naming holds their counts and disables presses. Active adds its scoped cache information.
+// The Active label stays "Active" at every window. Its accessible name names the window. Its hint
+// names the window until the count is pressed, and then reads the pressed hint.
 export function railCountButtons(
   counts: RailCounts | null,
   lens: RailHeadLens,
   words: RailCountWords,
   headLenses: readonly RailLens[] = DEFAULT_RAIL_QUICK_FILTERS,
+  chosenWindow: ActiveWindow = ACTIVE_HOUR,
 ): RailCountButton[] {
+  const within = railActiveWindowPhrase(railActiveCountWindow(lens.query, chosenWindow), words);
   const hints: Record<RailCountKind, string> = {
     running: words.runningHint,
-    active: words.activeHint,
+    active: `${words.activeHint} ${within}`,
     unread: words.unreadHint,
     input: words.inputHint,
+  };
+  const named: Record<RailCountKind, string> = {
+    running: words.running,
+    active: `${words.active} ${within}`,
+    unread: words.unread,
+    input: words.input,
   };
   return RAIL_LENSES.filter(
     (kind) => headLenses.includes(kind) && ((counts?.[kind] ?? 0) > 0 || railCountPressed(kind, lens)),
@@ -882,8 +961,8 @@ export function railCountButtons(
       pressed,
       name:
         count === undefined
-          ? words[kind]
-          : `${words[kind]}, ${figure} ${count === 1 ? words.session : words.sessions}${cacheDetail ? `. ${cacheDetail}` : ''}`,
+          ? named[kind]
+          : `${named[kind]}, ${figure} ${count === 1 ? words.session : words.sessions}${cacheDetail ? `. ${cacheDetail}` : ''}`,
       hint: pressed ? words.pressedHint : hints[kind],
     };
   });
@@ -1096,7 +1175,7 @@ export function railSections<T extends RailSectionCard>(
     // A view that does not keep archived sessions never sees one, so its section cannot
     // draw a card the reader put away.
     const pool = view.archived ? [...active, ...archived] : active;
-    const matched = matchSessions(pool, view.query, queryContext);
+    const matched = matchSessions(pool, view.query, queryContext, now);
     for (const card of matched) {
       claimed.add(card.id);
     }

@@ -240,6 +240,7 @@ test('a Group by or Rows press the rail holds is the value every save writes', (
     showArchived: true,
     showRuns: true,
     headLenses: ['active'],
+    activeWindow: '6h',
     groupBy: 'status',
     density: 'compact',
   }));
@@ -287,7 +288,7 @@ test('a browser copy that names an old lens opens with the lens words in the que
     ],
     [
       { railFilterId: 'all', railFilter: 'is:warm -is:archived -is:agentrun' },
-      { filter: 'is:active -is:archived -is:agentrun', filterId: 'all' },
+      { filter: 'active:1h -is:archived -is:agentrun', filterId: 'all' },
     ],
     [
       { railFilterId: 'all', railFilter: 'is:running' },
@@ -295,7 +296,7 @@ test('a browser copy that names an old lens opens with the lens words in the que
     ],
     [
       { railFilterId: 'f2', railFilter: 'label:ui', railLens: 'active' },
-      { filter: 'is:active -is:archived -is:agentrun label:ui', filterId: 'f2' },
+      { filter: 'active:1h -is:archived -is:agentrun label:ui', filterId: 'f2' },
     ],
     [{ railLens: 'warm' }, { filter: '', filterId: '' }],
   ];

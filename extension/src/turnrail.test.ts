@@ -1897,7 +1897,7 @@ test('partial zero attention retains uncertainty through rail names, menus and q
   for (const query of ['is:read', 'is:unread', '-is:read', '-is:unread'])
     assert.deepEqual(matchSessions(rows, query), []);
   for (const query of ['is:needsyou', '-is:needsyou'])
-    assert.deepEqual(matchSessions([{ ...rows[0], active: true }], query), []);
+    assert.deepEqual(matchSessions(rows, query, undefined, rows[0].at), []);
   rows[0].unread = false;
   assert.deepEqual(matchSessions(rows, 'is:read'), rows);
 });

@@ -1,6 +1,7 @@
 import { test } from 'vitest';
 import assert from 'node:assert';
 import {
+  activeNote,
   cacheExpiryNote,
   costNote,
   isNote,
@@ -90,6 +91,15 @@ test('an unknown is value is corrected with every value the grammar takes', () =
   );
   assert.equal(isNote('is:archived'), null);
   assert.equal(isNote('is:agentrun'), null);
+});
+
+test('an active: value that names no window receives a correction in the spelling the reader typed', () => {
+  const use = 'names no window. Use active:6h, active:2d or active:today.';
+  assert.equal(activeNote('active:6x'), `active:6x ${use}`);
+  assert.equal(activeNote('label:ui active:"6h"'), `active:"6h" ${use}`);
+  assert.equal(activeNote('-active:0h'), `-active:0h ${use}`);
+  assert.equal(activeNote('active:6h active:today'), null);
+  assert.equal(activeNote('active:'), null);
 });
 
 test('an invalid cost value receives one stable correction', () => {

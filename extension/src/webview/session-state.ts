@@ -1,5 +1,10 @@
 import type { RailSort } from '../domain/rail-sort.ts';
-import { migrateStoredRailLens, type RailLens } from '../domain/rail-filters.ts';
+import {
+  migrateStoredRailLens,
+  normalizeRailActiveWindow,
+  type RailActiveWindow,
+  type RailLens,
+} from '../domain/rail-filters.ts';
 import type { TurnComment } from '../view/comments.ts';
 import { SESSION_MENU_SECTIONS } from '../view/card-menu.ts';
 import {
@@ -27,6 +32,7 @@ export interface InitialRailState {
   showArchived: boolean;
   showRuns: boolean;
   headLenses: RailLens[];
+  activeWindow: RailActiveWindow;
   width: number;
   folds: Record<string, unknown>;
   composerHidden: boolean;
@@ -119,6 +125,7 @@ export function createPanelSessionState(options: SessionStateOptions): PanelSess
     showArchived: normalizeRailShowArchived(initial.railShowArchived),
     showRuns: normalizeRailShowRuns(initial.railShowRuns),
     headLenses: normalizeRailQuickFilters(initial.railQuickFilters, initial.railHeadLenses),
+    activeWindow: normalizeRailActiveWindow(initial.railActiveWindow),
     width: typeof initial.railWidth === 'number' ? initial.railWidth : 0,
     folds: record(initial.railFolds),
     composerHidden: initial.composerHidden === true,
@@ -146,6 +153,7 @@ export function createPanelSessionState(options: SessionStateOptions): PanelSess
         showArchived: initialRail.showArchived,
         showRuns: initialRail.showRuns,
         headLenses: initialRail.headLenses,
+        activeWindow: initialRail.activeWindow,
         groupBy: initialRail.groupBy,
         density: initialRail.density,
       };
@@ -163,6 +171,7 @@ export function createPanelSessionState(options: SessionStateOptions): PanelSess
           railShowArchived: rail.showArchived,
           railShowRuns: rail.showRuns,
           railQuickFilters: rail.headLenses,
+          railActiveWindow: rail.activeWindow,
           railWidth: rail.width,
           composerHidden: options.composerHidden(),
           promptFloor: options.promptFloor() ?? initialPromptFloor,

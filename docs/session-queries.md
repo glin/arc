@@ -44,7 +44,19 @@ A quote before a leading `-`, `id:`, or `session:` keeps it literal. Quoting onl
 
 Unknown read state matches neither `is:read` nor `is:unread`, including negations.
 
-`is:archived` selects archived sessions. `is:agentrun` selects agent runs. Both read their underlying facts independently of visible buckets. In the panel, `is:agentrun` excludes a non-archived session that is pinned or labelled, as [the session list](rail-and-navigation.md#session-list) files it. CLI listings and export read the classification alone, so a pinned or labelled agent run stays one there. `is:warm` uses prompt-cache lifetime against the browser clock, including archived sessions and agent runs. `is:active` matches a warm cache or activity within the last hour. `is:needsyou` requires Active and either unread or Needs input. [Status projection](rail-and-navigation.md#read-and-status-state) owns how rows obtain these facts.
+`is:archived` selects archived sessions. `is:agentrun` selects agent runs. Both read their underlying facts independently of visible buckets. In the panel, `is:agentrun` excludes a non-archived session that is pinned or labelled, as [the session list](rail-and-navigation.md#session-list) files it. CLI listings and export read the classification alone, so a pinned or labelled agent run stays one there. `is:warm` uses prompt-cache lifetime against the browser clock, including archived sessions and agent runs. `is:active` matches exactly what `active:1h` matches. `is:needsyou` requires `is:active` and either unread or Needs input. [Status projection](rail-and-navigation.md#read-and-status-state) owns how rows obtain these facts.
+
+### Recency
+
+`active:` keeps sessions with a warm prompt cache or recorded activity inside a window that ends at the browser clock. Write a positive whole number followed by `h` for hours or `d` for days, or write `today`. A day is 24 hours. `today` starts at local midnight, on every day length. Values ignore case. `parseActiveWindow` and `activeWindowHolds` in `domain/session-query.ts` own the grammar and the match. Like `is:warm`, `active:` keeps archived sessions and agent runs.
+
+This query keeps sessions labelled `release` that were active in the last 6 hours:
+
+```text
+active:6h label:release
+```
+
+An empty `active:` adds no term. Any other value that names no window, including a quoted value, stays visible, empties results, and receives correction guidance.
 
 ### Session identity
 

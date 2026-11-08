@@ -24,6 +24,12 @@ import {
   railFilterTermSelected,
   sameRailFilterLens,
   toggleRailFilterTerm,
+  normalizeRailActiveWindow,
+  RAIL_ACTIVE_WINDOWS,
+  railActiveWindow,
+  railLensWords,
+  railQueryActiveWindow,
+  withRailActiveWindow,
 } from './rail-filters.ts';
 
 test('saved rail filters normalize every stored field and retain live terms', () => {
@@ -55,7 +61,7 @@ test('a saved rail filter stored with a lens loads with the Active words in its 
   assert.deepEqual(
     kept.map((filter) => [filter.id, filter.query]),
     [
-      ['f1', 'is:active -is:archived -is:agentrun label:costs'],
+      ['f1', 'active:1h -is:archived -is:agentrun label:costs'],
       // A retired Needs you id or lens preserves its query without applying the Warm rewrite.
       ['f2', ''],
       ['f3', 'label:mine'],
@@ -234,7 +240,7 @@ test('a stored rail lens from an older build loads as the lens words in the quer
   // A lens stored as rail state joins its words to the saved query.
   assert.deepEqual(migrateStoredRailLens({ filterId: 'f1', query: 'label:ui label:bug', lens: 'active' }), {
     filterId: 'f1',
-    query: 'is:active -is:archived -is:agentrun label:ui label:bug',
+    query: 'active:1h -is:archived -is:agentrun label:ui label:bug',
   });
   assert.deepEqual(migrateStoredRailLens({ filterId: ALL_RAIL_FILTER_ID, query: 'label:ui', lens: 'needs-you' }), {
     filterId: ALL_RAIL_FILTER_ID,
@@ -272,7 +278,7 @@ test('a lens press adds and removes its own words and keeps every other word', (
   // In any order, beside words the reader typed between them.
   assert.equal(withRailLens('-is:agentrun label:"release 0.4" is:active -is:archived', null), 'label:"release 0.4"');
   // A word the query already holds is not written twice.
-  assert.equal(withRailLens('-is:archived label:ui', 'active'), 'is:active -is:agentrun -is:archived label:ui');
+  assert.equal(withRailLens('-is:archived label:ui', 'active'), 'active:1h -is:agentrun -is:archived label:ui');
   // A lens held only in part is the reader's own words, so nothing reads it as pressed and a
   // removal leaves it.
   assert.equal(railQueryHoldsLens('is:active label:ui', 'active'), false);
@@ -356,7 +362,7 @@ test('a word the parser reads as no term beside a lens words makes the funnel re
 test('the Running, Unread and Needs input lenses write their status beside the Active lens filing words', () => {
   assert.deepEqual(RAIL_LENS_WORDS, {
     running: 'is:running -is:archived -is:agentrun',
-    active: 'is:active -is:archived -is:agentrun',
+    active: 'active:1h -is:archived -is:agentrun',
     unread: 'is:unread -is:archived -is:agentrun',
     input: 'is:input -is:archived -is:agentrun',
   });
@@ -414,6 +420,45 @@ test('All clears every lens a query holds whole, so the rail returns to all sess
   assert.equal(withRailLens(stored, null), '');
   assert.equal(withRailLens(`label:ui ${stored} cost:>5`, null), 'label:ui cost:>5');
   assert.equal(withRailLens(`${active} ${unread} ${input} is:done`, null), 'is:done');
+});
+
+// The reader chooses the Active window, and a press writes it. The lens reads as Active at every
+// window, so the count stays pressed and a second press clears it.
+test('every Active window reads as the Active lens', () => {
+  assert.equal(normalizeRailActiveWindow(undefined), '1h');
+  assert.equal(normalizeRailActiveWindow('5h'), '1h');
+  for (const choice of RAIL_ACTIVE_WINDOWS) {
+    const window = railActiveWindow(choice);
+    const words = railLensWords('active', window);
+    assert.equal(words, `active:${choice} -is:archived -is:agentrun`);
+    assert.equal(pressRailLens('label:ui', 'active', window), `${words} label:ui`, choice);
+    assert.equal(railQueryLens(words), 'active', choice);
+    assert.equal(railQueryLens(words.split(' ').reverse().join(' ')), 'active', choice);
+    assert.equal(railQueryHeldLens(`label:ui ${words}`), 'active', choice);
+    assert.deepEqual(railQueryActiveWindow(`label:ui ${words}`), window, choice);
+    assert.equal(pressRailLens(`${words} label:ui`, 'active'), 'label:ui', choice);
+    // Choosing another window moves a held lens and leaves any other query alone.
+    assert.equal(withRailActiveWindow(`${RAIL_LENS_WORDS.active} label:ui`, window), `${words} label:ui`, choice);
+    assert.equal(withRailActiveWindow('active:3h label:ui', window), 'active:3h label:ui', choice);
+    // A typed `is:active` beside the held lens stays, and the lens reads the new window.
+    const typed = withRailActiveWindow('active:12h is:active -is:archived -is:agentrun label:ui', window);
+    assert.deepEqual(railQueryActiveWindow(typed), window, choice);
+    assert.ok(typed.split(' ').includes('is:active'), typed);
+    assert.equal(
+      withoutRailLenses('active:12h is:active -is:archived -is:agentrun label:ui'),
+      'is:active label:ui',
+      choice,
+    );
+    // Another lens replaces it whole.
+    assert.equal(withRailLens(`${words} label:ui`, 'unread'), `${RAIL_LENS_WORDS.unread} label:ui`, choice);
+  }
+  // A typed window outside the choices and the stored `is:active` both hold the lens.
+  assert.deepEqual(railQueryActiveWindow('active:5h -is:archived -is:agentrun'), { unit: 'hour', count: 5 });
+  assert.deepEqual(railQueryActiveWindow('is:active -is:archived -is:agentrun'), { unit: 'hour', count: 1 });
+  // A negated window, an invalid window, and the words alone hold no lens.
+  assert.equal(railQueryHeldLens('-active:6h -is:archived -is:agentrun'), null);
+  assert.equal(railQueryHeldLens('active:6x -is:archived -is:agentrun'), null);
+  assert.equal(railQueryLens('active:6h'), null);
 });
 
 test('the funnel names each lens, and a typed synonym holds its lens', () => {

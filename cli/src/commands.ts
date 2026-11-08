@@ -646,7 +646,7 @@ const definitions: readonly Command[] = [
       output: [
         'JSON: version, status, and reason when available. Status is applied, failed, or unknown.',
         'Applied confirms browser application and persistent save. Read the panel before retrying unknown.',
-        'Queries support session:ID, provider-qualified identities, OR groups, title:, label:, agent:, is:, find:, in:, cost:, and cache-expiry:.',
+        'Queries support session:ID, provider-qualified identities, OR groups, title:, label:, agent:, is:, active:, find:, in:, cost:, and cache-expiry:.',
       ],
       refusals: [
         'Supply one nonempty positional query, one --query QUERY, or --clear. Queries accept at most 200 characters and must use valid session list syntax.',

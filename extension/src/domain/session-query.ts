@@ -2,7 +2,7 @@
 
 import { labelKey } from './labels.ts';
 
-export type SessionField = 'session' | 'agent' | 'title' | 'labels' | 'cost' | 'cache-expiry' | 'status';
+export type SessionField = 'session' | 'agent' | 'title' | 'labels' | 'cost' | 'cache-expiry' | 'status' | 'active';
 
 export interface DecimalValue {
   digits: string;
@@ -33,15 +33,31 @@ export interface FilterTerm {
   // Present only when a cost or cache-expiry value follows the strict comparison grammar. An
   // absent comparison on either field keeps the value available for the visible correction.
   comparison?: NumericComparison;
+  // Present only when an `active:` value names a window. An absent window keeps the value
+  // available for the visible correction.
+  activeWindow?: ActiveWindow;
+}
+
+// How far back `active:` reaches: a whole number of hours or days, or since local midnight.
+export type ActiveWindow = { unit: 'hour' | 'day'; count: number } | { unit: 'today' };
+
+// The window `is:active` and `is:needsyou` read.
+export const ACTIVE_HOUR: ActiveWindow = { unit: 'hour', count: 1 };
+
+// The session's last activity time and the caller's clock, both in epoch milliseconds. Recency
+// moves with the clock alone, so the caller supplies the clock the way it supplies `cacheWarm`.
+export interface SessionRecency {
+  at: number;
+  clock: number;
 }
 
 export type SearchWhere = 'both' | 'prompt' | 'summary';
 
 // `warm` and `active` are not turn states. `warm` asks about the session's prompt cache, which
 // the caller answers with `cacheWarm` because the cache runs out on a clock this module does
-// not hold. `active` asks whether the session sits inside its own recency window, which the
-// caller answers with `active` for the same reason. `needsyou` asks for an active session that
-// waits on the reader or is unread, so it reads the same `active` fact beside the turn state.
+// not hold. `active` asks whether the cache is warm or the session recorded activity within
+// `ACTIVE_HOUR` of the caller's clock. `needsyou` asks for an active session that waits on the
+// reader or is unread, so it reads the same fact beside the turn state.
 // `archived` and `agentrun` are not turn states either. Each asks about a fact the reader or the agent put on the session, which the
 // caller carries on the session it hands in.
 export type SessionStatus =
@@ -106,6 +122,7 @@ export const IS_VALUES: SessionStatus[] = [
   'agentrun',
 ];
 export const IS_SYNONYMS: Record<string, SessionStatus> = { waiting: 'input', blocked: 'input' };
+export const ACTIVE_PREFIX = 'active';
 export const SESSION_AXES: SessionAxis[] = [
   { prefix: 'id', field: 'session' },
   { prefix: 'session', field: 'session' },
@@ -115,6 +132,7 @@ export const SESSION_AXES: SessionAxis[] = [
   { prefix: 'cost', field: 'cost' },
   { prefix: 'cache-expiry', field: 'cache-expiry' },
   { prefix: IS_PREFIX, field: 'status' },
+  { prefix: ACTIVE_PREFIX, field: 'active' },
 ];
 
 // The fields whose value follows the strict `>`/`<` comparison grammar `cost:` established.
@@ -128,6 +146,63 @@ const QUERY_SPACE = /\s/;
 // whole or decimal number, and nothing else.
 const NUMERIC_COMPARISON_VALUE = /^(>|<)(\d+(?:\.\d+)?)$/;
 const DECIMAL_VALUE = /^(\d+)(?:\.(\d+))?(?:e([+-]?\d+))?$/i;
+// An `active:` span: a whole number, then `h` for hours or `d` for days.
+const ACTIVE_SPAN_VALUE = /^(\d+)([hd])$/;
+const ACTIVE_TODAY = 'today';
+const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
+
+// The window an `active:` value names, or null. Case is ignored. A count must be at least one.
+export function parseActiveWindow(raw: string): ActiveWindow | null {
+  const value = raw.toLowerCase();
+  if (value === ACTIVE_TODAY) {
+    return { unit: 'today' };
+  }
+  const match = ACTIVE_SPAN_VALUE.exec(value);
+  const count = match ? Number(match[1]) : 0;
+  if (!match || !Number.isSafeInteger(count) || count < 1) {
+    return null;
+  }
+  return { unit: match[2] === 'h' ? 'hour' : 'day', count };
+}
+
+// The value `active:` takes for this window, such as `6h`, `2d`, or `today`.
+export function activeWindowValue(window: ActiveWindow): string {
+  return window.unit === 'today' ? ACTIVE_TODAY : `${window.count}${window.unit === 'hour' ? 'h' : 'd'}`;
+}
+
+// The local midnight that starts the day `back` days before the one holding `now`. Calendar
+// fields walk the days, so a daylight-saving change never moves the edge off midnight.
+export function localDayStart(now: number, back = 0): number {
+  const day = new Date(now);
+  return new Date(day.getFullYear(), day.getMonth(), day.getDate() - back).getTime();
+}
+
+// The start of today for one clock value. One match reads the same clock for every session, so
+// the last answer serves the next session.
+let todayFor: { clock: number; start: number } | null = null;
+function todayStart(clock: number): number {
+  if (todayFor?.clock !== clock) {
+    todayFor = { clock, start: localDayStart(clock) };
+  }
+  return todayFor.start;
+}
+
+// Whether a session sits inside the window: its prompt cache is warm, or it recorded activity
+// inside the window that ends at the caller's clock. Hours and days are fixed spans. `today`
+// starts at local midnight. Without recency the answer is false, whatever the cache says.
+export function activeWindowHolds(window: ActiveWindow, recency: SessionRecency | null, cacheWarm: boolean): boolean {
+  if (!recency) {
+    return false;
+  }
+  if (cacheWarm) {
+    return true;
+  }
+  if (window.unit === 'today') {
+    return recency.at >= todayStart(recency.clock);
+  }
+  return recency.clock - recency.at < window.count * (window.unit === 'hour' ? HOUR_MS : DAY_MS);
+}
 
 function decimalValue(raw: string): DecimalValue | null {
   const match = DECIMAL_VALUE.exec(raw);
@@ -351,6 +426,17 @@ export function parseSessionQuery(query: string): SessionQuery {
         out.where = where;
       } else if (value) {
         out.unknownWhere.push(value);
+      }
+      continue;
+    }
+    if (prefix === ACTIVE_PREFIX) {
+      // An empty value adds no term, as an empty `is:` does. A value naming no window stays as
+      // an invalid term, which empties the list and receives correction guidance.
+      const window = quoted || !typed ? null : parseActiveWindow(typed);
+      if (window) {
+        out.terms.push({ field: 'active', needle: activeWindowValue(window), activeWindow: window, ...mark });
+      } else if (typed) {
+        out.terms.push({ field: 'active', needle: typed, ...mark });
       }
       continue;
     }
@@ -597,7 +683,8 @@ function plainTermHolds(
   cacheWarm = false,
   runByAgent: boolean | null = false,
   archived = false,
-  active = false,
+  // The last activity time and the caller's clock. Null where the caller asks no recency.
+  recency: SessionRecency | null = null,
   // The exact count of cache-expiry returns from lifetime indexed facts. Null where the
   // source cannot answer, which holds for neither comparison the way an unpriced cost does.
   cacheExpiryCount: number | null = null,
@@ -619,6 +706,9 @@ function plainTermHolds(
       return compared > 0;
     }
     return !atLeast && compared < 0;
+  }
+  if (term.field === 'active') {
+    return !!term.activeWindow && activeWindowHolds(term.activeWindow, recency, cacheWarm);
   }
   // Labels are selected names and match exactly after locale folding. Titles and agent
   // names are prose and retain substring matching.
@@ -649,14 +739,13 @@ function plainTermHolds(
     if (term.needle === 'agentrun') {
       return runByAgent === true;
     }
-    // The reader's own recency window, answered by the caller against its own clock the same
-    // way `warm` is above.
+    // `is:active` reads the same window as `active:1h`.
     if (term.needle === 'active') {
-      return active;
+      return activeWindowHolds(ACTIVE_HOUR, recency, cacheWarm);
     }
     // An active session that waits on the reader or that the reader has not read.
     if (term.needle === 'needsyou') {
-      return active && (status === 'waiting' || unread);
+      return activeWindowHolds(ACTIVE_HOUR, recency, cacheWarm) && (status === 'waiting' || unread);
     }
     return railStatusRuns(status);
   }
@@ -682,7 +771,7 @@ export function sessionTermHolds(
   cacheWarm = false,
   runByAgent: boolean | null = false,
   archived = false,
-  active = false,
+  recency: SessionRecency | null = null,
   cacheExpiryCount: number | null = null,
   cacheExpiryAtLeast = false,
   sessionId = '',
@@ -691,7 +780,13 @@ export function sessionTermHolds(
   if (term.invalid || term.unresolved || (term.field === 'status' && term.needle === 'agentrun' && runByAgent === null))
     return false;
   if (!readKnown && term.field === 'status' && (term.needle === 'read' || term.needle === 'unread')) return false;
-  if (!readKnown && term.field === 'status' && term.needle === 'needsyou' && active && status !== 'waiting')
+  if (
+    !readKnown &&
+    term.field === 'status' &&
+    term.needle === 'needsyou' &&
+    status !== 'waiting' &&
+    activeWindowHolds(ACTIVE_HOUR, recency, cacheWarm)
+  )
     return false;
   if (term.field === 'session') {
     const identities = term.identities;
@@ -714,7 +809,7 @@ export function sessionTermHolds(
     cacheWarm,
     runByAgent,
     archived,
-    active,
+    recency,
     cacheExpiryCount,
     cacheExpiryAtLeast,
   );
@@ -775,10 +870,9 @@ export function matchSessions<
     // Whether the reader archived this session, which `is:archived` answers, whether or not
     // the caller's own Show-archived switch draws the session.
     archived?: boolean;
-    // Whether this session sits inside its own recency window, answered by the caller against
-    // its own clock. A caller that never asks about recency leaves it out, and `is:active`
-    // then matches nothing, which is the answer for a list with no recency facts.
-    active?: boolean;
+    // When the session last recorded activity, in epoch milliseconds. `is:active`, `is:needsyou`,
+    // and `active:` read it against the clock the caller passes to `matchSessions`.
+    at?: number;
     // The exact count of cache-expiry returns from lifetime indexed facts, read the same way
     // `costDollars` is: null where the source cannot answer, which matches neither comparison.
     cacheExpiryCount?: number | null;
@@ -786,10 +880,25 @@ export function matchSessions<
     // `costAtLeast` is.
     cacheExpiryAtLeast?: boolean;
   },
->(sessions: T[], query: string, context?: SessionQueryContext): T[] {
+>(
+  sessions: T[],
+  query: string,
+  context?: SessionQueryContext,
+  // The caller's clock in epoch milliseconds. A caller that never asks about recency leaves it
+  // out, and `is:active`, `is:needsyou`, and `active:` then match nothing, which is the answer
+  // for a list with no recency facts.
+  clock?: number,
+): T[] {
   const { terms } = resolveSessionQuery(query, context);
-  // Invalid numeric comparisons match no session.
-  if (terms.some((term) => (NUMERIC_FIELDS.includes(term.field) && !term.comparison) || term.invalid)) {
+  // Invalid numeric comparisons and `active:` values that name no window match no session.
+  if (
+    terms.some(
+      (term) =>
+        (NUMERIC_FIELDS.includes(term.field) && !term.comparison) ||
+        (term.field === 'active' && !term.activeWindow) ||
+        term.invalid,
+    )
+  ) {
     return [];
   }
   if (!terms.length) {
@@ -809,7 +918,7 @@ export function matchSessions<
         session.cacheWarm === true,
         session.runByAgent === null ? null : session.runByAgent === true,
         session.archived === true,
-        session.active === true,
+        clock === undefined || typeof session.at !== 'number' ? null : { at: session.at, clock },
         session.cacheExpiryCount ?? null,
         session.cacheExpiryAtLeast === true,
         session.sessionId ?? session.id ?? '',
@@ -863,7 +972,7 @@ export function listingTermHolds(
     false,
     session.agentRun === true,
     session.archived,
-    false,
+    null,
     null,
     false,
     session.sessionId,

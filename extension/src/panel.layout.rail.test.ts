@@ -8,7 +8,7 @@ import type { Page } from 'playwright-core';
 import { CARD_ACTIONS, RAIL_MIN_WIDTH, RAIL_WIDTH_DEFAULT, RAIL_WIDTH_MIN } from './turnview.ts';
 import { labelEditorRows } from './turnlabels.ts';
 import { RAIL_FILTER_NAME_LIMIT } from './domain/rail-filters.ts';
-import { ACTIVE_WINDOW_MS, type RailStatus } from './view/rail.ts';
+import type { RailStatus } from './view/rail.ts';
 import { MAX_RAIL_FILTER_NAME, NOW, SIX_QUESTION_ASK, pageHtml, renderPayload, themed } from './panelfixture.ts';
 import {
   rovingSelector,
@@ -22,6 +22,9 @@ import {
   EDITOR_LABELS,
   SessionLabelLine,
 } from '../test/layout.ts';
+
+// The hour `is:active` and the default Active window read.
+const ACTIVE_WINDOW_MS = 60 * 60 * 1000;
 
 // Open the session-list filter through its search control.
 
@@ -2710,7 +2713,7 @@ test(
         assert.equal(measured.boxes, 0, `the filter box took the row at ${width}px while it held no query`);
         assert.deepEqual(
           measured.names,
-          ['Active, 2 sessions. Some active sessions have a cache that is expiring.'],
+          ['Active in the last hour, 2 sessions. Some active sessions have a cache that is expiring.'],
           `the count is named ${JSON.stringify(measured.names)} at ${width}px`,
         );
       }

@@ -797,6 +797,7 @@ test('the saved panel state is rebuilt rather than trusted', () => {
     railShowArchived: true,
     railShowRuns: true,
     railQuickFilters: ['running', 'active', 'input'],
+    railActiveWindow: '1h',
     railWidth: RAIL_WIDTH_DEFAULT,
     composerHidden: false,
     promptFloor: 4.2,
@@ -1080,7 +1081,7 @@ test('a stored rail lens from an older build loads as the lens words in the quer
   );
   assert.deepEqual(
     lensOf(normalizePanelState({ railFilterId: 'all', railFilter: '-is:agentrun is:warm -is:archived' })),
-    { railFilter: 'is:active -is:archived -is:agentrun', railFilterId: 'all' },
+    { railFilter: 'active:1h -is:archived -is:agentrun', railFilterId: 'all' },
   );
   assert.deepEqual(lensOf(normalizePanelState({ railFilterId: 'all', railFilter: 'is:running' })), {
     railFilter: 'is:running',
@@ -1088,7 +1089,7 @@ test('a stored rail lens from an older build loads as the lens words in the quer
   });
   // A lens stored as rail state joins its query, and an unknown one leaves the query alone.
   assert.deepEqual(lensOf(normalizePanelState({ railFilterId: 'all', railFilter: 'label:ui', railLens: 'active' })), {
-    railFilter: 'is:active -is:archived -is:agentrun label:ui',
+    railFilter: 'active:1h -is:archived -is:agentrun label:ui',
     railFilterId: 'all',
   });
   assert.equal(normalizePanelState({ railFilter: 'label:ui', railLens: 'warm' }).railFilter, 'label:ui');
@@ -1096,7 +1097,7 @@ test('a stored rail lens from an older build loads as the lens words in the quer
 
   const typed = `${'title:x '.repeat(30).slice(0, 190)} label:bug`;
   const folded = normalizePanelState({ railFilterId: 'all', railFilter: typed, railLens: 'active' });
-  assert.equal(folded.railFilter, `is:active -is:archived -is:agentrun ${typed}`);
+  assert.equal(folded.railFilter, `active:1h -is:archived -is:agentrun ${typed}`);
   // The unsupported needs-you lens leaves the query unchanged.
   assert.equal(
     normalizePanelState({ railFilterId: 'all', railFilter: typed, railLens: 'needs-you' }).railFilter,

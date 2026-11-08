@@ -38,6 +38,9 @@ import {
   railAgeFormat,
   railBuckets,
   railCardActive,
+  railActiveEdgeCrossed,
+  railQueryActiveWindows,
+  railClockCards,
   railCardHint,
   railHoverLines,
   runningFor,
@@ -56,7 +59,6 @@ import {
   railKeptAfter,
   railShownCards,
   sortRailCards,
-  ACTIVE_WINDOW_MS,
   RAIL_DENSITIES,
   RAIL_FOLDS,
   RAIL_GROUP_BY,
@@ -94,10 +96,17 @@ import {
   RAIL_LENS_WORDS,
   pressRailLens,
   withRailLens,
+  railQueryHeldLens,
   type RailLens,
+  RAIL_ACTIVE_WINDOWS,
+  railActiveWindow,
+  type RailActiveWindow,
 } from '../domain/rail-filters.ts';
 import { CARD_ACTIONS } from './card-words.ts';
 import { formatRelative } from './time.ts';
+
+// The hour `is:active` and the default Active window read.
+const ACTIVE_WINDOW_MS = 60 * 60 * 1000;
 
 test('rail width and compact wording have one browser-safe owner', () => {
   assert.equal(clampRailWidth(undefined), RAIL_WIDTH_DEFAULT);
@@ -479,18 +488,150 @@ test('the Active button carries its session count and one aggregate cache state'
   const warm = CARD_ACTIONS.railCountCacheWarm;
   const expiring = CARD_ACTIONS.railCountCacheExpiring;
   const none = CARD_ACTIONS.railCountCacheNone;
-  assert.deepEqual(said({ active: 2, warm: 1, expiring: 0 }), ['warm', warm, `Active, 2 sessions. ${warm}`]);
+  const active = 'Active in the last hour';
+  assert.deepEqual(said({ active: 2, warm: 1, expiring: 0 }), ['warm', warm, `${active}, 2 sessions. ${warm}`]);
   assert.deepEqual(said({ active: 2, warm: 0, expiring: 1 }), [
     'nearly-gone',
     expiring,
-    `Active, 2 sessions. ${expiring}`,
+    `${active}, 2 sessions. ${expiring}`,
   ]);
   assert.deepEqual(said({ active: 5, warm: 3, expiring: 2 }), [
     'nearly-gone',
     expiring,
-    `Active, 5 sessions. ${expiring}`,
+    `${active}, 5 sessions. ${expiring}`,
   ]);
-  assert.deepEqual(said({ active: 1, warm: 0, expiring: 0 }), [null, none, `Active, 1 session. ${none}`]);
+  assert.deepEqual(said({ active: 1, warm: 0, expiring: 0 }), [null, none, `${active}, 1 session. ${none}`]);
+});
+
+// The Active count reads the reader's chosen window, or the window of the Active lens the query
+// holds. The label stays Active at every window, and the name and hint say which window.
+test('the Active count, name, and hint read the chosen window', () => {
+  const hour = 60 * 60_000;
+  // Age zero keeps every window non-empty, whatever local time the clock reads.
+  const ages = [0, 2, 5, 8, 20, 40];
+  const cards = ages.map((age) => testCard(`${age}h`, { status: 'done', at: countsNow - age * hour }));
+  const phrases: Record<RailActiveWindow, string> = {
+    '1h': 'in the last hour',
+    '3h': 'in the last 3 hours',
+    '6h': 'in the last 6 hours',
+    '12h': 'in the last 12 hours',
+    today: 'today',
+    '2d': 'in the last 2 days',
+  };
+  // How far back each window reaches, in hours before the clock.
+  const midnight = new Date(countsNow);
+  midnight.setHours(0, 0, 0, 0);
+  const reach: Record<RailActiveWindow, number> = {
+    '1h': 1,
+    '3h': 3,
+    '6h': 6,
+    '12h': 12,
+    today: (countsNow - midnight.getTime()) / hour,
+    '2d': 48,
+  };
+  for (const choice of RAIL_ACTIVE_WINDOWS) {
+    const window = railActiveWindow(choice);
+    const expected = ages.filter((age) => age <= reach[choice] && (choice === 'today' || age < reach[choice])).length;
+    const counts = railHeadCounts(cards, RAIL_SHOWN_BUCKETS, countsNow, { query: '' }, window);
+    assert.equal(counts.active, expected, choice);
+    const [button] = railCountButtons(counts, ALL_LENS, HEAD_WORDS, ['active'], window);
+    assert.deepEqual(
+      [button.label, button.figure, button.name, button.hint],
+      [
+        'Active',
+        String(expected),
+        `Active ${phrases[choice]}, ${expected} ${expected === 1 ? 'session' : 'sessions'}. ${HEAD_WORDS.cacheNone}`,
+        `${HEAD_WORDS.activeHint} ${phrases[choice]}`,
+      ],
+      choice,
+    );
+  }
+  // A query holding the Active lens at its own window counts and names that window.
+  const held = { query: 'active:3h -is:archived -is:agentrun' };
+  const counts = railHeadCounts(cards, RAIL_SHOWN_BUCKETS, countsNow, held, railActiveWindow('2d'));
+  assert.equal(counts.active, 2);
+  const [button] = railCountButtons(counts, { ...ALL_LENS, ...held }, HEAD_WORDS, ['active'], railActiveWindow('2d'));
+  assert.equal(button.name, `Active in the last 3 hours, 2 sessions. ${HEAD_WORDS.cacheNone}`);
+});
+
+// An `is:active` word beside a held Active lens at a wider window still keeps only the last hour,
+// in the list and in the Active count, as the query grammar reads it.
+test('is:active beside a held Active lens at a wider window keeps the last hour', () => {
+  const hour = 60 * 60_000;
+  const cards = [
+    testCard('recent', { status: 'done', at: countsNow - hour / 2 }),
+    testCard('earlier', { status: 'done', at: countsNow - 5 * hour }),
+  ];
+  for (const query of [
+    'active:6h is:active -is:archived -is:agentrun',
+    'is:active active:6h -is:archived -is:agentrun',
+  ]) {
+    assert.equal(railQueryHeldLens(query), 'active', query);
+    const rail = { query };
+    assert.deepEqual(
+      railShownCards(cards, rail, countsNow).map((card) => card.id),
+      ['recent'],
+      query,
+    );
+    assert.equal(railHeadCounts(cards, RAIL_SHOWN_BUCKETS, countsNow, rail, railActiveWindow('6h')).active, 1, query);
+  }
+});
+
+// An Active press keeps an Active word the reader typed and adds the Active window, so the Active
+// count before the press equals the list after it.
+test('the Active count before a press equals the list after it beside a typed Active word', () => {
+  const hour = 60 * 60_000;
+  const window = railActiveWindow('6h');
+  const cards = [0.5, 2, 5].map((age) =>
+    testCard(`${age}h`, { status: 'done', at: countsNow - age * hour, labels: ['ui'] }),
+  );
+  for (const [query, expected] of [
+    ['is:active label:ui', 1],
+    ['active:3h label:ui', 2],
+  ] as const) {
+    const before = railHeadCounts(cards, RAIL_SHOWN_BUCKETS, countsNow, { query }, window).active;
+    const pressed = pressRailLens(query, 'active', window);
+    assert.equal(railQueryHeldLens(pressed), 'active', pressed);
+    assert.ok(pressed.split(' ').includes(query.split(' ')[0]), pressed);
+    assert.equal(before, expected, query);
+    assert.equal(railShownCards(cards, { query: pressed }, countsNow).length, before, pressed);
+  }
+});
+
+// An `active:` value that names no window holds no lens, whatever the value spells.
+test('an invalid active: word beside the lens exclusions holds no lens and keeps no session', () => {
+  const cards = [testCard('recent', { status: 'done', at: countsNow })];
+  for (const query of ['active:window -is:archived -is:agentrun', 'active:"window" -is:archived -is:agentrun']) {
+    assert.equal(railQueryHeldLens(query), null, query);
+    assert.deepEqual(railShownCards(cards, { query }, countsNow), [], query);
+    const counts = railHeadCounts(cards, RAIL_SHOWN_BUCKETS, countsNow, { query }, railActiveWindow('6h'));
+    assert.equal(counts.active, 0, query);
+  }
+});
+
+test('railQueryActiveWindows reads every Active window a query names', () => {
+  const hour = { unit: 'hour', count: 1 };
+  assert.deepEqual(railQueryActiveWindows('is:active'), [hour]);
+  assert.deepEqual(railQueryActiveWindows('is:needsyou label:ui'), [hour]);
+  assert.deepEqual(railQueryActiveWindows('active:2d'), [{ unit: 'day', count: 2 }]);
+  assert.deepEqual(railQueryActiveWindows('active:today'), [{ unit: 'today' }]);
+  // A negated word still moves the list when a card crosses its edge.
+  assert.deepEqual(railQueryActiveWindows('-active:6h -is:active'), [{ unit: 'hour', count: 6 }, hour]);
+  assert.deepEqual(railQueryActiveWindows('active:6x active:"6h" active: label:ui'), []);
+});
+
+// A clock tick redraws the list when a card crosses the edge of a window wider than the hour.
+test('railActiveEdgeCrossed reads every window the query and the saved views read', () => {
+  const minute = 60_000;
+  const midnight = new Date(2026, 10, 7).getTime();
+  const twoDays = { at: midnight - 2 * 24 * 60 * minute + minute };
+  assert.equal(railActiveEdgeCrossed([twoDays], ['active:2d'], midnight, midnight + 2 * minute), true);
+  assert.equal(railActiveEdgeCrossed([twoDays], ['is:active', 'label:ui'], midnight, midnight + 2 * minute), false);
+  assert.equal(railActiveEdgeCrossed([twoDays], ['label:ui', 'active:2d'], midnight, midnight + 2 * minute), true);
+  // Two hours before midnight sits inside today until the clock passes midnight.
+  const lateEvening = { at: midnight - 120 * minute };
+  assert.equal(railActiveEdgeCrossed([lateEvening], ['active:today'], midnight - minute, midnight + minute), true);
+  assert.equal(railActiveEdgeCrossed([lateEvening], ['is:needsyou'], midnight - minute, midnight + minute), false);
 });
 
 // Count warm and expiring caches within Active. Expired caches contribute to neither count.
@@ -625,9 +766,13 @@ test('railLensHolds answers the way is:active -is:archived -is:agentrun does', (
     testCard('agent-waiting', { status: 'waiting', agentRun: true, runByAgent: true, at: now - 5 * 60_000 }),
   ];
   for (const card of cards) {
-    const stamped = { ...card, active: railCardActive(card, now) };
-    const activeMatch = matchSessions([stamped], 'is:active -is:archived -is:agentrun').length > 0;
-    assert.equal(railLensHolds(card, now), activeMatch, `Active disagrees for ${card.id}`);
+    const activeMatch = matchSessions(
+      railClockCards([card], now),
+      'is:active -is:archived -is:agentrun',
+      undefined,
+      now,
+    );
+    assert.equal(railLensHolds(card, now), activeMatch.length > 0, `Active disagrees for ${card.id}`);
   }
   // An archived session or agent run never matches Active, regardless of recent activity.
   assert.equal(
@@ -643,9 +788,13 @@ test('railLensHolds answers the way is:active -is:archived -is:agentrun does', (
     at: card.id === 'n3' || card.id === 'r2' ? now - 2 * ACTIVE_WINDOW_MS : now - 5 * 60_000,
   }));
   for (const card of workCards) {
-    const stamped = { ...card, active: railCardActive(card, now) };
-    const activeMatch = matchSessions([stamped], 'is:active -is:archived -is:agentrun').length > 0;
-    assert.equal(railLensHolds(card, now), activeMatch, `Active disagrees for ${card.id}`);
+    const activeMatch = matchSessions(
+      railClockCards([card], now),
+      'is:active -is:archived -is:agentrun',
+      undefined,
+      now,
+    );
+    assert.equal(railLensHolds(card, now), activeMatch.length > 0, `Active disagrees for ${card.id}`);
   }
   assert.equal(
     railCounts(workCards, RAIL_SHOWN_BUCKETS, now).active,
@@ -669,8 +818,7 @@ test('railCounts.active equals the typed lens query', () => {
     testCard('archived-waiting', { status: 'waiting', archived: true, at: now - 5 * 60_000 }),
     testCard('agent-waiting', { status: 'waiting', agentRun: true, runByAgent: true, at: now - 5 * 60_000 }),
   ];
-  const stamped = cards.map((card) => ({ ...card, active: railCardActive(card, now) }));
-  const activeCards = matchSessions(stamped, 'is:active -is:archived -is:agentrun');
+  const activeCards = matchSessions(railClockCards(cards, now), 'is:active -is:archived -is:agentrun', undefined, now);
   const counts = railCounts(cards, RAIL_SHOWN_BUCKETS, now);
   assert.equal(counts.active, activeCards.length);
   assert.deepEqual(
@@ -750,9 +898,17 @@ const HEAD_WORDS = {
   unreadHint: CARD_ACTIONS.railCountUnreadHint,
   inputHint: CARD_ACTIONS.railCountInputHint,
   pressedHint: CARD_ACTIONS.railCountPressedHint,
+  activeWithin: CARD_ACTIONS.railActiveWithin,
+  activeHour: CARD_ACTIONS.railActiveHour,
+  activeHours: CARD_ACTIONS.railActiveHours,
+  activeDay: CARD_ACTIONS.railActiveDay,
+  activeDays: CARD_ACTIONS.railActiveDays,
+  activeToday: CARD_ACTIONS.railActiveToday,
 };
 
 const ALL_LENS = { filterId: ALL_RAIL_FILTER_ID, query: '' };
+// The accessible name of each lens before its figure. Active names the hour it reads by default.
+const LENS_NAMES: Record<RailLens, string> = { ...HEAD_WORDS, active: 'Active in the last hour' };
 
 test('startup shows only a selected configured quick filter, without a figure, until counts arrive', () => {
   for (const configured of [[], RAIL_LENSES]) {
@@ -766,7 +922,7 @@ test('startup shows only a selected configured quick filter, without a figure, u
     const [button] = buttons;
     assert.deepEqual(
       [button.kind, button.figure, button.pressed, button.name, button.hint],
-      [lens, '', true, HEAD_WORDS[lens], HEAD_WORDS.pressedHint],
+      [lens, '', true, LENS_NAMES[lens], HEAD_WORDS.pressedHint],
       lens,
     );
     const cleared = { ...selected, query: pressRailLens(selected.query, lens) };
@@ -808,7 +964,7 @@ test('a selected configured zero-match lens keeps its live count and clearing ac
           '0',
           true,
           HEAD_WORDS.pressedHint,
-          `${HEAD_WORDS[lens]}, 0 ${HEAD_WORDS.sessions}${lens === 'active' ? `. ${HEAD_WORDS.cacheNone}` : ''}`,
+          `${LENS_NAMES[lens]}, 0 ${HEAD_WORDS.sessions}${lens === 'active' ? `. ${HEAD_WORDS.cacheNone}` : ''}`,
         ],
       );
       const cleared = { ...selected, query: pressRailLens(query, lens) };

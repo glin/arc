@@ -464,68 +464,170 @@ test('is:warm keeps the sessions whose caller called their cache warm', () => {
   );
 });
 
-// `is:active` asks about a session's recency window, which no session record carries as a
-// state either. The caller answers it with `active`, read against its own clock, the same way
-// `is:warm` is answered with `cacheWarm`.
-test('is:active keeps the sessions whose caller called them recently active', () => {
+// `is:active` asks about a session's recency, which no session record carries as a state. The
+// caller hands in the session's last activity time and its own clock, the same way it hands in
+// `cacheWarm` for `is:warm`.
+const CLOCK = Date.UTC(2026, 10, 7, 12);
+const RECENT = CLOCK - 5 * 60_000;
+const STALE = CLOCK - 2 * 60 * 60_000;
+
+test('is:active keeps the sessions with a warm cache or activity in the last hour', () => {
   assert.deepEqual(parseSessionQuery('is:active').terms, [{ field: 'status', needle: 'active' }]);
   assert.deepEqual(parseSessionQuery('-is:active').terms, [{ field: 'status', needle: 'active', negated: true }]);
   const rows = [
-    { label: 'Active', agent: 'Claude', status: 'done', unread: false, active: true },
-    { label: 'Stale', agent: 'Codex', status: 'done', unread: false, active: false },
+    { label: 'Active', agent: 'Claude', status: 'done', unread: false, at: RECENT },
+    { label: 'Warm', agent: 'Claude', status: 'done', unread: false, at: STALE, cacheWarm: true },
+    { label: 'Stale', agent: 'Codex', status: 'done', unread: false, at: STALE },
     { label: 'Unsaid', agent: 'Claude', status: 'done', unread: false },
   ];
   assert.deepEqual(
-    matchSessions(rows, 'is:active').map((row) => row.label),
-    ['Active'],
+    matchSessions(rows, 'is:active', undefined, CLOCK).map((row) => row.label),
+    ['Active', 'Warm'],
   );
   assert.deepEqual(
-    matchSessions(rows, '-is:active').map((row) => row.label),
+    matchSessions(rows, '-is:active', undefined, CLOCK).map((row) => row.label),
     ['Stale', 'Unsaid'],
   );
+  // A caller that passes no clock asks no recency, so the term holds for no session.
+  assert.deepEqual(matchSessions(rows, 'is:active'), []);
 
   // The term asks about recency alone, so a session an agent runs and one the reader put away
   // both hold it while inside the window. A lens that wants the sessions a reader can act on
   // excludes them in words, the same as `is:warm`.
   const filed = [
-    { label: 'Person', agent: 'Claude', status: 'done', unread: false, active: true },
-    { label: 'Agent', agent: 'Claude', status: 'done', unread: false, active: true, runByAgent: true },
-    { label: 'Archived', agent: 'Claude', status: 'done', unread: false, active: true, archived: true },
+    { label: 'Person', agent: 'Claude', status: 'done', unread: false, at: RECENT },
+    { label: 'Agent', agent: 'Claude', status: 'done', unread: false, at: RECENT, runByAgent: true },
+    { label: 'Archived', agent: 'Claude', status: 'done', unread: false, at: RECENT, archived: true },
   ];
   assert.deepEqual(
-    matchSessions(filed, 'is:active').map((row) => row.label),
+    matchSessions(filed, 'is:active', undefined, CLOCK).map((row) => row.label),
     ['Person', 'Agent', 'Archived'],
   );
   assert.deepEqual(
-    matchSessions(filed, 'is:active -is:archived -is:agentrun').map((row) => row.label),
+    matchSessions(filed, 'is:active -is:archived -is:agentrun', undefined, CLOCK).map((row) => row.label),
     ['Person'],
   );
 });
 
 // `is:needsyou` asks for an active session that waits on the reader or is unread. It reads the
-// same `active` fact the caller hands in for `is:active`.
+// same recency `is:active` reads.
 test('is:needsyou keeps the active sessions that wait on the reader or are unread', () => {
   assert.deepEqual(parseSessionQuery('is:needsyou').terms, [{ field: 'status', needle: 'needsyou' }]);
   const rows = [
-    { label: 'Waiting', agent: 'Claude', status: 'waiting', unread: false, active: true },
-    { label: 'Unread', agent: 'Claude', status: 'done', unread: true, active: true },
-    { label: 'Read', agent: 'Claude', status: 'done', unread: false, active: true },
-    { label: 'Stale-waiting', agent: 'Claude', status: 'waiting', unread: true, active: false },
+    { label: 'Waiting', agent: 'Claude', status: 'waiting', unread: false, at: RECENT },
+    { label: 'Unread', agent: 'Claude', status: 'done', unread: true, at: RECENT },
+    { label: 'Read', agent: 'Claude', status: 'done', unread: false, at: RECENT },
+    { label: 'Stale-waiting', agent: 'Claude', status: 'waiting', unread: true, at: STALE },
   ];
+  const match = (query: string) => matchSessions(rows, query, undefined, CLOCK);
   assert.deepEqual(
-    matchSessions(rows, 'is:needsyou').map((row) => row.label),
+    match('is:needsyou').map((row) => row.label),
     ['Waiting', 'Unread'],
   );
   assert.deepEqual(
-    matchSessions(rows, '-is:needsyou').map((row) => row.label),
+    match('-is:needsyou').map((row) => row.label),
     ['Read', 'Stale-waiting'],
   );
   // It holds exactly where `is:active` and one of `is:input` or `is:unread` both hold.
-  const either = new Set([...matchSessions(rows, 'is:active is:input'), ...matchSessions(rows, 'is:active is:unread')]);
+  const either = new Set([...match('is:active is:input'), ...match('is:active is:unread')]);
   assert.deepEqual(
-    matchSessions(rows, 'is:needsyou'),
+    match('is:needsyou'),
     rows.filter((row) => either.has(row)),
   );
+});
+
+test('active: names a whole number of hours or days, or today, and nothing else', () => {
+  assert.deepEqual(parseSessionQuery('active:6h').terms, [
+    { field: 'active', needle: '6h', activeWindow: { unit: 'hour', count: 6 } },
+  ]);
+  assert.deepEqual(parseSessionQuery('ACTIVE:2D').terms, [
+    { field: 'active', needle: '2d', activeWindow: { unit: 'day', count: 2 } },
+  ]);
+  assert.deepEqual(parseSessionQuery('-active:Today').terms, [
+    { field: 'active', needle: 'today', activeWindow: { unit: 'today' }, negated: true },
+  ]);
+  assert.deepEqual(parseSessionQuery('active:').terms, [], 'an empty value added a term');
+  for (const value of ['0h', '1.5h', '6', '6m', '-1h', 'week', '"6h"']) {
+    const query = `active:${value}`;
+    const terms = parseSessionQuery(query).terms;
+    assert.equal(terms.length, 1, query);
+    assert.equal(terms[0].activeWindow, undefined, `${query} named a window`);
+    assert.deepEqual(matchSessions([{ label: 'Live', agent: 'Claude', at: CLOCK }], query, undefined, CLOCK), []);
+  }
+  assert.equal(sameQueryTerms('active:6H', 'active:6h'), true);
+});
+
+// `is:active` and `active:1h` read one window, so a stored `is:active` and `is:needsyou` keep
+// their meaning. The rows sit on both sides of the hour edge.
+test('is:active matches exactly the sessions active:1h matches', () => {
+  const hour = 60 * 60_000;
+  const rows = [
+    { label: 'Now', agent: 'Claude', at: CLOCK },
+    { label: 'Just inside', agent: 'Claude', at: CLOCK - hour + 1 },
+    { label: 'On the edge', agent: 'Claude', at: CLOCK - hour },
+    { label: 'Just outside', agent: 'Claude', at: CLOCK - hour - 1 },
+    { label: 'Stale', agent: 'Codex', at: STALE },
+    { label: 'Warm and stale', agent: 'Codex', at: STALE, cacheWarm: true },
+    { label: 'Ahead of the clock', agent: 'Codex', at: CLOCK + 60_000 },
+    { label: 'Unsaid', agent: 'Codex' },
+  ];
+  const labels = (query: string) => matchSessions(rows, query, undefined, CLOCK).map((row) => row.label);
+  assert.deepEqual(labels('active:1h'), ['Now', 'Just inside', 'Warm and stale', 'Ahead of the clock']);
+  for (const [status, window] of [
+    ['is:active', 'active:1h'],
+    ['-is:active', '-active:1h'],
+    ['is:active -is:archived -is:agentrun', 'active:1h -is:archived -is:agentrun'],
+  ]) {
+    assert.deepEqual(labels(status), labels(window), `${status} and ${window} disagree`);
+  }
+});
+
+test('active: hours and days reach back from the caller clock', () => {
+  const hour = 60 * 60_000;
+  const rows = [
+    { label: '5h', agent: 'Claude', at: CLOCK - 5 * hour },
+    { label: '7h', agent: 'Claude', at: CLOCK - 7 * hour },
+    { label: '47h', agent: 'Claude', at: CLOCK - 47 * hour },
+    { label: '49h', agent: 'Claude', at: CLOCK - 49 * hour },
+  ];
+  const labels = (query: string) => matchSessions(rows, query, undefined, CLOCK).map((row) => row.label);
+  assert.deepEqual(labels('active:6h'), ['5h']);
+  assert.deepEqual(labels('active:2d'), ['5h', '7h', '47h']);
+  assert.deepEqual(labels('-active:6h'), ['7h', '47h', '49h']);
+  // A caller that passes no clock asks no recency.
+  assert.deepEqual(matchSessions(rows, 'active:2d'), []);
+});
+
+// `today` starts at local midnight, read from calendar fields. Chicago days are 23 hours long on
+// 8 March 2026 and 25 hours long on 1 November 2026, so a fixed 24-hour day moves the edge.
+test('active:today starts at local midnight across midnight and daylight-saving changes', () => {
+  const previous = process.env.TZ;
+  process.env.TZ = 'America/Chicago';
+  try {
+    const local = (month: number, day: number, hour: number, minute = 0) =>
+      new Date(2026, month - 1, day, hour, minute).getTime();
+    const today = (at: number, clock: number) =>
+      matchSessions([{ label: 'Row', agent: 'Claude', at }], 'active:today', undefined, clock).length === 1;
+    // Across midnight: activity at 23:00 is today until the clock reaches midnight.
+    const lateEvening = local(3, 6, 23);
+    assert.equal(today(lateEvening, local(3, 7, 0) - 1), true, 'activity before midnight left today early');
+    assert.equal(today(lateEvening, local(3, 7, 0)), false, 'activity before midnight stayed today past midnight');
+    assert.equal(today(local(3, 7, 0), local(3, 7, 0)), true, 'activity at midnight was not today');
+    // On the short day, noon is 11 hours after midnight.
+    assert.equal(local(3, 8, 12) - local(3, 8, 0), 11 * 60 * 60_000);
+    assert.equal(today(local(3, 8, 0, 30), local(3, 8, 12)), true, 'the short day lost its first hour');
+    assert.equal(today(local(3, 7, 23, 30), local(3, 8, 12)), false, 'the short day reached into yesterday');
+    // On the long day, noon is 13 hours after midnight.
+    assert.equal(local(11, 1, 12) - local(11, 1, 0), 13 * 60 * 60_000);
+    assert.equal(today(local(11, 1, 0, 30), local(11, 1, 12)), true, 'the long day lost its first hour');
+    assert.equal(today(local(10, 31, 23, 30), local(11, 1, 12)), false, 'the long day reached into yesterday');
+  } finally {
+    if (previous === undefined) {
+      delete process.env.TZ;
+    } else {
+      process.env.TZ = previous;
+    }
+  }
 });
 
 test('is: completes nine values and no value is a prefix of another', () => {

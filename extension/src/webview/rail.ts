@@ -27,6 +27,7 @@ import {
   type SavedViewSort,
 } from '../domain/rail-sort.ts';
 import {
+  activeNote,
   cacheExpiryNote,
   costNote,
   sessionIdentityNote,
@@ -61,7 +62,7 @@ import {
   railNarrowToRow,
   railDrawnRows,
   railCacheState,
-  railCardActive,
+  railActiveEdgeCrossed,
   railHeadCounts,
   railQueryReadsCache,
   railRunningWord,
@@ -140,6 +141,11 @@ import {
   sameRailFilterLens,
   toggleRailFilterTerm,
   withRailLens,
+  DEFAULT_RAIL_ACTIVE_WINDOW,
+  normalizeRailActiveWindow,
+  railActiveWindow,
+  withRailActiveWindow,
+  type RailActiveWindow,
   type RailFilterLens,
   type RailLens,
   type SavedRailFilter,
@@ -199,6 +205,12 @@ interface RailWords extends SessionRenameWords, RailHoverWords {
   railCountUnreadHint: string;
   railCountInputHint: string;
   railCountPressedHint: string;
+  railActiveWithin: string;
+  railActiveHour: string;
+  railActiveHours: string;
+  railActiveDay: string;
+  railActiveDays: string;
+  railActiveToday: string;
   railFilterEmpty: string;
   railFilterOffers: string;
   railFilterTake: string;
@@ -301,6 +313,7 @@ interface RailOptions {
     showArchived: unknown;
     showRuns: unknown;
     headLenses: unknown;
+    activeWindow: unknown;
     groupBy: unknown;
     density: unknown;
   };
@@ -330,9 +343,9 @@ interface RailOptions {
   onDraw?(): void;
 }
 
-// Query matching reads cache warmth and recent activity against the browser clock.
-// Attach these facts to session list cards before matching.
-type RailMatchCard = RailCardView & { cacheWarm?: boolean; active?: boolean };
+// Query matching reads cache warmth and recent activity against the browser clock. Attach cache
+// warmth to session list cards before matching. Matching reads recency from each card's `at`.
+type RailMatchCard = RailCardView & { cacheWarm?: boolean };
 
 // Session counts and Active's visible cache information change on the clock.
 function countsMoved(drawn: RailCounts, at: RailCounts): boolean {
@@ -356,6 +369,7 @@ export interface RailSnapshot {
   showArchived: boolean;
   showRuns: boolean;
   headLenses: RailLens[];
+  activeWindow: RailActiveWindow;
   groupBy: RailGroupBy;
   density: RailDensity;
 }
@@ -401,6 +415,8 @@ export interface RailRenderer {
   handleHotkey(event: KeyboardEvent, from: HTMLElement): boolean;
   place(): void;
   setViewSort(value: string): void;
+  // Choose the Active window. A held Active lens moves to it, and the choice saves with the panel.
+  setActiveWindow(value: string): void;
   // Refresh one session's native menu context after a pin or archive change.
   // The timeline renderer exposes the same operation for session headings.
   drawRowContext(session: string): void;
@@ -1804,6 +1820,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
   let railShowArchived = normalizeRailShowArchived(options.initial.showArchived);
   let railShowRuns = normalizeRailShowRuns(options.initial.showRuns);
   let railQuickFilters = options.readOnly ? [] : normalizeRailQuickFilters(options.initial.headLenses);
+  let railActiveChoice = normalizeRailActiveWindow(options.initial.activeWindow);
   let railGroupBy = normalizeRailGroupBy(options.initial.groupBy);
   let railDensity = normalizeRailDensity(options.initial.density);
   nav.dataset.density = railDensity;
@@ -1835,6 +1852,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     showArchived: railShowArchived,
     showRuns: railShowRuns,
     headLenses: railQuickFilters,
+    activeWindow: railActiveChoice,
     groupBy: railGroupBy,
     density: railDensity,
   });
@@ -1868,6 +1886,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     at: number;
     rail: RailNarrowing;
     shown: RailCountsOptions;
+    window: RailActiveWindow;
     counts: RailCounts;
   } | null = null;
   const headCounts = (at: number): RailCounts => {
@@ -1880,12 +1899,13 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       held.at === at &&
       held.rail.query === rail.query &&
       held.shown.showArchived === shown.showArchived &&
-      held.shown.showRuns === shown.showRuns
+      held.shown.showRuns === shown.showRuns &&
+      held.window === railActiveChoice
     ) {
       return held.counts;
     }
-    const counts = railHeadCounts(latestCards, shown, at, rail);
-    counted = { cards: latestCards, at, rail, shown, counts };
+    const counts = railHeadCounts(latestCards, shown, at, rail, railActiveWindow(railActiveChoice));
+    counted = { cards: latestCards, at, rail, shown, window: railActiveChoice, counts };
     return counts;
   };
   const viewOfSection = (id: string): SavedView | null => views.find((view) => viewFoldId(view) === id) ?? null;
@@ -2244,7 +2264,10 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     if (naming) {
       return;
     }
-    setLiveRailFilter({ ...liveRailFilter(), query: pressRailLens(filter, kind) }, railFilterId);
+    setLiveRailFilter(
+      { ...liveRailFilter(), query: pressRailLens(filter, kind, railActiveWindow(railActiveChoice)) },
+      railFilterId,
+    );
     restoreRailCountFocus();
   };
   const postRailFilters = (next: SavedRailFilter[]) => {
@@ -2324,7 +2347,10 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
         : null;
     const invalidCost = naming
       ? null
-      : (sessionQueryError(filter) ?? costNote(filter) ?? sessionIdentityNote(filter, queryContext));
+      : (sessionQueryError(filter) ??
+        costNote(filter) ??
+        activeNote(filter) ??
+        sessionIdentityNote(filter, queryContext));
     // Invalid cache-expiry values have a separate note and DOM id from invalid cost values.
     const invalidCacheExpiry = naming ? null : cacheExpiryNote(filter);
     const open = boxOpen();
@@ -2350,8 +2376,15 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
           unreadHint: options.words.railCountUnreadHint,
           inputHint: options.words.railCountInputHint,
           pressedHint: options.words.railCountPressedHint,
+          activeWithin: options.words.railActiveWithin,
+          activeHour: options.words.railActiveHour,
+          activeHours: options.words.railActiveHours,
+          activeDay: options.words.railActiveDay,
+          activeDays: options.words.railActiveDays,
+          activeToday: options.words.railActiveToday,
         },
         railQuickFilters,
+        railActiveWindow(railActiveChoice),
       );
     }
     countsHeld = Boolean(naming);
@@ -3537,11 +3570,11 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       const headMoved = fresh !== null && drawnCounts !== null && countsMoved(drawnCounts, fresh);
       const clockMoved =
         poolReadsCache() &&
-        drawnCards.some(
-          (card) =>
-            railCardActive(card, now) !== railCardActive(card, at) ||
-            (railCacheState(card.cache ?? null, now) !== null) !== (railCacheState(card.cache ?? null, at) !== null),
-        );
+        (railActiveEdgeCrossed(drawnCards, [filter, ...views.map((view) => view.query)], now, at) ||
+          drawnCards.some(
+            (card) =>
+              (railCacheState(card.cache ?? null, now) !== null) !== (railCacheState(card.cache ?? null, at) !== null),
+          ));
       if (!work.redraw && !headMoved && !clockMoved) {
         return;
       }
@@ -3569,6 +3602,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       railShowArchived = RAIL_SHOWN_BUCKETS.showArchived;
       railShowRuns = RAIL_SHOWN_BUCKETS.showRuns;
       railQuickFilters = options.readOnly ? [] : [...DEFAULT_RAIL_QUICK_FILTERS];
+      railActiveChoice = DEFAULT_RAIL_ACTIVE_WINDOW;
       railGroupBy = 'time';
       railDensity = 'comfortable';
       nav.dataset.density = railDensity;
@@ -3695,7 +3729,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       if (lens === undefined) {
         return;
       }
-      const query = withRailLens(filter, lens);
+      const query = withRailLens(filter, lens, railActiveWindow(railActiveChoice));
       if (query !== filter) {
         setLiveRailFilter({ ...liveRailFilter(), query }, railFilterId);
       }
@@ -4061,6 +4095,21 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       }
       viewOpen = { ...viewOpen, sort: normalizeSavedViewSort(value) };
       drawViewPop();
+    },
+    setActiveWindow(value: string) {
+      if (options.readOnly) return;
+      const next = normalizeRailActiveWindow(value);
+      if (next !== value || next === railActiveChoice) {
+        return;
+      }
+      railActiveChoice = next;
+      const query = withRailActiveWindow(filter, railActiveWindow(next));
+      if (query !== filter) {
+        setLiveRailFilter({ ...liveRailFilter(), query }, railFilterId);
+        return;
+      }
+      options.save();
+      drawTop();
     },
     saveEditedView() {
       const saved = viewOpen ? findView(views, viewOpen.view) : null;

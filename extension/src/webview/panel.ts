@@ -240,6 +240,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
   const initialRailShowArchived = sessionState.initialRail.showArchived;
   const initialRailShowRuns = sessionState.initialRail.showRuns;
   const initialRailHeadLenses = sessionState.initialRail.headLenses;
+  const initialRailActiveWindow = sessionState.initialRail.activeWindow;
   const initialRailGroupBy = sessionState.initialRail.groupBy;
   const initialRailDensity = sessionState.initialRail.density;
   // Clear and close controls use a multiplication sign. Each button supplies its own accessible name.
@@ -602,6 +603,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
       showArchived: initialRailShowArchived,
       showRuns: initialRailShowRuns,
       headLenses: initialRailHeadLenses,
+      activeWindow: initialRailActiveWindow,
       groupBy: initialRailGroupBy,
       density: initialRailDensity,
     },

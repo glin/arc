@@ -1,10 +1,12 @@
 // Browser-safe presentation values derived from session queries.
 
 import {
+  ACTIVE_PREFIX,
   IS_PREFIX,
   IS_VALUES,
   LABEL_PREFIX,
   parseSessionQuery,
+  queryTokens,
   sessionQueryError,
   resolveSessionQuery,
   type SessionQueryContext,
@@ -44,6 +46,20 @@ export function costNote(query: string): string | null {
 export function cacheExpiryNote(query: string): string | null {
   const invalid = parseSessionQuery(query).terms.find((term) => term.field === 'cache-expiry' && !term.comparison);
   return invalid ? `cache-expiry:${invalid.needle} ${CACHE_EXPIRY_UNKNOWN}` : null;
+}
+
+export const ACTIVE_UNKNOWN = `names no window. Use ${ACTIVE_PREFIX}:6h, ${ACTIVE_PREFIX}:2d or ${ACTIVE_PREFIX}:today.`;
+
+// The first `active:` word that names no window, spelled as the reader typed it, quotes included.
+export function activeNote(query: string): string | null {
+  for (const token of queryTokens(query)) {
+    const text = query.slice(token.start, token.end);
+    const terms = parseSessionQuery(text).terms;
+    if (terms.length === 1 && terms[0].field === 'active' && !terms[0].activeWindow) {
+      return `${text} ${ACTIVE_UNKNOWN}`;
+    }
+  }
+  return null;
 }
 
 export function sessionIdentityNote(query: string, context?: SessionQueryContext): string | null {

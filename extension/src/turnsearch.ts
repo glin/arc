@@ -69,7 +69,7 @@ function termHolds(term: FilterTerm, entry: SearchEntry): boolean {
     false,
     entry.runByAgent === null ? null : entry.runByAgent === true,
     entry.archived === true,
-    false,
+    null,
     null,
     false,
     entry.sessionId,
