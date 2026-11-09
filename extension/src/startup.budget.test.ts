@@ -30,6 +30,8 @@ const WORK_NAMES = new Set(['catalogWalk', 'watcher:grownMembers', 'pollDirector
 
 // Byte rows count paths and working directories, so a root of one length keeps those bytes the same on every machine.
 const ROOT_LENGTH = 160;
+// Longer than the host's checkpoint interval, so the timer the host armed fires inside this wait.
+const CHECKPOINT_WAIT_MS = 10 * 60 * 1000;
 
 function paddedRoot(base: string): string {
   const real = fs.realpathSync.native(base);
@@ -297,7 +299,16 @@ test('each step of the session list script stays within its recorded counts', as
   };
   try {
     await step('cold start', () => void active.receive({ type: 'ready' }));
-    assert.equal(active.provider.writeDerivedCache(), true, 'the cold start saved no derived cache');
+    // Only the host's own checkpoint writes the cache here. A host that stops after a checkpoint keeps what that checkpoint saved.
+    await step('automatic save', async () => {
+      const child = workspace.children[3];
+      workspace.growChild(child, Date.now());
+      watcherEvent(child.file);
+      await active.settle();
+      vi.advanceTimersByTime(CHECKPOINT_WAIT_MS);
+    });
+    assert.ok(fs.existsSync(workspace.derivedCacheFile), 'the automatic save never wrote the derived cache');
+    active.provider.writeDerivedCache = () => true;
     active.provider.dispose();
     active.worker.stop();
     intervals.length = 0;
