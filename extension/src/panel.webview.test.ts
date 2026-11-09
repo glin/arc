@@ -13,6 +13,7 @@ import { RepositoryCommits } from './gitcommits';
 import { commitCard, diffTitle, landingCard, turnFileContributors } from './turncard';
 import { groupCommitRows } from './view/card-presentation';
 import { candidateGitRunner } from './turnfixtures';
+import { compressedPairKey } from './compressedstore';
 import { CommitRepositories } from './commitrepositories';
 import { CLAUDE_CHILD_REFERENCE_PARSER_VERSION } from './derivedcache';
 import { discoveryCompatibility } from './progressiveworker';
@@ -4561,6 +4562,7 @@ test('a catalog refresh admits settled sessions without a file check after a wal
   let reused = false;
   let listed: any[] = [];
   const wired: any = {
+    withHeldCompressedRows: (sessions: unknown[]) => sessions,
     claimCatalogRefresh: (PanelProvider.prototype as any).claimCatalogRefresh,
     humanScans: new Map(),
     refreshGeneration: 0,
@@ -12639,6 +12641,85 @@ test('Claude child reference discovery runs in cancellable worker work', () => {
 });
 
 // Dispatch edges connect catalog members for cost attribution and agent-run classification.
+test('a compressed row shows the cost of its stored spend record', () => {
+  const folder = tempDir('compressed-cost-');
+  const twin = path.join(folder, 'rollout-2026-11-01T00-00-00-a.jsonl.zst');
+  const plain = twin.replace(/\.zst$/, '');
+  const spend = {
+    file: plain,
+    workspace: 'w',
+    size: 10,
+    mtimeMs: 1,
+    offset: 10,
+    trailing: '',
+    buckets: [],
+    indexedAt: 1,
+    complete: true,
+    lifetimeBuckets: aggregateUsageEvents([
+      {
+        timestamp: Date.parse('2026-08-31T10:00:00'),
+        agent: 'codex',
+        provider: null,
+        model: 'gpt-6-sol',
+        contextWindow: null,
+        billingClass: 'metered',
+        inferenceClass: null,
+        serviceTier: null,
+        reportedCost: null,
+        requestKey: null,
+        usage: {
+          input: 100_000,
+          cacheWrite1h: 0,
+          cacheWrite5m: 0,
+          cacheWrite30m: 0,
+          cacheRead: 0,
+          output: 0,
+          thinking: 0,
+        },
+      },
+    ]),
+  };
+  const host: any = Object.assign(Object.create(PanelProvider.prototype), {
+    claudeChildReferences: [],
+    sessionParents: null,
+    startedHere: new Set<string>(),
+    claudeSpendSources: [],
+    claudeChildren: [],
+    codexSubagents: [],
+    subagentDirectories: { files: () => [] },
+    sessionSpendSourceIndex: new SessionSpendSourceIndex(),
+    sessionSpendSources: [],
+    projectSpendRevision: 0,
+    lifetimeFigures: new SessionFiguresCache(),
+    projectSpendHydrated: true,
+    projectSpendIndexing: false,
+    projectSpendOffers: new Set(),
+    projectSpendQueued: new Set<string>(),
+    projectSpendFiles: [],
+    projectSpendVisibleFiles: [],
+    compressedFacts: new Map([
+      [twin, { file: twin, pairKey: compressedPairKey(twin), threadId: 'thread', spend, complete: true }],
+    ]),
+    compressedFactsRevision: 1,
+    compressedSpendPicks: new WeakMap(),
+    codexMetas: { revision: 0, keys: () => [] },
+    metaFor: () => ({ agentRun: false }),
+    dispatchFacts: new Map(),
+    saved: normalizePanelState(null),
+    sessionRows: [{ id: 'thread', label: 'thread' }],
+    sessionParentEdgeSet: null,
+  });
+  const row = { sessionId: 'thread', file: twin, agent: 'codex' };
+  assert.equal(
+    host.lifetimeFiguresBySession().costs.thread?.dollars ?? null,
+    null,
+    'a row without a source showed a cost',
+  );
+  host.updateSessionSpendSources([row], [row]);
+  const dollars = host.lifetimeFiguresBySession().costs.thread?.dollars ?? null;
+  assert.ok(dollars !== null && dollars > 0, 'the compressed row showed no cost');
+});
+
 test("the host counts a dispatched session in its parent's cost once and files it by who asked for it", async () => {
   const folder = tempDir('dispatch-cost-');
   const bucket = (input: number) =>

@@ -1663,6 +1663,8 @@ export class PanelProvider implements vscode.Disposable {
   private compressedRenderSeen = false;
   // Row-file names whose entry changed since the last list merged them, and the last walk that the rows join.
   private compressedRowsDirty: Set<string> | null = null;
+  // The row of each compressed entry that the last list gave. A discovery reply keeps them without a stat per entry.
+  private readonly compressedRowsHeld = new Map<string, SessionFile>();
   private compressedWalk: {
     walked: ReadonlySet<string>;
     listed: ReadonlySet<string>;
@@ -5326,6 +5328,7 @@ export class PanelProvider implements vscode.Disposable {
     const complete = listing.enumeration.status === 'complete';
     this.compressedWalk = { walked, listed, complete, inFolders };
     this.compressedRowsDirty = null;
+    this.compressedRowsHeld?.clear();
     if (complete) {
       for (const row of this.catalog?.sessions ?? []) {
         if (row.agent !== 'codex' || !row.file.endsWith('.jsonl') || walked.has(row.file)) continue;
@@ -5357,7 +5360,9 @@ export class PanelProvider implements vscode.Disposable {
         continue;
       }
       const row = this.compressedRowOf(twin, entry, walked);
-      if (row) out.push(row);
+      if (!row) continue;
+      out.push(row);
+      this.compressedRowsHeld?.set(twin, row);
     }
     return out;
   }
@@ -5391,13 +5396,38 @@ export class PanelProvider implements vscode.Disposable {
     if (!dirty?.size || !walk) return held;
     this.compressedRowsDirty = null;
     const out = held.filter((session) => !(isCompressedRollout(session.file) && dirty.has(session.file)));
+    let added = false;
     for (const twin of dirty) {
+      added ||= !this.compressedRowsHeld.has(twin);
+      this.compressedRowsHeld.delete(twin);
       const entry = this.compressedFacts.get(twin);
       if (!entry || (entry.opening?.cwd && !walk.inFolders(entry.opening.cwd))) continue;
       const row = this.compressedRowOf(twin, entry, walk.walked);
-      if (row) out.push(row);
+      if (!row) continue;
+      out.push(row);
+      this.compressedRowsHeld.set(twin, row);
+      if (!this.enumeratedAmbiguousIds?.has(row.sessionId)) this.enumeratedMembers?.add(sessionCoverageMember(row));
     }
+    // A row that joins between discovery replies needs its source now, or its cost waits for the next complete reply.
+    if (added && this.claudeChildrenDiscovered)
+      this.updateSessionSpendSources(
+        out.filter((session) => session.agent === 'codex'),
+        out,
+      );
     return out;
+  }
+
+  // Each discovery reply holds only the parents it was sent, and no compressed rollout is sent. The compressed rows
+  // of the last list join it. A plain row of the same rollout wins.
+  private withHeldCompressedRows(sessions: SessionFile[]): SessionFile[] {
+    if (!this.compressedRowsHeld?.size) return sessions;
+    const listed = new Set(sessions.map((session) => session.file));
+    return [
+      ...sessions,
+      ...[...this.compressedRowsHeld.values()].filter(
+        (row) => !listed.has(row.file) && !listed.has(row.file.replace(/\.zst$/, '')),
+      ),
+    ];
   }
 
   private compressedTitleOf(file: string): DerivedTitleEntry | undefined {
@@ -14419,7 +14449,9 @@ export class PanelProvider implements vscode.Disposable {
         const started = accepted ? this.startedSources(this.catalog.sessions, accepted) : [];
         this.catalog = {
           ...this.catalog,
-          sessions: started.length ? [...accepted!, ...started] : (accepted ?? this.catalog.sessions),
+          sessions: this.withHeldCompressedRows(
+            started.length ? [...accepted!, ...started] : (accepted ?? this.catalog.sessions),
+          ),
         };
       }
       if (this.dispatchedDiscoveryWaiting() !== discoveryWaiting) this.postDispatchedCostsIfMoved('childrenProgress');
@@ -14505,7 +14537,7 @@ export class PanelProvider implements vscode.Disposable {
       )),
     ]);
     if (signal.aborted || generation !== this.refreshGeneration) return false;
-    const roots = discoveryRoots.filter((root) => admittedRoots.has(root));
+    const roots = this.withHeldCompressedRows(discoveryRoots.filter((root) => admittedRoots.has(root)));
     if (spendSources) {
       this.claudeSpendSources = spendSources.claude;
       this.codexSpendSources = spendSources.codex;

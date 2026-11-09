@@ -3023,6 +3023,7 @@ function completeDiscoveryHarness(
     'compressedResume',
     'noteCompressedLoad',
     'withCompressedFactRows',
+    'withHeldCompressedRows',
     'compressedRowOf',
     'noteCompressedDecoderMissing',
     'nameCompressedSkips',
@@ -3086,7 +3087,7 @@ function completeDiscoveryHarness(
       repositoryCommits = new RepositoryCommits({ run: async () => null }, () => {});
       _showing = null; selections = []; messages = []; partial = []; catalog = null; drawnCards = [];
       coverageRevision = 0; enumeratedAdmissionComplete = true; claudeChildren = []; compressedRollouts = new Set();
-      compressedLoadPending = false; compressedFollowTimer = null; compressedRolloutsRevision = 0; compressedFacts = new Map(); compressedFactsRevision = 0; adoptionsUnsettled = new Map(); compressedSpendPicks = new WeakMap(); compressedLaunch = 'launch-test'; compressedWalk = null; compressedRowsDirty = null; compressedFactsRefreshDue = false; compressedLoadCursor = null; lifetimeDisplayPick = null;
+      compressedLoadPending = false; compressedFollowTimer = null; compressedRolloutsRevision = 0; compressedFacts = new Map(); compressedFactsRevision = 0; adoptionsUnsettled = new Map(); compressedSpendPicks = new WeakMap(); compressedLaunch = 'launch-test'; compressedWalk = null; compressedRowsDirty = null; compressedRowsHeld = new Map(); compressedFactsRefreshDue = false; compressedLoadCursor = null; lifetimeDisplayPick = null;
       authoritativeCatalog = null; attachmentHandoffs = new Set(); titles = new Map();
       metadataRevision = 0; drawnMetadataRevision = 0; startupProgressAt = 0;
       derivedCacheCheckpointState = { markChanged() {} };
@@ -11074,6 +11075,94 @@ test('a backfill batch lists a compressed-only session with its title and cost, 
   assert.equal(held[0].sessionId, twinThread);
   assert.equal(provider.titleEntryOf(twin)?.label, 'Decoded title', 'the row lost its title');
   assert.ok(provider.compressedFacts.get(twin)?.spend, 'the row lost its spend record');
+});
+
+test('a complete discovery reply keeps a backfilled row and gives it a spend source', async () => {
+  const { provider, root, writeRollout, releaseAll } = heldWalkHarness(
+    { readRolloutStat, isHiddenThread, isAgentRun, compressedTitleCurrent, withKeptUndercount, compressedEntrySame },
+    [],
+  );
+  delete provider.prepareClaudeChildren;
+  const plain = writeRollout('plain');
+  const twin = path.join(root, `rollout-${twinThread}.jsonl.zst`);
+  fs.writeFileSync(twin, 'x');
+  const stat = readRolloutStat(twin)!;
+  const roots: SessionFile[] = [];
+  let workerRuns = 0;
+  provider.claudeChildReferences = [];
+  provider.claudeChildStatWrites = new Map();
+  provider.pruneDerivedTitles = () => false;
+  provider.progressiveWorker = {
+    currentThreadId: 1,
+    run: (request: { parents: SessionFile[] }) => {
+      workerRuns++;
+      roots.splice(0, roots.length, ...request.parents);
+      return Promise.resolve({
+        generation: provider.refreshGeneration,
+        value: {
+          kind: 'claude-children',
+          scope: provider.repositoryScopeRoots,
+          compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
+          roots: request.parents,
+          complete: true,
+          continuation: false,
+          referenceEntries: [],
+          references: [],
+          children: [],
+          dispatchFacts: [],
+        },
+      });
+    },
+  };
+  const sourceUpdates: SessionFile[][] = [];
+  provider.updateSessionSpendSources = (codex: SessionFile[]) => sourceUpdates.push(codex);
+  provider.performanceCounters = { ...provider.performanceCounters, recordGauge() {} };
+  await releaseAll(provider.refresh(true));
+  const replies = workerRuns;
+  assert.deepEqual(
+    roots.map((row) => row.file),
+    [plain],
+    'the first request did not list the plain parent',
+  );
+  provider.applyCompressedBatch({
+    entries: [
+      {
+        file: twin,
+        pairKey: twin.replace(/\.zst$/, ''),
+        factsVersion: COMPRESSED_FACTS_VERSION,
+        metadataGeneration: METADATA_GENERATIONS.codex,
+        size: stat.size,
+        mtimeMs: stat.mtimeMs,
+        threadId: twinThread,
+        opening: { ...backfillOpening, cwd: provider.repositoryScopeRoots[0] },
+        spend: { file: twin.replace(/\.zst$/, ''), buckets: [] },
+        complete: true,
+        decodedLength: 500,
+      },
+    ],
+    backfillMs: 0,
+  });
+  await vi.waitFor(() => assert.equal(provider.refreshController, null));
+  assert.ok(await provider.prepareClaudeChildren(provider.refreshGeneration, new AbortController().signal));
+  assert.ok(workerRuns > replies, 'no complete reply followed the batch');
+  assert.ok(
+    roots.every((row) => !isCompressedRollout(row.file)),
+    'a compressed rollout reached the discovery parents',
+  );
+  assert.deepEqual(
+    (provider.authoritativeCatalog as SessionFile[]).map((row) => row.file).sort(),
+    [plain, twin].sort(),
+    'the complete reply dropped the backfilled row',
+  );
+  assert.deepEqual(
+    (provider.catalog.sessions as SessionFile[]).map((row) => row.file).sort(),
+    [plain, twin].sort(),
+    'the catalog lost the backfilled row after the complete reply',
+  );
+  assert.ok(
+    sourceUpdates.at(-1)?.some((row) => row.file === twin),
+    'the compressed row reached no spend source',
+  );
 });
 
 test('a plain twin suppresses the compressed row of a batch', () => {
