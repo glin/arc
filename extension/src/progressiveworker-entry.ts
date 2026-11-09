@@ -634,6 +634,9 @@ async function executeCompressedAdopt(
     compressedHolder(request.stores.facts),
     compressedHolder(request.stores.openings),
   );
+  // No list of names follows a failed adoption, so its twin must reach the backfill here.
+  if (!result.adopted && result.durable)
+    compressedBackfills.get(request.stores.facts)?.noteAdoptionFailed(result.entry.file);
   return {
     kind: 'compressed-adopt',
     adopted: result.adopted,

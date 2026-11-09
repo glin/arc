@@ -409,10 +409,24 @@ export class CompressedBackfill {
     void this.run();
   }
 
-  // A load repeats the roots every 10 seconds, so only a change plans again.
+  // A failed adoption needs the twin's body, and no list of names follows it.
+  noteAdoptionFailed(file: string): void {
+    this.events.add(file);
+    this.dirty = true;
+    void this.run();
+  }
+
+  // A load repeats the roots every 10 seconds, so only a change of the roots plans again. Each repeat also checks the
+  // files that failed, because a replaced file keeps its name.
   setRoots(roots: readonly string[]): void {
     const key = JSON.stringify(roots);
-    if (key === this.rootsKey) return;
+    if (key === this.rootsKey) {
+      if (this.failedRevisionMoved()) {
+        this.dirty = true;
+        void this.run();
+      }
+      return;
+    }
     this.rootsKey = key;
     this.inFolders = this.options.inFolders(roots);
     this.dirty = true;
@@ -427,6 +441,18 @@ export class CompressedBackfill {
     this.staleOpens.add(file);
     this.dirty = true;
     void this.run();
+  }
+
+  private failedRevisionMoved(): boolean {
+    let moved = false;
+    for (const [file, retry] of this.retries) {
+      const stat = this.statOf(file);
+      if (stat && stat.size === retry.size && stat.mtimeMs === retry.mtimeMs) continue;
+      this.retries.delete(file);
+      if (stat) this.events.add(file);
+      moved = true;
+    }
+    return moved;
   }
 
   dispose(): void {
@@ -501,7 +527,15 @@ export class CompressedBackfill {
         this.repairOpening(file, entry, stat, repairs);
         continue;
       }
-      if (current && entry.unreadable && entry.unreadableLaunch === this.options.launch) continue;
+      if (current && entry.unreadable && entry.unreadableLaunch === this.options.launch) {
+        this.retries.set(file, {
+          size: stat.size,
+          mtimeMs: stat.mtimeMs,
+          attempts: BACKFILL_RETRY_DELAYS_MS.length,
+          at: Infinity,
+        });
+        continue;
+      }
       const job: Job = { kind: 'body', file, stat };
       if (this.events.delete(file) || entry?.adoptionFailed || this.staleOpens.delete(file)) {
         events.push(job);
@@ -551,11 +585,16 @@ export class CompressedBackfill {
 
   private async deriveOpening(job: Job): Promise<void> {
     const started = this.now();
+    const report: { failed?: boolean } = {};
     let first: string | null = null;
     try {
-      first = await this.readFirst(job.file, COMPRESSED_ENTRY_TITLE_BYTES);
+      first = await this.readFirst(job.file, COMPRESSED_ENTRY_TITLE_BYTES, report);
     } catch {
-      // A filesystem refusal leaves the name for a later list.
+      report.failed = true;
+    }
+    // A failed read is not a rollout without an opening, so it takes the retries and saves no current opening.
+    if (report.failed) {
+      await this.retryLater(job);
       return;
     }
     const opening = openingRecordOf(first);

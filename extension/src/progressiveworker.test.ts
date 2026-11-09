@@ -17,7 +17,7 @@ import {
   type CompressedStoreHolder,
 } from './compressedstore.ts';
 import { CompressedBackfill, compressedFactsFromDerivation, RolloutDerivation } from './compressedbackfill.ts';
-import { streamCompressedRollout } from './compressedrollouts.ts';
+import { readCompressedFirstRecord, streamCompressedRollout } from './compressedrollouts.ts';
 import { compressedSpendDisplayFiles, indexSpendFile, spendRecordTotal } from './projectspend.ts';
 import * as path from 'node:path';
 import { buildSync } from 'esbuild';
@@ -15821,6 +15821,162 @@ test('the backfill waits for a saved unreadable mark before the next file', asyn
     'the next file started before the unreadable mark was on disk',
   );
   harness.backfill.dispose();
+});
+
+test('a failed adoption of a twin that the plan skipped queues the twin and plans again', async () => {
+  let plainPresent = true;
+  const decoded: string[] = [];
+  const harness = backfillHarness({
+    exists: () => plainPresent,
+    statOf: () => ({ ...unitStat, isFile: true }),
+    stream: async (file) => {
+      decoded.push(file);
+      return unitDecoded();
+    },
+  });
+  seedBody(harness, 'twin.jsonl.zst');
+  try {
+    harness.backfill.setNames(['twin.jsonl.zst']);
+    await vi.waitFor(() => assert.equal(harness.scheduled.length, 0));
+    assert.deepEqual(decoded, [], 'a twin with a plain file decoded');
+    plainPresent = false;
+    harness.backfill.noteAdoptionFailed('twin.jsonl.zst');
+    await vi.waitFor(() => assert.deepEqual(decoded, ['twin.jsonl.zst'], 'the failed adoption did not plan again'));
+  } finally {
+    harness.backfill.dispose();
+  }
+});
+
+test.skipIf(!zstdCompress)('a worker failed adoption reaches the backfill', async () => {
+  const pair = compressedRolloutPair();
+  const stores = { facts: path.join(pair.directory, 'facts'), openings: path.join(pair.directory, 'openings') };
+  const plain = pair.compressed.replace(/\.zst$/, '');
+  fs.copyFileSync(pair.plain, plain);
+  const worker = new ProgressiveWorker(source);
+  const signal = new AbortController().signal;
+  try {
+    await worker.run(
+      {
+        kind: 'compressed-load',
+        stores,
+        backfill: { workspace: pair.directory, roots: [pair.directory], launch: 'one' },
+      },
+      1,
+      signal,
+    );
+    await worker.run(
+      {
+        kind: 'claude-children',
+        parents: [],
+        repositoryRoots: [pair.directory],
+        compressed: [pair.compressed],
+        compressedStores: stores,
+      } as never,
+      2,
+      signal,
+    );
+    await vi.waitFor(() =>
+      assert.equal(readCompressedStore(stores.facts).entries.get(pair.compressed)?.nameOnly, true),
+    );
+    fs.rmSync(plain);
+    await worker.run(
+      { kind: 'compressed-adopt', adoption: { twin: pair.compressed, plain, plainMtimeMs: -1 }, stores },
+      3,
+      signal,
+    );
+    await vi.waitFor(() => {
+      const entry = readCompressedStore(stores.facts).entries.get(pair.compressed);
+      assert.equal(entry?.decodedLength, pair.body.length, 'the failed adoption did not reach the backfill');
+    });
+  } finally {
+    worker.stop();
+    fs.rmSync(pair.directory, { recursive: true, force: true });
+  }
+});
+
+test('a failed opening read takes the retries and saves no current opening', async () => {
+  let reads = 0;
+  const harness = backfillHarness({
+    exists: () => false,
+    statOf: () => ({ ...unitStat, isFile: true }),
+    readFirst: async () => {
+      reads++;
+      throw new Error('EACCES');
+    },
+  });
+  try {
+    harness.backfill.setNames(['unplaced.jsonl.zst']);
+    await vi.waitFor(() => assert.equal(harness.scheduled.length, 1, 'the failed read scheduled no retry'));
+    assert.equal(harness.scheduled[0].at - harness.now(), 10_000);
+    assert.equal(reads, 1);
+    assert.equal(harness.openings.length, 0, 'a failed read saved a current opening');
+    harness.advance(10_000);
+    await vi.waitFor(() => assert.equal(reads, 2, 'the retry did not read again'));
+    assert.equal(harness.openings.length, 0, 'a failed retry saved a current opening');
+  } finally {
+    harness.backfill.dispose();
+  }
+});
+
+test('a zstd error on an opening read reports a failed read', async () => {
+  const directory = tempDir('first-record-');
+  const file = path.join(directory, 'broken.jsonl.zst');
+  fs.writeFileSync(file, 'not a zstd frame, but long enough to reach the decoder');
+  const report: { failed?: boolean } = {};
+  try {
+    assert.equal(await readCompressedFirstRecord(file, 1024, report), null);
+    assert.equal(report.failed, true, 'a zstd error read as a rollout without an opening');
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('a replaced file restarts a failed revision with an unchanged list and roots', async () => {
+  let stat = { ...unitStat, isFile: true };
+  let decodes = 0;
+  const harness = backfillHarness({
+    exists: () => false,
+    statOf: () => stat,
+    stream: async () => {
+      decodes++;
+      return { kind: 'failed' } as never;
+    },
+  });
+  harness.known.set('cut.jsonl.zst', {
+    file: 'cut.jsonl.zst',
+    pairKey: 'cut.jsonl.zst',
+    ...compressedEntryVersions(),
+    nameOnly: true,
+    opening: compressedOpening,
+  });
+  const fail = async (expected: number) => {
+    await vi.waitFor(() => assert.equal(decodes, expected));
+    await vi.waitFor(() => assert.equal(harness.scheduled.length, 1));
+  };
+  try {
+    harness.backfill.setNames(['cut.jsonl.zst']);
+    await fail(1);
+    harness.advance(10_000);
+    await fail(2);
+    harness.advance(60_000);
+    await fail(3);
+    harness.advance(600_000);
+    await vi.waitFor(() => assert.equal(decodes, 4));
+    await vi.waitFor(() => {
+      harness.advance(0);
+      assert.equal(harness.batches.flatMap((batch) => batch.entries)[0]?.unreadable, true, 'no terminal entry');
+    });
+    harness.backfill.setRoots(['/']);
+    await vi.waitFor(() => assert.equal(harness.scheduled.length, 0));
+    assert.equal(decodes, 4, 'an unchanged file decoded again');
+    stat = { ...stat, size: stat.size + 1 };
+    harness.backfill.setRoots(['/']);
+    await vi.waitFor(() => assert.equal(decodes, 5, 'the replaced file did not restart'));
+    await vi.waitFor(() => assert.equal(harness.scheduled.length, 1));
+    assert.equal(harness.scheduled[0].at - harness.now(), 10_000, 'the replaced file kept the old count');
+  } finally {
+    harness.backfill.dispose();
+  }
 });
 
 const unitStat = { size: 10, mtimeMs: 2, dev: 1, ino: 1 };
