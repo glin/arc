@@ -17679,7 +17679,7 @@ test.each(['held', 'read'] as const)(
   'a reader selection records arrival through transcript paint with a %s window',
   async (window) => {
     const logged: Array<{ event: string; record: Record<string, unknown> }> = [];
-    const provider = paintHarness(['onMessage', 'routePerformanceEvent'], {
+    const provider = paintHarness(['onMessage', 'routePerformanceEvent', 'sendToHost'], {
       parsePanelToHost,
       dispatchPanelToHost,
       READER_INSTRUCTIONS: new Set(),
