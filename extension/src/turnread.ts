@@ -90,7 +90,7 @@ export function newCounts(
   agentRead: ReadonlyMap<string, string> = new Map(),
   mappedWindows: ReadonlyMap<string, readonly (ReadableTurn & { kind: string; finished?: boolean })[]> = new Map(),
 ): Map<string, NewCount> {
-  const readSet = new Set(read);
+  const readSet: ReadonlySet<string> = read instanceof Set ? read : new Set(read);
   const out = new Map<string, NewCount>();
   for (const [id, count] of newBySession(parsed, readSet, readTo, since, agentRead)) {
     const session = readerTurns(parsed, id);

@@ -43,7 +43,7 @@ export function newBySession(
   since = 0,
   agentRead: ReadonlyMap<string, string> = new Map(),
 ): Map<string, number> {
-  const readSet = new Set(read);
+  const readSet: ReadonlySet<string> = read instanceof Set ? read : new Set(read);
   const newestRead = new Map<string, number>();
   // Use the same read rule when locating the latest read turn.
   for (const c of cards) {

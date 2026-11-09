@@ -2,7 +2,7 @@
 
 import { test } from 'vitest';
 import { newestTurnStarts } from './turnread.ts';
-import { readSession, readSessionTurnStarts } from './transcript.ts';
+import { readSession, readSessionTurnStarts, type TurnStarts } from './transcript.ts';
 import { claudeLoopWake, claudeWakeupSequence } from './turnfixtures.ts';
 import assert from 'node:assert';
 import * as fs from 'node:fs';
@@ -387,6 +387,38 @@ test('a session nobody parsed still says how much is new in it', () => {
     count: 1,
     atLeast: false,
   });
+});
+
+test('newCounts keeps the shared read set unchanged across 3500 windows', () => {
+  const windows = new Map(
+    Array.from({ length: 3500 }, (_, index): [string, TurnStarts] => [
+      `session-${index}`,
+      { starts: [100, 200, 300], whole: true },
+    ]),
+  );
+  const read = new Set(Array.from({ length: 2000 }, (_, index) => `session-${index}:200`));
+  const held = new Set(read);
+  const readTo = new Map<string, number>();
+  const timings: number[] = [];
+  for (let run = 0; run < 5; run++) {
+    const start = performance.now();
+    newCounts([], windows, read, readTo);
+    timings.push(performance.now() - start);
+  }
+  console.log(`newCounts 3500 windows median: ${timings.sort((a, b) => a - b)[2].toFixed(3)} ms`);
+  assert.deepEqual(read, held);
+});
+
+test('unread counts keep callers with different rows and boundaries independent', () => {
+  const read = new Set(['a:200']);
+  const readTo = new Map<string, number>();
+  const first = [{ key: 'a:300', sessionId: 'a', startedAt: 300, kind: 'turn' }];
+  const second = [{ key: 'b:400', sessionId: 'b', startedAt: 400, kind: 'turn' }];
+  const one = newCounts(first, new Map(), read, readTo);
+  assert.deepEqual([...one], [['a', { count: 1, atLeast: false }]]);
+  assert.deepEqual([...newCounts(second, new Map(), read, readTo)], [['b', { count: 1, atLeast: false }]]);
+  assert.deepEqual([...newCounts(first, new Map(), read, readTo, 350)], [['a', { count: 0, atLeast: false }]]);
+  assert.deepEqual([...one], [['a', { count: 1, atLeast: false }]]);
 });
 
 const wakeupAt = (second: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, second)).toISOString();
