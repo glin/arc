@@ -1,6 +1,26 @@
 {
   "margin": "Each row has an integer margin. An integer counter must equal its budget within the margin. A byte counter fails only above budget plus margin.",
   "rows": {
+    "prompt scan save | selection:hostArrived": {
+      "reason": "The reader selects one session, which starts one selection timing measurement.",
+      "budget": 1,
+      "margin": 0
+    },
+    "prompt scan save | selection:renderPosted": {
+      "reason": "The first drawable selected transcript carries one timing identity. Later renders carry none.",
+      "budget": 1,
+      "margin": 0
+    },
+    "selection switch | selection:hostArrived": {
+      "reason": "The reader selects one session, which starts one selection timing measurement.",
+      "budget": 1,
+      "margin": 0
+    },
+    "selection switch | selection:renderPosted": {
+      "reason": "The first drawable selected transcript carries one timing identity. Later renders carry none.",
+      "budget": 1,
+      "margin": 0
+    },
     "automatic save | catalogWalk": {
       "reason": "A step walks the catalog only when no held catalog can serve it. A rise means a step lost catalog reuse.",
       "budget": 0,

@@ -23,6 +23,7 @@ const COUNTER_PREFIXES = [
   'humanPromptStat:',
   'cachedLinks:',
   'watcher:grownMemberMiss:',
+  'selection:',
 ];
 // Bytes depend on the platform's path separators, so these counters can fall below budget without a change in the work.
 const ONE_SIDED = new Set(['readBytes', 'dispatchSpendBytes']);
