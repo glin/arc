@@ -28,3 +28,38 @@ export function revisionOf(stat: fs.Stats | fs.BigIntStats): FileRevision {
     ino: typeof stat.ino === 'bigint' ? stat.ino.toString() : stat.ino,
   };
 }
+
+export function supportedFileIdentity(value: { dev?: unknown; ino?: unknown }): boolean {
+  return fileIdentityValue(value.dev) && fileIdentityValue(value.ino, true);
+}
+
+// The file stat that qualifies a saved opening.
+export interface OpeningStat {
+  size: number;
+  mtimeMs: number;
+  dev?: number | string;
+  ino?: number | string;
+}
+
+// The working directory that the opening of a Claude transcript named, with the stat of the file that the listing took.
+export interface SavedClaudeOpening extends OpeningStat {
+  cwd: string;
+}
+
+// Reports whether an opening saved at one file stat still answers for the file at `stat`.
+// With a device and inode on both sides, they must match, the file must not shrink, and a file of the same size must
+// keep its modification time. So a replaced or shrunk file, or a rewrite at the same size, needs another read.
+// Growth with the same identity keeps the opening.
+// A saved stat without an inode takes a current inode only at the same size and modification time.
+// Without an inode on either side, growth also needs a modification time that does not move backwards.
+// A saved inode with no current inode needs another read.
+export function savedOpeningCurrent(saved: OpeningStat, stat: OpeningStat): boolean {
+  const savedIdentity = supportedFileIdentity(saved);
+  const currentIdentity = supportedFileIdentity(stat);
+  if (!savedIdentity && currentIdentity) return stat.size === saved.size && stat.mtimeMs === saved.mtimeMs;
+  if (stat.size < saved.size) return false;
+  const unmoved = stat.size > saved.size || stat.mtimeMs === saved.mtimeMs;
+  if (savedIdentity && currentIdentity)
+    return String(stat.dev) === String(saved.dev) && String(stat.ino) === String(saved.ino) && unmoved;
+  return !savedIdentity && stat.mtimeMs >= saved.mtimeMs && unmoved;
+}

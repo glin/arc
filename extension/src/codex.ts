@@ -73,7 +73,7 @@ import {
   readTurnStartsFromTail,
   recordCommits,
   shortenTo,
-  supportedFileIdentity,
+  savedOpeningCurrent,
   tailOf,
   tallyToolName,
   activityIn,
@@ -246,24 +246,11 @@ export class CodexMetaCache {
     if (!meta) return null;
     // An opening saved before file identity lists as it stands until `prime` qualifies it.
     if (meta.fileIdentity === undefined) return meta;
-    const savedIdentity = supportedFileIdentity(meta.fileIdentity);
-    const currentIdentity = supportedFileIdentity(stat ?? {});
-    const physical = savedIdentity && currentIdentity;
-    const adopting = !savedIdentity && currentIdentity;
     const matches =
       stat?.isFile &&
       meta.size !== undefined &&
       meta.mtimeMs !== undefined &&
-      (adopting
-        ? stat.size === meta.size && stat.mtimeMs === meta.mtimeMs
-        : stat.size >= meta.size &&
-          (physical
-            ? String(stat.dev) === String(meta.fileIdentity?.dev) &&
-              String(stat.ino) === String(meta.fileIdentity?.ino) &&
-              (stat.size > meta.size || stat.mtimeMs === meta.mtimeMs)
-            : !savedIdentity &&
-              stat.mtimeMs >= meta.mtimeMs &&
-              (stat.size > meta.size || stat.mtimeMs === meta.mtimeMs)));
+      savedOpeningCurrent({ size: meta.size, mtimeMs: meta.mtimeMs, ...meta.fileIdentity }, stat);
     if (!matches) return null;
     const { size, mtimeMs, dev, ino } = stat;
     if (
