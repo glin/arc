@@ -13784,7 +13784,8 @@ export class PanelProvider implements vscode.Disposable {
     return claudeWalk && { enumeration, claudeWalk };
   }
 
-  // The Claude reads of a walk as steps. It writes no host state that the commit owns, so an abandoned walk leaves nothing.
+  // The Claude reads of a walk as steps. It writes no host state that the commit owns. An abandoned walk leaves the
+  // working directories it read in `cwds` and the entries it read in the subagent directory cache.
   private *claudeWalkSteps(
     roots: string[],
     workspaceFolders: string[],
