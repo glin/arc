@@ -33150,7 +33150,7 @@ test('selection and accepted worker results avoid unnecessary catalog walks', ()
   // Retain revalidated session revisions and distinguish reuse from a catalog walk.
   sourceMatch(
     body,
-    /this\.catalog = \{ folders: folderPrint, sessions: sorted \};\s*this\.catalogWalked = false;/,
+    /this\.catalog = \{ folders: folderPrint, sessions: sorted \};\s*if \(!settled\) this\.catalogWalked = false;/,
     'a reused catalog throws away the revision it just read',
   );
   sourceMatch(
