@@ -62,8 +62,8 @@
       "margin": 0
     },
     "automatic save | posted:render:rows": {
-      "reason": "The panel receives one message for each publication, and a delta carries only changed rows. A rise means a step publishes more or carries more rows.",
-      "budget": 5,
+      "reason": "The delta of the cold start already carries the finished status of the selected session, so this delta carries only the child rows. A rise means a step publishes more or carries more rows.",
+      "budget": 4,
       "margin": 0
     },
     "automatic save | readBytes": {
@@ -112,8 +112,8 @@
       "margin": 0
     },
     "child watcher event | catalogWalk": {
-      "reason": "A step walks the catalog only when no held catalog can serve it. A rise means a step lost catalog reuse.",
-      "budget": 0,
+      "reason": "A warm start lists the walk of its cold opening pass once. The test panel reports no paint, so that listing runs in this step, at the paint limit. A rise means a step lost catalog reuse.",
+      "budget": 1,
       "margin": 0
     },
     "child watcher event | discoveryRequest:walked": {
@@ -197,8 +197,8 @@
       "margin": 0
     },
     "child watcher event | refreshCount:catalog-enumeration": {
-      "reason": "Each refresh that lists sessions runs one enumeration. A rise means a step runs extra catalog refreshes.",
-      "budget": 2,
+      "reason": "A warm start lists the walk of its cold opening pass once. The test panel reports no paint, so that listing runs in this step, at the paint limit. A rise means a step runs extra catalog refreshes.",
+      "budget": 3,
       "margin": 0
     },
     "child watcher event | renderPost:enrichment": {
@@ -307,13 +307,18 @@
       "margin": 0
     },
     "cold start | posted:render": {
-      "reason": "The panel receives one message for each publication, and a delta carries only changed rows. A rise means a step publishes more or carries more rows.",
+      "reason": "A cold start lists the walked rows at the first partial reply, and the complete reply adds the child rows in one delta. A rise means a step publishes more or carries more rows.",
+      "budget": 2,
+      "margin": 0
+    },
+    "cold start | posted:render:delta": {
+      "reason": "A cold start lists the walked rows at the first partial reply, and the complete reply adds the child rows in one delta. A rise means a step publishes more or carries more rows.",
       "budget": 1,
       "margin": 0
     },
     "cold start | posted:render:rows": {
-      "reason": "The panel receives one message for each publication, and a delta carries only changed rows. A rise means a step publishes more or carries more rows.",
-      "budget": 240,
+      "reason": "A cold start lists the walked rows at the first partial reply, and the complete reply adds the child rows in one delta. A rise means a step publishes more or carries more rows.",
+      "budget": 253,
       "margin": 0
     },
     "cold start | posted:render:snapshot": {
@@ -363,6 +368,11 @@
     },
     "cold start | renderPost:dispatch-discovery": {
       "reason": "A refresh renders the session list when its inputs changed. A rise means a step redraws without new facts.",
+      "budget": 1,
+      "margin": 0
+    },
+    "cold start | renderPost:shell-ready": {
+      "reason": "A cold start lists the walked rows at the first partial reply, and the complete reply adds the child rows in one delta. A rise means a step redraws without new facts.",
       "budget": 1,
       "margin": 0
     },
