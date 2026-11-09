@@ -3320,7 +3320,7 @@ function railEnrichmentHarness(
       failSessionLoading() {}
       titles = new Map();
       refreshGeneration = 1;
-      codexMetas = { get() { return undefined; } };
+      codexMetas = { get() { return undefined; }, savedOpening() { return null; } };
       derivedCacheCheckpointState = { changes: 0, markChanged() { this.changes++; } };
       progressiveWorker;
       constructor(run) { this.progressiveWorker = { run }; }
@@ -3436,7 +3436,7 @@ function metadataHarness(
       titles = new Map(); carriedNames = new Map(); refreshGeneration = 1; metadataRevision = 0;
       commitRepositories = new CommitRepositories({ run: async () => null }, () => {});
       revision = ${derivedCacheFile ? 'null' : '{ size: 11, mtimeMs: 11, dev: 1, ino: 2 }'};
-      codexMetas = { get() { return undefined; } };
+      codexMetas = { get() { return undefined; }, savedOpening() { return null; } };
       derivedCacheCheckpointState = { markChanged() {} };
       claudeChildReferenceEntries = new Map(); codexOpenings = null; threadNames = { names: new Map(), fullNames: new Map() };
       startupCache = {}; progressiveWorker; sessionNames; derivedCacheFile;
@@ -7575,7 +7575,7 @@ function titlePublicationHarness(
     discoveryCheckpoint: cached?.discoveryCheckpoint,
     sessionNames: new SessionNames(),
     threadNames: { stamp: '', names: new Map(), fullNames: new Map() },
-    codexMetas: { get: () => undefined },
+    codexMetas: { get: () => undefined, savedOpening: () => null },
     progressiveWorker: { run },
     derivedCacheFile: cacheFile,
     derivedCacheCheckpointState: new DerivedCacheCheckpointState(Date.now()),
@@ -17820,7 +17820,7 @@ test('a failed metadata read records the file and does not keep the loading line
       },
     };
     provider.observeStoredEntry = () => {};
-    provider.codexMetas = new Map();
+    provider.codexMetas = Object.assign(new Map(), { savedOpening: () => null });
     // The first Codex source's accepted metadata trails its revision, and every read of it fails.
     provider.titles.set(first.file, { ...harness.settled(first), size: 0, mtimeMs: 0 });
     const discover = provider.progressiveWorker.run;

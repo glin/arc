@@ -2326,7 +2326,7 @@ function metadataEnrichmentFixture(sessions: any[], source = getProgressiveWorke
     titles: new Map(),
     metadataRevision: 0,
     drawnMetadataRevision: 0,
-    codexMetas: new Map(),
+    codexMetas: Object.assign(new Map(), { savedOpening: () => null }),
     commitRepositories: new CommitRepositories({ run: async () => null }, () => {}),
     carriedNames: new Map(),
     refreshGeneration: 1,
@@ -6307,7 +6307,7 @@ test('window session listings refuse ordinary archive of unread work while accep
   provider.refreshController = new AbortController();
   provider.refreshGeneration = 1;
   provider.derivedCacheCheckpointState = { markChanged() {} };
-  provider.codexMetas = new Map();
+  provider.codexMetas = Object.assign(new Map(), { savedOpening: () => null });
   provider.observeStoredName = (_source: any, next: any) => next;
   provider.metadataRecoveryQueue = [];
   provider.sessionAliases = new Map();
@@ -12549,7 +12549,7 @@ test('both agents reach one list, and each session is read and named by its own 
   // Retain rollout metadata and trim its cache against walked files.
   sourceMatch(
     merge,
-    /this\.codexMetas\.get\(file, countCodexOpeningRead\)/,
+    /this\.codexMetas\.listingOpening\(file, stat, inFolders, countCodexOpeningRead,/,
     'the panel keeps no opening record, so it reads every head again on every poll',
   );
   sourceMatch(
@@ -13616,7 +13616,7 @@ test('Claude child sessions own lifetime figures while project files stay dedupl
   );
   sourceMatch(
     panelHostSource,
-    /\(\) => qualifiedCodexStats\.get\(file\) \?\? \(this\.watching \? this\.codexStats\.get\(file\) : readRolloutStat\(file\)\)/,
+    /\(\) =>\s*qualifiedCodexStats\.get\(file\) \?\?\s*\(this\.watching \? this\.codexStats\.get\(file, this\.codexMetas\.savedOpening\(file\)\) : readRolloutStat\(file\)\)/,
     'a walk while the panel is hidden reused a rollout stat no watcher kept current',
   );
 });
@@ -31578,7 +31578,7 @@ function activityFallbackFixture(directory: string, children: { sessionId: strin
     },
     catalog: { folders: [directory, 1].join('\0'), sessions },
     cwds: new Map(),
-    codexMetas: { revision: 0, get: () => undefined, keys: () => [], delete() {} },
+    codexMetas: { revision: 0, get: () => undefined, savedOpening: () => null, keys: () => [], delete() {} },
     codexStats: { get: () => undefined, keys: () => [], delete() {}, markChanged() {} },
     subagentDirectories: { sweep() {} },
     claudeChildren: listedChildren,

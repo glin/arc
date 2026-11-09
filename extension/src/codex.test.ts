@@ -16291,12 +16291,7 @@ test('a cold opening pass reads up to its bound at once and never more', async (
   const waiting: (() => void)[] = [];
   let open = 0;
   let most = 0;
-  const cache = new CodexMetaCache(
-    () => assert.fail('a file the pass read was read again on the main thread'),
-    undefined,
-    undefined,
-    () => ({ size: opening.size!, mtimeMs: opening.mtimeMs!, ...opening.fileIdentity, isFile: true }),
-  );
+  const cache = new CodexMetaCache(() => assert.fail('a file the pass read was read again on the main thread'));
   const done = cache.prime(
     files,
     (file) => {
