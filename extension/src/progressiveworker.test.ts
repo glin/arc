@@ -16344,6 +16344,48 @@ test.skipIf(!zstdCompress)('the backfill holds no title or spend for an entry it
   }
 });
 
+test.skipIf(!zstdCompress)('a failed store read publishes no marked derivation', async () => {
+  const pair = compressedRolloutPair((turn) =>
+    turn === 1
+      ? [
+          {
+            timestamp: timestamp(70),
+            type: 'event_msg',
+            payload: { type: 'token_count', pad: 'z'.repeat(9000), info: null },
+          },
+        ]
+      : [],
+  );
+  const harness = backfillHarness({
+    exists: () => false,
+    limits: { reduceAbove: 1024, recordBytes: 4096 },
+    readStore: async (_directory, _statOf, _yieldStep, onUnreadable) => {
+      onUnreadable?.('segment-retired');
+      return { entries: new Map(), names: [] };
+    },
+  });
+  const { backfill, facts, scheduled, known } = harness;
+  known.set(pair.compressed, {
+    file: pair.compressed,
+    pairKey: pair.compressed,
+    ...compressedEntryVersions(),
+    size: 1,
+    mtimeMs: 1,
+    decodedLength: 9,
+    opening: compressedOpening,
+  });
+  try {
+    backfill.setNames([pair.compressed]);
+    await vi.waitFor(() => assert.equal((backfill as unknown as { running: boolean }).running, false));
+    assert.deepEqual(facts, [], 'a failed store read let a marked derivation lower the stored total');
+    assert.equal(scheduled.length, 1, 'the file waited for no later plan');
+    assert.equal(scheduled[0].at - harness.now(), 600_000);
+  } finally {
+    backfill.dispose();
+    fs.rmSync(pair.directory, { recursive: true, force: true });
+  }
+});
+
 const unitStat = { size: 10, mtimeMs: 2, dev: 1, ino: 1 };
 const unitDecoded = (hash = 'h') =>
   ({ kind: 'decoded', hash, stat: unitStat as never, frames: 1, complete: true }) as const;

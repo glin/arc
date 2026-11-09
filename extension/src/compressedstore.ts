@@ -531,8 +531,9 @@ export async function readCompressedStoreInSteps(
   directory: string,
   statOf: (file: string) => { size: number; mtimeMs: number } | null,
   yieldStep: () => Promise<void> = yieldToEvents,
+  onUnreadable?: (name: string) => void,
 ): Promise<CompressedStoreRead> {
-  const steps = storeReadSteps(directory, statOf);
+  const steps = storeReadSteps(directory, statOf, onUnreadable);
   let step = steps.next();
   while (!step.done) {
     await yieldStep();

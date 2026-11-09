@@ -350,6 +350,7 @@ export interface CompressedBackfillOptions {
   exists?: (file: string) => boolean;
   readFirst?: typeof readCompressedFirstRecord;
   stream?: typeof streamCompressedRollout;
+  readStore?: typeof readCompressedStoreInSteps;
   limits?: { recordBytes?: number; reduceAbove?: number; retainedBytes?: number };
 }
 
@@ -384,6 +385,7 @@ export class CompressedBackfill {
   private readonly exists: (file: string) => boolean;
   private readonly readFirst: typeof readCompressedFirstRecord;
   private readonly stream: typeof streamCompressedRollout;
+  private readonly readStore: typeof readCompressedStoreInSteps;
 
   constructor(private readonly options: CompressedBackfillOptions) {
     this.inFolders = options.inFolders(options.roots);
@@ -402,6 +404,7 @@ export class CompressedBackfill {
     this.exists = options.exists ?? ((file) => this.statOf(file) !== null);
     this.readFirst = options.readFirst ?? readCompressedFirstRecord;
     this.stream = options.stream ?? streamCompressedRollout;
+    this.readStore = options.readStore ?? readCompressedStoreInSteps;
   }
 
   // Each list from the host is the complete set. A name that a later list adds goes first.
@@ -769,20 +772,31 @@ export class CompressedBackfill {
 
   // The worker holds no title or spend, so the whole entry comes from the store.
   private async storedEntry(file: string): Promise<CompressedFactEntry | undefined> {
-    return (await readCompressedStoreInSteps(this.options.facts.directory, this.statOf, this.yieldStep)).entries.get(
-      file,
-    );
+    return (await this.readFacts())?.get(file);
+  }
+
+  // The entries of the facts store, or null when a store file gave no answer, because a compaction can retire a file during the read.
+  private async readFacts(): Promise<ReadonlyMap<string, CompressedFactEntry> | null> {
+    let failed = false;
+    const read = await this.readStore(this.options.facts.directory, this.statOf, this.yieldStep, () => {
+      failed = true;
+    });
+    return failed ? null : read.entries;
   }
 
   // Each derivation is on disk before the next one starts.
   private async publish(next: CompressedFactEntry): Promise<void> {
     let previous: CompressedFactEntry | undefined = this.results.get(next.file) ?? this.options.known().get(next.file);
     // Only a marked derivation needs the stored spend record, so the worker holds no spend for the other entries.
-    if (next.undercount && !next.unreadable && !previous?.spend)
-      previous =
-        (await readCompressedStoreInSteps(this.options.facts.directory, this.statOf, this.yieldStep)).entries.get(
-          next.file,
-        ) ?? previous;
+    if (next.undercount && !next.unreadable && !previous?.spend) {
+      const stored = await this.readFacts();
+      // A store that gave no answer can hold the higher total, so this derivation publishes nothing and a later plan runs it.
+      if (!stored) {
+        this.replanLater();
+        return;
+      }
+      previous = stored.get(next.file) ?? previous;
+    }
     const entry = boundedCompressedEntry(withKeptUndercount(previous, next));
     const [written] = await this.options.facts.append([entry]);
     if (!written && !(await this.options.facts.durable([entry]))) return;
