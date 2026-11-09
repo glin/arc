@@ -53,6 +53,7 @@ import {
   enumerateClaudeChildSourceSteps,
   enumerateSessionFilesFor,
   enumerateSessionFilesForSteps,
+  savedOpeningCurrent,
   scanSessionCwd,
   walkInSlices,
   WALK_SLICE_MS,
@@ -3164,6 +3165,7 @@ function completeDiscoveryHarness(
     sessionPresence,
     sessionSourceKey,
     supportedFileIdentity,
+    savedOpeningCurrent,
     fs,
     fileRevisionOf,
     SpendCoverage,
@@ -10043,6 +10045,121 @@ test('a watcher batch during a sliced walk folds into the walk, and a file in an
   assert.ok(folded, 'the batch did not fold into the running walk');
   assert.deepEqual(files(), [added, first].sort(), 'the commit did not list the file the batch named');
   assert.equal(walks.length, 1, 'the folded batch started another walk');
+});
+
+// Two launches of one workspace over real files. A relaunch saves through the host, loads the file as a new host does, and
+// starts from no held openings.
+function savedOpeningsHarness() {
+  const harness = slicedWalkHarness({ saveDerivedCache }, ['writeDerivedCache']);
+  const { provider, directoryOf, writeParent, releaseAll } = harness;
+  const workspace = path.join(harness.root, 'project');
+  provider.derivedCacheFile = path.join(tempDir('saved-openings-'), 'derived.json');
+  provider.walkedChildSources = [];
+  provider.savedChildOpenings = null;
+  const line = (cwd: string) => `${JSON.stringify({ type: 'user', cwd })}\n`;
+  const writeChild = (parent: string, name: string, content = line(workspace)) => {
+    const directory = path.join(directoryOf(), path.basename(parent, '.jsonl'), 'subagents');
+    fs.mkdirSync(directory, { recursive: true });
+    const file = path.join(directory, `agent-${name}.jsonl`);
+    fs.writeFileSync(file, content);
+    return file;
+  };
+  const walk = async () => {
+    const counters = new PanelPerformanceCounters();
+    provider.performanceCounters = counters;
+    await releaseAll(provider.refresh(true));
+    const work = counters.snapshot().work;
+    return { parents: work['openingsRead:parents'] ?? 0, children: work['openingsRead:children'] ?? 0 };
+  };
+  const relaunch = (change: (stored: any) => void = () => {}) => {
+    assert.equal(provider.writeDerivedCache(), true, 'the host did not save the derived cache');
+    const stored = JSON.parse(fs.readFileSync(provider.derivedCacheFile, 'utf8'));
+    change(stored);
+    fs.writeFileSync(provider.derivedCacheFile, JSON.stringify(stored));
+    const restored = loadDerivedCache(provider.derivedCacheFile);
+    assert.equal(restored.reuse?.reason, 'reused', 'the saved file did not load');
+    provider.cwds = new Map();
+    for (const [file, opening] of restored.claudeOpenings?.parents ?? [])
+      provider.cwds.set(file, { ...opening, saved: true });
+    provider.savedChildOpenings = restored.claudeOpenings?.children ?? null;
+    provider.walkedChildSources = [];
+  };
+  const parentCwd = (file: string) =>
+    provider.catalog.sessions.find((session: SessionFile) => session.file === file)?.cwd;
+  const childCwd = (file: string) => provider.walkedChildSources.find((row: SessionFile) => row.file === file)?.cwd;
+  return { ...harness, workspace, line, writeParent, writeChild, walk, relaunch, parentCwd, childCwd };
+}
+
+test('a warm start lists Claude parents and children from their saved openings with no read', async () => {
+  const { provider, writeParent, writeChild, walk, relaunch, parentCwd, childCwd, workspace } = savedOpeningsHarness();
+  const parent = writeParent('parent');
+  const other = writeParent('other');
+  const child = writeChild(parent, 'child');
+  assert.deepEqual(await walk(), { parents: 2, children: 1 }, 'the cold start did not read each opening once');
+  relaunch();
+  // A save before the first walk of a launch keeps the openings that the launch loaded.
+  relaunch();
+  assert.equal(provider.savedChildOpenings.size, 1, 'a save before the first census dropped the saved child openings');
+  assert.equal(provider.cwds.size, 2, 'a save before the first walk dropped the saved parent openings');
+  assert.deepEqual(await walk(), { parents: 0, children: 0 }, 'the warm start read an opening that it saved');
+  assert.deepEqual(
+    [parentCwd(parent), parentCwd(other), childCwd(child)],
+    [workspace, workspace, workspace],
+    'a saved opening listed a wrong working directory',
+  );
+  assert.equal(provider.savedChildOpenings, null, 'a committed census kept the saved child openings');
+});
+
+test('a replaced parent transcript at the same path reads again and lists its new working directory', async () => {
+  const { writeParent, walk, relaunch, parentCwd, line, workspace, root } = savedOpeningsHarness();
+  const parent = writeParent('parent');
+  await walk();
+  relaunch();
+  const moved = path.join(workspace, 'moved');
+  const replacement = path.join(root, 'replacement.jsonl');
+  fs.writeFileSync(replacement, line(moved));
+  fs.renameSync(replacement, parent);
+  assert.deepEqual(await walk(), { parents: 1, children: 0 }, 'the replaced transcript kept its saved opening');
+  assert.equal(parentCwd(parent), moved, 'the replaced transcript listed its old working directory');
+});
+
+test('an append to a saved transcript keeps its opening without a read', async () => {
+  const { writeParent, writeChild, walk, relaunch, parentCwd, childCwd, line, workspace } = savedOpeningsHarness();
+  const parent = writeParent('parent');
+  const child = writeChild(parent, 'child');
+  await walk();
+  relaunch();
+  fs.appendFileSync(parent, line('appended'));
+  fs.appendFileSync(child, line('appended'));
+  assert.deepEqual(await walk(), { parents: 0, children: 0 }, 'an append read a saved opening again');
+  assert.equal(parentCwd(parent), workspace);
+  assert.equal(childCwd(child), workspace);
+});
+
+test('a saved child opening whose file shrank reads again', async () => {
+  const { writeParent, writeChild, walk, relaunch, childCwd, line, workspace } = savedOpeningsHarness();
+  const parent = writeParent('parent');
+  const moved = path.join(workspace, 'moved');
+  const child = writeChild(parent, 'child', line(workspace) + line(workspace));
+  await walk();
+  relaunch();
+  fs.writeFileSync(child, line(moved));
+  assert.ok(fs.statSync(child).size < line(workspace).length * 2, 'the fixture did not shrink the child');
+  assert.deepEqual(await walk(), { parents: 0, children: 1 }, 'the shrunk child kept its saved opening');
+  assert.equal(childCwd(child), moved, 'the shrunk child listed its old working directory');
+});
+
+test('a saved file in the shape of a build without saved openings loads and reads each opening', async () => {
+  const { writeParent, writeChild, walk, relaunch, parentCwd, workspace } = savedOpeningsHarness();
+  const parent = writeParent('parent');
+  writeChild(parent, 'child');
+  await walk();
+  relaunch((stored) => {
+    assert.ok(stored.claudeOpenings, 'the host saved no openings');
+    delete stored.claudeOpenings;
+  });
+  assert.deepEqual(await walk(), { parents: 1, children: 1 }, 'a file without saved openings skipped a read');
+  assert.equal(parentCwd(parent), workspace);
 });
 
 test('a file created after its folder was read waits for the next walk', async () => {

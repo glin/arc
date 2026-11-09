@@ -144,6 +144,8 @@ import {
   projectsRoot,
   enumerateSessionFilesFor,
   enumerateSessionFilesForSteps,
+  savedOpeningCurrent,
+  type SavedClaudeOpening,
   enumerateClaudeChildSources,
   enumerateClaudeChildSourceSteps,
   walkInSlices,
@@ -1718,7 +1720,21 @@ export class PanelProvider implements vscode.Disposable {
     { revision: number; spend: number; metas: number; picked: readonly SpendFileIndex[] }
   >();
   // Recorded working directories, keyed by transcript path. Missing values retry after the file revision changes.
-  private cwds = new Map<string, { cwd: string | null; mtimeMs: number; size: number; unavailable?: boolean }>();
+  // `saved` marks a row from an earlier launch that no listing of this launch has compared with its file yet.
+  private cwds = new Map<
+    string,
+    {
+      cwd: string | null;
+      mtimeMs: number;
+      size: number;
+      dev?: number | string;
+      ino?: number | string;
+      unavailable?: boolean;
+      saved?: boolean;
+    }
+  >();
+  // A reader answered a working directory that the saved openings do not hold yet.
+  private claudeOpeningsMoved = false;
   // Cached Codex opening metadata, including each rollout's working directory.
   private codexMetas = new CodexMetaCache();
   // Saves `codexMetas` into the machine's shared opening records.
@@ -1878,6 +1894,8 @@ export class PanelProvider implements vscode.Disposable {
   };
   // Every child transcript that the last walk's census listed, with its working directory when its opening named one.
   private walkedChildSources: SessionFile[] = [];
+  // The child openings that an earlier launch saved, until the first census of this launch commits.
+  private savedChildOpenings: ReadonlyMap<string, SavedClaudeOpening> | null = null;
   // The selected session ID, restored from panel state and reconciled by `pickShowing`.
   private showing: string | null = null;
   // Archived session IDs filter host reads. Panel state persists the set without deleting session data.
@@ -3829,6 +3847,9 @@ export class PanelProvider implements vscode.Disposable {
       this.savedLinks = cached.links;
       this.savedLinksMalformed = cached.linksMalformed === true;
       this.savedPromptScans = cached.promptScans ?? new Map();
+      for (const [file, opening] of cached.claudeOpenings?.parents ?? [])
+        this.cwds.set(file, { ...opening, saved: true });
+      this.savedChildOpenings = cached.claudeOpenings?.children ?? null;
       this.carriedNames = cached.carriedNames;
       this.commitRepositories.load(cached.commitRepositories ?? []);
       this.derivedMigrationPending = cached.migrationPending === true;
@@ -11929,6 +11950,25 @@ export class PanelProvider implements vscode.Disposable {
     }
     try {
       const file = this.derivedCacheFile;
+      const parentOpenings = new Map<string, SavedClaudeOpening>();
+      for (const [source, held] of this.cwds ?? [])
+        if (held.cwd)
+          parentOpenings.set(source, {
+            cwd: held.cwd,
+            size: held.size,
+            mtimeMs: held.mtimeMs,
+            dev: held.dev,
+            ino: held.ino,
+          });
+      const childOpenings: ReadonlyMap<string, SavedClaudeOpening> =
+        this.savedChildOpenings ??
+        new Map(
+          (this.walkedChildSources ?? []).flatMap((row): [string, SavedClaudeOpening][] =>
+            row.cwd
+              ? [[row.file, { cwd: row.cwd, size: row.size, mtimeMs: row.mtimeMs, dev: row.dev, ino: row.ino }]]
+              : [],
+          ),
+        );
       const write = () =>
         saveDerivedCache(
           file,
@@ -11942,6 +11982,7 @@ export class PanelProvider implements vscode.Disposable {
           this.savedLinks,
           [...(this.savedPromptScans ?? []), ...(this.humanScans ?? [])],
           [...(this.adoptionsUnsettled ?? [])].map(([plain, held]): [string, string] => [plain, held.twin]),
+          { parents: parentOpenings, children: childOpenings },
         );
       const published = this.workspaceCache
         ? this.workspaceCache.write(write, this.cacheShutdownFlushing, file)
@@ -13806,6 +13847,7 @@ export class PanelProvider implements vscode.Disposable {
       time,
       () => this.performanceCounters?.recordWork('openingsRead:children'),
       this.walkedChildSources,
+      this.savedChildOpenings,
     );
     const spendSources = yield* claudeSessionSpendSourceSteps(listing.sessions, this.subagentDirectories);
     return { folderPrint, listing, census, spendSources, openings, ...started };
@@ -13838,10 +13880,13 @@ export class PanelProvider implements vscode.Disposable {
             sameSessionRevision(session, opening.revision) &&
             sessionCoverageMember(session) === sessionCoverageMember({ ...session, ...opening.revision })
           ) {
+            if (this.cwds.get(file)?.cwd !== opening.value) this.claudeOpeningsMoved = true;
             this.cwds.set(file, {
               cwd: opening.value,
               mtimeMs: opening.revision.mtimeMs,
               size: opening.revision.size,
+              dev: opening.revision.dev,
+              ino: opening.revision.ino,
               unavailable: false,
             });
             openings.observations.push({
@@ -13856,8 +13901,19 @@ export class PanelProvider implements vscode.Disposable {
         if (qualified !== null) return qualified;
       }
       return time('openings:parents', () => {
-        const hit = this.cwds.get(file);
+        let hit = this.cwds.get(file);
+        const listedStat = { mtimeMs: session.mtimeMs, size: session.size, dev: session.dev, ino: session.ino };
+        if (hit?.saved) {
+          if (savedOpeningCurrent(hit, session)) {
+            this.cwds.set(file, { cwd: hit.cwd, ...listedStat });
+            return hit.cwd;
+          }
+          this.cwds.delete(file);
+          hit = undefined;
+        }
         if (hit?.cwd) {
+          // An append moves only the stat. A held row that the stat refuses keeps its old stat, so a later launch reads the file.
+          if (!sameSessionRevision(hit, session) && savedOpeningCurrent(hit, session)) Object.assign(hit, listedStat);
           return hit.cwd;
         }
         if (hit && sameSessionRevision(hit, session)) {
@@ -13873,7 +13929,8 @@ export class PanelProvider implements vscode.Disposable {
           },
           countParentRead,
         );
-        this.cwds.set(file, { cwd, mtimeMs: session.mtimeMs, size: session.size, unavailable });
+        this.cwds.set(file, { cwd, ...listedStat, unavailable });
+        if (cwd) this.claudeOpeningsMoved = true;
         return cwd;
       });
     };
@@ -14177,7 +14234,14 @@ export class PanelProvider implements vscode.Disposable {
           time,
           () => this.performanceCounters?.recordWork('openingsRead:children'),
           this.walkedChildSources,
+          this.savedChildOpenings,
         );
+      // A new working directory is the change to save. An append moves only the stat and waits for another save.
+      const heldOpenings =
+        this.savedChildOpenings ?? new Map((this.walkedChildSources ?? []).map((row) => [row.file, row]));
+      if (census.sessions.some((row) => row.cwd && heldOpenings.get(row.file)?.cwd !== row.cwd))
+        this.claudeOpeningsMoved = true;
+      this.savedChildOpenings = null;
       this.walkedChildSources = census.sessions;
       claudeListing.files = [...claudeListing.files, ...census.files];
       claudeListing.directories = [...(claudeListing.directories ?? []), ...(census.directories ?? [])];
@@ -14190,6 +14254,10 @@ export class PanelProvider implements vscode.Disposable {
             source,
             excluded: !inRoots(source.cwd),
           });
+    }
+    if (this.claudeOpeningsMoved) {
+      this.claudeOpeningsMoved = false;
+      this.derivedCacheCheckpointState.markChanged();
     }
     const childSources = (this.walkedChildSources ?? []).filter((source) => !source.cwd || inRoots(source.cwd));
     this.sourceEnumerations = { claude: claudeListing, codex: listing.enumeration };

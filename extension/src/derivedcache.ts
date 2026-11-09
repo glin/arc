@@ -25,6 +25,7 @@ import {
   sessionOutcomeOf,
   sessionStatFactsOf,
   type AgentKind,
+  type SavedClaudeOpening,
   type AgentRunScan,
   type ClaudeChildSessionFile,
   type ClaudeChildSessionReference,
@@ -376,6 +377,8 @@ export interface DerivedCache {
   linksMalformed?: boolean;
   // Complete prompt scans of Claude transcripts by file, each at the revision it read. See `savedPromptScanOf`.
   promptScans?: Map<string, HumanPromptScan>;
+  // The openings that earlier launches read for Claude transcripts. See `savedOpeningCurrent`.
+  claudeOpenings?: SavedClaudeOpenings;
   // Rollouts with an adoption of their compressed twin not yet settled, as plain path to twin path. The title and
   // opening of such a rollout stay across a restart.
   unsettledAdoptions?: Map<string, string>;
@@ -494,6 +497,75 @@ function limitPromptScans(scans: ReadonlyMap<string, HumanPromptScan>): [string,
     .slice(0, MAX_SAVED_PROMPT_SCANS);
 }
 
+// The saved openings of Claude transcripts, by file, for the first walk of a launch. An opening holds only a nonempty
+// working directory, so a transcript whose opening names none reads again.
+export interface SavedClaudeOpenings {
+  parents: ReadonlyMap<string, SavedClaudeOpening>;
+  children: ReadonlyMap<string, SavedClaudeOpening>;
+}
+
+// Versions the rules that read a working directory from a Claude transcript's opening. Saved openings of another version do
+// not load. Bump it when `scanSessionCwd` or `cwdFromDescriptor` in transcript.ts can change the directory that they find.
+export const CLAUDE_OPENINGS_RULES_VERSION = 1;
+// The derived cache keeps the saved openings of the most recently modified files up to this count, for parents and for
+// children separately.
+export const MAX_SAVED_CLAUDE_OPENINGS = 10_000;
+
+interface StoredClaudeOpening extends SavedClaudeOpening {
+  file: string;
+}
+
+interface StoredClaudeOpenings {
+  rulesVersion: number;
+  parents: StoredClaudeOpening[];
+  children: StoredClaudeOpening[];
+}
+
+function savedClaudeOpening(value: unknown): value is SavedClaudeOpening {
+  return (
+    record(value) &&
+    nonEmptyText(value.cwd) &&
+    Number.isSafeInteger(value.size) &&
+    (value.size as number) >= 0 &&
+    finite(value.mtimeMs) &&
+    (value.dev === undefined || fileIdentityValue(value.dev)) &&
+    (value.ino === undefined || fileIdentityValue(value.ino))
+  );
+}
+
+// The valid openings, newest first, up to `MAX_SAVED_CLAUDE_OPENINGS`.
+function limitClaudeOpenings(openings: Iterable<[string, SavedClaudeOpening]>): [string, SavedClaudeOpening][] {
+  return [...openings]
+    .filter(([, opening]) => savedClaudeOpening(opening))
+    .sort(([a, left], [b, right]) => right.mtimeMs - left.mtimeMs || a.localeCompare(b))
+    .slice(0, MAX_SAVED_CLAUDE_OPENINGS);
+}
+
+function loadedClaudeOpenings(rows: unknown): ReadonlyMap<string, SavedClaudeOpening> {
+  const openings: [string, SavedClaudeOpening][] = [];
+  for (const row of Array.isArray(rows) ? rows : []) {
+    if (!record(row) || !fileName(row.file) || !savedClaudeOpening(row)) continue;
+    const { file, ...opening } = row as unknown as StoredClaudeOpening;
+    openings.push([file, opening]);
+  }
+  return new Map(limitClaudeOpenings(openings));
+}
+
+// A cache file of another rules version, or one without saved openings, loads none.
+function storedClaudeOpenings(value: unknown): SavedClaudeOpenings {
+  const current = record(value) && value.rulesVersion === CLAUDE_OPENINGS_RULES_VERSION;
+  return {
+    parents: loadedClaudeOpenings(current ? value.parents : undefined),
+    children: loadedClaudeOpenings(current ? value.children : undefined),
+  };
+}
+
+function storedClaudeOpeningRows(openings: ReadonlyMap<string, SavedClaudeOpening>): StoredClaudeOpening[] {
+  return limitClaudeOpenings(openings)
+    .map(([file, opening]) => ({ file, ...opening }))
+    .sort((a, b) => a.file.localeCompare(b.file));
+}
+
 export const CLAUDE_CHILD_REFERENCE_PARSER_VERSION = 26;
 export const MAX_CLAUDE_CHILD_REFERENCE_FILES = 10_000;
 export const MAX_CODEX_DISPATCH_CURSOR_BYTES = 64 * 1024 * 1024;
@@ -573,6 +645,7 @@ interface StoredCache {
   unsettledAdoptions?: [string, string][];
   links?: SavedDiscoveryLinks;
   promptScans?: StoredPromptScans;
+  claudeOpenings?: StoredClaudeOpenings;
 }
 
 export type MetadataGenerations = Readonly<Record<AgentKind, number>>;
@@ -1488,6 +1561,7 @@ export function loadDerivedCache(
     if (format === 2 && savedDiscoveryLinks(parsed.links)) loaded.links = parsed.links;
     else if (format === 2 && parsed.links !== undefined) loaded.linksMalformed = true;
     if (format === 2) loaded.promptScans = storedPromptScans(parsed.promptScans);
+    if (format === 2) loaded.claudeOpenings = storedClaudeOpenings(parsed.claudeOpenings);
     if (Array.isArray(parsed.unsettledAdoptions)) {
       const rows = parsed.unsettledAdoptions.filter(
         (row): row is [string, string] =>
@@ -1622,6 +1696,7 @@ export function saveDerivedCache(
   // A later scan of the same file replaces an earlier one. A scan that `savedPromptScanOf` refuses replaces nothing.
   promptScans: Iterable<[string, HumanPromptScan]> = [],
   unsettledAdoptions: Iterable<[string, string]> = [],
+  claudeOpenings?: SavedClaudeOpenings,
 ): void {
   const savedScans = new Map<string, HumanPromptScan>();
   for (const [scanFile, scan] of promptScans) {
@@ -1679,6 +1754,11 @@ export function saveDerivedCache(
       scans: limitPromptScans(savedScans)
         .map(([scanFile, scan]) => ({ file: scanFile, found: scan.found, bytes: scan.bytes, ...scan.source! }))
         .sort((a, b) => a.file.localeCompare(b.file)),
+    },
+    claudeOpenings: claudeOpenings && {
+      rulesVersion: CLAUDE_OPENINGS_RULES_VERSION,
+      parents: storedClaudeOpeningRows(claudeOpenings.parents),
+      children: storedClaudeOpeningRows(claudeOpenings.children),
     },
   };
   writeFileAtomically(file, JSON.stringify(data), replace);

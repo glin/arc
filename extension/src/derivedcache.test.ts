@@ -287,11 +287,14 @@ import {
   withRailEnrichment,
   withMetadataCoverage,
   withSessionName,
+  CLAUDE_OPENINGS_RULES_VERSION,
+  MAX_SAVED_CLAUDE_OPENINGS,
   type ClaudeChildReferenceCacheEntry,
   type DerivedCache,
   type DerivedCacheSources,
   type DerivedTitleEntry,
 } from './derivedcache.ts';
+import { savedOpeningCurrent, type SavedClaudeOpening } from './filerevision.ts';
 // The Claude metadata generation used by current-format fixtures.
 const VERSION = METADATA_GENERATIONS.claude;
 // Test sessions live outside both source roots. These helpers qualify every entry as a Claude session.
@@ -308,8 +311,23 @@ function saveClaudeCache(...args: Parameters<typeof saveDerivedCache>): void {
     agentOf = claudeSession,
     links,
     promptScans,
+    unsettledAdoptions,
+    claudeOpenings,
   ] = args;
-  saveDerivedCache(file, titles, references, names, replace, discovery, repositories, agentOf, links, promptScans);
+  saveDerivedCache(
+    file,
+    titles,
+    references,
+    names,
+    replace,
+    discovery,
+    repositories,
+    agentOf,
+    links,
+    promptScans,
+    unsettledAdoptions,
+    claudeOpenings,
+  );
 }
 function loadClaudeCache(file: string, sources: string | DerivedCacheSources = {}): DerivedCache {
   return loadDerivedCache(file, {
@@ -3799,4 +3817,159 @@ test('Codex cursor eviction discards dependent discovery while retaining the sou
   assert.equal(loaded.claudeChildReferences.size, 1);
   assert.equal(loaded.claudeChildReferences.get(normalizeFsPath(file))?.cursor, undefined);
   assert.equal(loaded.discovery, undefined, 'an evicted partial cursor retained its scheduler');
+});
+
+const openingsOf = (rows: Record<string, unknown>) =>
+  new Map(Object.entries(rows)) as unknown as ReadonlyMap<string, SavedClaudeOpening>;
+
+test('the derived cache keeps saved Claude openings of the current rules version and only those', () => {
+  const cache = path.join(folder(), 'cache.json');
+  const parent = { cwd: '/repo', size: 400, mtimeMs: 5, dev: '7', ino: '9' };
+  const noInode = { cwd: '/repo', size: 400, mtimeMs: 6 };
+  const child = { cwd: '/repo/nested', size: 100, mtimeMs: 7, dev: 7, ino: 11 };
+  saveClaudeCache(cache, [], [], [], undefined, undefined, [], undefined, undefined, undefined, undefined, {
+    parents: openingsOf({
+      '/repo/parent.jsonl': parent,
+      '/repo/no-inode.jsonl': noInode,
+      '/repo/no-cwd.jsonl': { ...parent, cwd: '' },
+      '/repo/no-size.jsonl': { ...parent, size: undefined },
+    }),
+    children: openingsOf({ '/repo/agent-child.jsonl': child }),
+  });
+  const loaded = loadClaudeCache(cache).claudeOpenings!;
+  assert.deepEqual(
+    [...loaded.parents].sort(([a], [b]) => a.localeCompare(b)),
+    [
+      ['/repo/no-inode.jsonl', noInode],
+      ['/repo/parent.jsonl', parent],
+    ],
+    'a saved opening was lost, or an opening without a working directory or stat was saved',
+  );
+  assert.deepEqual([...loaded.children], [['/repo/agent-child.jsonl', child]]);
+
+  const stored = JSON.parse(fs.readFileSync(cache, 'utf8'));
+  fs.writeFileSync(
+    cache,
+    JSON.stringify({
+      ...stored,
+      claudeOpenings: { ...stored.claudeOpenings, rulesVersion: CLAUDE_OPENINGS_RULES_VERSION + 1 },
+    }),
+  );
+  assert.equal(loadClaudeCache(cache).claudeOpenings?.parents.size, 0, 'openings of another rules version were loaded');
+
+  // A file that a build without saved openings wrote has no openings field.
+  const { claudeOpenings: _openings, ...older } = stored;
+  fs.writeFileSync(cache, JSON.stringify(older));
+  const reloaded = loadClaudeCache(cache);
+  assert.equal(reloaded.reuse?.reason, 'reused', 'the older cache file was not reused');
+  assert.equal(reloaded.claudeOpenings?.parents.size, 0, 'an older cache file loaded an opening');
+  assert.equal(reloaded.claudeOpenings?.children.size, 0, 'an older cache file loaded an opening');
+});
+
+test('the derived cache keeps the saved Claude openings of the most recently modified files up to its limit', () => {
+  const cache = path.join(folder(), 'cache.json');
+  const rows = Object.fromEntries(
+    Array.from({ length: MAX_SAVED_CLAUDE_OPENINGS + 2 }, (_, index) => [
+      `/repo/${index}.jsonl`,
+      { cwd: '/repo', size: 1, mtimeMs: index, dev: '7', ino: String(index + 1) },
+    ]),
+  );
+  saveClaudeCache(cache, [], [], [], undefined, undefined, [], undefined, undefined, undefined, undefined, {
+    parents: openingsOf(rows),
+    children: new Map(),
+  });
+  const kept = loadClaudeCache(cache).claudeOpenings!.parents;
+  assert.equal(kept.size, MAX_SAVED_CLAUDE_OPENINGS);
+  assert.equal(kept.has('/repo/0.jsonl'), false, 'the oldest opening stayed past the limit');
+  assert.equal(kept.has(`/repo/${MAX_SAVED_CLAUDE_OPENINGS + 1}.jsonl`), true, 'the newest opening left the cache');
+});
+
+test.each([
+  { platform: 'win32', dev: '4', ino: undefined, identityRefused: false, backwardsRefused: true },
+  { platform: 'darwin', dev: 5, ino: 11, identityRefused: true, backwardsRefused: false },
+  { platform: 'linux', dev: '6', ino: '18446744073709551557', identityRefused: true, backwardsRefused: false },
+])('a saved opening follows the $platform file identity', ({ dev, ino, identityRefused, backwardsRefused }) => {
+  const saved = { size: 1000, mtimeMs: 2000, dev, ino };
+  const current = (stat: Partial<typeof saved> & { ino?: string | number }) =>
+    savedOpeningCurrent(saved, { ...saved, ...stat });
+  assert.equal(current({}), true, 'an unchanged file');
+  assert.equal(current({ size: 1100, mtimeMs: 2100 }), true, 'an append');
+  assert.equal(current({ dev: String(dev) }), true, 'the same device in another form');
+  assert.equal(current({ size: 900 }), false, 'a shrunk file');
+  assert.equal(current({ mtimeMs: 2100 }), false, 'a rewrite at the same size');
+  assert.equal(current({ size: 1100, mtimeMs: 1900 }), !backwardsRefused, 'growth with a backwards modification time');
+  assert.equal(current({ dev: '9' }), !identityRefused, 'a changed device');
+  if (ino !== undefined) assert.equal(current({ ino: '99' }), false, 'a replaced file with a new inode');
+  assert.equal(current({ ino: undefined }), ino === undefined, 'a saved inode with none in the current stat');
+  if (ino === undefined) {
+    assert.equal(current({ ino: 77 }), true, 'a current inode at the recorded stat');
+    assert.equal(current({ ino: 77, size: 1100, mtimeMs: 2100 }), false, 'a current inode with growth');
+  }
+});
+
+// Reports the cost of the saved openings at the scale of a large workspace. The numbers depend on the machine and on the
+// path lengths of the workspace, so the test sets no threshold.
+test('the saved Claude openings report the bytes and the time that they add to one save', () => {
+  const directory = folder();
+  const project = 'C:\\Users\\example\\.claude\\projects\\c--Users-example-Documents-repo';
+  const stat = (index: number) => ({
+    cwd: 'C:\\Users\\example\\Documents\\repo\\.claude\\worktrees\\2026-11-09-topic',
+    size: 1_048_576 + index,
+    mtimeMs: 1_762_700_000_000.125 + index,
+    dev: '3518437209',
+    ino: String(1_125_899_906_842_624 + index),
+  });
+  const parents = new Map(
+    Array.from({ length: 1100 }, (_, index) => [`${project}\\${String(index).padStart(36, '0')}.jsonl`, stat(index)]),
+  );
+  const children = new Map(
+    Array.from({ length: 1600 }, (_, index) => [
+      `${project}\\${String(index % 1100).padStart(36, '0')}\\subagents\\agent-${String(index).padStart(17, '0')}.jsonl`,
+      stat(index),
+    ]),
+  );
+  const titles: [string, DerivedTitleEntry][] = [...parents.keys(), ...children.keys()].map((file) => [
+    file,
+    {
+      mtimeMs: 5,
+      size: 10,
+      label: 'A session name',
+      fullLabel: 'A session name',
+      activityMs: null,
+      agentRun: false,
+      outcome: null,
+      stats: null,
+    },
+  ]);
+  const save = (file: string, openings?: { parents: typeof parents; children: typeof children }) => {
+    const samples = Array.from({ length: 5 }, () => {
+      const started = performance.now();
+      saveClaudeCache(
+        file,
+        titles,
+        [],
+        [],
+        undefined,
+        undefined,
+        [],
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        openings,
+      );
+      return performance.now() - started;
+    }).sort((a, b) => a - b);
+    return { ms: samples[2], bytes: fs.statSync(file).size };
+  };
+  const without = save(path.join(directory, 'without.json'));
+  const withOpenings = save(path.join(directory, 'with.json'), { parents, children });
+  const loaded = loadClaudeCache(path.join(directory, 'with.json')).claudeOpenings!;
+  assert.equal(loaded.parents.size, 1100);
+  assert.equal(loaded.children.size, 1600);
+  console.info(
+    `saved openings: ${withOpenings.bytes - without.bytes} bytes added to a ${without.bytes} byte cache, one save ` +
+      `${withOpenings.ms.toFixed(2)} ms with them and ${without.ms.toFixed(2)} ms without them (median of 5)`,
+  );
+  assert.ok(withOpenings.bytes > without.bytes, 'the saved openings added no bytes');
 });

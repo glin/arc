@@ -4242,15 +4242,30 @@ function lastCensusOpening(
   };
 }
 
+// The opening that an earlier launch saved for a child, while `savedOpeningCurrent` accepts the listed stat.
+// A child without a device and inode gets no opening here, as a read of its transcript gets none.
+function savedCensusOpening(
+  saved: SavedClaudeOpening | undefined,
+  source: SessionFile,
+): { value: string; revision: FileRevision } | null {
+  if (!saved || !supportedFileIdentity(source) || !savedOpeningCurrent(saved, source)) return null;
+  return {
+    value: saved.cwd,
+    revision: { size: source.size, mtimeMs: source.mtimeMs, dev: source.dev!, ino: source.ino! },
+  };
+}
+
 // Physical child identities reserve competition even without accepted relationship edges.
 // `lastRows` holds the rows of the last census, and an unchanged child keeps its row without a read.
+// `savedOpenings` holds the openings that an earlier launch saved, by file, for the first census of a launch.
 export function enumerateClaudeChildSources(
   parents: readonly SessionFile[],
   time: ListingTimer = untimed,
   countRead?: () => void,
   lastRows: readonly SessionFile[] = [],
+  savedOpenings?: ReadonlyMap<string, SavedClaudeOpening> | null,
 ): SourceEnumeration & { sessions: SessionFile[] } {
-  return finishWalk(enumerateClaudeChildSourceSteps(parents, time, countRead, lastRows));
+  return finishWalk(enumerateClaudeChildSourceSteps(parents, time, countRead, lastRows, savedOpenings));
 }
 
 export function* enumerateClaudeChildSourceSteps(
@@ -4258,6 +4273,7 @@ export function* enumerateClaudeChildSourceSteps(
   time: ListingTimer = untimed,
   countRead?: () => void,
   lastRows: readonly SessionFile[] = [],
+  savedOpenings?: ReadonlyMap<string, SavedClaudeOpening> | null,
 ): WalkSteps<SourceEnumeration & { sessions: SessionFile[] }> {
   const lastRowOf = new Map(lastRows.map((row) => [row.file, row]));
   const census: SourceEnumeration & { sessions: SessionFile[] } = {
@@ -4299,7 +4315,9 @@ export function* enumerateClaudeChildSourceSteps(
     for (const source of listing.sessions) {
       if (!source.sessionId.startsWith('agent-')) continue;
       yield;
-      const kept = lastCensusOpening(lastRowOf.get(source.file), source);
+      const kept =
+        lastCensusOpening(lastRowOf.get(source.file), source) ??
+        savedCensusOpening(savedOpenings?.get(source.file), source);
       const opening = kept ?? time('openings:children', () => readQualifiedSessionCwd(source.file, countRead));
       if (
         !opening ||
