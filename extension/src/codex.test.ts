@@ -16169,6 +16169,41 @@ test('a listing reconciles a held stat that disagrees with the saved opening', a
   assert.equal(missedRewrite.counts.reads, 1);
 });
 
+test('a refused read of a replacement waits out each retry interval beside the held opening', () => {
+  const root = sessionsRoot([{ day: '2026/08/25', name: ROLLOUT(UUID_A), records: [meta({ id: UUID_A })] }]);
+  const file = rolloutFiles(root)[0];
+  const held = { ...readCodexSessionMeta(file)!, size: 1000, mtimeMs: 2000, fileIdentity: { dev: '1', ino: '2' } };
+  const replaced: RolloutStat = { size: 900, mtimeMs: 2100, dev: '1', ino: '3', isFile: true };
+  const readable = { ...held, sessionId: UUID_B, size: 900, mtimeMs: 2100, fileIdentity: { dev: '1', ino: '3' } };
+  let clock = 0;
+  let opens = 0;
+  let refuse = true;
+  const cache = new CodexMetaCache(
+    () => (opens++, refuse ? undefined : readable),
+    undefined,
+    () => clock,
+  );
+  cache.load([[file, held]]);
+  const revision = cache.revision;
+  const listing = () => cache.get(file, undefined, replaced)?.sessionId;
+  assert.equal(listing(), UUID_A);
+  assert.equal(opens, 1);
+  let expected = 1;
+  for (const wait of [10_000, 60_000, 600_000, 600_000]) {
+    clock += wait - 1;
+    assert.equal(listing(), UUID_A);
+    assert.equal(opens, expected, `a listing opened the file before the ${wait} ms retry`);
+    clock += 1;
+    assert.equal(listing(), UUID_A);
+    assert.equal(opens, ++expected, `the ${wait} ms retry never opened the file`);
+  }
+  assert.equal(cache.revision, revision, 'a refused read moved the revision');
+  refuse = false;
+  clock += 600_000;
+  assert.equal(listing(), UUID_B, 'a readable replacement stayed unread');
+  assert.equal(opens, expected + 1);
+});
+
 test('a listing stats only the rollouts whose saved openings list in its folders', async () => {
   const root = sessionsRoot([
     { day: '2026/08/25', name: ROLLOUT(UUID_A), records: [meta({ id: UUID_A })] },

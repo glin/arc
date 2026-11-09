@@ -219,13 +219,16 @@ export const REFUSED_OPENING_RETRY_MS = 30_000;
 // Short retry interval after the first refused opening read.
 export const REFUSED_OPENING_FIRST_RETRY_MS = 1_000;
 
+// Intervals between refused reads of a rollout that keeps a held opening. The last interval repeats.
+const REFUSED_HELD_OPENING_RETRIES_MS = [10_000, 60_000, 600_000];
+
 // Readable openings stay cached while their file identity remains current. An unreadable head gets one retry, then waits for file growth.
 // Refused reads retain no size marker. They use the first retry interval, then the repeated-refusal interval.
 // The default clock is monotonic.
 export class CodexMetaCache {
   private entries = new Map<
     string,
-    | { meta: CodexSessionMeta }
+    | { meta: CodexSessionMeta; refused?: { triedAt: number; wait: number } }
     | { meta: null; size: number | null }
     | { meta: undefined; triedAt: number; wait: number }
   >();
@@ -284,12 +287,10 @@ export class CodexMetaCache {
     if (current) return current;
     const hit = this.entries.get(file);
     let size: number | null = null;
-    if (hit && hit.meta === undefined) {
-      // A clock value before the last attempt makes the retry due immediately.
-      const elapsed = this.now() - hit.triedAt;
-      if (elapsed >= 0 && elapsed < hit.wait) {
-        return null;
-      }
+    if (hit?.meta) {
+      if (hit.refused && this.retryPending(hit.refused)) return hit.meta;
+    } else if (hit && hit.meta === undefined) {
+      if (this.retryPending(hit)) return null;
     } else if (hit?.meta === null) {
       size = this.sizeOf(file);
       if (size === null || (hit.size !== null && hit.size === size)) {
@@ -299,7 +300,13 @@ export class CodexMetaCache {
     const meta = this.readMeta(file, onRead);
     // Refused reads keep an attempt time and retry interval instead of a file-size marker.
     if (meta === undefined) {
-      if (hit?.meta) return hit.meta;
+      if (hit?.meta) {
+        const wait =
+          REFUSED_HELD_OPENING_RETRIES_MS.find((ms) => ms > (hit.refused?.wait ?? 0)) ??
+          REFUSED_HELD_OPENING_RETRIES_MS[REFUSED_HELD_OPENING_RETRIES_MS.length - 1];
+        this.entries.set(file, { meta: hit.meta, refused: { triedAt: this.now(), wait } });
+        return hit.meta;
+      }
       const wait = hit && hit.meta === undefined ? REFUSED_OPENING_RETRY_MS : REFUSED_OPENING_FIRST_RETRY_MS;
       this.entries.set(file, { meta: undefined, triedAt: this.now(), wait });
       return null;
@@ -315,6 +322,12 @@ export class CodexMetaCache {
   // The held opening of a file, with no read.
   peek(file: string): CodexSessionMeta | null {
     return this.entries.get(file)?.meta ?? null;
+  }
+
+  // A clock value before the last attempt makes the retry due immediately.
+  private retryPending(attempt: { triedAt: number; wait: number }): boolean {
+    const elapsed = this.now() - attempt.triedAt;
+    return elapsed >= 0 && elapsed < attempt.wait;
   }
 
   // The opening of one listing. Only an opening that lists in `inFolders` needs the stat its row takes anyway.
