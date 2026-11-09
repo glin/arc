@@ -1657,7 +1657,7 @@ export class PanelProvider implements vscode.Disposable {
   private compressedRenderSeen = false;
   private readonly compressedSpendPicks = new WeakMap<
     readonly SpendFileIndex[],
-    { revision: number; picked: readonly SpendFileIndex[] }
+    { revision: number; metas: number; picked: readonly SpendFileIndex[] }
   >();
   // Recorded working directories, keyed by transcript path. Missing values retry after the file revision changes.
   private cwds = new Map<string, { cwd: string | null; mtimeMs: number; size: number; unavailable?: boolean }>();
@@ -5258,8 +5258,9 @@ export class PanelProvider implements vscode.Disposable {
   // compressed record.
   private compressedSpendPick(files: readonly SpendFileIndex[]): readonly SpendFileIndex[] {
     if (!this.compressedFacts?.size) return files;
+    const metasRevision = this.codexMetas.revision;
     const held = this.compressedSpendPicks.get(files);
-    if (held?.revision === this.compressedFactsRevision) return held.picked;
+    if (held?.revision === this.compressedFactsRevision && held.metas === metasRevision) return held.picked;
     const candidates = [...this.compressedFacts.values()].flatMap((entry) =>
       entry.spend
         ? [
@@ -5272,12 +5273,18 @@ export class PanelProvider implements vscode.Disposable {
           ]
         : [],
     );
+    // The cache keys openings by the walk's raw path, and a spend record names its file by the canonical path.
+    const sessionIds = new Map<string, string>();
+    for (const file of this.codexMetas.keys()) {
+      const sessionId = this.codexMetas.peek(file)?.sessionId;
+      if (sessionId) sessionIds.set(normalizeFsPath(file), sessionId);
+    }
     const picked = compressedSpendDisplayFiles(
       files,
       candidates,
-      (file) => this.codexMetas.peek?.(file)?.sessionId ?? null,
+      (file) => sessionIds.get(normalizeFsPath(file)) ?? null,
     );
-    this.compressedSpendPicks.set(files, { revision: this.compressedFactsRevision, picked });
+    this.compressedSpendPicks.set(files, { revision: this.compressedFactsRevision, metas: metasRevision, picked });
     return picked;
   }
 

@@ -7645,3 +7645,28 @@ test('parent generation 66 rereads unchanged Claude Standard for configured pric
   assert.equal(fs.statSync(file).size, before.size);
   assert.equal(fs.statSync(file).mtimeMs, before.mtimeMs);
 });
+
+test('one thread with entries at two paths shows one largest total, joined by its session id', () => {
+  const record = (name: string, dollars: number): SpendFileIndex =>
+    ({
+      file: normalizeSpendFile(name),
+      buckets: [{ requests: dollars, reportedCost: dollars, reportedCostBasis: 'list', usage: emptyUsage() }],
+    }) as unknown as SpendFileIndex;
+  const seven = record('a.jsonl', 7);
+  const ten = record('b.jsonl', 10);
+  const other = record('other.jsonl', 3);
+  const plain = record('c.jsonl', 8);
+  const shown = compressedSpendDisplayFiles(
+    [plain, other],
+    [
+      { pairKey: normalizeSpendFile('a.jsonl'), threadId: 'thread', spend: seven, complete: true },
+      { pairKey: normalizeSpendFile('b.jsonl'), threadId: 'thread', spend: ten, complete: true },
+    ],
+    (file) => (file === plain.file ? 'thread' : null),
+  );
+  assert.deepEqual(
+    [...shown].map((file) => file.file).sort(),
+    [other.file, ten.file].sort(),
+    'the thread counted more than one record',
+  );
+});

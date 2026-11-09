@@ -4058,27 +4058,29 @@ export function compressedSpendDisplayFiles(
   sessionIdOf: (file: string) => string | null,
 ): readonly SpendFileIndex[] {
   if (!candidates.length) return files;
-  const byPair = new Map(candidates.map((candidate) => [candidate.pairKey, candidate]));
-  const byThread = new Map(
-    candidates.flatMap((candidate) => (candidate.threadId ? [[candidate.threadId, candidate] as const] : [])),
-  );
-  const joined = new Map<CompressedSpendCandidate, SpendFileIndex[]>();
+  // One thread is one group, whichever paths its compressed entries and plain records have.
+  const groupKey = (candidate: CompressedSpendCandidate) => candidate.threadId ?? `pair:${candidate.pairKey}`;
+  const groups = new Map<string, { entries: CompressedSpendCandidate[]; plain: SpendFileIndex[] }>();
+  const byPair = new Map<string, string>();
+  for (const candidate of candidates) {
+    const key = groupKey(candidate);
+    const group = groups.get(key);
+    if (group) group.entries.push(candidate);
+    else groups.set(key, { entries: [candidate], plain: [] });
+    byPair.set(candidate.pairKey, key);
+  }
   const out: SpendFileIndex[] = [];
   for (const record of files) {
     const sessionId = sessionIdOf(record.file);
-    const candidate = byPair.get(canonicalPath(record.file)) ?? (sessionId ? byThread.get(sessionId) : undefined);
-    if (!candidate) {
-      out.push(record);
-      continue;
-    }
-    joined.set(candidate, [...(joined.get(candidate) ?? []), record]);
+    const key = byPair.get(canonicalPath(record.file)) ?? (sessionId && groups.has(sessionId) ? sessionId : undefined);
+    if (key === undefined) out.push(record);
+    else groups.get(key)!.plain.push(record);
   }
-  for (const candidate of candidates) {
-    const plain = joined.get(candidate) ?? [];
+  for (const { entries, plain } of groups.values()) {
     const complete = plain.filter((record) => record.complete !== false);
-    if (candidate.spend && candidate.complete) complete.push(candidate.spend);
+    for (const entry of entries) if (entry.spend && entry.complete) complete.push(entry.spend);
+    // No complete record yet, so the thread counts its plain records.
     if (!complete.length) {
-      // No complete record yet, so the thread counts its plain records.
       out.push(...plain);
       continue;
     }

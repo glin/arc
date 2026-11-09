@@ -21612,7 +21612,7 @@ test('Project cost snapshot hydration replaces an interrupted build without coun
 });
 
 // The ledger holds the spend of a compressed rollout that an earlier build read, beside one plain rollout.
-async function hydrateCompressedRolloutLedger() {
+async function hydrateCompressedRolloutLedger(scope: Record<string, unknown> = {}) {
   const storage = tempDir('spend-compressed-rollout');
   const folder = tempDir('spend-compressed-sessions');
   const saved = (name: string, dollars: number): SpendFileIndex => ({
@@ -21638,6 +21638,7 @@ async function hydrateCompressedRolloutLedger() {
       indexSpendFile: () => ({ record: saved('rollout-a.jsonl', 7), stateChanged: true, complete: true, found: true }),
       compressedSpendDisplayFiles,
       fs,
+      ...scope,
     },
     ['hydrateProjectSpend', 'indexNextProjectSpendFile', 'finishProjectSpendIndex'],
   );
@@ -21656,7 +21657,7 @@ async function hydrateCompressedRolloutLedger() {
   provider.postRail = () => {};
   provider.hydrateProjectSpend('project', provider.refreshGeneration, null);
   await vi.runAllTimersAsync();
-  return { provider, storage, plain, saves: () => saves };
+  return { provider, storage, plain, plainFolder: folder, saves: () => saves };
 }
 
 // A compressed entry beside the plain record in the real hydrated ledger. The harness shows Project cost through the
@@ -21713,7 +21714,7 @@ test('Project cost shows the largest complete total through each ledger sequence
       workspace: normalizeWorkspace('project'),
       ...more,
     });
-    provider.codexMetas = { peek: () => null };
+    provider.codexMetas = new CodexMetaCache();
     provider.adoptionsUnsettled = new Map();
     provider.compressedFacts = new Map();
     provider.compressedFactsRevision = 0;
@@ -21738,6 +21739,133 @@ test('Project cost shows the largest complete total through each ledger sequence
     steps.setEntry(steps.entryOf(10, { undercount: true, spendGeneration: 0, metadataGeneration: 0 }));
     assert.equal(await dollars(), 15);
     assert.equal(provider.projectSpendFiles.length, 2, 'the pick entered the ledger');
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('one thread counts once across paths, through real openings and a real rescan of its plain rollout from byte 0', async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date('2026-10-21T12:00:00'));
+  try {
+    const thread = '01a032c9-1a92-7931-845c-723117d24dbe';
+    let maxBytes = Number.POSITIVE_INFINITY;
+    const { provider, plain, plainFolder } = await hydrateCompressedRolloutLedger({
+      productionNormalizeFsPath: normalizeFsPath,
+      createCodexUsageLineReducer,
+      indexSpendFile: (previous: SpendFileIndex, file: string, workspace: string, make: never) =>
+        indexSpendFile(previous, file, workspace, make, { maxBytes }),
+    });
+    const body = (requests: number, id = thread) => {
+      const lines = [
+        {
+          type: 'session_meta',
+          timestamp: '2026-10-21T11:00:00Z',
+          payload: { id, cwd: 'c:/repo', source: 'cli', model_provider: 'openai' },
+        },
+        { type: 'event_msg', timestamp: '2026-10-21T11:00:00Z', payload: { type: 'task_started', turn_id: 't' } },
+        { type: 'turn_context', timestamp: '2026-10-21T11:00:01Z', payload: { turn_id: 't', model: 'gpt-6.1-terra' } },
+      ];
+      for (let at = 0; at < requests; at++)
+        lines.push({
+          type: 'event_msg',
+          timestamp: `2026-10-21T11:00:${String(at + 2).padStart(2, '0')}Z`,
+          payload: {
+            type: 'token_count',
+            info: { last_token_usage: { input_tokens: 2_000_000, output_tokens: 200_000 } },
+          },
+        } as never);
+      return `${lines.map((line) => JSON.stringify(line)).join('\n')}\n`;
+    };
+    provider.adoptionsUnsettled = new Map();
+    provider.codexMetas = new CodexMetaCache();
+    provider.compressedFacts = new Map();
+    provider.compressedFactsRevision = 0;
+    provider.compressedSpendPicks = new WeakMap();
+    const dollars = async () => {
+      await vi.runAllTimersAsync();
+      return provider.projectSpendPayload().windows[0].dollars;
+    };
+    const index = (file: string) => {
+      provider.projectSpendQueue = [{ file, agent: 'codex', primary: true }];
+      provider.projectSpendQueued.add(normalizeSpendFile(file));
+      provider.indexNextProjectSpendFile();
+    };
+    const finished = (file: string) =>
+      provider.projectSpendFiles.find((record: SpendFileIndex) => record.file === normalizeSpendFile(file));
+    const entryFor = (file: string, spend: SpendFileIndex) => ({
+      file: `${file}.zst`,
+      pairKey: normalizeSpendFile(file),
+      threadId: thread,
+      complete: true,
+      spend,
+    });
+    fs.writeFileSync(plain, body(3));
+    provider.codexMetas.get(plain);
+    index(plain);
+    provider.finishProjectSpendIndex();
+    const three = finished(plain);
+    const elsewhere = path.join(plainFolder, 'rollout-b-other.jsonl');
+    fs.writeFileSync(elsewhere, body(5));
+    index(elsewhere);
+    const five = finished(elsewhere);
+    fs.unlinkSync(elsewhere);
+    provider.projectSpendFiles = provider.projectSpendFiles.filter((record: SpendFileIndex) => record !== five);
+    provider.projectSpendVisibleFiles = provider.projectSpendFiles;
+    provider.spendRecordsByFile = new Map(
+      provider.projectSpendFiles.map((record: SpendFileIndex, at: number) => [record.file, at]),
+    );
+    provider.invalidateProjectSpendSnapshot();
+    provider.compressedFacts = new Map([[`${plain}.zst`, entryFor(plain, three)]]);
+    provider.compressedFactsRevision++;
+    provider.invalidateProjectSpendSnapshot();
+    const adoptedTotal = await dollars();
+    assert.ok(adoptedTotal > 5, 'the plain record priced nothing');
+    provider.compressedFacts.set(`${elsewhere}.zst`, entryFor(elsewhere, five));
+    provider.compressedFactsRevision++;
+    provider.invalidateProjectSpendSnapshot();
+    const largest = await dollars();
+    assert.ok(largest > adoptedTotal, 'the larger total did not show');
+    // A plain record at another path joins by the session id of its real opening, whose key is the raw path.
+    const third = path.join(plainFolder, `rollout-c-${thread}.jsonl`);
+    fs.writeFileSync(third, body(4));
+    provider.codexMetas.get(third);
+    index(third);
+    provider.finishProjectSpendIndex();
+    provider.invalidateProjectSpendSnapshot();
+    assert.equal(await dollars(), largest, 'a plain record joined by session id counted beside the entries');
+    // A resume writes the plain rollout again from byte 0 under a new file identity, and the rescan stops early.
+    provider.compressedFacts.delete(`${elsewhere}.zst`);
+    provider.compressedFactsRevision++;
+    fs.unlinkSync(third);
+    provider.projectSpendFiles = provider.projectSpendFiles.filter(
+      (record: SpendFileIndex) => record.file !== normalizeSpendFile(third),
+    );
+    provider.projectSpendVisibleFiles = provider.projectSpendVisibleFiles.filter(
+      (record: SpendFileIndex) => record.file !== normalizeSpendFile(third),
+    );
+    provider.spendRecordsByFile = new Map(
+      provider.projectSpendFiles.map((record: SpendFileIndex, at: number) => [record.file, at]),
+    );
+    provider.invalidateProjectSpendSnapshot();
+    fs.unlinkSync(plain);
+    fs.writeFileSync(plain, body(6));
+    maxBytes = 600;
+    index(plain);
+    assert.equal(finished(plain).complete, false, 'the rescan did not stop early');
+    provider.finishProjectSpendIndex();
+    provider.invalidateProjectSpendSnapshot();
+    assert.equal(await dollars(), adoptedTotal, 'a plain rescan from byte 0 changed the shown total');
+    maxBytes = Number.POSITIVE_INFINITY;
+    index(plain);
+    assert.notEqual(finished(plain).complete, false);
+    provider.finishProjectSpendIndex();
+    provider.invalidateProjectSpendSnapshot();
+    assert.ok((await dollars()) > adoptedTotal, 'the finished rescan did not show its larger total');
+    assert.ok(
+      provider.projectSpendFiles.every((record: SpendFileIndex) => !record.file.endsWith('.zst')),
+      'the pick entered the ledger',
+    );
   } finally {
     vi.useRealTimers();
   }
