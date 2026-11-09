@@ -552,10 +552,13 @@ test('a window read queued during a receipt turn enters the worker within one ba
   const posted = path.join(root, 'window-posted');
   const step = 'receiptSteps++;';
   const prelude = `let noted=0,turns=0,gated=false,baseline=0,enteredAt=0,enteredTurns=0;globalThis.noteReceiptTurn=()=>turns++;const gatePort=require('node:worker_threads').parentPort,gateFs=require('node:fs'),gatePost=gatePort.postMessage.bind(gatePort);
-    globalThis.noteReceiptStep=()=>{noted++;if(noted===3&&!gated){gated=true;gatePort.postMessage({repeatedCoverage:'receipt-gate'});const end=performance.now()+30000;while(!gateFs.existsSync(${JSON.stringify(posted)}))if(performance.now()>=end)throw new Error('the window read was never queued');baseline=noted;}};
+    globalThis.noteReceiptStep=()=>{noted++;if(noted===3&&!gated){gated=true;gatePort.postMessage({repeatedCoverage:'receipt-gate'});const end=performance.now()+30000;while(!gateFs.existsSync(${JSON.stringify(posted)}))if(performance.now()>=end){gatePort.postMessage({repeatedCoverage:'receipt-gate-expired'});throw new Error('the window read was never queued');}baseline=noted;}};
     gatePort.postMessage=function(message){if(message.windowEntered){enteredAt=noted;enteredTurns=turns;gatePost({repeatedCoverage:'window-entered:'+(noted-baseline)});}if(message.result?.value?.kind==='window')gatePost({repeatedCoverage:'window-answered:'+(noted-enteredAt)+':'+(turns-enteredTurns)});return gatePost(message);};`;
   let reachedGate!: () => void;
   const gate = new Promise<void>((resolve) => (reachedGate = resolve));
+  let expireGate!: (error: Error) => void;
+  const gateExpired = new Promise<never>((_resolve, reject) => (expireGate = reject));
+  gateExpired.catch(() => {});
   let entered: number | undefined;
   let answered: number[] | undefined;
   const worker = new ProgressiveWorker(
@@ -568,6 +571,7 @@ test('a window read queued during a receipt turn enters the worker within one ba
     undefined,
     (message) => {
       if (message === 'receipt-gate') reachedGate();
+      else if (message === 'receipt-gate-expired') expireGate(new Error('the window read was never queued'));
       else if (message.startsWith('window-entered:')) entered = Number(message.slice('window-entered:'.length));
       else if (message.startsWith('window-answered:')) answered = message.split(':').slice(1).map(Number);
     },
@@ -595,12 +599,12 @@ test('a window read queued during a receipt turn enters the worker within one ba
       new AbortController().signal,
     );
     fs.writeFileSync(posted, '');
-    assert.equal((await window)?.value.kind, 'window');
+    assert.equal((await Promise.race([window, gateExpired]))?.value.kind, 'window');
     assert.ok(entered !== undefined && entered <= 8, `the window read entered after ${entered} more receipt steps`);
     // While the read runs, the scan runs one step in each event-loop turn.
     assert.ok(answered, 'the window answer was not reported');
     assert.ok(answered[0] <= answered[1] + 1, `${answered[0]} steps ran in ${answered[1]} turns during the read`);
-    await discovery;
+    await Promise.race([discovery, gateExpired]);
   } finally {
     worker.stop();
   }
