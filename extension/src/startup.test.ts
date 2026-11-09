@@ -51,6 +51,7 @@ import {
   enumerateClaudeChildSources,
   revisionOf as fileRevisionOf,
   enumerateClaudeChildSourceSteps,
+  enumerateSessionFilesFor,
   enumerateSessionFilesForSteps,
   scanSessionCwd,
   walkInSlices,
@@ -10056,6 +10057,63 @@ test('a file created after its folder was read waits for the next walk', async (
   await releaseAll(provider.refresh(true));
   assert.deepEqual(files(), [first, late].sort(), 'the next walk did not list the later file');
   assert.equal(walks.length, 2);
+});
+
+test('a file that lands after its folder was read asks for a walk at the next poll, after a synchronous commit during the slices', async () => {
+  vi.useFakeTimers({ toFake: ['Date'] });
+  try {
+    vi.setSystemTime(1_000_000);
+    let afterRead = () => {};
+    const { provider, files, writeParent, directoryOf, pauseOnce, releaseAll } = slicedWalkHarness({
+      enumerateSessionFilesFor,
+      enumerateClaudeChildSources,
+      discoverClaudeSessionSpendSources,
+      scanSessionCwd: (file: string, onUnreadable?: () => void, onRead?: () => void) => {
+        afterRead();
+        afterRead = () => {};
+        return scanSessionCwd(file, onUnreadable, onRead);
+      },
+    });
+    const first = writeParent('first');
+    const directory = directoryOf();
+    let walkStartedAt: number | null = null;
+    let landedAt = 0;
+    let late = '';
+    afterRead = () =>
+      pauseOnce(() => {
+        walkStartedAt = provider.catalogWalkPendingAt;
+        landedAt = walkStartedAt! + 5_000;
+        vi.setSystemTime(landedAt);
+        late = writeParent('late');
+        provider.allSessions(false, true, undefined, undefined, 'requested:search');
+        assert.equal(provider.catalogWalkPendingAt, null, 'the synchronous commit left the walk clock pending');
+        assert.ok(
+          provider.catalog.sessions.some((session: SessionFile) => session.file === late),
+          'the synchronous commit did not list the late file',
+        );
+        vi.setSystemTime(landedAt + 5_000);
+      });
+    await releaseAll(provider.refresh(true));
+    assert.ok(late, 'the walk never stopped after it read the folder');
+    assert.deepEqual(
+      files(),
+      [first],
+      'the sliced commit did not replace the catalog that the synchronous commit listed',
+    );
+    const gate = new PollDirectoryGate(async () => ({ mtimeMs: landedAt, print: 'landed' }));
+    const decision = await gate.decide(
+      { listing: [directory], children: [] },
+      () => provider.catalogWalk && { ...provider.catalogWalk, pendingSince: provider.catalogWalkPendingAt },
+      () => Date.now(),
+    );
+    assert.deepEqual(
+      decision,
+      { kind: 'walk', cause: 'directory' },
+      'the poll saw no move in the folder of the late file',
+    );
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 test('a file moved between two project folders during a sliced walk lists once and starts no quarantine', async () => {

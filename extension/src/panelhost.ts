@@ -793,6 +793,8 @@ interface ClaudeWalk {
   seeded: boolean;
   // Whether watcher events reached the walk when it started. A stat held from a later turn can miss an earlier event.
   watching: boolean;
+  // The time that the poll compares directory times with. A synchronous commit during the slices clears the pending clock.
+  startedAt: number;
 }
 
 interface GitExtensionExports {
@@ -13738,6 +13740,7 @@ export class PanelProvider implements vscode.Disposable {
     const started = {
       seeded: supplied !== undefined && supplied === this.codexColdPass?.listing,
       watching: this.watching,
+      startedAt: this.catalogWalkPendingAt ?? Date.now(),
     };
     const listingStarted = performance.now();
     const enumeration = supplied ?? (await enumerateRolloutFilesAsync(root, signal));
@@ -13761,7 +13764,7 @@ export class PanelProvider implements vscode.Disposable {
     roots: string[],
     workspaceFolders: string[],
     folderPrint: string,
-    started: Pick<ClaudeWalk, 'seeded' | 'watching'>,
+    started: Pick<ClaudeWalk, 'seeded' | 'watching' | 'startedAt'>,
     time: ListingTimer,
   ): WalkSteps<ClaudeWalk> {
     const openings: ClaudeOpenings = { observations: [], unavailable: false };
@@ -14263,7 +14266,7 @@ export class PanelProvider implements vscode.Disposable {
     }
     this.catalogWalk = {
       generation: (this.catalogWalk?.generation ?? 0) + 1,
-      startedAt: this.catalogWalkPendingAt ?? Date.now(),
+      startedAt: slicedClaude?.startedAt ?? this.catalogWalkPendingAt ?? Date.now(),
       pendingSince: null,
     };
     this.catalogWalkPendingAt = null;
