@@ -377,6 +377,8 @@ interface RankFields {
   size?: number;
   mtimeMs?: number;
   decodedLength?: number;
+  adoptionFailed?: boolean;
+  nameOnly?: boolean;
 }
 
 function rankFields(entry: CompressedFactEntry): RankFields {
@@ -387,6 +389,8 @@ function rankFields(entry: CompressedFactEntry): RankFields {
     size: entry.size,
     mtimeMs: entry.mtimeMs,
     decodedLength: entry.decodedLength,
+    adoptionFailed: entry.adoptionFailed,
+    nameOnly: entry.nameOnly,
   };
 }
 
@@ -401,7 +405,7 @@ interface RankedEntry {
 }
 
 // Greater when `left` ranks first. Current fact version first, then an equal stat, then greater mtimeMs and size, then
-// an entry with a decoded length, the higher epoch, the greater holder token and the later line.
+// an entry with a decoded length, an entry with facts, the higher epoch, the greater holder token and the later line.
 export function compareRankedEntries(
   left: RankedEntry,
   right: RankedEntry,
@@ -421,6 +425,9 @@ export function compareRankedEntries(
   if (size) return size;
   const decoded = Number(a.decodedLength !== undefined) - Number(b.decodedLength !== undefined);
   if (decoded) return decoded;
+  const withFacts = (entry: RankFields) => (entry.adoptionFailed || entry.nameOnly ? 0 : 1);
+  const facts = withFacts(a) - withFacts(b);
+  if (facts) return facts;
   if (left.epoch !== right.epoch) return left.epoch - right.epoch;
   if (left.token !== right.token) return left.token > right.token ? 1 : -1;
   return left.seq - right.seq || left.offset - right.offset;

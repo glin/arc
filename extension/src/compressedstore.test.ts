@@ -169,6 +169,53 @@ test('the merge ranks the current fact version, then an equal stat, then the lat
   assert.ok(compareRankedEntries(decoded, ranked({ seq: 9 }), stat) > 0, 'a decoded length lost to a later line');
 });
 
+test('a failed adoption from a later window never outranks a good one at the same stat', async () => {
+  const stat = { size: 100, mtimeMs: 1_000 };
+  const twin = 'shared.jsonl.zst';
+  const { directory, clock, make, names } = storeFixture('store-two-windows', {
+    compactSegments: 2,
+    statOf: () => stat,
+  });
+  const failed = (): CompressedFactEntry => ({
+    file: twin,
+    pairKey: twin.replace(/\.zst$/, ''),
+    ...compressedEntryVersions(),
+    ...stat,
+    threadId: 't',
+    adoptionFailed: true,
+  });
+  // Window A adopts the twin. Window B's row lags, so its adoption fails later at the same stat.
+  const windowA = make();
+  await windowA.append([entry(twin, { hash: 'facts' })]);
+  windowA.dispose();
+  const windowB = make();
+  await windowB.append([failed()]);
+  windowB.dispose();
+  const read = readCompressedStore(directory, () => stat).entries.get(twin);
+  assert.equal(read?.adopted, true, 'the failed adoption outranked the good one');
+  const follower = new CompressedStoreFollower(
+    directory,
+    () => stat,
+    async () => {},
+  );
+  const followed = await follower.poll();
+  assert.equal(followed.find((item) => item.file === twin)?.adopted, true);
+  // A takeover compacts the two segments and keeps the first-ranked entry.
+  clock.advance(1);
+  const compactor = make();
+  await compactor.append([entry('other.jsonl.zst')]);
+  assert.ok(
+    names().some((name) => name.startsWith('manifest-')),
+    'the compaction did not run',
+  );
+  assert.equal(
+    readCompressedStore(directory, () => stat).entries.get(twin)?.adopted,
+    true,
+    'the compaction kept the failed adoption',
+  );
+  compactor.dispose();
+});
+
 test('an entry is current only when its stat and each version match this build', () => {
   const stat = { size: 100, mtimeMs: 1_000 };
   assert.equal(compressedEntryCurrent(entry('a'), stat), true);
