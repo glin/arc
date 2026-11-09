@@ -9487,6 +9487,222 @@ test('a selection held on a rollout without a saved opening survives the list be
   }
 });
 
+// A warm start on the production paths: a real attached host, the real watcher classification, a real replaced-file
+// check, and a cold pass held after its enumeration at a gate. Every Claude listing is counted.
+function coldPassRaceHarness() {
+  let claudeListings = 0;
+  const harness = heldWalkHarness(
+    {
+      COLD_PASS_PAINT_LIMIT_MS: 60_000,
+      watcherRefreshDecision,
+      sessionDirectoryOwners,
+      unknownPathShapes,
+      unknownPathExtension,
+      replacedCatalogFiles,
+      enumerateSessionFilesFor: () => {
+        claudeListings++;
+        return { sessions: [], files: [], status: 'complete', uncertain: [] };
+      },
+    },
+    [
+      'settleBackgroundColdPass',
+      'listFinishedColdPass',
+      'browserPainted',
+      'relistHeldCodex',
+      'armColdPassPaintLimit',
+      'noteColdPassNamedPaths',
+      'runPendingWatch',
+      'unknownPathShapeOf',
+      'attach',
+    ],
+  );
+  const { provider, root, walks, writeRollout } = harness;
+  Object.assign(provider, {
+    notePanelStart() {},
+    allowThemeFiles() {},
+    shell: () => 'shell',
+    startPolling() {},
+    requestInitialCatalogRefresh: () => false,
+    refreshSelectedCatalogs() {},
+    pendingWatch: new PendingWatcherWake(),
+    cachedLinks: { references: [], children: [] },
+  });
+  const counters = new PanelPerformanceCounters();
+  provider.performanceCounters = counters;
+  const stages: string[] = [];
+  const decisions: string[] = [];
+  provider.startupHistory = { stage: (name: string) => stages.push(name), visibility() {} };
+  const recordStartup = counters.recordStartup.bind(counters);
+  counters.recordStartup = (name: any, at: number) => {
+    stages.push(name);
+    recordStartup(name, at);
+  };
+  const recordWatcherOperation = counters.recordWatcherOperation.bind(counters);
+  counters.recordWatcherOperation = (operation: any, ...rest: any[]) => {
+    decisions.push(operation.decision);
+    (recordWatcherOperation as any)(operation, ...rest);
+  };
+  const panel = host();
+  provider.attach(panel);
+  provider.readyHosts.add(panel);
+  let enumerated = false;
+  let finishPass!: () => void;
+  const passHeld = new Promise<void>((resolve) => (finishPass = resolve));
+  provider.codexColdReads = async (signal: AbortSignal) => {
+    const pass = await coldOpeningPass(provider.codexMetas, root, signal);
+    enumerated = true;
+    await passHeld;
+    return pass;
+  };
+  const seed = (id: string) => {
+    const file = writeRollout(id);
+    provider.codexMetas.get(file);
+    provider.savedCodexOpeningFiles = [...provider.codexMetas.keys()];
+    return file;
+  };
+  const waited = { timeout: 8_000, interval: 5 };
+  let released = 0;
+  // Releases each held walk, because a build that waits for the pass walks after it where another build lists seeded rows.
+  const settle = () =>
+    vi.waitFor(() => {
+      while (walks.length > released) walks[released++].release();
+      assert.ok(provider.refreshController === null && provider.pendingRefresh === null, 'a refresh is still running');
+    }, waited);
+  const posts = () => provider.messages.filter((message: any) => message.type === 'render');
+  return {
+    ...harness,
+    panel,
+    counters,
+    stages,
+    decisions,
+    seed,
+    settle,
+    posts,
+    finishPass,
+    claudeListings: () => claudeListings,
+    untilEnumerated: () => vi.waitFor(() => assert.ok(enumerated, 'the pass did not reach its enumeration'), waited),
+    untilPosted: () => vi.waitFor(() => assert.ok(posts().length > 0, 'no render post arrived'), waited),
+    untilPassEnded: () =>
+      vi.waitFor(() => assert.equal(provider.codexPriming, null, 'the pass is still running'), waited),
+    paint: () => provider.browserPainted(provider.hosts[0], provider.refreshGeneration, 'railReady', true),
+    watcherEvent: (file: string, kind: 'rename' | 'change') => {
+      provider.pendingWatch.noteFileEvent(path.dirname(file), path.basename(file), kind, normalizeFsPath);
+      provider.runPendingWatch({ cause: 'quiet', firstAt: 0, lastAt: 0, firedAt: 0 });
+    },
+    done() {
+      finishPass();
+      clearTimeout(provider.coldPassPaintWait);
+    },
+  };
+}
+
+test('a warm start with visible reports before and after the first post counts its Claude listings and catalog walks', async () => {
+  const race = coldPassRaceHarness();
+  const { provider, panel, counters } = race;
+  race.seed('seeded');
+  provider.refreshFrom('shell-ready', true);
+  panel.changeVisibility();
+  // A build that waits for the pass posts only after the pass, so its pass ends here.
+  if (provider.refreshController === null) race.finishPass();
+  await race.untilPosted();
+  await race.settle();
+  panel.changeVisibility();
+  await race.settle();
+  const work = counters.snapshot().work;
+  assert.deepEqual(
+    {
+      claudeListings: race.claudeListings(),
+      catalogWalks: work.catalogWalk ?? 0,
+      asynchronousWalks: race.walks.length,
+    },
+    { claudeListings: 2, catalogWalks: 2, asynchronousWalks: 0 },
+  );
+  race.done();
+});
+
+test('a rollout created while the cold pass runs lists with the production watcher classification', async () => {
+  const race = coldPassRaceHarness();
+  const { provider, files, writeRollout } = race;
+  race.seed('seeded');
+  provider.refreshFrom('shell-ready', true);
+  await race.untilEnumerated();
+  await race.settle();
+  const fresh = writeRollout('fresh');
+  race.watcherEvent(fresh, 'rename');
+  await race.settle();
+  const listedDuringPass = files()?.includes(fresh) ?? false;
+  race.finishPass();
+  await race.untilPassEnded();
+  await race.settle();
+  race.paint();
+  await race.settle();
+  const listedAfterPass = files()?.includes(fresh) ?? false;
+  provider.refreshFrom('poll:directory');
+  await race.settle();
+  assert.deepEqual(
+    {
+      decisions: race.decisions,
+      listedDuringPass,
+      listedAfterPass,
+      listedAfterNextWalk: files()?.includes(fresh) ?? false,
+    },
+    { decisions: ['broad'], listedDuringPass: false, listedAfterPass: false, listedAfterNextWalk: true },
+  );
+  race.done();
+});
+
+test.fails('a complete walk started by a replacement during the cold pass keeps the rows it found after the pass settles', async () => {
+  const race = coldPassRaceHarness();
+  const { provider, files, writeRollout, root } = race;
+  const seeded = race.seed('seeded');
+  const unseeded = writeRollout('unseeded');
+  provider.refreshFrom('shell-ready', true);
+  await race.untilEnumerated();
+  await race.settle();
+  const extra = writeRollout('extra');
+  const inode = fs.statSync(seeded, { bigint: true }).ino;
+  fs.unlinkSync(seeded);
+  fs.writeFileSync(
+    seeded,
+    `${JSON.stringify({ type: 'session_meta', payload: { id: 'seeded', cwd: path.join(root, 'project') } })}\n`,
+  );
+  assert.notEqual(fs.statSync(seeded, { bigint: true }).ino, inode, 'the rewrite kept the file identity');
+  provider.refreshFrom('replaced', false, true);
+  await race.settle();
+  const afterWalk = files()?.includes(extra) ?? false;
+  race.finishPass();
+  await race.untilPassEnded();
+  await race.settle();
+  race.paint();
+  await race.settle();
+  assert.deepEqual(
+    { afterWalk, afterBothSettle: files() },
+    { afterWalk: true, afterBothSettle: [extra, seeded, unseeded].sort() },
+  );
+  race.done();
+});
+
+test('a refresh between the first render post and its paint drops the startup stages of that draw', async () => {
+  const race = coldPassRaceHarness();
+  const { provider, stages } = race;
+  const seeded = race.seed('seeded');
+  provider.refreshFrom('shell-ready', true);
+  if (provider.refreshController === null) race.finishPass();
+  await race.untilPosted();
+  const drawn = provider.refreshGeneration;
+  await race.settle();
+  race.watcherEvent(seeded, 'change');
+  await race.settle();
+  assert.ok(provider.refreshGeneration > drawn, 'the watcher refresh did not move the generation');
+  provider.browserPainted(provider.hosts[0], drawn, 'railReady', true);
+  provider.browserPainted(provider.hosts[0], drawn, 'firstCard');
+  assert.deepEqual(
+    stages.filter((stage) => ['firstUsableRow', 'railReady', 'selectedText', 'firstCard'].includes(stage)),
+    [],
+  );
+  race.done();
+});
+
 test('targeted reuse avoids the broad walk, and a failed reuse performs exactly one walk', async () => {
   const { provider, walks, files, writeRollout, releaseAll } = heldWalkHarness();
   const held = writeRollout('held');
