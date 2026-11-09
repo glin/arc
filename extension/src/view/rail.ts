@@ -1074,7 +1074,7 @@ export function railCountPressed(kind: RailCountKind, lens: RailHeadLens): boole
 }
 
 // Configured shortcuts draw while selected or while their scoped session count is positive.
-// Active also draws at a count of 0 once counts arrive, so the reader can widen an empty window.
+// Active hides at a count of 0 whether selected or not, and the filter box's query term clears a held Active.
 // Before the catalog supplies counts, only a selected shortcut draws, without a figure, so a restored selection stays clearable.
 // Naming holds their counts and disables presses. Active adds its scoped cache information.
 // The Active label stays "Active" at every window. Its accessible name names the window. Its hint
@@ -1102,7 +1102,7 @@ export function railCountButtons(
   return RAIL_LENSES.filter(
     (kind) =>
       headLenses.includes(kind) &&
-      ((counts?.[kind] ?? 0) > 0 || railCountPressed(kind, lens) || (kind === 'active' && counts !== null)),
+      ((counts?.[kind] ?? 0) > 0 || (railCountPressed(kind, lens) && (kind !== 'active' || counts === null))),
   ).map((kind) => {
     const count = counts?.[kind];
     const figure = count === undefined ? '' : count.toLocaleString('en-US');

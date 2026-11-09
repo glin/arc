@@ -408,7 +408,6 @@ button.railtermmore:hover {
   gap: 0.3em;
 }
 .railfilterrow > .railhead,
-.railfilterrow > .railcounts,
 .railfilterrow > .railviewnotes,
 .railfilterrow > .railviewsave {
   flex: none;
@@ -524,8 +523,11 @@ button.railtermmore:hover {
 .railcounts {
   display: flex;
   flex: none;
-  width: 100%;
+  /* Each button keeps its own side padding and transparent border, so the row reaches past the
+     box by that much and the count text starts where the Sessions heading starts. */
+  width: calc(100% + 0.3em + 2px);
   min-width: 0;
+  margin: 0 calc(-0.15em - 1px);
   flex-wrap: wrap;
   align-items: center;
   gap: 0 0.25em;
@@ -599,7 +601,7 @@ button.railtermmore:hover {
   border-bottom-right-radius: 0;
 }
 .railactivewindow {
-  width: 0.77em;
+  width: 1.3em;
   margin: 0;
   padding: 0;
   border: 0;
@@ -5471,9 +5473,6 @@ body {
 .railnewmenu {
   width: 1.878em;
   padding: 1px;
-}
-.railnewmenu,
-.railactivewindow {
   border-left: 1px solid var(--edge);
 }
 .railnew:hover,

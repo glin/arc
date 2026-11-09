@@ -196,7 +196,11 @@ test('empty status filters stay selectable before matching sessions exist', { ti
       assert.equal(await button.locator('.railcountfig').count(), 0);
       await button.press('Enter');
       assert.equal(await button.getAttribute('aria-checked'), 'true');
-      assert.equal(await page.locator(`[data-control="railcount:${lens}"]`).count(), lens === 'unread' ? 0 : 1);
+      // Unread is not a default button, and Active hides at a count of 0 even while selected.
+      assert.equal(
+        await page.locator(`[data-control="railcount:${lens}"]`).count(),
+        lens === 'unread' || lens === 'active' ? 0 : 1,
+      );
     }
     await page.locator('[data-control="raillens:running"]').click();
     await page.locator('[data-control="railfilterlabel:composer"]').click();
@@ -1096,7 +1100,7 @@ test('the Running count stays selected at zero and clears to restore sessions', 
 });
 
 test(
-  'View clears a selected zero-match filter while its rail shortcut stays visible',
+  'View clears a selected zero-match Active filter after its rail shortcut hides',
   { timeout: 60_000 },
   async (t) => {
     const browser = await browserOrNone();
@@ -1136,8 +1140,11 @@ test(
       await page.evaluate(`window.postMessage(${JSON.stringify(railMessage(initial, archived.rail))}, '*')`);
       await page.evaluate(SETTLED);
       assert.deepEqual(await cardsShown(), [], 'an archived session stayed on the rail under the Active lens');
-      assert.equal(await active.locator('.railcountfig').textContent(), '0');
-      assert.deepEqual(await focus(), { control: 'railcount:active', body: false });
+      assert.equal(await active.count(), 0, 'the selected Active button stayed drawn at zero');
+      assert.equal(await page.locator('[data-control="railactivewindow"]').count(), 0, 'the caret outlived Active');
+      const left = (await focus()) as { control: string | null; body: boolean };
+      assert.equal(left.body, false, 'losing Active dropped focus onto the page body');
+      assert.notEqual(left.control, 'railactivewindow', 'focus fell back to the caret');
       await page.locator('[data-control="railfilters"]').click();
       assert.equal(await page.locator('[data-control="raillens:active"]').isEnabled(), true);
       assert.equal(await page.locator('[data-control="raillens:active"]').getAttribute('aria-checked'), 'true');
@@ -1401,21 +1408,19 @@ test(
         undefined,
         { timeout: 10_000 },
       );
-      assert.deepEqual(await state(), { box: 1, counts: 1, cards: 0, views: [] });
-      assert.equal(await active.locator('.railcountfig').textContent(), '0');
+      assert.deepEqual(await state(), { box: 1, counts: 0, cards: 0, views: [] });
+      assert.equal(await page.locator('[data-control="railactivewindow"]').count(), 0, 'the caret outlived Active');
       assert.equal(
-        await active.getAttribute('aria-label'),
-        `Active in the last hour, 0 sessions. ${CARD_ACTIONS.railCountCacheNone}`,
+        await page.evaluate(`document.activeElement?.dataset.control ?? null`),
+        'railfilters',
+        'losing Active did not hand focus to the funnel',
       );
-      assert.equal(await active.getAttribute('aria-pressed'), 'true');
-      assert.equal(await active.isEnabled(), true);
-      assert.equal(await active.evaluate((node) => node === document.activeElement), true);
       const renewed = payload()
         .rail.filter((card) => card.id === 's1' || card.id === 's2')
         .map((card) => ({ ...card, at: FIXTURE_CLOCK + 61 * 60_000 }));
       await postToPage(page, railMessage(payload(), renewed));
       assert.equal(await active.locator('.railcountfig').textContent(), '2');
-      assert.equal(await active.evaluate((node) => node === document.activeElement), true);
+      assert.equal(await active.getAttribute('aria-pressed'), 'true');
       assert.deepEqual(failures, []);
     } finally {
       await browser.close();
@@ -2133,6 +2138,138 @@ test('the Active window menu closes when the session list hides', { timeout: 60_
     });
     assert.notEqual(await page.evaluate(`document.activeElement.tagName`), 'BODY', 'focus was lost with the menu');
     assert.equal(await page.evaluate(`!!document.activeElement.closest('nav, [hidden]')`), false);
+  } finally {
+    await browser.close();
+  }
+});
+
+// Active and its caret leave the header at a count of 0, held or not.
+test('Active and its caret hide at a count of 0 and return with sessions', { timeout: 60_000 }, async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('no installed Edge or Chrome, so the Active button was not measured');
+    return;
+  }
+  try {
+    const page = await browser.newPage();
+    const failures: string[] = [];
+    page.on('pageerror', (error) => failures.push(String(error)));
+    const stale = activeWindowPayload([5, 6, 7]);
+    await openPage(page, stale, FIXTURE_CLOCK, {
+      railQuickFilters: ['active'],
+      railActiveWindow: '1h',
+    });
+    const active = page.locator('[data-control="railcount:active"]');
+    const caret = page.locator('[data-control="railactivewindow"]');
+    assert.equal(await active.count(), 0, 'an unselected Active button drew at a count of 0');
+    assert.equal(await caret.count(), 0, 'the caret drew at a count of 0');
+    const fresh = activeWindowPayload([0, 6, 7]);
+    await postToPage(page, railMessage(stale, fresh.rail));
+    await active.waitFor();
+    assert.equal(await active.locator('.railcountfig').textContent(), '1');
+    await caret.click();
+    await page.locator('#railactivewindowpop').waitFor({ state: 'visible' });
+    assert.equal(await caret.getAttribute('aria-expanded'), 'true');
+    assert.deepEqual(failures, []);
+  } finally {
+    await browser.close();
+  }
+});
+
+test('a selected Active at a count of 0 hides, and its query term clears it', { timeout: 60_000 }, async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('no installed Edge or Chrome, so the Active button was not measured');
+    return;
+  }
+  try {
+    const page = await browser.newPage();
+    const failures: string[] = [];
+    page.on('pageerror', (error) => failures.push(String(error)));
+    await openPage(page, activeWindowPayload([5, 6, 7]), FIXTURE_CLOCK, {
+      railFilter: 'active:1h -is:archived -is:agentrun',
+      railFilterId: ALL_RAIL_FILTER_ID,
+      railQuickFilters: ['active'],
+      railActiveWindow: '1h',
+    });
+    assert.equal(await page.locator('[data-control="railcount:active"]').count(), 0, 'a held Active drew at zero');
+    assert.equal(await page.locator('[data-control="railactivewindow"]').count(), 0, 'the caret drew at zero');
+    await page.locator('[data-control="railsearch"]').click();
+    await page.locator('.railfilter').blur();
+    await page.locator('[data-control="railterm-remove:0"]').click();
+    await page.waitForFunction(`document.querySelector('.railfilter').value === ''`);
+    assert.deepEqual(failures, []);
+  } finally {
+    await browser.close();
+  }
+});
+
+test(
+  'losing Active while the caret or its menu holds focus hands focus on, never to the caret',
+  { timeout: 60_000 },
+  async (t) => {
+    const browser = await browserOrNone();
+    if (!browser) {
+      t.skip('no installed Edge or Chrome, so the Active button was not measured');
+      return;
+    }
+    try {
+      const page = await browser.newPage();
+      const failures: string[] = [];
+      page.on('pageerror', (error) => failures.push(String(error)));
+      const live = activeWindowPayload([0, 6, 7]);
+      const stale = activeWindowPayload([5, 6, 7]);
+      await openPage(page, live, FIXTURE_CLOCK, {
+        railQuickFilters: ['active'],
+        railActiveWindow: '1h',
+      });
+      const held = async () =>
+        (await page.evaluate(`document.activeElement?.dataset.control ?? document.activeElement?.tagName`)) as string;
+      // The caret holds focus.
+      await page.locator('[data-control="railactivewindow"]').focus();
+      await postToPage(page, railMessage(live, stale.rail));
+      await page.waitForFunction(`!document.querySelector('[data-control="railactivewindow"]')`);
+      assert.equal(await held(), 'railfilters', 'focus did not reach the funnel when the caret left');
+      // The menu is open on a row.
+      await postToPage(page, railMessage(stale, live.rail));
+      await pressActiveWindowCaret(page);
+      await postToPage(page, railMessage(live, stale.rail));
+      await page.waitForFunction(`document.querySelector('#railactivewindowpop').hidden`);
+      assert.equal(await held(), 'railfilters', 'focus did not reach the funnel when the open menu closed');
+      assert.deepEqual(failures, []);
+    } finally {
+      await browser.close();
+    }
+  },
+);
+
+test('choosing a window that counts 0 removes Active and hands focus on', { timeout: 60_000 }, async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('no installed Edge or Chrome, so the Active window menu was not measured');
+    return;
+  }
+  try {
+    const page = await browser.newPage();
+    const failures: string[] = [];
+    page.on('pageerror', (error) => failures.push(String(error)));
+    await openPage(page, activeWindowPayload([5, 20, 40]), FIXTURE_CLOCK, {
+      railQuickFilters: ['active'],
+      railActiveWindow: '6h',
+    });
+    await pressActiveWindowCaret(page);
+    const row = page.locator('[data-control="railactivewindow:1h"]');
+    assert.equal(await row.locator('.railcountfig').textContent(), '0');
+    await row.click();
+    await page.waitForFunction(`!document.querySelector('[data-control="railactivewindow"]')`);
+    assert.equal(await page.locator('[data-control="railcount:active"]').count(), 0, 'Active stayed at zero');
+    assert.equal(await page.locator('#railactivewindowpop').isHidden(), true, 'the menu stayed open');
+    assert.equal(
+      await page.evaluate(`document.activeElement?.dataset.control ?? document.activeElement?.tagName`),
+      'railfilters',
+      'focus did not reach the funnel',
+    );
+    assert.deepEqual(failures, []);
   } finally {
     await browser.close();
   }

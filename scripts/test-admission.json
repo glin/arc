@@ -117,7 +117,7 @@
   "extension/src/panel.layout.rail.test.ts": {
     "reason": "Session-list controls must preserve native browser interaction across layout changes.",
     "cases": 28,
-    "matricesSha256": "732e76d389921a31b4179a6ea2605c90e3bcfb228bef7ebf53b9d21a47d9bc9c"
+    "matricesSha256": "fa7a5485d480f0d4dc6c47de914bb49d836f46c59b2441ae90776c550ba3f767"
   },
   "extension/src/panel.layout.test.ts": {
     "reason": "The built panel must preserve browser interaction, focus, and scrolling across supported viewports.",
@@ -161,7 +161,7 @@
   },
   "extension/src/rail.filter.browser.test.ts": {
     "reason": "Session filters must update the rendered list through native input and keyboard events.",
-    "cases": 46,
+    "cases": 50,
     "matricesSha256": "38a6cb833b1de9a1a053f3422e74683f39344843c6f89fec2e367c4c07a6b7e3"
   },
   "extension/src/rail.rows.browser.test.ts": {

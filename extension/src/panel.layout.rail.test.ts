@@ -2760,7 +2760,7 @@ async function pressActiveOverLeavingSession(
 }
 
 test(
-  'the selected Active shortcut stays pressed when a tick drops its last session',
+  'the selected Active shortcut leaves the header when a tick drops its last session',
   { timeout: 60_000 },
   async (t) => {
     const browser = await browserOrNone();
@@ -2779,7 +2779,7 @@ test(
       await page.clock.runFor(25_000);
       const after = await read();
       assert.equal(after.drawn, 0, 'the session did not leave the list on the tick that crossed the window');
-      assert.equal(after.pressed, 'true', 'the selected zero-match shortcut disappeared');
+      assert.equal(after.pressed, null, 'the selected Active shortcut stayed drawn at zero');
       assert.deepEqual(failures, [], 'the panel threw while the Active session left the list');
     } finally {
       await browser.close();
@@ -2819,14 +2819,15 @@ test('ending naming refreshes held cache information at the current time', { tim
     const paused = await pauseClock(page);
     await page.clock.setSystemTime(paused + 25_000);
     await page.keyboard.press('Escape');
-    assert.equal(await active.locator('.railcountfig').textContent(), '0', 'ending naming kept the held count');
+    await page.waitForFunction(`!document.querySelector('[data-control="railcount:active"]')`);
+    assert.equal(await active.count(), 0, 'ending naming kept an empty Active button');
     assert.deepEqual(failures, [], 'the panel threw while naming ended');
   } finally {
     await browser.close();
   }
 });
 
-test('a tick that empties Active keeps its button at zero and keeps focus', { timeout: 60_000 }, async (t) => {
+test('a tick that empties Active removes its button and hands focus on', { timeout: 60_000 }, async (t) => {
   const browser = await browserOrNone();
   if (!browser) {
     t.skip('no Edge, Chrome or bundled Chromium on this machine, so nothing was measured');
@@ -2855,12 +2856,13 @@ test('a tick that empties Active keeps its button at zero and keeps focus', { ti
     await active.focus();
     await pauseClock(page);
     await page.clock.runFor(25_000);
-    assert.equal(await active.locator('.railcountfig').textContent(), '0', 'the Active button left the header at zero');
-    assert.equal(
-      await page.evaluate(`document.activeElement?.dataset.control ?? null`),
-      'railcount:active',
-      'the tick moved focus off the Active button',
+    await page.waitForFunction(`!document.querySelector('[data-control="railcount:active"]')`);
+    const focused = (await page.evaluate(`document.activeElement?.dataset.control ?? null`)) as string | null;
+    assert.ok(
+      focused !== null && focused !== 'railcount:active' && focused !== 'railactivewindow',
+      `the tick left focus on ${focused}, not on another header control`,
     );
+    assert.equal(await page.locator('[data-control="railactivewindow"]').count(), 0, 'the caret outlived Active');
     assert.deepEqual(failures, []);
   } finally {
     await browser.close();
@@ -2868,7 +2870,7 @@ test('a tick that empties Active keeps its button at zero and keeps focus', { ti
 });
 
 test(
-  'releasing a held text selection retains the selected zero-match Active shortcut',
+  'releasing a held text selection removes the selected Active shortcut that reached zero',
   { timeout: 60_000 },
   async (t) => {
     const browser = await browserOrNone();
@@ -2896,7 +2898,7 @@ test(
       await page.evaluate('getSelection().removeAllRanges()');
       await page.waitForFunction(`document.querySelector('.railcard[data-session="s1"]') === null`);
       const after = await read();
-      assert.equal(after.pressed, 'true', 'the selected zero-match shortcut disappeared after selection release');
+      assert.equal(after.pressed, null, 'the selected Active shortcut stayed drawn at zero after selection release');
       assert.deepEqual(failures, [], 'the panel threw while releasing the held selection');
     } finally {
       await browser.close();

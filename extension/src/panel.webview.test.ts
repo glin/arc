@@ -32719,10 +32719,7 @@ test('startup shows only the restored selected quick filter until the workspace 
   });
   assert.deepEqual(
     buttons.map((button) => [button.kind, button.figure, button.pressed]),
-    [
-      ['running', '0', true],
-      ['active', '0', false],
-    ],
+    [['running', '0', true]],
   );
   const running = { id: 'running', status: 'running', at: 1_000, cache: null };
   handlers.render({
@@ -32747,10 +32744,7 @@ test('startup shows only the restored selected quick filter until the workspace 
   handlers.rail(configuration);
   assert.deepEqual(
     buttons.map((button) => [button.kind, button.figure, button.pressed]),
-    [
-      ['running', '0', true],
-      ['active', '0', false],
-    ],
+    [['running', '0', true]],
   );
 });
 

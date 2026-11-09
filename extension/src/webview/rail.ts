@@ -2367,8 +2367,14 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     railWindowOpen = false;
     drawActiveWindowPop();
     drawTop();
-    if (returnFocus && railWindowButton?.isConnected) {
-      railWindowButton.focus();
+    if (returnFocus) {
+      // Choosing a window that counts 0 removes Active and its caret, and drawTop has already moved focus.
+      // The fallback covers a row that did not hold focus.
+      if (railWindowButton?.isConnected) {
+        railWindowButton.focus();
+      } else {
+        restoreRailCountFocus();
+      }
     }
   };
   const openActiveWindowMenu = () => {
@@ -2714,10 +2720,12 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       : UNREADY_LAUNCHER_WORDS.primaryName;
     const railLabel = view?.words.railLabel ?? options.words.railLabel;
     nav.setAttribute('aria-label', railLabel);
-    // A count that holds focus and leaves the head in this draw hands focus on by the press rule.
+    // A count or the Active caret that holds focus and leaves the head in this draw hands focus on by the press rule.
     const focused = document.activeElement;
     const focusedCount =
-      focused instanceof HTMLElement && topMount.contains(focused) && focused.dataset.control?.startsWith('railcount:')
+      focused instanceof HTMLElement &&
+      topMount.contains(focused) &&
+      (focused.dataset.control?.startsWith('railcount:') || focused.dataset.control === 'railactivewindow')
         ? focused
         : null;
     const invalidCost = naming

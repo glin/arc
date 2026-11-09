@@ -596,6 +596,7 @@ export const SHOTS: Shot[] = [
     railWidth,
     railQuery: 'active:6h -is:archived -is:agentrun label:composer -label:bug cost:>5',
     clip: '#rail',
+    after: '[data-control="railclear"]',
   })),
   // Capture the session list header at several widths, at rest and with Active selected.
   // The resting fixture populates Running, Active, Unread, and Needs input counts.
@@ -1467,6 +1468,11 @@ export async function shoot(
     await page.evaluate(SETTLED);
   }
   if (shot.railCount) {
+    // Active hides at a count of 0, so two sessions need a recent update before the press.
+    const recent = renderPayload() as { rail: Record<string, unknown>[] };
+    recent.rail = recent.rail.map((card, index) => (index < 2 ? { ...card, at: FIXTURE_CLOCK } : card));
+    await page.evaluate(`window.postMessage(${JSON.stringify(recent)}, '*')`);
+    await page.evaluate(SETTLED);
     await page.locator(`[data-control="railcount:${shot.railCount}"]`).click();
     await page.evaluate(SETTLED);
   }
@@ -1476,7 +1482,7 @@ export async function shoot(
     const idle = payload.rail.findIndex((card, index) => index > 3 && !card.status);
     payload.rail = payload.rail.map((card, index) =>
       index < 3
-        ? { ...card, unread: true }
+        ? { ...card, unread: true, at: FIXTURE_CLOCK }
         : index === 3
           ? { ...card, status: 'waiting' }
           : index === idle
