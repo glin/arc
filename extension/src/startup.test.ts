@@ -21862,6 +21862,7 @@ async function hydrateCompressedRolloutLedger(scope: Record<string, unknown> = {
       // The plain rollout holds the same requests as the compressed one.
       indexSpendFile: () => ({ record: saved('rollout-a.jsonl', 7), stateChanged: true, complete: true, found: true }),
       compressedSpendDisplayFiles,
+      compressedPairKey,
       fs,
       ...scope,
     },
@@ -22090,6 +22091,98 @@ test('one thread counts once across paths, through real openings and a real resc
     assert.ok(
       provider.projectSpendFiles.every((record: SpendFileIndex) => !record.file.endsWith('.zst')),
       'the pick entered the ledger',
+    );
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('a plain record behind a directory alias joins its compressed thread by session id', async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date('2026-10-21T12:00:00'));
+  try {
+    const thread = '01a032c9-1a92-7931-845c-723117d24dbe';
+    const { provider, plainFolder } = await hydrateCompressedRolloutLedger({
+      productionNormalizeFsPath: normalizeFsPath,
+      createCodexUsageLineReducer,
+      indexSpendFile,
+    });
+    // The workspace reaches the sessions directory through a junction on Windows and a symlink elsewhere.
+    const alias = `${plainFolder}-alias`;
+    fs.symlinkSync(plainFolder, alias, process.platform === 'win32' ? 'junction' : 'dir');
+    const body = (requests: number) => {
+      const usage = Array.from({ length: requests }, (_, at) => ({
+        type: 'event_msg',
+        timestamp: `2026-10-21T11:00:${String(at + 2).padStart(2, '0')}Z`,
+        payload: {
+          type: 'token_count',
+          info: { last_token_usage: { input_tokens: 2_000_000, output_tokens: 200_000 } },
+        },
+      }));
+      return `${[
+        {
+          type: 'session_meta',
+          timestamp: '2026-10-21T11:00:00Z',
+          payload: { id: thread, cwd: 'c:/repo', source: 'cli', model_provider: 'openai' },
+        },
+        { type: 'event_msg', timestamp: '2026-10-21T11:00:00Z', payload: { type: 'task_started', turn_id: 't' } },
+        { type: 'turn_context', timestamp: '2026-10-21T11:00:01Z', payload: { turn_id: 't', model: 'gpt-6.1-terra' } },
+        ...usage,
+      ]
+        .map((line) => JSON.stringify(line))
+        .join('\n')}\n`;
+    };
+    provider.adoptionsUnsettled = new Map();
+    provider.codexMetas = new CodexMetaCache();
+    provider.compressedFacts = new Map();
+    provider.compressedFactsRevision = 0;
+    provider.compressedSpendPicks = new WeakMap();
+    const dollars = async () => {
+      provider.invalidateProjectSpendSnapshot();
+      await vi.runAllTimersAsync();
+      return provider.projectSpendPayload().windows[0].dollars;
+    };
+    const index = (file: string) => {
+      provider.projectSpendQueue = [{ file, agent: 'codex', primary: true }];
+      provider.projectSpendQueued.add(normalizeSpendFile(file));
+      provider.indexNextProjectSpendFile();
+      provider.finishProjectSpendIndex();
+      return provider.projectSpendFiles.find((record: SpendFileIndex) => record.file === normalizeSpendFile(file));
+    };
+    const forget = (record: SpendFileIndex) => {
+      provider.projectSpendFiles = provider.projectSpendFiles.filter((held: SpendFileIndex) => held !== record);
+      provider.projectSpendVisibleFiles = provider.projectSpendFiles;
+      provider.spendRecordsByFile = new Map(
+        provider.projectSpendFiles.map((held: SpendFileIndex, at: number) => [held.file, at]),
+      );
+    };
+    const compressedPlain = path.join(plainFolder, `rollout-a-${thread}.jsonl`);
+    fs.writeFileSync(compressedPlain, body(7));
+    const seven = index(compressedPlain);
+    fs.unlinkSync(compressedPlain);
+    forget(seven);
+    const resumed = path.join(alias, `rollout-b-${thread}.jsonl`);
+    fs.writeFileSync(resumed, body(10));
+    provider.codexMetas.get(resumed);
+    index(resumed);
+    const withoutEntry = await dollars();
+    provider.compressedFacts = new Map([
+      [
+        `${compressedPlain}.zst`,
+        {
+          file: `${compressedPlain}.zst`,
+          pairKey: normalizeSpendFile(compressedPlain),
+          threadId: thread,
+          complete: true,
+          spend: seven,
+        },
+      ],
+    ]);
+    provider.compressedFactsRevision++;
+    assert.equal(
+      await dollars(),
+      withoutEntry,
+      'a resumed plain record behind an alias counted beside its compressed entry',
     );
   } finally {
     vi.useRealTimers();

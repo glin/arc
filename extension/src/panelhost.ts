@@ -5335,16 +5335,18 @@ export class PanelProvider implements vscode.Disposable {
           ]
         : [],
     );
-    // The cache keys openings by the walk's raw path, and a spend record names its file by the canonical path.
+    // The cache keys openings by the walk's raw path, and a spend record names its file by the canonical path. Both sides
+    // go through the physical directory, so a directory alias reaches the same key.
     const sessionIds = new Map<string, string>();
+    const directories = new Map<string, string>();
     for (const file of this.codexMetas.keys()) {
       const sessionId = this.codexMetas.peek(file)?.sessionId;
-      if (sessionId) sessionIds.set(normalizeFsPath(file), sessionId);
+      if (sessionId) sessionIds.set(compressedPairKey(file, directories), sessionId);
     }
     const picked = compressedSpendDisplayFiles(
       files,
       candidates,
-      (file) => sessionIds.get(normalizeFsPath(file)) ?? null,
+      (file) => sessionIds.get(compressedPairKey(file, directories)) ?? null,
     );
     this.compressedSpendPicks.set(files, { revision: this.compressedFactsRevision, metas: metasRevision, picked });
     return picked;
