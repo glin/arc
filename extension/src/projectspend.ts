@@ -1958,6 +1958,120 @@ interface IncrementalRead {
   repeatedRevisionLost: boolean;
 }
 
+// Adds the usage events of one rollout to its dated and lifetime buckets, and orders its requests for the cache expiry
+// ledger. The incremental file scan and the backfill of a compressed rollout both feed it.
+function spendAccumulator(
+  reducer: UsageLineReducer,
+  buckets: readonly ProjectUsageBucket[],
+  lifetimeBuckets: readonly ProjectUsageBucket[],
+  cacheExpiry: CacheExpiryLedger | null | undefined,
+) {
+  const byKey = new Map(
+    buckets.map((bucket) => [
+      projectUsageKey(bucket, bucket.localDate),
+      { ...bucket, usage: bucket.usage.byContextBand ? structuredClone(bucket.usage) : { ...bucket.usage } },
+    ]),
+  );
+  const lifetimeByKey = new Map(
+    lifetimeBuckets.map((bucket) => [
+      projectUsageKey(bucket, bucket.localDate),
+      { ...bucket, usage: bucket.usage.byContextBand ? structuredClone(bucket.usage) : { ...bucket.usage } },
+    ]),
+  );
+  const addSliceTo = (target: Map<string, ProjectUsageBucket>, event: UsageEvent) => {
+    const date = localDate(event.timestamp);
+    const contextBand = event.usage.byContextBand
+      ? (event.contextBand ?? null)
+      : (event.contextBand ?? contextBandForRequest(event.model, event.provider, requestInputTokens(event.usage)));
+    const keyed = { ...event, contextBand };
+    const key = projectUsageKey(keyed, date);
+    let bucket = target.get(key);
+    if (!bucket && Object.values(event.usage).some((value) => typeof value === 'number' && value < 0)) {
+      return;
+    }
+    if (!bucket) {
+      bucket = {
+        localDate: date,
+        agent: event.agent,
+        provider: event.provider,
+        model: event.model,
+        contextWindow: event.contextWindow,
+        contextBand,
+        billingClass: event.billingClass,
+        inferenceClass: event.inferenceClass,
+        serviceTier: event.serviceTier,
+        reportedCostBasis: event.reportedCostBasis ?? null,
+        linkedSessionId: event.linkedSessionId ?? null,
+        linkedInvocationId: event.linkedInvocationId ?? null,
+        incomplete: event.incomplete === true,
+        ...(event.requestCountExact === false ? { requestCountExact: false as const } : {}),
+        ...(event.compactionEstimate ? { compactionEstimate: true as const } : {}),
+        ...(event.compactionUsage ? { compactionUsage: true as const } : {}),
+        ...(event.usageOrigin ? { usageOrigin: event.usageOrigin } : {}),
+        reportedCost: event.reportedCost === null ? null : 0,
+        usage: emptyUsage(),
+        requests: 0,
+      };
+      target.set(key, bucket);
+    }
+    addPricedUsage(bucket.usage, event.usage);
+    bucket.unclassifiedCacheWrite = (bucket.unclassifiedCacheWrite ?? 0) + (event.unclassifiedCacheWrite ?? 0);
+    if (!bucket.unclassifiedCacheWrite) {
+      delete bucket.unclassifiedCacheWrite;
+    }
+    addUsageWaits(bucket, event.waits);
+    addUsageTools(bucket, event);
+    bucket.requests += event.usage.requests ?? 1;
+    if (event.reportedCost !== null) {
+      bucket.reportedCost = (bucket.reportedCost ?? 0) + event.reportedCost;
+    }
+    if (bucketIsEmpty(bucket)) {
+      target.delete(key);
+    }
+  };
+  const addTo = (target: Map<string, ProjectUsageBucket>, event: UsageEvent) => {
+    for (const slice of usageBandEvents(event)) addSliceTo(target, slice);
+  };
+  // Track request order before bucket aggregation removes adjacency.
+  const ordered = reducer.recentCompactions
+    ? new CacheExpiryScan(cacheExpiry ?? undefined, () => reducer.nativeChildRequests?.() === true)
+    : null;
+  // Lifetime buckets include estimated compactions. Dated buckets contain recorded requests.
+  const add = (event: UsageEvent) => {
+    ordered?.push(event);
+    if (!event.compactionEstimate) {
+      addTo(byKey, event);
+    }
+    addTo(lifetimeByKey, event);
+  };
+  // A compaction that emits no usage event reaches the ordered pass after its line's events,
+  // and so does a revocation, which lowers the reducer's compaction count.
+  const signal = () => {
+    for (const item of reducer.takeCompactionSignals?.() ?? []) {
+      ordered?.signal(item);
+    }
+    const count = reducer.compactionCount?.();
+    if (typeof count === 'number') {
+      ordered?.compactionCount(count);
+    }
+  };
+
+  const sorted = (target: Map<string, ProjectUsageBucket>) =>
+    [...target.values()].sort((left, right) =>
+      projectUsageKey(left, left.localDate).localeCompare(projectUsageKey(right, right.localDate)),
+    );
+  return {
+    add,
+    signal,
+    retract(correction: CompactionRetraction) {
+      ordered?.retractCompactions(correction);
+    },
+    buckets: () => sorted(byKey),
+    lifetimeBuckets: () => sorted(lifetimeByKey),
+    ledger: () => (ordered ? ordered.ledger(reducer.recentCompactions!()) : null),
+  };
+}
+
 function readIncremental(
   file: string,
   offset: number,
@@ -1995,95 +2109,8 @@ function readIncremental(
     // stops the slice after that line.
     let stoppedBetweenLines = false;
     let classified = false;
-    const byKey = new Map(
-      buckets.map((bucket) => [
-        projectUsageKey(bucket, bucket.localDate),
-        { ...bucket, usage: bucket.usage.byContextBand ? structuredClone(bucket.usage) : { ...bucket.usage } },
-      ]),
-    );
-    const lifetimeByKey = new Map(
-      lifetimeBuckets.map((bucket) => [
-        projectUsageKey(bucket, bucket.localDate),
-        { ...bucket, usage: bucket.usage.byContextBand ? structuredClone(bucket.usage) : { ...bucket.usage } },
-      ]),
-    );
-    const addSliceTo = (target: Map<string, ProjectUsageBucket>, event: UsageEvent) => {
-      const date = localDate(event.timestamp);
-      const contextBand = event.usage.byContextBand
-        ? (event.contextBand ?? null)
-        : (event.contextBand ?? contextBandForRequest(event.model, event.provider, requestInputTokens(event.usage)));
-      const keyed = { ...event, contextBand };
-      const key = projectUsageKey(keyed, date);
-      let bucket = target.get(key);
-      if (!bucket && Object.values(event.usage).some((value) => typeof value === 'number' && value < 0)) {
-        return;
-      }
-      if (!bucket) {
-        bucket = {
-          localDate: date,
-          agent: event.agent,
-          provider: event.provider,
-          model: event.model,
-          contextWindow: event.contextWindow,
-          contextBand,
-          billingClass: event.billingClass,
-          inferenceClass: event.inferenceClass,
-          serviceTier: event.serviceTier,
-          reportedCostBasis: event.reportedCostBasis ?? null,
-          linkedSessionId: event.linkedSessionId ?? null,
-          linkedInvocationId: event.linkedInvocationId ?? null,
-          incomplete: event.incomplete === true,
-          ...(event.requestCountExact === false ? { requestCountExact: false as const } : {}),
-          ...(event.compactionEstimate ? { compactionEstimate: true as const } : {}),
-          ...(event.compactionUsage ? { compactionUsage: true as const } : {}),
-          ...(event.usageOrigin ? { usageOrigin: event.usageOrigin } : {}),
-          reportedCost: event.reportedCost === null ? null : 0,
-          usage: emptyUsage(),
-          requests: 0,
-        };
-        target.set(key, bucket);
-      }
-      addPricedUsage(bucket.usage, event.usage);
-      bucket.unclassifiedCacheWrite = (bucket.unclassifiedCacheWrite ?? 0) + (event.unclassifiedCacheWrite ?? 0);
-      if (!bucket.unclassifiedCacheWrite) {
-        delete bucket.unclassifiedCacheWrite;
-      }
-      addUsageWaits(bucket, event.waits);
-      addUsageTools(bucket, event);
-      bucket.requests += event.usage.requests ?? 1;
-      if (event.reportedCost !== null) {
-        bucket.reportedCost = (bucket.reportedCost ?? 0) + event.reportedCost;
-      }
-      if (bucketIsEmpty(bucket)) {
-        target.delete(key);
-      }
-    };
-    const addTo = (target: Map<string, ProjectUsageBucket>, event: UsageEvent) => {
-      for (const slice of usageBandEvents(event)) addSliceTo(target, slice);
-    };
-    // Track request order before bucket aggregation removes adjacency.
-    const ordered = reducer.recentCompactions
-      ? new CacheExpiryScan(cacheExpiry ?? undefined, () => reducer.nativeChildRequests?.() === true)
-      : null;
-    // Lifetime buckets include estimated compactions. Dated buckets contain recorded requests.
-    const add = (event: UsageEvent) => {
-      ordered?.push(event);
-      if (!event.compactionEstimate) {
-        addTo(byKey, event);
-      }
-      addTo(lifetimeByKey, event);
-    };
-    // A compaction that emits no usage event reaches the ordered pass after its line's events,
-    // and so does a revocation, which lowers the reducer's compaction count.
-    const signal = () => {
-      for (const item of reducer.takeCompactionSignals?.() ?? []) {
-        ordered?.signal(item);
-      }
-      const count = reducer.compactionCount?.();
-      if (typeof count === 'number') {
-        ordered?.compactionCount(count);
-      }
-    };
+    const spend = spendAccumulator(reducer, buckets, lifetimeBuckets, cacheExpiry);
+    const { add, signal } = spend;
     let position = scanOffset;
     // The bytes of an unfinished line, kept as separate pieces so that each byte is copied once
     // when the line ends or the slice stops. None of these bytes is a newline.
@@ -2153,7 +2180,7 @@ function readIncremental(
         classified = true;
         if (!repeat) {
           const events = reducer.pushLine(text, end);
-          for (const correction of reducer.takeCompactionRetractions?.() ?? []) ordered?.retractCompactions(correction);
+          for (const correction of reducer.takeCompactionRetractions?.() ?? []) spend.retract(correction);
           for (const event of events) {
             add(event);
           }
@@ -2212,17 +2239,13 @@ function readIncremental(
       trailing: held,
       scanOffset: position,
       complete,
-      buckets: [...byKey.values()].sort((left, right) =>
-        projectUsageKey(left, left.localDate).localeCompare(projectUsageKey(right, right.localDate)),
-      ),
-      lifetimeBuckets: [...lifetimeByKey.values()].sort((left, right) =>
-        projectUsageKey(left, left.localDate).localeCompare(projectUsageKey(right, right.localDate)),
-      ),
+      buckets: spend.buckets(),
+      lifetimeBuckets: spend.lifetimeBuckets(),
       turnCount: reducer.turnCount?.() ?? null,
       compactionCount: reducer.compactionCount?.() ?? null,
       firstTurnAt: reducer.firstTurnAt?.() ?? null,
       lastTurnAt: reducer.lastTurnAt?.() ?? null,
-      cacheExpiry: ordered ? ordered.ledger(reducer.recentCompactions!()) : null,
+      cacheExpiry: spend.ledger(),
       claudeRepeated: repeatedState,
       repeatedRevisionLost,
     };
@@ -2436,6 +2459,52 @@ export function indexSpendFile<State>(
     rebuilt: rebuilt || repeatedStateLost,
     found: true,
     complete: scanned.complete,
+  };
+}
+
+// Index a rollout whose complete records arrive in order, with no file to read them from. The record covers `size`
+// decoded bytes at the physical revision the caller names. Nothing resumes it, so it holds no unfinished bytes.
+export function createSpendLineScan<State>(
+  file: string,
+  workspace: string,
+  reducer: UsageLineReducer<State>,
+  now: () => number = Date.now,
+) {
+  const spend = spendAccumulator(reducer, [], [], null);
+  return {
+    pushLine(text: string, end: number): void {
+      const events = reducer.pushLine(text, end);
+      for (const correction of reducer.takeCompactionRetractions?.() ?? []) spend.retract(correction);
+      for (const event of events) spend.add(event);
+      spend.signal();
+    },
+    finish(revision: { size: number; mtimeMs: number; sourceIdentity: string }): SpendFileIndex {
+      const parserKind = reducer.parserKind;
+      return {
+        sourceIdentity: revision.sourceIdentity,
+        file: canonicalPath(file),
+        workspace: normalizeWorkspace(workspace),
+        size: revision.size,
+        mtimeMs: revision.mtimeMs,
+        offset: revision.size,
+        trailing: '',
+        buckets: spend.buckets(),
+        lifetimeBuckets: spend.lifetimeBuckets(),
+        turnCount: reducer.turnCount?.() ?? null,
+        compactionCount: reducer.compactionCount?.() ?? null,
+        firstTurnAt: reducer.firstTurnAt?.() ?? null,
+        lastTurnAt: reducer.lastTurnAt?.() ?? null,
+        newestTurnStartedAt: reducer.newestTurnStartedAt?.() ?? null,
+        outcome: reducer.newestTurnOutcome?.() ?? null,
+        cacheExpiry: spend.ledger(),
+        cacheExpiryChildPolicy: reducer.nativeChildRequests?.() === true,
+        parserGeneration: spendParserGeneration(parserKind),
+        ...(parserKind === undefined ? {} : { parserKind }),
+        indexedAt: now(),
+        parserState: reducer.snapshot(),
+        complete: true,
+      };
+    },
   };
 }
 

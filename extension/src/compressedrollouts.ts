@@ -358,19 +358,20 @@ export async function hashCompressedRollout(
   }
 }
 
-// Decode a whole compressed rollout into memory. One read of the file feeds the hash, the frame count and the decoder.
-// A decode that ends inside a frame answers its body with `complete` false.
-export async function decodeCompressedRollout(
+export type CompressedStreamRead =
+  | { kind: 'decoded'; hash: string; stat: FileRevision; frames: number; complete: boolean }
+  | { kind: 'unsupported' | 'failed' | 'stale' | 'missing' | 'cancelled' };
+
+// Decode a compressed rollout and pass each decoded chunk to `consume`. One read of the file feeds the hash, the frame
+// count and the decoder. A decode that ends inside a frame answers `complete` false. A consumer that throws
+// `BodyCapError` ends the read as `failed`.
+export async function streamCompressedRollout(
   file: string,
-  limits: CompressedBodyLimits = {},
-): Promise<CompressedBodyRead> {
+  consume: (chunk: Buffer) => void | Promise<void>,
+  limits: { signal?: AbortSignal } = {},
+): Promise<CompressedStreamRead> {
   const decoder = await announcedZstdDecoder(DECODER_WINDOW_LOG);
   if (!decoder) return { kind: 'unsupported' };
-  const cap = limits.bodyBytes ?? COMPRESSED_BODY_BYTES;
-  const builder = new BodyBuilder(
-    limits.reduceAbove ?? COMPRESSED_REDUCE_ABOVE,
-    limits.recordBytes ?? COMPRESSED_RECORD_BYTES,
-  );
   let handle: fs.promises.FileHandle;
   try {
     handle = await fs.promises.open(file, 'r');
@@ -380,7 +381,6 @@ export async function decodeCompressedRollout(
   }
   const hash = createHash('sha256');
   const frames = zstdFrames();
-  let decoded = 0;
   try {
     const stat = revisionOf(await handle.stat({ bigint: true }));
     await pipeline(
@@ -394,30 +394,12 @@ export async function decodeCompressedRollout(
       },
       decoder,
       async (chunks: AsyncIterable<Buffer>) => {
-        for await (const chunk of chunks) {
-          decoded += chunk.length;
-          if (decoded > cap) throw new BodyCapError();
-          builder.push(chunk);
-        }
+        for await (const chunk of chunks) await consume(chunk);
       },
       { signal: limits.signal ?? new AbortController().signal },
     );
-    builder.finish();
     if (!sameStat(stat, revisionOf(await handle.stat({ bigint: true })))) return { kind: 'stale' };
-    return {
-      kind: 'body',
-      body: {
-        file,
-        hash: hash.digest('hex'),
-        stat,
-        chunks: builder.chunks,
-        length: builder.length,
-        frames: frames.count(),
-        complete: frames.complete(),
-        skippedRecords: builder.skippedRecords,
-        undercount: builder.undercount,
-      },
-    };
+    return { kind: 'decoded', hash: hash.digest('hex'), stat, frames: frames.count(), complete: frames.complete() };
   } catch (error) {
     if (limits.signal?.aborted) return { kind: 'cancelled' };
     if (error instanceof BodyCapError) return { kind: 'failed' };
@@ -427,6 +409,44 @@ export async function decodeCompressedRollout(
   } finally {
     await handle.close().catch(() => undefined);
   }
+}
+
+// Decode a whole compressed rollout into memory.
+export async function decodeCompressedRollout(
+  file: string,
+  limits: CompressedBodyLimits = {},
+): Promise<CompressedBodyRead> {
+  const cap = limits.bodyBytes ?? COMPRESSED_BODY_BYTES;
+  const builder = new BodyBuilder(
+    limits.reduceAbove ?? COMPRESSED_REDUCE_ABOVE,
+    limits.recordBytes ?? COMPRESSED_RECORD_BYTES,
+  );
+  let decoded = 0;
+  const read = await streamCompressedRollout(
+    file,
+    (chunk) => {
+      decoded += chunk.length;
+      if (decoded > cap) throw new BodyCapError();
+      builder.push(chunk);
+    },
+    limits,
+  );
+  if (read.kind !== 'decoded') return read;
+  builder.finish();
+  return {
+    kind: 'body',
+    body: {
+      file,
+      hash: read.hash,
+      stat: read.stat,
+      chunks: builder.chunks,
+      length: builder.length,
+      frames: read.frames,
+      complete: read.complete,
+      skippedRecords: builder.skippedRecords,
+      undercount: builder.undercount,
+    },
+  };
 }
 
 // Copy `length` bytes at `start` out of a body, or null when the range passes its end.

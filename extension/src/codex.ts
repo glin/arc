@@ -1308,7 +1308,11 @@ export function readCodexSessionTitlePair(
   file: string,
   bytes = CODEX_TITLE_BYTES,
 ): { short: string | null; full: string | null } {
-  const lines = headLines(file, bytes);
+  return codexTitlePairOfLines(headLines(file, bytes));
+}
+
+// The session name that the first prompt of these opening lines gives.
+export function codexTitlePairOfLines(lines: readonly string[]): { short: string | null; full: string | null } {
   const opening = lines.length ? parseRecord(lines[0]) : null;
   const agentPath = opening?.kind === 'session_meta' ? codexAgentPath(opening.payload) : null;
   for (const line of lines) {
@@ -3634,7 +3638,7 @@ function subagentNotification(record: Entry): { id: string; status: ChildTermina
   return null;
 }
 
-function codexOutcomeIn(lines: string[], agentPath: string | null): TurnOutcome | null {
+export function codexOutcomeIn(lines: string[], agentPath: string | null): TurnOutcome | null {
   let current: (TurnOutcome & { worthDrawing: boolean }) | null = null;
   let latestDrawable: TurnOutcome | null = null;
   const pendingExec = new Set<string>();
@@ -6110,7 +6114,7 @@ function codexBoundaryState(lines: readonly string[], agentPath: string | null):
   return state;
 }
 
-function turnStartsIn(lines: string[], agentPath: string | null): number[] {
+export function codexTurnStartsIn(lines: string[], agentPath: string | null): number[] {
   const starts: number[] = [];
   // Hold the start until visible work arrives. Keep an unclosed start at the window's end.
   let open: number | null = null;
@@ -6151,7 +6155,7 @@ function turnStartsIn(lines: string[], agentPath: string | null): number[] {
 
 export function readCodexTurnStarts(file: string, bytes = TURN_START_BYTES): TurnStarts {
   const agentPath = readCodexSessionMeta(file)?.agentPath ?? null;
-  return readTurnStartsFromTail(file, (lines) => ({ starts: turnStartsIn(lines, agentPath) }), bytes);
+  return readTurnStartsFromTail(file, (lines) => ({ starts: codexTurnStartsIn(lines, agentPath) }), bytes);
 }
 
 export interface CodexReadOptions extends ReadOptions {
@@ -6178,7 +6182,7 @@ export function readCodexSession(file: string, sessionId: string, opts: CodexRea
     opts.prepareNewestTurnDiscovery &&
     !tail.whole &&
     tail.cursor &&
-    turnStartsIn(tail.lines, meta?.agentPath ?? null).length === 0
+    codexTurnStartsIn(tail.lines, meta?.agentPath ?? null).length === 0
   ) {
     read.newestTurnCursor = tail.cursor;
     read.newestTurnState = codexBoundaryState(tail.lines, meta?.agentPath ?? null);

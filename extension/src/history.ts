@@ -99,7 +99,7 @@ export interface ForwardRecoveryControl {
 
 export class ForwardRecoveryLimit extends Error {}
 
-function* frameRecovery<State>(
+export function* frameRecovery<State>(
   reducer: ForwardSessionReducer<State>,
   body: Buffer,
   baseOffset: number,
