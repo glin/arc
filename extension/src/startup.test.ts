@@ -303,7 +303,7 @@ import { emptyTrail, renamePlace, visitPlace } from './turnplaces';
 import { adoptLabelSession, labelsOf } from './turnlabels';
 import { isSearch, searchScope, searchScopeName, searchTurns } from './turnsearch.ts';
 import { dispatchPanelToHost, parsePanelToHost } from './webview/protocol.ts';
-import { createSelectionPaint } from './webview/panel.ts';
+import { createSelectionPaint } from './webview/selection-paint.ts';
 import {
   BoundedTrailingScheduler,
   IntegrityScheduler,

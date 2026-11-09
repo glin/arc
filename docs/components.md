@@ -26,6 +26,7 @@ Paths are relative to `extension/src/`. [Architecture](architecture.md) owns pac
 | `tones.ts` | Measures text contrast against backgrounds and color differences between status tones in panel.css | no |
 | `webview/panel.css` | Panel styles served into the webview | not TypeScript |
 | `webview/panel.ts` | Typed page-lifetime owner composition, cross-owner coordination, exhaustive host-message dispatch, and production message boundary | no |
+| `webview/selection-paint.ts` | Selection timing in the panel: the receipt and settled paint stamps of the selected session's render, one reply to the host per selection, and the abandonment reasons | no |
 | `webview/payload-contracts.ts` | Complete browser-safe card and session list-row contracts shared by protocol parsing and renderers | no |
 | `webview/card.ts` | Preact turn-card renderer, card-local disclosures and Activity filters, actions, clock updates, and read and comment subscriptions | no |
 | `webview/card-rows.ts` | Shared Preact file, child-session, and commit rows for card sections and chip popovers, with scoped records and repository and branch grouping | no |

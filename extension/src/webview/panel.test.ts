@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'vitest';
 import * as ts from 'typescript';
-import { createSelectionPaint } from './panel.ts';
+import { createSelectionPaint } from './selection-paint.ts';
 import type { PanelToHost } from './protocol.ts';
 
 type PaintMessage = Extract<PanelToHost, { type: 'selectionPainted' }>;
@@ -97,8 +97,8 @@ test('an unrelated render of the same session preserves the first receipt and pe
 });
 
 test('the selection paint assertion fails when the production paint post is removed', () => {
-  const source = readFileSync(new URL('./panel.ts', import.meta.url), 'utf8');
-  const file = ts.createSourceFile('panel.ts', source, ts.ScriptTarget.Latest, true);
+  const source = readFileSync(new URL('./selection-paint.ts', import.meta.url), 'utf8');
+  const file = ts.createSourceFile('selection-paint.ts', source, ts.ScriptTarget.Latest, true);
   const declaration = file.statements.find(
     (node) => ts.isFunctionDeclaration(node) && node.name?.text === 'createSelectionPaint',
   );
