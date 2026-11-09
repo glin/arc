@@ -24,15 +24,8 @@ const COUNTER_PREFIXES = [
   'cachedLinks:',
   'watcher:grownMemberMiss:',
 ];
-// These counters report in every step, so a renamed one fails as a missing report.
-const ALWAYS_REPORTED = [
-  'readBytes',
-  'receiptScanOpensAfterCompletion',
-  'dispatchSpendVisits',
-  'catalogWalk',
-  'cachedLinks:published',
-  'refreshCount:catalog-enumeration',
-];
+// Bytes depend on the platform's path separators, so these counters may fall below budget without a change in the work.
+const ONE_SIDED = new Set(['readBytes']);
 
 type Counts = Record<string, number>;
 interface BudgetRow {
@@ -98,32 +91,44 @@ function counts(counters: { snapshot(): any }): Counts {
     if (name === 'catalog-enumeration' || name.startsWith('catalog-enumeration:'))
       row[`refreshCount:${name}`] = entry.count;
   for (const name of ['readBytes', 'receiptScanOpensAfterCompletion', 'dispatchSpendVisits'])
-    row[name] = snapshot.discovery[name];
+    if (snapshot.discovery[name] !== undefined) row[name] = snapshot.discovery[name];
   return row;
 }
 
 function difference(after: Counts, before: Counts): Counts {
   const row: Counts = {};
-  for (const name of new Set([...Object.keys(after), ...ALWAYS_REPORTED])) {
-    const value = (after[name] ?? 0) - (before[name] ?? 0);
-    if (value !== 0 || ALWAYS_REPORTED.includes(name) || name.startsWith('openingsRead:')) row[name] = value;
-  }
+  for (const name of new Set([...Object.keys(after), ...Object.keys(before)]))
+    row[name] = (after[name] ?? 0) - (before[name] ?? 0);
   return row;
 }
 
-// Names each counter of each step that exceeds its row, and each counter with no row.
-function overBudget(measured: Record<string, Counts>, rows: Record<string, BudgetRow>): string[] {
+// Names each counter that differs from its row, each nonzero counter with no row, and each row that no step measures. A
+// counter with no record in one step reads 0, so a row of 0 needs that counter reported by some other step.
+function outsideBudget(measured: Record<string, Counts>, rows: Record<string, BudgetRow>): string[] {
   const failures: string[] = [];
+  const reported = new Set(Object.values(measured).flatMap((row) => Object.keys(row)));
+  for (const [key, budget] of Object.entries(rows)) {
+    const [step, counter] = key.split(' | ');
+    if (measured[step]?.[counter] !== undefined || (budget.budget === 0 && reported.has(counter))) continue;
+    failures.push(
+      `Step "${step}", counter ${counter}: not measured, recorded budget ${budget.budget}. The step or the counter was renamed or removed. Rename the row in scripts/test-budget.json with the code, or find the cause.`,
+    );
+  }
   for (const [step, row] of Object.entries(measured)) {
     for (const [counter, count] of Object.entries(row)) {
       const budget = rows[`${step} | ${counter}`];
-      if (!budget)
+      if (!budget) {
+        if (count !== 0)
+          failures.push(
+            `Step "${step}", counter ${counter}: measured ${count}, with no budget row. If the work is intended, add a row to scripts/test-budget.json with a reason.`,
+          );
+        continue;
+      }
+      const high = count > budget.budget + budget.margin;
+      const low = !ONE_SIDED.has(counter) && count < budget.budget - budget.margin;
+      if (high || low)
         failures.push(
-          `Step "${step}", counter ${counter}: measured ${count}, with no budget row. If the work is intended, add a row to scripts/test-budget.json with a reason.`,
-        );
-      else if (count > budget.budget + budget.margin)
-        failures.push(
-          `Step "${step}", counter ${counter}: measured ${count}, recorded budget ${budget.budget} with margin ${budget.margin}. If the change is intended, update the row in scripts/test-budget.json with a reason.`,
+          `Step "${step}", counter ${counter}: measured ${count}, recorded budget ${budget.budget} with margin ${budget.margin}. The count ${high ? 'rose' : 'fell'}. If the change is intended, ${high ? 'raise' : 'lower'} the row in scripts/test-budget.json with a reason.`,
         );
     }
   }
@@ -281,6 +286,6 @@ test('each step of the session list script stays within its recorded counts', { 
     interval.mockRestore();
     vi.useRealTimers();
   }
-  const failures = overBudget(measured, JSON.parse(fs.readFileSync(BUDGET_FILE, 'utf8')).rows);
+  const failures = outsideBudget(measured, JSON.parse(fs.readFileSync(BUDGET_FILE, 'utf8')).rows);
   assert.equal(failures.length, 0, failures.join('\n'));
 });
