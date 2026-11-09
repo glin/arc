@@ -1,7 +1,7 @@
 import assert from 'node:assert';
 import { test } from 'vitest';
 import { PromptEntry } from './agentwire.ts';
-import { CommandCatalogs } from './commandcatalog.ts';
+import { CommandCatalogs, commandSources } from './commandcatalog.ts';
 
 const native: PromptEntry = {
   kind: 'command',
@@ -111,5 +111,71 @@ test('a complete command catalog can remove the last skill', () => {
   assert.deepEqual(
     published?.codex.map((entry) => entry.name),
     ['compact'],
+  );
+});
+
+test('a read-only child reports a shorter list without replacing the skills on the commands or ready event', () => {
+  const full = [native, skill('close-session'), skill('deep-research')];
+  const narrow = [native, skill('deep-research')];
+  const policies: Record<string, unknown> = { readonly: { readOnly: true, readTools: [] } };
+  const policyOf = (key: string) => policies[key];
+  const states = [
+    { agent: 'claude', key: 'ordinary', usageSource: 1, sessionId: 'a', commands: full },
+    { agent: 'claude', key: 'readonly', usageSource: 2, sessionId: 'b', commands: narrow },
+  ];
+  const sources = commandSources(states, policyOf);
+  const names = (catalogs: CommandCatalogs) => catalogs.current().claude?.map((entry) => entry.name);
+  assert.deepEqual(
+    sources.map((source) => source.restricted),
+    [false, true],
+  );
+
+  const catalogs = new CommandCatalogs();
+  catalogs.publish(sources, { ...sources[0], complete: true });
+  assert.deepEqual(names(catalogs), ['compact', 'close-session', 'deep-research']);
+  const revision = catalogs.revision('claude');
+  // The commands event, then the ready event, of the read-only child.
+  catalogs.publish(sources, { ...sources[1], complete: true });
+  catalogs.publish(sources, { ...sources[1], complete: false });
+  assert.deepEqual(names(catalogs), ['compact', 'close-session', 'deep-research']);
+  assert.equal(catalogs.revision('claude'), revision, 'a restricted update must not supersede an idle read');
+  assert.ok(catalogs.publish(sources, { agent: 'claude', commands: narrow, complete: false }, revision));
+
+  // An ordinary child still replaces the list, so the list stays last-writer-wins.
+  const later = new CommandCatalogs();
+  later.publish(sources, { ...sources[1], complete: true });
+  later.publish(sources, { ...sources[0], complete: true });
+  assert.deepEqual(names(later), ['compact', 'close-session', 'deep-research']);
+  later.publish(sources, { ...sources[0], commands: [native], complete: true });
+  assert.deepEqual(names(later), ['compact']);
+});
+
+test('a read-only child as the only live child leaves the idle read to seed the provider list', () => {
+  const full = [native, skill('close-session'), skill('deep-research')];
+  const narrow = [native, skill('deep-research')];
+  const policyOf = (key: string) => (key === 'readonly' ? { readOnly: true, readTools: [] } : undefined);
+  const readOnly = { agent: 'claude', key: 'readonly', usageSource: 2, sessionId: 'b', commands: narrow };
+  const ordinary = { agent: 'claude', key: 'ordinary', usageSource: 1, sessionId: 'a', commands: full };
+  const sources = commandSources([readOnly], policyOf);
+
+  // The fallback loop does not seed the list from the restricted child, and neither does its update.
+  const catalogs = new CommandCatalogs();
+  catalogs.publish(sources);
+  catalogs.publish(sources, { ...sources[0], complete: true });
+  assert.equal(catalogs.current().claude, undefined);
+
+  // The idle read then answers and seeds the list.
+  const revision = catalogs.revision('claude');
+  const seeded = catalogs.publish(sources, { agent: 'claude', commands: full, complete: false }, revision);
+  assert.deepEqual(
+    seeded?.claude.map((entry) => entry.name),
+    ['compact', 'close-session', 'deep-research'],
+  );
+
+  // An ordinary sibling still seeds the list through the fallback loop.
+  const fresh = new CommandCatalogs();
+  assert.deepEqual(
+    fresh.publish(commandSources([readOnly, ordinary], policyOf))?.claude.map((entry) => entry.name),
+    ['compact', 'close-session', 'deep-research'],
   );
 });

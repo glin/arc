@@ -80,7 +80,7 @@ import {
   openDraftMcp,
 } from './agenthost';
 import { McpServer } from './agentwire';
-import { CommandCatalogs, CommandCatalogUpdate } from './commandcatalog';
+import { CommandCatalogs, CommandCatalogUpdate, commandSources } from './commandcatalog';
 import { validateResolvedPromptAssets } from './promptassets';
 import {
   claudeLaunch,
@@ -1051,8 +1051,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   panel.setSkills(skillLists);
   // Track agents already asked for commands, including unavailable agents and empty answers. Avoid starting another catalog child on every panel view.
   const commandsAsked = new Set<string>();
+  // A child under a launch policy never changes the provider's list. The Claude read-only launch adds `--setting-sources ""` and narrows its list, and Codex follows the same rule so one rule covers both providers.
+  const childPolicy = (key: string) => host.get(key)?.policy;
   const publishCommands = (said?: CommandCatalogUpdate, expectedRevision?: number) => {
-    const next = commandLists.publish(host.states(), said, expectedRevision);
+    const next = commandLists.publish(commandSources(host.states(), childPolicy), said, expectedRevision);
     if (next) {
       panel.setCommands(next, commandLists.childCommands(host.states(), draftMcpKeys));
     }
@@ -1574,8 +1576,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           return;
         }
         const liveSources = live.map((state) => host.get(state.key)!.usageSource);
-        const eligibleIdle = live
-          .filter((state) => !state.busy && usage.canDiscover(agent, host.get(state.key)!.usageSource, liveSources))
+        const idleCandidates = live.filter(
+          (state) => !state.busy && usage.canDiscover(agent, host.get(state.key)!.usageSource, liveSources),
+        );
+        // A restricted child cannot stand in for the idle read that seeds the provider list, so a commands request leaves it out.
+        const eligibleIdle = idleCandidates
+          .filter((state) => !wantCommands || host.get(state.key)?.policy === undefined)
           .sort((left, right) =>
             agent === 'codex' ? host.get(right.key)!.usageSource - host.get(left.key)!.usageSource : 0,
           );
@@ -1618,6 +1624,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             }
             return;
           }
+          // The session's own MCP status stays with its idle live child when the idle read supplies the commands. An idle child would load the reader's full MCP configuration, and a restricted child does not.
+          const mcpStaysLive = Boolean(wantMcp && resolvedMcpOwner && mcpLive && idleCandidates.includes(mcpLive));
+          if (mcpStaysLive) {
+            void readMcpFrom(mcpLive!.key, resolvedMcpOwner);
+          }
           if (!wantUsage && !wantModels && !wantCommands && wantMcp && resolvedMcpOwner) {
             const revision = mcp.beginInitialRead(resolvedMcpOwner, requestedMcpRevision);
             if (revision !== null) {
@@ -1638,7 +1649,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
               operation,
             );
             commandsAsked.add(agent);
-            if (resolvedMcpOwner) {
+            if (resolvedMcpOwner && !mcpStaysLive) {
               const revision = mcp.beginInitialRead(resolvedMcpOwner, requestedMcpRevision);
               if (revision !== null) {
                 mcp.noteSilent(resolvedMcpOwner, revision);
@@ -1650,7 +1661,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             return;
           }
           initialMcpRevision =
-            wantMcp && resolvedMcpOwner ? mcp.beginInitialRead(resolvedMcpOwner, requestedMcpRevision) : null;
+            wantMcp && resolvedMcpOwner && !mcpStaysLive
+              ? mcp.beginInitialRead(resolvedMcpOwner, requestedMcpRevision)
+              : null;
           const commandRevision = commandLists.revision(agent);
           if (!usageReads.current(agent, attempt)) return;
           let source = 0;

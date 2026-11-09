@@ -8474,13 +8474,18 @@ const SOME_SERVERS: McpServer[] = [
   },
 ];
 
-function idleMcpDiscovery(agent: 'claude' | 'codex', cwd: string) {
+function idleMcpDiscovery(
+  agent: 'claude' | 'codex',
+  cwd: string,
+  liveChildren: Array<{ key: string; sessionId: string; restricted?: boolean }> = [],
+) {
   const source = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
   const mcp = new McpBook();
   const usageReads = new UsageReadQueue();
   const children: FakeChild[] = [];
   const directories: string[] = [];
   const publications: string[] = [];
+  const reads: string[] = [];
   const models = new ModelBook();
   let releaseModels!: (models: ModelList) => void;
   const catalog = new Promise<ModelList>((resolve) => {
@@ -8504,7 +8509,21 @@ function idleMcpDiscovery(agent: 'claude' | 'codex', cwd: string) {
     publishPicks: () => publications.push('models'),
     publishCommands: () => publications.push('commands'),
     publishMcp: () => publications.push('MCP'),
-    host: { states: () => [], retireSession: () => Promise.resolve() },
+    host: {
+      states: () =>
+        liveChildren.map((child) => ({
+          agent,
+          key: child.key,
+          sessionId: child.sessionId,
+          exited: false,
+          busy: false,
+        })),
+      get: (key: string) => {
+        const index = liveChildren.findIndex((child) => child.key === key);
+        return { usageSource: index + 1, policy: liveChildren[index]?.restricted ? { readOnly: true } : undefined };
+      },
+      retireSession: () => Promise.resolve(),
+    },
     draftMcpKeys: new Map<string, string>(),
     acceptedDrafts: new Set<string>(),
     mcpRefreshes: new McpPendingRefreshes(),
@@ -8541,8 +8560,12 @@ function idleMcpDiscovery(agent: 'claude' | 'codex', cwd: string) {
       children.push(child);
       return child;
     },
-    readMcpFrom: async () => {},
-    readFrom: async () => {},
+    readMcpFrom: async (key: string, owner?: string) => {
+      reads.push(`MCP ${key} for ${owner}`);
+    },
+    readFrom: async (key: string) => {
+      reads.push(`usage ${key}`);
+    },
     refreshUsage: vi.fn<(agent: string, force: boolean, owner: string, ownerAgent: string, cwd: string) => void>(),
     panel: {} as Record<string, (...args: unknown[]) => void>,
   };
@@ -8577,6 +8600,7 @@ function idleMcpDiscovery(agent: 'claude' | 'codex', cwd: string) {
     children,
     directories,
     publications,
+    reads,
     releaseModels: () => releaseModels(A_MODEL_LIST),
     holdServers: () => {
       serverAnswer = new Promise((resolve) => {
@@ -8586,6 +8610,49 @@ function idleMcpDiscovery(agent: 'claude' | 'codex', cwd: string) {
     releaseServers: (servers: McpServer[] | null) => releaseServers(servers),
   };
 }
+
+test('a restricted session that is the only live child keeps its own MCP status while the idle read seeds the commands', async () => {
+  const fixture = idleMcpDiscovery('claude', 'D:/Work/Owner-A', [
+    { key: 'read-only', sessionId: 'owner-a', restricted: true },
+  ]);
+  fixture.releaseModels();
+  await fixture.askAgent('claude', false, 'owner-a', 'D:/Work/Owner-A');
+  assert.deepEqual(
+    fixture.reads,
+    ['MCP read-only for owner-a'],
+    'the restricted session lost its MCP read or its usage read moved',
+  );
+  assert.deepEqual(
+    fixture.directories,
+    ['D:/Work/Owner-A'],
+    'the idle read did not supply the commands, or an idle child also read MCP',
+  );
+  assert.ok(fixture.publications.includes('commands'));
+  assert.equal(
+    fixture.mcp.revision('owner-a'),
+    0,
+    'the idle read began an initial MCP read and made the live answer obsolete',
+  );
+  assert.equal(fixture.mcp.needsInitialRead('owner-a'), true);
+  assert.equal(fixture.commandsAsked.has('claude'), true);
+});
+
+test('an ordinary idle sibling supplies the commands and a restricted session keeps its own MCP status', async () => {
+  const fixture = idleMcpDiscovery('claude', 'D:/Work/Owner-A', [
+    { key: 'read-only', sessionId: 'owner-a', restricted: true },
+    { key: 'ordinary', sessionId: 'other' },
+  ]);
+  await fixture.askAgent('claude', false, 'owner-a', 'D:/Work/Owner-A');
+  assert.deepEqual(fixture.reads, ['MCP read-only for owner-a', 'usage ordinary']);
+  assert.deepEqual(fixture.directories, [], 'an idle child started although an ordinary live child could read');
+});
+
+test('an ordinary session that is the only live child still reads everything itself', async () => {
+  const fixture = idleMcpDiscovery('claude', 'D:/Work/Owner-A', [{ key: 'ordinary', sessionId: 'owner-a' }]);
+  await fixture.askAgent('claude', false, 'owner-a', 'D:/Work/Owner-A');
+  assert.deepEqual(fixture.reads, ['MCP ordinary for owner-a', 'usage ordinary']);
+  assert.deepEqual(fixture.directories, []);
+});
 
 for (const agent of ['claude', 'codex'] as const) {
   for (const next of ['owner-b', 'draft-new']) {

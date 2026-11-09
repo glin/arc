@@ -7,6 +7,8 @@ export interface CommandCatalogSource {
   usageSource?: number;
   sessionId?: string | null;
   exited?: boolean;
+  // A child launched under a launch policy. It never changes the provider list. A Claude read-only launch adds `--setting-sources ""`, which narrows that child's list to the built-in skills. A Codex policy child reports an unnarrowed list, and the same rule applies so one rule covers both providers.
+  restricted?: boolean;
 }
 
 export interface CommandCatalogUpdate extends CommandCatalogSource {
@@ -44,7 +46,19 @@ function sameCatalogs(
   );
 }
 
-// Ordinary provider lists survive child retirement. Supplied entries retain their child generation.
+export function isRestrictedChild(policy: unknown): boolean {
+  return policy !== undefined;
+}
+
+// Marks each live child that runs under a launch policy. `policyOf` returns a child's policy by key.
+export function commandSources<S extends { key: string }>(
+  states: readonly S[],
+  policyOf: (key: string) => unknown,
+): (S & { restricted: boolean })[] {
+  return states.map((state) => ({ ...state, restricted: isRestrictedChild(policyOf(state.key)) }));
+}
+
+// Ordinary provider lists survive child retirement. A restricted child never writes or seeds a provider list. Supplied entries retain their child generation.
 // A captured revision lets a live update invalidate an older idle read.
 export class CommandCatalogs {
   private lists: Record<string, PromptEntry[]> = {};
@@ -109,12 +123,14 @@ export class CommandCatalogs {
         childChanged = true;
       }
     }
-    if (update && !update.optionalOnly && (update.complete || update.commands.length > 0)) {
+    const restricted =
+      update?.key !== undefined && sources.some((source) => source.key === update.key && source.restricted);
+    if (update && !restricted && !update.optionalOnly && (update.complete || update.commands.length > 0)) {
       next[update.agent] = update.commands.filter((entry) => !entry.sessionSkillRelease).map((entry) => ({ ...entry }));
       this.revisions.set(update.agent, this.revision(update.agent) + 1);
     }
     for (const source of sources) {
-      if (!(source.agent in next) && source.commands.length > 0) {
+      if (!source.restricted && !(source.agent in next) && source.commands.length > 0) {
         next[source.agent] = source.commands
           .filter((entry) => !entry.sessionSkillRelease)
           .map((entry) => ({ ...entry }));
