@@ -38,7 +38,9 @@ import { sessionSourceKey, sessionPageSources, guardedSourceRevision } from './s
 import { afterAll, afterEach, beforeAll, test, vi } from 'vitest';
 import { pendingResponseSessionAdmitted, resolveResponseSession } from './domain/session-link';
 import { createPanelVisibility } from './panelvisibility';
-import { outcomesFor } from './timelinestate';
+import { liveTimelineChildren, outcomesFor, timelineRailState } from './timelinestate';
+import { runningSessionsSince } from './composerview';
+import { newestPerSession } from './turnread';
 import { claudeRelationshipKey, selectedDependencies } from './selectedsource';
 import {
   projectSlug,
@@ -6705,6 +6707,55 @@ test('a selected-only refresh before the catalog keeps every held title, and the
   await scoped;
   assert.ok(provider.authoritativeCatalog, 'the new scope refresh did not set the authoritative catalog');
   assert.deepEqual(heldFiles(provider.titles), [selected.file], 'the new scope kept titles outside it');
+});
+
+test('a refresh shares one live child derivation across cards and session list status', async () => {
+  const provider = completeDiscoveryHarness(
+    undefined,
+    false,
+    ['liveOpenChildren', 'railStatuses', 'drawTurnCards', 'childExpiryCosts'],
+    { liveTimelineChildren, timelineRailState, runningSessionsSince, newestPerSession },
+  );
+  const now = 100_000;
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+  try {
+    const row = { id: 'parent', agentKey: 'claude' };
+    const outcome = { startedAt: now - 100, endedAt: now, finished: true, openChildren: ['child'] };
+    provider.partial = [{ file: 'parent.jsonl', sessionId: 'parent', agent: 'claude', activity: now }];
+    provider.showing = 'parent';
+    provider.sessionRows = [row];
+    provider.outcomesFor = () => new Map([['parent', outcome]]);
+    provider.exitedSinceKeys = new Map();
+    provider.claudeChildReferences = [];
+    provider.claudeChildStatWrites = new Map();
+    provider.claudeChildren = [{ parentSessionId: 'parent', sessionId: 'child', file: 'child.jsonl', mtimeMs: now }];
+    provider.runningSessions = () => new Set();
+    provider.waitingSessions = () => new Set();
+    provider.heldLifetime.cacheExpiryFacts = { parent: { childSources: ['child'] } };
+    provider.childCacheExpiryAttribution = { read: () => new Map() };
+    const observations: unknown[] = [];
+    provider.collect = (_sessions: unknown, at: number, children: Map<string, string[]>) => {
+      observations.push([at, [...children]]);
+      return provider.drawTurnCards([], () => '', at, [], children);
+    };
+    const work: string[] = [];
+    provider.performanceCounters.recordWork = (name: string) => work.push(name);
+    for (const selectedOnly of [false, true]) {
+      work.length = 0;
+      await provider.refresh(true, true, true, selectedOnly);
+      assert.equal(work.filter((name) => name === 'liveOpenChildren').length, 1);
+      assert.deepEqual(observations.at(-1), [now, [['parent', ['child']]]]);
+    }
+    const outcomes = provider.sessionOutcomes;
+    provider.exitedSinceKeys.set('claude:parent', now);
+    assert.deepEqual([...provider.liveOpenChildren(now, outcomes, [row])], []);
+    const otherRows = provider.liveOpenChildren(now, outcomes, []);
+    assert.deepEqual([...otherRows], [['parent', ['child']]]);
+    assert.deepEqual([...provider.liveOpenChildren(now + TURN_QUIET_MS + 1, outcomes, [])], []);
+    assert.deepEqual([...otherRows], [['parent', ['child']]]);
+  } finally {
+    clock.mockRestore();
+  }
 });
 
 // A selection changes the rows of the session it leaves and the session it enters. Its refresh checks the prompt sources

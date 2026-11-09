@@ -11035,6 +11035,7 @@ export class PanelProvider implements vscode.Disposable {
       ];
       // Reconcile expired compaction activity before deciding whether to render. Removed activity requires an update.
       const swept = this.dropSpentPresses();
+      const liveChildren = this.liveOpenChildren(now);
       if (
         !swept &&
         !refreshWanted({
@@ -11047,7 +11048,7 @@ export class PanelProvider implements vscode.Disposable {
           dispatchFiguresMoved: this.dispatchFiguresRevision !== this.drawnDispatchFiguresRevision,
           openChildren: {
             drawn: this.drawnOpenChildren,
-            now: openChildrenKey(this.liveOpenChildren(now), this.liveBackgroundCommands(now)),
+            now: openChildrenKey(liveChildren, this.liveBackgroundCommands(now)),
           },
         })
       ) {
@@ -11075,7 +11076,11 @@ export class PanelProvider implements vscode.Disposable {
       const metadataRevision = this.metadataRevision ?? 0;
       const figuresRevision = this.dispatchFiguresRevision;
       this.evictCache(sessions, all);
-      this.cards = this.collect(sessions.filter((session) => this.cache.has(session.file)));
+      this.cards = this.collect(
+        sessions.filter((session) => this.cache.has(session.file)),
+        now,
+        liveChildren,
+      );
       // An accepted selected window can replace a live prompt with its recorded turn here.
       this.dropSpentPresses();
       const gained = agentsWithNewTurns(this.seenTurns, this.turnMarks);
@@ -11159,8 +11164,8 @@ export class PanelProvider implements vscode.Disposable {
         }
       }
       this.metadataRailRevisions = railRevisions;
-      const railNow = Date.now();
-      const { statuses, openChildren } = this.railStatuses(railNow);
+      const railNow = now;
+      const { statuses, openChildren } = this.railStatuses(railNow, undefined, liveChildren);
       const railInput = this.railInputFor(counts, statuses, openChildren, railNow);
       const railKey = railInputKey(railInput);
       const railPending = this.lifetimeFigures.answers();
@@ -11843,6 +11848,7 @@ export class PanelProvider implements vscode.Disposable {
   private railStatuses(
     now: number,
     session?: string,
+    children?: ReadonlyMap<string, readonly string[]>,
   ): {
     statuses: ReturnType<typeof sessionStatusOf>;
     openChildren: Map<string, number>;
@@ -11852,7 +11858,7 @@ export class PanelProvider implements vscode.Disposable {
     const rows = session === undefined ? this.sessionRows : this.sessionRows.filter((row) => row.id === session);
     return timelineRailState(
       outcomes,
-      this.liveOpenChildren(now, outcomes, rows),
+      children ?? this.liveOpenChildren(now, outcomes, rows),
       session === undefined ? this.runningSessions() : runningSessions(rows, [...this.running]),
       session === undefined
         ? this.waitingSessions()
@@ -12221,12 +12227,14 @@ export class PanelProvider implements vscode.Disposable {
     turns: readonly Turn[],
     facts: LifetimeFigures['cacheExpiryFacts'],
     now: number,
+    liveChildren?: ReadonlyMap<string, readonly string[]>,
   ): Map<string, ChildExpiryCost> {
     this.performanceCounters?.recordWork('childExpiryCosts');
     if (!Object.values(facts).some((fact) => fact.childSources?.length)) return new Map();
     const unique = new Map(turns.map((turn) => [turnKey(turn), turn]));
     const ongoing = new Set(this.runningSessions());
-    for (const [sessionId, children] of this.liveOpenChildren(now)) if (children.length) ongoing.add(sessionId);
+    for (const [sessionId, children] of liveChildren ?? this.liveOpenChildren(now))
+      if (children.length) ongoing.add(sessionId);
     return (this.childCacheExpiryAttribution ??= new ChildCacheExpiryAttribution()).read(
       [...unique.values()],
       facts,
@@ -17066,7 +17074,11 @@ export class PanelProvider implements vscode.Disposable {
     }
   }
 
-  private collect(sessions: SessionFile[]): RenderCard[] {
+  private collect(
+    sessions: SessionFile[],
+    clock?: number,
+    liveChildren?: ReadonlyMap<string, readonly string[]>,
+  ): RenderCard[] {
     // Rebuild card-to-turn references from the current selected windows.
     this.turnsByKey.clear();
     const ordinary = { maxTurns: TRANSCRIPT_TURN_LIMIT, tailBytes: TRANSCRIPT_TAIL_BYTES };
@@ -17187,12 +17199,12 @@ export class PanelProvider implements vscode.Disposable {
       }),
     );
 
-    const now = Date.now();
+    const now = clock ?? Date.now();
     // Retain the rendering clock for later status-change comparisons.
     this.collectedAt = now;
     // Use filenames for workspace files and full paths for files outside the open folders.
     const folders = this.folders();
-    const cards = this.drawTurnCards(listed, titleOf, now, folders);
+    const cards = this.drawTurnCards(listed, titleOf, now, folders, liveChildren);
     this.compactionsByCard = new Map();
     // Omit compactions older than every displayed turn. Find the minimum timestamp because the budgeted list is not globally sorted.
     const oldest = listed.length ? listed.reduce((low, t) => Math.min(low, t.startedAt), Infinity) : 0;
@@ -17213,13 +17225,13 @@ export class PanelProvider implements vscode.Disposable {
     titleOf: (sessionId: string) => string,
     now: number,
     folders: string[],
+    liveChildren: ReadonlyMap<string, readonly string[]> = this.liveOpenChildren(now),
   ): (RenderCard & { at: number; turnId?: string; preparesTurnId?: string })[] {
     const newestOf = newestPerSession(listed);
     // Include live background children on launching cards and carried children on each session's newest card.
     const runningSessions = this.runningSessions();
-    const liveChildren = this.liveOpenChildren(now);
     // Dispatched rows share session-list status, including work still running in subagents or background commands.
-    const dispatchStatuses = this.railStatuses(now).statuses;
+    const dispatchStatuses = this.railStatuses(now, undefined, liveChildren).statuses;
     // Read at most once for the batch, and only when a card counts a dispatched session. Each
     // card looks up only its own session's contributions.
     let batchCosts: ReturnType<typeof this.dispatchedTurnCosts> | undefined;
@@ -17227,7 +17239,7 @@ export class PanelProvider implements vscode.Disposable {
     // The session cache-expiry facts are also read once for the batch.
     let batchExpiry: ReturnType<typeof this.lifetimeFiguresBySession>['cacheExpiryFacts'] | undefined;
     const cacheExpiryFacts = () => (batchExpiry ??= this.lifetimeFiguresBySession().cacheExpiryFacts);
-    const childCosts = this.childExpiryCosts(listed, cacheExpiryFacts(), now);
+    const childCosts = this.childExpiryCosts(listed, cacheExpiryFacts(), now, liveChildren);
     this.drawnOpenChildren = openChildrenKey(liveChildren, this.liveBackgroundCommands(now));
     return listed.map((recordedTurn) => {
       const latest = newestOf.get(recordedTurn.sessionId) === recordedTurn.startedAt;
