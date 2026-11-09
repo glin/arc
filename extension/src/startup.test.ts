@@ -10333,7 +10333,7 @@ test.skipIf(!rolloutCompression.zstdCompressSync)(
     provider.adoptionsUnsettled.get(plain).running = true;
     void provider.refresh(true);
     await releaseAll(Promise.resolve()).catch(() => {});
-    await vi.waitFor(() => assert.ok(walks.length >= before), { timeout: 8_000, interval: 5 });
+    await vi.waitFor(() => assert.ok(walks.length > before), { timeout: 8_000, interval: 5 });
     for (const walk of walks) walk.release();
     await vi.waitFor(() => assert.ok(!provider.refreshController), { timeout: 8_000, interval: 5 });
     assert.equal(provider.titles.has(plain), true, 'title pruning dropped the plain path of an unsettled adoption');
@@ -22188,6 +22188,54 @@ test('a plain record behind a directory alias joins its compressed thread by ses
     vi.useRealTimers();
   }
 });
+
+// The opening keeps the walk's directory and the spend record keeps the ledger's. Each row names the physical directory
+// that the operating system resolves for the walk's directory.
+for (const [platform, shape, walkedDirectory, ledgerDirectory, physicalDirectory, joined] of [
+  ['win32', 'a junction alias', 'C:/Users/Me/Aliased', 'c:/users/me/real', 'C:/Users/Me/Real', true],
+  ['win32', 'a path in another case', 'C:/USERS/me/REAL', 'c:/users/me/real', 'C:/Users/Me/Real', true],
+  ['linux', 'a symlink alias', '/home/me/aliased', '/home/me/real', '/home/me/real', true],
+  ['darwin', 'a symlink alias', '/Users/me/aliased', '/Users/me/real', '/Users/me/real', true],
+  ['linux', 'a directory in another case', '/home/me/REAL', '/home/me/real', '/home/me/REAL', false],
+  ['darwin', 'a directory in another case', '/Users/me/REAL', '/Users/me/real', '/Users/me/REAL', false],
+] as const) {
+  test(`the session-id join follows the path rules of ${platform} through ${shape}`, () => {
+    const thread = '01a032c9-1a92-7931-845c-723117d24dbe';
+    const actual = Object.getOwnPropertyDescriptor(process, 'platform')!;
+    const unmapped: string[] = [];
+    const realpath = vi.spyOn(mutableFs.realpathSync, 'native').mockImplementation(((target: string) => {
+      if (target === walkedDirectory) return physicalDirectory;
+      if (!/aliased|real/i.test(target)) unmapped.push(target);
+      return target;
+    }) as never);
+    Object.defineProperty(process, 'platform', { ...actual, value: platform });
+    try {
+      const record = {
+        ...snapshotSpendFile(10),
+        file: normalizeWorkspace(`${ledgerDirectory}/rollout-b-${thread}.jsonl`),
+      };
+      const twinSpend = { ...snapshotSpendFile(7), file: 'twin-spend' };
+      const twin = `${physicalDirectory}/rollout-a-${thread}.jsonl.zst`;
+      const provider = projectSpendSnapshotHarness({ compressedSpendDisplayFiles, compressedPairKey });
+      provider.compressedFacts = new Map([
+        [twin, { file: twin, pairKey: 'no-path-match', threadId: thread, complete: true, spend: twinSpend }],
+      ]);
+      provider.compressedFactsRevision = 1;
+      provider.compressedSpendPicks = new WeakMap();
+      provider.codexMetas = {
+        revision: 1,
+        keys: () => [`${walkedDirectory}/rollout-b-${thread}.jsonl`],
+        peek: () => ({ sessionId: thread }),
+      };
+      const picked = provider.compressedSpendPick([record]).map((held: SpendFileIndex) => held.file);
+      assert.deepEqual(picked, joined ? [record.file] : [record.file, 'twin-spend']);
+      assert.deepEqual(unmapped, []);
+    } finally {
+      Object.defineProperty(process, 'platform', actual);
+      realpath.mockRestore();
+    }
+  });
+}
 
 test('Project cost hydration drops the saved spend of a compressed rollout and saves the ledger without it', async () => {
   vi.useFakeTimers();

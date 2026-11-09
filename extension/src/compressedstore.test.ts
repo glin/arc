@@ -918,24 +918,44 @@ test('a compaction syncs each shard and manifest before it deletes its inputs', 
   const { directory, make } = storeFixture('store-sync', { segmentBytes: 64, compactSegments: 3 });
   const opened = vi.spyOn(defaultFs, 'openSync');
   const synced = vi.spyOn(defaultFs, 'fsyncSync');
+  const closed = vi.spyOn(defaultFs, 'closeSync');
   try {
     const holder = make();
     for (const at of [1, 2, 3]) await holder.append([entry(`r${at}.jsonl.zst`)]);
     const temporaries = opened.mock.calls.flatMap(([name], index) =>
-      /\.tmp$/.test(String(name)) ? [{ name: String(name), fd: opened.mock.results[index].value as number }] : [],
+      /\.tmp$/.test(String(name))
+        ? [
+            {
+              name: String(name),
+              fd: opened.mock.results[index].value as number,
+              openedAt: opened.mock.invocationCallOrder[index],
+            },
+          ]
+        : [],
     );
     assert.ok(
       temporaries.some(({ name }) => /[/\\]shard-/.test(name)) &&
         temporaries.some(({ name }) => /[/\\]manifest-/.test(name)),
       'the compaction wrote no shard or manifest through a temporary',
     );
-    const fds = new Set(synced.mock.calls.map(([fd]) => fd));
-    for (const { name, fd } of temporaries) assert.ok(fds.has(fd), `${path.basename(name)} was not synced`);
+    // A descriptor number comes back after a close, so a sync counts only inside its own open and close.
+    for (const { name, fd, openedAt } of temporaries) {
+      const closedAt = closed.mock.invocationCallOrder.find(
+        (order, index) => closed.mock.calls[index][0] === fd && order > openedAt,
+      )!;
+      assert.ok(
+        synced.mock.invocationCallOrder.some(
+          (order, index) => synced.mock.calls[index][0] === fd && order > openedAt && order < closedAt,
+        ),
+        `${path.basename(name)} was not synced`,
+      );
+    }
     holder.dispose();
     assert.ok(threadCount(directory) === 3);
   } finally {
     opened.mockRestore();
     synced.mockRestore();
+    closed.mockRestore();
   }
 });
 
@@ -1329,10 +1349,12 @@ test('a pair key through a directory alias meets the ledger path after the plain
 });
 
 test('a lock held by a live holder with a fresh mtime keeps a second holder out', () => {
-  const directory = tempDir('store-live-lock');
+  const { directory, clock } = storeFixture('store-live-lock');
   const lock = path.join(directory, STORE_LOCK);
-  const token = takeCodexOpeningsLock(lock);
+  const token = takeCodexOpeningsLock(lock, clock.now);
   assert.ok(token);
-  assert.equal(takeCodexOpeningsLock(lock), null);
+  const renewed = new Date(clock.now);
+  fs.utimesSync(lock, renewed, renewed);
+  assert.equal(takeCodexOpeningsLock(lock, clock.now + 29_000), null);
   fs.rmSync(lock);
 });
