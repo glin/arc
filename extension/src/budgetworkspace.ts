@@ -11,9 +11,9 @@ import { projectSlug } from './transcript';
 export const BUDGET_SEED = 20261108;
 export const BUDGET_CLOCK = Date.parse('2026-10-20T12:00:00.000Z');
 
-const PARENTS = 150;
-const CHILDREN = 60;
-const ROLLOUTS = 30;
+const PARENTS = 75;
+const CHILDREN = 30;
+const ROLLOUTS = 15;
 const COLLISIONS = 3;
 const DISPATCHES = 6;
 const FOLDERS = ['alpha', 'beta', 'gamma'];
