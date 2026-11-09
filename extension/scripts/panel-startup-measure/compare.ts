@@ -420,6 +420,8 @@ export async function runComparison(args: string[], dependencies: ComparisonDepe
       throw new Error('Name --fixture and --candidate. Name --baseline when no installed build is recorded.');
     const soak = value('--soak') ?? '10';
     const timeout = value('--timeout') ?? '900';
+    // Both sides launch under the same free memory floor.
+    const minimumFree = value('--min-free-gb');
     // The candidate alone holds its warm-up until each named measure reads its value.
     const warmUntil = args.flatMap((arg, index) =>
       arg === '--warm-until' && args[index + 1] !== undefined ? ['--warm-until', args[index + 1]] : [],
@@ -449,6 +451,7 @@ export async function runComparison(args: string[], dependencies: ComparisonDepe
           '--build-cache',
           buildDirectory,
           ...(side === 'candidate' ? warmUntil : []),
+          ...(minimumFree != null ? ['--min-free-gb', minimumFree] : []),
           ...(args.includes('--keep') ? ['--keep'] : []),
         ],
         path.join(output, `${side}${suffix}.log`),

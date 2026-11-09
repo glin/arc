@@ -1959,6 +1959,7 @@ test('repeat builds each side once', async () => {
   const order: string[] = [];
   const discarded: string[] = [];
   const warmUntil: string[] = [];
+  const floors: number[] = [];
   // The measure runner of each repetition reads the arguments that the comparison passes, as `measure.ts` reads them.
   const measure = async (args: string[]): Promise<Repetition> => {
     const options = readOptions(args);
@@ -1966,6 +1967,7 @@ test('repeat builds each side once', async () => {
     const index = order.filter((name) => name.startsWith(side)).length;
     order.push(`${side}-${index}`);
     if (options.warmUntil.length) warmUntil.push(side);
+    floors.push(options.minimumFreeGb);
     preparedBuild(options.buildCache, buildKeyOf(options, side), () => {
       builds.push(side);
       const vsix = path.join(output, `${side}-${index}.vsix`);
@@ -1983,6 +1985,7 @@ test('repeat builds each side once', async () => {
     [
       ...['--fixture', manifest, '--baseline', 'base', '--candidate', 'next', '--repeat', '3'],
       ...['--warm-until', 'stubPending=0', '--output', path.join(output, 'report')],
+      ...['--min-free-gb', '0'],
     ],
     {
       measure,
@@ -1994,6 +1997,7 @@ test('repeat builds each side once', async () => {
   assert.deepEqual(builds, ['baseline', 'candidate'], 'a side built more than once');
   assert.deepEqual(order, ['baseline-0', 'candidate-0', 'baseline-1', 'candidate-1', 'baseline-2', 'candidate-2']);
   assert.deepEqual(warmUntil, ['candidate', 'candidate', 'candidate']);
+  assert.deepEqual(floors, [0, 0, 0, 0, 0, 0], 'a launch did not get the free memory floor of the comparison');
   // Each repetition deletes the scratch of the one before it, and the last one stays for the report.
   assert.deepEqual(
     discarded,
