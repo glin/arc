@@ -389,7 +389,7 @@ test('a session nobody parsed still says how much is new in it', () => {
   });
 });
 
-test('newCounts keeps the shared read set unchanged across 3500 windows', () => {
+test('newCounts keeps the shared read set unchanged across 3500 windows and matches a per-window copy', () => {
   const windows = new Map(
     Array.from({ length: 3500 }, (_, index): [string, TurnStarts] => [
       `session-${index}`,
@@ -399,14 +399,34 @@ test('newCounts keeps the shared read set unchanged across 3500 windows', () => 
   const read = new Set(Array.from({ length: 2000 }, (_, index) => `session-${index}:200`));
   const held = new Set(read);
   const readTo = new Map<string, number>();
-  const timings: number[] = [];
+  const cards = new Map(
+    [...windows].map(([sessionId, window]) => [
+      sessionId,
+      window.starts.map((startedAt) => ({
+        key: turnKey({ sessionId, startedAt }),
+        sessionId,
+        startedAt,
+        kind: 'turn',
+      })),
+    ]),
+  );
+  const shared: number[] = [];
+  const copied: number[] = [];
   for (let run = 0; run < 5; run++) {
-    const start = performance.now();
+    let start = performance.now();
     newCounts([], windows, read, readTo);
-    timings.push(performance.now() - start);
+    shared.push(performance.now() - start);
+    start = performance.now();
+    for (const refs of cards.values()) newBySession(refs, [...read], readTo);
+    copied.push(performance.now() - start);
   }
-  console.log(`newCounts 3500 windows median: ${timings.sort((a, b) => a - b)[2].toFixed(3)} ms`);
+  const median = (samples: number[]) => samples.sort((a, b) => a - b)[2].toFixed(3);
+  console.log(`newCounts 3500 windows median: shared ${median(shared)} ms, per-window copy ${median(copied)} ms`);
   assert.deepEqual(read, held);
+  const counts = newCounts([], windows, read, readTo);
+  for (const [sessionId, refs] of cards) {
+    assert.equal(counts.get(sessionId)?.count, newBySession(refs, [...read], readTo).get(sessionId) ?? 0);
+  }
 });
 
 test('unread counts keep callers with different rows and boundaries independent', () => {
