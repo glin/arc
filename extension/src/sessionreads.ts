@@ -468,17 +468,25 @@ export function sessionDiscoveryMembership(
   catalog: readonly SessionFile[],
   answered: ReadonlyMap<string, SessionFile>,
 ): string | undefined {
-  const proven =
-    answered.size === new Set(catalog.map((source) => source.file)).size &&
-    catalog.every((source) => {
-      const reply = answered.get(source.file);
-      return (
-        !!reply &&
-        identityText(reply.dev) === identityText(source.dev) &&
-        identityText(reply.ino) === identityText(source.ino)
-      );
-    });
-  return proven ? sessionCatalogMembership(scope, catalog) : undefined;
+  return sessionDiscoveryMismatch(catalog, answered) ? undefined : sessionCatalogMembership(scope, catalog);
+}
+
+// Why a complete reply proves no membership for a catalog: `size` when it answered another number of files than the catalog
+// lists, or `identity` when it answered a file at another device or inode.
+export function sessionDiscoveryMismatch(
+  catalog: readonly SessionFile[],
+  answered: ReadonlyMap<string, SessionFile>,
+): 'size' | 'identity' | undefined {
+  if (answered.size !== new Set(catalog.map((source) => source.file)).size) return 'size';
+  const same = catalog.every((source) => {
+    const reply = answered.get(source.file);
+    return (
+      !!reply &&
+      identityText(reply.dev) === identityText(source.dev) &&
+      identityText(reply.ino) === identityText(source.ino)
+    );
+  });
+  return same ? undefined : 'identity';
 }
 
 // The query context revision: a digest of the membership discovery proved, the catalog membership, and the panel's

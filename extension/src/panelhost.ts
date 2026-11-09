@@ -74,6 +74,7 @@ import {
   readSessionCursor,
   sessionCatalogMembership,
   sessionDiscoveryMembership,
+  sessionDiscoveryMismatch,
   sessionListingPage,
   sessionPageSources,
   sessionQueryRevision,
@@ -878,6 +879,17 @@ type DiscoveryPendingWriter =
   | 'catalogMismatch'
   | 'cachedLinks'
   | 'spendUnheld';
+
+// Why an accepted catalog holds no session read revision, named in the performance counters.
+type AcceptedUnsettledCause =
+  | 'pendingSet'
+  | 'enumeration'
+  | 'admission'
+  | 'unknownChild'
+  | 'sizeMismatch'
+  | 'identityMismatch'
+  | 'heldRowUnanswered'
+  | 'listedRowUnanswered';
 
 // The gate that kept a targeted watcher wake off the grown member route, named in the performance counters.
 type GrownMemberMiss =
@@ -1829,6 +1841,8 @@ export class PanelProvider implements vscode.Disposable {
   // The repository scope of a complete discovery reply whose catalog is not yet published, and the session files of the catalog it
   // answered. An incomplete reply or a scope change clears it. The next catalog publication under that scope turns it into the
   // completion stamp only when the reply answered every published session.
+  // The sub-condition that left the last accepted coverage incomplete.
+  private membershipCoverageGap?: AcceptedUnsettledCause;
   private discoveryComplete?: {
     scope: string;
     files: Set<string>;
@@ -11107,6 +11121,7 @@ export class PanelProvider implements vscode.Disposable {
         this.cachedLinksCandidate = undefined;
         if (cachedFirst && cachedFirst.generation === this.refreshGeneration)
           this.installCachedLinks(cachedFirst.catalog, catalogScope);
+        const listedRows = new Set(all.map((session) => session.file));
         all = this.acceptSessionCoverage(all, catalogScope);
         this.authoritativeCatalog = all;
         this.scopeSessionDirectories?.clear();
@@ -11125,12 +11140,16 @@ export class PanelProvider implements vscode.Disposable {
               : undefined;
           this.sessionQueryDiscoveryPending = !this.sessionReadDiscoveryRevision;
           if (revisions && !this.sessionReadDiscoveryRevision) {
+            this.performanceCounters.recordWork(`acceptedUnsettled:${this.acceptedUnsettledCause(all, revisions)}`);
             this.dispatchDiscoveryPending = true;
             this.dispatchDiscoveryPendingWriter = 'acceptedUnsettled';
           }
         } else if (answered) {
           // The catalog was listed again with a session the complete reply never answered. Discovery runs again before the list
           // completes, and the follow-up refresh this schedules lets the line clear.
+          this.performanceCounters.recordWork(
+            `acceptedUnsettled:${all.some((session) => !answered.has(session.file) && listedRows.has(session.file)) ? 'listedRowUnanswered' : 'heldRowUnanswered'}`,
+          );
           const discoveryWaiting = this.dispatchedDiscoveryWaiting();
           this.dispatchDiscoveryPending = true;
           this.dispatchDiscoveryPendingWriter = 'catalogMismatch';
@@ -15051,15 +15070,29 @@ export class PanelProvider implements vscode.Disposable {
     return started;
   }
 
+  // The sub-condition that left this acceptance without a session read revision, checked in the order the revision rule reads them.
+  private acceptedUnsettledCause(
+    catalog: readonly SessionFile[],
+    answered: ReadonlyMap<string, SessionFile>,
+  ): AcceptedUnsettledCause {
+    if (this.dispatchDiscoveryPending) return 'pendingSet';
+    if (this.membershipCoverage?.status !== 'complete') return this.membershipCoverageGap ?? 'enumeration';
+    return sessionDiscoveryMismatch(catalog, answered) === 'identity' ? 'identityMismatch' : 'sizeMismatch';
+  }
+
   private acceptSessionCoverage(current: SessionFile[], scope: string): SessionFile[] {
     const revision = String((this.coverageRevision = (this.coverageRevision ?? 0) + 1));
     const enumeration = this.sourceEnumerations;
-    let complete =
-      !!enumeration &&
-      enumeration.claude.status === 'complete' &&
-      enumeration.codex.status === 'complete' &&
-      this.enumeratedAdmissionComplete &&
-      !this.dispatchDiscoveryPending;
+    const enumerated =
+      !!enumeration && enumeration.claude.status === 'complete' && enumeration.codex.status === 'complete';
+    let complete = enumerated && this.enumeratedAdmissionComplete && !this.dispatchDiscoveryPending;
+    this.membershipCoverageGap = !enumerated
+      ? 'enumeration'
+      : !this.enumeratedAdmissionComplete
+        ? 'admission'
+        : this.dispatchDiscoveryPending
+          ? 'pendingSet'
+          : undefined;
     const members = new Set(
       current
         .filter(
@@ -15117,6 +15150,7 @@ export class PanelProvider implements vscode.Disposable {
     ) {
       complete = false;
       this.membershipCoverage.status = 'incomplete';
+      this.membershipCoverageGap = 'unknownChild';
     }
     // The acceptance after a settled reply drops each child row that only the saved links published.
     const unverified =

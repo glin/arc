@@ -128,7 +128,7 @@ import {
   preserveHostRead,
   projectAgentRead,
 } from './domain/read.ts';
-import { sessionCatalogMembership, sessionDiscoveryMembership } from './sessionreads.ts';
+import { sessionCatalogMembership, sessionDiscoveryMembership, sessionDiscoveryMismatch } from './sessionreads.ts';
 import { REPOSITORY_SCOPE_CONFIRM_MS, REPOSITORY_SCOPE_REFRESH_MS, RepositoryScope } from './repositoryscope';
 import {
   CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
@@ -3166,6 +3166,7 @@ function completeDiscoveryHarness(
     sessionCoverageMember,
     reconcileSessionCollisions,
     sessionCatalogMembership,
+    sessionDiscoveryMismatch,
     sessionPageSources,
     sessionPresence,
     sessionSourceKey,
@@ -3212,6 +3213,7 @@ function completeDiscoveryHarness(
     'savedLinksDrawn',
     'sessionParentEdges',
     'acceptSessionCoverage',
+    'acceptedUnsettledCause',
     'membershipOf',
     'physicalMembershipOf',
     'parentOfShown',
@@ -3506,6 +3508,7 @@ function completeDiscoveryHarness(
     'SessionLoadingLine',
     'pendingResponseSessionAdmitted',
     'sessionDiscoveryMembership',
+    'sessionDiscoveryMismatch',
     'path',
     'COMPRESSED_FACTS_STORE',
     'COMPRESSED_OPENINGS_STORE',
@@ -3566,6 +3569,7 @@ function completeDiscoveryHarness(
     SessionLoadingLine,
     pendingResponseSessionAdmitted,
     sessionDiscoveryMembership,
+    sessionDiscoveryMismatch,
     path,
     COMPRESSED_FACTS_STORE,
     COMPRESSED_OPENINGS_STORE,
