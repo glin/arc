@@ -418,6 +418,8 @@ export function compressedEntrySeed(entry: CompressedFactEntry): CompressedEntry
 export interface CompressedLoadResume {
   consumed: [string, number][];
   entries: CompressedEntrySeed[];
+  // The names the store holds with no facts, which the offsets cover and the host holds only as paths.
+  nameOnly?: string[];
 }
 
 interface RankedEntry {
@@ -688,7 +690,13 @@ export class CompressedStoreFollower {
   // A seed ranks below any line that ties it, because a later line wins a tie.
   seed(resume: CompressedLoadResume): void {
     for (const [name, end] of resume.consumed) this.consumed.set(name, end);
-    for (const seed of resume.entries) {
+    const nameSeeds = (resume.nameOnly ?? []).map((file): CompressedEntrySeed => ({
+      file,
+      pairKey: '',
+      ...compressedEntryVersions(),
+      nameOnly: true,
+    }));
+    for (const seed of [...nameSeeds, ...resume.entries]) {
       this.best.set(seed.file, {
         ranked: { entry: rankFields(seed), epoch: -1, token: '', input: '', offset: -1, seq: -1 },
         mark: compressedEntryMark(seed),

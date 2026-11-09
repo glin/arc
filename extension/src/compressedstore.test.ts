@@ -103,6 +103,27 @@ const stale = (lock: string, clock: { now: number }) => {
 
 const threadCount = (directory: string) => readCompressedStore(directory).entries.size;
 
+test('a follower seeded with name-only paths records no name again', async () => {
+  const directory = tempDir('store-name-seed-');
+  const follower = new CompressedStoreFollower(directory, () => null);
+  follower.seed({ consumed: [], entries: [], nameOnly: ['seen.zst'] });
+  assert.equal(follower.known().get('seen.zst')?.nameOnly, true, 'the seed lost a name-only path');
+  const appended: CompressedFactEntry[] = [];
+  const holder = {
+    directory,
+    append: async (entries: CompressedFactEntry[]) => {
+      appended.push(...entries);
+      return entries.map(() => true);
+    },
+  } as never;
+  await recordCompressedNames(['seen.zst', 'new.zst'], holder, { known: follower.known() });
+  assert.deepEqual(
+    appended.map((record) => record.file),
+    ['new.zst'],
+    'a seeded name wrote a second record',
+  );
+});
+
 test('a follower seeded with host offsets reads only the appended bytes and keeps the held rank', async () => {
   const directory = tempDir('store-follower-');
   const segment = path.join(directory, 'segment-1-holder-0');

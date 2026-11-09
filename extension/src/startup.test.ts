@@ -3088,7 +3088,7 @@ function completeDiscoveryHarness(
       repositoryCommits = new RepositoryCommits({ run: async () => null }, () => {});
       _showing = null; selections = []; messages = []; partial = []; catalog = null; drawnCards = [];
       coverageRevision = 0; enumeratedAdmissionComplete = true; claudeChildren = []; compressedRollouts = new Set();
-      compressedLoadPending = false; compressedFollowTimer = null; compressedRolloutsRevision = 0; compressedFacts = new Map(); compressedFactsRevision = 0; adoptionsUnsettled = new Map(); compressedSpendPicks = new WeakMap(); compressedLaunch = 'launch-test'; compressedWalk = null; compressedRowsDirty = null; compressedRowsHeld = new Map(); compressedFactsRefreshDue = false; compressedLoadCursor = null; lifetimeDisplayPick = null;
+      compressedLoadPending = false; compressedFollowTimer = null; compressedRolloutsRevision = 0; compressedFacts = new Map(); compressedFactsRevision = 0; adoptionsUnsettled = new Map(); compressedSpendPicks = new WeakMap(); compressedLaunch = 'launch-test'; compressedWalk = null; compressedRowsDirty = null; compressedRowsHeld = new Map(); compressedNameOnly = new Set(); compressedFactsRefreshDue = false; compressedLoadCursor = null; lifetimeDisplayPick = null;
       authoritativeCatalog = null; attachmentHandoffs = new Set(); titles = new Map();
       metadataRevision = 0; drawnMetadataRevision = 0; startupProgressAt = 0;
       derivedCacheCheckpointState = { markChanged() {} };
@@ -11271,7 +11271,13 @@ test('a new worker takes the host offsets and entries in place of the whole stor
   provider.folders = () => ['c:/repo'];
   provider.repositoryScopeRoots = ['c:/repo'];
   provider.compressedFacts.set('a', entry({ file: 'a' }));
-  provider.noteCompressedLoad({ kind: 'compressed-load', entries: [], done: true, consumed: [['segment-1-t-0', 12]] });
+  provider.noteCompressedLoad({
+    kind: 'compressed-load',
+    entries: [],
+    done: true,
+    consumed: [['segment-1-t-0', 12]],
+    nameOnly: ['names.zst'],
+  });
   assert.equal(
     provider.compressedLoadRequest({ facts: 'f', openings: 'o' }).resume,
     undefined,
@@ -11281,6 +11287,7 @@ test('a new worker takes the host offsets and entries in place of the whole stor
   const resume = provider.compressedLoadRequest({ facts: 'f', openings: 'o' }).resume;
   assert.deepEqual(resume?.consumed, [['segment-1-t-0', 12]]);
   assert.equal(resume?.entries[0].file, 'a');
+  assert.deepEqual(resume?.nameOnly, ['names.zst'], 'the resume dropped a name-only path');
   assert.equal('title' in resume!.entries[0], false, 'the resume carried a title entry');
 });
 

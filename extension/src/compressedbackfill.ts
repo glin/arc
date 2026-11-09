@@ -749,7 +749,7 @@ export class CompressedBackfill {
       ...(stored ? withoutOutdatedTitle(stored) : { complete: false, nameOnly: true }),
       decodedLength: undefined,
       file: job.file,
-      pairKey: previous?.pairKey ?? compressedPairKey(job.file),
+      pairKey: previous?.pairKey || compressedPairKey(job.file),
       ...compressedEntryVersions(),
       size: job.stat.size,
       mtimeMs: job.stat.mtimeMs,

@@ -661,7 +661,10 @@ async function executeCompressedLoad(
     compressedFollowers.set(request.stores.facts, follower);
     if (request.resume) follower.seed(request.resume);
   }
-  const facts = (await follower.poll()).filter((entry) => !entry.nameOnly);
+  const polled = await follower.poll();
+  // An unreadable name stays in the reply, so a replaced worker keeps its mark. Other names reach the host only as paths.
+  const facts = polled.filter((entry) => !entry.nameOnly || entry.unreadable);
+  const nameOnly = polled.filter((entry) => entry.nameOnly && !entry.unreadable).map((entry) => entry.file);
   const held = heldCompressedNames.get(request.stores.facts);
   if (held) {
     heldCompressedNames.delete(request.stores.facts);
@@ -671,7 +674,7 @@ async function executeCompressedLoad(
   const last = await postCompressedBatches(facts, signal, (batch) =>
     acknowledge?.({ kind: 'compressed-load', entries: batch, done: false }),
   );
-  return { kind: 'compressed-load', entries: last, done: true, consumed: follower.offsets() };
+  return { kind: 'compressed-load', entries: last, done: true, consumed: follower.offsets(), nameOnly };
 }
 
 // One backfill per store directory. A list of names that arrives before the first load waits for it, so the first

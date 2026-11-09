@@ -16181,6 +16181,32 @@ test.skipIf(!zstdCompress)('a rollout whose opening has no id takes the id in it
   }
 });
 
+test('a load reply returns name-only paths and keeps an unreadable name-only entry', async () => {
+  const directory = tempDir('worker-name-only-');
+  const stores = { facts: path.join(directory, 'facts'), openings: path.join(directory, 'openings') };
+  fs.mkdirSync(stores.facts);
+  const record = (file: string, fields: object) =>
+    `${JSON.stringify({ file, pairKey: file, ...compressedEntryVersions(), ...fields })}\n`;
+  fs.writeFileSync(
+    path.join(stores.facts, 'segment-1-holder-0'),
+    record('name.zst', { nameOnly: true }) +
+      record('bad.zst', { nameOnly: true, unreadable: true, unreadableLaunch: 'old' }),
+  );
+  const worker = new ProgressiveWorker(source);
+  try {
+    const result: any = await worker.run({ kind: 'compressed-load', stores }, 1, new AbortController().signal);
+    assert.deepEqual(result.value.nameOnly, ['name.zst'], 'the reply lost a name-only path');
+    assert.deepEqual(
+      result.value.entries.map((entry: CompressedFactEntry) => entry.file),
+      ['bad.zst'],
+      'the reply dropped the unreadable entry',
+    );
+  } finally {
+    worker.stop();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 const unitStat = { size: 10, mtimeMs: 2, dev: 1, ino: 1 };
 const unitDecoded = (hash = 'h') =>
   ({ kind: 'decoded', hash, stat: unitStat as never, frames: 1, complete: true }) as const;

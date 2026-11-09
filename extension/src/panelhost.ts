@@ -1675,6 +1675,8 @@ export class PanelProvider implements vscode.Disposable {
   private compressedFactsRefreshDue = false;
   // The last store offsets of the load, so a new worker reads only the bytes after them.
   private compressedLoadCursor: { worker: number | null; consumed: [string, number][] } | null = null;
+  // Names in the store with no facts. The host keeps only the paths, for a worker that replaces the current one.
+  private readonly compressedNameOnly = new Set<string>();
   private readonly compressedLaunch = crypto.randomUUID();
   private lifetimeDisplayPick: {
     files: readonly SpendFileIndex[];
@@ -5112,7 +5114,11 @@ export class PanelProvider implements vscode.Disposable {
     const cursor = this.compressedLoadCursor;
     if (!cursor || cursor.worker === (this.progressiveWorker.currentThreadId ?? null)) return {};
     return {
-      resume: { consumed: cursor.consumed, entries: [...this.compressedFacts.values()].map(compressedEntrySeed) },
+      resume: {
+        consumed: cursor.consumed,
+        entries: [...this.compressedFacts.values()].map(compressedEntrySeed),
+        nameOnly: [...this.compressedNameOnly].filter((file) => !this.compressedFacts.has(file)),
+      },
     };
   }
 
@@ -5130,7 +5136,9 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   private noteCompressedLoad(value: import('./progressiveworker').ProgressiveValue | undefined): void {
-    if (value?.kind === 'compressed-load' && value.consumed)
+    if (value?.kind !== 'compressed-load') return;
+    for (const file of value.nameOnly ?? []) this.compressedNameOnly.add(file);
+    if (value.consumed)
       this.compressedLoadCursor = { worker: this.progressiveWorker.currentThreadId ?? null, consumed: value.consumed };
   }
 

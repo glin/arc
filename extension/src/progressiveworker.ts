@@ -447,6 +447,8 @@ export type ProgressiveValue =
       done: boolean;
       // On the final reply: the bytes this reply covers in each store file.
       consumed?: [string, number][];
+      // On the final reply: the names the poll read that hold no facts.
+      nameOnly?: string[];
     }
   | { kind: 'codex-context'; estimate: import('./codexcontext').CodexContextResult | null }
   | {
