@@ -449,6 +449,8 @@ export type ProgressiveValue =
       consumed?: [string, number][];
       // On the final reply: the names the poll read that hold no facts.
       nameOnly?: string[];
+      // On the final reply: the size of the list that waited for this first load, which the worker now records.
+      heldNamesRecorded?: number;
     }
   | { kind: 'codex-context'; estimate: import('./codexcontext').CodexContextResult | null }
   | {
@@ -484,6 +486,7 @@ export type ProgressiveValue =
     }
   | {
       kind: 'claude-children-delta';
+      compressedNames?: 'held' | 'recorded';
       referenceEntries: Array<[string, ClaudeChildReferenceCacheEntry]>;
       checkpoint?: DiscoveryCheckpoint;
       epoch: string;
@@ -512,6 +515,7 @@ export type ProgressiveValue =
     }
   | {
       kind: 'claude-children-progress';
+      compressedNames?: 'held' | 'recorded';
       referenceEntries: Array<[string, ClaudeChildReferenceCacheEntry]>;
       checkpoint: DiscoveryCheckpoint;
       continuation: true;

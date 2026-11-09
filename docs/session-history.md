@@ -44,7 +44,7 @@ A plain rollout that Codex compresses while Arc runs keeps its facts through ado
 
 A version change never removes a row that the store holds at an older fact version. Until a re-derivation, the host shows a carried name and the previous spend record counts. An entry of a newer fact version stays unread and untouched until a build that knows that version reads it. `COMPRESSED_FACTS_VERSION` joins the entry currency test with `CODEX_META_VERSION`, the Codex metadata generation and the Codex spend parser generation.
 
-The host sends the worker its complete set of compressed names on `claude-children` until the worker answers a request that carried the current set. A superseded or cancelled request keeps the set unsent. A worker that receives a list before its first store load holds it until that load.
+The host sends the worker its complete set of compressed names on `claude-children` until the worker answers a request that carried the current set. The worker takes the set from any reply to that request, partial or complete. A superseded or cancelled request keeps the set unsent. A worker that receives a list before its first store load holds it until that load.
 
 ### Compressed rollout backfill
 

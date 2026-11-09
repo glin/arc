@@ -675,7 +675,14 @@ async function executeCompressedLoad(
   const last = await postCompressedBatches(facts, signal, (batch) =>
     acknowledge?.({ kind: 'compressed-load', entries: batch, done: false }),
   );
-  return { kind: 'compressed-load', entries: last, done: true, consumed: follower.offsets(), nameOnly };
+  return {
+    kind: 'compressed-load',
+    entries: last,
+    done: true,
+    consumed: follower.offsets(),
+    nameOnly,
+    ...(held ? { heldNamesRecorded: held.length } : {}),
+  };
 }
 
 // One backfill per store directory. A list of names that arrives before the first load waits for it, so the first
@@ -2772,9 +2779,12 @@ async function handleMessage(message: {
             result: { generation: message.generation, revision: null, value, workerMemory: workerMemory() },
           });
       });
+      // Any reply to the request carries the list on, a partial reply included. The host marks the list sent on that reply.
       if (
         request.kind === 'claude-children' &&
-        value.kind === 'claude-children' &&
+        (value.kind === 'claude-children' ||
+          value.kind === 'claude-children-progress' ||
+          value.kind === 'claude-children-delta') &&
         request.compressed &&
         request.compressedStores
       )

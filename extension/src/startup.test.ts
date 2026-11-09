@@ -12252,6 +12252,7 @@ test('a superseded discovery request sends the compressed list again with the ne
   provider.compressedRollouts = new Set(['a.jsonl.zst']);
   provider.compressedRolloutsRevision = 1;
   provider.compressedRolloutsSent = null;
+  provider.performanceCounters = new PanelPerformanceCounters(1000);
   const checkpoint = {
     compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
     parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
@@ -12266,6 +12267,7 @@ test('a superseded discovery request sends the compressed list again with the ne
     generation: 4,
     value: {
       kind: 'claude-children-progress',
+      compressedNames: 'recorded',
       checkpoint,
       referenceEntries: [],
       continuation: true,
@@ -12306,6 +12308,11 @@ test('a superseded discovery request sends the compressed list again with the ne
   assert.deepEqual(requests[1].compressed, ['a.jsonl.zst'], 'the lost list was not sent again');
   await provider.prepareClaudeChildren(4, new AbortController().signal);
   assert.equal(requests[2].compressed, undefined, 'a delivered list was sent again');
+  assert.equal(
+    provider.performanceCounters.snapshot().work['compressedNames:recorded'],
+    1,
+    'a capture did not show the names the worker holds',
+  );
 });
 
 test('the load of the stores waits for the first render and the pass, holds Project cost busy and applies each batch', async () => {

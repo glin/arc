@@ -16230,6 +16230,60 @@ test('a load reply returns name-only paths and keeps an unreadable name-only ent
   }
 });
 
+// A request can end on a partial reply, and the host never sends that list again for that worker and set of names.
+test.skipIf(!zstdCompress)('the list of a request that ends partial reaches the backfill', async () => {
+  const pair = compressedRolloutPair();
+  const root = tempDir('worker-partial-list-');
+  const fx = receiptDispatchFixture(root, 'claude', 'codex');
+  fs.mkdirSync(fx.receipts.root, { recursive: true });
+  for (let index = 0; index < 1200; index++)
+    fs.mkdirSync(path.join(fx.receipts.root, `${index.toString(16).padStart(8, '0')}-1111-2222-3333-444444444444`));
+  const stores = { facts: path.join(pair.directory, 'facts'), openings: path.join(pair.directory, 'openings') };
+  const published: CompressedFactEntry[] = [];
+  const worker = new ProgressiveWorker(
+    `process.env.ARC_HOME=${JSON.stringify(fx.home)};performance.now=()=>0;${narrowReceiptBudget(source)}`,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    (batch) => published.push(...batch.entries),
+  );
+  const signal = new AbortController().signal;
+  try {
+    await worker.run(
+      {
+        kind: 'compressed-load',
+        stores,
+        backfill: { workspace: pair.directory, roots: [pair.directory], launch: 'one' },
+      },
+      1,
+      signal,
+    );
+    const pass = await worker.run(
+      {
+        kind: 'claude-children',
+        parents: fx.catalog,
+        catalog: fx.catalog,
+        repositoryRoots: [root],
+        compressed: [pair.compressed],
+        compressedStores: stores,
+      },
+      2,
+      signal,
+    );
+    assert.equal(pass?.value.kind, 'claude-children-progress');
+    assert.equal(pass.value.compressedNames, 'recorded', 'a partial reply did not record the list');
+    await vi.waitFor(() => assert.equal(published.length, 1, 'the backfill did not publish the entry'));
+    assert.equal(published[0].file, pair.compressed);
+  } finally {
+    worker.stop();
+    fs.rmSync(pair.directory, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test.skipIf(!zstdCompress)('a load poll does not post the entries this worker published', async () => {
   const pair = compressedRolloutPair();
   const stores = { facts: path.join(pair.directory, 'facts'), openings: path.join(pair.directory, 'openings') };

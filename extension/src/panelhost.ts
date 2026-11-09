@@ -5188,6 +5188,8 @@ export class PanelProvider implements vscode.Disposable {
   private noteCompressedLoad(value: import('./progressiveworker').ProgressiveValue | undefined): void {
     if (value?.kind !== 'compressed-load') return;
     for (const file of value.nameOnly ?? []) this.compressedNameOnly.add(file);
+    if (value.heldNamesRecorded)
+      this.performanceCounters?.recordWork?.('compressedNames:recorded', value.heldNamesRecorded);
     if (value.consumed)
       this.compressedLoadCursor = { worker: this.progressiveWorker.currentThreadId ?? null, consumed: value.consumed };
   }
@@ -14696,7 +14698,17 @@ export class PanelProvider implements vscode.Disposable {
         acknowledge,
       )
       .catch(() => null);
-    if (result && compressedList.compressed) this.markCompressedRolloutsSent(compressedRevision);
+    if (result && compressedList.compressed) {
+      this.markCompressedRolloutsSent(compressedRevision);
+      // Any reply that carries the list says how the worker took it. A request that ends another way keeps the list unsent.
+      const taken =
+        result.value.kind === 'claude-children' ||
+        result.value.kind === 'claude-children-progress' ||
+        result.value.kind === 'claude-children-delta'
+          ? result.value.compressedNames
+          : undefined;
+      if (taken) this.performanceCounters?.recordWork?.(`compressedNames:${taken}`, compressedList.compressed.length);
+    }
     if (!result) {
       if (signal.aborted) this.performanceCounters?.recordDiscoveryAbort?.();
       this.failSessionLoading(generation, signal);
