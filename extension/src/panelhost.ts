@@ -1789,8 +1789,8 @@ export class PanelProvider implements vscode.Disposable {
   // completion stamp only when the reply answered every published session.
   private discoveryComplete?: {
     scope: string;
-    files: ReadonlySet<string>;
-    revisions?: ReadonlyMap<string, SessionFile>;
+    files: Set<string>;
+    revisions?: Map<string, SessionFile>;
   };
   private discoveryRequestSequence = 0;
   private discoveryObservation?: {
