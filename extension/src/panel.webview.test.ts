@@ -32977,7 +32977,7 @@ test('startup shows only the restored selected quick filter until the workspace 
     projectSpend: { update: noop },
     clock: { tick: noop },
     acknowledgePaint: noop,
-    selectionPaint: { receive: noop, schedule: noop },
+    selectionPaint: { receive: noop, discard: noop, schedule: noop },
     receivedAt: 0,
     pageStyle: { setIconFonts: noop },
     railAcrossSessionAdoption: (rail: unknown, stats: unknown) => ({ rail, stats }),
@@ -33314,6 +33314,11 @@ test('a ready host stages worker-backed session data without clearing accepted c
     receiveSelection,
     /render: function \(msg\) \{ selectionPaint\.receive\(msg, receivedAt\);/,
     'full render receipt is missing from selection timing',
+  );
+  sourceMatch(
+    receiveSelection,
+    /if \(!message && parsed\.type === 'render'\) selectionPaint\.discard\(parsed, receivedAt\);\s*if \(!message\) return;/,
+    'a timed render the panel cannot apply leaves its selection measurement open',
   );
   const renderAt = repaint.indexOf('render(latest.cards');
   const railUpdateAt = repaint.indexOf('railRenderer.update(');

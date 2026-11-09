@@ -96,6 +96,25 @@ test('an unrelated render of the same session preserves the first receipt and pe
   assert.equal(f.messages[0].receivedAt, 100);
 });
 
+test('a timed render the panel cannot apply ends its measurement with the rows gap reason', () => {
+  const f = paintFixture();
+  f.paint.discard({ showing: 'selected', selectionTiming: { id: 1, sessionId: 'selected' } }, 100);
+  assert.deepEqual(f.messages, [
+    { type: 'selectionPainted', id: 1, sessionId: 'selected', receivedAt: 100, reason: 'rows-gap' },
+  ]);
+  f.paint.schedule();
+  assert.equal(f.frames.length, 0, 'the discarded render scheduled a paint');
+  f.paint.receive({ showing: 'selected' }, 110);
+  assert.equal(f.messages.length, 1, 'the replacement snapshot reported the measurement again');
+});
+
+test('an untimed render the panel cannot apply leaves the pending measurement waiting', () => {
+  const f = paintFixture();
+  f.paint.receive({ showing: 'selected', selectionTiming: { id: 1, sessionId: 'selected' } }, 100);
+  f.paint.discard({ showing: 'selected' }, 110);
+  assert.deepEqual(f.messages, []);
+});
+
 test('a paint wait that never settles ends with one reason at the frame limit', () => {
   const f = paintFixture();
   f.settle(false);

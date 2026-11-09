@@ -17,6 +17,21 @@ export function createSelectionPaint(
     pending = null;
     send({ type: 'selectionPainted', id, sessionId, receivedAt, reason });
   }
+  function receive(
+    message: { showing: string | null; selectionTiming?: { id: number; sessionId: string } },
+    receivedAt: number,
+  ) {
+    if (
+      pending &&
+      (pending.sessionId !== message.showing || (message.selectionTiming && pending.id !== message.selectionTiming.id))
+    )
+      abandon('replaced');
+    const stamp = message.selectionTiming;
+    if (stamp && Number.isSafeInteger(stamp.id) && stamp.id > lastId && stamp.sessionId === message.showing) {
+      lastId = stamp.id;
+      pending = { ...stamp, receivedAt, scheduled: false, frames: 0 };
+    }
+  }
   function schedule() {
     const stamp = pending;
     if (!stamp || stamp.scheduled) return;
@@ -41,21 +56,15 @@ export function createSelectionPaint(
     });
   }
   return {
-    receive(
+    receive,
+    // Ends the measurement of a timed render that the panel could not apply. The replacement snapshot carries no identity.
+    discard(
       message: { showing: string | null; selectionTiming?: { id: number; sessionId: string } },
       receivedAt: number,
     ) {
-      if (
-        pending &&
-        (pending.sessionId !== message.showing ||
-          (message.selectionTiming && pending.id !== message.selectionTiming.id))
-      )
-        abandon('replaced');
-      const stamp = message.selectionTiming;
-      if (stamp && Number.isSafeInteger(stamp.id) && stamp.id > lastId && stamp.sessionId === message.showing) {
-        lastId = stamp.id;
-        pending = { ...stamp, receivedAt, scheduled: false, frames: 0 };
-      }
+      if (!message.selectionTiming) return;
+      receive(message, receivedAt);
+      abandon('rows-gap');
     },
     schedule,
     abandon,

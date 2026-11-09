@@ -22,7 +22,7 @@ test('selection paint replies retain their identity and reject malformed or reve
     { paintedAt: undefined, reason: 'unknown' },
   ])
     assert.equal(parsePanelToHost({ ...message, ...fields }), null);
-  for (const reason of ['replaced', 'unsettled']) {
+  for (const reason of ['replaced', 'unsettled', 'rows-gap']) {
     assert.deepEqual(parsePanelToHost({ ...message, paintedAt: undefined, reason }), {
       ...message,
       paintedAt: undefined,

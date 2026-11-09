@@ -1202,6 +1202,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
     }
     // Rebuild complete session lists from a row delta. A delta that cannot apply draws nothing.
     const message = parsed.type === 'render' || parsed.type === 'rail' ? rowDeltas.expand(parsed) : parsed;
+    if (!message && parsed.type === 'render') selectionPaint.discard(parsed, receivedAt);
     if (!message) return;
     dispatchHostToPanel(message, {
       readerDocument: () => {},
