@@ -73,6 +73,7 @@ export function liveTimelineChildren(
   now: number,
   workAt: (file: string) => number | undefined = () => undefined,
   unlistedAt: (session: string, child: string) => number | undefined = () => undefined,
+  noteExpiry?: (at: number) => void,
 ): Map<string, string[]> {
   let index: Map<string, number> | null = null;
   const writtenAt = (session: string, child: string): number | undefined => {
@@ -94,7 +95,7 @@ export function liveTimelineChildren(
     const file = files.get(childWriteKey(session, child));
     return file === undefined ? undefined : workAt(file);
   };
-  return liveOpenChildren(outcomes, writtenAt, hostExitedAt, now, childWorkAt);
+  return liveOpenChildren(outcomes, writtenAt, hostExitedAt, now, childWorkAt, noteExpiry);
 }
 
 // Session-list status and child counts share the supplied observation clock and live child IDs.

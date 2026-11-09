@@ -11042,7 +11042,10 @@ export class PanelProvider implements vscode.Disposable {
         ...scopedPendingRecords.map((pending) => ({ id: pending.sessionId, agentKey: pending.agent })),
         ...all.map((session) => ({ id: session.sessionId, agentKey: session.agent })),
       ];
-      const liveChildren = this.liveOpenChildren(now, this.sessionOutcomes, refreshRows);
+      let childExpiry = Infinity;
+      const liveChildren = this.liveOpenChildren(now, this.sessionOutcomes, refreshRows, (at) => {
+        childExpiry = Math.min(childExpiry, at);
+      });
       if (
         !swept &&
         !refreshWanted({
@@ -11170,8 +11173,15 @@ export class PanelProvider implements vscode.Disposable {
         }
       }
       this.metadataRailRevisions = railRevisions;
-      const railNow = now;
-      const { statuses, openChildren } = this.railStatuses(railNow, undefined, liveChildren);
+      // The first reading holds unless a listed child reaches its quiet limit during this refresh.
+      const statusClock = Date.now();
+      const childExpired = statusClock > childExpiry;
+      const railNow = childExpired ? statusClock : now;
+      const { statuses, openChildren } = this.railStatuses(
+        railNow,
+        undefined,
+        childExpired ? this.liveOpenChildren(railNow, this.sessionOutcomes, refreshRows) : liveChildren,
+      );
       const railInput = this.railInputFor(counts, statuses, openChildren, railNow);
       const railKey = railInputKey(railInput);
       const railPending = this.lifetimeFigures.answers();
@@ -11890,6 +11900,7 @@ export class PanelProvider implements vscode.Disposable {
     now: number,
     outcomes = this.sessionOutcomes,
     rows = this.sessionRows,
+    noteExpiry?: (at: number) => void,
   ): Map<string, string[]> {
     this.performanceCounters?.recordWork('liveOpenChildren');
     // A session ID that two Claude transcripts share names no single parent, so its children get no path check.
@@ -11921,6 +11932,7 @@ export class PanelProvider implements vscode.Disposable {
           ? (writeTimeOfVersion(this.claudeChildVersion(claudeChildFile(parent, child))) ?? undefined)
           : undefined;
       },
+      noteExpiry,
     );
   }
 

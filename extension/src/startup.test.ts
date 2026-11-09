@@ -6841,6 +6841,29 @@ test('a newly listed session whose host exited lists no subagents after its firs
   }
 });
 
+test('a child that reaches its quiet limit during a refresh leaves the session list status', async () => {
+  const now = 100_000_000;
+  let collected = false;
+  const clock = vi.spyOn(Date, 'now').mockImplementation(() => (collected ? now + 1 : now));
+  try {
+    const states: ReturnType<typeof timelineRailState>[] = [];
+    const provider = liveChildRefresh(now, now - TURN_QUIET_MS, states);
+    provider.sessionRows = [{ id: 'parent', agentKey: 'claude' }];
+    const collect = provider.collect;
+    provider.collect = (...input: unknown[]) => {
+      const cards = collect.apply(provider, input);
+      collected = true;
+      return cards;
+    };
+    await provider.refresh(true);
+    assert.ok(collected, 'the refresh drew no cards');
+    assert.deepEqual([...states.at(-1)!.openChildren], [], 'the session list counted a child past its quiet limit');
+    assert.notEqual(states.at(-1)!.statuses.get('parent'), 'subagents');
+  } finally {
+    clock.mockRestore();
+  }
+});
+
 // A selection changes the rows of the session it leaves and the session it enters. Its refresh checks the prompt sources
 // and builds the session list payload of those two sessions alone.
 

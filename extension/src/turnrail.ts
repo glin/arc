@@ -587,6 +587,8 @@ export function liveOpenChildren(
   hostExitedAt: ReadonlyMap<string, number>,
   now: number,
   workAt: (session: string, child: string) => number | undefined = () => undefined,
+  // Receives the time at which each listed child reaches its quiet limit.
+  noteExpiry: (at: number) => void = () => {},
 ): Map<string, string[]> {
   const out = new Map<string, string[]>();
   for (const [id, outcome] of outcomes) {
@@ -609,7 +611,9 @@ export function liveOpenChildren(
     const candidates = [...(outcome.openChildren ?? []).filter((child) => !closedIds.has(child)), ...reopened];
     const live = [...new Set(candidates)].filter((child) => {
       const at = writtenAt(id, child);
-      return at !== undefined && now - at <= TURN_QUIET_MS;
+      if (at === undefined || now - at > TURN_QUIET_MS) return false;
+      noteExpiry(at + TURN_QUIET_MS);
+      return true;
     });
     if (live.length > 0) {
       out.set(id, live);
