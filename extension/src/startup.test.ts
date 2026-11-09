@@ -3214,6 +3214,7 @@ function completeDiscoveryHarness(
     'sessionParentEdges',
     'acceptSessionCoverage',
     'acceptedUnsettledCause',
+    'acceptedUnsettledRequestsPass',
     'membershipOf',
     'physicalMembershipOf',
     'parentOfShown',
@@ -22532,6 +22533,291 @@ test('an unowned dispatched session reads as unknown while its person scan is un
   assert.equal(answer({ person: false, personPending: true }), null, 'an unfinished person scan read as an agent run');
   assert.equal(answer({ person: false }), true);
   assert.equal(answer({ person: true }), false);
+});
+
+// A settled reply over a gap that no pass can answer. `gap` shapes the state that each acceptance reads, and the catalog it
+// returns, as a real walk would have left them. Each host and worker stays real from the reply on.
+function settledGapHarness(
+  gap: (provider: any, current: any[], scope: string) => any[] | void,
+  spendFailure?: 'held-false' | 'reject',
+  extraRoots: object[] = [],
+) {
+  const harness = partialSpendHarness(true, spendFailure, { spendReplies: 1 });
+  const { provider } = harness;
+  provider.partial = [...provider.partial, ...extraRoots];
+  const accept = Object.getPrototypeOf(provider).acceptSessionCoverage.bind(provider);
+  provider.acceptSessionCoverage = (current: any[], scope: string) => {
+    const complete = { status: 'complete', files: current.map((source) => source.file), uncertain: [] };
+    provider.sourceEnumerations = { claude: complete, codex: complete };
+    provider.enumeratedAdmissionComplete = true;
+    provider.enumeratedMembers = new Set(current.map(sessionCoverageMember));
+    return accept(gap(provider, current, scope) ?? current, scope);
+  };
+  // Each step runs the timers due and the work they release. The step bound is the test's deadline.
+  const settle = async () => {
+    const quiet = () =>
+      !provider.dispatchSpendPending &&
+      !provider.dispatchDiscoveryPending &&
+      provider.refreshController === null &&
+      !provider.pendingRefresh;
+    for (let step = 0; step < 500 && !quiet(); step++) await vi.advanceTimersByTimeAsync(1);
+    assert.ok(quiet(), `discovery never settled after requests ${harness.requests.join(', ')}`);
+    for (let step = 0; step < 20; step++) await vi.advanceTimersByTimeAsync(1);
+  };
+  const full = () => harness.requests.filter((kind) => kind === 'discovery').length;
+  return { ...harness, settle, full };
+}
+
+const heldRow = (extra: object = {}) => ({
+  file: 'held-only.jsonl',
+  sessionId: 'held-only',
+  agent: 'claude',
+  size: 1,
+  mtimeMs: 1,
+  ...extra,
+});
+
+const answeredRow = {
+  file: 'answered-extra.jsonl',
+  sessionId: 'answered-extra',
+  agent: 'codex',
+  activity: 1,
+  size: 1,
+  mtimeMs: 1,
+};
+
+const unknownPhysicalRow = (provider: any, row: object, scope: string) => {
+  provider.authoritativeCatalog = [row];
+  provider.authoritativeCatalogScope = scope;
+  provider.titles.set(heldRow().file, provider.titles.get('claude.jsonl'));
+  provider.physicalMembershipOf = () => 'unknown';
+};
+
+const gapCases: {
+  cause: string;
+  name: string;
+  gap: (provider: any, current: any[], scope: string) => any[] | void;
+  roots?: object[];
+}[] = [
+  {
+    cause: 'enumeration',
+    name: 'a walk that stays incomplete',
+    gap: (provider) => {
+      provider.sourceEnumerations.claude = { ...provider.sourceEnumerations.claude, status: 'incomplete' };
+    },
+  },
+  {
+    cause: 'admission',
+    name: 'a human-prompt scan that ends unfound and incomplete',
+    gap: (provider) => {
+      provider.enumeratedAdmissionComplete = false;
+    },
+  },
+  {
+    cause: 'heldRowUnanswered',
+    name: 'a held row after a coverage gap',
+    gap: (provider, _current, scope) => {
+      provider.enumeratedAdmissionComplete = false;
+      unknownPhysicalRow(provider, heldRow(), scope);
+    },
+  },
+  {
+    cause: 'heldRowUnanswered',
+    name: 'an unknown child held in the accepted catalog',
+    gap: (provider, _current, scope) => unknownPhysicalRow(provider, heldRow({ childTranscript: true }), scope),
+  },
+  {
+    cause: 'sizeMismatch',
+    name: 'a reply that answered more files than the catalog lists',
+    roots: [answeredRow],
+    gap: (_provider, current) => current.filter((source) => source.file !== answeredRow.file),
+  },
+];
+
+for (const { cause, name, gap, roots } of gapCases)
+  test(`${name} requests no further full pass over an unchanged workspace`, async () => {
+    vi.useFakeTimers();
+    try {
+      const { provider, counters, requests, settle, full } = settledGapHarness(gap, undefined, roots);
+      provider.refreshFrom('startup', true);
+      await settle();
+      assert.equal(full(), 1, `requests ${requests.join(', ')}`);
+      for (let refresh = 0; refresh < 5; refresh++) {
+        provider.refreshFrom('poll', false, true);
+        await settle();
+      }
+      assert.equal(full(), 1, 'a refresh over an unchanged workspace sent another full discovery request');
+      assert.equal(provider.sessionReadDiscoveryRevision, undefined, 'the gap marked coverage complete');
+      assert.equal(provider.dispatchDiscoveryPending, false);
+      assert.equal(counters.snapshot().work[`acceptedUnsettledStopped:${cause}`], 1);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+test('a settled reply over a gap sends its dispatched spend to spend-only passes', async () => {
+  vi.useFakeTimers();
+  try {
+    const { provider, requests, settle } = settledGapHarness((target: any) => {
+      target.enumeratedAdmissionComplete = false;
+    });
+    provider.refreshFrom('startup', true);
+    await settle();
+    assert.deepEqual(requests, ['discovery', 'spend'], 'a spend tail ran a full pass');
+    assert.equal(provider.dispatchSpendPending, false);
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
+
+test('an identity mismatch that stays the same requests one pass and then stops', async () => {
+  vi.useFakeTimers();
+  try {
+    const { provider, counters, requests, settle, full } = settledGapHarness((_target: any, current: any[]) =>
+      current.map((source) => ({ ...source, dev: 3, ino: 9 })),
+    );
+    provider.refreshFrom('startup', true);
+    await settle();
+    assert.equal(full(), 2, `requests ${requests.join(', ')}`);
+    assert.deepEqual(
+      {
+        requested: counters.snapshot().work['acceptedUnsettled:identityMismatch'],
+        stopped: counters.snapshot().work['acceptedUnsettledStopped:identityMismatch'],
+      },
+      { requested: 1, stopped: 1 },
+    );
+    assert.equal(provider.sessionReadDiscoveryRevision, undefined, 'the mismatch marked coverage complete');
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
+
+for (const [change, act, outcome] of [
+  ['a catalog change that a walk finds', (provider: any) => provider.refreshFrom('poll:directory', false, false), 2],
+  [
+    'a new child transcript that a watcher names',
+    (provider: any) => provider.refreshFrom('watcher', false, false, ['projects/child.jsonl']),
+    2,
+  ],
+] as const)
+  test(`${change} still sends a full pass after a gap stopped the requests`, async () => {
+    vi.useFakeTimers();
+    try {
+      const { provider, requests, settle, full } = settledGapHarness((target: any) => {
+        target.enumeratedAdmissionComplete = false;
+      });
+      provider.refreshFrom('startup', true);
+      await settle();
+      assert.equal(full(), 1);
+      act(provider);
+      await settle();
+      assert.equal(full(), outcome, `requests ${requests.join(', ')}`);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+test('a listed row that the reply never answered still requests one pass', async () => {
+  vi.useFakeTimers();
+  try {
+    const { provider, counters, requests, settle, full } = settledGapHarness(() => undefined);
+    provider.refreshFrom('startup', true);
+    await settle();
+    assert.equal(full(), 1);
+    // A reply held for a refresh answers only one row of the catalog that refresh lists.
+    provider.discoveryComplete = {
+      scope: JSON.stringify(provider.repositoryScopeRoots),
+      files: new Set(['claude.jsonl']),
+      revisions: new Map(),
+      settled: true,
+    };
+    provider.refreshFrom('poll', false, true);
+    await settle();
+    assert.equal(full(), 2, `requests ${requests.join(', ')}`);
+    assert.equal(counters.snapshot().work['acceptedUnsettled:listedRowUnanswered'], 1);
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
+
+test('a grown dispatched member still reads its spend while a gap stops full passes', async () => {
+  vi.useFakeTimers();
+  try {
+    const { provider, requests, settle, full } = settledGapHarness((target: any) => {
+      target.enumeratedAdmissionComplete = false;
+    });
+    provider.refreshFrom('startup', true);
+    await settle();
+    provider.claudeChildReferences = [
+      { kind: 'dispatch', sessionId: 'codex-a', file: 'codex-a.jsonl', parentSessionId: 'parent', toolUseIds: [] },
+    ];
+    provider.refreshFrom('dispatch-discovery', false, true);
+    await settle();
+    assert.equal(requests.filter((kind) => kind === 'spend').length, 2, 'the grown member read no spend');
+    assert.equal(full(), 1, 'a grown member sent a full pass while members stayed settled');
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
+
+test('a new worker with no held reply still sends a full pass after a gap stopped the requests', async () => {
+  vi.useFakeTimers();
+  try {
+    const { provider, requests, settle, full } = settledGapHarness((target: any) => {
+      target.enumeratedAdmissionComplete = false;
+    }, 'held-false');
+    provider.refreshFrom('startup', true);
+    await settle();
+    assert.deepEqual(requests, ['discovery', 'spend', 'discovery', 'spend'], requests.join(', '));
+    assert.equal(full(), 2);
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
+
+test('a transcript whose last record has no line break leaves admission incomplete at each scan', async () => {
+  const provider = completeDiscoveryHarness(undefined, false, ['prepareHumanPrompts'], {
+    humanPromptScanSteps,
+    promptScanLists,
+  });
+  provider.humanScans = new Map();
+  const root = tempDir('admission-open-record-');
+  const file = path.join(root, 'open.jsonl');
+  fs.writeFileSync(file, '{"type":"system","uuid":"one"}');
+  const stat = fs.statSync(file, { bigint: true });
+  const session = {
+    file,
+    sessionId: 'open',
+    agent: 'claude',
+    size: Number(stat.size),
+    mtimeMs: Number(stat.mtimeMs),
+    dev: stat.dev,
+    ino: stat.ino,
+  };
+  try {
+    for (let scan = 0; scan < 3; scan++) {
+      provider.enumeratedAdmissionComplete = true;
+      await provider.prepareHumanPrompts(
+        [session],
+        false,
+        new AbortController().signal,
+        undefined,
+        undefined,
+        undefined,
+        'skip',
+      );
+      assert.equal(provider.enumeratedAdmissionComplete, false, `scan ${scan} completed admission`);
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('a complete reply whose members are still unsettled publishes nothing until they settle', async () => {

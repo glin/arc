@@ -1847,7 +1847,11 @@ export class PanelProvider implements vscode.Disposable {
     scope: string;
     files: Set<string>;
     revisions?: Map<string, SessionFile>;
+    // True when the worker reported settled membership in the reply.
+    settled?: boolean;
   };
+  // The catalog membership of the last pass that an accepted identity mismatch requested. The same membership requests no second one.
+  private identityRearmMembership?: string;
   private discoveryRequestSequence = 0;
   private discoveryObservation?: {
     hostRequest: number;
@@ -11127,10 +11131,8 @@ export class PanelProvider implements vscode.Disposable {
         this.scopeSessionDirectories?.clear();
         this.authoritativeCatalogScope = catalogScope;
         // A reply over the saved openings cannot complete the list. It waits for the refresh that lists the walk of the pass.
-        const answered =
-          !this.codexListingSeeded && this.discoveryComplete?.scope === catalogScope
-            ? this.discoveryComplete.files
-            : undefined;
+        const reply = this.discoveryComplete;
+        const answered = !this.codexListingSeeded && reply?.scope === catalogScope ? reply.files : undefined;
         if (answered && all.every((session) => answered.has(session.file))) {
           this.completeCatalogScope = catalogScope;
           const revisions = this.discoveryComplete?.revisions;
@@ -11139,23 +11141,33 @@ export class PanelProvider implements vscode.Disposable {
               ? sessionDiscoveryMembership(catalogScope, all, revisions)
               : undefined;
           this.sessionQueryDiscoveryPending = !this.sessionReadDiscoveryRevision;
+          if (this.sessionReadDiscoveryRevision) this.identityRearmMembership = undefined;
           if (revisions && !this.sessionReadDiscoveryRevision) {
-            this.performanceCounters.recordWork(`acceptedUnsettled:${this.acceptedUnsettledCause(all, revisions)}`);
-            this.dispatchDiscoveryPending = true;
-            this.dispatchDiscoveryPendingWriter = 'acceptedUnsettled';
+            const cause = this.acceptedUnsettledCause(all, revisions);
+            if (this.acceptedUnsettledRequestsPass(cause, reply?.settled === true, all, catalogScope)) {
+              this.performanceCounters.recordWork(`acceptedUnsettled:${cause}`);
+              this.dispatchDiscoveryPending = true;
+              this.dispatchDiscoveryPendingWriter = 'acceptedUnsettled';
+            } else this.performanceCounters.recordWork(`acceptedUnsettledStopped:${cause}`);
           }
         } else if (answered) {
           // The catalog was listed again with a session the complete reply never answered. Discovery runs again before the list
           // completes, and the follow-up refresh this schedules lets the line clear.
-          this.performanceCounters.recordWork(
-            `acceptedUnsettled:${all.some((session) => !answered.has(session.file) && listedRows.has(session.file)) ? 'listedRowUnanswered' : 'heldRowUnanswered'}`,
-          );
-          const discoveryWaiting = this.dispatchedDiscoveryWaiting();
-          this.dispatchDiscoveryPending = true;
-          this.dispatchDiscoveryPendingWriter = 'catalogMismatch';
-          this.publishSessionQueryContext();
-          if (this.dispatchedDiscoveryWaiting() !== discoveryWaiting)
-            this.postDispatchedCostsIfMoved('refreshDiscovery');
+          const cause = all.some((session) => !answered.has(session.file) && listedRows.has(session.file))
+            ? 'listedRowUnanswered'
+            : 'heldRowUnanswered';
+          // A held row reached this acceptance from the previous one, so no pass answers it. A settled reply leaves it for the next walk.
+          if (reply?.settled === true && cause === 'heldRowUnanswered') {
+            this.performanceCounters.recordWork(`acceptedUnsettledStopped:${cause}`);
+          } else {
+            this.performanceCounters.recordWork(`acceptedUnsettled:${cause}`);
+            const discoveryWaiting = this.dispatchedDiscoveryWaiting();
+            this.dispatchDiscoveryPending = true;
+            this.dispatchDiscoveryPendingWriter = 'catalogMismatch';
+            this.publishSessionQueryContext();
+            if (this.dispatchedDiscoveryWaiting() !== discoveryWaiting)
+              this.postDispatchedCostsIfMoved('refreshDiscovery');
+          }
         }
         if (!this.codexListingSeeded) this.discoveryComplete = undefined;
         this.publishSessionQueryContext();
@@ -14778,6 +14790,7 @@ export class PanelProvider implements vscode.Disposable {
     this.claudeChildReferences = progress.references;
     this.startupHistory?.stage('relationshipsComplete');
     this.dispatchDiscoveryPending = progress.continuation && progress.membershipSettled !== true;
+    const membersSettled = !this.dispatchDiscoveryPending;
     if (this.dispatchDiscoveryPending) this.dispatchDiscoveryPendingWriter = 'unsettledReply';
     this.dispatchSpendPending = progress.continuation && progress.membershipSettled === true;
     this.applyDispatchFacts(progress.dispatchFacts ?? []);
@@ -14867,6 +14880,7 @@ export class PanelProvider implements vscode.Disposable {
       scope: JSON.stringify(this.repositoryScopeRoots),
       files: new Set(sessions.map((session) => session.file)),
       revisions: new Map(sessions.map((session) => [session.file, { ...session }])),
+      settled: membersSettled,
     };
     this.updateSessionSpendSources(codex, sessions);
     if (this.catalog) {
@@ -15078,6 +15092,23 @@ export class PanelProvider implements vscode.Disposable {
     if (this.dispatchDiscoveryPending) return 'pendingSet';
     if (this.membershipCoverage?.status !== 'complete') return this.membershipCoverageGap ?? 'enumeration';
     return sessionDiscoveryMismatch(catalog, answered) === 'identity' ? 'identityMismatch' : 'sizeMismatch';
+  }
+
+  // True when this acceptance asks for another full pass. A settled reply leaves coverage gaps for the next walk, and a spend
+  // tail for its spend-only passes. An identity mismatch asks for one pass: the reply and the catalog named different files,
+  // and a further reply cannot answer a membership that stays the same.
+  private acceptedUnsettledRequestsPass(
+    cause: AcceptedUnsettledCause,
+    settled: boolean,
+    catalog: readonly SessionFile[],
+    scope: string,
+  ): boolean {
+    if (!settled || cause === 'pendingSet') return true;
+    if (cause !== 'identityMismatch') return false;
+    const membership = sessionCatalogMembership(scope, catalog);
+    if (membership === this.identityRearmMembership) return false;
+    this.identityRearmMembership = membership;
+    return true;
   }
 
   private acceptSessionCoverage(current: SessionFile[], scope: string): SessionFile[] {
