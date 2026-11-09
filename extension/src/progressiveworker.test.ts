@@ -16081,6 +16081,60 @@ test('a queued body that another window decoded is not decoded again', async () 
   }
 });
 
+test('a throw on one job takes the retries and the next job runs', async () => {
+  const decoded: string[] = [];
+  const harness = backfillHarness({
+    exists: () => false,
+    statOf: () => ({ ...unitStat, isFile: true }),
+    stream: async (file) => {
+      decoded.push(file);
+      if (file === 'bad.jsonl.zst') throw new Error('corrupt');
+      return unitDecoded();
+    },
+  });
+  seedBody(harness, 'bad.jsonl.zst');
+  seedBody(harness, 'good.jsonl.zst');
+  try {
+    harness.backfill.setNames(['bad.jsonl.zst', 'good.jsonl.zst']);
+    await vi.waitFor(() => assert.deepEqual(decoded, ['bad.jsonl.zst', 'good.jsonl.zst'], 'the next job did not run'));
+    await vi.waitFor(() => assert.equal(harness.scheduled.length >= 1, true));
+    assert.equal(
+      harness.scheduled.some((item) => item.at - harness.now() === 10_000),
+      true,
+      'the failed job took no retry',
+    );
+  } finally {
+    harness.backfill.dispose();
+  }
+});
+
+test('a throw while planning one name leaves the other names', async () => {
+  const decoded: string[] = [];
+  const harness = backfillHarness({
+    exists: () => false,
+    statOf: (file) => {
+      if (file === 'bad.jsonl.zst') throw new Error('EPERM');
+      return { ...unitStat, isFile: true };
+    },
+    stream: async (file) => {
+      decoded.push(file);
+      return unitDecoded();
+    },
+  });
+  seedBody(harness, 'good.jsonl.zst');
+  try {
+    harness.backfill.setNames(['bad.jsonl.zst', 'good.jsonl.zst']);
+    await vi.waitFor(() => assert.deepEqual(decoded, ['good.jsonl.zst'], 'a throw on one name ended the plan'));
+    assert.equal(
+      harness.scheduled.some((item) => item.at - harness.now() === 600_000),
+      true,
+      'no later plan is due',
+    );
+  } finally {
+    harness.backfill.dispose();
+  }
+});
+
 const unitStat = { size: 10, mtimeMs: 2, dev: 1, ino: 1 };
 const unitDecoded = (hash = 'h') =>
   ({ kind: 'decoded', hash, stat: unitStat as never, frames: 1, complete: true }) as const;

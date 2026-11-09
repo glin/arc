@@ -370,6 +370,7 @@ export class CompressedBackfill {
   private readonly stop = new AbortController();
   private readonly outbox: CompressedFactEntry[] = [];
   private cancelFlush: (() => void) | null = null;
+  private cancelReplan: (() => void) | null = null;
   private lastFlush = -Infinity;
   private unpostedMs = 0;
   private readonly now: () => number;
@@ -460,6 +461,8 @@ export class CompressedBackfill {
     this.stop.abort();
     this.cancelFlush?.();
     this.cancelFlush = null;
+    this.cancelReplan?.();
+    this.cancelReplan = null;
   }
 
   private factsOf(file: string): CompressedEntrySeed | undefined {
@@ -486,7 +489,12 @@ export class CompressedBackfill {
         if (this.dirty) {
           await this.waitIdle();
           if (this.disposed) return;
-          await this.plan();
+          try {
+            await this.plan();
+          } catch {
+            this.replanLater();
+            break;
+          }
         }
         const job = this.queue.shift();
         if (!job) break;
@@ -503,8 +511,13 @@ export class CompressedBackfill {
           !stored.unreadable
         )
           continue;
-        if (job.kind === 'opening') await this.deriveOpening(job);
-        else await this.deriveBody(job);
+        try {
+          if (job.kind === 'opening') await this.deriveOpening(job);
+          else await this.deriveBody(job);
+        } catch {
+          // A throw on one file must not end the worker, or each new worker reaches the same file.
+          await this.retryLater(job).catch(() => undefined);
+        }
       }
     } finally {
       this.running = false;
@@ -538,41 +551,64 @@ export class CompressedBackfill {
         await this.planYield();
         started = this.now();
       }
-      const stat = this.statOf(file);
-      if (!stat?.isFile || this.exists(file.replace(/\.zst$/, ''))) continue;
-      const retry = this.retries.get(file);
-      if (retry && retry.size === stat.size && retry.mtimeMs === stat.mtimeMs && retry.at > this.now()) continue;
-      const entry = this.factsOf(file);
-      const current = entry && compressedEntryCurrent(entry, stat);
-      if (current && entry.decodedLength !== undefined && !entry.unreadable) {
-        this.repairOpening(file, entry, stat, repairs);
-        continue;
+      try {
+        this.planName(file, { events, adopted, unplaced, placed }, repairs);
+      } catch {
+        this.replanLater();
       }
-      if (current && entry.unreadable && entry.unreadableLaunch === this.options.launch) {
-        this.retries.set(file, {
-          size: stat.size,
-          mtimeMs: stat.mtimeMs,
-          attempts: BACKFILL_RETRY_DELAYS_MS.length,
-          at: Infinity,
-        });
-        continue;
-      }
-      const job: Job = { kind: 'body', file, stat };
-      if (this.events.delete(file) || entry?.adoptionFailed || this.staleOpens.delete(file)) {
-        events.push(job);
-        continue;
-      }
-      if (entry?.adopted) {
-        adopted.push(job);
-        continue;
-      }
-      const opening = this.placingOpening(file, entry, stat);
-      if (opening === undefined) unplaced.push({ kind: 'opening', file, stat });
-      else if (codexRowAdmitted(opening, stat, this.inFolders)) placed.push(job);
     }
     placed.sort((left, right) => right.stat.mtimeMs - left.stat.mtimeMs);
     this.queue = [...events, ...adopted, ...unplaced, ...placed];
     if (repairs.length) await this.appendOpenings(repairs);
+  }
+
+  private planName(
+    file: string,
+    { events, adopted, unplaced, placed }: { events: Job[]; adopted: Job[]; unplaced: Job[]; placed: Job[] },
+    repairs: CompressedFactEntry[],
+  ): void {
+    const stat = this.statOf(file);
+    if (!stat?.isFile || this.exists(file.replace(/\.zst$/, ''))) return;
+    const retry = this.retries.get(file);
+    if (retry && retry.size === stat.size && retry.mtimeMs === stat.mtimeMs && retry.at > this.now()) return;
+    const entry = this.factsOf(file);
+    const current = entry && compressedEntryCurrent(entry, stat);
+    if (current && entry.decodedLength !== undefined && !entry.unreadable) {
+      this.repairOpening(file, entry, stat, repairs);
+      return;
+    }
+    if (current && entry.unreadable && entry.unreadableLaunch === this.options.launch) {
+      this.retries.set(file, {
+        size: stat.size,
+        mtimeMs: stat.mtimeMs,
+        attempts: BACKFILL_RETRY_DELAYS_MS.length,
+        at: Infinity,
+      });
+      return;
+    }
+    const job: Job = { kind: 'body', file, stat };
+    if (this.events.delete(file) || entry?.adoptionFailed || this.staleOpens.delete(file)) {
+      events.push(job);
+      return;
+    }
+    if (entry?.adopted) {
+      adopted.push(job);
+      return;
+    }
+    const opening = this.placingOpening(file, entry, stat);
+    if (opening === undefined) unplaced.push({ kind: 'opening', file, stat });
+    else if (codexRowAdmitted(opening, stat, this.inFolders)) placed.push(job);
+  }
+
+  // A plan that could not read a name or the store runs again after the longest retry delay.
+  private replanLater(): void {
+    if (this.cancelReplan || this.disposed) return;
+    const delay = BACKFILL_RETRY_DELAYS_MS[BACKFILL_RETRY_DELAYS_MS.length - 1];
+    this.cancelReplan = this.schedule(delay, () => {
+      this.cancelReplan = null;
+      this.dirty = true;
+      void this.run();
+    });
   }
 
   // A stop can lose an opening write, so a current facts entry writes its opening again with no decode.
