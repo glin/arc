@@ -13906,8 +13906,9 @@ export class PanelProvider implements vscode.Disposable {
   // `walkCause` names a walk that runs because the caller did not ask for reuse. A caller that may walk must name it.
   // `parts` times the filesystem calls of a walk and the file stats that check the held catalog again.
   // While a walk reads the sources in slices, a missed reuse from outside the walk answers from the rows the catalog holds.
+  // A caller that waited for a walk to end passes 'settled'. A missed reuse then answers the same way and starts no walk.
   private allSessions(
-    reuseCatalog = false,
+    reuseCatalog: boolean | 'settled' = false,
     deferHumanPrompts = false,
     codexEnumeration?: SourceEnumeration,
     deferWalk?: { needed: boolean },
@@ -13986,7 +13987,8 @@ export class PanelProvider implements vscode.Disposable {
       namedFileChanged = true;
     }
     let selectedFileGone = false;
-    const outsideWalk = reuseCatalog && !!this.catalogWalkRunning && !deferWalk && !codexEnumeration;
+    const settled = reuseCatalog === 'settled';
+    const outsideWalk = reuseCatalog && (settled || !!this.catalogWalkRunning) && !deferWalk && !codexEnumeration;
     if (reuseCatalog && this.catalog && this.catalog.folders === folderPrint && (!namedFileChanged || outsideWalk)) {
       // With no selection, or a draft selected, the held catalog has no row to revalidate. A draft has no file to list.
       const revalidated =
@@ -16869,6 +16871,7 @@ export class PanelProvider implements vscode.Disposable {
     const waited =
       this.codexPriming ||
       (this.catalogWalkRunning && !this.catalog?.sessions.some((held) => held.sessionId === sessionId));
+    let walked = false;
     if (waited) {
       if (!selected().has(sessionId) || !this.readWindows.has(sessionId) || this.history.get(sessionId)?.atBeginning) {
         return;
@@ -16876,13 +16879,13 @@ export class PanelProvider implements vscode.Disposable {
       const waiting = { sessionId, controller: new AbortController(), generation: ++this.historyGeneration };
       this.historyRequest = waiting;
       this.refreshFrom('history', true, true, null, true, true);
-      await this.catalogSettled();
+      walked = await this.catalogSettled();
       if (this.historyRequest !== waiting) {
         return;
       }
       this.historyRequest = null;
     }
-    const session = this.allSessions(true).find((candidate) => candidate.sessionId === sessionId);
+    const session = this.allSessions(walked ? 'settled' : true).find((candidate) => candidate.sessionId === sessionId);
     const visible = selected();
     const window = this.readWindows.get(sessionId);
     if (
@@ -17854,7 +17857,7 @@ export class PanelProvider implements vscode.Disposable {
     // Apply current labels, pins, archive state, and agent-run classification at search time. Transcript revisions do not track reader state.
     // `panelAgentRun` gives `is:agentrun` the answer the session list gives for the same session.
     const archived = this.archivedSessions();
-    const sessions = retainedSessions ?? this.allSessions(true);
+    const sessions = retainedSessions ?? this.allSessions(walked ? 'settled' : true);
     const parentEdges = this.sessionParentEdges(sessions).edges;
     const runs = new Map(sessions.map((session) => [session.sessionId, this.agentRunFor(session, parentEdges)]));
     const labelled = scope.entries.map((e) => {
@@ -17880,7 +17883,7 @@ export class PanelProvider implements vscode.Disposable {
   // Populate the bounded search corpus only for an explicit content search, outside polling and rendering.
   // After a walk ended, `walked` reads the catalog that the walk committed instead of reading the sources again.
   private searchCorpus(only: string | null = null, walked = false): SearchEntry[] {
-    const all = this.allSessions(walked, false, undefined, undefined, 'requested:search');
+    const all = this.allSessions(walked ? 'settled' : false, false, undefined, undefined, 'requested:search');
     // Refresh Codex names before filing search results.
     this.threadNames = readThreadNames(codexSessionIndexPath(), this.threadNames);
     const live = new Set(all.map((f) => f.file));

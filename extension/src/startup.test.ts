@@ -10202,13 +10202,13 @@ test('a held-catalog request during a sliced walk answers from the held rows and
   assert.equal(listings, 0, 'a request during the walk read the Claude sources on the host thread');
 });
 
-test('a content search during a sliced walk waits for the commit and reads the rows it lists', async () => {
-  let listings = 0;
+function searchingWalkHarness(scope: Record<string, unknown> = {}) {
+  const sources = { listings: 0 };
   const read: string[] = [];
-  const { provider, writeParent, pauseOnce, releaseAll } = slicedWalkHarness(
+  const harness = slicedWalkHarness(
     {
       enumerateSessionFilesFor: () => {
-        listings += 1;
+        sources.listings += 1;
         return noListing;
       },
       parsePanelToHost,
@@ -10223,25 +10223,110 @@ test('a content search during a sliced walk waits for the commit and reads the r
         return { turns: [], readBytes: 0 };
       },
       SEARCH_TAIL_BYTES: 1024,
+      ...scope,
     },
     ['onMessage', 'answerSearch', 'searchCorpus'],
   );
+  const { provider } = harness;
   provider.corpus = new Map();
   provider.archivedSessions = () => new Set();
   provider.observeParsedNames = () => {};
+  return {
+    ...harness,
+    sources,
+    read,
+    answered: () => provider.posts.some((message: { type: string }) => message.type === 'results'),
+    search: () => provider.onMessage({ type: 'search', text: 'find:hello' }, provider.hosts[0]),
+  };
+}
+
+test('a content search during a sliced walk waits for the commit and reads the rows it lists', async () => {
+  const { sources, read, answered, search, writeParent, pauseOnce, releaseAll, provider } = searchingWalkHarness();
   const first = writeParent('first');
   let added = '';
   let answeredDuringWalk: boolean | null = null;
   pauseOnce(async () => {
     added = writeParent('added');
-    await provider.onMessage({ type: 'search', text: 'find:hello' }, provider.hosts[0]);
-    answeredDuringWalk = provider.posts.some((message: { type: string }) => message.type === 'results');
+    await search();
+    answeredDuringWalk = answered();
   });
   await releaseAll(provider.refresh(true));
-  await vi.waitFor(() => assert.ok(provider.posts.some((message: { type: string }) => message.type === 'results')));
+  await vi.waitFor(() => assert.ok(answered()));
   assert.equal(answeredDuringWalk, false, 'the search answered before the commit');
   assert.deepEqual(read.sort(), [added, first].sort(), 'the search did not read the rows of the commit');
-  assert.equal(listings, 0, 'the search read the Claude sources on the host thread');
+  assert.equal(sources.listings, 0, 'the search read the Claude sources on the host thread');
+});
+
+test('a content search that waited for a sliced walk reads no source when the commit lacks the selected session', async () => {
+  const { sources, read, answered, search, writeParent, pauseOnce, releaseAll, provider } = searchingWalkHarness({
+    revalidatedCatalog,
+  });
+  writeParent('first');
+  pauseOnce(async () => {
+    await search();
+    provider.showing = 'gone';
+  });
+  await releaseAll(provider.refresh(true));
+  await vi.waitFor(() => assert.ok(answered()));
+  assert.deepEqual(read, [], 'the search read a row outside the selected session');
+  assert.equal(sources.listings, 0, 'the search walked the sources after the commit');
+});
+
+test('a content search that waited for a sliced walk past its deadline answers from no rows and reads no source', async () => {
+  vi.useFakeTimers(STREAM_TIMERS);
+  try {
+    const { sources, read, answered, search, walks, writeParent, provider } = searchingWalkHarness();
+    writeParent('first');
+    const refresh = provider.refresh(true);
+    await untilWalkSettles(() => walks.length === 1, 'the refresh did not start its walk');
+    await search();
+    await vi.advanceTimersByTimeAsync(CATALOG_WALK_DEADLINE_MS);
+    await untilWalkSettles(answered, 'the search did not answer after the deadline');
+    assert.deepEqual(read, [], 'the search read a row with no catalog held');
+    assert.equal(sources.listings, 0, 'the search walked the sources after the deadline');
+    walks[0].release();
+    await refresh;
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('older history that waited for a sliced walk past its deadline reads no source and no page', async () => {
+  vi.useFakeTimers(STREAM_TIMERS);
+  try {
+    let listings = 0;
+    const { provider, walks, writeParent } = slicedWalkHarness(
+      {
+        enumerateSessionFilesFor: () => {
+          listings += 1;
+          return noListing;
+        },
+        startSessionHistory,
+      },
+      ['loadOlderHistory'],
+    );
+    writeParent('first');
+    provider.showing = 'first';
+    provider.hostSessions = new Map();
+    provider.readWindows = new Map([['first', { loadedTurns: 40 }]]);
+    provider.historyGeneration = 0;
+    let pages = 0;
+    provider.readOlderHistoryPage = () => {
+      pages += 1;
+      return Promise.resolve({ kind: 'failed' });
+    };
+    const refresh = provider.refresh(true);
+    await untilWalkSettles(() => walks.length === 1, 'the refresh did not start its walk');
+    const older: Promise<void> = provider.loadOlderHistory('first');
+    await vi.advanceTimersByTimeAsync(CATALOG_WALK_DEADLINE_MS);
+    await older;
+    assert.equal(pages, 0, 'the request read a page with no catalog held');
+    assert.equal(listings, 0, 'the request walked the sources after the deadline');
+    walks[0].release();
+    await refresh;
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 test('older history during the first sliced walk waits for the commit and reads the page once', async () => {
