@@ -50,6 +50,8 @@ export interface BudgetWorkspace {
   runningRollout: BudgetSource;
   completeRunningRollout(at: number): void;
   growChild(child: BudgetChild, at: number): void;
+  // Adds rollouts that share a session id with a Claude parent, so the next walk reads their qualified openings.
+  addCollisions(at: number): void;
 }
 
 function randomFrom(seed: number): () => number {
@@ -192,10 +194,9 @@ export function budgetWorkspace(root: string, seed = BUDGET_SEED, clock = BUDGET
     }
   }
 
-  // A rollout that shares a session id with a Claude parent collides with it. The rest have their own ids.
   const rollouts: BudgetSource[] = [];
   for (let index = 0; index < ROLLOUTS; index++) {
-    const id = index < COLLISIONS ? parents[index].sessionId : sessionId(2, index);
+    const id = sessionId(2, index);
     const cwd = folders[index % folders.length];
     const file = path.join(codexSessions, '2026', '10', '20', `rollout-2026-10-20T00-00-00-${id}.jsonl`);
     const at = clock - (index + 1) * 90_000;
@@ -283,6 +284,18 @@ export function budgetWorkspace(root: string, seed = BUDGET_SEED, clock = BUDGET
         [{ type: 'user', timestamp: stamp(at), message: { role: 'user', content: 'One more step.' } }],
         at,
       );
+    },
+    addCollisions(at) {
+      for (const parent of parents.slice(0, COLLISIONS)) {
+        const file = path.join(
+          codexSessions,
+          '2026',
+          '10',
+          '20',
+          `rollout-2026-10-20T00-00-01-${parent.sessionId}.jsonl`,
+        );
+        writeRecords(file, rolloutRecords(parent.sessionId, parent.cwd, at, true), at);
+      }
     },
   };
 }

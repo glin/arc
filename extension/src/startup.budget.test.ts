@@ -114,9 +114,9 @@ beforeAll(async () => {
   workerSource = `performance.now=()=>0;Date.now=()=>${BUDGET_CLOCK};process.env.ARC_HOME=${JSON.stringify(workspace.home)};${bundle}`;
 });
 
-function counts(counters: { snapshot(): any }): Counts {
+function counts(counters: { snapshot(): any }, posts: Counts): Counts {
   const snapshot = counters.snapshot();
-  const row: Counts = {};
+  const row: Counts = { ...posts };
   for (const [name, count] of Object.entries<number>(snapshot.work))
     if (WORK_NAMES.has(name) || COUNTER_PREFIXES.some((prefix) => name.startsWith(prefix))) row[name] = count;
   for (const [name, entry] of Object.entries<{ count: number }>(snapshot.refreshes))
@@ -165,9 +165,18 @@ function outsideBudget(measured: Record<string, Counts>, rows: Record<string, Bu
   return failures;
 }
 
+// Counts the panel messages that carry rows, so a post that sends more rows than the panel needs moves a row.
+function countPost(posts: Counts, message: any): void {
+  if (!['render', 'rail', 'selection'].includes(message?.type)) return;
+  const add = (name: string, count: number) => (posts[name] = (posts[name] ?? 0) + count);
+  add(`posted:${message.type}`, 1);
+  if (message.rows) add(`posted:${message.type}:${message.rows.base === null ? 'snapshot' : 'delta'}`, 1);
+  add(`posted:${message.type}:rows`, (message.sessions?.length ?? 0) + (message.rail?.length ?? 0));
+}
+
 // One activation of the panel host. The host, its worker and its counters are real. The test owns the clock, the panel and
 // the watcher events.
-function activate() {
+function activate(options: { stubReadPasses: boolean }) {
   const { PanelProvider, ProgressiveWorker, CommitRepositories, RepositoryCommits } = modules;
   vi.spyOn(PanelProvider.prototype, 'wireEditorListeners').mockImplementation(() => {});
   vi.spyOn(PanelProvider.prototype, 'createRepositoryScope').mockImplementation(() => ({
@@ -204,9 +213,14 @@ function activate() {
     releaseQueuedEditOffer() {},
     closeBrowserStagingForHost() {},
     watchDirectories() {},
-    prepareMetadata: async () => true,
-    prepareRailEnrichment: async () => ({ changed: false, progress: false, stale: [] }),
   });
+  // A cold start reads every file once. Its metadata and enrichment passes are a fixed cost that the later steps guard.
+  if (options.stubReadPasses)
+    Object.assign(provider, {
+      prepareMetadata: async () => true,
+      prepareRailEnrichment: async () => ({ changed: false, progress: false, stale: [] }),
+    });
+  const posts: Counts = {};
   const started: Promise<unknown>[] = [];
   for (const method of ['refresh', 'continueDiscovery', 'pollCatalog', 'refineDispatchedSpend']) {
     const original = provider[method];
@@ -226,7 +240,10 @@ function activate() {
       cspSource: '',
       options: {},
       asWebviewUri: (uri: unknown) => uri,
-      postMessage: () => Promise.resolve(true),
+      postMessage: (message: unknown) => {
+        countPost(posts, message);
+        return Promise.resolve(true);
+      },
       onDidReceiveMessage: (listener: typeof receive) => {
         receive = listener;
         return disposable;
@@ -252,7 +269,7 @@ function activate() {
       if (!provider.dispatchDiscoveryPending && !provider.dispatchSpendPending) advanced++;
     }
   };
-  return { provider, worker, settle, receive: (message: unknown) => receive(message) };
+  return { provider, worker, posts, settle, receive: (message: unknown) => receive(message) };
 }
 
 test('each step of the session list script stays within its recorded counts', async () => {
@@ -265,12 +282,12 @@ test('each step of the session list script stays within its recorded counts', as
     return 0;
   }) as typeof setInterval);
   const measured: Record<string, Counts> = {};
-  let active = activate();
+  let active = activate({ stubReadPasses: true });
   let before: Counts = {};
   const step = async (name: string, act: () => void | Promise<void>) => {
     await act();
     await active.settle();
-    const after = counts(active.provider.performanceCounters);
+    const after = counts(active.provider.performanceCounters, active.posts);
     measured[name] = difference(after, before);
     before = after;
   };
@@ -284,7 +301,7 @@ test('each step of the session list script stays within its recorded counts', as
     active.provider.dispose();
     active.worker.stop();
     intervals.length = 0;
-    active = activate();
+    active = activate({ stubReadPasses: false });
     before = {};
     await step('warm start', () => void active.receive({ type: 'ready' }));
     await step('completion', () => {
@@ -300,10 +317,19 @@ test('each step of the session list script stays within its recorded counts', as
       'selection switch',
       () => void active.receive({ type: 'showSession', session: workspace.parents[50].sessionId }),
     );
+    await step('session list update', () => void active.receive({ type: 'setRailFilters', railFilters: [] }));
     const poll = intervals.find((callback) => callback.toString().includes('pollCatalog'));
     assert.ok(poll, 'polling never started');
     await step('poll and backstop walk', async () => {
       vi.setSystemTime(Date.now() + 5_000);
+      poll();
+      await active.settle();
+      vi.setSystemTime(Date.now() + POLL_BACKSTOP_WALK_MS);
+      poll();
+    });
+    await step('collision walk', async () => {
+      workspace.addCollisions(Date.now());
+      vi.setSystemTime(Date.now() + POLL_BACKSTOP_WALK_MS);
       poll();
       await active.settle();
       vi.setSystemTime(Date.now() + POLL_BACKSTOP_WALK_MS);
