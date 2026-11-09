@@ -35,7 +35,10 @@ import {
   indexSpendFile,
   invalidateSpendFileNormalization,
   loadSpendLedger,
+  compressedSpendDisplayFiles,
   normalizeSpendFile,
+  spendRecordTotal,
+  type CompressedSpendCandidate,
   normalizeWorkspace,
   prepareProjectSpendView,
   projectSpendDisplayFiles,
@@ -1917,6 +1920,123 @@ const spendRecord = (name: string, more: Partial<SpendFileIndex> = {}): SpendFil
   lifetimeBuckets: [],
   indexedAt: 1,
   ...more,
+});
+
+// One record worth `dollars`, at one request per dollar so the pick orders by its total.
+const dollarRecord = (name: string, dollars: number, more: Partial<SpendFileIndex> = {}): SpendFileIndex =>
+  spendRecord(name, {
+    lifetimeBuckets: [
+      { requests: dollars, reportedCost: dollars, reportedCostBasis: 'list' } as unknown as ProjectUsageBucket,
+    ],
+    ...more,
+  });
+
+const compressedCandidate = (
+  name: string,
+  dollars: number | null,
+  more: Partial<CompressedSpendCandidate> = {},
+): CompressedSpendCandidate => ({
+  pairKey: normalizeSpendFile(name),
+  threadId: 'thread',
+  spend: dollars === null ? null : dollarRecord(name, dollars),
+  complete: true,
+  ...more,
+});
+
+const noSessionId = () => null;
+
+test('an adopted $7 compression shows $7, and a resume shows the twin until the appends finish', () => {
+  const plain = 'rollout-a.jsonl';
+  const shown = (files: SpendFileIndex[], candidate: CompressedSpendCandidate) =>
+    compressedSpendDisplayFiles(files, [candidate], noSessionId).map((record) => spendRecordTotal(record).dollars);
+  // The ledger keeps the plain record, and the join shows one total.
+  assert.deepEqual(shown([dollarRecord(plain, 7)], compressedCandidate(plain, 7)), [7]);
+  // A resume rescans the plain file from byte 0: while the scan runs the plain record is incomplete, so the twin's $7 shows.
+  assert.deepEqual(
+    shown([dollarRecord(plain, 2, { complete: false })], compressedCandidate(plain, 7)),
+    [7],
+    'a rescan of the plain file lowered the shown total',
+  );
+  // The appends finish, and the $10 plain record is the largest complete total.
+  assert.deepEqual(shown([dollarRecord(plain, 10)], compressedCandidate(plain, 7)), [10]);
+});
+
+test('a second compression shows the plain $10 before the backfill decode and the compressed $10 after, also when the decode skips usage', () => {
+  const plain = 'rollout-b.jsonl';
+  const display = (candidate: CompressedSpendCandidate) =>
+    compressedSpendDisplayFiles([dollarRecord(plain, 10)], [candidate], noSessionId).map(
+      (record) => spendRecordTotal(record).dollars,
+    );
+  // Before its decode, the adopted entry and the plain record both hold $10.
+  assert.deepEqual(display(compressedCandidate(plain, 10)), [10]);
+  // After the decode, the compressed record holds the same stream.
+  assert.deepEqual(display(compressedCandidate(plain, 10, { spend: dollarRecord(plain, 10) })), [10]);
+  // A decode that skips a usage record reports $8 with the mark. The plain record keeps the shown total.
+  assert.deepEqual(display(compressedCandidate(plain, 8)), [10]);
+});
+
+test('a twin of another thread joins nothing and the plain record counts as it did', () => {
+  const plain = dollarRecord('rollout-c.jsonl', 5);
+  const other = compressedCandidate('rollout-other.jsonl', 9, { threadId: 'other-thread' });
+  const shown = compressedSpendDisplayFiles([plain], [other], () => 'this-thread');
+  assert.deepEqual(
+    shown.map((record) => record.file).sort(),
+    [other.spend!.file, plain.file].sort(),
+    'the unrelated twin took the plain record',
+  );
+});
+
+test('a plain record joins by session id when its path differs from the pair key', () => {
+  const plain = dollarRecord('rollout-d-renamed.jsonl', 3);
+  const entry = compressedCandidate('rollout-d.jsonl', 9, { threadId: 'thread-d' });
+  const shown = compressedSpendDisplayFiles([plain], [entry], (file) => (file === plain.file ? 'thread-d' : null));
+  assert.deepEqual(
+    shown.map((record) => spendRecordTotal(record).dollars),
+    [9],
+    'the session id join missed',
+  );
+});
+
+test.skipIf(process.platform === 'win32' && !process.env.SystemRoot)(
+  'a plain record joins an entry through a junction alias of its directory',
+  () => {
+    const root = dir();
+    const real = path.join(root, 'real');
+    fs.mkdirSync(real);
+    const alias = path.join(root, 'alias');
+    fs.symlinkSync(real, alias, process.platform === 'win32' ? 'junction' : 'dir');
+    const twinPath = path.join(real, 'rollout-e.jsonl');
+    fs.writeFileSync(twinPath, '{}');
+    const plain = dollarRecord(twinPath, 2, { file: path.join(alias, 'rollout-e.jsonl') });
+    assert.notEqual(plain.file, normalizeSpendFile(twinPath), 'the record does not name the alias');
+    const entry = compressedCandidate(twinPath, 9);
+    const shown = compressedSpendDisplayFiles([plain], [entry], noSessionId);
+    assert.deepEqual(
+      shown.map((record) => spendRecordTotal(record).dollars),
+      [9],
+      'the join did not follow the alias',
+    );
+    invalidateSpendFileNormalization(path.join(alias, 'rollout-e.jsonl'));
+  },
+);
+
+test('a thread with no complete record counts its plain records as they stand', () => {
+  const plain = dollarRecord('rollout-f.jsonl', 2, { complete: false });
+  const incomplete = compressedCandidate('rollout-f.jsonl', 5, { complete: false });
+  assert.deepEqual(compressedSpendDisplayFiles([plain], [incomplete], noSessionId), [plain]);
+});
+
+test('other threads pass through the pick unchanged and no candidate leaves the list as it was', () => {
+  const unrelated = dollarRecord('rollout-g.jsonl', 4);
+  assert.deepEqual(compressedSpendDisplayFiles([unrelated], [], noSessionId), [unrelated]);
+  const another = dollarRecord('rollout-h.jsonl', 1);
+  const pick = compressedSpendDisplayFiles(
+    [unrelated, another],
+    [compressedCandidate('rollout-h.jsonl', 3)],
+    noSessionId,
+  );
+  assert.deepEqual(pick.length, 2);
+  assert.ok(pick.includes(unrelated));
 });
 
 const ledgerName = (folder: string): string => fs.readdirSync(folder).filter((entry) => entry.endsWith('.json'))[0];

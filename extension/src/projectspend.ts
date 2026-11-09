@@ -4012,6 +4012,81 @@ export class SpendCoverage {
   }
 }
 
+// One compressed rollout in the display join. `spend` is its spend record, and `complete` says the record covers the
+// whole body as Codex wrote it.
+export interface CompressedSpendCandidate {
+  pairKey: string;
+  threadId: string | null;
+  spend: SpendFileIndex | null;
+  complete: boolean;
+}
+
+// The total a record covers: priced dollars first, then its request count. Records of one thread cover prefixes of one
+// byte stream, so the larger total covers the most bytes.
+export function spendRecordTotal(record: SpendFileIndex): { dollars: number; requests: number } {
+  const buckets = record.lifetimeBuckets ?? record.buckets;
+  let dollars = 0;
+  let requests = 0;
+  for (const bucket of buckets) {
+    dollars += publicProjectSpendPrice(bucket)?.dollars ?? 0;
+    requests += bucket.requests;
+  }
+  return { dollars, requests };
+}
+
+function spendTotalCompare(left: SpendFileIndex, right: SpendFileIndex): number {
+  const a = spendRecordTotal(left);
+  const b = spendRecordTotal(right);
+  return a.dollars - b.dollars || a.requests - b.requests;
+}
+
+// A marked derivation never replaces a higher total. The entry keeps the higher spend record and takes the mark.
+export function keepHigherSpend(
+  previous: SpendFileIndex | undefined,
+  next: SpendFileIndex | undefined,
+): SpendFileIndex | undefined {
+  if (!previous || !next) return next ?? previous;
+  return spendTotalCompare(previous, next) > 0 ? previous : next;
+}
+
+// For a thread with a compressed entry the session shows the largest total among its complete records. A plain record
+// joins an entry by a canonical path equal to the entry's pair key, or else by the session id of its opening. Other
+// records pass through. The pick reads the ledger and never enters it.
+export function compressedSpendDisplayFiles(
+  files: readonly SpendFileIndex[],
+  candidates: readonly CompressedSpendCandidate[],
+  sessionIdOf: (file: string) => string | null,
+): readonly SpendFileIndex[] {
+  if (!candidates.length) return files;
+  const byPair = new Map(candidates.map((candidate) => [candidate.pairKey, candidate]));
+  const byThread = new Map(
+    candidates.flatMap((candidate) => (candidate.threadId ? [[candidate.threadId, candidate] as const] : [])),
+  );
+  const joined = new Map<CompressedSpendCandidate, SpendFileIndex[]>();
+  const out: SpendFileIndex[] = [];
+  for (const record of files) {
+    const sessionId = sessionIdOf(record.file);
+    const candidate = byPair.get(canonicalPath(record.file)) ?? (sessionId ? byThread.get(sessionId) : undefined);
+    if (!candidate) {
+      out.push(record);
+      continue;
+    }
+    joined.set(candidate, [...(joined.get(candidate) ?? []), record]);
+  }
+  for (const candidate of candidates) {
+    const plain = joined.get(candidate) ?? [];
+    const complete = plain.filter((record) => record.complete !== false);
+    if (candidate.spend && candidate.complete) complete.push(candidate.spend);
+    if (!complete.length) {
+      // No complete record yet, so the thread counts its plain records.
+      out.push(...plain);
+      continue;
+    }
+    out.push(complete.reduce((best, record) => (spendTotalCompare(record, best) > 0 ? record : best)));
+  }
+  return out;
+}
+
 export function projectSpendDisplayFiles(
   indexing: boolean,
   resumable: readonly SpendFileIndex[],
