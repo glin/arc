@@ -196,6 +196,7 @@ import { afterAll, afterEach, beforeAll, describe, test, vi } from 'vitest';
 import assert from 'node:assert';
 import * as fs from 'node:fs';
 import fsBuiltin from 'node:fs';
+import { CODEX_META_VERSION, loadCodexOpenings } from './codexopenings';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import * as zlib from 'node:zlib';
@@ -15996,50 +15997,60 @@ test.each([
   }
 });
 
-test.each(['win32', 'darwin', 'linux'] as const)('a legacy Codex opening adopts matching stats on %s', (platform) => {
+test.each([
+  { platform: 'win32', dev: '4', ino: undefined },
+  { platform: 'darwin', dev: 5, ino: 11 },
+  { platform: 'linux', dev: '6', ino: '18446744073709551557' },
+])('a saved opening in the shape of an older file qualifies at the cold pass on $platform', async ({ dev, ino }) => {
   const root = sessionsRoot([{ day: '2026/08/25', name: ROLLOUT(UUID_A), records: [meta({ id: UUID_A })] }]);
   const file = rolloutFiles(root)[0];
-  const { fileIdentity: _fileIdentity, ...legacy } = readCodexSessionMeta(file)!;
-  const stat: RolloutStat = {
-    size: legacy.size!,
-    mtimeMs: legacy.mtimeMs!,
-    dev: '7',
-    ino: platform === 'win32' ? undefined : '13',
-    isFile: true,
-  };
-  for (const difference of ['none', 'growth', 'shrink', 'mtimeMs', 'missing stat'] as const) {
-    let reads = 0;
-    const cache = new CodexMetaCache(() => {
-      reads++;
-      return {
-        ...legacy,
-        sessionId: UUID_B,
-        size: stat.size,
-        mtimeMs: stat.mtimeMs,
-        fileIdentity: { dev: stat.dev, ino: stat.ino },
-      };
-    });
-    const saved: CodexSessionMeta = { ...legacy };
-    if (difference === 'shrink') saved.size! += 1;
-    if (difference === 'growth') saved.size! -= 1;
-    if (difference === 'mtimeMs') saved.mtimeMs! -= 1;
-    if (difference === 'missing stat') {
-      delete saved.size;
-      delete saved.mtimeMs;
-    }
-    cache.load([[file, saved]]);
+  const { fileIdentity: _fileIdentity, size, mtimeMs, ...unmeasured } = readCodexSessionMeta(file)!;
+  const recorded: CodexSessionMeta = { ...unmeasured, size, mtimeMs };
+  const stat: RolloutStat = { size: size!, mtimeMs: mtimeMs!, dev, ino, isFile: true };
+  const fresh = { ...unmeasured, size: stat.size, mtimeMs: stat.mtimeMs, fileIdentity: { dev, ino } };
+  const cases = [
+    { name: 'no recorded stat', saved: unmeasured, read: fresh, kept: true },
+    { name: 'matching stat', saved: recorded, read: fresh, kept: true },
+    { name: 'another size', saved: { ...recorded, size: size! + 1 }, read: fresh, kept: false },
+    { name: 'another time', saved: { ...recorded, mtimeMs: mtimeMs! - 1 }, read: fresh, kept: false },
+    { name: 'another session', saved: unmeasured, read: { ...fresh, sessionId: UUID_B }, kept: false },
+  ];
+  for (const { name, saved, read, kept } of cases) {
+    const data = path.join(root, 'openings.json');
+    fs.writeFileSync(
+      data,
+      JSON.stringify({ codexMetaVersion: CODEX_META_VERSION, codexMetas: [{ file, meta: saved }] }),
+    );
+    const cache = new CodexMetaCache(() => assert.fail(`${name}: the listing read an opening`));
+    cache.load(loadCodexOpenings(data)!);
     const list = () =>
       codexSessionFiles(
         root,
         ['c:/repo'],
-        (file, current) => cache.get(file, undefined, current()),
+        (file, current, inFolders) => cache.listingOpening(file, current, inFolders),
         () => stat,
       );
-    const expectedReads = difference === 'none' ? 0 : 1;
-    assert.equal(list().sessions[0].sessionId, expectedReads ? UUID_B : UUID_A, difference);
-    assert.equal(reads, expectedReads, difference);
-    assert.equal(cache.snapshot()[0][1].fileIdentity?.dev, stat.dev, difference);
-    assert.equal(cache.snapshot()[0][1].fileIdentity?.ino, stat.ino, difference);
+    assert.equal(list().sessions[0].sessionId, UUID_A, `${name}: the first listing`);
+    const revision = cache.revision;
+    let reads = 0;
+    const primed = await cache.prime(
+      [file],
+      async () => (reads++, read),
+      undefined,
+      undefined,
+      undefined,
+      async () => stat,
+    );
+    assert.equal(primed, true, `${name}: the pass reported no change`);
+    assert.equal(reads, 1, name);
+    assert.ok(cache.revision > revision, `${name}: the revision`);
+    const held = cache.snapshot()[0][1];
+    assert.deepEqual(held.fileIdentity, { dev, ino }, name);
+    assert.equal(held.size, stat.size, name);
+    assert.equal(held.mtimeMs, stat.mtimeMs, name);
+    assert.equal(held.sessionId, kept ? UUID_A : read.sessionId, name);
+    assert.equal(list().sessions[0].sessionId, held.sessionId, `${name}: the listing after the pass`);
+    assert.equal(reads, 1, `${name}: the second listing read an opening`);
   }
 });
 

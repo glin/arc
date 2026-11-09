@@ -59,36 +59,40 @@ test('an append keeps the revision and reaches the saved file at the next save',
   }
 });
 
-test.each(['shared', 'derived'] as const)('the %s opening loader retains current and legacy file stats', (source) => {
-  const root = tempDir('codex-opening-loader-');
-  const rollout = path.join(root, 'rollout.jsonl');
-  fs.writeFileSync(rollout, JSON.stringify({ type: 'session_meta', payload: { id: 'session', cwd: root } }) + '\n');
-  const current = readCodexSessionMeta(rollout)!;
-  const { fileIdentity: _fileIdentity, ...legacy } = current;
-  const { size: _size, mtimeMs: _mtimeMs, ...unmeasured } = legacy;
-  const entries: CodexSessionMeta[] = [current, legacy, unmeasured];
-  for (const meta of entries) {
-    const file = path.join(root, `${source}.json`);
-    fs.writeFileSync(
-      file,
-      JSON.stringify({
-        version: METADATA_GENERATIONS.claude,
-        codexMetaVersion: CODEX_META_VERSION,
-        codexMetas: [{ file: rollout, meta }],
-        titles: [],
-      }),
-    );
-    const loaded = source === 'shared' ? loadCodexOpenings(file) : loadDerivedCache(file).codexMetas;
-    assert.ok(loaded);
-    assert.deepEqual(loaded.get(rollout), meta);
-    const cache = new CodexMetaCache();
-    cache.load(loaded);
-    let reads = 0;
-    assert.equal(cache.get(rollout, () => reads++, readRolloutStat(rollout))?.sessionId, 'session');
-    assert.equal(reads, meta.size === undefined ? 1 : 0);
-    assert.deepEqual(cache.snapshot()[0][1], current);
-  }
-});
+test.each(['shared', 'derived'] as const)(
+  'the %s opening loader retains current and legacy file stats',
+  async (source) => {
+    const root = tempDir('codex-opening-loader-');
+    const rollout = path.join(root, 'rollout.jsonl');
+    fs.writeFileSync(rollout, JSON.stringify({ type: 'session_meta', payload: { id: 'session', cwd: root } }) + '\n');
+    const current = readCodexSessionMeta(rollout)!;
+    const { fileIdentity: _fileIdentity, ...legacy } = current;
+    const { size: _size, mtimeMs: _mtimeMs, ...unmeasured } = legacy;
+    const entries: CodexSessionMeta[] = [current, legacy, unmeasured];
+    for (const meta of entries) {
+      const file = path.join(root, `${source}.json`);
+      fs.writeFileSync(
+        file,
+        JSON.stringify({
+          version: METADATA_GENERATIONS.claude,
+          codexMetaVersion: CODEX_META_VERSION,
+          codexMetas: [{ file: rollout, meta }],
+          titles: [],
+        }),
+      );
+      const loaded = source === 'shared' ? loadCodexOpenings(file) : loadDerivedCache(file).codexMetas;
+      assert.ok(loaded);
+      assert.deepEqual(loaded.get(rollout), meta);
+      const cache = new CodexMetaCache();
+      cache.load(loaded);
+      await cache.prime([rollout]);
+      let reads = 0;
+      assert.equal(cache.get(rollout, () => reads++, readRolloutStat(rollout))?.sessionId, 'session');
+      assert.equal(reads, 0);
+      assert.deepEqual(cache.snapshot()[0][1], current);
+    }
+  },
+);
 
 test('opening validation drops malformed file stats without dropping other rows', () => {
   const root = tempDir('codex-opening-validation-');

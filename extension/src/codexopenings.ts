@@ -15,7 +15,7 @@ import { fileIdentityValue } from './filerevision';
 //
 // This version is independent of VERSION in derivedcache.ts.
 // A bump rereads every stored rollout opening on the machine.
-// File identity keeps this version: entries without it adopt matching size and modification time, or read the opening again.
+// File identity keeps this version. An entry without it lists as it stands, and the cold opening pass qualifies it.
 export const CODEX_META_VERSION = 4;
 
 // Unversioned opening rows use the derived session cache version below.

@@ -195,6 +195,16 @@ function openingWithStat(
   return { ...meta, size: stat.size, mtimeMs: stat.mtimeMs, fileIdentity: { dev: stat.dev, ino: stat.ino } };
 }
 
+// An opening saved without file identity keeps its fields when its recorded stat matches or is absent and the
+// file's first record still names its session.
+function legacyKeeps(legacy: CodexSessionMeta, stat: RolloutStat | null, read: CodexSessionMeta): boolean {
+  return (
+    !!stat?.isFile &&
+    read.sessionId === legacy.sessionId &&
+    (legacy.size === undefined || (stat.size === legacy.size && stat.mtimeMs === legacy.mtimeMs))
+  );
+}
+
 // Default concurrency limit for opening reads in `CodexMetaCache.prime`.
 export const COLD_OPENING_READS = 8;
 
@@ -225,10 +235,12 @@ export class CodexMetaCache {
   private current(file: string, stat: RolloutStat | null): CodexSessionMeta | null {
     const meta = this.entries.get(file)?.meta;
     if (!meta) return null;
-    const savedIdentity = supportedFileIdentity(meta.fileIdentity ?? {});
+    // An opening saved before file identity lists as it stands until `prime` qualifies it.
+    if (meta.fileIdentity === undefined) return meta;
+    const savedIdentity = supportedFileIdentity(meta.fileIdentity);
     const currentIdentity = supportedFileIdentity(stat ?? {});
     const physical = savedIdentity && currentIdentity;
-    const adopting = meta.fileIdentity === undefined || (!savedIdentity && currentIdentity);
+    const adopting = !savedIdentity && currentIdentity;
     const matches =
       stat?.isFile &&
       meta.size !== undefined &&
@@ -343,10 +355,14 @@ export class CodexMetaCache {
         if (signal?.aborted) return;
         const file = pending[next++];
         const held = this.entries.get(file)?.meta;
+        let legacy: CodexSessionMeta | null = null;
+        let stat: RolloutStat | null = null;
         if (held) {
-          const stat = await statAsync(file);
+          stat = await statAsync(file);
           if (signal?.aborted) return;
-          if (this.entries.get(file)?.meta !== held || this.current(file, stat)) continue;
+          if (this.entries.get(file)?.meta !== held) continue;
+          if (held.fileIdentity === undefined) legacy = held;
+          else if (this.current(file, stat)) continue;
         }
         let meta: CodexSessionMeta | null;
         try {
@@ -356,6 +372,16 @@ export class CodexMetaCache {
           continue;
         }
         const size = meta ? null : await sizeAsync(file).catch(() => null);
+        if (legacy) {
+          if (this.entries.get(file)?.meta !== legacy) continue;
+          if (meta) {
+            this.install(file, legacyKeeps(legacy, stat, meta) ? openingWithStat(legacy, stat!) : meta);
+          } else {
+            this.delete(file);
+            this.entries.set(file, { meta: null, size });
+          }
+          continue;
+        }
         if (this.entries.get(file)?.meta !== undefined) {
           continue;
         }
