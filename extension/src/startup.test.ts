@@ -6710,41 +6710,31 @@ test('a selected-only refresh before the catalog keeps every held title, and the
 });
 
 test('a refresh shares one live child derivation across cards and session list status', async () => {
-  const provider = completeDiscoveryHarness(
-    undefined,
-    false,
-    ['liveOpenChildren', 'railStatuses', 'drawTurnCards', 'childExpiryCosts'],
-    { liveTimelineChildren, timelineRailState, runningSessionsSince, newestPerSession },
-  );
   const now = 100_000;
-  const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+  let tick = now;
+  const clock = vi.spyOn(Date, 'now').mockImplementation(() => tick++);
   try {
+    const states: RailState[] = [];
+    const provider = liveChildRefresh(now, now, states);
     const row = { id: 'parent', agentKey: 'claude' };
-    const outcome = { startedAt: now - 100, endedAt: now, finished: true, openChildren: ['child'] };
-    provider.partial = [{ file: 'parent.jsonl', sessionId: 'parent', agent: 'claude', activity: now }];
-    provider.showing = 'parent';
     provider.sessionRows = [row];
-    provider.outcomesFor = () => new Map([['parent', outcome]]);
-    provider.exitedSinceKeys = new Map();
-    provider.claudeChildReferences = [];
-    provider.claudeChildStatWrites = new Map();
-    provider.claudeChildren = [{ parentSessionId: 'parent', sessionId: 'child', file: 'child.jsonl', mtimeMs: now }];
-    provider.runningSessions = () => new Set();
-    provider.waitingSessions = () => new Set();
-    provider.heldLifetime.cacheExpiryFacts = { parent: { childSources: ['child'] } };
-    provider.childCacheExpiryAttribution = { read: () => new Map() };
-    const observations: unknown[] = [];
-    provider.collect = (_sessions: unknown, at: number, children: Map<string, string[]>) => {
-      observations.push([at, [...children]]);
-      return provider.drawTurnCards([], () => '', at, [], children);
+    const derived: number[] = [];
+    const derive = provider.liveOpenChildren;
+    provider.liveOpenChildren = (at: number, ...rest: unknown[]) => {
+      derived.push(at);
+      return derive.call(provider, at, ...rest);
     };
     const work: string[] = [];
     provider.performanceCounters.recordWork = (name: string) => work.push(name);
     for (const selectedOnly of [false, true]) {
       work.length = 0;
+      derived.length = 0;
+      states.length = 0;
       await provider.refresh(true, true, true, selectedOnly);
       assert.equal(work.filter((name) => name === 'liveOpenChildren').length, 1);
-      assert.deepEqual(observations.at(-1), [now, [['parent', ['child']]]]);
+      assert.equal(provider.collectedAt, derived[0], 'the cards read a clock of their own');
+      assert.deepEqual([...new Set(states.map((state) => state.at))], [derived[0]], 'status read a clock of its own');
+      assert.deepEqual([...states.at(-1)!.openChildren], [['parent', 1]]);
     }
     const outcomes = provider.sessionOutcomes;
     provider.exitedSinceKeys.set('claude:parent', now);
@@ -6758,8 +6748,10 @@ test('a refresh shares one live child derivation across cards and session list s
   }
 });
 
-// One parent session with one open child written at `writtenAt`. `states` receives each session list state.
-function liveChildRefresh(now: number, writtenAt: number, states: ReturnType<typeof timelineRailState>[]): any {
+type RailState = ReturnType<typeof timelineRailState> & { at: number };
+
+// One parent session with one open child written at `writtenAt`. `states` receives each session list state and its clock.
+function liveChildRefresh(now: number, writtenAt: number, states: RailState[]): any {
   const provider = completeDiscoveryHarness(
     undefined,
     false,
@@ -6778,7 +6770,7 @@ function liveChildRefresh(now: number, writtenAt: number, states: ReturnType<typ
       statsBySession: () => ({}),
       timelineRailState: (...input: Parameters<typeof timelineRailState>) => {
         const state = timelineRailState(...input);
-        states.push(state);
+        states.push({ ...state, at: input[6] });
         return state;
       },
     },
@@ -6825,7 +6817,7 @@ test('a newly listed session whose host exited lists no subagents after its firs
   const now = 100_000;
   const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
   try {
-    const states: ReturnType<typeof timelineRailState>[] = [];
+    const states: RailState[] = [];
     const provider = liveChildRefresh(now, now, states);
     provider.sessionRows = [];
     provider.exitedSinceKeys.set('claude:parent', now);
@@ -6846,7 +6838,7 @@ test('a child that reaches its quiet limit during a refresh leaves the session l
   let collected = false;
   const clock = vi.spyOn(Date, 'now').mockImplementation(() => (collected ? now + 1 : now));
   try {
-    const states: ReturnType<typeof timelineRailState>[] = [];
+    const states: RailState[] = [];
     const provider = liveChildRefresh(now, now - TURN_QUIET_MS, states);
     provider.sessionRows = [{ id: 'parent', agentKey: 'claude' }];
     const collect = provider.collect;
