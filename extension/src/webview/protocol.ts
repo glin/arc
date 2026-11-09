@@ -242,6 +242,7 @@ export interface RenderMessage extends Record<string, unknown> {
   diagnosis: PanelDiagnosis | null;
   usage: PanelUsage | null;
   startup: PanelStartup | null;
+  selectionTiming?: { id: number; sessionId: string };
   // The initial render carries Timeline layout settings. Configuration changes arrive as layout messages.
   timelineLayout: TimelineLayout;
   // The row delta header. A message without it carries complete `sessions`, `rail` and `stats`.
@@ -272,6 +273,7 @@ export interface SelectionMessage {
   diagnosis: PanelDiagnosis | null;
   usage: PanelUsage | null;
   startup: PanelStartup | null;
+  selectionTiming?: { id: number; sessionId: string };
 }
 
 export interface PanelSessionAdoption {
@@ -414,6 +416,14 @@ export type PanelToHost =
   // The panel could not apply a session row delta and needs a snapshot.
   | { type: 'rowsGap' }
   | { type: 'painted'; generation: number; stage: 'railReady' | 'firstCard' | 'completeRender'; usableRows?: true }
+  | {
+      type: 'selectionPainted';
+      id: number;
+      sessionId: string;
+      receivedAt: number;
+      paintedAt?: number;
+      reason?: 'superseded' | 'replaced' | 'disposed' | 'hidden';
+    }
   | { type: 'initialize' }
   | { type: 'developmentReload' }
   | { type: 'refresh' }
@@ -1108,6 +1118,17 @@ export function parsePanelToHost(raw: unknown): PanelToHost | null {
         ...Object.fromEntries(names.filter((key) => m[key] !== undefined).map((key) => [key, m[key]])),
       };
     }
+    case 'selectionPainted':
+      return Number.isSafeInteger(m.id) &&
+        (m.id as number) > 0 &&
+        isString(m.sessionId) &&
+        isFiniteNumber(m.receivedAt) &&
+        m.receivedAt >= 0 &&
+        ((isFiniteNumber(m.paintedAt) && m.paintedAt >= m.receivedAt && m.reason === undefined) ||
+          (m.paintedAt === undefined &&
+            (m.reason === 'superseded' || m.reason === 'replaced' || m.reason === 'disposed' || m.reason === 'hidden')))
+        ? (m as unknown as Extract<PanelToHost, { type: 'selectionPainted' }>)
+        : null;
     case 'painted':
       return Number.isSafeInteger(m.generation) &&
         (m.generation as number) >= 0 &&
@@ -1581,6 +1602,8 @@ export function dispatchPanelToHost<R>(message: PanelToHost, handlers: PanelToHo
       return handlers.ready(message);
     case 'painted':
       return handlers.painted(message);
+    case 'selectionPainted':
+      return handlers.selectionPainted(message);
     case 'rowsGap':
       return handlers.rowsGap(message);
     case 'initialize':

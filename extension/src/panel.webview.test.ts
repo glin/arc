@@ -33297,6 +33297,22 @@ test('a ready host stages worker-backed session data without clearing accepted c
     'the panel acknowledges startup stages without waiting for the rendered rail, card, and complete state',
   );
   const repaint = declarationSource(script, 'repaint');
+  sourceMatch(
+    repaint,
+    /selectionPaint\.schedule\(\);/,
+    'the rendered transcript never schedules its selection paint reply',
+  );
+  const receiveSelection = declarationSource(script, 'receiveHostMessage');
+  sourceMatch(
+    receiveSelection,
+    /selection: function \(msg\) \{ selectionPaint\.receive\(msg, receivedAt\);/,
+    'selection receipt is missing from the production message handler',
+  );
+  sourceMatch(
+    receiveSelection,
+    /render: function \(msg\) \{ selectionPaint\.receive\(msg, receivedAt\);/,
+    'full render receipt is missing from selection timing',
+  );
   const renderAt = repaint.indexOf('render(latest.cards');
   const railUpdateAt = repaint.indexOf('railRenderer.update(');
   const acknowledgeAt = repaint.indexOf('acknowledgePaint();');

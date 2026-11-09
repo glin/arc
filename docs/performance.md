@@ -100,6 +100,28 @@ The command returns the written path or `null` after cancellation or failure. Fa
 
 Read `panelAdopted` before comparing startups. `created` means command-opened, `serializer` means restored, and `serializer-replaced` means stale stored options required replacement. `panelRevealed` retains its adoption origin. These records require `arc.diagnostics.log`. `revivePanel` and `adoptPanel` in `extension/src/panelhost.ts` own restoration and prompt-recovery failure handling.
 
+### Session selection timing
+
+`selection:hostArrived` marks the selection message's arrival at the host.
+
+`selection:renderPosted` marks the host's first drawable selected-session render post.
+
+`selection:renderReceived` marks the webview's receipt of that render before parsing and drawing.
+
+`selection:painted` marks settled transcript content after two animation frames, without establishing compositor presentation.
+
+`selection:hostMs` spans host arrival to render post.
+
+`selection:transportMs` spans render post to webview receipt.
+
+`selection:renderMs` spans webview receipt to paint acknowledgment.
+
+`selection:totalMs` spans host arrival to paint acknowledgment, excluding the click's transport to the host.
+
+The capture's `counters.selections` table retains the latest 64 switches with their session ID, reached stamps, spans, and abandonment reason. Missing endpoints produce null spans. `window` records `held` when selection finds a current uncompressed transcript window, or `read` when it requires a window read. Each stamp also increments its named `work` counter and reaches the detailed diagnostics log under that name. Abandonment emits `selection:abandoned` with the reached stamps and reason.
+
+Host and webview stamps use `performance.timeOrigin + performance.now()` in epoch milliseconds. Cross-process clock offsets affect transport and total spans. Host and webview internal spans each use one clock. One webview reply carries receipt and paint, or receipt and an abandonment reason. Selection timing adds no render or timer. Supersession, read failure, unavailable sessions, drafts, hidden panels, document replacement, scope changes, failed posts, and disposal end pending measurements. A late abandonment reply adds its receipt stamp to the retained switch without ending a newer selection.
+
 ### Startup measurement
 
 Measure startup against frozen inputs with `extension/scripts/panel-startup-measure/measure.ts`. Run it from `extension`:

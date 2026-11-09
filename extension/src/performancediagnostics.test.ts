@@ -18,6 +18,109 @@ import {
 } from './performancediagnostics.ts';
 import { tempDir } from './temproot.ts';
 
+test('selection stamps and spans reach the capture and the diagnostic event names', () => {
+  const lines: Array<{ event: string; fields: Record<string, unknown> }> = [];
+  const counters = new PanelPerformanceCounters(1000, {
+    enabled: () => true,
+    emit: (event, fields) => lines.push({ event, fields }),
+  });
+  const panel = {};
+  try {
+    counters.startSelection(panel, 'selected', 'held', 100);
+    assert.deepEqual(counters.selectionRender(panel, 'selected', 130), { id: 1, sessionId: 'selected' });
+    assert.equal(counters.selectionRender(panel, 'selected', 135), undefined);
+    counters.selectionPaint(panel, { id: 1, sessionId: 'selected', receivedAt: 140, paintedAt: 160 });
+    counters.selectionPaint(panel, { id: 1, sessionId: 'selected', receivedAt: 140, paintedAt: 170 });
+    const snapshot = counters.snapshot();
+    assert.deepEqual(snapshot.selections[0], {
+      id: 1,
+      sessionId: 'selected',
+      window: 'held',
+      reason: null,
+      stamps: {
+        'selection:hostArrived': 100,
+        'selection:renderPosted': 130,
+        'selection:renderReceived': 140,
+        'selection:painted': 160,
+      },
+      spans: { 'selection:hostMs': 30, 'selection:transportMs': 10, 'selection:renderMs': 20, 'selection:totalMs': 60 },
+    });
+    const saved = projectPerformanceDiagnostics(state(snapshot)) as { counters: { selections: unknown } };
+    assert.deepEqual(saved.counters.selections, snapshot.selections);
+    assert.deepEqual(
+      lines.map((line) => line.event),
+      Object.keys(snapshot.selections[0].stamps),
+    );
+    for (const { event, fields } of lines) {
+      assert.equal(snapshot.work[event], 1);
+      assert.equal(fields.sessionId, 'selected');
+      assert.equal(fields.window, 'held');
+    }
+  } finally {
+    counters.dispose();
+  }
+});
+
+test('abandoned selections preserve reached stamps and reject stale or wrong-panel paint replies', () => {
+  const counters = new PanelPerformanceCounters();
+  const panel = {};
+  try {
+    counters.startSelection(panel, 'first', 'read', 100);
+    counters.startSelection(panel, 'second', 'held', 110);
+    assert.deepEqual(counters.snapshot().selections[0].stamps, { 'selection:hostArrived': 100 });
+    assert.equal(counters.snapshot().selections[0].reason, 'superseded');
+    counters.selectionRender(panel, 'second', 120);
+    counters.selectionPaint({}, { id: 2, sessionId: 'second', receivedAt: 130, paintedAt: 140 });
+    counters.selectionPaint(panel, { id: 1, sessionId: 'first', receivedAt: 130, paintedAt: 140 });
+    counters.selectionPaint(panel, { id: 2, sessionId: 'wrong', receivedAt: 130, paintedAt: 140 });
+    counters.selectionPaint(panel, { id: 2, sessionId: 'second', receivedAt: 130, reason: 'replaced' });
+    const result = counters.snapshot().selections[1];
+    assert.equal(result.reason, 'replaced');
+    assert.deepEqual(result.stamps, {
+      'selection:hostArrived': 110,
+      'selection:renderPosted': 120,
+      'selection:renderReceived': 130,
+    });
+    assert.equal(result.spans['selection:totalMs'], null);
+    assert.equal(result.spans['selection:hostMs'], 10);
+  } finally {
+    counters.dispose();
+  }
+});
+
+test('selection history stays bounded and panel disposal ends pending measurements', () => {
+  const counters = new PanelPerformanceCounters();
+  const panel = {};
+  try {
+    for (let id = 1; id <= 70; id++) counters.startSelection(panel, `session-${id}`, 'read', id);
+    counters.releasePanel(panel);
+    assert.equal(counters.snapshot().selections.length, 64);
+    assert.equal(counters.snapshot().selections.at(-1)!.reason, 'panel-disposed');
+  } finally {
+    counters.dispose();
+  }
+});
+
+test('a hidden panel retains a receipt reported after host abandonment without changing the next selection', () => {
+  const counters = new PanelPerformanceCounters();
+  const panel = {};
+  try {
+    counters.startSelection(panel, 'first', 'held', 100);
+    counters.selectionRender(panel, 'first', 110);
+    counters.abandonSelection(panel, 'panel-hidden');
+    counters.startSelection(panel, 'second', 'read', 140);
+    counters.selectionPaint(panel, { id: 1, sessionId: 'first', receivedAt: 120, reason: 'hidden' });
+    const [first, second] = counters.snapshot().selections;
+    assert.equal(first.reason, 'panel-hidden');
+    assert.equal(first.stamps['selection:renderReceived'], 120);
+    assert.equal(second.reason, null);
+    assert.deepEqual(second.stamps, { 'selection:hostArrived': 140 });
+    assert.equal(counters.snapshot().work['selection:abandoned'], 1);
+  } finally {
+    counters.dispose();
+  }
+});
+
 function state(counters: ReturnType<PanelPerformanceCounters['snapshot']>): PerformanceDiagnosticState {
   return {
     panel: {
@@ -193,6 +296,7 @@ test('performance counters correlate posts and replies for every open panel', ()
     sourceId: 'window-a',
     startedAt: '1970-01-01T00:00:01.000Z',
     captureCount: 0,
+    selections: [],
     refreshes: {
       poll: { count: 1, totalDurationMs: 3, maximumDurationMs: 3, lastDurationMs: 3 },
       watcher: { count: 2, totalDurationMs: 20, maximumDurationMs: 12, lastDurationMs: 12 },

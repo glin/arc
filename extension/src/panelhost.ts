@@ -4700,6 +4700,7 @@ export class PanelProvider implements vscode.Disposable {
 
   // Runs on first scope readiness and whenever the repository scope roots change.
   private repositoryScopeChanged(): void {
+    for (const host of this.hosts) this.performanceCounters?.abandonSelection?.(host, 'scope-changed');
     this.initialNamesChanged();
     // A catalog listed under the previous roots cannot render the current scope.
     for (const work of this.selectionWorks.values()) work.controller.abort();
@@ -4740,6 +4741,7 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   private workspaceFoldersChanged(): void {
+    for (const host of this.hosts) this.performanceCounters?.abandonSelection?.(host, 'workspace-changed');
     this.cancelProjectSpendHydration();
     this.projectSpendHydrationReady = false;
     this.repositoryScopeReady = false;
@@ -4892,6 +4894,7 @@ export class PanelProvider implements vscode.Disposable {
         }
         this.startupHistory?.visibility(this.anyVisible());
         this.publishWindowState();
+        if (!host.visible()) this.performanceCounters?.abandonSelection?.(host, 'panel-hidden');
         void this.sendToHost(host, this.panelVisibility.current(host, host.visible()));
         // Keep polling while any ready host remains visible. Stop polling when no ready host is visible.
         if (this.anyVisible()) {
@@ -10503,7 +10506,22 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   // Select a reader-chosen session after abandoning any untouched draft being left.
-  private show(session: string | null, host?: PanelHost): void {
+  private show(session: string | null, host?: PanelHost, arrivedAt = performance.timeOrigin + performance.now()): void {
+    const selectedSource = session
+      ? this.authoritativeCatalog?.find((candidate) => candidate.sessionId === session)
+      : undefined;
+    if (host) {
+      if (session)
+        this.performanceCounters?.startSelection?.(
+          host,
+          session,
+          selectedSource && !isCompressedRollout(selectedSource.file) && this.progressiveCurrent(selectedSource)
+            ? 'held'
+            : 'read',
+          arrivedAt,
+        );
+      else this.performanceCounters?.abandonSelection?.(host, 'selection-cleared');
+    }
     const previousSelection = host ? (this.hostSessions.get(host) ?? this.showing) : this.showing;
     if (previousSelection && previousSelection !== session) {
       this.abandonDraft(previousSelection, false);
@@ -10528,9 +10546,7 @@ export class PanelProvider implements vscode.Disposable {
     );
     this.selectionGeneration++;
     this.metadataReadIntent = session ? { sessionId: session, generation: this.selectionGeneration } : null;
-    const selectedFile = session
-      ? this.authoritativeCatalog?.find((candidate) => candidate.sessionId === session)?.file
-      : undefined;
+    const selectedFile = selectedSource?.file;
     this.compressedCheck = selectedFile && isCompressedRollout(selectedFile) ? this.selectionGeneration : null;
     if (this.compressedRetry?.timer) clearTimeout(this.compressedRetry.timer);
     this.compressedRetry = null;
@@ -11456,6 +11472,12 @@ export class PanelProvider implements vscode.Disposable {
           ? (hostRows.find((row) => row.id === hostSession)?.label ?? hostSession)
           : null;
         const selectedFailure = selectedSession && this.drawnSelectionFailure(selectedSession);
+        if (selectedFailure) this.performanceCounters?.abandonSelection?.(host, 'read-failed');
+        else if (!selectedSession && (this.authoritativeCatalog !== null || this.newDrafts[hostSession ?? '']))
+          this.performanceCounters?.abandonSelection?.(
+            host,
+            this.newDrafts[hostSession ?? ''] ? 'draft' : 'session-unavailable',
+          );
         const discoveryLoading = selectedFailure
           ? hostDrawn.length
             ? {
@@ -11560,6 +11582,7 @@ export class PanelProvider implements vscode.Disposable {
             }
           },
           selectedSession ? this.cache.get(selectedSession.file)?.read : undefined,
+          !loadingNewest && !selectedFailure,
         ).then(
           (accepted) => {
             if (accepted && !controller?.signal.aborted && generation === this.refreshGeneration) {
@@ -12711,6 +12734,7 @@ export class PanelProvider implements vscode.Disposable {
     message: Record<string, unknown>,
     measured?: (serializedBytes: number | null) => void,
     selectedWindow?: SessionRead,
+    selectionReady = false,
   ): Thenable<boolean> {
     if (message.type !== 'render' && message.type !== 'rail' && message.type !== 'selection') {
       return this.sendToHost(host, message, measured);
@@ -12738,20 +12762,36 @@ export class PanelProvider implements vscode.Disposable {
       kind === 'selection' ? message : sender.encode(message as Record<string, unknown> & RowLists, globals);
     // The sender described what it encoded. Record it beside the bytes the post measured.
     const encoding = kind === 'selection' ? null : sender.lastEncoding;
-    const posted = this.sendToHost(host, outgoing, (serializedBytes) => {
-      if (encoding) this.performanceCounters?.recordRowPost(kind, encoding, serializedBytes);
-      measured?.(serializedBytes);
-    });
+    const selectionTiming = selectionReady
+      ? this.performanceCounters?.selectionRender?.(host, message.showing as string | null)
+      : undefined;
+    if (selectionTiming) outgoing.selectionTiming = selectionTiming;
+    let posted: Thenable<boolean>;
+    try {
+      posted = this.sendToHost(host, outgoing, (serializedBytes) => {
+        if (encoding) this.performanceCounters?.recordRowPost(kind, encoding, serializedBytes);
+        measured?.(serializedBytes);
+      });
+    } catch (error) {
+      if (selectionTiming) this.performanceCounters?.abandonSelection?.(host, 'post-failed', selectionTiming.id);
+      throw error;
+    }
     void Promise.resolve(posted).then(
       (accepted) => {
-        if (!accepted) sender.reset('unaccepted');
+        if (!accepted) {
+          sender.reset('unaccepted');
+          if (selectionTiming) this.performanceCounters?.abandonSelection?.(host, 'post-rejected', selectionTiming.id);
+        }
         if (accepted && cards && cardPost > (sender.acceptedCardPost ?? 0)) {
           sender.acceptedCards = cards;
           sender.acceptedWindow = selectedWindow;
           sender.acceptedCardPost = cardPost;
         }
       },
-      () => sender.reset('failed'),
+      () => {
+        sender.reset('failed');
+        if (selectionTiming) this.performanceCounters?.abandonSelection?.(host, 'post-failed', selectionTiming.id);
+      },
     );
     return posted;
   }
@@ -18259,6 +18299,10 @@ export class PanelProvider implements vscode.Disposable {
 
   // Parse messages before dispatch. Exhaustive variant handlers keep the host aligned with the panel protocol.
   private async onMessage(raw: unknown, host: PanelHost): Promise<void> {
+    const selectionArrivedAt =
+      raw && typeof raw === 'object' && 'type' in raw && (raw.type === 'showSession' || raw.type === 'showReaderParent')
+        ? performance.timeOrigin + performance.now()
+        : undefined;
     const parsed = parsePanelToHost(raw);
     const browserSession = parsed && 'session' in parsed ? parsed.session : null;
     const message =
@@ -18340,6 +18384,7 @@ export class PanelProvider implements vscode.Disposable {
         health: () => {},
         readerRead: (msg) => this.readerRead({ ...msg.operation, namespace: 'browser' }, host),
         ready: () => {
+          this.performanceCounters?.abandonSelection?.(host, 'document-replaced');
           // A loaded page holds no session rows and no query context.
           this.queryContextSent?.delete(host);
           const sender = this.rowSenders?.get(host);
@@ -18359,6 +18404,9 @@ export class PanelProvider implements vscode.Disposable {
         },
         painted: (msg) => {
           this.browserPainted(host, msg.generation, msg.stage, msg.usableRows);
+        },
+        selectionPainted: (msg) => {
+          this.performanceCounters?.selectionPaint?.(host, msg);
         },
         initialize: () => {
           this.onSetupRefresh?.();
@@ -18639,7 +18687,7 @@ export class PanelProvider implements vscode.Disposable {
         },
         // Select the named session. Refresh reconciles unavailable IDs with the newest reachable session.
         showReaderParent: (msg) => {
-          this.show(msg.session || null, host);
+          this.show(msg.session || null, host, selectionArrivedAt);
         },
         showSession: (msg) => {
           if (msg.responseLink === true) {
@@ -18671,7 +18719,7 @@ export class PanelProvider implements vscode.Disposable {
               if (!route.hosts.size) this.clearRoutes.delete(msg.session);
             }
           }
-          this.show(msg.session || null, host);
+          this.show(msg.session || null, host, selectionArrivedAt);
         },
         // Build label-editor rows from current provider state on each opening.
         labelEditor: (msg) => {

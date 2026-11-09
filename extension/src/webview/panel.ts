@@ -94,13 +94,82 @@ function drawCounter(renderer: 'timeline' | 'rail'): (() => void) | undefined {
   return typeof window === 'undefined' || !window.__arcOnDraw ? undefined : () => window.__arcOnDraw!(renderer);
 }
 
+export function createSelectionPaint(
+  send: (message: Extract<PanelToHost, { type: 'selectionPainted' }>) => void,
+  afterPaint: (callback: () => void) => void,
+  settled: () => boolean,
+  now = () => performance.timeOrigin + performance.now(),
+) {
+  let pending: { id: number; sessionId: string; receivedAt: number; scheduled: boolean } | null = null;
+  let lastId = 0;
+  function abandon(reason: Extract<PanelToHost, { type: 'selectionPainted' }>['reason']) {
+    if (!pending) return;
+    const { id, sessionId, receivedAt } = pending;
+    pending = null;
+    send({ type: 'selectionPainted', id, sessionId, receivedAt, reason });
+  }
+  function schedule() {
+    const stamp = pending;
+    if (!stamp || stamp.scheduled) return;
+    stamp.scheduled = true;
+    afterPaint(() => {
+      if (pending !== stamp) return;
+      stamp.scheduled = false;
+      if (!settled()) {
+        schedule();
+        return;
+      }
+      pending = null;
+      send({
+        type: 'selectionPainted',
+        id: stamp.id,
+        sessionId: stamp.sessionId,
+        receivedAt: stamp.receivedAt,
+        paintedAt: now(),
+      });
+    });
+  }
+  return {
+    receive(
+      message: { showing: string | null; selectionTiming?: { id: number; sessionId: string } },
+      receivedAt: number,
+    ) {
+      if (
+        pending &&
+        (pending.sessionId !== message.showing ||
+          (message.selectionTiming && pending.id !== message.selectionTiming.id))
+      )
+        abandon('replaced');
+      const stamp = message.selectionTiming;
+      if (stamp && Number.isSafeInteger(stamp.id) && stamp.id > lastId && stamp.sessionId === message.showing) {
+        lastId = stamp.id;
+        pending = { ...stamp, receivedAt, scheduled: false };
+      }
+    },
+    schedule,
+    abandon,
+  };
+}
+
 // Starts one panel page lifetime from the supplied browser ports.
 export function startPanel(kernel: PanelKernel): StartedPanel {
   const list = kernel.dom.list;
   const startupStatus = list.querySelector<HTMLElement>('[data-startup-status]');
   const savedState = kernel.savedState;
   // This posting port wraps kernel.sendToHost. The acquired VS Code API remains inside host.ts.
-  const vscode = Object.freeze({ postMessage: kernel.sendToHost });
+  const vscode = Object.freeze({
+    postMessage(message: PanelToHost) {
+      if (
+        message.type === 'showSession' ||
+        message.type === 'showReaderParent' ||
+        message.type === 'goBack' ||
+        message.type === 'goForward' ||
+        message.type === 'newSession'
+      )
+        selectionPaint.abandon('superseded');
+      kernel.sendToHost(message);
+    },
+  });
   const onDocument = kernel.events.document;
   const onWindow = kernel.events.window;
   const usageMetrics = startPageUsageMetrics(
@@ -164,6 +233,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
   let cardRenderer: ReturnType<typeof createCardRenderer>;
   let railRenderer: ReturnType<typeof createRailRenderer>;
   let timelineRenderer: ReturnType<typeof createTimelineRenderer>;
+  const selectionPaint = createSelectionPaint(kernel.sendToHost, kernel.afterPaint, () => timelineRenderer.settled());
   let readState: ReturnType<typeof createReadState>;
   let commentsRenderer: ReturnType<typeof createCommentRenderer>;
   let composerRenderer: ReturnType<typeof createComposerRenderer>;
@@ -1136,6 +1206,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
     projectSpend.update(latest.projectSpend);
     clock.tick();
     acknowledgePaint();
+    selectionPaint.schedule();
   }
 
   function firstSelection(): RenderMessage {
@@ -1190,6 +1261,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
   const appliedFilters = new Map<string, number>();
   function receiveHostMessage(data: unknown) {
     const startedAt = performance.now();
+    const receivedAt = performance.timeOrigin + startedAt;
     const parsed = parseHostToPanel(data);
     if (!parsed) {
       const kind = data && typeof data === 'object' && 'type' in data ? data.type : undefined;
@@ -1217,7 +1289,10 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
         sessionState.save(msg.request);
       },
       health: (msg) => vscode.postMessage({ type: 'health', sequence: msg.sequence }),
-      visibility: (msg) => visibility.receive(msg),
+      visibility: (msg) => {
+        visibility.receive(msg);
+        if (!msg.visible) selectionPaint.abandon('hidden');
+      },
       // A changed context redraws only the session list and refreshes content search, because both resolve queries against it.
       queryContext: function (msg) {
         // An equal context keeps the held object, so queries compiled against it stay reusable.
@@ -1496,6 +1571,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
       },
       // Replace session-specific values while preserving workspace state from the latest render.
       selection: function (msg) {
+        selectionPaint.receive(msg, receivedAt);
         if (msg.startup) applySessionLoading(msg.startup);
         latest ??= firstSelection();
         latest.cards = msg.cards;
@@ -1510,6 +1586,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
         repaint();
       },
       render: function (msg) {
+        selectionPaint.receive(msg, receivedAt);
         if (msg.startup) applySessionLoading(msg.startup);
         for (const adoption of msg.sessionAdoptions) {
           composerRenderer.adoptSessionIdentity(adoption.provisional, adoption.durable);
@@ -1540,6 +1617,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
     readerPageId: readState.pageId,
     receiveHostMessage,
     dispose() {
+      selectionPaint.abandon('disposed');
       usageMetrics?.flush();
       readState.dispose();
       visibility.dispose();

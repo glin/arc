@@ -69,6 +69,7 @@ const MESSAGE_COUNTED: Record<PanelToHost['type'], boolean> = {
   saveState: false,
   ready: false,
   painted: false,
+  selectionPainted: false,
   rowsGap: false,
   initialize: false,
   developmentReload: false,

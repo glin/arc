@@ -28,6 +28,7 @@ export const EXPORT_HOST_POLICY = {
   ready: 'local',
   rowsGap: 'blocked',
   painted: 'blocked',
+  selectionPainted: 'blocked',
   initialize: 'blocked',
   developmentReload: 'blocked',
   refresh: 'blocked',

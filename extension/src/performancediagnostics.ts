@@ -78,6 +78,38 @@ export interface LedgerSaveOperation {
   succeeded: boolean;
 }
 
+export interface SelectionTiming {
+  id: number;
+  sessionId: string;
+  window: 'held' | 'read';
+  stamps: Partial<
+    Record<
+      'selection:hostArrived' | 'selection:renderPosted' | 'selection:renderReceived' | 'selection:painted',
+      number
+    >
+  >;
+  reason: string | null;
+}
+
+function selectionSnapshot(timing: SelectionTiming) {
+  const stamps = { ...timing.stamps };
+  const span = (from: keyof typeof stamps, to: keyof typeof stamps) => {
+    const start = stamps[from];
+    const end = stamps[to];
+    return start === undefined || end === undefined ? null : end - start;
+  };
+  return {
+    ...timing,
+    stamps,
+    spans: {
+      'selection:hostMs': span('selection:hostArrived', 'selection:renderPosted'),
+      'selection:transportMs': span('selection:renderPosted', 'selection:renderReceived'),
+      'selection:renderMs': span('selection:renderReceived', 'selection:painted'),
+      'selection:totalMs': span('selection:hostArrived', 'selection:painted'),
+    },
+  };
+}
+
 export interface PerformanceCounterSnapshot {
   discovery: import('./progressiveworker').DiscoveryCharges & {
     continuations: number;
@@ -102,6 +134,7 @@ export interface PerformanceCounterSnapshot {
   panelPosts: Record<string, Record<string, MessageCounts>>;
   panelMessages: Record<string, OperationCounts>;
   panelReplies: Record<string, Record<string, OperationCounts>>;
+  selections: ReturnType<typeof selectionSnapshot>[];
   watcherOperationCount: number;
   watcherDecisions: WatcherDecisionCounts;
   rowPosts: Record<string, RowPostCounts>;
@@ -142,11 +175,21 @@ export type StartupStage =
 export type RefreshStage = 'started' | 'coalesced' | 'unchanged' | 'rendered' | 'abandoned' | 'walkDeadline';
 
 function operationCounts(): OperationCounts {
-  return { count: 0, totalDurationMs: 0, maximumDurationMs: 0, lastDurationMs: 0 };
+  return {
+    count: 0,
+    totalDurationMs: 0,
+    maximumDurationMs: 0,
+    lastDurationMs: 0,
+  };
 }
 
 function messageCounts(): MessageCounts {
-  return { count: 0, serializedBytes: 0, maximumSerializedBytes: 0, unavailableByteCount: 0 };
+  return {
+    count: 0,
+    serializedBytes: 0,
+    maximumSerializedBytes: 0,
+    unavailableByteCount: 0,
+  };
 }
 
 function recordMessageCount(counts: MessageCounts, serializedBytes: number | null): void {
@@ -160,7 +203,13 @@ function recordMessageCount(counts: MessageCounts, serializedBytes: number | nul
 }
 
 function rowPostCounts(): RowPostCounts {
-  return { whole: messageCounts(), delta: messageCounts(), wholeReasons: {}, rowsHeld: 0, rowsSent: 0 };
+  return {
+    whole: messageCounts(),
+    delta: messageCounts(),
+    wholeReasons: {},
+    rowsHeld: 0,
+    rowsSent: 0,
+  };
 }
 
 function sortedRecord<T>(entries: Iterable<[string, T]>, copy: (value: T) => T): Record<string, T> {
@@ -211,12 +260,17 @@ export interface PerformanceEventSink {
 }
 
 // Default sink disables detailed events and ignores emitted startup milestones.
-const UNWATCHED: PerformanceEventSink = { enabled: () => false, emit: () => {} };
+const UNWATCHED: PerformanceEventSink = {
+  enabled: () => false,
+  emit: () => {},
+};
 
 type DiscoveryCharges = import('./progressiveworker').DiscoveryCharges;
 
 // A record over every charge field fails typecheck when a field is missing, so no charge goes unsummed.
-const DISCOVERY_CHARGE_FIELDS: { readonly [K in keyof DiscoveryCharges]-?: true } = {
+const DISCOVERY_CHARGE_FIELDS: {
+  readonly [K in keyof DiscoveryCharges]-?: true;
+} = {
   readBytes: true,
   receiptEntries: true,
   receiptChecks: true,
@@ -289,7 +343,15 @@ function dispatchRootSnapshot(roots: ReadonlyMap<string, DispatchRootCharges>): 
   );
   const rest = ranked.slice(DISPATCH_ROOT_RECORDS);
   if (rest.length) {
-    const other = { roots: rest.length, passes: 0, bytes: 0, rereads: 0, rootWaits: 0, restarts: 0, remainingBytes: 0 };
+    const other = {
+      roots: rest.length,
+      passes: 0,
+      bytes: 0,
+      rereads: 0,
+      rootWaits: 0,
+      restarts: 0,
+      remainingBytes: 0,
+    };
     for (const [, root] of rest) for (const key of DISPATCH_ROOT_SUMS) other[key] += root[key];
     records.other = other;
   }
@@ -379,7 +441,11 @@ export class PanelPerformanceCounters {
   // spend publishes its settled members and counts as a partial publication. Every other reply counts as a continuation.
   recordDiscovery(
     charges: import('./progressiveworker').DiscoveryCharges | undefined,
-    reply: { complete: boolean; continuation: boolean; membershipSettled?: boolean },
+    reply: {
+      complete: boolean;
+      continuation: boolean;
+      membershipSettled?: boolean;
+    },
     dispatchRoots?: Record<string, DispatchRootCharges>,
   ): void {
     if (charges) for (const key of DISCOVERY_CHARGE_KEYS) this.discovery[key] += charges[key] ?? 0;
@@ -437,7 +503,9 @@ export class PanelPerformanceCounters {
   private rowsGapCount = 0;
   private readonly work = new Map<string, number>();
   private readonly gauges = new Map<string, number>();
-  private readonly loopDelay: IntervalHistogram = monitorEventLoopDelay({ resolution: 10 });
+  private readonly loopDelay: IntervalHistogram = monitorEventLoopDelay({
+    resolution: 10,
+  });
   private ledgerSaveCount = 0;
   private readonly refreshes = new Map<string, OperationCounts>();
   private readonly refreshStages: Record<RefreshStage, number> = {
@@ -456,7 +524,14 @@ export class PanelPerformanceCounters {
   private readonly panelReplies = new Map<string, Map<string, OperationCounts>>();
   private lastWatcherOperation: WatcherOperation | null = null;
   private lastLedgerSave: LedgerSaveOperation | null = null;
-  private startup: { id: number; milestones: Partial<Record<StartupStage, number>> } | null = null;
+  private startup: {
+    id: number;
+    milestones: Partial<Record<StartupStage, number>>;
+  } | null = null;
+  private nextSelectionId = 0;
+  private readonly selectionTimings: SelectionTiming[] = [];
+  private readonly pendingSelections = new Map<object, SelectionTiming>();
+  private readonly selectionPanels = new WeakMap<SelectionTiming, object>();
 
   constructor(
     startedAt = Date.now(),
@@ -471,7 +546,103 @@ export class PanelPerformanceCounters {
 
   // Stop the loop delay sampler. A snapshot after this keeps the delays recorded before it.
   dispose(): void {
+    for (const panel of this.pendingSelections.keys()) this.abandonSelection(panel, 'host-disposed');
     this.loopDelay.disable();
+  }
+
+  startSelection(panel: object, sessionId: string, window: SelectionTiming['window'], at: number): void {
+    this.abandonSelection(panel, 'superseded');
+    const timing: SelectionTiming = {
+      id: ++this.nextSelectionId,
+      sessionId,
+      window,
+      stamps: {},
+      reason: null,
+    };
+    this.selectionPanels.set(timing, panel);
+    this.pendingSelections.set(panel, timing);
+    this.selectionTimings.push(timing);
+    if (this.selectionTimings.length > 64) {
+      const oldest = this.selectionTimings.shift()!;
+      for (const [owner, pending] of this.pendingSelections) {
+        if (pending === oldest) this.abandonSelection(owner, 'history-limit');
+      }
+    }
+    this.selectionStamp(timing, 'selection:hostArrived', at);
+  }
+
+  selectionRender(panel: object, sessionId: string | null, at?: number): { id: number; sessionId: string } | undefined {
+    const timing = this.pendingSelections.get(panel);
+    if (!timing) return undefined;
+    if (timing.sessionId !== sessionId) {
+      this.abandonSelection(panel, 'selection-changed');
+      return undefined;
+    }
+    if (timing.stamps['selection:renderPosted'] !== undefined) return undefined;
+    this.selectionStamp(timing, 'selection:renderPosted', at ?? performance.timeOrigin + performance.now());
+    return { id: timing.id, sessionId: timing.sessionId };
+  }
+
+  selectionPaint(
+    panel: object,
+    message: {
+      id: number;
+      sessionId: string;
+      receivedAt: number;
+      paintedAt?: number;
+      reason?: string;
+    },
+  ): void {
+    const pending = this.pendingSelections.get(panel);
+    const timing =
+      pending?.id === message.id
+        ? pending
+        : message.reason
+          ? this.selectionTimings.find((entry) => entry.id === message.id && this.selectionPanels.get(entry) === panel)
+          : undefined;
+    if (
+      !timing ||
+      timing.id !== message.id ||
+      timing.sessionId !== message.sessionId ||
+      timing.stamps['selection:renderPosted'] === undefined ||
+      timing.stamps['selection:renderReceived'] !== undefined
+    )
+      return;
+    if (
+      !Number.isFinite(message.receivedAt) ||
+      (message.paintedAt !== undefined &&
+        (!Number.isFinite(message.paintedAt) || message.paintedAt < message.receivedAt))
+    )
+      return;
+    this.selectionStamp(timing, 'selection:renderReceived', message.receivedAt);
+    if (timing.reason) {
+      this.sink.emit('selection:abandoned', selectionSnapshot(timing));
+      return;
+    }
+    if (message.paintedAt !== undefined) {
+      this.selectionStamp(timing, 'selection:painted', message.paintedAt);
+      this.pendingSelections.delete(panel);
+    } else if (message.reason) this.abandonSelection(panel, message.reason);
+  }
+
+  abandonSelection(panel: object, reason: string, id?: number): void {
+    const timing = this.pendingSelections.get(panel);
+    if (!timing || (id !== undefined && timing.id !== id)) return;
+    timing.reason = reason;
+    this.pendingSelections.delete(panel);
+    this.recordWork('selection:abandoned');
+    this.sink.emit('selection:abandoned', selectionSnapshot(timing));
+  }
+
+  private selectionStamp(timing: SelectionTiming, name: keyof SelectionTiming['stamps'], at: number): void {
+    timing.stamps[name] = at;
+    this.recordWork(name);
+    this.sink.emit(name, {
+      id: timing.id,
+      sessionId: timing.sessionId,
+      window: timing.window,
+      at,
+    });
   }
 
   recordCapture(): void {
@@ -486,7 +657,10 @@ export class PanelPerformanceCounters {
     }
     this.startup.milestones[milestone] = finiteDuration(at);
     // Emit startup milestones even when detailed events are disabled, so the sink can retain startup history.
-    this.sink.emit('startup', { milestone, elapsedMs: Math.round(finiteDuration(at)) });
+    this.sink.emit('startup', {
+      milestone,
+      elapsedMs: Math.round(finiteDuration(at)),
+    });
   }
 
   recordRefresh(reason: string, durationMs: number): void {
@@ -511,6 +685,7 @@ export class PanelPerformanceCounters {
   }
 
   releasePanel(panel: object): void {
+    this.abandonSelection(panel, 'panel-disposed');
     const panelId = this.panelIds.get(panel);
     if (!panelId) {
       return;
@@ -570,7 +745,11 @@ export class PanelPerformanceCounters {
     current.rowsSent += encoding.rowsSent;
     this.rowPosts.set(type, current);
     if (this.sink.enabled()) {
-      this.sink.emit('rowPost', { kind: type, ...encoding, bytes: serializedBytes });
+      this.sink.emit('rowPost', {
+        kind: type,
+        ...encoding,
+        bytes: serializedBytes,
+      });
     }
   }
 
@@ -608,9 +787,15 @@ export class PanelPerformanceCounters {
       shapes[shape] = (shapes[shape] ?? 0) + 1;
       extensions[extension] = (extensions[extension] ?? 0) + 1;
     }
-    this.lastWatcherOperation = { id: this.watcherOperationCount, ...operation };
+    this.lastWatcherOperation = {
+      id: this.watcherOperationCount,
+      ...operation,
+    };
     if (this.sink.enabled()) {
-      this.sink.emit('watcher', { ...this.lastWatcherOperation, durationMs: Math.round(operation.durationMs) });
+      this.sink.emit('watcher', {
+        ...this.lastWatcherOperation,
+        durationMs: Math.round(operation.durationMs),
+      });
     }
   }
 
@@ -648,6 +833,7 @@ export class PanelPerformanceCounters {
             ),
           ]),
       ),
+      selections: this.selectionTimings.map(selectionSnapshot),
       watcherOperationCount: this.watcherOperationCount,
       watcherDecisions: {
         targeted: this.watcherDecisions.targeted,
@@ -655,7 +841,9 @@ export class PanelPerformanceCounters {
         walkListedPaths: this.watcherDecisions.walkListedPaths,
         broadReasons: { ...this.watcherDecisions.broadReasons },
         unknownPathShapes: { ...this.watcherDecisions.unknownPathShapes },
-        unknownPathExtensions: { ...this.watcherDecisions.unknownPathExtensions },
+        unknownPathExtensions: {
+          ...this.watcherDecisions.unknownPathExtensions,
+        },
       },
       rowPosts: sortedRecord(this.rowPosts, rowPostSnapshot),
       rowsGapCount: this.rowsGapCount,
@@ -663,14 +851,27 @@ export class PanelPerformanceCounters {
       gauges: sortedRecord(this.gauges, (value) => value),
       // The histogram records nanoseconds.
       loopDelay: this.loopDelay.count
-        ? { maxMs: this.loopDelay.max / 1e6, p99Ms: this.loopDelay.percentile(99) / 1e6 }
+        ? {
+            maxMs: this.loopDelay.max / 1e6,
+            p99Ms: this.loopDelay.percentile(99) / 1e6,
+          }
         : null,
       ledgerSaveCount: this.ledgerSaveCount,
       lastWatcherOperation: this.lastWatcherOperation
-        ? { ...this.lastWatcherOperation, broadReasons: [...this.lastWatcherOperation.broadReasons] }
+        ? {
+            ...this.lastWatcherOperation,
+            broadReasons: [...this.lastWatcherOperation.broadReasons],
+          }
         : null,
       lastLedgerSave: this.lastLedgerSave ? { ...this.lastLedgerSave } : null,
-      ...(this.startup ? { startup: { id: this.startup.id, milestones: { ...this.startup.milestones } } } : {}),
+      ...(this.startup
+        ? {
+            startup: {
+              id: this.startup.id,
+              milestones: { ...this.startup.milestones },
+            },
+          }
+        : {}),
       dispatchRoots: dispatchRootSnapshot(this.dispatchRoots),
     };
   }
@@ -813,14 +1014,23 @@ export function projectPerformanceDiagnostics(state: PerformanceDiagnosticState,
           Object.fromEntries(Object.entries(replies).map(([type, counts]) => [type, { ...counts }])),
         ]),
       ),
+      selections: state.counters.selections.map((timing) => ({
+        ...timing,
+        stamps: { ...timing.stamps },
+        spans: { ...timing.spans },
+      })),
       watcherOperationCount: state.counters.watcherOperationCount,
       watcherDecisions: {
         targeted: state.counters.watcherDecisions.targeted,
         broad: state.counters.watcherDecisions.broad,
         walkListedPaths: state.counters.watcherDecisions.walkListedPaths,
         broadReasons: { ...state.counters.watcherDecisions.broadReasons },
-        unknownPathShapes: { ...state.counters.watcherDecisions.unknownPathShapes },
-        unknownPathExtensions: { ...state.counters.watcherDecisions.unknownPathExtensions },
+        unknownPathShapes: {
+          ...state.counters.watcherDecisions.unknownPathShapes,
+        },
+        unknownPathExtensions: {
+          ...state.counters.watcherDecisions.unknownPathExtensions,
+        },
       },
       rowPosts: Object.fromEntries(
         Object.entries(state.counters.rowPosts).map(([type, counts]) => [type, rowPostSnapshot(counts)]),
@@ -838,7 +1048,12 @@ export function projectPerformanceDiagnostics(state: PerformanceDiagnosticState,
         : null,
       lastLedgerSave: state.counters.lastLedgerSave ? { ...state.counters.lastLedgerSave } : null,
       ...(state.counters.startup
-        ? { startup: { id: state.counters.startup.id, milestones: { ...state.counters.startup.milestones } } }
+        ? {
+            startup: {
+              id: state.counters.startup.id,
+              milestones: { ...state.counters.startup.milestones },
+            },
+          }
         : {}),
       dispatchRoots: Object.fromEntries(
         Object.entries(state.counters.dispatchRoots).map(([sessionId, root]) => [sessionId, { ...root }]),

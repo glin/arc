@@ -4,6 +4,31 @@ import assert from 'node:assert';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
+test('selection paint replies retain their identity and reject malformed or reversed stamps', () => {
+  const message = { type: 'selectionPainted', id: 1, sessionId: 'selected', receivedAt: 100, paintedAt: 120 };
+  assert.deepEqual(parsePanelToHost(message), message);
+  const seen: string[] = [];
+  dispatchPanelToHost(parsePanelToHost(message)!, panelRecorder(seen));
+  assert.deepEqual(seen, ['selectionPainted']);
+  for (const fields of [
+    { id: -1 },
+    { id: 1.5 },
+    { receivedAt: NaN },
+    { paintedAt: Infinity },
+    { paintedAt: 90 },
+    { paintedAt: undefined },
+    { reason: 'superseded' },
+    { sessionId: null },
+    { paintedAt: undefined, reason: 'unknown' },
+  ])
+    assert.equal(parsePanelToHost({ ...message, ...fields }), null);
+  assert.deepEqual(parsePanelToHost({ ...message, paintedAt: undefined, reason: 'superseded' }), {
+    ...message,
+    paintedAt: undefined,
+    reason: 'superseded',
+  });
+});
+
 test('response file citations retain their typed literal destination at the host boundary', () => {
   for (const path of ['C:/outside/file%20.csv#L10', '/outside/file:10']) {
     const message = { type: 'openLink', destination: { kind: 'fileCitation', path }, beside: true };
@@ -470,6 +495,10 @@ const PANEL: Array<{ raw: Record<string, unknown>; parsed: PanelToHost }> = [
     raw: { type: 'painted', generation: 3, stage: 'firstCard' },
     parsed: { type: 'painted', generation: 3, stage: 'firstCard' },
   },
+  {
+    raw: { type: 'selectionPainted', id: 1, sessionId: 's1', receivedAt: 100, paintedAt: 120 },
+    parsed: { type: 'selectionPainted', id: 1, sessionId: 's1', receivedAt: 100, paintedAt: 120 },
+  },
   { raw: { type: 'initialize' }, parsed: { type: 'initialize' } },
   { raw: { type: 'developmentReload' }, parsed: { type: 'developmentReload' } },
   { raw: { type: 'refresh' }, parsed: { type: 'refresh' } },
@@ -787,6 +816,7 @@ function panelRecorder(seen: string[]): PanelToHostHandlers<void> {
     ready: take('ready'),
     rowsGap: take('rowsGap'),
     painted: take('painted'),
+    selectionPainted: take('selectionPainted'),
     initialize: take('initialize'),
     developmentReload: take('developmentReload'),
     refresh: take('refresh'),

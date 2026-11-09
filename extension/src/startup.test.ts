@@ -303,6 +303,7 @@ import { emptyTrail, renamePlace, visitPlace } from './turnplaces';
 import { adoptLabelSession, labelsOf } from './turnlabels';
 import { isSearch, searchScope, searchScopeName, searchTurns } from './turnsearch.ts';
 import { dispatchPanelToHost, parsePanelToHost } from './webview/protocol.ts';
+import { createSelectionPaint } from './webview/panel.ts';
 import {
   BoundedTrailingScheduler,
   IntegrityScheduler,
@@ -17672,6 +17673,123 @@ test('opening a session leaves the rail to the render that selection asked for',
 
   await provider.readSession('session-a', 30);
   assert.equal(provider.rails().length, 2, 'a read mark made once the selection settled never reaches the rail');
+});
+
+test.each(['held', 'read'] as const)(
+  'a reader selection records arrival through transcript paint with a %s window',
+  async (window) => {
+    const logged: Array<{ event: string; record: Record<string, unknown> }> = [];
+    const provider = paintHarness(['onMessage', 'routePerformanceEvent'], {
+      parsePanelToHost,
+      dispatchPanelToHost,
+      READER_INSTRUCTIONS: new Set(),
+    });
+    const host = provider.hosts[0];
+    provider.hostSessions = new Map();
+    provider.hostPreviousSessions = new Map();
+    provider.panelSession = (session: string) => session;
+    provider.authoritativeCatalog = provider.partial;
+    let current = window === 'held';
+    provider.progressiveCurrent = () => current;
+    provider.completeSelectedWindow = async () => {
+      if (current) return;
+      current = true;
+      provider.refreshFrom('selected-window', true, true, null, true, true);
+    };
+    const refresh = provider.refresh.bind(provider);
+    const runs: Promise<void>[] = [];
+    provider.refresh = (...args: unknown[]) => {
+      const run = refresh(...args);
+      runs.push(run);
+      return run;
+    };
+    provider.diagnostics.log = (event: string, record: Record<string, unknown>) => logged.push({ event, record });
+    provider.panelStartedAt = null;
+    provider.performanceCounters = new PanelPerformanceCounters(Date.now(), {
+      enabled: () => true,
+      emit: (event: string, record: Record<string, unknown>) => provider.routePerformanceEvent(event, record),
+    });
+    const frames: Array<() => void> = [];
+    const replies: Promise<void>[] = [];
+    const paint = createSelectionPaint(
+      (message) => {
+        replies.push(provider.onMessage(message, host));
+      },
+      (callback) => frames.push(() => frames.push(callback)),
+      () => true,
+    );
+    try {
+      await provider.onMessage({ type: 'showSession', session: 'claude-a' }, host);
+      await Promise.all(runs);
+      const render = provider.messages.find((message: any) => message.selectionTiming);
+      assert.ok(render, 'the selected transcript carries no timing identity');
+      paint.receive(render, performance.timeOrigin + performance.now());
+      paint.schedule();
+      frames.shift()!();
+      assert.equal(provider.performanceCounters.snapshot().work['selection:painted'], undefined);
+      frames.shift()!();
+      await Promise.all(replies);
+      const timing = provider.performanceCounters.snapshot().selections[0];
+      const names = [
+        'selection:hostArrived',
+        'selection:renderPosted',
+        'selection:renderReceived',
+        'selection:painted',
+      ];
+      assert.equal(timing.sessionId, 'claude-a');
+      assert.equal(timing.window, window);
+      assert.equal(timing.reason, null);
+      const stamps = names.map((name) => timing.stamps[name]);
+      assert.ok(
+        stamps.every((stamp) => typeof stamp === 'number'),
+        'the selection is missing a paint stamp',
+      );
+      assert.deepEqual(
+        stamps,
+        [...stamps].sort((a, b) => a - b),
+      );
+      assert.deepEqual(
+        logged.filter((line) => line.event.startsWith('selection:')).map((line) => line.event),
+        names,
+      );
+      const docs = fs.readFileSync(path.join(__dirname, '..', '..', 'docs', 'performance.md'), 'utf8');
+      for (const name of names) {
+        assert.equal(provider.performanceCounters.snapshot().work[name], 1);
+        assert.ok(docs.includes('`' + name + '`'), `performance.md omits ${name}`);
+        assert.equal(logged.find((line) => line.event === name)!.record.sessionId, 'claude-a');
+      }
+      assert.equal(replies.length, 1);
+    } finally {
+      provider.performanceCounters.dispose();
+    }
+  },
+);
+
+test('a selection superseded before its render retains arrival and a reason', async () => {
+  const provider = paintHarness(['onMessage'], {
+    parsePanelToHost,
+    dispatchPanelToHost,
+    READER_INSTRUCTIONS: new Set(),
+  });
+  const host = provider.hosts[0];
+  provider.hostSessions = new Map();
+  provider.hostPreviousSessions = new Map();
+  provider.panelSession = (session: string) => session;
+  provider.authoritativeCatalog = provider.partial;
+  provider.performanceCounters = new PanelPerformanceCounters();
+  provider.refreshAs = async () => {};
+  provider.completeSelectedWindow = async () => {};
+  try {
+    await provider.onMessage({ type: 'showSession', session: 'claude-a' }, host);
+    await provider.onMessage({ type: 'showSession', session: 'claude-a' }, host);
+    const timing = provider.performanceCounters.snapshot().selections[0];
+    assert.equal(timing.reason, 'superseded');
+    assert.equal(timing.sessionId, 'claude-a');
+    assert.deepEqual(Object.keys(timing.stamps), ['selection:hostArrived']);
+    assert.equal(timing.spans['selection:totalMs'], null);
+  } finally {
+    provider.performanceCounters.dispose();
+  }
 });
 
 test('the startup record marks the metadata return, the first render post and the first paint arrival', async () => {
