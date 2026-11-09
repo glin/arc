@@ -175,21 +175,11 @@ export type StartupStage =
 export type RefreshStage = 'started' | 'coalesced' | 'unchanged' | 'rendered' | 'abandoned' | 'walkDeadline';
 
 function operationCounts(): OperationCounts {
-  return {
-    count: 0,
-    totalDurationMs: 0,
-    maximumDurationMs: 0,
-    lastDurationMs: 0,
-  };
+  return { count: 0, totalDurationMs: 0, maximumDurationMs: 0, lastDurationMs: 0 };
 }
 
 function messageCounts(): MessageCounts {
-  return {
-    count: 0,
-    serializedBytes: 0,
-    maximumSerializedBytes: 0,
-    unavailableByteCount: 0,
-  };
+  return { count: 0, serializedBytes: 0, maximumSerializedBytes: 0, unavailableByteCount: 0 };
 }
 
 function recordMessageCount(counts: MessageCounts, serializedBytes: number | null): void {
@@ -203,13 +193,7 @@ function recordMessageCount(counts: MessageCounts, serializedBytes: number | nul
 }
 
 function rowPostCounts(): RowPostCounts {
-  return {
-    whole: messageCounts(),
-    delta: messageCounts(),
-    wholeReasons: {},
-    rowsHeld: 0,
-    rowsSent: 0,
-  };
+  return { whole: messageCounts(), delta: messageCounts(), wholeReasons: {}, rowsHeld: 0, rowsSent: 0 };
 }
 
 function sortedRecord<T>(entries: Iterable<[string, T]>, copy: (value: T) => T): Record<string, T> {
@@ -260,17 +244,12 @@ export interface PerformanceEventSink {
 }
 
 // Default sink disables detailed events and ignores emitted startup milestones.
-const UNWATCHED: PerformanceEventSink = {
-  enabled: () => false,
-  emit: () => {},
-};
+const UNWATCHED: PerformanceEventSink = { enabled: () => false, emit: () => {} };
 
 type DiscoveryCharges = import('./progressiveworker').DiscoveryCharges;
 
 // A record over every charge field fails typecheck when a field is missing, so no charge goes unsummed.
-const DISCOVERY_CHARGE_FIELDS: {
-  readonly [K in keyof DiscoveryCharges]-?: true;
-} = {
+const DISCOVERY_CHARGE_FIELDS: { readonly [K in keyof DiscoveryCharges]-?: true } = {
   readBytes: true,
   receiptEntries: true,
   receiptChecks: true,
@@ -343,15 +322,7 @@ function dispatchRootSnapshot(roots: ReadonlyMap<string, DispatchRootCharges>): 
   );
   const rest = ranked.slice(DISPATCH_ROOT_RECORDS);
   if (rest.length) {
-    const other = {
-      roots: rest.length,
-      passes: 0,
-      bytes: 0,
-      rereads: 0,
-      rootWaits: 0,
-      restarts: 0,
-      remainingBytes: 0,
-    };
+    const other = { roots: rest.length, passes: 0, bytes: 0, rereads: 0, rootWaits: 0, restarts: 0, remainingBytes: 0 };
     for (const [, root] of rest) for (const key of DISPATCH_ROOT_SUMS) other[key] += root[key];
     records.other = other;
   }
@@ -441,11 +412,7 @@ export class PanelPerformanceCounters {
   // spend publishes its settled members and counts as a partial publication. Every other reply counts as a continuation.
   recordDiscovery(
     charges: import('./progressiveworker').DiscoveryCharges | undefined,
-    reply: {
-      complete: boolean;
-      continuation: boolean;
-      membershipSettled?: boolean;
-    },
+    reply: { complete: boolean; continuation: boolean; membershipSettled?: boolean },
     dispatchRoots?: Record<string, DispatchRootCharges>,
   ): void {
     if (charges) for (const key of DISCOVERY_CHARGE_KEYS) this.discovery[key] += charges[key] ?? 0;
@@ -503,9 +470,7 @@ export class PanelPerformanceCounters {
   private rowsGapCount = 0;
   private readonly work = new Map<string, number>();
   private readonly gauges = new Map<string, number>();
-  private readonly loopDelay: IntervalHistogram = monitorEventLoopDelay({
-    resolution: 10,
-  });
+  private readonly loopDelay: IntervalHistogram = monitorEventLoopDelay({ resolution: 10 });
   private ledgerSaveCount = 0;
   private readonly refreshes = new Map<string, OperationCounts>();
   private readonly refreshStages: Record<RefreshStage, number> = {
@@ -524,10 +489,7 @@ export class PanelPerformanceCounters {
   private readonly panelReplies = new Map<string, Map<string, OperationCounts>>();
   private lastWatcherOperation: WatcherOperation | null = null;
   private lastLedgerSave: LedgerSaveOperation | null = null;
-  private startup: {
-    id: number;
-    milestones: Partial<Record<StartupStage, number>>;
-  } | null = null;
+  private startup: { id: number; milestones: Partial<Record<StartupStage, number>> } | null = null;
   private nextSelectionId = 0;
   private readonly selectionTimings: SelectionTiming[] = [];
   private readonly pendingSelections = new Map<object, SelectionTiming>();
@@ -657,10 +619,7 @@ export class PanelPerformanceCounters {
     }
     this.startup.milestones[milestone] = finiteDuration(at);
     // Emit startup milestones even when detailed events are disabled, so the sink can retain startup history.
-    this.sink.emit('startup', {
-      milestone,
-      elapsedMs: Math.round(finiteDuration(at)),
-    });
+    this.sink.emit('startup', { milestone, elapsedMs: Math.round(finiteDuration(at)) });
   }
 
   recordRefresh(reason: string, durationMs: number): void {
@@ -745,11 +704,7 @@ export class PanelPerformanceCounters {
     current.rowsSent += encoding.rowsSent;
     this.rowPosts.set(type, current);
     if (this.sink.enabled()) {
-      this.sink.emit('rowPost', {
-        kind: type,
-        ...encoding,
-        bytes: serializedBytes,
-      });
+      this.sink.emit('rowPost', { kind: type, ...encoding, bytes: serializedBytes });
     }
   }
 
@@ -787,15 +742,9 @@ export class PanelPerformanceCounters {
       shapes[shape] = (shapes[shape] ?? 0) + 1;
       extensions[extension] = (extensions[extension] ?? 0) + 1;
     }
-    this.lastWatcherOperation = {
-      id: this.watcherOperationCount,
-      ...operation,
-    };
+    this.lastWatcherOperation = { id: this.watcherOperationCount, ...operation };
     if (this.sink.enabled()) {
-      this.sink.emit('watcher', {
-        ...this.lastWatcherOperation,
-        durationMs: Math.round(operation.durationMs),
-      });
+      this.sink.emit('watcher', { ...this.lastWatcherOperation, durationMs: Math.round(operation.durationMs) });
     }
   }
 
@@ -841,9 +790,7 @@ export class PanelPerformanceCounters {
         walkListedPaths: this.watcherDecisions.walkListedPaths,
         broadReasons: { ...this.watcherDecisions.broadReasons },
         unknownPathShapes: { ...this.watcherDecisions.unknownPathShapes },
-        unknownPathExtensions: {
-          ...this.watcherDecisions.unknownPathExtensions,
-        },
+        unknownPathExtensions: { ...this.watcherDecisions.unknownPathExtensions },
       },
       rowPosts: sortedRecord(this.rowPosts, rowPostSnapshot),
       rowsGapCount: this.rowsGapCount,
@@ -851,27 +798,14 @@ export class PanelPerformanceCounters {
       gauges: sortedRecord(this.gauges, (value) => value),
       // The histogram records nanoseconds.
       loopDelay: this.loopDelay.count
-        ? {
-            maxMs: this.loopDelay.max / 1e6,
-            p99Ms: this.loopDelay.percentile(99) / 1e6,
-          }
+        ? { maxMs: this.loopDelay.max / 1e6, p99Ms: this.loopDelay.percentile(99) / 1e6 }
         : null,
       ledgerSaveCount: this.ledgerSaveCount,
       lastWatcherOperation: this.lastWatcherOperation
-        ? {
-            ...this.lastWatcherOperation,
-            broadReasons: [...this.lastWatcherOperation.broadReasons],
-          }
+        ? { ...this.lastWatcherOperation, broadReasons: [...this.lastWatcherOperation.broadReasons] }
         : null,
       lastLedgerSave: this.lastLedgerSave ? { ...this.lastLedgerSave } : null,
-      ...(this.startup
-        ? {
-            startup: {
-              id: this.startup.id,
-              milestones: { ...this.startup.milestones },
-            },
-          }
-        : {}),
+      ...(this.startup ? { startup: { id: this.startup.id, milestones: { ...this.startup.milestones } } } : {}),
       dispatchRoots: dispatchRootSnapshot(this.dispatchRoots),
     };
   }
@@ -1025,12 +959,8 @@ export function projectPerformanceDiagnostics(state: PerformanceDiagnosticState,
         broad: state.counters.watcherDecisions.broad,
         walkListedPaths: state.counters.watcherDecisions.walkListedPaths,
         broadReasons: { ...state.counters.watcherDecisions.broadReasons },
-        unknownPathShapes: {
-          ...state.counters.watcherDecisions.unknownPathShapes,
-        },
-        unknownPathExtensions: {
-          ...state.counters.watcherDecisions.unknownPathExtensions,
-        },
+        unknownPathShapes: { ...state.counters.watcherDecisions.unknownPathShapes },
+        unknownPathExtensions: { ...state.counters.watcherDecisions.unknownPathExtensions },
       },
       rowPosts: Object.fromEntries(
         Object.entries(state.counters.rowPosts).map(([type, counts]) => [type, rowPostSnapshot(counts)]),
@@ -1048,12 +978,7 @@ export function projectPerformanceDiagnostics(state: PerformanceDiagnosticState,
         : null,
       lastLedgerSave: state.counters.lastLedgerSave ? { ...state.counters.lastLedgerSave } : null,
       ...(state.counters.startup
-        ? {
-            startup: {
-              id: state.counters.startup.id,
-              milestones: { ...state.counters.startup.milestones },
-            },
-          }
+        ? { startup: { id: state.counters.startup.id, milestones: { ...state.counters.startup.milestones } } }
         : {}),
       dispatchRoots: Object.fromEntries(
         Object.entries(state.counters.dispatchRoots).map(([sessionId, root]) => [sessionId, { ...root }]),
