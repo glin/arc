@@ -15093,7 +15093,7 @@ export class PanelProvider implements vscode.Disposable {
       }
     }
     const eligible = sessions.filter((session) => {
-      const entry = this.titleEntryOf(session.file);
+      const entry = this.titles.get(session.file);
       return entry && railEnrichmentNeeds(entry, session)?.recovery;
     });
     const eligibleIds = new Set(eligible.map((session) => session.sessionId));
