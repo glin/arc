@@ -24,7 +24,9 @@ const COUNTER_PREFIXES = [
   'watcher:grownMemberMiss:',
 ];
 // Bytes depend on the platform's path separators, so these counters may fall below budget without a change in the work.
-const ONE_SIDED = new Set(['readBytes']);
+const ONE_SIDED = new Set(['readBytes', 'dispatchSpendBytes']);
+// Counts of host work with one exact name each.
+const WORK_NAMES = new Set(['catalogWalk', 'watcher:grownMembers', 'pollDirectoryStats', 'childVersionStat']);
 
 // Byte rows count paths and working directories, so a root of one length keeps those bytes the same on every machine.
 const ROOT_LENGTH = 160;
@@ -39,6 +41,22 @@ function paddedRoot(base: string): string {
   fs.mkdirSync(root);
   return root;
 }
+
+// The discovery charges of each step: reads, scans, and spend reads inside one root.
+const DISCOVERY_NAMES = [
+  'readBytes',
+  'receiptScanOpensAfterCompletion',
+  'receiptScanOpens',
+  'receiptEntries',
+  'receiptChecks',
+  'parentChecks',
+  'unsettledParentChanges',
+  'dispatchSpendVisits',
+  'dispatchSpendBytes',
+  'dispatchSpendFiles',
+  'dispatchSpendRereads',
+  'dispatchSpendRootRestarts',
+];
 
 type Counts = Record<string, number>;
 interface BudgetRow {
@@ -100,11 +118,10 @@ function counts(counters: { snapshot(): any }): Counts {
   const snapshot = counters.snapshot();
   const row: Counts = {};
   for (const [name, count] of Object.entries<number>(snapshot.work))
-    if (name === 'catalogWalk' || COUNTER_PREFIXES.some((prefix) => name.startsWith(prefix))) row[name] = count;
+    if (WORK_NAMES.has(name) || COUNTER_PREFIXES.some((prefix) => name.startsWith(prefix))) row[name] = count;
   for (const [name, entry] of Object.entries<{ count: number }>(snapshot.refreshes))
     if (name === 'catalog-enumeration') row[`refreshCount:${name}`] = entry.count;
-  for (const name of ['readBytes', 'receiptScanOpensAfterCompletion', 'dispatchSpendVisits'])
-    if (snapshot.discovery[name] !== undefined) row[name] = snapshot.discovery[name];
+  for (const name of DISCOVERY_NAMES) if (snapshot.discovery[name] !== undefined) row[name] = snapshot.discovery[name];
   return row;
 }
 

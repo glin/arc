@@ -21,6 +21,21 @@
       "budget": 1,
       "margin": 0
     },
+    "cold start | dispatchSpendBytes": {
+      "reason": "A spend pass reads each pending root once. A rise means a pass reads spend sources again inside one root.",
+      "budget": 24826,
+      "margin": 0
+    },
+    "cold start | dispatchSpendFiles": {
+      "reason": "A spend pass reads each pending source file once. A rise means a pass opens spend sources again.",
+      "budget": 6,
+      "margin": 0
+    },
+    "cold start | dispatchSpendRereads": {
+      "reason": "Saved spend facts answer an unchanged root with no read. A rise means saved facts stopped answering it.",
+      "budget": 6,
+      "margin": 0
+    },
     "cold start | dispatchSpendVisits": {
       "reason": "Cold start visits 6 dispatched roots for spend.",
       "budget": 6,
@@ -56,10 +71,30 @@
       "budget": 150,
       "margin": 0
     },
+    "cold start | parentChecks": {
+      "reason": "Each settled parent takes one check in a pass. A rise means a step checks parents again.",
+      "budget": 440,
+      "margin": 0
+    },
     "cold start | readBytes": {
       "reason": "Cold start reads 392568 bytes through discovery. The margin covers the temporary path length and the file identity numbers in dispatch receipts.",
-      "budget": 411216,
+      "budget": 411210,
       "margin": 256
+    },
+    "cold start | receiptChecks": {
+      "reason": "The scan checks each receipt file once. A rise means a step checks receipts again.",
+      "budget": 762,
+      "margin": 0
+    },
+    "cold start | receiptEntries": {
+      "reason": "The receipt scan visits each receipt once for its pass. A rise means a step scans receipts again.",
+      "budget": 44,
+      "margin": 0
+    },
+    "cold start | receiptScanOpens": {
+      "reason": "A worker opens one receipt scan for a discovery pass. A rise means a step opens extra scans.",
+      "budget": 1,
+      "margin": 0
     },
     "cold start | receiptScanOpensAfterCompletion": {
       "reason": "Cold start opens 0 receipt scans after a complete reply.",
@@ -76,6 +111,11 @@
       "budget": 1,
       "margin": 0
     },
+    "cold start | unsettledParentChanges": {
+      "reason": "A held pass lists one parent set however a listing orders it. A rise means reordered parents reopen discovery.",
+      "budget": 0,
+      "margin": 0
+    },
     "cold start | walk:requested:shell-ready": {
       "reason": "Cold start lists the catalog 1 times for this cause.",
       "budget": 1,
@@ -88,6 +128,21 @@
     },
     "warm start | catalogWalk": {
       "reason": "Warm start runs 1 complete catalog walks.",
+      "budget": 1,
+      "margin": 0
+    },
+    "warm start | dispatchSpendBytes": {
+      "reason": "A spend pass reads each pending root once. A rise means a pass reads spend sources again inside one root.",
+      "budget": 1514,
+      "margin": 0
+    },
+    "warm start | dispatchSpendFiles": {
+      "reason": "A spend pass reads each pending source file once. A rise means a pass opens spend sources again.",
+      "budget": 1,
+      "margin": 0
+    },
+    "warm start | dispatchSpendRereads": {
+      "reason": "Saved spend facts answer an unchanged root with no read. A rise means saved facts stopped answering it.",
       "budget": 1,
       "margin": 0
     },
@@ -121,10 +176,30 @@
       "budget": 150,
       "margin": 0
     },
+    "warm start | parentChecks": {
+      "reason": "Each settled parent takes one check in a pass. A rise means a step checks parents again.",
+      "budget": 240,
+      "margin": 0
+    },
     "warm start | readBytes": {
       "reason": "Warm start reads 16105 bytes through discovery. The margin covers the temporary path length and the file identity numbers in dispatch receipts.",
-      "budget": 18913,
+      "budget": 18907,
       "margin": 256
+    },
+    "warm start | receiptChecks": {
+      "reason": "The scan checks each receipt file once. A rise means a step checks receipts again.",
+      "budget": 762,
+      "margin": 0
+    },
+    "warm start | receiptEntries": {
+      "reason": "The receipt scan visits each receipt once for its pass. A rise means a step scans receipts again.",
+      "budget": 44,
+      "margin": 0
+    },
+    "warm start | receiptScanOpens": {
+      "reason": "A worker opens one receipt scan for a discovery pass. A rise means a step opens extra scans.",
+      "budget": 1,
+      "margin": 0
     },
     "warm start | receiptScanOpensAfterCompletion": {
       "reason": "Warm start opens 0 receipt scans after a complete reply.",
@@ -146,6 +221,11 @@
       "budget": 1,
       "margin": 0
     },
+    "warm start | unsettledParentChanges": {
+      "reason": "A held pass lists one parent set however a listing orders it. A rise means reordered parents reopen discovery.",
+      "budget": 0,
+      "margin": 0
+    },
     "warm start | walk:requested:shell-ready": {
       "reason": "Warm start lists the catalog 1 times for this cause.",
       "budget": 1,
@@ -158,6 +238,21 @@
     },
     "completion | discoveryRequest:dispatchSpend": {
       "reason": "Completion sends 1 spend-only requests for a dispatched file that moved.",
+      "budget": 1,
+      "margin": 0
+    },
+    "completion | dispatchSpendBytes": {
+      "reason": "A spend pass reads each pending root once. A rise means a pass reads spend sources again inside one root.",
+      "budget": 2741,
+      "margin": 0
+    },
+    "completion | dispatchSpendFiles": {
+      "reason": "A spend pass reads each pending source file once. A rise means a pass opens spend sources again.",
+      "budget": 1,
+      "margin": 0
+    },
+    "completion | dispatchSpendRereads": {
+      "reason": "Saved spend facts answer an unchanged root with no read. A rise means saved facts stopped answering it.",
       "budget": 1,
       "margin": 0
     },
@@ -211,6 +306,16 @@
       "budget": 1,
       "margin": 0
     },
+    "completion | unsettledParentChanges": {
+      "reason": "A held pass lists one parent set however a listing orders it. A rise means reordered parents reopen discovery.",
+      "budget": 0,
+      "margin": 0
+    },
+    "completion | watcher:grownMembers": {
+      "reason": "A growing dispatched member takes the spend-only route. A fall means a completion lost that route and started full passes.",
+      "budget": 1,
+      "margin": 0
+    },
     "child watcher event | catalogWalk": {
       "reason": "Child watcher event runs 0 complete catalog walks.",
       "budget": 0,
@@ -251,10 +356,30 @@
       "budget": 0,
       "margin": 0
     },
+    "child watcher event | parentChecks": {
+      "reason": "Each settled parent takes one check in a pass. A rise means a step checks parents again.",
+      "budget": 240,
+      "margin": 0
+    },
     "child watcher event | readBytes": {
       "reason": "Child watcher event reads 18511 bytes through discovery. The margin covers the temporary path length and the file identity numbers in dispatch receipts.",
-      "budget": 21451,
+      "budget": 21445,
       "margin": 256
+    },
+    "child watcher event | receiptChecks": {
+      "reason": "The scan checks each receipt file once. A rise means a step checks receipts again.",
+      "budget": 762,
+      "margin": 0
+    },
+    "child watcher event | receiptEntries": {
+      "reason": "The receipt scan visits each receipt once for its pass. A rise means a step scans receipts again.",
+      "budget": 44,
+      "margin": 0
+    },
+    "child watcher event | receiptScanOpens": {
+      "reason": "A worker opens one receipt scan for a discovery pass. A rise means a step opens extra scans.",
+      "budget": 1,
+      "margin": 0
     },
     "child watcher event | receiptScanOpensAfterCompletion": {
       "reason": "Child watcher event opens 1 receipt scans after a complete reply.",
@@ -269,6 +394,11 @@
     "child watcher event | renderPost:transcript": {
       "reason": "Child watcher event posts 1 renders for this reason.",
       "budget": 1,
+      "margin": 0
+    },
+    "child watcher event | unsettledParentChanges": {
+      "reason": "A held pass lists one parent set however a listing orders it. A rise means reordered parents reopen discovery.",
+      "budget": 0,
       "margin": 0
     },
     "child watcher event | watcher:grownMemberMiss:notMember": {
@@ -336,6 +466,11 @@
       "budget": 2,
       "margin": 0
     },
+    "selection switch | unsettledParentChanges": {
+      "reason": "A held pass lists one parent set however a listing orders it. A rise means reordered parents reopen discovery.",
+      "budget": 0,
+      "margin": 0
+    },
     "poll and backstop walk | catalogWalk": {
       "reason": "Poll and backstop walk runs 1 complete catalog walks.",
       "budget": 1,
@@ -381,10 +516,35 @@
       "budget": 0,
       "margin": 0
     },
+    "poll and backstop walk | parentChecks": {
+      "reason": "Each settled parent takes one check in a pass. A rise means a step checks parents again.",
+      "budget": 240,
+      "margin": 0
+    },
+    "poll and backstop walk | pollDirectoryStats": {
+      "reason": "A poll stats each listed directory once. A rise means a poll checks more directories.",
+      "budget": 316,
+      "margin": 0
+    },
     "poll and backstop walk | readBytes": {
       "reason": "Poll and backstop walk reads 16105 bytes through discovery. The margin covers the temporary path length and the file identity numbers in dispatch receipts.",
-      "budget": 18913,
+      "budget": 18907,
       "margin": 256
+    },
+    "poll and backstop walk | receiptChecks": {
+      "reason": "The scan checks each receipt file once. A rise means a step checks receipts again.",
+      "budget": 762,
+      "margin": 0
+    },
+    "poll and backstop walk | receiptEntries": {
+      "reason": "The receipt scan visits each receipt once for its pass. A rise means a step scans receipts again.",
+      "budget": 44,
+      "margin": 0
+    },
+    "poll and backstop walk | receiptScanOpens": {
+      "reason": "A worker opens one receipt scan for a discovery pass. A rise means a step opens extra scans.",
+      "budget": 1,
+      "margin": 0
     },
     "poll and backstop walk | receiptScanOpensAfterCompletion": {
       "reason": "Poll and backstop walk opens 1 receipt scans after a complete reply.",
@@ -399,6 +559,11 @@
     "poll and backstop walk | renderPost:poll": {
       "reason": "Poll and backstop walk posts 1 renders for this reason.",
       "budget": 1,
+      "margin": 0
+    },
+    "poll and backstop walk | unsettledParentChanges": {
+      "reason": "A held pass lists one parent set however a listing orders it. A rise means reordered parents reopen discovery.",
+      "budget": 0,
       "margin": 0
     },
     "poll and backstop walk | walk:requested:poll:backstop": {
