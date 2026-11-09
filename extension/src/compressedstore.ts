@@ -274,14 +274,13 @@ function readManifest(directory: string, name: string): StoreManifest | null {
 }
 
 // One read of the fact lines of a file. The callback gets each complete line and its byte offset, so a caller holds one
-// line at a time. A trailing line without a line break is skipped.
-function eachLine(file: string, line: (text: Buffer, offset: number) => boolean | void): void {
-  let fd: number;
-  try {
-    fd = fs.openSync(file, 'r');
-  } catch {
-    return;
-  }
+// line at a time. A trailing line without a line break is skipped. A file that cannot be read throws.
+function eachLine(
+  file: string,
+  line: (text: Buffer, offset: number) => boolean | void,
+  open: (file: string) => number = openForRead,
+): void {
+  const fd = open(file);
   try {
     const chunk = Buffer.allocUnsafe(READ_CHUNK);
     let held: Buffer = Buffer.alloc(0);
@@ -305,6 +304,19 @@ function eachLine(file: string, line: (text: Buffer, offset: number) => boolean 
   }
 }
 
+function openForRead(file: string): number {
+  return fs.openSync(file, 'r');
+}
+
+// A reader skips a file that it cannot read, because a compaction can retire any file at any time.
+function eachReadableLine(file: string, line: (text: Buffer, offset: number) => boolean | void): void {
+  try {
+    eachLine(file, line);
+  } catch {
+    // The file is gone or cannot be read.
+  }
+}
+
 function parseEntry(text: string): CompressedFactEntry | null {
   try {
     const value = JSON.parse(text) as Partial<CompressedFactEntry>;
@@ -319,7 +331,7 @@ function parseEntry(text: string): CompressedFactEntry | null {
 // The fact version of a store file, from its first complete line. Null when the file holds no complete line.
 function fileFactsVersion(file: string): number | null {
   let version: number | null = null;
-  eachLine(file, (line) => {
+  eachReadableLine(file, (line) => {
     const entry = parseEntry(line.toString('utf8'));
     version = entry ? entry.factsVersion : null;
     return false;
@@ -447,7 +459,7 @@ export function readCompressedStore(
   let order = 0;
   for (const input of view.inputs) {
     if (fileFactsVersion(path.join(directory, input.name)) !== COMPRESSED_FACTS_VERSION) continue;
-    eachLine(path.join(directory, input.name), (line, offset) => {
+    eachReadableLine(path.join(directory, input.name), (line, offset) => {
       const entry = parseEntry(line.toString('utf8'));
       if (!entry) return;
       const ranked: RankedEntry = {
@@ -490,14 +502,9 @@ export function compressedEntryBatches(
   return batches;
 }
 
-// The line that starts at `offset`, or null when it has no line break.
-function readLineAt(file: string, offset: number): string | null {
-  let fd: number;
-  try {
-    fd = fs.openSync(file, 'r');
-  } catch {
-    return null;
-  }
+// The line that starts at `offset`, or null when it has no line break. A file that cannot be read throws.
+function readLineAt(file: string, offset: number, open: (file: string) => number): string | null {
+  const fd = open(file);
   try {
     const parts: Buffer[] = [];
     const chunk = Buffer.allocUnsafe(READ_CHUNK);
@@ -554,7 +561,12 @@ export interface CompressedStoreOptions {
   compactSegments?: number;
   // A hook that throws at a named step, for tests of a crash at that step.
   fault?: (point: string) => void;
+  // Opens a compaction input for reading.
+  openInput?: (file: string) => number;
 }
+
+// A compaction input could not be read. The compaction ends and retires nothing.
+class CompactionInputError extends Error {}
 
 interface OpenSegment {
   name: string;
@@ -575,6 +587,7 @@ export class CompressedStoreHolder {
   private readonly statOf: (file: string) => { size: number; mtimeMs: number } | null;
   private readonly wrote: (bytes: number) => void;
   private readonly fault: (point: string) => void;
+  private readonly openInput: (file: string) => number;
   private readonly segmentBytes: number;
   private readonly compactSegments: number;
 
@@ -587,6 +600,8 @@ export class CompressedStoreHolder {
   private open: OpenSegment | null = null;
   private closedSegments = 0;
   private lastCompaction = 0;
+  // A compaction that could not read an input waits for this time before the next one.
+  private compactionRetryAt = 0;
   private running: Promise<void> | null = null;
   private cancelRenewal: (() => void) | null = null;
   private cancelRetry: (() => void) | null = null;
@@ -621,6 +636,7 @@ export class CompressedStoreHolder {
       });
     this.wrote = options.wrote ?? (() => {});
     this.fault = options.fault ?? (() => {});
+    this.openInput = options.openInput ?? openForRead;
     this.lastCompaction = this.now();
     this.segmentBytes = options.segmentBytes ?? SEGMENT_BYTES;
     this.compactSegments = options.compactSegments ?? COMPACT_SEGMENTS;
@@ -676,14 +692,23 @@ export class CompressedStoreHolder {
       }
       while (this.queue.length && this.token) {
         if (!this.publishBatch()) return;
-        if (this.closedSegments >= this.compactSegments) await this.compact(false);
+        if (this.closedSegments >= this.compactSegments && this.compactionAllowed()) await this.compact(false);
         await this.yieldStep();
       }
       if (!this.token) return;
-      if (this.now() - this.lastCompaction >= COMPACT_INTERVAL_MS && this.closedSegments > 0) await this.compact(false);
+      if (
+        this.now() - this.lastCompaction >= COMPACT_INTERVAL_MS &&
+        this.closedSegments > 0 &&
+        this.compactionAllowed()
+      )
+        await this.compact(false);
       if (!this.token) return;
     }
     this.armIdleRelease();
+  }
+
+  private compactionAllowed(): boolean {
+    return this.now() >= this.compactionRetryAt;
   }
 
   private armIdleRelease(): void {
@@ -884,6 +909,8 @@ export class CompressedStoreHolder {
     const names = listDirectory(this.directory);
     const view = storeView(this.directory, names);
     this.fault('recovery:start');
+    // A holder paused since its listing deletes nothing, because the listing no longer describes the store.
+    if (!this.check()) return;
     const current = view.current;
     const keepShards = new Set(current?.shards ?? []);
     for (const stored of view.manifests) {
@@ -955,10 +982,46 @@ export class CompressedStoreHolder {
     const view = storeView(this.directory, names);
     const inputs = view.inputs.filter((stored) => this.ownVersion(stored.name));
     if (!inputs.length) return;
+    const shards: string[] = [];
+    try {
+      await this.compactInputs(view, inputs, shards, recovery);
+    } catch (error) {
+      if (!(error instanceof CompactionInputError)) throw error;
+      // The inputs stay, so every entry stays readable. The shards of this attempt go, and the next attempt waits.
+      for (const name of shards) this.remove(name);
+      this.compactionRetryAt = this.now() + COMPACT_INTERVAL_MS;
+    }
+  }
+
+  private readInputLines(input: string, line: (text: Buffer, offset: number) => boolean | void): void {
+    try {
+      eachLine(path.join(this.directory, input), line, this.openInput);
+    } catch (error) {
+      throw new CompactionInputError(input, { cause: error });
+    }
+  }
+
+  private readInputLine(input: string, offset: number): string {
+    let text: string | null;
+    try {
+      text = readLineAt(path.join(this.directory, input), offset, this.openInput);
+    } catch (error) {
+      throw new CompactionInputError(input, { cause: error });
+    }
+    if (text === null) throw new CompactionInputError(input);
+    return text;
+  }
+
+  private async compactInputs(
+    view: StoreView,
+    inputs: readonly StoreName[],
+    shards: string[],
+    recovery: boolean,
+  ): Promise<void> {
     const best = new Map<string, RankedEntry>();
     let order = 0;
     for (const input of inputs) {
-      eachLine(path.join(this.directory, input.name), (line, offset) => {
+      this.readInputLines(input.name, (line, offset) => {
         const entry = parseEntry(line.toString('utf8'));
         if (!entry) return;
         const ranked: RankedEntry = {
@@ -979,7 +1042,6 @@ export class CompressedStoreHolder {
       .sort((left, right) =>
         left.entry.pairKey < right.entry.pairKey ? -1 : left.entry.pairKey > right.entry.pairKey ? 1 : 0,
       );
-    const shards: string[] = [];
     let text = '';
     let bytes = 0;
     const flush = () => {
@@ -994,9 +1056,7 @@ export class CompressedStoreHolder {
       return true;
     };
     for (const ranked of kept) {
-      const stored = readLineAt(path.join(this.directory, ranked.input), ranked.offset);
-      if (stored === null) continue;
-      const line = `${stored}\n`;
+      const line = `${this.readInputLine(ranked.input, ranked.offset)}\n`;
       text += line;
       bytes += Buffer.byteLength(line);
       if (bytes >= this.segmentBytes) {
@@ -1011,13 +1071,15 @@ export class CompressedStoreHolder {
     const manifest: StoreManifest = {
       factsVersion: COMPRESSED_FACTS_VERSION,
       epoch: this.epoch!.e,
-      token: this.token,
+      token: this.token!,
       seq: this.seq++,
       shards,
       inputs: inputs.map((stored) => stored.name),
     };
     this.writeAtomically(path.join(this.directory, this.manifestName(manifest)), JSON.stringify(manifest));
     this.fault('compact:manifest-saved');
+    // A holder paused since its last check retires nothing, because a new holder can have removed the shards it named.
+    if (!this.check() || !shards.every((shard) => fs.existsSync(path.join(this.directory, shard)))) return;
     for (const input of inputs) this.remove(input.name);
     this.fault('compact:inputs-deleted');
     for (const stored of view.manifests)

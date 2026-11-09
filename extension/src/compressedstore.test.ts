@@ -60,6 +60,10 @@ function storeFixture(name: string, options: Partial<CompressedStoreOptions> = {
         timer.run();
       }
     },
+    // Moves the clock and fires no timer, so a held lease and its idle release stay as they are.
+    jump(milliseconds: number) {
+      now += milliseconds;
+    },
   };
   const make = (extra: Partial<CompressedStoreOptions> = {}) =>
     new CompressedStoreHolder(directory, {
@@ -246,7 +250,7 @@ test('an append during the trailing compaction is written and the idle release i
   const holder = make();
   late = holder;
   await holder.append([entry('a.jsonl.zst')]);
-  clock.advance(300_001);
+  clock.jump(300_001);
   await holder.append([entry('b.jsonl.zst')]);
   assert.equal(arrived, true, 'the trailing compaction did not run');
   await vi.waitFor(() => assert.equal(holder.pending, 0, 'an append during the compaction stayed queued'));
@@ -528,6 +532,99 @@ test('a reader ignores a shard that no valid manifest names and skips an input t
   fs.writeFileSync(path.join(directory, 'shard-88-y-0'), `${JSON.stringify(entry('orphan.jsonl.zst'))}\n`);
   const read = readCompressedStore(directory);
   assert.deepEqual([...read.entries.keys()].sort(), ['r1.jsonl.zst', 'r2.jsonl.zst', 'r3.jsonl.zst']);
+});
+
+test('a compactor paused past its lease retires no input, so a takeover loses no entry', async () => {
+  const { directory, clock, make } = storeFixture('store-paused-compactor', { segmentBytes: 64, compactSegments: 4 });
+  const lock = path.join(directory, STORE_LOCK);
+  const second = make();
+  const takeovers: Promise<unknown>[] = [];
+  const paused = make({
+    fault: (at) => {
+      if (at !== 'compact:before-manifest' || takeovers.length) return;
+      // The compactor pauses here. The lease goes stale and the second holder takes over, deletes the unnamed shards and
+      // yields while it scans the inputs.
+      stale(lock, clock);
+      takeovers.push(second.append([entry('second.jsonl.zst')]));
+    },
+  });
+  for (const at of [1, 2, 3, 4]) await paused.append([entry(`rollout-${at}.jsonl.zst`)]);
+  assert.equal(takeovers.length, 1, 'the compaction did not reach its manifest');
+  await Promise.all(takeovers);
+  assert.equal(paused.held, false, 'the paused holder kept its lease');
+  assert.equal(threadCount(directory), 5, 'a retired input took entries with it');
+  assert.deepEqual([...readCompressedStore(directory).entries.keys()].sort(), [
+    'rollout-1.jsonl.zst',
+    'rollout-2.jsonl.zst',
+    'rollout-3.jsonl.zst',
+    'rollout-4.jsonl.zst',
+    'second.jsonl.zst',
+  ]);
+  paused.dispose();
+  second.dispose();
+});
+
+test('a compaction whose named shard is gone retires no input', async () => {
+  const { directory, make, names } = storeFixture('store-shard-gone', { segmentBytes: 64, compactSegments: 3 });
+  const holder = make({
+    fault: (at) => {
+      if (at !== 'compact:manifest-saved') return;
+      for (const name of names()) if (name.startsWith('shard-')) fs.rmSync(path.join(directory, name));
+    },
+  });
+  for (const at of [1, 2, 3]) await holder.append([entry(`r${at}.jsonl.zst`)]);
+  assert.equal(names().filter((name) => name.startsWith('segment-')).length, 3, 'a compaction retired its inputs');
+  assert.equal(threadCount(directory), 3);
+  holder.dispose();
+});
+
+test('recovery that lost its lease since the listing deletes nothing', async () => {
+  const { directory, names, make } = storeFixture('store-recovery-paused');
+  const lock = path.join(directory, STORE_LOCK);
+  fs.writeFileSync(path.join(directory, 'shard-1-dead-0'), `${JSON.stringify(entry('unnamed.jsonl.zst'))}\n`);
+  const holder = make({
+    fault: (at) => {
+      if (at === 'recovery:start') fs.writeFileSync(lock, 'other');
+    },
+  });
+  await holder.append([entry('a.jsonl.zst')]);
+  assert.equal(holder.held, false);
+  assert.ok(names().includes('shard-1-dead-0'), 'a paused recovery deleted a file from its stale listing');
+  holder.dispose();
+});
+
+test('an input that cannot be read ends the compaction with every input kept', async () => {
+  let denied: string | null = null;
+  const { directory, clock, make, names } = storeFixture('store-unreadable', {
+    segmentBytes: 64,
+    compactSegments: 3,
+    openInput: (file) => {
+      if (denied && file.endsWith(denied)) throw Object.assign(new Error('denied'), { code: 'EACCES' });
+      return fs.openSync(file, 'r');
+    },
+  });
+  const holder = make();
+  await holder.append([entry('a.jsonl.zst')]);
+  await holder.append([entry('b.jsonl.zst')]);
+  denied = names().find((name) => name.startsWith('segment-'))!;
+  await holder.append([entry('c.jsonl.zst')]);
+  assert.equal(names().filter((name) => name.startsWith('segment-')).length, 3, 'the compaction retired an input');
+  assert.equal(
+    names().filter((name) => /^(shard|manifest)-/.test(name)).length,
+    0,
+    'the failed compaction left output',
+  );
+  assert.equal(holder.held, true, 'a read failure ended the lease');
+  assert.equal(threadCount(directory), 3);
+  denied = null;
+  clock.advance(300_001);
+  await holder.append([entry('d.jsonl.zst')]);
+  assert.ok(
+    names().some((name) => name.startsWith('manifest-')),
+    'the next compaction did not run',
+  );
+  assert.equal(threadCount(directory), 4);
+  holder.dispose();
 });
 
 test('the idle holder releases its lock and the next append takes it again with a higher epoch', async () => {
