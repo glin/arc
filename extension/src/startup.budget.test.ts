@@ -77,8 +77,9 @@ beforeAll(async () => {
     target: 'node18',
     write: false,
   }).outputFiles[0].text;
-  // A frozen worker clock keeps every pass inside its deadlines, so one pass reads the same files on every run.
-  workerSource = `performance.now=()=>0;process.env.ARC_HOME=${JSON.stringify(workspace.home)};${bundle}`;
+  // A frozen worker clock keeps every pass inside its deadlines, so one pass reads the same files on every run. It holds the
+  // start of the script, so the open spend band of a recently changed file applies as it does in a real host.
+  workerSource = `performance.now=()=>0;Date.now=()=>${BUDGET_CLOCK};process.env.ARC_HOME=${JSON.stringify(workspace.home)};${bundle}`;
 });
 
 function counts(counters: { snapshot(): any }): Counts {

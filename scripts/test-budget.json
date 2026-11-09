@@ -58,7 +58,7 @@
     },
     "cold start | readBytes": {
       "reason": "Cold start reads 392568 bytes through discovery. The margin covers the temporary path length and the file identity numbers in dispatch receipts.",
-      "budget": 392608,
+      "budget": 392607,
       "margin": 15703
     },
     "cold start | receiptScanOpensAfterCompletion": {
@@ -123,7 +123,7 @@
     },
     "warm start | readBytes": {
       "reason": "Warm start reads 16105 bytes through discovery. The margin covers the temporary path length and the file identity numbers in dispatch receipts.",
-      "budget": 16145,
+      "budget": 16144,
       "margin": 1024
     },
     "warm start | receiptScanOpensAfterCompletion": {
@@ -253,7 +253,7 @@
     },
     "child watcher event | readBytes": {
       "reason": "Child watcher event reads 18511 bytes through discovery. The margin covers the temporary path length and the file identity numbers in dispatch receipts.",
-      "budget": 18551,
+      "budget": 18550,
       "margin": 1024
     },
     "child watcher event | receiptScanOpensAfterCompletion": {
@@ -383,7 +383,7 @@
     },
     "poll and backstop walk | readBytes": {
       "reason": "Poll and backstop walk reads 16105 bytes through discovery. The margin covers the temporary path length and the file identity numbers in dispatch receipts.",
-      "budget": 16145,
+      "budget": 16144,
       "margin": 1024
     },
     "poll and backstop walk | receiptScanOpensAfterCompletion": {
