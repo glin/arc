@@ -12511,8 +12511,14 @@ test('both agents reach one list, and each session is read and named by its own 
   const merge =
     memberFrom(panelHostSource, from) +
     memberFrom(panelHostSource, panelHostSource.indexOf('private walkedSessions(')) +
-    memberFrom(panelHostSource, panelHostSource.indexOf('private claudeOpeningReader('));
+    memberFrom(panelHostSource, panelHostSource.indexOf('private claudeOpeningReader(')) +
+    memberFrom(panelHostSource, panelHostSource.indexOf('private *claudeWalkSteps('));
   sourceMatch(merge, /enumerateSessionFilesFor\(projectsRoot\(\)/, 'the list no longer holds Claude Code sessions');
+  sourceMatch(
+    merge,
+    /enumerateSessionFilesForSteps\(projectsRoot\(\)/,
+    'the list no longer holds Claude Code sessions from a walk',
+  );
   sourceMatch(merge, /codexSessionFiles\(codexSessionsRoot\(\)/, 'the list no longer holds Codex sessions');
   sourceMatch(
     merge,
@@ -12521,8 +12527,13 @@ test('both agents reach one list, and each session is read and named by its own 
   );
   sourceMatch(
     merge,
-    /enumerateSessionFilesFor\(projectsRoot\(\), roots,[\s\S]*workspaceFolders, time\);/,
+    /enumerateSessionFilesFor\(projectsRoot\(\), roots, this\.claudeOpeningReader\(inRoots, openings, time\), workspaceFolders, time\);/,
     'Claude discovery either omits worktree roots or trusts a missing cwd outside the open folder',
+  );
+  sourceMatch(
+    merge,
+    /enumerateSessionFilesForSteps\(projectsRoot\(\), roots, this\.claudeOpeningReader\(folderMatcher\(roots\), openings, time\), workspaceFolders, time\);/,
+    'a walk either omits worktree roots or trusts a missing cwd outside the open folder',
   );
   sourceMatch(
     merge,
@@ -13698,13 +13709,28 @@ test('Claude child sessions own lifetime figures while project files stay dedupl
   );
   sourceMatch(
     panelHostSource,
-    /discoverClaudeSessionSpendSources\(claude, this\.subagentDirectories\)/,
+    /claude: claudeWalk\?\.spendSources \?\? discoverClaudeSessionSpendSources\(claude, this\.subagentDirectories\)/,
     'project spend stopped using the deduplicated parent-owned file discovery',
+  );
+  sourceMatch(
+    panelHostSource,
+    /const spendSources = yield\* claudeSessionSpendSourceSteps\(listing\.sessions, this\.subagentDirectories\); return \{ folderPrint, listing, census, spendSources, openings, \.\.\.started \};/,
+    'a walk stopped carrying the deduplicated parent-owned file discovery to its commit',
   );
   sourceMatch(
     panelHostSource,
     /\(\) =>\s*qualifiedCodexStats\.get\(file\) \?\?\s*\(watching \? this\.codexStats\.get\(file, this\.codexMetas\.savedOpening\(file\)\) : readRolloutStat\(file\)\)/,
     'a walk while the panel is hidden reused a rollout stat no watcher kept current',
+  );
+  sourceMatch(
+    panelHostSource,
+    /const watching = slicedClaude\?\.watching \?\? this\.watching;/,
+    'the commit of a walk decides rollout stat reuse without the watch state',
+  );
+  sourceMatch(
+    panelHostSource,
+    /const started = \{[^{}]*watching: this\.watching,/,
+    'a walk does not read the watch state at its start',
   );
 });
 
