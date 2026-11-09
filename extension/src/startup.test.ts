@@ -9680,7 +9680,7 @@ test('a rollout created while the cold pass runs lists with the production watch
   race.done();
 });
 
-test.fails('a complete walk started by a replacement during the cold pass keeps the rows it found after the pass settles', async () => {
+test('a complete walk started by a replacement during the cold pass keeps the rows it found after the pass settles', async () => {
   const race = coldPassRaceHarness();
   const { provider, files, writeRollout, root } = race;
   const seeded = race.seed('seeded');

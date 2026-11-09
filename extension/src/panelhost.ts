@@ -1651,6 +1651,8 @@ export class PanelProvider implements vscode.Disposable {
     listing?: SourceEnumeration;
     // Rollouts that a refresh named while the pass ran. Its walk can predate them.
     namedPaths?: Set<string>;
+    // The catalog walk count when the pass started.
+    walkGeneration: number;
   } | null = null;
   // The walk of a warm start's finished pass, held until the first list has painted.
   private finishedColdPass: {
@@ -1661,7 +1663,7 @@ export class PanelProvider implements vscode.Disposable {
     // True once the first paint or the paint limit lets a refresh take this walk.
     released?: boolean;
     namedPaths?: Set<string>;
-    // The catalog walk count when the pass ended. A later complete walk lists more than this walk.
+    // The catalog walk count when the pass started. A complete walk that finished after that replaces this walk.
     walkGeneration: number;
   } | null = null;
   private coldPassPaintWait: ReturnType<typeof setTimeout> | null = null;
@@ -10106,6 +10108,7 @@ export class PanelProvider implements vscode.Disposable {
         const cold: NonNullable<typeof this.codexColdPass> = {
           controller,
           reads: coldReads,
+          walkGeneration: this.catalogWalk?.generation ?? 0,
           ...(seeded.length
             ? { listing: { status: 'incomplete' as const, files: seeded, uncertain: [coldRoot] } }
             : {}),
@@ -11177,7 +11180,7 @@ export class PanelProvider implements vscode.Disposable {
         startedAt,
         reads: cold.reads,
         ...(cold.namedPaths ? { namedPaths: cold.namedPaths } : {}),
-        walkGeneration: this.catalogWalk?.generation ?? 0,
+        walkGeneration: cold.walkGeneration,
       };
       this.listFinishedColdPass();
       return;
