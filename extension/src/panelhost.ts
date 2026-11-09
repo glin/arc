@@ -143,7 +143,11 @@ import {
   FileRevision,
   projectsRoot,
   enumerateSessionFilesFor,
+  enumerateSessionFilesForSteps,
   enumerateClaudeChildSources,
+  enumerateClaudeChildSourceSteps,
+  walkInSlices,
+  type WalkSteps,
   type ListingPart,
   type ListingTimer,
   readSession,
@@ -573,6 +577,7 @@ import {
   type SessionRailFacts,
   SubagentDirectoryCache,
   discoverClaudeSessionSpendSources,
+  claudeSessionSpendSourceSteps,
   spendFileIsClaudeChild,
   spendRecordAgent,
   discoverCodexSpendSources,
@@ -769,6 +774,25 @@ import { panelShell } from './paneldevelopment';
 interface CatalogEnumerationParts {
   ms: Record<ListingPart | 'prompts', number>;
   time: ListingTimer;
+}
+
+// What the opening reads of a Claude listing found, apart from the working directories.
+interface ClaudeOpenings {
+  observations: Pick<SessionCollisionObservation, 'source' | 'excluded'>[];
+  unavailable: boolean;
+}
+
+// The Claude half of a catalog walk, read in slices ahead of the commit. It holds no host state.
+interface ClaudeWalk {
+  folderPrint: string;
+  listing: SourceEnumeration & { sessions: SessionFile[] };
+  census: SourceEnumeration & { sessions: SessionFile[] };
+  spendSources: ReturnType<typeof discoverClaudeSessionSpendSources>;
+  openings: ClaudeOpenings;
+  // The walk lists the saved openings of a cold pass. The pass can end during the slices, so the walk reads this at its start.
+  seeded: boolean;
+  // Whether watcher events reached the walk when it started. A stat held from a later turn can miss an earlier event.
+  watching: boolean;
 }
 
 interface GitExtensionExports {
@@ -10802,14 +10826,14 @@ export class PanelProvider implements vscode.Disposable {
               `requested:${refreshReason}`,
               enumerationParts,
             );
-      // A held catalog or a supplied enumeration listed above without an await.
+      // A held catalog listed above without an await. Every other listing runs the walk in slices.
       if (!selectedOnly && deferredWalk.needed) {
-        const walked = await this.walkCatalog(controller.signal, generation, enumerationParts);
+        const walked = await this.walkCatalog(controller.signal, generation, enumerationParts, primedEnumeration);
         if (!walked) return;
         all = walked;
         // A walk restarts the poll's backstop clock, so a refresh that the held catalog could not serve sends the discovery
-        // request that a walk sends.
-        if (reuseCatalog) {
+        // request that a walk sends. A supplied enumeration keeps the request of the refresh that supplied it.
+        if (reuseCatalog && !primedEnumeration) {
           reuseCatalog = false;
           walkReasons = [refreshReason];
         }
@@ -13647,30 +13671,32 @@ export class PanelProvider implements vscode.Disposable {
     }
   }
 
-  // List the catalog from an asynchronous walk of the Codex rollout tree, after held and targeted reuse missed.
-  // Selection and other messages run during the walk. The answer is null when the refresh became obsolete
-  // during the walk: canceled, superseded, hidden, or moved to another rollout root. It is also null when the walk
-  // reached `CATALOG_WALK_DEADLINE_MS`. The refresh deadline does not abandon a refresh while its walk runs.
+  // List the catalog from a walk of the Codex rollout tree and the Claude sources, after held and targeted reuse missed.
+  // A cold pass or a saved opening list supplies `supplied`, which replaces the rollout walk. Selection and other messages
+  // run during the walk, and the listing commits in one synchronous block after it. The answer is null when the refresh
+  // became obsolete during the walk: canceled, superseded, hidden, or moved to another rollout root. It is also null when
+  // the walk reached `CATALOG_WALK_DEADLINE_MS`. The refresh deadline does not abandon a refresh while its walk runs.
   private async walkCatalog(
     signal: AbortSignal,
     generation: number,
     parts?: CatalogEnumerationParts,
+    supplied?: SourceEnumeration,
   ): Promise<SessionFile[] | null> {
     const root = codexSessionsRoot();
     // The walk serves every waiting request that walks and names no file, so none of them walks again after it.
     const running = { signal, overdue: false };
     if (this.pendingRefresh) this.pendingRefresh = mergeRefreshRequests(null, this.pendingRefresh, running);
     // The backstop clock starts when the walk starts, also after an earlier walk that never completed.
-    this.catalogWalkPendingAt = Date.now();
+    // A supplied enumeration keeps the clock of the pass that walked the tree.
+    if (!supplied) this.catalogWalkPendingAt = Date.now();
     this.catalogWalkRunning = running;
     const walk = new AbortController();
     let deadline: ReturnType<typeof setTimeout> | undefined;
     let stop = () => {};
-    let enumeration: SourceEnumeration | null | 'deadline';
-    const listingStarted = performance.now();
+    let collected: Awaited<ReturnType<typeof this.collectCatalogWalk>> | 'deadline';
     try {
-      enumeration = await Promise.race([
-        enumerateRolloutFilesAsync(root, walk.signal),
+      collected = await Promise.race([
+        this.collectCatalogWalk(root, walk.signal, supplied, parts),
         new Promise<null | 'deadline'>((resolve) => {
           stop = () => resolve(null);
           if (signal.aborted) stop();
@@ -13679,7 +13705,6 @@ export class PanelProvider implements vscode.Disposable {
         }),
       ]);
     } finally {
-      if (parts) parts.ms.listing += performance.now() - listingStarted;
       walk.abort();
       clearTimeout(deadline);
       signal.removeEventListener('abort', stop);
@@ -13688,8 +13713,8 @@ export class PanelProvider implements vscode.Disposable {
       const holder = this.refreshController;
       if (holder?.signal === signal && (running.overdue || this.refreshOverdue)) this.claimCatalogRefresh(holder);
     }
-    if (enumeration === 'deadline') this.performanceCounters?.recordRefreshStage('walkDeadline');
-    const walked = enumeration === 'deadline' ? null : enumeration;
+    if (collected === 'deadline') this.performanceCounters?.recordRefreshStage('walkDeadline');
+    const walked = collected === 'deadline' ? null : collected;
     const listed =
       !!walked &&
       !signal.aborted &&
@@ -13700,7 +13725,129 @@ export class PanelProvider implements vscode.Disposable {
     this.pendingRefresh = settleWalkFold(this.pendingRefresh, running, listed);
     if (!listed) return null;
     // Scope resolves again after the walk. A scope that became unresolved lists nothing and discards the walk.
-    return this.allSessions(false, true, walked, undefined, undefined, parts);
+    return this.allSessions(false, true, walked.enumeration, undefined, undefined, parts, walked.claudeWalk);
+  }
+
+  // Reads what the commit of a walk lists, and yields to the event loop between filesystem calls.
+  private async collectCatalogWalk(
+    root: string,
+    signal: AbortSignal,
+    supplied: SourceEnumeration | undefined,
+    parts: CatalogEnumerationParts | undefined,
+  ): Promise<{ enumeration: SourceEnumeration; claudeWalk?: ClaudeWalk } | null> {
+    const started = {
+      seeded: supplied !== undefined && supplied === this.codexColdPass?.listing,
+      watching: this.watching,
+    };
+    const listingStarted = performance.now();
+    const enumeration = supplied ?? (await enumerateRolloutFilesAsync(root, signal));
+    if (parts && !supplied) parts.ms.listing += performance.now() - listingStarted;
+    if (!enumeration || signal.aborted) return null;
+    const workspaceFolders = this.folders();
+    const scope = this.repositoryScope.snapshot(workspaceFolders);
+    if (!scope.ready) return { enumeration };
+    const time: ListingTimer = parts?.time ?? ((_part, run) => run());
+    const folderPrint = `${workspaceFolders.join('\n')}\0${scope.revision}`;
+    const claudeWalk = await walkInSlices(
+      this.claudeWalkSteps(scope.roots, workspaceFolders, folderPrint, started, time),
+      signal,
+      parts ? { paused: (ms) => (parts.ms.listing += ms) } : {},
+    );
+    return claudeWalk && { enumeration, claudeWalk };
+  }
+
+  // The Claude reads of a walk as steps. It writes no host state that the commit owns, so an abandoned walk leaves nothing.
+  private *claudeWalkSteps(
+    roots: string[],
+    workspaceFolders: string[],
+    folderPrint: string,
+    started: Pick<ClaudeWalk, 'seeded' | 'watching'>,
+    time: ListingTimer,
+  ): WalkSteps<ClaudeWalk> {
+    const openings: ClaudeOpenings = { observations: [], unavailable: false };
+    const listing = yield* enumerateSessionFilesForSteps(
+      projectsRoot(),
+      roots,
+      this.claudeOpeningReader(folderMatcher(roots), openings, time),
+      workspaceFolders,
+      time,
+    );
+    const census = yield* enumerateClaudeChildSourceSteps(
+      [...listing.sessions, ...this.claudeChildren],
+      time,
+      () => this.performanceCounters?.recordWork('openingsRead:children'),
+      this.walkedChildSources,
+    );
+    const spendSources = yield* claudeSessionSpendSourceSteps(listing.sessions, this.subagentDirectories);
+    return { folderPrint, listing, census, spendSources, openings, ...started };
+  }
+
+  // Answers whether the held same-ID evidence names a source, so that a listing reads that source's qualified opening.
+  private collidingSources(): (agent: 'claude' | 'codex', file: string) => boolean {
+    const collisionFiles = new Set(
+      this.enumeratedCollisions?.sources.map((source) => source.agent + '\0' + normalizeFsPath(source.file)),
+    );
+    // Without a collision, no file needs its path normalized to find that out.
+    return (agent, file) => collisionFiles.size > 0 && collisionFiles.has(agent + '\0' + normalizeFsPath(file));
+  }
+
+  // Reads the working directory of one Claude parent for a listing, from the held row or from its transcript.
+  private claudeOpeningReader(
+    inRoots: (cwd: string) => boolean,
+    openings: ClaudeOpenings,
+    time: ListingTimer,
+  ): (file: string, session: SessionFile) => string | null {
+    const collides = this.collidingSources();
+    const countCollisionRead = () => this.performanceCounters?.recordWork('openingsRead:collisions');
+    const countParentRead = () => this.performanceCounters?.recordWork('openingsRead:parents');
+    return (file, session) => {
+      if (collides('claude', file)) {
+        const qualified = time('openings:collisions', () => {
+          const opening = readQualifiedSessionCwd(file, countCollisionRead);
+          if (
+            opening &&
+            sameSessionRevision(session, opening.revision) &&
+            sessionCoverageMember(session) === sessionCoverageMember({ ...session, ...opening.revision })
+          ) {
+            this.cwds.set(file, {
+              cwd: opening.value,
+              mtimeMs: opening.revision.mtimeMs,
+              size: opening.revision.size,
+              unavailable: false,
+            });
+            openings.observations.push({
+              source: { ...session, cwd: opening.value },
+              excluded: !inRoots(opening.value),
+            });
+            return opening.value;
+          }
+          openings.unavailable = true;
+          return null;
+        });
+        if (qualified !== null) return qualified;
+      }
+      return time('openings:parents', () => {
+        const hit = this.cwds.get(file);
+        if (hit?.cwd) {
+          return hit.cwd;
+        }
+        if (hit && sameSessionRevision(hit, session)) {
+          openings.unavailable ||= hit.unavailable === true;
+          return hit.cwd;
+        }
+        let unavailable = false;
+        const cwd = scanSessionCwd(
+          file,
+          () => {
+            unavailable = true;
+            openings.unavailable = true;
+          },
+          countParentRead,
+        );
+        this.cwds.set(file, { cwd, mtimeMs: session.mtimeMs, size: session.size, unavailable });
+        return cwd;
+      });
+    };
   }
 
   // Add the compressed rollouts that a walk listed or a wake batch named. A complete walk also removes every name it no
@@ -13726,8 +13873,7 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   // Enumerate Claude and Codex sessions in repository scope. Accepted metadata supplies the catalog's recorded-activity order.
-  // With `deferWalk`, a missed reuse that has no supplied Codex enumeration sets `deferWalk.needed` and lists
-  // nothing, so the caller can walk the rollout tree asynchronously.
+  // With `deferWalk`, a missed reuse sets `deferWalk.needed` and lists nothing, so the caller can run the walk in slices.
   // `walkCause` names a walk that runs because the caller did not ask for reuse. A caller that may walk must name it.
   // `parts` times the filesystem calls of a walk and the file stats that check the held catalog again.
   private allSessions(
@@ -13737,6 +13883,7 @@ export class PanelProvider implements vscode.Disposable {
     deferWalk?: { needed: boolean },
     walkCause = 'unnamed',
     parts?: CatalogEnumerationParts,
+    claudeWalk?: ClaudeWalk,
   ): SessionFile[] {
     const workspaceFolders = this.folders();
     const scope = this.repositoryScope.snapshot(workspaceFolders);
@@ -13864,11 +14011,20 @@ export class PanelProvider implements vscode.Disposable {
     }
     // The poll compares directory times with the start of the walk that listed them.
     this.catalogWalkPendingAt ??= Date.now();
-    if (deferWalk && !codexEnumeration) {
+    if (deferWalk) {
       deferWalk.needed = true;
       return [];
     }
-    return this.walkedSessions(scope.roots, workspaceFolders, folderPrint, deferHumanPrompts, codexEnumeration, parts);
+    return this.walkedSessions(
+      scope.roots,
+      workspaceFolders,
+      folderPrint,
+      deferHumanPrompts,
+      codexEnumeration,
+      parts,
+      undefined,
+      claudeWalk,
+    );
   }
 
   // Lists the Codex rollouts of a finished cold pass beside the Claude rows the catalog holds, and reads no Claude source.
@@ -13895,83 +14051,41 @@ export class PanelProvider implements vscode.Disposable {
     parts?: CatalogEnumerationParts,
     // The last walk's Claude listing. With it, this call reads no Claude source and keeps the held Claude rows and their admission.
     heldClaude?: SourceEnumeration & { sessions: SessionFile[] },
+    // The Claude half of this walk, read in slices. A walk that scope moved under reads the Claude sources here instead.
+    slicedClaude?: ClaudeWalk,
   ): SessionFile[] {
     const time: ListingTimer = parts?.time ?? ((_part, run) => run());
     const codexRevision = this.codexMetas.revision;
-    const collisionFiles = new Set(
-      this.enumeratedCollisions?.sources.map((source) => source.agent + '\0' + normalizeFsPath(source.file)),
-    );
     const inRoots = folderMatcher(roots);
-    // Without a collision, no file needs its path normalized to find that out.
-    const collides = (agent: 'claude' | 'codex', file: string) =>
-      collisionFiles.size > 0 && collisionFiles.has(agent + '\0' + normalizeFsPath(file));
+    const collides = this.collidingSources();
     const countCollisionRead = () => this.performanceCounters?.recordWork('openingsRead:collisions');
-    const countParentRead = () => this.performanceCounters?.recordWork('openingsRead:parents');
+    const claudeWalk = slicedClaude?.folderPrint === folderPrint ? slicedClaude : undefined;
+    const watching = slicedClaude?.watching ?? this.watching;
     const physicalContext = {
       domain: 'physical' as const,
       scope: JSON.stringify(roots),
       revision: String(this.coverageRevision),
     };
-    const sourceObservations: SessionCollisionObservation[] = [];
     const qualifiedCodexStats = new Map<string, ReturnType<typeof readRolloutStat>>();
-    let claudeOpeningUnavailable = heldClaude ? this.claudeWalkOpeningUnavailable : false;
+    const openings: ClaudeOpenings = claudeWalk?.openings ?? {
+      observations: [],
+      unavailable: heldClaude ? this.claudeWalkOpeningUnavailable : false,
+    };
     const claudeListing =
       heldClaude ??
+      claudeWalk?.listing ??
       enumerateSessionFilesFor(
         projectsRoot(),
         roots,
-        (file, session) => {
-          if (collides('claude', file)) {
-            const qualified = time('openings:collisions', () => {
-              const opening = readQualifiedSessionCwd(file, countCollisionRead);
-              if (
-                opening &&
-                sameSessionRevision(session, opening.revision) &&
-                sessionCoverageMember(session) === sessionCoverageMember({ ...session, ...opening.revision })
-              ) {
-                this.cwds.set(file, {
-                  cwd: opening.value,
-                  mtimeMs: opening.revision.mtimeMs,
-                  size: opening.revision.size,
-                  unavailable: false,
-                });
-                sourceObservations.push({
-                  ...physicalContext,
-                  source: { ...session, cwd: opening.value },
-                  excluded: !inRoots(opening.value),
-                });
-                return opening.value;
-              }
-              claudeOpeningUnavailable = true;
-              return null;
-            });
-            if (qualified !== null) return qualified;
-          }
-          return time('openings:parents', () => {
-            const hit = this.cwds.get(file);
-            if (hit?.cwd) {
-              return hit.cwd;
-            }
-            if (hit && sameSessionRevision(hit, session)) {
-              claudeOpeningUnavailable ||= hit.unavailable === true;
-              return hit.cwd;
-            }
-            let unavailable = false;
-            const cwd = scanSessionCwd(
-              file,
-              () => {
-                unavailable = true;
-                claudeOpeningUnavailable = true;
-              },
-              countParentRead,
-            );
-            this.cwds.set(file, { cwd, mtimeMs: session.mtimeMs, size: session.size, unavailable });
-            return cwd;
-          });
-        },
+        this.claudeOpeningReader(inRoots, openings, time),
         workspaceFolders,
         time,
       );
+    const sourceObservations: SessionCollisionObservation[] = openings.observations.map((observation) => ({
+      ...physicalContext,
+      ...observation,
+    }));
+    const claudeOpeningUnavailable = openings.unavailable;
     this.claudeWalkOpeningUnavailable = claudeOpeningUnavailable;
     const claude = claudeListing.sessions;
     const countCodexOpeningRead = () => this.performanceCounters?.recordWork('openingsRead:codex');
@@ -14014,18 +14128,20 @@ export class PanelProvider implements vscode.Disposable {
           'stats',
           () =>
             qualifiedCodexStats.get(file) ??
-            (this.watching ? this.codexStats.get(file, this.codexMetas.savedOpening(file)) : readRolloutStat(file)),
+            (watching ? this.codexStats.get(file, this.codexMetas.savedOpening(file)) : readRolloutStat(file)),
         ),
       undefined,
       codexEnumeration,
     );
     if (!heldClaude) {
-      const census = enumerateClaudeChildSources(
-        [...claude, ...this.claudeChildren],
-        time,
-        () => this.performanceCounters?.recordWork('openingsRead:children'),
-        this.walkedChildSources,
-      );
+      const census =
+        claudeWalk?.census ??
+        enumerateClaudeChildSources(
+          [...claude, ...this.claudeChildren],
+          time,
+          () => this.performanceCounters?.recordWork('openingsRead:children'),
+          this.walkedChildSources,
+        );
       this.walkedChildSources = census.sessions;
       claudeListing.files = [...claudeListing.files, ...census.files];
       claudeListing.directories = [...(claudeListing.directories ?? []), ...(census.directories ?? [])];
@@ -14041,7 +14157,8 @@ export class PanelProvider implements vscode.Disposable {
     }
     const childSources = (this.walkedChildSources ?? []).filter((source) => !source.cwd || inRoots(source.cwd));
     this.sourceEnumerations = { claude: claudeListing, codex: listing.enumeration };
-    this.codexListingSeeded = codexEnumeration !== undefined && codexEnumeration === this.codexColdPass?.listing;
+    this.codexListingSeeded =
+      slicedClaude?.seeded ?? (codexEnumeration !== undefined && codexEnumeration === this.codexColdPass?.listing);
     this.noteCompressedRollouts(listing.enumeration.compressed ?? [], listing.enumeration);
     // Only a cached file that the walk missed needs this, so a refresh with none builds no path sets.
     let physical: SessionCoverage | undefined;
@@ -14078,7 +14195,7 @@ export class PanelProvider implements vscode.Disposable {
       heldClaude && this.enumeratedSpendSources
         ? { ...this.enumeratedSpendSources, codex: listing.sources, children: listing.subagents }
         : {
-            claude: discoverClaudeSessionSpendSources(claude, this.subagentDirectories),
+            claude: claudeWalk?.spendSources ?? discoverClaudeSessionSpendSources(claude, this.subagentDirectories),
             codex: listing.sources,
             children: listing.subagents,
           };

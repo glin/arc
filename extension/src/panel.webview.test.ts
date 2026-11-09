@@ -13696,12 +13696,12 @@ test('Claude child sessions own lifetime figures while project files stay dedupl
   );
   sourceMatch(
     panelHostSource,
-    /claude: discoverClaudeSessionSpendSources\(claude, this\.subagentDirectories\)/,
+    /discoverClaudeSessionSpendSources\(claude, this\.subagentDirectories\)/,
     'project spend stopped using the deduplicated parent-owned file discovery',
   );
   sourceMatch(
     panelHostSource,
-    /\(\) =>\s*qualifiedCodexStats\.get\(file\) \?\?\s*\(this\.watching \? this\.codexStats\.get\(file, this\.codexMetas\.savedOpening\(file\)\) : readRolloutStat\(file\)\)/,
+    /\(\) =>\s*qualifiedCodexStats\.get\(file\) \?\?\s*\(watching \? this\.codexStats\.get\(file, this\.codexMetas\.savedOpening\(file\)\) : readRolloutStat\(file\)\)/,
     'a walk while the panel is hidden reused a rollout stat no watcher kept current',
   );
 });
@@ -21591,8 +21591,14 @@ function methodBody(marker: string): string {
   assert.ok(body !== undefined, `${marker} has no body this guard can read`);
   const extracted = body.slice(1, -1);
   if (marker === 'private allSessions(') {
-    return `const codexEnumeration = arguments[2]; const deferWalk = arguments[3]; const parts = arguments[5];
-      this.walkedSessions = function(roots, workspaceFolders, folderPrint, deferHumanPrompts, codexEnumeration, parts, heldClaude) {
+    return `const codexEnumeration = arguments[2]; const deferWalk = arguments[3]; const parts = arguments[5]; const claudeWalk = arguments[6];
+      this.collidingSources = function() {
+        ${methodBody('private collidingSources(')}
+      };
+      this.claudeOpeningReader = function(inRoots, openings, time) {
+        ${methodBody('private claudeOpeningReader(')}
+      };
+      this.walkedSessions = function(roots, workspaceFolders, folderPrint, deferHumanPrompts, codexEnumeration, parts, heldClaude, slicedClaude) {
         ${methodBody('private walkedSessions(')}
       };
       ${extracted}`;

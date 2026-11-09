@@ -50,6 +50,13 @@ import {
   ClaudeChildSessionCache,
   enumerateClaudeChildSources,
   revisionOf as fileRevisionOf,
+  enumerateClaudeChildSourceSteps,
+  enumerateSessionFilesForSteps,
+  scanSessionCwd,
+  walkInSlices,
+  WALK_SLICE_MS,
+  type WalkPacing,
+  type WalkSteps,
   revalidatedCatalogPaths,
   revalidatedCatalog,
   watchDirs,
@@ -171,6 +178,7 @@ import {
   invalidateClaudeCostSupplements,
   claudeCostStateDependencies,
   discoverClaudeSessionSpendSources,
+  claudeSessionSpendSourceSteps,
   loadSpendLedger,
   saveSpendLedger,
   type SpendFileIndex,
@@ -2806,6 +2814,25 @@ afterEach(() => {
 // fault in the test that caused it. Other tests build fresh harnesses and are unaffected. A test that waits for work the
 // fault stopped fails at once when it awaits through raceHarnessFault. Discovery reads the instance methods of the class by identifier or string name.
 // Getters and properties that hold a function are not covered. A computed method name fails the discovery.
+// The walk reads the Claude sources through their step forms. A fake of a synchronous reader also answers its step form.
+function walkStepScope(scope: Record<string, unknown>): Record<string, unknown> {
+  const steps = (reader: string, real: (...args: never[]) => unknown) => {
+    const fake = scope[reader] as ((...args: unknown[]) => unknown) | undefined;
+    return fake
+      ? function* (...args: unknown[]) {
+          yield* [];
+          return fake(...args);
+        }
+      : real;
+  };
+  return {
+    walkInSlices,
+    enumerateSessionFilesForSteps: steps('enumerateSessionFilesFor', enumerateSessionFilesForSteps),
+    enumerateClaudeChildSourceSteps: steps('enumerateClaudeChildSources', enumerateClaudeChildSourceSteps),
+    claudeSessionSpendSourceSteps: steps('discoverClaudeSessionSpendSources', claudeSessionSpendSourceSteps),
+  };
+}
+
 const OPTIONAL_PANEL_PROVIDER_STUBS = `
       publishCachedLinks() { return null; }
       updateProjectSpendIntegrity() {}
@@ -3152,6 +3179,7 @@ function completeDiscoveryHarness(
     noteHarnessScopeMiss,
     ...scope,
   };
+  scope = { ...walkStepScope(scope), ...scope };
   const names = [
     'show',
     'publishWindowState',
@@ -3260,7 +3288,7 @@ function completeDiscoveryHarness(
   if (names.includes('allSessions') || names.includes('runPendingWatch')) names.push('currentWalkedCatalog');
   if (names.includes('runPendingWatch')) names.push('grownMemberMiss');
   if (names.includes('prepareClaudeChildren')) names.push('startedSources', 'applyDispatchFacts');
-  names.push('walkCatalog');
+  names.push('walkCatalog', 'collectCatalogWalk', 'claudeWalkSteps', 'collidingSources', 'claudeOpeningReader');
   const body = owner.members
     .filter((member) => member.name && names.includes(member.name.getText(file)))
     .map((member) => member.getText(file))
@@ -9930,6 +9958,206 @@ test('a poll during a walk requests no walk', async () => {
   } finally {
     vi.useRealTimers();
   }
+});
+
+// A held-walk harness whose Claude half runs the real step readers over real project folders. Every step is due, so the
+// walk stops at each step and `pauseOnce` runs at the next stop.
+function slicedWalkHarness(scope: Record<string, unknown> = {}, extraMethods: string[] = []) {
+  let clock = 0;
+  let pausedMs = 0;
+  let onPause: (() => void | Promise<void>) | null = null;
+  const projects = tempDir('sliced-walk-projects-');
+  const held = heldWalkHarness(
+    {
+      projectsRoot: () => projects,
+      enumerateSessionFilesForSteps,
+      enumerateClaudeChildSourceSteps,
+      claudeSessionSpendSourceSteps,
+      scanSessionCwd,
+      performance: { now: () => clock },
+      walkInSlices: <T>(steps: WalkSteps<T>, signal: AbortSignal, pacing: WalkPacing) =>
+        walkInSlices(steps, signal, {
+          ...pacing,
+          paused: (ms) => {
+            pausedMs += ms;
+            pacing.paused?.(ms);
+          },
+          now: () => (clock += WALK_SLICE_MS),
+          pause: async () => {
+            const run = onPause;
+            onPause = null;
+            await run?.();
+          },
+        }),
+      ...scope,
+    },
+    extraMethods,
+  );
+  const { provider } = held;
+  const workspace = path.join(held.root, 'project');
+  provider.subagentDirectories = { files: () => [], sweep() {} };
+  provider.prepareHumanPrompts = async (sessions: SessionFile[]) => sessions;
+  const directoryOf = (suffix = '') => {
+    const directory = path.join(projects, `${projectSlug(workspace)}${suffix}`);
+    fs.mkdirSync(directory, { recursive: true });
+    return directory;
+  };
+  const writeParent = (id: string, suffix = '') => {
+    const file = path.join(directoryOf(suffix), `${id}.jsonl`);
+    fs.writeFileSync(file, `${JSON.stringify({ type: 'user', cwd: workspace })}\n`);
+    return file;
+  };
+  return {
+    ...held,
+    directoryOf,
+    writeParent,
+    pauseOnce: (run: () => void | Promise<void>) => (onPause = run),
+    pausedMs: () => pausedMs,
+  };
+}
+
+test('a watcher batch during a sliced walk folds into the walk, and a file in an unread folder lists at the commit', async () => {
+  const { provider, walks, files, writeParent, pauseOnce } = slicedWalkHarness();
+  const first = writeParent('first');
+  let added = '';
+  let folded: unknown;
+  pauseOnce(() => {
+    added = writeParent('added');
+    provider.refreshFrom('watcher');
+    folded = provider.pendingRefresh?.walkFolded;
+  });
+  const refresh = provider.refresh(true);
+  await vi.waitFor(() => assert.equal(walks.length, 1));
+  assert.ok(provider.catalogWalkRunning, 'the walk did not mark itself running for the fold');
+  walks[0].release();
+  await refresh;
+  await vi.waitFor(() => assert.equal(provider.refreshController, null));
+  assert.ok(folded, 'the batch did not fold into the running walk');
+  assert.deepEqual(files(), [added, first].sort(), 'the commit did not list the file the batch named');
+  assert.equal(walks.length, 1, 'the folded batch started another walk');
+});
+
+test('a file created after its folder was read waits for the next walk', async () => {
+  let late = '';
+  let writeLate = () => {};
+  const { provider, walks, files, writeParent, releaseAll } = slicedWalkHarness({
+    scanSessionCwd: (file: string, onUnreadable?: () => void, onRead?: () => void) => {
+      writeLate();
+      writeLate = () => {};
+      return scanSessionCwd(file, onUnreadable, onRead);
+    },
+  });
+  const first = writeParent('first');
+  writeLate = () => {
+    late = writeParent('late');
+  };
+  await releaseAll(provider.refresh(true));
+  assert.deepEqual(files(), [first], 'a walk listed a file created after its folder was read');
+  await releaseAll(provider.refresh(true));
+  assert.deepEqual(files(), [first, late].sort(), 'the next walk did not list the later file');
+  assert.equal(walks.length, 2);
+});
+
+test('a file moved between two project folders during a sliced walk lists once and starts no quarantine', async () => {
+  let move: ((file: string) => void) | null = null;
+  const { provider, files, writeParent, directoryOf, releaseAll } = slicedWalkHarness({
+    scanSessionCwd: (file: string, onUnreadable?: () => void, onRead?: () => void) => {
+      const opening = scanSessionCwd(file, onUnreadable, onRead);
+      const moving = move;
+      move = null;
+      moving?.(file);
+      return opening;
+    },
+  });
+  const moved = writeParent('moved', '-one');
+  const other = writeParent('other', '-two');
+  // The walk reads the folders in the order of the root listing. The moved session sits in the folder read first.
+  const [firstRead] = fs.readdirSync(path.dirname(path.dirname(moved)));
+  const movedFrom = firstRead === path.basename(path.dirname(moved)) ? moved : other;
+  const movedTo = path.join(directoryOf(movedFrom === moved ? '-two' : '-one'), path.basename(movedFrom));
+  const stays = movedFrom === moved ? other : moved;
+  move = () => fs.renameSync(movedFrom, movedTo);
+  await releaseAll(provider.refresh(true));
+  assert.deepEqual(files(), [movedTo, stays].sort(), 'the moved session did not list once under its new path');
+  assert.equal(provider.enumeratedAmbiguousIds.size, 0, 'the move started a same-ID quarantine');
+  assert.equal(provider.sourceEnumerations.claude.files.includes(movedFrom), false, 'the old path stayed listed');
+});
+
+test('a selection during a sliced walk reads the published catalog and does not throw', async () => {
+  const { provider, walks, files, writeParent, pauseOnce, releaseAll } = slicedWalkHarness();
+  const first = writeParent('first');
+  await releaseAll(provider.refresh(true));
+  const published = provider.authoritativeCatalog;
+  provider.showing = 'first';
+  writeParent('added');
+  let selection: Promise<void> | null = null;
+  let held: unknown;
+  pauseOnce(async () => {
+    selection = provider.refresh(true, false, false, true);
+    await selection;
+    held = provider.authoritativeCatalog;
+  });
+  const refresh = provider.refresh(true);
+  await vi.waitFor(() => assert.equal(walks.length, 2));
+  walks[1].release();
+  await refresh;
+  assert.ok(selection, 'the walk did not stop for the selection');
+  assert.equal(held, published, 'a selection during the walk did not read the published catalog');
+  assert.deepEqual(files(), [path.join(path.dirname(first), 'added.jsonl'), first].sort());
+});
+
+test('a walk over a supplied enumeration runs in slices, folds broad requests and keeps the clock of the pass', async () => {
+  const { provider, root, walks, files, writeParent, pauseOnce } = slicedWalkHarness({}, ['noteColdPassNamedPaths']);
+  const first = writeParent('first');
+  provider.catalogWalkPendingAt = 123;
+  provider.finishedColdPass = {
+    released: true,
+    root,
+    walkGeneration: 0,
+    startedAt: 123,
+    enumeration: { status: 'complete', root, files: [], directories: [], uncertain: [] },
+  };
+  let running: unknown;
+  let folded: unknown;
+  let pendingAt: unknown;
+  pauseOnce(() => {
+    running = provider.catalogWalkRunning;
+    pendingAt = provider.catalogWalkPendingAt;
+    provider.refreshFrom('poll:directory');
+    folded = provider.pendingRefresh?.walkFolded;
+  });
+  await provider.refresh(true);
+  await vi.waitFor(() => assert.equal(provider.refreshController, null));
+  assert.ok(running, 'the walk over a supplied enumeration did not mark itself running');
+  assert.equal(folded, running, 'a broad request did not fold into the walk over a supplied enumeration');
+  assert.equal(pendingAt, 123, 'the walk restarted the clock of the pass that walked the tree');
+  assert.deepEqual(files(), [first]);
+  assert.equal(walks.length, 0, 'the walk read the rollout tree again');
+});
+
+test('the yields of a sliced walk count under the listing part, and the parts sum to the enumeration', async () => {
+  const { provider, walks, writeParent, pausedMs } = slicedWalkHarness();
+  writeParent('first');
+  writeParent('second');
+  const refreshes = new Map<string, number>();
+  provider.performanceCounters = {
+    ...provider.performanceCounters,
+    recordRefresh: (name: string, ms: number) => refreshes.set(name, ms),
+  };
+  const refresh = provider.refresh(true);
+  await vi.waitFor(() => assert.equal(walks.length, 1));
+  walks[0].release();
+  await refresh;
+  assert.ok(pausedMs() > 0, 'the walk never stopped');
+  assert.equal(refreshes.get('catalog-enumeration:listing'), pausedMs(), 'the yields went to another part');
+  assert.equal(
+    ['listing', 'stats', 'openings', 'prompts', 'build'].reduce(
+      (sum, part) => sum + refreshes.get(`catalog-enumeration:${part}`)!,
+      0,
+    ),
+    refreshes.get('catalog-enumeration'),
+    'the parts do not sum to the enumeration time',
+  );
 });
 
 test('a walk past its own deadline is abandoned and counted, and the request behind it runs', async () => {
