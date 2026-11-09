@@ -192,7 +192,7 @@
   "extension/src/startup.budget.test.ts": {
     "reason": "A session list script must stay within its recorded read, walk and post counts through a real panel host and a real discovery worker across a cold start, a warm start, watcher events and polls.",
     "cases": 1,
-    "matricesSha256": "b85fa3b4d526ebf4b7ab054055b4f89e1838628af0a8bdb24e0a96a1d362aa50"
+    "matricesSha256": "706449851fa2e6214d7e2994389899a8ef8d204763622326688bcb472ed088dc"
   },
   "extension/src/startup.browser.test.ts": {
     "reason": "Startup and restored panel rendering must preserve usable browser state and focus.",
