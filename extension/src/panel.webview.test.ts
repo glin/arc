@@ -33275,9 +33275,7 @@ test('a refresh keeps parsed rail cache facts at their parse revision until the 
     /revision: \{ \.\.\.revision \},/,
     'an accepted parse stores the listing revision instead of the revision the worker read',
   );
-  const collect = panelHostSource.slice(
-    panelHostSource.indexOf('private collect(sessions: SessionFile[]): RenderCard[] {'),
-  );
+  const collect = panelHostSource.slice(panelHostSource.indexOf('private collect('));
   sourceMatch(
     collect,
     /parsedCacheRevisions\.set\(session\.sessionId, window\.revision\);/,
