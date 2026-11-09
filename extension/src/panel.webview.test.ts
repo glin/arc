@@ -19718,7 +19718,7 @@ test('nothing leaves the panel with no session shown', () => {
   // Native selection and navigation history both call show to settle the departing draft.
   sourceMatch(
     panelHostSource,
-    /private show\(session: string \| null, host\?: PanelHost\): void \{\s*const previousSelection = host \? \(this\.hostSessions\.get\(host\) \?\? this\.showing\) : this\.showing;\s*if \(previousSelection && previousSelection !== session\) \{ this\.abandonDraft\(previousSelection, false\); \}[\s\S]*this\.hostSessions\.set\(host, session\);[\s\S]*this\.previousSelection = previousSelection;\s*this\.showing = session;/,
+    /private show\(session: string \| null, host\?: PanelHost,[\s\S]*?const previousSelection = host \? \(this\.hostSessions\.get\(host\) \?\? this\.showing\) : this\.showing;\s*if \(previousSelection && previousSelection !== session\) \{ this\.abandonDraft\(previousSelection, false\); \}[\s\S]*this\.hostSessions\.set\(host, session\);[\s\S]*this\.previousSelection = previousSelection;\s*this\.showing = session;/,
     'opening a session no longer settles the draft the reader is leaving',
   );
   sourceMatch(
