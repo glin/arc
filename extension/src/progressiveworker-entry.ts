@@ -736,6 +736,8 @@ function noteCompressedNames(
     heldCompressedNames.set(stores.facts, list);
     return 'held';
   }
+  // A first load in its store read still holds an older list, and this one replaces it.
+  heldCompressedNames.delete(stores.facts);
   compressedNames.set(stores.facts, list);
   compressedBackfills.get(stores.facts)?.setNames(list);
   // The record holds the worker for up to one slice, so it starts after the reply.

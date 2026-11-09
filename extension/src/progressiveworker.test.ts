@@ -16284,6 +16284,60 @@ test.skipIf(!zstdCompress)('the list of a request that ends partial reaches the 
   }
 });
 
+// The first load waits on its store read. A list that a request records in that wait is newer than the list the load holds.
+test.skipIf(!zstdCompress)('a list recorded during the first store read replaces the held list', async () => {
+  const pair = compressedRolloutPair();
+  const stores = { facts: path.join(pair.directory, 'facts'), openings: path.join(pair.directory, 'openings') };
+  const poll = 'const polled = await follower.poll();';
+  assert.equal(source.split(poll).length - 1, 1, 'The store poll did not match');
+  const deferred = source.replace(
+    poll,
+    `while (!compressedNames.has(request.stores.facts)) await new Promise((resolve) => setImmediate(resolve));${poll}`,
+  );
+  const published: CompressedFactEntry[] = [];
+  const worker = new ProgressiveWorker(
+    deferred,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    (batch) => published.push(...batch.entries),
+  );
+  const signal = new AbortController().signal;
+  const pass = (compressed: string[]) =>
+    ({
+      kind: 'claude-children',
+      parents: [],
+      repositoryRoots: [pair.directory],
+      compressed,
+      compressedStores: stores,
+    }) as never;
+  try {
+    const held: any = await worker.run(pass(['older.jsonl.zst']), 1, signal);
+    assert.equal(held?.value.compressedNames, 'held');
+    const load = worker.run(
+      {
+        kind: 'compressed-load',
+        stores,
+        backfill: { workspace: pair.directory, roots: [pair.directory], launch: 'one' },
+      },
+      2,
+      signal,
+    );
+    const recorded: any = await worker.run(pass([pair.compressed]), 3, signal);
+    assert.equal(recorded?.value.compressedNames, 'recorded');
+    const loaded: any = await load;
+    assert.equal(loaded?.value.heldNamesRecorded, undefined, 'the first load applied the older held list');
+    await vi.waitFor(() => assert.equal(published.length, 1, 'the backfill did not publish the newer list'));
+    assert.equal(published[0].file, pair.compressed);
+  } finally {
+    worker.stop();
+    fs.rmSync(pair.directory, { recursive: true, force: true });
+  }
+});
+
 test.skipIf(!zstdCompress)('a load poll does not post the entries this worker published', async () => {
   const pair = compressedRolloutPair();
   const stores = { facts: path.join(pair.directory, 'facts'), openings: path.join(pair.directory, 'openings') };
