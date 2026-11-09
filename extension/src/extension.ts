@@ -80,7 +80,13 @@ import {
   openDraftMcp,
 } from './agenthost';
 import { McpServer } from './agentwire';
-import { CommandCatalogs, CommandCatalogUpdate, commandSources } from './commandcatalog';
+import {
+  CommandCatalogs,
+  CommandCatalogUpdate,
+  CommandDiscovery,
+  commandScope,
+  commandSources,
+} from './commandcatalog';
 import { validateResolvedPromptAssets } from './promptassets';
 import {
   claudeLaunch,
@@ -555,6 +561,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             key,
             usageSource,
             commands: event.commands,
+            commandScope: host.get(key)!.commandScope,
+            commandOutcome: event.commandOutcome ?? 'success',
             complete: true,
             optionalOnly: event.optionalOnly,
           });
@@ -597,6 +605,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           key,
           usageSource,
           commands: event.commands,
+          commandScope: host.get(key)!.commandScope,
+          commandOutcome: event.commandOutcome ?? 'success',
           complete: false,
         });
       }
@@ -1039,7 +1049,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push(vscode.workspace.onDidChangeWorkspaceFolders(() => void refreshSetups()));
   void refreshSetups();
 
-  // What each agent published for its slash menu, once one of its children has answered.
+  // Ordinary command catalogs survive child retirement within their executable configuration and working directory.
   //
   // Merged rather than rebuilt, and never emptied. A child that has stopped is dropped from
   // `host.states()`, and a menu that emptied with it would go quiet exactly when the reader
@@ -1049,14 +1059,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   let skillLists: Record<string, readonly string[]> =
     context.workspaceState.get<Record<string, readonly string[]>>(SKILLS_KEY) ?? {};
   panel.setSkills(skillLists);
-  // Track agents already asked for commands, including unavailable agents and empty answers. Avoid starting another catalog child on every panel view.
-  const commandsAsked = new Set<string>();
-  // A child under a launch policy never changes the provider's list. The Claude read-only launch adds `--setting-sources ""` and narrows its list, and Codex follows the same rule so one rule covers both providers.
   const childPolicy = (key: string) => host.get(key)?.policy;
+  const commandDiscovery = new CommandDiscovery();
+  context.subscriptions.push(commandDiscovery);
+  const commandConfigurations: Record<string, string> = {};
+  let publishedCommandConfigurations = '';
   const publishCommands = (said?: CommandCatalogUpdate, expectedRevision?: number) => {
     const next = commandLists.publish(commandSources(host.states(), childPolicy), said, expectedRevision);
-    if (next) {
-      panel.setCommands(next, commandLists.childCommands(host.states(), draftMcpKeys));
+    const configurationKey = JSON.stringify(commandConfigurations);
+    if (next || configurationKey !== publishedCommandConfigurations) {
+      publishedCommandConfigurations = configurationKey;
+      panel.setCommands(
+        next ?? { ...commandLists.current() },
+        commandLists.childCommands(host.states(), draftMcpKeys),
+        { ...commandConfigurations },
+      );
     }
   };
 
@@ -1259,9 +1276,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
   };
 
-  // What to start to ask one agent the two questions that cost no model tokens: the same
-  // launch rule every other child goes through, and a plan that opens no session.
-  const idlePlanFor = (agent: AgentName, cwd: string): AgentPlan | null => {
+  // Control-only plans use the same executable selection as live children.
+  // Codex command discovery runs separately from account and model reads.
+  const idlePlanFor = (agent: AgentName, cwd: string, discoverCommands = false): AgentPlan | null => {
     const launch =
       agent === 'claude'
         ? { ...claudeLaunch(readSetting('claudePath'), thisMachine()), sessionSkills: sessionSkillSelection }
@@ -1269,8 +1286,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     if (launch.problem) {
       return null;
     }
-    return agent === 'claude' ? claudeIdlePlan(launch, cwd) : codexIdlePlan(launch, { cwd, clientInfo: CLIENT_INFO });
+    const plan =
+      agent === 'claude'
+        ? claudeIdlePlan(launch, cwd)
+        : codexIdlePlan(launch, { cwd, clientInfo: CLIENT_INFO, discoverCommands });
+    commandConfigurations[agent] = plan.commandConfiguration;
+    return plan;
   };
+
+  for (const agent of USAGE_AGENT_ORDER) idlePlanFor(agent as AgentName, workspaceCwd() ?? '.');
 
   let defaultsRevision = 0;
   const defaultRequests = new Map<string, Promise<AppliedDefaults>>();
@@ -1361,8 +1385,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   };
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((event) => {
-      if (event.affectsConfiguration(settingName('claudePath')) || event.affectsConfiguration(settingName('codexPath')))
+      let changed = false;
+      for (const agent of USAGE_AGENT_ORDER) {
+        if (!event.affectsConfiguration(settingName(agent === 'claude' ? 'claudePath' : 'codexPath'))) continue;
+        commandDiscovery.cancelAll((scope) => JSON.parse(scope)[0] === agent);
+        delete commandConfigurations[agent];
+        idlePlanFor(agent as AgentName, workspaceCwd() ?? '.');
+        changed = true;
+      }
+      if (changed) {
+        publishCommands();
         invalidateDefaults();
+      }
     }),
   );
   context.subscriptions.push(vscode.workspace.onDidChangeWorkspaceFolders(invalidateDefaults));
@@ -1539,7 +1573,46 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     return accepted;
   };
 
-  // Refresh usage and model catalogs through a live child or an idle child. Explicit requests override freshness and silent failures.
+  // Command discovery does not wait for account admission or unrelated control replies.
+  const discoverCommands = (agent: AgentName, cwd: string, force: boolean, owner: string): Promise<void> => {
+    const plan = idlePlanFor(agent, cwd, true);
+    if (!plan) return Promise.resolve();
+    const scope = commandScope(agent, cwd, plan.commandConfiguration);
+    return commandDiscovery.request(
+      scope,
+      async (signal) => {
+        if (
+          !force &&
+          (scope in commandLists.current() ||
+            host
+              .states()
+              .some(
+                (state) =>
+                  state.commandScope === scope &&
+                  state.commandOutcome === 'success' &&
+                  childPolicy(state.key) === undefined,
+              ))
+        ) {
+          publishCommands();
+          return 'success';
+        }
+        const revision = commandLists.revision(scope);
+        const answers = await askIdle(plan, spawner, undefined, undefined, () => !signal.aborted, undefined, false, {
+          controls: false,
+          signal,
+          onCommands: (commands, commandOutcome) => {
+            if (!signal.aborted)
+              publishCommands({ agent, commandScope: scope, commands, commandOutcome, complete: true }, revision);
+          },
+        });
+        return answers.commandOutcome;
+      },
+      force,
+      owner,
+    );
+  };
+
+  // Refresh usage and models through a live or idle child. Explicit requests override freshness and silent failures.
   const askAgent = (
     agent: AgentName,
     force: boolean,
@@ -1548,6 +1621,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     attempt?: number,
     ownedOperation?: number,
   ): Promise<void> => {
+    const commandCwd = mcpCwd ?? workspaceCwd();
+    if (!force && commandCwd) void discoverCommands(agent, commandCwd, false, mcpOwner ?? `workspace:${agent}`);
     const requestedMcpRevision = mcpOwner ? mcp.revision(mcpOwner) : 0;
     const requestedMcpGeneration = mcpSurfaceGeneration;
     const requestOwner = mcpOwner ? `${mcpOwner}:${requestedMcpRevision}` : '';
@@ -1564,27 +1639,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         // Evaluate both freshness checks. Each clears its silent mark on an explicit refresh, so short-circuiting would leave one marked silent.
         const wantUsage = usage.toAsk([agent], now, force).length > 0;
         const wantModels = models.toAsk([agent], now, force).length > 0;
-        // Request commands once per agent per window, even before any prompt starts a child.
-        const wantCommands = !commandsAsked.has(agent);
         // Request initial server status independently of usage and catalogs. Missing answers remain eligible for retry. The initial-read gate prevents duplicate requests.
         const live = host.states().filter((s) => s.agent === agent && !s.exited);
         const mcpTarget = liveMcpTarget(live, mcpOwner, draftMcpKeys);
         const mcpLive = mcpTarget?.state;
         const resolvedMcpOwner = mcpOwner ?? mcpTarget?.owner;
         const wantMcp = Boolean(resolvedMcpOwner && mcp.needsInitialRead(resolvedMcpOwner));
-        if (!wantUsage && !wantModels && !wantCommands && !wantMcp) {
+        if (!wantUsage && !wantModels && !wantMcp) {
           return;
         }
         const liveSources = live.map((state) => host.get(state.key)!.usageSource);
         const idleCandidates = live.filter(
           (state) => !state.busy && usage.canDiscover(agent, host.get(state.key)!.usageSource, liveSources),
         );
-        // A restricted child cannot stand in for the idle read that seeds the provider list, so a commands request leaves it out.
-        const eligibleIdle = idleCandidates
-          .filter((state) => !wantCommands || host.get(state.key)?.policy === undefined)
-          .sort((left, right) =>
-            agent === 'codex' ? host.get(right.key)!.usageSource - host.get(left.key)!.usageSource : 0,
-          );
+        const eligibleIdle = idleCandidates.sort((left, right) =>
+          agent === 'codex' ? host.get(right.key)!.usageSource - host.get(left.key)!.usageSource : 0,
+        );
         const idleLive = mcpOwner
           ? mcpLive?.busy
             ? undefined
@@ -1606,8 +1676,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           if (idleLive) {
             // Reuse a live child's command catalog. MCP status still requires a request, and a missing answer keeps the initial-read gate open.
             publishCommands();
-            commandsAsked.add(agent);
             if (wantMcp && resolvedMcpOwner) {
+              // An idle child runs without the session's launch policy. Claude's policy restricts MCP configuration and skills.
+              // Codex's policy changes only the approval policy, the approvals reviewer, and the sandbox.
               if (mcpLive) {
                 void readMcpFrom(mcpLive.key, resolvedMcpOwner);
               } else {
@@ -1624,12 +1695,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             }
             return;
           }
-          // The session's own MCP status stays with its idle live child when the idle read supplies the commands. An idle child runs without the session's launch policy. For Claude, that policy restricts the MCP configuration and skills the child loads, so only the idle child reports the reader's full set. For Codex, the policy changes only the approval policy, the approvals reviewer, and the sandbox.
-          const mcpStaysLive = Boolean(wantMcp && resolvedMcpOwner && mcpLive && idleCandidates.includes(mcpLive));
-          if (mcpStaysLive) {
-            void readMcpFrom(mcpLive!.key, resolvedMcpOwner);
-          }
-          if (!wantUsage && !wantModels && !wantCommands && wantMcp && resolvedMcpOwner) {
+          if (!wantUsage && !wantModels && wantMcp && resolvedMcpOwner) {
             const revision = mcp.beginInitialRead(resolvedMcpOwner, requestedMcpRevision);
             if (revision !== null) {
               void readIdleMcp(agent, mcpCwd ?? cwd, resolvedMcpOwner, revision, requestedMcpGeneration).then(
@@ -1648,8 +1714,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
               'The agent could not start to read usage. Check its executable setting.',
               operation,
             );
-            commandsAsked.add(agent);
-            if (resolvedMcpOwner && !mcpStaysLive) {
+            if (resolvedMcpOwner) {
               const revision = mcp.beginInitialRead(resolvedMcpOwner, requestedMcpRevision);
               if (revision !== null) {
                 mcp.noteSilent(resolvedMcpOwner, revision);
@@ -1661,10 +1726,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             return;
           }
           initialMcpRevision =
-            wantMcp && resolvedMcpOwner && !mcpStaysLive
-              ? mcp.beginInitialRead(resolvedMcpOwner, requestedMcpRevision)
-              : null;
-          const commandRevision = commandLists.revision(agent);
+            wantMcp && resolvedMcpOwner ? mcp.beginInitialRead(resolvedMcpOwner, requestedMcpRevision) : null;
           if (!usageReads.current(agent, attempt)) return;
           let source = 0;
           let revision = 0;
@@ -1716,9 +1778,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             },
             force,
           );
-          // Publish the idle child's commands when its remaining controls settle.
-          commandsAsked.add(agent);
-          publishCommands({ agent, ...answers.child, commands: answers.commands, complete: false }, commandRevision);
           if (answers.models) {
             models.note(agent, answers.models, readPath);
             publishPicks();
@@ -1739,7 +1798,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         } catch (error) {
           usageReads.result(agent, attempt, 'failed', (error as Error).message, operation);
           // Mark failed control reads silent to avoid repeated automatic process starts. Explicit refresh requests clear usage and model silent marks.
-          commandsAsked.add(agent);
           if (resolvedMcpOwner && initialMcpRevision !== null) {
             mcp.noteSilent(resolvedMcpOwner, initialMcpRevision);
           }
@@ -1768,10 +1826,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     mcpCwd?: string,
   ): void => {
     const agents = only ? [only] : USAGE_AGENT_ORDER;
+    if (force) {
+      for (const agent of agents) {
+        const selected = only === agent || (!only && mcpAgent === agent);
+        const cwd = (selected ? mcpCwd : undefined) ?? workspaceCwd();
+        if (cwd)
+          void discoverCommands(
+            agent as AgentName,
+            cwd,
+            true,
+            (selected ? mcpOwner : undefined) ?? `workspace:${agent}`,
+          );
+      }
+    }
     const attempt = force ? usageReads.begin(agents) : undefined;
     if (attempt === null) return;
     for (const agent of agents) {
-      const ownsMcp = only === agent || (!only && mcpAgent === agent);
+      const ownsMcp = !force && (only === agent || (!only && mcpAgent === agent));
       const read = () =>
         askAgent(agent as AgentName, force, ownsMcp ? mcpOwner : undefined, ownsMcp ? mcpCwd : undefined, attempt);
       if (force) {
@@ -2114,6 +2185,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
   };
   panel.onDraftRemoved = (draft) => {
+    commandDiscovery.cancel(draft.draftId);
     for (const agent of USAGE_AGENT_ORDER) {
       acceptedDrafts.delete(freshHostKey(agent as AgentName, draft.draftId));
     }
@@ -2141,6 +2213,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     publishMcp();
   };
   panel.onPanelsClosed = () => {
+    commandDiscovery.cancelAll();
     mcpSurfaceGeneration++;
     mcp.invalidateInitialReads();
     mcpRefreshes.dispose();

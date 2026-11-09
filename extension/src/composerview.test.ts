@@ -1324,7 +1324,7 @@ test('Claude sessions offer /remote-control and /rc once, and Codex sessions nev
   ]);
   assert.deepEqual(
     availableCommands([polish], 'codex').map((command) => command.name),
-    ['polish', 'mcp'],
+    ['polish', 'compact', 'clear', 'new', 'rename', 'mcp'],
   );
   const published = { kind: 'command' as const, name: 'RC', description: 'Claude wording', argumentHint: '' };
   assert.deepEqual(
@@ -1351,7 +1351,7 @@ test('Claude sessions offer /remote-control and /rc once, and Codex sessions nev
   }
   assert.deepEqual(
     composerView(composerState({ agent: 'codex', commands: [] }))!.commands.map((entry) => entry.command),
-    ['mcp'],
+    ['compact', 'clear', 'new', 'rename', 'mcp'],
   );
 });
 
@@ -1471,6 +1471,31 @@ test('Codex skills keep both invocation prefixes while commands keep slash only'
     }).box.placeholder,
     'Ask Codex anything, or type / for commands or $ for skills',
   );
+});
+
+test('draft discovery failures leave builtins and local controls available with dollar skill collisions', () => {
+  const empty = drawn({ agent: 'codex', commands: [] }).commands;
+  assert.deepEqual(
+    empty.map((entry) => entry.label),
+    ['/compact', '/clear', '/new', '/rename', '/mcp'],
+  );
+  const commands = ['fast', 'mcp', 'compact'].map((name) => ({
+    kind: 'skill' as const,
+    name,
+    description: 'Native skill',
+    argumentHint: '',
+    path: `/${name}/SKILL.md`,
+  }));
+  const entries = drawn({
+    agent: 'codex',
+    commands,
+    settings: { ...composerState().settings, serviceTier: 'priority' },
+  }).commands;
+  for (const name of ['fast', 'mcp', 'compact']) {
+    assert.equal(entries.filter((entry) => entry.label === `/${name}`).length, 1);
+    assert.equal(entries.find((entry) => entry.label === `/${name}`)?.kind, 'command');
+    assert.equal(entries.find((entry) => entry.label === `$${name}`)?.kind, 'skill');
+  }
 });
 
 test('each agent is asked in its own words, not in one vocabulary invented for both', () => {

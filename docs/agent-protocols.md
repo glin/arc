@@ -120,7 +120,9 @@ Usage and rate limits are provider snapshots, separate from local turn totals. C
 
 Serialize account reads per agent. Share requests only for the same session or draft MCP owner. Start selected-owner reads in its recorded directory. Codex caches account eligibility per process. Explicit Read again rediscovers eligibility before supported managed-auth renewal. Fresh idle children also renew on supported explicit reads. Long-lived children retain their opening credentials.
 
-When all children work, account reads wait without interrupting them or changing active authentication. Discovery revisions reject obsolete replies. Source identities reject obsolete notifications. Rejected usage admission does not invalidate model catalogs. [`extension.ts`](../extension/src/extension.ts) owns idle-source selection.
+Command discovery runs independently of account scheduling. Wire events and idle answers distinguish successful, failed, and unanswered command discovery. Built-in fallback entries do not establish a successful skill read. [Prompt entries](prompt-entries.md#prompt-entries) owns catalog scope and recovery.
+
+Explicit Read again uses any eligible idle child, regardless of the selected session. When all children work, account reads wait without interrupting them or changing active authentication. Discovery revisions reject obsolete replies. Source identities reject obsolete notifications. Rejected usage admission does not invalidate model catalogs. [`extension.ts`](../extension/src/extension.ts) owns idle-source selection.
 
 Explicit attempts have a 120-second deadline from acceptance, including queue and busy waits. Expired attempts cannot dispatch unsent reads. Sent reads retain ownership until settlement. Retry joins them without another authentication renewal. Late supported readings update figures without changing expired outcomes.
 

@@ -13,6 +13,7 @@ import {
   type DefaultContext,
 } from './view/model-picks';
 import { CARD_ACTIONS } from './view/card-words';
+import { CODEX_COMMANDS } from './domain/codex-commands';
 // Prepares Prompt box state, permission requests, and answers without importing `vscode`.
 // The host and webview consume these decisions.
 
@@ -5002,12 +5003,19 @@ export function availableCommands(commands: readonly ComposerPromptEntry[], agen
     commands.filter((command) => command.kind !== 'skill').map((command) => command.name.toLowerCase()),
   );
   const added = [
+    ...(agent === 'codex' ? CODEX_COMMANDS.map((command) => [command.name, command.description] as const) : []),
     ...Object.entries(PANEL_COMMANDS).map(([name, command]) => [name, command.description] as const),
     ...(agent === 'claude' ? Object.entries(CLAUDE_TOGGLE_COMMANDS) : []),
   ];
   for (const [name, description] of added) {
     if (!names.has(name)) {
-      available.push({ kind: 'command', name, description, argumentHint: '' });
+      available.push({
+        kind: 'command',
+        name,
+        description,
+        argumentHint:
+          agent === 'codex' ? (CODEX_COMMANDS.find((command) => command.name === name)?.argumentHint ?? '') : '',
+      });
     }
   }
   return available;
@@ -5147,8 +5155,16 @@ export function panelCommand(text: string): string | null {
 
 // Build menu rows in catalog order. Codex skills offer both dollar and slash prefixes.
 export function promptEntries(agent: string, commands: readonly ComposerPromptEntry[]): PromptEntryView[] {
+  const controls = new Set(
+    commands.filter((command) => command.kind !== 'skill').map((command) => command.name.toLowerCase()),
+  );
   return commands.flatMap((command) => {
-    const prefixes: Array<'/' | '$'> = command.kind === 'skill' && agent === 'codex' ? ['$', '/'] : ['/'];
+    const prefixes: Array<'/' | '$'> =
+      command.kind === 'skill' && agent === 'codex'
+        ? controls.has(command.name.toLowerCase())
+          ? ['$']
+          : ['$', '/']
+        : ['/'];
     return prefixes.map((prefix) => {
       const label = `${prefix}${command.name}`;
       const hint = command.argumentHint.trim();

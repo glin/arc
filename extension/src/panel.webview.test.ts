@@ -1,6 +1,6 @@
 import { linkBrowserKind, parseLinkDestination } from './domain/link-path';
 import { isDeepStrictEqual } from 'node:util';
-import { CommandCatalogs } from './commandcatalog';
+import { CommandCatalogs, CommandDiscovery, commandScope, commandSources } from './commandcatalog';
 import { isCompressedRollout } from './compressedrollouts.ts';
 import { claudeChildFileFor, commitSourceStamp, recordCommits as recordTranscriptCommits } from './transcript';
 import {
@@ -8981,7 +8981,7 @@ test.each(['identity', 'storage'])(
     const extensionSource = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
     const setupSource = extensionSource.slice(
       extensionSource.indexOf('const setupProjects = new SetupProjects('),
-      extensionSource.indexOf('// What each agent published for its slash menu'),
+      extensionSource.indexOf('const commandLists ='),
     );
     const compiled = esbuild.transformSync(setupSource, { loader: 'ts', format: 'cjs', target: 'esnext' }).code;
     const folderA = tempDir('setup-recovery-A-');
@@ -15422,6 +15422,12 @@ function wireDefaultMetadata(context: any, panel: any, environment: Record<strin
     defaultsKey,
     defaultsKeyParts,
     sessionSkillSelection: { current: () => undefined },
+    commandDiscovery: { cancelAll() {} },
+    commandConfigurations: {},
+    idlePlanFor: () => null,
+    workspaceCwd: () => '/workspace',
+    USAGE_AGENT_ORDER,
+    publishCommands() {},
     ...environment,
   };
   const source = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
@@ -15457,6 +15463,8 @@ test('default metadata watches external ancestors and ignores unrelated editor s
   const subscriptions: any[] = [];
   let configuration!: (event: any) => void;
   let cleared = 0;
+  const cancelledAgents: string[] = [];
+  let commandsPublished = 0;
   const readings: Array<(value: any) => void> = [];
   const accepted: any[] = [];
   const panel: any = {
@@ -15509,6 +15517,14 @@ test('default metadata watches external ancestors and ignores unrelated editor s
     },
   };
   wireDefaultMetadata({ subscriptions }, panel, {
+    commandDiscovery: {
+      cancelAll(matches: (scope: string) => boolean) {
+        for (const agent of ['claude', 'codex']) if (matches(commandScope(agent, cwd))) cancelledAgents.push(agent);
+      },
+    },
+    publishCommands() {
+      commandsPublished++;
+    },
     vscode,
     path,
     os: { homedir: () => 'user' },
@@ -15552,6 +15568,8 @@ test('default metadata watches external ancestors and ignores unrelated editor s
   assert.deepEqual(accepted, []);
   change('arc.codexPath');
   assert.equal(cleared, 2);
+  assert.deepEqual(cancelledAgents, ['claude', 'codex'], 'an executable change cancelled unrelated agents');
+  assert.equal(commandsPublished, 2, 'changing the executable retained another configuration catalog');
   const external = watchers.find(({ pattern }) => pattern.base === cwd);
   const claude = path.join(cwd, '.claude');
   external.create({ fsPath: claude });
@@ -15924,6 +15942,7 @@ function savedDefaultsDraftHost(cwd: string, folder = cwd) {
     showing: session,
     sessionRows: [{ id: session, label: 'Draft', agentKey: 'codex' }],
     commandLists: {},
+    commandConfigurations: {},
     skillLists: {},
     askLevels: {},
     running: new Set(),
@@ -16616,7 +16635,7 @@ test('an explicit permission pick mutates no state when a default transition own
 test('an MCP change without its exact live owner uses an isolated child and refreshes that owner', () => {
   const extensionSource = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
   const mcpChangeAt = extensionSource.indexOf('const setMcpFor = async');
-  const mcpChange = extensionSource.slice(mcpChangeAt, extensionSource.indexOf('// What to start', mcpChangeAt));
+  const mcpChange = statementFrom(extensionSource, mcpChangeAt);
   sourceMatch(
     mcpChange,
     /const target = liveMcpTarget\(live, owner, draftMcpKeys\);[\s\S]*if \(target\) \{[\s\S]*host\.changeMcp\(keys, changes\)/,
@@ -16702,10 +16721,13 @@ test('an invalid live Codex permission pick changes no setting or session', asyn
   assert.deepEqual(sessionUpdates, [], 'an invalid value changed a live Codex session');
 });
 
-function catalogRefreshFixture(book?: UsageBook) {
+function catalogRefreshFixture(
+  book?: UsageBook,
+  discoverCommands: (agent: string, cwd: string, force: boolean, owner: string) => Promise<void> = async () => {},
+) {
   const source = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
-  const statements = ['const publishPicks =', 'const readFrom =', 'const askAgent ='].map((needle) =>
-    statementFrom(source, source.indexOf(needle)),
+  const statements = ['const publishPicks =', 'const readFrom =', 'const askAgent =', 'const refreshUsage ='].map(
+    (needle) => statementFrom(source, source.indexOf(needle)),
   );
   const models = new ModelBook();
   const mcp = new McpBook();
@@ -16799,7 +16821,7 @@ function catalogRefreshFixture(book?: UsageBook) {
     publishUsage,
     publishCommands() {},
     commandLists: { revision: () => 0 },
-    commandsAsked: new Set<string>(),
+    discoverCommands,
     usage: book ?? {
       beginDiscovery: () => 1,
       canDiscover: () => true,
@@ -16888,7 +16910,9 @@ function catalogRefreshFixture(book?: UsageBook) {
     },
     readMcpFrom: async () => {},
   };
-  const code = esbuild.transformSync(`${statements.join('\n')}\nreturn { askAgent, readFrom };`, { loader: 'ts' }).code;
+  const code = esbuild.transformSync(`${statements.join('\n')}\nreturn { askAgent, readFrom, refreshUsage };`, {
+    loader: 'ts',
+  }).code;
   const compiled = new Function(...Object.keys(scope), code)(...Object.values(scope));
   const ask = compiled.askAgent as (
     agent: string,
@@ -16899,6 +16923,13 @@ function catalogRefreshFixture(book?: UsageBook) {
   ) => Promise<void>;
   return {
     ask,
+    refresh: compiled.refreshUsage as (
+      agent: string | null,
+      force: boolean,
+      owner?: string,
+      ownerAgent?: string,
+      cwd?: string,
+    ) => void,
     models,
     mcp,
     calls,
@@ -17294,6 +17325,98 @@ test('manual account refresh uses an idle sibling for both agents and publishes 
   }
 });
 
+test.each(['claude', 'codex'])(
+  'Read again uses an idle sibling while selected %s command discovery keeps its own directory',
+  async (agent) => {
+    vi.useFakeTimers();
+    const discovery = draftDiscoveryFixture();
+    discovery.setFailed(false);
+    const fixture = catalogRefreshFixture(undefined, discovery.discover);
+    Object.assign(fixture.control, { live: true, agent, ownerBusy: true, idleSibling: true, answer: { readAt: 42 } });
+    const provider = {
+      showing: 'selected',
+      sessionRows: [{ id: 'selected', agentKey: agent }],
+      ownCwdForSession: () => '/project/b',
+      refreshUsageHandler: fixture.refresh,
+    };
+    const refresh = new Function(`return ({${hostHandler('refreshUsage')}}).refreshUsage;`).call(provider);
+    try {
+      refresh({ agent: null, force: true });
+      await vi.advanceTimersByTimeAsync(0);
+      assert.equal(fixture.calls.includes('usage idle-sibling'), true, 'Read again waited on the busy selected child');
+      assert.equal(fixture.calls.includes('usage live'), false);
+      assert.equal(
+        fixture.usageResults.some((result) => result.agent === agent && result.phase === 'success'),
+        true,
+      );
+      assert.deepEqual(
+        discovery.commandLists.current()[commandScope(agent, '/project/b', 'executable')].map((entry) => entry.name),
+        ['project-b'],
+      );
+      assert.equal(discovery.commandLists.current()[commandScope(agent, '/workspace', 'executable')], undefined);
+    } finally {
+      fixture.usageReads.dispose();
+      discovery.commandDiscovery.dispose();
+      for (const exit of discovery.exits.splice(0)) exit();
+      await vi.advanceTimersByTimeAsync(0);
+      vi.useRealTimers();
+    }
+  },
+);
+
+test.each(['claude', 'codex'])(
+  'Read again discovers the selected %s directory while an account read is pending',
+  async (agent) => {
+    vi.useFakeTimers();
+    const discovery = draftDiscoveryFixture();
+    discovery.setFailed(false);
+    const fixture = catalogRefreshFixture(undefined, discovery.discover);
+    let release = () => {};
+    Object.assign(fixture.control, {
+      live: true,
+      agent,
+      ownerBusy: true,
+      idleSibling: true,
+      answer: { readAt: 42 },
+      holdDiscovery: new Promise<boolean>((resolve) => {
+        release = () => resolve(true);
+      }),
+    });
+    const pending = fixture.ask(agent, true, undefined, undefined, fixture.usageReads.begin([agent])!);
+    const provider = {
+      showing: 'selected',
+      sessionRows: [{ id: 'selected', agentKey: agent }],
+      ownCwdForSession: () => '/project/b',
+      refreshUsageHandler: fixture.refresh,
+    };
+    const refresh = new Function(`return ({${hostHandler('refreshUsage')}}).refreshUsage;`).call(provider);
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      assert.equal(fixture.control.discoveryCount, 1, 'the idle sibling did not start account discovery');
+      assert.equal(fixture.usageReads.begin([agent]), null, 'the account read did not remain pending');
+      refresh({ agent: null, force: true });
+      await vi.advanceTimersByTimeAsync(0);
+      assert.deepEqual(
+        discovery.commandLists.current()[commandScope(agent, '/project/b', 'executable')]?.map((entry) => entry.name),
+        ['project-b'],
+        'a pending account read blocked selected-directory command discovery',
+      );
+      assert.equal(fixture.control.discoveryCount, 1, 'the refresh duplicated the pending account read');
+      release();
+      await pending;
+      assert.deepEqual(fixture.calls, ['usage idle-sibling']);
+    } finally {
+      release();
+      await pending;
+      fixture.usageReads.dispose();
+      discovery.commandDiscovery.dispose();
+      for (const exit of discovery.exits.splice(0)) exit();
+      await vi.advanceTimersByTimeAsync(0);
+      vi.useRealTimers();
+    }
+  },
+);
+
 test('automatic live account completion leaves manual usage available before its held catalog finishes', async () => {
   const fixture = catalogRefreshFixture();
   let release = () => {};
@@ -17428,6 +17551,7 @@ test('draft acceptance survives profile-save and adoption failures until removal
     };
     const live = { key: 'codex:fresh:accepted', prompt: async () => 7, state: () => ({ sessionId: 'actual' }) };
     const scope = {
+      commandDiscovery: { cancel() {} },
       savePolicy: async () => {},
       panel,
       retireDraftProfile,
@@ -17509,7 +17633,6 @@ test('an idle live child answers a missing initial MCP read', async () => {
   const calls: string[] = [];
   const run = new Function(
     'publishCommands',
-    'commandsAsked',
     'mcp',
     'readMcpFrom',
     'readIdleMcp',
@@ -17518,7 +17641,6 @@ test('an idle live child answers a missing initial MCP read', async () => {
     `return async function (live, agent, force, wantMcp, resolvedMcpOwner, mcpLive) {const idleLive = mcpLive; const attempt = undefined; const operation = undefined; ${liveBody}\n};`,
   )(
     () => calls.push('commands'),
-    { add: () => calls.push('commands settled') },
     { beginInitialRead: () => true, finishInitialRead: () => calls.push('MCP settled') },
     async () => {
       calls.push('MCP read');
@@ -17543,7 +17665,7 @@ test('an idle live child answers a missing initial MCP read', async () => {
   await run([{ key: 'idle-live' }], 'claude', false, true, 'session-1', { key: 'idle-live' });
   assert.deepEqual(
     calls,
-    ['commands', 'commands settled', 'MCP read', 'usage read'],
+    ['commands', 'MCP read', 'usage read'],
     'an idle live child closed the initial MCP gate without asking for server status',
   );
 });
@@ -22634,7 +22756,8 @@ function stateForRow(
     awaitingSessionRecords?: Record<string, { cwd: string }>;
     folders?: () => string[];
     skillLists?: Record<string, readonly string[]>;
-    commandLists?: Record<string, PromptEntry[]>;
+    commandLists?: Readonly<Record<string, readonly PromptEntry[]>>;
+    commandConfigurations?: Record<string, string>;
     sessionCommandLists?: Record<string, PromptEntry[]>;
     picks?: SessionSettingBook;
     askLevels?: Record<string, string>;
@@ -22674,6 +22797,10 @@ function stateForRow(
     'claudeSkillPath',
     `return function (cwd, session) {\n${methodBody('private claudeCommandsFor(')}\n};`,
   )(claudeSkillPath) as (this: unknown, cwd: string | null) => PromptEntry[];
+  const commandsFor = new Function(
+    'commandScope',
+    `return function (agent, cwd) {\n${methodBody('private commandsFor(')}\n};`,
+  )(commandScope);
   const host = {
     newestBySession: selected.newest ?? new Map(),
     newestCompactionBySession: selected.compactions ?? new Map(),
@@ -22696,6 +22823,7 @@ function stateForRow(
     models: {},
     modelLabels: overrides.modelLabels,
     commandLists: overrides.commandLists ?? {},
+    commandConfigurations: overrides.commandConfigurations ?? {},
     sessionCommandLists: overrides.sessionCommandLists ?? {},
     claudeSkillPaths: new Map<string, string | null>(),
     skillLists: overrides.skillLists ?? {},
@@ -22705,6 +22833,7 @@ function stateForRow(
     cwdForSession,
     ownCwdForSession,
     claudeCommandsFor,
+    commandsFor,
     mcpServers: {},
     askLevels: overrides.askLevels ?? {},
     codexEffectiveModes: overrides.codexEffectiveModes ?? {},
@@ -22982,7 +23111,9 @@ test("a Claude row's composer state carries the SKILL.md path stateForRow found 
   const rows = [{ id: 'claude-land', label: 'Claude session', agentKey: 'claude' }];
   const catalog = { sessions: [{ agent: 'claude', sessionId: 'claude-land', cwd: projectDir }] };
   const commandLists = {
-    claude: [{ kind: 'skill' as const, name: 'land', description: 'Land one reviewed change', argumentHint: '' }],
+    [commandScope('claude', projectDir)]: [
+      { kind: 'skill' as const, name: 'land', description: 'Land one reviewed change', argumentHint: '' },
+    ],
   };
   const state = stateForRow(rows, {}, 'claude-land', {}, { catalog, commandLists });
   const command = state.commands.find((entry) => entry.name === 'land');
@@ -27920,6 +28051,7 @@ function queueRecoveryProvider(comments: ReturnType<typeof applyComment> = []) {
     liveActivity: {},
     models: {},
     commandLists: {},
+    commandConfigurations: {},
     skillLists: {},
     mcpServers: {},
     askLevels: {},
@@ -30166,6 +30298,7 @@ function liveProviderFixture(press: LivePress, newest = turn({ startedAt: press.
     memento: { update: async () => {} },
     models: {},
     commandLists: {},
+    commandConfigurations: {},
     skillLists: {},
     mcpServers: {},
     askLevels: {},
@@ -36442,6 +36575,7 @@ test.each(['claude', 'codex'] as const)(
       trail: emptyTrail(),
       sessionRows: [{ id: session, label: 'Draft', agentKey: agent }],
       commandLists: {},
+      commandConfigurations: {},
       skillLists: {},
       askLevels: {},
       running: new Set(),
@@ -38611,6 +38745,7 @@ test.each([
     running: new Set(),
     models: {},
     commandLists: {},
+    commandConfigurations: {},
     skillLists: {},
     mcpServers: {},
     askLevels: {},
@@ -45084,6 +45219,8 @@ test('Prompt boxes keep child-specific session skill paths after idle reads and 
   const rows = ['first', 'second', 'plain'].map((id) => ({ id, label: id, agentKey: 'claude' }));
   let sources = rows.map((row, index) => ({
     agent: 'claude',
+    commandScope: commandScope('claude', '/workspace'),
+    commandOutcome: 'success' as const,
     key: row.id,
     sessionId: row.id,
     usageSource: index + 1,
@@ -45097,11 +45234,17 @@ test('Prompt boxes keep child-specific session skill paths after idle reads and 
       id,
       {},
       {
-        commandLists: { ...catalogs.current() } as Record<string, PromptEntry[]>,
+        commandLists: { ...catalogs.current() },
         sessionCommandLists: catalogs.childCommands(sources),
       },
     ).commands;
-  catalogs.publish(sources, { agent: 'claude', commands: [supplied('idle')], complete: true });
+  catalogs.publish(sources, {
+    agent: 'claude',
+    commandScope: commandScope('claude', '/workspace'),
+    commandOutcome: 'success' as const,
+    commands: [supplied('idle')],
+    complete: true,
+  });
   assert.deepEqual(
     draw('first').map((entry) => entry.path),
     ['/first/SKILL.md'],
@@ -45117,6 +45260,8 @@ test('Prompt boxes keep child-specific session skill paths after idle reads and 
   catalogs.publish(sources, { ...sources[0], complete: true });
   catalogs.publish(sources, {
     agent: 'claude',
+    commandScope: commandScope('claude', '/workspace'),
+    commandOutcome: 'success' as const,
     key: 'first',
     usageSource: 1,
     commands: [supplied('retired')],
@@ -45130,6 +45275,138 @@ test('Prompt boxes keep child-specific session skill paths after idle reads and 
     draw('second').map((entry) => entry.path),
     ['/second/SKILL.md'],
   );
+});
+
+function draftDiscoveryFixture() {
+  const source = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
+  const commandLists = new CommandCatalogs();
+  const commandDiscovery = new CommandDiscovery();
+  const directories: string[] = [];
+  const exits: Array<() => void> = [];
+  const signals: AbortSignal[] = [];
+  let failed = true;
+  const live: any[] = [];
+  const scope = {
+    commandLists,
+    commandDiscovery,
+    host: { states: () => live },
+    childPolicy: (key: string) => live.find((state) => state.key === key)?.policy,
+    commandScope,
+    workspaceCwd: () => '/workspace',
+    idlePlanFor: (_agent: string, cwd: string) => ({ cwd, commandConfiguration: 'executable' }),
+    spawner: () => assert.fail('the protocol fixture owns process creation'),
+    askIdle: async (
+      plan: { cwd: string },
+      _spawner: unknown,
+      _deadline: unknown,
+      _usage: unknown,
+      _admit: unknown,
+      _discovery: unknown,
+      _force: unknown,
+      options: {
+        controls: boolean;
+        signal: AbortSignal;
+        onCommands(commands: PromptEntry[], outcome: 'success' | 'failed'): void;
+      },
+    ) => {
+      assert.equal(options.controls, false);
+      directories.push(plan.cwd);
+      signals.push(options.signal);
+      const commandOutcome = failed ? ('failed' as const) : ('success' as const);
+      const commands: PromptEntry[] = failed
+        ? []
+        : [
+            {
+              kind: 'skill',
+              name: plan.cwd.endsWith('a') ? 'project-a' : 'project-b',
+              path: plan.cwd + '/SKILL.md',
+              description: '',
+              argumentHint: '',
+            },
+          ];
+      options.onCommands(commands, commandOutcome);
+      await new Promise<void>((resolve) => {
+        exits.push(resolve);
+      });
+      return { commandOutcome, commands };
+    },
+    publishCommands: (update?: Parameters<CommandCatalogs['publish']>[1], revision?: number) =>
+      commandLists.publish(commandSources(live, scope.childPolicy), update, revision),
+    usageReads: { begin: () => 1, run: () => new Promise<void>(() => {}) },
+    USAGE_AGENT_ORDER,
+    mcp: { revision: () => 0 },
+    mcpSurfaceGeneration: 0,
+  };
+  const code = esbuild.transformSync(
+    `${source.includes('const discoverCommands =') ? statementFrom(source, source.indexOf('const discoverCommands =')) : ''}\n${statementFrom(source, source.indexOf('const askAgent ='))}\n${statementFrom(source, source.indexOf('const refreshUsage ='))}\nreturn { refreshUsage, discoverCommands };`,
+    { loader: 'ts' },
+  ).code;
+  const compiled = new Function(...Object.keys(scope), code)(...Object.values(scope));
+  const ask = async (agent: string, force: boolean, owner: string, cwd: string): Promise<void> => {
+    compiled.refreshUsage(agent, force, owner, agent, cwd);
+  };
+  const rows = ['a', 'b'].map((id) => ({ id, label: 'New session', agentKey: 'codex' }));
+  const drafts = Object.fromEntries(
+    rows.map((row) => [
+      row.id,
+      newSessionDraft(row.id, '/project/' + row.id, null, DRAFT_MADE_AT, { ...DRAFT_SETUP, agent: 'codex' }, null),
+    ]),
+  );
+  const draw = (id: string) =>
+    stateForRow(
+      rows,
+      drafts,
+      id,
+      {},
+      { commandLists: { ...commandLists.current() }, commandConfigurations: { codex: 'executable' } },
+    ).commands.map((command) => command.name);
+  return {
+    ask,
+    discover: compiled.discoverCommands as (agent: string, cwd: string, force: boolean, owner: string) => Promise<void>,
+    draw,
+    commandLists,
+    commandDiscovery,
+    directories,
+    exits,
+    signals,
+    live,
+    setFailed: (value: boolean) => {
+      failed = value;
+    },
+  };
+}
+
+test('draft discovery recovers the unsent Codex prompt box independently of pending account controls', async () => {
+  vi.useFakeTimers();
+  const { ask, draw, commandDiscovery, directories, exits, setFailed } = draftDiscoveryFixture();
+  try {
+    void ask('codex', false, 'a', '/project/a');
+    void ask('codex', false, 'a-sibling', '/project/a');
+    await vi.advanceTimersByTimeAsync(0);
+    assert.deepEqual(directories, ['/project/a']);
+    assert.deepEqual(draw('a'), []);
+    await vi.advanceTimersByTimeAsync(5_000);
+    assert.equal(directories.length, 1, 'retry started before failed-child exit');
+    setFailed(false);
+    exits.shift()!();
+    await vi.advanceTimersByTimeAsync(999);
+    assert.equal(directories.length, 1);
+    await vi.advanceTimersByTimeAsync(1);
+    assert.deepEqual(draw('a'), ['project-a'], 'the same unsent draft did not receive recovered skills');
+    assert.deepEqual(draw('b'), []);
+    void ask('codex', false, 'b', '/project/b');
+    await vi.advanceTimersByTimeAsync(0);
+    assert.deepEqual(draw('b'), ['project-b']);
+    assert.deepEqual(draw('a'), ['project-a']);
+    assert.deepEqual(directories, ['/project/a', '/project/a', '/project/b']);
+    for (const exit of exits.splice(0)) exit();
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(10_000);
+    assert.equal(directories.length, 3);
+  } finally {
+    commandDiscovery.dispose();
+    vi.useRealTimers();
+  }
 });
 
 const REMOTE_LINK = 'https://claude.ai/code/session_01ABCDEFGHJKMNPQRSTVWXYZ';
@@ -45969,3 +46246,238 @@ test('a Fast Codex draft that moves to Claude carries no speed into the setup or
   // Adoption stores the composer state settings, so a speed cannot return through them.
   assert.equal(provider.stateFor(session).settings.serviceTier, undefined, 'adoption would keep a Codex speed');
 });
+
+test('draft discovery actual refresh recovers the selected second-directory scope after two failures', async () => {
+  vi.useFakeTimers();
+  const f = draftDiscoveryFixture();
+  try {
+    void f.ask('codex', false, 'b', '/project/b');
+    await vi.advanceTimersByTimeAsync(0);
+    f.exits.shift()!();
+    await vi.advanceTimersByTimeAsync(1000);
+    f.exits.shift()!();
+    await vi.advanceTimersByTimeAsync(5000);
+    assert.deepEqual(f.directories, ['/project/b', '/project/b']);
+    f.setFailed(false);
+    const provider = {
+      showing: 'b',
+      sessionRows: [{ id: 'b', agentKey: 'codex' }],
+      ownCwdForSession: () => '/project/b',
+      refreshUsageHandler: (agent: string, force: boolean, owner: string, _selectedAgent: string, cwd: string) =>
+        f.ask(agent, force, owner, cwd),
+    };
+    const refresh = new Function(`return ({${hostHandler('refreshUsage')}}).refreshUsage;`).call(provider);
+    refresh({ agent: 'codex', force: true });
+    await vi.advanceTimersByTimeAsync(0);
+    assert.deepEqual(f.directories, ['/project/b', '/project/b', '/project/b']);
+    assert.deepEqual(f.draw('b'), ['project-b']);
+    f.exits.shift()!();
+    await vi.advanceTimersByTimeAsync(0);
+  } finally {
+    f.commandDiscovery.dispose();
+    vi.useRealTimers();
+  }
+});
+
+function wireDraftDiscoveryCallbacks(panel: any, commandDiscovery: CommandDiscovery) {
+  const source = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
+  const scope = {
+    panel,
+    commandDiscovery,
+    USAGE_AGENT_ORDER,
+    freshHostKey,
+    acceptedDrafts: new Set(),
+    draftMcpKeys: new Map(),
+    host: { retireSession: async () => {} },
+    mcp: { forget() {}, invalidateInitialReads() {} },
+    mcpRefreshes: { cancel() {}, dispose() {} },
+    retireDraftProfile() {},
+    publishMcp() {},
+    mcpSurfaceGeneration: 0,
+    activeMcpOwner: null,
+  };
+  const code = esbuild.transformSync(
+    ['panel.onDraftProfileChanged =', 'panel.onDraftRemoved =', 'panel.onPanelsClosed =']
+      .map((needle) => statementFrom(source, source.indexOf(needle)))
+      .join('\n'),
+    { loader: 'ts' },
+  ).code;
+  new Function(...Object.keys(scope), code)(...Object.values(scope));
+}
+
+test.each([
+  ['model', 'sonnet'],
+  ['effort', 'medium'],
+  ['askmode', 'plan'],
+])('draft discovery survives the actual same-scope %s change callback', async (control, value) => {
+  vi.useFakeTimers();
+  const f = draftDiscoveryFixture();
+  const panel = draftPanel(DRAFT_SETUP) as any;
+  wireDraftDiscoveryCallbacks(panel, f.commandDiscovery);
+  panel.refreshUsageHandler = (agent: string, force: boolean, owner: string, _selected: string, cwd: string) =>
+    f.ask(agent, force, owner, cwd);
+  try {
+    void f.ask('claude', false, 'd1', DRAFT_CWD);
+    await vi.advanceTimersByTimeAsync(0);
+    panel.press(control, value);
+    await vi.advanceTimersByTimeAsync(0);
+    assert.equal(f.signals[0].aborted, false, 'a profile pick cancelled the unchanged discovery scope');
+    assert.equal(f.directories.length, 1);
+    f.setFailed(false);
+    f.exits.shift()!();
+    await vi.advanceTimersByTimeAsync(1000);
+    assert.equal(f.directories.length, 2);
+    assert.equal(f.commandLists.current()[commandScope('claude', DRAFT_CWD, 'executable')].length, 1);
+    f.exits.shift()!();
+    await vi.advanceTimersByTimeAsync(0);
+  } finally {
+    f.commandDiscovery.dispose();
+    vi.useRealTimers();
+  }
+});
+
+test.each(['abandon', 'close'])(
+  'draft discovery restarts only on a new owner request after actual panel %s',
+  async (end) => {
+    vi.useFakeTimers();
+    const f = draftDiscoveryFixture();
+    const panel: any = {};
+    wireDraftDiscoveryCallbacks(panel, f.commandDiscovery);
+    try {
+      void f.ask('codex', false, 'old', '/project/a');
+      await vi.advanceTimersByTimeAsync(0);
+      if (end === 'close') panel.onPanelsClosed();
+      else panel.onDraftRemoved({ draftId: 'old' });
+      assert.equal(f.signals[0].aborted, true);
+      await vi.advanceTimersByTimeAsync(5000);
+      assert.equal(f.directories.length, 1);
+      f.setFailed(false);
+      void f.ask('codex', false, 'new', '/project/a');
+      await vi.advanceTimersByTimeAsync(0);
+      assert.equal(f.directories.length, 1, 'a replacement started before aborted-child exit');
+      f.exits.shift()!();
+      await vi.advanceTimersByTimeAsync(0);
+      assert.equal(f.directories.length, 2);
+      assert.deepEqual(f.draw('a'), ['project-a']);
+      f.exits.shift()!();
+      await vi.advanceTimersByTimeAsync(5000);
+      assert.equal(f.directories.length, 2);
+    } finally {
+      f.commandDiscovery.dispose();
+      vi.useRealTimers();
+    }
+  },
+);
+
+test.each([false, true])(
+  'draft discovery reuses a successful live catalog only without a launch policy %s',
+  async (restricted) => {
+    const f = draftDiscoveryFixture();
+    const commands: PromptEntry[] = [
+      { kind: 'skill', name: 'live-skill', path: '/project/a/SKILL.md', description: '', argumentHint: '' },
+    ];
+    f.live.push({
+      key: 'live',
+      policy: restricted ? { readOnly: true } : undefined,
+      agent: 'codex',
+      commandScope: commandScope('codex', '/project/a', 'executable'),
+      commandOutcome: 'success',
+      commands,
+    });
+    f.setFailed(false);
+    void f.ask('codex', false, 'a', '/project/a');
+    await vi.waitFor(() => assert.deepEqual(f.draw('a'), restricted ? ['project-a'] : ['live-skill']));
+    assert.deepEqual(f.directories, restricted ? ['/project/a'] : []);
+    for (const exit of f.exits) exit();
+    f.commandDiscovery.dispose();
+  },
+);
+
+test('command publication uses cached executable identities across child state changes', () => {
+  const source = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
+  let resolutions = 0;
+  const publications: any[] = [];
+  const scope = {
+    commandLists: new CommandCatalogs(),
+    commandSources,
+    childPolicy: () => undefined,
+    host: { states: () => [] },
+    draftMcpKeys: new Map(),
+    commandConfigurations: { claude: 'one', codex: 'two' },
+    panel: { setCommands: (...args: any[]) => publications.push(args) },
+    USAGE_AGENT_ORDER,
+    workspaceCwd: () => '/workspace',
+    idlePlanFor: () => {
+      resolutions++;
+      return { commandConfiguration: 'unexpected' };
+    },
+  };
+  const code = esbuild.transformSync(
+    `let publishedCommandConfigurations = ''; ${statementFrom(source, source.indexOf('const publishCommands ='))} return publishCommands;`,
+    { loader: 'ts' },
+  ).code;
+  const publish = new Function(...Object.keys(scope), code)(...Object.values(scope));
+  publish();
+  publish();
+  publish();
+  assert.equal(resolutions, 0, 'child state publication repeated executable resolution');
+  assert.equal(publications.length, 1);
+  assert.deepEqual(publications[0][2], scope.commandConfigurations);
+});
+
+test.each(['relative-home', ''])(
+  'prepared Claude live catalogs match the prompt box selection with inherited home %s',
+  (home) => {
+    const previous = Object.entries(process.env).filter(([key]) => key.toUpperCase() === 'CLAUDE_CONFIG_DIR');
+    const clear = () => {
+      for (const key of Object.keys(process.env))
+        if (key.toUpperCase() === 'CLAUDE_CONFIG_DIR') delete process.env[key];
+    };
+    clear();
+    process.env.CLAUDE_CONFIG_DIR = home;
+    try {
+      const cwd = path.resolve('project');
+      const launch = { command: 'claude', leadingArgs: [], env: {}, sessionSkills: { current: () => undefined } };
+      const ordinary = claudeIdlePlan(launch, cwd);
+      const prepared = claudePlan(launch, { cwd }).prepare!();
+      const session = new AgentSession(
+        'live',
+        prepared,
+        () => ({
+          stdin: { write() {}, end() {} },
+          stdout: { setEncoding() {}, on() {} },
+          stderr: { setEncoding() {}, on() {} },
+          kill() {},
+          on() {},
+        }),
+        () => {},
+        () => {},
+      );
+      const commands: PromptEntry[] = [{ kind: 'command', name: 'project-skill', description: '', argumentHint: '' }];
+      const catalogs = new CommandCatalogs();
+      catalogs.publish([], {
+        agent: 'claude',
+        commandScope: session.commandScope,
+        commandOutcome: 'success',
+        commands,
+        complete: true,
+      });
+      const state = stateForRow(
+        [{ id: 's', label: 'Claude', agentKey: 'claude' }],
+        {},
+        's',
+        {},
+        {
+          catalog: { sessions: [{ agent: 'claude', sessionId: 's', cwd }] },
+          commandLists: catalogs.current(),
+          commandConfigurations: { claude: ordinary.commandConfiguration },
+        },
+      );
+      assert.deepEqual(state.commands, commands, 'the live catalog was invisible to its prompt box');
+      assert.equal(session.commandScope, commandScope('claude', cwd, ordinary.commandConfiguration));
+    } finally {
+      clear();
+      for (const [key, value] of previous) process.env[key] = value;
+    }
+  },
+);

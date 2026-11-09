@@ -155,7 +155,7 @@ Paths are relative to `extension/src/`. [Architecture](architecture.md) owns pac
 | `settings.ts` | Setting names, defaults, and compatibility aliases | no |
 | `activitydetail.ts` | Shared activity subject policies and safe tool-input presentation | no |
 | `agentwire.ts` | Shared asks, answers, events, settings, and turn outcomes | no |
-| `commandcatalog.ts` | Retains ordinary provider catalogs and child-specific supplied commands, keeps children under a launch policy from changing a provider catalog by update or fallback, rejects superseded idle reads, and skips unchanged Prompt box payloads | no |
+| `commandcatalog.ts` | Scopes ordinary catalogs and bounded recovery, excludes restricted catalog sources, retains child-specific supplied commands, rejects superseded reads, and skips unchanged Prompt box payloads | no |
 | `promptassets.ts` | Prompt asset limits, descriptor normalization, media-type decisions including the plain-text check for unlisted extensions, staging paths, integrity validation, and staged-copy lifecycle | no |
 | `droppeduris.ts` | Drag type reading, `file:` URI to path conversion, path text in the path-completion format, image routing, and the `Add to Arc` argument shape | no |
 | `domain/context-detail.ts` | Separate native Claude and local Codex context normalization, provider-specific unavailable reason validation, bounded category and optional Claude message partition checks, category shares, aggregate-compatible demand reuse, and stale-demand release | no |
@@ -216,6 +216,7 @@ Paths are relative to `extension/src/`. [Architecture](architecture.md) owns pac
 | `view/composer-size.ts` | Browser-safe prompt floor clamping, keyboard movement, and line counts | no |
 | `view/cost.ts` | Browser-safe money wording for a cost estimate | no |
 | `domain/model-catalog.ts` | Browser-safe model and effort catalog types | no |
+| `domain/codex-commands.ts` | Browser-safe Codex built-in command definitions shared by discovery, attachment precedence, and prompt completion | no |
 | `view/model-picks.ts` | Model and effort reading labels, open-option default annotations, and saved-value transitions | no |
 | `view/launcher.ts` | Browser-safe launcher contracts, compact CLI setup projection from exact supported launch choices, and accessible names for Create draft and the field pin | no |
 | `view/projectspend.ts` | Browser-safe Project cost display contracts, projections, ordering, and indexing timing | no |

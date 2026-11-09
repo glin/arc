@@ -222,12 +222,14 @@ export type NativeEvent = {
     }
 );
 
+export type CommandDiscoveryOutcome = 'unanswered' | 'success' | 'failed';
+
 export type WireEvent =
   | { kind: 'native'; event: NativeEvent }
   | { kind: 'responseStarted'; sourceId: string }
   | { kind: 'responseRate'; sourceId: string; rate: import('./outputrate').ResponseRate }
-  | { kind: 'ready'; commands: PromptEntry[] }
-  | { kind: 'commands'; commands: PromptEntry[]; optionalOnly?: boolean }
+  | { kind: 'ready'; commands: PromptEntry[]; commandOutcome?: CommandDiscoveryOutcome }
+  | { kind: 'commands'; commands: PromptEntry[]; optionalOnly?: boolean; commandOutcome?: CommandDiscoveryOutcome }
   | { kind: 'sessionInitialized'; sessionId: string; changed: boolean }
   // `previous` identifies the session the child left. It is null when the child first reports its identity.
   // A reset can change the session while retaining the process.

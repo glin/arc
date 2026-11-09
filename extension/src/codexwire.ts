@@ -5,6 +5,7 @@ import { SessionNameUncertain } from './sessionrename';
 import { promptToken } from './domain/composer-editing';
 import { compareVersion, parseVersion } from './domain/version';
 import { canonicalToolPath } from './toolownership';
+import { CODEX_COMMANDS } from './domain/codex-commands';
 import {
   codexRawSkills,
   codexSkillConfigurationRefusal,
@@ -119,13 +120,6 @@ export interface CodexWireOptions {
   // Request response deadline.
   deadlineMs?: number;
 }
-
-const CODEX_COMMANDS: readonly PromptEntry[] = [
-  { kind: 'command', name: 'compact', description: 'Compact the session', argumentHint: '' },
-  { kind: 'command', name: 'clear', description: 'Start a new session', argumentHint: '' },
-  { kind: 'command', name: 'new', description: 'Start and name a new session', argumentHint: '[name]' },
-  { kind: 'command', name: 'rename', description: 'Rename the session', argumentHint: '<name>' },
-];
 
 // A server error alone does not establish whether the request took effect.
 class RequestRefused extends Error {
@@ -539,12 +533,12 @@ export class CodexWire {
         if (this.sessionSkills) this.skillRefreshAgain = false;
         commands = await this.commandCatalog(false, deadline);
       } while (this.sessionSkills && this.skillRefreshAgain && !this.closed);
-      this.emit({ kind: 'ready', commands });
+      this.emit({ kind: 'ready', commands, commandOutcome: 'success' });
       return commands;
     } catch (error) {
       if (this.sessionSkills && this.optionalFailure) throw error;
       const commands = CODEX_COMMANDS.map((command) => ({ ...command }));
-      this.emit({ kind: 'ready', commands });
+      this.emit({ kind: 'ready', commands, commandOutcome: 'failed' });
       return commands;
     } finally {
       this.commandsOpening = false;
@@ -557,7 +551,7 @@ export class CodexWire {
   }
 
   private async commandCatalog(forceReload: boolean, deadline: number): Promise<PromptEntry[]> {
-    const commands = CODEX_COMMANDS.map((command) => ({ ...command }));
+    const commands: PromptEntry[] = CODEX_COMMANDS.map((command) => ({ ...command }));
     const result =
       this.sessionSkills && !this.optionalUnsupported
         ? await this.sessionSkillCatalog(deadline)
@@ -565,7 +559,7 @@ export class CodexWire {
             cwds: [this.cwd],
             ...(forceReload ? { forceReload: true } : {}),
           });
-    const names = new Set(commands.map((command) => command.name.toLowerCase()));
+    const names = new Set<string>();
     const skills = new Map<string, { name: string; path: string } | null>();
     for (const group of arr(result.data)) {
       for (const entry of arr(obj(group)?.skills)) {
@@ -589,7 +583,11 @@ export class CodexWire {
               : { name, path },
           );
         }
-        if (name && !names.has(name.toLowerCase())) {
+        if (
+          name &&
+          !names.has(name.toLowerCase()) &&
+          (path || !CODEX_COMMANDS.some((command) => command.name.toLowerCase() === name.toLowerCase()))
+        ) {
           commands.push({
             kind: 'skill',
             name,
@@ -747,10 +745,11 @@ export class CodexWire {
         try {
           const commands = await this.commandCatalog(true, deadline);
           if (!this.closed && (!this.sessionSkills || !this.skillRefreshAgain)) {
-            this.emit({ kind: 'commands', commands });
+            this.emit({ kind: 'commands', commands, commandOutcome: 'success' });
           }
         } catch {
           // Autocomplete retains its last complete catalog. Attachments require a successful current read.
+          if (!this.closed) this.emit({ kind: 'commands', commands: [], commandOutcome: 'failed' });
         }
       } while (this.skillRefreshAgain && !this.closed && !this.optionalFailure);
     };
@@ -1094,7 +1093,12 @@ export class CodexWire {
       content.push({ type: 'text', text: prompt.text });
     }
     const skill = token && this.skills.get(token.typed.toLowerCase());
-    if (token && skill && !CODEX_COMMANDS.some((command) => command.name.toLowerCase() === token.typed.toLowerCase())) {
+    if (
+      token &&
+      skill &&
+      (token.prefix === '$' ||
+        !CODEX_COMMANDS.some((command) => command.name.toLowerCase() === token.typed.toLowerCase()))
+    ) {
       content.push({ type: 'skill', name: skill.name, path: skill.path });
     }
     for (const asset of prompt.assets) {

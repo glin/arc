@@ -1,7 +1,27 @@
-import { PromptEntry } from './agentwire';
+import type { PromptEntry, CommandDiscoveryOutcome } from './agentwire';
+import * as path from 'node:path';
+import { comparableFolder } from './configwatch';
+
+export function commandConfiguration(launch: {
+  command: string;
+  leadingArgs: string[];
+  env: Record<string, string>;
+}): string {
+  return JSON.stringify([
+    launch.command,
+    launch.leadingArgs,
+    Object.entries(launch.env).sort(([left], [right]) => left.localeCompare(right)),
+  ]);
+}
+
+export function commandScope(agent: string, cwd: string, configuration = '', rules: path.PlatformPath = path): string {
+  return JSON.stringify([agent, comparableFolder(cwd, rules), configuration]);
+}
 
 export interface CommandCatalogSource {
   agent: string;
+  commandScope: string;
+  commandOutcome: CommandDiscoveryOutcome;
   commands: readonly PromptEntry[];
   key?: string;
   usageSource?: number;
@@ -81,8 +101,8 @@ export class CommandCatalogs {
     return commands;
   }
 
-  revision(agent: string): number {
-    return this.revisions.get(agent) ?? 0;
+  revision(scope: string): number {
+    return this.revisions.get(scope) ?? 0;
   }
 
   current(): Readonly<Record<string, readonly PromptEntry[]>> {
@@ -94,7 +114,8 @@ export class CommandCatalogs {
     update?: CommandCatalogUpdate,
     expectedRevision?: number,
   ): Record<string, PromptEntry[]> | null {
-    if (update && expectedRevision !== undefined && this.revision(update.agent) !== expectedRevision) {
+    const scope = update?.commandScope ?? '';
+    if (update && expectedRevision !== undefined && this.revision(scope) !== expectedRevision) {
       return null;
     }
 
@@ -125,13 +146,27 @@ export class CommandCatalogs {
     }
     const restricted =
       update?.key !== undefined && sources.some((source) => source.key === update.key && source.restricted);
-    if (update && !restricted && !update.optionalOnly && (update.complete || update.commands.length > 0)) {
-      next[update.agent] = update.commands.filter((entry) => !entry.sessionSkillRelease).map((entry) => ({ ...entry }));
-      this.revisions.set(update.agent, this.revision(update.agent) + 1);
+    if (
+      update &&
+      !restricted &&
+      !update.optionalOnly &&
+      update.commandOutcome !== 'failed' &&
+      update.commandOutcome !== 'unanswered' &&
+      (update.complete || update.commands.length > 0)
+    ) {
+      next[scope] = update.commands.filter((entry) => !entry.sessionSkillRelease).map((entry) => ({ ...entry }));
+      this.revisions.set(scope, this.revision(scope) + 1);
     }
     for (const source of sources) {
-      if (!source.restricted && !(source.agent in next) && source.commands.length > 0) {
-        next[source.agent] = source.commands
+      const sourceScope = source.commandScope;
+      if (
+        !source.restricted &&
+        !(sourceScope in next) &&
+        source.commandOutcome !== 'failed' &&
+        source.commandOutcome !== 'unanswered' &&
+        source.commands.length > 0
+      ) {
+        next[sourceScope] = source.commands
           .filter((entry) => !entry.sessionSkillRelease)
           .map((entry) => ({ ...entry }));
       }
@@ -141,5 +176,136 @@ export class CommandCatalogs {
     }
     this.lists = next;
     return next;
+  }
+}
+
+interface DiscoveryRead {
+  outcome: CommandDiscoveryOutcome;
+  attempts: number;
+  pending?: Promise<void>;
+  timer?: ReturnType<typeof setTimeout>;
+  controller?: AbortController;
+}
+
+// One scope shares its read and its bounded recovery cycle across all prompt boxes.
+export class CommandDiscovery {
+  private readonly reads = new Map<string, DiscoveryRead>();
+  private readonly owners = new Map<string, string>();
+  private disposed = false;
+  private active = 0;
+  private readonly waiting: Array<() => void> = [];
+
+  private enqueue(
+    read: (signal: AbortSignal) => Promise<CommandDiscoveryOutcome>,
+    signal: AbortSignal,
+  ): Promise<CommandDiscoveryOutcome> {
+    if (signal.aborted) return Promise.resolve('unanswered');
+    return new Promise((resolve, reject) => {
+      const cancel = () => {
+        const index = this.waiting.indexOf(start);
+        if (index < 0) return;
+        this.waiting.splice(index, 1);
+        resolve('unanswered');
+      };
+      const start = () => {
+        signal.removeEventListener('abort', cancel);
+        this.active++;
+        Promise.resolve()
+          .then(() => (signal.aborted ? ('unanswered' as const) : read(signal)))
+          .then(resolve, reject)
+          .finally(() => {
+            this.active--;
+            this.drain();
+          });
+      };
+      this.waiting.push(start);
+      signal.addEventListener('abort', cancel, { once: true });
+      this.drain();
+    });
+  }
+
+  private drain(): void {
+    while (this.active < 2 && this.waiting.length) this.waiting.shift()!();
+  }
+
+  request(
+    scope: string,
+    read: (signal: AbortSignal) => Promise<CommandDiscoveryOutcome>,
+    force = false,
+    owner = scope,
+  ): Promise<void> {
+    if (this.disposed) return Promise.resolve();
+    if (this.owners.get(owner) !== scope) this.cancel(owner);
+    this.owners.set(owner, scope);
+    let state = this.reads.get(scope);
+    if (!state) {
+      state = { outcome: 'unanswered', attempts: 0 };
+      this.reads.set(scope, state);
+    }
+    if (state.pending)
+      return state.controller?.signal.aborted
+        ? state.pending.then(() =>
+            this.owners.get(owner) === scope ? this.request(scope, read, force, owner) : undefined,
+          )
+        : state.pending;
+    if (force) {
+      clearTimeout(state.timer);
+      state.timer = undefined;
+      state.attempts = 0;
+      state.outcome = 'unanswered';
+    }
+    if (state.timer || state.outcome === 'success' || state.attempts >= 2) return Promise.resolve();
+    const current = state;
+    const controller = new AbortController();
+    current.controller = controller;
+    current.attempts++;
+    const pending = Promise.resolve()
+      .then(() => this.enqueue(read, controller.signal))
+      .then(
+        (outcome) => {
+          if (!controller.signal.aborted) current.outcome = outcome;
+        },
+        () => {
+          if (!controller.signal.aborted) current.outcome = 'failed';
+        },
+      )
+      .finally(() => {
+        current.pending = undefined;
+        if (controller.signal.aborted || this.disposed || ![...this.owners.values()].includes(scope)) return;
+        if (current.outcome === 'failed' && current.attempts < 2) {
+          current.timer = setTimeout(() => {
+            current.timer = undefined;
+            const owner = [...this.owners].find(([, ownedScope]) => ownedScope === scope)?.[0];
+            if (owner) void this.request(scope, read, false, owner);
+          }, 1_000);
+          current.timer.unref?.();
+        }
+      });
+    current.pending = pending;
+    return pending;
+  }
+
+  cancel(owner: string): void {
+    const scope = this.owners.get(owner);
+    this.owners.delete(owner);
+    if (!scope || [...this.owners.values()].includes(scope)) return;
+    const state = this.reads.get(scope);
+    if (!state) return;
+    clearTimeout(state.timer);
+    state.timer = undefined;
+    state.controller?.abort();
+    if (state.outcome !== 'success') {
+      state.attempts = 0;
+      state.outcome = 'unanswered';
+    }
+  }
+
+  cancelAll(matches: (scope: string) => boolean = () => true): void {
+    for (const [owner, scope] of [...this.owners]) if (matches(scope)) this.cancel(owner);
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    this.cancelAll();
   }
 }

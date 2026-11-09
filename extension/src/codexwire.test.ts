@@ -2267,6 +2267,7 @@ test('a Codex skill-change notification replaces the live command catalog', asyn
 
   assert.deepEqual(h.events.at(-1), {
     kind: 'commands',
+    commandOutcome: 'success',
     commands: [
       { kind: 'command', name: 'compact', description: 'Compact the session', argumentHint: '' },
       { kind: 'command', name: 'clear', description: 'Start a new session', argumentHint: '' },
@@ -2430,6 +2431,50 @@ test('a skill-list timeout leaves native autocomplete available', async () => {
     ['compact', 'clear', 'new', 'rename'],
   );
   assert.equal(h.events[0].kind, 'ready');
+  assert.equal((h.events[0] as Extract<WireEvent, { kind: 'ready' }>).commandOutcome, 'failed');
+});
+
+test('draft discovery distinguishes empty success from fallback failure and reports failed refresh', async () => {
+  const h = harness();
+  const opening = h.wire.commands();
+  reply(h, { data: [{ cwd: 'C:\\ws', skills: [] }] });
+  await opening;
+  assert.equal((h.events.at(-1) as Extract<WireEvent, { kind: 'ready' }>).commandOutcome, 'success');
+  h.wire.receive(JSON.stringify({ method: 'skills/changed', params: {} }));
+  const request = h.parsed().at(-1);
+  h.wire.receive(JSON.stringify({ id: request.id, error: { code: -32603, message: 'failed' } }));
+  await vi.waitFor(() =>
+    assert.equal((h.events.at(-1) as Extract<WireEvent, { kind: 'commands' }>).commandOutcome, 'failed'),
+  );
+  h.wire.close('test complete');
+});
+
+test('draft discovery keeps native fast mcp and compact dollar skills while slash compact stays a control', async () => {
+  const h = harness();
+  const listing = h.wire.commands();
+  reply(h, {
+    data: [
+      {
+        cwd: 'C:\\ws',
+        skills: ['fast', 'mcp', 'compact'].map((name) => ({ name, path: `C:/skills/${name}/SKILL.md`, enabled: true })),
+      },
+    ],
+  });
+  const commands = await listing;
+  assert.deepEqual(
+    commands.filter((entry) => entry.kind === 'skill').map((entry) => entry.name),
+    ['fast', 'mcp', 'compact'],
+  );
+  const started = h.wire.startThread({ cwd: 'C:\\ws' });
+  reply(h, { thread: { id: THREAD } });
+  await started;
+  for (const name of ['fast', 'mcp', 'compact']) {
+    assert.deepEqual((await turn(h, `$${name} work`)).input, [
+      { type: 'text', text: `$${name} work` },
+      { type: 'skill', name, path: `C:/skills/${name}/SKILL.md` },
+    ]);
+  }
+  h.wire.close('test complete');
 });
 
 test('Codex MCP inventory joins tool names to startup status and stays read-only', async () => {

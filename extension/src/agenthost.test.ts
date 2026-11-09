@@ -132,6 +132,7 @@ import { payloadSha256 } from './sessionwrites';
 import { LaunchPolicyStore } from './launchpolicystore.ts';
 import * as esbuild from 'esbuild';
 import { callSources, declarationSource, statementFrom, sourceMatch } from '../test/source-contract.ts';
+import { commandConfiguration } from './commandcatalog';
 
 const CLAUDE = { command: 'C:\\claude.exe', leadingArgs: [], env: {} };
 const CODEX = { command: 'node', leadingArgs: ['C:\\codex.js'], env: {} };
@@ -2615,6 +2616,7 @@ test('a Claude idle report leaves a prompt that is still being prepared open', a
   let accept: (() => void) | undefined;
   let emit: ((event: WireEvent) => void) | undefined;
   const plan: AgentPlan = {
+    commandConfiguration: '',
     agent: 'claude',
     sessionId: 'session',
     command: 'c',
@@ -2887,6 +2889,7 @@ test('Claude turn identity follows wire acceptance when a later prompt is accept
   const accepts: (() => void)[] = [];
   let emit: (event: WireEvent) => void = () => undefined;
   const plan: AgentPlan = {
+    commandConfiguration: '',
     agent: 'claude',
     sessionId: 'session',
     command: 'c',
@@ -2986,6 +2989,7 @@ test('stopping Claude clears prompts canceled from its queue', async () => {
 test('stopping Claude keeps a preparing prompt from becoming an open turn afterward', async () => {
   let accept: (() => void) | undefined;
   const plan: AgentPlan = {
+    commandConfiguration: '',
     agent: 'claude',
     sessionId: 'session',
     command: 'c',
@@ -3257,6 +3261,7 @@ test.each(['live', 'settled', 'reader-acted'] as const)(
     let reject!: (error: Error) => void;
     let accept!: (turn: string) => void;
     const plan: AgentPlan = {
+      commandConfiguration: '',
       agent: 'codex',
       sessionId: 'session',
       command: 'c',
@@ -3336,6 +3341,7 @@ test('Codex native turn identity binds early and obsolete response events to acc
   let emit!: (event: WireEvent) => void;
   let accept!: (id: string) => void;
   const plan: AgentPlan = {
+    commandConfiguration: '',
     agent: 'codex',
     sessionId: 'session',
     command: 'c',
@@ -3445,6 +3451,7 @@ test('Claude native events follow the shared owner after prompt preparation ends
   let accept!: () => void;
   let received: (() => void) | undefined;
   const plan: AgentPlan = {
+    commandConfiguration: '',
     agent: 'claude',
     sessionId: 'session',
     command: 'c',
@@ -3525,6 +3532,7 @@ test('a shared guarded Codex receipt leaves the native turn with the reader subm
   const accepts: ((id: string) => void)[] = [];
   const guards: (GuardedAttempt | undefined)[] = [];
   const plan: AgentPlan = {
+    commandConfiguration: '',
     agent: 'codex',
     sessionId: 'session',
     command: 'c',
@@ -5972,6 +5980,7 @@ function answeringPlan(answers: {
   models(): Promise<ModelList | null>;
 }): AgentPlan {
   return {
+    commandConfiguration: '',
     agent: 'claude',
     sessionId: null,
     command: 'c',
@@ -7199,6 +7208,81 @@ test('an agent that publishes no commands answers with none rather than failing 
   child.answerControl('list_models', { models: [] });
   const answers = await probe.answers;
   assert.deepEqual(answers.commands, [], 'an agent with no commands is not an agent that failed');
+});
+
+test.each([false, true])(
+  'draft discovery publishes Codex skills before usage and models answer with optional selection %s',
+  async (optional) => {
+    const child = new FakeChild();
+    const published: string[][] = [];
+    const plan = codexIdlePlan(
+      {
+        ...CODEX,
+        sessionSkills: optional
+          ? {
+              current: () => {
+                throw new Error('control-only discovery read the optional release');
+              },
+            }
+          : undefined,
+      },
+      { cwd: WS, clientInfo: CODEX_CLIENT },
+    );
+    const answers = askIdle(plan, () => child, undefined, undefined, undefined, undefined, false, {
+      onCommands: (commands, outcome) => {
+        assert.equal(outcome, 'success');
+        published.push(commands.map((command) => command.name));
+      },
+    });
+    void answers.catch(() => {});
+    child.reply({ userAgent: 'codex_cli_rs/0.167.0' });
+    await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'skills/list'));
+    child.reply({ data: [{ cwd: WS, skills: [{ name: 'recap', path: 'C:/skills/recap/SKILL.md', enabled: true }] }] });
+    await vi.waitFor(() => assert.deepEqual(published, [['compact', 'clear', 'new', 'rename', 'recap']]));
+    assert.equal(child.ended, false);
+    assert.equal(
+      child.sent().some((message) => /^(thread\/|turn\/|skills\/extraRoots)/.test(String(message.method))),
+      false,
+    );
+    child.replyTo('account/read', { account: { type: 'amazonBedrock' } });
+    child.replyTo('model/list', { data: [] });
+    assert.equal((await answers).commandOutcome, 'success');
+    child.exit(0);
+  },
+);
+
+test('draft discovery reports fallback failure and waits for the disposable child exit', async () => {
+  const child = new FakeChild();
+  const published: unknown[] = [];
+  let settled = false;
+  const answers = askIdle(
+    codexIdlePlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT }),
+    () => child,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    false,
+    {
+      controls: false,
+      onCommands: (commands, outcome) => published.push({ names: commands.map((command) => command.name), outcome }),
+    },
+  );
+  void answers.then(() => {
+    settled = true;
+  });
+  child.reply({ userAgent: 'codex_cli_rs/0.167.0' });
+  await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'skills/list'));
+  child.replyError(-32603, 'unavailable');
+  await vi.waitFor(() => assert.equal(child.ended, true));
+  assert.deepEqual(published, [{ names: ['compact', 'clear', 'new', 'rename'], outcome: 'failed' }]);
+  assert.equal(settled, false, 'failure escaped before the disposable child exited');
+  assert.equal(
+    child.sent().some((message) => /account\/|model\/|thread\/|turn\//.test(String(message.method))),
+    false,
+  );
+  child.exit(0);
+  assert.equal((await answers).commandOutcome, 'failed');
 });
 
 test('mixed Claude and Bedrock idle reads exclude Codex before limits and release refresh before catalogs', async () => {
@@ -8486,6 +8570,7 @@ function idleMcpDiscovery(
   const directories: string[] = [];
   const publications: string[] = [];
   const reads: string[] = [];
+  const commandReads: unknown[][] = [];
   const models = new ModelBook();
   let releaseModels!: (models: ModelList) => void;
   const catalog = new Promise<ModelList>((resolve) => {
@@ -8501,7 +8586,11 @@ function idleMcpDiscovery(
     askIdleMcp,
     liveMcpTarget,
     usage: new UsageBook(),
-    commandsAsked: new Set<string>(),
+    discoverCommands: async (...args: unknown[]) => {
+      commandReads.push(args);
+      publications.push('commands');
+    },
+    commandDiscovery: { cancel() {}, cancelAll() {} },
     commandLists: { revision: () => 0 },
     workspaceCwd: () => cwd,
     cliPath: () => '',
@@ -8601,6 +8690,7 @@ function idleMcpDiscovery(
     directories,
     publications,
     reads,
+    commandReads,
     releaseModels: () => releaseModels(A_MODEL_LIST),
     holdServers: () => {
       serverAnswer = new Promise((resolve) => {
@@ -8611,7 +8701,7 @@ function idleMcpDiscovery(
   };
 }
 
-test('a restricted session that is the only live child keeps its own MCP status while the idle read seeds the commands', async () => {
+test('a restricted session keeps its own MCP and usage reads while commands use independent discovery', async () => {
   const fixture = idleMcpDiscovery('claude', 'D:/Work/Owner-A', [
     { key: 'read-only', sessionId: 'owner-a', restricted: true },
   ]);
@@ -8619,14 +8709,10 @@ test('a restricted session that is the only live child keeps its own MCP status 
   await fixture.askAgent('claude', false, 'owner-a', 'D:/Work/Owner-A');
   assert.deepEqual(
     fixture.reads,
-    ['MCP read-only for owner-a'],
-    'the restricted session lost its MCP read or its usage read moved',
+    ['MCP read-only for owner-a', 'usage read-only'],
+    'the restricted session lost its MCP or usage read',
   );
-  assert.deepEqual(
-    fixture.directories,
-    ['D:/Work/Owner-A'],
-    'the idle read did not supply the commands, or an idle child also read MCP',
-  );
+  assert.deepEqual(fixture.directories, [], 'account discovery started an idle child despite the selected live child');
   assert.ok(fixture.publications.includes('commands'));
   assert.equal(
     fixture.mcp.revision('owner-a'),
@@ -8634,16 +8720,17 @@ test('a restricted session that is the only live child keeps its own MCP status 
     'the idle read began an initial MCP read and made the live answer obsolete',
   );
   assert.equal(fixture.mcp.needsInitialRead('owner-a'), true);
-  assert.equal(fixture.commandsAsked.has('claude'), true);
+  assert.deepEqual(fixture.commandReads, [['claude', 'D:/Work/Owner-A', false, 'owner-a']]);
 });
 
-test('an ordinary idle sibling supplies the commands and a restricted session keeps its own MCP status', async () => {
+test('a restricted session keeps MCP and usage ownership with an ordinary idle sibling', async () => {
   const fixture = idleMcpDiscovery('claude', 'D:/Work/Owner-A', [
     { key: 'read-only', sessionId: 'owner-a', restricted: true },
     { key: 'ordinary', sessionId: 'other' },
   ]);
   await fixture.askAgent('claude', false, 'owner-a', 'D:/Work/Owner-A');
-  assert.deepEqual(fixture.reads, ['MCP read-only for owner-a', 'usage ordinary']);
+  assert.deepEqual(fixture.reads, ['MCP read-only for owner-a', 'usage read-only']);
+  assert.deepEqual(fixture.commandReads, [['claude', 'D:/Work/Owner-A', false, 'owner-a']]);
   assert.deepEqual(fixture.directories, [], 'an idle child started although an ordinary live child could read');
 });
 
@@ -12665,6 +12752,7 @@ test('Claude preparation preserves configured homes without inventing a default'
     codexDefinition: path.join(root, 'skills/arc-sessions/SKILL.md'),
   };
   const build = runInNewContext(`(() => { ${compiledClaudePlan()} })()`, {
+    commandConfiguration,
     process,
     childEnv,
     claudePlanEnv: (env: Record<string, string>) => ({ ...env }),
@@ -12692,10 +12780,16 @@ test('Claude preparation preserves configured homes without inventing a default'
       clear();
       if (inherited !== undefined) process.env.CLAUDE_CONFIG_DIR = inherited;
       const env: Record<string, string> = wanted === undefined ? {} : { CLAUDE_CONFIG_DIR: wanted };
-      const prepared = build(
+      const ordinary = build(
         { ...CLAUDE, env, sessionSkills: { current: () => (available ? release : undefined) } },
         { cwd: WS },
-      ).prepare!();
+      );
+      const prepared = ordinary.prepare!();
+      assert.equal(
+        prepared.commandConfiguration,
+        ordinary.commandConfiguration,
+        'preparation changed the catalog identity',
+      );
       assert.equal(prepared.args.includes('--plugin-dir'), available);
       process.env.CLAUDE_CONFIG_DIR = 'changed-after-preparation';
       const child = childEnv(prepared.inheritedEnvironment!, prepared.env, 'claude', WS);
@@ -12825,6 +12919,7 @@ test.each([
   // A personal definition that appears after launch refuses the skill in the running child.
   let running = false;
   const build = runInNewContext(`(() => { ${compiled} })()`, {
+    commandConfiguration,
     process: {
       env: {
         PATH: bin,
@@ -13094,6 +13189,7 @@ function preparedSkillPlan(): { plan: AgentPlan; withheld: SessionComponentsWith
     withheld: (record) => withheld.push(record),
     environment: {},
     args: spawnArgs({ ...options, replayUserMessages: true }),
+    commandConfiguration: commandConfiguration(CLAUDE),
   });
   return { plan, withheld, plugin: release.claudePlugin };
 }

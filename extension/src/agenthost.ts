@@ -18,6 +18,7 @@ import { readFileSync, statSync } from 'node:fs';
 import { join, type PlatformPath } from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
 import { defaultsKey } from './configwatch';
+import { commandConfiguration, commandScope } from './commandcatalog';
 import { parseEnv } from 'node:util';
 import {
   ClaudeWire,
@@ -279,6 +280,8 @@ export interface SessionState {
   busy: boolean;
   asks: Ask[];
   commands: PromptEntry[];
+  commandScope: string;
+  commandOutcome: import('./agentwire').CommandDiscoveryOutcome;
   // Claude's `init` skill list. Empty until the child's first `init` message.
   skills: string[];
   lastError: string | null;
@@ -380,6 +383,7 @@ export interface Driver {
 
 // What to start, and how to talk to it once it is running.
 export interface AgentPlan {
+  commandConfiguration: string;
   prepare?(): AgentPlan;
   // The same launch without Arc's session plugins, for a child that refused them while running.
   withoutSessionComponents?(): AgentPlan;
@@ -452,6 +456,7 @@ export function claudePlan(
     withheld?: (record: SessionComponentsWithheld) => void;
     environment: NodeJS.ProcessEnv;
     args: string[];
+    commandConfiguration: string;
   },
 ): AgentPlan {
   options = { ...options, replayUserMessages: true };
@@ -543,6 +548,7 @@ export function claudePlan(
               withheld,
               environment,
               args,
+              commandConfiguration: commandConfiguration(launch),
             });
           },
         }
@@ -550,6 +556,7 @@ export function claudePlan(
     ...(prepared?.release
       ? { withoutSessionComponents: () => claudePlan(launch, options, { ...prepared, release: undefined }) }
       : {}),
+    commandConfiguration: prepared?.commandConfiguration ?? commandConfiguration(launch),
     inheritedEnvironment: prepared?.environment,
     policy: options.policy,
     agent: 'claude',
@@ -704,6 +711,7 @@ export function codexPlan(
             }),
         }
       : {}),
+    commandConfiguration: commandConfiguration(launch),
     inheritedEnvironment: prepared?.environment,
     policy: options.policy,
     agent: 'codex',
@@ -812,6 +820,7 @@ export async function checkCodexServiceTier(
 ): Promise<void> {
   if (runtime.signal?.aborted) throw new Error('The service tier check was cancelled.');
   const plan: AgentPlan = {
+    commandConfiguration: commandConfiguration(launch),
     agent: 'codex',
     sessionId: null,
     command: launch.command,
@@ -864,20 +873,11 @@ export async function checkCodexServiceTier(
 
 export function codexIdlePlan(
   launch: Launch,
-  options: { cwd: string; clientInfo: ClientInfo; model?: string },
-  prepared?: { release?: SessionSkillRelease; environment: NodeJS.ProcessEnv },
+  options: { cwd: string; clientInfo: ClientInfo; model?: string; discoverCommands?: boolean },
 ): AgentPlan {
   return {
-    ...(!prepared && launch.sessionSkills
-      ? {
-          prepare: () =>
-            codexIdlePlan(launch, options, {
-              release: codexSessionRelease(launch, options.cwd),
-              environment: { ...process.env },
-            }),
-        }
-      : {}),
-    inheritedEnvironment: prepared?.environment,
+    commandConfiguration: commandConfiguration(launch),
+    inheritedEnvironment: { ...process.env },
     agent: 'codex',
     sessionId: null,
     command: launch.command,
@@ -890,13 +890,6 @@ export function codexIdlePlan(
         emit,
         clientInfo: options.clientInfo,
         cwd: options.cwd,
-        sessionSkills: prepared?.release
-          ? {
-              release: prepared.release,
-              refresh: () => retainedSessionSkill(prepared.release!, launch.sessionSkills!),
-              withheld: (record) => launch.sessionSkills?.withheld?.({ ...record, cwd: options.cwd }),
-            }
-          : undefined,
       });
       return {
         receive: (line) => wire.receive(line),
@@ -904,7 +897,7 @@ export function codexIdlePlan(
           // No thread is started: this child will never be prompted, and opening one would
           // leave a session on disk the reader never asked for.
           await wire.initialize();
-          return await wire.commands();
+          return options.discoverCommands === false ? [] : await wire.commands();
         },
         prompt: () => Promise.reject(new Error('this child was started to be asked a question, not to run a turn')),
         compact: () =>
@@ -946,6 +939,7 @@ export function codexRenamePlan(
   options: { cwd: string; clientInfo: ClientInfo; threadId: string; title: string },
 ): AgentPlan {
   return {
+    commandConfiguration: commandConfiguration(launch),
     agent: 'codex',
     sessionId: options.threadId,
     command: launch.command,
@@ -1224,6 +1218,8 @@ export class AgentSession {
   private readonly child: ChildLike;
   private readonly asks = new Map<string, Ask>();
   private commands: PromptEntry[] = [];
+  readonly commandScope: string;
+  private commandOutcome: import('./agentwire').CommandDiscoveryOutcome = 'unanswered';
   private skills: string[] = [];
   private commandVersion = 0;
   private busy = false;
@@ -1303,6 +1299,7 @@ export class AgentSession {
     this.key = key;
     this.agent = plan.agent;
     this.cwd = plan.cwd;
+    this.commandScope = commandScope(plan.agent, plan.cwd, plan.commandConfiguration);
     this.policy = plan.policy;
     this.driver = plan.driver(
       (line) => this.child.stdin.write(line),
@@ -1379,6 +1376,8 @@ export class AgentSession {
       busy: this.busy || this.delivering.size > 0,
       asks: [...this.asks.values()],
       commands: this.commands,
+      commandScope: this.commandScope,
+      commandOutcome: this.commandOutcome,
       skills: this.skills,
       lastError: this.lastError,
       ready: this.ready,
@@ -1397,6 +1396,7 @@ export class AgentSession {
       const commands = await withDeadline(this.driver.open(), this.openingDeadlineMs);
       if (this.commandVersion === commandVersion) {
         this.commands = commands;
+        this.commandOutcome = 'success';
       }
       this.ready = true;
     } catch (error) {
@@ -2292,7 +2292,8 @@ export class AgentSession {
     // Publish command catalogs before event listeners read session state.
     // `start` also accepts the opening result when the driver emits no catalog event.
     if (event.kind === 'ready' || event.kind === 'commands') {
-      this.commands = event.commands;
+      if (!('optionalOnly' in event && event.optionalOnly)) this.commandOutcome = event.commandOutcome ?? 'success';
+      if (event.commandOutcome !== 'failed' || !this.commands.length) this.commands = event.commands;
       this.commandVersion += 1;
     }
     if (event.kind === 'skills') {
@@ -2518,6 +2519,7 @@ export interface IdleAnswers {
   // Commands returned by the opening handshake, available before the reader sends a prompt.
   // Empty when the completed handshake publishes none.
   commands: PromptEntry[];
+  commandOutcome: import('./agentwire').CommandDiscoveryOutcome;
 }
 
 // Reads account usage and model catalogs through one idle child, then closes it.
@@ -2530,7 +2532,13 @@ export async function askIdle(
   admit: () => boolean = () => true,
   onDiscovery: (supported: boolean | null, source: number) => boolean = () => true,
   force = false,
+  options: {
+    onCommands?: (commands: PromptEntry[], outcome: import('./agentwire').CommandDiscoveryOutcome) => void;
+    controls?: boolean;
+    signal?: AbortSignal;
+  } = {},
 ): Promise<IdleAnswers> {
+  if (options.signal?.aborted) throw new Error('The command read was cancelled.');
   const session = new AgentSession(
     'idle',
     prepareAgentPlan(plan),
@@ -2539,15 +2547,23 @@ export async function askIdle(
     () => {},
     openingDeadlineMs,
   );
+  const cancel = () => {
+    void session.dispose();
+  };
+  options.signal?.addEventListener('abort', cancel, { once: true });
   try {
     await session.start();
     const failed = session.state().lastError;
     if (failed) {
       throw new Error(failed);
     }
-    if (!admit()) return { usage: null, usageFailure: '', models: null, commands: [] };
+    if (!admit() || options.signal?.aborted)
+      return { usage: null, usageFailure: '', models: null, commands: [], commandOutcome: 'unanswered' };
     // The completed handshake has already supplied commands.
     const commands = session.state().commands;
+    const commandOutcome = session.state().commandOutcome;
+    options.onCommands?.(commands, commandOutcome);
+    if (options.controls === false) return { usage: null, usageFailure: '', models: null, commands, commandOutcome };
     // Exclude MCP status here because that read waits for server connections.
     // Account usage and model requests run independently through the same child.
     let usageFailure = '';
@@ -2591,12 +2607,15 @@ export async function askIdle(
       usageFailure,
       models,
       commands,
+      commandOutcome,
       ...(commands.some((command) => command.sessionSkillRelease)
         ? { child: { key: session.key, usageSource: session.usageSource } }
         : {}),
     };
   } finally {
-    void session.dispose();
+    options.signal?.removeEventListener('abort', cancel);
+    if (options.controls === false) await session.dispose();
+    else void session.dispose();
   }
 }
 

@@ -4,7 +4,7 @@
 
 ## Checks before startup and input
 
-Arc checks optional skills and hooks before starting a process for live sessions, recovery, replacement, or idle discovery. Processes started only to rename a session receive neither. Arc fixes the environment and bundled release before launch. Windows configuration-home selection remains case-insensitive through launch. Running processes keep their release across extension updates.
+Arc checks optional skills and hooks before starting a process for live sessions, recovery, or replacement. Claude idle discovery receives the same checks. Processes started only to rename a session and Codex control-only discovery processes receive neither. Arc fixes the environment before launch and the bundled release before launching input-capable children. Windows configuration-home selection remains case-insensitive through launch. Running processes keep their release across extension updates.
 
 Claude loads the skill plugin and snapshot plugin separately through repeated `--plugin-dir` arguments. Both plugins come from the same immutable release. Arc reads settings once before choosing them. The running Claude process must report version `>=2.1.310 <3.0.0` in its initialize response.
 
@@ -48,7 +48,7 @@ Arc treats absent `skills` and `skills: null` as no skill configuration. It stil
 
 Any existing matching raw skill entry prevents registration, including an enabled link to the selected definition. After registration, Arc retains only the exact enabled Arc-owned entry. Arc registers only its immutable root through `skills/extraRoots/set` and requires an empty object acknowledgment.
 
-Arc repeats skill discovery and settings checks before start, resume, or fork. Idle processes open no thread.
+Arc repeats skill discovery and settings checks before start, resume, or fork. Codex control-only processes open no thread and register no optional skill root. Ordinary command discovery remains available without those optional checks.
 
 ## Platform checks
 
