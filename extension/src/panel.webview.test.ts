@@ -4197,6 +4197,8 @@ test('command-only admission removes pending rows through every catalog path and
       codexMetas: { revision: 0, keys: () => [] },
       codexStats: { keys: () => [] },
       compressedRollouts: new Set<string>(),
+      compressedFacts: new Map(),
+      adoptionsUnsettled: new Map(),
       subagentDirectories: { sweep() {} },
       cwds: new Map(),
       humanScans: new Map(),
@@ -6933,6 +6935,8 @@ test('window session pages lose coverage when a served transcript is replaced at
       codexMetas: { revision: 0, keys: () => [] },
       codexStats: { keys: () => [] },
       compressedRollouts: new Set<string>(),
+      compressedFacts: new Map(),
+      adoptionsUnsettled: new Map(),
       subagentDirectories: { sweep() {} },
       cwds: new Map(),
       humanScans: new Map(),
@@ -12329,7 +12333,7 @@ test('derived session caches load, trim against the walk, and checkpoint after f
   sourceMatch(disposeBody, /this\.writeDerivedCache\(\)/, 'shutdown does not flush a checkpoint that is still waiting');
   sourceMatch(
     panelHostSource,
-    /saveDerivedCache\(file, this\.titles, this\.claudeChildReferenceEntries, this\.carriedNames, undefined, this\.discoveryCheckpoint, this\.commitRepositories\.snapshot\(\), undefined, this\.savedLinks, \[\.\.\.\(this\.savedPromptScans \?\? \[\]\), \.\.\.\(this\.humanScans \?\? \[\]\)\]\)/,
+    /saveDerivedCache\(file, this\.titles, this\.claudeChildReferenceEntries, this\.carriedNames, undefined, this\.discoveryCheckpoint, this\.commitRepositories\.snapshot\(\), undefined, this\.savedLinks, \[\.\.\.\(this\.savedPromptScans \?\? \[\]\), \.\.\.\(this\.humanScans \?\? \[\]\)\], \[\.\.\.\(this\.adoptionsUnsettled \?\? \[\]\)\]\.map\(/,
     'the derived cache has no durable write path',
   );
   sourceMatch(
@@ -28002,6 +28006,8 @@ function queueRecoveryProvider(comments: ReturnType<typeof applyComment> = []) {
     typedRenames: new Map(),
     repositoryScopeReady: true,
     compressedRollouts: new Set<string>(),
+    compressedFacts: new Map(),
+    adoptionsUnsettled: new Map(),
     pendingQueueDrains: new Set<string>(),
     attachmentStorageDir: null,
     clearSettlements: new Map(),

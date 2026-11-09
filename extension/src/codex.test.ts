@@ -15545,33 +15545,38 @@ const compressedTwin = (plain: string) => {
   return `${plain}.zst`;
 };
 
-test.skipIf(!zstdEncode)('a rollout and its compressed twin give one row in every order they appear', () => {
-  const orders = {
-    'twin first': ['twin', 'plain'],
-    'plain first': ['plain', 'twin'],
-    'both at once': ['both'],
-  } as const;
-  for (const [order, steps] of Object.entries(orders)) {
-    const root = sessionsRoot([{ day: '2026/08/25', name: ROLLOUT(UUID_A), records: [meta({ id: UUID_A })] }]);
-    const plain = path.join(root, '2026', '08', '25', ROLLOUT(UUID_A));
-    const body = fs.readFileSync(plain);
-    fs.unlinkSync(plain);
-    const seen: { rows: number; files: readonly string[]; compressed: readonly string[] | undefined }[] = [];
-    for (const step of steps) {
-      if (step !== 'plain') fs.writeFileSync(`${plain}.zst`, zstdEncode!(body));
-      if (step !== 'twin') fs.writeFileSync(plain, body);
-      const listing = codexSessionFiles(root, ['c:\\repo']);
-      seen.push({ rows: listing.sessions.length, files: listing.walked, compressed: listing.enumeration.compressed });
+test.skipIf(!zstdEncode)(
+  'the walk lists a twin without a row until its plain rollout appears, then one row for the pair',
+  () => {
+    const orders = {
+      'twin first': ['twin', 'plain'],
+      'plain first': ['plain', 'twin'],
+      'both at once': ['both'],
+    } as const;
+    for (const [order, steps] of Object.entries(orders)) {
+      const root = sessionsRoot([{ day: '2026/08/25', name: ROLLOUT(UUID_A), records: [meta({ id: UUID_A })] }]);
+      const plain = path.join(root, '2026', '08', '25', ROLLOUT(UUID_A));
+      const body = fs.readFileSync(plain);
+      fs.unlinkSync(plain);
+      const twinOnly = { rows: 0, files: [], compressed: [`${plain}.zst`] };
+      const plainOnly = { rows: 1, files: [plain], compressed: [] };
+      const pair = { rows: 1, files: [plain], compressed: [`${plain}.zst`] };
+      const expected = { 'twin first': [twinOnly, pair], 'plain first': [plainOnly, pair], 'both at once': [pair] }[
+        order as keyof typeof orders
+      ];
+      steps.forEach((step, event) => {
+        if (step !== 'plain') fs.writeFileSync(`${plain}.zst`, zstdEncode!(body));
+        if (step !== 'twin') fs.writeFileSync(plain, body);
+        const listing = codexSessionFiles(root, ['c:\\repo']);
+        assert.deepEqual(
+          { rows: listing.sessions.length, files: listing.walked, compressed: listing.enumeration.compressed },
+          expected[event],
+          `${order}, event ${event}`,
+        );
+      });
     }
-    const twinOnly = { rows: 0, files: [], compressed: [`${plain}.zst`] };
-    const plainOnly = { rows: 1, files: [plain], compressed: [] };
-    const pair = { rows: 1, files: [plain], compressed: [`${plain}.zst`] };
-    const expected = { 'twin first': [twinOnly, pair], 'plain first': [plainOnly, pair], 'both at once': [pair] }[
-      order as keyof typeof orders
-    ];
-    assert.deepEqual(seen, expected, order);
-  }
-});
+  },
+);
 
 test.skipIf(!zstdEncode)('only a lower-case compressed rollout name joins the walk, on every platform', () => {
   const root = sessionsRoot(

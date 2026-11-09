@@ -139,6 +139,16 @@ import { TURN_QUIET_MS, statusOf } from './turncard';
 import { DispatchReceipts } from './dispatchreceipts';
 import { admittedDispatchReferences } from './turnrail';
 import {
+  adoptCompressedTwin,
+  compressedEntryBatches,
+  compressedEntryVersions,
+  compressedOpeningEntry,
+  compressedPairKey,
+  CompressedStoreHolder,
+  readCompressedStore,
+  type CompressedFactEntry,
+} from './compressedstore';
+import {
   compressedByteSource,
   compressedStat,
   decodeCompressedRollout,
@@ -584,11 +594,83 @@ function revive(checkpoint: ProgressiveCheckpoint | undefined): ProgressiveCheck
   return checkpoint;
 }
 
+// One holder per store directory, for the life of the worker.
+const compressedHolders = new Map<string, CompressedStoreHolder>();
+let compressedWriteBytes = 0;
+
+function compressedHolder(directory: string): CompressedStoreHolder {
+  let holder = compressedHolders.get(directory);
+  if (!holder) {
+    holder = new CompressedStoreHolder(directory, { wrote: (bytes) => (compressedWriteBytes += bytes) });
+    compressedHolders.set(directory, holder);
+  }
+  return holder;
+}
+
+function takeCompressedWriteBytes(): number {
+  const bytes = compressedWriteBytes;
+  compressedWriteBytes = 0;
+  return bytes;
+}
+
+async function executeCompressedAdopt(
+  request: Extract<ProgressiveRequest, { kind: 'compressed-adopt' }>,
+): Promise<ProgressiveValue> {
+  const result = await adoptCompressedTwin(request.adoption);
+  await compressedHolder(request.stores.facts).append([result.entry]);
+  if (result.adopted && result.entry.opening)
+    await compressedHolder(request.stores.openings).append([compressedOpeningEntry(result.entry)]);
+  return {
+    kind: 'compressed-adopt',
+    adopted: result.adopted,
+    entry: result.entry,
+    writeBytes: takeCompressedWriteBytes(),
+  };
+}
+
+// The worker posts at most one batch per second, of 4 MiB or one larger record.
+async function executeCompressedLoad(
+  request: Extract<ProgressiveRequest, { kind: 'compressed-load' }>,
+  signal: AbortSignal,
+  acknowledge?: (value: ProgressiveValue) => void,
+): Promise<ProgressiveValue> {
+  const facts = [...readCompressedStore(request.stores.facts).entries.values()].filter((entry) => !entry.nameOnly);
+  const batches = compressedEntryBatches(facts);
+  for (let at = 0; at < batches.length - 1 && !signal.aborted; at++) {
+    acknowledge?.({ kind: 'compressed-load', entries: batches[at], done: false });
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+  }
+  return { kind: 'compressed-load', entries: signal.aborted ? [] : (batches.at(-1) ?? []), done: true };
+}
+
+// Each list from the host is the complete set. The worker records every name without an entry for the backfill. It
+// decodes none of them.
+function noteCompressedNames(list: readonly string[], stores: import('./compressedstore').CompressedStorePaths): void {
+  let stored: ReadonlyMap<string, CompressedFactEntry>;
+  try {
+    stored = readCompressedStore(stores.facts).entries;
+  } catch {
+    stored = new Map();
+  }
+  // A name that the store holds in any form needs no second record. The backfill tests a stored entry for currency.
+  const records = list
+    .filter((name) => !stored.has(name))
+    .map((file): CompressedFactEntry => ({
+      file,
+      pairKey: compressedPairKey(file),
+      ...compressedEntryVersions(),
+      nameOnly: true,
+    }));
+  if (records.length) void compressedHolder(stores.facts).append(records);
+}
+
 async function execute(
   request: ProgressiveRequest,
   signal: AbortSignal,
   acknowledge?: (value: ProgressiveValue) => void,
 ): Promise<ProgressiveValue> {
+  if (request.kind === 'compressed-adopt') return executeCompressedAdopt(request);
+  if (request.kind === 'compressed-load') return executeCompressedLoad(request, signal, acknowledge);
   if (request.kind === 'codex-context') {
     if (isCompressedRollout(request.session.file)) return { kind: 'codex-context', estimate: null };
     const revision = revisionOf(request.session.file);
@@ -2595,7 +2677,11 @@ async function handleMessage(message: {
         });
       return;
     }
-    if (request.kind === 'claude-children') {
+    if (
+      request.kind === 'claude-children' ||
+      request.kind === 'compressed-adopt' ||
+      request.kind === 'compressed-load'
+    ) {
       // A cancelled request keeps the receipt scan, so the next request resumes it where this one stopped.
       const value = await execute(request, controller.signal, (value) => {
         noteBackground('discoveryProgress');
@@ -2612,6 +2698,8 @@ async function handleMessage(message: {
           result: { generation: message.generation, revision: null, value, workerMemory: workerMemory() },
         });
       }
+      if (request.kind === 'claude-children' && request.compressed && request.compressedStores)
+        noteCompressedNames(request.compressed, request.compressedStores);
       return;
     }
     const file = 'session' in request ? request.session.file : request.input.session.file;

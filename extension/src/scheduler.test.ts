@@ -373,6 +373,83 @@ test('a compressed twin rides with the next batch and the plain rollout alone de
   }
 });
 
+// A delete or rename of a listed rollout is a form change when the twin exists. The host decides that from the wake
+// batch, its set of compressed rollouts or one stat, and the decision takes no walk.
+test('a delete of a listed rollout whose twin exists is a form change, whichever order the watcher delivers', () => {
+  const plain = path.join('records', 'rollout-2026-08-25T12-00-00-01a032c9-1a92-7931-845c-723117d24dbe.jsonl');
+  const twin = `${plain}.zst`;
+  const known = (file: string) => file === plain;
+  const decide = (events: [string, string][], formChange: (file: string) => boolean) => {
+    const pending = new PendingWatcherWake();
+    for (const [name, kind] of events) pending.noteFileEvent('records', path.basename(name), kind);
+    return watcherRefreshDecision(pending.take(), known, undefined, undefined, formChange);
+  };
+  for (const [order, events] of Object.entries({
+    'twin event first': [
+      [twin, 'rename'],
+      [plain, 'rename'],
+    ],
+    'plain delete first': [
+      [plain, 'rename'],
+      [twin, 'rename'],
+    ],
+    'plain delete alone': [[plain, 'rename']],
+  }) as [string, [string, string][]][]) {
+    const decision = decide(events, (file) => file === plain);
+    assert.deepEqual(
+      [decision.kind, decision.formChanges ?? [], decision.changedPaths, decision.broadReasons],
+      ['targeted', [plain], [], []],
+      order,
+    );
+  }
+  assert.deepEqual(
+    decide([[plain, 'rename']], () => false).broadReasons,
+    ['createOrRename'],
+    'a delete with no twin must walk',
+  );
+  // A changed rollout with no form change keeps its targeted refresh beside a form change of another rollout.
+  const other = path.join('records', 'rollout-other.jsonl');
+  const pending = new PendingWatcherWake();
+  pending.noteFileEvent('records', path.basename(plain), 'rename');
+  pending.noteFileEvent('records', path.basename(other), 'change');
+  const mixed = watcherRefreshDecision(
+    pending.take(),
+    (file) => file === plain || file === other,
+    undefined,
+    undefined,
+    (file) => file === plain,
+  );
+  assert.deepEqual([mixed.kind, mixed.changedPaths, mixed.formChanges], ['targeted', [other], [plain]]);
+});
+
+test('a broad batch walks and decides no form change, and an unlisted delete walks', () => {
+  const plain = path.join('records', 'rollout-x.jsonl');
+  const broad = new PendingWatcherWake();
+  broad.noteFileEvent('records', path.basename(plain), 'rename');
+  broad.requireBroad('transcript');
+  const decision = watcherRefreshDecision(
+    broad.take(),
+    () => true,
+    undefined,
+    undefined,
+    () => true,
+  );
+  assert.equal(decision.kind, 'broad');
+  assert.equal(decision.formChanges, undefined);
+  const unlisted = new PendingWatcherWake();
+  unlisted.noteFileEvent('records', path.basename(plain), 'rename');
+  assert.deepEqual(
+    watcherRefreshDecision(
+      unlisted.take(),
+      () => false,
+      undefined,
+      undefined,
+      () => true,
+    ).broadReasons,
+    ['createOrRename'],
+  );
+});
+
 test('only a lower-case compressed rollout name joins a batch, on every platform', () => {
   const id = '01a032c9-1a92-7931-845c-723117d24dbe';
   const names = [

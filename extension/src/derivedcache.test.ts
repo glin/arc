@@ -26,6 +26,24 @@ import {
 // The newest generation the legacy cache format was written at.
 const LEGACY_GENERATION = 64;
 
+test('the derived cache keeps the plain path of an unsettled adoption across a restart', () => {
+  const cache = path.join(tempDir('derived-unsettled'), 'derived-session-cache-v2.json');
+  saveDerivedCache(
+    cache,
+    [],
+    [],
+    [],
+    undefined,
+    undefined,
+    [],
+    undefined,
+    undefined,
+    [],
+    [['plain.jsonl', 'plain.jsonl.zst']],
+  );
+  assert.deepEqual([...loadDerivedCache(cache).unsettledAdoptions!], [['plain.jsonl', 'plain.jsonl.zst']]);
+});
+
 test('verified commit cache bounds and validates its independent observation format', () => {
   const directory = folder();
   const file = path.join(directory, 'source.jsonl');

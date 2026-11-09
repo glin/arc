@@ -6,6 +6,7 @@ import * as fs from 'node:fs';
 import * as zlib from 'node:zlib';
 import { createHash } from 'node:crypto';
 import { tempDir } from './temproot.ts';
+import { readCompressedStore } from './compressedstore.ts';
 import * as path from 'node:path';
 import { buildSync } from 'esbuild';
 import { once } from 'node:events';
@@ -15144,3 +15145,72 @@ test('worker requests outside the opening path refuse a compressed rollout', asy
     worker.stop();
   }
 });
+
+const compressedSpend = { file: 'x', complete: true, buckets: [], lifetimeBuckets: [] } as never;
+
+test.skipIf(!zstdCompress)(
+  'the worker adopts a twin, loads it from the store and records the names of a compressed list',
+  async () => {
+    const root = tempDir('worker-compressed-');
+    const id = '01a032c9-1a92-7931-845c-723117d24dbe';
+    const plain = path.join(root, `rollout-2026-08-25T12-00-00-${id}.jsonl`);
+    const twin = `${plain}.zst`;
+    const first = `${JSON.stringify({ type: 'session_meta', timestamp: '2026-08-25T12:00:00Z', payload: { id, cwd: root } })}\n`;
+    fs.writeFileSync(twin, zstdCompress!(Buffer.from(first)));
+    const other = path.join(root, `rollout-2026-08-26T12-00-00-${id.replace(/1a92/, '2b93')}.jsonl.zst`);
+    fs.writeFileSync(other, zstdCompress!(Buffer.from(first)));
+    const mtime = new Date(1_700_000_000_000);
+    fs.utimesSync(twin, mtime, mtime);
+    const stores = { facts: path.join(root, 'facts'), openings: path.join(root, 'openings') };
+    const worker = new ProgressiveWorker(`process.env.ARC_HOME=${JSON.stringify(root)};` + source);
+    const signal = new AbortController().signal;
+    try {
+      const adopted = await worker.run(
+        {
+          kind: 'compressed-adopt',
+          adoption: {
+            twin,
+            plain,
+            plainMtimeMs: mtime.getTime(),
+            title: { label: 'Keep', fullLabel: 'Keep' } as never,
+            opening: { sessionId: id, cwd: root } as never,
+            spend: compressedSpend,
+          },
+          stores,
+        },
+        1,
+        signal,
+      );
+      assert.ok(adopted?.value.kind === 'compressed-adopt' && adopted.value.adopted, 'the adoption failed');
+      assert.equal(adopted.value.entry.adopted, true);
+      assert.ok(adopted.value.writeBytes > 0, 'the worker reported no store write');
+      const stored = readCompressedStore(stores.facts).entries.get(twin);
+      assert.equal(stored?.title?.label, 'Keep');
+      assert.ok(readCompressedStore(stores.openings).entries.get(twin)?.opening, 'the machine store holds no opening');
+      const loaded = await worker.run({ kind: 'compressed-load', stores }, 2, signal);
+      assert.ok(loaded?.value.kind === 'compressed-load' && loaded.value.done);
+      assert.deepEqual(
+        loaded.value.entries.map((entry) => entry.file),
+        [twin],
+      );
+      await worker.run(
+        {
+          kind: 'claude-children',
+          parents: [],
+          repositoryRoots: [root],
+          compressed: [twin, other],
+          compressedStores: stores,
+        } as never,
+        3,
+        signal,
+      );
+      await vi.waitFor(() => {
+        const read = readCompressedStore(stores.facts).entries;
+        assert.equal(read.get(other)?.nameOnly, true, 'the worker did not record a name without an entry');
+        assert.equal(read.get(twin)?.nameOnly, undefined, 'a name with an entry was overwritten');
+      });
+    } finally {
+      worker.stop();
+    }
+  },
+);

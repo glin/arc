@@ -67,6 +67,17 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { isDeepStrictEqual } from 'node:util';
 import * as zlib from 'node:zlib';
 import { compressedRolloutsReadable, isCompressedRollout } from './compressedrollouts.ts';
+import { compressedSpendDisplayFiles } from './projectspend.ts';
+import { isAgentRun, isHiddenThread, staleMetas } from './codex.ts';
+import { arcHome } from './store.ts';
+import {
+  COMPRESSED_FACTS_STORE,
+  COMPRESSED_OPENINGS_STORE,
+  compressedTitleCurrent,
+  withKeptUndercount,
+  adoptCompressedTwin,
+  type CompressedAdoptionInput,
+} from './compressedstore.ts';
 import ts from 'typescript';
 import { agentSpendIsOpen, heaviestModel, spendFileVersion, spendTokens } from './agentspend';
 import {
@@ -2676,6 +2687,14 @@ function harness(pendingRefresh = false, registerRefreshHandler = true, extraMet
     'refineDispatchedSpend',
   );
   methods.push(...extraMethods);
+  methods.push(
+    'compressedRolloutsToSend',
+    'compressedStorePaths',
+    'compressedSpendPick',
+    'titleEntryOf',
+    'compressedTitleOf',
+    'compressedCarriedNameOf',
+  );
   const body = owner.members
     .filter((member) => member.name && methods.includes(member.name.getText(file)))
     .map((member) => member.getText(file))
@@ -2744,6 +2763,16 @@ function harness(pendingRefresh = false, registerRefreshHandler = true, extraMet
     'CATALOG_REFRESH_DEADLINE_MS',
     'DISPATCH_FIGURES_REFRESH_MS',
     'SessionLoadingLine',
+    'COMPRESSED_FACTS_STORE',
+    'COMPRESSED_OPENINGS_STORE',
+    'compressedTitleCurrent',
+    'withKeptUndercount',
+    'compressedSpendDisplayFiles',
+    'normalizeSpendFile',
+    'isAgentRun',
+    'arcHome',
+    'path',
+    'readRolloutStat',
     compiled,
   )(
     module,
@@ -2754,6 +2783,16 @@ function harness(pendingRefresh = false, registerRefreshHandler = true, extraMet
     CATALOG_REFRESH_DEADLINE_MS,
     DISPATCH_FIGURES_REFRESH_MS,
     SessionLoadingLine,
+    COMPRESSED_FACTS_STORE,
+    COMPRESSED_OPENINGS_STORE,
+    compressedTitleCurrent,
+    withKeptUndercount,
+    compressedSpendDisplayFiles,
+    normalizeSpendFile,
+    isAgentRun,
+    arcHome,
+    path,
+    readRolloutStat,
   );
   const provider = guardedHarness(new module.exports.Harness());
   if (registerRefreshHandler) {
@@ -2936,7 +2975,22 @@ function completeDiscoveryHarness(
     );
   }
   if (names.includes('allSessions')) names.push('walkedSessions');
-  if (names.includes('walkedSessions') || names.includes('runPendingWatch')) names.push('noteCompressedRollouts');
+  if (names.includes('walkedSessions') || names.includes('runPendingWatch'))
+    names.push(
+      'noteCompressedRollouts',
+      'beginCompressedAdoption',
+      'adoptCompressedTwin',
+      'compressedStorePaths',
+      'applyCompressedEntries',
+      'compressedFactsChanged',
+      'invalidateProjectSpendSnapshot',
+    );
+  if (names.includes('walkedSessions')) names.push('compressedRowsOf');
+  if (names.includes('runPendingWatch')) names.push('compressedFormChange');
+  if (names.includes('browserPainted'))
+    names.push('maybeStartCompressedLoad', 'loadCompressedFacts', 'applyCompressedEntries', 'compressedStorePaths');
+  names.push('compressedRolloutsToSend', 'compressedStorePaths');
+  names.push('compressedSpendPick', 'titleEntryOf', 'compressedTitleOf', 'compressedCarriedNameOf');
   if (names.includes('allSessions') || names.includes('runPendingWatch')) names.push('currentWalkedCatalog');
   if (names.includes('runPendingWatch')) names.push('grownMemberMiss');
   if (names.includes('prepareClaudeChildren')) names.push('startedSources', 'applyDispatchFacts');
@@ -2988,6 +3042,7 @@ function completeDiscoveryHarness(
       repositoryCommits = new RepositoryCommits({ run: async () => null }, () => {});
       _showing = null; selections = []; messages = []; partial = []; catalog = null; drawnCards = [];
       coverageRevision = 0; enumeratedAdmissionComplete = true; claudeChildren = []; compressedRollouts = new Set();
+      compressedLoadPending = false; compressedRolloutsRevision = 0; compressedFacts = new Map(); compressedFactsRevision = 0; adoptionsUnsettled = new Map(); compressedSpendPicks = new WeakMap();
       authoritativeCatalog = null; attachmentHandoffs = new Set(); titles = new Map();
       metadataRevision = 0; drawnMetadataRevision = 0; startupProgressAt = 0;
       derivedCacheCheckpointState = { markChanged() {} };
@@ -3142,6 +3197,10 @@ function completeDiscoveryHarness(
     'SessionLoadingLine',
     'pendingResponseSessionAdmitted',
     'sessionDiscoveryMembership',
+    'path',
+    'COMPRESSED_FACTS_STORE',
+    'COMPRESSED_OPENINGS_STORE',
+    'arcHome',
     ...Object.keys(scope),
     compiled,
   )(
@@ -3194,6 +3253,10 @@ function completeDiscoveryHarness(
     SessionLoadingLine,
     pendingResponseSessionAdmitted,
     sessionDiscoveryMembership,
+    path,
+    COMPRESSED_FACTS_STORE,
+    COMPRESSED_OPENINGS_STORE,
+    arcHome,
     ...Object.values(scope),
   );
   const provider = guardedHarness(new module.exports.Harness());
@@ -3230,6 +3293,7 @@ function railEnrichmentHarness(
     `
     export class Harness {
       ${OPTIONAL_PANEL_PROVIDER_STUBS}
+      titleEntryOf(file) { return this.titles.get(file); }
       sessionQueryContext() { return undefined; }
       publishSessionQueryContext() {}
       failSessionLoading() {}
@@ -3307,6 +3371,7 @@ function metadataHarness(
   const method = owner.members.find((member) => member.name?.getText(file) === 'prepareMetadata');
   assert.ok(method);
   const naming = ['observeStoredName', 'observeStoredEntry'];
+  naming.push('titleEntryOf', 'compressedTitleOf', 'compressedCarriedNameOf');
   const real = owner.members.filter((member) => member.name && naming.includes(member.name.getText(file)));
   assert.equal(real.length, naming.length, 'panelhost.ts no longer reports a stored metadata entry to the name owner');
   const names = sessionNames
@@ -3324,7 +3389,17 @@ function metadataHarness(
       .slice(at, at + 2)
       .map((statement) => statement.getText(file))
       .join('\n');
-    const drawn = ['sessionLabel', 'claudeName', 'titleFor', 'fullTitleFor', 'metaFor', 'writeDerivedCache'];
+    const drawn = [
+      'sessionLabel',
+      'claudeName',
+      'titleFor',
+      'fullTitleFor',
+      'metaFor',
+      'titleEntryOf',
+      'compressedTitleOf',
+      'compressedCarriedNameOf',
+      'writeDerivedCache',
+    ];
     const members = owner.members.filter((member) => member.name && drawn.includes(member.name.getText(file)));
     assert.equal(members.length, drawn.length, 'panelhost.ts no longer names sessions through these methods');
     drawing = members.map((member) => member.getText(file)).join('\n');
@@ -3373,6 +3448,8 @@ function metadataHarness(
     saveDerivedCache,
     sessionLabelOf,
     codexTitleFor,
+    isCompressedRollout,
+    compressedTitleCurrent,
   };
   new Function('module', 'exports', ...Object.keys(scope), compiled)(module, module.exports, ...Object.values(scope));
   return guardedHarness(new module.exports.Harness(run, sessionNames, derivedCacheFile));
@@ -3396,6 +3473,12 @@ function selectedWindowHarness(
   // spendVersion supplies revisions for keys built by the extracted methods.
 
   const names = new Set([
+    'compressedRolloutsToSend',
+    'compressedStorePaths',
+    'compressedSpendPick',
+    'titleEntryOf',
+    'compressedTitleOf',
+    'compressedCarriedNameOf',
     'currentSelectedSession',
     'publishWindowState',
     'completeSelectedWindow',
@@ -3535,6 +3618,16 @@ function selectedWindowHarness(
     'claudeRelationshipKey',
     'isCompressedRollout',
     'compressedRolloutsReadable',
+    'readRolloutStat',
+    'COMPRESSED_FACTS_STORE',
+    'COMPRESSED_OPENINGS_STORE',
+    'compressedTitleCurrent',
+    'withKeptUndercount',
+    'compressedSpendDisplayFiles',
+    'normalizeSpendFile',
+    'isAgentRun',
+    'arcHome',
+    'path',
     'noteHarnessScopeMiss',
     compiled,
   )(
@@ -3574,6 +3667,16 @@ function selectedWindowHarness(
     claudeRelationshipKey,
     isCompressedRollout,
     compressedRolloutsReadable,
+    readRolloutStat,
+    COMPRESSED_FACTS_STORE,
+    COMPRESSED_OPENINGS_STORE,
+    compressedTitleCurrent,
+    withKeptUndercount,
+    compressedSpendDisplayFiles,
+    normalizeSpendFile,
+    isAgentRun,
+    arcHome,
+    path,
     noteHarnessScopeMiss,
   );
   return guardedHarness(new module.exports.Harness(run));
@@ -6444,7 +6547,16 @@ function heldFactsHarness(held: Array<{ file: string; size: number; mtimeMs: num
   const provider = completeDiscoveryHarness(
     undefined,
     false,
-    ['evictCache', 'pruneDerivedTitles', 'protectedHistorySessions', 'metaFor', 'workspaceFoldersChanged'],
+    [
+      'evictCache',
+      'pruneDerivedTitles',
+      'protectedHistorySessions',
+      'metaFor',
+      'titleEntryOf',
+      'compressedTitleOf',
+      'compressedCarriedNameOf',
+      'workspaceFoldersChanged',
+    ],
     { historyBytes, historyEvictions },
   );
   provider.sessionCacheBudgetBytes = () => Number.MAX_SAFE_INTEGER;
@@ -7238,8 +7350,14 @@ function titlePublicationHarness(
       ...(real.methods ?? []),
       'prepareMetadata',
       'prepareRailEnrichment',
+      'titleEntryOf',
+      'compressedTitleOf',
+      'compressedCarriedNameOf',
       'glanceAt',
       'metaFor',
+      'titleEntryOf',
+      'compressedTitleOf',
+      'compressedCarriedNameOf',
       'sessionLabel',
       'claudeName',
       'titleFor',
@@ -8211,6 +8329,9 @@ function bumpedCatalogHarness(
       'claudeName',
       'titleFor',
       'metaFor',
+      'titleEntryOf',
+      'compressedTitleOf',
+      'compressedCarriedNameOf',
       ...extraMethods,
     ],
     {
@@ -9854,6 +9975,413 @@ test('a refresh between the first render post and its paint drops the startup st
     [],
   );
   race.done();
+});
+
+// An adoption reply from the real worker logic: the row stays and the twin's title replaces the plain one.
+function adoptionHarness(extraScope: Record<string, unknown> = {}) {
+  const harness = heldWalkHarness(
+    {
+      watcherRefreshDecision,
+      sessionDirectoryOwners,
+      unknownPathShapes,
+      unknownPathExtension,
+      readRolloutStat,
+      COMPRESSED_FACTS_STORE,
+      COMPRESSED_OPENINGS_STORE,
+      compressedTitleCurrent,
+      withKeptUndercount,
+      compressedSpendDisplayFiles,
+      normalizeSpendFile,
+      isAgentRun,
+      arcHome,
+      isHiddenThread,
+      ...extraScope,
+    },
+    ['runPendingWatch', 'unknownPathShapeOf'],
+  );
+  const { provider } = harness;
+  provider.performanceCounters = new PanelPerformanceCounters();
+  provider.pendingWatch = new PendingWatcherWake();
+  provider.derivedCacheFile = path.join(harness.root, 'cache', 'derived-session-cache-v2.json');
+  provider.projectSpendFiles = [];
+  provider.projectSpendVisibleFiles = [];
+  provider.compressedFacts = new Map();
+  provider.compressedFactsRevision = 0;
+  provider.compressedSpendPicks = new WeakMap();
+  const opened: string[] = [];
+  const held = provider.codexMetas.get.bind(provider.codexMetas);
+  provider.codexMetas.get = (file: string, onRead?: () => void) => {
+    opened.push(file);
+    return held(file, onRead);
+  };
+  const run = provider.progressiveWorker.run;
+  let adopted: string[] = [];
+  provider.progressiveWorker = {
+    ...provider.progressiveWorker,
+    run: async (request: { kind: string; adoption?: CompressedAdoptionInput }, ...rest: unknown[]) => {
+      if (request.kind === 'compressed-adopt') {
+        adopted.push(request.adoption!.twin);
+        const { adopted: ok, entry } = await adoptCompressedTwin(request.adoption!);
+        return {
+          generation: 0,
+          revision: null,
+          value: { kind: 'compressed-adopt', adopted: ok, entry, writeBytes: 0 },
+        };
+      }
+      if (request.kind === 'compressed-load')
+        return { generation: 0, revision: null, value: { kind: 'compressed-load', entries: [], done: true } };
+      return run.call(provider.progressiveWorker, request, ...rest);
+    },
+  };
+  let walksBefore = 0;
+  const wake = (changes: [string, 'rename' | 'change'][]) => {
+    walksBefore = harness.walks.length;
+    for (const [file, kind] of changes)
+      provider.pendingWatch.noteFileEvent(path.dirname(file), path.basename(file), kind, normalizeFsPath);
+    provider.runPendingWatch({ cause: 'quiet', firstAt: 0, lastAt: 0, firedAt: 0 });
+  };
+  const settle = async () => {
+    await vi.waitFor(() => assert.equal(provider.adoptionsUnsettled.size, 0, 'the adoption did not settle'));
+    await vi.waitFor(
+      () => {
+        assert.ok(harness.walks.length > walksBefore, 'the settled adoption started no walk');
+        for (const walk of harness.walks) walk.release();
+        assert.ok(!provider.refreshController && !provider.pendingRefresh, 'the refresh did not end');
+      },
+      { timeout: 8_000, interval: 5 },
+    );
+  };
+  return { ...harness, opened, adopted: () => adopted, wake, settle };
+}
+
+const twinThread = '01a032c9-1a92-7931-845c-723117d24dbe';
+
+async function adoptedPair(extraScope: Record<string, unknown> = {}) {
+  const harness = adoptionHarness(extraScope);
+  const { provider, releaseAll, writeRollout, files } = harness;
+  const plain = writeRollout(twinThread);
+  const mtime = new Date(1_700_000_000_000);
+  fs.utimesSync(plain, mtime, mtime);
+  await releaseAll(provider.refresh(true));
+  assert.deepEqual(files(), [plain]);
+  provider.titles.set(plain, {
+    label: 'Keep me',
+    fullLabel: 'Keep me',
+    mtimeMs: fs.statSync(plain).mtimeMs,
+    size: 1,
+    activityMs: 1,
+    agentRun: false,
+    outcome: null,
+    stats: null,
+    foldedLabel: 'k',
+  });
+  provider.projectSpendVisibleFiles = [
+    {
+      ...snapshotSpendFile(7, '2026-10-21', 7),
+      file: normalizeSpendFile(plain),
+      workspace: normalizeWorkspace('project'),
+    },
+  ];
+  const body = fs.readFileSync(plain);
+  const twin = `${plain}.zst`;
+  const stat = fs.statSync(plain);
+  const writeTwin = () => {
+    fs.writeFileSync(twin, rolloutCompression.zstdCompressSync!(body));
+    fs.utimesSync(twin, stat.atime, stat.mtime);
+  };
+  return { ...harness, plain, twin, writeTwin };
+}
+
+test.skipIf(!rolloutCompression.zstdCompressSync)(
+  'a form change keeps one row with the plain title through every watcher ordering and reads no compressed head',
+  async () => {
+    for (const order of ['twin event first', 'plain delete first', 'both in one batch'] as const) {
+      const { provider, plain, twin, writeTwin, files, wake, settle, opened, adopted } = await adoptedPair();
+      writeTwin();
+      if (order === 'twin event first') {
+        // Codex writes the twin first. The twin rides with the batch of the delete that follows.
+        provider.pendingWatch.noteFileEvent(path.dirname(twin), path.basename(twin), 'rename', normalizeFsPath);
+        fs.unlinkSync(plain);
+        wake([[plain, 'rename']]);
+      } else if (order === 'plain delete first') {
+        fs.unlinkSync(plain);
+        // The batch names only the delete. The host set lacks the twin, and one stat shows it.
+        wake([[plain, 'rename']]);
+      } else {
+        fs.unlinkSync(plain);
+        wake([
+          [twin, 'rename'],
+          [plain, 'rename'],
+        ]);
+      }
+      await settle();
+      assert.deepEqual(files(), [twin], `${order}: the row left the list`);
+      assert.deepEqual(adopted(), [twin], `${order}: adoption ran a wrong number of times`);
+      assert.equal(provider.titleEntryOf(twin)?.label, 'Keep me', `${order}: the row lost its title`);
+      assert.equal(
+        opened.filter((file) => isCompressedRollout(file)).length,
+        0,
+        `${order}: a compressed head was read`,
+      );
+    }
+  },
+);
+
+test.skipIf(!rolloutCompression.zstdCompressSync)(
+  'a batch name stays in the host set until the next complete walk, and a walk that started earlier removes the name of a twin that appears later',
+  async () => {
+    const { provider, plain, twin, writeTwin, wake, settle, files } = await adoptedPair();
+    // A batch adds a name on a delete event, so the host set can hold a name whose file is gone.
+    provider.pendingWatch.noteFileEvent(path.dirname(twin), path.basename(twin), 'rename', normalizeFsPath);
+    provider.noteCompressedRollouts(provider.pendingWatch.take().compressedPaths);
+    assert.ok(provider.compressedRollouts.has(twin), 'a delete event of the twin added no name');
+    // A complete walk that started before the twin appeared removes the name until the next walk.
+    provider.noteCompressedRollouts([], { status: 'complete', files: [], uncertain: [], compressed: [] });
+    assert.equal(provider.compressedRollouts.has(twin), false, 'the walk kept a name it did not list');
+    writeTwin();
+    fs.unlinkSync(plain);
+    // The set no longer holds the twin, and the batch does not name it. One stat decides the form change.
+    wake([[plain, 'rename']]);
+    await settle();
+    assert.deepEqual(files(), [twin]);
+    assert.equal(provider.compressedRollouts.has(twin), true, 'the walk after the form change lost the twin');
+  },
+);
+
+test.skipIf(!rolloutCompression.zstdCompressSync)(
+  'a plain rollout that exists again settles its adoption and keeps its facts',
+  async () => {
+    const { provider, plain, twin, writeTwin, adopted } = await adoptedPair();
+    writeTwin();
+    provider.adoptionsUnsettled.set(plain, { twin, row: null, running: false });
+    provider.beginCompressedAdoption(plain, twin, null);
+    await vi.waitFor(() => assert.equal(provider.adoptionsUnsettled.size, 0));
+    assert.deepEqual(adopted(), [], 'the host adopted a twin whose plain rollout exists');
+    assert.equal(provider.titles.get(plain)?.label, 'Keep me');
+  },
+);
+
+test('a deleted rollout without a twin walks, and no adoption runs', async () => {
+  const { plain, files, releaseAll, walks, wake, adopted } = await adoptedPair();
+  const before = walks.length;
+  fs.unlinkSync(plain);
+  wake([[plain, 'rename']]);
+  await vi.waitFor(() => assert.ok(walks.length > before, 'the delete did not walk'));
+  await releaseAll(Promise.resolve());
+  assert.deepEqual(adopted(), []);
+  await vi.waitFor(() => assert.deepEqual(files(), []));
+});
+
+test.skipIf(!rolloutCompression.zstdCompressSync)(
+  'a failed adoption discards the plain facts and marks the twin for the backfill',
+  async () => {
+    const { provider, plain, twin, writeTwin, wake, settle, files } = await adoptedPair();
+    writeTwin();
+    fs.unlinkSync(plain);
+    // A rollout whose title entry records another time than the twin fails the equal-time rule.
+    provider.adoptionsUnsettled.clear();
+    provider.projectSpendVisibleFiles = provider.projectSpendVisibleFiles.map((record: SpendFileIndex) => ({
+      ...record,
+      complete: false,
+    }));
+    wake([[plain, 'rename']]);
+    await settle();
+    assert.deepEqual(files(), [], 'a failed adoption kept a row');
+    assert.equal(provider.titles.has(plain), false, 'a failed adoption kept the plain title');
+    assert.equal(provider.compressedFacts.get(twin)?.adoptionFailed, true);
+  },
+);
+
+test.skipIf(!rolloutCompression.zstdCompressSync)(
+  'a plain rollout keeps its title and opening while its adoption is unsettled',
+  async () => {
+    // Every path the walk misses is absent, so only the retention rule keeps the plain path.
+    const { provider, plain, writeTwin, wake, walks, releaseAll } = await adoptedPair({
+      sessionPresence: () => 'absent',
+      staleMetas,
+    });
+    writeTwin();
+    fs.unlinkSync(plain);
+    // The worker has not answered the adoption yet.
+    let answer: (value: unknown) => void = () => {};
+    const unanswered = new Promise((resolve) => (answer = resolve));
+    provider.progressiveWorker = {
+      ...provider.progressiveWorker,
+      run: (request: { kind: string }, ...rest: unknown[]) =>
+        request.kind === 'compressed-adopt' ? unanswered : provider.heldRun(request, ...rest),
+    };
+    provider.heldRun = (request: { kind: string }) =>
+      Promise.resolve({ value: { kind: request.kind, entries: [], done: true } });
+    wake([[plain, 'rename']]);
+    const before = walks.length;
+    // A broad walk while the adoption is unsettled trims stale names.
+    provider.adoptionsUnsettled.get(plain).running = true;
+    void provider.refresh(true);
+    await releaseAll(Promise.resolve()).catch(() => {});
+    await vi.waitFor(() => assert.ok(walks.length >= before), { timeout: 8_000, interval: 5 });
+    for (const walk of walks) walk.release();
+    await vi.waitFor(() => assert.ok(!provider.refreshController), { timeout: 8_000, interval: 5 });
+    assert.equal(provider.titles.has(plain), true, 'title pruning dropped the plain path of an unsettled adoption');
+    assert.ok(provider.codexMetas.peek(plain), 'the opening trim dropped the plain path of an unsettled adoption');
+    provider.physicalMembershipOf = () => 'absent';
+    provider.commitRepositories = { prune: () => false };
+    provider.pruneDerivedTitles(new Set());
+    assert.equal(provider.titles.has(plain), true, 'a direct prune dropped the plain path of an unsettled adoption');
+    provider.adoptionsUnsettled.delete(plain);
+    assert.equal(
+      provider.pruneDerivedTitles(new Set()),
+      true,
+      'title pruning kept a plain path after the adoption settled',
+    );
+    assert.equal(provider.titles.has(plain), false);
+    answer(null);
+  },
+);
+
+test('discovery sends the compressed list only when the set changed since the last send to the current worker', () => {
+  const { provider } = heldWalkHarness({ COMPRESSED_FACTS_STORE, COMPRESSED_OPENINGS_STORE, arcHome }, [
+    'compressedRolloutsToSend',
+    'compressedStorePaths',
+  ]);
+  provider.derivedCacheFile = path.join('cache', 'derived.json');
+  provider.progressiveWorker = { currentThreadId: 1 };
+  provider.compressedRollouts = new Set(['a.jsonl.zst', 'b.jsonl.zst']);
+  provider.compressedRolloutsRevision = 3;
+  provider.compressedRolloutsSent = null;
+  const stores = {
+    facts: path.join('cache', COMPRESSED_FACTS_STORE),
+    openings: path.join(arcHome(), 'cache', COMPRESSED_OPENINGS_STORE),
+  };
+  assert.deepEqual(provider.compressedRolloutsToSend(), {
+    compressed: ['a.jsonl.zst', 'b.jsonl.zst'],
+    compressedStores: stores,
+  });
+  assert.deepEqual(provider.compressedRolloutsToSend(), {}, 'an unchanged set was sent again');
+  provider.compressedRolloutsRevision++;
+  assert.deepEqual(provider.compressedRolloutsToSend().compressed, ['a.jsonl.zst', 'b.jsonl.zst']);
+  provider.progressiveWorker.currentThreadId = 2;
+  assert.deepEqual(
+    provider.compressedRolloutsToSend().compressed,
+    ['a.jsonl.zst', 'b.jsonl.zst'],
+    'a new worker missed the list',
+  );
+  provider.derivedCacheFile = undefined;
+  assert.deepEqual(provider.compressedRolloutsToSend(), {}, 'a panel with no store sent a list');
+});
+
+test('the load of the stores waits for the first render and the pass, holds Project cost busy and applies each batch', async () => {
+  const { provider } = heldWalkHarness(
+    { withKeptUndercount, COMPRESSED_FACTS_STORE, COMPRESSED_OPENINGS_STORE, arcHome },
+    [
+      'maybeStartCompressedLoad',
+      'loadCompressedFacts',
+      'applyCompressedEntries',
+      'compressedFactsChanged',
+      'projectSpendBusy',
+      'invalidateProjectSpendSnapshot',
+    ],
+  );
+  const entry = { file: 'a.jsonl.zst', pairKey: 'a.jsonl', factsVersion: 1 };
+  const requests: { kind: string }[] = [];
+  provider.progressiveWorker = {
+    run: async (
+      request: { kind: string },
+      _generation: number,
+      _signal: AbortSignal,
+      progress: (result: unknown) => void,
+    ) => {
+      requests.push(request);
+      progress({ value: { kind: 'compressed-load', entries: [entry], done: false } });
+      return { value: { kind: 'compressed-load', entries: [], done: true } };
+    },
+  };
+  provider.performanceCounters = { recordWork() {} };
+  provider.derivedCacheFile = path.join('cache', 'derived.json');
+  provider.refreshFrom = () => {};
+  provider.postProjectSpend = () => {};
+  Object.assign(provider, {
+    compressedFacts: new Map(),
+    compressedFactsRevision: 0,
+    adoptionsUnsettled: new Map(),
+    projectSpendHydrated: true,
+    projectSpendIndexing: false,
+    projectSpendOffers: new Set(),
+    projectSpendRevision: 0,
+    compressedLoadPending: true,
+    compressedLoadStarted: false,
+    compressedRenderSeen: false,
+    codexPriming: {},
+  });
+  assert.equal(provider.projectSpendBusy(), true, 'Project cost settled before the load');
+  provider.maybeStartCompressedLoad();
+  provider.compressedRenderSeen = true;
+  provider.maybeStartCompressedLoad();
+  assert.deepEqual(requests, [], 'the load started before the first pass ended');
+  provider.compressedRenderSeen = false;
+  provider.codexPriming = null;
+  provider.maybeStartCompressedLoad();
+  assert.deepEqual(requests, [], 'the load started before the first complete render');
+  provider.compressedRenderSeen = true;
+  provider.maybeStartCompressedLoad();
+  await vi.waitFor(() => assert.equal(provider.compressedLoadPending, false));
+  assert.equal(requests.length, 1);
+  assert.equal(provider.compressedFacts.get('a.jsonl.zst'), entry, 'the load dropped a batch');
+  assert.equal(provider.projectSpendBusy(), false, 'Project cost stayed busy after the load');
+});
+
+test('a stored entry keeps a row with a carried name across a version mismatch and its plain twin hides the row', () => {
+  const harness = heldWalkHarness({ readRolloutStat, isHiddenThread, isAgentRun, compressedTitleCurrent }, [
+    'compressedRowsOf',
+    'compressedCarriedNameOf',
+    'compressedTitleOf',
+  ]);
+  const { provider } = harness;
+  provider.compressedFacts = new Map();
+  const walking = (names: string[], compressed: string[]): any => ({
+    walked: names,
+    enumeration: { status: 'complete', files: names, uncertain: [], compressed },
+  });
+  const twin = path.join(harness.root, `rollout-${twinThread}.jsonl.zst`);
+  fs.writeFileSync(twin, 'x');
+  const entry: any = {
+    file: twin,
+    pairKey: twin.replace(/\.zst$/, ''),
+    threadId: twinThread,
+    metadataGeneration: 0,
+    factsVersion: 1,
+    title: { label: 'Carried', fullLabel: 'Carried', size: 1, mtimeMs: 1 },
+    opening: {
+      sessionId: twinThread,
+      cwd: 'c:/repo',
+      threadSource: null,
+      parentThreadId: null,
+      hasSubagentSource: false,
+      launchSource: null,
+      subagentKind: null,
+    },
+  };
+  provider.compressedFacts.set(twin, entry);
+  const rows = provider.compressedRowsOf(walking([], [twin]), () => true);
+  assert.deepEqual(
+    rows.map((row: SessionFile) => row.file),
+    [twin],
+    'a version mismatch removed the row',
+  );
+  assert.equal(provider.compressedCarriedNameOf(twin)?.label, 'Carried');
+  assert.equal(provider.compressedTitleOf(twin), undefined, 'an outdated title entry was shown as current');
+  // A listed plain twin gives no row, and the entry stays a ledger candidate.
+  assert.deepEqual(
+    provider.compressedRowsOf(walking([twin.replace(/\.zst$/, '')], [twin]), () => true),
+    [],
+  );
+  assert.equal(provider.compressedFacts.has(twin), true);
+  // A complete walk that lists neither form drops the entry.
+  provider.compressedRowsOf(walking([], []), () => true);
+  assert.equal(provider.compressedFacts.has(twin), false);
+  // An out-of-scope entry is dropped.
+  provider.compressedFacts.set(twin, entry);
+  provider.compressedRowsOf(walking([], [twin]), () => false);
+  assert.equal(provider.compressedFacts.has(twin), false);
 });
 
 test('targeted reuse avoids the broad walk, and a failed reuse performs exactly one walk', async () => {
@@ -20974,6 +21502,7 @@ async function hydrateCompressedRolloutLedger() {
       createCodexUsageLineReducer: () => null,
       // The plain rollout holds the same requests as the compressed one.
       indexSpendFile: () => ({ record: saved('rollout-a.jsonl', 7), stateChanged: true, complete: true, found: true }),
+      compressedSpendDisplayFiles,
       fs,
     },
     ['hydrateProjectSpend', 'indexNextProjectSpendFile', 'finishProjectSpendIndex'],
@@ -20995,6 +21524,90 @@ async function hydrateCompressedRolloutLedger() {
   await vi.runAllTimersAsync();
   return { provider, storage, plain, saves: () => saves };
 }
+
+// A compressed entry beside the plain record in the real hydrated ledger. The harness shows Project cost through the
+// pick, and every step counts the $5 of the other rollout.
+function compressedCostSteps(provider: any, plain: string) {
+  const twin = `${plain}.zst`;
+  const plainKey = normalizeSpendFile(plain);
+  const entryOf = (dollars: number, extra: Record<string, unknown> = {}) => ({
+    file: twin,
+    pairKey: plainKey,
+    threadId: 'thread-a',
+    complete: true,
+    spend: {
+      ...snapshotSpendFile(dollars, '2026-10-21', dollars),
+      file: plainKey,
+      workspace: normalizeWorkspace('project'),
+    },
+    ...extra,
+  });
+  return {
+    setPlain(record: SpendFileIndex) {
+      provider.projectSpendFiles = [
+        record,
+        ...provider.projectSpendFiles.filter((held: SpendFileIndex) => held.file !== plainKey),
+      ];
+      provider.projectSpendVisibleFiles = provider.projectSpendFiles;
+      provider.invalidateProjectSpendSnapshot();
+      vi.advanceTimersToNextTimer();
+    },
+    setEntry(entry: Record<string, unknown>) {
+      provider.compressedFacts = new Map([[twin, entry]]);
+      provider.compressedFactsRevision++;
+      provider.invalidateProjectSpendSnapshot();
+      vi.advanceTimersToNextTimer();
+    },
+    entryOf,
+    plainKey,
+  };
+}
+
+test('Project cost shows the largest complete total through each ledger sequence of a compressed thread', async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date('2026-10-21T12:00:00'));
+  try {
+    const { provider, plain } = await hydrateCompressedRolloutLedger();
+    const steps = compressedCostSteps(provider, plain);
+    const dollars = async () => {
+      await vi.runAllTimersAsync();
+      return provider.projectSpendPayload().windows[0].dollars;
+    };
+    const plainRecord = (amount: number, more: Partial<SpendFileIndex> = {}): SpendFileIndex => ({
+      ...snapshotSpendFile(amount, '2026-10-21', amount),
+      file: steps.plainKey,
+      workspace: normalizeWorkspace('project'),
+      ...more,
+    });
+    provider.codexMetas = { peek: () => null };
+    provider.adoptionsUnsettled = new Map();
+    provider.compressedFacts = new Map();
+    provider.compressedFactsRevision = 0;
+    provider.compressedSpendPicks = new WeakMap();
+    // Adoption of a $7 session counts the session once.
+    steps.setPlain(plainRecord(7));
+    steps.setEntry(steps.entryOf(7));
+    assert.equal(await dollars(), 12, 'an adopted compression changed the shown total');
+    // A resume rescans the plain file from byte 0. The incomplete scan shows the twin's $7.
+    steps.setPlain(plainRecord(2, { complete: false }));
+    assert.equal(await dollars(), 12, 'a plain rescan from byte 0 lowered the shown total');
+    // The rescan finishes at $10.
+    steps.setPlain(plainRecord(10));
+    assert.equal(await dollars(), 15);
+    // A second compression shows the plain $10 before its decode.
+    steps.setEntry(steps.entryOf(10));
+    assert.equal(await dollars(), 15);
+    // A decode that skips a usage record reports $8 with the mark, and the plain record keeps the shown $10.
+    steps.setEntry(steps.entryOf(8, { undercount: true }));
+    assert.equal(await dollars(), 15, 'a marked derivation lowered the shown total');
+    // A version bump over a marked record keeps the higher total, because the spend record itself is unchanged.
+    steps.setEntry(steps.entryOf(10, { undercount: true, spendGeneration: 0, metadataGeneration: 0 }));
+    assert.equal(await dollars(), 15);
+    assert.equal(provider.projectSpendFiles.length, 2, 'the pick entered the ledger');
+  } finally {
+    vi.useRealTimers();
+  }
+});
 
 test('Project cost hydration drops the saved spend of a compressed rollout and saves the ledger without it', async () => {
   vi.useFakeTimers();

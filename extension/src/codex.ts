@@ -244,6 +244,11 @@ export class CodexMetaCache {
     return meta;
   }
 
+  // The held opening of a file, with no read.
+  peek(file: string): CodexSessionMeta | null {
+    return this.entries.get(file)?.meta ?? null;
+  }
+
   // Read missing and refused openings asynchronously, with at most `limit` concurrent reads.
   // Preserve any non-refusal entry `get` supplies during the read.
   // A missing record keeps its measured size. Later `get` calls retry after growth.

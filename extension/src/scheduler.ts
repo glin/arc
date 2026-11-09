@@ -491,12 +491,15 @@ export function unknownPathExtension(file: string): '.jsonl' | 'other' {
 // discovery has not accepted yet, is named as it is, and the refresh revalidates the walked row. `walkListedPaths`
 // counts those paths. `unknownPaths` names the paths that decided `unknownPath`.
 // A created or moved path that no listed session owns walks, and so does a listed path that moved, because a walk is
-// the read that finds additions, removals and replacements.
+// the read that finds additions, removals and replacements. A delete or rename of a listed rollout whose compressed twin
+// exists is a form change, which `formChange` decides, and it takes no walk. A broad batch runs its walk and decides no
+// form change.
 export function watcherRefreshDecision(
   batch: WatcherWakeBatch,
   knownPath: (file: string) => boolean,
   ownersOf: (file: string) => string[] | null = () => null,
   walkListed: (file: string) => boolean = () => false,
+  formChange: (file: string) => boolean = () => false,
 ): {
   kind: 'broad' | 'targeted';
   changedPaths: string[];
@@ -504,6 +507,7 @@ export function watcherRefreshDecision(
   ownedPaths: number;
   walkListedPaths: number;
   unknownPaths: string[];
+  formChanges?: string[];
 } {
   const created = new Set(batch.createdPaths);
   const owned = new Map<string, string[] | null>();
@@ -540,6 +544,7 @@ export function watcherRefreshDecision(
   const broadReasons = new Set<WatcherBroadReason>();
   const changedPaths = new Set<string>();
   const unknownPaths: string[] = [];
+  const formChanges: string[] = [];
   let ownedPaths = 0;
   let walkListedPaths = 0;
   for (const file of batch.changedPaths) {
@@ -548,7 +553,8 @@ export function watcherRefreshDecision(
       ownedPaths++;
       for (const owner of owners) changedPaths.add(owner);
     } else if (created.has(file)) {
-      broadReasons.add('createOrRename');
+      if (knownPath(file) && formChange(file)) formChanges.push(file);
+      else broadReasons.add('createOrRename');
     } else if (knownPath(file)) {
       changedPaths.add(file);
     } else if (walkListed(file)) {
@@ -576,6 +582,7 @@ export function watcherRefreshDecision(
     ownedPaths,
     walkListedPaths,
     unknownPaths: [],
+    ...(formChanges.length ? { formChanges } : {}),
   };
 }
 

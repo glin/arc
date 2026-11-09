@@ -392,7 +392,16 @@ export type ProgressiveRequest =
       quantumBytes?: number;
       // Reads only the spend and person facts of the dispatch references of the last complete reply.
       spendOnly?: true;
+      // The complete host set of compressed rollouts, sent only when the set changed since the last send to this worker.
+      compressed?: string[];
+      compressedStores?: import('./compressedstore').CompressedStorePaths;
     }
+  | {
+      kind: 'compressed-adopt';
+      adoption: import('./compressedstore').CompressedAdoptionInput;
+      stores: import('./compressedstore').CompressedStorePaths;
+    }
+  | { kind: 'compressed-load'; stores: import('./compressedstore').CompressedStorePaths }
   | { kind: 'metadata'; session: SessionFile; opening?: CodexSessionMeta | null; tailBytes?: number }
   | {
       kind: 'metadata-recovery';
@@ -417,6 +426,13 @@ export type ProgressiveRequest =
     }
   | { kind: 'page'; input: ProgressiveInput; cursor: ProgressiveCursor | null };
 export type ProgressiveValue =
+  | {
+      kind: 'compressed-adopt';
+      adopted: boolean;
+      entry: import('./compressedstore').CompressedFactEntry;
+      writeBytes: number;
+    }
+  | { kind: 'compressed-load'; entries: import('./compressedstore').CompressedFactEntry[]; done: boolean }
   | { kind: 'codex-context'; estimate: import('./codexcontext').CodexContextResult | null }
   | {
       kind: 'child-file-edits';
@@ -677,6 +693,10 @@ export class ProgressiveWorker {
   private workerMemory: WorkerMemory | null = null;
   private workerMemoryAt = 0;
   private workerThreadId: number | null = null;
+  // The thread of the running worker, or null when no worker runs.
+  get currentThreadId(): number | null {
+    return this.worker ? this.workerThreadId : null;
+  }
   private workerMemoryThreadId: number | null = null;
   private workerMemoryRequestId: number | null = null;
   private recentWindows: WindowReadObservation[] = [];

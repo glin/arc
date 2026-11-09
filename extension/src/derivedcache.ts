@@ -376,6 +376,9 @@ export interface DerivedCache {
   linksMalformed?: boolean;
   // Complete prompt scans of Claude transcripts by file, each at the revision it read. See `savedPromptScanOf`.
   promptScans?: Map<string, HumanPromptScan>;
+  // Rollouts with an adoption of their compressed twin not yet settled, as plain path to twin path. The title and
+  // opening of such a rollout stay across a restart.
+  unsettledAdoptions?: Map<string, string>;
 }
 
 // The merged links and child rows of the last complete discovery reply that settled membership. A later start publishes its
@@ -567,6 +570,7 @@ interface StoredCache {
   titles: StoredTitle[];
   claudeChildReferences: StoredChildReferences[];
   carriedNames: StoredCarriedName[];
+  unsettledAdoptions?: [string, string][];
   links?: SavedDiscoveryLinks;
   promptScans?: StoredPromptScans;
 }
@@ -1484,6 +1488,13 @@ export function loadDerivedCache(
     if (format === 2 && savedDiscoveryLinks(parsed.links)) loaded.links = parsed.links;
     else if (format === 2 && parsed.links !== undefined) loaded.linksMalformed = true;
     if (format === 2) loaded.promptScans = storedPromptScans(parsed.promptScans);
+    if (Array.isArray(parsed.unsettledAdoptions)) {
+      const rows = parsed.unsettledAdoptions.filter(
+        (row): row is [string, string] =>
+          Array.isArray(row) && row.length === 2 && typeof row[0] === 'string' && typeof row[1] === 'string',
+      );
+      if (rows.length) loaded.unsettledAdoptions = new Map(rows);
+    }
     carryNames(loaded.carriedNames, parsed.carriedNames, (row) => row);
     loaded.reuse.storedGeneration = legacy
       ? parsed.version
@@ -1610,6 +1621,7 @@ export function saveDerivedCache(
   links?: SavedDiscoveryLinks,
   // A later scan of the same file replaces an earlier one. A scan that `savedPromptScanOf` refuses replaces nothing.
   promptScans: Iterable<[string, HumanPromptScan]> = [],
+  unsettledAdoptions: Iterable<[string, string]> = [],
 ): void {
   const savedScans = new Map<string, HumanPromptScan>();
   for (const [scanFile, scan] of promptScans) {
@@ -1656,6 +1668,7 @@ export function saveDerivedCache(
     titles: titleRows,
     claudeChildReferences: limitSavedDispatchFacts(childRows.slice(0, MAX_CLAUDE_CHILD_REFERENCE_FILES)),
     // Persists carried names until a title entry replaces them, including across restarts.
+    unsettledAdoptions: [...unsettledAdoptions],
     carriedNames: [...carriedNames, ...unqualified]
       .filter(([entryFile, name]) => !titled.has(entryFile) && carriedName(name))
       .map(([entryFile, name]) => ({ file: entryFile, label: name.label, fullLabel: name.fullLabel }))

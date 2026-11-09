@@ -13,6 +13,14 @@ import {
 } from './sessioncoverage';
 import { compressedRolloutsReadable, isCompressedRollout } from './compressedrollouts';
 import {
+  COMPRESSED_FACTS_STORE,
+  COMPRESSED_OPENINGS_STORE,
+  compressedTitleCurrent,
+  withKeptUndercount,
+  type CompressedFactEntry,
+  type CompressedStorePaths,
+} from './compressedstore';
+import {
   canonicalServiceTier,
   serviceTierRefusal,
   cacheLifetimeRefusal,
@@ -188,6 +196,7 @@ import {
   CodexSubagentFile,
   ThreadNames,
   codexSessionFiles,
+  isAgentRun,
   isHiddenThread,
   coldOpeningPass,
   enumerateRolloutFilesAsync,
@@ -571,6 +580,7 @@ import {
   normalizeWorkspace,
   prepareProjectSpendViewSteps,
   type ProjectSpendView,
+  compressedSpendDisplayFiles,
   projectSpendDisplayFiles,
   truncateProjectSpendView,
   pruneSpendFilesWithResult,
@@ -1630,8 +1640,24 @@ export class PanelProvider implements vscode.Disposable {
   private readonly sessionSpendSourceIndex = new SessionSpendSourceIndex();
   private readonly subagentDirectories = new SubagentDirectoryCache();
   private readonly codexStats = new CodexStatCache();
-  // Compressed Codex rollouts that the walk listed or a wake batch named. None of them gives a row.
+  // Compressed Codex rollouts that the walk listed or a wake batch named. A name gives a row only through a stored entry.
   private readonly compressedRollouts = new Set<string>();
+  private compressedRolloutsRevision = 0;
+  // The revision and worker thread of the last `compressed` list that discovery sent.
+  private compressedRolloutsSent: { worker: number | null; revision: number } | null = null;
+  // The entries of the stores, by twin path. Compressed facts never enter `titles`, which the checkpoint saves.
+  private compressedFacts = new Map<string, CompressedFactEntry>();
+  private compressedFactsRevision = 0;
+  // Plain rollouts whose adoption of their twin has not settled, and the row each held.
+  private adoptionsUnsettled = new Map<string, { twin: string; row: SessionFile | null; running: boolean }>();
+  // True from the start of a panel with a store until the load of the stores ends.
+  private compressedLoadPending = false;
+  private compressedLoadStarted = false;
+  private compressedRenderSeen = false;
+  private readonly compressedSpendPicks = new WeakMap<
+    readonly SpendFileIndex[],
+    { revision: number; picked: readonly SpendFileIndex[] }
+  >();
   // Recorded working directories, keyed by transcript path. Missing values retry after the file revision changes.
   private cwds = new Map<string, { cwd: string | null; mtimeMs: number; size: number; unavailable?: boolean }>();
   // Cached Codex opening metadata, including each rollout's working directory.
@@ -3422,7 +3448,7 @@ export class PanelProvider implements vscode.Disposable {
         const at = sources.indexOf(entry);
         counts = visible ? this.unreadCounts(sources.slice(at, at + limit).map(({ session }) => session)) : null;
       }
-      const meta = this.titles.get(source.file);
+      const meta = this.titleEntryOf(source.file);
       const revision = this.revisionOf(source);
       const sourceCurrent = sameProgressiveRevision(revision, source);
       const current = sourceCurrent && meta !== undefined && sameSessionRevision(meta, source);
@@ -3522,7 +3548,7 @@ export class PanelProvider implements vscode.Disposable {
         };
         if (!identityTerms.every((term) => listingTermHolds(term, metadata))) return false;
         if (!agentRunTerms.length) return true;
-        const meta = this.titles.get(source.file);
+        const meta = this.titleEntryOf(source.file);
         const current =
           meta !== undefined &&
           sameSessionRevision(meta, source) &&
@@ -3728,8 +3754,12 @@ export class PanelProvider implements vscode.Disposable {
       this.settleRecordedReplies();
     });
     this.projectSpendSaveScheduler = this.newProjectSpendSaveScheduler();
+    this.compressedLoadPending = !!this.derivedCacheFile;
     const cached = this.derivedCacheFile ? loadDerivedCache(this.derivedCacheFile, this.derivedCacheImports) : null;
     if (cached) {
+      this.adoptionsUnsettled = new Map(
+        [...(cached.unsettledAdoptions ?? [])].map(([plain, twin]) => [plain, { twin, row: null, running: false }]),
+      );
       this.titles = cached.titles;
       // Cached negative answers require current classifier evidence after restart.
       for (const [file, entry] of this.titles) {
@@ -4123,6 +4153,7 @@ export class PanelProvider implements vscode.Disposable {
     this.noteCompressedRollouts(batch.compressedPaths);
     const catalog = this.catalog?.sessions ?? [];
     const known = new Set(catalog.map((session) => normalizeFsPath(session.file)));
+    const formChangeRows = new Map<string, SessionFile>();
     // The decision asks only about paths outside the held catalog, so most wakes build no walked index.
     let walkListed: Set<string> | null = null;
     const decision = watcherRefreshDecision(
@@ -4133,7 +4164,13 @@ export class PanelProvider implements vscode.Disposable {
         (walkListed ??= new Set(
           this.currentWalkedCatalog()?.sessions.map((session) => normalizeFsPath(session.file)),
         )).has(normalizeFsPath(file)),
+      (file) => {
+        const row = this.compressedFormChange(file, batch.compressedPaths, catalog);
+        if (row) formChangeRows.set(normalizeFsPath(file), row);
+        return row !== null;
+      },
     );
+    for (const row of formChangeRows.values()) this.beginCompressedAdoption(row.file, `${row.file}.zst`, row);
     const reason = batch.reasons.length ? batch.reasons.join('+') : 'watcher';
     const started = performance.now();
     const unknownPaths = decision.unknownPaths.length
@@ -4151,7 +4188,9 @@ export class PanelProvider implements vscode.Disposable {
       this.performanceCounters.recordWork(
         `watcher:grownMemberMiss:membersUnsettled:${this.dispatchDiscoveryPendingWriter}`,
       );
-    this.refreshFrom(reason, batch.drawRequired, grown, decision.kind === 'targeted' ? decision.changedPaths : null);
+    // A batch of form changes alone starts no refresh. Each settled adoption refreshes the list itself.
+    if (decision.kind !== 'targeted' || decision.changedPaths.length || !decision.formChanges?.length)
+      this.refreshFrom(reason, batch.drawRequired, grown, decision.kind === 'targeted' ? decision.changedPaths : null);
     this.performanceCounters.recordWatcherOperation(
       {
         reason,
@@ -4968,6 +5007,247 @@ export class PanelProvider implements vscode.Disposable {
     }
     // The paint is recorded first, because the listing that this starts moves the refresh generation.
     if (stage === 'railReady' && this.finishedColdPass) this.listFinishedColdPass();
+    if (stage === 'completeRender') {
+      this.compressedRenderSeen = true;
+      this.maybeStartCompressedLoad();
+    }
+  }
+
+  // The stores of this panel's workspace and of the machine, or null when the panel has no cache directory.
+  private compressedStorePaths(): CompressedStorePaths | null {
+    return this.derivedCacheFile
+      ? {
+          facts: path.join(path.dirname(this.derivedCacheFile), COMPRESSED_FACTS_STORE),
+          openings: path.join(arcHome(), 'cache', COMPRESSED_OPENINGS_STORE),
+        }
+      : null;
+  }
+
+  // The load starts after both the first complete render and the first pass's publication, so it adds no work before
+  // the first usable row.
+  private maybeStartCompressedLoad(): void {
+    if (this.compressedLoadStarted || !this.compressedRenderSeen || this.codexPriming) return;
+    this.compressedLoadStarted = true;
+    const stores = this.compressedStorePaths();
+    if (!stores) {
+      this.compressedLoadPending = false;
+      return;
+    }
+    void this.loadCompressedFacts(stores);
+  }
+
+  private applyCompressedEntries(entries: readonly CompressedFactEntry[]): void {
+    for (const entry of entries)
+      this.compressedFacts.set(entry.file, withKeptUndercount(this.compressedFacts.get(entry.file), entry));
+    if (entries.length) this.compressedFactsChanged();
+  }
+
+  private compressedFactsChanged(): void {
+    this.compressedFactsRevision++;
+    this.projectSpendRevision++;
+    this.invalidateProjectSpendSnapshot();
+  }
+
+  private async loadCompressedFacts(stores: CompressedStorePaths): Promise<void> {
+    const started = performance.now();
+    let applied = false;
+    const take = (value: import('./progressiveworker').ProgressiveValue | undefined) => {
+      if (value?.kind !== 'compressed-load') return;
+      if (value.entries.length) applied = true;
+      this.applyCompressedEntries(value.entries);
+    };
+    try {
+      const result = await this.progressiveWorker.run(
+        { kind: 'compressed-load', stores },
+        this.refreshGeneration,
+        new AbortController().signal,
+        (progress) => take(progress.value),
+      );
+      take(result?.value);
+    } catch {
+      // A failed load leaves the rows of this activation without stored facts.
+    } finally {
+      this.compressedLoadPending = false;
+      this.performanceCounters?.recordWork('compressedLoadMs', Math.round(performance.now() - started));
+    }
+    for (const [plain, held] of this.adoptionsUnsettled) this.beginCompressedAdoption(plain, held.twin, held.row);
+    if (applied) this.refreshFrom('compressed-facts', true);
+    else if (!this.projectSpendBusy()) this.postProjectSpend();
+  }
+
+  // A delete or rename of a listed rollout is a form change when its compressed twin exists. The wake batch, the host
+  // set or one stat shows the twin. The plain file must be gone, because a rename event also names a created file.
+  private compressedFormChange(
+    file: string,
+    batched: readonly string[],
+    catalog: readonly SessionFile[],
+  ): SessionFile | null {
+    const target = normalizeFsPath(file);
+    const row = catalog.find((session) => session.agent === 'codex' && normalizeFsPath(session.file) === target);
+    if (!row || !row.file.endsWith('.jsonl') || readRolloutStat(row.file)) return null;
+    const twin = `${row.file}.zst`;
+    const named =
+      this.compressedRollouts.has(twin) || batched.some((name) => normalizeFsPath(name) === normalizeFsPath(twin));
+    return named || readRolloutStat(twin) ? row : null;
+  }
+
+  private beginCompressedAdoption(plain: string, twin: string, row: SessionFile | null): void {
+    const held = this.adoptionsUnsettled.get(plain);
+    if (held?.running) return;
+    this.adoptionsUnsettled.set(plain, { twin, row: row ?? held?.row ?? null, running: true });
+    this.derivedCacheCheckpointState.markChanged(true);
+    void this.adoptCompressedTwin(plain, twin);
+  }
+
+  // Worker adoption of a twin. A settled adoption ends the retention of the plain path and lists the session again.
+  private async adoptCompressedTwin(plain: string, twin: string): Promise<void> {
+    const stores = this.compressedStorePaths();
+    const held = this.adoptionsUnsettled.get(plain);
+    if (!stores || !held) return;
+    // A plain rollout that exists again keeps its facts, so its adoption has nothing to settle.
+    if (readRolloutStat(plain)) {
+      this.adoptionsUnsettled.delete(plain);
+      this.derivedCacheCheckpointState.markChanged(true);
+      return;
+    }
+    const title = this.titles.get(plain);
+    const plainKey = normalizeSpendFile(plain);
+    const spend = [...this.projectSpendVisibleFiles, ...this.projectSpendFiles].find(
+      (record) => normalizeSpendFile(record.file) === plainKey && record.complete !== false,
+    );
+    const result = await this.progressiveWorker
+      .run(
+        {
+          kind: 'compressed-adopt',
+          adoption: {
+            twin,
+            plain,
+            plainMtimeMs: held.row?.mtimeMs ?? title?.mtimeMs ?? -1,
+            title,
+            opening: this.codexMetas.peek(plain),
+            spend,
+          },
+          stores,
+        },
+        this.refreshGeneration,
+        new AbortController().signal,
+      )
+      .catch(() => null);
+    const value = result?.value;
+    if (value?.kind !== 'compressed-adopt') {
+      held.running = false;
+      return;
+    }
+    if (value.writeBytes) this.performanceCounters?.recordWork('compressedStoreWriteBytes', value.writeBytes);
+    this.applyCompressedEntries([value.entry]);
+    if (!value.adopted) {
+      this.titles.delete(plain);
+      this.carriedNames.delete(plain);
+    }
+    // The walk of the refresh below trims the opening of a failed adoption, because the path is no longer retained.
+    this.adoptionsUnsettled.delete(plain);
+    this.derivedCacheCheckpointState.markChanged(true);
+    this.refreshFrom('compressed-facts', true);
+  }
+
+  // The session rows a walk gives for compressed rollouts: the row of an unsettled adoption, and each entry with facts
+  // whose plain twin the walk does not list. A complete walk drops an entry whose paths are both absent or out of scope.
+  private compressedRowsOf(
+    listing: ReturnType<typeof codexSessionFiles>,
+    inFolders: (cwd: string) => boolean,
+  ): SessionFile[] {
+    const out: SessionFile[] = [];
+    const walked = new Set(listing.walked);
+    const listed = new Set(listing.enumeration.compressed ?? []);
+    const complete = listing.enumeration.status === 'complete';
+    if (complete) {
+      for (const row of this.catalog?.sessions ?? []) {
+        if (row.agent !== 'codex' || !row.file.endsWith('.jsonl') || walked.has(row.file)) continue;
+        const twin = `${row.file}.zst`;
+        if (listed.has(twin) && !this.compressedFacts.has(twin)) this.beginCompressedAdoption(row.file, twin, row);
+      }
+    }
+    for (const [plain, held] of this.adoptionsUnsettled) {
+      if (!walked.has(plain) && held.row) out.push(held.row);
+    }
+    for (const [twin, entry] of this.compressedFacts) {
+      const plain = twin.replace(/\.zst$/, '');
+      if (!walked.has(plain) && complete && !listed.has(twin)) {
+        this.compressedFacts.delete(twin);
+        this.compressedFactsChanged();
+        continue;
+      }
+      const opening = entry.opening;
+      if (opening?.cwd && !inFolders(opening.cwd)) {
+        this.compressedFacts.delete(twin);
+        this.compressedFactsChanged();
+        continue;
+      }
+      if (entry.adoptionFailed || entry.nameOnly || walked.has(plain) || !opening?.cwd || isHiddenThread(opening))
+        continue;
+      if (this.adoptionsUnsettled.has(plain)) continue;
+      const stat = readRolloutStat(twin);
+      if (!stat?.isFile || !entry.threadId) continue;
+      out.push({
+        agent: 'codex',
+        file: twin,
+        sessionId: entry.threadId,
+        mtimeMs: stat.mtimeMs,
+        size: stat.size,
+        cwd: opening.cwd,
+        ...(stat.dev === undefined ? {} : { dev: stat.dev }),
+        ...(stat.ino === undefined ? {} : { ino: stat.ino }),
+        agentRun: isAgentRun(opening),
+      });
+    }
+    return out;
+  }
+
+  private compressedTitleOf(file: string): DerivedTitleEntry | undefined {
+    if (!isCompressedRollout(file)) return undefined;
+    const entry = this.compressedFacts?.get(file);
+    return entry?.title && compressedTitleCurrent(entry) ? entry.title : undefined;
+  }
+
+  // A row whose stored title is out of version, or dropped for size, shows the name it carries.
+  private compressedCarriedNameOf(file: string): CarriedName | undefined {
+    if (!isCompressedRollout(file)) return undefined;
+    const entry = this.compressedFacts?.get(file);
+    if (!entry) return undefined;
+    if (entry.title && !compressedTitleCurrent(entry))
+      return { label: entry.title.label, fullLabel: entry.title.fullLabel };
+    return entry.carriedName;
+  }
+
+  private titleEntryOf(file: string): DerivedTitleEntry | undefined {
+    return this.titles.get(file) ?? this.compressedTitleOf(file);
+  }
+
+  // For a thread with a compressed entry, the shown record is the largest complete total. The ledger itself holds no
+  // compressed record.
+  private compressedSpendPick(files: readonly SpendFileIndex[]): readonly SpendFileIndex[] {
+    if (!this.compressedFacts?.size) return files;
+    const held = this.compressedSpendPicks.get(files);
+    if (held?.revision === this.compressedFactsRevision) return held.picked;
+    const candidates = [...this.compressedFacts.values()].flatMap((entry) =>
+      entry.spend
+        ? [
+            {
+              pairKey: entry.pairKey,
+              threadId: entry.threadId ?? null,
+              spend: entry.spend,
+              complete: entry.complete === true,
+            },
+          ]
+        : [],
+    );
+    const picked = compressedSpendDisplayFiles(
+      files,
+      candidates,
+      (file) => this.codexMetas.peek?.(file)?.sessionId ?? null,
+    );
+    this.compressedSpendPicks.set(files, { revision: this.compressedFactsRevision, picked });
+    return picked;
   }
 
   // Start delivery to every host before awaiting completion to preserve message call order.
@@ -11222,6 +11502,7 @@ export class PanelProvider implements vscode.Disposable {
     }
     finished.released = true;
     this.refreshFrom('cold-pass', false, true);
+    this.maybeStartCompressedLoad();
   }
 
   private noteColdPassNamedPaths(pass: { namedPaths?: Set<string> }): void {
@@ -11350,6 +11631,7 @@ export class PanelProvider implements vscode.Disposable {
           undefined,
           this.savedLinks,
           [...(this.savedPromptScans ?? []), ...(this.humanScans ?? [])],
+          [...(this.adoptionsUnsettled ?? [])].map(([plain, held]): [string, string] => [plain, held.twin]),
         );
       const published = this.workspaceCache
         ? this.workspaceCache.write(write, this.cacheShutdownFlushing, file)
@@ -11387,7 +11669,7 @@ export class PanelProvider implements vscode.Disposable {
     const windows = sessions
       ? new Map(
           sessions.flatMap((session) => {
-            const meta = this.titles.get(session.file);
+            const meta = this.titleEntryOf(session.file);
             return meta?.starts && sameSessionRevision(meta, session)
               ? [[session.sessionId, meta.starts] as const]
               : [];
@@ -11574,7 +11856,9 @@ export class PanelProvider implements vscode.Disposable {
 
   // Retain the last complete lifetime figures until a replacement read completes.
   private lifetimeDisplayFiles(): readonly SpendFileIndex[] {
-    return sessionLifetimeDisplayFiles(this.projectSpendBusy(), this.projectSpendFiles, this.projectSpendVisibleFiles);
+    return this.compressedSpendPick(
+      sessionLifetimeDisplayFiles(this.projectSpendBusy(), this.projectSpendFiles, this.projectSpendVisibleFiles),
+    );
   }
 
   private lifetimeFiguresBySession(): LifetimeFigures {
@@ -12214,7 +12498,9 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   private displayedProjectSpendFiles(): readonly SpendFileIndex[] {
-    return projectSpendDisplayFiles(this.projectSpendBusy(), this.projectSpendFiles, this.projectSpendVisibleFiles);
+    return this.compressedSpendPick(
+      projectSpendDisplayFiles(this.projectSpendBusy(), this.projectSpendFiles, this.projectSpendVisibleFiles),
+    );
   }
 
   private unknownProjectSpendSnapshot(): ProjectSpendView {
@@ -12282,7 +12568,8 @@ export class PanelProvider implements vscode.Disposable {
       tomorrow.setDate(tomorrow.getDate() + 1);
       // Complete display arrays remain stable while resumable indexing replaces its records.
       const files = this.projectSpendVisibleFiles;
-      const build = prepareProjectSpendViewSteps(files, price, {
+      // A thread with a compressed entry shows its largest complete total. The pick never enters the ledger.
+      const build = prepareProjectSpendViewSteps(this.compressedSpendPick(files), price, {
         now,
         historyCutoff: projectSpendHistoryCutoff(historyDays, now),
       });
@@ -12688,7 +12975,12 @@ export class PanelProvider implements vscode.Disposable {
 
   // Hydration, active indexing, and deferred offers each keep Project cost unsettled.
   private projectSpendBusy(): boolean {
-    return !this.projectSpendHydrated || this.projectSpendIndexing || this.projectSpendOffers.size > 0;
+    return (
+      !this.projectSpendHydrated ||
+      this.projectSpendIndexing ||
+      this.projectSpendOffers.size > 0 ||
+      this.compressedLoadPending
+    );
   }
 
   // Every source a spend offer would read, taken from the lists the last listing wrote.
@@ -13104,11 +13396,23 @@ export class PanelProvider implements vscode.Disposable {
   // Add the compressed rollouts that a walk listed or a wake batch named. A complete walk also removes every name it no
   // longer lists. An incomplete walk removes nothing, because its unread directories can still hold a listed name.
   private noteCompressedRollouts(names: readonly string[], walk?: SourceEnumeration): void {
+    let changed = false;
     if (walk?.status === 'complete') {
       const listed = new Set(walk.compressed);
-      for (const name of this.compressedRollouts) if (!listed.has(name)) this.compressedRollouts.delete(name);
+      for (const name of this.compressedRollouts) {
+        if (!listed.has(name)) {
+          this.compressedRollouts.delete(name);
+          changed = true;
+        }
+      }
     }
-    for (const name of names) this.compressedRollouts.add(name);
+    for (const name of names) {
+      if (!this.compressedRollouts.has(name)) {
+        this.compressedRollouts.add(name);
+        changed = true;
+      }
+    }
+    if (changed) this.compressedRolloutsRevision++;
   }
 
   // Enumerate Claude and Codex sessions in repository scope. Accepted metadata supplies the catalog's recorded-activity order.
@@ -13442,12 +13746,13 @@ export class PanelProvider implements vscode.Disposable {
     }
     // Trim opening metadata against every walked rollout, including files excluded from the session list.
     for (const file of staleMetas(this.codexMetas.keys(), listing.walked, listing.enumeration, absent)) {
+      if (this.adoptionsUnsettled.has(file)) continue;
       this.codexMetas.delete(file);
     }
     // Opening reads can finish before an incomplete walk visits their paths.
     this.codexOpenings?.setWalk(
       listing.enumeration.status === 'complete'
-        ? listing.walked
+        ? [...listing.walked, ...this.adoptionsUnsettled.keys()]
         : [...new Set([...listing.walked, ...this.codexMetas.keys()])],
     );
     if (this.codexMetas.revision !== codexRevision) {
@@ -13461,8 +13766,11 @@ export class PanelProvider implements vscode.Disposable {
             codex: listing.sources,
             children: listing.subagents,
           };
-    const codex = listing.sessions;
-    this.claudeParents = [...claude, ...codex];
+    const compressedRows = this.compressedRowsOf(listing, inRoots);
+    const codex = compressedRows.length
+      ? [...listing.sessions, ...compressedRows].sort((a, b) => b.mtimeMs - a.mtimeMs)
+      : listing.sessions;
+    this.claudeParents = [...claude, ...codex.filter((session) => !isCompressedRollout(session.file))];
     this.walkedClaude = claude.map((s) => s.file);
     // Exclude Claude peer wakes and commands answered by the CLI before catalog publication.
     const listed = deferHumanPrompts ? claude : claude.filter((s) => this.hasHumanPrompt(s, true));
@@ -13551,7 +13859,10 @@ export class PanelProvider implements vscode.Disposable {
     this.sessionSpendSources = this.sessionSpendSourceIndex.update(
       this.claudeSpendSources,
       this.claudeChildren,
-      codex,
+      // The spend sources hold plain names only, so a compressed row reads the spend record of its plain path.
+      codex.map((session) =>
+        isCompressedRollout(session.file) ? { ...session, file: session.file.replace(/\.zst$/, '') } : session,
+      ),
       this.codexSubagents,
       this.subagentDirectories,
       this.dispatchEdges(sessions),
@@ -13586,6 +13897,17 @@ export class PanelProvider implements vscode.Disposable {
       this.invalidateProjectSpendSnapshot();
       this.postDispatchedCostsIfMoved('spendSources');
     }
+  }
+
+  // The host set of compressed rollouts, when it changed since the last send to the current worker.
+  private compressedRolloutsToSend(): { compressed?: string[]; compressedStores?: CompressedStorePaths } {
+    const stores = this.compressedStorePaths();
+    if (!stores) return {};
+    const worker = this.progressiveWorker.currentThreadId ?? null;
+    const sent = this.compressedRolloutsSent;
+    if (sent && sent.worker === worker && sent.revision === this.compressedRolloutsRevision) return {};
+    this.compressedRolloutsSent = { worker, revision: this.compressedRolloutsRevision };
+    return { compressed: [...this.compressedRollouts], compressedStores: stores };
   }
 
   private async prepareClaudeChildren(
@@ -13773,6 +14095,7 @@ export class PanelProvider implements vscode.Disposable {
           repositoryRoots: this.repositoryScopeRoots,
           referenceEntries: [...this.claudeChildReferenceEntries],
           discovery: this.discoveryCheckpoint,
+          ...this.compressedRolloutsToSend(),
         },
         generation,
         signal,
@@ -14257,7 +14580,8 @@ export class PanelProvider implements vscode.Disposable {
     );
     for (const held of [this.titles, this.carriedNames]) {
       for (const file of held.keys()) {
-        if (!listed.has(file) && this.physicalMembershipOf(file) === 'absent') {
+        // A plain path stays while the adoption of its twin is unsettled.
+        if (!listed.has(file) && !this.adoptionsUnsettled?.has(file) && this.physicalMembershipOf(file) === 'absent') {
           held.delete(file);
           dropped = true;
         }
@@ -14468,7 +14792,7 @@ export class PanelProvider implements vscode.Disposable {
 
   // Return accepted rail metadata without reading the transcript. Unread files use neutral facts.
   private metaFor(session: SessionFile): DerivedTitleEntry {
-    const accepted = this.titles.get(session.file);
+    const accepted = this.titleEntryOf(session.file);
     if (session.agent === 'claude' && accepted && sameSessionRevision(accepted, session))
       this.onBackgroundWorkDetected?.(
         session,
@@ -14476,7 +14800,7 @@ export class PanelProvider implements vscode.Disposable {
         accepted.outcome?.openChildren ?? [],
       );
     return (
-      this.titles.get(session.file) ?? {
+      this.titleEntryOf(session.file) ?? {
         size: -1,
         mtimeMs: -1,
         label: '',
@@ -14666,7 +14990,7 @@ export class PanelProvider implements vscode.Disposable {
       }
     }
     const eligible = sessions.filter((session) => {
-      const entry = this.titles.get(session.file);
+      const entry = this.titleEntryOf(session.file);
       return entry && railEnrichmentNeeds(entry, session)?.recovery;
     });
     const eligibleIds = new Set(eligible.map((session) => session.sessionId));
@@ -14899,7 +15223,7 @@ export class PanelProvider implements vscode.Disposable {
 
   // Use accepted agent-specific names, then carried cache names, then an ID placeholder.
   private sessionLabel(session: SessionFile): { label: string; fullLabel: string } {
-    const carried = this.carriedNames.get(session.file);
+    const carried = this.carriedNames.get(session.file) ?? this.compressedCarriedNameOf(session.file);
     if (session.agent === 'claude') {
       const name = this.claudeName(session);
       return !name?.label && carried
