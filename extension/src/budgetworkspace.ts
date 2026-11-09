@@ -49,7 +49,7 @@ export interface BudgetWorkspace {
   // The dispatched rollout whose last turn has no end. A final reply completes it.
   runningRollout: BudgetSource;
   completeRunningRollout(at: number): void;
-  growChild(child: BudgetChild, at: number): void;
+  growSource(source: BudgetSource, at: number): void;
   // Adds rollouts that share a session id with a Claude parent, so the next walk reads their qualified openings.
   addCollisions(at: number): void;
 }
@@ -278,9 +278,9 @@ export function budgetWorkspace(root: string, seed = BUDGET_SEED, clock = BUDGET
     completeRunningRollout(at) {
       appendRecords(runningRollout.file, rolloutEnd(runningRollout.sessionId, at), at);
     },
-    growChild(child, at) {
+    growSource(source, at) {
       appendRecords(
-        child.file,
+        source.file,
         [{ type: 'user', timestamp: stamp(at), message: { role: 'user', content: 'One more step.' } }],
         at,
       );

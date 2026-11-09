@@ -68,7 +68,7 @@
     },
     "automatic save | readBytes": {
       "reason": "Discovery reads each source once, and the receipt scan reads each receipt once. A rise means a step reads files again.",
-      "budget": 19569,
+      "budget": 19563,
       "margin": 256
     },
     "automatic save | receiptChecks": {
@@ -173,7 +173,7 @@
     },
     "child watcher event | readBytes": {
       "reason": "Discovery reads each source once, and the receipt scan reads each receipt once. A rise means a step reads files again.",
-      "budget": 21344,
+      "budget": 21338,
       "margin": 256
     },
     "child watcher event | receiptChecks": {
@@ -333,7 +333,7 @@
     },
     "cold start | readBytes": {
       "reason": "Discovery reads each source once, and the receipt scan reads each receipt once. A rise means a step reads files again.",
-      "budget": 211697,
+      "budget": 211691,
       "margin": 256
     },
     "cold start | receiptChecks": {
@@ -453,7 +453,7 @@
     },
     "collision walk | readBytes": {
       "reason": "Discovery reads each source once, and the receipt scan reads each receipt once. A rise means a step reads files again.",
-      "budget": 40453,
+      "budget": 40441,
       "margin": 256
     },
     "collision walk | receiptChecks": {
@@ -753,7 +753,7 @@
     },
     "poll and backstop walk | readBytes": {
       "reason": "Discovery reads each source once, and the receipt scan reads each receipt once. A rise means a step reads files again.",
-      "budget": 18493,
+      "budget": 18487,
       "margin": 256
     },
     "poll and backstop walk | receiptChecks": {
@@ -787,6 +787,31 @@
       "margin": 0
     },
     "poll and backstop walk | workerRequest:claude-children": {
+      "reason": "The host sends a worker request only for work that held state cannot answer. A rise means a step asks the worker to read again.",
+      "budget": 1,
+      "margin": 0
+    },
+    "prompt scan save | humanPromptStat:walk": {
+      "reason": "Prompt admission checks a file only for this cause. A rise means settled sessions take file checks again.",
+      "budget": 8,
+      "margin": 0
+    },
+    "prompt scan save | posted:selection": {
+      "reason": "The panel receives one message for each publication, and a delta carries only changed rows. A rise means a step publishes more or carries more rows.",
+      "budget": 2,
+      "margin": 0
+    },
+    "prompt scan save | posted:selection:rows": {
+      "reason": "The panel receives one message for each publication, and a delta carries only changed rows. A rise means a step publishes more or carries more rows.",
+      "budget": 6,
+      "margin": 0
+    },
+    "prompt scan save | refreshCount:catalog-enumeration": {
+      "reason": "Each refresh that lists sessions runs one enumeration. A rise means a step runs extra catalog refreshes.",
+      "budget": 2,
+      "margin": 0
+    },
+    "prompt scan save | workerRequest:window": {
       "reason": "The host sends a worker request only for work that held state cannot answer. A rise means a step asks the worker to read again.",
       "budget": 1,
       "margin": 0
@@ -903,7 +928,7 @@
     },
     "selection switch | humanPromptStat:walk": {
       "reason": "Prompt admission checks a file only for this cause. A rise means settled sessions take file checks again.",
-      "budget": 4,
+      "budget": 8,
       "margin": 0
     },
     "selection switch | openingsRead:children": {
@@ -1066,6 +1091,11 @@
       "budget": 0,
       "margin": 0
     },
+    "warm start | humanPromptStat:walk": {
+      "reason": "Prompt admission checks a file only for this cause. A rise means settled sessions take file checks again.",
+      "budget": 2,
+      "margin": 0
+    },
     "warm start | openingsRead:children": {
       "reason": "A walk reads a child head only when the saved row cannot answer it. A rise means the child census reads every child again.",
       "budget": 30,
@@ -1103,7 +1133,7 @@
     },
     "warm start | posted:render:rows": {
       "reason": "The panel receives one message for each publication, and a delta carries only changed rows. A rise means a step publishes more or carries more rows.",
-      "budget": 346,
+      "budget": 347,
       "margin": 0
     },
     "warm start | posted:render:snapshot": {
@@ -1123,7 +1153,7 @@
     },
     "warm start | readBytes": {
       "reason": "Discovery reads each source once, and the receipt scan reads each receipt once. A rise means a step reads files again.",
-      "budget": 18493,
+      "budget": 21241,
       "margin": 256
     },
     "warm start | receiptChecks": {
@@ -1173,7 +1203,7 @@
     },
     "warm start | workerRequest:metadata": {
       "reason": "The host sends a worker request only for work that held state cannot answer. A rise means a step asks the worker to read again.",
-      "budget": 136,
+      "budget": 137,
       "margin": 0
     },
     "warm start | workerRequest:starts": {

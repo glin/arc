@@ -213,6 +213,7 @@ The script runs these steps in order:
 
 - `cold start`: the first activation on an empty cache. The test stubs its metadata and session list enrichment passes, so their reads do not count.
 - `automatic save`: an unrelated child grows and settles, and the host's own checkpoint timer writes the derived cache. The test skips the shutdown save, so the next activation reads only what the timer saved.
+- `prompt scan save`: a parent file grows and the panel selects it. The new prompt scan is the only change that the derived cache saves, and the next checkpoint writes it.
 - `warm start`: a second activation on that cache. The real metadata and enrichment passes run from here on.
 - `completion`: a dispatched rollout gains a final reply.
 - `child watcher event`: one child transcript grows.

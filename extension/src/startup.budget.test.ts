@@ -357,12 +357,21 @@ test('each step of the session list script stays within its recorded counts', as
     // Only the host's own checkpoint writes the cache here. A host that stops after a checkpoint keeps what that checkpoint saved.
     await step('automatic save', async () => {
       const child = workspace.children[3];
-      workspace.growChild(child, Date.now());
+      workspace.growSource(child, Date.now());
       watcherEvent(child.file);
       await active.settle();
       vi.advanceTimersByTime(CHECKPOINT_WAIT_MS);
     });
     assert.ok(fs.existsSync(workspace.derivedCacheFile), 'the automatic save never wrote the derived cache');
+    // A grown parent that the panel selects takes a prompt scan and changes nothing else that the cache saves. The warm start
+    // finds that scan only if the scan marked the cache dirty before this second save.
+    await step('prompt scan save', async () => {
+      const parent = workspace.parents[20];
+      workspace.growSource(parent, Date.now());
+      void active.receive({ type: 'showSession', session: parent.sessionId });
+      await active.settle();
+      vi.advanceTimersByTime(CHECKPOINT_WAIT_MS);
+    });
     active.provider.writeDerivedCache = () => true;
     active.provider.dispose();
     active.worker.stop();
@@ -376,7 +385,7 @@ test('each step of the session list script stays within its recorded counts', as
     });
     await step('child watcher event', () => {
       const child = workspace.children[7];
-      workspace.growChild(child, Date.now());
+      workspace.growSource(child, Date.now());
       watcherEvent(child.file);
     });
     await step(
