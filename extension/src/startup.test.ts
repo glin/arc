@@ -2494,6 +2494,10 @@ test('a fixture in the Arc home measure directory is not live data', () => {
 
 let panelProviderMembers: Set<string> | undefined;
 let harnessFaults: Error[] = [];
+// Providers built for the running test. A provider left with discovery pending reschedules its continuation at zero
+// delay for the rest of the file. A later test's fake clock runs that continuation once per fake millisecond, so a long
+// advance outlasts the test timeout.
+const harnessProviders = new Set<{ anyVisible?: () => boolean }>();
 // Each guarded harness has a signal that resolves with its fault. The signal lives here, outside the proxy, so reading it
 // never counts as a PanelProvider member read.
 const harnessFaultSignals = new WeakMap<object, Promise<Error>>();
@@ -2515,6 +2519,8 @@ function noteHarnessScopeMiss(provider: object | undefined, caught: unknown): vo
 const SCOPE_MISS_CATCH = '} catch (caught) { noteHarnessScopeMiss(this, caught);';
 
 afterEach(() => {
+  for (const provider of harnessProviders) provider.anyVisible = () => false;
+  harnessProviders.clear();
   const faults = harnessFaults;
   harnessFaults = [];
   if (faults.length) throw faults[0];
@@ -2605,6 +2611,7 @@ function guardedHarness<T extends object>(provider: T): T {
     harnessFaults.push(error);
     notify(error);
   };
+  harnessProviders.add(guarded);
   harnessFaultSignals.set(guarded, signal);
   harnessFaultSetters.set(guarded, fail);
   return guarded;
@@ -8746,6 +8753,40 @@ function recordedRefreshStages(provider: any): string[] {
   provider.performanceCounters.recordRefreshStage = (stage: string) => stages.push(stage);
   return stages;
 }
+
+// These two tests run in order. The first leaves a provider with discovery pending, and the second checks that provider.
+let abandoned: { provider: any; continued: number } | undefined;
+
+test('a discovery continuation left pending runs while its test runs', async () => {
+  vi.useFakeTimers(STREAM_TIMERS);
+  try {
+    const { provider } = heldWalkHarness();
+    const left = { provider, continued: 0 };
+    provider.dispatchDiscoveryPending = true;
+    provider.continueDiscovery = () => {
+      if (++left.continued < 3) provider.scheduleDiscoveryContinuation();
+    };
+    provider.scheduleDiscoveryContinuation();
+    await vi.advanceTimersByTimeAsync(10);
+    assert.equal(left.continued, 3, 'the continuation did not repeat at zero delay');
+    abandoned = left;
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('a discovery continuation left pending by an earlier test does not run on a later fake clock', async () => {
+  assert.ok(abandoned, 'the test before this one did not leave a continuation');
+  vi.useFakeTimers(STREAM_TIMERS);
+  try {
+    abandoned.continued = 0;
+    abandoned.provider.scheduleDiscoveryContinuation();
+    await vi.advanceTimersByTimeAsync(10);
+    assert.equal(abandoned.continued, 0, 'the earlier test left a continuation that runs on this fake clock');
+  } finally {
+    vi.useRealTimers();
+  }
+});
 
 test('a refresh past its deadline with a walk in progress completes the walk, and the request behind it does not walk again', async () => {
   vi.useFakeTimers(STREAM_TIMERS);
