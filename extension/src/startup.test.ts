@@ -17350,7 +17350,7 @@ async function selectedCacheMarksSent(
         unsentBySession,
         sessionRunningSince: () => new Map(),
         composerRuntimeBySession: () => new Map(),
-        promptsAcross: () => [],
+        recallPromptsOf: () => [],
         prunedSentPrompts: (sent: unknown) => sent,
         statsBySession: () => ({}),
       },

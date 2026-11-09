@@ -9453,3 +9453,18 @@ test('prompt recall after a scheduled turn returns what the reader typed and nev
   );
   assert.deepEqual(recallPromptsOf([], { prompt: 'a typed ask', startedAt: 1, laterPrompts: [] }), ['a typed ask']);
 });
+
+test('prompt recall offers each prompt of a turn that recorded two, so a press of Up sends one', () => {
+  assert.deepEqual(
+    recallPromptsOf([], {
+      prompt: 'and add a test\n\nnow commit',
+      startedAt: 1,
+      promptParts: [
+        { text: 'and add a test', at: 1, stepsBefore: 0 },
+        { text: 'now commit', at: 1, stepsBefore: 0 },
+      ],
+      laterPrompts: [],
+    }),
+    ['now commit', 'and add a test'],
+  );
+});

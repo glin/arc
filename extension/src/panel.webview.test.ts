@@ -32243,12 +32243,8 @@ test('the provider carries the walk between its two books and the composer', () 
       'the send control reads the stored draft, so it says Stop over a recalled prompt',
     ],
     [
-      'this.promptsBySession.set(t.sessionId, promptsAcross(',
+      'this.promptsBySession.set(t.sessionId, recallPromptsOf(',
       'the walk offers only what this window sent, losing every prompt written in a terminal',
-    ],
-    [
-      't.promptParts ?? [{ text: t.prompt, at: t.startedAt }]',
-      'a turn recording two prompts offers both as one, so a press of Up sends both at once',
     ],
     [
       'history: promptHistory(this.promptsBySession.get(row.id) ?? [], this.sentPrompts[row.id] ?? [])',
