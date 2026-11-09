@@ -1,6 +1,7 @@
 // @module-tag subprocess
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import { buildSync } from 'esbuild';
 import { beforeAll, test, vi } from 'vitest';
@@ -42,6 +43,13 @@ function paddedRoot(base: string): string {
   const root = path.join(real, 'p'.repeat(ROOT_LENGTH - real.length - 1));
   fs.mkdirSync(root);
   return root;
+}
+
+// The worker's receipt walk stops at the temporary directory, and the fixture root is a real path. The worker takes the
+// real spelling of that directory, so the walk stops at one level on every platform.
+function workerTemporaryEnvironment(directory: string, real: (file: string) => string): Record<string, string> {
+  const boundary = real(directory);
+  return { TMPDIR: boundary, TMP: boundary, TEMP: boundary };
 }
 
 // The discovery charges of each step: reads, scans, and spend reads inside one root.
@@ -113,7 +121,8 @@ beforeAll(async () => {
   }).outputFiles[0].text;
   // A frozen worker clock keeps every pass inside its deadlines, so one pass reads the same files on every run. It holds the
   // start of the script, so the open spend band of a recently changed file applies as it does in a real host.
-  workerSource = `performance.now=()=>0;Date.now=()=>${BUDGET_CLOCK};process.env.ARC_HOME=${JSON.stringify(workspace.home)};${bundle}`;
+  const temporary = workerTemporaryEnvironment(os.tmpdir(), fs.realpathSync.native);
+  workerSource = `performance.now=()=>0;Date.now=()=>${BUDGET_CLOCK};process.env.ARC_HOME=${JSON.stringify(workspace.home)};Object.assign(process.env,${JSON.stringify(temporary)});${bundle}`;
 });
 
 function counts(counters: { snapshot(): any }, posts: Counts): Counts {
@@ -273,6 +282,24 @@ function activate(options: { stubReadPasses: boolean }) {
   };
   return { provider, worker, posts, settle, receive: (message: unknown) => receive(message) };
 }
+
+test('the worker stops its receipt walk at the real temporary directory on macOS', async () => {
+  const { safeDispatchPath } = await import('./dispatchreceipts.ts');
+  const unresolved = '/var/folders/ab/T';
+  const resolved = `/private${unresolved}`;
+  const environment = workerTemporaryEnvironment(unresolved, (file) => (file === unresolved ? resolved : file));
+  const saved = Object.keys(environment).map((name) => [name, process.env[name]] as const);
+  Object.assign(process.env, environment);
+  try {
+    // The walk makes no file check at its boundary, so it returns for a path that exists on no host.
+    assert.doesNotThrow(() => safeDispatchPath(resolved, 'darwin'));
+  } finally {
+    for (const [name, value] of saved) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+});
 
 test('each step of the session list script stays within its recorded counts', async () => {
   const { normalizeFsPath, POLL_BACKSTOP_WALK_MS, BUDGET_CLOCK } = modules;
