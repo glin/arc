@@ -2760,7 +2760,7 @@ async function pressActiveOverLeavingSession(
 }
 
 test(
-  'the selected Active shortcut leaves the header when a tick drops its last session',
+  'the selected Active shortcut stays drawn at zero when a tick drops its last session',
   { timeout: 60_000 },
   async (t) => {
     const browser = await browserOrNone();
@@ -2779,7 +2779,7 @@ test(
       await page.clock.runFor(25_000);
       const after = await read();
       assert.equal(after.drawn, 0, 'the session did not leave the list on the tick that crossed the window');
-      assert.equal(after.pressed, null, 'the selected Active shortcut stayed drawn at zero');
+      assert.equal(after.pressed, 'true', 'the selected Active shortcut left the header at zero');
       assert.deepEqual(failures, [], 'the panel threw while the Active session left the list');
     } finally {
       await browser.close();
@@ -2870,7 +2870,7 @@ test('a tick that empties Active removes its button and hands focus on', { timeo
 });
 
 test(
-  'releasing a held text selection removes the selected Active shortcut that reached zero',
+  'releasing a held text selection keeps the selected Active shortcut that reached zero',
   { timeout: 60_000 },
   async (t) => {
     const browser = await browserOrNone();
@@ -2898,7 +2898,7 @@ test(
       await page.evaluate('getSelection().removeAllRanges()');
       await page.waitForFunction(`document.querySelector('.railcard[data-session="s1"]') === null`);
       const after = await read();
-      assert.equal(after.pressed, null, 'the selected Active shortcut stayed drawn at zero after selection release');
+      assert.equal(after.pressed, 'true', 'the selected Active shortcut left the header after selection release');
       assert.deepEqual(failures, [], 'the panel threw while releasing the held selection');
     } finally {
       await browser.close();

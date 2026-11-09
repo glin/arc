@@ -1076,7 +1076,7 @@ test('a lens count is pressed while the query holds its words, whatever wrote th
   assert.equal(railCountPressed('active', { ...ALL_LENS, query: 'is:needsyou -is:archived -is:agentrun' }), false);
 });
 
-test('a selected configured zero-match lens other than Active keeps its live count and clearing action', () => {
+test('a selected configured zero-match lens keeps its live count and clearing action', () => {
   const zero = { running: 0, warm: 0, expiring: 0, active: 0, unread: 0, input: 0 };
   const kinds = (buttons: readonly { kind: RailLens }[]) => buttons.map((each) => each.kind);
   assert.deepEqual(kinds(railCountButtons(zero, ALL_LENS, HEAD_WORDS, RAIL_LENSES)), []);
@@ -1085,34 +1085,34 @@ test('a selected configured zero-match lens other than Active keeps its live cou
       const query = `label:ui ${RAIL_LENS_WORDS[lens]}`;
       const selected = { filterId, query };
       assert.deepEqual(railCountButtons(zero, selected, HEAD_WORDS, []), [], lens);
-      // Active hides at zero even while held. Every other lens stays while held.
       const buttons = railCountButtons(zero, selected, HEAD_WORDS, RAIL_LENSES);
-      assert.deepEqual(kinds(buttons), lens === 'active' ? [] : [lens], lens);
+      assert.deepEqual(kinds(buttons), [lens], lens);
       const cleared = { ...selected, query: pressRailLens(query, lens) };
       assert.equal(cleared.query, 'label:ui');
       assert.deepEqual(kinds(railCountButtons(zero, cleared, HEAD_WORDS, RAIL_LENSES)), []);
-      if (lens === 'active') {
-        continue;
-      }
       const button = buttons.find((each) => each.kind === lens)!;
       assert.deepEqual(
-        [button.kind, button.figure, button.pressed, button.hint, button.name],
-        [lens, '0', true, HEAD_WORDS.pressedHint, `${LENS_NAMES[lens]}, 0 ${HEAD_WORDS.sessions}`],
+        [button.kind, button.figure, button.pressed, button.hint],
+        [lens, '0', true, HEAD_WORDS.pressedHint],
       );
+      // Only Active appends a cache sentence to the name.
+      const cache = lens === 'active' ? `. ${HEAD_WORDS.cacheNone}` : '';
+      assert.equal(button.name, `${LENS_NAMES[lens]}, 0 ${HEAD_WORDS.sessions}${cache}`, lens);
     }
   }
 });
 
-// A held Active lens reads 0 once its window empties. The filter box query term clears it.
-test('Active hides at a count of 0 whether selected or not', () => {
+// A held Active lens reads 0 once its window empties. The press and the query term clear it.
+test('Active hides at a count of 0 only while unselected', () => {
   const zero = { running: 0, warm: 0, expiring: 0, active: 0, unread: 0, input: 0 };
   const kinds = (counts: typeof zero | null, query: string) =>
     railCountButtons(counts, { ...ALL_LENS, query }, HEAD_WORDS, RAIL_LENSES).map((each) => each.kind);
   assert.deepEqual(kinds(zero, ''), []);
-  assert.deepEqual(kinds(zero, RAIL_LENS_WORDS.active), []);
+  assert.deepEqual(kinds(zero, RAIL_LENS_WORDS.active), ['active']);
+  assert.deepEqual(kinds(zero, `${RAIL_LENS_WORDS.active} label:ui`), ['active']);
   assert.deepEqual(kinds({ ...zero, active: 1 }, ''), ['active']);
   assert.deepEqual(kinds({ ...zero, active: 1 }, RAIL_LENS_WORDS.active), ['active']);
-  // Before the catalog supplies counts, a held Active lens draws without a figure so it stays clearable.
+  // Before the catalog supplies counts, a held Active lens draws without a figure.
   assert.deepEqual(kinds(null, RAIL_LENS_WORDS.active), ['active']);
   assert.deepEqual(kinds(null, ''), []);
 });

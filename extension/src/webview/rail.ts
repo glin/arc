@@ -2368,7 +2368,8 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     drawActiveWindowPop();
     drawTop();
     if (returnFocus) {
-      // Choosing a window that counts 0 removes Active and its caret, and drawTop has already moved focus.
+      // A held Active lens keeps Active and its caret at a count of 0, so focus returns to the caret.
+      // Without a held lens, choosing a window that counts 0 removes Active, and drawTop has already moved focus.
       // The fallback covers a row that did not hold focus.
       if (railWindowButton?.isConnected) {
         railWindowButton.focus();
