@@ -220,7 +220,6 @@ export class CodexMetaCache {
     private readMeta: (file: string, onRead?: () => void) => CodexSessionMeta | null | undefined = readCodexOpening,
     private sizeOf: (file: string) => number | null = fileSize,
     private now: () => number = () => performance.now(),
-    private statOf: (file: string) => RolloutStat | null = readRolloutStat,
   ) {}
 
   private current(file: string, stat: RolloutStat | null): CodexSessionMeta | null {
@@ -264,10 +263,10 @@ export class CodexMetaCache {
   }
 
   // A compressed rollout gets no opening read, and its name gets no entry. `onRead` runs once, before the first read of a file that opens.
+  // Without `stat`, a held opening answers as it stands, with no stat and no read.
   get(file: string, onRead?: () => void, stat?: RolloutStat | null): CodexSessionMeta | null {
     if (isCompressedRollout(file)) return null;
-    stat = stat === undefined ? this.statOf(file) : stat;
-    const current = this.current(file, stat);
+    const current = stat === undefined ? this.savedOpening(file) : this.current(file, stat);
     if (current) return current;
     const hit = this.entries.get(file);
     let size: number | null = null;
@@ -299,6 +298,25 @@ export class CodexMetaCache {
 
   // The held opening of a file, with no read.
   peek(file: string): CodexSessionMeta | null {
+    return this.entries.get(file)?.meta ?? null;
+  }
+
+  // The opening of one listing. Only an opening that lists in `inFolders` needs the stat its row takes anyway.
+  // `timed` wraps only the opening lookup, so the stat stays in the timing of its own reader.
+  listingOpening(
+    file: string,
+    stat: () => RolloutStat | null,
+    inFolders: (cwd: string) => boolean,
+    onRead?: () => void,
+    timed: (lookup: () => CodexSessionMeta | null) => CodexSessionMeta | null = (lookup) => lookup(),
+  ): CodexSessionMeta | null {
+    const held = this.savedOpening(file);
+    const current = held?.cwd && inFolders(held.cwd) && !isHiddenThread(held) ? stat() : undefined;
+    return timed(() => this.get(file, onRead, current));
+  }
+
+  // The held opening of a rollout, with no stat and no read.
+  savedOpening(file: string): CodexSessionMeta | null {
     return this.entries.get(file)?.meta ?? null;
   }
 
@@ -1132,7 +1150,11 @@ export function codexRowAdmitted(
 export function codexSessionFiles(
   root: string,
   folders: string[],
-  metaOf: (file: string, stat: () => RolloutStat | null) => CodexSessionMeta | null = readCodexSessionMeta,
+  metaOf: (
+    file: string,
+    stat: () => RolloutStat | null,
+    inFolders: (cwd: string) => boolean,
+  ) => CodexSessionMeta | null = readCodexSessionMeta,
   statOf: (file: string) => RolloutStat | null = readRolloutStat,
   walked?: string[],
   enumeration: SourceEnumeration = walked
@@ -1162,7 +1184,8 @@ export function codexSessionFiles(
     if (isCompressedRollout(file)) continue;
     let stat: RolloutStat | null | undefined;
     const currentStat = () => (stat === undefined ? (stat = statOf(file)) : stat);
-    const meta = metaOf(file, currentStat);
+    // Check cached opening metadata before requesting a stat. Other workspaces need no stat read here.
+    const meta = metaOf(file, currentStat, cwdInFolders);
     // No readable opening record means no cwd, and the path holds none either, so there is
     // nothing that puts the session in this workspace.
     if (!meta || !meta.cwd) admission = 'incomplete';

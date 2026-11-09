@@ -15924,7 +15924,7 @@ test('a saved Codex opening lists the replacement session at the next listing an
   const file = rolloutFiles(root)[0];
   const clock = new Date('2030-01-01T00:00:00Z');
   fs.utimesSync(file, clock, clock);
-  const cache = new CodexMetaCache(undefined, undefined, undefined, () => assert.fail('listing repeats its stat'));
+  const cache = new CodexMetaCache();
   const counters = new PanelPerformanceCounters();
   const list = () =>
     codexSessionFiles(root, ['c:/repo', 'c:/next'], (file, stat) =>
@@ -16041,6 +16041,40 @@ test.each(['win32', 'darwin', 'linux'] as const)('a legacy Codex opening adopts 
     assert.equal(cache.snapshot()[0][1].fileIdentity?.dev, stat.dev, difference);
     assert.equal(cache.snapshot()[0][1].fileIdentity?.ino, stat.ino, difference);
   }
+});
+
+test('a listing stats only the rollouts whose saved openings list in its folders', async () => {
+  const root = sessionsRoot([
+    { day: '2026/08/25', name: ROLLOUT(UUID_A), records: [meta({ id: UUID_A })] },
+    { day: '2026/08/25', name: ROLLOUT(UUID_B), records: [meta({ id: UUID_B, cwd: 'c:\\other' })] },
+    { day: '2026/08/25', name: ROLLOUT(UUID_C), records: [meta({ id: UUID_C, thread_source: 'guardian_review' })] },
+  ]);
+  const [listed, other] = [UUID_A, UUID_B].map((id) => rolloutFiles(root).find((file) => file.includes(id))!);
+  const cache = new CodexMetaCache();
+  const statted: string[] = [];
+  const list = () =>
+    codexSessionFiles(
+      root,
+      ['c:/repo'],
+      (file, stat, inFolders) => cache.listingOpening(file, stat, inFolders),
+      (file) => {
+        statted.push(file);
+        return readRolloutStat(file);
+      },
+    );
+  assert.deepEqual(
+    list().sessions.map((session) => session.sessionId),
+    [UUID_A],
+  );
+  assert.deepEqual(statted, [listed], 'a first listing stats only its own row');
+  statted.length = 0;
+  list();
+  assert.deepEqual(statted, [listed], 'a held listing stats only its own row');
+  fs.renameSync(other, `${other}.retired`);
+  fs.writeFileSync(other, JSON.stringify(meta({ id: UUID_B })) + '\n');
+  assert.equal(list().sessions.length, 1, 'a listing qualified an opening of another workspace');
+  await cache.prime(rolloutFiles(root));
+  assert.equal(list().sessions.length, 2, 'the cold pass left an opening of another workspace unqualified');
 });
 
 test('a warm prime qualifies openings in bounded lanes without a synchronous stat', async () => {

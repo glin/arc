@@ -84,7 +84,7 @@ test.each(['shared', 'derived'] as const)('the %s opening loader retains current
     const cache = new CodexMetaCache();
     cache.load(loaded);
     let reads = 0;
-    assert.equal(cache.get(rollout, () => reads++)?.sessionId, 'session');
+    assert.equal(cache.get(rollout, () => reads++, readRolloutStat(rollout))?.sessionId, 'session');
     assert.equal(reads, meta.size === undefined ? 1 : 0);
     assert.deepEqual(cache.snapshot()[0][1], current);
   }
