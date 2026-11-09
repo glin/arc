@@ -6,7 +6,18 @@ import * as fs from 'node:fs';
 import * as zlib from 'node:zlib';
 import { createHash } from 'node:crypto';
 import { tempDir } from './temproot.ts';
-import { readCompressedStore } from './compressedstore.ts';
+import {
+  compressedEntryBatches,
+  compressedEntryVersions,
+  compressedPairKey,
+  readCompressedStore,
+  type CompressedEntrySeed,
+  type CompressedFactEntry,
+  type CompressedStoreHolder,
+} from './compressedstore.ts';
+import { CompressedBackfill, compressedFactsFromDerivation, RolloutDerivation } from './compressedbackfill.ts';
+import { streamCompressedRollout } from './compressedrollouts.ts';
+import { indexSpendFile, spendRecordTotal } from './projectspend.ts';
 import * as path from 'node:path';
 import { buildSync } from 'esbuild';
 import { once } from 'node:events';
@@ -37,7 +48,12 @@ import {
   type SessionRead,
   type Turn,
 } from './transcript';
-import { readCodexSession } from './codex';
+import {
+  createCodexUsageLineReducer,
+  readCodexSession,
+  readCodexSessionTitlePair,
+  type CodexSessionMeta,
+} from './codex';
 import { scanCodexDispatchReferences } from './codex';
 import { railCacheMarkOf, sessionParentIndex, agentRunAnswer } from './turnrail';
 import { logOf, toCard, turnCost } from './turncard';
@@ -15344,3 +15360,514 @@ test.skipIf(!zstdCompress)(
     }
   },
 );
+
+const instantYield = () => Promise.resolve();
+
+const compressedOpening = {
+  sessionId: COMPRESSED_THREAD,
+  cwd: '/repo',
+  threadSource: null,
+  parentThreadId: null,
+  hasSubagentSource: false,
+  launchSource: null,
+  subagentKind: null,
+} as unknown as CodexSessionMeta;
+
+// A backfill over a manual clock. The test advances the clock and runs what `schedule` holds, so no test waits on real
+// time. Store holders are replaced by arrays when a test does not read the store.
+function backfillHarness(overrides: Partial<ConstructorParameters<typeof CompressedBackfill>[0]> = {}) {
+  let clock = 1_000_000;
+  const scheduled: { at: number; run: () => void }[] = [];
+  const batches: { entries: CompressedFactEntry[]; backfillMs: number; at: number }[] = [];
+  const facts: CompressedFactEntry[] = [];
+  const openings: CompressedFactEntry[] = [];
+  const holder = (written: CompressedFactEntry[]) =>
+    ({
+      directory: tempDir('backfill-store-'),
+      append: async (entries: CompressedFactEntry[]) => {
+        written.push(...entries);
+        return entries.map(() => true);
+      },
+      durable: async () => true,
+    }) as unknown as CompressedStoreHolder;
+  const known = new Map<string, CompressedEntrySeed>();
+  const backfill = new CompressedBackfill({
+    facts: holder(facts),
+    openings: holder(openings),
+    workspace: 'workspace',
+    roots: ['/'],
+    launch: 'launch-1',
+    busy: () => false,
+    known: () => known,
+    inFolders: () => () => true,
+    post: (batch) => batches.push({ ...batch, at: clock }),
+    now: () => clock,
+    schedule: (milliseconds, run) => {
+      const item = { at: clock + milliseconds, run };
+      scheduled.push(item);
+      return () => scheduled.splice(scheduled.indexOf(item), 1);
+    },
+    yieldStep: instantYield,
+    wait: instantYield,
+    ...overrides,
+  });
+  const advance = (milliseconds: number) => {
+    clock += milliseconds;
+    for (const item of scheduled.filter((held) => held.at <= clock)) {
+      scheduled.splice(scheduled.indexOf(item), 1);
+      item.run();
+    }
+  };
+  return { backfill, facts, openings, batches, known, advance, scheduled, now: () => clock };
+}
+
+// The plain facts of a rollout, computed the way a plain row computes them.
+function plainFactsOf(plain: string, workspace: string) {
+  return {
+    title: readCodexSessionTitlePair(plain),
+    stats: sessionStatFactsOf(
+      readCodexSession(plain, COMPRESSED_THREAD, { maxTurns: 40, tailBytes: 1024 * 1024 * 1024 }),
+    ),
+    spend: spendRecordTotal(indexSpendFile(undefined, plain, workspace, () => createCodexUsageLineReducer()).record),
+  };
+}
+
+async function derivedFactsOf(file: string, limits: { reduceAbove: number; recordBytes: number }) {
+  const derivation = new RolloutDerivation(file, 'workspace', limits);
+  const read = await streamCompressedRollout(file, (chunk) => derivation.push(chunk));
+  assert.ok(read.kind === 'decoded');
+  return compressedFactsFromDerivation(file, read, derivation);
+}
+
+const reasoningRecord = {
+  timestamp: timestamp(70),
+  type: 'response_item',
+  payload: { type: 'reasoning', encrypted_content: 'z'.repeat(5000) },
+};
+
+test.skipIf(!zstdCompress)(
+  'a skipped record without usage leaves title, turns and cost equal to the plain copy',
+  async () => {
+    const pair = compressedRolloutPair((turn) => (turn === 1 ? [reasoningRecord] : []));
+    try {
+      const plain = plainFactsOf(pair.plain, 'workspace');
+      const entry = await derivedFactsOf(pair.compressed, { reduceAbove: 1024, recordBytes: 4096 });
+      assert.equal(entry.skippedRecords, 1, 'the record past the limit was not skipped');
+      assert.equal(entry.undercount, false, 'a record without usage set the undercount mark');
+      assert.equal(entry.title?.label, plain.title.short);
+      assert.equal(entry.title?.fullLabel, plain.title.full);
+      assert.deepEqual(entry.title?.stats, plain.stats, 'the skipped record changed the turns or their facts');
+      assert.deepEqual(spendRecordTotal(entry.spend!), plain.spend, 'the skipped record changed the cost');
+      assert.equal(entry.complete, true);
+      assert.equal(entry.decodedLength, pair.body.length);
+      assert.equal(entry.pairKey, compressedPairKey(pair.compressed));
+    } finally {
+      fs.rmSync(pair.directory, { recursive: true, force: true });
+    }
+  },
+);
+
+test.skipIf(!zstdCompress)('a skipped usage record sets the undercount mark', async () => {
+  const pair = compressedRolloutPair((turn) =>
+    turn === 1
+      ? [
+          {
+            timestamp: timestamp(70),
+            type: 'event_msg',
+            payload: { type: 'token_count', pad: 'z'.repeat(9000), info: null },
+          },
+        ]
+      : [],
+  );
+  try {
+    const entry = await derivedFactsOf(pair.compressed, { reduceAbove: 1024, recordBytes: 4096 });
+    assert.equal(entry.skippedRecords, 1);
+    assert.equal(entry.undercount, true, 'a skipped usage record did not set the undercount mark');
+  } finally {
+    fs.rmSync(pair.directory, { recursive: true, force: true });
+  }
+});
+
+test.skipIf(!zstdCompress)('the backfill starts only after a load names it, and a list before it waits', async () => {
+  const pair = compressedRolloutPair();
+  const stores = { facts: path.join(pair.directory, 'facts'), openings: path.join(pair.directory, 'openings') };
+  let decodes = 0;
+  const worker = new ProgressiveWorker(source, undefined, undefined, undefined, undefined, () => {
+    decodes++;
+  });
+  try {
+    const signal = new AbortController().signal;
+    await worker.run(
+      {
+        kind: 'claude-children',
+        parents: [],
+        repositoryRoots: [pair.directory],
+        compressed: [pair.compressed],
+        compressedStores: stores,
+      } as never,
+      1,
+      signal,
+    );
+    assert.equal(decodes, 0, 'a list before the first load decoded a rollout');
+    await worker.run({ kind: 'compressed-load', stores }, 2, signal);
+    assert.equal(decodes, 0, 'a load without the backfill field started the backfill');
+    // The first load releases the list it waited for.
+    await vi.waitFor(() =>
+      assert.equal(
+        readCompressedStore(stores.facts).entries.get(pair.compressed)?.nameOnly,
+        true,
+        'the held list was lost',
+      ),
+    );
+    await worker.run(
+      {
+        kind: 'compressed-load',
+        stores,
+        backfill: { workspace: pair.directory, roots: [pair.directory], launch: 'one' },
+      },
+      3,
+      signal,
+    );
+    await vi.waitFor(() => {
+      const entry = readCompressedStore(stores.facts).entries.get(pair.compressed);
+      assert.equal(entry?.decodedLength, pair.body.length, 'the backfill did not publish the decoded entry');
+      assert.equal(entry?.complete, true);
+    });
+    assert.ok(decodes > 0, 'the decode was not counted');
+  } finally {
+    worker.stop();
+    fs.rmSync(pair.directory, { recursive: true, force: true });
+  }
+});
+
+test.skipIf(!zstdCompress)(
+  'a stream cut inside a frame retries at 10 s, 60 s and 600 s and then saves unreadable',
+  async () => {
+    const pair = compressedRolloutPair(undefined, 2);
+    const whole = fs.readFileSync(pair.compressed);
+    fs.writeFileSync(pair.compressed, whole.subarray(0, whole.length - 8));
+    let decodes = 0;
+    const harness = backfillHarness({
+      stream: async (...args) => {
+        decodes++;
+        return streamCompressedRollout(...args);
+      },
+      exists: () => false,
+    });
+    const { backfill, batches, advance, scheduled } = harness;
+    try {
+      backfill.setNames([pair.compressed]);
+      await vi.waitFor(() => assert.equal(scheduled.length, 1, 'the cut twin did not schedule a retry'));
+      assert.equal(decodes, 1, 'the first decode did not run');
+      assert.equal(scheduled[0].at - harness.now(), 10_000);
+      advance(9_999);
+      assert.equal(decodes, 1, 'the retry ran before 10 s');
+      advance(1);
+      await vi.waitFor(() => assert.equal(decodes, 2));
+      await vi.waitFor(() => assert.equal(scheduled.length, 1));
+      assert.equal(scheduled[0].at - harness.now(), 60_000);
+      advance(60_000);
+      await vi.waitFor(() => assert.equal(decodes, 3));
+      await vi.waitFor(() => assert.equal(scheduled.length, 1));
+      assert.equal(scheduled[0].at - harness.now(), 600_000);
+      advance(600_000);
+      await vi.waitFor(() => assert.equal(decodes, 4));
+      await vi.waitFor(() => {
+        advance(1_000);
+        assert.equal(batches.flatMap((batch) => batch.entries).length, 1, 'no unreadable entry');
+      });
+      const entry = batches.flatMap((batch) => batch.entries)[0];
+      assert.equal(entry.unreadable, true);
+      assert.equal(entry.unreadableLaunch, 'launch-1');
+      assert.equal(entry.decodedLength, undefined, 'an unreadable entry claimed a decoded length');
+      assert.equal(entry.nameOnly, true, 'an unreadable entry without earlier facts gives a row');
+      // The same launch tries nothing else for the saved revision.
+      harness.known.set(pair.compressed, entry);
+      backfill.setNames([pair.compressed]);
+      await vi.waitFor(() => assert.equal(scheduled.length, 0));
+      assert.equal(decodes, 4, 'the saved revision was tried again in the same launch');
+      // A new revision restarts the count at the first delay.
+      fs.writeFileSync(pair.compressed, whole.subarray(0, whole.length - 4));
+      harness.known.delete(pair.compressed);
+      backfill.setNames([pair.compressed]);
+      await vi.waitFor(() => assert.equal(decodes, 5, 'a new revision did not restart the count'));
+      await vi.waitFor(() => assert.equal(scheduled.length, 1));
+      assert.equal(scheduled[0].at - harness.now(), 10_000, 'the count did not restart at the first delay');
+    } finally {
+      backfill.dispose();
+      fs.rmSync(pair.directory, { recursive: true, force: true });
+    }
+  },
+);
+
+test.skipIf(!zstdCompress)('a new size or modification time restarts the retry count', async () => {
+  const pair = compressedRolloutPair(undefined, 2);
+  const whole = fs.readFileSync(pair.compressed);
+  fs.writeFileSync(pair.compressed, whole.subarray(0, whole.length - 8));
+  let decodes = 0;
+  const harness = backfillHarness({
+    stream: async (...args) => {
+      decodes++;
+      return streamCompressedRollout(...args);
+    },
+    exists: () => false,
+  });
+  const { backfill, advance, scheduled } = harness;
+  try {
+    backfill.setNames([pair.compressed]);
+    await vi.waitFor(() => assert.equal(scheduled.length, 1, 'the cut twin did not schedule a retry'));
+    assert.equal(scheduled[0].at - harness.now(), 10_000);
+    advance(10_000);
+    await vi.waitFor(() => assert.equal(decodes, 2));
+    await vi.waitFor(() => assert.equal(scheduled.length, 1));
+    assert.equal(scheduled[0].at - harness.now(), 60_000, 'the second failure did not take the second delay');
+    // Another cut of the file is a new revision, so its next failure takes the first delay again.
+    fs.writeFileSync(pair.compressed, whole.subarray(0, whole.length - 3));
+    advance(60_000);
+    await vi.waitFor(() => assert.equal(decodes, 3));
+    await vi.waitFor(() => assert.equal(scheduled.length, 1));
+    assert.equal(scheduled[0].at - harness.now(), 10_000, 'a new revision kept the old retry count');
+  } finally {
+    backfill.dispose();
+    fs.rmSync(pair.directory, { recursive: true, force: true });
+  }
+});
+
+const unitStat = { size: 10, mtimeMs: 2, dev: 1, ino: 1 };
+const unitDecoded = (hash = 'h') =>
+  ({ kind: 'decoded', hash, stat: unitStat as never, frames: 1, complete: true }) as const;
+
+function seedBody(harness: ReturnType<typeof backfillHarness>, file: string): void {
+  harness.known.set(file, {
+    file,
+    pairKey: file,
+    ...compressedEntryVersions(),
+    opening: compressedOpening,
+  });
+}
+
+test('the slice ends after 4 MiB of output', async () => {
+  const yields: number[] = [];
+  const harness = backfillHarness({
+    exists: () => false,
+    statOf: () => ({ ...unitStat, isFile: true }),
+    yieldStep: async () => {
+      yields.push(harness.now());
+    },
+    stream: async (_file, consume) => {
+      const chunk = Buffer.alloc(1024 * 1024, 0x20);
+      for (let index = 0; index < 9; index++) await consume(chunk);
+      return unitDecoded();
+    },
+  });
+  try {
+    seedBody(harness, 'a.jsonl.zst');
+    harness.backfill.setNames(['a.jsonl.zst']);
+    await vi.waitFor(() => assert.equal(harness.facts.length, 1));
+    assert.equal(yields.length, 2, 'nine chunks of 1 MiB did not end two slices');
+  } finally {
+    harness.backfill.dispose();
+  }
+});
+
+test('the slice ends after 50 ms', async () => {
+  const yields: number[] = [];
+  const harness = backfillHarness({
+    exists: () => false,
+    statOf: () => ({ ...unitStat, isFile: true }),
+    yieldStep: async () => {
+      yields.push(harness.now());
+    },
+    stream: async (_file, consume) => {
+      await consume(Buffer.alloc(100));
+      harness.advance(50);
+      await consume(Buffer.alloc(100));
+      await consume(Buffer.alloc(100));
+      return unitDecoded();
+    },
+  });
+  try {
+    seedBody(harness, 'b.jsonl.zst');
+    harness.backfill.setNames(['b.jsonl.zst']);
+    await vi.waitFor(() => assert.equal(harness.facts.length, 1));
+    assert.equal(yields.length, 1, 'a 50 ms slice did not end at its deadline');
+  } finally {
+    harness.backfill.dispose();
+  }
+});
+
+test('the worker posts at most one batch per second, of 4 MiB or one larger record', async () => {
+  let decodes = 0;
+  const harness = backfillHarness({
+    exists: () => false,
+    statOf: () => ({ ...unitStat, isFile: true }),
+    stream: async () => {
+      decodes++;
+      return unitDecoded(`h${decodes}`);
+    },
+  });
+  try {
+    for (const name of ['a', 'b', 'c']) seedBody(harness, `${name}.jsonl.zst`);
+    harness.backfill.setNames(['a.jsonl.zst', 'b.jsonl.zst', 'c.jsonl.zst']);
+    await vi.waitFor(() => assert.equal(harness.facts.length, 3));
+    await vi.waitFor(() => {
+      harness.advance(0);
+      assert.equal(harness.batches.length, 1, 'the first batch did not go out at once');
+    });
+    assert.equal(harness.batches[0].entries.length, 3);
+    // An entry inside the next second waits for that second.
+    harness.known.delete('a.jsonl.zst');
+    seedBody(harness, 'd.jsonl.zst');
+    harness.backfill.setNames(['d.jsonl.zst', 'b.jsonl.zst']);
+    await vi.waitFor(() => assert.equal(harness.facts.length, 4));
+    harness.advance(999);
+    assert.equal(harness.batches.length, 1, 'a second batch went out inside the same second');
+    harness.advance(1);
+    await vi.waitFor(() => assert.equal(harness.batches.length, 2, 'the second batch did not go out after a second'));
+    assert.ok(harness.batches[1].at - harness.batches[0].at >= 1_000, 'two batches came within a second');
+  } finally {
+    harness.backfill.dispose();
+  }
+});
+
+test('a record above the batch size goes alone, and a list replaces the set', async () => {
+  const oversized = 'z'.repeat(5 * 1024 * 1024);
+  const harness = backfillHarness({
+    exists: () => false,
+    statOf: () => ({ ...unitStat, isFile: true }),
+    stream: async () => unitDecoded(),
+  });
+  try {
+    seedBody(harness, 'big.jsonl.zst');
+    seedBody(harness, 'small.jsonl.zst');
+    const batches = compressedEntryBatches([
+      {
+        file: 'big',
+        pairKey: 'big',
+        factsVersion: 1,
+        codexMetaVersion: 1,
+        metadataGeneration: 1,
+        spendGeneration: 1,
+        hash: oversized,
+      },
+      {
+        file: 'small',
+        pairKey: 'small',
+        factsVersion: 1,
+        codexMetaVersion: 1,
+        metadataGeneration: 1,
+        spendGeneration: 1,
+      },
+    ]);
+    assert.deepEqual(
+      batches.map((batch) => batch.length),
+      [1, 1],
+      'a record above 4 MiB did not form its own batch',
+    );
+  } finally {
+    harness.backfill.dispose();
+  }
+});
+
+test('the backfill orders its queue, skips a twin, and treats each list as the complete set', async () => {
+  const stat = (mtimeMs: number) => ({ size: 10, mtimeMs, dev: 1, ino: 1, isFile: true });
+  const stats: Record<string, ReturnType<typeof stat>> = {
+    'new-event.jsonl.zst': stat(1),
+    'failed.jsonl.zst': stat(2),
+    'adopted.jsonl.zst': stat(3),
+    'unplaced.jsonl.zst': stat(4),
+    'old-body.jsonl.zst': stat(5),
+    'new-body.jsonl.zst': stat(6),
+    'twin.jsonl.zst': stat(7),
+    'gone.jsonl.zst': stat(8),
+  };
+  const order: string[] = [];
+  const firsts: string[] = [];
+  const versions = compressedEntryVersions();
+  const list = [
+    'old-body.jsonl.zst',
+    'unplaced.jsonl.zst',
+    'new-body.jsonl.zst',
+    'adopted.jsonl.zst',
+    'failed.jsonl.zst',
+    'twin.jsonl.zst',
+  ];
+  const harness = backfillHarness({
+    exists: (file) => file === 'twin.jsonl',
+    statOf: (file) => stats[file] ?? null,
+    readFirst: async (file) => {
+      firsts.push(file);
+      return JSON.stringify({
+        type: 'session_meta',
+        timestamp: timestamp(0),
+        payload: { id: COMPRESSED_THREAD, cwd: '/repo' },
+      });
+    },
+    stream: async (file) => {
+      order.push(file);
+      return { kind: 'decoded', hash: file, stat: stats[file], frames: 1, complete: true };
+    },
+  });
+  try {
+    const seed = (file: string, fields: Partial<CompressedEntrySeed>) =>
+      harness.known.set(file, {
+        file,
+        pairKey: file,
+        ...versions,
+        size: 10,
+        mtimeMs: stats[file].mtimeMs,
+        ...fields,
+      });
+    seed('failed.jsonl.zst', { adoptionFailed: true, opening: compressedOpening });
+    seed('adopted.jsonl.zst', { adopted: true, opening: compressedOpening });
+    seed('old-body.jsonl.zst', { opening: compressedOpening });
+    seed('new-body.jsonl.zst', { opening: compressedOpening });
+    seed('gone.jsonl.zst', { opening: compressedOpening });
+    harness.backfill.setNames([...list, 'gone.jsonl.zst']);
+    // A later list adds a name and drops another. The added name goes first and the dropped one never decodes.
+    harness.backfill.setNames(['new-event.jsonl.zst', ...list]);
+    await vi.waitFor(() => assert.equal(order.length, 6, order.join()));
+    assert.deepEqual(firsts, ['unplaced.jsonl.zst'], 'only the unplaced name read its first record');
+    assert.deepEqual(order, [
+      'new-event.jsonl.zst',
+      'failed.jsonl.zst',
+      'adopted.jsonl.zst',
+      'new-body.jsonl.zst',
+      'old-body.jsonl.zst',
+      'unplaced.jsonl.zst',
+    ]);
+    assert.equal(order.includes('twin.jsonl.zst'), false, 'a rollout with a plain twin was decoded');
+    assert.equal(order.includes('gone.jsonl.zst'), false, 'a name the list dropped was decoded');
+  } finally {
+    harness.backfill.dispose();
+  }
+});
+
+test('a current entry with no machine opening writes its opening again without a decode', async () => {
+  let decodes = 0;
+  const harness = backfillHarness({
+    exists: () => false,
+    statOf: () => ({ ...unitStat, isFile: true }),
+    stream: async () => {
+      decodes++;
+      return { kind: 'failed' };
+    },
+  });
+  try {
+    harness.known.set('a.jsonl.zst', {
+      file: 'a.jsonl.zst',
+      pairKey: 'a',
+      ...compressedEntryVersions(),
+      size: 10,
+      mtimeMs: 2,
+      decodedLength: 100,
+      opening: compressedOpening,
+    });
+    harness.backfill.setNames(['a.jsonl.zst']);
+    await vi.waitFor(() => assert.equal(harness.openings.length, 1, 'the lost opening was not written again'));
+    assert.equal(harness.openings[0].opening?.sessionId, COMPRESSED_THREAD);
+    assert.equal(decodes, 0, 'a current entry decoded its rollout again');
+  } finally {
+    harness.backfill.dispose();
+  }
+});

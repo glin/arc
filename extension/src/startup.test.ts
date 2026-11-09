@@ -69,13 +69,16 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { isDeepStrictEqual } from 'node:util';
 import * as zlib from 'node:zlib';
 import { compressedRolloutsReadable, isCompressedRollout } from './compressedrollouts.ts';
-import { compressedSpendDisplayFiles } from './projectspend.ts';
+import { compressedSpendDisplayFiles, projectSpendWorkspace } from './projectspend.ts';
+import { MULTI_ROOT_SPEND_WORKSPACE_PREFIX } from './identity.ts';
 import { isAgentRun, isHiddenThread, staleMetas } from './codex.ts';
 import { arcHome } from './store.ts';
 import {
   COMPRESSED_FACTS_STORE,
   COMPRESSED_FACTS_VERSION,
   COMPRESSED_OPENINGS_STORE,
+  compressedEntrySeed,
+  compressedEntryVersions,
   compressedPairKey,
   compressedTitleCurrent,
   readCompressedStore,
@@ -1681,7 +1684,13 @@ test('the panel records each worker decoder and store write under the counters o
 });
 
 test('the named counters hold every counter that the measure table lists', () => {
-  for (const name of ['compressedDecodes', 'compressedStoreWriteBytes', 'refreshCount:compressed-facts'])
+  for (const name of [
+    'compressedDecodes',
+    'compressedStoreWriteBytes',
+    'compressedLoadMs',
+    'backfillMs',
+    'refreshCount:compressed-facts',
+  ])
     assert.ok((NAMED_COUNTERS as readonly string[]).includes(name), name);
 });
 
@@ -1710,6 +1719,8 @@ test('soak measures read the counters a saved diagnostics snapshot carries', () 
       catalogWalks: 0,
       'refreshMs:compressed-facts': 30,
       'refreshCount:compressed-facts': 3,
+      compressedLoadMs: 0,
+      backfillMs: 0,
       loopDelayMaxMs: 120,
       loopDelayP99Ms: 30,
     },
@@ -3004,6 +3015,16 @@ function completeDiscoveryHarness(
   if (names.includes('browserPainted'))
     names.push('maybeStartCompressedLoad', 'loadCompressedFacts', 'applyCompressedEntries', 'compressedStorePaths');
   names.push(
+    'refreshCompressedFacts',
+    'noteCompressedRowsGauge',
+    'compressedLoadRequest',
+    'compressedResume',
+    'noteCompressedLoad',
+    'withCompressedFactRows',
+    'compressedRowOf',
+    'noteCompressedDecoderMissing',
+    'nameCompressedSkips',
+    'applyCompressedBatch',
     'compressedRolloutsToSend',
     'markCompressedRolloutsSent',
     'compressedStorePaths',
@@ -3063,7 +3084,7 @@ function completeDiscoveryHarness(
       repositoryCommits = new RepositoryCommits({ run: async () => null }, () => {});
       _showing = null; selections = []; messages = []; partial = []; catalog = null; drawnCards = [];
       coverageRevision = 0; enumeratedAdmissionComplete = true; claudeChildren = []; compressedRollouts = new Set();
-      compressedLoadPending = false; compressedFollowTimer = null; compressedRolloutsRevision = 0; compressedFacts = new Map(); compressedFactsRevision = 0; adoptionsUnsettled = new Map(); compressedSpendPicks = new WeakMap();
+      compressedLoadPending = false; compressedFollowTimer = null; compressedRolloutsRevision = 0; compressedFacts = new Map(); compressedFactsRevision = 0; adoptionsUnsettled = new Map(); compressedSpendPicks = new WeakMap(); compressedLaunch = 'launch-test'; compressedWalk = null; compressedRowsDirty = null; compressedFactsRefreshDue = false; compressedLoadCursor = null; lifetimeDisplayPick = null;
       authoritativeCatalog = null; attachmentHandoffs = new Set(); titles = new Map();
       metadataRevision = 0; drawnMetadataRevision = 0; startupProgressAt = 0;
       derivedCacheCheckpointState = { markChanged() {} };
@@ -3222,6 +3243,10 @@ function completeDiscoveryHarness(
     'COMPRESSED_FACTS_STORE',
     'COMPRESSED_OPENINGS_STORE',
     'arcHome',
+    'compressedRolloutsReadable',
+    'compressedEntrySeed',
+    'projectSpendWorkspace',
+    'MULTI_ROOT_SPEND_WORKSPACE_PREFIX',
     ...Object.keys(scope),
     compiled,
   )(
@@ -3278,6 +3303,10 @@ function completeDiscoveryHarness(
     COMPRESSED_FACTS_STORE,
     COMPRESSED_OPENINGS_STORE,
     arcHome,
+    compressedRolloutsReadable,
+    compressedEntrySeed,
+    projectSpendWorkspace,
+    MULTI_ROOT_SPEND_WORKSPACE_PREFIX,
     ...Object.values(scope),
   );
   const provider = guardedHarness(new module.exports.Harness());
@@ -10855,6 +10884,189 @@ test('a stored entry keeps a row with a carried name across a version mismatch a
   provider.compressedFacts.set(twin, entry);
   provider.compressedRowsOf(walking([], [twin]), () => false);
   assert.equal(provider.compressedFacts.has(twin), false);
+});
+
+const backfillOpening = {
+  sessionId: twinThread,
+  cwd: 'c:/repo',
+  threadSource: null,
+  parentThreadId: null,
+  hasSubagentSource: false,
+  launchSource: null,
+  subagentKind: null,
+};
+
+function backfillHostHarness() {
+  const harness = heldWalkHarness(
+    {
+      readRolloutStat,
+      isHiddenThread,
+      isAgentRun,
+      compressedTitleCurrent,
+      withKeptUndercount,
+      compressedEntrySame,
+      compressedSpendDisplayFiles,
+      compressedPairKey,
+      sessionLifetimeDisplayFiles,
+    },
+    [
+      'withCompressedFactRows',
+      'compressedRowOf',
+      'applyCompressedBatch',
+      'refreshCompressedFacts',
+      'titleEntryOf',
+      'lifetimeDisplayFiles',
+    ],
+  );
+  const { provider } = harness;
+  const twin = path.join(harness.root, `rollout-${twinThread}.jsonl.zst`);
+  fs.writeFileSync(twin, 'x');
+  const stat = readRolloutStat(twin)!;
+  provider.compressedFacts = new Map();
+  provider.projectSpendRevision = 0;
+  provider.invalidateProjectSpendSnapshot = () => {};
+  provider.compressedWalk = {
+    walked: new Set<string>(),
+    listed: new Set([twin]),
+    complete: true,
+    inFolders: () => true,
+  };
+  const refreshes: unknown[][] = [];
+  provider.refreshFrom = (...args: unknown[]) => refreshes.push(args);
+  const gauges: Record<string, number> = {};
+  provider.performanceCounters = {
+    recordWork() {},
+    recordGauge: (name: string, value: number) => (gauges[name] = value),
+  };
+  provider.adoptionsUnsettled = new Map();
+  const entry = (fields: Record<string, unknown> = {}) => ({
+    file: twin,
+    pairKey: twin.replace(/\.zst$/, ''),
+    factsVersion: COMPRESSED_FACTS_VERSION,
+    metadataGeneration: METADATA_GENERATIONS.codex,
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    threadId: twinThread,
+    opening: backfillOpening,
+    title: { label: 'Decoded title', fullLabel: 'Decoded title in full', size: stat.size, mtimeMs: stat.mtimeMs },
+    spend: { file: twin.replace(/\.zst$/, ''), buckets: [] },
+    complete: true,
+    decodedLength: 500,
+    ...fields,
+  });
+  return { provider, twin, entry, refreshes, gauges };
+}
+
+test('a backfill batch lists a compressed-only session with its title and cost, and refreshes once on the held catalog', () => {
+  const { provider, twin, entry, refreshes } = backfillHostHarness();
+  provider.applyCompressedBatch({ entries: [entry()], backfillMs: 12 });
+  assert.deepEqual(
+    refreshes,
+    [['compressed-facts', true, true]],
+    'the batch did not reuse the held catalog in one refresh',
+  );
+  const held = provider.withCompressedFactRows([]);
+  assert.deepEqual(
+    held.map((row: SessionFile) => row.file),
+    [twin],
+    'a backfilled entry gave no row',
+  );
+  assert.equal(held[0].sessionId, twinThread);
+  assert.equal(provider.titleEntryOf(twin)?.label, 'Decoded title', 'the row lost its title');
+  assert.ok(provider.compressedFacts.get(twin)?.spend, 'the row lost its spend record');
+});
+
+test('a plain twin suppresses the compressed row of a batch', () => {
+  const { provider, twin, entry } = backfillHostHarness();
+  provider.compressedWalk.walked = new Set([twin.replace(/\.zst$/, '')]);
+  provider.applyCompressedBatch({ entries: [entry()], backfillMs: 0 });
+  assert.deepEqual(provider.withCompressedFactRows([]), [], 'a listed plain twin left a compressed row');
+});
+
+test('a version mismatch keeps the row with a carried name until the re-derivation', () => {
+  const { provider, twin, entry } = backfillHostHarness();
+  provider.applyCompressedBatch({
+    entries: [entry({ metadataGeneration: METADATA_GENERATIONS.codex - 1 })],
+    backfillMs: 0,
+  });
+  const held = provider.withCompressedFactRows([]);
+  assert.equal(held.length, 1, 'a version mismatch removed the row');
+  assert.equal(provider.compressedCarriedNameOf(twin)?.label, 'Decoded title');
+  assert.equal(provider.compressedTitleOf(twin), undefined, 'an outdated title showed as current');
+  provider.applyCompressedBatch({
+    entries: [entry({ title: { label: 'New title', fullLabel: 'New', size: 1, mtimeMs: 1 }, hash: 'next' })],
+    backfillMs: 0,
+  });
+  const redrawn = provider.withCompressedFactRows(held);
+  assert.deepEqual(
+    redrawn.map((row: SessionFile) => row.file),
+    [twin],
+    'the re-derivation repeated the row',
+  );
+  assert.equal(provider.compressedTitleOf(twin)?.label, 'New title');
+});
+
+test('compressedRows moves at each compressed-facts refresh and stays absent until then', () => {
+  const { provider, twin, entry, gauges } = backfillHostHarness();
+  provider.noteCompressedRowsGauge([{ file: twin, sessionId: twinThread }]);
+  assert.equal(gauges.compressedRows, undefined, 'the gauge was set without a compressed-facts refresh');
+  provider.applyCompressedBatch({ entries: [entry()], backfillMs: 0 });
+  provider.noteCompressedRowsGauge([
+    { file: twin, sessionId: twinThread },
+    { file: 'plain.jsonl', sessionId: 'other' },
+  ]);
+  assert.equal(gauges.compressedRows, 1);
+  provider.noteCompressedRowsGauge([]);
+  assert.equal(gauges.compressedRows, 1, 'the gauge moved without a compressed-facts refresh');
+  provider.applyCompressedBatch({ entries: [entry({ hash: 'x' })], backfillMs: 0 });
+  provider.noteCompressedRowsGauge([]);
+  assert.equal(gauges.compressedRows, 0);
+});
+
+test('a spend pick reads again when an in-place spend change moves the revision', () => {
+  const { provider, twin, entry } = backfillHostHarness();
+  provider.compressedFacts.set(twin, entry());
+  provider.compressedSpendPicks = new WeakMap();
+  provider.codexMetas = { revision: 1, keys: () => [], peek: () => null };
+  const files = [{ file: 'plain.jsonl', buckets: [] }];
+  const first = provider.compressedSpendPick(files);
+  assert.equal(provider.compressedSpendPick(files), first, 'an unchanged revision missed the memo');
+  provider.projectSpendRevision++;
+  assert.notEqual(provider.compressedSpendPick(files), first, 'a spend revision change kept the old pick');
+});
+
+test('lifetime display files use the memo while the ledger stands still', () => {
+  const { provider, twin, entry } = backfillHostHarness();
+  provider.compressedFacts.set(twin, entry());
+  provider.compressedSpendPicks = new WeakMap();
+  provider.codexMetas = { revision: 1, keys: () => [], peek: () => null };
+  provider.projectSpendFiles = [{ file: 'plain.jsonl', buckets: [] }];
+  provider.projectSpendVisibleFiles = [];
+  provider.projectSpendBusy = () => false;
+  provider.lifetimeDisplayPick = null;
+  const first = provider.lifetimeDisplayFiles();
+  assert.equal(provider.lifetimeDisplayFiles(), first, 'the lifetime figures rebuilt with no change');
+  provider.projectSpendFiles = [{ file: 'other.jsonl', buckets: [] }];
+  assert.notEqual(provider.lifetimeDisplayFiles(), first, 'a new ledger kept the old lifetime figures');
+});
+
+test('a new worker takes the host offsets and entries in place of the whole store', () => {
+  const { provider, entry } = backfillHostHarness();
+  provider.progressiveWorker = { currentThreadId: 1 };
+  provider.folders = () => ['c:/repo'];
+  provider.repositoryScopeRoots = ['c:/repo'];
+  provider.compressedFacts.set('a', entry({ file: 'a' }));
+  provider.noteCompressedLoad({ kind: 'compressed-load', entries: [], done: true, consumed: [['segment-1-t-0', 12]] });
+  assert.equal(
+    provider.compressedLoadRequest({ facts: 'f', openings: 'o' }).resume,
+    undefined,
+    'the same worker got a resume',
+  );
+  provider.progressiveWorker.currentThreadId = 2;
+  const resume = provider.compressedLoadRequest({ facts: 'f', openings: 'o' }).resume;
+  assert.deepEqual(resume?.consumed, [['segment-1-t-0', 12]]);
+  assert.equal(resume?.entries[0].file, 'a');
+  assert.equal('title' in resume!.entries[0], false, 'the resume carried a title entry');
 });
 
 test('a facts version bump keeps the row and its carried name through the real store reader', async () => {

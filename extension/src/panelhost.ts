@@ -16,6 +16,7 @@ import {
   COMPRESSED_FACTS_STORE,
   COMPRESSED_OPENINGS_STORE,
   compressedEntrySame,
+  compressedEntrySeed,
   compressedPairKey,
   compressedTitleCurrent,
   withKeptUndercount,
@@ -1563,6 +1564,7 @@ export class PanelProvider implements vscode.Disposable {
     (sample) => this.performanceCounters?.recordDiscoveryTransport?.(sample),
     () => this.performanceCounters?.recordWork('compressedDecodes'),
     (bytes) => this.performanceCounters?.recordWork('compressedStoreWriteBytes', bytes),
+    (batch) => this.applyCompressedBatch(batch),
   );
   private readonly commitRepositoryReservations = new CommitRepositoryReservations();
   private readonly commitRepositoryReplies = new Map<string, { key: string; reply: CommitRepositoryReply }>();
@@ -1659,9 +1661,31 @@ export class PanelProvider implements vscode.Disposable {
   private compressedLoadStarted = false;
   private compressedFollowTimer: ReturnType<typeof setTimeout> | null = null;
   private compressedRenderSeen = false;
+  // Row-file names whose entry changed since the last list merged them, and the last walk that the rows join.
+  private compressedRowsDirty: Set<string> | null = null;
+  private compressedWalk: {
+    walked: ReadonlySet<string>;
+    listed: ReadonlySet<string>;
+    complete: boolean;
+    inFolders: (cwd: string) => boolean;
+  } | null = null;
+  // Set by a compressed-facts refresh, so the next list that it builds sets the `compressedRows` gauge.
+  private compressedFactsRefreshDue = false;
+  // The last store offsets of the load, so a new worker reads only the bytes after them.
+  private compressedLoadCursor: { worker: number | null; consumed: [string, number][] } | null = null;
+  private readonly compressedLaunch = crypto.randomUUID();
+  private lifetimeDisplayPick: {
+    files: readonly SpendFileIndex[];
+    visible: readonly SpendFileIndex[];
+    busy: boolean;
+    revision: number;
+    metas: number;
+    facts: number;
+    picked: readonly SpendFileIndex[];
+  } | null = null;
   private readonly compressedSpendPicks = new WeakMap<
     readonly SpendFileIndex[],
-    { revision: number; metas: number; picked: readonly SpendFileIndex[] }
+    { revision: number; spend: number; metas: number; picked: readonly SpendFileIndex[] }
   >();
   // Recorded working directories, keyed by transcript path. Missing values retry after the file revision changes.
   private cwds = new Map<string, { cwd: string | null; mtimeMs: number; size: number; unavailable?: boolean }>();
@@ -5053,10 +5077,59 @@ export class PanelProvider implements vscode.Disposable {
       const next = withKeptUndercount(held, entry);
       if (held && compressedEntrySame(held, next)) continue;
       this.compressedFacts.set(entry.file, next);
+      (this.compressedRowsDirty ??= new Set()).add(entry.file);
       changed = true;
     }
     if (changed) this.compressedFactsChanged();
     return changed;
+  }
+
+  // One batch of the backfill. It names each file with skipped records once, and refreshes once for the whole batch.
+  private applyCompressedBatch(batch: import('./compressedbackfill').CompressedBackfillBatch): void {
+    if (batch.backfillMs) this.performanceCounters?.recordWork('backfillMs', batch.backfillMs);
+    for (const entry of batch.entries)
+      if (entry.skippedRecords) this.nameCompressedSkips(entry.file, entry.skippedRecords);
+    if (this.applyCompressedEntries(batch.entries)) this.refreshCompressedFacts();
+  }
+
+  // A compressed-facts refresh reuses the held catalog, and sets the `compressedRows` gauge at its end.
+  private refreshCompressedFacts(): void {
+    this.compressedFactsRefreshDue = true;
+    this.refreshFrom('compressed-facts', true, true);
+  }
+
+  private noteCompressedRowsGauge(sessions: readonly SessionFile[]): void {
+    if (!this.compressedFactsRefreshDue) return;
+    this.compressedFactsRefreshDue = false;
+    const rows = new Set(sessions.filter((session) => isCompressedRollout(session.file)).map((row) => row.sessionId));
+    this.performanceCounters?.recordGauge('compressedRows', rows.size);
+  }
+
+  // The worker takes these offsets and entries in place of reading the whole store.
+  private compressedResume(): { resume?: import('./compressedstore').CompressedLoadResume } {
+    const cursor = this.compressedLoadCursor;
+    if (!cursor || cursor.worker === (this.progressiveWorker.currentThreadId ?? null)) return {};
+    return {
+      resume: { consumed: cursor.consumed, entries: [...this.compressedFacts.values()].map(compressedEntrySeed) },
+    };
+  }
+
+  private compressedLoadRequest(stores: CompressedStorePaths) {
+    return {
+      kind: 'compressed-load' as const,
+      stores,
+      backfill: {
+        workspace: projectSpendWorkspace(this.folders(), MULTI_ROOT_SPEND_WORKSPACE_PREFIX),
+        roots: [...this.repositoryScopeRoots],
+        launch: this.compressedLaunch,
+      },
+      ...this.compressedResume(),
+    };
+  }
+
+  private noteCompressedLoad(value: import('./progressiveworker').ProgressiveValue | undefined): void {
+    if (value?.kind === 'compressed-load' && value.consumed)
+      this.compressedLoadCursor = { worker: this.progressiveWorker.currentThreadId ?? null, consumed: value.consumed };
   }
 
   private compressedFactsChanged(): void {
@@ -5067,6 +5140,7 @@ export class PanelProvider implements vscode.Disposable {
 
   private async loadCompressedFacts(stores: CompressedStorePaths): Promise<void> {
     const started = performance.now();
+    this.noteCompressedDecoderMissing();
     let applied = false;
     const take = (value: import('./progressiveworker').ProgressiveValue | undefined) => {
       if (value?.kind === 'compressed-load' && this.applyCompressedEntries(value.entries)) applied = true;
@@ -5074,13 +5148,14 @@ export class PanelProvider implements vscode.Disposable {
     let cutOff = false;
     try {
       const result = await this.progressiveWorker.run(
-        { kind: 'compressed-load', stores },
+        this.compressedLoadRequest(stores),
         this.refreshGeneration,
         new AbortController().signal,
         (progress) => take(progress.value),
       );
       cutOff = !result;
       take(result?.value);
+      this.noteCompressedLoad(result?.value);
     } catch {
       // A failed load leaves the rows of this activation without stored facts.
     }
@@ -5094,7 +5169,7 @@ export class PanelProvider implements vscode.Disposable {
     this.performanceCounters?.recordWork('compressedLoadMs', Math.round(performance.now() - started));
     this.armCompressedFollow();
     this.resumeCompressedAdoptions();
-    if (applied) this.refreshFrom('compressed-facts', true);
+    if (applied) this.refreshCompressedFacts();
     else if (!this.projectSpendBusy()) this.postProjectSpend();
   }
 
@@ -5124,16 +5199,17 @@ export class PanelProvider implements vscode.Disposable {
       };
       try {
         const result = await this.progressiveWorker.run(
-          { kind: 'compressed-load', stores },
+          this.compressedLoadRequest(stores),
           this.refreshGeneration,
           new AbortController().signal,
           (progress) => take(progress.value),
         );
         take(result?.value);
+        this.noteCompressedLoad(result?.value);
       } catch {
         // A later poll reads the same bytes again.
       }
-      if (applied) this.refreshFrom('compressed-facts', true);
+      if (applied) this.refreshCompressedFacts();
     }
     this.armCompressedFollow();
   }
@@ -5190,6 +5266,7 @@ export class PanelProvider implements vscode.Disposable {
     if (stored?.adopted && twinStat && stored.size === twinStat.size && stored.mtimeMs === twinStat.mtimeMs) {
       this.adoptionsUnsettled.delete(plain);
       this.derivedCacheCheckpointState.markChanged(true);
+      this.compressedFactsRefreshDue = true;
       this.refreshFrom('compressed-facts', true);
       return;
     }
@@ -5233,6 +5310,7 @@ export class PanelProvider implements vscode.Disposable {
     // The walk of the refresh below trims the opening of a failed adoption, because the path is no longer retained.
     this.adoptionsUnsettled.delete(plain);
     this.derivedCacheCheckpointState.markChanged(true);
+    this.compressedFactsRefreshDue = true;
     this.refreshFrom('compressed-facts', true);
   }
 
@@ -5246,6 +5324,8 @@ export class PanelProvider implements vscode.Disposable {
     const walked = new Set(listing.walked);
     const listed = new Set(listing.enumeration.compressed ?? []);
     const complete = listing.enumeration.status === 'complete';
+    this.compressedWalk = { walked, listed, complete, inFolders };
+    this.compressedRowsDirty = null;
     if (complete) {
       for (const row of this.catalog?.sessions ?? []) {
         if (row.agent !== 'codex' || !row.file.endsWith('.jsonl') || walked.has(row.file)) continue;
@@ -5276,22 +5356,46 @@ export class PanelProvider implements vscode.Disposable {
         this.compressedFactsChanged();
         continue;
       }
-      if (entry.adoptionFailed || entry.nameOnly || walked.has(plain) || !opening?.cwd || isHiddenThread(opening))
-        continue;
-      if (this.adoptionsUnsettled.has(plain)) continue;
-      const stat = readRolloutStat(twin);
-      if (!stat?.isFile || !entry.threadId) continue;
-      out.push({
-        agent: 'codex',
-        file: twin,
-        sessionId: entry.threadId,
-        mtimeMs: stat.mtimeMs,
-        size: stat.size,
-        cwd: opening.cwd,
-        ...(stat.dev === undefined ? {} : { dev: stat.dev }),
-        ...(stat.ino === undefined ? {} : { ino: stat.ino }),
-        agentRun: isAgentRun(opening),
-      });
+      const row = this.compressedRowOf(twin, entry, walked);
+      if (row) out.push(row);
+    }
+    return out;
+  }
+
+  // The row of one compressed entry, or null when the entry gives none.
+  private compressedRowOf(twin: string, entry: CompressedFactEntry, walked: ReadonlySet<string>): SessionFile | null {
+    const plain = twin.replace(/\.zst$/, '');
+    const opening = entry.opening;
+    if (entry.adoptionFailed || entry.nameOnly || walked.has(plain) || !opening?.cwd || isHiddenThread(opening))
+      return null;
+    if (this.adoptionsUnsettled.has(plain)) return null;
+    const stat = readRolloutStat(twin);
+    if (!stat?.isFile || !entry.threadId) return null;
+    return {
+      agent: 'codex',
+      file: twin,
+      sessionId: entry.threadId,
+      mtimeMs: stat.mtimeMs,
+      size: stat.size,
+      cwd: opening.cwd,
+      ...(stat.dev === undefined ? {} : { dev: stat.dev }),
+      ...(stat.ino === undefined ? {} : { ino: stat.ino }),
+      agentRun: isAgentRun(opening),
+    };
+  }
+
+  // A batch joins the held catalog without a walk. Only the entries that changed since the last list stat their file.
+  private withCompressedFactRows(held: SessionFile[]): SessionFile[] {
+    const dirty = this.compressedRowsDirty;
+    const walk = this.compressedWalk;
+    if (!dirty?.size || !walk) return held;
+    this.compressedRowsDirty = null;
+    const out = held.filter((session) => !(isCompressedRollout(session.file) && dirty.has(session.file)));
+    for (const twin of dirty) {
+      const entry = this.compressedFacts.get(twin);
+      if (!entry || (entry.opening?.cwd && !walk.inFolders(entry.opening.cwd))) continue;
+      const row = this.compressedRowOf(twin, entry, walk.walked);
+      if (row) out.push(row);
     }
     return out;
   }
@@ -5322,7 +5426,12 @@ export class PanelProvider implements vscode.Disposable {
     if (!this.compressedFacts?.size) return files;
     const metasRevision = this.codexMetas.revision;
     const held = this.compressedSpendPicks.get(files);
-    if (held?.revision === this.compressedFactsRevision && held.metas === metasRevision) return held.picked;
+    if (
+      held?.revision === this.compressedFactsRevision &&
+      held.spend === this.projectSpendRevision &&
+      held.metas === metasRevision
+    )
+      return held.picked;
     const candidates = [...this.compressedFacts.values()].flatMap((entry) =>
       entry.spend
         ? [
@@ -5348,7 +5457,12 @@ export class PanelProvider implements vscode.Disposable {
       candidates,
       (file) => sessionIds.get(compressedPairKey(file, directories)) ?? null,
     );
-    this.compressedSpendPicks.set(files, { revision: this.compressedFactsRevision, metas: metasRevision, picked });
+    this.compressedSpendPicks.set(files, {
+      revision: this.compressedFactsRevision,
+      spend: this.projectSpendRevision,
+      metas: metasRevision,
+      picked,
+    });
     return picked;
   }
 
@@ -11982,9 +12096,29 @@ export class PanelProvider implements vscode.Disposable {
 
   // Retain the last complete lifetime figures until a replacement read completes.
   private lifetimeDisplayFiles(): readonly SpendFileIndex[] {
-    return this.compressedSpendPick(
+    const held = this.lifetimeDisplayPick;
+    if (
+      held?.files === this.projectSpendFiles &&
+      held.visible === this.projectSpendVisibleFiles &&
+      held.busy === this.projectSpendBusy() &&
+      held.revision === this.projectSpendRevision &&
+      held.facts === this.compressedFactsRevision &&
+      held.metas === (this.codexMetas?.revision ?? 0)
+    )
+      return held.picked;
+    const picked = this.compressedSpendPick(
       sessionLifetimeDisplayFiles(this.projectSpendBusy(), this.projectSpendFiles, this.projectSpendVisibleFiles),
     );
+    this.lifetimeDisplayPick = {
+      files: this.projectSpendFiles,
+      visible: this.projectSpendVisibleFiles,
+      busy: this.projectSpendBusy(),
+      revision: this.projectSpendRevision,
+      facts: this.compressedFactsRevision,
+      metas: this.codexMetas?.revision ?? 0,
+      picked,
+    };
+    return picked;
   }
 
   private lifetimeFiguresBySession(): LifetimeFigures {
@@ -13645,9 +13779,10 @@ export class PanelProvider implements vscode.Disposable {
             );
       // Reorder reused catalog rows after updating file revisions.
       if (held) {
+        const joined = this.withCompressedFactRows(held);
         const admitted = deferHumanPrompts
-          ? held
-          : held.filter(
+          ? joined
+          : joined.filter(
               (session) =>
                 session.agent !== 'claude' || session.childTranscript === true || this.hasHumanPrompt(session),
             );
@@ -13655,6 +13790,7 @@ export class PanelProvider implements vscode.Disposable {
         // Retain the updated rows so later selections reuse their current revisions.
         this.catalog = { folders: folderPrint, sessions: sorted };
         this.catalogWalked = false;
+        this.noteCompressedRowsGauge(sorted);
         return sorted;
       }
     }
@@ -13978,8 +14114,10 @@ export class PanelProvider implements vscode.Disposable {
       this.catalogWalked = true;
       this.performanceCounters?.recordWork('catalogWalk');
       this.performanceCounters?.recordWork('codexRelist');
+      this.noteCompressedRowsGauge(held);
       return held;
     }
+    this.noteCompressedRowsGauge(walkedSessions);
     this.catalog = { folders: folderPrint, sessions: walkedSessions };
     this.catalogWalked = true;
     this.performanceCounters?.recordWork('catalogWalk');
@@ -17053,13 +17191,7 @@ export class PanelProvider implements vscode.Disposable {
     generation: number,
   ): void {
     if (!isCompressedRollout(session.file)) return;
-    if (value.skippedRecords && !this.compressedSkipsNamed.has(session.file)) {
-      this.compressedSkipsNamed.add(session.file);
-      this.performanceOutput ??= vscode.window.createOutputChannel('Arc');
-      this.performanceOutput.appendLine(
-        `Arc left out ${value.skippedRecords} oversized ${value.skippedRecords === 1 ? 'record' : 'records'} of the compressed Codex session ${session.file}.`,
-      );
-    }
+    if (value.skippedRecords) this.nameCompressedSkips(session.file, value.skippedRecords);
     if (value.partial === undefined) {
       if (this.compressedCheck === generation) this.compressedCheck = null;
       return;
@@ -17076,6 +17208,16 @@ export class PanelProvider implements vscode.Disposable {
       void this.completeSelectedWindow(sessionId, generation);
     }, delay);
     this.compressedRetry = retry;
+  }
+
+  // The output channel names each compressed rollout with a dropped record once.
+  private nameCompressedSkips(file: string, skippedRecords: number): void {
+    if (this.compressedSkipsNamed.has(file)) return;
+    this.compressedSkipsNamed.add(file);
+    this.performanceOutput ??= vscode.window.createOutputChannel('Arc');
+    this.performanceOutput.appendLine(
+      `Arc left out ${skippedRecords} oversized ${skippedRecords === 1 ? 'record' : 'records'} of the compressed Codex session ${file}.`,
+    );
   }
 
   private noteCompressedDecoderMissing(): void {

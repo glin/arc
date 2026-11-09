@@ -145,6 +145,8 @@ import {
   recordCompressedAdoption,
   recordCompressedNames,
 } from './compressedstore';
+import { CompressedBackfill } from './compressedbackfill';
+import { folderMatcher } from './transcript';
 import {
   announceCompressedDecodes,
   compressedByteSource,
@@ -654,16 +656,73 @@ async function executeCompressedLoad(
   if (!follower) {
     follower = new CompressedStoreFollower(request.stores.facts);
     compressedFollowers.set(request.stores.facts, follower);
+    if (request.resume) follower.seed(request.resume);
   }
   const facts = (await follower.poll()).filter((entry) => !entry.nameOnly);
+  const held = heldCompressedNames.get(request.stores.facts);
+  if (held) {
+    heldCompressedNames.delete(request.stores.facts);
+    noteCompressedNames(held, request.stores);
+  }
+  if (request.backfill) startCompressedBackfill(request.stores, request.backfill, follower);
   const last = await postCompressedBatches(facts, signal, (batch) =>
     acknowledge?.({ kind: 'compressed-load', entries: batch, done: false }),
   );
-  return { kind: 'compressed-load', entries: last, done: true };
+  return { kind: 'compressed-load', entries: last, done: true, consumed: follower.offsets() };
+}
+
+// One backfill per store directory. A list of names that arrives before the first load waits for it, so the first
+// load and the backfill both start after the first render and the first pass.
+const compressedBackfills = new Map<string, CompressedBackfill>();
+const heldCompressedNames = new Map<string, readonly string[]>();
+// The last complete list of names per store, which a backfill that starts later takes.
+const compressedNames = new Map<string, readonly string[]>();
+
+function backfillBusy(): boolean {
+  return activeDiscovery || !!waitingDiscovery || !!activeKinds.window || !!activeKinds.page;
+}
+
+function startCompressedBackfill(
+  stores: import('./compressedstore').CompressedStorePaths,
+  start: { workspace: string; roots: string[]; launch: string },
+  follower: CompressedStoreFollower,
+): void {
+  let backfill = compressedBackfills.get(stores.facts);
+  if (backfill) {
+    backfill.setRoots(start.roots);
+    return;
+  }
+  backfill = new CompressedBackfill({
+    facts: compressedHolder(stores.facts),
+    openings: compressedHolder(stores.openings),
+    workspace: start.workspace,
+    roots: start.roots,
+    launch: start.launch,
+    busy: backfillBusy,
+    known: () => follower.known(),
+    inFolders: (roots) => folderMatcher([...roots]),
+    post: (batch) => {
+      parentPort?.postMessage({ compressedFacts: batch });
+      const bytes = takeCompressedWriteBytes();
+      if (bytes) parentPort?.postMessage({ compressedStoreWrite: bytes });
+    },
+  });
+  compressedBackfills.set(stores.facts, backfill);
+  const names = compressedNames.get(stores.facts);
+  if (names) backfill.setNames(names);
 }
 
 function noteCompressedNames(list: readonly string[], stores: import('./compressedstore').CompressedStorePaths): void {
-  void recordCompressedNames(list, compressedHolder(stores.facts)).then(() => {
+  // The first load reads the store after the first render and the first pass, so a list before it waits.
+  if (!compressedFollowers.has(stores.facts)) {
+    heldCompressedNames.set(stores.facts, list);
+    return;
+  }
+  compressedNames.set(stores.facts, list);
+  compressedBackfills.get(stores.facts)?.setNames(list);
+  void recordCompressedNames(list, compressedHolder(stores.facts), {
+    known: compressedFollowers.get(stores.facts)?.known(),
+  }).then(() => {
     const bytes = takeCompressedWriteBytes();
     if (bytes) parentPort?.postMessage({ compressedStoreWrite: bytes });
   });
@@ -1746,6 +1805,7 @@ async function execute(
     if (session.agent !== 'codex') return { kind: 'stale' as const };
     const releases = bodyReleases;
     const opened = await openCompressedBody(session.file, verify, signal, request.input.compressedLimits);
+    if (opened.kind === 'body') for (const backfill of compressedBackfills.values()) backfill.noteOpened(session.file);
     if (opened.kind !== 'body') return opened;
     if (releasedSinceArrival(session.file, opened.body, signal)) return { kind: 'cancelled' as const };
     requestBodies.set(signal, { body: opened.body, releases });
@@ -2892,6 +2952,10 @@ parentPort?.on(
       for (const holder of compressedHolders.values()) holder.dispose();
       compressedHolders.clear();
       compressedFollowers.clear();
+      for (const backfill of compressedBackfills.values()) backfill.dispose();
+      compressedBackfills.clear();
+      heldCompressedNames.clear();
+      compressedNames.clear();
       parentPort?.postMessage({ storesReleased: true });
       return;
     }

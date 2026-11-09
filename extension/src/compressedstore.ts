@@ -63,6 +63,10 @@ export interface CompressedFactEntry {
   adopted?: boolean;
   adoptionFailed?: boolean;
   nameOnly?: boolean;
+  // The backfill could not decode this revision. `unreadableLaunch` names the launch that last tried it, and another
+  // launch tries the file once.
+  unreadable?: boolean;
+  unreadableLaunch?: string;
   title?: DerivedTitleEntry;
   carriedName?: { label: string; fullLabel: string };
   opening?: CodexSessionMeta | null;
@@ -190,6 +194,13 @@ export function compressedOpeningEntry(entry: CompressedFactEntry): CompressedFa
     threadId: entry.threadId,
     opening: entry.opening,
   };
+}
+
+// An entry above 1 MiB drops its title entry and keeps a carried name and its cost.
+export function boundedCompressedEntry(entry: CompressedFactEntry): CompressedFactEntry {
+  if (!entry.title || Buffer.byteLength(JSON.stringify(entry)) < COMPRESSED_ENTRY_TITLE_BYTES) return entry;
+  const { title, ...rest } = entry;
+  return { ...rest, carriedName: { label: title.label, fullLabel: title.fullLabel } };
 }
 
 // A marked derivation never replaces a higher total. The entry keeps the higher spend record and takes the mark.
@@ -394,6 +405,20 @@ function rankFields(entry: CompressedFactEntry): RankFields {
   };
 }
 
+// An entry without its title entry and spend record. The worker keeps it to plan the backfill, and the host sends it to
+// a new worker, so that worker reads no store bytes it already answered.
+export type CompressedEntrySeed = Omit<CompressedFactEntry, 'title' | 'spend' | 'carriedName'>;
+
+export function compressedEntrySeed(entry: CompressedFactEntry): CompressedEntrySeed {
+  const { title: _title, spend: _spend, carriedName: _carried, ...seed } = entry;
+  return seed;
+}
+
+export interface CompressedLoadResume {
+  consumed: [string, number][];
+  entries: CompressedEntrySeed[];
+}
+
 interface RankedEntry {
   entry: RankFields;
   epoch: number;
@@ -426,6 +451,7 @@ export function compareRankedEntries(
   const decoded = Number(a.decodedLength !== undefined) - Number(b.decodedLength !== undefined);
   if (decoded) return decoded;
   const withFacts = (entry: RankFields) => (entry.adoptionFailed || entry.nameOnly ? 0 : 1);
+  // An `unreadable` entry with no facts carries `nameOnly`, so this rank also orders it below an entry with facts.
   const facts = withFacts(a) - withFacts(b);
   if (facts) return facts;
   if (left.epoch !== right.epoch) return left.epoch - right.epoch;
@@ -486,8 +512,9 @@ export interface CompressedStoreRead {
 export function readCompressedStore(
   directory: string,
   statOf: (file: string) => { size: number; mtimeMs: number } | null = () => null,
+  onUnreadable?: (name: string) => void,
 ): CompressedStoreRead {
-  const steps = storeReadSteps(directory, statOf);
+  const steps = storeReadSteps(directory, statOf, onUnreadable);
   let step = steps.next();
   while (!step.done) step = steps.next();
   return step.value;
@@ -515,13 +542,14 @@ function yieldToEvents(): Promise<void> {
 function* storeReadSteps(
   directory: string,
   statOf: (file: string) => { size: number; mtimeMs: number } | null,
+  onUnreadable?: (name: string) => void,
 ): Generator<void, CompressedStoreRead, void> {
   const names = listDirectory(directory);
   const view = storeView(directory, names);
   const best = new Map<string, { ranked: RankedEntry; entry: CompressedFactEntry }>();
   for (const input of view.inputs) {
     if (!readableFactsVersion(fileFactsVersion(path.join(directory, input.name)))) continue;
-    eachReadableLine(path.join(directory, input.name), (line, offset) => {
+    const readLine = (line: Buffer, offset: number) => {
       const entry = parseEntry(line.toString('utf8'));
       if (!entry || !readableFactsVersion(entry.factsVersion)) return;
       const ranked: RankedEntry = {
@@ -535,7 +563,13 @@ function* storeReadSteps(
       const held = best.get(entry.file);
       if (!held || compareRankedEntries(ranked, held.ranked, statOf(entry.file)) > 0)
         best.set(entry.file, { ranked, entry });
-    });
+    };
+    try {
+      eachLine(path.join(directory, input.name), readLine);
+    } catch {
+      // A compaction can retire any file at any time.
+      onUnreadable?.(input.name);
+    }
     yield;
   }
   const entries = new Map<string, CompressedFactEntry>();
@@ -626,6 +660,7 @@ function compressedEntryMark(entry: CompressedFactEntry): string {
     entry.adoptionFailed,
     entry.nameOnly,
     entry.undercount,
+    entry.unreadable,
   ].join('|');
 }
 
@@ -638,6 +673,7 @@ export function compressedEntrySame(left: CompressedFactEntry, right: Compressed
 export class CompressedStoreFollower {
   private readonly consumed = new Map<string, number>();
   private readonly best = new Map<string, { ranked: RankedEntry; mark: string }>();
+  private readonly seeds = new Map<string, CompressedEntrySeed>();
   // The bytes every poll read so far.
   bytesRead = 0;
 
@@ -646,6 +682,29 @@ export class CompressedStoreFollower {
     private readonly statOf: typeof compressedPhysicalStat = compressedPhysicalStat,
     private readonly yieldStep: () => Promise<void> = yieldToEvents,
   ) {}
+
+  // A new worker starts from what the host holds, so its first poll reads only the bytes appended since the last reply.
+  // A seed ranks below any line that ties it, because a later line wins a tie.
+  seed(resume: CompressedLoadResume): void {
+    for (const [name, end] of resume.consumed) this.consumed.set(name, end);
+    for (const seed of resume.entries) {
+      this.best.set(seed.file, {
+        ranked: { entry: rankFields(seed), epoch: -1, token: '', input: '', offset: -1, seq: -1 },
+        mark: compressedEntryMark(seed),
+      });
+      this.seeds.set(seed.file, seed);
+    }
+  }
+
+  // The byte offset that every poll reached in each store file.
+  offsets(): [string, number][] {
+    return [...this.consumed];
+  }
+
+  // The newest entry of each path that a poll or the seed gave, without its title entry and spend record.
+  known(): ReadonlyMap<string, CompressedEntrySeed> {
+    return this.seeds;
+  }
 
   // The entries that are new or changed since the last poll.
   async poll(): Promise<CompressedFactEntry[]> {
@@ -716,6 +775,7 @@ export class CompressedStoreFollower {
     if (held && compareRankedEntries(ranked, held.ranked, this.statOf(entry.file)) <= 0) return;
     const mark = compressedEntryMark(entry);
     this.best.set(entry.file, { ranked, mark });
+    this.seeds.set(entry.file, compressedEntrySeed(entry));
     if (held?.mark !== mark) changed.set(entry.file, entry);
   }
 }
@@ -1085,12 +1145,8 @@ export class CompressedStoreHolder {
         this.settleWaiters();
         continue;
       }
-      let line = `${JSON.stringify(entry)}\n`;
-      if (entry.title && Buffer.byteLength(line) > COMPRESSED_ENTRY_TITLE_BYTES) {
-        const { title, ...rest } = entry;
-        entry = { ...rest, carriedName: { label: title.label, fullLabel: title.fullLabel } };
-        line = `${JSON.stringify(entry)}\n`;
-      }
+      entry = boundedCompressedEntry(entry);
+      const line = `${JSON.stringify(entry)}\n`;
       const length = Buffer.byteLength(line);
       // A record above 4 MiB gets a segment file of its own.
       if (length > this.segmentBytes) {
@@ -1367,13 +1423,19 @@ export class CompressedStoreHolder {
 export async function recordCompressedNames(
   list: readonly string[],
   holder: CompressedStoreHolder,
-  options: { now?: () => number; yieldStep?: () => Promise<void>; statOf?: typeof compressedPhysicalStat } = {},
+  options: {
+    now?: () => number;
+    yieldStep?: () => Promise<void>;
+    statOf?: typeof compressedPhysicalStat;
+    // The paths the store holds, when a follower already read it.
+    known?: ReadonlyMap<string, unknown>;
+  } = {},
 ): Promise<void> {
   const now = options.now ?? performance.now.bind(performance);
   const yieldStep = options.yieldStep ?? yieldToEvents;
-  const stored = (
-    await readCompressedStoreInSteps(holder.directory, options.statOf ?? compressedPhysicalStat, yieldStep)
-  ).entries;
+  const stored =
+    options.known ??
+    (await readCompressedStoreInSteps(holder.directory, options.statOf ?? compressedPhysicalStat, yieldStep)).entries;
   const directories = new Map<string, string>();
   const records: CompressedFactEntry[] = [];
   let sliceStarted = now();
@@ -1407,8 +1469,12 @@ export async function recordCompressedAdoption(
     const [written] = await facts.append([result.entry], revisionHolds);
     const durable = written || (await facts.durable([result.entry]));
     if (!durable && facts.withdrew(result.entry)) continue;
-    if (durable && result.adopted && result.entry.opening)
-      await openings.append([compressedOpeningEntry(result.entry)]);
+    if (durable && result.adopted && result.entry.opening) {
+      // A stop before this line reaches the disk leaves the facts entry, and the backfill writes the opening from it.
+      const opening = compressedOpeningEntry(result.entry);
+      const [written] = await openings.append([opening]);
+      if (!written) await openings.durable([opening]);
+    }
     return { ...result, durable };
   }
 }

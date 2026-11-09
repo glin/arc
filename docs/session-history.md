@@ -44,7 +44,17 @@ A plain rollout that Codex compresses while Arc runs keeps its facts through ado
 
 A version change never removes a row that the store holds at an older fact version. Until a re-derivation, the host shows a carried name and the previous spend record counts. An entry of a newer fact version stays unread and untouched until a build that knows that version reads it. `COMPRESSED_FACTS_VERSION` joins the entry currency test with `CODEX_META_VERSION`, the Codex metadata generation and the Codex spend parser generation.
 
-The host sends the worker its complete set of compressed names on `claude-children` until the worker answers a request that carried the current set. A superseded or cancelled request keeps the set unsent. The worker records the names without an entry for the backfill, in slices that yield to other requests, and it decodes none of them.
+The host sends the worker its complete set of compressed names on `claude-children` until the worker answers a request that carried the current set. A superseded or cancelled request keeps the set unsent. A worker that receives a list before its first store load holds it until that load.
+
+### Compressed rollout backfill
+
+The backfill derives a current entry for every compressed rollout of this workspace. It starts in the worker after the first store load, which follows the first complete render and the publication of the first pass. It runs only while no discovery request, discovery continuation, window read or page read waits. Each list of names replaces the set, so a name that a later list drops leaves the queue.
+
+The queue runs in this order: names that a later list added, failed adoptions and rollouts whose entry an open found out of date, then adopted entries, then first-record reads for names with no placing opening, then the bodies of this workspace newest first. A name with a `.jsonl` twin is skipped. A first-record read decodes at most 1 MiB. An entry that is current but lost its machine-store opening writes the opening again with no decode. A version mismatch keeps the row, and the backfill derives such an entry again newest first.
+
+A slice decodes one file through `zlib.createZstdDecompress` in 64 KiB chunks, with a decoder window of at most 8 MiB, and ends after 4 MiB of decoded output or 50 ms. Records keep the bounds of metadata recovery. A record above 1 MiB passes through `OversizedRecordReducer`. A record past the 16 MiB reduced limit or the 64 MiB retained payload is skipped and counted in the entry's skipped records, and the read goes on with the next record. A skipped record with usage sets the undercount mark. The output channel names each such rollout once. A decode that fails, or that ends inside a frame, runs again after 10, 60 and 600 seconds. After the last failure the backfill saves the entry as unreadable. Another launch tries an unreadable entry once, and a new size or modification time restarts the count.
+
+Each derivation reaches both stores before the next one starts. The worker posts at most one batch per second, of 4 MiB or one larger record. The host applies each batch and runs one `compressed-facts` refresh over the held catalog, which adds the row of each changed entry and walks no directory. A worker that replaces another worker takes the host's store offsets and its held entries, so its first poll reads only the bytes appended since.
 
 ## Cache ownership
 

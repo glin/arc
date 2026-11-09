@@ -401,7 +401,14 @@ export type ProgressiveRequest =
       adoption: import('./compressedstore').CompressedAdoptionInput;
       stores: import('./compressedstore').CompressedStorePaths;
     }
-  | { kind: 'compressed-load'; stores: import('./compressedstore').CompressedStorePaths }
+  | {
+      kind: 'compressed-load';
+      stores: import('./compressedstore').CompressedStorePaths;
+      // Present once the first render and the first pass ended. The worker starts the backfill on it.
+      backfill?: { workspace: string; roots: string[]; launch: string };
+      // Offsets and entries that a new worker takes in place of reading the whole store.
+      resume?: import('./compressedstore').CompressedLoadResume;
+    }
   | { kind: 'metadata'; session: SessionFile; opening?: CodexSessionMeta | null; tailBytes?: number }
   | {
       kind: 'metadata-recovery';
@@ -434,7 +441,13 @@ export type ProgressiveValue =
       durable: boolean;
       writeBytes: number;
     }
-  | { kind: 'compressed-load'; entries: import('./compressedstore').CompressedFactEntry[]; done: boolean }
+  | {
+      kind: 'compressed-load';
+      entries: import('./compressedstore').CompressedFactEntry[];
+      done: boolean;
+      // On the final reply: the bytes this reply covers in each store file.
+      consumed?: [string, number][];
+    }
   | { kind: 'codex-context'; estimate: import('./codexcontext').CodexContextResult | null }
   | {
       kind: 'child-file-edits';
@@ -733,6 +746,8 @@ export class ProgressiveWorker {
     private readonly onCompressedDecode?: () => void,
     // Adds the bytes of store writes that no reply reports.
     private readonly onCompressedStoreWrite?: (bytes: number) => void,
+    // Hears each batch of entries that the backfill published.
+    private readonly onCompressedFacts?: (batch: import('./compressedbackfill').CompressedBackfillBatch) => void,
   ) {}
 
   snapshot(): {
@@ -943,7 +958,12 @@ export class ProgressiveWorker {
           dispatchSpend?: [string, import('./codex').CodexDispatchSpendEntry];
           compressedDecode?: number;
           compressedStoreWrite?: number;
+          compressedFacts?: import('./compressedbackfill').CompressedBackfillBatch;
         }) => {
+          if (message.compressedFacts) {
+            if (this.worker === worker) this.onCompressedFacts?.(message.compressedFacts);
+            return;
+          }
           if (message.compressedStoreWrite !== undefined) {
             this.onCompressedStoreWrite?.(message.compressedStoreWrite);
             return;

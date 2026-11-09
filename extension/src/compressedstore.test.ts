@@ -11,6 +11,7 @@ import {
   compressedPairKey,
   compressedEntryBatches,
   compressedEntryCurrent,
+  compressedEntrySeed,
   compressedEntryVersions,
   CompressedStoreFollower,
   CompressedStoreHolder,
@@ -101,6 +102,47 @@ const stale = (lock: string, clock: { now: number }) => {
 };
 
 const threadCount = (directory: string) => readCompressedStore(directory).entries.size;
+
+test('a follower seeded with host offsets reads only the appended bytes and keeps the held rank', async () => {
+  const directory = tempDir('store-follower-');
+  const segment = path.join(directory, 'segment-1-holder-0');
+  const line = (fields: object) => `${JSON.stringify(fields)}\n`;
+  const versions = compressedEntryVersions();
+  const held = {
+    file: 'a.jsonl.zst',
+    pairKey: 'a',
+    ...versions,
+    size: 5,
+    mtimeMs: 5,
+    decodedLength: 9,
+    hash: 'decoded',
+  };
+  fs.writeFileSync(segment, line(held));
+  const consumed = fs.statSync(segment).size;
+  fs.appendFileSync(
+    segment,
+    line({ file: 'b.jsonl.zst', pairKey: 'b', ...versions, size: 1, mtimeMs: 1, decodedLength: 3 }) +
+      // A failed adoption of the same stat ranks below the decoded entry and stays hidden.
+      line({ file: 'a.jsonl.zst', pairKey: 'a', ...versions, size: 5, mtimeMs: 5, adoptionFailed: true }),
+  );
+  const follower = new CompressedStoreFollower(
+    directory,
+    () => ({ size: 5, mtimeMs: 5 }),
+    async () => {},
+  );
+  follower.seed({
+    consumed: [[path.basename(segment), consumed]],
+    entries: [compressedEntrySeed(held)],
+  });
+  const changed = await follower.poll();
+  assert.deepEqual(
+    changed.map((entry) => entry.file),
+    ['b.jsonl.zst'],
+    'a seeded follower read the store from the start or let a lower rank through',
+  );
+  assert.ok(follower.bytesRead > 0 && follower.bytesRead < fs.statSync(segment).size);
+  assert.equal(follower.known().get('a.jsonl.zst')?.hash, 'decoded');
+});
 
 test('a store holds every appended entry across its own segments and names each file for its holder', async () => {
   const { directory, make } = storeFixture('store-append');
