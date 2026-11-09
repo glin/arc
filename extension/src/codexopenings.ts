@@ -8,7 +8,8 @@ import { fileIdentityValue } from './filerevision';
 // CODEX_META_VERSION identifies stored opening fields and their derivation rules.
 // Loading drops rows with another version and rereads their rollout openings.
 //
-// Bump this version when CodexSessionMeta fields or their derivation rules change.
+// Bump this version when the opening fields of CodexSessionMeta or their derivation rules change.
+// The file stat fields stay outside this rule, as the note below states.
 // readCodexOpeningRecord in codex.ts owns those rules and calls codexStartedAt,
 // codexReplayBoundaryAt, guardianPayloadAt, stamp, codexAgentPath, and their helpers.
 // Changed rules can leave the stored shape valid, so shape validation cannot detect them.
@@ -301,7 +302,7 @@ export function saveCodexOpenings(
 // Delay before retrying a save that failed to acquire the lock.
 export const CODEX_OPENINGS_RETRY_MS = 2_000;
 
-// The window's opening records, whose revision moves whenever a row is added or removed.
+// The window's opening records, whose revision moves when a row is added, removed or adopts a file identity.
 interface OpeningRows {
   readonly revision: number;
   snapshot(): Iterable<[string, CodexSessionMeta]>;

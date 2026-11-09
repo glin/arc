@@ -15947,8 +15947,8 @@ test('a saved Codex opening lists the replacement session at the next listing an
 
 test.each([
   { platform: 'win32', dev: '4', ino: undefined, identityReads: 0, backwardsReads: 1 },
-  { platform: 'darwin', dev: '5', ino: '11', identityReads: 1, backwardsReads: 0 },
-  { platform: 'linux', dev: '6', ino: '12', identityReads: 1, backwardsReads: 0 },
+  { platform: 'darwin', dev: 5, ino: 11, identityReads: 1, backwardsReads: 0 },
+  { platform: 'linux', dev: '6', ino: '18446744073709551557', identityReads: 1, backwardsReads: 0 },
 ])('saved Codex openings follow the $platform file identity', ({ dev, ino, identityReads, backwardsReads }) => {
   const root = sessionsRoot([{ day: '2026/08/25', name: ROLLOUT(UUID_A), records: [meta({ id: UUID_A })] }]);
   const file = rolloutFiles(root)[0];
@@ -15957,6 +15957,16 @@ test.each([
   const cases = [
     { name: 'unchanged', stat: initial, reads: 0 },
     { name: 'append', stat: { ...initial, size: 1100, mtimeMs: 2100 }, reads: 0 },
+    {
+      name: 'the same identity in another form',
+      stat: { ...initial, dev: String(dev), ino: ino === undefined ? undefined : String(ino) },
+      reads: 0,
+    },
+    {
+      name: 'saved inode with none in the current stat',
+      stat: { ...initial, ino: undefined },
+      reads: ino === undefined ? 0 : 1,
+    },
     { name: 'shrink', stat: { ...initial, size: 900 }, reads: 1 },
     { name: 'same-size rewrite', stat: { ...initial, mtimeMs: 2100 }, reads: 1 },
     { name: 'changed device', stat: { ...initial, dev: '9' }, reads: identityReads },
