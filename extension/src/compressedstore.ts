@@ -667,6 +667,7 @@ function compressedEntryMark(entry: CompressedFactEntry): string {
     entry.nameOnly,
     entry.undercount,
     entry.unreadable,
+    entry.unreadableLaunch,
   ].join('|');
 }
 

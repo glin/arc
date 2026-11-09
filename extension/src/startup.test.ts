@@ -69,7 +69,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { isDeepStrictEqual } from 'node:util';
 import * as zlib from 'node:zlib';
 import { compressedRolloutsReadable, isCompressedRollout, streamCompressedRollout } from './compressedrollouts.ts';
-import { RolloutDerivation, compressedFactsFromDerivation } from './compressedbackfill.ts';
+import { CompressedBackfill, RolloutDerivation, compressedFactsFromDerivation } from './compressedbackfill.ts';
 import { compressedSpendDisplayFiles, projectSpendWorkspace } from './projectspend.ts';
 import { MULTI_ROOT_SPEND_WORKSPACE_PREFIX } from './identity.ts';
 import { isAgentRun, isHiddenThread, staleMetas } from './codex.ts';
@@ -11040,6 +11040,7 @@ function backfillHostHarness() {
       compressedEntrySame,
       compressedSpendDisplayFiles,
       compressedPairKey,
+      compressedEntrySeed,
       sessionLifetimeDisplayFiles,
     },
     [
@@ -11049,6 +11050,8 @@ function backfillHostHarness() {
       'refreshCompressedFacts',
       'titleEntryOf',
       'lifetimeDisplayFiles',
+      'compressedResume',
+      'noteCompressedLoad',
     ],
   );
   const { provider } = harness;
@@ -11112,6 +11115,52 @@ test('a backfill batch lists a compressed-only session with its title and cost, 
     [provider.compressedFacts.get(twin).spend],
     'the shown total did not pick the stored spend record',
   );
+});
+
+test('a worker that replaces another worker takes the launch that retried an unreadable file', async () => {
+  const { provider, twin, entry } = backfillHostHarness();
+  const unreadable = (launch: string) =>
+    entry({
+      ...compressedEntryVersions(),
+      decodedLength: undefined,
+      unreadable: true,
+      unreadableLaunch: launch,
+    });
+  provider.applyCompressedEntries([unreadable('launch-1')]);
+  provider.applyCompressedEntries([unreadable('launch-2')]);
+  provider.progressiveWorker = { currentThreadId: 1 };
+  provider.noteCompressedLoad({ kind: 'compressed-load', entries: [], done: true, consumed: [['segment', 99]] });
+  provider.progressiveWorker.currentThreadId = 2;
+  const { resume } = provider.compressedResume();
+  let decodes = 0;
+  const holder = {
+    directory: tempDir('replacement-store-'),
+    append: async (entries: unknown[]) => entries.map(() => true),
+    durable: async () => true,
+  } as never;
+  const backfill = new CompressedBackfill({
+    facts: holder,
+    openings: holder,
+    workspace: 'workspace',
+    roots: ['/'],
+    launch: 'launch-2',
+    busy: () => false,
+    known: () => new Map(resume.entries.map((seed: { file: string }) => [seed.file, seed])) as never,
+    inFolders: () => () => true,
+    post: () => {},
+    exists: () => false,
+    stream: async () => {
+      decodes++;
+      return { kind: 'failed' };
+    },
+  });
+  try {
+    backfill.setNames([twin]);
+    await vi.waitFor(() => assert.equal((backfill as unknown as { running: boolean }).running, false));
+    assert.equal(decodes, 0, 'the replacement worker retried an unreadable file in the same launch');
+  } finally {
+    backfill.dispose();
+  }
 });
 
 test('a backfill batch reaches the held catalog and the gauge through the refresh', async () => {
