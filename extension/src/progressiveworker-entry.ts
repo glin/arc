@@ -719,20 +719,28 @@ function startCompressedBackfill(
   if (names) backfill.setNames(names);
 }
 
-function noteCompressedNames(list: readonly string[], stores: import('./compressedstore').CompressedStorePaths): void {
+// `held` means the list waits for the first load, and `recorded` means the worker took it.
+function noteCompressedNames(
+  list: readonly string[],
+  stores: import('./compressedstore').CompressedStorePaths,
+): 'held' | 'recorded' {
   // The first load reads the store after the first render and the first pass, so a list before it waits.
   if (!compressedFollowers.has(stores.facts)) {
     heldCompressedNames.set(stores.facts, list);
-    return;
+    return 'held';
   }
   compressedNames.set(stores.facts, list);
   compressedBackfills.get(stores.facts)?.setNames(list);
-  void recordCompressedNames(list, compressedHolder(stores.facts), {
-    known: compressedFollowers.get(stores.facts)?.known(),
-  }).then(() => {
-    const bytes = takeCompressedWriteBytes();
-    if (bytes) parentPort?.postMessage({ compressedStoreWrite: bytes });
+  // The record holds the worker for up to one slice, so it starts after the reply.
+  setImmediate(() => {
+    void recordCompressedNames(list, compressedHolder(stores.facts), {
+      known: compressedFollowers.get(stores.facts)?.known(),
+    }).then(() => {
+      const bytes = takeCompressedWriteBytes();
+      if (bytes) parentPort?.postMessage({ compressedStoreWrite: bytes });
+    });
   });
+  return 'recorded';
 }
 
 async function execute(
@@ -2764,14 +2772,19 @@ async function handleMessage(message: {
             result: { generation: message.generation, revision: null, value, workerMemory: workerMemory() },
           });
       });
+      if (
+        request.kind === 'claude-children' &&
+        value.kind === 'claude-children' &&
+        request.compressed &&
+        request.compressedStores
+      )
+        value.compressedNames = noteCompressedNames(request.compressed, request.compressedStores);
       if (!controller.signal.aborted) {
         parentPort?.postMessage({
           id: message.id,
           result: { generation: message.generation, revision: null, value, workerMemory: workerMemory() },
         });
       }
-      if (request.kind === 'claude-children' && request.compressed && request.compressedStores)
-        noteCompressedNames(request.compressed, request.compressedStores);
       return;
     }
     const file = 'session' in request ? request.session.file : request.input.session.file;

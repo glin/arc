@@ -15498,7 +15498,7 @@ test.skipIf(!zstdCompress)('the backfill starts only after a load names it, and 
   });
   try {
     const signal = new AbortController().signal;
-    await worker.run(
+    const listed = (await worker.run(
       {
         kind: 'claude-children',
         parents: [],
@@ -15508,7 +15508,8 @@ test.skipIf(!zstdCompress)('the backfill starts only after a load names it, and 
       } as never,
       1,
       signal,
-    );
+    )) as { value: { compressedNames?: string } };
+    assert.equal(listed.value.compressedNames, 'held', 'a list before the first load did not wait for it');
     assert.equal(decodes, 0, 'a list before the first load decoded a rollout');
     await worker.run({ kind: 'compressed-load', stores }, 2, signal);
     assert.equal(decodes, 0, 'a load without the backfill field started the backfill');

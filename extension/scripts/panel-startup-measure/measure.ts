@@ -1571,16 +1571,16 @@ export async function admittedCompressed(input: {
 }
 
 // The input of `compressedPending` for this run. A hold that does not name that measure needs none.
-async function compressedPendingInput(
-  options: Options,
+export async function compressedPendingInput(
+  options: Pick<Options, 'warmUntil' | 'fixture'>,
   workspace: string,
+  codex: string = soakRequested ? SOAK_CODEX : fixture.codex,
 ): Promise<CompressedPendingInput | undefined> {
   if (!options.warmUntil.some((condition) => condition.measure === 'compressedPending')) return undefined;
   const manifest = JSON.parse(fs.readFileSync(options.fixture, 'utf8')) as {
     frozen?: { compressed?: { rollouts?: Array<{ file: string }> } };
   };
   const rollouts = manifest.frozen?.compressed?.rollouts ?? [];
-  const codex = soakRequested ? SOAK_CODEX : fixture.codex;
   const names = rollouts.map((entry) => path.join(codex, path.relative('codex', entry.file)));
   const { files } = await admittedCompressed({ workspace, codex, rollouts });
   return { names, admitted: files };

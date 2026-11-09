@@ -462,6 +462,8 @@ export type ProgressiveValue =
   | ({ kind: 'commit-repositories' } & CommitRepositoryReply)
   | {
       kind: 'claude-children';
+      // How the worker took the `compressed` list of the request.
+      compressedNames?: 'held' | 'recorded';
       compatibility?: string;
       references: ClaudeChildSessionReference[];
       children: ClaudeChildSessionFile[];

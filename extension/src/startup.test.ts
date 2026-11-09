@@ -340,6 +340,7 @@ import {
   pollStartup,
   liveDirectories,
   compressedPending,
+  compressedPendingInput,
   holdUntil,
   holdReading,
   finishHold,
@@ -11105,8 +11106,100 @@ test('a backfill batch lists a compressed-only session with its title and cost, 
   );
   assert.equal(held[0].sessionId, twinThread);
   assert.equal(provider.titleEntryOf(twin)?.label, 'Decoded title', 'the row lost its title');
-  assert.ok(provider.compressedFacts.get(twin)?.spend, 'the row lost its spend record');
+  provider.codexMetas = { revision: 1, keys: () => [], peek: () => null };
+  assert.deepEqual(
+    provider.compressedSpendPick([]),
+    [provider.compressedFacts.get(twin).spend],
+    'the shown total did not pick the stored spend record',
+  );
 });
+
+test('a backfill batch reaches the held catalog and the gauge through the refresh', async () => {
+  const { provider, root, writeRollout, walks, releaseAll } = heldWalkHarness(
+    { readRolloutStat, isHiddenThread, isAgentRun, compressedTitleCurrent, withKeptUndercount, compressedEntrySame },
+    [],
+  );
+  writeRollout('plain');
+  const twin = path.join(root, `rollout-${twinThread}.jsonl.zst`);
+  fs.writeFileSync(twin, 'x');
+  const stat = readRolloutStat(twin)!;
+  const gauges: Record<string, number> = {};
+  provider.performanceCounters = {
+    ...provider.performanceCounters,
+    recordGauge: (name: string, value: number) => (gauges[name] = value),
+  };
+  await releaseAll(provider.refresh(true));
+  const walksBefore = walks.length;
+  assert.equal(gauges.compressedRows, undefined, 'the gauge moved without a compressed-facts refresh');
+  provider.applyCompressedBatch({
+    entries: [
+      {
+        file: twin,
+        pairKey: twin.replace(/\.zst$/, ''),
+        factsVersion: COMPRESSED_FACTS_VERSION,
+        metadataGeneration: METADATA_GENERATIONS.codex,
+        size: stat.size,
+        mtimeMs: stat.mtimeMs,
+        threadId: twinThread,
+        opening: { ...backfillOpening, cwd: provider.repositoryScopeRoots[0] },
+        complete: true,
+        decodedLength: 500,
+      },
+    ],
+    backfillMs: 0,
+  });
+  await vi.waitFor(() => assert.equal(provider.refreshController, null));
+  assert.deepEqual(
+    (provider.catalog.sessions as SessionFile[]).filter((row) => row.file === twin).map((row) => row.sessionId),
+    [twinThread],
+    'the batch did not reach the held catalog',
+  );
+  assert.equal(walks.length, walksBefore, 'a compressed-facts refresh walked the rollout tree');
+  assert.equal(gauges.compressedRows, 1, 'the refresh did not set the gauge');
+});
+
+test.skipIf(!rolloutCompression.zstdCompressSync)(
+  'compressedPendingInput names the rollouts of the run tree',
+  async () => {
+    const base = tempDir('pending-input-');
+    const repository = path.join(base, 'Repository');
+    fs.mkdirSync(repository);
+    execFileSync('git', ['-C', repository, 'init', '-q']);
+    const codex = path.join(base, 'codex');
+    const directory = path.join(codex, 'sessions', '2026', '11', '01');
+    fs.mkdirSync(directory, { recursive: true });
+    const id = '01a032c9-0000-7000-8000-000000000001';
+    const name = `rollout-2026-11-01T00-00-00-${id}.jsonl.zst`;
+    const file = path.join(directory, name);
+    fs.writeFileSync(
+      file,
+      rolloutCompression.zstdCompressSync!(
+        Buffer.from(
+          `${JSON.stringify({ timestamp: '2026-11-01T00:00:00.000Z', type: 'session_meta', payload: { id, cwd: repository, source: 'cli', thread_source: 'user' } })}\n`,
+        ),
+      ),
+    );
+    const manifest = path.join(base, 'manifest.json');
+    fs.writeFileSync(
+      manifest,
+      JSON.stringify({
+        frozen: { compressed: { rollouts: [{ file: path.join('codex', 'sessions', '2026', '11', '01', name) }] } },
+      }),
+    );
+    const options = { warmUntil: [{ measure: 'compressedPending', value: 0 }], fixture: manifest };
+    const input = await compressedPendingInput(options, repository, codex);
+    assert.deepEqual(input?.names, [file], 'the runner named a path outside the run tree');
+    assert.deepEqual([...input.admitted], [file], 'the runner did not admit the rollout');
+    const { home, facts } = pendingStores('pending-input-store-');
+    assert.equal(compressedPending(home, input), 1, 'an undecoded rollout did not count');
+    const stat = readRolloutStat(file)!;
+    writeSegment(facts, [
+      { file, pairKey: file, ...pendingVersions, size: stat.size, mtimeMs: stat.mtimeMs, decodedLength: 9 },
+    ]);
+    assert.equal(compressedPending(home, input), 0, 'a decoded entry under the run path did not count as done');
+    assert.equal(await compressedPendingInput({ warmUntil: [], fixture: manifest }, repository, codex), undefined);
+  },
+);
 
 test('a complete discovery reply keeps a backfilled row and gives it a spend source', async () => {
   const { provider, root, writeRollout, releaseAll } = heldWalkHarness(
