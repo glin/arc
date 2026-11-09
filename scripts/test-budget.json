@@ -103,7 +103,7 @@
     },
     "cold start | readBytes": {
       "reason": "Cold start reads 392568 bytes through discovery. The margin covers the temporary path length and the file identity numbers in dispatch receipts.",
-      "budget": 411185,
+      "budget": 411176,
       "margin": 256
     },
     "cold start | receiptChecks": {
@@ -243,7 +243,7 @@
     },
     "warm start | readBytes": {
       "reason": "Warm start reads 16105 bytes through discovery. The margin covers the temporary path length and the file identity numbers in dispatch receipts.",
-      "budget": 18882,
+      "budget": 18873,
       "margin": 256
     },
     "warm start | receiptChecks": {
@@ -458,7 +458,7 @@
     },
     "child watcher event | readBytes": {
       "reason": "Child watcher event reads 18511 bytes through discovery. The margin covers the temporary path length and the file identity numbers in dispatch receipts.",
-      "budget": 21420,
+      "budget": 21411,
       "margin": 256
     },
     "child watcher event | receiptChecks": {
@@ -651,6 +651,156 @@
       "budget": 0,
       "margin": 0
     },
+    "repeated record coverage | catalogWalk": {
+      "reason": "A step walks the catalog only when no held catalog can serve it. A rise means a step lost catalog reuse.",
+      "budget": 0,
+      "margin": 0
+    },
+    "repeated record coverage | discoveryRequest:walked": {
+      "reason": "A discovery request follows a catalog walk, and a held catalog sends none. A rise means a step reopens the receipt scan.",
+      "budget": 0,
+      "margin": 0
+    },
+    "repeated record coverage | dispatchSpendVisits": {
+      "reason": "A spend pass visits each dispatched root once and skips a settled root. A rise means a step visits settled roots.",
+      "budget": 0,
+      "margin": 0
+    },
+    "repeated record coverage | openingsRead:children": {
+      "reason": "A walk reads a child head only when the saved row cannot answer it. A rise means the child census reads every child again.",
+      "budget": 0,
+      "margin": 0
+    },
+    "repeated record coverage | openingsRead:codex": {
+      "reason": "The opening cache answers Codex rollouts after the first read. A rise means the cache stopped serving rollout openings.",
+      "budget": 0,
+      "margin": 0
+    },
+    "repeated record coverage | openingsRead:collisions": {
+      "reason": "Only a session that shares its ID with another source takes the qualified read. A rise means the collision check reads more sources.",
+      "budget": 0,
+      "margin": 0
+    },
+    "repeated record coverage | openingsRead:parents": {
+      "reason": "A new worker reads each parent opening once, and later steps answer from held state. A rise means a step reads parent openings again.",
+      "budget": 0,
+      "margin": 0
+    },
+    "repeated record coverage | posted:render": {
+      "reason": "The panel receives one message for each publication, and a delta carries only changed rows. A rise means a step publishes more or carries more rows.",
+      "budget": 2,
+      "margin": 0
+    },
+    "repeated record coverage | posted:render:delta": {
+      "reason": "The panel receives one message for each publication, and a delta carries only changed rows. A rise means a step publishes more or carries more rows.",
+      "budget": 2,
+      "margin": 0
+    },
+    "repeated record coverage | posted:render:rows": {
+      "reason": "The panel receives one message for each publication, and a delta carries only changed rows. A rise means a step publishes more or carries more rows.",
+      "budget": 4,
+      "margin": 0
+    },
+    "repeated record coverage | readBytes": {
+      "reason": "Discovery reads each source once, and the receipt scan reads each receipt once. A rise means a step reads files again.",
+      "budget": 0,
+      "margin": 0
+    },
+    "repeated record coverage | receiptScanOpensAfterCompletion": {
+      "reason": "A completed pass closes its receipt scan and a spend-only pass opens none. A rise means a completion reopens a full receipt scan.",
+      "budget": 0,
+      "margin": 0
+    },
+    "repeated record coverage | refreshCount:catalog-enumeration": {
+      "reason": "Each refresh that lists sessions runs one enumeration. A rise means a step runs extra catalog refreshes.",
+      "budget": 2,
+      "margin": 0
+    },
+    "repeated record coverage | renderPost:enrichment": {
+      "reason": "A refresh renders the session list when its inputs changed. A rise means a step redraws without new facts.",
+      "budget": 1,
+      "margin": 0
+    },
+    "repeated record coverage | renderPost:repeated-record-coverage": {
+      "reason": "A refresh renders the session list when its inputs changed. A rise means a step redraws without new facts.",
+      "budget": 1,
+      "margin": 0
+    },
+    "repeated record coverage | unsettledParentChanges": {
+      "reason": "A held pass lists one parent set however a listing orders it. A rise means reordered parents reopen discovery.",
+      "budget": 0,
+      "margin": 0
+    },
+    "enrichment stale file | catalogWalk": {
+      "reason": "A step walks the catalog only when no held catalog can serve it. A rise means a step lost catalog reuse.",
+      "budget": 0,
+      "margin": 0
+    },
+    "enrichment stale file | discoveryRequest:walked": {
+      "reason": "A discovery request follows a catalog walk, and a held catalog sends none. A rise means a step reopens the receipt scan.",
+      "budget": 0,
+      "margin": 0
+    },
+    "enrichment stale file | dispatchSpendVisits": {
+      "reason": "A spend pass visits each dispatched root once and skips a settled root. A rise means a step visits settled roots.",
+      "budget": 0,
+      "margin": 0
+    },
+    "enrichment stale file | openingsRead:children": {
+      "reason": "A walk reads a child head only when the saved row cannot answer it. A rise means the child census reads every child again.",
+      "budget": 0,
+      "margin": 0
+    },
+    "enrichment stale file | openingsRead:codex": {
+      "reason": "The opening cache answers Codex rollouts after the first read. A rise means the cache stopped serving rollout openings.",
+      "budget": 0,
+      "margin": 0
+    },
+    "enrichment stale file | openingsRead:collisions": {
+      "reason": "Only a session that shares its ID with another source takes the qualified read. A rise means the collision check reads more sources.",
+      "budget": 0,
+      "margin": 0
+    },
+    "enrichment stale file | openingsRead:parents": {
+      "reason": "A new worker reads each parent opening once, and later steps answer from held state. A rise means a step reads parent openings again.",
+      "budget": 0,
+      "margin": 0
+    },
+    "enrichment stale file | posted:render": {
+      "reason": "The panel receives one message for each publication, and a delta carries only changed rows. A rise means a step publishes more or carries more rows.",
+      "budget": 2,
+      "margin": 0
+    },
+    "enrichment stale file | posted:render:delta": {
+      "reason": "The panel receives one message for each publication, and a delta carries only changed rows. A rise means a step publishes more or carries more rows.",
+      "budget": 2,
+      "margin": 0
+    },
+    "enrichment stale file | readBytes": {
+      "reason": "Discovery reads each source once, and the receipt scan reads each receipt once. A rise means a step reads files again.",
+      "budget": 0,
+      "margin": 0
+    },
+    "enrichment stale file | receiptScanOpensAfterCompletion": {
+      "reason": "A completed pass closes its receipt scan and a spend-only pass opens none. A rise means a completion reopens a full receipt scan.",
+      "budget": 0,
+      "margin": 0
+    },
+    "enrichment stale file | refreshCount:catalog-enumeration": {
+      "reason": "Each refresh that lists sessions runs one enumeration. A rise means a step runs extra catalog refreshes.",
+      "budget": 2,
+      "margin": 0
+    },
+    "enrichment stale file | renderPost:enrichment": {
+      "reason": "A refresh renders the session list when its inputs changed. A rise means a step redraws without new facts.",
+      "budget": 2,
+      "margin": 0
+    },
+    "enrichment stale file | unsettledParentChanges": {
+      "reason": "A held pass lists one parent set however a listing orders it. A rise means reordered parents reopen discovery.",
+      "budget": 0,
+      "margin": 0
+    },
     "poll and backstop walk | catalogWalk": {
       "reason": "Poll and backstop walk runs 1 complete catalog walks.",
       "budget": 1,
@@ -701,24 +851,9 @@
       "budget": 316,
       "margin": 0
     },
-    "poll and backstop walk | posted:render": {
-      "reason": "The panel receives one message for each publication, and a delta carries only changed rows. A rise means a step publishes more or carries more rows.",
-      "budget": 1,
-      "margin": 0
-    },
-    "poll and backstop walk | posted:render:delta": {
-      "reason": "The panel receives one message for each publication, and a delta carries only changed rows. A rise means a step publishes more or carries more rows.",
-      "budget": 1,
-      "margin": 0
-    },
-    "poll and backstop walk | posted:render:rows": {
-      "reason": "The panel receives one message for each publication, and a delta carries only changed rows. A rise means a step publishes more or carries more rows.",
-      "budget": 2,
-      "margin": 0
-    },
     "poll and backstop walk | readBytes": {
       "reason": "Poll and backstop walk reads 16105 bytes through discovery. The margin covers the temporary path length and the file identity numbers in dispatch receipts.",
-      "budget": 18882,
+      "budget": 18873,
       "margin": 256
     },
     "poll and backstop walk | receiptChecks": {
@@ -744,11 +879,6 @@
     "poll and backstop walk | refreshCount:catalog-enumeration": {
       "reason": "Poll and backstop walk records this enumeration part 2 times.",
       "budget": 2,
-      "margin": 0
-    },
-    "poll and backstop walk | renderPost:poll": {
-      "reason": "Poll and backstop walk posts 1 renders for this reason.",
-      "budget": 1,
       "margin": 0
     },
     "poll and backstop walk | unsettledParentChanges": {
@@ -828,7 +958,7 @@
     },
     "collision walk | readBytes": {
       "reason": "Discovery reads each source once, and the receipt scan reads each receipt once. A rise means a step reads files again.",
-      "budget": 41261,
+      "budget": 41243,
       "margin": 256
     },
     "collision walk | receiptChecks": {

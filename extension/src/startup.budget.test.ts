@@ -318,6 +318,21 @@ test('each step of the session list script stays within its recorded counts', as
       () => void active.receive({ type: 'showSession', session: workspace.parents[50].sessionId }),
     );
     await step('session list update', () => void active.receive({ type: 'setRailFilters', railFilters: [] }));
+    await step(
+      'repeated record coverage',
+      () => void active.provider.repeatedCoverage(workspace.parents[60].file, 'worker'),
+    );
+    await step('enrichment stale file', () => {
+      const file = workspace.parents[61].file;
+      const enrichment = active.provider.prepareRailEnrichment;
+      let answered = false;
+      active.provider.prepareRailEnrichment = async (...args: unknown[]) => {
+        if (answered) return enrichment.apply(active.provider, args);
+        answered = true;
+        return { changed: true, progress: false, stale: [file] };
+      };
+      active.provider.refreshFrom('enrichment', true, true, null);
+    });
     const poll = intervals.find((callback) => callback.toString().includes('pollCatalog'));
     assert.ok(poll, 'polling never started');
     await step('poll and backstop walk', async () => {
