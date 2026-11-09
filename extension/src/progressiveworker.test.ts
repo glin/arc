@@ -639,6 +639,80 @@ test('the receipt counters record launches read, launches rejected at the reques
   }
 });
 
+test.each([
+  [3, 1],
+  [8, 1],
+  [9, 2],
+])('a receipt pass of %i steps counts %i scan turns', async (steps, turns) => {
+  const root = tempDir('receipt-worker-partial-turn-');
+  const fx = receiptDispatchFixture(root, 'claude', 'codex');
+  fs.mkdirSync(fx.receipts.root, { recursive: true });
+  for (let index = 0; index < 20; index++)
+    fs.mkdirSync(path.join(fx.receipts.root, `${index.toString(16).padStart(8, '0')}-1111-2222-3333-444444444444`));
+  const budget = 'receiptSteps >= RECEIPT_STEPS';
+  assert.ok(source.includes(budget));
+  const worker = new ProgressiveWorker(
+    `process.env.ARC_HOME=${JSON.stringify(fx.home)};performance.now=()=>0;` +
+      source.replace(budget, `receiptSteps >= ${steps}`),
+  );
+  try {
+    const pass = await worker.run(
+      { kind: 'claude-children', parents: fx.catalog, catalog: fx.catalog, repositoryRoots: [root] },
+      1,
+      new AbortController().signal,
+    );
+    assert.equal(pass?.value.kind, 'claude-children-progress');
+    assert.equal(pass.value.charges?.receiptScanTurns, turns);
+  } finally {
+    worker.stop();
+  }
+});
+
+test('the launch and turn counts of a cancelled request reach the next reply', async () => {
+  const root = tempDir('receipt-worker-cancelled-counts-');
+  const fx = receiptDispatchFixture(root, 'claude', 'codex');
+  fs.mkdirSync(fx.receipts.root, { recursive: true });
+  fx.launch(fx.parent, fx.child);
+  fx.launch(fx.grandchild, fx.child);
+  const catalog = [fx.parent, fx.child];
+  const turn = 'await receiptScanTurn();';
+  assert.ok(source.includes(turn));
+  const cancel = new AbortController();
+  // The first request stops at the first turn after it counts a launch, until its cancel message arrives.
+  const worker = new ProgressiveWorker(
+    `process.env.ARC_HOME=${JSON.stringify(fx.home)};let heldOnce=false;const holdPort=require('node:worker_threads').parentPort;` +
+      source.replace(
+        turn,
+        `${turn}if(!heldOnce&&charges.receiptLaunchesRead+charges.receiptLaunchesRejectedAtRequester>0){heldOnce=true;holdPort.postMessage({repeatedCoverage:'launch-counted'});while(!signal.aborted)${turn}}`,
+      ),
+    undefined,
+    (message) => {
+      if (message === 'launch-counted') cancel.abort();
+    },
+  );
+  const { host, replies } = await receiptDiscoveryHost(worker, [root], catalog);
+  const counters = new PanelPerformanceCounters(0, 'receipt-cancelled-counts');
+  host.performanceCounters = counters;
+  try {
+    let complete = false;
+    for (let request = 1; request <= 50 && !complete; request++) {
+      host.refreshGeneration = request;
+      replies.last = null;
+      await host.prepareClaudeChildren(request, (request === 1 ? cancel : new AbortController()).signal);
+      const reply = (replies.last as ProgressiveResult | null)?.value;
+      if (request === 1) assert.equal(reply, undefined, 'the cancelled request posted a reply');
+      complete = reply?.kind === 'claude-children';
+    }
+    assert.ok(complete, 'receipt discovery never completed');
+    const { discovery } = counters.snapshot();
+    assert.equal(discovery.receiptLaunchesRead, 1);
+    assert.equal(discovery.receiptLaunchesRejectedAtRequester, 1);
+    assert.ok((discovery.receiptScanTurns ?? 0) >= 2, `${discovery.receiptScanTurns} scan turns`);
+  } finally {
+    worker.stop();
+  }
+});
+
 test('the receipt slice deadline ends a pass inside a batch of steps', async () => {
   const root = tempDir('receipt-worker-deadline-');
   const fx = receiptDispatchFixture(root, 'claude', 'codex');
