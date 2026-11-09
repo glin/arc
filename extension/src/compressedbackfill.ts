@@ -24,6 +24,7 @@ import {
   compressedEntryBatches,
   compressedEntryCurrent,
   compressedEntrySame,
+  compressedEntrySeed,
   compressedEntryVersions,
   compressedOpeningEntry,
   compressedPairKey,
@@ -360,7 +361,7 @@ export class CompressedBackfill {
   private names: ReadonlySet<string> = new Set();
   private readonly events = new Set<string>();
   private readonly staleOpens = new Set<string>();
-  private readonly results = new Map<string, CompressedFactEntry>();
+  private readonly results = new Map<string, CompressedEntrySeed>();
   private readonly retries = new Map<string, { size: number; mtimeMs: number; attempts: number; at: number }>();
   private readonly openingEntries = new Map<string, CompressedFactEntry>();
   private openingsLoaded = false;
@@ -766,10 +767,8 @@ export class CompressedBackfill {
     });
   }
 
-  // The worker holds no title or spend for an entry it did not derive, so the whole entry comes from the store.
+  // The worker holds no title or spend, so the whole entry comes from the store.
   private async storedEntry(file: string): Promise<CompressedFactEntry | undefined> {
-    const held = this.results.get(file);
-    if (held) return held;
     return (await readCompressedStoreInSteps(this.options.facts.directory, this.statOf, this.yieldStep)).entries.get(
       file,
     );
@@ -787,7 +786,7 @@ export class CompressedBackfill {
     const entry = boundedCompressedEntry(withKeptUndercount(previous, next));
     const [written] = await this.options.facts.append([entry]);
     if (!written && !(await this.options.facts.durable([entry]))) return;
-    this.results.set(entry.file, entry);
+    this.results.set(entry.file, compressedEntrySeed(entry));
     this.outbox.set(entry.file, entry);
     if (entry.opening) {
       const opening = compressedOpeningEntry(entry);

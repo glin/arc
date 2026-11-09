@@ -16325,6 +16325,25 @@ test.skipIf(!zstdCompress)('a load reply carries an entry whose batch has not re
   }
 });
 
+test.skipIf(!zstdCompress)('the backfill holds no title or spend for an entry it published', async () => {
+  const pair = compressedRolloutPair();
+  const harness = backfillHarness({ exists: () => false });
+  const { backfill, facts } = harness;
+  const results = (backfill as unknown as { results: Map<string, Record<string, unknown>> }).results;
+  try {
+    backfill.setNames([pair.compressed]);
+    await vi.waitFor(() => assert.ok(results.get(pair.compressed), 'the published entry was not held'));
+    assert.ok(facts[0].title && facts[0].spend, 'the store entry lost its title or spend');
+    const held = results.get(pair.compressed)!;
+    assert.equal('title' in held, false, 'the worker kept the title of a published entry');
+    assert.equal('spend' in held, false, 'the worker kept the spend record of a published entry');
+    assert.ok(held.opening, 'the plan lost the opening of a published entry');
+  } finally {
+    backfill.dispose();
+    fs.rmSync(pair.directory, { recursive: true, force: true });
+  }
+});
+
 const unitStat = { size: 10, mtimeMs: 2, dev: 1, ino: 1 };
 const unitDecoded = (hash = 'h') =>
   ({ kind: 'decoded', hash, stat: unitStat as never, frames: 1, complete: true }) as const;
