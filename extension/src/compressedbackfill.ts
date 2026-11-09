@@ -23,6 +23,7 @@ import {
   boundedCompressedEntry,
   compressedEntryBatches,
   compressedEntryCurrent,
+  compressedEntrySame,
   compressedEntryVersions,
   compressedOpeningEntry,
   compressedPairKey,
@@ -464,6 +465,12 @@ export class CompressedBackfill {
     this.cancelFlush = null;
     this.cancelReplan?.();
     this.cancelReplan = null;
+  }
+
+  // True for the line of an entry that this backfill published, which a batch already carried to the host.
+  published(entry: CompressedFactEntry): boolean {
+    const held = this.results.get(entry.file);
+    return !!held && compressedEntrySame(held, entry);
   }
 
   private factsOf(file: string): CompressedEntrySeed | undefined {

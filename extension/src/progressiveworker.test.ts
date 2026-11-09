@@ -16207,6 +16207,52 @@ test('a load reply returns name-only paths and keeps an unreadable name-only ent
   }
 });
 
+test.skipIf(!zstdCompress)('a load poll does not post the entries this worker published', async () => {
+  const pair = compressedRolloutPair();
+  const stores = { facts: path.join(pair.directory, 'facts'), openings: path.join(pair.directory, 'openings') };
+  const published: CompressedFactEntry[] = [];
+  const worker = new ProgressiveWorker(
+    source,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    (batch) => published.push(...batch.entries),
+  );
+  const signal = new AbortController().signal;
+  const backfill = { workspace: pair.directory, roots: [pair.directory], launch: 'one' };
+  try {
+    await worker.run({ kind: 'compressed-load', stores, backfill }, 1, signal);
+    await worker.run(
+      {
+        kind: 'claude-children',
+        parents: [],
+        repositoryRoots: [pair.directory],
+        compressed: [pair.compressed],
+        compressedStores: stores,
+      } as never,
+      2,
+      signal,
+    );
+    await vi.waitFor(() => assert.equal(published.length, 1, 'the backfill did not post the entry'));
+    fs.writeFileSync(
+      path.join(stores.facts, 'segment-1-other-0'),
+      `${JSON.stringify({ file: 'other.zst', pairKey: 'other.zst', ...compressedEntryVersions(), decodedLength: 3 })}\n`,
+    );
+    const result: any = await worker.run({ kind: 'compressed-load', stores, backfill }, 3, signal);
+    assert.deepEqual(
+      result.value.entries.map((entry: CompressedFactEntry) => entry.file),
+      ['other.zst'],
+      "the poll re-posted this worker's own entry",
+    );
+  } finally {
+    worker.stop();
+    fs.rmSync(pair.directory, { recursive: true, force: true });
+  }
+});
+
 const unitStat = { size: 10, mtimeMs: 2, dev: 1, ino: 1 };
 const unitDecoded = (hash = 'h') =>
   ({ kind: 'decoded', hash, stat: unitStat as never, frames: 1, complete: true }) as const;

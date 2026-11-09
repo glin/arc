@@ -663,7 +663,8 @@ async function executeCompressedLoad(
   }
   const polled = await follower.poll();
   // An unreadable name stays in the reply, so a replaced worker keeps its mark. Other names reach the host only as paths.
-  const facts = polled.filter((entry) => !entry.nameOnly || entry.unreadable);
+  const backfill = compressedBackfills.get(request.stores.facts);
+  const facts = polled.filter((entry) => (!entry.nameOnly || entry.unreadable) && !backfill?.published(entry));
   const nameOnly = polled.filter((entry) => entry.nameOnly && !entry.unreadable).map((entry) => entry.file);
   const held = heldCompressedNames.get(request.stores.facts);
   if (held) {
