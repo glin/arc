@@ -1078,11 +1078,13 @@ export const CODEX_STAT_ACTIVE_MS = 10 * 60_000;
 // until the held stat is this old. The age limit covers an event the watcher never delivers.
 export const CODEX_STAT_REVALIDATE_MS = 60_000;
 
-function statBehindOpening(stat: RolloutStat, opening: CodexSessionMeta | null | undefined): boolean {
+function statDisagreesWithOpening(stat: RolloutStat, opening: CodexSessionMeta | null | undefined): boolean {
+  if (opening?.size === undefined || opening.mtimeMs === undefined) return false;
+  const identity = opening.fileIdentity;
   return (
-    opening?.size !== undefined &&
-    opening.mtimeMs !== undefined &&
-    (stat.size < opening.size || stat.mtimeMs < opening.mtimeMs)
+    stat.size !== opening.size ||
+    stat.mtimeMs !== opening.mtimeMs ||
+    (identity !== undefined && (String(stat.dev) !== String(identity.dev) || String(stat.ino) !== String(identity.ino)))
   );
 }
 
@@ -1096,7 +1098,7 @@ export class CodexStatCache {
     private readonly now: () => number = Date.now,
   ) {}
 
-  // `opening` is the saved opening of the file. A held stat older than the opening's own stat is read again.
+  // `opening` is the saved opening of the file. A held stat that disagrees with the opening's own stat is read again.
   get(file: string, opening?: CodexSessionMeta | null): RolloutStat | null {
     const at = this.now();
     const held = this.entries.get(file);
@@ -1104,7 +1106,7 @@ export class CodexStatCache {
       held &&
       held.stat.mtimeMs < at - CODEX_STAT_ACTIVE_MS &&
       at - held.readAt < CODEX_STAT_REVALIDATE_MS &&
-      !statBehindOpening(held.stat, opening)
+      !statDisagreesWithOpening(held.stat, opening)
     ) {
       return held.stat;
     }

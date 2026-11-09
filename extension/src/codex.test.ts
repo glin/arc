@@ -16065,7 +16065,7 @@ test.each([
   }
 });
 
-test('a listing reconciles a held stat older than the saved opening', async () => {
+test('a listing reconciles a held stat that disagrees with the saved opening', async () => {
   const root = sessionsRoot([{ day: '2026/08/25', name: ROLLOUT(UUID_A), records: [meta({ id: UUID_A })] }]);
   const file = rolloutFiles(root)[0];
   const opening = readCodexSessionMeta(file)!;
@@ -16132,6 +16132,34 @@ test('a listing reconciles a held stat older than the saved opening', async () =
   );
   for (let listing = 0; listing < 3; listing++) assert.equal(primedRewrite.list().sessionId, UUID_B);
   assert.equal(primedRewrite.counts.reads, 0, 'a held stat rejected the opening that the pass read');
+
+  const disagreements: { name: string; stat: RolloutStat }[] = [
+    { name: 'same size, earlier time', stat: { ...before, mtimeMs: 1900 } },
+    { name: 'smaller, earlier, another inode', stat: { ...before, size: 900, mtimeMs: 1800, ino: '3' } },
+    { name: 'same size and time, another inode', stat: { ...before, ino: '3' } },
+    { name: 'same size and time, another device', stat: { ...before, dev: '9' } },
+  ];
+  for (const { name, stat } of disagreements) {
+    const replaced = fixture(before);
+    replaced.list();
+    replaced.disk.stat = stat;
+    await replaced.cache.prime(
+      [file],
+      async () => replaced.reading(UUID_B),
+      undefined,
+      undefined,
+      undefined,
+      async () => replaced.disk.stat,
+    );
+    const revision = replaced.cache.revision;
+    for (let listing = 0; listing < 3; listing++) {
+      const row = replaced.list();
+      assert.equal(row.sessionId, UUID_B, name);
+      assert.equal(row.mtimeMs, stat.mtimeMs, name);
+    }
+    assert.equal(replaced.counts.reads, 0, `${name}: a listing read the opening again`);
+    assert.equal(replaced.cache.revision, revision, `${name}: a listing moved the revision`);
+  }
 
   const missedRewrite = fixture(before);
   missedRewrite.list();
