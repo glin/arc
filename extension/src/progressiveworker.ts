@@ -729,6 +729,8 @@ export class ProgressiveWorker {
     private readonly onRepeatedCoverage?: (file: string) => void,
     private readonly onFailure?: (failure: WorkerFailure) => void,
     private readonly onDiscoveryTransport?: (sample: DiscoveryTransportSample) => void,
+    // Counts each zstd decoder before the worker creates it.
+    private readonly onCompressedDecode?: () => void,
   ) {}
 
   snapshot(): {
@@ -937,7 +939,13 @@ export class ProgressiveWorker {
           windowRead?: WorkerWindowRead;
           repeatedCoverage?: string;
           dispatchSpend?: [string, import('./codex').CodexDispatchSpendEntry];
+          compressedDecode?: number;
         }) => {
+          if (message.compressedDecode !== undefined) {
+            this.onCompressedDecode?.();
+            worker.postMessage({ compressedDecodeAck: message.compressedDecode });
+            return;
+          }
           if (message.dispatchSpend) {
             if (this.worker !== worker) return;
             const [file, entry] = message.dispatchSpend;

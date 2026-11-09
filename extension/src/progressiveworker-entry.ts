@@ -148,6 +148,7 @@ import {
   type CompressedFactEntry,
 } from './compressedstore';
 import {
+  announceCompressedDecodes,
   compressedByteSource,
   compressedStat,
   decodeCompressedRollout,
@@ -592,6 +593,19 @@ function revive(checkpoint: ProgressiveCheckpoint | undefined): ProgressiveCheck
   checkpoint.contentAnchor.bytes = Buffer.from(checkpoint.contentAnchor.bytes);
   return checkpoint;
 }
+
+// The host counts every decoder before the worker creates it.
+let compressedDecodeIds = 0;
+const compressedDecodeAcks = new Map<number, () => void>();
+if (parentPort)
+  announceCompressedDecodes(
+    () =>
+      new Promise((resolve) => {
+        const id = ++compressedDecodeIds;
+        compressedDecodeAcks.set(id, resolve);
+        parentPort?.postMessage({ compressedDecode: id });
+      }),
+  );
 
 // One holder per store directory, for the life of the worker.
 const compressedHolders = new Map<string, CompressedStoreHolder>();
@@ -2873,7 +2887,13 @@ parentPort?.on(
     repeated?: { file: string; map: ClaudeRepeatedHeldMap };
     releaseBody?: string;
     releaseStores?: boolean;
+    compressedDecodeAck?: number;
   }) => {
+    if (message.compressedDecodeAck !== undefined) {
+      compressedDecodeAcks.get(message.compressedDecodeAck)?.();
+      compressedDecodeAcks.delete(message.compressedDecodeAck);
+      return;
+    }
     if (message.dispatchSpendEntries) {
       for (const [file, entry] of message.dispatchSpendEntries) retainCodexDispatchSpend(file, entry);
       return;

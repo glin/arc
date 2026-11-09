@@ -41,6 +41,21 @@ export function createZstdDecoder(windowLog?: number): Transform | null {
     : zstd.createZstdDecompress({ chunkSize: READ_CHUNK, params: { [param]: windowLog } });
 }
 
+let compressedDecodeAnnounce: (() => Promise<void>) | null = null;
+
+// Set the announcement of each decoder. The worker posts each one to the host and waits for the acknowledgement, so a
+// decoder never starts uncounted.
+export function announceCompressedDecodes(announce: (() => Promise<void>) | null): void {
+  compressedDecodeAnnounce = announce;
+}
+
+// A decoder for one rollout, after its announcement. Null when Node.js has no decoder.
+async function announcedZstdDecoder(windowLog?: number): Promise<Transform | null> {
+  if (!zstd.createZstdDecompress) return null;
+  await compressedDecodeAnnounce?.();
+  return createZstdDecoder(windowLog);
+}
+
 // True when this Node.js can decode a compressed rollout.
 export function compressedRolloutsReadable(): boolean {
   return typeof zstd.createZstdDecompress === 'function';
@@ -122,7 +137,7 @@ export function zstdFrames() {
 // zstd decoder, when the stream does not decode, or when no line ends within `maxBytes` decoded bytes. A body that ends
 // before its first line break answers null, because its first record is not complete. A file system refusal rejects.
 export async function readCompressedFirstRecord(file: string, maxBytes: number): Promise<string | null> {
-  const decoder = createZstdDecoder();
+  const decoder = await announcedZstdDecoder();
   if (!decoder) return null;
   const held: Buffer[] = [];
   let length = 0;
@@ -349,7 +364,7 @@ export async function decodeCompressedRollout(
   file: string,
   limits: CompressedBodyLimits = {},
 ): Promise<CompressedBodyRead> {
-  const decoder = createZstdDecoder(DECODER_WINDOW_LOG);
+  const decoder = await announcedZstdDecoder(DECODER_WINDOW_LOG);
   if (!decoder) return { kind: 'unsupported' };
   const cap = limits.bodyBytes ?? COMPRESSED_BODY_BYTES;
   const builder = new BodyBuilder(

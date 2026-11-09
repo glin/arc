@@ -1671,6 +1671,11 @@ test('a soak dispatch reads as a dispatched Codex child of a workspace parent', 
   assert.equal(simulation.appends, 1);
 });
 
+test('the panel records each worker decoder under the counter of the startup gate', () => {
+  const source = fs.readFileSync(path.join(__dirname, 'panelhost.ts'), 'utf8');
+  assert.match(source, /\(\) => this\.performanceCounters\?\.recordWork\('compressedDecodes'\)/);
+});
+
 test('the named counters hold every counter that the measure table lists', () => {
   for (const name of ['compressedDecodes', 'compressedStoreWriteBytes', 'refreshCount:compressed-facts'])
     assert.ok((NAMED_COUNTERS as readonly string[]).includes(name), name);

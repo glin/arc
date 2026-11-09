@@ -15148,6 +15148,52 @@ test('worker requests outside the opening path refuse a compressed rollout', asy
 
 const compressedSpend = { file: 'x', complete: true, buckets: [], lifetimeBuckets: [] } as never;
 
+test.skipIf(!zstdCompress)(
+  'the worker counts every decoder before it decodes, and a plain read counts none',
+  async () => {
+    const root = tempDir('worker-compressed-decodes-');
+    const id = '01a032c9-1a92-7931-845c-723117d24dbe';
+    const plain = path.join(root, `rollout-2026-08-25T12-00-00-${id}.jsonl`);
+    const twin = `${plain}.zst`;
+    const first = `${JSON.stringify({ type: 'session_meta', timestamp: '2026-08-25T12:00:00Z', payload: { id, cwd: root } })}\n`;
+    fs.writeFileSync(twin, zstdCompress!(Buffer.from(first)));
+    const mtime = new Date(1_700_000_000_000);
+    fs.utimesSync(twin, mtime, mtime);
+    const stores = { facts: path.join(root, 'facts'), openings: path.join(root, 'openings') };
+    const counters = new PanelPerformanceCounters();
+    const worker = new ProgressiveWorker(
+      `process.env.ARC_HOME=${JSON.stringify(root)};` + source,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      () => counters.recordWork('compressedDecodes'),
+    );
+    const signal = new AbortController().signal;
+    try {
+      const answered = await worker.run(
+        {
+          kind: 'compressed-adopt',
+          adoption: {
+            twin,
+            plain,
+            plainMtimeMs: mtime.getTime(),
+            opening: { sessionId: id, cwd: root } as never,
+            spend: compressedSpend,
+          },
+          stores,
+        },
+        1,
+        signal,
+      );
+      assert.ok(answered?.value.kind === 'compressed-adopt' && answered.value.adopted, 'the adoption failed');
+      assert.equal(counters.snapshot().work.compressedDecodes, 1, 'a decoder went uncounted');
+    } finally {
+      worker.stop();
+    }
+  },
+);
+
 test.skipIf(!zstdCompress)('a worker stop during an adoption releases its lease and the restart adopts', async () => {
   const root = tempDir('worker-compressed-stop-');
   const id = '01a032c9-1a92-7931-845c-723117d24dbe';
