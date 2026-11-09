@@ -4168,7 +4168,14 @@ test('unrelated and malformed background completions cannot satisfy a targeted r
   }
 });
 
+// Ends a fake child and checks that its shutdown left no timer for a later test.
+function finishChild(child: FakeChild): void {
+  child.exit(0);
+  assert.equal(vi.getTimerCount(), 0, 'a shutdown timer outlived its child');
+}
+
 test('accepted background metadata survives missing later reads and protects a resumed child', async () => {
+  vi.useFakeTimers();
   const { host, children } = fakeHost();
   host.retainBackgroundWork('claude', 'sess-1', [{ id: 'command', startedAt: 1 }], ['child']);
   const opening = host.session('one', claudePlan(CLAUDE, { cwd: WS, sessionId: 'sess-1' }));
@@ -4180,6 +4187,7 @@ test('accepted background metadata survives missing later reads and protects a r
   assert.equal(children[0].ended, false);
   host.cancelSessionRetirement('one');
   host.dispose();
+  finishChild(children[0]);
 });
 
 // Opens a child whose current turn launched one background command that never reports its end.
@@ -4207,6 +4215,7 @@ async function childWithBackgroundJob(options: Parameters<typeof fakeHost>[2] = 
 }
 
 test('archiving a settled child with an open background hold and no notice ends it once', async () => {
+  vi.useFakeTimers();
   const { host, child, session } = await childWithBackgroundJob();
   const dispose = vi.spyOn(session, 'dispose');
   child.say(COMPLETED_RESULT);
@@ -4218,9 +4227,11 @@ test('archiving a settled child with an open background hold and no notice ends 
   assert.equal(child.ended, true);
   host.setArchived(['sess-1']);
   assert.equal(dispose.mock.calls.length, 1);
+  finishChild(child);
 });
 
 test('an archive during a turn with an open background hold ends the child after the turn settles', async () => {
+  vi.useFakeTimers();
   const { host, child, session } = await childWithBackgroundJob();
   host.setArchived(['sess-1']);
   assert.strictEqual(host.get('one'), session, 'the archive ended a child during its turn');
@@ -4229,9 +4240,11 @@ test('an archive during a turn with an open background hold ends the child after
   settle(host, 'one');
   assert.equal(host.get('one'), null);
   assert.equal(child.ended, true);
+  finishChild(child);
 });
 
 test('an unarchived child with an open background hold does not retire at the idle limit', async () => {
+  vi.useFakeTimers();
   const timer = new FakeAgentHostTimer();
   const { host, child, session } = await childWithBackgroundJob({ idleDurationMs: 120, timer });
   child.say(COMPLETED_RESULT);
@@ -4240,9 +4253,11 @@ test('an unarchived child with an open background hold does not retire at the id
   for (let index = 0; index < timer.tasks.length; index++) timer.fire(index);
   assert.strictEqual(host.get('one'), session);
   assert.equal(child.ended, false);
+  finishChild(child);
 });
 
 test('a background task that ends during its turn releases its hold from the replayed notice', async () => {
+  vi.useFakeTimers();
   const timer = new FakeAgentHostTimer();
   const { host, child, session, say } = await childWithBackgroundJob({ idleDurationMs: 120, timer });
   const notice = (status: string, task = 'job-task', extra: object = {}) =>
@@ -4279,6 +4294,7 @@ test('a background task that ends during its turn releases its hold from the rep
   timer.fire(timer.tasks.length - 1);
   assert.equal(host.get('one'), null);
   assert.equal(child.ended, true);
+  finishChild(child);
 });
 
 test('a settled idle session retires when its timer fires', async () => {
