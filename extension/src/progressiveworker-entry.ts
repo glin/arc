@@ -142,6 +142,7 @@ import {
   compressedEntryBatches,
   compressedEntryVersions,
   compressedPairKey,
+  compressedPhysicalStat,
   CompressedStoreHolder,
   readCompressedStore,
   recordCompressedAdoption,
@@ -649,7 +650,9 @@ async function executeCompressedLoad(
   signal: AbortSignal,
   acknowledge?: (value: ProgressiveValue) => void,
 ): Promise<ProgressiveValue> {
-  const facts = [...readCompressedStore(request.stores.facts).entries.values()].filter((entry) => !entry.nameOnly);
+  const facts = [...readCompressedStore(request.stores.facts, compressedPhysicalStat).entries.values()].filter(
+    (entry) => !entry.nameOnly,
+  );
   const batches = compressedEntryBatches(facts);
   for (let at = 0; at < batches.length - 1 && !signal.aborted; at++) {
     acknowledge?.({ kind: 'compressed-load', entries: batches[at], done: false });

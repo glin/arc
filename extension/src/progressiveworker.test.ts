@@ -15194,6 +15194,33 @@ test.skipIf(!zstdCompress)(
   },
 );
 
+test.skipIf(!zstdCompress)(
+  'a load ranks an entry by the rollout stat, so a restored revision keeps its own facts',
+  async () => {
+    const root = tempDir('worker-compressed-rank-');
+    const twin = path.join(root, 'rollout-rank.jsonl.zst');
+    fs.writeFileSync(twin, 'x');
+    const mtime = new Date(1_700_000_000_000);
+    fs.utimesSync(twin, mtime, mtime);
+    const stat = fs.statSync(twin);
+    const stores = { facts: path.join(root, 'facts'), openings: path.join(root, 'openings') };
+    fs.mkdirSync(stores.facts, { recursive: true });
+    const stored = (mtimeMs: number, threadId: string) =>
+      `${JSON.stringify({ file: twin, pairKey: twin, factsVersion: 1, size: stat.size, mtimeMs, threadId })}\n`;
+    // The stat of the restored file matches the first entry. The second entry has a greater time and stays stale.
+    fs.writeFileSync(path.join(stores.facts, 'segment-1-holder-0'), stored(stat.mtimeMs, 'restored'));
+    fs.writeFileSync(path.join(stores.facts, 'segment-1-holder-1'), stored(stat.mtimeMs + 5_000, 'stale'));
+    const worker = new ProgressiveWorker(`process.env.ARC_HOME=${JSON.stringify(root)};` + source);
+    try {
+      const loaded = await worker.run({ kind: 'compressed-load', stores }, 1, new AbortController().signal);
+      assert.ok(loaded?.value.kind === 'compressed-load');
+      assert.equal(loaded.value.entries.find((entry) => entry.file === twin)?.threadId, 'restored');
+    } finally {
+      worker.stop();
+    }
+  },
+);
+
 test.skipIf(!zstdCompress)('a worker stop during an adoption releases its lease and the restart adopts', async () => {
   const root = tempDir('worker-compressed-stop-');
   const id = '01a032c9-1a92-7931-845c-723117d24dbe';

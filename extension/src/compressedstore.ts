@@ -336,6 +336,11 @@ function readableFactsVersion(version: number | null): boolean {
   return version === null || version <= COMPRESSED_FACTS_VERSION;
 }
 
+// The physical stat that ranks an entry against its rollout, in the precision that adoption stores.
+export function compressedPhysicalStat(file: string): { size: number; mtimeMs: number } | null {
+  return readRolloutStat(file);
+}
+
 // The fact version of a store file, from its first complete line. Null when the file holds no complete line.
 function fileFactsVersion(file: string): number | null {
   let version: number | null = null;
@@ -630,16 +635,7 @@ export class CompressedStoreHolder {
     this.retryDelay = options.retryDelay ?? (() => RETRY_MIN_MS + Math.random() * RETRY_SPREAD_MS);
     this.yieldStep = options.yieldStep ?? (() => new Promise((resolve) => setImmediate(resolve)));
     this.exists = options.exists ?? fs.existsSync;
-    this.statOf =
-      options.statOf ??
-      ((file) => {
-        try {
-          const stat = fs.statSync(file);
-          return { size: stat.size, mtimeMs: stat.mtimeMs };
-        } catch {
-          return null;
-        }
-      });
+    this.statOf = options.statOf ?? compressedPhysicalStat;
     this.wrote = options.wrote ?? (() => {});
     this.faultHook = options.fault ?? (() => {});
     this.openInput = options.openInput ?? openForRead;
