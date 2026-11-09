@@ -4157,7 +4157,7 @@ test('command-only admission removes pending rows through every catalog path and
     methodBody('private allSessions('),
     'reuseCatalog = false, deferHumanPrompts = false',
   );
-  const search = compile('search', methodBody('private searchCorpus('), 'only = null');
+  const search = compile('search', methodBody('private searchCorpus('), 'only = null, walked = false');
   const refreshBody = methodBody('async refresh(');
   const selected = compile(
     'selected',
@@ -19324,7 +19324,7 @@ test('the session on screen scopes the search, and every wording follows the sco
   // Scope search inputs to the selected session before reading individual files.
   sourceMatch(
     panelHostSource,
-    /const entries = retained[^;]*this\.searchCorpus\(this\.showing\);[\s\S]*searchScope\(entries, this\.showing\)/,
+    /const entries = retained[^;]*this\.searchCorpus\(this\.showing, walked\);[\s\S]*searchScope\(entries, this\.showing\)/,
     'the search is not scoped to the session on screen through the tested rule',
   );
   sourceMatch(
@@ -19404,6 +19404,7 @@ function searchHandler(): (host: object, text: string) => void {
   const answer = new Function(
     'query',
     'retained',
+    'walked',
     'searchScope',
     'searchScopeName',
     'labelsOf',
@@ -19411,6 +19412,8 @@ function searchHandler(): (host: object, text: string) => void {
     'panelAgentRun',
     member.slice(member.indexOf('{') + 1, member.lastIndexOf('}')),
   );
+  const AsyncFunction = (async () => {}).constructor as FunctionConstructor;
+  const settled = new AsyncFunction(methodBody('private async catalogSettled('));
   const handle = new Function('msg', 'isSearch', handlerBody(panelHostSource, 'search'));
   return (host, text) => {
     if (!('pinnedTop' in host)) Object.assign(host, { pinnedTop: new Set<string>() });
@@ -19419,8 +19422,11 @@ function searchHandler(): (host: object, text: string) => void {
       sessionQueryContext() {
         return undefined;
       },
-      answerSearch(this: object, query: string) {
-        answer.call(this, query, false, searchScope, searchScopeName, labelsOf, searchTurns, panelAgentRun);
+      catalogSettled(this: object) {
+        return settled.call(this);
+      },
+      answerSearch(this: object, query: string, _retained?: boolean, walked = false) {
+        answer.call(this, query, false, walked, searchScope, searchScopeName, labelsOf, searchTurns, panelAgentRun);
       },
     });
     handle.call(host, { type: 'search', text }, isSearch);
@@ -33133,7 +33139,7 @@ test('selection and accepted worker results avoid unnecessary catalog walks', ()
   const body = listing + memberFrom(panelHostSource, panelHostSource.indexOf('private walkedSessions('));
   sourceMatch(
     body,
-    /if \(reuseCatalog && this\.catalog && this\.catalog\.folders === folderPrint(?: && !namedFileChanged)?\)/,
+    /if \(reuseCatalog && this\.catalog && this\.catalog\.folders === folderPrint(?: && \(!namedFileChanged \|\| outsideWalk\))?\)/,
     'the held catalog is reused without checking that it was walked for these folders',
   );
   sourceMatch(
@@ -44413,7 +44419,7 @@ test.each([false, true])(
   async (admitted) => {
     const enumeration = methodBody('private walkedSessions(');
     const quarantineSource = ts.transpileModule(
-      `function quarantine(claude, codex, scope, sourceObservations = [], childSources = [], heldClaude) { const roots = scope.roots; const physicalContext = { domain: "physical", scope: JSON.stringify(scope.roots), revision: String(this.coverageRevision) }; const walkedSessions = [...claude, ...codex]; ${enumeration.slice(enumeration.indexOf('this.enumeratedMembers ='), enumeration.indexOf('this.catalog = { folders: folderPrint', enumeration.indexOf('this.enumeratedMembers =')))} }`,
+      `function quarantine(claude, codex, scope, sourceObservations = [], childSources = [], heldClaude, slicedClaude) { const roots = scope.roots; const physicalContext = { domain: "physical", scope: JSON.stringify(scope.roots), revision: String(this.coverageRevision) }; const walkedSessions = [...claude, ...codex]; ${enumeration.slice(enumeration.indexOf('this.enumeratedMembers ='), enumeration.indexOf('this.catalog = { folders: folderPrint', enumeration.indexOf('this.enumeratedMembers =')))} }`,
       { compilerOptions: { target: ts.ScriptTarget.ES2022 } },
     ).outputText;
     const quarantine = new Function(
