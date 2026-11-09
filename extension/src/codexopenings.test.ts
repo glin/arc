@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { test } from 'vitest';
-import { CodexMetaCache, readCodexSessionMeta, type CodexSessionMeta } from './codex';
+import { CodexMetaCache, readCodexSessionMeta, readRolloutStat, type CodexSessionMeta } from './codex';
 import { CODEX_META_VERSION, CodexOpeningsWriter, loadCodexOpenings, storedCodexMetas } from './codexopenings';
 import { loadDerivedCache, METADATA_GENERATIONS } from './derivedcache';
 import { tempDir } from './temproot';
@@ -23,10 +23,37 @@ test('the shared writer retains the file identity captured by an opening read', 
     assert.ok(Number.isFinite(opening.mtimeMs));
     assert.ok(opening.fileIdentity?.dev !== undefined);
     assert.ok(opening.fileIdentity?.ino !== undefined);
-    fs.appendFileSync(rollout, '{}\n');
-    cache.get(rollout, () => assert.fail('append reads the opening'));
+  } finally {
+    writer.dispose();
+  }
+});
+
+test('an append keeps the revision and reaches the saved file at the next save', () => {
+  const root = tempDir('codex-openings-');
+  const rollout = path.join(root, 'rollout.jsonl');
+  const next = path.join(root, 'next.jsonl');
+  const opening = JSON.stringify({ type: 'session_meta', payload: { id: 'session', cwd: root } }) + '\n';
+  fs.writeFileSync(rollout, opening);
+  const cache = new CodexMetaCache();
+  const file = path.join(root, 'openings.json');
+  const writer = new CodexOpeningsWriter(file, cache, false);
+  writer.setWalk([rollout, next]);
+  try {
+    cache.get(rollout);
     assert.equal(writer.write(), true);
-    assert.equal(loadCodexOpenings(file)?.get(rollout)?.size, fs.statSync(rollout).size);
+    const savedSize = loadCodexOpenings(file)?.get(rollout)?.size;
+    const revision = cache.revision;
+    fs.appendFileSync(rollout, '{}\n');
+    const grown = fs.statSync(rollout).size;
+    assert.ok(cache.get(rollout, () => assert.fail('append reads the opening'), readRolloutStat(rollout)));
+    assert.equal(cache.revision, revision, 'an append moved the revision');
+    assert.equal(cache.snapshot()[0][1].size, grown);
+    assert.equal(writer.write(), true);
+    assert.equal(loadCodexOpenings(file)?.get(rollout)?.size, savedSize, 'an append saved the file');
+    fs.writeFileSync(next, opening);
+    cache.get(next);
+    assert.equal(writer.write(), true);
+    assert.equal(loadCodexOpenings(file)?.get(rollout)?.size, grown);
   } finally {
     writer.dispose();
   }

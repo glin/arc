@@ -257,8 +257,10 @@ export class CodexMetaCache {
       meta.fileIdentity.ino === ino
     )
       return meta;
-    this.install(file, openingWithStat(meta, stat));
-    return this.entries.get(file)!.meta!;
+    // An append changes no opening field, so its stat reaches the saved records at the next save.
+    const grown = openingWithStat(meta, stat);
+    this.entries.set(file, { meta: grown });
+    return grown;
   }
 
   // A compressed rollout gets no opening read, and its name gets no entry. `onRead` runs once, before the first read of a file that opens.
