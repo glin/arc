@@ -10179,6 +10179,9 @@ export class PanelProvider implements vscode.Disposable {
           }
         } else if (this.codexColdPass?.listing) {
           this.noteColdPassNamedPaths(this.codexColdPass);
+          // A broad request reuses the catalog that the first listing built, as a request folded into the pass does.
+          // Only that first listing reads the Claude sources before the pass lists the rollouts.
+          if (this.catalog && !reuseCatalog && !this.targetedRefreshPaths?.length) reuseCatalog = true;
           primedEnumeration = this.codexColdPass.listing;
           this.performanceCounters.recordWork('seededListing');
         } else if (finished) {

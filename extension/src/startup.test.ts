@@ -9566,7 +9566,12 @@ function coldPassRaceHarness() {
   const settle = () =>
     vi.waitFor(() => {
       while (walks.length > released) walks[released++].release();
-      assert.ok(provider.refreshController === null && provider.pendingRefresh === null, 'a refresh is still running');
+      // A build that waits for the pass holds its folded request until the pass ends.
+      const held = provider.codexPriming !== null && !provider.codexColdPass?.listing;
+      assert.ok(
+        provider.refreshController === null && (held || provider.pendingRefresh === null),
+        'a refresh is still running',
+      );
     }, waited);
   const posts = () => provider.messages.filter((message: any) => message.type === 'render');
   return {
@@ -9615,7 +9620,31 @@ test('a warm start with visible reports before and after the first post counts i
       catalogWalks: work.catalogWalk ?? 0,
       asynchronousWalks: race.walks.length,
     },
-    { claudeListings: 2, catalogWalks: 2, asynchronousWalks: 0 },
+    { claudeListings: 1, catalogWalks: 1, asynchronousWalks: 0 },
+  );
+  race.done();
+});
+
+test('a visible report after the first post while the cold pass runs lists Claude once before the paint', async () => {
+  const race = coldPassRaceHarness();
+  const { provider, panel, counters } = race;
+  race.seed('seeded');
+  provider.refreshFrom('shell-ready', true);
+  await race.settle();
+  panel.changeVisibility();
+  await race.settle();
+  // A build that waits for the pass draws only after it, so the count stops at the post that follows the pass.
+  race.finishPass();
+  await race.untilPosted();
+  await race.settle();
+  const work = counters.snapshot().work;
+  assert.deepEqual(
+    {
+      claudeListings: race.claudeListings(),
+      catalogWalks: work.catalogWalk ?? 0,
+      asynchronousWalks: race.walks.length,
+    },
+    { claudeListings: 1, catalogWalks: 1, asynchronousWalks: 0 },
   );
   race.done();
 });
