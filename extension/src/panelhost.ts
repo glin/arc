@@ -5134,11 +5134,13 @@ export class PanelProvider implements vscode.Disposable {
       )
       .catch(() => null);
     const value = result?.value;
-    if (value?.kind !== 'compressed-adopt') {
+    if (value?.kind === 'compressed-adopt' && value.writeBytes)
+      this.performanceCounters?.recordWork('compressedStoreWriteBytes', value.writeBytes);
+    // An adoption settles only with its entry on disk. Until then the plain path stays retained and a later walk retries.
+    if (value?.kind !== 'compressed-adopt' || !value.durable) {
       held.running = false;
       return;
     }
-    if (value.writeBytes) this.performanceCounters?.recordWork('compressedStoreWriteBytes', value.writeBytes);
     this.applyCompressedEntries([value.entry]);
     if (!value.adopted) {
       this.titles.delete(plain);
@@ -5166,6 +5168,8 @@ export class PanelProvider implements vscode.Disposable {
         const twin = `${row.file}.zst`;
         if (listed.has(twin) && !this.compressedFacts.has(twin)) this.beginCompressedAdoption(row.file, twin, row);
       }
+      for (const [plain, held] of this.adoptionsUnsettled)
+        if (!held.running) this.beginCompressedAdoption(plain, held.twin, held.row);
     }
     for (const [plain, held] of this.adoptionsUnsettled) {
       if (!walked.has(plain) && held.row) out.push(held.row);

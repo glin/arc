@@ -563,7 +563,8 @@ interface OpenSegment {
 }
 
 // One writer of a store. It queues entries, holds the lease while it works, and never loses a queued entry to a lost
-// lease: an entry leaves the queue only after its line is written and flushed.
+// lease: an entry leaves the queue only after its line is written and flushed. The holder reports each entry as durable
+// only then, so a caller keeps its source until the report.
 export class CompressedStoreHolder {
   private readonly lock: string;
   private readonly now: () => number;
@@ -578,6 +579,8 @@ export class CompressedStoreHolder {
   private readonly compactSegments: number;
 
   private readonly queue: CompressedFactEntry[] = [];
+  private readonly flushed = new WeakSet<CompressedFactEntry>();
+  private waiters: { entries: readonly CompressedFactEntry[]; settle: (durable: boolean) => void }[] = [];
   private token: string | null = null;
   private epoch: { e: number; token: string } | null = null;
   private seq = 0;
@@ -632,38 +635,60 @@ export class CompressedStoreHolder {
     return this.queue.length;
   }
 
-  // Queue entries and work them off. The returned promise settles when this run of the queue ends.
-  append(entries: readonly CompressedFactEntry[]): Promise<void> {
+  // Queue entries and work them off. The returned promise settles when this run of the queue ends, with one value per
+  // entry: true when its line is on disk. A false value leaves the entry queued, and `durable` reports its end.
+  append(entries: readonly CompressedFactEntry[]): Promise<boolean[]> {
     this.queue.push(...entries);
-    return this.work();
+    return this.work().then(() => entries.map((entry) => this.flushed.has(entry)));
   }
 
-  // Run the queue once. A failed lease leaves the queue in place and retries after the jitter delay.
+  // True when every entry reaches the disk, or false when the holder is disposed first.
+  durable(entries: readonly CompressedFactEntry[]): Promise<boolean> {
+    if (entries.every((entry) => this.flushed.has(entry))) return Promise.resolve(true);
+    if (this.disposed) return Promise.resolve(false);
+    return new Promise((settle) => this.waiters.push({ entries, settle }));
+  }
+
+  // Run the queue until it is empty. A failed lease leaves the queue in place and retries after the jitter delay.
   work(): Promise<void> {
     if (this.disposed) return Promise.resolve();
-    this.running ??= this.run().finally(() => {
-      this.running = null;
-    });
+    this.running ??= this.run().then(
+      () => {
+        this.running = null;
+        // An entry that arrives after the last test of the queue starts its own run.
+        if (this.queue.length && !this.disposed && !this.cancelRetry) void this.work();
+      },
+      (error: unknown) => {
+        this.running = null;
+        throw error;
+      },
+    );
     return this.running;
   }
 
   private async run(): Promise<void> {
-    if (!this.queue.length || this.disposed) return;
-    this.cancelIdle?.();
-    this.cancelIdle = null;
-    if (!this.token && !(await this.takeLease())) {
-      this.retryLater();
-      return;
-    }
-    while (this.queue.length && this.token) {
-      if (!this.publishBatch()) return;
-      if (this.closedSegments >= this.compactSegments) await this.compact(false);
-      await this.yieldStep();
-    }
-    if (this.token && !this.queue.length) {
+    while (this.queue.length && !this.disposed) {
+      this.cancelIdle?.();
+      this.cancelIdle = null;
+      if (!this.token && !(await this.takeLease())) {
+        this.retryLater();
+        return;
+      }
+      while (this.queue.length && this.token) {
+        if (!this.publishBatch()) return;
+        if (this.closedSegments >= this.compactSegments) await this.compact(false);
+        await this.yieldStep();
+      }
+      if (!this.token) return;
       if (this.now() - this.lastCompaction >= COMPACT_INTERVAL_MS && this.closedSegments > 0) await this.compact(false);
-      if (this.token) this.cancelIdle = this.schedule(IDLE_RELEASE_MS, () => this.releaseIfIdle());
+      if (!this.token) return;
     }
+    this.armIdleRelease();
+  }
+
+  private armIdleRelease(): void {
+    if (this.token && !this.disposed && !this.cancelIdle)
+      this.cancelIdle = this.schedule(IDLE_RELEASE_MS, () => this.releaseIfIdle());
   }
 
   // Step 2 to step 4 of the abandonment sequence, and the recovery of a takeover.
@@ -832,9 +857,19 @@ export class CompressedStoreHolder {
     segment.bytes += bytes;
     this.wrote(bytes);
     this.fault('segment:flushed');
-    this.queue.splice(0, taken);
+    for (const flushed of this.queue.splice(0, taken)) this.flushed.add(flushed);
+    this.settleWaiters();
     if (oversized || segment.bytes >= this.segmentBytes) this.closeSegment();
     return true;
+  }
+
+  private settleWaiters(): void {
+    const waiting = this.waiters;
+    this.waiters = [];
+    for (const waiter of waiting) {
+      if (waiter.entries.every((entry) => this.flushed.has(entry))) waiter.settle(true);
+      else this.waiters.push(waiter);
+    }
   }
 
   private openSegment(): OpenSegment {
@@ -999,7 +1034,11 @@ export class CompressedStoreHolder {
 
   private releaseIfIdle(): void {
     this.cancelIdle = null;
-    if (!this.token || this.queue.length || this.running) return;
+    if (!this.token) return;
+    if (this.queue.length || this.running) {
+      this.armIdleRelease();
+      return;
+    }
     this.abandonToken();
   }
 
@@ -1011,5 +1050,22 @@ export class CompressedStoreHolder {
     this.cancelRetry = null;
     this.cancelIdle = null;
     this.abandonToken();
+    const waiting = this.waiters;
+    this.waiters = [];
+    for (const waiter of waiting) waiter.settle(false);
   }
+}
+
+// Adopt a twin and record the entry. The result is durable only after the entry's line is on disk, or false when the
+// holder is disposed first, so the host keeps the plain path until the entry can no longer be lost.
+export async function recordCompressedAdoption(
+  adoption: CompressedAdoptionInput,
+  facts: CompressedStoreHolder,
+  openings: CompressedStoreHolder,
+): Promise<CompressedAdoptionResult & { durable: boolean }> {
+  const result = await adoptCompressedTwin(adoption);
+  const [written] = await facts.append([result.entry]);
+  const durable = written || (await facts.durable([result.entry]));
+  if (durable && result.adopted && result.entry.opening) await openings.append([compressedOpeningEntry(result.entry)]);
+  return { ...result, durable };
 }

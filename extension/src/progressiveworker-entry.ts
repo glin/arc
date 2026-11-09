@@ -139,13 +139,12 @@ import { TURN_QUIET_MS, statusOf } from './turncard';
 import { DispatchReceipts } from './dispatchreceipts';
 import { admittedDispatchReferences } from './turnrail';
 import {
-  adoptCompressedTwin,
   compressedEntryBatches,
   compressedEntryVersions,
-  compressedOpeningEntry,
   compressedPairKey,
   CompressedStoreHolder,
   readCompressedStore,
+  recordCompressedAdoption,
   type CompressedFactEntry,
 } from './compressedstore';
 import {
@@ -616,14 +615,16 @@ function takeCompressedWriteBytes(): number {
 async function executeCompressedAdopt(
   request: Extract<ProgressiveRequest, { kind: 'compressed-adopt' }>,
 ): Promise<ProgressiveValue> {
-  const result = await adoptCompressedTwin(request.adoption);
-  await compressedHolder(request.stores.facts).append([result.entry]);
-  if (result.adopted && result.entry.opening)
-    await compressedHolder(request.stores.openings).append([compressedOpeningEntry(result.entry)]);
+  const result = await recordCompressedAdoption(
+    request.adoption,
+    compressedHolder(request.stores.facts),
+    compressedHolder(request.stores.openings),
+  );
   return {
     kind: 'compressed-adopt',
     adopted: result.adopted,
     entry: result.entry,
+    durable: result.durable,
     writeBytes: takeCompressedWriteBytes(),
   };
 }
@@ -2871,9 +2872,16 @@ parentPort?.on(
     dispatchSpendEntries?: Array<[string, CodexDispatchSpendEntry]>;
     repeated?: { file: string; map: ClaudeRepeatedHeldMap };
     releaseBody?: string;
+    releaseStores?: boolean;
   }) => {
     if (message.dispatchSpendEntries) {
       for (const [file, entry] of message.dispatchSpendEntries) retainCodexDispatchSpend(file, entry);
+      return;
+    }
+    if (message.releaseStores) {
+      for (const holder of compressedHolders.values()) holder.dispose();
+      compressedHolders.clear();
+      parentPort?.postMessage({ storesReleased: true });
       return;
     }
     if (message.releaseBody) {

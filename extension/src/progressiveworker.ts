@@ -430,6 +430,8 @@ export type ProgressiveValue =
       kind: 'compressed-adopt';
       adopted: boolean;
       entry: import('./compressedstore').CompressedFactEntry;
+      // True when the entry's line is on disk.
+      durable: boolean;
       writeBytes: number;
     }
   | { kind: 'compressed-load'; entries: import('./compressedstore').CompressedFactEntry[]; done: boolean }
@@ -661,6 +663,8 @@ export interface WindowReadObservation {
 }
 
 const RECENT_WINDOW_READS = 4;
+// How long a stopping worker that opened a store has to release its leases before the host ends it.
+const STORE_RELEASE_MS = 250;
 
 export function workerErrorIdentity(error: unknown): { name: string; code: string | null } {
   const value = error && typeof error === 'object' ? (error as { name?: unknown; code?: unknown }) : {};
@@ -693,6 +697,8 @@ export class ProgressiveWorker {
   private workerMemory: WorkerMemory | null = null;
   private workerMemoryAt = 0;
   private workerThreadId: number | null = null;
+  // True when the running worker took a request that opens a store, so a stop gives it time to release the lease.
+  private workerOpenedStores = false;
   // The thread of the running worker, or null when no worker runs.
   get currentThreadId(): number | null {
     return this.worker ? this.workerThreadId : null;
@@ -913,6 +919,7 @@ export class ProgressiveWorker {
       }
       this.worker = worker;
       this.workerThreadId = worker.threadId;
+      this.workerOpenedStores = false;
       this.workerMemory = null;
       this.workerMemoryThreadId = null;
       this.workerMemoryRequestId = null;
@@ -1055,6 +1062,12 @@ export class ProgressiveWorker {
       });
     }
     this.dispatchSeedThread = this.worker?.threadId ?? null;
+    if (
+      request.kind === 'compressed-adopt' ||
+      request.kind === 'compressed-load' ||
+      (request.kind === 'claude-children' && request.compressed)
+    )
+      this.workerOpenedStores = true;
     const id = ++this.nextId;
     return new Promise((resolve, reject) => {
       const abort = () => {
@@ -1125,6 +1138,33 @@ export class ProgressiveWorker {
     });
   }
 
+  // A worker that opened a store releases its leases first, so a later window takes them at once. A worker that does not
+  // answer in time leaves a lock for the 30 s takeover.
+  private endWorker(worker: Worker): void {
+    if (!this.workerOpenedStores) {
+      void worker.terminate();
+      return;
+    }
+    this.workerOpenedStores = false;
+    let ended = false;
+    const end = () => {
+      if (ended) return;
+      ended = true;
+      clearTimeout(timer);
+      void worker.terminate();
+    };
+    const timer = setTimeout(end, STORE_RELEASE_MS);
+    timer.unref?.();
+    worker.on('message', (message: { storesReleased?: boolean }) => {
+      if (message?.storesReleased) end();
+    });
+    try {
+      worker.postMessage({ releaseStores: true });
+    } catch {
+      end();
+    }
+  }
+
   stop(): void {
     this.state = 'cancelled';
     this.discoveryReplyAt = undefined;
@@ -1132,7 +1172,7 @@ export class ProgressiveWorker {
     this.discoveryWaiter = undefined;
     const worker = this.worker;
     this.worker = null;
-    void worker?.terminate();
+    if (worker) this.endWorker(worker);
     for (const [id, held] of this.pending) {
       this.settleWindow(id, held, 'stopped');
       held.dispose();

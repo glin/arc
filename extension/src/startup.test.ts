@@ -9997,7 +9997,7 @@ function adoptionHarness(extraScope: Record<string, unknown> = {}) {
       isHiddenThread,
       ...extraScope,
     },
-    ['runPendingWatch', 'unknownPathShapeOf'],
+    ['runPendingWatch', 'unknownPathShapeOf', 'loadCompressedFacts'],
   );
   const { provider } = harness;
   provider.performanceCounters = new PanelPerformanceCounters();
@@ -10025,7 +10025,13 @@ function adoptionHarness(extraScope: Record<string, unknown> = {}) {
         return {
           generation: 0,
           revision: null,
-          value: { kind: 'compressed-adopt', adopted: ok, entry, writeBytes: 0 },
+          value: {
+            kind: 'compressed-adopt',
+            adopted: ok,
+            entry,
+            durable: provider.adoptionDurable !== false,
+            writeBytes: 0,
+          },
         };
       }
       if (request.kind === 'compressed-load')
@@ -10158,6 +10164,31 @@ test.skipIf(!rolloutCompression.zstdCompressSync)(
     await vi.waitFor(() => assert.equal(provider.adoptionsUnsettled.size, 0));
     assert.deepEqual(adopted(), [], 'the host adopted a twin whose plain rollout exists');
     assert.equal(provider.titles.get(plain)?.label, 'Keep me');
+  },
+);
+
+test.skipIf(!rolloutCompression.zstdCompressSync)(
+  'an adoption stopped before its entry is on disk keeps the plain path, and the restart settles it',
+  async () => {
+    const { provider, plain, twin, writeTwin, wake, adopted } = await adoptedPair();
+    writeTwin();
+    fs.unlinkSync(plain);
+    // A worker stop answers the request with no entry on disk.
+    provider.adoptionDurable = false;
+    wake([[plain, 'rename']]);
+    await vi.waitFor(() => {
+      assert.deepEqual(adopted(), [twin], 'the adoption did not run');
+      assert.equal(provider.adoptionsUnsettled.get(plain)?.running, false);
+    });
+    assert.equal(provider.titles.get(plain)?.label, 'Keep me', 'a stopped adoption discarded the plain title');
+    assert.equal(provider.compressedFacts.has(twin), false, 'an entry that never reached the disk was applied');
+    // The restart keeps the path through the checkpoint and retries after the load.
+    provider.adoptionDurable = true;
+    await provider.loadCompressedFacts(provider.compressedStorePaths());
+    await vi.waitFor(() =>
+      assert.equal(provider.adoptionsUnsettled.size, 0, 'the restart did not settle the adoption'),
+    );
+    assert.equal(provider.compressedFacts.get(twin)?.adopted, true);
   },
 );
 

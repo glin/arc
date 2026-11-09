@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as zlib from 'node:zlib';
-import { test } from 'vitest';
+import { test, vi } from 'vitest';
 import { takeCodexOpeningsLock } from './codexopenings.ts';
 import {
   adoptCompressedTwin,
@@ -14,6 +14,7 @@ import {
   CompressedStoreHolder,
   COMPRESSED_FACTS_VERSION,
   readCompressedStore,
+  recordCompressedAdoption,
   STORE_LOCK,
   withKeptUndercount,
   type CompressedFactEntry,
@@ -193,6 +194,65 @@ test('a loser of the lock repeats the jitter wait until the lock is free', async
   await holder.work();
   assert.equal(holder.pending, 0);
   assert.equal(threadCount(directory), 1);
+  holder.dispose();
+});
+
+test('an append reports an entry as durable only when its line is on disk', async () => {
+  const { directory, clock, make } = storeFixture('store-durable');
+  const lock = path.join(directory, STORE_LOCK);
+  fs.writeFileSync(lock, 'live-holder');
+  const holder = make();
+  const queued = entry('a.jsonl.zst');
+  assert.deepEqual(await holder.append([queued]), [false], 'an entry behind a live lock read as durable');
+  let durable: boolean | null = null;
+  void holder.durable([queued]).then((value) => (durable = value));
+  await vi.waitFor(() => assert.equal(holder.pending, 1));
+  assert.equal(durable, null, 'the durable report settled before the write');
+  assert.equal(threadCount(directory), 0);
+  fs.rmSync(lock);
+  clock.advance(5_000);
+  await holder.work();
+  await vi.waitFor(() => assert.equal(durable, true));
+  assert.equal(threadCount(directory), 1);
+  assert.deepEqual(await holder.append([entry('b.jsonl.zst')]), [true]);
+  holder.dispose();
+});
+
+test('a disposed holder reports a queued entry as not durable', async () => {
+  const { directory, make } = storeFixture('store-disposed');
+  fs.writeFileSync(path.join(directory, STORE_LOCK), 'live-holder');
+  const holder = make();
+  const queued = entry('a.jsonl.zst');
+  await holder.append([queued]);
+  const report = holder.durable([queued]);
+  holder.dispose();
+  assert.equal(await report, false);
+  assert.equal(await holder.durable([queued]), false);
+});
+
+test('an append during the trailing compaction is written and the idle release is armed again', async () => {
+  let late: CompressedStoreHolder | null = null;
+  let arrived = false;
+  const { directory, clock, make } = storeFixture('store-trailing-compaction', {
+    segmentBytes: 64,
+    compactSegments: 99,
+    fault: (at) => {
+      if (at === 'compact:start' && late && !arrived) {
+        arrived = true;
+        void late.append([entry('late.jsonl.zst')]);
+      }
+    },
+  });
+  const holder = make();
+  late = holder;
+  await holder.append([entry('a.jsonl.zst')]);
+  clock.advance(300_001);
+  await holder.append([entry('b.jsonl.zst')]);
+  assert.equal(arrived, true, 'the trailing compaction did not run');
+  await vi.waitFor(() => assert.equal(holder.pending, 0, 'an append during the compaction stayed queued'));
+  assert.equal(threadCount(directory), 3);
+  clock.advance(20_000);
+  assert.equal(fs.existsSync(path.join(directory, STORE_LOCK)), false, 'the idle release did not fire');
   holder.dispose();
 });
 
@@ -576,6 +636,51 @@ for (const [name, firstLine, plainThread, mtimeShift, spendRecord] of [
     assert.equal(taken.spend, undefined);
   });
 }
+
+test.skipIf(!encode)('an adoption behind a live lock answers only after its entry is on disk', async () => {
+  const { plain, twin, mtimeMs } = twinFixture('adopt-durable', opening(THREAD));
+  const { directory, clock, make } = storeFixture('adopt-durable-store');
+  const openings = storeFixture('adopt-durable-openings').make();
+  const lock = path.join(directory, STORE_LOCK);
+  fs.writeFileSync(lock, 'live-holder');
+  const holder = make();
+  let answered = false;
+  const answer = recordCompressedAdoption(
+    { twin, plain, plainMtimeMs: mtimeMs, opening: meta(THREAD), spend: completeSpend },
+    holder,
+    openings,
+  ).then((result) => {
+    answered = true;
+    return result;
+  });
+  await vi.waitFor(() => assert.equal(holder.pending, 1));
+  assert.equal(answered, false, 'the adoption answered before its entry reached the disk');
+  fs.rmSync(lock);
+  clock.advance(5_000);
+  const result = await answer;
+  assert.equal(result.durable, true);
+  assert.equal(readCompressedStore(directory).entries.get(twin)?.adopted, true);
+  holder.dispose();
+  openings.dispose();
+});
+
+test.skipIf(!encode)('an adoption whose holder stops answers not durable', async () => {
+  const { plain, twin, mtimeMs } = twinFixture('adopt-stop', opening(THREAD));
+  const { directory, make } = storeFixture('adopt-stop-store');
+  const openings = storeFixture('adopt-stop-openings').make();
+  fs.writeFileSync(path.join(directory, STORE_LOCK), 'live-holder');
+  const holder = make();
+  const answer = recordCompressedAdoption(
+    { twin, plain, plainMtimeMs: mtimeMs, opening: meta(THREAD), spend: completeSpend },
+    holder,
+    openings,
+  );
+  await vi.waitFor(() => assert.equal(holder.pending, 1));
+  holder.dispose();
+  assert.equal((await answer).durable, false);
+  assert.equal(threadCount(directory), 0);
+  openings.dispose();
+});
 
 test.skipIf(!encode)('a twin that does not decode keeps no plain fact', async () => {
   const { plain, twin, mtimeMs } = twinFixture('adopt-corrupt', opening(THREAD));

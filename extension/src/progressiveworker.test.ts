@@ -15148,6 +15148,53 @@ test('worker requests outside the opening path refuse a compressed rollout', asy
 
 const compressedSpend = { file: 'x', complete: true, buckets: [], lifetimeBuckets: [] } as never;
 
+test.skipIf(!zstdCompress)('a worker stop during an adoption releases its lease and the restart adopts', async () => {
+  const root = tempDir('worker-compressed-stop-');
+  const id = '01a032c9-1a92-7931-845c-723117d24dbe';
+  const plain = path.join(root, `rollout-2026-08-25T12-00-00-${id}.jsonl`);
+  const twin = `${plain}.zst`;
+  const first = `${JSON.stringify({ type: 'session_meta', timestamp: '2026-08-25T12:00:00Z', payload: { id, cwd: root } })}\n`;
+  fs.writeFileSync(twin, zstdCompress!(Buffer.from(first)));
+  const mtime = new Date(1_700_000_000_000);
+  fs.utimesSync(twin, mtime, mtime);
+  const stores = { facts: path.join(root, 'facts'), openings: path.join(root, 'openings') };
+  const lock = path.join(stores.facts, 'backfill.lock');
+  fs.mkdirSync(stores.facts, { recursive: true });
+  fs.writeFileSync(lock, 'live-holder');
+  const prefix = `process.env.ARC_HOME=${JSON.stringify(root)};`;
+  const signal = new AbortController().signal;
+  const adopt = {
+    kind: 'compressed-adopt' as const,
+    adoption: {
+      twin,
+      plain,
+      plainMtimeMs: mtime.getTime(),
+      opening: { sessionId: id, cwd: root } as never,
+      spend: compressedSpend,
+    },
+    stores,
+  };
+  const blocked = new ProgressiveWorker(prefix + source);
+  const waiting = blocked.run(adopt, 1, signal);
+  blocked.stop();
+  assert.equal(await waiting, null, 'a stopped worker answered the adoption');
+  assert.equal(readCompressedStore(stores.facts).entries.size, 0);
+  fs.rmSync(lock);
+  const restarted = new ProgressiveWorker(prefix + source);
+  const answered = await restarted.run(adopt, 2, signal);
+  assert.ok(
+    answered?.value.kind === 'compressed-adopt' && answered.value.durable,
+    'the restart did not reach the disk',
+  );
+  assert.equal(readCompressedStore(stores.facts).entries.get(twin)?.adopted, true);
+  assert.equal(fs.existsSync(lock), true, 'the idle holder left no lease to release');
+  restarted.stop();
+  await vi.waitFor(() => assert.equal(fs.existsSync(lock), false, 'the worker stop left the lock'), {
+    timeout: 5_000,
+    interval: 5,
+  });
+});
+
 test.skipIf(!zstdCompress)(
   'the worker adopts a twin, loads it from the store and records the names of a compressed list',
   async () => {
