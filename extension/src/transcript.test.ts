@@ -4,10 +4,14 @@ import { test, vi } from 'vitest';
 import { agentRunAnswer } from './turnrail';
 import {
   enumerateClaudeChildSources,
+  enumerateClaudeChildSourceSteps,
   enumerateSessionFiles,
   enumerateSessionFilesFor,
+  enumerateSessionFilesForSteps,
   revisionOf,
   scanSessionCwd,
+  walkInSlices,
+  WALK_SLICE_MS,
   type ListingTimer,
 } from './transcript';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
@@ -17974,6 +17978,133 @@ test('a later child or submission cannot release a reused unresolved background 
     });
     assert.equal(work.pending, true, 'an older completion released the ambiguous later launch');
   }
+});
+
+// A clock that moves only inside the injected filesystem calls, with a record of each directory read and each pause.
+function slicedWalkClock(callMs: number) {
+  let clock = 0;
+  let sliceStart = 0;
+  const slices: number[] = [];
+  const events: string[] = [];
+  const time: ListingTimer = (part, run) => {
+    clock += callMs;
+    if (part === 'listing') events.push('read');
+    return run();
+  };
+  const pacing = {
+    now: () => clock,
+    pause: async () => {
+      events.push('pause');
+      slices.push(clock - sliceStart);
+      sliceStart = clock;
+    },
+  };
+  return { time, pacing, slices, events, finish: () => slices.push(clock - sliceStart) };
+}
+
+function assertYieldsBetweenDirectories(clock: ReturnType<typeof slicedWalkClock>, callMs: number): void {
+  clock.finish();
+  assert.ok(
+    clock.slices.every((slice) => slice <= WALK_SLICE_MS + callMs),
+    `a slice ran past the limit: ${clock.slices.join(', ')}`,
+  );
+  const reads = clock.events.filter((event) => event === 'read').length;
+  const between = clock.events
+    .join(' ')
+    .split('read')
+    .slice(1, reads)
+    .filter((gap) => gap.includes('pause')).length;
+  assert.equal(between, reads - 1, `a directory read followed another without a pause: ${clock.events.join(' ')}`);
+}
+
+test('a sliced Claude listing yields within each slice of injected time and lists what the synchronous walk lists', async () => {
+  const root = tempDir('claude-sliced-listing-');
+  const cwd = 'C:/work/sliced';
+  for (const suffix of ['', '-topic', '-other']) {
+    const directory = path.join(root, `${projectSlug(cwd)}${suffix}`);
+    fs.mkdirSync(directory);
+    for (const name of ['a', 'b']) fs.writeFileSync(path.join(directory, `${suffix}${name}.jsonl`), '{}\n');
+  }
+  const callMs = WALK_SLICE_MS + 1;
+  const clock = slicedWalkClock(callMs);
+  const sliced = await walkInSlices(
+    enumerateSessionFilesForSteps(root, [cwd], () => clock.time('openings:parents', () => cwd), [cwd], clock.time),
+    undefined,
+    clock.pacing,
+  );
+  assertYieldsBetweenDirectories(clock, callMs);
+  assert.deepEqual(
+    sliced,
+    enumerateSessionFilesFor(root, [cwd], () => cwd),
+  );
+});
+
+test('a sliced child census yields within each slice of injected time and finds what the synchronous census finds', async () => {
+  const root = tempDir('claude-sliced-census-');
+  const parents = ['one', 'two', 'three'].map((sessionId) => {
+    const directory = path.join(root, sessionId, 'subagents');
+    fs.mkdirSync(directory, { recursive: true });
+    for (const name of ['a', 'b']) {
+      fs.writeFileSync(path.join(directory, `agent-${sessionId}${name}.jsonl`), '{"cwd":"C:/work/sliced"}\n');
+    }
+    return { agent: 'claude' as const, file: path.join(root, `${sessionId}.jsonl`), sessionId, size: 1, mtimeMs: 1 };
+  });
+  const callMs = WALK_SLICE_MS + 1;
+  const clock = slicedWalkClock(callMs);
+  const sliced = await walkInSlices(enumerateClaudeChildSourceSteps(parents, clock.time), undefined, clock.pacing);
+  assertYieldsBetweenDirectories(clock, callMs);
+  assert.deepEqual(sliced, enumerateClaudeChildSources(parents));
+});
+
+test('a canceled sliced walk answers no result', async () => {
+  const root = tempDir('claude-sliced-cancel-');
+  const cwd = 'C:/work/sliced';
+  const directory = path.join(root, projectSlug(cwd));
+  fs.mkdirSync(directory);
+  fs.writeFileSync(path.join(directory, 'a.jsonl'), '{}\n');
+  const canceled = new AbortController();
+  canceled.abort();
+  assert.equal(
+    await walkInSlices(
+      enumerateSessionFilesForSteps(root, [cwd], () => cwd),
+      canceled.signal,
+    ),
+    null,
+  );
+});
+
+test('a file moved between two listed folders during a listing lists under one path, and two present files both list', () => {
+  const root = tempDir('claude-moved-listing-');
+  const cwd = 'C:/work/moved';
+  for (const suffix of ['-one', '-two']) fs.mkdirSync(path.join(root, `${projectSlug(cwd)}${suffix}`));
+  const [readFirst, readSecond] = fs.readdirSync(root).map((name) => path.join(root, name));
+  const from = path.join(readFirst, 'moved.jsonl');
+  const to = path.join(readSecond, 'moved.jsonl');
+  fs.writeFileSync(from, '{}\n');
+  let moved = false;
+  const listing = enumerateSessionFilesFor(root, [cwd], (file) => {
+    if (file === from && !moved) {
+      moved = true;
+      fs.renameSync(from, to);
+    }
+    return cwd;
+  });
+  assert.deepEqual(
+    listing.sessions.map((session) => session.file),
+    [to],
+    'the moved file did not list once under its new path',
+  );
+  assert.deepEqual(listing.files, [to], 'the old path stayed in the listed files');
+  assert.equal(listing.status, 'complete');
+
+  fs.writeFileSync(from, '{}\n');
+  assert.deepEqual(
+    enumerateSessionFilesFor(root, [cwd], () => cwd)
+      .sessions.map((session) => session.file)
+      .sort(),
+    [from, to].sort(),
+    'a real same-ID pair stopped reaching the collision quarantine',
+  );
 });
 
 test('Claude enumeration retains unread subtree uncertainty and distinguishes missing roots from I/O failure', () => {

@@ -4004,6 +4004,88 @@ export type ListingPart = 'listing' | 'stats' | `openings:${OpeningSource}`;
 export type ListingTimer = <T>(part: ListingPart, run: () => T) => T;
 const untimed: ListingTimer = (_part, run) => run();
 
+// How long a sliced walk works before it lets the host handle other work.
+export const WALK_SLICE_MS = 4;
+
+// A listing written as steps. Each `yield` marks a point between two filesystem calls where the walk can stop for a turn
+// of the event loop. `finishWalk` runs the steps without a stop, and `walkInSlices` stops once a slice has passed.
+export type WalkSteps<T> = Generator<void, T, void>;
+
+export function finishWalk<T>(steps: WalkSteps<T>): T {
+  for (;;) {
+    const step = steps.next();
+    if (step.done) return step.value;
+  }
+}
+
+export interface WalkPacing {
+  now?: () => number;
+  pause?: () => Promise<void>;
+  // Receives the length of each pause, so a caller can count the time that the walk gave to other work.
+  paused?: (ms: number) => void;
+}
+
+// Runs the steps and yields to the event loop once a slice of `WALK_SLICE_MS` has passed. One synchronous filesystem call
+// cannot be interrupted. A canceled walk answers null, which callers must treat as no result.
+export async function walkInSlices<T>(
+  steps: WalkSteps<T>,
+  signal?: AbortSignal,
+  {
+    now = () => performance.now(),
+    pause = () => new Promise<void>((resolve) => setImmediate(resolve)),
+    paused,
+  }: WalkPacing = {},
+): Promise<T | null> {
+  let slice = now();
+  for (;;) {
+    const step = steps.next();
+    if (step.done) return step.value;
+    if (signal?.aborted) return null;
+    if (now() - slice < WALK_SLICE_MS) continue;
+    const pausedAt = now();
+    await pause();
+    slice = now();
+    paused?.(slice - pausedAt);
+    if (signal?.aborted) return null;
+  }
+}
+
+// A walk reads its directories at different times, so a file that moves from one listed directory to another can appear
+// in both. A repeated session ID keeps a row only while its file exists at the end of the listing. Two files that both
+// exist stay listed, and the collision quarantine answers them.
+function dropMovedRows(
+  listing: SourceEnumeration & { sessions: SessionFile[] },
+  time: ListingTimer,
+): SourceEnumeration & { sessions: SessionFile[] } {
+  const firstOfId = new Map<string, SessionFile>();
+  const repeated = new Set<SessionFile>();
+  for (const row of listing.sessions) {
+    const first = firstOfId.get(row.sessionId);
+    if (first) {
+      repeated.add(first);
+      repeated.add(row);
+    } else {
+      firstOfId.set(row.sessionId, row);
+    }
+  }
+  const moved = new Set<string>();
+  for (const row of repeated) {
+    try {
+      time('stats', () => fs.statSync(row.file));
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT' || code === 'ENOTDIR') moved.add(row.file);
+    }
+  }
+  if (!moved.size) return listing;
+  return {
+    ...listing,
+    files: listing.files.filter((file) => !moved.has(file)),
+    uncertain: listing.uncertain.filter((file) => !moved.has(file)),
+    sessions: listing.sessions.filter((row) => !moved.has(row.file)),
+  };
+}
+
 export function enumerateSessionFilesFor(
   root: string,
   folders: string[],
@@ -4011,6 +4093,16 @@ export function enumerateSessionFilesFor(
   missingCwdFolders: string[] = folders,
   time: ListingTimer = untimed,
 ): SourceEnumeration & { sessions: SessionFile[] } {
+  return finishWalk(enumerateSessionFilesForSteps(root, folders, cwdOf, missingCwdFolders, time));
+}
+
+export function* enumerateSessionFilesForSteps(
+  root: string,
+  folders: string[],
+  cwdOf: (file: string, session: SessionFile) => string | null = (file) => readSessionCwd(file),
+  missingCwdFolders: string[] = folders,
+  time: ListingTimer = untimed,
+): WalkSteps<SourceEnumeration & { sessions: SessionFile[] }> {
   const evidence: SourceEnumeration & { sessions: SessionFile[] } = {
     status: 'complete',
     root,
@@ -4036,12 +4128,14 @@ export function enumerateSessionFilesFor(
     if (!slugs.some((slug) => projectDirectoryMatches(name, slug))) {
       continue;
     }
-    const listing = enumerateSessionFiles(path.join(root, d), time);
+    yield;
+    const listing = yield* enumerateSessionFileSteps(path.join(root, d), time);
     (evidence.files as string[]).push(...listing.files);
     (evidence.directories as string[]).push(...(listing.directories ?? []));
     (evidence.uncertain as string[]).push(...listing.uncertain);
     if (listing.status !== 'complete') evidence.status = 'incomplete';
     for (const f of listing.sessions) {
+      yield;
       const cwd = cwdOf(f.file, f);
       // Recorded cwd decides membership. Without it, require an exact allowed fallback slug.
       if (cwd ? inFolders(cwd) : missingCwdSlugs.includes(name)) {
@@ -4049,7 +4143,7 @@ export function enumerateSessionFilesFor(
       }
     }
   }
-  return { ...evidence, sessions: out.sort((a, b) => b.mtimeMs - a.mtimeMs) };
+  return dropMovedRows({ ...evidence, sessions: out.sort((a, b) => b.mtimeMs - a.mtimeMs) }, time);
 }
 
 // Session transcripts in a project directory, newest first.
@@ -4061,6 +4155,13 @@ export function enumerateSessionFiles(
   dir: string,
   time: ListingTimer = untimed,
 ): SourceEnumeration & { sessions: SessionFile[] } {
+  return finishWalk(enumerateSessionFileSteps(dir, time));
+}
+
+function* enumerateSessionFileSteps(
+  dir: string,
+  time: ListingTimer = untimed,
+): WalkSteps<SourceEnumeration & { sessions: SessionFile[] }> {
   const evidence: SourceEnumeration & { sessions: SessionFile[] } = {
     status: 'complete',
     root: dir,
@@ -4082,6 +4183,7 @@ export function enumerateSessionFiles(
     if (!name.endsWith('.jsonl')) {
       continue;
     }
+    yield;
     const file = path.join(dir, name);
     try {
       const stat = time('stats', () => fs.statSync(file, { bigint: true }));
@@ -4140,6 +4242,15 @@ export function enumerateClaudeChildSources(
   countRead?: () => void,
   lastRows: readonly SessionFile[] = [],
 ): SourceEnumeration & { sessions: SessionFile[] } {
+  return finishWalk(enumerateClaudeChildSourceSteps(parents, time, countRead, lastRows));
+}
+
+export function* enumerateClaudeChildSourceSteps(
+  parents: readonly SessionFile[],
+  time: ListingTimer = untimed,
+  countRead?: () => void,
+  lastRows: readonly SessionFile[] = [],
+): WalkSteps<SourceEnumeration & { sessions: SessionFile[] }> {
   const lastRowOf = new Map(lastRows.map((row) => [row.file, row]));
   const census: SourceEnumeration & { sessions: SessionFile[] } = {
     status: 'complete',
@@ -4158,7 +4269,8 @@ export function enumerateClaudeChildSources(
       ),
   );
   for (const directory of directories) {
-    const listing = enumerateSessionFiles(directory, time);
+    yield;
+    const listing = yield* enumerateSessionFileSteps(directory, time);
     (census.directories as string[]).push(directory);
     (census.files as string[]).push(...listing.files);
     (census.uncertain as string[]).push(...listing.uncertain);
@@ -4178,6 +4290,7 @@ export function enumerateClaudeChildSources(
     }
     for (const source of listing.sessions) {
       if (!source.sessionId.startsWith('agent-')) continue;
+      yield;
       const kept = lastCensusOpening(lastRowOf.get(source.file), source);
       const opening = kept ?? time('openings:children', () => readQualifiedSessionCwd(source.file, countRead));
       if (
@@ -4206,7 +4319,7 @@ export function enumerateClaudeChildSources(
       });
     }
   }
-  return census;
+  return dropMovedRows(census, time);
 }
 
 // Reads the parent-owned identity edge without retaining the parent's turns. The result is

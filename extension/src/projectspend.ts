@@ -54,7 +54,7 @@ import type {
   UsageTools,
   UsageWaits,
 } from './transcript';
-import { normalizeFsPath } from './transcript';
+import { finishWalk, normalizeFsPath, type WalkSteps } from './transcript';
 import { ExportLimitError } from './exportlimits';
 import { addUsage as addPricedUsage, addUsageTools, addUsageWaits } from './agentspend';
 
@@ -3272,6 +3272,14 @@ export function discoverClaudeSessionSpendSources(
   directories: SubagentDirectoryReader = uncachedSubagentDirectories,
   ancestors: readonly SpendSessionFile[] = [],
 ): SessionSpendSource[] {
+  return finishWalk(claudeSessionSpendSourceSteps(parents, directories, ancestors));
+}
+
+export function* claudeSessionSpendSourceSteps(
+  parents: readonly SpendSessionFile[],
+  directories: SubagentDirectoryReader = uncachedSubagentDirectories,
+  ancestors: readonly SpendSessionFile[] = [],
+): WalkSteps<SessionSpendSource[]> {
   const sources: SessionSpendSource[] = [];
   const seen = new Set<string>();
   const add = (source: SessionSpendSource) => {
@@ -3289,6 +3297,7 @@ export function discoverClaudeSessionSpendSources(
   );
   const parentFiles = new Map([...ancestors, ...parents].map((parent) => [parent.sessionId, parent.file]));
   for (const parent of parents) {
+    yield;
     const nativeParentFile = parent.parentSessionId ? parentFiles.get(parent.parentSessionId) : undefined;
     add({
       sessionId: parent.sessionId,

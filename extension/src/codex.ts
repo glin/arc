@@ -88,6 +88,7 @@ import {
   claudeLaunchKind,
   shellDispatchFromOutput,
   type ClaudeDispatchSessionReference,
+  WALK_SLICE_MS,
 } from './transcript';
 import {
   addSubagentResult,
@@ -986,9 +987,6 @@ export function watchInitialCodexName(session: string, cwd: string, wake: () => 
     },
   };
 }
-
-// How long the asynchronous walk works before it lets the host handle other work.
-const WALK_SLICE_MS = 4;
 
 // Walks the same policy, and yields to the event loop once a slice of `WALK_SLICE_MS` has passed.
 // It checks the time before each directory read and before each entry, so selection and other

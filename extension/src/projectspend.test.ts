@@ -28,6 +28,7 @@ import {
   aggregateUsageEvents,
   cacheExpiryExtraCost,
   discoverClaudeSessionSpendSources,
+  claudeSessionSpendSourceSteps,
   discoverClaudeSpendSources,
   discoverCodexSessionSpendSources,
   discoverCodexSpendSources,
@@ -169,6 +170,20 @@ const reducer: UsageReducerFactory<ClaudeUsageReducerState> = (state) => {
     }),
   };
 };
+
+test('the spend-source census stops between parents and answers what the synchronous census answers', () => {
+  const parents = ['a', 'b', 'c'].map((sessionId) => ({ sessionId, file: `${sessionId}.jsonl` }));
+  const reader = { files: () => [] };
+  const steps = claudeSessionSpendSourceSteps(parents, reader);
+  let stops = 0;
+  let step = steps.next();
+  while (!step.done) {
+    stops += 1;
+    step = steps.next();
+  }
+  assert.equal(stops, parents.length, 'the census ran more than one parent without a stop');
+  assert.deepEqual(step.value, discoverClaudeSessionSpendSources(parents, reader));
+});
 
 test('a cold archived source gains terminal usage after a missed watcher append', async () => {
   vi.useFakeTimers();
