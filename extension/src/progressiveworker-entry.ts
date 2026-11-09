@@ -676,7 +676,13 @@ function noteCompressedNames(list: readonly string[], stores: import('./compress
       ...compressedEntryVersions(),
       nameOnly: true,
     }));
-  if (records.length) void compressedHolder(stores.facts).append(records);
+  if (!records.length) return;
+  void compressedHolder(stores.facts)
+    .append(records)
+    .then(() => {
+      const bytes = takeCompressedWriteBytes();
+      if (bytes) parentPort?.postMessage({ compressedStoreWrite: bytes });
+    });
 }
 
 async function execute(

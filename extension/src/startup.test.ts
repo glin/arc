@@ -1671,9 +1671,10 @@ test('a soak dispatch reads as a dispatched Codex child of a workspace parent', 
   assert.equal(simulation.appends, 1);
 });
 
-test('the panel records each worker decoder under the counter of the startup gate', () => {
+test('the panel records each worker decoder and store write under the counters of the startup gate', () => {
   const source = fs.readFileSync(path.join(__dirname, 'panelhost.ts'), 'utf8');
   assert.match(source, /\(\) => this\.performanceCounters\?\.recordWork\('compressedDecodes'\)/);
+  assert.match(source, /\(bytes\) => this\.performanceCounters\?\.recordWork\('compressedStoreWriteBytes', bytes\)/);
 });
 
 test('the named counters hold every counter that the measure table lists', () => {
@@ -10379,6 +10380,61 @@ test('discovery sends the compressed list only when the set changed since the la
   );
   provider.derivedCacheFile = undefined;
   assert.deepEqual(provider.compressedRolloutsToSend(), {}, 'a panel with no store sent a list');
+});
+
+test('a load that a worker stop cut off runs again and holds Project cost busy until it ends', async () => {
+  const { provider } = heldWalkHarness(
+    { withKeptUndercount, COMPRESSED_FACTS_STORE, COMPRESSED_OPENINGS_STORE, arcHome },
+    [
+      'maybeStartCompressedLoad',
+      'loadCompressedFacts',
+      'applyCompressedEntries',
+      'compressedFactsChanged',
+      'projectSpendBusy',
+      'invalidateProjectSpendSnapshot',
+    ],
+  );
+  const replies: unknown[] = [
+    null,
+    {
+      value: {
+        kind: 'compressed-load',
+        entries: [{ file: 'a.jsonl.zst', pairKey: 'a.jsonl', factsVersion: 1 }],
+        done: true,
+      },
+    },
+  ];
+  const requests: { kind: string }[] = [];
+  provider.progressiveWorker = {
+    run: async (request: { kind: string }) => {
+      requests.push(request);
+      return replies.shift();
+    },
+  };
+  provider.performanceCounters = { recordWork() {} };
+  provider.derivedCacheFile = path.join('cache', 'derived.json');
+  provider.refreshFrom = () => {};
+  provider.postProjectSpend = () => {};
+  Object.assign(provider, {
+    compressedFacts: new Map(),
+    compressedFactsRevision: 0,
+    adoptionsUnsettled: new Map(),
+    projectSpendHydrated: true,
+    projectSpendIndexing: false,
+    projectSpendOffers: new Set(),
+    projectSpendRevision: 0,
+    compressedLoadPending: true,
+    compressedLoadStarted: false,
+    compressedRenderSeen: true,
+    codexPriming: null,
+  });
+  provider.maybeStartCompressedLoad();
+  await vi.waitFor(() => assert.equal(provider.compressedLoadStarted, false, 'the cut-off load kept its started flag'));
+  assert.equal(provider.compressedLoadPending, true, 'a cut-off load ended the busy state');
+  provider.maybeStartCompressedLoad();
+  await vi.waitFor(() => assert.equal(provider.compressedLoadPending, false));
+  assert.equal(requests.length, 2, 'the cut-off load did not run again');
+  assert.equal(provider.compressedFacts.has('a.jsonl.zst'), true);
 });
 
 test('a superseded discovery request sends the compressed list again with the next request', async () => {

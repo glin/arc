@@ -15255,7 +15255,16 @@ test.skipIf(!zstdCompress)(
     const mtime = new Date(1_700_000_000_000);
     fs.utimesSync(twin, mtime, mtime);
     const stores = { facts: path.join(root, 'facts'), openings: path.join(root, 'openings') };
-    const worker = new ProgressiveWorker(`process.env.ARC_HOME=${JSON.stringify(root)};` + source);
+    let nameBytes = 0;
+    const worker = new ProgressiveWorker(
+      `process.env.ARC_HOME=${JSON.stringify(root)};` + source,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      (bytes) => (nameBytes += bytes),
+    );
     const signal = new AbortController().signal;
     try {
       const adopted = await worker.run(
@@ -15301,6 +15310,7 @@ test.skipIf(!zstdCompress)(
         const read = readCompressedStore(stores.facts).entries;
         assert.equal(read.get(other)?.nameOnly, true, 'the worker did not record a name without an entry');
         assert.equal(read.get(twin)?.nameOnly, undefined, 'a name with an entry was overwritten');
+        assert.ok(nameBytes > 0, 'the name-only write was not counted');
       });
     } finally {
       worker.stop();

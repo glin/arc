@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
+import defaultFs from 'node:fs';
 import * as path from 'node:path';
 import * as zlib from 'node:zlib';
 import { test, vi } from 'vitest';
@@ -127,7 +128,7 @@ test('the merge ranks the current fact version, then an equal stat, then the lat
       token: 'a',
       input: 'i',
       offset: 0,
-      order: 0,
+      seq: 0,
       ...overrides,
     }) as Parameters<typeof compareRankedEntries>[0];
   const old = ranked({ entry: { file: 'x', pairKey: 'x', factsVersion: 0, size: 10, mtimeMs: 5 } });
@@ -142,16 +143,17 @@ test('the merge ranks the current fact version, then an equal stat, then the lat
     entry: { file: 'x', pairKey: 'x', factsVersion: COMPRESSED_FACTS_VERSION, size: 9, mtimeMs: 6 },
   });
   assert.ok(compareRankedEntries(equal, newer, stat) > 0, 'an equal stat lost to a greater mtime');
-  assert.ok(compareRankedEntries(ranked({ order: 2 }), ranked({ order: 1 }), stat) > 0, 'the later line lost');
+  assert.ok(compareRankedEntries(ranked({ seq: 2 }), ranked({ seq: 1 }), stat) > 0, 'the later file lost');
+  assert.ok(compareRankedEntries(ranked({ offset: 9 }), ranked({ offset: 2 }), stat) > 0, 'the later line lost');
   assert.ok(compareRankedEntries(ranked({ token: 'b' }), ranked({ token: 'a' }), stat) > 0, 'the greater token lost');
   assert.ok(
-    compareRankedEntries(ranked({ epoch: 3, order: 0 }), ranked({ epoch: 2, order: 9 }), stat) > 0,
+    compareRankedEntries(ranked({ epoch: 3, seq: 0 }), ranked({ epoch: 2, seq: 9 }), stat) > 0,
     'the higher epoch lost',
   );
   const decoded = ranked({
     entry: { file: 'x', pairKey: 'x', factsVersion: COMPRESSED_FACTS_VERSION, decodedLength: 4 },
   });
-  assert.ok(compareRankedEntries(decoded, ranked({ order: 9 }), stat) > 0, 'a decoded length lost to a later line');
+  assert.ok(compareRankedEntries(decoded, ranked({ seq: 9 }), stat) > 0, 'a decoded length lost to a later line');
 });
 
 test('an entry is current only when its stat and each version match this build', () => {
@@ -660,6 +662,126 @@ test('an older fact version stays a readable stale candidate and a compaction fo
     'the compaction dropped the older entry',
   );
   holder.dispose();
+});
+
+test('an entry in a later file of a holder wins over an earlier file, whatever the listing order', () => {
+  const { directory } = storeFixture('store-write-order');
+  // The name of the later file, seq 10, sorts before seq 9.
+  fs.writeFileSync(
+    path.join(directory, 'segment-1-t-10'),
+    `${JSON.stringify(entry('x.jsonl.zst', { threadId: 'later' }))}\n`,
+  );
+  fs.writeFileSync(
+    path.join(directory, 'segment-1-t-9'),
+    `${JSON.stringify(entry('x.jsonl.zst', { threadId: 'earlier' }))}\n`,
+  );
+  assert.equal(readCompressedStore(directory).entries.get('x.jsonl.zst')?.threadId, 'later');
+});
+
+test('a renewal with an unchanged lock and an overwritten epoch abandons within one interval', async () => {
+  const { directory, clock, make } = storeFixture('store-renew-epoch');
+  const holder = make();
+  await holder.append([entry('a.jsonl.zst')]);
+  fs.writeFileSync(path.join(directory, 'epoch'), JSON.stringify({ e: 99, token: 'paused' }));
+  clock.advance(10_000);
+  assert.equal(holder.held, false, 'the renewal did not check the epoch');
+  holder.dispose();
+});
+
+test('an error in the renewal timer abandons and retries, and the entry is written', async () => {
+  let failing = false;
+  const fixture = storeFixture('store-renew-error');
+  const { directory, clock, make } = fixture;
+  const holder = make({
+    now: () => {
+      if (failing) throw new Error('disk fault');
+      return clock.now;
+    },
+  });
+  await holder.append([entry('a.jsonl.zst')]);
+  failing = true;
+  clock.advance(10_000);
+  failing = false;
+  assert.equal(holder.held, false, 'a store error during renewal did not end the lease');
+  await holder.append([entry('b.jsonl.zst')]);
+  assert.equal(threadCount(directory), 2);
+  holder.dispose();
+});
+
+test('a store error during a run abandons, retries and never rejects the append', async () => {
+  let failing = true;
+  const { directory, clock, make } = storeFixture('store-work-error', {
+    yieldStep: async () => {
+      if (failing) throw new Error('disk fault');
+    },
+  });
+  const holder = make();
+  // The first yield rejects after the entry's line is written.
+  assert.deepEqual(await holder.append([entry('a.jsonl.zst')]), [true]);
+  assert.equal(holder.held, false, 'a store error did not end the lease');
+  assert.equal(fs.existsSync(path.join(directory, STORE_LOCK)), false, 'the abandonment left the lock');
+  failing = false;
+  await holder.append([entry('b.jsonl.zst')]);
+  clock.advance(1);
+  assert.equal(threadCount(directory), 2);
+  holder.dispose();
+});
+
+test('a failed epoch write abandons instead of wedging the holder, and the retry writes the entry', async () => {
+  const { directory, clock, make } = storeFixture('store-fence-error');
+  // A directory at the epoch path makes the rename of a new epoch file fail on every platform.
+  fs.mkdirSync(path.join(directory, 'epoch'));
+  const holder = make();
+  assert.deepEqual(await holder.append([entry('a.jsonl.zst')]), [false]);
+  assert.equal(holder.held, false);
+  assert.equal(fs.existsSync(path.join(directory, STORE_LOCK)), false, 'the failed fence left the lock');
+  fs.rmdirSync(path.join(directory, 'epoch'));
+  clock.advance(5_000);
+  await holder.work();
+  await vi.waitFor(() => assert.equal(holder.pending, 0));
+  assert.equal(threadCount(directory), 1);
+  holder.dispose();
+});
+
+test('unknown-version segments do not count toward the compaction roll at a takeover', async () => {
+  const { directory, make, names } = storeFixture('store-roll-newer', { segmentBytes: 64, compactSegments: 2 });
+  const newer = { ...entry('newer.jsonl.zst'), factsVersion: COMPRESSED_FACTS_VERSION + 1 };
+  fs.writeFileSync(path.join(directory, 'segment-5-newer-0'), `${JSON.stringify(newer)}\n`);
+  fs.writeFileSync(path.join(directory, 'segment-5-newer-1'), `${JSON.stringify(newer)}\n`);
+  fs.writeFileSync(path.join(directory, 'segment-5-newer-2'), `${JSON.stringify(newer)}\n`);
+  const holder = make();
+  await holder.append([entry('a.jsonl.zst')]);
+  assert.equal(
+    names().filter((name) => name.startsWith('manifest-')).length,
+    0,
+    'a newer segment started a compaction',
+  );
+  holder.dispose();
+});
+
+test('a compaction syncs each shard and manifest before it deletes its inputs', async () => {
+  const { directory, make } = storeFixture('store-sync', { segmentBytes: 64, compactSegments: 3 });
+  const opened = vi.spyOn(defaultFs, 'openSync');
+  const synced = vi.spyOn(defaultFs, 'fsyncSync');
+  try {
+    const holder = make();
+    for (const at of [1, 2, 3]) await holder.append([entry(`r${at}.jsonl.zst`)]);
+    const temporaries = opened.mock.calls.flatMap(([name], index) =>
+      /\.tmp$/.test(String(name)) ? [{ name: String(name), fd: opened.mock.results[index].value as number }] : [],
+    );
+    assert.ok(
+      temporaries.some(({ name }) => /[/\\]shard-/.test(name)) &&
+        temporaries.some(({ name }) => /[/\\]manifest-/.test(name)),
+      'the compaction wrote no shard or manifest through a temporary',
+    );
+    const fds = new Set(synced.mock.calls.map(([fd]) => fd));
+    for (const { name, fd } of temporaries) assert.ok(fds.has(fd), `${path.basename(name)} was not synced`);
+    holder.dispose();
+    assert.ok(threadCount(directory) === 3);
+  } finally {
+    opened.mockRestore();
+    synced.mockRestore();
+  }
 });
 
 test('the idle holder releases its lock and the next append takes it again with a higher epoch', async () => {

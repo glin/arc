@@ -731,6 +731,8 @@ export class ProgressiveWorker {
     private readonly onDiscoveryTransport?: (sample: DiscoveryTransportSample) => void,
     // Counts each zstd decoder before the worker creates it.
     private readonly onCompressedDecode?: () => void,
+    // Adds the bytes of store writes that no reply reports.
+    private readonly onCompressedStoreWrite?: (bytes: number) => void,
   ) {}
 
   snapshot(): {
@@ -940,7 +942,12 @@ export class ProgressiveWorker {
           repeatedCoverage?: string;
           dispatchSpend?: [string, import('./codex').CodexDispatchSpendEntry];
           compressedDecode?: number;
+          compressedStoreWrite?: number;
         }) => {
+          if (message.compressedStoreWrite !== undefined) {
+            this.onCompressedStoreWrite?.(message.compressedStoreWrite);
+            return;
+          }
           if (message.compressedDecode !== undefined) {
             this.onCompressedDecode?.();
             worker.postMessage({ compressedDecodeAck: message.compressedDecode });

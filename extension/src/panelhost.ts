@@ -1561,6 +1561,7 @@ export class PanelProvider implements vscode.Disposable {
     },
     (sample) => this.performanceCounters?.recordDiscoveryTransport?.(sample),
     () => this.performanceCounters?.recordWork('compressedDecodes'),
+    (bytes) => this.performanceCounters?.recordWork('compressedStoreWriteBytes', bytes),
   );
   private readonly commitRepositoryReservations = new CommitRepositoryReservations();
   private readonly commitRepositoryReplies = new Map<string, { key: string; reply: CommitRepositoryReply }>();
@@ -4813,6 +4814,7 @@ export class PanelProvider implements vscode.Disposable {
         void this.sendToHost(host, this.panelVisibility.current(host, host.visible()));
         // Keep polling while any ready host remains visible. Stop polling when no ready host is visible.
         if (this.anyVisible()) {
+          this.maybeStartCompressedLoad();
           this.refreshFrom('visible', true);
           this.startPolling();
           // Request account and catalog updates when a ready host becomes visible.
@@ -5058,6 +5060,7 @@ export class PanelProvider implements vscode.Disposable {
       if (value.entries.length) applied = true;
       this.applyCompressedEntries(value.entries);
     };
+    let cutOff = false;
     try {
       const result = await this.progressiveWorker.run(
         { kind: 'compressed-load', stores },
@@ -5065,13 +5068,18 @@ export class PanelProvider implements vscode.Disposable {
         new AbortController().signal,
         (progress) => take(progress.value),
       );
+      cutOff = !result;
       take(result?.value);
     } catch {
       // A failed load leaves the rows of this activation without stored facts.
-    } finally {
-      this.compressedLoadPending = false;
-      this.performanceCounters?.recordWork('compressedLoadMs', Math.round(performance.now() - started));
     }
+    if (cutOff) {
+      // A worker stop cut the load off. The panel loads again when it next becomes visible.
+      this.compressedLoadStarted = false;
+      return;
+    }
+    this.compressedLoadPending = false;
+    this.performanceCounters?.recordWork('compressedLoadMs', Math.round(performance.now() - started));
     this.resumeCompressedAdoptions();
     if (applied) this.refreshFrom('compressed-facts', true);
     else if (!this.projectSpendBusy()) this.postProjectSpend();

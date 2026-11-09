@@ -105,6 +105,7 @@ export function retryingReplace({
 // A caller with a shared, populated directory can disable leftover scans. The current temporary still closes with each write.
 // `writerToken` replaces the process ID in the temporary name, so a caller with several writers in one process can tell
 // its own temporaries from another writer's. Leftover scans do not recognize such a name.
+// `flush` syncs the temporary before the rename and the directory after it, for a file whose readers delete its sources.
 export function writeFileAtomically(
   target: string,
   text: string,
@@ -112,14 +113,26 @@ export function writeFileAtomically(
   mode?: number,
   cleanup = true,
   writerToken?: string,
+  flush = false,
 ): void {
   fs.mkdirSync(path.dirname(target), { recursive: true });
   // Remove leftovers before writing. A previous temporary from this process can have the same name as the new one.
   if (cleanup) removeStaleTemporaries(target);
   const temporary = `${target}.${writerToken ?? process.pid}.${Date.now()}.tmp`;
   try {
-    fs.writeFileSync(temporary, text, { encoding: 'utf8', mode });
+    if (flush) {
+      const descriptor = fs.openSync(temporary, 'w', mode);
+      try {
+        writeAll(descriptor, text);
+        fs.fsyncSync(descriptor);
+      } finally {
+        fs.closeSync(descriptor);
+      }
+    } else {
+      fs.writeFileSync(temporary, text, { encoding: 'utf8', mode });
+    }
     replace(temporary, target);
+    if (flush) syncDirectory(path.dirname(target));
   } finally {
     // The rename takes the temporary when it succeeds. This removes what a failure left.
     try {
@@ -186,6 +199,20 @@ export function writeFileStreamAtomically(
     } catch {
       // The temporary is absent or cannot be removed.
     }
+  }
+}
+
+// Windows has no directory sync, so a directory that cannot be synced stays as the rename left it.
+function syncDirectory(directory: string): void {
+  try {
+    const descriptor = fs.openSync(directory, 'r');
+    try {
+      fs.fsyncSync(descriptor);
+    } finally {
+      fs.closeSync(descriptor);
+    }
+  } catch {
+    // The rename stays durable as far as this platform allows.
   }
 }
 

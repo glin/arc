@@ -60,6 +60,32 @@ test('a write clears the temporaries an earlier write in this process left behin
   );
 });
 
+test('a flushed write syncs the temporary before the rename', () => {
+  const target = path.join(dir(), 'flushed.json');
+  const order: string[] = [];
+  const synced = vi.spyOn(fs, 'fsyncSync').mockImplementation(() => {
+    order.push('sync');
+  });
+  try {
+    writeFileAtomically(
+      target,
+      'text',
+      (from, to) => {
+        order.push('rename');
+        fs.renameSync(from, to);
+      },
+      undefined,
+      true,
+      undefined,
+      true,
+    );
+  } finally {
+    synced.mockRestore();
+  }
+  assert.equal(fs.readFileSync(target, 'utf8'), 'text');
+  assert.deepEqual(order.slice(0, 2), ['sync', 'rename'], 'the rename preceded the sync');
+});
+
 test('a write that cannot finish keeps the old target and leaves no temporary', () => {
   const folder = dir();
   const target = path.join(folder, 'store.json');

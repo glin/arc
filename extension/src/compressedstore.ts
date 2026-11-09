@@ -372,10 +372,10 @@ interface RankedEntry {
   entry: RankFields;
   epoch: number;
   token: string;
-  // The file and byte offset of the line, in reading order.
+  // The file and byte offset of the line. `seq` orders a holder's files in the order it wrote them.
   input: string;
   offset: number;
-  order: number;
+  seq: number;
 }
 
 // Greater when `left` ranks first. Current fact version first, then an equal stat, then greater mtimeMs and size, then
@@ -401,7 +401,7 @@ export function compareRankedEntries(
   if (decoded) return decoded;
   if (left.epoch !== right.epoch) return left.epoch - right.epoch;
   if (left.token !== right.token) return left.token > right.token ? 1 : -1;
-  return left.order - right.order;
+  return left.seq - right.seq || left.offset - right.offset;
 }
 
 interface StoreView {
@@ -461,7 +461,6 @@ export function readCompressedStore(
   const names = listDirectory(directory);
   const view = storeView(directory, names);
   const best = new Map<string, { ranked: RankedEntry; entry: CompressedFactEntry }>();
-  let order = 0;
   for (const input of view.inputs) {
     if (!readableFactsVersion(fileFactsVersion(path.join(directory, input.name)))) continue;
     eachReadableLine(path.join(directory, input.name), (line, offset) => {
@@ -473,7 +472,7 @@ export function readCompressedStore(
         token: input.token,
         input: input.name,
         offset,
-        order: order++,
+        seq: input.seq,
       };
       const held = best.get(entry.file);
       if (!held || compareRankedEntries(ranked, held.ranked, statOf(entry.file)) > 0)
@@ -591,7 +590,9 @@ export class CompressedStoreHolder {
   private readonly exists: (file: string) => boolean;
   private readonly statOf: (file: string) => { size: number; mtimeMs: number } | null;
   private readonly wrote: (bytes: number) => void;
-  private readonly fault: (point: string) => void;
+  private readonly faultHook: (point: string) => void;
+  // True after the fault hook of a test threw, so the holder stops as a crashed holder does.
+  private faulted = false;
   private readonly openInput: (file: string) => number;
   private readonly segmentBytes: number;
   private readonly compactSegments: number;
@@ -640,11 +641,20 @@ export class CompressedStoreHolder {
         }
       });
     this.wrote = options.wrote ?? (() => {});
-    this.fault = options.fault ?? (() => {});
+    this.faultHook = options.fault ?? (() => {});
     this.openInput = options.openInput ?? openForRead;
     this.lastCompaction = this.now();
     this.segmentBytes = options.segmentBytes ?? SEGMENT_BYTES;
     this.compactSegments = options.compactSegments ?? COMPACT_SEGMENTS;
+  }
+
+  private fault(point: string): void {
+    try {
+      this.faultHook(point);
+    } catch (error) {
+      this.faulted = true;
+      throw error;
+    }
   }
 
   // True while this holder owns the lease.
@@ -681,7 +691,9 @@ export class CompressedStoreHolder {
       },
       (error: unknown) => {
         this.running = null;
-        throw error;
+        // A store error ends this lease. It never reaches the worker, and the queue retries after the jitter delay.
+        if (this.faulted) throw error;
+        this.abandon();
       },
     );
     return this.running;
@@ -770,8 +782,9 @@ export class CompressedStoreHolder {
     return true;
   }
 
-  private writeAtomically(target: string, text: string): void {
-    writeFileAtomically(target, text, fs.renameSync, undefined, false, this.token!);
+  // `durable` syncs a file that must survive a crash, because its inputs are deleted after it.
+  private writeAtomically(target: string, text: string, durable = false): void {
+    writeFileAtomically(target, text, fs.renameSync, undefined, false, this.token!, durable);
     this.wrote(Buffer.byteLength(text));
   }
 
@@ -804,7 +817,11 @@ export class CompressedStoreHolder {
     this.cancelRenewal?.();
     const tick = () => {
       this.cancelRenewal = this.schedule(RENEW_MS, tick);
-      this.renew();
+      try {
+        this.renew();
+      } catch {
+        this.abandon();
+      }
     };
     this.cancelRenewal = this.schedule(RENEW_MS, tick);
   }
@@ -818,15 +835,24 @@ export class CompressedStoreHolder {
         this.abandon();
         return false;
       }
-      return true;
+      return this.renewalEpochHolds();
     }
     if (text !== this.token) {
       this.abandon();
       return false;
     }
+    if (!this.renewalEpochHolds()) return false;
     const at = new Date(this.now());
     fs.utimesSync(this.lock, at, at);
     return true;
+  }
+
+  // An overwritten epoch ends the lease within one renewal, even with an unchanged lock.
+  private renewalEpochHolds(): boolean {
+    const epoch = readEpoch(this.directory);
+    if (epoch?.e === this.epoch?.e && epoch?.token === this.epoch?.token) return true;
+    this.abandon();
+    return false;
   }
 
   // Step 1: stop, close the open segment, release the lock on a token match, then retry while work remains.
@@ -847,7 +873,11 @@ export class CompressedStoreHolder {
 
   private closeSegment(): void {
     if (!this.open) return;
-    fs.closeSync(this.open.fd);
+    try {
+      fs.closeSync(this.open.fd);
+    } catch {
+      // The holder keeps no descriptor after an error.
+    }
     this.open = null;
     this.closedSegments++;
   }
@@ -941,7 +971,9 @@ export class CompressedStoreHolder {
     this.fault('recovery:deleted');
     // Other holders' segments count as closed.
     const after = storeView(this.directory, listDirectory(this.directory));
-    this.closedSegments = after.inputs.filter((stored) => stored.kind === 'segment').length;
+    this.closedSegments = after.inputs.filter(
+      (stored) => stored.kind === 'segment' && this.ownVersion(stored.name),
+    ).length;
     if (
       this.closedSegments >= this.compactSegments ||
       after.valid.length > 1 ||
@@ -1023,7 +1055,6 @@ export class CompressedStoreHolder {
     recovery: boolean,
   ): Promise<void> {
     const best = new Map<string, RankedEntry>();
-    let order = 0;
     for (const input of inputs) {
       this.readInputLines(input.name, (line, offset) => {
         const entry = parseEntry(line.toString('utf8'));
@@ -1034,7 +1065,7 @@ export class CompressedStoreHolder {
           token: input.token,
           input: input.name,
           offset,
-          order: order++,
+          seq: input.seq,
         };
         const held = best.get(entry.file);
         if (!held || compareRankedEntries(ranked, held, this.statOf(entry.file)) > 0) best.set(entry.file, ranked);
@@ -1052,7 +1083,7 @@ export class CompressedStoreHolder {
       if (!text) return true;
       if (!this.check()) return false;
       const name = this.nextName('shard');
-      this.writeAtomically(path.join(this.directory, name), text);
+      this.writeAtomically(path.join(this.directory, name), text, true);
       shards.push(name);
       this.fault('compact:shard-written');
       text = '';
@@ -1080,7 +1111,7 @@ export class CompressedStoreHolder {
       shards,
       inputs: inputs.map((stored) => stored.name),
     };
-    this.writeAtomically(path.join(this.directory, this.manifestName(manifest)), JSON.stringify(manifest));
+    this.writeAtomically(path.join(this.directory, this.manifestName(manifest)), JSON.stringify(manifest), true);
     this.fault('compact:manifest-saved');
     // A holder paused since its last check retires nothing, because a new holder can have removed the shards it named.
     if (!this.check() || !shards.every((shard) => fs.existsSync(path.join(this.directory, shard)))) return;
