@@ -1481,12 +1481,13 @@ export async function recordCompressedAdoption(
     const [written] = await facts.append([result.entry], revisionHolds);
     const durable = written || (await facts.durable([result.entry]));
     if (!durable && facts.withdrew(result.entry)) continue;
+    let openingDurable = true;
     if (durable && result.adopted && result.entry.opening) {
-      // A stop before this line reaches the disk leaves the facts entry, and the backfill writes the opening from it.
+      // A false answer keeps the plain path retained, so a later walk adopts again and writes the opening.
       const opening = compressedOpeningEntry(result.entry);
       const [written] = await openings.append([opening]);
-      if (!written) await openings.durable([opening]);
+      openingDurable = written || (await openings.durable([opening]));
     }
-    return { ...result, durable };
+    return { ...result, durable: durable && openingDurable };
   }
 }

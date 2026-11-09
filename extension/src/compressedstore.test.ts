@@ -1307,6 +1307,20 @@ test.skipIf(!encode)('an adoption behind a live lock answers only after its entr
   openings.dispose();
 });
 
+test.skipIf(!encode)('an adoption whose opening line is not durable answers false', async () => {
+  const { plain, twin, mtimeMs } = twinFixture('adopt-opening-lost', opening(THREAD));
+  const holder = storeFixture('adopt-opening-lost-store').make();
+  const openings = { directory: '', append: async () => [false], durable: async () => false } as never;
+  const result = await recordCompressedAdoption(
+    { twin, plain, plainMtimeMs: mtimeMs, opening: meta(THREAD), spend: completeSpend },
+    holder,
+    openings,
+  );
+  assert.equal(result.adopted, true);
+  assert.equal(result.durable, false, 'an adoption with a lost opening line settled');
+  holder.dispose();
+});
+
 test.skipIf(!encode)('a twin replaced while its adoption waits for the lease restarts the adoption', async () => {
   const { plain, twin, mtimeMs } = twinFixture('adopt-wait-replaced', opening(THREAD));
   const { directory, clock, make } = storeFixture('adopt-wait-replaced-store');
