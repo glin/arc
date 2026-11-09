@@ -10898,6 +10898,34 @@ test('a failed store read counts every name until the next reading', () => {
   assert.equal(compressedPending(home, input), 2, 'a failed read lowered the count');
 });
 
+test('a failed directory or manifest read counts every name until the next reading', () => {
+  const { home, facts } = pendingStores('pending-listing-');
+  const input = {
+    names: ['a.zst', 'b.zst'],
+    admitted: new Set(['a.zst', 'b.zst']),
+    statOf: () => pendingStat,
+    exists: () => false,
+  };
+  const record = { file: 'a.zst', pairKey: 'a', ...pendingVersions, ...pendingStat, decodedLength: 9 };
+  writeSegment(facts, [record]);
+  assert.equal(compressedPending(home, input), 1);
+  // A directory named like a manifest answers listing but cannot be read as a file.
+  const manifest = path.join(facts, 'manifest-1-holder-0');
+  fs.mkdirSync(manifest);
+  assert.equal(compressedPending(home, input), 2, 'a failed manifest read lowered the count');
+  fs.rmdirSync(manifest);
+  assert.equal(compressedPending(home, input), 1, 'the next reading did not recover');
+  // A file at the store path fails the listing with an error other than a missing directory.
+  fs.rmSync(facts, { recursive: true });
+  fs.writeFileSync(facts, '');
+  assert.equal(compressedPending(home, input), 2, 'a failed listing lowered the count');
+  fs.rmSync(facts);
+  assert.equal(compressedPending(home, input), 2, 'an absent store did not count its names');
+  fs.mkdirSync(facts);
+  writeSegment(facts, [record, { ...record, file: 'b.zst', pairKey: 'b' }]);
+  assert.equal(compressedPending(home, input), 0, 'the next reading did not recover');
+});
+
 test('warm-until compressedPending=0 holds until the backfill ends', async () => {
   const readings = [3, 2, 0];
   const samples: Array<Record<string, number>> = [];

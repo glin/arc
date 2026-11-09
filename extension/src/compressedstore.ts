@@ -293,10 +293,11 @@ function parseManifest(text: string): StoreManifest | null {
   }
 }
 
-function readManifest(directory: string, name: string): StoreManifest | null {
+function readManifest(directory: string, name: string, onUnreadable?: (name: string) => void): StoreManifest | null {
   try {
     return parseManifest(fs.readFileSync(path.join(directory, name), 'utf8'));
   } catch {
+    onUnreadable?.(name);
     return null;
   }
 }
@@ -471,17 +472,19 @@ interface StoreView {
   retired: Set<string>;
 }
 
-function listDirectory(directory: string): string[] {
+// An absent store is empty. Any other failure tells the caller that the read did not see the store.
+function listDirectory(directory: string, onUnreadable?: (name: string) => void): string[] {
   try {
     return fs.readdirSync(directory);
-  } catch {
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') onUnreadable?.(directory);
     return [];
   }
 }
 
 // The files that this build can read: its own fact version and older ones. A manifest is valid when all its shards are present. A reader ignores a shard
 // that no valid manifest names and skips an input that one names.
-function storeView(directory: string, names: readonly string[]): StoreView {
+function storeView(directory: string, names: readonly string[], onUnreadable?: (name: string) => void): StoreView {
   const present = new Set(names);
   const parsed = names.flatMap((name) => {
     const stored = storeName(name);
@@ -490,7 +493,7 @@ function storeView(directory: string, names: readonly string[]): StoreView {
   const manifests = parsed.filter((stored) => stored.kind === 'manifest');
   const valid: StoreManifest[] = [];
   for (const stored of manifests) {
-    const manifest = readManifest(directory, stored.name);
+    const manifest = readManifest(directory, stored.name, onUnreadable);
     if (manifest && readableFactsVersion(manifest.factsVersion) && manifest.shards.every((shard) => present.has(shard)))
       valid.push(manifest);
   }
@@ -547,8 +550,8 @@ function* storeReadSteps(
   statOf: (file: string) => { size: number; mtimeMs: number } | null,
   onUnreadable?: (name: string) => void,
 ): Generator<void, CompressedStoreRead, void> {
-  const names = listDirectory(directory);
-  const view = storeView(directory, names);
+  const names = listDirectory(directory, onUnreadable);
+  const view = storeView(directory, names, onUnreadable);
   const best = new Map<string, { ranked: RankedEntry; entry: CompressedFactEntry }>();
   for (const input of view.inputs) {
     if (!readableFactsVersion(fileFactsVersion(path.join(directory, input.name)))) continue;
