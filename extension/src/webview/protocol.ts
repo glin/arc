@@ -422,7 +422,7 @@ export type PanelToHost =
       sessionId: string;
       receivedAt: number;
       paintedAt?: number;
-      reason?: 'superseded' | 'replaced' | 'disposed' | 'hidden';
+      reason?: 'replaced' | 'disposed' | 'hidden';
     }
   | { type: 'initialize' }
   | { type: 'developmentReload' }
@@ -1125,8 +1125,7 @@ export function parsePanelToHost(raw: unknown): PanelToHost | null {
         isFiniteNumber(m.receivedAt) &&
         m.receivedAt >= 0 &&
         ((isFiniteNumber(m.paintedAt) && m.paintedAt >= m.receivedAt && m.reason === undefined) ||
-          (m.paintedAt === undefined &&
-            (m.reason === 'superseded' || m.reason === 'replaced' || m.reason === 'disposed' || m.reason === 'hidden')))
+          (m.paintedAt === undefined && (m.reason === 'replaced' || m.reason === 'disposed' || m.reason === 'hidden')))
         ? (m as unknown as Extract<PanelToHost, { type: 'selectionPainted' }>)
         : null;
     case 'painted':

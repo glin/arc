@@ -17,15 +17,15 @@ test('selection paint replies retain their identity and reject malformed or reve
     { paintedAt: Infinity },
     { paintedAt: 90 },
     { paintedAt: undefined },
-    { reason: 'superseded' },
+    { reason: 'replaced' },
     { sessionId: null },
     { paintedAt: undefined, reason: 'unknown' },
   ])
     assert.equal(parsePanelToHost({ ...message, ...fields }), null);
-  assert.deepEqual(parsePanelToHost({ ...message, paintedAt: undefined, reason: 'superseded' }), {
+  assert.deepEqual(parsePanelToHost({ ...message, paintedAt: undefined, reason: 'replaced' }), {
     ...message,
     paintedAt: undefined,
-    reason: 'superseded',
+    reason: 'replaced',
   });
 });
 

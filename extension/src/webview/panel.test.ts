@@ -66,7 +66,7 @@ test('a selection reports receipt and paint once after two frames and settled ti
 });
 
 test('replacement and disposal report reached receipt without a paint stamp', () => {
-  for (const reason of ['superseded', 'disposed', 'hidden', 'replaced'] as const) {
+  for (const reason of ['disposed', 'hidden', 'replaced'] as const) {
     const f = paintFixture();
     f.paint.receive({ showing: 'old', selectionTiming: { id: 1, sessionId: 'old' } }, 100);
     f.paint.schedule();

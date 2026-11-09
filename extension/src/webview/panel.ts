@@ -101,19 +101,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
   const startupStatus = list.querySelector<HTMLElement>('[data-startup-status]');
   const savedState = kernel.savedState;
   // This posting port wraps kernel.sendToHost. The acquired VS Code API remains inside host.ts.
-  const vscode = Object.freeze({
-    postMessage(message: PanelToHost) {
-      if (
-        message.type === 'showSession' ||
-        message.type === 'showReaderParent' ||
-        message.type === 'goBack' ||
-        message.type === 'goForward' ||
-        message.type === 'newSession'
-      )
-        selectionPaint.abandon('superseded');
-      kernel.sendToHost(message);
-    },
-  });
+  const vscode = Object.freeze({ postMessage: kernel.sendToHost });
   const onDocument = kernel.events.document;
   const onWindow = kernel.events.window;
   const usageMetrics = startPageUsageMetrics(
@@ -1149,8 +1137,8 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
     railRenderer.place();
     projectSpend.update(latest.projectSpend);
     clock.tick();
-    acknowledgePaint();
     selectionPaint.schedule();
+    acknowledgePaint();
   }
 
   function firstSelection(): RenderMessage {
