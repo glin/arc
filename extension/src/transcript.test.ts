@@ -18056,6 +18056,29 @@ test('a sliced child census yields within each slice of injected time and finds 
   assert.deepEqual(sliced, enumerateClaudeChildSources(parents));
 });
 
+test('a sliced Claude listing yields between the stats of repeated session IDs', async () => {
+  const root = tempDir('claude-sliced-repeated-');
+  const cwd = 'C:/work/sliced';
+  for (const suffix of ['', '-topic', '-other']) {
+    const directory = path.join(root, `${projectSlug(cwd)}${suffix}`);
+    fs.mkdirSync(directory);
+    for (const name of ['repeated-a', 'repeated-b']) fs.writeFileSync(path.join(directory, `${name}.jsonl`), '{}\n');
+  }
+  const callMs = WALK_SLICE_MS + 1;
+  const clock = slicedWalkClock(callMs);
+  const sliced = await walkInSlices(
+    enumerateSessionFilesForSteps(root, [cwd], () => clock.time('openings:parents', () => cwd), [cwd], clock.time),
+    undefined,
+    clock.pacing,
+  );
+  clock.finish();
+  assert.ok(
+    clock.slices.every((slice) => slice <= WALK_SLICE_MS + callMs),
+    `a slice ran past the limit: ${clock.slices.join(', ')}`,
+  );
+  assert.equal(sliced?.sessions.length, 6, 'a repeated session ID whose files all exist lost a row');
+});
+
 test('a canceled sliced walk answers no result', async () => {
   const root = tempDir('claude-sliced-cancel-');
   const cwd = 'C:/work/sliced';

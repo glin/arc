@@ -4053,10 +4053,10 @@ export async function walkInSlices<T>(
 // A walk reads its directories at different times, so a file that moves from one listed directory to another can appear
 // in both. A repeated session ID keeps a row only while its file exists at the end of the listing. Two files that both
 // exist stay listed, and the collision quarantine answers them.
-function dropMovedRows(
+function* dropMovedRowSteps(
   listing: SourceEnumeration & { sessions: SessionFile[] },
   time: ListingTimer,
-): SourceEnumeration & { sessions: SessionFile[] } {
+): WalkSteps<SourceEnumeration & { sessions: SessionFile[] }> {
   const firstOfId = new Map<string, SessionFile>();
   const repeated = new Set<SessionFile>();
   for (const row of listing.sessions) {
@@ -4070,6 +4070,7 @@ function dropMovedRows(
   }
   const moved = new Set<string>();
   for (const row of repeated) {
+    yield;
     try {
       time('stats', () => fs.statSync(row.file));
     } catch (error) {
@@ -4143,7 +4144,7 @@ export function* enumerateSessionFilesForSteps(
       }
     }
   }
-  return dropMovedRows({ ...evidence, sessions: out.sort((a, b) => b.mtimeMs - a.mtimeMs) }, time);
+  return yield* dropMovedRowSteps({ ...evidence, sessions: out.sort((a, b) => b.mtimeMs - a.mtimeMs) }, time);
 }
 
 // Session transcripts in a project directory, newest first.
@@ -4319,7 +4320,7 @@ export function* enumerateClaudeChildSourceSteps(
       });
     }
   }
-  return dropMovedRows(census, time);
+  return yield* dropMovedRowSteps(census, time);
 }
 
 // Reads the parent-owned identity edge without retaining the parent's turns. The result is
