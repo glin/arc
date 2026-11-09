@@ -9,7 +9,7 @@ import { RAIL_STATS, renderPayload, costOverheadsPayload } from './panelfixture.
 import { missingUsageLimits, publish } from '../scripts/readme-shots.ts';
 import { DEMO_LABELS, DEMO_SESSION_IDS, README_SCENES, demoPayload, readmePayload } from '../scripts/readme-fixture.ts';
 import { turnCost } from './turncard.ts';
-import { claudeLaunchKind } from './transcript.ts';
+import { claudeLaunchKind, SKILL_STEP_KIND } from './transcript.ts';
 import type { SessionStatChip, TurnCard, CompactionCard } from './turncard.ts';
 import type { RailCard, SessionParent } from './turnrail.ts';
 import { estimateCost, formatCost } from './pricing.ts';
@@ -312,7 +312,7 @@ test('demo selections keep available setups, cache facts, and their own prompt t
 });
 
 test('default demo review command supports direct Codex dispatch recognition', () => {
-  const launch = DEMO_TURNS['arc-read-state'][0].steps.find((step) => step.ordinal === 23);
+  const launch = DEMO_TURNS['arc-read-state'][0].steps.find((step) => step.name === 'Bash' && step.detail.startsWith('codex exec'));
   assert.ok(launch);
   assert.deepEqual(claudeLaunchKind(launch.detail, 'bash'), { kind: 'codex-native', count: 1 });
 });
@@ -683,9 +683,12 @@ test('default demo history keeps distinct turns and provider-scoped expiry evide
   for (let index = 1; index < main.cards.length; index++) assert.ok(main.cards[index].endedAt < main.cards[index - 1].startedAt);
   assert.equal(new Set(main.cards.map((card) => card.key)).size, 3);
   assert.ok(main.cards.slice(1).every((card) => !card.agents.length && !card.commits.length && !card.files.length));
-  assert.ok(main.stats['arc-read-state'].find((chip) => chip.metric === 'cache-expiry'));
+  const expiry = main.stats['arc-read-state'].find((chip) => chip.metric === 'cache-expiry')!;
+  assert.equal(expiry.label, '2 cache expiries');
+  assert.equal(expiry.detailList!.heading!.value, '2 affected requests');
+  assert.equal(expiry.detailList!.entries.find((entry) => entry.label === 'Cache lifetimes')!.value, '1 at 5m · 1 at 1h');
   // The session's expiries reach the warning floor, so its cost popover leads with them.
-  assert.match(main.stats['arc-read-state'].find((chip) => chip.metric === 'cost')!.detail, /^1 cache expiry added \$\d+\.\d\d$/m);
+  assert.match(main.stats['arc-read-state'].find((chip) => chip.metric === 'cost')!.detail, /^2 cache expiries added \$\d+\.\d\d$/m);
   const expired = demoPayload('delegated-cost') as typeof main;
   const warning = main.cards[1].chips.find((chip) => chip.metric === 'cost')!.warnings!.find((warning) => warning.scope === 'cache-expiry');
   assert.ok(warning && warning.scope === 'cache-expiry' && warning.dollars! > 1, 'invented cold turn must cross the production warning threshold');
@@ -733,7 +736,10 @@ test('demo samples reach each cost popover state', () => {
   assert.ok(claude.parts.every((part) => part.rows.length), 'the Claude turn lacks tool rows in a section');
   // The arc-read-state turn holds all of that session's delegated work, so both popovers show the same Delegated tool rows.
   const claudeSession = sessionCost('arc-read-state').tabs.find((tab) => tab.name === 'Tools');
-  assert.deepEqual(claudeSession?.parts[1]?.rows, claude.parts[1].rows, 'the session and turn price delegated tool results differently');
+  const sessionRows = claudeSession!.parts[1].rows;
+  const turnRows = claude.parts[1].rows;
+  assert.deepEqual(sessionRows.map(({ share: _share, ...row }) => row), turnRows.map(({ share: _share, ...row }) => row), 'the session and turn price delegated tool results differently');
+  for (let index = 0; index < sessionRows.length; index++) assert.ok(Math.abs(sessionRows[index].share - turnRows[index].share) < 1e-12, 'the session and turn disagree on delegated cost shares');
   assert.equal(tools('arc-codex-read-state')?.parts[1].empty, 'No tool results');
   const codex = sessionCost('arc-codex-read-state');
   assert.match(codex.warnings[0].text, /^Waiting on subagents took \$\d+\.\d\d$/);
@@ -746,6 +752,39 @@ test('demo samples reach each cost popover state', () => {
   assert.ok(delegated.warnings.some((warning) => warning.text.includes('Low cache reuse in delegated work')));
   assert.match(delegated.warnings.find((warning) => warning.text.includes('cache expir'))?.quiet ?? '', /^\d+% of the total$/);
   assert.ok(turnChip('arc-read-state', 'context').entries.some((entry) => entry.label === 'Subagent results'));
+  const main = (demoPayload('arc-read-state') as Demo).cards[0];
+  const history = main.agents.find((agent) => agent.description === 'Find earlier unread fixes')!;
+  const cost = history.figures.find((figure) => figure.metric === 'cost')!;
+  assert.deepEqual(cost.warnings, ['cache-expiry', 'low-cache']);
+  assert.ok(cost.record?.cost?.warnings.some((warning) => /^Cache expiry affected 1 request and added \$0\./.test(warning.text)));
+  assert.ok(cost.record?.cost?.sections.some((section) => section.facts?.warning));
+  assert.equal(history.figures.find((figure) => figure.metric === 'rate')?.compactLabel, '100 tok/s');
+  const speed = main.chips.find((chip) => chip.metric === 'rate')!;
+  assert.equal(speed.label, '100 tok/s');
+  assert.ok(speed.detailList?.entries.some((entry) => entry.label === 'Output'));
+  assert.ok(main.chips.every((chip) => chip.metric !== 'tokens'));
+  const context = turnChip('arc-read-state', 'context').entries.find((entry) => entry.label === 'Subagent results')!;
+  assert.equal(context.breakdown?.rows.length, 2);
+  const source = DEMO_TURNS['arc-read-state'][0].agents.find((agent) => agent.id === 'unread-history')!;
+  assert.equal(source.tokens, Object.entries(source.spend[0].usage).filter(([key]) => ['input', 'cacheWrite1h', 'cacheWrite5m', 'cacheRead', 'output'].includes(key)).reduce((sum, [, value]) => sum + Number(value), 0));
+  const child = DEMO_DEFAULT_EXPIRY.childSources![0];
+  const returned = child.facts.returns[0];
+  assert.equal(child.facts.returns.length, 1);
+  assert.equal(returned.lifetime, '5m');
+  const turn = DEMO_TURNS['arc-read-state'][0];
+  const launch = turn.steps.find((step) => step.name === 'Agent' && step.detail === source.description)!;
+  assert.ok(launch.at <= source.startedAt!, 'the child starts before its launch');
+  for (let index = 1; index < turn.steps.length; index++) {
+    assert.ok(turn.steps[index - 1].at <= turn.steps[index].at, 'activity order disagrees with its clock');
+    assert.ok(turn.steps[index - 1].ordinal < turn.steps[index].ordinal, 'activity ordinals are out of order');
+  }
+  for (const step of turn.steps) {
+    if (step.name === 'Agent') assert.equal(turn.stepKinds[step.ordinal - 1], 'agents');
+    if (step.name === 'Skill') assert.equal(turn.stepKinds[step.ordinal - 1], SKILL_STEP_KIND);
+  }
+  assert.ok(returned.timestamp! >= source.startedAt! && returned.timestamp! <= source.startedAt! + source.durationMs!);
+  assert.ok(returned.timestamp! - returned.gapMs >= source.startedAt!);
+  for (const [key, value] of Object.entries(returned.request.usage)) assert.ok(Number(value) <= Number(source.spend[0].usage[key as keyof typeof source.spend[0]['usage']] ?? 0), `the child return exceeds its ${key} total`);
 });
 
 test('demo session costs retain usage details and count compaction estimates once', () => {

@@ -152,6 +152,17 @@ describe('read-only web demo', () => {
           fullPage: true,
         });
       await offline.keyboard.press('Escape');
+      if (session === 'arc-read-state') {
+        const history = offline.locator('#list .cardrecord .agentrow').filter({ hasText: 'Find earlier unread fixes' });
+        const name = await history.locator('[data-metric="cost"]').getAttribute('aria-label');
+        assert.match(name!, /Warning: 17% cached/);
+        assert.doesNotMatch(name!, /Cache expiry affected/);
+        if (process.env.ARC_DEMO_SHOTS)
+          await offline.screenshot({
+            path: path.join(process.env.ARC_DEMO_SHOTS, 'offline-subagent-cost.png'),
+            fullPage: true,
+          });
+      }
       await offline.locator(`[data-control="sessionmenu:${session}"]`).click();
       expect(
         await offline
@@ -467,8 +478,50 @@ describe('read-only web demo', () => {
         await page.locator('#list .turn').first().waitFor();
         expect(await page.locator('#list .turn').count()).toBe(3);
         expect(await page.locator('#list .turn').first().textContent()).toContain('Claude');
+        const capture = async (state: string) => {
+          if (!process.env.ARC_DEMO_SHOTS) return;
+          fs.mkdirSync(process.env.ARC_DEMO_SHOTS, { recursive: true });
+          await page.mouse.move(0, 0);
+          await page.screenshot({
+            path: path.join(process.env.ARC_DEMO_SHOTS, `${state}-${theme}-${width}.png`),
+            fullPage: true,
+          });
+        };
+        const main = page.locator('#list .turn').first();
+        await main.locator('.chips [data-metric="rate"]').click();
+        await page.locator('#chippop.pinned').waitFor({ state: 'visible' });
+        await page.locator('#chippop .chippopitemhead').getByText('Output', { exact: true }).waitFor();
+        await capture('main-speed');
+        await page.keyboard.press('Escape');
+        await main.locator('h3.cardheading button.head').click();
+        await main.locator('.chips [data-metric="rate"]').click();
+        await page.locator('#chippop.pinned .chippopitemhead').getByText('Output', { exact: true }).waitFor();
+        await capture('main-speed-timeline');
+        await page.keyboard.press('Escape');
+        await main.locator('h3.cardheading button.head').click();
+        const history = main.locator('.cardrecord .agentrow').filter({ hasText: 'Find earlier unread fixes' });
+        await history.locator('[data-metric="cost"]').press('Enter');
+        await page.locator('#chippopnested.pinned .costsection').first().waitFor({ state: 'visible' });
+        await page
+          .locator('#chippopnested .chippopwarning')
+          .filter({ hasText: 'Cache expiry affected 1 request' })
+          .waitFor();
+        await capture('subagent-cost');
+        await history.locator('[data-metric="cost"]').press('Enter');
+        await page.locator('#chippopnested').waitFor({ state: 'hidden' });
+        await history.locator('[data-metric="rate"]').press('Enter');
+        await page.locator('#chippopnested.pinned .chippopitemhead').getByText('Output', { exact: true }).waitFor();
+        await capture('subagent-speed');
+        await history.locator('[data-metric="rate"]').press('Enter');
+        await page.locator('#chippopnested').waitFor({ state: 'hidden' });
+        await main.locator('.chips [data-metric="context"]').click();
+        await page.locator('#chippop.pinned .sharerows').waitFor({ state: 'visible' });
+        expect(await page.locator('#chippop .sharerows .costrow').count()).toBe(2);
+        await capture('subagent-context');
+        await page.keyboard.press('Escape');
         await page.locator('.sessionstats [data-metric="cache-expiry"]').click();
         await page.locator('#chippop').waitFor({ state: 'visible' });
+        await capture('session-cache-expiry');
         await page.keyboard.press('Escape');
         for (const session of ['arc-read-state', 'delegated-cost']) {
           if (width === 1280) await page.locator(`[data-control="rail:${session}"]`).first().click();
@@ -509,6 +562,14 @@ describe('read-only web demo', () => {
         await page.locator('[data-control="sessionparent:arc-read-state"]').click();
         await page.locator('[data-control="session:arc-read-state"]').waitFor();
         expect(await page.locator('#list .turn').count()).toBe(3);
+        if (width === 1280) {
+          await page.locator('[data-control="railarchived"]').click();
+          await page.locator('[data-control="rail:arc-demo-continuation"]').first().click();
+        } else await page.locator('[data-control="picker"]').selectOption('arc-demo-continuation');
+        await page.locator('#list .compaction [data-metric="cost"]').click();
+        await page.locator('#chippop.pinned .costsection').first().waitFor({ state: 'visible' });
+        await capture('compaction-cost');
+        await page.keyboard.press('Escape');
         await page.close();
       }
     }

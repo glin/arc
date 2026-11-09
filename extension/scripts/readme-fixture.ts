@@ -22,6 +22,7 @@ import {
   publicProjectSpendPrice,
 } from '../src/projectspend.ts';
 import { cacheLifetimeFor, contextBandForRequest, compactionEstimate } from '../src/pricing.ts';
+import { combineCacheExpirySummaries } from '../src/cacheexpirysummary.ts';
 import type { CacheExpiryCarry, ProjectUsageBucket, SpendFileIndex } from '../src/projectspend.ts';
 import { usageBar } from '../src/usageview.ts';
 import type { AgentUsage } from '../src/usageview.ts';
@@ -44,6 +45,8 @@ import type { PinnedSetup } from '../src/domain/session-setups.ts';
 import type { RailCard, RailStatus, SessionParentEdge } from '../src/turnrail.ts';
 import { RAIL_FOLDS } from '../src/view/rail.ts';
 import { addUsage } from '../src/agentspend.ts';
+import { ChildCacheExpiryAttribution } from '../src/childcacheexpiry.ts';
+import { turnKey } from '../src/domain/read.ts';
 
 export const CAPTURE_TIME = Date.parse('2026-09-15T14:42:00-05:00');
 // Browser timezone for captures.
@@ -761,10 +764,10 @@ function demoUsagePart(
 
 const demoHistoryUsage: TurnUsage = {
   requests: 6,
-  input: 3_000,
+  input: 120_000,
   cacheWrite1h: 0,
   cacheWrite5m: 24_000,
-  cacheRead: 150_000,
+  cacheRead: 30_000,
   output: 3_000,
   thinking: 0,
 };
@@ -985,39 +988,44 @@ const demoReadStateTurn: Turn = {
           ],
         },
       ],
-      durationMs: 54_000,
-      tokens: 180_000,
+      startedAt: start + 5 * 60_000,
+      durationMs: 7 * 60_000,
+      tokens: 177_000,
       toolUses: 5,
       artifacts: { files: [], commits: [], complete: true, revision: 'unread-history' },
     }),
   ],
   steps: [
-    ...demoCodexReadStateTurn.steps.map((step) =>
-      step.ordinal === 22
+    ...demoCodexReadStateTurn.steps.map((step) => ({
+      ...(step.ordinal === 22
         ? { ...step, name: 'Skill', detail: 'review-changes' }
         : step.ordinal === 16
           ? { ...step, name: 'Read', detail: 'extension/src/webview/read-state.test.ts' }
-          : step,
-    ),
+          : step),
+      ordinal: step.ordinal >= 18 ? step.ordinal + 1 : step.ordinal,
+    })),
+    { ordinal: 18, name: 'Agent', detail: 'Find earlier unread fixes', at: start + 4.5 * 60_000, status: 'done' },
     {
-      ordinal: 23,
+      ordinal: 24,
       name: 'Bash',
       detail: 'codex exec --json --model gpt-6.1-sol -c model_reasoning_effort=high "Review the read-state change"',
       at: start + 12.6 * 60_000,
       status: 'done',
     },
-    { ordinal: 24, name: 'Agent', detail: 'Find earlier unread fixes', at: start + 12.7 * 60_000, status: 'done' },
-  ],
+  ].sort((a, b) => a.ordinal - b.ordinal) as Turn['steps'],
   skillUses: demoCodexReadStateTurn.skillUses.map((use) =>
     skillUse({ sourceId: use.sourceId, name: use.name, description: use.description, path: use.path, at: use.at }),
   ),
+  updates: demoCodexReadStateTurn.updates.map((update) => ({
+    ...update,
+    stepsBefore: update.stepsBefore >= 18 ? update.stepsBefore + 1 : update.stepsBefore,
+  })),
   stepCount: 24,
   stepKinds: [
-    ...demoCodexReadStateTurn.stepKinds.map((kind, index) =>
-      index === 21 ? SKILL_STEP_KIND : kind === 'searches' ? 'reads' : kind,
-    ),
+    ...demoCodexReadStateTurn.stepKinds
+      .map((kind, index) => (index === 21 ? SKILL_STEP_KIND : kind === 'searches' ? 'reads' : kind))
+      .flatMap((kind, index) => (index === 16 ? [kind, 'agents'] : [kind])),
     'commands',
-    'agents',
   ],
   toolUses: 24,
   toolCounts: {
@@ -1535,6 +1543,51 @@ DEMO_COMPACTIONS['arc-demo-continuation'] = [
 export const DEMO_DEFAULT_EXPIRY = emptyCacheExpiryFacts();
 const demoCodexExpiry = emptyCacheExpiryFacts();
 const demoDelegatedExpiry = emptyCacheExpiryFacts();
+// The history search resumes six minutes after a request with a five-minute cache lifetime.
+const historyRequest = usageShare(demoHistoryUsage, 1);
+const historyCarry: CacheExpiryCarry = {
+  requestKey: 'history-before-pause',
+  visibleTurnId: null,
+  timestamp: start + 5.5 * 60_000,
+  lifetime: '5m',
+  model: 'claude-opus-5-5',
+  provider: null,
+  serviceTier: null,
+  inferenceClass: null,
+  compactionsBefore: 0,
+  inputTokens: 29_000,
+  incomplete: false,
+  effort: 'medium',
+};
+const historyReturn = { ...historyCarry, requestKey: 'history-after-pause', timestamp: start + 11.5 * 60_000 };
+const historyVerdict = classifyCacheExpiry(historyCarry, historyReturn, historyRequest, true);
+if (historyVerdict.kind !== 'return') throw new Error('The demo history request must cross its cache lifetime');
+const historyBucket: ProjectUsageBucket = {
+  ...spendBucket('claude', 0, historyRequest, 1),
+  contextWindow: 1_000_000,
+  usage: historyRequest,
+};
+const historyFacts = emptyCacheExpiryFacts();
+historyFacts.counts[historyVerdict.lifetime] = 1;
+historyFacts.longestGapMs = historyVerdict.gapMs;
+historyFacts.returns.push({
+  ...historyVerdict,
+  timestamp: historyReturn.timestamp,
+  request: historyBucket,
+  visibleTurnId: null,
+  requestKey: historyReturn.requestKey,
+  previousInputSide: historyCarry.inputTokens,
+});
+DEMO_DEFAULT_EXPIRY.childSources = [
+  {
+    source: `${ROOT}/subagents/agent-unread-history.jsonl`,
+    childId: 'unread-history',
+    revision: spendFile('claude', [historyBucket]),
+    facts: historyFacts,
+    endedAt: start + 12 * 60_000,
+    outcome: null,
+  },
+];
 // Request identities let the production warning match the opening response.
 for (const turns of Object.values(DEMO_TURNS)) {
   for (const item of turns) {
@@ -1592,6 +1645,19 @@ for (const [sessionId, facts] of [
     });
   }
 }
+
+const demoExpirySummary = combineCacheExpirySummaries(
+  [DEMO_DEFAULT_EXPIRY, ...DEMO_DEFAULT_EXPIRY.childSources.map((child) => child.facts)].map((facts) => ({
+    ...facts,
+    longestGap: facts.longestGapMs,
+  })),
+);
+Object.assign(DEMO_DEFAULT_EXPIRY, {
+  counts: demoExpirySummary.counts,
+  longestGapMs: demoExpirySummary.longestGap,
+  excluded: demoExpirySummary.excluded,
+  unavailable: demoExpirySummary.unavailable,
+});
 
 const DEMO_PINNED_SETUPS: PinnedSetup[] = [
   { id: 'claude-opus-high', agent: 'claude', model: 'claude-opus-5-5', effort: 'high', permissionMode: 'auto' },
@@ -1729,6 +1795,11 @@ export const DEMO_LABELS: Readonly<Record<string, readonly string[]>> = {
 
 export function demoPayload(sessionId: string): Record<string, unknown> {
   const selected = DEMO_TURNS[sessionId] ? sessionId : 'arc-read-state';
+  const childExpiry = new ChildCacheExpiryAttribution().read(
+    DEMO_TURNS[selected],
+    { [selected]: demoSessionOverheads(selected).expiry ?? emptyCacheExpiryFacts() },
+    CAPTURE_TIME,
+  );
   const base = readmePayload('main');
   const rows = Object.entries(DEMO_TURNS).map(([id, turns]) => {
     const item = turns[0];
@@ -1963,6 +2034,7 @@ export function demoPayload(sessionId: string): Record<string, unknown> {
                 : selected === 'arc-codex-read-state'
                   ? demoCodexExpiry
                   : null,
+            childExpiry.get(turnKey(item)),
           ),
           DEMO_MODEL_LABELS,
         );
