@@ -11,6 +11,7 @@ import {
   compressedEntryVersions,
   compressedEntrySeed,
   compressedPairKey,
+  CompressedStoreFollower,
   readCompressedStore,
   type CompressedEntrySeed,
   type CompressedFactEntry,
@@ -16271,6 +16272,55 @@ test.skipIf(!zstdCompress)('a load poll does not post the entries this worker pu
     );
   } finally {
     worker.stop();
+    fs.rmSync(pair.directory, { recursive: true, force: true });
+  }
+});
+
+test.skipIf(!zstdCompress)('a load reply carries an entry whose batch has not reached the host', async () => {
+  const pair = compressedRolloutPair();
+  const store = storeBackedFacts(path.join(pair.directory, 'facts'));
+  let openingWrites = 0;
+  let release: () => void = () => {};
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  const harness = backfillHarness({
+    facts: store.holder,
+    exists: () => false,
+    openings: {
+      directory: tempDir('backfill-store-'),
+      append: async (entries: CompressedFactEntry[]) => {
+        // The first write is the first-record read. The second is the opening of the publication.
+        if (openingWrites++) await gate;
+        return entries.map(() => true);
+      },
+      durable: async () => true,
+    } as never,
+  });
+  const { backfill, batches, advance } = harness;
+  const uncovered = (entries: CompressedFactEntry[]) => entries.filter((entry) => !backfill.published(entry));
+  const follower = new CompressedStoreFollower(store.holder.directory);
+  try {
+    backfill.setNames([pair.compressed]);
+    await vi.waitFor(() =>
+      assert.ok(readCompressedStore(store.holder.directory).entries.has(pair.compressed), 'no entry reached the store'),
+    );
+    const polled = await follower.poll();
+    assert.equal(polled.length, 1);
+    await vi.waitFor(() =>
+      assert.equal(
+        (backfill as unknown as { results: Map<string, unknown> }).results.size,
+        1,
+        'the entry was not held',
+      ),
+    );
+    assert.deepEqual(uncovered(polled), polled, 'the offsets covered an entry that its opening write still held');
+    release();
+    await vi.waitFor(() => assert.equal(harness.scheduled.length, 1, 'the batch was not armed'));
+    assert.deepEqual(uncovered(polled), polled, 'the offsets covered an entry that no batch carried');
+    advance(0);
+    assert.equal(batches.length, 1, 'the batch did not post');
+    assert.deepEqual(uncovered(polled), [], 'a posted entry stayed in the load reply');
+  } finally {
+    backfill.dispose();
     fs.rmSync(pair.directory, { recursive: true, force: true });
   }
 });

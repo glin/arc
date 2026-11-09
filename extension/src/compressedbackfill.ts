@@ -370,7 +370,7 @@ export class CompressedBackfill {
   private inFolders: (cwd: string) => boolean;
   private rootsKey: string;
   private readonly stop = new AbortController();
-  private readonly outbox: CompressedFactEntry[] = [];
+  private readonly outbox = new Map<string, CompressedFactEntry>();
   private cancelFlush: (() => void) | null = null;
   private cancelReplan: (() => void) | null = null;
   private lastFlush = -Infinity;
@@ -467,10 +467,11 @@ export class CompressedBackfill {
     this.cancelReplan = null;
   }
 
-  // True for the line of an entry that this backfill published, which a batch already carried to the host.
+  // True for the line of an entry that a batch already carried to the host. An entry that waits for its batch stays in a
+  // load reply, so the offsets of that reply cover only entries that reach the host.
   published(entry: CompressedFactEntry): boolean {
     const held = this.results.get(entry.file);
-    return !!held && compressedEntrySame(held, entry);
+    return !!held && !this.outbox.has(entry.file) && compressedEntrySame(held, entry);
   }
 
   private factsOf(file: string): CompressedEntrySeed | undefined {
@@ -787,17 +788,17 @@ export class CompressedBackfill {
     const [written] = await this.options.facts.append([entry]);
     if (!written && !(await this.options.facts.durable([entry]))) return;
     this.results.set(entry.file, entry);
+    this.outbox.set(entry.file, entry);
     if (entry.opening) {
       const opening = compressedOpeningEntry(entry);
       this.openingEntries.set(entry.file, opening);
       await this.appendOpenings([opening]);
     }
-    this.outbox.push(entry);
     this.armFlush();
   }
 
   private armFlush(): void {
-    if (this.cancelFlush || !this.outbox.length || this.disposed) return;
+    if (this.cancelFlush || !this.outbox.size || this.disposed) return;
     this.cancelFlush = this.schedule(Math.max(0, this.lastFlush + BATCH_INTERVAL_MS - this.now()), () => {
       this.cancelFlush = null;
       this.flush();
@@ -806,10 +807,10 @@ export class CompressedBackfill {
 
   // At most one batch per second, of 4 MiB or one larger record.
   private flush(): void {
-    if (!this.outbox.length || this.disposed) return;
+    if (!this.outbox.size || this.disposed) return;
     if (this.cancelFlush || this.now() < this.lastFlush + BATCH_INTERVAL_MS) return this.armFlush();
-    const [batch] = compressedEntryBatches(this.outbox, COMPRESSED_BATCH_BYTES);
-    this.outbox.splice(0, batch.length);
+    const [batch] = compressedEntryBatches([...this.outbox.values()], COMPRESSED_BATCH_BYTES);
+    for (const entry of batch) this.outbox.delete(entry.file);
     this.lastFlush = this.now();
     const backfillMs = Math.round(this.unpostedMs);
     this.unpostedMs -= backfillMs;
