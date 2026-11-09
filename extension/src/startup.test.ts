@@ -11253,6 +11253,40 @@ test('a batch row added while a complete reply waits joins that reply', async ()
   assert.equal(reply.revisions.get(twin)?.file, twin, 'the complete reply held no revision of the batch row');
 });
 
+test('a compressed-facts refresh that walks sets the gauge on both walk paths', async () => {
+  const { provider, root, writeRollout, releaseAll } = heldWalkHarness(
+    { readRolloutStat, isHiddenThread, isAgentRun, compressedTitleCurrent, withKeptUndercount, compressedEntrySame },
+    ['relistHeldCodex'],
+  );
+  writeRollout('plain');
+  const twin = path.join(root, `rollout-${twinThread}.jsonl.zst`);
+  fs.writeFileSync(twin, 'x');
+  const stat = readRolloutStat(twin)!;
+  const gauges: Record<string, number> = {};
+  provider.performanceCounters = {
+    ...provider.performanceCounters,
+    recordGauge: (name: string, value: number) => (gauges[name] = value),
+  };
+  provider.compressedFacts.set(twin, {
+    file: twin,
+    pairKey: twin.replace(/\.zst$/, ''),
+    ...compressedEntryVersions(),
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    threadId: twinThread,
+    opening: { ...backfillOpening, cwd: path.join(root, 'project') },
+    complete: true,
+    decodedLength: 500,
+  });
+  provider.compressedFactsRefreshDue = true;
+  await releaseAll(provider.refresh(true));
+  assert.equal(gauges.compressedRows, 1, 'the walk of every source did not set the gauge');
+  delete gauges.compressedRows;
+  provider.compressedFactsRefreshDue = true;
+  provider.relistHeldCodex(provider.sourceEnumerations.codex);
+  assert.equal(gauges.compressedRows, 1, 'the walk over held Claude rows did not set the gauge');
+});
+
 test.skipIf(!rolloutCompression.zstdCompressSync)(
   'compressedPendingInput names the rollouts of the run tree',
   async () => {
