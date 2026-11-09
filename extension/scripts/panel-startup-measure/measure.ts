@@ -18,7 +18,6 @@ import {
   type HostMemory,
 } from './soak';
 import {
-  CODEX_OPENING_BYTES,
   ROLLOUT_NAME,
   codexRowAdmitted,
   codexSessionFiles,
@@ -32,6 +31,7 @@ import {
   compressedPhysicalStat,
   readCompressedStore,
   type CompressedFactEntry,
+  COMPRESSED_ENTRY_TITLE_BYTES,
 } from '../../src/compressedstore.ts';
 import { DIAGNOSTICS_LOG_DIRECTORY } from '../../src/diagnosticslog.ts';
 import type { StartupMilestone } from '../../src/performancediagnostics.ts';
@@ -1560,7 +1560,8 @@ export async function admittedCompressed(input: {
     const file = path.join(input.codex, path.relative('codex', entry.file));
     const plain = file.slice(0, -'.zst'.length);
     if (!isCompressedRollout(file) || fs.existsSync(plain)) continue;
-    const meta = openingRecordOf(await readCompressedFirstRecord(file, CODEX_OPENING_BYTES));
+    // The backfill reads an opening under the same limit, so the count and the backfill name the same files.
+    const meta = openingRecordOf(await readCompressedFirstRecord(file, COMPRESSED_ENTRY_TITLE_BYTES));
     if (!meta || !codexRowAdmitted(meta, readRolloutStat(file), inFolders)) continue;
     const named = ROLLOUT_NAME.exec(path.basename(plain));
     files.add(file);
