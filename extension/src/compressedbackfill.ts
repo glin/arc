@@ -26,6 +26,7 @@ import {
   compressedEntryVersions,
   compressedOpeningEntry,
   compressedPairKey,
+  compressedTitleCurrent,
   readCompressedStoreInSteps,
   withKeptUndercount,
   type CompressedEntrySeed,
@@ -269,6 +270,14 @@ function titleEntryOf(
     starts: { starts: codexTurnStartsIn([...tailLines], agentPath), whole: tailWhole },
     foldedLabel: label.toLocaleLowerCase(),
   };
+}
+
+// An entry that an unreadable revision carries. A title of another generation stays as a carried name, because the
+// new version stamps would show it as current.
+function withoutOutdatedTitle(entry: CompressedFactEntry): CompressedFactEntry {
+  if (!entry.title || compressedTitleCurrent(entry)) return entry;
+  const { title, ...rest } = entry;
+  return { ...rest, carriedName: rest.carriedName ?? { label: title.label, fullLabel: title.fullLabel } };
 }
 
 // The facts of one derivation, or null when the body held no record.
@@ -627,14 +636,16 @@ export class CompressedBackfill {
     });
   }
 
+  // An unreadable revision keeps the title, the spend record and the completeness that the store holds, so a failed decode
+  // neither lowers a shown total nor blanks a row. A store that does not answer publishes nothing, and the entry stays.
   private async publishUnreadable(job: Job): Promise<void> {
     const previous = this.factsOf(job.file);
-    const carried =
-      previous && !previous.nameOnly && !previous.adoptionFailed ? (previous as CompressedFactEntry) : null;
+    const hasFacts = !!previous && !previous.nameOnly && !previous.adoptionFailed;
+    const stored = hasFacts ? await this.storedEntry(job.file) : undefined;
+    if (hasFacts && !stored) return;
     await this.publish({
-      ...(carried ?? {}),
+      ...(stored ? withoutOutdatedTitle(stored) : { complete: false, nameOnly: true }),
       decodedLength: undefined,
-      complete: false,
       file: job.file,
       pairKey: previous?.pairKey ?? compressedPairKey(job.file),
       ...compressedEntryVersions(),
@@ -642,15 +653,23 @@ export class CompressedBackfill {
       mtimeMs: job.stat.mtimeMs,
       unreadable: true,
       unreadableLaunch: this.options.launch,
-      ...(carried ? {} : { nameOnly: true }),
     });
+  }
+
+  // The worker holds no title or spend for an entry it did not derive, so the whole entry comes from the store.
+  private async storedEntry(file: string): Promise<CompressedFactEntry | undefined> {
+    const held = this.results.get(file);
+    if (held) return held;
+    return (await readCompressedStoreInSteps(this.options.facts.directory, this.statOf, this.yieldStep)).entries.get(
+      file,
+    );
   }
 
   // Each derivation is on disk before the next one starts.
   private async publish(next: CompressedFactEntry): Promise<void> {
     let previous: CompressedFactEntry | undefined = this.results.get(next.file) ?? this.options.known().get(next.file);
     // Only a marked derivation needs the stored spend record, so the worker holds no spend for the other entries.
-    if (next.undercount && !previous?.spend)
+    if (next.undercount && !next.unreadable && !previous?.spend)
       previous =
         (await readCompressedStoreInSteps(this.options.facts.directory, this.statOf, this.yieldStep)).entries.get(
           next.file,

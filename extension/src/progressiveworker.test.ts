@@ -9,6 +9,7 @@ import { tempDir } from './temproot.ts';
 import {
   compressedEntryBatches,
   compressedEntryVersions,
+  compressedEntrySeed,
   compressedPairKey,
   readCompressedStore,
   type CompressedEntrySeed,
@@ -17,7 +18,7 @@ import {
 } from './compressedstore.ts';
 import { CompressedBackfill, compressedFactsFromDerivation, RolloutDerivation } from './compressedbackfill.ts';
 import { streamCompressedRollout } from './compressedrollouts.ts';
-import { indexSpendFile, spendRecordTotal } from './projectspend.ts';
+import { compressedSpendDisplayFiles, indexSpendFile, spendRecordTotal } from './projectspend.ts';
 import * as path from 'node:path';
 import { buildSync } from 'esbuild';
 import { once } from 'node:events';
@@ -54,7 +55,7 @@ import {
   readCodexSessionTitlePair,
   type CodexSessionMeta,
 } from './codex';
-import { scanCodexDispatchReferences } from './codex';
+import { readRolloutStat, scanCodexDispatchReferences } from './codex';
 import { railCacheMarkOf, sessionParentIndex, agentRunAnswer } from './turnrail';
 import { logOf, toCard, turnCost } from './turncard';
 import { codexAgentSpendVersion, codexSpendIndex, type CodexSubagentFile } from './codex';
@@ -15629,6 +15630,104 @@ test.skipIf(!zstdCompress)('a new size or modification time restarts the retry c
     assert.equal(scheduled[0].at - harness.now(), 10_000, 'a new revision kept the old retry count');
   } finally {
     backfill.dispose();
+    fs.rmSync(pair.directory, { recursive: true, force: true });
+  }
+});
+
+// A facts store whose appends reach real segment lines, so a later launch reads what an earlier one wrote.
+function storeBackedFacts(directory: string) {
+  fs.mkdirSync(directory, { recursive: true });
+  let segment = 0;
+  const line = (entries: CompressedFactEntry[]) =>
+    fs.writeFileSync(
+      path.join(directory, `segment-1-holder-${segment++}`),
+      entries.map((entry) => `${JSON.stringify(entry)}\n`).join(''),
+    );
+  return {
+    line,
+    holder: {
+      directory,
+      append: async (entries: CompressedFactEntry[]) => {
+        line(entries);
+        return entries.map(() => true);
+      },
+      durable: async () => true,
+    } as unknown as CompressedStoreHolder,
+  };
+}
+
+test.skipIf(!zstdCompress)('a failed decode keeps a shown total and the row name through a restart', async () => {
+  const pair = compressedRolloutPair(undefined, 2);
+  const whole = fs.readFileSync(pair.compressed);
+  fs.writeFileSync(pair.compressed, whole.subarray(0, whole.length - 8));
+  const stat = readRolloutStat(pair.compressed)!;
+  const store = storeBackedFacts(path.join(pair.directory, 'facts'));
+  const spend = {
+    file: pair.compressed.replace(/\.zst$/, ''),
+    buckets: [],
+    lifetimeBuckets: [],
+    complete: true,
+  } as never;
+  const adopted: CompressedFactEntry = {
+    file: pair.compressed,
+    pairKey: compressedPairKey(pair.compressed),
+    ...compressedEntryVersions(),
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    threadId: COMPRESSED_THREAD,
+    adopted: true,
+    complete: true,
+    opening: compressedOpening,
+    spend,
+    title: { label: 'Shown name', fullLabel: 'Shown name in full', size: stat.size, mtimeMs: stat.mtimeMs } as never,
+  };
+  store.line([adopted]);
+  const shownTotal = (entry: CompressedFactEntry) =>
+    compressedSpendDisplayFiles(
+      [],
+      [
+        {
+          pairKey: entry.pairKey,
+          threadId: entry.threadId ?? null,
+          spend: entry.spend!,
+          complete: entry.complete === true,
+        },
+      ],
+      () => null,
+    );
+  const launchOnce = async (launch: string) => {
+    const harness = backfillHarness({ facts: store.holder, launch, exists: () => false });
+    harness.known.set(
+      pair.compressed,
+      compressedEntrySeed(readCompressedStore(store.holder.directory).entries.get(pair.compressed)!),
+    );
+    try {
+      harness.backfill.setNames([pair.compressed]);
+      await vi.waitFor(() => {
+        harness.advance(600_000);
+        assert.ok(
+          harness.batches.some((batch) => batch.entries[0].unreadableLaunch === launch),
+          'no unreadable entry',
+        );
+      });
+    } finally {
+      harness.backfill.dispose();
+    }
+    return harness.batches.at(-1)!.entries[0];
+  };
+  try {
+    const entry = await launchOnce('launch-1');
+    assert.equal(entry.unreadable, true);
+    assert.deepEqual(shownTotal(entry), [spend], 'a failed decode lowered the shown total');
+    assert.equal(entry.title?.label, 'Shown name', 'a failed decode blanked the row name');
+    assert.equal(entry.complete, true, 'the entry lost its complete mark');
+    assert.equal(entry.nameOnly, undefined, 'an entry with facts turned into a name-only record');
+    const stored = readCompressedStore(store.holder.directory).entries.get(pair.compressed)!;
+    assert.deepEqual(shownTotal(stored), [spend], 'the store lost the shown total');
+    const restarted = await launchOnce('launch-2');
+    assert.deepEqual(shownTotal(restarted), [spend], 'a restart lowered the shown total');
+    assert.equal(restarted.title?.label, 'Shown name', 'a restart blanked the row name');
+  } finally {
     fs.rmSync(pair.directory, { recursive: true, force: true });
   }
 });
