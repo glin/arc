@@ -338,6 +338,7 @@ import {
   instrumentStartup,
   pollStartup,
   liveDirectories,
+  compressedPending,
   holdUntil,
   holdReading,
   finishHold,
@@ -368,6 +369,7 @@ import {
   boundsOf,
   compareResults,
   marginsOf,
+  isReportOnly,
   measuresOf,
   markdownTable,
   missingMeasures,
@@ -10829,6 +10831,104 @@ test('the load of the stores waits for the first render and the pass, holds Proj
   assert.equal(requests.length, 1);
   assert.equal(provider.compressedFacts.get('a.jsonl.zst'), entry, 'the load dropped a batch');
   assert.equal(provider.projectSpendBusy(), false, 'Project cost stayed busy after the load');
+});
+
+function pendingStores(rootName: string) {
+  const home = tempDir(rootName);
+  const facts = path.join(home, 'cache', 'workspace', COMPRESSED_STORES.facts);
+  const openings = path.join(home, 'cache', COMPRESSED_STORES.openings);
+  fs.mkdirSync(facts, { recursive: true });
+  fs.mkdirSync(openings, { recursive: true });
+  return { home, facts, openings };
+}
+
+const pendingStat = { size: 7, mtimeMs: 7 };
+const pendingVersions = compressedEntryVersions();
+
+function writeSegment(directory: string, entries: object[]): void {
+  fs.writeFileSync(
+    path.join(directory, 'segment-1-holder-0'),
+    entries.map((entry) => `${JSON.stringify(entry)}\n`).join(''),
+  );
+}
+
+test('compressedPending counts each admitted file without a current decoded entry and each other name without a current opening', () => {
+  const { home, facts, openings } = pendingStores('pending-');
+  const entry = (file: string, fields: object) => ({
+    file,
+    pairKey: file,
+    ...pendingVersions,
+    size: pendingStat.size,
+    mtimeMs: pendingStat.mtimeMs,
+    ...fields,
+  });
+  writeSegment(facts, [
+    entry('done.zst', { decodedLength: 9 }),
+    entry('adopted.zst', { adopted: true }),
+    entry('unreadable.zst', { unreadable: true, nameOnly: true }),
+    entry('stale.zst', { decodedLength: 9, metadataGeneration: pendingVersions.metadataGeneration - 1 }),
+  ]);
+  writeSegment(openings, [entry('opened.zst', { opening: null })]);
+  const input = {
+    names: ['done.zst', 'adopted.zst', 'unreadable.zst', 'stale.zst', 'opened.zst', 'noopening.zst', 'twin.zst'],
+    admitted: new Set(['done.zst', 'adopted.zst', 'unreadable.zst', 'stale.zst']),
+    statOf: () => pendingStat,
+    exists: (file: string) => file === 'twin',
+  };
+  // adopted, unreadable and stale have no current decoded entry, and noopening has no opening.
+  assert.equal(compressedPending(home, input), 4);
+});
+
+test('a failed store read counts every name until the next reading', () => {
+  const { home, facts } = pendingStores('pending-failed-');
+  writeSegment(facts, [{ file: 'a.zst', pairKey: 'a', ...pendingVersions, size: 7, mtimeMs: 7, decodedLength: 9 }]);
+  const input = {
+    names: ['a.zst', 'b.zst'],
+    admitted: new Set(['a.zst', 'b.zst']),
+    statOf: () => pendingStat,
+    exists: () => false,
+  };
+  assert.equal(compressedPending(home, input), 1);
+  // A directory named like a segment answers listing but cannot be read as a file.
+  fs.mkdirSync(path.join(facts, 'segment-1-holder-9'));
+  assert.equal(compressedPending(home, input), 2, 'a failed read lowered the count');
+});
+
+test('warm-until compressedPending=0 holds until the backfill ends', async () => {
+  const readings = [3, 2, 0];
+  const samples: Array<Record<string, number>> = [];
+  let clock = 0;
+  const hold = await holdUntil({
+    conditions: [{ measure: 'compressedPending', value: 0 }],
+    launchedAt: 0,
+    minimumMs: 0,
+    now: () => clock,
+    wait: async (milliseconds) => {
+      clock += milliseconds;
+    },
+    sample: async () => {
+      const reading = { compressedPending: readings.shift() ?? 0 };
+      samples.push(reading);
+      return reading;
+    },
+  });
+  assert.equal(hold.reached, true);
+  assert.equal(hold.reads, 3, 'the hold ended before the count reached 0');
+  assert.deepEqual(
+    samples.map((sample) => sample.compressedPending),
+    [3, 2, 0],
+  );
+});
+
+test('compressedRows and compressedPending carry the count class and the backfill measures are report-only', () => {
+  const measures = measuresOf({
+    runner: { compressedPending: 2 },
+    soak: { end: { compressedRows: 5, backfillMs: 40, compressedLoadMs: 9 } },
+  });
+  assert.equal(measures.get('compressedPending')?.kind, 'count');
+  assert.equal(measures.get('compressedRows')?.kind, 'count');
+  assert.equal(measures.get('backfillMs')?.kind, 'time');
+  assert.ok(isReportOnly('backfillMs') && isReportOnly('compressedLoadMs'));
 });
 
 test('a stored entry keeps a row with a carried name across a version mismatch and its plain twin hides the row', () => {

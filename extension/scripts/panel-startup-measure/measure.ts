@@ -27,6 +27,12 @@ import {
   readRolloutStat,
 } from '../../src/codex.ts';
 import { isCompressedRollout, readCompressedFirstRecord } from '../../src/compressedrollouts.ts';
+import {
+  compressedEntryCurrent,
+  compressedPhysicalStat,
+  readCompressedStore,
+  type CompressedFactEntry,
+} from '../../src/compressedstore.ts';
 import { DIAGNOSTICS_LOG_DIRECTORY } from '../../src/diagnosticslog.ts';
 import type { StartupMilestone } from '../../src/performancediagnostics.ts';
 import { parseWorktreeRoots } from '../../src/repositoryscope.ts';
@@ -1472,12 +1478,62 @@ export function runnerMeasures(input: {
   home: string;
   tempBefore: ReadonlySet<string>;
   listTemp?: () => string[];
+  pending?: CompressedPendingInput;
 }): Record<string, number> {
   const after = compressedTempNames((input.listTemp ?? listTemp)());
   return {
     compressedStoreBytes: compressedStoreBytes(input.home),
     compressedTempEntries: [...after].filter((name) => !input.tempBefore.has(name)).length,
+    ...(input.pending ? { compressedPending: compressedPending(input.home, input.pending) } : {}),
   };
+}
+
+export interface CompressedPendingInput {
+  // Every compressed rollout of the fixture, as the walk names it in the run tree.
+  names: readonly string[];
+  // The names that `--count-compressed` admits, whose body the backfill decodes.
+  admitted: ReadonlySet<string>;
+  // The stat that the store compares its entries with. A test supplies a fake stat.
+  statOf?: typeof compressedPhysicalStat;
+  exists?: (file: string) => boolean;
+}
+
+// Count the names a measured launch still decodes. An admitted file counts without a current decoded entry in the
+// workspace store. Any other name counts without a `.jsonl` twin and without a current opening in the machine store,
+// because the launch reads its first record otherwise. A failed read of a store counts every name until the next read.
+export function compressedPending(home: string, input: CompressedPendingInput): number {
+  const cache = path.join(home, 'cache');
+  const statOf = input.statOf ?? compressedPhysicalStat;
+  const exists = input.exists ?? fs.existsSync;
+  let failed = false;
+  const onUnreadable = () => (failed = true);
+  const facts = new Map<string, CompressedFactEntry>();
+  let workspaces: fs.Dirent[] = [];
+  try {
+    workspaces = fs.readdirSync(cache, { withFileTypes: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') failed = true;
+  }
+  for (const workspace of workspaces) {
+    if (!workspace.isDirectory() || workspace.name === COMPRESSED_STORES.openings) continue;
+    const read = readCompressedStore(path.join(cache, workspace.name, COMPRESSED_STORES.facts), statOf, onUnreadable);
+    for (const [file, entry] of read.entries) facts.set(file, entry);
+  }
+  const openings = readCompressedStore(path.join(cache, COMPRESSED_STORES.openings), statOf, onUnreadable).entries;
+  if (failed) return input.names.length;
+  let pending = 0;
+  for (const file of input.names) {
+    if (exists(file.slice(0, -'.zst'.length))) continue;
+    const stat = statOf(file);
+    if (input.admitted.has(file)) {
+      const entry = facts.get(file);
+      if (!entry || entry.decodedLength === undefined || !compressedEntryCurrent(entry, stat)) pending++;
+    } else {
+      const entry = openings.get(file);
+      if (!entry || !compressedEntryCurrent(entry, stat)) pending++;
+    }
+  }
+  return pending;
 }
 
 // Count the compressed rollouts of a fixture that would list as session rows. The roots are those of `sessionCount`.
@@ -1488,8 +1544,18 @@ export async function countCompressed(input: {
   codex: string;
   rollouts: ReadonlyArray<{ file: string }>;
 }): Promise<number> {
+  return (await admittedCompressed(input)).keys.size;
+}
+
+// The files `--count-compressed` admits, and their distinct session keys.
+export async function admittedCompressed(input: {
+  workspace: string;
+  codex: string;
+  rollouts: ReadonlyArray<{ file: string }>;
+}): Promise<{ files: Set<string>; keys: Set<string> }> {
   const inFolders = folderMatcher(repositoryRoots(input.workspace));
   const keys = new Set<string>();
+  const files = new Set<string>();
   for (const entry of input.rollouts) {
     const file = path.join(input.codex, path.relative('codex', entry.file));
     const plain = file.slice(0, -'.zst'.length);
@@ -1497,9 +1563,26 @@ export async function countCompressed(input: {
     const meta = openingRecordOf(await readCompressedFirstRecord(file, CODEX_OPENING_BYTES));
     if (!meta || !codexRowAdmitted(meta, readRolloutStat(file), inFolders)) continue;
     const named = ROLLOUT_NAME.exec(path.basename(plain));
+    files.add(file);
     keys.add(meta.sessionId || (named ? named[1] : path.basename(plain, '.jsonl')));
   }
-  return keys.size;
+  return { files, keys };
+}
+
+// The input of `compressedPending` for this run. A hold that does not name that measure needs none.
+async function compressedPendingInput(
+  options: Options,
+  workspace: string,
+): Promise<CompressedPendingInput | undefined> {
+  if (!options.warmUntil.some((condition) => condition.measure === 'compressedPending')) return undefined;
+  const manifest = JSON.parse(fs.readFileSync(options.fixture, 'utf8')) as {
+    frozen?: { compressed?: { rollouts?: Array<{ file: string }> } };
+  };
+  const rollouts = manifest.frozen?.compressed?.rollouts ?? [];
+  const codex = soakRequested ? SOAK_CODEX : fixture.codex;
+  const names = rollouts.map((entry) => path.join(codex, path.relative('codex', entry.file)));
+  const { files } = await admittedCompressed({ workspace, codex, rollouts });
+  return { names, admitted: files };
 }
 
 // Wait for every startup milestone by the measurement deadline.
@@ -1546,12 +1629,13 @@ async function measure(commandLine: string, workspace: string, options: Options)
         if (!warm.complete) return { ...warm, complete: false, note: `The warm-up launch failed. ${warm.note ?? ''}` };
         if (options.warmUntil.length) {
           const failure = () => warmLaunch.failure;
+          const pending = await compressedPendingInput(options, workspace);
           const reading = await holdUntil({
             conditions: options.warmUntil,
             launchedAt: warmAt,
             sample: async (index) =>
               holdReading(await requestSnapshot(`warm-${String(index).padStart(3, '0')}`, 120_000), () =>
-                runnerMeasures({ home: ARC_STORE, tempBefore: warmTempBefore }),
+                runnerMeasures({ home: ARC_STORE, tempBefore: warmTempBefore, pending }),
               ),
             failure,
           });

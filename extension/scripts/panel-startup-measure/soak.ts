@@ -294,6 +294,8 @@ export const NAMED_COUNTERS = [
   'catalogWalks',
   'compressedDecodes',
   'compressedStoreWriteBytes',
+  'compressedLoadMs',
+  'backfillMs',
   'refreshCount:compressed-facts',
 ] as const;
 const WORK_COUNTERS: Readonly<Record<string, string>> = { catalogWalks: 'catalogWalk' };
