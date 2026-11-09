@@ -15732,6 +15732,97 @@ test.skipIf(!zstdCompress)('a failed decode keeps a shown total and the row name
   }
 });
 
+test.skipIf(!zstdCompress)('a saved unreadable entry takes one attempt on another launch', async () => {
+  const pair = compressedRolloutPair(undefined, 2);
+  const whole = fs.readFileSync(pair.compressed);
+  fs.writeFileSync(pair.compressed, whole.subarray(0, whole.length - 8));
+  const stat = readRolloutStat(pair.compressed)!;
+  let decodes = 0;
+  const harness = backfillHarness({
+    launch: 'launch-2',
+    exists: () => false,
+    stream: async (...args) => {
+      decodes++;
+      return streamCompressedRollout(...args);
+    },
+  });
+  harness.known.set(pair.compressed, {
+    file: pair.compressed,
+    pairKey: pair.compressed,
+    ...compressedEntryVersions(),
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    nameOnly: true,
+    unreadable: true,
+    unreadableLaunch: 'launch-1',
+    opening: compressedOpening,
+  });
+  try {
+    harness.backfill.setNames([pair.compressed]);
+    await vi.waitFor(() => {
+      harness.advance(0);
+      assert.equal(harness.batches.length, 1, 'the launch did not save its attempt');
+    });
+    assert.equal(decodes, 1, 'a saved unreadable entry decoded more than once');
+    assert.equal(harness.batches[0].entries[0].unreadableLaunch, 'launch-2');
+    assert.equal(harness.scheduled.length, 0, 'a saved unreadable entry scheduled a retry');
+  } finally {
+    harness.backfill.dispose();
+    fs.rmSync(pair.directory, { recursive: true, force: true });
+  }
+});
+
+test('the backfill waits for a saved unreadable mark before the next file', async () => {
+  const started: { file: string; released: boolean }[] = [];
+  let released = false;
+  let release: () => void = () => {};
+  const appended: CompressedFactEntry[] = [];
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  const harness = backfillHarness({
+    exists: () => false,
+    statOf: (file) => ({ ...unitStat, mtimeMs: file === 'unreadable.jsonl.zst' ? 9 : 2, isFile: true }),
+    facts: {
+      directory: tempDir('backfill-store-'),
+      append: async (entries: CompressedFactEntry[]) => {
+        appended.push(...entries);
+        await gate;
+        return entries.map(() => true);
+      },
+      durable: async () => true,
+    } as never,
+    stream: async (file) => {
+      started.push({ file, released });
+      return file === 'unreadable.jsonl.zst' ? ({ kind: 'failed' } as never) : unitDecoded();
+    },
+  });
+  seedBody(harness, 'next.jsonl.zst');
+  harness.known.set('unreadable.jsonl.zst', {
+    file: 'unreadable.jsonl.zst',
+    pairKey: 'unreadable.jsonl.zst',
+    ...compressedEntryVersions(),
+    size: unitStat.size,
+    mtimeMs: 9,
+    nameOnly: true,
+    unreadable: true,
+    unreadableLaunch: 'earlier',
+    opening: compressedOpening,
+  });
+  harness.backfill.setNames(['next.jsonl.zst', 'unreadable.jsonl.zst']);
+  await vi.waitFor(() => assert.equal(appended.length, 1, 'the unreadable mark did not reach the store'));
+  released = true;
+  release();
+  await vi.waitFor(() => assert.equal(started.length, 2, 'the next file did not start'));
+  assert.deepEqual(
+    started,
+    [
+      { file: 'unreadable.jsonl.zst', released: false },
+      { file: 'next.jsonl.zst', released: true },
+    ],
+    'the next file started before the unreadable mark was on disk',
+  );
+  harness.backfill.dispose();
+});
+
 const unitStat = { size: 10, mtimeMs: 2, dev: 1, ino: 1 };
 const unitDecoded = (hash = 'h') =>
   ({ kind: 'decoded', hash, stat: unitStat as never, frames: 1, complete: true }) as const;

@@ -609,18 +609,25 @@ export class CompressedBackfill {
       this.dirty = true;
       return;
     }
-    if (read.kind === 'decoded' || read.kind === 'failed') this.retryLater(job);
+    if (read.kind === 'decoded' || read.kind === 'failed') await this.retryLater(job);
   }
 
-  // A zstd error or a cut twin runs again after each delay. Then the entry saves `unreadable`, which another launch tries
-  // once. A new size or modification time restarts the count.
-  private retryLater(job: Job): void {
+  // A zstd error or a cut twin runs again after each delay. Then the entry saves `unreadable`, and another launch tries it
+  // once, because the stored mark holds the end of the count across launches. A new size or modification time restarts it.
+  private async retryLater(job: Job): Promise<void> {
     const held = this.retries.get(job.file);
     const same = held && held.size === job.stat.size && held.mtimeMs === job.stat.mtimeMs;
+    const stored = this.factsOf(job.file);
+    const saved = stored?.unreadable && stored.size === job.stat.size && stored.mtimeMs === job.stat.mtimeMs;
     const attempts = same ? held.attempts : 0;
-    if (attempts >= BACKFILL_RETRY_DELAYS_MS.length) {
-      this.retries.delete(job.file);
-      void this.publishUnreadable(job);
+    if (saved || attempts >= BACKFILL_RETRY_DELAYS_MS.length) {
+      this.retries.set(job.file, {
+        size: job.stat.size,
+        mtimeMs: job.stat.mtimeMs,
+        attempts: BACKFILL_RETRY_DELAYS_MS.length,
+        at: Infinity,
+      });
+      await this.publishUnreadable(job);
       return;
     }
     const delay = BACKFILL_RETRY_DELAYS_MS[attempts];
