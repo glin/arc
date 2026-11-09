@@ -1,5 +1,5 @@
 {
-  "margin": "Each row has an integer margin. A step fails when its count is above budget plus margin.",
+  "margin": "Each row has an integer margin. An integer counter must equal its budget within the margin. A byte counter fails only above budget plus margin.",
   "rows": {
     "automatic save | catalogWalk": {
       "reason": "A step walks the catalog only when no held catalog can serve it. A rise means a step lost catalog reuse.",
@@ -68,7 +68,7 @@
     },
     "automatic save | readBytes": {
       "reason": "Discovery reads each source once, and the receipt scan reads each receipt once. A rise means a step reads files again.",
-      "budget": 20199,
+      "budget": 20163,
       "margin": 256
     },
     "automatic save | receiptChecks": {
@@ -112,42 +112,42 @@
       "margin": 0
     },
     "child watcher event | catalogWalk": {
-      "reason": "Child watcher event runs 0 complete catalog walks.",
+      "reason": "A step walks the catalog only when no held catalog can serve it. A rise means a step lost catalog reuse.",
       "budget": 0,
       "margin": 0
     },
     "child watcher event | discoveryRequest:walked": {
-      "reason": "Child watcher event sends 1 discovery requests after it lists the catalog.",
+      "reason": "A discovery request follows a catalog walk, and a held catalog sends none. A rise means a step reopens the receipt scan.",
       "budget": 1,
       "margin": 0
     },
     "child watcher event | discoveryRequest:walked:transcript": {
-      "reason": "Child watcher event sends 1 discovery requests after it lists the catalog.",
+      "reason": "A discovery request follows a catalog walk, and a held catalog sends none. A rise means a step reopens the receipt scan.",
       "budget": 1,
       "margin": 0
     },
     "child watcher event | dispatchSpendVisits": {
-      "reason": "Child watcher event visits 6 dispatched roots for spend.",
+      "reason": "A spend pass visits each dispatched root once and skips a settled root. A rise means a step visits settled roots.",
       "budget": 6,
       "margin": 0
     },
     "child watcher event | openingsRead:children": {
-      "reason": "Child watcher event opens 0 child transcripts in the child census.",
+      "reason": "A walk reads a child head only when the saved row cannot answer it. A rise means the child census reads every child again.",
       "budget": 0,
       "margin": 0
     },
     "child watcher event | openingsRead:codex": {
-      "reason": "Child watcher event opens 0 rollouts for their openings. The cold opening pass answers the rest.",
+      "reason": "The opening cache answers Codex rollouts after the first read. A rise means the cache stopped serving rollout openings.",
       "budget": 0,
       "margin": 0
     },
     "child watcher event | openingsRead:collisions": {
-      "reason": "Child watcher event reads 0 qualified openings of colliding sources.",
+      "reason": "Only a session that shares its ID with another source takes the qualified read. A rise means the collision check reads more sources.",
       "budget": 0,
       "margin": 0
     },
     "child watcher event | openingsRead:parents": {
-      "reason": "Child watcher event opens 0 parent transcripts for their working directories.",
+      "reason": "A new worker reads each parent opening once, and later steps answer from held state. A rise means a step reads parent openings again.",
       "budget": 0,
       "margin": 0
     },
@@ -172,8 +172,8 @@
       "margin": 0
     },
     "child watcher event | readBytes": {
-      "reason": "Child watcher event reads 18511 bytes through discovery. The margin covers the temporary path length and the file identity numbers in dispatch receipts.",
-      "budget": 21448,
+      "reason": "Discovery reads each source once, and the receipt scan reads each receipt once. A rise means a step reads files again.",
+      "budget": 21412,
       "margin": 256
     },
     "child watcher event | receiptChecks": {
@@ -192,12 +192,12 @@
       "margin": 0
     },
     "child watcher event | receiptScanOpensAfterCompletion": {
-      "reason": "Child watcher event opens 1 receipt scans after a complete reply.",
+      "reason": "A completed pass closes its receipt scan and a spend-only pass opens none. A rise means a completion reopens a full receipt scan.",
       "budget": 1,
       "margin": 0
     },
     "child watcher event | refreshCount:catalog-enumeration": {
-      "reason": "Child watcher event records this enumeration part 1 times.",
+      "reason": "Each refresh that lists sessions runs one enumeration. A rise means a step runs extra catalog refreshes.",
       "budget": 2,
       "margin": 0
     },
@@ -207,7 +207,7 @@
       "margin": 0
     },
     "child watcher event | renderPost:transcript": {
-      "reason": "Child watcher event posts 1 renders for this reason.",
+      "reason": "A refresh renders the session list when its inputs changed. A rise means a step redraws without new facts.",
       "budget": 1,
       "margin": 0
     },
@@ -217,27 +217,27 @@
       "margin": 0
     },
     "child watcher event | watcher:grownMemberMiss:notMember": {
-      "reason": "Child watcher event keeps 1 watcher wakes off the grown member route.",
+      "reason": "A watcher wake leaves the grown member route only for this gate. A rise means members fail the route more often.",
       "budget": 1,
       "margin": 0
     },
     "cold start | cachedLinks:refused:missing": {
-      "reason": "Cold start waits for the discovery reply 1 times for this refusal.",
+      "reason": "Only the first catalog of an activation uses the saved links. A change means a start lost or changed saved link reuse.",
       "budget": 1,
       "margin": 0
     },
     "cold start | catalogWalk": {
-      "reason": "Cold start runs 1 complete catalog walks.",
+      "reason": "A step walks the catalog only when no held catalog can serve it. A rise means a step lost catalog reuse.",
       "budget": 1,
       "margin": 0
     },
     "cold start | discoveryRequest:walked": {
-      "reason": "Cold start sends 1 discovery requests after it lists the catalog.",
+      "reason": "A discovery request follows a catalog walk, and a held catalog sends none. A rise means a step reopens the receipt scan.",
       "budget": 1,
       "margin": 0
     },
     "cold start | discoveryRequest:walked:shell-ready": {
-      "reason": "Cold start sends 1 discovery requests after it lists the catalog.",
+      "reason": "A discovery request follows a catalog walk, and a held catalog sends none. A rise means a step reopens the receipt scan.",
       "budget": 1,
       "margin": 0
     },
@@ -257,37 +257,37 @@
       "margin": 0
     },
     "cold start | dispatchSpendVisits": {
-      "reason": "Cold start visits 6 dispatched roots for spend.",
+      "reason": "A spend pass visits each dispatched root once and skips a settled root. A rise means a step visits settled roots.",
       "budget": 6,
       "margin": 0
     },
     "cold start | humanPromptStat:unscanned": {
-      "reason": "Cold start checks 300 files for prompt admission for this cause.",
+      "reason": "A prompt scan saved in the derived cache answers later starts. A rise means prompt scans stopped reaching the saved cache.",
       "budget": 300,
       "margin": 0
     },
     "cold start | humanPromptStat:walk": {
-      "reason": "Cold start checks 2 files for prompt admission for this cause.",
+      "reason": "Prompt admission checks a file only for this cause. A rise means settled sessions take file checks again.",
       "budget": 2,
       "margin": 0
     },
     "cold start | openingsRead:children": {
-      "reason": "Cold start opens 60 child transcripts in the child census.",
+      "reason": "A walk reads a child head only when the saved row cannot answer it. A rise means the child census reads every child again.",
       "budget": 60,
       "margin": 0
     },
     "cold start | openingsRead:codex": {
-      "reason": "Cold start opens 0 rollouts for their openings. The cold opening pass answers the rest.",
+      "reason": "The opening cache answers Codex rollouts after the first read. A rise means the cache stopped serving rollout openings.",
       "budget": 0,
       "margin": 0
     },
     "cold start | openingsRead:collisions": {
-      "reason": "Cold start reads 0 qualified openings of colliding sources.",
+      "reason": "Only a session that shares its ID with another source takes the qualified read. A rise means the collision check reads more sources.",
       "budget": 0,
       "margin": 0
     },
     "cold start | openingsRead:parents": {
-      "reason": "Cold start opens 150 parent transcripts for their working directories.",
+      "reason": "A new worker reads each parent opening once, and later steps answer from held state. A rise means a step reads parent openings again.",
       "budget": 150,
       "margin": 0
     },
@@ -322,8 +322,8 @@
       "margin": 0
     },
     "cold start | readBytes": {
-      "reason": "Cold start reads 392568 bytes through discovery. The margin covers the temporary path length and the file identity numbers in dispatch receipts.",
-      "budget": 411213,
+      "reason": "Discovery reads each source once, and the receipt scan reads each receipt once. A rise means a step reads files again.",
+      "budget": 411177,
       "margin": 256
     },
     "cold start | receiptChecks": {
@@ -342,17 +342,17 @@
       "margin": 0
     },
     "cold start | receiptScanOpensAfterCompletion": {
-      "reason": "Cold start opens 0 receipt scans after a complete reply.",
+      "reason": "A completed pass closes its receipt scan and a spend-only pass opens none. A rise means a completion reopens a full receipt scan.",
       "budget": 0,
       "margin": 0
     },
     "cold start | refreshCount:catalog-enumeration": {
-      "reason": "Cold start records this enumeration part 3 times.",
+      "reason": "Each refresh that lists sessions runs one enumeration. A rise means a step runs extra catalog refreshes.",
       "budget": 3,
       "margin": 0
     },
     "cold start | renderPost:dispatch-discovery": {
-      "reason": "Cold start posts 1 renders for this reason.",
+      "reason": "A refresh renders the session list when its inputs changed. A rise means a step redraws without new facts.",
       "budget": 1,
       "margin": 0
     },
@@ -362,7 +362,7 @@
       "margin": 0
     },
     "cold start | walk:requested:shell-ready": {
-      "reason": "Cold start lists the catalog 1 times for this cause.",
+      "reason": "A walk runs only for a refresh that asks to list the catalog again. A rise means a caller stopped reusing the held catalog.",
       "budget": 1,
       "margin": 0
     },
@@ -433,7 +433,7 @@
     },
     "collision walk | readBytes": {
       "reason": "Discovery reads each source once, and the receipt scan reads each receipt once. A rise means a step reads files again.",
-      "budget": 41317,
+      "budget": 41245,
       "margin": 256
     },
     "collision walk | receiptChecks": {
@@ -482,12 +482,12 @@
       "margin": 0
     },
     "completion | catalogWalk": {
-      "reason": "Completion runs 0 complete catalog walks.",
+      "reason": "A step walks the catalog only when no held catalog can serve it. A rise means a step lost catalog reuse.",
       "budget": 0,
       "margin": 0
     },
     "completion | discoveryRequest:dispatchSpend": {
-      "reason": "Completion sends 1 spend-only requests for a dispatched file that moved.",
+      "reason": "The refresh asks discovery for one pass for this cause. A rise means a step asks for extra discovery passes.",
       "budget": 2,
       "margin": 0
     },
@@ -507,27 +507,27 @@
       "margin": 0
     },
     "completion | dispatchSpendVisits": {
-      "reason": "Completion visits 1 dispatched roots for spend.",
+      "reason": "A spend pass visits each dispatched root once and skips a settled root. A rise means a step visits settled roots.",
       "budget": 1,
       "margin": 0
     },
     "completion | openingsRead:children": {
-      "reason": "Completion opens 0 child transcripts in the child census.",
+      "reason": "A walk reads a child head only when the saved row cannot answer it. A rise means the child census reads every child again.",
       "budget": 0,
       "margin": 0
     },
     "completion | openingsRead:codex": {
-      "reason": "Completion opens 0 rollouts for their openings. The cold opening pass answers the rest.",
+      "reason": "The opening cache answers Codex rollouts after the first read. A rise means the cache stopped serving rollout openings.",
       "budget": 0,
       "margin": 0
     },
     "completion | openingsRead:collisions": {
-      "reason": "Completion reads 0 qualified openings of colliding sources.",
+      "reason": "Only a session that shares its ID with another source takes the qualified read. A rise means the collision check reads more sources.",
       "budget": 0,
       "margin": 0
     },
     "completion | openingsRead:parents": {
-      "reason": "Completion opens 0 parent transcripts for their working directories.",
+      "reason": "A new worker reads each parent opening once, and later steps answer from held state. A rise means a step reads parent openings again.",
       "budget": 0,
       "margin": 0
     },
@@ -547,22 +547,22 @@
       "margin": 0
     },
     "completion | readBytes": {
-      "reason": "Completion reads 0 bytes through discovery. The margin covers the temporary path length and the file identity numbers in dispatch receipts.",
+      "reason": "Discovery reads each source once, and the receipt scan reads each receipt once. A rise means a step reads files again.",
       "budget": 0,
       "margin": 0
     },
     "completion | receiptScanOpensAfterCompletion": {
-      "reason": "Completion opens 0 receipt scans after a complete reply.",
+      "reason": "A completed pass closes its receipt scan and a spend-only pass opens none. A rise means a completion reopens a full receipt scan.",
       "budget": 0,
       "margin": 0
     },
     "completion | refreshCount:catalog-enumeration": {
-      "reason": "Completion records this enumeration part 2 times.",
+      "reason": "Each refresh that lists sessions runs one enumeration. A rise means a step runs extra catalog refreshes.",
       "budget": 3,
       "margin": 0
     },
     "completion | renderPost:dispatch-discovery": {
-      "reason": "Completion posts 1 renders for this reason.",
+      "reason": "A refresh renders the session list when its inputs changed. A rise means a step redraws without new facts.",
       "budget": 1,
       "margin": 0
     },
@@ -572,7 +572,7 @@
       "margin": 0
     },
     "completion | renderPost:transcript": {
-      "reason": "Completion posts 1 renders for this reason.",
+      "reason": "A refresh renders the session list when its inputs changed. A rise means a step redraws without new facts.",
       "budget": 1,
       "margin": 0
     },
@@ -657,42 +657,42 @@
       "margin": 0
     },
     "poll and backstop walk | catalogWalk": {
-      "reason": "Poll and backstop walk runs 1 complete catalog walks.",
+      "reason": "A step walks the catalog only when no held catalog can serve it. A rise means a step lost catalog reuse.",
       "budget": 1,
       "margin": 0
     },
     "poll and backstop walk | discoveryRequest:walked": {
-      "reason": "Poll and backstop walk sends 1 discovery requests after it lists the catalog.",
+      "reason": "A discovery request follows a catalog walk, and a held catalog sends none. A rise means a step reopens the receipt scan.",
       "budget": 1,
       "margin": 0
     },
     "poll and backstop walk | discoveryRequest:walked:poll:backstop": {
-      "reason": "Poll and backstop walk sends 1 discovery requests after it lists the catalog.",
+      "reason": "A discovery request follows a catalog walk, and a held catalog sends none. A rise means a step reopens the receipt scan.",
       "budget": 1,
       "margin": 0
     },
     "poll and backstop walk | dispatchSpendVisits": {
-      "reason": "Poll and backstop walk visits 6 dispatched roots for spend.",
+      "reason": "A spend pass visits each dispatched root once and skips a settled root. A rise means a step visits settled roots.",
       "budget": 6,
       "margin": 0
     },
     "poll and backstop walk | openingsRead:children": {
-      "reason": "Poll and backstop walk opens 1 child transcripts in the child census.",
+      "reason": "A walk reads a child head only when the saved row cannot answer it. A rise means the child census reads every child again.",
       "budget": 1,
       "margin": 0
     },
     "poll and backstop walk | openingsRead:codex": {
-      "reason": "Poll and backstop walk opens 0 rollouts for their openings. The cold opening pass answers the rest.",
+      "reason": "The opening cache answers Codex rollouts after the first read. A rise means the cache stopped serving rollout openings.",
       "budget": 0,
       "margin": 0
     },
     "poll and backstop walk | openingsRead:collisions": {
-      "reason": "Poll and backstop walk reads 6 qualified openings of colliding sources.",
+      "reason": "Only a session that shares its ID with another source takes the qualified read. A rise means the collision check reads more sources.",
       "budget": 0,
       "margin": 0
     },
     "poll and backstop walk | openingsRead:parents": {
-      "reason": "Poll and backstop walk opens 0 parent transcripts for their working directories.",
+      "reason": "A new worker reads each parent opening once, and later steps answer from held state. A rise means a step reads parent openings again.",
       "budget": 0,
       "margin": 0
     },
@@ -707,8 +707,8 @@
       "margin": 0
     },
     "poll and backstop walk | readBytes": {
-      "reason": "Poll and backstop walk reads 16105 bytes through discovery. The margin covers the temporary path length and the file identity numbers in dispatch receipts.",
-      "budget": 18910,
+      "reason": "Discovery reads each source once, and the receipt scan reads each receipt once. A rise means a step reads files again.",
+      "budget": 18874,
       "margin": 256
     },
     "poll and backstop walk | receiptChecks": {
@@ -727,12 +727,12 @@
       "margin": 0
     },
     "poll and backstop walk | receiptScanOpensAfterCompletion": {
-      "reason": "Poll and backstop walk opens 1 receipt scans after a complete reply.",
+      "reason": "A completed pass closes its receipt scan and a spend-only pass opens none. A rise means a completion reopens a full receipt scan.",
       "budget": 1,
       "margin": 0
     },
     "poll and backstop walk | refreshCount:catalog-enumeration": {
-      "reason": "Poll and backstop walk records this enumeration part 2 times.",
+      "reason": "Each refresh that lists sessions runs one enumeration. A rise means a step runs extra catalog refreshes.",
       "budget": 2,
       "margin": 0
     },
@@ -742,7 +742,7 @@
       "margin": 0
     },
     "poll and backstop walk | walk:requested:poll:backstop": {
-      "reason": "Poll and backstop walk lists the catalog 1 times for this cause.",
+      "reason": "A walk runs only for a refresh that asks to list the catalog again. A rise means a caller stopped reusing the held catalog.",
       "budget": 1,
       "margin": 0
     },
@@ -827,42 +827,42 @@
       "margin": 0
     },
     "selection switch | catalogWalk": {
-      "reason": "Selection switch runs 0 complete catalog walks.",
+      "reason": "A step walks the catalog only when no held catalog can serve it. A rise means a step lost catalog reuse.",
       "budget": 0,
       "margin": 0
     },
     "selection switch | discoveryRequest:walked": {
-      "reason": "Counter discoveryRequest:walked in step selection switch.",
+      "reason": "A discovery request follows a catalog walk, and a held catalog sends none. A rise means a step reopens the receipt scan.",
       "budget": 0,
       "margin": 0
     },
     "selection switch | dispatchSpendVisits": {
-      "reason": "Selection switch visits 0 dispatched roots for spend.",
+      "reason": "A spend pass visits each dispatched root once and skips a settled root. A rise means a step visits settled roots.",
       "budget": 0,
       "margin": 0
     },
     "selection switch | humanPromptStat:walk": {
-      "reason": "Selection switch checks 8 files for prompt admission for this cause.",
+      "reason": "Prompt admission checks a file only for this cause. A rise means settled sessions take file checks again.",
       "budget": 4,
       "margin": 0
     },
     "selection switch | openingsRead:children": {
-      "reason": "Selection switch opens 0 child transcripts in the child census.",
+      "reason": "A walk reads a child head only when the saved row cannot answer it. A rise means the child census reads every child again.",
       "budget": 0,
       "margin": 0
     },
     "selection switch | openingsRead:codex": {
-      "reason": "Selection switch opens 0 rollouts for their openings. The cold opening pass answers the rest.",
+      "reason": "The opening cache answers Codex rollouts after the first read. A rise means the cache stopped serving rollout openings.",
       "budget": 0,
       "margin": 0
     },
     "selection switch | openingsRead:collisions": {
-      "reason": "Selection switch reads 0 qualified openings of colliding sources.",
+      "reason": "Only a session that shares its ID with another source takes the qualified read. A rise means the collision check reads more sources.",
       "budget": 0,
       "margin": 0
     },
     "selection switch | openingsRead:parents": {
-      "reason": "Selection switch opens 0 parent transcripts for their working directories.",
+      "reason": "A new worker reads each parent opening once, and later steps answer from held state. A rise means a step reads parent openings again.",
       "budget": 0,
       "margin": 0
     },
@@ -877,17 +877,17 @@
       "margin": 0
     },
     "selection switch | readBytes": {
-      "reason": "Selection switch reads 0 bytes through discovery. The margin covers the temporary path length and the file identity numbers in dispatch receipts.",
+      "reason": "Discovery reads each source once, and the receipt scan reads each receipt once. A rise means a step reads files again.",
       "budget": 0,
       "margin": 0
     },
     "selection switch | receiptScanOpensAfterCompletion": {
-      "reason": "Selection switch opens 0 receipt scans after a complete reply.",
+      "reason": "A completed pass closes its receipt scan and a spend-only pass opens none. A rise means a completion reopens a full receipt scan.",
       "budget": 0,
       "margin": 0
     },
     "selection switch | refreshCount:catalog-enumeration": {
-      "reason": "Selection switch records this enumeration part 2 times.",
+      "reason": "Each refresh that lists sessions runs one enumeration. A rise means a step runs extra catalog refreshes.",
       "budget": 2,
       "margin": 0
     },
@@ -972,12 +972,12 @@
       "margin": 0
     },
     "warm start | cachedLinks:published": {
-      "reason": "Warm start publishes 1 first catalog from saved links.",
+      "reason": "Only the first catalog of an activation uses the saved links. A change means a start lost or changed saved link reuse.",
       "budget": 1,
       "margin": 0
     },
     "warm start | catalogWalk": {
-      "reason": "Warm start runs 1 complete catalog walks.",
+      "reason": "A step walks the catalog only when no held catalog can serve it. A rise means a step lost catalog reuse.",
       "budget": 1,
       "margin": 0
     },
@@ -1002,7 +1002,7 @@
       "margin": 0
     },
     "warm start | dispatchSpendVisits": {
-      "reason": "Warm start visits 6 dispatched roots for spend.",
+      "reason": "A spend pass visits each dispatched root once and skips a settled root. A rise means a step visits settled roots.",
       "budget": 6,
       "margin": 0
     },
@@ -1012,22 +1012,22 @@
       "margin": 0
     },
     "warm start | openingsRead:children": {
-      "reason": "Warm start opens 60 child transcripts in the child census.",
+      "reason": "A walk reads a child head only when the saved row cannot answer it. A rise means the child census reads every child again.",
       "budget": 60,
       "margin": 0
     },
     "warm start | openingsRead:codex": {
-      "reason": "Warm start opens 0 rollouts for their openings. The cold opening pass answers the rest.",
+      "reason": "The opening cache answers Codex rollouts after the first read. A rise means the cache stopped serving rollout openings.",
       "budget": 0,
       "margin": 0
     },
     "warm start | openingsRead:collisions": {
-      "reason": "Warm start reads 0 qualified openings of colliding sources.",
+      "reason": "Only a session that shares its ID with another source takes the qualified read. A rise means the collision check reads more sources.",
       "budget": 0,
       "margin": 0
     },
     "warm start | openingsRead:parents": {
-      "reason": "Warm start opens 150 parent transcripts for their working directories.",
+      "reason": "A new worker reads each parent opening once, and later steps answer from held state. A rise means a step reads parent openings again.",
       "budget": 150,
       "margin": 0
     },
@@ -1067,8 +1067,8 @@
       "margin": 0
     },
     "warm start | readBytes": {
-      "reason": "Warm start reads 16105 bytes through discovery. The margin covers the temporary path length and the file identity numbers in dispatch receipts.",
-      "budget": 18910,
+      "reason": "Discovery reads each source once, and the receipt scan reads each receipt once. A rise means a step reads files again.",
+      "budget": 18874,
       "margin": 256
     },
     "warm start | receiptChecks": {
@@ -1087,12 +1087,12 @@
       "margin": 0
     },
     "warm start | receiptScanOpensAfterCompletion": {
-      "reason": "Warm start opens 0 receipt scans after a complete reply.",
+      "reason": "A completed pass closes its receipt scan and a spend-only pass opens none. A rise means a completion reopens a full receipt scan.",
       "budget": 0,
       "margin": 0
     },
     "warm start | refreshCount:catalog-enumeration": {
-      "reason": "Warm start records this enumeration part 3 times.",
+      "reason": "Each refresh that lists sessions runs one enumeration. A rise means a step runs extra catalog refreshes.",
       "budget": 3,
       "margin": 0
     },
@@ -1102,7 +1102,7 @@
       "margin": 0
     },
     "warm start | renderPost:shell-ready": {
-      "reason": "Warm start posts 1 renders for this reason.",
+      "reason": "A refresh renders the session list when its inputs changed. A rise means a step redraws without new facts.",
       "budget": 1,
       "margin": 0
     },
@@ -1112,7 +1112,7 @@
       "margin": 0
     },
     "warm start | walk:requested:shell-ready": {
-      "reason": "Warm start lists the catalog 1 times for this cause.",
+      "reason": "A walk runs only for a refresh that asks to list the catalog again. A rise means a caller stopped reusing the held catalog.",
       "budget": 1,
       "margin": 0
     }

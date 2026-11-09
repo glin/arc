@@ -143,7 +143,7 @@ function outsideBudget(measured: Record<string, Counts>, rows: Record<string, Bu
     const [step, counter] = key.split(' | ');
     if (measured[step]?.[counter] !== undefined || (budget.budget === 0 && reported.has(counter))) continue;
     failures.push(
-      `Step "${step}", counter ${counter}: not measured, recorded budget ${budget.budget}. The step or the counter was renamed or removed. Rename the row in scripts/test-budget.json with the code, or find the cause.`,
+      `Step "${step}", counter ${counter}: not measured, recorded budget ${budget.budget}. The step or the counter was renamed or removed. If the change is intended, rename the row in scripts/test-budget.json. If the change is not intended, find the cause.`,
     );
   }
   for (const [step, row] of Object.entries(measured)) {
@@ -152,7 +152,7 @@ function outsideBudget(measured: Record<string, Counts>, rows: Record<string, Bu
       if (!budget) {
         if (count !== 0)
           failures.push(
-            `Step "${step}", counter ${counter}: measured ${count}, with no budget row. If the work is intended, add a row to scripts/test-budget.json with a reason.`,
+            `Step "${step}", counter ${counter}: measured ${count}, with no budget row. If the work is intended, add a row to scripts/test-budget.json with a reason. If the work is not intended, find the cause.`,
           );
         continue;
       }
@@ -160,7 +160,7 @@ function outsideBudget(measured: Record<string, Counts>, rows: Record<string, Bu
       const low = !ONE_SIDED.has(counter) && count < budget.budget - budget.margin;
       if (high || low)
         failures.push(
-          `Step "${step}", counter ${counter}: measured ${count}, recorded budget ${budget.budget} with margin ${budget.margin}. The count ${high ? 'rose' : 'fell'}. If the change is intended, ${high ? 'raise' : 'lower'} the row in scripts/test-budget.json with a reason.`,
+          `Step "${step}", counter ${counter}: measured ${count}, recorded budget ${budget.budget} with margin ${budget.margin}. The count ${high ? 'rose' : 'fell'}. The row says: ${budget.reason} If the change is intended, ${high ? 'raise' : 'lower'} the row in scripts/test-budget.json with a reason. If the change is not intended, find the cause.`,
         );
     }
   }

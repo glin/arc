@@ -207,9 +207,35 @@ Run it from `extension`. It builds a session list of `rows` sessions with `runni
 
 ### Count budget test
 
-`extension/src/startup.budget.test.ts` drives a real panel host and a real progressive worker through a fixed script of events on a generated workspace. `budgetWorkspace` in `extension/src/budgetworkspace.ts` writes the workspace from a fixed seed under a temporary directory: Claude parents under three project folders, child transcripts, Codex rollouts, session collisions and dispatch receipts. The script runs a cold start, a warm start from the saved derived cache and links, a completion of a dispatched rollout, a watcher event on one child file, a selection switch, and a poll followed by a backstop walk. The test does not run the metadata and session list enrichment passes, so their reads do not count.
+`extension/src/startup.budget.test.ts` drives a real panel host and a real progressive worker through a fixed script of events on a generated workspace. `budgetWorkspace` in `extension/src/budgetworkspace.ts` writes the workspace from a fixed seed under a temporary directory. The workspace holds Claude parents under three project folders, child transcripts, Codex rollouts and dispatch receipts.
 
-After each step the test reads the performance counters and compares the counts with `scripts/test-budget.json`. A row key joins the step name and the counter name. Each row has a `reason`, a `budget` and a `margin`. The margin is an integer count. A step fails when a count is above budget plus margin, or when a counter has no row. The message names the step, the counter, the recorded budget and the measured count. If a change is intended, update the row and its reason. A `readBytes` row has a margin because the temporary path length and the identity numbers in the receipts change the bytes of a run. The test measures no duration. Vitest timeouts cap its setup and its test body at five seconds each.
+The script runs these steps in order:
+
+- `cold start`: the first activation on an empty cache. The test stubs its metadata and session list enrichment passes, so their reads do not count.
+- `automatic save`: an unrelated child grows and settles, and the host's own checkpoint timer writes the derived cache. The test skips the shutdown save, so the next activation reads only what the timer saved.
+- `warm start`: a second activation on that cache. The real metadata and enrichment passes run from here on.
+- `completion`: a dispatched rollout gains a final reply.
+- `child watcher event`: one child transcript grows.
+- `selection switch`: the panel selects another session.
+- `session list update`: the panel changes the session list filters.
+- `repeated record coverage`: a parent file gains repeated-record coverage.
+- `enrichment stale file`: the enrichment pass reports a stale file once.
+- `poll and backstop walk`: one poll, then the backstop walk.
+- `collision walk`: rollouts that share a session ID with Claude parents appear. Two walks then read their qualified openings. The collisions arrive last, because two rows of one session ID make every post a snapshot.
+
+The test also counts each posted render, session list and selection message. It records whether the message is a snapshot or a delta, and the rows that it carries.
+
+The script has no parent reorder inside an open discovery epoch. A frozen worker clock finishes each discovery request in one reply, so no second request joins an open epoch. `extension/src/progressiveworker.test.ts` covers that comparison.
+
+After each step the test compares the performance counters with `scripts/test-budget.json`. A row key joins the step name and the counter name. Each row has a `reason`, a `budget` and an integer `margin`.
+
+An integer counter must equal its budget within the margin on both sides. The byte counters `readBytes` and `dispatchSpendBytes` fail only above budget plus margin, because Windows paths take more bytes in JSON than Linux paths. A counter that is nonzero with no row fails. A row that no step measures fails with its own message. A counter that one step does not report reads 0 there, so a row of 0 needs another step that reports the counter.
+
+The test pads the temporary root to one length, so path bytes do not change from machine to machine. A `readBytes` row that expects bytes keeps a small margin, because the receipt store records native device and file numbers. A row that expects no bytes has a margin of 0.
+
+The failure message names the step, the counter, the recorded budget, the measured count and the reason of the row. The message tells the reader to update the row if the change is intended, and to find the cause if the change is not intended.
+
+The test measures no duration. The default test timeout catches only a hang.
 
 ## Diagnostic implementation
 
