@@ -43198,6 +43198,11 @@ test('mixed ambiguous identity and invalid cost queries retain visible numeric c
   assert.equal(note(query, context, sessionQueryError, costNote, sessionIdentityNote), costNote(query));
 });
 
+test('a session reader takes the saved Codex opening with no stat and no read', () => {
+  assert.doesNotMatch(panelHostSource, /opening:.*codexMetas\.get\(/, 'a session reader can read an opening uncounted');
+  assert.equal(panelHostSource.match(/codexMetas\.savedOpening\((?:session|active)\.file\)/g)?.length, 3);
+});
+
 async function coverageEnumerationFixture() {
   const { CodexMetaCache, CodexStatCache } = await import('./codex.js');
   const root = tempDir('coverage-enumeration-');
