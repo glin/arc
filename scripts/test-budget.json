@@ -101,11 +101,6 @@
       "budget": 1,
       "margin": 0
     },
-    "automatic save | unsettledParentChanges": {
-      "reason": "A held pass lists one parent set however a listing orders it. A rise means reordered parents reopen discovery.",
-      "budget": 0,
-      "margin": 0
-    },
     "automatic save | watcher:grownMemberMiss:notMember": {
       "reason": "A watcher wake leaves the grown member route only for this gate. A rise means members fail the route more often.",
       "budget": 1,
@@ -209,11 +204,6 @@
     "child watcher event | renderPost:transcript": {
       "reason": "A refresh renders the session list when its inputs changed. A rise means a step redraws without new facts.",
       "budget": 1,
-      "margin": 0
-    },
-    "child watcher event | unsettledParentChanges": {
-      "reason": "A held pass lists one parent set however a listing orders it. A rise means reordered parents reopen discovery.",
-      "budget": 0,
       "margin": 0
     },
     "child watcher event | watcher:grownMemberMiss:notMember": {
@@ -356,11 +346,6 @@
       "budget": 1,
       "margin": 0
     },
-    "cold start | unsettledParentChanges": {
-      "reason": "A held pass lists one parent set however a listing orders it. A rise means reordered parents reopen discovery.",
-      "budget": 0,
-      "margin": 0
-    },
     "cold start | walk:requested:shell-ready": {
       "reason": "A walk runs only for a refresh that asks to list the catalog again. A rise means a caller stopped reusing the held catalog.",
       "budget": 1,
@@ -471,11 +456,6 @@
       "budget": 1,
       "margin": 0
     },
-    "collision walk | unsettledParentChanges": {
-      "reason": "A held pass lists one parent set however a listing orders it. A rise means reordered parents reopen discovery.",
-      "budget": 0,
-      "margin": 0
-    },
     "collision walk | walk:requested:poll:directory": {
       "reason": "A walk runs only for a refresh that asks to list the catalog again. A rise means a caller stopped reusing the held catalog.",
       "budget": 2,
@@ -576,11 +556,6 @@
       "budget": 1,
       "margin": 0
     },
-    "completion | unsettledParentChanges": {
-      "reason": "A held pass lists one parent set however a listing orders it. A rise means reordered parents reopen discovery.",
-      "budget": 0,
-      "margin": 0
-    },
     "completion | watcher:grownMembers": {
       "reason": "A growing dispatched member takes the spend-only route. A fall means a completion lost that route and started full passes.",
       "budget": 1,
@@ -649,11 +624,6 @@
     "enrichment stale file | renderPost:enrichment": {
       "reason": "A refresh renders the session list when its inputs changed. A rise means a step redraws without new facts.",
       "budget": 2,
-      "margin": 0
-    },
-    "enrichment stale file | unsettledParentChanges": {
-      "reason": "A held pass lists one parent set however a listing orders it. A rise means reordered parents reopen discovery.",
-      "budget": 0,
       "margin": 0
     },
     "poll and backstop walk | catalogWalk": {
@@ -736,11 +706,6 @@
       "budget": 2,
       "margin": 0
     },
-    "poll and backstop walk | unsettledParentChanges": {
-      "reason": "A held pass lists one parent set however a listing orders it. A rise means reordered parents reopen discovery.",
-      "budget": 0,
-      "margin": 0
-    },
     "poll and backstop walk | walk:requested:poll:backstop": {
       "reason": "A walk runs only for a refresh that asks to list the catalog again. A rise means a caller stopped reusing the held catalog.",
       "budget": 1,
@@ -821,11 +786,6 @@
       "budget": 1,
       "margin": 0
     },
-    "repeated record coverage | unsettledParentChanges": {
-      "reason": "A held pass lists one parent set however a listing orders it. A rise means reordered parents reopen discovery.",
-      "budget": 0,
-      "margin": 0
-    },
     "selection switch | catalogWalk": {
       "reason": "A step walks the catalog only when no held catalog can serve it. A rise means a step lost catalog reuse.",
       "budget": 0,
@@ -889,11 +849,6 @@
     "selection switch | refreshCount:catalog-enumeration": {
       "reason": "Each refresh that lists sessions runs one enumeration. A rise means a step runs extra catalog refreshes.",
       "budget": 2,
-      "margin": 0
-    },
-    "selection switch | unsettledParentChanges": {
-      "reason": "A held pass lists one parent set however a listing orders it. A rise means reordered parents reopen discovery.",
-      "budget": 0,
       "margin": 0
     },
     "session list update | catalogWalk": {
@@ -963,11 +918,6 @@
     },
     "session list update | refreshCount:catalog-enumeration": {
       "reason": "Each refresh that lists sessions runs one enumeration. A rise means a step runs extra catalog refreshes.",
-      "budget": 0,
-      "margin": 0
-    },
-    "session list update | unsettledParentChanges": {
-      "reason": "A held pass lists one parent set however a listing orders it. A rise means reordered parents reopen discovery.",
       "budget": 0,
       "margin": 0
     },
@@ -1104,11 +1054,6 @@
     "warm start | renderPost:shell-ready": {
       "reason": "A refresh renders the session list when its inputs changed. A rise means a step redraws without new facts.",
       "budget": 1,
-      "margin": 0
-    },
-    "warm start | unsettledParentChanges": {
-      "reason": "A held pass lists one parent set however a listing orders it. A rise means reordered parents reopen discovery.",
-      "budget": 0,
       "margin": 0
     },
     "warm start | walk:requested:shell-ready": {
