@@ -8,7 +8,7 @@
 
 ## Prompt entries
 
-Claude commands lack ownership metadata. Classify them with the working directory's latest skill-name list, persisted across reloads. Before the first list, all commands receive skill highlighting except panel controls, `/compact`, `/model`, `/remote-control`, and `/rc`.
+Claude commands lack ownership metadata. Classify them with the working directory's latest skill-name list, persisted across reloads. A session under a read-only launch policy never changes that list. Its narrowed list would hide the reader's skills from ordinary sessions. Before the first list, all commands receive skill highlighting except panel controls, `/compact`, `/model`, `/remote-control`, and `/rc`.
 
 [`composerview.ts`](../extension/src/composerview.ts)'s `availableCommands` adds `/remote-control` and `/rc` because Claude's published catalog omits them. [`claudeskillpath.ts`](../extension/src/claudeskillpath.ts) resolves missing definition paths, with project skills before the reader's Claude skills folder.
 

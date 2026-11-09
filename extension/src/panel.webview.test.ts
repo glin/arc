@@ -20,6 +20,7 @@ import { sessionPageSources } from './sessionreads';
 import { sessionCoverageMember, reconcileSessionCollisions } from './sessioncoverage';
 import { runningKey } from './composerview';
 import { HostReadPersistence, preserveHostRead } from './domain/read.ts';
+import { launchPolicy } from './launchpolicy';
 import { LaunchPolicyStore } from './launchpolicystore';
 import { SessionFilterRequests, FILTER_LIMITS } from './sessionfilter.ts';
 import { createSavedState } from './webview/state.ts';
@@ -2563,6 +2564,7 @@ import { manifestMenu, menuGroups, whenHolds } from '../scripts/web-demo-menu.ts
 import { turnMenuContext } from './view/card-menu.ts';
 import * as path from 'node:path';
 import * as esbuild from 'esbuild';
+import { claudeCommandIsSkill, sameSkillList, withDirectorySkills } from './domain/claude-skills.ts';
 import * as ts from 'typescript';
 import { mergePromptAssets } from './promptassets.ts';
 import {
@@ -22914,6 +22916,53 @@ test('a Claude row draws the skill list stored for its own working directory', (
     null,
     'a skill list stored for one working directory reached a row opened in another',
   );
+});
+
+test("a read-only child's shorter skill list never replaces the list an ordinary child saved", () => {
+  const extensionSource = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
+  const handlerCode = esbuild.transformSync(
+    statementFrom(extensionSource, extensionSource.indexOf("if (event.kind === 'skills'")),
+    { loader: 'ts' },
+  ).code;
+  const saved: Record<string, Record<string, readonly string[]>> = {};
+  const context = {
+    workspaceState: {
+      update: (name: string, value: Record<string, readonly string[]>) => {
+        saved[name] = value;
+        return Promise.resolve();
+      },
+    },
+  };
+  const handle = new Function(
+    'key',
+    'normalizeWorkspace',
+    'sameSkillList',
+    'withDirectorySkills',
+    'context',
+    'SKILLS_KEY',
+    'panel',
+    `let skillLists = {}; return (event, host) => { ${handlerCode} };`,
+  )('child', normalizeWorkspace, sameSkillList, withDirectorySkills, context, 'skills', { setSkills() {} }) as (
+    event: { kind: 'skills'; skills: string[] },
+    host: { get: () => { cwd: string; policy?: object } },
+  ) => void;
+  const publish = (skills: string[], policy?: object) =>
+    handle({ kind: 'skills', skills }, { get: () => ({ cwd: 'C:/repo-here', policy }) });
+  const rows = [{ id: 'here', label: 'Claude here', agentKey: 'claude' }];
+  const catalog = {
+    sessions: [{ agent: 'claude', sessionId: 'here', cwd: 'C:/repo-here' }],
+  };
+  // A reload reads only what the handler saved in workspaceState.
+  const reloaded = () => stateForRow(rows, {}, 'here', {}, { catalog, skillLists: saved.skills ?? {} });
+  publish(['land', 'close-session']);
+  publish(['land'], launchPolicy('claude', true));
+  assert.equal(
+    claudeCommandIsSkill('close-session', reloaded().claudeSkills),
+    true,
+    'a read-only child narrowed the saved skill list, so the reader skill lost its mark',
+  );
+  publish(['land']);
+  assert.deepEqual(reloaded().claudeSkills, ['land'], 'a later ordinary child no longer replaces the saved list');
 });
 
 test('a Codex row never draws a Claude skill list, even from its own working directory', () => {

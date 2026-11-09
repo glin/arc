@@ -600,8 +600,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           complete: false,
         });
       }
-      // Persist Claude's reported skills under its working directory. Sessions in that directory share the list, and identical lists cause no state write.
-      if (event.kind === 'skills') {
+      // Persist Claude's reported skills under its working directory. Sessions in that directory share the list, and identical lists cause no state write. A child under a launch policy reports a narrowed list, so it never changes the saved list.
+      if (event.kind === 'skills' && !host.get(key)?.policy) {
         const cwd = host.get(key)?.cwd;
         const directory = cwd ? normalizeWorkspace(cwd) : null;
         if (directory && !sameSkillList(skillLists[directory], event.skills)) {
@@ -1045,7 +1045,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // `host.states()`, and a menu that emptied with it would go quiet exactly when the reader
   // wants it: the command they are about to type is what starts the next child.
   const commandLists = new CommandCatalogs();
-  // Restore each directory's persisted Claude skills at activation. A session's `init` message replaces the list for its directory.
+  // Restore each directory's persisted Claude skills at activation. An ordinary session's `init` message replaces the list for its directory.
   let skillLists: Record<string, readonly string[]> =
     context.workspaceState.get<Record<string, readonly string[]>>(SKILLS_KEY) ?? {};
   panel.setSkills(skillLists);
@@ -1624,7 +1624,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             }
             return;
           }
-          // The session's own MCP status stays with its idle live child when the idle read supplies the commands. An idle child would load the reader's full MCP configuration, and a restricted child does not.
+          // The session's own MCP status stays with its idle live child when the idle read supplies the commands. An idle child runs without the session's launch policy. For Claude, that policy restricts the MCP configuration and skills the child loads, so only the idle child reports the reader's full set. For Codex, the policy changes only the approval policy, the approvals reviewer, and the sandbox.
           const mcpStaysLive = Boolean(wantMcp && resolvedMcpOwner && mcpLive && idleCandidates.includes(mcpLive));
           if (mcpStaysLive) {
             void readMcpFrom(mcpLive!.key, resolvedMcpOwner);
