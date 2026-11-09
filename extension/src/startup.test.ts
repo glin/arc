@@ -10272,6 +10272,22 @@ test('a content search that waited for a sliced walk reads no source when the co
   assert.equal(sources.listings, 0, 'the search walked the sources after the commit');
 });
 
+for (const named of [false, true]) {
+  test(`a content search that waited for a sliced walk${named ? ' and names a file' : ''} leaves the refresh trusting the rows of the commit`, async () => {
+    const trusted: boolean[] = [];
+    const { answered, search, writeParent, pauseOnce, releaseAll, provider } = searchingWalkHarness();
+    provider.updateProjectSpendIntegrity = () => trusted.push(provider.catalogWalked);
+    const first = writeParent('first');
+    pauseOnce(async () => {
+      await search();
+      if (named) provider.targetedRefreshPaths = [first];
+    });
+    await releaseAll(provider.refresh(true));
+    await vi.waitFor(() => assert.ok(answered()));
+    assert.equal(trusted[0], true, 'the read that followed the commit made the refresh distrust the walked rows');
+  });
+}
+
 test('a content search that waited for a sliced walk past its deadline answers from no rows and reads no source', async () => {
   vi.useFakeTimers(STREAM_TIMERS);
   try {

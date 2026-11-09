@@ -13928,6 +13928,8 @@ export class PanelProvider implements vscode.Disposable {
     const time: ListingTimer = parts?.time ?? ((_part, run) => run());
     const folderPrint = `${workspaceFolders.join('\n')}\0${scope.revision}`;
     let namedFileChanged = false;
+    // A read that follows a walk's commit keeps `catalogWalked`, so the refresh that continues does not stat every Claude row again.
+    const settled = reuseCatalog === 'settled';
     if (this.targetedRefreshPaths?.length && this.catalog && this.catalog.folders === folderPrint) {
       // A request that reuses the held catalog also revalidates the selected session, as one that names no file does.
       const selected = reuseCatalog
@@ -13980,14 +13982,13 @@ export class PanelProvider implements vscode.Disposable {
           ...parents.filter((session) => !listed.has(session.file)),
         ];
         this.catalog = { folders: folderPrint, sessions: sorted };
-        this.catalogWalked = false;
+        if (!settled) this.catalogWalked = false;
         return sorted;
       }
       // A named file went missing, changed identity or was never listed, so only a walk can say what replaced it.
       namedFileChanged = true;
     }
     let selectedFileGone = false;
-    const settled = reuseCatalog === 'settled';
     const outsideWalk = reuseCatalog && (settled || !!this.catalogWalkRunning) && !deferWalk && !codexEnumeration;
     if (reuseCatalog && this.catalog && this.catalog.folders === folderPrint && (!namedFileChanged || outsideWalk)) {
       // With no selection, or a draft selected, the held catalog has no row to revalidate. A draft has no file to list.
@@ -14017,7 +14018,7 @@ export class PanelProvider implements vscode.Disposable {
         const sorted = orderSessionCatalog(admitted, (session) => this.activityFor(session));
         // Retain the updated rows so later selections reuse their current revisions.
         this.catalog = { folders: folderPrint, sessions: sorted };
-        this.catalogWalked = false;
+        if (!settled) this.catalogWalked = false;
         this.noteCompressedRowsGauge(sorted);
         return sorted;
       }
