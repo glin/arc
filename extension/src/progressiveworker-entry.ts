@@ -139,10 +139,9 @@ import { TURN_QUIET_MS, statusOf } from './turncard';
 import { DispatchReceipts } from './dispatchreceipts';
 import { admittedDispatchReferences } from './turnrail';
 import {
-  compressedEntryBatches,
-  compressedPhysicalStat,
+  CompressedStoreFollower,
   CompressedStoreHolder,
-  readCompressedStore,
+  postCompressedBatches,
   recordCompressedAdoption,
   recordCompressedNames,
 } from './compressedstore';
@@ -642,21 +641,25 @@ async function executeCompressedAdopt(
   };
 }
 
-// The worker posts at most one batch per second, of 4 MiB or one larger record.
+// A worker keeps one follower per store. The first request of a worker reads the whole store, and a later request reads
+// only the bytes appended since.
+const compressedFollowers = new Map<string, CompressedStoreFollower>();
+
 async function executeCompressedLoad(
   request: Extract<ProgressiveRequest, { kind: 'compressed-load' }>,
   signal: AbortSignal,
   acknowledge?: (value: ProgressiveValue) => void,
 ): Promise<ProgressiveValue> {
-  const facts = [...readCompressedStore(request.stores.facts, compressedPhysicalStat).entries.values()].filter(
-    (entry) => !entry.nameOnly,
-  );
-  const batches = compressedEntryBatches(facts);
-  for (let at = 0; at < batches.length - 1 && !signal.aborted; at++) {
-    acknowledge?.({ kind: 'compressed-load', entries: batches[at], done: false });
-    await new Promise((resolve) => setTimeout(resolve, 1_000));
+  let follower = compressedFollowers.get(request.stores.facts);
+  if (!follower) {
+    follower = new CompressedStoreFollower(request.stores.facts);
+    compressedFollowers.set(request.stores.facts, follower);
   }
-  return { kind: 'compressed-load', entries: signal.aborted ? [] : (batches.at(-1) ?? []), done: true };
+  const facts = (await follower.poll()).filter((entry) => !entry.nameOnly);
+  const last = await postCompressedBatches(facts, signal, (batch) =>
+    acknowledge?.({ kind: 'compressed-load', entries: batch, done: false }),
+  );
+  return { kind: 'compressed-load', entries: last, done: true };
 }
 
 function noteCompressedNames(list: readonly string[], stores: import('./compressedstore').CompressedStorePaths): void {
@@ -2888,6 +2891,7 @@ parentPort?.on(
     if (message.releaseStores) {
       for (const holder of compressedHolders.values()) holder.dispose();
       compressedHolders.clear();
+      compressedFollowers.clear();
       parentPort?.postMessage({ storesReleased: true });
       return;
     }

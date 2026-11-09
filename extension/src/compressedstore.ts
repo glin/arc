@@ -36,6 +36,7 @@ const READ_CHUNK = 64 * 1024;
 export const COMPRESSED_ENTRY_TITLE_BYTES = 1024 * 1024;
 // The worker posts at most this many bytes of entries in one batch, or one larger record.
 export const COMPRESSED_BATCH_BYTES = 4 * 1024 * 1024;
+const COMPRESSED_BATCH_INTERVAL_MS = 1_000;
 // A worker step that prepares a list of names holds the worker for at most this long.
 const NAME_SLICE_MS = 25;
 
@@ -286,29 +287,33 @@ function readManifest(directory: string, name: string): StoreManifest | null {
 
 // One read of the fact lines of a file. The callback gets each complete line and its byte offset, so a caller holds one
 // line at a time. A trailing line without a line break is skipped. A file that cannot be read throws.
+// `start` skips the bytes that an earlier read already gave. The result counts the bytes read.
 function eachLine(
   file: string,
   line: (text: Buffer, offset: number) => boolean | void,
   open: (file: string) => number = openForRead,
-): void {
+  start = 0,
+): number {
   const fd = open(file);
+  let total = 0;
   try {
     const chunk = Buffer.allocUnsafe(READ_CHUNK);
     let held: Buffer = Buffer.alloc(0);
-    let heldAt = 0;
-    let position = 0;
+    let heldAt = start;
+    let position = start;
     while (true) {
       const read = fs.readSync(fd, chunk, 0, READ_CHUNK, position);
-      if (read === 0) return;
+      if (read === 0) return total;
+      total += read;
       const bytes = Buffer.concat([held, chunk.subarray(0, read)]);
       position += read;
-      let start = 0;
-      for (let end = bytes.indexOf(0x0a, start); end >= 0; end = bytes.indexOf(0x0a, start)) {
-        if (line(bytes.subarray(start, end), heldAt + start) === false) return;
-        start = end + 1;
+      let from = 0;
+      for (let end = bytes.indexOf(0x0a, from); end >= 0; end = bytes.indexOf(0x0a, from)) {
+        if (line(bytes.subarray(from, end), heldAt + from) === false) return total;
+        from = end + 1;
       }
-      held = bytes.subarray(start);
-      heldAt += start;
+      held = bytes.subarray(from);
+      heldAt += from;
     }
   } finally {
     fs.closeSync(fd);
@@ -592,6 +597,132 @@ function readLockText(lock: string): string | null | 'missing' {
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === 'ENOENT' ? 'missing' : null;
   }
+}
+
+// Every field of an entry that a reader can see change. A later file that repeats these values is not new for a host.
+function compressedEntryMark(entry: CompressedFactEntry): string {
+  return [
+    entry.size,
+    entry.mtimeMs,
+    entry.hash,
+    entry.factsVersion,
+    entry.codexMetaVersion,
+    entry.metadataGeneration,
+    entry.spendGeneration,
+    entry.decodedLength,
+    entry.complete,
+    entry.adopted,
+    entry.adoptionFailed,
+    entry.nameOnly,
+    entry.undercount,
+  ].join('|');
+}
+
+export function compressedEntrySame(left: CompressedFactEntry, right: CompressedFactEntry): boolean {
+  return compressedEntryMark(left) === compressedEntryMark(right);
+}
+
+// Reads one store as it changes. The first poll reads every file. Each later poll lists the store and reads only the
+// bytes appended since, so another window's entry arrives without a restart.
+export class CompressedStoreFollower {
+  private readonly consumed = new Map<string, number>();
+  private readonly best = new Map<string, { ranked: RankedEntry; mark: string }>();
+  // The bytes every poll read so far.
+  bytesRead = 0;
+
+  constructor(
+    readonly directory: string,
+    private readonly statOf: typeof compressedPhysicalStat = compressedPhysicalStat,
+    private readonly yieldStep: () => Promise<void> = yieldToEvents,
+  ) {}
+
+  // The entries that are new or changed since the last poll.
+  async poll(): Promise<CompressedFactEntry[]> {
+    const names = listDirectory(this.directory);
+    const view = storeView(this.directory, names);
+    const present = new Set(names);
+    for (const name of this.consumed.keys()) if (!present.has(name)) this.consumed.delete(name);
+    const changed = new Map<string, CompressedFactEntry>();
+    for (const input of view.inputs) {
+      if (this.readInput(input, changed)) await this.yieldStep();
+    }
+    return [...changed.values()];
+  }
+
+  // True when the input had new bytes.
+  private readInput(input: StoreName, changed: Map<string, CompressedFactEntry>): boolean {
+    const file = path.join(this.directory, input.name);
+    let size: number;
+    try {
+      size = fs.statSync(file).size;
+    } catch {
+      return false;
+    }
+    let consumed = this.consumed.get(input.name);
+    if (consumed === undefined) {
+      if (!readableFactsVersion(fileFactsVersion(file))) {
+        this.consumed.set(input.name, size);
+        return false;
+      }
+      consumed = 0;
+    }
+    if (size <= consumed) return false;
+    let end = consumed;
+    try {
+      this.bytesRead += eachLine(
+        file,
+        (line, offset) => {
+          end = offset + line.length + 1;
+          const entry = parseEntry(line.toString('utf8'));
+          if (!entry || !readableFactsVersion(entry.factsVersion)) return;
+          this.rank(entry, input, offset, changed);
+        },
+        openForRead,
+        consumed,
+      );
+    } catch {
+      // The file went away. The next listing no longer names it.
+    }
+    this.consumed.set(input.name, end);
+    return true;
+  }
+
+  private rank(
+    entry: CompressedFactEntry,
+    input: StoreName,
+    offset: number,
+    changed: Map<string, CompressedFactEntry>,
+  ): void {
+    const ranked: RankedEntry = {
+      entry: rankFields(entry),
+      epoch: input.epoch,
+      token: input.token,
+      input: input.name,
+      offset,
+      seq: input.seq,
+    };
+    const held = this.best.get(entry.file);
+    if (held && compareRankedEntries(ranked, held.ranked, this.statOf(entry.file)) <= 0) return;
+    const mark = compressedEntryMark(entry);
+    this.best.set(entry.file, { ranked, mark });
+    if (held?.mark !== mark) changed.set(entry.file, entry);
+  }
+}
+
+// Post entries as batches of at most 4 MiB, at most one batch per second. The last batch stays for the reply.
+export async function postCompressedBatches(
+  entries: readonly CompressedFactEntry[],
+  signal: AbortSignal,
+  post: (batch: CompressedFactEntry[]) => void,
+  wait: (milliseconds: number) => Promise<void> = (milliseconds) =>
+    new Promise((resolve) => setTimeout(resolve, milliseconds)),
+): Promise<CompressedFactEntry[]> {
+  const batches = compressedEntryBatches(entries);
+  for (let at = 0; at < batches.length - 1 && !signal.aborted; at++) {
+    post(batches[at]);
+    await wait(COMPRESSED_BATCH_INTERVAL_MS);
+  }
+  return signal.aborted ? [] : (batches.at(-1) ?? []);
 }
 
 export interface CompressedStoreOptions {

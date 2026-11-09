@@ -12,10 +12,12 @@ import {
   compressedEntryBatches,
   compressedEntryCurrent,
   compressedEntryVersions,
+  CompressedStoreFollower,
   CompressedStoreHolder,
   COMPRESSED_FACTS_VERSION,
   readCompressedStore,
   readCompressedStoreInSteps,
+  postCompressedBatches,
   recordCompressedAdoption,
   recordCompressedNames,
   STORE_LOCK,
@@ -847,6 +849,81 @@ test('a stepped read of the store yields after every file', async () => {
   );
   assert.equal(read.entries.size, 3);
   assert.ok(yields >= 3, `${yields} yields across 3 files`);
+});
+
+test('a follower reads only the bytes appended since its last poll and a compaction repeats no entry', async () => {
+  const { directory, clock, make, names } = storeFixture('store-follow', { segmentBytes: 4096, compactSegments: 99 });
+  const first = make();
+  await first.append([entry('a.jsonl.zst')]);
+  const follower = new CompressedStoreFollower(
+    directory,
+    () => null,
+    async () => {},
+  );
+  assert.deepEqual(
+    (await follower.poll()).map((item) => item.file),
+    ['a.jsonl.zst'],
+  );
+  const initial = follower.bytesRead;
+  assert.ok(initial > 0);
+  assert.deepEqual(await follower.poll(), [], 'an unchanged store gave an entry');
+  assert.equal(follower.bytesRead, initial, 'a poll with no appended bytes read the store again');
+  first.dispose();
+  // Another window takes the lease and appends.
+  const second = make();
+  await second.append([entry('b.jsonl.zst')]);
+  // A takeover folds the first window's segment into a shard, so the present files are the only new bytes.
+  const newBytes = names()
+    .filter((name) => /^(segment|shard)-/.test(name))
+    .map((name) => fs.statSync(path.join(directory, name)).size)
+    .reduce((sum, size) => sum + size, 0);
+  assert.deepEqual(
+    (await follower.poll()).map((item) => item.file),
+    ['b.jsonl.zst'],
+    "the other window's entry did not arrive",
+  );
+  assert.equal(follower.bytesRead, initial + newBytes, 'the follower read more than the appended bytes');
+  second.dispose();
+  clock.advance(1);
+  // A compaction writes the same entries into shards.
+  const third = make({ segmentBytes: 64, compactSegments: 2 });
+  await third.append([entry('c.jsonl.zst')]);
+  await third.append([entry('d.jsonl.zst')]);
+  assert.ok(
+    names().some((name) => name.startsWith('manifest-')),
+    'the compaction did not run',
+  );
+  assert.deepEqual(
+    (await follower.poll()).map((item) => item.file).sort(),
+    ['c.jsonl.zst', 'd.jsonl.zst'],
+    'a compaction repeated a known entry',
+  );
+  third.dispose();
+});
+
+test('successive load batches wait one second between posts', async () => {
+  vi.useFakeTimers();
+  try {
+    const big = (name: string) => entry(name, { threadId: 'x'.repeat(3 * 1024 * 1024) });
+    const posted: string[][] = [];
+    const answer = postCompressedBatches([big('a'), big('b'), big('c')], new AbortController().signal, (batch) =>
+      posted.push(batch.map((item) => item.file)),
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    assert.deepEqual(posted, [['a']]);
+    await vi.advanceTimersByTimeAsync(999);
+    assert.deepEqual(posted, [['a']], 'a second batch came before one second passed');
+    await vi.advanceTimersByTimeAsync(1);
+    assert.deepEqual(posted, [['a'], ['b']]);
+    await vi.advanceTimersByTimeAsync(1_000);
+    assert.deepEqual(
+      (await answer).map((item) => item.file),
+      ['c'],
+      'the last batch was not left for the reply',
+    );
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 test('a batch of entries holds at most 4 MiB, or one larger record', () => {

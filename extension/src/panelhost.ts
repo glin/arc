@@ -15,6 +15,7 @@ import { compressedRolloutsReadable, isCompressedRollout } from './compressedrol
 import {
   COMPRESSED_FACTS_STORE,
   COMPRESSED_OPENINGS_STORE,
+  compressedEntrySame,
   compressedPairKey,
   compressedTitleCurrent,
   withKeptUndercount,
@@ -1656,6 +1657,7 @@ export class PanelProvider implements vscode.Disposable {
   // True from the start of a panel with a store until the load of the stores ends.
   private compressedLoadPending = false;
   private compressedLoadStarted = false;
+  private compressedFollowTimer: ReturnType<typeof setTimeout> | null = null;
   private compressedRenderSeen = false;
   private readonly compressedSpendPicks = new WeakMap<
     readonly SpendFileIndex[],
@@ -3941,6 +3943,10 @@ export class PanelProvider implements vscode.Disposable {
       clearTimeout(this.projectSpendMidnight);
       this.projectSpendMidnight = null;
     }
+    if (this.compressedFollowTimer) {
+      clearTimeout(this.compressedFollowTimer);
+      this.compressedFollowTimer = null;
+    }
     this.cancelProjectSpendHydration();
     this.cancelProjectSpendOffers();
     this.cancelProjectSpendRebuild();
@@ -5040,10 +5046,18 @@ export class PanelProvider implements vscode.Disposable {
     void this.loadCompressedFacts(stores);
   }
 
-  private applyCompressedEntries(entries: readonly CompressedFactEntry[]): void {
-    for (const entry of entries)
-      this.compressedFacts.set(entry.file, withKeptUndercount(this.compressedFacts.get(entry.file), entry));
-    if (entries.length) this.compressedFactsChanged();
+  // True when an entry changed the facts.
+  private applyCompressedEntries(entries: readonly CompressedFactEntry[]): boolean {
+    let changed = false;
+    for (const entry of entries) {
+      const held = this.compressedFacts.get(entry.file);
+      const next = withKeptUndercount(held, entry);
+      if (held && compressedEntrySame(held, next)) continue;
+      this.compressedFacts.set(entry.file, next);
+      changed = true;
+    }
+    if (changed) this.compressedFactsChanged();
+    return changed;
   }
 
   private compressedFactsChanged(): void {
@@ -5056,9 +5070,7 @@ export class PanelProvider implements vscode.Disposable {
     const started = performance.now();
     let applied = false;
     const take = (value: import('./progressiveworker').ProgressiveValue | undefined) => {
-      if (value?.kind !== 'compressed-load') return;
-      if (value.entries.length) applied = true;
-      this.applyCompressedEntries(value.entries);
+      if (value?.kind === 'compressed-load' && this.applyCompressedEntries(value.entries)) applied = true;
     };
     let cutOff = false;
     try {
@@ -5080,9 +5092,45 @@ export class PanelProvider implements vscode.Disposable {
     }
     this.compressedLoadPending = false;
     this.performanceCounters?.recordWork('compressedLoadMs', Math.round(performance.now() - started));
+    this.armCompressedFollow();
     this.resumeCompressedAdoptions();
     if (applied) this.refreshFrom('compressed-facts', true);
     else if (!this.projectSpendBusy()) this.postProjectSpend();
+  }
+
+  // Every 10 s a visible panel lists the store and takes only the bytes appended since, so another window's adoption
+  // reaches this host without a restart. A hidden panel keeps no worker and reads nothing.
+  private armCompressedFollow(): void {
+    if (this.compressedFollowTimer || this.disposed || !this.compressedStorePaths()) return;
+    this.compressedFollowTimer = setTimeout(() => {
+      this.compressedFollowTimer = null;
+      void this.followCompressedFacts();
+    }, 10_000);
+    this.compressedFollowTimer.unref?.();
+  }
+
+  private async followCompressedFacts(): Promise<void> {
+    const stores = this.compressedStorePaths();
+    if (!stores || this.disposed) return;
+    if (this.anyVisible()) {
+      let applied = false;
+      const take = (value: import('./progressiveworker').ProgressiveValue | undefined) => {
+        if (value?.kind === 'compressed-load' && this.applyCompressedEntries(value.entries)) applied = true;
+      };
+      try {
+        const result = await this.progressiveWorker.run(
+          { kind: 'compressed-load', stores },
+          this.refreshGeneration,
+          new AbortController().signal,
+          (progress) => take(progress.value),
+        );
+        take(result?.value);
+      } catch {
+        // A later poll reads the same bytes again.
+      }
+      if (applied) this.refreshFrom('compressed-facts', true);
+    }
+    this.armCompressedFollow();
   }
 
   // A delete or rename of a listed rollout is a form change when its compressed twin exists. The wake batch, the host

@@ -78,6 +78,7 @@ import {
   compressedTitleCurrent,
   readCompressedStore,
   withKeptUndercount,
+  compressedEntrySame,
   adoptCompressedTwin,
   type CompressedAdoptionInput,
 } from './compressedstore.ts';
@@ -2776,6 +2777,7 @@ function harness(pendingRefresh = false, registerRefreshHandler = true, extraMet
     'COMPRESSED_OPENINGS_STORE',
     'compressedTitleCurrent',
     'withKeptUndercount',
+    'compressedEntrySame',
     'compressedSpendDisplayFiles',
     'normalizeSpendFile',
     'isAgentRun',
@@ -2796,6 +2798,7 @@ function harness(pendingRefresh = false, registerRefreshHandler = true, extraMet
     COMPRESSED_OPENINGS_STORE,
     compressedTitleCurrent,
     withKeptUndercount,
+    compressedEntrySame,
     compressedSpendDisplayFiles,
     normalizeSpendFile,
     isAgentRun,
@@ -3003,6 +3006,8 @@ function completeDiscoveryHarness(
     'markCompressedRolloutsSent',
     'compressedStorePaths',
     'resumeCompressedAdoptions',
+    'armCompressedFollow',
+    'followCompressedFacts',
   );
   names.push('compressedSpendPick', 'titleEntryOf', 'compressedTitleOf', 'compressedCarriedNameOf');
   if (names.includes('allSessions') || names.includes('runPendingWatch')) names.push('currentWalkedCatalog');
@@ -3056,7 +3061,7 @@ function completeDiscoveryHarness(
       repositoryCommits = new RepositoryCommits({ run: async () => null }, () => {});
       _showing = null; selections = []; messages = []; partial = []; catalog = null; drawnCards = [];
       coverageRevision = 0; enumeratedAdmissionComplete = true; claudeChildren = []; compressedRollouts = new Set();
-      compressedLoadPending = false; compressedRolloutsRevision = 0; compressedFacts = new Map(); compressedFactsRevision = 0; adoptionsUnsettled = new Map(); compressedSpendPicks = new WeakMap();
+      compressedLoadPending = false; compressedFollowTimer = null; compressedRolloutsRevision = 0; compressedFacts = new Map(); compressedFactsRevision = 0; adoptionsUnsettled = new Map(); compressedSpendPicks = new WeakMap();
       authoritativeCatalog = null; attachmentHandoffs = new Set(); titles = new Map();
       metadataRevision = 0; drawnMetadataRevision = 0; startupProgressAt = 0;
       derivedCacheCheckpointState = { markChanged() {} };
@@ -3491,6 +3496,8 @@ function selectedWindowHarness(
     'markCompressedRolloutsSent',
     'compressedStorePaths',
     'resumeCompressedAdoptions',
+    'armCompressedFollow',
+    'followCompressedFacts',
     'compressedSpendPick',
     'titleEntryOf',
     'compressedTitleOf',
@@ -3639,6 +3646,7 @@ function selectedWindowHarness(
     'COMPRESSED_OPENINGS_STORE',
     'compressedTitleCurrent',
     'withKeptUndercount',
+    'compressedEntrySame',
     'compressedSpendDisplayFiles',
     'normalizeSpendFile',
     'isAgentRun',
@@ -3688,6 +3696,7 @@ function selectedWindowHarness(
     COMPRESSED_OPENINGS_STORE,
     compressedTitleCurrent,
     withKeptUndercount,
+    compressedEntrySame,
     compressedSpendDisplayFiles,
     normalizeSpendFile,
     isAgentRun,
@@ -10006,6 +10015,7 @@ function adoptionHarness(extraScope: Record<string, unknown> = {}) {
       COMPRESSED_OPENINGS_STORE,
       compressedTitleCurrent,
       withKeptUndercount,
+      compressedEntrySame,
       compressedSpendDisplayFiles,
       compressedPairKey,
       normalizeSpendFile,
@@ -10382,9 +10392,74 @@ test('discovery sends the compressed list only when the set changed since the la
   assert.deepEqual(provider.compressedRolloutsToSend(), {}, 'a panel with no store sent a list');
 });
 
+test("a visible panel reads another window's adoption every 10 seconds without a restart", async () => {
+  vi.useFakeTimers();
+  try {
+    const { provider } = heldWalkHarness(
+      { withKeptUndercount, compressedEntrySame, COMPRESSED_FACTS_STORE, COMPRESSED_OPENINGS_STORE, arcHome },
+      [
+        'maybeStartCompressedLoad',
+        'loadCompressedFacts',
+        'applyCompressedEntries',
+        'compressedFactsChanged',
+        'projectSpendBusy',
+        'invalidateProjectSpendSnapshot',
+      ],
+    );
+    const seen = { file: 'a.jsonl.zst', pairKey: 'a.jsonl', factsVersion: 1, size: 1, mtimeMs: 1 };
+    const fromOtherWindow = { file: 'b.jsonl.zst', pairKey: 'b.jsonl', factsVersion: 1, size: 2, mtimeMs: 2 };
+    let requests = 0;
+    const answers = [[seen], [], [fromOtherWindow], [fromOtherWindow]];
+    provider.progressiveWorker = {
+      run: async () => {
+        requests++;
+        return { value: { kind: 'compressed-load', entries: answers.shift() ?? [], done: true } };
+      },
+    };
+    provider.performanceCounters = { recordWork() {} };
+    provider.derivedCacheFile = path.join('cache', 'derived.json');
+    const refreshes: string[] = [];
+    provider.refreshFrom = (reason: string) => refreshes.push(reason);
+    provider.postProjectSpend = () => {};
+    provider.anyVisible = () => true;
+    Object.assign(provider, {
+      compressedFacts: new Map(),
+      compressedFactsRevision: 0,
+      adoptionsUnsettled: new Map(),
+      projectSpendHydrated: true,
+      projectSpendIndexing: false,
+      projectSpendOffers: new Set(),
+      projectSpendRevision: 0,
+      compressedLoadPending: true,
+      compressedLoadStarted: false,
+      compressedRenderSeen: true,
+      codexPriming: null,
+      disposed: false,
+      compressedFollowTimer: null,
+    });
+    provider.maybeStartCompressedLoad();
+    await vi.advanceTimersByTimeAsync(0);
+    assert.equal(provider.compressedFacts.has('a.jsonl.zst'), true);
+    assert.equal(requests, 1);
+    await vi.advanceTimersByTimeAsync(10_000);
+    assert.equal(requests, 2, 'the panel did not list the store after 10 seconds');
+    assert.deepEqual(refreshes, ['compressed-facts'], 'an empty poll refreshed the list');
+    await vi.advanceTimersByTimeAsync(10_000);
+    assert.equal(provider.compressedFacts.get('b.jsonl.zst'), fromOtherWindow, "another window's entry did not arrive");
+    assert.deepEqual(refreshes, ['compressed-facts', 'compressed-facts']);
+    await vi.advanceTimersByTimeAsync(10_000);
+    assert.equal(refreshes.length, 2, 'an unchanged entry refreshed the list again');
+    provider.anyVisible = () => false;
+    await vi.advanceTimersByTimeAsync(10_000);
+    assert.equal(requests, 4, 'a hidden panel read the store');
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 test('a load that a worker stop cut off runs again and holds Project cost busy until it ends', async () => {
   const { provider } = heldWalkHarness(
-    { withKeptUndercount, COMPRESSED_FACTS_STORE, COMPRESSED_OPENINGS_STORE, arcHome },
+    { withKeptUndercount, compressedEntrySame, COMPRESSED_FACTS_STORE, COMPRESSED_OPENINGS_STORE, arcHome },
     [
       'maybeStartCompressedLoad',
       'loadCompressedFacts',
@@ -10508,7 +10583,7 @@ test('a superseded discovery request sends the compressed list again with the ne
 
 test('the load of the stores waits for the first render and the pass, holds Project cost busy and applies each batch', async () => {
   const { provider } = heldWalkHarness(
-    { withKeptUndercount, COMPRESSED_FACTS_STORE, COMPRESSED_OPENINGS_STORE, arcHome },
+    { withKeptUndercount, compressedEntrySame, COMPRESSED_FACTS_STORE, COMPRESSED_OPENINGS_STORE, arcHome },
     [
       'maybeStartCompressedLoad',
       'loadCompressedFacts',
