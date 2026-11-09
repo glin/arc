@@ -16135,6 +16135,28 @@ test('a throw while planning one name leaves the other names', async () => {
   }
 });
 
+test('a retry timer that fires before its due time still runs the retry', async () => {
+  let decodes = 0;
+  const harness = backfillHarness({
+    exists: () => false,
+    statOf: () => ({ ...unitStat, isFile: true }),
+    stream: async () => {
+      decodes++;
+      return { kind: 'failed' } as never;
+    },
+  });
+  seedBody(harness, 'cut.jsonl.zst');
+  try {
+    harness.backfill.setNames(['cut.jsonl.zst']);
+    await vi.waitFor(() => assert.equal(harness.scheduled.length, 1, 'no retry timer'));
+    const timer = harness.scheduled.splice(0, 1)[0];
+    timer.run();
+    await vi.waitFor(() => assert.equal(decodes, 2, 'a timer that fired early lost the retry'));
+  } finally {
+    harness.backfill.dispose();
+  }
+});
+
 const unitStat = { size: 10, mtimeMs: 2, dev: 1, ino: 1 };
 const unitDecoded = (hash = 'h') =>
   ({ kind: 'decoded', hash, stat: unitStat as never, frames: 1, complete: true }) as const;

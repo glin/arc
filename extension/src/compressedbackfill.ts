@@ -727,13 +727,11 @@ export class CompressedBackfill {
       return;
     }
     const delay = BACKFILL_RETRY_DELAYS_MS[attempts];
-    this.retries.set(job.file, {
-      size: job.stat.size,
-      mtimeMs: job.stat.mtimeMs,
-      attempts: attempts + 1,
-      at: this.now() + delay,
-    });
+    const retry = { size: job.stat.size, mtimeMs: job.stat.mtimeMs, attempts: attempts + 1, at: this.now() + delay };
+    this.retries.set(job.file, retry);
+    // The timer can fire before `at` by the loop's cached time, so the firing itself marks the retry due.
     this.schedule(delay, () => {
+      retry.at = -Infinity;
       this.dirty = true;
       void this.run();
     });
