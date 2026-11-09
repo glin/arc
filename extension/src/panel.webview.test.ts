@@ -13551,7 +13551,11 @@ test("the host counts a dispatched session in its parent's cost once and files i
     ];
     const none: never[] = [];
     host.setModels({ claude }, [], none);
-    assert.deepEqual(refreshes, [['models']], 'new names forced a full refresh');
+    assert.deepEqual(
+      refreshes,
+      [['models', false, true]],
+      'new names forced a full refresh or a catalog walk. A model list changes cards and no session row.',
+    );
     assert.equal(railPosts.length, 1, 'new names did not redraw the session list');
     assert.equal(posted.length, 1, 'new names did not redraw the drawn cards once');
     assert.equal(mainModels(posted[0].cards[0]), 'Opus 5 listed');
@@ -33037,10 +33041,10 @@ test('selection and accepted worker results avoid unnecessary catalog walks', ()
   const reusing = [...panelHostSource.matchAll(/this\.refresh(?:From|As)\('[^']+', (?:true|false), true\b/g)];
   assert.equal(
     reusing.length,
-    21,
+    24,
     `${reusing.length} refresh callers reuse the held catalog. Selection, older-page loading, ` +
       'the accepted selected-worker follow-up, row delta recovery, repeated-record coverage, the listing after the cold opening pass, a poll at unchanged ' +
-      'directories and a compressed facts batch must not repeat catalog enumeration.',
+      'directories, a compressed facts batch and the commit and model list updates, which change cards and no session row, must not repeat catalog enumeration.',
   );
   const refreshAt = panelHostSource.indexOf('async refresh(');
   const refresh = panelHostSource.slice(
