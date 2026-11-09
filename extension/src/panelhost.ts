@@ -5414,6 +5414,9 @@ export class PanelProvider implements vscode.Disposable {
       if (!row) continue;
       out.push(row);
       this.compressedRowsHeld.set(twin, row);
+      // A row that joins while a complete reply waits counts as answered, so accepting that reply records no mismatch.
+      this.discoveryComplete?.files.add(row.file);
+      this.discoveryComplete?.revisions?.set(row.file, { ...row });
       if (!this.enumeratedAmbiguousIds?.has(row.sessionId)) this.enumeratedMembers?.add(sessionCoverageMember(row));
     }
     // A row that joins between discovery replies needs its source now, or its cost waits for the next complete reply.

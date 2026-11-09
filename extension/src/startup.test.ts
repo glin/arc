@@ -11207,6 +11207,52 @@ test('a backfill batch reaches the held catalog and the gauge through the refres
   assert.equal(gauges.compressedRows, 1, 'the refresh did not set the gauge');
 });
 
+test('a batch row added while a complete reply waits joins that reply', async () => {
+  const { provider, root, writeRollout, releaseAll } = heldWalkHarness(
+    { readRolloutStat, isHiddenThread, isAgentRun, compressedTitleCurrent, withKeptUndercount, compressedEntrySame },
+    [],
+  );
+  const plain = writeRollout('plain');
+  const twin = path.join(root, `rollout-${twinThread}.jsonl.zst`);
+  fs.writeFileSync(twin, 'x');
+  const stat = readRolloutStat(twin)!;
+  provider.performanceCounters = { ...provider.performanceCounters, recordGauge() {} };
+  await releaseAll(provider.refresh(true));
+  const row = (provider.catalog.sessions as SessionFile[]).find((session) => session.file === plain);
+  const reply = {
+    scope: JSON.stringify(provider.repositoryScopeRoots),
+    files: new Set([plain]),
+    revisions: new Map([[plain, row]]),
+  };
+  provider.discoveryComplete = reply;
+  provider.dispatchDiscoveryPendingWriter = undefined;
+  provider.applyCompressedBatch({
+    entries: [
+      {
+        file: twin,
+        pairKey: twin.replace(/\.zst$/, ''),
+        factsVersion: COMPRESSED_FACTS_VERSION,
+        metadataGeneration: METADATA_GENERATIONS.codex,
+        size: stat.size,
+        mtimeMs: stat.mtimeMs,
+        threadId: twinThread,
+        opening: { ...backfillOpening, cwd: provider.repositoryScopeRoots[0] },
+        complete: true,
+        decodedLength: 500,
+      },
+    ],
+    backfillMs: 0,
+  });
+  await vi.waitFor(() => assert.equal(provider.refreshController, null));
+  assert.notEqual(
+    provider.dispatchDiscoveryPendingWriter,
+    'catalogMismatch',
+    'a batch row cost one more discovery pass',
+  );
+  assert.equal(reply.files.has(twin), true, 'the complete reply did not hold the batch row');
+  assert.equal(reply.revisions.get(twin)?.file, twin, 'the complete reply held no revision of the batch row');
+});
+
 test.skipIf(!rolloutCompression.zstdCompressSync)(
   'compressedPendingInput names the rollouts of the run tree',
   async () => {
