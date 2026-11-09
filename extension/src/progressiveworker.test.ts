@@ -547,10 +547,12 @@ test('a window read queued during a receipt turn enters the worker within one ba
   fs.mkdirSync(fx.receipts.root, { recursive: true });
   for (let index = 0; index < 1200; index++)
     fs.mkdirSync(path.join(fx.receipts.root, `${index.toString(16).padStart(8, '0')}-1111-2222-3333-444444444444`));
+  // The scan holds inside its first batch until the test writes this file, which the test does after it queues the window
+  // read. The ceiling only fails a run whose signal never arrives. It never releases the scan.
   const posted = path.join(root, 'window-posted');
   const step = 'receiptSteps++;';
   const prelude = `let noted=0,turns=0,gated=false,baseline=0,enteredAt=0,enteredTurns=0;globalThis.noteReceiptTurn=()=>turns++;const gatePort=require('node:worker_threads').parentPort,gateFs=require('node:fs'),gatePost=gatePort.postMessage.bind(gatePort);
-    globalThis.noteReceiptStep=()=>{noted++;if(noted===3&&!gated){gated=true;gatePort.postMessage({repeatedCoverage:'receipt-gate'});const end=Date.now()+30000;while(!gateFs.existsSync(${JSON.stringify(posted)})&&Date.now()<end);baseline=noted;}};
+    globalThis.noteReceiptStep=()=>{noted++;if(noted===3&&!gated){gated=true;gatePort.postMessage({repeatedCoverage:'receipt-gate'});const end=performance.now()+30000;while(!gateFs.existsSync(${JSON.stringify(posted)}))if(performance.now()>=end)throw new Error('the window read was never queued');baseline=noted;}};
     gatePort.postMessage=function(message){if(message.windowEntered){enteredAt=noted;enteredTurns=turns;gatePost({repeatedCoverage:'window-entered:'+(noted-baseline)});}if(message.result?.value?.kind==='window')gatePost({repeatedCoverage:'window-answered:'+(noted-enteredAt)+':'+(turns-enteredTurns)});return gatePost(message);};`;
   let reachedGate!: () => void;
   const gate = new Promise<void>((resolve) => (reachedGate = resolve));
