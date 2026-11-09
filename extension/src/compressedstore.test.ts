@@ -49,11 +49,14 @@ function entry(file: string, overrides: Partial<CompressedFactEntry> = {}): Comp
   };
 }
 
+// The start of the test clock, well before any file the test run creates, so a fresh lock never reads as stale.
+const STORE_CLOCK_START = Date.UTC(2026, 0, 1);
+
 // A store directory, a controlled wall clock and timers that fire only when the test advances them.
 function storeFixture(name: string, options: Partial<CompressedStoreOptions> = {}) {
   const directory = path.join(tempDir(name), 'facts');
   fs.mkdirSync(directory, { recursive: true });
-  let now = Date.now();
+  let now = STORE_CLOCK_START;
   const timers: { at: number; run: () => void }[] = [];
   const clock = {
     get now() {
@@ -268,7 +271,7 @@ test('an append during the trailing compaction is written and the idle release i
 });
 
 test('a lock missing at renewal is recreated and the holder keeps writing', async () => {
-  const { directory, clock, make } = storeFixture('store-renew-missing');
+  const { directory, clock, make, names } = storeFixture('store-renew-missing');
   const holder = make();
   await holder.append([entry('a.jsonl.zst')]);
   const lock = path.join(directory, STORE_LOCK);
@@ -278,6 +281,7 @@ test('a lock missing at renewal is recreated and the holder keeps writing', asyn
   assert.equal(holder.held, true, 'the holder abandoned a removed lock');
   await holder.append([entry('b.jsonl.zst')]);
   assert.equal(threadCount(directory), 2);
+  assert.ok(names().length <= STEADY_NAMES, `listing ${names().length}`);
   holder.dispose();
 });
 
@@ -342,7 +346,7 @@ test('a takeover through a removed lock fences the old holder, and no entry is l
 });
 
 test('a record of 5 MiB gets a segment of its own and drops its title entry', async () => {
-  const { directory, make } = storeFixture('store-large');
+  const { directory, make, names } = storeFixture('store-large');
   const holder = make();
   await holder.append([entry('small.jsonl.zst')]);
   const large = entry('large.jsonl.zst', {
@@ -359,6 +363,7 @@ test('a record of 5 MiB gets a segment of its own and drops its title entry', as
   assert.equal(segments.length, 2, 'the large record shared a segment');
   assert.ok(sizes[0] < 4096, 'the small segment holds the small entry alone');
   assert.ok(sizes[1] > 5 * 1024 * 1024);
+  assert.ok(names().length <= STEADY_NAMES, `listing ${names().length}`);
   holder.dispose();
 });
 
@@ -482,6 +487,7 @@ test('a takeover after a worker thread exited under a running host deletes its t
     'recovery kept a temporary of a running process',
   );
   assert.equal(threadCount(directory), 2);
+  assert.ok(names().length <= CRASH_NAMES, `listing ${names().length}`);
   next.dispose();
 });
 
@@ -864,8 +870,18 @@ test('a follower reads only the bytes appended since its last poll and a compact
     (await follower.poll()).map((item) => item.file),
     ['a.jsonl.zst'],
   );
+  const firstBytes = follower.bytesRead;
+  await first.append([entry('a2.jsonl.zst')]);
+  const segment = names().find((name) => name.startsWith('segment-'))!;
+  const grown = fs.statSync(path.join(directory, segment)).size;
+  assert.deepEqual(
+    (await follower.poll()).map((item) => item.file),
+    ['a2.jsonl.zst'],
+    'the appended entry did not arrive',
+  );
+  assert.equal(follower.bytesRead, grown, 'the follower read the whole file again after an append');
+  assert.ok(grown > firstBytes);
   const initial = follower.bytesRead;
-  assert.ok(initial > 0);
   assert.deepEqual(await follower.poll(), [], 'an unchanged store gave an entry');
   assert.equal(follower.bytesRead, initial, 'a poll with no appended bytes read the store again');
   first.dispose();
