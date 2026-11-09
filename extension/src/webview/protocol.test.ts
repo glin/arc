@@ -22,11 +22,13 @@ test('selection paint replies retain their identity and reject malformed or reve
     { paintedAt: undefined, reason: 'unknown' },
   ])
     assert.equal(parsePanelToHost({ ...message, ...fields }), null);
-  assert.deepEqual(parsePanelToHost({ ...message, paintedAt: undefined, reason: 'replaced' }), {
-    ...message,
-    paintedAt: undefined,
-    reason: 'replaced',
-  });
+  for (const reason of ['replaced', 'unsettled']) {
+    assert.deepEqual(parsePanelToHost({ ...message, paintedAt: undefined, reason }), {
+      ...message,
+      paintedAt: undefined,
+      reason,
+    });
+  }
 });
 
 test('response file citations retain their typed literal destination at the host boundary', () => {

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'vitest';
 import * as ts from 'typescript';
-import { createSelectionPaint } from './selection-paint.ts';
+import { createSelectionPaint, SELECTION_PAINT_FRAME_LIMIT } from './selection-paint.ts';
 import type { PanelToHost } from './protocol.ts';
 
 type PaintMessage = Extract<PanelToHost, { type: 'selectionPainted' }>;
@@ -94,6 +94,21 @@ test('an unrelated render of the same session preserves the first receipt and pe
   f.frames.shift()!();
   f.frames.shift()!();
   assert.equal(f.messages[0].receivedAt, 100);
+});
+
+test('a paint wait that never settles ends with one reason at the frame limit', () => {
+  const f = paintFixture();
+  f.settle(false);
+  f.paint.receive({ showing: 'selected', selectionTiming: { id: 1, sessionId: 'selected' } }, 100);
+  f.paint.schedule();
+  for (let frame = 0; frame < SELECTION_PAINT_FRAME_LIMIT; frame++) {
+    assert.deepEqual(f.messages, []);
+    f.frames.shift()!();
+  }
+  assert.deepEqual(f.messages, [
+    { type: 'selectionPainted', id: 1, sessionId: 'selected', receivedAt: 100, reason: 'unsettled' },
+  ]);
+  assert.equal(f.frames.length, 0, 'the wait scheduled another frame after it ended');
 });
 
 test('the selection paint assertion fails when the production paint post is removed', () => {

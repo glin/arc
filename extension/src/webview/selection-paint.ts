@@ -1,5 +1,7 @@
 import type { PanelToHost } from './protocol.ts';
 
+export const SELECTION_PAINT_FRAME_LIMIT = 240;
+
 // Times one selection from the render's receipt to its settled paint and replies to the host once.
 export function createSelectionPaint(
   send: (message: Extract<PanelToHost, { type: 'selectionPainted' }>) => void,
@@ -7,7 +9,7 @@ export function createSelectionPaint(
   settled: () => boolean,
   now = () => performance.timeOrigin + performance.now(),
 ) {
-  let pending: { id: number; sessionId: string; receivedAt: number; scheduled: boolean } | null = null;
+  let pending: { id: number; sessionId: string; receivedAt: number; scheduled: boolean; frames: number } | null = null;
   let lastId = 0;
   function abandon(reason: Extract<PanelToHost, { type: 'selectionPainted' }>['reason']) {
     if (!pending) return;
@@ -22,8 +24,10 @@ export function createSelectionPaint(
     afterPaint(() => {
       if (pending !== stamp) return;
       stamp.scheduled = false;
+      stamp.frames += 2;
       if (!settled()) {
-        schedule();
+        if (stamp.frames >= SELECTION_PAINT_FRAME_LIMIT) abandon('unsettled');
+        else schedule();
         return;
       }
       pending = null;
@@ -50,7 +54,7 @@ export function createSelectionPaint(
       const stamp = message.selectionTiming;
       if (stamp && Number.isSafeInteger(stamp.id) && stamp.id > lastId && stamp.sessionId === message.showing) {
         lastId = stamp.id;
-        pending = { ...stamp, receivedAt, scheduled: false };
+        pending = { ...stamp, receivedAt, scheduled: false, frames: 0 };
       }
     },
     schedule,
