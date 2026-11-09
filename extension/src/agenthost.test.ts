@@ -4008,8 +4008,8 @@ test('disposing the host ends every child it started', async () => {
   assert.deepEqual(host.states(), []);
 });
 
-test('archive, idle and targeted retirement react to final background completion without another turn', async () => {
-  for (const mode of ['archive', 'idle', 'targeted', 'unarchive']) {
+test('idle and targeted retirement react to final background completion without another turn', async () => {
+  for (const mode of ['idle', 'targeted']) {
     vi.useFakeTimers();
     const timer = new FakeAgentHostTimer();
     const { host, children } = fakeHost(undefined, Date.now, { timer });
@@ -4047,8 +4047,7 @@ test('archive, idle and targeted retirement react to final background completion
     settle(host, 'one');
     let retirement: Promise<void> | undefined;
     if (mode === 'targeted') retirement = host.retireSession('one');
-    else if (mode !== 'idle') host.setArchived(['sess-1']);
-    assert.strictEqual(host.get('one'), session, 'archive closed an idle child whose background tasks still run');
+    assert.strictEqual(host.get('one'), session, 'retirement closed an idle child whose background tasks still run');
     vi.setSystemTime(Date.now() + 48 * 60 * 60 * 1000);
     host.setIdleDuration(1);
     for (let index = 0; index < timer.tasks.length; index++) timer.fire(index);
@@ -4095,12 +4094,8 @@ test('archive, idle and targeted retirement react to final background completion
     settle(host, 'one');
     notice('command', 'task', 'completed');
     assert.strictEqual(host.get('one'), session, 'one task completion released the other task');
-    if (mode === 'unarchive') host.setArchived([]);
     notice('agent', 'child', 'completed');
-    if (mode === 'unarchive') {
-      assert.strictEqual(host.get('one'), session, 'completion ignored unarchive');
-      host.setArchived(['sess-1']);
-    } else if (mode === 'idle') {
+    if (mode === 'idle') {
       assert.strictEqual(host.get('one'), session);
       assert.equal(timer.tasks.at(-1)?.delayMs, 1, 'completion did not restart idle retirement');
       timer.fire(timer.tasks.length - 1);
@@ -4113,7 +4108,7 @@ test('archive, idle and targeted retirement react to final background completion
   }
 });
 
-test('unrelated and malformed background completions cannot retire an archived live child', async () => {
+test('unrelated and malformed background completions cannot satisfy a targeted retirement', async () => {
   const qualified = '<task-id>actual-task</task-id><tool-use-id>command</tool-use-id><status>completed</status>';
   const invalid = [qualified.replace('actual-task', 'unrelated-task')];
   for (const field of ['status', 'tool-use-id', 'task-id']) {
@@ -4154,7 +4149,7 @@ test('unrelated and malformed background completions cannot retire an archived l
     });
     children[0].say(COMPLETED_RESULT);
     settle(host, 'one');
-    host.setArchived(['sess-1']);
+    const retirement = host.retireSession('one');
     const notice = (body: string) =>
       say({
         type: 'user',
@@ -4169,6 +4164,7 @@ test('unrelated and malformed background completions cannot retire an archived l
     assert.equal(host.get('one'), null);
     assert.equal(children[0].ended, true);
     children[0].exit(0);
+    await retirement;
   }
 });
 
@@ -4179,11 +4175,71 @@ test('accepted background metadata survives missing later reads and protects a r
   children[0].answerHandshake();
   const session = await opening;
   host.retainBackgroundWork('claude', 'sess-1', [], []);
-  host.setArchived(['sess-1']);
+  void host.retireSession('one');
   assert.strictEqual(host.get('one'), session);
   assert.equal(children[0].ended, false);
-  host.setArchived([]);
+  host.cancelSessionRetirement('one');
   host.dispose();
+});
+
+// Opens a child whose current turn launched one background command that never reports its end.
+async function childWithBackgroundJob(options: Parameters<typeof fakeHost>[2] = {}) {
+  const { host, children } = fakeHost(undefined, undefined, options);
+  const opening = host.session('one', claudePlan(CLAUDE, { cwd: WS, sessionId: 'sess-1' }));
+  children[0].answerHandshake();
+  const session = await opening;
+  const say = (record: object) =>
+    children[0].say(JSON.stringify({ session_id: 'sess-1', parent_tool_use_id: null, ...record }) + '\n');
+  await session.prompt('start the job');
+  say({
+    type: 'assistant',
+    message: {
+      content: [{ type: 'tool_use', name: 'Bash', id: 'launch', input: { command: 'job', run_in_background: true } }],
+    },
+  });
+  say({
+    type: 'user',
+    tool_use_result: { backgroundTaskId: 'job-task' },
+    message: { content: [{ type: 'tool_result', tool_use_id: 'launch' }] },
+  });
+  assert.equal(session.state().backgroundPending, true);
+  return { host, child: children[0], session, say };
+}
+
+test('archiving a settled child with an open background hold and no notice ends it once', async () => {
+  const { host, child, session } = await childWithBackgroundJob();
+  const dispose = vi.spyOn(session, 'dispose');
+  child.say(COMPLETED_RESULT);
+  settle(host, 'one');
+  assert.strictEqual(host.get('one'), session);
+
+  host.setArchived(['sess-1']);
+  assert.equal(host.get('one'), null, 'the archived child stayed open behind its background hold');
+  assert.equal(child.ended, true);
+  host.setArchived(['sess-1']);
+  assert.equal(dispose.mock.calls.length, 1);
+});
+
+test('an archive during a turn with an open background hold ends the child after the turn settles', async () => {
+  const { host, child, session } = await childWithBackgroundJob();
+  host.setArchived(['sess-1']);
+  assert.strictEqual(host.get('one'), session, 'the archive ended a child during its turn');
+  assert.equal(child.ended, false);
+  child.say(COMPLETED_RESULT);
+  settle(host, 'one');
+  assert.equal(host.get('one'), null);
+  assert.equal(child.ended, true);
+});
+
+test('an unarchived child with an open background hold does not retire at the idle limit', async () => {
+  const timer = new FakeAgentHostTimer();
+  const { host, child, session } = await childWithBackgroundJob({ idleDurationMs: 120, timer });
+  child.say(COMPLETED_RESULT);
+  settle(host, 'one');
+  assert.equal(timer.activeCount(), 0, 'an idle window started behind the background hold');
+  for (let index = 0; index < timer.tasks.length; index++) timer.fire(index);
+  assert.strictEqual(host.get('one'), session);
+  assert.equal(child.ended, false);
 });
 
 test('a settled idle session retires when its timer fires', async () => {

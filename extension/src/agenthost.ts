@@ -4302,8 +4302,11 @@ export class AgentHost {
     this.targetedRetirements.clear();
   }
 
+  // Archive retirement ignores the background hold, so a job that the session still runs can end with its child.
   private eligible(state: SessionState): boolean {
-    return !state.exited && !state.busy && !state.backgroundPending && state.asks.length === 0;
+    return (
+      !state.exited && !state.busy && state.asks.length === 0 && (this.isArchived(state) || !state.backgroundPending)
+    );
   }
 
   private requestRetirement(
