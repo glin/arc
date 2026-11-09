@@ -494,6 +494,15 @@ export class CompressedBackfill {
         if (this.disposed) return;
         // A name that a later list dropped, or that a plain rollout replaced, is no longer backfilled.
         if (!this.names.has(job.file) || this.exists(job.file.replace(/\.zst$/, ''))) continue;
+        // Another window's backfill can decode a queued body while this one waits for the store lease.
+        const stored = this.factsOf(job.file);
+        if (
+          stored &&
+          compressedEntryCurrent(stored, job.stat) &&
+          stored.decodedLength !== undefined &&
+          !stored.unreadable
+        )
+          continue;
         if (job.kind === 'opening') await this.deriveOpening(job);
         else await this.deriveBody(job);
       }

@@ -16047,6 +16047,40 @@ test('a plan yield and a store read yield wait for a request', async () => {
   }
 });
 
+test('a queued body that another window decoded is not decoded again', async () => {
+  const decoded: string[] = [];
+  const harness = backfillHarness({
+    exists: () => false,
+    statOf: () => ({ ...unitStat, isFile: true }),
+    stream: async (file) => {
+      decoded.push(file);
+      harness.known.set('b.jsonl.zst', {
+        file: 'b.jsonl.zst',
+        pairKey: 'b.jsonl.zst',
+        ...compressedEntryVersions(),
+        size: unitStat.size,
+        mtimeMs: unitStat.mtimeMs,
+        decodedLength: 5,
+        complete: true,
+        opening: compressedOpening,
+      });
+      return unitDecoded();
+    },
+  });
+  seedBody(harness, 'a.jsonl.zst');
+  seedBody(harness, 'b.jsonl.zst');
+  try {
+    harness.backfill.setNames(['a.jsonl.zst', 'b.jsonl.zst']);
+    await vi.waitFor(() => {
+      harness.advance(0);
+      assert.equal(harness.batches.length, 1, 'the first body did not publish');
+    });
+    assert.deepEqual(decoded, ['a.jsonl.zst'], 'a body that another window decoded was decoded again');
+  } finally {
+    harness.backfill.dispose();
+  }
+});
+
 const unitStat = { size: 10, mtimeMs: 2, dev: 1, ino: 1 };
 const unitDecoded = (hash = 'h') =>
   ({ kind: 'decoded', hash, stat: unitStat as never, frames: 1, complete: true }) as const;
