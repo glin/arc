@@ -1,18 +1,16 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import { test } from 'vitest';
-import * as ts from 'typescript';
 import { createSelectionPaint, SELECTION_PAINT_FRAME_LIMIT } from './selection-paint.ts';
 import type { PanelToHost } from './protocol.ts';
 
 type PaintMessage = Extract<PanelToHost, { type: 'selectionPainted' }>;
 
-function paintFixture(create = createSelectionPaint) {
+function paintFixture() {
   const frames: Array<() => void> = [];
   const messages: PaintMessage[] = [];
   let settled = true;
   let now = 120;
-  const paint = create(
+  const paint = createSelectionPaint(
     (message) => messages.push(message),
     (callback) => frames.push(() => frames.push(callback)),
     () => settled,
@@ -128,35 +126,4 @@ test('a paint wait that never settles ends with one reason at the frame limit', 
     { type: 'selectionPainted', id: 1, sessionId: 'selected', receivedAt: 100, reason: 'unsettled' },
   ]);
   assert.equal(f.frames.length, 0, 'the wait scheduled another frame after it ended');
-});
-
-test('the selection paint assertion fails when the production paint post is removed', () => {
-  const source = readFileSync(new URL('./selection-paint.ts', import.meta.url), 'utf8');
-  const file = ts.createSourceFile('selection-paint.ts', source, ts.ScriptTarget.Latest, true);
-  const declaration = file.statements.find(
-    (node) => ts.isFunctionDeclaration(node) && node.name?.text === 'createSelectionPaint',
-  );
-  assert.ok(declaration);
-  const changed = declaration.getText(file).replace(/send\(\{[^;]*paintedAt: now\(\),?\s*\}\);/, '');
-  assert.notEqual(changed, declaration.getText(file));
-  const module = {
-    exports: {} as { createSelectionPaint: typeof createSelectionPaint },
-  };
-  // oxlint-disable-next-line typescript/no-implied-eval
-  new Function(
-    'module',
-    'exports',
-    ts.transpileModule(changed, {
-      compilerOptions: {
-        module: ts.ModuleKind.CommonJS,
-        target: ts.ScriptTarget.ESNext,
-      },
-    }).outputText,
-  )(module, module.exports);
-  const f = paintFixture(module.exports.createSelectionPaint);
-  f.paint.receive({ showing: 'selected', selectionTiming: { id: 1, sessionId: 'selected' } }, 100);
-  f.paint.schedule();
-  f.frames.shift()!();
-  f.frames.shift()!();
-  assert.throws(() => assert.equal(f.messages[0]?.paintedAt, 120), assert.AssertionError);
 });

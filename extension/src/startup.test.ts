@@ -17675,61 +17675,54 @@ test('opening a session leaves the rail to the render that selection asked for',
   assert.equal(provider.rails().length, 2, 'a read mark made once the selection settled never reaches the rail');
 });
 
-test.each(['held', 'read'] as const)(
-  'a reader selection records arrival through transcript paint with a %s window',
-  async (window) => {
-    const logged: Array<{ event: string; record: Record<string, unknown> }> = [];
-    const provider = paintHarness(['onMessage', 'routePerformanceEvent', 'sendToHost'], {
-      parsePanelToHost,
-      dispatchPanelToHost,
-      READER_INSTRUCTIONS: new Set(),
-    });
-    const host = provider.hosts[0];
-    provider.hostSessions = new Map();
-    provider.hostPreviousSessions = new Map();
-    provider.panelSession = (session: string) => session;
-    provider.authoritativeCatalog = provider.partial;
-    let current = window === 'held';
-    provider.progressiveCurrent = () => current;
-    provider.completeSelectedWindow = async () => {
-      if (current) return;
-      current = true;
-      provider.refreshFrom('selected-window', true, true, null, true, true);
+test.each([
+  ['held', 'held', false],
+  ['read', 'read', false],
+  ['grown', 'read', true],
+] as const)(
+  'a reader selection of a %s window records arrival through paint on its first drawable post',
+  async (name, window, heldCards) => {
+    let now = 1000;
+    const clock = vi.spyOn(performance, 'now').mockImplementation(() => now);
+    const f = selectionHarness();
+    let current = name === 'held';
+    f.provider.progressiveCurrent = () => current;
+    f.provider.collect = () => {
+      now += 5;
+      return current || heldCards ? [{ key: 'turn', sessionId: 'claude-a' }] : [];
     };
-    const refresh = provider.refresh.bind(provider);
-    const runs: Promise<void>[] = [];
-    provider.refresh = (...args: unknown[]) => {
-      const run = refresh(...args);
-      runs.push(run);
-      return run;
-    };
-    provider.diagnostics.log = (event: string, record: Record<string, unknown>) => logged.push({ event, record });
-    provider.panelStartedAt = null;
-    provider.performanceCounters = new PanelPerformanceCounters(Date.now(), {
-      enabled: () => true,
-      emit: (event: string, record: Record<string, unknown>) => provider.routePerformanceEvent(event, record),
-    });
     const frames: Array<() => void> = [];
     const replies: Promise<void>[] = [];
     const paint = createSelectionPaint(
       (message) => {
-        replies.push(provider.onMessage(message, host));
+        replies.push(f.provider.onMessage(message, f.host));
       },
       (callback) => frames.push(() => frames.push(callback)),
       () => true,
+      () => performance.timeOrigin + now,
     );
     try {
-      await provider.onMessage({ type: 'showSession', session: 'claude-a' }, host);
-      await Promise.all(runs);
-      const render = provider.messages.find((message: any) => message.selectionTiming);
-      assert.ok(render, 'the selected transcript carries no timing identity');
-      paint.receive(render, performance.timeOrigin + performance.now());
+      await f.provider.onMessage({ type: 'showSession', session: 'claude-a' }, f.host);
+      await f.settled();
+      const readCompletedAt = performance.timeOrigin + (now += 20);
+      if (!current) {
+        current = true;
+        f.provider.refreshFrom('selected-window', true, true, null, true, true);
+        await f.settled();
+      }
+      const render = f.posts().find((post) => post.showing === 'claude-a' && post.cards.length > 0);
+      assert.ok(render, 'the selected transcript was never drawn');
+      assert.deepEqual(render.selectionTiming, { id: 1, sessionId: 'claude-a' });
+      assert.equal(f.posts().filter((post) => post.selectionTiming).length, 1);
+      now += 3;
+      paint.receive(render, performance.timeOrigin + now);
       paint.schedule();
+      now += 7;
       frames.shift()!();
-      assert.equal(provider.performanceCounters.snapshot().work['selection:painted'], undefined);
+      assert.equal(f.provider.performanceCounters.snapshot().work['selection:painted'], undefined);
       frames.shift()!();
       await Promise.all(replies);
-      const timing = provider.performanceCounters.snapshot().selections[0];
+      const timing = f.timing();
       const names = [
         'selection:hostArrived',
         'selection:renderPosted',
@@ -17739,28 +17732,34 @@ test.each(['held', 'read'] as const)(
       assert.equal(timing.sessionId, 'claude-a');
       assert.equal(timing.window, window);
       assert.equal(timing.reason, null);
-      const stamps = names.map((name) => timing.stamps[name]);
+      const stamps = names.map((stamp) => timing.stamps[stamp]);
       assert.ok(
         stamps.every((stamp) => typeof stamp === 'number'),
         'the selection is missing a paint stamp',
       );
       assert.deepEqual(
         stamps,
-        [...stamps].sort((a, b) => a - b),
+        [...stamps].sort((left, right) => left - right),
+      );
+      assert.equal(
+        timing.stamps['selection:renderPosted'] < readCompletedAt,
+        name !== 'read',
+        'the render stamp does not name the first post that draws the session',
       );
       assert.deepEqual(
-        logged.filter((line) => line.event.startsWith('selection:')).map((line) => line.event),
+        f.logged.filter((line) => line.event.startsWith('selection:')).map((line) => line.event),
         names,
       );
       const docs = fs.readFileSync(path.join(__dirname, '..', '..', 'docs', 'performance.md'), 'utf8');
-      for (const name of names) {
-        assert.equal(provider.performanceCounters.snapshot().work[name], 1);
-        assert.ok(docs.includes('`' + name + '`'), `performance.md omits ${name}`);
-        assert.equal(logged.find((line) => line.event === name)!.record.sessionId, 'claude-a');
+      for (const stamp of names) {
+        assert.equal(f.provider.performanceCounters.snapshot().work[stamp], 1);
+        assert.ok(docs.includes('`' + stamp + '`'), `performance.md omits ${stamp}`);
+        assert.equal(f.logged.find((line) => line.event === stamp)!.record.sessionId, 'claude-a');
       }
       assert.equal(replies.length, 1);
     } finally {
-      provider.performanceCounters.dispose();
+      f.provider.performanceCounters.dispose();
+      clock.mockRestore();
     }
   },
 );
