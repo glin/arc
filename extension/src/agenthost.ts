@@ -4528,6 +4528,8 @@ export class AgentHost {
     this.sessions.delete(key);
     const state = session.state();
     const identity = state.sessionId ? this.sessionIdentity(session.agent, state.sessionId) : null;
+    // Archive retirement can end a child that a targeted request waits on. The request resolves after the exit.
+    const targeted = this.targetedRetirements.get(key);
     let completeShutdown: () => void = () => undefined;
     const shutdown = new Promise<void>((resolve) => {
       completeShutdown = resolve;
@@ -4543,6 +4545,10 @@ export class AgentHost {
       }
       if (identity && this.retiringSessions.get(identity) === shutdown) {
         this.retiringSessions.delete(identity);
+      }
+      if (targeted && this.targetedRetirements.get(key) === targeted) {
+        this.targetedRetirements.delete(key);
+        targeted.resolve();
       }
     });
     return shutdown;

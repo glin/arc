@@ -4243,6 +4243,34 @@ test('an archive during a turn with an open background hold ends the child after
   finishChild(child);
 });
 
+test('a targeted retirement waiting on a background hold resolves after archive ends the child', async () => {
+  for (const path of ['immediate', 'deferred']) {
+    vi.useFakeTimers();
+    const { host, child, session } = await childWithBackgroundJob();
+    if (path === 'immediate') {
+      child.say(COMPLETED_RESULT);
+      settle(host, 'one');
+    }
+    let resolved = false;
+    void host.retireSession('one').then(() => {
+      resolved = true;
+    });
+    host.setArchived(['sess-1']);
+    if (path === 'deferred') {
+      assert.strictEqual(host.get('one'), session, 'the archive ended a child during its turn');
+      child.say(COMPLETED_RESULT);
+      settle(host, 'one');
+    }
+    assert.equal(host.get('one'), null, `${path} archive left the child open`);
+    await vi.advanceTimersByTimeAsync(0);
+    assert.equal(resolved, false, `${path} archive resolved the request before the child exited`);
+    finishChild(child);
+    await vi.advanceTimersByTimeAsync(0);
+    assert.equal(resolved, true, `${path} archive left the targeted retirement waiting after exit`);
+    vi.useRealTimers();
+  }
+});
+
 test('an unarchived child with an open background hold does not retire at the idle limit', async () => {
   vi.useFakeTimers();
   const timer = new FakeAgentHostTimer();
