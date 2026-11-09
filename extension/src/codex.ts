@@ -255,10 +255,7 @@ export class CodexMetaCache {
             : !savedIdentity &&
               stat.mtimeMs >= meta.mtimeMs &&
               (stat.size > meta.size || stat.mtimeMs === meta.mtimeMs)));
-    if (!matches) {
-      this.delete(file);
-      return null;
-    }
+    if (!matches) return null;
     const { size, mtimeMs, dev, ino } = stat;
     if (
       meta.size === size &&
@@ -297,10 +294,12 @@ export class CodexMetaCache {
     const meta = this.readMeta(file, onRead);
     // Refused reads keep an attempt time and retry interval instead of a file-size marker.
     if (meta === undefined) {
+      if (hit?.meta) return hit.meta;
       const wait = hit && hit.meta === undefined ? REFUSED_OPENING_RETRY_MS : REFUSED_OPENING_FIRST_RETRY_MS;
       this.entries.set(file, { meta: undefined, triedAt: this.now(), wait });
       return null;
     }
+    if (hit?.meta) this.delete(file);
     this.entries.set(file, meta ? { meta } : { meta: null, size });
     if (meta) {
       this.changed += 1;
@@ -335,7 +334,7 @@ export class CodexMetaCache {
   // Qualify held openings and read missing or refused ones asynchronously, with at most `limit` lanes.
   // Preserve any non-refusal entry `get` supplies during the read.
   // A missing record keeps its measured size. Later `get` calls retry after growth.
-  // A rejected read keeps a missing or refused entry. An opening that failed qualification stays removed.
+  // A rejected read leaves every existing entry unchanged, including an opening that failed qualification.
   // Return true when the saved openings changed.
   // An aborted `signal` stops each lane before its next stat or read. A compressed rollout gets no read.
   async prime(
@@ -372,22 +371,12 @@ export class CodexMetaCache {
           continue;
         }
         const size = meta ? null : await sizeAsync(file).catch(() => null);
-        if (legacy) {
-          if (this.entries.get(file)?.meta !== legacy) continue;
-          if (meta) {
-            this.install(file, legacyKeeps(legacy, stat, meta) ? openingWithStat(legacy, stat!) : meta);
-          } else {
-            this.delete(file);
-            this.entries.set(file, { meta: null, size });
-          }
-          continue;
-        }
-        if (this.entries.get(file)?.meta !== undefined) {
-          continue;
-        }
-        this.entries.set(file, meta ? { meta } : { meta: null, size });
+        if (this.entries.get(file)?.meta !== held) continue;
         if (meta) {
-          this.changed += 1;
+          this.install(file, legacy && legacyKeeps(legacy, stat, meta) ? openingWithStat(legacy, stat!) : meta);
+        } else {
+          if (held) this.delete(file);
+          this.entries.set(file, { meta: null, size });
         }
       }
     };
