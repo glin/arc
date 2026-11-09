@@ -9723,11 +9723,12 @@ test('a complete walk started by a replacement during the cold pass keeps the ro
   await race.settle();
   const extra = writeRollout('extra');
   const inode = fs.statSync(seeded, { bigint: true }).ino;
-  fs.unlinkSync(seeded);
+  const replacement = `${seeded}.next`;
   fs.writeFileSync(
-    seeded,
+    replacement,
     `${JSON.stringify({ type: 'session_meta', payload: { id: 'seeded', cwd: path.join(root, 'project') } })}\n`,
   );
+  fs.renameSync(replacement, seeded);
   assert.notEqual(fs.statSync(seeded, { bigint: true }).ino, inode, 'the rewrite kept the file identity');
   provider.refreshFrom('replaced', false, true);
   await race.settle();
