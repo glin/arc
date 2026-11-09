@@ -9482,6 +9482,77 @@ test.each([
   await vi.waitFor(() => assert.equal(provider.completeCatalogScope, scope, 'the list never completed'));
 });
 
+test('a dispatched rollout that finishes during a warm cold pass reads its spend before the walk of the pass lists', async () => {
+  const { provider, release, seed, files, settled } = warmStartHarness();
+  const dispatched = seed('dispatched');
+  const facts = (toolUses: number) => {
+    const { size, mtimeMs, dev, ino } = fs.statSync(dispatched);
+    return {
+      sessionId: 'dispatched',
+      revision: { size, mtimeMs, dev, ino },
+      refreshAt: null,
+      startedAt: null,
+      endedAt: null,
+      toolUses,
+      person: false,
+      spend: { models: [], found: true, partial: false, effort: null },
+    };
+  };
+  const complete = provider.prepareClaudeChildren;
+  provider.prepareClaudeChildren = () => {
+    provider.claudeChildReferences = [
+      { kind: 'dispatch', sessionId: 'dispatched', file: dispatched, parentSessionId: 'parent', toolUseIds: [] },
+    ];
+    provider.claudeChildrenDiscovered = true;
+    provider.applyDispatchFacts([facts(1)]);
+    return complete();
+  };
+  const run = provider.progressiveWorker.run;
+  provider.progressiveWorker.run = async (request: ProgressiveRequest, generation: number, signal: AbortSignal) => {
+    if (request.kind !== 'claude-children' || !request.spendOnly) return run(request, generation, signal);
+    return {
+      generation,
+      value: {
+        kind: 'dispatch-spend',
+        held: true,
+        dispatchFacts: [facts(5)],
+        continuation: false,
+        savedDispatch: [],
+        charges: {},
+        dispatchRoots: {},
+      },
+    };
+  };
+  await provider.refresh(true);
+  const scope = JSON.stringify(provider.repositoryScopeRoots);
+  assert.equal(provider.dispatchFacts.get('dispatched')?.toolUses, 1);
+
+  const counters = new PanelPerformanceCounters();
+  provider.performanceCounters = counters;
+  fs.appendFileSync(dispatched, `${JSON.stringify({ type: 'event_msg', payload: { type: 'task_complete' } })}\n`);
+  await provider.refreshAs('watch', true, true, [dispatched], false, false);
+  await vi.waitFor(() =>
+    assert.equal(
+      provider.dispatchFacts.get('dispatched')?.toolUses,
+      5,
+      'the row kept its figure from before the finish',
+    ),
+  );
+  await vi.waitFor(() => assert.equal(provider.refreshController, null));
+  assert.equal(counters.snapshot().work['discoveryRequest:dispatchSpend'], 1);
+  assert.equal(settled(), false, 'the figure waited for the cold pass');
+  assert.equal(provider.completeCatalogScope, undefined, 'the spend read completed the list');
+  assert.deepEqual(provider.sessionLoadingBlocker(provider.refreshGeneration), { reason: 'discovery pending' });
+
+  release();
+  await vi.waitFor(() => assert.ok(provider.finishedColdPass, 'the finished pass was not held'));
+  assert.equal(provider.completeCatalogScope, undefined, 'the list completed before the walk of the pass was listed');
+  provider.browserPainted(provider.hosts[0], provider.refreshGeneration, 'railReady', true);
+  await vi.waitFor(() => assert.deepEqual(files(), [dispatched]));
+  await vi.waitFor(() => assert.equal(provider.completeCatalogScope, scope, 'the list never completed'));
+  assert.equal(provider.dispatchFacts.get('dispatched')?.toolUses, 5);
+});
+
 test('a complete walk before the paint keeps the rollouts it found when the finished pass is listed', async () => {
   const { provider, release, seed, writeRollout, files, releaseAll } = warmStartHarness();
   const seeded = seed('seeded');

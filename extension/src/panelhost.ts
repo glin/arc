@@ -10416,11 +10416,12 @@ export class PanelProvider implements vscode.Disposable {
       // reuses the catalog accepts it before it sends another request.
       const replyHeld = reuseCatalog && this.discoveryComplete?.scope === JSON.stringify(this.repositoryScopeRoots);
       // While members stay settled, a dispatched file that moved needs only its spend read again. The spend-only pass that
-      // follows this refresh reads it with no discovery epoch and no receipt scan.
+      // follows this refresh reads it with no discovery epoch and no receipt scan. A reply held over the saved openings waits
+      // for the refresh that lists the walk of the pass, so it holds back no spend read.
       const spendOnly =
         dispatchChanged &&
         reuseCatalog &&
-        !replyHeld &&
+        (!replyHeld || this.codexListingSeeded) &&
         !this.dispatchDiscoveryPending &&
         this.claudeChildrenDiscovered;
       if (spendOnly) {
