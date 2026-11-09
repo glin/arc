@@ -715,6 +715,110 @@ test('the launch and turn counts of a cancelled request reach the next reply', a
   }
 });
 
+// The folder change cancels workspace A's request and leaves the worker running, and workspace B's request continues the
+// scan. The worker reports each count it adds after the hold, so B's record must equal B's own work.
+test('a workspace folder change keeps the held receipt counts of the old folders out of the new record', async () => {
+  const rootA = tempDir('receipt-worker-scope-a-');
+  const fx = receiptDispatchFixture(rootA, 'claude', 'codex');
+  fs.mkdirSync(fx.receipts.root, { recursive: true });
+  fx.launch(fx.parent, fx.child);
+  fx.launch(fx.grandchild, fx.child);
+  for (let index = 0; index < 40; index++)
+    fs.mkdirSync(path.join(fx.receipts.root, `${index.toString(16).padStart(8, '0')}-1111-2222-3333-444444444444`));
+  const rootB = tempDir('receipt-worker-scope-b-');
+  const catalogB = [receiptDispatchFixture(rootB, 'claude', 'codex').parent];
+  const turn = 'await receiptScanTurn();';
+  const hold = /holdReceiptWork\(charges[^)]*\);/;
+  assert.ok(source.includes(turn) && hold.test(source));
+  const noted = (code: string, counter: string, message: string) => {
+    const site = `charges.${counter}++`;
+    assert.equal(code.split(site).length - 1, 1, `${site} did not match`);
+    return code.replace(site, `(holdPort.postMessage({repeatedCoverage:'${message}'}),${site})`);
+  };
+  const own = { read: 0, rejected: 0, turns: 0 };
+  let afterHold = false;
+  let reachedHold!: () => void;
+  const holding = new Promise<void>((resolve) => (reachedHold = resolve));
+  let recordHeld!: (counts: number[]) => void;
+  const heldCounts = new Promise<number[]>((resolve) => (recordHeld = resolve));
+  const worker = new ProgressiveWorker(
+    `process.env.ARC_HOME=${JSON.stringify(fx.home)};let heldOnce=false;const holdPort=require('node:worker_threads').parentPort;` +
+      launchesFirst(fx.receipts.root) +
+      noted(
+        noted(noted(source, 'receiptLaunchesRead', 'read'), 'receiptLaunchesRejectedAtRequester', 'rejected'),
+        'receiptScanTurns',
+        'turns',
+      )
+        .replace(
+          turn,
+          `${turn}if(!heldOnce&&charges.receiptScanTurns>=3&&charges.receiptLaunchesRead+charges.receiptLaunchesRejectedAtRequester>0){heldOnce=true;holdPort.postMessage({repeatedCoverage:'launch-counted'});while(!signal.aborted)${turn}}`,
+        )
+        .replace(
+          hold,
+          (call) =>
+            `holdPort.postMessage({repeatedCoverage:'held:'+charges.receiptLaunchesRead+':'+charges.receiptLaunchesRejectedAtRequester+':'+charges.receiptScanTurns});${call}`,
+        ),
+    undefined,
+    (message) => {
+      if (message === 'launch-counted') reachedHold();
+      else if (message.startsWith('held:')) {
+        afterHold = true;
+        recordHeld(message.slice('held:'.length).split(':').map(Number));
+      } else if (afterHold && message in own) own[message as keyof typeof own]++;
+    },
+  );
+  const { host, replies } = await receiptDiscoveryHost(worker, [rootA], [fx.parent, fx.child]);
+  const cancel = new AbortController();
+  Object.assign(host, {
+    refreshController: cancel,
+    windowStateHandler() {},
+    repositoryScope: { snapshot: () => ({ ready: true, roots: [rootB] }) },
+    hosts: [],
+    cancelProjectSpendHydration() {},
+    publishWindowState() {},
+    refreshFrom() {},
+    post: async () => {},
+    usagePayload: () => ({}),
+    folders: () => [],
+  });
+  host.loadingLine.release = () => {};
+  try {
+    host.refreshGeneration = 1;
+    const cancelled = host.prepareClaudeChildren(1, cancel.signal);
+    await holding;
+    host.workspaceFoldersChanged();
+    assert.equal(cancel.signal.aborted, true, 'the folder change left the discovery request running');
+    await cancelled;
+    const [heldRead, heldRejected, heldTurns] = await heldCounts;
+    assert.ok(
+      heldRead + heldRejected >= 1 && heldTurns >= 3,
+      `workspace A held ${heldRead}, ${heldRejected}, ${heldTurns}`,
+    );
+    Object.assign(host, { claudeParents: catalogB, catalog: { sessions: catalogB }, authoritativeCatalog: catalogB });
+    const counters = new PanelPerformanceCounters(0, 'receipt-workspace-change');
+    host.performanceCounters = counters;
+    replies.last = null;
+    await host.prepareClaudeChildren(host.refreshGeneration, new AbortController().signal);
+    assert.ok(replies.last, 'workspace B received no reply');
+    const { discovery } = counters.snapshot();
+    assert.equal(
+      discovery.publications + discovery.partialPublications + discovery.continuations,
+      1,
+      'the record holds no reply of workspace B',
+    );
+    const read = discovery.receiptLaunchesRead ?? 0;
+    const rejected = discovery.receiptLaunchesRejectedAtRequester ?? 0;
+    const turns = discovery.receiptScanTurns ?? 0;
+    const newWorkerOpens = discovery.receiptScanOpensNewWorker ?? 0;
+    assert.ok(
+      read === own.read && rejected === own.rejected && turns === own.turns && newWorkerOpens === 0,
+      `workspace A held ${heldRead} read, ${heldRejected} rejected, ${heldTurns} turns. Workspace B did ${own.read} read, ${own.rejected} rejected, ${own.turns} turns and recorded ${read} read, ${rejected} rejected, ${turns} turns, ${newWorkerOpens} new-worker opens`,
+    );
+  } finally {
+    worker.stop();
+  }
+});
+
 test('the receipt slice deadline ends a pass inside a batch of steps', async () => {
   const root = tempDir('receipt-worker-deadline-');
   const fx = receiptDispatchFixture(root, 'claude', 'codex');

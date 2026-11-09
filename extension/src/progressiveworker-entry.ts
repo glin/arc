@@ -280,25 +280,37 @@ const RECEIPT_SCAN_OPEN_CHARGES = {
   refusal: 'receiptScanOpensAfterRefusal',
   completion: 'receiptScanOpensAfterCompletion',
 } as const;
-// Receipt scans and receipt work that no reply counted yet. The worker counts them in its next reply to an uncancelled
-// discovery request, so a scan that opened in a cancelled request and the launches and turns of that request still count.
-const unrecordedReceiptOpens: Array<
-  (typeof RECEIPT_SCAN_OPEN_CHARGES)[keyof typeof RECEIPT_SCAN_OPEN_CHARGES] | 'receiptScanOpensNewWorker'
-> = [];
-const unrecordedReceiptWork = { receiptLaunchesRead: 0, receiptLaunchesRejectedAtRequester: 0, receiptScanTurns: 0 };
-function holdReceiptWork(charges: DiscoveryCharges): void {
-  for (const key of Object.keys(unrecordedReceiptWork) as Array<keyof typeof unrecordedReceiptWork>)
-    unrecordedReceiptWork[key] += charges[key]!;
+// Receipt scans and receipt work that no reply counted yet, by the repository roots of the request that did them. The worker
+// counts them in its next reply to an uncancelled discovery request for the same roots, so a scan that opened in a cancelled
+// request and the launches and turns of that request still count, and no other roots receive them.
+interface HeldReceiptCounts {
+  opens: Array<
+    (typeof RECEIPT_SCAN_OPEN_CHARGES)[keyof typeof RECEIPT_SCAN_OPEN_CHARGES] | 'receiptScanOpensNewWorker'
+  >;
+  work: { receiptLaunchesRead: number; receiptLaunchesRejectedAtRequester: number; receiptScanTurns: number };
 }
-function recordHeldReceiptCounts(charges: DiscoveryCharges): void {
-  for (const cause of unrecordedReceiptOpens.splice(0)) {
+const heldReceiptCounts = new Map<string, HeldReceiptCounts>();
+function heldReceiptCountsFor(scope: string): HeldReceiptCounts {
+  let held = heldReceiptCounts.get(scope);
+  if (!held) {
+    held = { opens: [], work: { receiptLaunchesRead: 0, receiptLaunchesRejectedAtRequester: 0, receiptScanTurns: 0 } };
+    heldReceiptCounts.set(scope, held);
+  }
+  return held;
+}
+function holdReceiptWork(charges: DiscoveryCharges, scope: string): void {
+  const { work } = heldReceiptCountsFor(scope);
+  for (const key of Object.keys(work) as Array<keyof HeldReceiptCounts['work']>) work[key] += charges[key]!;
+}
+function recordHeldReceiptCounts(charges: DiscoveryCharges, scope: string): void {
+  const held = heldReceiptCounts.get(scope);
+  if (!held) return;
+  heldReceiptCounts.delete(scope);
+  for (const cause of held.opens) {
     charges.receiptScanOpens!++;
     charges[cause]!++;
   }
-  for (const key of Object.keys(unrecordedReceiptWork) as Array<keyof typeof unrecordedReceiptWork>) {
-    charges[key]! += unrecordedReceiptWork[key];
-    unrecordedReceiptWork[key] = 0;
-  }
+  for (const key of Object.keys(held.work) as Array<keyof HeldReceiptCounts['work']>) charges[key]! += held.work[key];
 }
 function closeReceiptScan(cause: 'epoch' | 'store' | 'refusal'): void {
   if (receiptScan) receiptScanClosed = cause;
@@ -949,7 +961,7 @@ async function execute(
       for (const [file, entry] of entries) claudeChildReferences.set(file, entry);
       for (const [file, entry] of entries) if (!entry.complete && !entry.visitedEof) completed.delete(file);
       epoch.completed = [...completed];
-      if (!signal.aborted) recordHeldReceiptCounts(charges);
+      if (!signal.aborted) recordHeldReceiptCounts(charges, scope);
       const referenceEntries = entries.map(withSavedFacts);
       sentReferences = {
         epoch: epoch.epoch!,
@@ -1296,7 +1308,7 @@ async function execute(
     // keep the scan's position.
     if (receiptScan && receiptScan.store.storeIdentity() !== receiptScan.storeIdentity) closeReceiptScan('store');
     if (!receiptScan) {
-      unrecordedReceiptOpens.push(
+      heldReceiptCountsFor(scope).opens.push(
         receiptScanClosed ? RECEIPT_SCAN_OPEN_CHARGES[receiptScanClosed] : 'receiptScanOpensNewWorker',
       );
       const controller = new AbortController();
@@ -1343,7 +1355,7 @@ async function execute(
       for (const file of completed) if (!hostCompleted.has(file)) completionChanges.set(file, true);
       for (const file of hostCompleted) if (!completed.has(file)) completionChanges.set(file, false);
       epoch.completed = [...completed];
-      if (!signal.aborted) recordHeldReceiptCounts(charges);
+      if (!signal.aborted) recordHeldReceiptCounts(charges, scope);
       return pending(undefined, true, rows);
     };
     const receiptDeadline = performance.now() + RECEIPT_SLICE_MS;
@@ -1411,7 +1423,7 @@ async function execute(
       }
     }
     if (signal.aborted) {
-      holdReceiptWork(charges);
+      holdReceiptWork(charges, scope);
       return { kind: 'stale' };
     }
     // Links read from a replaced store never publish with retries read from its replacement.
@@ -1442,7 +1454,7 @@ async function execute(
     );
     const spend = collectDispatchFacts(request, references, admittedReferences, charges);
     heldDispatchReferences = { scope: JSON.stringify(epoch.repositoryRoots), references, admittedReferences };
-    recordHeldReceiptCounts(charges);
+    recordHeldReceiptCounts(charges, scope);
     if (unsettled.unfinished) charges.unsettledUnfinishedSources!++;
     if (unsettled.deferred) charges.unsettledDeferredSources!++;
     if (unsettled.unread) charges.unsettledUnreadSources!++;
