@@ -69,7 +69,7 @@ test('selection stamps and spans reach the capture and the diagnostic event name
   }
 });
 
-test('abandoned selections preserve reached stamps and reject stale or wrong-panel paint replies', () => {
+test('abandoned selections preserve reached stamps and reject stale or wrong-panel paint replies', async () => {
   const counters = new PanelPerformanceCounters();
   const panel = {};
   try {
@@ -91,6 +91,8 @@ test('abandoned selections preserve reached stamps and reject stale or wrong-pan
       'selection:replyArrived': 150,
     });
     assert.equal(result.spans['selection:totalMs'], 40);
+    const guide = await fs.readFile(path.join(__dirname, '..', '..', 'docs', 'performance.md'), 'utf8');
+    assert.match(guide, /filters on a null `reason` before it takes a percentile of the spans/);
     assert.equal(result.spans['selection:roundTripMs'], null);
     assert.equal(result.spans['selection:hostToPaintMs'], null);
     assert.equal(result.spans['selection:hostMs'], 10);
