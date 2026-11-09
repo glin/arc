@@ -20,13 +20,23 @@ export function temporaryIsStale(
   if (Number(parts[2]) === ownPid) {
     return true;
   }
-  if (now - Number(parts[3]) < TEMPORARY_GRACE_MILLISECONDS) {
-    return false;
-  }
-  return !running(Number(parts[2]));
+  return temporaryWriterGone(Number(parts[2]), Number(parts[3]), now, running);
 }
 
-function processIsRunning(pid: number): boolean {
+// A temporary of another writer is stale once the grace period passed and its process stopped.
+export function temporaryWriterGone(
+  pid: number,
+  writtenAt: number,
+  now: number,
+  running: (pid: number) => boolean,
+): boolean {
+  if (now - writtenAt < TEMPORARY_GRACE_MILLISECONDS) {
+    return false;
+  }
+  return !running(pid);
+}
+
+export function processIsRunning(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
@@ -93,17 +103,20 @@ export function retryingReplace({
 // Other editor windows use separate temporaries. Cleanup retains their temporaries while their processes run.
 // `replace` lets a caller supply the rename operation.
 // A caller with a shared, populated directory can disable leftover scans. The current temporary still closes with each write.
+// `writerToken` replaces the process ID in the temporary name, so a caller with several writers in one process can tell
+// its own temporaries from another writer's. Leftover scans do not recognize such a name.
 export function writeFileAtomically(
   target: string,
   text: string,
   replace: (temporary: string, target: string) => void = fs.renameSync,
   mode?: number,
   cleanup = true,
+  writerToken?: string,
 ): void {
   fs.mkdirSync(path.dirname(target), { recursive: true });
   // Remove leftovers before writing. A previous temporary from this process can have the same name as the new one.
   if (cleanup) removeStaleTemporaries(target);
-  const temporary = `${target}.${process.pid}.${Date.now()}.tmp`;
+  const temporary = `${target}.${writerToken ?? process.pid}.${Date.now()}.tmp`;
   try {
     fs.writeFileSync(temporary, text, { encoding: 'utf8', mode });
     replace(temporary, target);

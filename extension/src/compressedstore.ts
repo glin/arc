@@ -1,0 +1,1015 @@
+// The stores of compressed rollout facts. One directory per store holds an `epoch` file, the lock `backfill.lock`,
+// segments of one JSON line per revision, compacted shards and the manifests that name them. Only the worker writes.
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { processIsRunning, temporaryWriterGone, writeFileAtomically } from './atomicfile';
+import { CODEX_META_VERSION, createExclusive, releaseCodexOpeningsLock, takeCodexOpeningsLock } from './codexopenings';
+import { openingRecordOf, readRolloutStat, ROLLOUT_NAME, type CodexSessionMeta } from './codex';
+import { hashCompressedRollout, readCompressedFirstRecord } from './compressedrollouts';
+import type { DerivedTitleEntry } from './derivedcache';
+import { METADATA_GENERATIONS } from './derivedcache';
+import {
+  keepHigherSpend,
+  normalizeSpendFile,
+  PROJECT_SPEND_PARSER_GENERATIONS,
+  type SpendFileIndex,
+} from './projectspend';
+
+// Versions the fields and the derivation of a stored entry. Bump it when a stored field or its derivation changes.
+export const COMPRESSED_FACTS_VERSION = 1;
+export const COMPRESSED_FACTS_STORE = 'compressed-rollout-facts-v1';
+export const COMPRESSED_OPENINGS_STORE = 'compressed-rollout-openings-v1';
+
+export const STORE_LOCK = 'backfill.lock';
+const EPOCH_FILE = 'epoch';
+const SEGMENT_BYTES = 4 * 1024 * 1024;
+const COMPACT_SEGMENTS = 32;
+const COMPACT_INTERVAL_MS = 300_000;
+const RENEW_MS = 10_000;
+// After an abandonment the holder waits a random time in this range before it takes the lock again.
+const RETRY_MIN_MS = 5_000;
+const RETRY_SPREAD_MS = 25_000;
+// A holder with no work left releases the lock after this time, so an idle window holds no lease.
+const IDLE_RELEASE_MS = 20_000;
+const READ_CHUNK = 64 * 1024;
+// An entry above this many bytes drops its title entry. The row keeps a carried name and its cost.
+export const COMPRESSED_ENTRY_TITLE_BYTES = 1024 * 1024;
+// The worker posts at most this many bytes of entries in one batch, or one larger record.
+export const COMPRESSED_BATCH_BYTES = 4 * 1024 * 1024;
+
+// The facts of one compressed rollout. An entry with `adoptionFailed` or `nameOnly` holds no facts, and the backfill
+// reads the names it marks first.
+export interface CompressedFactEntry {
+  file: string;
+  // `canonicalPath` of the rollout without `.zst`.
+  pairKey: string;
+  factsVersion: number;
+  codexMetaVersion: number;
+  metadataGeneration: number;
+  spendGeneration: number;
+  // The physical size and modification time of the `.jsonl.zst`. A name-only record has neither.
+  size?: number;
+  mtimeMs?: number;
+  hash?: string;
+  threadId?: string | null;
+  decodedLength?: number;
+  skippedRecords?: number;
+  undercount?: boolean;
+  // True when the decode ended on a frame boundary. An adopted entry is complete, because its plain record was.
+  complete?: boolean;
+  adopted?: boolean;
+  adoptionFailed?: boolean;
+  nameOnly?: boolean;
+  title?: DerivedTitleEntry;
+  carriedName?: { label: string; fullLabel: string };
+  opening?: CodexSessionMeta | null;
+  spend?: SpendFileIndex;
+}
+
+export interface CompressedStorePaths {
+  facts: string;
+  openings: string;
+}
+
+export interface CompressedAdoptionInput {
+  twin: string;
+  plain: string;
+  plainMtimeMs: number;
+  title?: DerivedTitleEntry;
+  opening?: CodexSessionMeta | null;
+  // The plain spend record, when it is complete.
+  spend?: SpendFileIndex;
+}
+
+export interface CompressedAdoptionResult {
+  adopted: boolean;
+  entry: CompressedFactEntry;
+}
+
+// The pair key of a twin: the canonical path of the rollout without `.zst`. The plain file can be gone, so the twin's
+// directory supplies the physical path and a pair under a junction alias still meets the ledger's path.
+export function compressedPairKey(twin: string): string {
+  let directory = path.dirname(twin);
+  try {
+    directory = fs.realpathSync.native(directory);
+  } catch {
+    // A directory that cannot be resolved keeps its name.
+  }
+  return normalizeSpendFile(path.join(directory, path.basename(twin).replace(/\.zst$/, '')));
+}
+
+function sessionKeyOf(file: string, opening: CodexSessionMeta | null | undefined): string | null {
+  return opening?.sessionId ?? ROLLOUT_NAME.exec(path.basename(file).replace(/\.zst$/, ''))?.[1] ?? null;
+}
+
+// Take the facts of a plain rollout for its twin. The twin's first line must name the same thread, the times must be
+// equal and the plain spend record must be complete. Anything else discards the plain facts, and the entry marks the
+// twin for the backfill.
+export async function adoptCompressedTwin(input: CompressedAdoptionInput): Promise<CompressedAdoptionResult> {
+  const stat = readRolloutStat(input.twin);
+  let first: string | null = null;
+  try {
+    first = await readCompressedFirstRecord(input.twin, COMPRESSED_ENTRY_TITLE_BYTES);
+  } catch {
+    first = null;
+  }
+  const opening = openingRecordOf(first);
+  const threadId = first === null ? null : sessionKeyOf(input.twin, opening);
+  const expected = sessionKeyOf(input.plain, input.opening);
+  const failed = (): CompressedAdoptionResult => ({
+    adopted: false,
+    entry: {
+      file: input.twin,
+      pairKey: compressedPairKey(input.twin),
+      ...compressedEntryVersions(),
+      ...(stat ? { size: stat.size, mtimeMs: stat.mtimeMs } : {}),
+      threadId,
+      adoptionFailed: true,
+    },
+  });
+  if (
+    first === null ||
+    !stat ||
+    !threadId ||
+    threadId !== expected ||
+    stat.mtimeMs !== input.plainMtimeMs ||
+    !input.spend ||
+    input.spend.complete === false
+  )
+    return failed();
+  const hashed = await hashCompressedRollout(input.twin);
+  if (!hashed) return failed();
+  return {
+    adopted: true,
+    entry: {
+      file: input.twin,
+      pairKey: compressedPairKey(input.twin),
+      ...compressedEntryVersions(),
+      size: hashed.stat.size,
+      mtimeMs: hashed.stat.mtimeMs,
+      hash: hashed.hash,
+      threadId,
+      complete: true,
+      adopted: true,
+      skippedRecords: 0,
+      undercount: false,
+      ...(input.title ? { title: { ...input.title, size: hashed.stat.size, mtimeMs: hashed.stat.mtimeMs } } : {}),
+      opening: input.opening ?? opening,
+      spend: input.spend,
+    },
+  };
+}
+
+// The placing opening of an adopted entry for the machine store.
+export function compressedOpeningEntry(entry: CompressedFactEntry): CompressedFactEntry {
+  return {
+    file: entry.file,
+    pairKey: entry.pairKey,
+    factsVersion: entry.factsVersion,
+    codexMetaVersion: entry.codexMetaVersion,
+    metadataGeneration: entry.metadataGeneration,
+    spendGeneration: entry.spendGeneration,
+    size: entry.size,
+    mtimeMs: entry.mtimeMs,
+    threadId: entry.threadId,
+    opening: entry.opening,
+  };
+}
+
+// A marked derivation never replaces a higher total. The entry keeps the higher spend record and takes the mark.
+export function withKeptUndercount(
+  previous: CompressedFactEntry | undefined,
+  next: CompressedFactEntry,
+): CompressedFactEntry {
+  if (!previous?.spend || !next.undercount || !next.spend) return next;
+  const spend = keepHigherSpend(previous.spend, next.spend);
+  return spend === previous.spend ? { ...next, spend, undercount: true } : next;
+}
+
+// The version stamps of a new entry, as of this build.
+export function compressedEntryVersions(): Pick<
+  CompressedFactEntry,
+  'factsVersion' | 'codexMetaVersion' | 'metadataGeneration' | 'spendGeneration'
+> {
+  return {
+    factsVersion: COMPRESSED_FACTS_VERSION,
+    codexMetaVersion: CODEX_META_VERSION,
+    metadataGeneration: METADATA_GENERATIONS.codex,
+    spendGeneration: PROJECT_SPEND_PARSER_GENERATIONS.codex,
+  };
+}
+
+// True when the entry's title entry has this build's title versions. The row shows a carried name otherwise.
+export function compressedTitleCurrent(entry: CompressedFactEntry): boolean {
+  return entry.factsVersion === COMPRESSED_FACTS_VERSION && entry.metadataGeneration === METADATA_GENERATIONS.codex;
+}
+
+// An entry is current when its stat matches the file and each version matches this build.
+export function compressedEntryCurrent(
+  entry: CompressedFactEntry,
+  stat: { size: number; mtimeMs: number } | null,
+): boolean {
+  return (
+    !!stat &&
+    entry.size === stat.size &&
+    entry.mtimeMs === stat.mtimeMs &&
+    entry.factsVersion === COMPRESSED_FACTS_VERSION &&
+    entry.codexMetaVersion === CODEX_META_VERSION &&
+    entry.metadataGeneration === METADATA_GENERATIONS.codex &&
+    entry.spendGeneration === PROJECT_SPEND_PARSER_GENERATIONS.codex
+  );
+}
+
+// A name that a store file carries, split into its parts. `seq` counts the files of one holder, so a name is unique.
+const STORE_FILE = /^(segment|shard|manifest)-(\d+)-(.+)-(\d+)$/;
+// `<target>.<token>.<time>.tmp`, with a token of `<pid>.<uuid>`.
+const STORE_TEMPORARY = /^(.+)\.(\d+)\.([0-9a-f-]+)\.(\d+)\.tmp$/;
+
+interface StoreName {
+  name: string;
+  kind: 'segment' | 'shard' | 'manifest';
+  epoch: number;
+  token: string;
+  seq: number;
+}
+
+function storeName(name: string): StoreName | null {
+  const parts = STORE_FILE.exec(name);
+  return parts
+    ? { name, kind: parts[1] as StoreName['kind'], epoch: Number(parts[2]), token: parts[3], seq: Number(parts[4]) }
+    : null;
+}
+
+export interface StoreManifest {
+  factsVersion: number;
+  epoch: number;
+  token: string;
+  seq: number;
+  shards: string[];
+  inputs: string[];
+}
+
+function parseManifest(text: string): StoreManifest | null {
+  try {
+    const value = JSON.parse(text) as Partial<StoreManifest>;
+    return typeof value.factsVersion === 'number' &&
+      Array.isArray(value.shards) &&
+      Array.isArray(value.inputs) &&
+      typeof value.epoch === 'number' &&
+      typeof value.token === 'string' &&
+      typeof value.seq === 'number'
+      ? (value as StoreManifest)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function readManifest(directory: string, name: string): StoreManifest | null {
+  try {
+    return parseManifest(fs.readFileSync(path.join(directory, name), 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+// One read of the fact lines of a file. The callback gets each complete line and its byte offset, so a caller holds one
+// line at a time. A trailing line without a line break is skipped.
+function eachLine(file: string, line: (text: Buffer, offset: number) => boolean | void): void {
+  let fd: number;
+  try {
+    fd = fs.openSync(file, 'r');
+  } catch {
+    return;
+  }
+  try {
+    const chunk = Buffer.allocUnsafe(READ_CHUNK);
+    let held: Buffer = Buffer.alloc(0);
+    let heldAt = 0;
+    let position = 0;
+    while (true) {
+      const read = fs.readSync(fd, chunk, 0, READ_CHUNK, position);
+      if (read === 0) return;
+      const bytes = Buffer.concat([held, chunk.subarray(0, read)]);
+      position += read;
+      let start = 0;
+      for (let end = bytes.indexOf(0x0a, start); end >= 0; end = bytes.indexOf(0x0a, start)) {
+        if (line(bytes.subarray(start, end), heldAt + start) === false) return;
+        start = end + 1;
+      }
+      held = bytes.subarray(start);
+      heldAt += start;
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function parseEntry(text: string): CompressedFactEntry | null {
+  try {
+    const value = JSON.parse(text) as Partial<CompressedFactEntry>;
+    return typeof value.file === 'string' && typeof value.factsVersion === 'number' && typeof value.pairKey === 'string'
+      ? (value as CompressedFactEntry)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+// The fact version of a store file, from its first complete line. Null when the file holds no complete line.
+function fileFactsVersion(file: string): number | null {
+  let version: number | null = null;
+  eachLine(file, (line) => {
+    const entry = parseEntry(line.toString('utf8'));
+    version = entry ? entry.factsVersion : null;
+    return false;
+  });
+  return version;
+}
+
+// The fields of an entry that the merge ranks, kept apart from the entry so a compaction holds no entry body.
+interface RankFields {
+  file: string;
+  pairKey: string;
+  factsVersion: number;
+  size?: number;
+  mtimeMs?: number;
+  decodedLength?: number;
+}
+
+function rankFields(entry: CompressedFactEntry): RankFields {
+  return {
+    file: entry.file,
+    pairKey: entry.pairKey,
+    factsVersion: entry.factsVersion,
+    size: entry.size,
+    mtimeMs: entry.mtimeMs,
+    decodedLength: entry.decodedLength,
+  };
+}
+
+interface RankedEntry {
+  entry: RankFields;
+  epoch: number;
+  token: string;
+  // The file and byte offset of the line, in reading order.
+  input: string;
+  offset: number;
+  order: number;
+}
+
+// Greater when `left` ranks first. Current fact version first, then an equal stat, then greater mtimeMs and size, then
+// an entry with a decoded length, the higher epoch, the greater holder token and the later line.
+export function compareRankedEntries(
+  left: RankedEntry,
+  right: RankedEntry,
+  stat: { size: number; mtimeMs: number } | null,
+): number {
+  const a = left.entry;
+  const b = right.entry;
+  const version =
+    Number(a.factsVersion === COMPRESSED_FACTS_VERSION) - Number(b.factsVersion === COMPRESSED_FACTS_VERSION);
+  if (version) return version;
+  const equal = (entry: RankFields) => (!!stat && entry.size === stat.size && entry.mtimeMs === stat.mtimeMs ? 1 : 0);
+  const statRank = equal(a) - equal(b);
+  if (statRank) return statRank;
+  const mtime = (a.mtimeMs ?? -1) - (b.mtimeMs ?? -1);
+  if (mtime) return mtime;
+  const size = (a.size ?? -1) - (b.size ?? -1);
+  if (size) return size;
+  const decoded = Number(a.decodedLength !== undefined) - Number(b.decodedLength !== undefined);
+  if (decoded) return decoded;
+  if (left.epoch !== right.epoch) return left.epoch - right.epoch;
+  if (left.token !== right.token) return left.token > right.token ? 1 : -1;
+  return left.order - right.order;
+}
+
+interface StoreView {
+  // The fact-version files that a reader merges, in reading order.
+  inputs: StoreName[];
+  manifests: StoreName[];
+  valid: StoreManifest[];
+  current: StoreManifest | null;
+  retired: Set<string>;
+}
+
+function listDirectory(directory: string): string[] {
+  try {
+    return fs.readdirSync(directory);
+  } catch {
+    return [];
+  }
+}
+
+// The files of this build's fact version. A manifest is valid when all its shards are present. A reader ignores a shard
+// that no valid manifest names and skips an input that one names.
+function storeView(directory: string, names: readonly string[]): StoreView {
+  const present = new Set(names);
+  const parsed = names.flatMap((name) => {
+    const stored = storeName(name);
+    return stored ? [stored] : [];
+  });
+  const manifests = parsed.filter((stored) => stored.kind === 'manifest');
+  const valid: StoreManifest[] = [];
+  for (const stored of manifests) {
+    const manifest = readManifest(directory, stored.name);
+    if (
+      manifest &&
+      manifest.factsVersion === COMPRESSED_FACTS_VERSION &&
+      manifest.shards.every((shard) => present.has(shard))
+    )
+      valid.push(manifest);
+  }
+  valid.sort((left, right) => left.epoch - right.epoch || left.seq - right.seq);
+  const current = valid.at(-1) ?? null;
+  const named = new Set(valid.flatMap((manifest) => manifest.shards));
+  const retired = new Set(valid.flatMap((manifest) => manifest.inputs));
+  const inputs = parsed.filter(
+    (stored) =>
+      (stored.kind === 'segment' || (stored.kind === 'shard' && named.has(stored.name))) && !retired.has(stored.name),
+  );
+  return { inputs, manifests, valid, current, retired };
+}
+
+export interface CompressedStoreRead {
+  entries: Map<string, CompressedFactEntry>;
+  names: readonly string[];
+}
+
+// Merge the store's files into one entry per path. A file of another fact version is skipped.
+export function readCompressedStore(
+  directory: string,
+  statOf: (file: string) => { size: number; mtimeMs: number } | null = () => null,
+): CompressedStoreRead {
+  const names = listDirectory(directory);
+  const view = storeView(directory, names);
+  const best = new Map<string, { ranked: RankedEntry; entry: CompressedFactEntry }>();
+  let order = 0;
+  for (const input of view.inputs) {
+    if (fileFactsVersion(path.join(directory, input.name)) !== COMPRESSED_FACTS_VERSION) continue;
+    eachLine(path.join(directory, input.name), (line, offset) => {
+      const entry = parseEntry(line.toString('utf8'));
+      if (!entry) return;
+      const ranked: RankedEntry = {
+        entry: rankFields(entry),
+        epoch: input.epoch,
+        token: input.token,
+        input: input.name,
+        offset,
+        order: order++,
+      };
+      const held = best.get(entry.file);
+      if (!held || compareRankedEntries(ranked, held.ranked, statOf(entry.file)) > 0)
+        best.set(entry.file, { ranked, entry });
+    });
+  }
+  const entries = new Map<string, CompressedFactEntry>();
+  for (const [file, { entry }] of best) entries.set(file, entry);
+  return { entries, names };
+}
+
+// Split entries into batches of at most `bytes`. A single larger record forms its own batch.
+export function compressedEntryBatches(
+  entries: readonly CompressedFactEntry[],
+  bytes = COMPRESSED_BATCH_BYTES,
+): CompressedFactEntry[][] {
+  const batches: CompressedFactEntry[][] = [];
+  let current: CompressedFactEntry[] = [];
+  let size = 0;
+  for (const entry of entries) {
+    const length = Buffer.byteLength(JSON.stringify(entry));
+    if (current.length && size + length > bytes) {
+      batches.push(current);
+      current = [];
+      size = 0;
+    }
+    current.push(entry);
+    size += length;
+  }
+  if (current.length) batches.push(current);
+  return batches;
+}
+
+// The line that starts at `offset`, or null when it has no line break.
+function readLineAt(file: string, offset: number): string | null {
+  let fd: number;
+  try {
+    fd = fs.openSync(file, 'r');
+  } catch {
+    return null;
+  }
+  try {
+    const parts: Buffer[] = [];
+    const chunk = Buffer.allocUnsafe(READ_CHUNK);
+    let position = offset;
+    while (true) {
+      const read = fs.readSync(fd, chunk, 0, READ_CHUNK, position);
+      if (read === 0) return null;
+      const end = chunk.subarray(0, read).indexOf(0x0a);
+      if (end >= 0) {
+        parts.push(Buffer.from(chunk.subarray(0, end)));
+        return Buffer.concat(parts).toString('utf8');
+      }
+      parts.push(Buffer.from(chunk.subarray(0, read)));
+      position += read;
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function readEpoch(directory: string): { e: number; token: string } | null {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.join(directory, EPOCH_FILE), 'utf8')) as {
+      e?: unknown;
+      token?: unknown;
+    };
+    return typeof parsed.e === 'number' && typeof parsed.token === 'string'
+      ? { e: parsed.e, token: parsed.token }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function readLockText(lock: string): string | null | 'missing' {
+  try {
+    return fs.readFileSync(lock, 'utf8');
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ENOENT' ? 'missing' : null;
+  }
+}
+
+export interface CompressedStoreOptions {
+  now?: () => number;
+  schedule?: (milliseconds: number, run: () => void) => () => void;
+  retryDelay?: () => number;
+  yieldStep?: () => Promise<void>;
+  // True when the rollout path still exists.
+  exists?: (file: string) => boolean;
+  statOf?: (file: string) => { size: number; mtimeMs: number } | null;
+  // Called with the byte count of every store file write.
+  wrote?: (bytes: number) => void;
+  segmentBytes?: number;
+  compactSegments?: number;
+  // A hook that throws at a named step, for tests of a crash at that step.
+  fault?: (point: string) => void;
+}
+
+interface OpenSegment {
+  name: string;
+  fd: number;
+  bytes: number;
+}
+
+// One writer of a store. It queues entries, holds the lease while it works, and never loses a queued entry to a lost
+// lease: an entry leaves the queue only after its line is written and flushed.
+export class CompressedStoreHolder {
+  private readonly lock: string;
+  private readonly now: () => number;
+  private readonly schedule: (milliseconds: number, run: () => void) => () => void;
+  private readonly retryDelay: () => number;
+  private readonly yieldStep: () => Promise<void>;
+  private readonly exists: (file: string) => boolean;
+  private readonly statOf: (file: string) => { size: number; mtimeMs: number } | null;
+  private readonly wrote: (bytes: number) => void;
+  private readonly fault: (point: string) => void;
+  private readonly segmentBytes: number;
+  private readonly compactSegments: number;
+
+  private readonly queue: CompressedFactEntry[] = [];
+  private token: string | null = null;
+  private epoch: { e: number; token: string } | null = null;
+  private seq = 0;
+  private open: OpenSegment | null = null;
+  private closedSegments = 0;
+  private lastCompaction = 0;
+  private running: Promise<void> | null = null;
+  private cancelRenewal: (() => void) | null = null;
+  private cancelRetry: (() => void) | null = null;
+  private cancelIdle: (() => void) | null = null;
+  private disposed = false;
+
+  constructor(
+    readonly directory: string,
+    options: CompressedStoreOptions = {},
+  ) {
+    this.lock = path.join(directory, STORE_LOCK);
+    this.now = options.now ?? Date.now;
+    this.schedule =
+      options.schedule ??
+      ((milliseconds, run) => {
+        const timer = setTimeout(run, milliseconds);
+        timer.unref();
+        return () => clearTimeout(timer);
+      });
+    this.retryDelay = options.retryDelay ?? (() => RETRY_MIN_MS + Math.random() * RETRY_SPREAD_MS);
+    this.yieldStep = options.yieldStep ?? (() => new Promise((resolve) => setImmediate(resolve)));
+    this.exists = options.exists ?? fs.existsSync;
+    this.statOf =
+      options.statOf ??
+      ((file) => {
+        try {
+          const stat = fs.statSync(file);
+          return { size: stat.size, mtimeMs: stat.mtimeMs };
+        } catch {
+          return null;
+        }
+      });
+    this.wrote = options.wrote ?? (() => {});
+    this.fault = options.fault ?? (() => {});
+    this.lastCompaction = this.now();
+    this.segmentBytes = options.segmentBytes ?? SEGMENT_BYTES;
+    this.compactSegments = options.compactSegments ?? COMPACT_SEGMENTS;
+  }
+
+  // True while this holder owns the lease.
+  get held(): boolean {
+    return this.token !== null;
+  }
+
+  get pending(): number {
+    return this.queue.length;
+  }
+
+  // Queue entries and work them off. The returned promise settles when this run of the queue ends.
+  append(entries: readonly CompressedFactEntry[]): Promise<void> {
+    this.queue.push(...entries);
+    return this.work();
+  }
+
+  // Run the queue once. A failed lease leaves the queue in place and retries after the jitter delay.
+  work(): Promise<void> {
+    if (this.disposed) return Promise.resolve();
+    this.running ??= this.run().finally(() => {
+      this.running = null;
+    });
+    return this.running;
+  }
+
+  private async run(): Promise<void> {
+    if (!this.queue.length || this.disposed) return;
+    this.cancelIdle?.();
+    this.cancelIdle = null;
+    if (!this.token && !(await this.takeLease())) {
+      this.retryLater();
+      return;
+    }
+    while (this.queue.length && this.token) {
+      if (!this.publishBatch()) return;
+      if (this.closedSegments >= this.compactSegments) await this.compact(false);
+      await this.yieldStep();
+    }
+    if (this.token && !this.queue.length) {
+      if (this.now() - this.lastCompaction >= COMPACT_INTERVAL_MS && this.closedSegments > 0) await this.compact(false);
+      if (this.token) this.cancelIdle = this.schedule(IDLE_RELEASE_MS, () => this.releaseIfIdle());
+    }
+  }
+
+  // Step 2 to step 4 of the abandonment sequence, and the recovery of a takeover.
+  private async takeLease(): Promise<boolean> {
+    fs.mkdirSync(this.directory, { recursive: true });
+    const token = takeCodexOpeningsLock(this.lock, this.now());
+    if (token === null) return false;
+    const kept = readEpoch(this.directory);
+    this.token = token;
+    this.fault('takeover:after-lock');
+    if (!this.fenceEpoch(kept)) return false;
+    this.startRenewal();
+    await this.recover();
+    return this.token !== null;
+  }
+
+  private abandonToken(): void {
+    const token = this.token;
+    this.closeSegment();
+    this.cancelRenewal?.();
+    this.cancelRenewal = null;
+    this.token = null;
+    this.epoch = null;
+    if (token) {
+      try {
+        releaseCodexOpeningsLock(this.lock, token);
+      } catch {
+        // A lock that cannot be read is left for the stale takeover.
+      }
+    }
+  }
+
+  // Step 4: write `epoch` above the kept value and every epoch in file names, or abandon when `epoch` moved.
+  private fenceEpoch(kept: { e: number; token: string } | null): boolean {
+    const now = readEpoch(this.directory);
+    if ((now?.e ?? 0) !== (kept?.e ?? 0) || now?.token !== kept?.token) {
+      this.abandon();
+      return false;
+    }
+    const parsed = listDirectory(this.directory).flatMap((name) => {
+      const stored = storeName(name);
+      return stored ? [stored.epoch] : [];
+    });
+    const e = Math.max(kept?.e ?? 0, ...parsed) + 1;
+    const value = { e, token: this.token! };
+    this.writeAtomically(path.join(this.directory, EPOCH_FILE), JSON.stringify(value));
+    this.epoch = value;
+    this.seq = 0;
+    return true;
+  }
+
+  private writeAtomically(target: string, text: string): void {
+    writeFileAtomically(target, text, fs.renameSync, undefined, false, this.token!);
+    this.wrote(Buffer.byteLength(text));
+  }
+
+  private nextName(kind: 'segment' | 'shard' | 'manifest'): string {
+    return `${kind}-${this.epoch!.e}-${this.token}-${this.seq++}`;
+  }
+
+  // A check reads the lease token and `epoch`. A failure abandons.
+  private check(): boolean {
+    const held = this.token;
+    if (!held || !this.epoch) return false;
+    // A paused holder can remove the live lock once, so a missing lock follows the renewal rule.
+    let lock = readLockText(this.lock);
+    if (lock === 'missing' && createExclusive(this.lock, held)) lock = held;
+    if (lock !== held) {
+      this.abandon();
+      return false;
+    }
+    const epoch = readEpoch(this.directory);
+    if (epoch?.e !== this.epoch.e || epoch.token !== this.epoch.token) {
+      this.abandon();
+      return false;
+    }
+    return true;
+  }
+
+  // Every 10 s the holder reads the lock, compares the token and touches the mtime. Another token abandons. A missing
+  // lock is created again, and a failed creation abandons.
+  private startRenewal(): void {
+    this.cancelRenewal?.();
+    const tick = () => {
+      this.cancelRenewal = this.schedule(RENEW_MS, tick);
+      this.renew();
+    };
+    this.cancelRenewal = this.schedule(RENEW_MS, tick);
+  }
+
+  // One renewal. Public for tests that drive the clock.
+  renew(): boolean {
+    if (!this.token) return false;
+    const text = readLockText(this.lock);
+    if (text === 'missing') {
+      if (!createExclusive(this.lock, this.token)) {
+        this.abandon();
+        return false;
+      }
+      return true;
+    }
+    if (text !== this.token) {
+      this.abandon();
+      return false;
+    }
+    const at = new Date(this.now());
+    fs.utimesSync(this.lock, at, at);
+    return true;
+  }
+
+  // Step 1: stop, close the open segment, release the lock on a token match, then retry while work remains.
+  private abandon(): void {
+    this.abandonToken();
+    this.cancelIdle?.();
+    this.cancelIdle = null;
+    if (this.queue.length) this.retryLater();
+  }
+
+  private retryLater(): void {
+    if (this.cancelRetry || this.disposed) return;
+    this.cancelRetry = this.schedule(this.retryDelay(), () => {
+      this.cancelRetry = null;
+      void this.work();
+    });
+  }
+
+  private closeSegment(): void {
+    if (!this.open) return;
+    fs.closeSync(this.open.fd);
+    this.open = null;
+    this.closedSegments++;
+  }
+
+  private publishBatch(): boolean {
+    let bytes = 0;
+    let taken = 0;
+    let oversized = false;
+    const lines: string[] = [];
+    while (taken < this.queue.length && bytes < this.segmentBytes) {
+      let entry = this.queue[taken];
+      let line = `${JSON.stringify(entry)}\n`;
+      if (entry.title && Buffer.byteLength(line) > COMPRESSED_ENTRY_TITLE_BYTES) {
+        const { title, ...rest } = entry;
+        entry = { ...rest, carriedName: { label: title.label, fullLabel: title.fullLabel } };
+        line = `${JSON.stringify(entry)}\n`;
+      }
+      const length = Buffer.byteLength(line);
+      // A record above 4 MiB gets a segment file of its own.
+      if (length > this.segmentBytes) {
+        if (taken) break;
+        oversized = true;
+        lines.push(line);
+        bytes = length;
+        taken = 1;
+        break;
+      }
+      lines.push(line);
+      bytes += length;
+      taken++;
+    }
+    if (!this.check()) return false;
+    if (oversized) this.closeSegment();
+    const segment = this.open ?? this.openSegment();
+    fs.writeSync(segment.fd, lines.join(''));
+    fs.fsyncSync(segment.fd);
+    segment.bytes += bytes;
+    this.wrote(bytes);
+    this.fault('segment:flushed');
+    this.queue.splice(0, taken);
+    if (oversized || segment.bytes >= this.segmentBytes) this.closeSegment();
+    return true;
+  }
+
+  private openSegment(): OpenSegment {
+    const name = this.nextName('segment');
+    const fd = fs.openSync(path.join(this.directory, name), 'a');
+    this.open = { name, fd, bytes: 0 };
+    return this.open;
+  }
+
+  // Recovery at a takeover, before the holder writes any shard, segment or manifest.
+  private async recover(): Promise<void> {
+    const names = listDirectory(this.directory);
+    const view = storeView(this.directory, names);
+    this.fault('recovery:start');
+    const current = view.current;
+    const keepShards = new Set(current?.shards ?? []);
+    for (const stored of view.manifests) {
+      if (current && stored.name === this.manifestName(current)) continue;
+      const manifest = readManifest(this.directory, stored.name);
+      // An unknown-version manifest belongs to a newer build.
+      if (manifest && manifest.factsVersion !== COMPRESSED_FACTS_VERSION) continue;
+      this.remove(stored.name);
+    }
+    if (current) for (const input of current.inputs) this.remove(input);
+    for (const name of names) {
+      const stored = storeName(name);
+      if (stored?.kind === 'shard' && !keepShards.has(name) && this.ownVersion(name)) this.remove(name);
+      const temporary = STORE_TEMPORARY.exec(name);
+      if (temporary) {
+        const pid = Number(temporary[2]);
+        const token = `${temporary[2]}.${temporary[3]}`;
+        const writtenAt = Number(temporary[4]);
+        if (token !== this.token || temporaryWriterGone(pid, writtenAt, this.now(), processIsRunning))
+          this.remove(name);
+      }
+    }
+    this.fault('recovery:deleted');
+    // Other holders' segments count as closed.
+    const after = storeView(this.directory, listDirectory(this.directory));
+    this.closedSegments = after.inputs.filter((stored) => stored.kind === 'segment').length;
+    if (
+      this.closedSegments >= this.compactSegments ||
+      after.valid.length > 1 ||
+      (this.closedSegments && this.compactionDue(after))
+    ) {
+      await this.compact(true);
+    }
+  }
+
+  // The newest manifest's time tells when any holder compacted last.
+  private compactionDue(view: StoreView): boolean {
+    if (!view.current) return true;
+    try {
+      const stat = fs.statSync(path.join(this.directory, this.manifestName(view.current)));
+      return this.now() - stat.mtimeMs >= COMPACT_INTERVAL_MS;
+    } catch {
+      return true;
+    }
+  }
+
+  private manifestName(manifest: StoreManifest): string {
+    return `manifest-${manifest.epoch}-${manifest.token}-${manifest.seq}`;
+  }
+
+  private ownVersion(name: string): boolean {
+    const version = fileFactsVersion(path.join(this.directory, name));
+    return version === null || version === COMPRESSED_FACTS_VERSION;
+  }
+
+  private remove(name: string): void {
+    try {
+      fs.rmSync(path.join(this.directory, name), { force: true });
+    } catch {
+      // A file that cannot be removed stays until the next holder.
+    }
+  }
+
+  private async compact(recovery: boolean): Promise<void> {
+    if (!this.token) return;
+    this.closeSegment();
+    this.fault('compact:start');
+    const names = listDirectory(this.directory);
+    const view = storeView(this.directory, names);
+    const inputs = view.inputs.filter((stored) => this.ownVersion(stored.name));
+    if (!inputs.length) return;
+    const best = new Map<string, RankedEntry>();
+    let order = 0;
+    for (const input of inputs) {
+      eachLine(path.join(this.directory, input.name), (line, offset) => {
+        const entry = parseEntry(line.toString('utf8'));
+        if (!entry) return;
+        const ranked: RankedEntry = {
+          entry: rankFields(entry),
+          epoch: input.epoch,
+          token: input.token,
+          input: input.name,
+          offset,
+          order: order++,
+        };
+        const held = best.get(entry.file);
+        if (!held || compareRankedEntries(ranked, held, this.statOf(entry.file)) > 0) best.set(entry.file, ranked);
+      });
+      await this.yieldStep();
+    }
+    const kept = [...best.values()]
+      .filter(({ entry }) => this.exists(entry.file) || this.exists(entry.file.replace(/\.zst$/, '')))
+      .sort((left, right) =>
+        left.entry.pairKey < right.entry.pairKey ? -1 : left.entry.pairKey > right.entry.pairKey ? 1 : 0,
+      );
+    const shards: string[] = [];
+    let text = '';
+    let bytes = 0;
+    const flush = () => {
+      if (!text) return true;
+      if (!this.check()) return false;
+      const name = this.nextName('shard');
+      this.writeAtomically(path.join(this.directory, name), text);
+      shards.push(name);
+      this.fault('compact:shard-written');
+      text = '';
+      bytes = 0;
+      return true;
+    };
+    for (const ranked of kept) {
+      const stored = readLineAt(path.join(this.directory, ranked.input), ranked.offset);
+      if (stored === null) continue;
+      const line = `${stored}\n`;
+      text += line;
+      bytes += Buffer.byteLength(line);
+      if (bytes >= this.segmentBytes) {
+        if (!flush()) return;
+        await this.yieldStep();
+        if (!this.token) return;
+      }
+    }
+    if (!flush()) return;
+    if (!this.check()) return;
+    this.fault('compact:before-manifest');
+    const manifest: StoreManifest = {
+      factsVersion: COMPRESSED_FACTS_VERSION,
+      epoch: this.epoch!.e,
+      token: this.token,
+      seq: this.seq++,
+      shards,
+      inputs: inputs.map((stored) => stored.name),
+    };
+    this.writeAtomically(path.join(this.directory, this.manifestName(manifest)), JSON.stringify(manifest));
+    this.fault('compact:manifest-saved');
+    for (const input of inputs) this.remove(input.name);
+    this.fault('compact:inputs-deleted');
+    for (const stored of view.manifests)
+      if (stored.name !== this.manifestName(manifest) && this.ownVersionManifest(stored.name)) this.remove(stored.name);
+    this.closedSegments = 0;
+    this.lastCompaction = this.now();
+    this.fault(recovery ? 'recovery:compacted' : 'compact:done');
+  }
+
+  private ownVersionManifest(name: string): boolean {
+    const manifest = readManifest(this.directory, name);
+    return !manifest || manifest.factsVersion === COMPRESSED_FACTS_VERSION;
+  }
+
+  private releaseIfIdle(): void {
+    this.cancelIdle = null;
+    if (!this.token || this.queue.length || this.running) return;
+    this.abandonToken();
+  }
+
+  // Close the segment and release the lock at worker exit or dispose.
+  dispose(): void {
+    this.disposed = true;
+    this.cancelRetry?.();
+    this.cancelIdle?.();
+    this.cancelRetry = null;
+    this.cancelIdle = null;
+    this.abandonToken();
+  }
+}

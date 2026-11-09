@@ -123,7 +123,7 @@ function readText(file: string): string | null {
 }
 
 // Creates file containing token, or returns false if creation or writing fails.
-function createExclusive(file: string, token: string): boolean {
+export function createExclusive(file: string, token: string): boolean {
   let fd: number;
   try {
     fd = fs.openSync(file, 'wx');
