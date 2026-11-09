@@ -2997,7 +2997,12 @@ function completeDiscoveryHarness(
   if (names.includes('runPendingWatch')) names.push('compressedFormChange');
   if (names.includes('browserPainted'))
     names.push('maybeStartCompressedLoad', 'loadCompressedFacts', 'applyCompressedEntries', 'compressedStorePaths');
-  names.push('compressedRolloutsToSend', 'compressedStorePaths', 'resumeCompressedAdoptions');
+  names.push(
+    'compressedRolloutsToSend',
+    'markCompressedRolloutsSent',
+    'compressedStorePaths',
+    'resumeCompressedAdoptions',
+  );
   names.push('compressedSpendPick', 'titleEntryOf', 'compressedTitleOf', 'compressedCarriedNameOf');
   if (names.includes('allSessions') || names.includes('runPendingWatch')) names.push('currentWalkedCatalog');
   if (names.includes('runPendingWatch')) names.push('grownMemberMiss');
@@ -3482,6 +3487,7 @@ function selectedWindowHarness(
 
   const names = new Set([
     'compressedRolloutsToSend',
+    'markCompressedRolloutsSent',
     'compressedStorePaths',
     'resumeCompressedAdoptions',
     'compressedSpendPick',
@@ -10339,6 +10345,7 @@ test.skipIf(!rolloutCompression.zstdCompressSync)(
 test('discovery sends the compressed list only when the set changed since the last send to the current worker', () => {
   const { provider } = heldWalkHarness({ COMPRESSED_FACTS_STORE, COMPRESSED_OPENINGS_STORE, arcHome }, [
     'compressedRolloutsToSend',
+    'markCompressedRolloutsSent',
     'compressedStorePaths',
   ]);
   provider.derivedCacheFile = path.join('cache', 'derived.json');
@@ -10354,9 +10361,16 @@ test('discovery sends the compressed list only when the set changed since the la
     compressed: ['a.jsonl.zst', 'b.jsonl.zst'],
     compressedStores: stores,
   });
+  assert.deepEqual(
+    provider.compressedRolloutsToSend().compressed,
+    ['a.jsonl.zst', 'b.jsonl.zst'],
+    'a list the worker did not answer stayed marked as sent',
+  );
+  provider.markCompressedRolloutsSent(provider.compressedRolloutsRevision);
   assert.deepEqual(provider.compressedRolloutsToSend(), {}, 'an unchanged set was sent again');
   provider.compressedRolloutsRevision++;
   assert.deepEqual(provider.compressedRolloutsToSend().compressed, ['a.jsonl.zst', 'b.jsonl.zst']);
+  provider.markCompressedRolloutsSent(provider.compressedRolloutsRevision);
   provider.progressiveWorker.currentThreadId = 2;
   assert.deepEqual(
     provider.compressedRolloutsToSend().compressed,
@@ -10365,6 +10379,75 @@ test('discovery sends the compressed list only when the set changed since the la
   );
   provider.derivedCacheFile = undefined;
   assert.deepEqual(provider.compressedRolloutsToSend(), {}, 'a panel with no store sent a list');
+});
+
+test('a superseded discovery request sends the compressed list again with the next request', async () => {
+  const { provider, claude, codex } = bumpedCatalogHarness();
+  const rows = [claude, codex];
+  provider.authoritativeCatalog = rows;
+  provider.catalog = { sessions: [claude] };
+  provider.refreshGeneration = 4;
+  provider.showing = codex.sessionId;
+  provider.checkpointDerivedCache = () => {};
+  provider.updateSessionSpendSources = () => {};
+  provider.derivedCacheFile = path.join('cache', 'derived.json');
+  provider.compressedRollouts = new Set(['a.jsonl.zst']);
+  provider.compressedRolloutsRevision = 1;
+  provider.compressedRolloutsSent = null;
+  const checkpoint = {
+    compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
+    parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
+    parents: rows,
+    catalog: rows,
+    repositoryRoots: ['project'],
+    completed: [],
+    position: 1,
+    sequence: 2,
+  };
+  const answer = {
+    generation: 4,
+    value: {
+      kind: 'claude-children-progress',
+      checkpoint,
+      referenceEntries: [],
+      continuation: true,
+      charges: {
+        readBytes: 65536,
+        hits: 0,
+        resets: 0,
+        quanta: 1,
+        dispatchRetries: 0,
+        parentChecks: 0,
+        parentCheckMs: 0,
+        childHeadFiles: 0,
+        childHeadBytes: 0,
+        childHeadMs: 0,
+        dispatchSpendVisits: 0,
+        dispatchSpendRereads: 0,
+        dispatchSpendFiles: 0,
+        dispatchSpendBytes: 0,
+        dispatchSpendMs: 0,
+      },
+    },
+  };
+  const requests: { compressed?: string[] }[] = [];
+  const replies: unknown[] = [null, answer, answer];
+  provider.progressiveWorker = {
+    ...provider.progressiveWorker,
+    currentThreadId: 1,
+    endDiscoveryReplyGap() {},
+    run: (request: { compressed?: string[] }) => {
+      requests.push(request);
+      return Promise.resolve(replies.shift());
+    },
+  };
+  // The worker ends the first request without an answer, as a superseded or cancelled request ends.
+  assert.equal(await provider.prepareClaudeChildren(4, new AbortController().signal), false);
+  assert.deepEqual(requests[0].compressed, ['a.jsonl.zst']);
+  await provider.prepareClaudeChildren(4, new AbortController().signal);
+  assert.deepEqual(requests[1].compressed, ['a.jsonl.zst'], 'the lost list was not sent again');
+  await provider.prepareClaudeChildren(4, new AbortController().signal);
+  assert.equal(requests[2].compressed, undefined, 'a delivered list was sent again');
 });
 
 test('the load of the stores waits for the first render and the pass, holds Project cost busy and applies each batch', async () => {

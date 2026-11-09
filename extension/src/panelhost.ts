@@ -13939,15 +13939,19 @@ export class PanelProvider implements vscode.Disposable {
     }
   }
 
-  // The host set of compressed rollouts, when it changed since the last send to the current worker.
+  // The host set of compressed rollouts, when the current worker has not answered a request that carried this revision.
   private compressedRolloutsToSend(): { compressed?: string[]; compressedStores?: CompressedStorePaths } {
     const stores = this.compressedStorePaths();
     if (!stores) return {};
     const worker = this.progressiveWorker.currentThreadId ?? null;
     const sent = this.compressedRolloutsSent;
     if (sent && sent.worker === worker && sent.revision === this.compressedRolloutsRevision) return {};
-    this.compressedRolloutsSent = { worker, revision: this.compressedRolloutsRevision };
     return { compressed: [...this.compressedRollouts], compressedStores: stores };
+  }
+
+  // The worker answered the request that carried the list. A superseded or cancelled request keeps the list unsent.
+  private markCompressedRolloutsSent(revision: number): void {
+    this.compressedRolloutsSent = { worker: this.progressiveWorker.currentThreadId ?? null, revision };
   }
 
   private async prepareClaudeChildren(
@@ -14125,6 +14129,8 @@ export class PanelProvider implements vscode.Disposable {
       return true;
     };
     const parents = this.claudeParents;
+    const compressedList = this.compressedRolloutsToSend();
+    const compressedRevision = this.compressedRolloutsRevision;
     const result = await this.progressiveWorker
       .run(
         {
@@ -14135,13 +14141,14 @@ export class PanelProvider implements vscode.Disposable {
           repositoryRoots: this.repositoryScopeRoots,
           referenceEntries: [...this.claudeChildReferenceEntries],
           discovery: this.discoveryCheckpoint,
-          ...this.compressedRolloutsToSend(),
+          ...compressedList,
         },
         generation,
         signal,
         acknowledge,
       )
       .catch(() => null);
+    if (result && compressedList.compressed) this.markCompressedRolloutsSent(compressedRevision);
     if (!result) {
       if (signal.aborted) this.performanceCounters?.recordDiscoveryAbort?.();
       this.failSessionLoading(generation, signal);
