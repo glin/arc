@@ -11035,7 +11035,14 @@ export class PanelProvider implements vscode.Disposable {
       ];
       // Reconcile expired compaction activity before deciding whether to render. Removed activity requires an update.
       const swept = this.dropSpentPresses();
-      const liveChildren = this.liveOpenChildren(now);
+      // Exit evidence and row identities settle first, so a newly listed session answers from the rows of this refresh.
+      this.pruneExits(all);
+      const refreshRows = [
+        ...scopedDrafts.map((draft) => ({ id: draft.draftId, agentKey: draft.profile.agent })),
+        ...scopedPendingRecords.map((pending) => ({ id: pending.sessionId, agentKey: pending.agent })),
+        ...all.map((session) => ({ id: session.sessionId, agentKey: session.agent })),
+      ];
+      const liveChildren = this.liveOpenChildren(now, this.sessionOutcomes, refreshRows);
       if (
         !swept &&
         !refreshWanted({
@@ -11091,7 +11098,6 @@ export class PanelProvider implements vscode.Disposable {
       // Build rows for the full catalog, independent of selected transcript reads.
       const counts = this.unreadCounts();
       const fullLabels = new Map<string, string>();
-      this.pruneExits(all);
       this.sessionRows = all.map((f) => {
         // Use recorded activity time, with mtime only when metadata has no timestamp.
         const at = this.activityFor(f);

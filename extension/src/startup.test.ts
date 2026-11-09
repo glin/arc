@@ -6758,6 +6758,89 @@ test('a refresh shares one live child derivation across cards and session list s
   }
 });
 
+// One parent session with one open child written at `writtenAt`. `states` receives each session list state.
+function liveChildRefresh(now: number, writtenAt: number, states: ReturnType<typeof timelineRailState>[]): any {
+  const provider = completeDiscoveryHarness(
+    undefined,
+    false,
+    ['liveOpenChildren', 'railStatuses', 'drawTurnCards', 'childExpiryCosts', 'collect'],
+    {
+      liveTimelineChildren,
+      runningSessionsSince,
+      newestPerSession,
+      turnBudget,
+      turnKey,
+      currentRecordsBySession,
+      groupBySession,
+      composerRuntimeBySession: () => new Map(),
+      recallPromptsOf: () => [],
+      prunedSentPrompts: (sent: unknown) => sent,
+      statsBySession: () => ({}),
+      timelineRailState: (...input: Parameters<typeof timelineRailState>) => {
+        const state = timelineRailState(...input);
+        states.push(state);
+        return state;
+      },
+    },
+  );
+  Object.assign(provider, {
+    turnsByKey: new Map(),
+    promptsBySession: new Map(),
+    sentPrompts: {},
+    trimOlderHistory() {},
+    observeParsedNames() {},
+    headingTitle: () => '',
+  });
+  const outcome = { startedAt: now - 100, endedAt: now, finished: true, openChildren: ['child'] };
+  provider.partial = [
+    {
+      file: 'parent.jsonl',
+      sessionId: 'parent',
+      agent: 'claude',
+      activity: now,
+      size: 100,
+      mtimeMs: now,
+      dev: 1,
+      ino: 1,
+    },
+  ];
+  provider.catalog = { sessions: provider.partial };
+  provider.discovery = Promise.resolve(true);
+  provider.showing = 'parent';
+  provider.outcomesFor = () => new Map([['parent', outcome]]);
+  provider.exitedSinceKeys = new Map();
+  provider.claudeChildReferences = [];
+  provider.claudeChildStatWrites = new Map();
+  provider.claudeChildren = [
+    { parentSessionId: 'parent', sessionId: 'child', file: 'child.jsonl', mtimeMs: writtenAt },
+  ];
+  provider.runningSessions = () => new Set();
+  provider.waitingSessions = () => new Set();
+  provider.heldLifetime.cacheExpiryFacts = { parent: { childSources: ['child'] } };
+  provider.childCacheExpiryAttribution = { read: () => new Map() };
+  return provider;
+}
+
+test('a newly listed session whose host exited lists no subagents after its first refresh', async () => {
+  const now = 100_000;
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+  try {
+    const states: ReturnType<typeof timelineRailState>[] = [];
+    const provider = liveChildRefresh(now, now, states);
+    provider.sessionRows = [];
+    provider.exitedSinceKeys.set('claude:parent', now);
+    await provider.refresh(true);
+    assert.deepEqual(
+      provider.sessionRows.map((row: { id: string }) => row.id),
+      ['parent'],
+    );
+    assert.deepEqual([...states.at(-1)!.openChildren], [], 'the session list counted a child of an exited host');
+    assert.notEqual(states.at(-1)!.statuses.get('parent'), 'subagents');
+  } finally {
+    clock.mockRestore();
+  }
+});
+
 // A selection changes the rows of the session it leaves and the session it enters. Its refresh checks the prompt sources
 // and builds the session list payload of those two sessions alone.
 
