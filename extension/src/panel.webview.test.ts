@@ -9699,7 +9699,7 @@ test('a created draft focuses the existing box and an untouched draft leaves on 
     'the launcher builds a second prompt box instead of focusing the existing one',
   );
   // Session switching abandons an untouched draft before updating the previous selection.
-  const switchAt = panelHostSource.indexOf('private show(session: string | null, host?: PanelHost): void {');
+  const switchAt = panelHostSource.indexOf('private show(session: string | null, host?: PanelHost,');
   const switching = memberFrom(panelHostSource, switchAt);
   sourceMatch(
     switching,
@@ -19712,7 +19712,7 @@ test('nothing leaves the panel with no session shown', () => {
   );
   sourceMatch(
     hostHandler('showSession'),
-    /this\.show\(msg\.session \|\| null, host\);/,
+    /this\.show\(msg\.session \|\| null, host, selectionArrivedAt\);/,
     'the panel can name a session the workspace does not have and be believed',
   );
   // Native selection and navigation history both call show to settle the departing draft.
@@ -32977,6 +32977,8 @@ test('startup shows only the restored selected quick filter until the workspace 
     projectSpend: { update: noop },
     clock: { tick: noop },
     acknowledgePaint: noop,
+    selectionPaint: { receive: noop, schedule: noop },
+    receivedAt: 0,
     pageStyle: { setIconFonts: noop },
     railAcrossSessionAdoption: (rail: unknown, stats: unknown) => ({ rail, stats }),
     replaceRows,
@@ -33120,7 +33122,7 @@ test('selection and accepted worker results avoid unnecessary catalog walks', ()
     'the sentinel stands still under the reader while its page is read',
   );
   // Selection and history navigation share show and its selected-only refresh.
-  const showAt = panelHostSource.indexOf('private show(session: string | null, host?: PanelHost): void {');
+  const showAt = panelHostSource.indexOf('private show(session: string | null, host?: PanelHost,');
   assert.notEqual(showAt, -1, 'the panel opens a session some other way, so this guard is blind');
   const show = memberFrom(panelHostSource, showAt);
   sourceMatch(
@@ -33130,7 +33132,7 @@ test('selection and accepted worker results avoid unnecessary catalog walks', ()
   );
   sourceMatch(
     hostHandler('showSession'),
-    /this\.show\(msg\.session \|\| null, host\);/,
+    /this\.show\(msg\.session \|\| null, host, selectionArrivedAt\);/,
     'the selection message no longer opens a session the way every other route does',
   );
 
