@@ -222,6 +222,14 @@ function activate(options: { stubReadPasses: boolean }) {
     undefined,
     (sample: unknown) => provider.performanceCounters.recordDiscoveryTransport?.(sample),
   );
+  const posts: Counts = {};
+  // Counts each request at the host's send, so a file the host asks the worker to read again moves a row.
+  const send = worker.run.bind(worker);
+  worker.run = (request: { kind: string }, ...rest: unknown[]) => {
+    const name = `workerRequest:${request.kind}`;
+    posts[name] = (posts[name] ?? 0) + 1;
+    return send(request, ...rest);
+  };
   const noGit = { run: async () => null };
   Object.assign(provider, {
     progressiveWorker: worker,
@@ -241,7 +249,6 @@ function activate(options: { stubReadPasses: boolean }) {
       prepareMetadata: async () => true,
       prepareRailEnrichment: async () => ({ changed: false, progress: false, stale: [] }),
     });
-  const posts: Counts = {};
   const started: Promise<unknown>[] = [];
   for (const method of ['refresh', 'continueDiscovery', 'pollCatalog', 'refineDispatchedSpend']) {
     const original = provider[method];

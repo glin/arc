@@ -223,7 +223,7 @@ The script runs these steps in order:
 - `poll and backstop walk`: one poll, then the backstop walk.
 - `collision walk`: rollouts that share a session ID with Claude parents appear. Two walks then read their qualified openings. The collisions arrive last, because two rows of one session ID make every post a snapshot.
 
-The test also counts each posted render, session list and selection message. It records whether the message is a snapshot or a delta, and the rows that it carries.
+The test also counts each posted render, session list and selection message. It records whether the message is a snapshot or a delta, and the rows that it carries. The test counts each worker request at the host's send, under a `workerRequest:` name with the kind of the request.
 
 The script has no parent reorder inside an open discovery epoch. A frozen worker clock finishes each discovery request in one reply, so no second request joins an open epoch. `extension/src/progressiveworker.test.ts` covers that comparison.
 

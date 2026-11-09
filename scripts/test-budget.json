@@ -68,7 +68,7 @@
     },
     "automatic save | readBytes": {
       "reason": "Discovery reads each source once, and the receipt scan reads each receipt once. A rise means a step reads files again.",
-      "budget": 19562,
+      "budget": 19569,
       "margin": 256
     },
     "automatic save | receiptChecks": {
@@ -103,6 +103,11 @@
     },
     "automatic save | watcher:grownMemberMiss:notMember": {
       "reason": "A watcher wake leaves the grown member route only for this gate. A rise means members fail the route more often.",
+      "budget": 1,
+      "margin": 0
+    },
+    "automatic save | workerRequest:claude-children": {
+      "reason": "The host sends a worker request only for work that held state cannot answer. A rise means a step asks the worker to read again.",
       "budget": 1,
       "margin": 0
     },
@@ -168,7 +173,7 @@
     },
     "child watcher event | readBytes": {
       "reason": "Discovery reads each source once, and the receipt scan reads each receipt once. A rise means a step reads files again.",
-      "budget": 21337,
+      "budget": 21344,
       "margin": 256
     },
     "child watcher event | receiptChecks": {
@@ -208,6 +213,21 @@
     },
     "child watcher event | watcher:grownMemberMiss:notMember": {
       "reason": "A watcher wake leaves the grown member route only for this gate. A rise means members fail the route more often.",
+      "budget": 1,
+      "margin": 0
+    },
+    "child watcher event | workerRequest:claude-children": {
+      "reason": "The host sends a worker request only for work that held state cannot answer. A rise means a step asks the worker to read again.",
+      "budget": 1,
+      "margin": 0
+    },
+    "child watcher event | workerRequest:metadata": {
+      "reason": "The host sends a worker request only for work that held state cannot answer. A rise means a step asks the worker to read again.",
+      "budget": 2,
+      "margin": 0
+    },
+    "child watcher event | workerRequest:starts": {
+      "reason": "The host sends a worker request only for work that held state cannot answer. A rise means a step asks the worker to read again.",
       "budget": 1,
       "margin": 0
     },
@@ -313,7 +333,7 @@
     },
     "cold start | readBytes": {
       "reason": "Discovery reads each source once, and the receipt scan reads each receipt once. A rise means a step reads files again.",
-      "budget": 211690,
+      "budget": 211697,
       "margin": 256
     },
     "cold start | receiptChecks": {
@@ -348,6 +368,16 @@
     },
     "cold start | walk:requested:shell-ready": {
       "reason": "A walk runs only for a refresh that asks to list the catalog again. A rise means a caller stopped reusing the held catalog.",
+      "budget": 1,
+      "margin": 0
+    },
+    "cold start | workerRequest:claude-children": {
+      "reason": "The host sends a worker request only for work that held state cannot answer. A rise means a step asks the worker to read again.",
+      "budget": 16,
+      "margin": 0
+    },
+    "cold start | workerRequest:window": {
+      "reason": "The host sends a worker request only for work that held state cannot answer. A rise means a step asks the worker to read again.",
       "budget": 1,
       "margin": 0
     },
@@ -423,7 +453,7 @@
     },
     "collision walk | readBytes": {
       "reason": "Discovery reads each source once, and the receipt scan reads each receipt once. A rise means a step reads files again.",
-      "budget": 40439,
+      "budget": 40453,
       "margin": 256
     },
     "collision walk | receiptChecks": {
@@ -464,6 +494,21 @@
     "collision walk | walk:requested:poll:directory": {
       "reason": "A walk runs only for a refresh that asks to list the catalog again. A rise means a caller stopped reusing the held catalog.",
       "budget": 2,
+      "margin": 0
+    },
+    "collision walk | workerRequest:claude-children": {
+      "reason": "The host sends a worker request only for work that held state cannot answer. A rise means a step asks the worker to read again.",
+      "budget": 2,
+      "margin": 0
+    },
+    "collision walk | workerRequest:metadata": {
+      "reason": "The host sends a worker request only for work that held state cannot answer. A rise means a step asks the worker to read again.",
+      "budget": 6,
+      "margin": 0
+    },
+    "collision walk | workerRequest:starts": {
+      "reason": "The host sends a worker request only for work that held state cannot answer. A rise means a step asks the worker to read again.",
+      "budget": 3,
       "margin": 0
     },
     "completion | catalogWalk": {
@@ -563,6 +608,21 @@
     },
     "completion | watcher:grownMembers": {
       "reason": "A growing dispatched member takes the spend-only route. A fall means a completion lost that route and started full passes.",
+      "budget": 1,
+      "margin": 0
+    },
+    "completion | workerRequest:claude-children": {
+      "reason": "The host sends a worker request only for work that held state cannot answer. A rise means a step asks the worker to read again.",
+      "budget": 1,
+      "margin": 0
+    },
+    "completion | workerRequest:metadata": {
+      "reason": "The host sends a worker request only for work that held state cannot answer. A rise means a step asks the worker to read again.",
+      "budget": 2,
+      "margin": 0
+    },
+    "completion | workerRequest:starts": {
+      "reason": "The host sends a worker request only for work that held state cannot answer. A rise means a step asks the worker to read again.",
       "budget": 1,
       "margin": 0
     },
@@ -693,7 +753,7 @@
     },
     "poll and backstop walk | readBytes": {
       "reason": "Discovery reads each source once, and the receipt scan reads each receipt once. A rise means a step reads files again.",
-      "budget": 18486,
+      "budget": 18493,
       "margin": 256
     },
     "poll and backstop walk | receiptChecks": {
@@ -723,6 +783,11 @@
     },
     "poll and backstop walk | walk:requested:poll:backstop": {
       "reason": "A walk runs only for a refresh that asks to list the catalog again. A rise means a caller stopped reusing the held catalog.",
+      "budget": 1,
+      "margin": 0
+    },
+    "poll and backstop walk | workerRequest:claude-children": {
+      "reason": "The host sends a worker request only for work that held state cannot answer. A rise means a step asks the worker to read again.",
       "budget": 1,
       "margin": 0
     },
@@ -806,6 +871,16 @@
       "budget": 1,
       "margin": 0
     },
+    "repeated record coverage | workerRequest:metadata": {
+      "reason": "The host sends a worker request only for work that held state cannot answer. A rise means a step asks the worker to read again.",
+      "budget": 1,
+      "margin": 0
+    },
+    "repeated record coverage | workerRequest:starts": {
+      "reason": "The host sends a worker request only for work that held state cannot answer. A rise means a step asks the worker to read again.",
+      "budget": 1,
+      "margin": 0
+    },
     "selection switch | catalogWalk": {
       "reason": "A step walks the catalog only when no held catalog can serve it. A rise means a step lost catalog reuse.",
       "budget": 0,
@@ -874,6 +949,11 @@
     "selection switch | refreshCount:catalog-enumeration": {
       "reason": "Each refresh that lists sessions runs one enumeration. A rise means a step runs extra catalog refreshes.",
       "budget": 2,
+      "margin": 0
+    },
+    "selection switch | workerRequest:window": {
+      "reason": "The host sends a worker request only for work that held state cannot answer. A rise means a step asks the worker to read again.",
+      "budget": 1,
       "margin": 0
     },
     "session list update | catalogWalk": {
@@ -1043,7 +1123,7 @@
     },
     "warm start | readBytes": {
       "reason": "Discovery reads each source once, and the receipt scan reads each receipt once. A rise means a step reads files again.",
-      "budget": 18486,
+      "budget": 18493,
       "margin": 256
     },
     "warm start | receiptChecks": {
@@ -1083,6 +1163,26 @@
     },
     "warm start | walk:requested:shell-ready": {
       "reason": "A walk runs only for a refresh that asks to list the catalog again. A rise means a caller stopped reusing the held catalog.",
+      "budget": 1,
+      "margin": 0
+    },
+    "warm start | workerRequest:claude-children": {
+      "reason": "The host sends a worker request only for work that held state cannot answer. A rise means a step asks the worker to read again.",
+      "budget": 1,
+      "margin": 0
+    },
+    "warm start | workerRequest:metadata": {
+      "reason": "The host sends a worker request only for work that held state cannot answer. A rise means a step asks the worker to read again.",
+      "budget": 136,
+      "margin": 0
+    },
+    "warm start | workerRequest:starts": {
+      "reason": "The host sends a worker request only for work that held state cannot answer. A rise means a step asks the worker to read again.",
+      "budget": 120,
+      "margin": 0
+    },
+    "warm start | workerRequest:window": {
+      "reason": "The host sends a worker request only for work that held state cannot answer. A rise means a step asks the worker to read again.",
       "budget": 1,
       "margin": 0
     }
