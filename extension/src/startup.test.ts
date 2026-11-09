@@ -3289,7 +3289,14 @@ function completeDiscoveryHarness(
   if (names.includes('allSessions') || names.includes('runPendingWatch')) names.push('currentWalkedCatalog');
   if (names.includes('runPendingWatch')) names.push('grownMemberMiss');
   if (names.includes('prepareClaudeChildren')) names.push('startedSources', 'applyDispatchFacts');
-  names.push('walkCatalog', 'collectCatalogWalk', 'claudeWalkSteps', 'collidingSources', 'claudeOpeningReader');
+  names.push(
+    'walkCatalog',
+    'catalogSettled',
+    'collectCatalogWalk',
+    'claudeWalkSteps',
+    'collidingSources',
+    'claudeOpeningReader',
+  );
   const body = owner.members
     .filter((member) => member.name && names.includes(member.name.getText(file)))
     .map((member) => member.getText(file))
@@ -10162,6 +10169,119 @@ test('a selection during a sliced walk reads the published catalog and does not 
   assert.ok(selection, 'the walk did not stop for the selection');
   assert.equal(held, published, 'a selection during the walk did not read the published catalog');
   assert.deepEqual(files(), [path.join(path.dirname(first), 'added.jsonl'), first].sort());
+});
+
+const noListing = { status: 'complete', files: [], uncertain: [], sessions: [] };
+
+test('a held-catalog request during a sliced walk answers from the held rows and reads no source', async () => {
+  let listings = 0;
+  const { provider, writeParent, pauseOnce, releaseAll } = slicedWalkHarness({
+    enumerateSessionFilesFor: () => {
+      listings += 1;
+      return noListing;
+    },
+  });
+  const first = writeParent('first');
+  let beforeFirstCommit: SessionFile[] | null = null;
+  pauseOnce(() => {
+    beforeFirstCommit = provider.allSessions(true);
+  });
+  await releaseAll(provider.refresh(true));
+  assert.deepEqual(beforeFirstCommit, [], 'a request before the first commit answered rows that no commit listed');
+  provider.showing = 'not-listed';
+  let held: SessionFile[] = [];
+  pauseOnce(() => {
+    held = provider.allSessions(true);
+  });
+  await releaseAll(provider.refresh(true));
+  assert.deepEqual(
+    held.map((session) => session.file),
+    [first],
+    'a missed reuse during the walk did not answer the held rows',
+  );
+  assert.equal(listings, 0, 'a request during the walk read the Claude sources on the host thread');
+});
+
+test('a content search during a sliced walk waits for the commit and reads the rows it lists', async () => {
+  let listings = 0;
+  const read: string[] = [];
+  const { provider, writeParent, pauseOnce, releaseAll } = slicedWalkHarness(
+    {
+      enumerateSessionFilesFor: () => {
+        listings += 1;
+        return noListing;
+      },
+      parsePanelToHost,
+      dispatchPanelToHost,
+      labelsOf,
+      isSearch,
+      searchScope,
+      searchScopeName,
+      searchTurns,
+      readSession: (file: string) => {
+        read.push(file);
+        return { turns: [], readBytes: 0 };
+      },
+      SEARCH_TAIL_BYTES: 1024,
+    },
+    ['onMessage', 'answerSearch', 'searchCorpus'],
+  );
+  provider.corpus = new Map();
+  provider.archivedSessions = () => new Set();
+  provider.observeParsedNames = () => {};
+  const first = writeParent('first');
+  let added = '';
+  let answeredDuringWalk: boolean | null = null;
+  pauseOnce(async () => {
+    added = writeParent('added');
+    await provider.onMessage({ type: 'search', text: 'find:hello' }, provider.hosts[0]);
+    answeredDuringWalk = provider.posts.some((message: { type: string }) => message.type === 'results');
+  });
+  await releaseAll(provider.refresh(true));
+  await vi.waitFor(() => assert.ok(provider.posts.some((message: { type: string }) => message.type === 'results')));
+  assert.equal(answeredDuringWalk, false, 'the search answered before the commit');
+  assert.deepEqual(read.sort(), [added, first].sort(), 'the search did not read the rows of the commit');
+  assert.equal(listings, 0, 'the search read the Claude sources on the host thread');
+});
+
+test('older history during the first sliced walk waits for the commit and reads the page once', async () => {
+  let listings = 0;
+  const { provider, writeParent, pauseOnce, releaseAll } = slicedWalkHarness(
+    {
+      enumerateSessionFilesFor: () => {
+        listings += 1;
+        return noListing;
+      },
+      startSessionHistory,
+      historyPageReads,
+      afterHistoryPage,
+      historyRequestContinues,
+      afterHistoryRequest,
+      staleCursorIsStuck,
+    },
+    ['loadOlderHistory'],
+  );
+  writeParent('first');
+  provider.showing = 'first';
+  provider.hostSessions = new Map();
+  provider.readWindows = new Map([['first', { loadedTurns: 40 }]]);
+  provider.historyGeneration = 0;
+  let pages = 0;
+  provider.readOlderHistoryPage = () => {
+    pages += 1;
+    return Promise.resolve({ kind: 'failed' });
+  };
+  let older: Promise<void> = Promise.resolve();
+  let pagesDuringWalk: number | null = null;
+  pauseOnce(() => {
+    older = provider.loadOlderHistory('first');
+    pagesDuringWalk = pages;
+  });
+  await releaseAll(provider.refresh(true));
+  await older;
+  assert.equal(pagesDuringWalk, 0, 'the page read started before the commit');
+  assert.equal(pages, 1, 'the request did not read the page after the commit');
+  assert.equal(listings, 0, 'the request read the Claude sources on the host thread');
 });
 
 test('a walk over a supplied enumeration runs in slices, folds broad requests and keeps the clock of the pass', async () => {

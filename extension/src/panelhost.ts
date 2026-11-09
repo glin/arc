@@ -2461,8 +2461,8 @@ export class PanelProvider implements vscode.Disposable {
   private catalogWalk: CatalogWalkTimes | null = null;
   private catalogWalkPendingAt: number | null = null;
   // The catalog walk that runs now, with the signal of its refresh. `overdue` is true when the refresh deadline passed
-  // during the walk.
-  private catalogWalkRunning: { signal: AbortSignal; overdue: boolean } | null = null;
+  // during the walk. `ended` resolves when the walk ends, and a walk that lists commits before any waiter runs.
+  private catalogWalkRunning: { signal: AbortSignal; overdue: boolean; ended: Promise<void> } | null = null;
   private lastSignature = '';
   private lastSpendSourceSignature = '';
   // The rows lastSpendSourceSignature signed, so a targeted offer can name every row that moved since.
@@ -13686,7 +13686,14 @@ export class PanelProvider implements vscode.Disposable {
   ): Promise<SessionFile[] | null> {
     const root = codexSessionsRoot();
     // The walk serves every waiting request that walks and names no file, so none of them walks again after it.
-    const running = { signal, overdue: false };
+    let walkEnded = () => {};
+    const running = {
+      signal,
+      overdue: false,
+      ended: new Promise<void>((resolve) => {
+        walkEnded = resolve;
+      }),
+    };
     if (this.pendingRefresh) this.pendingRefresh = mergeRefreshRequests(null, this.pendingRefresh, running);
     // The backstop clock starts when the walk starts, also after an earlier walk that never completed.
     // A supplied enumeration keeps the clock of the pass that walked the tree.
@@ -13711,6 +13718,7 @@ export class PanelProvider implements vscode.Disposable {
       clearTimeout(deadline);
       signal.removeEventListener('abort', stop);
       if (this.catalogWalkRunning === running) this.catalogWalkRunning = null;
+      walkEnded();
       // A refresh whose deadline passed during its walk gets a full deadline for the work after the walk.
       const holder = this.refreshController;
       if (holder?.signal === signal && (running.overdue || this.refreshOverdue)) this.claimCatalogRefresh(holder);
@@ -13728,6 +13736,23 @@ export class PanelProvider implements vscode.Disposable {
     if (!listed) return null;
     // Scope resolves again after the walk. A scope that became unresolved lists nothing and discards the walk.
     return this.allSessions(false, true, walked.enumeration, undefined, undefined, parts, walked.claudeWalk);
+  }
+
+  // Waits for the cold opening pass and for a running catalog walk. Answers true when a walk ran, so the caller can read
+  // the catalog that the walk committed.
+  private async catalogSettled(): Promise<boolean> {
+    // A canceled pass hands over to the pass that replaces it.
+    let current = this.codexPriming;
+    while (current) {
+      await current.catch(() => undefined);
+      current = this.codexPriming === current ? null : this.codexPriming;
+    }
+    let walked = false;
+    for (let running = this.catalogWalkRunning; running; running = this.catalogWalkRunning) {
+      walked = true;
+      await running.ended;
+    }
+    return walked;
   }
 
   // Reads what the commit of a walk lists, and yields to the event loop between filesystem calls.
@@ -13879,6 +13904,7 @@ export class PanelProvider implements vscode.Disposable {
   // With `deferWalk`, a missed reuse sets `deferWalk.needed` and lists nothing, so the caller can run the walk in slices.
   // `walkCause` names a walk that runs because the caller did not ask for reuse. A caller that may walk must name it.
   // `parts` times the filesystem calls of a walk and the file stats that check the held catalog again.
+  // While a walk reads the sources in slices, a missed reuse from outside the walk answers from the rows the catalog holds.
   private allSessions(
     reuseCatalog = false,
     deferHumanPrompts = false,
@@ -13959,9 +13985,10 @@ export class PanelProvider implements vscode.Disposable {
       namedFileChanged = true;
     }
     let selectedFileGone = false;
-    if (reuseCatalog && this.catalog && this.catalog.folders === folderPrint && !namedFileChanged) {
+    const outsideWalk = reuseCatalog && !!this.catalogWalkRunning && !deferWalk && !codexEnumeration;
+    if (reuseCatalog && this.catalog && this.catalog.folders === folderPrint && (!namedFileChanged || outsideWalk)) {
       // With no selection, or a draft selected, the held catalog has no row to revalidate. A draft has no file to list.
-      const held =
+      const revalidated =
         !this.showing || this.newDrafts?.[this.showing]
           ? [...this.catalog.sessions]
           : revalidatedCatalog(this.catalog.sessions, this.showing, (file) =>
@@ -13974,6 +14001,7 @@ export class PanelProvider implements vscode.Disposable {
                 }
               }),
             );
+      const held = revalidated ?? (outsideWalk ? [...this.catalog.sessions] : null);
       // Reorder reused catalog rows after updating file revisions.
       if (held) {
         const joined = this.withCompressedFactRows(held);
@@ -13991,6 +14019,7 @@ export class PanelProvider implements vscode.Disposable {
         return sorted;
       }
     }
+    if (outsideWalk) return [];
     // The held catalog does not serve this refresh. Name the cause, so a capture says which cause walks.
     // The walk itself lists again with its enumeration and no deferral, and that re-entry is the same walk.
     if (deferWalk || !codexEnumeration) {
@@ -16834,21 +16863,19 @@ export class PanelProvider implements vscode.Disposable {
     }
     const selected = () =>
       new Set([this.showing, ...this.hostSessions.values()].filter((held): held is string => held !== null));
-    // Hold the request while cold opening reads finish. Publish loading through a selected-only refresh without starting a competing catalog walk.
-    const priming = this.codexPriming;
-    if (priming) {
+    // Hold the request while cold opening reads finish, or while a walk runs and the catalog holds no row for the session.
+    // Publish loading through a selected-only refresh without starting a competing catalog walk.
+    const waited =
+      this.codexPriming ||
+      (this.catalogWalkRunning && !this.catalog?.sessions.some((held) => held.sessionId === sessionId));
+    if (waited) {
       if (!selected().has(sessionId) || !this.readWindows.has(sessionId) || this.history.get(sessionId)?.atBeginning) {
         return;
       }
       const waiting = { sessionId, controller: new AbortController(), generation: ++this.historyGeneration };
       this.historyRequest = waiting;
       this.refreshFrom('history', true, true, null, true, true);
-      // A canceled pass hands over to the pass that replaces it.
-      let current = this.codexPriming;
-      while (current) {
-        await current.catch(() => undefined);
-        current = this.codexPriming === current ? null : this.codexPriming;
-      }
+      await this.catalogSettled();
       if (this.historyRequest !== waiting) {
         return;
       }
@@ -16864,7 +16891,7 @@ export class PanelProvider implements vscode.Disposable {
       (this.history.get(sessionId) ?? startSessionHistory(session, 0)).atBeginning
     ) {
       // A press that waited takes back the loading status it sent.
-      if (priming) {
+      if (waited) {
         this.refreshFrom('history', true, true, null, true, true);
       }
       return;
@@ -17808,7 +17835,7 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   // The results of one search query, posted to the panel.
-  private answerSearch(query: string, retained = false): void {
+  private answerSearch(query: string, retained = false, walked = false): void {
     // Retained matching admits cached files from the accepted scoped catalog without revalidating files.
     const repository = retained ? this.repositoryScope.snapshot(this.folders()) : null;
     const roots = JSON.stringify(repository?.roots ?? []);
@@ -17821,7 +17848,7 @@ export class PanelProvider implements vscode.Disposable {
     const admitted = retainedSessions ? new Set(retainedSessions.map((source) => source.file)) : null;
     const entries = retained
       ? [...this.corpus.entries()].filter(([file]) => admitted?.has(file)).flatMap(([, source]) => source.entries)
-      : this.searchCorpus(this.showing);
+      : this.searchCorpus(this.showing, walked);
     const scope = searchScope(entries, this.showing);
     // Apply current labels, pins, archive state, and agent-run classification at search time. Transcript revisions do not track reader state.
     // `panelAgentRun` gives `is:agentrun` the answer the session list gives for the same session.
@@ -17850,8 +17877,9 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   // Populate the bounded search corpus only for an explicit content search, outside polling and rendering.
-  private searchCorpus(only: string | null = null): SearchEntry[] {
-    const all = this.allSessions(false, false, undefined, undefined, 'requested:search');
+  // After a walk ended, `walked` reads the catalog that the walk committed instead of reading the sources again.
+  private searchCorpus(only: string | null = null, walked = false): SearchEntry[] {
+    const all = this.allSessions(walked, false, undefined, undefined, 'requested:search');
     // Refresh Codex names before filing search results.
     this.threadNames = readThreadNames(codexSessionIndexPath(), this.threadNames);
     const live = new Set(all.map((f) => f.file));
@@ -18630,22 +18658,13 @@ export class PanelProvider implements vscode.Disposable {
             void this.post({ type: 'results', query, hits: null, scope: 'workspace' });
             return;
           }
-          // Wait for cold opening reads before building the corpus. Answer only the latest waiting query.
-          const priming = this.codexPriming;
-          if (priming) {
+          // Wait for cold opening reads and a running walk before building the corpus. Answer only the latest waiting query.
+          if (this.codexPriming || (this.catalogWalkRunning && !msg.retained)) {
             this.waitingSearch = query;
-            // A canceled pass hands over to the pass that replaces it.
-            const settled = async () => {
-              let current = this.codexPriming;
-              while (current) {
-                await current.catch(() => undefined);
-                current = this.codexPriming === current ? null : this.codexPriming;
-              }
-            };
-            void settled().then(() => {
+            void this.catalogSettled().then((walked) => {
               if (this.waitingSearch === query) {
                 this.waitingSearch = null;
-                this.answerSearch(query, msg.retained);
+                this.answerSearch(query, msg.retained, walked);
               }
             });
             return;
