@@ -10830,6 +10830,33 @@ test('a cold start with no saved links lists the walked rows at the first partia
   }
 });
 
+test('a start whose saved links are refused lists the walked rows at the first partial reply', async () => {
+  vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+  try {
+    const { provider, claude, child, work, requests, now } = cachedLinksHarness((fixture) => {
+      fixture.census = [];
+      fixture.reply = partialLinksReply;
+    });
+    vi.setSystemTime(now);
+    await provider.refresh(true);
+    assert.equal(work.get('cachedLinks:refused:child'), 1);
+    assert.equal(requests.length, 1, 'the first catalog did not wait for one discovery reply');
+    assert.ok(
+      provider.authoritativeCatalog?.some((session: SessionFile) => session.sessionId === claude.sessionId),
+      'the first partial reply published no walked row',
+    );
+    assert.equal(
+      provider.authoritativeCatalog.some((session: SessionFile) => session.file === child.file),
+      false,
+      'a child transcript listed before the complete reply',
+    );
+    assert.equal(provider.sessionParentsOf().get(child.sessionId), undefined, 'an edge drew before its reply');
+    assert.deepEqual(provider.sessionLoadingBlocker(provider.refreshGeneration), { reason: 'discovery pending' });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 test('a start from saved links keeps its published rows and saved edges through a partial reply', async () => {
   vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
   try {
