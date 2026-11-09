@@ -135,14 +135,18 @@ export function zstdFrames() {
 
 // Decode the first record of a compressed rollout, and stop the decode there. The answer is null when Node.js has no
 // zstd decoder, when the stream does not decode, or when no line ends within `maxBytes` decoded bytes. A body that ends
-// before its first line break answers null, because its first record is not complete. A file system refusal rejects.
+// before its first line break answers null, because its first record is not complete. `report.failed` marks no decoder,
+// a stream that does not decode and a body that ends before its first line break. A file system refusal rejects.
 export async function readCompressedFirstRecord(
   file: string,
   maxBytes: number,
   report?: { failed?: boolean },
 ): Promise<string | null> {
   const decoder = await announcedZstdDecoder();
-  if (!decoder) return null;
+  if (!decoder) {
+    if (report) report.failed = true;
+    return null;
+  }
   const held: Buffer[] = [];
   let length = 0;
   let line: string | null | undefined;
@@ -163,6 +167,7 @@ export async function readCompressedFirstRecord(
             return;
           }
         }
+        if (report) report.failed = true;
         line = null;
       },
       { signal: stop.signal },

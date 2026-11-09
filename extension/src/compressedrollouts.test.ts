@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as zlib from 'node:zlib';
-import { test } from 'vitest';
+import { test, vi } from 'vitest';
 import {
   decodeCompressedRollout,
   isCompressedRollout,
@@ -47,6 +47,37 @@ test.skipIf(!encode)('the first record of a compressed rollout decodes alone, wi
   assert.equal(await readCompressedFirstRecord(write('empty.jsonl.zst', encode!(Buffer.alloc(0))), 1024), null);
   assert.equal(await readCompressedFirstRecord(write('plain.jsonl.zst', Buffer.from(`${opening}\n`)), 1024), null);
   await assert.rejects(readCompressedFirstRecord(path.join(root, 'missing.jsonl.zst'), 1024), { code: 'ENOENT' });
+});
+
+test.skipIf(!encode)('a first-record read that ends before a line break reports a failure', async () => {
+  const root = tempDir('compressed-first-cut');
+  const whole = Buffer.from(encode!(Buffer.from('{"type":"session_meta","payload":{"id":"a"}}\n'.repeat(200))));
+  const file = path.join(root, 'cut.jsonl.zst');
+  fs.writeFileSync(file, whole.subarray(0, 12));
+  const report: { failed?: boolean } = {};
+  assert.equal(await readCompressedFirstRecord(file, 1024, report), null);
+  assert.equal(report.failed, true, 'a stream cut before its first line break reported no failure');
+  const read: { failed?: boolean } = {};
+  fs.writeFileSync(file, whole);
+  assert.ok(await readCompressedFirstRecord(file, 1024, read));
+  assert.equal(read.failed, undefined, 'a whole first record reported a failure');
+});
+
+test('a first-record read with no zstd decoder reports a failure', async () => {
+  vi.resetModules();
+  vi.doMock('node:zlib', async (load) => ({
+    ...(await load<typeof zlib>()),
+    createZstdDecompress: undefined,
+  }));
+  try {
+    const { readCompressedFirstRecord: read } = await import('./compressedrollouts.ts');
+    const report: { failed?: boolean } = {};
+    assert.equal(await read('absent.jsonl.zst', 1024, report), null);
+    assert.equal(report.failed, true, 'a read with no decoder reported no failure');
+  } finally {
+    vi.doUnmock('node:zlib');
+    vi.resetModules();
+  }
 });
 
 test.skipIf(!encode)('a zstd stream is complete only when it ends on a frame boundary', () => {

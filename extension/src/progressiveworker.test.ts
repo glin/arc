@@ -15635,6 +15635,27 @@ test.skipIf(!zstdCompress)('a new size or modification time restarts the retry c
   }
 });
 
+test.skipIf(!zstdCompress)('a cut opening retries, and a replacement under the same name lists', async () => {
+  const pair = compressedRolloutPair();
+  const whole = fs.readFileSync(pair.compressed);
+  fs.writeFileSync(pair.compressed, whole.subarray(0, 12));
+  const harness = backfillHarness({ exists: () => false });
+  const { backfill, scheduled, openings, facts } = harness;
+  try {
+    backfill.setNames([pair.compressed]);
+    await vi.waitFor(() => assert.equal(scheduled.length, 1, 'the cut opening scheduled no retry'));
+    assert.deepEqual(openings, [], 'a cut opening saved a current null opening');
+    fs.writeFileSync(pair.compressed, whole);
+    backfill.setRoots(['/']);
+    await vi.waitFor(() =>
+      assert.equal(facts[0]?.decodedLength, pair.body.length, 'the repaired file stayed unlisted'),
+    );
+  } finally {
+    backfill.dispose();
+    fs.rmSync(pair.directory, { recursive: true, force: true });
+  }
+});
+
 // A facts store whose appends reach real segment lines, so a later launch reads what an earlier one wrote.
 function storeBackedFacts(directory: string) {
   fs.mkdirSync(directory, { recursive: true });
