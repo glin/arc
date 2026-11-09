@@ -15,6 +15,7 @@ import { compressedRolloutsReadable, isCompressedRollout } from './compressedrol
 import {
   COMPRESSED_FACTS_STORE,
   COMPRESSED_OPENINGS_STORE,
+  compressedPairKey,
   compressedTitleCurrent,
   withKeptUndercount,
   type CompressedFactEntry,
@@ -5070,7 +5071,7 @@ export class PanelProvider implements vscode.Disposable {
       this.compressedLoadPending = false;
       this.performanceCounters?.recordWork('compressedLoadMs', Math.round(performance.now() - started));
     }
-    for (const [plain, held] of this.adoptionsUnsettled) this.beginCompressedAdoption(plain, held.twin, held.row);
+    this.resumeCompressedAdoptions();
     if (applied) this.refreshFrom('compressed-facts', true);
     else if (!this.projectSpendBusy()) this.postProjectSpend();
   }
@@ -5089,6 +5090,12 @@ export class PanelProvider implements vscode.Disposable {
     const named =
       this.compressedRollouts.has(twin) || batched.some((name) => normalizeFsPath(name) === normalizeFsPath(twin));
     return named || readRolloutStat(twin) ? row : null;
+  }
+
+  private resumeCompressedAdoptions(): void {
+    if (this.compressedLoadPending || !this.projectSpendHydrated) return;
+    for (const [plain, held] of this.adoptionsUnsettled ?? [])
+      if (!held.running) this.beginCompressedAdoption(plain, held.twin, held.row);
   }
 
   private beginCompressedAdoption(plain: string, twin: string, row: SessionFile | null): void {
@@ -5110,8 +5117,23 @@ export class PanelProvider implements vscode.Disposable {
       this.derivedCacheCheckpointState.markChanged(true);
       return;
     }
+    // The load and the ledger supply the entry and the spend record, so an adoption waits for both.
+    if (this.compressedLoadPending || !this.projectSpendHydrated) {
+      held.running = false;
+      return;
+    }
+    // A current adopted entry already holds these facts. Another adoption can only fail it.
+    const stored = this.compressedFacts.get(twin);
+    const twinStat = readRolloutStat(twin);
+    if (stored?.adopted && twinStat && stored.size === twinStat.size && stored.mtimeMs === twinStat.mtimeMs) {
+      this.adoptionsUnsettled.delete(plain);
+      this.derivedCacheCheckpointState.markChanged(true);
+      this.refreshFrom('compressed-facts', true);
+      return;
+    }
     const title = this.titles.get(plain);
-    const plainKey = normalizeSpendFile(plain);
+    // The plain file can be gone, so the twin's directory supplies the physical path of the ledger's key.
+    const plainKey = compressedPairKey(twin);
     const spend = [...this.projectSpendVisibleFiles, ...this.projectSpendFiles].find(
       (record) => normalizeSpendFile(record.file) === plainKey && record.complete !== false,
     );
@@ -5122,7 +5144,7 @@ export class PanelProvider implements vscode.Disposable {
           adoption: {
             twin,
             plain,
-            plainMtimeMs: held.row?.mtimeMs ?? title?.mtimeMs ?? -1,
+            plainMtimeMs: held.row?.mtimeMs ?? spend?.mtimeMs ?? title?.mtimeMs ?? -1,
             title,
             opening: this.codexMetas.peek(plain),
             spend,
@@ -5166,7 +5188,12 @@ export class PanelProvider implements vscode.Disposable {
       for (const row of this.catalog?.sessions ?? []) {
         if (row.agent !== 'codex' || !row.file.endsWith('.jsonl') || walked.has(row.file)) continue;
         const twin = `${row.file}.zst`;
-        if (listed.has(twin) && !this.compressedFacts.has(twin)) this.beginCompressedAdoption(row.file, twin, row);
+        if (!listed.has(twin)) continue;
+        // A new compression of a resumed rollout replaces the twin, so an entry of another revision adopts again.
+        const entry = this.compressedFacts.get(twin);
+        const stat = entry ? readRolloutStat(twin) : null;
+        if (!entry || (stat && (entry.size !== stat.size || entry.mtimeMs !== stat.mtimeMs)))
+          this.beginCompressedAdoption(row.file, twin, row);
       }
       for (const [plain, held] of this.adoptionsUnsettled)
         if (!held.running) this.beginCompressedAdoption(plain, held.twin, held.row);
@@ -12486,6 +12513,7 @@ export class PanelProvider implements vscode.Disposable {
     this.projectSpendVisibleFiles = visible.files;
     this.spendRecordsByFile = new Map(this.projectSpendFiles.map((record, index) => [record.file, index]));
     this.projectSpendHydrated = true;
+    this.resumeCompressedAdoptions();
     if (this.watching) this.spendIntegrity?.start();
     this.projectSpendRevision++;
     this.invalidateProjectSpendSnapshot();

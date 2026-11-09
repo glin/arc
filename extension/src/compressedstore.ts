@@ -5,7 +5,7 @@ import * as path from 'node:path';
 import { processIsRunning, temporaryWriterGone, writeFileAtomically } from './atomicfile';
 import { CODEX_META_VERSION, createExclusive, releaseCodexOpeningsLock, takeCodexOpeningsLock } from './codexopenings';
 import { openingRecordOf, readRolloutStat, ROLLOUT_NAME, type CodexSessionMeta } from './codex';
-import { hashCompressedRollout, readCompressedFirstRecord } from './compressedrollouts';
+import { hashCompressedRollout, readCompressedFirstRecord, sameStat } from './compressedrollouts';
 import type { DerivedTitleEntry } from './derivedcache';
 import { METADATA_GENERATIONS } from './derivedcache';
 import {
@@ -102,10 +102,13 @@ function sessionKeyOf(file: string, opening: CodexSessionMeta | null | undefined
   return opening?.sessionId ?? ROLLOUT_NAME.exec(path.basename(file).replace(/\.zst$/, ''))?.[1] ?? null;
 }
 
-// Take the facts of a plain rollout for its twin. The twin's first line must name the same thread, the times must be
-// equal and the plain spend record must be complete. Anything else discards the plain facts, and the entry marks the
-// twin for the backfill.
-export async function adoptCompressedTwin(input: CompressedAdoptionInput): Promise<CompressedAdoptionResult> {
+// Take the facts of a plain rollout for its twin. The twin's first line must be an opening of the same thread, the
+// times must be equal and the plain spend record must be complete. The twin's stat is one revision across the header
+// read and the hash. Anything else discards the plain facts, and the entry marks the twin for the backfill.
+export async function adoptCompressedTwin(
+  input: CompressedAdoptionInput,
+  hash: typeof hashCompressedRollout = hashCompressedRollout,
+): Promise<CompressedAdoptionResult> {
   const stat = readRolloutStat(input.twin);
   let first: string | null = null;
   try {
@@ -114,7 +117,7 @@ export async function adoptCompressedTwin(input: CompressedAdoptionInput): Promi
     first = null;
   }
   const opening = openingRecordOf(first);
-  const threadId = first === null ? null : sessionKeyOf(input.twin, opening);
+  const threadId = opening?.sessionId ?? null;
   const expected = sessionKeyOf(input.plain, input.opening);
   const failed = (): CompressedAdoptionResult => ({
     adopted: false,
@@ -137,8 +140,8 @@ export async function adoptCompressedTwin(input: CompressedAdoptionInput): Promi
     input.spend.complete === false
   )
     return failed();
-  const hashed = await hashCompressedRollout(input.twin);
-  if (!hashed) return failed();
+  const hashed = await hash(input.twin);
+  if (!hashed || !sameStat(hashed.stat, stat) || !sameStat(readRolloutStat(input.twin), stat)) return failed();
   return {
     adopted: true,
     entry: {

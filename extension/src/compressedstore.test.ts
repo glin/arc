@@ -20,6 +20,7 @@ import {
   type CompressedFactEntry,
   type CompressedStoreOptions,
 } from './compressedstore.ts';
+import { hashCompressedRollout } from './compressedrollouts.ts';
 import { normalizeSpendFile, type SpendFileIndex } from './projectspend.ts';
 import { tempDir } from './temproot.ts';
 
@@ -777,6 +778,34 @@ test.skipIf(!encode)('an adoption whose holder stops answers not durable', async
   assert.equal((await answer).durable, false);
   assert.equal(threadCount(directory), 0);
   openings.dispose();
+});
+
+test.skipIf(!encode)('a twin replaced during its hash fails the adoption', async () => {
+  const { plain, twin, mtimeMs } = twinFixture('adopt-replaced', opening(THREAD));
+  const { adopted, entry: taken } = await adoptCompressedTwin(
+    { twin, plain, plainMtimeMs: mtimeMs, opening: meta(THREAD), spend: completeSpend },
+    async (file) => {
+      // Another thread's compression replaces the file between the header read and the hash.
+      fs.writeFileSync(twin, encode!(Buffer.from(opening(OTHER_THREAD))));
+      return hashCompressedRollout(file);
+    },
+  );
+  assert.equal(adopted, false, 'the facts of one revision took the hash of another');
+  assert.equal(taken.adoptionFailed, true);
+  assert.equal(taken.hash, undefined);
+});
+
+test.skipIf(!encode)('a twin whose first line is not an opening fails the adoption', async () => {
+  const { plain, twin, mtimeMs } = twinFixture('adopt-no-opening', `${JSON.stringify({ type: 'response_item' })}\n`);
+  const { adopted, entry: taken } = await adoptCompressedTwin({
+    twin,
+    plain,
+    plainMtimeMs: mtimeMs,
+    opening: meta(THREAD),
+    spend: completeSpend,
+  });
+  assert.equal(adopted, false, 'a file name passed as thread evidence');
+  assert.equal(taken.adoptionFailed, true);
 });
 
 test.skipIf(!encode)('a twin that does not decode keeps no plain fact', async () => {

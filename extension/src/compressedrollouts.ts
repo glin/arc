@@ -290,7 +290,10 @@ const NEWLINE = Buffer.from('\n');
 
 class BodyCapError extends Error {}
 
-function sameStat(left: FileRevision | null, right: FileRevision | null): boolean {
+// A physical revision. A filesystem read can leave the device and inode out.
+type CompressedStat = Pick<FileRevision, 'size' | 'mtimeMs'> & Partial<Pick<FileRevision, 'dev' | 'ino'>>;
+
+export function sameStat(left: CompressedStat | null, right: CompressedStat | null): boolean {
   return (
     !!left &&
     !!right &&

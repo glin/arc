@@ -73,6 +73,7 @@ import { arcHome } from './store.ts';
 import {
   COMPRESSED_FACTS_STORE,
   COMPRESSED_OPENINGS_STORE,
+  compressedPairKey,
   compressedTitleCurrent,
   withKeptUndercount,
   adoptCompressedTwin,
@@ -2989,7 +2990,7 @@ function completeDiscoveryHarness(
   if (names.includes('runPendingWatch')) names.push('compressedFormChange');
   if (names.includes('browserPainted'))
     names.push('maybeStartCompressedLoad', 'loadCompressedFacts', 'applyCompressedEntries', 'compressedStorePaths');
-  names.push('compressedRolloutsToSend', 'compressedStorePaths');
+  names.push('compressedRolloutsToSend', 'compressedStorePaths', 'resumeCompressedAdoptions');
   names.push('compressedSpendPick', 'titleEntryOf', 'compressedTitleOf', 'compressedCarriedNameOf');
   if (names.includes('allSessions') || names.includes('runPendingWatch')) names.push('currentWalkedCatalog');
   if (names.includes('runPendingWatch')) names.push('grownMemberMiss');
@@ -3475,6 +3476,7 @@ function selectedWindowHarness(
   const names = new Set([
     'compressedRolloutsToSend',
     'compressedStorePaths',
+    'resumeCompressedAdoptions',
     'compressedSpendPick',
     'titleEntryOf',
     'compressedTitleOf',
@@ -9991,6 +9993,7 @@ function adoptionHarness(extraScope: Record<string, unknown> = {}) {
       compressedTitleCurrent,
       withKeptUndercount,
       compressedSpendDisplayFiles,
+      compressedPairKey,
       normalizeSpendFile,
       isAgentRun,
       arcHome,
@@ -10189,6 +10192,63 @@ test.skipIf(!rolloutCompression.zstdCompressSync)(
       assert.equal(provider.adoptionsUnsettled.size, 0, 'the restart did not settle the adoption'),
     );
     assert.equal(provider.compressedFacts.get(twin)?.adopted, true);
+  },
+);
+
+test.skipIf(!rolloutCompression.zstdCompressSync)(
+  'a restart adopts a twin through a directory alias and waits for hydration',
+  async () => {
+    const { provider, plain, writeTwin, adopted, root } = await adoptedPair();
+    writeTwin();
+    const realDirectory = path.dirname(plain);
+    const alias = path.join(root, 'alias');
+    fs.symlinkSync(realDirectory, alias, process.platform === 'win32' ? 'junction' : 'dir');
+    const aliasPlain = path.join(alias, path.basename(plain));
+    const aliasTwin = `${aliasPlain}.zst`;
+    const title = provider.titles.get(plain);
+    provider.codexMetas.get(aliasPlain);
+    provider.projectSpendVisibleFiles = provider.projectSpendVisibleFiles.map((record: SpendFileIndex) => ({
+      ...record,
+      mtimeMs: fs.statSync(plain).mtimeMs,
+    }));
+    fs.unlinkSync(plain);
+    provider.titles.set(aliasPlain, title);
+    provider.adoptionsUnsettled.set(aliasPlain, { twin: aliasTwin, row: null, running: false });
+    provider.projectSpendHydrated = false;
+    provider.resumeCompressedAdoptions();
+    assert.deepEqual(adopted(), [], 'an adoption ran before the ledger was hydrated');
+    provider.projectSpendHydrated = true;
+    provider.resumeCompressedAdoptions();
+    await vi.waitFor(() => assert.equal(provider.adoptionsUnsettled.size, 0));
+    assert.deepEqual(adopted(), [aliasTwin]);
+    const entry = provider.compressedFacts.get(aliasTwin);
+    assert.equal(entry?.adopted, true, 'the alias path missed the plain spend record');
+  },
+);
+
+test.skipIf(!rolloutCompression.zstdCompressSync)(
+  'a restart settles on a current adopted entry and adopts a twin of another revision again',
+  async () => {
+    const { provider, plain, twin, writeTwin, adopted } = await adoptedPair();
+    writeTwin();
+    fs.unlinkSync(plain);
+    const stat = readRolloutStat(twin)!;
+    const current = { file: twin, pairKey: 'x', adopted: true, size: stat.size, mtimeMs: stat.mtimeMs };
+    provider.compressedFacts.set(twin, current);
+    provider.adoptionsUnsettled.set(plain, { twin, row: null, running: false });
+    provider.beginCompressedAdoption(plain, twin, null);
+    await vi.waitFor(() => assert.equal(provider.adoptionsUnsettled.size, 0));
+    assert.deepEqual(adopted(), [], 'an adoption replaced a current adopted entry');
+    assert.equal(provider.compressedFacts.get(twin), current);
+    // A resume wrote the plain rollout again, and a second compression replaced the twin.
+    const row = { agent: 'codex', file: plain, sessionId: twinThread, mtimeMs: stat.mtimeMs, size: 1 };
+    provider.catalog = { sessions: [row] };
+    provider.compressedFacts.set(twin, { ...current, size: stat.size + 1 });
+    provider.compressedRowsOf(
+      { walked: [], enumeration: { status: 'complete', files: [], uncertain: [], compressed: [twin] } },
+      () => true,
+    );
+    await vi.waitFor(() => assert.deepEqual(adopted(), [twin], 'a twin of another revision kept the older entry'));
   },
 );
 
