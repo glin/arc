@@ -10407,6 +10407,7 @@ test.skipIf(!rolloutCompression.zstdCompressSync)(
       assert.equal(provider.adoptionsUnsettled.size, 0, 'the restart did not settle the adoption'),
     );
     assert.equal(provider.compressedFacts.get(twin)?.adopted, true);
+    clearTimeout(provider.compressedFollowTimer);
   },
 );
 
@@ -10707,6 +10708,7 @@ test('a load that a worker stop cut off runs again and holds Project cost busy u
   await vi.waitFor(() => assert.equal(provider.compressedLoadPending, false));
   assert.equal(requests.length, 2, 'the cut-off load did not run again');
   assert.equal(provider.compressedFacts.has('a.jsonl.zst'), true);
+  clearTimeout(provider.compressedFollowTimer);
 });
 
 test('a superseded discovery request sends the compressed list again with the next request', async () => {
@@ -10836,6 +10838,7 @@ test('the load of the stores waits for the first render and the pass, holds Proj
   assert.equal(requests.length, 1);
   assert.equal(provider.compressedFacts.get('a.jsonl.zst'), entry, 'the load dropped a batch');
   assert.equal(provider.projectSpendBusy(), false, 'Project cost stayed busy after the load');
+  clearTimeout(provider.compressedFollowTimer);
 });
 
 function pendingStores(rootName: string) {
