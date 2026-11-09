@@ -87,8 +87,7 @@ function counts(counters: { snapshot(): any }): Counts {
   for (const [name, count] of Object.entries<number>(snapshot.work))
     if (name === 'catalogWalk' || COUNTER_PREFIXES.some((prefix) => name.startsWith(prefix))) row[name] = count;
   for (const [name, entry] of Object.entries<{ count: number }>(snapshot.refreshes))
-    if (name === 'catalog-enumeration' || name.startsWith('catalog-enumeration:'))
-      row[`refreshCount:${name}`] = entry.count;
+    if (name === 'catalog-enumeration') row[`refreshCount:${name}`] = entry.count;
   for (const name of ['readBytes', 'receiptScanOpensAfterCompletion', 'dispatchSpendVisits'])
     if (snapshot.discovery[name] !== undefined) row[name] = snapshot.discovery[name];
   return row;

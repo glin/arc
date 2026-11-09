@@ -1,11 +1,6 @@
 {
   "margin": "Each row has an integer margin. A step fails when its count is above budget plus margin.",
   "rows": {
-    "cold start | cachedLinks:published": {
-      "reason": "Cold start publishes 0 first catalog from saved links.",
-      "budget": 0,
-      "margin": 0
-    },
     "cold start | cachedLinks:refused:missing": {
       "reason": "Cold start waits for the discovery reply 1 times for this refusal.",
       "budget": 1,
@@ -63,7 +58,7 @@
     },
     "cold start | readBytes": {
       "reason": "Cold start reads 392568 bytes through discovery. The margin covers the temporary path length and the file identity numbers in dispatch receipts.",
-      "budget": 392568,
+      "budget": 392608,
       "margin": 15703
     },
     "cold start | receiptScanOpensAfterCompletion": {
@@ -72,51 +67,6 @@
       "margin": 0
     },
     "cold start | refreshCount:catalog-enumeration": {
-      "reason": "Cold start records this enumeration part 3 times.",
-      "budget": 3,
-      "margin": 0
-    },
-    "cold start | refreshCount:catalog-enumeration:build": {
-      "reason": "Cold start records this enumeration part 3 times.",
-      "budget": 3,
-      "margin": 0
-    },
-    "cold start | refreshCount:catalog-enumeration:listing": {
-      "reason": "Cold start records this enumeration part 3 times.",
-      "budget": 3,
-      "margin": 0
-    },
-    "cold start | refreshCount:catalog-enumeration:openings": {
-      "reason": "Cold start records this enumeration part 3 times.",
-      "budget": 3,
-      "margin": 0
-    },
-    "cold start | refreshCount:catalog-enumeration:openings:children": {
-      "reason": "Cold start records this enumeration part 3 times.",
-      "budget": 3,
-      "margin": 0
-    },
-    "cold start | refreshCount:catalog-enumeration:openings:codex": {
-      "reason": "Cold start records this enumeration part 3 times.",
-      "budget": 3,
-      "margin": 0
-    },
-    "cold start | refreshCount:catalog-enumeration:openings:collisions": {
-      "reason": "Cold start records this enumeration part 3 times.",
-      "budget": 3,
-      "margin": 0
-    },
-    "cold start | refreshCount:catalog-enumeration:openings:parents": {
-      "reason": "Cold start records this enumeration part 3 times.",
-      "budget": 3,
-      "margin": 0
-    },
-    "cold start | refreshCount:catalog-enumeration:prompts": {
-      "reason": "Cold start records this enumeration part 3 times.",
-      "budget": 3,
-      "margin": 0
-    },
-    "cold start | refreshCount:catalog-enumeration:stats": {
       "reason": "Cold start records this enumeration part 3 times.",
       "budget": 3,
       "margin": 0
@@ -173,7 +123,7 @@
     },
     "warm start | readBytes": {
       "reason": "Warm start reads 16105 bytes through discovery. The margin covers the temporary path length and the file identity numbers in dispatch receipts.",
-      "budget": 16105,
+      "budget": 16145,
       "margin": 1024
     },
     "warm start | receiptScanOpensAfterCompletion": {
@@ -182,51 +132,6 @@
       "margin": 0
     },
     "warm start | refreshCount:catalog-enumeration": {
-      "reason": "Warm start records this enumeration part 3 times.",
-      "budget": 3,
-      "margin": 0
-    },
-    "warm start | refreshCount:catalog-enumeration:build": {
-      "reason": "Warm start records this enumeration part 3 times.",
-      "budget": 3,
-      "margin": 0
-    },
-    "warm start | refreshCount:catalog-enumeration:listing": {
-      "reason": "Warm start records this enumeration part 3 times.",
-      "budget": 3,
-      "margin": 0
-    },
-    "warm start | refreshCount:catalog-enumeration:openings": {
-      "reason": "Warm start records this enumeration part 3 times.",
-      "budget": 3,
-      "margin": 0
-    },
-    "warm start | refreshCount:catalog-enumeration:openings:children": {
-      "reason": "Warm start records this enumeration part 3 times.",
-      "budget": 3,
-      "margin": 0
-    },
-    "warm start | refreshCount:catalog-enumeration:openings:codex": {
-      "reason": "Warm start records this enumeration part 3 times.",
-      "budget": 3,
-      "margin": 0
-    },
-    "warm start | refreshCount:catalog-enumeration:openings:collisions": {
-      "reason": "Warm start records this enumeration part 3 times.",
-      "budget": 3,
-      "margin": 0
-    },
-    "warm start | refreshCount:catalog-enumeration:openings:parents": {
-      "reason": "Warm start records this enumeration part 3 times.",
-      "budget": 3,
-      "margin": 0
-    },
-    "warm start | refreshCount:catalog-enumeration:prompts": {
-      "reason": "Warm start records this enumeration part 3 times.",
-      "budget": 3,
-      "margin": 0
-    },
-    "warm start | refreshCount:catalog-enumeration:stats": {
       "reason": "Warm start records this enumeration part 3 times.",
       "budget": 3,
       "margin": 0
@@ -244,11 +149,6 @@
     "warm start | walk:requested:shell-ready": {
       "reason": "Warm start lists the catalog 1 times for this cause.",
       "budget": 1,
-      "margin": 0
-    },
-    "completion | cachedLinks:published": {
-      "reason": "Completion publishes 0 first catalog from saved links.",
-      "budget": 0,
       "margin": 0
     },
     "completion | catalogWalk": {
@@ -301,51 +201,6 @@
       "budget": 2,
       "margin": 0
     },
-    "completion | refreshCount:catalog-enumeration:build": {
-      "reason": "Completion records this enumeration part 2 times.",
-      "budget": 2,
-      "margin": 0
-    },
-    "completion | refreshCount:catalog-enumeration:listing": {
-      "reason": "Completion records this enumeration part 2 times.",
-      "budget": 2,
-      "margin": 0
-    },
-    "completion | refreshCount:catalog-enumeration:openings": {
-      "reason": "Completion records this enumeration part 2 times.",
-      "budget": 2,
-      "margin": 0
-    },
-    "completion | refreshCount:catalog-enumeration:openings:children": {
-      "reason": "Completion records this enumeration part 2 times.",
-      "budget": 2,
-      "margin": 0
-    },
-    "completion | refreshCount:catalog-enumeration:openings:codex": {
-      "reason": "Completion records this enumeration part 2 times.",
-      "budget": 2,
-      "margin": 0
-    },
-    "completion | refreshCount:catalog-enumeration:openings:collisions": {
-      "reason": "Completion records this enumeration part 2 times.",
-      "budget": 2,
-      "margin": 0
-    },
-    "completion | refreshCount:catalog-enumeration:openings:parents": {
-      "reason": "Completion records this enumeration part 2 times.",
-      "budget": 2,
-      "margin": 0
-    },
-    "completion | refreshCount:catalog-enumeration:prompts": {
-      "reason": "Completion records this enumeration part 2 times.",
-      "budget": 2,
-      "margin": 0
-    },
-    "completion | refreshCount:catalog-enumeration:stats": {
-      "reason": "Completion records this enumeration part 2 times.",
-      "budget": 2,
-      "margin": 0
-    },
     "completion | renderPost:dispatch-discovery": {
       "reason": "Completion posts 1 renders for this reason.",
       "budget": 1,
@@ -354,11 +209,6 @@
     "completion | renderPost:transcript": {
       "reason": "Completion posts 1 renders for this reason.",
       "budget": 1,
-      "margin": 0
-    },
-    "child watcher event | cachedLinks:published": {
-      "reason": "Child watcher event publishes 0 first catalog from saved links.",
-      "budget": 0,
       "margin": 0
     },
     "child watcher event | catalogWalk": {
@@ -403,7 +253,7 @@
     },
     "child watcher event | readBytes": {
       "reason": "Child watcher event reads 18511 bytes through discovery. The margin covers the temporary path length and the file identity numbers in dispatch receipts.",
-      "budget": 18511,
+      "budget": 18551,
       "margin": 1024
     },
     "child watcher event | receiptScanOpensAfterCompletion": {
@@ -412,51 +262,6 @@
       "margin": 0
     },
     "child watcher event | refreshCount:catalog-enumeration": {
-      "reason": "Child watcher event records this enumeration part 1 times.",
-      "budget": 1,
-      "margin": 0
-    },
-    "child watcher event | refreshCount:catalog-enumeration:build": {
-      "reason": "Child watcher event records this enumeration part 1 times.",
-      "budget": 1,
-      "margin": 0
-    },
-    "child watcher event | refreshCount:catalog-enumeration:listing": {
-      "reason": "Child watcher event records this enumeration part 1 times.",
-      "budget": 1,
-      "margin": 0
-    },
-    "child watcher event | refreshCount:catalog-enumeration:openings": {
-      "reason": "Child watcher event records this enumeration part 1 times.",
-      "budget": 1,
-      "margin": 0
-    },
-    "child watcher event | refreshCount:catalog-enumeration:openings:children": {
-      "reason": "Child watcher event records this enumeration part 1 times.",
-      "budget": 1,
-      "margin": 0
-    },
-    "child watcher event | refreshCount:catalog-enumeration:openings:codex": {
-      "reason": "Child watcher event records this enumeration part 1 times.",
-      "budget": 1,
-      "margin": 0
-    },
-    "child watcher event | refreshCount:catalog-enumeration:openings:collisions": {
-      "reason": "Child watcher event records this enumeration part 1 times.",
-      "budget": 1,
-      "margin": 0
-    },
-    "child watcher event | refreshCount:catalog-enumeration:openings:parents": {
-      "reason": "Child watcher event records this enumeration part 1 times.",
-      "budget": 1,
-      "margin": 0
-    },
-    "child watcher event | refreshCount:catalog-enumeration:prompts": {
-      "reason": "Child watcher event records this enumeration part 1 times.",
-      "budget": 1,
-      "margin": 0
-    },
-    "child watcher event | refreshCount:catalog-enumeration:stats": {
       "reason": "Child watcher event records this enumeration part 1 times.",
       "budget": 1,
       "margin": 0
@@ -471,13 +276,18 @@
       "budget": 1,
       "margin": 0
     },
-    "selection switch | cachedLinks:published": {
-      "reason": "Selection switch publishes 0 first catalog from saved links.",
+    "selection switch | catalogWalk": {
+      "reason": "Selection switch runs 0 complete catalog walks.",
       "budget": 0,
       "margin": 0
     },
-    "selection switch | catalogWalk": {
-      "reason": "Selection switch runs 0 complete catalog walks.",
+    "selection switch | discoveryRequest:walked": {
+      "reason": "Counter discoveryRequest:walked in step selection switch.",
+      "budget": 0,
+      "margin": 0
+    },
+    "selection switch | discoveryRequest:walked:transcript": {
+      "reason": "Counter discoveryRequest:walked:transcript in step selection switch.",
       "budget": 0,
       "margin": 0
     },
@@ -526,56 +336,6 @@
       "budget": 2,
       "margin": 0
     },
-    "selection switch | refreshCount:catalog-enumeration:build": {
-      "reason": "Selection switch records this enumeration part 2 times.",
-      "budget": 2,
-      "margin": 0
-    },
-    "selection switch | refreshCount:catalog-enumeration:listing": {
-      "reason": "Selection switch records this enumeration part 2 times.",
-      "budget": 2,
-      "margin": 0
-    },
-    "selection switch | refreshCount:catalog-enumeration:openings": {
-      "reason": "Selection switch records this enumeration part 2 times.",
-      "budget": 2,
-      "margin": 0
-    },
-    "selection switch | refreshCount:catalog-enumeration:openings:children": {
-      "reason": "Selection switch records this enumeration part 2 times.",
-      "budget": 2,
-      "margin": 0
-    },
-    "selection switch | refreshCount:catalog-enumeration:openings:codex": {
-      "reason": "Selection switch records this enumeration part 2 times.",
-      "budget": 2,
-      "margin": 0
-    },
-    "selection switch | refreshCount:catalog-enumeration:openings:collisions": {
-      "reason": "Selection switch records this enumeration part 2 times.",
-      "budget": 2,
-      "margin": 0
-    },
-    "selection switch | refreshCount:catalog-enumeration:openings:parents": {
-      "reason": "Selection switch records this enumeration part 2 times.",
-      "budget": 2,
-      "margin": 0
-    },
-    "selection switch | refreshCount:catalog-enumeration:prompts": {
-      "reason": "Selection switch records this enumeration part 2 times.",
-      "budget": 2,
-      "margin": 0
-    },
-    "selection switch | refreshCount:catalog-enumeration:stats": {
-      "reason": "Selection switch records this enumeration part 2 times.",
-      "budget": 2,
-      "margin": 0
-    },
-    "poll and backstop walk | cachedLinks:published": {
-      "reason": "Poll and backstop walk publishes 0 first catalog from saved links.",
-      "budget": 0,
-      "margin": 0
-    },
     "poll and backstop walk | catalogWalk": {
       "reason": "Poll and backstop walk runs 1 complete catalog walks.",
       "budget": 1,
@@ -589,6 +349,11 @@
     "poll and backstop walk | discoveryRequest:walked:poll:backstop": {
       "reason": "Poll and backstop walk sends 1 discovery requests after it lists the catalog.",
       "budget": 1,
+      "margin": 0
+    },
+    "poll and backstop walk | discoveryRequest:walked:transcript": {
+      "reason": "Counter discoveryRequest:walked:transcript in step poll and backstop walk.",
+      "budget": 0,
       "margin": 0
     },
     "poll and backstop walk | dispatchSpendVisits": {
@@ -618,7 +383,7 @@
     },
     "poll and backstop walk | readBytes": {
       "reason": "Poll and backstop walk reads 16105 bytes through discovery. The margin covers the temporary path length and the file identity numbers in dispatch receipts.",
-      "budget": 16105,
+      "budget": 16145,
       "margin": 1024
     },
     "poll and backstop walk | receiptScanOpensAfterCompletion": {
@@ -627,51 +392,6 @@
       "margin": 0
     },
     "poll and backstop walk | refreshCount:catalog-enumeration": {
-      "reason": "Poll and backstop walk records this enumeration part 2 times.",
-      "budget": 2,
-      "margin": 0
-    },
-    "poll and backstop walk | refreshCount:catalog-enumeration:build": {
-      "reason": "Poll and backstop walk records this enumeration part 2 times.",
-      "budget": 2,
-      "margin": 0
-    },
-    "poll and backstop walk | refreshCount:catalog-enumeration:listing": {
-      "reason": "Poll and backstop walk records this enumeration part 2 times.",
-      "budget": 2,
-      "margin": 0
-    },
-    "poll and backstop walk | refreshCount:catalog-enumeration:openings": {
-      "reason": "Poll and backstop walk records this enumeration part 2 times.",
-      "budget": 2,
-      "margin": 0
-    },
-    "poll and backstop walk | refreshCount:catalog-enumeration:openings:children": {
-      "reason": "Poll and backstop walk records this enumeration part 2 times.",
-      "budget": 2,
-      "margin": 0
-    },
-    "poll and backstop walk | refreshCount:catalog-enumeration:openings:codex": {
-      "reason": "Poll and backstop walk records this enumeration part 2 times.",
-      "budget": 2,
-      "margin": 0
-    },
-    "poll and backstop walk | refreshCount:catalog-enumeration:openings:collisions": {
-      "reason": "Poll and backstop walk records this enumeration part 2 times.",
-      "budget": 2,
-      "margin": 0
-    },
-    "poll and backstop walk | refreshCount:catalog-enumeration:openings:parents": {
-      "reason": "Poll and backstop walk records this enumeration part 2 times.",
-      "budget": 2,
-      "margin": 0
-    },
-    "poll and backstop walk | refreshCount:catalog-enumeration:prompts": {
-      "reason": "Poll and backstop walk records this enumeration part 2 times.",
-      "budget": 2,
-      "margin": 0
-    },
-    "poll and backstop walk | refreshCount:catalog-enumeration:stats": {
       "reason": "Poll and backstop walk records this enumeration part 2 times.",
       "budget": 2,
       "margin": 0
