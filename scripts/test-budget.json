@@ -68,7 +68,7 @@
     },
     "automatic save | readBytes": {
       "reason": "Discovery reads each source once, and the receipt scan reads each receipt once. A rise means a step reads files again.",
-      "budget": 20163,
+      "budget": 19732,
       "margin": 256
     },
     "automatic save | receiptChecks": {
@@ -168,7 +168,7 @@
     },
     "child watcher event | readBytes": {
       "reason": "Discovery reads each source once, and the receipt scan reads each receipt once. A rise means a step reads files again.",
-      "budget": 21412,
+      "budget": 20971,
       "margin": 256
     },
     "child watcher event | receiptChecks": {
@@ -233,7 +233,7 @@
     },
     "cold start | dispatchSpendBytes": {
       "reason": "A spend pass reads each pending root once. A rise means a pass reads spend sources again inside one root.",
-      "budget": 24826,
+      "budget": 24606,
       "margin": 0
     },
     "cold start | dispatchSpendFiles": {
@@ -313,7 +313,7 @@
     },
     "cold start | readBytes": {
       "reason": "Discovery reads each source once, and the receipt scan reads each receipt once. A rise means a step reads files again.",
-      "budget": 411177,
+      "budget": 408356,
       "margin": 256
     },
     "cold start | receiptChecks": {
@@ -418,7 +418,7 @@
     },
     "collision walk | readBytes": {
       "reason": "Discovery reads each source once, and the receipt scan reads each receipt once. A rise means a step reads files again.",
-      "budget": 41245,
+      "budget": 40373,
       "margin": 256
     },
     "collision walk | receiptChecks": {
@@ -473,7 +473,7 @@
     },
     "completion | dispatchSpendBytes": {
       "reason": "A spend pass reads each pending root once. A rise means a pass reads spend sources again inside one root.",
-      "budget": 2741,
+      "budget": 2721,
       "margin": 0
     },
     "completion | dispatchSpendFiles": {
@@ -678,7 +678,7 @@
     },
     "poll and backstop walk | readBytes": {
       "reason": "Discovery reads each source once, and the receipt scan reads each receipt once. A rise means a step reads files again.",
-      "budget": 18874,
+      "budget": 18453,
       "margin": 256
     },
     "poll and backstop walk | receiptChecks": {
@@ -938,7 +938,7 @@
     },
     "warm start | dispatchSpendBytes": {
       "reason": "A spend pass reads each pending root once. A rise means a pass reads spend sources again inside one root.",
-      "budget": 1514,
+      "budget": 1494,
       "margin": 0
     },
     "warm start | dispatchSpendFiles": {
@@ -1018,7 +1018,7 @@
     },
     "warm start | readBytes": {
       "reason": "Discovery reads each source once, and the receipt scan reads each receipt once. A rise means a step reads files again.",
-      "budget": 18874,
+      "budget": 18453,
       "margin": 256
     },
     "warm start | receiptChecks": {

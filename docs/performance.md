@@ -231,7 +231,7 @@ After each step the test compares the performance counters with `scripts/test-bu
 
 An integer counter must equal its budget within the margin on both sides. The byte counters `readBytes` and `dispatchSpendBytes` fail only above budget plus margin, because Windows paths take more bytes in JSON than Linux paths. A counter that is nonzero with no row fails. A row that no step measures fails with its own message. A counter that one step does not report reads 0 there, so a row of 0 needs another step that reports the counter.
 
-The test pads the temporary root to one length, so path bytes do not change from machine to machine. A `readBytes` row that expects bytes keeps a small margin, because the receipt store records native device and file numbers. A row that expects no bytes has a margin of 0. The worker takes the real path of the temporary directory, so its receipt walk stops at one level on every platform.
+The test pads the temporary root to one UTF-8 byte length in JSON, so a non-ASCII character or a deeper temporary directory adds no path bytes. A `readBytes` row that expects bytes keeps a small margin, because the receipt store records native device and file numbers. A row that expects no bytes has a margin of 0. The worker takes the real path of the temporary directory, so its receipt walk stops at one level on every platform.
 
 The failure message names the step, the counter, the recorded budget, the measured count and the reason of the row. The message tells the reader to update the row if the change is intended. It tells the reader to find the cause if the change is not intended.
 

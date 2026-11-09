@@ -29,18 +29,28 @@ const ONE_SIDED = new Set(['readBytes', 'dispatchSpendBytes']);
 // Counts of host work with one exact name each.
 const WORK_NAMES = new Set(['catalogWalk', 'watcher:grownMembers', 'pollDirectoryStats', 'childVersionStat']);
 
-// Byte rows count paths and working directories, so a root of one length keeps those bytes the same on every machine.
-const ROOT_LENGTH = 160;
+// Byte rows count paths and working directories in JSON, so a root of one serialized length keeps those bytes the same
+// under any temporary directory.
+const ROOT_BYTES = 160;
 // Longer than the host's checkpoint interval, so the timer the host armed fires inside this wait.
 const CHECKPOINT_WAIT_MS = 10 * 60 * 1000;
 
-function paddedRoot(base: string): string {
-  const real = fs.realpathSync.native(base);
+function serializedBytes(text: string): number {
+  return Buffer.byteLength(JSON.stringify(text)) - 2;
+}
+
+// Each padding character adds one byte, so the padding removes what a separator or a non-ASCII character adds.
+function paddedRootPath(real: string, paths: Pick<path.PlatformPath, 'join'>): string {
+  const start = paths.join(real, 'p');
   assert.ok(
-    real.length < ROOT_LENGTH - 1,
+    serializedBytes(start) <= ROOT_BYTES,
     `The temporary directory ${real} leaves no room to pad. Use a shorter TEMP.`,
   );
-  const root = path.join(real, 'p'.repeat(ROOT_LENGTH - real.length - 1));
+  return start + 'p'.repeat(ROOT_BYTES - serializedBytes(start));
+}
+
+function paddedRoot(base: string): string {
+  const root = paddedRootPath(fs.realpathSync.native(base), path);
   fs.mkdirSync(root);
   return root;
 }
@@ -282,6 +292,17 @@ function activate(options: { stubReadPasses: boolean }) {
   };
   return { provider, worker, posts, settle, receive: (message: unknown) => receive(message) };
 }
+
+test('a temporary root takes one serialized byte length on each platform', () => {
+  const branches = [
+    { paths: path.win32, base: 'C:\\Temp\\run' },
+    { paths: path.posix, base: '/private/var/folders/run' },
+    { paths: path.posix, base: '/tmp/run' },
+  ];
+  for (const { paths, base } of branches)
+    for (const real of [base, `${base}é漢`, paths.join(base, 'deeper', 'still')])
+      assert.equal(serializedBytes(paddedRootPath(real, paths)), ROOT_BYTES, real);
+});
 
 test('the worker stops its receipt walk at the real temporary directory on macOS', async () => {
   const { safeDispatchPath } = await import('./dispatchreceipts.ts');
