@@ -3919,7 +3919,7 @@ test('the saved Claude openings report the bytes and the time that they add to o
   const directory = folder();
   const project = 'C:\\Users\\example\\.claude\\projects\\c--Users-example-Documents-repo';
   const stat = (index: number) => ({
-    cwd: 'C:\\Users\\example\\Documents\\repo\\.claude\\worktrees\\2026-11-09-topic',
+    cwd: 'C:\\Users\\example\\Documents\\repo\\.claude\\worktrees\\a-topic-worktree',
     size: 1_048_576 + index,
     mtimeMs: 1_762_700_000_000.125 + index,
     dev: '3518437209',
