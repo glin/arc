@@ -11899,7 +11899,7 @@ export class PanelProvider implements vscode.Disposable {
   private liveOpenChildren(
     now: number,
     outcomes = this.sessionOutcomes,
-    rows = this.sessionRows,
+    rows: readonly { id: string; agentKey: string }[] = this.sessionRows,
     noteExpiry?: (at: number) => void,
   ): Map<string, string[]> {
     this.performanceCounters?.recordWork('liveOpenChildren');
