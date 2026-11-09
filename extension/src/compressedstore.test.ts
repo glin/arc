@@ -1177,6 +1177,36 @@ test.skipIf(!encode)('an adoption behind a live lock answers only after its entr
   openings.dispose();
 });
 
+test.skipIf(!encode)('a twin replaced while its adoption waits for the lease restarts the adoption', async () => {
+  const { plain, twin, mtimeMs } = twinFixture('adopt-wait-replaced', opening(THREAD));
+  const { directory, clock, make } = storeFixture('adopt-wait-replaced-store');
+  const openings = storeFixture('adopt-wait-replaced-openings').make();
+  const lock = path.join(directory, STORE_LOCK);
+  fs.writeFileSync(lock, 'live-holder');
+  const holder = make();
+  const answer = recordCompressedAdoption(
+    { twin, plain, plainMtimeMs: mtimeMs, opening: meta(THREAD), spend: completeSpend },
+    holder,
+    openings,
+  );
+  await vi.waitFor(() => assert.equal(holder.pending, 1));
+  // Another thread's compression replaces the twin after its validation and before the append.
+  fs.writeFileSync(twin, encode!(Buffer.from(opening(OTHER_THREAD))));
+  const replaced = new Date(mtimeMs + 60_000);
+  fs.utimesSync(twin, replaced, replaced);
+  fs.rmSync(lock);
+  clock.advance(5_000);
+  const result = await answer;
+  assert.equal(result.adopted, false, "the queue published the replaced twin's facts");
+  assert.equal(result.durable, true);
+  const stored = readCompressedStore(directory).entries.get(twin);
+  assert.equal(stored?.adopted, undefined, "the store holds the replaced twin's facts");
+  assert.equal(stored?.adoptionFailed, true);
+  assert.equal(stored?.threadId, OTHER_THREAD);
+  holder.dispose();
+  openings.dispose();
+});
+
 test.skipIf(!encode)('an adoption whose holder stops answers not durable', async () => {
   const { plain, twin, mtimeMs } = twinFixture('adopt-stop', opening(THREAD));
   const { directory, make } = storeFixture('adopt-stop-store');

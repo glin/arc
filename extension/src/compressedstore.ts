@@ -87,6 +87,8 @@ export interface CompressedAdoptionInput {
 export interface CompressedAdoptionResult {
   adopted: boolean;
   entry: CompressedFactEntry;
+  // The stat of the twin that the header read and the hash covered.
+  revision: ReturnType<typeof readRolloutStat>;
 }
 
 // The pair key of a twin: the canonical path of the rollout without `.zst`. The plain file can be gone, so the twin's
@@ -130,6 +132,7 @@ export async function adoptCompressedTwin(
   const expected = sessionKeyOf(input.plain, input.opening);
   const failed = (): CompressedAdoptionResult => ({
     adopted: false,
+    revision: stat,
     entry: {
       file: input.twin,
       pairKey: compressedPairKey(input.twin),
@@ -153,6 +156,7 @@ export async function adoptCompressedTwin(
   if (!hashed || !sameStat(hashed.stat, stat) || !sameStat(readRolloutStat(input.twin), stat)) return failed();
   return {
     adopted: true,
+    revision: stat,
     entry: {
       file: input.twin,
       pairKey: compressedPairKey(input.twin),
@@ -776,6 +780,8 @@ export class CompressedStoreHolder {
 
   private readonly queue: CompressedFactEntry[] = [];
   private readonly flushed = new WeakSet<CompressedFactEntry>();
+  private readonly revisionTests = new WeakMap<CompressedFactEntry, () => boolean>();
+  private readonly withdrawn = new WeakSet<CompressedFactEntry>();
   private waiters: { entries: readonly CompressedFactEntry[]; settle: (durable: boolean) => void }[] = [];
   private token: string | null = null;
   private epoch: { e: number; token: string } | null = null;
@@ -837,16 +843,24 @@ export class CompressedStoreHolder {
 
   // Queue entries and work them off. The returned promise settles when this run of the queue ends, with one value per
   // entry: true when its line is on disk. A false value leaves the entry queued, and `durable` reports its end.
-  append(entries: readonly CompressedFactEntry[]): Promise<boolean[]> {
+  // `revisionHolds` runs at the write. A false answer withdraws the entry, and nothing writes its line.
+  append(entries: readonly CompressedFactEntry[], revisionHolds?: () => boolean): Promise<boolean[]> {
+    if (revisionHolds) for (const entry of entries) this.revisionTests.set(entry, revisionHolds);
     this.queue.push(...entries);
     return this.work().then(() => entries.map((entry) => this.flushed.has(entry)));
   }
 
-  // True when every entry reaches the disk, or false when the holder is disposed first.
+  // True when every entry reaches the disk, or false when one is withdrawn or the holder is disposed first.
   durable(entries: readonly CompressedFactEntry[]): Promise<boolean> {
     if (entries.every((entry) => this.flushed.has(entry))) return Promise.resolve(true);
+    if (entries.some((entry) => this.withdrawn.has(entry))) return Promise.resolve(false);
     if (this.disposed) return Promise.resolve(false);
     return new Promise((settle) => this.waiters.push({ entries, settle }));
+  }
+
+  // True when the entry's revision changed before its write.
+  withdrew(entry: CompressedFactEntry): boolean {
+    return this.withdrawn.has(entry);
   }
 
   // Run the queue until it is empty. A failed lease leaves the queue in place and retries after the jitter delay.
@@ -1058,6 +1072,12 @@ export class CompressedStoreHolder {
     const lines: string[] = [];
     while (taken < this.queue.length && bytes < this.segmentBytes) {
       let entry = this.queue[taken];
+      if (this.revisionTests.get(entry)?.() === false) {
+        this.queue.splice(taken, 1);
+        this.withdrawn.add(entry);
+        this.settleWaiters();
+        continue;
+      }
       let line = `${JSON.stringify(entry)}\n`;
       if (entry.title && Buffer.byteLength(line) > COMPRESSED_ENTRY_TITLE_BYTES) {
         const { title, ...rest } = entry;
@@ -1078,6 +1098,7 @@ export class CompressedStoreHolder {
       bytes += length;
       taken++;
     }
+    if (!taken) return true;
     if (!this.check()) return false;
     this.fault('segment:checked');
     if (oversized) this.closeSegment();
@@ -1108,6 +1129,7 @@ export class CompressedStoreHolder {
     this.waiters = [];
     for (const waiter of waiting) {
       if (waiter.entries.every((entry) => this.flushed.has(entry))) waiter.settle(true);
+      else if (waiter.entries.some((entry) => this.withdrawn.has(entry))) waiter.settle(false);
       else this.waiters.push(waiter);
     }
   }
@@ -1365,15 +1387,21 @@ export async function recordCompressedNames(
 }
 
 // Adopt a twin and record the entry. The result is durable only after the entry's line is on disk, or false when the
-// holder is disposed first, so the host keeps the plain path until the entry can no longer be lost.
+// holder is disposed first, so the host keeps the plain path until the entry can no longer be lost. An entry can wait
+// for the lease, so its write first compares the twin with the validated stat. A different stat restarts the adoption.
 export async function recordCompressedAdoption(
   adoption: CompressedAdoptionInput,
   facts: CompressedStoreHolder,
   openings: CompressedStoreHolder,
 ): Promise<CompressedAdoptionResult & { durable: boolean }> {
-  const result = await adoptCompressedTwin(adoption);
-  const [written] = await facts.append([result.entry]);
-  const durable = written || (await facts.durable([result.entry]));
-  if (durable && result.adopted && result.entry.opening) await openings.append([compressedOpeningEntry(result.entry)]);
-  return { ...result, durable };
+  for (;;) {
+    const result = await adoptCompressedTwin(adoption);
+    const revisionHolds = result.adopted ? () => sameStat(readRolloutStat(adoption.twin), result.revision) : undefined;
+    const [written] = await facts.append([result.entry], revisionHolds);
+    const durable = written || (await facts.durable([result.entry]));
+    if (!durable && facts.withdrew(result.entry)) continue;
+    if (durable && result.adopted && result.entry.opening)
+      await openings.append([compressedOpeningEntry(result.entry)]);
+    return { ...result, durable };
+  }
 }
