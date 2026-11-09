@@ -555,16 +555,11 @@ export class PanelPerformanceCounters {
       reason?: string;
     },
   ): void {
-    const pending = this.pendingSelections.get(panel);
-    const timing =
-      pending?.id === message.id
-        ? pending
-        : message.reason
-          ? this.selectionTimings.find((entry) => entry.id === message.id && this.selectionPanels.get(entry) === panel)
-          : undefined;
+    const timing = this.selectionTimings.find(
+      (entry) => entry.id === message.id && this.selectionPanels.get(entry) === panel,
+    );
     if (
       !timing ||
-      timing.id !== message.id ||
       timing.sessionId !== message.sessionId ||
       timing.stamps['selection:renderPosted'] === undefined ||
       timing.stamps['selection:renderReceived'] !== undefined
@@ -577,14 +572,10 @@ export class PanelPerformanceCounters {
     )
       return;
     this.selectionStamp(timing, 'selection:renderReceived', message.receivedAt);
-    if (timing.reason) {
-      this.sink.emit('selection:abandoned', selectionSnapshot(timing));
-      return;
-    }
-    if (message.paintedAt !== undefined) {
-      this.selectionStamp(timing, 'selection:painted', message.paintedAt);
-      this.pendingSelections.delete(panel);
-    } else if (message.reason) this.abandonSelection(panel, message.reason);
+    if (message.paintedAt !== undefined) this.selectionStamp(timing, 'selection:painted', message.paintedAt);
+    if (timing.reason) return;
+    if (message.paintedAt !== undefined) this.pendingSelections.delete(panel);
+    else if (message.reason) this.abandonSelection(panel, message.reason, timing.id);
   }
 
   abandonSelection(panel: object, reason: string, id?: number): void {

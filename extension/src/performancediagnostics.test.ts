@@ -121,6 +121,31 @@ test('a hidden panel retains a receipt reported after host abandonment without c
   }
 });
 
+test.each([
+  ['paint', { paintedAt: 150 }, 150],
+  ['abandonment', { reason: 'hidden' }, undefined],
+] as const)('a late %s reply keeps the terminal reason and emits no second terminal event', (_name, reply, painted) => {
+  const lines: string[] = [];
+  const counters = new PanelPerformanceCounters(1000, { enabled: () => true, emit: (event) => lines.push(event) });
+  const panel = {};
+  try {
+    counters.startSelection(panel, 'first', 'held', 100);
+    counters.selectionRender(panel, 'first', 110);
+    counters.startSelection(panel, 'second', 'read', 120);
+    counters.selectionPaint(panel, { id: 1, sessionId: 'first', receivedAt: 130, ...reply });
+    const [first, second] = counters.snapshot().selections;
+    assert.equal(first.reason, 'superseded');
+    assert.equal(first.stamps['selection:renderReceived'], 130);
+    assert.equal(first.stamps['selection:painted'], painted);
+    assert.equal(second.reason, null);
+    assert.deepEqual(second.stamps, { 'selection:hostArrived': 120 });
+    assert.equal(lines.filter((event) => event === 'selection:abandoned').length, 1);
+    assert.equal(counters.snapshot().work['selection:abandoned'], 1);
+  } finally {
+    counters.dispose();
+  }
+});
+
 function state(counters: ReturnType<PanelPerformanceCounters['snapshot']>): PerformanceDiagnosticState {
   return {
     panel: {
