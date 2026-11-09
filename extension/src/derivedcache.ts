@@ -381,7 +381,7 @@ export interface DerivedCache {
 // The merged links and child rows of the last complete discovery reply that settled membership. A later start publishes its
 // first catalog from them while discovery stays pending.
 export interface SavedDiscoveryLinks {
-  // `Date.now()` when the reply settled. No check reads it, so a set of any age can publish.
+  // `Date.now()` when the reply settled. No age check reads it, so a set of any age can publish.
   savedAt: number;
   // The repository roots of the reply, as JSON.
   scope: string;
@@ -396,8 +396,7 @@ export interface SavedDiscoveryLinks {
 export const MAX_SAVED_DISCOVERY_LINKS = 65_536;
 
 export type SavedLinksRefusal = 'missing' | 'malformed' | 'scope' | 'incompatible';
-// Why a saved link set cannot publish a first catalog, before the walked rows are compared with it. A set stays valid until
-// its compatibility value changes or a settled reply replaces it, whatever its age.
+// Why a saved link set cannot publish a first catalog, before the walked rows are compared with it. Age never refuses a set.
 export function savedLinksRefusal(
   saved: SavedDiscoveryLinks | undefined,
   malformed: boolean,

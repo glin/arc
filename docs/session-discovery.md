@@ -16,7 +16,7 @@ Admission shares read and filesystem-check allowances across Claude sources and 
 
 After a catalog is accepted, the published rows stay that catalog's sessions while relationship discovery continues. A refresh can list an accepted source again with the same device and inode and no smaller size. That source takes the listed revision, so its metadata follows the file. A walked source of a session that this panel started and still awaits joins them. That source must be the only walked source of its session ID and a walk member without a collision. It must also have a supported file identity, lie inside repository scope, and be absent from the accepted rows. Child transcripts wait for discovery, and discovery stays incomplete.
 
-The first catalog of an activation can publish before the worker's first reply, from the links and child rows that the last settled complete reply saved in the [derived cache](session-history.md#cache-ownership). A saved set has no age limit. It stays valid until its discovery compatibility changes or a settled reply replaces it. The host refuses the saved set when one of these holds, and the start then publishes at the first discovery reply that carries walked rows:
+The first catalog of an activation can publish before the worker's first reply, from the links and child rows that the last settled complete reply saved in the [derived cache](session-history.md#cache-ownership). Age never refuses a saved set. A settled reply replaces the set. The host refuses the saved set when one of these holds, and the start then publishes at the first discovery reply that carries walked rows:
 
 - `missing`: the derived cache holds no saved set.
 - `malformed`: the derived cache holds a set that fails validation.
