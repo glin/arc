@@ -15,7 +15,9 @@ import {
   CompressedStoreHolder,
   COMPRESSED_FACTS_VERSION,
   readCompressedStore,
+  readCompressedStoreInSteps,
   recordCompressedAdoption,
+  recordCompressedNames,
   STORE_LOCK,
   withKeptUndercount,
   type CompressedFactEntry,
@@ -796,6 +798,55 @@ test('the idle holder releases its lock and the next append takes it again with 
   const epoch = JSON.parse(fs.readFileSync(path.join(directory, 'epoch'), 'utf8'));
   assert.equal(epoch.e, 2);
   holder.dispose();
+});
+
+test('recording a compressed list resolves each directory once and yields between slices', async () => {
+  const { directory, make } = storeFixture('store-names', { segmentBytes: 4096 });
+  const holder = make();
+  await holder.append([entry('known.jsonl.zst')]);
+  const root = tempDir('store-names-rollouts');
+  for (const name of ['a', 'b']) fs.mkdirSync(path.join(root, name));
+  const names = [
+    'known.jsonl.zst',
+    ...Array.from({ length: 200 }, (_, at) => path.join(root, at % 2 ? 'a' : 'b', `rollout-${at}.jsonl.zst`)),
+  ];
+  const resolved = vi.spyOn(defaultFs.realpathSync, 'native');
+  let clock = 0;
+  let yields = 0;
+  try {
+    await recordCompressedNames(names, holder, {
+      now: () => (clock += 5),
+      yieldStep: async () => {
+        yields++;
+      },
+      statOf: () => null,
+    });
+  } finally {
+    const calls = resolved.mock.calls.length;
+    resolved.mockRestore();
+    assert.ok(calls <= 2, `${calls} directory resolutions for 2 directories`);
+  }
+  assert.ok(yields >= 30, `${yields} yields across 200 names at 5 ms each`);
+  const stored = readCompressedStore(directory).entries;
+  assert.equal(stored.get(names[1])?.nameOnly, true);
+  assert.equal(stored.get('known.jsonl.zst')?.nameOnly, undefined, 'a known name got a second record');
+  holder.dispose();
+});
+
+test('a stepped read of the store yields after every file', async () => {
+  const { directory } = storeFixture('store-read-steps');
+  for (const at of [1, 2, 3])
+    fs.writeFileSync(path.join(directory, `segment-1-t-${at}`), `${JSON.stringify(entry(`r${at}.jsonl.zst`))}\n`);
+  let yields = 0;
+  const read = await readCompressedStoreInSteps(
+    directory,
+    () => null,
+    async () => {
+      yields++;
+    },
+  );
+  assert.equal(read.entries.size, 3);
+  assert.ok(yields >= 3, `${yields} yields across 3 files`);
 });
 
 test('a batch of entries holds at most 4 MiB, or one larger record', () => {

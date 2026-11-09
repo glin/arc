@@ -10,7 +10,7 @@ import type { DerivedTitleEntry } from './derivedcache';
 import { METADATA_GENERATIONS } from './derivedcache';
 import {
   keepHigherSpend,
-  normalizeSpendFile,
+  normalizeWorkspace,
   PROJECT_SPEND_PARSER_GENERATIONS,
   type SpendFileIndex,
 } from './projectspend';
@@ -36,6 +36,8 @@ const READ_CHUNK = 64 * 1024;
 export const COMPRESSED_ENTRY_TITLE_BYTES = 1024 * 1024;
 // The worker posts at most this many bytes of entries in one batch, or one larger record.
 export const COMPRESSED_BATCH_BYTES = 4 * 1024 * 1024;
+// A worker step that prepares a list of names holds the worker for at most this long.
+const NAME_SLICE_MS = 25;
 
 // The facts of one compressed rollout. An entry with `adoptionFailed` or `nameOnly` holds no facts, and the backfill
 // reads the names it marks first.
@@ -87,15 +89,21 @@ export interface CompressedAdoptionResult {
 }
 
 // The pair key of a twin: the canonical path of the rollout without `.zst`. The plain file can be gone, so the twin's
-// directory supplies the physical path and a pair under a junction alias still meets the ledger's path.
-export function compressedPairKey(twin: string): string {
-  let directory = path.dirname(twin);
-  try {
-    directory = fs.realpathSync.native(directory);
-  } catch {
-    // A directory that cannot be resolved keeps its name.
+// directory supplies the physical path and a pair under a junction alias still meets the ledger's path. A caller with
+// many names passes `directories`, which keeps each resolved directory.
+export function compressedPairKey(twin: string, directories: Map<string, string> = new Map()): string {
+  const directory = path.dirname(twin);
+  let real = directories.get(directory);
+  if (real === undefined) {
+    try {
+      real = fs.realpathSync.native(directory);
+    } catch {
+      // A directory that cannot be resolved keeps its name.
+      real = directory;
+    }
+    directories.set(directory, real);
   }
-  return normalizeSpendFile(path.join(directory, path.basename(twin).replace(/\.zst$/, '')));
+  return normalizeWorkspace(path.join(real, path.basename(twin).replace(/\.zst$/, '')));
 }
 
 function sessionKeyOf(file: string, opening: CodexSessionMeta | null | undefined): string | null {
@@ -463,6 +471,35 @@ export function readCompressedStore(
   directory: string,
   statOf: (file: string) => { size: number; mtimeMs: number } | null = () => null,
 ): CompressedStoreRead {
+  const steps = storeReadSteps(directory, statOf);
+  let step = steps.next();
+  while (!step.done) step = steps.next();
+  return step.value;
+}
+
+// The same read with a yield after each file, so no step holds the worker past one file of at most 4 MiB and one entry.
+export async function readCompressedStoreInSteps(
+  directory: string,
+  statOf: (file: string) => { size: number; mtimeMs: number } | null,
+  yieldStep: () => Promise<void> = yieldToEvents,
+): Promise<CompressedStoreRead> {
+  const steps = storeReadSteps(directory, statOf);
+  let step = steps.next();
+  while (!step.done) {
+    await yieldStep();
+    step = steps.next();
+  }
+  return step.value;
+}
+
+function yieldToEvents(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+function* storeReadSteps(
+  directory: string,
+  statOf: (file: string) => { size: number; mtimeMs: number } | null,
+): Generator<void, CompressedStoreRead, void> {
   const names = listDirectory(directory);
   const view = storeView(directory, names);
   const best = new Map<string, { ranked: RankedEntry; entry: CompressedFactEntry }>();
@@ -483,6 +520,7 @@ export function readCompressedStore(
       if (!held || compareRankedEntries(ranked, held.ranked, statOf(entry.file)) > 0)
         best.set(entry.file, { ranked, entry });
     });
+    yield;
   }
   const entries = new Map<string, CompressedFactEntry>();
   for (const [file, { entry }] of best) entries.set(file, entry);
@@ -633,7 +671,7 @@ export class CompressedStoreHolder {
         return () => clearTimeout(timer);
       });
     this.retryDelay = options.retryDelay ?? (() => RETRY_MIN_MS + Math.random() * RETRY_SPREAD_MS);
-    this.yieldStep = options.yieldStep ?? (() => new Promise((resolve) => setImmediate(resolve)));
+    this.yieldStep = options.yieldStep ?? yieldToEvents;
     this.exists = options.exists ?? fs.existsSync;
     this.statOf = options.statOf ?? compressedPhysicalStat;
     this.wrote = options.wrote ?? (() => {});
@@ -1147,6 +1185,37 @@ export class CompressedStoreHolder {
     this.waiters = [];
     for (const waiter of waiting) waiter.settle(false);
   }
+}
+
+// Each list from the host is the complete set. A name that the store holds in any form needs no second record, because
+// the backfill tests a stored entry for currency. Nothing here decodes a rollout.
+export async function recordCompressedNames(
+  list: readonly string[],
+  holder: CompressedStoreHolder,
+  options: { now?: () => number; yieldStep?: () => Promise<void>; statOf?: typeof compressedPhysicalStat } = {},
+): Promise<void> {
+  const now = options.now ?? performance.now.bind(performance);
+  const yieldStep = options.yieldStep ?? yieldToEvents;
+  const stored = (
+    await readCompressedStoreInSteps(holder.directory, options.statOf ?? compressedPhysicalStat, yieldStep)
+  ).entries;
+  const directories = new Map<string, string>();
+  const records: CompressedFactEntry[] = [];
+  let sliceStarted = now();
+  for (const file of list) {
+    if (!stored.has(file))
+      records.push({
+        file,
+        pairKey: compressedPairKey(file, directories),
+        ...compressedEntryVersions(),
+        nameOnly: true,
+      });
+    if (now() - sliceStarted >= NAME_SLICE_MS) {
+      await yieldStep();
+      sliceStarted = now();
+    }
+  }
+  if (records.length) await holder.append(records);
 }
 
 // Adopt a twin and record the entry. The result is durable only after the entry's line is on disk, or false when the

@@ -140,13 +140,11 @@ import { DispatchReceipts } from './dispatchreceipts';
 import { admittedDispatchReferences } from './turnrail';
 import {
   compressedEntryBatches,
-  compressedEntryVersions,
-  compressedPairKey,
   compressedPhysicalStat,
   CompressedStoreHolder,
   readCompressedStore,
   recordCompressedAdoption,
-  type CompressedFactEntry,
+  recordCompressedNames,
 } from './compressedstore';
 import {
   announceCompressedDecodes,
@@ -661,31 +659,11 @@ async function executeCompressedLoad(
   return { kind: 'compressed-load', entries: signal.aborted ? [] : (batches.at(-1) ?? []), done: true };
 }
 
-// Each list from the host is the complete set. The worker records every name without an entry for the backfill. It
-// decodes none of them.
 function noteCompressedNames(list: readonly string[], stores: import('./compressedstore').CompressedStorePaths): void {
-  let stored: ReadonlyMap<string, CompressedFactEntry>;
-  try {
-    stored = readCompressedStore(stores.facts).entries;
-  } catch {
-    stored = new Map();
-  }
-  // A name that the store holds in any form needs no second record. The backfill tests a stored entry for currency.
-  const records = list
-    .filter((name) => !stored.has(name))
-    .map((file): CompressedFactEntry => ({
-      file,
-      pairKey: compressedPairKey(file),
-      ...compressedEntryVersions(),
-      nameOnly: true,
-    }));
-  if (!records.length) return;
-  void compressedHolder(stores.facts)
-    .append(records)
-    .then(() => {
-      const bytes = takeCompressedWriteBytes();
-      if (bytes) parentPort?.postMessage({ compressedStoreWrite: bytes });
-    });
+  void recordCompressedNames(list, compressedHolder(stores.facts)).then(() => {
+    const bytes = takeCompressedWriteBytes();
+    if (bytes) parentPort?.postMessage({ compressedStoreWrite: bytes });
+  });
 }
 
 async function execute(
