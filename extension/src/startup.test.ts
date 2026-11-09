@@ -12801,6 +12801,22 @@ test.each(['commit-repositories', 'repository-commits', 'models'])(
   },
 );
 
+test('a models refresh that builds the first catalog from a cold pass sends the discovery request', async () => {
+  const { provider, root, file, files, releaseAll, runs, update, walks } = cardRefreshHarness('models');
+  const counters = new PanelPerformanceCounters();
+  provider.performanceCounters = counters;
+  provider.codexColdReads = (signal: AbortSignal) => coldOpeningPass(provider.codexMetas, root, signal);
+  await update();
+  await releaseAll(runs[0]);
+  assert.deepEqual(files(), [file]);
+  assert.equal(walks.length, 0, 'the first refresh walked the tree that the cold pass listed');
+  assert.equal(
+    counters.snapshot().work['discoveryRequest:walked:models'],
+    1,
+    'the first catalog published without a discovery request',
+  );
+});
+
 test('each catalog walk names its requester, and the re-list after a replaced file names itself', async () => {
   let replaced: string[] = [];
   const { provider, walks, writeRollout, releaseAll } = heldWalkHarness(

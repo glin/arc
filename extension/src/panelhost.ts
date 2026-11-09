@@ -10784,6 +10784,12 @@ export class PanelProvider implements vscode.Disposable {
       }
       // A request merged into the relist still revalidates the paths that it names.
       const codexOnly = codexRelisted !== null && !this.targetedRefreshPaths?.length;
+      // No discovery reply answers a first catalog, so a refresh that lists it from a primed enumeration sends the
+      // discovery request that a walk sends.
+      if (reuseCatalog && primedEnumeration && !this.catalog) {
+        reuseCatalog = false;
+        walkReasons = [refreshReason];
+      }
       let all = selectedOnly
         ? (this.authoritativeCatalog ?? [])
         : codexOnly
