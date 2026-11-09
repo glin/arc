@@ -195,6 +195,7 @@ import { revisionOf, readQualifiedSessionCwd, readPreviousLines } from './transc
 import { afterAll, afterEach, beforeAll, describe, test, vi } from 'vitest';
 import assert from 'node:assert';
 import * as fs from 'node:fs';
+import fsBuiltin from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import * as zlib from 'node:zlib';
@@ -241,6 +242,7 @@ import {
   readCodexSessionMetaAsync,
   readCodexSessionTitle,
   readCodexSessionTitlePair,
+  readRolloutStat,
   REFUSED_OPENING_FIRST_RETRY_MS,
   REFUSED_OPENING_RETRY_MS,
   rolloutFiles,
@@ -16038,6 +16040,44 @@ test.each(['win32', 'darwin', 'linux'] as const)('a legacy Codex opening adopts 
     assert.equal(reads, expectedReads, difference);
     assert.equal(cache.snapshot()[0][1].fileIdentity?.dev, stat.dev, difference);
     assert.equal(cache.snapshot()[0][1].fileIdentity?.ino, stat.ino, difference);
+  }
+});
+
+test('a warm prime qualifies openings in bounded lanes without a synchronous stat', async () => {
+  const root = sessionsRoot(
+    [UUID_A, UUID_B, UUID_C].map((id) => ({ day: '2026/08/25', name: ROLLOUT(id), records: [meta({ id })] })),
+  );
+  const files = rolloutFiles(root);
+  const cache = new CodexMetaCache();
+  await cache.prime(files);
+  const stats = new Map(files.map((file) => [file, readRolloutStat(file)]));
+  const statSync = vi.spyOn(fsBuiltin, 'statSync');
+  syncBuiltinESMExports();
+  let running = 0;
+  let most = 0;
+  let asked = 0;
+  try {
+    const read = await cache.prime(
+      files,
+      async () => assert.fail('a warm prime read an opening'),
+      2,
+      undefined,
+      undefined,
+      async (file) => {
+        asked++;
+        most = Math.max(most, ++running);
+        await Promise.resolve();
+        running--;
+        return stats.get(file)!;
+      },
+    );
+    assert.equal(read, false);
+    assert.equal(statSync.mock.calls.length, 0, 'a warm prime made a synchronous stat');
+    assert.equal(asked, files.length);
+    assert.equal(most, 2);
+  } finally {
+    statSync.mockRestore();
+    syncBuiltinESMExports();
   }
 });
 

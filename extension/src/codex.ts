@@ -302,33 +302,37 @@ export class CodexMetaCache {
     return this.entries.get(file)?.meta ?? null;
   }
 
-  // Read missing and refused openings asynchronously, with at most `limit` concurrent reads.
+  // Qualify held openings and read missing or refused ones asynchronously, with at most `limit` lanes.
   // Preserve any non-refusal entry `get` supplies during the read.
   // A missing record keeps its measured size. Later `get` calls retry after growth.
-  // Rejected reads leave existing entries unchanged. Return true when a readable opening was added.
-  // An aborted `signal` stops each lane before its next read. A compressed rollout gets no read.
+  // A rejected read keeps a missing or refused entry. An opening that failed qualification stays removed.
+  // Return true when the saved openings changed.
+  // An aborted `signal` stops each lane before its next stat or read. A compressed rollout gets no read.
   async prime(
     files: readonly string[],
     readAsync: (file: string, buf: Buffer) => Promise<CodexSessionMeta | null> = readCodexSessionMetaAsync,
     limit = COLD_OPENING_READS,
     sizeAsync: (file: string) => Promise<number | null> = fileSizeAsync,
     signal?: AbortSignal,
+    statAsync: (file: string) => Promise<RolloutStat | null> = readRolloutStatAsync,
   ): Promise<boolean> {
-    const missing = files.filter(
-      (file) =>
-        !isCompressedRollout(file) &&
-        !this.current(file, this.statOf(file)) &&
-        this.entries.get(file)?.meta === undefined,
-    );
+    const pending = files.filter((file) => !isCompressedRollout(file) && this.entries.get(file)?.meta !== null);
     const before = this.changed;
     let next = 0;
     const lane = async (): Promise<void> => {
-      const buf = Buffer.allocUnsafe(META_BYTES);
-      while (next < missing.length) {
+      let buf: Buffer | undefined;
+      while (next < pending.length) {
         if (signal?.aborted) return;
-        const file = missing[next++];
+        const file = pending[next++];
+        const held = this.entries.get(file)?.meta;
+        if (held) {
+          const stat = await statAsync(file);
+          if (signal?.aborted) return;
+          if (this.entries.get(file)?.meta !== held || this.current(file, stat)) continue;
+        }
         let meta: CodexSessionMeta | null;
         try {
+          buf ??= Buffer.allocUnsafe(META_BYTES);
           meta = await readAsync(file, buf);
         } catch {
           continue;
@@ -343,7 +347,7 @@ export class CodexMetaCache {
         }
       }
     };
-    await Promise.all(Array.from({ length: Math.min(limit, missing.length) }, lane));
+    await Promise.all(Array.from({ length: Math.min(limit, pending.length) }, lane));
     return this.changed !== before;
   }
 
@@ -1018,6 +1022,15 @@ export function readRolloutStat(file: string): RolloutStat | null {
   } catch {
     return null;
   } // vanished mid-scan
+}
+
+async function readRolloutStatAsync(file: string): Promise<RolloutStat | null> {
+  try {
+    const stat = await fs.promises.stat(file, { bigint: true });
+    return { ...revisionOf(stat), isFile: stat.isFile() };
+  } catch {
+    return null;
+  }
 }
 
 // A rollout written to within this window is statted on every listing.
