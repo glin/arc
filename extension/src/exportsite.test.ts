@@ -832,10 +832,46 @@ test('an exported Claude turn keeps the interval that timed its output speed', (
     'root',
   );
   const speed = (card: ReturnType<typeof toCard>) =>
-    card.chips.find((chip) => chip.metric === 'tokens')?.detailList?.entries.find((entry) => entry.label === 'Output')
+    card.chips.find((chip) => chip.metric === 'rate')?.detailList?.entries.find((entry) => entry.label === 'Output')
       ?.lines?.[0];
   assert.deepEqual(speed(toCard(restored, false, 200_000)), speed(toCard(original, false, 200_000)));
   assert.match(JSON.stringify(speed(toCard(restored, false, 200_000))), /Request time includes the wait/);
+});
+
+test('an exported subagent row keeps the warning sign on its dollars', () => {
+  const low = {
+    requests: 6,
+    input: 300_000,
+    cacheRead: 100_000,
+    cacheWrite1h: 0,
+    cacheWrite5m: 0,
+    output: 300,
+    thinking: 0,
+  };
+  const production = toCard(
+    turn({
+      agents: [
+        {
+          id: 'child',
+          description: 'Audit the parser',
+          agentType: 'Explore',
+          model: 'claude-sonnet-5',
+          effort: null,
+          spend: [{ model: 'claude-sonnet-5', usage: low }],
+          spendFound: true,
+          spendPartial: false,
+          durationMs: 60_000,
+          tokens: null,
+          toolUses: null,
+          status: 'completed',
+        },
+      ],
+    }),
+    false,
+    200_000,
+  );
+  const figure = exportCard(production).agents![0].figures.find((held) => held.metric === 'cost')!;
+  assert.deepEqual(figure.warnings, ['low-cache']);
 });
 
 test('exported turn figures retain production records, warnings and counted partial lines', () => {
@@ -898,7 +934,7 @@ test('exported turn figures retain production records, warnings and counted part
     );
     const card = exportCard(toCard(restored, false, 200_000));
     assert.deepEqual(JSON.parse(JSON.stringify(card.chips)), JSON.parse(JSON.stringify(exportCard(production).chips)));
-    for (const metric of ['cost', 'files', 'context', 'tokens', 'agents']) {
+    for (const metric of ['cost', 'files', 'context', 'rate', 'agents']) {
       const chip = card.chips!.find((chip) => chip.metric === metric)!;
       assert.ok(chip.detailList?.entries, metric);
       assert.deepEqual(chip.detailList, production.chips.find((chip) => chip.metric === metric)!.detailList);

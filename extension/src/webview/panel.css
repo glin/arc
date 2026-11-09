@@ -6824,6 +6824,15 @@ button.railfilterlabel:focus-visible {
    keep their fields on one line and each bar spans the full width under its row. The popover is
    min(520px, 100vw - 12px) wide, so the viewport width selects this layout. */
 @media (max-width: 420px) {
+  /* A row with dollars, commits and files holds no room for the output speed at this width. */
+  .chippop
+    .agentrow
+    .agentfacts:has(.railstatchip[data-metric='cost']):has(.railstatchip[data-metric='commits']):has(
+      .railstatchip[data-metric='files']
+    )
+    .railstatchip[data-metric='rate'] {
+    display: none;
+  }
   .chippop .split {
     flex-wrap: wrap;
     row-gap: 0.45em;

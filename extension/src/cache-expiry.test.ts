@@ -2115,6 +2115,48 @@ test('native child coverage refuses a return with an invalid request clock', () 
   assert.equal(turnCacheExpiryWarning(turn, expiry, cost), null);
 });
 
+test('native child coverage gives each child its own expiry entry, and the entries sum to the turn total', () => {
+  const main = indexed([claudePrompt(0, 'root'), claudeResponse(1, { id: 'root' })], claudeReducer);
+  const directory = dir();
+  const named = (id: string, model?: string) => {
+    const record = indexedNativeExpiry(id, model);
+    const file = path.join(directory, `agent-${id}.jsonl`);
+    fs.copyFileSync(record.file, file);
+    return { ...record, file };
+  };
+  const sonnet = named('sonnet');
+  const haiku = named('haiku', 'claude-haiku-4-5');
+  const unlisted = named('unlisted', 'claude-unlisted');
+  const expiry = sessionCacheFactsBySession(
+    [main, sonnet, haiku, unlisted],
+    [
+      { sessionId: 'root', file: main.file, primary: true },
+      ...[sonnet, haiku, unlisted].map((record) => ({ sessionId: 'root', file: record.file, primary: false })),
+    ],
+  ).root.expiry;
+  const turn = { ...readSession(main.file, 'root').turns[0], sessionId: 'root' };
+  const cost = new ChildCacheExpiryAttribution().read([turn], { root: expiry }, BASE + 20 * MINUTE).get(turnKey(turn))!;
+  const entries = cost.agents!;
+  assert.equal(entries.length, 3);
+  assert.equal(new Set(entries.map((entry) => entry.childId)).size, 3);
+  assert.deepEqual(
+    entries.map((entry) => entry.count),
+    [1, 1, 1],
+  );
+  const priced = entries.filter((entry) => entry.dollars !== null);
+  assert.equal(priced.length, 2);
+  assert.notEqual(priced[0].dollars, priced[1].dollars);
+  assert.equal(
+    entries.reduce((total, entry) => total + (entry.dollars ?? 0), 0),
+    cost.dollars,
+  );
+  assert.equal(
+    entries.reduce((total, entry) => total + entry.count, 0),
+    cost.count,
+  );
+  assert.deepEqual(entries.find((entry) => entry.dollars === null)?.status, 'unknown');
+});
+
 test('native child coverage signs a known material floor with an unpriced return', () => {
   const main = indexed([claudePrompt(0, 'root'), claudeResponse(1, { id: 'root' })], claudeReducer);
   const known = indexedNativeExpiry('known');

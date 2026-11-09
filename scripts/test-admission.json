@@ -70,9 +70,9 @@
     "matricesSha256": "1729f86a1bedd916432b1d5b354c73bd38b81022bf6d2c2d02bee50398f938ef"
   },
   "extension/src/exportsite.test.ts": {
-    "reason": "The production export bundle must retain complete responses and remove host-only actions from portable output. Preparatory compaction pagination uses the existing export bundle. Static cost figures must preserve captured model names and speed identities. Dispatched cost notes use the source's own tiers and retain unknown own evidence across models.",
-    "cases": 43,
-    "matricesSha256": "40b2b518dddc97167c01f34dd1d92e9b99b029fe1a0becb44c36dc1263b8c8c4"
+    "reason": "The production export bundle must retain complete responses and remove host-only actions from portable output. Preparatory compaction pagination uses the existing export bundle. Static cost figures must preserve captured model names and speed identities. Dispatched cost notes use the source's own tiers and retain unknown own evidence across models. A subagent row's warning sign must survive export.",
+    "cases": 44,
+    "matricesSha256": "03550acb708c7b1c77d624af5601b6bd9814779d4012940222ec8a1d9b3b7292"
   },
   "extension/src/gitcommits.test.ts": {
     "reason": "A real fast-forward must retain its reflog details. Verified foreign child commits must retain their repository across cache reload and worktree removal. A removed commit directory must open only in a containing repository that holds the commit.",
@@ -121,7 +121,7 @@
   },
   "extension/src/panel.layout.test.ts": {
     "reason": "The built panel must preserve browser interaction, focus, and scrolling across supported viewports.",
-    "cases": 25,
+    "cases": 26,
     "matricesSha256": "50c194ec69a1f7d68e8655516909ebd43ded23b649d8532210557fec1bb5eeda"
   },
   "extension/src/panel.webview.test.ts": {

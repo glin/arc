@@ -501,7 +501,10 @@ export function AgentRow({
       return;
     }
     const host = event.currentTarget as HTMLElement;
-    const stops = Array.from(host.querySelectorAll<HTMLElement>('.railstatchip[tabindex]'));
+    // A figure the narrow row hides keeps its tabindex, and focusing it would lose the focus.
+    const stops = Array.from(host.querySelectorAll<HTMLElement>('.railstatchip[tabindex]')).filter(
+      (figure) => figure.getClientRects().length > 0,
+    );
     const at = stops.indexOf(event.target as HTMLElement);
     const to = at < 0 ? null : stops[at + (event.key === 'ArrowRight' ? 1 : -1)];
     if (!to) {

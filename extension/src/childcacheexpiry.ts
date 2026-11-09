@@ -12,9 +12,17 @@ import {
 import type { Turn, TurnOutcome } from './transcript';
 import { CHILD_CLOSE_MARGIN_MS } from './turnrail';
 
+export interface ChildExpiryAgent extends CacheExpiryCost {
+  childId: string;
+  count: number;
+  longestGapMs: number;
+}
+
 export interface ChildExpiryCost extends CacheExpiryCost {
   count: number;
   longestGapMs: number;
+  // One entry per child, which sum to the turn's total. An array keeps child ids out of object keys.
+  agents?: ChildExpiryAgent[];
 }
 
 interface Span {
@@ -123,18 +131,33 @@ export class ChildCacheExpiryAttribution {
             continue;
           // A retained return establishes historical child activity independently of write freshness.
           const key = turnKey(span.turn);
-          const held = result.get(key) ?? { count: 0, longestGapMs: 0, dollars: null, status: 'exact' as const };
-          held.count++;
-          held.longestGapMs = Math.max(held.longestGapMs, item.gapMs);
-          if (cost.dollars !== null) held.dollars = (held.dollars ?? 0) + cost.dollars;
-          if (cost.status !== 'exact' || source.facts.truncated || facts[sessionId]?.incompleteSources)
-            held.status = 'atLeast';
+          const held: ChildExpiryCost = result.get(key) ?? {
+            count: 0,
+            longestGapMs: 0,
+            dollars: null,
+            status: 'exact',
+            agents: [],
+          };
+          const entries = held.agents!;
+          let entry = entries.find((one) => one.childId === childId);
+          if (!entry) {
+            entry = { childId, count: 0, longestGapMs: 0, dollars: null, status: 'exact' };
+            entries.push(entry);
+          }
+          for (const total of [held, entry]) {
+            total.count++;
+            total.longestGapMs = Math.max(total.longestGapMs, item.gapMs);
+            if (cost.dollars !== null) total.dollars = (total.dollars ?? 0) + cost.dollars;
+            if (cost.status !== 'exact' || source.facts.truncated || facts[sessionId]?.incompleteSources)
+              total.status = 'atLeast';
+          }
           result.set(key, held);
         }
       }
     }
     for (const source of this.prices.keys()) if (!retained.has(source)) this.prices.delete(source);
-    for (const value of result.values()) if (value.dollars === null) value.status = 'unknown';
+    for (const value of result.values())
+      for (const total of [value, ...value.agents!]) if (total.dollars === null) total.status = 'unknown';
     return result;
   }
 }

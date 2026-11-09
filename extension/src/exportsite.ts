@@ -230,6 +230,7 @@ export function exportCard(value: ReturnType<typeof toCard> | ReturnType<typeof 
         paths: figure.paths,
         fileIdentities: figure.fileIdentities,
         shas: figure.shas,
+        ...(figure.warnings ? { warnings: figure.warnings } : {}),
         record: figure.record as import('./webview/payload-contracts').WireAgentFigure['record'],
       })),
     })),

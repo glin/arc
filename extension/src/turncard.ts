@@ -1,7 +1,7 @@
 import { wholePercent } from './view/tokens.ts';
 import { normalizeModelIdentity } from './domain/model-identity';
-import type { ChildExpiryCost } from './childcacheexpiry';
-import { outputRateText, type OutputRate, type OutputRateBasis } from './outputrate';
+import type { ChildExpiryAgent, ChildExpiryCost } from './childcacheexpiry';
+import { outputRateFigure, outputRateText, type OutputRate, type OutputRateBasis } from './outputrate';
 // Reduces turns to card headlines, status, figures, and control text.
 // `turnview.ts` re-exports these projections for compatibility.
 
@@ -119,7 +119,13 @@ import {
   type TurnMenuContext as SharedTurnMenuContext,
   type TurnMenuNode as SharedTurnMenuNode,
 } from './view/card-menu.ts';
-import { diffHalves, formatCacheHitDetail, type AgentFigureFacts, type CacheHitDetail } from './view/stat-detail.ts';
+import {
+  diffHalves,
+  formatCacheHitDetail,
+  type AgentFigureFacts,
+  type AgentFigureWarning,
+  type CacheHitDetail,
+} from './view/stat-detail.ts';
 import { childrenOutliveTurn, type RailStatus } from './view/rail.ts';
 
 // Card projections remain independent of the VS Code host.
@@ -342,7 +348,7 @@ export interface AgentFigure extends AgentFigureFacts {
 }
 
 // Subagent row with identity and state above its figures.
-// Figures contain cost, commits, files, and duration.
+// Figures contain cost, duration, output speed, commits, files, and unpriced tokens.
 // `hintDetail` contains tool uses for completed children.
 export interface AgentCard {
   speed?: string | null;
@@ -1155,6 +1161,7 @@ function costRecordList(
   row: TimedRow,
   running: boolean,
   labels?: ModelLabels,
+  warnings: CostDetailView['warnings'] = [],
 ): Omit<StatDetailList, 'heading'> {
   const notes: string[] = [];
   const footer: string[] = [];
@@ -1265,7 +1272,7 @@ function costRecordList(
   }
   return {
     entries: [],
-    cost: { warnings: [], sections, tabs: [{ name: 'Usage', parts }], included: [] },
+    cost: { warnings, sections, tabs: [{ name: 'Usage', parts }], included: [] },
     ...(footer.length ? { footer } : {}),
     ...(notes.length ? { notes } : {}),
   };
@@ -1276,26 +1283,61 @@ function agentRateBasis(runner: AgentKind): OutputRateBasis | undefined {
   return runner === 'claude' ? 'request' : undefined;
 }
 
-// Unpriced children display token usage as a separate figure.
-// Priced children include that usage in their cost records.
+// The token counts one child's tokens figure and speed figure both open.
+function agentUsageRecord(
+  agent: TurnAgent,
+  name: string,
+  runner: AgentKind,
+  row: TimedRow,
+  running: boolean,
+  noEnding: boolean,
+  headingLabel: string = name,
+): Pick<AgentFigure, 'record' | 'detail'> {
+  const total = emptyUsage();
+  for (const spend of agent.spend) {
+    addUsage(total, spend.usage);
+  }
+  return figureRecord(
+    name,
+    {
+      entries: usageDetailEntries(
+        total,
+        [],
+        agent.outputRateModel ? agent.outputRate : undefined,
+        runner,
+        agent.outputRateModel,
+        cacheDetailUsage(
+          total,
+          agent.spend.flatMap<Pick<SessionCostUsage, 'usage' | 'usageOrigin'>>((spend) =>
+            spend.usageParts?.length ? spend.usageParts : [spend],
+          ),
+        ),
+        agentRateBasis(runner),
+        row,
+      ),
+      ...(running ? { footer: [noEnding ? AGENT_USAGE_NO_ENDING : AGENT_USAGE_SO_FAR] } : {}),
+    },
+    false,
+    undefined,
+    headingLabel,
+  );
+}
+
+// A row draws a tokens figure only when no cost or speed figure holds the child's counts.
 function agentTokensFigure(
   agent: TurnAgent,
-  priced: boolean,
+  countsHeldElsewhere: boolean,
   runner: AgentKind,
   row: TimedRow,
   running = false,
   noEnding = false,
 ): AgentFigure | null {
-  if (priced) {
+  if (countsHeldElsewhere) {
     return null;
   }
   // Omit zero token counts.
   const spent = agent.spend.length ? spendTokens(agent.spend) : 0;
   if (spent) {
-    const total = emptyUsage();
-    for (const spend of agent.spend) {
-      addUsage(total, spend.usage);
-    }
     const amount = formatTokens(spent);
     // A running child's tokens take the lower-bound mark and words of a partial cost.
     const name = running ? `At least ${amount} tokens` : `${amount} tokens`;
@@ -1303,28 +1345,7 @@ function agentTokensFigure(
       metric: 'tokens',
       compactLabel: running ? `${amount}+ tokens` : name,
       name,
-      ...figureRecord(
-        name,
-        {
-          entries: usageDetailEntries(
-            total,
-            [],
-            agent.outputRateModel ? agent.outputRate : undefined,
-            runner,
-            agent.outputRateModel,
-            cacheDetailUsage(
-              total,
-              agent.spend.flatMap<Pick<SessionCostUsage, 'usage' | 'usageOrigin'>>((spend) =>
-                spend.usageParts?.length ? spend.usageParts : [spend],
-              ),
-            ),
-            agentRateBasis(runner),
-            row,
-          ),
-          ...(running ? { footer: [noEnding ? AGENT_USAGE_NO_ENDING : AGENT_USAGE_SO_FAR] } : {}),
-        },
-        false,
-      ),
+      ...agentUsageRecord(agent, name, runner, row, running, noEnding),
     };
   }
   // The tokens a finished child's result reports. A running child has no result yet.
@@ -1333,6 +1354,71 @@ function agentTokensFigure(
   }
   const name = `${formatTokens(agent.tokens)} tokens`;
   return { metric: 'tokens', compactLabel: name, name };
+}
+
+// The readers skip an unmeasured turn and a response on another model, so a child that used two
+// models can still hold a rate. A one-model child with a nested helper keeps its rate, because
+// `ownModelTiers` leaves out advisors and nested subagents.
+function agentUsedOnlyMeasuredModel(agent: TurnAgent, measured: string): boolean {
+  const models = agent.ownModelTiers?.length
+    ? agent.ownModelTiers.map((tier) => tier.model)
+    : agent.spend.map((part) => part.model);
+  return models.every((model) => normalizeModelIdentity(model) === normalizeModelIdentity(measured));
+}
+
+// A finished subagent's output speed, in whole tokens per second. Its record holds the child's
+// token counts, and an unpriced child's tokens figure gives way to it.
+function agentRateFigure(agent: TurnAgent, runner: AgentKind, row: TimedRow): AgentFigure | null {
+  const face = row === 'subagent' ? outputRateFigure(agent.outputRate) : null;
+  if (
+    !face ||
+    !agent.outputRateModel ||
+    !agentUsedOnlyMeasuredModel(agent, agent.outputRateModel) ||
+    !(agent.spend.length && spendTokens(agent.spend))
+  ) {
+    return null;
+  }
+  const name = `${face} output speed`;
+  return {
+    metric: 'rate',
+    compactLabel: face,
+    name,
+    ...agentUsageRecord(agent, name, runner, row, false, false, face),
+  };
+}
+
+// A row's share of its turn's warnings, from the child's own expiry entry and write scopes.
+interface AgentRowWarnings {
+  expiry?: ChildExpiryAgent;
+  writes: readonly CacheWriteWarning[];
+}
+
+// A row signs from one cent, so its popover line prints a real amount.
+function agentExpiryLine(entry: ChildExpiryAgent | undefined): CostDetailView['warnings'][number] | null {
+  if (!entry || entry.dollars === null || entry.dollars < 0.01) {
+    return null;
+  }
+  return { text: childExpirySentence(entry, 'request'), title: CACHE_EXPIRY_COST_ADDED_HINT };
+}
+
+// Hands each child's entry to the first row that names the child, as `shareChildSpendByTurn`
+// hands a turn's share. An entry with no row, such as a nested helper's, signs nothing.
+function agentExpiryEntries(
+  agents: readonly TurnAgent[],
+  children: ChildExpiryCost | undefined,
+): Map<TurnAgent, ChildExpiryAgent> {
+  const rows = new Map<TurnAgent, ChildExpiryAgent>();
+  const taken = new Set<ChildExpiryAgent>();
+  for (const agent of agents) {
+    const entry = children?.agents?.find(
+      (one) => !taken.has(one) && (one.childId === agent.id || one.childId === agent.childSessionId),
+    );
+    if (entry) {
+      taken.add(entry);
+      rows.set(agent, entry);
+    }
+  }
+  return rows;
 }
 
 // Sort tool counts descending, with alphabetical names breaking ties.
@@ -1421,6 +1507,7 @@ function agentFigures(
   runner: AgentKind,
   row: TimedRow,
   labels?: ModelLabels,
+  rowWarnings: AgentRowWarnings = { writes: [] },
 ): AgentFigure[] {
   const figures: AgentFigure[] = [];
   const priced = spendCost(agent);
@@ -1433,11 +1520,32 @@ function agentFigures(
     const partial = priced.partial || running;
     // The spoken name says what the money is, because the face carries the amount alone.
     const name = `${partial ? `At least ${cost}` : cost} spent`;
+    const expiryLine = agentExpiryLine(rowWarnings.expiry);
+    const lines: CostDetailView['warnings'] = [
+      ...(expiryLine ? [expiryLine] : []),
+      ...rowWarnings.writes.map((warning) => ({ text: cacheWriteWarningText(warning) })),
+    ];
+    const list = costRecordList(agent, priced, runner, noEnding, row, running, labels, lines);
+    // The low share is the amber fact line the popover draws, so the sign cannot disagree with it.
+    const lowShares =
+      row === 'subagent'
+        ? (list.cost?.sections ?? []).flatMap((section) =>
+            section.facts?.warning === undefined ? [] : [section.facts.parts[section.facts.warning]],
+          )
+        : [];
+    const warnings: AgentFigureWarning[] = [
+      ...(expiryLine ? (['cache-expiry'] as const) : []),
+      ...(rowWarnings.writes.length ? (['cache-write'] as const) : []),
+      ...(lowShares.length ? (['low-cache'] as const) : []),
+    ];
+    // The sign is hidden from assistive technology, so the spoken name carries each warning.
+    const spoken = [name, ...lines.map((line) => line.text), ...lowShares.map((share) => `Warning: ${share}`)];
     figures.push({
       metric: 'cost',
       compactLabel: `${cost}${partial ? '+' : ''}`,
-      name,
-      ...figureRecord(name, costRecordList(agent, priced, runner, noEnding, row, running, labels), false),
+      name: spoken.join('. '),
+      ...(warnings.length ? { warnings } : {}),
+      ...figureRecord(name, list, false),
     });
   }
   if (running) {
@@ -1447,6 +1555,10 @@ function agentFigures(
   const ran = agentDurationFigure(agent, now);
   if (ran) {
     figures.push(ran);
+  }
+  const rate = agentRateFigure(agent, runner, row);
+  if (rate) {
+    figures.push(rate);
   }
   const artifacts = agent.artifacts;
   const partial = !!artifacts && !artifacts.complete;
@@ -1496,7 +1608,8 @@ function agentFigures(
       ),
     });
   }
-  const tokens = agentTokensFigure(agent, !!cost, runner, row);
+  // The speed figure's record holds an unpriced child's counts, so the tokens figure steps aside.
+  const tokens = agentTokensFigure(agent, !!cost || !!rate, runner, row);
   if (tokens) {
     figures.push(tokens);
   }
@@ -1513,6 +1626,7 @@ function agentCard(
   runner: AgentKind = 'claude',
   row: TimedRow = 'subagent',
   labels?: ModelLabels,
+  rowWarnings?: AgentRowWarnings,
 ): AgentCard {
   const display = agentDisplay(agent, turnRunning, sessionLive, labels);
   // Only a child with live-process evidence counts up. An open child draws no time.
@@ -1524,7 +1638,7 @@ function agentCard(
       ? { speed: modelSpeed(agentModel(agent), agent.ownModelTiers) }
       : {}),
     effort: agent.effort,
-    figures: agentFigures(agent, display.state, rowPaths, now, runner, row, labels),
+    figures: agentFigures(agent, display.state, rowPaths, now, runner, row, labels, rowWarnings),
     state: display.state,
     stateWord: display.stateWord,
     since: display.state === 'running' ? agent.startedAt || launch?.step.at || null : null,
@@ -2192,14 +2306,20 @@ function spendCost(agent: TurnAgent): AgentCost {
 
 // Prices the turn and its subagents. Unknown coverage makes the priced subtotal a lower bound.
 // `agents` receives each subagent's own price, so a caller never prices a subagent twice.
-export function turnCost(turn: Turn, agents?: Map<TurnAgent, AgentCost>): SessionCostTotal {
-  const hasExactOwn = Boolean(turn.usageParts?.length);
-  const exactOwn = hasExactOwn
-    ? sessionCostTotalOf(turn.usageParts!.map((part) => priceSessionCost({ agent: turn.agent, role: 'main', ...part })))
+// The main agent's own price: its recorded parts when the turn has them, or an estimate from
+// its usage. `own` is null when no part of the main agent's usage has a price.
+function turnOwnCost(turn: Turn): { own: number | null; exactOwn: SessionCostTotal | null } {
+  const exactOwn = turn.usageParts?.length
+    ? sessionCostTotalOf(turn.usageParts.map((part) => priceSessionCost({ agent: turn.agent, role: 'main', ...part })))
     : null;
-  const own = hasExactOwn
-    ? exactOwn!.dollars
-    : estimateCost(turn.usage, turn.model, turn.provider ?? null, turn.contextWindow);
+  return {
+    own: exactOwn ? exactOwn.dollars : estimateCost(turn.usage, turn.model, turn.provider ?? null, turn.contextWindow),
+    exactOwn,
+  };
+}
+
+export function turnCost(turn: Turn, agents?: Map<TurnAgent, AgentCost>): SessionCostTotal {
+  const { own, exactOwn } = turnOwnCost(turn);
   let dollars = own ?? 0;
   let priced = own !== null;
   let partial = exactOwn?.partial ?? (own === null && spentTokens(turn.usage));
@@ -3499,16 +3619,23 @@ export function cacheExpiryWarningPrint(warning: CacheExpiryWarning | null): str
   return warning ? JSON.stringify(warning) : '';
 }
 
+function childExpirySentence(
+  cost: Pick<ChildExpiryCost, 'count' | 'dollars' | 'status'>,
+  noun: 'request' | 'subagent request',
+): string {
+  const added =
+    cost.dollars === null
+      ? ''
+      : ` and added ${cost.status === 'atLeast' ? 'at least ' : ''}${formatCost(cost.dollars) ?? ZERO_COST}`;
+  return `Cache expiry affected ${cost.count} ${noun}${cost.count === 1 ? '' : 's'}${added}`;
+}
+
 export function cacheExpiryWarningText(warning: CacheExpiryWarning): string {
   if (warning.children) {
     const children = warning.children;
-    const added =
-      children.dollars === null
-        ? ''
-        : ` and added ${children.status === 'atLeast' ? 'at least ' : ''}${formatCost(children.dollars) ?? ZERO_COST}`;
     const childText =
       children.dollars !== null && children.dollars >= CACHE_EXPIRY_SIGN_DOLLARS
-        ? `Cache expiry affected ${children.count} subagent ${children.count === 1 ? 'request' : 'requests'}${added}`
+        ? childExpirySentence(children, 'subagent request')
         : '';
     return [warning.main ? cacheExpiryWarningText({ scope: 'cache-expiry', ...warning.main }) : '', childText]
       .filter(Boolean)
@@ -4285,6 +4412,8 @@ function chipsOf(
   landingCards: CommitCard[],
   subagentCommitCount: number,
   subagentFileCount: number,
+  scopes: CacheWriteScope[],
+  writeWarnings: CacheWriteWarning[],
   // How many live carried subagents the newest card counts.
   carried = 0,
   // The dispatched sessions the card counts in its cost.
@@ -4298,8 +4427,6 @@ function chipsOf(
   // Keep a dispatched cost figure even when the parsed turn has no priced usage.
   const cost = formatCost(total.dollars) ?? (shares.length ? ZERO_COST : null);
   if (cost) {
-    const scopes = turnCacheWriteScopes(turn, turn.finished);
-    const writeWarnings = cacheWriteWarnings(scopes);
     const waitWarnings = waitShareWarnings(scopes[0]);
     const detailList = costDetailList(
       turn,
@@ -4401,14 +4528,25 @@ function chipsOf(
       detailList,
     });
   }
-  // Separate input and output token totals, including repeated context input across requests.
+  // The main agent's output speed, whose record holds its token totals. Input totals repeat
+  // context across requests. With no speed, the cost figure covers a priced turn's counts, and
+  // an unpriced turn keeps its totals on this figure.
+  const speed = turn.usage.output > 0 ? outputRateFigure(turn.interrupted ? undefined : turn.outputRate) : null;
   const read =
     turn.usage.input +
     turn.usage.cacheRead +
     turn.usage.cacheWrite1h +
     turn.usage.cacheWrite5m +
     (turn.usage.cacheWrite30m ?? 0);
-  if (read || turn.usage.output) {
+  if (speed) {
+    chips.push({
+      kind: 'plain',
+      metric: 'rate',
+      label: speed,
+      detail: tokenLines(turn).join('\n'),
+      detailList: tokenDetailList(turn),
+    });
+  } else if ((read || turn.usage.output) && turnOwnCost(turn).own === null) {
     const parts: string[] = [];
     if (read) {
       parts.push(`${formatTokens(read)} in`);
@@ -5237,8 +5375,15 @@ export function toCard(
   const fileCards = fileCardsOf(changed, folders);
   const launches = agentLaunches(turn);
   const rowPaths = fileRowPathsByKey(changed);
-  const agentCards = turn.agents.map((agent) =>
-    agentCard(agent, status === 'running', live, launches, rowPaths, now, turn.agent, 'subagent', labels),
+  const writeScopes = turnCacheWriteScopes(turn, turn.finished);
+  const writeWarnings = cacheWriteWarnings(writeScopes);
+  const expiryEntries = agentExpiryEntries(turn.agents, expiry?.children);
+  // A delegated warning's id starts with its row's index, and a nested invocation signs the row that holds it.
+  const agentCards = turn.agents.map((agent, index) =>
+    agentCard(agent, status === 'running', live, launches, rowPaths, now, turn.agent, 'subagent', labels, {
+      expiry: expiryEntries.get(agent),
+      writes: writeWarnings.filter((warning) => warning.id?.startsWith(`${index}:`)),
+    }),
   );
   const { commits: commitCards, landings: landingCards, rows: commitRows } = commitRowsOf(turn, now, folders);
   const subagentCommitCount = commitCards.filter((commit) => Boolean(commit.madeBy)).length;
@@ -5255,6 +5400,8 @@ export function toCard(
     landingCards,
     subagentCommitCount,
     subagentFileCount,
+    writeScopes,
+    writeWarnings,
     carried,
     dispatched,
     expiry,

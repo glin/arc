@@ -1279,7 +1279,7 @@ test('a terminal Claude turn shows request-timed speed while observed rates hold
   const speed = () =>
     host
       .renderTurnCard(recorded, false, 'Terminal', NOW)
-      .chips.find((chip: { metric?: string }) => chip.metric === 'tokens')
+      .chips.find((chip: { metric?: string }) => chip.metric === 'rate')
       .detailList.entries.find((entry: { label: string }) => entry.label === 'Output').lines[0];
   assert.deepEqual(speed(), {
     text: '100.0 tok/s',

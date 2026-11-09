@@ -62,7 +62,7 @@ A current Codex collaboration spawn supplies its recorded thread id and nickname
 
 [Card sources](timeline.md#card-sources) owns structural review attachment and parent-row precedence. The newest child outcome supplies state, and its transcript supplies model and usage. Descendants never flatten onto the root turn.
 
-`agentFigures` and `agentDisplay` in [`turncard.ts`](../extension/src/turncard.ts) own child figure allocation and wording. An unfinished child without live evidence reports no recorded ending rather than claiming continued work.
+`agentFigures` and `agentDisplay` in [`turncard.ts`](../extension/src/turncard.ts) own child figure allocation and wording, including the dollars, duration, output speed, commits, files, and tokens order. An unfinished child without live evidence reports no recorded ending rather than claiming continued work.
 
 Claude foreground tool counts come from Agent results. Background counts come from completion notices' `<tool_uses>`. Finished children without either count total their own calls. Codex children total their own calls. A Claude CLI row under a Codex parent supplies no tool count through that attachment path.
 

@@ -50,7 +50,8 @@ import { composerView, pickMenu, sessionLauncherView } from './composerview.ts';
 import { fillPanelText, panelValues } from './paneltext.ts';
 import { browserBundle, browserStylesheet } from './panelbundle.ts';
 import { renderRichMarkdown } from './richtext.ts';
-import type { Compaction } from './transcript.ts';
+import type { Compaction, TurnUsage } from './transcript.ts';
+import type { CacheExpiryWarning } from './turncard.ts';
 import type { SubagentContextFigure } from './subagentcontext.ts';
 
 // Fill the browser bundle and stylesheet with the panel's text values.
@@ -2228,6 +2229,136 @@ export function costBreakdownPayload(): Record<string, unknown> {
         summaryHtml: renderRichMarkdown(COMPACTION_SUMMARIES[0].summary),
       },
       { ...toCompactionCard(exact, NOW), summaryHtml: '' },
+    ],
+  };
+}
+
+// Every case of a subagent row: each warning, running, unpriced with and without a rate, two
+// models, a Codex subagent, and the row with commits and files.
+export function agentRowPayload(): Record<string, unknown> {
+  const payload = renderPayload();
+  const [running, fold, read] = LONG_AGENTS;
+  const usage = (requests: number, over: Partial<TurnUsage>): TurnUsage => ({
+    requests,
+    input: 4_000,
+    cacheWrite1h: 0,
+    cacheWrite5m: 20_000,
+    cacheRead: 420_000,
+    output: 6_000,
+    thinking: 0,
+    ...over,
+  });
+  const rated = (
+    id: string,
+    model: string,
+    rate: number,
+    description: string,
+    over: Partial<TurnAgent>,
+  ): TurnAgent => ({
+    ...read,
+    id,
+    childSessionId: undefined,
+    description,
+    model,
+    spend: [{ model, usage: usage(12, {}) }],
+    outputRate: { output: rate * 100, milliseconds: 100_000 },
+    outputRateModel: model,
+    ...over,
+  });
+  const writes = usage(8, { input: 1_000, cacheRead: 120_000, cacheWrite5m: 2_400_000, output: 9_000 });
+  const twoModels = [fold.spend[0], { ...read.spend[0] }];
+  const unpriced = 'claude-unpriced-9';
+  const agents: TurnAgent[] = [
+    rated('agent-clean', 'claude-sonnet-5', 41, 'Fix the readme-shots type error', {}),
+    rated('agent-low', 'claude-opus-5', 38, 'Review chunk 18 candidate (opus)', {
+      spend: [{ model: 'claude-opus-5', usage: usage(36, { input: 820_000, cacheRead: 900_000 }) }],
+    }),
+    rated('agent-write', 'claude-sonnet-5', 52, 'Implement outside folder links', {
+      spend: [
+        {
+          model: 'claude-sonnet-5',
+          usage: writes,
+          usageParts: [
+            {
+              model: 'claude-sonnet-5',
+              provider: null,
+              contextWindow: null,
+              contextBand: null,
+              inferenceClass: null,
+              serviceTier: null,
+              usage: writes,
+            },
+          ],
+        },
+      ],
+    }),
+    rated('agent-expiry', 'claude-sonnet-5', 47, 'Audit the expired cache attribution', {}),
+    { ...running, id: 'agent-running', description: 'Diagnose and fix the gate failure' },
+    rated('agent-unpriced', unpriced, 66, 'Consult (fable)', {}),
+    rated('agent-unpriced-work', unpriced, 58, 'Implement the fold head', {
+      commits: fold.commits,
+      artifacts: { ...fold.artifacts!, revision: 'fixture-unpriced-work' },
+    }),
+    rated('agent-unpriced-plain', unpriced, 0, 'Check the export wording', {
+      outputRate: undefined,
+      outputRateModel: undefined,
+    }),
+    rated('agent-models', 'claude-sonnet-5', 44, 'Review the fold change and hand the file reads to a smaller model', {
+      spend: twoModels,
+      ownModelTiers: twoModels.map((part) => ({ model: part.model })),
+    }),
+    rated('agent-fold', 'claude-sonnet-5', 35, fold.description, {
+      commits: fold.commits,
+      artifacts: fold.artifacts,
+      spend: fold.spend,
+    }),
+  ];
+  // A Codex row sits under a Codex turn, because the parent turn names the row's runner.
+  const codexModel = 'gpt-5.6-sol';
+  const codexAgent = rated('agent-codex', codexModel, 73, 'Review the admission gate diff', {
+    // A Codex price holds no five-minute cache write and stops at the model's context window.
+    spend: [{ model: codexModel, provider: 'openai', usage: usage(12, { cacheWrite5m: 0, cacheRead: 120_000 }) }],
+  });
+  const expiry: CacheExpiryWarning = {
+    scope: 'cache-expiry',
+    gapMs: 3_600_000,
+    dollars: 0.6,
+    status: 'exact',
+    children: {
+      count: 2,
+      longestGapMs: 3_600_000,
+      dollars: 0.6,
+      status: 'exact',
+      agents: [{ childId: 'agent-expiry', count: 2, longestGapMs: 3_600_000, dollars: 0.6, status: 'exact' }],
+    },
+  };
+  return {
+    ...payload,
+    cards: [
+      toCard(
+        { ...FIXTURE_TURNS[LONG_TURN_INDEX], finished: true, agents },
+        false,
+        NOW,
+        [],
+        null,
+        false,
+        new Set(['agent-running']),
+        [],
+        expiry,
+      ),
+      toCard(
+        {
+          ...FIXTURE_TURNS[LONG_TURN_INDEX - 1],
+          agent: 'codex',
+          model: codexModel,
+          provider: 'openai',
+          usage: { ...FIXTURE_TURNS[LONG_TURN_INDEX - 1].usage, cacheWrite5m: 0 },
+          finished: true,
+          agents: [codexAgent],
+        },
+        false,
+        NOW,
+      ),
     ],
   };
 }

@@ -645,12 +645,12 @@ test('native Codex speed retracts later classified compaction across append and 
     assert.equal(child.outputRateModel, hasWorkRate ? 'gpt-6.1-sol' : undefined);
     assert.equal(
       toCard(full.turns[0], false, Date.parse(at(28)))
-        .chips.find((chip) => chip.metric === 'tokens')
+        .chips.find((chip) => chip.metric === 'rate')
         ?.detailList?.entries.some(
           (row) =>
             row.label === 'Output' &&
             row.lines?.some((line) => typeof line === 'object' && 'text' in line && line.text.includes('tok/s')),
-        ),
+        ) ?? false,
       hasWorkRate,
     );
     for (const checkpoint of [provisional.checkpoint, clone]) {

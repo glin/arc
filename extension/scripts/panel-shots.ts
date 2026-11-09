@@ -37,6 +37,7 @@ import {
   draftRenderPayload,
   launcherPinsPayload,
   compactionSummaryPayload,
+  agentRowPayload,
   costBreakdownPayload,
   cacheWriteWarningPayload,
   costOverheadsPayload,
@@ -76,6 +77,8 @@ export interface Shot {
   // Keep the focus through the capture, for a nested popover that a blur anywhere would close.
   keepFocus?: boolean;
   costBreakdowns?: boolean; // Load the subagent and compaction cost fixture.
+  agentRows?: boolean; // Load every subagent row case.
+  popoverEnd?: boolean; // Scroll the open popover to its last row.
   costHover?: string; // Cost figure to hover until its unpinned popover opens.
   hover?: string; // Control selector to hover until its hint opens.
   after?: string; // Control selector to press after capture.
@@ -208,7 +211,7 @@ export const SHOTS: Shot[] = [
     stats: true,
     click: '.sessionstats .statchip:has-text("files")',
   },
-  { name: 'wide-stat-tokens', width: 1350, escape: true, stats: true, click: '.chips .statchip:has-text("in")' },
+  { name: 'wide-stat-tokens', width: 1350, escape: true, stats: true, click: '.chips .statchip[data-metric="rate"]' },
   { name: 'wide-stat-turn-files', width: 1350, escape: true, stats: true, click: '.chips .statchip:has(.add)' },
   {
     name: 'wide-stat-no-files',
@@ -310,7 +313,7 @@ export const SHOTS: Shot[] = [
     stats: true,
     click: '.sessionstats .statchip:has-text("files")',
   },
-  { name: 'narrow-stat-tokens', width: 340, escape: true, stats: true, click: '.chips .statchip:has-text("in")' },
+  { name: 'narrow-stat-tokens', width: 340, escape: true, stats: true, click: '.chips .statchip[data-metric="rate"]' },
   { name: 'narrow-stat-turn-files', width: 340, escape: true, stats: true, click: '.chips .statchip:has(.add)' },
   {
     name: 'narrow-stat-no-files',
@@ -470,6 +473,27 @@ export const SHOTS: Shot[] = [
         costBreakdowns: true,
         click: `#list section.compaction >> nth=${at} >> .statchip[data-metric="cost"]`,
       })),
+    ];
+  }),
+  // Every subagent row case, with the rows drawn from the agent row fixture.
+  ...[1350, 340].flatMap((width): Shot[] => {
+    const wide = width === 1350;
+    const prefix = wide ? 'wide' : 'narrow';
+    const rows = { width, height: wide ? 1650 : 2650, escape: 2, agentRows: true };
+    const claude = {
+      ...rows,
+      openCard: '#list .turn h3.cardheading button.head',
+      click: '#list .turn .statchip[data-metric="agents"]',
+    };
+    return [
+      { ...claude, name: `${prefix}-agent-rows` },
+      ...(wide ? [{ ...claude, name: 'wide-agent-rows-end', popoverEnd: true }] : []),
+      {
+        ...rows,
+        name: `${prefix}-agent-rows-codex`,
+        openCard: '#list .turn + .turn h3.cardheading button.head',
+        click: '#list .turn + .turn .statchip[data-metric="agents"]',
+      },
     ];
   }),
   // Capture the long turn after its main agent finishes while two subagents run.
@@ -1288,6 +1312,10 @@ export async function shoot(
     await page.evaluate(`window.postMessage(${JSON.stringify(costBreakdownPayload())}, '*')`);
     await page.evaluate(SETTLED);
   }
+  if (shot.agentRows) {
+    await page.evaluate(`window.postMessage(${JSON.stringify(agentRowPayload())}, '*')`);
+    await page.evaluate(SETTLED);
+  }
   if (shot.stats !== undefined) {
     const payload = shot.stats ? statPopoverPayload(shot.subagentContext) : renderPayload();
     await page.evaluate(`window.postMessage(${JSON.stringify(payload)}, '*')`);
@@ -1572,6 +1600,12 @@ export async function shoot(
       console.log(`${shot.name}.webp not written: ${shot.click}: ${String(error)}`);
       return;
     }
+    await page.evaluate(SETTLED);
+  }
+  if (shot.popoverEnd) {
+    await page.locator('#chippop').evaluate((popover) => {
+      popover.scrollTop = popover.scrollHeight;
+    });
     await page.evaluate(SETTLED);
   }
   for (const control of shot.press ?? []) {

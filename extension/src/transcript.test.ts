@@ -1152,7 +1152,15 @@ import {
   sdkSlashCommandTranscript,
   throughStructuredClone,
 } from './turnfixtures.ts';
-import { nextTurnBasisOf, sessionStats, statusOf, toCard, turnCacheExpiryReturn, TURN_QUIET_MS } from './turncard.ts';
+import {
+  nextTurnBasisOf,
+  sessionStats,
+  statusOf,
+  toCard,
+  tokenLines,
+  turnCacheExpiryReturn,
+  TURN_QUIET_MS,
+} from './turncard.ts';
 import type { CacheExpiryReturn } from './projectspend.ts';
 import { newCounts, newestTurnStarts } from './turnread.ts';
 import {
@@ -1345,8 +1353,7 @@ test('a Claude turn that compacts between two responses names the compaction in 
   const plain = cost(plainTurn);
   // The tokens figure, its request count, its cached-input share and the session's latest-turn
   // cached reads hold recorded usage only.
-  const tokens = (turn: (typeof read.turns)[number]) =>
-    toCard(turn, false, Date.parse(at(60))).chips.find((chip) => chip.metric === 'tokens');
+  const tokens = (turn: (typeof read.turns)[number]) => tokenLines(turn);
   assert.deepEqual(tokens(read.turns[0]), tokens(plainTurn));
   const reread = (session: typeof read) =>
     sessionStats(session.turns, session.compactions)
@@ -1408,7 +1415,7 @@ function requestBlock(
 }
 const outputLines = (turn: Parameters<typeof toCard>[0]) =>
   toCard(turn, false, ms(120))
-    .chips.find((chip) => chip.metric === 'tokens')
+    .chips.find((chip) => chip.metric === 'rate')
     ?.detailList?.entries.find((entry) => entry.label === 'Output')?.lines ?? [];
 const REQUEST_TITLE =
   '100.0 tok/s. Output tokens per second. Actual output includes thinking. Request time includes the wait for the first response event. Untimed responses are excluded.';

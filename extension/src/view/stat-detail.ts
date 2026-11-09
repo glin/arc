@@ -54,7 +54,10 @@ export function diffHalves(added: number | undefined, removed: number | undefine
 }
 
 // Shared metric names for subagent figures on both sides of the host/browser message boundary.
-export type AgentFigureMetric = 'cost' | 'commits' | 'files' | 'tokens' | 'duration';
+export type AgentFigureMetric = 'cost' | 'commits' | 'files' | 'tokens' | 'duration' | 'rate';
+
+// The rules that mark a subagent's dollars with the warning sign.
+export type AgentFigureWarning = 'cache-expiry' | 'cache-write' | 'low-cache';
 
 // Shared subagent figure fields, excluding the detail record. AgentFigure and WireAgentFigure extend this interface.
 // The host record uses StatDetailList. The browser record uses Record<string, unknown> for commit and file rows.
@@ -74,4 +77,5 @@ export interface AgentFigureFacts {
   // Captured identities distinguish files whose display paths match. Rows without identity use paths.
   fileIdentities?: string[];
   shas?: string[];
+  warnings?: readonly AgentFigureWarning[];
 }

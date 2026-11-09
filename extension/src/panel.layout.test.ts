@@ -25,6 +25,7 @@ import {
   THREE_QUESTION_ASK,
   pageHtml,
   renderPayload,
+  agentRowPayload,
   themed,
 } from './panelfixture.ts';
 import {
@@ -1224,6 +1225,44 @@ test(
       assert.equal(measured.economics, true);
       assert.equal(measured.inside, true);
       assert.equal(measured.stacked, true);
+    } finally {
+      await browser.close();
+    }
+  },
+);
+
+test(
+  'at the narrow width, ArrowRight from the duration reaches commits past the hidden speed',
+  { timeout: 60_000 },
+  async (t) => {
+    const browser = await browserOrNone();
+    if (!browser) {
+      t.skip('no browser installed');
+      return;
+    }
+    try {
+      const page = await browser.newPage();
+      await page.setContent(themed(pageHtml()));
+      await page.setViewportSize({ width: 340, height: 900 });
+      await page.evaluate(`window.postMessage(${JSON.stringify(agentRowPayload())}, '*')`);
+      await page.locator('#list .turn h3.cardheading button.head').first().click();
+      await page.locator('#list .turn .statchip[data-metric="agents"]').first().click();
+      const row = page
+        .locator('#chippop .agentrow')
+        .filter({ has: page.locator('[data-metric="cost"]') })
+        .filter({ has: page.locator('[data-metric="commits"]') })
+        .filter({ has: page.locator('[data-metric="files"]') })
+        .first();
+      await row.waitFor();
+      const rate = row.locator('[data-metric="rate"]');
+      assert.deepEqual(
+        await rate.evaluate((element) => element.getClientRects().length),
+        0,
+        'the speed figure still draws at the narrow width',
+      );
+      await row.locator('[data-metric="duration"]').focus();
+      await page.keyboard.press('ArrowRight');
+      await page.waitForFunction(() => document.activeElement?.getAttribute('data-metric') === 'commits');
     } finally {
       await browser.close();
     }
@@ -3706,6 +3745,8 @@ test('the strip stops at two rows and a folded request is one', { timeout: 60_00
 
     await page.locator('[data-control="askfold:layout-six"]').click();
     await page.locator('[data-control="askfold:layout-permission"]').click();
+    // Folding moves the cards below under the resting pointer, and a chip that arrives there opens its popover over the fold.
+    await page.mouse.move(0, 0);
     const shut = (await page.evaluate(`(() => {
       const card = document.querySelector('.cask[data-ask="layout-six"]');
       const body = card.querySelector('.caskbody');

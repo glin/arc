@@ -99,10 +99,23 @@ export function summedTurnRate(
     : undefined;
 }
 
-export function outputRateText(rate: OutputRate | undefined): string | null {
+function tokensPerSecond(rate: OutputRate | undefined): number | null {
   if (!rate || !validRate(rate) || rate.output === 0) return null;
   const value = (rate.output * 1000) / rate.milliseconds;
-  return Number.isFinite(value) ? `${value.toFixed(1)} tok/s` : null;
+  return Number.isFinite(value) ? value : null;
+}
+
+export function outputRateText(rate: OutputRate | undefined): string | null {
+  const value = tokensPerSecond(rate);
+  return value === null ? null : `${value.toFixed(1)} tok/s`;
+}
+
+// The figure's face, in whole tokens per second. A measured rate that rounds to zero reads `<1 tok/s`.
+export function outputRateFigure(rate: OutputRate | undefined): string | null {
+  const value = tokensPerSecond(rate);
+  if (value === null) return null;
+  const whole = Math.round(value);
+  return whole > 0 ? `${whole} tok/s` : '<1 tok/s';
 }
 
 // A single main response retains final cumulative usage until its terminal event.

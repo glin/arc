@@ -191,7 +191,7 @@ test('turn token detail places qualified measurement under Output before Thinkin
       usage: { ...FIXTURE_TURNS[0].usage, output: 168, thinking: 40 },
       outputRate: { output: 84, milliseconds: 10000 },
     };
-    const entries = toCard(subject, false, NOW).chips.find((chip) => chip.metric === 'tokens')!.detailList!.entries;
+    const entries = toCard(subject, false, NOW).chips.find((chip) => chip.metric === 'rate')!.detailList!.entries;
     const output = entries.find((entry) => entry.label === 'Output')!;
     const line = output.lines![0];
     assert.ok(typeof line === 'object' && 'text' in line);
@@ -3633,11 +3633,11 @@ test('a card carries the figures the panel shows, and omits the ones with nothin
   // Two tool failures add no figure or mark.
   assert.deepEqual(
     card.chips.map((c) => c.label),
-    ['$7.05+', '16% of 1M ctx (160k)', '2 files', '3M in · 206k out', '1 commit', '1 subagent'],
+    ['$7.05+', '16% of 1M ctx (160k)', '2 files', '1 commit', '1 subagent'],
   );
   assert.deepEqual(
     foldedChips(card.chips).map((c) => c.label),
-    ['$7.05+', '16% of 1M ctx (160k)', '2 files', '3M in · 206k out', '1 commit', '1 subagent'],
+    ['$7.05+', '16% of 1M ctx (160k)', '2 files', '1 commit', '1 subagent'],
   );
   // The files figure tooltip includes file and line totals.
 
@@ -3656,12 +3656,12 @@ test('a card carries the figures the panel shows, and omits the ones with nothin
     'the tool count is drawn twice on one open card, once as a chip and once as a heading',
   );
   assert.equal(card.toolMix, '40 run · 20 edit · 8 read', 'the heading has no mix left to draw');
-  assert.deepEqual(card.chips[5].detail.split('\n'), ['Audit the parser', '  Haiku 4.5 · 2m · 20 tools · 70k']);
+  assert.deepEqual(card.chips[4].detail.split('\n'), ['Audit the parser', '  Haiku 4.5 · 2m · 20 tools · 70k']);
   // The commits figure tooltip lists the same commits as its popover.
 
-  assert.equal(card.chips[4].detail, ['1 commit: +12', '', '00facf2a: Add the timeline'].join('\n'));
+  assert.equal(card.chips[3].detail, ['1 commit: +12', '', '00facf2a: Add the timeline'].join('\n'));
 
-  // A turn that answered in text with no file changes carries the no-change figure, its cost, and its output.
+  // A turn that answered in text with no file changes carries the no-change figure and its cost.
 
   const empty = toCard(
     turn({ summary: 'Answered your question.', usage: { ...turn().usage, output: 50 } }),
@@ -3670,11 +3670,11 @@ test('a card carries the figures the panel shows, and omits the ones with nothin
   );
   assert.deepEqual(
     empty.chips.map((c) => c.label),
-    ['<$0.01', 'no file changes', '50 out'],
+    ['<$0.01', 'no file changes'],
   );
   assert.deepEqual(
     foldedChips(empty.chips).map((c) => c.label),
-    ['<$0.01', 'no file changes', '50 out'],
+    ['<$0.01', 'no file changes'],
   );
 });
 
@@ -3887,11 +3887,11 @@ test('the card draws one ordered row in both its open and folded states', () => 
   );
   assert.deepEqual(
     loaded.chips.map((c) => c.label),
-    ['$7.05+', '16% of 1M ctx (160k)', '1 file', '3M in · 206k out', '1 commit', '1 subagent'],
+    ['$7.05+', '16% of 1M ctx (160k)', '1 file', '1 commit', '1 subagent'],
   );
   assert.deepEqual(
     foldedChips(loaded.chips).map((c) => c.label),
-    ['$7.05+', '16% of 1M ctx (160k)', '1 file', '3M in · 206k out', '1 commit', '1 subagent'],
+    ['$7.05+', '16% of 1M ctx (160k)', '1 file', '1 commit', '1 subagent'],
   );
   // The files figure carries both added and removed line counts.
 
@@ -3899,7 +3899,7 @@ test('the card draws one ordered row in both its open and folded states', () => 
   // The tones travel with the chips, so each remaining figure keeps its role in the row.
   assert.deepEqual(
     loaded.chips.map((c) => c.kind),
-    ['plain', 'plain', 'diff', 'plain', 'plain', 'plain'],
+    ['plain', 'plain', 'diff', 'plain', 'plain'],
   );
 
   // Absent cost and context figures leave no gap before the file count.
@@ -6170,6 +6170,7 @@ test('a Bedrock Codex turn shows recorded usage and its list-price estimate', ()
       agent: 'codex',
       model: 'openai.gpt-5.6-sol',
       provider: 'amazon-bedrock',
+      outputRate: { output: 807, milliseconds: 10_000 },
       usage: {
         requests: 1,
         input: 292,
@@ -6188,8 +6189,8 @@ test('a Bedrock Codex turn shows recorded usage and its list-price estimate', ()
   const cost = card.chips.find((chip) => chip.label === '$0.15')!;
   assert.match(cost.detail, /30-minute cache writes: \$0\.11/);
   assert.match(cost.detail, /Estimated from published model rates\. Your actual charge may differ/);
-  const token = card.chips.find((chip) => chip.label.includes(' in'))!;
-  assert.equal(token.label, '57k in · 807 out');
+  const token = card.chips.find((chip) => chip.metric === 'rate')!;
+  assert.equal(token.label, '81 tok/s');
   assert.match(token.detail, /30-minute cache writes: 21k tokens/);
   assert.match(token.detail, /Uncached input: 292 tokens/);
 });
@@ -6216,7 +6217,10 @@ test('a single legacy Bedrock request can recover its context band from token vo
     NOW,
   );
   assert.equal(costChip(card), '$2.67');
-  assert.ok(card.chips.some((chip) => chip.label === '300k in · 1k out'));
+  assert.equal(
+    card.chips.some((chip) => chip.metric === 'tokens'),
+    false,
+  );
 });
 
 test('a direct OpenAI turn prices mixed request bands together', () => {
@@ -6634,9 +6638,9 @@ test('a turn labels model requests separately from tool calls in its usage detai
     'the average omits one input-side tier or divides by something other than model requests',
   );
   const card = toCard(turn({ usage }), false, NOW);
-  const token = card.chips.find((chip) => chip.label.includes(' in'))!;
-  assert.match(token.detail, /Input: 100\.5M tokens\nModel requests: 206/);
-  assert.match(token.detail, /Average input per request: 488k tokens/);
+  const detail = tokenLines(turn({ usage })).join('\n');
+  assert.match(detail, /Input: 100\.5M tokens\nModel requests: 206/);
+  assert.match(detail, /Average input per request: 488k tokens/);
   assert.match(
     card.chips[0].detail,
     /206 requests · 488k avg input/,
@@ -6776,7 +6780,7 @@ test('turn and compaction chips keep semantic identities while optional roles ch
   );
   assert.deepEqual(
     card.chips.map((chip) => chip.metric),
-    ['cost', 'context', 'files', 'tokens', 'commits', 'agents'],
+    ['cost', 'context', 'files', 'commits', 'agents'],
   );
   assert.deepEqual(
     toCompactionCard(compaction(), NOW).chips.map((chip) => chip.metric),
@@ -8028,10 +8032,352 @@ test('a Claude subagent row drops its output speed once the subagent times a sec
   assert.doesNotMatch(JSON.stringify(row), /tok\/s/);
 });
 
-test('an unpriced Claude subagent row names request time in its tokens figure', () => {
+test('an unpriced Claude subagent row names request time in its speed figure', () => {
   const row = toCard(timedAgentTurn('claude-unpriced-9').turn, false, NOW).agents[0];
   assert.ok(!row.figures.some((figure) => figure.metric === 'cost'));
-  assert.equal(outputSpeedTitle(row, 'tokens'), childRequestTitle('claude-unpriced-9'));
+  assert.equal(outputSpeedTitle(row, 'rate'), childRequestTitle('claude-unpriced-9'));
+});
+
+const OUTPUT_RATE = { output: 3_300, milliseconds: 100_000 };
+const rowUsage = (over: Partial<Turn['usage']> = {}): Turn['usage'] => ({
+  requests: 3,
+  input: 1_000,
+  cacheWrite1h: 0,
+  cacheWrite5m: 0,
+  cacheRead: 9_000,
+  output: 2_000,
+  thinking: 0,
+  ...over,
+});
+const rowSpend = (model: string, over: Partial<Turn['usage']> = {}) => ({ model, usage: rowUsage(over) });
+const rateAgent = (over: Partial<TurnAgent> = {}): TurnAgent =>
+  agent({
+    id: 'rate-child',
+    model: 'claude-sonnet-5',
+    spendFound: true,
+    durationMs: 60_000,
+    spend: [rowSpend('claude-sonnet-5')],
+    outputRate: OUTPUT_RATE,
+    outputRateModel: 'claude-sonnet-5',
+    ...over,
+  });
+const rowOf = (over: Partial<TurnAgent> = {}) => toCard(turn({ agents: [rateAgent(over)] }), false, NOW).agents[0];
+const figureOf = (row: ReturnType<typeof rowOf>, metric: string) => row.figures.find((held) => held.metric === metric);
+const metricsOf = (row: ReturnType<typeof rowOf>) => row.figures.map((held) => held.metric);
+
+test('a finished subagent row draws its output speed after the duration, and the figure opens the counts', () => {
+  const row = rowOf();
+  assert.deepEqual(metricsOf(row), ['cost', 'duration', 'rate']);
+  const rate = figureOf(row, 'rate')!;
+  assert.equal(rate.compactLabel, '33 tok/s');
+  assert.equal(rate.name, '33 tok/s output speed');
+  assert.equal(rate.record?.heading?.label, '33 tok/s');
+  const output = rate.record?.entries.find((entry) => entry.label === 'Output');
+  const line = output?.lines?.[0];
+  assert.ok(typeof line === 'object' && 'text' in line);
+  assert.equal(line.text, '33.0 tok/s', 'the popover line lost its one decimal');
+  assert.equal(output?.value, '2,000 tokens');
+});
+
+test('a priced Codex subagent row in a Codex turn draws dollars, duration and speed, with the Codex hover', () => {
+  const model = 'gpt-5.6-sol';
+  const row = toCard(
+    turn({
+      agent: 'codex',
+      agents: [rateAgent({ model, spend: [{ ...rowSpend(model), provider: 'openai' }], outputRateModel: model })],
+    }),
+    false,
+    NOW,
+  ).agents[0];
+  assert.deepEqual(metricsOf(row), ['cost', 'duration', 'rate']);
+  assert.equal(figureOf(row, 'rate')?.compactLabel, '33 tok/s');
+  const line = figureOf(row, 'rate')?.record?.entries.find((entry) => entry.label === 'Output')?.lines?.[0];
+  assert.ok(typeof line === 'object' && 'title' in line);
+  assert.ok(line.title?.includes('Actual output includes reasoning.'), 'the hover lost the Codex wording');
+});
+
+test('a rate that rounds to zero reads under one token per second', () => {
+  assert.equal(figureOf(rowOf({ outputRate: { output: 1, milliseconds: 10_000 } }), 'rate')?.compactLabel, '<1 tok/s');
+});
+
+test('a running subagent row has no speed figure', () => {
+  const row = toCard(turn({ finished: false, agents: [rateAgent({ status: 'running', durationMs: null })] }), true, NOW)
+    .agents[0];
+  assert.equal(metricsOf(row).includes('rate'), false);
+});
+
+test('a row or turn with no measured speed follows its price', () => {
+  // A priced row holds its counts in the cost figure.
+  assert.deepEqual(metricsOf(rowOf({ outputRate: undefined, outputRateModel: undefined })), ['cost', 'duration']);
+  // An unpriced row keeps its tokens figure, or trades it for the speed figure when one is measured.
+  const unpriced = { model: 'claude-unpriced-9', spend: [rowSpend('claude-unpriced-9')] };
+  assert.deepEqual(metricsOf(rowOf({ ...unpriced, outputRate: undefined, outputRateModel: undefined })), [
+    'duration',
+    'tokens',
+  ]);
+  const rated = rowOf({ ...unpriced, outputRateModel: 'claude-unpriced-9' });
+  assert.deepEqual(metricsOf(rated), ['duration', 'rate']);
+  assert.equal(
+    figureOf(rated, 'rate')?.record?.entries.find((entry) => entry.label === 'Output')?.value,
+    '2,000 tokens',
+  );
+});
+
+test('an unpriced main agent with a measured speed draws the speed figure alone', () => {
+  const { chips } = toCard(
+    turn({ model: 'claude-unpriced-9', usage: rowUsage(), outputRate: OUTPUT_RATE }),
+    false,
+    NOW,
+  );
+  const speed = chips.find((held) => held.metric === 'rate');
+  assert.equal(speed?.label, '33 tok/s');
+  assert.ok(speed?.detailList?.entries.length, 'the speed figure lost the counts');
+  assert.equal(
+    chips.some((held) => held.metric === 'tokens'),
+    false,
+  );
+});
+
+test("the main agent's figure is its output speed, and an unpriced main agent keeps its counts without one", () => {
+  const priced = toCard(turn({ usage: rowUsage(), outputRate: OUTPUT_RATE }), false, NOW);
+  const chip = priced.chips.find((held) => held.metric === 'rate');
+  assert.equal(chip?.label, '33 tok/s');
+  assert.ok(chip?.detailList?.entries.length);
+  assert.equal(
+    toCard(turn({ usage: rowUsage() }), false, NOW).chips.some(
+      (held) => held.metric === 'tokens' || held.metric === 'rate',
+    ),
+    false,
+    'a priced turn with no speed drew a token figure',
+  );
+  // The turn is unpriced even though a child's cost makes a cost figure.
+  const unpricedMain = toCard(
+    turn({ model: 'claude-unpriced-9', usage: rowUsage(), agents: [rateAgent()] }),
+    false,
+    NOW,
+  );
+  assert.ok(unpricedMain.chips.some((held) => held.metric === 'cost'));
+  assert.ok(unpricedMain.chips.some((held) => held.metric === 'tokens' && held.label.includes(' in')));
+  // An interrupted turn has no rate, and no output means no speed.
+  assert.equal(
+    toCard(turn({ usage: rowUsage(), outputRate: OUTPUT_RATE, interrupted: true }), false, NOW).chips.some(
+      (held) => held.metric === 'rate',
+    ),
+    false,
+  );
+  assert.equal(
+    toCard(turn({ usage: rowUsage({ output: 0 }), outputRate: OUTPUT_RATE }), false, NOW).chips.some(
+      (held) => held.metric === 'rate',
+    ),
+    false,
+  );
+});
+
+test('a running main turn draws its speed once a response has finished', () => {
+  const running = (over: Partial<Turn>) => turn({ finished: false, usage: rowUsage(), ...over });
+  assert.ok(toCard(running({ outputRate: OUTPUT_RATE }), true, NOW).chips.some((held) => held.metric === 'rate'));
+  assert.equal(
+    toCard(running({}), true, NOW).chips.some((held) => held.metric === 'rate'),
+    false,
+  );
+});
+
+test('a dispatched row keeps its figures', () => {
+  const card = dispatchedAgentCard(
+    'child',
+    'Audit the parser',
+    {
+      models: [rowSpend('claude-sonnet-5', { requests: 6, input: 300_000, cacheRead: 100_000 })],
+      found: true,
+      partial: false,
+      effort: null,
+      outputRate: OUTPUT_RATE,
+      outputRateModel: 'claude-sonnet-5',
+    },
+    'done',
+    1,
+    60_001,
+    0,
+    [],
+    NOW,
+  );
+  assert.equal(metricsOf(card).includes('rate'), false);
+  assert.equal(figureOf(card, 'cost')?.warnings, undefined);
+});
+
+test('the speed figure requires one measured model', () => {
+  const haiku = rowSpend('claude-haiku-4-5');
+  // Two measured models.
+  assert.equal(
+    metricsOf(
+      rowOf({
+        ownModelTiers: [{ model: 'claude-sonnet-5' }, { model: 'claude-haiku-4-5' }],
+      }),
+    ).includes('rate'),
+    false,
+  );
+  // One measured model and one unmeasured model, read from spend.
+  assert.equal(metricsOf(rowOf({ spend: [rowSpend('claude-sonnet-5'), haiku] })).includes('rate'), false);
+  // A nested helper's usage is not the child's own model.
+  assert.ok(
+    metricsOf(
+      rowOf({
+        spend: [rowSpend('claude-sonnet-5'), haiku],
+        ownModelTiers: [{ model: 'claude-sonnet-5' }],
+      }),
+    ).includes('rate'),
+  );
+});
+
+// Over the low cached share thresholds on its own.
+const LOW_USAGE = { requests: 6, input: 300_000, cacheRead: 100_000, cacheWrite5m: 0 };
+// One invocation's writes are over the cache write thresholds. The direct reads keep the child's cached share high.
+const INVOCATION_WRITES = rowUsage({ requests: 6, input: 1_000, cacheRead: 100_000, cacheWrite5m: 2_200_000 });
+const DIRECT_READS = rowUsage({ requests: 20, input: 0, cacheRead: 20_000_000, output: 100 });
+const usagePart = (usage: Turn['usage'], linkedInvocationId?: string) => ({
+  model: 'claude-sonnet-5',
+  provider: null,
+  contextWindow: null,
+  contextBand: null,
+  inferenceClass: null,
+  serviceTier: null,
+  usage,
+  ...(linkedInvocationId ? { linkedInvocationId } : {}),
+});
+const writeAgent = (over: Partial<TurnAgent> = {}): TurnAgent =>
+  rateAgent({
+    spend: [
+      {
+        model: 'claude-sonnet-5',
+        usage: rowUsage({ requests: 26, input: 1_000, cacheRead: 20_100_000, cacheWrite5m: 2_200_000, output: 2_100 }),
+        usageParts: [usagePart(DIRECT_READS), usagePart(INVOCATION_WRITES, 'nested')],
+      },
+    ],
+    ...over,
+  });
+const expiryOf = (
+  entries: { childId: string; count?: number; dollars: number | null }[],
+  dollars = 0,
+): CacheExpiryWarning => ({
+  scope: 'cache-expiry',
+  gapMs: 60_000,
+  dollars,
+  status: 'exact',
+  children: {
+    count: 0,
+    longestGapMs: 60_000,
+    dollars,
+    status: 'exact',
+    agents: entries.map((entry) => ({
+      count: 2,
+      longestGapMs: 60_000,
+      status: entry.dollars === null ? ('unknown' as const) : ('exact' as const),
+      ...entry,
+    })),
+  },
+});
+const expiryRows = (agents: TurnAgent[], expiry: CacheExpiryWarning) =>
+  toCard(turn({ agents }), false, NOW, [], null, false, new Set(), [], expiry).agents;
+
+test('a low cached share signs the dollars and names the warning', () => {
+  const row = rowOf({ spend: [rowSpend('claude-sonnet-5', LOW_USAGE)] });
+  const cost = figureOf(row, 'cost')!;
+  assert.deepEqual(cost.warnings, ['low-cache']);
+  assert.match(cost.name ?? '', /^\$[\d.]+ spent\. Warning: 25% cached$/);
+  // The popover heading keeps the plain amount.
+  assert.match(cost.record?.heading?.label ?? '', /^\$[\d.]+ spent$/);
+});
+
+test('a child under the low cached share thresholds draws no sign', () => {
+  const row = rowOf({ spend: [rowSpend('claude-sonnet-5', { ...LOW_USAGE, requests: 4 })] });
+  assert.equal(figureOf(row, 'cost')?.warnings, undefined);
+  assert.match(figureOf(row, 'cost')?.name ?? '', /spent$/);
+});
+
+// Each case misses one cache write threshold and meets the other two.
+for (const [threshold, over] of [
+  ['request count', { requests: 4 }],
+  ['cache write share', { cacheRead: 2_300_000 }],
+  ['cache write cost', { cacheWrite5m: 1_000_000 }],
+] as const) {
+  test(`a child under the cache write ${threshold} threshold draws no sign and no popover line`, () => {
+    const invocation = { ...INVOCATION_WRITES, ...over };
+    const row = rowOf({
+      spend: [
+        {
+          model: 'claude-sonnet-5',
+          usage: rowUsage({
+            requests: DIRECT_READS.requests! + invocation.requests!,
+            input: invocation.input,
+            cacheRead: DIRECT_READS.cacheRead + invocation.cacheRead,
+            cacheWrite5m: invocation.cacheWrite5m,
+            output: DIRECT_READS.output + invocation.output,
+          }),
+          usageParts: [usagePart(DIRECT_READS), usagePart(invocation, 'nested')],
+        },
+      ],
+    });
+    const cost = figureOf(row, 'cost')!;
+    assert.equal(cost.warnings, undefined);
+    assert.deepEqual(cost.record?.cost?.warnings, []);
+  });
+}
+
+test("a nested invocation's cache write warning signs the row that holds it, and adds its popover line", () => {
+  const card = toCard(
+    turn({ agents: [writeAgent({ id: 'other', spend: [rowSpend('claude-sonnet-5')] }), writeAgent()] }),
+    false,
+    NOW,
+  );
+  const [other, row] = card.agents;
+  assert.equal(figureOf(other, 'cost')?.warnings, undefined);
+  const cost = figureOf(row, 'cost')!;
+  assert.deepEqual(cost.warnings, ['cache-write'], 'the low cached share signed too');
+  assert.match(cost.name ?? '', /^\$[\d.]+ spent\. .*went to cache writes$/);
+  assert.match(cost.record?.cost?.warnings[0].text ?? '', /went to cache writes$/);
+});
+
+test('a row waits for its turn to finish before it signs a cache write', () => {
+  const row = toCard(turn({ finished: false, agents: [writeAgent()] }), true, NOW).agents[0];
+  assert.equal(figureOf(row, 'cost')?.warnings, undefined);
+});
+
+test('cache expiry signs the dollars from one cent and adds its popover line', () => {
+  const rows = (dollars: number | null) =>
+    expiryRows([rateAgent({ id: 'child-a' })], expiryOf([{ childId: 'child-a', dollars }]))[0];
+  const cost = figureOf(rows(0.6), 'cost')!;
+  assert.deepEqual(cost.warnings, ['cache-expiry']);
+  assert.deepEqual(cost.record?.cost?.warnings, [
+    { text: 'Cache expiry affected 2 requests and added $0.60', title: CACHE_EXPIRY_COST_ADDED_HINT },
+  ]);
+  assert.match(cost.name ?? '', /spent\. Cache expiry affected 2 requests and added \$0\.60$/);
+  assert.equal(figureOf(rows(0.004), 'cost')?.warnings, undefined);
+  assert.equal(figureOf(rows(0.006), 'cost')?.warnings, undefined, 'a row signed with a sub-cent amount');
+  assert.deepEqual(figureOf(rows(0.01), 'cost')?.warnings, ['cache-expiry']);
+  assert.equal(figureOf(rows(null), 'cost')?.warnings, undefined);
+});
+
+test('an expiry entry signs the first row that names its child, and a row with no match signs nothing', () => {
+  // The entry's id matches both subagent rows' `childSessionId`.
+  const [first, second] = expiryRows(
+    [rateAgent({ id: 'a', childSessionId: 'shared' }), rateAgent({ id: 'b', childSessionId: 'shared' })],
+    expiryOf([{ childId: 'shared', dollars: 0.6 }]),
+  );
+  assert.deepEqual(figureOf(first, 'cost')?.warnings, ['cache-expiry']);
+  assert.equal(figureOf(second, 'cost')?.warnings, undefined);
+  const expiry = expiryOf([{ childId: 'nested-helper', count: 3, dollars: 2 }], 2);
+  const [row] = expiryRows([rateAgent({ id: 'a' })], expiry);
+  assert.equal(figureOf(row, 'cost')?.warnings, undefined);
+  // The turn total keeps what no row claimed.
+  const card = toCard(turn({ agents: [rateAgent({ id: 'a' })] }), false, NOW, [], null, false, new Set(), [], {
+    ...expiry,
+    children: { ...expiry.children!, count: 3 },
+  });
+  assert.ok(
+    card.chips
+      .find((chip) => chip.metric === 'cost')
+      ?.warnings?.some((warning) => warning.scope === 'cache-expiry' && warning.children?.count === 3),
+  );
 });
 
 // The dispatched row's speed names the dispatched session, never a subagent.
@@ -10514,7 +10860,7 @@ test('indexed lifetime cost prices aggregated Auto Review volume without changin
     ],
   });
   const card = toCard(parent, false, NOW);
-  assert.equal(card.chips.find((held) => held.label.includes(' in'))?.label, '2k in · 200 out');
+  assert.match(tokenLines(parent).join('\n'), /Input: 2,000 tokens\nOutput: 200 tokens/);
   const wholeReview = sessionCostStats(
     [firstReview, secondReview].map((usage) => ({
       agent: 'codex',
