@@ -1626,12 +1626,12 @@ export class PanelProvider implements vscode.Disposable {
   private cache = new Map<string, CacheEntry>();
   // Background commit reads refresh affected turns without delaying the initial render.
   private repositoryCommits = new RepositoryCommits(nodeGitRunner(), () =>
-    this.refreshFrom('repository-commits', true),
+    this.refreshFrom('repository-commits', true, true),
   );
   private commitRepositories = new CommitRepositories(nodeGitRunner(), () => {
     this.derivedCacheCheckpointState.markChanged();
     this.checkpointDerivedCache();
-    this.refreshFrom('commit-repositories', true);
+    this.refreshFrom('commit-repositories', true, true);
   });
   private readonly repositoryScope: RepositoryScope;
   private repositoryScopeReady = false;
@@ -5934,7 +5934,7 @@ export class PanelProvider implements vscode.Disposable {
       renamed = !sameModelLabels(labels, this.modelLabels ?? new Map());
       if (renamed) this.modelLabels = labels;
     }
-    this.refreshFrom('models');
+    this.refreshFrom('models', false, true);
     if (renamed) this.redrawModelNames();
   }
 

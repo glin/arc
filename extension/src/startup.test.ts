@@ -227,6 +227,7 @@ import {
   writeTimeOfVersion,
 } from './turnrail';
 import { recordedCostBasis } from './pricing';
+import { modelLabels, sameModelLabels } from './turnformat';
 import { isTurnRead, readMovedOnlyFor, turnKey } from './domain/read.ts';
 import { commitRowsOf } from './turncard';
 import {
@@ -3087,8 +3088,8 @@ function completeDiscoveryHarness(
       failSessionLoading() {}
       noteSessionRead() {}
       loadingLine = new SessionLoadingLine((event, record) => this.diagnostics.warn(event, record));
-      commitRepositories = new CommitRepositories({ run: async () => null }, () => {});
-      repositoryCommits = new RepositoryCommits({ run: async () => null }, () => {});
+      ${names.includes('commitRepositories') ? '' : 'commitRepositories = new CommitRepositories({ run: async () => null }, () => {});'}
+      ${names.includes('repositoryCommits') ? '' : 'repositoryCommits = new RepositoryCommits({ run: async () => null }, () => {});'}
       _showing = null; selections = []; messages = []; partial = []; catalog = null; drawnCards = [];
       coverageRevision = 0; enumeratedAdmissionComplete = true; claudeChildren = []; compressedRollouts = new Set();
       compressedLoadPending = false; compressedFollowTimer = null; compressedRolloutsRevision = 0; compressedFacts = new Map(); compressedFactsRevision = 0; adoptionsUnsettled = new Map(); compressedSpendPicks = new WeakMap(); compressedLaunch = 'launch-test'; compressedWalk = null; compressedRowsDirty = null; compressedRowsHeld = new Map(); compressedNameOnly = new Set(); compressedFactsRefreshDue = false; compressedLoadCursor = null; lifetimeDisplayPick = null;
@@ -11648,6 +11649,110 @@ test.skipIf(!rolloutCompression.zstdCompressSync)(
     assert.equal(walks.length, walksBefore + 1);
     assert.deepEqual([...provider.compressedRollouts].sort(), [pairTwin, named].sort());
     assert.deepEqual(files(), [held]);
+  },
+);
+
+function cardRefreshHarness() {
+  const harness = heldWalkHarness({ nodeGitRunner: () => ({ run: async () => null }), modelLabels, sameModelLabels }, [
+    'commitRepositories',
+    'repositoryCommits',
+    'setModels',
+  ]);
+  const { provider } = harness;
+  const selected = turn({ sessionId: 'held', agent: 'codex', model: 'gpt-catalog-model', commits: [] });
+  provider.collect = () => [
+    toCard(selected, true, Date.now(), provider.folders(), null, false, new Set(), [], null, provider.modelLabels),
+  ];
+  provider.redrawModelNames = vi.fn<() => void>();
+  const runs: Promise<void>[] = [];
+  const refresh = provider.refresh;
+  provider.refresh = (...args: unknown[]) => {
+    const run = refresh.apply(provider, args);
+    runs.push(run);
+    return run;
+  };
+  const update = (reason: string) => {
+    if (reason === 'models') {
+      provider.setModels({ codex: [{ value: selected.model, label: 'Catalog Model', description: '', efforts: [] }] });
+    } else {
+      selected.commits = [
+        {
+          sha: 'abc1234',
+          subject: 'Updated commit',
+          at: selected.endedAt,
+          dir: null,
+          place: null,
+          files: 1,
+          added: 1,
+          removed: 0,
+        },
+      ];
+      if (reason === 'commit-repositories') provider.commitRepositories.changed();
+      else provider.repositoryCommits.onFilled();
+    }
+  };
+  return { ...harness, runs, update };
+}
+
+test.each(['commit-repositories', 'repository-commits', 'models'])(
+  'a %s refresh updates cards without walking a usable held catalog',
+  async (reason) => {
+    const { provider, writeRollout, releaseAll, runs, update, files } = cardRefreshHarness();
+    const file = writeRollout('held');
+    const counters = new PanelPerformanceCounters();
+    provider.performanceCounters = counters;
+    await releaseAll(provider.refresh(true));
+    const before = counters.snapshot().work.catalogWalk;
+    const first = provider.messages.filter((message: any) => message.type === 'render').at(-1).cards[0];
+    assert.equal(first.commits.length, 0);
+    assert.notEqual(first.model, 'Catalog Model');
+    provider.messages.length = 0;
+    update(reason);
+    await releaseAll(runs.at(-1)!);
+    assert.equal(counters.snapshot().work.catalogWalk, before, `${reason} walked a usable held catalog`);
+    assert.deepEqual(files(), [file]);
+    const card = provider.messages.filter((message: any) => message.type === 'render').at(-1)?.cards[0];
+    assert.ok(card, `${reason} did not publish the updated card`);
+    if (reason === 'models') assert.equal(card.model, 'Catalog Model');
+    else assert.equal(card.commits[0]?.subject, 'Updated commit');
+  },
+);
+
+test.each(['commit-repositories', 'repository-commits', 'models'])(
+  'a %s refresh coalesced with workspace-folders walks once and names only the listing requester',
+  async (reason) => {
+    const { provider, writeRollout, releaseAll, runs, update, files } = cardRefreshHarness();
+    const held = writeRollout('held');
+    await releaseAll(provider.refresh(true));
+    const counters = new PanelPerformanceCounters();
+    provider.performanceCounters = counters;
+    const prepare = provider.prepareHumanPrompts;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let entered = false;
+    provider.prepareHumanPrompts = async (...args: unknown[]) => {
+      entered = true;
+      await gate;
+      return prepare.apply(provider, args);
+    };
+    provider.refreshFrom('metadata', false, true);
+    await vi.waitFor(() => assert.ok(entered, 'the held refresh did not reach prompt admission'));
+    update(reason);
+    const added = writeRollout('added');
+    provider.refreshFrom('workspace-folders', true);
+    const pending = provider.pendingRefresh;
+    release();
+    await releaseAll(runs[1]);
+    await vi.waitFor(() => assert.equal(runs.length, 5, 'the merged refresh did not run'));
+    await releaseAll(runs[4]);
+    assert.equal(pending.reuseCatalog, false);
+    assert.deepEqual(pending.walkReasons, ['workspace-folders']);
+    const work = counters.snapshot().work;
+    assert.equal(work.catalogWalk, 1);
+    assert.equal(work['walk:requested:coalesced'], 1);
+    assert.equal(work['discoveryRequest:walked:workspace-folders'], 1);
+    assert.equal(work[`discoveryRequest:walked:${reason}`] ?? 0, 0);
+    assert.deepEqual(files(), [added, held].sort());
   },
 );
 
