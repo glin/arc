@@ -12509,7 +12509,9 @@ test('both agents reach one list, and each session is read and named by its own 
   const from = panelHostSource.indexOf(marker);
   assert.notEqual(from, -1, `panelhost.ts no longer contains "${marker}", so this guard cannot see the merge`);
   const merge =
-    memberFrom(panelHostSource, from) + memberFrom(panelHostSource, panelHostSource.indexOf('private walkedSessions('));
+    memberFrom(panelHostSource, from) +
+    memberFrom(panelHostSource, panelHostSource.indexOf('private walkedSessions(')) +
+    memberFrom(panelHostSource, panelHostSource.indexOf('private claudeOpeningReader('));
   sourceMatch(merge, /enumerateSessionFilesFor\(projectsRoot\(\)/, 'the list no longer holds Claude Code sessions');
   sourceMatch(merge, /codexSessionFiles\(codexSessionsRoot\(\)/, 'the list no longer holds Codex sessions');
   sourceMatch(
