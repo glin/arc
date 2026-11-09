@@ -595,7 +595,7 @@ test('a window read queued during a receipt turn enters the worker within one ba
     fs.writeFileSync(posted, '');
     assert.equal((await window)?.value.kind, 'window');
     assert.ok(entered !== undefined && entered <= 8, `the window read entered after ${entered} more receipt steps`);
-    // Each step during the read takes its own turn, so a step runs behind each file call of the read.
+    // While the read runs, the scan runs one step in each event-loop turn.
     assert.ok(answered, 'the window answer was not reported');
     assert.ok(answered[0] <= answered[1] + 1, `${answered[0]} steps ran in ${answered[1]} turns during the read`);
     await discovery;

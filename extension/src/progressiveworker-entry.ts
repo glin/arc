@@ -234,9 +234,9 @@ export const CODEX_DISPATCH_REQUEST_BYTES = 8 * 1024 * 1024;
 // check.
 const RECEIPT_SLICE_MS = 1500;
 const RECEIPT_STEPS = 65536;
-// The steps that one event-loop turn of the receipt scan runs. A receipt filesystem call costs at most about 0.5 ms on a large
-// store, so a window read waits at most about 4 ms behind a turn. While a window read runs, each step takes its own turn, so
-// each file call of the read waits behind one step.
+// The steps that one event-loop turn of the receipt scan runs. A receipt filesystem call took about 0.5 ms on average in a
+// recorded large store, so a window read enters the worker about 4 ms behind a scan turn. One slow call has no bound. While a
+// window read runs, the scan runs one step in each event-loop turn.
 const RECEIPT_TURN_STEPS = 8;
 const receiptScanTurn = () => new Promise<void>((resolve) => setImmediate(resolve));
 let discoveryEpoch: DiscoveryCheckpoint | null = null;
