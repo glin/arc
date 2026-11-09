@@ -15967,6 +15967,12 @@ test.each([
       stat: { ...initial, ino: undefined },
       reads: ino === undefined ? 0 : 1,
     },
+    { name: 'a current inode at the recorded stat', stat: { ...initial, ino: ino ?? '77' }, reads: 0 },
+    {
+      name: 'a current inode with growth',
+      stat: { ...initial, ino: ino ?? '77', size: 1100, mtimeMs: 2100 },
+      reads: ino === undefined ? 1 : 0,
+    },
     { name: 'shrink', stat: { ...initial, size: 900 }, reads: 1 },
     { name: 'same-size rewrite', stat: { ...initial, mtimeMs: 2100 }, reads: 1 },
     { name: 'changed device', stat: { ...initial, dev: '9' }, reads: identityReads },
@@ -16003,6 +16009,7 @@ test.each([
     const held = cache.snapshot()[0][1];
     assert.equal(held.size, stat.size, name);
     assert.equal(held.mtimeMs, stat.mtimeMs, name);
+    assert.equal(held.fileIdentity?.ino, stat.ino, name);
     assert.equal(list().sessions[0].sessionId, reads ? UUID_B : UUID_A, name);
     assert.equal(read, reads, `${name} reads an unchanged opening again`);
   }
@@ -16167,6 +16174,19 @@ test('a listing reconciles a held stat that disagrees with the saved opening', a
   missedRewrite.clock.now += CODEX_STAT_REVALIDATE_MS;
   assert.equal(missedRewrite.list().sessionId, UUID_B, 'an expired held stat kept the old opening');
   assert.equal(missedRewrite.counts.reads, 1);
+});
+
+test('a refused read keeps the held opening and the revision', () => {
+  const root = sessionsRoot([{ day: '2026/08/25', name: ROLLOUT(UUID_A), records: [meta({ id: UUID_A })] }]);
+  const file = rolloutFiles(root)[0];
+  const held = { ...readCodexSessionMeta(file)!, size: 1000, mtimeMs: 2000, fileIdentity: { dev: '1', ino: '2' } };
+  const cache = new CodexMetaCache(() => undefined);
+  cache.load([[file, held]]);
+  const revision = cache.revision;
+  assert.equal(cache.get(file, undefined, { size: 900, mtimeMs: 2100, dev: '1', ino: '3', isFile: true }), held);
+  assert.equal(cache.savedOpening(file), held);
+  assert.equal(cache.revision, revision);
+  assert.deepEqual(cache.snapshot(), [[file, held]]);
 });
 
 test('a refused read of a replacement waits out each retry interval beside the held opening', () => {
