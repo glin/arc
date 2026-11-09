@@ -1107,8 +1107,8 @@
       "margin": 0
     },
     "warm start | openingsRead:children": {
-      "reason": "A walk reads a child head only when the saved row cannot answer it. A rise means the child census reads every child again.",
-      "budget": 30,
+      "reason": "A warm start takes each opening of its parents and children from the saved entries of the derived cache while the listed file identity is current. A rise means a saved opening no longer qualifies.",
+      "budget": 0,
       "margin": 0
     },
     "warm start | openingsRead:codex": {
@@ -1122,8 +1122,8 @@
       "margin": 0
     },
     "warm start | openingsRead:parents": {
-      "reason": "A new worker reads each parent opening once, and later steps answer from held state. A rise means a step reads parent openings again.",
-      "budget": 75,
+      "reason": "A warm start takes each opening of its parents and children from the saved entries of the derived cache while the listed file identity is current. A rise means a saved opening no longer qualifies.",
+      "budget": 0,
       "margin": 0
     },
     "warm start | parentChecks": {
