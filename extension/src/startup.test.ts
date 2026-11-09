@@ -9562,16 +9562,11 @@ function coldPassRaceHarness() {
   };
   const waited = { timeout: 8_000, interval: 5 };
   let released = 0;
-  // Releases each held walk, because a build that waits for the pass walks after it where another build lists seeded rows.
+  // Releases each held walk, so a refresh that walks can finish.
   const settle = () =>
     vi.waitFor(() => {
       while (walks.length > released) walks[released++].release();
-      // A build that waits for the pass holds its folded request until the pass ends.
-      const held = provider.codexPriming !== null && !provider.codexColdPass?.listing;
-      assert.ok(
-        provider.refreshController === null && (held || provider.pendingRefresh === null),
-        'a refresh is still running',
-      );
+      assert.ok(provider.refreshController === null && provider.pendingRefresh === null, 'a refresh is still running');
     }, waited);
   const posts = () => provider.messages.filter((message: any) => message.type === 'render');
   return {
@@ -9607,8 +9602,6 @@ test('a warm start with visible reports before and after the first post counts i
   race.seed('seeded');
   provider.refreshFrom('shell-ready', true);
   panel.changeVisibility();
-  // A build that waits for the pass posts only after the pass, so its pass ends here.
-  if (provider.refreshController === null) race.finishPass();
   await race.untilPosted();
   await race.settle();
   panel.changeVisibility();
@@ -9633,7 +9626,6 @@ test('a visible report after the first post while the cold pass runs lists Claud
   await race.settle();
   panel.changeVisibility();
   await race.settle();
-  // A build that waits for the pass draws only after it, so the count stops at the post that follows the pass.
   race.finishPass();
   await race.untilPosted();
   await race.settle();
@@ -9716,7 +9708,6 @@ test('a refresh between the first render post and its paint drops the startup st
   const { provider, stages } = race;
   const seeded = race.seed('seeded');
   provider.refreshFrom('shell-ready', true);
-  if (provider.refreshController === null) race.finishPass();
   await race.untilPosted();
   const drawn = provider.refreshGeneration;
   await race.settle();
