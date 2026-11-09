@@ -483,7 +483,11 @@ export class CompressedBackfill {
     this.running = true;
     try {
       while (!this.disposed) {
-        if (this.dirty) await this.plan();
+        if (this.dirty) {
+          await this.waitIdle();
+          if (this.disposed) return;
+          await this.plan();
+        }
         const job = this.queue.shift();
         if (!job) break;
         await this.waitIdle();
@@ -501,10 +505,18 @@ export class CompressedBackfill {
 
   private queue: Job[] = [];
 
+  // A plan step gives way to a waiting request, as a decode slice does.
+  private async planYield(): Promise<void> {
+    await this.yieldStep();
+    await this.waitIdle();
+  }
+
   private async plan(): Promise<void> {
     this.dirty = false;
     if (!this.openingsLoaded) {
-      const openings = await readCompressedStoreInSteps(this.options.openings.directory, this.statOf, this.yieldStep);
+      const openings = await readCompressedStoreInSteps(this.options.openings.directory, this.statOf, () =>
+        this.planYield(),
+      );
       for (const [file, entry] of openings.entries) this.openingEntries.set(file, entry);
       this.openingsLoaded = true;
     }
@@ -514,7 +526,7 @@ export class CompressedBackfill {
     for (const file of this.names) {
       if (this.disposed) return;
       if (this.now() - started >= PLAN_SLICE_MS) {
-        await this.yieldStep();
+        await this.planYield();
         started = this.now();
       }
       const stat = this.statOf(file);

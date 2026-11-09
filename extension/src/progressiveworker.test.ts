@@ -15979,6 +15979,74 @@ test('a replaced file restarts a failed revision with an unchanged list and root
   }
 });
 
+test('the plan waits for a discovery request before it stats a name', async () => {
+  let busy = true;
+  let stats = 0;
+  const seen: number[] = [];
+  const harness = backfillHarness({
+    exists: () => false,
+    busy: () => busy,
+    wait: async () => {
+      seen.push(stats);
+      if (seen.length === 3) busy = false;
+    },
+    statOf: () => {
+      stats++;
+      return null;
+    },
+  });
+  try {
+    harness.backfill.setNames(['a.jsonl.zst']);
+    await vi.waitFor(() => assert.equal(stats, 1, 'the plan never ran after the request ended'));
+    assert.deepEqual(seen, [0, 0, 0], 'the plan read a stat while a request waited');
+  } finally {
+    harness.backfill.dispose();
+  }
+});
+
+test('a plan yield and a store read yield wait for a request', async () => {
+  let busy = false;
+  const statBusy: boolean[] = [];
+  const openings = tempDir('backfill-openings-');
+  for (const seq of [0, 1])
+    fs.writeFileSync(
+      path.join(openings, `segment-1-holder-${seq}`),
+      `${JSON.stringify({ file: `o${seq}.zst`, pairKey: `o${seq}`, factsVersion: 1 })}\n`,
+    );
+  let waits = 0;
+  let yields = 0;
+  const harness = backfillHarness({
+    exists: () => false,
+    openings: {
+      directory: openings,
+      append: async (entries: unknown[]) => entries.map(() => true),
+      durable: async () => true,
+    } as never,
+    busy: () => busy,
+    yieldStep: async () => {
+      if (++yields === 1) busy = true;
+    },
+    wait: async () => {
+      if (++waits === 3) busy = false;
+    },
+    statOf: () => {
+      statBusy.push(busy);
+      harness.advance(30);
+      return null;
+    },
+  });
+  try {
+    harness.backfill.setNames(['a.jsonl.zst', 'b.jsonl.zst', 'c.jsonl.zst']);
+    await vi.waitFor(() =>
+      assert.equal(statBusy.filter(Boolean).length + statBusy.filter((b) => !b).length >= 3, true),
+    );
+    assert.equal(statBusy.includes(true), false, 'the plan ran on while a request waited');
+    assert.ok(waits >= 3, 'the store read did not wait for the request');
+  } finally {
+    harness.backfill.dispose();
+  }
+});
+
 const unitStat = { size: 10, mtimeMs: 2, dev: 1, ino: 1 };
 const unitDecoded = (hash = 'h') =>
   ({ kind: 'decoded', hash, stat: unitStat as never, frames: 1, complete: true }) as const;
