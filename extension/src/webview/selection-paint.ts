@@ -57,7 +57,7 @@ export function createSelectionPaint(
   }
   return {
     receive,
-    // Ends the measurement of a timed render that the panel could not apply. The replacement snapshot carries no identity.
+    // Ends the measurement of a timed render that the panel cannot apply. The replacement snapshot carries no identity.
     discard(
       message: { showing: string | null; selectionTiming?: { id: number; sessionId: string } },
       receivedAt: number,
