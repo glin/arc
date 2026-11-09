@@ -10511,16 +10511,18 @@ export class PanelProvider implements vscode.Disposable {
       ? this.authoritativeCatalog?.find((candidate) => candidate.sessionId === session)
       : undefined;
     if (host) {
-      if (session)
+      if (session) {
+        // The list that the refresh draws from. A partial catalog is held before the session list accepts it.
+        const windowSource = selectedSource ?? this.catalog?.sessions.find((one) => one.sessionId === session);
         this.performanceCounters?.startSelection?.(
           host,
           session,
-          selectedSource && !isCompressedRollout(selectedSource.file) && this.progressiveCurrent(selectedSource)
+          windowSource && !isCompressedRollout(windowSource.file) && this.progressiveCurrent(windowSource)
             ? 'held'
             : 'read',
           arrivedAt,
         );
-      else this.performanceCounters?.abandonSelection?.(host, 'selection-cleared');
+      } else this.performanceCounters?.abandonSelection?.(host, 'selection-cleared');
     }
     const previousSelection = host ? (this.hostSessions.get(host) ?? this.showing) : this.showing;
     if (previousSelection && previousSelection !== session) {

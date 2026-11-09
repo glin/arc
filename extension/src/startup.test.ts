@@ -17864,6 +17864,18 @@ test.each([
   },
 );
 
+test('a current window under a partial catalog is labelled held', async () => {
+  const f = selectionHarness();
+  f.provider.authoritativeCatalog = null;
+  f.provider.progressiveCurrent = () => true;
+  try {
+    await f.provider.onMessage({ type: 'showSession', session: 'claude-a' }, f.host);
+    assert.equal(f.timing().window, 'held');
+  } finally {
+    f.provider.performanceCounters.dispose();
+  }
+});
+
 test('a selection superseded before its render retains arrival and a reason', async () => {
   const provider = paintHarness(['onMessage'], {
     parsePanelToHost,
