@@ -12,6 +12,7 @@ export const DEMO_HOST_POLICY = {
   ready: 'handled',
   rowsGap: 'noop',
   painted: 'noop',
+  selectionPainted: 'noop',
   initialize: 'noop',
   developmentReload: 'noop',
   refresh: 'noop',
