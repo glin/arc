@@ -7,7 +7,7 @@
       "margin": 0
     },
     "prompt scan save | selection:renderPosted": {
-      "reason": "The first drawable selected transcript carries one timing identity. Later renders carry none.",
+      "reason": "The first post that draws the selected session carries one timing identity. Later renders carry none.",
       "budget": 1,
       "margin": 0
     },
@@ -17,7 +17,7 @@
       "margin": 0
     },
     "selection switch | selection:renderPosted": {
-      "reason": "The first drawable selected transcript carries one timing identity. Later renders carry none.",
+      "reason": "The first post that draws the selected session carries one timing identity. Later renders carry none.",
       "budget": 1,
       "margin": 0
     },

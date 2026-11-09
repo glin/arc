@@ -11582,7 +11582,7 @@ export class PanelProvider implements vscode.Disposable {
             }
           },
           selectedSession ? this.cache.get(selectedSession.file)?.read : undefined,
-          !loadingNewest && !selectedFailure,
+          Boolean(selectedSession) && (hostDrawn.length > 0 || !loadingNewest) && !selectedFailure,
         ).then(
           (accepted) => {
             if (accepted && !controller?.signal.aborted && generation === this.refreshGeneration) {

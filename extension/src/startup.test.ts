@@ -17765,6 +17765,105 @@ test.each(['held', 'read'] as const)(
   },
 );
 
+function selectionHarness() {
+  const provider = paintHarness(['onMessage', 'routePerformanceEvent', 'sendToHost'], {
+    parsePanelToHost,
+    dispatchPanelToHost,
+    READER_INSTRUCTIONS: new Set(),
+  });
+  provider.hostSessions = new Map();
+  provider.hostPreviousSessions = new Map();
+  provider.panelSession = (session: string) => session;
+  provider.authoritativeCatalog = provider.partial;
+  provider.panelStartedAt = null;
+  const logged: Array<{ event: string; record: Record<string, unknown> }> = [];
+  provider.diagnostics.log = (event: string, record: Record<string, unknown>) => logged.push({ event, record });
+  provider.performanceCounters = new PanelPerformanceCounters(1000, {
+    enabled: () => true,
+    emit: (event: string, record: Record<string, unknown>) => provider.routePerformanceEvent(event, record),
+  });
+  const refresh = provider.refresh.bind(provider);
+  const runs: Promise<void>[] = [];
+  provider.refresh = (...args: unknown[]) => {
+    const run = refresh(...args);
+    runs.push(run);
+    return run;
+  };
+  return {
+    provider,
+    host: provider.hosts[0],
+    logged,
+    async settled() {
+      for (let done = 0; done < runs.length; done++) await runs[done];
+    },
+    posts: (): any[] =>
+      provider.messages.filter((message: any) => message.type === 'render' || message.type === 'selection'),
+    timing: () => provider.performanceCounters.snapshot().selections[0],
+  };
+}
+
+test('a grown cached session carries the timing identity on the held cards posted before its read completes', async () => {
+  const f = selectionHarness();
+  let current = false;
+  f.provider.progressiveCurrent = () => current;
+  f.provider.collect = () => [{ key: 'held-turn', sessionId: 'claude-a' }];
+  try {
+    await f.provider.onMessage({ type: 'showSession', session: 'claude-a' }, f.host);
+    await f.settled();
+    const [first] = f.posts();
+    assert.equal(first.cards.length, 1, 'the held cards never reached the panel');
+    assert.deepEqual(first.selectionTiming, { id: 1, sessionId: 'claude-a' });
+    assert.equal(typeof f.timing().stamps['selection:renderPosted'], 'number');
+    current = true;
+    f.provider.refreshFrom('selected-window', true, true, null, true, true);
+    await f.settled();
+    const later = f.posts().slice(1);
+    assert.ok(later.length > 0, 'the completed read posted nothing');
+    assert.ok(
+      later.every((post) => post.selectionTiming === undefined),
+      'a second post carried the timing identity',
+    );
+    assert.equal(f.provider.performanceCounters.snapshot().work['selection:renderPosted'], 1);
+  } finally {
+    f.provider.performanceCounters.dispose();
+  }
+});
+
+test.each([
+  ['listed', true, null],
+  ['unlisted', false, 'session-unavailable'],
+] as const)(
+  'a selection before the catalog publishes stamps no render until a %s session settles it',
+  async (_name, listed, reason) => {
+    const f = selectionHarness();
+    f.provider.authoritativeCatalog = null;
+    f.provider.progressiveCurrent = () => true;
+    f.provider.collect = () => [{ key: 'turn', sessionId: 'claude-a' }];
+    try {
+      await f.provider.onMessage({ type: 'showSession', session: 'claude-a' }, f.host);
+      await f.settled();
+      assert.ok(f.posts().length > 0, 'the selection posted nothing before the catalog');
+      assert.ok(
+        f.posts().every((post) => post.selectionTiming === undefined),
+        'a post with no selected session carried the timing identity',
+      );
+      assert.deepEqual(Object.keys(f.timing().stamps), ['selection:hostArrived']);
+      assert.equal(f.timing().reason, null);
+      f.provider.authoritativeCatalog = listed ? f.provider.partial : [];
+      f.provider.refreshFrom('selected-window', true, true, null, true, true);
+      await f.settled();
+      assert.equal(f.timing().reason, reason);
+      assert.equal(f.timing().stamps['selection:renderPosted'] !== undefined, listed);
+      assert.equal(
+        f.posts().some((post) => post.selectionTiming !== undefined),
+        listed,
+      );
+    } finally {
+      f.provider.performanceCounters.dispose();
+    }
+  },
+);
+
 test('a selection superseded before its render retains arrival and a reason', async () => {
   const provider = paintHarness(['onMessage'], {
     parsePanelToHost,

@@ -104,7 +104,7 @@ Read `panelAdopted` before comparing startups. `created` means command-opened, `
 
 `selection:hostArrived` marks the selection message's arrival at the host.
 
-`selection:renderPosted` marks the host's first drawable selected-session render post.
+`selection:renderPosted` marks the host's first post that draws the selected session, either its held cards while a newer read runs or its current transcript. A selection that ends with nothing drawn has no render stamp and records an abandonment reason.
 
 `selection:renderReceived` marks the webview's receipt of that render before parsing and drawing.
 
