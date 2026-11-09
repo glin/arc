@@ -10177,6 +10177,20 @@ function withoutInodes(): () => void {
   };
 }
 
+test('a parent transcript replaced during a running launch reads at the next launch and lists its new working directory', async () => {
+  const { writeParent, walk, relaunch, parentCwd, line, workspace, root } = savedOpeningsHarness();
+  const parent = writeParent('parent');
+  assert.deepEqual(await walk(), { parents: 1, children: 0 });
+  const moved = path.join(workspace, 'moved');
+  const replacement = path.join(root, 'replacement.jsonl');
+  fs.writeFileSync(replacement, line(moved));
+  fs.renameSync(replacement, parent);
+  assert.deepEqual(await walk(), { parents: 0, children: 0 }, 'a held row read its transcript again');
+  relaunch();
+  assert.deepEqual(await walk(), { parents: 1, children: 0 }, 'the replaced transcript kept the saved opening');
+  assert.equal(parentCwd(parent), moved, 'the replaced transcript listed its old working directory');
+});
+
 test.each([
   { moment: 'after the relaunch', duringLaunch: false },
   { moment: 'during the running launch', duringLaunch: true },
