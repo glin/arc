@@ -16157,6 +16157,30 @@ test('a retry timer that fires before its due time still runs the retry', async 
   }
 });
 
+test.skipIf(!zstdCompress)('a rollout whose opening has no id takes the id in its file name', async () => {
+  const directory = tempDir('worker-no-id-');
+  const file = path.join(directory, `rollout-2026-01-01T00-00-00-${COMPRESSED_THREAD}.jsonl.zst`);
+  fs.writeFileSync(
+    file,
+    zstdCompress!(
+      Buffer.from(
+        `${JSON.stringify({ timestamp: '2026-01-01T00:00:00.000Z', type: 'session_meta', payload: { cwd: '/repo', source: 'cli', thread_source: 'user' } })}\n`,
+      ),
+    ),
+  );
+  const harness = backfillHarness({ exists: () => false });
+  try {
+    const entry = await derivedFactsOf(file, { reduceAbove: 1024, recordBytes: 4096 });
+    assert.equal(entry.threadId, COMPRESSED_THREAD, 'the facts lost the id in the file name');
+    harness.backfill.setNames([file]);
+    await vi.waitFor(() => assert.ok(harness.openings.length >= 1));
+    assert.equal(harness.openings[0].threadId, COMPRESSED_THREAD, 'the opening lost the id in the file name');
+  } finally {
+    harness.backfill.dispose();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 const unitStat = { size: 10, mtimeMs: 2, dev: 1, ino: 1 };
 const unitDecoded = (hash = 'h') =>
   ({ kind: 'decoded', hash, stat: unitStat as never, frames: 1, complete: true }) as const;

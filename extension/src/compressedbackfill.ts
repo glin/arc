@@ -28,6 +28,7 @@ import {
   compressedPairKey,
   compressedTitleCurrent,
   readCompressedStoreInSteps,
+  sessionKeyOf,
   withKeptUndercount,
   type CompressedEntrySeed,
   type CompressedFactEntry,
@@ -296,7 +297,7 @@ export function compressedFactsFromDerivation(
     size: stat.size,
     mtimeMs: stat.mtimeMs,
     hash: read.hash,
-    threadId: finished.opening?.sessionId ?? null,
+    threadId: sessionKeyOf(file, finished.opening),
     decodedLength: derivation.offset,
     skippedRecords: derivation.skippedRecords,
     undercount: derivation.undercount,
@@ -661,7 +662,7 @@ export class CompressedBackfill {
       ...compressedEntryVersions(),
       size: job.stat.size,
       mtimeMs: job.stat.mtimeMs,
-      threadId: opening?.sessionId ?? null,
+      threadId: sessionKeyOf(job.file, opening),
       opening,
     };
     this.openingEntries.set(job.file, entry);

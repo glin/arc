@@ -113,7 +113,8 @@ export function compressedPairKey(twin: string, directories: Map<string, string>
   return normalizeWorkspace(path.join(real, path.basename(twin).replace(/\.zst$/, '')));
 }
 
-function sessionKeyOf(file: string, opening: CodexSessionMeta | null | undefined): string | null {
+// The session a rollout belongs to: the id of its opening, or the id in its file name for an opening with none.
+export function sessionKeyOf(file: string, opening: CodexSessionMeta | null | undefined): string | null {
   return opening?.sessionId ?? ROLLOUT_NAME.exec(path.basename(file).replace(/\.zst$/, ''))?.[1] ?? null;
 }
 

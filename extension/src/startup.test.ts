@@ -68,7 +68,8 @@ import * as path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { isDeepStrictEqual } from 'node:util';
 import * as zlib from 'node:zlib';
-import { compressedRolloutsReadable, isCompressedRollout } from './compressedrollouts.ts';
+import { compressedRolloutsReadable, isCompressedRollout, streamCompressedRollout } from './compressedrollouts.ts';
+import { RolloutDerivation, compressedFactsFromDerivation } from './compressedbackfill.ts';
 import { compressedSpendDisplayFiles, projectSpendWorkspace } from './projectspend.ts';
 import { MULTI_ROOT_SPEND_WORKSPACE_PREFIX } from './identity.ts';
 import { isAgentRun, isHiddenThread, staleMetas } from './codex.ts';
@@ -11164,6 +11165,31 @@ test('a complete discovery reply keeps a backfilled row and gives it a spend sou
     'the compressed row reached no spend source',
   );
 });
+
+test.skipIf(!rolloutCompression.zstdCompressSync)(
+  'a rollout whose opening has no id lists under the id in its file name',
+  async () => {
+    const { provider, twin } = backfillHostHarness();
+    fs.writeFileSync(
+      twin,
+      rolloutCompression.zstdCompressSync!(
+        Buffer.from(
+          `${JSON.stringify({ timestamp: '2026-01-01T00:00:00.000Z', type: 'session_meta', payload: { cwd: 'c:/repo', source: 'cli', thread_source: 'user' } })}\n`,
+        ),
+      ),
+    );
+    const derivation = new RolloutDerivation(twin, 'workspace');
+    const read = await streamCompressedRollout(twin, (chunk: Buffer) => derivation.push(chunk));
+    assert.ok(read.kind === 'decoded');
+    provider.applyCompressedBatch({ entries: [compressedFactsFromDerivation(twin, read, derivation)], backfillMs: 0 });
+    const rows: SessionFile[] = provider.withCompressedFactRows([]);
+    assert.deepEqual(
+      rows.map((row) => [row.file, row.sessionId]),
+      [[twin, twinThread]],
+      'a rollout with no id gave no row',
+    );
+  },
+);
 
 test('a plain twin suppresses the compressed row of a batch', () => {
   const { provider, twin, entry } = backfillHostHarness();
