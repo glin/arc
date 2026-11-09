@@ -10503,10 +10503,16 @@ test('a load that a worker stop cut off runs again and holds Project cost busy u
     compressedRenderSeen: true,
     codexPriming: null,
   });
+  provider.anyVisible = () => true;
+  provider.disposed = false;
+  provider.compressedFollowTimer = null;
   provider.maybeStartCompressedLoad();
   await vi.waitFor(() => assert.equal(provider.compressedLoadStarted, false, 'the cut-off load kept its started flag'));
   assert.equal(provider.compressedLoadPending, true, 'a cut-off load ended the busy state');
-  provider.maybeStartCompressedLoad();
+  // The follow timer runs the load again while the panel is visible.
+  clearTimeout(provider.compressedFollowTimer);
+  provider.compressedFollowTimer = null;
+  await provider.followCompressedFacts();
   await vi.waitFor(() => assert.equal(provider.compressedLoadPending, false));
   assert.equal(requests.length, 2, 'the cut-off load did not run again');
   assert.equal(provider.compressedFacts.has('a.jsonl.zst'), true);

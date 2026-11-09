@@ -4820,7 +4820,6 @@ export class PanelProvider implements vscode.Disposable {
         void this.sendToHost(host, this.panelVisibility.current(host, host.visible()));
         // Keep polling while any ready host remains visible. Stop polling when no ready host is visible.
         if (this.anyVisible()) {
-          this.maybeStartCompressedLoad();
           this.refreshFrom('visible', true);
           this.startPolling();
           // Request account and catalog updates when a ready host becomes visible.
@@ -5086,8 +5085,9 @@ export class PanelProvider implements vscode.Disposable {
       // A failed load leaves the rows of this activation without stored facts.
     }
     if (cutOff) {
-      // A worker stop cut the load off. The panel loads again when it next becomes visible.
+      // A worker stop cut the load off. The panel loads again at the next poll while it is visible.
       this.compressedLoadStarted = false;
+      this.armCompressedFollow();
       return;
     }
     this.compressedLoadPending = false;
@@ -5112,6 +5112,11 @@ export class PanelProvider implements vscode.Disposable {
   private async followCompressedFacts(): Promise<void> {
     const stores = this.compressedStorePaths();
     if (!stores || this.disposed) return;
+    if (this.compressedLoadPending && !this.compressedLoadStarted) {
+      if (this.anyVisible()) this.maybeStartCompressedLoad();
+      this.armCompressedFollow();
+      return;
+    }
     if (this.anyVisible()) {
       let applied = false;
       const take = (value: import('./progressiveworker').ProgressiveValue | undefined) => {
