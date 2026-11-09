@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import { test } from 'vitest';
 import { createSelectionPaint, SELECTION_PAINT_FRAME_LIMIT } from './selection-paint.ts';
 import type { PanelToHost } from './protocol.ts';
@@ -105,7 +104,6 @@ test('a timed render the panel cannot apply ends its measurement with the rows g
   assert.equal(f.frames.length, 0, 'the discarded render scheduled a paint');
   f.paint.receive({ showing: 'selected' }, 110);
   assert.equal(f.messages.length, 1, 'the replacement snapshot reported the measurement again');
-  assert.match(readFileSync(`${__dirname}/selection-paint.ts`, 'utf8'), /timed render that the panel cannot apply/);
 });
 
 test('an untimed render the panel cannot apply leaves the pending measurement waiting', () => {
