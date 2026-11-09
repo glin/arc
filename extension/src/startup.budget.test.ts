@@ -143,7 +143,7 @@ function outsideBudget(measured: Record<string, Counts>, rows: Record<string, Bu
     const [step, counter] = key.split(' | ');
     if (measured[step]?.[counter] !== undefined || (budget.budget === 0 && reported.has(counter))) continue;
     failures.push(
-      `Step "${step}", counter ${counter}: not measured, recorded budget ${budget.budget}. The step or the counter was renamed or removed. If the change is intended, rename the row in scripts/test-budget.json. If the change is not intended, find the cause.`,
+      `Step "${step}", counter ${counter}: not measured, recorded budget ${budget.budget}. The step or the counter was renamed or removed. If the change is intended, rename or delete the row in scripts/test-budget.json. If the change is not intended, find the cause.`,
     );
   }
   for (const [step, row] of Object.entries(measured)) {

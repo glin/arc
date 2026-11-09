@@ -233,7 +233,7 @@ An integer counter must equal its budget within the margin on both sides. The by
 
 The test pads the temporary root to one length, so path bytes do not change from machine to machine. A `readBytes` row that expects bytes keeps a small margin, because the receipt store records native device and file numbers. A row that expects no bytes has a margin of 0.
 
-The failure message names the step, the counter, the recorded budget, the measured count and the reason of the row. The message tells the reader to update the row if the change is intended, and to find the cause if the change is not intended.
+The failure message names the step, the counter, the recorded budget, the measured count and the reason of the row. The message tells the reader to update the row if the change is intended. It tells the reader to find the cause if the change is not intended.
 
 The test measures no duration. The default test timeout catches only a hang.
 
