@@ -2,7 +2,13 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { test } from 'vitest';
-import { CodexMetaCache, readCodexSessionMeta, readRolloutStat, type CodexSessionMeta } from './codex';
+import {
+  CodexMetaCache,
+  readCodexSessionMeta,
+  readQualifiedCodexOpening,
+  readRolloutStat,
+  type CodexSessionMeta,
+} from './codex';
 import { CODEX_META_VERSION, CodexOpeningsWriter, loadCodexOpenings, storedCodexMetas } from './codexopenings';
 import { loadDerivedCache, METADATA_GENERATIONS } from './derivedcache';
 import { tempDir } from './temproot';
@@ -57,6 +63,25 @@ test('an append keeps the revision and reaches the saved file at the next save',
   } finally {
     writer.dispose();
   }
+});
+
+test('growth of a colliding rollout keeps the revision, and a replacement moves it', () => {
+  const root = tempDir('codex-openings-');
+  const rollout = path.join(root, 'rollout.jsonl');
+  const opening = JSON.stringify({ type: 'session_meta', payload: { id: 'session', cwd: root } }) + '\n';
+  fs.writeFileSync(rollout, opening);
+  const cache = new CodexMetaCache();
+  const qualify = () => cache.install(rollout, readQualifiedCodexOpening(rollout)!.value);
+  qualify();
+  const revision = cache.revision;
+  fs.appendFileSync(rollout, '{}\n');
+  qualify();
+  assert.equal(cache.revision, revision, 'growth of a colliding rollout moved the revision');
+  assert.equal(cache.savedOpening(rollout)?.size, fs.statSync(rollout).size);
+  fs.renameSync(rollout, `${rollout}.retired`);
+  fs.writeFileSync(rollout, opening);
+  qualify();
+  assert.equal(cache.revision, revision + 1, 'a replacement left the revision still');
 });
 
 test.each(['shared', 'derived'] as const)(

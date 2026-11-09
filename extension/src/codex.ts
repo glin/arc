@@ -195,6 +195,11 @@ function openingWithStat(
   return { ...meta, size: stat.size, mtimeMs: stat.mtimeMs, fileIdentity: { dev: stat.dev, ino: stat.ino } };
 }
 
+function openingFields(meta: CodexSessionMeta): Omit<CodexSessionMeta, 'size' | 'mtimeMs'> {
+  const { size: _size, mtimeMs: _mtimeMs, ...fields } = meta;
+  return fields;
+}
+
 // An opening saved without file identity keeps its fields when its recorded stat matches or is absent and the
 // file's first record still names its session.
 function legacyKeeps(legacy: CodexSessionMeta, stat: RolloutStat | null, read: CodexSessionMeta): boolean {
@@ -391,10 +396,11 @@ export class CodexMetaCache {
     return this.changed;
   }
   // Install an already qualified opening and notify the existing snapshot owner.
+  // A new size or modification time alone reaches the saved records at the next save.
   install(file: string, meta: CodexSessionMeta): void {
     const previous = this.entries.get(file)?.meta;
     this.entries.set(file, { meta });
-    if (!isDeepStrictEqual(previous, meta)) {
+    if (!previous || !isDeepStrictEqual(openingFields(previous), openingFields(meta))) {
       this.changed += 1;
     }
   }
