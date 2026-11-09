@@ -72,9 +72,11 @@ import { isAgentRun, isHiddenThread, staleMetas } from './codex.ts';
 import { arcHome } from './store.ts';
 import {
   COMPRESSED_FACTS_STORE,
+  COMPRESSED_FACTS_VERSION,
   COMPRESSED_OPENINGS_STORE,
   compressedPairKey,
   compressedTitleCurrent,
+  readCompressedStore,
   withKeptUndercount,
   adoptCompressedTwin,
   type CompressedAdoptionInput,
@@ -10473,6 +10475,47 @@ test('a stored entry keeps a row with a carried name across a version mismatch a
   provider.compressedFacts.set(twin, entry);
   provider.compressedRowsOf(walking([], [twin]), () => false);
   assert.equal(provider.compressedFacts.has(twin), false);
+});
+
+test('a facts version bump keeps the row and its carried name through the real store reader', async () => {
+  const harness = heldWalkHarness({ readRolloutStat, isHiddenThread, isAgentRun, compressedTitleCurrent }, [
+    'compressedRowsOf',
+    'compressedCarriedNameOf',
+    'compressedTitleOf',
+  ]);
+  const { provider } = harness;
+  const directory = path.join(harness.root, 'facts');
+  fs.mkdirSync(directory, { recursive: true });
+  const twin = path.join(harness.root, `rollout-${twinThread}.jsonl.zst`);
+  fs.writeFileSync(twin, 'x');
+  const stored = {
+    file: twin,
+    pairKey: twin.replace(/\.zst$/, ''),
+    threadId: twinThread,
+    factsVersion: COMPRESSED_FACTS_VERSION - 1,
+    title: { label: 'Carried', fullLabel: 'Carried', size: 1, mtimeMs: 1 },
+    opening: {
+      sessionId: twinThread,
+      cwd: 'c:/repo',
+      threadSource: null,
+      parentThreadId: null,
+      hasSubagentSource: false,
+      launchSource: null,
+      subagentKind: null,
+    },
+  };
+  fs.writeFileSync(path.join(directory, 'segment-1-holder-0'), `${JSON.stringify(stored)}\n`);
+  provider.compressedFacts = new Map(readCompressedStore(directory).entries);
+  const rows = provider.compressedRowsOf(
+    { walked: [], enumeration: { status: 'complete', files: [], uncertain: [], compressed: [twin] } },
+    () => true,
+  );
+  assert.deepEqual(
+    rows.map((row: SessionFile) => row.file),
+    [twin],
+    'a facts version bump removed the row',
+  );
+  assert.equal(provider.compressedCarriedNameOf(twin)?.label, 'Carried');
 });
 
 test('targeted reuse avoids the broad walk, and a failed reuse performs exactly one walk', async () => {

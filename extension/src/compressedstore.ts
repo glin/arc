@@ -331,6 +331,11 @@ function parseEntry(text: string): CompressedFactEntry | null {
   }
 }
 
+// A newer build's file stays untouched. An older version is a stale candidate that still carries names and spend.
+function readableFactsVersion(version: number | null): boolean {
+  return version === null || version <= COMPRESSED_FACTS_VERSION;
+}
+
 // The fact version of a store file, from its first complete line. Null when the file holds no complete line.
 function fileFactsVersion(file: string): number | null {
   let version: number | null = null;
@@ -416,7 +421,7 @@ function listDirectory(directory: string): string[] {
   }
 }
 
-// The files of this build's fact version. A manifest is valid when all its shards are present. A reader ignores a shard
+// The files that this build can read: its own fact version and older ones. A manifest is valid when all its shards are present. A reader ignores a shard
 // that no valid manifest names and skips an input that one names.
 function storeView(directory: string, names: readonly string[]): StoreView {
   const present = new Set(names);
@@ -428,11 +433,7 @@ function storeView(directory: string, names: readonly string[]): StoreView {
   const valid: StoreManifest[] = [];
   for (const stored of manifests) {
     const manifest = readManifest(directory, stored.name);
-    if (
-      manifest &&
-      manifest.factsVersion === COMPRESSED_FACTS_VERSION &&
-      manifest.shards.every((shard) => present.has(shard))
-    )
+    if (manifest && readableFactsVersion(manifest.factsVersion) && manifest.shards.every((shard) => present.has(shard)))
       valid.push(manifest);
   }
   valid.sort((left, right) => left.epoch - right.epoch || left.seq - right.seq);
@@ -451,7 +452,8 @@ export interface CompressedStoreRead {
   names: readonly string[];
 }
 
-// Merge the store's files into one entry per path. A file of another fact version is skipped.
+// Merge the store's files into one entry per path. A file or line of a newer fact version is skipped, and an older one
+// is a stale candidate.
 export function readCompressedStore(
   directory: string,
   statOf: (file: string) => { size: number; mtimeMs: number } | null = () => null,
@@ -461,10 +463,10 @@ export function readCompressedStore(
   const best = new Map<string, { ranked: RankedEntry; entry: CompressedFactEntry }>();
   let order = 0;
   for (const input of view.inputs) {
-    if (fileFactsVersion(path.join(directory, input.name)) !== COMPRESSED_FACTS_VERSION) continue;
+    if (!readableFactsVersion(fileFactsVersion(path.join(directory, input.name)))) continue;
     eachReadableLine(path.join(directory, input.name), (line, offset) => {
       const entry = parseEntry(line.toString('utf8'));
-      if (!entry) return;
+      if (!entry || !readableFactsVersion(entry.factsVersion)) return;
       const ranked: RankedEntry = {
         entry: rankFields(entry),
         epoch: input.epoch,
@@ -919,8 +921,8 @@ export class CompressedStoreHolder {
     for (const stored of view.manifests) {
       if (current && stored.name === this.manifestName(current)) continue;
       const manifest = readManifest(this.directory, stored.name);
-      // An unknown-version manifest belongs to a newer build.
-      if (manifest && manifest.factsVersion !== COMPRESSED_FACTS_VERSION) continue;
+      // A newer manifest belongs to a newer build.
+      if (manifest && !readableFactsVersion(manifest.factsVersion)) continue;
       this.remove(stored.name);
     }
     if (current) for (const input of current.inputs) this.remove(input);
@@ -965,8 +967,7 @@ export class CompressedStoreHolder {
   }
 
   private ownVersion(name: string): boolean {
-    const version = fileFactsVersion(path.join(this.directory, name));
-    return version === null || version === COMPRESSED_FACTS_VERSION;
+    return readableFactsVersion(fileFactsVersion(path.join(this.directory, name)));
   }
 
   private remove(name: string): void {
@@ -1026,7 +1027,7 @@ export class CompressedStoreHolder {
     for (const input of inputs) {
       this.readInputLines(input.name, (line, offset) => {
         const entry = parseEntry(line.toString('utf8'));
-        if (!entry) return;
+        if (!entry || !readableFactsVersion(entry.factsVersion)) return;
         const ranked: RankedEntry = {
           entry: rankFields(entry),
           epoch: input.epoch,
@@ -1094,7 +1095,7 @@ export class CompressedStoreHolder {
 
   private ownVersionManifest(name: string): boolean {
     const manifest = readManifest(this.directory, name);
-    return !manifest || manifest.factsVersion === COMPRESSED_FACTS_VERSION;
+    return !manifest || readableFactsVersion(manifest.factsVersion);
   }
 
   private releaseIfIdle(): void {

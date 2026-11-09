@@ -628,6 +628,40 @@ test('an input that cannot be read ends the compaction with every input kept', a
   holder.dispose();
 });
 
+test('an older fact version stays a readable stale candidate and a compaction folds it', async () => {
+  const { directory, clock, make, names } = storeFixture('store-older-version', {
+    segmentBytes: 64,
+    compactSegments: 2,
+  });
+  const older = {
+    ...entry('older.jsonl.zst', { carriedName: { label: 'Kept', fullLabel: 'Kept' } }),
+    factsVersion: COMPRESSED_FACTS_VERSION - 1,
+  };
+  const newer = { ...entry('newer.jsonl.zst'), factsVersion: COMPRESSED_FACTS_VERSION + 1 };
+  fs.writeFileSync(path.join(directory, 'segment-3-old-0'), `${JSON.stringify(older)}\n`);
+  fs.writeFileSync(path.join(directory, 'segment-3-new-0'), `${JSON.stringify(newer)}\n`);
+  const before = readCompressedStore(directory).entries;
+  assert.equal(before.get('older.jsonl.zst')?.carriedName?.label, 'Kept', 'an older fact version removed the entry');
+  assert.equal(before.has('newer.jsonl.zst'), false, 'a reader merged a newer fact version');
+  const holder = make();
+  await holder.append([entry('a.jsonl.zst')]);
+  await holder.append([entry('b.jsonl.zst')]);
+  clock.advance(1);
+  assert.ok(
+    names().some((name) => name.startsWith('manifest-')),
+    'the compaction did not run',
+  );
+  assert.equal(names().includes('segment-3-old-0'), false, 'the older input was left out of the compaction');
+  assert.ok(names().includes('segment-3-new-0'), 'a compaction took a newer file');
+  const after = readCompressedStore(directory).entries;
+  assert.equal(
+    after.get('older.jsonl.zst')?.factsVersion,
+    COMPRESSED_FACTS_VERSION - 1,
+    'the compaction dropped the older entry',
+  );
+  holder.dispose();
+});
+
 test('the idle holder releases its lock and the next append takes it again with a higher epoch', async () => {
   const { directory, clock, make } = storeFixture('store-idle');
   const holder = make();
