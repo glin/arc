@@ -17728,6 +17728,7 @@ test.each([
         'selection:renderPosted',
         'selection:renderReceived',
         'selection:painted',
+        'selection:replyArrived',
       ];
       assert.equal(timing.sessionId, 'claude-a');
       assert.equal(timing.window, window);

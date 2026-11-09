@@ -29,8 +29,8 @@ test('selection stamps and spans reach the capture and the diagnostic event name
     counters.startSelection(panel, 'selected', 'held', 100);
     assert.deepEqual(counters.selectionRender(panel, 'selected', 130), { id: 1, sessionId: 'selected' });
     assert.equal(counters.selectionRender(panel, 'selected', 135), undefined);
-    counters.selectionPaint(panel, { id: 1, sessionId: 'selected', receivedAt: 140, paintedAt: 160 });
-    counters.selectionPaint(panel, { id: 1, sessionId: 'selected', receivedAt: 140, paintedAt: 170 });
+    counters.selectionPaint(panel, { id: 1, sessionId: 'selected', receivedAt: 140, paintedAt: 160 }, 200);
+    counters.selectionPaint(panel, { id: 1, sessionId: 'selected', receivedAt: 140, paintedAt: 170 }, 210);
     const snapshot = counters.snapshot();
     assert.deepEqual(snapshot.selections[0], {
       id: 1,
@@ -42,8 +42,16 @@ test('selection stamps and spans reach the capture and the diagnostic event name
         'selection:renderPosted': 130,
         'selection:renderReceived': 140,
         'selection:painted': 160,
+        'selection:replyArrived': 200,
       },
-      spans: { 'selection:hostMs': 30, 'selection:transportMs': 10, 'selection:renderMs': 20, 'selection:totalMs': 60 },
+      spans: {
+        'selection:hostMs': 30,
+        'selection:transportMs': 10,
+        'selection:renderMs': 20,
+        'selection:totalMs': 100,
+        'selection:roundTripMs': 50,
+        'selection:hostToPaintMs': 60,
+      },
     });
     const saved = projectPerformanceDiagnostics(state(snapshot)) as { counters: { selections: unknown } };
     assert.deepEqual(saved.counters.selections, snapshot.selections);
@@ -73,15 +81,18 @@ test('abandoned selections preserve reached stamps and reject stale or wrong-pan
     counters.selectionPaint({}, { id: 2, sessionId: 'second', receivedAt: 130, paintedAt: 140 });
     counters.selectionPaint(panel, { id: 1, sessionId: 'first', receivedAt: 130, paintedAt: 140 });
     counters.selectionPaint(panel, { id: 2, sessionId: 'wrong', receivedAt: 130, paintedAt: 140 });
-    counters.selectionPaint(panel, { id: 2, sessionId: 'second', receivedAt: 130, reason: 'replaced' });
+    counters.selectionPaint(panel, { id: 2, sessionId: 'second', receivedAt: 130, reason: 'replaced' }, 150);
     const result = counters.snapshot().selections[1];
     assert.equal(result.reason, 'replaced');
     assert.deepEqual(result.stamps, {
       'selection:hostArrived': 110,
       'selection:renderPosted': 120,
       'selection:renderReceived': 130,
+      'selection:replyArrived': 150,
     });
-    assert.equal(result.spans['selection:totalMs'], null);
+    assert.equal(result.spans['selection:totalMs'], 40);
+    assert.equal(result.spans['selection:roundTripMs'], null);
+    assert.equal(result.spans['selection:hostToPaintMs'], null);
     assert.equal(result.spans['selection:hostMs'], 10);
   } finally {
     counters.dispose();

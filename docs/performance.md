@@ -110,17 +110,23 @@ Read `panelAdopted` before comparing startups. `created` means command-opened, `
 
 `selection:painted` marks settled transcript content after two animation frames, without establishing compositor presentation.
 
+`selection:replyArrived` marks the arrival of the webview's reply at the host.
+
 `selection:hostMs` spans host arrival to render post.
 
 `selection:transportMs` spans render post to webview receipt.
 
 `selection:renderMs` spans webview receipt to paint acknowledgment.
 
-`selection:totalMs` spans host arrival to paint acknowledgment, excluding the click's transport to the host.
+`selection:totalMs` spans host arrival to reply arrival on the host clock, excluding the click's transport to the host.
+
+`selection:roundTripMs` is the render post to reply arrival time minus the webview's receipt to paint time, which leaves the transport of the render and the reply.
+
+`selection:hostToPaintMs` spans host arrival to paint acknowledgment.
 
 The capture's `counters.selections` table retains the latest 64 switches with their session ID, reached stamps, spans, and abandonment reason. Missing endpoints produce null spans. `window` records `held` when selection finds a current uncompressed transcript window in the accepted catalog or the held catalog, or `read` when it requires a window read. Each stamp also increments its named `work` counter and reaches the detailed diagnostics log under that name. Abandonment emits `selection:abandoned` with the reached stamps and reason.
 
-Host and webview stamps use `performance.timeOrigin + performance.now()` in epoch milliseconds. Cross-process clock offsets affect transport and total spans. Host and webview internal spans each use one clock. One webview reply carries receipt and paint, or receipt and an abandonment reason. A paint wait that stays unsettled for 240 animation frames ends with `unsettled`. A timed render that the webview cannot apply to its session rows ends with `rows-gap`, because its replacement snapshot carries no timing identity. Selection timing adds no render or timer. Supersession, read failure, unavailable sessions, drafts, hidden panels, document replacement, scope changes, failed posts, and disposal end pending measurements. A late reply adds its receipt and paint stamps to the retained switch. It keeps the switch's abandonment reason, emits no second `selection:abandoned`, and leaves a newer selection pending.
+Host and webview stamps use `performance.timeOrigin + performance.now()` in epoch milliseconds. Cross-process clock offsets affect `selection:transportMs` and `selection:hostToPaintMs`. `selection:totalMs` and `selection:roundTripMs` subtract times of one clock, so the offset does not affect them. Host and webview internal spans each use one clock. One webview reply carries receipt and paint, or receipt and an abandonment reason. A paint wait that stays unsettled for 240 animation frames ends with `unsettled`. A timed render that the webview cannot apply to its session rows ends with `rows-gap`, because its replacement snapshot carries no timing identity. Selection timing adds no render or timer. Supersession, read failure, unavailable sessions, drafts, hidden panels, document replacement, scope changes, failed posts, and disposal end pending measurements. A late reply adds its receipt and paint stamps to the retained switch. It keeps the switch's abandonment reason, emits no second `selection:abandoned`, and leaves a newer selection pending.
 
 ### Startup measurement
 

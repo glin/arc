@@ -84,7 +84,11 @@ export interface SelectionTiming {
   window: 'held' | 'read';
   stamps: Partial<
     Record<
-      'selection:hostArrived' | 'selection:renderPosted' | 'selection:renderReceived' | 'selection:painted',
+      | 'selection:hostArrived'
+      | 'selection:renderPosted'
+      | 'selection:renderReceived'
+      | 'selection:painted'
+      | 'selection:replyArrived',
       number
     >
   >;
@@ -98,6 +102,8 @@ function selectionSnapshot(timing: SelectionTiming) {
     const end = stamps[to];
     return start === undefined || end === undefined ? null : end - start;
   };
+  const replyWait = span('selection:renderPosted', 'selection:replyArrived');
+  const webviewWork = span('selection:renderReceived', 'selection:painted');
   return {
     ...timing,
     stamps,
@@ -105,7 +111,9 @@ function selectionSnapshot(timing: SelectionTiming) {
       'selection:hostMs': span('selection:hostArrived', 'selection:renderPosted'),
       'selection:transportMs': span('selection:renderPosted', 'selection:renderReceived'),
       'selection:renderMs': span('selection:renderReceived', 'selection:painted'),
-      'selection:totalMs': span('selection:hostArrived', 'selection:painted'),
+      'selection:totalMs': span('selection:hostArrived', 'selection:replyArrived'),
+      'selection:roundTripMs': replyWait === null || webviewWork === null ? null : replyWait - webviewWork,
+      'selection:hostToPaintMs': span('selection:hostArrived', 'selection:painted'),
     },
   };
 }
@@ -554,6 +562,7 @@ export class PanelPerformanceCounters {
       paintedAt?: number;
       reason?: string;
     },
+    replyArrivedAt = performance.timeOrigin + performance.now(),
   ): void {
     const timing = this.selectionTimings.find(
       (entry) => entry.id === message.id && this.selectionPanels.get(entry) === panel,
@@ -573,6 +582,7 @@ export class PanelPerformanceCounters {
       return;
     this.selectionStamp(timing, 'selection:renderReceived', message.receivedAt);
     if (message.paintedAt !== undefined) this.selectionStamp(timing, 'selection:painted', message.paintedAt);
+    this.selectionStamp(timing, 'selection:replyArrived', replyArrivedAt);
     if (timing.reason) return;
     if (message.paintedAt !== undefined) this.pendingSelections.delete(panel);
     else if (message.reason) this.abandonSelection(panel, message.reason, timing.id);
