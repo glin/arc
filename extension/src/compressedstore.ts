@@ -741,6 +741,8 @@ export interface CompressedStoreOptions {
   fault?: (point: string) => void;
   // Opens a compaction input for reading.
   openInput?: (file: string) => number;
+  // True when the named segment file still exists.
+  segmentPresent?: (file: string) => boolean;
 }
 
 // A compaction input could not be read. The compaction ends and retires nothing.
@@ -768,6 +770,7 @@ export class CompressedStoreHolder {
   // True after the fault hook of a test threw, so the holder stops as a crashed holder does.
   private faulted = false;
   private readonly openInput: (file: string) => number;
+  private readonly segmentPresent: (file: string) => boolean;
   private readonly segmentBytes: number;
   private readonly compactSegments: number;
 
@@ -808,6 +811,7 @@ export class CompressedStoreHolder {
     this.wrote = options.wrote ?? (() => {});
     this.faultHook = options.fault ?? (() => {});
     this.openInput = options.openInput ?? openForRead;
+    this.segmentPresent = options.segmentPresent ?? fs.existsSync;
     this.lastCompaction = this.now();
     this.segmentBytes = options.segmentBytes ?? SEGMENT_BYTES;
     this.compactSegments = options.compactSegments ?? COMPACT_SEGMENTS;
@@ -1075,6 +1079,7 @@ export class CompressedStoreHolder {
       taken++;
     }
     if (!this.check()) return false;
+    this.fault('segment:checked');
     if (oversized) this.closeSegment();
     const segment = this.open ?? this.openSegment();
     fs.writeSync(segment.fd, lines.join(''));
@@ -1082,10 +1087,20 @@ export class CompressedStoreHolder {
     segment.bytes += bytes;
     this.wrote(bytes);
     this.fault('segment:flushed');
+    if (!this.flushReachedStore(segment)) return false;
     for (const flushed of this.queue.splice(0, taken)) this.flushed.add(flushed);
     this.settleWaiters();
     if (oversized || segment.bytes >= this.segmentBytes) this.closeSegment();
     return true;
+  }
+
+  // A holder paused since its publish check can write through the descriptor of a segment that a new holder compacted
+  // and deleted. Its line is then in no store file, so the entries stay queued.
+  private flushReachedStore(segment: OpenSegment): boolean {
+    if (!this.check()) return false;
+    if (this.segmentPresent(path.join(this.directory, segment.name))) return true;
+    this.abandon();
+    return false;
   }
 
   private settleWaiters(): void {

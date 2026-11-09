@@ -144,7 +144,13 @@ test('the merge ranks the current fact version, then an equal stat, then the lat
   });
   assert.ok(compareRankedEntries(current, old, stat) > 0, 'an older fact version ranked first');
   const equal = ranked({
-    entry: { file: 'x', pairKey: 'x', factsVersion: COMPRESSED_FACTS_VERSION, size: 10, mtimeMs: 5 },
+    entry: {
+      file: 'x',
+      pairKey: 'x',
+      factsVersion: COMPRESSED_FACTS_VERSION,
+      size: 10,
+      mtimeMs: 5,
+    },
   });
   const newer = ranked({
     entry: { file: 'x', pairKey: 'x', factsVersion: COMPRESSED_FACTS_VERSION, size: 9, mtimeMs: 6 },
@@ -326,7 +332,9 @@ test('an overwritten epoch makes the holder abandon at the next publish and resu
 });
 
 test('a takeover through a removed lock fences the old holder, and no entry is lost', async () => {
-  const { directory, clock, make, names } = storeFixture('store-takeover-removed', { segmentBytes: 256 });
+  const { directory, clock, make, names } = storeFixture('store-takeover-removed', {
+    segmentBytes: 256,
+  });
   const first = make();
   await first.append([entry('a.jsonl.zst')]);
   fs.rmSync(path.join(directory, STORE_LOCK));
@@ -368,7 +376,10 @@ test('a record of 5 MiB gets a segment of its own and drops its title entry', as
 });
 
 test('compaction at the closed segment count folds segments into shards and keeps the listing bound', async () => {
-  const { directory, make, names } = storeFixture('store-compact', { segmentBytes: 64, compactSegments: 8 });
+  const { directory, make, names } = storeFixture('store-compact', {
+    segmentBytes: 64,
+    compactSegments: 8,
+  });
   const holder = make();
   const entries = Array.from({ length: 40 }, (_, at) => entry(`rollout-${at}.jsonl.zst`));
   for (const single of entries) await holder.append([single]);
@@ -492,7 +503,10 @@ test('a takeover after a worker thread exited under a running host deletes its t
 });
 
 test('recovery deletes unnamed shards and the older manifest and never touches an unknown-version file', async () => {
-  const { directory, clock, make, names } = storeFixture('store-recovery', { segmentBytes: 64, compactSegments: 3 });
+  const { directory, clock, make, names } = storeFixture('store-recovery', {
+    segmentBytes: 64,
+    compactSegments: 3,
+  });
   const holder = make();
   for (const at of [1, 2, 3]) await holder.append([entry(`r${at}.jsonl.zst`)]);
   const lockFile = path.join(directory, STORE_LOCK);
@@ -526,7 +540,10 @@ test('recovery deletes unnamed shards and the older manifest and never touches a
 });
 
 test('a reader ignores a shard that no valid manifest names and skips an input that one names', async () => {
-  const { directory, make, names } = storeFixture('store-validity', { segmentBytes: 64, compactSegments: 3 });
+  const { directory, make, names } = storeFixture('store-validity', {
+    segmentBytes: 64,
+    compactSegments: 3,
+  });
   const holder = make();
   for (const at of [1, 2, 3]) await holder.append([entry(`r${at}.jsonl.zst`)]);
   holder.dispose();
@@ -548,7 +565,10 @@ test('a reader ignores a shard that no valid manifest names and skips an input t
 });
 
 test('a compactor paused past its lease retires no input, so a takeover loses no entry', async () => {
-  const { directory, clock, make } = storeFixture('store-paused-compactor', { segmentBytes: 64, compactSegments: 4 });
+  const { directory, clock, make } = storeFixture('store-paused-compactor', {
+    segmentBytes: 64,
+    compactSegments: 4,
+  });
   const lock = path.join(directory, STORE_LOCK);
   const second = make();
   const takeovers: Promise<unknown>[] = [];
@@ -577,8 +597,83 @@ test('a compactor paused past its lease retires no input, so a takeover loses no
   second.dispose();
 });
 
+// What a holder reads for the name of a segment it still has open, after another holder removed the file.
+const SEGMENT_REMOVALS = [
+  ['linux', 'an unlink removes the name', false],
+  ['darwin', 'an unlink removes the name', false],
+  ['win32', 'a delete-pending file reads as absent', false],
+  ['win32', 'a refused delete keeps the name', true],
+] as const;
+
+// A holder pauses before its write of one entry, then retries. The outcome holds what the holder and the store report.
+async function pausedWriteOutcome(name: string, present: boolean, pause: (segment: string, directory: string) => void) {
+  let paused: string | null = null;
+  let armed = false;
+  const { directory, clock, make, names } = storeFixture(name, { compactSegments: 99 });
+  const holder = make({
+    segmentPresent: (file) => present || path.basename(file) !== paused,
+    fault: (at) => {
+      if (at !== 'segment:checked' || !armed) return;
+      armed = false;
+      paused = names().find((stored) => stored.startsWith('segment-'))!;
+      pause(paused, directory);
+    },
+  });
+  await holder.append([entry('a.jsonl.zst')]);
+  armed = true;
+  const late = entry('b.jsonl.zst');
+  const written = await holder.append([late]);
+  const queued = holder.pending;
+  const held = holder.held;
+  fs.rmSync(path.join(directory, STORE_LOCK), { force: true });
+  clock.advance(5_000);
+  await holder.work();
+  await vi.waitFor(() => assert.equal(holder.pending, 0));
+  const durable = await holder.durable([late]);
+  const stored = readCompressedStore(directory).entries.has('b.jsonl.zst');
+  holder.dispose();
+  return { written, queued, held, durable, stored };
+}
+
+const REQUEUED = { written: [false], queued: 1, held: false, durable: true, stored: true };
+
+// Another holder takes the lease, folds the open segment into a shard and retires it.
+function compactAsNewHolder(segment: string, directory: string) {
+  const token = 'new-holder';
+  fs.writeFileSync(path.join(directory, STORE_LOCK), token);
+  fs.writeFileSync(path.join(directory, 'epoch'), JSON.stringify({ e: 9, token }));
+  fs.copyFileSync(path.join(directory, segment), path.join(directory, 'shard-9-new-holder-0'));
+  fs.writeFileSync(
+    path.join(directory, 'manifest-9-new-holder-1'),
+    JSON.stringify({
+      factsVersion: COMPRESSED_FACTS_VERSION,
+      epoch: 9,
+      token,
+      seq: 1,
+      shards: ['shard-9-new-holder-0'],
+      inputs: [segment],
+    }),
+  );
+}
+
+for (const [platform, removal, present] of SEGMENT_REMOVALS) {
+  test(`a takeover during a paused write keeps the entry queued (${platform}, ${removal})`, async () => {
+    const name = `store-paused-takeover-${platform}-${present}`;
+    assert.deepEqual(await pausedWriteOutcome(name, present, compactAsNewHolder), REQUEUED);
+  });
+}
+
+for (const [platform, removal] of SEGMENT_REMOVALS.filter(([, , present]) => !present)) {
+  test(`a segment removed during a paused write keeps the entry queued under a held lease (${platform}, ${removal})`, async () => {
+    assert.deepEqual(await pausedWriteOutcome(`store-paused-removed-${platform}`, false, () => {}), REQUEUED);
+  });
+}
+
 test('a compaction whose named shard is gone retires no input', async () => {
-  const { directory, make, names } = storeFixture('store-shard-gone', { segmentBytes: 64, compactSegments: 3 });
+  const { directory, make, names } = storeFixture('store-shard-gone', {
+    segmentBytes: 64,
+    compactSegments: 3,
+  });
   const holder = make({
     fault: (at) => {
       if (at !== 'compact:manifest-saved') return;
@@ -754,7 +849,10 @@ test('a failed epoch write abandons instead of wedging the holder, and the retry
 });
 
 test('unknown-version segments do not count toward the compaction roll at a takeover', async () => {
-  const { directory, make, names } = storeFixture('store-roll-newer', { segmentBytes: 64, compactSegments: 2 });
+  const { directory, make, names } = storeFixture('store-roll-newer', {
+    segmentBytes: 64,
+    compactSegments: 2,
+  });
   const newer = { ...entry('newer.jsonl.zst'), factsVersion: COMPRESSED_FACTS_VERSION + 1 };
   fs.writeFileSync(path.join(directory, 'segment-5-newer-0'), `${JSON.stringify(newer)}\n`);
   fs.writeFileSync(path.join(directory, 'segment-5-newer-1'), `${JSON.stringify(newer)}\n`);
@@ -858,7 +956,10 @@ test('a stepped read of the store yields after every file', async () => {
 });
 
 test('a follower reads only the bytes appended since its last poll and a compaction repeats no entry', async () => {
-  const { directory, clock, make, names } = storeFixture('store-follow', { segmentBytes: 4096, compactSegments: 99 });
+  const { directory, clock, make, names } = storeFixture('store-follow', {
+    segmentBytes: 4096,
+    compactSegments: 99,
+  });
   const first = make();
   await first.append([entry('a.jsonl.zst')]);
   const follower = new CompressedStoreFollower(
@@ -983,7 +1084,11 @@ function twinFixture(name: string, firstLine: string, plainThread = THREAD) {
   const twin = `${plain}.zst`;
   fs.writeFileSync(twin, encode!(Buffer.from(firstLine)));
   const stat = fs.statSync(twin, { bigint: true });
-  return { plain, twin, mtimeMs: Number(stat.mtimeNs / 1_000_000n) + Number(stat.mtimeNs % 1_000_000n) / 1_000_000 };
+  return {
+    plain,
+    twin,
+    mtimeMs: Number(stat.mtimeNs / 1_000_000n) + Number(stat.mtimeNs % 1_000_000n) / 1_000_000,
+  };
 }
 
 const opening = (id: string) =>
@@ -993,7 +1098,12 @@ const completeSpend = { file: 'x', complete: true, buckets: [] } as unknown as S
 
 test.skipIf(!encode)('an adopted twin takes the plain title, opening and spend record with a hash', async () => {
   const { plain, twin, mtimeMs } = twinFixture('adopt-ok', opening(THREAD));
-  const title = { label: 'Work', fullLabel: 'Work', mtimeMs, size: 12 } as CompressedFactEntry['title'];
+  const title = {
+    label: 'Work',
+    fullLabel: 'Work',
+    mtimeMs,
+    size: 12,
+  } as CompressedFactEntry['title'];
   const { adopted, entry: taken } = await adoptCompressedTwin({
     twin,
     plain,
@@ -1024,7 +1134,12 @@ for (const [name, firstLine, plainThread, mtimeShift, spendRecord] of [
       twin,
       plain,
       plainMtimeMs: mtimeMs + mtimeShift,
-      title: { label: 'Work', fullLabel: 'Work', mtimeMs, size: 12 } as CompressedFactEntry['title'],
+      title: {
+        label: 'Work',
+        fullLabel: 'Work',
+        mtimeMs,
+        size: 12,
+      } as CompressedFactEntry['title'],
       opening: meta(plainThread),
       spend: spendRecord,
     });
