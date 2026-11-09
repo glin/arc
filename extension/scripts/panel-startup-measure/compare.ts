@@ -56,6 +56,10 @@ const COUNTS = new Set([
   'continuations',
   'dispatchSpendVisits',
   'dispatchSpendRootRestarts',
+  'receiptChecks',
+  'receiptLaunchesRead',
+  'receiptLaunchesRejectedAtRequester',
+  'receiptScanTurns',
   'catalogWalks',
   'compressedRows',
   'compressedDecodes',
@@ -73,6 +77,10 @@ export const REPORT_ONLY = new Set([
   'compressedStoreWriteBytes',
   'compressedStoreBytes',
   'refreshCount:compressed-facts',
+  'receiptChecks',
+  'receiptLaunchesRead',
+  'receiptLaunchesRejectedAtRequester',
+  'receiptScanTurns',
 ]);
 export const REPORT_ONLY_PREFIXES = [
   'refreshMs:',

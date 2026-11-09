@@ -329,6 +329,10 @@ export function soakMeasures(snapshot: {
     'dispatchSpendVisits',
     'dispatchSpendBytes',
     'dispatchSpendRootRestarts',
+    'receiptChecks',
+    'receiptLaunchesRead',
+    'receiptLaunchesRejectedAtRequester',
+    'receiptScanTurns',
   ])
     if (typeof discovery[name] === 'number') out[name] = discovery[name];
   for (const [reason, counts] of Object.entries(snapshot.counters?.refreshes ?? {})) {

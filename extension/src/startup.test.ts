@@ -2126,6 +2126,25 @@ test('the opening read counts of a saved snapshot reach the report and never fai
   assert.equal(measuresOf(held).get('openingsRead:children')?.value, 9);
 });
 
+test('the receipt scan counters reach the report as count rows and an older baseline reads not reported', () => {
+  const candidate = {
+    receiptChecks: 83469,
+    receiptLaunchesRead: 12,
+    receiptLaunchesRejectedAtRequester: 40,
+    receiptScanTurns: 2100,
+  };
+  const measures = soakMeasures({ counters: { discovery: candidate } });
+  const older = soakMeasures({ counters: { discovery: { publications: 1 } } });
+  const report = compareResults([runnerResult(older)], [runnerResult(measures)]);
+  const table = markdownTable(report, 'baseline', 'candidate');
+  for (const [name, value] of Object.entries(candidate)) {
+    const row = report.find((measure) => measure.name === name);
+    assert.ok(row, `the report has no ${name} row`);
+    assert.deepEqual([row.kind, row.baseline, row.reportOnly, row.regressed], ['count', null, true, false], name);
+    assert.ok(table.includes(`| ${name} | not reported | ${value} | n/a | report only | reported |`), name);
+  }
+});
+
 test('a launch whose readers read nothing reports 0 for every source, and an older build reports none', async () => {
   const { provider } = bumpedCatalogHarness();
   provider.performanceCounters = new PanelPerformanceCounters();
