@@ -205,7 +205,8 @@ import { RepositoryCommits } from './gitcommits.ts';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { tempDir } from './temproot.ts';
 import type { BackwardRangeReader, TurnAgent } from './transcript.ts';
-import type { CodexSubagentFile } from './codex.ts';
+import type { CodexSessionMeta, CodexSubagentFile, RolloutStat } from './codex.ts';
+import { PanelPerformanceCounters } from './performancediagnostics.ts';
 import { childFileTotals } from './childartifacts.ts';
 import { AgentSpendCache, childSpendRevisionKey, readChildSpend, spendFileVersion } from './agentspend.ts';
 import {
@@ -15916,6 +15917,152 @@ test('a malformed rollout head is not read again while its file stays still', ()
   assert.equal(reads, 2);
 });
 
+test('a saved Codex opening lists the replacement session at the next listing and counts its read', () => {
+  const root = sessionsRoot([{ day: '2026/08/25', name: ROLLOUT(UUID_A), records: [meta({ id: UUID_A })] }]);
+  const file = rolloutFiles(root)[0];
+  const clock = new Date('2030-01-01T00:00:00Z');
+  fs.utimesSync(file, clock, clock);
+  const cache = new CodexMetaCache(undefined, undefined, undefined, () => assert.fail('listing repeats its stat'));
+  const counters = new PanelPerformanceCounters();
+  const list = () =>
+    codexSessionFiles(root, ['c:/repo', 'c:/next'], (file, stat) =>
+      cache.get(file, () => counters.recordWork('openingsRead:codex'), stat()),
+    );
+  assert.equal(list().sessions[0].sessionId, UUID_A);
+  const saved = cache.snapshot();
+  cache.load(saved);
+  fs.renameSync(file, `${file}.retired`);
+  fs.writeFileSync(file, JSON.stringify(meta({ id: UUID_B, cwd: 'c:\\next' })) + '\n');
+  fs.utimesSync(file, clock, clock);
+  assert.equal(fs.statSync(file).size, saved[0][1].size);
+  const replacement = list().sessions[0];
+  assert.equal(replacement.sessionId, UUID_B);
+  assert.equal(replacement.cwd, 'c:\\next');
+  assert.equal(counters.snapshot().work['openingsRead:codex'], 2);
+});
+
+test.each([
+  { platform: 'win32', dev: '4', ino: undefined, identityReads: 0, backwardsReads: 1 },
+  { platform: 'darwin', dev: '5', ino: '11', identityReads: 1, backwardsReads: 0 },
+  { platform: 'linux', dev: '6', ino: '12', identityReads: 1, backwardsReads: 0 },
+])('saved Codex openings follow the $platform file identity', ({ dev, ino, identityReads, backwardsReads }) => {
+  const root = sessionsRoot([{ day: '2026/08/25', name: ROLLOUT(UUID_A), records: [meta({ id: UUID_A })] }]);
+  const file = rolloutFiles(root)[0];
+  const opening = readCodexSessionMeta(file)!;
+  const initial: RolloutStat = { size: 1000, mtimeMs: 2000, dev, ino, isFile: true };
+  const cases = [
+    { name: 'unchanged', stat: initial, reads: 0 },
+    { name: 'append', stat: { ...initial, size: 1100, mtimeMs: 2100 }, reads: 0 },
+    { name: 'shrink', stat: { ...initial, size: 900 }, reads: 1 },
+    { name: 'same-size rewrite', stat: { ...initial, mtimeMs: 2100 }, reads: 1 },
+    { name: 'changed device', stat: { ...initial, dev: '9' }, reads: identityReads },
+    { name: 'changed inode', stat: { ...initial, ino: ino === undefined ? undefined : '99' }, reads: identityReads },
+    {
+      name: 'backwards modification time with growth',
+      stat: { ...initial, size: 1100, mtimeMs: 1900 },
+      reads: backwardsReads,
+    },
+  ];
+  for (const { name, stat, reads } of cases) {
+    let read = 0;
+    const cache = new CodexMetaCache((_file, onRead) => {
+      read++;
+      onRead?.();
+      return {
+        ...opening,
+        sessionId: UUID_B,
+        size: stat.size,
+        mtimeMs: stat.mtimeMs,
+        fileIdentity: { dev: stat.dev, ino: stat.ino },
+      };
+    });
+    cache.load([[file, { ...opening, size: initial.size, mtimeMs: initial.mtimeMs, fileIdentity: { dev, ino } }]]);
+    const list = () =>
+      codexSessionFiles(
+        root,
+        ['c:/repo'],
+        (file, current) => cache.get(file, undefined, current()),
+        () => stat,
+      );
+    assert.equal(list().sessions[0].sessionId, reads ? UUID_B : UUID_A, name);
+    assert.equal(read, reads, name);
+    const held = cache.snapshot()[0][1];
+    assert.equal(held.size, stat.size, name);
+    assert.equal(held.mtimeMs, stat.mtimeMs, name);
+    assert.equal(list().sessions[0].sessionId, reads ? UUID_B : UUID_A, name);
+    assert.equal(read, reads, `${name} reads an unchanged opening again`);
+  }
+});
+
+test.each(['win32', 'darwin', 'linux'] as const)('a legacy Codex opening adopts matching stats on %s', (platform) => {
+  const root = sessionsRoot([{ day: '2026/08/25', name: ROLLOUT(UUID_A), records: [meta({ id: UUID_A })] }]);
+  const file = rolloutFiles(root)[0];
+  const { fileIdentity: _fileIdentity, ...legacy } = readCodexSessionMeta(file)!;
+  const stat: RolloutStat = {
+    size: legacy.size!,
+    mtimeMs: legacy.mtimeMs!,
+    dev: '7',
+    ino: platform === 'win32' ? undefined : '13',
+    isFile: true,
+  };
+  for (const difference of ['none', 'growth', 'shrink', 'mtimeMs', 'missing stat'] as const) {
+    let reads = 0;
+    const cache = new CodexMetaCache(() => {
+      reads++;
+      return {
+        ...legacy,
+        sessionId: UUID_B,
+        size: stat.size,
+        mtimeMs: stat.mtimeMs,
+        fileIdentity: { dev: stat.dev, ino: stat.ino },
+      };
+    });
+    const saved: CodexSessionMeta = { ...legacy };
+    if (difference === 'shrink') saved.size! += 1;
+    if (difference === 'growth') saved.size! -= 1;
+    if (difference === 'mtimeMs') saved.mtimeMs! -= 1;
+    if (difference === 'missing stat') {
+      delete saved.size;
+      delete saved.mtimeMs;
+    }
+    cache.load([[file, saved]]);
+    const list = () =>
+      codexSessionFiles(
+        root,
+        ['c:/repo'],
+        (file, current) => cache.get(file, undefined, current()),
+        () => stat,
+      );
+    const expectedReads = difference === 'none' ? 0 : 1;
+    assert.equal(list().sessions[0].sessionId, expectedReads ? UUID_B : UUID_A, difference);
+    assert.equal(reads, expectedReads, difference);
+    assert.equal(cache.snapshot()[0][1].fileIdentity?.dev, stat.dev, difference);
+    assert.equal(cache.snapshot()[0][1].fileIdentity?.ino, stat.ino, difference);
+  }
+});
+
+test('the cold opening pass reads a replaced rollout and keeps an appended rollout', async () => {
+  const root = sessionsRoot([{ day: '2026/08/25', name: ROLLOUT(UUID_A), records: [meta({ id: UUID_A })] }]);
+  const file = rolloutFiles(root)[0];
+  const cache = new CodexMetaCache();
+  assert.equal((await coldOpeningPass(cache, root)).read, true);
+  fs.appendFileSync(file, '{}\n');
+  assert.equal((await coldOpeningPass(cache, root)).read, false, 'append reads the opening again');
+  assert.equal(cache.get(file)?.sessionId, UUID_A);
+  let reads = 0;
+  const read = (file: string, buf: Buffer) => {
+    reads++;
+    return readCodexSessionMetaAsync(file, buf);
+  };
+  await cache.prime([file], read);
+  assert.equal(reads, 0, 'prime reads an unchanged opening');
+  fs.renameSync(file, `${file}.retired`);
+  fs.writeFileSync(file, JSON.stringify(meta({ id: UUID_B })) + '\n');
+  await cache.prime([file], read);
+  assert.equal(reads, 1, 'prime keeps a replaced opening');
+  assert.equal(cache.get(file)?.sessionId, UUID_B);
+});
+
 test('Codex metadata cache hydrates and snapshots only positive opening records', () => {
   const valid = writeRollout([meta()]);
   const invalid = writeRollout([{ type: 'not_session_meta' }]);
@@ -15972,7 +16119,12 @@ test('a cold opening pass reads up to its bound at once and never more', async (
   const waiting: (() => void)[] = [];
   let open = 0;
   let most = 0;
-  const cache = new CodexMetaCache(() => assert.fail('a file the pass read was read again on the main thread'));
+  const cache = new CodexMetaCache(
+    () => assert.fail('a file the pass read was read again on the main thread'),
+    undefined,
+    undefined,
+    () => ({ size: opening.size!, mtimeMs: opening.mtimeMs!, ...opening.fileIdentity, isFile: true }),
+  );
   const done = cache.prime(
     files,
     (file) => {
@@ -16289,7 +16441,7 @@ test('the cold pass walks the rollout tree once, and the listing lists from its 
   assert.equal((await coldOpeningPass(cache, root)).read, false, 'a warm pass reported rows it did not read');
 });
 
-test('a valid opening record is read before any stat', () => {
+test('a valid opening record needs no missing-record size check', () => {
   const file = writeRollout([meta()]);
   let stats = 0;
   const cache = new CodexMetaCache(readCodexSessionMeta, () => {
@@ -16298,7 +16450,7 @@ test('a valid opening record is read before any stat', () => {
   });
   assert.equal(cache.get(file)?.cwd, 'c:\\repo');
   assert.equal(cache.get(file)?.cwd, 'c:\\repo');
-  assert.equal(stats, 0, 'a valid opening record does not stat an unrelated rollout');
+  assert.equal(stats, 0, 'a valid opening record requests no missing-record size check');
 });
 
 test('a turn that ran commands and recorded no patch may have changed something anyway', () => {

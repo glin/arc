@@ -1,6 +1,12 @@
 import type fs from 'node:fs';
 import type { FileRevision } from './transcript';
 
+export function fileIdentityValue(value: unknown, positive = false): boolean {
+  return typeof value === 'string'
+    ? (positive ? /^[1-9][0-9]*$/ : /^(0|[1-9][0-9]*)$/).test(value)
+    : typeof value === 'number' && Number.isSafeInteger(value) && (positive ? value > 0 : value >= 0);
+}
+
 export function revisionOf(stat: fs.Stats | fs.BigIntStats): FileRevision {
   const size =
     typeof stat.size === 'bigint'

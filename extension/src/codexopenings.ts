@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import * as path from 'node:path';
 import { writeFileAtomically } from './atomicfile';
 import type { CodexSessionMeta } from './codex';
+import { fileIdentityValue } from './filerevision';
 
 // CODEX_META_VERSION identifies stored opening fields and their derivation rules.
 // Loading drops rows with another version and rereads their rollout openings.
@@ -14,6 +15,7 @@ import type { CodexSessionMeta } from './codex';
 //
 // This version is independent of VERSION in derivedcache.ts.
 // A bump rereads every stored rollout opening on the machine.
+// File identity keeps this version: entries without it adopt matching size and modification time, or read the opening again.
 export const CODEX_META_VERSION = 4;
 
 // Unversioned opening rows use the derived session cache version below.
@@ -43,11 +45,21 @@ function nullableFinite(value: unknown): value is number | null {
   return value === null || (typeof value === 'number' && Number.isFinite(value));
 }
 
-// Validates required stored fields and the optional nativeSpawnedAt field.
+// Validates required stored fields and optional file stats and nativeSpawnedAt.
 // Invalid rows are dropped individually.
 export function isStoredCodexMeta(value: unknown): value is CodexSessionMeta {
   return (
     record(value) &&
+    ((value.size === undefined && value.mtimeMs === undefined) ||
+      (typeof value.size === 'number' &&
+        Number.isSafeInteger(value.size) &&
+        value.size >= 0 &&
+        typeof value.mtimeMs === 'number' &&
+        Number.isFinite(value.mtimeMs))) &&
+    (value.fileIdentity === undefined ||
+      (record(value.fileIdentity) &&
+        (value.fileIdentity.dev === undefined || fileIdentityValue(value.fileIdentity.dev)) &&
+        (value.fileIdentity.ino === undefined || fileIdentityValue(value.fileIdentity.ino)))) &&
     (value.sessionId === null || nonEmptyText(value.sessionId)) &&
     (value.cwd === null || nonEmptyText(value.cwd)) &&
     (value.modelProvider === null || nonEmptyText(value.modelProvider)) &&

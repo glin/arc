@@ -73,6 +73,7 @@ import {
   readTurnStartsFromTail,
   recordCommits,
   shortenTo,
+  supportedFileIdentity,
   tailOf,
   tallyToolName,
   activityIn,
@@ -152,8 +153,12 @@ export function codexSessionsRoot(): string {
 
 // Opening metadata identifies the session, workspace, launch source, and child relationships.
 // Read it from the first record without loading the full rollout.
-// Changes to persisted fields require a `CODEX_META_VERSION` change in `codexopenings.ts`.
+// Changes to opening derivation require a `CODEX_META_VERSION` change in `codexopenings.ts`.
 export interface CodexSessionMeta {
+  // The file stat captured by the opening read. Older entries lack these fields.
+  size?: number;
+  mtimeMs?: number;
+  fileIdentity?: { dev?: number | string; ino?: number | string };
   sessionId: string | null;
   cwd: string | null;
   modelProvider: string | null;
@@ -183,6 +188,13 @@ export interface CodexSessionMeta {
   hasSubagentSource: boolean;
 }
 
+function openingWithStat(
+  meta: CodexSessionMeta,
+  stat: Pick<RolloutStat, 'size' | 'mtimeMs' | 'dev' | 'ino'>,
+): CodexSessionMeta {
+  return { ...meta, size: stat.size, mtimeMs: stat.mtimeMs, fileIdentity: { dev: stat.dev, ino: stat.ino } };
+}
+
 // Default concurrency limit for opening reads in `CodexMetaCache.prime`.
 export const COLD_OPENING_READS = 8;
 
@@ -192,7 +204,7 @@ export const REFUSED_OPENING_RETRY_MS = 30_000;
 // Short retry interval after the first refused opening read.
 export const REFUSED_OPENING_FIRST_RETRY_MS = 1_000;
 
-// Readable openings stay cached until invalidation. An unreadable head gets one retry, then waits for file growth.
+// Readable openings stay cached while their file identity remains current. An unreadable head gets one retry, then waits for file growth.
 // Refused reads retain no size marker. They use the first retry interval, then the repeated-refusal interval.
 // The default clock is monotonic.
 export class CodexMetaCache {
@@ -208,15 +220,54 @@ export class CodexMetaCache {
     private readMeta: (file: string, onRead?: () => void) => CodexSessionMeta | null | undefined = readCodexOpening,
     private sizeOf: (file: string) => number | null = fileSize,
     private now: () => number = () => performance.now(),
+    private statOf: (file: string) => RolloutStat | null = readRolloutStat,
   ) {}
 
-  // A compressed rollout gets no opening read, and its name gets no entry. `onRead` runs once, before the first read of a file that opens.
-  get(file: string, onRead?: () => void): CodexSessionMeta | null {
-    if (isCompressedRollout(file)) return null;
-    const hit = this.entries.get(file);
-    if (hit?.meta) {
-      return hit.meta;
+  private current(file: string, stat: RolloutStat | null): CodexSessionMeta | null {
+    const meta = this.entries.get(file)?.meta;
+    if (!meta) return null;
+    const savedIdentity = supportedFileIdentity(meta.fileIdentity ?? {});
+    const currentIdentity = supportedFileIdentity(stat ?? {});
+    const physical = savedIdentity && currentIdentity;
+    const adopting = meta.fileIdentity === undefined || (!savedIdentity && currentIdentity);
+    const matches =
+      stat?.isFile &&
+      meta.size !== undefined &&
+      meta.mtimeMs !== undefined &&
+      (adopting
+        ? stat.size === meta.size && stat.mtimeMs === meta.mtimeMs
+        : stat.size >= meta.size &&
+          (physical
+            ? String(stat.dev) === String(meta.fileIdentity?.dev) &&
+              String(stat.ino) === String(meta.fileIdentity?.ino) &&
+              (stat.size > meta.size || stat.mtimeMs === meta.mtimeMs)
+            : !savedIdentity &&
+              stat.mtimeMs >= meta.mtimeMs &&
+              (stat.size > meta.size || stat.mtimeMs === meta.mtimeMs)));
+    if (!matches) {
+      this.delete(file);
+      return null;
     }
+    const { size, mtimeMs, dev, ino } = stat;
+    if (
+      meta.size === size &&
+      meta.mtimeMs === mtimeMs &&
+      meta.fileIdentity !== undefined &&
+      meta.fileIdentity.dev === dev &&
+      meta.fileIdentity.ino === ino
+    )
+      return meta;
+    this.install(file, openingWithStat(meta, stat));
+    return this.entries.get(file)!.meta!;
+  }
+
+  // A compressed rollout gets no opening read, and its name gets no entry. `onRead` runs once, before the first read of a file that opens.
+  get(file: string, onRead?: () => void, stat?: RolloutStat | null): CodexSessionMeta | null {
+    if (isCompressedRollout(file)) return null;
+    stat = stat === undefined ? this.statOf(file) : stat;
+    const current = this.current(file, stat);
+    if (current) return current;
+    const hit = this.entries.get(file);
     let size: number | null = null;
     if (hit && hit.meta === undefined) {
       // A clock value before the last attempt makes the retry due immediately.
@@ -224,7 +275,7 @@ export class CodexMetaCache {
       if (elapsed >= 0 && elapsed < hit.wait) {
         return null;
       }
-    } else if (hit) {
+    } else if (hit?.meta === null) {
       size = this.sizeOf(file);
       if (size === null || (hit.size !== null && hit.size === size)) {
         return null;
@@ -261,7 +312,12 @@ export class CodexMetaCache {
     sizeAsync: (file: string) => Promise<number | null> = fileSizeAsync,
     signal?: AbortSignal,
   ): Promise<boolean> {
-    const missing = files.filter((file) => !isCompressedRollout(file) && this.entries.get(file)?.meta === undefined);
+    const missing = files.filter(
+      (file) =>
+        !isCompressedRollout(file) &&
+        !this.current(file, this.statOf(file)) &&
+        this.entries.get(file)?.meta === undefined,
+    );
     const before = this.changed;
     let next = 0;
     const lane = async (): Promise<void> => {
@@ -401,12 +457,13 @@ function firstLineStep(buf: Buffer, have: number, read: number, want: number): s
 
 // Read the first line in growing windows up to `META_BYTES`. Decode only through its newline.
 // Accept an unterminated line when the file ends below the bound. Failed opens and reads throw.
-function firstLineOf(file: string, onRead?: () => void): string | null {
+function firstLineOf(file: string, onRead?: () => void): { line: string | null; revision: FileRevision } {
   let fd = -1;
   try {
     fd = fs.openSync(file, 'r');
+    const revision = revisionOf(fs.fstatSync(fd, { bigint: true }));
     onRead?.();
-    return firstLineFromDescriptor(file, fd);
+    return { line: firstLineFromDescriptor(file, fd), revision };
   } finally {
     if (fd >= 0) {
       try {
@@ -436,7 +493,7 @@ export function readQualifiedCodexOpening(
   file: string,
   onRead?: () => void,
 ): { value: CodexSessionMeta; revision: FileRevision } | null {
-  return readQualifiedOpening(
+  const opening = readQualifiedOpening(
     file,
     (fd) => {
       const meta = openingRecordOf(firstLineFromDescriptor(file, fd));
@@ -444,14 +501,16 @@ export function readQualifiedCodexOpening(
     },
     onRead,
   );
+  return opening ? { ...opening, value: openingWithStat(opening.value, opening.revision) } : null;
 }
 
 // Read the first line asynchronously. This read owns its `META_BYTES` buffer until settlement.
 // Failed opens and reads reject, distinguishing refusal from a head with no opening record.
-async function firstLineOfAsync(file: string, buf: Buffer): Promise<string | null> {
+async function firstLineOfAsync(file: string, buf: Buffer): Promise<{ line: string | null; revision: FileRevision }> {
   let handle: fs.promises.FileHandle | null = null;
   try {
     handle = await fs.promises.open(file, 'r');
+    const revision = revisionOf(await handle.stat({ bigint: true }));
     let have = 0;
     let window = FIRST_LINE_WINDOW;
     for (;;) {
@@ -459,7 +518,7 @@ async function firstLineOfAsync(file: string, buf: Buffer): Promise<string | nul
       const { bytesRead: read } = await handle.read(buf, have, want, have);
       const line = firstLineStep(buf, have, read, want);
       if (line !== undefined) {
-        return line;
+        return { line, revision };
       }
       have += read;
       window = Math.min(window * 2, META_BYTES);
@@ -472,13 +531,13 @@ async function firstLineOfAsync(file: string, buf: Buffer): Promise<string | nul
 // Returns opening metadata, null for a head without it, or undefined for a refused read.
 // Changes to persisted fields or their deriving helpers require a `CODEX_META_VERSION` change in `codexopenings.ts`.
 function readCodexOpeningRecord(file: string, onRead?: () => void): CodexSessionMeta | null | undefined {
-  let line: string | null;
   try {
-    line = firstLineOf(file, onRead);
+    const { line, revision } = firstLineOf(file, onRead);
+    const meta = openingRecordOf(line);
+    return meta ? openingWithStat(meta, revision) : null;
   } catch {
     return undefined;
   }
-  return openingRecordOf(line);
 }
 
 export function openingRecordOf(line: string | null): CodexSessionMeta | null {
@@ -540,7 +599,9 @@ export function readCodexOpening(file: string, onRead?: () => void): CodexSessio
 // `readCodexSessionMeta` off the extension host's main thread. `buf` holds `META_BYTES` and
 // belongs to this read until it settles. It rejects when the file system refuses the read.
 export async function readCodexSessionMetaAsync(file: string, buf: Buffer): Promise<CodexSessionMeta | null> {
-  return openingRecordOf(await firstLineOfAsync(file, buf));
+  const { line, revision } = await firstLineOfAsync(file, buf);
+  const meta = openingRecordOf(line);
+  return meta ? openingWithStat(meta, revision) : null;
 }
 
 function str(value: unknown): string | null {
@@ -1056,7 +1117,7 @@ export function codexRowAdmitted(
 export function codexSessionFiles(
   root: string,
   folders: string[],
-  metaOf: (file: string) => CodexSessionMeta | null = readCodexSessionMeta,
+  metaOf: (file: string, stat: () => RolloutStat | null) => CodexSessionMeta | null = readCodexSessionMeta,
   statOf: (file: string) => RolloutStat | null = readRolloutStat,
   walked?: string[],
   enumeration: SourceEnumeration = walked
@@ -1083,8 +1144,10 @@ export function codexSessionFiles(
     return member;
   };
   for (const file of walked) {
-    // Check cached opening metadata before requesting a stat. Other workspaces need no stat read here.
-    const meta = metaOf(file);
+    if (isCompressedRollout(file)) continue;
+    let stat: RolloutStat | null | undefined;
+    const currentStat = () => (stat === undefined ? (stat = statOf(file)) : stat);
+    const meta = metaOf(file, currentStat);
     // No readable opening record means no cwd, and the path holds none either, so there is
     // nothing that puts the session in this workspace.
     if (!meta || !meta.cwd) admission = 'incomplete';
@@ -1107,12 +1170,12 @@ export function codexSessionFiles(
         backgroundReview: isHiddenThread(meta),
       });
     }
-    // Omit guardian review from visible sessions before requesting its stat.
+    // Omit guardian review from visible sessions.
     // Dispatched children remain visible in Run by agents.
     if (isHiddenThread(meta)) {
       continue;
     }
-    const stat = statOf(file);
+    currentStat();
     if (!stat) admission = 'incomplete';
     if (!stat || !codexRowAdmitted(meta, stat, cwdInFolders)) {
       continue;

@@ -1,8 +1,8 @@
 import { toolKind } from './domain/tool-kinds';
-import { revisionOf } from './filerevision';
+import { fileIdentityValue, revisionOf } from './filerevision';
 import { isCompressedRollout } from './compressedrollouts';
 import { turnKey } from './domain/read';
-export { revisionOf } from './filerevision';
+export { fileIdentityValue, revisionOf } from './filerevision';
 import type { SourceEnumeration } from './sessioncoverage';
 import * as fs from 'node:fs';
 import { ExportLimitError, type ExportRelationshipLimits } from './exportlimits';
@@ -5822,12 +5822,6 @@ export interface TailRead {
 export interface MetadataCoverage {
   whole: boolean;
   windowBytes: number;
-}
-
-export function fileIdentityValue(value: unknown, positive = false): boolean {
-  return typeof value === 'string'
-    ? (positive ? /^[1-9][0-9]*$/ : /^(0|[1-9][0-9]*)$/).test(value)
-    : typeof value === 'number' && Number.isSafeInteger(value) && (positive ? value > 0 : value >= 0);
 }
 
 export function supportedFileIdentity(value: { dev?: unknown; ino?: unknown }): boolean {

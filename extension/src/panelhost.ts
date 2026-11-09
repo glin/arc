@@ -13796,7 +13796,7 @@ export class PanelProvider implements vscode.Disposable {
     const listing = codexSessionFiles(
       codexSessionsRoot(),
       roots,
-      (file) => {
+      (file, stat) => {
         if (isCompressedRollout(file)) return null;
         if (collides('codex', file)) {
           const qualified = time('openings:collisions', () => {
@@ -13822,7 +13822,8 @@ export class PanelProvider implements vscode.Disposable {
           });
           if (qualified) return qualified;
         }
-        return time('openings:codex', () => this.codexMetas.get(file, countCodexOpeningRead));
+        const current = stat();
+        return time('openings:codex', () => this.codexMetas.get(file, countCodexOpeningRead, current));
       },
       (file) =>
         time(
