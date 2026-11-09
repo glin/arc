@@ -8753,12 +8753,18 @@ test('a catalog walk records each part of the enumeration time, and the parts su
     codexSessionFiles: (
       _root: string,
       _folders: string[],
-      metaOf: (file: string) => unknown,
+      metaOf: (file: string, stat: () => unknown) => unknown,
       statOf: (file: string) => unknown,
     ) => {
-      metaOf(codex.file);
-      metaOf(collidedCodexFile);
-      statOf(codex.file);
+      // As the listing does, each rollout pays one stat, and the opening lookup receives that stat.
+      const statOnce = (file: string) => {
+        let held: unknown;
+        return () => (held === undefined ? (held = statOf(file)) : held);
+      };
+      const codexStat = statOnce(codex.file);
+      metaOf(codex.file, codexStat);
+      metaOf(collidedCodexFile, statOnce(collidedCodexFile));
+      codexStat();
       return {
         walked: [codex.file],
         sessions: [codex],
@@ -8809,10 +8815,10 @@ test('a catalog walk records each part of the enumeration time, and the parts su
   const parts = ['listing', 'stats', 'openings', 'prompts', 'build'];
   assert.deepEqual(
     Object.fromEntries(parts.map((part) => [part, refreshes.get(`catalog-enumeration:${part}`)])),
-    { listing: [9], stats: [6], openings: [36], prompts: [11], build: [13] },
+    { listing: [9], stats: [10], openings: [36], prompts: [11], build: [13] },
     'a part of the walk was not timed, or its time went to another part',
   );
-  assert.deepEqual(refreshes.get('catalog-enumeration'), [75]);
+  assert.deepEqual(refreshes.get('catalog-enumeration'), [79]);
   const sources = ['parents', 'codex', 'collisions', 'children'];
   assert.deepEqual(
     Object.fromEntries(sources.map((source) => [source, refreshes.get(`catalog-enumeration:openings:${source}`)])),
