@@ -222,6 +222,7 @@ import {
   worktreeRelationships,
 } from './transcript.ts';
 import {
+  CODEX_STAT_ACTIVE_MS,
   CODEX_STAT_REVALIDATE_MS,
   CODEX_USAGE_ASSOCIATION_LIMIT,
   CodexMetaCache,
@@ -16052,6 +16053,82 @@ test.each([
     assert.equal(list().sessions[0].sessionId, held.sessionId, `${name}: the listing after the pass`);
     assert.equal(reads, 1, `${name}: the second listing read an opening`);
   }
+});
+
+test('a listing reconciles a held stat older than the saved opening', async () => {
+  const root = sessionsRoot([{ day: '2026/08/25', name: ROLLOUT(UUID_A), records: [meta({ id: UUID_A })] }]);
+  const file = rolloutFiles(root)[0];
+  const opening = readCodexSessionMeta(file)!;
+  const before: RolloutStat = { size: 1000, mtimeMs: 2000, dev: '1', ino: '2', isFile: true };
+  const fixture = (stat: RolloutStat) => {
+    const clock = { now: CODEX_STAT_ACTIVE_MS * 2 };
+    const disk = { stat };
+    const stats = new CodexStatCache(
+      () => disk.stat,
+      () => clock.now,
+    );
+    const counts = { reads: 0 };
+    const reading = (sessionId: string) => ({
+      ...opening,
+      sessionId,
+      size: disk.stat.size,
+      mtimeMs: disk.stat.mtimeMs,
+      fileIdentity: { dev: disk.stat.dev, ino: disk.stat.ino },
+    });
+    const cache = new CodexMetaCache((_file, onRead) => {
+      counts.reads++;
+      onRead?.();
+      return reading(UUID_B);
+    });
+    cache.load([[file, { ...reading(UUID_A) }]]);
+    const list = () =>
+      codexSessionFiles(
+        root,
+        ['c:/repo'],
+        (file, current, inFolders) => cache.listingOpening(file, current, inFolders),
+        (file) => stats.get(file, cache.savedOpening(file)),
+      ).sessions[0];
+    return { clock, disk, cache, counts, list, reading };
+  };
+
+  const appended = fixture(before);
+  assert.equal(appended.list().size, 1000);
+  appended.disk.stat = { ...before, size: 1200, mtimeMs: 2100 };
+  await appended.cache.prime(
+    [file],
+    async () => assert.fail('the pass read an appended opening'),
+    undefined,
+    undefined,
+    undefined,
+    async () => appended.disk.stat,
+  );
+  for (let listing = 0; listing < 3; listing++) {
+    const row = appended.list();
+    assert.equal(row.sessionId, UUID_A);
+    assert.equal(row.size, 1200, 'the row keeps the held stat');
+  }
+  assert.equal(appended.counts.reads, 0, 'a held stat read as shrinkage');
+
+  const primedRewrite = fixture(before);
+  primedRewrite.list();
+  primedRewrite.disk.stat = { ...before, mtimeMs: 2100 };
+  await primedRewrite.cache.prime(
+    [file],
+    async () => primedRewrite.reading(UUID_B),
+    undefined,
+    undefined,
+    undefined,
+    async () => primedRewrite.disk.stat,
+  );
+  for (let listing = 0; listing < 3; listing++) assert.equal(primedRewrite.list().sessionId, UUID_B);
+  assert.equal(primedRewrite.counts.reads, 0, 'a held stat rejected the opening that the pass read');
+
+  const missedRewrite = fixture(before);
+  missedRewrite.list();
+  missedRewrite.disk.stat = { ...before, mtimeMs: 2100 };
+  missedRewrite.clock.now += CODEX_STAT_REVALIDATE_MS;
+  assert.equal(missedRewrite.list().sessionId, UUID_B, 'an expired held stat kept the old opening');
+  assert.equal(missedRewrite.counts.reads, 1);
 });
 
 test('a listing stats only the rollouts whose saved openings list in its folders', async () => {

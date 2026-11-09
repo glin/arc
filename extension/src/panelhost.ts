@@ -13829,7 +13829,9 @@ export class PanelProvider implements vscode.Disposable {
       (file) =>
         time(
           'stats',
-          () => qualifiedCodexStats.get(file) ?? (this.watching ? this.codexStats.get(file) : readRolloutStat(file)),
+          () =>
+            qualifiedCodexStats.get(file) ??
+            (this.watching ? this.codexStats.get(file, this.codexMetas.savedOpening(file)) : readRolloutStat(file)),
         ),
       undefined,
       codexEnumeration,
