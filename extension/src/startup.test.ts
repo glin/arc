@@ -17765,12 +17765,16 @@ test.each([
   },
 );
 
-function selectionHarness() {
-  const provider = paintHarness(['onMessage', 'routePerformanceEvent', 'sendToHost'], {
-    parsePanelToHost,
-    dispatchPanelToHost,
-    READER_INSTRUCTIONS: new Set(),
-  });
+function selectionHarness(revalidate?: Parameters<typeof completeDiscoveryHarness>[0]) {
+  const provider = paintHarness(
+    ['onMessage', 'routePerformanceEvent', 'sendToHost'],
+    {
+      parsePanelToHost,
+      dispatchPanelToHost,
+      READER_INSTRUCTIONS: new Set(),
+    },
+    revalidate,
+  );
   provider.hostSessions = new Map();
   provider.hostPreviousSessions = new Map();
   provider.panelSession = (session: string) => session;
@@ -17871,6 +17875,26 @@ test('a current window under a partial catalog is labelled held', async () => {
   try {
     await f.provider.onMessage({ type: 'showSession', session: 'claude-a' }, f.host);
     assert.equal(f.timing().window, 'held');
+  } finally {
+    f.provider.performanceCounters.dispose();
+  }
+});
+
+test('a reselection after an append whose read completed is labelled held', async () => {
+  const appended = { size: 9, mtimeMs: 9 };
+  const f = selectionHarness((sessions) => sessions.map((row) => ({ ...row, ...appended })));
+  f.provider.revisionOf = () => ({ ...appended, dev: 1, ino: 2 });
+  f.provider.progressiveCurrent = (row: { size: number }) => row.size === appended.size;
+  f.provider.collect = () => [];
+  try {
+    await f.provider.onMessage({ type: 'showSession', session: 'claude-a' }, f.host);
+    await f.settled();
+    assert.equal(f.timing().window, 'held');
+    assert.equal(
+      typeof f.timing().stamps['selection:renderPosted'],
+      'number',
+      'the refresh did not find the cached window current',
+    );
   } finally {
     f.provider.performanceCounters.dispose();
   }
@@ -18150,7 +18174,11 @@ test('session selection reads cached spend signatures without enumerating source
 });
 
 // The harness retains the refresh stages that precede the render post.
-function paintHarness(extraMethods: string[] = [], scope: Record<string, unknown> = {}): any {
+function paintHarness(
+  extraMethods: string[] = [],
+  scope: Record<string, unknown> = {},
+  revalidate?: Parameters<typeof completeDiscoveryHarness>[0],
+): any {
   const session = {
     file: 'claude.jsonl',
     sessionId: 'claude-a',
@@ -18159,7 +18187,7 @@ function paintHarness(extraMethods: string[] = [], scope: Record<string, unknown
     size: 1,
     mtimeMs: 1,
   };
-  const provider = completeDiscoveryHarness(undefined, false, extraMethods, scope);
+  const provider = completeDiscoveryHarness(revalidate, false, extraMethods, scope);
   provider.initialNamesChanged = () => {};
   provider.partial = [session];
   provider.catalog = { sessions: [session] };

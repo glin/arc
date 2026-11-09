@@ -10512,8 +10512,14 @@ export class PanelProvider implements vscode.Disposable {
       : undefined;
     if (host) {
       if (session) {
-        // The list that the refresh draws from. A partial catalog is held before the session list accepts it.
-        const windowSource = selectedSource ?? this.catalog?.sessions.find((one) => one.sessionId === session);
+        // The listed row at the file's current size and time, the revision that a selection refresh revalidates.
+        // A partial catalog is held before the session list accepts it.
+        const listed = selectedSource ?? this.catalog?.sessions.find((one) => one.sessionId === session);
+        const revision = listed && this.revisionOf(listed);
+        const windowSource =
+          listed && revision && revision.size >= 0
+            ? { ...listed, mtimeMs: revision.mtimeMs, size: revision.size }
+            : listed;
         this.performanceCounters?.startSelection?.(
           host,
           session,
