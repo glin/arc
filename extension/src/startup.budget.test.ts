@@ -23,7 +23,7 @@ const COUNTER_PREFIXES = [
   'cachedLinks:',
   'watcher:grownMemberMiss:',
 ];
-// Bytes depend on the platform's path separators, so these counters may fall below budget without a change in the work.
+// Bytes depend on the platform's path separators, so these counters can fall below budget without a change in the work.
 const ONE_SIDED = new Set(['readBytes', 'dispatchSpendBytes']);
 // Counts of host work with one exact name each.
 const WORK_NAMES = new Set(['catalogWalk', 'watcher:grownMembers', 'pollDirectoryStats', 'childVersionStat']);
