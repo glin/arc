@@ -58,8 +58,8 @@
     },
     "cold start | readBytes": {
       "reason": "Cold start reads 392568 bytes through discovery. The margin covers the temporary path length and the file identity numbers in dispatch receipts.",
-      "budget": 392607,
-      "margin": 15703
+      "budget": 411216,
+      "margin": 256
     },
     "cold start | receiptScanOpensAfterCompletion": {
       "reason": "Cold start opens 0 receipt scans after a complete reply.",
@@ -123,8 +123,8 @@
     },
     "warm start | readBytes": {
       "reason": "Warm start reads 16105 bytes through discovery. The margin covers the temporary path length and the file identity numbers in dispatch receipts.",
-      "budget": 16144,
-      "margin": 1024
+      "budget": 18913,
+      "margin": 256
     },
     "warm start | receiptScanOpensAfterCompletion": {
       "reason": "Warm start opens 0 receipt scans after a complete reply.",
@@ -189,7 +189,7 @@
     "completion | readBytes": {
       "reason": "Completion reads 0 bytes through discovery. The margin covers the temporary path length and the file identity numbers in dispatch receipts.",
       "budget": 0,
-      "margin": 1024
+      "margin": 0
     },
     "completion | receiptScanOpensAfterCompletion": {
       "reason": "Completion opens 0 receipt scans after a complete reply.",
@@ -253,8 +253,8 @@
     },
     "child watcher event | readBytes": {
       "reason": "Child watcher event reads 18511 bytes through discovery. The margin covers the temporary path length and the file identity numbers in dispatch receipts.",
-      "budget": 18550,
-      "margin": 1024
+      "budget": 21451,
+      "margin": 256
     },
     "child watcher event | receiptScanOpensAfterCompletion": {
       "reason": "Child watcher event opens 1 receipt scans after a complete reply.",
@@ -324,7 +324,7 @@
     "selection switch | readBytes": {
       "reason": "Selection switch reads 0 bytes through discovery. The margin covers the temporary path length and the file identity numbers in dispatch receipts.",
       "budget": 0,
-      "margin": 1024
+      "margin": 0
     },
     "selection switch | receiptScanOpensAfterCompletion": {
       "reason": "Selection switch opens 0 receipt scans after a complete reply.",
@@ -383,8 +383,8 @@
     },
     "poll and backstop walk | readBytes": {
       "reason": "Poll and backstop walk reads 16105 bytes through discovery. The margin covers the temporary path length and the file identity numbers in dispatch receipts.",
-      "budget": 16144,
-      "margin": 1024
+      "budget": 18913,
+      "margin": 256
     },
     "poll and backstop walk | receiptScanOpensAfterCompletion": {
       "reason": "Poll and backstop walk opens 1 receipt scans after a complete reply.",

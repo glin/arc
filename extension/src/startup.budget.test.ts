@@ -26,6 +26,20 @@ const COUNTER_PREFIXES = [
 // Bytes depend on the platform's path separators, so these counters may fall below budget without a change in the work.
 const ONE_SIDED = new Set(['readBytes']);
 
+// Byte rows count paths and working directories, so a root of one length keeps those bytes the same on every machine.
+const ROOT_LENGTH = 160;
+
+function paddedRoot(base: string): string {
+  const real = fs.realpathSync.native(base);
+  assert.ok(
+    real.length < ROOT_LENGTH - 1,
+    `The temporary directory ${real} leaves no room to pad. Use a shorter TEMP.`,
+  );
+  const root = path.join(real, 'p'.repeat(ROOT_LENGTH - real.length - 1));
+  fs.mkdirSync(root);
+  return root;
+}
+
 type Counts = Record<string, number>;
 interface BudgetRow {
   reason: string;
@@ -45,7 +59,7 @@ let workspace: BudgetWorkspace;
 let workerSource: string;
 
 beforeAll(async () => {
-  const root = tempDir('count-budget-');
+  const root = paddedRoot(tempDir('count-budget-'));
   vi.stubEnv('ARC_HOME', path.join(root, 'arc'));
   vi.stubEnv('ARC_PROJECTS_ROOT', path.join(root, 'projects'));
   vi.stubEnv('ARC_CODEX_ROOT', path.join(root, 'sessions'));
