@@ -12623,6 +12623,7 @@ function cardRefreshHarness(reason: string) {
   const file = writeRollout('held');
   const startedAt = Date.parse('2026-10-01T12:00:00.000Z');
   const endedAt = startedAt + 60_000;
+  const cardClock = endedAt + 60_000;
   const sha = 'abc12345'.padEnd(40, '0');
   const selected = turn({
     sessionId: 'held',
@@ -12670,7 +12671,7 @@ function cardRefreshHarness(reason: string) {
       provider
         .readFor(source, 40, 1024)
         .read.turns.map((value: any) =>
-          toCard(value, true, Date.now(), provider.folders(), null, false, new Set(), [], null, provider.modelLabels),
+          toCard(value, true, cardClock, provider.folders(), null, false, new Set(), [], null, provider.modelLabels),
         ),
     );
   const gitAnswer = (args: string[]) => {
@@ -12760,37 +12761,43 @@ test.each(['commit-repositories', 'repository-commits', 'models'])(
 test.each(['commit-repositories', 'repository-commits', 'models'])(
   'a %s refresh coalesced with workspace-folders walks once and names only the listing requester',
   async (reason) => {
-    const { provider, file: held, writeRollout, releaseAll, runs, update, files } = cardRefreshHarness(reason);
-    await releaseAll(provider.refresh(true));
-    const counters = new PanelPerformanceCounters();
-    provider.performanceCounters = counters;
-    const prepare = provider.prepareHumanPrompts;
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => (release = resolve));
-    let entered = false;
-    provider.prepareHumanPrompts = async (...args: unknown[]) => {
-      entered = true;
-      await gate;
-      return prepare.apply(provider, args);
-    };
-    provider.refreshFrom('metadata', false, true);
-    await vi.waitFor(() => assert.ok(entered, 'the held refresh did not reach prompt admission'));
-    await update();
-    const added = writeRollout('added');
-    provider.refreshFrom('workspace-folders', true);
-    const pending = provider.pendingRefresh;
-    release();
-    await releaseAll(runs[1]);
-    await vi.waitFor(() => assert.equal(runs.length, 5, 'the merged refresh did not run'));
-    await releaseAll(runs[4]);
-    assert.equal(pending.reuseCatalog, false);
-    assert.deepEqual(pending.walkReasons, ['workspace-folders']);
-    const work = counters.snapshot().work;
-    assert.equal(work.catalogWalk, 1);
-    assert.equal(work['walk:requested:coalesced'], 1);
-    assert.equal(work['discoveryRequest:walked:workspace-folders'], 1);
-    assert.equal(work[`discoveryRequest:walked:${reason}`] ?? 0, 0);
-    assert.deepEqual(files(), [added, held].sort());
+    // The refresh deadline moves only with this clock, so a pause in the run cannot split the merge.
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    try {
+      const { provider, file: held, writeRollout, releaseAll, runs, update, files } = cardRefreshHarness(reason);
+      await releaseAll(provider.refresh(true));
+      const counters = new PanelPerformanceCounters();
+      provider.performanceCounters = counters;
+      const prepare = provider.prepareHumanPrompts;
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => (release = resolve));
+      let entered = false;
+      provider.prepareHumanPrompts = async (...args: unknown[]) => {
+        entered = true;
+        await gate;
+        return prepare.apply(provider, args);
+      };
+      provider.refreshFrom('metadata', false, true);
+      await vi.waitFor(() => assert.ok(entered, 'the held refresh did not reach prompt admission'));
+      await update();
+      const added = writeRollout('added');
+      provider.refreshFrom('workspace-folders', true);
+      const pending = provider.pendingRefresh;
+      release();
+      await releaseAll(runs[1]);
+      await vi.waitFor(() => assert.equal(runs.length, 5, 'the merged refresh did not run'));
+      await releaseAll(runs[4]);
+      assert.equal(pending.reuseCatalog, false);
+      assert.deepEqual(pending.walkReasons, ['workspace-folders']);
+      const work = counters.snapshot().work;
+      assert.equal(work.catalogWalk, 1);
+      assert.equal(work['walk:requested:coalesced'], 1);
+      assert.equal(work['discoveryRequest:walked:workspace-folders'], 1);
+      assert.equal(work[`discoveryRequest:walked:${reason}`] ?? 0, 0);
+      assert.deepEqual(files(), [added, held].sort());
+    } finally {
+      vi.useRealTimers();
+    }
   },
 );
 
