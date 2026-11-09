@@ -26495,8 +26495,8 @@ test('the panel dates a session by what it recorded, not by its file being touch
   );
   sourceMatch(
     panelHostSource,
-    /return timelineRailState\(\s*outcomes,\s*this\.liveOpenChildren\(now, outcomes, rows\),/,
-    'the rail reads selected cards before their progressive result is accepted',
+    /return timelineRailState\(\s*outcomes,\s*children \?\? this\.liveOpenChildren\(now, outcomes, rows\),/,
+    'session-list status no longer defaults to the live children of the accepted outcomes',
   );
   sourceMatch(
     fs.readFileSync(path.join(__dirname, 'timelinestate.ts'), 'utf8'),
