@@ -1228,6 +1228,7 @@ export class ClaudeWire {
     // Replayed user messages are receipts only. Display, session tracking, and turn tracking ignore them.
     if (m.isReplay === true) {
       this.replay(m);
+      this.replayedTaskNotice(m);
       return;
     }
 
@@ -1340,6 +1341,31 @@ export class ClaudeWire {
           evidence: {},
         },
       });
+  }
+
+  // A task notice that Claude absorbs during a turn reaches the stream only as a replayed root user record.
+  private replayedTaskNotice(message: Json): void {
+    const sessionId = str(message.session_id);
+    if (
+      this.closed ||
+      !sessionId ||
+      sessionId !== this.session ||
+      message.type !== 'user' ||
+      message.parent_tool_use_id !== null ||
+      obj(message.origin)?.kind !== 'task-notification'
+    )
+      return;
+    this.emit({
+      kind: 'native',
+      event: {
+        provider: 'claude',
+        sessionId,
+        generation: this.nativeGeneration,
+        turnId: null,
+        evidence: message,
+        kind: 'background',
+      },
+    });
   }
 
   private nativeMessage(message: Json): void {

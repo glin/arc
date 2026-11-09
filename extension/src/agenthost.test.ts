@@ -4242,6 +4242,45 @@ test('an unarchived child with an open background hold does not retire at the id
   assert.equal(child.ended, false);
 });
 
+test('a background task that ends during its turn releases its hold from the replayed notice', async () => {
+  const timer = new FakeAgentHostTimer();
+  const { host, child, session, say } = await childWithBackgroundJob({ idleDurationMs: 120, timer });
+  const notice = (status: string, task = 'job-task', extra: object = {}) =>
+    say({
+      type: 'user',
+      isReplay: true,
+      uuid: 'notice-record',
+      timestamp: '2026-01-02T03:04:05.000Z',
+      origin: { kind: 'task-notification', producer: 'session-task' },
+      message: {
+        role: 'user',
+        content: `<task-notification>\n<task-id>${task}</task-id>\n<tool-use-id>launch</tool-use-id>\n<output-file>C:\\Temp\\tasks\\${task}.output</output-file>\n<status>${status}</status>\n<summary>Background command "job" completed (exit code 0)</summary>\n</task-notification>`,
+      },
+      ...extra,
+    });
+  say({
+    type: 'assistant',
+    message: { content: [{ type: 'tool_use', name: 'Bash', id: 'foreground', input: { command: 'wait' } }] },
+  });
+  say({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'foreground' }] } });
+
+  notice('running');
+  notice('completed', 'unrelated-task');
+  notice('completed', 'job-task', { session_id: 'foreign' });
+  notice('completed', 'job-task', { parent_tool_use_id: 'subagent' });
+  notice('completed', 'job-task', { origin: { kind: 'peer' } });
+  assert.equal(session.state().backgroundPending, true, 'an ambiguous replayed notice released the hold');
+
+  notice('completed');
+  assert.equal(Boolean(session.state().backgroundPending), false, 'the replayed notice left the hold open');
+  child.say(COMPLETED_RESULT);
+  settle(host, 'one');
+  assert.equal(timer.tasks.at(-1)?.delayMs, 120);
+  timer.fire(timer.tasks.length - 1);
+  assert.equal(host.get('one'), null);
+  assert.equal(child.ended, true);
+});
+
 test('a settled idle session retires when its timer fires', async () => {
   const timer = new FakeAgentHostTimer();
   const { host, children } = fakeHost(undefined, undefined, { idleDurationMs: 120, timer });
