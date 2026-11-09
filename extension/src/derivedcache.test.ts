@@ -294,7 +294,7 @@ import {
   type DerivedCacheSources,
   type DerivedTitleEntry,
 } from './derivedcache.ts';
-import { savedOpeningCurrent, type SavedClaudeOpening } from './filerevision.ts';
+import { savedOpeningCurrent, savedParentOpeningCurrent, type SavedClaudeOpening } from './filerevision.ts';
 // The Claude metadata generation used by current-format fixtures.
 const VERSION = METADATA_GENERATIONS.claude;
 // Test sessions live outside both source roots. These helpers qualify every entry as a Claude session.
@@ -3901,6 +3901,12 @@ test.each([
   assert.equal(current({ dev: '9' }), !identityRefused, 'a changed device');
   if (ino !== undefined) assert.equal(current({ ino: '99' }), false, 'a replaced file with a new inode');
   assert.equal(current({ ino: undefined }), ino === undefined, 'a saved inode with none in the current stat');
+  assert.equal(savedParentOpeningCurrent(saved, saved), true, 'an unchanged parent transcript');
+  assert.equal(
+    savedParentOpeningCurrent(saved, { ...saved, size: 1100, mtimeMs: 2100 }),
+    ino !== undefined,
+    'a parent transcript that grew',
+  );
   if (ino === undefined) {
     assert.equal(current({ ino: 77 }), true, 'a current inode at the recorded stat');
     assert.equal(current({ ino: 77, size: 1100, mtimeMs: 2100 }), false, 'a current inode with growth');

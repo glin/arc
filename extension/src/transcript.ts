@@ -8,7 +8,13 @@ import {
 } from './filerevision';
 import { isCompressedRollout } from './compressedrollouts';
 import { turnKey } from './domain/read';
-export { fileIdentityValue, revisionOf, savedOpeningCurrent, supportedFileIdentity } from './filerevision';
+export {
+  fileIdentityValue,
+  revisionOf,
+  savedOpeningCurrent,
+  savedParentOpeningCurrent,
+  supportedFileIdentity,
+} from './filerevision';
 export type { OpeningStat, SavedClaudeOpening } from './filerevision';
 import type { SourceEnumeration } from './sessioncoverage';
 import * as fs from 'node:fs';

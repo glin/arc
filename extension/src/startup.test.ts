@@ -53,7 +53,7 @@ import {
   enumerateClaudeChildSourceSteps,
   enumerateSessionFilesFor,
   enumerateSessionFilesForSteps,
-  savedOpeningCurrent,
+  savedParentOpeningCurrent,
   scanSessionCwd,
   walkInSlices,
   WALK_SLICE_MS,
@@ -3165,7 +3165,7 @@ function completeDiscoveryHarness(
     sessionPresence,
     sessionSourceKey,
     supportedFileIdentity,
-    savedOpeningCurrent,
+    savedParentOpeningCurrent,
     fs,
     fileRevisionOf,
     SpendCoverage,
@@ -10160,6 +10160,72 @@ test('a saved file in the shape of a build without saved openings loads and read
   });
   assert.deepEqual(await walk(), { parents: 1, children: 1 }, 'a file without saved openings skipped a read');
   assert.equal(parentCwd(parent), workspace);
+});
+
+// Lists every transcript with the stat of a filesystem that reports no inode.
+function withoutInodes(): () => void {
+  const statSync = mutableFs.statSync;
+  const spy = vi.spyOn(mutableFs, 'statSync').mockImplementation(((file: fs.PathLike, options?: fs.StatSyncOptions) => {
+    const real = (statSync as any)(file, options);
+    if (!String(file).endsWith('.jsonl') || !real) return real;
+    return Object.assign(Object.create(Object.getPrototypeOf(real)), real, { ino: options?.bigint ? 0n : 0 });
+  }) as typeof fs.statSync);
+  syncBuiltinESMExports();
+  return () => {
+    spy.mockRestore();
+    syncBuiltinESMExports();
+  };
+}
+
+test.each([
+  { moment: 'after the relaunch', duringLaunch: false },
+  { moment: 'during the running launch', duringLaunch: true },
+])(
+  'a parent transcript replaced by a larger file $moment without an inode leaves the workspace that it no longer names',
+  async ({ duringLaunch }) => {
+    const { writeParent, walk, relaunch, line, root, files } = savedOpeningsHarness();
+    const restore = withoutInodes();
+    try {
+      const parent = writeParent('parent');
+      const kept = writeParent('kept');
+      assert.deepEqual(await walk(), { parents: 2, children: 0 });
+      assert.deepEqual(files(), [kept, parent].sort());
+      const replace = () => {
+        const { size, mtimeMs } = fs.statSync(parent);
+        const elsewhere = path.join(root, 'elsewhere');
+        fs.writeFileSync(parent, line(elsewhere) + line(elsewhere));
+        fs.utimesSync(parent, new Date(), new Date(mtimeMs + 5_000));
+        assert.ok(fs.statSync(parent).size > size, 'the fixture did not grow the transcript');
+      };
+      if (duringLaunch) {
+        replace();
+        await walk();
+        relaunch();
+      } else {
+        relaunch();
+        replace();
+      }
+      const reads = await walk();
+      assert.deepEqual(files(), [kept], 'the replaced transcript listed under its old workspace');
+      assert.deepEqual(reads, { parents: 1, children: 0 }, 'the replaced transcript kept its saved opening');
+    } finally {
+      restore();
+    }
+  },
+);
+
+test('a parent transcript at its saved stat without an inode lists with no read', async () => {
+  const { writeParent, walk, relaunch, parentCwd, workspace } = savedOpeningsHarness();
+  const restore = withoutInodes();
+  try {
+    const parent = writeParent('parent');
+    await walk();
+    relaunch();
+    assert.deepEqual(await walk(), { parents: 0, children: 0 }, 'an unchanged transcript read its opening again');
+    assert.equal(parentCwd(parent), workspace);
+  } finally {
+    restore();
+  }
 });
 
 test('a file created after its folder was read waits for the next walk', async () => {

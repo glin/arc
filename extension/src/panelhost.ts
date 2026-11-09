@@ -144,7 +144,7 @@ import {
   projectsRoot,
   enumerateSessionFilesFor,
   enumerateSessionFilesForSteps,
-  savedOpeningCurrent,
+  savedParentOpeningCurrent,
   type SavedClaudeOpening,
   enumerateClaudeChildSources,
   enumerateClaudeChildSourceSteps,
@@ -13904,7 +13904,7 @@ export class PanelProvider implements vscode.Disposable {
         let hit = this.cwds.get(file);
         const listedStat = { mtimeMs: session.mtimeMs, size: session.size, dev: session.dev, ino: session.ino };
         if (hit?.saved) {
-          if (savedOpeningCurrent(hit, session)) {
+          if (savedParentOpeningCurrent(hit, session)) {
             this.cwds.set(file, { cwd: hit.cwd, ...listedStat });
             return hit.cwd;
           }
@@ -13913,7 +13913,8 @@ export class PanelProvider implements vscode.Disposable {
         }
         if (hit?.cwd) {
           // An append moves only the stat. A held row that the stat refuses keeps its old stat, so a later launch reads the file.
-          if (!sameSessionRevision(hit, session) && savedOpeningCurrent(hit, session)) Object.assign(hit, listedStat);
+          if (!sameSessionRevision(hit, session) && savedParentOpeningCurrent(hit, session))
+            Object.assign(hit, listedStat);
           return hit.cwd;
         }
         if (hit && sameSessionRevision(hit, session)) {

@@ -63,3 +63,12 @@ export function savedOpeningCurrent(saved: OpeningStat, stat: OpeningStat): bool
     return String(stat.dev) === String(saved.dev) && String(stat.ino) === String(saved.ino) && unmoved;
   return !savedIdentity && stat.mtimeMs >= saved.mtimeMs && unmoved;
 }
+
+// Reports whether a saved opening still answers for a Claude parent transcript at `stat`.
+// Without an inode, an append and a replacement that grew have the same stat, so the size and modification time must match.
+export function savedParentOpeningCurrent(saved: OpeningStat, stat: OpeningStat): boolean {
+  return (
+    savedOpeningCurrent(saved, stat) &&
+    (supportedFileIdentity(stat) || (stat.size === saved.size && stat.mtimeMs === saved.mtimeMs))
+  );
+}
