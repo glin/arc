@@ -537,8 +537,8 @@ test('steady appends write at most twice the bytes the store keeps, through ever
   holder.dispose();
 });
 
-// Each release closes a segment of one append, so timed compactions run as the store doubles. Their rewrites add up to
-// less than twice the kept bytes, on top of the appends themselves.
+// Each release closes a segment of one append, so timed compactions run as the store doubles. For the 72 appends of
+// this test, their rewrites add up to less than twice the kept bytes, on top of the appends themselves.
 test('appends that release the lease between them write at most three times the bytes the store keeps', async () => {
   let written = 0;
   const { directory, clock, make, names } = storeFixture('store-released-appends', {

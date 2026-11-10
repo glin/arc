@@ -1002,7 +1002,7 @@ export class CompressedStoreHolder {
   }
 
   // True when no shard exists or the closed segments hold at least as many bytes as the shards, so a compaction that
-  // the segment limit did not force writes at most twice the bytes it folds in.
+  // the segment limit did not force writes at most twice the bytes of the closed segments.
   private segmentsOutweighShards(view: StoreView): boolean {
     let segments = 0;
     let shards = 0;
