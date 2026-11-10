@@ -1626,6 +1626,7 @@ import {
   FOLDERLESS_OWNER_FILE,
 } from './store.ts';
 import {
+  coversBox,
   createRetainedFocus,
   createRetainedVisibility,
   type VisibilityBox,
@@ -1811,6 +1812,18 @@ test('resize and hide reject old observer and paint generations', () => {
   assert.ok(f.observations[2].disconnected);
   f.controller.receive({ visible: false, revision: 5 });
   assert.equal(f.opacity(), '0.7');
+});
+
+test('a zoomed page counts as fully visible when its visible area is one device pixel short', () => {
+  // A fully shown panel in a VS Code window at zoom level 1 on a 2x display.
+  const box = { x: 0, y: 0, width: 546.6666259765625, height: 649.1666259765625 };
+  const visible = { x: 0, y: 0, width: 546.25, height: 649.1666259765625 };
+  assert.ok(coversBox(visible, box, 2.4000000953674316));
+  assert.ok(!coversBox({ ...visible, width: 544.6666259765625 }, box, 1), 'two pixels short at 1x');
+  assert.ok(!coversBox({ ...visible, width: 545.5 }, box, 2.4000000953674316), 'two device pixels short');
+  assert.ok(!coversBox({ ...visible, x: 1, width: 545.6666259765625 }, box, 2.4000000953674316), 'clipped on the left');
+  assert.ok(!coversBox({ ...box, height: 600 }, box, 2.4000000953674316), 'clipped at the bottom');
+  assert.ok(coversBox(box, box, 2));
 });
 
 test('unsupported observation releases after paint and disposal restores opacity', () => {

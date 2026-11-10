@@ -25,6 +25,19 @@ function sameBox(a: VisibilityBox, b: VisibilityBox): boolean {
   return a.x === b.x && a.y === b.y && a.width === b.width && a.height === b.height;
 }
 
+// Chromium snaps a webview frame's visible area to whole device pixels. At a fractional
+// device pixel ratio, such as a zoomed editor window, the visible area of a fully shown page
+// can fall short of the page box by up to one device pixel on each edge.
+export function coversBox(visible: VisibilityBox, box: VisibilityBox, devicePixelRatio: number): boolean {
+  const slack = 1 / (devicePixelRatio > 0 ? devicePixelRatio : 1) + 1 / 64;
+  return (
+    visible.x - box.x <= slack &&
+    visible.y - box.y <= slack &&
+    box.x + box.width - (visible.x + visible.width) <= slack &&
+    box.y + box.height - (visible.y + visible.height) <= slack
+  );
+}
+
 export function createRetainedVisibility(ports: RetainedVisibilityPorts) {
   let revision = -1;
   let generation = 0;
@@ -221,7 +234,9 @@ export function mountRetainedVisibility(
                 if (entry)
                   receive({
                     box: entry.boundingClientRect,
-                    full: entry.isIntersecting && entry.intersectionRatio === 1,
+                    full:
+                      entry.isIntersecting &&
+                      coversBox(entry.intersectionRect, entry.boundingClientRect, view.devicePixelRatio),
                   });
               },
               { root: null, threshold: [0, 1] },

@@ -218,6 +218,61 @@ for (const phase of ['before hide', 'pending release']) {
   });
 }
 
+test('a returning panel shows when a zoomed window reports its visible area a fraction of a pixel short', async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('no browser available');
+    return;
+  }
+  try {
+    const page = await browser.newPage();
+    await page.setViewportSize({ width: 1100, height: 800 });
+    // A fully shown panel in a VS Code window at zoom level 1 on a 2x display reported a visible
+    // area 0.42 CSS px narrower than the page, an intersection ratio of 0.99924.
+    const html = browserStatePageHtml().replace(
+      'window.__posted = [];',
+      `window.__posted = [];
+      const NativeObserver = window.IntersectionObserver;
+      window.IntersectionObserver = class extends NativeObserver {
+        constructor(callback, options) {
+          super((entries, observer) => {
+            callback(entries.map((entry) => {
+              if (!entry.target.inert || !entry.isIntersecting) return entry;
+              const box = entry.boundingClientRect;
+              const visible = new DOMRect(box.x, box.y, box.width - 0.42, box.height);
+              return {
+                target: entry.target,
+                time: entry.time,
+                rootBounds: entry.rootBounds,
+                boundingClientRect: box,
+                intersectionRect: visible,
+                intersectionRatio: (visible.width * visible.height) / (box.width * box.height),
+                isIntersecting: true,
+              };
+            }), observer);
+          }, options);
+        }
+      };`,
+    );
+    await page.setContent(themed(html));
+    await page.evaluate(`window.postMessage(${JSON.stringify(renderPayload())}, '*')`);
+    await page.evaluate(SETTLED);
+    await page.evaluate(`window.postMessage({type:'visibility',visible:false,revision:1}, '*')`);
+    await page.waitForFunction(() => document.documentElement.style.opacity === '0');
+    await page.evaluate(`window.postMessage({type:'visibility',visible:true,revision:2}, '*')`);
+    const released = await page
+      .waitForFunction(() => document.documentElement.style.opacity !== '0', undefined, { timeout: 5_000 })
+      .then(
+        () => true,
+        () => false,
+      );
+    assert.ok(released, 'the returning panel stays transparent');
+    await page.close();
+  } finally {
+    await browser.close();
+  }
+});
+
 type Payload = Record<string, unknown> & {
   cards: Array<Record<string, unknown>>;
   sessions: Array<Record<string, unknown>>;
