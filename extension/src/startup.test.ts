@@ -15606,6 +15606,42 @@ test('a walk names a later gate when the earlier gates pass', async () => {
   }
 });
 
+test('a receipt store that changes after a settled reply sends the request through a refresh', async () => {
+  const harness = settledWalkHarness();
+  const { provider, count, walked, skipped, settle } = harness;
+  try {
+    await settle();
+    const before = { walked: walked(), skipped: skipped() };
+    fs.mkdirSync(path.join(new DispatchReceipts().root, 'launch'), { recursive: true });
+    await provider.refresh(true);
+    assert.deepEqual({ walked: walked(), skipped: skipped() }, { walked: before.walked + 1, skipped: before.skipped });
+    assert.equal(count('discoveryRequest:walkKept:receipts'), 1);
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});
+
+test('a walk after an unsettled reply keeps no baseline when the pending flag clears', async () => {
+  const harness = settledWalkHarness();
+  const { provider, reply, walked, skipped, settle, claude, claudeWalk } = harness;
+  try {
+    await settle();
+    const before = { walked: walked(), skipped: skipped() };
+    reply.settled = false;
+    claudeWalk[0] = { ...claude, size: claude.size + 1 };
+    await provider.refresh(true);
+    assert.equal(walked(), before.walked + 1, 'the member change sent no request');
+    assert.equal(provider.settledDiscovery, undefined, 'the unsettled reply left a settled baseline');
+    // A later writer clears the pending flag. The walk still has no settled reply to keep.
+    provider.dispatchDiscoveryPending = false;
+    provider.sessionQueryDiscoveryPending = false;
+    await provider.refresh(true);
+    assert.deepEqual({ walked: walked(), skipped: skipped() }, { walked: before.walked + 2, skipped: before.skipped });
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});
+
 test('a targeted refresh after a settled reply sends its discovery request', async () => {
   const { provider, walked, skipped, settle, claude } = settledWalkHarness();
   try {

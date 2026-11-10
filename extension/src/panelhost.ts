@@ -15285,8 +15285,8 @@ export class PanelProvider implements vscode.Disposable {
     );
   }
 
-  // True when this walk lists what the last settled reply covered, with nothing outstanding. The next pass then reads the same
-  // sources and receipts and reaches the same reply.
+  // True when this walk matches the compared inputs of the last settled reply: the roots and folders, the worker, each listed
+  // source and its exact stamp, each subagent sidecar and the receipt store revision, with nothing outstanding.
   private async walkKeepsDiscovery(held: NonNullable<PanelProvider['settledDiscovery']>): Promise<boolean> {
     const refuse = (gate: string): false => {
       this.performanceCounters?.recordWork?.(`discoveryRequest:walkKept:${gate}`);
