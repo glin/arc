@@ -4528,6 +4528,12 @@ export class AgentHost {
     this.sessions.delete(key);
     const state = session.state();
     const identity = state.sessionId ? this.sessionIdentity(session.agent, state.sessionId) : null;
+    // Only archive retirement passes an open hold. The launches end with the child, also for a resumed session.
+    if (identity && state.sessionId && state.backgroundPending) {
+      const work = session.backgroundWork(state.sessionId);
+      work.closeOpen();
+      this.backgroundReads.set(identity, work);
+    }
     // Archive retirement can end a child that a targeted request waits on. The request resolves after the exit.
     const targeted = this.targetedRetirements.get(key);
     let completeShutdown: () => void = () => undefined;

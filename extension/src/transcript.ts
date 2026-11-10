@@ -2206,6 +2206,16 @@ export class ClaudeBackgroundWork {
       if (!this.completed.has(key)) this.open.add(key);
   }
 
+  // Ends every open launch, with the task it maps to, so a later read of the same launch does not reopen it.
+  closeOpen(): void {
+    for (const key of this.open) {
+      this.completed.add(key);
+      const task = this.toolTasks.get(key);
+      if (task !== undefined) this.completed.add(`child:${task}`);
+    }
+    this.open.clear();
+  }
+
   observe(record: Record<string, unknown>, owner = 'unidentified'): void {
     const content = (record.message as { content?: unknown } | undefined)?.content;
     const blocks = Array.isArray(content)

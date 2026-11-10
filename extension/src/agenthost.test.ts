@@ -4191,14 +4191,15 @@ test('accepted background metadata survives missing later reads and protects a r
 });
 
 // Opens a child whose current turn launched one background command that never reports its end.
-async function childWithBackgroundJob(options: Parameters<typeof fakeHost>[2] = {}) {
+async function childWithBackgroundJob(options: Parameters<typeof fakeHost>[2] = {}, fresh = false) {
   const { host, children } = fakeHost(undefined, undefined, options);
-  const opening = host.session('one', claudePlan(CLAUDE, { cwd: WS, sessionId: 'sess-1' }));
+  const opening = host.session('one', claudePlan(CLAUDE, { cwd: WS, ...(fresh ? {} : { sessionId: 'sess-1' }) }));
   children[0].answerHandshake();
   const session = await opening;
   const say = (record: object) =>
     children[0].say(JSON.stringify({ session_id: 'sess-1', parent_tool_use_id: null, ...record }) + '\n');
   await session.prompt('start the job');
+  if (fresh) say({ type: 'system', subtype: 'init' });
   say({
     type: 'assistant',
     message: {
@@ -4211,7 +4212,7 @@ async function childWithBackgroundJob(options: Parameters<typeof fakeHost>[2] = 
     message: { content: [{ type: 'tool_result', tool_use_id: 'launch' }] },
   });
   assert.equal(session.state().backgroundPending, true);
-  return { host, child: children[0], session, say };
+  return { host, children, child: children[0], session, say };
 }
 
 test('archiving a settled child with an open background hold and no notice ends it once', async () => {
@@ -4323,6 +4324,92 @@ test('a background task that ends during its turn releases its hold from the rep
   assert.equal(host.get('one'), null);
   assert.equal(child.ended, true);
   finishChild(child);
+});
+
+type BackgroundFixture = Awaited<ReturnType<typeof childWithBackgroundJob>>;
+
+// Archives a settled child past its open hold and confirms its exit.
+async function archivePastHold({ host, child }: BackgroundFixture): Promise<void> {
+  child.say(COMPLETED_RESULT);
+  settle(host, 'one');
+  host.setArchived(['sess-1']);
+  assert.equal(host.get('one'), null);
+  finishChild(child);
+  await vi.advanceTimersByTimeAsync(0);
+}
+
+async function resumeArchived({ host, children }: BackgroundFixture): Promise<AgentSession> {
+  host.setArchived([]);
+  const opening = host.session('one', claudePlan(CLAUDE, { cwd: WS, sessionId: 'sess-1' }));
+  await vi.advanceTimersByTimeAsync(0);
+  children[1].answerHandshake();
+  return await opening;
+}
+
+async function finishTurnAndRetire(
+  { host, children }: BackgroundFixture,
+  resumed: AgentSession,
+  timer: FakeAgentHostTimer,
+): Promise<void> {
+  assert.equal(Boolean(resumed.state().backgroundPending), false, 'the resumed child inherited the closed hold');
+  await resumed.prompt('next');
+  children[1].say(COMPLETED_RESULT);
+  settle(host, 'one');
+  assert.equal(timer.activeCount(), 1, 'no idle window started for the resumed child');
+  timer.fire(timer.tasks.length - 1);
+  assert.equal(host.get('one'), null);
+  finishChild(children[1]);
+}
+
+test('a session resumed after archive ended its held child retires at the idle limit', async () => {
+  vi.useFakeTimers();
+  const timer = new FakeAgentHostTimer();
+  const fixture = await childWithBackgroundJob({ idleDurationMs: 120, timer });
+  await archivePastHold(fixture);
+  await finishTurnAndRetire(fixture, await resumeArchived(fixture), timer);
+  assert.equal(fixture.children[1].ended, true);
+});
+
+test('a transcript read of the old launch does not reopen a hold that archive closed', async () => {
+  for (const opening of ['resumed', 'fresh']) {
+    vi.useFakeTimers();
+    const timer = new FakeAgentHostTimer();
+    const fixture = await childWithBackgroundJob({ idleDurationMs: 120, timer }, opening === 'fresh');
+    const offerOldLaunch = () =>
+      fixture.host.retainBackgroundWork('claude', 'sess-1', [{ id: 'launch', startedAt: 1 }], ['job-task']);
+    await archivePastHold(fixture);
+    offerOldLaunch();
+    const resumed = await resumeArchived(fixture);
+    offerOldLaunch();
+    await finishTurnAndRetire(fixture, resumed, timer);
+    assert.equal(fixture.children[1].ended, true);
+    vi.useRealTimers();
+  }
+});
+
+test('a background task that the resumed session starts holds its child', async () => {
+  vi.useFakeTimers();
+  const timer = new FakeAgentHostTimer();
+  const fixture = await childWithBackgroundJob({ idleDurationMs: 120, timer });
+  await archivePastHold(fixture);
+  const resumed = await resumeArchived(fixture);
+  await resumed.prompt('start another job');
+  fixture.children[1].say(
+    JSON.stringify({
+      type: 'assistant',
+      session_id: 'sess-1',
+      parent_tool_use_id: null,
+      message: {
+        content: [{ type: 'tool_use', name: 'Bash', id: 'own-launch', input: { run_in_background: true } }],
+      },
+    }) + '\n',
+  );
+  assert.equal(resumed.state().backgroundPending, true);
+  fixture.children[1].say(COMPLETED_RESULT);
+  settle(fixture.host, 'one');
+  assert.equal(timer.activeCount(), 0, 'an idle window started behind the resumed session background task');
+  assert.strictEqual(fixture.host.get('one'), resumed);
+  finishChild(fixture.children[1]);
 });
 
 test('a settled idle session retires when its timer fires', async () => {
