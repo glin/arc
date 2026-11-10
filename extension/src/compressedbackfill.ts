@@ -355,7 +355,7 @@ export interface CompressedBackfillOptions {
 }
 
 // `added` marks the opening read of a name that a later list added. The name keeps its place at the front of the queue
-// across every plan until its body starts or its opening rejects it.
+// across every plan until its body starts, its opening rejects it, a list drops it, or its stored entry is current.
 type Job = {
   kind: 'opening' | 'body';
   file: string;
@@ -419,6 +419,7 @@ export class CompressedBackfill {
   setNames(list: readonly string[]): void {
     const next = new Set(list);
     if (this.names.size) for (const name of next) if (!this.names.has(name)) this.added.add(name);
+    for (const name of this.added) if (!next.has(name)) this.added.delete(name);
     this.names = next;
     if (this.decoding && !next.has(this.decoding.file)) this.decoding.controller.abort();
     this.dirty = true;
@@ -531,8 +532,10 @@ export class CompressedBackfill {
           compressedEntryCurrent(stored, job.stat) &&
           stored.decodedLength !== undefined &&
           !stored.unreadable
-        )
+        ) {
+          this.added.delete(job.file);
           continue;
+        }
         try {
           if (job.kind === 'opening') await this.deriveOpening(job);
           else {
@@ -599,6 +602,7 @@ export class CompressedBackfill {
     const entry = this.factsOf(file);
     const current = entry && compressedEntryCurrent(entry, stat);
     if (current && entry.decodedLength !== undefined && !entry.unreadable) {
+      this.added.delete(file);
       this.repairOpening(file, entry, stat, repairs);
       return;
     }

@@ -17006,6 +17006,42 @@ test('a list between an added name and its body keeps the body before the unplac
   }
 });
 
+test('a name that a list drops before its body starts keeps no place at the front', async () => {
+  const order: string[] = [];
+  const added = 'added.jsonl.zst';
+  let release = () => {};
+  const harness = backfillHarness({
+    exists: () => false,
+    statOf: () => ({ ...unitStat, isFile: true }),
+    readFirst: async (file) => {
+      order.push(`opening ${file}`);
+      if (file === added) await new Promise<void>((resolve) => (release = resolve));
+      return unitOpeningLine;
+    },
+    stream: async (file) => {
+      order.push(`body ${file}`);
+      return unitDecoded();
+    },
+  });
+  try {
+    harness.backfill.setNames(['first.jsonl.zst']);
+    await vi.waitFor(() => assert.equal(backfillIdle(harness.backfill), true));
+    harness.backfill.setNames(['first.jsonl.zst', added]);
+    await vi.waitFor(() => assert.ok(order.includes(`opening ${added}`), order.join()));
+    // After an empty list, the next list adds no name to the front.
+    harness.backfill.setNames([]);
+    release();
+    await vi.waitFor(() => assert.equal(backfillIdle(harness.backfill), true));
+    assert.ok(!order.includes(`body ${added}`), `the dropped name decoded: ${order.join()}`);
+    order.length = 0;
+    harness.backfill.setNames(['other.jsonl.zst', added]);
+    await vi.waitFor(() => assert.equal(harness.facts.length, 3, order.join()));
+    assert.equal(order[0], 'opening other.jsonl.zst', `the dropped name kept its place: ${order.join()}`);
+  } finally {
+    harness.backfill.dispose();
+  }
+});
+
 test('an unreadable mark that does not reach the disk decodes nothing until the last retry delay passes', async () => {
   let decodes = 0;
   const harness = backfillHarness({
