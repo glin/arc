@@ -42,8 +42,10 @@ test('a tick rewords the visible age and leaves the reader on the control they h
   const { page } = held;
   try {
     const payload = renderPayload() as Payload;
+    const card = payload.cards[2];
+    payload.cards = [card];
     await post(page, payload);
-    const head = `[data-key=${JSON.stringify(payload.cards[2].key)}] .head`;
+    const head = `[data-key=${JSON.stringify(card.key)}] .head`;
     await page.locator(head).focus();
     await page.evaluate(`window.__head = document.querySelector(${JSON.stringify(head)})`);
     const before = await page.locator(`${head} .when`).textContent();
@@ -77,6 +79,7 @@ test('a tick leaves a selection inside a figure whose wording has not moved', as
   try {
     const payload = renderPayload() as Payload;
     const running = payload.cards[0];
+    payload.cards = [running];
     running.live = true;
     running.duration = '5m';
     running.durationWord = 'Running for';
@@ -121,8 +124,9 @@ test('a clock-only card change updates the accessible name in place', async (t) 
   const { page } = held;
   try {
     const payload = renderPayload() as Payload;
-    await post(page, payload);
     const card = payload.cards[1];
+    payload.cards = [card];
+    await post(page, payload);
     const head = `[data-key=${JSON.stringify(card.key)}] .head`;
     const before = await page.locator(head).getAttribute('aria-label');
     assert.ok(before, 'the head carries no accessible name to begin with');
@@ -155,6 +159,7 @@ test('the clock writes nothing into a card that has left the page', async (t) =>
     // Set both ages to five minutes so advancing a minute changes both figures.
     const staying = payload.cards[1];
     const going = payload.cards[6];
+    payload.cards = [staying, going];
     staying.endedAt = FIXTURE_CLOCK - 300_000;
     going.endedAt = FIXTURE_CLOCK - 300_000;
     await post(page, payload);
@@ -166,7 +171,7 @@ test('the clock writes nothing into a card that has left the page', async (t) =>
     })()`)) as string;
     assert.equal(gone, before, 'the two ages did not start together');
 
-    await post(page, { ...payload, cards: payload.cards.slice(0, 3) });
+    await post(page, { ...payload, cards: [staying] });
     assert.equal(await page.locator(`[data-key=${JSON.stringify(going.key)}]`).count(), 0);
 
     await runFor(page, 61_000);
