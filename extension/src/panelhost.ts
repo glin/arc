@@ -5200,11 +5200,22 @@ export class PanelProvider implements vscode.Disposable {
     this.compressedRowsTimer.unref?.();
   }
 
+  // A failed merge keeps its files in the dirty set, so the next merge or catalog refresh lists them.
+  private applyCompressedRows(): void {
+    const dirty = this.compressedRowsDirty;
+    try {
+      this.mergeCompressedRows();
+    } catch (error) {
+      this.compressedRowsDirty = dirty;
+      console.warn('Arc: session reading failed.', error);
+    }
+  }
+
   // Merges the rows whose entries changed since the last list into the held and accepted catalogs, and posts the session
   // list. Its work follows the changed rows: a row keeps its spend source, discovery state, statistics and order, and
   // every other row keeps the facts of the refresh that listed it. A catalog refresh merges the same rows through
   // `withCompressedFactRows`. A catalog that cannot take the rows runs that refresh.
-  private applyCompressedRows(): void {
+  private mergeCompressedRows(): void {
     const dirty = this.compressedRowsDirty;
     if (this.disposed || !dirty?.size || !this.anyVisible()) return;
     if (this.refreshController || this.selectedRefreshes) {
@@ -5315,11 +5326,7 @@ export class PanelProvider implements vscode.Disposable {
     if (!this.compressedRowsWaiting) return;
     this.compressedRowsWaiting = false;
     if (this.pendingRefresh) return;
-    try {
-      this.applyCompressedRows();
-    } catch (error) {
-      console.warn('Arc: session reading failed.', error);
-    }
+    this.applyCompressedRows();
   }
 
   // A compressed-facts refresh reuses the held catalog, and sets the `compressedRows` gauge at its end.

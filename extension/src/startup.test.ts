@@ -3298,6 +3298,7 @@ function completeDiscoveryHarness(
     'offerCompressedRows',
     'armCompressedRowsTimer',
     'applyCompressedRows',
+    'mergeCompressedRows',
     'noteCompressedCoverage',
     'noteCompressedRowFacts',
     'drainCompressedRows',
@@ -13156,6 +13157,42 @@ test('a batch row that a panel shows redraws through the selected-window refresh
     [['selected-window', true, true, null, true, true]],
     'the shown row did not redraw through one selected-window refresh',
   );
+});
+
+test('a batch whose row builder throws once keeps its rows for the next merge', async () => {
+  const { provider, posted, entryOf } = await batchApplyHarness();
+  const rowOf = provider.compressedRowOf;
+  let throws = 0;
+  provider.compressedRowOf = function (...args: unknown[]) {
+    if (throws > 0) {
+      throws--;
+      throw new Error('row builder failed');
+    }
+    return rowOf.apply(this, args);
+  };
+  const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  try {
+    const failed = entryOf('failed-row');
+    throws = 1;
+    provider.applyCompressedBatch({ entries: [failed.entry], backfillMs: 0 });
+    assert.equal(provider.compressedRowsDirty?.has(failed.twin), true, 'the failed merge lost its row');
+    provider.applyCompressedBatch({ entries: [entryOf('next-row').entry], backfillMs: 0 });
+    endBatchWindow(provider);
+    const listed = posted.at(-1) ?? [];
+    assert.ok(listed.includes('failed-row'), 'the next merge did not list the row that failed');
+    assert.ok(listed.includes('next-row'), 'the next merge did not list its own row');
+
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    provider.applyCompressedBatch({ entries: [entryOf('first-of-window').entry], backfillMs: 0 });
+    const owed = entryOf('owed-row');
+    provider.applyCompressedBatch({ entries: [owed.entry], backfillMs: 0 });
+    throws = 1;
+    await vi.advanceTimersByTimeAsync(5_000);
+    assert.equal(provider.compressedRowsDirty?.has(owed.twin), true, 'the merge at the window end lost its row');
+  } finally {
+    vi.useRealTimers();
+    warn.mockRestore();
+  }
 });
 
 test('twenty batches with no shown session redraw only for the first row of an empty list', async () => {
