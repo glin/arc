@@ -195,6 +195,17 @@ let heldDispatchReferences: {
   scope: string;
   references: readonly import('./transcript').ClaudeChildSessionReference[];
   admittedReferences: ReturnType<typeof admittedDispatchReferences>;
+  // The receipt answer of that reply: the catalog it read and the launches it visited with their references.
+  receipts: {
+    catalog: readonly SessionFile[];
+    launches: ReadonlyMap<string, string[]>;
+    references: ReadonlyMap<string, import('./transcript').ClaudeDispatchSessionReference>;
+  };
+} | null = null;
+// The receipt revision that the host sent for this epoch.
+let requestedReceiptRevision: {
+  epoch: string | undefined;
+  revision: import('./dispatchreceipts').DispatchStoreRevision;
 } | null = null;
 // A new worker takes a dispatched file's facts from its saved reference row once.
 function seededDispatch(file: string): HeldDispatchFacts | undefined {
@@ -336,14 +347,21 @@ function closeReceiptScan(cause: 'epoch' | 'store' | 'refusal'): void {
   receiptScan = null;
 }
 const catalogIdentity = (agent: string, sessionId: string) => JSON.stringify([agent, sessionId]);
-// Names the identities whose catalog rows differ between two catalogs, by file and child flag.
-function changedCatalogIdentities(before: readonly SessionFile[], after: readonly SessionFile[]): Set<string> {
+const catalogRowPlace = (row: SessionFile) => `${normalizeFsPath(row.file)}|${row.childTranscript === true}`;
+const catalogRowRevision = (row: SessionFile) =>
+  `${catalogRowPlace(row)}|${row.size}:${row.mtimeMs}:${String(row.dev)}:${String(row.ino)}`;
+// Names the identities whose catalog rows differ between two catalogs, by the place of each row or by the row key the caller passes.
+function changedCatalogIdentities(
+  before: readonly SessionFile[],
+  after: readonly SessionFile[],
+  rowKey: (row: SessionFile) => string = catalogRowPlace,
+): Set<string> {
   const rows = (catalog: readonly SessionFile[]) => {
     const byIdentity = new Map<string, string[]>();
     for (const row of catalog) {
       const key = catalogIdentity(row.agent, row.sessionId);
       const files = byIdentity.get(key) ?? [];
-      files.push(`${normalizeFsPath(row.file)}|${row.childTranscript === true}`);
+      files.push(rowKey(row));
       byIdentity.set(key, files);
     }
     return new Map([...byIdentity].map(([key, files]) => [key, JSON.stringify(files.sort())]));
@@ -970,6 +988,7 @@ async function execute(
       };
     }
     const epoch = discoveryEpoch;
+    if (request.receiptRevision) requestedReceiptRevision = { epoch: epoch.epoch, revision: request.receiptRevision };
     // The host's checkpoint as the request carried it. A receipt reply is a delta only while the epoch is that checkpoint.
     const hostCheckpoint =
       epoch === request.discovery ? { sequence: epoch.sequence, completed: epoch.completed } : null;
@@ -1488,6 +1507,48 @@ async function execute(
     // A replaced store directory starts the scan again from its first entry, here and before publication. Other store changes
     // keep the scan's position.
     if (receiptScan && receiptScan.store.storeIdentity() !== receiptScan.storeIdentity) closeReceiptScan('store');
+    // A store that keeps the revision of the last settled pass gives the same answer, so this pass reads no receipt. A launch
+    // whose catalog rows moved or whose dispatched child moved is read again against the current catalog.
+    const heldReceipts = heldDispatchReferences?.scope === scope ? heldDispatchReferences.receipts : undefined;
+    const requestedRevision =
+      requestedReceiptRevision?.epoch === epoch.epoch ? requestedReceiptRevision.revision : undefined;
+    if (!receiptScan && heldReceipts && requestedRevision) {
+      const store = new DispatchReceipts();
+      if (await store.unchangedSince(requestedRevision)) {
+        const controller = new AbortController();
+        const launches = new Map(heldReceipts.launches);
+        const references = new Map(heldReceipts.references);
+        const placeChanged = changedCatalogIdentities(heldReceipts.catalog, epoch.catalog);
+        const revisionChanged = changedCatalogIdentities(heldReceipts.catalog, epoch.catalog, catalogRowRevision);
+        const retries: string[] = [];
+        for (const [launchId, identities] of launches) {
+          const child = identities[1];
+          if (!identities.some((identity) => placeChanged.has(identity)) && !(child && revisionChanged.has(child)))
+            continue;
+          launches.delete(launchId);
+          references.delete(launchId);
+          retries.push(launchId);
+        }
+        const scan: ReceiptScan = {
+          storeIdentity: store.storeIdentity(),
+          storeRevision: requestedRevision.store,
+          evidence: new Map(requestedRevision.evidence),
+          unproved: false,
+          epoch: epoch.epoch,
+          store,
+          controller,
+          catalog: epoch.catalog,
+          steps: store.relationships(() => scan.catalog, controller.signal),
+          launches,
+          references,
+          retries,
+          retry: null,
+          storeRead: true,
+          competitionRefused: false,
+        };
+        receiptScan = scan;
+      }
+    }
     if (!receiptScan) {
       heldReceiptCountsFor(scope).opens.push(
         receiptScanClosed ? RECEIPT_SCAN_OPEN_CHARGES[receiptScanClosed] : 'receiptScanOpensNewWorker',
@@ -1643,7 +1704,17 @@ async function execute(
       new Set(admittedReferences.flatMap((reference) => (reference.file ? [reference.file] : []))),
     );
     const spend = collectDispatchFacts(request, references, admittedReferences, charges);
-    heldDispatchReferences = { scope: JSON.stringify(epoch.repositoryRoots), references, admittedReferences };
+    heldDispatchReferences = {
+      scope: JSON.stringify(epoch.repositoryRoots),
+      references,
+      admittedReferences,
+      receipts: {
+        catalog: activeReceipts.catalog,
+        launches: activeReceipts.launches,
+        references: activeReceipts.references,
+      },
+    };
+    requestedReceiptRevision = null;
     recordHeldReceiptCounts(charges, scope);
     if (unsettled.unfinished) charges.unsettledUnfinishedSources!++;
     if (unsettled.deferred) charges.unsettledDeferredSources!++;

@@ -1302,6 +1302,108 @@ test('a refused receipt read leaves no store revision until a clean pass', async
   }
 });
 
+// Appends a line to one source transcript and moves its catalog row to the file's new revision, as the next walk lists it.
+function growTranscript(row: { file: string; size: number; mtimeMs: number }) {
+  fs.appendFileSync(
+    row.file,
+    `${JSON.stringify({ type: 'system', timestamp: '2026-01-01T00:00:05Z' })}
+`,
+  );
+  Object.assign(row, revisionOf(fs.statSync(row.file, { bigint: true })));
+}
+
+test('a member change reuses the held receipt answer across three walked requests', async () => {
+  const { fx, worker, pass, walk, settle, checks } = await receiptWalkHarness();
+  try {
+    fx.launch();
+    await settle();
+    const costs: number[] = [];
+    for (let index = 0; index < 3; index++) {
+      growTranscript(fx.parent);
+      assert.equal(await walk(), false, 'a walk kept discovery over a grown parent');
+      const before = checks();
+      const reply = await pass();
+      costs.push(checks() - before);
+      assert.ok(
+        reply.references.some(
+          (reference) => reference.kind === 'dispatch' && reference.sessionId === fx.child.sessionId,
+        ),
+        'the reused answer lost its dispatched child',
+      );
+    }
+    assert.deepEqual(costs.slice(1), [0, 0], `receipt checks by walk: ${costs.join(', ')}`);
+  } finally {
+    worker.stop();
+    vi.unstubAllEnvs();
+  }
+});
+
+test('a receipt change between two walked requests scans the store and finds the change', async () => {
+  const { fx, worker, pass, walk, settle, checks } = await receiptWalkHarness();
+  try {
+    fx.launch();
+    await settle();
+    growTranscript(fx.parent);
+    await pass();
+    fx.launch(fx.parent, fx.grandchild);
+    growTranscript(fx.parent);
+    assert.equal(await walk(), false);
+    const before = checks();
+    const reply = await pass();
+    assert.ok(checks() > before, 'the pass after a receipt change read no receipt');
+    assert.ok(
+      reply.references.some(
+        (reference) => reference.kind === 'dispatch' && reference.sessionId === fx.grandchild.sessionId,
+      ),
+      'the pass after a receipt change missed the new launch',
+    );
+  } finally {
+    worker.stop();
+    vi.unstubAllEnvs();
+  }
+});
+
+test('a worker with no held references scans the store in full', async () => {
+  const { fx, worker, pass, settle, checks } = await receiptWalkHarness();
+  try {
+    fx.launch();
+    await settle();
+    worker.stop();
+    growTranscript(fx.parent);
+    const before = checks();
+    await pass();
+    assert.ok(checks() > before, 'a new worker reused references that it does not hold');
+  } finally {
+    worker.stop();
+    vi.unstubAllEnvs();
+  }
+});
+
+test('a reused receipt answer checks the opening of a dispatched child whose file moved', async () => {
+  const { fx, worker, pass, settle } = await receiptWalkHarness();
+  try {
+    fx.launch();
+    await settle();
+    fs.writeFileSync(
+      fx.child.file,
+      `${JSON.stringify({ type: 'user', replaced: true })}
+`,
+    );
+    Object.assign(fx.child, revisionOf(fs.statSync(fx.child.file, { bigint: true })));
+    growTranscript(fx.parent);
+    const reply = await pass();
+    assert.ok(
+      !reply.references.some(
+        (reference) => reference.kind === 'dispatch' && reference.sessionId === fx.child.sessionId,
+      ),
+      'the reused answer kept a dispatched child whose opening changed',
+    );
+  } finally {
+    worker.stop();
+    vi.unstubAllEnvs();
+  }
+});
+
 // Tests of events inside a receipt scan read a small store over several requests, so each request gets 256 receipt steps.
 function narrowReceiptBudget(code: string): string {
   const allowance = 'receiptSteps >= RECEIPT_STEPS';

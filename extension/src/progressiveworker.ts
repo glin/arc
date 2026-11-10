@@ -390,6 +390,9 @@ export type ProgressiveRequest =
       discovery?: DiscoveryCheckpoint;
       discoveryBytes?: number;
       quantumBytes?: number;
+      // The receipt store revision of the last settled pass. A worker that still holds its answer reuses it while the store keeps
+      // this revision. The first request of an epoch carries it.
+      receiptRevision?: import('./dispatchreceipts').DispatchStoreRevision;
       // Reads only the spend and person facts of the dispatch references of the last complete reply.
       spendOnly?: true;
       // The complete host set of compressed rollouts, sent only when the set changed since the last send to this worker.

@@ -15063,6 +15063,9 @@ export class PanelProvider implements vscode.Disposable {
           codexChildren,
           parents,
           catalog: parents,
+          ...(!this.discoveryCheckpoint && this.settledDiscovery
+            ? { receiptRevision: this.settledDiscovery.receipts }
+            : {}),
           repositoryRoots: this.repositoryScopeRoots,
           referenceEntries: [...this.claudeChildReferenceEntries],
           discovery: this.discoveryCheckpoint,
