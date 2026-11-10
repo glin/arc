@@ -723,11 +723,13 @@ export class CompressedBackfill {
       this.dirty = true;
       return;
     }
-    if (read.kind === 'decoded' || read.kind === 'failed') await this.retryLater(job);
+    if (read.kind !== 'cancelled') await this.retryLater(job);
   }
 
-  // A zstd error or a cut twin runs again after each delay. Then the entry saves `unreadable`, and another launch tries it
-  // once, because the stored mark holds the end of the count across launches. A new size or modification time restarts it.
+  // A zstd error, a cut twin, a file that does not open or a missing decoder runs again after each delay. A rollout that
+  // left the disk ends at the next plan, which finds no file. After the last delay the entry saves `unreadable`, and
+  // another launch tries it once, because the stored mark holds the end of the count across launches. A new size or
+  // modification time restarts it.
   private async retryLater(job: Job): Promise<void> {
     const held = this.retries.get(job.file);
     const same = held && held.size === job.stat.size && held.mtimeMs === job.stat.mtimeMs;
@@ -735,13 +737,15 @@ export class CompressedBackfill {
     const saved = stored?.unreadable && stored.size === job.stat.size && stored.mtimeMs === job.stat.mtimeMs;
     const attempts = same ? held.attempts : 0;
     if (saved || attempts >= BACKFILL_RETRY_DELAYS_MS.length) {
-      this.retries.set(job.file, {
+      const ended = {
         size: job.stat.size,
         mtimeMs: job.stat.mtimeMs,
         attempts: BACKFILL_RETRY_DELAYS_MS.length,
         at: Infinity,
-      });
-      await this.publishUnreadable(job);
+      };
+      this.retries.set(job.file, ended);
+      // A mark that did not reach the disk stays due, so a later plan reads the name once more.
+      if (!(await this.publishUnreadable(job))) ended.at = -Infinity;
       return;
     }
     const delay = BACKFILL_RETRY_DELAYS_MS[attempts];
@@ -756,13 +760,17 @@ export class CompressedBackfill {
   }
 
   // An unreadable revision keeps the title, the spend record and the completeness that the store holds, so a failed decode
-  // neither lowers a shown total nor blanks a row. A store that does not answer publishes nothing, and the entry stays.
-  private async publishUnreadable(job: Job): Promise<void> {
+  // neither lowers a shown total nor blanks a row. A store that does not answer publishes nothing, the entry stays and a
+  // later plan runs. The result is true when the mark reached the disk.
+  private async publishUnreadable(job: Job): Promise<boolean> {
     const previous = this.factsOf(job.file);
     const hasFacts = !!previous && !previous.nameOnly && !previous.adoptionFailed;
     const stored = hasFacts ? await this.storedEntry(job.file) : undefined;
-    if (hasFacts && !stored) return;
-    await this.publish({
+    if (hasFacts && !stored) {
+      this.replanLater();
+      return false;
+    }
+    return this.publish({
       ...(stored ? withoutOutdatedTitle(stored) : { complete: false, nameOnly: true }),
       decodedLength: undefined,
       file: job.file,
@@ -789,8 +797,8 @@ export class CompressedBackfill {
     return failed ? null : read.entries;
   }
 
-  // Each derivation is on disk before the next one starts.
-  private async publish(next: CompressedFactEntry): Promise<void> {
+  // Each derivation is on disk before the next one starts. The result is true when the entry reached the disk.
+  private async publish(next: CompressedFactEntry): Promise<boolean> {
     let previous: CompressedFactEntry | undefined = this.results.get(next.file) ?? this.options.known().get(next.file);
     // Only a marked derivation needs the stored spend record, so the worker holds no spend for the other entries.
     if (next.undercount && !next.unreadable && !previous?.spend) {
@@ -798,13 +806,17 @@ export class CompressedBackfill {
       // A store that gave no answer can hold the higher total, so this derivation publishes nothing and a later plan runs it.
       if (!stored) {
         this.replanLater();
-        return;
+        return false;
       }
       previous = stored.get(next.file) ?? previous;
     }
     const entry = boundedCompressedEntry(withKeptUndercount(previous, next));
     const [written] = await this.options.facts.append([entry]);
-    if (!written && !(await this.options.facts.durable([entry]))) return;
+    // An entry that did not reach the disk plans its name again.
+    if (!written && !(await this.options.facts.durable([entry]))) {
+      this.dirty = true;
+      return false;
+    }
     this.results.set(entry.file, compressedEntrySeed(entry));
     this.outbox.set(entry.file, entry);
     if (entry.opening) {
@@ -813,6 +825,7 @@ export class CompressedBackfill {
       await this.appendOpenings([opening]);
     }
     this.armFlush();
+    return true;
   }
 
   private armFlush(): void {

@@ -16180,6 +16180,144 @@ test('a retry timer that fires before its due time still runs the retry', async 
   }
 });
 
+const unitOpeningLine = JSON.stringify({
+  type: 'session_meta',
+  timestamp: timestamp(0),
+  payload: { id: COMPRESSED_THREAD, cwd: '/repo' },
+});
+
+const backfillIdle = (backfill: CompressedBackfill) => !(backfill as unknown as { running: boolean }).running;
+
+test.each(['missing', 'unsupported'] as const)(
+  'a body stream that ends %s takes the retries and saves unreadable',
+  async (answer) => {
+    let decodes = 0;
+    const harness = backfillHarness({
+      exists: () => false,
+      statOf: () => ({ ...unitStat, isFile: true }),
+      readFirst: async () => unitOpeningLine,
+      stream: async () => {
+        decodes++;
+        return { kind: answer };
+      },
+    });
+    const { backfill, batches, advance, scheduled } = harness;
+    try {
+      backfill.setNames(['a.jsonl.zst']);
+      for (const [attempt, delay] of [10_000, 60_000, 600_000].entries()) {
+        await vi.waitFor(() => assert.equal(decodes, attempt + 1));
+        await vi.waitFor(() => assert.equal(scheduled.length, 1, 'the stream end scheduled no retry'));
+        assert.equal(scheduled[0].at - harness.now(), delay);
+        advance(delay);
+      }
+      await vi.waitFor(() => assert.equal(decodes, 4));
+      await vi.waitFor(() => {
+        advance(1_000);
+        assert.equal(batches.flatMap((batch) => batch.entries).length, 1, 'no unreadable entry');
+      });
+      const [entry] = batches.flatMap((batch) => batch.entries);
+      assert.equal(entry.unreadable, true);
+      assert.equal(entry.decodedLength, undefined, 'an unreadable entry claimed a decoded length');
+    } finally {
+      backfill.dispose();
+    }
+  },
+);
+
+test('a rollout that left the disk ends its retries', async () => {
+  let gone = false;
+  let decodes = 0;
+  const harness = backfillHarness({
+    exists: () => false,
+    statOf: () => (gone ? null : { ...unitStat, isFile: true }),
+    stream: async () => {
+      decodes++;
+      return { kind: 'missing' };
+    },
+  });
+  seedBody(harness, 'a.jsonl.zst');
+  try {
+    harness.backfill.setNames(['a.jsonl.zst']);
+    await vi.waitFor(() => assert.equal(harness.scheduled.length, 1, 'the stream end scheduled no retry'));
+    gone = true;
+    harness.advance(10_000);
+    await vi.waitFor(() => assert.equal(backfillIdle(harness.backfill), true));
+    assert.equal(decodes, 1, 'a rollout that left the disk decoded again');
+    assert.equal(harness.scheduled.length, 0, 'a rollout that left the disk kept a timer');
+    assert.deepEqual(harness.facts, [], 'a rollout that left the disk saved an entry');
+  } finally {
+    harness.backfill.dispose();
+  }
+});
+
+test('a publish that does not reach the disk publishes on the next plan', async () => {
+  let refusals = 1;
+  const written: CompressedFactEntry[] = [];
+  const harness = backfillHarness({
+    exists: () => false,
+    statOf: () => ({ ...unitStat, isFile: true }),
+    stream: async () => unitDecoded(),
+    facts: {
+      directory: tempDir('backfill-refused-'),
+      append: async (entries: CompressedFactEntry[]) => {
+        if (refusals-- > 0) return entries.map(() => false);
+        written.push(...entries);
+        return entries.map(() => true);
+      },
+      durable: async () => false,
+    } as unknown as CompressedStoreHolder,
+  });
+  seedBody(harness, 'a.jsonl.zst');
+  try {
+    harness.backfill.setNames(['a.jsonl.zst']);
+    await vi.waitFor(() => assert.equal(written.length, 1, 'the name did not publish on the next plan'));
+  } finally {
+    harness.backfill.dispose();
+  }
+});
+
+test('an unreadable entry that the store does not answer stays due for a later plan', async () => {
+  let storeReads = 0;
+  let decodes = 0;
+  const harness = backfillHarness({
+    exists: () => false,
+    statOf: () => ({ ...unitStat, isFile: true }),
+    stream: async () => {
+      decodes++;
+      return { kind: 'failed' };
+    },
+    readStore: async (_directory, _statOf, _yieldStep, onUnreadable) => {
+      if (storeReads++ === 0) {
+        onUnreadable?.('segment-retired');
+        return { entries: new Map(), names: [] };
+      }
+      const stored = { file: 'a.jsonl.zst', pairKey: 'a', ...compressedEntryVersions() };
+      return { entries: new Map([['a.jsonl.zst', stored]]), names: [] };
+    },
+  });
+  const { backfill, batches, advance, scheduled } = harness;
+  seedBody(harness, 'a.jsonl.zst');
+  try {
+    backfill.setNames(['a.jsonl.zst']);
+    for (const delay of [10_000, 60_000, 600_000]) {
+      await vi.waitFor(() => assert.equal(scheduled.length, 1, 'no retry timer'));
+      advance(delay);
+    }
+    await vi.waitFor(() => assert.equal(storeReads, 1, 'the last retry read no store'));
+    await vi.waitFor(() => assert.equal(scheduled.length, 1, 'the entry waited for no later plan'));
+    assert.equal(scheduled[0].at - harness.now(), 600_000);
+    assert.equal(batches.length, 0, 'a store that gave no answer published an entry');
+    advance(600_000);
+    await vi.waitFor(() => {
+      advance(1_000);
+      assert.equal(batches.flatMap((batch) => batch.entries)[0]?.unreadable, true, 'no unreadable entry');
+    });
+    assert.equal(decodes, 5, 'the later plan did not read the name once more');
+  } finally {
+    backfill.dispose();
+  }
+});
+
 test.skipIf(!zstdCompress)('a rollout whose opening has no id takes the id in its file name', async () => {
   const directory = tempDir('worker-no-id-');
   const file = path.join(directory, `rollout-2026-01-01T00-00-00-${COMPRESSED_THREAD}.jsonl.zst`);
