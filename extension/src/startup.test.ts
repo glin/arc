@@ -355,6 +355,7 @@ import {
   liveDirectories,
   compressedPending,
   compressedPendingInput,
+  compressedUnreadableMarks,
   holdUntil,
   holdReading,
   finishHold,
@@ -12504,6 +12505,48 @@ test('compressedPending counts an entry the backfill marked unreadable at the cu
   assert.equal(compressedPending(home, input), 1, 'a mark of the current revision did not settle its name');
 });
 
+test('an unreadable mark from an earlier launch leaves its name pending until this launch writes its entry', () => {
+  const { home, facts } = pendingStores('pending-earlier-mark-');
+  const file = 'readable-now.zst';
+  const entry = (fields: object) => ({
+    file,
+    pairKey: file,
+    ...pendingVersions,
+    size: pendingStat.size,
+    mtimeMs: pendingStat.mtimeMs,
+    ...fields,
+  });
+  const mark = (launch: string) =>
+    entry({ complete: false, nameOnly: true, unreadable: true, unreadableLaunch: launch });
+  writeSegment(facts, [mark('earlier')]);
+  const input = {
+    names: [file],
+    admitted: new Set([file]),
+    statOf: () => pendingStat,
+    exists: () => false,
+    earlierMarks: compressedUnreadableMarks(home, () => pendingStat),
+  };
+  assert.equal(
+    compressedPending(home, input),
+    1,
+    'a mark of an earlier launch settled a rollout this launch still reads',
+  );
+  writeSegment(facts, [entry({ decodedLength: 9 })]);
+  assert.equal(compressedPending(home, input), 0, 'the entry of this launch did not settle its name');
+  writeSegment(facts, [mark('this-launch')]);
+  assert.equal(compressedPending(home, input), 0, 'a mark of this launch did not settle its name');
+});
+
+test('the runner reads the seeded unreadable marks before it launches the editor', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'panel-startup-measure', 'measure.ts'), 'utf8');
+  const read = source.indexOf('await compressedPendingInput(options, workspace, ARC_STORE)');
+  assert.notEqual(read, -1, 'the warm-up hold no longer names the seeded store');
+  assert.ok(
+    read < source.indexOf('launchEditor(commandLine, workspace, WARM_USER_DATA'),
+    'the runner read the marks after the launch',
+  );
+});
+
 test('a failed store read counts every name until the next reading', () => {
   const { home, facts } = pendingStores('pending-failed-');
   writeSegment(facts, [
@@ -13233,24 +13276,25 @@ test.skipIf(!rolloutCompression.zstdCompressSync)(
       warmUntil: [{ measure: 'compressedPending', value: 0 }],
       fixture: manifest,
     };
-    const input = await compressedPendingInput(options, repository, codex);
+    const { home, facts } = pendingStores('pending-input-store-');
+    const stat = readRolloutStat(file)!;
+    const revision = { file, pairKey: file, ...pendingVersions, size: stat.size, mtimeMs: stat.mtimeMs };
+    writeSegment(facts, [{ ...revision, nameOnly: true, unreadable: true, unreadableLaunch: 'earlier' }]);
+    const input = await compressedPendingInput(options, repository, home, codex);
     assert.deepEqual(input?.names, [file], 'the runner named a path outside the run tree');
     assert.deepEqual([...input.admitted], [file], 'the runner did not admit the rollout');
-    const { home, facts } = pendingStores('pending-input-store-');
-    assert.equal(compressedPending(home, input), 1, 'an undecoded rollout did not count');
-    const stat = readRolloutStat(file)!;
+    assert.equal(compressedPending(home, input), 1, 'a seeded mark settled an undecoded rollout');
     writeSegment(facts, [
       {
-        file,
-        pairKey: file,
-        ...pendingVersions,
-        size: stat.size,
-        mtimeMs: stat.mtimeMs,
+        ...revision,
         decodedLength: 9,
       },
     ]);
     assert.equal(compressedPending(home, input), 0, 'a decoded entry under the run path did not count as done');
-    assert.equal(await compressedPendingInput({ warmUntil: [], fixture: manifest }, repository, codex), undefined);
+    assert.equal(
+      await compressedPendingInput({ warmUntil: [], fixture: manifest }, repository, home, codex),
+      undefined,
+    );
   },
 );
 

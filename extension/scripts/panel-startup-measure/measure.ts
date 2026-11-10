@@ -1496,17 +1496,18 @@ export interface CompressedPendingInput {
   // The stat that the store compares its entries with. A test supplies a fake stat.
   statOf?: typeof compressedPhysicalStat;
   exists?: (file: string) => boolean;
+  // The unreadable marks that the store held before this launch, from `compressedUnreadableMarks`.
+  earlierMarks?: ReadonlySet<string>;
 }
 
-// Count the names a measured launch still decodes. An admitted file counts without a current decoded entry in the
-// workspace store. Any other name counts without a `.jsonl` twin and without a current opening in the machine store,
-// because the launch reads its first record otherwise. An entry that a launch marked unreadable at the file's current
-// revision counts as settled, because that revision gets no decoded length and no opening. A failed read of a store
-// counts every name until the next read.
-export function compressedPending(home: string, input: CompressedPendingInput): number {
+const unreadableMarkOf = (entry: CompressedFactEntry) => JSON.stringify([entry.file, entry.unreadableLaunch ?? null]);
+
+// The entries of every workspace store under a run's Arc home.
+function readWorkspaceFacts(
+  home: string,
+  statOf: typeof compressedPhysicalStat,
+): { facts: Map<string, CompressedFactEntry>; failed: boolean } {
   const cache = path.join(home, 'cache');
-  const statOf = input.statOf ?? compressedPhysicalStat;
-  const exists = input.exists ?? fs.existsSync;
   let failed = false;
   const onUnreadable = () => (failed = true);
   const facts = new Map<string, CompressedFactEntry>();
@@ -1521,14 +1522,46 @@ export function compressedPending(home: string, input: CompressedPendingInput): 
     const read = readCompressedStore(path.join(cache, workspace.name, COMPRESSED_STORES.facts), statOf, onUnreadable);
     for (const [file, entry] of read.entries) facts.set(file, entry);
   }
-  const openings = readCompressedStore(path.join(cache, COMPRESSED_STORES.openings), statOf, onUnreadable).entries;
+  return { facts, failed };
+}
+
+// The unreadable marks of a run's seeded store. The runner reads them before the launch, because a later read also holds
+// the marks of that launch. A seeded store that cannot be read stops the run.
+export function compressedUnreadableMarks(
+  home: string,
+  statOf: typeof compressedPhysicalStat = compressedPhysicalStat,
+): Set<string> {
+  const { facts, failed } = readWorkspaceFacts(home, statOf);
+  if (failed) throw new Error('The seeded compressed facts store is not readable.');
+  return new Set([...facts.values()].filter((entry) => entry.unreadable).map(unreadableMarkOf));
+}
+
+// Count the names a measured launch still decodes. An admitted file counts without a current decoded entry in the
+// workspace store. Any other name counts without a `.jsonl` twin and without a current opening in the machine store,
+// because the launch reads its first record otherwise. An entry that this launch marked unreadable at the file's current
+// revision counts as settled, because this launch gets no decoded length and no opening for that revision. A mark that
+// the seeded store held leaves its name pending, because another launch retries the revision. A failed read of a store
+// counts every name until the next read.
+export function compressedPending(home: string, input: CompressedPendingInput): number {
+  const statOf = input.statOf ?? compressedPhysicalStat;
+  const exists = input.exists ?? fs.existsSync;
+  const { facts, failed: factsFailed } = readWorkspaceFacts(home, statOf);
+  let failed = factsFailed;
+  const openings = readCompressedStore(path.join(home, 'cache', COMPRESSED_STORES.openings), statOf, () => {
+    failed = true;
+  }).entries;
   if (failed) return input.names.length;
   let pending = 0;
   for (const file of input.names) {
     if (exists(file.slice(0, -'.zst'.length))) continue;
     const stat = statOf(file);
     const marked = facts.get(file);
-    if (marked?.unreadable && compressedEntryCurrent(marked, stat)) continue;
+    if (
+      marked?.unreadable &&
+      compressedEntryCurrent(marked, stat) &&
+      !input.earlierMarks?.has(unreadableMarkOf(marked))
+    )
+      continue;
     if (input.admitted.has(file)) {
       const entry = facts.get(file);
       if (!entry || entry.decodedLength === undefined || !compressedEntryCurrent(entry, stat)) pending++;
@@ -1578,6 +1611,7 @@ export async function admittedCompressed(input: {
 export async function compressedPendingInput(
   options: Pick<Options, 'warmUntil' | 'fixture'>,
   workspace: string,
+  home: string,
   codex: string = soakRequested ? SOAK_CODEX : fixture.codex,
 ): Promise<CompressedPendingInput | undefined> {
   if (!options.warmUntil.some((condition) => condition.measure === 'compressedPending')) return undefined;
@@ -1587,7 +1621,7 @@ export async function compressedPendingInput(
   const rollouts = manifest.frozen?.compressed?.rollouts ?? [];
   const names = rollouts.map((entry) => path.join(codex, path.relative('codex', entry.file)));
   const { files } = await admittedCompressed({ workspace, codex, rollouts });
-  return { names, admitted: files };
+  return { names, admitted: files, earlierMarks: compressedUnreadableMarks(home) };
 }
 
 // Wait for every startup milestone by the measurement deadline.
@@ -1620,6 +1654,7 @@ async function measure(commandLine: string, workspace: string, options: Options)
       await awaitMachine(options.minimumFreeGb, 10 * 60_000);
       const warmRun = `${MEASUREMENT_RUN}-warm`;
       const warmTempBefore = compressedTempNames(listTemp());
+      const pending = await compressedPendingInput(options, workspace, ARC_STORE);
       const warmAt = Date.now();
       const warmLaunch = launchEditor(commandLine, workspace, WARM_USER_DATA, warmRun);
       try {
@@ -1634,7 +1669,6 @@ async function measure(commandLine: string, workspace: string, options: Options)
         if (!warm.complete) return { ...warm, complete: false, note: `The warm-up launch failed. ${warm.note ?? ''}` };
         if (options.warmUntil.length) {
           const failure = () => warmLaunch.failure;
-          const pending = await compressedPendingInput(options, workspace);
           const reading = await holdUntil({
             conditions: options.warmUntil,
             launchedAt: warmAt,
