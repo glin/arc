@@ -764,13 +764,19 @@ export class CompressedBackfill {
         at: Infinity,
       };
       this.retries.set(job.file, ended);
-      // A mark that did not reach the disk stays due, so a later plan reads the name once more.
-      if (!(await this.publishUnreadable(job))) ended.at = -Infinity;
+      // A mark that did not reach the disk waits for the last retry delay before a later plan reads the name again.
+      if (!(await this.publishUnreadable(job)))
+        this.retryAfter(ended, BACKFILL_RETRY_DELAYS_MS[BACKFILL_RETRY_DELAYS_MS.length - 1]);
       return;
     }
     const delay = BACKFILL_RETRY_DELAYS_MS[attempts];
-    const retry = { size: job.stat.size, mtimeMs: job.stat.mtimeMs, attempts: attempts + 1, at: this.now() + delay };
+    const retry = { size: job.stat.size, mtimeMs: job.stat.mtimeMs, attempts: attempts + 1, at: 0 };
     this.retries.set(job.file, retry);
+    this.retryAfter(retry, delay);
+  }
+
+  private retryAfter(retry: { at: number }, delay: number): void {
+    retry.at = this.now() + delay;
     // The timer can fire before `at` by the loop's cached time, so the firing itself marks the retry due.
     this.schedule(delay, () => {
       retry.at = -Infinity;
@@ -786,10 +792,7 @@ export class CompressedBackfill {
     const previous = this.factsOf(job.file);
     const hasFacts = !!previous && !previous.nameOnly && !previous.adoptionFailed;
     const stored = hasFacts ? await this.storedEntry(job.file) : undefined;
-    if (hasFacts && !stored) {
-      this.replanLater();
-      return false;
-    }
+    if (hasFacts && !stored) return false;
     return this.publish({
       ...(stored ? withoutOutdatedTitle(stored) : { complete: false, nameOnly: true }),
       decodedLength: undefined,

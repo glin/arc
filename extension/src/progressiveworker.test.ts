@@ -17006,6 +17006,42 @@ test('a list between an added name and its body keeps the body before the unplac
   }
 });
 
+test('an unreadable mark that does not reach the disk decodes nothing until the last retry delay passes', async () => {
+  let decodes = 0;
+  const harness = backfillHarness({
+    exists: () => false,
+    statOf: () => ({ ...unitStat, isFile: true }),
+    stream: async () => {
+      decodes++;
+      return { kind: 'failed' };
+    },
+    readStore: async (_directory, _statOf, _yieldStep, onUnreadable) => {
+      onUnreadable?.('segment-retired');
+      return { entries: new Map(), names: [] };
+    },
+  });
+  const { backfill, advance, scheduled } = harness;
+  seedBody(harness, 'a.jsonl.zst');
+  try {
+    backfill.setNames(['a.jsonl.zst']);
+    for (const delay of [10_000, 60_000, 600_000]) {
+      await vi.waitFor(() => assert.equal(scheduled.length, 1, 'no retry timer'));
+      advance(delay);
+    }
+    await vi.waitFor(() => assert.equal(decodes, 4, 'the last retry did not decode'));
+    await vi.waitFor(() => assert.equal(backfillIdle(backfill), true));
+    assert.equal(scheduled.length, 1, 'the name has no later attempt');
+    advance(1_000);
+    backfill.setNames(['a.jsonl.zst']);
+    await vi.waitFor(() => assert.equal(backfillIdle(backfill), true));
+    assert.equal(decodes, 4, 'a plan inside the delay decoded the name');
+    advance(599_000);
+    await vi.waitFor(() => assert.equal(decodes, 5, 'the name did not decode after the delay'));
+  } finally {
+    backfill.dispose();
+  }
+});
+
 test('a publish over a held opening of another generation appends a current opening', async () => {
   const store = storeBackedFacts(path.join(tempDir('backfill-held-opening-'), 'openings'));
   const versions = compressedEntryVersions();
