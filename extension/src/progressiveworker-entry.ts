@@ -280,6 +280,12 @@ interface ReceiptScan {
   controller: AbortController;
   // The physical identity of the store directory when the scan opened it.
   storeIdentity: string;
+  // The store revision from before the scan opened the store, or undefined when the store proves nothing about a later read.
+  storeRevision: string | undefined;
+  // Each directory and absent path outside the store that the scan checked, with its revision.
+  outside: Map<string, string | null>;
+  // True after a refused read, or after one path answered with two revisions.
+  unproved: boolean;
 }
 let receiptScan: ReceiptScan | null = null;
 // Why the last receipt scan of this worker closed. The next scan counts it when it opens.
@@ -1490,6 +1496,9 @@ async function execute(
       const store = new DispatchReceipts();
       const scan: ReceiptScan = {
         storeIdentity: store.storeIdentity(),
+        storeRevision: store.storeRevision(),
+        outside: new Map(),
+        unproved: false,
         epoch: epoch.epoch,
         store,
         controller,
@@ -1588,6 +1597,12 @@ async function execute(
         activeReceipts.references.set(launchId ?? `step-${activeReceipts.references.size}`, step.value.reference);
         activeReceipts.store.checkpointRelationships();
       }
+      if (step.value.refusal) activeReceipts.unproved = true;
+      for (const [file, revision] of step.value.outside ?? []) {
+        if (activeReceipts.outside.has(file) && activeReceipts.outside.get(file) !== revision)
+          activeReceipts.unproved = true;
+        activeReceipts.outside.set(file, revision);
+      }
       if (step.value.refusal && ('launchId' in step.value.refusal || step.value.refusal.storeOpened))
         activeReceipts.competitionRefused = true;
       receiptSteps++;
@@ -1653,6 +1668,9 @@ async function execute(
       roots: epoch.parents,
       scope: epoch.repositoryRoots,
       receiptStore: activeReceipts.storeIdentity,
+      ...(activeReceipts.storeRevision !== undefined && !activeReceipts.unproved
+        ? { receiptRevision: { store: activeReceipts.storeRevision, outside: [...activeReceipts.outside] } }
+        : {}),
     };
   }
   if ((request.kind === 'starts' || request.kind === 'metadata') && isCompressedRollout(request.session.file)) {

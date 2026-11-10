@@ -282,6 +282,8 @@ export interface DispatchRelationshipStep extends DispatchRelationshipAllowance 
   // The final step of one launch names it. Identities are present when its read reached a catalog lookup.
   launchId?: string;
   identities?: DispatchRelationshipIdentities;
+  // The directories and absent paths outside the store that the read of this launch checked, with their revisions.
+  outside?: Array<[string, string | null]>;
 }
 type RelationshipScan<T> = Generator<DispatchRelationshipStep, T, DispatchRelationshipAllowance>;
 
@@ -543,6 +545,7 @@ export class DispatchReceipts {
         launchId: id,
         ...(reader.identities ? { identities: reader.identities } : {}),
         ...(reference ? { reference } : {}),
+        outside: this.outsideRevisions(reader),
       };
       reader.progress = emptyRelationshipStep();
       return reference;
@@ -552,11 +555,19 @@ export class DispatchReceipts {
         launchId: id,
         ...(reader.identities ? { identities: reader.identities } : {}),
         ...(reader.refusal ? { refusal: { ...reader.refusal, launchId: id } } : {}),
+        outside: this.outsideRevisions(reader),
       };
       return null;
     } finally {
       reader.dispose();
     }
+  }
+  private outsideRevisions(reader: RelationshipReader): Array<[string, string | null]> {
+    return [...reader.revisions].filter(
+      ([file, revision]) =>
+        (revision === null || revision.endsWith(':directory')) &&
+        outsideDispatchStorage(this.root, file, this.platform),
+    );
   }
   // Each iterator is one epoch. New epochs revisit delayed bindings and changed catalog scope.
   *relationships(

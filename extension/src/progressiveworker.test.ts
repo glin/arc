@@ -1106,6 +1106,139 @@ async function receiptDiscoveryHost(
   return { host, replies };
 }
 
+// A real receipt store and worker behind the host's walk gate. `age` moves the store directories past the recent-write margin
+// to a time no other call used, so a later write still moves their modification time.
+async function receiptWalkHarness(prefix = (_fx: ReturnType<typeof receiptDispatchFixture>) => '') {
+  const root = tempDir('receipt-walk-');
+  const fx = receiptDispatchFixture(root, 'claude', 'claude');
+  fs.mkdirSync(fx.receipts.root, { recursive: true });
+  vi.stubEnv('ARC_HOME', fx.home);
+  const worker = new ProgressiveWorker(`process.env.ARC_HOME=${JSON.stringify(fx.home)};` + prefix(fx) + source);
+  const { host, replies } = await receiptDiscoveryHost(worker, [root], fx.catalog);
+  Object.assign(host, {
+    sourceEnumerations: { claude: { status: 'complete' }, codex: { status: 'complete' } },
+    enumeratedAdmissionComplete: true,
+    enumeratedAmbiguousIds: new Set(),
+    codexListingSeeded: false,
+    walkedChildSources: [],
+    compressedRolloutsToSend: () => ({}),
+  });
+  let generation = 0;
+  let checks = 0;
+  let ages = 0;
+  const age = () => {
+    const time = Date.now() / 1000 - 3600 - ages++;
+    for (const directory of [fx.receipts.root, path.join(fx.home, 'cache', 'dispatch-relationships')])
+      if (fs.existsSync(directory)) fs.utimesSync(directory, time, time);
+  };
+  const pass = async () => {
+    generation++;
+    host.refreshGeneration = generation;
+    for (let turn = 0; turn < 100; turn++) {
+      assert.equal(await host.prepareClaudeChildren(generation, new AbortController().signal), true);
+      const value = replies.last?.value;
+      if (value && 'charges' in value) checks += value.charges?.receiptChecks ?? 0;
+      if (value?.kind === 'claude-children' && !host.dispatchDiscoveryPending) {
+        host.sessionQueryDiscoveryPending = false;
+        return value;
+      }
+    }
+    throw new Error('discovery never settled');
+  };
+  const walk = async (): Promise<boolean> =>
+    host.settledDiscovery ? host.walkKeepsDiscovery(host.settledDiscovery) : false;
+  // The first pass saves the launch verifications, which moves the relationship cache directory.
+  const settle = async () => {
+    age();
+    await pass();
+    age();
+    await pass();
+  };
+  return { fx, root, worker, host, pass, walk, age, settle, checks: () => checks };
+}
+
+test('an unchanged receipt store records zero receipt checks across three walks', async () => {
+  const { fx, worker, pass, walk, settle, checks } = await receiptWalkHarness();
+  try {
+    fx.launch();
+    await settle();
+    const before = checks();
+    assert.ok(before > 0, 'the settling passes read no receipt');
+    for (let index = 0; index < 3; index++) {
+      if (await walk()) continue;
+      await pass();
+      assert.fail('a walk over an unchanged store started a pass');
+    }
+    assert.equal(checks(), before);
+  } finally {
+    worker.stop();
+    vi.unstubAllEnvs();
+  }
+});
+
+test.each(['added', 'changed', 'removed'] as const)(
+  'a receipt %s while no member moves starts a pass that finds the change',
+  async (change) => {
+    const { fx, worker, pass, walk, settle } = await receiptWalkHarness();
+    const dispatched = (value: Awaited<ReturnType<typeof pass>>) =>
+      value.references.filter((reference) => reference.kind === 'dispatch').map((reference) => reference.sessionId);
+    try {
+      fx.launch(fx.parent, fx.child);
+      const waiting = change === 'changed' ? fx.launch(fx.parent, fx.grandchild, true, false) : undefined;
+      const present = change === 'removed' ? fx.launch(fx.parent, fx.grandchild) : undefined;
+      await settle();
+      assert.equal(await walk(), true, 'the store moved before the change');
+      if (change === 'added') fx.launch(fx.parent, fx.grandchild);
+      if (change === 'changed') fx.accept(waiting!.launchId, fx.grandchild);
+      if (change === 'removed') fs.rmSync(path.join(fx.receipts.root, present!.launchId), { recursive: true });
+      assert.equal(await walk(), false, 'the walk kept discovery over a changed store');
+      const reply = await pass();
+      assert.equal(dispatched(reply).includes(fx.grandchild.sessionId), change !== 'removed');
+      assert.ok(dispatched(reply).includes(fx.child.sessionId));
+    } finally {
+      worker.stop();
+      vi.unstubAllEnvs();
+    }
+  },
+);
+
+test('a replaced directory outside the store that a receipt checked starts a pass', async () => {
+  const { fx, worker, walk, settle } = await receiptWalkHarness();
+  try {
+    fx.launch();
+    await settle();
+    assert.equal(await walk(), true);
+    const ancestor = path.dirname(fx.child.file);
+    fs.renameSync(ancestor, `${ancestor}-moved`);
+    fs.mkdirSync(ancestor);
+    assert.equal(await walk(), false, 'the walk kept discovery over a replaced directory');
+  } finally {
+    worker.stop();
+    vi.unstubAllEnvs();
+  }
+});
+
+test('a refused receipt read leaves no store revision until a clean pass', async () => {
+  const marker = path.join(tempDir('receipt-refusal-'), 'refuse');
+  const { fx, worker, host, pass, settle, walk } = await receiptWalkHarness(
+    (fx) =>
+      `const faultFs=require('node:fs'),faultOpen=faultFs.openSync;faultFs.openSync=function(p,...a){if(faultFs.existsSync(${JSON.stringify(marker)})&&String(p).startsWith(${JSON.stringify(fx.receipts.root)})&&String(p).endsWith('.json'))throw Object.assign(new Error('Receipt evidence is unavailable.'),{code:'EACCES'});return faultOpen.call(this,p,...a);};`,
+  );
+  try {
+    fx.launch();
+    fs.writeFileSync(marker, '');
+    await settle();
+    assert.equal((await pass()).receiptRevision, undefined, 'a refused scan still reported a store revision');
+    assert.equal(host.settledDiscovery, undefined, 'a refused scan armed the walk gate');
+    fs.rmSync(marker);
+    await settle();
+    assert.equal(await walk(), true, 'a clean scan armed no walk gate');
+  } finally {
+    worker.stop();
+    vi.unstubAllEnvs();
+  }
+});
+
 // Tests of events inside a receipt scan read a small store over several requests, so each request gets 256 receipt steps.
 function narrowReceiptBudget(code: string): string {
   const allowance = 'receiptSteps >= RECEIPT_STEPS';

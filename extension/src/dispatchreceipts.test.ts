@@ -147,6 +147,17 @@ function drainRelationships(
   return assert.fail('The bounded receipt scan did not finish.');
 }
 
+test('a store modified inside the write margin gives no revision until it ages', () => {
+  const receipts = new DispatchReceipts(tempDir('store-revision-'));
+  const absent = receipts.storeRevision();
+  assert.equal(absent, '\0', 'a missing store has a revision of its own');
+  fs.mkdirSync(receipts.root, { recursive: true });
+  const { mtimeMs } = fs.statSync(receipts.root);
+  assert.equal(receipts.storeRevision(mtimeMs + 1_999), undefined);
+  assert.equal(typeof receipts.storeRevision(mtimeMs + 2_001), 'string');
+  assert.notEqual(receipts.storeRevision(mtimeMs + 2_001), absent);
+});
+
 test('a receipt that names a compressed child transcript links no session', () => {
   const fx = relationshipFixture('claude', 'codex', false, undefined, 'native.jsonl.zst');
   assert.deepEqual(drainRelationships(fx.receipts.relationships(fx.catalog)), []);
