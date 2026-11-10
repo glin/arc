@@ -13627,6 +13627,67 @@ test('a joined row reaches its spend source and the session list at the next pol
   assert.ok(posted.at(-1)?.includes('joined-spend'), 'the session list lost the joined row');
 });
 
+test('a row whose only merge threw reaches its spend source at the next poll', async () => {
+  const { provider, sourceUpdates, entryOf } = await batchApplyHarness(pollScope, ['pollCatalog']);
+  provider.claudeChildrenDiscovered = true;
+  const sessionRowOf = provider.sessionRowOf;
+  let throws = 1;
+  provider.sessionRowOf = function (...args: unknown[]) {
+    if (throws > 0) {
+      throws--;
+      throw new Error('row builder failed');
+    }
+    return sessionRowOf.apply(this, args);
+  };
+  const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  try {
+    const joined = entryOf('failed-spend');
+    provider.applyCompressedBatch({ entries: [joined.entry], backfillMs: 0 });
+    endBatchWindow(provider);
+    assert.equal(throws, 0, 'the merge did not reach the row builder');
+    assert.equal(sourceUpdates.length, 0, 'the failed merge rebuilt the spend sources');
+    await pollOnce(provider);
+    assert.ok(
+      sourceUpdates.at(-1)?.some((row) => row.file === joined.twin),
+      'the row of the failed merge has no spend source after the next poll',
+    );
+  } finally {
+    warn.mockRestore();
+  }
+});
+
+test('a poll whose spend source rebuild fails leaves the rebuild to the poll after it', async () => {
+  const { provider, sourceUpdates, entryOf } = await batchApplyHarness(pollScope, ['pollCatalog']);
+  provider.claudeChildrenDiscovered = true;
+  const joined = entryOf('rebuild-fails');
+  provider.applyCompressedBatch({ entries: [joined.entry], backfillMs: 0 });
+  endBatchWindow(provider);
+  const update = provider.updateSessionSpendSources;
+  let throws = 1;
+  provider.updateSessionSpendSources = (...args: unknown[]) => {
+    if (throws > 0) {
+      throws--;
+      throw new Error('spend sources failed');
+    }
+    return update(...args);
+  };
+  const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  try {
+    await pollOnce(provider);
+    assert.equal(throws, 0, 'the poll did not try the rebuild');
+    assert.equal(sourceUpdates.length, 0, 'the failed rebuild reached the spend sources');
+    await pollOnce(provider);
+    assert.ok(
+      sourceUpdates.at(-1)?.some((row) => row.file === joined.twin),
+      'the poll after the failed rebuild did not rebuild the spend sources',
+    );
+    await pollOnce(provider);
+    assert.equal(sourceUpdates.length, 1, 'a poll after the rebuild succeeded rebuilt the spend sources again');
+  } finally {
+    warn.mockRestore();
+  }
+});
+
 test('a batch leaves the project spend post to the next poll unless a row of the batch is shown', async () => {
   const { provider, sourceUpdates, entryOf } = await batchApplyHarness(pollScope, ['pollCatalog']);
   provider.claudeChildrenDiscovered = true;

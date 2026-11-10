@@ -5251,6 +5251,7 @@ export class PanelProvider implements vscode.Disposable {
     }
     const replaced = held.sessions.filter((session) => dirty.has(session.file));
     const { rows, added } = this.takeCompressedRows(dirty, this.compressedWalk);
+    this.compressedSourcesOwed ||= added;
     const activity = (session: SessionFile) => this.activityFor(session);
     const sessions = placeInSessionCatalog(
       held.sessions.filter((session) => !dirty.has(session.file)),
@@ -5274,7 +5275,6 @@ export class PanelProvider implements vscode.Disposable {
     const changed = new Set([...rows, ...replaced].map((row) => row.sessionId));
     const shown = [this.showing, ...(this.hostSessions?.values() ?? [])].filter((id): id is string => id !== null);
     const showsChanged = shown.some((id) => changed.has(id));
-    this.compressedSourcesOwed ||= added;
     this.compressedSpendPostOwed = true;
     if (showsChanged) this.settleCompressedSpend();
     this.postRail(true, 'compressedBatch', undefined, false);
@@ -5289,17 +5289,22 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   // Brings the spend sources and the project spend up to the merged rows. Returns whether the spend sources were rebuilt,
-  // so a poll can post the session list that carries the new spend.
+  // so a poll can post the session list that carries the new spend. A rebuild that fails stays owed to the next poll.
   private settleCompressedSpend(): boolean {
-    const sourcesOwed = this.compressedSourcesOwed;
     const sessions = this.catalog?.sessions;
-    this.compressedSourcesOwed = false;
-    const rebuild = sourcesOwed && !!sessions && this.claudeChildrenDiscovered;
-    if (rebuild)
-      this.updateSessionSpendSources(
-        sessions.filter((session) => session.agent === 'codex'),
-        sessions,
-      );
+    const rebuild = this.compressedSourcesOwed && !!sessions && this.claudeChildrenDiscovered;
+    if (rebuild) {
+      try {
+        this.updateSessionSpendSources(
+          sessions.filter((session) => session.agent === 'codex'),
+          sessions,
+        );
+      } catch (error) {
+        console.warn('Arc: session cost update failed.', error);
+        return false;
+      }
+      this.compressedSourcesOwed = false;
+    }
     if (this.compressedSpendPostOwed && !this.projectSpendBusy()) this.postProjectSpend();
     this.compressedSpendPostOwed = false;
     return rebuild;
