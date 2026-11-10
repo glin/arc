@@ -17042,22 +17042,33 @@ test('an unreadable mark that does not reach the disk decodes nothing until the 
   }
 });
 
-test('a publish over a held opening of another generation appends a current opening', async () => {
+test('a publish appends the opening of a held opening of another generation and not of a current one', async () => {
   const store = storeBackedFacts(path.join(tempDir('backfill-held-opening-'), 'openings'));
   const versions = compressedEntryVersions();
+  const held = (file: string, codexMetaVersion: number): CompressedFactEntry => ({
+    file,
+    pairKey: file,
+    ...versions,
+    codexMetaVersion,
+    size: unitStat.size,
+    mtimeMs: unitStat.mtimeMs,
+    opening: compressedOpening,
+  });
   store.line([
-    {
-      file: 'a.jsonl.zst',
-      pairKey: 'a',
-      ...versions,
-      codexMetaVersion: versions.codexMetaVersion - 1,
-      size: unitStat.size,
-      mtimeMs: unitStat.mtimeMs,
-      opening: compressedOpening,
-    },
+    held('current.jsonl.zst', versions.codexMetaVersion),
+    held('stale.jsonl.zst', versions.codexMetaVersion - 1),
   ]);
+  const appended: string[] = [];
+  const openings = {
+    directory: store.holder.directory,
+    durable: async () => true,
+    append: async (entries: CompressedFactEntry[]) => {
+      appended.push(...entries.map((entry) => entry.file));
+      return store.holder.append(entries);
+    },
+  } as unknown as CompressedStoreHolder;
   const harness = backfillHarness({
-    openings: store.holder,
+    openings,
     exists: () => false,
     statOf: () => ({ ...unitStat, isFile: true }),
     stream: async (_file, push) => {
@@ -17068,11 +17079,14 @@ test('a publish over a held opening of another generation appends a current open
       return unitDecoded();
     },
   });
-  seedBody(harness, 'a.jsonl.zst');
+  seedBody(harness, 'current.jsonl.zst');
+  seedBody(harness, 'stale.jsonl.zst');
   try {
-    harness.backfill.setNames(['a.jsonl.zst']);
-    await vi.waitFor(() => assert.equal(harness.facts.length, 1, 'the name did not publish'));
-    const stored = readCompressedStore(store.holder.directory).entries.get('a.jsonl.zst');
+    harness.backfill.setNames(['current.jsonl.zst', 'stale.jsonl.zst']);
+    await vi.waitFor(() => assert.equal(harness.facts.length, 2, 'the names did not publish'));
+    await vi.waitFor(() => assert.equal(backfillIdle(harness.backfill), true));
+    assert.deepEqual(appended, ['stale.jsonl.zst'], 'only the stale held opening appends a current opening');
+    const stored = readCompressedStore(store.holder.directory).entries.get('stale.jsonl.zst');
     assert.equal(stored?.codexMetaVersion, versions.codexMetaVersion, 'the held opening of another generation stayed');
   } finally {
     harness.backfill.dispose();

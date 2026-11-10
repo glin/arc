@@ -382,7 +382,7 @@ test('an append during the trailing compaction is written and the idle release i
   await vi.waitFor(() => assert.equal(arrived, true, 'the trailing compaction did not run'));
   await vi.waitFor(() => assert.equal(holder.pending, 0, 'an append during the compaction stayed queued'));
   assert.equal(threadCount(directory), 3);
-  await holder.work();
+  await vi.waitFor(() => assert.equal((holder as unknown as { running: unknown }).running, null));
   clock.advance(20_000);
   assert.equal(fs.existsSync(path.join(directory, STORE_LOCK)), false, 'the idle release did not fire');
   holder.dispose();
