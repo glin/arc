@@ -1838,16 +1838,16 @@ export class PanelProvider implements vscode.Disposable {
   // figure refresh during the current spend-only tail.
   private dispatchFiguresHeld = false;
   private dispatchFiguresRefreshedAt?: number;
+  // The sub-condition that left the last accepted coverage incomplete.
+  private membershipCoverageGap?: AcceptedUnsettledCause;
   // The repository scope of a complete discovery reply whose catalog is not yet published, and the session files of the catalog it
   // answered. An incomplete reply or a scope change clears it. The next catalog publication under that scope turns it into the
   // completion stamp only when the reply answered every published session.
-  // The sub-condition that left the last accepted coverage incomplete.
-  private membershipCoverageGap?: AcceptedUnsettledCause;
   private discoveryComplete?: {
     scope: string;
     files: Set<string>;
     revisions?: Map<string, SessionFile>;
-    // True when the worker reported settled membership in the reply.
+    // True when the reply ends discovery or reports settled membership.
     settled?: boolean;
   };
   // The catalog membership of the last pass that an accepted identity mismatch requested. The same membership requests no second one.

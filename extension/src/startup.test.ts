@@ -22536,7 +22536,7 @@ test('an unowned dispatched session reads as unknown while its person scan is un
 });
 
 // A settled reply over a gap that no pass can answer. `gap` shapes the state that each acceptance reads, and the catalog it
-// returns, as a real walk would have left them. Each host and worker stays real from the reply on.
+// returns, as a real walk would have left them. The harness substitutes each discovery reply, and the host accepts it.
 function settledGapHarness(
   gap: (provider: any, current: any[], scope: string) => any[] | void,
   spendFailure?: 'held-false' | 'reject',
