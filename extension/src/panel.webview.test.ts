@@ -12155,11 +12155,16 @@ test('worker metadata carries the agent-run mark to the host', () => {
     /this\.sessionRowOf\(\s*f,\s*parentEdges\.edges,/,
     'the refresh builds its rail rows without the parent edges, so the detector reads no run',
   );
+  const mergedRows = memberFrom(panelHostSource, panelHostSource.indexOf('private noteCompressedRowFacts('));
   sourceMatch(
-    memberFrom(panelHostSource, panelHostSource.indexOf('private noteCompressedRowFacts(')),
-    /const edges = this\.sessionParentEdges\(admitted\)\.edges;[\s\S]*this\.sessionRowOf\(row, edges,/,
-    'a merged row is built without the parent edges of the accepted list',
+    mergedRows,
+    /const edges = this\.sessionParentEdges\(admitted\)\.edges;/,
+    'a merge reads no parent edges for the accepted list',
   );
+  const mergedRowCalls = mergedRows.match(/this\.sessionRowOf\([^,]+,\s*[^,]+,/g) ?? [];
+  assert.equal(mergedRowCalls.length, 2, 'a call of the session row builder left the merge, so this guard reads less');
+  for (const call of mergedRowCalls)
+    assert.match(call, /,\s*edges,$/, 'a merged row is built without the parent edges of the accepted list');
   sourceMatch(
     panelHostSource,
     /private agentRunFor\(session: SessionFile, edges: ReadonlyMap<string, SessionParentEdge>\): boolean \| null \{[^}]*return agentRunAnswer\(\s*guessed,/,
