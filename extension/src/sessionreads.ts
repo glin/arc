@@ -495,6 +495,62 @@ export function discoveryMemberRevisions(
   return revisions;
 }
 
+// The exact state of a source: its size, both exact times, and its device and inode where the volume reports an inode.
+interface SourceStamp {
+  size: number | string;
+  mtimeNs: string;
+  ctimeNs: string;
+  dev?: number | string;
+  ino?: number | string;
+}
+
+export function sourceStampText({ size, mtimeNs, ctimeNs, dev, ino }: SourceStamp): string {
+  const identified = ino !== undefined && String(ino) !== '0';
+  return JSON.stringify([
+    String(size),
+    mtimeNs,
+    ctimeNs,
+    identified ? identityText(dev) : null,
+    identified ? String(ino) : null,
+  ]);
+}
+
+// One walk checks files in groups of this many stats, so other file work keeps its turn in the thread pool.
+const SOURCE_STAT_GROUP = 64;
+
+// The exact stamp of each file by normalized path. A file that a stat cannot reach holds null.
+export async function discoverySourceStamps(files: readonly string[]): Promise<Map<string, string | null>> {
+  const stamps = new Map<string, string | null>();
+  for (let start = 0; start < files.length; start += SOURCE_STAT_GROUP) {
+    await Promise.all(
+      files.slice(start, start + SOURCE_STAT_GROUP).map(async (file) => {
+        let stamp: string | null = null;
+        try {
+          const stat = await fs.promises.stat(file, { bigint: true });
+          stamp = sourceStampText({
+            size: stat.size.toString(),
+            mtimeNs: stat.mtimeNs.toString(),
+            ctimeNs: stat.ctimeNs.toString(),
+            dev: stat.dev.toString(),
+            ino: stat.ino.toString(),
+          });
+        } catch {
+          // A missing or unreadable file holds no stamp.
+        }
+        stamps.set(normalizeFsPath(file), stamp);
+      }),
+    );
+  }
+  return stamps;
+}
+
+// The launch sidecar beside each Claude child transcript. The dispatched spend tree reads these files through its folder.
+export function subagentSidecars(children: readonly { file: string }[]): string[] {
+  return children.flatMap(({ file }) =>
+    file.endsWith('.jsonl') ? [`${file.slice(0, -'.jsonl'.length)}.meta.json`] : [],
+  );
+}
+
 // Why a complete reply proves no membership for a catalog: `size` when it answered another number of files than the catalog
 // lists, or `identity` when it answered a file at another device or inode.
 export function sessionDiscoveryMismatch(

@@ -34,7 +34,14 @@ import { runningKey, sessionRunning, type LivePress } from './composerview';
 import { compatibleDiscovery, discoveryCompatibility } from './progressiveworker';
 import { claudeDispatchTranscript } from './turnfixtures';
 import { sessionCoverageMember, sessionPresence, reconcileSessionCollisions } from './sessioncoverage';
-import { discoveryMemberRevisions, sessionSourceKey, sessionPageSources, guardedSourceRevision } from './sessionreads';
+import {
+  discoveryMemberRevisions,
+  discoverySourceStamps,
+  subagentSidecars,
+  sessionSourceKey,
+  sessionPageSources,
+  guardedSourceRevision,
+} from './sessionreads';
 import { afterAll, afterEach, beforeAll, test, vi } from 'vitest';
 import { pendingResponseSessionAdmitted, resolveResponseSession } from './domain/session-link';
 import { createPanelVisibility } from './panelvisibility';
@@ -3326,6 +3333,8 @@ function completeDiscoveryHarness(
     reconcileSessionCollisions,
     sessionCatalogMembership,
     discoveryMemberRevisions,
+    discoverySourceStamps,
+    subagentSidecars,
     DispatchReceipts,
     sessionDiscoveryMismatch,
     sessionPageSources,
@@ -15373,6 +15382,36 @@ test.each([
     vi.unstubAllEnvs();
   }
 });
+
+test.each(['added', 'rewritten in place', 'removed'] as const)(
+  'a walk after a settled reply sends one discovery request when a subagent sidecar is %s',
+  async (change) => {
+    const harness = settledWalkHarness();
+    const { provider, walked, skipped, settle, child } = harness;
+    const sidecar = child.file.replace(/\.jsonl$/, '.meta.json');
+    const stamps: Record<string, bigint> = change === 'added' ? {} : { [sidecar]: 1n };
+    const stat = fs.promises.stat;
+    vi.spyOn(fs.promises, 'stat').mockImplementation(((file: string, options: any) => {
+      const time = stamps[file];
+      if (time === undefined) return stat(file, options);
+      return Promise.resolve({ size: 10n, mtimeMs: 1n, mtimeNs: time, ctimeNs: time, dev: 1n, ino: 2n });
+    }) as any);
+    try {
+      await settle();
+      const before = { walked: walked(), skipped: skipped() };
+      if (change === 'removed') delete stamps[sidecar];
+      else stamps[sidecar] = 2n;
+      await provider.refresh(true);
+      assert.deepEqual(
+        { walked: walked(), skipped: skipped() },
+        { walked: before.walked + 1, skipped: before.skipped },
+      );
+    } finally {
+      vi.restoreAllMocks();
+      vi.unstubAllEnvs();
+    }
+  },
+);
 
 test('a targeted refresh after a settled reply sends its discovery request', async () => {
   const { provider, walked, skipped, settle, claude } = settledWalkHarness();
