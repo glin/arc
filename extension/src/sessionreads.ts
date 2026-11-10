@@ -544,15 +544,14 @@ export async function discoverySourceStamps(files: readonly string[]): Promise<M
   return stamps;
 }
 
-// The transcripts that a walk compares exactly: each Claude parent and child transcript, and each unlisted Codex child.
+// The transcripts that a walk compares exactly: each parent, each Claude child transcript, and each unlisted Codex child. A
+// direct stat of each one catches a change that the Codex stat cache still holds.
 export function walkStampFiles(
-  parents: readonly { file: string; agent: string }[],
+  parents: readonly { file: string }[],
   children: readonly { file: string }[] | undefined,
   unlisted: readonly { file: string }[],
 ): string[] {
-  return [...parents.filter((parent) => parent.agent !== 'codex'), ...(children ?? []), ...unlisted].map(
-    ({ file }) => file,
-  );
+  return [...parents, ...(children ?? []), ...unlisted].map(({ file }) => file);
 }
 
 interface AcceptedSource {

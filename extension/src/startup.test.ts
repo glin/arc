@@ -15516,6 +15516,30 @@ test('a walk skips the device and inode comparison when the volume reports inode
   }
 });
 
+test('a rollout that grows with no watcher event sends the request at the next walk', async () => {
+  const { provider, walked, skipped, settle, codex } = settledWalkHarness();
+  const stamp: Record<string, bigint | number> = {
+    size: BigInt(codex.size),
+    mtimeMs: codex.mtimeMs,
+    mtimeNs: 10_000_000n,
+    ctimeNs: 10n,
+    dev: 1n,
+    ino: 2n,
+  };
+  injectFileStat(codex.file, stamp);
+  try {
+    await settle();
+    const before = { walked: walked(), skipped: skipped() };
+    stamp.size = BigInt(codex.size + 10);
+    stamp.mtimeNs = 20_000_000n;
+    await provider.refresh(true);
+    assert.deepEqual({ walked: walked(), skipped: skipped() }, { walked: before.walked + 1, skipped: before.skipped });
+  } finally {
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+  }
+});
+
 test('a targeted refresh after a settled reply sends its discovery request', async () => {
   const { provider, walked, skipped, settle, claude } = settledWalkHarness();
   try {
