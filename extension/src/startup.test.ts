@@ -15561,6 +15561,21 @@ test('a rollout that grows with no watcher event sends the request at the next w
   }
 });
 
+test('the first walk after a worker replacement sends the request with no cache directory', async () => {
+  const { provider, walked, skipped, settle } = settledWalkHarness();
+  assert.equal(provider.compressedRolloutsToSend().compressed, undefined);
+  provider.progressiveWorker.currentThreadId = 7;
+  try {
+    await settle();
+    const before = { walked: walked(), skipped: skipped() };
+    provider.progressiveWorker.currentThreadId = 8;
+    await provider.refresh(true);
+    assert.deepEqual({ walked: walked(), skipped: skipped() }, { walked: before.walked + 1, skipped: before.skipped });
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});
+
 test('a targeted refresh after a settled reply sends its discovery request', async () => {
   const { provider, walked, skipped, settle, claude } = settledWalkHarness();
   try {

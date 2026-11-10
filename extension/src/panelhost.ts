@@ -1881,6 +1881,8 @@ export class PanelProvider implements vscode.Disposable {
   private settledDiscovery?: {
     scope: string;
     folders: string | undefined;
+    // The thread of the worker that answered the settled reply.
+    worker: number | null;
     members: Map<string, string>;
     stamps: Map<string, string | null>;
     sidecars: Map<string, string | null>;
@@ -15238,6 +15240,7 @@ export class PanelProvider implements vscode.Disposable {
         ? {
             scope: JSON.stringify(this.repositoryScopeRoots),
             folders: this.catalog?.folders,
+            worker: this.progressiveWorker.currentThreadId ?? null,
             members: discoveryMemberRevisions(
               [...progress.roots!, ...(childSources ?? []), ...this.epochCodexChildren!],
               progress.referenceEntries,
@@ -15286,6 +15289,7 @@ export class PanelProvider implements vscode.Disposable {
     if (
       held.scope !== JSON.stringify(this.repositoryScopeRoots) ||
       held.folders !== this.catalog?.folders ||
+      held.worker !== (this.progressiveWorker.currentThreadId ?? null) ||
       this.dispatchDiscoveryPending ||
       this.dispatchSpendPending ||
       this.sessionQueryDiscoveryPending ||
