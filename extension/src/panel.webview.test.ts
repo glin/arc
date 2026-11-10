@@ -12143,11 +12143,11 @@ test('a pin or a label leaves agentRunFor and isAgentRunLaunch unchanged', () =>
 });
 
 test('worker metadata carries the agent-run mark to the host', () => {
-  const rowsAt = panelHostSource.indexOf('this.sessionRows = all.map(');
+  const rowsAt = panelHostSource.indexOf('private sessionRowOf(');
   assert.notEqual(rowsAt, -1, 'panelhost.ts no longer builds the rail rows, so this guard reads nothing');
   sourceMatch(
-    statementFrom(panelHostSource, rowsAt),
-    /agentRun: this\.agentRunFor\(f, parentEdges\.edges\),/,
+    memberFrom(panelHostSource, rowsAt),
+    /agentRun: this\.agentRunFor\(f, edges\),/,
     'the rail row does not read the detector, so no session is ever marked as run by an agent',
   );
   sourceMatch(
@@ -26630,9 +26630,9 @@ test('the panel dates a session by what it recorded, not by its file being touch
   );
 
   // Session rows derive calendar, timestamp, and relative-age fields from activityFor.
-  const from = panelHostSource.indexOf('this.sessionRows = all.map(');
+  const from = panelHostSource.indexOf('private sessionRowOf(');
   assert.notEqual(from, -1, 'panelhost.ts no longer builds sessionRows from the listing');
-  const rows = statementFrom(panelHostSource, from);
+  const rows = memberFrom(panelHostSource, from);
   sourceMatch(rows, /const at = this\.activityFor\(f\);/, 'a session row no longer takes the recorded activity time');
   for (const field of ['when: formatWhen(at)', 'at,', 'relative: formatRelative(at)']) {
     assert.ok(rows.includes(field), `the session row's \`${field}\` no longer comes from the recorded activity time`);
@@ -26974,9 +26974,9 @@ test('the glance goes on filling the rail on a refresh where nothing else moved'
 test('the composer is aimed by the agent key, never by the name the rail draws', () => {
   // Session rows carry the displayed agent name and the agentKey used for routing.
   // Prompt-box state reads agentKey.
-  const rows = panelHostSource.indexOf('this.sessionRows = all.map');
+  const rows = panelHostSource.indexOf('private sessionRowOf(');
   assert.notEqual(rows, -1, 'the panel no longer builds its session rows here');
-  const built = statementFrom(panelHostSource, rows);
+  const built = memberFrom(panelHostSource, rows);
   sourceMatch(built, /agent: AGENT_NAMES\[f\.agent\]/, 'the rail draws something other than the agent name');
   sourceMatch(built, /agentKey: f\.agent/, 'the row carries no key, so everything is filed under a drawn name');
 
@@ -33083,10 +33083,10 @@ test('selection and accepted worker results avoid unnecessary catalog walks', ()
   const reusing = [...panelHostSource.matchAll(/this\.refresh(?:From|As)\('[^']+', (?:true|false), true\b/g)];
   assert.equal(
     reusing.length,
-    24,
+    25,
     `${reusing.length} refresh callers reuse the held catalog. Selection, older-page loading, ` +
       'the accepted selected-worker follow-up, row delta recovery, repeated-record coverage, the listing after the cold opening pass, a poll at unchanged ' +
-      'directories, a compressed facts batch and the commit and model list updates, which change cards and no session row, must not repeat catalog enumeration.',
+      'directories, a compressed facts batch, the redraw of a shown row that a batch changed, and the commit and model list updates, which change cards and no session row, must not repeat catalog enumeration.',
   );
   const refreshAt = panelHostSource.indexOf('async refresh(');
   const refresh = panelHostSource.slice(
@@ -33679,7 +33679,7 @@ test('session details keeps native controls and dialog lifetime outside the redr
   );
   sourceMatch(
     panelHostSource,
-    /fullLabels\.set\(f\.sessionId, named\.fullLabel\)/,
+    /fullLabels\?\.set\(f\.sessionId, named\.fullLabel\)/,
     'full names are not scoped to sessions with a drawn heading',
   );
 
@@ -33729,26 +33729,32 @@ test('a session row carries a bounded rail name, past the sixty-character cut th
     'the timeline heading, search results and saved comments no longer read the sixty-character cut',
   );
 
-  const from = panelHostSource.indexOf('this.sessionRows = all.map(');
-  const statement = statementFrom(panelHostSource, from);
+  const from = panelHostSource.indexOf('private sessionRowOf(');
+  const member = memberFrom(panelHostSource, from);
   const built = esbuild.transformSync(
-    `export function build(all, sessions, parentEdges, fullLabels, AGENT_NAMES, formatWhen, formatRelative, shortenTo, RAIL_NAME_LIMIT) {\n${statement}\n  return this.sessionRows;\n}`,
+    `export function build(AGENT_NAMES, formatWhen, formatRelative, shortenTo, RAIL_NAME_LIMIT) {
+return class Rows {
+${member}
+};
+}`,
     { loader: 'ts', format: 'cjs' },
   ).code;
-  const builtModule = { exports: {} as { build: (...args: unknown[]) => { label: string; railName?: string }[] } };
+  const builtModule = { exports: {} as { build: (...args: unknown[]) => new () => any } };
   new Function('module', 'exports', built)(builtModule, builtModule.exports);
-  const rows = builtModule.exports.build.call(
-    { activityFor: () => 0, sessionLabel: () => ({ label: capped, fullLabel: full }), agentRunFor: () => false },
-    [{ sessionId: 's1', agent: 'claude' }],
-    [],
-    { edges: [] },
-    new Map(),
+  const Rows = builtModule.exports.build(
     { claude: 'Claude' },
     () => '',
     () => '',
     shortenTo,
     200,
   );
+  const rows: { label: string; railName?: string }[] = [
+    Object.assign(new Rows(), {
+      activityFor: () => 0,
+      sessionLabel: () => ({ label: capped, fullLabel: full }),
+      agentRunFor: () => false,
+    }).sessionRowOf({ sessionId: 's1', agent: 'claude' }, new Map(), false, new Map()),
+  ];
   assert.equal(
     rows[0].label,
     capped,
