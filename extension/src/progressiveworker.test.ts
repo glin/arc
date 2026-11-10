@@ -16971,6 +16971,41 @@ test('a name that a later list adds and its folder excludes takes one first reco
   }
 });
 
+test('a list between an added name and its body keeps the body before the unplaced openings', async () => {
+  const order: string[] = [];
+  const list = ['first.jsonl.zst', 'second.jsonl.zst', 'third.jsonl.zst'];
+  const added = 'added.jsonl.zst';
+  let release = () => {};
+  const harness = backfillHarness({
+    exists: () => false,
+    statOf: () => ({ ...unitStat, isFile: true }),
+    readFirst: async (file) => {
+      order.push(`opening ${file}`);
+      if (file === list[0]) await new Promise<void>((resolve) => (release = resolve));
+      // The next list arrives during the added name's opening, before its body job starts.
+      if (file === added) harness.backfill.setNames([added, ...list]);
+      return unitOpeningLine;
+    },
+    stream: async (file) => {
+      order.push(`body ${file}`);
+      return unitDecoded();
+    },
+  });
+  try {
+    harness.backfill.setNames(list);
+    await vi.waitFor(() => assert.deepEqual(order, [`opening ${list[0]}`]));
+    harness.backfill.setNames([added, ...list]);
+    release();
+    await vi.waitFor(() => assert.equal(harness.facts.length, 4, order.join()));
+    assert.ok(
+      order.indexOf(`body ${added}`) < order.indexOf(`opening ${list[1]}`),
+      `the added body lost its place: ${order.join()}`,
+    );
+  } finally {
+    harness.backfill.dispose();
+  }
+});
+
 test('a publish over a held opening of another generation appends a current opening', async () => {
   const store = storeBackedFacts(path.join(tempDir('backfill-held-opening-'), 'openings'));
   const versions = compressedEntryVersions();

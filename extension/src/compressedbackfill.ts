@@ -354,7 +354,8 @@ export interface CompressedBackfillOptions {
   limits?: { recordBytes?: number; reduceAbove?: number; retainedBytes?: number };
 }
 
-// `added` marks the opening read of a name that a later list added, so an admitted body stays at the front of the queue.
+// `added` marks the opening read of a name that a later list added. The name keeps its place at the front of the queue
+// across every plan until its body starts or its opening rejects it.
 type Job = {
   kind: 'opening' | 'body';
   file: string;
@@ -534,7 +535,10 @@ export class CompressedBackfill {
           continue;
         try {
           if (job.kind === 'opening') await this.deriveOpening(job);
-          else await this.deriveBody(job);
+          else {
+            this.added.delete(job.file);
+            await this.deriveBody(job);
+          }
         } catch {
           // A throw on one file must not end the worker, or each new worker reaches the same file.
           await this.retryLater(job).catch(() => undefined);
@@ -612,7 +616,7 @@ export class CompressedBackfill {
       events.push(job);
       return;
     }
-    const added = this.added.delete(file);
+    const added = this.added.has(file);
     if (entry?.adopted && !added) {
       adopted.push(job);
       return;
@@ -621,6 +625,7 @@ export class CompressedBackfill {
     const opening = this.placingOpening(file, entry, stat);
     if (opening === undefined) (added ? events : unplaced).push({ kind: 'opening', file, stat, added });
     else if (codexRowAdmitted(opening, stat, this.inFolders)) (added ? events : placed).push(job);
+    else this.added.delete(file);
   }
 
   // A plan that could not read a name or the store runs again after the longest retry delay.
@@ -690,7 +695,10 @@ export class CompressedBackfill {
     this.openingEntries.set(job.file, entry);
     await this.appendOpenings([entry]);
     this.unpostedMs += this.now() - started;
-    if (!codexRowAdmitted(opening, job.stat, this.inFolders)) return;
+    if (!codexRowAdmitted(opening, job.stat, this.inFolders)) {
+      this.added.delete(job.file);
+      return;
+    }
     const body: Job = { ...job, kind: 'body' };
     if (job.added) this.queue.unshift(body);
     else this.insertBody(body);
