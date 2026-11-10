@@ -2540,6 +2540,7 @@ export class PanelProvider implements vscode.Disposable {
   private sessionReadProofCatalog?: readonly SessionFile[];
   // Rows that merged since the last poll, for the spend sources and for the project spend post.
   private compressedSourcesOwed = false;
+  private compressedSourcesFailureWarned = false;
   private compressedSpendPostOwed = false;
   // Backfill batches that changed the facts since the last poll, for the project spend snapshot.
   private compressedSnapshotOwed = false;
@@ -5301,21 +5302,24 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   // Brings the spend sources and the project spend up to the merged rows. Returns whether the spend sources were rebuilt,
-  // so a poll can post the session list that carries the new spend. A rebuild that fails stays owed to the next poll.
+  // so a poll can post the session list that carries the new spend. A rebuild that fails stays owed to the next poll, and
+  // the project spend still follows the rows. A run of failures logs one warning, and a success starts a new run.
   private settleCompressedSpend(): boolean {
     const sessions = this.catalog?.sessions;
-    const rebuild = this.compressedSourcesOwed && !!sessions && this.claudeChildrenDiscovered;
-    if (rebuild) {
+    let rebuilt = false;
+    if (this.compressedSourcesOwed && sessions && this.claudeChildrenDiscovered) {
       try {
         this.updateSessionSpendSources(
           sessions.filter((session) => session.agent === 'codex'),
           sessions,
         );
+        rebuilt = true;
+        this.compressedSourcesOwed = false;
+        this.compressedSourcesFailureWarned = false;
       } catch (error) {
-        console.warn('Arc: session cost update failed.', error);
-        return false;
+        if (!this.compressedSourcesFailureWarned) console.warn('Arc: session cost update failed.', error);
+        this.compressedSourcesFailureWarned = true;
       }
-      this.compressedSourcesOwed = false;
     }
     if (this.compressedSnapshotOwed) {
       this.compressedSnapshotOwed = false;
@@ -5326,7 +5330,7 @@ export class PanelProvider implements vscode.Disposable {
     const rebuilding = this.projectSpendRebuild || this.projectSpendBuild;
     if (this.compressedSpendPostOwed && !rebuilding && !this.projectSpendBusy()) this.postProjectSpend();
     this.compressedSpendPostOwed = false;
-    return rebuild;
+    return rebuilt;
   }
 
   // The listing proof for a session index. A merge advances the proof by list identity, so the proof takes the digest of

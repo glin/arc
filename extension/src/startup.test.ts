@@ -13775,11 +13775,12 @@ test('a batch leaves the project spend post to the next poll unless a row of the
   assert.equal(sourceUpdates.length, 2, 'a poll after a shown row rebuilt the spend sources again');
 });
 
-test('fifty unshown batches in a hydrated workspace post the project cost at most once per poll', async () => {
-  const { provider, entryOf } = await batchApplyHarness(
+async function hydratedSpendHarness() {
+  const harness = await batchApplyHarness(
     { ...pollScope, prepareProjectSpendViewSteps, publicProjectSpendPrice, projectSpendHistoryCutoff },
     ['pollCatalog'],
   );
+  const { provider } = harness;
   provider.claudeChildrenDiscovered = true;
   provider.compressedSpendPick = (files: unknown) => files;
   provider.projectSpendBusy = () => false;
@@ -13787,6 +13788,75 @@ test('fifty unshown batches in a hydrated workspace post the project cost at mos
   provider.projectSpendHydrated = true;
   provider.projectSpendRevision = 0;
   provider.projectSpendSnapshotPrice = publicProjectSpendPrice;
+  return harness;
+}
+
+test('a spend source rebuild that always fails still posts the project cost once for the poll', async () => {
+  const { provider, entryOf } = await hydratedSpendHarness();
+  let projectPosts = 0;
+  provider.postProjectSpend = () => projectPosts++;
+  provider.updateSessionSpendSources = () => {
+    throw new Error('spend sources failed');
+  };
+  const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  try {
+    for (const id of ['failing-first', 'failing-second']) {
+      provider.applyCompressedBatch({ entries: [entryOf(id).entry], backfillMs: 0 });
+      await vi.advanceTimersByTimeAsync(5_000);
+    }
+    assert.equal(projectPosts, 0, 'a batch posted the project cost before the poll');
+    await pollOnce(provider);
+    await vi.advanceTimersByTimeAsync(5_000);
+    assert.equal(projectPosts, 1, 'the failed rebuild held back the project cost of the poll');
+    assert.equal(provider.compressedSourcesOwed, true, 'the failed rebuild is no longer owed');
+  } finally {
+    vi.useRealTimers();
+    warn.mockRestore();
+  }
+});
+
+test('a spend source rebuild that keeps failing warns once until a rebuild succeeds', async () => {
+  const { provider, sourceUpdates, entryOf } = await hydratedSpendHarness();
+  provider.postProjectSpend = () => {};
+  const update = provider.updateSessionSpendSources;
+  let failing = true;
+  let attempts = 0;
+  provider.updateSessionSpendSources = (...args: unknown[]) => {
+    attempts++;
+    if (failing) throw new Error('spend sources failed');
+    return update(...args);
+  };
+  const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  const warnings = () => warn.mock.calls.filter(([message]) => message === 'Arc: session cost update failed.').length;
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  try {
+    const joined = entryOf('keeps-failing');
+    provider.applyCompressedBatch({ entries: [joined.entry], backfillMs: 0 });
+    await vi.advanceTimersByTimeAsync(5_000);
+    for (let poll = 0; poll < 5; poll++) await pollOnce(provider);
+    assert.equal(attempts, 5, 'a poll did not retry the owed rebuild');
+    assert.equal(warnings(), 1, 'the repeated failure did not warn exactly once');
+    failing = false;
+    await pollOnce(provider);
+    assert.ok(
+      sourceUpdates.at(-1)?.some((row) => row.file === joined.twin),
+      'the rebuild that succeeded did not reach the spend sources',
+    );
+    failing = true;
+    provider.applyCompressedBatch({ entries: [entryOf('fails-again').entry], backfillMs: 0 });
+    await vi.advanceTimersByTimeAsync(5_000);
+    await pollOnce(provider);
+    await pollOnce(provider);
+    assert.equal(warnings(), 2, 'the failure after a success did not warn exactly once more');
+  } finally {
+    vi.useRealTimers();
+    warn.mockRestore();
+  }
+});
+
+test('fifty unshown batches in a hydrated workspace post the project cost at most once per poll', async () => {
+  const { provider, entryOf } = await hydratedSpendHarness();
   let projectPosts = 0;
   provider.postProjectSpend = () => projectPosts++;
   vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
