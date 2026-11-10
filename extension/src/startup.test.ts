@@ -22542,7 +22542,11 @@ function settledGapHarness(
   spendFailure?: 'held-false' | 'reject',
   extraRoots: object[] = [],
 ) {
-  const harness = partialSpendHarness(true, spendFailure, { spendReplies: 1 });
+  const harness = partialSpendHarness(true, spendFailure, {
+    spendReplies: 1,
+    methods: ['runPendingWatch', 'unknownPathShapeOf'],
+    scope: { fs, watcherRefreshDecision, sessionDirectoryOwners, unknownPathShapes, unknownPathExtension },
+  });
   const { provider } = harness;
   provider.partial = [...provider.partial, ...extraRoots];
   const accept = Object.getPrototypeOf(provider).acceptSessionCoverage.bind(provider);
@@ -22695,18 +22699,36 @@ test('an identity mismatch that stays the same requests one pass and then stops'
   }
 });
 
-for (const [change, act, outcome] of [
-  ['a catalog change that a walk finds', (provider: any) => provider.refreshFrom('poll:directory', false, false), 2],
+// A watcher batch that creates a child transcript in the session directory of a listed Claude session.
+const newChildWatch = (provider: any) => {
+  const child = `/${provider.partial[0].sessionId}/subagents/agent-new.jsonl`;
+  provider.pendingWatch = {
+    take: () => ({
+      eventCount: 1,
+      changedPaths: [child],
+      createdPaths: [child],
+      compressedPaths: [],
+      broadRequired: false,
+      broadReasons: [],
+      drawRequired: false,
+      reasons: ['transcript'],
+    }),
+  };
+  provider.runPendingWatch({ cause: 'quiet', firstAt: 0, lastAt: 0, firedAt: 0 });
+};
+
+for (const [change, act, routed] of [
   [
-    'a new child transcript that a watcher names',
-    (provider: any) => provider.refreshFrom('watcher', false, false, ['projects/child.jsonl']),
-    2,
+    'a catalog change that a walk finds',
+    (provider: any) => provider.refreshFrom('poll:directory', false, false),
+    undefined,
   ],
+  ['a new child transcript that a watcher names', newChildWatch, 'watcher:sessionDirectory'],
 ] as const)
   test(`${change} still sends a full pass after a gap stopped the requests`, async () => {
     vi.useFakeTimers();
     try {
-      const { provider, requests, settle, full } = settledGapHarness((target: any) => {
+      const { provider, counters, requests, settle, full } = settledGapHarness((target: any) => {
         target.enumeratedAdmissionComplete = false;
       });
       provider.refreshFrom('startup', true);
@@ -22714,7 +22736,8 @@ for (const [change, act, outcome] of [
       assert.equal(full(), 1);
       act(provider);
       await settle();
-      assert.equal(full(), outcome, `requests ${requests.join(', ')}`);
+      assert.equal(full(), 2, `requests ${requests.join(', ')}`);
+      if (routed) assert.equal(counters.snapshot().work[routed], 1, 'the watcher did not place the child transcript');
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();
