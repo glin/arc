@@ -1719,6 +1719,8 @@ export class PanelProvider implements vscode.Disposable {
   // The window after a batch applies. A batch that arrives in it waits, and the window's end applies them as one.
   private compressedRowsTimer: ReturnType<typeof setTimeout> | null = null;
   private compressedRowsOwed = false;
+  // The first row of an empty list still owes its redraw of an empty selection. A merge that throws keeps this set.
+  private compressedFirstRowRedrawOwed = false;
   // Rows that wait for a running refresh to end, because the refresh replaces the catalogs from its own copy.
   private compressedRowsWaiting = false;
   // The running selected-only refreshes. Each rebuilds the session rows from the catalog it read at its start.
@@ -5200,13 +5202,15 @@ export class PanelProvider implements vscode.Disposable {
     this.compressedRowsTimer.unref?.();
   }
 
-  // A failed merge keeps its files in the dirty set, so the next merge or catalog refresh lists them.
+  // A failed merge keeps its files in the dirty set, so the next merge or catalog refresh lists them. It arms the window,
+  // so a row that fails at every merge costs one merge per window.
   private applyCompressedRows(): void {
     const dirty = this.compressedRowsDirty;
     try {
       this.mergeCompressedRows();
     } catch (error) {
       this.compressedRowsDirty = dirty;
+      this.armCompressedRowsTimer();
       console.warn('Arc: session reading failed.', error);
     }
   }
@@ -5253,6 +5257,7 @@ export class PanelProvider implements vscode.Disposable {
       rows,
       activity,
     );
+    this.compressedFirstRowRedrawOwed ||= accepted.length === 0 && rows.length > 0;
     this.catalog = { ...held, sessions };
     this.authoritativeCatalog = admitted;
     this.noteCompressedMembership(accepted, admitted, replaced, rows, scope);
@@ -5267,7 +5272,9 @@ export class PanelProvider implements vscode.Disposable {
     // session is shown.
     const changed = new Set([...rows, ...replaced].map((row) => row.sessionId));
     const shown = [this.showing, ...(this.hostSessions?.values() ?? [])].filter((id): id is string => id !== null);
-    if (this.showing === null ? accepted.length === 0 && rows.length > 0 : shown.some((id) => changed.has(id)))
+    const firstRow = this.compressedFirstRowRedrawOwed;
+    this.compressedFirstRowRedrawOwed = false;
+    if (this.showing === null ? firstRow : shown.some((id) => changed.has(id)))
       this.refreshFrom('selected-window', true, true, null, true, true);
     this.performanceCounters?.recordRefresh('compressed-facts', performance.now() - started);
   }

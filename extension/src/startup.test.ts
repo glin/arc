@@ -13290,6 +13290,7 @@ test('a batch whose row builder throws once keeps its rows for the next merge', 
     throws = 1;
     provider.applyCompressedBatch({ entries: [failed.entry], backfillMs: 0 });
     assert.equal(provider.compressedRowsDirty?.has(failed.twin), true, 'the failed merge lost its row');
+    endBatchWindow(provider);
     provider.applyCompressedBatch({ entries: [entryOf('next-row').entry], backfillMs: 0 });
     endBatchWindow(provider);
     const listed = posted.at(-1) ?? [];
@@ -13306,6 +13307,71 @@ test('a batch whose row builder throws once keeps its rows for the next merge', 
   } finally {
     vi.useRealTimers();
     warn.mockRestore();
+  }
+});
+
+test('a row builder that throws at every call runs one merge per window', async () => {
+  const { provider, entryOf } = await batchApplyHarness();
+  provider.compressedRowOf = () => {
+    throw new Error('row builder failed');
+  };
+  const merge = provider.mergeCompressedRows;
+  let merges = 0;
+  provider.mergeCompressedRows = function () {
+    merges++;
+    return merge.apply(this);
+  };
+  const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  try {
+    for (let window = 1; window <= 3; window++) {
+      for (let batch = 0; batch < 5; batch++)
+        provider.applyCompressedBatch({ entries: [entryOf(`failing-${window}-${batch}`).entry], backfillMs: 0 });
+      assert.equal(merges, 2 * window - 1, 'a batch inside the window ran its own merge');
+      await vi.advanceTimersByTimeAsync(5_000);
+      assert.equal(merges, 2 * window, 'the end of the window did not retry the merge once');
+    }
+  } finally {
+    vi.useRealTimers();
+    warn.mockRestore();
+  }
+});
+
+test('a first-row merge that throws once still redraws the empty selection after its retry', async () => {
+  const { provider, entryOf } = await batchApplyHarness();
+  const refreshes: unknown[][] = [];
+  provider.refreshFrom = (...args: unknown[]) => refreshes.push(args);
+  provider.showing = null;
+  provider.catalog = { ...provider.catalog, sessions: [] };
+  provider.authoritativeCatalog = [];
+  const sessionRowOf = provider.sessionRowOf;
+  let throws = 1;
+  provider.sessionRowOf = function (...args: unknown[]) {
+    if (throws > 0) {
+      throws--;
+      throw new Error('row builder failed');
+    }
+    return sessionRowOf.apply(this, args);
+  };
+  const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  try {
+    provider.applyCompressedBatch({ entries: [entryOf('first-row').entry], backfillMs: 0 });
+    assert.equal(throws, 0, 'the merge did not reach the row builder');
+    assert.equal(provider.authoritativeCatalog.length, 1, 'the merge threw before it published the first row');
+    assert.deepEqual(refreshes, [], 'the merge that threw redrew the selection');
+    endBatchWindow(provider);
+    provider.applyCompressedBatch({ entries: [entryOf('retry-row').entry], backfillMs: 0 });
+    assert.deepEqual(
+      refreshes,
+      [['selected-window', true, true, null, true, true]],
+      'the retry did not redraw the empty selection',
+    );
+    endBatchWindow(provider);
+    provider.applyCompressedBatch({ entries: [entryOf('later-row').entry], backfillMs: 0 });
+    assert.equal(refreshes.length, 1, 'a later merge redrew the selection again');
+  } finally {
+    warn.mockRestore();
+    endBatchWindow(provider);
   }
 });
 
