@@ -522,7 +522,9 @@ export class CompressedBackfill {
     });
   }
 
-  // A store call can wait on another window's lease, so the backfill ends a held turn before each one.
+  // A store write can wait on another window's lease. The backfill ends a held turn before each store write and each read
+  // of the facts store, and it grants no turn during them. A read of the openings store in a plan is synchronous between
+  // its yields, and its first yield ends a held turn.
   private endTurn(): void {
     this.cancelTurnLimit?.();
     this.cancelTurnLimit = null;
@@ -930,9 +932,11 @@ export class CompressedBackfill {
 }
 
 // Runs discovery requests one at a time. A request that arrives during another waits, and a newer request replaces it.
-// After the first complete discovery reply of the worker, one backfill slice runs before each request when the
-// backfill can decode and no reader waits, so a chain of continuations leaves the backfill a share of the worker. Until
-// that reply each request starts at once.
+// After the first complete discovery reply of the worker, a request waits for one backfill slice when the backfill is
+// parked between slices or decodes a slice and no reader waits, so a chain of continuations leaves the backfill a share
+// of the worker. A parked backfill starts the slice, and a decode in work ends the slice it holds. At any other step of
+// the backfill, such as a plan or a store call, the request starts at once. Until that reply each request starts at
+// once. A slice in work finishes beside a request that starts at once or that reaches the limit of its wait.
 export class DiscoveryQueue<Message extends { id: number }> {
   private running = false;
   private waiting: Message | undefined;
