@@ -22756,7 +22756,7 @@ for (const [change, act, routed] of [
     }
   });
 
-test('a listed row that the reply never answered still requests one pass', async () => {
+test('a listed row that the reply never answered still requests a pass', async () => {
   vi.useFakeTimers();
   try {
     const { provider, counters, requests, settle, full } = settledGapHarness(() => undefined);
