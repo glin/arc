@@ -1120,7 +1120,9 @@ test.each(['claude', 'codex'] as const)(
   },
 );
 
-test.each(['receipt', 'catalog', 'late-receipt'] as const)(
+// A late-receipt launch names a requester in scope from the start, so its startup file is read once before the failure.
+// A deferred-receipt launch names a requester that only the native subagent walk adds to scope, so its first read is the failing one.
+test.each(['receipt', 'catalog', 'late-receipt', 'deferred-receipt'] as const)(
   'dispatch-bearing cost refuses hidden %s competition without a qualified touch',
   async (boundary) => {
     for (const cooperative of [false, true]) {
@@ -1136,7 +1138,7 @@ test.each(['receipt', 'catalog', 'late-receipt'] as const)(
       fs.appendFileSync(fx.parent.file, marker);
       const foreignDirectory = path.join(fx.projects, 'foreign-project');
       let requester = fx.grandchild;
-      if (boundary === 'catalog' || boundary === 'late-receipt') {
+      if (boundary === 'catalog' || boundary === 'deferred-receipt') {
         const foreign = fx.write('claude', 'eeeeeeee-1111-2222-3333-444444444444');
         const subtree = path.join(path.dirname(foreign.file), foreign.sessionId, 'subagents');
         fs.mkdirSync(subtree, { recursive: true });
@@ -1173,7 +1175,11 @@ test.each(['receipt', 'catalog', 'late-receipt'] as const)(
       });
       const open = vi.spyOn(nativeFs, 'openSync').mockImplementation((file, ...args) => {
         if (String(file) === target) {
-          if (boundary === 'receipt' || (boundary === 'late-receipt' && startupSeen)) {
+          if (
+            boundary === 'receipt' ||
+            boundary === 'deferred-receipt' ||
+            (boundary === 'late-receipt' && startupSeen)
+          ) {
             denied++;
             throw failure;
           }
