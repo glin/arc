@@ -119,6 +119,7 @@ export interface Options {
   buildCache: string | null;
   countCompressed: string | null;
   minimumFreeGb: number;
+  warmCapMinutes: number;
 }
 
 export interface WarmCondition {
@@ -186,6 +187,7 @@ export function readOptions(argv: string[]): Options {
     countCompressed: null,
     // 1.5 times the largest extension host peak working set that saved measurements record.
     minimumFreeGb: 5.4,
+    warmCapMinutes: WARM_UNTIL_CAP_MS / 60_000,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const flag = argv[i];
@@ -223,6 +225,8 @@ export function readOptions(argv: string[]): Options {
       options.soakMinutes = Number(value);
     } else if (flag === '--min-free-gb') {
       options.minimumFreeGb = Number(value);
+    } else if (flag === '--warm-cap-minutes') {
+      options.warmCapMinutes = Number(value);
     } else if (flag === '--warm-until') {
       const match = /^([^=]+)=(.+)$/.exec(value);
       if (!match || !Number.isFinite(Number(match[2]))) stop('--warm-until takes <measure>=<number>.');
@@ -245,6 +249,8 @@ export function readOptions(argv: string[]): Options {
   if (!Number.isFinite(options.soakMinutes) || options.soakMinutes < 0) stop('--soak takes a number of minutes.');
   if (!Number.isFinite(options.minimumFreeGb) || options.minimumFreeGb < 0)
     stop('--min-free-gb takes a number of gigabytes.');
+  if (!Number.isFinite(options.warmCapMinutes) || options.warmCapMinutes <= 0)
+    stop('--warm-cap-minutes takes a number of minutes.');
   if (options.soakMinutes > 0 && options.selection) stop('--soak runs without --selection and --response.');
   return options;
 }
@@ -1230,7 +1236,8 @@ async function soak(minutes: number, launch: Launch): Promise<{ complete: boolea
 // `panelhost.ts` sets. The warm-up stays open past that point, so its store holds what it learned.
 export const WARM_UP_OPEN_MS = 5.5 * 60_000;
 
-// A `--warm-until` hold starts a read at this interval, and fails the run this long after the warm-up launch.
+// A `--warm-until` hold starts a read at this interval. Without `--warm-cap-minutes`, it fails the run this long after
+// the warm-up launch.
 export const WARM_UNTIL_INTERVAL_MS = 15_000;
 export const WARM_UNTIL_CAP_MS = 30 * 60_000;
 // The hold checks the warm-up editor at this interval while it keeps the minimum open time.
@@ -1272,13 +1279,15 @@ export async function holdUntil(options: {
   launchedAt: number;
   sample: (index: number) => Promise<Record<string, number> | null>;
   minimumMs?: number;
+  capMs?: number;
   failure?: () => string | null;
   now?: () => number;
   wait?: (ms: number) => Promise<void>;
 }): Promise<WarmHold> {
   const now = options.now ?? Date.now;
   const wait = options.wait ?? delay;
-  const deadline = options.launchedAt + WARM_UNTIL_CAP_MS;
+  const capMs = options.capMs ?? WARM_UNTIL_CAP_MS;
+  const deadline = options.launchedAt + capMs;
   let next = options.launchedAt + (options.minimumMs ?? WARM_UP_OPEN_MS);
   let measures: Record<string, number> | null = null;
   let reads = 0;
@@ -1294,10 +1303,7 @@ export async function holdUntil(options: {
     const last = options.conditions
       .map((condition) => `${condition.measure} read ${measures?.[condition.measure] ?? 'nothing'}`)
       .join(', ');
-    return ended(
-      false,
-      `The warm-up did not reach ${wanted} within ${WARM_UNTIL_CAP_MS / 60_000} min of its launch: ${last}.`,
-    );
+    return ended(false, `The warm-up did not reach ${wanted} within ${capMs / 60_000} min of its launch: ${last}.`);
   };
   while (now() < next) {
     const failure = options.failure?.() ?? null;
@@ -1681,6 +1687,7 @@ async function measure(commandLine: string, workspace: string, options: Options)
           const reading = await holdUntil({
             conditions: options.warmUntil,
             launchedAt: warmAt,
+            capMs: options.warmCapMinutes * 60_000,
             sample: async (index) =>
               holdReading(await requestSnapshot(`warm-${String(index).padStart(3, '0')}`, 120_000), () =>
                 runnerMeasures({ home: ARC_STORE, tempBefore: warmTempBefore, pending }),

@@ -1967,9 +1967,11 @@ test('repeat builds each side once', async () => {
   const discarded: string[] = [];
   const warmUntil: string[] = [];
   const floors: number[] = [];
+  const caps: number[] = [];
   // The measure runner of each repetition reads the arguments that the comparison passes, as `measure.ts` reads them.
   const measure = async (args: string[]): Promise<Repetition> => {
     const options = readOptions(args);
+    caps.push(options.warmCapMinutes);
     const side = options.commit === 'base' ? 'baseline' : 'candidate';
     const index = order.filter((name) => name.startsWith(side)).length;
     order.push(`${side}-${index}`);
@@ -1992,7 +1994,7 @@ test('repeat builds each side once', async () => {
     [
       ...['--fixture', manifest, '--baseline', 'base', '--candidate', 'next', '--repeat', '3'],
       ...['--warm-until', 'stubPending=0', '--output', path.join(output, 'report')],
-      ...['--min-free-gb', '0'],
+      ...['--min-free-gb', '0', '--warm-cap-minutes', '45'],
     ],
     {
       measure,
@@ -2005,6 +2007,7 @@ test('repeat builds each side once', async () => {
   assert.deepEqual(order, ['baseline-0', 'candidate-0', 'baseline-1', 'candidate-1', 'baseline-2', 'candidate-2']);
   assert.deepEqual(warmUntil, ['candidate', 'candidate', 'candidate']);
   assert.deepEqual(floors, [0, 0, 0, 0, 0, 0], 'a launch did not get the free memory floor of the comparison');
+  assert.deepEqual(caps, [45, 45, 45, 45, 45, 45], 'a launch did not get the warm-up limit of the comparison');
   // Each repetition deletes the scratch of the one before it, and the last one stays for the report.
   assert.deepEqual(
     discarded,
@@ -2014,6 +2017,28 @@ test('repeat builds each side once', async () => {
   const report = JSON.parse(fs.readFileSync(path.join(output, 'report', 'compare.json'), 'utf8'));
   const row = report.measures.find((measure: { name: string }) => measure.name === 'firstUsableRowMs');
   assert.deepEqual([report.repeat, row.baseline, row.candidate], [3, 60_000, 70_000]);
+});
+
+test('a warm-up hold fails at the limit that the run names', async () => {
+  const launchedAt = 1_000_000;
+  let clock = launchedAt;
+  const capMs = WARM_UP_OPEN_MS + 2 * WARM_UNTIL_INTERVAL_MS;
+  const hold = await holdUntil({
+    conditions: [{ measure: 'stubPending', value: 0 }],
+    launchedAt,
+    capMs,
+    sample: async () => ({ stubPending: 2 }),
+    now: () => clock,
+    wait: async (ms) => {
+      clock += ms;
+    },
+  });
+  assert.equal(hold.reached, false);
+  assert.equal(clock - launchedAt, capMs, 'the hold did not end at the named limit');
+  assert.equal(hold.reads, 2);
+  assert.match(hold.note ?? '', /within 6 min of its launch/);
+  assert.equal(readOptions(['--fixture', 'f', '--warm-cap-minutes', '45']).warmCapMinutes, 45);
+  assert.equal(readOptions(['--fixture', 'f']).warmCapMinutes, WARM_UNTIL_CAP_MS / 60_000);
 });
 
 test('warm-until ends when the measure reads the value', async () => {

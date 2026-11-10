@@ -422,6 +422,7 @@ export async function runComparison(args: string[], dependencies: ComparisonDepe
     const timeout = value('--timeout') ?? '900';
     // Both sides launch under the same free memory floor.
     const minimumFree = value('--min-free-gb');
+    const warmCap = value('--warm-cap-minutes');
     // The candidate alone holds its warm-up until each named measure reads its value.
     const warmUntil = args.flatMap((arg, index) =>
       arg === '--warm-until' && args[index + 1] !== undefined ? ['--warm-until', args[index + 1]] : [],
@@ -452,6 +453,7 @@ export async function runComparison(args: string[], dependencies: ComparisonDepe
           buildDirectory,
           ...(side === 'candidate' ? warmUntil : []),
           ...(minimumFree != null ? ['--min-free-gb', minimumFree] : []),
+          ...(warmCap != null ? ['--warm-cap-minutes', warmCap] : []),
           ...(args.includes('--keep') ? ['--keep'] : []),
         ],
         path.join(output, `${side}${suffix}.log`),
