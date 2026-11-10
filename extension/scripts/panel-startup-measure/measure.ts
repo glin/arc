@@ -1500,7 +1500,9 @@ export interface CompressedPendingInput {
 
 // Count the names a measured launch still decodes. An admitted file counts without a current decoded entry in the
 // workspace store. Any other name counts without a `.jsonl` twin and without a current opening in the machine store,
-// because the launch reads its first record otherwise. A failed read of a store counts every name until the next read.
+// because the launch reads its first record otherwise. An entry that a launch marked unreadable at the file's current
+// revision counts as settled, because that revision gets no decoded length and no opening. A failed read of a store
+// counts every name until the next read.
 export function compressedPending(home: string, input: CompressedPendingInput): number {
   const cache = path.join(home, 'cache');
   const statOf = input.statOf ?? compressedPhysicalStat;
@@ -1525,6 +1527,8 @@ export function compressedPending(home: string, input: CompressedPendingInput): 
   for (const file of input.names) {
     if (exists(file.slice(0, -'.zst'.length))) continue;
     const stat = statOf(file);
+    const marked = facts.get(file);
+    if (marked?.unreadable && compressedEntryCurrent(marked, stat)) continue;
     if (input.admitted.has(file)) {
       const entry = facts.get(file);
       if (!entry || entry.decodedLength === undefined || !compressedEntryCurrent(entry, stat)) pending++;

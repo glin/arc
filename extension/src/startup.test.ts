@@ -12469,8 +12469,36 @@ test('compressedPending counts each admitted file without a current decoded entr
     statOf: () => pendingStat,
     exists: (file: string) => file === 'twin',
   };
-  // adopted, unreadable and stale have no current decoded entry, and noopening has no opening.
-  assert.equal(compressedPending(home, input), 4);
+  // adopted and stale have no current decoded entry, and noopening has no opening.
+  assert.equal(compressedPending(home, input), 3);
+});
+
+test('compressedPending counts an entry the backfill marked unreadable at the current revision as settled', () => {
+  const { home, facts } = pendingStores('pending-unreadable-');
+  const marked = (file: string, fields: object = {}) => ({
+    file,
+    pairKey: file,
+    ...pendingVersions,
+    size: pendingStat.size,
+    mtimeMs: pendingStat.mtimeMs,
+    complete: false,
+    nameOnly: true,
+    unreadable: true,
+    unreadableLaunch: 'launch-test',
+    ...fields,
+  });
+  writeSegment(facts, [
+    marked('undecodable.zst'),
+    marked('opening-failed.zst'),
+    marked('old-revision.zst', { size: pendingStat.size - 1 }),
+  ]);
+  const input = {
+    names: ['undecodable.zst', 'opening-failed.zst', 'old-revision.zst'],
+    admitted: new Set(['undecodable.zst', 'old-revision.zst']),
+    statOf: () => pendingStat,
+    exists: () => false,
+  };
+  assert.equal(compressedPending(home, input), 1, 'a mark of the current revision did not settle its name');
 });
 
 test('a failed store read counts every name until the next reading', () => {
