@@ -5235,6 +5235,7 @@ export class PanelProvider implements vscode.Disposable {
       this.authoritativeCatalogScope !== scope ||
       held.folders !== `${workspaceFolders.join('\n')}\0${this.repositoryScope.snapshot(workspaceFolders).revision}`
     ) {
+      this.armCompressedRowsTimer();
       this.refreshCompressedFacts();
       return;
     }

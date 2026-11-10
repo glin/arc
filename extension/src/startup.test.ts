@@ -13208,6 +13208,24 @@ test('a changed row posts its current unread count and later polls that change n
   assert.equal(counts.at(-1)?.count, 3, 'a later poll left an old unread count on the panel');
 });
 
+test('three batches before the first accepted catalog run one compressed-facts refresh', async () => {
+  const { provider, entryOf } = await batchApplyHarness();
+  const refreshes: unknown[][] = [];
+  provider.refreshFrom = (...args: unknown[]) => refreshes.push(args);
+  provider.authoritativeCatalog = null;
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  try {
+    for (let batch = 0; batch < 3; batch++) {
+      provider.applyCompressedBatch({ entries: [entryOf(`before-${batch}`).entry], backfillMs: 0 });
+    }
+    assert.deepEqual(refreshes, [['compressed-facts', true, true]], 'each batch ran its own refresh');
+    await vi.advanceTimersByTimeAsync(5_000);
+    assert.equal(refreshes.length, 2, 'the batches behind the first did not run as one refresh');
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 test('a batch whose row builder throws once keeps its rows for the next merge', async () => {
   const { provider, posted, entryOf } = await batchApplyHarness();
   const rowOf = provider.compressedRowOf;
@@ -13580,6 +13598,7 @@ test('compressedRows moves at each compressed-facts refresh and stays absent unt
   assert.equal(gauges.compressedRows, 1);
   provider.noteCompressedRowsGauge([]);
   assert.equal(gauges.compressedRows, 1, 'the gauge moved without a compressed-facts refresh');
+  endBatchWindow(provider);
   provider.applyCompressedBatch({
     entries: [entry({ hash: 'x' })],
     backfillMs: 0,
