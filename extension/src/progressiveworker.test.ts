@@ -70,7 +70,7 @@ import { railCacheMarkOf, sessionParentIndex, agentRunAnswer } from './turnrail'
 import { logOf, toCard, turnCost } from './turncard';
 import { codexAgentSpendVersion, codexSpendIndex, type CodexSubagentFile } from './codex';
 import { agentSpendDependencyKey } from './transcript';
-import { openSpendBand } from './agentspend';
+import { openSpendBand, openSpendBandMs } from './agentspend';
 import {
   readClaudeSessionIncremental,
   readClaudeSessionIncrementalAsync,
@@ -1256,21 +1256,23 @@ test.each([
   ['the startup binding', (id: string) => `${id}/startup.json`],
   ['the startup witness', (id: string) => `${id}.startup.json`],
 ])('an in-place write of %s reaches the reader at the age bound', async (_name, name) => {
-  const { fx, worker, walk, settle, advance, pass, checks } = await receiptWalkHarness();
+  const { fx, worker, walk, settle, advance, pass } = await receiptWalkHarness();
   try {
     const { launchId } = fx.launch();
     await settle();
     assert.equal(await walk(), true);
-    fs.appendFileSync(path.join(fx.receipts.root, name(launchId)), ' ');
+    const file = path.join(fx.receipts.root, name(launchId));
+    const content = JSON.parse(fs.readFileSync(file, 'utf8'));
+    content.launchId = 'dddddddd-1111-2222-3333-444444444444';
+    fs.writeFileSync(file, JSON.stringify(content));
     assert.equal(await walk(), true);
     advance();
     assert.equal(await walk(), false);
-    const before = checks();
     const reply = await pass();
-    assert.ok(checks() > before, 'the age bound pass read no receipt');
     assert.equal(
       reply.references.some((reference) => reference.sessionId === fx.child.sessionId),
-      !name(launchId).includes('/'),
+      false,
+      `the age bound pass kept the link after ${name(launchId)} changed`,
     );
   } finally {
     worker.stop();
@@ -13243,6 +13245,14 @@ test('a new worker resolves unchanged Claude children from saved heads and rerea
 });
 
 test('a grown descendant refreshes at the full pass age bound after its spend band expires', async () => {
+  await assert.doesNotReject(descendantSpendAtAgeBound(0));
+});
+
+test('a long spend band holds a grown descendant at the age bound and refreshes at the first age request after expiry', async () => {
+  await assert.doesNotReject(descendantSpendAtAgeBound(700 * 1024 * 1024));
+});
+
+async function descendantSpendAtAgeBound(aggregateBytes: number) {
   const directory = tempDir('spend-band-');
   const codexId = 'aaaaaaaa-1111-1111-1111-111111111111';
   const parentFile = path.join(directory, 'parent.jsonl');
@@ -13322,9 +13332,18 @@ test('a grown descendant refreshes at the full pass age bound after its spend ba
     ],
     repositoryRoots: [directory],
   });
+  // The version reports aggregate bytes while the usage reader reads only the fixture's records.
+  const versionRead = 'return stat.isFile() ? `${stat.size}:${stat.mtimeMs}` : "not-file";';
+  assert.ok(source.includes(versionRead));
+  const workerSource = aggregateBytes
+    ? source.replace(
+        versionRead,
+        `return stat.isFile() ? \`\${file === ${JSON.stringify(nativeFile)} ? ${aggregateBytes} : stat.size}:\${stat.mtimeMs}\` : "not-file";`,
+      )
+    : source;
   const worker = new ProgressiveWorker(
     `performance.now = () => 0; const bandClock = require('node:fs'); Date.now = () => Number(bandClock.readFileSync(${JSON.stringify(clockFile)}, 'utf8'));` +
-      source,
+      workerSource,
   );
   const { host, replies } = await receiptDiscoveryHost(worker, [directory], request().parents);
   Object.assign(host, {
@@ -13378,12 +13397,29 @@ test('a grown descendant refreshes at the full pass age bound after its spend ba
     }
     setClock(start + 3_000 + 10 * 60_000 + 1);
     assert.equal(await host.walkKeepsDiscovery(host.settledDiscovery), false);
+    if (aggregateBytes) {
+      assert.ok(openSpendBandMs(aggregateBytes) > 10 * 60_000);
+      assert.equal(figure((await fullPass()).dispatchFacts), 8, 'the age request inside the band refreshed the figure');
+      host.sessionQueryDiscoveryPending = false;
+      const insideRequests = requests;
+      setClock(start + 3_000 + 2 * (10 * 60_000 + 1));
+      assert.equal(await host.walkKeepsDiscovery(host.settledDiscovery), false);
+      assert.equal(figure((await fullPass()).dispatchFacts), 8);
+      assert.ok(requests > insideRequests);
+      host.sessionQueryDiscoveryPending = false;
+      const expiry = start + 2_000 + openSpendBandMs(aggregateBytes);
+      assert.ok(Date.now() < expiry);
+      const afterExpiry = start + 3_000 + 3 * (10 * 60_000 + 1);
+      assert.ok(afterExpiry > expiry && afterExpiry - expiry <= 10 * 60_000);
+      setClock(afterExpiry);
+      assert.equal(await host.walkKeepsDiscovery(host.settledDiscovery), false);
+    }
     assert.ok(figure((await fullPass()).dispatchFacts)! > 8, 'the full pass kept the earlier figure');
   } finally {
     worker.stop();
     fs.rmSync(directory, { recursive: true, force: true });
   }
-});
+}
 
 test('a new worker reuses saved spend facts of unchanged dispatched sessions and rereads only a grown one', async () => {
   const directory = tempDir('saved-dispatch-facts-');
