@@ -4532,7 +4532,7 @@ export class AgentHost {
     this.sessions.delete(key);
     const state = session.state();
     const identity = state.sessionId ? this.sessionIdentity(session.agent, state.sessionId) : null;
-    // Only archive retirement passes an open hold. The launches end with the child, also for a resumed session.
+    // Only archive retirement passes an open hold. The holds on its open launches close with the child, also for a resumed session.
     if (state.backgroundPending) {
       for (const [sessionId, work] of session.allBackgroundWork()) {
         work.closeOpen();
