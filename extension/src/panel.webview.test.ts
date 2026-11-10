@@ -14103,6 +14103,7 @@ test('polling discovers a completed transcript turn without a snapshot trigger',
     pollInFlight: null,
     performanceCounters: { recordWork() {} },
     pollDirectories: () => null,
+    settleCompressedSpend: () => false,
     refreshFrom(reason: string) {
       assert.equal(reason, 'poll:noListing');
       for (const session of listSessionFiles(dir)) {

@@ -299,6 +299,20 @@ export class SessionFactFigures<F, V> {
     this.held = next;
     return this.value;
   }
+
+  // Sets the figure of one session, or drops it with null. The output keeps its identity, so a caller that patches a
+  // figure posts the change itself.
+  patch(sessionId: string, entry: { facts: F; value: V } | null): Readonly<Record<string, V>> {
+    const value = this.value as Record<string, V>;
+    if (entry) {
+      this.held.set(sessionId, entry);
+      value[sessionId] = entry.value;
+    } else {
+      this.held.delete(sessionId);
+      delete value[sessionId];
+    }
+    return this.value;
+  }
 }
 
 // Stores session list enrichment and uses scan results to set `agentRun`.

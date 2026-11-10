@@ -3414,6 +3414,9 @@ function completeDiscoveryHarness(
     'noteCompressedCoverage',
     'noteCompressedRowFacts',
     'noteCompressedMembership',
+    'takeCompressedRows',
+    'settleCompressedSpend',
+    'sessionReadProofFor',
     'sessionPageIndexFor',
     'drainCompressedRows',
     'compressedRolloutsToSend',
@@ -5856,6 +5859,28 @@ test('placeInSessionCatalog gives the full order and compares only for the place
     'a placed row is out of the catalog order',
   );
   assert.ok(comparisons < 3 * 2 * 8, `placing three rows made ${comparisons} activity reads`);
+});
+
+test('placeInSessionCatalog shifts the list once for all its rows', () => {
+  const activity = (session: { activity: number }) => session.activity;
+  const catalog = orderSessionCatalog(
+    Array.from({ length: 200 }, (_, index) => ({ sessionId: `listed-${index}`, activity: index * 2 })),
+    activity,
+  );
+  const rows = Array.from({ length: 50 }, (_, index) => ({ sessionId: `row-${index}`, activity: index * 7 + 1 }));
+  const splice = vi.spyOn(Array.prototype, 'splice');
+  let placed: { sessionId: string; activity: number }[];
+  try {
+    placed = placeInSessionCatalog(catalog, rows, activity);
+    assert.equal(splice.mock.calls.length, 0, 'each placed row shifted the list');
+  } finally {
+    splice.mockRestore();
+  }
+  assert.deepEqual(
+    placed.map((session) => session.sessionId),
+    orderSessionCatalog([...catalog, ...rows], activity).map((session) => session.sessionId),
+    'a placed row is out of the catalog order',
+  );
 });
 
 test('complete discovery has one stable final order across Claude and Codex sessions', () => {
@@ -13191,8 +13216,22 @@ const endBatchWindow = (provider: any) => {
 const discoveryRequests = (work: Record<string, number>) =>
   Object.keys(work).filter((name) => name.startsWith('discoveryRequest:'));
 
+const pollScope = { sessionDirectoryOwners: () => () => null };
+
+// One poll tick over a directory gate that asks for no walk. The refresh it asks for does nothing.
+const pollOnce = async (provider: any) => {
+  provider.pollGate = { stats: 0, decide: async () => ({ kind: 'none' }) };
+  provider.pollDirectories = () => null;
+  provider.watching = true;
+  provider.refreshFrom = () => {};
+  await provider.pollCatalog();
+};
+
 test('fifty batches during pending discovery list their rows with no discovery request or catalog enumeration', async () => {
-  const { provider, plain, work, refreshes, gauges, posted, sourceUpdates, entryOf } = await batchApplyHarness();
+  const { provider, plain, work, refreshes, gauges, posted, sourceUpdates, entryOf } = await batchApplyHarness(
+    pollScope,
+    ['pollCatalog'],
+  );
   provider.activityFor = (session: SessionFile) => session.mtimeMs;
   provider.dispatchDiscoveryPending = true;
   provider.claudeChildrenDiscovered = true;
@@ -13231,6 +13270,7 @@ test('fifty batches during pending discovery list their rows with no discovery r
       orderSessionCatalog(provider.catalog.sessions as SessionFile[], provider.activityFor).map((row) => row.file),
       'a joined row is out of its place in the list order',
     );
+    await pollOnce(provider);
     assert.ok(
       sourceUpdates.some((codex) => codex.some((row) => row.file === twins[0])),
       'a joined row reached no spend source',
@@ -13549,6 +13589,173 @@ test('a merged row keeps the session listing complete only when the last walk li
   provider.applyCompressedBatch({ entries: [entryOf('never-walked').entry], backfillMs: 0 });
   endBatchWindow(provider);
   assert.equal(provider.sessionQueryContext().coverage, 'incomplete', 'a row no walk listed read as covered');
+});
+
+test('fifty batches rebuild the spend sources at most once per poll', async () => {
+  const { provider, sourceUpdates, entryOf } = await batchApplyHarness(pollScope, ['pollCatalog']);
+  provider.claudeChildrenDiscovered = true;
+  let polls = 0;
+  for (let batch = 0; batch < 50; batch++) {
+    provider.applyCompressedBatch({ entries: [entryOf(`spend-${batch}`).entry], backfillMs: 0 });
+    endBatchWindow(provider);
+    assert.equal(sourceUpdates.length, polls, 'a batch rebuilt the spend sources');
+    if (batch % 10 === 9) {
+      await pollOnce(provider);
+      polls++;
+      assert.equal(sourceUpdates.length, polls, 'a poll with new rows did not rebuild the spend sources once');
+    }
+  }
+  await pollOnce(provider);
+  assert.equal(sourceUpdates.length, polls, 'a poll with no new row rebuilt the spend sources');
+});
+
+test('a joined row reaches its spend source and the session list at the next poll', async () => {
+  const { provider, posted, sourceUpdates, entryOf } = await batchApplyHarness(pollScope, ['pollCatalog']);
+  provider.claudeChildrenDiscovered = true;
+  provider.projectSpendBusy = () => false;
+  const joined = entryOf('joined-spend');
+  provider.applyCompressedBatch({ entries: [joined.entry], backfillMs: 0 });
+  endBatchWindow(provider);
+  assert.equal(sourceUpdates.length, 0, 'the merge rebuilt the spend sources before the poll');
+  const revisionBefore = provider.railRevision;
+  await pollOnce(provider);
+  assert.ok(
+    sourceUpdates.at(-1)?.some((row) => row.file === joined.twin),
+    'the joined row has no spend source after the next poll',
+  );
+  assert.ok(provider.railRevision > revisionBefore, 'the poll did not ask the session list to take the new spend');
+  assert.ok(posted.at(-1)?.includes('joined-spend'), 'the session list lost the joined row');
+});
+
+test('a batch leaves the project spend post to the next poll unless a row of the batch is shown', async () => {
+  const { provider, sourceUpdates, entryOf } = await batchApplyHarness(pollScope, ['pollCatalog']);
+  provider.claudeChildrenDiscovered = true;
+  provider.refreshFrom = () => {};
+  provider.projectSpendBusy = () => false;
+  let projectPosts = 0;
+  provider.postProjectSpend = () => projectPosts++;
+  provider.showing = 'shown-spend';
+  provider.applyCompressedBatch({ entries: [entryOf('other-spend').entry], backfillMs: 0 });
+  endBatchWindow(provider);
+  assert.equal(projectPosts, 0, 'a row no panel shows posted the project spend');
+  assert.equal(sourceUpdates.length, 0, 'a row no panel shows rebuilt the spend sources');
+  await pollOnce(provider);
+  assert.equal(projectPosts, 1, 'the poll did not post the project spend');
+  assert.equal(sourceUpdates.length, 1, 'the poll did not rebuild the spend sources');
+  provider.applyCompressedBatch({ entries: [entryOf('shown-spend').entry], backfillMs: 0 });
+  endBatchWindow(provider);
+  assert.equal(projectPosts, 2, 'a shown row did not post the project spend at once');
+  assert.equal(sourceUpdates.length, 2, 'a shown row did not rebuild its spend source at once');
+  await pollOnce(provider);
+  assert.equal(projectPosts, 2, 'a poll after a shown row posted the project spend again');
+  assert.equal(sourceUpdates.length, 2, 'a poll after a shown row rebuilt the spend sources again');
+});
+
+// A provider whose listing starts complete, with a counted membership digest.
+async function provedListingHarness() {
+  let digests = 0;
+  const harness = await batchApplyHarness(
+    {
+      sessionQueryRevision,
+      sessionCatalogMembership: (...args: Parameters<typeof sessionCatalogMembership>) => {
+        digests++;
+        return sessionCatalogMembership(...args);
+      },
+    },
+    ['sessionQueryContext', 'sessionQueryRevisionFor', 'sessionsKeptByReader'],
+  );
+  const { provider } = harness;
+  const scope = JSON.stringify(provider.repositoryScopeRoots);
+  provider.sessionReadDiscoveryRevision = sessionCatalogMembership(scope, provider.authoritativeCatalog);
+  provider.sessionPageIndex = undefined;
+  provider.sessionQueryDiscoveryPending = false;
+  provider.dispatchDiscoveryPending = false;
+  provider.publishSessionQueryContext = () => {};
+  provider.membershipCoverage = {
+    domain: 'admitted',
+    scope,
+    revision: '1',
+    status: 'complete',
+    files: [],
+    uncertain: [],
+    members: new Set<string>(),
+  };
+  const merge = (entry: unknown) => {
+    provider.applyCompressedBatch({ entries: [entry], backfillMs: 0 });
+    endBatchWindow(provider);
+  };
+  const listedEntry = (thread: string, bytes?: string) => {
+    const made = harness.entryOf(thread, bytes);
+    provider.compressedWalk.listed.add(made.twin);
+    return made.entry;
+  };
+  const coverage = () => provider.sessionQueryContext().coverage;
+  return { ...harness, merge, listedEntry, coverage, digests: () => digests, clearDigests: () => (digests = 0) };
+}
+
+test('the listing proof follows merges under its three conditions and digests the list at most once', async () => {
+  const listed = await provedListingHarness();
+  listed.clearDigests();
+  listed.merge(listed.listedEntry('first-merge'));
+  assert.ok(listed.digests() <= 1, `the first merge digested the list ${listed.digests()} times`);
+  listed.clearDigests();
+  listed.merge(listed.listedEntry('second-merge'));
+  assert.equal(listed.digests(), 0, 'a merge over the list the proof follows digested it');
+  assert.equal(listed.coverage(), 'complete', 'the proof did not follow the merges');
+
+  const other = await provedListingHarness();
+  other.provider.sessionReadDiscoveryRevision = 'another-list';
+  other.merge(other.listedEntry('other-list'));
+  assert.equal(other.coverage(), 'incomplete', 'a proof of another list advanced');
+
+  const unlisted = await provedListingHarness();
+  unlisted.merge(unlisted.entryOf('never-walked').entry);
+  assert.equal(unlisted.coverage(), 'incomplete', 'a row no walk listed advanced the proof');
+
+  const leaving = await provedListingHarness();
+  leaving.merge(leaving.listedEntry('leaving'));
+  assert.equal(leaving.coverage(), 'complete', 'the fixture did not join its row');
+  const elsewhere = leaving.entryOf('leaving', 'xx').entry;
+  leaving.merge({ ...elsewhere, opening: { ...elsewhere.opening, cwd: '' } });
+  assert.equal(leaving.coverage(), 'incomplete', 'a row that left the list advanced the proof');
+
+  const unproved = await provedListingHarness();
+  unproved.provider.sessionReadDiscoveryRevision = undefined;
+  unproved.clearDigests();
+  unproved.merge(unproved.entryOf('no-proof').entry);
+  assert.equal(unproved.digests(), 0, 'a merge with no held proof digested the list');
+});
+
+test('a merge changes the held coverage set, statistics and outcomes in place', async () => {
+  const { provider, entryOf } = await batchApplyHarness();
+  provider.outcomesFor = (rows: SessionFile[]) => new Map(rows.map((row) => [row.sessionId, null]));
+  provider.applyCompressedBatch({ entries: [entryOf('held-first').entry], backfillMs: 0 });
+  endBatchWindow(provider);
+  provider.membershipCoverage = {
+    domain: 'admitted',
+    scope: JSON.stringify(provider.repositoryScopeRoots),
+    revision: '1',
+    status: 'complete',
+    files: [],
+    uncertain: [],
+    members: new Set<string>(),
+  };
+  const { members } = provider.membershipCoverage;
+  const outcomes = provider.sessionOutcomes;
+  const stats = provider.metadataStatsBySession;
+  const caches = provider.metadataRailCaches;
+  const next = entryOf('held-second');
+  provider.compressedWalk.listed.add(next.twin);
+  provider.applyCompressedBatch({ entries: [next.entry], backfillMs: 0 });
+  endBatchWindow(provider);
+  assert.equal(provider.membershipCoverage.members, members, 'a merge copied the coverage set');
+  assert.equal(members.size, 1, 'the merge left the walk-listed row out of the coverage set');
+  assert.equal(provider.sessionOutcomes, outcomes, 'a merge copied the outcome map');
+  assert.equal(provider.metadataStatsBySession, stats, 'a merge copied the statistics');
+  assert.equal(provider.metadataRailCaches, caches, 'a merge copied the cache marks');
+  assert.ok(Object.hasOwn(stats, 'held-second'), 'the statistics lost the merged row');
+  assert.ok(Object.hasOwn(caches, 'held-second'), 'the cache marks lost the merged row');
+  assert.ok(outcomes.has('held-second'), 'the outcomes lost the merged row');
 });
 
 test('a joined row asks discovery for no pass and leaves nothing for the next acceptance to answer', async () => {

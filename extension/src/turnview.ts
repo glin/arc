@@ -72,23 +72,30 @@ function compareSessionCatalog<T extends { sessionId: string }>(
   return activityFor(right) - activityFor(left) || left.sessionId.localeCompare(right.sessionId);
 }
 
-// Puts each row at its place in a list in catalog order. The comparisons grow with the placed rows.
+// Puts each row at its place in a list in catalog order. The comparisons grow with the placed rows, and the list copies once.
 export function placeInSessionCatalog<T extends { sessionId: string }>(
   ordered: readonly T[],
   rows: readonly T[],
   activityFor: (session: T) => number,
 ): T[] {
-  const placed = [...ordered];
-  for (const row of rows) {
+  const places = rows.map((row) => {
     let low = 0;
-    let high = placed.length;
+    let high = ordered.length;
     while (low < high) {
       const middle = (low + high) >>> 1;
-      if (compareSessionCatalog(placed[middle], row, activityFor) < 0) low = middle + 1;
+      if (compareSessionCatalog(ordered[middle], row, activityFor) < 0) low = middle + 1;
       else high = middle;
     }
-    placed.splice(low, 0, row);
+    return { row, at: low };
+  });
+  places.sort((left, right) => left.at - right.at || compareSessionCatalog(left.row, right.row, activityFor));
+  const placed: T[] = [];
+  let next = 0;
+  for (const { row, at } of places) {
+    while (next < at) placed.push(ordered[next++]);
+    placed.push(row);
   }
+  while (next < ordered.length) placed.push(ordered[next++]);
   return placed;
 }
 

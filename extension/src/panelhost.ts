@@ -2536,6 +2536,11 @@ export class PanelProvider implements vscode.Disposable {
   // Programmatic completeness belongs to the catalog membership accepted from complete discovery: each file with its device and
   // inode. Transcript appends leave it unchanged.
   private sessionReadDiscoveryRevision?: string;
+  // The accepted list that a merge advanced the listing proof to. `sessionReadProofFor` gives the proof the digest of this list.
+  private sessionReadProofCatalog?: readonly SessionFile[];
+  // Rows that merged since the last poll, for the spend sources and for the project spend post.
+  private compressedSourcesOwed = false;
+  private compressedSpendPostOwed = false;
   // Each provider instance signs its own session cursors, so a reload invalidates every cursor it issued.
   private sessionCursorSecret?: Buffer;
   // Session pages over one accepted catalog and scope filter, sort, and serialize that catalog once.
@@ -3678,7 +3683,7 @@ export class PanelProvider implements vscode.Disposable {
             : this.membershipCoverage?.status === 'complete' &&
                 !this.dispatchDiscoveryPending &&
                 index.scoped.length === accepted.length &&
-                this.sessionReadDiscoveryRevision === index.discovery
+                this.sessionReadProofFor(index) === index.discovery
               ? 'complete'
               : 'incomplete',
       fresh,
@@ -3770,20 +3775,17 @@ export class PanelProvider implements vscode.Disposable {
     const roots = JSON.stringify(scope?.roots ?? []);
     const accepted = scope?.ready && this.authoritativeCatalogScope === roots ? this.authoritativeCatalog : null;
     const index = accepted ? this.sessionPageIndexFor(accepted, roots, scope?.roots ?? []) : null;
+    const proof = index ? this.sessionReadProofFor(index) : this.sessionReadDiscoveryRevision;
     const coverage = !index
       ? 'unavailable'
       : this.membershipCoverage?.status === 'complete' &&
           !this.sessionQueryDiscoveryPending &&
           !this.dispatchDiscoveryPending &&
           index.scoped.length === accepted!.length &&
-          this.sessionReadDiscoveryRevision === index.discovery
+          proof === index.discovery
         ? 'complete'
         : 'incomplete';
-    const revision = this.sessionQueryRevisionFor(
-      this.sessionReadDiscoveryRevision,
-      index?.discovery,
-      this.sessionsKeptByReader(),
-    );
+    const revision = this.sessionQueryRevisionFor(proof, index?.discovery, this.sessionsKeptByReader());
     const held = this.resolvedQueryContext;
     if (
       held?.catalog === accepted &&
@@ -4102,6 +4104,7 @@ export class PanelProvider implements vscode.Disposable {
   // A moved `subagents` directory revalidates the session that owns it, and that refresh sends child discovery. Any other poll
   // refreshes from the held catalog, which revalidates the selected session and redraws.
   private async pollCatalog(): Promise<void> {
+    if (this.settleCompressedSpend()) this.postRail(true, 'compressedSpend', undefined, false);
     if (this.pollInFlight) {
       // Stats that never answer, such as on a lost network share, still leave the backstop walk.
       const since = (time: number | null | undefined) => Date.now() - (time ?? 0) >= POLL_BACKSTOP_WALK_MS;
@@ -4745,6 +4748,7 @@ export class PanelProvider implements vscode.Disposable {
     this.discoveryComplete = undefined;
     this.completeCatalogScope = undefined;
     this.sessionReadDiscoveryRevision = undefined;
+    this.sessionReadProofCatalog = undefined;
     this.publishSessionQueryContext();
     // Removing roots needs no new loading, so the hold stays unless the new roots add one outside the held scope.
     const scope = this.repositoryScope.snapshot(this.folders());
@@ -4794,6 +4798,7 @@ export class PanelProvider implements vscode.Disposable {
     this.authoritativeCatalogScope = undefined;
     this.completeCatalogScope = undefined;
     this.sessionReadDiscoveryRevision = undefined;
+    this.sessionReadProofCatalog = undefined;
     this.publishSessionQueryContext();
     this.sessionReadFailures?.clear();
     this.startupSourceCheckpoint = null;
@@ -5217,7 +5222,8 @@ export class PanelProvider implements vscode.Disposable {
 
   // Merges the rows whose entries changed since the last list into the held and accepted catalogs, and posts the session
   // list. Its work follows the changed rows: a row keeps its spend source, discovery state, statistics and order, and
-  // every other row keeps the facts of the refresh that listed it. A catalog refresh merges the same rows through
+  // every other row keeps the facts of the refresh that listed it. The next poll rebuilds the spend sources and posts the
+  // project spend, unless a row of the batch is shown. A catalog refresh merges the same rows through
   // `withCompressedFactRows`. A catalog that cannot take the rows runs that refresh.
   private mergeCompressedRows(): void {
     const dirty = this.compressedRowsDirty;
@@ -5244,8 +5250,7 @@ export class PanelProvider implements vscode.Disposable {
       return;
     }
     const replaced = held.sessions.filter((session) => dirty.has(session.file));
-    const kept = held.sessions.length - replaced.length;
-    const rows = this.withCompressedFactRows(held.sessions).slice(kept);
+    const { rows, added } = this.takeCompressedRows(dirty, this.compressedWalk);
     const activity = (session: SessionFile) => this.activityFor(session);
     const sessions = placeInSessionCatalog(
       held.sessions.filter((session) => !dirty.has(session.file)),
@@ -5266,22 +5271,50 @@ export class PanelProvider implements vscode.Disposable {
     this.compressedFactsRefreshDue = true;
     this.noteCompressedRowsGauge(sessions);
     this.armCompressedRowsTimer();
-    this.postRail(true, 'compressedBatch', undefined, false);
-    if (!this.projectSpendBusy()) this.postProjectSpend();
-    // A row that a panel shows redraws through the selected-window path. So does the first row of an empty list when no
-    // session is shown.
     const changed = new Set([...rows, ...replaced].map((row) => row.sessionId));
     const shown = [this.showing, ...(this.hostSessions?.values() ?? [])].filter((id): id is string => id !== null);
+    const showsChanged = shown.some((id) => changed.has(id));
+    this.compressedSourcesOwed ||= added;
+    this.compressedSpendPostOwed = true;
+    if (showsChanged) this.settleCompressedSpend();
+    this.postRail(true, 'compressedBatch', undefined, false);
+    // A row that a panel shows redraws through the selected-window path. So does the first row of an empty list when no
+    // session is shown.
     const firstRow = this.compressedFirstRowRedrawOwed;
     this.compressedFirstRowRedrawOwed = false;
-    if (this.showing === null ? firstRow : shown.some((id) => changed.has(id)))
+    if (this.showing === null ? firstRow : showsChanged)
       this.refreshFrom('selected-window', true, true, null, true, true);
     this.performanceCounters?.recordWork('compressedMerge');
     this.performanceCounters?.recordWork('compressedMergeMs', Math.round(performance.now() - started));
   }
 
+  // Brings the spend sources and the project spend up to the merged rows. Returns whether the spend sources were rebuilt,
+  // so a poll can post the session list that carries the new spend.
+  private settleCompressedSpend(): boolean {
+    const sourcesOwed = this.compressedSourcesOwed;
+    const sessions = this.catalog?.sessions;
+    this.compressedSourcesOwed = false;
+    const rebuild = sourcesOwed && !!sessions && this.claudeChildrenDiscovered;
+    if (rebuild)
+      this.updateSessionSpendSources(
+        sessions.filter((session) => session.agent === 'codex'),
+        sessions,
+      );
+    if (this.compressedSpendPostOwed && !this.projectSpendBusy()) this.postProjectSpend();
+    this.compressedSpendPostOwed = false;
+    return rebuild;
+  }
+
+  // The listing proof for a session index. A merge advances the proof by list identity, so the proof takes the digest of
+  // the merged list when a reader first holds its index.
+  private sessionReadProofFor(index: { catalog: readonly SessionFile[]; discovery: string }): string | undefined {
+    if (this.sessionReadProofCatalog === index.catalog) this.sessionReadDiscoveryRevision = index.discovery;
+    return this.sessionReadDiscoveryRevision;
+  }
+
   // The discovery proof follows a merge when it named the old list and the last walk listed each changed row. A row that
-  // leaves the list, or that no walk listed, leaves the proof on the earlier membership.
+  // leaves the list, or that no walk listed, leaves the proof on the earlier membership. The check digests the old list
+  // only when no merge advanced the proof to it and no held index names it.
   private noteCompressedMembership(
     accepted: SessionFile[],
     admitted: SessionFile[],
@@ -5294,8 +5327,15 @@ export class PanelProvider implements vscode.Disposable {
     if (!proof || !walk) return;
     const merged = new Set(rows.map((row) => row.file));
     if (!replaced.every((row) => merged.has(row.file)) || !rows.every((row) => walk.listed.has(row.file))) return;
-    if (proof !== this.sessionPageIndexFor(accepted, scope, this.repositoryScopeRoots).discovery) return;
-    this.sessionReadDiscoveryRevision = this.sessionPageIndexFor(admitted, scope, this.repositoryScopeRoots).discovery;
+    if (this.sessionReadProofCatalog !== accepted) {
+      const index = this.sessionPageIndex;
+      const named =
+        index?.catalog === accepted && index.roots === scope
+          ? index.discovery
+          : sessionCatalogMembership(scope, accepted);
+      if (proof !== named) return;
+    }
+    this.sessionReadProofCatalog = admitted;
   }
 
   // A joined row counts as a member when the walk listed it, as `acceptSessionCoverage` counts it. A row that leaves the
@@ -5308,10 +5348,9 @@ export class PanelProvider implements vscode.Disposable {
     const coverage = this.membershipCoverage;
     if (!coverage) return;
     coverage.files = admitted.map((source) => source.file);
-    const members = new Set(coverage.members);
+    const members = (coverage.members ??= new Set<string>()) as Set<string>;
     for (const session of replaced) members.delete(sessionCoverageMember(session));
     for (const row of rows) if (this.coveredMember(row)) members.add(sessionCoverageMember(row));
-    coverage.members = members;
   }
 
   // The session rows, statistics, cache marks and outcomes of the changed rows. Every other row keeps its own.
@@ -5320,25 +5359,29 @@ export class PanelProvider implements vscode.Disposable {
     replaced: readonly SessionFile[],
     rows: readonly SessionFile[],
   ): void {
-    const stats = { ...this.metadataStatsBySession };
-    const caches = { ...this.metadataRailCaches };
     const now = Date.now();
     for (const session of replaced) {
-      delete stats[session.sessionId];
-      delete caches[session.sessionId];
+      this.metadataStatsBySession = this.metadataStatFigures.patch(session.sessionId, null);
+      this.metadataRailCaches = this.metadataCacheFigures.patch(session.sessionId, null);
       this.windows.delete(session.sessionId);
     }
     for (const [sessionId, starts] of this.glanceAt(rows, [])) this.windows.set(sessionId, starts);
     for (const row of rows) {
       const meta = this.metaFor(row);
-      stats[row.sessionId] = sessionStatsFromFacts(derivedTitleStats(meta));
-      caches[row.sessionId] = railCacheMarkOf(derivedTitleCacheStats(meta), now);
+      const statFacts = derivedTitleStats(meta);
+      this.metadataStatsBySession = this.metadataStatFigures.patch(row.sessionId, {
+        facts: statFacts,
+        value: sessionStatsFromFacts(statFacts),
+      });
+      const cacheFacts = derivedTitleCacheStats(meta);
+      this.metadataRailCaches = this.metadataCacheFigures.patch(row.sessionId, {
+        facts: cacheFacts,
+        value: railCacheMarkOf(cacheFacts, now),
+      });
       if (Object.hasOwn(this.parsedRailCaches, row.sessionId))
         this.metadataRailRevisions[row.sessionId] = derivedTitleCacheRevision(meta);
     }
-    this.metadataStatsBySession = stats;
-    this.metadataRailCaches = caches;
-    this.sessionOutcomes = new Map([...this.sessionOutcomes, ...this.outcomesFor(rows)]);
+    for (const [sessionId, outcome] of this.outcomesFor(rows)) this.sessionOutcomes.set(sessionId, outcome);
     const shown = new Set([this.showing, ...(this.hostSessions?.values() ?? [])]);
     const edges = this.sessionParentEdges(admitted).edges;
     const listed = new Map(this.sessionRows.map((row) => [row.id, row]));
@@ -5662,13 +5705,30 @@ export class PanelProvider implements vscode.Disposable {
     };
   }
 
-  // A batch joins the held catalog without a walk. Only the entries that changed since the last list stat their file.
+  // A batch joins the held catalog without a walk.
   private withCompressedFactRows(held: SessionFile[]): SessionFile[] {
     const dirty = this.compressedRowsDirty;
     const walk = this.compressedWalk;
     if (!dirty?.size || !walk) return held;
+    const { rows, added } = this.takeCompressedRows(dirty, walk);
+    const out = [...held.filter((session) => !(isCompressedRollout(session.file) && dirty.has(session.file))), ...rows];
+    // A row that joins between discovery replies needs its source now, or its cost waits for the next complete reply.
+    if (added && this.claudeChildrenDiscovered)
+      this.updateSessionSpendSources(
+        out.filter((session) => session.agent === 'codex'),
+        out,
+      );
+    return out;
+  }
+
+  // The rows of the entries that changed since the last list. Only these entries stat their file. `added` says whether
+  // the host held no row for one of the entries.
+  private takeCompressedRows(
+    dirty: ReadonlySet<string>,
+    walk: NonNullable<typeof this.compressedWalk>,
+  ): { rows: SessionFile[]; added: boolean } {
     this.compressedRowsDirty = null;
-    const out = held.filter((session) => !(isCompressedRollout(session.file) && dirty.has(session.file)));
+    const rows: SessionFile[] = [];
     let added = false;
     for (const twin of dirty) {
       added ||= !this.compressedRowsHeld.has(twin);
@@ -5677,20 +5737,14 @@ export class PanelProvider implements vscode.Disposable {
       if (!entry || (entry.opening?.cwd && !walk.inFolders(entry.opening.cwd))) continue;
       const row = this.compressedRowOf(twin, entry, walk.walked);
       if (!row) continue;
-      out.push(row);
+      rows.push(row);
       this.compressedRowsHeld.set(twin, row);
       // A row that joins while a complete reply waits counts as answered, so accepting that reply records no mismatch.
       this.discoveryComplete?.files.add(row.file);
       this.discoveryComplete?.revisions?.set(row.file, { ...row });
       if (!this.enumeratedAmbiguousIds?.has(row.sessionId)) this.enumeratedMembers?.add(sessionCoverageMember(row));
     }
-    // A row that joins between discovery replies needs its source now, or its cost waits for the next complete reply.
-    if (added && this.claudeChildrenDiscovered)
-      this.updateSessionSpendSources(
-        out.filter((session) => session.agent === 'codex'),
-        out,
-      );
-    return out;
+    return { rows, added };
   }
 
   // Each discovery reply holds only the parents it was sent, and no compressed rollout is sent. The compressed rows
