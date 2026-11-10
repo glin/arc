@@ -1206,6 +1206,10 @@ export class AgentSession {
     return work;
   }
 
+  allBackgroundWork(): ReadonlyMap<string, ClaudeBackgroundWork> {
+    return this.background;
+  }
+
   readonly usageSource = ++nextUsageSource;
   // A fresh secret for each spawned process. The Arc command line that the process runs sends it back.
   readonly token = randomBytes(16).toString('hex');
@@ -4529,10 +4533,11 @@ export class AgentHost {
     const state = session.state();
     const identity = state.sessionId ? this.sessionIdentity(session.agent, state.sessionId) : null;
     // Only archive retirement passes an open hold. The launches end with the child, also for a resumed session.
-    if (identity && state.sessionId && state.backgroundPending) {
-      const work = session.backgroundWork(state.sessionId);
-      work.closeOpen();
-      this.backgroundReads.set(identity, work);
+    if (state.backgroundPending) {
+      for (const [sessionId, work] of session.allBackgroundWork()) {
+        work.closeOpen();
+        this.backgroundReads.set(this.sessionIdentity(session.agent, sessionId), work);
+      }
     }
     // Archive retirement can end a child that a targeted request waits on. The request resolves after the exit.
     const targeted = this.targetedRetirements.get(key);

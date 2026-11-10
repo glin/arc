@@ -4329,10 +4329,10 @@ test('a background task that ends during its turn releases its hold from the rep
 type BackgroundFixture = Awaited<ReturnType<typeof childWithBackgroundJob>>;
 
 // Archives a settled child past its open hold and confirms its exit.
-async function archivePastHold({ host, child }: BackgroundFixture): Promise<void> {
+async function archivePastHold({ host, child }: BackgroundFixture, sessionId = 'sess-1'): Promise<void> {
   child.say(COMPLETED_RESULT);
   settle(host, 'one');
-  host.setArchived(['sess-1']);
+  host.setArchived([sessionId]);
   assert.equal(host.get('one'), null);
   finishChild(child);
   await vi.advanceTimersByTimeAsync(0);
@@ -4410,6 +4410,19 @@ test('a background task that the resumed session starts holds its child', async 
   assert.equal(timer.activeCount(), 0, 'an idle window started behind the resumed session background task');
   assert.strictEqual(fixture.host.get('one'), resumed);
   finishChild(fixture.children[1]);
+});
+
+test('a session resumed after /clear and archive of its successor retires at the idle limit', async () => {
+  vi.useFakeTimers();
+  const timer = new FakeAgentHostTimer();
+  const fixture = await childWithBackgroundJob({ idleDurationMs: 120, timer });
+  fixture.say({ type: 'system', subtype: 'init', session_id: 'sess-2' });
+  assert.equal(fixture.session.state().sessionId, 'sess-2');
+  assert.equal(fixture.session.state().backgroundPending, true);
+  await archivePastHold(fixture, 'sess-2');
+  fixture.host.retainBackgroundWork('claude', 'sess-1', [{ id: 'launch', startedAt: 1 }], ['job-task']);
+  await finishTurnAndRetire(fixture, await resumeArchived(fixture), timer);
+  assert.equal(fixture.children[1].ended, true);
 });
 
 test('a new task id under a tool id that archive closed holds the resumed child until its notice', async () => {
