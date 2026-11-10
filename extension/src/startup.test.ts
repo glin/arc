@@ -15271,6 +15271,7 @@ function settledWalkHarness() {
     {
       DispatchReceipts,
       discoveryMemberRevisions,
+      revalidatedCatalogPaths: (sessions: SessionFile[]) => [...sessions],
       enumerateClaudeChildSources: (parents: SessionFile[]) => {
         const sessions = parents.filter((session) => session.childTranscript);
         return {
@@ -15359,6 +15360,19 @@ test.each([
     const before = { walked: walked(), skipped: skipped() };
     change(harness);
     await provider.refresh(true);
+    assert.deepEqual({ walked: walked(), skipped: skipped() }, { walked: before.walked + 1, skipped: before.skipped });
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});
+
+test('a targeted refresh after a settled reply sends its discovery request', async () => {
+  const { provider, walked, skipped, settle, claude } = settledWalkHarness();
+  try {
+    await settle();
+    const before = { walked: walked(), skipped: skipped() };
+    provider.targetedRefreshPaths = [claude.file];
+    await provider.refresh(false);
     assert.deepEqual({ walked: walked(), skipped: skipped() }, { walked: before.walked + 1, skipped: before.skipped });
   } finally {
     vi.unstubAllEnvs();

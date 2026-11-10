@@ -11329,7 +11329,7 @@ export class PanelProvider implements vscode.Disposable {
         }
       }
       // A walk that lists what the last settled reply covered keeps the accepted discovery and sends no request.
-      if (!selectedOnly && !reuseCatalog && this.settledDiscovery) {
+      if (!selectedOnly && !reuseCatalog && this.catalogWalked && this.settledDiscovery) {
         const unchanged = await this.walkKeepsDiscovery(this.settledDiscovery);
         if (controller.signal.aborted || generation !== this.refreshGeneration) return;
         if (unchanged) {
