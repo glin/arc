@@ -25,9 +25,9 @@ function sameBox(a: VisibilityBox, b: VisibilityBox): boolean {
   return a.x === b.x && a.y === b.y && a.width === b.width && a.height === b.height;
 }
 
-// Chromium snaps a webview frame's visible area to whole device pixels. At a fractional
-// device pixel ratio, such as a zoomed editor window, the visible area of a fully shown page
-// can fall short of the page box by up to one device pixel on each edge.
+// Chromium snaps a webview frame's visible area to whole device pixels.
+// At a fractional device pixel ratio, a fully shown page's visible area can fall short
+// by up to one device pixel per edge.
 export function coversBox(visible: VisibilityBox, box: VisibilityBox, devicePixelRatio: number): boolean {
   const slack = 1 / (devicePixelRatio > 0 ? devicePixelRatio : 1) + 1 / 64;
   return (
