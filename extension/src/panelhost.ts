@@ -15250,7 +15250,7 @@ export class PanelProvider implements vscode.Disposable {
             ),
             stamps: heldStamps,
             sidecars: epochSidecars,
-            receipts: progress.receiptRevision,
+            receipts: progress.receiptRevision!,
           }
         : undefined;
     this.updateSessionSpendSources(codex, sessions);

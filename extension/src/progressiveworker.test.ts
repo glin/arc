@@ -13180,6 +13180,129 @@ test('a new worker resolves unchanged Claude children from saved heads and rerea
   }
 });
 
+test('a spend band that expires makes a spend-only request read the grown descendant', async () => {
+  const directory = tempDir('spend-band-');
+  const codexId = 'aaaaaaaa-1111-1111-1111-111111111111';
+  const parentFile = path.join(directory, 'parent.jsonl');
+  const codexFile = path.join(directory, codexId + '.jsonl');
+  const nativeFile = path.join(directory, 'native.jsonl');
+  const clockFile = path.join(directory, 'clock');
+  const timestamp = (second: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, second)).toISOString();
+  const write = (file: string, rows: unknown[]) =>
+    fs.writeFileSync(file, rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
+  write(
+    parentFile,
+    claudeDispatchTranscript(
+      'python launch.py --arc-dispatch',
+      `ARC_DISPATCH_SESSION={"agent":"codex","session_id":"${codexId}"}`,
+      'dispatch-codex',
+    ),
+  );
+  const usage = (output: number, total: number) => ({
+    type: 'event_msg',
+    timestamp: timestamp(3),
+    payload: {
+      type: 'token_count',
+      info: {
+        last_token_usage: { input_tokens: 10, output_tokens: output, total_tokens: 10 + output },
+        total_token_usage: { input_tokens: 10, output_tokens: total, total_tokens: 10 + total },
+        model_context_window: 258400,
+      },
+    },
+  });
+  const rollout = (threadId: string, output: number, parentThreadId?: string) => [
+    {
+      type: 'session_meta',
+      timestamp: timestamp(0),
+      payload: {
+        id: threadId,
+        cwd: directory,
+        source: 'exec',
+        model_provider: 'openai',
+        ...(parentThreadId ? { parent_thread_id: parentThreadId } : {}),
+      },
+    },
+    { type: 'event_msg', timestamp: timestamp(1), payload: { type: 'task_started', turn_id: threadId } },
+    { type: 'turn_context', timestamp: timestamp(2), payload: { turn_id: threadId, model: 'gpt-6-sol' } },
+    { type: 'event_msg', timestamp: timestamp(2), payload: { type: 'user_message', message: 'work' } },
+    usage(output, output),
+    { type: 'event_msg', timestamp: timestamp(4), payload: { type: 'task_complete', turn_id: threadId } },
+  ];
+  write(codexFile, rollout(codexId, 3));
+  write(nativeFile, rollout('native', 5, codexId));
+  const start = 5_000 * Math.floor(Date.UTC(2026, 0, 2) / 5_000);
+  const setClock = (now: number) => fs.writeFileSync(clockFile, String(now));
+  const setModified = (file: string, ms: number) => fs.utimesSync(file, ms / 1000, ms / 1000);
+  setClock(start + 1_000);
+  for (const file of [parentFile, codexFile]) fs.utimesSync(file, 100, 100);
+  setModified(nativeFile, start);
+  const session = (file: string, sessionId: string, agent: 'claude' | 'codex') => ({
+    file,
+    sessionId,
+    agent,
+    ...revisionOf(fs.statSync(file, { bigint: true })),
+  });
+  const request = () => ({
+    kind: 'claude-children' as const,
+    parents: [session(parentFile, 'parent', 'claude'), session(codexFile, codexId, 'codex')],
+    catalog: [session(parentFile, 'parent', 'claude'), session(codexFile, codexId, 'codex')],
+    codexChildren: [
+      {
+        file: nativeFile,
+        threadId: 'native',
+        parentThreadId: codexId,
+        agentPath: '/native',
+        openedAt: 0,
+        startedAt: 0,
+        threadSource: 'subagent',
+        backgroundReview: false,
+      },
+    ],
+    repositoryRoots: [directory],
+  });
+  const worker = new ProgressiveWorker(
+    `performance.now = () => 0; const bandClock = require('node:fs'); Date.now = () => Number(bandClock.readFileSync(${JSON.stringify(clockFile)}, 'utf8'));` +
+      source,
+  );
+  const fullPass = async () => {
+    for (let pass = 0; pass < 60; pass++) {
+      const result = await worker.run(request(), pass + 1, new AbortController().signal);
+      assert.ok(result?.value.kind === 'claude-children' || result?.value.kind === 'claude-children-progress');
+      if (result.value.kind === 'claude-children' && !result.value.continuation) return result.value;
+    }
+    throw new Error('the full pass never settled');
+  };
+  const figure = (facts: readonly { sessionId: string; spend: import('./agentspend').AgentSpend }[]) =>
+    facts.find((fact) => fact.sessionId === codexId)?.spend.models[0]?.usage.output;
+  try {
+    assert.equal(figure((await fullPass()).dispatchFacts), 8);
+    fs.appendFileSync(
+      nativeFile,
+      [
+        { type: 'event_msg', timestamp: timestamp(5), payload: { type: 'task_started', turn_id: 'second' } },
+        { type: 'turn_context', timestamp: timestamp(6), payload: { turn_id: 'second', model: 'gpt-6-sol' } },
+        { ...usage(7, 12), timestamp: timestamp(7) },
+        { type: 'event_msg', timestamp: timestamp(8), payload: { type: 'task_complete', turn_id: 'second' } },
+      ]
+        .map((row) => JSON.stringify(row))
+        .join('\n') + '\n',
+    );
+    setModified(nativeFile, start + 2_000);
+    setClock(start + 3_000);
+    const inBand = await fullPass();
+    assert.equal(figure(inBand.dispatchFacts), 8, 'the full pass inside the band read the grown descendant');
+    const deadline = inBand.dispatchFacts.find((fact) => fact.sessionId === codexId)?.refreshAt;
+    assert.ok(deadline && deadline <= start + 9_000, `the held spend tree named no band deadline: ${deadline}`);
+    setClock(start + 9_000);
+    const expired = await worker.run({ ...request(), spendOnly: true }, 99, new AbortController().signal);
+    assert.ok(expired?.value.kind === 'dispatch-spend' && expired.value.held);
+    assert.ok(figure(expired.value.dispatchFacts)! > 8, 'the expired band kept the earlier figure');
+  } finally {
+    worker.stop();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('a new worker reuses saved spend facts of unchanged dispatched sessions and rereads only a grown one', async () => {
   const directory = tempDir('saved-dispatch-facts-');
   const cache = path.join(directory, 'derived-cache.json');

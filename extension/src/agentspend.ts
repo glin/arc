@@ -366,18 +366,7 @@ export function openSpendBandMs(bytes: number): number {
 // Each version line ends with `size:mtime`. After a full quiet band, the caller uses the exact version.
 // A version with no valid file size and time returns `none`.
 export function openSpendBand(version: string, now: number): string | null {
-  let newest = -Infinity;
-  let bytes = 0;
-  for (const line of version.split('\n')) {
-    const fields = line.split(':');
-    const written = Number(fields[fields.length - 1]);
-    const size = Number(fields[fields.length - 2]);
-    if (fields.length < 2 || !Number.isFinite(written) || !Number.isFinite(size)) {
-      continue;
-    }
-    newest = Math.max(newest, written);
-    bytes += size;
-  }
+  const { newest, bytes } = openSpendExtent(version);
   if (!Number.isFinite(newest)) {
     return 'none';
   }
@@ -391,6 +380,30 @@ export function childSpendBand(status: string, version: string, now: number): st
     (version.includes('codex-aggregate') && version.split('\n').some((line) => line.startsWith('[')))
     ? openSpendBand(version, now)
     : null;
+}
+
+function openSpendExtent(version: string): { newest: number; bytes: number } {
+  let newest = -Infinity;
+  let bytes = 0;
+  for (const line of version.split('\n')) {
+    const fields = line.split(':');
+    const written = Number(fields[fields.length - 1]);
+    const size = Number(fields[fields.length - 2]);
+    if (fields.length < 2 || !Number.isFinite(written) || !Number.isFinite(size)) {
+      continue;
+    }
+    newest = Math.max(newest, written);
+    bytes += size;
+  }
+  return { newest, bytes };
+}
+
+// The time at which a version inside its band leaves that band, or null for a version outside a band.
+export function childSpendBandEnd(status: string, version: string, now: number): number | null {
+  const band = childSpendBand(status, version, now);
+  if (band === null || band === 'none') return null;
+  const { newest, bytes } = openSpendExtent(version);
+  return newest + openSpendBandMs(bytes) + 1;
 }
 
 export function childSpendRevisionKey(status: string, version: string, now: number): string {

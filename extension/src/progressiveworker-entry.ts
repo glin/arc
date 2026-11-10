@@ -110,6 +110,7 @@ import {
 import {
   AgentSpendCache,
   readChildSpend,
+  childSpendBandEnd,
   childSpendRevisionKey,
   scanLinesIncremental,
   spendFileVersion,
@@ -1510,8 +1511,8 @@ async function execute(
     // A store that keeps the revision of the last settled pass gives the same answer, so this pass reads no receipt. A launch
     // whose catalog rows moved or whose dispatched child moved is read again against the current catalog.
     const heldReceipts = heldDispatchReferences?.scope === scope ? heldDispatchReferences.receipts : undefined;
-    const requestedRevision =
-      requestedReceiptRevision?.epoch === epoch.epoch ? requestedReceiptRevision.revision : undefined;
+    const requested = requestedReceiptRevision;
+    const requestedRevision = requested && requested.epoch === epoch.epoch ? requested.revision : undefined;
     if (!receiptScan && heldReceipts && requestedRevision) {
       const store = new DispatchReceipts();
       if (await store.unchangedSince(requestedRevision)) {
@@ -2273,6 +2274,7 @@ function collectDispatchFacts(
         spendOnly &&
         revision &&
         heldValue?.settled &&
+        Date.now() < heldValue.refreshAt &&
         !heldValue.activityStale &&
         heldValue.sourceGeneration === sourceGeneration &&
         sameRevision(heldValue.revision, revision)
@@ -2315,10 +2317,13 @@ function collectDispatchFacts(
           reference.sessionId,
           codexDependencies,
         );
+      const openVersion = reference.agent === 'codex' ? codexVersion() : null;
       const tree =
-        reference.agent === 'codex'
-          ? childSpendRevisionKey('completed', codexVersion(), now)
+        openVersion !== null
+          ? childSpendRevisionKey('completed', openVersion, now)
           : claudeAgentSpendVersion(reference.file, false, subagentMetas);
+      // A settled tree inside its spend band keeps the figures of an earlier read until the band ends.
+      const bandEnd = openVersion !== null ? childSpendBandEnd('completed', openVersion, now) : null;
       if (
         held &&
         sameRevision(held.revision, revision) &&
@@ -2516,7 +2521,7 @@ function collectDispatchFacts(
       }
       const facts: DispatchSessionFacts = {
         sessionId: reference.sessionId,
-        refreshAt: active ? refreshAt : null,
+        refreshAt: active ? refreshAt : bandEnd,
         revision,
         spend,
         startedAt: spend.startedAt ?? null,
@@ -2536,7 +2541,7 @@ function collectDispatchFacts(
         tree,
         codexDependencies,
         facts,
-        refreshAt: active ? refreshAt : Number.POSITIVE_INFINITY,
+        refreshAt: active ? refreshAt : (bandEnd ?? Number.POSITIVE_INFINITY),
         person: scan,
         codexPerson,
         settled:
