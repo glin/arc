@@ -408,7 +408,7 @@ test('unpriced or incomplete delegated work keeps the wait-share warning on a pa
     rows(
       sessionCostProjection([owner, child], { main: false, delegated: true, delegatedScopeIds: new Set(['child']) }),
     ),
-    ['$2.00+', ['$2.00+', '100%', 1, 'claude-sonnet-5, 1 agent. At least $2.00, 100% of delegated work.']],
+    ['$2.00+', ['$2.00+', '100%', 1, 'claude-sonnet-5, 1 agent. At least $2.00, 100% of priced delegated work.']],
   );
 });
 

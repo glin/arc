@@ -209,8 +209,8 @@ export interface CostDetailRow {
 export interface CostDetailPart {
   rows: CostDetailRow[];
   more?: { shown: number; open: string; close: string };
-  // The quiet line under a section's rows that names recorded dollars with no split. A section with
-  // no rows shows it where its rows would be.
+  // The quiet line under a section's rows explains missing pricing or a missing breakdown.
+  // A section with no rows shows it where its rows would be.
   empty?: string;
 }
 
@@ -3129,6 +3129,7 @@ function costDetailList(
   const total = cardCostOf(turn, shares, agentCosts);
   const sharedCosts = shares.flatMap((share) => share.costs);
   const childCompactionNotes: string[] = [];
+  const childExplanations: { label: string; text: string }[] = [];
   const totalLabel = formatCost(total.dollars) ?? (shares.length ? ZERO_COST : null);
   const mainParts = (turn.usageParts ?? []).map((part): SessionCostUsage => ({
     agent: turn.agent,
@@ -3167,6 +3168,14 @@ function costDetailList(
               childCompactionNotes,
               labels,
             );
+            const pricingNotes = new Set(agent.spend.flatMap((part) => recordedCostNote(part.costBasis) ?? []));
+            for (const entry of childEntries) {
+              for (const line of entry.lines ?? []) {
+                if (typeof line === 'object' && 'cost' in line && line.cost) continue;
+                const text = hintDetailLine(line);
+                if (!pricingNotes.has(text)) childExplanations.push({ label: entry.label, text });
+              }
+            }
             if (childEntries[0]) {
               withCostWarnings(
                 childEntries[0],
@@ -3244,8 +3253,6 @@ function costDetailList(
     ...(expiryText ? [{ label: expiryText, warning: true }] : []),
   ];
   const totalValue = totalLabel ? `${totalLabel}${total.partial ? '+' : ''}` : 'cost unavailable';
-  // A turn without usage parts prices its categories once here. The flat entries already
-  // priced its total, and the categories sum to it.
   const turnCategories = mainParts.length
     ? []
     : pricedUsageCategories(turn.usage, turn.model, turn.provider ?? null, turn.contextWindow);
@@ -3262,7 +3269,7 @@ function costDetailList(
             usage: turn.usage,
           },
           dollars: turnCategories.length ? turnCategories.reduce((sum, category) => sum + category.dollars, 0) : null,
-          partial: false,
+          partial: !turnCategories.length && spentTokens(turn.usage),
           categories: turnCategories,
           unallocatedRecordedCost: false,
           publiclyPriced: true,
@@ -3270,9 +3277,11 @@ function costDetailList(
       ];
   const delegates = turn.agents.length > 0 || shares.length > 0;
   const mainDollars = dollarsOf(mainPriced);
-  const mainValue = formatCost(mainDollars) ?? '$0';
-  const usageRows = costUsageRows(mainPriced, mainDollars, delegates ? "the main agent's cost" : 'this turn');
-  const toolRows = costToolRows(mainPriced, delegates ? "the main agent's cost" : 'this turn');
+  const mainTotal = sessionCostTotalOf(mainPriced);
+  const mainValue = sessionCostValue([mainTotal]);
+  const mainOf = mainTotal.partial ? 'priced main agent cost' : delegates ? "the main agent's cost" : 'this turn';
+  const usageRows = costUsageRows(mainPriced, mainDollars, mainOf);
+  const toolRows = costToolRows(mainPriced, mainOf);
   const delegatedDollars = Math.max(0, (total.dollars ?? 0) - mainDollars);
   // A launch row and a resume row of one child are one child session, so rows with a shared id merge.
   // A child's own partial flag holds only what no part's model can be told apart from: an unread,
@@ -3300,75 +3309,106 @@ function costDetailList(
     const parts =
       priced?.parts ??
       agent.spend.map((part) => ({ model: part.model, provider: part.provider ?? null, dollars: null }));
-    // An agent with no spend yet still counts, under its model with no cost.
-    holdChild(key, parts.length ? parts : [{ model: agentModel(agent), dollars: null }], priced?.unattributed ?? true);
+    // A fully read child with no billed usage counts without an unavailable model row.
+    const noBilledUsage = priced && !priced.partial && priced.dollars === null;
+    holdChild(
+      key,
+      parts.length || noBilledUsage ? parts : [{ model: agentModel(agent), dollars: null }],
+      priced?.unattributed ?? true,
+    );
   });
   shares.forEach((share) =>
     holdChild(`child:${share.cost.sessionId}`, pricedModelParts(share.costs), share.unattributed),
   );
   const children = [...childrenById.values()];
-  const delegatedPartial = children.some((child) => child.partial || child.parts.some((part) => part.partial));
+  const delegatedTotals = [
+    ...turn.agents.filter((agent) => !covered(agent)).map((agent) => agentCosts.get(agent)!),
+    ...shares,
+  ];
+  const delegatedPartial = delegatedTotals.some((cost) => cost.partial);
+  const delegatedTotal = {
+    dollars: !delegatedPartial || delegatedTotals.some((cost) => cost.dollars !== null) ? delegatedDollars : null,
+    partial: delegatedPartial,
+  };
+  const delegatedOf = delegatedPartial ? 'priced delegated work' : 'delegated work';
   const delegatedCosts = delegates ? turnDelegatedCosts(turn, shares, agentCosts) : [];
-  const delegatedTools = delegates ? costToolRows(delegatedCosts, 'delegated work') : [];
+  const delegatedTools = delegates ? costToolRows(delegatedCosts, delegatedOf) : [];
+  const delegatedUsage = delegatedModelPart(children, delegatedDollars, labels, delegatedPartial);
+  if (!delegatedUsage.rows.length && !delegatedPartial) delegatedUsage.empty = 'No billed usage';
+  const unavailable = unavailableUsage([...mainPriced, ...delegatedCosts], labels);
+  const unavailableLines = unavailableUsageLines(unavailable);
+  const unavailableTexts = new Set(unavailableLines);
+  const childFooter = [
+    ...new Set(
+      childExplanations.filter(({ text }) => !unavailableTexts.has(text)).map(({ label, text }) => `${label}: ${text}`),
+    ),
+  ];
   const mainFacts = costFacts(mainPriced, 'main');
   // The turn's Delegated section never warns. Its own subagents' costs carry no invocation scope,
   // so the rule that reads one invocation at a time cannot read them. A dispatched session's
   // costs keep that session's invocation scopes.
   const delegatedFacts = delegates ? costFacts(delegatedCosts, 'off') : undefined;
-  const cost: CostDetailView | undefined = usageRows.length
-    ? {
-        warnings: [
-          ...waitWarnings.map((warning) => waitShareLead(warning, 'turn')),
-          ...(expiryText ? [{ text: expiryText, title: CACHE_EXPIRY_COST_ADDED_HINT }] : []),
-          ...warnings.map((warning) => ({ text: cacheWriteWarningText(warning) })),
-        ],
-        ...(delegates ? costSplit(mainDollars, delegatedDollars) : {}),
-        sections: [
-          {
-            label: 'Main agent',
-            detail: modelNames(
-              mainPriced.map((held) => held.part),
-              labels,
-            ),
-            ...(delegates ? { value: mainValue } : {}),
-            title: `${[
-              centsCost(mainDollars),
-              ...(turn.usage.requests !== undefined ? [requestCount(turn.usage.requests)] : []),
-            ].join(', ')}.${delegates ? '' : ' This turn delegated nothing.'}`,
-            ...(mainFacts ? { facts: mainFacts } : {}),
-          },
-          ...(delegates
-            ? [
-                {
-                  label: 'Delegated' as const,
-                  detail: agentCount(children.length),
-                  value: `${formatCost(delegatedDollars) ?? '$0'}${delegatedPartial ? '+' : ''}`,
-                  title: `${delegatedPartial ? 'At least ' : ''}${centsCost(delegatedDollars)}, ${agentCount(children.length)}`,
-                  ...(delegatedFacts ? { facts: delegatedFacts } : {}),
-                },
-              ]
-            : []),
-        ],
-        tabs: [
-          {
-            name: 'Usage',
-            parts: [
-              { rows: usageRows },
-              ...(delegates ? [delegatedModelPart(children, delegatedDollars, labels)] : []),
-            ],
-          },
-          ...(toolRows.length || delegatedTools.length
-            ? [
-                {
-                  name: 'Tools' as const,
-                  parts: [toolPart(toolRows), ...(delegates ? [toolPart(delegatedTools)] : [])],
-                },
-              ]
-            : []),
-        ],
-        included: costIncluded(included),
-      }
-    : undefined;
+  const cost: CostDetailView | undefined =
+    usageRows.length || delegatedUsage.rows.some((row) => row.share > 0)
+      ? {
+          warnings: [
+            ...waitWarnings.map((warning) => waitShareLead(warning, 'turn')),
+            ...(expiryText ? [{ text: expiryText, title: CACHE_EXPIRY_COST_ADDED_HINT }] : []),
+            ...warnings.map((warning) => ({ text: cacheWriteWarningText(warning) })),
+          ],
+          ...(delegates && !mainTotal.partial && !delegatedTotal.partial
+            ? costSplit(mainDollars, delegatedDollars)
+            : {}),
+          sections: [
+            {
+              label: 'Main agent',
+              detail: modelNames(
+                mainPriced.map((held) => held.part),
+                labels,
+              ),
+              ...(delegates ? { value: mainValue } : {}),
+              title: `${[
+                costScopeTitle(mainTotal),
+                ...(turn.usage.requests !== undefined ? [requestCount(turn.usage.requests)] : []),
+              ].join(', ')}.${delegates ? '' : ' This turn delegated nothing.'}`,
+              ...(mainFacts ? { facts: mainFacts } : {}),
+            },
+            ...(delegates
+              ? [
+                  {
+                    label: 'Delegated' as const,
+                    detail: agentCount(children.length),
+                    value: sessionCostValue([delegatedTotal]),
+                    title: `${costScopeTitle(delegatedTotal)}, ${agentCount(children.length)}`,
+                    ...(delegatedFacts ? { facts: delegatedFacts } : {}),
+                  },
+                ]
+              : []),
+          ],
+          tabs: [
+            {
+              name: 'Usage',
+              parts: [
+                costUsagePart(
+                  usageRows,
+                  mainTotal,
+                  dollarsOf(mainPriced.filter((cost) => cost.unallocatedRecordedCost)),
+                ),
+                ...(delegates ? [delegatedUsage] : []),
+              ],
+            },
+            ...(toolRows.length || delegatedTools.length
+              ? [
+                  {
+                    name: 'Tools' as const,
+                    parts: [toolPart(toolRows), ...(delegates ? [toolPart(delegatedTools)] : [])],
+                  },
+                ]
+              : []),
+          ],
+          included: costIncluded(included),
+        }
+      : undefined;
   return {
     ...(cost ? { cost } : {}),
     heading: {
@@ -3376,13 +3416,17 @@ function costDetailList(
       value: totalValue,
     },
     entries: [...leading, ...entries, ...included],
-    // The compaction notes say part of the cost is a modelled estimate, so they stay visible.
-    ...(mainEstimated || compactionNote || childCompactionNotes.length
+    // Estimates, coverage, and unavailable pricing stay visible when the chart replaces flat entries.
+    ...(mainEstimated ||
+    compactionNote ||
+    childCompactionNotes.length ||
+    (cost && (unavailable.size || childFooter.length))
       ? {
           footer: [
             ...(mainEstimated ? [COMPACTION_ESTIMATE_FOOTER] : []),
             ...(compactionNote ? [compactionNote] : []),
             ...childCompactionNotes,
+            ...(cost ? [...unavailableLines, ...childFooter] : []),
           ],
         }
       : {}),
@@ -6115,7 +6159,7 @@ function sessionCostValue(costs: readonly SessionCostTotal[], short = false): st
     dollars += cost.dollars;
     priced = true;
   }
-  const label = priced ? formatCost(dollars) : null;
+  const label = priced ? (formatCost(dollars) ?? '$0') : null;
   const partial = short || costs.some((cost) => cost.partial);
   if (!label) {
     return partial ? 'cost unavailable' : 'no billed usage';
@@ -6471,10 +6515,15 @@ function costDetailRow(
   after: { facts?: string[]; note?: string } = {},
 ): CostDetailRow & { dollars: number } {
   const share = costShare(dollars, whole);
-  const title = [centsCost(dollars), ...facts, `${sharePercent(share)} of ${of}`, ...(after.facts ?? [])].join(', ');
+  const title = [
+    centsCost(dollars),
+    ...facts,
+    ...(whole > 0 ? [`${sharePercent(share)} of ${of}`] : []),
+    ...(after.facts ?? []),
+  ].join(', ');
   return {
     label,
-    percent: sharePercent(share),
+    percent: whole > 0 ? sharePercent(share) : '',
     share,
     value: formatCost(dollars) ?? '$0',
     title: after.note ? `${title} (${after.note})` : title,
@@ -6491,6 +6540,7 @@ function costUsageRows(costs: readonly PricedSessionCost[], whole: number, of: s
   const dollars = new Map<PricedUsageKey, number>();
   const usage = emptyUsage();
   for (const cost of costs) {
+    if (!cost.categories.length) continue;
     for (const category of cost.categories) {
       dollars.set(category.key, (dollars.get(category.key) ?? 0) + category.dollars);
     }
@@ -6551,6 +6601,26 @@ function mainWaitFigures(
 // A Tools tab section without tool rows keeps its heading, and says so where its rows would be.
 const toolPart = (rows: CostDetailRow[]): CostDetailPart =>
   rows.length ? { rows } : { rows, empty: 'No tool results' };
+
+// Usage without category rows distinguishes missing prices from known money and absent usage.
+function costUsagePart(rows: CostDetailRow[], total: SessionCostTotal, unallocated = 0): CostDetailPart {
+  if (rows.length)
+    return {
+      rows,
+      ...(unallocated > 0 ? { empty: `No breakdown recorded for ${centsCost(unallocated)}` } : {}),
+    };
+  return {
+    rows,
+    empty: total.dollars !== null ? 'No breakdown recorded' : total.partial ? 'Cost unavailable' : 'No billed usage',
+  };
+}
+
+const costScopeTitle = (total: SessionCostTotal): string =>
+  total.dollars === null
+    ? total.partial
+      ? 'cost unavailable'
+      : 'no billed usage'
+    : `${total.partial ? 'At least ' : ''}${centsCost(total.dollars)}`;
 
 const TOOL_RESULT_NOTE =
   "A request's cost goes to the tool results it read, split evenly when it read more than one. This is attribution, not tool run time.";
@@ -6694,7 +6764,13 @@ interface DelegatedChild {
 // row it holds. A row without a priced part reads `cost unavailable` with no share, and a row with
 // incomplete usage reads its dollars as a lower bound. Rows past the third wait behind the View
 // more expander.
-function delegatedModelPart(children: readonly DelegatedChild[], whole: number, labels?: ModelLabels): CostDetailPart {
+function delegatedModelPart(
+  children: readonly DelegatedChild[],
+  whole: number,
+  labels?: ModelLabels,
+  partial = false,
+): CostDetailPart {
+  const of = partial ? 'priced delegated work' : 'delegated work';
   const groups = new Map<
     string,
     {
@@ -6746,7 +6822,7 @@ function delegatedModelPart(children: readonly DelegatedChild[], whole: number, 
         .filter(Boolean)
         .join(' · ');
       const head = [identity, ...(count ? [count] : [])].join(', ');
-      const { dollars: _dollars, ...built } = costDetailRow(name, held.dollars, whole, 'delegated work', []);
+      const { dollars: _dollars, ...built } = costDetailRow(name, held.dollars, whole, of, []);
       if (!held.priced) {
         return {
           label: name,
@@ -6761,7 +6837,7 @@ function delegatedModelPart(children: readonly DelegatedChild[], whole: number, 
         ...built,
         ...(count ? { count } : {}),
         ...(held.partial ? { value: `${built.value}+` } : {}),
-        title: `${head}. ${held.partial ? 'At least ' : ''}${centsCost(held.dollars)}, ${built.percent} of delegated work.`,
+        title: `${head}. ${held.partial ? 'At least ' : ''}${centsCost(held.dollars)}${whole > 0 ? `, ${built.percent} of ${of}` : ''}.`,
       };
     });
   const hidden = rows.length - DELEGATED_MODELS_SHOWN;
@@ -7134,10 +7210,20 @@ export function sessionCostProjection(
       COST_ESTIMATE_NOTE,
     ],
   };
-  const mainValue = sessionCostValue(captured ? [captured.main] : main, captured ? false : mainShort);
-  const mainUsage = costUsageRows(main, dollarsOf(main), "the main agent's cost");
-  if (mainUsage.length) {
-    const delegatedValue = sessionCostValue(captured ? [captured.delegated] : delegated, captured ? false : short);
+  const mainTotal = captured?.main ?? {
+    ...sessionCostTotalOf(main),
+    partial: mainShort || main.some((cost) => cost.partial),
+  };
+  const delegatedTotal = captured?.delegated ?? {
+    ...sessionCostTotalOf(delegated),
+    partial: short || delegatedShort(delegated) || delegated.some((cost) => cost.partial),
+  };
+  const mainValue = sessionCostValue([mainTotal]);
+  const mainOf = mainTotal.partial ? 'priced main agent cost' : "the main agent's cost";
+  const delegatedOf = delegatedTotal.partial ? 'priced delegated work' : 'delegated work';
+  const mainUsage = costUsageRows(main, mainTotal.dollars ?? 0, mainOf);
+  if (mainUsage.length || delegated.some((cost) => (cost.dollars ?? 0) > 0)) {
+    const delegatedValue = sessionCostValue([delegatedTotal]);
     const mainDollars = captured?.main.dollars ?? dollarsOf(main);
     const delegatedDollars = captured?.delegated.dollars ?? dollarsOf(delegated);
     const combined = mainDollars + delegatedDollars;
@@ -7162,11 +7248,14 @@ export function sessionCostProjection(
     const agents = new Set(childOfScope.values()).size;
     const shortChildren = new Set([...childOfScope].filter(([id]) => scopeShort(id)).map(([, child]) => child));
     const delegates = delegated.length > 0 || short;
-    const tools = costToolRows(main, "the main agent's cost");
-    const delegatedTools = delegates ? costToolRows(delegated, 'delegated work') : [];
+    const tools = costToolRows(main, mainOf);
+    const delegatedTools = delegates ? costToolRows(delegated, delegatedOf) : [];
     const scopeNames = new Map([...delegatedScopes].map(([id, held], index) => [id, subagentName(held, index)]));
     const mainFacts = costFacts(main, 'main', mainShort);
     const delegatedFacts = costFacts(delegated, 'delegated', short || delegatedShort(delegated));
+    const complete =
+      !mainTotal.partial && !delegatedTotal.partial && mainTotal.dollars !== null && delegatedTotal.dollars !== null;
+    detailList.footer = [...(detailList.footer ?? []), ...unavailableUsageLines(unavailable)];
     if (tools.length || delegatedTools.length) detailList.notes = [TOOL_RESULT_NOTE, ...(detailList.notes ?? [])];
     const requestTotal = (costs: readonly PricedSessionCost[]) =>
       costs.every((cost) => cost.part.usage.requests !== undefined)
@@ -7182,7 +7271,7 @@ export function sessionCostProjection(
           text: `${warning.scope === 'main' ? '' : `${scopeNames.get(warning.id ?? '') ?? 'Delegated work'}: `}${cacheWriteWarningText(warning)}`,
         })),
       ],
-      ...(delegates ? costSplit(mainDollars, delegatedDollars) : {}),
+      ...(delegates && complete ? costSplit(mainDollars, delegatedDollars) : {}),
       sections: [
         {
           label: 'Main agent',
@@ -7192,9 +7281,11 @@ export function sessionCostProjection(
           ),
           ...(delegates ? { value: mainValue } : {}),
           title: [
-            centsCost(mainDollars),
+            costScopeTitle(mainTotal),
             ...requestTotal(main),
-            ...(delegates ? [`${sharePercent(costShare(mainDollars, combined))} of the total`] : []),
+            ...(delegates && complete && combined > 0
+              ? [`${sharePercent(costShare(mainDollars, combined))} of the total`]
+              : []),
           ].join(', '),
           ...(mainFacts ? { facts: mainFacts } : {}),
         },
@@ -7205,11 +7296,13 @@ export function sessionCostProjection(
                 detail: agents ? agentCount(agents) : '',
                 value: delegatedValue,
                 title: [
-                  centsCost(delegatedDollars),
+                  costScopeTitle(delegatedTotal),
                   ...(agents ? [agentCount(agents)] : []),
                   ...(unscoped.length ? [agents ? 'and other delegated work' : 'no agent recorded'] : []),
                   ...requestTotal(delegated),
-                  `${sharePercent(costShare(delegatedDollars, combined))} of the total`,
+                  ...(complete && combined > 0
+                    ? [`${sharePercent(costShare(delegatedDollars, combined))} of the total`]
+                    : []),
                 ].join(', '),
                 ...(delegatedFacts ? { facts: delegatedFacts } : {}),
               },
@@ -7220,7 +7313,7 @@ export function sessionCostProjection(
         {
           name: 'Usage',
           parts: [
-            { rows: mainUsage },
+            costUsagePart(mainUsage, mainTotal, dollarsOf(main.filter((cost) => cost.unallocatedRecordedCost))),
             ...(delegates
               ? [
                   delegatedModelPart(
@@ -7234,6 +7327,7 @@ export function sessionCostProjection(
                     ],
                     delegatedDollars,
                     overheads.labels,
+                    delegatedTotal.partial,
                   ),
                 ]
               : []),

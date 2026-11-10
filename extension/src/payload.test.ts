@@ -50,9 +50,9 @@ const CEILINGS = {
   renderRail: 1_146_658,
   renderStats: 1_476_250,
   renderSessions: 305_000,
-  // The card ceiling includes commit branches, repository paths, and author sessions.
+  // The card ceiling includes commit branches, repository paths, author sessions, and unavailable-pricing explanations.
 
-  renderCards: 113_000,
+  renderCards: 114_300,
   selectionTotal: 9_400,
   railMessageTotal: 2_676_966,
   railRow: 1_255,

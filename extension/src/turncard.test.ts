@@ -45,7 +45,14 @@ import assert from 'node:assert';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { readCodexAgentSpend, refreshCodexStructuralAgents } from './codex.ts';
-import { AgentSpendCache, emptyUsage, heaviestModel, readChildSpend, spendFileVersion } from './agentspend.ts';
+import {
+  AgentSpendCache,
+  addUsage,
+  emptyUsage,
+  heaviestModel,
+  readChildSpend,
+  spendFileVersion,
+} from './agentspend.ts';
 import { tempDir } from './temproot.ts';
 import * as pricing from './pricing.ts';
 import * as richtext from './richtext.ts';
@@ -58,6 +65,7 @@ import {
   TurnAgent,
   TurnCommit,
   TurnLanding,
+  type TurnUsagePart,
   cleanPrompt,
   readClaudeAgentSpend,
   readSession,
@@ -1520,8 +1528,143 @@ test('the Delegated section lists one row per model with its agent count', () =>
   ]);
 });
 
-// The cost popovers name each model with the display name its CLI lists, in the Main agent detail
-// and in the Delegated rows of the turn and the session.
+for (const scope of ['turn', 'session'] as const)
+  test(`${scope} cost charts retain priced work across unavailable and recorded-only scopes`, () => {
+    type ChartUsage = SessionCostUsage & TurnUsagePart;
+    const priced: ChartUsage = {
+      ...sonnetPart,
+      usage: tokenUsage({ requests: 1, input: 100_000, cacheRead: 100_000, output: 10_000 }),
+    };
+    const unknown: ChartUsage = {
+      ...priced,
+      model: 'unlisted-model',
+      usage: tokenUsage({ requests: 1, input: 900_000, cacheRead: 0, output: 90_000 }),
+    };
+    const child = { ...priced, role: 'delegated' as const, scopeId: 'child' };
+    const project = (main: ChartUsage[], children: ChartUsage[], childOverrides: Partial<TurnAgent> = {}) => {
+      const usage = emptyUsage();
+      for (const part of main) addUsage(usage, part.usage);
+      const chips = [
+        toCard(
+          turn({
+            model: main[0]?.model ?? null,
+            usage,
+            usageParts: main,
+            agents: children.map((part) =>
+              agent({
+                model: part.model,
+                spendFound: true,
+                spend: [{ ...part, usageParts: [part] }],
+                ...childOverrides,
+              }),
+            ),
+          }),
+          false,
+          NOW,
+        ).chips.find((chip) => chip.metric === 'cost'),
+        sessionCostProjection([...main, ...children]).stats[0],
+      ];
+      return [chips[scope === 'turn' ? 0 : 1]];
+    };
+    for (const chip of project([unknown], [child])) {
+      assert.ok(chip);
+      assert.ok(chip.label.endsWith('+'));
+      const detail = chip.detailList!;
+      const chart = detail.cost!;
+      assert.ok(chart, 'unpriced main usage hid the priced child chart');
+      assert.equal(chart.sections[0].value, 'cost unavailable');
+      assert.match(chart.sections[0].title, /cost unavailable/);
+      assert.equal(chart.tabs[0].parts[0].empty, 'Cost unavailable');
+      assert.ok(chart.tabs[0].parts[1].rows.some((row) => row.share > 0));
+      assert.equal(chart.split, undefined);
+      assert.doesNotMatch(JSON.stringify(chart.sections), /of the total/);
+      assert.match(detail.footer!.join('\n'), /unlisted-model.*reliable list-price estimate unavailable/);
+    }
+    if (scope === 'turn') {
+      for (const [childOverrides, explanation] of [
+        [{ spendPartial: true }, 'Some nested subagents are still running or left no record. This is the cost so far.'],
+        [{ spendPartial: true, agentType: 'claude-cli' }, 'Claude CLI did not report the full cost of this run.'],
+        [{ status: 'launched' }, 'This subagent recorded no ending. This is the cost Arc read.'],
+      ] as const) {
+        const chip = project([unknown], [child], childOverrides)[0]!;
+        const detail = chip.detailList!;
+        assert.ok(detail.cost, 'the priced child must keep the chart available');
+        assert.ok(chip.label.endsWith('+'));
+        assert.ok(
+          detail.footer?.some((line) => line.startsWith('Audit the parser') && line.endsWith(explanation)),
+          `the chart footer lost the child explanation: ${explanation}`,
+        );
+      }
+    }
+    for (const chip of project([priced], [child, { ...unknown, role: 'delegated', scopeId: 'unknown-child' }])) {
+      const chart = chip!.detailList!.cost!;
+      assert.equal(chart.split, undefined);
+      assert.ok(chip!.label.endsWith('+'));
+      assert.ok(chart.sections[1].value!.endsWith('+'));
+      const rows = chart.tabs[0].parts[1].rows;
+      assert.match(rows.find((row) => row.share > 0)!.title, /of priced delegated work/);
+      const missing = rows.find((row) => row.value === 'cost unavailable')!;
+      assert.deepEqual([missing.percent, missing.share], ['', 0]);
+    }
+    for (const chip of project([priced, unknown], [child])) {
+      const chart = chip!.detailList!.cost!;
+      assert.ok(chart.sections[0].value!.endsWith('+'));
+      assert.equal(chart.split, undefined);
+      const rows = chart.tabs[0].parts[0].rows;
+      assert.match(rows.find((row) => row.label === 'Output')!.title, /10,000 tokens, .*of priced main agent cost/);
+      assert.match(
+        rows.find((row) => row.label === 'Cached input reads')!.title,
+        /100,000 tokens.*50% of input tokens/,
+      );
+      assert.doesNotMatch(JSON.stringify(rows), /90,000|900,000/);
+      assert.match(chip!.detailList!.footer!.join('\n'), /unlisted-model/);
+    }
+    for (const chip of project([], [child])) {
+      const chart = chip!.detailList!.cost!;
+      assert.equal(chart.sections[0].value, 'no billed usage');
+      assert.equal(chart.tabs[0].parts[0].empty, 'No billed usage');
+      assert.ok(chart.tabs[0].parts[1].rows.some((row) => row.share > 0));
+    }
+    for (const recordedCost of [0, 2.5]) {
+      for (const chip of project([{ ...unknown, recordedCost, costBasis: 'list' }], [child])) {
+        const chart = chip!.detailList!.cost!;
+        assert.equal(chart.sections[0].value, formatCost(recordedCost) ?? '$0');
+        assert.equal(chart.tabs[0].parts[0].empty, 'No breakdown recorded');
+        assert.doesNotMatch(JSON.stringify(chart), /unavailable/);
+      }
+      for (const chip of project([priced], [{ ...child, recordedCost, costBasis: 'list' }])) {
+        const chart = chip!.detailList!.cost!;
+        assert.equal(chart.sections[1].value, formatCost(recordedCost) ?? '$0');
+        if (!recordedCost) {
+          assert.equal(chart.tabs[0].parts[1].rows[0].percent, '');
+          assert.doesNotMatch(chart.tabs[0].parts[1].rows[0].title, /%/);
+        }
+      }
+    }
+    for (const chip of project([priced, { ...unknown, recordedCost: 2.5, costBasis: 'list' }], [child])) {
+      assert.equal(chip!.detailList!.cost!.tabs[0].parts[0].empty, 'No breakdown recorded for $2.50');
+    }
+    for (const chip of project([unknown], [{ ...child, model: 'another-unlisted-model' }])) {
+      assert.equal(chip, undefined, 'fully unavailable usage invented chart dollars');
+    }
+    const captured = {
+      main: { dollars: 4, partial: false },
+      delegated: { dollars: 6, partial: false },
+      combined: { dollars: 10, partial: false },
+    };
+    const saved = sessionCostProjection(
+      [{ ...unknown, recordedCost: 4, costBasis: 'list' }, child],
+      false,
+      {},
+      captured,
+    ).stats[0];
+    assert.equal(saved.label, '$10');
+    assert.equal(saved.detailList!.cost!.sections[0].value, '$4.00');
+    assert.equal(saved.detailList!.cost!.sections[1].value, '$6.00');
+    assert.equal(saved.detailList!.cost!.tabs[0].parts[0].empty, 'No breakdown recorded');
+  });
+
+// Model names match the CLI lists in the Main agent detail and Delegated rows.
 test('the cost popovers name models with the display names their CLIs list', () => {
   const labels = modelLabels([
     [{ value: 'fable', resolvedModel: 'claude-fable-5-1', label: 'Fable 5.1' }],
@@ -8426,6 +8569,22 @@ test('a completed child with no billed response is an exact zero', () => {
     card.chips.find((chip) => chip.label === '1 subagent')?.detail ?? '',
     /billed usage|cost unavailable/,
   );
+  const chart = card.chips.find((chip) => chip.metric === 'cost')!.detailList!.cost!;
+  assert.equal(chart.sections[1].value, '$0');
+  assert.equal(chart.sections[1].title, '$0.00, 1 agent');
+  assert.deepEqual(chart.tabs[0].parts[1], { rows: [], empty: 'No billed usage' });
+  const sibling = agent({
+    id: 'priced-sibling',
+    spendFound: true,
+    spend: [{ model: 'claude-sonnet-5-5', usage: emptyUsage(), recordedCost: 2, costBasis: 'list' }],
+  });
+  const withSibling = toCard({ ...t, agents: [...t.agents, sibling] }, false, NOW);
+  assert.equal(costChip(withSibling), '$7.00');
+  const shared = withSibling.chips.find((chip) => chip.metric === 'cost')!.detailList!.cost!;
+  assert.equal(shared.sections[1].value, '$2.00');
+  assert.equal(shared.sections[1].title, '$2.00, 2 agents');
+  assert.deepEqual(shared.split, { main: '71%', delegated: '29%', mainShare: 5 / 7 });
+  assert.doesNotMatch(JSON.stringify(shared), /unavailable|priced delegated work|\$2\.00\+/);
 });
 
 test('a completed child with an incomplete billed response does not claim no billed usage', () => {
@@ -10716,7 +10875,10 @@ test('indexed lifetime cost separates the main agent from rolled-up delegated wo
         lines: costLines('Output: <$0.01', 'Cached input reads: $0 (0% cached)', 'Uncached input: <$0.01'),
       },
     ],
-    footer: ['Some usage could not be priced, so the estimated total may be low.'],
+    footer: [
+      'Some usage could not be priced, so the estimated total may be low.',
+      'Cost unavailable for Codex · GPT-5.6-Sol · OpenAI: unsupported service-tier price unavailable.',
+    ],
     notes: [
       'Codex Auto Review uses the OpenAI Codex rate card.',
       'Includes the main session and delegated work.',
