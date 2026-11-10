@@ -2782,7 +2782,9 @@ async function handleMessage(message: {
           });
       });
       // Any reply to the request carries the list on, a partial reply included. The host marks the list sent on that reply.
+      // A cancelled request posts no reply, so the host keeps its list unsent and the worker records nothing.
       if (
+        !controller.signal.aborted &&
         request.kind === 'claude-children' &&
         (value.kind === 'claude-children' ||
           value.kind === 'claude-children-progress' ||

@@ -16338,6 +16338,42 @@ test.skipIf(!zstdCompress)('a list recorded during the first store read replaces
   }
 });
 
+// A cancelled request posts no reply, so the host still holds its list as unsent.
+test('a cancelled discovery request records no compressed list', async () => {
+  const directory = tempDir('worker-cancelled-list-');
+  const stores = { facts: path.join(directory, 'facts'), openings: path.join(directory, 'openings') };
+  const start = 'await execute(request, controller.signal, (';
+  assert.equal(source.split(start).length - 1, 1, 'The request start did not match');
+  // The request finishes its work first, so the cancel arrives when the reply exists and the list is not yet recorded.
+  const held = source.replace(
+    start,
+    `await ((run) => async (...args) => { const value = await run(...args); if (request.kind !== 'claude-children') return value; require('node:worker_threads').parentPort.postMessage({ repeatedCoverage: 'list-request-started' }); await new Promise((resolve) => controller.signal.addEventListener('abort', resolve, { once: true })); return value; })(execute)(request, controller.signal, (`,
+  );
+  const cancel = new AbortController();
+  const worker = new ProgressiveWorker(held, undefined, (message) => {
+    if (message === 'list-request-started') cancel.abort();
+  });
+  try {
+    const cancelled = await worker.run(
+      {
+        kind: 'claude-children',
+        parents: [],
+        repositoryRoots: [directory],
+        compressed: ['cancelled.jsonl.zst'],
+        compressedStores: stores,
+      } as never,
+      1,
+      cancel.signal,
+    );
+    assert.equal(cancelled, null, 'a cancelled request posted a reply');
+    const loaded: any = await worker.run({ kind: 'compressed-load', stores }, 2, new AbortController().signal);
+    assert.equal(loaded?.value.heldNamesRecorded, undefined, 'the cancelled request recorded its list');
+  } finally {
+    worker.stop();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test.skipIf(!zstdCompress)('a load poll does not post the entries this worker published', async () => {
   const pair = compressedRolloutPair();
   const stores = { facts: path.join(pair.directory, 'facts'), openings: path.join(pair.directory, 'openings') };
