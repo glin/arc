@@ -12151,6 +12151,16 @@ test('worker metadata carries the agent-run mark to the host', () => {
     'the rail row does not read the detector, so no session is ever marked as run by an agent',
   );
   sourceMatch(
+    statementFrom(panelHostSource, panelHostSource.indexOf('this.sessionRows = all.map(')),
+    /this\.sessionRowOf\(\s*f,\s*parentEdges\.edges,/,
+    'the refresh builds its rail rows without the parent edges, so the detector reads no run',
+  );
+  sourceMatch(
+    memberFrom(panelHostSource, panelHostSource.indexOf('private noteCompressedRowFacts(')),
+    /const edges = this\.sessionParentEdges\(admitted\)\.edges;[\s\S]*this\.sessionRowOf\(row, edges,/,
+    'a merged row is built without the parent edges of the accepted list',
+  );
+  sourceMatch(
     panelHostSource,
     /private agentRunFor\(session: SessionFile, edges: ReadonlyMap<string, SessionParentEdge>\): boolean \| null \{[^}]*return agentRunAnswer\(\s*guessed,/,
     'the host does not apply the reader-owned override to worker metadata',
@@ -33729,32 +33739,41 @@ test('a session row carries a bounded rail name, past the sixty-character cut th
     'the timeline heading, search results and saved comments no longer read the sixty-character cut',
   );
 
-  const from = panelHostSource.indexOf('private sessionRowOf(');
-  const member = memberFrom(panelHostSource, from);
+  const member = memberFrom(panelHostSource, panelHostSource.indexOf('private sessionRowOf('));
+  const assignment = statementFrom(panelHostSource, panelHostSource.indexOf('this.sessionRows = all.map('));
   const built = esbuild.transformSync(
-    `export function build(AGENT_NAMES, formatWhen, formatRelative, shortenTo, RAIL_NAME_LIMIT) {
-return class Rows {
+    `export function build(all, sessions, parentEdges, fullLabels, AGENT_NAMES, formatWhen, formatRelative, shortenTo, RAIL_NAME_LIMIT, fields) {
+class Rows {
 ${member}
-};
+assign() {
+${assignment}
+return this.sessionRows;
+}
+}
+return Object.assign(new Rows(), fields).assign();
 }`,
     { loader: 'ts', format: 'cjs' },
   ).code;
-  const builtModule = { exports: {} as { build: (...args: unknown[]) => new () => any } };
+  const builtModule = {
+    exports: {} as { build: (...args: unknown[]) => { label: string; railName?: string }[] },
+  };
   new Function('module', 'exports', built)(builtModule, builtModule.exports);
-  const Rows = builtModule.exports.build(
+  const rows = builtModule.exports.build(
+    [{ sessionId: 's1', agent: 'claude' }],
+    [],
+    { edges: new Map() },
+    new Map(),
     { claude: 'Claude' },
     () => '',
     () => '',
     shortenTo,
     200,
-  );
-  const rows: { label: string; railName?: string }[] = [
-    Object.assign(new Rows(), {
+    {
       activityFor: () => 0,
       sessionLabel: () => ({ label: capped, fullLabel: full }),
       agentRunFor: () => false,
-    }).sessionRowOf({ sessionId: 's1', agent: 'claude' }, new Map(), false, new Map()),
-  ];
+    },
+  );
   assert.equal(
     rows[0].label,
     capped,
