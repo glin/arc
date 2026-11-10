@@ -2196,6 +2196,7 @@ export class ClaudeBackgroundWork {
   private readonly toolTasks = new Map<string, string>();
   private readonly ambiguous = new Set<string>();
   private readonly launches = new Map<string, string>();
+  private readonly closed = new Set<string>();
 
   get pending(): boolean {
     return this.open.size > 0;
@@ -2210,6 +2211,7 @@ export class ClaudeBackgroundWork {
   closeOpen(): void {
     for (const key of this.open) {
       this.completed.add(key);
+      this.closed.add(key);
       const task = this.toolTasks.get(key);
       if (task !== undefined) this.completed.add(`child:${task}`);
     }
@@ -2253,6 +2255,13 @@ export class ClaudeBackgroundWork {
         const child = result?.status === 'async_launched' || result?.status === 'launched' ? result.agentId : undefined;
         const task = child ?? result?.backgroundTaskId;
         if (typeof task === 'string' && task) {
+          // A task that was not open when its tool id closed is a new launch under a reused tool id.
+          if (this.closed.has(key) && !this.completed.has(`child:${task}`)) {
+            this.closed.delete(key);
+            this.completed.delete(key);
+            this.ambiguous.delete(key);
+            this.toolTasks.delete(key);
+          }
           const previous = this.tasks.get(task);
           const previousTask = this.toolTasks.get(key);
           if (previousTask !== undefined && previousTask !== task) {

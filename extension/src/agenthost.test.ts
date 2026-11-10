@@ -4412,6 +4412,64 @@ test('a background task that the resumed session starts holds its child', async 
   finishChild(fixture.children[1]);
 });
 
+test('a new task id under a tool id that archive closed holds the resumed child until its notice', async () => {
+  for (const backgrounding of ['result only', 'launch input']) {
+    vi.useFakeTimers();
+    const timer = new FakeAgentHostTimer();
+    const fixture = await childWithBackgroundJob({ idleDurationMs: 120, timer });
+    await archivePastHold(fixture);
+    const resumed = await resumeArchived(fixture);
+    const say = (record: object) =>
+      fixture.children[1].say(JSON.stringify({ session_id: 'sess-1', parent_tool_use_id: null, ...record }) + '\n');
+    const result = (task: string) =>
+      say({
+        type: 'user',
+        tool_use_result: { backgroundTaskId: task },
+        message: { content: [{ type: 'tool_result', tool_use_id: 'launch' }] },
+      });
+    const notice = (task: string) =>
+      say({
+        type: 'user',
+        isReplay: true,
+        uuid: `notice-${task}`,
+        timestamp: '2026-01-02T03:04:05.000Z',
+        origin: { kind: 'task-notification', producer: 'session-task' },
+        message: {
+          role: 'user',
+          content: `<task-notification>\n<task-id>${task}</task-id>\n<tool-use-id>launch</tool-use-id>\n<output-file>C:\\Temp\\tasks\\${task}.output</output-file>\n<status>completed</status>\n<summary>Background command "job" completed (exit code 0)</summary>\n</task-notification>`,
+        },
+      });
+    await resumed.prompt('start the job again');
+    result('job-task');
+    assert.equal(Boolean(resumed.state().backgroundPending), false, 'the closed task opened a hold');
+    say({
+      type: 'assistant',
+      message: {
+        content: [
+          {
+            type: 'tool_use',
+            name: 'Bash',
+            id: 'launch',
+            input: { command: 'job', ...(backgrounding === 'launch input' ? { run_in_background: true } : {}) },
+          },
+        ],
+      },
+    });
+    result('new-task');
+    assert.equal(resumed.state().backgroundPending, true, `${backgrounding}: the new task opened no hold`);
+    fixture.children[1].say(COMPLETED_RESULT);
+    settle(fixture.host, 'one');
+    assert.equal(timer.activeCount(), 0, `${backgrounding}: an idle window started behind the new task`);
+    notice('job-task');
+    assert.equal(resumed.state().backgroundPending, true, `${backgrounding}: the closed task released the new hold`);
+    notice('new-task');
+    assert.equal(Boolean(resumed.state().backgroundPending), false, `${backgrounding}: the notice left the hold open`);
+    await finishTurnAndRetire(fixture, resumed, timer);
+    assert.equal(fixture.children[1].ended, true);
+    vi.useRealTimers();
+  }
+});
+
 test('a settled idle session retires when its timer fires', async () => {
   const timer = new FakeAgentHostTimer();
   const { host, children } = fakeHost(undefined, undefined, { idleDurationMs: 120, timer });
