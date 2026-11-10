@@ -946,8 +946,13 @@ export class CompressedStoreHolder {
 
   // Run the queue until it is empty. A failed lease leaves the queue in place and retries after the jitter delay.
   work(): Promise<void> {
+    return this.exclusive(() => this.run());
+  }
+
+  // One body at a time holds the writes of this holder.
+  private exclusive(body: () => Promise<void>): Promise<void> {
     if (this.disposed) return Promise.resolve();
-    this.running ??= this.run().then(
+    this.running ??= body().then(
       () => {
         this.running = null;
         // An entry that arrives after the last test of the queue starts its own run.
@@ -977,19 +982,28 @@ export class CompressedStoreHolder {
         await this.yieldStep();
       }
       if (!this.token) return;
-      if (
-        this.now() - this.lastCompaction >= COMPACT_INTERVAL_MS &&
-        this.closedSegments > 0 &&
-        this.compactionAllowed()
-      )
-        await this.compact(false);
-      if (!this.token) return;
     }
     this.armIdleRelease();
   }
 
   private compactionAllowed(): boolean {
     return this.now() >= this.compactionRetryAt;
+  }
+
+  // The timed compaction waits for the appends to stop, because each one rewrites the whole store. While appends keep
+  // arriving, the closed segment limit alone starts a compaction.
+  private timedCompactionDue(): boolean {
+    return (
+      this.closedSegments > 0 && this.now() - this.lastCompaction >= COMPACT_INTERVAL_MS && this.compactionAllowed()
+    );
+  }
+
+  // An append that arrives during the compaction keeps the lease for its own run.
+  private async compactWhileIdle(): Promise<void> {
+    await this.yieldStep();
+    if (this.queue.length) return;
+    await this.compact(false);
+    if (this.token && !this.queue.length) this.abandonToken();
   }
 
   private armIdleRelease(): void {
@@ -1413,6 +1427,10 @@ export class CompressedStoreHolder {
     if (!this.token) return;
     if (this.queue.length || this.running) {
       this.armIdleRelease();
+      return;
+    }
+    if (this.timedCompactionDue()) {
+      void this.exclusive(() => this.compactWhileIdle());
       return;
     }
     this.abandonToken();

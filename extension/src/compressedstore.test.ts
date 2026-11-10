@@ -378,9 +378,11 @@ test('an append during the trailing compaction is written and the idle release i
   await holder.append([entry('a.jsonl.zst')]);
   clock.jump(300_001);
   await holder.append([entry('b.jsonl.zst')]);
-  assert.equal(arrived, true, 'the trailing compaction did not run');
+  clock.advance(20_000);
+  await vi.waitFor(() => assert.equal(arrived, true, 'the trailing compaction did not run'));
   await vi.waitFor(() => assert.equal(holder.pending, 0, 'an append during the compaction stayed queued'));
   assert.equal(threadCount(directory), 3);
+  await holder.work();
   clock.advance(20_000);
   assert.equal(fs.existsSync(path.join(directory, STORE_LOCK)), false, 'the idle release did not fire');
   holder.dispose();
@@ -503,6 +505,33 @@ test('compaction at the closed segment count folds segments into shards and keep
     'compaction wrote no shard',
   );
   assert.ok(names().length <= STEADY_NAMES, `listing ${names().length}`);
+  holder.dispose();
+});
+
+test('steady appends write at most twice the bytes the store keeps, and a compaction runs after they stop', async () => {
+  let written = 0;
+  const { directory, clock, make, names } = storeFixture('store-steady-appends', {
+    segmentBytes: 4 * 1024,
+    wrote: (bytes) => (written += bytes),
+  });
+  const holder = make();
+  const pad = 'x'.repeat(1024);
+  // One append every 10 s for 30 minutes.
+  for (let at = 0; at < 180; at++) {
+    await holder.append([entry(`rollout-${at}.jsonl.zst`, { carriedName: { label: pad, fullLabel: '' } })]);
+    clock.advance(10_000);
+  }
+  const kept = [...readCompressedStore(directory).entries.values()].reduce(
+    (bytes, stored) => bytes + Buffer.byteLength(JSON.stringify(stored)) + 1,
+    0,
+  );
+  assert.equal(threadCount(directory), 180);
+  assert.ok(written <= 2 * kept, `the store wrote ${written} bytes to keep ${kept}`);
+  const segments = () => names().filter((name) => name.startsWith('segment-')).length;
+  assert.ok(segments() > 0, 'no closed segment waited for the compaction');
+  clock.advance(20_000);
+  await vi.waitFor(() => assert.equal(segments(), 0, 'no compaction ran after the appends stopped'));
+  assert.equal(threadCount(directory), 180);
   holder.dispose();
 });
 
@@ -835,7 +864,7 @@ test('an input that cannot be read ends the compaction with every input kept', a
   assert.equal(holder.held, true, 'a read failure ended the lease');
   assert.equal(threadCount(directory), 3);
   denied = null;
-  clock.advance(300_001);
+  clock.jump(300_001);
   await holder.append([entry('d.jsonl.zst')]);
   assert.ok(
     names().some((name) => name.startsWith('manifest-')),
