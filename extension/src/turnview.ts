@@ -61,9 +61,35 @@ export function orderSessionCatalog<T extends { sessionId: string }>(
   sessions: readonly T[],
   activityFor: (session: T) => number,
 ): T[] {
-  return [...sessions].sort(
-    (left, right) => activityFor(right) - activityFor(left) || left.sessionId.localeCompare(right.sessionId),
-  );
+  return [...sessions].sort((left, right) => compareSessionCatalog(left, right, activityFor));
+}
+
+function compareSessionCatalog<T extends { sessionId: string }>(
+  left: T,
+  right: T,
+  activityFor: (session: T) => number,
+): number {
+  return activityFor(right) - activityFor(left) || left.sessionId.localeCompare(right.sessionId);
+}
+
+// Puts each row at its place in a list in catalog order. The comparisons grow with the placed rows.
+export function placeInSessionCatalog<T extends { sessionId: string }>(
+  ordered: readonly T[],
+  rows: readonly T[],
+  activityFor: (session: T) => number,
+): T[] {
+  const placed = [...ordered];
+  for (const row of rows) {
+    let low = 0;
+    let high = placed.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      if (compareSessionCatalog(placed[middle], row, activityFor) < 0) low = middle + 1;
+      else high = middle;
+    }
+    placed.splice(low, 0, row);
+  }
+  return placed;
 }
 
 // Supply turns newest first. The selected session takes priority within the global turn budget.

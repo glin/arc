@@ -225,6 +225,7 @@ import {
   normalizePanelState,
   remapReaderParents,
   orderSessionCatalog,
+  placeInSessionCatalog,
   refreshWanted,
   turnBudget,
 } from './turnview';
@@ -2956,6 +2957,7 @@ function harness(pendingRefresh = false, registerRefreshHandler = true, extraMet
   methods.push(
     'refreshFrom',
     'refreshAs',
+    'sessionRowOf',
     'claimCatalogRefresh',
     'releaseCatalogRefresh',
     'scheduleDiscoveryContinuation',
@@ -3198,6 +3200,7 @@ function completeDiscoveryHarness(
     'rowSender',
     'refreshFrom',
     'refreshAs',
+    'sessionRowOf',
     'claimCatalogRefresh',
     'releaseCatalogRefresh',
     'scheduleDiscoveryContinuation',
@@ -3213,6 +3216,7 @@ function completeDiscoveryHarness(
     'savedLinksDrawn',
     'sessionParentEdges',
     'acceptSessionCoverage',
+    'coveredMember',
     'acceptedUnsettledCause',
     'acceptedUnsettledRequestsPass',
     'membershipOf',
@@ -3288,6 +3292,12 @@ function completeDiscoveryHarness(
     'noteCompressedDecoderMissing',
     'nameCompressedSkips',
     'applyCompressedBatch',
+    'offerCompressedRows',
+    'armCompressedRowsTimer',
+    'applyCompressedRows',
+    'noteCompressedCoverage',
+    'noteCompressedRowFacts',
+    'drainCompressedRows',
     'compressedRolloutsToSend',
     'markCompressedRolloutsSent',
     'compressedStorePaths',
@@ -3337,7 +3347,7 @@ function completeDiscoveryHarness(
     const sessionLabelOf = (name, id) => ({ label: name?.label || 'Session ' + id.slice(0, 8), fullLabel: name?.fullLabel || name?.label || 'Session ' + id.slice(0, 8) });
     const storedSessionName = ${scope.realStoredSessionName ? 'realStoredSessionName' : '() => null'};
     const shortenTo = (line, limit, ellipsis) => line.length <= limit ? line : line.slice(0, Math.max(0, limit - ellipsis.length)) + ellipsis;
-    const RAIL_NAME_LIMIT = 200;
+    const RAIL_NAME_LIMIT = 200; const COMPRESSED_ROWS_APPLY_MS = 2_000;
     const TRANSCRIPT_TURN_LIMIT = 40; const TRANSCRIPT_TAIL_BYTES = 1024;
     const renderPayload = (value) => ({ type: 'render', ...value, ...value.rail }); const olderHistoryPossible = () => false;
     const olderHistoryControl = () => null; const syntheticDraftRows = (drafts) => drafts.map((draft) => ({ ...draft, id: draft.draftId, label: 'New session' }));
@@ -3350,6 +3360,7 @@ function completeDiscoveryHarness(
       failSessionLoading() {}
       noteSessionRead() {}
       loadingLine = new SessionLoadingLine((event, record) => this.diagnostics.warn(event, record));
+      ${names.includes('postRail') ? '' : 'postRail() {}'}
       ${names.includes('commitRepositories') ? '' : 'commitRepositories = new CommitRepositories({ run: async () => null }, () => {});'}
       ${names.includes('repositoryCommits') ? '' : 'repositoryCommits = new RepositoryCommits({ run: async () => null }, () => {});'}
       _showing = null; selections = []; messages = []; partial = []; catalog = null; drawnCards = [];
@@ -3464,6 +3475,7 @@ function completeDiscoveryHarness(
     'exports',
     'createPanelVisibility',
     'orderSessionCatalog',
+    'placeInSessionCatalog',
     'revalidatedCatalog',
     'sameProgressiveRevision',
     'transcriptReadCacheKey',
@@ -3525,6 +3537,7 @@ function completeDiscoveryHarness(
     module.exports,
     createPanelVisibility,
     orderSessionCatalog,
+    placeInSessionCatalog,
     revalidate,
     sameProgressiveRevision,
     transcriptReadCacheKey,
@@ -3837,6 +3850,7 @@ function selectedWindowHarness(
     'acceptJointSplitWindow',
     'refreshFrom',
     'refreshAs',
+    'sessionRowOf',
     'claimCatalogRefresh',
     'releaseCatalogRefresh',
     'scheduleDiscoveryContinuation',
@@ -5702,6 +5716,27 @@ test('a carried discovery reply after removal clears listing coverage while comp
     true,
     'the missing listing proof did not request another discovery pass',
   );
+});
+
+test('placeInSessionCatalog gives the full order and compares only for the placed rows', () => {
+  const ordered = Array.from({ length: 64 }, (_, index) => ({ sessionId: `listed-${index}`, activity: index }));
+  const catalog = orderSessionCatalog(ordered, (session) => session.activity);
+  const rows = [
+    { sessionId: 'newest', activity: 100 },
+    { sessionId: 'between', activity: 30 },
+    { sessionId: 'oldest', activity: -1 },
+  ];
+  let comparisons = 0;
+  const placed = placeInSessionCatalog(catalog, rows, (session) => {
+    comparisons++;
+    return session.activity;
+  });
+  assert.deepEqual(
+    placed.map((session) => session.sessionId),
+    orderSessionCatalog([...catalog, ...rows], (session) => session.activity).map((session) => session.sessionId),
+    'a placed row is out of the catalog order',
+  );
+  assert.ok(comparisons < 3 * 2 * 8, `placing three rows made ${comparisons} activity reads`);
 });
 
 test('complete discovery has one stable final order across Claude and Codex sessions', () => {
@@ -12672,13 +12707,13 @@ function backfillHostHarness() {
   return { provider, twin, entry, refreshes, gauges };
 }
 
-test('a backfill batch lists a compressed-only session with its title and cost, and refreshes once on the held catalog', () => {
+test('a backfill batch with no held catalog lists a compressed-only session with its title and cost through one refresh', () => {
   const { provider, twin, entry, refreshes } = backfillHostHarness();
   provider.applyCompressedBatch({ entries: [entry()], backfillMs: 12 });
   assert.deepEqual(
     refreshes,
     [['compressed-facts', true, true]],
-    'the batch did not reuse the held catalog in one refresh',
+    'the batch did not run one refresh on the held catalog',
   );
   const held = provider.withCompressedFactRows([]);
   assert.deepEqual(
@@ -12747,7 +12782,7 @@ test('a worker that replaces another worker takes the launch that retried an unr
   }
 });
 
-test('a backfill batch reaches the held catalog and the gauge through the refresh', async () => {
+test('a backfill batch reaches the held catalog and the gauge without a walk', async () => {
   const { provider, root, writeRollout, walks, releaseAll } = heldWalkHarness(
     {
       readRolloutStat,
@@ -12794,8 +12829,8 @@ test('a backfill batch reaches the held catalog and the gauge through the refres
     [twinThread],
     'the batch did not reach the held catalog',
   );
-  assert.equal(walks.length, walksBefore, 'a compressed-facts refresh walked the rollout tree');
-  assert.equal(gauges.compressedRows, 1, 'the refresh did not set the gauge');
+  assert.equal(walks.length, walksBefore, 'the batch walked the rollout tree');
+  assert.equal(gauges.compressedRows, 1, 'the batch did not set the gauge');
 });
 
 test('a batch row added while a complete reply waits joins that reply', async () => {
@@ -12852,6 +12887,201 @@ test('a batch row added while a complete reply waits joins that reply', async ()
   );
   assert.equal(reply.files.has(twin), true, 'the complete reply did not hold the batch row');
   assert.equal(reply.revisions.get(twin)?.file, twin, 'the complete reply held no revision of the batch row');
+});
+
+// A held-walk provider whose counters record into plain tables, with one accepted plain row and a helper that writes
+// compressed rollouts and their batch entries.
+async function batchApplyHarness(extraScope: Record<string, unknown> = {}) {
+  const held = heldWalkHarness(
+    {
+      readRolloutStat,
+      isHiddenThread,
+      isAgentRun,
+      compressedTitleCurrent,
+      withKeptUndercount,
+      compressedEntrySame,
+      ...extraScope,
+    },
+    ['postRail'],
+  );
+  const { provider, root, writeRollout, releaseAll } = held;
+  const plain = writeRollout('plain');
+  const work: Record<string, number> = {};
+  const refreshes: Record<string, number> = {};
+  const gauges: Record<string, number> = {};
+  provider.performanceCounters = {
+    ...provider.performanceCounters,
+    recordWork: (name: string, amount = 1) => (work[name] = (work[name] ?? 0) + amount),
+    recordRefresh: (reason: string) => (refreshes[reason] = (refreshes[reason] ?? 0) + 1),
+    recordGauge: (name: string, value: number) => (gauges[name] = value),
+  };
+  await releaseAll(provider.refresh(true));
+  for (const table of [work, refreshes]) for (const name of Object.keys(table)) delete table[name];
+  const posted: string[][] = [];
+  provider.useRailPayload((input: { sessions: { id: string }[] }) => {
+    posted.push(input.sessions.map((row) => row.id));
+    return { rail: [], labels: [], views: [], railFilters: [], stats: {} };
+  });
+  const sourceUpdates: SessionFile[][] = [];
+  provider.updateSessionSpendSources = (codex: SessionFile[]) => sourceUpdates.push(codex);
+  const entryOf = (thread: string, bytes = 'x', mtime?: Date) => {
+    const twin = path.join(root, `rollout-${thread}.jsonl.zst`);
+    fs.writeFileSync(twin, bytes);
+    if (mtime) fs.utimesSync(twin, mtime, mtime);
+    const stat = readRolloutStat(twin)!;
+    return {
+      twin,
+      entry: {
+        file: twin,
+        pairKey: twin.replace(/\.zst$/, ''),
+        factsVersion: COMPRESSED_FACTS_VERSION,
+        metadataGeneration: METADATA_GENERATIONS.codex,
+        size: stat.size,
+        mtimeMs: stat.mtimeMs,
+        threadId: thread,
+        opening: { ...backfillOpening, cwd: provider.repositoryScopeRoots[0] },
+        spend: { file: twin.replace(/\.zst$/, ''), buckets: [] },
+        complete: true,
+        decodedLength: 500,
+      },
+    };
+  };
+  return { ...held, plain, work, refreshes, gauges, posted, sourceUpdates, entryOf };
+}
+
+const endBatchWindow = (provider: any) => {
+  clearTimeout(provider.compressedRowsTimer);
+  provider.compressedRowsTimer = null;
+};
+
+const discoveryRequests = (work: Record<string, number>) =>
+  Object.keys(work).filter((name) => name.startsWith('discoveryRequest:'));
+
+test('fifty batches during pending discovery list their rows with no discovery request or catalog enumeration', async () => {
+  const { provider, plain, work, refreshes, gauges, posted, sourceUpdates, entryOf } = await batchApplyHarness();
+  provider.activityFor = (session: SessionFile) => session.mtimeMs;
+  provider.dispatchDiscoveryPending = true;
+  provider.claudeChildrenDiscovered = true;
+  provider.progressiveWorker = {
+    run() {
+      throw new Error('a batch waited for a worker reply');
+    },
+  };
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  try {
+    const twins: string[] = [];
+    for (let batch = 0; batch < 50; batch++) {
+      const { twin, entry } = entryOf(`batch-${batch}`, 'x', new Date(1_700_000_000_000 + batch * 60_000));
+      twins.push(twin);
+      provider.applyCompressedBatch({ entries: [entry], backfillMs: 0 });
+      await vi.advanceTimersByTimeAsync(5_000);
+    }
+    assert.deepEqual(discoveryRequests(work), [], 'a batch asked discovery for a pass');
+    assert.equal(refreshes['catalog-enumeration'], undefined, 'a batch enumerated the catalog');
+    assert.ok(refreshes['compressed-facts'] >= 1, 'the measure runner saw no compressed-facts count');
+    assert.equal(gauges.compressedRows, 50, 'the gauge did not count the joined rows');
+    assert.deepEqual(
+      [...(posted.at(-1) ?? [])].sort(),
+      [...twins.map((_, batch) => `batch-${batch}`), 'plain'].sort(),
+      'the last posted session list did not hold every batch row',
+    );
+    const held = (provider.catalog.sessions as SessionFile[]).map((row) => row.file);
+    assert.deepEqual([...held].sort(), [plain, ...twins].sort(), 'the held catalog did not hold every batch row');
+    assert.deepEqual(
+      (provider.authoritativeCatalog as SessionFile[]).map((row) => row.file),
+      held,
+      'the accepted catalog differs from the held catalog',
+    );
+    assert.deepEqual(
+      held,
+      orderSessionCatalog(provider.catalog.sessions as SessionFile[], provider.activityFor).map((row) => row.file),
+      'a joined row is out of its place in the list order',
+    );
+    assert.ok(
+      sourceUpdates.some((codex) => codex.some((row) => row.file === twins[0])),
+      'a joined row reached no spend source',
+    );
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('batches that arrive close together apply as one', async () => {
+  const { provider, posted, refreshes, entryOf } = await batchApplyHarness();
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  try {
+    for (let batch = 0; batch < 5; batch++) {
+      provider.applyCompressedBatch({ entries: [entryOf(`close-${batch}`).entry], backfillMs: 0 });
+    }
+    assert.equal(refreshes['compressed-facts'], 1, 'the first batch did not apply at once, alone');
+    await vi.advanceTimersByTimeAsync(5_000);
+    assert.equal(refreshes['compressed-facts'], 2, 'the batches behind the first did not apply as one');
+    assert.ok(posted.at(-1)?.includes('close-4'), 'the last batch of the close run did not reach the session list');
+    await vi.advanceTimersByTimeAsync(5_000);
+    assert.equal(refreshes['compressed-facts'], 2, 'a window with no batch applied again');
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('a batch that changes a listed row updates that row in both catalogs', async () => {
+  const { provider, entryOf } = await batchApplyHarness();
+  const first = entryOf('changing');
+  provider.applyCompressedBatch({ entries: [first.entry], backfillMs: 0 });
+  const grown = entryOf('changing', 'xxxx');
+  endBatchWindow(provider);
+  provider.applyCompressedBatch({ entries: [grown.entry], backfillMs: 0 });
+  for (const list of [provider.catalog.sessions, provider.authoritativeCatalog] as SessionFile[][]) {
+    assert.deepEqual(
+      list.filter((row) => row.sessionId === 'changing').map((row) => row.size),
+      [grown.entry.size],
+      'the listed row kept its old revision',
+    );
+  }
+});
+
+test('rows of a batch that arrives while a catalog refresh runs wait for the slot', async () => {
+  const { provider, posted, entryOf } = await batchApplyHarness();
+  const controller = new AbortController();
+  provider.claimCatalogRefresh(controller);
+  provider.applyCompressedBatch({ entries: [entryOf('waiting').entry], backfillMs: 0 });
+  assert.equal(
+    (provider.catalog.sessions as SessionFile[]).some((row) => row.sessionId === 'waiting'),
+    false,
+    'a batch changed the catalog behind a running refresh',
+  );
+  provider.releaseCatalogRefresh(controller);
+  assert.ok(posted.at(-1)?.includes('waiting'), 'the rows did not apply when the refresh released the slot');
+});
+
+test('rows of a batch wait for a running selected-only refresh and apply when it ends', async () => {
+  const { provider, posted, entryOf } = await batchApplyHarness();
+  provider.selectedRefreshes = 1;
+  provider.applyCompressedBatch({ entries: [entryOf('selection-wait').entry], backfillMs: 0 });
+  assert.equal(
+    (provider.authoritativeCatalog as SessionFile[]).some((row) => row.sessionId === 'selection-wait'),
+    false,
+    'a batch changed the accepted catalog behind a running selected-only refresh',
+  );
+  provider.selectedRefreshes = 0;
+  provider.drainCompressedRows();
+  assert.ok(posted.at(-1)?.includes('selection-wait'), 'the rows did not apply when the selected-only refresh ended');
+});
+
+test('a batch row that a panel shows redraws through the selected-window refresh', async () => {
+  const { provider, entryOf } = await batchApplyHarness();
+  const refreshes: unknown[][] = [];
+  provider.refreshFrom = (...args: unknown[]) => refreshes.push(args);
+  provider.showing = 'shown-row';
+  provider.applyCompressedBatch({ entries: [entryOf('other-row').entry], backfillMs: 0 });
+  assert.deepEqual(refreshes, [], 'a row no panel shows ran a selected-window refresh');
+  endBatchWindow(provider);
+  provider.applyCompressedBatch({ entries: [entryOf('shown-row').entry], backfillMs: 0 });
+  assert.deepEqual(
+    refreshes,
+    [['selected-window', true, true, null, true, true]],
+    'the shown row did not redraw through one selected-window refresh',
+  );
 });
 
 test('a compressed-facts refresh that walks sets the gauge on both walk paths', async () => {

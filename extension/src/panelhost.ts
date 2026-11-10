@@ -265,6 +265,7 @@ import {
   turnBudget,
   pickShowing,
   orderSessionCatalog,
+  placeInSessionCatalog,
   turnKey,
   turnFileContributors,
   type TurnFileContributors,
@@ -956,6 +957,8 @@ const LIVE_ACTIVITY_STALE_MS = 30 * 60 * 1000;
 // Bound the session list's displayed name because every row travels in each
 // render and session list post. Other surfaces retain their separate labels.
 const RAIL_NAME_LIMIT = 200;
+// Compressed backfill batches that arrive within this time apply as one.
+const COMPRESSED_ROWS_APPLY_MS = 2_000;
 
 interface HeldActivity extends TimedWireActivity {
   seenAt: number;
@@ -1713,6 +1716,13 @@ export class PanelProvider implements vscode.Disposable {
   } | null = null;
   // Set by a compressed-facts refresh, so the next list that it builds sets the `compressedRows` gauge.
   private compressedFactsRefreshDue = false;
+  // The window after a batch applies. A batch that arrives in it waits, and the window's end applies them as one.
+  private compressedRowsTimer: ReturnType<typeof setTimeout> | null = null;
+  private compressedRowsOwed = false;
+  // Rows that wait for a running refresh to end, because the refresh replaces the catalogs from its own copy.
+  private compressedRowsWaiting = false;
+  // The running selected-only refreshes. Each rebuilds the session rows from the catalog it read at its start.
+  private selectedRefreshes = 0;
   // The last store offsets of the load, so a new worker reads only the bytes after them.
   private compressedLoadCursor: { worker: number | null; consumed: [string, number][] } | null = null;
   // Names in the store with no facts. The host keeps only the paths, for a worker that replaces the current one.
@@ -4036,6 +4046,10 @@ export class PanelProvider implements vscode.Disposable {
       clearTimeout(this.projectSpendMidnight);
       this.projectSpendMidnight = null;
     }
+    if (this.compressedRowsTimer) {
+      clearTimeout(this.compressedRowsTimer);
+      this.compressedRowsTimer = null;
+    }
     if (this.compressedFollowTimer) {
       clearTimeout(this.compressedFollowTimer);
       this.compressedFollowTimer = null;
@@ -5156,12 +5170,155 @@ export class PanelProvider implements vscode.Disposable {
     return changed;
   }
 
-  // One batch of the backfill. It names each file with skipped records once, and refreshes once for the whole batch.
+  // One batch of the backfill. It names each file with skipped records once. Its changed rows join the lists through
+  // `applyCompressedRows`.
   private applyCompressedBatch(batch: import('./compressedbackfill').CompressedBackfillBatch): void {
     if (batch.backfillMs) this.performanceCounters?.recordWork('backfillMs', batch.backfillMs);
     for (const entry of batch.entries)
       if (entry.skippedRecords) this.nameCompressedSkips(entry.file, entry.skippedRecords);
-    if (this.applyCompressedEntries(batch.entries)) this.refreshCompressedFacts();
+    if (this.applyCompressedEntries(batch.entries)) this.offerCompressedRows();
+  }
+
+  // The first batch applies at once. A batch that arrives within the next COMPRESSED_ROWS_APPLY_MS waits for the window to
+  // end, so close batches apply as one.
+  private offerCompressedRows(): void {
+    if (this.compressedRowsTimer) {
+      this.compressedRowsOwed = true;
+      return;
+    }
+    this.applyCompressedRows();
+  }
+
+  private armCompressedRowsTimer(): void {
+    if (this.compressedRowsTimer) return;
+    this.compressedRowsTimer = setTimeout(() => {
+      this.compressedRowsTimer = null;
+      if (!this.compressedRowsOwed) return;
+      this.compressedRowsOwed = false;
+      this.applyCompressedRows();
+    }, COMPRESSED_ROWS_APPLY_MS);
+    this.compressedRowsTimer.unref?.();
+  }
+
+  // Merges the rows whose entries changed since the last list into the held and accepted catalogs, and posts the session
+  // list. Its work follows the changed rows: a row keeps its spend source, discovery state, statistics and order, and
+  // every other row keeps the facts of the refresh that listed it. A catalog refresh merges the same rows through
+  // `withCompressedFactRows`. A catalog that cannot take the rows runs that refresh.
+  private applyCompressedRows(): void {
+    const dirty = this.compressedRowsDirty;
+    if (this.disposed || !dirty?.size || !this.anyVisible()) return;
+    if (this.refreshController || this.selectedRefreshes) {
+      this.compressedRowsWaiting = true;
+      return;
+    }
+    const started = performance.now();
+    const held = this.catalog;
+    const accepted = this.authoritativeCatalog;
+    const scope = JSON.stringify(this.repositoryScopeRoots);
+    const workspaceFolders = this.folders();
+    if (
+      !held ||
+      !accepted ||
+      !this.compressedWalk ||
+      !this.repositoryScopeReady ||
+      this.authoritativeCatalogScope !== scope ||
+      held.folders !== `${workspaceFolders.join('\n')}\0${this.repositoryScope.snapshot(workspaceFolders).revision}`
+    ) {
+      this.refreshCompressedFacts();
+      return;
+    }
+    const replaced = held.sessions.filter((session) => dirty.has(session.file));
+    const kept = held.sessions.length - replaced.length;
+    const rows = this.withCompressedFactRows(held.sessions).slice(kept);
+    const activity = (session: SessionFile) => this.activityFor(session);
+    const sessions = placeInSessionCatalog(
+      held.sessions.filter((session) => !dirty.has(session.file)),
+      rows,
+      activity,
+    );
+    const admitted = placeInSessionCatalog(
+      accepted.filter((session) => !dirty.has(session.file)),
+      rows,
+      activity,
+    );
+    this.catalog = { ...held, sessions };
+    this.authoritativeCatalog = admitted;
+    this.noteCompressedCoverage(admitted, replaced, rows);
+    this.noteCompressedRowFacts(admitted, replaced, rows);
+    this.compressedFactsRefreshDue = true;
+    this.noteCompressedRowsGauge(sessions);
+    this.armCompressedRowsTimer();
+    this.postRail(true, 'compressedBatch', undefined, false);
+    if (!this.projectSpendBusy()) this.postProjectSpend();
+    // A row that a panel shows, or the first row of an empty selection, redraws through the selected-window path.
+    const changed = new Set([...rows, ...replaced].map((row) => row.sessionId));
+    const shown = [this.showing, ...(this.hostSessions?.values() ?? [])].filter((id): id is string => id !== null);
+    if (this.showing === null ? rows.length > 0 : shown.some((id) => changed.has(id)))
+      this.refreshFrom('selected-window', true, true, null, true, true);
+    this.performanceCounters?.recordRefresh('compressed-facts', performance.now() - started);
+  }
+
+  // A joined row counts as a member when the walk listed it, as `acceptSessionCoverage` counts it. A row that leaves the
+  // list leaves the set.
+  private noteCompressedCoverage(
+    admitted: readonly SessionFile[],
+    replaced: readonly SessionFile[],
+    rows: readonly SessionFile[],
+  ): void {
+    const coverage = this.membershipCoverage;
+    if (!coverage) return;
+    coverage.files = admitted.map((source) => source.file);
+    const members = new Set(coverage.members);
+    for (const session of replaced) members.delete(sessionCoverageMember(session));
+    for (const row of rows) if (this.coveredMember(row)) members.add(sessionCoverageMember(row));
+    coverage.members = members;
+  }
+
+  // The session rows, statistics, cache marks and outcomes of the changed rows. Every other row keeps its own.
+  private noteCompressedRowFacts(
+    admitted: readonly SessionFile[],
+    replaced: readonly SessionFile[],
+    rows: readonly SessionFile[],
+  ): void {
+    const stats = { ...this.metadataStatsBySession };
+    const caches = { ...this.metadataRailCaches };
+    const now = Date.now();
+    for (const session of replaced) {
+      delete stats[session.sessionId];
+      delete caches[session.sessionId];
+    }
+    for (const row of rows) {
+      const meta = this.metaFor(row);
+      stats[row.sessionId] = sessionStatsFromFacts(derivedTitleStats(meta));
+      caches[row.sessionId] = railCacheMarkOf(derivedTitleCacheStats(meta), now);
+      if (Object.hasOwn(this.parsedRailCaches, row.sessionId))
+        this.metadataRailRevisions[row.sessionId] = derivedTitleCacheRevision(meta);
+    }
+    this.metadataStatsBySession = stats;
+    this.metadataRailCaches = caches;
+    this.sessionOutcomes = new Map([...this.sessionOutcomes, ...this.outcomesFor(rows)]);
+    const shown = new Set([this.showing, ...(this.hostSessions?.values() ?? [])]);
+    const edges = this.sessionParentEdges(admitted).edges;
+    const listed = new Map(this.sessionRows.map((row) => [row.id, row]));
+    for (const row of rows) listed.set(row.sessionId, this.sessionRowOf(row, edges, shown.has(row.sessionId)));
+    this.sessionRows = [
+      ...this.sessionRows.filter((row) => !row.persisted),
+      ...admitted.map(
+        (source) => listed.get(source.sessionId) ?? this.sessionRowOf(source, edges, shown.has(source.sessionId)),
+      ),
+    ];
+  }
+
+  // Applies rows that waited for a refresh or selection to end. A waiting refresh merges them itself.
+  private drainCompressedRows(): void {
+    if (!this.compressedRowsWaiting) return;
+    this.compressedRowsWaiting = false;
+    if (this.pendingRefresh) return;
+    try {
+      this.applyCompressedRows();
+    } catch (error) {
+      console.warn('Arc: session reading failed.', error);
+    }
   }
 
   // A compressed-facts refresh reuses the held catalog, and sets the `compressedRows` gauge at its end.
@@ -10721,6 +10878,7 @@ export class PanelProvider implements vscode.Disposable {
     let walkReasons = reuseCatalog ? ['replacedFiles'] : (this.refreshWalkReasons ?? [refreshReason]);
     let controller: AbortController | null = null;
     let primed = false;
+    if (selectedOnly) this.selectedRefreshes = (this.selectedRefreshes ?? 0) + 1;
     let primedEnumeration: SourceEnumeration | undefined;
     let codexRelist: SourceEnumeration | undefined;
     let generation = this.refreshGeneration;
@@ -11366,32 +11524,14 @@ export class PanelProvider implements vscode.Disposable {
       // Build rows for the full catalog, independent of selected transcript reads.
       const counts = this.unreadCounts();
       const fullLabels = new Map<string, string>();
-      this.sessionRows = all.map((f) => {
-        // Use recorded activity time, with mtime only when metadata has no timestamp.
-        const at = this.activityFor(f);
-        const named = this.sessionLabel(f);
-        const label = named.label;
-        fullLabels.set(f.sessionId, named.fullLabel);
-        // Bound session-list names by `RAIL_NAME_LIMIT`. Other session surfaces retain the short label.
-        const railName = shortenTo(named.fullLabel, RAIL_NAME_LIMIT, '...');
-        return {
-          id: f.sessionId,
-          persisted: true,
-          label,
-          ...(railName === label ? {} : { railName }),
-          // Use the shared calendar formatter for session activity.
-          when: formatWhen(at),
-          // `agent` is the displayed name. `agentKey` identifies catalogs, prompt settings, and agent callbacks.
-          agent: AGENT_NAMES[f.agent],
-          agentKey: f.agent,
-          shown: sessions.some((s) => s.sessionId === f.sessionId),
-          // The browser's age ticker reads `at`. Unread counts remain independent session-list facts.
-          at,
-          relative: formatRelative(at),
-          // Classify agent runs from accepted metadata and parent ownership.
-          agentRun: this.agentRunFor(f, parentEdges.edges),
-        };
-      });
+      this.sessionRows = all.map((f) =>
+        this.sessionRowOf(
+          f,
+          parentEdges.edges,
+          sessions.some((s) => s.sessionId === f.sessionId),
+          fullLabels,
+        ),
+      );
       this.sessionRows = [
         ...syntheticDraftRows(
           scopedDrafts.map((draft) => ({
@@ -11709,6 +11849,7 @@ export class PanelProvider implements vscode.Disposable {
       }
       console.warn('Arc: session reading failed.', error);
     } finally {
+      if (selectedOnly && --this.selectedRefreshes === 0) this.drainCompressedRows();
       const owned = !selectedOnly && controller !== null && this.releaseCatalogRefresh(controller);
       this.performanceCounters.recordRefresh(refreshReason, performance.now() - refreshStarted);
       this.health?.observe('refresh', performance.now() - refreshStarted);
@@ -11718,6 +11859,39 @@ export class PanelProvider implements vscode.Disposable {
         if (owned) this.scheduleDiscoveryContinuation();
       }
     }
+  }
+
+  // The session list row of one catalog entry.
+  private sessionRowOf(
+    f: SessionFile,
+    edges: ReadonlyMap<string, SessionParentEdge>,
+    shown: boolean,
+    fullLabels?: Map<string, string>,
+  ): (typeof this.sessionRows)[number] {
+    // Use recorded activity time, with mtime only when metadata has no timestamp.
+    const at = this.activityFor(f);
+    const named = this.sessionLabel(f);
+    const label = named.label;
+    fullLabels?.set(f.sessionId, named.fullLabel);
+    // Bound session-list names by `RAIL_NAME_LIMIT`. Other session surfaces retain the short label.
+    const railName = shortenTo(named.fullLabel, RAIL_NAME_LIMIT, '...');
+    return {
+      id: f.sessionId,
+      persisted: true,
+      label,
+      ...(railName === label ? {} : { railName }),
+      // Use the shared calendar formatter for session activity.
+      when: formatWhen(at),
+      // `agent` is the displayed name. `agentKey` identifies catalogs, prompt settings, and agent callbacks.
+      agent: AGENT_NAMES[f.agent],
+      agentKey: f.agent,
+      shown,
+      // The browser's age ticker reads `at`. Unread counts remain independent session-list facts.
+      at,
+      relative: formatRelative(at),
+      // Classify agent runs from accepted metadata and parent ownership.
+      agentRun: this.agentRunFor(f, edges),
+    };
   }
 
   // The catalog refresh slot. A catalog refresh requested while the slot is held waits behind its holder, and a holder
@@ -11751,6 +11925,7 @@ export class PanelProvider implements vscode.Disposable {
       clearTimeout(this.refreshDeadline);
       this.refreshDeadline = null;
     }
+    this.drainCompressedRows();
     return true;
   }
 
@@ -15111,6 +15286,15 @@ export class PanelProvider implements vscode.Disposable {
     return true;
   }
 
+  // Whether membership coverage lists this source as a member of the catalog.
+  private coveredMember(source: SessionFile): boolean {
+    return (
+      !this.enumeratedAmbiguousIds?.has(source.sessionId) &&
+      (this.enumeratedMembers?.has(sessionCoverageMember(source)) ||
+        (source.childTranscript === true && !this.dispatchDiscoveryPending))
+    );
+  }
+
   private acceptSessionCoverage(current: SessionFile[], scope: string): SessionFile[] {
     const revision = String((this.coverageRevision = (this.coverageRevision ?? 0) + 1));
     const enumeration = this.sourceEnumerations;
@@ -15124,16 +15308,7 @@ export class PanelProvider implements vscode.Disposable {
         : this.dispatchDiscoveryPending
           ? 'pendingSet'
           : undefined;
-    const members = new Set(
-      current
-        .filter(
-          (source) =>
-            !this.enumeratedAmbiguousIds?.has(source.sessionId) &&
-            (this.enumeratedMembers?.has(sessionCoverageMember(source)) ||
-              (source.childTranscript === true && !this.dispatchDiscoveryPending)),
-        )
-        .map(sessionCoverageMember),
-    );
+    const members = new Set(current.filter((source) => this.coveredMember(source)).map(sessionCoverageMember));
     this.membershipCoverage = {
       domain: 'admitted',
       scope,
