@@ -214,7 +214,7 @@ import {
   sameRailInputs,
   selectionPayload,
 } from './payload';
-import { RowDeltaReceiver, RowDeltaSender } from './webview/row-deltas.ts';
+import { replaceRows, replaceStats, RowDeltaReceiver, RowDeltaSender } from './webview/row-deltas.ts';
 import {
   acceptsProgressiveResult,
   CommitRepositoryReservations,
@@ -245,6 +245,7 @@ import {
 } from './turnview';
 import {
   groupBySession,
+  hasUnsentPrompt,
   railCachesOf,
   sessionParentEdgeSet,
   sessionParentIndex,
@@ -20460,6 +20461,119 @@ test('a session list post counts the rows it carried and each row field that dif
     ],
     'a nested field change, a dropped field or a removed figure entry was not counted',
   );
+});
+
+test('a draft hold among 2000 rows builds only draft payloads and preserves each panel rail', () => {
+  const provider = railPostHarness(['holdDraft'], { hasUnsentPrompt, replaceRows, replaceStats });
+  provider.performanceOutput = { appendLine() {} };
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(new Date(2026, 0, 15, 12).getTime());
+  try {
+    const labelsRead = new Set<string>();
+    provider.sessionRows = Array.from({ length: 2000 }, (_, index) => ({
+      id: `s${index}`,
+      persisted: true,
+      agent: 'claude',
+      when: 'Today',
+      at: 1,
+      relative: 'Today',
+      get label() {
+        labelsRead.add(`s${index}`);
+        return `Session ${index}`;
+      },
+    }));
+    provider.showing = 's0';
+    provider.saved.labels = { s17: ['check'], s18: ['hold'] };
+    provider.saved.comments = [{ sessionId: 's17' }];
+    provider.hidden = ['s20'];
+    provider.pinnedTop = ['s19'];
+    provider.drafts = { s22: 'other draft' };
+    provider.metadataStatsBySession = Object.fromEntries(
+      ['s0', 's1', 's17', 's18'].map((id) => [
+        id,
+        [
+          {
+            kind: 'plain',
+            metric: 'turns',
+            label: '3 turns',
+            compactLabel: '3',
+            detail: '',
+          },
+        ],
+      ]),
+    );
+    provider.boxText = {};
+    provider.rememberDrafts = () => {};
+    const inputFor = provider.railInputFor.bind(provider);
+    let statuses = new Map();
+    provider.railStatuses = () => ({ statuses, openChildren: new Map() });
+    provider.railInputFor = (
+      counts: unknown,
+      states: unknown,
+      children: unknown,
+      now: number,
+      showing = provider.showing,
+    ) => ({
+      ...inputFor(counts, states, children, now),
+      showing,
+      unsent: unsentBySession(provider.drafts, provider.saved.comments),
+    });
+    const received: any[] = [];
+    provider.hosts = ['s0', 's1'].map((showing) => {
+      const receiver = new RowDeltaReceiver();
+      const slot = received.length;
+      received.push(null);
+      return {
+        showing,
+        webview: {
+          postMessage(message: any) {
+            received[slot] = receiver.expand(message);
+            return Promise.resolve(true);
+          },
+        },
+        active: () => false,
+        visible: () => true,
+      };
+    });
+    provider.readyHosts = new Set(provider.hosts);
+    provider.hostSessions = new Map(provider.hosts.map((host: any) => [host, host.showing]));
+    const built: string[][] = [];
+    provider.useRailPayload((input: Parameters<typeof railPayload>[0], rows?: ReadonlySet<string | null>) => {
+      const payload = railPayload(input, rows);
+      built.push(payload.rail.map((row) => row.id));
+      return payload;
+    });
+    provider.postRail(true, 'opening');
+    const checkRail = () => {
+      for (const [index, host] of provider.hosts.entries()) {
+        const full = railPayload(provider.railInputFor(new Map(), statuses, new Map(), Date.now(), host.showing));
+        assert.deepEqual(received[index].rail, full.rail);
+        assert.deepEqual(received[index].stats, full.stats);
+        assert.deepEqual(received[index].labels, full.labels);
+      }
+    };
+    for (const text of ['draft', '']) {
+      built.length = 0;
+      labelsRead.clear();
+      provider.holdDraft('s17', text);
+      assert.deepEqual(
+        built.map((rows) => rows.length),
+        [1, 1],
+      );
+      assert.deepEqual(built, [['s17'], ['s17']]);
+      assert.deepEqual([...labelsRead], ['s17'], 'a draft hold reads labels outside its draft rows');
+      checkRail();
+    }
+    built.length = 0;
+    statuses = new Map([['s18', 'running']]);
+    provider.holdDraft('s17', 'another draft');
+    assert.deepEqual(
+      built.map((rows) => rows.length),
+      [2000, 2000],
+    );
+    checkRail();
+  } finally {
+    clock.mockRestore();
+  }
 });
 
 test('a rail update serializes once for each actual ready-host post', () => {

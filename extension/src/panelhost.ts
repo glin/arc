@@ -563,7 +563,7 @@ import {
   type ReaderReadEvent,
 } from './domain/read.ts';
 import { SessionReadObservations, runSessionRead, requesterOf } from './sessionwrites.ts';
-import { RowDeltaSender, type RowLists } from './webview/row-deltas.ts';
+import { replaceRows, replaceStats, RowDeltaSender, type RowLists } from './webview/row-deltas.ts';
 import { withRecoveredCommits } from './childartifacts.ts';
 import {
   hasImageReference,
@@ -2518,6 +2518,13 @@ export class PanelProvider implements vscode.Disposable {
   private lastRailCountsJson = '';
   // Inputs for the last session-list payload, including the local day. Matching inputs skip rebuilding it.
   private lastRailKey: RailInputKey | null = null;
+  // Complete payloads by selected session. Unsent-only changes rebuild the affected rows.
+  private heldRailPayloads:
+    | Map<
+        string | null,
+        { key: RailInputKey; unsent: RailPayloadInput['unsent']; payload: ReturnType<typeof railPayload> }
+      >
+    | undefined;
   // Pending-source state used by the last session-list payload. A selection render can advance the figure cache independently.
   private railPendingAnswers: SpendPendingAnswers | null = null;
   // Selection render that owes a session-list update. A skipped save update is posted when that render settles without supplying it.
@@ -11780,6 +11787,7 @@ export class PanelProvider implements vscode.Disposable {
       if (listLoading.complete && this.authoritativeCatalogScope === loadingScope)
         this.loadingLine.hold(loadingScope, generation, selectedOnly ? 'selection' : 'render');
       const metadataAcceptedHosts = new Set<PanelHost>();
+      if (!selectedOnly) this.heldRailPayloads = new Map();
       for (const host of this.hosts) {
         const hostSession = this.hostSessions?.get(host) ?? this.showing;
         const hostPreviousSession = this.hostPreviousSessions?.get(host) ?? previousSelection;
@@ -11810,6 +11818,8 @@ export class PanelProvider implements vscode.Disposable {
           this.railInputFor(counts, statuses, openChildren, railNow, hostSession),
           changedRows ?? undefined,
         );
+        if (!selectedOnly)
+          this.heldRailPayloads!.set(hostSession, { key: railKey, unsent: railInput.unsent, payload: hostRail });
         const selectedSession = sessions.find((session) => session.sessionId === hostSession);
         const loadingNewest = selectedSession ? !this.progressiveCurrent(selectedSession) : false;
         const loadingLabel = loadingNewest
@@ -13053,13 +13063,36 @@ export class PanelProvider implements vscode.Disposable {
     const changes = this.lastRailKey ? railInputChanges(this.lastRailKey, key) : ['first'];
     if (this.lastRailKey && adoptionsJson !== this.lastRailAdoptionsJson) changes.push('sessionAdoptions');
     for (const change of changes) this.performanceCounters?.recordWork(`railPostInput:${caller}:${change}`);
-    const sharedRail = railPayload(input);
+    const heldPayloads = this.heldRailPayloads;
+    this.heldRailPayloads = new Map();
+    const buildRail = (hostInput: RailPayloadInput) => {
+      const held = heldPayloads?.get(hostInput.showing);
+      let payload: ReturnType<typeof railPayload>;
+      if (held?.key === this.lastRailKey && changes.length === 1 && changes[0] === 'unsent') {
+        const ids = new Set([...held.unsent.keys(), ...hostInput.unsent.keys()]);
+        const rows = new Set(
+          [...ids].filter((id) => JSON.stringify(held.unsent.get(id)) !== JSON.stringify(hostInput.unsent.get(id))),
+        );
+        const changed = railPayload(hostInput, rows);
+        const replaces = [...rows];
+        payload = {
+          ...changed,
+          rail: replaceRows(held.payload.rail, changed.rail, replaces),
+          stats: replaceStats(held.payload.stats, changed.stats, replaces),
+        };
+      } else {
+        payload = railPayload(hostInput);
+      }
+      this.heldRailPayloads!.set(hostInput.showing, { key, unsent: hostInput.unsent, payload });
+      return payload;
+    };
+    const sharedRail = buildRail(input);
     let largestRailBytes: number | null = null;
     for (const host of this.hosts) {
       const message = railMessage(
         (this.hostSessions?.get(host) ?? this.showing) === this.showing
           ? sharedRail
-          : railPayload(
+          : buildRail(
               this.railInputFor(counts, statuses, openChildren, railNow, this.hostSessions?.get(host) ?? this.showing),
             ),
         {

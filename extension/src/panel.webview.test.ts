@@ -24244,7 +24244,7 @@ test('a rail card wears the status that needs attention', () => {
   const postRail = memberFrom(panelHostSource, postRailAt);
   sourceMatch(
     postRail,
-    /const railAdoptions = sessionAdoptions\(this\.sessionAliases\);[\s\S]*?for \(const host of this\.hosts\) \{[\s\S]*?sharedRail[\s\S]*?railPayload\(this\.railInputFor\([\s\S]*?this\.hostSessions\?\.get\(host\) \?\? this\.showing[\s\S]*?sessionAdoptions: railAdoptions[\s\S]*?void this\.postRows\(host, message, \(serializedBytes\) => \{/,
+    /const railAdoptions = sessionAdoptions\(this\.sessionAliases\);[\s\S]*?for \(const host of this\.hosts\) \{[\s\S]*?sharedRail[\s\S]*?buildRail\(this\.railInputFor\([\s\S]*?this\.hostSessions\?\.get\(host\) \?\? this\.showing[\s\S]*?sessionAdoptions: railAdoptions[\s\S]*?void this\.postRows\(host, message, \(serializedBytes\) => \{/,
     'a completed lifetime index updates the rail but leaves the open heading stale',
   );
   sourceMatch(
