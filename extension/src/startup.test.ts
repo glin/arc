@@ -13212,7 +13212,7 @@ test('fifty batches during pending discovery list their rows with no discovery r
     }
     assert.deepEqual(discoveryRequests(work), [], 'a batch asked discovery for a pass');
     assert.equal(refreshes['catalog-enumeration'], undefined, 'a batch enumerated the catalog');
-    assert.ok(refreshes['compressed-facts'] >= 1, 'the measure runner saw no compressed-facts count');
+    assert.equal(work.compressedMerge, 50, 'a batch ran no merge of its own');
     assert.equal(gauges.compressedRows, 50, 'the gauge did not count the joined rows');
     assert.deepEqual(
       [...(posted.at(-1) ?? [])].sort(),
@@ -13241,21 +13241,32 @@ test('fifty batches during pending discovery list their rows with no discovery r
 });
 
 test('batches that arrive close together apply as one', async () => {
-  const { provider, posted, refreshes, entryOf } = await batchApplyHarness();
+  const { provider, posted, work, entryOf } = await batchApplyHarness();
   vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
   try {
     for (let batch = 0; batch < 5; batch++) {
       provider.applyCompressedBatch({ entries: [entryOf(`close-${batch}`).entry], backfillMs: 0 });
     }
-    assert.equal(refreshes['compressed-facts'], 1, 'the first batch did not apply at once, alone');
+    assert.equal(work.compressedMerge, 1, 'the first batch did not apply at once, alone');
     await vi.advanceTimersByTimeAsync(5_000);
-    assert.equal(refreshes['compressed-facts'], 2, 'the batches behind the first did not apply as one');
+    assert.equal(work.compressedMerge, 2, 'the batches behind the first did not apply as one');
     assert.ok(posted.at(-1)?.includes('close-4'), 'the last batch of the close run did not reach the session list');
     await vi.advanceTimersByTimeAsync(5_000);
-    assert.equal(refreshes['compressed-facts'], 2, 'a window with no batch applied again');
+    assert.equal(work.compressedMerge, 2, 'a window with no batch applied again');
   } finally {
     vi.useRealTimers();
   }
+});
+
+test('ten merges add ten to the merge count and none to the refresh count', async () => {
+  const { provider, work, refreshes, entryOf } = await batchApplyHarness();
+  for (let batch = 0; batch < 10; batch++) {
+    provider.applyCompressedBatch({ entries: [entryOf(`merged-${batch}`).entry], backfillMs: 0 });
+    endBatchWindow(provider);
+  }
+  assert.equal(work.compressedMerge, 10, 'a merge went uncounted');
+  assert.equal(typeof work.compressedMergeMs, 'number', 'the merges recorded no time of their own');
+  assert.equal(refreshes['compressed-facts'], undefined, 'a merge counted as a compressed-facts refresh');
 });
 
 test('a batch that changes a listed row updates that row in both catalogs', async () => {

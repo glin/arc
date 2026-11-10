@@ -5276,7 +5276,8 @@ export class PanelProvider implements vscode.Disposable {
     this.compressedFirstRowRedrawOwed = false;
     if (this.showing === null ? firstRow : shown.some((id) => changed.has(id)))
       this.refreshFrom('selected-window', true, true, null, true, true);
-    this.performanceCounters?.recordRefresh('compressed-facts', performance.now() - started);
+    this.performanceCounters?.recordWork('compressedMerge');
+    this.performanceCounters?.recordWork('compressedMergeMs', Math.round(performance.now() - started));
   }
 
   // The discovery proof follows a merge when it named the old list and the last walk listed each changed row. A row that
