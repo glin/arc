@@ -22545,7 +22545,14 @@ function settledGapHarness(
   const harness = partialSpendHarness(true, spendFailure, {
     spendReplies: 1,
     methods: ['runPendingWatch', 'unknownPathShapeOf'],
-    scope: { fs, watcherRefreshDecision, sessionDirectoryOwners, unknownPathShapes, unknownPathExtension },
+    scope: {
+      fs,
+      crypto: { createHash },
+      watcherRefreshDecision,
+      sessionDirectoryOwners,
+      unknownPathShapes,
+      unknownPathExtension,
+    },
   });
   const { provider } = harness;
   provider.partial = [...provider.partial, ...extraRoots];

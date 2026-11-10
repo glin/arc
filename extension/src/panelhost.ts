@@ -1850,7 +1850,7 @@ export class PanelProvider implements vscode.Disposable {
     // True when the reply ends discovery or reports settled membership.
     settled?: boolean;
   };
-  // The catalog membership of the last pass that an accepted identity mismatch requested. The same membership requests no second one.
+  // A digest of the catalog membership of the last pass that an accepted identity mismatch requested. The same membership requests no second one.
   private identityRearmMembership?: string;
   private discoveryRequestSequence = 0;
   private discoveryObservation?: {
@@ -15105,7 +15105,7 @@ export class PanelProvider implements vscode.Disposable {
   ): boolean {
     if (!settled || cause === 'pendingSet') return true;
     if (cause !== 'identityMismatch') return false;
-    const membership = sessionCatalogMembership(scope, catalog);
+    const membership = crypto.createHash('sha256').update(sessionCatalogMembership(scope, catalog)).digest('hex');
     if (membership === this.identityRearmMembership) return false;
     this.identityRearmMembership = membership;
     return true;
