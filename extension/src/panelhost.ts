@@ -1,7 +1,7 @@
 import { parseLinkDestination, linkBrowserKind, type LinkDestination, type LinkOpening } from './domain/link-path';
 import { commandScope } from './commandcatalog';
 import { compatibleDiscovery, discoveryCompatibility } from './progressiveworker';
-import { DispatchReceipts } from './dispatchreceipts';
+import { DispatchReceipts, type DispatchStoreRevision } from './dispatchreceipts';
 import {
   sessionCoverageMember,
   reconcileSessionCollisions,
@@ -74,6 +74,7 @@ import {
   readSessionCursor,
   sessionCatalogMembership,
   sessionDiscoveryMembership,
+  discoveryMemberRevisions,
   sessionDiscoveryMismatch,
   sessionListingPage,
   sessionPageSources,
@@ -1861,6 +1862,21 @@ export class PanelProvider implements vscode.Disposable {
     revisions?: Map<string, SessionFile>;
     // True when the reply ends discovery or reports settled membership.
     settled?: boolean;
+  };
+  // What the last settled complete reply covered, which a later walk compares with what it lists. A partial or unsettled reply
+  // clears it, and a reply that carries no receipt revision leaves nothing to compare.
+  private epochCodexChildren?: Array<{
+    file: string;
+    size: number;
+    mtimeMs: number;
+    dev?: number | string;
+    ino?: number | string;
+  }>;
+  private settledDiscovery?: {
+    scope: string;
+    folders: string | undefined;
+    members: Map<string, string>;
+    receipts: DispatchStoreRevision;
   };
   // A digest of the catalog membership of the last pass that an accepted identity mismatch requested. The same membership requests no second one.
   private identityRearmMembership?: string;
@@ -4751,6 +4767,7 @@ export class PanelProvider implements vscode.Disposable {
     this.selectionWork = null;
     // A catalog completed under the previous roots never completes the new ones, even when the roots later return to it.
     this.discoveryComplete = undefined;
+    this.settledDiscovery = undefined;
     this.completeCatalogScope = undefined;
     this.sessionReadDiscoveryRevision = undefined;
     this.sessionReadProofCatalog = undefined;
@@ -4812,6 +4829,7 @@ export class PanelProvider implements vscode.Disposable {
     this.discoveryCompleted = undefined;
     this.discoveryAcknowledgment = undefined;
     this.discoveryComplete = undefined;
+    this.settledDiscovery = undefined;
     this.claudeChildReferenceEntries = new Map();
     this.enumeratedSpendSources = undefined;
     // Cancel catalog work started for different workspace folders.
@@ -11310,6 +11328,15 @@ export class PanelProvider implements vscode.Disposable {
           reuseCatalog = false;
         }
       }
+      // A walk that lists what the last settled reply covered keeps the accepted discovery and sends no request.
+      if (!selectedOnly && !reuseCatalog && this.settledDiscovery) {
+        const unchanged = await this.walkKeepsDiscovery(this.settledDiscovery);
+        if (controller.signal.aborted || generation !== this.refreshGeneration) return;
+        if (unchanged) {
+          reuseCatalog = true;
+          this.performanceCounters.recordWork('discoveryRequest:unchangedWalk');
+        }
+      }
       const dispatchCatalog =
         !selectedOnly && this.claudeChildReferences?.length
           ? new Map(all.map((session) => [session.sessionId, session]))
@@ -15010,13 +15037,18 @@ export class PanelProvider implements vscode.Disposable {
       return true;
     };
     const parents = this.claudeParents;
+    const childSources = this.walkedChildSources;
+    const codexChildren = spendSources?.children ?? this.codexSubagents;
+    // The revisions that a new epoch starts from. A later epoch of the same chain keeps its own.
+    if (!this.discoveryCheckpoint)
+      this.epochCodexChildren = codexChildren?.length ? await this.unlistedCodexChildren(parents, codexChildren) : [];
     const compressedList = this.compressedRolloutsToSend();
     const compressedRevision = this.compressedRolloutsRevision;
     const result = await this.progressiveWorker
       .run(
         {
           kind: 'claude-children',
-          codexChildren: spendSources?.children ?? this.codexSubagents,
+          codexChildren,
           parents,
           catalog: parents,
           repositoryRoots: this.repositoryScopeRoots,
@@ -15067,6 +15099,7 @@ export class PanelProvider implements vscode.Disposable {
     if (progress.kind !== 'claude-children' || !progress.complete) {
       this.dispatchDiscoveryPending = true;
       this.dispatchDiscoveryPendingWriter = 'partialReply';
+      this.settledDiscovery = undefined;
       this.publishSessionQueryContext();
       this.discoveryComplete = undefined;
       this.checkpointDerivedCache();
@@ -15182,6 +15215,18 @@ export class PanelProvider implements vscode.Disposable {
       revisions: new Map(sessions.map((session) => [session.file, { ...session }])),
       settled: membersSettled,
     };
+    this.settledDiscovery =
+      membersSettled && progress.roots && progress.receiptRevision && this.epochCodexChildren
+        ? {
+            scope: JSON.stringify(this.repositoryScopeRoots),
+            folders: this.catalog?.folders,
+            members: discoveryMemberRevisions(
+              [...progress.roots, ...(childSources ?? []), ...this.epochCodexChildren],
+              progress.referenceEntries,
+            ),
+            receipts: progress.receiptRevision,
+          }
+        : undefined;
     this.updateSessionSpendSources(codex, sessions);
     if (this.catalog) {
       this.catalog = { ...this.catalog, sessions };
@@ -15192,6 +15237,57 @@ export class PanelProvider implements vscode.Disposable {
       this.derivedCacheCheckpointState.markChanged();
     }
     return true;
+  }
+
+  // The revision of each Codex child that the walk read no row for, such as a background review, because a dispatched spend tree
+  // still reads its rollout. A child that a stat cannot reach holds no revision.
+  private async unlistedCodexChildren(
+    parents: readonly SessionFile[],
+    children: readonly CodexSubagentFile[] | undefined,
+  ): Promise<Array<{ file: string; size: number; mtimeMs: number; dev?: number | string; ino?: number | string }>> {
+    const listed = new Set(parents.map((parent) => normalizeFsPath(parent.file)));
+    const unlisted = (children ?? []).filter((child) => !listed.has(normalizeFsPath(child.file)));
+    if (!unlisted.length) return [];
+    return Promise.all(
+      unlisted.map(async ({ file }) => {
+        try {
+          return { file, ...fileRevisionOf(await fs.promises.stat(file, { bigint: true })) };
+        } catch {
+          return { file, size: -1, mtimeMs: -1 };
+        }
+      }),
+    );
+  }
+
+  // True when this walk lists what the last settled reply covered, with nothing outstanding. The next pass then reads the same
+  // sources and receipts and reaches the same reply.
+  private async walkKeepsDiscovery(held: NonNullable<PanelProvider['settledDiscovery']>): Promise<boolean> {
+    const enumeration = this.sourceEnumerations;
+    if (
+      held.scope !== JSON.stringify(this.repositoryScopeRoots) ||
+      held.folders !== this.catalog?.folders ||
+      this.dispatchDiscoveryPending ||
+      this.sessionQueryDiscoveryPending ||
+      this.discoveryCheckpoint !== undefined ||
+      this.codexListingSeeded ||
+      enumeration?.claude.status !== 'complete' ||
+      enumeration.codex.status !== 'complete' ||
+      !this.enumeratedAdmissionComplete ||
+      this.enumeratedAmbiguousIds?.size ||
+      this.compressedRolloutsToSend().compressed !== undefined
+    )
+      return false;
+    const listed = discoveryMemberRevisions([
+      ...this.claudeParents,
+      ...(this.walkedChildSources ?? []),
+      ...(await this.unlistedCodexChildren(
+        this.claudeParents,
+        this.enumeratedSpendSources?.children ?? this.codexSubagents,
+      )),
+    ]);
+    if (listed.size !== held.members.size) return false;
+    for (const [file, revision] of listed) if (held.members.get(file) !== revision) return false;
+    return new DispatchReceipts().unchangedSince(held.receipts);
   }
 
   // Whether a partial reply publishes the first catalog from the walked rows, because the activation has no saved links to

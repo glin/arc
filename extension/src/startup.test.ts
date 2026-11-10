@@ -34,7 +34,7 @@ import { runningKey, sessionRunning, type LivePress } from './composerview';
 import { compatibleDiscovery, discoveryCompatibility } from './progressiveworker';
 import { claudeDispatchTranscript } from './turnfixtures';
 import { sessionCoverageMember, sessionPresence, reconcileSessionCollisions } from './sessioncoverage';
-import { sessionSourceKey, sessionPageSources, guardedSourceRevision } from './sessionreads';
+import { discoveryMemberRevisions, sessionSourceKey, sessionPageSources, guardedSourceRevision } from './sessionreads';
 import { afterAll, afterEach, beforeAll, test, vi } from 'vitest';
 import { pendingResponseSessionAdmitted, resolveResponseSession } from './domain/session-link';
 import { createPanelVisibility } from './panelvisibility';
@@ -15261,6 +15261,123 @@ test('a new transcript in a directory the stat list misses lists at the backstop
 });
 
 // Coverage of a file that no catalog lists, such as a transcript outside repository scope, misses the held catalog and walks.
+// One settled discovery reply, with a receipt revision that the store still holds. `census` and `reply` change what the next
+// walk lists and what the next reply says.
+function settledWalkHarness() {
+  vi.stubEnv('ARC_HOME', tempDir('settled-walk-arc-'));
+  const census = { status: 'complete' };
+  const reply = { settled: true };
+  const harness = bumpedCatalogHarness(
+    {
+      DispatchReceipts,
+      discoveryMemberRevisions,
+      enumerateClaudeChildSources: (parents: SessionFile[]) => {
+        const sessions = parents.filter((session) => session.childTranscript);
+        return {
+          sessions,
+          files: sessions.map((session) => session.file),
+          directories: ['fixture'],
+          status: census.status,
+          uncertain: [],
+        };
+      },
+    },
+    false,
+    ['walkKeepsDiscovery', 'unlistedCodexChildren', 'compressedRolloutsToSend', 'compressedStorePaths'],
+  );
+  const { provider } = harness;
+  const counters = new PanelPerformanceCounters();
+  provider.performanceCounters = counters;
+  const run = provider.progressiveWorker.run;
+  provider.progressiveWorker.run = async (request: ProgressiveRequest, generation: number, signal: AbortSignal) => {
+    const result = await run(request, generation, signal);
+    if (request.kind !== 'claude-children') return result;
+    return {
+      ...result,
+      value: {
+        ...result.value,
+        membershipSettled: reply.settled,
+        continuation: !reply.settled,
+        receiptRevision: { store: new DispatchReceipts().storeRevision(), outside: [] },
+      },
+    };
+  };
+  const count = (name: string) => counters.snapshot().work[name] ?? 0;
+  const walked = () => count('discoveryRequest:walked');
+  const skipped = () => count('discoveryRequest:unchangedWalk');
+  // The first reply names child transcripts that the next census lists, so discovery settles after a second pass.
+  const settle = async () => {
+    for (let walk = 0; walk < 4; walk++) {
+      const before = skipped();
+      await provider.refresh(true);
+      if (skipped() > before) return;
+    }
+    assert.fail('the walks never kept the accepted discovery');
+  };
+  return { ...harness, census, reply, walked, skipped, settle };
+}
+
+test('backstop walks over an unchanged catalog after a settled reply send no discovery request', async () => {
+  const { provider, walked, skipped, settle } = settledWalkHarness();
+  try {
+    await settle();
+    const before = { walked: walked(), skipped: skipped() };
+    for (let walk = 0; walk < 3; walk++) await provider.refresh(true);
+    assert.deepEqual({ walked: walked(), skipped: skipped() }, { walked: before.walked, skipped: before.skipped + 3 });
+    assert.ok(provider.authoritativeCatalog.length > 0, 'the unchanged walks left no accepted catalog');
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});
+
+test.each([
+  [
+    'a member joined',
+    ({ claudeWalk, claude }: any) => claudeWalk.push({ ...claude, file: 'projects/j.jsonl', sessionId: 'j' }),
+  ],
+  ['a member left', ({ codexWalk }: any) => codexWalk.splice(0)],
+  ['a member revision moved', ({ claudeWalk, claude }: any) => (claudeWalk[0] = { ...claude, size: claude.size + 1 })],
+  [
+    'the repository scope changed',
+    ({ provider }: any) =>
+      (provider.repositoryScope = { snapshot: () => ({ ready: true, roots: ['project', 'other'], revision: 1 }) }),
+  ],
+  ['the workspace folders changed', ({ provider }: any) => (provider.folders = () => ['elsewhere'])],
+  ['a coverage gap is held', ({ census }: any) => (census.status = 'incomplete')],
+  ['the last acceptance proved no membership', ({ provider }: any) => (provider.sessionQueryDiscoveryPending = true)],
+  ['an accepted catalog asks for another pass', ({ provider }: any) => (provider.dispatchDiscoveryPending = true)],
+  [
+    'the compressed list waits for the worker',
+    ({ provider }: any) =>
+      (provider.compressedRolloutsToSend = () => ({ compressed: ['rollout.jsonl.zst'], compressedStores: {} })),
+  ],
+])('a walk after a settled reply sends one discovery request when %s', async (_name, change) => {
+  const harness = settledWalkHarness();
+  const { provider, walked, skipped, settle } = harness;
+  try {
+    await settle();
+    const before = { walked: walked(), skipped: skipped() };
+    change(harness);
+    await provider.refresh(true);
+    assert.deepEqual({ walked: walked(), skipped: skipped() }, { walked: before.walked + 1, skipped: before.skipped });
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});
+
+test('a walk after an unsettled complete reply sends another discovery request', async () => {
+  const { provider, walked, skipped, reply } = settledWalkHarness();
+  reply.settled = false;
+  try {
+    await provider.refresh(true);
+    assert.equal(walked(), 1);
+    await provider.refresh(true);
+    assert.deepEqual({ walked: walked(), skipped: skipped() }, { walked: 2, skipped: 0 });
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});
+
 // Each walk restarts the backstop clock. Only a discovery request finds a new receipt or a grown descendant of an unmoved
 // root. When the walk sends none, coverage every 30 s holds off every discovery request with no limit.
 test('coverage that walks every 30 s leaves no backstop window without a discovery request', async () => {

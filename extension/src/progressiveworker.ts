@@ -482,6 +482,8 @@ export type ProgressiveValue =
       scope?: string[];
       // The device and inode of the receipt store directory that the receipt scan read. Empty when the store was missing.
       receiptStore?: string;
+      // What the receipt scan of this pass observed, or absent when the pass proves nothing about a later store state.
+      receiptRevision?: import('./dispatchreceipts').DispatchStoreRevision;
       checkpoint?: DiscoveryCheckpoint;
     }
   | {

@@ -284,6 +284,22 @@ export interface DispatchRelationshipStep extends DispatchRelationshipAllowance 
   identities?: DispatchRelationshipIdentities;
 }
 type RelationshipScan<T> = Generator<DispatchRelationshipStep, T, DispatchRelationshipAllowance>;
+
+// The state of a receipt store that one complete relationship scan observed. The store part names the store and relationship
+// cache directories. The outside part lists each directory beyond the store that the scan checked, with its revision.
+export interface DispatchStoreRevision {
+  store: string;
+  outside: Array<[string, string | null]>;
+}
+// A write inside this margin of a stat can keep the directory's modification time on a filesystem with coarse times, so a
+// directory this young proves nothing about the next write.
+const STORE_REVISION_MARGIN_MS = 2_000;
+function relationshipRevision(stat: fs.BigIntStats | null): string | null {
+  if (!stat) return null;
+  return stat.isDirectory()
+    ? `${stat.dev}:${stat.ino}:directory`
+    : `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+}
 const emptyRelationshipStep = (): DispatchRelationshipStep => ({ entries: 0, bytes: 0, checks: 0 });
 
 // Each next call grants one filesystem operation. Zero grants preserve its position.
@@ -333,11 +349,7 @@ class RelationshipReader {
       }
     });
     if (stat?.isSymbolicLink()) throw new DispatchPathRedirected();
-    const revision = stat
-      ? stat.isDirectory()
-        ? `${stat.dev}:${stat.ino}:directory`
-        : `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`
-      : null;
+    const revision = relationshipRevision(stat);
     if (this.revisions.has(file) && this.revisions.get(file) !== revision)
       throw new Error('The dispatch relationship evidence changed.');
     this.revisions.set(file, revision);
@@ -445,6 +457,38 @@ export class DispatchReceipts {
     } catch {
       return '';
     }
+  }
+  // The device, inode and modification time of the store and relationship cache directories, or undefined when a directory is
+  // too young to prove the next write or cannot be read. Each launch step that a relationship read depends on adds or replaces
+  // an entry in the store directory, which moves its modification time.
+  storeRevision(now = Date.now()): string | undefined {
+    const paths = this.platform === 'win32' ? path.win32 : path.posix;
+    const parts: string[] = [];
+    for (const directory of [this.root, paths.dirname(this.relationshipCacheFile(''))]) {
+      let stat: fs.BigIntStats | undefined;
+      try {
+        stat = fs.lstatSync(directory, { bigint: true, throwIfNoEntry: false });
+      } catch {
+        return undefined;
+      }
+      if (stat && (!stat.isDirectory() || Number(stat.mtimeMs) > now - STORE_REVISION_MARGIN_MS)) return undefined;
+      parts.push(stat ? `${stat.dev}:${stat.ino}:${stat.mtimeNs}` : '');
+    }
+    return parts.join('\0');
+  }
+  // Whether the store and each outside directory still hold the given revision. A failed stat answers no.
+  async unchangedSince(held: DispatchStoreRevision): Promise<boolean> {
+    if (this.storeRevision() !== held.store) return false;
+    const same = await Promise.all(
+      held.outside.map(async ([file, revision]) => {
+        try {
+          return relationshipRevision(await fs.promises.lstat(file, { bigint: true })) === revision;
+        } catch (error) {
+          return revision === null && (error as NodeJS.ErrnoException).code === 'ENOENT';
+        }
+      }),
+    );
+    return same.every(Boolean);
   }
   private relationshipCacheFile(id: string): string {
     const paths = this.platform === 'win32' ? path.win32 : path.posix;

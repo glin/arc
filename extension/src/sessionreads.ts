@@ -471,6 +471,30 @@ export function sessionDiscoveryMembership(
   return sessionDiscoveryMismatch(catalog, answered) ? undefined : sessionCatalogMembership(scope, catalog);
 }
 
+// A source's revision as a walk lists it or as a scan read it.
+interface SourceRevision {
+  size: number;
+  mtimeMs: number;
+  dev?: number | string;
+  ino?: number | string;
+}
+
+// The revision of each source by normalized file. A source with a scan entry holds the revision that the scan read, so a later
+// listing that differs from the scan's cut counts as a change. Any other source holds its listed revision.
+export function discoveryMemberRevisions(
+  sources: readonly (SourceRevision & { file: string })[],
+  entries: ReadonlyArray<readonly [string, SourceRevision]> = [],
+): Map<string, string> {
+  const scanned = new Map(entries.map(([file, entry]) => [normalizeFsPath(file), entry]));
+  const revisions = new Map<string, string>();
+  for (const source of sources) {
+    const key = normalizeFsPath(source.file);
+    const { size, mtimeMs, dev, ino } = scanned.get(key) ?? source;
+    revisions.set(key, JSON.stringify([size, mtimeMs, identityText(dev), identityText(ino)]));
+  }
+  return revisions;
+}
+
 // Why a complete reply proves no membership for a catalog: `size` when it answered another number of files than the catalog
 // lists, or `identity` when it answered a file at another device or inode.
 export function sessionDiscoveryMismatch(
