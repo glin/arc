@@ -260,7 +260,7 @@ import {
   type SessionStatFacts,
   enumerateSessionFiles,
 } from './transcript';
-import { currentRecordsBySession, transcriptReadCacheKey } from './turnread';
+import { currentRecordsBySession, newCounts, transcriptReadCacheKey, type NewCount } from './turnread';
 import {
   afterHistoryPage,
   afterHistoryRequest,
@@ -12966,7 +12966,11 @@ test('a batch row added while a complete reply waits joins that reply', async ()
 
 // A held-walk provider whose counters record into plain tables, with one accepted plain row and a helper that writes
 // compressed rollouts and their batch entries.
-async function batchApplyHarness(extraScope: Record<string, unknown> = {}) {
+async function batchApplyHarness(
+  extraScope: Record<string, unknown> = {},
+  extraMethods: string[] = [],
+  prepare: (provider: any) => void = () => {},
+) {
   const held = heldWalkHarness(
     {
       readRolloutStat,
@@ -12977,7 +12981,7 @@ async function batchApplyHarness(extraScope: Record<string, unknown> = {}) {
       compressedEntrySame,
       ...extraScope,
     },
-    ['postRail'],
+    ['postRail', ...extraMethods],
   );
   const { provider, root, writeRollout, releaseAll } = held;
   const plain = writeRollout('plain');
@@ -12990,6 +12994,7 @@ async function batchApplyHarness(extraScope: Record<string, unknown> = {}) {
     recordRefresh: (reason: string) => (refreshes[reason] = (refreshes[reason] ?? 0) + 1),
     recordGauge: (name: string, value: number) => (gauges[name] = value),
   };
+  prepare(provider);
   await releaseAll(provider.refresh(true));
   for (const table of [work, refreshes]) for (const name of Object.keys(table)) delete table[name];
   const posted: string[][] = [];
@@ -13157,6 +13162,50 @@ test('a batch row that a panel shows redraws through the selected-window refresh
     [['selected-window', true, true, null, true, true]],
     'the shown row did not redraw through one selected-window refresh',
   );
+});
+
+test('a changed row posts its current unread count and later polls that change nothing keep it', async () => {
+  const { provider, entryOf, releaseAll } = await batchApplyHarness(
+    { newCounts, projectAgentRead },
+    ['glanceAt', 'metaFor', 'unreadCounts'],
+    (target) => {
+      target.lifetimeRailFacts = () => ({ rederived: { newestTurnStartedAt: 3_000 } });
+      target.readFacts = () => () => null;
+      target.saved = { ...target.saved, read: [], readTo: {}, since: 0, agentRead: [] };
+    },
+  );
+  provider.useRefreshGate(refreshWanted);
+  provider.useListingSignature(() => 'unchanged');
+  const counts: (NewCount | undefined)[] = [];
+  provider.useRailPayload((input: { counts: ReadonlyMap<string, NewCount> }) => {
+    counts.push(input.counts.get('rederived'));
+    return { rail: [], labels: [], views: [], railFilters: [], stats: {} };
+  });
+  const older = entryOf('rederived');
+  provider.applyCompressedBatch({
+    entries: [{ ...older.entry, metadataGeneration: METADATA_GENERATIONS.codex - 1 }],
+    backfillMs: 0,
+  });
+  endBatchWindow(provider);
+  await releaseAll(provider.refresh(false, true));
+  assert.equal(provider.windows.get('rederived')?.starts.length, 1, 'the older entry did not take the lifetime start');
+  const title = {
+    size: older.entry.size,
+    mtimeMs: older.entry.mtimeMs,
+    label: 'rederived',
+    fullLabel: 'rederived',
+    activityMs: null,
+    agentRun: false,
+    outcome: null,
+    stats: null,
+    starts: { starts: [1_000, 2_000, 3_000], whole: true },
+  };
+  provider.applyCompressedBatch({ entries: [{ ...older.entry, title }], backfillMs: 0 });
+  endBatchWindow(provider);
+  assert.equal(counts.at(-1)?.count, 3, 'the merge posted the unread count of the old starts');
+  await releaseAll(provider.refresh(false, true));
+  await releaseAll(provider.refresh(false, true));
+  assert.equal(counts.at(-1)?.count, 3, 'a later poll left an old unread count on the panel');
 });
 
 test('a batch whose row builder throws once keeps its rows for the next merge', async () => {

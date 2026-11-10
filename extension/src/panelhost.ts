@@ -5298,7 +5298,9 @@ export class PanelProvider implements vscode.Disposable {
     for (const session of replaced) {
       delete stats[session.sessionId];
       delete caches[session.sessionId];
+      this.windows.delete(session.sessionId);
     }
+    for (const [sessionId, starts] of this.glanceAt(rows, [])) this.windows.set(sessionId, starts);
     for (const row of rows) {
       const meta = this.metaFor(row);
       stats[row.sessionId] = sessionStatsFromFacts(derivedTitleStats(meta));
@@ -12246,7 +12248,7 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   // A bounded metadata answer wins. Complete lifetime facts fill a missing newest start.
-  private glanceAt(all: SessionFile[], _parsed: SessionFile[]): Map<string, TurnStarts> {
+  private glanceAt(all: readonly SessionFile[], _parsed: SessionFile[]): Map<string, TurnStarts> {
     const out = new Map<string, TurnStarts>();
     const lifetime = this.lifetimeRailFacts();
     for (const session of all) {
