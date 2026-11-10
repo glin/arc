@@ -15288,23 +15288,24 @@ export class PanelProvider implements vscode.Disposable {
   // True when this walk lists what the last settled reply covered, with nothing outstanding. The next pass then reads the same
   // sources and receipts and reaches the same reply.
   private async walkKeepsDiscovery(held: NonNullable<PanelProvider['settledDiscovery']>): Promise<boolean> {
-    const enumeration = this.sourceEnumerations;
-    if (
-      held.scope !== JSON.stringify(this.repositoryScopeRoots) ||
-      held.folders !== this.catalog?.folders ||
-      held.worker !== (this.progressiveWorker.currentThreadId ?? null) ||
-      this.dispatchDiscoveryPending ||
-      this.dispatchSpendPending ||
-      this.sessionQueryDiscoveryPending ||
-      this.discoveryCheckpoint !== undefined ||
-      this.codexListingSeeded ||
-      enumeration?.claude.status !== 'complete' ||
-      enumeration.codex.status !== 'complete' ||
-      !this.enumeratedAdmissionComplete ||
-      this.enumeratedAmbiguousIds?.size ||
-      this.compressedRolloutsToSend().compressed !== undefined
-    )
+    const refuse = (gate: string): false => {
+      this.performanceCounters?.recordWork?.(`discoveryRequest:walkKept:${gate}`);
       return false;
+    };
+    const enumeration = this.sourceEnumerations;
+    if (held.scope !== JSON.stringify(this.repositoryScopeRoots)) return refuse('scope');
+    if (held.folders !== this.catalog?.folders) return refuse('folders');
+    if (held.worker !== (this.progressiveWorker.currentThreadId ?? null)) return refuse('worker');
+    if (this.dispatchDiscoveryPending) return refuse('membersPending');
+    if (this.dispatchSpendPending) return refuse('spendPending');
+    if (this.sessionQueryDiscoveryPending) return refuse('queryPending');
+    if (this.discoveryCheckpoint !== undefined) return refuse('checkpoint');
+    if (this.codexListingSeeded) return refuse('seededListing');
+    if (enumeration?.claude.status !== 'complete' || enumeration.codex.status !== 'complete')
+      return refuse('enumeration');
+    if (!this.enumeratedAdmissionComplete) return refuse('admission');
+    if (this.enumeratedAmbiguousIds?.size) return refuse('ambiguousIds');
+    if (this.compressedRolloutsToSend().compressed !== undefined) return refuse('compressedList');
     const unlistedChildren = await this.unlistedCodexChildren(
       this.claudeParents,
       this.enumeratedSpendSources?.children ?? this.codexSubagents,
@@ -15314,16 +15315,16 @@ export class PanelProvider implements vscode.Disposable {
       ...(this.walkedChildSources ?? []),
       ...unlistedChildren,
     ]);
-    if (listed.size !== held.members.size) return false;
-    for (const [file, revision] of listed) if (held.members.get(file) !== revision) return false;
+    if (listed.size !== held.members.size) return refuse('members');
+    for (const [file, revision] of listed) if (held.members.get(file) !== revision) return refuse('members');
     const stamps = await discoverySourceStamps(
       walkStampFiles(this.claudeParents, this.walkedChildSources, unlistedChildren),
     );
-    for (const [file, stamp] of stamps) if (held.stamps.get(file) !== stamp) return false;
+    for (const [file, stamp] of stamps) if (held.stamps.get(file) !== stamp) return refuse('stamps');
     const sidecars = await discoverySourceStamps(subagentSidecars(this.walkedChildSources ?? []));
-    if (sidecars.size !== held.sidecars.size) return false;
-    for (const [file, stamp] of sidecars) if (held.sidecars.get(file) !== stamp) return false;
-    return new DispatchReceipts().unchangedSince(held.receipts);
+    if (sidecars.size !== held.sidecars.size) return refuse('sidecars');
+    for (const [file, stamp] of sidecars) if (held.sidecars.get(file) !== stamp) return refuse('sidecars');
+    return (await new DispatchReceipts().unchangedSince(held.receipts)) || refuse('receipts');
   }
 
   // Whether a partial reply publishes the first catalog from the walked rows, because the activation has no saved links to

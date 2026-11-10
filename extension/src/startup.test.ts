@@ -15337,7 +15337,7 @@ function settledWalkHarness() {
     }
     assert.fail('the walks never kept the accepted discovery');
   };
-  return { ...harness, census, reply, walked, skipped, settle };
+  return { ...harness, census, reply, count, walked, skipped, settle };
 }
 
 test('backstop walks over an unchanged catalog after a settled reply send no discovery request', async () => {
@@ -15571,6 +15571,36 @@ test('the first walk after a worker replacement sends the request with no cache 
     provider.progressiveWorker.currentThreadId = 8;
     await provider.refresh(true);
     assert.deepEqual({ walked: walked(), skipped: skipped() }, { walked: before.walked + 1, skipped: before.skipped });
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});
+
+test('a walk that sends the request names the first gate that refused the skip', async () => {
+  const harness = settledWalkHarness();
+  const { provider, census, count, settle } = harness;
+  try {
+    await settle();
+    // The scope gate runs before the enumeration gate, and the two gates refuse together.
+    provider.repositoryScope = { snapshot: () => ({ ready: true, roots: ['project', 'other'], revision: 1 }) };
+    census.status = 'incomplete';
+    await provider.refresh(true);
+    assert.equal(count('discoveryRequest:walkKept:scope'), 1);
+    assert.equal(count('discoveryRequest:walkKept:enumeration'), 0);
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});
+
+test('a walk names a later gate when the earlier gates pass', async () => {
+  const harness = settledWalkHarness();
+  const { provider, census, count, settle } = harness;
+  try {
+    await settle();
+    census.status = 'incomplete';
+    await provider.refresh(true);
+    assert.equal(count('discoveryRequest:walkKept:scope'), 0);
+    assert.equal(count('discoveryRequest:walkKept:enumeration'), 1);
   } finally {
     vi.unstubAllEnvs();
   }
