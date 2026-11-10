@@ -15215,14 +15215,6 @@ export class PanelProvider implements vscode.Disposable {
         generation,
       )),
     ]);
-    const walkReady = membersSettled && progress.roots && progress.receiptRevision && this.epochCodexChildren;
-    const epochSidecars = walkReady ? await this.epochSidecars : undefined;
-    const heldStamps = walkReady
-      ? await discoveryHeldStamps(
-          walkStampFiles(progress.roots!, childSources, this.epochCodexChildren!),
-          progress.referenceEntries,
-        )
-      : undefined;
     if (signal.aborted || generation !== this.refreshGeneration) return false;
     const roots = this.withHeldCompressedRows(discoveryRoots.filter((root) => admittedRoots.has(root)));
     if (spendSources) {
@@ -15238,21 +15230,7 @@ export class PanelProvider implements vscode.Disposable {
       revisions: new Map(sessions.map((session) => [session.file, { ...session }])),
       settled: membersSettled,
     };
-    this.settledDiscovery =
-      walkReady && epochSidecars && heldStamps
-        ? {
-            scope: JSON.stringify(this.repositoryScopeRoots),
-            folders: this.catalog?.folders,
-            worker: this.progressiveWorker.currentThreadId ?? null,
-            members: discoveryMemberRevisions(
-              [...progress.roots!, ...(childSources ?? []), ...this.epochCodexChildren!],
-              progress.referenceEntries,
-            ),
-            stamps: heldStamps,
-            sidecars: epochSidecars,
-            receipts: progress.receiptRevision!,
-          }
-        : undefined;
+    this.settledDiscovery = undefined;
     this.updateSessionSpendSources(codex, sessions);
     if (this.catalog) {
       this.catalog = { ...this.catalog, sessions };
@@ -15261,6 +15239,28 @@ export class PanelProvider implements vscode.Disposable {
     const walked = new Set(sessions.map((session) => session.file));
     if (this.pruneDerivedTitles(walked)) {
       this.derivedCacheCheckpointState.markChanged();
+    }
+    // What later walks compare. The stamps come from stats, so this runs after the rest of the reply applies. The acceptance values
+    // are read before the stats.
+    const epochCodexChildren = this.epochCodexChildren;
+    if (membersSettled && progress.roots && progress.receiptRevision && epochCodexChildren) {
+      const receipts = progress.receiptRevision;
+      const scope = JSON.stringify(this.repositoryScopeRoots);
+      const folders = this.catalog?.folders;
+      const worker = this.progressiveWorker.currentThreadId ?? null;
+      const members = discoveryMemberRevisions(
+        [...progress.roots, ...(childSources ?? []), ...epochCodexChildren],
+        progress.referenceEntries,
+      );
+      const [sidecars, stamps] = await Promise.all([
+        this.epochSidecars,
+        discoveryHeldStamps(
+          walkStampFiles(progress.roots, childSources, epochCodexChildren),
+          progress.referenceEntries,
+        ),
+      ]);
+      if (sidecars && !signal.aborted && generation === this.refreshGeneration)
+        this.settledDiscovery = { scope, folders, worker, members, stamps, sidecars, receipts };
     }
     return true;
   }
