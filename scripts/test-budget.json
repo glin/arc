@@ -1245,6 +1245,26 @@
       "reason": "The host sends a worker request only for work that held state cannot answer. A rise means a step asks the worker to read again.",
       "budget": 1,
       "margin": 0
+    },
+    "cold start | discoveryRequest:walkKept:noBaseline": {
+      "reason": "Each walk without a settled discovery baseline counts one refusal and retains its full request.",
+      "budget": 1,
+      "margin": 0
+    },
+    "warm start | discoveryRequest:walkKept:noBaseline": {
+      "reason": "Each walk without a settled discovery baseline counts one refusal and retains its full request.",
+      "budget": 1,
+      "margin": 0
+    },
+    "poll and backstop walk | discoveryRequest:walkKept:noBaseline": {
+      "reason": "Each walk without a settled discovery baseline counts one refusal and retains its full request.",
+      "budget": 1,
+      "margin": 0
+    },
+    "collision walk | discoveryRequest:walkKept:noBaseline": {
+      "reason": "Each walk without a settled discovery baseline counts one refusal and retains its full request.",
+      "budget": 2,
+      "margin": 0
     }
   }
 }

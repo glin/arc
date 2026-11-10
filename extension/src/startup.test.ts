@@ -15321,7 +15321,7 @@ function settledWalkHarness() {
         membershipSettled: reply.settled,
         continuation: !reply.settled,
         ...(reply.entries ? { referenceEntries: reply.entries } : {}),
-        receiptRevision: { store: new DispatchReceipts().storeRevision(), evidence: [] },
+        receiptRevision: { store: new DispatchReceipts().storeRevision() },
       },
     };
   };
@@ -15339,6 +15339,59 @@ function settledWalkHarness() {
   };
   return { ...harness, census, reply, count, walked, skipped, settle };
 }
+
+test('unchanged walks request a full pass after ten minutes and skip after acceptance', async () => {
+  const { provider, walked, skipped, settle, count } = settledWalkHarness();
+  let now = Date.now();
+  vi.spyOn(Date, 'now').mockImplementation(() => now);
+  try {
+    await settle();
+    const before = { walked: walked(), skipped: skipped() };
+    for (let minute = 1; minute <= 10; minute++) {
+      now += 60_000;
+      await provider.refresh(true);
+    }
+    assert.equal(walked(), before.walked);
+    now++;
+    await provider.refresh(true);
+    assert.equal(walked(), before.walked + 1);
+    assert.equal(count('discoveryRequest:walkKept:age'), 1);
+    await provider.refresh(true);
+    assert.equal(walked(), before.walked + 1);
+    assert.equal(skipped(), before.skipped + 11);
+  } finally {
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+  }
+});
+
+test('a walk without a settled baseline counts its refusal', async () => {
+  const { provider, count } = settledWalkHarness();
+  try {
+    await provider.refresh(true);
+    assert.equal(count('discoveryRequest:walkKept:noBaseline'), 1);
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});
+
+test('the settled baseline keeps the answering worker during reply application', async () => {
+  const { provider, settle } = settledWalkHarness();
+  provider.progressiveWorker.currentThreadId = 7;
+  try {
+    await settle();
+    const prepare = provider.prepareHumanPrompts.bind(provider);
+    provider.prepareHumanPrompts = async (...args: any[]) => {
+      provider.progressiveWorker.currentThreadId = 8;
+      return prepare(...args);
+    };
+    await provider.prepareClaudeChildren(provider.refreshGeneration, new AbortController().signal);
+    assert.equal(provider.settledDiscovery.worker, 7);
+    assert.equal(await provider.walkKeepsDiscovery(provider.settledDiscovery), false);
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});
 
 test('backstop walks over an unchanged catalog after a settled reply send no discovery request', async () => {
   const { provider, walked, skipped, settle } = settledWalkHarness();

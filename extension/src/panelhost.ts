@@ -1879,6 +1879,7 @@ export class PanelProvider implements vscode.Disposable {
   // The sidecar stamps from the start of the epoch. The stats start before the request, and acceptance waits for them.
   private epochSidecars?: Promise<Map<string, string | null>>;
   private settledDiscovery?: {
+    settledAt: number;
     scope: string;
     folders: string | undefined;
     // The thread of the worker that answered the settled reply.
@@ -11338,8 +11339,8 @@ export class PanelProvider implements vscode.Disposable {
           reuseCatalog = false;
         }
       }
-      // A walk that lists what the last settled reply covered keeps the accepted discovery and sends no request.
-      if (!selectedOnly && !reuseCatalog && this.catalogWalked && this.settledDiscovery) {
+      // A walk keeps recent settled discovery when every compared input matches.
+      if (!selectedOnly && !reuseCatalog && this.catalogWalked) {
         const unchanged = await this.walkKeepsDiscovery(this.settledDiscovery);
         if (controller.signal.aborted || generation !== this.refreshGeneration) return;
         if (unchanged) {
@@ -15063,9 +15064,6 @@ export class PanelProvider implements vscode.Disposable {
           codexChildren,
           parents,
           catalog: parents,
-          ...(!this.discoveryCheckpoint && this.settledDiscovery
-            ? { receiptRevision: this.settledDiscovery.receipts }
-            : {}),
           repositoryRoots: this.repositoryScopeRoots,
           referenceEntries: [...this.claudeChildReferenceEntries],
           discovery: this.discoveryCheckpoint,
@@ -15076,6 +15074,7 @@ export class PanelProvider implements vscode.Disposable {
         acknowledge,
       )
       .catch(() => null);
+    const answeringWorker = this.progressiveWorker.currentThreadId ?? null;
     if (result && compressedList.compressed) {
       this.markCompressedRolloutsSent(compressedRevision);
       // Any reply that carries the list says how the worker took it. A request that ends another way keeps the list unsent.
@@ -15247,7 +15246,7 @@ export class PanelProvider implements vscode.Disposable {
       const receipts = progress.receiptRevision;
       const scope = JSON.stringify(this.repositoryScopeRoots);
       const folders = this.catalog?.folders;
-      const worker = this.progressiveWorker.currentThreadId ?? null;
+      const worker = answeringWorker;
       const members = discoveryMemberRevisions(
         [...progress.roots, ...(childSources ?? []), ...epochCodexChildren],
         progress.referenceEntries,
@@ -15260,7 +15259,7 @@ export class PanelProvider implements vscode.Disposable {
         ),
       ]);
       if (sidecars && !signal.aborted && generation === this.refreshGeneration)
-        this.settledDiscovery = { scope, folders, worker, members, stamps, sidecars, receipts };
+        this.settledDiscovery = { scope, folders, worker, members, stamps, sidecars, receipts, settledAt: Date.now() };
     }
     return true;
   }
@@ -15287,11 +15286,14 @@ export class PanelProvider implements vscode.Disposable {
 
   // True when this walk matches the compared inputs of the last settled reply: the roots and folders, the worker, each listed
   // source and its exact stamp, each subagent sidecar and the receipt store revision, with nothing outstanding.
-  private async walkKeepsDiscovery(held: NonNullable<PanelProvider['settledDiscovery']>): Promise<boolean> {
+  private async walkKeepsDiscovery(held: PanelProvider['settledDiscovery']): Promise<boolean> {
+    const DISCOVERY_FULL_PASS_MAX_AGE_MS = 10 * 60_000;
     const refuse = (gate: string): false => {
       this.performanceCounters?.recordWork?.(`discoveryRequest:walkKept:${gate}`);
       return false;
     };
+    if (!held) return refuse('noBaseline');
+    if (Date.now() - held.settledAt > DISCOVERY_FULL_PASS_MAX_AGE_MS) return refuse('age');
     const enumeration = this.sourceEnumerations;
     if (held.scope !== JSON.stringify(this.repositoryScopeRoots)) return refuse('scope');
     if (held.folders !== this.catalog?.folders) return refuse('folders');
@@ -15324,7 +15326,7 @@ export class PanelProvider implements vscode.Disposable {
     const sidecars = await discoverySourceStamps(subagentSidecars(this.walkedChildSources ?? []));
     if (sidecars.size !== held.sidecars.size) return refuse('sidecars');
     for (const [file, stamp] of sidecars) if (held.sidecars.get(file) !== stamp) return refuse('sidecars');
-    return (await new DispatchReceipts().unchangedSince(held.receipts)) || refuse('receipts');
+    return new DispatchReceipts().storeRevision() === held.receipts.store || refuse('receipts');
   }
 
   // Whether a partial reply publishes the first catalog from the walked rows, because the activation has no saved links to

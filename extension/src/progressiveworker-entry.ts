@@ -110,7 +110,6 @@ import {
 import {
   AgentSpendCache,
   readChildSpend,
-  childSpendBandEnd,
   childSpendRevisionKey,
   scanLinesIncremental,
   spendFileVersion,
@@ -196,17 +195,6 @@ let heldDispatchReferences: {
   scope: string;
   references: readonly import('./transcript').ClaudeChildSessionReference[];
   admittedReferences: ReturnType<typeof admittedDispatchReferences>;
-  // The receipt answer of that reply: the catalog it read and the launches it visited with their references.
-  receipts: {
-    catalog: readonly SessionFile[];
-    launches: ReadonlyMap<string, string[]>;
-    references: ReadonlyMap<string, import('./transcript').ClaudeDispatchSessionReference>;
-  };
-} | null = null;
-// The receipt revision that the host sent for this epoch.
-let requestedReceiptRevision: {
-  epoch: string | undefined;
-  revision: import('./dispatchreceipts').DispatchStoreRevision;
 } | null = null;
 // A new worker takes a dispatched file's facts from its saved reference row once.
 function seededDispatch(file: string): HeldDispatchFacts | undefined {
@@ -294,9 +282,7 @@ interface ReceiptScan {
   storeIdentity: string;
   // The store revision from before the scan opened the store, or undefined when the store proves nothing about a later read.
   storeRevision: string | undefined;
-  // Each path that decided a relationship in this scan, with its revision.
-  evidence: Map<string, string | null>;
-  // True after a refused read, or after one path answered with two revisions.
+  // True after a refused read.
   unproved: boolean;
 }
 let receiptScan: ReceiptScan | null = null;
@@ -349,9 +335,6 @@ function closeReceiptScan(cause: 'epoch' | 'store' | 'refusal'): void {
 }
 const catalogIdentity = (agent: string, sessionId: string) => JSON.stringify([agent, sessionId]);
 const catalogRowPlace = (row: SessionFile) => `${normalizeFsPath(row.file)}|${row.childTranscript === true}`;
-const catalogRowRevision = (row: SessionFile) =>
-  `${catalogRowPlace(row)}|${row.size}:${row.mtimeMs}:${String(row.dev)}:${String(row.ino)}`;
-// Names the identities whose catalog rows differ between two catalogs, by the place of each row or by the row key the caller passes.
 function changedCatalogIdentities(
   before: readonly SessionFile[],
   after: readonly SessionFile[],
@@ -989,7 +972,6 @@ async function execute(
       };
     }
     const epoch = discoveryEpoch;
-    if (request.receiptRevision) requestedReceiptRevision = { epoch: epoch.epoch, revision: request.receiptRevision };
     // The host's checkpoint as the request carried it. A receipt reply is a delta only while the epoch is that checkpoint.
     const hostCheckpoint =
       epoch === request.discovery ? { sequence: epoch.sequence, completed: epoch.completed } : null;
@@ -1508,48 +1490,6 @@ async function execute(
     // A replaced store directory starts the scan again from its first entry, here and before publication. Other store changes
     // keep the scan's position.
     if (receiptScan && receiptScan.store.storeIdentity() !== receiptScan.storeIdentity) closeReceiptScan('store');
-    // A store that keeps the revision of the last settled pass gives the same answer, so this pass reads no receipt. A launch
-    // whose catalog rows moved or whose dispatched child moved is read again against the current catalog.
-    const heldReceipts = heldDispatchReferences?.scope === scope ? heldDispatchReferences.receipts : undefined;
-    const requested = requestedReceiptRevision;
-    const requestedRevision = requested && requested.epoch === epoch.epoch ? requested.revision : undefined;
-    if (!receiptScan && heldReceipts && requestedRevision) {
-      const store = new DispatchReceipts();
-      if (await store.unchangedSince(requestedRevision)) {
-        const controller = new AbortController();
-        const launches = new Map(heldReceipts.launches);
-        const references = new Map(heldReceipts.references);
-        const placeChanged = changedCatalogIdentities(heldReceipts.catalog, epoch.catalog);
-        const revisionChanged = changedCatalogIdentities(heldReceipts.catalog, epoch.catalog, catalogRowRevision);
-        const retries: string[] = [];
-        for (const [launchId, identities] of launches) {
-          const child = identities[1];
-          if (!identities.some((identity) => placeChanged.has(identity)) && !(child && revisionChanged.has(child)))
-            continue;
-          launches.delete(launchId);
-          references.delete(launchId);
-          retries.push(launchId);
-        }
-        const scan: ReceiptScan = {
-          storeIdentity: store.storeIdentity(),
-          storeRevision: requestedRevision.store,
-          evidence: new Map(requestedRevision.evidence),
-          unproved: false,
-          epoch: epoch.epoch,
-          store,
-          controller,
-          catalog: epoch.catalog,
-          steps: store.relationships(() => scan.catalog, controller.signal),
-          launches,
-          references,
-          retries,
-          retry: null,
-          storeRead: true,
-          competitionRefused: false,
-        };
-        receiptScan = scan;
-      }
-    }
     if (!receiptScan) {
       heldReceiptCountsFor(scope).opens.push(
         receiptScanClosed ? RECEIPT_SCAN_OPEN_CHARGES[receiptScanClosed] : 'receiptScanOpensNewWorker',
@@ -1559,7 +1499,6 @@ async function execute(
       const scan: ReceiptScan = {
         storeIdentity: store.storeIdentity(),
         storeRevision: store.storeRevision(),
-        evidence: new Map(),
         unproved: false,
         epoch: epoch.epoch,
         store,
@@ -1660,11 +1599,6 @@ async function execute(
         activeReceipts.store.checkpointRelationships();
       }
       if (step.value.refusal) activeReceipts.unproved = true;
-      for (const [file, revision] of step.value.evidence ?? []) {
-        if (activeReceipts.evidence.has(file) && activeReceipts.evidence.get(file) !== revision)
-          activeReceipts.unproved = true;
-        activeReceipts.evidence.set(file, revision);
-      }
       if (step.value.refusal && ('launchId' in step.value.refusal || step.value.refusal.storeOpened))
         activeReceipts.competitionRefused = true;
       receiptSteps++;
@@ -1709,13 +1643,7 @@ async function execute(
       scope: JSON.stringify(epoch.repositoryRoots),
       references,
       admittedReferences,
-      receipts: {
-        catalog: activeReceipts.catalog,
-        launches: activeReceipts.launches,
-        references: activeReceipts.references,
-      },
     };
-    requestedReceiptRevision = null;
     recordHeldReceiptCounts(charges, scope);
     if (unsettled.unfinished) charges.unsettledUnfinishedSources!++;
     if (unsettled.deferred) charges.unsettledDeferredSources!++;
@@ -1741,7 +1669,7 @@ async function execute(
       scope: epoch.repositoryRoots,
       receiptStore: activeReceipts.storeIdentity,
       ...(activeReceipts.storeRevision !== undefined && !activeReceipts.unproved
-        ? { receiptRevision: { store: activeReceipts.storeRevision, evidence: [...activeReceipts.evidence] } }
+        ? { receiptRevision: { store: activeReceipts.storeRevision } }
         : {}),
     };
   }
@@ -2274,7 +2202,6 @@ function collectDispatchFacts(
         spendOnly &&
         revision &&
         heldValue?.settled &&
-        Date.now() < heldValue.refreshAt &&
         !heldValue.activityStale &&
         heldValue.sourceGeneration === sourceGeneration &&
         sameRevision(heldValue.revision, revision)
@@ -2317,13 +2244,10 @@ function collectDispatchFacts(
           reference.sessionId,
           codexDependencies,
         );
-      const openVersion = reference.agent === 'codex' ? codexVersion() : null;
       const tree =
-        openVersion !== null
-          ? childSpendRevisionKey('completed', openVersion, now)
+        reference.agent === 'codex'
+          ? childSpendRevisionKey('completed', codexVersion(), now)
           : claudeAgentSpendVersion(reference.file, false, subagentMetas);
-      // A settled tree inside its spend band keeps the figures of an earlier read until the band ends.
-      const bandEnd = openVersion !== null ? childSpendBandEnd('completed', openVersion, now) : null;
       if (
         held &&
         sameRevision(held.revision, revision) &&
@@ -2521,7 +2445,7 @@ function collectDispatchFacts(
       }
       const facts: DispatchSessionFacts = {
         sessionId: reference.sessionId,
-        refreshAt: active ? refreshAt : bandEnd,
+        refreshAt: active ? refreshAt : null,
         revision,
         spend,
         startedAt: spend.startedAt ?? null,
@@ -2541,7 +2465,7 @@ function collectDispatchFacts(
         tree,
         codexDependencies,
         facts,
-        refreshAt: active ? refreshAt : (bandEnd ?? Number.POSITIVE_INFINITY),
+        refreshAt: active ? refreshAt : Number.POSITIVE_INFINITY,
         person: scan,
         codexPerson,
         settled:

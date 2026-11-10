@@ -282,20 +282,14 @@ export interface DispatchRelationshipStep extends DispatchRelationshipAllowance 
   // The final step of one launch names it. Identities are present when its read reached a catalog lookup.
   launchId?: string;
   identities?: DispatchRelationshipIdentities;
-  // Each store path, and each directory or absent path outside the store, that the read of this launch checked, with its revision.
-  evidence?: Array<[string, string | null]>;
 }
+
 type RelationshipScan<T> = Generator<DispatchRelationshipStep, T, DispatchRelationshipAllowance>;
 
-// The state of a receipt store that one complete relationship scan observed. The store part names the store and relationship
-// cache directories. The evidence part lists each path that decided a relationship with its revision: every file and launch
-// directory that the scan read inside the store, every absent marker, and every directory beyond the store.
+// The root directory revisions observed before a complete receipt scan.
 export interface DispatchStoreRevision {
   store: string;
-  evidence: Array<[string, string | null]>;
 }
-// One walk checks the evidence in groups of this many stats, so other file work keeps its turn in the thread pool.
-const EVIDENCE_STAT_GROUP = 64;
 // A write inside this margin of a stat can keep the directory's modification time on a filesystem with coarse times, so a
 // directory this young proves nothing about the next write.
 const STORE_REVISION_MARGIN_MS = 2_000;
@@ -464,8 +458,7 @@ export class DispatchReceipts {
     }
   }
   // The device, inode and modification time of the store and relationship cache directories, or undefined when a directory is
-  // too young to prove the next write or cannot be read. A launch that joins or leaves moves the store directory's time. A write
-  // inside a launch directory moves no time here, so the evidence list carries those files.
+  // too young to prove the next write or cannot be read. Writes inside a launch directory wait for the full pass age bound.
   storeRevision(now = Date.now()): string | undefined {
     const paths = this.platform === 'win32' ? path.win32 : path.posix;
     const parts: string[] = [];
@@ -480,23 +473,6 @@ export class DispatchReceipts {
       parts.push(stat ? `${stat.dev}:${stat.ino}:${stat.mtimeNs}` : '');
     }
     return parts.join('\0');
-  }
-  // Whether the store and each evidence path still hold the given revision. A failed stat answers no.
-  async unchangedSince(held: DispatchStoreRevision): Promise<boolean> {
-    if (this.storeRevision() !== held.store) return false;
-    for (let start = 0; start < held.evidence.length; start += EVIDENCE_STAT_GROUP) {
-      const same = await Promise.all(
-        held.evidence.slice(start, start + EVIDENCE_STAT_GROUP).map(async ([file, revision]) => {
-          try {
-            return relationshipRevision(await fs.promises.lstat(file, { bigint: true })) === revision;
-          } catch (error) {
-            return revision === null && (error as NodeJS.ErrnoException).code === 'ENOENT';
-          }
-        }),
-      );
-      if (!same.every(Boolean)) return false;
-    }
-    return true;
   }
   private relationshipCacheFile(id: string): string {
     const paths = this.platform === 'win32' ? path.win32 : path.posix;
@@ -551,7 +527,6 @@ export class DispatchReceipts {
         launchId: id,
         ...(reader.identities ? { identities: reader.identities } : {}),
         ...(reference ? { reference } : {}),
-        evidence: this.evidenceRevisions(reader),
       };
       reader.progress = emptyRelationshipStep();
       return reference;
@@ -561,20 +536,11 @@ export class DispatchReceipts {
         launchId: id,
         ...(reader.identities ? { identities: reader.identities } : {}),
         ...(reader.refusal ? { refusal: { ...reader.refusal, launchId: id } } : {}),
-        evidence: this.evidenceRevisions(reader),
       };
       return null;
     } finally {
       reader.dispose();
     }
-  }
-  // A file outside the store is a child transcript or the relationship cache file. The walk's member list and the cache
-  // directory's time answer for those.
-  private evidenceRevisions(reader: RelationshipReader): Array<[string, string | null]> {
-    return [...reader.revisions].filter(
-      ([file, revision]) =>
-        revision === null || revision.endsWith(':directory') || !outsideDispatchStorage(this.root, file, this.platform),
-    );
   }
   // Each iterator is one epoch. New epochs revisit delayed bindings and changed catalog scope.
   *relationships(

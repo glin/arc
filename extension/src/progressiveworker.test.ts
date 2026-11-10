@@ -3,6 +3,8 @@ import { revisionOf } from './transcript';
 import { beforeAll, test, vi } from 'vitest';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
+import mutableFs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import * as zlib from 'node:zlib';
 import { createHash } from 'node:crypto';
 import { tempDir } from './temproot.ts';
@@ -1109,6 +1111,11 @@ async function receiptDiscoveryHost(
 // A real receipt store and worker behind the host's walk gate. `age` moves the store directories past the recent-write margin
 // to a time no other call used, so a later write still moves their modification time.
 async function receiptWalkHarness(prefix = (_fx: ReturnType<typeof receiptDispatchFixture>) => '') {
+  let now = Date.now();
+  vi.spyOn(Date, 'now').mockImplementation(() => now);
+  const advance = () => {
+    now += 10 * 60_000 + 1;
+  };
   const root = tempDir('receipt-walk-');
   const fx = receiptDispatchFixture(root, 'claude', 'claude');
   fs.mkdirSync(fx.receipts.root, { recursive: true });
@@ -1154,7 +1161,7 @@ async function receiptWalkHarness(prefix = (_fx: ReturnType<typeof receiptDispat
     age();
     await pass();
   };
-  return { fx, root, worker, host, pass, walk, age, settle, checks: () => checks };
+  return { fx, root, worker, host, pass, walk, age, settle, advance, checks: () => checks };
 }
 
 test('an unchanged receipt store records zero receipt checks across three walks', async () => {
@@ -1164,13 +1171,20 @@ test('an unchanged receipt store records zero receipt checks across three walks'
     await settle();
     const before = checks();
     assert.ok(before > 0, 'the settling passes read no receipt');
+    const stat = vi.spyOn(mutableFs, 'lstatSync');
+    syncBuiltinESMExports();
+    const asyncStat = vi.spyOn(fs.promises, 'lstat');
     for (let index = 0; index < 3; index++) {
       if (await walk()) continue;
       await pass();
       assert.fail('a walk over an unchanged store started a pass');
     }
     assert.equal(checks(), before);
+    assert.equal(stat.mock.calls.length, 6);
+    assert.equal(asyncStat.mock.calls.length, 0);
   } finally {
+    vi.restoreAllMocks();
+    syncBuiltinESMExports();
     worker.stop();
     vi.unstubAllEnvs();
   }
@@ -1218,13 +1232,15 @@ test('a replaced directory outside the store that a receipt checked starts a pas
   }
 });
 
-test('a deleted startup binding of an accepted launch starts a pass at the next walk', async () => {
-  const { fx, worker, walk, settle } = await receiptWalkHarness();
+test('a deleted startup binding of an accepted launch starts a pass at the age bound', async () => {
+  const { fx, worker, walk, settle, advance } = await receiptWalkHarness();
   try {
     const { launchId } = fx.launch();
     await settle();
     assert.equal(await walk(), true);
     fs.rmSync(path.join(fx.receipts.root, launchId, 'startup.json'));
+    assert.equal(await walk(), true);
+    advance();
     assert.equal(await walk(), false, 'the walk kept discovery over a deleted startup binding');
   } finally {
     worker.stop();
@@ -1239,27 +1255,38 @@ test.each([
   ['the accepted witness', (id: string) => `${id}.accepted.json`],
   ['the startup binding', (id: string) => `${id}/startup.json`],
   ['the startup witness', (id: string) => `${id}.startup.json`],
-])('an in-place write of %s starts a pass at the next walk', async (_name, name) => {
-  const { fx, worker, walk, settle } = await receiptWalkHarness();
+])('an in-place write of %s reaches the reader at the age bound', async (_name, name) => {
+  const { fx, worker, walk, settle, advance, pass, checks } = await receiptWalkHarness();
   try {
     const { launchId } = fx.launch();
     await settle();
     assert.equal(await walk(), true);
     fs.appendFileSync(path.join(fx.receipts.root, name(launchId)), ' ');
-    assert.equal(await walk(), false, 'the walk kept discovery over a rewritten evidence file');
+    assert.equal(await walk(), true);
+    advance();
+    assert.equal(await walk(), false);
+    const before = checks();
+    const reply = await pass();
+    assert.ok(checks() > before, 'the age bound pass read no receipt');
+    assert.equal(
+      reply.references.some((reference) => reference.sessionId === fx.child.sessionId),
+      !name(launchId).includes('/'),
+    );
   } finally {
     worker.stop();
     vi.unstubAllEnvs();
   }
 });
 
-test('a refusal marker that joins an accepted launch starts a pass at the next walk', async () => {
-  const { fx, worker, walk, settle } = await receiptWalkHarness();
+test('a refusal marker that joins an accepted launch starts a pass at the age bound', async () => {
+  const { fx, worker, walk, settle, advance } = await receiptWalkHarness();
   try {
     const { launchId } = fx.launch();
     await settle();
     assert.equal(await walk(), true);
     fs.writeFileSync(path.join(fx.receipts.root, launchId, 'startup-refused.json'), '{}');
+    assert.equal(await walk(), true);
+    advance();
     assert.equal(await walk(), false, 'the walk kept discovery over a new refusal marker');
   } finally {
     worker.stop();
@@ -1294,8 +1321,40 @@ test('a refused receipt read leaves no store revision until a clean pass', async
     assert.equal((await pass()).receiptRevision, undefined, 'a refused scan still reported a store revision');
     assert.equal(host.settledDiscovery, undefined, 'a refused scan armed the walk gate');
     fs.rmSync(marker);
+    const reply = await pass();
+    assert.ok(reply.references.some((reference) => reference.sessionId === fx.child.sessionId));
     await settle();
     assert.equal(await walk(), true, 'a clean scan armed no walk gate');
+  } finally {
+    worker.stop();
+    vi.unstubAllEnvs();
+  }
+});
+
+test('a refused store scan leaves no receipt answer for the next walked request', async () => {
+  const marker = path.join(tempDir('receipt-store-refusal-'), 'refuse');
+  const { fx, worker, host, pass, settle, checks } = await receiptWalkHarness(
+    (fx) =>
+      `const faultFs=require('node:fs'),faultStat=faultFs.lstatSync;faultFs.lstatSync=function(p,...a){if(faultFs.existsSync(${JSON.stringify(marker)})&&String(p)===${JSON.stringify(fx.receipts.root)})throw Object.assign(new Error('The receipt store is unavailable.'),{code:'EPERM'});return faultStat.call(this,p,...a);};`,
+  );
+  try {
+    fx.launch();
+    await settle();
+    const baseline = host.settledDiscovery;
+    host.settledDiscovery = undefined;
+    fs.writeFileSync(marker, '');
+    const refused = await pass();
+    assert.equal(refused.receiptRevision, undefined);
+    assert.equal(
+      refused.references.some((reference) => reference.kind === 'dispatch'),
+      false,
+    );
+    host.settledDiscovery = baseline;
+    fs.rmSync(marker);
+    const before = checks();
+    const reply = await pass();
+    assert.ok(checks() > before, 'the request after refusal read no receipt');
+    assert.ok(reply.references.some((reference) => reference.sessionId === fx.child.sessionId));
   } finally {
     worker.stop();
     vi.unstubAllEnvs();
@@ -1312,7 +1371,7 @@ function growTranscript(row: { file: string; size: number; mtimeMs: number }) {
   Object.assign(row, revisionOf(fs.statSync(row.file, { bigint: true })));
 }
 
-test('a member change reuses the held receipt answer across three walked requests', async () => {
+test('a member change scans receipts across three walked requests', async () => {
   const { fx, worker, pass, walk, settle, checks } = await receiptWalkHarness();
   try {
     fx.launch();
@@ -1328,10 +1387,13 @@ test('a member change reuses the held receipt answer across three walked request
         reply.references.some(
           (reference) => reference.kind === 'dispatch' && reference.sessionId === fx.child.sessionId,
         ),
-        'the reused answer lost its dispatched child',
+        'the full receipt scan lost its dispatched child',
       );
     }
-    assert.deepEqual(costs.slice(1), [0, 0], `receipt checks by walk: ${costs.join(', ')}`);
+    assert.ok(
+      costs.every((cost) => cost > 0),
+      `receipt checks by walk: ${costs.join(', ')}`,
+    );
   } finally {
     worker.stop();
     vi.unstubAllEnvs();
@@ -1379,7 +1441,7 @@ test('a worker with no held references scans the store in full', async () => {
   }
 });
 
-test('a reused receipt answer checks the opening of a dispatched child whose file moved', async () => {
+test('a full receipt scan checks the opening of a dispatched child whose file moved', async () => {
   const { fx, worker, pass, settle } = await receiptWalkHarness();
   try {
     fx.launch();
@@ -1396,7 +1458,7 @@ test('a reused receipt answer checks the opening of a dispatched child whose fil
       !reply.references.some(
         (reference) => reference.kind === 'dispatch' && reference.sessionId === fx.child.sessionId,
       ),
-      'the reused answer kept a dispatched child whose opening changed',
+      'the full receipt scan kept a dispatched child whose opening changed',
     );
   } finally {
     worker.stop();
@@ -13180,7 +13242,7 @@ test('a new worker resolves unchanged Claude children from saved heads and rerea
   }
 });
 
-test('a spend band that expires makes a spend-only request read the grown descendant', async () => {
+test('a grown descendant refreshes at the full pass age bound after its spend band expires', async () => {
   const directory = tempDir('spend-band-');
   const codexId = 'aaaaaaaa-1111-1111-1111-111111111111';
   const parentFile = path.join(directory, 'parent.jsonl');
@@ -13264,9 +13326,24 @@ test('a spend band that expires makes a spend-only request read the grown descen
     `performance.now = () => 0; const bandClock = require('node:fs'); Date.now = () => Number(bandClock.readFileSync(${JSON.stringify(clockFile)}, 'utf8'));` +
       source,
   );
+  const { host, replies } = await receiptDiscoveryHost(worker, [directory], request().parents);
+  Object.assign(host, {
+    sourceEnumerations: { claude: { status: 'complete' }, codex: { status: 'complete' } },
+    enumeratedAdmissionComplete: true,
+    enumeratedAmbiguousIds: new Set(),
+    codexListingSeeded: false,
+    walkedChildSources: [],
+    compressedRolloutsToSend: () => ({}),
+  });
+  vi.spyOn(Date, 'now').mockImplementation(() => Number(fs.readFileSync(clockFile, 'utf8')));
+  let requests = 0;
   const fullPass = async () => {
     for (let pass = 0; pass < 60; pass++) {
-      const result = await worker.run(request(), pass + 1, new AbortController().signal);
+      host.refreshGeneration = ++requests;
+      host.claudeParents = request().parents;
+      host.codexSubagents = request().codexChildren;
+      assert.equal(await host.prepareClaudeChildren(requests, new AbortController().signal), true);
+      const result = replies.last;
       assert.ok(result?.value.kind === 'claude-children' || result?.value.kind === 'claude-children-progress');
       if (result.value.kind === 'claude-children' && !result.value.continuation) return result.value;
     }
@@ -13291,12 +13368,17 @@ test('a spend band that expires makes a spend-only request read the grown descen
     setClock(start + 3_000);
     const inBand = await fullPass();
     assert.equal(figure(inBand.dispatchFacts), 8, 'the full pass inside the band read the grown descendant');
-    const deadline = inBand.dispatchFacts.find((fact) => fact.sessionId === codexId)?.refreshAt;
-    assert.ok(deadline && deadline <= start + 9_000, `the held spend tree named no band deadline: ${deadline}`);
-    setClock(start + 9_000);
-    const expired = await worker.run({ ...request(), spendOnly: true }, 99, new AbortController().signal);
-    assert.ok(expired?.value.kind === 'dispatch-spend' && expired.value.held);
-    assert.ok(figure(expired.value.dispatchFacts)! > 8, 'the expired band kept the earlier figure');
+    assert.equal(inBand.dispatchFacts.find((fact) => fact.sessionId === codexId)?.refreshAt, null);
+    host.sessionQueryDiscoveryPending = false;
+    const before = requests;
+    for (let minute = 1; minute <= 10; minute++) {
+      setClock(start + 3_000 + minute * 60_000);
+      if (!(await host.walkKeepsDiscovery(host.settledDiscovery))) await fullPass();
+      assert.equal(requests, before, 'an unchanged walk sent a request before the age bound');
+    }
+    setClock(start + 3_000 + 10 * 60_000 + 1);
+    assert.equal(await host.walkKeepsDiscovery(host.settledDiscovery), false);
+    assert.ok(figure((await fullPass()).dispatchFacts)! > 8, 'the full pass kept the earlier figure');
   } finally {
     worker.stop();
     fs.rmSync(directory, { recursive: true, force: true });
