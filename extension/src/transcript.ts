@@ -10147,9 +10147,8 @@ export function claudeSubagentMetaOf(text: string, id: string, file: string): Cl
   };
 }
 
-// Parsed meta files by path. Claude Code writes a meta file once, when the subagent starts, so a
-// parsed file stays true while the folder lists it. A file that does not parse yet is read again.
-const subagentMetaFiles = new Map<string, ClaudeSubagentMeta>();
+// Parsed sidecars retain the exact file stamp of their read.
+const subagentMetaFiles = new Map<string, { stamp: string; meta: ClaudeSubagentMeta }>();
 const SUBAGENT_META_LIMIT = 5000;
 
 export function readClaudeSubagentMetas(directory: string): ClaudeSubagentMeta[] {
@@ -10166,7 +10165,16 @@ export function readClaudeSubagentMetas(directory: string): ClaudeSubagentMeta[]
       continue;
     }
     const metaFile = path.join(directory, name);
-    let meta = subagentMetaFiles.get(metaFile);
+    let stamp: string;
+    try {
+      const stat = fs.statSync(metaFile, { bigint: true });
+      stamp = [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].join(':');
+    } catch {
+      subagentMetaFiles.delete(metaFile);
+      continue;
+    }
+    const held = subagentMetaFiles.get(metaFile);
+    let meta = held?.stamp === stamp ? held.meta : undefined;
     if (!meta) {
       let text: string;
       try {
@@ -10181,7 +10189,7 @@ export function readClaudeSubagentMetas(directory: string): ClaudeSubagentMeta[]
       if (subagentMetaFiles.size >= SUBAGENT_META_LIMIT) {
         subagentMetaFiles.clear();
       }
-      subagentMetaFiles.set(metaFile, meta);
+      subagentMetaFiles.set(metaFile, { stamp, meta });
     }
     metas.push(meta);
   }

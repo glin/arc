@@ -3,6 +3,7 @@ import { claudeLoopWake, claudeWakeupCall, claudeWakeupSequence } from './turnfi
 import { test, vi } from 'vitest';
 import { agentRunAnswer } from './turnrail';
 import {
+  readClaudeSubagentMetas,
   enumerateClaudeChildSources,
   enumerateClaudeChildSourceSteps,
   enumerateSessionFiles,
@@ -19288,4 +19289,15 @@ test('scheduled turns leave ownership and agent-run filing as the same session w
   assert.equal(verdict(without), true);
   assert.equal(verdict(records), true);
   assert.equal(readSessionMeta(writeTranscript(records)).title, readSessionMeta(writeTranscript(without)).title);
+});
+
+test('a rewritten subagent sidecar updates its parsed parent', () => {
+  const directory = tempDir('sidecar-parent-');
+  const file = path.join(directory, 'agent-child.meta.json');
+  fs.writeFileSync(file, JSON.stringify({ parentAgentId: 'first' }));
+  fs.utimesSync(file, 100, 100);
+  assert.equal(readClaudeSubagentMetas(directory)[0].parentAgentId, 'first');
+  fs.writeFileSync(file, JSON.stringify({ parentAgentId: 'other' }));
+  fs.utimesSync(file, 101, 101);
+  assert.equal(readClaudeSubagentMetas(directory)[0].parentAgentId, 'other');
 });
