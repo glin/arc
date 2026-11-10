@@ -1496,21 +1496,22 @@ export interface CompressedPendingInput {
   // The stat that the store compares its entries with. A test supplies a fake stat.
   statOf?: typeof compressedPhysicalStat;
   exists?: (file: string) => boolean;
-  // The unreadable marks that the store held before this launch, from `compressedUnreadableMarks`.
+  // The unreadable marks that each store held before this launch, from `compressedUnreadableMarks`.
   earlierMarks?: ReadonlySet<string>;
 }
 
-const unreadableMarkOf = (entry: CompressedFactEntry) => JSON.stringify([entry.file, entry.unreadableLaunch ?? null]);
+const unreadableMarkOf = (store: string, entry: CompressedFactEntry) =>
+  JSON.stringify([store, entry.file, entry.unreadableLaunch ?? null]);
 
-// The entries of every workspace store under a run's Arc home.
+// The entries of each workspace store under a run's Arc home, by the name of its workspace directory.
 function readWorkspaceFacts(
   home: string,
   statOf: typeof compressedPhysicalStat,
-): { facts: Map<string, CompressedFactEntry>; failed: boolean } {
+): { stores: Map<string, Map<string, CompressedFactEntry>>; failed: boolean } {
   const cache = path.join(home, 'cache');
   let failed = false;
   const onUnreadable = () => (failed = true);
-  const facts = new Map<string, CompressedFactEntry>();
+  const stores = new Map<string, Map<string, CompressedFactEntry>>();
   let workspaces: fs.Dirent[] = [];
   try {
     workspaces = fs.readdirSync(cache, { withFileTypes: true });
@@ -1520,9 +1521,9 @@ function readWorkspaceFacts(
   for (const workspace of workspaces) {
     if (!workspace.isDirectory() || workspace.name === COMPRESSED_STORES.openings) continue;
     const read = readCompressedStore(path.join(cache, workspace.name, COMPRESSED_STORES.facts), statOf, onUnreadable);
-    for (const [file, entry] of read.entries) facts.set(file, entry);
+    stores.set(workspace.name, read.entries);
   }
-  return { facts, failed };
+  return { stores, failed };
 }
 
 // The unreadable marks of a run's seeded store. The runner reads them before the launch, because a later read also holds
@@ -1531,21 +1532,24 @@ export function compressedUnreadableMarks(
   home: string,
   statOf: typeof compressedPhysicalStat = compressedPhysicalStat,
 ): Set<string> {
-  const { facts, failed } = readWorkspaceFacts(home, statOf);
+  const { stores, failed } = readWorkspaceFacts(home, statOf);
   if (failed) throw new Error('The seeded compressed facts store is not readable.');
-  return new Set([...facts.values()].filter((entry) => entry.unreadable).map(unreadableMarkOf));
+  const marks = new Set<string>();
+  for (const [store, entries] of stores)
+    for (const entry of entries.values()) if (entry.unreadable) marks.add(unreadableMarkOf(store, entry));
+  return marks;
 }
 
 // Count the names a measured launch still decodes. An admitted file counts without a current decoded entry in the
 // workspace store. Any other name counts without a `.jsonl` twin and without a current opening in the machine store,
 // because the launch reads its first record otherwise. An entry that this launch marked unreadable at the file's current
 // revision counts as settled, because this launch gets no decoded length and no opening for that revision. A mark that
-// the seeded store held leaves its name pending, because another launch retries the revision. A failed read of a store
-// counts every name until the next read.
+// its own store held before the launch leaves its name pending, because another launch retries the revision. A failed
+// read of a store counts every name until the next read.
 export function compressedPending(home: string, input: CompressedPendingInput): number {
   const statOf = input.statOf ?? compressedPhysicalStat;
   const exists = input.exists ?? fs.existsSync;
-  const { facts, failed: factsFailed } = readWorkspaceFacts(home, statOf);
+  const { stores, failed: factsFailed } = readWorkspaceFacts(home, statOf);
   let failed = factsFailed;
   const openings = readCompressedStore(path.join(home, 'cache', COMPRESSED_STORES.openings), statOf, () => {
     failed = true;
@@ -1555,16 +1559,21 @@ export function compressedPending(home: string, input: CompressedPendingInput): 
   for (const file of input.names) {
     if (exists(file.slice(0, -'.zst'.length))) continue;
     const stat = statOf(file);
-    const marked = facts.get(file);
-    if (
-      marked?.unreadable &&
-      compressedEntryCurrent(marked, stat) &&
-      !input.earlierMarks?.has(unreadableMarkOf(marked))
-    )
-      continue;
+    const settled = [...stores].some(([store, entries]) => {
+      const marked = entries.get(file);
+      return (
+        marked?.unreadable &&
+        compressedEntryCurrent(marked, stat) &&
+        !input.earlierMarks?.has(unreadableMarkOf(store, marked))
+      );
+    });
+    if (settled) continue;
     if (input.admitted.has(file)) {
-      const entry = facts.get(file);
-      if (!entry || entry.decodedLength === undefined || !compressedEntryCurrent(entry, stat)) pending++;
+      const decoded = [...stores.values()].some((entries) => {
+        const entry = entries.get(file);
+        return entry && entry.decodedLength !== undefined && compressedEntryCurrent(entry, stat);
+      });
+      if (!decoded) pending++;
     } else {
       const entry = openings.get(file);
       if (!entry || !compressedEntryCurrent(entry, stat)) pending++;

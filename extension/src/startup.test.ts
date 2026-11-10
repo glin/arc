@@ -12545,6 +12545,46 @@ test('an unreadable mark from an earlier launch leaves its name pending until th
   assert.equal(compressedPending(home, input), 0, 'a mark of this launch did not settle its name');
 });
 
+test('a store settles a name against its own seeded marks when two stores mark the same file', () => {
+  const file = 'marked-twice.zst';
+  const entry = (fields: object) => ({
+    file,
+    pairKey: file,
+    ...pendingVersions,
+    size: pendingStat.size,
+    mtimeMs: pendingStat.mtimeMs,
+    ...fields,
+  });
+  const mark = (launch: string) =>
+    entry({ complete: false, nameOnly: true, unreadable: true, unreadableLaunch: launch });
+  const seeded = (prefix: string) => {
+    const { home, facts } = pendingStores(prefix);
+    const others = ['a-other', 'z-other'].map((name) => {
+      const store = path.join(home, 'cache', name, COMPRESSED_STORES.facts);
+      fs.mkdirSync(store, { recursive: true });
+      return store;
+    });
+    for (const store of [facts, ...others]) writeSegment(store, [mark('seeded')]);
+    const input = {
+      names: [file],
+      admitted: new Set([file]),
+      statOf: () => pendingStat,
+      exists: () => false,
+      earlierMarks: compressedUnreadableMarks(home, () => pendingStat),
+    };
+    assert.equal(compressedPending(home, input), 1, 'a seeded mark settled its name');
+    return { home, input, stores: [facts, ...others] };
+  };
+  for (const measured of [0, 1, 2]) {
+    const marked = seeded(`pending-two-stores-mark-${measured}-`);
+    writeSegment(marked.stores[measured], [mark('this-launch')]);
+    assert.equal(compressedPending(marked.home, marked.input), 0, `store ${measured} lost its mark of this launch`);
+    const decoded = seeded(`pending-two-stores-decoded-${measured}-`);
+    writeSegment(decoded.stores[measured], [entry({ decodedLength: 9 })]);
+    assert.equal(compressedPending(decoded.home, decoded.input), 0, `store ${measured} lost its decoded entry`);
+  }
+});
+
 test('the runner reads the seeded unreadable marks before it launches the editor', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'panel-startup-measure', 'measure.ts'), 'utf8');
   const read = source.indexOf('await compressedPendingInput(options, workspace, ARC_STORE)');
