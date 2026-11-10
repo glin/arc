@@ -2042,7 +2042,7 @@ test('a warm-up hold fails at the limit that the run names', async () => {
 });
 
 test('--warm-cap-minutes refuses a value that does not bound the hold', () => {
-  const refusal = (value: string) => {
+  const refusal = (...value: string[]) => {
     const written: string[] = [];
     const write = vi.spyOn(process.stderr, 'write').mockImplementation((text) => {
       written.push(String(text));
@@ -2052,7 +2052,11 @@ test('--warm-cap-minutes refuses a value that does not bound the hold', () => {
       throw new Error('stopped');
     });
     try {
-      assert.throws(() => readOptions(['--fixture', 'f', '--warm-cap-minutes', value]), /stopped/, `${value} passed`);
+      assert.throws(
+        () => readOptions(['--fixture', 'f', '--warm-cap-minutes', ...value]),
+        /stopped/,
+        `${value} passed`,
+      );
     } finally {
       write.mockRestore();
       exit.mockRestore();
@@ -2060,8 +2064,11 @@ test('--warm-cap-minutes refuses a value that does not bound the hold', () => {
     return written.join('');
   };
   for (const value of ['1', '5.5']) assert.match(refusal(value), /--warm-cap-minutes .*above 5\.5/);
-  for (const value of ['1e308', 'Infinity']) assert.match(refusal(value), /--warm-cap-minutes .*at most/);
+  for (const value of ['1441', '1e300', '1e308', 'Infinity'])
+    assert.match(refusal(value), /--warm-cap-minutes .*above 5\.5.*at most 1440/);
+  assert.match(refusal(), /--warm-cap-minutes .*above 5\.5.*at most 1440/);
   assert.equal(readOptions(['--fixture', 'f', '--warm-cap-minutes', '5.6']).warmCapMinutes, 5.6);
+  assert.equal(readOptions(['--fixture', 'f', '--warm-cap-minutes', '1440']).warmCapMinutes, 1440);
 });
 
 test('a comparison refuses a warm-up limit before any build starts', async () => {
@@ -2083,9 +2090,11 @@ test('a comparison refuses a warm-up limit before any build starts', async () =>
         installed: () => null,
       },
     );
-  await assert.rejects(compare('--warm-cap-minutes'), /--warm-cap-minutes .*above 5\.5/);
+  await assert.rejects(compare('--warm-cap-minutes'), /--warm-cap-minutes .*above 5\.5.*at most 1440/);
   await assert.rejects(compare('--warm-cap-minutes', '5.5'), /--warm-cap-minutes .*above 5\.5/);
-  await assert.rejects(compare('--warm-cap-minutes', '1e308'), /--warm-cap-minutes .*at most/);
+  await assert.rejects(compare('--warm-cap-minutes', '1441'), /--warm-cap-minutes .*above 5\.5.*at most 1440/);
+  await assert.rejects(compare('--warm-cap-minutes', '1e300'), /--warm-cap-minutes .*above 5\.5.*at most 1440/);
+  await assert.rejects(compare('--warm-cap-minutes', '1e308'), /--warm-cap-minutes .*above 5\.5.*at most 1440/);
   assert.equal(launches, 0, 'a build started for a limit that the runner refuses');
 });
 

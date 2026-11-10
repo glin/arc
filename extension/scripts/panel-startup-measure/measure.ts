@@ -210,7 +210,7 @@ export function readOptions(argv: string[]): Options {
       continue;
     }
     if (value === undefined) {
-      stop(`${flag} takes a value.`);
+      stop((flag === '--warm-cap-minutes' && warmCapRefusal(NaN)) || `${flag} takes a value.`);
     }
     if (value.startsWith('--')) {
       stop(`${flag} takes a value, and ${value} is another option.`);
@@ -1240,14 +1240,14 @@ export const WARM_UP_OPEN_MS = 5.5 * 60_000;
 // the warm-up launch.
 export const WARM_UNTIL_INTERVAL_MS = 15_000;
 export const WARM_UNTIL_CAP_MS = 30 * 60_000;
+// The longest limit of a hold, in minutes. A hold with a longer limit has a deadline that no run reaches.
+const WARM_CAP_MAX_MINUTES = 1440;
 // The reason that a number of minutes cannot limit a hold, or null when it can. A hold keeps the warm-up open for the
 // minimum open time before its first deadline check, so a limit at or below that time never bounds it.
 export function warmCapRefusal(minutes: number): string | null {
   const minimum = WARM_UP_OPEN_MS / 60_000;
-  if (!(minutes > minimum)) return `--warm-cap-minutes takes a number of minutes above ${minimum}.`;
-  if (!Number.isFinite(minutes * 60_000))
-    return `--warm-cap-minutes takes at most ${Number.MAX_VALUE / 60_000} minutes.`;
-  return null;
+  if (minutes > minimum && minutes <= WARM_CAP_MAX_MINUTES) return null;
+  return `--warm-cap-minutes takes a number of minutes above ${minimum} and at most ${WARM_CAP_MAX_MINUTES}.`;
 }
 
 // The hold checks the warm-up editor at this interval while it keeps the minimum open time.
