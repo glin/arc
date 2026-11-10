@@ -544,6 +544,43 @@ export async function discoverySourceStamps(files: readonly string[]): Promise<M
   return stamps;
 }
 
+// The transcripts that a walk compares exactly: each Claude parent and child transcript, and each unlisted Codex child.
+export function walkStampFiles(
+  parents: readonly { file: string; agent: string }[],
+  children: readonly { file: string }[] | undefined,
+  unlisted: readonly { file: string }[],
+): string[] {
+  return [...parents.filter((parent) => parent.agent !== 'codex'), ...(children ?? []), ...unlisted].map(
+    ({ file }) => file,
+  );
+}
+
+interface AcceptedSource {
+  claudeCursor?: { evidence?: { accepted: SourceStamp | null } };
+  cursor?: { evidence?: { accepted: SourceStamp | null } };
+  evidence?: { accepted: SourceStamp | null };
+}
+
+// The stamp that discovery holds for each source: the stamp the worker accepted for a scanned source, or the stat at this call
+// for a source with no accepted stamp.
+export async function discoveryHeldStamps(
+  files: readonly string[],
+  entries: ReadonlyArray<readonly [string, AcceptedSource]>,
+): Promise<Map<string, string | null>> {
+  const accepted = new Map<string, string>();
+  for (const [file, entry] of entries) {
+    const stamp = (entry.claudeCursor?.evidence ?? entry.cursor?.evidence ?? entry.evidence)?.accepted;
+    if (stamp) accepted.set(normalizeFsPath(file), sourceStampText(stamp));
+  }
+  const stats = await discoverySourceStamps(files.filter((file) => !accepted.has(normalizeFsPath(file))));
+  return new Map(
+    files.map((file) => {
+      const key = normalizeFsPath(file);
+      return [key, accepted.get(key) ?? stats.get(key) ?? null];
+    }),
+  );
+}
+
 // The launch sidecar beside each Claude child transcript. The dispatched spend tree reads these files through its folder.
 export function subagentSidecars(children: readonly { file: string }[]): string[] {
   return children.flatMap(({ file }) =>

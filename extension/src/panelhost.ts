@@ -75,6 +75,8 @@ import {
   sessionCatalogMembership,
   sessionDiscoveryMembership,
   discoveryMemberRevisions,
+  discoveryHeldStamps,
+  walkStampFiles,
   discoverySourceStamps,
   subagentSidecars,
   sessionDiscoveryMismatch,
@@ -1880,6 +1882,7 @@ export class PanelProvider implements vscode.Disposable {
     scope: string;
     folders: string | undefined;
     members: Map<string, string>;
+    stamps: Map<string, string | null>;
     sidecars: Map<string, string | null>;
     receipts: DispatchStoreRevision;
   };
@@ -15207,8 +15210,14 @@ export class PanelProvider implements vscode.Disposable {
         generation,
       )),
     ]);
-    const epochSidecars =
-      membersSettled && progress.roots && progress.receiptRevision ? await this.epochSidecars : undefined;
+    const walkReady = membersSettled && progress.roots && progress.receiptRevision && this.epochCodexChildren;
+    const epochSidecars = walkReady ? await this.epochSidecars : undefined;
+    const heldStamps = walkReady
+      ? await discoveryHeldStamps(
+          walkStampFiles(progress.roots!, childSources, this.epochCodexChildren!),
+          progress.referenceEntries,
+        )
+      : undefined;
     if (signal.aborted || generation !== this.refreshGeneration) return false;
     const roots = this.withHeldCompressedRows(discoveryRoots.filter((root) => admittedRoots.has(root)));
     if (spendSources) {
@@ -15225,14 +15234,15 @@ export class PanelProvider implements vscode.Disposable {
       settled: membersSettled,
     };
     this.settledDiscovery =
-      membersSettled && progress.roots && progress.receiptRevision && this.epochCodexChildren && epochSidecars
+      walkReady && epochSidecars && heldStamps
         ? {
             scope: JSON.stringify(this.repositoryScopeRoots),
             folders: this.catalog?.folders,
             members: discoveryMemberRevisions(
-              [...progress.roots, ...(childSources ?? []), ...this.epochCodexChildren],
+              [...progress.roots!, ...(childSources ?? []), ...this.epochCodexChildren!],
               progress.referenceEntries,
             ),
+            stamps: heldStamps,
             sidecars: epochSidecars,
             receipts: progress.receiptRevision,
           }
@@ -15288,16 +15298,21 @@ export class PanelProvider implements vscode.Disposable {
       this.compressedRolloutsToSend().compressed !== undefined
     )
       return false;
+    const unlistedChildren = await this.unlistedCodexChildren(
+      this.claudeParents,
+      this.enumeratedSpendSources?.children ?? this.codexSubagents,
+    );
     const listed = discoveryMemberRevisions([
       ...this.claudeParents,
       ...(this.walkedChildSources ?? []),
-      ...(await this.unlistedCodexChildren(
-        this.claudeParents,
-        this.enumeratedSpendSources?.children ?? this.codexSubagents,
-      )),
+      ...unlistedChildren,
     ]);
     if (listed.size !== held.members.size) return false;
     for (const [file, revision] of listed) if (held.members.get(file) !== revision) return false;
+    const stamps = await discoverySourceStamps(
+      walkStampFiles(this.claudeParents, this.walkedChildSources, unlistedChildren),
+    );
+    for (const [file, stamp] of stamps) if (held.stamps.get(file) !== stamp) return false;
     const sidecars = await discoverySourceStamps(subagentSidecars(this.walkedChildSources ?? []));
     if (sidecars.size !== held.sidecars.size) return false;
     for (const [file, stamp] of sidecars) if (held.sidecars.get(file) !== stamp) return false;

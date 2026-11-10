@@ -36,6 +36,8 @@ import { claudeDispatchTranscript } from './turnfixtures';
 import { sessionCoverageMember, sessionPresence, reconcileSessionCollisions } from './sessioncoverage';
 import {
   discoveryMemberRevisions,
+  discoveryHeldStamps,
+  walkStampFiles,
   discoverySourceStamps,
   subagentSidecars,
   sessionSourceKey,
@@ -3333,6 +3335,8 @@ function completeDiscoveryHarness(
     reconcileSessionCollisions,
     sessionCatalogMembership,
     discoveryMemberRevisions,
+    discoveryHeldStamps,
+    walkStampFiles,
     discoverySourceStamps,
     subagentSidecars,
     DispatchReceipts,
@@ -15285,7 +15289,7 @@ test('a new transcript in a directory the stat list misses lists at the backstop
 function settledWalkHarness() {
   vi.stubEnv('ARC_HOME', tempDir('settled-walk-arc-'));
   const census = { status: 'complete' };
-  const reply = { settled: true };
+  const reply: { settled: boolean; entries?: unknown[] } = { settled: true };
   const harness = bumpedCatalogHarness(
     {
       revalidatedCatalogPaths: (sessions: SessionFile[]) => [...sessions],
@@ -15316,6 +15320,7 @@ function settledWalkHarness() {
         ...result.value,
         membershipSettled: reply.settled,
         continuation: !reply.settled,
+        ...(reply.entries ? { referenceEntries: reply.entries } : {}),
         receiptRevision: { store: new DispatchReceipts().storeRevision(), evidence: [] },
       },
     };
@@ -15412,6 +15417,104 @@ test.each(['added', 'rewritten in place', 'removed'] as const)(
     }
   },
 );
+
+// The stat that a test reports for one file, as a walk's bigint stat. Every other file takes the real stat.
+function injectFileStat(file: string, stamp: Record<string, bigint | number>) {
+  const stat = fs.promises.stat;
+  vi.spyOn(fs.promises, 'stat').mockImplementation(((name: string, options: any) =>
+    name === file ? Promise.resolve({ ...stamp }) : stat(name, options)) as any);
+}
+
+test.each([
+  ['the change time moved', { ctimeNs: 11n }],
+  ['the exact modification time moved within the millisecond', { mtimeNs: 10_000_001n }],
+] as const)(
+  'a same-size rewrite that keeps the listed modification time sends the request when %s',
+  async (_name, moved) => {
+    const harness = settledWalkHarness();
+    const { provider, walked, skipped, settle, claude } = harness;
+    const stamp: Record<string, bigint | number> = {
+      size: BigInt(claude.size),
+      mtimeMs: claude.mtimeMs,
+      mtimeNs: 10_000_000n,
+      ctimeNs: 10n,
+      dev: 1n,
+      ino: 2n,
+    };
+    injectFileStat(claude.file, stamp);
+    try {
+      await settle();
+      const before = { walked: walked(), skipped: skipped() };
+      Object.assign(stamp, moved);
+      await provider.refresh(true);
+      assert.deepEqual(
+        { walked: walked(), skipped: skipped() },
+        { walked: before.walked + 1, skipped: before.skipped },
+      );
+    } finally {
+      vi.restoreAllMocks();
+      vi.unstubAllEnvs();
+    }
+  },
+);
+
+test('a walk compares the stamp that the worker accepted', async () => {
+  const harness = settledWalkHarness();
+  const { provider, reply, skipped, claude } = harness;
+  const accepted = {
+    size: claude.size,
+    mtimeMs: claude.mtimeMs,
+    mtimeNs: '10000000',
+    ctimeNs: '10',
+    dev: 1,
+    ino: 2,
+  };
+  reply.entries = [
+    [
+      claude.file,
+      { size: claude.size, mtimeMs: claude.mtimeMs, dev: claude.dev, ino: claude.ino, evidence: { accepted } },
+    ],
+  ];
+  injectFileStat(claude.file, {
+    size: BigInt(claude.size),
+    mtimeMs: claude.mtimeMs,
+    mtimeNs: 10_000_000n,
+    ctimeNs: 11n,
+    dev: 1n,
+    ino: 2n,
+  });
+  try {
+    for (let walk = 0; walk < 4; walk++) await provider.refresh(true);
+    assert.equal(skipped(), 0, 'a walk kept discovery over a stamp that differs from the accepted stamp');
+  } finally {
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+  }
+});
+
+test('a walk skips the device and inode comparison when the volume reports inode zero', async () => {
+  const harness = settledWalkHarness();
+  const { provider, walked, skipped, settle, claude } = harness;
+  const stamp: Record<string, bigint | number> = {
+    size: BigInt(claude.size),
+    mtimeMs: claude.mtimeMs,
+    mtimeNs: 10_000_000n,
+    ctimeNs: 10n,
+    dev: 7n,
+    ino: 0n,
+  };
+  injectFileStat(claude.file, stamp);
+  try {
+    await settle();
+    const before = { walked: walked(), skipped: skipped() };
+    stamp.dev = 8n;
+    await provider.refresh(true);
+    assert.deepEqual({ walked: walked(), skipped: skipped() }, { walked: before.walked, skipped: before.skipped + 1 });
+  } finally {
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+  }
+});
 
 test('a targeted refresh after a settled reply sends its discovery request', async () => {
   const { provider, walked, skipped, settle, claude } = settledWalkHarness();
