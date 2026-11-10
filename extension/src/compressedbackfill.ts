@@ -54,8 +54,7 @@ export const BACKFILL_SLICE_MS = 50;
 const PLAN_SLICE_MS = 25;
 // How often a held slice checks that no request waits. The longest wait of a discovery request is one slice.
 const BUSY_CHECK_MS = 50;
-// The longest time a discovery request waits for a slice, because a store write or a slow read can outlast the slice's
-// own limits.
+// The longest time a discovery request waits for a slice, because a slow read can outlast the slice's own limits.
 export const BACKFILL_TURN_LIMIT_MS = 100;
 // A decode that fails or ends inside a frame runs again after each of these delays, and then saves `unreadable`.
 export const BACKFILL_RETRY_DELAYS_MS = [10_000, 60_000, 600_000] as const;
@@ -509,8 +508,8 @@ export class CompressedBackfill {
     slice.started = this.now();
   }
 
-  // Lets one slice run while discovery requests wait, and resolves when it ended. The result is null when a reader waits,
-  // or when the backfill is not parked between slices, because only a parked backfill can decode at once.
+  // Lets one slice run while discovery requests wait, and resolves when it ended. The result is null when a reader
+  // waits, or when the backfill is not parked between slices, because only a parked backfill can decode at once.
   takeTurn(): Promise<void> | null {
     if (!this.wake || this.disposed || this.options.reading?.()) return null;
     return new Promise((resolve) => {
@@ -931,8 +930,9 @@ export class CompressedBackfill {
 }
 
 // Runs discovery requests one at a time. A request that arrives during another waits, and a newer request replaces it.
-// After the first complete discovery reply of the launch, one backfill slice runs before each request, so a chain of
-// continuations leaves the backfill a share of the worker. Until that reply each request starts at once.
+// After the first complete discovery reply of the worker, one backfill slice runs before each request when the
+// backfill can decode and no reader waits, so a chain of continuations leaves the backfill a share of the worker. Until
+// that reply each request starts at once.
 export class DiscoveryQueue<Message extends { id: number }> {
   private running = false;
   private waiting: Message | undefined;
