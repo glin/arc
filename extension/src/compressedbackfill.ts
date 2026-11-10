@@ -354,13 +354,20 @@ export interface CompressedBackfillOptions {
   limits?: { recordBytes?: number; reduceAbove?: number; retainedBytes?: number };
 }
 
-type Job = { kind: 'opening' | 'body'; file: string; stat: NonNullable<ReturnType<typeof readRolloutStat>> };
+// `added` marks the opening read of a name that a later list added, so an admitted body stays at the front of the queue.
+type Job = {
+  kind: 'opening' | 'body';
+  file: string;
+  stat: NonNullable<ReturnType<typeof readRolloutStat>>;
+  added?: boolean;
+};
 
 // One worker holds one backfill per workspace store. Each list of names replaces the set. A name that the list no longer
 // holds leaves the queue, its running decode stops, and it publishes nothing.
 export class CompressedBackfill {
   private names: ReadonlySet<string> = new Set();
   private readonly events = new Set<string>();
+  private readonly added = new Set<string>();
   private readonly staleOpens = new Set<string>();
   private readonly results = new Map<string, CompressedEntrySeed>();
   private readonly retries = new Map<string, { size: number; mtimeMs: number; attempts: number; at: number }>();
@@ -410,7 +417,7 @@ export class CompressedBackfill {
   // Each list from the host is the complete set. A name that a later list adds goes first.
   setNames(list: readonly string[]): void {
     const next = new Set(list);
-    if (this.names.size) for (const name of next) if (!this.names.has(name)) this.events.add(name);
+    if (this.names.size) for (const name of next) if (!this.names.has(name)) this.added.add(name);
     this.names = next;
     if (this.decoding && !next.has(this.decoding.file)) this.decoding.controller.abort();
     this.dirty = true;
@@ -605,13 +612,15 @@ export class CompressedBackfill {
       events.push(job);
       return;
     }
-    if (entry?.adopted) {
+    const added = this.added.delete(file);
+    if (entry?.adopted && !added) {
       adopted.push(job);
       return;
     }
+    // A name that a later list added goes first, and its opening still decides whether its folder admits it.
     const opening = this.placingOpening(file, entry, stat);
-    if (opening === undefined) unplaced.push({ kind: 'opening', file, stat });
-    else if (codexRowAdmitted(opening, stat, this.inFolders)) placed.push(job);
+    if (opening === undefined) (added ? events : unplaced).push({ kind: 'opening', file, stat, added });
+    else if (codexRowAdmitted(opening, stat, this.inFolders)) (added ? events : placed).push(job);
   }
 
   // A plan that could not read a name or the store runs again after the longest retry delay.
@@ -681,7 +690,10 @@ export class CompressedBackfill {
     this.openingEntries.set(job.file, entry);
     await this.appendOpenings([entry]);
     this.unpostedMs += this.now() - started;
-    if (codexRowAdmitted(opening, job.stat, this.inFolders)) this.insertBody({ ...job, kind: 'body' });
+    if (!codexRowAdmitted(opening, job.stat, this.inFolders)) return;
+    const body: Job = { ...job, kind: 'body' };
+    if (job.added) this.queue.unshift(body);
+    else this.insertBody(body);
   }
 
   // A body of a name that its opening placed joins the queue newest first, after the remaining openings.
@@ -819,7 +831,11 @@ export class CompressedBackfill {
     }
     this.results.set(entry.file, compressedEntrySeed(entry));
     this.outbox.set(entry.file, entry);
-    if (entry.opening) {
+    // An opening read already wrote the opening of this revision.
+    const held = this.openingEntries.get(entry.file);
+    const openingWritten =
+      held?.opening && compressedEntryCurrent(held, { size: entry.size!, mtimeMs: entry.mtimeMs! });
+    if (entry.opening && !openingWritten) {
       const opening = compressedOpeningEntry(entry);
       this.openingEntries.set(entry.file, opening);
       await this.appendOpenings([opening]);

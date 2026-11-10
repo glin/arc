@@ -16892,7 +16892,11 @@ test('the backfill orders its queue, skips a twin, and treats each list as the c
     // A later list adds a name and drops another. The added name goes first and the dropped one never decodes.
     harness.backfill.setNames(['new-event.jsonl.zst', ...list]);
     await vi.waitFor(() => assert.equal(order.length, 6, order.join()));
-    assert.deepEqual(firsts, ['unplaced.jsonl.zst'], 'only the unplaced name read its first record');
+    assert.deepEqual(
+      firsts,
+      ['new-event.jsonl.zst', 'unplaced.jsonl.zst'],
+      'a name with a known opening read its first record',
+    );
     assert.deepEqual(order, [
       'new-event.jsonl.zst',
       'failed.jsonl.zst',
@@ -16932,6 +16936,100 @@ test('a current entry with no machine opening writes its opening again without a
     await vi.waitFor(() => assert.equal(harness.openings.length, 1, 'the lost opening was not written again'));
     assert.equal(harness.openings[0].opening?.sessionId, COMPRESSED_THREAD);
     assert.equal(decodes, 0, 'a current entry decoded its rollout again');
+  } finally {
+    harness.backfill.dispose();
+  }
+});
+
+test('a name that a later list adds and its folder excludes takes one first record read and no body decode', async () => {
+  const firsts: string[] = [];
+  let decodes = 0;
+  const harness = backfillHarness({
+    exists: () => false,
+    statOf: () => ({ ...unitStat, isFile: true }),
+    inFolders: () => () => false,
+    readFirst: async (file) => {
+      firsts.push(file);
+      return unitOpeningLine;
+    },
+    stream: async () => {
+      decodes++;
+      return unitDecoded();
+    },
+  });
+  try {
+    harness.backfill.setNames(['first.jsonl.zst']);
+    await vi.waitFor(() => assert.deepEqual(firsts, ['first.jsonl.zst']));
+    await vi.waitFor(() => assert.equal(backfillIdle(harness.backfill), true));
+    harness.backfill.setNames(['first.jsonl.zst', 'later.jsonl.zst']);
+    await vi.waitFor(() => assert.equal(backfillIdle(harness.backfill), true));
+    assert.deepEqual(firsts, ['first.jsonl.zst', 'later.jsonl.zst'], 'the added name read no opening');
+    assert.equal(decodes, 0, 'a name out of scope decoded its body');
+    assert.deepEqual(harness.facts, [], 'a name out of scope saved facts');
+  } finally {
+    harness.backfill.dispose();
+  }
+});
+
+test('a publish over a held opening of another generation appends a current opening', async () => {
+  const store = storeBackedFacts(path.join(tempDir('backfill-held-opening-'), 'openings'));
+  const versions = compressedEntryVersions();
+  store.line([
+    {
+      file: 'a.jsonl.zst',
+      pairKey: 'a',
+      ...versions,
+      codexMetaVersion: versions.codexMetaVersion - 1,
+      size: unitStat.size,
+      mtimeMs: unitStat.mtimeMs,
+      opening: compressedOpening,
+    },
+  ]);
+  const harness = backfillHarness({
+    openings: store.holder,
+    exists: () => false,
+    statOf: () => ({ ...unitStat, isFile: true }),
+    stream: async (_file, push) => {
+      await push(
+        Buffer.from(`${unitOpeningLine}
+`),
+      );
+      return unitDecoded();
+    },
+  });
+  seedBody(harness, 'a.jsonl.zst');
+  try {
+    harness.backfill.setNames(['a.jsonl.zst']);
+    await vi.waitFor(() => assert.equal(harness.facts.length, 1, 'the name did not publish'));
+    const stored = readCompressedStore(store.holder.directory).entries.get('a.jsonl.zst');
+    assert.equal(stored?.codexMetaVersion, versions.codexMetaVersion, 'the held opening of another generation stayed');
+  } finally {
+    harness.backfill.dispose();
+  }
+});
+
+test('each admitted name appends one opening', async () => {
+  const harness = backfillHarness({
+    exists: () => false,
+    statOf: () => ({ ...unitStat, isFile: true }),
+    readFirst: async () => unitOpeningLine,
+    stream: async (_file, push) => {
+      await push(
+        Buffer.from(`${unitOpeningLine}
+`),
+      );
+      return unitDecoded();
+    },
+  });
+  seedBody(harness, 'seeded.jsonl.zst');
+  try {
+    harness.backfill.setNames(['read.jsonl.zst', 'seeded.jsonl.zst']);
+    await vi.waitFor(() => assert.equal(harness.facts.length, 2, 'the names did not publish'));
+    assert.deepEqual(
+      harness.openings.map((entry) => entry.file).sort(),
+      ['read.jsonl.zst', 'seeded.jsonl.zst'],
+      'an admitted name did not append exactly one opening',
+    );
   } finally {
     harness.backfill.dispose();
   }
