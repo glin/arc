@@ -288,8 +288,8 @@ export function missingSoakMeasures(measures: Record<string, number>): string[] 
 }
 
 // The host counters the measure table names, by measure name. A refresh count reads the refreshes of its reason. Every
-// other counter reads the `work` counter that `WORK_COUNTERS` names, or the `work` counter of its own name. A build that
-// never counted one reports 0.
+// other counter reads the `work` counter that `WORK_COUNTERS` names, or the `work` counter of its own name. A snapshot
+// with no `compressedMerge` count holds no merge rows. Any other counter that a build never counted reports 0.
 export const NAMED_COUNTERS = [
   'catalogWalks',
   'compressedDecodes',
