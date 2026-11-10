@@ -249,8 +249,8 @@ export function readOptions(argv: string[]): Options {
   if (!Number.isFinite(options.soakMinutes) || options.soakMinutes < 0) stop('--soak takes a number of minutes.');
   if (!Number.isFinite(options.minimumFreeGb) || options.minimumFreeGb < 0)
     stop('--min-free-gb takes a number of gigabytes.');
-  if (!Number.isFinite(options.warmCapMinutes) || options.warmCapMinutes <= 0)
-    stop('--warm-cap-minutes takes a number of minutes.');
+  const capRefusal = warmCapRefusal(options.warmCapMinutes);
+  if (capRefusal) stop(capRefusal);
   if (options.soakMinutes > 0 && options.selection) stop('--soak runs without --selection and --response.');
   return options;
 }
@@ -1240,6 +1240,16 @@ export const WARM_UP_OPEN_MS = 5.5 * 60_000;
 // the warm-up launch.
 export const WARM_UNTIL_INTERVAL_MS = 15_000;
 export const WARM_UNTIL_CAP_MS = 30 * 60_000;
+// The reason that a number of minutes cannot limit a hold, or null when it can. A hold keeps the warm-up open for the
+// minimum open time before its first deadline check, so a limit at or below that time never bounds it.
+export function warmCapRefusal(minutes: number): string | null {
+  const minimum = WARM_UP_OPEN_MS / 60_000;
+  if (!(minutes > minimum)) return `--warm-cap-minutes takes a number of minutes above ${minimum}.`;
+  if (!Number.isFinite(minutes * 60_000))
+    return `--warm-cap-minutes takes at most ${Number.MAX_VALUE / 60_000} minutes.`;
+  return null;
+}
+
 // The hold checks the warm-up editor at this interval while it keeps the minimum open time.
 const WARM_UP_CHECK_MS = 5_000;
 

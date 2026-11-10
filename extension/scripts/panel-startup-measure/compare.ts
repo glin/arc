@@ -5,6 +5,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { arcHome } from '../../src/store.ts';
+import { warmCapRefusal } from './measure';
 import { CAUSE_COUNTER_PREFIXES, REQUIRED_DISCOVERY_MEASURES } from './soak';
 
 // A candidate regresses when its value exceeds the baseline by this ratio and by the floor of its kind.
@@ -427,6 +428,9 @@ export async function runComparison(args: string[], dependencies: ComparisonDepe
     // Both sides launch under the same free memory floor.
     const minimumFree = value('--min-free-gb');
     const warmCap = value('--warm-cap-minutes');
+    // A limit that the runner refuses stops the comparison before either build starts.
+    const capRefusal = args.includes('--warm-cap-minutes') ? warmCapRefusal(Number(warmCap)) : null;
+    if (capRefusal) throw new Error(capRefusal);
     // The candidate alone holds its warm-up until each named measure reads its value.
     const warmUntil = args.flatMap((arg, index) =>
       arg === '--warm-until' && args[index + 1] !== undefined ? ['--warm-until', args[index + 1]] : [],
