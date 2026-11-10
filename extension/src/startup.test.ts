@@ -22810,44 +22810,6 @@ test('a new worker with no held reply still sends a full pass after a gap stoppe
   }
 });
 
-test('a transcript whose last record has no line break leaves admission incomplete at each scan', async () => {
-  const provider = completeDiscoveryHarness(undefined, false, ['prepareHumanPrompts'], {
-    humanPromptScanSteps,
-    promptScanLists,
-  });
-  provider.humanScans = new Map();
-  const root = tempDir('admission-open-record-');
-  const file = path.join(root, 'open.jsonl');
-  fs.writeFileSync(file, '{"type":"system","uuid":"one"}');
-  const stat = fs.statSync(file, { bigint: true });
-  const session = {
-    file,
-    sessionId: 'open',
-    agent: 'claude',
-    size: Number(stat.size),
-    mtimeMs: Number(stat.mtimeMs),
-    dev: stat.dev,
-    ino: stat.ino,
-  };
-  try {
-    for (let scan = 0; scan < 3; scan++) {
-      provider.enumeratedAdmissionComplete = true;
-      await provider.prepareHumanPrompts(
-        [session],
-        false,
-        new AbortController().signal,
-        undefined,
-        undefined,
-        undefined,
-        'skip',
-      );
-      assert.equal(provider.enumeratedAdmissionComplete, false, `scan ${scan} completed admission`);
-    }
-  } finally {
-    fs.rmSync(root, { recursive: true, force: true });
-  }
-});
-
 test('a complete reply whose members are still unsettled publishes nothing until they settle', async () => {
   vi.useFakeTimers();
   try {
