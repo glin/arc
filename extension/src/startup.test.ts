@@ -22557,16 +22557,21 @@ function settledGapHarness(
     provider.enumeratedMembers = new Set(current.map(sessionCoverageMember));
     return accept(gap(provider, current, scope) ?? current, scope);
   };
-  // Each step runs the timers due and the work they release. The step bound is the test's deadline.
+  // Each step runs the timers due and the work they release. The step bound is the test's deadline. The harness starts no
+  // poll, so the advance past the longest refresh timer runs only a request that waits behind a throttle or a deadline.
   const settle = async () => {
     const quiet = () =>
       !provider.dispatchSpendPending &&
       !provider.dispatchDiscoveryPending &&
       provider.refreshController === null &&
       !provider.pendingRefresh;
-    for (let step = 0; step < 500 && !quiet(); step++) await vi.advanceTimersByTimeAsync(1);
-    assert.ok(quiet(), `discovery never settled after requests ${harness.requests.join(', ')}`);
-    for (let step = 0; step < 20; step++) await vi.advanceTimersByTimeAsync(1);
+    const drain = async () => {
+      for (let step = 0; step < 500 && !quiet(); step++) await vi.advanceTimersByTimeAsync(1);
+      assert.ok(quiet(), `discovery never settled after requests ${harness.requests.join(', ')}`);
+    };
+    await drain();
+    await vi.advanceTimersByTimeAsync(CATALOG_REFRESH_DEADLINE_MS + 1);
+    await drain();
   };
   const full = () => harness.requests.filter((kind) => kind === 'discovery').length;
   return { ...harness, settle, full };
