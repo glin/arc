@@ -310,6 +310,9 @@ export const OPENING_READ_COUNTERS = [
   'openingsRead:children',
 ] as const;
 
+// The work counters that name why a walk or a discovery pass ran. Each one appears only when the snapshot holds it.
+export const CAUSE_COUNTER_PREFIXES = ['walk:', 'discoveryRequest:', 'acceptedUnsettled', 'compressedNames:'] as const;
+
 // The measures a soak snapshot supplies, in the units the comparison reads. Every gauge passes through by its own name.
 export function soakMeasures(snapshot: {
   counters?: {
@@ -351,6 +354,9 @@ export function soakMeasures(snapshot: {
   // A snapshot during the first enumeration holds only the sources that read so far, and the other sources report 0.
   if (OPENING_READ_COUNTERS.some((name) => typeof work[name] === 'number'))
     for (const name of OPENING_READ_COUNTERS) out[name] = work[name] ?? 0;
+  for (const [name, value] of Object.entries(work))
+    if (typeof value === 'number' && CAUSE_COUNTER_PREFIXES.some((prefix) => name.startsWith(prefix)))
+      out[name] = value;
   for (const [name, value] of Object.entries(snapshot.counters?.gauges ?? {}))
     if (typeof value === 'number') out[name] = value;
   const loopDelay = snapshot.counters?.loopDelay;

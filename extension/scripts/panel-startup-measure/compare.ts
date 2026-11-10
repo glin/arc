@@ -5,7 +5,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { arcHome } from '../../src/store.ts';
-import { REQUIRED_DISCOVERY_MEASURES } from './soak';
+import { CAUSE_COUNTER_PREFIXES, REQUIRED_DISCOVERY_MEASURES } from './soak';
 
 // A candidate regresses when its value exceeds the baseline by this ratio and by the floor of its kind.
 export const MARGINS = { time: 1.5, count: 1.5, bytes: 1.5, memory: 1.25 } as const;
@@ -87,6 +87,7 @@ export const REPORT_ONLY_PREFIXES = [
   'refreshMaxMs:',
   'refreshCount:catalog-enumeration:',
   'openingsRead:',
+  ...CAUSE_COUNTER_PREFIXES,
 ] as const;
 
 export function isReportOnly(name: string): boolean {
@@ -94,7 +95,10 @@ export function isReportOnly(name: string): boolean {
 }
 
 function kindOf(name: string): Kind {
-  return COUNTS.has(name) || name.startsWith('refreshCount:') || name.startsWith('openingsRead:')
+  return COUNTS.has(name) ||
+    name.startsWith('refreshCount:') ||
+    name.startsWith('openingsRead:') ||
+    CAUSE_COUNTER_PREFIXES.some((prefix) => name.startsWith(prefix))
     ? 'count'
     : BYTES.has(name)
       ? 'bytes'

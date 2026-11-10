@@ -2412,6 +2412,31 @@ test('the receipt scan counters reach the report as count rows and an older base
   }
 });
 
+test('the counters that name why walks and passes ran reach the measures as report-only rows', () => {
+  const record = { counters: { work: { 'walk:backstop': 7, 'discoveryRequest:walked': 5, catalogWalk: 12 } } };
+  const measures = holdReading(record, () => ({}))!;
+  assert.equal(measures['walk:backstop'], 7);
+  assert.equal(measures['discoveryRequest:walked'], 5);
+  assert.deepEqual(
+    Object.keys(measures).filter((name) => /^(acceptedUnsettled|compressedNames:)/.test(name)),
+    [],
+    'an absent counter was reported',
+  );
+  const report = compareResults([runnerResult(soakMeasures({ counters: { work: {} } }))], [runnerResult(measures)]);
+  for (const [name, value] of [
+    ['walk:backstop', 7],
+    ['discoveryRequest:walked', 5],
+  ] as const) {
+    const row = report.find((measure) => measure.name === name);
+    assert.ok(row, `the report has no ${name} row`);
+    assert.deepEqual(
+      [row.kind, row.baseline, row.candidate, row.reportOnly, row.regressed],
+      ['count', null, value, true, false],
+      name,
+    );
+  }
+});
+
 test('a launch whose readers read nothing reports 0 for every source, and an older build reports none', async () => {
   const { provider } = bumpedCatalogHarness();
   provider.performanceCounters = new PanelPerformanceCounters();
