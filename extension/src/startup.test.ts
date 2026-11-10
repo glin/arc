@@ -13084,6 +13084,43 @@ test('a batch row that a panel shows redraws through the selected-window refresh
   );
 });
 
+test('a joined row asks discovery for no pass and leaves nothing for the next acceptance to answer', async () => {
+  const { provider, work, entryOf, releaseAll } = await batchApplyHarness();
+  provider.claudeChildrenDiscovered = true;
+  provider.dispatchDiscoveryPending = true;
+  provider.dispatchDiscoveryPendingWriter = 'unsettledReply';
+  provider.applyCompressedBatch({ entries: [entryOf('joined-pending').entry], backfillMs: 0 });
+  await vi.waitFor(() => assert.equal(provider.refreshController, null));
+  assert.deepEqual(discoveryRequests(work), [], 'a batch sent a discovery request while discovery was pending');
+  assert.equal(provider.dispatchDiscoveryPendingWriter, 'unsettledReply', 'a batch set the pending state');
+  const held = () => (provider.catalog.sessions as SessionFile[]).map((row) => row.file);
+  assert.deepEqual(
+    (provider.authoritativeCatalog as SessionFile[]).map((row) => row.file),
+    held(),
+    'the held and accepted lists differ, so the next continuation would run a catalog refresh',
+  );
+  provider.dispatchDiscoveryPending = false;
+  const reply = {
+    scope: JSON.stringify(provider.repositoryScopeRoots),
+    files: new Set(held()),
+    revisions: new Map((provider.catalog.sessions as SessionFile[]).map((row) => [row.file, row])),
+    settled: true,
+  };
+  provider.discoveryComplete = reply;
+  endBatchWindow(provider);
+  const joined = entryOf('joined-reply');
+  provider.applyCompressedBatch({ entries: [joined.entry], backfillMs: 0 });
+  assert.equal(reply.files.has(joined.twin), true, 'the waiting reply did not hold the batch row');
+  await releaseAll(provider.refresh(false, true));
+  assert.deepEqual(discoveryRequests(work), [], 'the acceptance asked discovery for a pass');
+  assert.deepEqual(
+    Object.keys(work).filter((name) => /^acceptedUnsettled:(listed|held)RowUnanswered$/.test(name)),
+    [],
+    'the joined row left the waiting reply unanswered',
+  );
+  assert.equal(provider.dispatchDiscoveryPending, false, 'the joined row set discovery pending');
+});
+
 test('a compressed-facts refresh that walks sets the gauge on both walk paths', async () => {
   const { provider, root, writeRollout, releaseAll } = heldWalkHarness(
     {
