@@ -133,6 +133,14 @@ export type UsagePriceContext = Pick<UsageQuoteInput, 'inferenceClass' | 'servic
 // Readers retain each request's pricing band before aggregation. Aggregate totals cannot recover those bands.
 export const MODEL_DEFINITIONS: readonly ModelDefinition[] = [
   {
+    effortChangeKeepsCache: /^claude-fable-5-2(?:-\d{8})?(?:\[[^\]]+\])?$/,
+    pattern: /^claude-(fable|mythos)-5-2(?:-\d{8})?(?:\[[^\]]+\])?$/,
+    rate: { input: 8, cacheRead: 0.2, output: 40 },
+    fast: { input: 16, cacheRead: 0.4, output: 80 },
+    cachePolicy: CLAUDE_CACHE_POLICY,
+    window: 1_000_000,
+  },
+  {
     effortChangeKeepsCache: /^claude-fable-5-1(?:-\d{8})?(?:\[[^\]]+\])?$/,
     pattern: /^claude-(fable|mythos)-5-1(?:-\d{8})?(?:\[[^\]]+\])?$/,
     rate: { input: 10, cacheRead: 0.25, output: 50 },

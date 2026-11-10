@@ -826,7 +826,7 @@ import {
   MIXED_PASS_ITERATIONS,
 } from './turnfixtures.ts';
 import { estimateCost } from './pricing.ts';
-import { averageContextPerRequest } from './turncard.ts';
+import { averageContextPerRequest, sessionStatsFromFacts } from './turncard.ts';
 import { railBuckets } from './view/rail.ts';
 
 const folder = () => tempDir('derived-cache-');
@@ -938,6 +938,27 @@ test('per-pass pricing survives a derived-cache reload with both bands and reque
   assert.ok(Math.abs(estimateCost(restored.usage, restored.model)! - 0.0600315) < 1e-12);
   assert.equal(averageContextPerRequest(restored.usage), 200001);
   assert.deepEqual(restored.usage, facts.turns[0].usage);
+});
+
+test('a Fable 5.2 session restored from saved facts at the current generations reports a cost', () => {
+  const file = path.join(folder(), 'cache.json');
+  const [turn] = stats.turns;
+  const facts: SessionStatFacts = {
+    ...stats,
+    turns: [
+      {
+        ...turn,
+        model: 'claude-fable-5-2',
+        usage: { ...turn.usage, requests: 2, input: 1_000_000, cacheRead: 1_000_000, output: 100_000 },
+      },
+    ],
+  };
+  saveClaudeCache(file, [['/fable.jsonl', { ...title, stats: facts }]]);
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')).metadataGenerations, METADATA_GENERATIONS);
+  const chips = sessionStatsFromFacts(derivedTitleStats(loadClaudeCache(file).titles.get('/fable.jsonl')!));
+  const cost = chips.find((chip) => chip.metric === 'cost');
+  assert.ok(cost?.dollars !== undefined && Math.abs(cost.dollars - 12.2) < 1e-9, `restored cost: ${cost?.dollars}`);
+  assert.ok(!cost?.partial, 'a Fable 5.2 turn left part of its restored usage unpriced');
 });
 
 test('prior derived generations drop saved figures and carry valid names for bounded rereading', () => {

@@ -1163,6 +1163,7 @@ import {
   toCard,
   tokenLines,
   turnCacheExpiryReturn,
+  turnCost,
   TURN_QUIET_MS,
 } from './turncard.ts';
 import type { CacheExpiryReturn } from './projectspend.ts';
@@ -17163,6 +17164,62 @@ function bedrockSessionCost(text: string) {
   );
   return { turn, cost };
 }
+
+test('a Fable 5.2 turn prices recorded usage without unavailable cost', () => {
+  const responses = Array.from({ length: 6 }, (_, index) => {
+    const response = assistantText('Review.', index + 1, undefined, undefined, index === 5 ? 'end_turn' : 'tool_use');
+    return {
+      ...response,
+      message: {
+        ...response.message,
+        model: 'claude-fable-5-2',
+        usage: {
+          input_tokens: 2,
+          cache_creation_input_tokens: index === 0 ? 257_579 : 0,
+          cache_creation: { ephemeral_1h_input_tokens: index === 0 ? 257_579 : 0, ephemeral_5m_input_tokens: 0 },
+          cache_read_input_tokens: index === 0 ? 0 : index === 5 ? 252_919 : 252_918,
+          output_tokens: index === 5 ? 878 : 877,
+          inference_geo: 'global',
+          service_tier: 'standard',
+          speed: 'standard',
+        },
+      },
+    };
+  });
+  const read = readSession(writeTranscript([userPrompt('Review.', 0), ...responses]), 'sess');
+  assert.equal(read.turns.length, 1);
+  assert.equal(read.turns[0].usage.requests, 6);
+  const cost = turnCost(read.turns[0]);
+  assert.equal(cost.dollars?.toFixed(4), '4.5848');
+  assert.equal(cost.partial, false);
+});
+
+test('Fable 5.2 Bedrock turns use the attached profile or the regional fallback', () => {
+  const source = BEDROCK_SESSION.replaceAll('claude-opus-5-5', 'claude-fable-5-2');
+  const listPrice = 0.3112642;
+  for (const [profile, multiplier, inferenceClass] of [
+    ['global.anthropic.claude-fable-5-2', 1, null],
+    ['us.anthropic.claude-fable-5-2[1m]', 1.1, 'bedrock-regional'],
+    ['anthropic.claude-fable-5-2', 1.1, 'bedrock-regional'],
+    [null, 1.1, 'bedrock-regional'],
+  ] as const) {
+    const text = profile
+      ? source.replace('us.anthropic.claude-fable-5-2[1m]', profile)
+      : source
+          .split('\n')
+          .filter((line) => !line.includes('"modelId"'))
+          .join('\n');
+    const { turn, cost } = bedrockSessionCost(text);
+    assert.deepEqual(
+      turn.usageParts?.map((part) => [part.model, part.inferenceClass, part.usage.requests]),
+      [['claude-fable-5-2', inferenceClass, 2]],
+    );
+    assert.ok(Math.abs(cost - listPrice * multiplier) < 1e-9, `${profile}: ${cost}`);
+    const total = turnCost(turn);
+    assert.ok(total.dollars !== null && Math.abs(total.dollars - listPrice * multiplier) < 1e-9);
+    assert.equal(total.partial, false);
+  }
+});
 
 test('a Bedrock session prices each response once at 1.1 times list on a regional profile', () => {
   const { turn, cost } = bedrockSessionCost(BEDROCK_SESSION);

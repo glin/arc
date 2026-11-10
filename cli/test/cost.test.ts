@@ -870,6 +870,71 @@ test('cost attributes a delayed native child once through colliding parent sessi
   }
 });
 
+test('cost scales a completed Fable 5.2 result by its regional Bedrock modelUsage identity', async () => {
+  const { root, projects, codex } = fixture();
+  try {
+    const file = path.join(codex, 'rollout-fable-parent.jsonl');
+    const records = [
+      { type: 'session_meta', payload: { id: 'fable-parent', source: 'cli', cwd: root } },
+      {
+        type: 'event_msg',
+        timestamp: '2026-09-26T00:00:00Z',
+        payload: { type: 'task_started', turn_id: 'review' },
+      },
+      { type: 'turn_context', payload: { turn_id: 'review', model: 'gpt-6-sol', effort: 'high' } },
+      {
+        type: 'event_msg',
+        timestamp: '2026-09-26T00:00:01Z',
+        payload: {
+          type: 'item_completed',
+          item: {
+            type: 'CommandExecution',
+            id: 'fable-print',
+            command: ['claude', '-p', 'review', '--output-format', 'json'],
+            parsed_cmd: [{ type: 'unknown', cmd: 'claude -p review --output-format json' }],
+            status: 'completed',
+            exit_code: 0,
+            stdout: JSON.stringify({
+              type: 'result',
+              session_id: 'printed-fable',
+              total_cost_usd: 4.5848,
+              duration_ms: 100,
+              is_error: false,
+              usage: {
+                input_tokens: 12,
+                output_tokens: 5263,
+                cache_read_input_tokens: 1264591,
+                cache_creation_input_tokens: 257579,
+              },
+              modelUsage: {
+                'us.anthropic.claude-fable-5-2[1m]': {
+                  inputTokens: 12,
+                  outputTokens: 5263,
+                  cacheReadInputTokens: 1264591,
+                  cacheCreationInputTokens: 257579,
+                  thinkingTokens: 0,
+                  costUSD: 4.5848,
+                  contextWindow: 1_000_000,
+                  canonicalModel: 'claude-fable-5-2',
+                  costBasis: 'list',
+                },
+              },
+            }),
+          },
+        },
+      },
+    ];
+    fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+    const report = JSON.parse(await runCost([file, '--projects', projects, '--codex-sessions', codex, '--by-model']));
+    assert.equal(report.children.length, 1);
+    assert.equal(report.children[0].sessionId, 'printed-fable');
+    assert.deepEqual(report.children[0].models, ['claude-fable-5-2']);
+    assert.equal(report.children[0].costUsd, 5.0433);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('cost resolves an id with explicit roots and prints the versioned JSON report by default', async () => {
   const { root, projects, codex, file } = fixture();
   try {

@@ -37,6 +37,8 @@ import { COMPACTION_SAMPLES, previousContextOf, type CompactionCalibrationRow } 
 // Keep expected model ids independent of the price table so missing rows fail the test.
 
 const MODEL_IDS = [
+  'claude-fable-5-2',
+  'claude-mythos-5-2',
   'claude-fable-5-1',
   'claude-mythos-5-1',
   'claude-fable-5',
@@ -109,11 +111,13 @@ const claudeSupport = (
     rate,
     window,
     cachePolicy: RECORDED_POLICY,
-    ...(models.includes('claude-fable-5-1')
-      ? { effortChangeKeepsCache: /^claude-fable-5-1(?:-\d{8})?(?:\[[^\]]+\])?$/ }
-      : models.some((model) => ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5'].includes(model))
-        ? { effortChangeKeepsCache: true as const }
-        : {}),
+    ...(models.includes('claude-fable-5-2')
+      ? { effortChangeKeepsCache: /^claude-fable-5-2(?:-\d{8})?(?:\[[^\]]+\])?$/ }
+      : models.includes('claude-fable-5-1')
+        ? { effortChangeKeepsCache: /^claude-fable-5-1(?:-\d{8})?(?:\[[^\]]+\])?$/ }
+        : models.some((model) => ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5'].includes(model))
+          ? { effortChangeKeepsCache: true as const }
+          : {}),
     ...(fast ? { fast } : {}),
     ...(effectiveDate ? { effectiveDate } : {}),
   },
@@ -819,6 +823,13 @@ const bedrockSupport = (effectiveDate: string, profileEffectiveDate?: string, mo
 });
 const SUPPORT_MATRIX: { models: string[]; definition: ModelDefinition }[] = [
   claudeSupport(
+    /^claude-(fable|mythos)-5-2(?:-\d{8})?(?:\[[^\]]+\])?$/,
+    ['claude-fable-5-2', 'claude-mythos-5-2'],
+    { input: 8, cacheRead: 0.2, output: 40 },
+    1_000_000,
+    { input: 16, cacheRead: 0.4, output: 80 },
+  ),
+  claudeSupport(
     /^claude-(fable|mythos)-5-1(?:-\d{8})?(?:\[[^\]]+\])?$/,
     ['claude-fable-5-1', 'claude-mythos-5-1'],
     { input: 10, cacheRead: 0.25, output: 50 },
@@ -1104,7 +1115,7 @@ test('a model the table has never heard of has no rate, rather than its sibling 
   assert.equal(rateFor('claude-opus-4-88'), null);
   assert.equal(rateFor('claude-haiku-4-55'), null);
   assert.equal(rateFor('claude-sonnet-4-4'), null);
-  assert.equal(rateFor('claude-fable-5-2'), null);
+  assert.equal(rateFor('claude-fable-5-3'), null);
   assert.equal(rateFor('claude-opus-5-1'), null);
   assert.equal(rateFor('claude-sonnet-5-1'), null);
   assert.equal(rateFor('claude-sonnet-5-6'), null);
@@ -2173,12 +2184,17 @@ const EVERY_CLAUDE_CATEGORY = usage({
   output: 1_000_000,
 });
 
-// Fast cache prices use the model's fast input rate, including the explicit Opus 5.5 cache-read rate.
+// Fast cache prices use the model's fast input rate and its explicit cache-read rate when present.
 
 test('every model that sells fast mode quotes its fast rate, cache reads and writes included', () => {
   const opus55 = { input: 8, cacheRead: 0.4, output: 40 };
   const opus5 = { input: 10, output: 50 };
+  const fable52 = { input: 16, cacheRead: 0.4, output: 80 };
   for (const [model, standard, fast, rate] of [
+    ['claude-fable-5-2', 8 + 10 + 16 + 0.2 + 40, 16 + 20 + 32 + 0.4 + 80, fable52],
+    ['claude-mythos-5-2', 8 + 10 + 16 + 0.2 + 40, 16 + 20 + 32 + 0.4 + 80, fable52],
+    ['claude-fable-5-2-20261109[1m]', 8 + 10 + 16 + 0.2 + 40, 16 + 20 + 32 + 0.4 + 80, fable52],
+    ['claude-mythos-5-2-20261109[1m]', 8 + 10 + 16 + 0.2 + 40, 16 + 20 + 32 + 0.4 + 80, fable52],
     ['claude-opus-5-5', 4 + 5 + 8 + 0.2 + 20, 8 + 10 + 16 + 0.4 + 40, opus55],
     ['claude-opus-5-5-20260922[1m]', 4 + 5 + 8 + 0.2 + 20, 8 + 10 + 16 + 0.4 + 40, opus55],
     ['claude-opus-5', 5 + 6.25 + 10 + 0.5 + 25, 10 + 12.5 + 20 + 1 + 50, opus5],
@@ -2416,12 +2432,15 @@ test('the cost figures guide states the provider-specific cache multiples the pr
     }
   }
 
-  const fable = cellsFor('Claude Fable 5.1');
-  assert.deepEqual(multiplesIn(fable[1]), [ratio('claude-fable-5-1', { cacheRead: 1_000_000 })]);
-  assert.deepEqual(multiplesIn(fable[2]), [
-    ratio('claude-fable-5-1', { cacheWrite5m: 1_000_000 }),
-    ratio('claude-fable-5-1', { cacheWrite1h: 1_000_000 }),
-  ]);
+  const fable = cellsFor('Claude Fable 5.1, Mythos 5.1, Fable 5.2, and Mythos 5.2');
+  for (const model of ['claude-fable-5-1', 'claude-mythos-5-1', 'claude-fable-5-2', 'claude-mythos-5-2']) {
+    assert.deepEqual(multiplesIn(fable[1]), [ratio(model, { cacheRead: 1_000_000 })], model);
+    assert.deepEqual(
+      multiplesIn(fable[2]),
+      [ratio(model, { cacheWrite5m: 1_000_000 }), ratio(model, { cacheWrite1h: 1_000_000 })],
+      model,
+    );
+  }
 
   const openai = cellsFor('Other priced direct OpenAI GPT-5.6 and GPT-6 models');
   assert.deepEqual(multiplesIn(openai[1]), [ratio('gpt-5.6-sol', { cacheRead: 1_000_000 })]);
@@ -2618,8 +2637,46 @@ test('the next-turn floor and the compaction estimate carry the regional Bedrock
   assert.ok(Math.abs(bedrockCompaction - listCompaction * 1.1) < 1e-9);
 });
 
+test('Fable and Mythos 5.2 price all five categories on global and regional Bedrock routes', () => {
+  const categories: Array<[Partial<TurnUsage>, number, number]> = [
+    [{ input: 1_000_000 }, 8, 8.8],
+    [{ cacheWrite5m: 1_000_000 }, 10, 11],
+    [{ cacheWrite1h: 1_000_000 }, 16, 17.6],
+    [{ cacheRead: 1_000_000 }, 0.2, 0.22],
+    [{ output: 1_000_000 }, 40, 44],
+  ];
+  for (const model of ['claude-fable-5-2', 'claude-mythos-5-2']) {
+    for (const suffix of ['', '-20261109', '[1m]', '-20261109[1m]']) {
+      assert.equal(contextWindowFor(model + suffix), 1_000_000);
+      assert.deepEqual(resolveModelPricing(model + suffix)?.cachePolicy, RECORDED_POLICY);
+      for (const [category, global, regional] of categories) {
+        for (const [inferenceClass, expected] of [
+          [null, global],
+          ['global', global],
+          ['bedrock-regional', regional],
+        ] as const) {
+          const quote = quoteUsage({
+            model: model + suffix,
+            usage: usage(category),
+            inferenceClass,
+            serviceTier: 'standard',
+          });
+          near(quote?.cost, expected, `${model}${suffix} ${inferenceClass} ${Object.keys(category)[0]}`);
+        }
+      }
+    }
+  }
+});
+
 test('a Bedrock model id pays 1.1 times list on every profile but global.', () => {
   const cases: Array<[string, string | null, number]> = [
+    ['us.anthropic.claude-fable-5-2', 'claude-fable-5-2', 1.1],
+    ['us.anthropic.claude-fable-5-2[1m]', 'claude-fable-5-2', 1.1],
+    ['anthropic.claude-fable-5-2', 'claude-fable-5-2', 1.1],
+    ['global.anthropic.claude-fable-5-2', 'claude-fable-5-2', 1],
+    ['global.anthropic.claude-fable-5-2[1m]', 'claude-fable-5-2', 1],
+    ['us.anthropic.claude-mythos-5-2[1m]', 'claude-mythos-5-2', 1.1],
+    ['global.anthropic.claude-mythos-5-2', 'claude-mythos-5-2', 1],
     ['us.anthropic.claude-opus-5-5[1m]', 'claude-opus-5-5', 1.1],
     ['apac.anthropic.claude-opus-5-5', 'claude-opus-5-5', 1.1],
     ['us-gov.anthropic.claude-opus-5-5', 'claude-opus-5-5', 1.1],
@@ -2715,8 +2772,17 @@ test('Bedrock Astra prices exact routes and request thresholds without inventing
 });
 
 test('effort cache policy distinguishes exact Claude models and detectable Bedrock routes', () => {
-  for (const model of ['opus-5-5', 'sonnet-5-5', 'haiku-5-5', 'fable-5-1', 'mythos-5-1', 'opus-5']) {
-    const keeps = ['opus-5-5', 'sonnet-5-5', 'haiku-5-5', 'fable-5-1'].includes(model);
+  for (const model of [
+    'opus-5-5',
+    'sonnet-5-5',
+    'haiku-5-5',
+    'fable-5-2',
+    'mythos-5-2',
+    'fable-5-1',
+    'mythos-5-1',
+    'opus-5',
+  ]) {
+    const keeps = ['opus-5-5', 'sonnet-5-5', 'haiku-5-5', 'fable-5-2', 'fable-5-1'].includes(model);
     for (const suffix of ['', '-20261001', '[1m]', '-20261001[1m]']) {
       const identity = 'claude-' + model + suffix;
       assert.equal(effortChangeKeepsCache(identity, null), keeps, identity);

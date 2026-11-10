@@ -354,9 +354,10 @@ const changesTurn: Turn = turn({
   toolCounts: { edits: 3, reads: 8, searches: 3, commands: 6, agents: 1, coordination: 1, web: 0, other: 0 },
 });
 
+const NEXT_TURN_MODEL = 'claude-fable-5-1';
 const nextTurn: Turn = {
   ...changesTurn,
-  model: 'claude-fable-5-1',
+  model: NEXT_TURN_MODEL,
   outputRate: { output: 50, milliseconds: 1_000 },
   contextTokens: 198_000,
   contextWindow: 1_000_000,
@@ -2219,7 +2220,7 @@ export function readmePayload(scene: (typeof README_SCENES)[number] = 'main'): R
   const claudeModel = {
     value: 'opus',
     resolvedModel: selected.model ?? undefined,
-    label: catalogModel('claude', selected === nextTurn ? 'fable' : 'opus').label,
+    label: catalogModel('claude', selected === nextTurn ? NEXT_TURN_MODEL : 'opus').label,
     description: '',
     efforts: [{ value: 'high', label: 'High', description: '' }],
   };

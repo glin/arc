@@ -150,16 +150,17 @@ Change model and provider pricing in `extension/src/pricing.ts`.
 6. Add explicit provider support beside that definition for every confirmed provider. Every Codex shorthand target requires an independent decision for direct OpenAI and Amazon Bedrock in `pricing.test.ts`. The guard reads the exported shorthand map and the independent support matrix. A supported route requires rates and cache policy. An unpriced route requires an exact, sourced reason beside the matrix. Removing production and expected support together must fail the guard.
 7. Specify each provider's accepted prefixes, regional multiplier, effective dates, fallback window, and explicit sourced cache policy.
 8. Reuse shared rates only when published provider rates establish equivalence. Set a provider rate override when they differ.
-9. Keep service tiers specific to their provider. Price recorded cache tokens without inferring caching support or a lifetime.
-10. Extend the independent exhaustive support matrix in `pricing.test.ts` before adding any model or provider route. Include rates, request bands, tiers, windows, accepted identities, cache policies, and effort-change retention.
-11. Extend existing independent effort-change policy tests for exact identities, dated snapshots, context suffixes, broad-row exceptions, and detectable provider routes.
-12. Require documented duration, recorded duration, unsupported caching, or sourced unknown duration. Never infer duration from token-field names.
-13. Add symptom regressions to the existing pricing and consumer tests. Include saved usage and both request bands.
-14. Bump the generation of the affected agent in `PROJECT_SPEND_PARSER_GENERATIONS` in `projectspend.ts` when model support changes saved request bands or derived usage facts. Bump both generations when the change affects both agents.
-15. Bump the generation of the affected agent in `METADATA_GENERATIONS` in `derivedcache.ts` when model support changes saved session cost or context facts. Bump both generations when the change affects both agents.
-16. Remove the new provider support temporarily and run the symptom regressions. Also remove its cache policy, price, and independent route expectation separately. Remove production and expected provider support together. Change a shorthand target to an unreviewed model. Remove the new effort-change retention policy and its independent expectation separately. Also widen each exact-identity retention pattern. Require each guard to fail, then restore from plain backups.
-17. Update exact model coverage in [Supported pricing](cost-figures.md#supported-pricing). Update README provider summaries when provider coverage changes.
-18. Check personal billing consumers against the same request evidence and Arc build. Record independent pricing behavior until each consumer uses Arc billing.
+9. Before landing each Claude row, compare global and non-global category rates with the AWS `AmazonBedrockFoundationModels` price list. Record the price list publication date and regional coverage in the plan entry.
+10. Keep service tiers specific to their provider. Price recorded cache tokens without inferring caching support or a lifetime.
+11. Extend the independent exhaustive support matrix in `pricing.test.ts` before adding any model or provider route. Include rates, request bands, tiers, windows, accepted identities, cache policies, and effort-change retention.
+12. Extend existing independent effort-change policy tests for exact identities, dated snapshots, context suffixes, broad-row exceptions, and detectable provider routes.
+13. Require documented duration, recorded duration, unsupported caching, or sourced unknown duration. Never infer duration from token-field names.
+14. Add symptom regressions to the existing pricing and consumer tests. Include saved usage and both request bands.
+15. Bump the generation of the affected agent in `PROJECT_SPEND_PARSER_GENERATIONS` in `projectspend.ts` when model support changes saved request bands or derived usage facts. Bump both generations when the change affects both agents.
+16. Bump the generation of the affected agent in `METADATA_GENERATIONS` in `derivedcache.ts` when model support changes saved session cost or context facts. Bump both generations when the change affects both agents.
+17. Remove the new provider support temporarily and run the symptom regressions. Also remove its cache policy, price, and independent route expectation separately. Remove production and expected provider support together. Change a shorthand target to an unreviewed model. Remove the new effort-change retention policy and its independent expectation separately. Also widen each exact-identity retention pattern. Require each guard to fail, then restore from plain backups.
+18. Update exact model coverage in [Supported pricing](cost-figures.md#supported-pricing). Update README provider summaries when provider coverage changes.
+19. Check personal billing consumers against the same request evidence and Arc build. Record independent pricing behavior until each consumer uses Arc billing.
 
 For each direct OpenAI model, audit Standard, Fast/Priority, Flex, Batch, and Ultrafast against primary rate tables. Record independently expected category rates and supported request bands in `OPENAI_TIER_AUDIT` in `pricing.test.ts`. Mark unpublished combinations explicitly. Audit exact identities, snapshots, rate aliases, promotions, and provider routes. A new model without a tier decision fails the independent support matrix.
 
