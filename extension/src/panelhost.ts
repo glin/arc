@@ -4010,6 +4010,7 @@ export class PanelProvider implements vscode.Disposable {
   dispose(): void {
     this.fileAction?.abort();
     this.recordedReplies?.clear();
+    this.heldRailPayloads?.clear();
     if (this.disposed) return;
     if (this.coldPassPaintWait) clearTimeout(this.coldPassPaintWait);
     this.coldPassPaintWait = null;
@@ -5015,6 +5016,14 @@ export class PanelProvider implements vscode.Disposable {
         this.hostSessions?.delete(host);
         this.hostPreviousSessions?.delete(host);
         this.hosts = this.hosts.filter((open) => open !== host);
+        if (!this.hosts.length) {
+          this.heldRailPayloads?.clear();
+        } else {
+          const showing = new Set(this.hosts.map((open) => this.hostSessions?.get(open) ?? this.showing));
+          for (const session of this.heldRailPayloads?.keys() ?? []) {
+            if (!showing.has(session)) this.heldRailPayloads!.delete(session);
+          }
+        }
         for (const [source, route] of this.clearRoutes ?? []) {
           route.hosts.delete(host);
           if (!route.hosts.size) {

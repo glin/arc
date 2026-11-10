@@ -20576,6 +20576,98 @@ test('a draft hold among 2000 rows builds only draft payloads and preserves each
   }
 });
 
+function railPanelLifecycleHarness(): any {
+  const provider = railPostHarness(['attach', 'releaseQueuedEditOffer']);
+  provider.performanceOutput = { appendLine() {} };
+  const lifecycle = harness();
+  for (const name of [
+    'notePanelStart',
+    'healthPanel',
+    'allowThemeFiles',
+    'shell',
+    'closeBrowserStagingForHost',
+    'stopPolling',
+    'abandonCatalogRefresh',
+  ])
+    provider[name] = lifecycle[name].bind(provider);
+  provider.performanceCounters.registerPanel = () => {};
+  provider.performanceCounters.releasePanel = () => {};
+  provider.progressiveWorker.stop = () => {};
+  provider.hosts = [];
+  provider.readyHosts = new Set();
+  provider.hostSessions = new Map();
+  provider.queuedEditOffers = new Map();
+  provider.queuedEditReservations = new Set();
+  provider.boxText = {};
+  provider.sessionRows = Array.from({ length: 2000 }, (_, index) => ({
+    id: `s${index}`,
+    label: `Session ${index}`,
+    persisted: true,
+    agent: 'claude',
+    when: 'Today',
+    at: 1,
+    relative: 'Today',
+  }));
+  provider.showing = 's0';
+  const inputFor = provider.railInputFor.bind(provider);
+  provider.railInputFor = (
+    counts: unknown,
+    statuses: unknown,
+    children: unknown,
+    now: number,
+    showing = provider.showing,
+  ) => ({
+    ...inputFor(counts, statuses, children, now),
+    showing,
+  });
+  provider.useRailPayload(railPayload);
+  return provider;
+}
+
+test('closing every panel releases complete rail payloads and a reopened panel receives a complete rail', () => {
+  const provider = railPanelLifecycleHarness();
+  const first = host();
+  const second = host();
+  provider.attach(first);
+  provider.attach(second);
+  provider.readyHosts = new Set(provider.hosts);
+  provider.postRail(true);
+  assert.equal(provider.heldRailPayloads.get('s0').payload.rail.length, 2000);
+  first.dispose();
+  assert.equal(provider.heldRailPayloads.size, 1);
+  second.dispose();
+  assert.equal(provider.heldRailPayloads.size, 0);
+
+  provider.showing = 's1';
+  const reopened = host();
+  provider.attach(reopened);
+  provider.readyHosts.add(reopened);
+  provider.postRail(true);
+  const message = reopened.sent.find((message: any) => message.type === 'rail');
+  assert.ok(message);
+  assert.equal(message.rows.base, null);
+  const received = new RowDeltaReceiver().expand(message);
+  const full = railPayload(provider.railInputFor(new Map(), new Map(), new Map(), Date.now()));
+  assert.deepEqual(received?.rail, full.rail);
+  assert.deepEqual(received?.stats, full.stats);
+});
+
+test('closing one panel releases only the complete rail payload its remaining peers do not use', () => {
+  const provider = railPanelLifecycleHarness();
+  const first = host();
+  provider.attach(first);
+  provider.showing = 's1';
+  const second = host();
+  provider.attach(second);
+  provider.readyHosts = new Set(provider.hosts);
+  provider.postRail(true);
+  assert.deepEqual([...provider.heldRailPayloads.keys()].sort(), ['s0', 's1']);
+  const kept = provider.heldRailPayloads.get('s1');
+  first.dispose();
+  assert.deepEqual([...provider.heldRailPayloads.keys()], ['s1']);
+  assert.equal(provider.heldRailPayloads.get('s1'), kept);
+});
+
 test('a rail update serializes once for each actual ready-host post', () => {
   const provider = railPostHarness(['post', 'sendToHost']);
   const order: string[] = [];
@@ -21829,8 +21921,10 @@ test('disposal saves drafts and the derived cache when the ledger save fails', (
       return true;
     };
     provider.projectSpendFiles = [{ file: 'a.jsonl', complete: true, size: 1, mtimeMs: 1 }];
+    provider.heldRailPayloads = new Map([['selected', { payload: { rail: [{ id: 'selected' }] } }]]);
     provider.scheduleProjectSpendSave();
     provider.dispose();
+    assert.equal(provider.heldRailPayloads.size, 0);
     assert.deepEqual(saved, ['drafts', 'derived cache'], 'a failed ledger save at disposal skipped the saves after it');
     assert.equal(vi.getTimerCount(), 0, 'a failed ledger save at disposal left a retry on the disposed provider');
   } finally {
