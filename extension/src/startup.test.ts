@@ -13712,6 +13712,42 @@ test('a batch leaves the project spend post to the next poll unless a row of the
   assert.equal(sourceUpdates.length, 2, 'a poll after a shown row rebuilt the spend sources again');
 });
 
+test('fifty unshown batches in a hydrated workspace post the project cost at most once per poll', async () => {
+  const { provider, entryOf } = await batchApplyHarness(
+    { ...pollScope, prepareProjectSpendViewSteps, publicProjectSpendPrice, projectSpendHistoryCutoff },
+    ['pollCatalog'],
+  );
+  provider.claudeChildrenDiscovered = true;
+  provider.compressedSpendPick = (files: unknown) => files;
+  provider.projectSpendBusy = () => false;
+  provider.projectSpendWorkspace = 'project';
+  provider.projectSpendHydrated = true;
+  provider.projectSpendRevision = 0;
+  provider.projectSpendSnapshotPrice = publicProjectSpendPrice;
+  let projectPosts = 0;
+  provider.postProjectSpend = () => projectPosts++;
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  try {
+    let posted = 0;
+    for (let batch = 0; batch < 50; batch++) {
+      provider.applyCompressedBatch({ entries: [entryOf(`unshown-${batch}`).entry], backfillMs: 0 });
+      await vi.advanceTimersByTimeAsync(5_000);
+      assert.equal(projectPosts, posted, 'a batch posted the project cost before the poll');
+      if (batch % 10 === 9) {
+        await pollOnce(provider);
+        await vi.advanceTimersByTimeAsync(5_000);
+        assert.equal(projectPosts, ++posted, 'the poll did not post the project cost exactly once');
+      }
+    }
+    provider.showing = 'shown-batch';
+    provider.applyCompressedBatch({ entries: [entryOf('shown-batch').entry], backfillMs: 0 });
+    await vi.advanceTimersByTimeAsync(5_000);
+    assert.equal(projectPosts, posted + 1, 'a shown row did not post the project cost once without a poll');
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 // A provider whose listing starts complete, with a counted membership digest.
 async function provedListingHarness() {
   let digests = 0;

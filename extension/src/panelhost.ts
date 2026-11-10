@@ -2541,6 +2541,8 @@ export class PanelProvider implements vscode.Disposable {
   // Rows that merged since the last poll, for the spend sources and for the project spend post.
   private compressedSourcesOwed = false;
   private compressedSpendPostOwed = false;
+  // Backfill batches that changed the facts since the last poll, for the project spend snapshot.
+  private compressedSnapshotOwed = false;
   // Each provider instance signs its own session cursors, so a reload invalidates every cursor it issued.
   private sessionCursorSecret?: Buffer;
   // Session pages over one accepted catalog and scope filter, sort, and serialize that catalog once.
@@ -5162,8 +5164,8 @@ export class PanelProvider implements vscode.Disposable {
     void this.loadCompressedFacts(stores);
   }
 
-  // True when an entry changed the facts.
-  private applyCompressedEntries(entries: readonly CompressedFactEntry[]): boolean {
+  // True when an entry changed the facts. A backfill batch moves the project spend at the next poll.
+  private applyCompressedEntries(entries: readonly CompressedFactEntry[], afterPoll = false): boolean {
     let changed = false;
     for (const entry of entries) {
       const held = this.compressedFacts.get(entry.file);
@@ -5173,7 +5175,7 @@ export class PanelProvider implements vscode.Disposable {
       (this.compressedRowsDirty ??= new Set()).add(entry.file);
       changed = true;
     }
-    if (changed) this.compressedFactsChanged();
+    if (changed) this.compressedFactsChanged(afterPoll);
     return changed;
   }
 
@@ -5183,7 +5185,7 @@ export class PanelProvider implements vscode.Disposable {
     if (batch.backfillMs) this.performanceCounters?.recordWork('backfillMs', batch.backfillMs);
     for (const entry of batch.entries)
       if (entry.skippedRecords) this.nameCompressedSkips(entry.file, entry.skippedRecords);
-    if (this.applyCompressedEntries(batch.entries)) this.offerCompressedRows();
+    if (this.applyCompressedEntries(batch.entries, true)) this.offerCompressedRows();
   }
 
   // The first batch applies at once. A batch that arrives within the next COMPRESSED_ROWS_APPLY_MS waits for the window to
@@ -5305,7 +5307,14 @@ export class PanelProvider implements vscode.Disposable {
       }
       this.compressedSourcesOwed = false;
     }
-    if (this.compressedSpendPostOwed && !this.projectSpendBusy()) this.postProjectSpend();
+    if (this.compressedSnapshotOwed) {
+      this.compressedSnapshotOwed = false;
+      this.projectSpendRevision++;
+      this.invalidateProjectSpendSnapshot();
+    }
+    // A snapshot rebuild posts the project spend when it ends.
+    const rebuilding = this.projectSpendRebuild || this.projectSpendBuild;
+    if (this.compressedSpendPostOwed && !rebuilding && !this.projectSpendBusy()) this.postProjectSpend();
     this.compressedSpendPostOwed = false;
     return rebuild;
   }
@@ -5455,8 +5464,12 @@ export class PanelProvider implements vscode.Disposable {
       this.compressedLoadCursor = { worker: this.progressiveWorker.currentThreadId ?? null, consumed: value.consumed };
   }
 
-  private compressedFactsChanged(): void {
+  private compressedFactsChanged(afterPoll = false): void {
     this.compressedFactsRevision++;
+    if (afterPoll) {
+      this.compressedSnapshotOwed = true;
+      return;
+    }
     this.projectSpendRevision++;
     this.invalidateProjectSpendSnapshot();
   }
