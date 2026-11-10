@@ -356,8 +356,8 @@ export interface CompressedBackfillOptions {
 
 type Job = { kind: 'opening' | 'body'; file: string; stat: NonNullable<ReturnType<typeof readRolloutStat>> };
 
-// One worker holds one backfill per workspace store. Each list of names replaces the set, and a name that the list no
-// longer holds leaves the queue when its current slice ends.
+// One worker holds one backfill per workspace store. Each list of names replaces the set. A name that the list no longer
+// holds leaves the queue, its running decode stops, and it publishes nothing.
 export class CompressedBackfill {
   private names: ReadonlySet<string> = new Set();
   private readonly events = new Set<string>();
@@ -371,7 +371,7 @@ export class CompressedBackfill {
   private disposed = false;
   private inFolders: (cwd: string) => boolean;
   private rootsKey: string;
-  private readonly stop = new AbortController();
+  private decoding: { file: string; controller: AbortController } | null = null;
   private readonly outbox = new Map<string, CompressedFactEntry>();
   private cancelFlush: (() => void) | null = null;
   private cancelReplan: (() => void) | null = null;
@@ -412,6 +412,7 @@ export class CompressedBackfill {
     const next = new Set(list);
     if (this.names.size) for (const name of next) if (!this.names.has(name)) this.events.add(name);
     this.names = next;
+    if (this.decoding && !next.has(this.decoding.file)) this.decoding.controller.abort();
     this.dirty = true;
     void this.run();
   }
@@ -464,7 +465,7 @@ export class CompressedBackfill {
 
   dispose(): void {
     this.disposed = true;
-    this.stop.abort();
+    this.decoding?.controller.abort();
     this.cancelFlush?.();
     this.cancelFlush = null;
     this.cancelReplan?.();
@@ -697,6 +698,8 @@ export class CompressedBackfill {
   private async deriveBody(job: Job): Promise<void> {
     const derivation = new RolloutDerivation(job.file, this.options.workspace, this.options.limits);
     const slice = { bytes: 0, started: this.now() };
+    const decoding = { file: job.file, controller: new AbortController() };
+    this.decoding = decoding;
     const read = await this.stream(
       job.file,
       async (chunk) => {
@@ -705,10 +708,12 @@ export class CompressedBackfill {
         if (slice.bytes >= BACKFILL_SLICE_BYTES || this.now() - slice.started >= BACKFILL_SLICE_MS)
           await this.sliceEnd(slice);
       },
-      { signal: this.stop.signal },
-    );
+      { signal: decoding.controller.signal },
+    ).finally(() => {
+      this.decoding = null;
+    });
     this.unpostedMs += this.now() - slice.started;
-    if (this.disposed) return;
+    if (this.disposed || !this.names.has(job.file)) return;
     if (read.kind === 'decoded' && read.complete) {
       await this.publish(compressedFactsFromDerivation(job.file, read, derivation));
       return;

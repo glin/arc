@@ -16531,6 +16531,36 @@ test('the slice ends after 4 MiB of output', async () => {
   }
 });
 
+test('a name that a list drops during its decode stops the decode and publishes nothing', async () => {
+  let cancelled: boolean | undefined;
+  const harness = backfillHarness({
+    exists: () => false,
+    statOf: () => ({ ...unitStat, isFile: true }),
+    stream: async (file, consume, limits) => {
+      await consume(Buffer.alloc(100));
+      if (file === 'dropped.jsonl.zst') {
+        harness.backfill.setNames(['kept.jsonl.zst']);
+        cancelled = limits?.signal?.aborted;
+      }
+      return unitDecoded();
+    },
+  });
+  try {
+    seedBody(harness, 'dropped.jsonl.zst');
+    seedBody(harness, 'kept.jsonl.zst');
+    harness.backfill.setNames(['dropped.jsonl.zst']);
+    await vi.waitFor(() => assert.equal(harness.facts.length, 1));
+    assert.deepEqual(
+      harness.facts.map((entry) => entry.file),
+      ['kept.jsonl.zst'],
+      'the dropped name published its decode',
+    );
+    assert.equal(cancelled, true, 'the dropped name kept its decode running');
+  } finally {
+    harness.backfill.dispose();
+  }
+});
+
 test('the slice ends after 50 ms', async () => {
   const yields: number[] = [];
   const harness = backfillHarness({
