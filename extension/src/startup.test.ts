@@ -27582,8 +27582,10 @@ test('one thread counts once across paths, through real openings and a real resc
       provider.projectSpendFiles.map((record: SpendFileIndex, at: number) => [record.file, at]),
     );
     provider.invalidateProjectSpendSnapshot();
+    const replacement = `${plain}.replacement`;
+    fs.writeFileSync(replacement, body(6));
     fs.unlinkSync(plain);
-    fs.writeFileSync(plain, body(6));
+    fs.renameSync(replacement, plain);
     maxBytes = 600;
     index(plain);
     assert.equal(finished(plain).complete, false, 'the rescan did not stop early');

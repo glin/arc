@@ -14830,8 +14830,12 @@ function decoderWorker(directory: string, gated: number[], holdRead = false, hol
   const heldFile = path.join(directory, 'held');
   const whileHeldFile = path.join(directory, 'while-held');
   const armFile = path.join(directory, 'arm');
+  const releaseFile = path.join(directory, 'release');
   const prefix = `{
     const zlib = require('node:zlib');
+    require('node:worker_threads').parentPort.on('message', (message) => {
+      if (message.releaseBody) require('node:fs').writeFileSync(${JSON.stringify(releaseFile)}, message.releaseBody);
+    });
     let decoded = false;
     let holding = false;
     if (${JSON.stringify(holdHash)}) {
@@ -14895,6 +14899,7 @@ function decoderWorker(directory: string, gated: number[], holdRead = false, hol
     decoders,
     open: () => fs.writeFileSync(gate, ''),
     held: () => fs.existsSync(heldFile),
+    released: (file: string) => fs.existsSync(releaseFile) && fs.readFileSync(releaseFile, 'utf8') === file,
     decodedWhileHeld: () => fs.existsSync(whileHeldFile),
     armHash: () => fs.writeFileSync(armFile, ''),
   };
@@ -14996,7 +15001,7 @@ test.skipIf(!zstdCompress)(
   'a release between the end of a decode and the window check turns the window stale',
   async () => {
     const pair = compressedRolloutPair();
-    const { worker, decoders, open, held } = decoderWorker(pair.directory, [], true);
+    const { worker, decoders, open, held, released } = decoderWorker(pair.directory, [], true);
     try {
       const window = worker.run(
         { kind: 'window', input: pair.input(pair.compressed) },
@@ -15006,6 +15011,7 @@ test.skipIf(!zstdCompress)(
       await vi.waitFor(() => assert.ok(held(), 'the window read did not yield after its decode'), DECODE_STARTS);
       assert.equal(decoders().made, 1);
       worker.releaseCompressedBody(pair.compressed);
+      await vi.waitFor(() => assert.ok(released(pair.compressed)), DECODE_STARTS);
       open();
       assert.deepEqual(
         staleKind(await window),
@@ -15027,7 +15033,7 @@ test.skipIf(!zstdCompress)(
   'a release of another path keeps the held body, and a release during the hash check turns the window stale',
   async () => {
     const pair = compressedRolloutPair();
-    const { worker, decoders, open, held, armHash } = decoderWorker(pair.directory, [], false, true);
+    const { worker, decoders, open, held, released, armHash } = decoderWorker(pair.directory, [], false, true);
     const window = (generation: number) =>
       worker.run({ kind: 'window', input: pair.input(pair.compressed) }, generation, new AbortController().signal);
     try {
@@ -15040,6 +15046,7 @@ test.skipIf(!zstdCompress)(
       const hashed = window(3);
       await vi.waitFor(() => assert.ok(held(), 'the window did not hash its held body'), DECODE_STARTS);
       worker.releaseCompressedBody(pair.compressed);
+      await vi.waitFor(() => assert.ok(released(pair.compressed)), DECODE_STARTS);
       open();
       assert.deepEqual(
         staleKind(await hashed),
@@ -15090,7 +15097,7 @@ test.skipIf(!zstdCompress)(
     const second = compressedRolloutPair();
     // The window of the second path holds its first chunk until the gate opens. The page stops that decode and waits
     // until the window ends.
-    const { worker, decoders, open } = decoderWorker(first.directory, [1]);
+    const { worker, decoders, open, released } = decoderWorker(first.directory, [1]);
     try {
       const window = worker.run(
         { kind: 'window', input: second.input(second.compressed) },
@@ -15104,6 +15111,7 @@ test.skipIf(!zstdCompress)(
         new AbortController().signal,
       );
       worker.releaseCompressedBody(first.compressed);
+      await vi.waitFor(() => assert.ok(released(first.compressed)), DECODE_STARTS);
       open();
       assert.deepEqual(staleKind(await window), { kind: 'stale', interrupted: true });
       assert.equal(pageKind(await page), 'stale', 'a page read a body that the host released while it waited');
