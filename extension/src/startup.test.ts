@@ -13748,6 +13748,39 @@ test('fifty unshown batches in a hydrated workspace post the project cost at mos
   }
 });
 
+test('a row under the open session settles its spend and redraws as a shown row does', async () => {
+  const { provider, sourceUpdates, entryOf } = await batchApplyHarness(pollScope, ['pollCatalog']);
+  const refreshes: unknown[][] = [];
+  provider.claudeChildrenDiscovered = true;
+  provider.refreshFrom = (...args: unknown[]) => refreshes.push(args);
+  provider.projectSpendBusy = () => false;
+  let projectPosts = 0;
+  provider.postProjectSpend = () => projectPosts++;
+  provider.codexSubagents = [
+    { threadId: 'open-child', parentThreadId: 'open-parent', backgroundReview: false },
+    { threadId: 'other-child', parentThreadId: 'other-parent', backgroundReview: false },
+  ];
+  provider.showing = 'open-parent';
+  provider.applyCompressedBatch({ entries: [entryOf('other-child').entry], backfillMs: 0 });
+  endBatchWindow(provider);
+  assert.equal(sourceUpdates.length, 0, 'a child of another session rebuilt the spend sources');
+  assert.equal(projectPosts, 0, 'a child of another session posted the project cost');
+  assert.deepEqual(refreshes, [], 'a child of another session redrew the selection');
+  const child = entryOf('open-child');
+  provider.applyCompressedBatch({ entries: [child.entry], backfillMs: 0 });
+  endBatchWindow(provider);
+  assert.ok(
+    sourceUpdates.at(-1)?.some((row) => row.file === child.twin),
+    'a child of the open session waited for the poll to reach its spend source',
+  );
+  assert.equal(projectPosts, 1, 'a child of the open session did not post the project cost');
+  assert.deepEqual(
+    refreshes,
+    [['selected-window', true, true, null, true, true]],
+    'a child of the open session did not redraw the selection',
+  );
+});
+
 // A provider whose listing starts complete, with a counted membership digest.
 async function provedListingHarness() {
   let digests = 0;

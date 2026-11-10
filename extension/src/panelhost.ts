@@ -5275,8 +5275,13 @@ export class PanelProvider implements vscode.Disposable {
     this.noteCompressedRowsGauge(sessions);
     this.armCompressedRowsTimer();
     const changed = new Set([...rows, ...replaced].map((row) => row.sessionId));
-    const shown = [this.showing, ...(this.hostSessions?.values() ?? [])].filter((id): id is string => id !== null);
-    const showsChanged = shown.some((id) => changed.has(id));
+    const shown = new Set([this.showing, ...(this.hostSessions?.values() ?? [])].filter((id) => id !== null));
+    const parents = this.sessionParentsOf();
+    // The spend of a row under the open session joins the total of that session.
+    const showsChanged = [...changed].some((id) => {
+      const parent = parents.get(id)?.parent;
+      return shown.has(id) || (parent !== undefined && shown.has(parent));
+    });
     this.compressedSpendPostOwed = true;
     if (showsChanged) this.settleCompressedSpend();
     this.postRail(true, 'compressedBatch', undefined, false);
