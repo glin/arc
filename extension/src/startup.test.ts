@@ -15460,7 +15460,7 @@ test.each([
 
 test('a walk compares the stamp that the worker accepted', async () => {
   const harness = settledWalkHarness();
-  const { provider, reply, skipped, claude } = harness;
+  const { provider, reply, walked, skipped, settle, claude } = harness;
   const accepted = {
     size: claude.size,
     mtimeMs: claude.mtimeMs,
@@ -15472,20 +15472,41 @@ test('a walk compares the stamp that the worker accepted', async () => {
   reply.entries = [
     [
       claude.file,
-      { size: claude.size, mtimeMs: claude.mtimeMs, dev: claude.dev, ino: claude.ino, evidence: { accepted } },
+      {
+        parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
+        sessionId: claude.sessionId,
+        childTranscript: false,
+        references: [],
+        size: claude.size,
+        mtimeMs: claude.mtimeMs,
+        dev: claude.dev,
+        ino: claude.ino,
+        evidence: { accepted },
+      },
     ],
   ];
-  injectFileStat(claude.file, {
+  const stamp: Record<string, bigint | number> = {
     size: BigInt(claude.size),
     mtimeMs: claude.mtimeMs,
     mtimeNs: 10_000_000n,
-    ctimeNs: 11n,
+    ctimeNs: 10n,
     dev: 1n,
     ino: 2n,
-  });
+  };
+  injectFileStat(claude.file, stamp);
   try {
-    for (let walk = 0; walk < 4; walk++) await provider.refresh(true);
-    assert.equal(skipped(), 0, 'a walk kept discovery over a stamp that differs from the accepted stamp');
+    await settle();
+    assert.ok(skipped() > 0, 'the walk never kept discovery at the accepted stamp');
+    const before = { walked: walked(), skipped: skipped() };
+    // The file moved, and the next reply accepts the earlier stamp again, so the walk after that reply still differs.
+    stamp.ctimeNs = 11n;
+    await provider.refresh(true);
+    await provider.refresh(true);
+    assert.deepEqual(
+      { walked: walked(), skipped: skipped() },
+      { walked: before.walked + 2, skipped: before.skipped },
+      'a walk compared the stamp at acceptance and not the stamp that the worker accepted',
+    );
   } finally {
     vi.restoreAllMocks();
     vi.unstubAllEnvs();
