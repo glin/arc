@@ -842,7 +842,7 @@ export class CompressedBackfill {
     }
     this.results.set(entry.file, compressedEntrySeed(entry));
     this.outbox.set(entry.file, entry);
-    // An opening read already wrote the opening of this revision.
+    // A held opening of this revision needs no second write.
     const held = this.openingEntries.get(entry.file);
     const openingWritten =
       held?.opening && compressedEntryCurrent(held, { size: entry.size!, mtimeMs: entry.mtimeMs! });
