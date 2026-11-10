@@ -145,7 +145,7 @@ import {
   recordCompressedAdoption,
   recordCompressedNames,
 } from './compressedstore';
-import { CompressedBackfill } from './compressedbackfill';
+import { CompressedBackfill, DiscoveryQueue } from './compressedbackfill';
 import { folderMatcher } from './transcript';
 import {
   announceCompressedDecodes,
@@ -692,8 +692,12 @@ const heldCompressedNames = new Map<string, readonly string[]>();
 // The last complete list of names per store, which a backfill that starts later takes.
 const compressedNames = new Map<string, readonly string[]>();
 
+function readerWaits(): boolean {
+  return !!activeKinds.window || !!activeKinds.page;
+}
+
 function backfillBusy(): boolean {
-  return activeDiscovery || !!waitingDiscovery || !!activeKinds.window || !!activeKinds.page;
+  return discovery.busy || readerWaits();
 }
 
 function startCompressedBackfill(
@@ -713,6 +717,7 @@ function startCompressedBackfill(
     roots: start.roots,
     launch: start.launch,
     busy: backfillBusy,
+    reading: readerWaits,
     known: () => follower.known(),
     inFolders: (roots) => folderMatcher([...roots]),
     post: (batch) => {
@@ -2742,7 +2747,7 @@ async function handleMessage(message: {
       completedAt: null,
       report: {
         atReceipt: { ...activeKinds },
-        discoveryWaiting: !!waitingDiscovery,
+        discoveryWaiting: discovery.hasWaiting,
         during: { received: {}, finished: {}, discoveryProgress: 0, repeatedCoverage: 0 },
       },
     });
@@ -2794,6 +2799,7 @@ async function handleMessage(message: {
       )
         value.compressedNames = noteCompressedNames(request.compressed, request.compressedStores);
       if (!controller.signal.aborted) {
+        if (request.kind === 'claude-children') discovery.noteReply(value);
         parentPort?.postMessage({
           id: message.id,
           result: { generation: message.generation, revision: null, value, workerMemory: workerMemory() },
@@ -2931,23 +2937,11 @@ type WorkerMessage = {
   cancel?: number;
   metadataEligible?: string[];
 };
-let activeDiscovery = false;
-let waitingDiscovery: WorkerMessage | undefined;
-function runDiscovery(message: WorkerMessage): void {
-  activeDiscovery = true;
-  void handleMessage(message).finally(() => {
-    if (!waitingDiscovery) {
-      activeDiscovery = false;
-      return;
-    }
-    setImmediate(() => {
-      const waiting = waitingDiscovery;
-      waitingDiscovery = undefined;
-      activeDiscovery = false;
-      if (waiting) runDiscovery(waiting);
-    });
-  });
-}
+const discovery = new DiscoveryQueue<WorkerMessage>({
+  execute: handleMessage,
+  drop: (message) => parentPort?.postMessage({ id: message.id }),
+  backfills: () => compressedBackfills.values(),
+});
 // Bounded reads skip the records that the repeated-record map does not reach yet, and request background
 // completion of the map. When a map reaches the end of its file, the host reads that file again and draws once.
 onClaudeRepeatedCoverage((file) => {
@@ -3003,18 +2997,12 @@ parentPort?.on(
       return;
     }
     if (message.cancel !== undefined) {
-      if (waitingDiscovery?.id === message.cancel) {
-        parentPort?.postMessage({ id: waitingDiscovery.id });
-        waitingDiscovery = undefined;
-      }
+      discovery.cancel(message.cancel);
       void handleMessage({ ...message });
       return;
     }
     if (message.request.kind === 'claude-children') {
-      if (activeDiscovery) {
-        if (waitingDiscovery) parentPort?.postMessage({ id: waitingDiscovery.id });
-        waitingDiscovery = message;
-      } else runDiscovery(message);
+      discovery.submit(message);
       return;
     }
     void handleMessage(message);

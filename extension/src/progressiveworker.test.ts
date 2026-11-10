@@ -17,7 +17,14 @@ import {
   type CompressedFactEntry,
   type CompressedStoreHolder,
 } from './compressedstore.ts';
-import { CompressedBackfill, compressedFactsFromDerivation, RolloutDerivation } from './compressedbackfill.ts';
+import {
+  BACKFILL_SLICE_BYTES,
+  BACKFILL_TURN_LIMIT_MS,
+  CompressedBackfill,
+  compressedFactsFromDerivation,
+  DiscoveryQueue,
+  RolloutDerivation,
+} from './compressedbackfill.ts';
 import { readCompressedFirstRecord, streamCompressedRollout } from './compressedrollouts.ts';
 import { compressedSpendDisplayFiles, indexSpendFile, spendRecordTotal } from './projectspend.ts';
 import * as path from 'node:path';
@@ -15487,6 +15494,100 @@ test.skipIf(!zstdCompress)('a skipped usage record sets the undercount mark', as
     assert.equal(entry.undercount, true, 'a skipped usage record did not set the undercount mark');
   } finally {
     fs.rmSync(pair.directory, { recursive: true, force: true });
+  }
+});
+
+// A backfill that decodes one rollout without end and stops after its first slice, with a discovery queue beside it.
+// The queue starts `count` requests back to back, each one sent while the one before it runs.
+async function discoveryShareHarness(options: { streamHangs?: boolean } = {}) {
+  const chunk = Buffer.alloc(BACKFILL_SLICE_BYTES, 'x');
+  const state = { slices: 0, held: false, reading: false };
+  const harness = backfillHarness({
+    busy: () => state.held || queue.busy || state.reading,
+    reading: () => state.reading,
+    wait: () => new Promise((resolve) => setImmediate(resolve)),
+    exists: () => false,
+    statOf: () => ({ isFile: true, size: 1, mtimeMs: 1, dev: 1, ino: 1 }),
+    stream: async (_file, onChunk, streamOptions) => {
+      const signal = streamOptions!.signal!;
+      while (!signal.aborted) {
+        state.slices++;
+        state.held = true;
+        if (options.streamHangs && state.slices > 1)
+          await new Promise((resolve) => signal.addEventListener('abort', resolve));
+        else await onChunk(chunk);
+      }
+      return { kind: 'cancelled' } as never;
+    },
+  });
+  const started: number[] = [];
+  let answer: (id: number) => void = () => undefined;
+  const queue = new DiscoveryQueue<{ id: number }>({
+    execute: async (message) => {
+      started.push(message.id);
+      answer(message.id);
+    },
+    drop: () => undefined,
+    backfills: () => [harness.backfill],
+  });
+  harness.known.set('a.jsonl.zst', { adoptionFailed: true } as never);
+  harness.backfill.setNames(['a.jsonl.zst']);
+  await vi.waitFor(() => assert.equal(state.slices, 1, 'the first slice did not run'));
+  const backToBack = async (count: number) => {
+    let next = 0;
+    await new Promise<void>((resolve) => {
+      answer = (id) => {
+        if (id === count - 1) resolve();
+        else queue.submit({ id: ++next });
+      };
+      queue.submit({ id: 0 });
+    });
+    await vi.waitFor(() => assert.equal(queue.busy, false, 'the last request did not end'));
+  };
+  return { ...harness, state, queue, started, backToBack };
+}
+
+test('each discovery request after a complete reply lets one backfill slice run first', async () => {
+  const { backfill, state, queue, started, backToBack } = await discoveryShareHarness();
+  try {
+    queue.noteReply({ kind: 'claude-children', complete: false });
+    await backToBack(100);
+    assert.equal(state.slices, 1, 'a request before a complete reply let a slice run');
+    started.length = 0;
+    queue.noteReply({ kind: 'claude-children', complete: true });
+    await backToBack(100);
+    assert.equal(started.length, 100);
+    assert.ok(state.slices - 1 >= 100, `100 requests let ${state.slices - 1} slices run`);
+  } finally {
+    backfill.dispose();
+  }
+});
+
+test('a window read that waits is not held by a slice', async () => {
+  const { backfill, state, queue, started } = await discoveryShareHarness();
+  try {
+    queue.noteReply({ kind: 'claude-children', complete: true });
+    state.reading = true;
+    queue.submit({ id: 1 });
+    assert.deepEqual(started, [1], 'the request did not start at once while a reader waited');
+    await vi.waitFor(() => assert.equal(queue.busy, false));
+    assert.equal(state.slices, 1, 'a slice ran ahead of the reader');
+  } finally {
+    backfill.dispose();
+  }
+});
+
+test('a slice that does not end holds a discovery request only up to the limit', async () => {
+  const { backfill, state, queue, started, advance } = await discoveryShareHarness({ streamHangs: true });
+  try {
+    queue.noteReply({ kind: 'claude-children', complete: true });
+    queue.submit({ id: 1 });
+    await vi.waitFor(() => assert.equal(state.slices, 2, 'the slice did not start'));
+    assert.deepEqual(started, [], 'the request started before its slice ended');
+    advance(BACKFILL_TURN_LIMIT_MS);
+    await vi.waitFor(() => assert.deepEqual(started, [1], 'the request stayed held past the limit'));
+  } finally {
+    backfill.dispose();
   }
 });
 

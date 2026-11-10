@@ -54,6 +54,9 @@ export const BACKFILL_SLICE_MS = 50;
 const PLAN_SLICE_MS = 25;
 // How often a held slice checks that no request waits. The longest wait of a discovery request is one slice.
 const BUSY_CHECK_MS = 50;
+// The longest time a discovery request waits for a slice, because a store write or a slow read can outlast the slice's
+// own limits.
+export const BACKFILL_TURN_LIMIT_MS = 100;
 // A decode that fails or ends inside a frame runs again after each of these delays, and then saves `unreadable`.
 export const BACKFILL_RETRY_DELAYS_MS = [10_000, 60_000, 600_000] as const;
 const BATCH_INTERVAL_MS = 1_000;
@@ -338,6 +341,8 @@ export interface CompressedBackfillOptions {
   launch: string;
   // True while a discovery, continuation or open request waits.
   busy: () => boolean;
+  // True while a window or page read runs. A reader waits on that read, so no slice takes a turn ahead of it.
+  reading?: () => boolean;
   post: (batch: CompressedBackfillBatch) => void;
   // The entries of the facts store that the follower holds.
   known: () => ReadonlyMap<string, CompressedEntrySeed>;
@@ -383,6 +388,9 @@ export class CompressedBackfill {
   private readonly outbox = new Map<string, CompressedFactEntry>();
   private cancelFlush: (() => void) | null = null;
   private cancelReplan: (() => void) | null = null;
+  private turnEnded: (() => void) | null = null;
+  private cancelTurnLimit: (() => void) | null = null;
+  private wake: (() => void) | null = null;
   private lastFlush = -Infinity;
   private unpostedMs = 0;
   private readonly now: () => number;
@@ -475,6 +483,7 @@ export class CompressedBackfill {
   dispose(): void {
     this.disposed = true;
     this.decoding?.controller.abort();
+    this.endTurn();
     this.cancelFlush?.();
     this.cancelFlush = null;
     this.cancelReplan?.();
@@ -500,8 +509,39 @@ export class CompressedBackfill {
     slice.started = this.now();
   }
 
+  // Lets one slice run while discovery requests wait, and resolves when it ended. A slice that already runs is that
+  // slice. The result is null when the backfill holds no work or a reader waits.
+  takeTurn(): Promise<void> | null {
+    if (!this.running || this.disposed || this.options.reading?.()) return null;
+    return new Promise((resolve) => {
+      this.turnEnded = resolve;
+      this.cancelTurnLimit = this.schedule(BACKFILL_TURN_LIMIT_MS, () => {
+        this.cancelTurnLimit = null;
+        this.endTurn();
+      });
+      this.wake?.();
+    });
+  }
+
+  private endTurn(): void {
+    this.cancelTurnLimit?.();
+    this.cancelTurnLimit = null;
+    this.turnEnded?.();
+    this.turnEnded = null;
+  }
+
+  // Every call follows a finished step of work, so it ends a turn that waited on that step.
   private async waitIdle(): Promise<void> {
-    while (this.options.busy() && !this.disposed) await this.wait(BUSY_CHECK_MS);
+    this.endTurn();
+    while (this.options.busy() && !this.disposed && !this.turnEnded) await this.pause();
+  }
+
+  // Lasts until the next busy check, or until a turn starts.
+  private pause(): Promise<void> {
+    return new Promise((resolve) => {
+      this.wake = resolve;
+      void this.wait(BUSY_CHECK_MS).then(resolve);
+    });
   }
 
   private async run(): Promise<void> {
@@ -549,6 +589,7 @@ export class CompressedBackfill {
       }
     } finally {
       this.running = false;
+      this.endTurn();
     }
     if (this.dirty && !this.disposed) void this.run();
   }
@@ -878,5 +919,81 @@ export class CompressedBackfill {
     this.unpostedMs -= backfillMs;
     this.options.post({ entries: batch, backfillMs });
     this.armFlush();
+  }
+}
+
+// Runs discovery requests one at a time. A request that arrives during another waits, and a newer request replaces it.
+// After the first complete discovery reply of the launch, one backfill slice runs before each request, so a chain of
+// continuations leaves the backfill a share of the worker. Until that reply each request starts at once.
+export class DiscoveryQueue<Message extends { id: number }> {
+  private running = false;
+  private waiting: Message | undefined;
+  private completeReply = false;
+
+  constructor(
+    private readonly options: {
+      execute: (message: Message) => Promise<unknown>;
+      // Answers a request that will not run.
+      drop: (message: Message) => void;
+      backfills: () => Iterable<CompressedBackfill>;
+    },
+  ) {}
+
+  get busy(): boolean {
+    return this.running || !!this.waiting;
+  }
+
+  get hasWaiting(): boolean {
+    return !!this.waiting;
+  }
+
+  noteReply(value: { kind: string; complete?: boolean }): void {
+    if (value.kind === 'claude-children' && value.complete) this.completeReply = true;
+  }
+
+  submit(message: Message): void {
+    if (this.running) {
+      if (this.waiting) this.options.drop(this.waiting);
+      this.waiting = message;
+      return;
+    }
+    const slice = this.slice();
+    if (!slice) {
+      this.run(message);
+      return;
+    }
+    this.running = true;
+    this.waiting = message;
+    void slice.then(() => this.release());
+  }
+
+  cancel(id: number): void {
+    if (this.waiting?.id !== id) return;
+    this.options.drop(this.waiting);
+    this.waiting = undefined;
+  }
+
+  private slice(): Promise<unknown> | null {
+    if (!this.completeReply) return null;
+    const turns = [...this.options.backfills()].flatMap((backfill) => backfill.takeTurn() ?? []);
+    return turns.length ? Promise.all(turns) : null;
+  }
+
+  private run(message: Message): void {
+    this.running = true;
+    void this.options.execute(message).finally(() => {
+      if (!this.waiting) {
+        this.running = false;
+        return;
+      }
+      void (this.slice() ?? Promise.resolve()).then(() => setImmediate(() => this.release()));
+    });
+  }
+
+  private release(): void {
+    const waiting = this.waiting;
+    this.waiting = undefined;
+    this.running = false;
+    if (waiting) this.run(waiting);
   }
 }
