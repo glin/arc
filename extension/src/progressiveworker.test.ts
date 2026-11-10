@@ -15500,10 +15500,14 @@ test.skipIf(!zstdCompress)('a skipped usage record sets the undercount mark', as
 // A backfill that decodes one rollout without end and stops after its first slice, with a discovery queue beside it.
 // The queue starts `count` requests back to back, each one sent while the one before it runs.
 async function discoveryShareHarness(
-  options: { streamHangs?: boolean; facts?: Partial<Pick<CompressedStoreHolder, 'append' | 'durable'>> } = {},
+  options: {
+    streamHangs?: boolean;
+    facts?: Partial<Pick<CompressedStoreHolder, 'append' | 'durable'>>;
+    chunkGap?: () => Promise<void>;
+  } = {},
 ) {
   const chunk = Buffer.alloc(BACKFILL_SLICE_BYTES, 'x');
-  const state = { slices: 0, held: false, reading: false };
+  const state = { slices: 0, held: false, reading: false, betweenChunks: false, finished: 0, startedBetween: 0 };
   const harness = backfillHarness({
     busy: () => state.held || queue.busy || state.reading,
     reading: () => state.reading,
@@ -15520,7 +15524,15 @@ async function discoveryShareHarness(
         state.held = true;
         if (options.streamHangs && state.slices > 1)
           await new Promise((resolve) => signal.addEventListener('abort', resolve));
-        else await onChunk(chunk);
+        else if (options.chunkGap) {
+          // Each half alone stays under the slice size, so the slice ends at the second half.
+          await onChunk(chunk.subarray(0, BACKFILL_SLICE_BYTES / 2));
+          state.betweenChunks = true;
+          await options.chunkGap();
+          state.betweenChunks = false;
+          state.finished++;
+          await onChunk(chunk.subarray(BACKFILL_SLICE_BYTES / 2));
+        } else await onChunk(chunk);
         // A rollout with a store stub ends after the slice that the first request lets run.
         if (options.facts) return unitDecoded();
       }
@@ -15532,6 +15544,7 @@ async function discoveryShareHarness(
   const queue = new DiscoveryQueue<{ id: number }>({
     execute: async (message) => {
       started.push(message.id);
+      if (state.betweenChunks) state.startedBetween++;
       answer(message.id);
     },
     drop: () => undefined,
@@ -15626,6 +15639,32 @@ test('a store flush that waits on another window holds no request of a chain', a
     const chain = backToBack(20);
     await vi.waitFor(() => assert.equal(started.length, 20, `only ${started.length} of 20 requests started`));
     await chain;
+  } finally {
+    backfill.dispose();
+  }
+});
+
+test('a request that arrives between two chunks of a slice waits for the end of that slice', async () => {
+  let startChain: () => void = () => undefined;
+  const chainStarted = new Promise<void>((resolve) => {
+    startChain = resolve;
+  });
+  // The gap outlasts a chain of requests that start at once, so such a chain ends inside the gap of one slice.
+  const gapTurns = 256;
+  const { backfill, state, queue, started, backToBack } = await discoveryShareHarness({
+    chunkGap: async () => {
+      await chainStarted;
+      for (let turn = 0; turn < gapTurns; turn++) await new Promise((resolve) => setImmediate(resolve));
+    },
+  });
+  try {
+    queue.noteReply({ kind: 'claude-children', complete: true });
+    await vi.waitFor(() => assert.equal(state.betweenChunks, true, 'the first slice did not reach its chunk gap'));
+    startChain();
+    await backToBack(100);
+    assert.equal(started.length, 100);
+    assert.ok(state.finished >= 100, `100 requests let ${state.finished} slices finish`);
+    assert.equal(state.startedBetween, 0, 'a request started between two chunks of a slice');
   } finally {
     backfill.dispose();
   }

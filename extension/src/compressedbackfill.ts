@@ -508,10 +508,10 @@ export class CompressedBackfill {
     slice.started = this.now();
   }
 
-  // Lets one slice run while discovery requests wait, and resolves when it ended. The result is null when a reader
-  // waits, or when the backfill is not parked between slices, because only a parked backfill can decode at once.
+  // Lets one slice end while discovery requests wait, and resolves when it ended. A parked backfill starts the slice, and
+  // a decode in work ends the slice it holds. The result is null when a reader waits, or at any other step of the backfill.
   takeTurn(): Promise<void> | null {
-    if (!this.wake || this.disposed || this.options.reading?.()) return null;
+    if ((!this.wake && !this.decoding) || this.disposed || this.options.reading?.()) return null;
     return new Promise((resolve) => {
       this.turnEnded = resolve;
       this.cancelTurnLimit = this.schedule(BACKFILL_TURN_LIMIT_MS, () => {
