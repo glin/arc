@@ -15499,7 +15499,9 @@ test.skipIf(!zstdCompress)('a skipped usage record sets the undercount mark', as
 
 // A backfill that decodes one rollout without end and stops after its first slice, with a discovery queue beside it.
 // The queue starts `count` requests back to back, each one sent while the one before it runs.
-async function discoveryShareHarness(options: { streamHangs?: boolean } = {}) {
+async function discoveryShareHarness(
+  options: { streamHangs?: boolean; facts?: Partial<Pick<CompressedStoreHolder, 'append' | 'durable'>> } = {},
+) {
   const chunk = Buffer.alloc(BACKFILL_SLICE_BYTES, 'x');
   const state = { slices: 0, held: false, reading: false };
   const harness = backfillHarness({
@@ -15508,6 +15510,9 @@ async function discoveryShareHarness(options: { streamHangs?: boolean } = {}) {
     wait: () => new Promise((resolve) => setImmediate(resolve)),
     exists: () => false,
     statOf: () => ({ isFile: true, size: 1, mtimeMs: 1, dev: 1, ino: 1 }),
+    ...(options.facts
+      ? { facts: { directory: tempDir('backfill-store-'), ...options.facts } as unknown as CompressedStoreHolder }
+      : {}),
     stream: async (_file, onChunk, streamOptions) => {
       const signal = streamOptions!.signal!;
       while (!signal.aborted) {
@@ -15516,6 +15521,8 @@ async function discoveryShareHarness(options: { streamHangs?: boolean } = {}) {
         if (options.streamHangs && state.slices > 1)
           await new Promise((resolve) => signal.addEventListener('abort', resolve));
         else await onChunk(chunk);
+        // A rollout with a store stub ends after the slice that the first request lets run.
+        if (options.facts) return unitDecoded();
       }
       return { kind: 'cancelled' } as never;
     },
@@ -15586,6 +15593,39 @@ test('a slice that does not end holds a discovery request only up to the limit',
     assert.deepEqual(started, [], 'the request started before its slice ended');
     advance(BACKFILL_TURN_LIMIT_MS);
     await vi.waitFor(() => assert.deepEqual(started, [1], 'the request stayed held past the limit'));
+  } finally {
+    backfill.dispose();
+  }
+});
+
+test('a store write that waits on another window holds no discovery request', async () => {
+  const { backfill, queue, started } = await discoveryShareHarness({
+    facts: { append: () => new Promise(() => undefined) },
+  });
+  try {
+    queue.noteReply({ kind: 'claude-children', complete: true });
+    queue.submit({ id: 1 });
+    await vi.waitFor(() => assert.deepEqual(started, [1], 'the request stayed held by the store write'));
+    await vi.waitFor(() => assert.equal(queue.busy, false));
+    queue.submit({ id: 2 });
+    assert.deepEqual(started, [1, 2], 'the next request took a turn from a backfill that waits on the store');
+  } finally {
+    backfill.dispose();
+  }
+});
+
+test('a store flush that waits on another window holds no request of a chain', async () => {
+  const { backfill, queue, started, backToBack } = await discoveryShareHarness({
+    facts: {
+      append: async (entries: readonly unknown[]) => entries.map(() => false),
+      durable: () => new Promise(() => undefined),
+    },
+  });
+  try {
+    queue.noteReply({ kind: 'claude-children', complete: true });
+    const chain = backToBack(20);
+    await vi.waitFor(() => assert.equal(started.length, 20, `only ${started.length} of 20 requests started`));
+    await chain;
   } finally {
     backfill.dispose();
   }

@@ -509,10 +509,10 @@ export class CompressedBackfill {
     slice.started = this.now();
   }
 
-  // Lets one slice run while discovery requests wait, and resolves when it ended. A slice that already runs is that
-  // slice. The result is null when the backfill holds no work or a reader waits.
+  // Lets one slice run while discovery requests wait, and resolves when it ended. The result is null when a reader waits,
+  // or when the backfill is not parked between slices, because only a parked backfill can decode at once.
   takeTurn(): Promise<void> | null {
-    if (!this.running || this.disposed || this.options.reading?.()) return null;
+    if (!this.wake || this.disposed || this.options.reading?.()) return null;
     return new Promise((resolve) => {
       this.turnEnded = resolve;
       this.cancelTurnLimit = this.schedule(BACKFILL_TURN_LIMIT_MS, () => {
@@ -523,6 +523,7 @@ export class CompressedBackfill {
     });
   }
 
+  // A store call can wait on another window's lease, so the backfill ends a held turn before each one.
   private endTurn(): void {
     this.cancelTurnLimit?.();
     this.cancelTurnLimit = null;
@@ -539,8 +540,12 @@ export class CompressedBackfill {
   // Lasts until the next busy check, or until a turn starts.
   private pause(): Promise<void> {
     return new Promise((resolve) => {
-      this.wake = resolve;
-      void this.wait(BUSY_CHECK_MS).then(resolve);
+      const wake = () => {
+        if (this.wake === wake) this.wake = null;
+        resolve();
+      };
+      this.wake = wake;
+      void this.wait(BUSY_CHECK_MS).then(wake);
     });
   }
 
@@ -709,6 +714,7 @@ export class CompressedBackfill {
   }
 
   private async appendOpenings(entries: CompressedFactEntry[]): Promise<void> {
+    this.endTurn();
     const written = await this.options.openings.append(entries);
     if (written.some((flushed) => !flushed)) await this.options.openings.durable(entries);
   }
@@ -858,6 +864,7 @@ export class CompressedBackfill {
 
   // The entries of the facts store, or null when a store file gave no answer, because a compaction can retire a file during the read.
   private async readFacts(): Promise<ReadonlyMap<string, CompressedFactEntry> | null> {
+    this.endTurn();
     let failed = false;
     const read = await this.readStore(this.options.facts.directory, this.statOf, this.yieldStep, () => {
       failed = true;
@@ -867,6 +874,7 @@ export class CompressedBackfill {
 
   // Each derivation is on disk before the next one starts. The result is true when the entry reached the disk.
   private async publish(next: CompressedFactEntry): Promise<boolean> {
+    this.endTurn();
     let previous: CompressedFactEntry | undefined = this.results.get(next.file) ?? this.options.known().get(next.file);
     // Only a marked derivation needs the stored spend record, so the worker holds no spend for the other entries.
     if (next.undercount && !next.unreadable && !previous?.spend) {
