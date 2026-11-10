@@ -11414,6 +11414,7 @@ export class PanelProvider implements vscode.Disposable {
         if (answered && all.every((session) => answered.has(session.file))) {
           this.completeCatalogScope = catalogScope;
           const revisions = this.discoveryComplete?.revisions;
+          this.sessionReadProofCatalog = undefined;
           this.sessionReadDiscoveryRevision =
             !this.dispatchDiscoveryPending && this.membershipCoverage?.status === 'complete' && revisions
               ? sessionDiscoveryMembership(catalogScope, all, revisions)
