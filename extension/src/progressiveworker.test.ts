@@ -1218,6 +1218,69 @@ test('a replaced directory outside the store that a receipt checked starts a pas
   }
 });
 
+test('a deleted startup binding of an accepted launch starts a pass at the next walk', async () => {
+  const { fx, worker, walk, settle } = await receiptWalkHarness();
+  try {
+    const { launchId } = fx.launch();
+    await settle();
+    assert.equal(await walk(), true);
+    fs.rmSync(path.join(fx.receipts.root, launchId, 'startup.json'));
+    assert.equal(await walk(), false, 'the walk kept discovery over a deleted startup binding');
+  } finally {
+    worker.stop();
+    vi.unstubAllEnvs();
+  }
+});
+
+test.each([
+  ['the anchor', (id: string) => `${id}.json`],
+  ['the receipt', (id: string) => `${id}/receipt.json`],
+  ['the accepted binding', (id: string) => `${id}/accepted.json`],
+  ['the accepted witness', (id: string) => `${id}.accepted.json`],
+  ['the startup binding', (id: string) => `${id}/startup.json`],
+  ['the startup witness', (id: string) => `${id}.startup.json`],
+])('an in-place write of %s starts a pass at the next walk', async (_name, name) => {
+  const { fx, worker, walk, settle } = await receiptWalkHarness();
+  try {
+    const { launchId } = fx.launch();
+    await settle();
+    assert.equal(await walk(), true);
+    fs.appendFileSync(path.join(fx.receipts.root, name(launchId)), ' ');
+    assert.equal(await walk(), false, 'the walk kept discovery over a rewritten evidence file');
+  } finally {
+    worker.stop();
+    vi.unstubAllEnvs();
+  }
+});
+
+test('a refusal marker that joins an accepted launch starts a pass at the next walk', async () => {
+  const { fx, worker, walk, settle } = await receiptWalkHarness();
+  try {
+    const { launchId } = fx.launch();
+    await settle();
+    assert.equal(await walk(), true);
+    fs.writeFileSync(path.join(fx.receipts.root, launchId, 'startup-refused.json'), '{}');
+    assert.equal(await walk(), false, 'the walk kept discovery over a new refusal marker');
+  } finally {
+    worker.stop();
+    vi.unstubAllEnvs();
+  }
+});
+
+test('a write to a launch file that the scan does not read keeps the walk from sending a request', async () => {
+  const { fx, worker, walk, settle } = await receiptWalkHarness();
+  try {
+    const { launchId } = fx.launch();
+    await settle();
+    assert.equal(await walk(), true);
+    fs.appendFileSync(path.join(fx.receipts.root, launchId, 'state.json'), ' ');
+    assert.equal(await walk(), true, 'a file outside the relationship read moved the signal');
+  } finally {
+    worker.stop();
+    vi.unstubAllEnvs();
+  }
+});
+
 test('a refused receipt read leaves no store revision until a clean pass', async () => {
   const marker = path.join(tempDir('receipt-refusal-'), 'refuse');
   const { fx, worker, host, pass, settle, walk } = await receiptWalkHarness(

@@ -282,8 +282,8 @@ interface ReceiptScan {
   storeIdentity: string;
   // The store revision from before the scan opened the store, or undefined when the store proves nothing about a later read.
   storeRevision: string | undefined;
-  // Each directory and absent path outside the store that the scan checked, with its revision.
-  outside: Map<string, string | null>;
+  // Each path that decided a relationship in this scan, with its revision.
+  evidence: Map<string, string | null>;
   // True after a refused read, or after one path answered with two revisions.
   unproved: boolean;
 }
@@ -1497,7 +1497,7 @@ async function execute(
       const scan: ReceiptScan = {
         storeIdentity: store.storeIdentity(),
         storeRevision: store.storeRevision(),
-        outside: new Map(),
+        evidence: new Map(),
         unproved: false,
         epoch: epoch.epoch,
         store,
@@ -1598,10 +1598,10 @@ async function execute(
         activeReceipts.store.checkpointRelationships();
       }
       if (step.value.refusal) activeReceipts.unproved = true;
-      for (const [file, revision] of step.value.outside ?? []) {
-        if (activeReceipts.outside.has(file) && activeReceipts.outside.get(file) !== revision)
+      for (const [file, revision] of step.value.evidence ?? []) {
+        if (activeReceipts.evidence.has(file) && activeReceipts.evidence.get(file) !== revision)
           activeReceipts.unproved = true;
-        activeReceipts.outside.set(file, revision);
+        activeReceipts.evidence.set(file, revision);
       }
       if (step.value.refusal && ('launchId' in step.value.refusal || step.value.refusal.storeOpened))
         activeReceipts.competitionRefused = true;
@@ -1669,7 +1669,7 @@ async function execute(
       scope: epoch.repositoryRoots,
       receiptStore: activeReceipts.storeIdentity,
       ...(activeReceipts.storeRevision !== undefined && !activeReceipts.unproved
-        ? { receiptRevision: { store: activeReceipts.storeRevision, outside: [...activeReceipts.outside] } }
+        ? { receiptRevision: { store: activeReceipts.storeRevision, evidence: [...activeReceipts.evidence] } }
         : {}),
     };
   }

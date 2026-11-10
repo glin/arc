@@ -15307,7 +15307,7 @@ function settledWalkHarness() {
         ...result.value,
         membershipSettled: reply.settled,
         continuation: !reply.settled,
-        receiptRevision: { store: new DispatchReceipts().storeRevision(), outside: [] },
+        receiptRevision: { store: new DispatchReceipts().storeRevision(), evidence: [] },
       },
     };
   };
