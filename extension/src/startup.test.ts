@@ -13158,6 +13158,29 @@ test('a batch row that a panel shows redraws through the selected-window refresh
   );
 });
 
+test('twenty batches with no shown session redraw only for the first row of an empty list', async () => {
+  const { provider, entryOf } = await batchApplyHarness();
+  const refreshes: unknown[][] = [];
+  provider.refreshFrom = (...args: unknown[]) => refreshes.push(args);
+  provider.showing = null;
+  const applyTwenty = (prefix: string) => {
+    for (let batch = 0; batch < 20; batch++) {
+      provider.applyCompressedBatch({ entries: [entryOf(`${prefix}-${batch}`).entry], backfillMs: 0 });
+      endBatchWindow(provider);
+    }
+  };
+  applyTwenty('listed');
+  assert.deepEqual(refreshes, [], 'a batch redrew a selection that a list with rows left empty');
+  provider.catalog = { ...provider.catalog, sessions: [] };
+  provider.authoritativeCatalog = [];
+  applyTwenty('first');
+  assert.deepEqual(
+    refreshes,
+    [['selected-window', true, true, null, true, true]],
+    'the first row of an empty list did not redraw once',
+  );
+});
+
 test('a joined row asks discovery for no pass and leaves nothing for the next acceptance to answer', async () => {
   const { provider, work, entryOf, releaseAll } = await batchApplyHarness();
   provider.claudeChildrenDiscovered = true;

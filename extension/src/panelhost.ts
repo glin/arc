@@ -5250,10 +5250,11 @@ export class PanelProvider implements vscode.Disposable {
     this.armCompressedRowsTimer();
     this.postRail(true, 'compressedBatch', undefined, false);
     if (!this.projectSpendBusy()) this.postProjectSpend();
-    // A row that a panel shows, or the first row of an empty selection, redraws through the selected-window path.
+    // A row that a panel shows redraws through the selected-window path. So does the first row of an empty list when no
+    // session is shown.
     const changed = new Set([...rows, ...replaced].map((row) => row.sessionId));
     const shown = [this.showing, ...(this.hostSessions?.values() ?? [])].filter((id): id is string => id !== null);
-    if (this.showing === null ? rows.length > 0 : shown.some((id) => changed.has(id)))
+    if (this.showing === null ? accepted.length === 0 && rows.length > 0 : shown.some((id) => changed.has(id)))
       this.refreshFrom('selected-window', true, true, null, true, true);
     this.performanceCounters?.recordRefresh('compressed-facts', performance.now() - started);
   }
