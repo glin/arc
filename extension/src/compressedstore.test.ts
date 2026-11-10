@@ -508,30 +508,63 @@ test('compaction at the closed segment count folds segments into shards and keep
   holder.dispose();
 });
 
-test('steady appends write at most twice the bytes the store keeps, and a compaction runs after they stop', async () => {
+const keptBytes = (directory: string) =>
+  [...readCompressedStore(directory).entries.values()].reduce(
+    (bytes, stored) => bytes + Buffer.byteLength(JSON.stringify(stored)) + 1,
+    0,
+  );
+
+const paddedEntry = (at: number) =>
+  entry(`rollout-${at}.jsonl.zst`, { carriedName: { label: 'x'.repeat(1024), fullLabel: '' } });
+
+test('steady appends write at most twice the bytes the store keeps, through every compaction', async () => {
   let written = 0;
-  const { directory, clock, make, names } = storeFixture('store-steady-appends', {
+  const { directory, clock, make } = storeFixture('store-steady-appends', {
     segmentBytes: 4 * 1024,
     wrote: (bytes) => (written += bytes),
   });
   const holder = make();
-  const pad = 'x'.repeat(1024);
   // One append every 10 s for 30 minutes.
   for (let at = 0; at < 180; at++) {
-    await holder.append([entry(`rollout-${at}.jsonl.zst`, { carriedName: { label: pad, fullLabel: '' } })]);
+    await holder.append([paddedEntry(at)]);
     clock.advance(10_000);
   }
-  const kept = [...readCompressedStore(directory).entries.values()].reduce(
-    (bytes, stored) => bytes + Buffer.byteLength(JSON.stringify(stored)) + 1,
-    0,
-  );
-  assert.equal(threadCount(directory), 180);
-  assert.ok(written <= 2 * kept, `the store wrote ${written} bytes to keep ${kept}`);
-  const segments = () => names().filter((name) => name.startsWith('segment-')).length;
-  assert.ok(segments() > 0, 'no closed segment waited for the compaction');
   clock.advance(20_000);
-  await vi.waitFor(() => assert.equal(segments(), 0, 'no compaction ran after the appends stopped'));
+  await vi.waitFor(() => assert.equal(holder.held, false, 'the holder kept the lease after the appends stopped'));
   assert.equal(threadCount(directory), 180);
+  const kept = keptBytes(directory);
+  assert.ok(written <= 2 * kept, `the store wrote ${written} bytes to keep ${kept}`);
+  holder.dispose();
+});
+
+// Each release closes a segment of one append, so timed compactions run as the store doubles. Their rewrites add up to
+// less than twice the kept bytes, on top of the appends themselves.
+test('appends that release the lease between them write at most three times the bytes the store keeps', async () => {
+  let written = 0;
+  const { directory, clock, make, names } = storeFixture('store-released-appends', {
+    segmentBytes: 4 * 1024,
+    wrote: (bytes) => (written += bytes),
+    // A takeover reads the age of the newest manifest from the file, so the file carries the time of the test clock.
+    fault: (at) => {
+      if (at !== 'compact:manifest-saved') return;
+      const time = new Date(clock.now);
+      for (const name of names().filter((held) => held.startsWith('manifest-')))
+        fs.utimesSync(path.join(directory, name), time, time);
+    },
+  });
+  const holder = make();
+  let released = 0;
+  // One append every 25 s for 30 minutes. The idle release fires 20 s after each append.
+  for (let at = 0; at < 72; at++) {
+    await holder.append([paddedEntry(at)]);
+    clock.advance(25_000);
+    await vi.waitFor(() => assert.equal(holder.held, false, 'the idle release did not fire'));
+    released++;
+  }
+  assert.equal(released, 72);
+  assert.equal(threadCount(directory), 72);
+  const kept = keptBytes(directory);
+  assert.ok(written <= 3 * kept, `the store wrote ${written} bytes to keep ${kept}`);
   holder.dispose();
 });
 

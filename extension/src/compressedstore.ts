@@ -994,8 +994,34 @@ export class CompressedStoreHolder {
   // arriving, the closed segment limit alone starts a compaction.
   private timedCompactionDue(): boolean {
     return (
-      this.closedSegments > 0 && this.now() - this.lastCompaction >= COMPACT_INTERVAL_MS && this.compactionAllowed()
+      this.closedSegments > 0 &&
+      this.now() - this.lastCompaction >= COMPACT_INTERVAL_MS &&
+      this.compactionAllowed() &&
+      this.segmentsOutweighShards(storeView(this.directory, listDirectory(this.directory)))
     );
+  }
+
+  // True when no shard exists or the closed segments hold at least as many bytes as the shards, so a compaction that
+  // the segment limit did not force writes at most twice the bytes it folds in.
+  private segmentsOutweighShards(view: StoreView): boolean {
+    let segments = 0;
+    let shards = 0;
+    for (const stored of view.inputs) {
+      if (stored.name === this.open?.name || !this.ownVersion(stored.name)) continue;
+      const bytes = this.storedBytes(stored.name);
+      if (stored.kind === 'shard') shards += bytes;
+      else segments += bytes;
+    }
+    return shards === 0 || segments >= shards;
+  }
+
+  // A file that a compaction already retired holds no bytes.
+  private storedBytes(name: string): number {
+    try {
+      return fs.statSync(path.join(this.directory, name)).size;
+    } catch {
+      return 0;
+    }
   }
 
   // An append that arrives during the compaction keeps the lease for its own run.
@@ -1270,7 +1296,7 @@ export class CompressedStoreHolder {
     if (
       this.closedSegments >= this.compactSegments ||
       after.valid.length > 1 ||
-      (this.closedSegments && this.compactionDue(after))
+      (this.closedSegments && this.compactionDue(after) && this.segmentsOutweighShards(after))
     ) {
       await this.compact(true);
     }
