@@ -5255,6 +5255,7 @@ export class PanelProvider implements vscode.Disposable {
     );
     this.catalog = { ...held, sessions };
     this.authoritativeCatalog = admitted;
+    this.noteCompressedMembership(accepted, admitted, replaced, rows, scope);
     this.noteCompressedCoverage(admitted, replaced, rows);
     this.noteCompressedRowFacts(admitted, replaced, rows);
     this.compressedFactsRefreshDue = true;
@@ -5269,6 +5270,24 @@ export class PanelProvider implements vscode.Disposable {
     if (this.showing === null ? accepted.length === 0 && rows.length > 0 : shown.some((id) => changed.has(id)))
       this.refreshFrom('selected-window', true, true, null, true, true);
     this.performanceCounters?.recordRefresh('compressed-facts', performance.now() - started);
+  }
+
+  // The discovery proof follows a merge when it named the old list and the last walk listed each changed row. A row that
+  // leaves the list, or that no walk listed, leaves the proof on the earlier membership.
+  private noteCompressedMembership(
+    accepted: SessionFile[],
+    admitted: SessionFile[],
+    replaced: readonly SessionFile[],
+    rows: readonly SessionFile[],
+    scope: string,
+  ): void {
+    const proof = this.sessionReadDiscoveryRevision;
+    const walk = this.compressedWalk;
+    if (!proof || !walk) return;
+    const merged = new Set(rows.map((row) => row.file));
+    if (!replaced.every((row) => merged.has(row.file)) || !rows.every((row) => walk.listed.has(row.file))) return;
+    if (proof !== this.sessionPageIndexFor(accepted, scope, this.repositoryScopeRoots).discovery) return;
+    this.sessionReadDiscoveryRevision = this.sessionPageIndexFor(admitted, scope, this.repositoryScopeRoots).discovery;
   }
 
   // A joined row counts as a member when the walk listed it, as `acceptSessionCoverage` counts it. A row that leaves the

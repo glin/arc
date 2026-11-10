@@ -128,7 +128,12 @@ import {
   preserveHostRead,
   projectAgentRead,
 } from './domain/read.ts';
-import { sessionCatalogMembership, sessionDiscoveryMembership, sessionDiscoveryMismatch } from './sessionreads.ts';
+import {
+  sessionCatalogMembership,
+  sessionDiscoveryMembership,
+  sessionDiscoveryMismatch,
+  sessionQueryRevision,
+} from './sessionreads.ts';
 import { REPOSITORY_SCOPE_CONFIRM_MS, REPOSITORY_SCOPE_REFRESH_MS, RepositoryScope } from './repositoryscope';
 import {
   CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
@@ -3301,6 +3306,8 @@ function completeDiscoveryHarness(
     'mergeCompressedRows',
     'noteCompressedCoverage',
     'noteCompressedRowFacts',
+    'noteCompressedMembership',
+    'sessionPageIndexFor',
     'drainCompressedRows',
     'compressedRolloutsToSend',
     'markCompressedRolloutsSent',
@@ -13283,6 +13290,41 @@ test('twenty batches with no shown session redraw only for the first row of an e
     [['selected-window', true, true, null, true, true]],
     'the first row of an empty list did not redraw once',
   );
+});
+
+test('a merged row keeps the session listing complete only when the last walk listed it', async () => {
+  const { provider, work, entryOf } = await batchApplyHarness({ sessionQueryRevision }, [
+    'sessionQueryContext',
+    'sessionQueryRevisionFor',
+    'sessionsKeptByReader',
+  ]);
+  const scope = JSON.stringify(provider.repositoryScopeRoots);
+  provider.sessionReadDiscoveryRevision = sessionCatalogMembership(scope, provider.authoritativeCatalog);
+  provider.sessionQueryDiscoveryPending = false;
+  provider.dispatchDiscoveryPending = false;
+  provider.membershipCoverage = {
+    domain: 'admitted',
+    scope,
+    revision: '1',
+    status: 'complete',
+    files: [],
+    uncertain: [],
+    members: new Set<string>(),
+  };
+  assert.equal(provider.sessionQueryContext().coverage, 'complete', 'the fixture did not start complete');
+  const listed = entryOf('walk-listed');
+  provider.compressedWalk.listed.add(listed.twin);
+  provider.applyCompressedBatch({ entries: [listed.entry], backfillMs: 0 });
+  endBatchWindow(provider);
+  assert.equal(
+    provider.sessionQueryContext().coverage,
+    'complete',
+    'a row the walk listed left the listing incomplete',
+  );
+  assert.deepEqual(discoveryRequests(work), [], 'the merge asked discovery for a pass');
+  provider.applyCompressedBatch({ entries: [entryOf('never-walked').entry], backfillMs: 0 });
+  endBatchWindow(provider);
+  assert.equal(provider.sessionQueryContext().coverage, 'incomplete', 'a row no walk listed read as covered');
 });
 
 test('a joined row asks discovery for no pass and leaves nothing for the next acceptance to answer', async () => {
