@@ -1817,6 +1817,9 @@ test('the named counters hold every counter that the measure table lists', () =>
     'compressedLoadMs',
     'backfillMs',
     'refreshCount:compressed-facts',
+    'compressedMerge',
+    'compressedMergeMs',
+    'compressedMergeMaxMs',
   ])
     assert.ok((NAMED_COUNTERS as readonly string[]).includes(name), name);
 });
@@ -2510,6 +2513,44 @@ test('a launch whose readers read nothing reports 0 for every source, and an old
   const older = soakMeasures({ counters: { work: { catalogWalk: 1 } } });
   const table = markdownTable(compareResults([runnerResult(older)], [runnerResult(counting)]), 'baseline', 'candidate');
   for (const name of OPENING_READ_COUNTERS) assert.ok(table.includes(`| ${name} | not reported | 0 |`), name);
+});
+
+const COMPRESSED_MERGE_MEASURES = ['compressedMerge', 'compressedMergeMs', 'compressedMergeMaxMs'];
+
+test('a limit on the longest merge fails a run past it, and the merge rows report only until a bound names them', () => {
+  const counters = new PanelPerformanceCounters();
+  counters.recordWork('compressedMerge');
+  counters.recordWork('compressedMergeMs', 80.4);
+  counters.recordGauge('compressedMergeMaxMs', 80.4);
+  const measures = soakMeasures({ counters: counters.snapshot() as any });
+  assert.deepEqual(
+    COMPRESSED_MERGE_MEASURES.map((name) => measures[name]),
+    [1, 80.4, 80.4],
+  );
+  const row = (bounds: ReturnType<typeof boundsOf>, name: string) =>
+    compareResults([runnerResult()], [runnerResult(measures)], bounds).find((measure) => measure.name === name)!;
+  for (const name of COMPRESSED_MERGE_MEASURES)
+    assert.deepEqual([row({}, name).reportOnly, row({}, name).regressed], [true, false], name);
+  assert.equal(row({}, 'compressedMerge').kind, 'count');
+  const past = row(boundsOf(['--limit', 'compressedMergeMaxMs=50']), 'compressedMergeMaxMs');
+  assert.deepEqual([past.regressed, past.candidate], [true, 80.4]);
+  assert.equal(row(boundsOf(['--limit', 'compressedMergeMaxMs=90']), 'compressedMergeMaxMs').regressed, false);
+  const hold = { compressedMerge: 40, compressedMergeMs: 900, compressedMergeMaxMs: 120 };
+  const held = compareResults(
+    [runnerResult()],
+    [{ ...runnerResult(), warmUp: { hold: { snapshot: hold } } }],
+    boundsOf(['--limit', 'compressedMergeMaxMs=90']),
+  ).find((measure) => measure.name === 'compressedMergeMaxMs')!;
+  assert.deepEqual([held.regressed, held.candidate], [true, 120], 'the limit did not read the hold snapshot');
+});
+
+test('a run with no merge reports no merge row', () => {
+  const measures = soakMeasures({ counters: { work: { catalogWalk: 1 } } });
+  assert.deepEqual(
+    COMPRESSED_MERGE_MEASURES.filter((name) => name in measures),
+    [],
+    'a run with no merge reported a merge row',
+  );
 });
 
 test('refresh rows read the hold snapshot when the run holds', () => {
@@ -13307,6 +13348,28 @@ test('ten merges add ten to the merge count and none to the refresh count', asyn
   assert.equal(work.compressedMerge, 10, 'a merge went uncounted');
   assert.equal(typeof work.compressedMergeMs, 'number', 'the merges recorded no time of their own');
   assert.equal(refreshes['compressed-facts'], undefined, 'a merge counted as a compressed-facts refresh');
+});
+
+test('merge time adds without rounding and the gauge holds the longest merge', async () => {
+  const { provider, work, gauges, entryOf } = await batchApplyHarness();
+  let now = 1_000;
+  const clock = vi.spyOn(performance, 'now').mockImplementation(() => now);
+  const postRail = provider.postRail;
+  const spent = [0.4, 2.5, 0.2];
+  provider.postRail = function (...args: unknown[]) {
+    now += spent.shift() ?? 0;
+    return postRail.apply(this, args);
+  };
+  try {
+    for (let batch = 0; batch < 3; batch++) {
+      provider.applyCompressedBatch({ entries: [entryOf(`timed-${batch}`).entry], backfillMs: 0 });
+      endBatchWindow(provider);
+    }
+  } finally {
+    clock.mockRestore();
+  }
+  assert.ok(Math.abs(work.compressedMergeMs - 3.1) < 1e-6, `the merges added ${work.compressedMergeMs} ms`);
+  assert.ok(Math.abs(gauges.compressedMergeMaxMs - 2.5) < 1e-6, `the gauge held ${gauges.compressedMergeMaxMs} ms`);
 });
 
 test('a batch that changes a listed row updates that row in both catalogs', async () => {

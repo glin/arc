@@ -297,6 +297,9 @@ export const NAMED_COUNTERS = [
   'compressedLoadMs',
   'backfillMs',
   'refreshCount:compressed-facts',
+  'compressedMerge',
+  'compressedMergeMs',
+  'compressedMergeMaxMs',
 ] as const;
 const WORK_COUNTERS: Readonly<Record<string, string>> = { catalogWalks: 'catalogWalk' };
 
@@ -348,6 +351,8 @@ export function soakMeasures(snapshot: {
   const work = snapshot.counters?.work ?? {};
   for (const measure of NAMED_COUNTERS) {
     if (typeof out[measure] === 'number') continue;
+    // A snapshot with no merge reports no merge row, so the comparison shows "not reported".
+    if (measure.startsWith('compressedMerge') && typeof work.compressedMerge !== 'number') continue;
     const value = measure.startsWith('refreshCount:') ? undefined : work[WORK_COUNTERS[measure] ?? measure];
     out[measure] = typeof value === 'number' ? value : 0;
   }

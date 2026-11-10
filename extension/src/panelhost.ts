@@ -2543,6 +2543,8 @@ export class PanelProvider implements vscode.Disposable {
   private compressedSpendPostOwed = false;
   // Backfill batches that changed the facts since the last poll, for the project spend snapshot.
   private compressedSnapshotOwed = false;
+  // The longest single merge of this activation, for the `compressedMergeMaxMs` gauge.
+  private compressedMergeLongestMs?: number;
   // Each provider instance signs its own session cursors, so a reload invalidates every cursor it issued.
   private sessionCursorSecret?: Buffer;
   // Session pages over one accepted catalog and scope filter, sort, and serialize that catalog once.
@@ -5292,7 +5294,10 @@ export class PanelProvider implements vscode.Disposable {
     if (this.showing === null ? firstRow : showsChanged)
       this.refreshFrom('selected-window', true, true, null, true, true);
     this.performanceCounters?.recordWork('compressedMerge');
-    this.performanceCounters?.recordWork('compressedMergeMs', Math.round(performance.now() - started));
+    const mergeMs = performance.now() - started;
+    this.compressedMergeLongestMs = Math.max(this.compressedMergeLongestMs ?? 0, mergeMs);
+    this.performanceCounters?.recordWork('compressedMergeMs', mergeMs);
+    this.performanceCounters?.recordGauge('compressedMergeMaxMs', this.compressedMergeLongestMs);
   }
 
   // Brings the spend sources and the project spend up to the merged rows. Returns whether the spend sources were rebuilt,

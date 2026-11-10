@@ -63,6 +63,7 @@ const COUNTS = new Set([
   'receiptScanTurns',
   'catalogWalks',
   'compressedRows',
+  'compressedMerge',
   'compressedDecodes',
   'compressedPending',
   'compressedTempEntries',
@@ -89,6 +90,7 @@ export const REPORT_ONLY_PREFIXES = [
   'refreshCount:catalog-enumeration:',
   'openingsRead:',
   ...CAUSE_COUNTER_PREFIXES,
+  'compressedMerge',
 ] as const;
 
 export function isReportOnly(name: string): boolean {
@@ -106,13 +108,14 @@ function kindOf(name: string): Kind {
       : 'time';
 }
 
-// The refresh rows and opening read rows that the comparison reads from the hold snapshot when the run holds, and from
+// The refresh rows, opening read rows and merge rows that the comparison reads from the hold snapshot when the run holds, and from
 // the end snapshot of the measured launch otherwise.
 export function readFromHold(name: string): boolean {
   return (
     name.startsWith('refreshMs:') ||
     name.startsWith('refreshMaxMs:') ||
     name.startsWith('openingsRead:') ||
+    name.startsWith('compressedMerge') ||
     name === 'refreshCount:compressed-facts'
   );
 }
