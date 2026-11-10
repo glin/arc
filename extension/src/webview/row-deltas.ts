@@ -56,20 +56,9 @@ export interface RowLists {
   stats: Readonly<Record<string, unknown>>;
 }
 
-// A 64-bit hash of the value's JSON text and the text length. Two different rows share a print with negligible probability.
-// The sender keeps prints rather than the text, so its memory stays small for every listed session.
+// Exact JSON text for comparison with the last posted value.
 export function rowPrint(value: unknown): string {
-  const text = JSON.stringify(value) ?? '';
-  let first = 0xdeadbeef;
-  let second = 0x41c6ce57;
-  for (let at = 0; at < text.length; at++) {
-    const code = text.charCodeAt(at);
-    first = Math.imul(first ^ code, 2654435761);
-    second = Math.imul(second ^ code, 1597334677);
-  }
-  first = Math.imul(first ^ (first >>> 16), 2246822507) ^ Math.imul(second ^ (second >>> 13), 3266489909);
-  second = Math.imul(second ^ (second >>> 16), 2246822507) ^ Math.imul(first ^ (first >>> 13), 3266489909);
-  return `${(second >>> 0).toString(36)}.${(first >>> 0).toString(36)}.${text.length}`;
+  return JSON.stringify(value) ?? '';
 }
 
 // The shortest edit that keeps a common start and end of the held order. Returns undefined when the order did not move.

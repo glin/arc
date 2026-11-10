@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { test } from 'vitest';
 import { parseHostToPanel } from './protocol.ts';
-import { replaceRows, replaceStats, RowDeltaReceiver, RowDeltaSender, rowOrderEdit } from './row-deltas.ts';
+import { replaceRows, replaceStats, RowDeltaReceiver, RowDeltaSender, rowOrderEdit, rowPrint } from './row-deltas.ts';
 
 function seeded(seed: number): () => number {
   let state = seed;
@@ -363,6 +363,26 @@ test('a delta carries only rows whose content changed', () => {
     statsRemoved: ['b'],
   });
   assert.equal(sender.encode({ rail: rows('B2'), stats: { a: 1 } }, { day: 'next' }).rows?.base, null);
+});
+
+test('exact row text keeps unchanged rows and sends changed rows including one-character edits', () => {
+  const sender = new RowDeltaSender();
+  const rows = [
+    { id: 'a', label: 'A' },
+    { id: 'b', label: 'B' },
+  ];
+  const message = () => ({ sessions: rows, rail: rows, stats: { a: rows[0], b: rows[1] } });
+  sender.encode(message(), {});
+  const unchanged = sender.encode(message(), {});
+  assert.deepEqual([unchanged.sessions, unchanged.rail, unchanged.stats], [[], [], {}]);
+  rows[0] = { ...rows[0], label: 'C' };
+  const changed = sender.encode(message(), {});
+  assert.deepEqual([changed.sessions, changed.rail, changed.stats], [[rows[0]], [rows[0]], { a: rows[0] }]);
+  rows[0] = { ...rows[0], label: 'D' };
+  rows[1] = { ...rows[1], label: 'D' };
+  const both = sender.encode(message(), {});
+  assert.deepEqual([both.sessions, both.rail, both.stats], [rows, rows, { a: rows[0], b: rows[1] }]);
+  for (const row of rows) assert.equal(rowPrint(row), JSON.stringify(row));
 });
 
 test('an order edit keeps the common start and end of the held order', () => {
