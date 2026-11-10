@@ -15933,6 +15933,7 @@ export class PanelProvider implements vscode.Disposable {
   private async prepareMetadata(sessions: SessionFile[], generation: number, signal: AbortSignal): Promise<boolean> {
     let remaining = INITIAL_RAIL_READ_BYTES;
     for (const session of sessions) {
+      if (isCompressedRollout(session.file)) continue;
       const previous = this.titles.get(session.file);
       if (previous && sameSessionRevision(previous, session) && previous.foldedLabel !== undefined) {
         this.observeStoredEntry(session, previous);

@@ -8516,6 +8516,7 @@ function titlePublicationHarness(
       withSessionName,
       transcriptIdentity,
       codexTitleFor,
+      compressedTitleCurrent,
       saveDerivedCache,
       DERIVED_CACHE_CHECKPOINT_MS: 5 * 60 * 1000,
       ...real.scope,
@@ -13024,6 +13025,106 @@ function backfillHostHarness() {
   });
   return { provider, twin, entry, refreshes, gauges };
 }
+
+test('stored compressed rows publish without metadata requests and a plain replacement requests metadata', async () => {
+  const stored = backfillHostHarness();
+  const facts = stored.entry();
+  stored.provider.applyCompressedEntries([facts]);
+  const rows = stored.provider.withCompressedFactRows([]);
+  assert.equal(rows.length, 1);
+  let release!: (result: ProgressiveResult | null) => void;
+  const held = new Promise<ProgressiveResult | null>((resolve) => {
+    release = resolve;
+  });
+  const requests: ProgressiveRequest[] = [];
+  const provider = titlePublicationHarness(rows, (request: ProgressiveRequest) => {
+    requests.push(request);
+    return held;
+  });
+  provider.compressedFacts.set(stored.twin, facts);
+  let pending = provider.refresh(true);
+  try {
+    await vi.waitFor(() =>
+      assert.ok(
+        requests.some((request) => request.kind === 'metadata') ||
+          provider.messages.some((message: any) => message.rail),
+      ),
+    );
+    assert.deepEqual(
+      requests.filter((request) => request.kind === 'metadata'),
+      [],
+      'a stored compressed row requests metadata before publication',
+    );
+    await pending;
+    assert.deepEqual(
+      provider.messages.at(-1).rail.map((row: any) => row.id),
+      [twinThread],
+    );
+    assert.equal(provider.messages.at(-1).rail[0].label, 'Decoded title');
+
+    const plain = stored.twin.replace(/\.zst$/, '');
+    fs.renameSync(stored.twin, plain);
+    provider.partial = [{ ...rows[0], file: plain }];
+    provider.catalog = { sessions: provider.partial };
+    pending = provider.refresh(true);
+    await vi.waitFor(() => assert.ok(requests.some((request) => request.kind === 'metadata')));
+    assert.deepEqual(
+      requests.flatMap((request) => (request.kind === 'metadata' ? [request.session.file] : [])),
+      [plain],
+    );
+  } finally {
+    release(null);
+    await pending;
+    provider.abandonCatalogRefresh();
+    if (provider.derivedCacheCheckpointTick) clearTimeout(provider.derivedCacheCheckpointTick);
+  }
+});
+
+test('a plain row beside a stored compressed row requests metadata before both rows publish', async () => {
+  const stored = backfillHostHarness();
+  const facts = stored.entry();
+  stored.provider.applyCompressedEntries([facts]);
+  const rows = stored.provider.withCompressedFactRows([]);
+  const plain = titleRollout(path.dirname(stored.twin), 'plain', 'Plain title');
+  let release!: (result: ProgressiveResult | null) => void;
+  const held = new Promise<ProgressiveResult | null>((resolve) => {
+    release = resolve;
+  });
+  const requests: ProgressiveRequest[] = [];
+  const provider = titlePublicationHarness([...rows, plain], (request: ProgressiveRequest) => {
+    requests.push(request);
+    return held;
+  });
+  provider.compressedFacts.set(stored.twin, facts);
+  const pending = provider.refresh(true);
+  try {
+    await vi.waitFor(() => assert.ok(requests.some((request) => request.kind === 'metadata')));
+    assert.deepEqual(
+      requests.flatMap((request) => (request.kind === 'metadata' ? [request.session.file] : [])),
+      [plain.file],
+    );
+    assert.deepEqual(provider.messages, [], 'rows publish before the plain metadata request returns');
+    release(null);
+    await pending;
+    assert.deepEqual(
+      provider.messages
+        .at(-1)
+        .rail.map((row: any) => row.id)
+        .sort(),
+      [twinThread, plain.sessionId].sort(),
+    );
+    assert.equal(provider.messages.at(-1).rail.find((row: any) => row.id === twinThread).label, 'Decoded title');
+    assert.deepEqual(
+      requests.flatMap((request) => (request.kind === 'metadata' ? [request.session.file] : [])),
+      [plain.file],
+    );
+  } finally {
+    release(null);
+    await pending;
+    provider.abandonCatalogRefresh();
+    if (provider.derivedCacheCheckpointTick) clearTimeout(provider.derivedCacheCheckpointTick);
+  }
+});
 
 test('a backfill batch with no held catalog lists a compressed-only session with its title and cost through one refresh', () => {
   const { provider, twin, entry, refreshes } = backfillHostHarness();
