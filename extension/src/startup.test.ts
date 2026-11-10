@@ -3122,6 +3122,8 @@ function harness(pendingRefresh = false, registerRefreshHandler = true, extraMet
   methods.push(...extraMethods);
   methods.push(
     'compressedRolloutsToSend',
+    'walkKeepsDiscovery',
+    'unlistedCodexChildren',
     'compressedStorePaths',
     'compressedSpendPick',
     'titleEntryOf',
@@ -3323,6 +3325,8 @@ function completeDiscoveryHarness(
     sessionCoverageMember,
     reconcileSessionCollisions,
     sessionCatalogMembership,
+    discoveryMemberRevisions,
+    DispatchReceipts,
     sessionDiscoveryMismatch,
     sessionPageSources,
     sessionPresence,
@@ -3461,6 +3465,8 @@ function completeDiscoveryHarness(
     'sessionPageIndexFor',
     'drainCompressedRows',
     'compressedRolloutsToSend',
+    'walkKeepsDiscovery',
+    'unlistedCodexChildren',
     'markCompressedRolloutsSent',
     'compressedStorePaths',
     'resumeCompressedAdoptions',
@@ -3975,6 +3981,8 @@ function selectedWindowHarness(
 
   const names = new Set([
     'compressedRolloutsToSend',
+    'walkKeepsDiscovery',
+    'unlistedCodexChildren',
     'markCompressedRolloutsSent',
     'compressedStorePaths',
     'resumeCompressedAdoptions',
@@ -12271,6 +12279,8 @@ test.skipIf(!rolloutCompression.zstdCompressSync)(
 test('discovery sends the compressed list only when the set changed since the last send to the current worker', () => {
   const { provider } = heldWalkHarness({ COMPRESSED_FACTS_STORE, COMPRESSED_OPENINGS_STORE, arcHome }, [
     'compressedRolloutsToSend',
+    'walkKeepsDiscovery',
+    'unlistedCodexChildren',
     'markCompressedRolloutsSent',
     'compressedStorePaths',
   ]);
@@ -15269,8 +15279,6 @@ function settledWalkHarness() {
   const reply = { settled: true };
   const harness = bumpedCatalogHarness(
     {
-      DispatchReceipts,
-      discoveryMemberRevisions,
       revalidatedCatalogPaths: (sessions: SessionFile[]) => [...sessions],
       enumerateClaudeChildSources: (parents: SessionFile[]) => {
         const sessions = parents.filter((session) => session.childTranscript);
@@ -15284,7 +15292,7 @@ function settledWalkHarness() {
       },
     },
     false,
-    ['walkKeepsDiscovery', 'unlistedCodexChildren', 'compressedRolloutsToSend', 'compressedStorePaths'],
+    ['compressedRolloutsToSend', 'compressedStorePaths'],
   );
   const { provider } = harness;
   const counters = new PanelPerformanceCounters();

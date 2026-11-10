@@ -15267,6 +15267,7 @@ export class PanelProvider implements vscode.Disposable {
       held.scope !== JSON.stringify(this.repositoryScopeRoots) ||
       held.folders !== this.catalog?.folders ||
       this.dispatchDiscoveryPending ||
+      this.dispatchSpendPending ||
       this.sessionQueryDiscoveryPending ||
       this.discoveryCheckpoint !== undefined ||
       this.codexListingSeeded ||
