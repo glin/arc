@@ -264,6 +264,10 @@ The test pads the temporary root to one UTF-8 byte length in JSON, so a non-ASCI
 
 The failure message names the step, the counter, the recorded budget, the measured count and the reason of the row. The message tells the reader to update the row if the change is intended. It tells the reader to find the cause if the change is not intended.
 
+The host work guard uses V8 precise coverage with `callCount: true` and `detailed: true`. It sums function and block executions in host scripts under `extension/src/`, excluding test files and generated Vitest export accessors. It divides the difference between 400 and 200 listed sessions by 200. A settled workspace receives an unchanged poll refresh, a selection, one new turn, and an unchanged discovery reply. An unchanged-filter session list post also runs. The test starts coverage and disables optimization, Maglev, Sparkplug, and lazy feedback allocation before product modules load. These interpreter flags keep block counts independent of compiler tiers. The guard measures JavaScript executions, excluding worker execution and work inside native functions. It measures growth over this fixture range, rather than CPU cost or every possible session mix.
+
+The `hostWork` rows in `scripts/test-budget.json` record block executions per added session with a zero margin. A failure lists the ten functions with the largest growth, including their source locations. After a fix reduces work, run the host work test and lower each changed row to its reported value. Repeat the test to check that the value stays fixed. A rise requires investigation before a deliberate row edit.
+
 The test measures no duration. The default test timeout catches only a hang.
 
 ## Diagnostic implementation
