@@ -19349,7 +19349,6 @@ test('claude relationship byte causes bound each running append at both file siz
     measurements.push(bytes);
   }
   assert.deepEqual(measurements[0], measurements[1]);
-  console.log('claude append bytes', JSON.stringify(measurements));
 });
 
 test('claude relationship pending records read only appended bytes and validation', async () => {
@@ -19358,7 +19357,6 @@ test('claude relationship pending records read only appended bytes and validatio
   fs.appendFileSync(file, '{"type":"ignored","payload":"' + 'y'.repeat(8192));
   const budget = 128 * 1024;
   let scan = await scanClaudeRelationshipQuantum({ file, sessionId: 'parent' }, undefined, budget);
-  const bytes: number[] = [];
   for (let step = 0; step < 3; step++) {
     assert.equal(scan.complete, false);
     const quiet = await scanClaudeRelationshipQuantum(
@@ -19377,10 +19375,7 @@ test('claude relationship pending records read only appended bytes and validatio
       undefined,
       meter,
     );
-    bytes.push(meter.readBytes);
-    console.log('claude pending step', step, meter.readBytes, meter.claudeRelationshipBoundaryBytes ?? 0);
     assert.equal(meter.claudeRelationshipBoundaryBytes ?? 0, 0);
     assert.ok(meter.readBytes <= 8192 + 8191);
   }
-  console.log('claude pending bytes', JSON.stringify(bytes));
 });

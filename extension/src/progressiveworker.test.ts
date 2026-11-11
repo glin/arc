@@ -17967,8 +17967,199 @@ test('relationship second activation above the save cap counts only omitted sour
       for (const cause of ['NoEntry', 'Rejected', 'Resumed', 'Growth', 'Validation', 'Boundary'] as const)
         sum += charges[`${agent}Relationship${cause}Bytes`] ?? 0;
     assert.equal(sum, charges.readBytes - (charges.receiptBytes ?? 0));
-    console.log('cap second activation', JSON.stringify({ sources: parents.length, dropped, relationshipBytes: sum }));
   } finally {
     worker.stop();
   }
 }, 240000);
+
+const RELATIONSHIP_CAUSES = ['NoEntry', 'Rejected', 'Resumed', 'Growth', 'Validation', 'Boundary'] as const;
+
+// Runs discovery requests until a complete reply, checks that the six causes of each reply partition its relationship
+// bytes, and returns the bytes of each cause summed over the replies, with the count of replies that read bytes.
+async function relationshipCauseTotals(
+  worker: ProgressiveWorker,
+  request: (pass: number) => import('./progressiveworker').ProgressiveRequest,
+  agent: 'claude' | 'codex',
+) {
+  const totals = Object.fromEntries(RELATIONSHIP_CAUSES.map((cause) => [cause, 0])) as Record<
+    (typeof RELATIONSHIP_CAUSES)[number],
+    number
+  >;
+  let reading = 0;
+  for (let pass = 0; pass < 50; pass++) {
+    const result = await worker.run(request(pass), 100 + pass, new AbortController().signal);
+    assert.ok(
+      result?.value.kind === 'claude-children' || result?.value.kind === 'claude-children-progress',
+      'discovery returned no reply',
+    );
+    const charges = result.value.charges!;
+    let relationship = 0;
+    for (const provider of ['claude', 'codex'] as const)
+      for (const cause of RELATIONSHIP_CAUSES) relationship += charges[`${provider}Relationship${cause}Bytes`] ?? 0;
+    assert.equal(relationship, charges.readBytes - (charges.receiptBytes ?? 0));
+    for (const cause of RELATIONSHIP_CAUSES) totals[cause] += charges[`${agent}Relationship${cause}Bytes`] ?? 0;
+    if (relationship > 0) reading++;
+    if (result.value.kind === 'claude-children' && !result.value.continuation) return { totals, reading };
+  }
+  throw new Error('discovery never completed');
+}
+
+function relationshipFixture(prefix: string, name = 'parent.jsonl') {
+  const directory = tempDir(prefix);
+  const file = path.join(directory, name);
+  const rows = Array.from({ length: 200 }, (_, index) =>
+    JSON.stringify({ type: 'ignored', index, payload: 'y'.repeat(1000) }),
+  );
+  fs.writeFileSync(file, rows.join('\n') + '\n');
+  return { directory, file, size: fs.statSync(file).size };
+}
+
+test.each([
+  ['claude', 'NoEntry'],
+  ['codex', 'NoEntry'],
+  ['claude', 'Rejected'],
+  ['codex', 'Rejected'],
+] as const)('a %s source read from byte 0 across requests counts its opening bytes under %s', async (agent, cause) => {
+  const { directory, file, size } = relationshipFixture('relationship-origin-');
+  const appended = JSON.stringify({ type: 'ignored', payload: 'z'.repeat(1000) }) + '\n';
+  const worker = new ProgressiveWorker('performance.now=()=>0;' + source);
+  try {
+    // The host names a load rejection until the first reply acknowledges the source. The file grows after that reply.
+    const { totals, reading } = await relationshipCauseTotals(
+      worker,
+      (pass) => {
+        if (pass === 1) fs.appendFileSync(file, appended);
+        return {
+          kind: 'claude-children',
+          parents: [{ file, agent, sessionId: 'session', ...revisionOf(fs.statSync(file, { bigint: true })) }],
+          repositoryRoots: [directory],
+          quantumBytes: 65536,
+          discoveryBytes: 65536,
+          ...(cause === 'Rejected' && pass === 0 ? { relationshipRejections: [normalizeFsPath(file)] } : {}),
+        };
+      },
+      agent,
+    );
+    assert.ok(reading >= 2, 'the source finished in one request');
+    assert.equal(totals[cause], size);
+    assert.equal(totals[cause === 'NoEntry' ? 'Rejected' : 'NoEntry'], 0);
+    assert.equal(totals.Resumed + totals.Growth, appended.length);
+  } finally {
+    worker.stop();
+  }
+});
+
+test.each(['claude', 'codex'] as const)(
+  'a %s source that a same-size rewrite rebuilds counts the rebuild as rejected',
+  async (agent) => {
+    const { directory, file, size } = relationshipFixture('relationship-rebuild-');
+    const request = () => ({
+      kind: 'claude-children' as const,
+      parents: [{ file, agent, sessionId: 'session', ...revisionOf(fs.statSync(file, { bigint: true })) }],
+      repositoryRoots: [directory],
+      quantumBytes: 65536,
+      discoveryBytes: 65536,
+    });
+    const worker = new ProgressiveWorker('performance.now=()=>0;' + source);
+    try {
+      const first = await completeDiscovery(worker, request(), 1, new AbortController().signal);
+      assert.ok(first?.value.kind === 'claude-children');
+      fs.writeFileSync(file, fs.readFileSync(file, 'utf8').replace('"index":0,', '"index":9,'));
+      fs.utimesSync(file, new Date(0), new Date(first.value.referenceEntries[0][1].mtimeMs + 2000));
+      const { totals } = await relationshipCauseTotals(worker, request, agent);
+      assert.ok(totals.Validation > 0, 'the rewrite was not compared');
+      assert.equal(totals.Rejected, size);
+      assert.equal(totals.Resumed, 0);
+      assert.equal(totals.NoEntry, 0);
+      assert.equal(totals.Growth, 0);
+    } finally {
+      worker.stop();
+    }
+  },
+);
+
+test('a saved pending cursor that resumes beside a source read from byte 0 counts as resumed', async () => {
+  const saved = relationshipFixture('relationship-resumed-', 'saved.jsonl');
+  const fresh = path.join(saved.directory, 'fresh.jsonl');
+  fs.writeFileSync(fresh, fs.readFileSync(saved.file, 'utf8').repeat(2));
+  const parent = (file: string) => ({
+    file,
+    agent: 'claude' as const,
+    sessionId: path.basename(file),
+    ...revisionOf(fs.statSync(file, { bigint: true })),
+  });
+  let worker = new ProgressiveWorker('performance.now=()=>0;' + source);
+  try {
+    const partial = await worker.run(
+      {
+        kind: 'claude-children',
+        parents: [parent(saved.file)],
+        repositoryRoots: [saved.directory],
+        quantumBytes: 65536,
+      },
+      1,
+      new AbortController().signal,
+    );
+    assert.ok(partial?.value.kind === 'claude-children-progress');
+    const entries = partial.value.referenceEntries;
+    const offset = entries[0][1].claudeCursor!.offset;
+    assert.ok(offset > 0 && offset < saved.size);
+    worker.stop();
+    worker = new ProgressiveWorker('performance.now=()=>0;' + source);
+    const { totals, reading } = await relationshipCauseTotals(
+      worker,
+      () => ({
+        kind: 'claude-children',
+        parents: [parent(fresh), parent(saved.file)],
+        repositoryRoots: [saved.directory],
+        referenceEntries: entries,
+        quantumBytes: 65536,
+      }),
+      'claude',
+    );
+    assert.ok(reading >= 2, 'the sources finished in one request');
+    assert.equal(totals.NoEntry, fs.statSync(fresh).size);
+    assert.equal(totals.Resumed, saved.size - offset);
+    assert.equal(totals.Rejected, 0);
+    assert.equal(totals.Growth, 0);
+  } finally {
+    worker.stop();
+  }
+});
+
+test('the save cap gauge holds the drops of the last save', async () => {
+  vi.stubGlobal('PANEL_CSS', '');
+  vi.stubGlobal('PANEL_JS', '');
+  vi.stubGlobal('PANEL_DEV_SERVER_URL', null);
+  const { PanelProvider } = await import('./panelhost.js');
+  const { MAX_CLAUDE_CHILD_REFERENCE_FILES } = await import('./derivedcache.ts');
+  const root = tempDir('relationship-cap-gauge-');
+  const counters = new PanelPerformanceCounters(0, 'relationship-cap-gauge');
+  const entries = new Map<string, import('./derivedcache').ClaudeChildReferenceCacheEntry>();
+  for (let index = 0; index <= MAX_CLAUDE_CHILD_REFERENCE_FILES; index++)
+    entries.set(normalizeFsPath(path.join(root, `${String(index).padStart(5, '0')}.jsonl`)), {
+      parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
+      source: 'claude',
+      sessionId: String(index),
+      childTranscript: false,
+      references: [],
+      complete: true,
+      size: 1,
+      mtimeMs: 1,
+      dev: '1',
+      ino: String(index),
+    });
+  const host = Object.create(PanelProvider.prototype) as Record<string, any>;
+  Object.assign(host, {
+    derivedCacheFile: path.join(root, 'cache.json'),
+    titles: new Map(),
+    carriedNames: new Map(),
+    claudeChildReferenceEntries: entries,
+    commitRepositories: { snapshot: () => [] },
+    performanceCounters: counters,
+  });
+  for (let save = 0; save < 2; save++) assert.equal(host.writeDerivedCache(), true);
+  const { gauges } = counters.snapshot();
+  assert.equal(gauges['relationshipSaveCapDropped:claude'], 1);
+  assert.equal(gauges['relationshipSaveCapDropped:codex'], 0);
+});

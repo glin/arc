@@ -161,6 +161,9 @@ import {
 const agentSpends = new AgentSpendCache();
 const claudeChildSessions = new ClaudeChildSessionCache();
 const claudeChildReferences = new Map<string, ClaudeChildReferenceCacheEntry>();
+// The read cause of each candidate source whose relationship scan started from byte 0 and has not reached its target.
+// Later slices of that scan count their bytes under this cause.
+const relationshipOrigins = new Map<string, 'noEntry' | 'rejected'>();
 // Cached subagent revisions invalidate the dispatched session's spend.
 // Claude retains its append scan for reader input.
 // Codex retains its prompt cursor across quiet reads to correct copied-turn classification.
@@ -1220,6 +1223,7 @@ async function execute(
     // The seeded count reaches the host at once, whatever agent the remaining sources belong to.
     if (completionChanges.size) acknowledge?.(pending(undefined, true));
     const relationshipRejections = new Set(request.relationshipRejections);
+    for (const key of relationshipOrigins.keys()) if (!candidates.has(key)) relationshipOrigins.delete(key);
     const requestBytes = Math.min(request.discoveryBytes ?? CODEX_DISPATCH_REQUEST_BYTES, CODEX_DISPATCH_REQUEST_BYTES);
     const quantumBytes = Math.min(request.quantumBytes ?? RELATIONSHIP_QUANTUM_BYTES, RELATIONSHIP_QUANTUM_BYTES);
     const pendingCharge = (entry: ClaudeChildReferenceCacheEntry | undefined) =>
@@ -1240,6 +1244,7 @@ async function execute(
           admittedCompletions.add(key);
           completionChanges.set(key, true);
           claudeChildReferences.delete(key);
+          relationshipOrigins.delete(key);
           epochChildSessions.set(key, null);
           dispatchFacts.delete(parent.file);
           if (epoch.protectedFile === key) delete epoch.protectedFile;
@@ -1284,7 +1289,14 @@ async function execute(
         let cursor: import('./codex').CodexDispatchCursor | undefined;
         let claudeCursor: import('./transcript').ClaudeRelationshipCursor | undefined;
         let reset = !identity || (!!held && !(held.claudeCursor?.evidence ?? held.cursor?.evidence));
-        const origin = held || relationshipRejections.has(key) ? ('rejected' as const) : ('noEntry' as const);
+        // A scan that resumes a held cursor keeps the cause of the scan from byte 0 that made the cursor.
+        const resumes = identity && !!(parent.agent === 'codex' ? held?.cursor : held?.claudeCursor);
+        const origin = resumes
+          ? relationshipOrigins.get(key)
+          : held || relationshipRejections.has(key)
+            ? ('rejected' as const)
+            : ('noEntry' as const);
+        let rebuilt = false;
         if (parent.agent === 'codex') {
           const scan = await scanCodexDispatchReferencesAsync(
             parent.file,
@@ -1294,11 +1306,12 @@ async function execute(
             () => signal.aborted,
             charges,
             undefined,
-            identity && held?.cursor ? undefined : origin,
+            origin,
           );
           cursor = scan.cursor;
           complete = scan.complete;
           qualified = scan.qualified && !scan.reset;
+          rebuilt = scan.reset;
           reset ||= scan.reset;
           references = scan.qualified
             ? scan.references
@@ -1325,12 +1338,13 @@ async function execute(
             signal,
             charges,
             undefined,
-            identity && held?.claudeCursor ? undefined : origin,
+            origin,
           );
           claudeCursor = scan.cursor;
           complete = scan.complete;
           qualified = scan.qualified && !scan.reset;
           references = scan.references;
+          rebuilt = scan.reset;
           reset ||= scan.reset;
         }
         charges.resets += Number(reset && !!held);
@@ -1343,6 +1357,10 @@ async function execute(
         };
         const evidence = claudeCursor?.evidence ?? cursor!.evidence;
         const reachedTarget = cursor ? cursor.offset === cursor.target : claudeCursor!.offset === claudeCursor!.target;
+        // A mismatch starts the source again from byte 0, and the slices that rebuild it count as rejected.
+        const scanOrigin = rebuilt ? 'rejected' : origin;
+        if (reachedTarget || !scanOrigin) relationshipOrigins.delete(key);
+        else relationshipOrigins.set(key, scanOrigin);
         const accepted =
           qualified &&
           (complete || (parent.agent === 'claude' && reachedTarget && claudeCursor!.offset === scanRevision.size));

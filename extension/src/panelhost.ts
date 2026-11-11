@@ -12982,7 +12982,7 @@ export class PanelProvider implements vscode.Disposable {
           { parents: parentOpenings, children: childOpenings },
           (dropped) => {
             for (const agent of ['claude', 'codex'] as const)
-              this.performanceCounters?.recordWork?.(`relationshipSaveCapDropped:${agent}`, dropped[agent]);
+              this.performanceCounters?.recordGauge?.(`relationshipSaveCapDropped:${agent}`, dropped[agent]);
           },
         );
         // The source set changes only at a settled reply, so a write for another reason leaves its file alone.

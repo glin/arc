@@ -19919,7 +19919,6 @@ test('codex relationship byte causes bound each running append at both file size
     measurements.push(bytes);
   }
   assert.deepEqual(measurements[0], measurements[1]);
-  console.log('codex append bytes', JSON.stringify(measurements));
 });
 
 test('codex relationship pending records count boundary recovery at both file sizes', async () => {
@@ -19938,6 +19937,8 @@ test('codex relationship pending records count boundary recovery at both file si
       const quiet = await scanCodexDispatchReferencesAsync(file, 'parent', structuredClone(scan.cursor), budget);
       assert.equal(quiet.complete, false);
       assert.equal(quiet.readBytes, 0);
+      const before = fs.readFileSync(file);
+      const fragment = before.length - (before.lastIndexOf(10) + 1);
       fs.appendFileSync(file, 'z'.repeat(8192));
       const meter: import('./transcript').RelationshipReadMeter = { readBytes: 0 };
       scan = await scanCodexDispatchReferencesAsync(
@@ -19949,6 +19950,8 @@ test('codex relationship pending records count boundary recovery at both file si
         meter,
       );
       assert.equal(meter.codexRelationshipGrowthBytes, 8192);
+      // Each append to the unfinished record reads its discarded fragment again.
+      assert.equal(meter.codexRelationshipBoundaryBytes, fragment);
       assert.ok((meter.codexRelationshipValidationBytes ?? 0) < 8192);
       assert.equal(
         meter.readBytes,
@@ -19961,5 +19964,4 @@ test('codex relationship pending records count boundary recovery at both file si
     measurements.push(bytes);
   }
   assert.deepEqual(measurements[0], measurements[1]);
-  console.log('codex pending bytes', JSON.stringify(measurements));
 });
