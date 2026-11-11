@@ -1,5 +1,6 @@
 import { validClaudeTaskCompletions } from './transcript';
 import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { boundedCommitRepositories, type VerifiedCommitRepository } from './commitrepositories';
 import { writeFileAtomically } from './atomicfile';
 import { storedCodexMetas } from './codexopenings';
@@ -484,17 +485,15 @@ export function savedSpendSourcesRefusal(
   return null;
 }
 
-// The saved form of a settled source list. `listed` holds rows with the walk's stat of each file, and a later row of a file
-// replaces an earlier one. A source file without a listed row with a device and inode saves no identity.
-export function savedSpendSourcesOf(
-  scope: string,
-  compatibility: string,
+// The stats that a settled source list saves for its files. `listed` holds rows with a stat of each file, and a later row of
+// a file replaces an earlier one. A source file without a listed row with a device and inode saves no stats.
+export function savedSpendFilesOf(
   sources: readonly SessionSpendSource[],
   listed: Iterable<
     Pick<FileRevision, 'size' | 'mtimeMs'> & { file: string; dev?: number | string; ino?: number | string }
   >,
   key: (file: string) => string,
-): SavedSpendSources {
+): SavedSpendFile[] {
   const stats = new Map<string, SavedSpendFile>();
   for (const { file, size, mtimeMs, dev, ino } of listed)
     if (dev !== undefined && ino !== undefined && fileIdentityValue(dev) && fileIdentityValue(ino))
@@ -505,22 +504,42 @@ export function savedSpendSourcesOf(
     const stat = stats.get(at);
     if (stat) files.set(at, { ...stat, file: source.file });
   }
-  return {
-    version: SAVED_SPEND_SOURCES_VERSION,
-    scope,
-    compatibility,
-    sources: [...sources],
-    files: [...files.values()],
-  };
+  return [...files.values()];
+}
+
+// Whether two lists of saved file stats hold the same values in the same order.
+export function sameSavedSpendFiles(left: readonly SavedSpendFile[], right: readonly SavedSpendFile[]): boolean {
+  return (
+    left.length === right.length &&
+    left.every(
+      (file, at) =>
+        file.file === right[at].file &&
+        file.size === right[at].size &&
+        file.mtimeMs === right[at].mtimeMs &&
+        String(file.dev) === String(right[at].dev) &&
+        String(file.ino) === String(right[at].ino),
+    )
+  );
+}
+
+// The saved form of a settled source list with the stats of its files.
+export function savedSpendSourcesOf(
+  scope: string,
+  compatibility: string,
+  sources: readonly SessionSpendSource[],
+  files: readonly SavedSpendFile[],
+): SavedSpendSources {
+  return { version: SAVED_SPEND_SOURCES_VERSION, scope, compatibility, sources: [...sources], files: [...files] };
 }
 
 // The saved sources of each session whose source files kept their identity, and the count of sessions that lost them. A
 // source file that the walk lists keeps its identity when its saved size, modification time, device and inode equal the
 // walk's stat, and its spend index record has the same size and modification time. A record that names the device and inode
 // of its file must name those of the walk's stat. A source file that the walk does not list keeps its saved source, so its
-// spend index record counts as it stands. `children` pairs each child file that the walk lists with the file of its parent.
-// A child file that the saved set does not hold takes the saved sources from every session that holds its parent's file.
-// `key` gives the walk's key of a file.
+// spend index record counts as it stands. `children` names each child file that the walk lists, with the file of its parent
+// and, for a Claude child, its folder. A child file that the saved set does not hold takes the saved sources from every
+// session that holds its parent's file or a file in its folder. Claude keeps the transcripts of every depth of one session in
+// one folder, so the folder reaches the parent of a nested child. `key` gives the walk's key of a file.
 export function admittedSpendSources(
   saved: SavedSpendSources,
   key: (file: string) => string,
@@ -529,12 +548,17 @@ export function admittedSpendSources(
     Pick<FileRevision, 'size' | 'mtimeMs'> & { dev?: number | string; ino?: number | string }
   >,
   recorded: (file: string) => { size: number; mtimeMs: number; sourceIdentity?: string } | undefined,
-  children: Iterable<readonly [child: string, parent: string]> = [],
+  children: Iterable<readonly [child: string, parent: string | undefined, folder?: string]> = [],
 ): { sources: SessionSpendSource[]; changed: number } {
   const identities = new Map(saved.files.map((file) => [key(file.file), file]));
   const held = new Set(saved.sources.map((source) => key(source.file)));
   const grown = new Set<string>();
-  for (const [child, parent] of children) if (!held.has(key(child))) grown.add(key(parent));
+  const grownFolders = new Set<string>();
+  for (const [child, parent, folder] of children) {
+    if (held.has(key(child))) continue;
+    if (parent !== undefined) grown.add(key(parent));
+    if (folder !== undefined) grownFolders.add(key(folder));
+  }
   const kept = new Map<string, boolean>();
   const unchanged = (file: string): boolean => {
     const at = key(file);
@@ -545,6 +569,7 @@ export function admittedSpendSources(
     const record = stat && recorded(file);
     answer =
       !grown.has(at) &&
+      !(grownFolders.size && grownFolders.has(key(path.dirname(file)))) &&
       (!stat ||
         (!!identity &&
           !!record &&
@@ -626,13 +651,17 @@ export function loadSavedSpendSources(file: string): LoadedSpendSources {
     : { refused: 'malformed' };
 }
 
-// Replaces `file` atomically with the set. A set past `MAX_SAVED_SPEND_SOURCES` is not saved, and the file is left as it is.
+// Replaces `file` atomically with the set. A set past `MAX_SAVED_SPEND_SOURCES` is not saved, and the file is removed, so the
+// next start holds no set.
 export function saveSavedSpendSources(
   file: string,
   saved: SavedSpendSources,
   replace: (temporary: string, target: string) => void = fs.renameSync,
 ): void {
-  if (saved.sources.length > MAX_SAVED_SPEND_SOURCES || saved.files.length > MAX_SAVED_SPEND_SOURCES) return;
+  if (saved.sources.length > MAX_SAVED_SPEND_SOURCES || saved.files.length > MAX_SAVED_SPEND_SOURCES) {
+    fs.rmSync(file, { force: true });
+    return;
+  }
   writeFileAtomically(file, JSON.stringify(saved), replace);
 }
 

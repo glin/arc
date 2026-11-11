@@ -293,6 +293,11 @@ import {
   type DerivedCache,
   type DerivedCacheSources,
   type DerivedTitleEntry,
+  loadSavedSpendSources,
+  saveSavedSpendSources,
+  MAX_SAVED_SPEND_SOURCES,
+  SAVED_SPEND_SOURCES_FILE,
+  SAVED_SPEND_SOURCES_VERSION,
 } from './derivedcache.ts';
 import { savedOpeningCurrent, savedParentOpeningCurrent, type SavedClaudeOpening } from './filerevision.ts';
 // The Claude metadata generation used by current-format fixtures.
@@ -3999,4 +4004,23 @@ test('the saved Claude openings report the bytes and the time that they add to o
       `${withOpenings.ms.toFixed(2)} ms with them and ${without.ms.toFixed(2)} ms without them (median of 5)`,
   );
   assert.ok(withOpenings.bytes > without.bytes, 'the saved openings added no bytes');
+});
+
+test('a source set past the saved limit removes the saved file, so the next start holds no set', () => {
+  const file = path.join(tempDir('saved-spend-limit-'), SAVED_SPEND_SOURCES_FILE);
+  const source = (at: number) => ({ sessionId: `s${at}`, file: `s${at}.jsonl`, primary: true });
+  const set = {
+    version: SAVED_SPEND_SOURCES_VERSION,
+    scope: '[]',
+    compatibility: 'c',
+    sources: [source(0)],
+    files: [],
+  };
+  saveSavedSpendSources(file, set);
+  assert.deepEqual(loadSavedSpendSources(file).sources?.sources, [source(0)], 'the first set was not saved');
+  saveSavedSpendSources(file, {
+    ...set,
+    sources: Array.from({ length: MAX_SAVED_SPEND_SOURCES + 1 }, (_unused, at) => source(at)),
+  });
+  assert.deepEqual(loadSavedSpendSources(file), {}, 'a set past the limit left the older set in place');
 });

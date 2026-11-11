@@ -680,6 +680,8 @@ import {
   type SavedSpendSources,
   admittedSpendSources,
   savedSpendSourcesOf,
+  savedSpendFilesOf,
+  sameSavedSpendFiles,
   savedSpendSourcesRefusal,
   loadSavedSpendSources,
   saveSavedSpendSources,
@@ -1743,14 +1745,16 @@ export class PanelProvider implements vscode.Disposable {
   // The saved sources that draw the session figures until the first complete discovery reply. Undefined until the walk and
   // the spend index load let `admitSavedSpendSources` run, and null after a refusal or that reply.
   private savedRowSources: readonly SessionSpendSource[] | null | undefined = undefined;
-  // The sources, the scope and the rows that hold the file stats of the last settled reply in this activation, taken when the
-  // host accepted it. `saved` turns true when a derived cache write saved them in `SAVED_SPEND_SOURCES_FILE`.
+  // The sources and the scope of the last settled reply in this activation, with the rows that the host held for it, which
+  // hold the stats of its files. `saved` turns true when a derived cache write took it.
   private settledSpendSources?: {
     scope: string;
     sources: readonly SessionSpendSource[];
     rows: readonly (readonly SessionFile[])[];
     saved: boolean;
   };
+  // The record that this activation last wrote to `SAVED_SPEND_SOURCES_FILE`, with the source list it came from.
+  private writtenSpendSources?: { sources: readonly SessionSpendSource[]; record: SavedSpendSources };
   private readonly sessionSpendSourceIndex = new SessionSpendSourceIndex();
   private readonly subagentDirectories = new SubagentDirectoryCache();
   private readonly codexStats = new CodexStatCache();
@@ -4891,6 +4895,9 @@ export class PanelProvider implements vscode.Disposable {
     this.selectionWorks.clear();
     this.selectionWork?.controller.abort();
     this.selectionWork = null;
+    // Admitted saved sources and the sources of a settled reply belong to the previous roots.
+    if (this.savedRowSources) this.savedRowSources = null;
+    this.settledSpendSources = undefined;
     // A catalog completed under the previous roots never completes the new ones, even when the roots later return to it.
     this.discoveryComplete = undefined;
     this.settledDiscovery = undefined;
@@ -12972,7 +12979,7 @@ export class PanelProvider implements vscode.Disposable {
         );
         // The source set changes only at a settled reply, so a write for another reason leaves its file alone.
         if (settled && !settled.saved) {
-          saveSavedSpendSources(this.spendSourcesFile(file), this.settledSpendSourcesRecord(settled));
+          this.writeSettledSpendSources(this.spendSourcesFile(file), settled);
           settled.saved = true;
         }
       };
@@ -12990,19 +12997,26 @@ export class PanelProvider implements vscode.Disposable {
     return false;
   }
 
-  private spendSourcesFile(derivedCacheFile: string): string {
-    return path.join(path.dirname(derivedCacheFile), SAVED_SPEND_SOURCES_FILE);
+  // Writes the record of a settled reply, unless the record that this activation last wrote holds the same sources, scope and
+  // file stats. The comparison reads the stats by value and serializes nothing.
+  private writeSettledSpendSources(file: string, settled: NonNullable<typeof this.settledSpendSources>): void {
+    const compatibility = discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION);
+    const files = savedSpendFilesOf(settled.sources, settled.rows.flat(), normalizeFsPath);
+    const written = this.writtenSpendSources;
+    if (
+      written?.sources === settled.sources &&
+      written.record.scope === settled.scope &&
+      written.record.compatibility === compatibility &&
+      sameSavedSpendFiles(written.record.files, files)
+    )
+      return;
+    const record = savedSpendSourcesOf(settled.scope, compatibility, settled.sources, files);
+    saveSavedSpendSources(file, record);
+    this.writtenSpendSources = { sources: settled.sources, record };
   }
 
-  // The saved form of the sources of a settled reply, with the file stats that the rows of that reply hold.
-  private settledSpendSourcesRecord(settled: NonNullable<typeof this.settledSpendSources>): SavedSpendSources {
-    return savedSpendSourcesOf(
-      settled.scope,
-      discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
-      settled.sources,
-      settled.rows.flat(),
-      normalizeFsPath,
-    );
+  private spendSourcesFile(derivedCacheFile: string): string {
+    return path.join(path.dirname(derivedCacheFile), SAVED_SPEND_SOURCES_FILE);
   }
 
   // A bounded metadata answer wins. Complete lifetime facts fill a missing newest start.
@@ -13341,15 +13355,20 @@ export class PanelProvider implements vscode.Disposable {
         .map((row) => [normalizeFsPath(path.join(path.dirname(row.file), row.sessionId, 'subagents')), row.file]),
     );
     const codexChildren = this.enumeratedSpendSources?.children ?? [];
+    // A saved primary source names the file of its thread when the walk lists no row of that thread. A listed row wins.
     const threads = new Map([
+      ...this.savedSpendSources!.sources.filter((source) => source.primary === true).map((source): [string, string] => [
+        source.sessionId,
+        source.file,
+      ]),
       ...walk.parents.filter((row) => row.agent === 'codex').map((row): [string, string] => [row.sessionId, row.file]),
       ...codexChildren.map((child): [string, string] => [child.threadId, child.file]),
     ]);
-    const children: [string, string | undefined][] = [
-      ...(this.walkedChildSources ?? []).map((row): [string, string | undefined] => [
-        row.file,
-        subagentParents.get(normalizeFsPath(path.dirname(row.file))),
-      ]),
+    const children: [string, string | undefined, string?][] = [
+      ...(this.walkedChildSources ?? []).flatMap((row): [string, string, string][] => {
+        const parent = subagentParents.get(normalizeFsPath(path.dirname(row.file)));
+        return parent === undefined ? [] : [[row.file, parent, path.dirname(row.file)]];
+      }),
       ...codexChildren.map((child): [string, string | undefined] => [
         child.file,
         child.parentThreadId === null ? undefined : threads.get(child.parentThreadId),
@@ -13360,7 +13379,7 @@ export class PanelProvider implements vscode.Disposable {
       normalizeFsPath,
       listed,
       (file) => records.get(normalizeWorkspace(file)) ?? records.get(normalizeSpendFile(file)),
-      children.filter((pair): pair is [string, string] => pair[1] !== undefined),
+      children,
     );
     if (admitted.changed) this.performanceCounters.recordWork('savedSpendSources:changed', admitted.changed);
     this.performanceCounters.recordWork('savedSpendSources:admitted');
@@ -15905,8 +15924,6 @@ export class PanelProvider implements vscode.Disposable {
     this.applyDispatchFacts(progress.dispatchFacts ?? []);
     this.claudeChildren = progress.children;
     this.claudeChildrenDiscovered = true;
-    // The rows stop reading the saved sources at the first complete reply, even when the host then drops the reply.
-    this.savedRowSources = null;
     if (!this.dispatchDiscoveryPending) {
       // A settled reply verifies the links that the first catalog published from the saved set, and replaces the saved set. A
       // reply under other roots verifies nothing that the catalog published and counts nothing. The published child rows keep
@@ -15978,7 +15995,11 @@ export class PanelProvider implements vscode.Disposable {
         generation,
       )),
     ]);
-    if (signal.aborted || generation !== this.refreshGeneration) return false;
+    if (signal.aborted || generation !== this.refreshGeneration) {
+      // The rows stop reading the saved sources at the first complete reply, even when the host drops the reply.
+      this.savedRowSources = null;
+      return false;
+    }
     const roots = this.withHeldCompressedRows(discoveryRoots.filter((root) => admittedRoots.has(root)));
     if (spendSources) {
       this.claudeSpendSources = spendSources.claude;
@@ -15996,20 +16017,16 @@ export class PanelProvider implements vscode.Disposable {
     this.settledDiscovery = undefined;
     this.updateSessionSpendSources(codex, sessions);
     if (membersSettled) {
-      // The stats of the files come from the rows that this reply settled, and from the walk that it answered.
-      const rows = [this.walkedChildSources ?? [], this.claudeParents ?? [], sessions];
-      const held = this.settledSpendSources;
-      const scope = JSON.stringify(this.repositoryScopeRoots);
-      if (
-        !held ||
-        held.sources !== this.sessionSpendSources ||
-        held.scope !== scope ||
-        held.rows.some((row, at) => row !== rows[at])
-      ) {
-        this.settledSpendSources = { scope, sources: this.sessionSpendSources, rows, saved: false };
-        this.savedSpendSources = undefined;
-        this.derivedCacheCheckpointState.markChanged();
-      }
+      // The stats of the files come from the rows that the host held for this reply: the census and walk rows of its request,
+      // and the rows that it settled. The derived cache write builds the record from them.
+      this.settledSpendSources = {
+        scope: JSON.stringify(this.repositoryScopeRoots),
+        sources: this.sessionSpendSources,
+        rows: [childSources ?? [], parents ?? [], sessions],
+        saved: false,
+      };
+      this.savedSpendSources = undefined;
+      this.derivedCacheCheckpointState.markChanged();
     }
     if (this.catalog) {
       this.catalog = { ...this.catalog, sessions };

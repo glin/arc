@@ -169,6 +169,8 @@ import {
   savedLinksRefusal,
   admittedSpendSources,
   savedSpendSourcesOf,
+  savedSpendFilesOf,
+  sameSavedSpendFiles,
   savedSpendSourcesRefusal,
   loadSavedSpendSources,
   saveSavedSpendSources,
@@ -3119,7 +3121,7 @@ function guardedHarness<T extends object>(provider: T): T {
 function withCompanionMethods(names: Iterable<string>): string[] {
   const out = [...names];
   if (out.includes('lifetimeFiguresBySession')) out.push('rowSpendSources', 'admitSavedSpendSources');
-  if (out.includes('writeDerivedCache')) out.push('spendSourcesFile', 'settledSpendSourcesRecord');
+  if (out.includes('writeDerivedCache')) out.push('spendSourcesFile', 'writeSettledSpendSources');
   const cards = [
     'redrawModelNames',
     'noteActivity',
@@ -3389,6 +3391,8 @@ function completeDiscoveryHarness(
     RepositoryCommits,
     saveSavedSpendSources,
     savedSpendSourcesOf,
+    savedSpendFilesOf,
+    sameSavedSpendFiles,
     SAVED_SPEND_SOURCES_FILE,
     CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
     claudeSubagentMetaReader,
@@ -4050,7 +4054,7 @@ function metadataHarness(
       'compressedCarriedNameOf',
       'writeDerivedCache',
       'spendSourcesFile',
-      'settledSpendSourcesRecord',
+      'writeSettledSpendSources',
     ];
     const members = owner.members.filter((member) => member.name && drawn.includes(member.name.getText(file)));
     assert.equal(members.length, drawn.length, 'panelhost.ts no longer names sessions through these methods');
@@ -4102,6 +4106,8 @@ function metadataHarness(
     loadSavedSpendSources,
     saveSavedSpendSources,
     savedSpendSourcesOf,
+    savedSpendFilesOf,
+    sameSavedSpendFiles,
     SAVED_SPEND_SOURCES_FILE,
     sessionLabelOf,
     codexTitleFor,
@@ -17091,7 +17097,7 @@ function savedFiguresRecord(
 
 // A warm start whose spend index holds a complete record of the walked Claude parent, and whose derived cache holds the
 // spend sources that the last settled reply saved for it. The discovery reply waits until `answer` runs.
-function savedFiguresHarness(change: (fixture: any) => void = () => {}) {
+function savedFiguresHarness(change: (fixture: any) => void = () => {}, scope: Record<string, unknown> = {}) {
   const harness = cachedLinksHarness(change, {
     methods: [
       'lifetimeFiguresBySession',
@@ -17099,9 +17105,10 @@ function savedFiguresHarness(change: (fixture: any) => void = () => {}) {
       'rowSpendSources',
       'admitSavedSpendSources',
       'updateSessionSpendSources',
-      'settledSpendSourcesRecord',
+      'writeSettledSpendSources',
       'cardLifetimeFigures',
       'workspaceFoldersChanged',
+      'repositoryScopeChanged',
     ],
     scope: {
       discoverClaudeSessionSpendSources: (parents: SessionFile[]) =>
@@ -17125,6 +17132,9 @@ function savedFiguresHarness(change: (fixture: any) => void = () => {}) {
       admittedSpendSources,
       savedSpendSourcesRefusal,
       savedSpendSourcesOf,
+      savedSpendFilesOf,
+      sameSavedSpendFiles,
+      ...scope,
     },
   });
   const { provider, claude } = harness;
@@ -17136,13 +17146,14 @@ function savedFiguresHarness(change: (fixture: any) => void = () => {}) {
     sources: [{ sessionId: claude.sessionId, file: claude.file, primary: true }],
     files: [{ file: claude.file, size: claude.size, mtimeMs: claude.mtimeMs, dev: claude.dev, ino: claude.ino }],
   };
-  // The reply sets the sources with the host's own update.
+  // The reply sets the sources with the host's own update. `native` holds the child sources that it adds.
   delete provider.updateSessionSpendSources;
+  const native: SessionSpendSource[] = [];
   Object.assign(provider, {
     lifetimeFigures: new SessionFiguresCache(),
     sessionSpendSources: [],
     sessionSpendSourceIndex: new SessionSpendSourceIndex({
-      claude: () => [],
+      claude: () => native,
       codex: spendConsumers.discoverCodexSessionSpendSources,
     }),
     projectSpendHolds: () => false,
@@ -17177,7 +17188,13 @@ function savedFiguresHarness(change: (fixture: any) => void = () => {}) {
     });
     await vi.waitFor(() => assert.ok(provider.completeCatalogScope, 'the follow-up refresh accepted no settled reply'));
   };
-  return { ...harness, record, saved, settle };
+  return { ...harness, record, saved, settle, native };
+}
+
+// The file stats that the capture of the last settled reply saves.
+function capturedSpendFiles(provider: any) {
+  const settled = provider.settledSpendSources;
+  return savedSpendFilesOf(settled.sources, settled.rows.flat(), normalizeFsPath);
 }
 
 // The figures of a session in the last session list message that carries any figure of it.
@@ -17339,7 +17356,7 @@ test('the reply replaces the saved sources, draws a new session and posts no fig
     );
     for (const message of lists.filter((message: any) => message.rows?.base === null))
       assert.deepEqual(message.stats[claude.sessionId], saved, 'a snapshot after the reply changed the saved figures');
-    const written = provider.settledSpendSourcesRecord(provider.settledSpendSources);
+    const written = { ...provider.settledSpendSources, files: capturedSpendFiles(provider) };
     assert.deepEqual(
       [written.scope, written.sources.find((source: any) => source.sessionId === claude.sessionId)],
       [JSON.stringify(['project']), { sessionId: claude.sessionId, file: claude.file, primary: true }],
@@ -17366,9 +17383,8 @@ test('a walk after the settled reply leaves the file stats of the saved sources 
     claudeWalk[0] = { ...claude, size: 5000, mtimeMs: 20 };
     provider.allSessions();
     assert.equal(provider.walkedCatalog.parents[0].size, 5000, 'the later walk did not list the grown parent');
-    const written = provider.settledSpendSourcesRecord(provider.settledSpendSources);
     assert.deepEqual(
-      written.files.find((file: any) => file.file === claude.file),
+      capturedSpendFiles(provider).find((file: any) => file.file === claude.file),
       { file: claude.file, size: claude.size, mtimeMs: claude.mtimeMs, dev: claude.dev, ino: claude.ino },
       'the saved sources took the file stats of a walk after the settled reply',
     );
@@ -17485,7 +17501,19 @@ test('a complete reply that the host drops after it sets the discovered flag sti
 test('turn cards read no figure from the saved sources while they draw the rows', async () => {
   vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
   try {
-    const { provider, claude, saved, now } = savedFiguresHarness();
+    const { provider, claude, saved, record, now } = savedFiguresHarness();
+    // One cache-expiry return of the parent.
+    record.cacheExpiry = {
+      facts: {
+        counts: { '5m': 1, '30m': 0, '1h': 0 },
+        longestGapMs: null,
+        returns: [],
+        excluded: 0,
+        unavailable: 0,
+        truncated: false,
+      },
+      compactions: [],
+    } as never;
     const dispatched = { file: 'fixture/dispatched.jsonl', size: 800, mtimeMs: 9 };
     const dispatchedRecord = savedFiguresRecord(dispatched.file, dispatched, 3);
     provider.projectSpendFiles.push(dispatchedRecord);
@@ -17509,7 +17537,214 @@ test('turn cards read no figure from the saved sources while they draw the rows'
       {},
       'a turn card read a contribution of the saved sources',
     );
-    assert.deepEqual(provider.cardLifetimeFigures().cacheExpiryFacts, {});
+    assert.ok(
+      provider.lifetimeFiguresBySession().cacheExpiryFacts[claude.sessionId],
+      'the rows hold no cache-expiry fact',
+    );
+    assert.deepEqual(provider.cardLifetimeFigures().cacheExpiryFacts, {}, 'a turn card read a cache-expiry fact');
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('a spend record without a device and inode draws the saved figures when the walk keeps the saved stats', async () => {
+  vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+  try {
+    const { provider, claude, record, now } = savedFiguresHarness();
+    delete (record as { sourceIdentity?: string }).sourceIdentity;
+    vi.setSystemTime(now);
+    await provider.refresh(true);
+    assert.ok(postedFigures(provider, claude.sessionId).includes('cost'), 'the row drew no saved cost');
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('a new nested Claude child refuses the root, its immediate parent and the session that dispatched the root', async () => {
+  vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+  try {
+    let census: any[] = [];
+    const { provider, claude, other, saved, work, now } = savedFiguresHarness((fixture) => {
+      census = fixture.census;
+    });
+    // Claude keeps the transcripts of every depth of the root in one folder.
+    const folder = path.join('fixture', claude.sessionId, 'subagents');
+    const middle = { file: path.join(folder, 'agent-mid.jsonl'), size: 300, mtimeMs: 10, dev: 1, ino: 5 };
+    const row = (file: string, sessionId: string, ino: number, size: number) => ({
+      agent: 'claude',
+      file,
+      sessionId,
+      size,
+      mtimeMs: 10,
+      dev: 1,
+      ino,
+      childTranscript: true,
+      agentRun: true,
+      cwd: 'project',
+    });
+    census.push(row(middle.file, 'mid', 5, 300), row(path.join(folder, 'agent-grand.jsonl'), 'grand', 6, 40));
+    for (const added of [savedFiguresRecord(middle.file, middle), savedFiguresRecord(other.file, other)]) {
+      provider.projectSpendFiles.push(added);
+      provider.projectSpendVisibleFiles.push(added);
+    }
+    saved.sources.push(
+      { sessionId: claude.sessionId, file: middle.file, primary: false, nativeParentFile: claude.file },
+      { sessionId: 'mid', file: middle.file, primary: true },
+      { sessionId: other.sessionId, file: other.file, primary: true },
+      ...[claude.file, middle.file].map((file) => ({
+        sessionId: other.sessionId,
+        file,
+        primary: false,
+        dispatchedFrom: claude.sessionId,
+        dispatchedVia: claude.sessionId,
+      })),
+    );
+    saved.files.push(middle, {
+      file: other.file,
+      size: other.size,
+      mtimeMs: other.mtimeMs,
+      dev: other.dev,
+      ino: other.ino,
+    });
+    vi.setSystemTime(now);
+    await provider.refresh(true);
+    assert.deepEqual(provider.savedRowSources, [], 'a session kept its saved sources after a new nested child');
+    assert.equal(work.get('savedSpendSources:changed'), 3, 'the refused sessions were not counted');
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test.each([
+  ['lists', (codex: SessionFile) => codex.sessionId],
+  ['omits', () => 'gone-parent'],
+])(
+  'a new Codex child refuses the sessions that hold its parent when the walk %s that parent',
+  async (_case, parentOf) => {
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    try {
+      let parent = '';
+      const { provider, claude, codex, saved, work, now } = savedFiguresHarness(undefined, {
+        codexSessionFiles: () => ({
+          walked: [codex.file],
+          sessions: [codex],
+          subagents: [
+            {
+              file: 'fixture/codex-child.jsonl',
+              threadId: 'new-child',
+              parentThreadId: parent,
+              agentPath: null,
+              openedAt: null,
+              startedAt: null,
+              threadSource: 'subagent',
+              backgroundReview: false,
+            },
+          ],
+          sources: [],
+          enumeration: { status: 'complete', files: [codex.file], uncertain: [] },
+          admission: 'complete',
+        }),
+      });
+      parent = parentOf(codex);
+      const parentFile = parent === codex.sessionId ? codex.file : 'fixture/gone-parent.jsonl';
+      if (parent === codex.sessionId) {
+        const codexRecord = savedFiguresRecord(codex.file, codex);
+        provider.projectSpendFiles.push(codexRecord);
+        provider.projectSpendVisibleFiles.push(codexRecord);
+        saved.files.push({
+          file: codex.file,
+          size: codex.size,
+          mtimeMs: codex.mtimeMs,
+          dev: codex.dev,
+          ino: codex.ino,
+        });
+      }
+      saved.sources.push({ sessionId: parent, file: parentFile, primary: true });
+      // The Claude session dispatched the parent, so its saved sources hold the parent's file.
+      saved.sources.push({
+        sessionId: claude.sessionId,
+        file: parentFile,
+        primary: false,
+        dispatchedFrom: parent,
+        dispatchedVia: parent,
+        dispatchedPrimary: true,
+      });
+      vi.setSystemTime(now);
+      await provider.refresh(true);
+      assert.deepEqual(
+        postedFigures(provider, claude.sessionId),
+        [],
+        'the session above the parent drew a saved figure',
+      );
+      assert.deepEqual(provider.savedRowSources, [], 'a session kept its saved sources after a new Codex child');
+      assert.equal(work.get('savedSpendSources:changed'), 2, 'the refused sessions were not counted');
+    } finally {
+      vi.useRealTimers();
+    }
+  },
+);
+
+test('the rows keep the saved figures while a complete reply waits for prompt admission', async () => {
+  vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+  try {
+    const { provider, claude, now, settle } = savedFiguresHarness();
+    vi.setSystemTime(now);
+    await provider.refresh(true);
+    const drawn: unknown[] = [];
+    const prepare = provider.prepareHumanPrompts;
+    provider.prepareHumanPrompts = function (this: any, ...args: unknown[]) {
+      // A session list post here draws these figures.
+      if (provider.claudeChildrenDiscovered) drawn.push(provider.lifetimeFiguresBySession().stats[claude.sessionId]);
+      return prepare.apply(this, args);
+    };
+    await settle();
+    assert.ok(drawn.length, 'the reply waited for no prompt admission');
+    assert.ok(
+      drawn.every((figures) => Array.isArray(figures) && figures.length),
+      'the rows lost the saved figures while the reply applied',
+    );
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('a repository scope change with the same folders drops the admitted saved sources and the settled capture', async () => {
+  vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+  try {
+    const { provider, now } = savedFiguresHarness();
+    vi.setSystemTime(now);
+    await provider.refresh(true);
+    assert.ok(provider.savedRowSources?.length, 'the saved sources were not admitted');
+    provider.settledSpendSources = { scope: '[]', sources: [], rows: [], saved: false };
+    // The scope change reaches names and starts a refresh, which this test leaves out.
+    Object.assign(provider, { initialNamesChanged() {}, refreshFrom() {}, selectionWorks: new Map() });
+    provider.repositoryScopeChanged();
+    assert.equal(provider.savedRowSources, null, 'the scope change kept the admitted saved sources');
+    assert.equal(provider.settledSpendSources, undefined, 'the scope change kept the sources of the settled reply');
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('the capture of a settled reply takes the census rows of its own request', async () => {
+  vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+  try {
+    const { provider, claude, child, native, now, settle } = savedFiguresHarness();
+    native.push({ sessionId: claude.sessionId, file: child.file, primary: false });
+    vi.setSystemTime(now);
+    await provider.refresh(true);
+    const prepare = provider.prepareHumanPrompts;
+    provider.prepareHumanPrompts = function (this: any, ...args: unknown[]) {
+      // A refresh of the selected session lists the child grown while the reply applies.
+      provider.walkedChildSources = provider.walkedChildSources.map((row: SessionFile) => ({ ...row, size: 5000 }));
+      return prepare.apply(this, args);
+    };
+    await settle();
+    assert.equal(
+      capturedSpendFiles(provider).find((file: any) => file.file === child.file)?.size,
+      1200,
+      'the capture took a census row that a later refresh listed',
+    );
   } finally {
     vi.useRealTimers();
   }
@@ -29472,7 +29707,7 @@ function derivedCacheMigrationHarness(
     'checkpointDerivedCache',
     'writeDerivedCache',
     'spendSourcesFile',
-    'settledSpendSourcesRecord',
+    'writeSettledSpendSources',
   ].map((name) => {
     const member = owner.members.find((candidate) => candidate.name?.getText(file) === name);
     assert.ok(member, `panelhost.ts no longer declares ${name}`);
@@ -29511,6 +29746,8 @@ function derivedCacheMigrationHarness(
     loadSavedSpendSources,
     saveSavedSpendSources,
     savedSpendSourcesOf,
+    savedSpendFilesOf,
+    sameSavedSpendFiles,
     ...overrides,
   };
   new Function('module', 'exports', ...Object.keys(scope), compiled)(module, module.exports, ...Object.values(scope));
@@ -29554,6 +29791,46 @@ test('a settled reply saves its sources once in their own file, and the next act
   } finally {
     vi.useRealTimers();
   }
+});
+
+test('settled replies that change no stat write the saved sources once, and one after a file grew writes them again', () => {
+  const root = tempDir('saved-spend-quiet-');
+  const files = { derivedCacheFile: path.join(root, 'derived-session-cache-v2.json') } as ReturnType<
+    typeof activationCacheFiles
+  >;
+  const counted = { built: 0, saved: 0 };
+  const host = derivedCacheMigrationHarness(files, {
+    savedSpendSourcesOf: (...args: Parameters<typeof savedSpendSourcesOf>) => {
+      counted.built++;
+      return savedSpendSourcesOf(...args);
+    },
+    saveSavedSpendSources: (...args: Parameters<typeof saveSavedSpendSources>) => {
+      counted.saved++;
+      return saveSavedSpendSources(...args);
+    },
+  });
+  const { claude } = bumpedDerivedCache();
+  const sources = [{ sessionId: claude.sessionId, file: claude.file, primary: true }];
+  // Each settled reply takes the same source list with new rows, as the host does, and the next write follows it.
+  const reply = (row: SessionFile) => {
+    host.settledSpendSources = {
+      scope: JSON.stringify(['project']),
+      sources,
+      rows: [[], [{ ...row }], [{ ...row }]],
+      saved: false,
+    };
+    assert.equal(host.writeDerivedCache(), true, 'the write failed');
+  };
+  reply(claude);
+  reply(claude);
+  assert.deepEqual(counted, { built: 1, saved: 1 }, 'a reply that changed no stat built or saved the sources again');
+  reply({ ...claude, size: 2000 });
+  assert.deepEqual(counted, { built: 2, saved: 2 }, 'a reply after the file grew saved no sources');
+  assert.equal(
+    loadSavedSpendSources(path.join(root, SAVED_SPEND_SOURCES_FILE)).sources?.files[0]?.size,
+    2000,
+    'the saved sources lack the grown size',
+  );
 });
 
 test('an upgrade from shared metadata version 70 saves the current cache file once from the previous file', async () => {
