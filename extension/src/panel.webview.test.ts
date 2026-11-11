@@ -1604,6 +1604,7 @@ test('the host reads closed child work once per file version and never reads ope
     claudeChildReferences: [],
     claudeChildStatWrites: new Map(),
     claudeChildVersion: () => version,
+    childSourcesFor: (PanelProvider.prototype as any).childSourcesFor,
   };
   assert.deepEqual(read.call(host, now), new Map([['parent', ['child']]]));
   assert.equal(reader.mock.calls.length, 0);
@@ -4182,7 +4183,7 @@ test('command-only admission removes pending rows through every catalog path and
     'selected',
     'const codexOnly = false; ' +
       refreshBody.slice(
-        refreshBody.indexOf('let all = selectedOnly'),
+        refreshBody.indexOf('const switched = selectedOnly'),
         refreshBody.indexOf("this.performanceCounters.recordRefresh('catalog-enumeration'"),
       ) +
       '\nreturn all;',
@@ -4908,6 +4909,7 @@ test('refresh human admission shares read and source allowances and resumes canc
 
   // A selected refresh loses ownership without its private controller receiving an abort. The refresh follows a switch
   // away from the replaced session, so it rechecks that session.
+  provider.sourcesForSelection = (PanelProvider.prototype as any).sourcesForSelection;
   provider.previousSelection = 'same-id';
   provider.hosts = [];
   for (const supersede of ['refreshGeneration', 'selectionGeneration']) {
@@ -9870,13 +9872,13 @@ test('rail counts use metadata windows until the progressive read is accepted', 
   const counts = memberFrom(panelHostSource, panelHostSource.indexOf('private unreadCounts('));
   sourceMatch(
     counts,
-    /: this\.windows;[\s\S]*return newCounts\(\s*\[\], windows,/,
+    /: \(this\.selectionWindows \?\? this\.windows\);[\s\S]*return newCounts\(\s*\[\], windows,/,
     'the rail count depends on selected turns that have not reached the host',
   );
   const newest = memberFrom(panelHostSource, panelHostSource.indexOf('private newestTurns():'));
   sourceMatch(
     newest,
-    /newestTurnStarts\(\[\], this\.windows\)/,
+    /newestTurnStarts\(\[\], this\.selectionWindows \?\? this\.windows\)/,
     'the read watermark disagrees with the rail count while selected work is pending',
   );
 });
@@ -12171,7 +12173,7 @@ test('worker metadata carries the agent-run mark to the host', () => {
     'the rail row does not read the detector, so no session is ever marked as run by an agent',
   );
   sourceMatch(
-    statementFrom(panelHostSource, panelHostSource.indexOf('this.sessionRows = all.map(')),
+    statementFrom(panelHostSource, panelHostSource.indexOf('let sessionRows = all.map(')),
     /this\.sessionRowOf\(\s*f,\s*parentEdges\.edges,/,
     'the refresh builds its rail rows without the parent edges, so the detector reads no run',
   );
@@ -24220,18 +24222,18 @@ test('a rail card wears the status that needs attention', () => {
     'hidden: this.hidden',
     'showing',
     'pinnedTop: this.pinnedTop',
-    'unsent: unsentBySession(this.drafts, this.saved.comments)',
+    'unsent: unsentBySession(only(this.drafts), this.saved.comments)',
     'parsedStats: {}',
-    'metadataStats: this.metadataStatsBySession',
-    'lifetimeStats: lifetime.stats',
-    'lifetimeCosts: lifetime.costs',
-    'lifetimeCacheExpiry: lifetime.cacheExpiryCounts',
-    'labels: this.saved.labels',
-    'caches: railCachesOf(this.parsedRailCaches, this.metadataRailCaches, this.metadataRailRevisions)',
+    'metadataStats: only(this.selectionMetadataStats ?? this.metadataStatsBySession)',
+    'lifetimeStats: only(lifetime.stats)',
+    'lifetimeCosts: only(lifetime.costs)',
+    'lifetimeCacheExpiry: only(lifetime.cacheExpiryCounts)',
+    'labels: only(this.saved.labels)',
+    'caches: railCachesOf(only(this.parsedRailCaches), only(this.selectionMetadataCaches ?? this.metadataRailCaches), only(this.selectionMetadataRevisions ?? this.metadataRailRevisions))',
     'views: this.saved.views',
     'railFilters: this.saved.railFilters',
   ]) {
-    assert.ok(railPayloadFor.includes(input), `the shared rail payload drops ${input}`);
+    assert.notEqual(layoutIndexOf(railPayloadFor, input), -1, `the shared rail payload drops ${input}`);
   }
   assert.equal(
     (panelHostSource.match(/this\.railInputFor\(counts, statuses, openChildren, railNow\)/g) ?? []).length,
@@ -26972,7 +26974,7 @@ const COMPOSER_STATE = {
 
 // Update metadata windows before deciding whether the refresh needs a render.
 test('the glance goes on filling the rail on a refresh where nothing else moved', () => {
-  const glance = panelHostSource.indexOf('this.windows = this.glanceAt(all, sessions)');
+  const glance = panelHostSource.indexOf('const windows = this.glanceAt(all, sessions)');
   assert.notEqual(glance, -1, 'panelhost.ts no longer glances, so this guard cannot see the order');
   const compare = panelHostSource.indexOf('refreshWanted({');
   assert.notEqual(compare, -1, 'panelhost.ts no longer asks refreshWanted, so this guard sees nothing');
@@ -27008,7 +27010,7 @@ test('the glance goes on filling the rail on a refresh where nothing else moved'
   );
   sourceMatch(
     panelHostSource,
-    /this\.windows = this\.glanceAt\(all, sessions\);/,
+    /const windows = this\.glanceAt\(all, sessions\);[\s\S]*this\.windows = windows;/,
     'the rail loses its refresh-local metadata windows',
   );
 });
@@ -33772,14 +33774,14 @@ test('a session row carries a bounded rail name, past the sixty-character cut th
   );
 
   const member = memberFrom(panelHostSource, panelHostSource.indexOf('private sessionRowOf('));
-  const assignment = statementFrom(panelHostSource, panelHostSource.indexOf('this.sessionRows = all.map('));
+  const assignment = statementFrom(panelHostSource, panelHostSource.indexOf('let sessionRows = all.map('));
   const built = esbuild.transformSync(
     `export function build(all, sessions, parentEdges, fullLabels, AGENT_NAMES, formatWhen, formatRelative, shortenTo, RAIL_NAME_LIMIT, fields) {
 class Rows {
 ${member}
 assign() {
 ${assignment}
-return this.sessionRows;
+return sessionRows;
 }
 }
 return Object.assign(new Rows(), fields).assign();
@@ -43730,7 +43732,7 @@ test('unread membership retains selection navigation derived caches exit corpus 
   );
   const collect = methodBody('private collect(');
   const retainedWindows = ts.transpileModule(
-    `function refreshDerived(all = [], sessions = [], currentRecords = { newestTurns: new Map() }) { ${refresh.slice(refresh.indexOf('const heldWindows ='), refresh.indexOf('const statusFacts ='))} ${collect.slice(collect.indexOf('for (const session of this.readWindows.keys())'), collect.indexOf('// Update retained-page recency'))} ${collect.slice(collect.indexOf('const heldNewest ='), collect.indexOf('this.composerRuntime ='))} }`,
+    `function refreshDerived(all = [], sessions = [], currentRecords = { newestTurns: new Map() }, selectedOnly = false) { ${refresh.slice(refresh.indexOf('const heldWindows ='), refresh.indexOf('const statusFacts ='))} ${collect.slice(collect.indexOf('for (const session of this.readWindows.keys())'), collect.indexOf('// Update retained-page recency'))} ${collect.slice(collect.indexOf('const heldNewest ='), collect.indexOf('this.composerRuntime ='))} }`,
     { compilerOptions: { target: ts.ScriptTarget.ES2022 } },
   ).outputText;
   const refreshDerived = new Function(retainedWindows + '\nreturn refreshDerived;')();

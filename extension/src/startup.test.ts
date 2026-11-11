@@ -51,7 +51,7 @@ import { pendingResponseSessionAdmitted, resolveResponseSession } from './domain
 import { createPanelVisibility } from './panelvisibility';
 import { liveTimelineChildren, outcomesFor, timelineRailState } from './timelinestate';
 import { runningSessionsSince } from './composerview';
-import { newestPerSession } from './turnread';
+import { newestPerSession, newestTurnStarts } from './turnread';
 import { claudeRelationshipKey, selectedDependencies } from './selectedsource';
 import {
   projectSlug,
@@ -319,7 +319,15 @@ import { countedDispatchedCosts, pendingAskPosition, toCard, TURN_QUIET_MS } fro
 import { COMMIT_REPOSITORY_PARSER_VERSION, commitRepositoryOccurrence } from './codexhistory';
 import { RepositoryCommits } from './gitcommits';
 import { CommitRepositories } from './commitrepositories';
-import { agentRunAnswer, railCacheMarkOf, sessionStatusOf, stableRailOrder, syntheticDraftRows } from './turnrail';
+import {
+  agentRunAnswer,
+  liveBackgroundCommands,
+  railCacheMarkOf,
+  sessionRunningSince,
+  sessionStatusOf,
+  stableRailOrder,
+  syntheticDraftRows,
+} from './turnrail';
 import { storedAssetsForPrompt } from './promptassets';
 import { emptyTrail, renamePlace, visitPlace } from './turnplaces';
 import { adoptLabelSession, labelsOf } from './turnlabels';
@@ -3128,6 +3136,10 @@ function harness(pendingRefresh = false, registerRefreshHandler = true, extraMet
     'refreshFrom',
     'refreshAs',
     'sessionRowOf',
+    'sourcesForSelection',
+    'indexSessionRows',
+    'indexRailOrder',
+    'childSourcesFor',
     'claimCatalogRefresh',
     'releaseCatalogRefresh',
     'drainCompressedRows',
@@ -3380,6 +3392,9 @@ function completeDiscoveryHarness(
     'refreshFrom',
     'refreshAs',
     'sessionRowOf',
+    'sourcesForSelection',
+    'indexSessionRows',
+    'indexRailOrder',
     'claimCatalogRefresh',
     'releaseCatalogRefresh',
     'drainCompressedRows',
@@ -3493,7 +3508,7 @@ function completeDiscoveryHarness(
     'armCompressedFollow',
     'followCompressedFacts',
   );
-  names.push('compressedSpendPick', 'titleEntryOf', 'compressedTitleOf', 'compressedCarriedNameOf');
+  names.push('compressedSpendPick', 'titleEntryOf', 'compressedTitleOf', 'compressedCarriedNameOf', 'childSourcesFor');
   if (names.includes('allSessions') || names.includes('runPendingWatch')) names.push('currentWalkedCatalog');
   if (names.includes('runPendingWatch')) names.push('grownMemberMiss');
   if (names.includes('prepareClaudeChildren')) names.push('startedSources', 'applyDispatchFacts');
@@ -3747,7 +3762,7 @@ function completeDiscoveryHarness(
     derivedTitleStats,
     withMetadataCoverage,
     railEnrichmentNeeds,
-    railInputKey,
+    scope.countedRailInputKey ?? railInputKey,
     railInputChanges,
     railWordingDay,
     scope.retainedPayloads === false
@@ -19969,6 +19984,348 @@ test.each([
   },
 );
 
+// The full reference derives every listed session at every selection and retains no built rows.
+function switchInputsHarness(count: number, full = false, countedRailInputKey = railInputKey): any {
+  const now = Date.now();
+  const provider = completeDiscoveryHarness(
+    undefined,
+    false,
+    [
+      'outcomesFor',
+      'glanceAt',
+      'railStatuses',
+      'runningSessions',
+      'runningSince',
+      'liveBackgroundCommands',
+      'liveOpenChildren',
+      'waitingSessions',
+      'railInputFor',
+      'railRows',
+      'newestTurns',
+      'activityFor',
+      'metaFor',
+      'unreadCounts',
+      'observeStoredEntry',
+      'observeStoredName',
+      'sessionLabel',
+      'claudeName',
+      'titleFor',
+      'fullTitleFor',
+      'agentRunFor',
+    ],
+    {
+      retainedPayloads: !full,
+      sessionRunningSince,
+      liveBackgroundCommands,
+      countedRailInputKey,
+      runningSessions,
+      runningSessionsSince,
+      timelineRailState,
+      liveTimelineChildren,
+      railCachesOf,
+      unsentBySession,
+      stableRailOrder,
+      newestTurnStarts,
+      isCompressedRollout,
+      transcriptIdentity,
+      codexTitleFor,
+      withSessionName,
+      agentRunScanUnread,
+      needsAgentRunScan: () => false,
+      agentRunAnswer,
+      newCounts,
+      projectAgentRead,
+      turnKey,
+      realStoredSessionName: storedSessionName,
+      writeTimeOfVersion,
+      claudeChildFile: () => 'child.jsonl',
+      rowFormatWhen: formatWhen,
+      rowFormatRelative: formatRelative,
+    },
+  );
+  provider.partial = Array.from({ length: count }, (_, index) => ({
+    sessionId: 'switch-' + index,
+    file: 'switch-' + index + '.jsonl',
+    agent: index % 2 ? 'codex' : 'claude',
+    size: 1000,
+    mtimeMs: now - index * 1000,
+    activity: now - index * 1000,
+    cwd: 'project',
+    dev: 1,
+    ino: index + 1,
+  }));
+  provider.carriedNames = new Map();
+  provider.threadNames = { stamp: '', names: new Map(), fullNames: new Map() };
+  provider.dispatchFacts = new Map();
+  provider.startedHere = new Set();
+  provider.catalog = { sessions: provider.partial };
+  provider.authoritativeCatalog = provider.partial;
+  provider.authoritativeCatalogScope = JSON.stringify(provider.repositoryScopeRoots);
+  provider.discovery = Promise.resolve(true);
+  provider.showing = 'switch-0';
+  provider.railOrder = [];
+  provider.hidden = new Set();
+  provider.pinnedTop = new Set();
+  provider.running = new Set();
+  provider.runningSinceKeys = new Map();
+  provider.exitedSinceKeys = new Map();
+  provider.asks = [];
+  provider.claudeChildReferences = [];
+  provider.claudeChildStatWrites = new Map();
+  provider.claudeChildVersion = () => '?';
+  provider.lifetimeFacts = {};
+  provider.lifetimeRailFacts = () => provider.lifetimeFacts;
+  provider.readFacts = () => () => null;
+  provider.saved.read = [];
+  provider.saved.readTo = {};
+  provider.saved.since = 0;
+  provider.saved.views = [];
+  provider.saved.railFilters = [];
+  provider.rawMessages = [];
+  provider.progressiveCurrent = () => true;
+  for (const [index, source] of provider.partial.entries())
+    provider.titles.set(source.file, {
+      ...source,
+      expandedStatsRead: true,
+      foldedLabel: 'session ' + index,
+      label: 'Session ' + index,
+      fullLabel: 'Session ' + index,
+      activityMs: source.activity,
+      agentRun: false,
+      outcome: {
+        startedAt: source.activity - 1000,
+        endedAt: source.activity,
+        finished: true,
+        error: false,
+        interrupted: false,
+      },
+      stats: null,
+      starts: { starts: [source.activity - 1000], whole: true },
+    });
+  provider.useRailPayload(railPayload);
+  const post = provider.postRows.bind(provider);
+  provider.postRows = (host: unknown, message: unknown, ...rest: unknown[]) => {
+    provider.rawMessages.push(message);
+    return post(host, message, ...rest);
+  };
+  if (full) {
+    provider.sourcesForSelection = (catalog: SessionFile[]) => [...catalog];
+    provider.childSourcesFor = () => ({
+      children: provider.claudeChildren,
+      references: provider.claudeChildReferences,
+    });
+    provider.sessionParentEdges = (sources: SessionFile[]) => {
+      const parents = sessionParentIndex(
+        provider.claudeChildReferences,
+        provider.claudeChildren,
+        provider.codexSubagents ?? [],
+      );
+      return (provider.sessionParentEdgeSet = sessionParentEdgeSet(null, parents, sources));
+    };
+  }
+  return provider;
+}
+
+test(
+  'selection inputs match a full computation through seeded switches and clock changes',
+  { timeout: 120_000 },
+  async () => {
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.UTC(2026, 0, 15, 18));
+    const providers = [switchInputsHarness(2000), switchInputsHarness(2000, true)];
+    let seed = 1907;
+    let target = 'switch-1';
+    const random = () => (seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0);
+    const seen = new Set<string>();
+    try {
+      for (const provider of providers) await provider.refresh(true);
+      for (let step = 0; step < 240; step++) {
+        const kind = step % 16;
+        if (kind < 3) target = 'switch-' + (1 + (random() % 1990));
+        if (kind === 6) clock.mockReturnValue(Date.now() + TURN_QUIET_MS);
+        if (kind === 10) clock.mockReturnValue(Date.now() + 60_000);
+        if (kind === 11) clock.mockReturnValue(Date.now() + TURN_QUIET_MS + 1);
+        if (kind === 12) {
+          const day = new Date(Date.now());
+          day.setHours(24, 1, 0, 0);
+          clock.mockReturnValue(day.getTime());
+        }
+        for (const provider of providers) {
+          provider.rawMessages.length = 0;
+          if (kind === 0) {
+            const pending = [];
+            for (const session of ['switch-1991', 'switch-1992', target]) {
+              provider.previousSelection = provider.showing;
+              provider.showing = session;
+              provider.selectionGeneration++;
+              pending.push(provider.refresh(true, true, true, true));
+            }
+            await Promise.all(pending);
+          }
+          const file = target + '.jsonl';
+          const meta = provider.titles.get(file);
+          const outcome = { ...meta.outcome };
+          switch (kind) {
+            case 1:
+              seen.add('status');
+              provider.asks = [{ session: target }];
+              break;
+            case 2:
+              seen.add('turn');
+              meta.starts = { starts: [...meta.starts.starts, Date.now()], whole: true };
+              outcome.startedAt = outcome.endedAt = Date.now();
+              outcome.finished = false;
+              break;
+            case 3:
+              seen.add('child-open');
+              outcome.finished = true;
+              outcome.openChildren = ['child'];
+              provider.claudeChildren = [
+                { parentSessionId: target, sessionId: 'child', file: 'child.jsonl', mtimeMs: Date.now() },
+              ];
+              break;
+            case 4:
+              seen.add('child-close');
+              outcome.openChildren = [];
+              outcome.closedChildren = ['child'];
+              break;
+            case 5:
+              seen.add('command-start');
+              outcome.backgroundCommands = [{ id: 'command', startedAt: Date.now() }];
+              break;
+            case 6:
+              seen.add('command-expiry');
+              break;
+            case 7:
+              seen.add('join');
+              provider.partial = [
+                ...provider.partial,
+                { ...provider.partial[0], sessionId: 'joined', file: 'joined.jsonl' },
+              ];
+              provider.titles.set('joined.jsonl', { ...meta, label: 'Joined' });
+              break;
+            case 8:
+              seen.add('leave');
+              provider.partial = provider.partial.filter((source: SessionFile) => source.sessionId !== 'joined');
+              break;
+            case 9:
+              seen.add('unread');
+              provider.saved.readTo[target] = Date.now();
+              break;
+            case 11:
+              seen.add('quiet-expiry');
+              outcome.finished = false;
+              outcome.endedAt = Date.now() - TURN_QUIET_MS - 1;
+              break;
+            case 13:
+              seen.add('source-replacement');
+              provider.partial = provider.partial.map((source: SessionFile) =>
+                source.sessionId === target
+                  ? {
+                      ...source,
+                      agent: source.agent === 'claude' ? 'codex' : 'claude',
+                      activity: Date.now(),
+                      size: source.size + step,
+                    }
+                  : source,
+              );
+              break;
+            case 14:
+              seen.add('metadata');
+              meta.label = meta.fullLabel = 'Changed ' + step;
+              break;
+            case 15: {
+              const key = meta.agent + ':' + target;
+              provider.running = new Set([key]);
+              provider.runningSinceKeys.set(key, Date.now());
+              provider.heldLifetime.costs = {
+                ...provider.heldLifetime.costs,
+                [target]: { dollars: step, partial: true },
+              };
+              break;
+            }
+          }
+          meta.outcome = outcome;
+          provider.catalog = { sessions: provider.partial };
+          provider.authoritativeCatalog = provider.partial;
+          provider.previousSelection = provider.showing;
+          provider.showing = kind === 7 ? 'joined' : target;
+          await provider.refresh(true, true, true, true);
+        }
+        assert.deepEqual(providers[0].rawMessages, providers[1].rawMessages, 'selection differs at step ' + step);
+        const row = providers[0].rawMessages.at(-1).rail.find((row: any) => row.id === providers[0].showing);
+        if (kind === 2) assert.equal(row.status, 'running');
+        if (kind === 3) assert.equal(row.subagents, 1);
+        if (kind === 4) assert.equal(row.subagents, null);
+        if (kind === 5) assert.equal(row.commands, 1);
+        if (kind === 6) assert.equal(row.commands, null);
+        if (kind === 11) assert.equal(row.status, 'stopped');
+        if (kind === 9) assert.equal(row.unread, false);
+        seen.add('switch');
+        if (step % 16 < 3) seen.add('fast-switches');
+        if (kind === 10) seen.add('minute');
+        if (kind === 12) seen.add('day');
+      }
+      assert.equal(seen.size, 16);
+    } finally {
+      clock.mockRestore();
+    }
+  },
+);
+test('an unchanged selection computes a fixed number of session inputs at 2000 and 4000 rows', async () => {
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.UTC(2026, 0, 15, 18));
+  try {
+    for (const count of [2000, 4000]) {
+      let keyedRows = 0;
+      const provider = switchInputsHarness(count, false, (input, day) => {
+        keyedRows += input.sessions.length;
+        return railInputKey(input, day);
+      });
+      await provider.refresh(true);
+      keyedRows = 0;
+      const calls: Record<string, number> = {};
+      for (const name of [
+        'outcomesFor',
+        'glanceAt',
+        'unreadCounts',
+        'sessionRowOf',
+        'railRows',
+        'railInputFor',
+        'liveOpenChildren',
+        'liveBackgroundCommands',
+      ]) {
+        const original = provider[name].bind(provider);
+        provider[name] = (...args: any[]) => {
+          const rows =
+            name === 'outcomesFor' || name === 'glanceAt'
+              ? args[0].length
+              : name === 'sessionRowOf'
+                ? 1
+                : name === 'unreadCounts'
+                  ? (provider.selectionWindows ?? provider.windows).size
+                  : name === 'liveOpenChildren' || name === 'liveBackgroundCommands'
+                    ? Math.max(
+                        (args[1] ?? provider.selectionOutcomes ?? provider.sessionOutcomes).size,
+                        (args[2] ?? provider.selectionStatusRows ?? provider.sessionRows).length,
+                      )
+                    : (provider.selectionRows ?? provider.sessionRows).length;
+          calls[name] = (calls[name] ?? 0) + rows;
+          return original(...args);
+        };
+      }
+      provider.previousSelection = provider.showing;
+      provider.showing = 'switch-1';
+      await provider.refresh(true, true, true, true);
+      for (const [name, rows] of Object.entries(calls))
+        assert.ok(rows <= 8, name + ' computes ' + rows + ' session inputs among ' + count);
+      assert.equal(calls.outcomesFor, 2);
+      assert.equal(calls.sessionRowOf, 2);
+      assert.equal(keyedRows, 0, 'selection serializes the complete session list inputs');
+      assert.equal(provider.selectionRows, undefined);
+    }
+  } finally {
+    clock.mockRestore();
+  }
+});
 function selectionHarness(revalidate?: Parameters<typeof completeDiscoveryHarness>[0]) {
   const provider = paintHarness(
     ['onMessage', 'routePerformanceEvent', 'sendToHost'],
