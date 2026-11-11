@@ -110,7 +110,11 @@ import {
 import type { ClaudeForwardCheckpoint } from './claudehistory';
 import * as vscode from 'vscode';
 import { costStateDependency, costStateIdentity, reconcileClaudeCostState } from './claudecoststate';
-import { claudeCostStateDependencies, invalidateClaudeCostSupplements } from './projectspend';
+import {
+  ClaudeCostStateDependencyIndex,
+  claudeCostStateDependencies,
+  invalidateClaudeCostSupplements,
+} from './projectspend';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { PlatformPath } from 'node:path';
@@ -14078,7 +14082,7 @@ export class PanelProvider implements vscode.Disposable {
           this.spendChecks.set(result.record, Date.now());
         }
       } catch (error) {
-        invalidateSpendFileNormalization(next.file);
+        if (result.record.missingAt === undefined) invalidateSpendFileNormalization(next.file);
         if (
           result.record.missingAt !== undefined &&
           ['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')
@@ -14104,15 +14108,16 @@ export class PanelProvider implements vscode.Disposable {
   private indexNextClaudeCostState(): boolean {
     if (!this.claudeChildrenDiscovered || this.dispatchDiscoveryPending) return false;
     const sources = this.sessionSpendSources ?? this.claudeSpendSources;
+    const dependencyIndex = new ClaudeCostStateDependencyIndex(sources, this.projectSpendFiles);
     // Each key keeps the first owner with that key, its dependency count, which orders the queue, and its dependency files.
     const owners = this.projectSpendCostOwners;
     const offer = (owner: SessionSpendSource, queue: string[]) => {
       const key = normalizeSpendFile(owner.file);
-      const at = this.projectSpendFiles.findIndex((file) => file.file === key);
+      const at = dependencyIndex.firstRecordIndex(key);
       const record = this.projectSpendFiles[at];
       const capture = (record?.parserState as ClaudeUsageReducerState | undefined)?.costState;
       if (!record || !capture?.snapshots.length) return;
-      const dependencies = claudeCostStateDependencies(owner, sources, this.projectSpendFiles);
+      const dependencies = claudeCostStateDependencies(owner, sources, this.projectSpendFiles, dependencyIndex);
       if (!owners.has(key))
         owners.set(key, {
           owner,
@@ -14147,12 +14152,10 @@ export class PanelProvider implements vscode.Disposable {
     }
     const key = this.projectSpendCostQueue.shift();
     if (!key) return false;
-    const owner = sources.find(
-      (source) => !source.dispatchedFrom && !source.dispatchedVia && normalizeSpendFile(source.file) === key,
-    );
-    const at = this.projectSpendFiles.findIndex((file) => file.file === key);
+    const owner = dependencyIndex.owners.get(key);
+    const at = dependencyIndex.firstRecordIndex(key);
     const record = this.projectSpendFiles[at];
-    const dependencies = owner && claudeCostStateDependencies(owner, sources, this.projectSpendFiles);
+    const dependencies = owner && claudeCostStateDependencies(owner, sources, this.projectSpendFiles, dependencyIndex);
     const capture = (record?.parserState as ClaudeUsageReducerState | undefined)?.costState;
     if (!dependencies || !capture) return this.projectSpendCostQueue.length > 0;
     const result = reconcileClaudeCostState(

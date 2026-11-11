@@ -2266,7 +2266,7 @@ export function indexSpendFile<State>(
 ): IndexSpendFileResult {
   const now = typeof nowOrBudget === 'number' ? nowOrBudget : Date.now();
   const scanBudget = typeof nowOrBudget === 'number' ? budget : nowOrBudget;
-  const normalizedFile = canonicalPath(file);
+  let normalizedFile = canonicalPath(file);
   const normalizedWorkspace = normalizeWorkspace(workspace);
   const emptyReducer = makeReducer(undefined);
   const parserKind = emptyReducer.parserKind;
@@ -2276,6 +2276,10 @@ export function indexSpendFile<State>(
     stat = revisionOf(physical);
     if (!physical.isFile()) {
       throw new Error('not a file');
+    }
+    if (previous?.missingAt !== undefined) {
+      invalidateSpendFileNormalization(file);
+      normalizedFile = canonicalPath(file);
     }
   } catch (error) {
     if (!['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')) {
@@ -2291,7 +2295,7 @@ export function indexSpendFile<State>(
         };
       throw error;
     }
-    invalidateSpendFileNormalization(file);
+    if (previous?.missingAt === undefined) invalidateSpendFileNormalization(file);
     const record =
       previous && previous.file === normalizedFile
         ? // A source that returns is read again from its start, so the record lets its held bytes go.
@@ -3064,58 +3068,99 @@ export function claudeCostStateDependencies(
   owner: SessionSpendSource,
   sources: readonly SessionSpendSource[],
   files: readonly SpendFileIndex[],
+  index = new ClaudeCostStateDependencyIndex(sources, files),
 ): SpendFileIndex[] | null {
-  const records = new Map(files.map((file) => [file.file, file]));
-  const root = normalizeSpendFile(owner.file);
-  const children = new Map<string, Set<string>>();
-  for (const source of sources) {
-    if (source.dispatchedFrom || source.dispatchedVia) continue;
-    const child = normalizeSpendFile(source.file);
-    const parent = source.nativeParentFile
-      ? normalizeSpendFile(source.nativeParentFile)
-      : owner.primary !== false && source.sessionId === owner.sessionId && child !== root
-        ? root
-        : null;
-    if (!parent || child === parent) continue;
-    const siblings = children.get(parent) ?? new Set<string>();
-    siblings.add(child);
-    children.set(parent, siblings);
+  return index.dependencies(owner);
+}
+
+interface ClaudeCostChild {
+  file: string;
+  order: number;
+}
+
+export class ClaudeCostStateDependencyIndex {
+  readonly owners = new Map<string, SessionSpendSource>();
+  private records = new Map<string, { first: number; last: number }>();
+  private normalized = new Map<SessionSpendSource, string>();
+  private children = new Map<string, ClaudeCostChild[]>();
+  private sessionChildren = new Map<string, ClaudeCostChild[]>();
+
+  constructor(
+    sources: readonly SessionSpendSource[],
+    private files: readonly SpendFileIndex[],
+  ) {
+    files.forEach((file, at) =>
+      this.records.set(file.file, { first: this.records.get(file.file)?.first ?? at, last: at }),
+    );
+    sources.forEach((source, order) => {
+      if (source.dispatchedFrom || source.dispatchedVia) return;
+      const file = normalizeSpendFile(source.file);
+      this.normalized.set(source, file);
+      if (!this.owners.has(file)) this.owners.set(file, source);
+      const parent = source.nativeParentFile ? normalizeSpendFile(source.nativeParentFile) : null;
+      if (parent === file) return;
+      const groups = parent ? this.children : this.sessionChildren;
+      const key = parent ?? source.sessionId;
+      const children = groups.get(key) ?? [];
+      children.push({ file, order });
+      groups.set(key, children);
+    });
   }
-  const keys = [root];
-  const seen = new Set(keys);
-  for (let at = 0; at < keys.length; at++) {
-    for (const child of children.get(keys[at]) ?? []) {
-      if (seen.has(child)) continue;
-      seen.add(child);
-      keys.push(child);
+
+  firstRecordIndex(file: string): number {
+    return this.records.get(file)?.first ?? -1;
+  }
+
+  dependencies(owner: SessionSpendSource): SpendFileIndex[] | null {
+    const root = this.normalized.get(owner) ?? normalizeSpendFile(owner.file);
+    const explicit = this.children.get(root) ?? [];
+    const implicit = owner.primary !== false ? (this.sessionChildren.get(owner.sessionId) ?? []) : [];
+    const keys = [root];
+    const seen = new Set(keys);
+    const add = (child: ClaudeCostChild) => {
+      if (seen.has(child.file)) return;
+      seen.add(child.file);
+      keys.push(child.file);
+    };
+    let left = 0;
+    let right = 0;
+    while (left < explicit.length || right < implicit.length) {
+      if (right === implicit.length || (left < explicit.length && explicit[left].order < implicit[right].order))
+        add(explicit[left++]);
+      else add(implicit[right++]);
     }
-  }
-  const dependencies = keys.map((key) => records.get(key));
-  if (
-    dependencies.some(
-      (file) =>
-        !file ||
-        file.complete === false ||
-        file.missingAt ||
-        file.trailing ||
-        file.trailingBytes ||
-        !spendParserCurrent(file.parserKind, file.parserGeneration),
+    for (let at = 1; at < keys.length; at++) for (const child of this.children.get(keys[at]) ?? []) add(child);
+    const dependencies = keys.map((key) => {
+      const at = this.records.get(key)?.last;
+      return at === undefined ? undefined : this.files[at];
+    });
+    if (
+      dependencies.some(
+        (file) =>
+          !file ||
+          file.complete === false ||
+          file.missingAt ||
+          file.trailing ||
+          file.trailingBytes ||
+          !spendParserCurrent(file.parserKind, file.parserGeneration),
+      )
     )
-  )
-    return null;
-  return dependencies as SpendFileIndex[];
+      return null;
+    return dependencies as SpendFileIndex[];
+  }
 }
 
 export function invalidateClaudeCostSupplements(
   files: readonly SpendFileIndex[],
   sources: readonly SessionSpendSource[],
 ): SpendFileIndex[] {
+  const index = files.some((record) => record.costStateSupplement || record.costStateProgress)
+    ? new ClaudeCostStateDependencyIndex(sources, files)
+    : null;
   return files.map((record) => {
     if (!record.costStateSupplement && !record.costStateProgress) return record;
-    const owner = sources.find(
-      (source) => !source.dispatchedFrom && !source.dispatchedVia && normalizeSpendFile(source.file) === record.file,
-    );
-    const dependencies = owner && claudeCostStateDependencies(owner, sources, files);
+    const owner = index!.owners.get(record.file);
+    const dependencies = owner && claudeCostStateDependencies(owner, sources, files, index!);
     const identity = dependencies ? costStateIdentity(dependencies.map(costStateDependency)) : null;
     if (identity === (record.costStateSupplement?.identity ?? record.costStateProgress?.identity)) return record;
     const { costStateSupplement: _supplement, costStateProgress: _progress, ...baseline } = record;

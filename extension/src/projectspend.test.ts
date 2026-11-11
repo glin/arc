@@ -4,6 +4,7 @@ import { describe, test, vi } from 'vitest';
 import { IntegrityScheduler } from './scheduler';
 import {
   costStateDependency,
+  costStateIdentity,
   matchingCostSupplementSteps,
   reconcileClaudeCostState,
   CLAUDE_COST_STATE_SNAPSHOTS,
@@ -13,7 +14,11 @@ import {
   CLAUDE_COST_STATE_BYTES,
 } from './claudecoststate';
 import { claudeCostState } from './turnfixtures';
-import { claudeCostStateDependencies, invalidateClaudeCostSupplements } from './projectspend';
+import {
+  ClaudeCostStateDependencyIndex,
+  claudeCostStateDependencies,
+  invalidateClaudeCostSupplements,
+} from './projectspend';
 import assert from 'node:assert';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -7684,4 +7689,250 @@ test('one thread with entries at two paths shows one largest total, joined by it
     [other.file, ten.file].sort(),
     'the thread counted more than one record',
   );
+});
+
+function referenceClaudeCostStateDependencies(
+  owner: SessionSpendSource,
+  sources: readonly SessionSpendSource[],
+  files: readonly SpendFileIndex[],
+): SpendFileIndex[] | null {
+  const records = new Map(files.map((file) => [file.file, file]));
+  const root = normalizeSpendFile(owner.file);
+  const children = new Map<string, Set<string>>();
+  for (const source of sources) {
+    if (source.dispatchedFrom || source.dispatchedVia) continue;
+    const child = normalizeSpendFile(source.file);
+    const parent = source.nativeParentFile
+      ? normalizeSpendFile(source.nativeParentFile)
+      : owner.primary !== false && source.sessionId === owner.sessionId && child !== root
+        ? root
+        : null;
+    if (!parent || child === parent) continue;
+    const siblings = children.get(parent) ?? new Set<string>();
+    siblings.add(child);
+    children.set(parent, siblings);
+  }
+  const keys = [root];
+  const seen = new Set(keys);
+  for (let at = 0; at < keys.length; at++) {
+    for (const child of children.get(keys[at]) ?? []) {
+      if (seen.has(child)) continue;
+      seen.add(child);
+      keys.push(child);
+    }
+  }
+  const dependencies = keys.map((key) => records.get(key));
+  if (
+    dependencies.some(
+      (file) =>
+        !file ||
+        file.complete === false ||
+        file.missingAt ||
+        file.trailing ||
+        file.trailingBytes ||
+        !spendParserCurrent(file.parserKind, file.parserGeneration),
+    )
+  )
+    return null;
+  return dependencies as SpendFileIndex[];
+}
+
+function referenceInvalidateClaudeCostSupplements(
+  files: readonly SpendFileIndex[],
+  sources: readonly SessionSpendSource[],
+): SpendFileIndex[] {
+  return files.map((record) => {
+    if (!record.costStateSupplement && !record.costStateProgress) return record;
+    const owner = sources.find(
+      (source) => !source.dispatchedFrom && !source.dispatchedVia && normalizeSpendFile(source.file) === record.file,
+    );
+    const dependencies = owner && referenceClaudeCostStateDependencies(owner, sources, files);
+    const identity = dependencies ? costStateIdentity(dependencies.map(costStateDependency)) : null;
+    if (identity === (record.costStateSupplement?.identity ?? record.costStateProgress?.identity)) return record;
+    const { costStateSupplement: _supplement, costStateProgress: _progress, ...baseline } = record;
+    return baseline;
+  });
+}
+
+function countSpendNormalizations(action: () => void): number {
+  const marker = path.join(dir(), 'normalization-marker');
+  const get = Map.prototype.get;
+  const caches = new Set<Map<unknown, unknown>>();
+  let calls = 0;
+  const spy = vi.spyOn(Map.prototype, 'get').mockImplementation(function (this: Map<unknown, unknown>, key: unknown) {
+    if (key === marker) caches.add(this);
+    if (caches.has(this)) calls++;
+    return get.call(this, key);
+  });
+  try {
+    normalizeSpendFile(marker);
+    calls = 0;
+    action();
+    return calls;
+  } finally {
+    spy.mockRestore();
+  }
+}
+
+test('cost-state dependencies and invalidation match the reference across seeded source graphs', () => {
+  const folder = dir();
+  let seed = 73519;
+  const random = (limit: number) => {
+    seed ^= seed << 13;
+    seed ^= seed >>> 17;
+    seed ^= seed << 5;
+    return (seed >>> 0) % limit;
+  };
+  for (let sample = 0; sample < 240; sample++) {
+    const names = Array.from({ length: 24 }, (_, at) => normalizeWorkspace(path.join(folder, `${at}.jsonl`)));
+    const files = names.map((file, at): SpendFileIndex => ({
+      file,
+      workspace: folder,
+      size: at + 1,
+      mtimeMs: 1,
+      offset: at + 1,
+      trailing: '',
+      buckets: [],
+      indexedAt: 1,
+      parserKind: 'claude',
+      parserGeneration: PROJECT_SPEND_PARSER_GENERATIONS.claude,
+      sourceIdentity: `source-${at}`,
+    }));
+    const sources: SessionSpendSource[] = [
+      { sessionId: 'parent', file: names[0], primary: true },
+      { sessionId: 'parent', file: names[1], primary: false, nativeParentFile: names[0] },
+      { sessionId: 'parent', file: names[2], primary: false },
+      { sessionId: 'parent', file: names[3], primary: false, nativeParentFile: names[1] },
+      { sessionId: 'shared', file: names[0], primary: false },
+      { sessionId: 'dispatch', file: names[4], dispatchedFrom: 'parent', dispatchedVia: 'parent' },
+    ];
+    for (let at = 0; at < 50; at++) {
+      const mode = random(7);
+      sources.push({
+        sessionId: ['parent', 'shared', 'other'][random(3)],
+        file: names[random(names.length)],
+        ...(mode === 0 ? {} : { primary: mode === 1 }),
+        ...(mode === 2 || mode === 3 ? { nativeParentFile: names[random(names.length)] } : {}),
+        ...(mode === 4 ? { dispatchedFrom: 'parent' } : {}),
+        ...(mode === 5 ? { dispatchedVia: 'parent' } : {}),
+      });
+    }
+    if (sample % 3 === 0) {
+      const at = random(files.length);
+      Object.assign(
+        files[at],
+        [
+          { complete: false },
+          { missingAt: 1 },
+          { trailing: 'unfinished' },
+          { trailingBytes: 'YQ==' },
+          { parserGeneration: 0 },
+          { missingAt: 0 },
+        ][random(6)],
+      );
+    }
+    if (sample % 5 === 0) files.push({ ...files[0], size: 99 });
+    if (sample % 7 === 0) files.splice(random(files.length), 1);
+    const shared = new ClaudeCostStateDependencyIndex(sources, files);
+    for (const record of files)
+      assert.equal(
+        shared.firstRecordIndex(record.file),
+        files.findIndex((file) => file.file === record.file),
+      );
+    for (const owner of sources) {
+      const expected = referenceClaudeCostStateDependencies(owner, sources, files);
+      const actual = claudeCostStateDependencies(owner, sources, files, shared);
+      assert.deepEqual(actual, expected, `sample ${sample}`);
+      if (expected && actual) {
+        expected.forEach((file, at) => assert.equal(actual[at], file));
+        assert.equal(
+          costStateIdentity(actual.map(costStateDependency)),
+          costStateIdentity(expected.map(costStateDependency)),
+        );
+      }
+    }
+    for (const record of files) {
+      const owner = sources.find(
+        (source) => !source.dispatchedFrom && !source.dispatchedVia && normalizeSpendFile(source.file) === record.file,
+      );
+      const dependencies = owner && referenceClaudeCostStateDependencies(owner, sources, files);
+      const identity = dependencies ? costStateIdentity(dependencies.map(costStateDependency)) : 'unmatched';
+      if (random(2))
+        record.costStateSupplement = {
+          identity,
+          dependencies: [],
+          snapshots: [],
+          dated: [],
+          lifetime: [],
+          lifetimeAllocations: [],
+          datedAllocations: [],
+        };
+      else record.costStateProgress = { identity, dependencies: [] } as unknown as ClaudeCostProgress;
+      if (random(3) === 0) {
+        if (record.costStateSupplement) record.costStateSupplement.identity = 'stale';
+        else record.costStateProgress!.identity = 'stale';
+      }
+    }
+    const expected = referenceInvalidateClaudeCostSupplements(files, sources);
+    const actual = invalidateClaudeCostSupplements(files, sources);
+    assert.deepEqual(actual, expected, `invalidation sample ${sample}`);
+    expected.forEach((record, at) => assert.equal(actual[at] === files[at], record === files[at]));
+    const replacement = { ...files[0], size: files[0].size + 1 };
+    files[0] = replacement;
+    assert.deepEqual(shared.dependencies(sources[0]), referenceClaudeCostStateDependencies(sources[0], sources, files));
+  }
+});
+
+test('cost-state invalidation normalizes sources once across 200 supplemental files', () => {
+  const folder = dir();
+  const sources = Array.from({ length: 2000 }, (_, at) => ({
+    sessionId: `session-${at}`,
+    file: normalizeWorkspace(path.join(folder, `${at}.jsonl`)),
+    primary: true,
+  }));
+  const files = sources.slice(0, 200).map((source): SpendFileIndex => ({
+    file: source.file,
+    workspace: folder,
+    size: 1,
+    mtimeMs: 1,
+    offset: 1,
+    trailing: '',
+    buckets: [],
+    indexedAt: 1,
+    parserKind: 'claude',
+    parserGeneration: PROJECT_SPEND_PARSER_GENERATIONS.claude,
+    costStateProgress: { identity: 'stale', dependencies: [] } as unknown as ClaudeCostProgress,
+  }));
+  const calls = countSpendNormalizations(() => {
+    assert.equal(invalidateClaudeCostSupplements(files, sources).filter((file) => file.costStateProgress).length, 0);
+  });
+  assert.ok(calls <= sources.length * 3, `${calls} normalizations for ${sources.length} sources`);
+});
+
+test('missing spend sources retain normalization until a source returns at a new target', () => {
+  const folder = dir();
+  const first = path.join(folder, 'first');
+  const second = path.join(folder, 'second');
+  const alias = path.join(folder, 'alias');
+  fs.mkdirSync(first);
+  fs.mkdirSync(second);
+  fs.symlinkSync(first, alias, process.platform === 'win32' ? 'junction' : 'dir');
+  const source = path.join(alias, 'source.jsonl');
+  fs.writeFileSync(source, JSON.stringify(event(1)) + '\n');
+  let record = indexSpendFile(undefined, source, folder, reducer, 1).record;
+  fs.unlinkSync(source);
+  record = indexSpendFile(record, source, folder, reducer, 2).record;
+  const native = fs.realpathSync.native;
+  const resolves = vi.spyOn(fs.realpathSync, 'native').mockImplementation(native);
+  for (let at = 0; at < 20; at++) {
+    normalizeSpendFile(source);
+    record = indexSpendFile(record, source, folder, reducer, 3 + at).record;
+  }
+  assert.equal(resolves.mock.calls.length, 1);
+  fs.unlinkSync(alias);
+  fs.writeFileSync(path.join(second, 'source.jsonl'), JSON.stringify(event(2)) + '\n');
+  fs.symlinkSync(second, alias, process.platform === 'win32' ? 'junction' : 'dir');
+  const returned = indexSpendFile(record, source, folder, reducer, 30);
+  assert.equal(returned.record.file, normalizeWorkspace(path.join(second, 'source.jsonl')));
+  assert.equal(returned.record.missingAt, undefined);
 });
