@@ -90,6 +90,7 @@ export function exportCard(value: ReturnType<typeof toCard> | ReturnType<typeof 
     lastAbsolute: turn?.lastAbsolute ?? value.absolute,
     label: value.label,
     agent: turn?.agent ?? '',
+    headingAgent: value.headingAgent,
     model: turn?.model ?? null,
     effort: turn?.effort ?? null,
     ...(turn?.speed ? { speed: turn.speed } : {}),

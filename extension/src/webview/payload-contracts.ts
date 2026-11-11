@@ -60,6 +60,7 @@ export interface CardView extends Record<string, unknown> {
   lastAbsolute: string;
   label: string;
   agent: string;
+  headingAgent: string | null;
   model: string | null;
   effort: string | null;
   speed?: string | null;

@@ -28,6 +28,7 @@ export const CARD_CONTENT_FIELDS: readonly string[] = [
   'status',
   'statusWord',
   'agent',
+  'headingAgent',
   'model',
   'effort',
   'speed',

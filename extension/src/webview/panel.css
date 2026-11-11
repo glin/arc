@@ -921,29 +921,15 @@ button.railtermmore:hover {
 .sessionmenu:not(.sessionlayout) {
   padding: 0;
 }
-/* Drawn inside, at -1px: the button sits at the panel's right edge, where an outside ring is
-   cut off the way `.session`'s own focus ring is. */
+/* Native action buttons share an inset focus ring. Session heading buttons can reach the
+   panel edge, where an outside ring is clipped. */
 .sessionmenu:focus-visible {
   outline: 1px solid var(--vscode-focusBorder, #0078d4);
   outline-offset: -1px;
 }
-/* Nudged down against the box the flex row centers it in. A line of text does not fill its
-   own box evenly: the box reserves descent under the baseline, so the ink sits high in it and
-   an icon centered on the box reads high beside the words. Measured on this row, the dots
-   landed 2 pixels over the title's ink. The shift is in `em` because the
-   gap it answers is a fraction of the font, not a count of pixels.
-
-   The icon narrowed because the button never reset its own browser-default padding
-   (`1px 6px`), not because the heading row outside the button squeezed it: the button is
-   `box-sizing: border-box`, so that padding ate into the box the icon had to draw in, on the
-   width alone (`6px` a side against `1px` top and bottom). Resetting the padding above fixes
-   the room directly. `flex: none` here on the icon itself keeps that fix even if the button's
-   own width and the icon's declared size are ever tuned out of step again, without which the
-   icon's default flex-shrink would silently absorb a future mismatch instead of overflowing
-   where it would be noticed. Scoped away from the gear below, whose own `svg.sessionlayouticon`
-   rule sets a larger declared size than its unreset padding leaves room for and depends on the
-   default shrink to fit it back down. The gear still takes the fill and the nudge below,
-   through the unscoped rule: only the size and the shrink lock are scoped away from it. */
+/* Native action icons inherit their button's color and share a small vertical offset.
+   Non-layout icons keep their declared size without flex shrinking. The layout icon retains
+   its own size and flex behavior. */
 .sessionmenu svg {
   fill: currentColor;
   transform: translateY(0.1em);
@@ -1210,8 +1196,8 @@ button.head:hover .durationfact {
 .dim {
   color: var(--idle);
 }
-/* The agent takes the gap that used to push the model to the right, so the two read as one
-   run: which agent, then which of its models. */
+/* The agent starts the right-aligned metadata. A heading without the agent gives its model
+   the alignment margin instead. */
 .agent {
   margin-left: auto;
   color: var(--idle);
@@ -1224,8 +1210,8 @@ button.head:hover .durationfact {
   font-size: var(--t-body);
   white-space: nowrap;
 }
-/* Sized with the model it sits beside, not with the body. The agent carries the margin
-   that pushes the run right, so this one follows it. */
+/* Effort and speed follow the model at its text size. The first metadata field carries
+   the margin that aligns the group. */
 .effort,
 .speed {
   color: var(--idle);

@@ -526,6 +526,7 @@ export interface TurnCard {
   lastAbsolute: string; // the same moment as a clock time, carried on its hover
   label: string; // what the head row is announced by, since a glyph says nothing
   agent: string; // which agent recorded the turn, in words
+  headingAgent: string | null; // visible agent name beside the model
   model: string | null;
   effort: string | null;
   headline: string;
@@ -3868,6 +3869,7 @@ function carriedAgentsLine(carried: number): string | null {
 
 // Compaction boundary on the timeline, separate from prompt-response turns.
 export interface CompactionCard {
+  headingAgent: null;
   kind: 'compaction';
   key: string;
   sessionId: string;
@@ -4130,6 +4132,7 @@ export function toCompactionCard(c: Compaction, now: number = Date.now(), labels
   const headline = size ? `${why} ${size}` : why;
   return {
     kind: 'compaction',
+    headingAgent: null,
     key: `${c.sessionId}:compact:${c.at}`,
     sessionId: c.sessionId,
     sessionTitle: null,
@@ -5502,6 +5505,7 @@ export function toCard(
     endedAt: turn.endedAt,
     ...(turn.processEndedAt !== undefined ? { processEndedAt: turn.processEndedAt } : {}),
     agent: AGENT_NAMES[turn.agent],
+    headingAgent: turn.agent === 'codex' && model ? null : AGENT_NAMES[turn.agent],
     model,
     effort: turn.effort,
     speed,

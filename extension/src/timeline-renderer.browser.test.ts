@@ -4691,7 +4691,7 @@ test('a long activity update keeps the chosen disclosure and visible row', async
     }));
     payload.cards = [card];
     await post(page, payload);
-    await page.locator(`[data-control=${JSON.stringify(`card:${card.key}`)}]`).press('Enter');
+    await page.locator(`[data-control=${JSON.stringify(`card:${card.key}`)}] > .glyph`).click();
     await page.locator(`[data-control=${JSON.stringify(`activity:${card.key}`)}]`).click();
     await page.locator(`[data-control=${JSON.stringify(`activity:${card.key}`)}]`).click();
     const row = page.locator(`[data-key=${JSON.stringify(card.key)}] .actrow`).nth(25);
@@ -4914,16 +4914,17 @@ test('turn menus cover static and compaction headings while Codex retains comple
     const payload = renderPayload() as Payload;
     const base = {
       ...payload.cards[0],
-      agent: 'Codex',
+      agent: 'Recorded Codex',
+      headingAgent: null,
       model: 'GPT-6.1-Terra-Codex',
       effort: 'ultra',
       speed: 'Fast',
-      label: 'Codex GPT-6.1-Terra-Codex ultra Fast',
+      label: 'Recorded Codex GPT-6.1-Terra-Codex ultra Fast',
     };
     payload.cards = [
       base,
-      { ...base, key: 's1:missing-model', model: null },
-      { ...base, key: 's1:other-agent', agent: 'Claude' },
+      { ...base, key: 's1:missing-model', model: null, headingAgent: 'Codex' },
+      { ...base, key: 's1:other-agent', agent: 'Claude', headingAgent: 'Claude' },
       {
         ...base,
         key: 's1:static',
@@ -4948,7 +4949,7 @@ test('turn menus cover static and compaction headings while Codex retains comple
         await host.locator('.turnmenu').getAttribute('data-vscode-context'),
         await host.locator('.head').getAttribute('data-vscode-context'),
       );
-      assert.equal(await host.locator('.agent').count(), card.model && card.agent === 'Codex' ? 0 : 1);
+      assert.equal(await host.locator('.agent').count(), card.headingAgent ? 1 : 0);
       if (card.model) {
         assert.equal(await host.locator('.head > .model').textContent(), card.model);
         assert.equal(
@@ -4958,6 +4959,9 @@ test('turn menus cover static and compaction headings while Codex retains comple
       }
     }
     assert.equal(await page.locator('[data-key="s1:static"] .head').evaluate((node) => node.tagName), 'SPAN');
+    assert.deepEqual(await page.locator('[data-key="s1:static"] .head > .sr-only').allTextContents(), [
+      'Recorded Codex ',
+    ]);
     assert.equal(await page.locator('[data-key="s1:static"] .durationfact').count(), 0);
     assert.equal(
       JSON.parse((await page.locator('[data-key="s1:compaction-menu"] .turnmenu').getAttribute('data-vscode-context'))!)
@@ -4975,6 +4979,10 @@ test('turn menus cover static and compaction headings while Codex retains comple
     );
     await post(exported, payload);
     assert.equal(await exported.locator('.turnmenu').count(), 0);
+    assert.deepEqual(await exported.locator('[data-key="s1:static"] .head > .sr-only').allTextContents(), [
+      'Recorded Codex ',
+    ]);
+    assert.equal(await exported.locator('[data-key="s1:static"]').getByRole('heading', { name: /Codex/ }).count(), 1);
   } finally {
     await browser.close();
   }

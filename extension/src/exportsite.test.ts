@@ -1434,11 +1434,17 @@ test('linked Claude usage parts retain exact dollars through exported turns', ()
   assert.match(String(partial.detail), /usage record incomplete/);
 });
 
-test('exported named response links retain labels without live session navigation', () => {
+test('exported cards retain heading identity and response link labels without live session navigation', () => {
   const summary = '[Claude cache controls](arc-session:7390194c-8fea-4b6d-80be-e7e8c7684426)';
   const card = exportCard(toCard(turn({ summary }), false, 1));
   assert.match(card.summaryHtml ?? '', /Claude cache controls/);
   assert.doesNotMatch(card.summaryHtml ?? '', /arc-session:|<a|data-link/);
+  assert.equal(card.headingAgent, 'Claude');
+  const codex = exportCard(toCard(turn({ agent: 'codex', model: 'gpt-5.6-sol' }), false, 1));
+  assert.equal(codex.headingAgent, null);
+  assert.equal(codex.agent, 'Codex');
+  assert.equal(exportCard(toCard(turn({ agent: 'codex', model: null }), false, 1)).headingAgent, 'Codex');
+  assert.equal(exportCard(toCompactionCard(compaction(), 1)).headingAgent, null);
 });
 
 test('export citations preserve source bodies and identify every response surface without file actions', () => {

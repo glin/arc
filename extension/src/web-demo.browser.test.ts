@@ -493,12 +493,12 @@ describe('read-only web demo', () => {
         await page.locator('#chippop .chippopitemhead').getByText('Output', { exact: true }).waitFor();
         await capture('main-speed');
         await page.keyboard.press('Escape');
-        await main.locator('h3.cardheading button.head').click();
+        await main.locator('h3.cardheading button.head > .glyph').click();
         await main.locator('.chips [data-metric="rate"]').click();
         await page.locator('#chippop.pinned .chippopitemhead').getByText('Output', { exact: true }).waitFor();
         await capture('main-speed-timeline');
         await page.keyboard.press('Escape');
-        await main.locator('h3.cardheading button.head').click();
+        await main.locator('h3.cardheading button.head > .glyph').click();
         const history = main.locator('.cardrecord .agentrow').filter({ hasText: 'Find earlier unread fixes' });
         await history.locator('[data-metric="cost"]').press('Enter');
         await page.locator('#chippopnested.pinned .costsection').first().waitFor({ state: 'visible' });

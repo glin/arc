@@ -1717,8 +1717,7 @@ function Card({
   const head = useRef<HTMLElement>(null);
   const body = useRef<HTMLDivElement>(null);
   const menu = useRef<HTMLButtonElement>(null);
-  const hasMenu = !options.readOnly && !options.readonlyBody && !!card.sessionId && !!card.key;
-  const visibleAgent = card.agent !== 'Codex' || !card.model ? card.agent : null;
+  const hasMenu = !options.readOnly && !options.readonlyBody;
   const expandable = cardHasBody(card);
   const expanded = expandable && openState.isExpanded();
   const read = options.readonlyBody ? true : options.read!.isRead(card);
@@ -1871,9 +1870,10 @@ function Card({
   return h(Fragment, {}, [
     h('h3', { class: `cardheading${hasMenu ? ' has-turnmenu' : ''}`, id: cardHeadingId(card.key) }, [
       h(expandable ? 'button' : 'span', headProps, [
+        !expandable && !card.headingAgent && card.agent ? h('span', { class: 'sr-only' }, `${card.agent} `) : null,
         h('span', { class: 'glyph' }, glyph),
         h('span', { class: 'timing' }, timing),
-        visibleAgent ? h('span', { class: 'agent' }, visibleAgent) : null,
+        card.headingAgent ? h('span', { class: 'agent' }, card.headingAgent) : null,
         card.model
           ? h(
               'span',

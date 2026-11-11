@@ -13,7 +13,7 @@ import {
   type NativeChildCacheFacts,
 } from './projectspend.ts';
 import { turnCacheExpiryWarning, turnFileContributors, type CacheExpiryWarning } from './turncard.ts';
-import { orderTimelineEntries } from './turncard.ts';
+import { AGENT_NAMES, orderTimelineEntries } from './turncard.ts';
 
 test('linked preparatory compactions change placement while card identity and clocks stay intact', () => {
   const comment = { text: 'Keep this comment' };
@@ -3013,11 +3013,24 @@ and a second line`,
   assert.ok(!row.includes('and a second line'), 'the row took more than the first line of the prompt');
 });
 
-test('a card names the agent that recorded it, in the badge and in what it is announced by', () => {
+test('a card projects its heading agent separately from its complete identity', () => {
   const claude = toCard(turn(), false, NOW);
   const codex = toCard(turn({ agent: 'codex', model: 'gpt-5.6-sol', effort: 'high' }), false, NOW);
   assert.equal(claude.agent, 'Claude');
   assert.equal(codex.agent, 'Codex');
+  assert.equal(claude.headingAgent, 'Claude');
+  assert.equal(codex.headingAgent, null);
+  assert.equal(toCard(turn({ agent: 'codex', model: null }), false, NOW).headingAgent, 'Codex');
+  assert.equal(toCompactionCard(compaction(), NOW).headingAgent, null);
+  const codexName = AGENT_NAMES.codex;
+  try {
+    AGENT_NAMES.codex = 'Renamed Codex';
+    const renamed = toCard(turn({ agent: 'codex', model: 'gpt-5.6-sol' }), false, NOW);
+    assert.equal(renamed.headingAgent, null);
+    assert.equal(renamed.agent, 'Renamed Codex');
+  } finally {
+    AGENT_NAMES.codex = codexName;
+  }
   // The card's accessible name includes the agent word alongside its model.
 
   assert.match(codex.label, /Codex GPT-5\.6-Sol high/);
