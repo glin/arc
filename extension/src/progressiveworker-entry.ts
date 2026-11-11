@@ -297,6 +297,9 @@ interface ReceiptScan {
   // Each launch that a reused scan sent to be read again and that has not been read yet, with true when the launch ended
   // without a link in the completed scan.
   reuseRetries: Map<string, boolean>;
+  // Each launch that a reused scan kept from the completed scan and has not sent to be read again, with true when the launch
+  // ended without a link in the completed scan. A fresh scan holds none.
+  reuseClasses: Map<string, boolean>;
 }
 let receiptScan: ReceiptScan | null = null;
 // A completed scan answers a new epoch only within the full pass age bound of the host's walk gate, from the opening of the
@@ -394,33 +397,40 @@ function keptScanRefusal(kept: ReceiptScan): keyof typeof KEPT_SCAN_REFUSAL_CHAR
 // the store revision. Its steps then check the dispatched transcript of each link that the scan holds.
 function reusedReceiptScan(kept: ReceiptScan, epoch: DiscoveryCheckpoint): ReceiptScan {
   const changed = changedCatalogIdentities(kept.catalog, epoch.catalog);
-  const retries: string[] = [];
-  const reuseRetries = new Map<string, boolean>();
-  for (const launchId of kept.visited) {
-    // The identities hold the requester, and then the dispatched session when the read reached it.
-    const identities = kept.launches.get(launchId) ?? [];
-    const unlinked = !kept.references.has(launchId);
-    if (!identities.some((identity) => changed.has(identity)) && !(unlinked && identities.length > 1)) continue;
-    kept.launches.delete(launchId);
-    kept.references.delete(launchId);
-    kept.startups.delete(launchId);
-    retries.push(launchId);
-    reuseRetries.set(launchId, unlinked);
-  }
   const scan: ReceiptScan = {
     ...kept,
     epoch: epoch.epoch,
     catalog: epoch.catalog,
     controller: new AbortController(),
     steps: keptStartupChecks(() => scan),
-    retries,
+    retries: [],
     retry: null,
     storeRead: false,
     competitionRefused: false,
     unproved: false,
-    reuseRetries,
+    reuseRetries: new Map(),
+    reuseClasses: new Map([...kept.visited].map((launchId) => [launchId, !kept.references.has(launchId)])),
   };
+  for (const launchId of kept.visited) {
+    // The identities hold the requester, and then the dispatched session when the read reached it.
+    const identities = scan.launches.get(launchId) ?? [];
+    const unlinked = scan.reuseClasses.get(launchId)!;
+    if (!identities.some((identity) => changed.has(identity)) && !(unlinked && identities.length > 1)) continue;
+    retryReceiptLaunch(scan, launchId);
+  }
   return scan;
+}
+// Sends a launch of a scan to be read again. A launch that a reused scan kept from the completed scan counts as a reuse read
+// when that read ends, with its class from the completed scan. Each launch counts once in a reused scan.
+function retryReceiptLaunch(scan: ReceiptScan, launchId: string): void {
+  scan.launches.delete(launchId);
+  scan.references.delete(launchId);
+  scan.startups.delete(launchId);
+  scan.retries.push(launchId);
+  const unlinked = scan.reuseClasses.get(launchId);
+  if (unlinked === undefined) return;
+  scan.reuseClasses.delete(launchId);
+  scan.reuseRetries.set(launchId, unlinked);
 }
 // The steps of a reused scan. The first step reads nothing. Each later step stats the dispatched transcript of one link. A
 // transcript whose device, inode, size or times differ from its opening check, or that cannot be read, sends its launch to be
@@ -436,13 +446,7 @@ function* keptStartupChecks(current: () => ReceiptScan): ReceiptScan['steps'] {
     } catch {
       moved = true;
     }
-    if (moved) {
-      scan.launches.delete(launchId);
-      scan.references.delete(launchId);
-      scan.startups.delete(launchId);
-      scan.retries.push(launchId);
-      scan.reuseRetries.set(launchId, false);
-    }
+    if (moved) retryReceiptLaunch(scan, launchId);
     yield { entries: 0, bytes: 0, checks: 1 };
   }
 }
@@ -1053,13 +1057,8 @@ async function execute(
       for (const [key, child] of epochChildSessions) if (!child || !inRoots(child.cwd)) epochChildSessions.delete(key);
       if (receiptScan && receiptScan.epoch === held.epoch) {
         const changed = changedCatalogIdentities(receiptScan.catalog, catalog);
-        for (const [launchId, identities] of receiptScan.launches) {
-          if (!identities.some((identity) => changed.has(identity))) continue;
-          receiptScan.launches.delete(launchId);
-          receiptScan.references.delete(launchId);
-          receiptScan.startups.delete(launchId);
-          receiptScan.retries.push(launchId);
-        }
+        for (const [launchId, identities] of receiptScan.launches)
+          if (identities.some((identity) => changed.has(identity))) retryReceiptLaunch(receiptScan, launchId);
         receiptScan.catalog = catalog;
       }
       const { protectedFile: _protectedFile, ...rest } = held;
@@ -1662,6 +1661,7 @@ async function execute(
           startups: new Map(),
           fullAt: Date.now(),
           reuseRetries: new Map(),
+          reuseClasses: new Map(),
         };
         receiptScan = scan;
       }

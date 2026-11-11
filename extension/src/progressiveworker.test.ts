@@ -2070,14 +2070,16 @@ test('a launch rejected at its requester is read again only when its requester e
 });
 
 // Each receipt slice ends after 16 steps with a reply. Once the marker exists, the worker cancels its own request four receipt
-// steps later, inside the second read of the launch whose child grew. That read takes more than 16 steps.
-test('a reused receipt scan that a cancel and slice replies interrupt keeps each link once and counts each read as it ends', async () => {
+// steps later, inside the second read of the launch whose child grew. That read takes more than 16 steps. After the first slice
+// reply, a root change drops the grandchild from the catalog, so the reused scan reads its kept launch to the grandchild again.
+// The roots then return, and the next reused scan reads that launch again without its link.
+test('a reused receipt scan that a cancel, slice replies and a root change interrupt keeps each link once and counts each read as it ends', async () => {
   const marker = path.join(tempDir('receipt-reuse-cancel-'), 'cancel');
   const cancel = new AbortController();
   const requestStart = 'requests.set(message.id, controller);';
   const step = 'receiptSteps++;';
   const limit = 'receiptSteps >= RECEIPT_STEPS';
-  const { fx, worker, host, pass, cancelled, settle, charged } = await receiptWalkHarness(
+  const { fx, root, worker, host, pass, cancelled, settle, charged } = await receiptWalkHarness(
     () =>
       `const reuseFs=require('node:fs'),reusePort=require('node:worker_threads').parentPort;let reuseRequest,reuseSteps=-1;`,
     (code) => {
@@ -2111,6 +2113,26 @@ test('a reused receipt scan that a cancel and slice replies interrupt keeps each
     growTranscript(fx.parent);
     fs.writeFileSync(marker, '');
     await cancelled(cancel);
+    const prepare = host.prepareClaudeChildren.bind(host);
+    let requests = 0;
+    host.prepareClaudeChildren = (...args: unknown[]) => {
+      if (++requests === 2) {
+        host.repositoryScopeRoots = [root, path.join(root, 'other')];
+        host.claudeParents = [fx.parent, fx.child];
+      }
+      return prepare(...args);
+    };
+    const narrowed = sessionParentIndex((await pass()).references);
+    assert.ok(requests > 1, 'the reused scan completed before the root change');
+    assert.equal(narrowed.get(fx.child.sessionId)?.parent, fx.parent.sessionId);
+    assert.equal(
+      narrowed.get(fx.grandchild.sessionId),
+      undefined,
+      'a link to a session that left the catalog survived',
+    );
+    host.prepareClaudeChildren = prepare;
+    host.repositoryScopeRoots = [root];
+    host.claudeParents = fx.catalog;
     const reply = await pass();
     const dispatched = reply.references.filter((reference) => reference.kind === 'dispatch');
     assert.deepEqual(
@@ -2122,7 +2144,7 @@ test('a reused receipt scan that a cancel and slice replies interrupt keeps each
     assert.equal(parents.get(fx.grandchild.sessionId)?.parent, fx.child.sessionId);
     const replies = charged.slice(settled);
     assert.ok(replies.length > 2, `the reused scan took ${replies.length} replies`);
-    // The second read of the launch counts in the reply where its read ends.
+    // Each second read of a launch counts in the reply where its read ends.
     assert.deepEqual(
       replies.map((charges) => charges.receiptScanReuseLaunches ?? 0),
       replies.map((charges) => charges.receiptLaunchesRead ?? 0),
@@ -2135,7 +2157,7 @@ test('a reused receipt scan that a cancel and slice replies interrupt keeps each
         discovery.receiptScanReuseLaunches,
         discovery.receiptScanReuseLaunchesUnlinked,
       ],
-      [0, 1, 1, 0],
+      [0, 2, 3, 1],
     );
   } finally {
     worker.stop();
