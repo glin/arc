@@ -247,9 +247,9 @@ test('attachment refusals post once and leave unrelated staging intact', async (
       (
         await refuse(
           Array.from({ length: 3 }, (_, at) => ({
-            name: `total-${at}.bin`,
-            type: 'application/octet-stream',
-            size: 7 * 1024 * 1024,
+            name: `total-${at}.png`,
+            type: 'image/png',
+            size: 40 * 1024 * 1024,
           })),
         )
       ).code,

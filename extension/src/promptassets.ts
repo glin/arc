@@ -3,10 +3,31 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { AgentPrompt, PromptAsset } from './agentwire';
 
-import { MAX_PROMPT_ASSETS, MAX_PROMPT_ASSET_BYTES, MAX_PROMPT_ASSET_TOTAL_BYTES } from './domain/prompt-assets';
-export { MAX_PROMPT_ASSETS, MAX_PROMPT_ASSET_BYTES, MAX_PROMPT_ASSET_TOTAL_BYTES };
+import {
+  MAX_CLAUDE_PDF_TOTAL_BYTES,
+  MAX_PROMPT_ASSETS,
+  MAX_PROMPT_ASSET_TOTAL_BYTES,
+  IMAGE_ASSET_MIMES,
+  browserAssetMime,
+  normalizeAssetMime,
+  promptAssetByteLimit,
+} from './domain/prompt-assets';
+export {
+  MAX_CLAUDE_PDF_TOTAL_BYTES,
+  MAX_PROMPT_ASSETS,
+  MAX_PROMPT_ASSET_BYTES,
+  MAX_PROMPT_IMAGE_BYTES,
+  MAX_PROMPT_ASSET_TOTAL_BYTES,
+  IMAGE_ASSET_MIMES,
+  assetBatchRefusal,
+  assetMimeForName,
+  browserAssetMime,
+  normalizeAssetMime,
+  promptAssetByteLimit,
+  type AssetBatchLimits,
+  type AssetBatchRefusal,
+} from './domain/prompt-assets';
 
-export const IMAGE_ASSET_MIMES: ReadonlySet<string> = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
 const CLAUDE_ASSET_MIMES = new Set([...IMAGE_ASSET_MIMES, 'application/pdf']);
 
 export function assetKindWord(mime: string): string {
@@ -36,6 +57,15 @@ export function agentTakesAsset(agent: string, mime: string): boolean {
 
 export function unsupportedPromptAsset<T extends { mime: string }>(agent: string, assets: readonly T[]): T | null {
   return assets.find((asset) => !agentTakesAsset(agent, asset.mime)) ?? null;
+}
+
+// The PDF bytes of a Claude prompt when they pass the budget Claude Code reads, and null otherwise.
+export function claudePdfOverBudget(agent: string, assets: readonly { mime: string; size: number }[]): number | null {
+  if (agent !== 'claude') {
+    return null;
+  }
+  const total = assets.reduce((sum, asset) => (asset.mime === 'application/pdf' ? sum + asset.size : sum), 0);
+  return total > MAX_CLAUDE_PDF_TOTAL_BYTES ? total : null;
 }
 
 export interface StoredPromptAsset {
@@ -76,7 +106,6 @@ export function adoptPromptAssetOperationTarget(
 }
 
 const ASSET_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const MIME = /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/;
 const SHA256 = /^[0-9a-f]{64}$/i;
 
 export function normalizeAssetName(raw: unknown): string | null {
@@ -91,83 +120,6 @@ export function normalizeAssetName(raw: unknown): string | null {
     return null;
   }
   return name;
-}
-
-export function normalizeAssetMime(raw: unknown): string | null {
-  if (typeof raw !== 'string') {
-    return null;
-  }
-  const mime = raw.trim().toLowerCase();
-  return mime.length <= 127 && MIME.test(mime) ? mime : null;
-}
-
-export function assetMimeForName(name: string): string {
-  const extension = path.extname(name).toLowerCase();
-  return (
-    (
-      {
-        '.jpg': 'image/jpeg',
-        '.jpeg': 'image/jpeg',
-        '.png': 'image/png',
-        '.gif': 'image/gif',
-        '.webp': 'image/webp',
-        '.pdf': 'application/pdf',
-        '.txt': 'text/plain',
-        '.md': 'text/markdown',
-        '.json': 'text/json',
-        '.csv': 'text/csv',
-        '.tsv': 'text/tab-separated-values',
-        '.js': 'text/javascript',
-        '.ts': 'text/typescript',
-        '.css': 'text/css',
-        '.html': 'text/html',
-        '.xml': 'text/xml',
-        '.yaml': 'text/yaml',
-        '.yml': 'text/yaml',
-      } as Record<string, string>
-    )[extension] ?? 'application/octet-stream'
-  );
-}
-
-export function browserAssetMime(name: string, reported: string): string {
-  const named = assetMimeForName(name);
-  return named !== 'application/octet-stream' ? named : (normalizeAssetMime(reported) ?? 'application/octet-stream');
-}
-
-export interface AssetBatchLimits {
-  count: number;
-  fileBytes: number;
-  totalBytes: number;
-}
-
-export interface AssetBatchRefusal {
-  code: 'count' | 'file-size' | 'total-size';
-  name: string;
-  // The offending file size for `file-size` and the combined size for `total-size`. Zero for `count`.
-  size: number;
-  // The number of incoming files for `count`. Zero otherwise.
-  rejected: number;
-}
-
-// Decide from sizes alone whether a batch fits beside the files already held. The first limit that fails wins, in the order count, file size, total size.
-export function assetBatchRefusal(
-  existing: readonly { size: number }[],
-  incoming: readonly { name: string; size: number }[],
-  limits: AssetBatchLimits = {
-    count: MAX_PROMPT_ASSETS,
-    fileBytes: MAX_PROMPT_ASSET_BYTES,
-    totalBytes: MAX_PROMPT_ASSET_TOTAL_BYTES,
-  },
-): AssetBatchRefusal | null {
-  if (existing.length + incoming.length > limits.count) {
-    return { code: 'count', name: '', size: 0, rejected: incoming.length };
-  }
-  const tooLarge = incoming.find((file) => file.size > limits.fileBytes);
-  if (tooLarge) {
-    return { code: 'file-size', name: tooLarge.name, size: tooLarge.size, rejected: 0 };
-  }
-  const total = [...existing, ...incoming].reduce((sum, file) => sum + file.size, 0);
-  return total > limits.totalBytes ? { code: 'total-size', name: '', size: total, rejected: 0 } : null;
 }
 
 // True when the bytes are valid UTF-8 with no NUL byte, which is how a source file with an unlisted extension reads.
@@ -201,7 +153,8 @@ export function normalizeStoredPromptAsset(raw: unknown): StoredPromptAsset | nu
     typeof value.size === 'number' &&
     Number.isSafeInteger(value.size) &&
     value.size >= 0 &&
-    value.size <= MAX_PROMPT_ASSET_BYTES
+    mime !== null &&
+    value.size <= promptAssetByteLimit(mime)
       ? value.size
       : null;
   const digest = typeof value.digest === 'string' && SHA256.test(value.digest) ? value.digest.toLowerCase() : null;
@@ -309,13 +262,14 @@ export function validatePromptAssetBatch(
     if (!name) {
       throw new Error('An attached file has an invalid name.');
     }
-    if (!normalizeAssetMime(input.mime)) {
+    const mime = normalizeAssetMime(input.mime);
+    if (!mime) {
       throw new Error(`${name} has an invalid media type.`);
     }
     if (!Number.isSafeInteger(input.size) || input.size < 0) {
       throw new Error(`${name} has an invalid size.`);
     }
-    if (input.size > MAX_PROMPT_ASSET_BYTES) {
+    if (input.size > promptAssetByteLimit(mime)) {
       throw new Error(`${name} is larger than the per-file attachment limit.`);
     }
     total += input.size;

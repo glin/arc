@@ -2665,7 +2665,7 @@ import {
   sentPromptsToSave,
   pressesAfterLocalAnswer,
 } from './composerview.ts';
-import { unsupportedPromptAsset, normalizePromptAssetBook } from './promptassets.ts';
+import { claudePdfOverBudget, unsupportedPromptAsset, normalizePromptAssetBook } from './promptassets.ts';
 import type { StoredPromptAsset } from './promptassets.ts';
 import type { ComposerState, SessionProfile, SessionSettingBook, LivePress, NewSessionDraft } from './composerview.ts';
 import {
@@ -21752,6 +21752,9 @@ ${methodBody('public flushQueue(')}
     'queueSuccessorDelivery',
     'remoteControlRequest',
     'REMOTE_CONTROL_ARGUMENTS',
+    'unsupportedPromptAsset',
+    'claudePdfOverBudget',
+    'attachmentRefusal',
     compiled,
   )(
     module,
@@ -21766,6 +21769,9 @@ ${methodBody('public flushQueue(')}
     queueSuccessorDelivery,
     remoteControlRequest,
     REMOTE_CONTROL_ARGUMENTS,
+    unsupportedPromptAsset,
+    claudePdfOverBudget,
+    attachmentRefusal,
   );
   return module.exports.flushQueue;
 }
@@ -22608,7 +22614,7 @@ interface DraftPanel {
 function draftPanel(
   profile: SessionProfile,
   live: LivePress[] = [],
-  assets: { name: string; mime: string }[] = [],
+  assets: { name: string; mime: string; size?: number }[] = [],
 ): DraftPanel {
   const press = new Function(
     'draftStarted',
@@ -22617,6 +22623,7 @@ function draftPanel(
     'withSessionSettings',
     'sessionSettingsForProfile',
     'unsupportedPromptAsset',
+    'claudePdfOverBudget',
     'attachmentRefusal',
     'AGENT_NAMES',
     `return function (session, control, value) {\n${methodBody('private pickOnDraft(')}\n};`,
@@ -22627,6 +22634,7 @@ function draftPanel(
     withSessionSettings,
     sessionSettingsForProfile,
     unsupportedPromptAsset,
+    claudePdfOverBudget,
     attachmentRefusal,
     AGENT_NAMES,
   ) as (this: DraftPanel, session: string, control: string, value: string) => void;
@@ -22883,6 +22891,18 @@ test('a draft keeps its agent when the next agent cannot read an attached file',
   assert.equal(panel.draftProfiles.d1.agent, 'codex');
   assert.deepEqual(panel.refreshed, []);
   assert.match(panel.notices[0], /Claude cannot read report\.docx/);
+});
+
+test('a Codex draft holding PDFs past the Claude PDF budget keeps its agent', () => {
+  const pdfs = ['a.pdf', 'b.pdf', 'c.pdf'].map((name) => ({ name, mime: 'application/pdf', size: PDF_6_5_MIB }));
+  const panel = draftPanel({ ...DRAFT_SETUP, agent: 'codex' }, [], pdfs);
+  panel.press('agent', 'claude');
+  assert.equal(panel.draftProfiles.d1.agent, 'codex', 'the draft moved to an agent that drops part of its PDFs');
+  assert.deepEqual(panel.refreshed, []);
+  assert.deepEqual(panel.notices, [attachmentRefusal('pdf-total')]);
+  const back = draftPanel(DRAFT_SETUP, [], pdfs.slice(1));
+  back.press('agent', 'codex');
+  assert.equal(back.draftProfiles.d1.agent, 'codex', 'PDFs within the budget blocked an agent change');
 });
 
 test('a press on a draft whose first prompt has gone changes nothing', () => {
@@ -33656,7 +33676,17 @@ test('attachment compatibility and contents are checked at every handoff boundar
       /stateFor\(target\)[\s\S]*unsupportedPromptAsset\(settled\.agent, written\)[\s\S]*mergePromptAssets/,
       'an agent switch during file staging can merge a file the new agent cannot read',
     );
+    sourceMatch(
+      after,
+      /stateFor\(target\)[\s\S]*claudePdfOverBudget\(settled\.agent, \[\.\.\.current, \.\.\.written\]\)[\s\S]*mergePromptAssets/,
+      'an agent switch during file staging can merge PDFs past the Claude PDF budget',
+    );
   }
+  sourceMatch(
+    memberFrom(panelHostSource, panelHostSource.indexOf('private async stageFiles(')),
+    /claudePdfOverBudget\(state\.agent, \[\.\.\.\(this\.assets\[operation\.target\] \?\? \[\]\), \.\.\.incoming\]\)[\s\S]*const written = await stagePromptAssets/,
+    'a Claude prompt writes staged copies of PDFs past the Claude PDF budget',
+  );
 
   const abandonAt = panelHostSource.indexOf('public abandonDraft(');
   const abandon = memberFrom(panelHostSource, abandonAt);
@@ -37681,6 +37711,82 @@ test.each([
   await h.send(failure === 'empty' ? '' : 'Reader direction.');
   await h.finish();
   await vi.waitFor(() => assert.equal(h.writes(), 1));
+});
+
+const PDF_6_5_MIB = 6.5 * 1024 * 1024;
+
+// Three PDFs that each fit the per-file limit and together pass the Claude PDF budget.
+function budgetPdfs() {
+  return ['a', 'b', 'c'].map((letter, index) => ({
+    id: `12345678-1234-4123-8123-00000000000${index}`,
+    name: `${letter}.pdf`,
+    mime: 'application/pdf',
+    size: PDF_6_5_MIB,
+    digest: '0'.repeat(64),
+  }));
+}
+
+test.each(['claude', 'codex'] as const)(
+  'a %s send with 19.5 MiB of PDFs follows the Claude PDF budget',
+  async (agent) => {
+    const h = heldCompactionProvider(agent);
+    const current = h.provider.stateFor;
+    h.provider.stateFor = () => ({ ...current(), agent });
+    h.provider.assets.source = budgetPdfs();
+    const sent: string[] = [];
+    h.provider.onSendPrompt = async (_agent: string, _session: string) => {
+      sent.push(_session);
+      return { delivered: false, reason: 'refused' };
+    };
+    await h.send('Read these papers.');
+    if (agent === 'claude') {
+      assert.equal(h.provider.attachmentNotices.source, attachmentRefusal('pdf-total'));
+      assert.deepEqual(sent, [], 'Claude received PDFs it drops without notice');
+    } else {
+      await vi.waitFor(() => assert.deepEqual(sent, ['source'], 'the Claude PDF budget refused a Codex prompt'));
+      assert.equal(h.provider.attachmentNotices.source, undefined);
+    }
+  },
+);
+
+const DOCX_MIME = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+
+// A file Claude cannot read and Codex can.
+function wordDocument() {
+  return {
+    ...budgetPdfs()[0],
+    id: '12345678-1234-4123-8123-00000000000d',
+    name: 'report.docx',
+    mime: DOCX_MIME,
+    size: 5,
+  };
+}
+
+test.each([
+  ['claude', '19.5 MiB of PDFs', budgetPdfs, attachmentRefusal('pdf-total')],
+  ['codex', '19.5 MiB of PDFs', budgetPdfs, null],
+  ['claude', 'a Word document', () => [wordDocument()], attachmentRefusal('unsupported', 'report.docx')],
+] as const)('a queued %s prompt with %s drains by the files its agent reads', async (agent, _files, files, refusal) => {
+  const h = heldCompactionProvider(agent);
+  const current = h.provider.stateFor;
+  h.provider.stateFor = () => ({ ...current(), agent, running: false });
+  h.provider.attachmentStorageDir = tempDir('queued-pdf-budget-');
+  h.provider.queues.source = queueSubmissionAfter([], 'waiting', 'Read these papers.', [], files(), 1, false, {
+    agent,
+    owner: 'source',
+  });
+  const sent: unknown[] = [];
+  h.provider.onSendPrompt = async (_agent: string, _session: string, _cwd: string, prompt: { assets?: unknown[] }) => {
+    sent.push(prompt.assets?.length);
+    return { delivered: false, reason: 'refused' };
+  };
+  h.provider.flushQueue('source');
+  if (refusal) {
+    assert.equal(h.provider.queues.source[0].reason, refusal);
+    assert.deepEqual(sent, [], 'a queued Claude prompt sent files Claude cannot read');
+  } else {
+    await vi.waitFor(() => assert.deepEqual(sent, [3], 'the Claude PDF budget held a queued Codex prompt'));
+  }
 });
 
 test.each(['retention', 'delivery'] as const)(
@@ -45344,6 +45450,25 @@ test('Remote Control runs from a fresh submission, a queue flush, and a restored
       ['q-held', undefined],
     ],
   );
+
+  // A restored command still toggles when its files are past the Claude PDF budget or are files Claude cannot read.
+  for (const [session, files] of [
+    ['s7', budgetPdfs()],
+    ['s8', [wordDocument()]],
+  ] as const) {
+    provider.queues[session] = normalizeQueuedSubmissions({
+      [session]: [{ id: `restored-${session}`, text: '/rc', assets: files, commentIds: [], at: 1 }],
+    })[session];
+    assert.equal(provider.queues[session][0].assets.length, files.length, 'the restored files did not survive loading');
+    provider.flushQueue(session);
+    assert.equal(toggled.at(-1), session, `a restored /rc holding ${files[0].name} did not toggle Remote Control`);
+    assert.deepEqual(
+      provider.assets[session],
+      files,
+      `a restored /rc did not return ${files[0].name} to the prompt box`,
+    );
+    assert.deepEqual(provider.queues[session], []);
+  }
 });
 
 test('a queued Remote Control command hands its comment claims to the prompt box', async () => {
@@ -45365,13 +45490,11 @@ test('a queued Remote Control command hands its comment claims to the prompt box
 
 test('a queued Remote Control command stays queued when its files exceed the prompt box limits', async () => {
   const megabytes = 1024 * 1024;
+  // Only images are large enough to pass the prompt total within the count limit.
+  const photo = (id: string) => ({ ...remoteFile(id, 45 * megabytes), name: `${id}.png`, mime: 'image/png' });
   for (const [limit, draft, file] of [
     ['count', Array.from({ length: 8 }, (_, index) => remoteFile(`draft-${index}`)), remoteFile('queued')],
-    [
-      'bytes',
-      [remoteFile('draft-a', 7 * megabytes), remoteFile('draft-b', 7 * megabytes)],
-      remoteFile('queued', 7 * megabytes),
-    ],
+    ['bytes', [photo('draft-a'), photo('draft-b')], photo('queued')],
   ] as const) {
     const { provider, toggled, delivered } = remoteControlProvider();
     provider.assets.s6 = [...draft];

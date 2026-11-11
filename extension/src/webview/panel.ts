@@ -52,7 +52,7 @@ import {
 import { commentsFor } from '../view/comments.ts';
 import { CARD_GLYPHS, contextClass } from '../view/card-presentation.ts';
 import { sameSessionQueryContext, type SessionQueryContext } from '../domain/session-query.ts';
-import { MAX_PROMPT_ASSETS, MAX_PROMPT_ASSET_BYTES, MAX_PROMPT_ASSET_TOTAL_BYTES } from '../domain/prompt-assets.ts';
+import { PROMPT_ASSET_LIMITS } from '../domain/prompt-assets.ts';
 import { CARD_ACTIONS } from '../view/card-words.ts';
 import type { SavedStateService } from './state.ts';
 import { startPageUsageMetrics } from './panel-usage-metrics.ts';
@@ -874,7 +874,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
     setDropping(dropping) {
       composerRenderer.setDropping(dropping);
     },
-    limits: { count: MAX_PROMPT_ASSETS, fileBytes: MAX_PROMPT_ASSET_BYTES, totalBytes: MAX_PROMPT_ASSET_TOTAL_BYTES },
+    limits: PROMPT_ASSET_LIMITS,
   });
   const queueLiveRenderer = createQueueLiveRenderer({
     document,

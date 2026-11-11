@@ -533,6 +533,7 @@ import {
   adoptPromptAssetOperationTarget,
   agentTakesAsset,
   assetBatchRefusal,
+  claudePdfOverBudget,
   stagedAssetMime,
   deleteStagedPromptAssets,
   mergePromptAssets,
@@ -7189,6 +7190,10 @@ export class PanelProvider implements vscode.Disposable {
       this.setAttachmentNotice(session, attachmentRefusal('unsupported', unsupported.name));
       return;
     }
+    if (next.agent !== profile.agent && claudePdfOverBudget(next.agent, this.assets[session] ?? []) !== null) {
+      this.setAttachmentNotice(session, attachmentRefusal('pdf-total'));
+      return;
+    }
     this.draftProfiles[session] = next;
     // Retain a draft after an actual setup change. Selecting the current value leaves `handChanged` unchanged.
     const changed =
@@ -8470,6 +8475,22 @@ export class PanelProvider implements vscode.Disposable {
       if (this.drainRemoteControl(state.sessionId, next, rest)) this.flushQueue(session);
       return;
     }
+    // The agent can change after the prompt was queued, so the drain checks the files against the agent it sends to.
+    // A Remote Control command never reaches this check, because its files return to the prompt box.
+    const unsupported = unsupportedPromptAsset(state.agent, next.assets);
+    const refusal = unsupported
+      ? attachmentRefusal('unsupported', unsupported.name)
+      : claudePdfOverBudget(state.agent, next.assets) !== null
+        ? attachmentRefusal('pdf-total')
+        : '';
+    if (refusal) {
+      this.queues[state.sessionId] = state.queued.map((entry) =>
+        entry.id === next.id ? { ...entry, reason: refusal } : entry,
+      );
+      void this.writeDrafts();
+      void this.post({ type: 'usage', usage: this.usagePayload() });
+      return;
+    }
     if (!text.trim() && !carried.length && !assets.length) {
       // The reader removed the comments while they waited. Do not turn that cancellation
       // into an empty prompt, and continue to the next real submission if there is one.
@@ -8733,7 +8754,7 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   // Show the refusal notice and return true when a batch of this size does not fit beside the target's files.
-  private refuseAssetBatch(target: string, incoming: readonly { name: string; size: number }[]): boolean {
+  private refuseAssetBatch(target: string, incoming: readonly { name: string; mime: string; size: number }[]): boolean {
     const refusal = assetBatchRefusal(this.assets[target] ?? [], incoming);
     if (!refusal) {
       return false;
@@ -8765,7 +8786,7 @@ export class PanelProvider implements vscode.Disposable {
       if (
         this.refuseAssetBatch(
           operation.target,
-          inputs.map((input) => ({ name: input.name, size: input.bytes.byteLength })),
+          inputs.map((input) => ({ name: input.name, mime: input.mime, size: input.bytes.byteLength })),
         )
       ) {
         return;
@@ -8773,6 +8794,11 @@ export class PanelProvider implements vscode.Disposable {
       const unsupported = inputs.find((input) => !agentTakesAsset(state.agent, input.mime));
       if (unsupported) {
         this.setAttachmentNotice(operation.target, attachmentRefusal('unsupported', unsupported.name));
+        return;
+      }
+      const incoming = inputs.map((input) => ({ mime: input.mime, size: input.bytes.byteLength }));
+      if (claudePdfOverBudget(state.agent, [...(this.assets[operation.target] ?? []), ...incoming]) !== null) {
+        this.setAttachmentNotice(operation.target, attachmentRefusal('pdf-total'));
         return;
       }
       validatePromptAssetBatch(
@@ -8798,6 +8824,11 @@ export class PanelProvider implements vscode.Disposable {
           return;
         }
         const current = this.assets[target] ?? [];
+        if (claudePdfOverBudget(settled.agent, [...current, ...written]) !== null) {
+          await deleteStagedPromptAssets(this.attachmentStorageDir, written);
+          this.setAttachmentNotice(target, attachmentRefusal('pdf-total'));
+          return;
+        }
         this.assets[target] = mergePromptAssets(current, written);
       } catch (error) {
         await deleteStagedPromptAssets(this.attachmentStorageDir, written);
@@ -8890,10 +8921,14 @@ export class PanelProvider implements vscode.Disposable {
       return;
     }
     // Every size is read before any bytes, so a refused selection never loads into memory.
-    const sizes: { name: string; size: number }[] = [];
+    const sizes: { name: string; mime: string; size: number }[] = [];
     try {
       for (const image of images) {
-        sizes.push({ name: image.name, size: (await vscode.workspace.fs.stat(vscode.Uri.file(image.path))).size });
+        sizes.push({
+          name: image.name,
+          mime: image.mime,
+          size: (await vscode.workspace.fs.stat(vscode.Uri.file(image.path))).size,
+        });
       }
     } catch {
       this.setAttachmentNotice(browserSession, attachmentRefusal('read', images[sizes.length]?.name));
@@ -9295,6 +9330,11 @@ export class PanelProvider implements vscode.Disposable {
     const unsupported = unsupportedPromptAsset(state.agent, heldAssets);
     if (unsupported) {
       this.setAttachmentNotice(state.sessionId, attachmentRefusal('unsupported', unsupported.name));
+      void this.post({ type: 'restoreDraft', session: browserSession, text, revision });
+      return;
+    }
+    if (claudePdfOverBudget(state.agent, heldAssets) !== null) {
+      this.setAttachmentNotice(state.sessionId, attachmentRefusal('pdf-total'));
       void this.post({ type: 'restoreDraft', session: browserSession, text, revision });
       return;
     }

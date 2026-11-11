@@ -3,10 +3,16 @@ import assert from 'node:assert';
 import * as fs from 'node:fs';
 import { tempDir } from './temproot.ts';
 import * as path from 'node:path';
+import { formatMegabytes } from './turnformat.ts';
 import {
+  IMAGE_ASSET_MIMES,
+  MAX_CLAUDE_PDF_TOTAL_BYTES,
   MAX_PROMPT_ASSETS,
   MAX_PROMPT_ASSET_BYTES,
+  MAX_PROMPT_IMAGE_BYTES,
   MAX_PROMPT_ASSET_TOTAL_BYTES,
+  claudePdfOverBudget,
+  normalizeStoredPromptAsset,
   normalizeAssetName,
   normalizeAssetMime,
   normalizePromptAssetBook,
@@ -39,7 +45,79 @@ const DIGEST = '0'.repeat(64);
 test('attachment limits are fixed at the product bounds', () => {
   assert.equal(MAX_PROMPT_ASSETS, 8);
   assert.equal(MAX_PROMPT_ASSET_BYTES, 7 * 1024 * 1024);
-  assert.equal(MAX_PROMPT_ASSET_TOTAL_BYTES, 20 * 1024 * 1024);
+  assert.equal(MAX_PROMPT_IMAGE_BYTES, 50 * 1024 * 1024);
+  assert.equal(MAX_PROMPT_ASSET_TOTAL_BYTES, 100 * 1024 * 1024);
+  assert.equal(MAX_CLAUDE_PDF_TOTAL_BYTES, 16 * 1024 * 1024);
+});
+
+test('the prompt attachments guide states the limits the code enforces', () => {
+  const guide = fs
+    .readFileSync(path.join(__dirname, '..', '..', 'docs', 'prompt-attachments.md'), 'utf8')
+    .replace(/\r\n/g, '\n');
+  const section = guide.split('\n## Size limits\n')[1]?.split('\n## ')[0];
+  assert.ok(section, 'the guide must have a Size limits section');
+  const stated = (pattern: RegExp): number => {
+    const match = section.match(pattern);
+    assert.ok(match, `the Size limits section must match ${pattern}`);
+    return Number(match[1].replace(/,/g, ''));
+  };
+  const MB = stated(/1 MB is ([\d,]+) bytes/);
+  assert.equal(formatMegabytes(MB), '1 MB');
+  assert.equal(stated(/carries at most (\d+) files/), MAX_PROMPT_ASSETS);
+  assert.equal(stated(/WebP image can be up to (\d+) MB/) * MB, MAX_PROMPT_IMAGE_BYTES);
+  assert.equal(stated(/Every other file can be up to (\d+) MB/) * MB, MAX_PROMPT_ASSET_BYTES);
+  assert.equal(stated(/files of one prompt total at most (\d+) MB/) * MB, MAX_PROMPT_ASSET_TOTAL_BYTES);
+  assert.equal(stated(/PDFs of one Claude prompt total at most (\d+) MB/) * MB, MAX_CLAUDE_PDF_TOTAL_BYTES);
+  const types = section
+    .match(/A (JPEG, PNG, GIF, or WebP) image/)?.[1]
+    .replace(' or', '')
+    .toLowerCase()
+    .split(', ');
+  assert.deepEqual(
+    types?.map((type) => `image/${type}`),
+    [...IMAGE_ASSET_MIMES],
+  );
+});
+
+test('a 40 MiB photo fits one prompt and a 9 MiB PDF does not', () => {
+  const MiB = 1024 * 1024;
+  const photo = { name: 'IMG_0001.png', mime: 'image/png', size: 40 * MiB };
+  const pdf = { name: 'scan.pdf', mime: 'application/pdf', size: 9 * MiB };
+  assert.equal(assetBatchRefusal([], [photo]), null);
+  assert.doesNotThrow(() => validatePromptAssetBatch([], [photo]));
+  assert.deepEqual(assetBatchRefusal([], [pdf]), { code: 'file-size', name: 'scan.pdf', size: 9 * MiB, rejected: 0 });
+  assert.throws(() => validatePromptAssetBatch([], [pdf]), /per-file/);
+  assert.deepEqual(assetBatchRefusal([], [{ ...photo, size: MAX_PROMPT_IMAGE_BYTES + 1 }]), {
+    code: 'image-size',
+    name: 'IMG_0001.png',
+    size: MAX_PROMPT_IMAGE_BYTES + 1,
+    rejected: 0,
+  });
+});
+
+test('a saved descriptor keeps the size limit of its kind', () => {
+  const MiB = 1024 * 1024;
+  const stored = (mime: string, size: number) =>
+    normalizeStoredPromptAsset({ id: ID, name: 'f', mime, size, digest: DIGEST });
+  assert.equal(stored('image/jpeg', 40 * MiB)?.size, 40 * MiB);
+  assert.equal(stored('image/jpeg', MAX_PROMPT_IMAGE_BYTES + 1), null);
+  assert.equal(stored('application/pdf', MAX_PROMPT_ASSET_BYTES)?.size, MAX_PROMPT_ASSET_BYTES);
+  assert.equal(stored('application/pdf', 9 * MiB), null);
+  assert.equal(stored('text/plain', 9 * MiB), null);
+});
+
+test('two 9 MiB PDFs exceed the Claude PDF budget and fit a Codex prompt', () => {
+  const MiB = 1024 * 1024;
+  const pdfs = [
+    { mime: 'application/pdf', size: 9 * MiB },
+    { mime: 'application/pdf', size: 9 * MiB },
+  ];
+  assert.equal(claudePdfOverBudget('claude', pdfs), 18 * MiB);
+  assert.equal(claudePdfOverBudget('codex', pdfs), null);
+  assert.equal(claudePdfOverBudget('claude', pdfs.slice(1)), null);
+  // Images do not count toward the PDF budget.
+  assert.equal(claudePdfOverBudget('claude', [...pdfs.slice(1), { mime: 'image/png', size: 44 * MiB }]), null);
+  assert.equal(claudePdfOverBudget('claude', [{ mime: 'application/pdf', size: MAX_CLAUDE_PDF_TOTAL_BYTES }]), null);
 });
 
 test('asset kind words distinguish PDF, text, and generic files', () => {
@@ -368,29 +446,37 @@ test('an open staging operation keeps its adopted target without the routing ali
 });
 
 test('a batch is refused from sizes alone on count, then file size, then total size', () => {
-  const limits = { count: 3, fileBytes: 10, totalBytes: 20 };
+  const limits = { count: 3, fileBytes: 10, imageBytes: 15, totalBytes: 20 };
   const held = [{ size: 4 }];
-  assert.equal(assetBatchRefusal(held, [{ name: 'a', size: 5 }], limits), null);
+  const text = 'text/plain';
+  assert.equal(assetBatchRefusal(held, [{ name: 'a', mime: text, size: 5 }], limits), null);
   assert.deepEqual(
     assetBatchRefusal(
       held,
-      ['a', 'b', 'c'].map((name) => ({ name, size: 99 })),
+      ['a', 'b', 'c'].map((name) => ({ name, mime: text, size: 99 })),
       limits,
     ),
     { code: 'count', name: '', size: 0, rejected: 3 },
   );
-  assert.deepEqual(assetBatchRefusal(held, [{ name: 'big.png', size: 11 }], limits), {
+  assert.deepEqual(assetBatchRefusal(held, [{ name: 'big.txt', mime: text, size: 11 }], limits), {
     code: 'file-size',
-    name: 'big.png',
+    name: 'big.txt',
     size: 11,
+    rejected: 0,
+  });
+  assert.equal(assetBatchRefusal(held, [{ name: 'big.png', mime: 'image/png', size: 11 }], limits), null);
+  assert.deepEqual(assetBatchRefusal(held, [{ name: 'big.png', mime: 'image/png', size: 16 }], limits), {
+    code: 'image-size',
+    name: 'big.png',
+    size: 16,
     rejected: 0,
   });
   assert.deepEqual(
     assetBatchRefusal(
       held,
       [
-        { name: 'a', size: 9 },
-        { name: 'b', size: 9 },
+        { name: 'a', mime: text, size: 9 },
+        { name: 'b', mime: text, size: 9 },
       ],
       limits,
     ),

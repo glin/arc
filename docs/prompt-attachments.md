@@ -12,6 +12,22 @@ Refusal retains draft descriptors. Acceptance removes them and retains staged by
 
 Drop deletes staged data only after drafts, queues, and handoffs release every reference.
 
+## Size limits
+
+[`domain/prompt-assets.ts`](../extension/src/domain/prompt-assets.ts) holds the count, size, and PDF limits. The webview checks count and size before it reads a pasted file. The host checks them again before it writes a staged copy, and checks saved descriptors when it loads them.
+
+The panel shows sizes in MB, where 1 MB is 1,048,576 bytes. The limits use the same unit:
+
+- One prompt carries at most 8 files.
+- A JPEG, PNG, GIF, or WebP image can be up to 50 MB. Claude Code shrinks an image before it sends, echoes, or saves it. Codex reads each file from its staged path. The limit remains because a paste reads each file whole into the panel's memory.
+- Every other file can be up to 7 MB. Claude Code keeps PDFs and text files at full size in the echoed prompt and the transcript.
+- The files of one prompt total at most 100 MB. Arc reads and hashes every file of a prompt at send.
+- The PDFs of one Claude prompt total at most 16 MB. Claude Code drops PDFs without an error once the PDFs in one prompt total more than about 16 MB.
+
+Arc refuses a Claude prompt whose PDFs pass `MAX_CLAUDE_PDF_TOTAL_BYTES`. The host checks this budget at staging, agent change, send, and queued delivery, and `claudePromptContent` refuses such a prompt before it reads the files. Images do not count toward the budget. Codex prompts have no PDF budget.
+
+A PDF in a later turn can push an earlier PDF out of Claude's context. A check of one prompt cannot see this, and Arc does not prevent it.
+
 ## Paste, drop, and Add to Arc
 
 Capture browser files and drag values during the event, before awaiting reads. Event data disappears afterward.

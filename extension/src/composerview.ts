@@ -33,7 +33,9 @@ import {
   splitAssetName,
   StoredPromptAsset,
   MAX_PROMPT_ASSETS,
+  MAX_CLAUDE_PDF_TOTAL_BYTES,
   MAX_PROMPT_ASSET_BYTES,
+  MAX_PROMPT_IMAGE_BYTES,
   MAX_PROMPT_ASSET_TOTAL_BYTES,
 } from './promptassets';
 import { compactModel, formatMegabytes, modelLabels, shortModel, speedName, type ModelLabels } from './turnformat';
@@ -3112,8 +3114,15 @@ export function sendRefusal(reason: SendRefusal): string {
 }
 
 export function attachmentRefusal(code: string, name: string = '', size: number = 0, rejected: number = 0): string {
+  if (code === 'image-size') {
+    return `${name} is ${formatMegabytes(size)}. Each image must be under ${formatMegabytes(MAX_PROMPT_IMAGE_BYTES)}.`;
+  }
   if (code === 'file-size') {
-    return `${name} is ${formatMegabytes(size)}. Each file must be under ${formatMegabytes(MAX_PROMPT_ASSET_BYTES)}.`;
+    return `${name} is ${formatMegabytes(size)}. Files other than JPEG, PNG, GIF, and WebP images must be under ${formatMegabytes(MAX_PROMPT_ASSET_BYTES)}.`;
+  }
+  if (code === 'pdf-total') {
+    const budget = formatMegabytes(MAX_CLAUDE_PDF_TOTAL_BYTES);
+    return `These PDFs together are over ${budget}. Claude can read ${budget} of PDFs with one prompt.`;
   }
   if (code === 'count') {
     return `Only ${MAX_PROMPT_ASSETS} files can go with one prompt. ${rejected} ${rejected === 1 ? 'was' : 'were'} not attached.`;

@@ -63,7 +63,7 @@ import {
   GuardedAttempt,
   normalizeAgentPrompt,
 } from './agentwire';
-import { agentTakesAsset, validatePromptAssetBytes } from './promptassets';
+import { agentTakesAsset, claudePdfOverBudget, validatePromptAssetBytes } from './promptassets';
 import { ClaudeResponseClock } from './outputrate';
 import { claudeTaskNotification, replayedPromptMatches } from './transcript';
 
@@ -77,6 +77,10 @@ export async function claudePromptContent(
   const content: ClaudePromptBlock[] = [];
   if (prompt.text) {
     content.push({ type: 'text', text: prompt.text });
+  }
+  const pdfBytes = claudePdfOverBudget('claude', prompt.assets);
+  if (pdfBytes !== null) {
+    throw new Error(`the PDFs total ${pdfBytes} bytes, past the Claude PDF budget`);
   }
   for (const asset of prompt.assets) {
     if (!agentTakesAsset('claude', asset.mime)) {

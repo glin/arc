@@ -1,5 +1,5 @@
 import { h, render, type ComponentChildren } from 'preact';
-import { URI_DRAG_TYPES } from '../domain/prompt-assets.ts';
+import { assetBatchRefusal, browserAssetMime, URI_DRAG_TYPES, type AssetBatchLimits } from '../domain/prompt-assets.ts';
 import type { ComposerFile, ComposerView, PanelToHost } from './protocol.ts';
 
 interface AttachmentOptions {
@@ -14,7 +14,7 @@ interface AttachmentOptions {
   view(): ComposerView | null;
   updateFoot(): void;
   setDropping(dropping: boolean): void;
-  limits: { count: number; fileBytes: number; totalBytes: number };
+  limits: AssetBatchLimits;
 }
 
 export interface AttachmentRenderer {
@@ -196,33 +196,13 @@ export function createAttachmentRenderer(options: AttachmentOptions): Attachment
       options.sendToHost({ type: 'fileRejected', session, code: 'busy', name: '', size: 0, rejected: 0 });
       return true;
     }
-    if (view.files.length + captured.length > options.limits.count) {
-      options.sendToHost({
-        type: 'fileRejected',
-        session,
-        code: 'count',
-        name: '',
-        size: 0,
-        rejected: captured.length,
-      });
-      return true;
-    }
-    const tooLarge = captured.find((file) => file.size > options.limits.fileBytes);
-    if (tooLarge) {
-      options.sendToHost({
-        type: 'fileRejected',
-        session,
-        code: 'file-size',
-        name: tooLarge.name,
-        size: tooLarge.size,
-        rejected: 0,
-      });
-      return true;
-    }
-    const total =
-      view.files.reduce((sum, file) => sum + file.size, 0) + captured.reduce((sum, file) => sum + file.size, 0);
-    if (total > options.limits.totalBytes) {
-      options.sendToHost({ type: 'fileRejected', session, code: 'total-size', name: '', size: total, rejected: 0 });
+    const refusal = assetBatchRefusal(
+      view.files,
+      captured.map((file) => ({ name: file.name, mime: browserAssetMime(file.name, file.type), size: file.size })),
+      options.limits,
+    );
+    if (refusal) {
+      options.sendToHost({ type: 'fileRejected', session, ...refusal });
       return true;
     }
     const token = `${Date.now()}:${++serial}:${Math.random()}`;

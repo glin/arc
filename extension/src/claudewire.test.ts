@@ -1934,6 +1934,26 @@ test('Claude prompt content frames supported files and rejects other binaries', 
   );
 });
 
+test('Claude prompt content refuses PDFs past the Claude PDF budget before it reads them', async () => {
+  const reads: string[] = [];
+  const pdf = (name: string) => ({
+    id: 'id',
+    name,
+    mime: 'application/pdf',
+    size: 6.5 * 1024 * 1024,
+    digest: '0'.repeat(64),
+    path: `C:\\staged\\${name}`,
+  });
+  await assert.rejects(
+    claudePromptContent({ text: 'read these', assets: [pdf('a.pdf'), pdf('b.pdf'), pdf('c.pdf')] }, async (file) => {
+      reads.push(file);
+      return new Uint8Array(0);
+    }),
+    /Claude PDF budget/,
+  );
+  assert.deepEqual(reads, [], 'a prompt Claude Code would partly drop still reached the file reads');
+});
+
 test('a control request the panel cannot answer is refused, not left hanging', () => {
   const h = harness();
   h.wire.receive(

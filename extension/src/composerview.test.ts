@@ -2902,10 +2902,21 @@ test('files alone enable Send with an accessible name', () => {
   );
 });
 
-test('file-size attachment refusal names the file and limit', () => {
+test('size attachment refusals name the file and the limit of its kind', () => {
   assert.equal(
     attachmentRefusal('file-size', 'report.zip', 9.2 * 1024 * 1024),
-    'report.zip is 9.2 MB. Each file must be under 7 MB.',
+    'report.zip is 9.2 MB. Files other than JPEG, PNG, GIF, and WebP images must be under 7 MB.',
+  );
+  assert.equal(
+    attachmentRefusal('image-size', 'pano.png', 61 * 1024 * 1024),
+    'pano.png is 61 MB. Each image must be under 50 MB.',
+  );
+});
+
+test('the Claude PDF refusal states the budget and no measured total', () => {
+  assert.equal(
+    attachmentRefusal('pdf-total', '', 18 * 1024 * 1024),
+    'These PDFs together are over 16 MB. Claude can read 16 MB of PDFs with one prompt.',
   );
 });
 
@@ -2916,8 +2927,8 @@ test('count attachment refusal uses singular and plural wording', () => {
 
 test('total-size attachment refusal states the combined limit', () => {
   assert.equal(
-    attachmentRefusal('total-size', '', 24 * 1024 * 1024),
-    'The files together are 24 MB. One prompt can carry 20 MB.',
+    attachmentRefusal('total-size', '', 124 * 1024 * 1024),
+    'The files together are 124 MB. One prompt can carry 100 MB.',
   );
 });
 
