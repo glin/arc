@@ -11172,6 +11172,8 @@ export class PanelProvider implements vscode.Disposable {
         this.catalogWalkRunning ?? this.codexPriming,
       );
       this.performanceCounters.recordRefreshStage('coalesced');
+      if (this.refreshController && this.refreshController === this.discoveryContinuation)
+        this.progressiveWorker.yieldDiscovery();
       // A merge of different requesters runs as `coalesced`, so each waiting request also counts under its own name.
       this.performanceCounters.recordWork(`coalesced:${this.refreshReason}`);
       if (this.refreshOverdue && !this.catalogWalkRunning) {
@@ -15681,6 +15683,27 @@ export class PanelProvider implements vscode.Disposable {
     const spendSources = this.discoveryCheckpoint?.spendSources ?? this.enumeratedSpendSources;
     const acknowledge = (result: import('./progressiveworker').ProgressiveResult): boolean => {
       const progress = result.value;
+      if (progress.kind === 'discovery-status') {
+        if (signal.aborted || result.generation !== this.refreshGeneration) return false;
+        const scope = JSON.stringify(this.repositoryScopeRoots);
+        if (this.loadingLine.held(scope)) return true;
+        const { completed, known } = progress;
+        this.loadingLine.present(
+          'discovery progress',
+          { generation: result.generation, complete: false, completed, known },
+          scope,
+          () => ({ reason: 'discovery pending' }),
+        );
+        void this.post({
+          type: 'startupProgress',
+          generation: result.generation,
+          epoch: String(generation),
+          sequence: (this.startupProgressSequence = (this.startupProgressSequence ?? 0) + 1),
+          completed,
+          known,
+        }).catch(() => {});
+        return true;
+      }
       if (
         progress.kind !== 'claude-children' &&
         progress.kind !== 'claude-children-progress' &&
@@ -15858,6 +15881,7 @@ export class PanelProvider implements vscode.Disposable {
           referenceEntries: [...this.claudeChildReferenceEntries],
           relationshipRejections: this.relationshipRejections,
           discovery: this.discoveryCheckpoint,
+          ...(!this.authoritativeCatalog ? { firstCatalog: true as const } : {}),
           ...compressedList,
         },
         generation,

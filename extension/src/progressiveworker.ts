@@ -393,6 +393,8 @@ export type ProgressiveRequest =
       discovery?: DiscoveryCheckpoint;
       discoveryBytes?: number;
       quantumBytes?: number;
+      // The host needs its first partial catalog at the next slice boundary.
+      firstCatalog?: true;
       // Reads only the spend and person facts of the dispatch references of the last complete reply.
       spendOnly?: true;
       // The complete host set of compressed rollouts, sent only when the set changed since the last send to this worker.
@@ -526,6 +528,7 @@ export type ProgressiveValue =
       continuation: true;
       charges: DiscoveryCharges;
     }
+  | { kind: 'discovery-status'; completed: number; known: number }
   | { kind: 'metadata'; entry: DerivedTitleEntry; coverage?: import('./transcript').MetadataCoverage }
   | {
       kind: 'metadata-recovery';
@@ -885,6 +888,10 @@ export class ProgressiveWorker {
     this.discoveryReplyAt = undefined;
   }
 
+  yieldDiscovery(): void {
+    this.worker?.postMessage({ yieldDiscovery: true });
+  }
+
   retainMetadataRecovery(sessionIds: string[]): void {
     this.worker?.postMessage({ metadataEligible: sessionIds });
   }
@@ -925,6 +932,7 @@ export class ProgressiveWorker {
         this.discoveryWaiter?.cancel();
         this.discoveryWaiter = waiting;
         signal.addEventListener('abort', cancel, { once: true });
+        this.yieldDiscovery();
       } else start();
     });
   }

@@ -346,7 +346,14 @@ function activate(options: { stubReadPasses: boolean; coverage?: boolean }) {
       if (!provider.dispatchDiscoveryPending && !provider.dispatchSpendPending) advanced++;
     }
   };
-  return { provider, worker, posts, settle, receive: (message: unknown) => receive(message) };
+  return { provider, worker, posts, settle, started, receive: (message: unknown) => receive(message) };
+}
+
+// Replaces the workspace that `activate` serves and returns the one it replaced.
+function replaceWorkspace(next: BudgetWorkspace): BudgetWorkspace {
+  const previous = workspace;
+  workspace = next;
+  return previous;
 }
 
 interface HostCoverage {
@@ -496,7 +503,9 @@ export {
   coverageSession,
   hostCoverage,
   workspace,
+  replaceWorkspace,
   modules,
+  paddedRoot,
   paddedRootPath,
   serializedBytes,
   ROOT_BYTES,

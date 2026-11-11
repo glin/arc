@@ -3672,7 +3672,7 @@ function completeDiscoveryHarness(
       historyStructuralKeys = new Map(); dropped = 0; live = {};
       posts = []; markStartedPresses() {} postAcceptedResponses() {}
       post(message) { this.posts.push(message); return Promise.resolve(); }
-      progressiveWorker = { run() { return Promise.resolve(null); } };
+      progressiveWorker = { run() { return Promise.resolve(null); }, yieldDiscovery() {} };
       performanceCounters = { recordRowPost() {}, recordRowsGap() {}, recordWork() {}, recordWatcherOperation() {}, recordMessage() {}, recordRefresh() {}, recordRefreshStage() {}, recordStartup() {}, dispose() {} };
       warnedMessageBudgets = new Set(); performanceOutput = null; icons = { fontFaces() { return []; } };
       diagnostics = { log() {}, warn() {}, file() { return null; }, enabled() { return false; } };
@@ -25978,6 +25978,98 @@ test('the startup record counts a complete discovery reply that asks for another
   }
   const { continuations, publications } = counters.snapshot().discovery;
   assert.deepEqual({ continuations, publications }, { continuations: 2, publications: 1 });
+});
+
+test('receipt progress updates the loading counters without reading catalog entries', async () => {
+  vi.useFakeTimers();
+  try {
+    const { provider } = exhaustedLoadingHarness();
+    const stream: Array<{ completed: number; known: number }> = [];
+    provider.post = async (message: any) => {
+      stream.push(message);
+    };
+    const run = provider.progressiveWorker.run;
+    provider.startupProgressAt = Date.now();
+    provider.sourceCountOf = () => assert.fail('receipt progress reads catalog entries');
+    provider.progressiveWorker.run = async (
+      request: ProgressiveRequest,
+      generation: number,
+      signal: AbortSignal,
+      progress: (value: unknown) => void,
+    ) => {
+      progress({ generation: generation - 1, value: { kind: 'discovery-status', completed: 99, known: 100 } });
+      for (const completed of [4, 5])
+        progress({ generation, value: { kind: 'discovery-status', completed, known: completed + 1 } });
+      return run(request, generation, signal);
+    };
+    await provider.prepareClaudeChildren(provider.refreshGeneration, new AbortController().signal);
+    assert.deepEqual(
+      stream.map(({ completed, known }: { completed: number; known: number }) => [completed, known]),
+      [
+        [4, 5],
+        [5, 6],
+      ],
+    );
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
+
+test('a catalog trigger starts its refresh at the next discovery slice without a deadline abort', async () => {
+  vi.useFakeTimers();
+  let release!: () => void;
+  let held: Promise<void> | undefined;
+  try {
+    const { provider, discovery } = exhaustedLoadingHarness();
+    const counters = new PanelPerformanceCounters(1000);
+    provider.performanceCounters = counters;
+    const run = provider.progressiveWorker.run;
+    let requests = 0;
+    let slices = 0;
+    let yielded = false;
+    let activeSignal: AbortSignal | undefined;
+    provider.progressiveWorker.yieldDiscovery = () => {
+      yielded = true;
+    };
+    provider.progressiveWorker.run = async (request: ProgressiveRequest, generation: number, signal: AbortSignal) => {
+      if (request.kind !== 'claude-children') return run(request, generation, signal);
+      requests++;
+      discovery.pending = requests <= 2;
+      if (requests === 2) {
+        activeSignal = signal;
+        held = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        await held;
+        for (; slices < 40; slices++) {
+          if (yielded) {
+            slices++;
+            break;
+          }
+        }
+      }
+      return run(request, generation, signal);
+    };
+    void provider.refreshFrom('startup', true);
+    for (let step = 0; step < 500; step++) {
+      if (held) break;
+      await vi.advanceTimersByTimeAsync(1);
+    }
+    assert.ok(held, 'the discovery continuation never started');
+    await provider.refreshFrom('running', true, true);
+    release();
+    for (let step = 0; step < 500 && !counters.snapshot().refreshes.running?.count; step++)
+      await vi.advanceTimersByTimeAsync(1);
+    assert.equal(slices, 1, 'the catalog trigger waited through more than one slice');
+    assert.equal(counters.snapshot().refreshes.running?.count, 1);
+    assert.equal(activeSignal?.aborted, false);
+    assert.equal(counters.snapshot().refreshStages.abandoned, 0);
+  } finally {
+    release?.();
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
 });
 
 test('incomplete discovery replies continue without a catalog refresh, and the complete reply refreshes once', async () => {

@@ -243,7 +243,7 @@ function withSavedFacts([file, entry]: [string, ClaudeChildReferenceCacheEntry])
 }
 const DISPATCH_METADATA_BYTES = 256 * 1024;
 export const CODEX_DISPATCH_REQUEST_BYTES = 8 * 1024 * 1024;
-// The receipt scan's limits in each discovery request. Each step advances the scan by at most one store entry and one file
+// The receipt scan's limits in each slice. Each step advances the scan by at most one store entry and one file
 // check.
 const RECEIPT_SLICE_MS = 1500;
 const RECEIPT_STEPS = 65536;
@@ -252,6 +252,7 @@ const RECEIPT_STEPS = 65536;
 // window read runs, the scan runs one step in each event-loop turn.
 const RECEIPT_TURN_STEPS = 8;
 const receiptScanTurn = () => new Promise<void>((resolve) => setImmediate(resolve));
+let discoveryYield = false;
 let discoveryEpoch: DiscoveryCheckpoint | null = null;
 // The reference rows of this worker's last discovery reply, by key, with the epoch and sequence of that reply. A row keeps
 // its entry and the head and dispatch facts that the reply added to it.
@@ -1567,19 +1568,40 @@ async function execute(
       if (!signal.aborted) recordHeldReceiptCounts(charges, scope);
       return pending(undefined, true, rows);
     };
-    const receiptDeadline = performance.now() + RECEIPT_SLICE_MS;
+    let receiptDeadline = performance.now() + RECEIPT_SLICE_MS;
+    let receiptSliceStart = 0;
     let receiptSteps = 0;
     let turnSteps = 0;
     let turnEntered = false;
-    // The deadline ends the loop only after a step, so a worker paused past the deadline in every request still advances.
+    let statusAt = performance.now();
+    // The deadline ends a slice after its first step, so a paused worker still advances.
     while (!signal.aborted) {
       if (
-        requestBytes <= charges.readBytes ||
+        requestBytes <= charges.readBytes - receiptSliceStart ||
         receiptSteps >= RECEIPT_STEPS ||
         (receiptSteps > 0 && performance.now() >= receiptDeadline)
       ) {
         charges.receiptPassEnds++;
-        return receiptReply();
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        if (signal.aborted) break;
+        if (discoveryYield) return receiptReply();
+        if (request.firstCatalog) return receiptReply();
+        await Promise.all([...compressedBackfills.values()].flatMap((backfill) => backfill.takeTurn() ?? []));
+        if (signal.aborted) break;
+        if (performance.now() - statusAt >= 250) {
+          statusAt = performance.now();
+          const done = completed.size + charges.receiptEntries!;
+          acknowledge?.({
+            kind: 'discovery-status',
+            completed: done,
+            known: candidates.size + charges.receiptEntries! + 1,
+          });
+        }
+        receiptSliceStart = charges.readBytes;
+        receiptSteps = 0;
+        turnSteps = 0;
+        turnEntered = false;
+        receiptDeadline = performance.now() + RECEIPT_SLICE_MS;
       }
       // A recorded launch whose identities changed catalog rows is read again before the scan completes.
       const retryId = activeReceipts.retry ? undefined : activeReceipts.retries.shift();
@@ -1594,7 +1616,7 @@ async function execute(
         turnEntered = true;
         charges.receiptScanTurns!++;
       }
-      const grant = { entries: 1, checks: 1, bytes: requestBytes - charges.readBytes };
+      const grant = { entries: 1, checks: 1, bytes: requestBytes - (charges.readBytes - receiptSliceStart) };
       const step = activeReceipts.retry ? activeReceipts.retry.next(grant) : activeReceipts.steps.next(grant);
       if (step.done) {
         if (activeReceipts.retry) activeReceipts.retry = null;
@@ -2781,6 +2803,7 @@ async function handleMessage(message: {
   requests.set(message.id, controller);
   arrivalReleases.set(controller.signal, releaseSequence);
   const kind = message.request.kind;
+  if (kind === 'claude-children') discoveryYield = false;
   for (const read of windowReads.values()) countKind(read.report.during.received, kind);
   if (kind === 'window' && windowReads.size < WINDOW_READS) {
     windowReads.set(message.id, {
@@ -3008,7 +3031,12 @@ parentPort?.on(
     releaseBody?: string;
     releaseStores?: boolean;
     compressedDecodeAck?: number;
+    yieldDiscovery?: boolean;
   }) => {
+    if (message.yieldDiscovery) {
+      discoveryYield = true;
+      return;
+    }
     if (message.compressedDecodeAck !== undefined) {
       compressedDecodeAcks.get(message.compressedDecodeAck)?.();
       compressedDecodeAcks.delete(message.compressedDecodeAck);
@@ -3044,6 +3072,7 @@ parentPort?.on(
       return;
     }
     if (message.request.kind === 'claude-children') {
+      if (discovery.busy) discoveryYield = true;
       discovery.submit(message);
       return;
     }
