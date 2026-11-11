@@ -2505,6 +2505,7 @@ test('the receipt scan counters reach the report as count rows and an older base
     ),
   };
   assert.ok(DISCOVERY_CAUSE_MEASURES.includes('receiptScanReuseLaunchesUnlinked'));
+  assert.ok(DISCOVERY_CAUSE_MEASURES.includes('discoveryRequestReferenceSeeds'));
   assert.ok(DISCOVERY_CAUSE_MEASURES.includes('codexRelationshipBoundarySources'));
   const measures = soakMeasures({ counters: { discovery: candidate } });
   const older = soakMeasures({ counters: { discovery: { publications: 1 } } });

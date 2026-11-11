@@ -127,6 +127,7 @@ export interface PerformanceCounterSnapshot {
     discoveryRequests: number;
     discoveryRequestPostMs: number;
     discoveryRequestJsonBytes: number;
+    discoveryRequestReferenceSeeds: number;
     discoveryReplies: number;
     discoveryReplyJsonBytes: number;
     discoveryRoundTripMs: number;
@@ -472,6 +473,7 @@ export class PanelPerformanceCounters {
     discoveryRequests: 0,
     discoveryRequestPostMs: 0,
     discoveryRequestJsonBytes: 0,
+    discoveryRequestReferenceSeeds: 0,
     discoveryReplies: 0,
     discoveryReplyJsonBytes: 0,
     discoveryRoundTripMs: 0,
@@ -516,6 +518,7 @@ export class PanelPerformanceCounters {
       this.discovery.discoveryRequests++;
       this.discovery.discoveryRequestPostMs += finiteDuration(sample.postMs);
       this.discovery.discoveryRequestJsonBytes += sample.jsonBytes ?? 0;
+      if (sample.referenceSeed) this.discovery.discoveryRequestReferenceSeeds++;
       if (sample.gapMs !== undefined) {
         this.discovery.discoveryReplyGaps++;
         this.discovery.discoveryReplyGapMs += finiteDuration(sample.gapMs);

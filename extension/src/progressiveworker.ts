@@ -717,7 +717,7 @@ export function workerErrorIdentity(error: unknown): { name: string; code: strin
 // One discovery message that crossed the worker boundary, as the host saw it. `jsonBytes` is a content proxy that is
 // present only while JSON measurement is on.
 export type DiscoveryTransportSample =
-  | { kind: 'request'; postMs: number; jsonBytes?: number; gapMs?: number }
+  | { kind: 'request'; postMs: number; jsonBytes?: number; gapMs?: number; referenceSeed?: true }
   | { kind: 'reply'; final: boolean; jsonBytes?: number; roundTripMs?: number };
 
 /** One execution boundary. The provider owns checkpoints and admitted pages. */
@@ -727,6 +727,8 @@ export class ProgressiveWorker {
   private dispatchSpends = new Map<string, { entry: import('./codex').CodexDispatchSpendEntry; bytes: number }>();
   private dispatchSpendBytes = 0;
   private dispatchSeedThread: number | null = null;
+  // The worker thread that answered a discovery request that carried the host's reference entries.
+  private referenceSeedThread: number | null = null;
   private nextId = 0;
   private discoveryActive = false;
   private discoveryWaiter?: { start(): void; cancel(): void };
@@ -755,6 +757,8 @@ export class ProgressiveWorker {
       started: number;
       // When the host began to post the request, on the clock of `unmeasuredNow`.
       posted?: number;
+      // True when the request carries the host's reference entries.
+      referenceSeed?: true;
       window?: { agent: SessionFile['agent']; entered: number | null };
       resolve(value: ProgressiveResult | null): void;
       reject(error: Error): void;
@@ -1032,6 +1036,9 @@ export class ProgressiveWorker {
           if (!held || this.worker !== worker) {
             return;
           }
+          // The worker takes the entries before it can send any result, so a result proves that the thread holds them. A
+          // request that the worker drops unread sends no result.
+          if (held.referenceSeed && message.result) this.referenceSeedThread = worker.threadId;
           if (message.windowEntered) {
             if (held.window) held.window.entered = performance.now();
             return;
@@ -1131,6 +1138,17 @@ export class ProgressiveWorker {
       });
     }
     this.dispatchSeedThread = this.worker?.threadId ?? null;
+    // A worker thread keeps every reference entry that it receives or writes. The host loads saved entries before its first
+    // request, and later takes entries only from the replies of its worker. So a thread that answered a request that
+    // carried the entries receives none again.
+    let sent = request;
+    let referenceSeed = false;
+    if (request.kind === 'claude-children' && request.referenceEntries) {
+      if (this.worker?.threadId === this.referenceSeedThread) {
+        const { referenceEntries: _referenceEntries, ...rest } = request;
+        sent = rest;
+      } else referenceSeed = true;
+    }
     if (
       request.kind === 'compressed-adopt' ||
       request.kind === 'compressed-load' ||
@@ -1159,6 +1177,7 @@ export class ProgressiveWorker {
         generation,
         kind: request.kind,
         started: performance.now(),
+        ...(referenceSeed ? { referenceSeed: true as const } : {}),
         ...(request.kind === 'window' ? { window: { agent: request.input.session.agent, entered: null } } : {}),
         resolve,
         reject,
@@ -1173,7 +1192,7 @@ export class ProgressiveWorker {
       const transported =
         request.kind === 'retained'
           ? { ...request, hidden: request.pages.flatMap((page) => page.turns).map(hiddenTurnFields) }
-          : request;
+          : sent;
       const message = { id, generation, request: transported, repeated };
       const unmeasured = this.unmeasuredNow();
       const gapMs =
@@ -1203,6 +1222,7 @@ export class ProgressiveWorker {
           postMs,
           ...(requestBytes === undefined ? {} : { jsonBytes: requestBytes }),
           ...(gapMs === undefined ? {} : { gapMs }),
+          ...(referenceSeed ? { referenceSeed: true as const } : {}),
         });
     });
   }

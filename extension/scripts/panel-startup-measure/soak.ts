@@ -316,8 +316,9 @@ export const OPENING_READ_COUNTERS = [
 // The work counters that name why a walk or a discovery pass ran. Each one appears only when the snapshot holds it.
 export const CAUSE_COUNTER_PREFIXES = ['walk:', 'discoveryRequest:', 'acceptedUnsettled', 'compressedNames:'] as const;
 
-// The discovery counters that name how each receipt scan opened and why relationship reads ran. A snapshot from a build
-// that does not count one of them holds no value, so the comparison shows "not reported".
+// The discovery counters that name how each receipt scan opened, why relationship reads ran, and how many requests carried
+// the reference entries. A snapshot from a build that does not count one of them holds no value, so the comparison shows
+// "not reported".
 export const DISCOVERY_CAUSE_MEASURES = [
   'receiptScanOpens',
   'receiptScanOpensNewWorker',
@@ -332,6 +333,7 @@ export const DISCOVERY_CAUSE_MEASURES = [
   'receiptScanReuses',
   'receiptScanReuseLaunches',
   'receiptScanReuseLaunchesUnlinked',
+  'discoveryRequestReferenceSeeds',
   ...['claude', 'codex'].flatMap((agent) =>
     ['NoEntry', 'Rejected', 'Resumed', 'Growth', 'Validation', 'Boundary'].flatMap((cause) => [
       `${agent}Relationship${cause}Bytes`,

@@ -1452,6 +1452,121 @@ test('a receipt delta carries the row of a Codex parent that the final check mar
   }
 });
 
+// A worker thread keeps the reference entries that it receives and writes, so the host's entries go to a thread only until
+// it answers a request that carries them. The worker reports each discovery request as it receives it. A run that clears the host's
+// record of the answering thread sends every entry with every request, and its replies and published rows are the same.
+test('a live worker thread receives the reference entries once, and a new thread receives every entry', async () => {
+  const root = tempDir('receipt-worker-seed-once-');
+  const fx = receiptDispatchFixture(root, 'claude', 'codex');
+  fs.mkdirSync(fx.receipts.root, { recursive: true });
+  for (let index = 0; index < 900; index++)
+    fs.mkdirSync(path.join(fx.receipts.root, `${index.toString(16).padStart(8, '0')}-1111-2222-3333-444444444444`));
+  fx.launch(fx.parent, fx.child, true, true);
+  const environment = `process.env.ARC_HOME=${JSON.stringify(fx.home)};`;
+  let saved = new Map<string, any>();
+  {
+    const worker = new ProgressiveWorker(environment + source);
+    const { host, replies } = await receiptDiscoveryHost(worker, [root], fx.catalog);
+    try {
+      for (let request = 1; request <= 50 && !saved.size; request++) {
+        host.refreshGeneration = request;
+        await host.prepareClaudeChildren(request, new AbortController().signal);
+        const reply = replies.last?.value;
+        if (reply?.kind === 'claude-children' && reply.membershipSettled)
+          saved = new Map(host.claudeChildReferenceEntries);
+      }
+    } finally {
+      worker.stop();
+    }
+  }
+  assert.ok(saved.size > 1, 'discovery never settled');
+  fs.appendFileSync(
+    fx.child.file,
+    JSON.stringify({ type: 'event_msg', timestamp: '2026-01-01T00:00:04Z', payload: { type: 'agent_message' } }) + '\n',
+  );
+  const received =
+    "const seedPort=require('node:worker_threads');seedPort.parentPort.on('message',(message)=>{if(message.request?.kind==='claude-children')" +
+    "seedPort.parentPort.postMessage({repeatedCoverage:'request:'+JSON.stringify({thread:seedPort.threadId,entries:message.request.referenceEntries?.length??null,bytes:Buffer.byteLength(JSON.stringify(message.request)),checkpoint:!!message.request.discovery,spendSources:'spendSources' in (message.request.discovery??{}),catalog:'catalog' in message.request})});});";
+  // The host's checkpoint holds spend sources, and the host keeps them.
+  const spendSources = {
+    claude: [{ file: fx.parent.file, sessionId: fx.parent.sessionId, primary: true }],
+    codex: [],
+    children: [],
+  };
+  const settle = (key: string, value: unknown) =>
+    ['charges', 'epoch', 'observedAt', 'workerMemory'].includes(key) ? undefined : value;
+  const drive = async (resend: boolean) => {
+    const requests: Array<{
+      thread: number;
+      entries: number | null;
+      bytes: number;
+      checkpoint: boolean;
+      spendSources: boolean;
+      catalog: boolean;
+    }> = [];
+    const worker = new ProgressiveWorker(environment + received + narrowReceiptBudget(source), undefined, (message) => {
+      if (message.startsWith('request:')) requests.push(JSON.parse(message.slice('request:'.length)));
+    });
+    const { host, replies } = await receiptDiscoveryHost(worker, [root], fx.catalog);
+    host.claudeChildReferenceEntries = new Map(saved);
+    host.enumeratedSpendSources = spendSources;
+    const run = worker.run.bind(worker);
+    worker.run = (request, ...rest) =>
+      run(request.kind === 'claude-children' ? { ...request, discoveryBytes: 16 * 1024 } : request, ...rest);
+    const outcomes: string[] = [];
+    const hostEntries: number[] = [];
+    try {
+      for (let request = 1; request <= 5; request++) {
+        // The fifth request goes to a new worker thread.
+        if (request === 5) worker.stop();
+        if (resend) Object.assign(worker, { referenceSeedThread: null });
+        host.refreshGeneration = request;
+        hostEntries.push(host.claudeChildReferenceEntries.size);
+        assert.equal(await host.prepareClaudeChildren(request, new AbortController().signal), true);
+        outcomes.push(
+          JSON.stringify(
+            {
+              reply: replies.last?.value,
+              rows: host.catalog.sessions,
+              entries: [...host.claudeChildReferenceEntries],
+              references: host.claudeChildReferences,
+            },
+            settle,
+          ),
+        );
+        if (host.discoveryCheckpoint) assert.equal(host.discoveryCheckpoint.spendSources, spendSources);
+      }
+    } finally {
+      worker.stop();
+    }
+    return { requests, outcomes, hostEntries };
+  };
+  const once = await drive(false);
+  const full = await drive(true);
+  assert.equal(once.requests.length, 5);
+  assert.equal(full.requests.length, 5);
+  const [first, ...later] = once.requests;
+  assert.equal(first.entries, once.hostEntries[0], 'the first request to a thread lacked an entry');
+  for (const request of later.slice(0, 3)) {
+    assert.equal(request.thread, first.thread);
+    assert.equal(request.entries, null, 'a request to a live thread carried reference entries');
+  }
+  assert.notEqual(later[3].thread, first.thread);
+  assert.equal(later[3].entries, once.hostEntries[4], 'a new worker thread lacked an entry');
+  assert.deepEqual(
+    full.requests.map((request) => request.entries),
+    full.hostEntries,
+  );
+  assert.deepEqual(once.outcomes, full.outcomes, 'the replies or rows differ from those of a full resend');
+  const requests = [...once.requests, ...full.requests];
+  assert.ok(requests.some((request) => request.checkpoint));
+  assert.deepEqual(
+    requests.filter((request) => request.spendSources || request.catalog),
+    [],
+    'a request carried the spend sources or a second copy of the parents',
+  );
+});
+
 // A receipt delta omits each row that matches the worker's last reply, so the host must hold every row of that reply while
 // its checkpoint carries the reply's sequence. Each host write that drops rows also replaces or clears the checkpoint.
 test('every host write that drops reference rows also replaces or clears the discovery checkpoint', () => {
@@ -4744,7 +4859,13 @@ test('discovery requests and replies count their sizes, round trips and the host
             last,
             fail,
           } as never;
-          requests.push({ id: generation, generation, request });
+          // Only the first request to each worker thread carries the reference entries.
+          const { referenceEntries: _referenceEntries, ...unseeded } = request as { referenceEntries: unknown };
+          requests.push({
+            id: generation,
+            generation,
+            request: generation === 1 || generation === 3 ? request : unseeded,
+          });
           const result = await worker
             .run(request, generation, new AbortController().signal, (progress) => {
               replies.push({ id: generation, progress: true, result: progress });
@@ -4786,6 +4907,7 @@ test('discovery requests and replies count their sizes, round trips and the host
         const bytes = (values: unknown[]) =>
           measured ? values.reduce<number>((sum, value) => sum + Buffer.byteLength(stringify(value), 'utf8'), 0) : 0;
         assert.equal(discovery.discoveryRequests, 7);
+        assert.equal(discovery.discoveryRequestReferenceSeeds, 2);
         assert.equal(discovery.discoveryReplies, 13);
         assert.equal(discovery.discoveryRequestJsonBytes, bytes(requests));
         assert.equal(discovery.discoveryReplyJsonBytes, bytes(replies));
@@ -4799,6 +4921,33 @@ test('discovery requests and replies count their sizes, round trips and the host
     }
   } finally {
     vi.restoreAllMocks();
+  }
+});
+
+// The worker drops a waiting discovery request unread and answers it with no result. The thread then holds no reference
+// entries, so the next request carries them again.
+test('a discovery request that the worker drops unread leaves the next request to carry the reference entries', async () => {
+  const stub = `const port = require('node:worker_threads').parentPort;
+    let seen = 0;
+    port.on('message', (message) => {
+      if (message.request?.kind !== 'claude-children') return;
+      port.postMessage({ repeatedCoverage: String(message.request.referenceEntries?.length ?? 'none') });
+      if (++seen === 1) return port.postMessage({ id: message.id });
+      const value = { kind: 'claude-children-progress', referenceEntries: [], checkpoint: null, continuation: true };
+      port.postMessage({ id: message.id, result: { generation: message.generation, value } });
+    });`;
+  const carried: string[] = [];
+  const worker = new ProgressiveWorker(stub, undefined, (entries) => carried.push(entries));
+  try {
+    for (let generation = 1; generation <= 3; generation++)
+      await worker.run(
+        { kind: 'claude-children', parents: [], repositoryRoots: [], referenceEntries: [['a.jsonl', {} as never]] },
+        generation,
+        new AbortController().signal,
+      );
+    assert.deepEqual(carried, ['1', '1', 'none']);
+  } finally {
+    worker.stop();
   }
 });
 

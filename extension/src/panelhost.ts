@@ -15924,17 +15924,22 @@ export class PanelProvider implements vscode.Disposable {
     }
     const compressedList = this.compressedRolloutsToSend();
     const compressedRevision = this.compressedRolloutsRevision;
+    // The host keeps the spend sources of its checkpoint, and the worker reads none of them.
+    let discovery: import('./progressiveworker').DiscoveryCheckpoint | undefined;
+    if (this.discoveryCheckpoint) {
+      const { spendSources: _spendSources, ...sent } = this.discoveryCheckpoint;
+      discovery = sent;
+    }
     const result = await this.progressiveWorker
       .run(
         {
           kind: 'claude-children',
           codexChildren,
           parents,
-          catalog: parents,
           repositoryRoots: this.repositoryScopeRoots,
           referenceEntries: [...this.claudeChildReferenceEntries],
           relationshipRejections: this.relationshipRejections,
-          discovery: this.discoveryCheckpoint,
+          discovery,
           // A refresh waits on its own request before it renders. A continuation keeps its receipt slices in one request until
           // the host accepts its first catalog.
           ...(!continuation || !this.authoritativeCatalog ? { sliceReply: true as const } : {}),
