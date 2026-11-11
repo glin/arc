@@ -48,4 +48,4 @@ Arc has no code-hosting integration for pull requests, issues, reviews, or remot
 
 The panel must remain responsive with many sessions. Reads are bounded, derived caches are rebuildable, and expensive history work waits for an explicit request or a background budget.
 
-A feature must make review or direction easier for this reader. It must not make one agent the default or hide uncertainty in a cost or activity figure.
+A feature must make review or direction easier for this reader. It must not make one agent the default or hide uncertainty in a cost or activity figure. After a restart, a session row shows its saved turn count and cost without a mark until session discovery replaces them.

@@ -144,7 +144,7 @@ Paths are relative to `extension/src/`. [Architecture](architecture.md) owns pac
 | `windowpipe-source.ts` | Native Windows pipe access rules, overlapped transport source, and separate read-only ancestry query | no |
 | `claudecoststate.ts` | Captures cumulative Claude accounting snapshots, reconciles native child usage under bounded background budgets, and allocates supplemental lifetime and Project cost | no |
 | `projectspendstate.ts` | Runtime validation for persisted project-spend records and resumable parser checkpoints | no |
-| `derivedcache.ts` | Validates and atomically stores session metadata, complete relationship facts, and pending discovery checkpoints, and holds metadata figures until their facts change | no |
+| `derivedcache.ts` | Validates and atomically stores session metadata, complete relationship facts, settled spend sources, and pending discovery checkpoints, admits saved spend sources against the walk, and holds metadata figures until their facts change | no |
 | `codexopenings.ts` | Versions, validates, and merges the machine's stored Codex opening records under a lock | no |
 | `sessionnames.ts` | Holds the one name each Claude session draws on every surface, ranks its sources, and releases withdrawn command names | no |
 | `sessionrename.ts` | Owns durable initial-name transitions and readiness-driven recovery, cleans a session name before either agent renames it, confirms a Claude rename from its saved title file, and builds the rename editor's opening message and the answer every rename request gets | no |
