@@ -210,7 +210,7 @@ Anthropic's [Manage costs effectively](https://code.claude.com/docs/en/costs) co
 
 ### What makes a turn expensive
 
-One prompt often triggers many model requests, one after each tool-call round. Each resends the whole context: instructions, earlier messages, tool results, and attachments. Prompt caching lowers its price, not its size.
+One prompt often triggers many model requests, one after each tool-call round. Each makes the model read the whole context again: instructions, earlier messages, tool results, and attachments. Prompt caching lowers its price, not its size.
 
 Ten requests that start at 100,000 tokens and grow by 10,000 each process 1.45 million input tokens. Each subagent adds its own context, requests, and cache.
 
