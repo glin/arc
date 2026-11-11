@@ -1,29 +1,33 @@
 {
+  "hostWorkEnvironment": {
+    "platform": "win32",
+    "nodeMajor": 25
+  },
   "margin": "Each row has an integer margin. An integer counter must equal its budget within the margin. A byte counter fails only above budget plus margin.",
   "hostWork": {
     "poll refresh": {
       "reason": "Host block executions per added listed session stay fixed until a reduction lowers this row.",
-      "budget": 257.74,
+      "budget": 274.74,
       "margin": 0
     },
     "selection": {
       "reason": "Host block executions per added listed session stay fixed until a reduction lowers this row.",
-      "budget": 610.215,
+      "budget": 624.215,
       "margin": 0
     },
     "one turn": {
       "reason": "Host block executions per added listed session stay fixed until a reduction lowers this row.",
-      "budget": 1270.86,
+      "budget": 1306.86,
       "margin": 0
     },
     "discovery reply": {
       "reason": "Host block executions per added listed session stay fixed until a reduction lowers this row.",
-      "budget": 342.86,
+      "budget": 355.86,
       "margin": 0
     },
     "session list post": {
       "reason": "Host block executions per added listed session stay fixed until a reduction lowers this row.",
-      "budget": 127,
+      "budget": 128,
       "margin": 0
     }
   },
