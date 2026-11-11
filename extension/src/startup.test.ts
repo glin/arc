@@ -7660,23 +7660,39 @@ test('a selected-only refresh before the catalog keeps every held title, and the
     size: 1,
     mtimeMs: 1,
   };
-  // Counts the projects root reads and the membership checks inside each eviction.
-  let evicting = false;
-  const eviction = { calls: 0, checks: 0, rootReads: 0 };
+  // Counts the membership checks inside evictions, and the reads of each source root inside each eviction.
+  let evicting: { claude: number; codex: number } | null = null;
+  const eviction = { calls: 0, checks: 0, reads: [] as { claude: number; codex: number }[] };
+  // The Claude sources sit under the projects root and the Codex sources under the sessions root. Other roots hold every path.
+  const sourceRoots = new Map([
+    [selected.file, 'projects'],
+    [child.file, 'projects'],
+    [codex.file, 'sessions'],
+    [gone.file, 'sessions'],
+  ]);
   const provider = heldFactsHarness([selected, codex, child, gone], {
+    scopeInside: (target: string, roots: string[]) =>
+      roots.length === 1 && (roots[0] === 'projects' || roots[0] === 'sessions')
+        ? sourceRoots.get(target) === roots[0]
+        : true,
     projectsRoot: () => {
-      if (evicting) eviction.rootReads++;
+      if (evicting) evicting.claude++;
       return 'projects';
+    },
+    codexSessionsRoot: () => {
+      if (evicting) evicting.codex++;
+      return 'sessions';
     },
   });
   const evict = provider.evictCache;
   provider.evictCache = function (...args: unknown[]) {
     eviction.calls++;
-    evicting = true;
+    evicting = { claude: 0, codex: 0 };
+    eviction.reads.push(evicting);
     try {
       return evict.apply(this, args);
     } finally {
-      evicting = false;
+      evicting = null;
     }
   };
   const membership = provider.physicalMembershipOf;
@@ -7756,11 +7772,16 @@ test('a selected-only refresh before the catalog keeps every held title, and the
   await scoped;
   assert.ok(provider.authoritativeCatalog, 'the new scope refresh did not set the authoritative catalog');
   assert.deepEqual(heldFiles(provider.titles), [selected.file], 'the new scope kept titles outside it');
-  // The fixture checks more files than it runs evictions, and each eviction reads the projects root at most once.
+  // The fixture checks more files than it runs evictions. Checks reach both source roots, and each eviction reads each root at most once.
   assert.ok(eviction.checks > eviction.calls, `${eviction.checks} membership checks in ${eviction.calls} evictions`);
+  const reads = eviction.reads.map(({ claude, codex }) => [claude, codex]);
   assert.ok(
-    eviction.rootReads <= eviction.calls,
-    `${eviction.calls} evictions read the projects root ${eviction.rootReads} times`,
+    reads.some(([claude, codex]) => claude > 0 && codex > 0),
+    `no eviction read both source roots: ${JSON.stringify(reads)}`,
+  );
+  assert.ok(
+    reads.every(([claude, codex]) => claude <= 1 && codex <= 1),
+    `an eviction read a source root more than once: ${JSON.stringify(reads)}`,
   );
 });
 
@@ -24910,7 +24931,7 @@ test('a render that leaves the loading status pending still ends the source coun
 test('the source count follows the latest accepted checkpoint even when its progress post is throttled', async () => {
   vi.useFakeTimers();
   try {
-    const { pendingPass, provider, discovery, poll } = exhaustedLoadingHarness();
+    const { pendingPass, completePass, provider, discovery, poll } = exhaustedLoadingHarness();
     pendingPass();
     await provider.refresh(true);
     provider.useRefreshGate(() => false);
@@ -24995,6 +25016,20 @@ test('the source count follows the latest accepted checkpoint even when its prog
     }
     assert.deepEqual(provider.sourceCountOf(large), { completed: 10, known: 100 });
     assert.equal(rowReads - firstReads, 0, 'a delta read the parent and catalog rows again');
+
+    // A completed list releases the known sources, and a later pass counts its own checkpoint again.
+    completePass();
+    const { last } = await poll(3);
+    assert.equal(last.complete, true, 'the complete pass left the session list pending');
+    assert.equal(provider.startupSourceCounted, null, 'a completed list kept the known sources');
+    pendingPass();
+    discovery.more = [{ file: 'later.jsonl' }];
+    await poll(2);
+    assert.deepEqual(
+      provider.withSourceCount({ complete: false }),
+      { complete: false, completed: 1, known: 2 },
+      'a later pass did not count its own checkpoint',
+    );
   } finally {
     vi.clearAllTimers();
     vi.useRealTimers();

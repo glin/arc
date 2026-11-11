@@ -17190,10 +17190,12 @@ export class PanelProvider implements vscode.Disposable {
     }).catch(() => {});
   }
 
-  // Drops the retained checkpoint once the session list completes. Panel statuses never call it, because one panel can be complete
-  // while another still reads its newest turns.
+  // Drops the retained checkpoint and its normalized known sources once the session list completes. Panel statuses never call it,
+  // because one panel can be complete while another still reads its newest turns.
   private settleSourceCount(list: { complete: boolean }): void {
-    if (list.complete) this.startupSourceCheckpoint = null;
+    if (!list.complete) return;
+    this.startupSourceCheckpoint = null;
+    this.startupSourceCounted = null;
   }
 
   // Counts the known and checked sources of a checkpoint. The result is reused until the checkpoint changes. The normalized
