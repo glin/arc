@@ -22,12 +22,17 @@ import {
 import assert from 'node:assert';
 import fs from 'node:fs';
 import path from 'node:path';
+import { compileFunction } from 'node:vm';
+import ts from 'typescript';
+import { revisionOf as fileRevisionOf } from './transcript';
+import { isCompressedRollout } from './compressedrollouts';
 import {
   PROJECT_SPEND_INTEGRITY_MILLISECONDS,
   PROJECT_SPEND_HELD_LINE_BYTES,
   PROJECT_SPEND_PARSER_GENERATIONS,
   spendParserCurrent,
   spendRecordHoldsLongLine,
+  releaseSpendHeldLine,
   sessionCacheFactsBySession,
   SessionFiguresCache,
   aggregateUsageEvents,
@@ -7774,6 +7779,137 @@ function countSpendNormalizations(action: () => void): number {
   }
 }
 
+function costStateHost(scope: Record<string, unknown> = {}) {
+  const source = fs.readFileSync(path.join(__dirname, 'panelhost.ts'), 'utf8');
+  const parsed = ts.createSourceFile('panelhost.ts', source, ts.ScriptTarget.Latest, true);
+  const host = parsed.statements.find(
+    (node): node is ts.ClassDeclaration => ts.isClassDeclaration(node) && node.name?.text === 'PanelProvider',
+  )!;
+  const methods = host.members.filter(
+    (node) =>
+      ts.isMethodDeclaration(node) &&
+      ['indexNextClaudeCostState', 'indexNextProjectSpendFile'].includes(node.name.getText(parsed)),
+  );
+  const compiled = ts.transpileModule(`return class { ${methods.map((node) => node.getText(parsed)).join('\n')} }`, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
+  }).outputText;
+  const values = {
+    fs,
+    normalizeSpendFile,
+    invalidateSpendFileNormalization,
+    ClaudeCostStateDependencyIndex,
+    claudeCostStateDependencies,
+    costStateDependency,
+    costStateIdentity,
+    reconcileClaudeCostState,
+    createClaudeUsageLineReducer,
+    createCodexUsageLineReducer,
+    fileRevisionOf,
+    isCompressedRollout,
+    indexSpendFile,
+    spendRecordChangesRail,
+    spendRecordHoldsLongLine,
+    releaseSpendHeldLine,
+    ...scope,
+  };
+  const Host = compileFunction(compiled, Object.keys(values))(...Object.values(values));
+  return Object.assign(new Host(), {
+    claudeChildrenDiscovered: true,
+    dispatchDiscoveryPending: false,
+    projectSpendCostOwners: new Map(),
+    projectSpendCostQueue: null,
+    projectSpendRevision: 0,
+    projectSpendFiles: [] as SpendFileIndex[],
+    sessionSpendSources: [] as SessionSpendSource[],
+    invalidateProjectSpendSnapshot() {},
+    scheduleProjectSpendSave() {},
+    scheduleNextProjectSpendFile() {},
+    diagnostics: { warn() {} },
+  });
+}
+
+for (const pruneEmpty of [true, false]) {
+  test.each(['win32', 'darwin', 'linux'] as const)(
+    `a returning alias counts one file after its missing record ${pruneEmpty ? 'is pruned' : 'stays'} on %s`,
+    (platform) => {
+      const folder = dir();
+      const target = path.join(folder, 'Target.jsonl');
+      const alias = path.join(folder, 'Alias.jsonl');
+      const now = Date.now();
+      fs.writeFileSync(target, JSON.stringify(event(now, { reportedCost: 5 })) + '\n');
+      const descriptor = Object.getOwnPropertyDescriptor(process, 'platform')!;
+      const stat = fs.statSync;
+      const open = fs.openSync;
+      const realpath = fs.realpathSync.native;
+      let present = true;
+      const unmapped: string[] = [];
+      const key = (file: string) => (platform === 'linux' ? file : file.toLowerCase());
+      const mapped = (file: fs.PathLike) => {
+        const raw = String(file);
+        if ([key(alias), key(target)].includes(key(raw))) {
+          if (!present) throw Object.assign(new Error('Missing fixture file'), { code: 'ENOENT' });
+          return target;
+        }
+        const relative = path.relative(folder, raw);
+        if (relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative))) return raw;
+        unmapped.push(raw);
+        throw new Error(`Unmapped fixture path: ${raw}`);
+      };
+      const statSpy = vi
+        .spyOn(fs, 'statSync')
+        .mockImplementation(((file: fs.PathLike, options: any) => stat(mapped(file), options)) as typeof fs.statSync);
+      const openSpy = vi
+        .spyOn(fs, 'openSync')
+        .mockImplementation(((file: fs.PathLike, flags: any) => open(mapped(file), flags)) as typeof fs.openSync);
+      const resolveSpy = vi
+        .spyOn(fs.realpathSync, 'native')
+        .mockImplementation((file: fs.PathLike) => realpath(mapped(file)));
+      Object.defineProperty(process, 'platform', { value: platform });
+      try {
+        const expectedTarget = realpath(target).replace(/\\/g, '/');
+        const expected = platform === 'win32' ? expectedTarget.toLowerCase() : expectedTarget;
+        const provider = costStateHost({ createClaudeUsageLineReducer: reducer });
+        provider.projectSpendWorkspace = folder;
+        provider.projectSpendStorageDir = folder;
+        provider.projectSpendQueued = new Set();
+        provider.projectSpendFiles = [indexSpendFile(undefined, target, folder, reducer, now).record];
+        assert.equal(normalizeSpendFile(alias), expected);
+        const tick = () => {
+          provider.projectSpendQueue = [{ file: alias, agent: 'claude', primary: true }];
+          provider.indexNextProjectSpendFile();
+        };
+        present = false;
+        tick();
+        tick();
+        tick();
+        assert.ok(
+          provider.projectSpendFiles.some((record: SpendFileIndex) => record.missingAt && !record.buckets.length),
+        );
+        if (pruneEmpty) {
+          provider.projectSpendFiles = pruneSpendFiles(provider.projectSpendFiles, now);
+          provider.spendRecordsByFile = undefined;
+          assert.equal(provider.projectSpendFiles.length, 1);
+        }
+        present = true;
+        tick();
+        const records: SpendFileIndex[] = pruneSpendFiles(provider.projectSpendFiles, now);
+        assert.equal(records.length, 1, 'one file has multiple records');
+        assert.equal(records[0].file, expected);
+        assert.equal(
+          records.reduce((total, record) => total + spendRecordTotal(record).dollars, 0),
+          5,
+        );
+      } finally {
+        Object.defineProperty(process, 'platform', descriptor);
+        statSpy.mockRestore();
+        openSpy.mockRestore();
+        resolveSpy.mockRestore();
+        assert.deepEqual(unmapped, []);
+      }
+    },
+  );
+}
+
 test('cost-state dependencies and invalidation match the reference across seeded source graphs', () => {
   const folder = dir();
   let seed = 73519;
@@ -7841,7 +7977,7 @@ test('cost-state dependencies and invalidation match the reference across seeded
       );
     for (const owner of sources) {
       const expected = referenceClaudeCostStateDependencies(owner, sources, files);
-      const actual = claudeCostStateDependencies(owner, sources, files, shared);
+      const actual = shared.dependencies(owner);
       assert.deepEqual(actual, expected, `sample ${sample}`);
       if (expected && actual) {
         expected.forEach((file, at) => assert.equal(actual[at], file));
@@ -7883,7 +8019,7 @@ test('cost-state dependencies and invalidation match the reference across seeded
   }
 });
 
-test('cost-state invalidation normalizes sources once across 200 supplemental files', () => {
+test('cost-state invalidation bounds normalizations across 200 supplemental files', () => {
   const folder = dir();
   const sources = Array.from({ length: 2000 }, (_, at) => ({
     sessionId: `session-${at}`,
@@ -7909,30 +8045,123 @@ test('cost-state invalidation normalizes sources once across 200 supplemental fi
   assert.ok(calls <= sources.length * 3, `${calls} normalizations for ${sources.length} sources`);
 });
 
-test('missing spend sources retain normalization until a source returns at a new target', () => {
+test('host queue admission and child supplement reoffers bound source normalizations', () => {
   const folder = dir();
-  const first = path.join(folder, 'first');
-  const second = path.join(folder, 'second');
-  const alias = path.join(folder, 'alias');
-  fs.mkdirSync(first);
-  fs.mkdirSync(second);
-  fs.symlinkSync(first, alias, process.platform === 'win32' ? 'junction' : 'dir');
-  const source = path.join(alias, 'source.jsonl');
-  fs.writeFileSync(source, JSON.stringify(event(1)) + '\n');
-  let record = indexSpendFile(undefined, source, folder, reducer, 1).record;
-  fs.unlinkSync(source);
-  record = indexSpendFile(record, source, folder, reducer, 2).record;
-  const native = fs.realpathSync.native;
-  const resolves = vi.spyOn(fs.realpathSync, 'native').mockImplementation(native);
-  for (let at = 0; at < 20; at++) {
-    normalizeSpendFile(source);
-    record = indexSpendFile(record, source, folder, reducer, 3 + at).record;
+  const sources: SessionSpendSource[] = Array.from({ length: 2000 }, (_, at) => ({
+    sessionId: `session-${at}`,
+    file: path.join(folder, `${at}.jsonl`),
+    primary: true,
+  }));
+  for (let at = 1; at < 200; at++)
+    sources.push({ sessionId: 'child', file: sources[0].file, nativeParentFile: sources[at].file, primary: false });
+  const files = sources.slice(0, 200).map((source): SpendFileIndex => ({
+    ...dollarRecord(source.file, 1),
+    parserKind: 'claude',
+    parserGeneration: PROJECT_SPEND_PARSER_GENERATIONS.claude,
+    parserState: { costState: { snapshots: [{}] } },
+  }));
+  let reconciled = 0;
+  const provider = costStateHost({
+    reconcileClaudeCostState: (_capture: unknown, dependencies: SpendFileIndex[]) => {
+      reconciled++;
+      return {
+        complete: true,
+        progress: {},
+        supplement: { identity: costStateIdentity(dependencies.map(costStateDependency)) },
+      };
+    },
+  });
+  provider.sessionSpendSources = sources;
+  provider.projectSpendFiles = files;
+  const calls = countSpendNormalizations(() => assert.equal(provider.indexNextClaudeCostState(), true));
+  assert.equal(reconciled, 1);
+  assert.ok(files[0].costStateSupplement);
+  assert.equal(provider.projectSpendCostOwners.size, 200);
+  assert.equal(provider.projectSpendCostQueue.length, 200);
+  assert.ok(calls <= sources.length * 3, `${calls} normalizations for ${sources.length} sources`);
+});
+
+test('host cost-state ticks match the reference through replacements and earlier-owner reoffers', () => {
+  const folder = dir();
+  const raw = (name: string) => path.join(folder, 'nested') + path.sep + '..' + path.sep + `${name}.jsonl`;
+  const sources: SessionSpendSource[] = [
+    { sessionId: 'parent', file: raw('parent'), primary: true },
+    { sessionId: 'child', file: raw('child'), primary: true, nativeParentFile: raw('parent') },
+  ];
+  assert.notEqual(sources[0].file, normalizeSpendFile(sources[0].file));
+  class ReferenceIndex {
+    owners = new Map<string, SessionSpendSource>();
+    constructor(
+      private sources: readonly SessionSpendSource[],
+      private files: readonly SpendFileIndex[],
+    ) {
+      for (const source of sources) {
+        if (source.dispatchedFrom || source.dispatchedVia) continue;
+        const key = normalizeSpendFile(source.file);
+        if (!this.owners.has(key)) this.owners.set(key, source);
+      }
+    }
+    firstRecordIndex(key: string) {
+      return this.files.findIndex((file) => file.file === key);
+    }
+    dependencies(owner: SessionSpendSource) {
+      return referenceClaudeCostStateDependencies(owner, this.sources, this.files);
+    }
   }
-  assert.equal(resolves.mock.calls.length, 1);
-  fs.unlinkSync(alias);
-  fs.writeFileSync(path.join(second, 'source.jsonl'), JSON.stringify(event(2)) + '\n');
-  fs.symlinkSync(second, alias, process.platform === 'win32' ? 'junction' : 'dir');
-  const returned = indexSpendFile(record, source, folder, reducer, 30);
-  assert.equal(returned.record.file, normalizeWorkspace(path.join(second, 'source.jsonl')));
-  assert.equal(returned.record.missingAt, undefined);
+  const build = (Index: typeof ClaudeCostStateDependencyIndex | typeof ReferenceIndex) => {
+    const reads: SpendFileIndex[][] = [];
+    const provider = costStateHost({
+      ClaudeCostStateDependencyIndex: Index,
+      reconcileClaudeCostState: (_capture: unknown, dependencies: SpendFileIndex[]) => {
+        reads.push(dependencies);
+        return {
+          complete: reads.length > 1,
+          progress: {},
+          ...(reads.length > 1
+            ? { supplement: { identity: costStateIdentity(dependencies.map(costStateDependency)) } }
+            : {}),
+        };
+      },
+    });
+    provider.sessionSpendSources = sources.map((source) => ({ ...source }));
+    provider.projectSpendFiles = sources.map((source) => ({
+      ...dollarRecord(normalizeSpendFile(source.file), 1),
+      parserKind: 'claude',
+      parserGeneration: PROJECT_SPEND_PARSER_GENERATIONS.claude,
+      parserState: { costState: { snapshots: [{}] } },
+      costStateSupplement: { identity: 'stale' },
+    }));
+    return { provider, reads, original: [...provider.projectSpendFiles] };
+  };
+  const actual = build(ClaudeCostStateDependencyIndex);
+  const expected = build(ReferenceIndex);
+  const checkTick = () => {
+    assert.equal(actual.provider.indexNextClaudeCostState(), expected.provider.indexNextClaudeCostState());
+    assert.deepEqual(actual.provider.projectSpendFiles, expected.provider.projectSpendFiles);
+    assert.deepEqual(actual.provider.projectSpendCostQueue, expected.provider.projectSpendCostQueue);
+    assert.deepEqual(actual.reads, expected.reads);
+  };
+  checkTick();
+  assert.notEqual(actual.reads[0][0], actual.original[1], 'admission keeps a stale record in the dependency index');
+  assert.equal(actual.reads[0][0].costStateSupplement, undefined);
+  const parentKey = normalizeSpendFile(sources[0].file);
+  for (const state of [actual, expected]) {
+    state.provider.sessionSpendSources = sources.map((source) => ({ ...source }));
+    state.provider.projectSpendFiles[0] = {
+      ...state.provider.projectSpendFiles[0],
+      costStateSupplement: { identity: costStateIdentity(state.provider.projectSpendFiles.map(costStateDependency)) },
+    };
+    assert.notEqual(state.provider.projectSpendCostOwners.get(parentKey).owner, state.provider.sessionSpendSources[0]);
+  }
+  const beforeReoffer = actual.provider.projectSpendFiles[0];
+  checkTick();
+  const replacement = actual.provider.projectSpendFiles[0];
+  assert.notEqual(replacement, beforeReoffer);
+  assert.equal(replacement.costStateSupplement, undefined);
+  assert.deepEqual(actual.provider.projectSpendCostQueue, [parentKey]);
+  checkTick();
+  assert.equal(actual.reads[2][0], replacement, 'the parent slice reads the replacement from the reoffer');
+  assert.equal(actual.reads[2][1], actual.provider.projectSpendFiles[1]);
+  assert.ok(actual.reads[2][1].costStateSupplement);
+  checkTick();
 });

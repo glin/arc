@@ -2266,7 +2266,7 @@ export function indexSpendFile<State>(
 ): IndexSpendFileResult {
   const now = typeof nowOrBudget === 'number' ? nowOrBudget : Date.now();
   const scanBudget = typeof nowOrBudget === 'number' ? budget : nowOrBudget;
-  let normalizedFile = canonicalPath(file);
+  const normalizedFile = canonicalPath(file);
   const normalizedWorkspace = normalizeWorkspace(workspace);
   const emptyReducer = makeReducer(undefined);
   const parserKind = emptyReducer.parserKind;
@@ -2276,10 +2276,6 @@ export function indexSpendFile<State>(
     stat = revisionOf(physical);
     if (!physical.isFile()) {
       throw new Error('not a file');
-    }
-    if (previous?.missingAt !== undefined) {
-      invalidateSpendFileNormalization(file);
-      normalizedFile = canonicalPath(file);
     }
   } catch (error) {
     if (!['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')) {
@@ -2295,7 +2291,7 @@ export function indexSpendFile<State>(
         };
       throw error;
     }
-    if (previous?.missingAt === undefined) invalidateSpendFileNormalization(file);
+    invalidateSpendFileNormalization(file);
     const record =
       previous && previous.file === normalizedFile
         ? // A source that returns is read again from its start, so the record lets its held bytes go.
@@ -3068,9 +3064,8 @@ export function claudeCostStateDependencies(
   owner: SessionSpendSource,
   sources: readonly SessionSpendSource[],
   files: readonly SpendFileIndex[],
-  index = new ClaudeCostStateDependencyIndex(sources, files),
 ): SpendFileIndex[] | null {
-  return index.dependencies(owner);
+  return new ClaudeCostStateDependencyIndex(sources, files).dependencies(owner);
 }
 
 interface ClaudeCostChild {
@@ -3160,7 +3155,7 @@ export function invalidateClaudeCostSupplements(
   return files.map((record) => {
     if (!record.costStateSupplement && !record.costStateProgress) return record;
     const owner = index!.owners.get(record.file);
-    const dependencies = owner && claudeCostStateDependencies(owner, sources, files, index!);
+    const dependencies = owner && index!.dependencies(owner);
     const identity = dependencies ? costStateIdentity(dependencies.map(costStateDependency)) : null;
     if (identity === (record.costStateSupplement?.identity ?? record.costStateProgress?.identity)) return record;
     const { costStateSupplement: _supplement, costStateProgress: _progress, ...baseline } = record;

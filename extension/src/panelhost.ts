@@ -110,11 +110,7 @@ import {
 import type { ClaudeForwardCheckpoint } from './claudehistory';
 import * as vscode from 'vscode';
 import { costStateDependency, costStateIdentity, reconcileClaudeCostState } from './claudecoststate';
-import {
-  ClaudeCostStateDependencyIndex,
-  claudeCostStateDependencies,
-  invalidateClaudeCostSupplements,
-} from './projectspend';
+import { ClaudeCostStateDependencyIndex, invalidateClaudeCostSupplements } from './projectspend';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { PlatformPath } from 'node:path';
@@ -14082,7 +14078,7 @@ export class PanelProvider implements vscode.Disposable {
           this.spendChecks.set(result.record, Date.now());
         }
       } catch (error) {
-        if (result.record.missingAt === undefined) invalidateSpendFileNormalization(next.file);
+        invalidateSpendFileNormalization(next.file);
         if (
           result.record.missingAt !== undefined &&
           ['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')
@@ -14117,7 +14113,7 @@ export class PanelProvider implements vscode.Disposable {
       const record = this.projectSpendFiles[at];
       const capture = (record?.parserState as ClaudeUsageReducerState | undefined)?.costState;
       if (!record || !capture?.snapshots.length) return;
-      const dependencies = claudeCostStateDependencies(owner, sources, this.projectSpendFiles, dependencyIndex);
+      const dependencies = dependencyIndex.dependencies(owner);
       if (!owners.has(key))
         owners.set(key, {
           owner,
@@ -14155,7 +14151,7 @@ export class PanelProvider implements vscode.Disposable {
     const owner = dependencyIndex.owners.get(key);
     const at = dependencyIndex.firstRecordIndex(key);
     const record = this.projectSpendFiles[at];
-    const dependencies = owner && claudeCostStateDependencies(owner, sources, this.projectSpendFiles, dependencyIndex);
+    const dependencies = owner && dependencyIndex.dependencies(owner);
     const capture = (record?.parserState as ClaudeUsageReducerState | undefined)?.costState;
     if (!dependencies || !capture) return this.projectSpendCostQueue.length > 0;
     const result = reconcileClaudeCostState(

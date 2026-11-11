@@ -201,6 +201,7 @@ import {
   loadSpendLedger,
   saveSpendLedger,
   type SpendFileIndex,
+  type SessionSpendSource,
   SessionSpendSourceIndex,
   indexSpendFile,
   normalizeSpendFile,
@@ -26948,11 +26949,13 @@ test('the Claude cost-state queue reads each owner dependencies once and orders 
       normalizeSpendFile,
       costStateDependency: (record: SpendFileIndex) => record.file,
       costStateIdentity: (files: string[]) => files.join('|'),
-      claudeCostStateDependencies: (owner: { sessionId: string }) => {
-        reads.push(owner.sessionId);
-        return Array.from({ length: counts[owner.sessionId] }, (_, at) => ({
-          file: `${owner.sessionId}-${at}`,
-        }));
+      ClaudeCostStateDependencyIndex: class extends ClaudeCostStateDependencyIndex {
+        override dependencies(owner: SessionSpendSource): SpendFileIndex[] {
+          reads.push(owner.sessionId);
+          return Array.from({ length: counts[owner.sessionId] }, (_, at) => ({
+            file: `${owner.sessionId}-${at}`,
+          })) as SpendFileIndex[];
+        }
       },
       reconcileClaudeCostState: () => {
         order = [...provider.projectSpendCostQueue];
@@ -27001,9 +27004,11 @@ function costQueueHarness() {
     normalizeSpendFile,
     costStateDependency: dependency,
     costStateIdentity: (files: string[]) => files.join('|'),
-    claudeCostStateDependencies: (owner: { sessionId: string }) => {
-      reads.push(owner.sessionId);
-      return dependencies(owner.sessionId);
+    ClaudeCostStateDependencyIndex: class extends ClaudeCostStateDependencyIndex {
+      override dependencies(owner: SessionSpendSource): SpendFileIndex[] {
+        reads.push(owner.sessionId);
+        return dependencies(owner.sessionId);
+      }
     },
     reconcileClaudeCostState: (_capture: unknown, files: SpendFileIndex[]) => ({
       invalidated: false,
