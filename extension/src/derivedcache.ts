@@ -27,6 +27,7 @@ import {
   sessionOutcomeOf,
   sessionStatFactsOf,
   type AgentKind,
+  type RelationshipRejection,
   type SavedClaudeOpening,
   type AgentRunScan,
   type ClaudeChildSessionFile,
@@ -387,12 +388,14 @@ export interface DerivedCache {
     reason: string;
     storedGeneration?: unknown;
     rejectedRelationships?: number;
+    relationshipRejected?: Record<string, number>;
     rejectedTitles?: number;
     acceptedRelationships?: number;
     format?: number;
     source?: string;
     checkpoint?: string;
   };
+  relationshipRejections?: Map<string, RelationshipRejection>;
   migrationPending?: boolean;
   discovery?: import('./progressiveworker').DiscoveryCheckpoint;
   // Legacy workspace Codex opening rows seed a missing shared `codex-openings.json`.
@@ -1857,10 +1860,44 @@ export function loadDerivedCache(
       if (rejected) loaded.reuse.rejectedTitles = rejected;
     }
     const relationshipRows = Array.isArray(parsed.claudeChildReferences) ? parsed.claudeChildReferences : [];
-    for (const row of legacy && !knownLegacy ? [] : relationshipRows) {
+    loaded.relationshipRejections = new Map();
+    loaded.reuse.relationshipRejected = {};
+    for (const row of relationshipRows) {
       const entry = record(row) ? withCurrentDispatch(row.entry) : undefined;
-      if (record(row) && fileName(row.file) && childReferenceEntry(entry) && (!legacy || entry.parserVersion === 26)) {
-        loaded.claudeChildReferences.set(normalizeFsPath(row.file), entry);
+      const accepted = childReferenceEntry(entry) ? entry : undefined;
+      const reason: RelationshipRejection | undefined =
+        !record(row) || !fileName(row.file)
+          ? 'path'
+          : (legacy && !knownLegacy) || (record(entry) && entry.parserVersion !== CLAUDE_CHILD_REFERENCE_PARSER_VERSION)
+            ? 'parser'
+            : accepted
+              ? undefined
+              : record(entry) && !fileRevision(entry)
+                ? 'stamp'
+                : record(entry) &&
+                    entry.claudeCursor !== undefined &&
+                    !claudeRelationshipCursor(entry.claudeCursor, entry.sessionId as string)
+                  ? 'cursor'
+                  : record(entry) &&
+                      entry.cursor !== undefined &&
+                      !codexDispatchCursor(entry.cursor, entry.sessionId as string, entry.size as number)
+                    ? 'cursor'
+                    : !childReferenceEntry(entry)
+                      ? 'state'
+                      : undefined;
+      if (reason) {
+        const agent = !record(entry)
+          ? 'unknown'
+          : entry.source === 'codex'
+            ? 'codex'
+            : entry.source === 'claude' || entry.source === undefined
+              ? 'claude'
+              : 'unknown';
+        const key = `${agent}:${reason}`;
+        loaded.reuse.relationshipRejected[key] = (loaded.reuse.relationshipRejected[key] ?? 0) + 1;
+        if (record(row) && fileName(row.file)) loaded.relationshipRejections.set(normalizeFsPath(row.file), reason);
+      } else if (record(row) && accepted) {
+        loaded.claudeChildReferences.set(normalizeFsPath(row.file as string), accepted);
       }
     }
     const admitted = loaded.claudeChildReferences;
@@ -1947,6 +1984,7 @@ export function saveDerivedCache(
   promptScans: Iterable<[string, HumanPromptScan]> = [],
   unsettledAdoptions: Iterable<[string, string]> = [],
   claudeOpenings?: SavedClaudeOpenings,
+  saved?: (dropped: Record<AgentKind, number>) => void,
 ): void {
   const savedScans = new Map<string, HumanPromptScan>();
   for (const [scanFile, scan] of promptScans) {
@@ -2012,6 +2050,9 @@ export function saveDerivedCache(
     },
   };
   writeFileAtomically(file, JSON.stringify(data), replace);
+  const dropped = { claude: 0, codex: 0 };
+  for (const row of childRows.slice(MAX_CLAUDE_CHILD_REFERENCE_FILES)) dropped[row.entry.source ?? 'claude']++;
+  saved?.(dropped);
 }
 
 // Changed parent files recreate discarded cursors. Unchanged finished sources retain their evidence.

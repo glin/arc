@@ -1,3 +1,4 @@
+import type { RelationshipCauseCounters } from './transcript';
 import { Worker } from 'node:worker_threads';
 import { CODEX_META_VERSION } from './codexopenings';
 import { brotliDecompressSync } from 'node:zlib';
@@ -275,7 +276,8 @@ export function validDiscoveryCheckpoint(value: unknown): value is DiscoveryChec
 // A parent check counts every stat of a candidate source. A file count names each file once per measured pass.
 // The dispatch visit count includes sessions whose held facts read nothing. The reread count excludes them.
 // Times are wall milliseconds.
-export interface DiscoveryCharges extends Record<import('./codex').CodexDispatchSpendProgress, number> {
+export interface DiscoveryCharges
+  extends RelationshipCauseCounters, Record<import('./codex').CodexDispatchSpendProgress, number> {
   readBytes: number;
   receiptEntries?: number;
   receiptChecks?: number;
@@ -387,6 +389,7 @@ export type ProgressiveRequest =
       codexChildren?: import('./codex').CodexSubagentFile[];
       repositoryRoots: string[];
       referenceEntries?: Array<[string, ClaudeChildReferenceCacheEntry]>;
+      relationshipRejections?: string[];
       discovery?: DiscoveryCheckpoint;
       discoveryBytes?: number;
       quantumBytes?: number;

@@ -19301,3 +19301,86 @@ test('a rewritten subagent sidecar updates its parsed parent', () => {
   fs.utimesSync(file, 101, 101);
   assert.equal(readClaudeSubagentMetas(directory)[0].parentAgentId, 'other');
 });
+
+test('claude relationship byte causes bound each running append at both file sizes', async () => {
+  vi.spyOn(performance, 'now').mockReturnValue(0);
+  const measurements: number[][] = [];
+  for (const size of [32768, 1048576]) {
+    const file = writeTranscript([
+      { type: 'ignored', payload: 'x'.repeat(size) },
+      { type: 'ignored', payload: 'y'.repeat(65536) },
+    ]);
+    const budget = 128 * 1024;
+    let scan = await scanClaudeRelationshipQuantum({ file, sessionId: 'parent' }, undefined, budget);
+    for (let pass = 0; !scan.complete && pass < 100; pass++)
+      scan = await scanClaudeRelationshipQuantum({ file, sessionId: 'parent' }, scan.cursor, budget);
+    assert.equal(scan.complete, true);
+    const bytes: number[] = [];
+    for (let step = 0; step < 3; step++) {
+      const record = JSON.stringify({ type: 'ignored', payload: 'z'.repeat(step === 1 ? 65536 : 100) }) + '\n';
+      fs.appendFileSync(file, record);
+      fs.utimesSync(file, new Date(0), new Date(2000000000000 + step * 2000));
+      const meter: import('./transcript').RelationshipReadMeter = { readBytes: 0 };
+      scan = await scanClaudeRelationshipQuantum(
+        { file, sessionId: 'parent' },
+        structuredClone(scan.cursor),
+        budget,
+        undefined,
+        meter,
+      );
+      for (let pass = 0; !scan.complete && pass < 100; pass++)
+        scan = await scanClaudeRelationshipQuantum(
+          { file, sessionId: 'parent' },
+          structuredClone(scan.cursor),
+          budget,
+          undefined,
+          meter,
+        );
+      assert.equal(scan.complete, true);
+      assert.equal(meter.claudeRelationshipGrowthBytes, Buffer.byteLength(record));
+      assert.ok(meter.readBytes <= Buffer.byteLength(record) + 8191);
+      const categories = ['NoEntry', 'Rejected', 'Resumed', 'Growth', 'Validation', 'Boundary'] as const;
+      assert.equal(
+        categories.reduce((sum, cause) => sum + (meter[`claudeRelationship${cause}Bytes`] ?? 0), 0),
+        meter.readBytes,
+      );
+      bytes.push(meter.readBytes);
+    }
+    measurements.push(bytes);
+  }
+  assert.deepEqual(measurements[0], measurements[1]);
+  console.log('claude append bytes', JSON.stringify(measurements));
+});
+
+test('claude relationship pending records read only appended bytes and validation', async () => {
+  vi.spyOn(performance, 'now').mockReturnValue(0);
+  const file = writeTranscript([{ type: 'ignored', payload: 'x'.repeat(32768) }]);
+  fs.appendFileSync(file, '{"type":"ignored","payload":"' + 'y'.repeat(8192));
+  const budget = 128 * 1024;
+  let scan = await scanClaudeRelationshipQuantum({ file, sessionId: 'parent' }, undefined, budget);
+  const bytes: number[] = [];
+  for (let step = 0; step < 3; step++) {
+    assert.equal(scan.complete, false);
+    const quiet = await scanClaudeRelationshipQuantum(
+      { file, sessionId: 'parent' },
+      structuredClone(scan.cursor),
+      budget,
+    );
+    assert.equal(quiet.complete, false);
+    assert.equal(quiet.readBytes, 0);
+    fs.appendFileSync(file, 'z'.repeat(8192));
+    const meter: import('./transcript').RelationshipReadMeter = { readBytes: 0 };
+    scan = await scanClaudeRelationshipQuantum(
+      { file, sessionId: 'parent' },
+      structuredClone(scan.cursor),
+      budget,
+      undefined,
+      meter,
+    );
+    bytes.push(meter.readBytes);
+    console.log('claude pending step', step, meter.readBytes, meter.claudeRelationshipBoundaryBytes ?? 0);
+    assert.equal(meter.claudeRelationshipBoundaryBytes ?? 0, 0);
+    assert.ok(meter.readBytes <= 8192 + 8191);
+  }
+  console.log('claude pending bytes', JSON.stringify(bytes));
+});

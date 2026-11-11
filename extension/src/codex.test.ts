@@ -19869,3 +19869,97 @@ test('a Codex user record with loop wake fields stays an ordinary Codex record',
   assert.deepEqual(turnsOf(marked), turnsOf(plain));
   assert.deepEqual(turnsOf(plain), [['Ask', undefined]]);
 });
+
+test('codex relationship byte causes bound each running append at both file sizes', async () => {
+  vi.spyOn(performance, 'now').mockReturnValue(0);
+  const measurements: number[][] = [];
+  for (const size of [32768, 1048576]) {
+    const file = writeRollout([
+      { type: 'ignored', payload: 'x'.repeat(size) },
+      { type: 'ignored', payload: 'y'.repeat(65536) },
+    ]);
+    const budget = 128 * 1024;
+    let scan = await scanCodexDispatchReferencesAsync(file, 'parent', null, budget);
+    for (let pass = 0; !scan.complete && pass < 100; pass++)
+      scan = await scanCodexDispatchReferencesAsync(file, 'parent', scan.cursor, budget);
+    assert.equal(scan.complete, true);
+    const bytes: number[] = [];
+    for (let step = 0; step < 3; step++) {
+      const record = JSON.stringify({ type: 'ignored', payload: 'z'.repeat(step === 1 ? 65536 : 100) }) + '\n';
+      fs.appendFileSync(file, record);
+      fs.utimesSync(file, new Date(0), new Date(2000000000000 + step * 2000));
+      const meter: import('./transcript').RelationshipReadMeter = { readBytes: 0 };
+      scan = await scanCodexDispatchReferencesAsync(
+        file,
+        'parent',
+        structuredClone(scan.cursor),
+        budget,
+        () => false,
+        meter,
+      );
+      for (let pass = 0; !scan.complete && pass < 100; pass++)
+        scan = await scanCodexDispatchReferencesAsync(
+          file,
+          'parent',
+          structuredClone(scan.cursor),
+          budget,
+          () => false,
+          meter,
+        );
+      assert.equal(scan.complete, true);
+      assert.equal(meter.codexRelationshipGrowthBytes, Buffer.byteLength(record));
+      assert.ok(meter.readBytes <= Buffer.byteLength(record) + 8191);
+      const categories = ['NoEntry', 'Rejected', 'Resumed', 'Growth', 'Validation', 'Boundary'] as const;
+      assert.equal(
+        categories.reduce((sum, cause) => sum + (meter[`codexRelationship${cause}Bytes`] ?? 0), 0),
+        meter.readBytes,
+      );
+      bytes.push(meter.readBytes);
+    }
+    measurements.push(bytes);
+  }
+  assert.deepEqual(measurements[0], measurements[1]);
+  console.log('codex append bytes', JSON.stringify(measurements));
+});
+
+test('codex relationship pending records count boundary recovery at both file sizes', async () => {
+  vi.spyOn(performance, 'now').mockReturnValue(0);
+  const measurements: number[][] = [];
+  for (const size of [32768, 1048576]) {
+    const file = writeRollout([{ type: 'ignored', payload: 'x'.repeat(size) }]);
+    fs.appendFileSync(file, '{"type":"ignored","payload":"' + 'y'.repeat(8192));
+    const budget = 128 * 1024;
+    let scan = await scanCodexDispatchReferencesAsync(file, 'parent', null, budget);
+    for (let pass = 0; scan.cursor.offset < scan.cursor.target! && pass < 100; pass++)
+      scan = await scanCodexDispatchReferencesAsync(file, 'parent', scan.cursor, budget);
+    const bytes: number[] = [];
+    for (let step = 0; step < 3; step++) {
+      assert.equal(scan.complete, false);
+      const quiet = await scanCodexDispatchReferencesAsync(file, 'parent', structuredClone(scan.cursor), budget);
+      assert.equal(quiet.complete, false);
+      assert.equal(quiet.readBytes, 0);
+      fs.appendFileSync(file, 'z'.repeat(8192));
+      const meter: import('./transcript').RelationshipReadMeter = { readBytes: 0 };
+      scan = await scanCodexDispatchReferencesAsync(
+        file,
+        'parent',
+        structuredClone(scan.cursor),
+        budget,
+        () => false,
+        meter,
+      );
+      assert.equal(meter.codexRelationshipGrowthBytes, 8192);
+      assert.ok((meter.codexRelationshipValidationBytes ?? 0) < 8192);
+      assert.equal(
+        meter.readBytes,
+        (meter.codexRelationshipGrowthBytes ?? 0) +
+          (meter.codexRelationshipValidationBytes ?? 0) +
+          (meter.codexRelationshipBoundaryBytes ?? 0),
+      );
+      bytes.push(meter.readBytes);
+    }
+    measurements.push(bytes);
+  }
+  assert.deepEqual(measurements[0], measurements[1]);
+  console.log('codex pending bytes', JSON.stringify(measurements));
+});

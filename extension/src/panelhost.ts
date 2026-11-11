@@ -1976,6 +1976,7 @@ export class PanelProvider implements vscode.Disposable {
     children: CodexSubagentFile[];
   };
   private discoveryCheckpoint?: import('./progressiveworker').DiscoveryCheckpoint;
+  private relationshipRejections?: string[];
   private discoveryCompleted?: Set<string>;
   private claudeChildReferences: ClaudeChildSessionReference[] = [];
   // Parent relationships rebuilt when dispatch references or Claude or Codex children change. Selection reuses the index.
@@ -4006,6 +4007,9 @@ export class PanelProvider implements vscode.Disposable {
       }
       this.claudeChildReferenceEntries = cached.claudeChildReferences;
       this.discoveryCheckpoint = cached.discovery;
+      this.relationshipRejections = [...(cached.relationshipRejections?.keys() ?? [])];
+      for (const [reason, count] of Object.entries(cached.reuse?.relationshipRejected ?? {}))
+        this.performanceCounters?.recordWork?.(`relationshipLoadRejected:${reason}`, count);
       this.savedLinks = cached.links;
       this.savedLinksMalformed = cached.linksMalformed === true;
       this.savedPromptScans = cached.promptScans ?? new Map();
@@ -12976,6 +12980,10 @@ export class PanelProvider implements vscode.Disposable {
           [...(this.savedPromptScans ?? []), ...(this.humanScans ?? [])],
           [...(this.adoptionsUnsettled ?? [])].map(([plain, held]): [string, string] => [plain, held.twin]),
           { parents: parentOpenings, children: childOpenings },
+          (dropped) => {
+            for (const agent of ['claude', 'codex'] as const)
+              this.performanceCounters?.recordWork?.(`relationshipSaveCapDropped:${agent}`, dropped[agent]);
+          },
         );
         // The source set changes only at a settled reply, so a write for another reason leaves its file alone.
         if (settled && !settled.saved) {
@@ -15742,6 +15750,7 @@ export class PanelProvider implements vscode.Disposable {
       }
       for (const [file, entry] of progress.referenceEntries) acknowledged.set(file, entry);
       this.claudeChildReferenceEntries = acknowledged;
+      this.relationshipRejections = this.relationshipRejections?.filter((file) => !acknowledged.has(file));
       this.discoveryAcknowledgment = {
         scope,
         request: requestOrder,
@@ -15847,6 +15856,7 @@ export class PanelProvider implements vscode.Disposable {
           catalog: parents,
           repositoryRoots: this.repositoryScopeRoots,
           referenceEntries: [...this.claudeChildReferenceEntries],
+          relationshipRejections: this.relationshipRejections,
           discovery: this.discoveryCheckpoint,
           ...compressedList,
         },

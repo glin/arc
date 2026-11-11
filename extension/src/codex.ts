@@ -18,6 +18,7 @@ import { isDeepStrictEqual } from 'node:util';
 import {
   BackwardLineCursor,
   type RelationshipReadMeter,
+  type RelationshipReadCause,
   captureTurnTextOrder,
   BoundaryDiscovery,
   BoundaryDiscoveryOptions,
@@ -4155,8 +4156,9 @@ export function scanCodexDispatchReferences(
   budget = Number.POSITIVE_INFINITY,
   cancelled: () => boolean = () => false,
   meter?: RelationshipReadMeter,
+  origin?: RelationshipReadCause,
 ): CodexDispatchScan {
-  const steps = codexDispatchSteps(file, parentSessionId, previous, budget, cancelled, meter);
+  const steps = codexDispatchSteps(file, parentSessionId, previous, budget, cancelled, meter, undefined, origin);
   let step = steps.next();
   while (!step.done) step = steps.next();
   return step.value;
@@ -4170,8 +4172,9 @@ export async function scanCodexDispatchReferencesAsync(
   cancelled: () => boolean = () => false,
   meter?: RelationshipReadMeter,
   exportPolicy?: ExportRelationshipLimits,
+  origin?: RelationshipReadCause,
 ): Promise<CodexDispatchScan> {
-  const steps = codexDispatchSteps(file, parentSessionId, previous, budget, cancelled, meter, exportPolicy);
+  const steps = codexDispatchSteps(file, parentSessionId, previous, budget, cancelled, meter, exportPolicy, origin);
   let step = steps.next();
   while (!step.done) {
     await new Promise<void>((resolve) => setImmediate(resolve));
@@ -4188,6 +4191,7 @@ function* codexDispatchSteps(
   cancelled: () => boolean,
   meter?: RelationshipReadMeter,
   exportPolicy?: ExportRelationshipLimits,
+  origin?: RelationshipReadCause,
 ): Generator<void, CodexDispatchScan> {
   const fd = fs.openSync(file, 'r');
   try {
@@ -4198,6 +4202,9 @@ function* codexDispatchSteps(
           : (meterReadWork('cursorCopies'), structuredClone(previous))
         : null;
     const reader = new RelationshipReader(fd, file, budget, cancelled, meter, !Number.isFinite(budget));
+    reader.agent = 'codex';
+    reader.cause = origin ?? (previous ? 'resumed' : 'noEntry');
+    reader.growthFrom = previous?.evidence?.provisional.size ?? Infinity;
     const stat = reader.stamp;
     let qualification: 'match' | 'pending' | 'reset' =
       cursor?.evidence && cursor.parentSessionId === parentSessionId
@@ -4208,11 +4215,12 @@ function* codexDispatchSteps(
       cursor!.mtimeMs = cursor!.evidence!.provisional.mtimeMs;
     }
     if (qualification === 'match' && cursor!.terminalApplied && cursor!.offset < stat.size) {
-      const continuation = reader.read(cursor!.offset, 1, 0, false);
+      const continuation = reader.read(cursor!.offset, 1, 0, false, 'boundary');
       if (!continuation.length) qualification = 'pending';
       else if (continuation[0] !== 10 && continuation[0] !== 13) qualification = 'reset';
     }
     const reset = !!previous && qualification === 'reset';
+    if (reset) reader.cause = 'rejected';
     if (!cursor || qualification === 'reset') {
       cursor = codexDispatchCursor(
         createHash('sha256').update(Buffer.alloc(0)).digest('hex'),
@@ -4237,7 +4245,13 @@ function* codexDispatchSteps(
           cursor.replayThrough ??= cursor.fragmentStart;
           cursor.replayFragment ??= '';
           while (cursor.replayThrough < cursor.offset && reader.available() > 0) {
-            const bytes = reader.read(cursor.replayThrough, cursor.offset - cursor.replayThrough);
+            const bytes = reader.read(
+              cursor.replayThrough,
+              cursor.offset - cursor.replayThrough,
+              undefined,
+              true,
+              'boundary',
+            );
             if (!bytes.length) break;
             cursor.replayFragment = Buffer.concat([Buffer.from(cursor.replayFragment, 'base64'), bytes]).toString(
               'base64',

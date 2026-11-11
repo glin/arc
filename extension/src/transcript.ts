@@ -4802,7 +4802,15 @@ export function extendRelationshipEvidence(evidence: RelationshipDigest, bytes: 
 
 // Every returned filesystem byte enters the request meter before any later operation can fail.
 // `revalidationBytes` is the part of `readBytes` that re-hashes a prefix an earlier scan read.
-export interface RelationshipReadMeter {
+export const RELATIONSHIP_READ_CAUSES = ['noEntry', 'rejected', 'resumed', 'growth', 'validation', 'boundary'] as const;
+export type RelationshipReadCause = (typeof RELATIONSHIP_READ_CAUSES)[number];
+export type RelationshipRejection = 'parser' | 'path' | 'stamp' | 'cursor' | 'state';
+export type RelationshipCauseCounters = Partial<
+  Record<`${AgentKind}Relationship${Capitalize<RelationshipReadCause>}${'Bytes' | 'Sources'}`, number>
+>;
+const relationshipSources = new WeakMap<RelationshipReadMeter, Set<string>>();
+
+export interface RelationshipReadMeter extends RelationshipCauseCounters {
   readBytes: number;
   revalidationBytes?: number;
   size?: number;
@@ -4849,6 +4857,24 @@ export class RelationshipReader {
   private markBytes = 0;
   private checked = 0;
   private advanced = false;
+  cause: RelationshipReadCause = 'noEntry';
+  growthFrom = Infinity;
+  agent: AgentKind = 'claude';
+  private countCause(cause: RelationshipReadCause, bytes: number): void {
+    if (!this.meter || bytes === 0) return;
+    const prefix =
+      `${this.agent}Relationship${cause[0].toUpperCase()}${cause.slice(1)}` as `${AgentKind}Relationship${Capitalize<RelationshipReadCause>}`;
+    const byteKey = `${prefix}Bytes` as const;
+    const sourceKey = `${prefix}Sources` as const;
+    this.meter[byteKey] = (this.meter[byteKey] ?? 0) + bytes;
+    let sources = relationshipSources.get(this.meter);
+    if (!sources) relationshipSources.set(this.meter, (sources = new Set()));
+    const key = `${prefix}:${this.file}`;
+    if (!sources.has(key)) {
+      sources.add(key);
+      this.meter[sourceKey] = (this.meter[sourceKey] ?? 0) + 1;
+    }
+  }
   constructor(
     readonly fd: number,
     readonly file: string,
@@ -4894,7 +4920,7 @@ export class RelationshipReader {
       : 0;
   }
   // The one-byte check after a terminal record passes advances false, so the parsing read that follows it still ignores the deadline.
-  read(at: number, length: number, reserve = RELATIONSHIP_RESERVE_BYTES, advances = true): Buffer {
+  read(at: number, length: number, reserve = RELATIONSHIP_RESERVE_BYTES, advances = true, cause = this.cause): Buffer {
     const size = Math.min(
       length,
       RELATIONSHIP_READ_BYTES,
@@ -4902,12 +4928,17 @@ export class RelationshipReader {
       (this.meter?.size ?? Infinity) - at,
     );
     if (size <= 0) return Buffer.alloc(0);
-    const bytes = this.readAt(at, size);
+    const bytes = this.readAt(at, size, cause);
     if (advances && bytes.length > 0) this.advanced = true;
     return bytes;
   }
-  private readAt(at: number, size: number): Buffer {
+  private readAt(at: number, size: number, cause: RelationshipReadCause): Buffer {
     const count = meterRead(this.file, fs.readSync(this.fd, this.buffer, 0, size, at), at);
+    if (cause === 'resumed' && at + count > this.growthFrom) {
+      const grown = Math.min(count, at + count - this.growthFrom);
+      this.countCause('growth', grown);
+      this.countCause(cause, count - grown);
+    } else this.countCause(cause, count);
     this.readBytes += count;
     if (this.meter) this.meter.readBytes += count;
     this.meter?.onRead?.(this.buffer.subarray(0, count), at);
@@ -4958,7 +4989,7 @@ export class RelationshipReader {
           this.checked = reached;
           return 'pending';
         }
-        const bytes = this.readAt(start, mark.offset - start);
+        const bytes = this.readAt(start, mark.offset - start, 'validation');
         if (this.meter) this.meter.revalidationBytes = (this.meter.revalidationBytes ?? 0) + bytes.length;
         if (!this.stable || bytes.length !== mark.offset - start) {
           this.checked = 0;
@@ -5028,11 +5059,17 @@ export class RelationshipReader {
     while (comparison.digest.offset < comparison.required && !this.grew && this.available() > 0) {
       const remaining = comparison.required - comparison.digest.offset;
       const available = this.available();
-      const allowance =
+      const readLimit =
         remaining < RELATIONSHIP_BLOCK_BYTES && remaining <= available
           ? remaining
           : Math.floor(available / RELATIONSHIP_BLOCK_BYTES) * RELATIONSHIP_BLOCK_BYTES;
-      const bytes = this.read(comparison.digest.offset, Math.min(RELATIONSHIP_READ_BYTES, remaining, allowance));
+      const bytes = this.read(
+        comparison.digest.offset,
+        Math.min(RELATIONSHIP_READ_BYTES, remaining, readLimit),
+        RELATIONSHIP_RESERVE_BYTES,
+        true,
+        'validation',
+      );
       if (this.meter) this.meter.revalidationBytes = (this.meter.revalidationBytes ?? 0) + bytes.length;
       if (!bytes.length) break;
       for (let at = 0; at < bytes.length; at += RELATIONSHIP_BLOCK_BYTES) {
@@ -5110,6 +5147,7 @@ export async function scanClaudeRelationshipQuantum(
   signal?: AbortSignal,
   meter?: RelationshipReadMeter,
   exportPolicy?: ExportRelationshipLimits,
+  origin?: RelationshipReadCause,
 ): Promise<{
   cursor: ClaudeRelationshipCursor;
   references: ClaudeChildSessionReference[];
@@ -5127,6 +5165,8 @@ export async function scanClaudeRelationshipQuantum(
           : (meterReadWork('cursorCopies'), structuredClone(previous))
         : undefined;
     const reader = new RelationshipReader(fd, parent.file, budget, () => signal?.aborted === true, meter);
+    reader.cause = origin ?? (previous ? 'resumed' : 'noEntry');
+    reader.growthFrom = previous?.evidence?.provisional.size ?? Infinity;
     const revision = reader.stamp;
     let qualification: 'match' | 'pending' | 'reset' = 'reset';
     if (
@@ -5144,11 +5184,12 @@ export async function scanClaudeRelationshipQuantum(
     }
     if (qualification === 'match') cursor!.revision = cursor!.evidence!.provisional;
     if (qualification === 'match' && cursor!.terminalApplied && cursor!.offset < revision.size) {
-      const continuation = reader.read(cursor!.offset, 1, 0, false);
+      const continuation = reader.read(cursor!.offset, 1, 0, false, 'boundary');
       if (!continuation.length) qualification = 'pending';
       else if (continuation[0] !== 10 && continuation[0] !== 13) qualification = 'reset';
     }
     const reset = !!previous && qualification === 'reset';
+    if (reset) reader.cause = 'rejected';
     if (!cursor || qualification === 'reset') {
       const state = createClaudeRelationshipReducer(parent).state();
       cursor = {

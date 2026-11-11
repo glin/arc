@@ -1219,6 +1219,7 @@ async function execute(
     if (signal.aborted) return pending();
     // The seeded count reaches the host at once, whatever agent the remaining sources belong to.
     if (completionChanges.size) acknowledge?.(pending(undefined, true));
+    const relationshipRejections = new Set(request.relationshipRejections);
     const requestBytes = Math.min(request.discoveryBytes ?? CODEX_DISPATCH_REQUEST_BYTES, CODEX_DISPATCH_REQUEST_BYTES);
     const quantumBytes = Math.min(request.quantumBytes ?? RELATIONSHIP_QUANTUM_BYTES, RELATIONSHIP_QUANTUM_BYTES);
     const pendingCharge = (entry: ClaudeChildReferenceCacheEntry | undefined) =>
@@ -1283,6 +1284,7 @@ async function execute(
         let cursor: import('./codex').CodexDispatchCursor | undefined;
         let claudeCursor: import('./transcript').ClaudeRelationshipCursor | undefined;
         let reset = !identity || (!!held && !(held.claudeCursor?.evidence ?? held.cursor?.evidence));
+        const origin = held || relationshipRejections.has(key) ? ('rejected' as const) : ('noEntry' as const);
         if (parent.agent === 'codex') {
           const scan = await scanCodexDispatchReferencesAsync(
             parent.file,
@@ -1291,6 +1293,8 @@ async function execute(
             allowance,
             () => signal.aborted,
             charges,
+            undefined,
+            identity && held?.cursor ? undefined : origin,
           );
           cursor = scan.cursor;
           complete = scan.complete;
@@ -1320,6 +1324,8 @@ async function execute(
             allowance,
             signal,
             charges,
+            undefined,
+            identity && held?.claudeCursor ? undefined : origin,
           );
           claudeCursor = scan.cursor;
           complete = scan.complete;

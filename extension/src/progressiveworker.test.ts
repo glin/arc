@@ -150,6 +150,14 @@ test.each(['claude', 'codex'] as const)(
                 'Receipt reads exceeded the remaining request allowance',
               );
               assert.ok((result.value.charges.receiptBytes ?? 0) <= result.value.charges.readBytes);
+              let relationshipBytes = 0;
+              for (const agent of ['claude', 'codex'] as const)
+                for (const cause of ['NoEntry', 'Rejected', 'Resumed', 'Growth', 'Validation', 'Boundary'] as const)
+                  relationshipBytes += result.value.charges[`${agent}Relationship${cause}Bytes`] ?? 0;
+              assert.equal(
+                relationshipBytes,
+                result.value.charges.readBytes - (result.value.charges.receiptBytes ?? 0),
+              );
               // An incomplete pass names the one read whose limit ended it, and a pass that reaches the dispatched window names none.
               assert.equal(
                 result.value.charges.transcriptPassEnds +
@@ -17882,3 +17890,85 @@ test('each admitted name appends one opening', async () => {
     harness.backfill.dispose();
   }
 });
+
+test('relationship second activation above the save cap counts only omitted source bytes', async () => {
+  vi.spyOn(performance, 'now').mockReturnValue(0);
+  const { scanClaudeRelationshipQuantum } = await import('./transcript.ts');
+  const { MAX_CLAUDE_CHILD_REFERENCE_FILES } = await import('./derivedcache.ts');
+  const root = tempDir('relationship-cap-activation-');
+  const cache = path.join(root, 'cache.json');
+  const entries: Array<[string, import('./derivedcache').ClaudeChildReferenceCacheEntry]> = [];
+  const parents = [];
+  const budget = 65536;
+  for (let index = 0; index < MAX_CLAUDE_CHILD_REFERENCE_FILES + 2; index++) {
+    const file = path.join(root, `${String(index).padStart(5, '0')}.jsonl`);
+    const agent = index % 2 === 0 ? ('claude' as const) : ('codex' as const);
+    fs.writeFileSync(file, '{"type":"ignored"}\n');
+    const scan =
+      agent === 'claude'
+        ? await scanClaudeRelationshipQuantum({ file, sessionId: String(index) }, undefined, budget)
+        : scanCodexDispatchReferences(file, String(index), null, budget);
+    assert.equal(scan.complete, true);
+    const stat = revisionOf(fs.statSync(file, { bigint: true }));
+    parents.push({ file, sessionId: String(index), agent, ...stat });
+    entries.push([
+      normalizeFsPath(file),
+      {
+        parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
+        source: agent,
+        sessionId: String(index),
+        childTranscript: false,
+        references: [],
+        complete: true,
+        ...stat,
+        ...(agent === 'claude'
+          ? { claudeCursor: scan.cursor as import('./transcript').ClaudeRelationshipCursor }
+          : { cursor: scan.cursor as import('./codex').CodexDispatchCursor }),
+      },
+    ]);
+  }
+  let dropped = { claude: 0, codex: 0 };
+  saveDerivedCache(
+    cache,
+    [],
+    entries,
+    [],
+    undefined,
+    undefined,
+    [],
+    undefined,
+    undefined,
+    [],
+    [],
+    undefined,
+    (counts) => {
+      dropped = counts;
+    },
+  );
+  assert.deepEqual(dropped, { claude: 1, codex: 1 });
+  const restored = [...loadDerivedCache(cache).claudeChildReferences];
+  const worker = new ProgressiveWorker('performance.now=()=>0;' + source);
+  try {
+    const result = await completeDiscovery(
+      worker,
+      { kind: 'claude-children', parents, repositoryRoots: [root], referenceEntries: restored, discoveryBytes: budget },
+      1,
+      new AbortController().signal,
+    );
+    assert.ok(result?.value.kind === 'claude-children');
+    const charges = result.value.charges!;
+    assert.equal(charges.readBytes - (charges.receiptBytes ?? 0), 38);
+    assert.equal(charges.claudeRelationshipNoEntryBytes, 19);
+    assert.equal(charges.codexRelationshipNoEntryBytes, 19);
+    assert.equal(charges.claudeRelationshipNoEntrySources, 1);
+    assert.equal(charges.codexRelationshipNoEntrySources, 1);
+    let sum = 0;
+    for (const agent of ['claude', 'codex'] as const)
+      for (const cause of ['NoEntry', 'Rejected', 'Resumed', 'Growth', 'Validation', 'Boundary'] as const)
+        sum += charges[`${agent}Relationship${cause}Bytes`] ?? 0;
+    assert.equal(sum, charges.readBytes - (charges.receiptBytes ?? 0));
+    console.log('cap second activation', JSON.stringify({ sources: parents.length, dropped, relationshipBytes: sum }));
+  } finally {
+    worker.stop();
+  }
+}, 240000);

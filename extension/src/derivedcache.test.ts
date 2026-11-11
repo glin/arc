@@ -4024,3 +4024,44 @@ test('a source set past the saved limit removes the saved file, so the next star
   });
   assert.deepEqual(loadSavedSpendSources(file), {}, 'a set past the limit left the older set in place');
 });
+
+test('relationship load rejection names the provider and parser path stamp cursor or state', async () => {
+  vi.spyOn(performance, 'now').mockReturnValue(0);
+  const root = folder();
+  const cache = path.join(root, 'cache.json');
+  for (const agent of ['claude', 'codex'] as const) {
+    const file = path.join(root, `${agent}.jsonl`);
+    fs.writeFileSync(file, '{"type":"ignored"}\n');
+    const scan =
+      agent === 'claude'
+        ? await scanClaudeRelationshipQuantum({ file, sessionId: 'parent' }, undefined, 65536)
+        : await scanCodexDispatchReferencesAsync(file, 'parent', null, 65536);
+    const entry = {
+      parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
+      source: agent,
+      sessionId: 'parent',
+      childTranscript: false,
+      references: [],
+      complete: true,
+      ...revisionOf(fs.statSync(file, { bigint: true })),
+      ...(agent === 'claude' ? { claudeCursor: scan.cursor } : { cursor: scan.cursor }),
+    };
+    saveDerivedCache(cache, [], [[file, entry as ClaudeChildReferenceCacheEntry]]);
+    const saved = JSON.parse(fs.readFileSync(cache, 'utf8'));
+    for (const [reason, row] of [
+      ['parser', { file, entry: { ...entry, parserVersion: 0 } }],
+      ['path', { file: '', entry }],
+      ['stamp', { file, entry: { ...entry, size: -1 } }],
+      ['cursor', { file, entry: { ...entry, [agent === 'claude' ? 'claudeCursor' : 'cursor']: {} } }],
+      ['state', { file, entry: { ...entry, references: null } }],
+      ['state', { file, entry: { ...entry, source: 'unknown' } }],
+    ] as const) {
+      fs.writeFileSync(cache, JSON.stringify({ ...saved, claudeChildReferences: [row] }));
+      const loaded = loadDerivedCache(cache);
+      assert.equal(loaded.claudeChildReferences.size, 0);
+      const provider = row.entry.source === 'unknown' ? 'unknown' : agent;
+      assert.deepEqual(loaded.reuse?.relationshipRejected, { [`${provider}:${reason}`]: 1 });
+      if (reason !== 'path') assert.equal(loaded.relationshipRejections?.get(normalizeFsPath(file)), reason);
+    }
+  }
+});
