@@ -26,7 +26,7 @@ Selection holds the newest card snapshot until release. Retrying held cards must
 
 `webview/row-deltas.ts` owns row encoding and reconstruction. [Performance diagnostics](performance.md#diagnostic-implementation) describes retained row comparisons and payload reuse. Other fields travel complete.
 
-Closing a panel drops complete session list payloads that no remaining panel uses. Closing the last panel or disposing the provider clears them.
+The host retains catalog rows, per-panel session rows, and session list payloads by selected session. A publication removes departed entries from its row caches. Selection changes drop payloads that no panel uses. Closing a panel releases its row projections and sender. Closing the last panel or disposing the provider clears the shared row caches.
 
 The query context travels in its own `queryContext` message. It carries the scoped catalog identities, discovery coverage, and scope roots that session queries resolve against. Its revision is a SHA-256 digest of three sets: the membership that discovery proved, the catalog membership, and the unarchived pinned or labelled sessions. A change to any set changes the revision. The third set follows pins and labels, which change the panel answer to `is:agentrun`. The host posts it to a ready panel when the context that panel last accepted differs. Page readiness and a failed post clear what the panel accepted, so the next publication posts the context again. Each render, selection, session list, and loading post publishes the context first and never carries it. The panel applies the last context it received to every later draw. A changed context redraws the session list and refreshes content search, and it draws nothing else.
 

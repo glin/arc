@@ -67,7 +67,7 @@ Paths are relative to `extension/src/`. [Architecture](architecture.md) owns pac
 | `webview/text-field.ts` | Shared single-line text box with a clear button | no |
 | `webview/protocol.ts` | The message contract both sides read: one union and one parser for each direction, and a dispatcher that names every message | no |
 | `webview/panel-usage-metrics.ts` | The page's share of panel usage metrics: consumed key chords, View menu choices, committed queries, and their throttled post to the host | no |
-| `webview/row-deltas.ts` | Session row deltas in render and session list messages: exact JSON text comparisons and order edits for each panel on the host, held rows and revision checks in the panel | no |
+| `webview/row-deltas.ts` | Session row deltas in render and session list messages: exact JSON text comparisons, immutable row text reuse and order edits for each panel on the host, held rows and revision checks in the panel | no |
 | `webview/retained-visibility.ts` | Retained-page opacity, revision and observation generations, viewport observation, resize invalidation, paint-boundary release, and retained focus | no |
 | `panelvisibility.ts` | Per-panel visibility revisions and lifetime cleanup | no |
 | `panelusage.ts` | Panel usage metrics: the counts, the message types it skips, one daily file for each window, repeated query checks across tabs, the query limit, the count key limit, throttled writes, the retry of a failed write, and day-folder expiry | no |
@@ -77,7 +77,7 @@ Paths are relative to `extension/src/`. [Architecture](architecture.md) owns pac
 | `panelbundle.ts` | Builds the compact browser program and stylesheet for the host build and page fixture | no |
 | `paneldevelopment.ts` | Validates the loopback development origin and component updates, then builds production or development panel HTML and CSP | no |
 | `paneltext.ts` | Replaces named panel tokens with values prepared by tested modules | no |
-| `payload.ts` | Shapes the render, selection, and session list messages the extension posts, and weighs a message by field, by session list row, and by repeated long string | no |
+| `payload.ts` | Shapes the render, selection, and session list messages, retains row projections against per-session inputs, and weighs messages by field, session list row, and repeated long string | no |
 | `richtext.ts` | Safe block and noninteractive inline Markdown, named response session anchors, literal file citations, validated disclosure structure, host-only content references, local picture rules, and fallback text | no |
 | `uris.ts` | Read-only URI schemes used by diff editors | yes |
 | `externalopen.ts` | Binary-document eligibility for external opening, executable and text exclusions, and bounded regular-file sampling | no |
