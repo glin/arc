@@ -287,14 +287,24 @@ export interface DiscoveryCharges
   receiptLaunchesRejectedAtRequester?: number;
   // The event-loop turns that the receipt scan took.
   receiptScanTurns?: number;
-  // Each receipt scan that opened in the request, split by why the worker's previous scan closed. A scan with no earlier
-  // scan in its worker counts as a new worker.
+  // Each receipt scan that opened at the first store entry in the request, split by why the worker's previous scan closed.
+  // A scan with no earlier scan in its worker counts as a new worker. A scan after a completed scan also counts the first
+  // reason that it could not reuse the completed scan.
   receiptScanOpens?: number;
   receiptScanOpensNewWorker?: number;
   receiptScanOpensAfterEpoch?: number;
   receiptScanOpensAfterStore?: number;
   receiptScanOpensAfterRefusal?: number;
   receiptScanOpensAfterCompletion?: number;
+  receiptScanOpensAfterCompletionStore?: number;
+  receiptScanOpensAfterCompletionAge?: number;
+  receiptScanOpensAfterCompletionUnproved?: number;
+  receiptScanOpensAfterCompletionRevision?: number;
+  // Each receipt scan that reused a completed scan, and the launches that such scans read again. The unlinked launches are
+  // the part that ended without a link in the completed scan.
+  receiptScanReuses?: number;
+  receiptScanReuseLaunches?: number;
+  receiptScanReuseLaunchesUnlinked?: number;
   // A complete reply that leaves membership unsettled counts each branch that asked for another pass. The worker skips the
   // unread check once another branch asked.
   unsettledUnfinishedSources?: number;

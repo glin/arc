@@ -282,6 +282,12 @@ export interface DispatchRelationshipStep extends DispatchRelationshipAllowance 
   // The final step of one launch names it. Identities are present when its read reached a catalog lookup.
   launchId?: string;
   identities?: DispatchRelationshipIdentities;
+  // The dispatched transcript of a found reference, with the revision that its opening check read.
+  startup?: DispatchStartupRevision;
+}
+export interface DispatchStartupRevision {
+  file: string;
+  revision: string;
 }
 
 type RelationshipScan<T> = Generator<DispatchRelationshipStep, T, DispatchRelationshipAllowance>;
@@ -299,6 +305,12 @@ function relationshipRevision(stat: fs.BigIntStats | null): string | null {
     ? `${stat.dev}:${stat.ino}:directory`
     : `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
 }
+// The device, inode, size, modification time and change time of a dispatched transcript, in the form of the revision that
+// its opening check read, or null when the path holds nothing. A link or another failure to stat it never matches.
+export function dispatchStartupRevision(file: string): string | null {
+  const stat = fs.lstatSync(file, { bigint: true, throwIfNoEntry: false });
+  return stat?.isFile() ? relationshipRevision(stat) : null;
+}
 const emptyRelationshipStep = (): DispatchRelationshipStep => ({ entries: 0, bytes: 0, checks: 0 });
 
 // Each next call grants one filesystem operation. Zero grants preserve its position.
@@ -306,6 +318,7 @@ class RelationshipReader {
   progress = emptyRelationshipStep();
   refusal: { error: unknown } | null = null;
   identities?: DispatchRelationshipIdentities;
+  startup?: DispatchStartupRevision;
   readonly revisions = new Map<string, string | null>();
   readonly digests = new Map<string, string>();
   private readonly descriptors = new Set<number>();
@@ -527,6 +540,7 @@ export class DispatchReceipts {
         launchId: id,
         ...(reader.identities ? { identities: reader.identities } : {}),
         ...(reference ? { reference } : {}),
+        ...(reference && reader.startup ? { startup: reader.startup } : {}),
       };
       reader.progress = emptyRelationshipStep();
       return reference;
@@ -764,6 +778,8 @@ export class DispatchReceipts {
     )
       return null;
     if (cwdPresent) this.verifiedRelationships.set(id, verification);
+    const opened = reader.revisions.get(startup.file);
+    if (opened) reader.startup = { file: startup.file, revision: opened };
     return {
       kind: 'dispatch',
       agent: options.provider,

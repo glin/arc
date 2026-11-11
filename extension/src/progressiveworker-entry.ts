@@ -136,7 +136,7 @@ import {
   validDiscoveryCheckpoint,
 } from './progressiveworker';
 import { TURN_QUIET_MS, statusOf } from './turncard';
-import { DispatchReceipts } from './dispatchreceipts';
+import { DispatchReceipts, dispatchStartupRevision, type DispatchStartupRevision } from './dispatchreceipts';
 import { admittedDispatchReferences } from './turnrail';
 import {
   CompressedStoreFollower,
@@ -288,8 +288,21 @@ interface ReceiptScan {
   storeRevision: string | undefined;
   // True after a refused read.
   unproved: boolean;
+  // Each launch that a step named, with or without a link.
+  visited: Set<string>;
+  // The dispatched transcript of each linked launch, with the revision of its opening check.
+  startups: Map<string, DispatchStartupRevision>;
+  // When the scan that last read the store from its first entry opened. A reused scan keeps the time of the scan it reused.
+  fullAt: number;
+  // The launches that the startup checks sent to be read again since the last step was counted.
+  rereads: number;
 }
 let receiptScan: ReceiptScan | null = null;
+// A completed scan answers a new epoch only within the full pass age bound of the host's walk gate, from the opening of the
+// scan that last read the store from its first entry.
+const RECEIPT_SCAN_REUSE_MAX_AGE_MS = 10 * 60_000;
+// The last completed receipt scan, which the next epoch reuses when the store proves that it did not change.
+let keptReceiptScan: ReceiptScan | null = null;
 // Why the last receipt scan of this worker closed. The next scan counts it when it opens.
 let receiptScanClosed: 'epoch' | 'store' | 'refusal' | 'completion' | undefined;
 const RECEIPT_SCAN_OPEN_CHARGES = {
@@ -298,20 +311,46 @@ const RECEIPT_SCAN_OPEN_CHARGES = {
   refusal: 'receiptScanOpensAfterRefusal',
   completion: 'receiptScanOpensAfterCompletion',
 } as const;
+// Why a completed scan cannot answer the next epoch, in the order that the gate checks.
+const KEPT_SCAN_REFUSAL_CHARGES = {
+  store: 'receiptScanOpensAfterCompletionStore',
+  age: 'receiptScanOpensAfterCompletionAge',
+  unproved: 'receiptScanOpensAfterCompletionUnproved',
+  revision: 'receiptScanOpensAfterCompletionRevision',
+} as const;
+type ReceiptOpenCharge =
+  | 'receiptScanOpens'
+  | 'receiptScanOpensNewWorker'
+  | 'receiptScanReuses'
+  | (typeof RECEIPT_SCAN_OPEN_CHARGES)[keyof typeof RECEIPT_SCAN_OPEN_CHARGES]
+  | (typeof KEPT_SCAN_REFUSAL_CHARGES)[keyof typeof KEPT_SCAN_REFUSAL_CHARGES];
 // Receipt scans and receipt work that no reply counted yet, by the repository roots of the request that did them. The worker
 // counts them in its next reply to an uncancelled discovery request for the same roots, so a scan that opened in a cancelled
 // request and the launches and turns of that request still count, and no other roots receive them.
 interface HeldReceiptCounts {
-  opens: Array<
-    (typeof RECEIPT_SCAN_OPEN_CHARGES)[keyof typeof RECEIPT_SCAN_OPEN_CHARGES] | 'receiptScanOpensNewWorker'
-  >;
-  work: { receiptLaunchesRead: number; receiptLaunchesRejectedAtRequester: number; receiptScanTurns: number };
+  opens: ReceiptOpenCharge[];
+  work: {
+    receiptLaunchesRead: number;
+    receiptLaunchesRejectedAtRequester: number;
+    receiptScanTurns: number;
+    receiptScanReuseLaunches: number;
+    receiptScanReuseLaunchesUnlinked: number;
+  };
 }
 const heldReceiptCounts = new Map<string, HeldReceiptCounts>();
 function heldReceiptCountsFor(scope: string): HeldReceiptCounts {
   let held = heldReceiptCounts.get(scope);
   if (!held) {
-    held = { opens: [], work: { receiptLaunchesRead: 0, receiptLaunchesRejectedAtRequester: 0, receiptScanTurns: 0 } };
+    held = {
+      opens: [],
+      work: {
+        receiptLaunchesRead: 0,
+        receiptLaunchesRejectedAtRequester: 0,
+        receiptScanTurns: 0,
+        receiptScanReuseLaunches: 0,
+        receiptScanReuseLaunchesUnlinked: 0,
+      },
+    };
     heldReceiptCounts.set(scope, held);
   }
   return held;
@@ -324,10 +363,7 @@ function recordHeldReceiptCounts(charges: DiscoveryCharges, scope: string): void
   const held = heldReceiptCounts.get(scope);
   if (!held) return;
   heldReceiptCounts.delete(scope);
-  for (const cause of held.opens) {
-    charges.receiptScanOpens!++;
-    charges[cause]!++;
-  }
+  for (const key of held.opens) charges[key] = (charges[key] ?? 0) + 1;
   for (const key of Object.keys(held.work) as Array<keyof HeldReceiptCounts['work']>) charges[key]! += held.work[key];
 }
 function closeReceiptScan(cause: 'epoch' | 'store' | 'refusal'): void {
@@ -336,6 +372,71 @@ function closeReceiptScan(cause: 'epoch' | 'store' | 'refusal'): void {
   receiptScan?.steps.return(undefined);
   receiptScan?.retry?.return(null);
   receiptScan = null;
+  keptReceiptScan = null;
+}
+// The first reason that a completed scan cannot answer a new epoch, or undefined when it can. The store must keep its
+// identity and prove the revision that the completed scan read, and the scan that read the store must be within the age bound.
+function keptScanRefusal(kept: ReceiptScan): keyof typeof KEPT_SCAN_REFUSAL_CHARGES | undefined {
+  if (kept.store.storeIdentity() !== kept.storeIdentity) return 'store';
+  if (Date.now() - kept.fullAt > RECEIPT_SCAN_REUSE_MAX_AGE_MS) return 'age';
+  if (kept.storeRevision === undefined || kept.unproved) return 'unproved';
+  const revision = kept.store.storeRevision();
+  if (revision === undefined) return 'unproved';
+  return revision === kept.storeRevision ? undefined : 'revision';
+}
+// A scan for a new epoch from a completed scan. It reads again each launch that ended without a link and each launch whose
+// requester or dispatched session changed catalog rows. Its steps then check the dispatched transcript of each other link.
+function reusedReceiptScan(kept: ReceiptScan, epoch: DiscoveryCheckpoint, charges: DiscoveryCharges): ReceiptScan {
+  const changed = changedCatalogIdentities(kept.catalog, epoch.catalog);
+  const retries: string[] = [];
+  for (const launchId of kept.visited) {
+    const unlinked = !kept.references.has(launchId);
+    if (!unlinked && !kept.launches.get(launchId)?.some((identity) => changed.has(identity))) continue;
+    kept.launches.delete(launchId);
+    kept.references.delete(launchId);
+    kept.startups.delete(launchId);
+    retries.push(launchId);
+    charges.receiptScanReuseLaunches!++;
+    if (unlinked) charges.receiptScanReuseLaunchesUnlinked!++;
+  }
+  const scan: ReceiptScan = {
+    ...kept,
+    epoch: epoch.epoch,
+    catalog: epoch.catalog,
+    controller: new AbortController(),
+    steps: keptStartupChecks(() => scan),
+    retries,
+    retry: null,
+    storeRead: false,
+    competitionRefused: false,
+    unproved: false,
+    rereads: 0,
+  };
+  return scan;
+}
+// The steps of a reused scan. The first step reads nothing. Each later step stats the dispatched transcript of one link. A
+// transcript whose device, inode, size or times differ from its opening check, or that cannot be read, sends its launch to be
+// read again, so the read checks the opening again.
+function* keptStartupChecks(current: () => ReceiptScan): ReceiptScan['steps'] {
+  yield { entries: 0, bytes: 0, checks: 0 };
+  const scan = current();
+  for (const [launchId, startup] of [...scan.startups]) {
+    if (!scan.references.has(launchId)) continue;
+    let moved: boolean;
+    try {
+      moved = dispatchStartupRevision(startup.file) !== startup.revision;
+    } catch {
+      moved = true;
+    }
+    if (moved) {
+      scan.launches.delete(launchId);
+      scan.references.delete(launchId);
+      scan.startups.delete(launchId);
+      scan.retries.push(launchId);
+      scan.rereads++;
+    }
+    yield { entries: 0, bytes: 0, checks: 1 };
+  }
 }
 const catalogIdentity = (agent: string, sessionId: string) => JSON.stringify([agent, sessionId]);
 const catalogRowPlace = (row: SessionFile) => `${normalizeFsPath(row.file)}|${row.childTranscript === true}`;
@@ -948,6 +1049,7 @@ async function execute(
           if (!identities.some((identity) => changed.has(identity))) continue;
           receiptScan.launches.delete(launchId);
           receiptScan.references.delete(launchId);
+          receiptScan.startups.delete(launchId);
           receiptScan.retries.push(launchId);
         }
         receiptScan.catalog = catalog;
@@ -1515,29 +1617,46 @@ async function execute(
     // A replaced store directory starts the scan again from its first entry, here and before publication. Other store changes
     // keep the scan's position.
     if (receiptScan && receiptScan.store.storeIdentity() !== receiptScan.storeIdentity) closeReceiptScan('store');
+    // The scan of a new epoch reuses the last completed scan when the store proves that it did not change. Otherwise it reads
+    // the store from its first entry.
     if (!receiptScan) {
-      heldReceiptCountsFor(scope).opens.push(
-        receiptScanClosed ? RECEIPT_SCAN_OPEN_CHARGES[receiptScanClosed] : 'receiptScanOpensNewWorker',
-      );
-      const controller = new AbortController();
-      const store = new DispatchReceipts();
-      const scan: ReceiptScan = {
-        storeIdentity: store.storeIdentity(),
-        storeRevision: store.storeRevision(),
-        unproved: false,
-        epoch: epoch.epoch,
-        store,
-        controller,
-        catalog: epoch.catalog,
-        steps: store.relationships(() => scan.catalog, controller.signal),
-        launches: new Map(),
-        references: new Map(),
-        retries: [],
-        retry: null,
-        storeRead: false,
-        competitionRefused: false,
-      };
-      receiptScan = scan;
+      const kept = keptReceiptScan;
+      keptReceiptScan = null;
+      const refusal = kept ? keptScanRefusal(kept) : undefined;
+      const opens = heldReceiptCountsFor(scope).opens;
+      if (kept && !refusal) {
+        opens.push('receiptScanReuses');
+        receiptScan = reusedReceiptScan(kept, epoch, charges);
+      } else {
+        opens.push(
+          'receiptScanOpens',
+          receiptScanClosed ? RECEIPT_SCAN_OPEN_CHARGES[receiptScanClosed] : 'receiptScanOpensNewWorker',
+        );
+        if (refusal) opens.push(KEPT_SCAN_REFUSAL_CHARGES[refusal]);
+        const controller = new AbortController();
+        const store = new DispatchReceipts();
+        const scan: ReceiptScan = {
+          storeIdentity: store.storeIdentity(),
+          storeRevision: store.storeRevision(),
+          unproved: false,
+          epoch: epoch.epoch,
+          store,
+          controller,
+          catalog: epoch.catalog,
+          steps: store.relationships(() => scan.catalog, controller.signal),
+          launches: new Map(),
+          references: new Map(),
+          retries: [],
+          retry: null,
+          storeRead: false,
+          competitionRefused: false,
+          visited: new Set(),
+          startups: new Map(),
+          fullAt: Date.now(),
+          rereads: 0,
+        };
+        receiptScan = scan;
+      }
     }
     const activeReceipts = receiptScan;
     // A receipt slice changes no reference entry. When this request sent no earlier reply and the host's checkpoint is the
@@ -1634,10 +1753,15 @@ async function execute(
       charges.receiptChecks! += step.value.checks;
       charges.receiptBytes! += step.value.bytes;
       charges.readBytes += step.value.bytes;
+      charges.receiptScanReuseLaunches! += activeReceipts.rereads;
+      activeReceipts.rereads = 0;
       const launchId = step.value.launchId;
       if (launchId !== undefined) {
         const identities = step.value.identities;
+        activeReceipts.visited.add(launchId);
         activeReceipts.references.delete(launchId);
+        activeReceipts.startups.delete(launchId);
+        if (step.value.startup) activeReceipts.startups.set(launchId, step.value.startup);
         if (identities?.child) charges.receiptLaunchesRead!++;
         else if (identities) charges.receiptLaunchesRejectedAtRequester!++;
         if (identities)
@@ -1685,6 +1809,7 @@ async function execute(
     discoveryEpoch = null;
     epochParentKeys = null;
     receiptScan = null;
+    keptReceiptScan = activeReceipts;
     receiptScanClosed = 'completion';
     const references = [...transcriptReferences, ...activeReceipts.references.values()];
     const admittedReferences = admittedDispatchReferences(references, found.children, request.codexChildren);
@@ -2120,6 +2245,13 @@ function emptyDiscoveryCharges(): DiscoveryCharges {
     receiptScanOpensAfterStore: 0,
     receiptScanOpensAfterRefusal: 0,
     receiptScanOpensAfterCompletion: 0,
+    receiptScanOpensAfterCompletionStore: 0,
+    receiptScanOpensAfterCompletionAge: 0,
+    receiptScanOpensAfterCompletionUnproved: 0,
+    receiptScanOpensAfterCompletionRevision: 0,
+    receiptScanReuses: 0,
+    receiptScanReuseLaunches: 0,
+    receiptScanReuseLaunchesUnlinked: 0,
     unsettledUnfinishedSources: 0,
     unsettledDeferredSources: 0,
     unsettledUnreadSources: 0,
