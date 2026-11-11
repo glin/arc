@@ -3145,6 +3145,7 @@ function harness(pendingRefresh = false, registerRefreshHandler = true, extraMet
     'indexSessionRows',
     'indexRailOrder',
     'childSourcesFor',
+    'childParents',
     'switchedSessions',
     'selectionScope',
     'selectionDraftsKey',
@@ -3155,6 +3156,9 @@ function harness(pendingRefresh = false, registerRefreshHandler = true, extraMet
     'recordSelectionBasis',
     'advanceSelectionBasis',
     'moveRailGroups',
+    'noteRailInstant',
+    'noteRailMark',
+    'ownSessionCount',
     'claimCatalogRefresh',
     'releaseCatalogRefresh',
     'drainCompressedRows',
@@ -3420,6 +3424,9 @@ function completeDiscoveryHarness(
     'recordSelectionBasis',
     'advanceSelectionBasis',
     'moveRailGroups',
+    'noteRailInstant',
+    'noteRailMark',
+    'ownSessionCount',
     'claimCatalogRefresh',
     'releaseCatalogRefresh',
     'drainCompressedRows',
@@ -3533,7 +3540,14 @@ function completeDiscoveryHarness(
     'armCompressedFollow',
     'followCompressedFacts',
   );
-  names.push('compressedSpendPick', 'titleEntryOf', 'compressedTitleOf', 'compressedCarriedNameOf', 'childSourcesFor');
+  names.push(
+    'compressedSpendPick',
+    'titleEntryOf',
+    'compressedTitleOf',
+    'compressedCarriedNameOf',
+    'childSourcesFor',
+    'childParents',
+  );
   if (names.includes('allSessions') || names.includes('runPendingWatch')) names.push('currentWalkedCatalog');
   if (names.includes('runPendingWatch')) names.push('grownMemberMiss');
   if (names.includes('prepareClaudeChildren')) names.push('startedSources', 'applyDispatchFacts');
@@ -3666,6 +3680,8 @@ function completeDiscoveryHarness(
       // The dispatched-source answers a drawn rail keeps. A test that reads real figures replaces this.
       lifetimeFigures = { answers: () => new Map(), pendingMoved: () => false };
       lifetimeFiguresBySession() { return this.heldLifetime; }
+      // The lifetime rail facts stay empty unless a test supplies them.
+      lifetimeRailFacts() { return this.heldRailFacts ??= {}; }
       // The inputs as the host gathers them: printed values built afresh, and the rows and
       // figures held by identity.
       railInputFor(counts, statuses) {
@@ -4120,6 +4136,7 @@ function selectedWindowHarness(
     'refreshFrom',
     'refreshAs',
     'sessionRowOf',
+    'noteRailInstant',
     'claimCatalogRefresh',
     'releaseCatalogRefresh',
     'drainCompressedRows',
@@ -20198,6 +20215,22 @@ function switchHarness(count: number, scope: Record<string, unknown> = {}): any 
   provider.drawnDispatchFiguresRevision = 0;
   provider.progressiveCurrent = () => true;
   provider.scheduleProjectSpendIndex = () => {};
+  provider.ownCwdForSession = () => null;
+  // The work time of every child transcript, which a step moves to make a closed child live again.
+  provider.childWorkAt = 0;
+  provider.claudeChildWork = { read: () => provider.childWorkAt };
+  // A metadata read replaces each entry that has no folded label, as a read of a grown transcript does.
+  provider.prepareMetadata = async (sessions: any[]) => {
+    for (const session of sessions) {
+      const held = provider.titles.get(session.file);
+      if (held && held.foldedLabel === undefined)
+        provider.storeTitleEntry(session.file, { ...held, foldedLabel: 'read', label: 'Read ' + session.sessionId });
+    }
+    return true;
+  };
+  // The refresh that the last selection requested, which a step waits for.
+  const refreshAs = provider.refreshAs.bind(provider);
+  provider.refreshAs = (...args: any[]) => (provider.lastRefresh = refreshAs(...args));
   provider.hosts = [];
   provider.readyHosts = new Set();
   provider.sendToHost = (host: any, message: unknown) => host.webview.postMessage(message);
@@ -20268,6 +20301,7 @@ test(
   async () => {
     const start = new Date(2026, 0, 15, 18, 0).getTime();
     const clock = vi.spyOn(Date, 'now').mockReturnValue(start);
+    const zone = process.env.TZ;
     let outcomeInputs = 0;
     const sides = [
       switchHarness(2000, {
@@ -20327,9 +20361,21 @@ test(
         for (const panel of side.panels) delete panel.replacing;
       }
     };
+    for (const side of sides) {
+      if (!side.reference) continue;
+      const refreshAs = side.provider.refreshAs;
+      side.provider.refreshAs = (...args: any[]) =>
+        (side.provider.lastRefresh = args[5] ? settle(side) : refreshAs(...args));
+    }
+    // A panel other than the first selects through the production selection of a panel.
     const select = async (side: Side, panel: SwitchPanel, session: string | null) => {
-      choose(side, panel, session);
-      await settle(side);
+      if (panel === side.panels[0] || !session) {
+        choose(side, panel, session);
+        await settle(side);
+        return;
+      }
+      side.provider.show(session, panel.host);
+      await side.provider.lastRefresh;
     };
     const createDraft = (side: Side) => {
       const draftId = 'draft:' + drafts;
@@ -20351,7 +20397,7 @@ test(
     // Each step runs on both sides with the same arguments.
     const steps: Record<
       string,
-      (side: Side, pick: { session: string; other: string; panel: number; codex: number }) => Promise<void>
+      (side: Side, pick: { session: string; other: string; panel: number; codex: number }) => Promise<unknown>
     > = {
       switch: (side, pick) => select(side, side.panels[pick.panel % side.panels.length], pick.session),
       'fast-switches': async (side, pick) => {
@@ -20432,6 +20478,76 @@ test(
         };
         await select(side, side.panels[0], pick.session);
         await provider.refresh(false, true);
+        provider.postRail(true, 'step');
+      },
+      // Spend records move the lifetime outcome of a session outside the scope, which runs and then ends before a post.
+      'lifetime-facts': async (side, pick) => {
+        const { provider } = side;
+        const turn = (finished: boolean) => ({
+          outcome: {
+            startedAt: Date.now() - 2000,
+            endedAt: Date.now() - 1000,
+            finished,
+            error: false,
+            interrupted: false,
+          },
+          newestTurnStartedAt: Date.now() - 2000,
+        });
+        provider.lifetimeFacts = { ...provider.lifetimeFacts, [pick.other]: turn(false) };
+        await select(side, side.panels[0], pick.session);
+        provider.lifetimeFacts = { ...provider.lifetimeFacts, [pick.other]: turn(true) };
+        provider.postRail(true, 'step');
+      },
+      // Discovery waits for members, which moves the agent-run answer of every row that is not dispatched.
+      'dispatch-state': async (side, pick) => {
+        const { provider } = side;
+        provider.dispatchDiscoveryPending = true;
+        await provider.refresh(false, true);
+        await select(side, side.panels[0], pick.session);
+        provider.postRail(true, 'step');
+        provider.dispatchDiscoveryPending = false;
+      },
+      // A closed child of an inactive parent writes again, and then stops before a post.
+      'resumed-child': async (side, pick) => {
+        const { provider } = side;
+        const parent = 'switch-' + 2 * (pick.codex + 1);
+        const title = titleOf(side, parent);
+        provider.storeTitleEntry(title.file, {
+          ...title,
+          outcome: {
+            ...title.outcome,
+            finished: true,
+            closedChildren: [{ id: 'kid', closedAt: Date.now() - 600_000 }],
+          },
+        });
+        provider.claudeChildren = [
+          { parentSessionId: parent, sessionId: 'kid', file: 'kid-' + parent + '.jsonl', mtimeMs: Date.now() },
+        ];
+        provider.childWorkAt = Date.now() - 900_000;
+        await provider.refresh(true, true);
+        provider.childWorkAt = Date.now();
+        await select(side, side.panels[0], pick.session);
+        provider.childWorkAt = Date.now() - 900_000;
+        provider.postRail(true, 'step');
+      },
+      'clock-backward': async (side, pick) => {
+        if (!side.reference) clock.mockReturnValue(Date.now() - 125_000);
+        await select(side, side.panels[0], pick.session);
+        side.provider.postRail(true, 'step');
+      },
+      'time-zone': async (side, pick) => {
+        if (!side.reference) process.env.TZ = process.env.TZ === 'Asia/Tokyo' ? 'America/New_York' : 'Asia/Tokyo';
+        await select(side, side.panels[0], pick.session);
+        side.provider.postRail(true, 'step');
+      },
+      // A checkouts refresh prepares metadata before its render. A session outside the scope holds an unread entry.
+      'checkouts-selection': async (side, pick) => {
+        const { provider } = side;
+        const title = titleOf(side, pick.other);
+        provider.titles.set(title.file, { ...title, foldedLabel: undefined });
+        choose(side, side.panels[0], pick.session);
+        if (side.reference) await settle(side);
+        else await provider.refresh(true, true, false, true);
         provider.postRail(true, 'step');
       },
       'metadata-before-selection': async (side, pick) => {
@@ -20557,6 +20673,15 @@ test(
         await provider.refresh(true, true);
         await select(side, side.panels[0], pick.other);
         provider.postRail(true, 'step');
+        // A session that the reader started from the shared id names the first row of that id as its parent.
+        const parent = provider.partial.find(twin)?.sessionId;
+        if (!parent) return;
+        provider.saved.readerParents = { [pick.session]: parent };
+        await select(side, side.panels[0], pick.session);
+        const named = side.panels[0].state.sessions.find((row: any) => row.id === pick.session)?.parent?.label;
+        const first = provider.sessionRows.find((row: any) => row.id === parent)?.label;
+        if (named !== first) divergent.push(`two-sources: ${side.reference ? 'reference' : 'panel'} parent ${named}`);
+        provider.saved.readerParents = {};
       },
     };
     const divergent: string[] = [];
@@ -20636,10 +20761,30 @@ test(
           }
         }
       }
+      // Two sources with one session id keep every selection complete, so the long run starts without them.
+      for (const side of sides) {
+        side.provider.partial = side.provider.partial.filter((one: any) => one.file !== 'twin.jsonl');
+        side.provider.catalog = { sessions: side.provider.partial };
+        await side.provider.refresh(true, true);
+      }
+      compare('long run catalog');
+      let fullSelections = 0;
+      for (let run = 0; run < 120; run++) {
+        const pick = { session: target(), other: target(), panel: random(2), codex: random(990) };
+        outcomeInputs = 0;
+        for (const side of sides) await steps.switch(side, pick);
+        if (outcomeInputs >= 2000) fullSelections++;
+        count++;
+        compare(`long run ${run}`);
+      }
       assert.deepEqual(divergent, [], 'the selection differs from the reference');
-      assert.ok(outcomeInputs >= 2000, 'no step computed every listed session');
+      assert.ok(
+        fullSelections > 0 && fullSelections < 10,
+        fullSelections + ' selections of the long run were complete',
+      );
     } finally {
       clock.mockRestore();
+      process.env.TZ = zone;
     }
   },
 );
@@ -20664,6 +20809,18 @@ function countedSwitchHarness(count: number): { provider: any; inputs: Record<st
     outcomesFor: (...args: Parameters<typeof outcomesFor>) => {
       add('outcomesFor', args[0].length);
       return outcomesFor(...args);
+    },
+    runningSessions: (...args: Parameters<typeof runningSessions>) => {
+      add('runningSessions', args[0].length);
+      return runningSessions(...args);
+    },
+    runningSessionsSince: (...args: Parameters<typeof runningSessionsSince>) => {
+      add('runningSessionsSince', args[0].length);
+      return runningSessionsSince(...args);
+    },
+    liveBackgroundCommands: (...args: Parameters<typeof liveBackgroundCommands>) => {
+      add('liveBackgroundCommands', args[0].size);
+      return liveBackgroundCommands(...args);
     },
     countedRailInputKey: (input: Parameters<typeof railInputKey>[0], day?: string) => {
       add('railInputKey', input.sessions.length + Object.keys(input.metadataStats).length);
@@ -20717,13 +20874,32 @@ test('a selection that changes only the shown session computes a fixed number of
         provider.partial.map((source: any) => [source.sessionId, source.activity]),
       );
       await provider.refresh(true);
+      const select = async (session: string) => {
+        provider.previousSelection = provider.showing;
+        provider.hostPreviousSessions.set(provider.hosts[0], provider.showing);
+        provider.hostSessions.set(provider.hosts[0], session);
+        provider.showing = session;
+        provider.selectionGeneration++;
+        await provider.refresh(true, true, true, true);
+      };
+      // The first selection after a catalog change indexes the listed sources.
+      await select('switch-2');
+      // A held read failure of a file that left the list makes the selection check the held files.
+      const filesRead = new Set<string>();
+      for (const source of provider.partial) {
+        const file = source.file;
+        Object.defineProperty(source, 'file', {
+          get: () => {
+            filesRead.add(file);
+            return file;
+          },
+        });
+      }
+      provider.selectionFailures.set('gone.jsonl', { revision: null });
       for (const key of Object.keys(inputs)) delete inputs[key];
-      provider.previousSelection = provider.showing;
-      provider.hostPreviousSessions.set(provider.hosts[0], provider.showing);
-      provider.hostSessions.set(provider.hosts[0], 'switch-1');
-      provider.showing = 'switch-1';
-      provider.selectionGeneration++;
-      await provider.refresh(true, true, true, true);
+      await select('switch-1');
+      assert.ok(filesRead.size <= 120, `the selection reads ${filesRead.size} listed files among ${count}`);
+      assert.equal(provider.selectionFailures.has('gone.jsonl'), false, 'a removed source keeps its read failure');
       for (const name of [
         'stableRailOrder',
         'newCounts',
@@ -20732,6 +20908,9 @@ test('a selection that changes only the shown session computes a fixed number of
         'outcomesFor',
         'unreadCounts',
         'sessionRowOf',
+        'runningSessions',
+        'runningSessionsSince',
+        'liveBackgroundCommands',
       ])
         assert.ok((inputs[name] ?? 0) <= 120, `${name} reads ${inputs[name]} session inputs among ${count}`);
       assert.ok((inputs.outcomesFor ?? 0) > 0, 'the selection computed no session');

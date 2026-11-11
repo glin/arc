@@ -321,8 +321,8 @@ export function stableRailOrder<T extends { id: string }>(
     ordered.push(session);
   }
   return [
-    ...ordered.filter((session) => inRailRunningGroup(statuses.get(session.id))),
-    ...ordered.filter((session) => !inRailRunningGroup(statuses.get(session.id))),
+    ...ordered.filter((session) => RUNNING_GROUP.has(statuses.get(session.id) ?? '')),
+    ...ordered.filter((session) => !RUNNING_GROUP.has(statuses.get(session.id) ?? '')),
   ];
 }
 

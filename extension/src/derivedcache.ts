@@ -280,7 +280,7 @@ export class SessionFactFigures<F, V> {
 
   read(
     sessions: readonly (readonly [sessionId: string, facts: F])[],
-    derive: (facts: F) => V,
+    derive: (facts: F, sessionId: string) => V,
     current: (value: V) => boolean = () => true,
   ): Readonly<Record<string, V>> {
     const next = new Map<string, { facts: F; value: V }>();
@@ -292,7 +292,7 @@ export class SessionFactFigures<F, V> {
         continue;
       }
       moved = true;
-      next.set(sessionId, { facts, value: derive(facts) });
+      next.set(sessionId, { facts, value: derive(facts, sessionId) });
     }
     // Unchanged entries come from the held map, so equal sizes also mean equal membership.
     if (moved || next.size !== this.held.size) {
@@ -306,12 +306,12 @@ export class SessionFactFigures<F, V> {
   readOne(
     sessionId: string,
     facts: F,
-    derive: (facts: F) => V,
+    derive: (facts: F, sessionId: string) => V,
     current: (value: V) => boolean = () => true,
   ): Readonly<Record<string, V>> {
     const previous = this.held.get(sessionId);
     if (previous && previous.facts === facts && current(previous.value)) return this.value;
-    return this.patch(sessionId, { facts, value: derive(facts) });
+    return this.patch(sessionId, { facts, value: derive(facts, sessionId) });
   }
 
   // Sets the figure of one session, or drops it with null. The output keeps its identity.

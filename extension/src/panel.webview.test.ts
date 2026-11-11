@@ -1605,6 +1605,7 @@ test('the host reads closed child work once per file version and never reads ope
     claudeChildStatWrites: new Map(),
     claudeChildVersion: () => version,
     childSourcesFor: (PanelProvider.prototype as any).childSourcesFor,
+    childParents: (PanelProvider.prototype as any).childParents,
   };
   assert.deepEqual(read.call(host, now), new Map([['parent', ['child']]]));
   assert.equal(reader.mock.calls.length, 0);
@@ -33439,7 +33440,7 @@ test('a ready host stages worker-backed session data without clearing accepted c
   );
   sourceMatch(
     refresh,
-    /if \(!metadataAfterRender && !\(await this\.prepareMetadata\(all, generation, controller\.signal\)\)\) \{\s*return;\s*\}/,
+    /const metadataSources = selectedOnly && !metadataAfterRender \? this\.selectionSourcesOf\(null, all\) : all;\s*if \(!metadataAfterRender && !\(await this\.prepareMetadata\(metadataSources, generation, controller\.signal\)\)\) \{\s*return;\s*\}/,
     'ordinary refreshes no longer hydrate metadata before their first rail',
   );
   sourceMatch(
@@ -33787,7 +33788,9 @@ test('a session row carries a bounded rail name, past the sixty-character cut th
   const assignment = statementFrom(panelHostSource, panelHostSource.indexOf('let sessionRows = all.map('));
   const built = esbuild.transformSync(
     `export function build(all, sessions, parentEdges, fullLabels, AGENT_NAMES, formatWhen, formatRelative, shortenTo, RAIL_NAME_LIMIT, fields) {
+const relativeChangeAt = () => 0;
 class Rows {
+noteRailInstant() {}
 ${member}
 assign() {
 ${assignment}
@@ -42949,7 +42952,7 @@ test('catalog prefix resolution suspends through discovery progress failure canc
     'controller',
     'orderSessionCatalog',
     'sessionDiscoveryMembership',
-    `return (async () => { const selectedOnly = false, metadataAfterRender = false; ${acceptance} })();`,
+    `return (async () => { const selectedOnly = false, metadataAfterRender = false, metadataSources = all; ${acceptance} })();`,
   );
   let metadata!: (value: boolean) => void;
   provider.prepareMetadata = () =>
