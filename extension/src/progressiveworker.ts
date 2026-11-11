@@ -393,8 +393,8 @@ export type ProgressiveRequest =
       discovery?: DiscoveryCheckpoint;
       discoveryBytes?: number;
       quantumBytes?: number;
-      // The host needs its first partial catalog at the next slice boundary.
-      firstCatalog?: true;
+      // The worker replies at the first receipt slice boundary. The host waits on this request for its catalog.
+      sliceReply?: true;
       // Reads only the spend and person facts of the dispatch references of the last complete reply.
       spendOnly?: true;
       // The complete host set of compressed rollouts, sent only when the set changed since the last send to this worker.
@@ -528,7 +528,9 @@ export type ProgressiveValue =
       continuation: true;
       charges: DiscoveryCharges;
     }
-  | { kind: 'discovery-status'; completed: number; known: number }
+  // `completed` and `known` count sources as the host counts a checkpoint. `receiptEntries` counts the receipt entries that
+  // the request checked, and no visible text reads it.
+  | { kind: 'discovery-status'; completed: number; known: number; receiptEntries: number }
   | { kind: 'metadata'; entry: DerivedTitleEntry; coverage?: import('./transcript').MetadataCoverage }
   | {
       kind: 'metadata-recovery';
@@ -932,7 +934,8 @@ export class ProgressiveWorker {
         this.discoveryWaiter?.cancel();
         this.discoveryWaiter = waiting;
         signal.addEventListener('abort', cancel, { once: true });
-        this.yieldDiscovery();
+        // The worker holds a yield until a discovery request ends, so only a request that has not replied receives one.
+        if ([...this.pending.values()].some((held) => held.kind === 'claude-children')) this.yieldDiscovery();
       } else start();
     });
   }

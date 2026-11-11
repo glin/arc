@@ -94,7 +94,7 @@ import {
   clockWriter,
 } from './turnfixtures';
 
-test('each internal receipt boundary advances a parked backfill and reports bounded progress', async () => {
+test('receipt boundaries grant a parked backfill a turn after the first complete reply and serve a yield from that turn', async () => {
   const root = tempDir('receipt-backfill-');
   const fx = receiptDispatchFixture(root, 'claude', 'codex');
   for (let index = 0; index < 32; index++)
@@ -103,10 +103,13 @@ test('each internal receipt boundary advances a parked backfill and reports boun
   const boundary = 'charges.receiptPassEnds++;';
   const check = 'receiptSliceStart = charges.readBytes;';
   assert.ok(source.includes(start) && source.includes(boundary) && source.includes(check));
+  // The first request runs before any complete reply. The third request receives a yield during its third backfill turn.
   const code = source
     .replace(
       start,
       `${start}
+      receiptRequests++;
+      backfillTurns=0;
       if(!compressedBackfills.size){
         let slices=0;
         const backfill=new CompressedBackfill({
@@ -123,7 +126,13 @@ test('each internal receipt boundary advances a parked backfill and reports boun
           }
         });
         const take=backfill.takeTurn.bind(backfill);
-        backfill.takeTurn=async()=>{const before=slices;await take();if(slices!==before+1)throw Error('backfill does not advance once');backfillTurns++;};
+        backfill.takeTurn=async()=>{
+          const before=slices;
+          if(receiptRequests===3&&backfillTurns===2)require('node:worker_threads').parentPort.emit('message',{yieldDiscovery:true});
+          await take();
+          if(slices!==before+1)throw Error('backfill does not advance once');
+          backfillTurns++;
+        };
         compressedBackfills.set('test',backfill);
         backfill.setNames(['a.jsonl.zst']);
         while(slices<1)await new Promise(resolve=>setImmediate(resolve));
@@ -131,34 +140,44 @@ test('each internal receipt boundary advances a parked backfill and reports boun
       }`,
     )
     .replace(boundary, `${boundary}boundaryClock+=125;`)
-    .replace(check, `if(backfillTurns!==charges.receiptPassEnds)throw Error('backfill missed a boundary');${check}`);
-  const status: Array<{ completed: number; known: number }> = [];
+    .replace(
+      check,
+      `if(backfillTurns!==(receiptRequests>1?charges.receiptPassEnds:0))throw Error('backfill turns differ from the boundaries');${check}`,
+    );
+  let status: Array<{ completed: number; known: number; receiptEntries: number }> = [];
   const worker = new ProgressiveWorker(
-    `process.env.ARC_HOME=${JSON.stringify(fx.home)};let boundaryClock=0,backfillTurns=0;performance.now=()=>boundaryClock;` +
+    `process.env.ARC_HOME=${JSON.stringify(fx.home)};let boundaryClock=0,backfillTurns=0,receiptRequests=0;performance.now=()=>boundaryClock;` +
       code,
   );
+  const request = {
+    kind: 'claude-children' as const,
+    parents: fx.catalog,
+    catalog: fx.catalog,
+    repositoryRoots: [root],
+    discoveryBytes: 32 * 1024,
+  };
+  const pass = (generation: number) => {
+    status = [];
+    return worker.run(request, generation, new AbortController().signal, ({ value }) => {
+      if (value.kind === 'discovery-status') status.push(value);
+    });
+  };
   try {
-    const result = await worker.run(
-      {
-        kind: 'claude-children',
-        parents: fx.catalog,
-        catalog: fx.catalog,
-        repositoryRoots: [root],
-        discoveryBytes: 32 * 1024,
-      },
-      1,
-      new AbortController().signal,
-      ({ value }) => {
-        if (value.kind === 'discovery-status') status.push(value);
-      },
-    );
-    assert.equal(result?.value.kind, 'claude-children');
-    if (result?.value.kind !== 'claude-children') throw new Error('Discovery did not complete');
-    assert.ok(result.value.charges!.receiptPassEnds >= 20);
-    assert.equal(status.length, Math.floor(result.value.charges!.receiptPassEnds / 2));
-    assert.ok(status.every((value, index) => index === 0 || value.completed >= status[index - 1].completed));
-    assert.ok(status.at(-1)!.completed > status[0].completed);
-    assert.ok(status.every((value) => Object.keys(value).length === 3));
+    for (const generation of [1, 2]) {
+      const result = await pass(generation);
+      assert.equal(result?.value.kind, 'claude-children');
+      if (result?.value.kind !== 'claude-children') throw new Error('Discovery did not complete');
+      assert.ok(result.value.charges!.receiptPassEnds >= 20);
+      assert.equal(status.length, Math.floor(result.value.charges!.receiptPassEnds / 2));
+      assert.ok(status.every((value) => value.completed === status[0].completed && value.known === status[0].known));
+      assert.ok(status.every((value) => value.completed <= value.known && value.known <= fx.catalog.length));
+      assert.ok(status.every((value, index) => index === 0 || value.receiptEntries > status[index - 1].receiptEntries));
+      assert.ok(status.every((value) => Object.keys(value).length === 4));
+    }
+    const yielded = await pass(3);
+    assert.notEqual(yielded?.value.kind, 'claude-children');
+    if (!yielded || !('charges' in yielded.value)) throw new Error('Discovery did not reply');
+    assert.equal(yielded.value.charges?.receiptPassEnds, 3, 'a yield during a backfill turn waits for another slice');
   } finally {
     worker.stop();
   }
@@ -212,7 +231,7 @@ test('a receipt created during a pass appears by the next pass', async () => {
   }
 });
 
-test.each(['cancel', 'replacement', 'newer request'] as const)(
+test.each(['cancel', 'newer request'] as const)(
   'a %s queued inside a receipt batch stops within its step bound',
   async (action) => {
     const root = tempDir('receipt-interrupt-');
@@ -255,7 +274,6 @@ test.each(['cancel', 'replacement', 'newer request'] as const)(
     });
     const { host, replies } = await receiptDiscoveryHost(worker, [root], fx.catalog);
     const controller = new AbortController();
-    let replacement: ProgressiveWorker | undefined;
     try {
       host.refreshGeneration = 1;
       const first = host.prepareClaudeChildren(1, controller.signal);
@@ -273,12 +291,7 @@ test.each(['cancel', 'replacement', 'newer request'] as const)(
           2,
           new AbortController().signal,
         );
-      else if (action === 'replacement') {
-        replacement = new ProgressiveWorker(prefix + source);
-        host.progressiveWorker = replacement;
-        host.refreshGeneration = 2;
-      }
-      if (action !== 'newer request') worker.yieldDiscovery();
+      else worker.yieldDiscovery();
       await first;
       const [steps, atInterrupt] = await finished;
       assert.equal(atInterrupt, 9, 'the interrupt was not queued inside the second batch');
@@ -287,17 +300,9 @@ test.each(['cancel', 'replacement', 'newer request'] as const)(
         `the worker takes ${steps - atInterrupt} receipt steps after interruption`,
       );
       if (action === 'cancel') return;
-      if (action === 'replacement') {
-        for (let pass = 0; pass < 20; pass++) {
-          await host.prepareClaudeChildren(2, new AbortController().signal);
-          if (!host.dispatchDiscoveryPending) break;
-        }
-        assert.equal(host.dispatchDiscoveryPending, false);
-      } else {
-        const result = await newer;
-        assert.equal(result?.value.kind, 'claude-children');
-        if (result?.value.kind === 'claude-children') host.claudeChildReferences = result.value.references;
-      }
+      const result = await newer;
+      assert.equal(result?.value.kind, 'claude-children');
+      if (result?.value.kind === 'claude-children') host.claudeChildReferences = result.value.references;
       const control = new ProgressiveWorker(prefix + source);
       try {
         const result = await completeDiscovery(
@@ -312,14 +317,208 @@ test.each(['cancel', 'replacement', 'newer request'] as const)(
       } finally {
         control.stop();
       }
-      assert.ok(replies.last || action === 'replacement');
+      assert.ok(replies.last);
     } finally {
       controller.abort();
       worker.stop();
-      replacement?.stop();
     }
   },
 );
+
+test('a worker replacement during a receipt batch ends the old scan, and the restarted worker completes the pass', async () => {
+  const root = tempDir('receipt-replacement-');
+  const fx = receiptDispatchFixture(root, 'claude', 'codex');
+  for (let index = 0; index < 32; index++)
+    fx.launch({ ...fx.parent, sessionId: 'eeeeeeee-1111-2222-3333-444444444444' }, fx.child, true, false, 36 * 1024);
+  fx.launch(fx.parent, fx.child);
+  fx.launch(fx.child, fx.grandchild);
+  const turn = 'await receiptScanTurn();';
+  const step = 'receiptSteps++;';
+  assert.ok(source.includes(turn) && source.includes(step));
+  const name = `arc-${path.basename(root)}`;
+  const claim = path.join(root, 'first-thread');
+  const prefix = `process.env.ARC_HOME=${JSON.stringify(fx.home)};performance.now=()=>0;Date.now=()=>${Date.UTC(2026, 0, 2)};`;
+  // The first thread reports each receipt step on a channel that the host's worker filter does not reach. It waits at the
+  // end of its second batch until the test answers.
+  const instrumented =
+    prefix +
+    `const gateChannel=(()=>{try{require('node:fs').writeFileSync(${JSON.stringify(claim)},'',{flag:'wx'});return new BroadcastChannel(${JSON.stringify(name)});}catch{return null;}})();let gateSteps=0,gateHeld=false;` +
+    source
+      .replace('receiptSteps >= RECEIPT_STEPS', 'receiptSteps >= 256')
+      .replace(step, `${step}if(gateChannel)gateChannel.postMessage(++gateSteps);`)
+      .replace(
+        turn,
+        `${turn}if(gateChannel&&gateSteps>=16&&!gateHeld){gateHeld=true;await new Promise(resolve=>{gateChannel.onmessage=resolve;gateChannel.postMessage('held');});}`,
+      );
+  const channel = new BroadcastChannel(name);
+  let steps = 0;
+  let held!: () => void;
+  const holding = new Promise<void>((resolve) => (held = resolve));
+  channel.onmessage = (event: { data: unknown }) => {
+    if (event.data === 'held') held();
+    else steps = event.data as number;
+  };
+  const worker = new ProgressiveWorker(instrumented);
+  const { host } = await receiptDiscoveryHost(worker, [root], fx.catalog);
+  // The stopped request ends without an answer, and the loading line that reports it is outside this test.
+  host.failSessionLoading = () => {};
+  try {
+    host.refreshGeneration = 1;
+    const first = host.prepareClaudeChildren(1, new AbortController().signal);
+    await holding;
+    const atStop = steps;
+    assert.equal(atStop, 16, 'the old scan did not wait at the end of its second batch');
+    worker.stop();
+    // A thread that the stop left running resumes its scan.
+    channel.postMessage('go');
+    await first;
+    host.refreshGeneration = 2;
+    for (let pass = 0; pass < 20; pass++) {
+      await host.prepareClaudeChildren(2, new AbortController().signal);
+      if (!host.dispatchDiscoveryPending) break;
+    }
+    assert.equal(host.dispatchDiscoveryPending, false);
+    assert.ok(steps - atStop <= 8, `the replaced worker takes ${steps - atStop} receipt steps after the stop`);
+    const control = new ProgressiveWorker(prefix + source);
+    try {
+      const result = await completeDiscovery(
+        control,
+        { kind: 'claude-children', parents: fx.catalog, catalog: fx.catalog, repositoryRoots: [root] },
+        3,
+        new AbortController().signal,
+      );
+      assert.equal(result?.value.kind, 'claude-children');
+      if (result?.value.kind === 'claude-children')
+        assert.deepEqual(host.claudeChildReferences, result.value.references);
+    } finally {
+      control.stop();
+    }
+  } finally {
+    channel.close();
+    worker.stop();
+  }
+});
+
+test('a yield that reaches the worker before its discovery request costs that request one early reply', async () => {
+  const root = tempDir('receipt-early-yield-');
+  const fx = receiptDispatchFixture(root, 'claude', 'codex');
+  for (let index = 0; index < 32; index++)
+    fx.launch({ ...fx.parent, sessionId: 'eeeeeeee-1111-2222-3333-444444444444' }, fx.child, true, false, 36 * 1024);
+  const worker = new ProgressiveWorker(`process.env.ARC_HOME=${JSON.stringify(fx.home)};` + source);
+  const request = {
+    kind: 'claude-children' as const,
+    parents: fx.catalog,
+    catalog: fx.catalog,
+    repositoryRoots: [root],
+    discoveryBytes: 32 * 1024,
+  };
+  try {
+    const settled = await completeDiscovery(worker, request, 1, new AbortController().signal);
+    assert.equal(settled?.value.kind, 'claude-children');
+    worker.yieldDiscovery();
+    const early = await worker.run(request, 2, new AbortController().signal);
+    assert.notEqual(early?.value.kind, 'claude-children', 'the yield was lost before the request started');
+    if (!early || !('charges' in early.value)) throw new Error('Discovery did not reply');
+    assert.equal(early.value.charges?.receiptPassEnds, 1);
+    const rest = await worker.run(request, 3, new AbortController().signal);
+    assert.equal(rest?.value.kind, 'claude-children', 'the yield also ended the next request');
+    if (rest?.value.kind === 'claude-children') assert.ok(rest.value.charges!.receiptPassEnds >= 19);
+  } finally {
+    worker.stop();
+  }
+});
+
+test('the loading count stays in source units across a receipt yield and a transcript-limited reply', async () => {
+  const root = tempDir('receipt-loading-count-');
+  const fx = receiptDispatchFixture(root, 'claude', 'codex');
+  for (let index = 0; index < 32; index++)
+    fx.launch({ ...fx.parent, sessionId: 'eeeeeeee-1111-2222-3333-444444444444' }, fx.child, true, false, 36 * 1024);
+  // A long transcript ends the first requests at the transcript byte limit.
+  const sessionId = 'dddddddd-1111-2222-3333-444444444444';
+  const file = path.join(path.dirname(fx.parent.file), `${sessionId}.jsonl`);
+  const padding = Array.from({ length: 100 }, () => JSON.stringify({ type: 'ignored', payload: 'y'.repeat(1024) }));
+  fs.writeFileSync(
+    file,
+    [
+      fs.readFileSync(fx.grandchild.file, 'utf8').trim().replaceAll(fx.grandchild.sessionId, sessionId),
+      ...padding,
+    ].join('\n') + '\n',
+  );
+  const catalog = [
+    ...fx.catalog,
+    { ...fx.grandchild, file, sessionId, ...revisionOf(fs.statSync(file, { bigint: true })) },
+  ];
+  const boundary = 'charges.receiptPassEnds++;';
+  assert.ok(source.includes(boundary));
+  const worker = new ProgressiveWorker(
+    `process.env.ARC_HOME=${JSON.stringify(fx.home)};let boundaryClock=0;performance.now=()=>boundaryClock;` +
+      source.replace(boundary, `${boundary}boundaryClock+=125;`),
+  );
+  const { host, replies } = await receiptDiscoveryHost(worker, [root], catalog, {
+    held: () => false,
+    present() {},
+    withhold() {},
+  });
+  const posts: Array<{ type: string; completed: number; known: number }> = [];
+  host.post = async (message: { type: string; completed: number; known: number }) => {
+    posts.push(message);
+  };
+  // Every reply posts its count.
+  Object.defineProperty(host, 'startupProgressAt', { get: () => 0, set() {} });
+  const send = worker.run.bind(worker);
+  let yielded = false;
+  const ends: Array<{ kind: string; transcript: number; receipt: number }> = [];
+  worker.run = async (request, generation, signal, progress) => {
+    const result = await send(
+      request.kind === 'claude-children' ? { ...request, discoveryBytes: 32 * 1024, quantumBytes: 32 * 1024 } : request,
+      generation,
+      signal,
+      (value) => {
+        if (value.value.kind === 'discovery-status' && !yielded) {
+          yielded = true;
+          worker.yieldDiscovery();
+        }
+        progress?.(value);
+      },
+    );
+    if (result && 'charges' in result.value && result.value.charges)
+      ends.push({
+        kind: result.value.kind,
+        transcript: result.value.charges.transcriptPassEnds,
+        receipt: result.value.charges.receiptPassEnds,
+      });
+    return result;
+  };
+  try {
+    host.refreshGeneration = 1;
+    for (let pass = 0; pass < 100; pass++) {
+      await host.prepareClaudeChildren(1, new AbortController().signal, undefined, true);
+      if (replies.last?.value.kind === 'claude-children' && !host.dispatchDiscoveryPending) break;
+    }
+    assert.equal(replies.last?.value.kind, 'claude-children');
+    assert.ok(
+      ends.some((end) => end.transcript > 0),
+      'no reply ended at the transcript limit',
+    );
+    assert.ok(
+      ends.some((end) => end.kind !== 'claude-children' && end.receipt > 0),
+      'no reply ended at a receipt slice boundary',
+    );
+    const counts = posts.filter((message) => message.type === 'startupProgress');
+    assert.ok(counts.length > 2);
+    counts.forEach(({ completed, known }, index) => {
+      assert.ok(completed <= known && known <= catalog.length, `the loading line shows ${completed} of ${known}`);
+      if (index === 0) return;
+      const previous = counts[index - 1];
+      assert.ok(
+        completed >= previous.completed && known >= previous.known,
+        `the loading line goes from ${previous.completed} of ${previous.known} to ${completed} of ${known}`,
+      );
+    });
+  } finally {
+    worker.stop();
+  }
+});
 
 test.each(['claude', 'codex'] as const)(
   'receipt-only %s discovery reaches the store tail and retains immediate parents across restart',
@@ -1306,13 +1505,14 @@ async function receiptDiscoveryHost(
   worker: ProgressiveWorker,
   roots: string[],
   catalog: import('./transcript').SessionFile[],
+  loadingLine: object = { held: () => true, withhold() {} },
 ) {
   vi.stubGlobal('PANEL_CSS', '');
   vi.stubGlobal('PANEL_JS', '');
   vi.stubGlobal('PANEL_DEV_SERVER_URL', null);
   const { PanelProvider } = await import('./panelhost.js');
   const host = Object.create(PanelProvider.prototype) as Record<string, any>;
-  Object.defineProperty(host, 'loadingLine', { value: { held: () => true, withhold() {} } });
+  Object.defineProperty(host, 'loadingLine', { value: loadingLine });
   Object.assign(host, {
     progressiveWorker: worker,
     refreshGeneration: 0,

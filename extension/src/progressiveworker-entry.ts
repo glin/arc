@@ -1574,6 +1574,8 @@ async function execute(
     let turnSteps = 0;
     let turnEntered = false;
     let statusAt = performance.now();
+    // A receipt slice changes no completion, so the source count of the status messages is the same for the whole loop.
+    let sourceCount: { completed: number; known: number } | undefined;
     // The deadline ends a slice after its first step, so a paused worker still advances.
     while (!signal.aborted) {
       if (
@@ -1585,17 +1587,22 @@ async function execute(
         await new Promise<void>((resolve) => setImmediate(resolve));
         if (signal.aborted) break;
         if (discoveryYield) return receiptReply();
-        if (request.firstCatalog) return receiptReply();
-        await Promise.all([...compressedBackfills.values()].flatMap((backfill) => backfill.takeTurn() ?? []));
-        if (signal.aborted) break;
+        if (request.sliceReply) return receiptReply();
+        // A backfill takes discovery turns only after the worker's first complete reply, as between requests.
+        if (discovery.repliedComplete) {
+          await Promise.all([...compressedBackfills.values()].flatMap((backfill) => backfill.takeTurn() ?? []));
+          if (signal.aborted) break;
+          // A request that arrived during the turn takes its reply before another slice.
+          if (discoveryYield) return receiptReply();
+        }
         if (performance.now() - statusAt >= 250) {
           statusAt = performance.now();
-          const done = completed.size + charges.receiptEntries!;
-          acknowledge?.({
-            kind: 'discovery-status',
-            completed: done,
-            known: candidates.size + charges.receiptEntries! + 1,
-          });
+          if (!sourceCount) {
+            const known = new Set([...epoch.parents, ...epoch.catalog].map((row) => normalizeFsPath(row.file)));
+            const done = new Set([...completed].map(normalizeFsPath).filter((file) => known.has(file)));
+            sourceCount = { completed: done.size, known: known.size };
+          }
+          acknowledge?.({ kind: 'discovery-status', ...sourceCount, receiptEntries: charges.receiptEntries! });
         }
         receiptSliceStart = charges.readBytes;
         receiptSteps = 0;
@@ -2803,7 +2810,6 @@ async function handleMessage(message: {
   requests.set(message.id, controller);
   arrivalReleases.set(controller.signal, releaseSequence);
   const kind = message.request.kind;
-  if (kind === 'claude-children') discoveryYield = false;
   for (const read of windowReads.values()) countKind(read.report.during.received, kind);
   if (kind === 'window' && windowReads.size < WINDOW_READS) {
     windowReads.set(message.id, {
@@ -2986,6 +2992,9 @@ async function handleMessage(message: {
         windowRead: windowReadReport(message.id),
       });
   } finally {
+    // A yield that arrives before a discovery request starts holds for that request. One that arrives after the request it
+    // asked for costs the next request one early reply.
+    if (kind === 'claude-children') discoveryYield = false;
     if (bodyEntered) leaveBodyPath();
     requests.delete(message.id);
     windowReads.delete(message.id);

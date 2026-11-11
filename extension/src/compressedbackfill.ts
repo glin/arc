@@ -959,6 +959,11 @@ export class DiscoveryQueue<Message extends { id: number }> {
     return !!this.waiting;
   }
 
+  // True after the first complete discovery reply of the worker. A backfill gets no turn from discovery before it.
+  get repliedComplete(): boolean {
+    return this.completeReply;
+  }
+
   noteReply(value: { kind: string; complete?: boolean }): void {
     if (value.kind === 'claude-children' && value.complete) this.completeReply = true;
   }

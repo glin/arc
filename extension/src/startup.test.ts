@@ -26016,57 +26016,67 @@ test('receipt progress updates the loading counters without reading catalog entr
   }
 });
 
-test('a catalog trigger starts its refresh at the next discovery slice without a deadline abort', async () => {
+test('a catalog trigger and a trigger during its refresh each wait at most one discovery slice', async () => {
   vi.useFakeTimers();
-  let release!: () => void;
-  let held: Promise<void> | undefined;
+  const holds: Array<() => void> = [];
   try {
     const { provider, discovery } = exhaustedLoadingHarness();
     const counters = new PanelPerformanceCounters(1000);
     provider.performanceCounters = counters;
     const run = provider.progressiveWorker.run;
-    let requests = 0;
-    let slices = 0;
+    // The receipt slices that each discovery request runs, in request order.
+    const slices: number[] = [];
+    const signals: AbortSignal[] = [];
     let yielded = false;
-    let activeSignal: AbortSignal | undefined;
     provider.progressiveWorker.yieldDiscovery = () => {
       yielded = true;
     };
     provider.progressiveWorker.run = async (request: ProgressiveRequest, generation: number, signal: AbortSignal) => {
       if (request.kind !== 'claude-children') return run(request, generation, signal);
-      requests++;
-      discovery.pending = requests <= 2;
-      if (requests === 2) {
-        activeSignal = signal;
-        held = new Promise<void>((resolve) => {
-          release = resolve;
-        });
-        await held;
-        for (; slices < 40; slices++) {
-          if (yielded) {
-            slices++;
-            break;
-          }
-        }
+      const index = slices.push(0) - 1;
+      signals.push(signal);
+      discovery.pending = index < 4;
+      // The continuation and then the first trigger's refresh hold their requests until the test releases them.
+      if (index === 1 || index === 2) await new Promise<void>((resolve) => holds.push(resolve));
+      // A request replies at a slice boundary when it asks for that reply or a yield waits. Otherwise it runs 40 slices.
+      for (let slice = 1; slice <= 40; slice++) {
+        slices[index] = slice;
+        if (request.sliceReply || yielded) break;
       }
+      yielded = false;
       return run(request, generation, signal);
     };
+    const until = async (condition: () => boolean, message: string) => {
+      for (let step = 0; step < 500 && !condition(); step++) await vi.advanceTimersByTimeAsync(1);
+      assert.ok(condition(), message);
+    };
     void provider.refreshFrom('startup', true);
-    for (let step = 0; step < 500; step++) {
-      if (held) break;
-      await vi.advanceTimersByTimeAsync(1);
-    }
-    assert.ok(held, 'the discovery continuation never started');
+    await until(() => holds.length === 1, 'the discovery continuation never started');
+    // The host holds an accepted catalog from an incomplete pass.
+    provider.authoritativeCatalog ??= provider.partial;
     await provider.refreshFrom('running', true, true);
-    release();
-    for (let step = 0; step < 500 && !counters.snapshot().refreshes.running?.count; step++)
-      await vi.advanceTimersByTimeAsync(1);
-    assert.equal(slices, 1, 'the catalog trigger waited through more than one slice');
+    holds[0]();
+    await until(() => holds.length === 2, 'the first trigger never sent its own discovery request');
+    await provider.refreshFrom('transcript', true, true);
+    holds[1]();
+    await until(
+      () => !!counters.snapshot().refreshes.transcript?.count,
+      'the second trigger never finished its refresh',
+    );
+    assert.equal(slices[1], 1, 'the first trigger waited through more than one slice of the continuation');
+    assert.equal(slices[2], 1, 'the refresh request of the first trigger ran more than one slice before its render');
     assert.equal(counters.snapshot().refreshes.running?.count, 1);
-    assert.equal(activeSignal?.aborted, false);
+    assert.equal(slices[3], 1, 'the refresh request of the second trigger ran more than one slice');
+    assert.equal(counters.snapshot().refreshes.transcript?.count, 1);
+    await until(() => slices.length > 4, 'the discovery continuation never resumed');
+    assert.equal(slices[4], 40, 'the continuation replied before the end of its receipt scan');
+    assert.deepEqual(
+      signals.map((signal) => signal.aborted),
+      signals.map(() => false),
+    );
     assert.equal(counters.snapshot().refreshStages.abandoned, 0);
   } finally {
-    release?.();
+    for (const release of holds) release();
     vi.clearAllTimers();
     vi.useRealTimers();
   }

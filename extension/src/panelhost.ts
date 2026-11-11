@@ -12742,7 +12742,7 @@ export class PanelProvider implements vscode.Disposable {
         if (moved && !refresh) this.performanceCounters.recordWork('dispatchFiguresHeld');
         return;
       }
-      const discovered = await this.prepareClaudeChildren(generation, controller.signal);
+      const discovered = await this.prepareClaudeChildren(generation, controller.signal, undefined, true);
       // An incomplete reply lists the accepted sessions, and adds a session this panel started once its source qualifies.
       const accepted = new Set((this.authoritativeCatalog ?? []).map((session) => session.file));
       const listed = this.catalog?.sessions ?? [];
@@ -15668,6 +15668,7 @@ export class PanelProvider implements vscode.Disposable {
     generation: number,
     signal: AbortSignal,
     humanPromptWork = { bytes: 0, sources: 0, reads: 0, unknown: new Set<string>() },
+    continuation = false,
   ): Promise<boolean> {
     if (!signal.aborted && generation === this.refreshGeneration) {
       this.sessionQueryDiscoveryPending = true;
@@ -15881,7 +15882,9 @@ export class PanelProvider implements vscode.Disposable {
           referenceEntries: [...this.claudeChildReferenceEntries],
           relationshipRejections: this.relationshipRejections,
           discovery: this.discoveryCheckpoint,
-          ...(!this.authoritativeCatalog ? { firstCatalog: true as const } : {}),
+          // A refresh waits on its own request before it renders. A continuation keeps its receipt slices in one request until
+          // the host accepts its first catalog.
+          ...(!continuation || !this.authoritativeCatalog ? { sliceReply: true as const } : {}),
           ...compressedList,
         },
         generation,
