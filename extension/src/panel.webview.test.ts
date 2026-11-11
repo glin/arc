@@ -24276,7 +24276,7 @@ test('a rail card wears the status that needs attention', () => {
   const lifetimeBody = memberFrom(panelHostSource, panelHostSource.indexOf('private lifetimeFiguresBySession('));
   sourceMatch(
     lifetimeBody,
-    /this\.lifetimeFigures\.read\(\s*this\.lifetimeDisplayFiles\(\),\s*this\.sessionSpendSources,/,
+    /this\.lifetimeFigures\.read\(\s*this\.lifetimeDisplayFiles\(\),\s*this\.rowSpendSources\(\),/,
     'each rail sender recalculates every lifetime fact for the same records',
   );
   const displayed = memberFrom(panelHostSource, panelHostSource.indexOf('private lifetimeDisplayFiles('));

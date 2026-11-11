@@ -167,6 +167,11 @@ import {
   withMetadataCoverage,
   withSessionName,
   savedLinksRefusal,
+  admittedSpendSources,
+  savedSpendSourcesOf,
+  savedSpendSourcesRefusal,
+  SAVED_SPEND_SOURCES_VERSION,
+  type SavedSpendSources,
 } from './derivedcache';
 import {
   aggregateUsageEvents,
@@ -3107,6 +3112,14 @@ function guardedHarness<T extends object>(provider: T): T {
   return guarded;
 }
 
+// The members that a named member calls, which a harness carries with it.
+function withCompanionMethods(names: Iterable<string>): string[] {
+  const out = [...names];
+  if (out.includes('lifetimeFiguresBySession')) out.push('rowSpendSources', 'admitSavedSpendSources');
+  if (out.includes('writeDerivedCache')) out.push('savedSpendSourcesToWrite');
+  return out;
+}
+
 function harness(pendingRefresh = false, registerRefreshHandler = true, extraMethods: string[] = []): any {
   const file = ts.createSourceFile(
     'panelhost.ts',
@@ -3177,8 +3190,9 @@ function harness(pendingRefresh = false, registerRefreshHandler = true, extraMet
     'compressedTitleOf',
     'compressedCarriedNameOf',
   );
+  const carried = withCompanionMethods(methods);
   const body = owner.members
-    .filter((member) => member.name && methods.includes(member.name.getText(file)))
+    .filter((member) => member.name && carried.includes(member.name.getText(file)))
     .map((member) => member.getText(file))
     .join('\n');
   const compiled = transformSync(
@@ -3559,6 +3573,7 @@ function completeDiscoveryHarness(
     'collidingSources',
     'claudeOpeningReader',
   );
+  names.push(...withCompanionMethods(names).slice(names.length));
   const body = owner.members
     .filter((member) => member.name && names.includes(member.name.getText(file)))
     .map((member) => member.getText(file))
@@ -4019,6 +4034,7 @@ function metadataHarness(
       'compressedTitleOf',
       'compressedCarriedNameOf',
       'writeDerivedCache',
+      'savedSpendSourcesToWrite',
     ];
     const members = owner.members.filter((member) => member.name && drawn.includes(member.name.getText(file)));
     assert.equal(members.length, drawn.length, 'panelhost.ts no longer names sessions through these methods');
@@ -4146,6 +4162,7 @@ function selectedWindowHarness(
     ...extra,
     // evictCache calls pruneDerivedTitles and evictOverBudget.
     ...(extra.includes('evictCache') ? ['pruneDerivedTitles', 'evictOverBudget'] : []),
+    ...withCompanionMethods(extra),
   ]);
   const body = owner.members
     .filter((member) => member.name && names.has(member.name.getText(file)))
@@ -16498,7 +16515,10 @@ test('the first rail after a derived cache version bump draws every stored name,
 
 // A warm start whose derived cache holds the links of the last settled discovery reply. The census lists the child transcript
 // at a grown size, and the walk lists a second Claude parent that a verified reply can move the child to.
-function cachedLinksHarness(change: (fixture: any) => void = () => {}) {
+function cachedLinksHarness(
+  change: (fixture: any) => void = () => {},
+  extra: { methods?: string[]; scope?: Record<string, unknown> } = {},
+) {
   const now = 1_000_000_000_000;
   const fixture: any = { census: [] };
   const harness = bumpedCatalogHarness(
@@ -16511,9 +16531,10 @@ function cachedLinksHarness(change: (fixture: any) => void = () => {}) {
         status: fixture.censusUncertain ? 'incomplete' : 'complete',
         uncertain: fixture.censusUncertain ?? [],
       }),
+      ...extra.scope,
     },
     false,
-    ['publishCachedLinks', 'installCachedLinks', 'membershipOf', 'physicalMembershipOf'],
+    ['publishCachedLinks', 'installCachedLinks', 'membershipOf', 'physicalMembershipOf', ...(extra.methods ?? [])],
   );
   const { provider, claude, child, claudeWalk } = harness;
   const other = {
@@ -16995,6 +17016,310 @@ test('a refresh that stops before acceptance counts no publication and leaves th
     assert.equal(work.get('cachedLinks:published'), 1, 'the next refresh did not publish from the saved links');
     assert.equal(requests.length, 0);
     assert.ok(provider.authoritativeCatalog.some((session: SessionFile) => session.file === child.file));
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+// The spend record of one complete transcript revision, with three turns and one request at a recorded price.
+function savedFiguresRecord(file: string, revision: { size: number; mtimeMs: number }, dollars = 2) {
+  const buckets = aggregateUsageEvents([
+    {
+      timestamp: revision.mtimeMs,
+      agent: 'Claude',
+      provider: 'anthropic',
+      model: 'claude-opus-4-1',
+      contextWindow: null,
+      billingClass: 'metered',
+      inferenceClass: null,
+      serviceTier: null,
+      reportedCost: dollars,
+      reportedCostBasis: 'list',
+      requestKey: null,
+      usage: { input: 10, output: 5, thinking: 0, cacheRead: 0, cacheWrite1h: 0, cacheWrite5m: 0 },
+    },
+  ]);
+  return {
+    file,
+    workspace: 'project',
+    size: revision.size,
+    mtimeMs: revision.mtimeMs,
+    offset: revision.size,
+    trailing: '',
+    buckets,
+    lifetimeBuckets: buckets,
+    turnCount: 3,
+    compactionCount: 0,
+    firstTurnAt: 1,
+    lastTurnAt: 2,
+    newestTurnStartedAt: 2,
+    outcome: null,
+    cacheExpiry: null,
+    parserKind: 'claude' as const,
+    parserGeneration: PROJECT_SPEND_PARSER_GENERATIONS.claude,
+    indexedAt: 1,
+    complete: true,
+  };
+}
+
+// A warm start whose spend index holds a complete record of the walked Claude parent, and whose derived cache holds the
+// spend sources that the last settled reply saved for it. The discovery reply waits until `answer` runs.
+function savedFiguresHarness(change: (fixture: any) => void = () => {}) {
+  const harness = cachedLinksHarness(change, {
+    methods: [
+      'lifetimeFiguresBySession',
+      'lifetimeDisplayFiles',
+      'rowSpendSources',
+      'admitSavedSpendSources',
+      'updateSessionSpendSources',
+      'savedSpendSourcesToWrite',
+    ],
+    scope: {
+      discoverClaudeSessionSpendSources: (parents: SessionFile[]) =>
+        parents
+          .filter((parent) => parent.childTranscript !== true)
+          .map((parent) => ({ sessionId: parent.sessionId, file: parent.file, primary: true })),
+      sessionLifetimeDisplayFiles,
+      sessionSpendPartsBySession,
+      sessionTurnStatsBySession: spendConsumers.sessionTurnStatsBySession,
+      sessionCacheFactsBySession: spendConsumers.sessionCacheFactsBySession,
+      dispatchedSpendPartsBySession: spendConsumers.dispatchedSpendPartsBySession,
+      cacheExpiryReturnCount: cardConsumers.cacheExpiryReturnCount,
+      sessionCostUsageOf: cardConsumers.sessionCostUsageOf,
+      sessionCostProjection: cardConsumers.sessionCostProjection,
+      sessionTurnStats: cardConsumers.sessionTurnStats,
+      sessionCacheExpiryStats: cardConsumers.sessionCacheExpiryStats,
+      sessionCompactionContextDetail: cardConsumers.sessionCompactionContextDetail,
+      priceDispatchedParts: cardConsumers.priceDispatchedParts,
+      normalizeWorkspace,
+      normalizeSpendFile,
+      admittedSpendSources,
+      savedSpendSourcesRefusal,
+      savedSpendSourcesOf,
+    },
+  });
+  const { provider, claude } = harness;
+  const record = savedFiguresRecord(claude.file, claude);
+  const saved: SavedSpendSources = {
+    version: SAVED_SPEND_SOURCES_VERSION,
+    scope: JSON.stringify(['project']),
+    compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
+    sources: [{ sessionId: claude.sessionId, file: claude.file, primary: true }],
+    files: [{ file: claude.file, size: claude.size, mtimeMs: claude.mtimeMs, dev: claude.dev, ino: claude.ino }],
+  };
+  // The reply sets the sources with the host's own update.
+  delete provider.updateSessionSpendSources;
+  Object.assign(provider, {
+    lifetimeFigures: new SessionFiguresCache(),
+    sessionSpendSources: [],
+    sessionSpendSourceIndex: new SessionSpendSourceIndex({
+      claude: () => [],
+      codex: spendConsumers.discoverCodexSessionSpendSources,
+    }),
+    projectSpendHolds: () => false,
+    projectSpendFiles: [record],
+    projectSpendVisibleFiles: [record],
+    savedSpendSources: saved,
+  });
+  provider.useRailPayload(railPayload);
+  let answer: ((value: unknown) => void) | undefined;
+  provider.progressiveWorker.run = (request: ProgressiveRequest, generation: number) =>
+    new Promise((resolve) => {
+      harness.requests.push(request);
+      answer = (value) => resolve({ generation, value });
+    });
+  // A complete reply that settles membership and lists the walked parents with no relationship.
+  const settle = async () => {
+    await vi.runOnlyPendingTimersAsync();
+    assert.equal(harness.requests.length, 1, 'the continuation sent no discovery request');
+    const request = harness.requests[0];
+    answer?.({
+      compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
+      kind: 'claude-children',
+      roots: request.kind === 'claude-children' ? request.parents : [],
+      complete: true,
+      continuation: false,
+      membershipSettled: true,
+      references: [],
+      dispatchFacts: [],
+      children: [],
+      referenceEntries: [],
+      receiptStore: 'store-1',
+    });
+    await vi.waitFor(() => assert.ok(provider.completeCatalogScope, 'the follow-up refresh accepted no settled reply'));
+  };
+  return { ...harness, record, saved, settle };
+}
+
+// The figures of a session in the last session list message that carries any figure of it.
+function postedFigures(provider: any, sessionId: string): string[] {
+  const posted = provider.messages
+    .filter((message: any) => (message.type === 'render' || message.type === 'rail') && message.stats?.[sessionId])
+    .at(-1);
+  return (posted?.stats[sessionId] ?? []).map((chip: { metric?: string }) => chip.metric);
+}
+
+test('a warm start over an unchanged parent posts its saved turn count and cost while the discovery reply waits', async () => {
+  vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+  try {
+    const { provider, claude, now } = savedFiguresHarness();
+    vi.setSystemTime(now);
+    await provider.refresh(true);
+    assert.ok(!provider.claudeChildrenDiscovered, 'the discovery reply arrived before the assertion');
+    const figures = postedFigures(provider, claude.sessionId);
+    assert.ok(figures.includes('turns'), `the row posted no turn count: ${figures.join(', ')}`);
+    assert.ok(figures.includes('cost'), `the row posted no cost: ${figures.join(', ')}`);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test.each([
+  ['its file grew after the reply that saved its sources', { walked: { size: 1500 }, record: { size: 1500 } }],
+  ['its file has a new modification time', { walked: { mtimeMs: 11 }, record: { mtimeMs: 11 } }],
+  ['its file was replaced by another with the same size', { walked: { ino: 3 } }],
+  ['its file moved to another device', { walked: { dev: 4 } }],
+  ['its spend record holds another revision', { record: { size: 900 } }],
+  ['the file of one of its children changed', { child: true }],
+])('a warm start posts no saved figure of a session when %s', async (_case, moved: any) => {
+  vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+  try {
+    const { provider, claude, child, saved, record, work, now } = savedFiguresHarness();
+    if (moved.walked) Object.assign(claude, moved.walked);
+    if (moved.record) Object.assign(record, moved.record);
+    if (moved.child) {
+      // The census and the spend index hold the child at 1200 bytes, and the last settled reply saw it at 1000.
+      const childRecord = savedFiguresRecord(child.file, { ...child, size: 1200 });
+      provider.projectSpendFiles.push(childRecord);
+      provider.projectSpendVisibleFiles.push(childRecord);
+      saved.sources.push({ sessionId: claude.sessionId, file: child.file, primary: false });
+      saved.files.push({ file: child.file, size: 1000, mtimeMs: child.mtimeMs, dev: child.dev, ino: child.ino });
+    }
+    vi.setSystemTime(now);
+    await provider.refresh(true);
+    assert.deepEqual(postedFigures(provider, claude.sessionId), [], 'the row drew a saved figure');
+    assert.equal(work.get('savedSpendSources:changed'), 1, 'the changed session was not counted');
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('a warm start posts the saved cost of a parent whose dispatched session is gone, and the corrected cost at the reply', async () => {
+  vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+  try {
+    const { provider, claude, saved, now, settle } = savedFiguresHarness();
+    const dispatched = { file: 'fixture/dispatched.jsonl', size: 800, mtimeMs: 9 };
+    const dispatchedRecord = savedFiguresRecord(dispatched.file, dispatched, 3);
+    provider.projectSpendFiles.push(dispatchedRecord);
+    provider.projectSpendVisibleFiles.push(dispatchedRecord);
+    saved.sources.push(
+      { sessionId: 'dispatched', file: dispatched.file, primary: true },
+      {
+        sessionId: claude.sessionId,
+        file: dispatched.file,
+        primary: false,
+        dispatchedFrom: 'dispatched',
+        dispatchedVia: 'dispatched',
+        dispatchedPrimary: true,
+      },
+    );
+    saved.files.push({ ...dispatched, dev: 1, ino: 9 });
+    const cost = () =>
+      provider.messages
+        .filter((message: any) => message.type === 'render' || message.type === 'rail')
+        .at(-1)
+        ?.rail.find((row: any) => row.id === claude.sessionId)?.costDollars;
+    vi.setSystemTime(now);
+    await provider.refresh(true);
+    assert.equal(cost(), 5, 'the row did not draw the saved cost with the dispatched session');
+    await settle();
+    assert.equal(cost(), 2, 'the reply did not correct the cost of the parent');
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test.each([
+  ['another workspace', (cache: any) => (cache.spendSources.scope = JSON.stringify(['elsewhere'])), 'scope'],
+  ['another format', (cache: any) => (cache.spendSources.version = SAVED_SPEND_SOURCES_VERSION + 1), 'incompatible'],
+  ['another relationship parser', (cache: any) => (cache.spendSources.compatibility = 'other'), 'incompatible'],
+  ['a file without an inode', (cache: any) => delete cache.spendSources.files[0].ino, 'malformed'],
+  ['a cut-off write', null, 'missing'],
+])('a saved source set of %s is refused and the rows draw no saved figure', async (_case, edit, reason) => {
+  vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+  try {
+    const { provider, claude, saved, work, now } = savedFiguresHarness();
+    const file = path.join(tempDir('saved-spend-sources-'), 'derived-session-cache-v2.json');
+    saveDerivedCache(file, [], [], [], undefined, undefined, [], undefined, undefined, [], [], undefined, saved);
+    const text = fs.readFileSync(file, 'utf8');
+    if (edit) {
+      const cache = JSON.parse(text);
+      edit(cache);
+      fs.writeFileSync(file, JSON.stringify(cache));
+    } else fs.writeFileSync(file, text.slice(0, text.indexOf('"spendSources"') + 40));
+    const loaded = loadDerivedCache(file);
+    provider.savedSpendSources = loaded.spendSources;
+    provider.savedSpendSourcesRefused = loaded.spendSourcesRefused;
+    vi.setSystemTime(now);
+    await provider.refresh(true);
+    assert.deepEqual(postedFigures(provider, claude.sessionId), [], 'the row drew a saved figure');
+    assert.equal(work.get(`savedSpendSources:refused:${reason}`), 1, [...work.keys()].join(', '));
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('the reply replaces the saved sources, draws a new session and posts no figure again for an unchanged one', async () => {
+  vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+  try {
+    const { provider, claude, other, now, settle } = savedFiguresHarness();
+    // A session that the saved set does not hold, with a record in the spend index.
+    const otherRecord = savedFiguresRecord(other.file, other);
+    provider.projectSpendFiles.push(otherRecord);
+    provider.projectSpendVisibleFiles.push(otherRecord);
+    vi.setSystemTime(now);
+    await provider.refresh(true);
+    assert.ok(postedFigures(provider, claude.sessionId).includes('cost'), 'the saved cost was not posted');
+    assert.deepEqual(postedFigures(provider, other.sessionId), [], 'a session without saved sources drew a figure');
+    const before = provider.messages.length;
+    const saved = provider.messages.findLast((message: any) => message.stats?.[claude.sessionId]).stats[
+      claude.sessionId
+    ];
+    await settle();
+    assert.equal(provider.savedRowSources, null, 'the reply left the saved sources in place');
+    assert.ok(
+      provider.sessionSpendSources.some((source: any) => source.sessionId === claude.sessionId),
+      'the reply did not set the sources of the parent',
+    );
+    // The host sends each session list message as a row delta, which carries the figures of changed sessions only.
+    const lists = provider.messages
+      .slice(before)
+      .filter((message: any) => message.type === 'render' || message.type === 'rail');
+    assert.ok(
+      lists.some((message: any) => message.stats?.[other.sessionId]?.length),
+      'the reply drew no figure of the new session',
+    );
+    // A snapshot carries every figure, so it must carry the saved figures unchanged.
+    assert.deepEqual(
+      lists
+        .filter((message: any) => message.rows?.base !== null && claude.sessionId in (message.stats ?? {}))
+        .map((message: any) => message.type),
+      [],
+      'the reply posted the figures of an unchanged session again',
+    );
+    for (const message of lists.filter((message: any) => message.rows?.base === null))
+      assert.deepEqual(message.stats[claude.sessionId], saved, 'a snapshot after the reply changed the saved figures');
+    const written = provider.savedSpendSourcesToWrite();
+    assert.deepEqual(
+      [written.scope, written.sources.find((source: any) => source.sessionId === claude.sessionId)],
+      [JSON.stringify(['project']), { sessionId: claude.sessionId, file: claude.file, primary: true }],
+      'the next derived cache write does not save the sources of the reply',
+    );
+    assert.deepEqual(
+      written.files.find((file: any) => file.file === claude.file),
+      { file: claude.file, size: claude.size, mtimeMs: claude.mtimeMs, dev: claude.dev, ino: claude.ino },
+      'the saved sources lack the identity that the walk listed',
+    );
   } finally {
     vi.useRealTimers();
   }
@@ -28944,7 +29269,12 @@ function derivedCacheMigrationHarness(files: ReturnType<typeof activationCacheFi
     statements[0]?.startsWith('const cached = this.derivedCacheFile ? loadDerivedCache('),
     'the provider no longer restores the derived cache at startup',
   );
-  const members = ['derivedCacheImports', 'checkpointDerivedCache', 'writeDerivedCache'].map((name) => {
+  const members = [
+    'derivedCacheImports',
+    'checkpointDerivedCache',
+    'writeDerivedCache',
+    'savedSpendSourcesToWrite',
+  ].map((name) => {
     const member = owner.members.find((candidate) => candidate.name?.getText(file) === name);
     assert.ok(member, `panelhost.ts no longer declares ${name}`);
     return member.getText(file);

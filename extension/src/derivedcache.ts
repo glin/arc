@@ -12,6 +12,7 @@ import {
   type SessionNameSource,
 } from './sessionnames';
 import { codexSessionsRoot, type CodexSessionMeta } from './codex';
+import type { SessionSpendSource } from './projectspend';
 import {
   agentRunOfScan,
   isCacheLifetime,
@@ -403,6 +404,9 @@ export interface DerivedCache {
   links?: SavedDiscoveryLinks;
   // The file held a link set that failed validation, so `links` is absent for that reason.
   linksMalformed?: boolean;
+  spendSources?: SavedSpendSources;
+  // The file held a source set of another version or one that failed validation, so `spendSources` is absent for that reason.
+  spendSourcesRefused?: 'malformed' | 'incompatible';
   // Complete prompt scans of Claude transcripts by file, each at the revision it read. See `savedPromptScanOf`.
   promptScans?: Map<string, HumanPromptScan>;
   // The openings that earlier launches read for Claude transcripts. See `savedOpeningCurrent`.
@@ -441,6 +445,159 @@ export function savedLinksRefusal(
   if (saved.scope !== scope) return 'scope';
   if (saved.compatibility !== compatibility) return 'incompatible';
   return null;
+}
+
+// The spend sources of each session at the last complete discovery reply that settled membership, with the size,
+// modification time, device and inode of each source file that the reply's walk listed. A later start draws the turn count
+// and cost of an unchanged session from the spend index with them until its first complete reply.
+export interface SavedSpendSources {
+  version: number;
+  // The repository roots of the reply, as JSON.
+  scope: string;
+  // `discoveryCompatibility` of the relationship parser version that found the sources.
+  compatibility: string;
+  sources: SessionSpendSource[];
+  files: SavedSpendFile[];
+}
+export interface SavedSpendFile {
+  file: string;
+  size: number;
+  mtimeMs: number;
+  dev: number | string;
+  ino: number | string;
+}
+// Bump when the fields of a saved spend source, or the rules that build the sources, change. A set of another version is
+// refused.
+export const SAVED_SPEND_SOURCES_VERSION = 1;
+// A larger source set is not saved.
+export const MAX_SAVED_SPEND_SOURCES = 65_536;
+
+export type SavedSpendSourcesRefusal = 'missing' | 'malformed' | 'scope' | 'incompatible';
+// Why a saved source set cannot draw row figures, before its files are compared with the walk.
+export function savedSpendSourcesRefusal(
+  saved: SavedSpendSources | undefined,
+  refused: 'malformed' | 'incompatible' | undefined,
+  scope: string,
+  compatibility: string,
+): SavedSpendSourcesRefusal | null {
+  if (!saved) return refused ?? 'missing';
+  if (saved.scope !== scope) return 'scope';
+  if (saved.compatibility !== compatibility) return 'incompatible';
+  return null;
+}
+
+// The saved form of a settled source list. `listed` holds rows with the walk's stat of each file, and a later row of a file
+// replaces an earlier one. A source file without a listed row with a device and inode saves no identity.
+export function savedSpendSourcesOf(
+  scope: string,
+  compatibility: string,
+  sources: readonly SessionSpendSource[],
+  listed: Iterable<
+    Pick<FileRevision, 'size' | 'mtimeMs'> & { file: string; dev?: number | string; ino?: number | string }
+  >,
+  key: (file: string) => string,
+): SavedSpendSources {
+  const stats = new Map<string, SavedSpendFile>();
+  for (const { file, size, mtimeMs, dev, ino } of listed)
+    if (dev !== undefined && ino !== undefined && fileIdentityValue(dev) && fileIdentityValue(ino))
+      stats.set(key(file), { file, size, mtimeMs, dev, ino });
+  const files = new Map<string, SavedSpendFile>();
+  for (const source of sources) {
+    const at = key(source.file);
+    const stat = stats.get(at);
+    if (stat) files.set(at, { ...stat, file: source.file });
+  }
+  return {
+    version: SAVED_SPEND_SOURCES_VERSION,
+    scope,
+    compatibility,
+    sources: [...sources],
+    files: [...files.values()],
+  };
+}
+
+// The saved sources of each session whose source files kept their identity, and the count of sessions that lost them. A
+// source file that the walk lists keeps its identity when its saved size, modification time, device and inode equal the
+// walk's stat, and its spend index record has the same size and modification time. A source file that the walk does not
+// list keeps its saved source, so its spend index record counts as it stands. `key` gives the walk's key of a file.
+export function admittedSpendSources(
+  saved: SavedSpendSources,
+  key: (file: string) => string,
+  listed: ReadonlyMap<
+    string,
+    Pick<FileRevision, 'size' | 'mtimeMs'> & { dev?: number | string; ino?: number | string }
+  >,
+  recorded: (file: string) => { size: number; mtimeMs: number } | undefined,
+): { sources: SessionSpendSource[]; changed: number } {
+  const identities = new Map(saved.files.map((file) => [key(file.file), file]));
+  const kept = new Map<string, boolean>();
+  const unchanged = (file: string): boolean => {
+    const at = key(file);
+    let answer = kept.get(at);
+    if (answer !== undefined) return answer;
+    const stat = listed.get(at);
+    const identity = identities.get(at);
+    const record = stat && recorded(file);
+    answer =
+      !stat ||
+      (!!identity &&
+        !!record &&
+        fileIdentityValue(stat.dev) &&
+        fileIdentityValue(stat.ino) &&
+        String(stat.dev) === String(identity.dev) &&
+        String(stat.ino) === String(identity.ino) &&
+        stat.size === identity.size &&
+        stat.mtimeMs === identity.mtimeMs &&
+        record.size === stat.size &&
+        record.mtimeMs === stat.mtimeMs);
+    kept.set(at, answer);
+    return answer;
+  };
+  const refused = new Set<string>();
+  for (const source of saved.sources) if (!unchanged(source.file)) refused.add(source.sessionId);
+  return { sources: saved.sources.filter((source) => !refused.has(source.sessionId)), changed: refused.size };
+}
+
+function savedSpendSource(value: unknown): value is SessionSpendSource {
+  return (
+    record(value) &&
+    nonEmptyText(value.sessionId) &&
+    fileName(value.file) &&
+    (value.primary === undefined || typeof value.primary === 'boolean') &&
+    (value.nativeParentFile === undefined || fileName(value.nativeParentFile)) &&
+    (value.dispatchedFrom === undefined || nonEmptyText(value.dispatchedFrom)) &&
+    (value.dispatchedVia === undefined || nonEmptyText(value.dispatchedVia)) &&
+    (value.dispatchedPrimary === undefined || value.dispatchedPrimary === true)
+  );
+}
+
+function savedSpendFile(value: unknown): value is SavedSpendFile {
+  return (
+    record(value) &&
+    fileName(value.file) &&
+    Number.isSafeInteger(value.size) &&
+    (value.size as number) >= 0 &&
+    finite(value.mtimeMs) &&
+    fileIdentityValue(value.dev) &&
+    fileIdentityValue(value.ino)
+  );
+}
+
+// A stored set of the current version that passes validation, or the reason it is refused.
+function storedSpendSources(value: unknown): Pick<DerivedCache, 'spendSources' | 'spendSourcesRefused'> {
+  if (value === undefined) return {};
+  if (record(value) && value.version !== SAVED_SPEND_SOURCES_VERSION) return { spendSourcesRefused: 'incompatible' };
+  return record(value) &&
+    text(value.scope) &&
+    text(value.compatibility) &&
+    Array.isArray(value.sources) &&
+    Array.isArray(value.files) &&
+    value.sources.length <= MAX_SAVED_SPEND_SOURCES &&
+    value.files.length <= MAX_SAVED_SPEND_SOURCES &&
+    value.sources.every(savedSpendSource) &&
+    value.files.every(savedSpendFile)
+    ? { spendSources: value as unknown as SavedSpendSources }
+    : { spendSourcesRefused: 'malformed' };
 }
 
 export interface CarriedName {
@@ -674,6 +831,7 @@ interface StoredCache {
   links?: SavedDiscoveryLinks;
   promptScans?: StoredPromptScans;
   claudeOpenings?: StoredClaudeOpenings;
+  spendSources?: SavedSpendSources;
 }
 
 export type MetadataGenerations = Readonly<Record<AgentKind, number>>;
@@ -1588,6 +1746,7 @@ export function loadDerivedCache(
     loaded.codexMetas = legacy ? storedCodexMetas(parsed) : new Map();
     if (format === 2 && savedDiscoveryLinks(parsed.links)) loaded.links = parsed.links;
     else if (format === 2 && parsed.links !== undefined) loaded.linksMalformed = true;
+    if (format === 2) Object.assign(loaded, storedSpendSources(parsed.spendSources));
     if (format === 2) loaded.promptScans = storedPromptScans(parsed.promptScans);
     if (format === 2) loaded.claudeOpenings = storedClaudeOpenings(parsed.claudeOpenings);
     if (Array.isArray(parsed.unsettledAdoptions)) {
@@ -1725,6 +1884,7 @@ export function saveDerivedCache(
   promptScans: Iterable<[string, HumanPromptScan]> = [],
   unsettledAdoptions: Iterable<[string, string]> = [],
   claudeOpenings?: SavedClaudeOpenings,
+  spendSources?: SavedSpendSources,
 ): void {
   const savedScans = new Map<string, HumanPromptScan>();
   for (const [scanFile, scan] of promptScans) {
@@ -1788,6 +1948,12 @@ export function saveDerivedCache(
       parents: storedClaudeOpeningRows(claudeOpenings.parents),
       children: storedClaudeOpeningRows(claudeOpenings.children),
     },
+    spendSources:
+      spendSources &&
+      spendSources.sources.length <= MAX_SAVED_SPEND_SOURCES &&
+      spendSources.files.length <= MAX_SAVED_SPEND_SOURCES
+        ? spendSources
+        : undefined,
   };
   writeFileAtomically(file, JSON.stringify(data), replace);
 }

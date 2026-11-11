@@ -677,6 +677,10 @@ import {
   type ClaudeChildReferenceCacheEntry,
   type SavedDiscoveryLinks,
   savedLinksRefusal,
+  type SavedSpendSources,
+  admittedSpendSources,
+  savedSpendSourcesOf,
+  savedSpendSourcesRefusal,
 } from './derivedcache';
 import { drawnSessionCards } from './sessiondetails';
 import {
@@ -1730,6 +1734,14 @@ export class PanelProvider implements vscode.Disposable {
   private claudeSpendSources: SessionSpendSource[] = [];
   private codexSpendSources: { file: string }[] = [];
   private sessionSpendSources: readonly SessionSpendSource[] = [];
+  // The sources that the derived cache saved at the last settled reply of an earlier activation, or why it refused them.
+  private savedSpendSources?: SavedSpendSources;
+  private savedSpendSourcesRefused?: 'malformed' | 'incompatible';
+  // The saved sources that draw the session figures until the first complete discovery reply. Undefined until the walk and
+  // the spend index load let `admitSavedSpendSources` run, and null after a refusal or that reply.
+  private savedRowSources: readonly SessionSpendSource[] | null | undefined = undefined;
+  // The sources of the last settled reply in this activation, which the next derived cache write saves.
+  private settledSpendSources?: { scope: string; sources: readonly SessionSpendSource[] };
   private readonly sessionSpendSourceIndex = new SessionSpendSourceIndex();
   private readonly subagentDirectories = new SubagentDirectoryCache();
   private readonly codexStats = new CodexStatCache();
@@ -3983,6 +3995,8 @@ export class PanelProvider implements vscode.Disposable {
       this.discoveryCheckpoint = cached.discovery;
       this.savedLinks = cached.links;
       this.savedLinksMalformed = cached.linksMalformed === true;
+      this.savedSpendSources = cached.spendSources;
+      this.savedSpendSourcesRefused = cached.spendSourcesRefused;
       this.savedPromptScans = cached.promptScans ?? new Map();
       for (const [file, opening] of cached.claudeOpenings?.parents ?? [])
         this.cwds.set(file, { ...opening, saved: true });
@@ -12939,6 +12953,7 @@ export class PanelProvider implements vscode.Disposable {
           [...(this.savedPromptScans ?? []), ...(this.humanScans ?? [])],
           [...(this.adoptionsUnsettled ?? [])].map(([plain, held]): [string, string] => [plain, held.twin]),
           { parents: parentOpenings, children: childOpenings },
+          this.savedSpendSourcesToWrite(),
         );
       const published = this.workspaceCache
         ? this.workspaceCache.write(write, this.cacheShutdownFlushing, file)
@@ -12952,6 +12967,20 @@ export class PanelProvider implements vscode.Disposable {
       /* an optional cache must not affect the panel */
     }
     return false;
+  }
+
+  // The sources of the last settled reply with the identity that the current walk lists for each file, or else the set this
+  // activation loaded.
+  private savedSpendSourcesToWrite(): SavedSpendSources | undefined {
+    const settled = this.settledSpendSources;
+    if (!settled) return this.savedSpendSources;
+    return savedSpendSourcesOf(
+      settled.scope,
+      discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
+      settled.sources,
+      [...(this.walkedChildSources ?? []), ...(this.walkedCatalog?.parents ?? [])],
+      normalizeFsPath,
+    );
   }
 
   // A bounded metadata answer wins. Complete lifetime facts fill a missing newest start.
@@ -13254,12 +13283,51 @@ export class PanelProvider implements vscode.Disposable {
     return picked;
   }
 
+  // The sources of the session figures. Before the first complete discovery reply, they are the admitted saved sources.
+  // Project cost, its index order, cost-state indexing and dispatch ownership read `sessionSpendSources` alone.
+  private rowSpendSources(): readonly SessionSpendSource[] {
+    if (this.savedRowSources === undefined) this.savedRowSources = this.admitSavedSpendSources();
+    return this.savedRowSources ?? this.sessionSpendSources;
+  }
+
+  // The saved sources of each session whose files kept their identity, once the walk of the current scope and the spend index
+  // load have run. Undefined while either is missing, and null when the reply came first or the saved set is refused.
+  private admitSavedSpendSources(): readonly SessionSpendSource[] | null | undefined {
+    if (this.claudeChildrenDiscovered) return null;
+    const scope = JSON.stringify(this.repositoryScopeRoots);
+    const walk = this.walkedCatalog;
+    if (!this.projectSpendHydrated || !walk || walk.scope !== scope) return undefined;
+    const refusal = savedSpendSourcesRefusal(
+      this.savedSpendSources,
+      this.savedSpendSourcesRefused,
+      scope,
+      discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
+    );
+    if (refusal) {
+      this.performanceCounters.recordWork(`savedSpendSources:refused:${refusal}`);
+      return null;
+    }
+    const listed = new Map(
+      [...(this.walkedChildSources ?? []), ...walk.parents].map((row) => [normalizeFsPath(row.file), row]),
+    );
+    const records = new Map(this.lifetimeDisplayFiles().map((record) => [normalizeWorkspace(record.file), record]));
+    const admitted = admittedSpendSources(
+      this.savedSpendSources!,
+      normalizeFsPath,
+      listed,
+      (file) => records.get(normalizeWorkspace(file)) ?? records.get(normalizeSpendFile(file)),
+    );
+    if (admitted.changed) this.performanceCounters.recordWork('savedSpendSources:changed', admitted.changed);
+    this.performanceCounters.recordWork('savedSpendSources:admitted');
+    return admitted.sources;
+  }
+
   private lifetimeFiguresBySession(): LifetimeFigures {
     const labels: ModelLabels | undefined = this.modelLabels;
     // Cache lifetime figures by session sources, displayed records, pending-source state, and model display names.
     return this.lifetimeFigures.read(
       this.lifetimeDisplayFiles(),
-      this.sessionSpendSources,
+      this.rowSpendSources(),
       (sessionId, files, sources, pending): SessionPricedFigures | undefined => {
         // The contributions are priced here, once per change, so a card draw only looks them up.
         const contributions = sources.some((source) => source.dispatchedVia !== undefined)
@@ -15454,6 +15522,7 @@ export class PanelProvider implements vscode.Disposable {
 
   // Catalog membership selects dispatch edges consistently for headings, spend sources, and refresh keys.
   private updateSessionSpendSources(codex: SessionFile[], sessions: readonly SessionFile[]): void {
+    this.savedRowSources = null;
     const revision = this.sessionSpendSourceIndex.revision;
     this.sessionSpendSources = this.sessionSpendSourceIndex.update(
       this.claudeSpendSources,
@@ -15871,6 +15940,14 @@ export class PanelProvider implements vscode.Disposable {
     };
     this.settledDiscovery = undefined;
     this.updateSessionSpendSources(codex, sessions);
+    if (membersSettled && this.settledSpendSources?.sources !== this.sessionSpendSources) {
+      this.settledSpendSources = {
+        scope: JSON.stringify(this.repositoryScopeRoots),
+        sources: this.sessionSpendSources,
+      };
+      this.savedSpendSources = undefined;
+      this.derivedCacheCheckpointState.markChanged();
+    }
     if (this.catalog) {
       this.catalog = { ...this.catalog, sessions };
     }
