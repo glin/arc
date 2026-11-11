@@ -409,9 +409,9 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
       host.dataset.vscodeContext = JSON.stringify(
         turnMenuContext(card, options.read.isRead(card), 'body', notesOn(card).length > 0, selected, labeled),
       );
-      const head = host.querySelector<HTMLElement>('.head');
+      const heads = host.querySelectorAll<HTMLElement>('.head, .turnmenu');
       const body = host.querySelector<HTMLElement>('.body');
-      if (head) {
+      for (const head of Array.from(heads)) {
         const context = turnMenuContext(
           card,
           options.read.isRead(card),

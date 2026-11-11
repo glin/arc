@@ -894,10 +894,7 @@ button.railtermmore:hover {
 .sessionheading > .sessionlayout {
   margin-left: auto;
 }
-/* The session's own menu, always visible rather than shown on hover. A control found
-   only by a reader who already hovers there is the right-click problem again, and this button
-   exists to answer it. The pin before it and the layout gear after it share this rule. All three
-   take the idle colour at rest and the same hover pair `.railact:hover` uses below. */
+/* Native action buttons share artwork, hover surfaces, and focus treatment. */
 .sessionmenu {
   flex: none;
   width: 1.9em;
@@ -1112,6 +1109,37 @@ button.railtermmore:hover {
   cursor: default;
   padding-bottom: 6px;
   border-bottom: 1px solid var(--edge);
+}
+.cardheading.has-turnmenu {
+  position: relative;
+  anchor-scope: --turn-timing-end;
+}
+.has-turnmenu > .head > .timing {
+  margin-right: calc(var(--t-body) * 1.9);
+}
+.has-turnmenu > .head > .timing > :last-child {
+  anchor-name: --turn-timing-end;
+}
+.has-turnmenu > .turnmenu {
+  position: absolute;
+  position-anchor: --turn-timing-end;
+  left: calc(anchor(right) + 2px);
+  top: anchor(center);
+  translate: 0 -50%;
+  opacity: 0;
+}
+.turn:hover .has-turnmenu > .turnmenu,
+.compaction:hover .has-turnmenu > .turnmenu,
+.has-turnmenu:focus-within > .turnmenu {
+  opacity: 1;
+}
+@media (hover: none) {
+  .has-turnmenu > .turnmenu {
+    opacity: 1;
+  }
+}
+.cardheading > .head > .timing + .model {
+  margin-left: auto;
 }
 button.head {
   cursor: pointer;

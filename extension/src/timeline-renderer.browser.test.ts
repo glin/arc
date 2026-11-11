@@ -4691,7 +4691,7 @@ test('a long activity update keeps the chosen disclosure and visible row', async
     }));
     payload.cards = [card];
     await post(page, payload);
-    await page.locator(`[data-control=${JSON.stringify(`card:${card.key}`)}]`).click();
+    await page.locator(`[data-control=${JSON.stringify(`card:${card.key}`)}]`).press('Enter');
     await page.locator(`[data-control=${JSON.stringify(`activity:${card.key}`)}]`).click();
     await page.locator(`[data-control=${JSON.stringify(`activity:${card.key}`)}]`).click();
     const row = page.locator(`[data-key=${JSON.stringify(card.key)}] .actrow`).nth(25);
@@ -4752,6 +4752,229 @@ test("the session menu button presses the row's own context menu", async (t) => 
       null,
       'pressing the drawn menu button raised no contextmenu event on the row that carries data-vscode-context',
     );
+  } finally {
+    await browser.close();
+  }
+});
+
+test('turn menus preserve disclosure, selection scope, current context, and focus', async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('A browser is required');
+    return;
+  }
+  const page = await browser.newPage();
+  try {
+    await page.setContent(themed(pageHtml()));
+    const payload = renderPayload() as Payload;
+    const first = {
+      ...payload.cards[0],
+      status: 'done',
+      live: false,
+      summaryHtml: '<p>Selected response from the first turn.</p>',
+    };
+    const second = {
+      ...first,
+      key: `${first.sessionId}:menu-other`,
+      summaryHtml: '<p>Response from the other turn.</p>',
+    };
+    payload.cards = [first, second];
+    await post(page, payload);
+    const host = page.locator(`[data-key=${JSON.stringify(first.key)}]`);
+    const head = host.locator('.head');
+    const menu = host.locator('.turnmenu');
+    const context = async () => JSON.parse((await menu.getAttribute('data-vscode-context')) || '{}');
+    await page.evaluate(() => {
+      document.addEventListener('contextmenu', (event) => {
+        const target = event.target as HTMLElement;
+        document.body.dataset.menuTarget = target.dataset.control;
+        document.body.dataset.menuCount = String(Number(document.body.dataset.menuCount ?? 0) + 1);
+      });
+    });
+    assert.equal(await menu.getAttribute('aria-haspopup'), 'menu');
+    assert.equal(await menu.getAttribute('title'), null);
+    assert.equal(await menu.getAttribute('aria-label'), `${CARD_ACTIONS.turnActions}: ${payload.cards[0].label}`);
+    assert.equal(await menu.evaluate((node) => node.previousElementSibling?.classList.contains('head')), true);
+    assert.equal(await menu.getAttribute('data-vscode-context'), await head.getAttribute('data-vscode-context'));
+    for (const key of ['Enter', 'Space', 'Shift+Enter', 'Shift+Space']) {
+      await menu.focus();
+      await menu.press(key);
+      assert.equal(await head.getAttribute('aria-expanded'), 'false');
+      assert.equal(await host.evaluate((node) => node.classList.contains('is-read')), false);
+    }
+    await menu.click({ modifiers: ['Shift'] });
+    assert.equal(await head.getAttribute('aria-expanded'), 'false');
+    assert.equal(await page.locator('body').getAttribute('data-menu-count'), '5');
+    assert.equal(
+      await menu.evaluate((node: HTMLElement) => {
+        node.blur();
+        window.dispatchEvent(new Event('focus'));
+        return document.activeElement === node;
+      }),
+      true,
+    );
+    await menu.click();
+    assert.equal(
+      await head.evaluate((node: HTMLElement) => {
+        node.focus();
+        window.dispatchEvent(new Event('focus'));
+        return document.activeElement === node;
+      }),
+      true,
+    );
+    assert.equal(await page.locator('body').getAttribute('data-menu-target'), `turnmenu:${first.key}`);
+    assert.equal(await page.evaluate(() => (window as any).__posted.some((m: any) => m.type === 'readerRead')), false);
+    await head.click();
+    await host.locator('.summary p').evaluate((node) => {
+      const range = document.createRange();
+      range.selectNodeContents(node);
+      getSelection()!.removeAllRanges();
+      getSelection()!.addRange(range);
+      document.dispatchEvent(new Event('selectionchange'));
+    });
+    await menu.click();
+    assert.equal(await page.evaluate(() => getSelection()?.toString()), 'Selected response from the first turn.');
+    assert.equal(await menu.evaluate((node) => document.activeElement === node), true);
+    assert.equal((await context()).arcSelection, true);
+    assert.ok(
+      await page.evaluate(
+        (session) => (window as any).__posted.some((m: any) => m.type === 'armSessionDetails' && m.session === session),
+        first.sessionId,
+      ),
+    );
+    await post(page, { type: 'sendSelectedText', key: first.key, copyLabels: false });
+    assert.equal(
+      await page.evaluate(
+        () => (window as any).__posted.filter((m: any) => m.type === 'selectedTextHandoff').at(-1)?.key,
+      ),
+      first.key,
+    );
+    const otherMenu = page.locator(`[data-control=${JSON.stringify(`turnmenu:${second.key}`)}]`);
+    await otherMenu.click();
+    await page.evaluate(() => {
+      (window as any).__posted.length = 0;
+    });
+    await post(page, { type: 'sendSelectedText', key: second.key, copyLabels: false });
+    assert.equal(
+      await page.evaluate(() => (window as any).__posted.some((m: any) => m.type === 'selectedTextHandoff')),
+      false,
+    );
+    await menu.focus();
+    await post(page, { type: 'setRead', key: first.key, read: false });
+    assert.equal((await context()).webviewSection, 'arcTurnUnreadSummary');
+    await post(page, {
+      type: 'notes',
+      comments: [
+        {
+          id: 'menu-comment',
+          sessionId: first.sessionId,
+          turnKey: first.key,
+          part: 'summary',
+          quote: 'Selected response',
+          note: 'Review this response.',
+          at: 1,
+          turnAt: first.startedAt,
+          headline: first.headline,
+          sessionTitle: '',
+        },
+      ],
+    });
+    assert.equal((await context()).arcComments, true);
+    const rail = payload.rail as Array<Record<string, unknown> & { id: string; labels?: string[] }>;
+    const labeled = rail.find((row) => row.id === first.sessionId)!;
+    labeled.labels = ['menu-label'];
+    await post(page, { type: 'rail', rail, labels: payload.labels });
+    assert.equal((await context()).sessionLabeled, true);
+    assert.equal(await menu.getAttribute('data-vscode-context'), await head.getAttribute('data-vscode-context'));
+    await page.evaluate(() => {
+      getSelection()!.removeAllRanges();
+      document.dispatchEvent(new Event('selectionchange'));
+    });
+    payload.cards = [{ ...first, headline: 'Updated response headline.', label: 'Updated turn identity.' }, second];
+    await post(page, payload);
+    assert.equal(await menu.evaluate((node) => document.activeElement === node), true);
+    assert.equal(await menu.getAttribute('aria-label'), `${CARD_ACTIONS.turnActions}: Updated turn identity.`);
+    payload.cards[0].label = 'Clock-updated turn identity.';
+    await post(page, payload);
+    assert.equal(await menu.getAttribute('aria-label'), `${CARD_ACTIONS.turnActions}: Clock-updated turn identity.`);
+  } finally {
+    await browser.close();
+  }
+});
+
+test('turn menus cover static and compaction headings while Codex retains complete model identity', async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('A browser is required');
+    return;
+  }
+  const page = await browser.newPage();
+  try {
+    await page.setContent(themed(pageHtml()));
+    const payload = renderPayload() as Payload;
+    const base = {
+      ...payload.cards[0],
+      agent: 'Codex',
+      model: 'GPT-6.1-Terra-Codex',
+      effort: 'ultra',
+      speed: 'Fast',
+      label: 'Codex GPT-6.1-Terra-Codex ultra Fast',
+    };
+    payload.cards = [
+      base,
+      { ...base, key: 's1:missing-model', model: null },
+      { ...base, key: 's1:other-agent', agent: 'Claude' },
+      {
+        ...base,
+        key: 's1:static',
+        duration: '',
+        prompt: '',
+        summary: '',
+        summaryHtml: '',
+        saidMessages: [],
+        activity: [],
+        delegation: '',
+        laterPrompts: [],
+        dispatched: [],
+        errorText: '',
+      },
+      { ...base, key: 's1:compaction-menu', kind: 'compaction', at: base.startedAt },
+    ];
+    await post(page, payload);
+    for (const card of payload.cards) {
+      const host = page.locator(`[data-key=${JSON.stringify(card.key)}]`);
+      assert.equal(await host.locator('.turnmenu').count(), 1);
+      assert.equal(
+        await host.locator('.turnmenu').getAttribute('data-vscode-context'),
+        await host.locator('.head').getAttribute('data-vscode-context'),
+      );
+      assert.equal(await host.locator('.agent').count(), card.model && card.agent === 'Codex' ? 0 : 1);
+      if (card.model) {
+        assert.equal(await host.locator('.head > .model').textContent(), card.model);
+        assert.equal(
+          await host.locator('.head > .model').getAttribute('title'),
+          `${card.agent} ${card.model} ultra Fast`,
+        );
+      }
+    }
+    assert.equal(await page.locator('[data-key="s1:static"] .head').evaluate((node) => node.tagName), 'SPAN');
+    assert.equal(await page.locator('[data-key="s1:static"] .durationfact').count(), 0);
+    assert.equal(
+      JSON.parse((await page.locator('[data-key="s1:compaction-menu"] .turnmenu').getAttribute('data-vscode-context'))!)
+        .arcTurn,
+      undefined,
+    );
+    const exported = await browser.newPage();
+    await exported.setContent(
+      themed(
+        pageHtml().replace(
+          'postMessage: (m) => window.__posted.push(m),',
+          'readOnly: true, postMessage: (m) => window.__posted.push(m),',
+        ),
+      ),
+    );
+    await post(exported, payload);
+    assert.equal(await exported.locator('.turnmenu').count(), 0);
   } finally {
     await browser.close();
   }

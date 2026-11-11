@@ -34,6 +34,8 @@ The timeline has one independent roving Tab stop. Controls outside its navigatio
 
 Draw width-dependent actions as controls only where they work. Session heading labels are buttons while the session list fits. At narrower widths they are spans with native titles. Button labels use panel hints. The roving selector names the button tag so read-only labels never enter its walk. Session list labels stay inside their selector button and cannot contain buttons. Responsive replacement transfers focus and the navigation stop.
 
+Each recorded card places a native Turn actions button immediately after its disclosure or static heading in the roving walk. Its accessible name identifies the turn. Whole-card hover or heading focus reveals it without moving content. It stays visible on devices without hover. Enter and Space open its native menu. Shift does not change its action. Updates preserve its focus identity. Closing the native menu returns focus to its surviving button unless another control owns focus.
+
 The session heading contains sibling name, pin, menu, and layout buttons in that order. The name button contains only the title. Its press pins the selectable full name open and exposes `aria-pressed`. The other buttons follow it in the roving walk. An `.sr-only` span supplies the full local activity time.
 
 Tab enters a pinned name's first Tab stop. Down enters its first action. Without Tab stops, either key enters the box only when its content overflows. Arrow, Page, Home, and End keys then scroll it. Escape, another name press, or an outside press closes it. Escape returns focus to the heading. Removing a focused worktree link keeps focus inside the popover.

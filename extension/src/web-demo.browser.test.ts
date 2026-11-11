@@ -558,7 +558,7 @@ describe('read-only web demo', () => {
           });
         await child.click();
         await page.locator('[data-control="session:arc-demo-sketch"]').waitFor();
-        expect(await page.locator('#list .turn').first().textContent()).toContain('Codex');
+        expect(await page.locator('#list .turn .head').first().getAttribute('aria-label')).toContain('Codex');
         await page.locator('[data-control="sessionparent:arc-read-state"]').click();
         await page.locator('[data-control="session:arc-read-state"]').waitFor();
         expect(await page.locator('#list .turn').count()).toBe(3);

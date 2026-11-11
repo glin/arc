@@ -20,6 +20,7 @@ import type { StatDetailRenderer } from './stat-detail.ts';
 import type { StatDetailList } from './stat-detail.ts';
 import type { PanelToHost } from './protocol.ts';
 import { inlineText } from './inline-text.ts';
+import { nativeMenuIcon, pressNativeMenu } from './native-menu.ts';
 import { StatChip } from './stat-chip.ts';
 import type { CardChip as ChipView } from './stat-chip.ts';
 import {
@@ -92,6 +93,7 @@ export interface CardWords {
   collapseTurn: string;
   expandShownDetail: string;
   collapseShownDetail: string;
+  turnActions: string;
   sessionActions: string;
   sessionActionsDetail: string;
   railPinHint: string;
@@ -1714,6 +1716,9 @@ function Card({
   }, []);
   const head = useRef<HTMLElement>(null);
   const body = useRef<HTMLDivElement>(null);
+  const menu = useRef<HTMLButtonElement>(null);
+  const hasMenu = !options.readOnly && !options.readonlyBody && !!card.sessionId && !!card.key;
+  const visibleAgent = card.agent !== 'Codex' || !card.model ? card.agent : null;
   const expandable = cardHasBody(card);
   const expanded = expandable && openState.isExpanded();
   const read = options.readonlyBody ? true : options.read!.isRead(card);
@@ -1736,6 +1741,9 @@ function Card({
     options.comments!.writeContext(host, card, 'body');
     if (head.current) {
       options.comments!.writeContext(head.current, card, 'head');
+    }
+    if (menu.current) {
+      options.comments!.writeContext(menu.current, card, 'head');
     }
     if (body.current) {
       options.comments!.writeContext(body.current, card, 'body');
@@ -1861,18 +1869,42 @@ function Card({
     : null;
 
   return h(Fragment, {}, [
-    h(
-      'h3',
-      { class: 'cardheading', id: cardHeadingId(card.key) },
+    h('h3', { class: `cardheading${hasMenu ? ' has-turnmenu' : ''}`, id: cardHeadingId(card.key) }, [
       h(expandable ? 'button' : 'span', headProps, [
         h('span', { class: 'glyph' }, glyph),
         h('span', { class: 'timing' }, timing),
-        card.agent ? h('span', { class: 'agent' }, card.agent) : null,
-        card.model ? h('span', { class: 'model' }, card.model) : null,
+        visibleAgent ? h('span', { class: 'agent' }, visibleAgent) : null,
+        card.model
+          ? h(
+              'span',
+              { class: 'model', title: [card.agent, card.model, card.effort, card.speed].filter(Boolean).join(' ') },
+              card.model,
+            )
+          : null,
         card.effort ? h('span', { class: 'effort' }, card.effort) : null,
         card.speed ? h('span', { class: 'speed', 'data-comment-metadata': 'speed' }, card.speed) : null,
       ]),
-    ),
+      hasMenu
+        ? h(
+            'button',
+            {
+              class: 'turnmenu sessionmenu',
+              ref: menu,
+              'data-control': `turnmenu:${card.key}`,
+              'aria-haspopup': 'menu',
+              'aria-label': `${cardWords().turnActions}: ${card.label}`,
+              'data-hint': cardWords().turnActions,
+              onMouseDown: (event: MouseEvent) => {
+                if (event.button !== 0) return;
+                event.preventDefault();
+                (event.currentTarget as HTMLButtonElement).focus({ preventScroll: true });
+              },
+              onClick: pressNativeMenu,
+            },
+            nativeMenuIcon(),
+          )
+        : null,
+    ]),
     h(
       'div',
       { class: 'chips', hidden: !card.chips?.length },
@@ -1911,6 +1943,11 @@ function writeCardClock(host: CardHost, card: CardView): void {
   const head = host.querySelector('.head');
   if (head && card.label && head.getAttribute('aria-label') !== card.label) {
     head.setAttribute('aria-label', card.label);
+  }
+  const menu = host.querySelector('.turnmenu');
+  const menuLabel = `${cardWords().turnActions}: ${card.label}`;
+  if (menu && menu.getAttribute('aria-label') !== menuLabel) {
+    menu.setAttribute('aria-label', menuLabel);
   }
   const when = host.querySelector<HTMLElement>('.when');
   const whenAbsolute = card.kind === 'compaction' ? card.absolute : card.lastAbsolute;

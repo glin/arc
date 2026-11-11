@@ -54,6 +54,8 @@ Keyboard copy of selected timeline text runs in the panel before VS Code restore
 
 ### Native context and menu order
 
+Turn actions opens the heading's native menu from a sibling button after the complete timing group. Opening it preserves selected response text without opening the turn or marking it read. Recorded turns and compactions retain their existing command eligibility. Read-only exports and pending submissions have no Turn actions button.
+
 Menu enablement reads the invoking turn card, session heading, session list row, file link, or summary link's context. Editor selection elsewhere supplies no target. Route commands to the panel that opened the menu.
 
 Session menus order their groups as follows:

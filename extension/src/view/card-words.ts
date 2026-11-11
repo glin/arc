@@ -103,6 +103,7 @@ export const CARD_ACTIONS = {
   lastActive: 'Last active',
   startedIn: 'Started in',
   // The session heading's menu offers pin, archive, labels, rename and details actions.
+  turnActions: 'Turn actions',
   sessionActions: 'Session actions',
   sessionActionsDetail: 'Pin, archive, labels, rename, and details',
   // Empty search results distinguish workspace, whole-session and partial-session searches.

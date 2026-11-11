@@ -221,8 +221,8 @@
   },
   "extension/src/timeline-renderer.browser.test.ts": {
     "reason": "Production timeline rendering must preserve native disclosure, selection, navigation, and accessible interaction. Markdown preview links must deliver click and keyboard destinations while fenced source remains copyable. Explicit link actions must retain destination identity, native event context, and invoking-panel ownership. A pinned popover's View more expander must keep its Tab stop.",
-    "cases": 77,
-    "matricesSha256": "fcc820ddc134c7a5b2e51939870b29648406048f7f675753b7b40fd887da57f5"
+    "cases": 79,
+    "matricesSha256": "76a1aea3c715478b17551e784ff5ef2e74dd17ff03eb1a8174ec9660f3e8c790"
   },
   "extension/src/timelinecheck.test.ts": {
     "reason": "Npm and extension-directory invocations must inspect the caller project through the real command environment.",
