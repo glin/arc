@@ -17,7 +17,7 @@ Paths are relative to `extension/src/`. [Architecture](architecture.md) owns pac
 | `identity.ts` | Re-exports product identifiers and owns measurement environment names, saved-state keys, and the multi-root spend workspace path | no |
 | `projectsetups.ts` | Canonical setup project identity, project-entry normalization, one-time legacy pin import, and serialized pin and accepted-profile persistence | no |
 | `sessiondetails.ts` | Filters cards to the displayed session | no |
-| `panelhost.ts` | Extension-host side of the panel webview, window state publication, per-host readiness, retained session list payloads, indexed selection sources and replacement-row inputs, durable initial catalog demand, staged loading, discovery walk comparison with a full request age bound, accepted progressive reader state, startup counters and sparse history, reader metadata read intent, and reader-started parent ownership, and context-detail acceptance, plus host-owned initial-name persistence and lifecycle cancellation | yes |
+| `panelhost.ts` | Extension-host side of the panel webview, window state publication, per-host readiness, retained session list payloads, selection scopes over the last computation of every listed session, durable initial catalog demand, staged loading, discovery walk comparison with a full request age bound, accepted progressive reader state, startup counters and sparse history, reader metadata read intent, and reader-started parent ownership, and context-detail acceptance, plus host-owned initial-name persistence and lifecycle cancellation | yes |
 | `timelinestate.ts` | Combines accepted tail, lifetime, and parsed outcomes, assembles child write and work times and live child IDs, caches child work by file version, projects session-list status and counts, and exposes the card's carried-subagent count | no |
 | `timelinecheck.ts` | Reads raw Claude work and close evidence independently, checks timeline consistency, and assembles read-only project sweeps through the shared timeline state and card projections | no |
 | `progressiveworker.ts` | Typed worker requests, cancellation, bounded pending-work, window read lifecycle and failure observations, discovery checkpoints and quantum deltas, transport counters, revision and generation acceptance, and host-lifetime commit evidence reservations. Completed Codex dispatched-source parses survive worker replacement in a host cache capped at 200 entries and 32 MiB of serialized payload. | no |
@@ -77,7 +77,7 @@ Paths are relative to `extension/src/`. [Architecture](architecture.md) owns pac
 | `panelbundle.ts` | Builds the compact browser program and stylesheet for the host build and page fixture | no |
 | `paneldevelopment.ts` | Validates the loopback development origin and component updates, then builds production or development panel HTML and CSP | no |
 | `paneltext.ts` | Replaces named panel tokens with values prepared by tested modules | no |
-| `payload.ts` | Shapes the render, selection, and session list messages, retains row projections against per-session inputs, and weighs messages by field, session list row, and repeated long string | no |
+| `payload.ts` | Shapes the render, selection, and session list messages, retains row projections against per-session inputs, keeps the clock of row wording and cache-mark instants, and weighs messages by field, session list row, and repeated long string | no |
 | `richtext.ts` | Safe block and noninteractive inline Markdown, named response session anchors, literal file citations, validated disclosure structure, host-only content references, local picture rules, and fallback text | no |
 | `uris.ts` | Read-only URI schemes used by diff editors | yes |
 | `externalopen.ts` | Binary-document eligibility for external opening, executable and text exclusions, and bounded regular-file sampling | no |
@@ -229,7 +229,7 @@ Paths are relative to `extension/src/`. [Architecture](architecture.md) owns pac
 | `view/stat-detail.ts` | Browser-safe cost-line suffix shared by host and panel renderers, including cached-input share and request scale. Selects which line-count figures appear. Defines the subagent-row figures sent over the wire | no |
 | `view/export-facts.ts` | Browser-safe readable labels and exact captured values with shared figure formatting | no |
 | `view/timeline-layout.ts` | Browser-safe Timeline layout values, defaults, dialog wording, normalization of hand-typed settings, and save-refusal messages | no |
-| `view/time.ts` | Browser-safe relative-time ladder with compact and verbose recency formatters, including `formatRelativeShort` for a compact session list row, the cache-span figure, and the duration formatter | no |
+| `view/time.ts` | Browser-safe relative-time ladder with compact and verbose recency formatters, including `formatRelativeShort` for a compact session list row and the instant at which a relative age changes its wording, the cache-span figure, and the duration formatter | no |
 | `view/tokens.ts` | Browser-safe compact token-count formatter shared by host and panel renderers | no |
 | `view/usage.ts` | Browser-safe display contracts for collapsed and expanded usage figures | no |
 | `usageview.ts` | Normalizes reported account limits, owns current-process admission and retained account exclusion, and prepares usage-bar rows | no |
