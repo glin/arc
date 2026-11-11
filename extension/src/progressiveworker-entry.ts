@@ -294,8 +294,9 @@ interface ReceiptScan {
   startups: Map<string, DispatchStartupRevision>;
   // When the scan that last read the store from its first entry opened. A reused scan keeps the time of the scan it reused.
   fullAt: number;
-  // The launches that the startup checks sent to be read again since the last step was counted.
-  rereads: number;
+  // Each launch that a reused scan sent to be read again and that has not been read yet, with true when the launch ended
+  // without a link in the completed scan.
+  reuseRetries: Map<string, boolean>;
 }
 let receiptScan: ReceiptScan | null = null;
 // A completed scan answers a new epoch only within the full pass age bound of the host's walk gate, from the opening of the
@@ -376,28 +377,35 @@ function closeReceiptScan(cause: 'epoch' | 'store' | 'refusal'): void {
 }
 // The first reason that a completed scan cannot answer a new epoch, or undefined when it can. The store must keep its
 // identity and prove the revision that the completed scan read, and the scan that read the store must be within the age bound.
+// A clock that reads earlier than the opening of that scan proves no age.
 function keptScanRefusal(kept: ReceiptScan): keyof typeof KEPT_SCAN_REFUSAL_CHARGES | undefined {
   if (kept.store.storeIdentity() !== kept.storeIdentity) return 'store';
-  if (Date.now() - kept.fullAt > RECEIPT_SCAN_REUSE_MAX_AGE_MS) return 'age';
+  const age = Date.now() - kept.fullAt;
+  if (age < 0 || age > RECEIPT_SCAN_REUSE_MAX_AGE_MS) return 'age';
   if (kept.storeRevision === undefined || kept.unproved) return 'unproved';
   const revision = kept.store.storeRevision();
   if (revision === undefined) return 'unproved';
   return revision === kept.storeRevision ? undefined : 'revision';
 }
-// A scan for a new epoch from a completed scan. It reads again each launch that ended without a link and each launch whose
-// requester or dispatched session changed catalog rows. Its steps then check the dispatched transcript of each other link.
-function reusedReceiptScan(kept: ReceiptScan, epoch: DiscoveryCheckpoint, charges: DiscoveryCharges): ReceiptScan {
+// A scan for a new epoch from a completed scan. It reads again each launch whose requester or dispatched session changed
+// catalog rows, and each launch without a link whose read reached its dispatched session. Such a read depends on files
+// outside the store, such as the opening of the dispatched transcript. Any other launch without a link stopped at its
+// requester or on a store file, and Arc completes each write of such a file with a write in the store directory that moves
+// the store revision. Its steps then check the dispatched transcript of each link that the scan holds.
+function reusedReceiptScan(kept: ReceiptScan, epoch: DiscoveryCheckpoint): ReceiptScan {
   const changed = changedCatalogIdentities(kept.catalog, epoch.catalog);
   const retries: string[] = [];
+  const reuseRetries = new Map<string, boolean>();
   for (const launchId of kept.visited) {
+    // The identities hold the requester, and then the dispatched session when the read reached it.
+    const identities = kept.launches.get(launchId) ?? [];
     const unlinked = !kept.references.has(launchId);
-    if (!unlinked && !kept.launches.get(launchId)?.some((identity) => changed.has(identity))) continue;
+    if (!identities.some((identity) => changed.has(identity)) && !(unlinked && identities.length > 1)) continue;
     kept.launches.delete(launchId);
     kept.references.delete(launchId);
     kept.startups.delete(launchId);
     retries.push(launchId);
-    charges.receiptScanReuseLaunches!++;
-    if (unlinked) charges.receiptScanReuseLaunchesUnlinked!++;
+    reuseRetries.set(launchId, unlinked);
   }
   const scan: ReceiptScan = {
     ...kept,
@@ -410,7 +418,7 @@ function reusedReceiptScan(kept: ReceiptScan, epoch: DiscoveryCheckpoint, charge
     storeRead: false,
     competitionRefused: false,
     unproved: false,
-    rereads: 0,
+    reuseRetries,
   };
   return scan;
 }
@@ -433,7 +441,7 @@ function* keptStartupChecks(current: () => ReceiptScan): ReceiptScan['steps'] {
       scan.references.delete(launchId);
       scan.startups.delete(launchId);
       scan.retries.push(launchId);
-      scan.rereads++;
+      scan.reuseRetries.set(launchId, false);
     }
     yield { entries: 0, bytes: 0, checks: 1 };
   }
@@ -1626,7 +1634,7 @@ async function execute(
       const opens = heldReceiptCountsFor(scope).opens;
       if (kept && !refusal) {
         opens.push('receiptScanReuses');
-        receiptScan = reusedReceiptScan(kept, epoch, charges);
+        receiptScan = reusedReceiptScan(kept, epoch);
       } else {
         opens.push(
           'receiptScanOpens',
@@ -1653,7 +1661,7 @@ async function execute(
           visited: new Set(),
           startups: new Map(),
           fullAt: Date.now(),
-          rereads: 0,
+          reuseRetries: new Map(),
         };
         receiptScan = scan;
       }
@@ -1753,11 +1761,16 @@ async function execute(
       charges.receiptChecks! += step.value.checks;
       charges.receiptBytes! += step.value.bytes;
       charges.readBytes += step.value.bytes;
-      charges.receiptScanReuseLaunches! += activeReceipts.rereads;
-      activeReceipts.rereads = 0;
       const launchId = step.value.launchId;
       if (launchId !== undefined) {
         const identities = step.value.identities;
+        // A launch that a reused scan sent to be read again counts when its read ends.
+        const reused = activeReceipts.reuseRetries.get(launchId);
+        if (reused !== undefined) {
+          activeReceipts.reuseRetries.delete(launchId);
+          charges.receiptScanReuseLaunches!++;
+          if (reused) charges.receiptScanReuseLaunchesUnlinked!++;
+        }
         activeReceipts.visited.add(launchId);
         activeReceipts.references.delete(launchId);
         activeReceipts.startups.delete(launchId);
@@ -1847,7 +1860,7 @@ async function execute(
       scope: epoch.repositoryRoots,
       receiptStore: activeReceipts.storeIdentity,
       ...(activeReceipts.storeRevision !== undefined && !activeReceipts.unproved
-        ? { receiptRevision: { store: activeReceipts.storeRevision } }
+        ? { receiptRevision: { store: activeReceipts.storeRevision, observedAt: activeReceipts.fullAt } }
         : {}),
     };
   }

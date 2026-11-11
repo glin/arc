@@ -292,9 +292,10 @@ export interface DispatchStartupRevision {
 
 type RelationshipScan<T> = Generator<DispatchRelationshipStep, T, DispatchRelationshipAllowance>;
 
-// The root directory revisions observed before a complete receipt scan.
+// The root directory revisions observed before a complete receipt scan, and the clock time when the scan observed them.
 export interface DispatchStoreRevision {
   store: string;
+  observedAt: number;
 }
 // A write inside this margin of a stat can keep the directory's modification time on a filesystem with coarse times, so a
 // directory this young proves nothing about the next write.

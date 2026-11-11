@@ -316,6 +316,30 @@ export const OPENING_READ_COUNTERS = [
 // The work counters that name why a walk or a discovery pass ran. Each one appears only when the snapshot holds it.
 export const CAUSE_COUNTER_PREFIXES = ['walk:', 'discoveryRequest:', 'acceptedUnsettled', 'compressedNames:'] as const;
 
+// The discovery counters that name how each receipt scan opened and why relationship reads ran. A snapshot from a build
+// that does not count one of them holds no value, so the comparison shows "not reported".
+export const DISCOVERY_CAUSE_MEASURES = [
+  'receiptScanOpens',
+  'receiptScanOpensNewWorker',
+  'receiptScanOpensAfterEpoch',
+  'receiptScanOpensAfterStore',
+  'receiptScanOpensAfterRefusal',
+  'receiptScanOpensAfterCompletion',
+  'receiptScanOpensAfterCompletionStore',
+  'receiptScanOpensAfterCompletionAge',
+  'receiptScanOpensAfterCompletionUnproved',
+  'receiptScanOpensAfterCompletionRevision',
+  'receiptScanReuses',
+  'receiptScanReuseLaunches',
+  'receiptScanReuseLaunchesUnlinked',
+  ...['claude', 'codex'].flatMap((agent) =>
+    ['NoEntry', 'Rejected', 'Resumed', 'Growth', 'Validation', 'Boundary'].flatMap((cause) => [
+      `${agent}Relationship${cause}Bytes`,
+      `${agent}Relationship${cause}Sources`,
+    ]),
+  ),
+];
+
 // The measures a soak snapshot supplies, in the units the comparison reads. Every gauge passes through by its own name.
 export function soakMeasures(snapshot: {
   counters?: {
@@ -341,6 +365,7 @@ export function soakMeasures(snapshot: {
     'receiptLaunchesRead',
     'receiptLaunchesRejectedAtRequester',
     'receiptScanTurns',
+    ...DISCOVERY_CAUSE_MEASURES,
   ])
     if (typeof discovery[name] === 'number') out[name] = discovery[name];
   for (const [reason, counts] of Object.entries(snapshot.counters?.refreshes ?? {})) {

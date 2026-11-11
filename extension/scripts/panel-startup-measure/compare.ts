@@ -6,7 +6,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { arcHome } from '../../src/store.ts';
 import { warmCapRefusal } from './measure';
-import { CAUSE_COUNTER_PREFIXES, REQUIRED_DISCOVERY_MEASURES } from './soak';
+import { CAUSE_COUNTER_PREFIXES, DISCOVERY_CAUSE_MEASURES, REQUIRED_DISCOVERY_MEASURES } from './soak';
 
 // A candidate regresses when its value exceeds the baseline by this ratio and by the floor of its kind.
 export const MARGINS = { time: 1.5, count: 1.5, bytes: 1.5, memory: 1.25 } as const;
@@ -67,8 +67,15 @@ const COUNTS = new Set([
   'compressedDecodes',
   'compressedPending',
   'compressedTempEntries',
+  ...DISCOVERY_CAUSE_MEASURES.filter((name) => !name.endsWith('Bytes')),
 ]);
-const BYTES = new Set(['dispatchSpendBytes', 'readBytes', 'compressedStoreWriteBytes', 'compressedStoreBytes']);
+const BYTES = new Set([
+  'dispatchSpendBytes',
+  'readBytes',
+  'compressedStoreWriteBytes',
+  'compressedStoreBytes',
+  ...DISCOVERY_CAUSE_MEASURES.filter((name) => name.endsWith('Bytes')),
+]);
 // Measures that the report shows and the comparison gates only through a bound. Every row whose name starts with a
 // prefix of `REPORT_ONLY_PREFIXES` is report-only too.
 export const REPORT_ONLY = new Set([
@@ -83,6 +90,7 @@ export const REPORT_ONLY = new Set([
   'receiptLaunchesRead',
   'receiptLaunchesRejectedAtRequester',
   'receiptScanTurns',
+  ...DISCOVERY_CAUSE_MEASURES,
 ]);
 export const REPORT_ONLY_PREFIXES = [
   'refreshMs:',

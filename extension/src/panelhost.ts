@@ -16127,7 +16127,10 @@ export class PanelProvider implements vscode.Disposable {
       return false;
     };
     if (!held) return refuse('noBaseline');
-    if (Date.now() - held.settledAt > DISCOVERY_FULL_PASS_MAX_AGE_MS) return refuse('age');
+    // A reply can reuse a receipt scan that read the store before the reply settled, so the interval starts at the earlier
+    // time. A clock that reads earlier than that start proves no age.
+    const age = Date.now() - Math.min(held.settledAt, held.receipts.observedAt);
+    if (age < 0 || age > DISCOVERY_FULL_PASS_MAX_AGE_MS) return refuse('age');
     const enumeration = this.sourceEnumerations;
     if (held.scope !== JSON.stringify(this.repositoryScopeRoots)) return refuse('scope');
     if (held.folders !== this.catalog?.folders) return refuse('folders');

@@ -1548,16 +1548,21 @@ async function receiptDiscoveryHost(
 
 // A real receipt store and worker behind the host's walk gate. `age` moves the store directories past the recent-write margin
 // to a time no other call used, so a later write still moves their modification time. `advance` moves the host's clock and
-// the worker's clock past the full pass age bound. The worker reads its clock offset from a file.
-async function receiptWalkHarness(prefix = (_fx: ReturnType<typeof receiptDispatchFixture>) => '') {
+// the worker's clock, by default past the full pass age bound. The worker reads its clock offset from a file. `transform`
+// edits the worker source, and `coverage` receives the worker's coverage messages. `replies` holds the charges of each reply.
+async function receiptWalkHarness(
+  prefix = (_fx: ReturnType<typeof receiptDispatchFixture>) => '',
+  transform = (code: string) => code,
+  coverage?: (message: string) => void,
+) {
   let now = Date.now();
   vi.spyOn(Date, 'now').mockImplementation(() => now);
   const root = tempDir('receipt-walk-');
   const offset = path.join(root, 'worker-clock-offset');
   let advanced = 0;
-  const advance = () => {
-    now += 10 * 60_000 + 1;
-    advanced += 10 * 60_000 + 1;
+  const advance = (milliseconds = 10 * 60_000 + 1) => {
+    now += milliseconds;
+    advanced += milliseconds;
     fs.writeFileSync(offset, String(advanced));
   };
   const workerClock = `const clockFs=require('node:fs'),clockNow=Date.now;Date.now=()=>clockNow()+(clockFs.existsSync(${JSON.stringify(offset)})?Number(clockFs.readFileSync(${JSON.stringify(offset)},'utf8')):0);`;
@@ -1565,7 +1570,9 @@ async function receiptWalkHarness(prefix = (_fx: ReturnType<typeof receiptDispat
   fs.mkdirSync(fx.receipts.root, { recursive: true });
   vi.stubEnv('ARC_HOME', fx.home);
   const worker = new ProgressiveWorker(
-    `process.env.ARC_HOME=${JSON.stringify(fx.home)};` + workerClock + prefix(fx) + source,
+    `process.env.ARC_HOME=${JSON.stringify(fx.home)};` + workerClock + prefix(fx) + transform(source),
+    undefined,
+    coverage,
   );
   const { host, replies } = await receiptDiscoveryHost(worker, [root], fx.catalog);
   Object.assign(host, {
@@ -1579,22 +1586,40 @@ async function receiptWalkHarness(prefix = (_fx: ReturnType<typeof receiptDispat
   let generation = 0;
   let checks = 0;
   let launchesRead = 0;
+  const charged: import('./progressiveworker').DiscoveryCharges[] = [];
   let ages = 0;
   const age = () => {
     const time = Date.now() / 1000 - 3600 - ages++;
     for (const directory of [fx.receipts.root, path.join(fx.home, 'cache', 'dispatch-relationships')])
       if (fs.existsSync(directory)) fs.utimesSync(directory, time, time);
   };
-  const pass = async () => {
+  // One request of the current refresh generation. A cancelled request returns undefined.
+  const request = async (cancel?: AbortController) => {
+    replies.last = null;
+    const prepared = await host.prepareClaudeChildren(generation, (cancel ?? new AbortController()).signal);
+    if (cancel?.signal.aborted) return undefined;
+    assert.equal(prepared, true);
+    const value = (replies.last as ProgressiveResult | null)?.value;
+    if (value && 'charges' in value && value.charges) {
+      charged.push(value.charges);
+      checks += value.charges.receiptChecks ?? 0;
+      launchesRead += value.charges.receiptLaunchesRead ?? 0;
+    }
+    return value;
+  };
+  const refresh = () => {
     generation++;
     host.refreshGeneration = generation;
+  };
+  // A request of a new refresh generation that the coverage callback cancels.
+  const cancelled = async (cancel: AbortController) => {
+    refresh();
+    assert.equal(await request(cancel), undefined, 'the request was not cancelled');
+  };
+  const pass = async () => {
+    refresh();
     for (let turn = 0; turn < 100; turn++) {
-      assert.equal(await host.prepareClaudeChildren(generation, new AbortController().signal), true);
-      const value = replies.last?.value;
-      if (value && 'charges' in value) {
-        checks += value.charges?.receiptChecks ?? 0;
-        launchesRead += value.charges?.receiptLaunchesRead ?? 0;
-      }
+      const value = await request();
       if (value?.kind === 'claude-children' && !host.dispatchDiscoveryPending) {
         host.sessionQueryDiscoveryPending = false;
         return value;
@@ -1617,10 +1642,12 @@ async function receiptWalkHarness(prefix = (_fx: ReturnType<typeof receiptDispat
     worker,
     host,
     pass,
+    cancelled,
     walk,
     age,
     settle,
     advance,
+    charged,
     checks: () => checks,
     launchesRead: () => launchesRead,
   };
@@ -1655,7 +1682,7 @@ test('an unchanged receipt store records zero receipt checks across three walks'
 test.each(['added', 'changed', 'removed'] as const)(
   'a receipt %s while no member moves starts a pass that finds the change',
   async (change) => {
-    const { fx, worker, pass, walk, settle } = await receiptWalkHarness();
+    const { fx, worker, host, pass, walk, settle, age } = await receiptWalkHarness();
     const dispatched = (value: Awaited<ReturnType<typeof pass>>) =>
       value.references.filter((reference) => reference.kind === 'dispatch').map((reference) => reference.sessionId);
     try {
@@ -1667,10 +1694,16 @@ test.each(['added', 'changed', 'removed'] as const)(
       if (change === 'added') fx.launch(fx.parent, fx.grandchild);
       if (change === 'changed') fx.accept(waiting!.launchId, fx.grandchild);
       if (change === 'removed') fs.rmSync(path.join(fx.receipts.root, present!.launchId), { recursive: true });
+      // The aged directories prove a revision, so only the moved revision keeps the completed scan from answering.
+      age();
+      const counters = new PanelPerformanceCounters(0, 'receipt-revision');
+      host.performanceCounters = counters;
       assert.equal(await walk(), false, 'the walk kept discovery over a changed store');
       const reply = await pass();
       assert.equal(dispatched(reply).includes(fx.grandchild.sessionId), change !== 'removed');
       assert.ok(dispatched(reply).includes(fx.child.sessionId));
+      const discovery = counters.snapshot().discovery;
+      assert.deepEqual([discovery.receiptScanOpensAfterCompletionRevision, discovery.receiptScanReuses], [1, 0]);
     } finally {
       worker.stop();
       vi.unstubAllEnvs();
@@ -1736,6 +1769,51 @@ test.each([
       false,
       `the age bound pass kept the link after ${name(launchId)} changed`,
     );
+  } finally {
+    worker.stop();
+    vi.unstubAllEnvs();
+  }
+});
+
+// The reply at 9 minutes reuses the scan that read the store at 0 minutes, so the age bound still counts from 0 minutes.
+test('an in-place receipt write reaches the reader at the age bound of a scan that a later reply reused', async () => {
+  const { fx, worker, walk, settle, advance, pass } = await receiptWalkHarness();
+  const linked = (value: Awaited<ReturnType<typeof pass>>) =>
+    value.references.some((reference) => reference.kind === 'dispatch' && reference.sessionId === fx.child.sessionId);
+  try {
+    const { launchId } = fx.launch();
+    await settle();
+    const file = path.join(fx.receipts.root, launchId, 'receipt.json');
+    const content = JSON.parse(fs.readFileSync(file, 'utf8'));
+    content.launchId = 'dddddddd-1111-2222-3333-444444444444';
+    fs.writeFileSync(file, JSON.stringify(content));
+    advance(9 * 60_000);
+    growTranscript(fx.parent);
+    assert.equal(await walk(), false, 'a walk kept discovery over a grown parent');
+    assert.ok(linked(await pass()), 'the member change read the changed launch again');
+    advance(2 * 60_000);
+    assert.equal(await walk(), false, 'the walk kept discovery past the age bound of the reused scan');
+    assert.equal(linked(await pass()), false, 'the age bound pass kept the link after the receipt changed');
+  } finally {
+    worker.stop();
+    vi.unstubAllEnvs();
+  }
+});
+
+test('a clock that moves back ends the walk gate and the reuse of a completed receipt scan', async () => {
+  const { fx, worker, host, walk, settle, advance, pass } = await receiptWalkHarness();
+  try {
+    fx.launch();
+    await settle();
+    assert.equal(await walk(), true);
+    const counters = new PanelPerformanceCounters(0, 'receipt-clock-back');
+    host.performanceCounters = counters;
+    advance(-60_000);
+    assert.equal(await walk(), false, 'the walk kept discovery over a clock that moved back');
+    growTranscript(fx.parent);
+    await pass();
+    const discovery = counters.snapshot().discovery;
+    assert.deepEqual([discovery.receiptScanReuses, discovery.receiptScanOpensAfterCompletionAge], [0, 1]);
   } finally {
     worker.stop();
     vi.unstubAllEnvs();
@@ -1886,7 +1964,7 @@ test('a member change checks each held receipt link once across three walked req
   }
 });
 
-// The unaccepted launch ended without a link, so each reused scan reads it again.
+// The read of the unaccepted launch stopped on a store file before its dispatched session, so no reused scan reads it again.
 test('a member change that moves no catalog identity reads no held launch again', async () => {
   const { fx, worker, host, pass, walk, settle, launchesRead } = await receiptWalkHarness();
   const dispatched = (value: Awaited<ReturnType<typeof pass>>) =>
@@ -1916,8 +1994,179 @@ test('a member change that moves no catalog identity reads no held launch again'
         discovery.receiptScanReuseLaunches,
         discovery.receiptScanReuseLaunchesUnlinked,
       ],
-      [0, 3, 3, 3],
+      [0, 3, 0, 0],
     );
+  } finally {
+    worker.stop();
+    vi.unstubAllEnvs();
+  }
+});
+
+// The startup binding names the whole opening line of the child transcript, which is empty until the test writes the opening
+// in place. The child keeps its path, so it keeps its catalog identity, and only the second read of the launch finds the link.
+test('a launch whose child opening completes after a completed scan gets its link on a reused scan', async () => {
+  const { fx, worker, host, pass, settle } = await receiptWalkHarness();
+  try {
+    const opening = fs.readFileSync(fx.child.file);
+    fx.launch();
+    fs.truncateSync(fx.child.file, 0);
+    Object.assign(fx.child, revisionOf(fs.statSync(fx.child.file, { bigint: true })));
+    await settle();
+    const counters = new PanelPerformanceCounters(0, 'receipt-late-opening');
+    host.performanceCounters = counters;
+    fs.writeFileSync(fx.child.file, opening);
+    Object.assign(fx.child, revisionOf(fs.statSync(fx.child.file, { bigint: true })));
+    growTranscript(fx.parent);
+    const reply = await pass();
+    assert.equal(sessionParentIndex(reply.references).get(fx.child.sessionId)?.parent, fx.parent.sessionId);
+    const discovery = counters.snapshot().discovery;
+    assert.deepEqual(
+      [
+        discovery.receiptScanOpens,
+        discovery.receiptScanReuses,
+        discovery.receiptScanReuseLaunches,
+        discovery.receiptScanReuseLaunchesUnlinked,
+      ],
+      [0, 1, 1, 1],
+    );
+  } finally {
+    worker.stop();
+    vi.unstubAllEnvs();
+  }
+});
+
+// The requester of the second launch has a transcript that no catalog lists until the test adds it to the parents.
+test('a launch rejected at its requester is read again only when its requester enters the catalog', async () => {
+  const { fx, worker, host, pass, settle } = await receiptWalkHarness();
+  try {
+    const requester = fx.write('claude', 'eeeeeeee-1111-2222-3333-444444444444');
+    fx.launch(fx.parent, fx.child);
+    fx.launch(requester, fx.grandchild);
+    await settle();
+    const counters = new PanelPerformanceCounters(0, 'receipt-requester');
+    host.performanceCounters = counters;
+    const counts = () => {
+      const discovery = counters.snapshot().discovery;
+      return [
+        discovery.receiptScanReuses,
+        discovery.receiptScanReuseLaunches,
+        discovery.receiptScanReuseLaunchesUnlinked,
+        discovery.receiptLaunchesRejectedAtRequester,
+      ];
+    };
+    growTranscript(fx.parent);
+    const held = sessionParentIndex((await pass()).references);
+    assert.equal(held.get(fx.grandchild.sessionId), undefined);
+    assert.deepEqual(counts(), [1, 0, 0, 0], 'a reused scan read a launch whose requester stayed out of the catalog');
+    host.claudeParents = [...fx.catalog, requester];
+    const joined = sessionParentIndex((await pass()).references);
+    assert.equal(joined.get(fx.grandchild.sessionId)?.parent, requester.sessionId);
+    assert.equal(joined.get(fx.child.sessionId)?.parent, fx.parent.sessionId);
+    assert.deepEqual(counts(), [2, 1, 1, 0]);
+  } finally {
+    worker.stop();
+    vi.unstubAllEnvs();
+  }
+});
+
+// Each receipt slice ends after 16 steps with a reply. Once the marker exists, the worker cancels its own request four receipt
+// steps later, inside the second read of the launch whose child grew. That read takes more than 16 steps.
+test('a reused receipt scan that a cancel and slice replies interrupt keeps each link once and counts each read as it ends', async () => {
+  const marker = path.join(tempDir('receipt-reuse-cancel-'), 'cancel');
+  const cancel = new AbortController();
+  const requestStart = 'requests.set(message.id, controller);';
+  const step = 'receiptSteps++;';
+  const limit = 'receiptSteps >= RECEIPT_STEPS';
+  const { fx, worker, host, pass, cancelled, settle, charged } = await receiptWalkHarness(
+    () =>
+      `const reuseFs=require('node:fs'),reusePort=require('node:worker_threads').parentPort;let reuseRequest,reuseSteps=-1;`,
+    (code) => {
+      for (const text of [requestStart, step, limit, 'if (discoveryYield)'])
+        assert.ok(code.includes(text), `the worker source has no ${text}`);
+      return code
+        .replace(limit, 'receiptSteps >= 16')
+        .replace('if (discoveryYield)', 'if (true)')
+        .replace(
+          requestStart,
+          `${requestStart}if (message.request.kind === 'claude-children') reuseRequest = message.id;`,
+        )
+        .replace(
+          step,
+          `${step}if(reuseSteps<0&&reuseFs.existsSync(${JSON.stringify(marker)})){reuseFs.rmSync(${JSON.stringify(marker)});reuseSteps=4;}if(reuseSteps>0&&--reuseSteps===0){reusePort.postMessage({repeatedCoverage:'reuse-cancel'});reusePort.emit('message',{cancel:reuseRequest});}`,
+        );
+    },
+    (message) => {
+      if (message === 'reuse-cancel') cancel.abort();
+    },
+  );
+  try {
+    fx.launch(fx.parent, fx.child);
+    fx.launch(fx.child, fx.grandchild);
+    fx.launch(fx.parent, fx.grandchild, true, false);
+    await settle();
+    const counters = new PanelPerformanceCounters(0, 'receipt-reuse-interrupted');
+    host.performanceCounters = counters;
+    const settled = charged.length;
+    growTranscript(fx.child);
+    growTranscript(fx.parent);
+    fs.writeFileSync(marker, '');
+    await cancelled(cancel);
+    const reply = await pass();
+    const dispatched = reply.references.filter((reference) => reference.kind === 'dispatch');
+    assert.deepEqual(
+      dispatched.map((reference) => reference.sessionId).sort(),
+      [fx.child.sessionId, fx.grandchild.sessionId].sort(),
+    );
+    const parents = sessionParentIndex(reply.references);
+    assert.equal(parents.get(fx.child.sessionId)?.parent, fx.parent.sessionId);
+    assert.equal(parents.get(fx.grandchild.sessionId)?.parent, fx.child.sessionId);
+    const replies = charged.slice(settled);
+    assert.ok(replies.length > 2, `the reused scan took ${replies.length} replies`);
+    // The second read of the launch counts in the reply where its read ends.
+    assert.deepEqual(
+      replies.map((charges) => charges.receiptScanReuseLaunches ?? 0),
+      replies.map((charges) => charges.receiptLaunchesRead ?? 0),
+    );
+    const discovery = counters.snapshot().discovery;
+    assert.deepEqual(
+      [
+        discovery.receiptScanOpens,
+        discovery.receiptScanReuses,
+        discovery.receiptScanReuseLaunches,
+        discovery.receiptScanReuseLaunchesUnlinked,
+      ],
+      [0, 1, 1, 0],
+    );
+  } finally {
+    worker.stop();
+    vi.unstubAllEnvs();
+  }
+});
+
+test('a root change between a completed scan and its reuse drops the link of a session that left and restores it on return', async () => {
+  const { fx, root, worker, host, pass, settle } = await receiptWalkHarness();
+  try {
+    fx.launch(fx.parent, fx.child);
+    fx.launch(fx.child, fx.grandchild);
+    await settle();
+    const counters = new PanelPerformanceCounters(0, 'receipt-root-change');
+    host.performanceCounters = counters;
+    host.repositoryScopeRoots = [root, path.join(root, 'other')];
+    host.claudeParents = [fx.parent, fx.child];
+    const narrowed = sessionParentIndex((await pass()).references);
+    assert.equal(narrowed.get(fx.child.sessionId)?.parent, fx.parent.sessionId);
+    assert.equal(
+      narrowed.get(fx.grandchild.sessionId),
+      undefined,
+      'a link to a session that left the catalog survived',
+    );
+    host.repositoryScopeRoots = [root];
+    host.claudeParents = fx.catalog;
+    const restored = sessionParentIndex((await pass()).references);
+    assert.equal(restored.get(fx.grandchild.sessionId)?.parent, fx.child.sessionId);
+    assert.equal(restored.get(fx.child.sessionId)?.parent, fx.parent.sessionId);
+    const discovery = counters.snapshot().discovery;
+    assert.deepEqual([discovery.receiptScanOpens, discovery.receiptScanReuses], [0, 2]);
   } finally {
     worker.stop();
     vi.unstubAllEnvs();
@@ -13975,12 +14224,14 @@ async function descendantSpendAtAgeBound(aggregateBytes: number) {
     assert.equal(inBand.dispatchFacts.find((fact) => fact.sessionId === codexId)?.refreshAt, null);
     host.sessionQueryDiscoveryPending = false;
     const before = requests;
+    // The pass inside the band reuses the receipt scan that the first pass opened, so the age bound counts from that opening.
+    const opened = start + 1_000;
     for (let minute = 1; minute <= 10; minute++) {
-      setClock(start + 3_000 + minute * 60_000);
+      setClock(opened + minute * 60_000);
       if (!(await host.walkKeepsDiscovery(host.settledDiscovery))) await fullPass();
       assert.equal(requests, before, 'an unchanged walk sent a request before the age bound');
     }
-    setClock(start + 3_000 + 10 * 60_000 + 1);
+    setClock(opened + 10 * 60_000 + 1);
     assert.equal(await host.walkKeepsDiscovery(host.settledDiscovery), false);
     if (aggregateBytes) {
       assert.ok(openSpendBandMs(aggregateBytes) > 10 * 60_000);

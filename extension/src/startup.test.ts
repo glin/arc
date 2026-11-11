@@ -446,6 +446,7 @@ import {
 import { DispatchReceipts } from './dispatchreceipts';
 import {
   appendDispatchTurn,
+  DISCOVERY_CAUSE_MEASURES,
   instrumentSoak,
   linkTree,
   NAMED_COUNTERS,
@@ -2492,13 +2493,19 @@ test('the opening read counts of a saved snapshot reach the report and never fai
   assert.equal(measuresOf(held).get('openingsRead:children')?.value, 9);
 });
 
+// The scan opens and reuses and the relationship causes reach the report beside the receipt work counters.
 test('the receipt scan counters reach the report as count rows and an older baseline reads not reported', () => {
-  const candidate = {
+  const candidate: Record<string, number> = {
     receiptChecks: 83469,
     receiptLaunchesRead: 12,
     receiptLaunchesRejectedAtRequester: 40,
     receiptScanTurns: 2100,
+    ...Object.fromEntries(
+      DISCOVERY_CAUSE_MEASURES.map((name, index) => [name, (index + 1) * (name.endsWith('Bytes') ? 1024 * 1024 : 1)]),
+    ),
   };
+  assert.ok(DISCOVERY_CAUSE_MEASURES.includes('receiptScanReuseLaunchesUnlinked'));
+  assert.ok(DISCOVERY_CAUSE_MEASURES.includes('codexRelationshipBoundarySources'));
   const measures = soakMeasures({ counters: { discovery: candidate } });
   const older = soakMeasures({ counters: { discovery: { publications: 1 } } });
   const report = compareResults([runnerResult(older)], [runnerResult(measures)]);
@@ -2506,8 +2513,10 @@ test('the receipt scan counters reach the report as count rows and an older base
   for (const [name, value] of Object.entries(candidate)) {
     const row = report.find((measure) => measure.name === name);
     assert.ok(row, `the report has no ${name} row`);
-    assert.deepEqual([row.kind, row.baseline, row.reportOnly, row.regressed], ['count', null, true, false], name);
-    assert.ok(table.includes(`| ${name} | not reported | ${value} | n/a | report only | reported |`), name);
+    const kind = name.endsWith('Bytes') ? 'bytes' : 'count';
+    assert.deepEqual([row.kind, row.baseline, row.reportOnly, row.regressed], [kind, null, true, false], name);
+    const shown = kind === 'bytes' ? `${(value / 1024 / 1024).toFixed(1)} MiB` : value;
+    assert.ok(table.includes(`| ${name} | not reported | ${shown} | n/a | report only | reported |`), name);
   }
 });
 
@@ -15958,7 +15967,7 @@ function settledWalkHarness() {
         membershipSettled: reply.settled,
         continuation: !reply.settled,
         ...(reply.entries ? { referenceEntries: reply.entries } : {}),
-        receiptRevision: { store: new DispatchReceipts().storeRevision() },
+        receiptRevision: { store: new DispatchReceipts().storeRevision(), observedAt: Date.now() },
       },
     };
   };

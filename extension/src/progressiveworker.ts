@@ -300,8 +300,8 @@ export interface DiscoveryCharges
   receiptScanOpensAfterCompletionAge?: number;
   receiptScanOpensAfterCompletionUnproved?: number;
   receiptScanOpensAfterCompletionRevision?: number;
-  // Each receipt scan that reused a completed scan, and the launches that such scans read again. The unlinked launches are
-  // the part that ended without a link in the completed scan.
+  // Each receipt scan that reused a completed scan, and each launch that such a scan read again, counted when that read ends.
+  // The unlinked launches are the part that ended without a link in the completed scan.
   receiptScanReuses?: number;
   receiptScanReuseLaunches?: number;
   receiptScanReuseLaunchesUnlinked?: number;
