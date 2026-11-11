@@ -1567,6 +1567,101 @@ test('a live worker thread receives the reference entries once, and a new thread
   );
 });
 
+// Parent P launches child C. A later epoch adds parent Q, and P goes missing. The worker marks P complete and drops its row.
+// The host keeps that row and sends no rows to the worker again. Between requests, a large Q keeps the pass open while P
+// returns. Inside one request, P returns while the request reads a small Q.
+test.each(['returns between requests', 'returns inside one request', 'stays missing'] as const)(
+  'a missing parent that %s publishes its children only while its file exists',
+  async (change) => {
+    const root = tempDir('discovery-returned-parent-');
+    const session = (file: string, sessionId: string) => ({
+      file,
+      sessionId,
+      agent: 'claude' as const,
+      cwd: root,
+      ...revisionOf(fs.statSync(file, { bigint: true })),
+    });
+    const parentFile = path.join(root, 'parent.jsonl');
+    fs.writeFileSync(
+      parentFile,
+      [
+        { type: 'user', cwd: root },
+        { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Agent', id: 'launch' }] } },
+        {
+          type: 'user',
+          message: { content: [{ type: 'tool_result', tool_use_id: 'launch' }] },
+          toolUseResult: { agentId: 'child' },
+        },
+      ]
+        .map((row) => JSON.stringify(row))
+        .join('\n') + '\n',
+    );
+    fs.mkdirSync(path.join(root, 'parent', 'subagents'), { recursive: true });
+    fs.writeFileSync(
+      path.join(root, 'parent', 'subagents', 'agent-child.jsonl'),
+      JSON.stringify({ type: 'user', cwd: root }) + '\n',
+    );
+    const parent = session(parentFile, 'parent');
+    const waitingFile = path.join(root, 'waiting.jsonl');
+    const key = normalizeFsPath(parentFile);
+    const backup = path.join(root, 'parent.backup');
+    fs.copyFileSync(parentFile, backup);
+    // The worker puts P back when it posts the first delta that marks P complete.
+    const armed = path.join(root, 'restore-armed');
+    const restore =
+      `const restoreFs=require('node:fs'),restorePort=require('node:worker_threads').parentPort,restorePost=restorePort.postMessage;` +
+      `restorePort.postMessage=function(message){const value=message&&message.result&&message.result.value;` +
+      `if(value&&value.kind==='claude-children-delta'&&value.completed.some(([file,done])=>file===${JSON.stringify(key)}&&done)&&restoreFs.existsSync(${JSON.stringify(armed)})){` +
+      `restoreFs.copyFileSync(${JSON.stringify(backup)},${JSON.stringify(parentFile)});restoreFs.unlinkSync(${JSON.stringify(armed)});}` +
+      `return restorePost.call(this,message);};`;
+    const worker = new ProgressiveWorker('performance.now=()=>0;' + restore + source);
+    const { host, replies } = await receiptDiscoveryHost(worker, [root], [parent]);
+    const run = worker.run.bind(worker);
+    worker.run = (request, ...rest) =>
+      run(request.kind === 'claude-children' ? { ...request, discoveryBytes: 64 * 1024 } : request, ...rest);
+    let generation = 0;
+    const discover = async (until: () => boolean) => {
+      for (let request = 0; request < 40; request++) {
+        host.refreshGeneration = ++generation;
+        await host.prepareClaudeChildren(generation, new AbortController().signal);
+        if (until()) return;
+      }
+      assert.fail('discovery never settled');
+    };
+    const settled = () =>
+      replies.last?.value.kind === 'claude-children' && replies.last.value.membershipSettled === true;
+    const children = () =>
+      (host.catalog.sessions as Array<{ file: string; parentSessionId?: string }>)
+        .filter((row) => row.parentSessionId === 'parent')
+        .map((row) => path.basename(row.file));
+    try {
+      await discover(settled);
+      assert.deepEqual(children(), ['agent-child.jsonl']);
+      fs.writeFileSync(
+        waitingFile,
+        JSON.stringify({ type: 'ignored', text: 'x'.repeat(change === 'returns inside one request' ? 1000 : 300000) }) +
+          '\n',
+      );
+      host.claudeParents = [parent, session(waitingFile, 'waiting')];
+      fs.unlinkSync(parentFile);
+      if (change === 'returns inside one request') fs.writeFileSync(armed, '');
+      else {
+        await discover(() => true);
+        // The worker dropped the row of P and marked P complete, and the host kept the row.
+        assert.equal(replies.last?.value.kind, 'claude-children-progress');
+        assert.ok(host.discoveryCheckpoint.completed.includes(key));
+        assert.ok(host.claudeChildReferenceEntries.has(key));
+        if (change === 'returns between requests') fs.copyFileSync(backup, parentFile);
+      }
+      await discover(settled);
+      assert.equal(fs.existsSync(armed), false, 'the worker never put the parent back');
+      assert.deepEqual(children(), change === 'stays missing' ? [] : ['agent-child.jsonl']);
+    } finally {
+      worker.stop();
+    }
+  },
+);
+
 // A receipt delta omits each row that matches the worker's last reply, so the host must hold every row of that reply while
 // its checkpoint carries the reply's sequence. Each host write that drops rows also replaces or clears the checkpoint.
 test('every host write that drops reference rows also replaces or clears the discovery checkpoint', () => {
@@ -4925,8 +5020,9 @@ test('discovery requests and replies count their sizes, round trips and the host
 });
 
 // The worker drops a waiting discovery request unread and answers it with no result. The thread then holds no reference
-// entries, so the next request carries them again.
-test('a discovery request that the worker drops unread leaves the next request to carry the reference entries', async () => {
+// entries, so the next request carries them again. A spend-only reply returns before the worker reads entries, so the full
+// request after it carries them too.
+test('a request that the worker drops unread or a spend-only request leaves the next request to carry the reference entries', async () => {
   const stub = `const port = require('node:worker_threads').parentPort;
     let seen = 0;
     port.on('message', (message) => {
@@ -4939,13 +5035,19 @@ test('a discovery request that the worker drops unread leaves the next request t
   const carried: string[] = [];
   const worker = new ProgressiveWorker(stub, undefined, (entries) => carried.push(entries));
   try {
-    for (let generation = 1; generation <= 3; generation++)
+    for (let generation = 1; generation <= 4; generation++)
       await worker.run(
-        { kind: 'claude-children', parents: [], repositoryRoots: [], referenceEntries: [['a.jsonl', {} as never]] },
+        {
+          kind: 'claude-children',
+          parents: [],
+          repositoryRoots: [],
+          referenceEntries: [['a.jsonl', {} as never]],
+          ...(generation === 2 ? { spendOnly: true as const } : {}),
+        },
         generation,
         new AbortController().signal,
       );
-    assert.deepEqual(carried, ['1', '1', 'none']);
+    assert.deepEqual(carried, ['1', '1', '1', 'none'], 'a spend-only reply marked the thread as holding the entries');
   } finally {
     worker.stop();
   }
@@ -14049,7 +14151,8 @@ test.each(['claude', 'codex'] as const)(
       return { file, sessionId, agent: 'claude' as const, size: stat.size, mtimeMs: stat.mtimeMs };
     };
     const dispatched = { ...session(dispatchedFile, id), agent };
-    // A missing parent gets an admission check and an absence check before its scan.
+    // A missing parent gets an admission check and an absence check before its scan, and an absence check before the complete
+    // reply.
     const gone = { file: goneFile, sessionId: 'gone', agent: 'claude' as const, size: 1, mtimeMs: 1 };
     // A Codex dispatched session is a catalog entry with a native descendant, never a relationship parent.
     const parents = [session(parentFile, 'parent'), gone, ...(agent === 'claude' ? [dispatched] : [])];
@@ -14117,10 +14220,10 @@ test.each(['claude', 'codex'] as const)(
       assert.equal(cold.charges.hits, candidates);
       assert.equal(
         cold.charges.parentChecks,
-        candidates + 2,
+        candidates + 3,
         'source checks share admission observations and confirm missing files',
       );
-      assert.equal(cold.charges.parentCheckMs, candidates + 2);
+      assert.equal(cold.charges.parentCheckMs, candidates + 3);
       assert.equal(cold.charges.childHeadFiles, 1);
       assert.equal(cold.charges.childHeadBytes, fs.statSync(childFile).size);
       assert.equal(cold.charges.childHeadMs, 2 * candidates + 2, 'walk duration includes initial source checks');

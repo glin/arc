@@ -268,6 +268,9 @@ function discoverySourceKey(row: SessionFile): string {
 // The parent keys of the current epoch. The worker builds them when an epoch starts and when a root change replaces its
 // parents. The host returns the epoch's own checkpoint, so an adopted checkpoint of the same epoch keeps them.
 let epochParentKeys: { epoch: string | undefined; keys: Set<string> } | null = null;
+// The sources that the worker marked complete in an epoch because their files were missing.
+// The worker checks each one again before a complete reply of that epoch.
+let missingSources: { epoch: string | undefined; keys: Set<string> } | null = null;
 interface ReceiptScan {
   epoch: string | undefined;
   store: DispatchReceipts;
@@ -1353,6 +1356,9 @@ async function execute(
           completed.add(key);
           admittedCompletions.add(key);
           completionChanges.set(key, true);
+          if (!missingSources || missingSources.epoch !== epoch.epoch)
+            missingSources = { epoch: epoch.epoch, keys: new Set() };
+          missingSources.keys.add(key);
           claudeChildReferences.delete(key);
           relationshipOrigins.delete(key);
           epochChildSessions.set(key, null);
@@ -1807,6 +1813,26 @@ async function execute(
       closeReceiptScan('store');
       charges.receiptPassEnds++;
       return pending();
+    }
+    // A missing source that returned ends the request with a progress reply. The next request reads the source from its
+    // first byte, so the complete reply carries its children.
+    if (missingSources && missingSources.epoch === epoch.epoch) {
+      let returned = false;
+      for (const key of missingSources.keys) {
+        const parent = candidates.get(key);
+        if (parent && completed.has(key) && checkMissing(parent.file)) continue;
+        missingSources.keys.delete(key);
+        if (!parent || !completed.delete(key)) continue;
+        returned = true;
+        admittedCompletions.delete(key);
+        completionChanges.set(key, false);
+        claudeChildReferences.delete(key);
+        epochChildSessions.delete(key);
+      }
+      if (returned) {
+        charges.transcriptPassEnds++;
+        return pending();
+      }
     }
     const transcriptReferences = resolveClaudeDispatchReferences(found.references, epoch.catalog);
     if (
