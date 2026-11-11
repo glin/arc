@@ -293,6 +293,10 @@ export function sessionStatsOf(
 // The caller supplies the previous order, which remains stable within each group.
 const RUNNING_GROUP: ReadonlySet<string> = new Set<RailStatus>(['background', 'running', 'subagents', 'waiting']);
 
+export function inRailRunningGroup(status: RailStatus | undefined): boolean {
+  return RUNNING_GROUP.has(status ?? '');
+}
+
 export function stableRailOrder<T extends { id: string }>(
   sessions: readonly T[],
   previous: readonly string[],
@@ -317,8 +321,8 @@ export function stableRailOrder<T extends { id: string }>(
     ordered.push(session);
   }
   return [
-    ...ordered.filter((session) => RUNNING_GROUP.has(statuses.get(session.id) ?? '')),
-    ...ordered.filter((session) => !RUNNING_GROUP.has(statuses.get(session.id) ?? '')),
+    ...ordered.filter((session) => inRailRunningGroup(statuses.get(session.id))),
+    ...ordered.filter((session) => !inRailRunningGroup(statuses.get(session.id))),
   ];
 }
 

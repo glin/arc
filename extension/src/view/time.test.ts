@@ -1,6 +1,13 @@
 import { test } from 'vitest';
 import assert from 'node:assert';
-import { formatCompactRelative, formatDuration, formatRelative, formatRelativeShort, RELATIVE_STEPS } from './time.ts';
+import {
+  formatCompactRelative,
+  formatDuration,
+  formatRelative,
+  formatRelativeShort,
+  relativeChangeAt,
+  RELATIVE_STEPS,
+} from './time.ts';
 
 test('compact relative ages use the shared time ladder without verbose units', () => {
   const now = new Date(2026, 7, 23, 20, 0).getTime();
@@ -89,6 +96,18 @@ test('formatRelative and formatRelativeShort pick the same step for the same spa
     assert.equal(short, `${count}${['m', 'h', 'd', 'w', 'mo', 'y'][step]}`, `${seconds} seconds ago: ${long}`);
   }
   assert.ok(RELATIVE_STEPS.length > 0);
+});
+
+test('the relative age wording holds until its change instant and moves there, across every tier', () => {
+  const now = new Date(2026, 7, 23, 20, 0).getTime();
+  for (let seconds = -90; seconds < 800 * 24 * 3600; seconds += 4093) {
+    const at = now - seconds * 1000 - 337;
+    const change = relativeChangeAt(at, now);
+    const wording = formatRelative(at, now);
+    assert.ok(change > now, `${seconds} seconds ago changes at ${change}`);
+    assert.equal(formatRelative(at, change - 1), wording, `${seconds} seconds ago changes before ${change}`);
+    assert.notEqual(formatRelative(at, change), wording, `${seconds} seconds ago holds past ${change}`);
+  }
 });
 
 test('a duration keeps its tiers, its rounding and the space between hours and minutes', () => {

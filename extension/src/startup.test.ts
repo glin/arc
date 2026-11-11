@@ -209,7 +209,10 @@ import {
   sessionSpendPartsBySession,
 } from './projectspend';
 import {
+  advanceRailClock,
   messageFieldBytes,
+  railClockDue,
+  railClockOf,
   railInputKey,
   railInputChanges,
   railMessage,
@@ -319,8 +322,10 @@ import { countedDispatchedCosts, pendingAskPosition, toCard, TURN_QUIET_MS } fro
 import { COMMIT_REPOSITORY_PARSER_VERSION, commitRepositoryOccurrence } from './codexhistory';
 import { RepositoryCommits } from './gitcommits';
 import { CommitRepositories } from './commitrepositories';
+import { relativeChangeAt } from './view/time';
 import {
   agentRunAnswer,
+  inRailRunningGroup,
   liveBackgroundCommands,
   railCacheMarkOf,
   sessionRunningSince,
@@ -3140,6 +3145,16 @@ function harness(pendingRefresh = false, registerRefreshHandler = true, extraMet
     'indexSessionRows',
     'indexRailOrder',
     'childSourcesFor',
+    'switchedSessions',
+    'selectionScope',
+    'selectionDraftsKey',
+    'selectionSourcesOf',
+    'settleChangedSessions',
+    'restoreChangedSessions',
+    'noteChangedSession',
+    'recordSelectionBasis',
+    'advanceSelectionBasis',
+    'moveRailGroups',
     'claimCatalogRefresh',
     'releaseCatalogRefresh',
     'drainCompressedRows',
@@ -3395,6 +3410,16 @@ function completeDiscoveryHarness(
     'sourcesForSelection',
     'indexSessionRows',
     'indexRailOrder',
+    'switchedSessions',
+    'selectionScope',
+    'selectionDraftsKey',
+    'selectionSourcesOf',
+    'settleChangedSessions',
+    'restoreChangedSessions',
+    'noteChangedSession',
+    'recordSelectionBasis',
+    'advanceSelectionBasis',
+    'moveRailGroups',
     'claimCatalogRefresh',
     'releaseCatalogRefresh',
     'drainCompressedRows',
@@ -3631,7 +3656,7 @@ function completeDiscoveryHarness(
       dispatchedDiscoveryWaiting() { return false; }
       indexNextClaudeCostState() { return false; }
       settleRailSeed() {}
-      glanceAt() { return new Map(); } dropSpentPresses() { return false; } evictCache() {}
+      glanceAt() { return new Map(); } dropSpentPresses() { return false; } evictCache() {} evictOverBudget() {}
       collect() { return this.drawnCards; } unreadCounts() { return new Map(); } titleFor() { return null; } fullTitleFor() { return null; }
       sessionLabel(session) { return sessionLabelOf(null, session.sessionId); }
       agentRunFor() { return false; } drainPendingQueues() {} flushAgentQueue() {} metaFor() { return { stats: null, starts: undefined }; }
@@ -3728,6 +3753,11 @@ function completeDiscoveryHarness(
     'pendingResponseSessionAdmitted',
     'sessionDiscoveryMembership',
     'sessionDiscoveryMismatch',
+    'railClockOf',
+    'railClockDue',
+    'advanceRailClock',
+    'relativeChangeAt',
+    'inRailRunningGroup',
     'path',
     'COMPRESSED_FACTS_STORE',
     'COMPRESSED_OPENINGS_STORE',
@@ -3813,6 +3843,11 @@ function completeDiscoveryHarness(
     pendingResponseSessionAdmitted,
     sessionDiscoveryMembership,
     sessionDiscoveryMismatch,
+    railClockOf,
+    railClockDue,
+    advanceRailClock,
+    relativeChangeAt,
+    inRailRunningGroup,
     path,
     COMPRESSED_FACTS_STORE,
     COMPRESSED_OPENINGS_STORE,
@@ -3875,6 +3910,7 @@ function railEnrichmentHarness(
       observeStoredName(_session, entry) { return entry; }
       observeStoredEntry() {}
       ${owner.members.find((member) => member.name?.getText(file) === 'storeTitleEntry')?.getText(file) ?? ''}
+      ${owner.members.find((member) => member.name?.getText(file) === 'noteChangedSession')?.getText(file) ?? ''}
       ${owner.members.find((member) => member.name?.getText(file) === 'noteSessionRead')?.getText(file) ?? ''}
       ${method.getText(file)}
     }`,
@@ -3994,6 +4030,7 @@ function metadataHarness(
       revisionOf(session) { return this.revision ?? { size: session.size, mtimeMs: session.mtimeMs, dev: 1, ino: 2 }; }
       ${names}
       ${owner.members.find((member) => member.name?.getText(file) === 'storeTitleEntry')?.getText(file) ?? ''}
+      ${owner.members.find((member) => member.name?.getText(file) === 'noteChangedSession')?.getText(file) ?? ''}
       ${drawing}
       ${method.getText(file)}
     }`,
@@ -4065,6 +4102,7 @@ function selectedWindowHarness(
     'hydrateCommitRepositories',
     'acceptExplicitMetadataRead',
     'storeTitleEntry',
+    'noteChangedSession',
     'acceptSelectedMetadataRead',
     'spendVersion',
     'updateHistoryAfterAcceptedWindow',
@@ -4089,8 +4127,8 @@ function selectedWindowHarness(
     'continueDiscovery',
     'refineDispatchedSpend',
     ...extra,
-    // evictCache calls pruneDerivedTitles.
-    ...(extra.includes('evictCache') ? ['pruneDerivedTitles'] : []),
+    // evictCache calls pruneDerivedTitles and evictOverBudget.
+    ...(extra.includes('evictCache') ? ['pruneDerivedTitles', 'evictOverBudget'] : []),
   ]);
   const body = owner.members
     .filter((member) => member.name && names.has(member.name.getText(file)))
@@ -19984,9 +20022,62 @@ test.each([
   },
 );
 
-// The full reference derives every listed session at every selection and retains no built rows.
-function switchInputsHarness(count: number, full = false, countedRailInputKey = railInputKey): any {
+// A panel of the selection harness, with the rows, figures and selection that its messages leave drawn.
+interface SwitchPanel {
+  host: any;
+  state: { sessions: any[]; rail: any[]; stats: Record<string, unknown>; showing: string | null };
+  // While the reference renders for a selection, the session that the panel showed before it.
+  replacing?: { previous: string | null };
+}
+
+function applySwitchSelection(state: SwitchPanel['state'], message: any): void {
+  state.sessions = replaceRows(state.sessions, message.sessions, message.replaces);
+  state.rail = replaceRows(state.rail, message.rail, message.replaces);
+  state.stats = replaceStats(state.stats, message.stats, message.replaces);
+  state.showing = message.showing;
+}
+
+function openSwitchPanel(provider: any): SwitchPanel {
+  const receiver = new RowDeltaReceiver();
+  const panel: SwitchPanel = { host: null, state: { sessions: [], rail: [], stats: {}, showing: null } };
+  panel.host = {
+    active: () => false,
+    visible: () => true,
+    webview: {
+      postMessage(message: any) {
+        if (message.type === 'selection') applySwitchSelection(panel.state, message);
+        if (message.type !== 'render' && message.type !== 'rail') return Promise.resolve(true);
+        const full = receiver.expand(message);
+        assert.ok(full, 'a ' + message.type + ' message did not apply to the rows the panel holds');
+        if (message.type === 'rail') Object.assign(panel.state, { rail: full.rail, stats: full.stats });
+        else if (panel.replacing) {
+          // The reference keeps of its render what a selection message carries: the rows of the session that the panel
+          // shows and of the session that it showed before.
+          const replaces = [...new Set([full.showing, panel.replacing.previous])].filter(
+            (id): id is string => typeof id === 'string',
+          );
+          applySwitchSelection(panel.state, {
+            replaces,
+            sessions: full.sessions.filter((row: any) => replaces.includes(row.id)),
+            rail: full.rail.filter((row: any) => replaces.includes(row.id)),
+            stats: Object.fromEntries(Object.entries(full.stats).filter(([id]) => replaces.includes(id))),
+            showing: full.showing,
+          });
+        } else panel.state = { sessions: full.sessions, rail: full.rail, stats: full.stats, showing: full.showing };
+        return Promise.resolve(true);
+      },
+    },
+  };
+  provider.hosts.push(panel.host);
+  provider.readyHosts.add(panel.host);
+  return panel;
+}
+
+// A provider over `count` generated sessions with the production session list derivations, an editable clock and figures
+// whose cache marks expire. `scope` replaces the derivation functions that a count guard wraps.
+function switchHarness(count: number, scope: Record<string, unknown> = {}): any {
   const now = Date.now();
+  const gate: { pending: Promise<string[]> | null; reached: boolean } = { pending: null, reached: false };
   const provider = completeDiscoveryHarness(
     undefined,
     false,
@@ -20012,12 +20103,15 @@ function switchInputsHarness(count: number, full = false, countedRailInputKey = 
       'titleFor',
       'fullTitleFor',
       'agentRunFor',
+      'postRail',
+      'evictCache',
+      'evictOverBudget',
+      'protectedHistorySessions',
     ],
     {
-      retainedPayloads: !full,
+      retainedPayloads: true,
       sessionRunningSince,
       liveBackgroundCommands,
-      countedRailInputKey,
       runningSessions,
       runningSessionsSince,
       timelineRailState,
@@ -20036,26 +20130,36 @@ function switchInputsHarness(count: number, full = false, countedRailInputKey = 
       newCounts,
       projectAgentRead,
       turnKey,
+      historyBytes,
+      historyEvictions,
       realStoredSessionName: storedSessionName,
       writeTimeOfVersion,
       claudeChildFile: () => 'child.jsonl',
       rowFormatWhen: formatWhen,
       rowFormatRelative: formatRelative,
+      replacedCatalogFiles: () => {
+        gate.reached = true;
+        return gate.pending ?? Promise.resolve([]);
+      },
+      ...scope,
     },
+    (facts: any, at = Date.now()) =>
+      facts?.cacheUntil > at ? { expiresAt: facts.cacheUntil, nearlyGoneAt: null, tier: null } : null,
   );
+  provider.gate = gate;
   provider.partial = Array.from({ length: count }, (_, index) => ({
     sessionId: 'switch-' + index,
     file: 'switch-' + index + '.jsonl',
     agent: index % 2 ? 'codex' : 'claude',
     size: 1000,
-    mtimeMs: now - index * 1000,
-    activity: now - index * 1000,
+    mtimeMs: now - index * 7000,
+    activity: now - index * 7000,
     cwd: 'project',
     dev: 1,
     ino: index + 1,
   }));
   provider.carriedNames = new Map();
-  provider.threadNames = { stamp: '', names: new Map(), fullNames: new Map() };
+  provider.threadNames = { stamp: 'names-0', names: new Map(), fullNames: new Map() };
   provider.dispatchFacts = new Map();
   provider.startedHere = new Set();
   provider.catalog = { sessions: provider.partial };
@@ -20069,6 +20173,7 @@ function switchInputsHarness(count: number, full = false, countedRailInputKey = 
   provider.running = new Set();
   provider.runningSinceKeys = new Map();
   provider.exitedSinceKeys = new Map();
+  provider.exitedNow = new Set();
   provider.asks = [];
   provider.claudeChildReferences = [];
   provider.claudeChildStatWrites = new Map();
@@ -20081,251 +20186,562 @@ function switchInputsHarness(count: number, full = false, countedRailInputKey = 
   provider.saved.since = 0;
   provider.saved.views = [];
   provider.saved.railFilters = [];
-  provider.rawMessages = [];
+  provider.hostSessions = new Map();
+  provider.hostPreviousSessions = new Map();
+  provider.cwds = new Map();
+  provider.humanScans = new Map();
+  provider.savedPromptScans = new Map();
+  provider.walkedClaude = [];
+  provider.pruneDerivedTitles = () => false;
+  provider.sessionCacheBudgetBytes = () => 3_000_000;
+  provider.dispatchFiguresRevision = 0;
+  provider.drawnDispatchFiguresRevision = 0;
   provider.progressiveCurrent = () => true;
-  for (const [index, source] of provider.partial.entries())
-    provider.titles.set(source.file, {
-      ...source,
-      expandedStatsRead: true,
-      foldedLabel: 'session ' + index,
-      label: 'Session ' + index,
-      fullLabel: 'Session ' + index,
-      activityMs: source.activity,
-      agentRun: false,
-      outcome: {
-        startedAt: source.activity - 1000,
-        endedAt: source.activity,
-        finished: true,
-        error: false,
-        interrupted: false,
-      },
-      stats: null,
-      starts: { starts: [source.activity - 1000], whole: true },
-    });
-  provider.useRailPayload(railPayload);
-  const post = provider.postRows.bind(provider);
-  provider.postRows = (host: unknown, message: unknown, ...rest: unknown[]) => {
-    provider.rawMessages.push(message);
-    return post(host, message, ...rest);
+  provider.scheduleProjectSpendIndex = () => {};
+  provider.hosts = [];
+  provider.readyHosts = new Set();
+  provider.sendToHost = (host: any, message: unknown) => host.webview.postMessage(message);
+  // A change that a step makes while a selection waits for prompt admission.
+  const prepareHumanPrompts = provider.prepareHumanPrompts.bind(provider);
+  provider.prepareHumanPrompts = async (...args: unknown[]) => {
+    const admitted = await prepareHumanPrompts(...args);
+    const during = provider.duringAdmission;
+    provider.duringAdmission = undefined;
+    during?.();
+    return admitted;
   };
-  if (full) {
-    provider.sourcesForSelection = (catalog: SessionFile[]) => [...catalog];
-    provider.childSourcesFor = () => ({
-      children: provider.claudeChildren,
-      references: provider.claudeChildReferences,
-    });
-    provider.sessionParentEdges = (sources: SessionFile[]) => {
-      const parents = sessionParentIndex(
-        provider.claudeChildReferences,
-        provider.claudeChildren,
-        provider.codexSubagents ?? [],
-      );
-      return (provider.sessionParentEdgeSet = sessionParentEdgeSet(null, parents, sources));
-    };
-  }
+  provider.useListingSignature(listingSignature);
+  provider.useSpendSignature(spendSourceSignature);
+  provider.useRefreshGate(refreshWanted);
+  provider.useSessionStats((facts: any) =>
+    facts
+      ? [{ kind: 'context', metric: 'context', label: 'Context ' + facts.compact, compactLabel: facts.compact }]
+      : [],
+  );
+  provider.useRailPayload(railPayload);
+  for (const [index, source] of provider.partial.entries())
+    provider.titles.set(source.file, switchTitle(source, index, now));
   return provider;
 }
 
+// Every fiftieth session holds an unfinished turn, and the first forty sessions hold cache marks that end in turn.
+function switchTitle(source: any, index: number, now: number): any {
+  return {
+    ...source,
+    expandedStatsRead: true,
+    foldedLabel: 'session ' + index,
+    label: 'Session ' + index,
+    fullLabel: 'Session ' + index,
+    activityMs: source.activity,
+    agentRun: false,
+    outcome: {
+      startedAt: source.activity - 1000,
+      endedAt: source.activity,
+      finished: index % 50 !== 0,
+      error: false,
+      interrupted: false,
+    },
+    stats: { compact: index + 'k', cacheUntil: index < 40 ? now + (index + 1) * 20_000 : 0 },
+    starts: { starts: [source.activity - 1000], whole: true },
+  };
+}
+
+// The rows, order, figures and windows that the host holds, in a form that compares by value.
+function switchHostState(provider: any): string {
+  const byId = (rows: readonly any[]) => [...rows].sort((left, right) => (left.id < right.id ? -1 : 1));
+  const record = (value: Record<string, unknown>) => Object.fromEntries(Object.entries(value).sort());
+  return JSON.stringify({
+    rows: byId(provider.sessionRows),
+    order: provider.railOrder,
+    stats: record(provider.metadataStatsBySession),
+    caches: record(provider.metadataRailCaches),
+    cache: [...provider.cache.keys()].sort(),
+  });
+}
+
+// The reference is a second provider that answers each selection with a forced catalog render of every listed session, with
+// no selection branch, and keeps of that render the rows that a selection message replaces. Both providers run the same
+// seeded steps, and after each step each panel and the host must hold the same rows, order, figures and selection.
 test(
-  'selection inputs match a full computation through seeded switches and clock changes',
-  { timeout: 120_000 },
+  'a selection leaves each panel and the host as a catalog render of every listed session leaves them',
+  { timeout: 240_000 },
   async () => {
-    const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.UTC(2026, 0, 15, 18));
-    const providers = [switchInputsHarness(2000), switchInputsHarness(2000, true)];
+    const start = new Date(2026, 0, 15, 18, 0).getTime();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(start);
+    let outcomeInputs = 0;
+    const sides = [
+      switchHarness(2000, {
+        outcomesFor: (...args: Parameters<typeof outcomesFor>) => {
+          outcomeInputs = Math.max(outcomeInputs, args[0].length);
+          return outcomesFor(...args);
+        },
+      }),
+      switchHarness(2000),
+    ].map((provider, slot) => ({ provider, reference: slot === 1, panels: [] as SwitchPanel[] }));
+    type Side = (typeof sides)[number];
     let seed = 1907;
-    let target = 'switch-1';
-    const random = () => (seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0);
-    const seen = new Set<string>();
-    try {
-      for (const provider of providers) await provider.refresh(true);
-      for (let step = 0; step < 240; step++) {
-        const kind = step % 16;
-        if (kind < 3) target = 'switch-' + (1 + (random() % 1990));
-        if (kind === 6) clock.mockReturnValue(Date.now() + TURN_QUIET_MS);
-        if (kind === 10) clock.mockReturnValue(Date.now() + 60_000);
-        if (kind === 11) clock.mockReturnValue(Date.now() + TURN_QUIET_MS + 1);
-        if (kind === 12) {
+    const random = (below: number) => (seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0) % below;
+    const renderKeys = [
+      'lastRailKey',
+      'lastRailRevision',
+      'lastRailDay',
+      'lastRailCountsJson',
+      'lastRailAdoptionsJson',
+      'lastRailMessageType',
+      'lastRailMessageSerializedBytes',
+      'railPendingAnswers',
+      'drawnMetadataRevision',
+    ];
+    // A reader selection as `show` makes it: an untouched draft that the panel leaves goes, and the panel records the session
+    // that it showed before.
+    const choose = (side: Side, panel: SwitchPanel, session: string | null) => {
+      const { provider } = side;
+      const previous = provider.hostSessions.get(panel.host) ?? provider.showing;
+      if (previous && previous !== session && provider.newDrafts[previous]) {
+        delete provider.newDrafts[previous];
+        provider.railOrder = provider.railOrder.filter((id: string) => id !== previous);
+      }
+      if (session) {
+        provider.hostPreviousSessions.set(panel.host, previous ?? session);
+        provider.hostSessions.set(panel.host, session);
+      } else provider.hostSessions.clear();
+      provider.previousSelection = previous;
+      provider.showing = session;
+      provider.selectionGeneration++;
+    };
+    const settle = async (side: Side) => {
+      const { provider } = side;
+      if (!side.reference) {
+        await provider.refresh(true, true, true, true);
+        return;
+      }
+      for (const panel of side.panels)
+        panel.replacing = {
+          previous: provider.hostPreviousSessions.get(panel.host) ?? provider.previousSelection ?? null,
+        };
+      const held = Object.fromEntries(renderKeys.map((key) => [key, provider[key]]));
+      try {
+        await provider.refresh(true, true);
+      } finally {
+        Object.assign(provider, held);
+        for (const panel of side.panels) delete panel.replacing;
+      }
+    };
+    const select = async (side: Side, panel: SwitchPanel, session: string | null) => {
+      choose(side, panel, session);
+      await settle(side);
+    };
+    const createDraft = (side: Side) => {
+      const draftId = 'draft:' + drafts;
+      side.provider.newDrafts[draftId] = {
+        draftId,
+        cwd: 'project',
+        sourceSession: null,
+        createdAt: Date.now(),
+        profile: { agent: 'claude' },
+      };
+      return select(side, side.panels[0], draftId);
+    };
+    const listed = (side: Side) => side.provider.partial.map((source: any) => source.sessionId) as string[];
+    const target = () => 'switch-' + (1 + random(1990));
+    const titleOf = (side: Side, session: string) =>
+      side.provider.titles.get(side.provider.partial.find((source: any) => source.sessionId === session).file);
+    let drafts = 0;
+    let adopted: string | null = null;
+    // Each step runs on both sides with the same arguments.
+    const steps: Record<
+      string,
+      (side: Side, pick: { session: string; other: string; panel: number; codex: number }) => Promise<void>
+    > = {
+      switch: (side, pick) => select(side, side.panels[pick.panel % side.panels.length], pick.session),
+      'fast-switches': async (side, pick) => {
+        const panel = side.panels[0];
+        if (side.reference) {
+          for (const session of [pick.other, 'switch-1995', pick.session]) choose(side, panel, session);
+          await settle(side);
+          return;
+        }
+        const pending = [];
+        for (const session of [pick.other, 'switch-1995', pick.session]) {
+          choose(side, panel, session);
+          pending.push(side.provider.refresh(true, true, true, true));
+        }
+        await Promise.all(pending);
+      },
+      'draft-created': (side) => createDraft(side),
+      // The panel leaves a draft that the reader did not touch, and the session list posts.
+      'draft-discarded': async (side, pick) => {
+        await createDraft(side);
+        await select(side, side.panels[0], pick.session);
+        side.provider.postRail(true, 'step');
+      },
+      'draft-adopted': async (side, pick) => {
+        const { provider } = side;
+        const draftId = Object.keys(provider.newDrafts)[0];
+        if (!draftId) return select(side, side.panels[0], pick.session);
+        adopted = 'adopted-' + drafts;
+        delete provider.newDrafts[draftId];
+        provider.awaitingSessionRecords[adopted] = {
+          sessionId: adopted,
+          agent: 'claude',
+          cwd: 'project',
+          createdAt: Date.now(),
+        };
+        provider.railOrder = provider.railOrder.map((id: string) => (id === draftId ? adopted : id));
+        await select(side, side.panels[0], adopted);
+        provider.postRail(true, 'step');
+      },
+      'adopted-listed': async (side, pick) => {
+        const { provider } = side;
+        if (adopted && !listed(side).includes(adopted)) {
+          const source = { ...provider.partial[0], sessionId: adopted, file: adopted + '.jsonl', ino: 90_000 };
+          provider.partial = [source, ...provider.partial];
+          provider.titles.set(source.file, { ...switchTitle(source, 1, Date.now()), label: 'Adopted' });
+          provider.catalog = { sessions: provider.partial };
+          await provider.refresh(true, true);
+        }
+        await select(side, side.panels[0], pick.session);
+      },
+      'no-shown-session': async (side) => {
+        await select(side, side.panels[0], null);
+        side.provider.postRail(true, 'step');
+      },
+      'second-panel': async (side, pick) => {
+        if (side.panels.length < 2) {
+          side.panels.push(openSwitchPanel(side.provider));
+          side.provider.hostSessions.set(side.panels[1].host, pick.other);
+          await side.provider.refresh(true, true);
+        }
+        await select(side, side.panels[1], pick.session);
+      },
+      'filter-and-pin': async (side, pick) => {
+        const { provider } = side;
+        provider.pinnedTop = new Set([pick.other]);
+        provider.hidden = new Set([pick.session]);
+        provider.saved.railFilters = [{ id: 'filter', name: 'Pinned', query: 'is:pinned' }];
+        provider.postRail(true, 'step');
+        await select(side, side.panels[0], pick.other);
+      },
+      'codex-rename': async (side, pick) => {
+        const { provider } = side;
+        const renamed = 'switch-' + (2 * pick.codex + 1);
+        provider.threadNames = {
+          stamp: 'names-' + renamed,
+          names: new Map([[renamed, 'Renamed ' + renamed]]),
+          fullNames: new Map([[renamed, 'Renamed ' + renamed]]),
+        };
+        await select(side, side.panels[0], pick.session);
+        await provider.refresh(false, true);
+        provider.postRail(true, 'step');
+      },
+      'metadata-before-selection': async (side, pick) => {
+        const { provider } = side;
+        const changed = pick.panel ? pick.session : pick.other;
+        const title = titleOf(side, changed);
+        provider.storeTitleEntry(title.file, {
+          ...title,
+          stats: { compact: 'moved ' + Date.now(), cacheUntil: Date.now() + 90_000 },
+        });
+        await select(side, side.panels[0], pick.session);
+        provider.postRail(true, 'step');
+      },
+      exit: async (side, pick) => {
+        const { provider } = side;
+        const key = runningKey(titleOf(side, pick.other).agent, pick.other);
+        provider.exitedSinceKeys.set(key, Date.now());
+        provider.exitedNow = new Set([key]);
+        await provider.refresh(true, true);
+        await select(side, side.panels[0], pick.session);
+      },
+      'permission-request': async (side, pick) => {
+        side.provider.asks = [{ session: pick.other, ask: { kind: 'permission' } }];
+        side.provider.postRail(true, 'step');
+        await select(side, side.panels[0], pick.session);
+        side.provider.postRail(true, 'step');
+      },
+      running: async (side, pick) => {
+        const { provider } = side;
+        const key = runningKey(titleOf(side, pick.other).agent, pick.other);
+        provider.running = new Set([key]);
+        provider.runningSinceKeys.set(key, Date.now());
+        await provider.refresh(true, true);
+        await select(side, side.panels[0], pick.session);
+      },
+      'clock-minute': async (side, pick) => {
+        clock.mockReturnValue(Date.now() + (side.reference ? 0 : 61_000));
+        await select(side, side.panels[0], pick.session);
+        side.provider.postRail(true, 'step');
+      },
+      'clock-hour': async (side, pick) => {
+        clock.mockReturnValue(Date.now() + (side.reference ? 0 : TURN_QUIET_MS + 1));
+        await select(side, side.panels[0], pick.session);
+        side.provider.postRail(true, 'step');
+      },
+      'clock-day': async (side, pick) => {
+        if (!side.reference) {
           const day = new Date(Date.now());
           day.setHours(24, 1, 0, 0);
           clock.mockReturnValue(day.getTime());
         }
-        for (const provider of providers) {
-          provider.rawMessages.length = 0;
-          if (kind === 0) {
-            const pending = [];
-            for (const session of ['switch-1991', 'switch-1992', target]) {
-              provider.previousSelection = provider.showing;
-              provider.showing = session;
-              provider.selectionGeneration++;
-              pending.push(provider.refresh(true, true, true, true));
-            }
-            await Promise.all(pending);
-          }
-          const file = target + '.jsonl';
-          const meta = provider.titles.get(file);
-          const outcome = { ...meta.outcome };
-          switch (kind) {
-            case 1:
-              seen.add('status');
-              provider.asks = [{ session: target }];
-              break;
-            case 2:
-              seen.add('turn');
-              meta.starts = { starts: [...meta.starts.starts, Date.now()], whole: true };
-              outcome.startedAt = outcome.endedAt = Date.now();
-              outcome.finished = false;
-              break;
-            case 3:
-              seen.add('child-open');
-              outcome.finished = true;
-              outcome.openChildren = ['child'];
-              provider.claudeChildren = [
-                { parentSessionId: target, sessionId: 'child', file: 'child.jsonl', mtimeMs: Date.now() },
-              ];
-              break;
-            case 4:
-              seen.add('child-close');
-              outcome.openChildren = [];
-              outcome.closedChildren = ['child'];
-              break;
-            case 5:
-              seen.add('command-start');
-              outcome.backgroundCommands = [{ id: 'command', startedAt: Date.now() }];
-              break;
-            case 6:
-              seen.add('command-expiry');
-              break;
-            case 7:
-              seen.add('join');
-              provider.partial = [
-                ...provider.partial,
-                { ...provider.partial[0], sessionId: 'joined', file: 'joined.jsonl' },
-              ];
-              provider.titles.set('joined.jsonl', { ...meta, label: 'Joined' });
-              break;
-            case 8:
-              seen.add('leave');
-              provider.partial = provider.partial.filter((source: SessionFile) => source.sessionId !== 'joined');
-              break;
-            case 9:
-              seen.add('unread');
-              provider.saved.readTo[target] = Date.now();
-              break;
-            case 11:
-              seen.add('quiet-expiry');
-              outcome.finished = false;
-              outcome.endedAt = Date.now() - TURN_QUIET_MS - 1;
-              break;
-            case 13:
-              seen.add('source-replacement');
-              provider.partial = provider.partial.map((source: SessionFile) =>
-                source.sessionId === target
-                  ? {
-                      ...source,
-                      agent: source.agent === 'claude' ? 'codex' : 'claude',
-                      activity: Date.now(),
-                      size: source.size + step,
-                    }
-                  : source,
-              );
-              break;
-            case 14:
-              seen.add('metadata');
-              meta.label = meta.fullLabel = 'Changed ' + step;
-              break;
-            case 15: {
-              const key = meta.agent + ':' + target;
-              provider.running = new Set([key]);
-              provider.runningSinceKeys.set(key, Date.now());
-              provider.heldLifetime.costs = {
-                ...provider.heldLifetime.costs,
-                [target]: { dollars: step, partial: true },
-              };
-              break;
-            }
-          }
-          meta.outcome = outcome;
-          provider.catalog = { sessions: provider.partial };
-          provider.authoritativeCatalog = provider.partial;
-          provider.previousSelection = provider.showing;
-          provider.showing = kind === 7 ? 'joined' : target;
-          await provider.refresh(true, true, true, true);
+        await select(side, side.panels[0], pick.session);
+        side.provider.postRail(true, 'step');
+      },
+      'list-post': async (side, pick) => {
+        await select(side, side.panels[0], pick.session);
+        side.provider.postRail(true, 'step');
+      },
+      'catalog-after-selection': async (side, pick) => {
+        await select(side, side.panels[0], pick.session);
+        await side.provider.refresh(false, true);
+      },
+      'catalog-overlap': async (side, pick) => {
+        const { provider } = side;
+        if (side.reference) {
+          await select(side, side.panels[0], pick.session);
+          await provider.refresh(false, true);
+          return;
         }
-        assert.deepEqual(providers[0].rawMessages, providers[1].rawMessages, 'selection differs at step ' + step);
-        const row = providers[0].rawMessages.at(-1).rail.find((row: any) => row.id === providers[0].showing);
-        if (kind === 2) assert.equal(row.status, 'running');
-        if (kind === 3) assert.equal(row.subagents, 1);
-        if (kind === 4) assert.equal(row.subagents, null);
-        if (kind === 5) assert.equal(row.commands, 1);
-        if (kind === 6) assert.equal(row.commands, null);
-        if (kind === 11) assert.equal(row.status, 'stopped');
-        if (kind === 9) assert.equal(row.unread, false);
-        seen.add('switch');
-        if (step % 16 < 3) seen.add('fast-switches');
-        if (kind === 10) seen.add('minute');
-        if (kind === 12) seen.add('day');
+        let release!: (files: string[]) => void;
+        provider.gate.reached = false;
+        provider.gate.pending = new Promise<string[]>((resolve) => (release = resolve));
+        const catalog = provider.refresh(false, true);
+        await vi.waitFor(() => assert.ok(provider.gate.reached));
+        await select(side, side.panels[0], pick.session);
+        provider.gate.pending = null;
+        release([]);
+        await catalog;
+      },
+      // A change of the shown session that does not supersede the selection, as an adoption or a session move makes it.
+      'shown-during-admission': async (side, pick) => {
+        const { provider } = side;
+        const move = () => {
+          provider.hostSessions.set(side.panels[0].host, pick.other);
+          provider.showing = pick.other;
+        };
+        if (side.reference) {
+          choose(side, side.panels[0], pick.session);
+          move();
+          await settle(side);
+          return;
+        }
+        provider.duringAdmission = move;
+        await select(side, side.panels[0], pick.session);
+      },
+      'window-read': async (side, pick) => {
+        const { provider } = side;
+        const session = provider.hostSessions.get(side.panels[0].host) ?? provider.showing;
+        const source = provider.partial.find((one: any) => one.sessionId === session);
+        if (source) provider.cache.set(source.file, { bytes: 900_000, usedAt: Date.now() });
+        await select(side, side.panels[0], pick.session);
+      },
+      'session-joins': async (side, pick) => {
+        const { provider } = side;
+        const source = { ...provider.partial[3], sessionId: 'joined', file: 'joined.jsonl', ino: 80_000 };
+        provider.partial = listed(side).includes('joined')
+          ? provider.partial.filter((one: any) => one.sessionId !== 'joined')
+          : [...provider.partial, source];
+        provider.titles.set(source.file, { ...switchTitle(source, 3, Date.now()), label: 'Joined' });
+        provider.catalog = { sessions: provider.partial };
+        await provider.refresh(true, true);
+        await select(side, side.panels[0], pick.session);
+      },
+      'two-sources': async (side, pick) => {
+        const { provider } = side;
+        const twin = (one: any) => one.file === 'twin.jsonl';
+        const owner = provider.partial.find((one: any) => one.sessionId === pick.other);
+        provider.partial = provider.partial.some(twin)
+          ? provider.partial.filter((one: any) => !twin(one))
+          : [...provider.partial, { ...owner, file: 'twin.jsonl', ino: 70_000 }];
+        provider.titles.set('twin.jsonl', { ...titleOf(side, pick.other), label: 'Twin' });
+        provider.catalog = { sessions: provider.partial };
+        await provider.refresh(true, true);
+        await select(side, side.panels[0], pick.other);
+        provider.postRail(true, 'step');
+      },
+    };
+    const divergent: string[] = [];
+    const compare = (label: string) => {
+      const [candidate, reference] = sides;
+      // Figures are keyed by session, so their key order carries nothing that the panel draws.
+      const panels = (side: Side) =>
+        JSON.stringify(
+          side.panels.map((panel) => ({
+            ...panel.state,
+            stats: Object.fromEntries(Object.entries(panel.state.stats).sort()),
+          })),
+        );
+      if (panels(candidate) !== panels(reference)) divergent.push(label + ': panel');
+      else if (switchHostState(candidate.provider) !== switchHostState(reference.provider)) {
+        const [held, expected] = [candidate, reference].map((side) => JSON.parse(switchHostState(side.provider)));
+        const fields = Object.keys(held).filter((key) => JSON.stringify(held[key]) !== JSON.stringify(expected[key]));
+        divergent.push(label + ': host ' + fields.join(', '));
+      } else return true;
+      return false;
+    };
+    try {
+      // The first row of an empty list opens while no session is shown.
+      for (const side of sides) {
+        const { provider } = side;
+        const catalog = provider.partial;
+        provider.partial = [];
+        provider.catalog = { sessions: [] };
+        provider.authoritativeCatalog = [];
+        provider.showing = null;
+        side.panels.push(openSwitchPanel(provider));
+        await provider.refresh(true);
+        provider.partial = [catalog[0]];
+        provider.catalog = { sessions: provider.partial };
+        provider.authoritativeCatalog = provider.partial;
+        provider.previousSelection = null;
+        provider.selectionGeneration++;
+        await settle(side);
+        provider.partial = catalog;
+        provider.catalog = { sessions: catalog };
       }
-      assert.equal(seen.size, 16);
+      compare('first-row-of-empty-list');
+      for (const side of sides) await side.provider.refresh(true, true);
+      compare('catalog');
+      const kinds = Object.keys(steps);
+      let count = 0;
+      for (let round = 0; count < 300; round++) {
+        const order = [...kinds].sort(() => random(3) - 1);
+        for (const kind of order) {
+          // Both sides render every listed session before each kind, so a step reports only what it changed itself.
+          for (const side of sides) await side.provider.refresh(true, true);
+          compare(`step ${count} catalog`);
+          for (const name of [kind, 'switch']) {
+            const pick = { session: target(), other: target(), panel: random(2), codex: random(990) };
+            if (name.startsWith('draft-')) drafts++;
+            for (const side of sides) {
+              side.provider.selectionWork = null;
+              await steps[name](side, pick);
+            }
+            count++;
+            if (!compare(`step ${count} ${name}`)) {
+              // The candidate takes the order and the selection of the reference, and both sides render every listed
+              // session, so the next step starts from equal state.
+              const [held, expected] = sides.map((side) => side.provider);
+              held.railOrder = [...expected.railOrder];
+              held.showing = expected.showing;
+              held.previousSelection = expected.previousSelection;
+              for (const [slot, panel] of sides[0].panels.entries()) {
+                const host = sides[1].panels[slot].host;
+                for (const name of ['hostSessions', 'hostPreviousSessions'])
+                  if (expected[name].has(host)) held[name].set(panel.host, expected[name].get(host));
+                  else held[name].delete(panel.host);
+              }
+              for (const side of sides) await side.provider.refresh(true, true);
+              compare(`step ${count} ${name} after a catalog render`);
+            }
+          }
+        }
+      }
+      assert.deepEqual(divergent, [], 'the selection differs from the reference');
+      assert.ok(outcomeInputs >= 2000, 'no step computed every listed session');
     } finally {
       clock.mockRestore();
     }
   },
 );
-test('an unchanged selection computes a fixed number of session inputs at 2000 and 4000 rows', async () => {
-  const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.UTC(2026, 0, 15, 18));
+
+// Wraps the derivations of the session list and counts the session inputs that reach them during one selection.
+function countedSwitchHarness(count: number): { provider: any; inputs: Record<string, number> } {
+  const inputs: Record<string, number> = {};
+  const add = (name: string, size: number) => (inputs[name] = (inputs[name] ?? 0) + size);
+  const provider = switchHarness(count, {
+    stableRailOrder: (...args: Parameters<typeof stableRailOrder>) => {
+      add('stableRailOrder', args[0].length + args[1].length);
+      return stableRailOrder(...args);
+    },
+    newCounts: (...args: Parameters<typeof newCounts>) => {
+      add('newCounts', args[1].size);
+      return newCounts(...args);
+    },
+    liveTimelineChildren: (...args: Parameters<typeof liveTimelineChildren>) => {
+      add('liveTimelineChildren', args[0].size + args[1].length + args[2].length);
+      return liveTimelineChildren(...args);
+    },
+    outcomesFor: (...args: Parameters<typeof outcomesFor>) => {
+      add('outcomesFor', args[0].length);
+      return outcomesFor(...args);
+    },
+    countedRailInputKey: (input: Parameters<typeof railInputKey>[0], day?: string) => {
+      add('railInputKey', input.sessions.length + Object.keys(input.metadataStats).length);
+      return railInputKey(input, day);
+    },
+  });
+  const methods: Record<string, (args: any[], result: any) => number> = {
+    railRows: (args, result) => args[0].size + result.length,
+    sessionRowOf: () => 1,
+  };
+  for (const [name, size] of Object.entries(methods)) {
+    const original = provider[name].bind(provider);
+    provider[name] = (...args: any[]) => {
+      const result = original(...args);
+      add(name, size(args, result));
+      return result;
+    };
+  }
+  // The read marks of every listed session reach `newCounts` when the counts are not narrowed to the computed sessions.
+  const unreadCounts = provider.unreadCounts.bind(provider);
+  provider.unreadCounts = (...args: any[]) => {
+    const readTo = provider.saved.readTo;
+    let reads = 0;
+    provider.saved.readTo = new Proxy(readTo, {
+      ownKeys: (target) => {
+        reads += Reflect.ownKeys(target).length;
+        return Reflect.ownKeys(target);
+      },
+      get: (target, key) => {
+        if (typeof key === 'string' && Object.hasOwn(target, key)) reads++;
+        return Reflect.get(target, key);
+      },
+    });
+    try {
+      return unreadCounts(...args);
+    } finally {
+      provider.saved.readTo = readTo;
+      add('unreadCounts', reads);
+    }
+  };
+  return { provider, inputs };
+}
+
+test('a selection that changes only the shown session computes a fixed number of session inputs at 2000 and 4000 rows', async () => {
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(new Date(2026, 0, 15, 18, 0).getTime());
   try {
     for (const count of [2000, 4000]) {
-      let keyedRows = 0;
-      const provider = switchInputsHarness(count, false, (input, day) => {
-        keyedRows += input.sessions.length;
-        return railInputKey(input, day);
-      });
+      const { provider, inputs } = countedSwitchHarness(count);
+      openSwitchPanel(provider);
+      provider.saved.readTo = Object.fromEntries(
+        provider.partial.map((source: any) => [source.sessionId, source.activity]),
+      );
       await provider.refresh(true);
-      keyedRows = 0;
-      const calls: Record<string, number> = {};
+      for (const key of Object.keys(inputs)) delete inputs[key];
+      provider.previousSelection = provider.showing;
+      provider.hostPreviousSessions.set(provider.hosts[0], provider.showing);
+      provider.hostSessions.set(provider.hosts[0], 'switch-1');
+      provider.showing = 'switch-1';
+      provider.selectionGeneration++;
+      await provider.refresh(true, true, true, true);
       for (const name of [
+        'stableRailOrder',
+        'newCounts',
+        'liveTimelineChildren',
+        'railRows',
         'outcomesFor',
-        'glanceAt',
         'unreadCounts',
         'sessionRowOf',
-        'railRows',
-        'railInputFor',
-        'liveOpenChildren',
-        'liveBackgroundCommands',
-      ]) {
-        const original = provider[name].bind(provider);
-        provider[name] = (...args: any[]) => {
-          const rows =
-            name === 'outcomesFor' || name === 'glanceAt'
-              ? args[0].length
-              : name === 'sessionRowOf'
-                ? 1
-                : name === 'unreadCounts'
-                  ? (provider.selectionWindows ?? provider.windows).size
-                  : name === 'liveOpenChildren' || name === 'liveBackgroundCommands'
-                    ? Math.max(
-                        (args[1] ?? provider.selectionOutcomes ?? provider.sessionOutcomes).size,
-                        (args[2] ?? provider.selectionStatusRows ?? provider.sessionRows).length,
-                      )
-                    : (provider.selectionRows ?? provider.sessionRows).length;
-          calls[name] = (calls[name] ?? 0) + rows;
-          return original(...args);
-        };
-      }
-      provider.previousSelection = provider.showing;
-      provider.showing = 'switch-1';
-      await provider.refresh(true, true, true, true);
-      for (const [name, rows] of Object.entries(calls))
-        assert.ok(rows <= 8, name + ' computes ' + rows + ' session inputs among ' + count);
-      assert.equal(calls.outcomesFor, 2);
-      assert.equal(calls.sessionRowOf, 2);
-      assert.equal(keyedRows, 0, 'selection serializes the complete session list inputs');
-      assert.equal(provider.selectionRows, undefined);
+      ])
+        assert.ok((inputs[name] ?? 0) <= 120, `${name} reads ${inputs[name]} session inputs among ${count}`);
+      assert.ok((inputs.outcomesFor ?? 0) > 0, 'the selection computed no session');
+      assert.equal(inputs.railInputKey ?? 0, 0, 'the selection serializes the session list inputs');
     }
   } finally {
     clock.mockRestore();
   }
 });
+
 function selectionHarness(revalidate?: Parameters<typeof completeDiscoveryHarness>[0]) {
   const provider = paintHarness(
     ['onMessage', 'routePerformanceEvent', 'sendToHost'],

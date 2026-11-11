@@ -133,6 +133,7 @@ import { codexOpeningsAtStartup, CodexOpeningsWriter } from './codexopenings';
 import { baselineUri, turnFileUri, PATCH_SCHEME } from './uris';
 import { readSetting, writeSetting } from './config';
 import { saveTimelineLayout } from './view/timeline-layout';
+import { relativeChangeAt } from './view/time';
 import { exportSavedSession, savedExportSource, writeSavedSession } from './sessionexport';
 import type { ExportIdentity, ExportReaderState } from './domain/export-model';
 import { RAIL_FOLDS } from './view/rail';
@@ -339,6 +340,7 @@ import { ClaudeChildWorkCache, liveTimelineChildren, outcomesFor, timelineRailSt
 import { ChildCacheExpiryAttribution, type ChildExpiryCost } from './childcacheexpiry';
 import {
   agentRunAnswer,
+  inRailRunningGroup,
   sessionParentEdgeSet,
   sessionParentIndex,
   type SessionParent,
@@ -748,7 +750,11 @@ import {
   RailPayloadInput,
   PayloadRows,
   RailPayloadRows,
+  advanceRailClock,
   messageFieldBytes,
+  railClockDue,
+  railClockOf,
+  type RailClock,
   railInputKey,
   railInputChanges,
   railMessage,
@@ -1569,6 +1575,32 @@ interface CachedLinksCatalog {
   readonly references: readonly ClaudeChildSessionReference[];
   readonly children: readonly ClaudeChildSessionFile[];
   readonly sessions: SessionFile[];
+}
+
+// What the last computation of every listed session read, by identity or by value. A selection that finds the same state
+// computes only the sessions in its scope. Every other session keeps the rows, figures and order of that computation.
+interface SelectionBasis {
+  readonly catalog: readonly SessionFile[];
+  readonly scope: string;
+  readonly rows: readonly { id: string }[];
+  readonly names: string;
+  readonly parents: ReadonlyMap<string, SessionParentEdge>;
+  readonly spend: string;
+  readonly drafts: string;
+  readonly titles: ReadonlyMap<string, DerivedTitleEntry>;
+  readonly compressed: number;
+  readonly running: ReadonlySet<string>;
+  readonly asks: readonly unknown[];
+  readonly exits: ReadonlySet<string>;
+  readonly children: readonly ClaudeChildSessionFile[];
+  readonly references: readonly ClaudeChildSessionReference[];
+  readonly saved: PanelState;
+  readonly prompted: readonly string[] | undefined;
+  readonly agentRuns: readonly string[] | undefined;
+  readonly day: string;
+  readonly clock: RailClock;
+  // The sessions whose rows the computation drew as shown.
+  readonly shown: ReadonlySet<string>;
 }
 
 export class PanelProvider implements vscode.Disposable {
@@ -2523,14 +2555,20 @@ export class PanelProvider implements vscode.Disposable {
   private heldRailPayloads: Map<string | null, RailPayloadRows> | undefined;
   private heldSessionRows: PayloadRows<(typeof this.sessionRows)[number]> | undefined;
   private heldHostRows: WeakMap<PanelHost, PayloadRows<(typeof this.sessionRows)[number]>> | undefined;
-  private selectionSources: { catalog: readonly SessionFile[]; byId: Map<string, SessionFile[]> } | undefined;
+  private selectionSources:
+    | { catalog: readonly SessionFile[]; byId: Map<string, SessionFile[]>; byFile: Map<string, SessionFile> }
+    | undefined;
+  // The state that the last computation of every listed session read. `selectionScope` compares a selection with it.
+  private selectionBasis: SelectionBasis | undefined;
+  // Files whose metadata or read window changed, and sessions whose stored name changed, after that computation read them.
+  private changedSessionFiles: Set<string> | undefined;
+  private changedSessionIds: Set<string> | undefined;
+  // The sessions in the running group of the session list order, with the order that `railRows` built.
+  private railOrderGroups: { order: readonly string[]; running: ReadonlySet<string> } | undefined;
   private selectionRows: typeof this.sessionRows | undefined;
   private selectionStatusRows: readonly { id: string; agentKey: string }[] | undefined;
   private selectionOutcomes: Map<string, TurnOutcome | null> | undefined;
   private selectionWindows: Map<string, TurnStarts> | undefined;
-  private selectionMetadataStats: typeof this.metadataStatsBySession | undefined;
-  private selectionMetadataCaches: typeof this.metadataRailCaches | undefined;
-  private selectionMetadataRevisions: typeof this.metadataRailRevisions | undefined;
   private sessionRowIndex: { rows: PanelProvider['sessionRows']; byId: Map<string, number> } | undefined;
   private railOrderIndex: { order: readonly string[]; byId: Map<string, number> } | undefined;
   private sessionParentCatalog: readonly SessionFile[] | undefined;
@@ -4032,6 +4070,10 @@ export class PanelProvider implements vscode.Disposable {
     this.heldSessionRows?.clear();
     this.heldHostRows = undefined;
     this.selectionSources = undefined;
+    this.selectionBasis = undefined;
+    this.changedSessionFiles = undefined;
+    this.changedSessionIds = undefined;
+    this.railOrderGroups = undefined;
     this.sessionRowIndex = undefined;
     this.railOrderIndex = undefined;
     this.sessionParentCatalog = undefined;
@@ -4777,7 +4819,10 @@ export class PanelProvider implements vscode.Disposable {
   private repeatedCoverage(file: string, source: 'worker' | 'host'): void {
     this.corpus.delete(file);
     const held = this.titles.get(file);
-    if (held) this.titles.set(file, { ...held, size: -1 });
+    if (held) {
+      this.titles.set(file, { ...held, size: -1 });
+      this.noteChangedSession(file);
+    }
     const covered = normalizeFsPath(file);
     for (const reference of source === 'worker' ? (this.claudeChildReferences ?? []) : []) {
       if (reference.kind !== 'dispatch' || !reference.file || normalizeFsPath(reference.file) !== covered) continue;
@@ -5050,6 +5095,10 @@ export class PanelProvider implements vscode.Disposable {
           this.heldSessionRows?.clear();
           this.heldHostRows = undefined;
           this.selectionSources = undefined;
+          this.selectionBasis = undefined;
+          this.changedSessionFiles = undefined;
+          this.changedSessionIds = undefined;
+          this.railOrderGroups = undefined;
           this.sessionRowIndex = undefined;
           this.railOrderIndex = undefined;
           this.sessionParentCatalog = undefined;
@@ -5740,6 +5789,7 @@ export class PanelProvider implements vscode.Disposable {
     this.applyCompressedEntries([value.entry]);
     if (!value.adopted) {
       this.titles.delete(plain);
+      this.noteChangedSession(plain);
       this.carriedNames.delete(plain);
     }
     // The walk of the refresh below trims the opening of a failed adoption, because the path is no longer retained.
@@ -6756,6 +6806,7 @@ export class PanelProvider implements vscode.Disposable {
           bytes: value.retainedBytes,
           checkpointBytes: value.checkpointBytes,
         });
+        this.noteChangedSession(session.file);
         const runtime = composerRuntimeBySession(
           value.read.turns,
           currentRecordsBySession(value.read.turns, value.read.compactions).newestCompactions,
@@ -11248,15 +11299,7 @@ export class PanelProvider implements vscode.Disposable {
         reuseCatalog = false;
         walkReasons = [refreshReason];
       }
-      const switched = selectedOnly
-        ? new Set(
-            [
-              this.showing,
-              previousSelection,
-              ...this.hosts.flatMap((host) => [this.hostSessions?.get(host), this.hostPreviousSessions?.get(host)]),
-            ].filter((session): session is string => typeof session === 'string'),
-          )
-        : null;
+      const switched = selectedOnly ? this.switchedSessions(previousSelection) : null;
       let all = selectedOnly
         ? this.sourcesForSelection(this.authoritativeCatalog ?? [], switched!)
         : codexOnly
@@ -11564,11 +11607,24 @@ export class PanelProvider implements vscode.Disposable {
       const scopedDrafts = Object.values(this.newDrafts).filter((draft) =>
         isInside(draft.cwd, this.repositoryScopeRoots),
       );
+      // A selection computes the sessions of its scope while the state that the last computation of every listed session read
+      // stands. Any other selection computes every listed session, with the sources that it revalidated and admitted. A
+      // selection that met another change of the shown sessions during admission also computes the sessions now shown.
+      // Renames do not change rollout revisions, so a selection reads the Codex name index before it compares the state.
+      if (selectedOnly) this.threadNames = readThreadNames(codexSessionIndexPath(), this.threadNames);
+      const now = Date.now();
+      const selectionScope = selectedOnly
+        ? this.selectionScope(new Set([...switched!, ...this.switchedSessions(previousSelection)]), now)
+        : null;
+      if (selectedOnly)
+        all = orderSessionCatalog(this.selectionSourcesOf(selectionScope, all), (session) => this.activityFor(session));
       const scopedPendingRecords = Object.values(this.awaitingSessionRecords).filter(
         (pending) =>
           pending.cwd !== null &&
           isInside(pending.cwd, this.repositoryScopeRoots) &&
-          !all.some((source) => source.sessionId === pending.sessionId),
+          !(selectionScope
+            ? this.selectionSources!.byId.has(pending.sessionId)
+            : all.some((source) => source.sessionId === pending.sessionId)),
       );
       this.ensureProjectSpendWorkspace();
       // Settle selection before requesting a window or building cards. The rail and payload use
@@ -11581,7 +11637,7 @@ export class PanelProvider implements vscode.Disposable {
       for (const session of [this.showing, ...(this.hostSessions?.values() ?? []), ...(this.trail?.places ?? [])]) {
         if (
           session &&
-          ((selectedOnly && this.selectionSources?.byId.has(session)) || this.membershipOf(session) === 'unknown')
+          ((selectionScope && this.selectionSources!.byId.has(session)) || this.membershipOf(session) === 'unknown')
         )
           reachable.push(session);
       }
@@ -11610,7 +11666,7 @@ export class PanelProvider implements vscode.Disposable {
       // Reconcile navigation with reachable sessions and record the settled selection.
       this.trail = visitPlace(prunePlaces(this.trail, new Set(reachable)), this.showing ?? '');
       this.releaseUnselectedCompressedBody();
-      this.dropRemovedSelectionFailures(selectedOnly ? (this.authoritativeCatalog ?? []) : all);
+      this.dropRemovedSelectionFailures(selectionScope ? (this.authoritativeCatalog ?? []) : all);
       const sessions = this.shownSessions(all);
       if (
         this.showing &&
@@ -11619,15 +11675,17 @@ export class PanelProvider implements vscode.Disposable {
       ) {
         void this.completeSelectedWindow(this.showing, this.selectionGeneration);
       }
-      const now = Date.now();
+      // The facts that change from here on reach the next selection, which computes their sessions.
+      const basisBefore = this.selectionBasis;
+      const changedBefore = this.settleChangedSessions(selectionScope, all);
       const outcomes = this.outcomesFor(all);
-      if (selectedOnly) {
+      if (selectionScope) {
         this.selectionOutcomes = outcomes;
         this.sessionOutcomes ??= new Map();
         for (const [id, outcome] of outcomes) this.sessionOutcomes.set(id, outcome);
       } else this.sessionOutcomes = outcomes;
       // Read the Codex name index before computing the listing signature. Renames do not change rollout revisions.
-      this.threadNames = readThreadNames(codexSessionIndexPath(), this.threadNames);
+      if (!selectedOnly) this.threadNames = readThreadNames(codexSessionIndexPath(), this.threadNames);
       const children = this.agentListingStamp(sessions);
       // Selection reuses the catalog spend signature and promotes only its session sources for checking.
       const parentEdges = this.sessionParentEdges(selectedOnly ? (this.authoritativeCatalog ?? all) : all);
@@ -11677,7 +11735,7 @@ export class PanelProvider implements vscode.Disposable {
       const glanced = this.windows.size;
       const heldWindows = this.windows;
       const windows = this.glanceAt(all, sessions);
-      if (selectedOnly) {
+      if (selectionScope) {
         this.selectionWindows = windows;
         for (const source of all) {
           const window = windows.get(source.sessionId);
@@ -11691,7 +11749,7 @@ export class PanelProvider implements vscode.Disposable {
         }
       }
       const statusFacts = [
-        ...(selectedOnly
+        ...(selectionScope
           ? sessions.flatMap((session) => this.newestBySession.get(session.sessionId) ?? [])
           : this.newestBySession.values()),
         ...[...outcomes]
@@ -11707,7 +11765,7 @@ export class PanelProvider implements vscode.Disposable {
         ...scopedPendingRecords.map((pending) => ({ id: pending.sessionId, agentKey: pending.agent })),
         ...all.map((session) => ({ id: session.sessionId, agentKey: session.agent })),
       ];
-      if (selectedOnly) this.selectionStatusRows = refreshRows;
+      if (selectionScope) this.selectionStatusRows = refreshRows;
       let childExpiry = Infinity;
       const liveChildren = this.liveOpenChildren(now, outcomes, refreshRows, (at) => {
         childExpiry = Math.min(childExpiry, at);
@@ -11728,6 +11786,13 @@ export class PanelProvider implements vscode.Disposable {
           },
         })
       ) {
+        // The listing signature still names the files that the held rows describe, so the last computation stands for the
+        // accepted catalog. The facts that changed wait for the next computation.
+        this.restoreChangedSessions(changedBefore);
+        if (basisBefore && this.authoritativeCatalog) {
+          this.selectionBasis = { ...basisBefore, catalog: this.authoritativeCatalog };
+          this.sourcesForSelection(this.authoritativeCatalog, new Set());
+        }
         if (!selectedOnly) {
           this.performanceCounters.recordRefreshStage('unchanged');
         }
@@ -11751,7 +11816,13 @@ export class PanelProvider implements vscode.Disposable {
       this.lastSignature = signature;
       const metadataRevision = this.metadataRevision ?? 0;
       const figuresRevision = this.dispatchFiguresRevision;
-      if (!selectedOnly) this.evictCache(sessions, all);
+      if (selectionScope) {
+        const index = this.selectionSources!;
+        this.evictOverBudget(
+          (file) => index.byFile.get(file)?.sessionId ?? '',
+          (sessionId) => index.byId.get(sessionId)?.[0],
+        );
+      } else this.evictCache(sessions, all);
       this.cards = this.collect(
         sessions.filter((session) => this.cache.has(session.file)),
         now,
@@ -11764,7 +11835,8 @@ export class PanelProvider implements vscode.Disposable {
       if (gained.agents.length) {
         this.onTurnsFinished?.(gained.agents);
       }
-      // Build rows for the full catalog, independent of selected transcript reads.
+      // Build the rows of the computed sessions, independent of selected transcript reads. A selection with a scope builds the
+      // rows of its scope, and every other refresh builds the rows of every listed session.
       const counts = this.unreadCounts();
       const fullLabels = new Map<string, string>();
       const wordingDay = railWordingDay(now);
@@ -11811,22 +11883,17 @@ export class PanelProvider implements vscode.Disposable {
         ),
         ...sessionRows,
       ];
-      if (selectedOnly) {
+      if (selectionScope) {
+        // Every row of the scope holds a place in the held rows, which `selectionScope` checked.
         this.selectionRows = sessionRows;
         this.indexSessionRows();
-        for (const row of sessionRows) {
-          const at = this.sessionRowIndex!.byId.get(row.id);
-          if (at !== undefined) (this.sessionRows as (typeof row)[])[at] = row;
-          else {
-            this.sessionRowIndex!.byId.set(row.id, this.sessionRows.length);
-            (this.sessionRows as (typeof row)[]).push(row);
-          }
-        }
+        for (const row of sessionRows)
+          (this.sessionRows as (typeof row)[])[this.sessionRowIndex!.byId.get(row.id)!] = row;
       } else {
         this.sessionRows = sessionRows;
         this.indexSessionRows();
         this.heldSessionRows?.retain(new Set(this.sessionRows.map((row) => row.id)));
-        this.sourcesForSelection(all, new Set());
+        this.sourcesForSelection(this.authoritativeCatalog ?? [], new Set());
       }
       if (!selectedOnly && this.repositoryScopeReady) this.onSessionRowsRefreshed?.();
       if (!selectedOnly && this.repositoryScopeReady) this.onDispatchEvidence?.();
@@ -11836,19 +11903,28 @@ export class PanelProvider implements vscode.Disposable {
         this.drainPendingQueues();
       }
       const metadata = all.map((session) => [session.sessionId, this.metaFor(session)] as const);
-      if (selectedOnly) {
+      if (selectionScope) {
+        // The shared figures keep their identity, and the session list keys compare each entry.
         const markNow = Date.now();
-        this.selectionMetadataStats = Object.fromEntries(
-          metadata.map(([id, meta]) => [id, sessionStatsFromFacts(derivedTitleStats(meta))]),
-        );
-        this.selectionMetadataCaches = Object.fromEntries(
-          metadata.map(([id, meta]) => [id, railCacheMarkOf(derivedTitleCacheStats(meta), markNow)]),
-        );
-        this.selectionMetadataRevisions = {};
         for (const [sessionId, meta] of metadata) {
-          if (Object.hasOwn(this.parsedRailCaches, sessionId))
-            this.selectionMetadataRevisions[sessionId] = derivedTitleCacheRevision(meta);
+          this.metadataStatsBySession = this.metadataStatFigures.readOne(
+            sessionId,
+            derivedTitleStats(meta),
+            sessionStatsFromFacts,
+          );
+          this.metadataRailCaches = this.metadataCacheFigures.readOne(
+            sessionId,
+            derivedTitleCacheStats(meta),
+            (facts) => railCacheMarkOf(facts, markNow),
+            (mark) => mark === null || mark.expiresAt > markNow,
+          );
         }
+        // Only the shown sessions hold a timeline mark, so their revisions are computed again.
+        const railRevisions: Record<string, RailCacheRevision | null> = {};
+        for (const sessionId of Object.keys(this.parsedRailCaches))
+          for (const source of this.selectionSources!.byId.get(sessionId) ?? [])
+            railRevisions[sessionId] = derivedTitleCacheRevision(this.metaFor(source));
+        this.metadataRailRevisions = railRevisions;
       } else {
         this.metadataStatsBySession = this.metadataStatFigures.read(
           metadata.map(([sessionId, meta]) => [sessionId, derivedTitleStats(meta)] as const),
@@ -11879,8 +11955,9 @@ export class PanelProvider implements vscode.Disposable {
         undefined,
         childExpired ? this.liveOpenChildren(railNow, outcomes, refreshRows) : liveChildren,
       );
+      if (selectionScope) this.moveRailGroups(selectionScope, statuses);
       const railInput = this.railInputFor(counts, statuses, openChildren, railNow);
-      if (!selectedOnly) this.indexRailOrder();
+      if (!selectionScope) this.indexRailOrder();
       const railKey = selectedOnly ? null : railInputKey(railInput, wordingDay);
       const railPending = this.lifetimeFigures.answers();
       const railAdoptions = sessionAdoptions(this.sessionAliases);
@@ -11931,7 +12008,7 @@ export class PanelProvider implements vscode.Disposable {
           heldHostRows = new PayloadRows();
           this.heldHostRows.set(host, heldHostRows);
         }
-        if (!selectedOnly) heldHostRows.retain(new Set(this.sessionRows.map((row) => row.id)));
+        if (!selectionScope) heldHostRows.retain(new Set(this.sessionRows.map((row) => row.id)));
         const hostRows = (
           changedRows
             ? (this.selectionRows ?? this.sessionRows).filter((row) => changedRows.has(row.id))
@@ -12126,12 +12203,15 @@ export class PanelProvider implements vscode.Disposable {
       // render that aborts before this point posts nothing.
       this.railSeedSkipped = false;
       const shownSessions = new Set(this.hosts.map((host) => this.hostSessions?.get(host) ?? this.showing));
-      if (!selectedOnly) {
-        for (const showing of this.heldRailPayloads.keys()) {
-          if (!shownSessions.has(showing)) this.heldRailPayloads.delete(showing);
-        }
-        this.indexRailOrder();
+      for (const showing of this.heldRailPayloads.keys()) {
+        if (!shownSessions.has(showing)) this.heldRailPayloads.delete(showing);
       }
+      // Each panel's session list input orders the rows again, so the order index follows the last order.
+      if (!selectionScope) this.indexRailOrder();
+      const shownIds = new Set(sessions.map((session) => session.sessionId));
+      if (selectionScope) this.advanceSelectionBasis(selectionScope, now, shownIds);
+      else if (!selectedOnly && all !== this.authoritativeCatalog) this.selectionBasis = undefined;
+      else this.recordSelectionBasis(now, wordingDay, shownIds);
       if (!this.hosts.length) this.heldSessionRows?.clear();
       if (!selectedOnly) {
         // A selection omits peer rows, labels and adoptions, so it cannot settle their keys.
@@ -12177,6 +12257,8 @@ export class PanelProvider implements vscode.Disposable {
         }
       }
     } catch (error) {
+      // A computation that stopped part way leaves no state that a selection can extend.
+      this.selectionBasis = undefined;
       if (!selectedOnly && controller && this.refreshController === controller && !controller.signal.aborted) {
         this.failSessionLoading(generation, controller.signal);
       }
@@ -12186,9 +12268,6 @@ export class PanelProvider implements vscode.Disposable {
       this.selectionStatusRows = undefined;
       this.selectionOutcomes = undefined;
       this.selectionWindows = undefined;
-      this.selectionMetadataStats = undefined;
-      this.selectionMetadataCaches = undefined;
-      this.selectionMetadataRevisions = undefined;
       if (selectedOnly && --this.selectedRefreshes === 0) this.drainCompressedRows();
       const owned = !selectedOnly && controller !== null && this.releaseCatalogRefresh(controller);
       this.performanceCounters.recordRefresh(refreshReason, performance.now() - refreshStarted);
@@ -12201,17 +12280,218 @@ export class PanelProvider implements vscode.Disposable {
     }
   }
 
+  // The sources of `sessions` in `catalog`, in catalog order for each session. The index follows the catalog's identity.
   private sourcesForSelection(catalog: readonly SessionFile[], sessions: ReadonlySet<string>): SessionFile[] {
     if (this.selectionSources?.catalog !== catalog) {
       const byId = new Map<string, SessionFile[]>();
+      const byFile = new Map<string, SessionFile>();
       for (const source of catalog) {
         const rows = byId.get(source.sessionId);
         if (rows) rows.push(source);
         else byId.set(source.sessionId, [source]);
+        if (!byFile.has(source.file)) byFile.set(source.file, source);
       }
-      this.selectionSources = { catalog, byId };
+      this.selectionSources = { catalog, byId, byFile };
     }
     return [...sessions].flatMap((id) => this.selectionSources!.byId.get(id) ?? []);
+  }
+
+  // Each panel's current and previous session, with the session that the selection leaves.
+  private switchedSessions(previousSelection: string | null): Set<string> {
+    return new Set(
+      [
+        this.showing,
+        previousSelection,
+        ...this.hosts.flatMap((host) => [this.hostSessions?.get(host), this.hostPreviousSessions?.get(host)]),
+      ].filter((session): session is string => typeof session === 'string'),
+    );
+  }
+
+  // The sessions that a selection computes, or null when the selection computes every listed session. A selection extends the
+  // last computation of every listed session while the state that the computation read stands. The scope holds the switched
+  // sessions, the sessions drawn as shown, the running group, the sessions whose facts changed, and the rows whose age wording
+  // or cache mark moved.
+  private selectionScope(switched: ReadonlySet<string>, now: number): Set<string> | null {
+    const basis = this.selectionBasis;
+    const catalog = this.authoritativeCatalog;
+    const groups = this.railOrderGroups;
+    if (!basis || !catalog || !groups || this.showing === null) return null;
+    this.indexSessionRows();
+    const rows = this.sessionRowIndex!.byId;
+    if (
+      basis.catalog !== catalog ||
+      basis.scope !== this.authoritativeCatalogScope ||
+      basis.scope !== JSON.stringify(this.repositoryScopeRoots) ||
+      basis.rows !== this.sessionRows ||
+      rows.size !== this.sessionRows.length ||
+      groups.order !== this.railOrder ||
+      basis.names !== this.threadNames.stamp ||
+      basis.parents !== this.sessionParentsOf() ||
+      basis.spend !== this.lastSpendSourceSignature ||
+      basis.drafts !== this.selectionDraftsKey() ||
+      basis.titles !== this.titles ||
+      basis.compressed !== this.compressedFactsRevision ||
+      basis.running !== this.running ||
+      basis.asks !== this.asks ||
+      basis.exits !== this.exitedNow ||
+      basis.children !== this.claudeChildren ||
+      basis.references !== this.claudeChildReferences ||
+      basis.saved !== this.saved ||
+      basis.prompted !== this.saved.prompted ||
+      basis.agentRuns !== this.saved.agentRuns ||
+      basis.day !== railWordingDay(now)
+    )
+      return null;
+    this.sourcesForSelection(catalog, new Set());
+    const index = this.selectionSources!;
+    const scope = new Set<string>();
+    for (const id of switched) {
+      if (!rows.has(id)) return null;
+      if (!this.newDrafts[id] && !this.awaitingSessionRecords[id] && !index.byId.has(id)) return null;
+      scope.add(id);
+    }
+    for (const id of [...groups.running, ...basis.shown]) if (rows.has(id)) scope.add(id);
+    for (const file of this.changedSessionFiles ?? []) {
+      const source = index.byFile.get(file);
+      if (source) scope.add(source.sessionId);
+    }
+    for (const id of this.changedSessionIds ?? []) if (index.byId.has(id)) scope.add(id);
+    for (const id of railClockDue(basis.clock, now)) scope.add(id);
+    return scope;
+  }
+
+  // The drafts and pending records that a computation lists, by the fields of their rows.
+  private selectionDraftsKey(): string {
+    return JSON.stringify([
+      this.repositoryScopeRoots,
+      Object.values(this.newDrafts ?? {}).map((draft) => [
+        draft.draftId,
+        draft.cwd,
+        draft.createdAt,
+        draft.profile.agent,
+      ]),
+      Object.values(this.awaitingSessionRecords ?? {}).map((pending) => [
+        pending.sessionId,
+        pending.cwd,
+        pending.createdAt,
+        pending.agent,
+      ]),
+    ]);
+  }
+
+  // The sources that a selection computes: the sources of its scope, or every listed source. The sources that the selection
+  // revalidated and admitted replace their catalog rows.
+  private selectionSourcesOf(scope: ReadonlySet<string> | null, admitted: readonly SessionFile[]): SessionFile[] {
+    const replaced = new Map(admitted.map((source) => [source.file, source]));
+    const catalog = this.authoritativeCatalog ?? [];
+    return (scope ? this.sourcesForSelection(catalog, scope) : catalog).map(
+      (source) => replaced.get(source.file) ?? source,
+    );
+  }
+
+  // A computation of every listed session takes every changed fact and sets aside the state that a selection extends, until
+  // it records that state again. A selection takes the changed facts of its scope. A refresh that builds no rows gives the
+  // taken facts back.
+  private settleChangedSessions(
+    scope: ReadonlySet<string> | null,
+    sources: readonly SessionFile[],
+  ): { files: Set<string>; ids: Set<string> } {
+    const files = this.changedSessionFiles ?? new Set<string>();
+    const ids = this.changedSessionIds ?? new Set<string>();
+    if (!scope) {
+      this.changedSessionFiles = new Set();
+      this.changedSessionIds = new Set();
+      this.selectionBasis = undefined;
+      return { files, ids };
+    }
+    const taken = { files: new Set<string>(), ids: new Set<string>() };
+    for (const source of sources) if (files.delete(source.file)) taken.files.add(source.file);
+    for (const id of scope) if (ids.delete(id)) taken.ids.add(id);
+    return taken;
+  }
+
+  private restoreChangedSessions(taken: { files: Set<string>; ids: Set<string> }): void {
+    for (const file of taken.files) this.noteChangedSession(file);
+    for (const id of taken.ids) (this.changedSessionIds ??= new Set()).add(id);
+  }
+
+  // A changed metadata entry or read window of `file`, which the next selection computes.
+  private noteChangedSession(file: string): void {
+    (this.changedSessionFiles ??= new Set()).add(file);
+  }
+
+  // Records what this computation of every listed session read, with the instants at which its rows change their age wording
+  // or cache mark.
+  private recordSelectionBasis(now: number, day: string, shown: ReadonlySet<string>): void {
+    const catalog = this.authoritativeCatalog;
+    if (!catalog) {
+      this.selectionBasis = undefined;
+      return;
+    }
+    this.sourcesForSelection(catalog, new Set());
+    const listed = this.selectionSources!.byId;
+    const instants: [string, number][] = [];
+    for (const row of this.sessionRows) if (listed.has(row.id)) instants.push([row.id, relativeChangeAt(row.at, now)]);
+    for (const [id, mark] of Object.entries(this.metadataRailCaches)) if (mark) instants.push([id, mark.expiresAt]);
+    this.selectionBasis = {
+      catalog,
+      scope: this.authoritativeCatalogScope ?? '',
+      rows: this.sessionRows,
+      names: this.threadNames.stamp,
+      parents: this.sessionParentsOf(),
+      spend: this.lastSpendSourceSignature,
+      drafts: this.selectionDraftsKey(),
+      titles: this.titles,
+      compressed: this.compressedFactsRevision,
+      running: this.running,
+      asks: this.asks,
+      exits: this.exitedNow,
+      children: this.claudeChildren,
+      references: this.claudeChildReferences,
+      saved: this.saved,
+      prompted: this.saved.prompted,
+      agentRuns: this.saved.agentRuns,
+      day,
+      clock: railClockOf(instants),
+      shown,
+    };
+  }
+
+  // Moves the age wording and cache mark instants of the computed sessions past `now`, and records the sessions now shown.
+  private advanceSelectionBasis(scope: ReadonlySet<string>, now: number, shown: ReadonlySet<string>): void {
+    const basis = this.selectionBasis;
+    if (!basis) return;
+    const next: [string, number][] = [];
+    for (const id of scope) {
+      const at = this.sessionRowIndex!.byId.get(id);
+      if (at !== undefined && this.selectionSources!.byId.has(id))
+        next.push([id, relativeChangeAt(this.sessionRows[at].at, now)]);
+      const mark = this.metadataRailCaches[id];
+      if (mark) next.push([id, mark.expiresAt]);
+    }
+    advanceRailClock(basis.clock, now, next);
+    this.selectionBasis = { ...basis, shown };
+    // An instant of a row that a selection computed again stays until it passes. A long run of selections lets them pile up,
+    // so past this size the next selection computes every listed session.
+    if (basis.clock.at.length > 2 * this.sessionRows.length + 64) this.selectionBasis = undefined;
+  }
+
+  // Moves the sessions of a selection scope between the running group and the other sessions of the held order, as
+  // `stableRailOrder` orders the held order with statuses that differ only in the scope.
+  private moveRailGroups(scope: ReadonlySet<string>, statuses: ReturnType<typeof sessionStatusOf>): void {
+    const groups = this.railOrderGroups!;
+    const joined = new Set([...scope].filter((id) => !groups.running.has(id) && inRailRunningGroup(statuses.get(id))));
+    const left = new Set([...scope].filter((id) => groups.running.has(id) && !inRailRunningGroup(statuses.get(id))));
+    if (!joined.size && !left.size) return;
+    const order = this.railOrder ?? [];
+    const running = order.filter((id) => groups.running.has(id) && !left.has(id));
+    this.railOrder = [
+      ...running,
+      ...order.filter((id) => joined.has(id)),
+      ...order.filter((id) => left.has(id)),
+      ...order.filter((id) => !groups.running.has(id) && !joined.has(id)),
+    ];
+    this.railOrderGroups = { order: this.railOrder, running: new Set([...running, ...joined]) };
   }
 
   private indexSessionRows(): void {
@@ -12858,6 +13138,10 @@ export class PanelProvider implements vscode.Disposable {
     }
     const ordered = stableRailOrder(this.sessionRows, this.railOrder, statuses);
     this.railOrder = ordered.map((row) => row.id);
+    this.railOrderGroups = {
+      order: this.railOrder,
+      running: new Set(this.railOrder.filter((id) => inRailRunningGroup(statuses.get(id)))),
+    };
     return ordered;
   }
 
@@ -13254,7 +13538,7 @@ export class PanelProvider implements vscode.Disposable {
       pinnedTop: this.pinnedTop,
       unsent: unsentBySession(only(this.drafts), this.saved.comments),
       parsedStats: {},
-      metadataStats: only(this.selectionMetadataStats ?? this.metadataStatsBySession),
+      metadataStats: only(this.metadataStatsBySession),
       lifetimeStats: only(lifetime.stats),
       lifetimeContextDetails: only(lifetime.contextDetails),
       lifetimeCosts: only(lifetime.costs),
@@ -13262,8 +13546,8 @@ export class PanelProvider implements vscode.Disposable {
       labels: only(this.saved.labels),
       caches: railCachesOf(
         only(this.parsedRailCaches),
-        only(this.selectionMetadataCaches ?? this.metadataRailCaches),
-        only(this.selectionMetadataRevisions ?? this.metadataRailRevisions),
+        only(this.metadataRailCaches),
+        only(this.metadataRailRevisions),
       ),
       views: this.saved.views,
       railFilters: this.saved.railFilters,
@@ -16206,6 +16490,7 @@ export class PanelProvider implements vscode.Disposable {
   private storeTitleEntry(file: string, entry: DerivedTitleEntry): void {
     const previous = this.titles.get(file);
     this.titles.set(file, entry);
+    this.noteChangedSession(file);
     if ((previous?.label ?? '') !== entry.label || (previous?.fullLabel ?? '') !== entry.fullLabel) {
       this.metadataRevision = (this.metadataRevision ?? 0) + 1;
     }
@@ -16705,15 +16990,18 @@ export class PanelProvider implements vscode.Disposable {
       return entry;
     }
     // Use the worker-measured entry size and catalog inode without another file read.
-    this.sessionNames.observe(
-      session.sessionId,
-      storedSessionName(entry),
-      transcriptIdentity(
-        { size: entry.size, ...(entry.sourceIdentity ?? { dev: session.dev, ino: session.ino }) },
-        entry.headKey,
-      ),
-      entry.withdrawnPrompt,
-    );
+    if (
+      this.sessionNames.observe(
+        session.sessionId,
+        storedSessionName(entry),
+        transcriptIdentity(
+          { size: entry.size, ...(entry.sourceIdentity ?? { dev: session.dev, ino: session.ino }) },
+          entry.headKey,
+        ),
+        entry.withdrawnPrompt,
+      )
+    )
+      (this.changedSessionIds ??= new Set()).add(session.sessionId);
     const held = this.sessionNames.get(session.sessionId);
     return held ? withSessionName(entry, held) : entry;
   }
@@ -16762,6 +17050,7 @@ export class PanelProvider implements vscode.Disposable {
   // Persist changed held names in existing derived entries for subsequent startup.
   private storeSessionNames(changed: Iterable<string>, fileOf: (sessionId: string) => SessionFile | undefined): void {
     for (const sessionId of changed) {
+      (this.changedSessionIds ??= new Set()).add(sessionId);
       const session = fileOf(sessionId);
       const name = this.sessionNames.get(sessionId);
       const entry = session && this.titles.get(session.file);
@@ -17582,6 +17871,7 @@ export class PanelProvider implements vscode.Disposable {
         bytes: result.value.retainedBytes,
         checkpointBytes: result.value.checkpointBytes,
       });
+      this.noteChangedSession(current.file);
       // Another panel's failure stays drawn when this panel's window arrives.
       if (this.selectionFailureOf(current)) this.selectionFailures.delete(current.file);
       retryLatestRevision ||= result.value.recoveryPending === true;
@@ -17769,6 +18059,7 @@ export class PanelProvider implements vscode.Disposable {
         bytes: result.value.retainedBytes,
         checkpointBytes: result.value.checkpointBytes,
       });
+      this.noteChangedSession(session.file);
       changed = true;
       // A new Claude window changes the turns the subagent split reads, so the retained pages refresh with it.
       const accepted = this.cache.get(session.file);
@@ -18072,6 +18363,34 @@ export class PanelProvider implements vscode.Disposable {
     return new Set(this.hostSessions.values());
   }
 
+  // Apply the retained-history budget to the parsed windows and retained pages, least recently used first. `sessionIdOf` names
+  // the session of a cached file, and `sourceOf` the source whose window an evicted session gives up.
+  private evictOverBudget(
+    sessionIdOf: (file: string) => string,
+    sourceOf: (sessionId: string) => SessionFile | undefined,
+  ): void {
+    const retained = [...this.cache].map(([file, entry]) => {
+      const sessionId = sessionIdOf(file);
+      return {
+        sessionId,
+        bytes: (entry.bytes ?? 0) + historyBytes(this.history.get(sessionId)?.pages ?? []),
+        usedAt: entry.usedAt ?? 0,
+      };
+    });
+    for (const sessionId of historyEvictions(
+      retained,
+      this.protectedHistorySessions(),
+      this.sessionCacheBudgetBytes(),
+    )) {
+      const session = sourceOf(sessionId);
+      if (session) {
+        this.cache.delete(session.file);
+        this.noteChangedSession(session.file);
+      }
+      this.dropOlderHistory(sessionId);
+    }
+  }
+
   // Evict absent parsed windows and apply the retained-history budget. Trim small discovery caches against all present files.
   private evictCache(keep: SessionFile[], known: SessionFile[]): void {
     const live = new Set(known.map((s) => s.file));
@@ -18079,28 +18398,13 @@ export class PanelProvider implements vscode.Disposable {
     for (const file of [...this.cache.keys()]) {
       if (!live.has(file) && this.physicalMembershipOf(file) === 'absent') {
         this.cache.delete(file);
+        this.noteChangedSession(file);
       }
     }
-    const retained = [...this.cache].map(([file, entry]) => ({
-      sessionId: historySources.find((session) => session.file === file)?.sessionId ?? '',
-      bytes:
-        (entry.bytes ?? 0) +
-        historyBytes(
-          this.history.get(historySources.find((session) => session.file === file)?.sessionId ?? '')?.pages ?? [],
-        ),
-      usedAt: entry.usedAt ?? 0,
-    }));
-    for (const sessionId of historyEvictions(
-      retained,
-      this.protectedHistorySessions(),
-      this.sessionCacheBudgetBytes(),
-    )) {
-      const session = historySources.find((candidate) => candidate.sessionId === sessionId);
-      if (session) {
-        this.cache.delete(session.file);
-      }
-      this.dropOlderHistory(sessionId);
-    }
+    this.evictOverBudget(
+      (file) => historySources.find((session) => session.file === file)?.sessionId ?? '',
+      (sessionId) => historySources.find((candidate) => candidate.sessionId === sessionId),
+    );
     // Per-source facts are pruned only while the catalog is authoritative. Before the first one, or after a workspace folder
     // change clears it, a selected-only refresh lists at most the selected sessions. A refresh that renders before metadata
     // lists a catalog that is not yet authoritative. Neither list shows that any other source is gone.

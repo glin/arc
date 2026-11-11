@@ -302,6 +302,18 @@ export class SessionFactFigures<F, V> {
     return this.value;
   }
 
+  // Reads the figure of one session as `read` reads each session, and patches the output when the figure moves.
+  readOne(
+    sessionId: string,
+    facts: F,
+    derive: (facts: F) => V,
+    current: (value: V) => boolean = () => true,
+  ): Readonly<Record<string, V>> {
+    const previous = this.held.get(sessionId);
+    if (previous && previous.facts === facts && current(previous.value)) return this.value;
+    return this.patch(sessionId, { facts, value: derive(facts) });
+  }
+
   // Sets the figure of one session, or drops it with null. The output keeps its identity.
   // Session list keys detect replaced entries and changed membership. The caller requests publication after patching.
   patch(sessionId: string, entry: { facts: F; value: V } | null): Readonly<Record<string, V>> {

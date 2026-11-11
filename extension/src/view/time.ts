@@ -34,6 +34,17 @@ export function formatRelative(at: number, now: number = Date.now()): string {
   return RELATIVE_UNDER_A_MINUTE;
 }
 
+// The first instant after `now` at which `formatRelative(at)` reads differently. Each tier hands over at a whole count of its
+// unit, so the wording changes when the count of the current unit grows.
+export function relativeChangeAt(at: number, now: number = Date.now()): number {
+  const seconds = Math.max(0, Math.floor((now - at) / 1000));
+  const step =
+    seconds < RELATIVE_STEPS[0].unitSeconds
+      ? RELATIVE_STEPS[0]
+      : RELATIVE_STEPS.find((tier) => tier.max === null || Math.floor(seconds / tier.unitSeconds) <= tier.max)!;
+  return at + (Math.floor(seconds / step.unitSeconds) + 1) * step.unitSeconds * 1000;
+}
+
 // Cache estimates switch to cold 90 seconds before inferred expiry. Spans under two minutes use near-boundary wording.
 export const CACHE_SPAN_MINIMUM_SECONDS = 120;
 

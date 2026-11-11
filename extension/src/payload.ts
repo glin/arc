@@ -224,6 +224,78 @@ export function railWordingDay(now: number): string {
   return `${date.toDateString()} ${date.getTimezoneOffset()} ${Intl.DateTimeFormat().resolvedOptions().timeZone}`;
 }
 
+// The instants at which session list rows change their age wording or cache mark, as a binary min-heap. One session can hold
+// several instants. An instant past its row's change only asks for one more computation of that row.
+export interface RailClock {
+  at: number[];
+  ids: string[];
+}
+
+export function railClockOf(entries: Iterable<readonly [id: string, at: number]>): RailClock {
+  const clock: RailClock = { at: [], ids: [] };
+  for (const [id, at] of entries) {
+    clock.at.push(at);
+    clock.ids.push(id);
+  }
+  for (let index = (clock.at.length >> 1) - 1; index >= 0; index--) siftDown(clock, index);
+  return clock;
+}
+
+// The sessions with an instant at or before `now`, without changing the clock. The walk visits only those instants and
+// their children.
+export function railClockDue(clock: RailClock, now: number): Set<string> {
+  const due = new Set<string>();
+  const pending = clock.at.length && clock.at[0] <= now ? [0] : [];
+  for (let index = pending.pop(); index !== undefined; index = pending.pop()) {
+    due.add(clock.ids[index]);
+    for (const child of [2 * index + 1, 2 * index + 2])
+      if (child < clock.at.length && clock.at[child] <= now) pending.push(child);
+  }
+  return due;
+}
+
+// Removes the instants at or before `now` and adds the next instants of the sessions computed at `now`.
+export function advanceRailClock(
+  clock: RailClock,
+  now: number,
+  next: Iterable<readonly [id: string, at: number]>,
+): void {
+  while (clock.at.length && clock.at[0] <= now) {
+    const lastAt = clock.at.pop()!;
+    const lastId = clock.ids.pop()!;
+    if (!clock.at.length) break;
+    clock.at[0] = lastAt;
+    clock.ids[0] = lastId;
+    siftDown(clock, 0);
+  }
+  for (const [id, at] of next) {
+    let index = clock.at.push(at) - 1;
+    clock.ids.push(id);
+    while (index > 0) {
+      const parent = (index - 1) >> 1;
+      if (clock.at[parent] <= clock.at[index]) break;
+      swap(clock, index, parent);
+      index = parent;
+    }
+  }
+}
+
+function siftDown(clock: RailClock, start: number): void {
+  for (let index = start; ;) {
+    let least = index;
+    for (const child of [2 * index + 1, 2 * index + 2])
+      if (child < clock.at.length && clock.at[child] < clock.at[least]) least = child;
+    if (least === index) return;
+    swap(clock, index, least);
+    index = least;
+  }
+}
+
+function swap(clock: RailClock, left: number, right: number): void {
+  [clock.at[left], clock.at[right]] = [clock.at[right], clock.at[left]];
+  [clock.ids[left], clock.ids[right]] = [clock.ids[right], clock.ids[left]];
+}
+
 function printable(value: unknown): unknown {
   if (value instanceof Map || value instanceof Set) {
     return [...value];

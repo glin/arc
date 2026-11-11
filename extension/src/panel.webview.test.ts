@@ -334,7 +334,7 @@ test('heading worktree metadata follows each panel opening source and clears whe
   const end = panelHostSource.indexOf('const hostInput =', begin);
   assert.ok(begin > 0 && end > begin);
   const code = ts.transpileModule(
-    `function rows(sessions, hostSession, fullLabels, hostParent, selectedOnly = false, hostPreviousSession = null) { ${panelHostSource.slice(begin, end)} return hostRows; }`,
+    `function rows(sessions, hostSession, fullLabels, hostParent, selectedOnly = false, hostPreviousSession = null, selectionScope = null) { ${panelHostSource.slice(begin, end)} return hostRows; }`,
     { compilerOptions: { target: ts.ScriptTarget.ES2022 } },
   ).outputText;
   const project = new Function('startingWorktree', 'PayloadRows', 'host', `${code}; return rows;`)(
@@ -4910,6 +4910,7 @@ test('refresh human admission shares read and source allowances and resumes canc
   // A selected refresh loses ownership without its private controller receiving an abort. The refresh follows a switch
   // away from the replaced session, so it rechecks that session.
   provider.sourcesForSelection = (PanelProvider.prototype as any).sourcesForSelection;
+  provider.switchedSessions = (PanelProvider.prototype as any).switchedSessions;
   provider.previousSelection = 'same-id';
   provider.hosts = [];
   for (const supersede of ['refreshGeneration', 'selectionGeneration']) {
@@ -20059,6 +20060,8 @@ test('the live Codex subagent route keeps each panel on the place its shared tra
     'prunePlaces',
     'setTimeout',
     'CATALOG_REFRESH_DEADLINE_MS',
+    'readThreadNames',
+    'codexSessionIndexPath',
     refreshCode,
   )(
     async () => [],
@@ -20076,13 +20079,15 @@ test('the live Codex subagent route keeps each panel on the place its shared tra
     prunePlaces,
     () => null,
     1,
+    (_path: string, names: unknown) => names,
+    () => 'index',
   );
 
   const loopAt = panelHostSource.indexOf('let largestRenderBytes: number | null = null;');
   const loopEnd = panelHostSource.indexOf('// The payload just posted words the rail', loopAt);
   assert.ok(loopAt > 0 && loopEnd > loopAt, 'the actual host payload loop is no longer available to the symptom check');
   const loopCode = esbuild.transformSync(
-    `export function post(previousSelection, counts, statuses, openChildren, railNow, sessions, selectedOnly, railAdoptions, fullLabels, light, generation, all) {\nconst controller = new AbortController(); const figuresRevision = this.dispatchFiguresRevision;\n${panelHostSource.slice(loopAt, loopEnd)}\n}`,
+    `export function post(previousSelection, counts, statuses, openChildren, railNow, sessions, selectedOnly, railAdoptions, fullLabels, light, generation, all, selectionScope = null) {\nconst controller = new AbortController(); const figuresRevision = this.dispatchFiguresRevision;\n${panelHostSource.slice(loopAt, loopEnd)}\n}`,
     { loader: 'ts', format: 'cjs' },
   ).code;
   const loopModule = { exports: {} as { post: (...args: unknown[]) => void } };
@@ -24224,12 +24229,12 @@ test('a rail card wears the status that needs attention', () => {
     'pinnedTop: this.pinnedTop',
     'unsent: unsentBySession(only(this.drafts), this.saved.comments)',
     'parsedStats: {}',
-    'metadataStats: only(this.selectionMetadataStats ?? this.metadataStatsBySession)',
+    'metadataStats: only(this.metadataStatsBySession)',
     'lifetimeStats: only(lifetime.stats)',
     'lifetimeCosts: only(lifetime.costs)',
     'lifetimeCacheExpiry: only(lifetime.cacheExpiryCounts)',
     'labels: only(this.saved.labels)',
-    'caches: railCachesOf(only(this.parsedRailCaches), only(this.selectionMetadataCaches ?? this.metadataRailCaches), only(this.selectionMetadataRevisions ?? this.metadataRailRevisions))',
+    'caches: railCachesOf(only(this.parsedRailCaches), only(this.metadataRailCaches), only(this.metadataRailRevisions))',
     'views: this.saved.views',
     'railFilters: this.saved.railFilters',
   ]) {
@@ -33442,11 +33447,16 @@ test('a ready host stages worker-backed session data without clearing accepted c
     /acceptsProgressiveResult\(result, this\.refreshGeneration, this\.revisionOf\(session\)\)/,
     'a worker result can replace content after its request generation or source revision changed',
   );
-  const eviction = memberFrom(panelHostSource, panelHostSource.indexOf('private evictCache('));
+  const eviction = memberFrom(panelHostSource, panelHostSource.indexOf('private evictOverBudget('));
   sourceMatch(
     eviction,
-    /historyEvictions\([\s\S]*retained, this\.protectedHistorySessions\(\), this\.sessionCacheBudgetBytes\(\)[\s\S]*\)/,
+    /historyEvictions\([\s\S]*retained,\s*this\.protectedHistorySessions\(\),\s*this\.sessionCacheBudgetBytes\(\)[\s\S]*\)/,
     'selected and recently used payloads have no bounded retention rule',
+  );
+  sourceMatch(
+    memberFrom(panelHostSource, panelHostSource.indexOf('private evictCache(')),
+    /this\.evictOverBudget\(/,
+    'a catalog refresh no longer applies the retained-history budget',
   );
 });
 
@@ -43722,7 +43732,7 @@ test('incomplete Codex walks persist newly readable openings through recovered c
 test('unread membership retains selection navigation derived caches exit corpus and reader input until complete absence', () => {
   const refresh = methodBody('async refresh(');
   const selection = ts.transpileModule(
-    `function reconcile(all, scopedDrafts = [], scopedPendingRecords = [], selectedOnly = false) { ${refresh.slice(refresh.indexOf('const reachable = ['), refresh.indexOf('const sessions = this.shownSessions(all);'))} }`,
+    `function reconcile(all, scopedDrafts = [], scopedPendingRecords = [], selectedOnly = false, selectionScope = null) { ${refresh.slice(refresh.indexOf('const reachable = ['), refresh.indexOf('const sessions = this.shownSessions(all);'))} }`,
     { compilerOptions: { target: ts.ScriptTarget.ES2022 } },
   ).outputText;
   const reconcile = new Function('pickShowing', 'visitPlace', 'prunePlaces', selection + '\nreturn reconcile;')(
@@ -43732,7 +43742,7 @@ test('unread membership retains selection navigation derived caches exit corpus 
   );
   const collect = methodBody('private collect(');
   const retainedWindows = ts.transpileModule(
-    `function refreshDerived(all = [], sessions = [], currentRecords = { newestTurns: new Map() }, selectedOnly = false) { ${refresh.slice(refresh.indexOf('const heldWindows ='), refresh.indexOf('const statusFacts ='))} ${collect.slice(collect.indexOf('for (const session of this.readWindows.keys())'), collect.indexOf('// Update retained-page recency'))} ${collect.slice(collect.indexOf('const heldNewest ='), collect.indexOf('this.composerRuntime ='))} }`,
+    `function refreshDerived(all = [], sessions = [], currentRecords = { newestTurns: new Map() }, selectedOnly = false, selectionScope = null) { ${refresh.slice(refresh.indexOf('const heldWindows ='), refresh.indexOf('const statusFacts ='))} ${collect.slice(collect.indexOf('for (const session of this.readWindows.keys())'), collect.indexOf('// Update retained-page recency'))} ${collect.slice(collect.indexOf('const heldNewest ='), collect.indexOf('this.composerRuntime ='))} }`,
     { compilerOptions: { target: ts.ScriptTarget.ES2022 } },
   ).outputText;
   const refreshDerived = new Function(retainedWindows + '\nreturn refreshDerived;')();

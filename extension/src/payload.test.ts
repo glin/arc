@@ -3,8 +3,11 @@ import assert from 'node:assert';
 
 import {
   DUPLICATE_CENSUS_MINIMUM,
+  advanceRailClock,
   duplicateStrings,
   messageFieldBytes,
+  railClockDue,
+  railClockOf,
   railPayload,
   railRowBytes,
   renderPayload,
@@ -658,4 +661,23 @@ test('no ceiling sits far above what the payload actually weighs', () => {
         `the ceiling for ${name} is ${ceiling} and the payload weighs ${actual}. Lower it to about ${Math.ceil(actual * SLACK)}.`,
     );
   assert.deepEqual(roomy, [], roomy.join('\n'));
+});
+
+test('the session list clock names every row whose instant passed, and moves those rows to their next instants', () => {
+  let seed = 41;
+  const random = (below: number) => (seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0) % below;
+  const held = Array.from({ length: 300 }, (_, index) => ['row-' + (index % 120), random(10_000)] as [string, number]);
+  const clock = railClockOf(held);
+  for (let now = 0; now < 12_000; now += 500 + random(700)) {
+    const due = new Set(held.filter(([, at]) => at <= now).map(([id]) => id));
+    assert.deepEqual(railClockDue(clock, now), due, 'due rows at ' + now);
+    const next = [...due].map((id) => [id, now + 1 + random(5_000)] as [string, number]);
+    advanceRailClock(clock, now, next);
+    for (let at = held.length - 1; at >= 0; at--) if (held[at][1] <= now) held.splice(at, 1);
+    held.push(...next);
+    assert.deepEqual(
+      [...clock.at].sort((a, b) => a - b),
+      held.map(([, at]) => at).sort((a, b) => a - b),
+    );
+  }
 });
