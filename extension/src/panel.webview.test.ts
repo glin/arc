@@ -12415,7 +12415,7 @@ test('derived session caches load, trim against the walk, and checkpoint after f
   const evict = memberFrom(panelHostSource, evictAt);
   sourceMatch(
     evict,
-    /if \(this\.pruneDerivedTitles\(present\)\) \{ this\.derivedCacheCheckpointState\.markChanged\(\); \}/,
+    /if \(this\.pruneDerivedTitles\(present, physical\)\) \{ this\.derivedCacheCheckpointState\.markChanged\(\); \}/,
     'removed title metadata never makes the durable cache dirty',
   );
   sourceMatch(
@@ -32380,11 +32380,13 @@ test('the unsent prompts reach storage and come back out of it', () => {
     'a window opens without the submissions Arc already accepted',
   );
 
-  const draftsWriteAt = panelHostSource.indexOf('private writeDrafts(): Promise<void> {');
+  const draftsWriteAt = panelHostSource.indexOf(
+    'private writeDrafts(sentPrompts?: Record<string, string[]>): Promise<void> {',
+  );
   const draftsWrite = memberFrom(panelHostSource, draftsWriteAt);
   sourceMatch(
     draftsWrite,
-    /this\.saved\.sentPrompts = sentPromptsToSave\(this\.sentPrompts, this\.promptsBySession\);/,
+    /this\.saved\.sentPrompts = sentPrompts \?\? sentPromptsToSave\(this\.sentPrompts, this\.promptsBySession\);/,
     'a send never reaches storage, so a restart still loses the prompt an agent process never recorded',
   );
 
@@ -32876,7 +32878,7 @@ test('the provider carries the walk between its two books and the composer', () 
       'a second poll appends to what it already holds, so the prompt just sent is offered last',
     ],
     [
-      'const prunedSent = prunedSentPrompts(this.sentPrompts, this.promptsBySession);',
+      'const prunedSent = sentPromptsToSave(this.sentPrompts, this.promptsBySession);',
       'a prompt the transcript now records still sits in the saved book though the transcript alone now supplies it',
     ],
     ['sent: this.sentPrompts,', 'a session gaining its real id empties the sent book of every session'],
@@ -32901,7 +32903,7 @@ test('the provider carries the walk between its two books and the composer', () 
   const pruneBody = panelHostSource.slice(pruneAt, pruneEnd);
   sourceMatch(
     pruneBody,
-    /void this\.writeDrafts\(\)/,
+    /void this\.writeDrafts\(prunedSent\)/,
     'the pruned projection never reaches storage, so a restart brings back a prompt the transcript already recorded',
   );
   // holdDraft updates boxText as well as the retained draft.
@@ -32979,8 +32981,17 @@ test('refreshes after a sent prompt reaches its transcript leave room for the sa
     await gate;
     stored.push(state);
   });
+  // The first refresh prunes the sent book once against the recorded prompts, and its save stores that pruned book.
+  let recordedReads = 0;
+  const recorded = provider.promptsBySession as Map<string, string[]>;
+  recorded.get = (session: string) => {
+    recordedReads++;
+    return Map.prototype.get.call(recorded, session);
+  };
+  refresh();
+  assert.equal(recordedReads, 2, 'a refresh that saves pruned the sent book twice');
   // More refreshes than the 256 saves the host save queue admits, all while the first save waits on storage.
-  for (let n = 0; n < 300; n++) refresh();
+  for (let n = 1; n < 300; n++) refresh();
   provider.sentPrompts.session.push('sent now');
   const send = provider.writeDrafts().then(
     () => 'saved',
@@ -46081,7 +46092,7 @@ test('saved drafts never carry a Remote Control link', async () => {
   const { provider, toggle } = remoteControlState();
   await toggle('s1', { outcome: 'connected', url: REMOTE_LINK, late: false });
   const same = (value: unknown) => value;
-  const writeDrafts = compiledProviderMethod('function ()', 'private writeDrafts(', {
+  const writeDrafts = compiledProviderMethod('function (sentPrompts)', 'private writeDrafts(', {
     normalizeDrafts: same,
     sentPromptsToSave: same,
     normalizePromptAssetBook: same,

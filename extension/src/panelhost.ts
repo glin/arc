@@ -432,7 +432,6 @@ import {
   promptHistory,
   sentAfter,
   recallPromptsOf,
-  prunedSentPrompts,
   sentPromptsToSave,
   commentsForQueuedSubmission,
   queueWithout,
@@ -902,6 +901,9 @@ type DiscoveryPendingWriter =
   | 'catalogMismatch'
   | 'cachedLinks'
   | 'spendUnheld';
+
+// The scope text and source roots that physical membership checks share within one synchronous run.
+type PhysicalMembershipHeld = { scope?: string; claude?: string[]; codex?: string[] };
 
 // Why an accepted catalog holds no session read revision, named in the performance counters.
 type AcceptedUnsettledCause =
@@ -2773,6 +2775,14 @@ export class PanelProvider implements vscode.Disposable {
     checkpoint: object;
     key: string;
     count: { completed: number; known: number };
+    // The normalized paths of the parent and catalog files, with the arrays they came from.
+    sources: {
+      parents: readonly SessionFile[];
+      catalog: readonly SessionFile[];
+      parentCount: number;
+      catalogCount: number;
+      known: ReadonlySet<string>;
+    };
   } | null = null;
   private readonly warnedMessageBudgets = new Set<string>();
   private performanceOutput: vscode.OutputChannel | null = null;
@@ -9248,9 +9258,10 @@ export class PanelProvider implements vscode.Disposable {
     }
   }
 
-  private writeDrafts(): Promise<void> {
+  // A caller that already pruned the sent book against the current recorded prompts passes that book, so it is not pruned again.
+  private writeDrafts(sentPrompts?: Record<string, string[]>): Promise<void> {
     this.saved.drafts = normalizeDrafts(this.drafts);
-    this.saved.sentPrompts = sentPromptsToSave(this.sentPrompts, this.promptsBySession);
+    this.saved.sentPrompts = sentPrompts ?? sentPromptsToSave(this.sentPrompts, this.promptsBySession);
     this.saved.assets = normalizePromptAssetBook(this.assets);
     this.saved.queues = normalizeQueuedSubmissions(this.queues);
     this.saved.draftCommentIds = normalizeDraftCommentIds(this.draftCommentIds);
@@ -12901,6 +12912,8 @@ export class PanelProvider implements vscode.Disposable {
       this.performanceCounters.recordRefreshStage('abandoned');
     }
     this.pendingRefresh = null;
+    // Requests with one reason keep it when they merge, so a merged request of only one requester kind runs under that kind.
+    this.performanceCounters?.recordWork(`pendingRun:${pending.reason}`);
     void this.refreshAs(
       pending.reason,
       pending.force,
@@ -16423,11 +16436,11 @@ export class PanelProvider implements vscode.Disposable {
     return true;
   }
 
-  // Whether membership coverage lists this source as a member of the catalog.
-  private coveredMember(source: SessionFile): boolean {
+  // Whether membership coverage lists this source as a member of the catalog. A caller that holds the source's member key passes it.
+  private coveredMember(source: SessionFile, member?: string): boolean {
     return (
       !this.enumeratedAmbiguousIds?.has(source.sessionId) &&
-      (this.enumeratedMembers?.has(sessionCoverageMember(source)) ||
+      (this.enumeratedMembers?.has(member ?? sessionCoverageMember(source)) ||
         (source.childTranscript === true && !this.dispatchDiscoveryPending))
     );
   }
@@ -16445,7 +16458,14 @@ export class PanelProvider implements vscode.Disposable {
         : this.dispatchDiscoveryPending
           ? 'pendingSet'
           : undefined;
-    const members = new Set(current.filter((source) => this.coveredMember(source)).map(sessionCoverageMember));
+    // The member key of each source, computed once in this call. A source that both lists hold is the same object.
+    const memberKeys = new Map<SessionFile, string>();
+    const memberOf = (source: SessionFile): string => {
+      let member = memberKeys.get(source);
+      if (member === undefined) memberKeys.set(source, (member = sessionCoverageMember(source)));
+      return member;
+    };
+    const members = new Set(current.filter((source) => this.coveredMember(source, memberOf(source))).map(memberOf));
     this.membershipCoverage = {
       domain: 'admitted',
       scope,
@@ -16480,15 +16500,16 @@ export class PanelProvider implements vscode.Disposable {
           );
       }
     }
-    const currentMembers = new Set(current.map(sessionCoverageMember));
+    const currentMembers = new Set(current.map(memberOf));
+    const physical: PhysicalMembershipHeld = {};
     if (
       complete &&
       this.authoritativeCatalogScope === scope &&
       (this.authoritativeCatalog ?? []).some(
         (source) =>
           source.childTranscript === true &&
-          !currentMembers.has(sessionCoverageMember(source)) &&
-          this.physicalMembershipOf(source.file) === 'unknown',
+          !currentMembers.has(memberOf(source)) &&
+          this.physicalMembershipOf(source.file, physical) === 'unknown',
       )
     ) {
       complete = false;
@@ -16506,9 +16527,9 @@ export class PanelProvider implements vscode.Disposable {
       ...current,
       ...(this.authoritativeCatalog ?? []).filter(
         (source) =>
-          !currentMembers.has(sessionCoverageMember(source)) &&
+          !currentMembers.has(memberOf(source)) &&
           !unverified?.has(normalizeFsPath(source.file)) &&
-          this.physicalMembershipOf(source.file) !== 'absent',
+          this.physicalMembershipOf(source.file, physical) !== 'absent',
       ),
     ];
   }
@@ -16548,26 +16569,35 @@ export class PanelProvider implements vscode.Disposable {
     );
   }
 
-  private physicalMembershipOf(file: string): import('./sessioncoverage').SessionPresence {
-    const scope = JSON.stringify(this.repositoryScopeRoots ?? []);
+  // A caller that checks many files in one synchronous run passes one `held` object to every call. The scope text and each
+  // source root are then computed once for that run. Coverage, readiness and the coverage revision are read on every call.
+  private physicalMembershipOf(
+    file: string,
+    held: PhysicalMembershipHeld = {},
+  ): import('./sessioncoverage').SessionPresence {
+    const scope = (held.scope ??= JSON.stringify(this.repositoryScopeRoots ?? []));
     const context = { domain: 'physical' as const, scope, revision: String(this.coverageRevision) };
     const facts = this.physicalCoverage;
     if (!this.repositoryScopeReady || !facts) return 'unknown';
-    if (isInside(file, [projectsRoot()])) return sessionPresence(facts.claude, context, { file });
-    if (isInside(file, [codexSessionsRoot()])) return sessionPresence(facts.codex, context, { file });
+    if (isInside(file, (held.claude ??= [projectsRoot()]))) return sessionPresence(facts.claude, context, { file });
+    if (isInside(file, (held.codex ??= [codexSessionsRoot()]))) return sessionPresence(facts.codex, context, { file });
     return 'unknown';
   }
 
   // Drop cached source facts only when physical coverage proves the source absent.
   // True when saved rows were dropped, so the caller marks the cache for its next save.
-  private pruneDerivedTitles(listed: ReadonlySet<string>): boolean {
+  private pruneDerivedTitles(listed: ReadonlySet<string>, physical: PhysicalMembershipHeld = {}): boolean {
     let dropped = this.commitRepositories.prune(
-      (file) => !listed.has(file) && this.physicalMembershipOf(file) === 'absent',
+      (file) => !listed.has(file) && this.physicalMembershipOf(file, physical) === 'absent',
     );
     for (const held of [this.titles, this.carriedNames]) {
       for (const file of held.keys()) {
         // A plain path stays while the adoption of its twin is unsettled.
-        if (!listed.has(file) && !this.adoptionsUnsettled?.has(file) && this.physicalMembershipOf(file) === 'absent') {
+        if (
+          !listed.has(file) &&
+          !this.adoptionsUnsettled?.has(file) &&
+          this.physicalMembershipOf(file, physical) === 'absent'
+        ) {
           held.delete(file);
           dropped = true;
         }
@@ -17166,7 +17196,9 @@ export class PanelProvider implements vscode.Disposable {
     if (list.complete) this.startupSourceCheckpoint = null;
   }
 
-  // Counts the known and checked sources of a checkpoint. The result is reused until the checkpoint changes.
+  // Counts the known and checked sources of a checkpoint. The result is reused until the checkpoint changes. The normalized
+  // known sources are reused while the parents and catalog arrays and their lengths stay the same, so a delta that only checks
+  // more sources counts its checked sources against them.
   private sourceCountOf(checkpoint: import('./progressiveworker').DiscoveryCheckpoint): {
     completed: number;
     known: number;
@@ -17179,10 +17211,33 @@ export class PanelProvider implements vscode.Disposable {
     ].join(':');
     const held = this.startupSourceCounted;
     if (held && held.checkpoint === checkpoint && held.key === key) return held.count;
-    const known = new Set([...checkpoint.parents, ...checkpoint.catalog].map((row) => normalizeFsPath(row.file)));
-    const completed = new Set(checkpoint.completed.map(normalizeFsPath).filter((file) => known.has(file))).size;
-    const count = { completed, known: known.size };
-    this.startupSourceCounted = { checkpoint, key, count };
+    let sources = held?.sources;
+    if (
+      !sources ||
+      sources.parents !== checkpoint.parents ||
+      sources.catalog !== checkpoint.catalog ||
+      sources.parentCount !== checkpoint.parents.length ||
+      sources.catalogCount !== checkpoint.catalog.length
+    ) {
+      sources = {
+        parents: checkpoint.parents,
+        catalog: checkpoint.catalog,
+        parentCount: checkpoint.parents.length,
+        catalogCount: checkpoint.catalog.length,
+        known: new Set([...checkpoint.parents, ...checkpoint.catalog].map((row) => normalizeFsPath(row.file))),
+      };
+    }
+    // A known path is already normalized, and normalizing it again returns it unchanged.
+    const completed = new Set<string>();
+    for (const file of checkpoint.completed) {
+      if (sources.known.has(file)) completed.add(file);
+      else {
+        const normal = normalizeFsPath(file);
+        if (sources.known.has(normal)) completed.add(normal);
+      }
+    }
+    const count = { completed: completed.size, known: sources.known.size };
+    this.startupSourceCounted = { checkpoint, key, count, sources };
     return count;
   }
 
@@ -18713,8 +18768,10 @@ export class PanelProvider implements vscode.Disposable {
   private evictCache(keep: SessionFile[], known: SessionFile[]): void {
     const live = new Set(known.map((s) => s.file));
     const historySources = [...(this.authoritativeCatalog ?? []), ...known];
+    // Every membership check in this call shares one scope text and one set of source roots.
+    const physical: PhysicalMembershipHeld = {};
     for (const file of [...this.cache.keys()]) {
-      if (!live.has(file) && this.physicalMembershipOf(file) === 'absent') {
+      if (!live.has(file) && this.physicalMembershipOf(file, physical) === 'absent') {
         this.cache.delete(file);
         this.noteChangedSession(file);
       }
@@ -18729,21 +18786,21 @@ export class PanelProvider implements vscode.Disposable {
     if (this.authoritativeCatalog !== null) {
       // Include filtered Claude peer-wake files when retaining working-directory and human-prompt scan caches.
       const present = new Set([...known.map((s) => s.file), ...this.walkedClaude]);
-      if (this.pruneDerivedTitles(present)) {
+      if (this.pruneDerivedTitles(present, physical)) {
         this.derivedCacheCheckpointState.markChanged();
       }
       for (const file of [...this.cwds.keys()]) {
-        if (!present.has(file) && this.physicalMembershipOf(file) === 'absent') {
+        if (!present.has(file) && this.physicalMembershipOf(file, physical) === 'absent') {
           this.cwds.delete(file);
         }
       }
       for (const file of [...this.humanScans.keys()]) {
-        if (!present.has(file) && this.physicalMembershipOf(file) === 'absent') {
+        if (!present.has(file) && this.physicalMembershipOf(file, physical) === 'absent') {
           this.humanScans.delete(file);
         }
       }
       for (const file of [...(this.savedPromptScans?.keys() ?? [])]) {
-        if (!present.has(file) && this.physicalMembershipOf(file) === 'absent') {
+        if (!present.has(file) && this.physicalMembershipOf(file, physical) === 'absent') {
           this.savedPromptScans.delete(file);
         }
       }
@@ -19056,14 +19113,15 @@ export class PanelProvider implements vscode.Disposable {
     // The in-memory book keeps recorded prompts, so compare the pruned book with the stored book. A book whose save is in flight
     // is not saved again, and a failed save is retried on the next refresh.
     if (Object.keys(this.sentPrompts).length) {
-      const prunedSent = prunedSentPrompts(this.sentPrompts, this.promptsBySession);
-      const pruned = JSON.stringify(normalizeSentPrompts(prunedSent));
+      // This method only serializes the pruned book, and writeDrafts stores it without a copy.
+      const prunedSent = sentPromptsToSave(this.sentPrompts, this.promptsBySession);
+      const pruned = JSON.stringify(prunedSent);
       if (pruned !== this.storedSentPrompts && pruned !== this.savingSentPrompts) {
         this.savingSentPrompts = pruned;
         const settled = () => {
           if (this.savingSentPrompts === pruned) this.savingSentPrompts = undefined;
         };
-        void this.writeDrafts().then(settled, settled);
+        void this.writeDrafts(prunedSent).then(settled, settled);
       }
     }
     this.newestCompactionBySession = currentRecords.newestCompactions;

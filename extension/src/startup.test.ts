@@ -7581,6 +7581,7 @@ function heldFactsHarness(
     mtimeMs: number;
     sessionId: string;
   }>,
+  scope: Record<string, unknown> = {},
 ): any {
   const provider = completeDiscoveryHarness(
     undefined,
@@ -7595,7 +7596,7 @@ function heldFactsHarness(
       'compressedCarriedNameOf',
       'workspaceFoldersChanged',
     ],
-    { historyBytes, historyEvictions },
+    { historyBytes, historyEvictions, ...scope },
   );
   provider.sessionCacheBudgetBytes = () => Number.MAX_SAFE_INTEGER;
   provider.hostSessions = new Map();
@@ -7659,7 +7660,30 @@ test('a selected-only refresh before the catalog keeps every held title, and the
     size: 1,
     mtimeMs: 1,
   };
-  const provider = heldFactsHarness([selected, codex, child, gone]);
+  // Counts the projects root reads and the membership checks inside each eviction.
+  let evicting = false;
+  const eviction = { calls: 0, checks: 0, rootReads: 0 };
+  const provider = heldFactsHarness([selected, codex, child, gone], {
+    projectsRoot: () => {
+      if (evicting) eviction.rootReads++;
+      return 'projects';
+    },
+  });
+  const evict = provider.evictCache;
+  provider.evictCache = function (...args: unknown[]) {
+    eviction.calls++;
+    evicting = true;
+    try {
+      return evict.apply(this, args);
+    } finally {
+      evicting = false;
+    }
+  };
+  const membership = provider.physicalMembershipOf;
+  provider.physicalMembershipOf = function (...args: unknown[]) {
+    if (evicting) eviction.checks++;
+    return membership.apply(this, args);
+  };
   const heldFiles = (map: Map<string, unknown>) => [...map.keys()].sort();
   const everyFile = [selected, codex, child, gone].map((session) => session.file).sort();
 
@@ -7732,6 +7756,12 @@ test('a selected-only refresh before the catalog keeps every held title, and the
   await scoped;
   assert.ok(provider.authoritativeCatalog, 'the new scope refresh did not set the authoritative catalog');
   assert.deepEqual(heldFiles(provider.titles), [selected.file], 'the new scope kept titles outside it');
+  // The fixture checks more files than it runs evictions, and each eviction reads the projects root at most once.
+  assert.ok(eviction.checks > eviction.calls, `${eviction.checks} membership checks in ${eviction.calls} evictions`);
+  assert.ok(
+    eviction.rootReads <= eviction.calls,
+    `${eviction.calls} evictions read the projects root ${eviction.rootReads} times`,
+  );
 });
 
 test('a refresh shares one live child derivation across cards and session list status', async () => {
@@ -15494,14 +15524,38 @@ test('each catalog walk names its requester, and the re-list after a replaced fi
   assert.deepEqual(
     Object.fromEntries(
       Object.entries(counters.snapshot().work).filter(
-        ([name]) => name.startsWith('walk:') || name.startsWith('coalesced:'),
+        ([name]) => name.startsWith('walk:') || name.startsWith('coalesced:') || name.startsWith('pendingRun:'),
       ),
     ),
     {
       'coalesced:child:tool': 1,
       'coalesced:poll': 2,
+      'pendingRun:coalesced': 1,
       'walk:requested:trigger': 1,
     },
+  );
+  // Requests that share one reason keep it when they merge, so the merged run counts under that reason.
+  provider.performanceCounters = counters = new PanelPerformanceCounters();
+  const again: Promise<void>[] = [];
+  provider.refresh = (...args: unknown[]) => {
+    const run = refresh.apply(provider, args);
+    again.push(run);
+    return run;
+  };
+  try {
+    provider.refreshFrom('trigger');
+    await vi.waitFor(() => assert.equal(walks.length, 6, 'the second trigger refresh did not reach its walk'));
+    provider.refreshFrom('repeated-record-coverage', true, true);
+    provider.refreshFrom('repeated-record-coverage', true, true);
+    await releaseAll(again[0]);
+    assert.equal(again.length, 4, 'the waiting requests did not run once as one merged refresh');
+    await releaseAll(again[3]);
+  } finally {
+    provider.refresh = refresh;
+  }
+  assert.deepEqual(
+    Object.fromEntries(Object.entries(counters.snapshot().work).filter(([name]) => name.startsWith('pendingRun:'))),
+    { 'pendingRun:repeated-record-coverage': 1 },
   );
 });
 
@@ -24895,6 +24949,52 @@ test('the source count follows the latest accepted checkpoint even when its prog
       { completed: 2, known: 2 },
       'a changed checkpoint kept its count',
     );
+    checkpoint.completed.splice(checkpoint.completed.indexOf('a'), 1);
+    assert.deepEqual(
+      provider.sourceCountOf(checkpoint),
+      { completed: 1, known: 2 },
+      'a source that is no longer checked kept its count',
+    );
+    // A delta that replaces the parents array keeps every length, so the count follows the array itself.
+    checkpoint.sequence = 2;
+    checkpoint.parents = [{ file: 'b' }];
+    assert.deepEqual(
+      provider.sourceCountOf(checkpoint),
+      { completed: 1, known: 1 },
+      'new parents kept the known sources of the old parents',
+    );
+    checkpoint.catalog.push({ file: 'e' });
+    checkpoint.completed.push('e');
+    assert.deepEqual(
+      provider.sourceCountOf(checkpoint),
+      { completed: 2, known: 2 },
+      'a catalog that grew in place kept its known sources',
+    );
+
+    // Deltas that only check more sources read no parent or catalog row again.
+    let rowReads = 0;
+    const counted = (rows: { file: string }[]) =>
+      new Proxy(rows, {
+        get(target, property, receiver) {
+          if (typeof property === 'string' && /^\d+$/.test(property)) rowReads++;
+          return Reflect.get(target, property, receiver);
+        },
+      });
+    const large = {
+      sequence: 1,
+      parents: counted(Array.from({ length: 50 }, (_, index) => ({ file: `parent-${index}` }))),
+      catalog: counted(Array.from({ length: 50 }, (_, index) => ({ file: `child-${index}` }))),
+      completed: [] as string[],
+    };
+    assert.deepEqual(provider.sourceCountOf(large), { completed: 0, known: 100 });
+    const firstReads = rowReads;
+    for (let index = 0; index < 10; index++) {
+      large.sequence++;
+      large.completed.push(`parent-${index}`);
+      provider.sourceCountOf(large);
+    }
+    assert.deepEqual(provider.sourceCountOf(large), { completed: 10, known: 100 });
+    assert.equal(rowReads - firstReads, 0, 'a delta read the parent and catalog rows again');
   } finally {
     vi.clearAllTimers();
     vi.useRealTimers();
