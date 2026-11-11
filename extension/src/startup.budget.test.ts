@@ -1,10 +1,14 @@
 // @module-tag subprocess
 import assert from 'node:assert/strict';
+import { Session } from 'node:inspector/promises';
+import { SourceMap } from 'node:module';
+import { setFlagsFromString } from 'node:v8';
+import crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { buildSync } from 'esbuild';
-import { beforeAll, test, vi } from 'vitest';
+import { afterAll, beforeAll, test, vi } from 'vitest';
 import { tempDir } from './temproot.ts';
 import type { BudgetWorkspace } from './budgetworkspace';
 
@@ -96,8 +100,16 @@ let modules: {
 };
 let workspace: BudgetWorkspace;
 let workerSource: string;
+const coverageSession = new Session();
 
 beforeAll(async () => {
+  // Interpreter execution keeps precise block counts independent of compiler tiers and feedback allocation.
+  setFlagsFromString('--no-opt --no-maglev --no-sparkplug --no-lazy-feedback-allocation');
+  // Coverage starts before product bytecode compiles, including when another case runs first.
+  coverageSession.connect();
+  await coverageSession.post('Debugger.enable');
+  await coverageSession.post('Profiler.enable');
+  await coverageSession.post('Profiler.startPreciseCoverage', { callCount: true, detailed: true });
   const root = paddedRoot(tempDir('count-budget-'));
   vi.stubEnv('ARC_HOME', path.join(root, 'arc'));
   vi.stubEnv('ARC_PROJECTS_ROOT', path.join(root, 'projects'));
@@ -134,6 +146,11 @@ beforeAll(async () => {
   // start of the script, so the open spend band of a recently changed file applies as it does in a real host.
   const temporary = workerTemporaryEnvironment(os.tmpdir(), fs.realpathSync.native);
   workerSource = `performance.now=()=>0;Date.now=()=>${BUDGET_CLOCK};process.env.ARC_HOME=${JSON.stringify(workspace.home)};Object.assign(process.env,${JSON.stringify(temporary)});${bundle}`;
+});
+
+afterAll(async () => {
+  await coverageSession.post('Profiler.stopPreciseCoverage');
+  coverageSession.disconnect();
 });
 
 function counts(counters: { snapshot(): any }, posts: Counts): Counts {
@@ -198,7 +215,7 @@ function countPost(posts: Counts, message: any): void {
 
 // One activation of the panel host. The host, its worker and its counters are real. The test owns the clock, the panel and
 // the watcher events.
-function activate(options: { stubReadPasses: boolean }) {
+function activate(options: { stubReadPasses: boolean; coverage?: boolean }) {
   const { PanelProvider, ProgressiveWorker, CommitRepositories, RepositoryCommits } = modules;
   vi.spyOn(PanelProvider.prototype, 'wireEditorListeners').mockImplementation(() => {});
   vi.spyOn(PanelProvider.prototype, 'createRepositoryScope').mockImplementation(() => ({
@@ -251,7 +268,13 @@ function activate(options: { stubReadPasses: boolean }) {
       prepareRailEnrichment: async () => ({ changed: false, progress: false, stale: [] }),
     });
   const started: Promise<unknown>[] = [];
-  for (const method of ['refresh', 'continueDiscovery', 'pollCatalog', 'refineDispatchedSpend']) {
+  for (const method of [
+    'refresh',
+    'continueDiscovery',
+    'pollCatalog',
+    'refineDispatchedSpend',
+    ...(options.coverage ? ['prepareMetadata', 'prepareRailEnrichment'] : []),
+  ]) {
     const original = provider[method];
     provider[method] = (...args: unknown[]) => {
       const run = original.apply(provider, args);
@@ -290,7 +313,7 @@ function activate(options: { stubReadPasses: boolean }) {
         await Promise.all(started.splice(0));
         continue;
       }
-      const state = worker.snapshot();
+      const state = options.coverage ? { pendingCount: worker.pending.size, active: [] } : worker.snapshot();
       if (state.pendingCount || state.active.length || provider.refreshController || provider.pendingRefresh) continue;
       if (provider.codexPriming || provider.pollInFlight) continue;
       vi.advanceTimersByTime(stepMs);
@@ -433,5 +456,154 @@ test('each step of the session list script stays within its recorded counts', as
     vi.useRealTimers();
   }
   const failures = outsideBudget(measured, JSON.parse(fs.readFileSync(BUDGET_FILE, 'utf8')).rows);
+  assert.equal(failures.length, 0, failures.join('\n'));
+});
+
+interface HostCoverage {
+  listed: number;
+  events: Record<string, Map<string, number>>;
+}
+
+async function hostCoverage(
+  extra: number,
+  session: Session,
+  locations: Map<string, Map<number, string>>,
+): Promise<HostCoverage> {
+  const { budgetWorkspace } = await import('./budgetworkspace.ts');
+  const savedWorkspace = workspace;
+  const savedEnvironment = new Map(
+    ['ARC_HOME', 'ARC_PROJECTS_ROOT', 'ARC_CODEX_ROOT'].map((name) => [name, process.env[name]]),
+  );
+  const root = paddedRoot(tempDir('visit-budget-'));
+  workspace = budgetWorkspace(root);
+  const update = crypto.Hash.prototype.update;
+  // Unique fixture IDs keep source keys distinct without the random temporary path changing their sort order.
+  const hash = vi.spyOn(crypto.Hash.prototype, 'update').mockImplementation(function (
+    this: crypto.Hash,
+    ...args: Parameters<crypto.Hash['update']>
+  ) {
+    const data = args[0];
+    if (typeof data === 'string' && /^(claude|codex)\0/.test(data)) args[0] = data.split('\0').slice(0, 2).join('\0');
+    return Reflect.apply(update, this, args);
+  });
+  vi.stubEnv('ARC_HOME', workspace.home);
+  vi.stubEnv('ARC_PROJECTS_ROOT', workspace.projects);
+  vi.stubEnv('ARC_CODEX_ROOT', workspace.codexSessions);
+  const source = workspace.parents[70];
+  for (let index = 0; index < extra; index++) {
+    const sessionId = `00000003-${index.toString(16).padStart(4, '0')}-4000-8000-000000000000`;
+    const file = path.join(path.dirname(source.file), `${sessionId}.jsonl`);
+    fs.writeFileSync(file, fs.readFileSync(source.file, 'utf8').replaceAll(source.sessionId, sessionId));
+    fs.utimesSync(file, new Date(modules.BUDGET_CLOCK - 3_600_000), new Date(modules.BUDGET_CLOCK - 3_600_000));
+    workspace.parents.push({ ...source, sessionId, file });
+  }
+  vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+  vi.setSystemTime(modules.BUDGET_CLOCK);
+  const clock = vi.spyOn(performance, 'now').mockReturnValue(0);
+  const interval = vi.spyOn(globalThis, 'setInterval').mockImplementation((() => 0) as unknown as typeof setInterval);
+  const active = activate({ stubReadPasses: false, coverage: true });
+  const events: HostCoverage['events'] = {};
+  try {
+    await active.receive({ type: 'ready' });
+    await active.settle();
+    const measure = async (name: string, act: () => unknown) => {
+      await session.post('Profiler.takePreciseCoverage');
+      await act();
+      await active.settle();
+      const { result } = await session.post('Profiler.takePreciseCoverage');
+      const functions = new Map<string, number>();
+      for (const script of result) {
+        const file = script.url.replaceAll('\\', '/');
+        if (!file.includes('/extension/src/') || /\.test\.[cm]?[jt]s(?:$|\?)/.test(file)) continue;
+        const raw = (await session.post('Debugger.getScriptSource', { scriptId: script.scriptId })).scriptSource;
+        let names = locations.get(script.scriptId);
+        if (!names || script.functions.some((fn) => !names!.has(fn.ranges[0].startOffset))) {
+          names ??= new Map();
+          const encodedMap = /sourceMappingURL=data:application\/json;base64,([^\s]+)/.exec(raw)?.[1];
+          assert.ok(encodedMap, `No source map for ${file}`);
+          const sourceMap = new SourceMap(JSON.parse(Buffer.from(encodedMap, 'base64').toString('utf8')));
+          for (const fn of script.functions) {
+            const offset = fn.ranges[0].startOffset;
+            const prefix = raw.slice(0, offset);
+            const line = prefix.split('\n').length - 1;
+            const column = prefix.length - prefix.lastIndexOf('\n') - 1;
+            const entry = sourceMap.findEntry(line, column);
+            const position =
+              'originalLine' in entry
+                ? `${entry.originalLine + 1}:${entry.originalColumn + 1}`
+                : `generated:${line + 1}:${column + 1}`;
+            const location = `${file.split('/extension/src/')[1]}:${position}`;
+            names.set(offset, `${location} ${fn.functionName || '<anonymous>'}`);
+          }
+          locations.set(script.scriptId, names);
+        }
+        for (const fn of script.functions) {
+          const body = raw.slice(fn.ranges[0].startOffset, fn.ranges[0].endOffset);
+          if (/^\(\) => \{ try \{ return [\w$]+ \} catch \{\} \}$/.test(body)) continue;
+          const key = names.get(fn.ranges[0].startOffset)!;
+          functions.set(key, (functions.get(key) ?? 0) + fn.ranges.reduce((sum, range) => sum + range.count, 0));
+        }
+      }
+      events[name] = functions;
+    };
+    await measure('poll refresh', () => active.provider.refreshFrom('poll', false, true));
+    await measure('selection', () => active.receive({ type: 'showSession', session: workspace.parents[50].sessionId }));
+    await measure('one turn', () => {
+      const source = workspace.parents[10];
+      workspace.growSource(source, Date.now());
+      active.provider.pendingWatch.noteFileEvent(
+        path.dirname(source.file),
+        path.basename(source.file),
+        'change',
+        modules.normalizeFsPath,
+      );
+      active.provider.runPendingWatch({ cause: 'quiet', firstAt: 0, lastAt: 0, firedAt: 0 });
+    });
+    await measure('discovery reply', async () => {
+      active.provider.dispatchDiscoveryPending = true;
+      await active.provider.continueDiscovery();
+    });
+    await measure('session list post', () => active.receive({ type: 'setRailFilters', railFilters: [] }));
+    return { listed: active.provider.catalog.sessions.length, events };
+  } finally {
+    active.provider.writeDerivedCache = () => true;
+    active.provider.dispose();
+    active.worker.stop();
+    clock.mockRestore();
+    hash.mockRestore();
+    interval.mockRestore();
+    vi.useRealTimers();
+    workspace = savedWorkspace;
+    for (const [name, value] of savedEnvironment) vi.stubEnv(name, value);
+  }
+}
+
+test('host work per listed session stays within its recorded counts', async () => {
+  const locations = new Map<string, Map<number, string>>();
+  const low = await hostCoverage(80, coverageSession, locations);
+  const high = await hostCoverage(280, coverageSession, locations);
+  const delta = high.listed - low.listed;
+  assert.equal(delta, 200);
+  const measured: Record<string, { value: number; top: Array<{ name: string; growth: number }> }> = {};
+  for (const [event, functions] of Object.entries(high.events)) {
+    const before = low.events[event];
+    const growth = [...new Set([...functions.keys(), ...before.keys()])]
+      .map((name) => ({ name, growth: ((functions.get(name) ?? 0) - (before.get(name) ?? 0)) / delta }))
+      .sort((a, b) => b.growth - a.growth || a.name.localeCompare(b.name));
+    measured[event] = {
+      value: Number(growth.reduce((sum, fn) => sum + fn.growth, 0).toFixed(6)),
+      top: growth.slice(0, 10),
+    };
+  }
+  const rows: Record<string, BudgetRow> = JSON.parse(fs.readFileSync(BUDGET_FILE, 'utf8')).hostWork;
+  const failures: string[] = [];
+  for (const event of new Set([...Object.keys(rows), ...Object.keys(measured)])) {
+    const sample = measured[event];
+    const row = rows[event];
+    if (sample && row && Math.abs(sample.value - row.budget) <= row.margin) continue;
+    failures.push(
+      `${event}: measured ${sample?.value ?? 'nothing'} block executions per added session, recorded ${row?.budget ?? 'no row'} with margin ${row?.margin ?? 0}. ${row?.reason ?? ''} Lower the row in scripts/test-budget.json after a reduction. Investigate growth before changing a row.\n${sample?.top.map((fn) => `${fn.name}: ${fn.growth}`).join('\n') ?? ''}`,
+    );
+  }
   assert.equal(failures.length, 0, failures.join('\n'));
 });

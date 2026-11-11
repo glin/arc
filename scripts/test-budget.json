@@ -1,5 +1,32 @@
 {
   "margin": "Each row has an integer margin. An integer counter must equal its budget within the margin. A byte counter fails only above budget plus margin.",
+  "hostWork": {
+    "poll refresh": {
+      "reason": "Host block executions per added listed session stay fixed until a reduction lowers this row.",
+      "budget": 257.74,
+      "margin": 0
+    },
+    "selection": {
+      "reason": "Host block executions per added listed session stay fixed until a reduction lowers this row.",
+      "budget": 610.215,
+      "margin": 0
+    },
+    "one turn": {
+      "reason": "Host block executions per added listed session stay fixed until a reduction lowers this row.",
+      "budget": 1270.86,
+      "margin": 0
+    },
+    "discovery reply": {
+      "reason": "Host block executions per added listed session stay fixed until a reduction lowers this row.",
+      "budget": 342.86,
+      "margin": 0
+    },
+    "session list post": {
+      "reason": "Host block executions per added listed session stay fixed until a reduction lowers this row.",
+      "budget": 127,
+      "margin": 0
+    }
+  },
   "rows": {
     "prompt scan save | selection:hostArrived": {
       "reason": "The reader selects one session, which starts one selection timing measurement.",
