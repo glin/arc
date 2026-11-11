@@ -1075,6 +1075,7 @@ import {
   linkTargetIsVideo,
   resolveLink,
   linkCandidates,
+  menuPathTarget,
   holdsHumanPrompt,
   promptScanLists,
   scanForHumanPrompt,
@@ -13208,6 +13209,44 @@ test('local link candidates preserve platform spelling and allow paths outside o
     assert.deepEqual(linkCandidates('', [root], platform), []);
   }
   assert.deepEqual(linkCandidates('c:\\Notes\\Mixed.md', ['C:/Work'], 'win32'), ['c:\\Notes\\Mixed.md']);
+});
+
+test('menu path targets name the row path, the citation literal, or the first folder that holds a link', () => {
+  for (const [platform, roots, outside] of [
+    ['win32', ['C:/Work/App', 'c:/work/Lib'], 'D:/Notes/Mixed Case.md'],
+    ['darwin', ['/Users/Reader/Work/App', '/users/reader/work/Lib'], '/Users/Reader/Notes/Mixed Case.md'],
+    ['linux', ['/home/reader/Work/App', '/Home/Reader/Work/Lib'], '/home/reader/Notes/Mixed Case.md'],
+  ] as const) {
+    const paths = platform === 'win32' ? path.win32 : path.posix;
+    const inApp = paths.join(roots[0], 'Src', 'Only In Lib.ts');
+    const inLib = paths.join(roots[1], 'Src', 'Only In Lib.ts');
+    const probed: string[] = [];
+    const exists = (file: string) => {
+      probed.push(file);
+      return file === inLib;
+    };
+    const target = (arg: unknown) => menuPathTarget(arg, [...roots], exists, platform);
+    assert.equal(target({ webviewSection: 'arcFile', path: outside }), outside);
+    for (const suffix of ['', ':42', ':42:7', '#L42', '#L42-L50']) {
+      probed.length = 0;
+      assert.equal(target({ webviewSection: 'arcLink', link: `Src/Only In Lib.ts${suffix}` }), inLib, suffix);
+      assert.deepEqual(probed, [inApp, inLib], `${platform}: folders were not tried in order`);
+    }
+    assert.equal(
+      menuPathTarget({ link: 'Src/Missing.ts:7' }, [...roots], () => false, platform),
+      paths.join(roots[0], 'Src', 'Missing.ts'),
+    );
+    probed.length = 0;
+    assert.equal(target({ link: `${outside}:12` }), outside);
+    for (const suffix of ['#L10', ':10', '%20']) {
+      const cited = `${outside}${suffix}`;
+      assert.equal(target({ link: cited, destination: { kind: 'fileCitation', path: cited } }), cited);
+    }
+    assert.deepEqual(probed, [], `${platform}: an absolute target was checked on disk`);
+    for (const arg of [undefined, null, {}, { path: '' }, { link: 'https://example.com/Guide.md' }]) {
+      assert.equal(target(arg), null);
+    }
+  }
 });
 
 test('a session was last active when it last recorded a time, not when its file was touched', () => {

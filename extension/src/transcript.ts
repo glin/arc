@@ -8,6 +8,7 @@ import {
 } from './filerevision';
 import { isCompressedRollout } from './compressedrollouts';
 import { turnKey } from './domain/read';
+import { nativeCitationPath } from './domain/file-citation';
 export {
   fileIdentityValue,
   revisionOf,
@@ -3965,15 +3966,53 @@ export function linkCandidates(
 }
 
 // Returns an absolute target, the first existing workspace-relative target, or the first joined fallback.
-export function resolveLink(target: string, folders: string[], exists: (p: string) => boolean): string | null {
+export function resolveLink(
+  target: string,
+  folders: string[],
+  exists: (p: string) => boolean,
+  platform: NodeJS.Platform = process.platform,
+): string | null {
   if (!target) {
     return null;
   }
-  if (path.isAbsolute(target)) {
+  if ((platform === 'win32' ? path.win32 : path.posix).isAbsolute(target)) {
     return target;
   }
-  const joined = linkCandidates(target, folders);
+  const joined = linkCandidates(target, folders, platform);
   return joined.find(exists) ?? joined[0] ?? null;
+}
+
+// The one path that a file row or local response link menu action names. A row supplies its absolute path.
+// A file citation keeps its literal filename. Other links lose a line anchor and resolve through the workspace folders.
+export function menuPathTarget(
+  arg: unknown,
+  folders: string[],
+  exists: (p: string) => boolean,
+  platform: NodeJS.Platform,
+): string | null {
+  const context = arg as { path?: unknown; link?: unknown; destination?: { kind?: unknown; path?: unknown } } | null;
+  if (!context) {
+    return null;
+  }
+  if (typeof context.path === 'string' && context.path) {
+    return context.path;
+  }
+  const destination = context.destination;
+  const literal =
+    destination?.kind === 'fileCitation' && typeof destination.path === 'string'
+      ? nativeCitationPath(destination.path, platform)
+      : null;
+  if (literal) {
+    return literal;
+  }
+  const named = menuLinkTarget(context);
+  return named ? resolveLink(named, folders, exists, platform) : null;
+}
+
+// The local target that a menu context's link names as written, without its line anchor. A web link names none.
+export function menuLinkTarget(arg: unknown): string | null {
+  const link = (arg as { link?: unknown } | null | undefined)?.link;
+  return typeof link === 'string' ? linkTarget(link) : null;
 }
 
 // Resolve one accepted Claude session without reading other transcripts.

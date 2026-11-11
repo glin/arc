@@ -91,6 +91,8 @@ Each native link invocation supplies a fresh token and typed destination through
 
 Copy-path actions use one extension-prepared spelling. Ordinary Markdown links receive native Copy Path context without target resolution or a workspace-containment check. [Literal citations](#response-link-and-citation-contracts) keep separate native actions.
 
+In local desktop windows, file rows and local response links offer Reveal in File Explorer on Windows, Reveal in Finder on macOS, and Open Containing Folder on Linux. The entry passes the file or folder that Copy Path copies to VS Code's own reveal command. A missing target shows a notice instead.
+
 ### Session details
 
 Headings open the same native menu through right-click, `Shift+F10`, or the always-visible three-dots button. Session list cards use right-click or `Shift+F10`. The button supplies a route for Mac readers without that chord.

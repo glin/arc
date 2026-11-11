@@ -37,7 +37,7 @@ import { fileDiffersOnDisk } from './store';
 import { PayloadRows, RailPayloadRows, railWordingDay } from './payload';
 
 test('native Copy Path and Copy Relative Path retain citation filename suffixes', async () => {
-  const { linkTarget, resolveLink, relativePath, nativePath } = await import('./transcript.js');
+  const { linkTarget, menuPathTarget, relativePath, nativePath } = await import('./transcript.js');
   const copied: string[] = [];
   const root = process.platform === 'win32' ? 'C:/workspace' : '/workspace';
   const outside = process.platform === 'win32' ? 'C:/Downloads' : '/Downloads';
@@ -59,14 +59,11 @@ test('native Copy Path and Copy Relative Path retain citation filename suffixes'
   const copy = new Function(
     'vscode',
     'fs',
-    'pathFrom',
-    'linkTarget',
-    'resolveLink',
+    'menuPathTarget',
     'relativePath',
     'nativePath',
-    'nativeCitationPath',
     `${compiled}\nreturn copyPath;`,
-  )(host, fs, () => null, linkTarget, resolveLink, relativePath, nativePath, nativeCitationPath);
+  )(host, fs, menuPathTarget, relativePath, nativePath);
   for (const [link, absolute, relative] of [
     [`${root}/Two%20words.html#L42`, `${root}/Two words.html`, 'Two words.html'],
     [`${root}/Two%2520words.html:42`, `${root}/Two%20words.html`, 'Two%20words.html'],
@@ -14714,6 +14711,197 @@ test('Copy Link writes the rendered destination and stays out of the palette', (
     ),
     'Copy Link is available without a rendered table link',
   );
+});
+
+test('file rows and local response links offer one reveal entry per platform under its Explorer label', () => {
+  const extensionSource = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
+  for (const command of ['arc.revealInFileExplorer', 'arc.revealInFinder', 'arc.openContainingFolder']) {
+    sourceMatch(
+      extensionSource,
+      new RegExp(`reg\\('${command.replace('.', '\\.')}', \\(arg\\) => void revealPath\\(arg\\)\\);`),
+      `${command} does not run the reveal handler`,
+    );
+  }
+  const titles = new Map<string, string>(
+    manifest.contributes.commands.map((entry: { command: string; title: string }) => [entry.command, entry.title]),
+  );
+  const menu = manifest.contributes.menus['webview/context'] as { command: string; when: string; group: string }[];
+  const platformKeys = ['isWindows', 'isMac', 'isLinux'];
+  const reveal = [
+    ['arc.revealInFileExplorer', 'Reveal in File Explorer', 'isWindows'],
+    ['arc.revealInFinder', 'Reveal in Finder', 'isMac'],
+    ['arc.openContainingFolder', 'Open Containing Folder', 'isLinux'],
+  ] as const;
+  for (const [command, title, platformKey] of reveal) {
+    assert.equal(titles.get(command), title);
+    assert.deepEqual(
+      menu.filter((entry) => entry.command === command),
+      [
+        {
+          command,
+          when: `${platformKey} && arc.localLinkBrowserAvailable && (webviewSection == 'arcFile' || webviewSection == 'arcLink')`,
+          group: '0_open@3',
+        },
+      ],
+    );
+    assert.ok(
+      manifest.contributes.menus.commandPalette.some(
+        (entry: { command: string; when: string }) => entry.command === command && entry.when === 'false',
+      ),
+      `${command} is available without a file row or response link`,
+    );
+  }
+  for (const platformKey of platformKeys) {
+    const shown = menu.filter(
+      (entry) =>
+        reveal.some(([command]) => command === entry.command) &&
+        (entry.when.split(/\W+/).includes(platformKey) ||
+          !platformKeys.some((key) => entry.when.split(/\W+/).includes(key))),
+    );
+    assert.equal(shown.length, 1, `${platformKey} shows ${shown.length} reveal entries`);
+  }
+});
+
+test('the reveal entry stats the Copy Path target and reveals it only in a local desktop window', async () => {
+  const { menuLinkTarget, menuPathTarget } = await import('./transcript.js');
+  const extensionSource = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
+  const compiled = ts.transpileModule(
+    `${declarationSource(extensionSource, 'localDesktopWindow')}\n${declarationSource(extensionSource, 'revealPath')}`,
+    { compilerOptions: { target: ts.ScriptTarget.ES2022 } },
+  ).outputText;
+  for (const [platform, roots] of [
+    ['win32', ['C:/Work/App', 'c:/work/Lib']],
+    ['darwin', ['/Users/Reader/Work/App', '/users/reader/work/Lib']],
+    ['linux', ['/home/reader/Work/App', '/Home/Reader/Work/Lib']],
+  ] as const) {
+    const paths = platform === 'win32' ? path.win32 : path.posix;
+    const uri = (file: string) => ({ scheme: 'file', fsPath: file });
+    const existing = new Map<string, number>();
+    const statErrors = new Map<string, unknown>();
+    const checked: string[] = [];
+    const probed: string[] = [];
+    const commands: unknown[][] = [];
+    const notices: string[] = [];
+    const revealErrors = new Map<string, unknown>();
+    const host = {
+      Uri: { file: uri },
+      env: { remoteName: undefined as string | undefined },
+      workspace: {
+        workspaceFolders: roots.map((root) => ({ uri: uri(root) })) as { uri: { scheme: string; fsPath: string } }[],
+        fs: {
+          stat: async (file: ReturnType<typeof uri>) => {
+            checked.push(file.fsPath);
+            if (statErrors.has(file.fsPath)) throw statErrors.get(file.fsPath);
+            const type = existing.get(file.fsPath);
+            if (type === undefined) throw Object.assign(new Error('missing'), { code: 'FileNotFound' });
+            return { type };
+          },
+        },
+      },
+      commands: {
+        executeCommand: async (...args: unknown[]) => {
+          commands.push(args);
+          const file = (args[1] as ReturnType<typeof uri>).fsPath;
+          if (revealErrors.has(file)) throw revealErrors.get(file);
+        },
+      },
+      window: { showInformationMessage: (message: string) => notices.push(message) },
+    };
+    const files = {
+      existsSync: (file: string) => {
+        probed.push(file);
+        return existing.has(file);
+      },
+    };
+    const reveal = new Function(
+      'vscode',
+      'fs',
+      'process',
+      'menuPathTarget',
+      'menuLinkTarget',
+      `${compiled}\nreturn revealPath;`,
+    )(host, files, { platform }, menuPathTarget, menuLinkTarget) as (arg: unknown) => Promise<void>;
+    const revealed = async (arg: unknown, expected: string) => {
+      const before = commands.length;
+      await reveal(arg);
+      assert.deepEqual(notices, [], `${platform}: ${expected}`);
+      assert.equal(commands.length, before + 1, `${platform}: ${expected} was not revealed`);
+      assert.equal(commands.at(-1)![0], 'revealFileInOS');
+      assert.equal((commands.at(-1)![1] as ReturnType<typeof uri>).fsPath, expected);
+      assert.equal(checked.at(-1), expected);
+    };
+    const refused = async (arg: unknown, notice: string, statted: boolean) => {
+      const beforeCommands = commands.length;
+      const beforeChecked = checked.length;
+      await reveal(arg);
+      assert.deepEqual(notices.splice(0), [notice]);
+      assert.equal(commands.length, beforeCommands, `${platform}: ${notice} still ran a command`);
+      assert.equal(checked.length, beforeChecked + (statted ? 1 : 0));
+    };
+
+    const row = paths.join(roots[0], 'Src', 'Mixed Case.ts');
+    existing.set(row, 1);
+    await revealed({ webviewSection: 'arcFile', path: row }, row);
+
+    const inApp = paths.join(roots[0], 'Src', 'Only In Lib.ts');
+    const inLib = paths.join(roots[1], 'Src', 'Only In Lib.ts');
+    existing.set(inLib, 1);
+    for (const suffix of [':42', '#L42']) {
+      probed.length = 0;
+      await revealed({ webviewSection: 'arcLink', link: `Src/Only%20In%20Lib.ts${suffix}` }, inLib);
+      assert.deepEqual(probed, [inApp, inLib], `${platform}: folders were not tried in order`);
+    }
+
+    const cited = `${roots[0]}/Report.csv#L10`;
+    existing.set(cited, 1);
+    await revealed(
+      { webviewSection: 'arcLink', link: cited, destination: { kind: 'fileCitation', path: cited } },
+      cited,
+    );
+
+    const folder = paths.join(roots[1], 'Docs Folder');
+    existing.set(folder, 2);
+    await revealed({ webviewSection: 'arcFile', path: folder }, folder);
+
+    const missing = paths.join(roots[0], 'Gone.ts');
+    await refused({ webviewSection: 'arcFile', path: missing }, `Arc: no file at ${missing}.`, true);
+
+    const locked = paths.join(roots[0], 'Locked.ts');
+    statErrors.set(locked, Object.assign(new Error('permission denied'), { code: 'NoPermissions' }));
+    await refused({ webviewSection: 'arcFile', path: locked }, `Arc: cannot access ${locked}. permission denied`, true);
+
+    const refusedByEditor = paths.join(roots[0], 'Refused By Editor.ts');
+    existing.set(refusedByEditor, 1);
+    revealErrors.set(refusedByEditor, new Error('reveal failed'));
+    await reveal({ webviewSection: 'arcFile', path: refusedByEditor });
+    assert.deepEqual(notices.splice(0), [`Arc: did not reveal ${refusedByEditor}. reveal failed`]);
+    assert.equal(commands.at(-1)![0], 'revealFileInOS');
+
+    host.env.remoteName = 'ssh-remote';
+    await refused({ webviewSection: 'arcFile', path: row }, `Arc: ${row} needs a local desktop window.`, false);
+    host.env.remoteName = undefined;
+    host.workspace.workspaceFolders = [
+      ...host.workspace.workspaceFolders,
+      { uri: { scheme: 'vscode-vfs', fsPath: '/Repo' } },
+    ];
+    await refused({ webviewSection: 'arcFile', path: row }, `Arc: ${row} needs a local desktop window.`, false);
+
+    // A window with no workspace folders resolves no relative link. The notice names the link as written.
+    host.workspace.workspaceFolders = [];
+    probed.length = 0;
+    await refused(
+      { webviewSection: 'arcLink', link: 'Src/Mixed%20Case.ts:42' },
+      'Arc: no file at Src/Mixed Case.ts.',
+      false,
+    );
+    assert.deepEqual(probed, []);
+    await revealed({ webviewSection: 'arcFile', path: row }, row);
+
+    const beforeCommands = commands.length;
+    for (const arg of [undefined, {}, { link: 'https://example.com/Guide.md' }]) await reveal(arg);
+    assert.equal(commands.length, beforeCommands);
+    assert.deepEqual(notices, []);
+  }
 });
 
 test('turn handoff commands validate context and preserve labels only when requested', () => {
@@ -46008,7 +46196,8 @@ test('local HTML menu eligibility follows workspace folder changes', () => {
   const start = extensionSource.indexOf('const refreshLocalLinkBrowser =');
   const end = extensionSource.indexOf('// Explorer and editor tab menus', start);
   assert.ok(start >= 0 && end > start);
-  const compiled = ts.transpileModule(extensionSource.slice(start, end), {
+  const local = declarationSource(extensionSource, 'localDesktopWindow');
+  const compiled = ts.transpileModule(`${local}\n${extensionSource.slice(start, end)}`, {
     compilerOptions: { target: ts.ScriptTarget.ES2022 },
   }).outputText;
   for (const remoteName of [undefined, 'ssh-remote', 'wsl', 'dev-container']) {

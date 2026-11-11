@@ -144,6 +144,18 @@
         "title": "Copy Link"
       },
       {
+        "command": "arc.revealInFileExplorer",
+        "title": "Reveal in File Explorer"
+      },
+      {
+        "command": "arc.revealInFinder",
+        "title": "Reveal in Finder"
+      },
+      {
+        "command": "arc.openContainingFolder",
+        "title": "Open Containing Folder"
+      },
+      {
         "command": "arc.sendResponseLinkWithLabels",
         "title": "Send to a new session with the same labels"
       },
@@ -362,6 +374,21 @@
           "command": "arc.openLinkDefault",
           "when": "arcLinkBrowser == 'html' && arc.localLinkBrowserAvailable",
           "group": "0_open@2"
+        },
+        {
+          "command": "arc.revealInFileExplorer",
+          "when": "isWindows && arc.localLinkBrowserAvailable && (webviewSection == 'arcFile' || webviewSection == 'arcLink')",
+          "group": "0_open@3"
+        },
+        {
+          "command": "arc.revealInFinder",
+          "when": "isMac && arc.localLinkBrowserAvailable && (webviewSection == 'arcFile' || webviewSection == 'arcLink')",
+          "group": "0_open@3"
+        },
+        {
+          "command": "arc.openContainingFolder",
+          "when": "isLinux && arc.localLinkBrowserAvailable && (webviewSection == 'arcFile' || webviewSection == 'arcLink')",
+          "group": "0_open@3"
         },
         {
           "command": "arc.copyLink",
@@ -604,6 +631,18 @@
         },
         {
           "command": "arc.copyPath",
+          "when": "false"
+        },
+        {
+          "command": "arc.revealInFileExplorer",
+          "when": "false"
+        },
+        {
+          "command": "arc.revealInFinder",
+          "when": "false"
+        },
+        {
+          "command": "arc.openContainingFolder",
           "when": "false"
         },
         {

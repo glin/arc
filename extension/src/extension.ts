@@ -25,8 +25,7 @@ import {
   sweepOldSessions,
 } from './store';
 import { SCHEME } from './uris';
-import { relativePath, nativePath, linkTarget, resolveLink, projectsRoot, sessionFileFor } from './transcript';
-import { nativeCitationPath } from './domain/file-citation';
+import { relativePath, nativePath, menuLinkTarget, menuPathTarget, projectsRoot, sessionFileFor } from './transcript';
 import { sessionRenameTitle } from './sessionrename';
 import { watchInitialCodexName } from './codex';
 import { commandRegistrar, registerPanel, PanelProvider } from './panelhost';
@@ -324,12 +323,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       ),
     );
   const refreshLocalLinkBrowser = () =>
-    void vscode.commands.executeCommand(
-      'setContext',
-      'arc.localLinkBrowserAvailable',
-      vscode.env.remoteName === undefined &&
-        (vscode.workspace.workspaceFolders ?? []).every((folder) => folder.uri.scheme === 'file'),
-    );
+    void vscode.commands.executeCommand('setContext', 'arc.localLinkBrowserAvailable', localDesktopWindow());
   refreshLocalLinkBrowser();
   context.subscriptions.push(vscode.workspace.onDidChangeWorkspaceFolders(refreshLocalLinkBrowser));
   // Explorer and editor tab menus pass the clicked resource, then the Explorer's multi-selection.
@@ -340,6 +334,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   reg('arc.sendSelectedText', (arg) => sendSelectedText(panel, arg, false));
   reg('arc.newSessionWithLabels', (arg) => newSessionWithLabels(panel, arg));
   reg('arc.copyRelativePath', (arg) => void copyPath(arg, true));
+  // The manifest shows one of these per platform, under the label VS Code's Explorer uses there.
+  reg('arc.revealInFileExplorer', (arg) => void revealPath(arg));
+  reg('arc.revealInFinder', (arg) => void revealPath(arg));
+  reg('arc.openContainingFolder', (arg) => void revealPath(arg));
   // Forward turn read-state changes to the webview, which owns that state.
   reg('arc.markTurnRead', (arg) => setTurnRead(panel, arg, true));
   reg('arc.markTurnUnread', (arg) => setTurnRead(panel, arg, false));
@@ -2720,15 +2718,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   updateAgentAffordance();
 }
 
-// Extract a nonempty path from the command's context object. Invalid arguments copy nothing.
-function pathFrom(arg: unknown): string | null {
-  const row = arg as { path?: string } | undefined;
-  if (!row) {
-    return null;
-  }
-  return typeof row.path === 'string' && row.path ? row.path : null;
-}
-
 // Extract a nonempty turn key from the command's context object.
 function turnKeyFrom(arg: unknown): string | null {
   const key = (arg as { key?: string } | undefined)?.key;
@@ -2898,15 +2887,7 @@ function editView(panel: PanelProvider, arg: unknown, mode: 'rename' | 'delete')
 
 async function copyPath(arg: unknown, relative: boolean): Promise<void> {
   const folders = (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath);
-  // Citation filenames keep literal suffixes. Ordinary summary links remove line anchors before path resolution.
-  const link = (arg as { link?: string } | undefined)?.link;
-  const destination = (arg as { destination?: { kind?: unknown; path?: unknown } } | undefined)?.destination;
-  const literal =
-    destination?.kind === 'fileCitation' && typeof destination.path === 'string'
-      ? nativeCitationPath(destination.path, process.platform)
-      : null;
-  const named = typeof link === 'string' ? linkTarget(link) : null;
-  const target = pathFrom(arg) ?? literal ?? (named ? resolveLink(named, folders, fs.existsSync) : null);
+  const target = menuPathTarget(arg, folders, fs.existsSync, process.platform);
   if (!target) {
     return;
   }
@@ -2914,6 +2895,55 @@ async function copyPath(arg: unknown, relative: boolean): Promise<void> {
   const text = nativePath(relative ? relativePath(target, folders) : target);
   await vscode.env.clipboard.writeText(text);
   void vscode.window.setStatusBarMessage(`Copied ${text}`, 2000);
+}
+
+// Remote windows and virtual workspace folders name targets that are not on this machine's disk.
+// The arc.localLinkBrowserAvailable menu context and the reveal entry both read this.
+function localDesktopWindow(): boolean {
+  return (
+    vscode.env.remoteName === undefined &&
+    (vscode.workspace.workspaceFolders ?? []).every((folder) => folder.uri.scheme === 'file')
+  );
+}
+
+// Reveal the Copy Path target in the operating system's file manager, which runs on this machine.
+async function revealPath(arg: unknown): Promise<void> {
+  const target = menuPathTarget(
+    arg,
+    (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath),
+    fs.existsSync,
+    process.platform,
+  );
+  if (!target) {
+    // A relative link in a window without workspace folders resolves to nothing. A left click names it the same way.
+    const named = menuLinkTarget(arg);
+    if (named) {
+      void vscode.window.showInformationMessage(`Arc: no file at ${named}.`);
+    }
+    return;
+  }
+  const uri = vscode.Uri.file(target);
+  if (!localDesktopWindow()) {
+    void vscode.window.showInformationMessage(`Arc: ${uri.fsPath} needs a local desktop window.`);
+    return;
+  }
+  try {
+    await vscode.workspace.fs.stat(uri);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    void vscode.window.showInformationMessage(
+      (error as { code?: string } | null)?.code === 'FileNotFound'
+        ? `Arc: no file at ${uri.fsPath}.`
+        : `Arc: cannot access ${uri.fsPath}. ${detail}`,
+    );
+    return;
+  }
+  try {
+    await vscode.commands.executeCommand('revealFileInOS', uri);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    void vscode.window.showInformationMessage(`Arc: did not reveal ${uri.fsPath}. ${detail}`);
+  }
 }
 
 async function copyLink(arg: unknown): Promise<void> {
