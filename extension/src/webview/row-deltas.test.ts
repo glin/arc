@@ -385,6 +385,30 @@ test('exact row text keeps unchanged rows and sends changed rows including one-c
   for (const row of rows) assert.equal(rowPrint(row), JSON.stringify(row));
 });
 
+test('immutable row text follows replacements and resets without printing held rows', () => {
+  const sender = new RowDeltaSender(true);
+  let prints = 0;
+  const row = (label: string) => ({
+    id: 'a',
+    toJSON() {
+      prints++;
+      return { id: 'a', label };
+    },
+  });
+  let value = row('First');
+  const message = () => ({ sessions: [value], rail: [value], stats: { a: value } });
+  sender.encode(message(), {});
+  assert.equal(prints, 1);
+  assert.deepEqual(sender.encode(message(), {}).rail, []);
+  assert.equal(prints, 1);
+  value = row('Second');
+  assert.deepEqual(sender.encode(message(), {}).rail, [value]);
+  assert.equal(prints, 2);
+  sender.reset('gap');
+  assert.deepEqual(sender.encode(message(), {}).rail, [value]);
+  assert.equal(prints, 3);
+});
+
 test('an order edit keeps the common start and end of the held order', () => {
   assert.equal(rowOrderEdit(['a', 'b', 'c'], ['a', 'b', 'c']), undefined);
   assert.deepEqual(rowOrderEdit(['a', 'b', 'c', 'd'], ['c', 'a', 'b', 'd']), {

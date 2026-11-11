@@ -563,7 +563,7 @@ import {
   type ReaderReadEvent,
 } from './domain/read.ts';
 import { SessionReadObservations, runSessionRead, requesterOf } from './sessionwrites.ts';
-import { replaceRows, replaceStats, RowDeltaSender, type RowLists } from './webview/row-deltas.ts';
+import { RowDeltaSender, type RowLists } from './webview/row-deltas.ts';
 import { withRecoveredCommits } from './childartifacts.ts';
 import {
   hasImageReference,
@@ -747,6 +747,8 @@ import {
 import { SessionLoadingLine, type SessionLoadingBlocker, type SessionLoadingPath } from './sessionloadingline';
 import {
   RailPayloadInput,
+  PayloadRows,
+  RailPayloadRows,
   messageFieldBytes,
   railInputKey,
   railInputChanges,
@@ -2518,13 +2520,10 @@ export class PanelProvider implements vscode.Disposable {
   private lastRailCountsJson = '';
   // Inputs for the last session-list payload, including the local day. Matching inputs skip rebuilding it.
   private lastRailKey: RailInputKey | null = null;
-  // Complete payloads by selected session. Unsent-only changes rebuild the affected rows.
-  private heldRailPayloads:
-    | Map<
-        string | null,
-        { key: RailInputKey; unsent: RailPayloadInput['unsent']; payload: ReturnType<typeof railPayload> }
-      >
-    | undefined;
+  // Complete row projections by selected session.
+  private heldRailPayloads: Map<string | null, RailPayloadRows> | undefined;
+  private heldSessionRows: PayloadRows<(typeof this.sessionRows)[number]> | undefined;
+  private heldHostRows: WeakMap<PanelHost, PayloadRows<(typeof this.sessionRows)[number]>> | undefined;
   // Pending-source state used by the last session-list payload. A selection render can advance the figure cache independently.
   private railPendingAnswers: SpendPendingAnswers | null = null;
   // Selection render that owes a session-list update. A skipped save update is posted when that render settles without supplying it.
@@ -4011,6 +4010,9 @@ export class PanelProvider implements vscode.Disposable {
     this.fileAction?.abort();
     this.recordedReplies?.clear();
     this.heldRailPayloads?.clear();
+    this.heldSessionRows?.clear();
+    this.heldHostRows = undefined;
+    this.rowSenders = undefined;
     if (this.disposed) return;
     if (this.coldPassPaintWait) clearTimeout(this.coldPassPaintWait);
     this.coldPassPaintWait = null;
@@ -5015,9 +5017,14 @@ export class PanelProvider implements vscode.Disposable {
         this.performanceCounters.releasePanel(host);
         this.hostSessions?.delete(host);
         this.hostPreviousSessions?.delete(host);
+        this.heldHostRows?.delete(host);
+        this.rowSenders?.get(host)?.reset('unready');
+        this.rowSenders?.delete(host);
         this.hosts = this.hosts.filter((open) => open !== host);
         if (!this.hosts.length) {
           this.heldRailPayloads?.clear();
+          this.heldSessionRows?.clear();
+          this.heldHostRows = undefined;
         } else {
           const showing = new Set(this.hosts.map((open) => this.hostSessions?.get(open) ?? this.showing));
           for (const session of this.heldRailPayloads?.keys() ?? []) {
@@ -5433,6 +5440,7 @@ export class PanelProvider implements vscode.Disposable {
     rows: readonly SessionFile[],
   ): void {
     const now = Date.now();
+    const wordingDay = railWordingDay(now);
     for (const session of replaced) {
       this.metadataStatsBySession = this.metadataStatFigures.patch(session.sessionId, null);
       this.metadataRailCaches = this.metadataCacheFigures.patch(session.sessionId, null);
@@ -5458,11 +5466,14 @@ export class PanelProvider implements vscode.Disposable {
     const shown = new Set([this.showing, ...(this.hostSessions?.values() ?? [])]);
     const edges = this.sessionParentEdges(admitted).edges;
     const listed = new Map(this.sessionRows.map((row) => [row.id, row]));
-    for (const row of rows) listed.set(row.sessionId, this.sessionRowOf(row, edges, shown.has(row.sessionId)));
+    for (const row of rows)
+      listed.set(row.sessionId, this.sessionRowOf(row, edges, shown.has(row.sessionId), undefined, wordingDay));
     this.sessionRows = [
       ...this.sessionRows.filter((row) => !row.persisted),
       ...admitted.map(
-        (source) => listed.get(source.sessionId) ?? this.sessionRowOf(source, edges, shown.has(source.sessionId)),
+        (source) =>
+          listed.get(source.sessionId) ??
+          this.sessionRowOf(source, edges, shown.has(source.sessionId), undefined, wordingDay),
       ),
     ];
   }
@@ -11703,33 +11714,51 @@ export class PanelProvider implements vscode.Disposable {
       // Build rows for the full catalog, independent of selected transcript reads.
       const counts = this.unreadCounts();
       const fullLabels = new Map<string, string>();
+      const wordingDay = railWordingDay(now);
+      this.heldSessionRows ??= new PayloadRows();
       this.sessionRows = all.map((f) =>
         this.sessionRowOf(
           f,
           parentEdges.edges,
           sessions.some((s) => s.sessionId === f.sessionId),
           fullLabels,
+          wordingDay,
         ),
       );
       this.sessionRows = [
-        ...syntheticDraftRows(
-          scopedDrafts.map((draft) => ({
-            draftId: draft.draftId,
-            createdAt: draft.createdAt,
-            agent: AGENT_NAMES[draft.profile.agent],
-            agentKey: draft.profile.agent,
-          })),
+        ...scopedDrafts.map((draft) =>
+          this.heldSessionRows!.read(
+            draft.draftId,
+            [false, draft.createdAt, draft.profile.agent, wordingDay],
+            () =>
+              syntheticDraftRows([
+                {
+                  draftId: draft.draftId,
+                  createdAt: draft.createdAt,
+                  agent: AGENT_NAMES[draft.profile.agent],
+                  agentKey: draft.profile.agent,
+                },
+              ])[0],
+          ),
         ),
-        ...syntheticDraftRows(
-          scopedPendingRecords.map((pending) => ({
-            draftId: pending.sessionId,
-            createdAt: pending.createdAt,
-            agent: AGENT_NAMES[pending.agent],
-            agentKey: pending.agent,
-          })),
+        ...scopedPendingRecords.map((pending) =>
+          this.heldSessionRows!.read(
+            pending.sessionId,
+            [false, pending.createdAt, pending.agent, wordingDay],
+            () =>
+              syntheticDraftRows([
+                {
+                  draftId: pending.sessionId,
+                  createdAt: pending.createdAt,
+                  agent: AGENT_NAMES[pending.agent],
+                  agentKey: pending.agent,
+                },
+              ])[0],
+          ),
         ),
         ...this.sessionRows,
       ];
+      this.heldSessionRows?.retain(new Set(this.sessionRows.map((row) => row.id)));
       if (!selectedOnly && this.repositoryScopeReady) this.onSessionRowsRefreshed?.();
       if (!selectedOnly && this.repositoryScopeReady) this.onDispatchEvidence?.();
       if (!selectedOnly && this.repositoryScopeReady && this.saved.agentRead?.length) this.restoreAgentReads();
@@ -11767,7 +11796,7 @@ export class PanelProvider implements vscode.Disposable {
         childExpired ? this.liveOpenChildren(railNow, this.sessionOutcomes, refreshRows) : liveChildren,
       );
       const railInput = this.railInputFor(counts, statuses, openChildren, railNow);
-      const railKey = railInputKey(railInput);
+      const railKey = railInputKey(railInput, wordingDay);
       const railPending = this.lifetimeFigures.answers();
       const railAdoptions = sessionAdoptions(this.sessionAliases);
       // A selection settles no adoptions and reads no serialized form, so only a catalog render serializes them.
@@ -11796,7 +11825,8 @@ export class PanelProvider implements vscode.Disposable {
       if (listLoading.complete && this.authoritativeCatalogScope === loadingScope)
         this.loadingLine.hold(loadingScope, generation, selectedOnly ? 'selection' : 'render');
       const metadataAcceptedHosts = new Set<PanelHost>();
-      if (!selectedOnly) this.heldRailPayloads = new Map();
+      this.heldRailPayloads ??= new Map();
+      this.heldHostRows ??= new WeakMap();
       for (const host of this.hosts) {
         const hostSession = this.hostSessions?.get(host) ?? this.showing;
         const hostPreviousSession = this.hostPreviousSessions?.get(host) ?? previousSelection;
@@ -11811,24 +11841,47 @@ export class PanelProvider implements vscode.Disposable {
         // A selection posts only the rows it changes in this panel, so it builds those rows alone.
         const changedRows = selectedOnly ? new Set([hostSession, hostPreviousSession]) : null;
         // Omit `railName` from general session rows. Session-list cards read it through the separate session-list payload.
+        let heldHostRows = this.heldHostRows.get(host);
+        if (!heldHostRows) {
+          heldHostRows = new PayloadRows();
+          this.heldHostRows.set(host, heldHostRows);
+        }
+        heldHostRows.retain(new Set(this.sessionRows.map((row) => row.id)));
         const hostRows = (
           changedRows ? this.sessionRows.filter((row) => changedRows.has(row.id)) : this.sessionRows
-        ).map(({ railName: _railName, ...row }) => {
-          const full = row.id === hostSession ? (fullLabels.get(row.id) ?? row.label) : row.label;
-          return {
-            ...row,
-            ...(full === row.label ? {} : { fullLabel: full }),
-            ...(row.id === hostSession && hostParent ? { parent: hostParent } : {}),
-            ...(row.id === hostSession && startWorktree ? { startWorktree } : {}),
-            shown: row.id === hostSession,
-          };
+        ).map((source) => {
+          const selected = source.id === hostSession;
+          const full = selected ? (fullLabels.get(source.id) ?? source.label) : source.label;
+          return heldHostRows.read(
+            source.id,
+            [
+              source,
+              selected,
+              full,
+              selected ? JSON.stringify(hostParent) : null,
+              selected ? JSON.stringify(startWorktree) : null,
+            ],
+            () => {
+              const { railName: _railName, ...row } = source;
+              return {
+                ...row,
+                ...(full === row.label ? {} : { fullLabel: full }),
+                ...(selected && hostParent ? { parent: hostParent } : {}),
+                ...(selected && startWorktree ? { startWorktree } : {}),
+                shown: selected,
+              };
+            },
+          );
         });
-        const hostRail = railPayload(
-          this.railInputFor(counts, statuses, openChildren, railNow, hostSession),
-          changedRows ?? undefined,
-        );
-        if (!selectedOnly)
-          this.heldRailPayloads!.set(hostSession, { key: railKey, unsent: railInput.unsent, payload: hostRail });
+        const hostInput = this.railInputFor(counts, statuses, openChildren, railNow, hostSession);
+        let heldRail = this.heldRailPayloads.get(hostSession);
+        if (!heldRail) {
+          heldRail = new RailPayloadRows(this.heldRailPayloads.values().next().value);
+          this.heldRailPayloads.set(hostSession, heldRail);
+        }
+        const hostRail = selectedOnly
+          ? railPayload(hostInput, changedRows!)
+          : heldRail.read(hostInput, railPayload, wordingDay);
         const selectedSession = sessions.find((session) => session.sessionId === hostSession);
         const loadingNewest = selectedSession ? !this.progressiveCurrent(selectedSession) : false;
         const loadingLabel = loadingNewest
@@ -11946,6 +11999,7 @@ export class PanelProvider implements vscode.Disposable {
           },
           selectedSession ? this.cache.get(selectedSession.file)?.read : undefined,
           Boolean(selectedSession) && (hostDrawn.length > 0 || !loadingNewest) && !selectedFailure,
+          wordingDay,
         ).then(
           (accepted) => {
             if (accepted && !controller?.signal.aborted && generation === this.refreshGeneration) {
@@ -11982,6 +12036,11 @@ export class PanelProvider implements vscode.Disposable {
       // the rail a save skipped. Marked here rather than where the rail was worded, because a
       // render that aborts before this point posts nothing.
       this.railSeedSkipped = false;
+      const shownSessions = new Set(this.hosts.map((host) => this.hostSessions?.get(host) ?? this.showing));
+      for (const showing of this.heldRailPayloads.keys()) {
+        if (!shownSessions.has(showing)) this.heldRailPayloads.delete(showing);
+      }
+      if (!this.hosts.length) this.heldSessionRows?.clear();
       if (!selectedOnly) {
         // A selection omits peer rows, labels and adoptions, so it cannot settle their keys.
         this.lastRailMessageType = largestRenderBytes === null ? null : 'render';
@@ -11990,7 +12049,7 @@ export class PanelProvider implements vscode.Disposable {
         this.lastRailKey = railKey;
         this.railPendingAnswers = railPending;
         this.lastRailRevision = this.railRevision;
-        this.lastRailDay = railWordingDay(railInput.now);
+        this.lastRailDay = wordingDay;
         this.lastRailCountsJson = JSON.stringify([...counts]);
       }
       this.checkpointDerivedCache();
@@ -12049,31 +12108,41 @@ export class PanelProvider implements vscode.Disposable {
     edges: ReadonlyMap<string, SessionParentEdge>,
     shown: boolean,
     fullLabels?: Map<string, string>,
+    wordingDay = railWordingDay(Date.now()),
   ): (typeof this.sessionRows)[number] {
     // Use recorded activity time, with mtime only when metadata has no timestamp.
     const at = this.activityFor(f);
     const named = this.sessionLabel(f);
     const label = named.label;
     fullLabels?.set(f.sessionId, named.fullLabel);
-    // Bound session-list names by `RAIL_NAME_LIMIT`. Other session surfaces retain the short label.
-    const railName = shortenTo(named.fullLabel, RAIL_NAME_LIMIT, '...');
-    return {
-      id: f.sessionId,
-      persisted: true,
-      label,
-      ...(railName === label ? {} : { railName }),
-      // Use the shared calendar formatter for session activity.
-      when: formatWhen(at),
-      // `agent` is the displayed name. `agentKey` identifies catalogs, prompt settings, and agent callbacks.
-      agent: AGENT_NAMES[f.agent],
-      agentKey: f.agent,
-      shown,
-      // The browser's age ticker reads `at`. Unread counts remain independent session-list facts.
-      at,
-      relative: formatRelative(at),
-      // Classify agent runs from accepted metadata and parent ownership.
-      agentRun: this.agentRunFor(f, edges),
-    };
+    const relative = formatRelative(at);
+    const agentRun = this.agentRunFor(f, edges);
+    this.heldSessionRows ??= new PayloadRows();
+    return this.heldSessionRows.read(
+      f.sessionId,
+      [at, label, named.fullLabel, f.agent, shown, relative, agentRun, wordingDay],
+      () => {
+        // Bound session-list names by `RAIL_NAME_LIMIT`. Other session surfaces retain the short label.
+        const railName = shortenTo(named.fullLabel, RAIL_NAME_LIMIT, '...');
+        return {
+          id: f.sessionId,
+          persisted: true,
+          label,
+          ...(railName === label ? {} : { railName }),
+          // Use the shared calendar formatter for session activity.
+          when: formatWhen(at),
+          // `agent` is the displayed name. `agentKey` identifies catalogs, prompt settings, and agent callbacks.
+          agent: AGENT_NAMES[f.agent],
+          agentKey: f.agent,
+          shown,
+          // The browser's age ticker reads `at`. Unread counts remain independent session-list facts.
+          at,
+          relative,
+          // Classify agent runs from accepted metadata and parent ownership.
+          agentRun,
+        };
+      },
+    );
   }
 
   // The catalog refresh slot. A catalog refresh requested while the slot is held waits behind its holder, and a holder
@@ -13055,7 +13124,7 @@ export class PanelProvider implements vscode.Disposable {
     const railNow = Date.now();
     const { statuses, openChildren } = this.railStatuses(railNow);
     const input = this.railInputFor(counts, statuses, openChildren, railNow);
-    const key = railInputKey(input);
+    const key = railInputKey(input, day);
     const pendingAnswers = this.lifetimeFigures.answers();
     const railAdoptions = sessionAdoptions(this.sessionAliases);
     const adoptionsJson = JSON.stringify(railAdoptions);
@@ -13075,25 +13144,9 @@ export class PanelProvider implements vscode.Disposable {
     const heldPayloads = this.heldRailPayloads;
     this.heldRailPayloads = new Map();
     const buildRail = (hostInput: RailPayloadInput) => {
-      const held = heldPayloads?.get(hostInput.showing);
-      let payload: ReturnType<typeof railPayload>;
-      if (held?.key === this.lastRailKey && changes.length === 1 && changes[0] === 'unsent') {
-        const ids = new Set([...held.unsent.keys(), ...hostInput.unsent.keys()]);
-        const rows = new Set(
-          [...ids].filter((id) => JSON.stringify(held.unsent.get(id)) !== JSON.stringify(hostInput.unsent.get(id))),
-        );
-        const changed = railPayload(hostInput, rows);
-        const replaces = [...rows];
-        payload = {
-          ...changed,
-          rail: replaceRows(held.payload.rail, changed.rail, replaces),
-          stats: replaceStats(held.payload.stats, changed.stats, replaces),
-        };
-      } else {
-        payload = railPayload(hostInput);
-      }
-      this.heldRailPayloads!.set(hostInput.showing, { key, unsent: hostInput.unsent, payload });
-      return payload;
+      const held = heldPayloads?.get(hostInput.showing) ?? new RailPayloadRows(heldPayloads?.values().next().value);
+      this.heldRailPayloads!.set(hostInput.showing, held);
+      return held.read(hostInput, railPayload, day);
     };
     const sharedRail = buildRail(input);
     let largestRailBytes: number | null = null;
@@ -13110,11 +13163,18 @@ export class PanelProvider implements vscode.Disposable {
           pinnedTop: [...this.pinnedTop],
         },
       );
-      void this.postRows(host, message, (serializedBytes) => {
-        if (serializedBytes !== null) {
-          largestRailBytes = Math.max(largestRailBytes ?? 0, serializedBytes);
-        }
-      });
+      void this.postRows(
+        host,
+        message,
+        (serializedBytes) => {
+          if (serializedBytes !== null) {
+            largestRailBytes = Math.max(largestRailBytes ?? 0, serializedBytes);
+          }
+        },
+        undefined,
+        false,
+        day,
+      );
       // The panel's row sender encoded this post without an await, so its record describes this post.
       const changed = this.rowSender(host).lastRailChanges;
       if (changed) {
@@ -13141,7 +13201,7 @@ export class PanelProvider implements vscode.Disposable {
     this.rowSenders ??= new WeakMap();
     let sender = this.rowSenders.get(host);
     if (!sender) {
-      sender = new RowDeltaSender();
+      sender = new RowDeltaSender(true);
       this.rowSenders.set(host, sender);
     }
     return sender;
@@ -13156,6 +13216,7 @@ export class PanelProvider implements vscode.Disposable {
     measured?: (serializedBytes: number | null) => void,
     selectedWindow?: SessionRead,
     selectionReady = false,
+    wordingDay = railWordingDay(Date.now()),
   ): Thenable<boolean> {
     if (message.type !== 'render' && message.type !== 'rail' && message.type !== 'selection') {
       return this.sendToHost(host, message, measured);
@@ -13174,7 +13235,7 @@ export class PanelProvider implements vscode.Disposable {
     // A change in one of these inputs touches most rows, so it sends a snapshot. Prints cover every other input.
     // Fields outside `sessions`, `rail` and `stats`, such as `hidden`, `pinnedTop` and `labels`, travel complete in every message.
     const globals: Record<string, unknown> = {
-      day: railWordingDay(Date.now()),
+      day: wordingDay,
       scope: this.repositoryScopeRoots ?? null,
       folders: this.catalog?.folders ?? null,
     };

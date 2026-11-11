@@ -75,6 +75,110 @@ export interface RailPayload {
   railFilters: readonly SavedRailFilter[];
 }
 
+// Inputs contain immutable identities or snapshots of mutable values.
+export class PayloadRows<T> {
+  private rows = new Map<string, { inputs: readonly unknown[]; value: T }>();
+
+  read(id: string, inputs: readonly unknown[], build: () => T): T {
+    const held = this.rows.get(id);
+    if (held && held.inputs.length === inputs.length && inputs.every((value, at) => value === held.inputs[at]))
+      return held.value;
+    const value = build();
+    this.rows.set(id, { inputs, value });
+    return value;
+  }
+
+  retain(ids: ReadonlySet<string>): void {
+    for (const id of this.rows.keys()) if (!ids.has(id)) this.rows.delete(id);
+  }
+
+  clear(): void {
+    this.rows.clear();
+  }
+
+  fork(): PayloadRows<T> {
+    const next = new PayloadRows<T>();
+    next.rows = new Map(this.rows);
+    return next;
+  }
+}
+
+// One selection's complete payload, with independently compared row inputs.
+export class RailPayloadRows {
+  private rows: PayloadRows<{ rail?: RailCard; stats?: SessionStatChip[] }>;
+  payload: RailPayload | undefined;
+
+  constructor(previous?: RailPayloadRows) {
+    this.rows = previous?.rows.fork() ?? new PayloadRows();
+  }
+
+  read(input: RailPayloadInput, build = railPayload, day = railWordingDay(input.now)): RailPayload {
+    const sessions = new Map(input.sessions.map((row) => [row.id, row]));
+    if (sessions.size !== input.sessions.length) {
+      this.rows.clear();
+      return (this.payload = build(input));
+    }
+    const statIds = new Set([
+      ...Object.keys(input.metadataStats),
+      ...Object.keys(input.parsedStats),
+      ...Object.keys(input.lifetimeStats),
+    ]);
+    const ids = new Set([...sessions.keys(), ...statIds]);
+    const changed = new Set<string>();
+    const values = new Map<string, { rail?: RailCard; stats?: SessionStatChip[] }>();
+    for (const id of ids) {
+      const count = input.counts.get(id);
+      const unsent = input.unsent.get(id);
+      const inputs = [
+        sessions.get(id),
+        statIds.has(id),
+        count?.count,
+        count?.atLeast,
+        input.newest.get(id),
+        input.statuses.get(id),
+        input.runningSince.get(id),
+        input.openChildren.get(id),
+        input.backgroundCommands.get(id),
+        input.hidden.has(id),
+        input.showing === id,
+        input.pinnedTop.has(id),
+        unsent?.prompt,
+        unsent?.comments,
+        JSON.stringify(input.parsedStats[id]),
+        input.metadataStats[id],
+        input.lifetimeStats[id],
+        input.lifetimeContextDetails?.[id],
+        input.lifetimeCosts[id],
+        input.lifetimeCacheExpiry?.[id],
+        JSON.stringify(input.labels[id]),
+        JSON.stringify(input.caches[id]),
+        input.statuses.get(id) === 'running' && input.runningSince.has(id) ? day : null,
+      ];
+      values.set(
+        id,
+        this.rows.read(id, inputs, () => {
+          changed.add(id);
+          return {};
+        }),
+      );
+    }
+    this.rows.retain(ids);
+    const patch = build(input, changed);
+    for (const row of patch.rail) values.get(row.id)!.rail = row;
+    for (const [id, stats] of Object.entries(patch.stats)) values.get(id)!.stats = stats;
+    const rail = input.sessions.map((row) => values.get(row.id)!.rail!);
+    return (this.payload = {
+      ...patch,
+      rail: [
+        ...rail.filter((row) => !row.archived && row.pinnedTop),
+        ...rail.filter((row) => !row.archived && !row.pinnedTop),
+        ...rail.filter((row) => row.archived),
+      ],
+      stats: Object.fromEntries([...statIds].map((id) => [id, values.get(id)!.stats!])),
+    });
+  }
+}
+
 // Compare session list inputs before building the message.
 // RAIL_INPUT_HOLDS selects serialized values, object identities, row identities, or the local day for each field.
 // Change identities when identity-compared input contents change.
@@ -87,7 +191,9 @@ export interface RailInputKey {
 }
 
 // Comparison policy for every session list input field.
-const RAIL_INPUT_HOLDS: { readonly [Field in keyof Required<RailPayloadInput>]: 'print' | 'same' | 'each' | 'day' } = {
+const RAIL_INPUT_HOLDS: {
+  readonly [Field in keyof Required<RailPayloadInput>]: 'print' | 'same' | 'each' | 'entries' | 'day';
+} = {
   sessions: 'each',
   counts: 'print',
   newest: 'print',
@@ -100,7 +206,7 @@ const RAIL_INPUT_HOLDS: { readonly [Field in keyof Required<RailPayloadInput>]: 
   pinnedTop: 'print',
   unsent: 'print',
   parsedStats: 'print',
-  metadataStats: 'same',
+  metadataStats: 'entries',
   lifetimeStats: 'same',
   lifetimeContextDetails: 'same',
   lifetimeCosts: 'same',
@@ -112,10 +218,10 @@ const RAIL_INPUT_HOLDS: { readonly [Field in keyof Required<RailPayloadInput>]: 
   now: 'day',
 };
 
-// Local calendar day and zone offset used by session list wording.
+// Local calendar day, current offset, and zone identity used by session list wording.
 export function railWordingDay(now: number): string {
   const date = new Date(now);
-  return `${date.toDateString()} ${date.getTimezoneOffset()}`;
+  return `${date.toDateString()} ${date.getTimezoneOffset()} ${Intl.DateTimeFormat().resolvedOptions().timeZone}`;
 }
 
 function printable(value: unknown): unknown {
@@ -125,7 +231,7 @@ function printable(value: unknown): unknown {
   return value ?? null;
 }
 
-export function railInputKey(input: RailPayloadInput): RailInputKey {
+export function railInputKey(input: RailPayloadInput, day = railWordingDay(input.now)): RailInputKey {
   const held: unknown[] = [];
   const heldEnds: number[] = [];
   const prints: (string | null)[] = [];
@@ -136,13 +242,18 @@ export function railInputKey(input: RailPayloadInput): RailInputKey {
       held.push(value);
       prints.push(null);
     } else if (hold === 'day') {
-      prints.push(railWordingDay(value as number));
+      prints.push(day);
     } else if (hold === 'each') {
       const items = value as readonly unknown[];
       held.push(items.length);
       for (const item of items) {
         held.push(item);
       }
+      prints.push(null);
+    } else if (hold === 'entries') {
+      const entries = Object.entries(value as Readonly<Record<string, unknown>>);
+      held.push(value, entries.length);
+      for (const [id, entry] of entries) held.push(id, entry);
       prints.push(null);
     } else {
       prints.push(JSON.stringify(printable(value)));

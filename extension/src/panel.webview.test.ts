@@ -34,6 +34,7 @@ import { contributedFileSides } from './patchview';
 import * as crypto from 'node:crypto';
 import { codexSubagentFor, type CodexSubagentFile } from './codex';
 import { fileDiffersOnDisk } from './store';
+import { PayloadRows, RailPayloadRows, railWordingDay } from './payload';
 
 test('native Copy Path and Copy Relative Path retain citation filename suffixes', async () => {
   const { linkTarget, resolveLink, relativePath, nativePath } = await import('./transcript.js');
@@ -330,13 +331,17 @@ test('response citation presses open external literal files without workspace or
 
 test('heading worktree metadata follows each panel opening source and clears when selection changes', () => {
   const begin = panelHostSource.indexOf('const startWorktree = startingWorktree(');
-  const end = panelHostSource.indexOf('const hostRail =', begin);
+  const end = panelHostSource.indexOf('const hostInput =', begin);
   assert.ok(begin > 0 && end > begin);
   const code = ts.transpileModule(
     `function rows(sessions, hostSession, fullLabels, hostParent, selectedOnly = false, hostPreviousSession = null) { ${panelHostSource.slice(begin, end)} return hostRows; }`,
     { compilerOptions: { target: ts.ScriptTarget.ES2022 } },
   ).outputText;
-  const project = new Function('startingWorktree', `${code}; return rows;`)(startingWorktree);
+  const project = new Function('startingWorktree', 'PayloadRows', 'host', `${code}; return rows;`)(
+    startingWorktree,
+    PayloadRows,
+    {},
+  );
   const home = '/repo';
   const nested = '/repo/.claude/worktrees/é #L10';
   const sessions = [
@@ -346,6 +351,7 @@ test('heading worktree metadata follows each panel opening source and clears whe
     { sessionId: 'unknown', cwd: '/unknown' },
   ];
   const provider = {
+    heldHostRows: new WeakMap(),
     sessionRows: sessions.map((s) => ({ id: s.sessionId, label: s.sessionId })),
     folders: () => [home],
     repositoryScope: { checkoutSnapshot: () => [home, nested] },
@@ -10678,6 +10684,7 @@ function dispatchedRefreshFixture(sessions: any[], worker: ProgressiveWorker, tu
       statuses,
       runningSince: new Map(),
       openChildren,
+      backgroundCommands: new Map(),
       hidden: new Set(),
       showing,
       pinnedTop: new Set(),
@@ -12160,7 +12167,7 @@ test('worker metadata carries the agent-run mark to the host', () => {
   assert.notEqual(rowsAt, -1, 'panelhost.ts no longer builds the rail rows, so this guard reads nothing');
   sourceMatch(
     memberFrom(panelHostSource, rowsAt),
-    /agentRun: this\.agentRunFor\(f, edges\),/,
+    /const agentRun = this\.agentRunFor\(f, edges\);[\s\S]*return \{[\s\S]*agentRun,/,
     'the rail row does not read the detector, so no session is ever marked as run by an agent',
   );
   sourceMatch(
@@ -13941,7 +13948,7 @@ test('synthetic sessions become interactive only inside the current repository s
   );
   sourceMatch(
     refresh,
-    /scopedDrafts\.map[\s\S]*scopedPendingRecords\.map[\s\S]*syntheticDraftRows\(scopedDrafts\.map[\s\S]*syntheticDraftRows\(scopedPendingRecords\.map/,
+    /scopedDrafts\.map[\s\S]*scopedPendingRecords\.map[\s\S]*scopedDrafts\.map\(\(draft\) =>[\s\S]*syntheticDraftRows\(\[\s*\{\s*draftId: draft\.draftId,[\s\S]*scopedPendingRecords\.map\(\(pending\) =>[\s\S]*syntheticDraftRows\(\[\s*\{\s*draftId: pending\.sessionId,/,
     'out-of-scope synthetic sessions still reach selection, launch, or session rows',
   );
 });
@@ -19759,7 +19766,7 @@ test('nothing leaves the panel with no session shown', () => {
   for (const [what, line] of [
     ['the parse cut', 'const sessions = this.shownSessions(all);'],
     ['what is drawn', 'const hostDrawn = drawnSessionCards(this.cards, hostSession);'],
-    ['the rail', 'this.railInputFor(counts, statuses, openChildren, railNow, hostSession),'],
+    ['the rail', 'const hostInput = this.railInputFor(counts, statuses, openChildren, railNow, hostSession);'],
   ] as const) {
     const at = panelHostSource.indexOf(line);
     assert.notEqual(at, -1, `${what} is not where this guard expects it`);
@@ -20091,6 +20098,9 @@ test('the live Codex subagent route keeps each panel on the place its shared tra
     'selectionPayload',
     'renderPayload',
     'startingWorktree',
+    'PayloadRows',
+    'RailPayloadRows',
+    'wordingDay',
     loopCode,
   )(
     loopModule,
@@ -20106,6 +20116,9 @@ test('the live Codex subagent route keeps each panel on the place its shared tra
     selectionPayload,
     renderPayload,
     startingWorktree,
+    PayloadRows,
+    RailPayloadRows,
+    railWordingDay(1),
   );
   const postPayloads = () => {
     sent.length = 0;
@@ -20287,7 +20300,7 @@ test('a fresh session stays selected until its disk record is discoverable', () 
   );
   sourceMatch(
     refresh,
-    /syntheticDraftRows\(scopedPendingRecords\.map/,
+    /scopedPendingRecords\.map\(\(pending\) =>[\s\S]*syntheticDraftRows\(\[\s*\{\s*draftId: pending\.sessionId,[\s\S]*createdAt: pending\.createdAt,[\s\S]*agent: AGENT_NAMES\[pending\.agent\]/,
     'the selected actual id has no row or composer while its disk record is delayed',
   );
 
@@ -26663,7 +26676,7 @@ test('the panel dates a session by what it recorded, not by its file being touch
   assert.notEqual(from, -1, 'panelhost.ts no longer builds sessionRows from the listing');
   const rows = memberFrom(panelHostSource, from);
   sourceMatch(rows, /const at = this\.activityFor\(f\);/, 'a session row no longer takes the recorded activity time');
-  for (const field of ['when: formatWhen(at)', 'at,', 'relative: formatRelative(at)']) {
+  for (const field of ['when: formatWhen(at)', 'at,', 'const relative = formatRelative(at);', 'relative,']) {
     assert.ok(rows.includes(field), `the session row's \`${field}\` no longer comes from the recorded activity time`);
   }
   sourceDoesNotMatch(
@@ -33693,7 +33706,7 @@ test('session details keeps native controls and dialog lifetime outside the redr
   );
   sourceMatch(
     panelHostSource,
-    /const full = row\.id === hostSession \? \(fullLabels\.get\(row\.id\) \?\? row\.label\) : row\.label/,
+    /const selected = source\.id === hostSession;\s*const full = selected \? \(fullLabels\.get\(source\.id\) \?\? source\.label\) : source\.label/,
     'hidden sessions can send their complete names in every render payload',
   );
   sourceMatch(
@@ -33742,7 +33755,7 @@ test('session details keeps native controls and dialog lifetime outside the redr
   // Remove railName from the session rows supplied to the session view.
   sourceMatch(
     panelHostSource,
-    /\)\.map\(\(\{ railName: _railName, \.\.\.row \}\) => \{/,
+    /const \{ railName: _railName, \.\.\.row \} = source;\s*return \{\s*\.\.\.row,/,
     "the render payload's session rows still carry the rail's own wide name",
   );
 });
@@ -33776,7 +33789,13 @@ return Object.assign(new Rows(), fields).assign();
   const builtModule = {
     exports: {} as { build: (...args: unknown[]) => { label: string; railName?: string }[] },
   };
-  new Function('module', 'exports', built)(builtModule, builtModule.exports);
+  new Function('module', 'exports', 'PayloadRows', 'railWordingDay', 'wordingDay', built)(
+    builtModule,
+    builtModule.exports,
+    PayloadRows,
+    railWordingDay,
+    railWordingDay(0),
+  );
   const rows = builtModule.exports.build(
     [{ sessionId: 's1', agent: 'claude' }],
     [],

@@ -133,11 +133,12 @@ function sendList<T extends Row>(
   rows: readonly T[],
   held: SentList | null,
   whole: boolean,
+  printRow: (value: unknown) => string,
 ): { changed: readonly T[]; order: RowOrderEdit | undefined; next: SentList } {
   const prints = new Map<string, string>();
   const changed: T[] = [];
   for (const row of rows) {
-    const print = rowPrint(row);
+    const print = printRow(row);
     prints.set(row.id, print);
     if (!whole && held?.prints.get(row.id) !== print) changed.push(row);
   }
@@ -155,6 +156,19 @@ let lastRevision = 0;
 
 // Host side of one panel's row sequence. Reset it whenever the panel may hold other rows, so the next message is a snapshot.
 export class RowDeltaSender {
+  private rowTexts = new WeakMap<object, string>();
+
+  constructor(private readonly immutableRows = false) {}
+
+  private printRow = (value: unknown): string => {
+    if (!this.immutableRows || value === null || typeof value !== 'object') return rowPrint(value);
+    const held = this.rowTexts.get(value);
+    if (held !== undefined) return held;
+    const print = rowPrint(value);
+    this.rowTexts.set(value, print);
+    return print;
+  };
+
   // The revision of the last message posted to the panel.
   private revision: number | null = null;
   private sessions: (SentList & { revision: number }) | null = null;
@@ -171,6 +185,7 @@ export class RowDeltaSender {
   lastRailChanges: RailRowChanges | null = null;
 
   reset(reason: RowResetReason): void {
+    this.rowTexts = new WeakMap();
     this.revision = null;
     this.sessions = null;
     this.rail = null;
@@ -222,7 +237,7 @@ export class RowDeltaSender {
     if (message.sessions) {
       // A session list message leaves `sessions` out, so `sessions` extend the last message that carried them.
       const held = whole ? null : this.sessions;
-      const sessions = sendList(message.sessions, held, !held);
+      const sessions = sendList(message.sessions, held, !held, this.printRow);
       out.sessions = sessions.changed;
       header.sessionsBase = held ? held.revision : null;
       if (sessions.order) header.sessionOrder = sessions.order;
@@ -230,7 +245,7 @@ export class RowDeltaSender {
       rowsHeld += message.sessions.length;
       rowsSent += sessions.changed.length;
     }
-    const rail = sendList(message.rail, this.rail, whole);
+    const rail = sendList(message.rail, this.rail, whole, this.printRow);
     out.rail = rail.changed;
     rowsSent += rail.changed.length;
     if (rail.order) header.railOrder = rail.order;
@@ -240,7 +255,7 @@ export class RowDeltaSender {
     const prints = new Map<string, string>();
     const stats: Record<string, unknown> = {};
     for (const [id, value] of Object.entries(message.stats)) {
-      const print = rowPrint(value);
+      const print = this.printRow(value);
       prints.set(id, print);
       if (whole || this.stats?.get(id) !== print) stats[id] = value;
     }

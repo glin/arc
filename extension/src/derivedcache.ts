@@ -272,7 +272,7 @@ export function derivedTitleCacheRevision(entry: DerivedTitleEntry): Pick<FileRe
 // The `current` predicate rejects figures affected by changing external inputs, such as the clock.
 // The `derive` callback must use facts and other unchanging inputs. Callers must replace changed facts with a new object.
 // `read` gives a new output when a figure moves, and the same output when every listed session keeps its figure.
-// `patch` changes the output in place. Readers hold the output by identity, as `lastRailKey` in panelhost.ts does.
+// `patch` changes the output in place. Session list keys compare the output identity and each entry's identity.
 // Removed sessions lose their figures.
 export class SessionFactFigures<F, V> {
   private held = new Map<string, { facts: F; value: V }>();
@@ -302,8 +302,8 @@ export class SessionFactFigures<F, V> {
     return this.value;
   }
 
-  // Sets the figure of one session, or drops it with null. The output keeps its identity, so a reader that holds it by
-  // identity, as `lastRailKey` in panelhost.ts does, sees no change. A caller that patches a figure posts the change itself.
+  // Sets the figure of one session, or drops it with null. The output keeps its identity.
+  // Session list keys detect replaced entries and changed membership. The caller requests publication after patching.
   patch(sessionId: string, entry: { facts: F; value: V } | null): Readonly<Record<string, V>> {
     const value = this.value as Record<string, V>;
     if (entry) {

@@ -1,3 +1,5 @@
+import { formatWhen, formatRelative } from './turnformat';
+import type { RailStatus } from './view/rail';
 import { startingWorktree } from './repositoryscope';
 import { StartupHistory } from './diagnosticslog';
 import * as spendConsumers from './projectspend';
@@ -210,6 +212,8 @@ import {
   railInputChanges,
   railMessage,
   railPayload,
+  PayloadRows,
+  RailPayloadRows,
   railWordingDay,
   sameRailInputs,
   selectionPayload,
@@ -313,7 +317,7 @@ import { countedDispatchedCosts, pendingAskPosition, toCard, TURN_QUIET_MS } fro
 import { COMMIT_REPOSITORY_PARSER_VERSION, commitRepositoryOccurrence } from './codexhistory';
 import { RepositoryCommits } from './gitcommits';
 import { CommitRepositories } from './commitrepositories';
-import { agentRunAnswer, railCacheMarkOf, sessionStatusOf, stableRailOrder } from './turnrail';
+import { agentRunAnswer, railCacheMarkOf, sessionStatusOf, stableRailOrder, syntheticDraftRows } from './turnrail';
 import { storedAssetsForPrompt } from './promptassets';
 import { emptyTrail, renamePlace, visitPlace } from './turnplaces';
 import { adoptLabelSession, labelsOf } from './turnlabels';
@@ -3522,7 +3526,7 @@ function completeDiscoveryHarness(
     const trustedListedRevisions = () => new Map(); const sessionStatusOf = () => new Map();
     let refreshWanted = () => true; const statusMoved = () => false; const openChildrenKey = () => ''; const openChildCounts = () => new Map();
     const agentsWithNewTurns = (seen) => ({ seen, agents: [] }); const drawnSessionCards = (cards) => cards;
-    const resumeCommand = () => ''; const formatWhen = () => ''; const formatRelative = () => '';
+    const resumeCommand = () => ''; const formatWhen = ${scope.rowFormatWhen ? 'rowFormatWhen' : "() => ''"}; const formatRelative = ${scope.rowFormatRelative ? 'rowFormatRelative' : "() => ''"};
     let sessionStatsFromFacts = (facts) => facts; const railCacheMarkOf = railCacheMark; const derivedTitleCacheStats = cacheStats;
     const newestTurnLoading = () => ({}); const emptyTimeline = () => null;
     const readSetting = ${scope.snapshotHistoryDays ? 'snapshotHistoryDays' : '() => 3'}; const isLightColourTheme = () => false;
@@ -3532,7 +3536,7 @@ function completeDiscoveryHarness(
     const RAIL_NAME_LIMIT = 200; const COMPRESSED_ROWS_APPLY_MS = 2_000;
     const TRANSCRIPT_TURN_LIMIT = 40; const TRANSCRIPT_TAIL_BYTES = 1024;
     const renderPayload = (value) => ({ type: 'render', ...value, ...value.rail }); const olderHistoryPossible = () => false;
-    const olderHistoryControl = () => null; const syntheticDraftRows = (drafts) => drafts.map((draft) => ({ ...draft, id: draft.draftId, label: 'New session' }));
+    const olderHistoryControl = () => null; const syntheticDraftRows = ${scope.rowDrafts ? 'rowDrafts' : "(drafts) => drafts.map((draft) => ({ ...draft, id: draft.draftId, label: 'New session' }))"};
     const prunePlaces = (trail) => trail; const visitPlace = (trail) => trail;
     let railPayload = () => ({ rail: [], labels: [], views: [], railFilters: [], stats: {} });
     export class Harness {
@@ -3626,7 +3630,7 @@ function completeDiscoveryHarness(
         const lifetime = this.lifetimeFiguresBySession();
         return {
           sessions: this.sessionRows, counts: counts ?? new Map(), newest: new Map(), statuses: statuses ?? new Map(),
-          runningSince: this.runningSince(), openChildren: new Map(), hidden: new Set(this.hidden), showing: this.showing, pinnedTop: new Set(this.pinnedTop),
+          runningSince: this.runningSince(), openChildren: new Map(), backgroundCommands: new Map(), hidden: new Set(this.hidden), showing: this.showing, pinnedTop: new Set(this.pinnedTop),
           unsent: new Map(), parsedStats: {}, metadataStats: this.metadataStatsBySession, lifetimeStats: lifetime.stats,
           lifetimeContextDetails: lifetime.contextDetails, lifetimeCosts: lifetime.costs, labels: this.saved.labels ?? {},
           caches: {}, views: this.saved.views ?? [], railFilters: this.saved.railFilters ?? [], now: Date.now(),
@@ -3679,6 +3683,8 @@ function completeDiscoveryHarness(
     'railInputKey',
     'railInputChanges',
     'railWordingDay',
+    'PayloadRows',
+    'RailPayloadRows',
     'RowDeltaReceiver',
     'RowDeltaSender',
     'sameRailInputs',
@@ -3741,8 +3747,30 @@ function completeDiscoveryHarness(
     railInputKey,
     railInputChanges,
     railWordingDay,
+    scope.retainedPayloads === false
+      ? class {
+          read(_id: string, _inputs: unknown[], build: () => unknown) {
+            return build();
+          }
+          retain() {}
+        }
+      : PayloadRows,
+    scope.retainedPayloads
+      ? RailPayloadRows
+      : class {
+          payload: unknown;
+          read(input: Parameters<typeof railPayload>[0], build: typeof railPayload) {
+            return (this.payload = build(input));
+          }
+        },
     RowDeltaReceiver,
-    RowDeltaSender,
+    scope.retainedPayloads === false
+      ? class extends RowDeltaSender {
+          constructor() {
+            super(false);
+          }
+        }
+      : RowDeltaSender,
     sameRailInputs,
     railMessage,
     sessionAdoptions,
@@ -7738,6 +7766,394 @@ test('a child that reaches its quiet limit during a refresh leaves the session l
     clock.mockRestore();
   }
 });
+
+test(
+  'a refresh retains unchanged session and rail rows and matches a full publication',
+  { timeout: 120_000 },
+  async () => {
+    const previousZone = process.env.TZ;
+    process.env.TZ = 'America/Chicago';
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.UTC(2026, 10, 10, 18));
+    let sessionBuilds = 0;
+    const statuses = new Map<string, RailStatus>();
+    const counts = new Map<string, NewCount>();
+    const newest = new Map<string, number>();
+    const runningSince = new Map<string, number>();
+    const children = new Map<string, number>();
+    const commands = new Map<string, number>();
+    const contextFacts = (tokens: number) => ({
+      turns: [
+        {
+          startedAt: 1,
+          endedAt: 2,
+          finished: true,
+          error: false,
+          model: 'gpt-5',
+          provider: null,
+          contextTokens: tokens,
+          contextWindow: 200000,
+          usage: { requests: 1, input: 0, cacheWrite1h: 0, cacheWrite5m: 0, cacheRead: 0, output: 0, thinking: 0 },
+        },
+      ],
+      compactions: [],
+    });
+    const providers = [false, true].map((full) => {
+      const provider = completeDiscoveryHarness(undefined, false, ['postRail', 'sendToHost', 'adoptDraft'], {
+        retainedPayloads: !full,
+        rowDrafts: syntheticDraftRows,
+        remapReaderParents,
+        adoptSessionIdentity,
+        rememberSessionAlias,
+        renamePlace,
+        labelsOf,
+        adoptLabelSession,
+        SESSION_LIMIT: 2000,
+        rowFormatWhen: (at: number) => {
+          if (!full) sessionBuilds++;
+          return formatWhen(at);
+        },
+        rowFormatRelative: formatRelative,
+      });
+      provider.partial = Array.from({ length: 2000 }, (_, index) => ({
+        sessionId: 'retained-' + index,
+        file: 'retained-' + index + (index < 1250 ? '.jsonl.zst' : '.jsonl'),
+        agent: 'codex',
+        activity: Date.UTC(2026, 6, 15, 18) - index,
+        cwd: 'project',
+        size: 1,
+        mtimeMs: 1,
+        dev: 1,
+        ino: index + 1,
+        ...(index === 0 ? { facts: contextFacts(60000) } : {}),
+      }));
+      provider.catalog = { sessions: provider.partial };
+      provider.performanceOutput = { appendLine() {} };
+      provider.discovery = Promise.resolve(true);
+      provider.showing = 'retained-0';
+      provider.hidden = new Set();
+      provider.pinnedTop = new Set();
+      provider.parents = {};
+      provider.parentOfShown = (session: string) => provider.parents[session];
+      provider.repositoryScope = { checkoutSnapshot: () => ['project', 'project/worktree'] };
+      Object.assign(provider, {
+        trail: emptyTrail(),
+        startedHere: new Set(),
+        assets: {},
+        queues: {},
+        sentPrompts: {},
+        boxText: {},
+        railOrder: [],
+        mcpServers: {},
+        draftCommentIds: {},
+        attachmentNotices: {},
+        staging: new Set(),
+        stagingTokens: new Map(),
+        stagingOperations: new Map(),
+      });
+      provider.sessionLabel = (source: any) => ({
+        label: (source.name ?? source.sessionId).slice(0, 60),
+        fullLabel: source.name ?? source.sessionId,
+      });
+      provider.railStatuses = () => ({ statuses, openChildren: children });
+      provider.unreadCounts = () => counts;
+      provider.metaFor = (source: any) => ({ stats: source.facts ?? null, starts: undefined });
+      provider.useSessionStats(sessionStatsFromFacts);
+      const inputFor = provider.railInputFor.bind(provider);
+      provider.railInputFor = (...args: any[]) => ({
+        ...inputFor(...args),
+        showing: args[4] ?? provider.showing,
+        newest,
+        runningSince,
+        openChildren: children,
+        backgroundCommands: commands,
+        lifetimeCacheExpiry: provider.heldLifetime.cacheExpiryCounts,
+        caches: provider.cacheMarks ?? {},
+        unsent: unsentBySession(provider.drafts, provider.saved.comments),
+      });
+      provider.rawMessages = [];
+      provider.panelMessages = [[], []];
+      provider.rawPanelMessages = [[], []];
+      provider.hosts = ['retained-0', 'retained-1'].map((session, slot) => {
+        const receiver = new RowDeltaReceiver();
+        return {
+          session,
+          webview: {
+            postMessage(message: any) {
+              provider.rawMessages.push(message);
+              provider.rawPanelMessages[slot].push(message);
+              const expanded =
+                message.type === 'render' || message.type === 'rail' ? receiver.expand(message) : message;
+              assert.ok(expanded, 'the panel rejects its row delta');
+              provider.messages.push(expanded);
+              provider.panelMessages[slot].push(expanded);
+              return Promise.resolve(true);
+            },
+          },
+          active: () => false,
+          visible: () => true,
+        };
+      });
+      provider.readyHosts = new Set(provider.hosts);
+      provider.hostSessions = new Map(provider.hosts.map((host: any) => [host, host.session]));
+      provider.shownSessions = (sources: any[]) =>
+        sources.filter(
+          (source) =>
+            source.sessionId === provider.showing || source.sessionId === provider.hostSessions.get(provider.hosts[1]),
+        );
+      return provider;
+    });
+    const [retained, full] = providers;
+    let railBuilds = 0;
+    retained.useRailPayload((input: Parameters<typeof railPayload>[0], rows?: ReadonlySet<string | null>) => {
+      const result = railPayload(input, rows);
+      railBuilds += result.rail.length;
+      return result;
+    });
+    full.useRailPayload(railPayload);
+    const compare = async (step = -1) => {
+      for (const provider of providers) {
+        provider.messages.length = 0;
+        provider.rawMessages.length = 0;
+        for (const messages of [...provider.panelMessages, ...provider.rawPanelMessages]) messages.length = 0;
+      }
+      await retained.refresh(true);
+      await full.refresh(true);
+      const clean = (provider: any, slot: number) => {
+        const message = provider.panelMessages[slot].filter((value: any) => value.type === 'render').at(-1);
+        assert.ok(message, 'refresh posts no render');
+        return JSON.stringify({ ...message, rows: undefined });
+      };
+      const wire = (provider: any, slot: number) => {
+        const message = provider.rawPanelMessages[slot].filter((value: any) => value.type === 'render').at(-1);
+        const rows = { ...message.rows };
+        for (const field of ['revision', 'base', 'sessionsBase']) if (typeof rows[field] === 'number') rows[field] = 1;
+        return JSON.stringify({ ...message, rows });
+      };
+      for (const slot of [0, 1]) {
+        assert.ok(
+          clean(retained, slot) === clean(full, slot),
+          'expanded publication differs for panel ' + slot + ' at step ' + step,
+        );
+        assert.ok(
+          wire(retained, slot) === wire(full, slot),
+          'encoded publication differs for panel ' + slot + ' at step ' + step,
+        );
+      }
+    };
+    const rowsOf = (provider: any) =>
+      JSON.stringify(
+        provider.panelMessages.map((messages: any[]) => {
+          const message = messages.filter((value) => value.type === 'render').at(-1);
+          return [message.sessions, message.rail, message.stats];
+        }),
+      );
+    try {
+      await compare();
+      sessionBuilds = railBuilds = 0;
+      for (const provider of providers) provider.partial[17] = { ...provider.partial[17], name: 'Changed name' };
+      await compare();
+      assert.equal(sessionBuilds, 1);
+      assert.equal(railBuilds, 2);
+      sessionBuilds = railBuilds = 0;
+      await compare();
+      assert.equal(sessionBuilds, 0);
+      assert.equal(railBuilds, 0);
+      for (const provider of providers) {
+        provider.partial[18] = { ...provider.partial[18], name: 'Patched compressed name' };
+        provider.noteCompressedRowFacts(provider.partial, [], [provider.partial[18]]);
+      }
+      retained.postRail(true);
+      full.postRail(true);
+      const railMessageOf = (provider: any) =>
+        JSON.stringify({ ...provider.messages.filter((value: any) => value.type === 'rail').at(-1), rows: undefined });
+      assert.ok(railMessageOf(retained) === railMessageOf(full), 'compressed metadata publication differs');
+      assert.equal(sessionBuilds, 1);
+      assert.equal(railBuilds, 2);
+      sessionBuilds = railBuilds = 0;
+      for (const provider of providers) {
+        provider.partial[18] = { ...provider.partial[18], facts: contextFacts(60000) };
+        provider.noteCompressedRowFacts(provider.partial, [], [provider.partial[18]]);
+      }
+      full.lastRailKey = null;
+      retained.postRail(true);
+      full.postRail(true);
+      assert.ok(railMessageOf(retained) === railMessageOf(full), 'compressed metadata publication differs');
+      assert.equal(sessionBuilds, 0);
+      assert.equal(railBuilds, 2);
+      let seed = 731;
+      const random = () => {
+        seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+        return seed;
+      };
+      for (let step = 0; step < 240; step++) {
+        const before = rowsOf(full);
+        sessionBuilds = railBuilds = 0;
+        let index = random() % retained.partial.length;
+        if (retained.partial[index].sessionId === retained.showing) index = (index + 1) % retained.partial.length;
+        const id = retained.partial[index].sessionId;
+        const kind = step % 30;
+        if (kind === 0) statuses.set(id, statuses.get(id) === 'running' ? 'waiting' : 'running');
+        if (kind === 1) {
+          counts.set(id, { count: step + 1, atLeast: false });
+          newest.set(id, Date.now() + step);
+        }
+        if (kind === 12) {
+          const day = new Date(Date.now());
+          day.setHours(24, 1, 0, 0);
+          clock.mockReturnValue(day.getTime());
+        }
+        if (kind === 13) {
+          statuses.set(id, 'running');
+          runningSince.set(id, Date.now());
+        }
+        if (kind === 14) {
+          statuses.set(id, 'subagents');
+          children.set(id, step);
+        }
+        if (kind === 15) {
+          statuses.set(id, 'background');
+          commands.set(id, step);
+        }
+        if (kind === 20) counts.set(id, { count: counts.get(id)?.count ?? 3, atLeast: !counts.get(id)?.atLeast });
+        if (kind === 29) {
+          const before = [new Date(Date.now()).toDateString(), new Date(Date.now()).getTimezoneOffset()];
+          const historical = formatWhen(Date.UTC(2026, 6, 15, 18));
+          process.env.TZ = process.env.TZ === 'America/Chicago' ? 'America/Mexico_City' : 'America/Chicago';
+          assert.deepEqual([new Date(Date.now()).toDateString(), new Date(Date.now()).getTimezoneOffset()], before);
+          assert.notEqual(formatWhen(Date.UTC(2026, 6, 15, 18)), historical);
+        }
+        for (const provider of providers) {
+          const source = provider.partial[index];
+          switch (kind) {
+            case 1:
+              provider.partial[index] = { ...source, activity: Date.now() + step };
+              break;
+            case 2:
+              provider.partial[index] = { ...source, name: 'Renamed ' + step };
+              break;
+            case 3:
+              provider.pinnedTop = new Set(provider.pinnedTop.has(id) ? [] : [id]);
+              break;
+            case 4:
+              provider.hidden = new Set(provider.hidden.has(id) ? [] : [id]);
+              break;
+            case 5:
+              (provider.saved.labels[id] ??= []).push('label ' + step);
+              break;
+            case 6:
+              provider.drafts[id] = 'Draft ' + step;
+              break;
+            case 7:
+              provider.previousSelection = provider.showing;
+              provider.showing = id;
+              provider.hostPreviousSessions ??= new Map();
+              provider.hostPreviousSessions.set(provider.hosts[0], provider.previousSelection);
+              provider.hostSessions.set(provider.hosts[0], id);
+              break;
+            case 8:
+              provider.partial.push({ ...source, sessionId: 'joined-' + step, file: 'joined-' + step + '.jsonl' });
+              break;
+            case 9:
+              provider.partial.pop();
+              break;
+            case 10:
+              provider.heldLifetime.costs = { ...provider.heldLifetime.costs, [id]: { dollars: step, partial: true } };
+              break;
+            case 11:
+              provider.partial[18] = { ...provider.partial[18], facts: contextFacts(60000 + step * 100) };
+              provider.noteCompressedRowFacts(provider.partial, [], [provider.partial[18]]);
+              break;
+            case 16:
+              provider.cacheMarks ??= {};
+              provider.cacheMarks[id] = { expiresAt: Date.now() + 300_000 + step, nearlyGoneAt: Date.now() + 240_000 };
+              break;
+            case 17:
+              provider.heldLifetime.stats = {
+                ...provider.heldLifetime.stats,
+                [id]: [
+                  { kind: 'plain', metric: 'turns', label: step + ' turns', compactLabel: String(step), detail: '' },
+                ],
+              };
+              break;
+            case 18:
+              provider.heldLifetime.contextDetails = {
+                ...provider.heldLifetime.contextDetails,
+                'retained-0': { entries: [], footer: ['Context ' + step] },
+              };
+              break;
+            case 19:
+              provider.heldLifetime.cacheExpiryCounts = {
+                ...provider.heldLifetime.cacheExpiryCounts,
+                [id]: { count: step, atLeast: true },
+              };
+              break;
+            case 21:
+              provider.saved.comments.push({ id: 'comment-' + step, sessionId: id, text: 'Unsent comment' });
+              break;
+            case 22:
+              provider.newDrafts['draft:retained'] = {
+                draftId: 'draft:retained',
+                cwd: 'project',
+                sourceSession: null,
+                createdAt: Date.now(),
+                profile: { agent: 'codex', model: 'gpt-5', effort: 'high', permissionMode: 'default' },
+              };
+              provider.drafts['draft:retained'] = 'First prompt';
+              break;
+            case 23:
+              provider.adoptDraft('draft:retained', 'adopted-' + step, undefined, undefined, true);
+              break;
+            case 24:
+              provider.parents[provider.showing] = { id, label: 'Parent ' + step, relation: 'reader' };
+              break;
+            case 25: {
+              const selected = provider.partial.findIndex((row: any) => row.sessionId === provider.showing);
+              provider.partial[selected] = { ...provider.partial[selected], cwd: 'project/worktree/src' };
+              break;
+            }
+            case 26: {
+              const actual = 'adopted-' + (step - 3);
+              delete provider.awaitingSessionRecords[actual];
+              provider.partial.push({ ...source, sessionId: actual, file: actual + '.jsonl' });
+              break;
+            }
+            case 27:
+              provider.partial[index] = { ...source, name: ('Complete session name ' + step + ' ').repeat(20) };
+              break;
+            case 28:
+              provider.hostSessions.set(provider.hosts[1], id);
+              break;
+          }
+        }
+        if (kind === 7) {
+          for (const provider of providers) await provider.refresh(true, true, false, true);
+          const selected = providers.map((provider) =>
+            provider.rawMessages.filter((message: any) => message.type === 'selection').at(-1),
+          );
+          assert.ok(selected.every(Boolean), 'selection posts no message');
+          assert.ok(JSON.stringify(selected[0]) === JSON.stringify(selected[1]), 'selection publication differs');
+        }
+        await compare(step);
+        if (kind >= 16)
+          assert.notEqual(rowsOf(full), before, 'the mutation leaves reference rows unchanged at step ' + step);
+        if (kind !== 12 && kind !== 29) {
+          assert.ok(sessionBuilds <= 4, 'mutation builds ' + sessionBuilds + ' session rows at step ' + step);
+          assert.ok(railBuilds <= 8, 'mutation builds ' + railBuilds + ' rail rows at step ' + step);
+        }
+      }
+      for (const provider of providers)
+        provider.partial = provider.partial.filter((source: any) => source.sessionId !== 'retained-17');
+      await compare();
+      assert.equal(retained.heldSessionRows.rows.size, retained.partial.length);
+      assert.equal(retained.heldHostRows.get(retained.hosts[0]).rows.size, retained.partial.length);
+      assert.equal(retained.heldRailPayloads.get(retained.showing).payload.rail.length, retained.partial.length);
+    } finally {
+      clock.mockRestore();
+      if (previousZone === undefined) delete process.env.TZ;
+      else process.env.TZ = previousZone;
+    }
+  },
+);
 
 // A selection changes the rows of the session it leaves and the session it enters. Its refresh checks the prompt sources
 // and builds the session list payload of those two sessions alone.
@@ -20351,13 +20767,12 @@ test('a render post counts its caller and each session list input that differs f
     provider.pinnedTop = [provider.catalog.sessions[0].sessionId];
     provider.refreshFrom('pin', true, true);
     await settle();
-    // A pin moves the pinned row, so the session rows differ too.
+    // A pin changes session list placement without changing session-row content.
     assert.deepEqual(
       posts(before).sort(),
       [
         ['renderPost:pin', 1],
         ['renderPostInput:pin:pinnedTop', 1],
-        ['renderPostInput:pin:sessions', 1],
       ],
       'the counter named an input that did not change, or missed one that did',
     );
@@ -20464,7 +20879,12 @@ test('a session list post counts the rows it carried and each row field that dif
 });
 
 test('a draft hold among 2000 rows builds only draft payloads and preserves each panel rail', () => {
-  const provider = railPostHarness(['holdDraft'], { hasUnsentPrompt, replaceRows, replaceStats });
+  const provider = railPostHarness(['holdDraft'], {
+    hasUnsentPrompt,
+    replaceRows,
+    replaceStats,
+    retainedPayloads: true,
+  });
   provider.performanceOutput = { appendLine() {} };
   const clock = vi.spyOn(Date, 'now').mockReturnValue(new Date(2026, 0, 15, 12).getTime());
   try {
@@ -20568,7 +20988,7 @@ test('a draft hold among 2000 rows builds only draft payloads and preserves each
     provider.holdDraft('s17', 'another draft');
     assert.deepEqual(
       built.map((rows) => rows.length),
-      [2000, 2000],
+      [2, 2],
     );
     checkRail();
   } finally {
@@ -20577,7 +20997,7 @@ test('a draft hold among 2000 rows builds only draft payloads and preserves each
 });
 
 function railPanelLifecycleHarness(): any {
-  const provider = railPostHarness(['attach', 'releaseQueuedEditOffer']);
+  const provider = railPostHarness(['attach', 'releaseQueuedEditOffer'], { retainedPayloads: true });
   provider.performanceOutput = { appendLine() {} };
   const lifecycle = harness();
   for (const name of [
@@ -26024,9 +26444,11 @@ test('a pass that ends after a scheduled save owes the ledger the displayed file
 });
 
 test('a rail post words the rail again when an input held by identity is replaced', () => {
-  const provider = railPostHarness([]);
+  const provider = railPostHarness([], { retainedPayloads: true });
+  provider.useRailPayload(railPayload);
   const row = (id: string) => ({
     id,
+    persisted: true,
     label: id,
     agent: 'Claude',
     agentKey: 'claude',
@@ -26093,6 +26515,21 @@ test('a rail post words the rail again when an input held by identity is replace
     provider.postRail(true);
     assert.equal(provider.rails().length, at + 2, `the panel kept a stale rail after ${name} was replaced`);
   }
+  const figure = (count: number) => ({
+    kind: 'plain',
+    metric: 'context',
+    label: count + '% context',
+    compactLabel: String(count),
+    detail: '',
+  });
+  provider.metadataStatsBySession = { 'session-a': [figure(3)] };
+  provider.postRail(true);
+  assert.equal(provider.rails().at(-1).stats['session-a'][0].label, '3% context');
+  const record = provider.metadataStatsBySession;
+  record['session-a'] = [figure(4)];
+  provider.postRail(true);
+  assert.equal(provider.metadataStatsBySession, record);
+  assert.equal(provider.rails().at(-1).stats['session-a'][0].label, '4% context');
 });
 
 test('a spend pass that settles a new cost posts a rail with that cost', () => {
