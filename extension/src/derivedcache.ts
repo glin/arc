@@ -404,9 +404,6 @@ export interface DerivedCache {
   links?: SavedDiscoveryLinks;
   // The file held a link set that failed validation, so `links` is absent for that reason.
   linksMalformed?: boolean;
-  spendSources?: SavedSpendSources;
-  // The file held a source set of another version or one that failed validation, so `spendSources` is absent for that reason.
-  spendSourcesRefused?: 'malformed' | 'incompatible';
   // Complete prompt scans of Claude transcripts by file, each at the revision it read. See `savedPromptScanOf`.
   promptScans?: Map<string, HumanPromptScan>;
   // The openings that earlier launches read for Claude transcripts. See `savedOpeningCurrent`.
@@ -448,8 +445,9 @@ export function savedLinksRefusal(
 }
 
 // The spend sources of each session at the last complete discovery reply that settled membership, with the size,
-// modification time, device and inode of each source file that the reply's walk listed. A later start draws the turn count
-// and cost of an unchanged session from the spend index with them until its first complete reply.
+// modification time, device and inode that each source file had when the host accepted that reply. A later start draws the
+// turn count and cost of an unchanged session from the spend index with them until its first complete reply. They live in
+// `SAVED_SPEND_SOURCES_FILE` beside the derived cache file, which the host writes only after such a reply.
 export interface SavedSpendSources {
   version: number;
   // The repository roots of the reply, as JSON.
@@ -518,8 +516,11 @@ export function savedSpendSourcesOf(
 
 // The saved sources of each session whose source files kept their identity, and the count of sessions that lost them. A
 // source file that the walk lists keeps its identity when its saved size, modification time, device and inode equal the
-// walk's stat, and its spend index record has the same size and modification time. A source file that the walk does not
-// list keeps its saved source, so its spend index record counts as it stands. `key` gives the walk's key of a file.
+// walk's stat, and its spend index record has the same size and modification time. A record that names the device and inode
+// of its file must name those of the walk's stat. A source file that the walk does not list keeps its saved source, so its
+// spend index record counts as it stands. `children` pairs each child file that the walk lists with the file of its parent.
+// A child file that the saved set does not hold takes the saved sources from every session that holds its parent's file.
+// `key` gives the walk's key of a file.
 export function admittedSpendSources(
   saved: SavedSpendSources,
   key: (file: string) => string,
@@ -527,9 +528,13 @@ export function admittedSpendSources(
     string,
     Pick<FileRevision, 'size' | 'mtimeMs'> & { dev?: number | string; ino?: number | string }
   >,
-  recorded: (file: string) => { size: number; mtimeMs: number } | undefined,
+  recorded: (file: string) => { size: number; mtimeMs: number; sourceIdentity?: string } | undefined,
+  children: Iterable<readonly [child: string, parent: string]> = [],
 ): { sources: SessionSpendSource[]; changed: number } {
   const identities = new Map(saved.files.map((file) => [key(file.file), file]));
+  const held = new Set(saved.sources.map((source) => key(source.file)));
+  const grown = new Set<string>();
+  for (const [child, parent] of children) if (!held.has(key(child))) grown.add(key(parent));
   const kept = new Map<string, boolean>();
   const unchanged = (file: string): boolean => {
     const at = key(file);
@@ -539,17 +544,19 @@ export function admittedSpendSources(
     const identity = identities.get(at);
     const record = stat && recorded(file);
     answer =
-      !stat ||
-      (!!identity &&
-        !!record &&
-        fileIdentityValue(stat.dev) &&
-        fileIdentityValue(stat.ino) &&
-        String(stat.dev) === String(identity.dev) &&
-        String(stat.ino) === String(identity.ino) &&
-        stat.size === identity.size &&
-        stat.mtimeMs === identity.mtimeMs &&
-        record.size === stat.size &&
-        record.mtimeMs === stat.mtimeMs);
+      !grown.has(at) &&
+      (!stat ||
+        (!!identity &&
+          !!record &&
+          fileIdentityValue(stat.dev) &&
+          fileIdentityValue(stat.ino) &&
+          String(stat.dev) === String(identity.dev) &&
+          String(stat.ino) === String(identity.ino) &&
+          stat.size === identity.size &&
+          stat.mtimeMs === identity.mtimeMs &&
+          record.size === stat.size &&
+          record.mtimeMs === stat.mtimeMs &&
+          (record.sourceIdentity === undefined || record.sourceIdentity === `${stat.dev}:${stat.ino}`)));
     kept.set(at, answer);
     return answer;
   };
@@ -583,10 +590,29 @@ function savedSpendFile(value: unknown): value is SavedSpendFile {
   );
 }
 
-// A stored set of the current version that passes validation, or the reason it is refused.
-function storedSpendSources(value: unknown): Pick<DerivedCache, 'spendSources' | 'spendSourcesRefused'> {
-  if (value === undefined) return {};
-  if (record(value) && value.version !== SAVED_SPEND_SOURCES_VERSION) return { spendSourcesRefused: 'incompatible' };
+export const SAVED_SPEND_SOURCES_FILE = 'saved-spend-sources.json';
+
+export interface LoadedSpendSources {
+  sources?: SavedSpendSources;
+  // The file held a set of another version, or text that is not a valid set, such as a write cut off midway.
+  refused?: 'malformed' | 'incompatible';
+}
+
+// The saved set in `file`. A missing or unreadable file holds no set.
+export function loadSavedSpendSources(file: string): LoadedSpendSources {
+  let content: string;
+  try {
+    content = fs.readFileSync(file, 'utf8');
+  } catch {
+    return {};
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(content);
+  } catch {
+    return { refused: 'malformed' };
+  }
+  if (record(value) && value.version !== SAVED_SPEND_SOURCES_VERSION) return { refused: 'incompatible' };
   return record(value) &&
     text(value.scope) &&
     text(value.compatibility) &&
@@ -596,8 +622,18 @@ function storedSpendSources(value: unknown): Pick<DerivedCache, 'spendSources' |
     value.files.length <= MAX_SAVED_SPEND_SOURCES &&
     value.sources.every(savedSpendSource) &&
     value.files.every(savedSpendFile)
-    ? { spendSources: value as unknown as SavedSpendSources }
-    : { spendSourcesRefused: 'malformed' };
+    ? { sources: value as unknown as SavedSpendSources }
+    : { refused: 'malformed' };
+}
+
+// Replaces `file` atomically with the set. A set past `MAX_SAVED_SPEND_SOURCES` is not saved, and the file is left as it is.
+export function saveSavedSpendSources(
+  file: string,
+  saved: SavedSpendSources,
+  replace: (temporary: string, target: string) => void = fs.renameSync,
+): void {
+  if (saved.sources.length > MAX_SAVED_SPEND_SOURCES || saved.files.length > MAX_SAVED_SPEND_SOURCES) return;
+  writeFileAtomically(file, JSON.stringify(saved), replace);
 }
 
 export interface CarriedName {
@@ -831,7 +867,6 @@ interface StoredCache {
   links?: SavedDiscoveryLinks;
   promptScans?: StoredPromptScans;
   claudeOpenings?: StoredClaudeOpenings;
-  spendSources?: SavedSpendSources;
 }
 
 export type MetadataGenerations = Readonly<Record<AgentKind, number>>;
@@ -1746,7 +1781,6 @@ export function loadDerivedCache(
     loaded.codexMetas = legacy ? storedCodexMetas(parsed) : new Map();
     if (format === 2 && savedDiscoveryLinks(parsed.links)) loaded.links = parsed.links;
     else if (format === 2 && parsed.links !== undefined) loaded.linksMalformed = true;
-    if (format === 2) Object.assign(loaded, storedSpendSources(parsed.spendSources));
     if (format === 2) loaded.promptScans = storedPromptScans(parsed.promptScans);
     if (format === 2) loaded.claudeOpenings = storedClaudeOpenings(parsed.claudeOpenings);
     if (Array.isArray(parsed.unsettledAdoptions)) {
@@ -1884,7 +1918,6 @@ export function saveDerivedCache(
   promptScans: Iterable<[string, HumanPromptScan]> = [],
   unsettledAdoptions: Iterable<[string, string]> = [],
   claudeOpenings?: SavedClaudeOpenings,
-  spendSources?: SavedSpendSources,
 ): void {
   const savedScans = new Map<string, HumanPromptScan>();
   for (const [scanFile, scan] of promptScans) {
@@ -1948,12 +1981,6 @@ export function saveDerivedCache(
       parents: storedClaudeOpeningRows(claudeOpenings.parents),
       children: storedClaudeOpeningRows(claudeOpenings.children),
     },
-    spendSources:
-      spendSources &&
-      spendSources.sources.length <= MAX_SAVED_SPEND_SOURCES &&
-      spendSources.files.length <= MAX_SAVED_SPEND_SOURCES
-        ? spendSources
-        : undefined,
   };
   writeFileAtomically(file, JSON.stringify(data), replace);
 }

@@ -681,6 +681,9 @@ import {
   admittedSpendSources,
   savedSpendSourcesOf,
   savedSpendSourcesRefusal,
+  loadSavedSpendSources,
+  saveSavedSpendSources,
+  SAVED_SPEND_SOURCES_FILE,
 } from './derivedcache';
 import { drawnSessionCards } from './sessiondetails';
 import {
@@ -1740,8 +1743,14 @@ export class PanelProvider implements vscode.Disposable {
   // The saved sources that draw the session figures until the first complete discovery reply. Undefined until the walk and
   // the spend index load let `admitSavedSpendSources` run, and null after a refusal or that reply.
   private savedRowSources: readonly SessionSpendSource[] | null | undefined = undefined;
-  // The sources of the last settled reply in this activation, which the next derived cache write saves.
-  private settledSpendSources?: { scope: string; sources: readonly SessionSpendSource[] };
+  // The sources, the scope and the rows that hold the file stats of the last settled reply in this activation, taken when the
+  // host accepted it. `saved` turns true when a derived cache write saved them in `SAVED_SPEND_SOURCES_FILE`.
+  private settledSpendSources?: {
+    scope: string;
+    sources: readonly SessionSpendSource[];
+    rows: readonly (readonly SessionFile[])[];
+    saved: boolean;
+  };
   private readonly sessionSpendSourceIndex = new SessionSpendSourceIndex();
   private readonly subagentDirectories = new SubagentDirectoryCache();
   private readonly codexStats = new CodexStatCache();
@@ -3995,8 +4004,6 @@ export class PanelProvider implements vscode.Disposable {
       this.discoveryCheckpoint = cached.discovery;
       this.savedLinks = cached.links;
       this.savedLinksMalformed = cached.linksMalformed === true;
-      this.savedSpendSources = cached.spendSources;
-      this.savedSpendSourcesRefused = cached.spendSourcesRefused;
       this.savedPromptScans = cached.promptScans ?? new Map();
       for (const [file, opening] of cached.claudeOpenings?.parents ?? [])
         this.cwds.set(file, { ...opening, saved: true });
@@ -4006,6 +4013,11 @@ export class PanelProvider implements vscode.Disposable {
       this.derivedMigrationPending = cached.migrationPending === true;
       this.derivedMigrationNeedsOpenings = this.derivedMigrationPending && cached.codexMetas.size > 0;
       if (this.derivedMigrationPending) this.derivedCacheCheckpointState.markChanged(true);
+    }
+    if (this.derivedCacheFile) {
+      const loaded = loadSavedSpendSources(this.spendSourcesFile(this.derivedCacheFile));
+      this.savedSpendSources = loaded.sources;
+      this.savedSpendSourcesRefused = loaded.refused;
     }
     this.startupCache = {
       file: this.derivedCacheFile ?? null,
@@ -4946,6 +4958,9 @@ export class PanelProvider implements vscode.Disposable {
     this.settledDiscovery = undefined;
     this.claudeChildReferenceEntries = new Map();
     this.enumeratedSpendSources = undefined;
+    // The saved sources belong to the folders that the host admitted them for.
+    this.savedRowSources = null;
+    this.settledSpendSources = undefined;
     // Cancel catalog work started for different workspace folders.
     this.abandonCatalogRefresh();
     const scope = this.repositoryScope.snapshot(this.folders());
@@ -6463,7 +6478,7 @@ export class PanelProvider implements vscode.Disposable {
     }
     if (!turns.size) return;
     let held: ReturnType<typeof this.dispatchedTurnCosts> | undefined;
-    const expiryFacts = this.lifetimeFiguresBySession().cacheExpiryFacts;
+    const expiryFacts = this.cardLifetimeFigures().cacheExpiryFacts;
     const now = Date.now();
     const childCosts = this.childExpiryCosts(
       [...this.turnsByKey.values(), ...this.newestBySession.values()],
@@ -7808,7 +7823,7 @@ export class PanelProvider implements vscode.Disposable {
         const turn = this.newestBySession?.get(heldSession);
         return turn && this.cards.some((card) => card.kind === 'turn' && card.key === turnKey(turn));
       });
-      const expiryFacts = drawn ? this.lifetimeFiguresBySession().cacheExpiryFacts : undefined;
+      const expiryFacts = drawn ? this.cardLifetimeFigures().cacheExpiryFacts : undefined;
       const childCosts = expiryFacts
         ? this.childExpiryCosts(
             [...(this.turnsByKey?.values() ?? []), ...(this.newestBySession?.values() ?? [])],
@@ -12939,7 +12954,8 @@ export class PanelProvider implements vscode.Disposable {
               : [],
           ),
         );
-      const write = () =>
+      const settled = this.settledSpendSources;
+      const write = () => {
         saveDerivedCache(
           file,
           this.titles,
@@ -12953,8 +12969,13 @@ export class PanelProvider implements vscode.Disposable {
           [...(this.savedPromptScans ?? []), ...(this.humanScans ?? [])],
           [...(this.adoptionsUnsettled ?? [])].map(([plain, held]): [string, string] => [plain, held.twin]),
           { parents: parentOpenings, children: childOpenings },
-          this.savedSpendSourcesToWrite(),
         );
+        // The source set changes only at a settled reply, so a write for another reason leaves its file alone.
+        if (settled && !settled.saved) {
+          saveSavedSpendSources(this.spendSourcesFile(file), this.settledSpendSourcesRecord(settled));
+          settled.saved = true;
+        }
+      };
       const published = this.workspaceCache
         ? this.workspaceCache.write(write, this.cacheShutdownFlushing, file)
         : (write(), true);
@@ -12969,16 +12990,17 @@ export class PanelProvider implements vscode.Disposable {
     return false;
   }
 
-  // The sources of the last settled reply with the identity that the current walk lists for each file, or else the set this
-  // activation loaded.
-  private savedSpendSourcesToWrite(): SavedSpendSources | undefined {
-    const settled = this.settledSpendSources;
-    if (!settled) return this.savedSpendSources;
+  private spendSourcesFile(derivedCacheFile: string): string {
+    return path.join(path.dirname(derivedCacheFile), SAVED_SPEND_SOURCES_FILE);
+  }
+
+  // The saved form of the sources of a settled reply, with the file stats that the rows of that reply hold.
+  private settledSpendSourcesRecord(settled: NonNullable<typeof this.settledSpendSources>): SavedSpendSources {
     return savedSpendSourcesOf(
       settled.scope,
       discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
       settled.sources,
-      [...(this.walkedChildSources ?? []), ...(this.walkedCatalog?.parents ?? [])],
+      settled.rows.flat(),
       normalizeFsPath,
     );
   }
@@ -13311,15 +13333,46 @@ export class PanelProvider implements vscode.Disposable {
       [...(this.walkedChildSources ?? []), ...walk.parents].map((row) => [normalizeFsPath(row.file), row]),
     );
     const records = new Map(this.lifetimeDisplayFiles().map((record) => [normalizeWorkspace(record.file), record]));
+    // Each child file that the census or the Codex walk lists, with the file of its parent. The census lists the children of
+    // a Claude parent in `<session id>/subagents` beside its transcript, and nested children beside their own parent.
+    const subagentParents = new Map(
+      walk.parents
+        .filter((row) => row.agent === 'claude' && row.childTranscript !== true)
+        .map((row) => [normalizeFsPath(path.join(path.dirname(row.file), row.sessionId, 'subagents')), row.file]),
+    );
+    const codexChildren = this.enumeratedSpendSources?.children ?? [];
+    const threads = new Map([
+      ...walk.parents.filter((row) => row.agent === 'codex').map((row): [string, string] => [row.sessionId, row.file]),
+      ...codexChildren.map((child): [string, string] => [child.threadId, child.file]),
+    ]);
+    const children: [string, string | undefined][] = [
+      ...(this.walkedChildSources ?? []).map((row): [string, string | undefined] => [
+        row.file,
+        subagentParents.get(normalizeFsPath(path.dirname(row.file))),
+      ]),
+      ...codexChildren.map((child): [string, string | undefined] => [
+        child.file,
+        child.parentThreadId === null ? undefined : threads.get(child.parentThreadId),
+      ]),
+    ];
     const admitted = admittedSpendSources(
       this.savedSpendSources!,
       normalizeFsPath,
       listed,
       (file) => records.get(normalizeWorkspace(file)) ?? records.get(normalizeSpendFile(file)),
+      children.filter((pair): pair is [string, string] => pair[1] !== undefined),
     );
     if (admitted.changed) this.performanceCounters.recordWork('savedSpendSources:changed', admitted.changed);
     this.performanceCounters.recordWork('savedSpendSources:admitted');
     return admitted.sources;
+  }
+
+  // The lifetime figures that turn cards read. While the saved sources draw the rows, cards read none, as they read none
+  // before the first complete discovery reply.
+  private cardLifetimeFigures(): LifetimeFigures {
+    const figures = this.lifetimeFiguresBySession();
+    if (!this.savedRowSources) return figures;
+    return { stats: {}, costs: {}, contextDetails: {}, cacheExpiryCounts: {}, cacheExpiryFacts: {}, dispatched: {} };
   }
 
   private lifetimeFiguresBySession(): LifetimeFigures {
@@ -13436,7 +13489,7 @@ export class PanelProvider implements vscode.Disposable {
   // Project dispatched costs from cached lifetime contributions. Pending source reads withhold the settled-turn timestamp.
   private dispatchedTurnCosts(): Record<string, Record<string, DispatchedSessionCost>> {
     const out: Record<string, Record<string, DispatchedSessionCost>> = {};
-    for (const [sessionId, contributions] of Object.entries(this.lifetimeFiguresBySession().dispatched)) {
+    for (const [sessionId, contributions] of Object.entries(this.cardLifetimeFigures().dispatched)) {
       out[sessionId] = Object.fromEntries(
         Object.entries(contributions).map(([via, { costs, short, own }]) => {
           const spend = this.dispatchFacts?.get(via)?.spend;
@@ -13477,7 +13530,7 @@ export class PanelProvider implements vscode.Disposable {
     // costs when it redraws.
     let held: ReturnType<typeof this.dispatchedTurnCosts> | undefined;
     const costs = () => (held ??= this.dispatchedTurnCosts());
-    const expiryFacts = this.lifetimeFiguresBySession().cacheExpiryFacts;
+    const expiryFacts = this.cardLifetimeFigures().cacheExpiryFacts;
     const now = Date.now();
     const childCosts = this.childExpiryCosts(
       [...this.turnsByKey.values(), ...this.newestBySession.values()],
@@ -15852,6 +15905,8 @@ export class PanelProvider implements vscode.Disposable {
     this.applyDispatchFacts(progress.dispatchFacts ?? []);
     this.claudeChildren = progress.children;
     this.claudeChildrenDiscovered = true;
+    // The rows stop reading the saved sources at the first complete reply, even when the host then drops the reply.
+    this.savedRowSources = null;
     if (!this.dispatchDiscoveryPending) {
       // A settled reply verifies the links that the first catalog published from the saved set, and replaces the saved set. A
       // reply under other roots verifies nothing that the catalog published and counts nothing. The published child rows keep
@@ -15940,13 +15995,21 @@ export class PanelProvider implements vscode.Disposable {
     };
     this.settledDiscovery = undefined;
     this.updateSessionSpendSources(codex, sessions);
-    if (membersSettled && this.settledSpendSources?.sources !== this.sessionSpendSources) {
-      this.settledSpendSources = {
-        scope: JSON.stringify(this.repositoryScopeRoots),
-        sources: this.sessionSpendSources,
-      };
-      this.savedSpendSources = undefined;
-      this.derivedCacheCheckpointState.markChanged();
+    if (membersSettled) {
+      // The stats of the files come from the rows that this reply settled, and from the walk that it answered.
+      const rows = [this.walkedChildSources ?? [], this.claudeParents ?? [], sessions];
+      const held = this.settledSpendSources;
+      const scope = JSON.stringify(this.repositoryScopeRoots);
+      if (
+        !held ||
+        held.sources !== this.sessionSpendSources ||
+        held.scope !== scope ||
+        held.rows.some((row, at) => row !== rows[at])
+      ) {
+        this.settledSpendSources = { scope, sources: this.sessionSpendSources, rows, saved: false };
+        this.savedSpendSources = undefined;
+        this.derivedCacheCheckpointState.markChanged();
+      }
     }
     if (this.catalog) {
       this.catalog = { ...this.catalog, sessions };
@@ -18993,7 +19056,7 @@ export class PanelProvider implements vscode.Disposable {
     const dispatchedCosts = () => (batchCosts ??= this.dispatchedTurnCosts());
     // The session cache-expiry facts are also read once for the batch.
     let batchExpiry: ReturnType<typeof this.lifetimeFiguresBySession>['cacheExpiryFacts'] | undefined;
-    const cacheExpiryFacts = () => (batchExpiry ??= this.lifetimeFiguresBySession().cacheExpiryFacts);
+    const cacheExpiryFacts = () => (batchExpiry ??= this.cardLifetimeFigures().cacheExpiryFacts);
     const childCosts = this.childExpiryCosts(listed, cacheExpiryFacts(), now, liveChildren);
     this.drawnOpenChildren = openChildrenKey(liveChildren, this.liveBackgroundCommands(now));
     return listed.map((recordedTurn) => {
@@ -19028,7 +19091,7 @@ export class PanelProvider implements vscode.Disposable {
     dispatchedCosts: () => Readonly<Record<string, Readonly<Record<string, DispatchedSessionCost>>>> = () =>
       this.dispatchedTurnCosts(),
     cacheExpiryFacts: () => Readonly<Record<string, Readonly<CacheExpiryFacts>>> = () =>
-      this.lifetimeFiguresBySession().cacheExpiryFacts,
+      this.cardLifetimeFigures().cacheExpiryFacts,
     childCosts?: ReadonlyMap<string, ChildExpiryCost>,
   ): RenderCard {
     const activeTurn = latest ? this.withActivity(recordedTurn) : recordedTurn;
