@@ -1017,7 +1017,7 @@ function waitingPayload(): Record<string, unknown> {
     usage: { composer: unknown };
   };
   const live: LivePress = { ...LIVE_PRESS, agent: 'codex', kind: 'compact', text: '' };
-  payload.cards = payload.cards.map((card) => ({ ...card, agent: 'Codex', model: 'gpt-5.6' }));
+  payload.cards = payload.cards.map((card) => ({ ...card, agent: 'Codex', headingAgent: null, model: 'gpt-5.6' }));
   payload.sessions = payload.sessions.map((session) =>
     session.id === 's1' ? { ...session, agent: 'Codex' } : session,
   );

@@ -72,7 +72,7 @@
   "extension/src/exportsite.test.ts": {
     "reason": "The production export bundle must retain complete responses and remove host-only actions from portable output. Preparatory compaction pagination uses the existing export bundle. Static cost figures must preserve captured model names and speed identities. Dispatched cost notes use the source's own tiers and retain unknown own evidence across models. A subagent row's warning sign must survive export.",
     "cases": 44,
-    "matricesSha256": "03550acb708c7b1c77d624af5601b6bd9814779d4012940222ec8a1d9b3b7292"
+    "matricesSha256": "a342392a839cbcc63c4e218ba6483d2896d33072d21b0cde37da2aa2255f8dce"
   },
   "extension/src/gitcommits.test.ts": {
     "reason": "A real fast-forward must retain its reflog details. Verified foreign child commits must retain their repository across cache reload and worktree removal. A removed commit directory must open only in a containing repository that holds the commit.",
