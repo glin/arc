@@ -1138,17 +1138,18 @@ export class ProgressiveWorker {
       });
     }
     this.dispatchSeedThread = this.worker?.threadId ?? null;
-    // A worker thread keeps each reference entry that it receives or writes. It drops the entry of a source whose file is
-    // missing or that leaves the candidates of the epoch. It checks a missing source again before a complete reply. The host
-    // loads saved entries before its first request, and later takes entries only from the replies of its worker. So a thread
-    // that answered a request that carried the entries receives none again. A spend-only request reads no entries.
+    // The host loads saved entries before its first request. A worker thread keeps each entry that it receives or writes, and
+    // the host takes later entries only from that thread's replies. So a thread that answered a request that carried the
+    // entries receives none again. The thread drops the entry of a missing source and of a source that leaves the epoch's
+    // candidates. Before a complete reply, it checks again each file that its epoch recorded as missing, even one that the
+    // walk no longer reaches. A spend-only request reads no entries, so it carries none.
     let sent = request;
     let referenceSeed = false;
     if (request.kind === 'claude-children' && request.referenceEntries) {
-      if (this.worker?.threadId === this.referenceSeedThread) {
+      if (request.spendOnly || this.worker?.threadId === this.referenceSeedThread) {
         const { referenceEntries: _referenceEntries, ...rest } = request;
         sent = rest;
-      } else if (!request.spendOnly) referenceSeed = true;
+      } else referenceSeed = true;
     }
     if (
       request.kind === 'compressed-adopt' ||

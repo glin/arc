@@ -161,6 +161,13 @@ import {
 const agentSpends = new AgentSpendCache();
 const claudeChildSessions = new ClaudeChildSessionCache();
 const claudeChildReferences = new Map<string, ClaudeChildReferenceCacheEntry>();
+// The highest source generation of each reference row that this worker thread received or wrote, by row key. The host
+// refuses a row older than the one it holds. So a row that the worker builds for a source without a held row starts above it.
+const sourceGenerations = new Map<string, number>();
+function noteSourceGeneration(key: string, entry: ClaudeChildReferenceCacheEntry): void {
+  const generation = entry.sourceGeneration ?? 0;
+  if (generation > (sourceGenerations.get(key) ?? 0)) sourceGenerations.set(key, generation);
+}
 // The read cause of each candidate source whose relationship scan started from byte 0 and has not reached its target.
 // Later slices of that scan count their bytes under this cause.
 const relationshipOrigins = new Map<string, 'noEntry' | 'rejected'>();
@@ -268,9 +275,9 @@ function discoverySourceKey(row: SessionFile): string {
 // The parent keys of the current epoch. The worker builds them when an epoch starts and when a root change replaces its
 // parents. The host returns the epoch's own checkpoint, so an adopted checkpoint of the same epoch keeps them.
 let epochParentKeys: { epoch: string | undefined; keys: Set<string> } | null = null;
-// The sources that the worker marked complete in an epoch because their files were missing.
-// The worker checks each one again before a complete reply of that epoch.
-let missingSources: { epoch: string | undefined; keys: Set<string> } | null = null;
+// The files of the sources that the worker marked complete in an epoch because they were missing, by row key.
+// The worker checks each one again before a complete reply of that epoch, whether or not the walk still reaches it.
+let missingSources: { epoch: string | undefined; files: Map<string, string> } | null = null;
 interface ReceiptScan {
   epoch: string | undefined;
   store: DispatchReceipts;
@@ -1009,6 +1016,10 @@ async function execute(
     }
     for (const [file, entry] of request.referenceEntries ?? []) {
       const key = normalizeFsPath(file);
+      noteSourceGeneration(key, entry);
+      // A source that the held epoch recorded as missing stays complete with no row, so its old edges stay out of the walk.
+      const missing = discoveryEpoch && missingSources?.epoch === discoveryEpoch.epoch ? missingSources : null;
+      if (missing?.files.has(key)) continue;
       if (!claudeChildReferences.has(key)) {
         claudeChildReferences.set(key, entry);
       }
@@ -1357,8 +1368,8 @@ async function execute(
           admittedCompletions.add(key);
           completionChanges.set(key, true);
           if (!missingSources || missingSources.epoch !== epoch.epoch)
-            missingSources = { epoch: epoch.epoch, keys: new Set() };
-          missingSources.keys.add(key);
+            missingSources = { epoch: epoch.epoch, files: new Map() };
+          missingSources.files.set(key, parent.file);
           claudeChildReferences.delete(key);
           relationshipOrigins.delete(key);
           epochChildSessions.set(key, null);
@@ -1482,7 +1493,7 @@ async function execute(
           (complete || (parent.agent === 'claude' && reachedTarget && claudeCursor!.offset === scanRevision.size));
         const finished = qualified && reachedTarget && (claudeCursor?.offset ?? cursor!.offset) === scanRevision.size;
         claudeChildReferences.set(key, {
-          sourceGeneration: (held?.sourceGeneration ?? 0) + Number(reset || !held),
+          sourceGeneration: held ? (held.sourceGeneration ?? 0) + Number(reset) : (sourceGenerations.get(key) ?? 0) + 1,
           sequence: (held?.sequence ?? 0) + 1,
           parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
           source: parent.agent,
@@ -1518,6 +1529,7 @@ async function execute(
                 : undefined,
           ...(reset && held ? { resetReason: 'source generation changed' } : {}),
         });
+        noteSourceGeneration(key, claudeChildReferences.get(key)!);
         if (reset) dispatchFacts.delete(parent.file);
         pendingBytes += pendingCharge(claudeChildReferences.get(key)) - pendingCharge(held);
         if (!reachedTarget && claudeCursor && pendingBytes > 64 * 1024 * 1024) epoch.protectedFile ??= key;
@@ -1556,8 +1568,12 @@ async function execute(
       } catch (error) {
         if (charges.readBytes > readsBefore || performance.now() - startedAt >= RELATIONSHIP_SLICE_MS) charges.quanta++;
         incomplete = true;
+        const generation = sourceGenerations.get(key);
         claudeChildReferences.set(key, {
-          ...(held ?? { ...revision, references: [] }),
+          ...(held ??
+            (generation === undefined
+              ? { ...revision, references: [] }
+              : { ...revision, references: [], sourceGeneration: generation + 1 })),
           parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
           source: parent.agent,
           sessionId: parent.sessionId,
@@ -1566,6 +1582,7 @@ async function execute(
           relationshipComplete: false,
           resetReason: error instanceof Error ? error.message : 'Source unavailable',
         });
+        noteSourceGeneration(key, claudeChildReferences.get(key)!);
         completed.delete(key);
         completionChanges.set(key, false);
       }
@@ -1818,16 +1835,16 @@ async function execute(
     // first byte, so the complete reply carries its children.
     if (missingSources && missingSources.epoch === epoch.epoch) {
       let returned = false;
-      for (const key of missingSources.keys) {
-        const parent = candidates.get(key);
-        if (parent && completed.has(key) && checkMissing(parent.file)) continue;
-        missingSources.keys.delete(key);
-        if (!parent || !completed.delete(key)) continue;
+      for (const [key, file] of missingSources.files) {
+        if (completed.has(key) && checkMissing(file)) continue;
+        missingSources.files.delete(key);
+        // A child source that returned resolves again in the next walk.
+        epochChildSessions.delete(key);
+        if (!completed.delete(key)) continue;
         returned = true;
         admittedCompletions.delete(key);
         completionChanges.set(key, false);
         claudeChildReferences.delete(key);
-        epochChildSessions.delete(key);
       }
       if (returned) {
         charges.transcriptPassEnds++;
