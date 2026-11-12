@@ -543,6 +543,37 @@ test('a Claude 5-minute write and a Claude 1-hour write each report their own li
   });
 });
 
+test('an automatic resume 15 minutes after an API error counts as a return to an expired cache', () => {
+  const record = indexed(
+    [
+      claudePrompt(0, 'p1'),
+      claudeResponse(1, { id: 'm1', input: 100, write5m: 4_000 }),
+      JSON.stringify({
+        type: 'assistant',
+        uuid: 'e-1',
+        timestamp: at(2),
+        isApiErrorMessage: true,
+        error: 'server_error',
+        message: {
+          model: '<synthetic>',
+          role: 'assistant',
+          content: [{ type: 'text', text: 'API Error: Unable to connect to API: SSL certificate has expired' }],
+        },
+      }),
+      claudePrompt(17, 'resume'),
+      claudeResponse(17, { id: 'm2', input: 100, write5m: 4_100 }),
+    ],
+    claudeReducer,
+  );
+  assert.deepEqual(summary(record), {
+    counts: { '5m': 1, '30m': 0, '1h': 0 },
+    excluded: 0,
+    unavailable: 0,
+    longestGapMs: 16 * MINUTE,
+    truncated: false,
+  });
+});
+
 test('a 1-hour cache returned to after 59 minutes reports nothing', () => {
   const record = indexed(
     [

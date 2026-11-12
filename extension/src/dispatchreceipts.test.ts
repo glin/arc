@@ -2501,6 +2501,19 @@ test('native failure, input requests and unknown process exit remain distinct', 
     if (mode !== 'failed') assert.equal(event.report, null);
   }
 });
+test('a hosted dispatch names the session whose turn it observed', () => {
+  const { receipts, launch } = fixture();
+  const { host, child } = hosted(receipts, launch.launchId, () => null, { agent: 'claude' });
+  assert.equal(host.hasSession(session), false);
+  host.observe(
+    child,
+    { kind: 'turnEnd', outcome: { status: 'error', text: '', costUsd: null, turns: null, deniedTools: [] } },
+    1,
+  );
+  assert.equal(receipts.status(launch.launchId).events.at(-1)!.outcome, 'failed');
+  assert.equal(host.hasSession(session), true);
+  assert.equal(host.hasSession('bbbbbbbb-1111-2222-3333-444444444444'), false);
+});
 test('wait deadline and disconnection retain the exact worker and receipt', async () => {
   vi.useFakeTimers();
   const { receipts, launch } = fixture('wait');

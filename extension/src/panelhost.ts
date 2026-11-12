@@ -1,5 +1,6 @@
 import { parseLinkDestination, linkBrowserKind, type LinkDestination, type LinkOpening } from './domain/link-path';
 import { commandScope } from './commandcatalog';
+import { RESUME_WINDOW_MS, type ResumeCandidate } from './apierrorresume';
 import { compatibleDiscovery, discoveryCompatibility } from './progressiveworker';
 import { DispatchReceipts, type DispatchStoreRevision } from './dispatchreceipts';
 import {
@@ -2225,6 +2226,7 @@ export class PanelProvider implements vscode.Disposable {
     | null = null;
   // Sends to the named session and returns delivery status. Successful delivery removes submitted comments, while failure retains them for retry.
   // The guarded mode delivers a coordinator's follow-up to the session's retained child and returns its structured result.
+  // A `report` callback receives each failure message in place of an editor notification.
   public onSendPrompt:
     | ((
         agent: string,
@@ -2233,6 +2235,7 @@ export class PanelProvider implements vscode.Disposable {
         prompt: AgentPrompt,
         onSubmitted?: (session: string, turnId: number) => void,
         guarded?: GuardedDelivery,
+        report?: (message: string) => void,
       ) => Promise<PromptDelivery & { guarded?: GuardedSendResult }>)
     | null = null;
   private contextGenerations = new Map<string, number>();
@@ -3366,6 +3369,38 @@ export class PanelProvider implements vscode.Disposable {
 
   public isAgentRunLaunch(session: string): boolean {
     return this.saved.agentRuns?.includes(session) === true;
+  }
+
+  // Claude sessions that `ApiErrorResumer` may resume after an API error. A session qualifies when all of these hold.
+  // It is a Claude main transcript with a recorded working directory, not a native subagent.
+  // It has no dispatching parent, which already received the failed result and can redo the work.
+  // Its transcript changed inside the resume window, and its newest turn failed.
+  // This workspace started it, launched it as an agent run, or recorded a reader prompt to it.
+  // It is not archived, running in this window, or waiting on a question.
+  // It has no queued prompt, prompt in flight, unresolved delivery, or pending control.
+  // No check before the recency check touches a file, so a large catalog costs one pass of field and set reads.
+  public apiErrorCandidates(now = Date.now()): ResumeCandidate[] {
+    if (this.disposed || !this.repositoryScopeReady || !this.catalog) return [];
+    const keys = [...this.running];
+    const edges = this.sessionParentEdgeSet?.edges;
+    const out: ResumeCandidate[] = [];
+    for (const session of this.catalog.sessions) {
+      const id = session.sessionId;
+      if (session.agent !== 'claude' || session.childTranscript || !session.cwd) continue;
+      if (now - session.mtimeMs > RESUME_WINDOW_MS) continue;
+      if (this.sessionOutcomes.get(id)?.error !== true) continue;
+      const relation = edges?.get(id)?.relation;
+      if (relation === 'subagent' || relation === 'dispatched') continue;
+      const owned =
+        this.startedHere.has(id) ||
+        this.saved.agentRuns?.includes(id) === true ||
+        this.saved.prompted?.includes(id) === true;
+      if (!owned || this.hidden.has(id) || sessionRunning(keys, 'claude', id)) continue;
+      if (this.asks.some((entry) => entry.session === id)) continue;
+      if (this.continuationWork(id) === 'pending') continue;
+      out.push({ session: id, cwd: session.cwd, file: session.file, name: this.titleFor(session) ?? id });
+    }
+    return out;
   }
 
   private async curateSessionRequest(request: import('./sessionrequests').SessionRequest): Promise<unknown> {

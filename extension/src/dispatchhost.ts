@@ -66,6 +66,11 @@ export class HostedDispatch {
       observation: '',
     });
   }
+  // Whether a dispatch in this window ran the session. Assignments live in memory, so a reload forgets them.
+  hasSession(session: string): boolean {
+    for (const assignment of this.assignments.values()) if (assignment.session === session) return true;
+    return false;
+  }
   request(origin: string, params: SessionWriteParams, signal: AbortSignal): unknown | Promise<unknown> {
     const id = params.launchId!;
     if (this.receipts.launch(id).origin !== origin) throw new Error('This dispatch belongs to another Arc activation.');

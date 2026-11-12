@@ -1,5 +1,6 @@
 import { type LaunchPolicy, refusePolicyChange } from './launchpolicy';
 import { LaunchPolicyStore } from './launchpolicystore';
+import { ApiErrorResumer } from './apierrorresume';
 import { DispatchReceipts } from './dispatchreceipts';
 import { HostedDispatch } from './dispatchhost';
 import { savedDispatchResponse } from './sessionreads';
@@ -840,10 +841,39 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     if (recovery) host.setRecovery(recovery);
     updateAgentAffordance();
   };
+  const apiErrorResumer = new ApiErrorResumer({
+    // A dispatch in this window excludes its session when discovery lists no dispatching parent for it.
+    candidates: () => panel.apiErrorCandidates().filter((candidate) => !dispatch.hasSession(candidate.session)),
+    // The resumer shows the one notice for a refused resume, so the prompt path reports its failure text instead of showing it.
+    deliver: async (candidate, text) => {
+      let failure = '';
+      const report = (message: string) => {
+        failure = message;
+      };
+      const result = await panel.onSendPrompt?.(
+        'claude',
+        candidate.session,
+        candidate.cwd,
+        { text, assets: [] },
+        undefined,
+        undefined,
+        report,
+      );
+      return { delivered: result?.delivered === true, reason: failure || 'Arc could not open the session.' };
+    },
+    notify: (_candidate, message) => void vscode.window.showWarningMessage(`Arc: ${message}`),
+    now: () => Date.now(),
+    schedule: (callback, delayMs) => {
+      const timer = setTimeout(callback, delayMs);
+      return { dispose: () => clearTimeout(timer) };
+    },
+  });
+  context.subscriptions.push({ dispose: () => apiErrorResumer.dispose() });
   const rowsRefreshed = panel.onSessionRowsRefreshed;
   panel.onSessionRowsRefreshed = () => {
     rowsRefreshed?.();
     updateAgentAffordance();
+    void apiErrorResumer.check();
   };
 
   const workspaceCwd = (): string | null => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? null;
@@ -1887,6 +1917,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     prompt,
     onSubmitted,
     guarded?: GuardedDelivery,
+    report?: (message: string) => void,
   ): Promise<PromptDelivery & { guarded?: GuardedSendResult }> => {
     if (guarded) {
       // Guarded delivery mode. It requires the recorded child and never reopens, resumes, forks, or shows a dialog.
@@ -1898,22 +1929,28 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       return { delivered: result.status === 'accepted', reason: result.reason, guarded: result };
     }
     try {
-      const turnId = await withExistingSessionActivity(agent as AgentName, sessionId, cwd, async (session) => {
-        validateResolvedPromptAssets(prompt.assets);
-        // Retain prompt text until the child accepts the turn. The returned promise reports protocol refusals to the retained card.
-        return await promptAsReader(
-          compaction,
-          session,
-          (submitted, received) =>
-            session.prompt(
-              readerPrompt(compaction, sessionId, prompt),
-              submitted,
-              recoveryPrompts.get(prompt),
-              received,
-            ),
-          (turnId) => onSubmitted?.(session.state().sessionId ?? sessionId, turnId),
-        );
-      });
+      const turnId = await withExistingSessionActivity(
+        agent as AgentName,
+        sessionId,
+        cwd,
+        async (session) => {
+          validateResolvedPromptAssets(prompt.assets);
+          // Retain prompt text until the child accepts the turn. The returned promise reports protocol refusals to the retained card.
+          return await promptAsReader(
+            compaction,
+            session,
+            (submitted, received) =>
+              session.prompt(
+                readerPrompt(compaction, sessionId, prompt),
+                submitted,
+                recoveryPrompts.get(prompt),
+                received,
+              ),
+            (turnId) => onSubmitted?.(session.state().sessionId ?? sessionId, turnId),
+          );
+        },
+        report,
+      );
       if (turnId === null) {
         return failedPromptDelivery(agent, new Error('no agent session could be opened'));
       }
@@ -1959,7 +1996,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           }
         }
       }
-      void vscode.window.showErrorMessage(`Arc: ${(error as Error).message}`);
+      if (report) report((error as Error).message);
+      else void vscode.window.showErrorMessage(`Arc: ${(error as Error).message}`);
       return failedPromptDelivery(agent, error);
     }
   };
@@ -2394,9 +2432,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     session: string,
     cwd: string | null,
     work: (session: AgentSession) => Promise<T>,
+    report?: (message: string) => void,
   ): Promise<T | null> => {
     if (!cwd) {
-      void vscode.window.showWarningMessage('Arc: open a folder first. The agent runs in it.');
+      if (report) report('Open a folder first. The agent runs in it.');
+      else void vscode.window.showWarningMessage('Arc: open a folder first. The agent runs in it.');
       return null;
     }
     const existing = host.find(which, session);
@@ -2408,7 +2448,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
     const launch = launchFor(which);
     if (launch.problem) {
-      void vscode.window.showErrorMessage(`Arc: ${launch.problem}`);
+      if (report) report(launch.problem);
+      else void vscode.window.showErrorMessage(`Arc: ${launch.problem}`);
       return null;
     }
     return await host.withSessionActivity(

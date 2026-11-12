@@ -27629,7 +27629,7 @@ test('a prompt goes to the session the composer names, and nowhere else', () => 
   // The send callback returns a PromptDelivery answer.
   sourceMatch(
     panelHostSource,
-    /public onSendPrompt: \|? ?\(\(agent: string, session: string, cwd: string \| null, prompt: AgentPrompt, onSubmitted\?: \(session: string, turnId: number\) => void, guarded\?: GuardedDelivery\) => Promise<PromptDelivery & \{ guarded\?: GuardedSendResult \}>\) \| null/,
+    /public onSendPrompt: \|? ?\(\(agent: string, session: string, cwd: string \| null, prompt: AgentPrompt, onSubmitted\?: \(session: string, turnId: number\) => void, guarded\?: GuardedDelivery, report\?: \(message: string\) => void\) => Promise<PromptDelivery & \{ guarded\?: GuardedSendResult \}>\) \| null/,
     'the send handoff does not have to say whether the prompt went, so the panel cannot wait for it',
   );
   // The host keeps no saved.sent field.
@@ -47252,3 +47252,74 @@ test.each(['relative-home', ''])(
     }
   },
 );
+
+test('automatic resume candidates are idle Claude main sessions of this workspace with a recent failed turn and no pending work', () => {
+  const now = Date.parse('2026-11-11T18:00:00Z');
+  const source = (sessionId: string, extra: Record<string, unknown> = {}) => ({
+    agent: 'claude',
+    sessionId,
+    cwd: `/work/${sessionId}`,
+    file: `/transcripts/${sessionId}.jsonl`,
+    size: 1,
+    mtimeMs: now - 60_000,
+    ...extra,
+  });
+  const sessions = [
+    source('started'),
+    source('agent-run'),
+    source('prompted'),
+    source('codex', { agent: 'codex' }),
+    source('child', { childTranscript: true }),
+    source('no-folder', { cwd: undefined }),
+    source('stale', { mtimeMs: now - 7 * 60 * 60_000 }),
+    source('answered'),
+    source('stranger'),
+    source('dispatched'),
+    source('dispatched-started'),
+    source('dispatched-run'),
+    source('subagent'),
+    source('archived'),
+    source('running'),
+    source('waiting'),
+    source('queued'),
+  ];
+  const ids = sessions.map((session) => session.sessionId);
+  const failed = { startedAt: now - 120_000, endedAt: now - 60_000, finished: true, error: true, interrupted: false };
+  const provider: any = Object.assign(Object.create(PanelProvider.prototype), {
+    disposed: false,
+    repositoryScopeReady: true,
+    catalog: { folders: '[]', sessions },
+    sessionOutcomes: new Map(ids.map((id) => [id, id === 'answered' ? { ...failed, error: false } : failed])),
+    startedHere: new Set(
+      ids.filter((id) => !['agent-run', 'prompted', 'stranger', 'dispatched', 'dispatched-run'].includes(id)),
+    ),
+    saved: { agentRuns: ['agent-run', 'dispatched-run'], prompted: ['prompted'] },
+    sessionParentEdgeSet: {
+      edges: new Map([
+        ['dispatched', { relation: 'dispatched', parent: 'started' }],
+        ['dispatched-started', { relation: 'dispatched', parent: 'started' }],
+        ['dispatched-run', { relation: 'dispatched', parent: 'started' }],
+        ['subagent', { relation: 'subagent', parent: 'started' }],
+      ]),
+    },
+    hidden: new Set(['archived']),
+    running: new Set([runningKey('claude', 'running')]),
+    // A rail filter that selects no rows leaves the running check unchanged.
+    selectionStatusRows: [],
+    sessionRows: [],
+    asks: [{ session: 'waiting' }],
+    queues: { queued: [{ id: 'q1' }] },
+    pendingQueueDrains: new Set(),
+    newDrafts: {},
+    awaitingSessionRecords: {},
+    membershipOf: () => 'present',
+    stateFor: () => null,
+    guardedTargetFacts: () => null,
+    titleFor: (session: { sessionId: string }) => `Title ${session.sessionId}`,
+  });
+  assert.deepEqual(provider.apiErrorCandidates(now), [
+    { session: 'started', cwd: '/work/started', file: '/transcripts/started.jsonl', name: 'Title started' },
+    { session: 'agent-run', cwd: '/work/agent-run', file: '/transcripts/agent-run.jsonl', name: 'Title agent-run' },
+    { session: 'prompted', cwd: '/work/prompted', file: '/transcripts/prompted.jsonl', name: 'Title prompted' },
+  ]);
+});
