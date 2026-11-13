@@ -66,8 +66,8 @@ export interface DerivedTitleEntry {
   metadataWindow?: { whole: boolean; windowBytes: number; exhausted?: boolean; exhaustedRule?: number };
   sourceIdentity?: Pick<FileRevision, 'dev' | 'ino'>;
   starts?: TurnStarts;
-  // The turn starts that a read of an earlier revision of the same file returned. Only the refresh that carried them draws
-  // them. The derived cache does not save them.
+  // The turn starts that a read of an earlier revision of the same file returned. The refresh that carried them drops them
+  // when it ends. The derived cache does not save them.
   heldStarts?: TurnStarts;
   foldedLabel?: string;
   agentRunScan?: AgentRunScan;
@@ -196,9 +196,9 @@ export function carryDerivedTitleFacts(
 }
 
 // Carries the turn starts that a read of the earlier revision returned as held starts while the file grows. An entry with its
-// own starts, a first read, a file that kept its size or shrank, and a replaced source carry none. Without a head key on both
-// entries, as for a Codex rollout, a changed full label carries none. A Codex metadata read takes that label from the first
-// prompt at the head of the file.
+// own starts, a first read, a file that kept its size or shrank, and a replaced source carry none. Both entries need the same
+// known device and inode. Both need the same head key, or, as for a Codex rollout, no head key and the same full label that
+// is not empty. A Codex metadata read takes that label from the first prompt at the head of the file.
 function carryTurnStarts(previous: DerivedTitleEntry | undefined, next: DerivedTitleEntry): DerivedTitleEntry {
   const held = previous?.starts;
   if (
@@ -206,13 +206,25 @@ function carryTurnStarts(previous: DerivedTitleEntry | undefined, next: DerivedT
     !held ||
     next.starts !== undefined ||
     next.size <= previous.size ||
-    replacedMetadataSource(previous, next) ||
+    !sameKnownSource(previous, next) ||
     replacedTranscript(previous, next) ||
-    ((previous.headKey === undefined || next.headKey === undefined) && previous.fullLabel !== next.fullLabel)
+    !keptHead(previous, next)
   ) {
     return withoutHeldStarts(next);
   }
   return { ...next, heldStarts: held };
+}
+
+function sameKnownSource(previous: DerivedTitleEntry, next: DerivedTitleEntry): boolean {
+  const before = previous.sourceIdentity;
+  const after = next.sourceIdentity;
+  return before?.dev != null && before.ino != null && before.dev === after?.dev && before.ino === after.ino;
+}
+
+// Reports whether both entries hold the same head key, or hold no head key and the same full label that is not empty.
+function keptHead(previous: DerivedTitleEntry, next: DerivedTitleEntry): boolean {
+  if (previous.headKey !== undefined || next.headKey !== undefined) return previous.headKey === next.headKey;
+  return !!previous.fullLabel && previous.fullLabel === next.fullLabel;
 }
 
 export function withoutHeldStarts(entry: DerivedTitleEntry): DerivedTitleEntry {

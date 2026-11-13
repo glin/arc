@@ -110,19 +110,25 @@ test('each step of the session list script stays within its recorded counts', as
       watcherEvent(workspace.runningRollout.file);
     });
     // The completion closes the turn of the running rollout with no visible work. The first render keeps the turn start that
-    // the card drew before the completion, and the follow-up render withdraws it. No other card changes.
-    const completionCards = (
-      completionPosts() as { type: string; rail?: { id: string; newestTurnAt: number | null }[] }[]
+    // the card drew before the completion, and the follow-up render withdraws it. No other card changes. Each render
+    // carries only the cards that changed.
+    const completionRenders = (
+      completionPosts() as { type: string; rail?: { id: string; newestTurnAt?: number | null }[] }[]
     )
-      .filter((message) => message.type === 'render')
-      .flatMap((message) => message.rail ?? [])
-      .map((card) => [card.id, card.newestTurnAt !== null]);
+      .filter((message) => message.type === 'render' && message.rail?.length)
+      .map((message) =>
+        message.rail!.map((card) => [
+          card.id,
+          typeof card.newestTurnAt === 'number'
+            ? 'a turn start'
+            : card.newestTurnAt === undefined
+              ? 'no field'
+              : card.newestTurnAt,
+        ]),
+      );
     assert.deepEqual(
-      completionCards,
-      [
-        [workspace.runningRollout.sessionId, true],
-        [workspace.runningRollout.sessionId, false],
-      ],
+      completionRenders,
+      [[[workspace.runningRollout.sessionId, 'a turn start']], [[workspace.runningRollout.sessionId, null]]],
       'the completion did not draw the card of the finished rollout with its turn start, then without it',
     );
     await step('child watcher event', () => {

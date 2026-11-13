@@ -2293,6 +2293,32 @@ test('a grown transcript draws the turn starts of its earlier revision until a r
     undefined,
     'a rollout that changed its first prompt',
   );
+  // A carry needs equal head keys on both entries, or equal full labels that are not empty when neither entry has a head
+  // key. It also needs the same known device and inode on both entries.
+  const withoutHeadKey: DerivedTitleEntry = { ...grown };
+  delete withoutHeadKey.headKey;
+  const withoutIdentity: DerivedTitleEntry = { ...previous };
+  delete withoutIdentity.sourceIdentity;
+  const grownWithoutIdentity: DerivedTitleEntry = { ...grown };
+  delete grownWithoutIdentity.sourceIdentity;
+  const unproven = [
+    [
+      'had no head key and no full label',
+      { ...rollout, label: '', fullLabel: '' },
+      { ...appended, label: '', fullLabel: '' },
+    ],
+    ['gained a head key', rollout, { ...appended, headKey: 'a' }],
+    ['lost its head key', previous, withoutHeadKey],
+    ['had no device or inode before', withoutIdentity, grown],
+    ['has no device or inode now', previous, grownWithoutIdentity],
+  ] as const;
+  assert.deepEqual(
+    unproven.flatMap(([subject, before, after]) =>
+      shownTurnStarts(carryDerivedTitleFacts(before, after)) === undefined ? [] : [subject],
+    ),
+    [],
+    'a transcript without evidence that it kept its prefix carried turn starts',
+  );
   const file = path.join(folder(), 'cache.json');
   saveClaudeCache(file, [['/session.jsonl', carried]]);
   assert.equal(
@@ -2304,9 +2330,10 @@ test('a grown transcript draws the turn starts of its earlier revision until a r
 
 test('a read that confirms carried turn starts or widens its coverage changes no drawn fact', () => {
   const session = { agent: 'claude', size: 40 };
-  const grown: DerivedTitleEntry = { ...title, mtimeMs: 11, size: 40 };
+  const source: DerivedTitleEntry = { ...title, sourceIdentity: { dev: 1, ino: 1 } };
+  const grown: DerivedTitleEntry = { ...source, mtimeMs: 11, size: 40 };
   delete grown.starts;
-  const carried = carryDerivedTitleFacts(title, grown);
+  const carried = carryDerivedTitleFacts(source, grown);
   const confirmed = withRailEnrichment(carried, title.starts!, undefined);
   const drawn = shownTitleFacts(carried, session);
   assert.equal(shownTitleFacts(confirmed, session), drawn, 'a read that found the carried starts');

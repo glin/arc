@@ -11642,6 +11642,8 @@ export class PanelProvider implements vscode.Disposable {
       if (!selectedOnly) {
         this.performanceCounters.recordStartup('catalogReady', performance.now());
       }
+      // A metadata read of this refresh that moves a drawn fact asks for its render.
+      const factsBefore = this.metadataFactsRevision ?? 0;
       // A selection that reads metadata before its render reads it for every listed session, as a catalog refresh does.
       const metadataSources = selectedOnly && !metadataAfterRender ? this.selectionSourcesOf(null, all) : all;
       if (!metadataAfterRender && !(await this.prepareMetadata(metadataSources, generation, controller.signal))) {
@@ -11885,7 +11887,10 @@ export class PanelProvider implements vscode.Disposable {
       if (
         !swept &&
         !refreshWanted({
-          force: force || (this.metadataRevision ?? 0) !== (this.drawnMetadataRevision ?? 0),
+          force:
+            force ||
+            (this.metadataRevision ?? 0) !== (this.drawnMetadataRevision ?? 0) ||
+            (this.metadataFactsRevision ?? 0) !== factsBefore,
           signature,
           lastSignature: this.lastSignature,
           glancedBefore: glanced,

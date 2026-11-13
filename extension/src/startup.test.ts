@@ -26801,6 +26801,7 @@ for (const {
   replaced,
   progressive = false,
   shown = false,
+  lost = false,
   counts: drawn,
   context,
   enrichment,
@@ -26921,6 +26922,16 @@ for (const {
     counts: [undefined, 2],
     enrichment: [null],
   },
+  // The metadata read of the wake fails, so its render draws the entry of the earlier revision. The next poll stores the
+  // new entry with the carried starts and the context that the read found, and that poll draws them without a follow-up.
+  {
+    subject: 'a metadata read that fails draws the new facts in the next poll',
+    earlier: [5, 15],
+    lost: true,
+    counts: [2, 2],
+    context: [false, true],
+    enrichment: [],
+  },
 ] as {
   subject: string;
   earlier: number[];
@@ -26934,6 +26945,7 @@ for (const {
   replaced?: 'grown' | 'same';
   progressive?: boolean;
   shown?: boolean;
+  lost?: boolean;
   counts: (number | undefined)[];
   context?: boolean[];
   enrichment: (string[] | null)[];
@@ -26997,10 +27009,12 @@ for (const {
       // Each step runs the timers due and the work they release. The step bound is the test's deadline.
       for (let step = 0; step < 500 && !quiet(); step++) await vi.advanceTimersByTimeAsync(1);
       assert.deepEqual(requests, ['discovery', 'spend', 'spend', 'spend']);
-      const row = provider.catalog.sessions[0];
+      // The grown session has a known device and inode, which its stored entry and each metadata read record.
+      const row = { ...provider.catalog.sessions[0], dev: 1, ino: 1 };
       provider._showing = shown ? row.sessionId : provider.catalog.sessions[1].sessionId;
       provider.titles.set(row.file, {
         ...provider.titles.get(row.file),
+        sourceIdentity: { dev: 1, ino: 1 },
         starts: { starts: earlier, whole: true },
         ...(shrunk ? { size: 30 } : {}),
       });
@@ -27026,6 +27040,7 @@ for (const {
       let moving = moved;
       let failing = fails;
       let replacing = replaced !== undefined;
+      let losing = lost;
       let windows = progressive ? 1 : 0;
       provider.prepareProgressive = () => Promise.resolve(windows-- > 0);
       // The listing and the discovery reply both carry the row at its current revision.
@@ -27064,6 +27079,10 @@ for (const {
         }
         if (request.kind === 'starts') return { generation, revision, value: { kind: 'starts', starts } };
         if (request.kind !== 'metadata') return run(request, generation, signal);
+        if (losing) {
+          losing = false;
+          throw new Error('Session reading failed.');
+        }
         // A read inside a turn finds its context. A read of a new turn finds none, and a wide read finds the context that
         // the tail read of the refresh missed.
         const found =
@@ -27132,6 +27151,16 @@ for (const {
         // The newer refresh: a wake for the grown file, or a refresh of the held catalog.
         if (replaced === 'grown') provider.runPendingWatch({ cause: 'quiet', firstAt: 0, lastAt: 0, firedAt: 0 });
         else provider.refreshFrom('replacing', true, true);
+      }
+      if (lost) {
+        // The wake has ended after its failed metadata read. A poll follows with no other event.
+        const wakeEnded = () => !losing && quiet();
+        for (let step = 0; step < 500 && !wakeEnded(); step++) await vi.advanceTimersByTimeAsync(1);
+        // The poll renders only when the real gate asks for it. The panel accepted every render of the wake, so it has drawn
+        // every dispatch figure.
+        provider.useRefreshGate(refreshWanted);
+        provider.drawnDispatchFiguresRevision = provider.dispatchFiguresRevision;
+        provider.refreshFrom('poll', false, true);
       }
       const settled = () =>
         quiet() &&

@@ -2490,7 +2490,7 @@ test.each([13 * 1024 * 1024, 84_686_045])(
 );
 
 test(
-  'ordinary unchanged refresh retries failed metadata and enriches later sessions',
+  'an unforced refresh retries failed metadata and renders the entry it stores',
   { tags: ['subprocess'] },
   async () => {
     const directory = tempDir('panel-metadata-retry-');
@@ -2522,11 +2522,20 @@ test(
       await fixture.provider.prepareMetadata(sessions, 1, new AbortController().signal);
       assert.equal(fixture.provider.titles.has(files[0]), false, 'a failed tail acquired accepted coverage');
       assert.equal(fixture.provider.titles.has(files[1]), true, 'one metadata failure stopped later work');
-      await PanelProvider.prototype.refresh.call(fixture.provider, false, true);
-      assert.ok(
-        fixture.provider.titles.get(files[0])?.expandedStatsRead,
-        'an unforced refresh stranded retryable metadata behind its unchanged-render decision',
-      );
+      // The fixture holds no render state, so the refresh stops where its render starts.
+      let rendered = false;
+      fixture.provider.evictCache = () => {
+        rendered = true;
+        throw new Error('The render started.');
+      };
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        await PanelProvider.prototype.refresh.call(fixture.provider, false, true);
+      } finally {
+        warn.mockRestore();
+      }
+      assert.ok(fixture.provider.titles.has(files[0]), 'an unforced refresh stranded retryable metadata');
+      assert.ok(rendered, 'an unforced refresh left the entry that its retried metadata read stored undrawn');
     } finally {
       fixture.worker.stop();
       fs.rmSync(directory, { recursive: true, force: true });
