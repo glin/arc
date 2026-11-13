@@ -33380,7 +33380,7 @@ test('selection and accepted worker results avoid unnecessary catalog walks', ()
   assert.equal(
     (
       refresh.match(
-        /this\.refreshFrom\('enrichment', enrichment\.changed, true, enrichment\.stale\.length \? enrichment\.stale : null\);/g,
+        /this\.refreshFrom\('enrichment', (?:enrichment\.)?changed, true, enrichment\.stale\.length \? enrichment\.stale : null\);/g,
       ) ?? []
     ).length,
     2,

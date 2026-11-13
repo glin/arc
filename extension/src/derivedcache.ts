@@ -66,8 +66,8 @@ export interface DerivedTitleEntry {
   metadataWindow?: { whole: boolean; windowBytes: number; exhausted?: boolean; exhaustedRule?: number };
   sourceIdentity?: Pick<FileRevision, 'dev' | 'ino'>;
   starts?: TurnStarts;
-  // The turn starts of an earlier revision of the same file. The session list draws them until `starts` holds a read of this
-  // revision. The derived cache does not save them.
+  // The turn starts that a read of an earlier revision of the same file returned. Only the refresh that carried them draws
+  // them. The derived cache does not save them.
   heldStarts?: TurnStarts;
   foldedLabel?: string;
   agentRunScan?: AgentRunScan;
@@ -195,17 +195,20 @@ export function carryDerivedTitleFacts(
   return previous.heldRevision ? { ...out, heldRevision: previous.heldRevision } : out;
 }
 
-// Carries the turn starts of an earlier revision as held starts while the file only grew. An entry with its own starts, a
-// first read, a shrink and a replaced source carry none.
+// Carries the turn starts that a read of the earlier revision returned as held starts while the file grows. An entry with its
+// own starts, a first read, a file that kept its size or shrank, and a replaced source carry none. Without a head key on both
+// entries, as for a Codex rollout, a changed full label carries none. A Codex metadata read takes that label from the first
+// prompt at the head of the file.
 function carryTurnStarts(previous: DerivedTitleEntry | undefined, next: DerivedTitleEntry): DerivedTitleEntry {
-  const held = previous?.starts ?? previous?.heldStarts;
+  const held = previous?.starts;
   if (
     !previous ||
     !held ||
     next.starts !== undefined ||
-    next.size < previous.size ||
+    next.size <= previous.size ||
     replacedMetadataSource(previous, next) ||
-    replacedTranscript(previous, next)
+    replacedTranscript(previous, next) ||
+    ((previous.headKey === undefined || next.headKey === undefined) && previous.fullLabel !== next.fullLabel)
   ) {
     return withoutHeldStarts(next);
   }

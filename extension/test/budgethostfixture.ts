@@ -308,6 +308,16 @@ function activate(options: { stubReadPasses: boolean; coverage?: boolean }) {
     };
   }
   let receive: (message: unknown) => unknown = () => assert.fail('the panel never attached');
+  // The panel messages since a test called `recordPosts`, until it calls the function that call returned.
+  let recorded: unknown[] | null = null;
+  const recordPosts = () => {
+    const messages: unknown[] = [];
+    recorded = messages;
+    return () => {
+      recorded = null;
+      return messages;
+    };
+  };
   const disposable = { dispose() {} };
   provider.attach({
     active: () => true,
@@ -319,6 +329,7 @@ function activate(options: { stubReadPasses: boolean; coverage?: boolean }) {
       asWebviewUri: (uri: unknown) => uri,
       postMessage: (message: unknown) => {
         countPost(posts, message);
+        recorded?.push(message);
         return Promise.resolve(true);
       },
       onDidReceiveMessage: (listener: typeof receive) => {
@@ -346,7 +357,15 @@ function activate(options: { stubReadPasses: boolean; coverage?: boolean }) {
       if (!provider.dispatchDiscoveryPending && !provider.dispatchSpendPending) advanced++;
     }
   };
-  return { provider, worker, posts, settle, started, receive: (message: unknown) => receive(message) };
+  return {
+    provider,
+    worker,
+    posts,
+    settle,
+    started,
+    recordPosts,
+    receive: (message: unknown) => receive(message),
+  };
 }
 
 // Replaces the workspace that `activate` serves and returns the one it replaced.

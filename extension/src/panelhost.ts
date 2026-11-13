@@ -1893,6 +1893,10 @@ export class PanelProvider implements vscode.Disposable {
   private titles = new Map<string, DerivedTitleEntry>();
   private metadataRevision = 0;
   private drawnMetadataRevision = 0;
+  // Counts metadata reads that stored an entry whose drawn facts differ from the entry before the read.
+  private metadataFactsRevision = 0;
+  // The turn starts that the metadata reads of each refresh carried, by the signal of that refresh and the file.
+  private carriedStarts = new WeakMap<AbortSignal, Map<string, TurnStarts>>();
   // Names retained after cache invalidation until metadata supplies replacements. Only `sessionLabel` reads these fallback names.
   private carriedNames = new Map<string, CarriedName>();
   // Retain short and full Claude names from parsed tails, including titles outside the metadata window.
@@ -12348,9 +12352,12 @@ export class PanelProvider implements vscode.Disposable {
         return;
       }
       // Post an accepted selected window before the next bounded metadata batch.
+      const factsRevision = this.metadataFactsRevision ?? 0;
       if (metadataAfterRender && !(await this.prepareMetadata(all, generation, controller.signal))) {
         return;
       }
+      // The render drew each entry from before these reads, so a read that moved a drawn fact needs a follow-up render.
+      const factsMoved = metadataAfterRender && (this.metadataFactsRevision ?? 0) > factsRevision;
       if (metadataAfterRender) this.performanceCounters?.recordStartup('metadataPrepared', performance.now());
       if (controller.signal.aborted || generation !== this.refreshGeneration) {
         return;
@@ -12367,12 +12374,9 @@ export class PanelProvider implements vscode.Disposable {
       } else {
         const enrichment = await this.prepareRailEnrichment(all, generation, controller.signal);
         this.postSessionLoading(generation, controller.signal);
-        if (
-          (enrichment.changed || enrichment.progress) &&
-          !controller.signal.aborted &&
-          generation === this.refreshGeneration
-        ) {
-          this.refreshFrom('enrichment', enrichment.changed, true, enrichment.stale.length ? enrichment.stale : null);
+        const changed = enrichment.changed || factsMoved;
+        if ((changed || enrichment.progress) && !controller.signal.aborted && generation === this.refreshGeneration) {
+          this.refreshFrom('enrichment', changed, true, enrichment.stale.length ? enrichment.stale : null);
         }
       }
     } catch (error) {
@@ -12383,6 +12387,18 @@ export class PanelProvider implements vscode.Disposable {
       }
       console.warn('Arc: session reading failed.', error);
     } finally {
+      // A refresh that ends before its enrichment pass leaves no turn starts that it carried. An entry that holds the turn
+      // starts of a newer refresh keeps them.
+      const carried = controller && this.carriedStarts?.get(controller.signal);
+      if (carried) {
+        this.carriedStarts.delete(controller!.signal);
+        for (const [file, held] of carried) {
+          const current = this.titles.get(file);
+          if (current?.heldStarts !== held) continue;
+          this.storeTitleEntry(file, withoutHeldStarts(current));
+          this.derivedCacheCheckpointState.markChanged();
+        }
+      }
       this.selectionRows = undefined;
       this.selectionStatusRows = undefined;
       this.selectionOutcomes = undefined;
@@ -16897,6 +16913,12 @@ export class PanelProvider implements vscode.Disposable {
       remaining += unreadHeadBytes(session, entry);
       const carried = carryDerivedTitleFacts(previous, entry, session);
       this.storeTitleEntry(session.file, carried);
+      if (!previous || shownTitleFacts(previous, session) !== shownTitleFacts(carried, session))
+        this.metadataFactsRevision = (this.metadataFactsRevision ?? 0) + 1;
+      if (carried.heldStarts) {
+        const refreshes = (this.carriedStarts ??= new WeakMap());
+        refreshes.set(signal, (refreshes.get(signal) ?? new Map()).set(session.file, carried.heldStarts));
+      }
       // The read's own name replaces the one a version bump carried.
       this.carriedNames.delete(session.file);
       this.observeStoredEntry(session, carried);
@@ -16927,12 +16949,6 @@ export class PanelProvider implements vscode.Disposable {
       stored = true;
       if (shownTitleFacts(before, session) !== shownTitleFacts(after, session)) drawn = true;
     };
-    // A turn-start read that stores no starts of this revision drops the starts of an earlier revision. The session list
-    // then draws what it draws for an entry that holds no starts.
-    const dropHeldStarts = (session: SessionFile) => {
-      const current = this.titles.get(session.file);
-      if (current?.heldStarts !== undefined) store(session, current, withoutHeldStarts(current));
-    };
     for (const session of sessions) {
       if (signal.aborted) {
         break;
@@ -16962,7 +16978,6 @@ export class PanelProvider implements vscode.Disposable {
         // A session that grows during every pass then never holds back the sessions after it.
         if (!result || signal.aborted) {
           if (signal.aborted || generation !== this.refreshGeneration) break;
-          dropHeldStarts(session);
           continue;
         }
         // A read the worker refused before opening the source spent nothing, so its charge returns to the pass.
@@ -16982,11 +16997,9 @@ export class PanelProvider implements vscode.Disposable {
             this.derivedCacheCheckpointState.markChanged();
           }
           if (generation !== this.refreshGeneration) break;
-          dropHeldStarts(session);
           continue;
         }
         if (result.value.kind !== 'starts') {
-          dropHeldStarts(session);
           continue;
         }
         next = withRailEnrichment(next, result.value.starts, result.value.agentRunScan);
@@ -16994,7 +17007,10 @@ export class PanelProvider implements vscode.Disposable {
       }
       if (needsMetadata) {
         const metadataBytes = metadataReadBudget(session, RAIL_ENRICHMENT_READ_BYTES);
-        if (metadataBytes > remaining) continue;
+        if (metadataBytes > remaining) {
+          deferred = true;
+          continue;
+        }
         remaining -= metadataBytes;
         const result = await this.progressiveWorker
           .run(
@@ -17030,6 +17046,21 @@ export class PanelProvider implements vscode.Disposable {
         next = this.observeStoredName(session, next);
       }
       if (JSON.stringify(previous) !== JSON.stringify(next)) store(session, previous, next);
+    }
+    // The turn starts that this refresh carried end with its pass, whether the pass read the session, deferred it, failed to
+    // read it or stopped. The session list then draws what it draws for an entry without turn starts. An entry that holds the
+    // turn starts of a newer refresh keeps them.
+    const carried = this.carriedStarts?.get(signal);
+    this.carriedStarts?.delete(signal);
+    for (const [file, held] of carried ?? []) {
+      const current = this.titles.get(file);
+      if (current?.heldStarts !== held) continue;
+      const session = sessions.find((listed) => listed.file === file);
+      if (session) store(session, current, withoutHeldStarts(current));
+      else {
+        this.storeTitleEntry(file, withoutHeldStarts(current));
+        this.derivedCacheCheckpointState.markChanged();
+      }
     }
     // A follow-up refresh draws a changed fact. It also reads the files that this pass refused and the sessions behind its
     // allowance when the pass stored an entry, so a chain of passes reaches every session.

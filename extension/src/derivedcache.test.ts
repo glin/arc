@@ -2264,19 +2264,35 @@ test('a grown transcript draws the turn starts of its earlier revision until a r
     { starts: true, metadata: false },
     'the carried starts took the place of a read',
   );
+  // Only starts that a read of the earlier revision returned carry. A second growth before that read carries none.
   const again = carryDerivedTitleFacts(carried, { ...grown, mtimeMs: 12, size: 60 });
-  assert.deepEqual(shownTurnStarts(again), title.starts, 'a second growth before the read dropped the carried starts');
+  assert.equal(shownTurnStarts(again), undefined, 'a second growth before the read carried the carried starts again');
   const read = withRailEnrichment(carried, { starts: [10, 30], whole: true }, undefined);
   assert.equal(read.heldStarts, undefined, 'a read of its own kept the carried starts beside it');
   assert.deepEqual(shownTurnStarts(read), { starts: [10, 30], whole: true });
   for (const [subject, next] of [
     ['shrank', { ...grown, size: 4 }],
+    ['kept its size', { ...grown, size: previous.size }],
     ['changed its device or inode', { ...grown, sourceIdentity: { dev: 1, ino: 2 } }],
     ['changed its first record', { ...grown, headKey: 'b' }],
   ] as const) {
-    assert.equal(shownTurnStarts(carryDerivedTitleFacts(carried, next)), undefined, `a transcript that ${subject}`);
+    assert.equal(shownTurnStarts(carryDerivedTitleFacts(previous, next)), undefined, `a transcript that ${subject}`);
   }
   assert.equal(shownTurnStarts(carryDerivedTitleFacts(undefined, grown)), undefined, 'a first read');
+  // A Codex entry has no head key. Each metadata read takes its full label from the first prompt at the head of the file.
+  const rollout: DerivedTitleEntry = { ...title, sourceIdentity: { dev: 1, ino: 1 } };
+  const appended: DerivedTitleEntry = { ...rollout, mtimeMs: 11, size: 40 };
+  delete appended.starts;
+  assert.deepEqual(
+    shownTurnStarts(carryDerivedTitleFacts(rollout, appended)),
+    title.starts,
+    'a rollout that kept its first prompt drew no turn starts',
+  );
+  assert.equal(
+    shownTurnStarts(carryDerivedTitleFacts(rollout, { ...appended, label: 'Another', fullLabel: 'Another' })),
+    undefined,
+    'a rollout that changed its first prompt',
+  );
   const file = path.join(folder(), 'cache.json');
   saveClaudeCache(file, [['/session.jsonl', carried]]);
   assert.equal(

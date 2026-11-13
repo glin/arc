@@ -26786,7 +26786,8 @@ test('an enrichment refresh after a moved file names that file and sends no disc
 
 // A watcher wake of a grown session that no dispatch names reads its metadata again. The new entry draws the turn starts of
 // the earlier revision until the enrichment pass at the end of the refresh reads its own. A follow-up refresh runs only when
-// that pass changes a drawn fact or refuses a file.
+// that pass changes a drawn fact, refuses a file or stops at its allowance. The carried starts end with the refresh that
+// carried them, so every later render draws what an entry without turn starts draws: no unread count.
 for (const {
   subject,
   earlier,
@@ -26796,8 +26797,16 @@ for (const {
   moved = false,
   fails = false,
   shrunk = false,
+  allowance,
+  replaced,
+  progressive = false,
+  shown = false,
   counts: drawn,
+  context,
   enrichment,
+  transcript = shown ? 0 : replaced === 'grown' ? 2 : 1,
+  discovery = shown ? [] : replaced === 'grown' ? ['discovery', 'discovery'] : ['discovery'],
+  entry: settledStarts = { starts: read, whole: true },
 } of [
   { subject: 'an append inside a turn runs one refresh', earlier: [5, 15], counts: [2], enrichment: [] },
   // The wide read of the pass at the end finds no context either, so it changes only its coverage.
@@ -26817,14 +26826,70 @@ for (const {
     counts: [2, 1],
     enrichment: [null],
   },
-  // The failed read drops the carried starts. The follow-up draws the window that the host holds for a session of unknown
-  // membership, and its own read of the turn starts runs one more follow-up.
+  // The failed read drops the carried starts. The follow-up draws no count, and its own read of the turn starts runs one more
+  // follow-up.
   {
     subject: 'a turn start read that fails drops the carried starts',
     earlier: [5, 15],
     fails: true,
+    counts: [2, undefined, 2],
+    enrichment: [null, null],
+  },
+  // Failed reads of a session ahead of the grown one spend the allowance of the pass, so the pass defers the grown session.
+  // The carried starts end with the pass, and the follow-up draws no count.
+  {
+    subject: 'a session behind the allowance draws no carried starts after its refresh',
+    earlier: [5, 15],
+    allowance: 'turn-start',
+    counts: [2, undefined],
+    enrichment: [null],
+    entry: null,
+  },
+  // The pass reads the turn starts and skips the wide metadata read for its allowance. The follow-up reads the context.
+  {
+    subject: 'a wide metadata read behind the allowance runs in a follow-up',
+    earlier: [5, 15],
+    wide: true,
+    allowance: 'metadata',
     counts: [2, 2, 2],
     enrichment: [null, null],
+  },
+  // A newer refresh starts before the pass reads the turn starts. The newer refresh draws no count until its own pass reads
+  // the starts of the current revision, whether the file grows again or not.
+  {
+    subject: 'a refresh that a newer refresh replaces leaves no carried starts to a grown file',
+    earlier: [5, 15],
+    read: [5, 15, 25],
+    replaced: 'grown',
+    counts: [2, undefined, 3],
+    enrichment: [null],
+  },
+  {
+    subject: 'a refresh that a newer refresh replaces leaves no carried starts to an unchanged file',
+    earlier: [5, 15],
+    read: [5, 15, 25],
+    replaced: 'same',
+    counts: [2, undefined, 3],
+    enrichment: [null],
+  },
+  // A selected window that the refresh accepts sends it to a progressive refresh, so its enrichment pass does not run. The
+  // progressive refresh draws no count until its own pass reads the turn starts.
+  {
+    subject: 'a refresh that ends before its enrichment pass leaves no carried starts',
+    earlier: [5, 15],
+    progressive: true,
+    counts: [2, undefined, 2],
+    enrichment: [null],
+  },
+  // A progressive refresh renders the shown session from its earlier entry and reads its metadata after the render. The new
+  // entry moves the drawn context, so a follow-up draws it although the turn starts stay the same.
+  {
+    subject: 'a shown session whose metadata a progressive refresh reads after its render draws the new facts',
+    earlier: [5, 15],
+    shown: true,
+    counts: [2, 2],
+    context: [false, true],
+    enrichment: [null],
   },
   {
     subject: 'an append that opens a turn draws the new turn in one follow-up',
@@ -26839,13 +26904,13 @@ for (const {
     counts: [2, 2],
     enrichment: [null],
   },
-  // The refused read drops the carried starts. The refresh that names the file draws the window that the host holds for a
-  // session of unknown membership, and its own read of the turn starts runs one more follow-up.
+  // The refused read drops the carried starts. The refresh that names the file draws no count, and its own read of the turn
+  // starts runs one more follow-up.
   {
     subject: 'a file that moves during the turn start read keeps its follow-up',
     earlier: [5, 15],
     moved: true,
-    counts: [2, 2, 2],
+    counts: [2, undefined, 2],
     enrichment: [['claude.jsonl'], null],
   },
   // A file that shrank carries no starts, so its first render draws no count of the earlier revision.
@@ -26865,8 +26930,16 @@ for (const {
   moved?: boolean;
   fails?: boolean;
   shrunk?: boolean;
+  allowance?: 'turn-start' | 'metadata';
+  replaced?: 'grown' | 'same';
+  progressive?: boolean;
+  shown?: boolean;
   counts: (number | undefined)[];
+  context?: boolean[];
   enrichment: (string[] | null)[];
+  transcript?: number;
+  discovery?: string[];
+  entry?: { starts: number[]; whole: boolean } | null;
 }[])
   test(`a targeted wake of a grown unselected session: ${subject}`, async () => {
     vi.useFakeTimers();
@@ -26904,6 +26977,9 @@ for (const {
           shownTitleFacts,
           shownTurnStarts,
           withoutHeldStarts,
+          // A small allowance stands in for 64 MiB of reads ahead of the grown session.
+          ...(allowance === 'turn-start' ? { INITIAL_RAIL_READ_BYTES: 20 } : {}),
+          ...(allowance === 'metadata' ? { INITIAL_RAIL_READ_BYTES: 30 } : {}),
         },
       });
       // The real enrichment pass replaces the stub of the harness.
@@ -26911,18 +26987,33 @@ for (const {
       provider.carriedNames = new Map();
       provider.readFacts = () => () => null;
       provider.saved = { ...provider.saved, read: [], readTo: {}, since: 0, agentRead: [] };
+      // Discovery settled the membership of every listed session, so the host keeps no window for an unknown one.
+      provider.membershipOf = (sessionId: string) =>
+        provider.catalog.sessions.some((session: { sessionId: string }) => session.sessionId === sessionId)
+          ? 'present'
+          : 'absent';
       const quiet = () => !provider.dispatchSpendPending && requests.length >= 4 && provider.refreshController === null;
       provider.refreshFrom('startup', true);
       // Each step runs the timers due and the work they release. The step bound is the test's deadline.
       for (let step = 0; step < 500 && !quiet(); step++) await vi.advanceTimersByTimeAsync(1);
       assert.deepEqual(requests, ['discovery', 'spend', 'spend', 'spend']);
       const row = provider.catalog.sessions[0];
-      provider._showing = provider.catalog.sessions[1].sessionId;
+      provider._showing = shown ? row.sessionId : provider.catalog.sessions[1].sessionId;
       provider.titles.set(row.file, {
         ...provider.titles.get(row.file),
         starts: { starts: earlier, whole: true },
         ...(shrunk ? { size: 30 } : {}),
       });
+      // A session with newer activity that needs its turn starts goes ahead of the grown session in the pass.
+      const ahead = provider.catalog.sessions[2];
+      if (allowance === 'turn-start') {
+        const entry = { ...provider.titles.get(ahead.file) };
+        delete entry.starts;
+        provider.titles.set(ahead.file, entry);
+        provider.catalog.sessions = provider.catalog.sessions.map((session: { file: string }) =>
+          session.file === ahead.file ? { ...session, activity: 110 } : session,
+        );
+      }
       const grown = { ...row, size: 20, mtimeMs: 20 };
       const starts = { starts: read, whole: true };
       const resolved = {
@@ -26934,6 +27025,16 @@ for (const {
       };
       let moving = moved;
       let failing = fails;
+      let replacing = replaced !== undefined;
+      let windows = progressive ? 1 : 0;
+      provider.prepareProgressive = () => Promise.resolve(windows-- > 0);
+      // The listing and the discovery reply both carry the row at its current revision.
+      const list = (revision: { size: number; mtimeMs: number }) => {
+        provider.catalog.sessions = provider.catalog.sessions.map((session: { file: string }) =>
+          session.file === row.file ? { ...row, ...revision } : session,
+        );
+        provider.partial = provider.catalog.sessions;
+      };
       const run = provider.progressiveWorker.run;
       provider.progressiveWorker.run = async (request: ProgressiveRequest, generation: number, signal: AbortSignal) => {
         if (request.kind === 'claude-children' && !request.spendOnly) {
@@ -26941,8 +27042,17 @@ for (const {
           const reply = await run(request, generation, signal);
           return { ...reply, value: { ...reply.value, continuation: false } };
         }
+        if (allowance === 'turn-start' && request.kind === 'starts' && request.session.file === ahead.file)
+          throw new Error('Session reading failed.');
         if (!('session' in request) || request.session.file !== row.file) return run(request, generation, signal);
         const revision = provider.revisionOf(request.session);
+        if (request.kind === 'starts' && replacing) {
+          // A newer refresh starts before this read returns, so the pass stops at the newer generation.
+          replacing = false;
+          provider.refreshGeneration++;
+          if (replaced === 'grown') list({ size: 30, mtimeMs: 30 });
+          return { generation, revision, value: { kind: 'starts', starts } };
+        }
         if (request.kind === 'starts' && moving) {
           // The worker read a later revision than the one the host holds, so the host refuses the read.
           moving = false;
@@ -26963,15 +27073,15 @@ for (const {
           revision,
           value: {
             kind: 'metadata',
-            coverage: { whole: true, windowBytes: grown.size },
+            coverage: { whole: true, windowBytes: request.session.size },
             entry: {
               sourceIdentity: { dev: revision.dev, ino: revision.ino },
-              mtimeMs: grown.mtimeMs,
-              size: grown.size,
+              mtimeMs: request.session.mtimeMs,
+              size: request.session.size,
               label: 'Session',
               fullLabel: 'Session',
               foldedLabel: 'session',
-              activityMs: grown.mtimeMs,
+              activityMs: request.session.mtimeMs,
               agentRun: false,
               // The tail read of a wide case finds the outcome without its context, so the wide read moves only the context.
               ...(found
@@ -26985,8 +27095,11 @@ for (const {
       };
       // The unread count of the grown session in each session list payload that a render builds from the real count.
       const counts: (number | undefined)[] = [];
+      // The metadata figures of the grown session in each render.
+      const contexts: string[] = [];
       provider.useRailPayload((input: Parameters<typeof railPayload>[0], rows?: ReadonlySet<string | null>) => {
         counts.push(input.counts.get(row.sessionId)?.count);
+        contexts.push(JSON.stringify(input.metadataStats[row.sessionId] ?? []));
         void rows;
         return { rail: [], labels: [], views: [], railFilters: [], stats: {} };
       });
@@ -26996,11 +27109,7 @@ for (const {
         if (provider.refreshReason === 'enrichment') enrichmentPaths.push(provider.targetedRefreshPaths);
         return listed(reuse);
       };
-      // The listing and the discovery reply both carry the grown row.
-      provider.catalog.sessions = provider.catalog.sessions.map((session: { file: string }) =>
-        session.file === row.file ? grown : session,
-      );
-      provider.partial = provider.catalog.sessions;
+      list(grown);
       provider.pendingWatch = {
         take: () => ({
           eventCount: 1,
@@ -27014,11 +27123,21 @@ for (const {
         }),
       };
       const before = counters.snapshot();
-      provider.runPendingWatch({ cause: 'quiet', firstAt: 0, lastAt: 0, firedAt: 0 });
+      if (shown) provider.refreshFrom('progressive', true, true, null, true);
+      else provider.runPendingWatch({ cause: 'quiet', firstAt: 0, lastAt: 0, firedAt: 0 });
+      if (replaced) {
+        // The read that the newer refresh replaced has returned, and the replaced refresh has ended.
+        const replacedEnded = () => !replacing && quiet();
+        for (let step = 0; step < 500 && !replacedEnded(); step++) await vi.advanceTimersByTimeAsync(1);
+        // The newer refresh: a wake for the grown file, or a refresh of the held catalog.
+        if (replaced === 'grown') provider.runPendingWatch({ cause: 'quiet', firstAt: 0, lastAt: 0, firedAt: 0 });
+        else provider.refreshFrom('replacing', true, true);
+      }
       const settled = () =>
         quiet() &&
+        counts.length >= drawn.length &&
         enrichmentPaths.length >= enrichment.length &&
-        isDeepStrictEqual(provider.titles.get(row.file)?.starts, starts);
+        isDeepStrictEqual(provider.titles.get(row.file)?.starts ?? null, settledStarts);
       for (let step = 0; step < 500 && !settled(); step++) await vi.advanceTimersByTimeAsync(1);
       const after = counters.snapshot();
       const refreshed = (reason: string) =>
@@ -27026,18 +27145,22 @@ for (const {
       assert.deepEqual(
         {
           counts,
+          ...(context ? { context: contexts.map((one) => one !== '[]') } : {}),
           transcript: refreshed('transcript'),
           enrichment: enrichmentPaths,
-          entry: provider.titles.get(row.file)?.starts,
+          entry: provider.titles.get(row.file)?.starts ?? null,
+          carried: provider.titles.get(row.file)?.heldStarts ?? null,
           requests: requests.slice(4),
           pending: provider.pendingRefresh,
         },
         {
           counts: drawn,
-          transcript: 1,
+          ...(context ? { context } : {}),
+          transcript,
           enrichment,
-          entry: starts,
-          requests: ['discovery'],
+          entry: settledStarts,
+          carried: null,
+          requests: discovery,
           pending: null,
         },
         'the session list did not draw the settled turn starts in the expected refreshes',

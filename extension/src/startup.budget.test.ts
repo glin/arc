@@ -104,10 +104,27 @@ test('each step of the session list script stays within its recorded counts', as
     active = activate({ stubReadPasses: false });
     before = {};
     await step('warm start', () => void active.receive({ type: 'ready' }));
+    const completionPosts = active.recordPosts();
     await step('completion', () => {
       workspace.completeRunningRollout(Date.now());
       watcherEvent(workspace.runningRollout.file);
     });
+    // The completion closes the turn of the running rollout with no visible work. The first render keeps the turn start that
+    // the card drew before the completion, and the follow-up render withdraws it. No other card changes.
+    const completionCards = (
+      completionPosts() as { type: string; rail?: { id: string; newestTurnAt: number | null }[] }[]
+    )
+      .filter((message) => message.type === 'render')
+      .flatMap((message) => message.rail ?? [])
+      .map((card) => [card.id, card.newestTurnAt !== null]);
+    assert.deepEqual(
+      completionCards,
+      [
+        [workspace.runningRollout.sessionId, true],
+        [workspace.runningRollout.sessionId, false],
+      ],
+      'the completion did not draw the card of the finished rollout with its turn start, then without it',
+    );
     await step('child watcher event', () => {
       const child = workspace.children[7];
       workspace.growSource(child, Date.now());
