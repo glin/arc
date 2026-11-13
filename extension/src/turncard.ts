@@ -909,14 +909,22 @@ export function statusOf(turn: Turn | TurnOutcome, isLatest: boolean, now: numbe
 
 // Detects clock-driven status changes for the newest turn in each session.
 // A nonpositive earlier clock means no previous status exists to compare.
-export function statusMoved(turns: Iterable<Turn | TurnOutcome>, was: number, now: number): boolean {
+// `noteQuietLimit` receives the time at which each turn that runs at `was` reaches its quiet limit.
+export function statusMoved(
+  turns: Iterable<Turn | TurnOutcome>,
+  was: number,
+  now: number,
+  noteQuietLimit?: (at: number) => void,
+): boolean {
   if (was <= 0) {
     return false;
   }
   for (const turn of turns) {
-    if (statusOf(turn, true, was) !== statusOf(turn, true, now)) {
+    const before = statusOf(turn, true, was);
+    if (before !== statusOf(turn, true, now)) {
       return true;
     }
+    if (before === 'running' && turn.endedAt > 0) noteQuietLimit?.(turn.endedAt + TURN_QUIET_MS);
   }
   return false;
 }

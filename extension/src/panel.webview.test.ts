@@ -12228,11 +12228,11 @@ test('a session this window started overrides what its transcript suggests', () 
     'the one seam every caller reads takes the transcript guess alone',
   );
 
-  // Refresh must retain the host's startedHere identities.
+  // Refresh must retain the host's startedHere identities. Reading the count of started sessions keeps them.
   const refreshAt = panelHostSource.indexOf('async refresh(');
   sourceDoesNotMatch(
     panelHostSource.slice(refreshAt, panelHostSource.indexOf('private glanceAt(', refreshAt)),
-    /startedHere/,
+    /startedHere(?!\?\.size\b)/,
     'a refresh forgets that this window started the session, so the mark comes back',
   );
 });
@@ -27221,7 +27221,7 @@ test('the glance goes on filling the rail on a refresh where nothing else moved'
   // Pass the retained collection time and current time to statusMoved.
   sourceMatch(
     panelHostSource,
-    /const statusFacts = \[[\s\S]*?this\.newestBySession\.values\(\)[\s\S]*?outcomes[\s\S]*?statusMoved: statusMoved\(statusFacts, this\.collectedAt, now\),/,
+    /const statusFacts = \[[\s\S]*?this\.newestBySession\.values\(\)[\s\S]*?outcomes[\s\S]*?statusMoved: statusMoved\(statusFacts, this\.collectedAt, now(?:, [^()]*)?\),/,
     'the refresh no longer asks whether a parsed or metadata-only turn stopped running, so a dead session keeps the word',
   );
   sourceMatch(

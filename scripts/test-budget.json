@@ -7,7 +7,7 @@
   "hostWork": {
     "poll refresh": {
       "reason": "Host block executions per added listed session stay fixed until a reduction lowers this row.",
-      "budget": 193.06,
+      "budget": 8,
       "margin": 0
     },
     "selection": {

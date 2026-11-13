@@ -32,7 +32,7 @@ import {
 } from './turnview';
 // @module-tag subprocess
 import { sessionStatsFromFacts } from './turncard';
-import { runningKey, sessionRunning, type LivePress } from './composerview';
+import { LIVE_PRESS_LIMIT_MS, runningKey, sessionRunning, type LivePress } from './composerview';
 import { compatibleDiscovery, discoveryCompatibility } from './progressiveworker';
 import { claudeDispatchTranscript } from './turnfixtures';
 import { sessionCoverageMember, sessionPresence, reconcileSessionCollisions } from './sessioncoverage';
@@ -268,6 +268,7 @@ import {
 import {
   groupBySession,
   hasUnsentPrompt,
+  openChildrenKey,
   railCachesOf,
   sessionParentEdgeSet,
   sessionParentIndex,
@@ -338,6 +339,7 @@ import { CommitRepositories } from './commitrepositories';
 import { relativeChangeAt } from './view/time';
 import {
   agentRunAnswer,
+  BACKGROUND_COMMAND_CAP_MS,
   inRailRunningGroup,
   liveBackgroundCommands,
   railCacheMarkOf,
@@ -2525,7 +2527,17 @@ test('the receipt scan counters reach the report as count rows and an older base
 });
 
 test('the counters that name why walks and passes ran reach the measures as report-only rows', () => {
-  const record = { counters: { work: { 'walk:backstop': 7, 'discoveryRequest:walked': 5, catalogWalk: 12 } } };
+  const record = {
+    counters: {
+      work: {
+        'walk:backstop': 7,
+        'discoveryRequest:walked': 5,
+        'poll:quiet': 30,
+        'poll:quietMiss:basis': 2,
+        catalogWalk: 12,
+      },
+    },
+  };
   const measures = holdReading(record, () => ({}))!;
   assert.equal(measures['walk:backstop'], 7);
   assert.equal(measures['discoveryRequest:walked'], 5);
@@ -2538,6 +2550,8 @@ test('the counters that name why walks and passes ran reach the measures as repo
   for (const [name, value] of [
     ['walk:backstop', 7],
     ['discoveryRequest:walked', 5],
+    ['poll:quiet', 30],
+    ['poll:quietMiss:basis', 2],
   ] as const) {
     const row = report.find((measure) => measure.name === name);
     assert.ok(row, `the report has no ${name} row`);
@@ -3136,6 +3150,11 @@ function withCompanionMethods(names: Iterable<string>): string[] {
   if (out.includes('lifetimeFiguresBySession')) out.push('rowSpendSources', 'admitSavedSpendSources');
   if (out.includes('writeDerivedCache')) out.push('spendSourcesFile', 'writeSettledSpendSources');
   if (out.includes('claudeStructuralKey') || out.includes('claudeChildRevisions')) out.push('childParents');
+  if (out.includes('pollCatalog')) out.push('quietPoll', 'quietPollMiss');
+  if (out.includes('refresh')) out.push('quietSnapshot', 'commitQuietBasis');
+  if (out.includes('quietSnapshot') || out.includes('quietPollMiss')) out.push('hostSessionsKey', 'quietSpendInputs');
+  if (['selectionScope', 'recordSelectionBasis', 'quietSnapshot', 'quietPollMiss'].some((name) => out.includes(name)))
+    out.push('basisInputs', 'basisInputMoved');
   const cards = [
     'redrawModelNames',
     'noteActivity',
@@ -3198,7 +3217,6 @@ function harness(pendingRefresh = false, registerRefreshHandler = true, extraMet
     'moveRailGroups',
     'noteRailInstant',
     'noteRailMark',
-    'ownSessionCount',
     'claimCatalogRefresh',
     'releaseCatalogRefresh',
     'drainCompressedRows',
@@ -3473,7 +3491,6 @@ function completeDiscoveryHarness(
     'moveRailGroups',
     'noteRailInstant',
     'noteRailMark',
-    'ownSessionCount',
     'claimCatalogRefresh',
     'releaseCatalogRefresh',
     'drainCompressedRows',
@@ -3624,11 +3641,11 @@ function completeDiscoveryHarness(
     const sessionSettingsForProfile = (profile) => profile;
     const AGENT_NAMES = { claude: 'Claude', codex: 'Codex' }; const DRAFT_SESSION_PREFIX = 'draft:';
     const watchDirs = ${scope.productionWatchDirs ? 'productionWatchDirs' : '() => []'}; const readThreadNames = (_path, names) => names;
-    const codexSessionIndexPath = () => 'index'; const spendFileVersion = () => 'unchanged';
+    const codexSessionIndexPath = () => 'index'; let spendFileVersion = () => 'unchanged';
     let spendSourceSignature = () => ''; let listingSignature = () => 'catalog';
     let projectSpendSourceOfferDue = () => false; const normalizeFsPath = ${scope.productionNormalizeFsPath ? 'productionNormalizeFsPath' : '(value) => value'};
     const trustedListedRevisions = () => new Map(); const sessionStatusOf = () => new Map();
-    let refreshWanted = () => true; const statusMoved = () => false; const openChildrenKey = () => ''; const openChildCounts = () => new Map();
+    let refreshWanted = () => true; let statusMoved = () => false; let openChildrenKey = () => ''; const openChildCounts = () => new Map();
     const agentsWithNewTurns = (seen) => ({ seen, agents: [] }); const drawnSessionCards = (cards) => cards;
     const resumeCommand = () => ''; const formatWhen = ${scope.rowFormatWhen ? 'rowFormatWhen' : "() => ''"}; const formatRelative = ${scope.rowFormatRelative ? 'rowFormatRelative' : "() => ''"};
     let sessionStatsFromFacts = (facts) => facts; const railCacheMarkOf = railCacheMark; const derivedTitleCacheStats = cacheStats;
@@ -3752,6 +3769,8 @@ function completeDiscoveryHarness(
       ${realSelectedWindow ? '' : 'completeSelectedWindow() { return Promise.resolve(); }'}
       sendToHost(_host, message) { this.messages.push(message); return Promise.resolve(); }
       useRefreshGate(gate) { refreshWanted = gate; }
+      useStatusClock(moved, key) { statusMoved = moved; openChildrenKey = key; }
+      useFileVersion(read) { spendFileVersion = read; }
       useSessionStats(build) { sessionStatsFromFacts = build; }
       useListingSignature(sign) { listingSignature = sign; }
       useSpendSignature(sign) { spendSourceSignature = sign; }
@@ -7836,12 +7855,19 @@ test('a refresh shares one live child derivation across cards and session list s
 type RailState = ReturnType<typeof timelineRailState> & { at: number };
 
 // One parent session with one open child written at `writtenAt`. `states` receives each session list state and its clock.
-function liveChildRefresh(now: number, writtenAt: number, states: RailState[]): any {
+function liveChildRefresh(
+  now: number,
+  writtenAt: number,
+  states: RailState[],
+  extraMethods: string[] = [],
+  extraScope: Record<string, unknown> = {},
+): any {
   const provider = completeDiscoveryHarness(
     undefined,
     false,
-    ['liveOpenChildren', 'railStatuses', 'drawTurnCards', 'childExpiryCosts', 'collect'],
+    ['liveOpenChildren', 'railStatuses', 'drawTurnCards', 'childExpiryCosts', 'collect', ...extraMethods],
     {
+      ...extraScope,
       liveTimelineChildren,
       runningSessionsSince,
       newestPerSession,
@@ -7950,6 +7976,211 @@ test('a child that reaches its quiet limit during a refresh leaves the session l
     assert.notEqual(states.at(-1)!.statuses.get('parent'), 'subagents');
   } finally {
     clock.mockRestore();
+  }
+});
+
+// A live child refresh whose parent transcript is a file on disk, with the real refresh gate, the real status clock and a
+// poll over a directory gate that asks for no walk. `poll` moves the clock, polls, and waits for the refresh that it runs.
+function quietChildRefresh(
+  now: number,
+  writtenAt: number,
+  states: RailState[],
+  outcome: object,
+  extraMethods: string[] = [],
+  extraScope: Record<string, unknown> = {},
+) {
+  const provider = liveChildRefresh(
+    now,
+    writtenAt,
+    states,
+    ['pollCatalog', 'liveBackgroundCommands', ...extraMethods],
+    { sessionDirectoryOwners, liveBackgroundCommands, ...extraScope },
+  );
+  const file = path.join(tempDir('quiet-parent-'), 'parent.jsonl');
+  fs.writeFileSync(file, 'x'.repeat(100));
+  Object.assign(provider.partial[0], revisionOf(fs.statSync(file, { bigint: true })), { file });
+  provider.catalog = { folders: 'project\0' + 0, sessions: provider.partial };
+  provider.repositoryScope = { snapshot: () => ({ ready: true, revision: 0, roots: provider.repositoryScopeRoots }) };
+  provider.outcomesFor = () => new Map([['parent', outcome]]);
+  provider.sessionRows = [{ id: 'parent', agentKey: 'claude' }];
+  provider.useRefreshGate(refreshWanted);
+  provider.useStatusClock(cardConsumers.statusMoved, openChildrenKey);
+  const work: Record<string, number> = {};
+  provider.performanceCounters = {
+    ...provider.performanceCounters,
+    recordWork: (name: string, amount = 1) => (work[name] = (work[name] ?? 0) + amount),
+  };
+  provider.pollGate = { stats: 0, decide: async () => ({ kind: 'none' }) };
+  provider.pollDirectories = () => null;
+  provider.watching = true;
+  const started: Promise<void>[] = [];
+  const refresh = provider.refresh;
+  provider.refresh = (...args: unknown[]) => {
+    const run = refresh.apply(provider, args);
+    started.push(run);
+    return run;
+  };
+  const clock = { now };
+  const spy = vi.spyOn(Date, 'now').mockImplementation(() => clock.now);
+  const poll = async (at: number) => {
+    clock.now = at;
+    await provider.pollCatalog();
+    while (started.length) await started.shift();
+  };
+  return { provider, work, poll, clock, restore: () => spy.mockRestore() };
+}
+
+// Draws the parent, records the quiet basis at the first poll, and checks that the second poll stands in for its refresh.
+async function quietAfterTwoPolls(fixture: ReturnType<typeof quietChildRefresh>, now: number): Promise<void> {
+  await fixture.provider.refresh(true);
+  await fixture.poll(now + 1_000);
+  await fixture.poll(now + 2_000);
+  assert.equal(fixture.work['poll:quiet'], 1, 'the second unchanged poll ran a refresh');
+}
+
+test('a running turn that reaches its quiet limit between two polls draws as stopped at the next poll', async () => {
+  const now = 100_000_000;
+  const states: RailState[] = [];
+  const fixture = quietChildRefresh(now, 0, states, { startedAt: now - 100, endedAt: now, finished: false });
+  try {
+    await quietAfterTwoPolls(fixture, now);
+    assert.equal(states.at(-1)!.statuses.get('parent'), 'running');
+    await fixture.poll(now + TURN_QUIET_MS + 1);
+    assert.notEqual(states.at(-1)!.statuses.get('parent'), 'running', 'the stopped session stayed drawn as running');
+    assert.equal(fixture.work['poll:quietMiss:deadline'], 1);
+  } finally {
+    fixture.restore();
+  }
+});
+
+test('a child that reaches its quiet limit between two polls leaves the session list status at the next poll', async () => {
+  const now = 100_000_000;
+  const states: RailState[] = [];
+  const outcome = { startedAt: now - 100, endedAt: now, finished: true, openChildren: ['child'] };
+  const fixture = quietChildRefresh(now, now, states, outcome);
+  try {
+    await quietAfterTwoPolls(fixture, now);
+    assert.equal(states.at(-1)!.statuses.get('parent'), 'subagents');
+    await fixture.poll(now + TURN_QUIET_MS + 1);
+    assert.notEqual(states.at(-1)!.statuses.get('parent'), 'subagents', 'the expired child stayed drawn');
+  } finally {
+    fixture.restore();
+  }
+});
+
+test('a background command that reaches its cap between two polls leaves the session list status at the next poll', async () => {
+  const now = 100_000_000;
+  const states: RailState[] = [];
+  const outcome = {
+    startedAt: now - 100,
+    endedAt: now,
+    finished: true,
+    backgroundCommands: [{ id: 'command', startedAt: now - 50 }],
+  };
+  const fixture = quietChildRefresh(now, 0, states, outcome);
+  try {
+    await quietAfterTwoPolls(fixture, now);
+    assert.equal(states.at(-1)!.statuses.get('parent'), 'background');
+    await fixture.poll(now - 50 + BACKGROUND_COMMAND_CAP_MS);
+    assert.notEqual(states.at(-1)!.statuses.get('parent'), 'background', 'the capped command stayed drawn');
+  } finally {
+    fixture.restore();
+  }
+});
+
+test('a live press keeps every poll refreshing until the refresh at its limit drops it', async () => {
+  const now = 100_000_000;
+  const states: RailState[] = [];
+  const fixture = quietChildRefresh(
+    now,
+    0,
+    states,
+    { startedAt: now - 100, endedAt: now, finished: true },
+    ['dropSpentPresses'],
+    {
+      livePressOver,
+      selectedWindowContainsRecordedTurn,
+      sessionRunning,
+    },
+  );
+  const { provider, poll, work } = fixture;
+  try {
+    provider.newestCompactionBySession = new Map();
+    provider.running = new Set();
+    await quietAfterTwoPolls(fixture, now);
+    const press: LivePress = {
+      sessionId: 'parent',
+      agent: 'claude',
+      kind: 'compact',
+      text: '',
+      at: now + 2_000,
+      reply: '',
+      completed: false,
+      midTurn: false,
+      ran: false,
+      started: false,
+      failed: false,
+      reason: '',
+    };
+    provider.live = { parent: [press] };
+    await poll(now + 3_000);
+    assert.ok(provider.live.parent, 'the press ended before its limit');
+    await poll(now + 2_000 + LIVE_PRESS_LIMIT_MS);
+    assert.equal(provider.live.parent, undefined, 'the press outlived its limit');
+    assert.equal(work['poll:quietMiss:presses'], 2);
+  } finally {
+    fixture.restore();
+  }
+});
+
+test('a held dispatch fact that reaches its refresh time sends its spend-only request at the next poll', async () => {
+  const now = 100_000_000;
+  const states: RailState[] = [];
+  const fixture = quietChildRefresh(now, 0, states, { startedAt: now - 100, endedAt: now, finished: true });
+  const { provider, poll, work } = fixture;
+  try {
+    const row = provider.partial[0];
+    Object.assign(provider, {
+      claudeChildrenDiscovered: true,
+      claudeChildReferences: [{ kind: 'dispatch', file: row.file, sessionId: 'parent', parentSessionId: 'other' }],
+      dispatchFacts: new Map([
+        ['parent', { revision: { size: row.size, mtimeMs: row.mtimeMs }, refreshAt: now + 60_000 }],
+      ]),
+    });
+    await quietAfterTwoPolls(fixture, now);
+    await poll(now + 60_000);
+    assert.equal(work['discoveryRequest:dispatchSpend'], 1, 'the expired fact sent no spend-only request');
+    assert.equal(provider.dispatchSpendPending, true);
+  } finally {
+    fixture.restore();
+  }
+});
+
+test('a child transcript written with no watcher event draws its live child at the next poll', async () => {
+  const now = 100_000_000;
+  const states: RailState[] = [];
+  const child = path.join(tempDir('quiet-child-'), 'child.jsonl');
+  fs.writeFileSync(child, '{}\n');
+  const stale = new Date(now - TURN_QUIET_MS - 10_000);
+  fs.utimesSync(child, stale, stale);
+  const outcome = { startedAt: now - 100, endedAt: now, finished: true, openChildren: ['child'] };
+  const fixture = quietChildRefresh(now, 0, states, outcome, ['claudeChildVersion'], {
+    claudeChildFile: () => child,
+    writeTimeOfVersion,
+  });
+  const { provider, poll, work } = fixture;
+  try {
+    provider.claudeChildren = [];
+    provider.useFileVersion(spendFileVersion);
+    await quietAfterTwoPolls(fixture, now);
+    assert.notEqual(states.at(-1)!.statuses.get('parent'), 'subagents');
+    const written = new Date(now + 2_500);
+    fs.utimesSync(child, written, written);
+    await poll(now + 3_000);
+    assert.equal(states.at(-1)!.statuses.get('parent'), 'subagents', 'the written child stayed undrawn');
+    assert.equal(work['poll:quietMiss:childFiles'], 1);
+  } finally {
+    fixture.restore();
   }
 });
 
@@ -15847,6 +16078,59 @@ test('a new transcript that a watcher walk listed makes no poll walk', async () 
   }
 });
 
+// The quiet poll counters and the poll refreshes that ran.
+function quietPolls(counters: PanelPerformanceCounters): Record<string, number> {
+  const snapshot = counters.snapshot();
+  return {
+    ...Object.fromEntries(Object.entries(snapshot.work).filter(([name]) => name.startsWith('poll:quiet'))),
+    refreshes: snapshot.refreshes.poll?.count ?? 0,
+  };
+}
+
+// A poll walk harness whose refreshes take the exit that renders nothing when the listing, statuses and open children stand,
+// with the parent transcript shown.
+function quietPollHarness() {
+  const harness = pollWalkHarness();
+  const { provider, parent } = harness;
+  provider.useRefreshGate(refreshWanted);
+  provider.useListingSignature(listingSignature);
+  provider.useSpendSignature(spendSourceSignature);
+  provider.useStatusClock(cardConsumers.statusMoved, openChildrenKey);
+  provider.scheduleProjectSpendIndex = () => {};
+  // The harness draws no turn cards, so the drawn key is the key of no open child.
+  provider.drawnOpenChildren = openChildrenKey(new Map());
+  provider.showing = path.basename(parent, '.jsonl');
+  return harness;
+}
+
+test('two unchanged polls after a refresh count one quiet poll and run one refresh', async () => {
+  const { start, poll, counters } = quietPollHarness();
+  try {
+    await start();
+    await poll();
+    await poll();
+    assert.deepEqual(quietPolls(counters), { 'poll:quietMiss:basis': 1, 'poll:quiet': 1, refreshes: 1 });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('a shown transcript that grows with no watcher event lists its new revision at the next poll', async () => {
+  const { start, poll, counters, provider, parent } = quietPollHarness();
+  try {
+    await start();
+    await poll();
+    await poll();
+    fs.appendFileSync(parent, '{"type":"assistant"}\n');
+    await poll();
+    const row = (provider.authoritativeCatalog as SessionFile[]).find((source) => source.file === parent);
+    assert.equal(row?.size, fs.statSync(parent).size, 'the poll kept the revision from before the append');
+    assert.equal(quietPolls(counters)['poll:quietMiss:shownFile'], 1);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 // Discovery that reports progress and never completes, as in a window where discovery has not published. Each request
 // keeps only the accepted rows, as `prepareClaudeChildren` does, and records the parents it was sent.
 function discoveryInProgress(provider: any): SessionFile[][] {
@@ -21105,9 +21389,11 @@ function switchHarness(count: number, scope: Record<string, unknown> = {}): any 
       'evictCache',
       'evictOverBudget',
       'protectedHistorySessions',
+      'pollCatalog',
     ],
     {
       retainedPayloads: true,
+      sessionDirectoryOwners,
       sessionRunningSince,
       liveBackgroundCommands,
       runningSessions,
@@ -21915,6 +22201,202 @@ test('a selection that changes only the shown session computes a fixed number of
       assert.ok((inputs.outcomesFor ?? 0) > 0, 'the selection computed no session');
       assert.equal(inputs.railInputKey ?? 0, 0, 'the selection serializes the session list inputs');
     }
+  } finally {
+    clock.mockRestore();
+  }
+});
+
+// Puts the shown session's transcript on disk, so the poll's check of the shown file finds the row's revision, and polls
+// over a directory gate that asks for no walk. `poll` waits for the refresh that the poll runs.
+function quietSwitch(provider: any): { poll: () => Promise<void>; work: Record<string, number> } {
+  const shown = provider.partial.find((source: any) => source.sessionId === provider.showing);
+  const file = path.join(tempDir('quiet-switch-'), path.basename(shown.file));
+  fs.writeFileSync(file, 'x'.repeat(shown.size));
+  const title = provider.titles.get(shown.file);
+  provider.titles.delete(shown.file);
+  const revision = revisionOf(fs.statSync(file, { bigint: true }));
+  Object.assign(shown, revision, { file });
+  provider.titles.set(file, { ...title, file, size: revision.size, mtimeMs: revision.mtimeMs });
+  provider.catalog = { folders: 'project\0' + 0, sessions: provider.partial };
+  provider.repositoryScope = { snapshot: () => ({ ready: true, revision: 0, roots: provider.repositoryScopeRoots }) };
+  const work: Record<string, number> = {};
+  provider.performanceCounters = {
+    ...provider.performanceCounters,
+    recordWork: (name: string, amount = 1) => (work[name] = (work[name] ?? 0) + amount),
+  };
+  provider.pollGate = { stats: 0, decide: async () => ({ kind: 'none' }) };
+  provider.pollDirectories = () => null;
+  provider.watching = true;
+  const poll = async () => {
+    const before = provider.lastRefresh;
+    await provider.pollCatalog();
+    if (provider.lastRefresh !== before) await provider.lastRefresh;
+  };
+  return { poll, work };
+}
+
+test('a second unchanged poll reads no session input at 2000 and 4000 rows', async () => {
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(new Date(2026, 0, 15, 18, 0).getTime());
+  try {
+    for (const count of [2000, 4000]) {
+      const { provider, inputs } = countedSwitchHarness(count);
+      openSwitchPanel(provider);
+      const { poll, work } = quietSwitch(provider);
+      await provider.refresh(true);
+      await poll();
+      const filesRead = new Set<string>();
+      for (const source of provider.partial) {
+        const file = source.file;
+        Object.defineProperty(source, 'file', {
+          get: () => {
+            filesRead.add(file);
+            return file;
+          },
+        });
+      }
+      for (const key of Object.keys(inputs)) delete inputs[key];
+      await poll();
+      assert.equal(work['poll:quiet'], 1, `the second poll at ${count} rows ran a refresh`);
+      assert.deepEqual(inputs, {}, `the second poll at ${count} rows read session inputs`);
+      assert.ok(filesRead.size <= 1, `the second poll reads ${filesRead.size} listed files among ${count}`);
+    }
+  } finally {
+    clock.mockRestore();
+  }
+});
+
+test('a title entry stored outside a refresh draws at the next poll', async () => {
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(new Date(2026, 0, 15, 18, 0).getTime());
+  try {
+    const provider = switchHarness(3);
+    const panel = openSwitchPanel(provider);
+    const { poll, work } = quietSwitch(provider);
+    await provider.refresh(true);
+    await poll();
+    await poll();
+    assert.equal(work['poll:quiet'], 1, 'the second unchanged poll ran a refresh');
+    const file = provider.partial[1].file;
+    provider.storeTitleEntry(file, {
+      ...provider.titles.get(file),
+      label: 'Stored outside',
+      fullLabel: 'Stored outside',
+      foldedLabel: 'stored outside',
+    });
+    await poll();
+    assert.equal(work['poll:quietMiss:changedSessions'], 1);
+    assert.equal(
+      panel.state.sessions.find((row) => row.id === 'switch-1')?.label,
+      'Stored outside',
+      'the poll left the title from before the store drawn',
+    );
+  } finally {
+    clock.mockRestore();
+  }
+});
+
+// Each writer that moves one input of the quiet basis, with the name that the poll after it counts. Saved links that the
+// session list draws hold the parent edges while a writer replaces the child sources.
+const drawSavedLinks = (provider: any) =>
+  Object.assign(provider, { claudeChildrenDiscovered: false, cachedLinks: { children: [], references: [] } });
+const QUIET_WRITERS: [string, (provider: any) => void, ((provider: any) => void)?][] = [
+  ['refresh', (provider) => (provider.pendingRefresh = { reason: 'waiting', reuseCatalog: true, changedPaths: null })],
+  ['discovery', (provider) => (provider.dispatchSpendPending = true)],
+  ['compressedRows', (provider) => (provider.compressedRowsWaiting = true)],
+  [
+    'folders',
+    (provider) =>
+      (provider.repositoryScope = {
+        snapshot: () => ({ ready: true, revision: 1, roots: provider.repositoryScopeRoots }),
+      }),
+  ],
+  ['listing', (provider) => (provider.catalog = { ...provider.catalog })],
+  ['catalog', (provider) => (provider.authoritativeCatalog = [...provider.authoritativeCatalog])],
+  ['scope', (provider) => (provider.authoritativeCatalogScope = '[]')],
+  ['rows', (provider) => (provider.sessionRows = [...provider.sessionRows])],
+  ['names', (provider) => (provider.threadNames = { ...provider.threadNames, stamp: 'names-1' })],
+  ['parents', (provider) => (provider.codexSubagents = [])],
+  ['spend', (provider) => (provider.lastSpendSourceSignature = 'moved')],
+  [
+    'drafts',
+    (provider) =>
+      (provider.awaitingSessionRecords = { new: { sessionId: 'new', cwd: 'project', createdAt: 1, agent: 'claude' } }),
+  ],
+  ['titles', (provider) => (provider.titles = new Map(provider.titles))],
+  ['compressed', (provider) => provider.compressedFactsRevision++],
+  ['running', (provider) => (provider.running = new Set())],
+  ['asks', (provider) => (provider.asks = [])],
+  ['exits', (provider) => (provider.exitedNow = new Set())],
+  ['children', (provider) => (provider.claudeChildren = []), drawSavedLinks],
+  ['references', (provider) => (provider.claudeChildReferences = []), drawSavedLinks],
+  ['saved', (provider) => (provider.saved = { ...provider.saved })],
+  ['prompted', (provider) => (provider.saved.prompted = ['switch-1'])],
+  ['agentRuns', (provider) => (provider.saved.agentRuns = ['switch-1'])],
+  ['figures', (provider) => provider.dispatchFiguresRevision++],
+  ['ownSessions', (provider) => provider.startedHere.add('switch-1')],
+  ['shown', (provider) => provider.hostSessions.set(provider.hosts[0], 'switch-1')],
+  ['changedSessions', (provider) => provider.noteChangedSession('switch-1.jsonl')],
+  ['metadata', (provider) => provider.metadataFactsRevision++],
+  ['dispatchFacts', (provider) => (provider.dispatchFacts = new Map())],
+  ['spendFacts', (provider) => provider.projectSpendRevision++],
+  ['drawnMetadata', (provider) => (provider.drawnMetadataRevision = -1)],
+  ['drawnFigures', (provider) => (provider.drawnDispatchFiguresRevision = -1)],
+];
+
+test('a poll after a writer moves one input of the quiet basis refreshes and names that input', async () => {
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(new Date(2026, 0, 15, 18, 0).getTime());
+  try {
+    for (const [input, write, prepare] of [
+      ...QUIET_WRITERS,
+      ['clock', () => clock.mockReturnValue(new Date(2026, 0, 15, 17, 0).getTime())] as const,
+    ]) {
+      clock.mockReturnValue(new Date(2026, 0, 15, 18, 0).getTime());
+      const provider = switchHarness(3);
+      openSwitchPanel(provider);
+      provider.hostSessions.set(provider.hosts[0], provider.showing);
+      provider.projectSpendRevision = 0;
+      prepare?.(provider);
+      const { poll, work } = quietSwitch(provider);
+      await provider.refresh(true);
+      await poll();
+      await poll();
+      assert.equal(work['poll:quiet'], 1, `the poll before the ${input} writer ran a refresh`);
+      write(provider);
+      const before = provider.lastRefresh;
+      await provider.pollCatalog();
+      assert.deepEqual(
+        Object.keys(work).filter((name) => name.startsWith('poll:quietMiss:') && name !== 'poll:quietMiss:basis'),
+        [`poll:quietMiss:${input}`],
+        `the ${input} writer`,
+      );
+      assert.ok(
+        provider.lastRefresh !== before || input === 'refresh',
+        `the poll after the ${input} writer ran no refresh`,
+      );
+      await provider.lastRefresh;
+    }
+  } finally {
+    clock.mockRestore();
+  }
+});
+
+test('a title entry stored while a poll refresh waits for its enrichment pass draws at the next poll', async () => {
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(new Date(2026, 0, 15, 18, 0).getTime());
+  try {
+    const provider = switchHarness(3);
+    openSwitchPanel(provider);
+    const { poll, work } = quietSwitch(provider);
+    await provider.refresh(true);
+    const file = provider.partial[2].file;
+    let store = true;
+    provider.prepareRailEnrichment = async () => {
+      if (store) provider.storeTitleEntry(file, { ...provider.titles.get(file), activityMs: Date.now() + 60_000 });
+      store = false;
+      return { changed: false, stale: [], progress: false };
+    };
+    await poll();
+    await poll();
+    assert.equal(work['poll:quiet'], undefined, 'a poll stood in for a refresh over a title stored after its decision');
+    assert.equal(provider.authoritativeCatalog[0].sessionId, 'switch-2', 'the stored activity never moved the row');
   } finally {
     clock.mockRestore();
   }

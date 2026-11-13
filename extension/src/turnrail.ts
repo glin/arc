@@ -631,10 +631,12 @@ export const BACKGROUND_COMMAND_CAP_MS = 60 * 60 * 1000;
 
 // Background command counts by session. Commands count from launch until their end record, bounded by BACKGROUND_COMMAND_CAP_MS.
 // A recorded process end closes every command. An Arc-hosted process exit after the newest turn began does the same.
+// `noteCap` receives the time at which each counted command reaches the cap.
 export function liveBackgroundCommands(
   outcomes: ReadonlyMap<string, TurnOutcome | null>,
   hostExitedAt: ReadonlyMap<string, number>,
   now: number,
+  noteCap?: (at: number) => void,
 ): Map<string, number> {
   const out = new Map<string, number>();
   for (const [id, outcome] of outcomes) {
@@ -645,9 +647,11 @@ export function liveBackgroundCommands(
     if (exited !== undefined && exited >= (outcome.startedAt ?? 0)) {
       continue;
     }
-    const count = outcome.backgroundCommands.filter(
-      (command) => command.startedAt > 0 && now - command.startedAt < BACKGROUND_COMMAND_CAP_MS,
-    ).length;
+    const count = outcome.backgroundCommands.filter((command) => {
+      const counted = command.startedAt > 0 && now - command.startedAt < BACKGROUND_COMMAND_CAP_MS;
+      if (counted && noteCap) noteCap(command.startedAt + BACKGROUND_COMMAND_CAP_MS);
+      return counted;
+    }).length;
     if (count > 0) {
       out.set(id, count);
     }

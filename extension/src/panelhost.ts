@@ -1592,9 +1592,9 @@ interface CachedLinksCatalog {
   readonly sessions: SessionFile[];
 }
 
-// What the last computation of every listed session read, by identity or by value. A selection that finds the same state
-// computes only the sessions in its scope. Every other session keeps the rows, figures and order of that computation.
-interface SelectionBasis {
+// Host state that a computation of every listed session reads, by identity or by value. `basisInputMoved` compares it with the
+// state that the host holds now.
+interface BasisInputs {
   readonly catalog: readonly SessionFile[];
   readonly scope: string;
   readonly rows: readonly { id: string }[];
@@ -1612,16 +1612,44 @@ interface SelectionBasis {
   readonly saved: PanelState;
   readonly prompted: readonly string[] | undefined;
   readonly agentRuns: readonly string[] | undefined;
-  readonly day: string;
-  // The clock of the computation. A selection at an earlier time computes every listed session.
+  // The clock of the computation. A selection or a poll at an earlier time finds the state moved.
   readonly at: number;
-  // The lifetime rail facts that the computation read for its outcomes.
-  readonly lifetime: Readonly<Record<string, SessionRailFacts>> | undefined;
   readonly dispatchPending: boolean;
   readonly figures: number;
+  // The count of sessions that this window started, which the agent-run answer of every row reads.
   readonly ownSessions: number;
+}
+
+// What the last computation of every listed session read, by identity or by value. A selection that finds the same state
+// computes only the sessions in its scope. Every other session keeps the rows, figures and order of that computation.
+interface SelectionBasis extends BasisInputs {
+  readonly day: string;
+  // The lifetime rail facts that the computation read for its outcomes.
+  readonly lifetime: Readonly<Record<string, SessionRailFacts>> | undefined;
   // The sessions whose rows the computation drew as shown.
   readonly shown: ReadonlySet<string>;
+}
+
+// What a refresh of the held catalog read, when it named no path, read no file and asked for no follow-up. A poll that finds
+// the same state and a clock before `until` would take the exit that renders nothing, so it runs no refresh.
+interface QuietBasis {
+  readonly inputs: BasisInputs;
+  // The held catalog, and its row that the poll's refresh checks, which is the first row of the shown session.
+  readonly listing: { folders: string; sessions: SessionFile[] };
+  readonly shownSource: SessionFile | undefined;
+  readonly showing: string | null;
+  readonly hostSessions: string;
+  readonly changed: number;
+  readonly metadata: number;
+  readonly facts: number;
+  readonly dispatchFacts: ReadonlyMap<string, DispatchSessionFacts>;
+  // The inputs of the lifetime rail facts that outcomes read.
+  readonly spend: readonly unknown[];
+  // The version of each child file that the live child check read.
+  readonly childVersions: ReadonlyMap<string, string>;
+  // The earliest time at which a running turn, a live child, a counted background command or a held dispatch fact changes
+  // with no file change.
+  readonly until: number;
 }
 
 export class PanelProvider implements vscode.Disposable {
@@ -2605,6 +2633,12 @@ export class PanelProvider implements vscode.Disposable {
   // Files whose metadata or read window changed, and sessions whose stored name changed, after that computation read them.
   private changedSessionFiles: Set<string> | undefined;
   private changedSessionIds: Set<string> | undefined;
+  // Moves at each note of a changed file or session, so a poll compares the notes since its quiet basis in one step.
+  private changedSessionsRevision = 0;
+  // What the last refresh of the held catalog read, when a poll can stand in for the next one. Every refresh drops it.
+  private quietBasis: QuietBasis | undefined;
+  // Moves at each metadata, turn start, enrichment and recovery read of a session.
+  private sessionReads = 0;
   // The sessions in the running group of the session list order, with the order that `railRows` built.
   private railOrderGroups: { order: readonly string[]; running: number } | undefined;
   // When each listed row changes its age wording or cache mark. A row that a computation builds adds its next instant, from
@@ -4345,7 +4379,7 @@ export class PanelProvider implements vscode.Disposable {
           ? decision.directories.flatMap((directory) => owners(path.join(directory, 'agent.jsonl')) ?? [])
           : [];
       if (files.length) this.refreshFrom('poll:children', false, false, files);
-      else this.refreshFrom('poll', false, true);
+      else if (!this.quietPoll()) this.refreshFrom('poll', false, true);
     } finally {
       if (this.pollInFlight === started) this.pollInFlight = null;
     }
@@ -11275,6 +11309,9 @@ export class PanelProvider implements vscode.Disposable {
     const previousSelection = this.previousSelection;
     const refreshReason = this.refreshReason;
     const targetedRefreshPaths = this.targetedRefreshPaths;
+    // A poll stands in for a refresh only while nothing ran since the refresh that recorded the quiet basis.
+    this.quietBasis = undefined;
+    const readsBefore = this.sessionReads ?? 0;
     // The requesters that a walked discovery request names. A refresh that asked to reuse the held catalog names
     // `replacedFiles` when a held file went missing or changed identity, and its own reason when the held catalog missed.
     let walkReasons = reuseCatalog ? ['replacedFiles'] : (this.refreshWalkReasons ?? [refreshReason]);
@@ -11466,7 +11503,7 @@ export class PanelProvider implements vscode.Disposable {
           walkReasons = [refreshReason];
         }
       }
-      const humanPromptWork = { bytes: 0, sources: 0, reads: 0, unknown: new Set<string>() };
+      const humanPromptWork = { bytes: 0, sources: 0, reads: 0, checks: 0, unknown: new Set<string>() };
       if (
         selectedOnly &&
         this.authoritativeCatalog &&
@@ -11553,11 +11590,13 @@ export class PanelProvider implements vscode.Disposable {
       if (!this.repositoryScopeReady) {
         return;
       }
+      // The first row of the shown session, which the held listing of the next poll's refresh checks again.
+      let shownSource: SessionFile | undefined;
       if (!selectedOnly) {
         const checkedPaths = new Set(
           (targetedRefreshPaths?.length
             ? targetedRefreshPaths
-            : [all.find((session) => session.sessionId === this.showing)?.file].filter(
+            : [(shownSource = all.find((session) => session.sessionId === this.showing))?.file].filter(
                 (file): file is string => file !== undefined,
               )
           ).map(normalizeFsPath),
@@ -11583,6 +11622,19 @@ export class PanelProvider implements vscode.Disposable {
           reuseCatalog = false;
         }
       }
+      // The held catalog of a refresh that listed it as a poll's refresh does: with no walk, no relist, no named path and no
+      // prompt file check. Only such a refresh records a quiet basis.
+      const quietListing =
+        !selectedOnly &&
+        reuseCatalog &&
+        !targetedRefreshPaths?.length &&
+        !deferredWalk.needed &&
+        !primed &&
+        !primedEnumeration &&
+        !codexRelist &&
+        humanPromptWork.checks === 0
+          ? this.catalog
+          : null;
       // A walk keeps recent settled discovery when every compared input matches.
       if (!selectedOnly && !reuseCatalog && this.catalogWalked) {
         const unchanged = await this.walkKeepsDiscovery(this.settledDiscovery);
@@ -11596,6 +11648,8 @@ export class PanelProvider implements vscode.Disposable {
         !selectedOnly && this.claudeChildReferences?.length
           ? new Map(all.map((session) => [session.sessionId, session]))
           : new Map<string, SessionFile>();
+      // The earliest refresh time of a held dispatch fact that has not expired.
+      let dispatchDue = Infinity;
       const dispatchChanged =
         !selectedOnly &&
         this.claudeChildReferences?.some((reference) => {
@@ -11605,6 +11659,7 @@ export class PanelProvider implements vscode.Disposable {
           const session = dispatchCatalog.get(reference.sessionId);
           const held = this.dispatchFacts?.get(reference.sessionId);
           const expired = !!held && held.refreshAt !== null && held.refreshAt <= Date.now();
+          if (held && held.refreshAt !== null && !expired) dispatchDue = Math.min(dispatchDue, held.refreshAt);
           // A member whose row prompt admission excludes has no listed revision to compare. Its expired facts still ask for
           // a spend read.
           if (!session) return expired;
@@ -11916,6 +11971,15 @@ export class PanelProvider implements vscode.Disposable {
       const liveChildren = this.liveOpenChildren(now, outcomes, refreshRows, (at) => {
         childExpiry = Math.min(childExpiry, at);
       });
+      // The child files that this synchronous run checked, with the versions that the live child check read.
+      const childVersions = this.claudeChildVersionsThisRun;
+      // The earliest time at which a live child, a held dispatch fact, a running turn or a counted background command changes
+      // with no file change.
+      let quietUntil = Math.min(childExpiry, dispatchDue);
+      const noteQuietUntil = (at: number) => {
+        quietUntil = Math.min(quietUntil, at);
+      };
+      const collectedBefore = this.collectedAt;
       if (
         !swept &&
         !refreshWanted({
@@ -11927,11 +11991,14 @@ export class PanelProvider implements vscode.Disposable {
           lastSignature: this.lastSignature,
           glancedBefore: glanced,
           glancedNow: this.windows.size,
-          statusMoved: statusMoved(statusFacts, this.collectedAt, now),
+          statusMoved: statusMoved(statusFacts, this.collectedAt, now, quietListing ? noteQuietUntil : undefined),
           dispatchFiguresMoved: this.dispatchFiguresRevision !== this.drawnDispatchFiguresRevision,
           openChildren: {
             drawn: this.drawnOpenChildren,
-            now: openChildrenKey(liveChildren, this.liveBackgroundCommands(now)),
+            now: openChildrenKey(
+              liveChildren,
+              this.liveBackgroundCommands(now, undefined, undefined, quietListing ? noteQuietUntil : undefined),
+            ),
           },
         })
       ) {
@@ -11943,6 +12010,10 @@ export class PanelProvider implements vscode.Disposable {
             this.selectionSources = { ...this.selectionSources, catalog: this.authoritativeCatalog };
           this.selectionBasis = { ...basisBefore, catalog: this.authoritativeCatalog };
         }
+        const quiet =
+          quietListing && !dispatchChanged && !replyHeld
+            ? this.quietSnapshot(quietListing, shownSource, childVersions, quietUntil, now)
+            : undefined;
         if (!selectedOnly) {
           this.performanceCounters.recordRefreshStage('unchanged');
         }
@@ -11959,7 +12030,7 @@ export class PanelProvider implements vscode.Disposable {
             generation === this.refreshGeneration
           ) {
             this.refreshFrom('enrichment', enrichment.changed, true, enrichment.stale.length ? enrichment.stale : null);
-          }
+          } else if (quiet) this.commitQuietBasis(quiet, readsBefore, generation, controller.signal);
         }
         return;
       }
@@ -12388,6 +12459,12 @@ export class PanelProvider implements vscode.Disposable {
       if (selectedOnly) {
         return;
       }
+      let quiet: QuietBasis | undefined;
+      if (quietListing && !dispatchChanged && !replyHeld && !swept && collectedBefore > 0) {
+        // The render drew new turns of the shown sessions, and the next poll compares their status at the render clock.
+        statusMoved(this.newestBySession.values(), this.collectedAt, this.collectedAt, noteQuietUntil);
+        quiet = this.quietSnapshot(quietListing, shownSource, childVersions, quietUntil, now);
+      }
       // Post an accepted selected window before the next bounded metadata batch.
       const factsRevision = this.metadataFactsRevision ?? 0;
       if (metadataAfterRender && !(await this.prepareMetadata(all, generation, controller.signal))) {
@@ -12414,7 +12491,7 @@ export class PanelProvider implements vscode.Disposable {
         const changed = enrichment.changed || factsMoved;
         if ((changed || enrichment.progress) && !controller.signal.aborted && generation === this.refreshGeneration) {
           this.refreshFrom('enrichment', changed, true, enrichment.stale.length ? enrichment.stale : null);
-        }
+        } else if (quiet) this.commitQuietBasis(quiet, readsBefore, generation, controller.signal);
       }
     } catch (error) {
       // A computation that stopped part way leaves no state that a selection can extend.
@@ -12492,31 +12569,10 @@ export class PanelProvider implements vscode.Disposable {
     this.indexSessionRows();
     const rows = this.sessionRowIndex!.byId;
     if (
-      basis.catalog !== catalog ||
-      basis.scope !== this.authoritativeCatalogScope ||
-      basis.scope !== JSON.stringify(this.repositoryScopeRoots) ||
-      basis.rows !== this.sessionRows ||
       rows.size !== this.sessionRows.length ||
       groups.order !== this.railOrder ||
-      basis.names !== this.threadNames.stamp ||
-      basis.parents !== this.sessionParentsOf() ||
-      basis.spend !== this.lastSpendSourceSignature ||
-      basis.drafts !== this.selectionDraftsKey() ||
-      basis.titles !== this.titles ||
-      basis.compressed !== this.compressedFactsRevision ||
-      basis.running !== this.running ||
-      basis.asks !== this.asks ||
-      basis.exits !== this.exitedNow ||
-      basis.children !== this.claudeChildren ||
-      basis.references !== this.claudeChildReferences ||
-      basis.saved !== this.saved ||
-      basis.prompted !== this.saved.prompted ||
-      basis.agentRuns !== this.saved.agentRuns ||
-      basis.dispatchPending !== this.dispatchDiscoveryPending ||
-      basis.figures !== this.dispatchFiguresRevision ||
-      basis.ownSessions !== this.ownSessionCount() ||
-      basis.day !== railWordingDay(now) ||
-      now < basis.at
+      this.basisInputMoved(basis, catalog, now) ||
+      basis.day !== railWordingDay(now)
     )
       return null;
     this.sourcesForSelection(catalog, new Set());
@@ -12608,11 +12664,13 @@ export class PanelProvider implements vscode.Disposable {
   private restoreChangedSessions(taken: { files: Set<string>; ids: Set<string> }): void {
     for (const file of taken.files) this.noteChangedSession(file);
     for (const id of taken.ids) (this.changedSessionIds ??= new Set()).add(id);
+    if (taken.ids.size) this.changedSessionsRevision = (this.changedSessionsRevision ?? 0) + 1;
   }
 
   // A changed metadata entry or read window of `file`, which the next selection computes.
   private noteChangedSession(file: string): void {
     (this.changedSessionFiles ??= new Set()).add(file);
+    this.changedSessionsRevision = (this.changedSessionsRevision ?? 0) + 1;
   }
 
   // Records what this computation of every listed session read. A selection that computes every listed session builds the
@@ -12628,7 +12686,12 @@ export class PanelProvider implements vscode.Disposable {
       for (const [id, mark] of Object.entries(this.metadataRailCaches)) if (mark) instants.push([id, mark.expiresAt]);
       this.railClock = railClockOf(instants);
     }
-    this.selectionBasis = {
+    this.selectionBasis = { ...this.basisInputs(catalog, now), day, lifetime: this.lifetimeRead, shown };
+  }
+
+  // The host state that a computation of every listed session at `at` reads.
+  private basisInputs(catalog: readonly SessionFile[], at: number): BasisInputs {
+    return {
       catalog,
       scope: this.authoritativeCatalogScope ?? '',
       rows: this.sessionRows,
@@ -12646,14 +12709,39 @@ export class PanelProvider implements vscode.Disposable {
       saved: this.saved,
       prompted: this.saved.prompted,
       agentRuns: this.saved.agentRuns,
-      day,
-      at: now,
-      lifetime: this.lifetimeRead,
+      at,
       dispatchPending: this.dispatchDiscoveryPending,
       figures: this.dispatchFiguresRevision,
-      ownSessions: this.ownSessionCount(),
-      shown,
+      ownSessions: this.startedHere?.size ?? 0,
     };
+  }
+
+  // The first input of `basis` that the host state no longer holds, or an empty string when every input stands. A clock
+  // before the computation moves the input `clock`.
+  private basisInputMoved(basis: BasisInputs, catalog: readonly SessionFile[] | null, now: number): string {
+    if (basis.catalog !== catalog) return 'catalog';
+    if (basis.scope !== this.authoritativeCatalogScope || basis.scope !== JSON.stringify(this.repositoryScopeRoots))
+      return 'scope';
+    if (basis.rows !== this.sessionRows) return 'rows';
+    if (basis.names !== this.threadNames.stamp) return 'names';
+    if (basis.parents !== this.sessionParentsOf()) return 'parents';
+    if (basis.spend !== this.lastSpendSourceSignature) return 'spend';
+    if (basis.drafts !== this.selectionDraftsKey()) return 'drafts';
+    if (basis.titles !== this.titles) return 'titles';
+    if (basis.compressed !== this.compressedFactsRevision) return 'compressed';
+    if (basis.running !== this.running) return 'running';
+    if (basis.asks !== this.asks) return 'asks';
+    if (basis.exits !== this.exitedNow) return 'exits';
+    if (basis.children !== this.claudeChildren) return 'children';
+    if (basis.references !== this.claudeChildReferences) return 'references';
+    if (basis.saved !== this.saved) return 'saved';
+    if (basis.prompted !== this.saved.prompted) return 'prompted';
+    if (basis.agentRuns !== this.saved.agentRuns) return 'agentRuns';
+    if (basis.dispatchPending !== this.dispatchDiscoveryPending) return 'dispatchPending';
+    if (basis.figures !== this.dispatchFiguresRevision) return 'figures';
+    if (basis.ownSessions !== (this.startedHere?.size ?? 0)) return 'ownSessions';
+    if (now < basis.at) return 'clock';
+    return '';
   }
 
   // Drops the instants that passed by `now`, and records the sessions now shown. The rows and marks that the selection built
@@ -12673,6 +12761,152 @@ export class PanelProvider implements vscode.Disposable {
     // An instant of a row built again stays until it passes. Past this size the host drops the instants, and the next
     // selection computes every listed session and builds them.
     if (clock.at.length > this.sessionRows.length + 256) this.railClock = null;
+  }
+
+  // What a refresh of the held catalog read, taken where it decides whether to render. It returns nothing when the shown row
+  // that its listing checked no longer belongs to the shown session.
+  private quietSnapshot(
+    listing: { folders: string; sessions: SessionFile[] },
+    shownSource: SessionFile | undefined,
+    childVersions: ReadonlyMap<string, string> | null,
+    until: number,
+    now: number,
+  ): QuietBasis | undefined {
+    const catalog = this.authoritativeCatalog;
+    const showing = this.showing;
+    if (!catalog || (shownSource ? shownSource.sessionId !== showing : showing && !this.newDrafts?.[showing]))
+      return undefined;
+    return {
+      inputs: this.basisInputs(catalog, now),
+      listing,
+      shownSource,
+      showing,
+      hostSessions: this.hostSessionsKey(),
+      changed: this.changedSessionsRevision ?? 0,
+      metadata: this.metadataRevision ?? 0,
+      facts: this.metadataFactsRevision ?? 0,
+      dispatchFacts: this.dispatchFacts,
+      spend: this.quietSpendInputs(),
+      childVersions: new Map(childVersions ?? []),
+      until,
+    };
+  }
+
+  // Keeps the snapshot as the quiet basis when the refresh read no session file and asked for no follow-up. A writer that
+  // moved the state after the snapshot makes the next poll refresh.
+  private commitQuietBasis(snapshot: QuietBasis, readsBefore: number, generation: number, signal: AbortSignal): void {
+    if (
+      signal.aborted ||
+      generation !== this.refreshGeneration ||
+      this.pendingRefresh ||
+      this.selectedRefreshes ||
+      (this.sessionReads ?? 0) !== readsBefore
+    )
+      return;
+    this.quietBasis = snapshot;
+  }
+
+  // The sessions that each panel shows, in panel order.
+  private hostSessionsKey(): string {
+    return JSON.stringify([...(this.hostSessions?.values() ?? [])]);
+  }
+
+  // The inputs of `lifetimeRailFacts`, which outcomes read, by identity or by value.
+  private quietSpendInputs(): unknown[] {
+    return [
+      this.projectSpendFiles,
+      this.projectSpendVisibleFiles,
+      this.projectSpendRevision,
+      this.projectSpendBusy(),
+      this.sessionSpendSources,
+      this.compressedFactsRevision,
+      this.codexMetas?.revision ?? 0,
+    ];
+  }
+
+  // The first input that differs from the quiet basis, or an empty string when a refresh would find the state that the basis
+  // holds and take the exit that renders nothing. The checks read no listed session. File checks run last: the child files
+  // that the live child check read, and the shown session's file.
+  private quietPollMiss(now: number): string {
+    const basis = this.quietBasis;
+    if (!basis) return 'basis';
+    if (
+      this.refreshController ||
+      this.pendingRefresh ||
+      this.selectedRefreshes ||
+      this.codexPriming ||
+      this.codexColdReads ||
+      this.codexColdPass ||
+      this.finishedColdPass
+    )
+      return 'refresh';
+    if (this.dispatchDiscoveryPending || this.dispatchSpendPending || this.discoveryComplete !== undefined)
+      return 'discovery';
+    if (this.compressedRowsDirty?.size || this.compressedRowsWaiting) return 'compressedRows';
+    if (this.automaticCompactions?.size || Object.keys(this.live ?? {}).length) return 'presses';
+    if (now >= basis.until) return 'deadline';
+    // The listing of a poll's refresh starts the same way, and the snapshot keeps the periodic check of repository roots.
+    const folders = this.folders();
+    const scope = this.repositoryScope.snapshot(folders);
+    if (
+      scope.ready !== this.repositoryScopeReady ||
+      JSON.stringify(scope.ready ? scope.roots : []) !== JSON.stringify(this.repositoryScopeRoots) ||
+      `${folders.join('\n')}\0${scope.revision}` !== this.catalog?.folders
+    )
+      return 'folders';
+    this.publishWindowState();
+    this.threadNames = readThreadNames(codexSessionIndexPath(), this.threadNames);
+    if (this.catalog !== basis.listing) return 'listing';
+    const moved = this.basisInputMoved(basis.inputs, this.authoritativeCatalog, now);
+    if (moved) return moved;
+    if (this.showing !== basis.showing || this.hostSessionsKey() !== basis.hostSessions) return 'shown';
+    if ((this.changedSessionsRevision ?? 0) !== basis.changed) return 'changedSessions';
+    if ((this.metadataRevision ?? 0) !== basis.metadata || (this.metadataFactsRevision ?? 0) !== basis.facts)
+      return 'metadata';
+    if (this.dispatchFacts !== basis.dispatchFacts) return 'dispatchFacts';
+    const spend = this.quietSpendInputs();
+    if (spend.some((input, at) => input !== basis.spend[at])) return 'spendFacts';
+    if ((this.metadataRevision ?? 0) !== (this.drawnMetadataRevision ?? 0)) return 'drawnMetadata';
+    if (this.dispatchFiguresRevision !== this.drawnDispatchFiguresRevision) return 'drawnFigures';
+    for (const [file, version] of basis.childVersions)
+      if (this.claudeChildVersion(file) !== version) return 'childFiles';
+    const shown = basis.shownSource;
+    if (shown) {
+      let revision: ReturnType<typeof fileRevisionOf> | null = null;
+      try {
+        revision = fileRevisionOf(fs.statSync(shown.file, { bigint: true }));
+      } catch {
+        // A missing file walks in the refresh.
+      }
+      if (
+        !revision ||
+        String(revision.dev) !== String(shown.dev) ||
+        String(revision.ino) !== String(shown.ino) ||
+        !sameSessionRevision(shown, revision)
+      )
+        return 'shownFile';
+    }
+    return '';
+  }
+
+  // A poll that finds the quiet basis standing runs no refresh. It asks for each shown session's window, runs the session row
+  // hooks and posts the loading line, as the refresh that it replaces does.
+  private quietPoll(): boolean {
+    const miss = this.quietPollMiss(Date.now());
+    if (miss) {
+      this.performanceCounters.recordWork(`poll:quietMiss:${miss}`);
+      return false;
+    }
+    this.performanceCounters.recordWork('poll:quiet');
+    for (const session of new Set([this.showing, ...(this.hostSessions?.values() ?? [])])) {
+      if (session) void this.completeSelectedWindow(session, this.selectionGeneration);
+    }
+    if (this.repositoryScopeReady) this.onSessionRowsRefreshed?.();
+    if (this.repositoryScopeReady) this.onDispatchEvidence?.();
+    if (this.repositoryScopeReady && this.saved.agentRead?.length) this.restoreAgentReads();
+    this.scheduleProjectSpendHydration(this.refreshGeneration);
+    this.postSessionLoading(this.refreshGeneration, new AbortController().signal);
+    return true;
   }
 
   // Adds the instant at which a built row changes its age wording.
@@ -13269,8 +13503,9 @@ export class PanelProvider implements vscode.Disposable {
     now: number,
     outcomes = this.selectionOutcomes ?? this.sessionOutcomes,
     rows: readonly { id: string; agentKey: string }[] = this.selectionStatusRows ?? this.sessionRows,
+    noteCap?: (at: number) => void,
   ): Map<string, number> {
-    return liveBackgroundCommands(outcomes, runningSessionsSince(rows, this.exitedSinceKeys), now);
+    return liveBackgroundCommands(outcomes, runningSessionsSince(rows, this.exitedSinceKeys), now, noteCap);
   }
 
   // Closed children read work timestamps once per changed file version. Open children use held write times. An open
@@ -16678,7 +16913,12 @@ export class PanelProvider implements vscode.Disposable {
     sessions: SessionFile[],
     sizeCurrent: boolean,
     signal: AbortSignal,
-    work = { bytes: 0, sources: 0, reads: 0, unknown: new Set<string>() },
+    work: { bytes: number; sources: number; reads: number; checks?: number; unknown: Set<string> } = {
+      bytes: 0,
+      sources: 0,
+      reads: 0,
+      unknown: new Set<string>(),
+    },
     generation = this.refreshGeneration,
     selectionGeneration?: number,
     settled: 'recheck' | 'skip' = 'recheck',
@@ -16740,6 +16980,7 @@ export class PanelProvider implements vscode.Disposable {
         if (!currentRefresh()) return [];
       }
       work.sources++;
+      if (work.checks !== undefined) work.checks++;
       let previous = this.humanScans.get(session.file);
       let revision;
       this.performanceCounters?.recordWork(`humanPromptStat:${cause}`);
@@ -17233,6 +17474,7 @@ export class PanelProvider implements vscode.Disposable {
     generation: number,
     signal: AbortSignal,
   ): void {
+    this.sessionReads = (this.sessionReads ?? 0) + 1;
     this.sessionReadFailures ??= new Set();
     const key = `${session.file}\0${read}`;
     if (succeeded) {
@@ -17464,8 +17706,10 @@ export class PanelProvider implements vscode.Disposable {
         ),
         entry.withdrawnPrompt,
       )
-    )
+    ) {
       (this.changedSessionIds ??= new Set()).add(session.sessionId);
+      this.changedSessionsRevision = (this.changedSessionsRevision ?? 0) + 1;
+    }
     const held = this.sessionNames.get(session.sessionId);
     return held ? withSessionName(entry, held) : entry;
   }
@@ -17515,6 +17759,7 @@ export class PanelProvider implements vscode.Disposable {
   private storeSessionNames(changed: Iterable<string>, fileOf: (sessionId: string) => SessionFile | undefined): void {
     for (const sessionId of changed) {
       (this.changedSessionIds ??= new Set()).add(sessionId);
+      this.changedSessionsRevision = (this.changedSessionsRevision ?? 0) + 1;
       const session = fileOf(sessionId);
       const name = this.sessionNames.get(sessionId);
       const entry = session && this.titles.get(session.file);
@@ -17565,11 +17810,6 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   private activityHeld?: WeakMap<SessionFile, { entry: DerivedTitleEntry | undefined; value: number }>;
-
-  // The count of sessions that this window started, which the agent-run answer of every row reads.
-  private ownSessionCount(): number {
-    return this.startedHere?.size ?? 0;
-  }
 
   // Apply reader-started and parent ownership to cached agent-run classification without changing the shared metadata fact.
   // A child transcript stays an agent run. A session the reader prompted from the Prompt box is the reader's own.

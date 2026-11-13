@@ -313,8 +313,15 @@ export const OPENING_READ_COUNTERS = [
   'openingsRead:children',
 ] as const;
 
-// The work counters that name why a walk or a discovery pass ran. Each one appears only when the snapshot holds it.
-export const CAUSE_COUNTER_PREFIXES = ['walk:', 'discoveryRequest:', 'acceptedUnsettled', 'compressedNames:'] as const;
+// The work counters that name why a walk or a discovery pass ran, and whether a poll ran a refresh. Each one appears only
+// when the snapshot holds it.
+export const CAUSE_COUNTER_PREFIXES = [
+  'walk:',
+  'discoveryRequest:',
+  'acceptedUnsettled',
+  'compressedNames:',
+  'poll:quiet',
+] as const;
 
 // The discovery counters that name how each receipt scan opened, why relationship reads ran, and how many requests carried
 // the reference entries. A snapshot from a build that does not count one of them holds no value, so the comparison shows
