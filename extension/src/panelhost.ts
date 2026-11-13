@@ -1647,6 +1647,10 @@ interface QuietBasis {
   readonly spend: readonly unknown[];
   // The version of each child file that the live child check read.
   readonly childVersions: ReadonlyMap<string, string>;
+  // The shown rows and the agent stamp of the listing signature. The stamp reads child spend bands from the clock and the
+  // files of nested and Codex children, so a poll computes it again for these rows.
+  readonly agentRows: readonly SessionFile[];
+  readonly agents: string;
   // The earliest time at which a running turn, a live child, a counted background command or a held dispatch fact changes
   // with no file change.
   readonly until: number;
@@ -2659,6 +2663,10 @@ export class PanelProvider implements vscode.Disposable {
         byParent: Map<string, { children: ClaudeChildSessionFile[]; references: ClaudeChildSessionReference[] }>;
       }
     | undefined;
+  // The Codex children of each parent thread, in list order, for the list that `codexSubagents` held when it was built.
+  private codexChildIndex:
+    | { children: readonly CodexSubagentFile[]; byParent: Map<string | null, CodexSubagentFile[]> }
+    | undefined;
   // Pending-source state used by the last session-list payload. A selection render can advance the figure cache independently.
   private railPendingAnswers: SpendPendingAnswers | null = null;
   // Selection render that owes a session-list update. A skipped save update is posted when that render settles without supplying it.
@@ -3042,13 +3050,15 @@ export class PanelProvider implements vscode.Disposable {
   private restoreAgentReads(): void {
     if (this.restoringReadSources || !this.saved.agentRead?.length) return;
     const sessions = new Set(this.saved.agentRead.map((record) => record.sessionId));
+    // The index of the authoritative catalog by session finds the sources of the acknowledged sessions without a pass over
+    // every listed session.
+    const catalog = this.authoritativeCatalog;
     const signature = JSON.stringify([
       this.saved.agentRead,
       this.readScopeKey(),
       this.authoritativeCatalogScope,
-      this.authoritativeCatalog
-        ?.filter((source) => sessions.has(source.sessionId))
-        .map((source) => [
+      catalog &&
+        this.sourcesForSelection(catalog, sessions).map((source) => [
           source.agent,
           source.sessionId,
           source.file,
@@ -4337,8 +4347,9 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   // A poll walks the catalog only when no walk runs, and a directory the last walk enumerated moved or the backstop is due.
-  // A moved `subagents` directory revalidates the session that owns it, and that refresh sends child discovery. Any other poll
-  // refreshes from the held catalog, which revalidates the selected session and redraws.
+  // A moved `subagents` directory revalidates the session that owns it, and that refresh sends child discovery. A poll that
+  // finds the quiet basis standing runs no refresh. Any other poll refreshes from the held catalog, which revalidates the
+  // selected session and redraws.
   private async pollCatalog(): Promise<void> {
     if (this.settleCompressedSpend()) this.postRail(true, 'compressedSpend', undefined, false);
     if (this.pollInFlight) {
@@ -11980,6 +11991,9 @@ export class PanelProvider implements vscode.Disposable {
         quietUntil = Math.min(quietUntil, at);
       };
       const collectedBefore = this.collectedAt;
+      // The comparison stops at the first turn whose status moved, so its limits cover every turn only when nothing moved.
+      const statusChanged =
+        !swept && statusMoved(statusFacts, this.collectedAt, now, quietListing ? noteQuietUntil : undefined);
       if (
         !swept &&
         !refreshWanted({
@@ -11991,7 +12005,7 @@ export class PanelProvider implements vscode.Disposable {
           lastSignature: this.lastSignature,
           glancedBefore: glanced,
           glancedNow: this.windows.size,
-          statusMoved: statusMoved(statusFacts, this.collectedAt, now, quietListing ? noteQuietUntil : undefined),
+          statusMoved: statusChanged,
           dispatchFiguresMoved: this.dispatchFiguresRevision !== this.drawnDispatchFiguresRevision,
           openChildren: {
             drawn: this.drawnOpenChildren,
@@ -12012,7 +12026,14 @@ export class PanelProvider implements vscode.Disposable {
         }
         const quiet =
           quietListing && !dispatchChanged && !replyHeld
-            ? this.quietSnapshot(quietListing, shownSource, childVersions, quietUntil, now)
+            ? this.quietSnapshot(
+                quietListing,
+                shownSource,
+                childVersions,
+                { rows: sessions, stamp: children },
+                quietUntil,
+                now,
+              )
             : undefined;
         if (!selectedOnly) {
           this.performanceCounters.recordRefreshStage('unchanged');
@@ -12044,6 +12065,7 @@ export class PanelProvider implements vscode.Disposable {
           (sessionId) => index.byId.get(sessionId)?.[0],
         );
       } else this.evictCache(sessions, all);
+      const newestBefore = this.newestBySession;
       this.cards = this.collect(
         sessions.filter((session) => this.cache.has(session.file)),
         now,
@@ -12460,10 +12482,24 @@ export class PanelProvider implements vscode.Disposable {
         return;
       }
       let quiet: QuietBasis | undefined;
-      if (quietListing && !dispatchChanged && !replyHeld && !swept && collectedBefore > 0) {
-        // The render drew new turns of the shown sessions, and the next poll compares their status at the render clock.
-        statusMoved(this.newestBySession.values(), this.collectedAt, this.collectedAt, noteQuietUntil);
-        quiet = this.quietSnapshot(quietListing, shownSource, childVersions, quietUntil, now);
+      if (quietListing && !dispatchChanged && !replyHeld && !swept && !statusChanged && collectedBefore > 0) {
+        // The next refresh compares the newest drawn turns and the outcomes of every other session at the render clock. The
+        // comparison before the render noted the outcomes of the sessions that no render drew. It noted the sessions that this
+        // render stopped drawing by their drawn turns, so their outcomes join the drawn turns here. After a status that
+        // moved, the comparison noted only some turns, so the next poll refreshes.
+        const undrawn = [...newestBefore.keys()].flatMap((id) => {
+          const outcome = this.newestBySession.has(id) ? null : outcomes.get(id);
+          return outcome ? [outcome] : [];
+        });
+        statusMoved([...this.newestBySession.values(), ...undrawn], this.collectedAt, this.collectedAt, noteQuietUntil);
+        quiet = this.quietSnapshot(
+          quietListing,
+          shownSource,
+          childVersions,
+          { rows: sessions, stamp: children },
+          quietUntil,
+          now,
+        );
       }
       // Post an accepted selected window before the next bounded metadata batch.
       const factsRevision = this.metadataFactsRevision ?? 0;
@@ -12769,6 +12805,7 @@ export class PanelProvider implements vscode.Disposable {
     listing: { folders: string; sessions: SessionFile[] },
     shownSource: SessionFile | undefined,
     childVersions: ReadonlyMap<string, string> | null,
+    agents: { rows: readonly SessionFile[]; stamp: string },
     until: number,
     now: number,
   ): QuietBasis | undefined {
@@ -12788,6 +12825,8 @@ export class PanelProvider implements vscode.Disposable {
       dispatchFacts: this.dispatchFacts,
       spend: this.quietSpendInputs(),
       childVersions: new Map(childVersions ?? []),
+      agentRows: agents.rows,
+      agents: agents.stamp,
       until,
     };
   }
@@ -12826,7 +12865,7 @@ export class PanelProvider implements vscode.Disposable {
 
   // The first input that differs from the quiet basis, or an empty string when a refresh would find the state that the basis
   // holds and take the exit that renders nothing. The checks read no listed session. File checks run last: the child files
-  // that the live child check read, and the shown session's file.
+  // that the live child check read, the agent stamp of the shown rows, and the shown session's file.
   private quietPollMiss(now: number): string {
     const basis = this.quietBasis;
     if (!basis) return 'basis';
@@ -12870,6 +12909,7 @@ export class PanelProvider implements vscode.Disposable {
     if (this.dispatchFiguresRevision !== this.drawnDispatchFiguresRevision) return 'drawnFigures';
     for (const [file, version] of basis.childVersions)
       if (this.claudeChildVersion(file) !== version) return 'childFiles';
+    if (this.agentListingStamp(basis.agentRows) !== basis.agents) return 'shownAgents';
     const shown = basis.shownSource;
     if (shown) {
       let revision: ReturnType<typeof fileRevisionOf> | null = null;
@@ -18954,15 +18994,25 @@ export class PanelProvider implements vscode.Disposable {
 
   private agentFile(session: SessionFile, agent: AgentSpendRef, metas: ClaudeSubagentMetaReader): string | null {
     if (session.agent === 'claude') {
-      return claudeChildFileFor(this.claudeChildReferences, session, agent, metas);
+      // Only the references of this parent can match its agent.
+      return claudeChildFileFor(this.childParents().get(session.sessionId)?.references ?? [], session, agent, metas);
     }
     return codexSubagentFor(this.codexSubagents, session.sessionId, agent)?.file ?? null;
   }
 
-  private codexStructuralChildren(session: SessionFile): CodexSubagentFile[] {
-    return session.agent === 'codex'
-      ? this.codexSubagents.filter((child) => child.parentThreadId === session.sessionId)
-      : [];
+  private codexStructuralChildren(session: SessionFile): readonly CodexSubagentFile[] {
+    if (session.agent !== 'codex') return [];
+    const children = this.codexSubagents;
+    if (this.codexChildIndex?.children !== children) {
+      const byParent = new Map<string | null, CodexSubagentFile[]>();
+      for (const child of children) {
+        const rows = byParent.get(child.parentThreadId);
+        if (rows) rows.push(child);
+        else byParent.set(child.parentThreadId, [child]);
+      }
+      this.codexChildIndex = { children, byParent };
+    }
+    return this.codexChildIndex.byParent.get(session.sessionId) ?? [];
   }
 
   // Key Codex child relationships without file revisions. `agentSpendKey` refreshes changed child figures without rereading the parent.
@@ -19025,7 +19075,7 @@ export class PanelProvider implements vscode.Disposable {
     );
   }
 
-  private agentListingStamp(sessions: SessionFile[]): string {
+  private agentListingStamp(sessions: readonly SessionFile[]): string {
     return sessions
       .map((session) => {
         const hit = this.cache.get(session.file);

@@ -909,7 +909,8 @@ export function statusOf(turn: Turn | TurnOutcome, isLatest: boolean, now: numbe
 
 // Detects clock-driven status changes for the newest turn in each session.
 // A nonpositive earlier clock means no previous status exists to compare.
-// `noteQuietLimit` receives the time at which each turn that runs at `was` reaches its quiet limit.
+// `noteQuietLimit` receives the time at which each turn that runs at `was` reaches its quiet limit. The comparison stops at the
+// first turn whose status moved, so the times cover every turn only when it returns false.
 export function statusMoved(
   turns: Iterable<Turn | TurnOutcome>,
   was: number,

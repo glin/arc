@@ -27221,7 +27221,7 @@ test('the glance goes on filling the rail on a refresh where nothing else moved'
   // Pass the retained collection time and current time to statusMoved.
   sourceMatch(
     panelHostSource,
-    /const statusFacts = \[[\s\S]*?this\.newestBySession\.values\(\)[\s\S]*?outcomes[\s\S]*?statusMoved: statusMoved\(statusFacts, this\.collectedAt, now(?:, [^()]*)?\),/,
+    /const statusFacts = \[[\s\S]*?this\.newestBySession\.values\(\)[\s\S]*?outcomes[\s\S]*?const statusChanged =\s*!swept && statusMoved\(statusFacts, this\.collectedAt, now(?:, [^()]*)?\);[\s\S]*?statusMoved: statusChanged,/,
     'the refresh no longer asks whether a parsed or metadata-only turn stopped running, so a dead session keeps the word',
   );
   sourceMatch(

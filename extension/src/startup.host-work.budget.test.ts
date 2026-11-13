@@ -27,8 +27,8 @@ test('host work per listed session stays within its recorded counts', async ({ s
   // ceilings bound the absolute block executions of the selection at each size.
   const total = (functions: Map<string, number>) => [...functions.values()].reduce((sum, count) => sum + count, 0);
   for (const [sample, ceiling] of [
-    [low, 23687],
-    [high, 20196],
+    [low, 23235],
+    [high, 18944],
   ] as const) {
     const measured = total(sample.events.selection);
     assert.ok(
