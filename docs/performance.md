@@ -270,7 +270,7 @@ The host work guard in `startup.host-work.budget.test.ts` uses V8 precise covera
 
 The `hostWorkEnvironment` entry in `scripts/test-budget.json` names the platform and Node major version for its `hostWork` rows. The case skips with a reported reason in other environments and when Vitest collects coverage. Each row records block executions per added session with a zero margin. The selection row can rise while work falls at both sizes, when the smaller size loses more work. The test file therefore also holds a ceiling on the absolute block executions of the selection at each size. `scripts/test-budget-host-work.json` records every function's growth for each event. A failed row lists functions whose growth differs from that record, largest absolute difference first, with source locations and recorded and measured values.
 
-After a deliberate change, investigate each changed row and function. From `extension/`, set `ARC_UPDATE_HOST_WORK=1` and run `npx vitest run src/startup.host-work.budget.test.ts --maxWorkers=2` to update both records. Clear the variable, repeat the case five times, and check that every row stays fixed. Review and commit both records together.
+After a deliberate change, investigate each changed row and function. From `extension/`, set `ARC_UPDATE_HOST_WORK=1` and run `npx vitest run src/startup.host-work.budget.test.ts --maxWorkers=2` to update both records. After a reduction, lower the two selection ceilings in the test file to the measured counts, because the variable does not change them. Clear the variable, repeat the case five times, and check that every row stays fixed. Review and commit both records together.
 
 The test measures no duration. The default test timeout catches only a hang.
 
