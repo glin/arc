@@ -1648,7 +1648,7 @@ interface QuietBasis {
   // The version of each child file that the live child check read.
   readonly childVersions: ReadonlyMap<string, string>;
   // The shown rows and the agent stamp of the listing signature. The stamp reads child spend bands from the clock and the
-  // files of nested and Codex children, so a poll computes it again for these rows.
+  // files of nested and Codex children. A poll computes it again for these rows.
   readonly agentRows: readonly SessionFile[];
   readonly agents: string;
   // The earliest time at which a running turn, a live child, a counted background command or a held dispatch fact changes
@@ -3050,8 +3050,8 @@ export class PanelProvider implements vscode.Disposable {
   private restoreAgentReads(): void {
     if (this.restoringReadSources || !this.saved.agentRead?.length) return;
     const sessions = new Set(this.saved.agentRead.map((record) => record.sessionId));
-    // The index of the authoritative catalog by session finds the sources of the acknowledged sessions without a pass over
-    // every listed session.
+    // The index of the authoritative catalog by session finds the sources of the acknowledged sessions. The first lookup in
+    // a catalog builds that index over every listed session. Later lookups in that catalog make no such pass.
     const catalog = this.authoritativeCatalog;
     const signature = JSON.stringify([
       this.saved.agentRead,

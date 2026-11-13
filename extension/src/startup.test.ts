@@ -8133,6 +8133,38 @@ test('two running sessions whose limits differ each draw as stopped at the poll 
   }
 });
 
+test('a session that a render stops drawing draws as stopped at the poll after the limit of its outcome', async () => {
+  const now = 100_000_000;
+  const states: RailState[] = [];
+  const fixture = twoRunningSessions(now, states, now + 20_000, now);
+  const { provider } = fixture;
+  try {
+    await quietAfterTwoPolls(fixture, now);
+    // The drawn turn of the other session reaches its limit after its outcome does. The render replaces the drawn turns
+    // with a map that does not hold that session.
+    provider.newestBySession = new Map([
+      ['other', { sessionId: 'other', startedAt: now - 100, endedAt: now + 10_000, finished: false }],
+    ]);
+    const collect = provider.collect;
+    provider.collect = function (this: any, ...args: unknown[]) {
+      const cards = collect.apply(this, args);
+      this.newestBySession = new Map();
+      return cards;
+    };
+    await provider.refresh(true, true);
+    assert.equal(states.at(-1)!.statuses.get('other'), 'running');
+    await fixture.poll(now + TURN_QUIET_MS + 1);
+    assert.notEqual(
+      states.at(-1)!.statuses.get('other'),
+      'running',
+      'the session that the render stopped drawing stayed drawn as running',
+    );
+    assert.equal(fixture.work['poll:quietMiss:deadline'], 1);
+  } finally {
+    fixture.restore();
+  }
+});
+
 test('a child that reaches its quiet limit between two polls leaves the session list status at the next poll', async () => {
   const now = 100_000_000;
   const states: RailState[] = [];
