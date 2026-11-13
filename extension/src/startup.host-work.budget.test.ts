@@ -23,6 +23,19 @@ test('host work per listed session stays within its recorded counts', async ({ s
   const high = await hostCoverage(280, coverageSession, locations);
   const delta = high.listed - low.listed;
   assert.equal(delta, 200);
+  // The selection row is a difference between two sizes, so a size that loses more work than the other raises the row. These
+  // ceilings bound the absolute block executions of the selection at each size.
+  const total = (functions: Map<string, number>) => [...functions.values()].reduce((sum, count) => sum + count, 0);
+  for (const [sample, ceiling] of [
+    [low, 24269],
+    [high, 20232],
+  ] as const) {
+    const measured = total(sample.events.selection);
+    assert.ok(
+      measured <= ceiling,
+      `selection at ${sample.listed} listed sessions: measured ${measured} block executions, above its ceiling of ${ceiling}. Investigate growth before raising the ceiling.`,
+    );
+  }
   const measured: Record<string, { value: number; functions: Record<string, number> }> = {};
   for (const [event, functions] of Object.entries(high.events)) {
     const before = low.events[event];

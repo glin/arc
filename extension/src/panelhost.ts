@@ -2685,6 +2685,8 @@ export class PanelProvider implements vscode.Disposable {
   // Session pages over one accepted catalog and scope filter, sort, and serialize that catalog once.
   private sessionPageIndex?: {
     catalog: readonly SessionFile[];
+    // Each catalog row by file, or undefined when two rows share a file.
+    rows: Map<string, SessionFile> | undefined;
     roots: string;
     scoped: SessionFile[];
     ids: Set<string>;
@@ -3843,7 +3845,9 @@ export class PanelProvider implements vscode.Disposable {
     });
   }
 
-  // Keyed by catalog array identity and scope roots. A refresh publishes a new catalog array.
+  // Keyed by catalog array identity and scope roots. A refresh publishes a new catalog array. When each row of the new array
+  // keeps the file, session ID, agent, working directory, device, and inode of a held row, the index keeps its membership
+  // digest, its scope IDs, and its sorted sources, and points each source at the new row. Size, time, and order can differ.
   private sessionPageIndexFor(accepted: SessionFile[], roots: string, scopeRoots: string[]) {
     const held = this.sessionPageIndex;
     if (held?.catalog === accepted && held.roots === roots) return held;
@@ -3857,15 +3861,43 @@ export class PanelProvider implements vscode.Disposable {
       if (member === undefined) members.set(source.cwd, (member = inScope(source.cwd)));
       return member;
     });
-    this.sessionPageIndex = {
-      catalog: accepted,
-      roots,
-      scoped,
-      ids: new Set(scoped.map((source) => source.sessionId)),
-      identities: scoped.map(({ sessionId, agent }) => ({ sessionId, agent })),
-      sources: sessionPageSources(scoped),
-      discovery: sessionCatalogMembership(roots, accepted),
-    };
+    let rows: Map<string, SessionFile> | undefined = new Map();
+    let same = held?.roots === roots && held.rows !== undefined && held.rows.size === accepted.length;
+    for (const source of accepted) {
+      const prior = same ? held!.rows!.get(source.file) : undefined;
+      same &&=
+        prior !== undefined &&
+        !rows.has(source.file) &&
+        prior.sessionId === source.sessionId &&
+        prior.agent === source.agent &&
+        prior.cwd === source.cwd &&
+        prior.dev === source.dev &&
+        prior.ino === source.ino;
+      rows.set(source.file, source);
+    }
+    if (rows.size !== accepted.length) rows = undefined;
+    this.sessionPageIndex =
+      same && held
+        ? {
+            catalog: accepted,
+            rows,
+            roots,
+            scoped,
+            ids: held.ids,
+            identities: scoped.map(({ sessionId, agent }) => ({ sessionId, agent })),
+            sources: held.sources.map((entry) => ({ ...entry, session: rows!.get(entry.session.file)! })),
+            discovery: held.discovery,
+          }
+        : {
+            catalog: accepted,
+            rows,
+            roots,
+            scoped,
+            ids: new Set(scoped.map((source) => source.sessionId)),
+            identities: scoped.map(({ sessionId, agent }) => ({ sessionId, agent })),
+            sources: sessionPageSources(scoped),
+            discovery: sessionCatalogMembership(roots, accepted),
+          };
     this.health?.observe('sessionIndex', performance.now() - started);
     return this.sessionPageIndex;
   }
@@ -17520,10 +17552,19 @@ export class PanelProvider implements vscode.Disposable {
     return this.threadNames.fullNames.get(session.sessionId) || fromFile;
   }
 
-  // Use recorded activity time, falling back to mtime when metadata has no timestamp.
+  // Use recorded activity time, falling back to mtime when metadata has no timestamp. Each row keeps the value with the title
+  // entry that gave it, so each comparison of a sort reads it again only after the entry changes.
   private activityFor(session: SessionFile): number {
-    return this.metaFor(session).activityMs ?? session.mtimeMs;
+    const entry = this.titleEntryOf(session.file);
+    const memo = (this.activityHeld ??= new WeakMap());
+    const held = memo.get(session);
+    if (held && held.entry === entry) return held.value;
+    const value = this.metaFor(session).activityMs ?? session.mtimeMs;
+    memo.set(session, { entry, value });
+    return value;
   }
+
+  private activityHeld?: WeakMap<SessionFile, { entry: DerivedTitleEntry | undefined; value: number }>;
 
   // The count of sessions that this window started, which the agent-run answer of every row reads.
   private ownSessionCount(): number {

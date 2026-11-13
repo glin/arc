@@ -7,22 +7,22 @@
   "hostWork": {
     "poll refresh": {
       "reason": "Host block executions per added listed session stay fixed until a reduction lowers this row.",
-      "budget": 246.74,
+      "budget": 193.06,
       "margin": 0
     },
     "selection": {
       "reason": "Host block executions per added listed session stay fixed until a reduction lowers this row.",
-      "budget": -20.185,
+      "budget": -17.455,
       "margin": 0
     },
     "one turn": {
       "reason": "Host block executions per added listed session stay fixed until a reduction lowers this row.",
-      "budget": 1232.41,
+      "budget": 1119.975,
       "margin": 0
     },
     "discovery reply": {
       "reason": "Host block executions per added listed session stay fixed until a reduction lowers this row.",
-      "budget": 323.86,
+      "budget": 276.12,
       "margin": 0
     },
     "session list post": {
@@ -32,7 +32,7 @@
     },
     "append inside a turn": {
       "reason": "Host block executions per added listed session stay fixed until a reduction lowers this row.",
-      "budget": 679.995,
+      "budget": 622.24,
       "margin": 0
     }
   },

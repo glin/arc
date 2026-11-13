@@ -18473,6 +18473,99 @@ test('a workspace folder change makes the next session page index test each work
   assert.equal(tests, 2, 'scope membership from the previous folders outlived the folder change');
 });
 
+function sessionPageIndexHarness() {
+  const counts = { digests: 0, sorts: 0 };
+  const provider = completeDiscoveryHarness(undefined, false, ['sessionPageIndexFor', 'dispatchSource'], {
+    scopeInside: (cwd: string) => cwd.startsWith('/work/repo'),
+    sessionCatalogMembership: (...args: Parameters<typeof sessionCatalogMembership>) => {
+      counts.digests++;
+      return sessionCatalogMembership(...args);
+    },
+    sessionPageSources: (...args: Parameters<typeof sessionPageSources>) => {
+      counts.sorts++;
+      return sessionPageSources(...args);
+    },
+  });
+  const roots = ['/work/repo'];
+  provider.folders = () => roots;
+  provider.repositoryScope = { snapshot: () => ({ ready: true, roots }) };
+  provider.authoritativeCatalogScope = JSON.stringify(roots);
+  const row = (sessionId: string, fields: Record<string, unknown> = {}) => ({
+    agent: 'claude',
+    sessionId,
+    file: `/sessions/${sessionId}.jsonl`,
+    cwd: '/work/repo',
+    size: 10,
+    mtimeMs: 1,
+    dev: 7,
+    ino: sessionId.length + 100,
+    ...fields,
+  });
+  const index = (catalog: any[]) => {
+    provider.authoritativeCatalog = catalog;
+    return provider.sessionPageIndexFor(catalog, JSON.stringify(roots), roots);
+  };
+  return { provider, counts, row, index, roots };
+}
+
+test('a catalog with equal membership keeps the session page index and a page serves its new rows', () => {
+  const { provider, counts, row, index, roots } = sessionPageIndexHarness();
+  index([row('one'), row('two'), row('three', { cwd: '/elsewhere' })]);
+  assert.deepEqual(counts, { digests: 1, sorts: 1 });
+  // One row grew in place, and activity reordered the catalog.
+  const grown = [row('two'), row('one', { size: 25, mtimeMs: 2 }), row('three', { cwd: '/elsewhere' })];
+  const kept = index(grown);
+  assert.deepEqual(counts, { digests: 1, sorts: 1 }, 'a catalog with equal membership built the index again');
+  assert.equal(kept.catalog, grown);
+  assert.deepEqual(kept.scoped, [grown[0], grown[1]]);
+  assert.ok(kept.scoped.every((source: any, at: number) => source === grown[at]));
+  assert.deepEqual(
+    kept.identities.map(({ sessionId }: any) => sessionId),
+    ['two', 'one'],
+    'the query context identities kept the old catalog order',
+  );
+  assert.ok(
+    kept.sources.every((entry: any) => grown.includes(entry.session)),
+    'a page source still served a row of the old catalog',
+  );
+  assert.deepEqual(kept.sources, sessionPageSources(kept.scoped));
+  assert.equal(kept.discovery, sessionCatalogMembership(JSON.stringify(roots), grown));
+  assert.equal(provider.dispatchSource('claude', 'one').size, 25, 'a reader served the size of the old row');
+});
+
+test('a session page index builds again when a row changes identity, membership, or working directory', () => {
+  const variants: [string, (rows: any[], row: (id: string, fields?: Record<string, unknown>) => any) => any[]][] = [
+    ['new inode', (rows, row) => [row('one', { ino: 999 }), rows[1]]],
+    ['new device', (rows, row) => [row('one', { dev: 8 }), rows[1]]],
+    ['added row', (rows, row) => [...rows, row('three')]],
+    ['removed row', (rows) => [rows[0]]],
+    ['replaced row', (rows, row) => [rows[0], row('three')]],
+    ['repeated row', (rows) => [rows[0], rows[0]]],
+    ['moved file', (rows) => [{ ...rows[0], file: '/sessions/moved.jsonl' }, rows[1]]],
+    ['new working directory', (rows, row) => [row('one', { cwd: '/elsewhere' }), rows[1]]],
+    ['new session ID', (rows) => [{ ...rows[0], sessionId: 'renamed' }, rows[1]]],
+    ['new agent', (rows) => [{ ...rows[0], agent: 'codex' }, rows[1]]],
+  ];
+  for (const [name, change] of variants) {
+    const { counts, row, index, roots } = sessionPageIndexHarness();
+    const rows = [row('one'), row('two')];
+    index(rows);
+    const changed = change(rows, row);
+    const built = index(changed);
+    assert.equal(counts.sorts, 2, `${name} kept the session page index`);
+    const scoped = changed.filter((source) => source.cwd.startsWith('/work/repo'));
+    assert.deepEqual(built.scoped, scoped, name);
+    assert.deepEqual(built.sources, sessionPageSources(scoped), name);
+    assert.deepEqual([...built.ids], [...new Set(scoped.map((source) => source.sessionId))], name);
+    assert.deepEqual(
+      built.identities,
+      scoped.map(({ sessionId, agent }) => ({ sessionId, agent })),
+      name,
+    );
+    assert.equal(built.discovery, sessionCatalogMembership(JSON.stringify(roots), changed), name);
+  }
+});
+
 test('a selected record that keeps growing retries without publishing unstable windows', async () => {
   let provider: any;
   let attempts = 0;
@@ -21168,6 +21261,22 @@ function switchTitle(source: any, index: number, now: number): any {
     starts: { starts: [source.activity - 1000], whole: true },
   };
 }
+
+test('a row whose title entry is replaced takes its new place in the order of the next refresh', async () => {
+  const provider = switchHarness(3);
+  const order = () => provider.authoritativeCatalog.map((source: any) => source.sessionId);
+  await provider.refresh(true);
+  assert.deepEqual(order(), ['switch-0', 'switch-1', 'switch-2']);
+  const rows = [...provider.authoritativeCatalog];
+  const held = provider.titles.get('switch-2.jsonl');
+  provider.storeTitleEntry('switch-2.jsonl', { ...held, activityMs: provider.partial[0].activity + 1000 });
+  await provider.refresh(true);
+  assert.ok(
+    provider.authoritativeCatalog.every((source: any) => rows.includes(source)),
+    'the refresh listed new rows',
+  );
+  assert.deepEqual(order(), ['switch-2', 'switch-0', 'switch-1'], 'the row kept the place of its replaced entry');
+});
 
 // The rows, order, figures and windows that the host holds, in a form that compares by value.
 function switchHostState(provider: any): string {
