@@ -7,27 +7,32 @@
   "hostWork": {
     "poll refresh": {
       "reason": "Host block executions per added listed session stay fixed until a reduction lowers this row.",
-      "budget": 263.74,
+      "budget": 246.74,
       "margin": 0
     },
     "selection": {
       "reason": "Host block executions per added listed session stay fixed until a reduction lowers this row.",
-      "budget": -2.075,
+      "budget": -20.185,
       "margin": 0
     },
     "one turn": {
       "reason": "Host block executions per added listed session stay fixed until a reduction lowers this row.",
-      "budget": 1286.86,
+      "budget": 1232.41,
       "margin": 0
     },
     "discovery reply": {
       "reason": "Host block executions per added listed session stay fixed until a reduction lowers this row.",
-      "budget": 344.86,
+      "budget": 323.86,
       "margin": 0
     },
     "session list post": {
       "reason": "Host block executions per added listed session stay fixed until a reduction lowers this row.",
       "budget": 128,
+      "margin": 0
+    },
+    "append inside a turn": {
+      "reason": "Host block executions per added listed session stay fixed until a reduction lowers this row.",
+      "budget": 679.995,
       "margin": 0
     }
   },
@@ -633,8 +638,8 @@
       "margin": 0
     },
     "completion | posted:render:rows": {
-      "reason": "The panel receives one message for each publication, and a delta carries only changed rows. A rise means a step publishes more or carries more rows.",
-      "budget": 2,
+      "reason": "The panel receives one message for each publication, and a delta carries only changed rows. The completion posts the card of the finished rollout twice. The first render keeps the turn start that the card drew before the completion, and the follow-up render withdraws the start that the completion closed with no visible work. A rise means a step publishes more or carries more rows.",
+      "budget": 3,
       "margin": 0
     },
     "completion | readBytes": {
@@ -884,7 +889,7 @@
     },
     "repeated record coverage | childVersionStat": {
       "reason": "Readers of one child file in one host run share one file check. A rise means readers check the same child file again.",
-      "budget": 2,
+      "budget": 1,
       "margin": 0
     },
     "repeated record coverage | discoveryRequest:walked": {
@@ -919,17 +924,17 @@
     },
     "repeated record coverage | posted:render": {
       "reason": "The panel receives one message for each publication, and a delta carries only changed rows. A rise means a step publishes more or carries more rows.",
-      "budget": 2,
+      "budget": 1,
       "margin": 0
     },
     "repeated record coverage | posted:render:delta": {
       "reason": "The panel receives one message for each publication, and a delta carries only changed rows. A rise means a step publishes more or carries more rows.",
-      "budget": 2,
+      "budget": 1,
       "margin": 0
     },
     "repeated record coverage | posted:render:rows": {
       "reason": "The panel receives one message for each publication, and a delta carries only changed rows. A rise means a step publishes more or carries more rows.",
-      "budget": 4,
+      "budget": 2,
       "margin": 0
     },
     "repeated record coverage | readBytes": {
@@ -944,12 +949,12 @@
     },
     "repeated record coverage | refreshCount:catalog-enumeration": {
       "reason": "Each refresh that lists sessions runs one enumeration. A rise means a step runs extra catalog refreshes.",
-      "budget": 2,
+      "budget": 1,
       "margin": 0
     },
     "repeated record coverage | renderPost:enrichment": {
       "reason": "A refresh renders the session list when its inputs changed. A rise means a step redraws without new facts.",
-      "budget": 1,
+      "budget": 0,
       "margin": 0
     },
     "repeated record coverage | renderPost:repeated-record-coverage": {

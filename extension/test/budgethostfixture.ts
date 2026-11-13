@@ -482,6 +482,17 @@ async function hostCoverage(
       await active.provider.continueDiscovery();
     });
     await measure('session list post', () => active.receive({ type: 'setRailFilters', railFilters: [] }));
+    await measure('append inside a turn', () => {
+      const source = workspace.parents[20];
+      workspace.growTurn(source, Date.now());
+      active.provider.pendingWatch.noteFileEvent(
+        path.dirname(source.file),
+        path.basename(source.file),
+        'change',
+        modules.normalizeFsPath,
+      );
+      active.provider.runPendingWatch({ cause: 'quiet', firstAt: 0, lastAt: 0, firedAt: 0 });
+    });
     return { listed: active.provider.catalog.sessions.length, events };
   } finally {
     active.provider.writeDerivedCache = () => true;

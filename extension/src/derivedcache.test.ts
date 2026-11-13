@@ -283,6 +283,8 @@ import {
   METADATA_EXHAUSTED_RULE,
   saveDerivedCache,
   scanForRailEnrichment,
+  shownTitleFacts,
+  shownTurnStarts,
   withAgentRunScanProgress,
   withRailEnrichment,
   withMetadataCoverage,
@@ -2248,6 +2250,91 @@ test('a transcript that shrank does not inherit the figures of the one it replac
   const rewritten = carryDerivedTitleFacts(carried, { ...title, mtimeMs: 12, size: 4, stats: null });
   assert.equal(rewritten.heldStats, undefined, 'figures read from one transcript are drawn on the card of another');
   assert.equal(derivedTitleStats(rewritten), null);
+});
+
+test('a grown transcript draws the turn starts of its earlier revision until a read of its own', () => {
+  const previous: DerivedTitleEntry = { ...title, sourceIdentity: { dev: 1, ino: 1 }, headKey: 'a' };
+  const grown: DerivedTitleEntry = { ...previous, mtimeMs: 11, size: 40 };
+  delete grown.starts;
+  const carried = carryDerivedTitleFacts(previous, grown);
+  assert.equal(carried.starts, undefined, 'the starts of the earlier revision read as starts of this one');
+  assert.deepEqual(shownTurnStarts(carried), title.starts, 'the grown transcript drew no turn starts');
+  assert.deepEqual(
+    railEnrichmentNeeds(carried, { mtimeMs: 11, size: 40 }),
+    { starts: true, metadata: false },
+    'the carried starts took the place of a read',
+  );
+  const again = carryDerivedTitleFacts(carried, { ...grown, mtimeMs: 12, size: 60 });
+  assert.deepEqual(shownTurnStarts(again), title.starts, 'a second growth before the read dropped the carried starts');
+  const read = withRailEnrichment(carried, { starts: [10, 30], whole: true }, undefined);
+  assert.equal(read.heldStarts, undefined, 'a read of its own kept the carried starts beside it');
+  assert.deepEqual(shownTurnStarts(read), { starts: [10, 30], whole: true });
+  for (const [subject, next] of [
+    ['shrank', { ...grown, size: 4 }],
+    ['changed its device or inode', { ...grown, sourceIdentity: { dev: 1, ino: 2 } }],
+    ['changed its first record', { ...grown, headKey: 'b' }],
+  ] as const) {
+    assert.equal(shownTurnStarts(carryDerivedTitleFacts(carried, next)), undefined, `a transcript that ${subject}`);
+  }
+  assert.equal(shownTurnStarts(carryDerivedTitleFacts(undefined, grown)), undefined, 'a first read');
+  const file = path.join(folder(), 'cache.json');
+  saveClaudeCache(file, [['/session.jsonl', carried]]);
+  assert.equal(
+    loadClaudeCache(file).titles.get('/session.jsonl')?.heldStarts,
+    undefined,
+    'the derived cache saved the turn starts of an earlier revision',
+  );
+});
+
+test('a read that confirms carried turn starts or widens its coverage changes no drawn fact', () => {
+  const session = { agent: 'claude', size: 40 };
+  const grown: DerivedTitleEntry = { ...title, mtimeMs: 11, size: 40 };
+  delete grown.starts;
+  const carried = carryDerivedTitleFacts(title, grown);
+  const confirmed = withRailEnrichment(carried, title.starts!, undefined);
+  const drawn = shownTitleFacts(carried, session);
+  assert.equal(shownTitleFacts(confirmed, session), drawn, 'a read that found the carried starts');
+  assert.equal(
+    shownTitleFacts(withMetadataCoverage(confirmed, { whole: true, windowBytes: 40 }), session),
+    drawn,
+    'a read that only widened its coverage',
+  );
+  for (const [subject, next] of [
+    ['a new turn start', withRailEnrichment(carried, { starts: [10, 30], whole: true }, undefined)],
+    ['new context', { ...confirmed, stats: { ...stats, turns: [{ ...stats.turns[0], contextTokens: 200 }] } }],
+    ['a new label', { ...confirmed, label: 'Another session' }],
+    ['a field that no list names', { ...confirmed, withdrawnPrompt: true }],
+  ] as [string, DerivedTitleEntry][]) {
+    assert.notEqual(shownTitleFacts(next, session), drawn, subject);
+  }
+  const large = { agent: 'claude', size: 300_000 };
+  const scan = (bytes: number, person: boolean): AgentRunScan => ({
+    bytes,
+    prompts: 0,
+    finished: false,
+    unattended: false,
+    changedFile: false,
+    deniedTool: false,
+    command: false,
+    bridgeSession: false,
+    bg: false,
+    person,
+  });
+  const scanned = (bytes: number, person: boolean) => ({
+    ...confirmed,
+    size: large.size,
+    agentRunScan: scan(bytes, person),
+  });
+  assert.equal(
+    shownTitleFacts(scanned(200_000, true), large),
+    shownTitleFacts(scanned(300_000, true), large),
+    'the cursor of a settled person scan',
+  );
+  assert.notEqual(
+    shownTitleFacts(scanned(200_000, false), large),
+    shownTitleFacts(scanned(300_000, false), large),
+    'an agent-run answer that no longer waits for its scan',
+  );
 });
 
 test('a turn that has not reported its context draws the figures the session last had', () => {

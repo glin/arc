@@ -150,6 +150,9 @@ import {
   CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
   agentRunScanUnread,
   carryDerivedTitleFacts,
+  shownTitleFacts,
+  shownTurnStarts,
+  withoutHeldStarts,
   derivedTitleCacheRevision,
   derivedTitleCacheStats,
   derivedTitleStats,
@@ -3132,6 +3135,7 @@ function withCompanionMethods(names: Iterable<string>): string[] {
   const out = [...names];
   if (out.includes('lifetimeFiguresBySession')) out.push('rowSpendSources', 'admitSavedSpendSources');
   if (out.includes('writeDerivedCache')) out.push('spendSourcesFile', 'writeSettledSpendSources');
+  if (out.includes('claudeStructuralKey') || out.includes('claudeChildRevisions')) out.push('childParents');
   const cards = [
     'redrawModelNames',
     'noteActivity',
@@ -3993,6 +3997,8 @@ function railEnrichmentHarness(
     'carryDerivedTitleFacts',
     'scanForRailEnrichment',
     'withMetadataCoverage',
+    'shownTitleFacts',
+    'withoutHeldStarts',
     compiled,
   )(
     module,
@@ -4010,6 +4016,8 @@ function railEnrichmentHarness(
     carryDerivedTitleFacts,
     scanForRailEnrichment,
     withMetadataCoverage,
+    shownTitleFacts,
+    withoutHeldStarts,
   );
   return guardedHarness(new module.exports.Harness(run));
 }
@@ -9113,6 +9121,9 @@ function titlePublicationHarness(
       codexTitleFor,
       compressedTitleCurrent,
       saveDerivedCache,
+      shownTitleFacts,
+      shownTurnStarts,
+      withoutHeldStarts,
       DERIVED_CACHE_CHECKPOINT_MS: 5 * 60 * 1000,
       ...real.scope,
     },
@@ -14155,7 +14166,7 @@ test('a batch row that a panel shows redraws through the selected-window refresh
 
 test('a changed row posts its current unread count and later polls that change nothing keep it', async () => {
   const { provider, entryOf, releaseAll } = await batchApplyHarness(
-    { newCounts, projectAgentRead },
+    { newCounts, projectAgentRead, shownTurnStarts },
     ['glanceAt', 'metaFor', 'unreadCounts'],
     (target) => {
       target.lifetimeRailFacts = () => ({ rederived: { newestTurnStartedAt: 3_000 } });
@@ -19334,6 +19345,48 @@ test.each([99999, 100000])(
   },
 );
 
+// The structural key and the child revisions of a parent read its child references from an index. The index follows the
+// identity of each collection, so a reply that adds a reference or a child file of the parent moves both. A dispatch
+// reference and a child of another parent move neither.
+test('a new child reference or child file of a parent moves its child revisions and its structural key', () => {
+  const folder = tempDir('panel-startup-child-index-');
+  const transcript = (name: string) => {
+    const file = path.join(folder, `agent-${name}.jsonl`);
+    fs.writeFileSync(file, JSON.stringify({ type: 'assistant', isSidechain: true }) + '\n');
+    return file;
+  };
+  const provider = selectedWindowHarness(
+    async () => null,
+    ['structuralKey', 'claudeStructuralKey', 'claudeChildRevisions', 'claudeChildVersion', 'codexStructuralChildren'],
+  );
+  const reference = (sessionId: string, parentSessionId = 'selected') => ({
+    parentSessionId,
+    sessionId,
+    toolUseIds: [`launch-${sessionId}`],
+    file: transcript(sessionId),
+  });
+  const dispatch = { ...reference('dispatched'), kind: 'dispatch' };
+  provider.claudeChildReferences = [reference('first'), reference('other', 'another-parent'), dispatch];
+  provider.claudeChildren = [];
+  provider.codexSubagents = [];
+  const keys = () => ({
+    revisions: provider.claudeChildRevisions(provider.session),
+    structural: provider.structuralKey(provider.session),
+  });
+  const first = keys();
+  assert.ok(first.revisions.includes('agent-first.jsonl'), 'the child revisions lost the child of the parent');
+  assert.ok(!first.revisions.includes('agent-other.jsonl'), 'the child revisions hold a child of another parent');
+  assert.ok(!first.revisions.includes('agent-dispatched.jsonl'), 'the child revisions hold a dispatch reference');
+  provider.claudeChildReferences = [...provider.claudeChildReferences, reference('another', 'another-parent')];
+  assert.deepEqual(keys(), first, 'a reference of another parent moved the keys of this parent');
+  provider.claudeChildReferences = [...provider.claudeChildReferences, reference('second')];
+  const referenced = keys();
+  assert.notEqual(referenced.revisions, first.revisions, 'a new child reference left the child revisions');
+  assert.notEqual(referenced.structural, first.structural, 'a new child reference left the structural key');
+  provider.claudeChildren = [{ sessionId: 'third', parentSessionId: 'selected', file: transcript('third') }];
+  assert.notEqual(keys().structural, referenced.structural, 'a new child file left the structural key');
+});
+
 // Nested subagent writes must update the finished launcher's cost.
 
 test('a nested subagent that appears or grows after its launcher finished moves the launcher row cost', async () => {
@@ -20978,6 +21031,8 @@ function switchHarness(count: number, scope: Record<string, unknown> = {}): any 
       withSessionName,
       agentRunScanUnread,
       needsAgentRunScan: () => false,
+      agentRunScanPending: () => false,
+      shownTurnStarts,
       agentRunAnswer,
       newCounts,
       projectAgentRead,
@@ -26728,6 +26783,270 @@ test('an enrichment refresh after a moved file names that file and sends no disc
     vi.useRealTimers();
   }
 });
+
+// A watcher wake of a grown session that no dispatch names reads its metadata again. The new entry draws the turn starts of
+// the earlier revision until the enrichment pass at the end of the refresh reads its own. A follow-up refresh runs only when
+// that pass changes a drawn fact or refuses a file.
+for (const {
+  subject,
+  earlier,
+  read = [5, 15],
+  unresolved = false,
+  wide = false,
+  moved = false,
+  fails = false,
+  shrunk = false,
+  counts: drawn,
+  enrichment,
+} of [
+  { subject: 'an append inside a turn runs one refresh', earlier: [5, 15], counts: [2], enrichment: [] },
+  // The wide read of the pass at the end finds no context either, so it changes only its coverage.
+  {
+    subject: 'an append before the first response of a turn runs one refresh',
+    earlier: [5, 15],
+    unresolved: true,
+    counts: [2],
+    enrichment: [],
+  },
+  // A start that a later record withdraws stays drawn for one render. The follow-up render withdraws it, and no third
+  // render follows.
+  {
+    subject: 'a withdrawn turn start leaves the session list in one follow-up',
+    earlier: [5, 15],
+    read: [5],
+    counts: [2, 1],
+    enrichment: [null],
+  },
+  // The failed read drops the carried starts. The follow-up draws the window that the host holds for a session of unknown
+  // membership, and its own read of the turn starts runs one more follow-up.
+  {
+    subject: 'a turn start read that fails drops the carried starts',
+    earlier: [5, 15],
+    fails: true,
+    counts: [2, 2, 2],
+    enrichment: [null, null],
+  },
+  {
+    subject: 'an append that opens a turn draws the new turn in one follow-up',
+    earlier: [5],
+    counts: [1, 2],
+    enrichment: [null],
+  },
+  {
+    subject: 'a wide metadata read that finds context runs one follow-up',
+    earlier: [5, 15],
+    wide: true,
+    counts: [2, 2],
+    enrichment: [null],
+  },
+  // The refused read drops the carried starts. The refresh that names the file draws the window that the host holds for a
+  // session of unknown membership, and its own read of the turn starts runs one more follow-up.
+  {
+    subject: 'a file that moves during the turn start read keeps its follow-up',
+    earlier: [5, 15],
+    moved: true,
+    counts: [2, 2, 2],
+    enrichment: [['claude.jsonl'], null],
+  },
+  // A file that shrank carries no starts, so its first render draws no count of the earlier revision.
+  {
+    subject: 'a file that shrank draws its own turn starts in one follow-up',
+    earlier: [5, 15],
+    shrunk: true,
+    counts: [undefined, 2],
+    enrichment: [null],
+  },
+] as {
+  subject: string;
+  earlier: number[];
+  read?: number[];
+  unresolved?: boolean;
+  wide?: boolean;
+  moved?: boolean;
+  fails?: boolean;
+  shrunk?: boolean;
+  counts: (number | undefined)[];
+  enrichment: (string[] | null)[];
+}[])
+  test(`a targeted wake of a grown unselected session: ${subject}`, async () => {
+    vi.useFakeTimers();
+    try {
+      const { provider, counters, requests } = partialSpendHarness(true, undefined, {
+        methods: [
+          'runPendingWatch',
+          'unknownPathShapeOf',
+          'prepareMetadata',
+          'prepareRailEnrichment',
+          'glanceAt',
+          'unreadCounts',
+          'observeStoredEntry',
+          'observeStoredName',
+        ],
+        scope: {
+          watcherRefreshDecision,
+          sessionDirectoryOwners,
+          unknownPathShapes,
+          unknownPathExtension,
+          INITIAL_RAIL_READ_BYTES,
+          RAIL_ENRICHMENT_READ_BYTES,
+          metadataReadBudget,
+          unreadHeadBytes,
+          carryDerivedTitleFacts,
+          agentRunScanUnread,
+          withRailEnrichment,
+          withAgentRunScanProgress,
+          scanForRailEnrichment,
+          transcriptIdentity,
+          withSessionName,
+          newCounts,
+          projectAgentRead,
+          turnKey,
+          shownTitleFacts,
+          shownTurnStarts,
+          withoutHeldStarts,
+        },
+      });
+      // The real enrichment pass replaces the stub of the harness.
+      delete provider.prepareRailEnrichment;
+      provider.carriedNames = new Map();
+      provider.readFacts = () => () => null;
+      provider.saved = { ...provider.saved, read: [], readTo: {}, since: 0, agentRead: [] };
+      const quiet = () => !provider.dispatchSpendPending && requests.length >= 4 && provider.refreshController === null;
+      provider.refreshFrom('startup', true);
+      // Each step runs the timers due and the work they release. The step bound is the test's deadline.
+      for (let step = 0; step < 500 && !quiet(); step++) await vi.advanceTimersByTimeAsync(1);
+      assert.deepEqual(requests, ['discovery', 'spend', 'spend', 'spend']);
+      const row = provider.catalog.sessions[0];
+      provider._showing = provider.catalog.sessions[1].sessionId;
+      provider.titles.set(row.file, {
+        ...provider.titles.get(row.file),
+        starts: { starts: earlier, whole: true },
+        ...(shrunk ? { size: 30 } : {}),
+      });
+      const grown = { ...row, size: 20, mtimeMs: 20 };
+      const starts = { starts: read, whole: true };
+      const resolved = {
+        outcome: { finished: true, error: false, interrupted: false, endedAt: 15, startedAt: 15 },
+        stats: {
+          turns: [{ startedAt: 15, endedAt: 15, finished: true, error: false, contextTokens: 100 }],
+          compactions: [],
+        },
+      };
+      let moving = moved;
+      let failing = fails;
+      const run = provider.progressiveWorker.run;
+      provider.progressiveWorker.run = async (request: ProgressiveRequest, generation: number, signal: AbortSignal) => {
+        if (request.kind === 'claude-children' && !request.spendOnly) {
+          // The reply settles the dispatched spend, so no spend-only pass or its refresh follows the wake.
+          const reply = await run(request, generation, signal);
+          return { ...reply, value: { ...reply.value, continuation: false } };
+        }
+        if (!('session' in request) || request.session.file !== row.file) return run(request, generation, signal);
+        const revision = provider.revisionOf(request.session);
+        if (request.kind === 'starts' && moving) {
+          // The worker read a later revision than the one the host holds, so the host refuses the read.
+          moving = false;
+          return { generation, revision: { ...revision, size: revision.size + 10 }, value: { kind: 'stale' } };
+        }
+        if (request.kind === 'starts' && failing) {
+          failing = false;
+          throw new Error('Session reading failed.');
+        }
+        if (request.kind === 'starts') return { generation, revision, value: { kind: 'starts', starts } };
+        if (request.kind !== 'metadata') return run(request, generation, signal);
+        // A read inside a turn finds its context. A read of a new turn finds none, and a wide read finds the context that
+        // the tail read of the refresh missed.
+        const found =
+          !unresolved && earlier.length === 2 && (!wide || request.tailBytes === RAIL_ENRICHMENT_READ_BYTES);
+        return {
+          generation,
+          revision,
+          value: {
+            kind: 'metadata',
+            coverage: { whole: true, windowBytes: grown.size },
+            entry: {
+              sourceIdentity: { dev: revision.dev, ino: revision.ino },
+              mtimeMs: grown.mtimeMs,
+              size: grown.size,
+              label: 'Session',
+              fullLabel: 'Session',
+              foldedLabel: 'session',
+              activityMs: grown.mtimeMs,
+              agentRun: false,
+              // The tail read of a wide case finds the outcome without its context, so the wide read moves only the context.
+              ...(found
+                ? resolved
+                : wide
+                  ? { outcome: resolved.outcome, stats: null }
+                  : { outcome: null, stats: null }),
+            },
+          },
+        };
+      };
+      // The unread count of the grown session in each session list payload that a render builds from the real count.
+      const counts: (number | undefined)[] = [];
+      provider.useRailPayload((input: Parameters<typeof railPayload>[0], rows?: ReadonlySet<string | null>) => {
+        counts.push(input.counts.get(row.sessionId)?.count);
+        void rows;
+        return { rail: [], labels: [], views: [], railFilters: [], stats: {} };
+      });
+      const enrichmentPaths: (string[] | null)[] = [];
+      const listed = provider.allSessions;
+      provider.allSessions = (reuse: boolean) => {
+        if (provider.refreshReason === 'enrichment') enrichmentPaths.push(provider.targetedRefreshPaths);
+        return listed(reuse);
+      };
+      // The listing and the discovery reply both carry the grown row.
+      provider.catalog.sessions = provider.catalog.sessions.map((session: { file: string }) =>
+        session.file === row.file ? grown : session,
+      );
+      provider.partial = provider.catalog.sessions;
+      provider.pendingWatch = {
+        take: () => ({
+          eventCount: 1,
+          changedPaths: [row.file],
+          createdPaths: [],
+          compressedPaths: [],
+          broadRequired: false,
+          broadReasons: [],
+          drawRequired: false,
+          reasons: ['transcript'],
+        }),
+      };
+      const before = counters.snapshot();
+      provider.runPendingWatch({ cause: 'quiet', firstAt: 0, lastAt: 0, firedAt: 0 });
+      const settled = () =>
+        quiet() &&
+        enrichmentPaths.length >= enrichment.length &&
+        isDeepStrictEqual(provider.titles.get(row.file)?.starts, starts);
+      for (let step = 0; step < 500 && !settled(); step++) await vi.advanceTimersByTimeAsync(1);
+      const after = counters.snapshot();
+      const refreshed = (reason: string) =>
+        (after.refreshes[reason]?.count ?? 0) - (before.refreshes[reason]?.count ?? 0);
+      assert.deepEqual(
+        {
+          counts,
+          transcript: refreshed('transcript'),
+          enrichment: enrichmentPaths,
+          entry: provider.titles.get(row.file)?.starts,
+          requests: requests.slice(4),
+          pending: provider.pendingRefresh,
+        },
+        {
+          counts: drawn,
+          transcript: 1,
+          enrichment,
+          entry: starts,
+          requests: ['discovery'],
+          pending: null,
+        },
+        'the session list did not draw the settled turn starts in the expected refreshes',
+      );
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
 
 // Repeated-record coverage of a file after discovery completes. The first walked discovery request after a completed pass
 // opens a new receipt scan of the whole store, and a spend-only request opens none. A dispatched member that the worker's

@@ -13780,7 +13780,7 @@ test('Claude relationships refresh current and retained parent rows without a pa
   assert.ok(claudeKeyAt > 0, 'the worker cache key omits Claude relationship state');
   sourceMatch(
     panelHostSource,
-    /\? claudeRelationshipKey\(session\.sessionId, this\.claudeChildReferences, this\.claudeChildren\)/,
+    /const own = this\.childParents\(\)\.get\(session\.sessionId\);\s*return own \? claudeRelationshipKey\(session\.sessionId, own\.references, own\.children\) : '';/,
     'the host builds its Claude relationship key apart from the worker, so the two never agree',
   );
   const claudeKeyFrom = selectedSource.indexOf('export function claudeRelationshipKey(');
@@ -27010,7 +27010,7 @@ test('initial session listing keeps every metadata read within 64 MiB before the
   assert.notEqual(enrichmentAt, -1, 'panelhost.ts no longer defers turn-start enrichment until after the first rail');
   sourceMatch(
     enrichment,
-    /let remaining = INITIAL_RAIL_READ_BYTES;[\s\S]*const bytes = [\s\S]*RAIL_ENRICHMENT_READ_BYTES[\s\S]*agentRunScanUnread\(session, previous\.agentRunScan\)[\s\S]*if \(bytes > remaining && remaining < INITIAL_RAIL_READ_BYTES\) \{ break; \}[\s\S]*remaining -= bytes;[\s\S]*kind: 'starts'/,
+    /let remaining = INITIAL_RAIL_READ_BYTES;[\s\S]*const bytes = [\s\S]*RAIL_ENRICHMENT_READ_BYTES[\s\S]*agentRunScanUnread\(session, previous\.agentRunScan\)[\s\S]*if \(bytes > remaining && remaining < INITIAL_RAIL_READ_BYTES\) \{ deferred = true; break; \}[\s\S]*remaining -= bytes;[\s\S]*kind: 'starts'/,
     'deferred rail enrichment has no bounded admission rule',
   );
   sourceMatch(
@@ -27036,8 +27036,13 @@ test('initial session listing keeps every metadata read within 64 MiB before the
     'the enrichment sequence no longer accepts starts before expanded metadata',
   );
   sourceMatch(
+    enrichment,
+    /const store = \(session: SessionFile, before: DerivedTitleEntry, after: DerivedTitleEntry\) => \{\s*this\.storeTitleEntry\(session\.file, after\);\s*this\.derivedCacheCheckpointState\.markChanged\(\);\s*stored = true;/,
+    'accepted turn starts and agent-run progress wait for expanded metadata before entering the cache',
+  );
+  sourceMatch(
     acceptedStarts,
-    /this\.storeTitleEntry\(session\.file, next\);[\s\S]*this\.derivedCacheCheckpointState\.markChanged\(\);[\s\S]*changed = true;/,
+    /store\(session, previous, next\);/,
     'accepted turn starts and agent-run progress wait for expanded metadata before entering the cache',
   );
   sourceMatch(

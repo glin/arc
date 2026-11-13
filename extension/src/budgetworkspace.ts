@@ -50,6 +50,8 @@ export interface BudgetWorkspace {
   runningRollout: BudgetSource;
   completeRunningRollout(at: number): void;
   growSource(source: BudgetSource, at: number): void;
+  // Appends a reply inside the newest turn of a Claude parent. The reply opens no turn.
+  growTurn(source: BudgetSource, at: number): void;
   // Adds rollouts that share a session id with a Claude parent, so the next walk reads their qualified openings.
   addCollisions(at: number): void;
 }
@@ -282,6 +284,26 @@ export function budgetWorkspace(root: string, seed = BUDGET_SEED, clock = BUDGET
       appendRecords(
         source.file,
         [{ type: 'user', timestamp: stamp(at), message: { role: 'user', content: 'One more step.' } }],
+        at,
+      );
+    },
+    growTurn(source, at) {
+      appendRecords(
+        source.file,
+        [
+          {
+            type: 'assistant',
+            timestamp: stamp(at),
+            message: {
+              id: `${source.sessionId}-step-${at}`,
+              role: 'assistant',
+              model: 'claude-sonnet-4-6',
+              content: 'Still complete.',
+              stop_reason: 'end_turn',
+              usage: { input_tokens: 1100, output_tokens: 10 },
+            },
+          },
+        ],
         at,
       );
     },

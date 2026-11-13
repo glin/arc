@@ -655,8 +655,8 @@ import {
   METADATA_GENERATIONS,
   DerivedCacheCheckpointState,
   DerivedTitleEntry,
+  agentRunScanPending,
   agentRunScanUnread,
-  needsAgentRunScan,
   carryDerivedTitleFacts,
   derivedTitleCacheRevision,
   derivedTitleCacheStats,
@@ -670,7 +670,10 @@ import {
   saveDerivedCache,
   scanForRailEnrichment,
   SessionFactFigures,
+  shownTitleFacts,
+  shownTurnStarts,
   withAgentRunScanProgress,
+  withoutHeldStarts,
   withRailEnrichment,
   withSessionName,
   type CarriedName,
@@ -13087,7 +13090,9 @@ export class PanelProvider implements vscode.Disposable {
     const out = new Map<string, TurnStarts>();
     const lifetime = this.lifetimeRailFacts();
     for (const session of all) {
-      const starts = this.metaFor(session).starts;
+      // The starts that `shownTurnStarts` draws, read inline because this loop visits every listed session.
+      const meta = this.metaFor(session);
+      const starts = meta.starts ?? meta.heldStarts;
       const newest = lifetime[session.sessionId]?.newestTurnStartedAt;
       if (starts?.starts.length || starts?.whole) {
         out.set(session.sessionId, starts);
@@ -13105,9 +13110,8 @@ export class PanelProvider implements vscode.Disposable {
       ? new Map(
           sessions.flatMap((session) => {
             const meta = this.titleEntryOf(session.file);
-            return meta?.starts && sameSessionRevision(meta, session)
-              ? [[session.sessionId, meta.starts] as const]
-              : [];
+            const starts = meta && shownTurnStarts(meta);
+            return starts && sameSessionRevision(meta, session) ? [[session.sessionId, starts] as const] : [];
           }),
         )
       : (this.selectionWindows ?? this.windows);
@@ -16908,10 +16912,27 @@ export class PanelProvider implements vscode.Disposable {
   ): Promise<{ changed: boolean; stale: string[]; progress: boolean }> {
     let remaining = INITIAL_RAIL_READ_BYTES;
     let changed = false;
+    // Whether a stored entry changes a fact that the session list draws, and whether the pass stores any entry.
+    let drawn = false;
+    let stored = false;
+    // Whether the pass stops at its allowance before a session that needs a read.
+    let deferred = false;
     // The files whose read the host refused because they moved after the catalog listed them. The follow-up refresh names
     // them, so the held catalog lists their current revisions without a walk or a discovery request.
     const stale: string[] = [];
     let progress = false;
+    const store = (session: SessionFile, before: DerivedTitleEntry, after: DerivedTitleEntry) => {
+      this.storeTitleEntry(session.file, after);
+      this.derivedCacheCheckpointState.markChanged();
+      stored = true;
+      if (shownTitleFacts(before, session) !== shownTitleFacts(after, session)) drawn = true;
+    };
+    // A turn-start read that stores no starts of this revision drops the starts of an earlier revision. The session list
+    // then draws what it draws for an entry that holds no starts.
+    const dropHeldStarts = (session: SessionFile) => {
+      const current = this.titles.get(session.file);
+      if (current?.heldStarts !== undefined) store(session, current, withoutHeldStarts(current));
+    };
     for (const session of sessions) {
       if (signal.aborted) {
         break;
@@ -16927,6 +16948,7 @@ export class PanelProvider implements vscode.Disposable {
         (needsStarts ? Math.min(session.size, RAIL_ENRICHMENT_READ_BYTES) : 0) +
         (needsStarts ? agentRunScanUnread(session, previous.agentRunScan) : 0);
       if (bytes > remaining && remaining < INITIAL_RAIL_READ_BYTES) {
+        deferred = true;
         break;
       }
       remaining -= bytes;
@@ -16940,6 +16962,7 @@ export class PanelProvider implements vscode.Disposable {
         // A session that grows during every pass then never holds back the sessions after it.
         if (!result || signal.aborted) {
           if (signal.aborted || generation !== this.refreshGeneration) break;
+          dropHeldStarts(session);
           continue;
         }
         // A read the worker refused before opening the source spent nothing, so its charge returns to the pass.
@@ -16959,15 +16982,15 @@ export class PanelProvider implements vscode.Disposable {
             this.derivedCacheCheckpointState.markChanged();
           }
           if (generation !== this.refreshGeneration) break;
+          dropHeldStarts(session);
           continue;
         }
         if (result.value.kind !== 'starts') {
+          dropHeldStarts(session);
           continue;
         }
         next = withRailEnrichment(next, result.value.starts, result.value.agentRunScan);
-        this.storeTitleEntry(session.file, next);
-        this.derivedCacheCheckpointState.markChanged();
-        changed = true;
+        store(session, previous, next);
       }
       if (needsMetadata) {
         const metadataBytes = metadataReadBudget(session, RAIL_ENRICHMENT_READ_BYTES);
@@ -17006,12 +17029,11 @@ export class PanelProvider implements vscode.Disposable {
         next = carryDerivedTitleFacts(next, withMetadataCoverage(found, result.value.coverage), session);
         next = this.observeStoredName(session, next);
       }
-      if (JSON.stringify(previous) !== JSON.stringify(next)) {
-        this.storeTitleEntry(session.file, next);
-        this.derivedCacheCheckpointState.markChanged();
-        changed = true;
-      }
+      if (JSON.stringify(previous) !== JSON.stringify(next)) store(session, previous, next);
     }
+    // A follow-up refresh draws a changed fact. It also reads the files that this pass refused and the sessions behind its
+    // allowance when the pass stored an entry, so a chain of passes reaches every session.
+    changed = drawn || (stored && (stale.length > 0 || deferred));
     const eligible = sessions.filter((session) => {
       const entry = this.titles.get(session.file);
       return entry && railEnrichmentNeeds(entry, session)?.recovery;
@@ -17486,9 +17508,7 @@ export class PanelProvider implements vscode.Disposable {
       (meta.sourceIdentity !== undefined &&
         (String(meta.sourceIdentity.dev) !== String(session.dev) ||
           String(meta.sourceIdentity.ino) !== String(session.ino))) ||
-      (needsAgentRunScan(session) &&
-        agentRunScanUnread(session, meta.agentRunScan) > 0 &&
-        meta.agentRunScan?.end !== session.size)
+      agentRunScanPending(session, meta.agentRunScan)
         ? null
         : meta.agentRun;
     const facts = dispatched ? this.dispatchFacts.get(session.sessionId) : undefined;
@@ -18660,9 +18680,9 @@ export class PanelProvider implements vscode.Disposable {
 
   // Key Claude child relationships without file revisions. Separate spend keys track completed children and active spend bands.
   private claudeStructuralKey(session: SessionFile): string {
-    return session.agent === 'claude'
-      ? claudeRelationshipKey(session.sessionId, this.claudeChildReferences, this.claudeChildren)
-      : '';
+    if (session.agent !== 'claude') return '';
+    const own = this.childParents().get(session.sessionId);
+    return own ? claudeRelationshipKey(session.sessionId, own.references, own.children) : '';
   }
 
   private structuralKey(session: SessionFile): string {
@@ -18701,9 +18721,8 @@ export class PanelProvider implements vscode.Disposable {
 
   private claudeChildRevisions(session: SessionFile): string {
     return session.agent === 'claude'
-      ? this.claudeChildReferences
+      ? (this.childParents().get(session.sessionId)?.references ?? [])
           .flatMap((child) => (child.kind === 'dispatch' ? [] : [child]))
-          .filter((child) => child.parentSessionId === session.sessionId)
           .map((child) => `\n${child.file}:${this.claudeChildVersion(child.file)}`)
           .sort()
           .join('')

@@ -66,6 +66,9 @@ export interface DerivedTitleEntry {
   metadataWindow?: { whole: boolean; windowBytes: number; exhausted?: boolean; exhaustedRule?: number };
   sourceIdentity?: Pick<FileRevision, 'dev' | 'ino'>;
   starts?: TurnStarts;
+  // The turn starts of an earlier revision of the same file. The session list draws them until `starts` holds a read of this
+  // revision. The derived cache does not save them.
+  heldStarts?: TurnStarts;
   foldedLabel?: string;
   agentRunScan?: AgentRunScan;
   // Claude name source. A lower-ranked source cannot replace a held name.
@@ -96,6 +99,14 @@ export function agentRunScanUnread(
     return 0;
   }
   return session.size - (scan && scan.bytes <= session.size ? scan.bytes : 0);
+}
+
+// Reports whether the agent-run answer of a session waits for its scan to reach the end of the file.
+export function agentRunScanPending(
+  session: { agent: string; size: number; childTranscript?: boolean },
+  scan: AgentRunScan | undefined,
+): boolean {
+  return needsAgentRunScan(session) && agentRunScanUnread(session, scan) > 0 && scan?.end !== session.size;
 }
 
 // Carries the scan cursor into a changed revision.
@@ -159,7 +170,7 @@ export function carryDerivedTitleFacts(
   next: DerivedTitleEntry,
   session?: { agent: string; size: number; childTranscript?: boolean },
 ): DerivedTitleEntry {
-  const carried = carryAgentRunScan(previous, carrySessionName(previous, next), session);
+  const carried = carryTurnStarts(previous, carryAgentRunScan(previous, carrySessionName(previous, next), session));
   if (statsHaveContext(next.stats)) {
     return released(carried);
   }
@@ -182,6 +193,59 @@ export function carryDerivedTitleFacts(
   const out: DerivedTitleEntry = { ...carried, heldStats: previous.heldStats };
   delete out.heldRevision;
   return previous.heldRevision ? { ...out, heldRevision: previous.heldRevision } : out;
+}
+
+// Carries the turn starts of an earlier revision as held starts while the file only grew. An entry with its own starts, a
+// first read, a shrink and a replaced source carry none.
+function carryTurnStarts(previous: DerivedTitleEntry | undefined, next: DerivedTitleEntry): DerivedTitleEntry {
+  const held = previous?.starts ?? previous?.heldStarts;
+  if (
+    !previous ||
+    !held ||
+    next.starts !== undefined ||
+    next.size < previous.size ||
+    replacedMetadataSource(previous, next) ||
+    replacedTranscript(previous, next)
+  ) {
+    return withoutHeldStarts(next);
+  }
+  return { ...next, heldStarts: held };
+}
+
+export function withoutHeldStarts(entry: DerivedTitleEntry): DerivedTitleEntry {
+  if (entry.heldStarts === undefined) return entry;
+  const out = { ...entry };
+  delete out.heldStarts;
+  return out;
+}
+
+// The turn starts that the session list draws for an entry.
+export function shownTurnStarts(entry: DerivedTitleEntry): TurnStarts | undefined {
+  return entry.starts ?? entry.heldStarts;
+}
+
+// `metadataWindow` and `expandedStatsRead` reach no card, figure, loading mark or search entry that a render draws. A session
+// page reads `metadataWindow` when a client asks for the page, so a render does not carry it. The other fields of the list
+// count only through what their readers draw: `starts` and `heldStarts` through `shownTurnStarts`, and `agentRunScan`
+// through `agentRunScanPending`. Every other field counts as drawn.
+const UNDRAWN_TITLE_FIELDS = ['metadataWindow', 'expandedStatsRead', 'starts', 'heldStarts', 'agentRunScan'] as const;
+
+// The facts of an entry that the session list draws, as text. Two entries with equal text draw the same session list.
+export function shownTitleFacts(
+  entry: DerivedTitleEntry,
+  session: { agent: string; size: number; childTranscript?: boolean },
+): string {
+  const drawn: Record<string, unknown> = { ...entry };
+  for (const field of UNDRAWN_TITLE_FIELDS) delete drawn[field];
+  drawn.drawnStarts = shownTurnStarts(entry) ?? null;
+  drawn.agentRunScanPending = agentRunScanPending(session, entry.agentRunScan);
+  return JSON.stringify(
+    Object.fromEntries(
+      Object.keys(drawn)
+        .sort()
+        .map((field) => [field, drawn[field]]),
+    ),
+  );
 }
 
 // Carries the Claude session name through `resolveSessionName`.
@@ -339,10 +403,11 @@ export function withRailEnrichment(
   starts: TurnStarts,
   scan: AgentRunScan | undefined,
 ): DerivedTitleEntry {
+  const own = withoutHeldStarts(entry);
   if (scan) {
-    return { ...entry, starts, agentRunScan: scan, agentRun: agentRunOfScan(scan, entry.size) };
+    return { ...own, starts, agentRunScan: scan, agentRun: agentRunOfScan(scan, entry.size) };
   }
-  const next: DerivedTitleEntry = { ...entry, starts };
+  const next: DerivedTitleEntry = { ...own, starts };
   delete next.agentRunScan;
   return next;
 }
@@ -2001,7 +2066,7 @@ export function saveDerivedCache(
       titleRows.push({
         file: entryFile,
         agent,
-        entry: entry.agentRun === null ? { ...entry, agentRun: false } : entry,
+        entry: withoutHeldStarts(entry.agentRun === null ? { ...entry, agentRun: false } : entry),
       });
   }
   titleRows.sort((a, b) => a.file.localeCompare(b.file));
