@@ -26860,8 +26860,8 @@ test('the panel dates a session by what it recorded, not by its file being touch
   );
   sourceMatch(
     panelHostSource,
-    /= this\.metaFor\(session\)\.activityMs \?\? session\.mtimeMs;/,
-    'activityFor no longer prefers the recorded time, or no longer falls back to the mtime',
+    /const value = this\.metaFor\(session\)\.activityMs \?\? session\.mtimeMs;\s*memo\.set\(session, \{ entry, value \}\);\s*return value;/,
+    'activityFor no longer prefers the recorded time, no longer falls back to the mtime, or no longer holds and returns that time',
   );
   // Key derived title and activity metadata by the complete session revision.
   sourceMatch(
