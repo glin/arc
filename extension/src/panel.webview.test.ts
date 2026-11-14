@@ -14563,6 +14563,11 @@ test('performance diagnostics are a redacted read-only snapshot of held state', 
     /vscode\.window\.|showSaveDialog|show\w*Message|reveal\(|\.focus\(|executeCommand\(/,
     'a channel capture shows something in the window or moves focus',
   );
+  sourceDoesNotMatch(
+    channelCapture,
+    /vscode\.workspace\.fs\b/,
+    'a channel capture writes through the editor file system beside its exclusive creation',
+  );
   // Each call of another member of the provider is on this list, so a helper cannot show something or move focus.
   const channelCaptureCalls = ['performanceCounters.recordCapture', 'performanceDiagnostics', 'diagnostics.warn'];
   for (const [, member] of channelCapture.matchAll(/\bthis\.([\w.?]+)\s*\(/g))
@@ -14740,6 +14745,13 @@ test('a channel capture keeps existing files, refuses with its reason, and shows
     shown.push(`executeCommand: ${JSON.stringify(args)}`);
     return Promise.resolve(undefined);
   };
+  const editorFiles = editorWorkspace.fs;
+  editorWorkspace.fs = {
+    writeFile: (...args: unknown[]) => {
+      shown.push(`workspace.fs.writeFile: ${JSON.stringify(args)}`);
+      assert.fail('a channel capture wrote through the editor file system');
+    },
+  };
   const capturedAt = Date.UTC(2026, 10, 13, 4, 5, 6, 789);
   const clock = vi.spyOn(Date, 'now').mockReturnValue(capturedAt);
   const name = performanceDiagnosticsFileName(capturedAt);
@@ -14783,6 +14795,8 @@ test('a channel capture keeps existing files, refuses with its reason, and shows
     vi.unstubAllEnvs();
     for (const name of windowStubs) delete editorWindow[name];
     delete editorCommands.executeCommand;
+    if (editorFiles === undefined) delete editorWorkspace.fs;
+    else editorWorkspace.fs = editorFiles;
     editorWorkspace.workspaceFolders = folders;
   }
 

@@ -980,16 +980,23 @@ test('a path that cannot be written is reported, and answers with no file', asyn
 
 const CAPTURE_JSON = `${JSON.stringify(SNAPSHOT, null, 2)}\n`;
 
-// Record the file operations of a window channel capture. Like the file system, a write without the `wx` flag
+// Record the file operations of a window channel capture. Like the file system, an open without the `wx` flag
 // replaces a name in `taken` and follows a link there. With the flag, a taken name fails with EEXIST.
-function channelFiles(taken: Iterable<string> = [], failure?: Error & { code?: string }) {
+// `failure` fails each open. `after` fails the write or the close of a file that the open created.
+function channelFiles(
+  taken: Iterable<string> = [],
+  failure?: Error & { code?: string },
+  after: { write?: Error; close?: Error } = {},
+) {
   const existing = new Set(taken);
-  const writes: { file: string; bytes: number; flag: string }[] = [];
+  const writes: { file: string; flag: string }[] = [];
   const directories: string[] = [];
+  const removed: string[] = [];
   const reported: PerformanceDiagnosticsFailure[] = [];
   return {
     writes,
     directories,
+    removed,
     reported,
     report: (failure: PerformanceDiagnosticsFailure): void => {
       reported.push(failure);
@@ -1000,14 +1007,22 @@ function channelFiles(taken: Iterable<string> = [], failure?: Error & { code?: s
         directories.push(directory);
         return Promise.resolve(undefined);
       },
-      writeFile: (file: string, contents: Uint8Array, options: { flag: 'wx' }): Promise<void> => {
-        writes.push({ file, bytes: contents.byteLength, flag: options.flag });
+      open: (file: string, flags: 'wx') => {
+        writes.push({ file, flag: flags });
         if (failure) return Promise.reject(failure);
-        if (existing.has(file) && options.flag === 'wx')
+        if (existing.has(file) && flags === 'wx')
           return Promise.reject(
             Object.assign(new Error(`EEXIST: file already exists, open '${file}'`), { code: 'EEXIST' }),
           );
         existing.add(file);
+        return Promise.resolve({
+          writeFile: (): Promise<void> => (after.write ? Promise.reject(after.write) : Promise.resolve()),
+          close: (): Promise<void> => (after.close ? Promise.reject(after.close) : Promise.resolve()),
+        });
+      },
+      unlink: (file: string): Promise<void> => {
+        removed.push(file);
+        existing.delete(file);
         return Promise.resolve();
       },
     },
@@ -1086,6 +1101,21 @@ test('a window channel capture picks its destination by the same rules on Window
       });
       assert.equal(saved.file, expected, `a capture with ${JSON.stringify(environment)} left its destination`);
     }
+    if (paths === path.win32) {
+      // A Windows path with a root and no drive takes the drive of the editor's current folder, here D:.
+      const sink = channelFiles();
+      const saved = await createPerformanceCaptureFile({
+        snapshot: SNAPSHOT,
+        environment: { [variable]: '\\Perf\\Out' },
+        workspaceFolder: folder,
+        capturedAt: CAPTURED_AT,
+        paths: { ...path.win32, resolve: (...segments: string[]) => path.win32.resolve('D:\\Editor', ...segments) },
+        files: sink.files,
+        report: sink.report,
+      });
+      assert.equal(saved.file, `D:\\Perf\\Out\\${name}`, 'the reply names a path with no drive');
+      assert.deepEqual(sink.writes, [{ file: saved.file, flag: 'wx' }], 'the capture wrote a path with no drive');
+    }
     // With no folder, a full path still works, and a relative directory or no directory refuses.
     const absolute = cases[0][0];
     const sink = channelFiles();
@@ -1133,7 +1163,7 @@ test('a window channel capture picks its destination by the same rules on Window
   }
 });
 
-test('a window channel capture refuses after its bounded fresh names, and refuses a failed write at once', async () => {
+test('a window channel capture refuses after its bounded fresh names, and refuses a failed creation at once', async () => {
   const environment = { [PERFORMANCE_DIAGNOSTICS_DIRECTORY_VARIABLE]: ROOT };
   const taken = channelFiles([], Object.assign(new Error('EEXIST: file already exists'), { code: 'EEXIST' }));
   await assert.rejects(
@@ -1148,8 +1178,10 @@ test('a window channel capture refuses after its bounded fresh names, and refuse
     new RegExp(`${PERFORMANCE_CAPTURE_NAME_ATTEMPTS} capture file names there already exist\\. Nothing was saved\\.$`),
   );
   assert.equal(taken.writes.length, PERFORMANCE_CAPTURE_NAME_ATTEMPTS, 'a channel capture tried names without a bound');
+  assert.equal(taken.writes.length, 16, 'a channel capture tries a number of names other than the 16 the guides state');
   assert.equal(new Set(taken.writes.map(({ file }) => file)).size, PERFORMANCE_CAPTURE_NAME_ATTEMPTS);
   assert.equal(taken.reported.length, 1, 'a channel capture that ran out of names is not in the log');
+  assert.deepEqual(taken.removed, [], 'a channel capture removed a file that it did not create');
 
   const denied = channelFiles([], Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' }));
   await assert.rejects(
@@ -1163,11 +1195,46 @@ test('a window channel capture refuses after its bounded fresh names, and refuse
     }),
     /could not save performance diagnostics to .*EACCES: permission denied/,
   );
-  assert.equal(denied.writes.length, 1, 'a failed write moved to another name');
+  assert.equal(denied.writes.length, 1, 'a failed creation moved to another name');
   assert.deepEqual(
     denied.reported.map((failure) => [failure.file, failure.reason]),
     [[path.join(ROOT, performanceDiagnosticsFileName(CAPTURED_AT)), 'EACCES: permission denied']],
   );
+  assert.deepEqual(denied.removed, [], 'a channel capture removed a file that it did not create');
+});
+
+test('a window channel capture that fails to write removes only the file that it created', async () => {
+  const environment = { [PERFORMANCE_DIAGNOSTICS_DIRECTORY_VARIABLE]: ROOT };
+  const first = path.join(ROOT, performanceDiagnosticsFileName(CAPTURED_AT));
+  const fresh = first.replace(/\.json$/, '-1.json');
+  for (const [stage, failure] of [
+    ['write', new Error('ENOSPC: no space left on device, write')],
+    ['close', new Error('EIO: i/o error, close')],
+  ] as const) {
+    const reason = failure.message;
+    // The first name holds an existing file, so the capture creates the second name and then fails.
+    const sink = channelFiles([first], undefined, { [stage]: failure });
+    await assert.rejects(
+      createPerformanceCaptureFile({
+        snapshot: SNAPSHOT,
+        environment,
+        workspaceFolder: null,
+        capturedAt: CAPTURED_AT,
+        files: sink.files,
+        report: sink.report,
+      }),
+      (error: Error) => {
+        assert.equal(error.message, `Arc could not save performance diagnostics to ${fresh}. ${reason}`);
+        return true;
+      },
+    );
+    assert.deepEqual(sink.removed, [fresh], 'a failed write left a partial file, or removed a file it did not create');
+    assert.deepEqual(
+      sink.reported.map((failure) => [failure.file, failure.reason]),
+      [[fresh, reason]],
+      'a failed write is not in the log',
+    );
+  }
 });
 
 test('a window channel capture keeps an existing file, and two captures in one millisecond write two files', async () => {

@@ -1172,7 +1172,8 @@ export const PERFORMANCE_CAPTURE_NAME_ATTEMPTS = 16;
 // The file operations of a window channel capture. The `wx` flag creates a file and fails when its name exists.
 export interface PerformanceCaptureFiles {
   mkdir(directory: string, options: { recursive: true }): Promise<unknown>;
-  writeFile(file: string, contents: Uint8Array, options: { flag: 'wx' }): Promise<void>;
+  open(file: string, flags: 'wx'): Promise<{ writeFile(contents: Uint8Array): Promise<void>; close(): Promise<void> }>;
+  unlink(file: string): Promise<void>;
 }
 
 export interface PerformanceCaptureRequest extends Omit<PerformanceDiagnosticsTarget, 'target'> {
@@ -1182,7 +1183,8 @@ export interface PerformanceCaptureRequest extends Omit<PerformanceDiagnosticsTa
 }
 
 // Create a new file for a window channel capture. The capture directory comes first, then the open folder.
-// An existing file or link at a name stays as it is, and the capture takes the next numbered name.
+// An existing file at a name stays as it is, and the capture takes the next numbered name.
+// After a failed write, the capture removes the file that it created and ignores a failure of that removal.
 // A refusal reports its failure and rejects with the message for the caller.
 export async function createPerformanceCaptureFile(
   request: PerformanceCaptureRequest,
@@ -1210,8 +1212,10 @@ export async function createPerformanceCaptureFile(
       reason: `a relative destination needs an open folder to be read against: ${destination.given}`,
       message: absent,
     });
-  const first = destination.kind === 'file' ? destination.file : destination.suggested;
-  if (!first) throw refusal({ file: null, reason: 'no open folder and no capture directory', message: absent });
+  const chosen = destination.kind === 'file' ? destination.file : destination.suggested;
+  if (!chosen) throw refusal({ file: null, reason: 'no open folder and no capture directory', message: absent });
+  // A Windows path such as `\Perf` names no drive. The reply names the drive that the write uses.
+  const first = paths.resolve(chosen);
   const directory = paths.dirname(first);
   const contents = Buffer.from(`${JSON.stringify(request.snapshot, null, 2)}\n`, 'utf8');
   try {
@@ -1221,12 +1225,24 @@ export async function createPerformanceCaptureFile(
   }
   for (let attempt = 0; attempt < PERFORMANCE_CAPTURE_NAME_ATTEMPTS; attempt++) {
     const file = attempt === 0 ? first : `${first.slice(0, -'.json'.length)}-${attempt}.json`;
+    let handle: Awaited<ReturnType<PerformanceCaptureFiles['open']>>;
     try {
-      await files.writeFile(file, contents, { flag: 'wx' });
-      return { file, bytes: contents.byteLength };
+      handle = await files.open(file, 'wx');
     } catch (error) {
-      if ((error as { code?: unknown } | null)?.code !== 'EEXIST') throw failed(file, error);
+      if ((error as { code?: unknown } | null)?.code === 'EEXIST') continue;
+      throw failed(file, error);
     }
+    try {
+      await handle.writeFile(contents).catch(async (error: unknown) => {
+        await handle.close().catch(() => undefined);
+        throw error;
+      });
+      await handle.close();
+    } catch (error) {
+      await files.unlink(file).catch(() => undefined);
+      throw failed(file, error);
+    }
+    return { file, bytes: contents.byteLength };
   }
   throw refusal({
     file: first,
