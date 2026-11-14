@@ -98,7 +98,7 @@ await vscode.commands.executeCommand('arc.savePerformanceDiagnostics', file);
 
 The command returns the written path or `null` after cancellation or failure. Failure appears in the window and as `performanceCaptureFailed`, even with detailed logging off. An explicit path overrides `ARC_PERF_OUT_DIR`. Relative paths resolve against the open folder and fail without one. `extension/src/performancediagnostics.ts` owns destination selection.
 
-An agent in a terminal saves the same capture from a running window with `arc diagnostics performance --window HOST_ID`. [Performance capture](window-channel.md#performance-capture) owns where the window writes it.
+An agent in a terminal saves the same capture from a running window with `arc diagnostics performance --window WINDOW_ID`. [Performance capture](window-channel.md#performance-capture) owns where the window writes it.
 
 Read `panelAdopted` before comparing startups. `created` means command-opened, `serializer` means restored, and `serializer-replaced` means stale stored options required replacement. `panelRevealed` retains its adoption origin. These records require `arc.diagnostics.log`. `revivePanel` and `adoptPanel` in `extension/src/panelhost.ts` own restoration and prompt-recovery failure handling.
 

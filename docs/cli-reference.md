@@ -257,9 +257,9 @@ Unavailable source facts project no marks. Reader boundaries remain separate, an
 
 `diagnostics performance` requires `--window`. `ARC_WINDOW` and terminal ownership never select its window. The selected window must list `performanceCapture`. Otherwise the command refuses before it connects and says that the window must reload after an update.
 
-Text output names the saved file and its size. `--json` prints `version: 1`, `file`, `bytes`, and `capturedAt`. `file` is the absolute path that the window wrote. `bytes` is its size. `capturedAt` is the capture time in milliseconds since the epoch. The output carries no capture content.
+Text output names the saved file and its size. `--json` prints `version: 1`, `file`, `bytes`, and `capturedAt`. `file` is the absolute path of the new file that the window created. `bytes` is its size. `capturedAt` is the capture time in milliseconds since the epoch. The output carries no capture content.
 
-The window refuses without an open folder or `ARC_PERF_OUT_DIR`, and refuses a relative `ARC_PERF_OUT_DIR` without an open folder. A failed write refuses with its reason. A request while another capture runs refuses. So does a request past the [activation allowance](window-channel.md#performance-capture). The exchange allows five seconds. A reply that does not arrive in time reports that the window did not answer, and the window can still write the file.
+The window refuses without an open folder or `ARC_PERF_OUT_DIR`, and refuses a relative `ARC_PERF_OUT_DIR` without an open folder. It refuses when every [file name that it tries](window-channel.md#performance-capture) exists. A failed write refuses with its reason. A request while another capture runs refuses. A capture that never finishes keeps that refusal until a window reload. Each activation runs at most 256 captures. Every capture that reaches the window counts, whether or not it saves a file. Later requests refuse until a window reload. The exchange allows five seconds. A reply that does not arrive in time reports that the window did not answer, and the window can still write the file.
 
 ## Cost reports
 
