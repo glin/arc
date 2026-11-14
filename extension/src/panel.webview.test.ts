@@ -33864,10 +33864,10 @@ test('a ready host stages worker-backed session data without clearing accepted c
     'catalog enrichment can own a selected-session window read after selected work settles',
   );
   const renderPost = layoutIndexOf(refresh, 'void this.postRows(host, message');
-  const deferredMetadata = layoutIndexOf(
-    refresh,
-    'const prepared = await this.prepareMetadata(all, generation, controller.signal);',
-  );
+  const deferredMetadata =
+    /if \(metadataAfterRender\) \{[^}]*await this\.prepareMetadata\(all, generation, controller\.signal\);[^}]*if \(!prepared\) return;\s*\}/.exec(
+      refresh,
+    )?.index ?? -1;
   assert.ok(
     renderPost >= 0 && deferredMetadata > renderPost,
     'accepted selected cards wait for another metadata hydration batch before their first post',

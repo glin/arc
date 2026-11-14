@@ -67,6 +67,9 @@ const COUNTS = new Set([
   'compressedDecodes',
   'compressedPending',
   'compressedTempEntries',
+  'heldPresses',
+  'heldPressesFailed',
+  'heldPressesNotShown',
   ...DISCOVERY_CAUSE_MEASURES.filter((name) => !name.endsWith('Bytes')),
 ]);
 const BYTES = new Set([
@@ -90,6 +93,9 @@ export const REPORT_ONLY = new Set([
   'receiptLaunchesRead',
   'receiptLaunchesRejectedAtRequester',
   'receiptScanTurns',
+  'heldPresses',
+  'heldPressesFailed',
+  'heldPressesNotShown',
   ...DISCOVERY_CAUSE_MEASURES,
 ]);
 export const REPORT_ONLY_PREFIXES = [

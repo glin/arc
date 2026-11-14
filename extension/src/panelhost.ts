@@ -1824,6 +1824,8 @@ export class PanelProvider implements vscode.Disposable {
   private compressedLoadStarted = false;
   private compressedFollowTimer: ReturnType<typeof setTimeout> | null = null;
   private compressedRenderSeen = false;
+  // Whether the startup record holds the `completeRender` stage.
+  private completeRenderRecorded = false;
   // Row-file names whose entry changed since the last list merged them, and the last walk that the rows join.
   private compressedRowsDirty: Set<string> | null = null;
   // The row of each compressed entry that the last list gave. A discovery reply keeps them without a stat per entry.
@@ -5465,6 +5467,7 @@ export class PanelProvider implements vscode.Disposable {
       if (stage === 'railReady' && usableRows) this.startupHistory?.stage('firstUsableRow');
       if (stage === 'firstCard') this.startupHistory?.stage('selectedText');
       this.performanceCounters.recordStartup(stage, performance.now());
+      if (stage === 'completeRender') this.completeRenderRecorded = true;
       if (stage === 'railReady') {
         if (this.codexColdPass?.listing || this.finishedColdPass) this.coldPassDrawGeneration = generation;
         for (const [source, route] of this.clearRoutes ?? []) {
@@ -5477,8 +5480,8 @@ export class PanelProvider implements vscode.Disposable {
           }
         }
       }
-    } else if (stage === 'completeRender') {
-      // A refresh moved the generation between the paint and its acknowledgment, so the stage is not recorded.
+    } else if (stage === 'completeRender' && !this.completeRenderRecorded) {
+      // A refresh moved the generation after the post, so the host drops this acknowledgment of the startup stage.
       this.performanceCounters.recordWork('completeRenderDropped:staleGeneration');
     }
     // The paint is recorded first, because the listing that this starts moves the refresh generation.
@@ -13014,12 +13017,13 @@ export class PanelProvider implements vscode.Disposable {
     if (this.dispatchDiscoveryPending || this.dispatchSpendPending || this.discoveryComplete !== undefined)
       return 'discovery';
     if (this.compressedRowsDirty?.size || this.compressedRowsWaiting) return 'compressedRows';
-    // The gauges name the sessions whose presses keep a poll from standing in for its refresh.
+    // The gauges count the sessions whose presses keep a poll from standing in for its refresh.
     const held = Object.entries(this.live ?? {});
     let failed = 0;
     let notShown = 0;
     if (held.length) {
-      const shown = new Set([this.showing, ...(this.hostSessions?.values() ?? [])]);
+      // Each attached panel shows the session that the render of that panel draws.
+      const shown = new Set(this.hosts.map((host) => this.hostSessions?.get(host) ?? this.showing));
       for (const [session, presses] of held) {
         if (presses.some((press) => press.failed)) failed++;
         if (!shown.has(session)) notShown++;

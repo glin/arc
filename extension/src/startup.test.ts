@@ -2476,13 +2476,17 @@ test('every part row of the catalog enumeration reports and never fails', () => 
   assert.deepEqual([whole.reportOnly, whole.regressed], [false, true]);
 });
 
-test('a comparison whose baseline holds no refresh stage row reports the new rows and never fails on them', () => {
+test('a comparison whose baseline holds no refresh stage row or held press gauge reports them and never fails on them', () => {
   const stages = ['discovery-wait', 'discovery-host', 'metadata', 'build', 'post', 'enrichment', 'held-sweep'];
-  const names = stages.flatMap((stage) => [
-    `refreshCount:refresh-stage:${stage}`,
-    `refreshMs:refresh-stage:${stage}`,
-    `refreshMaxMs:refresh-stage:${stage}`,
-  ]);
+  const gauges = ['heldPresses', 'heldPressesFailed', 'heldPressesNotShown'];
+  const names = [
+    ...stages.flatMap((stage) => [
+      `refreshCount:refresh-stage:${stage}`,
+      `refreshMs:refresh-stage:${stage}`,
+      `refreshMaxMs:refresh-stage:${stage}`,
+    ]),
+    ...gauges,
+  ];
   const measures = compareResults(
     [runnerResult()],
     [runnerResult(Object.fromEntries(names.map((name) => [name, 4_000])))],
@@ -2491,6 +2495,8 @@ test('a comparison whose baseline holds no refresh stage row reports the new row
     const row = measures.find((measure) => measure.name === name)!;
     assert.deepEqual([row.baseline, row.candidate, row.reportOnly, row.regressed], [null, 4_000, true, false], name);
   }
+  const counted = measuresOf({ soak: { end: Object.fromEntries(gauges.map((name) => [name, 4_000])) } });
+  for (const name of gauges) assert.equal(counted.get(name)?.kind, 'count', name);
 });
 
 test('the opening read counts of a saved snapshot reach the report and never fail', () => {
@@ -11046,8 +11052,9 @@ test('a catalog walk records each part of the enumeration time, and the parts su
   );
 });
 
-// A refresh whose controlled clock moves only inside one step of each stage: the enumeration, the held-file sweep, the
-// discovery request on each side of its wait, the metadata reads, the render post, the build and the enrichment pass.
+// A refresh with a controlled clock that moves only inside one step of each stage.
+// The steps are the enumeration, the held-file sweep and each side of the discovery wait.
+// The metadata reads, the render post, the build and the enrichment pass follow.
 function stagedRefreshHarness(scope: Record<string, unknown> = {}) {
   let clock = 0;
   const advance = (ms: number) => {
@@ -11134,6 +11141,15 @@ test('a catalog refresh that sends a discovery request and renders records each 
   await provider.refresh(true, false, false, true);
   assert.ok(refreshes.has('catalog-enumeration'), 'the selected-only refresh did not run');
   assert.deepEqual(stages(), {}, 'a selected-only refresh recorded a stage');
+});
+
+test('a refresh that posts to two panels records one post row that holds both posts', async () => {
+  const { provider, stages } = stagedRefreshHarness();
+  const second = { webview: { postMessage: () => Promise.resolve(true) }, active: () => false, visible: () => true };
+  provider.hosts = [...provider.hosts, second];
+  provider.readyHosts = new Set(provider.hosts);
+  await provider.refresh(true);
+  assert.deepEqual(stages()['refresh-stage:post'], [6], 'the post row did not add the post of each panel once');
 });
 
 test('a refresh that returns after its discovery wait records only the stages that it finished', async () => {
@@ -21841,7 +21857,7 @@ test('a completeRender acknowledgment after a refresh moved the generation count
   provider.performanceCounters = counters;
   provider.maybeStartCompressedLoad = () => {};
   provider.readyHosts.add(panel);
-  // The panel painted the render of generation 1, and a refresh moved the generation before the acknowledgment arrived.
+  // The host posted the render of generation 1, and a refresh moved the generation before the acknowledgment arrived.
   provider.refreshGeneration = 2;
   provider.browserPainted(panel, 1, 'completeRender');
   assert.equal(counters.snapshot().startup, undefined);
@@ -21851,6 +21867,14 @@ test('a completeRender acknowledgment after a refresh moved the generation count
     counters.snapshot().work['completeRenderDropped:staleGeneration'],
     1,
     'an acknowledgment of the current generation counted as dropped',
+  );
+  // Once the startup record holds the stage, an acknowledgment of an old generation adds nothing.
+  provider.refreshGeneration = 3;
+  provider.browserPainted(panel, 2, 'completeRender');
+  assert.equal(
+    counters.snapshot().work['completeRenderDropped:staleGeneration'],
+    1,
+    'an acknowledgment after the startup record held the stage counted as dropped',
   );
 });
 
@@ -24156,7 +24180,7 @@ test('a render post names each session list field that differs from the held car
   );
 });
 
-test('a render post measured by the diagnostics samples the bytes of its complete fields', async () => {
+test('the first measured render post and every sixteenth one after it record the bytes of their complete fields', async () => {
   const posted = async (scope: Record<string, unknown> = {}) => {
     const provider = paintHarness(['sendToHost'], scope);
     provider.useRailPayload(() => ({ rail: [], labels: [], views: [], railFilters: [], stats: {} }));
