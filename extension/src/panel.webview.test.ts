@@ -2804,6 +2804,7 @@ import { performance } from 'node:perf_hooks';
 import { replaceRows, replaceStats } from './webview/row-deltas.ts';
 import {
   PanelPerformanceCounters,
+  performanceDiagnosticsFileName,
   savePerformanceDiagnosticsSnapshot,
   serializedMessageBytes,
   type PerformanceEventSink,
@@ -14553,14 +14554,29 @@ test('performance diagnostics are a redacted read-only snapshot of held state', 
   );
   sourceMatch(
     channelCapture,
-    /savePerformanceDiagnosticsSnapshot\(\{/,
-    'a channel capture picks its own destination instead of the tested rules',
+    /createPerformanceCaptureFile\(\{/,
+    'a channel capture picks its own destination or write instead of the tested rules',
   );
   sourceDoesNotMatch(channelCapture, /\btarget\b/, 'a channel capture takes a destination from the caller');
   sourceDoesNotMatch(
     channelCapture,
-    /vscode\.window\.|showSaveDialog|show\w*Message/,
-    'a channel capture shows something in the window',
+    /vscode\.window\.|showSaveDialog|show\w*Message|reveal\(|\.focus\(|executeCommand\(/,
+    'a channel capture shows something in the window or moves focus',
+  );
+  // Each call of another member of the provider is on this list, so a helper cannot show something or move focus.
+  const channelCaptureCalls = ['performanceCounters.recordCapture', 'performanceDiagnostics', 'diagnostics.warn'];
+  for (const [, member] of channelCapture.matchAll(/\bthis\.([\w.?]+)\s*\(/g))
+    assert.ok(
+      channelCaptureCalls.includes(member),
+      `a channel capture calls this.${member}, which is not on its list of calls that show nothing`,
+    );
+  const activateSource = declarationSource(fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8'), 'activate');
+  const captureHandlers = callSources(activateSource, 'channel?.setPerformanceCaptureHandler');
+  assert.equal(captureHandlers.length, 1, 'activate does not give the window channel its performance capture');
+  sourceMatch(
+    captureHandlers[0],
+    /\(\(\) => panel\.capturePerformanceForChannel\(\)\)/,
+    'the window channel capture does not reach the panel capture',
   );
   sourceDoesNotMatch(
     channelCapture,
@@ -14692,7 +14708,7 @@ test('a capture that writes nothing puts its reason where a run with no reader c
   );
 });
 
-test('a channel capture that writes nothing logs its reason, refuses, and shows nothing in the window', async () => {
+test('a channel capture keeps existing files, refuses with its reason, and shows nothing in the window', async () => {
   const shown: string[] = [];
   const diagnostics = createDiagnosticsLog({
     enabled: false,
@@ -14707,25 +14723,34 @@ test('a channel capture that writes nothing logs its reason, refuses, and shows 
     disposed: false,
     performanceCounters: { recordWork() {}, recordRowPost() {}, recordRowsGap() {}, recordCapture: () => undefined },
     performanceDiagnostics: () => ({ schemaVersion: 1 }),
+    // An editor panel tab that a capture must leave where it is.
+    editorPanel: { webview: {}, reveal: (...args: unknown[]) => shown.push(`reveal: ${JSON.stringify(args)}`) },
   });
   const editorWindow = vscode.window as unknown as Record<string, unknown>;
-  const fileUri = vscode.Uri as unknown as Record<string, unknown>;
+  const editorCommands = vscode.commands as unknown as Record<string, unknown>;
   const editorWorkspace = vscode.workspace as unknown as Record<string, unknown>;
-  for (const name of ['showErrorMessage', 'showInformationMessage', 'showWarningMessage', 'showSaveDialog'])
+  const folders = editorWorkspace.workspaceFolders;
+  const windowStubs = ['showErrorMessage', 'showInformationMessage', 'showWarningMessage', 'showSaveDialog'];
+  for (const name of windowStubs)
     editorWindow[name] = (message: unknown) => {
       shown.push(`${name}: ${String(message)}`);
       return Promise.resolve(undefined);
     };
-  fileUri.file = (file: string) => ({ fsPath: file });
-  let writes: { file: string; bytes: number }[] = [];
-  let failure: Error | null = new Error('EACCES: permission denied');
-  editorWorkspace.fs = {
-    writeFile: (uri: { fsPath: string }, contents: Uint8Array) => {
-      writes.push({ file: uri.fsPath, bytes: contents.byteLength });
-      return failure ? Promise.reject(failure) : Promise.resolve();
-    },
+  editorCommands.executeCommand = (...args: unknown[]) => {
+    shown.push(`executeCommand: ${JSON.stringify(args)}`);
+    return Promise.resolve(undefined);
   };
-  const directory = path.join(path.sep === '\\' ? 'C:\\arc-capture' : '/arc-capture', 'out');
+  const capturedAt = Date.UTC(2026, 10, 13, 4, 5, 6, 789);
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(capturedAt);
+  const name = performanceDiagnosticsFileName(capturedAt);
+  const root = tempDir('arc-channel-capture-');
+  const [first, second, captures] = ['First Folder', 'Second Folder', 'Captures'].map((folder) => {
+    fs.mkdirSync(path.join(root, folder));
+    return path.join(root, folder);
+  });
+  fs.writeFileSync(path.join(captures, name), 'kept');
+  const blocker = path.join(root, 'blocker');
+  fs.writeFileSync(blocker, 'not a folder');
   const capture = provider as unknown as {
     capturePerformanceForChannel(): Promise<{ version: number; file: string; bytes: number; capturedAt: number }>;
   };
@@ -14736,46 +14761,87 @@ test('a channel capture that writes nothing logs its reason, refuses, and shows 
       (error: Error) => outcomes.push(error.message),
     );
   try {
-    // No folder and no capture directory.
+    editorWorkspace.workspaceFolders = undefined;
+    // No folder and no capture directory, then a relative capture directory with no folder.
     vi.stubEnv('ARC_PERF_OUT_DIR', '');
     await attempt();
-    vi.stubEnv('ARC_PERF_OUT_DIR', directory);
+    vi.stubEnv('ARC_PERF_OUT_DIR', 'out');
     await attempt();
-    failure = null;
+    // A capture directory that cannot hold a folder, then one whose first name is taken.
+    vi.stubEnv('ARC_PERF_OUT_DIR', path.join(blocker, 'out'));
+    await attempt();
+    vi.stubEnv('ARC_PERF_OUT_DIR', captures);
+    await attempt();
+    // With no capture directory, the first folder of the workspace.
+    vi.stubEnv('ARC_PERF_OUT_DIR', '');
+    editorWorkspace.workspaceFolders = [first, second].map((folder) => ({ uri: { fsPath: folder } }));
     await attempt();
     provider.disposed = true;
-    writes = [];
     await attempt();
   } finally {
+    clock.mockRestore();
     vi.unstubAllEnvs();
-    for (const name of ['showErrorMessage', 'showInformationMessage', 'showWarningMessage', 'showSaveDialog'])
-      delete editorWindow[name];
-    delete fileUri.file;
-    delete editorWorkspace.fs;
+    for (const name of windowStubs) delete editorWindow[name];
+    delete editorCommands.executeCommand;
+    editorWorkspace.workspaceFolders = folders;
   }
 
-  assert.deepEqual(shown, [], 'a channel capture showed something in the window');
-  assert.match(String(outcomes[0]), /Open a folder/, 'a capture with no destination did not refuse');
-  assert.match(String(outcomes[1]), /EACCES: permission denied/, 'a failed write did not refuse with its reason');
-  const saved = outcomes[2] as { version: number; file: string; bytes: number; capturedAt: number };
-  assert.equal(saved.version, 1);
-  assert.equal(path.dirname(saved.file), directory, 'the capture left the host capture directory');
-  assert.equal(saved.bytes, `${JSON.stringify({ schemaVersion: 1 }, null, 2)}\n`.length);
-  assert.ok(Number.isSafeInteger(saved.capturedAt));
-  assert.match(String(outcomes[3]), /closed/, 'a closed window saved a capture');
-  assert.deepEqual(writes, [], 'a closed window wrote a file');
+  assert.deepEqual(shown, [], 'a channel capture showed something in the window or moved focus');
+  const absent =
+    /^Open a folder in the selected Arc window, or start the editor with ARC_PERF_OUT_DIR set to a full path\./;
+  assert.match(String(outcomes[0]), absent, 'a capture with no destination did not refuse');
+  assert.match(
+    String(outcomes[1]),
+    absent,
+    'a relative capture directory with no folder gave advice the caller cannot follow',
+  );
+  assert.match(
+    String(outcomes[2]),
+    /could not save performance diagnostics/,
+    'a failed write did not refuse with its reason',
+  );
+  const json = `${JSON.stringify({ schemaVersion: 1 }, null, 2)}\n`;
+  assert.equal(
+    fs.readFileSync(path.join(captures, name), 'utf8'),
+    'kept',
+    'a channel capture replaced an existing file',
+  );
+  for (const [index, folder] of [
+    [3, captures],
+    [4, first],
+  ] as const) {
+    const saved = outcomes[index] as { version: number; file: string; bytes: number; capturedAt: number };
+    assert.equal(saved.version, 1);
+    assert.equal(path.dirname(saved.file), folder, 'the capture left its destination folder');
+    assert.equal(fs.readFileSync(saved.file, 'utf8'), json, 'the reply names a file that does not hold the capture');
+    assert.equal(saved.bytes, fs.statSync(saved.file).size, 'the reply does not give the size of its file');
+    assert.equal(saved.capturedAt, capturedAt);
+  }
+  assert.notEqual((outcomes[3] as { file: string }).file, path.join(captures, name));
+  assert.deepEqual(fs.readdirSync(second), [], 'a capture went to the second folder of the workspace');
+  assert.match(String(outcomes[5]), /closed/, 'a closed window saved a capture');
+  assert.deepEqual(fs.readdirSync(first), [name], 'a closed window wrote a file');
   const lines = fs
     .readFileSync(diagnostics.file()!, 'utf8')
     .trim()
     .split('\n')
     .map((line) => JSON.parse(line) as Record<string, unknown>);
   assert.deepEqual(
-    lines.map((line) => [line.event, line.file === null ? null : path.dirname(String(line.file)), line.reason]),
+    lines.map((line) => [
+      line.event,
+      line.file,
+      line.reason === undefined ? undefined : String(line.reason).length > 0,
+    ]),
     [
-      ['performanceCaptureFailed', null, 'no open folder and no capture directory'],
-      ['performanceCaptureFailed', directory, 'EACCES: permission denied'],
+      ['performanceCaptureFailed', null, true],
+      ['performanceCaptureFailed', null, true],
+      ['performanceCaptureFailed', path.join(blocker, 'out', name), true],
     ],
     'a channel capture failure is not in the log a run with no reader can read',
+  );
+  assert.deepEqual(
+    lines.slice(0, 2).map((line) => line.reason),
+    ['no open folder and no capture directory', 'a relative destination needs an open folder to be read against: out'],
   );
 });
 

@@ -1,4 +1,5 @@
 import * as path from 'node:path';
+import { promises as nodeFiles } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { monitorEventLoopDelay, type IntervalHistogram } from 'node:perf_hooks';
 
@@ -1077,39 +1078,42 @@ export interface PerformanceDiagnosticsTarget {
   environment?: Record<string, string | undefined>;
   workspaceFolder?: string | null;
   capturedAt: number;
+  // The path rules of the host. Tests pass `path.win32` or `path.posix`.
+  paths?: path.PlatformPath;
 }
 
 // Resolve relative paths against the open folder. Refuse them when no folder is open.
-function against(folder: string | null, given: string): string | null {
-  if (path.isAbsolute(given)) {
-    return path.normalize(given);
+function against(folder: string | null, given: string, paths: path.PlatformPath): string | null {
+  if (paths.isAbsolute(given)) {
+    return paths.normalize(given);
   }
-  return folder ? path.resolve(folder, given) : null;
+  return folder ? paths.resolve(folder, given) : null;
 }
 
 // An explicit file takes precedence over the environment directory. With neither, the reader selects a file.
 export function performanceDiagnosticsDestination(
   request: PerformanceDiagnosticsTarget,
 ): PerformanceDiagnosticsDestination {
+  const paths = request.paths ?? path;
   const folder = request.workspaceFolder ?? null;
   const named = (request.target ?? '').trim();
   if (named) {
-    const file = against(folder, named);
+    const file = against(folder, named, paths);
     return file ? { kind: 'file', file, source: 'argument' } : { kind: 'refuse', given: named };
   }
   const directory = (request.environment?.[PERFORMANCE_DIAGNOSTICS_DIRECTORY_VARIABLE] ?? '').trim();
   if (directory) {
-    const root = against(folder, directory);
+    const root = against(folder, directory, paths);
     if (!root) {
       return { kind: 'refuse', given: directory };
     }
     return {
       kind: 'file',
-      file: path.join(root, performanceDiagnosticsFileName(request.capturedAt)),
+      file: paths.join(root, performanceDiagnosticsFileName(request.capturedAt)),
       source: 'variable',
     };
   }
-  const suggested = folder ? path.join(folder, performanceDiagnosticsFileName(request.capturedAt)) : null;
+  const suggested = folder ? paths.join(folder, performanceDiagnosticsFileName(request.capturedAt)) : null;
   return { kind: 'ask', suggested };
 }
 
@@ -1160,4 +1164,73 @@ export async function savePerformanceDiagnosticsSnapshot(request: PerformanceDia
     request.announce(file);
   }
   return file;
+}
+
+// A window channel capture tries this many file names before it refuses.
+export const PERFORMANCE_CAPTURE_NAME_ATTEMPTS = 16;
+
+// The file operations of a window channel capture. The `wx` flag creates a file and fails when its name exists.
+export interface PerformanceCaptureFiles {
+  mkdir(directory: string, options: { recursive: true }): Promise<unknown>;
+  writeFile(file: string, contents: Uint8Array, options: { flag: 'wx' }): Promise<void>;
+}
+
+export interface PerformanceCaptureRequest extends Omit<PerformanceDiagnosticsTarget, 'target'> {
+  snapshot: unknown;
+  files?: PerformanceCaptureFiles;
+  report(failure: PerformanceDiagnosticsFailure): void;
+}
+
+// Create a new file for a window channel capture. The capture directory comes first, then the open folder.
+// An existing file or link at a name stays as it is, and the capture takes the next numbered name.
+// A refusal reports its failure and rejects with the message for the caller.
+export async function createPerformanceCaptureFile(
+  request: PerformanceCaptureRequest,
+): Promise<{ file: string; bytes: number }> {
+  const paths = request.paths ?? path;
+  const files = request.files ?? nodeFiles;
+  const refusal = (failure: PerformanceDiagnosticsFailure): Error => {
+    request.report(failure);
+    return new Error(failure.message);
+  };
+  const failed = (file: string, error: unknown): Error => {
+    const reason = error instanceof Error ? error.message : String(error);
+    return refusal({ file, reason, message: `Arc could not save performance diagnostics to ${file}. ${reason}` });
+  };
+  const absent = `Open a folder in the selected Arc window, or start the editor with ${PERFORMANCE_DIAGNOSTICS_DIRECTORY_VARIABLE} set to a full path. Nothing was saved.`;
+  const destination = performanceDiagnosticsDestination({
+    environment: request.environment,
+    workspaceFolder: request.workspaceFolder,
+    capturedAt: request.capturedAt,
+    paths,
+  });
+  if (destination.kind === 'refuse')
+    throw refusal({
+      file: null,
+      reason: `a relative destination needs an open folder to be read against: ${destination.given}`,
+      message: absent,
+    });
+  const first = destination.kind === 'file' ? destination.file : destination.suggested;
+  if (!first) throw refusal({ file: null, reason: 'no open folder and no capture directory', message: absent });
+  const directory = paths.dirname(first);
+  const contents = Buffer.from(`${JSON.stringify(request.snapshot, null, 2)}\n`, 'utf8');
+  try {
+    await files.mkdir(directory, { recursive: true });
+  } catch (error) {
+    throw failed(first, error);
+  }
+  for (let attempt = 0; attempt < PERFORMANCE_CAPTURE_NAME_ATTEMPTS; attempt++) {
+    const file = attempt === 0 ? first : `${first.slice(0, -'.json'.length)}-${attempt}.json`;
+    try {
+      await files.writeFile(file, contents, { flag: 'wx' });
+      return { file, bytes: contents.byteLength };
+    } catch (error) {
+      if ((error as { code?: unknown } | null)?.code !== 'EEXIST') throw failed(file, error);
+    }
+  }
+  throw refusal({
+    file: first,
+    reason: `${PERFORMANCE_CAPTURE_NAME_ATTEMPTS} capture file names already exist`,
+    message: `Arc could not save performance diagnostics in ${directory}. ${PERFORMANCE_CAPTURE_NAME_ATTEMPTS} capture file names there already exist. Nothing was saved.`,
+  });
 }

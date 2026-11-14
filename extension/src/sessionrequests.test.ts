@@ -24,7 +24,6 @@ import {
   hostAddress,
   parseSessionRequest,
   PERFORMANCE_CAPTURE_CAPABILITY,
-  PERFORMANCE_CAPTURE_LIMIT,
   pingWindow,
   SESSION_REQUEST_LIMITS,
   WindowChannel,
@@ -1591,7 +1590,7 @@ test(
 );
 
 test(
-  'performance capture needs an explicit window and its capability, and runs one capture at a time within its allowance',
+  'performance capture needs an explicit window and its capability, and runs one capture at a time',
   { tags: ['subprocess'] },
   async () => {
     for (const key of ['TERM_PROGRAM', 'VSCODE_PID', 'VSCODE_IPC_HOOK_CLI']) vi.stubEnv(key, '');
@@ -1620,16 +1619,76 @@ test(
     await assert.rejects(requestWindow('performance-capture', {}, channel.hostId, home), /could not save.*EACCES/);
     channel.setPerformanceCaptureHandler(() => ({ file: 'x'.repeat(SESSION_REQUEST_LIMITS.lineBytes) }));
     await assert.rejects(requestWindow('performance-capture', {}, channel.hostId, home), /allowance/);
+  },
+);
+
+// The channel answers each request on its own connection, as the CLI does.
+async function capture(entry: HostRegistration, id: string): Promise<Record<string, any>> {
+  const socket = await connect(entry.address);
+  const received = reply(socket);
+  socket.write(JSON.stringify(request(entry, { id, method: 'performance-capture' })) + '\n');
+  const answer = await received;
+  socket.destroy();
+  return answer;
+}
+
+test(
+  'a performance capture that never settles keeps the window busy, and its refusal names a reload',
+  { tags: ['subprocess'] },
+  async () => {
+    const { channel, entry } = await fixture();
+    let calls = 0;
     channel.setPerformanceCaptureHandler(() => {
       calls++;
-      return reply;
+      return new Promise(() => {});
     });
-    // Each activation saves at most PERFORMANCE_CAPTURE_LIMIT captures. Start one short of it.
-    (channel as unknown as { performanceCaptures: number }).performanceCaptures = PERFORMANCE_CAPTURE_LIMIT - 1;
-    assert.deepEqual(await requestWindow('performance-capture', {}, channel.hostId, home), reply);
-    const admitted = calls;
-    await assert.rejects(requestWindow('performance-capture', {}, channel.hostId, home), /Reload the window/);
-    assert.equal(calls, admitted, 'a capture past the allowance reached the panel');
+    const held = await connect(entry.address);
+    held.write(JSON.stringify(request(entry, { id: 'held', method: 'performance-capture' })) + '\n');
+    await vi.waitFor(() => assert.equal(calls, 1));
+    // The caller stops waiting, as it does at the end of its exchange.
+    held.destroy();
+    for (const id of ['second', 'later'])
+      assert.deepEqual(await capture(entry, id), {
+        id,
+        error:
+          'This Arc window is already saving a performance capture. Request another after it finishes, or reload the window if it never finishes.',
+      });
+    assert.equal(calls, 1, 'a capture ran beside one that never settled');
+  },
+);
+
+test(
+  'the performance capture allowance counts every capture that reaches the window, and no busy refusal',
+  { tags: ['subprocess'] },
+  async () => {
+    const { channel, entry } = await fixture();
+    let calls = 0;
+    let release!: () => void;
+    channel.setPerformanceCaptureHandler(() => {
+      calls++;
+      if (calls === 1)
+        return new Promise((resolve) => {
+          release = () => resolve({ version: 1, file: 'held.json', bytes: 1, capturedAt: 1 });
+        });
+      // Every other capture fails, and a failed capture still counts.
+      if (calls % 2 === 0) throw new Error('EACCES: permission denied');
+      return { version: 1, file: `capture-${calls}.json`, bytes: 1, capturedAt: calls };
+    });
+    const held = await connect(entry.address);
+    const first = reply(held);
+    held.write(JSON.stringify(request(entry, { id: 'held', method: 'performance-capture' })) + '\n');
+    await vi.waitFor(() => assert.equal(calls, 1));
+    for (const id of ['busy-1', 'busy-2', 'busy-3', 'busy-4'])
+      assert.match(String((await capture(entry, id)).error), /already saving/);
+    release();
+    assert.equal((await first).result.data.file, 'held.json');
+    for (let index = 2; index <= 256; index++) await capture(entry, `capture-${index}`);
+    assert.equal(calls, 256, 'a capture within the allowance of 256 did not reach the window');
+    assert.deepEqual(await capture(entry, 'past'), {
+      id: 'past',
+      error: 'This Arc window has run 256 performance captures. Reload the window to run more.',
+    });
+    assert.equal(calls, 256, 'a capture past the allowance reached the window');
   },
 );
 

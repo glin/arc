@@ -69,6 +69,21 @@ process.stdin[Symbol.asyncIterator] = deny;
     const result = await run(process.execPath, ['--require', preload, cli, 'dispatch', 'rm', '--help'], options);
     assert.equal(result.stderr, '');
     assert.equal(result.stdout, renderCommandHelp(command) + '\n');
+    // A command group prints its own help, and a bare group refuses alike for every group.
+    for (const group of ['label', 'compact', 'diagnostics']) {
+      const result = await run(process.execPath, ['--require', preload, cli, group, '--help'], options);
+      assert.equal(result.stdout, renderCommandHelp(findCommand([group])) + '\n');
+      assert.equal(findCommand([group]).name, group, `${group} --help prints no help of its group`);
+    }
+    const bare = {};
+    for (const group of ['label', 'diagnostics']) {
+      const failed = await run(process.execPath, ['--require', preload, cli, group], options).then(
+        () => assert.fail(`bare ${group} succeeded`),
+        (error) => error,
+      );
+      bare[group] = [failed.code, failed.stdout, failed.stderr.replaceAll(group, 'GROUP')];
+    }
+    assert.deepEqual(bare.diagnostics, bare.label, 'bare diagnostics and bare label print different refusals');
     for (const verb of ['start', 'run']) {
       for (const provider of [undefined, 'claude', 'codex']) {
         const args = [verb, ...(provider ? [provider] : []), '--help'];

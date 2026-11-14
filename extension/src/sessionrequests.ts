@@ -79,7 +79,7 @@ export { FILTER_LIMITS } from './sessionfilter.ts';
 
 export const REQUESTER_PROVIDER_CAPABILITY = 'requesterProvider';
 export const SESSION_READ_CAPABILITY = 'sessionRead';
-// The window saves its performance diagnostics on request. Each activation saves at most PERFORMANCE_CAPTURE_LIMIT.
+// The window saves its performance diagnostics on request. Each activation runs at most PERFORMANCE_CAPTURE_LIMIT.
 export const PERFORMANCE_CAPTURE_CAPABILITY = 'performanceCapture';
 export const PERFORMANCE_CAPTURE_LIMIT = 256;
 
@@ -873,10 +873,12 @@ export class WindowChannel {
     const handler = this.performanceCaptureHandler;
     if (!handler) throw new Error('This Arc window does not support performance captures.');
     if (this.performanceCapture)
-      throw new Error('This Arc window is already saving a performance capture. Request another after it finishes.');
+      throw new Error(
+        'This Arc window is already saving a performance capture. Request another after it finishes, or reload the window if it never finishes.',
+      );
     if (this.performanceCaptures >= PERFORMANCE_CAPTURE_LIMIT)
       throw new Error(
-        `This Arc window has saved ${PERFORMANCE_CAPTURE_LIMIT} performance captures. Reload the window to save more.`,
+        `This Arc window has run ${PERFORMANCE_CAPTURE_LIMIT} performance captures. Reload the window to run more.`,
       );
     this.performanceCaptures++;
     const capture = Promise.resolve().then(handler);

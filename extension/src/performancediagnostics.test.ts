@@ -4,8 +4,10 @@ import assert from 'node:assert';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import {
+  PERFORMANCE_CAPTURE_NAME_ATTEMPTS,
   PERFORMANCE_DIAGNOSTICS_DIRECTORY_VARIABLE,
   PERFORMANCE_DIAGNOSTICS_SCHEMA_VERSION,
+  createPerformanceCaptureFile,
   DISPATCH_ROOT_RECORDS,
   PanelPerformanceCounters,
   PerformanceDiagnosticState,
@@ -974,6 +976,227 @@ test('a path that cannot be written is reported, and answers with no file', asyn
     sink.reported[0].message.includes('EACCES: permission denied'),
     'the failure does not carry what the file system said',
   );
+});
+
+const CAPTURE_JSON = `${JSON.stringify(SNAPSHOT, null, 2)}\n`;
+
+// Record the file operations of a window channel capture. Like the file system, a write without the `wx` flag
+// replaces a name in `taken` and follows a link there. With the flag, a taken name fails with EEXIST.
+function channelFiles(taken: Iterable<string> = [], failure?: Error & { code?: string }) {
+  const existing = new Set(taken);
+  const writes: { file: string; bytes: number; flag: string }[] = [];
+  const directories: string[] = [];
+  const reported: PerformanceDiagnosticsFailure[] = [];
+  return {
+    writes,
+    directories,
+    reported,
+    report: (failure: PerformanceDiagnosticsFailure): void => {
+      reported.push(failure);
+    },
+    files: {
+      mkdir: (directory: string, options: { recursive: true }): Promise<undefined> => {
+        assert.deepEqual(options, { recursive: true });
+        directories.push(directory);
+        return Promise.resolve(undefined);
+      },
+      writeFile: (file: string, contents: Uint8Array, options: { flag: 'wx' }): Promise<void> => {
+        writes.push({ file, bytes: contents.byteLength, flag: options.flag });
+        if (failure) return Promise.reject(failure);
+        if (existing.has(file) && options.flag === 'wx')
+          return Promise.reject(
+            Object.assign(new Error(`EEXIST: file already exists, open '${file}'`), { code: 'EEXIST' }),
+          );
+        existing.add(file);
+        return Promise.resolve();
+      },
+    },
+  };
+}
+
+test('a window channel capture creates its file and moves to a fresh name when a file or link holds the name', async () => {
+  const name = performanceDiagnosticsFileName(CAPTURED_AT);
+  const fresh = name.replace(/\.json$/, '-1.json');
+  for (const [paths, directory, separator] of [
+    [path.win32, 'C:\\Work\\Arc Repo\\Captures', '\\'],
+    [path.posix, '/Work/Arc Repo/Captures', '/'],
+  ] as const) {
+    // A regular file or a symbolic link at the first name both make an exclusive creation fail with EEXIST.
+    const sink = channelFiles([`${directory}${separator}${name}`]);
+    const saved = await createPerformanceCaptureFile({
+      snapshot: SNAPSHOT,
+      environment: { [PERFORMANCE_DIAGNOSTICS_DIRECTORY_VARIABLE]: directory },
+      workspaceFolder: null,
+      capturedAt: CAPTURED_AT,
+      paths,
+      files: sink.files,
+      report: sink.report,
+    });
+    assert.deepEqual(
+      sink.writes.map(({ file, flag }) => [file, flag]),
+      [
+        [`${directory}${separator}${name}`, 'wx'],
+        [`${directory}${separator}${fresh}`, 'wx'],
+      ],
+      'a channel capture replaced or followed an existing name, or did not move to a fresh name',
+    );
+    assert.deepEqual(
+      saved,
+      { file: `${directory}${separator}${fresh}`, bytes: Buffer.byteLength(CAPTURE_JSON) },
+      'the reply does not describe the file that the capture created',
+    );
+    assert.deepEqual(sink.directories, [directory]);
+    assert.deepEqual(sink.reported, []);
+  }
+});
+
+test('a window channel capture picks its destination by the same rules on Windows and POSIX hosts', async () => {
+  const name = performanceDiagnosticsFileName(CAPTURED_AT);
+  const variable = PERFORMANCE_DIAGNOSTICS_DIRECTORY_VARIABLE;
+  for (const [paths, folder, cases] of [
+    [
+      path.win32,
+      'C:\\Work\\Arc Repo',
+      [
+        [{ [variable]: 'D:\\Perf\\Out' }, `D:\\Perf\\Out\\${name}`],
+        [{ [variable]: 'Perf\\Out' }, `C:\\Work\\Arc Repo\\Perf\\Out\\${name}`],
+        [{}, `C:\\Work\\Arc Repo\\${name}`],
+      ],
+    ],
+    [
+      path.posix,
+      '/Work/Arc Repo',
+      [
+        [{ [variable]: '/Perf/Out' }, `/Perf/Out/${name}`],
+        [{ [variable]: 'Perf/Out' }, `/Work/Arc Repo/Perf/Out/${name}`],
+        [{}, `/Work/Arc Repo/${name}`],
+      ],
+    ],
+  ] as const) {
+    for (const [environment, expected] of cases) {
+      const sink = channelFiles();
+      const saved = await createPerformanceCaptureFile({
+        snapshot: SNAPSHOT,
+        environment,
+        workspaceFolder: folder,
+        capturedAt: CAPTURED_AT,
+        paths,
+        files: sink.files,
+        report: sink.report,
+      });
+      assert.equal(saved.file, expected, `a capture with ${JSON.stringify(environment)} left its destination`);
+    }
+    // With no folder, a full path still works, and a relative directory or no directory refuses.
+    const absolute = cases[0][0];
+    const sink = channelFiles();
+    const saved = await createPerformanceCaptureFile({
+      snapshot: SNAPSHOT,
+      environment: absolute,
+      workspaceFolder: null,
+      capturedAt: CAPTURED_AT,
+      paths,
+      files: sink.files,
+      report: sink.report,
+    });
+    assert.equal(saved.file, cases[0][1]);
+    for (const [environment, reason] of [
+      [cases[1][0], `a relative destination needs an open folder to be read against: ${cases[1][0][variable]}`],
+      [{}, 'no open folder and no capture directory'],
+    ] as const) {
+      const refused = channelFiles();
+      await assert.rejects(
+        createPerformanceCaptureFile({
+          snapshot: SNAPSHOT,
+          environment,
+          workspaceFolder: null,
+          capturedAt: CAPTURED_AT,
+          paths,
+          files: refused.files,
+          report: refused.report,
+        }),
+        (error: Error) => {
+          assert.equal(
+            error.message,
+            `Open a folder in the selected Arc window, or start the editor with ${variable} set to a full path. Nothing was saved.`,
+            'a channel capture refusal gives advice that a caller of the channel cannot follow',
+          );
+          return true;
+        },
+      );
+      assert.deepEqual(refused.writes, [], 'a refused channel capture wrote a file');
+      assert.deepEqual(
+        refused.reported.map((failure) => [failure.file, failure.reason]),
+        [[null, reason]],
+        'a refused channel capture is not in the log',
+      );
+    }
+  }
+});
+
+test('a window channel capture refuses after its bounded fresh names, and refuses a failed write at once', async () => {
+  const environment = { [PERFORMANCE_DIAGNOSTICS_DIRECTORY_VARIABLE]: ROOT };
+  const taken = channelFiles([], Object.assign(new Error('EEXIST: file already exists'), { code: 'EEXIST' }));
+  await assert.rejects(
+    createPerformanceCaptureFile({
+      snapshot: SNAPSHOT,
+      environment,
+      workspaceFolder: null,
+      capturedAt: CAPTURED_AT,
+      files: taken.files,
+      report: taken.report,
+    }),
+    new RegExp(`${PERFORMANCE_CAPTURE_NAME_ATTEMPTS} capture file names there already exist\\. Nothing was saved\\.$`),
+  );
+  assert.equal(taken.writes.length, PERFORMANCE_CAPTURE_NAME_ATTEMPTS, 'a channel capture tried names without a bound');
+  assert.equal(new Set(taken.writes.map(({ file }) => file)).size, PERFORMANCE_CAPTURE_NAME_ATTEMPTS);
+  assert.equal(taken.reported.length, 1, 'a channel capture that ran out of names is not in the log');
+
+  const denied = channelFiles([], Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' }));
+  await assert.rejects(
+    createPerformanceCaptureFile({
+      snapshot: SNAPSHOT,
+      environment,
+      workspaceFolder: null,
+      capturedAt: CAPTURED_AT,
+      files: denied.files,
+      report: denied.report,
+    }),
+    /could not save performance diagnostics to .*EACCES: permission denied/,
+  );
+  assert.equal(denied.writes.length, 1, 'a failed write moved to another name');
+  assert.deepEqual(
+    denied.reported.map((failure) => [failure.file, failure.reason]),
+    [[path.join(ROOT, performanceDiagnosticsFileName(CAPTURED_AT)), 'EACCES: permission denied']],
+  );
+});
+
+test('a window channel capture keeps an existing file, and two captures in one millisecond write two files', async () => {
+  const directory = path.join(tempDir('arc-channel-capture-'), 'Captures');
+  await fs.mkdir(directory);
+  const first = path.join(directory, performanceDiagnosticsFileName(CAPTURED_AT));
+  await fs.writeFile(first, 'kept', 'utf8');
+  const request = {
+    snapshot: SNAPSHOT,
+    environment: { [PERFORMANCE_DIAGNOSTICS_DIRECTORY_VARIABLE]: directory },
+    workspaceFolder: null,
+    capturedAt: CAPTURED_AT,
+    report: (failure: PerformanceDiagnosticsFailure) => assert.fail(failure.message),
+  };
+  const saved = await Promise.all([createPerformanceCaptureFile(request), createPerformanceCaptureFile(request)]);
+  assert.equal(await fs.readFile(first, 'utf8'), 'kept', 'a channel capture replaced an existing file');
+  assert.notEqual(saved[0].file, saved[1].file, 'two captures in one millisecond named one file');
+  for (const { file, bytes } of saved) {
+    assert.equal(path.dirname(file), directory);
+    assert.equal(await fs.readFile(file, 'utf8'), CAPTURE_JSON);
+    assert.equal((await fs.stat(file)).size, bytes, 'the reply does not give the size of the file that exists');
+  }
+  // A capture directory that does not exist yet is created.
+  const nested = path.join(directory, 'Later');
+  const created = await createPerformanceCaptureFile({
+    ...request,
+    environment: { [PERFORMANCE_DIAGNOSTICS_DIRECTORY_VARIABLE]: nested },
+  });
+  assert.equal(await fs.readFile(created.file, 'utf8'), CAPTURE_JSON);
 });
 
 test('discovery counters sum relationship read charges across worker replies', () => {

@@ -239,6 +239,10 @@ test('bundled management commands carry reader-default classification, prompt fi
       { env },
     );
     assert.deepEqual(requests.at(-1).params.readTools, ['mcp__server__read', 'mcp__server__list']);
+    const saved = { version: 1, file: join(home, 'capture.json'), bytes: 2, capturedAt: 1 };
+    channel.setPerformanceCaptureHandler(() => saved);
+    const diagnostics = [cli, 'diagnostics', 'performance', '--window', channel.hostId, '--json'];
+    assert.deepEqual(JSON.parse((await run(process.execPath, diagnostics, { env })).stdout), saved);
     const before = requests.length;
     await assert.rejects(
       run(process.execPath, [cli, 'start', 'codex', '--prompt-file', prompt, '--agent-run=yes'], {

@@ -737,14 +737,13 @@ import {
   type PollDirectories,
 } from './scheduler';
 import {
-  PERFORMANCE_DIAGNOSTICS_DIRECTORY_VARIABLE,
   PanelPerformanceCounters,
+  createPerformanceCaptureFile,
   messageByteBudget,
   projectPerformanceDiagnostics,
   savePerformanceDiagnosticsSnapshot,
   serializedMessageBytes,
   type LedgerSaveOperation,
-  type PerformanceDiagnosticsFailure,
   type PerformanceEventSink,
   type StartupMilestone,
 } from './performancediagnostics';
@@ -4752,42 +4751,21 @@ export class PanelProvider implements vscode.Disposable {
     return written;
   }
 
-  // Save a capture for a window channel request. The host alone chooses the file: its capture directory, else the first
+  // Save a capture for a window channel request. The host alone chooses a new file in its capture directory or first
   // folder. Failures log `performanceCaptureFailed` and reject with the reason. Nothing appears in the window.
   async capturePerformanceForChannel(): Promise<{ version: 1; file: string; bytes: number; capturedAt: number }> {
     if (this.disposed) throw new Error('This Arc window is closed. Run arc windows and select a live window.');
     this.performanceCounters.recordCapture();
     const capturedAt = Date.now();
     const snapshot = this.performanceDiagnostics(capturedAt);
-    let bytes = 0;
-    let refusal = 'The performance capture was not saved.';
-    const report = (failure: PerformanceDiagnosticsFailure) => {
-      this.diagnostics.warn('performanceCaptureFailed', { file: failure.file, reason: failure.reason });
-      refusal = failure.message;
-    };
-    const file = await savePerformanceDiagnosticsSnapshot({
+    const { file, bytes } = await createPerformanceCaptureFile({
       snapshot,
       environment: process.env,
       workspaceFolder: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? null,
       capturedAt,
-      ask: async (suggested) => {
-        if (!suggested)
-          report({
-            file: null,
-            reason: 'no open folder and no capture directory',
-            message: `Open a folder in the selected Arc window, or start the editor with ${PERFORMANCE_DIAGNOSTICS_DIRECTORY_VARIABLE} set. Nothing was saved.`,
-          });
-        return suggested;
-      },
-      write: (file, contents) => {
-        const encoded = Buffer.from(contents, 'utf8');
-        bytes = encoded.byteLength;
-        return Promise.resolve(vscode.workspace.fs.writeFile(vscode.Uri.file(file), encoded));
-      },
-      report,
-      announce: () => {},
+      report: (failure) =>
+        this.diagnostics.warn('performanceCaptureFailed', { file: failure.file, reason: failure.reason }),
     });
-    if (!file) throw new Error(refusal);
     return { version: 1, file, bytes, capturedAt };
   }
 

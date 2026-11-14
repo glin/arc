@@ -115,7 +115,8 @@ async function run(): Promise<void> {
       process.stdout.write(`${await runCompact(args.slice(1))}\n`);
       return;
     case 'diagnostics':
-      process.stdout.write(`${await runDiagnostics(command.action!, commandArgs)}\n`);
+      if (!command.action) throw new Error(`Unknown command: ${args[0]}`);
+      process.stdout.write(`${await runDiagnostics(command.action, commandArgs)}\n`);
       return;
     case 'sessions':
       process.stdout.write(`${await runSessions(command.name as 'sessions' | 'session' | 'filter', commandArgs)}\n`);

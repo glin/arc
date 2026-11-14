@@ -265,6 +265,8 @@ test('diagnostics performance crosses a real window channel and prints the saved
   const fixture = await host();
   try {
     const window = fixture.channel.hostId;
+    // ARC_WINDOW names a live window, and the capture still requires --window.
+    vi.stubEnv('ARC_WINDOW', window);
     await assert.rejects(runDiagnostics('performance', ['--json']), /--window is required/);
     await assert.rejects(runDiagnostics('performance', ['--window', window, '--file', 'x']), /Usage: arc diagnostics/);
     await assert.rejects(runDiagnostics('performance', ['--window', window]), /must reload after an update/);
