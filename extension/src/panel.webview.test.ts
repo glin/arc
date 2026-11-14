@@ -1211,6 +1211,7 @@ test('response session navigation releases only its invoking clear route and ret
 import type { TurnOutcome } from './transcript';
 import { outcomeWithWiderChildren } from './turnrail';
 import {
+  discoveryParentsOf,
   guardedSourceRevision,
   RecordedReplies,
   sessionCatalogMembership,
@@ -4129,6 +4130,7 @@ test('command-only admission removes pending rows through every catalog path and
   let sources: any[] = [];
   const dependencies = {
     isCompressedRollout,
+    discoveryParentsOf,
     fs,
     fileRevisionOf: revisionOf,
     revalidatedCatalog,
@@ -6912,6 +6914,7 @@ test('window session pages lose coverage when a served transcript is replaced at
     const { sources, provider, traverse } = pagedListingFixture(150);
     const dependencies = {
       isCompressedRollout,
+      discoveryParentsOf,
       fs,
       fileRevisionOf: revisionOf,
       revalidatedCatalog,

@@ -38,6 +38,7 @@ import { claudeDispatchTranscript } from './turnfixtures';
 import { sessionCoverageMember, sessionPresence, reconcileSessionCollisions } from './sessioncoverage';
 import {
   discoveryMemberRevisions,
+  discoveryParentsOf,
   discoveryHeldStamps,
   walkStampFiles,
   discoverySourceStamps,
@@ -249,6 +250,7 @@ import {
   RAIL_ENRICHMENT_READ_BYTES,
   sameProgressiveRevision,
   unreadHeadBytes,
+  type DiscoveryCheckpoint,
   type ProgressiveCheckpoint,
   type ProgressiveInput,
   type ProgressiveRequest,
@@ -3439,6 +3441,7 @@ function completeDiscoveryHarness(
     reconcileSessionCollisions,
     sessionCatalogMembership,
     discoveryMemberRevisions,
+    discoveryParentsOf,
     discoveryHeldStamps,
     walkStampFiles,
     discoverySourceStamps,
@@ -15328,8 +15331,10 @@ test.skipIf(!rolloutCompression.zstdCompressSync)(
   },
 );
 
-test('a complete discovery reply keeps a backfilled row and gives it a spend source', async () => {
-  const { provider, root, writeRollout, releaseAll } = heldWalkHarness(
+// A walked plain rollout beside a compressed twin that a backfill batch joins later. The worker fake records the parents of
+// each discovery request. By default it answers each request with a complete reply.
+function backfilledTwinHarness(extraMethods: string[] = [], scope: Record<string, unknown> = {}) {
+  const harness = heldWalkHarness(
     {
       readRolloutStat,
       isHiddenThread,
@@ -15337,39 +15342,40 @@ test('a complete discovery reply keeps a backfilled row and gives it a spend sou
       compressedTitleCurrent,
       withKeptUndercount,
       compressedEntrySame,
+      ...scope,
     },
-    [],
+    extraMethods,
   );
+  const { provider, root, writeRollout } = harness;
   delete provider.prepareClaudeChildren;
   const plain = writeRollout('plain');
   const twin = path.join(root, `rollout-${twinThread}.jsonl.zst`);
   fs.writeFileSync(twin, 'x');
   const stat = readRolloutStat(twin)!;
-  const roots: SessionFile[] = [];
-  let workerRuns = 0;
+  const requests: SessionFile[][] = [];
   provider.claudeChildReferences = [];
   provider.claudeChildStatWrites = new Map();
   provider.pruneDerivedTitles = () => false;
+  const complete = (request: { parents: SessionFile[] }) => ({
+    kind: 'claude-children',
+    scope: provider.repositoryScopeRoots,
+    compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
+    roots: request.parents,
+    complete: true,
+    continuation: false,
+    referenceEntries: [],
+    references: [],
+    children: [],
+    dispatchFacts: [],
+  });
+  const worker: { reply: (request: { parents: SessionFile[]; discovery?: DiscoveryCheckpoint }) => unknown } = {
+    reply: complete,
+  };
   provider.progressiveWorker = {
     currentThreadId: 1,
-    run: (request: { parents: SessionFile[] }) => {
-      workerRuns++;
-      roots.splice(0, roots.length, ...request.parents);
-      return Promise.resolve({
-        generation: provider.refreshGeneration,
-        value: {
-          kind: 'claude-children',
-          scope: provider.repositoryScopeRoots,
-          compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
-          roots: request.parents,
-          complete: true,
-          continuation: false,
-          referenceEntries: [],
-          references: [],
-          children: [],
-          dispatchFacts: [],
-        },
-      });
+    run: (request: { parents: SessionFile[]; discovery?: DiscoveryCheckpoint }) => {
+      requests.push(request.parents);
+      return Promise.resolve({ generation: provider.refreshGeneration, value: worker.reply(request) });
     },
   };
   const sourceUpdates: SessionFile[][] = [];
@@ -15378,36 +15384,54 @@ test('a complete discovery reply keeps a backfilled row and gives it a spend sou
     ...provider.performanceCounters,
     recordGauge() {},
   };
+  const applyTwin = () =>
+    provider.applyCompressedBatch({
+      entries: [
+        {
+          file: twin,
+          pairKey: twin.replace(/\.zst$/, ''),
+          factsVersion: COMPRESSED_FACTS_VERSION,
+          metadataGeneration: METADATA_GENERATIONS.codex,
+          size: stat.size,
+          mtimeMs: stat.mtimeMs,
+          threadId: twinThread,
+          opening: { ...backfillOpening, cwd: provider.repositoryScopeRoots[0] },
+          spend: { file: twin.replace(/\.zst$/, ''), buckets: [] },
+          complete: true,
+          decodedLength: 500,
+        },
+      ],
+      backfillMs: 0,
+    });
+  return { ...harness, plain, twin, requests, worker, complete, sourceUpdates, applyTwin };
+}
+
+// The parents of a request as a set, keyed as the worker compares them within a discovery epoch.
+function discoveryParentKeys(parents: readonly SessionFile[]): string[] {
+  return [
+    ...new Set(
+      parents.map(
+        (row) => `${normalizeFsPath(row.file)}\0${row.sessionId}\0${row.agent}\0${row.childTranscript === true}`,
+      ),
+    ),
+  ].sort();
+}
+
+test('a complete discovery reply keeps a backfilled row and gives it a spend source', async () => {
+  const { provider, plain, twin, requests, sourceUpdates, applyTwin, releaseAll } = backfilledTwinHarness();
   await releaseAll(provider.refresh(true));
-  const replies = workerRuns;
+  const replies = requests.length;
   assert.deepEqual(
-    roots.map((row) => row.file),
+    requests.at(-1)?.map((row) => row.file),
     [plain],
     'the first request did not list the plain parent',
   );
-  provider.applyCompressedBatch({
-    entries: [
-      {
-        file: twin,
-        pairKey: twin.replace(/\.zst$/, ''),
-        factsVersion: COMPRESSED_FACTS_VERSION,
-        metadataGeneration: METADATA_GENERATIONS.codex,
-        size: stat.size,
-        mtimeMs: stat.mtimeMs,
-        threadId: twinThread,
-        opening: { ...backfillOpening, cwd: provider.repositoryScopeRoots[0] },
-        spend: { file: twin.replace(/\.zst$/, ''), buckets: [] },
-        complete: true,
-        decodedLength: 500,
-      },
-    ],
-    backfillMs: 0,
-  });
+  applyTwin();
   await vi.waitFor(() => assert.equal(provider.refreshController, null));
   assert.ok(await provider.prepareClaudeChildren(provider.refreshGeneration, new AbortController().signal));
-  assert.ok(workerRuns > replies, 'no complete reply followed the batch');
+  assert.ok(requests.length > replies, 'no complete reply followed the batch');
   assert.ok(
-    roots.every((row) => !isCompressedRollout(row.file)),
+    requests.at(-1)!.every((row) => !isCompressedRollout(row.file)),
     'a compressed rollout reached the discovery parents',
   );
   assert.deepEqual(
@@ -15424,6 +15448,87 @@ test('a complete discovery reply keeps a backfilled row and gives it a spend sou
     sourceUpdates.at(-1)?.some((row) => row.file === twin),
     'the compressed row reached no spend source',
   );
+});
+
+test('a watcher refresh of a named path sends the parents that the walk sent', async () => {
+  const { provider, plain, requests, applyTwin, releaseAll } = backfilledTwinHarness();
+  await releaseAll(provider.refresh(true));
+  const walked = requests.at(-1)!;
+  applyTwin();
+  await vi.waitFor(() => assert.equal(provider.refreshController, null));
+  assert.ok(await provider.prepareClaudeChildren(provider.refreshGeneration, new AbortController().signal));
+  assert.equal(provider.dispatchDiscoveryPending, false, 'discovery did not settle before the watcher refresh');
+  const sent = requests.length;
+  provider.refreshFrom('watcher', false, false, [plain]);
+  await vi.waitFor(() => assert.equal(provider.refreshController, null));
+  assert.equal(requests.length, sent + 1, 'the watcher refresh sent no discovery request');
+  assert.deepEqual(
+    discoveryParentKeys(requests.at(-1)!),
+    discoveryParentKeys(walked),
+    'the watcher refresh sent other parents than the walk',
+  );
+});
+
+test('an epoch of a walked request and a named request settles and leaves the listing complete', async () => {
+  const { provider, plain, requests, worker, complete, applyTwin, releaseAll } = backfilledTwinHarness(
+    ['sessionQueryContext', 'sessionQueryRevisionFor', 'sessionsKeptByReader'],
+    { sessionQueryRevision },
+  );
+  // The worker fake answers as the worker does. The first request of an epoch fixes its parents. A complete reply settles
+  // members only when the request lists the same parent set. While `holdOpen` is set, the first reply of an epoch is partial.
+  let epoch: (DiscoveryCheckpoint & { requests: number }) | null = null;
+  let holdOpen = false;
+  const epochs: { requests: number; settled: boolean }[] = [];
+  worker.reply = (request) => {
+    if (!epoch) {
+      epoch = {
+        epoch: `epoch-${epochs.length + 1}`,
+        compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
+        parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
+        parents: request.parents,
+        catalog: request.parents,
+        repositoryRoots: provider.repositoryScopeRoots,
+        completed: [],
+        position: 0,
+        sequence: 0,
+        requests: 0,
+      };
+    }
+    const { requests: count, ...checkpoint } = epoch;
+    epoch.requests = count + 1;
+    if (holdOpen && count === 0)
+      return { kind: 'claude-children-progress', checkpoint, continuation: true, referenceEntries: [] };
+    const settled =
+      JSON.stringify(discoveryParentKeys(request.parents)) === JSON.stringify(discoveryParentKeys(epoch.parents));
+    epochs.push({ requests: count + 1, settled });
+    epoch = null;
+    return {
+      ...complete({ parents: checkpoint.parents }),
+      checkpoint: { ...checkpoint, sequence: checkpoint.sequence + 1 },
+      continuation: !settled,
+      membershipSettled: settled,
+    };
+  };
+  // No continuation runs, so the epoch stays open until the named request, and the coverage read follows its reply.
+  provider.scheduleDiscoveryContinuation = () => {};
+  await releaseAll(provider.refresh(true));
+  assert.equal(provider.sessionQueryContext().coverage, 'complete', 'the fixture did not start complete');
+  applyTwin();
+  await vi.waitFor(() => assert.equal(provider.refreshController, null));
+  holdOpen = true;
+  await releaseAll(provider.refresh(true));
+  assert.equal(provider.dispatchDiscoveryPending, true, 'the walked request did not leave its epoch open');
+  const sent = requests.length;
+  provider.refreshFrom('watcher', false, false, [plain]);
+  await vi.waitFor(() => assert.equal(provider.refreshController, null));
+  assert.equal(requests.length, sent + 1, 'the watcher refresh sent no discovery request');
+  assert.deepEqual(
+    epochs.at(-1),
+    { requests: 2, settled: true },
+    'the epoch of a walked and a named request did not settle',
+  );
+  assert.equal(provider.dispatchDiscoveryPending, false, 'the settled epoch left discovery pending');
+  assert.equal(provider.sessionQueryContext().coverage, 'complete', 'the settled epoch left the listing incomplete');
 });
 
 test.skipIf(!rolloutCompression.zstdCompressSync)(

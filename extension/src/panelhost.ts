@@ -78,6 +78,7 @@ import {
   discoveryHeldStamps,
   walkStampFiles,
   discoverySourceStamps,
+  discoveryParentsOf,
   subagentSidecars,
   sessionDiscoveryMismatch,
   sessionListingPage,
@@ -15648,10 +15649,7 @@ export class PanelProvider implements vscode.Disposable {
             );
         const sorted = orderSessionCatalog(admitted, (session) => this.activityFor(session));
         const listed = new Set(sorted.map((session) => session.file));
-        this.claudeParents = [
-          ...sorted.filter((session) => session.childTranscript !== true),
-          ...parents.filter((session) => !listed.has(session.file)),
-        ];
+        this.claudeParents = discoveryParentsOf([...sorted, ...parents.filter((session) => !listed.has(session.file))]);
         this.catalog = { folders: folderPrint, sessions: sorted };
         if (!settled) this.catalogWalked = false;
         return sorted;
@@ -15921,7 +15919,7 @@ export class PanelProvider implements vscode.Disposable {
     const codex = compressedRows.length
       ? [...listing.sessions, ...compressedRows].sort((a, b) => b.mtimeMs - a.mtimeMs)
       : listing.sessions;
-    this.claudeParents = [...claude, ...codex.filter((session) => !isCompressedRollout(session.file))];
+    this.claudeParents = discoveryParentsOf([...claude, ...codex]);
     this.walkedClaude = claude.map((s) => s.file);
     // Exclude Claude peer wakes and commands answered by the CLI before catalog publication.
     const listed = deferHumanPrompts ? claude : claude.filter((s) => this.hasHumanPrompt(s, true));

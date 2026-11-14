@@ -39,6 +39,7 @@ import {
   type IncrementalSessionResult,
   type ForwardRecoveryControl,
 } from './history';
+import { isCompressedRollout } from './compressedrollouts.ts';
 
 export const SESSION_READ_LIMITS = {
   turns: 20,
@@ -469,6 +470,13 @@ export function sessionDiscoveryMembership(
   answered: ReadonlyMap<string, SessionFile>,
 ): string | undefined {
   return sessionDiscoveryMismatch(catalog, answered) ? undefined : sessionCatalogMembership(scope, catalog);
+}
+
+// The listed rows that a discovery request sends as parents: every row except a Claude child transcript and a compressed
+// rollout. A walk and a refresh that names files both build parents by this rule, so the worker compares equal sets.
+// The worker receives compressed rollouts by name in the compressed rollout list.
+export function discoveryParentsOf(rows: readonly SessionFile[]): SessionFile[] {
+  return rows.filter((row) => row.childTranscript !== true && !isCompressedRollout(row.file));
 }
 
 // A source's revision as a walk lists it or as a scan read it.
