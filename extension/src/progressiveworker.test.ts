@@ -18424,6 +18424,196 @@ test.skipIf(!zstdCompress)('the list of a request that ends partial reaches the 
   }
 });
 
+// A Codex requester whose rollout Codex compressed, with one standalone launch to its child. The parents of each request hold
+// the child only, as the host sends them while the compressed rollout has no row. `keepPlain` keeps the plain rollout too.
+function compressedRequesterFixture(childAgent: 'claude' | 'codex', keepPlain = false) {
+  const root = tempDir('receipt-compressed-requester-');
+  const fx = receiptDispatchFixture(root, 'codex', childAgent);
+  fs.mkdirSync(fx.receipts.root, { recursive: true });
+  fx.launch(fx.parent, fx.child);
+  const twin = `${fx.parent.file}.zst`;
+  fs.writeFileSync(twin, zstdCompress!(fs.readFileSync(fx.parent.file)));
+  if (!keepPlain) fs.unlinkSync(fx.parent.file);
+  const stores = { facts: path.join(root, 'facts'), openings: path.join(root, 'openings') };
+  const request = { kind: 'claude-children' as const, parents: [fx.child], repositoryRoots: [root] };
+  return { root, fx, twin, stores, request, listed: { ...request, compressed: [twin], compressedStores: stores } };
+}
+
+const dispatchedFrom = (result: ProgressiveResult | null, child: string) => {
+  assert.ok(result?.value.kind === 'claude-children', result?.value.kind);
+  return {
+    parent: sessionParentIndex(result.value.references).get(child)?.parent,
+    facts: result.value.dispatchFacts.filter((facts) => facts.sessionId === child).length,
+  };
+};
+
+for (const childAgent of ['codex', 'claude'] as const)
+  test.skipIf(!zstdCompress)(
+    `a ${childAgent} child of a compressed Codex requester joins it, and a later epoch without the list keeps it`,
+    async () => {
+      const { fx, request, listed } = compressedRequesterFixture(childAgent);
+      const worker = new ProgressiveWorker(`process.env.ARC_HOME=${JSON.stringify(fx.home)};` + source);
+      try {
+        for (const [generation, sent] of [listed, request].entries()) {
+          const reply = await completeDiscovery(worker, sent, generation + 1, new AbortController().signal);
+          assert.deepEqual(
+            dispatchedFrom(reply, fx.child.sessionId),
+            { parent: fx.parent.sessionId, facts: 1 },
+            `epoch ${generation + 1}`,
+          );
+        }
+      } finally {
+        worker.stop();
+      }
+    },
+  );
+
+// The plain rollout of the requester is among the parents, and its compressed twin is in the list.
+test.skipIf(!zstdCompress)('a requester with a plain row and a listed twin keeps one requester row', async () => {
+  const { root, fx, stores, twin } = compressedRequesterFixture('codex', true);
+  const worker = new ProgressiveWorker(`process.env.ARC_HOME=${JSON.stringify(fx.home)};` + source);
+  try {
+    const reply = await completeDiscovery(
+      worker,
+      {
+        kind: 'claude-children',
+        parents: [fx.parent, fx.child],
+        repositoryRoots: [root],
+        compressed: [twin],
+        compressedStores: stores,
+      },
+      1,
+      new AbortController().signal,
+    );
+    assert.deepEqual(dispatchedFrom(reply, fx.child.sessionId), { parent: fx.parent.sessionId, facts: 1 });
+  } finally {
+    worker.stop();
+  }
+});
+
+test.skipIf(!zstdCompress)('two compressed names with one session ID give the requester no row', async () => {
+  const { root, fx, twin, listed } = compressedRequesterFixture('codex');
+  const elsewhere = path.join(root, 'elsewhere', path.basename(twin));
+  fs.mkdirSync(path.dirname(elsewhere));
+  fs.copyFileSync(twin, elsewhere);
+  const worker = new ProgressiveWorker(`process.env.ARC_HOME=${JSON.stringify(fx.home)};` + source);
+  try {
+    const reply = await completeDiscovery(
+      worker,
+      { ...listed, compressed: [twin, elsewhere] },
+      1,
+      new AbortController().signal,
+    );
+    assert.deepEqual(dispatchedFrom(reply, fx.child.sessionId), { parent: undefined, facts: 0 });
+  } finally {
+    worker.stop();
+  }
+});
+
+// The first epoch has no list, so the launch ends at its requester. The store directories are an hour old, so the store
+// proves its revision and the second epoch reuses the completed scan.
+test.skipIf(!zstdCompress)(
+  'a launch rejected at its compressed requester joins it when the list arrives with the next epoch',
+  async () => {
+    const { fx, request, listed } = compressedRequesterFixture('codex');
+    const hourAgo = Date.now() / 1000 - 3600;
+    for (const directory of [fx.receipts.root, path.join(fx.home, 'cache', 'dispatch-relationships')])
+      if (fs.existsSync(directory)) fs.utimesSync(directory, hourAgo, hourAgo);
+    const worker = new ProgressiveWorker(`process.env.ARC_HOME=${JSON.stringify(fx.home)};` + source);
+    const epoch = async (sent: typeof request, generation: number) => {
+      const counts = { rejected: 0, reuses: 0, reused: 0 };
+      for (let pass = 0; pass < 100; pass++) {
+        const result = await worker.run(sent, generation, new AbortController().signal);
+        assert.ok(result && 'charges' in result.value && result.value.charges, result?.value.kind);
+        counts.rejected += result.value.charges.receiptLaunchesRejectedAtRequester ?? 0;
+        counts.reuses += result.value.charges.receiptScanReuses ?? 0;
+        counts.reused += result.value.charges.receiptScanReuseLaunches ?? 0;
+        if (result.value.kind === 'claude-children' && !result.value.continuation)
+          return { counts, ...dispatchedFrom(result, fx.child.sessionId) };
+      }
+      throw new Error('discovery never completed');
+    };
+    try {
+      assert.deepEqual(await epoch(request, 1), {
+        counts: { rejected: 1, reuses: 0, reused: 0 },
+        parent: undefined,
+        facts: 0,
+      });
+      assert.deepEqual(await epoch(listed, 2), {
+        counts: { rejected: 0, reuses: 1, reused: 1 },
+        parent: fx.parent.sessionId,
+        facts: 1,
+      });
+    } finally {
+      worker.stop();
+    }
+  },
+);
+
+// The scan lists the launch first and ends each request after 256 steps, so the first request reads the launch without the
+// list and the store keeps the scan open for later requests.
+test.skipIf(!zstdCompress)(
+  'a list that arrives while a receipt scan is open reads the rejected launch again',
+  async () => {
+    const { fx, request, listed } = compressedRequesterFixture('codex');
+    for (let index = 0; index < 1200; index++)
+      fs.mkdirSync(path.join(fx.receipts.root, `${index.toString(16).padStart(8, '0')}-1111-2222-3333-444444444444`));
+    const worker = new ProgressiveWorker(
+      `process.env.ARC_HOME=${JSON.stringify(fx.home)};` +
+        launchesFirst(fx.receipts.root) +
+        narrowReceiptBudget(source),
+    );
+    try {
+      const first = await worker.run(request, 1, new AbortController().signal);
+      assert.equal(first?.value.kind, 'claude-children-progress');
+      assert.equal(
+        first.value.charges?.receiptLaunchesRejectedAtRequester,
+        1,
+        'the first request did not read the launch',
+      );
+      const reply = await completeDiscovery(worker, listed, 2, new AbortController().signal);
+      assert.deepEqual(dispatchedFrom(reply, fx.child.sessionId), { parent: fx.parent.sessionId, facts: 1 });
+    } finally {
+      worker.stop();
+    }
+  },
+);
+
+// Each receipt slice ends after two steps and posts the source count.
+test.skipIf(!zstdCompress)(
+  'the reply of a compressed requester keeps the checkpoint and the source count of the parents sent',
+  async () => {
+    const { fx, listed } = compressedRequesterFixture('codex');
+    for (let index = 0; index < 8; index++)
+      fs.mkdirSync(path.join(fx.receipts.root, `${index.toString(16).padStart(8, '0')}-1111-2222-3333-444444444444`));
+    const limit = 'receiptSteps >= RECEIPT_STEPS';
+    const status = 'performance.now() - statusAt >= 250';
+    for (const text of [limit, status]) assert.equal(source.split(text).length - 1, 1, `${text} did not match`);
+    const worker = new ProgressiveWorker(
+      `process.env.ARC_HOME=${JSON.stringify(fx.home)};` +
+        source.replace(limit, 'receiptSteps >= 2').replace(status, 'true'),
+    );
+    const known: number[] = [];
+    try {
+      let reply: ProgressiveResult | null = null;
+      for (let pass = 0; pass < 100 && reply?.value.kind !== 'claude-children'; pass++)
+        reply = await worker.run(listed, 1, new AbortController().signal, (value) => {
+          if (value.value.kind === 'discovery-status') known.push(value.value.known);
+        });
+      assert.ok(reply?.value.kind === 'claude-children');
+      assert.deepEqual(
+        reply.value.checkpoint?.catalog,
+        [fx.child],
+        'the checkpoint holds a row the request did not send',
+      );
+      assert.ok(known.length > 0, 'no slice posted its source count');
+      assert.deepEqual(new Set(known), new Set([1]), 'the source count holds a row the request did not send');
+    } finally {
+      worker.stop();
+    }
+  },
+);
+
 // The first load waits on its store read. A list that a request records in that wait is newer than the list the load holds.
 test.skipIf(!zstdCompress)('a list recorded during the first store read replaces the held list', async () => {
   const pair = compressedRolloutPair();

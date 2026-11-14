@@ -149,6 +149,7 @@ import { CompressedBackfill, DiscoveryQueue } from './compressedbackfill';
 import { folderMatcher } from './transcript';
 import {
   announceCompressedDecodes,
+  COMPRESSED_ROLLOUT_NAME,
   compressedByteSource,
   compressedStat,
   decodeCompressedRollout,
@@ -281,8 +282,11 @@ let missingSources: { epoch: string | undefined; files: Map<string, string> } | 
 interface ReceiptScan {
   epoch: string | undefined;
   store: DispatchReceipts;
-  // Receipt lookups read this catalog, which follows the epoch when its repository roots change.
+  // Receipt lookups read this catalog, which follows the epoch when its repository roots change. It is the epoch's catalog
+  // plus the rows of `compressed`.
   catalog: SessionFile[];
+  // The compressed rollout names whose rows the catalog holds.
+  compressed: CompressedRequesters | null;
   steps: ReturnType<DispatchReceipts['relationships']>;
   // Each visited launch whose read reached a catalog lookup, with the identities it looked up, found or not.
   launches: Map<string, string[]>;
@@ -312,6 +316,39 @@ interface ReceiptScan {
   reuseClasses: Map<string, boolean>;
 }
 let receiptScan: ReceiptScan | null = null;
+// The compressed rollout names of the last list that a discovery request carried, by the session ID in each name. An ID that
+// more than one name carries maps to null.
+type CompressedRequesters = Map<string, string | null>;
+let compressedRequesters: CompressedRequesters | null = null;
+function compressedRequestersOf(names: readonly string[]): CompressedRequesters {
+  const files: CompressedRequesters = new Map();
+  for (const file of names) {
+    const sessionId = isCompressedRollout(file) ? COMPRESSED_ROLLOUT_NAME.exec(file)?.[1] : undefined;
+    if (sessionId !== undefined) files.set(sessionId, files.has(sessionId) ? null : file);
+  }
+  return files;
+}
+// The catalog of a receipt scan. The parents of a discovery request hold no compressed rollout, so a receipt whose requester is
+// a compressed rollout finds no requester row among them. The scan adds a Codex row for each compressed name whose session ID one name alone
+// carries and no Codex row of the catalog holds. The lookup reads only the agent, the session ID and the file of such a row.
+// The catalog itself returns when there is no row to add.
+function receiptCatalogOf(catalog: SessionFile[]): SessionFile[] {
+  if (!compressedRequesters?.size) return catalog;
+  const held = new Set(catalog.flatMap((row) => (row.agent === 'codex' ? [row.sessionId] : [])));
+  const added: SessionFile[] = [];
+  for (const [sessionId, file] of compressedRequesters)
+    if (file !== null && !held.has(sessionId)) added.push({ agent: 'codex', sessionId, file } as SessionFile);
+  return added.length ? [...catalog, ...added] : catalog;
+}
+// Sets the catalog of an open scan from its epoch's catalog. Each recorded launch whose identities changed rows is read again.
+function updateReceiptCatalog(scan: ReceiptScan, catalog: SessionFile[]): void {
+  const next = receiptCatalogOf(catalog);
+  const changed = changedCatalogIdentities(scan.catalog, next);
+  for (const [launchId, identities] of scan.launches)
+    if (identities.some((identity) => changed.has(identity))) retryReceiptLaunch(scan, launchId);
+  scan.catalog = next;
+  scan.compressed = compressedRequesters;
+}
 // A completed scan answers a new epoch only within the full pass age bound of the host's walk gate, from the opening of the
 // scan that last read the store from its first entry.
 const RECEIPT_SCAN_REUSE_MAX_AGE_MS = 10 * 60_000;
@@ -406,11 +443,13 @@ function keptScanRefusal(kept: ReceiptScan): keyof typeof KEPT_SCAN_REFUSAL_CHAR
 // requester or on a store file, and Arc completes each write of such a file with a write in the store directory that moves
 // the store revision. Its steps then check the dispatched transcript of each link that the scan holds.
 function reusedReceiptScan(kept: ReceiptScan, epoch: DiscoveryCheckpoint): ReceiptScan {
-  const changed = changedCatalogIdentities(kept.catalog, epoch.catalog);
+  const catalog = receiptCatalogOf(epoch.catalog);
+  const changed = changedCatalogIdentities(kept.catalog, catalog);
   const scan: ReceiptScan = {
     ...kept,
     epoch: epoch.epoch,
-    catalog: epoch.catalog,
+    catalog,
+    compressed: compressedRequesters,
     controller: new AbortController(),
     steps: keptStartupChecks(() => scan),
     retries: [],
@@ -1014,6 +1053,7 @@ async function execute(
         dispatchRoots: spend.dispatchRoots,
       };
     }
+    if (request.compressed) compressedRequesters = compressedRequestersOf(request.compressed);
     for (const [file, entry] of request.referenceEntries ?? []) {
       const key = normalizeFsPath(file);
       noteSourceGeneration(key, entry);
@@ -1069,12 +1109,7 @@ async function execute(
           : undefined;
       // A child read answers for the roots it was read under.
       for (const [key, child] of epochChildSessions) if (!child || !inRoots(child.cwd)) epochChildSessions.delete(key);
-      if (receiptScan && receiptScan.epoch === held.epoch) {
-        const changed = changedCatalogIdentities(receiptScan.catalog, catalog);
-        for (const [launchId, identities] of receiptScan.launches)
-          if (identities.some((identity) => changed.has(identity))) retryReceiptLaunch(receiptScan, launchId);
-        receiptScan.catalog = catalog;
-      }
+      if (receiptScan && receiptScan.epoch === held.epoch) updateReceiptCatalog(receiptScan, catalog);
       const { protectedFile: _protectedFile, ...rest } = held;
       epochParentKeys = null;
       discoveryEpoch = {
@@ -1104,6 +1139,9 @@ async function execute(
       epoch === request.discovery ? { sequence: epoch.sequence, completed: epoch.completed } : null;
     let replied = false;
     if (receiptScan && receiptScan.epoch !== epoch.epoch) closeReceiptScan('epoch');
+    // A list that arrived while the scan is open changes its compressed rows, as a root change does.
+    if (receiptScan && receiptScan.compressed !== compressedRequesters)
+      updateReceiptCatalog(receiptScan, epoch.catalog);
     // A new worker checks saved completions as their sources become reachable.
     const seeding = heldEpoch?.epoch !== epoch.epoch;
     if (seeding) {
@@ -1672,7 +1710,8 @@ async function execute(
           epoch: epoch.epoch,
           store,
           controller,
-          catalog: epoch.catalog,
+          catalog: receiptCatalogOf(epoch.catalog),
+          compressed: compressedRequesters,
           steps: store.relationships(() => scan.catalog, controller.signal),
           launches: new Map(),
           references: new Map(),
