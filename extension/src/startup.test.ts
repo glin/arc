@@ -47,7 +47,17 @@ import {
   sessionPageSources,
   guardedSourceIdentity,
   guardedSourceRevision,
+  sessionScopeDigest,
+  readSessionCursor,
+  SESSION_PAGE_LIMITS,
+  SESSION_PAGE_ERRORS,
+  sessionListingPage,
+  sessionReadStatus,
+  sessionAttention,
+  sessionExitMatches,
 } from './sessionreads';
+import { listingQueryError } from './domain/session-query';
+import * as crypto from 'node:crypto';
 import { afterAll, afterEach, beforeAll, test, vi } from 'vitest';
 import { pendingResponseSessionAdmitted, resolveResponseSession } from './domain/session-link';
 import { createPanelVisibility } from './panelvisibility';
@@ -12249,7 +12259,7 @@ test.each(['closing', 'closing and reopening'])(
       assert.deepEqual(files(), expected);
       assert.equal(walks.length, 0, 'the reopened panel walked again after its cold pass');
       assert.deepEqual(
-        primes.mock.calls.map((call) => call[4]),
+        primes.mock.calls.map((call) => call[3]),
         [signals[1]],
         'opening records were read by a pass other than the reopened one',
       );
@@ -15614,9 +15624,34 @@ function cutOffRollout(root: string, cwd: string, bytes: number): string {
 }
 
 test('a rollout cut off inside its first line leaves the listing complete', async () => {
-  const harness = backfilledTwinHarness(['sessionQueryContext', 'sessionQueryRevisionFor', 'sessionsKeptByReader'], {
-    sessionQueryRevision,
-  });
+  const harness = backfilledTwinHarness(
+    [
+      'sessionQueryContext',
+      'sessionQueryRevisionFor',
+      'sessionsKeptByReader',
+      'readSessionRequest',
+      'readScopeKey',
+      'verifiedParentEdges',
+      'revisionOf',
+      'readFacts',
+    ],
+    {
+      sessionQueryRevision,
+      sessionScopeDigest,
+      readSessionCursor,
+      SESSION_PAGE_LIMITS,
+      SESSION_PAGE_ERRORS,
+      sessionListingPage,
+      sameProgressiveRevision,
+      sessionReadStatus,
+      sessionRunning,
+      sessionAttention,
+      labelsOf,
+      listingQueryError,
+      sessionExitMatches,
+      crypto,
+    },
+  );
   const { provider, root, plain, releaseAll } = harness;
   epochWorker(harness);
   const counters = new PanelPerformanceCounters();
@@ -15634,6 +15669,14 @@ test('a rollout cut off inside its first line leaves the listing complete', asyn
     'the cut-off rollout stopped the listing at an admission gap',
   );
   assert.equal(provider.sessionQueryContext().coverage, 'complete', 'the cut-off rollout left the listing incomplete');
+  // Unread counts and the agent run class fill rows. The coverage of the listing reads neither.
+  provider.unreadCounts = () => null;
+  provider.agentRunFor = () => null;
+  provider.pendingWatch ??= { snapshot: () => ({ eventCount: 0, broadRequired: false }) };
+  provider.hidden = new Set();
+  provider.pinnedTop = new Set();
+  const page = provider.readSessionRequest({ id: 'page', method: 'sessions', requester: null, params: {} });
+  assert.equal(page.coverage, 'complete', 'the first page of the listing was not complete');
 });
 
 // Each case leaves one arm of the Codex listing undecided and returns the number of sources it leaves undecided. It
@@ -16805,7 +16848,7 @@ test('a new transcript in a directory the stat list misses lists at the backstop
 // Coverage of a file that no catalog lists, such as a transcript outside repository scope, misses the held catalog and walks.
 // One settled discovery reply, with a receipt revision that the store still holds. `census` and `reply` change what the next
 // walk lists and what the next reply says.
-function settledWalkHarness() {
+function settledWalkHarness(scope: Record<string, unknown> = {}) {
   vi.stubEnv('ARC_HOME', tempDir('settled-walk-arc-'));
   const census = { status: 'complete' };
   const reply: { settled: boolean; entries?: unknown[] } = { settled: true };
@@ -16822,6 +16865,7 @@ function settledWalkHarness() {
           uncertain: [],
         };
       },
+      ...scope,
     },
     false,
     ['compressedRolloutsToSend', 'compressedStorePaths'],
@@ -16880,6 +16924,29 @@ test('unchanged walks request a full pass after ten minutes and skip after accep
     assert.equal(skipped(), before.skipped + 11);
   } finally {
     vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+  }
+});
+
+test('a rollout cut off inside its first line lets an unchanged walk keep the settled discovery', async () => {
+  const root = tempDir('cut-off-walk-');
+  const { provider, settle, count } = settledWalkHarness({
+    codexSessionsRoot: () => root,
+    codexSessionFiles,
+    readRolloutStat,
+  });
+  provider.codexMetas = new CodexMetaCache();
+  provider.codexStats = new CodexStatCache();
+  provider.codexColdReads = null;
+  try {
+    cutOffRollout(root, root, 150 * 1024);
+    await settle();
+    assert.equal(
+      count('discoveryRequest:walkKept:admission'),
+      0,
+      'a walk kept its discovery request for an admission gap',
+    );
+  } finally {
     vi.unstubAllEnvs();
   }
 });

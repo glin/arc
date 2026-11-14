@@ -701,6 +701,33 @@ test('bounded session reads preserve native provider turns and reject stale scop
   assert.equal('observation' in oversized, false);
 });
 
+test('a session read refuses a Codex opening record longer than 128 KiB after reading at most 128 KiB', () => {
+  const directory = tempDir('session-read-');
+  const file = path.join(directory, 'codex.jsonl');
+  const records = [
+    {
+      type: 'session_meta',
+      timestamp: '2026-10-08T12:00:00Z',
+      payload: { id: 'known', cwd: directory, source: 'cli', base_instructions: 'x'.repeat(150 * 1024) },
+    },
+    { type: 'event_msg', timestamp: '2026-10-08T12:00:01Z', payload: { type: 'user_message', message: 'prompt' } },
+  ];
+  fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+  const source = {
+    agent: 'codex' as const,
+    file,
+    sessionId: 'known',
+    cwd: directory,
+    ...revisionOf(fs.statSync(file, { bigint: true })),
+  };
+  const window = openReadWindow();
+  const refused = boundedSessionRead(source, 2, () => 'scope', null, [directory]);
+  const tally = closeReadWindow(window);
+  assert.equal(refused.state, 'stale');
+  assert.match(refused.notes.join(' '), /opening is unavailable/);
+  assert.ok(tally.bytes <= 128 * 1024, `the qualification read ${tally.bytes} bytes`);
+});
+
 test('session attention stays unknown for hidden panels and unavailable facts', () => {
   assert.equal(sessionAttention(false, 'waiting', true), 'unknown');
   assert.equal(sessionAttention(true, 'waiting', false), 'input');
