@@ -305,6 +305,12 @@ export interface DiscoveryCharges
   receiptScanReuses?: number;
   receiptScanReuseLaunches?: number;
   receiptScanReuseLaunchesUnlinked?: number;
+  // Each launch that a reused scan holds from the completed scan, ended without a link and names both identities, by the stop
+  // of its last read. It counts whether the scan reads it again or not.
+  receiptScanReuseUnlinkedSession?: number;
+  receiptScanReuseUnlinkedFile?: number;
+  receiptScanReuseUnlinkedPath?: number;
+  receiptScanReuseUnlinkedOpening?: number;
   // A complete reply that leaves membership unsettled counts each branch that asked for another pass. The worker skips the
   // unread check once another branch asked.
   unsettledUnfinishedSources?: number;

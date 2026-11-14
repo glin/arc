@@ -276,12 +276,19 @@ export interface DispatchRelationshipIdentities {
   requester: { agent: 'claude' | 'codex'; sessionId: string };
   child?: { agent: 'claude' | 'codex'; sessionId: string };
 }
+// Where the read of a launch that names both identities ended without a link. `session` is the lookup of the dispatched
+// session, which found no single row, found a child-transcript row or found the requester itself. `file` is the comparison of
+// the startup file with the row file. `path` is the ancestor and working directory checks. `opening` is the opening read of the
+// dispatched transcript and the recheck after it.
+export type DispatchRelationshipStop = 'session' | 'file' | 'path' | 'opening';
 export interface DispatchRelationshipStep extends DispatchRelationshipAllowance {
   reference?: ClaudeDispatchSessionReference;
   refusal?: { error: unknown } & ({ launchId: string } | { storeOpened: boolean });
   // The final step of one launch names it. Identities are present when its read reached a catalog lookup.
   launchId?: string;
   identities?: DispatchRelationshipIdentities;
+  // The final step of a launch without a link names its stop when its read passed the lookup of its requester and bindings.
+  stop?: DispatchRelationshipStop;
   // The dispatched transcript of a found reference, with the revision that its opening check read.
   startup?: DispatchStartupRevision;
 }
@@ -319,6 +326,7 @@ class RelationshipReader {
   progress = emptyRelationshipStep();
   refusal: { error: unknown } | null = null;
   identities?: DispatchRelationshipIdentities;
+  stop?: DispatchRelationshipStop;
   startup?: DispatchStartupRevision;
   readonly revisions = new Map<string, string | null>();
   readonly digests = new Map<string, string>();
@@ -540,7 +548,7 @@ export class DispatchReceipts {
         ...reader.progress,
         launchId: id,
         ...(reader.identities ? { identities: reader.identities } : {}),
-        ...(reference ? { reference } : {}),
+        ...(reference ? { reference } : reader.stop ? { stop: reader.stop } : {}),
         ...(reference && reader.startup ? { startup: reader.startup } : {}),
       };
       reader.progress = emptyRelationshipStep();
@@ -550,6 +558,7 @@ export class DispatchReceipts {
         ...reader.progress,
         launchId: id,
         ...(reader.identities ? { identities: reader.identities } : {}),
+        ...(reader.stop ? { stop: reader.stop } : {}),
         ...(reader.refusal ? { refusal: { ...reader.refusal, launchId: id } } : {}),
       };
       return null;
@@ -750,10 +759,17 @@ export class DispatchReceipts {
       return parents.length === 1 && children.length === 1 ? { parent: parents[0], child: children[0] } : null;
     };
     const scoped = lookup();
-    if (!scoped || scoped.child.childTranscript || scoped.parent.sessionId === accepted.sessionId) return null;
+    if (!scoped || scoped.child.childTranscript || scoped.parent.sessionId === accepted.sessionId) {
+      reader.stop = 'session';
+      return null;
+    }
     const normalize = (value: string) =>
       this.platform === 'win32' ? paths.resolve(value).toLowerCase() : paths.resolve(value);
-    if (normalize(startup.file) !== normalize(scoped.child.file)) return null;
+    if (normalize(startup.file) !== normalize(scoped.child.file)) {
+      reader.stop = 'file';
+      return null;
+    }
+    reader.stop = 'path';
     yield* reader.path(startup.ancestor);
     const ancestor = yield* reader.stat(startup.ancestor);
     if (!ancestor?.isDirectory() || `${ancestor.dev}:${ancestor.ino}` !== startup.directory) return null;
@@ -768,6 +784,7 @@ export class DispatchReceipts {
       const retained = JSON.parse(yield* reader.read(this.relationshipCacheFile(id)));
       if (retained !== verification) return null;
     }
+    reader.stop = 'opening';
     yield* reader.read(startup.file, startup);
     yield* reader.recheck();
     const current = lookup();

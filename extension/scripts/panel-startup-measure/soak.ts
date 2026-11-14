@@ -340,6 +340,10 @@ export const DISCOVERY_CAUSE_MEASURES = [
   'receiptScanReuses',
   'receiptScanReuseLaunches',
   'receiptScanReuseLaunchesUnlinked',
+  'receiptScanReuseUnlinkedSession',
+  'receiptScanReuseUnlinkedFile',
+  'receiptScanReuseUnlinkedPath',
+  'receiptScanReuseUnlinkedOpening',
   'discoveryRequestReferenceSeeds',
   ...['claude', 'codex'].flatMap((agent) =>
     ['NoEntry', 'Rejected', 'Resumed', 'Growth', 'Validation', 'Boundary'].flatMap((cause) => [

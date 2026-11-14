@@ -2383,8 +2383,9 @@ test('a launch whose child opening completes after a completed scan gets its lin
         discovery.receiptScanReuses,
         discovery.receiptScanReuseLaunches,
         discovery.receiptScanReuseLaunchesUnlinked,
+        discovery.receiptScanReuseUnlinkedOpening,
       ],
-      [0, 1, 1, 1],
+      [0, 1, 1, 1, 1],
     );
   } finally {
     worker.stop();
@@ -2420,6 +2421,166 @@ test('a launch rejected at its requester is read again only when its requester e
     assert.equal(joined.get(fx.grandchild.sessionId)?.parent, requester.sessionId);
     assert.equal(joined.get(fx.child.sessionId)?.parent, fx.parent.sessionId);
     assert.deepEqual(counts(), [2, 1, 1, 0]);
+  } finally {
+    worker.stop();
+    vi.unstubAllEnvs();
+  }
+});
+
+// A linked launch beside a launch to a dispatched session whose transcript exists. `rows` gives the catalog rows of that
+// session when the settling passes read the launch, so its read ends unlinked at or after the lookup of its dispatched session.
+// `grown` grows the parent and runs a pass, with the receipt work of that pass's replies.
+async function unlinkedLaunchHarness(
+  rows: (
+    absent: import('./transcript').SessionFile,
+    fx: ReturnType<typeof receiptDispatchFixture>,
+  ) => object[] = () => [],
+) {
+  const harness = await receiptWalkHarness();
+  const { fx, host, charged } = harness;
+  const absent = fx.write('claude', 'ffffffff-1111-2222-3333-444444444444');
+  fx.launch();
+  fx.launch(fx.parent, absent);
+  host.claudeParents = [...fx.catalog, ...rows(absent, fx)];
+  await harness.settle();
+  const counters = new PanelPerformanceCounters(0, 'receipt-reuse-stop');
+  host.performanceCounters = counters;
+  const grown = async () => {
+    growTranscript(fx.parent);
+    const from = charged.length;
+    const reply = await harness.pass();
+    const sum = (key: keyof import('./progressiveworker').DiscoveryCharges) =>
+      charged.slice(from).reduce((total, charges) => total + (charges[key] ?? 0), 0);
+    return {
+      parents: sessionParentIndex(reply.references),
+      bytes: sum('receiptBytes'),
+      checks: sum('receiptChecks'),
+      read: sum('receiptLaunchesRead'),
+    };
+  };
+  const stops = () => {
+    const discovery = counters.snapshot().discovery;
+    return {
+      reread: discovery.receiptScanReuseLaunchesUnlinked,
+      session: discovery.receiptScanReuseUnlinkedSession,
+      file: discovery.receiptScanReuseUnlinkedFile,
+      path: discovery.receiptScanReuseUnlinkedPath,
+      opening: discovery.receiptScanReuseUnlinkedOpening,
+    };
+  };
+  return { ...harness, absent, grown, stops, counters };
+}
+
+// No catalog lists the second launch's dispatched session, so only a catalog change can link it.
+test('a reused receipt scan reads no launch whose read stopped at the lookup of its dispatched session', async () => {
+  const { fx, worker, absent, grown, stops, counters } = await unlinkedLaunchHarness();
+  try {
+    const work: number[][] = [];
+    for (let index = 0; index < 2; index++) {
+      const pass = await grown();
+      work.push([pass.bytes, pass.checks]);
+      assert.equal(pass.parents.get(fx.child.sessionId)?.parent, fx.parent.sessionId, 'the reused scan lost its link');
+      assert.equal(pass.parents.get(absent.sessionId), undefined);
+    }
+    assert.deepEqual(work, [
+      [0, 1],
+      [0, 1],
+    ]);
+    assert.equal(counters.snapshot().discovery.receiptScanReuses, 2);
+    assert.deepEqual(stops(), { reread: 0, session: 2, file: 0, path: 0, opening: 0 });
+  } finally {
+    worker.stop();
+    vi.unstubAllEnvs();
+  }
+});
+
+// The row of a copy of a session's transcript in another project directory.
+function rowElsewhere(fx: ReturnType<typeof receiptDispatchFixture>, row: import('./transcript').SessionFile) {
+  const file = path.join(fx.projects, 'elsewhere', path.basename(row.file));
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.copyFileSync(row.file, file);
+  return { ...row, file, ...revisionOf(fs.statSync(file, { bigint: true })) };
+}
+
+const dispatchedSessionRows: Array<
+  [string, 'session' | 'file', NonNullable<Parameters<typeof unlinkedLaunchHarness>[0]>]
+> = [
+  ['no row', 'session', () => []],
+  ['a row of the other agent', 'session', (absent, fx) => [fx.write('codex', absent.sessionId)]],
+  ['a row at another file', 'file', (absent, fx) => [rowElsewhere(fx, absent)]],
+  ['a child-transcript row', 'session', (absent) => [{ ...absent, childTranscript: true }]],
+  ['two rows', 'session', (absent, fx) => [absent, rowElsewhere(fx, absent)]],
+];
+test.each(dispatchedSessionRows)(
+  'a launch whose dispatched session has %s links on the reused scan after its row appears',
+  async (_name, stop, rows) => {
+    const { fx, worker, host, absent, grown, stops } = await unlinkedLaunchHarness(rows);
+    try {
+      const held = await grown();
+      assert.equal(held.parents.get(absent.sessionId), undefined);
+      assert.deepEqual(stops(), { reread: 0, session: 0, file: 0, path: 0, opening: 0, [stop]: 1 });
+      host.claudeParents = [...fx.catalog, absent];
+      const joined = await grown();
+      assert.equal(joined.parents.get(absent.sessionId)?.parent, fx.parent.sessionId);
+      assert.equal(joined.parents.get(fx.child.sessionId)?.parent, fx.parent.sessionId);
+    } finally {
+      worker.stop();
+      vi.unstubAllEnvs();
+    }
+  },
+);
+
+// The pass that drops the requester reads both launches again, and each read stops at the requester. The pass that restores
+// the requester reads both again. Only the first reuse holds a stop, which is the stop of the second launch.
+test('a launch that stopped at its dispatched session links after its requester leaves the catalog and returns', async () => {
+  const { fx, worker, host, absent, grown, stops } = await unlinkedLaunchHarness();
+  try {
+    host.claudeParents = [fx.child, fx.grandchild, absent];
+    const left = await grown();
+    assert.equal(left.parents.get(absent.sessionId), undefined);
+    host.claudeParents = [...fx.catalog, absent];
+    const back = await grown();
+    assert.equal(back.parents.get(absent.sessionId)?.parent, fx.parent.sessionId);
+    assert.equal(back.parents.get(fx.child.sessionId)?.parent, fx.parent.sessionId);
+    assert.deepEqual(stops(), { reread: 3, session: 1, file: 0, path: 0, opening: 0 });
+  } finally {
+    worker.stop();
+    vi.unstubAllEnvs();
+  }
+});
+
+// The roots change between the completed scan and its reuse, and the dispatched session enters the catalog with them.
+test('a launch that stopped at its dispatched session links when a root change brings its row', async () => {
+  const { fx, root, worker, host, absent, grown, counters } = await unlinkedLaunchHarness();
+  try {
+    host.repositoryScopeRoots = [root, path.join(root, 'other')];
+    host.claudeParents = [...fx.catalog, absent];
+    const joined = await grown();
+    assert.equal(joined.parents.get(absent.sessionId)?.parent, fx.parent.sessionId);
+    assert.equal(joined.parents.get(fx.child.sessionId)?.parent, fx.parent.sessionId);
+    const discovery = counters.snapshot().discovery;
+    assert.deepEqual([discovery.receiptScanOpens, discovery.receiptScanReuses], [0, 1]);
+  } finally {
+    worker.stop();
+    vi.unstubAllEnvs();
+  }
+});
+
+// The reply at 9 minutes reuses the scan that read the store at 0 minutes, so the age bound still counts from 0 minutes, and
+// the scan at 11 minutes reads the launch that the reused scan skipped.
+test('a launch that a reused scan skips is read again by the scan at the age bound', async () => {
+  const { worker, absent, grown, advance, stops, counters } = await unlinkedLaunchHarness();
+  try {
+    advance(9 * 60_000);
+    const reused = await grown();
+    assert.equal(reused.read, 0);
+    assert.deepEqual(stops(), { reread: 0, session: 1, file: 0, path: 0, opening: 0 });
+    advance(2 * 60_000);
+    const full = await grown();
+    assert.equal(full.read, 2, 'the scan at the age bound did not read both launches');
+    assert.equal(full.parents.get(absent.sessionId), undefined);
+    const discovery = counters.snapshot().discovery;
+    assert.deepEqual([discovery.receiptScanReuses, discovery.receiptScanOpensAfterCompletionAge], [1, 1]);
   } finally {
     worker.stop();
     vi.unstubAllEnvs();
@@ -18583,6 +18744,53 @@ test.skipIf(!zstdCompress)(
         counts: { rejected: 1, reuses: 1, reused: 1 },
         parent: undefined,
         facts: 0,
+      });
+    } finally {
+      worker.stop();
+    }
+  },
+);
+
+// The child has no row in the first two epochs, so the read stops at the lookup of its dispatched session. The requester row
+// comes from the list. The store directories are an hour old, so the second epoch reuses the completed scan without a read of
+// the launch. The third epoch reuses it again with the row of the child.
+test.skipIf(!zstdCompress)(
+  'a launch of a compressed requester that stopped at its dispatched session links when the row of that session arrives',
+  async () => {
+    const { fx, listed } = compressedRequesterFixture('codex');
+    const hourAgo = Date.now() / 1000 - 3600;
+    for (const directory of [fx.receipts.root, path.join(fx.home, 'cache', 'dispatch-relationships')])
+      if (fs.existsSync(directory)) fs.utimesSync(directory, hourAgo, hourAgo);
+    const worker = new ProgressiveWorker(`process.env.ARC_HOME=${JSON.stringify(fx.home)};` + source);
+    const epoch = async (sent: typeof listed, generation: number) => {
+      const counts = { reuses: 0, reread: 0, session: 0 };
+      for (let pass = 0; pass < 100; pass++) {
+        const result = await worker.run(sent, generation, new AbortController().signal);
+        assert.ok(result && 'charges' in result.value && result.value.charges, result?.value.kind);
+        counts.reuses += result.value.charges.receiptScanReuses ?? 0;
+        counts.reread += result.value.charges.receiptScanReuseLaunchesUnlinked ?? 0;
+        counts.session += result.value.charges.receiptScanReuseUnlinkedSession ?? 0;
+        if (result.value.kind === 'claude-children' && !result.value.continuation)
+          return { counts, ...dispatchedFrom(result, fx.child.sessionId) };
+      }
+      throw new Error('discovery never completed');
+    };
+    const without = { ...listed, parents: [fx.grandchild] };
+    try {
+      assert.deepEqual(await epoch(without, 1), {
+        counts: { reuses: 0, reread: 0, session: 0 },
+        parent: undefined,
+        facts: 0,
+      });
+      assert.deepEqual(await epoch(without, 2), {
+        counts: { reuses: 1, reread: 0, session: 1 },
+        parent: undefined,
+        facts: 0,
+      });
+      assert.deepEqual(await epoch({ ...listed, parents: [fx.grandchild, fx.child] }, 3), {
+        counts: { reuses: 1, reread: 1, session: 1 },
+        parent: fx.parent.sessionId,
+        facts: 1,
       });
     } finally {
       worker.stop();

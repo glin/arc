@@ -996,14 +996,23 @@ test('the final step of each launch names it and the identities its catalog look
   assert.equal(linked.launchId, fx.launch.launchId);
   assert.deepEqual(linked.identities, identities);
   assert.equal(linked.reference?.sessionId, turn);
+  assert.equal(linked.stop, undefined);
   // A lookup that misses still names the identities, so a later catalog can read the launch again.
   const [missed] = ends([fx.catalog[0]]);
   assert.deepEqual(missed.identities, identities);
   assert.equal(missed.reference, undefined);
+  assert.equal(missed.stop, 'session');
+  const [elsewhere] = ends([fx.catalog[0], { ...fx.catalog[1], file: path.join(fx.home, 'elsewhere.jsonl') }]);
+  assert.deepEqual([elsewhere.reference, elsewhere.stop], [undefined, 'file']);
+  // The same bytes in another order keep the identity and size of the opening, and fail its digest.
+  fs.writeFileSync(fx.file, Buffer.from(fx.opening).reverse());
+  const [opening] = ends(fx.catalog);
+  assert.deepEqual([opening.reference, opening.stop], [undefined, 'opening']);
   fs.rmSync(path.join(fx.receipts.root, `${fx.launch.launchId}.json`));
   const [unread] = ends(fx.catalog);
   assert.equal(unread.launchId, fx.launch.launchId);
   assert.equal(unread.identities, undefined);
+  assert.equal(unread.stop, undefined);
 });
 
 test('receipt readers recheck early evidence after partial source reads', () => {

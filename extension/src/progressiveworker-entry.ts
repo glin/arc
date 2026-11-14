@@ -136,7 +136,12 @@ import {
   validDiscoveryCheckpoint,
 } from './progressiveworker';
 import { TURN_QUIET_MS, statusOf } from './turncard';
-import { DispatchReceipts, dispatchStartupRevision, type DispatchStartupRevision } from './dispatchreceipts';
+import {
+  DispatchReceipts,
+  dispatchStartupRevision,
+  type DispatchRelationshipStop,
+  type DispatchStartupRevision,
+} from './dispatchreceipts';
 import { admittedDispatchReferences } from './turnrail';
 import {
   CompressedStoreFollower,
@@ -306,6 +311,8 @@ interface ReceiptScan {
   visited: Set<string>;
   // The dispatched transcript of each linked launch, with the revision of its opening check.
   startups: Map<string, DispatchStartupRevision>;
+  // The stop of each launch whose last read named both identities and ended without a link.
+  stops: Map<string, DispatchRelationshipStop>;
   // When the scan that last read the store from its first entry opened. A reused scan keeps the time of the scan it reused.
   fullAt: number;
   // Each launch that a reused scan sent to be read again and that has not been read yet, with true when the launch ended
@@ -387,6 +394,10 @@ interface HeldReceiptCounts {
     receiptScanTurns: number;
     receiptScanReuseLaunches: number;
     receiptScanReuseLaunchesUnlinked: number;
+    receiptScanReuseUnlinkedSession: number;
+    receiptScanReuseUnlinkedFile: number;
+    receiptScanReuseUnlinkedPath: number;
+    receiptScanReuseUnlinkedOpening: number;
   };
 }
 const heldReceiptCounts = new Map<string, HeldReceiptCounts>();
@@ -401,6 +412,10 @@ function heldReceiptCountsFor(scope: string): HeldReceiptCounts {
         receiptScanTurns: 0,
         receiptScanReuseLaunches: 0,
         receiptScanReuseLaunchesUnlinked: 0,
+        receiptScanReuseUnlinkedSession: 0,
+        receiptScanReuseUnlinkedFile: 0,
+        receiptScanReuseUnlinkedPath: 0,
+        receiptScanReuseUnlinkedOpening: 0,
       },
     };
     heldReceiptCounts.set(scope, held);
@@ -438,12 +453,26 @@ function keptScanRefusal(kept: ReceiptScan): keyof typeof KEPT_SCAN_REFUSAL_CHAR
   if (revision === undefined) return 'unproved';
   return revision === kept.storeRevision ? undefined : 'revision';
 }
+// The count of each stop of a launch without a link that a reused scan holds.
+const REUSE_UNLINKED_CHARGES = {
+  session: 'receiptScanReuseUnlinkedSession',
+  file: 'receiptScanReuseUnlinkedFile',
+  path: 'receiptScanReuseUnlinkedPath',
+  opening: 'receiptScanReuseUnlinkedOpening',
+} as const satisfies Record<DispatchRelationshipStop, keyof HeldReceiptCounts['work']>;
 // A scan for a new epoch from a completed scan. It reads again each launch whose requester or dispatched session changed
-// catalog rows, and each launch without a link whose read reached its dispatched session. Such a read depends on files
-// outside the store, such as the opening of the dispatched transcript. Any other launch without a link stopped at its
-// requester or on a store file, and Arc completes each write of such a file with a write in the store directory that moves
-// the store revision. Its steps then check the dispatched transcript of each link that the scan holds.
-function reusedReceiptScan(kept: ReceiptScan, epoch: DiscoveryCheckpoint): ReceiptScan {
+// catalog rows. It also reads again each launch without a link whose read went past the file comparison of its dispatched
+// session. Such a read depends on files outside the store, such as the opening of the dispatched transcript. A launch without a
+// link that stopped at the lookup of its dispatched session or at the file comparison read only store files and catalog rows.
+// So only a change of those rows or of the store can link it. Any other launch without a link stopped at its requester or on
+// a store file. Arc completes each write of such a file with a write in the store directory that moves the store revision.
+// The steps of the scan then check the dispatched transcript of each link that the scan holds. `work` counts each launch
+// without a link that names both identities, by its stop.
+function reusedReceiptScan(
+  kept: ReceiptScan,
+  epoch: DiscoveryCheckpoint,
+  work: HeldReceiptCounts['work'],
+): ReceiptScan {
   const catalog = receiptCatalogOf(epoch.catalog);
   const changed = changedCatalogIdentities(kept.catalog, catalog);
   const scan: ReceiptScan = {
@@ -464,9 +493,11 @@ function reusedReceiptScan(kept: ReceiptScan, epoch: DiscoveryCheckpoint): Recei
   for (const launchId of kept.visited) {
     // The identities hold the requester, and then the dispatched session when the read reached it.
     const identities = scan.launches.get(launchId) ?? [];
-    const unlinked = scan.reuseClasses.get(launchId)!;
-    if (!identities.some((identity) => changed.has(identity)) && !(unlinked && identities.length > 1)) continue;
-    retryReceiptLaunch(scan, launchId);
+    const unlinked = scan.reuseClasses.get(launchId)! && identities.length > 1;
+    const stop = unlinked ? scan.stops.get(launchId) : undefined;
+    if (stop) work[REUSE_UNLINKED_CHARGES[stop]]++;
+    if (identities.some((identity) => changed.has(identity))) retryReceiptLaunch(scan, launchId);
+    else if (unlinked && stop !== 'session' && stop !== 'file') retryReceiptLaunch(scan, launchId);
   }
   return scan;
 }
@@ -476,6 +507,7 @@ function retryReceiptLaunch(scan: ReceiptScan, launchId: string): void {
   scan.launches.delete(launchId);
   scan.references.delete(launchId);
   scan.startups.delete(launchId);
+  scan.stops.delete(launchId);
   scan.retries.push(launchId);
   const unlinked = scan.reuseClasses.get(launchId);
   if (unlinked === undefined) return;
@@ -1695,7 +1727,7 @@ async function execute(
       const opens = heldReceiptCountsFor(scope).opens;
       if (kept && !refusal) {
         opens.push('receiptScanReuses');
-        receiptScan = reusedReceiptScan(kept, epoch);
+        receiptScan = reusedReceiptScan(kept, epoch, heldReceiptCountsFor(scope).work);
       } else {
         opens.push(
           'receiptScanOpens',
@@ -1722,6 +1754,7 @@ async function execute(
           competitionRefused: false,
           visited: new Set(),
           startups: new Map(),
+          stops: new Map(),
           fullAt: Date.now(),
           reuseRetries: new Map(),
           reuseClasses: new Map(),
@@ -1838,6 +1871,8 @@ async function execute(
         activeReceipts.references.delete(launchId);
         activeReceipts.startups.delete(launchId);
         if (step.value.startup) activeReceipts.startups.set(launchId, step.value.startup);
+        if (step.value.stop) activeReceipts.stops.set(launchId, step.value.stop);
+        else activeReceipts.stops.delete(launchId);
         if (identities?.child) charges.receiptLaunchesRead!++;
         else if (identities) charges.receiptLaunchesRejectedAtRequester!++;
         if (identities)
@@ -2348,6 +2383,10 @@ function emptyDiscoveryCharges(): DiscoveryCharges {
     receiptScanReuses: 0,
     receiptScanReuseLaunches: 0,
     receiptScanReuseLaunchesUnlinked: 0,
+    receiptScanReuseUnlinkedSession: 0,
+    receiptScanReuseUnlinkedFile: 0,
+    receiptScanReuseUnlinkedPath: 0,
+    receiptScanReuseUnlinkedOpening: 0,
     unsettledUnfinishedSources: 0,
     unsettledDeferredSources: 0,
     unsettledUnreadSources: 0,
