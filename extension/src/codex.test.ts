@@ -242,6 +242,7 @@ import {
   scanForCodexPerson,
   readCodexSession,
   readCodexOpening,
+  openingRecordOf,
   readCodexOpeningAnswer,
   readCodexOpeningAsync,
   readQualifiedCodexOpening,
@@ -19054,6 +19055,24 @@ test('a held answer with no session reads the file again when it changes at the 
     [UUID_A, UUID_B].sort(),
     'a change at the same size kept the held answer',
   );
+  // A new file of the same size and modification time, renamed over the rollout, differs only in its identity.
+  const replaced = rootWithHead(`${'x'.repeat(Buffer.byteLength(opening) - 1)}\n`);
+  const at = new Date(Math.floor(Date.now() / 1000) * 1000 - 60_000);
+  fs.utimesSync(replaced.file, at, at);
+  assert.deepEqual(listedIds(listThrough(replaced.root, cache)), [UUID_A]);
+  const next = `${replaced.file}.next`;
+  fs.writeFileSync(next, opening);
+  fs.utimesSync(next, at, at);
+  const old = revisionOf(fs.statSync(replaced.file, { bigint: true }));
+  fs.renameSync(next, replaced.file);
+  const now = revisionOf(fs.statSync(replaced.file, { bigint: true }));
+  assert.deepEqual([now.size, now.mtimeMs], [old.size, old.mtimeMs], 'the fixture moved the size or the time');
+  assert.notEqual(`${now.dev}:${now.ino}`, `${old.dev}:${old.ino}`, 'the fixture kept the file identity');
+  assert.deepEqual(
+    listedIds(listThrough(replaced.root, cache)).sort(),
+    [UUID_A, UUID_B].sort(),
+    'a replacement with the same size and time kept the held answer',
+  );
 });
 
 test('an opening record with no working directory is read again when the file changes', () => {
@@ -19062,19 +19081,32 @@ test('an opening record with no working directory is read again when the file ch
   const first = listThrough(root, cache);
   assert.equal(first.admission, 'complete');
   assert.deepEqual(listedIds(first), [UUID_A]);
-  assert.ok(
-    cache.snapshot().every(([saved]) => saved !== file),
-    'the cache saved an opening with no working directory',
-  );
+  const saved = cache.snapshot();
   fs.writeFileSync(file, `${JSON.stringify(meta({ id: UUID_B }))}\n`);
   assert.deepEqual(
     listedIds(listThrough(root, cache)).sort(),
     [UUID_A, UUID_B].sort(),
     'the opening that gained a working directory gave no row',
   );
+  assert.ok(
+    saved.every(([rollout]) => rollout !== file),
+    'the cache saved an opening with no working directory',
+  );
 });
 
-test('a saved opening with no working directory answers at its revision and reads again after a change', () => {
+test('a stored opening with no working directory at the stat of the current file is read at the first listing', () => {
+  const { root, file } = rootWithHead(`${JSON.stringify(meta({ id: UUID_B }))}\n`);
+  // The stored row holds the stat of the current file and the fields of an earlier opening with no working directory.
+  const cache = new CodexMetaCache();
+  cache.load([[file, { ...readCodexSessionMeta(file)!, cwd: null }]]);
+  assert.deepEqual(
+    listedIds(listThrough(root, cache)).sort(),
+    [UUID_A, UUID_B].sort(),
+    'the stored opening hid the session',
+  );
+});
+
+test('a saved opening with no working directory is read once at the first listing and again after a change', () => {
   const { root, file } = rootWithHead(`${JSON.stringify(meta({ id: UUID_B, cwd: undefined }))}\n`);
   let reads = 0;
   const cache = new CodexMetaCache((rollout, onRead) => {
@@ -19085,13 +19117,40 @@ test('a saved opening with no working directory answers at its revision and read
   const unchanged = listThrough(root, cache);
   assert.equal(unchanged.admission, 'complete', 'the loaded opening left admission incomplete');
   assert.deepEqual(listedIds(unchanged), [UUID_A]);
-  assert.equal(reads, 0, 'the loaded opening of an unchanged file was read again');
+  assert.equal(reads, 1, 'the first listing did not read the loaded opening');
+  assert.deepEqual(listedIds(listThrough(root, cache)), [UUID_A]);
+  assert.equal(reads, 1, 'the second listing read the unchanged file again');
+  assert.equal(cache.peek(file)?.sessionId, UUID_B, 'the held opening with no working directory left peek');
   fs.writeFileSync(file, `${JSON.stringify(meta({ id: UUID_B }))}\n`);
   assert.deepEqual(
     listedIds(listThrough(root, cache)).sort(),
     [UUID_A, UUID_B].sort(),
     'the loaded opening hid the changed file',
   );
+});
+
+test('the cache revision moves when the opening that peek answers for a head with no session changes', () => {
+  const noDirectory = (id: string) => openingRecordOf(JSON.stringify(meta({ id, cwd: undefined })));
+  let answer: ReturnType<typeof noDirectory> = null;
+  let size = 1;
+  const file = 'C:/isolated/Rollout.jsonl';
+  const cache = new CodexMetaCache(
+    () => answer,
+    () => ({ size, mtimeMs: 0 }),
+  );
+  cache.get(file);
+  const moved = (next: typeof answer) => {
+    answer = next;
+    size += 1;
+    const before = cache.revision;
+    assert.equal(cache.get(file), null, 'a head with no session gave an opening');
+    return cache.revision !== before;
+  };
+  assert.equal(moved(null), false, 'a head read again with no opening moved the revision');
+  assert.equal(moved(noDirectory(UUID_A)), true, 'a head that gained an opening left the revision');
+  assert.equal(moved(noDirectory(UUID_A)), false, 'the same opening read again moved the revision');
+  assert.equal(moved(noDirectory(UUID_B)), true, 'a changed opening left the revision');
+  assert.equal(moved(null), true, 'a head that lost its opening left the revision');
 });
 
 test('failed Codex stat reads retain the held revision until enumeration proves absence', () => {

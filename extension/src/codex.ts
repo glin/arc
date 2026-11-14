@@ -243,7 +243,9 @@ function sameHeadRevision(held: OpeningStat, stat: OpeningStat): boolean {
 // Readable openings with a working directory stay cached while their file identity remains current.
 // A head with no session holds the revision that its read saw. A stat of any other revision reads the file again.
 // A head with no session includes an opening record with no working directory, which `peek` still answers.
-// A read that names no revision holds none, so the next `get` reads the file once more.
+// A cold read that names no revision holds none, so the next `get` reads the file once more.
+// When `get` reads a held head with no session again, such an answer holds the stat that `get` took before the read.
+// A change of the opening that `peek` answers moves `revision`.
 // Refused reads retain no revision. They use the first retry interval, then the repeated-refusal interval.
 // The default clock is monotonic.
 export class CodexMetaCache {
@@ -274,13 +276,20 @@ export class CodexMetaCache {
     pastBound: boolean,
     opening: CodexSessionMeta | null,
   ): void {
-    if (this.entries.get(file)?.meta) this.delete(file);
+    const before = this.peek(file);
     this.entries.set(file, {
       meta: null,
       revision,
       ...(pastBound ? { pastBound: true as const } : {}),
       ...(opening ? { opening } : {}),
     });
+    this.notePeek(before, opening);
+  }
+
+  // Move `revision` when the opening that `peek` answers changes its fields.
+  private notePeek(before: CodexSessionMeta | null, after: CodexSessionMeta | null): void {
+    if (before === after) return;
+    if (!before || !after || !isDeepStrictEqual(openingFields(before), openingFields(after))) this.changed += 1;
   }
 
   private current(file: string, stat: RolloutStat | null): CodexSessionMeta | null {
@@ -346,7 +355,9 @@ export class CodexMetaCache {
         return hit.meta;
       }
       const wait = hit && hit.meta === undefined ? REFUSED_OPENING_RETRY_MS : REFUSED_OPENING_FIRST_RETRY_MS;
+      const before = this.peek(file);
       this.entries.set(file, { meta: undefined, triedAt: this.now(), wait });
+      this.notePeek(before, null);
       return null;
     }
     if (!meta.cwd) {
@@ -467,11 +478,9 @@ export class CodexMetaCache {
     }
   }
   delete(file: string): boolean {
-    const hit = this.entries.get(file);
+    const before = this.peek(file);
     const deleted = this.entries.delete(file);
-    if (deleted && hit?.meta) {
-      this.changed += 1;
-    }
+    this.notePeek(before, null);
     return deleted;
   }
 
@@ -483,11 +492,11 @@ export class CodexMetaCache {
 
   // Restore entries from the machine's stored opening records. Validation belongs to the cache reader, while this
   // method keeps the retry-marker representation private to this class. A stored opening with no working directory
-  // answers as a head with no session at its saved stat.
+  // holds no revision, because its saved stat can be newer than the read that gave its fields. The next `get` reads it.
   load(entries: Iterable<[string, CodexSessionMeta]>): void {
     for (const [file, meta] of entries) {
       if (meta.cwd) this.entries.set(file, { meta });
-      else this.entries.set(file, { meta: null, revision: openingRevision(meta), opening: meta });
+      else this.entries.set(file, { meta: null, revision: null, opening: meta });
     }
   }
 }
