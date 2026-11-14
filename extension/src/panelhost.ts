@@ -807,6 +807,15 @@ interface CatalogEnumerationParts {
   time: ListingTimer;
 }
 
+// The prompt admission work of a discovery request. `discoveryWaitMs` adds the time that the request waited for the worker.
+interface DiscoveryWork {
+  bytes: number;
+  sources: number;
+  reads: number;
+  unknown: Set<string>;
+  discoveryWaitMs?: number;
+}
+
 // What the opening reads of a Claude listing found, apart from the working directories.
 interface ClaudeOpenings {
   observations: Pick<SessionCollisionObservation, 'source' | 'excluded'>[];
@@ -2842,6 +2851,8 @@ export class PanelProvider implements vscode.Disposable {
     };
   } | null = null;
   private readonly warnedMessageBudgets = new Set<string>();
+  // The render posts whose bytes the host measured. Every sixteenth one, from the first, measures its complete fields.
+  private renderPostsMeasured = 0;
   private performanceOutput: vscode.OutputChannel | null = null;
 
   // Live panel state shared by attached hosts and persisted through the memento.
@@ -5466,6 +5477,9 @@ export class PanelProvider implements vscode.Disposable {
           }
         }
       }
+    } else if (stage === 'completeRender') {
+      // A refresh moved the generation between the paint and its acknowledgment, so the stage is not recorded.
+      this.performanceCounters.recordWork('completeRenderDropped:staleGeneration');
     }
     // The paint is recorded first, because the listing that this starts moves the refresh generation.
     if (stage === 'railReady' && this.finishedColdPass) this.listFinishedColdPass();
@@ -6245,6 +6259,18 @@ export class PanelProvider implements vscode.Disposable {
     if (measuring) this.health?.settle(measuring);
     this.performanceCounters.recordMessage(kind, serializedBytes, host);
     measured?.(serializedBytes);
+    if (kind === 'render' && serializedBytes !== null) {
+      this.renderPostsMeasured = (this.renderPostsMeasured ?? 0) + 1;
+      // Each field serializes again, so only a sample of the posts measures them.
+      if (this.renderPostsMeasured % 16 === 1) {
+        this.performanceCounters.recordWork('renderPostBytes:sampled');
+        for (const field of ['cards', 'hidden', 'comments', 'usage']) {
+          const value = (message as Record<string, unknown>)[field];
+          const bytes = value === undefined ? null : serializedMessageBytes(value);
+          if (bytes !== null) this.performanceCounters.recordWork(`renderPostBytes:${field}`, bytes);
+        }
+      }
+    }
     if (serializedBytes !== null && budget !== null && serializedBytes > budget) {
       // Log each budget breach when diagnostics are enabled. Warn once per message kind with its largest field sizes.
       if (this.diagnostics.enabled()) {
@@ -11570,7 +11596,14 @@ export class PanelProvider implements vscode.Disposable {
           walkReasons = [refreshReason];
         }
       }
-      const humanPromptWork = { bytes: 0, sources: 0, reads: 0, checks: 0, unknown: new Set<string>() };
+      // A discovery request of this refresh also returns the time that it waited for the worker in `discoveryWaitMs`.
+      const humanPromptWork: DiscoveryWork & { checks: number } = {
+        bytes: 0,
+        sources: 0,
+        reads: 0,
+        checks: 0,
+        unknown: new Set<string>(),
+      };
       if (
         selectedOnly &&
         this.authoritativeCatalog &&
@@ -11635,7 +11668,8 @@ export class PanelProvider implements vscode.Disposable {
             this.authoritativeCatalog = this.authoritativeCatalog.filter((session) => !refused.has(session.file));
         }
       }
-      const enumerationMs = performance.now() - catalogStarted;
+      const enumerationEnded = performance.now();
+      const enumerationMs = enumerationEnded - catalogStarted;
       this.performanceCounters.recordRefresh('catalog-enumeration', enumerationMs);
       let timedMs = 0;
       let openingsMs = 0;
@@ -11650,6 +11684,13 @@ export class PanelProvider implements vscode.Disposable {
       }
       this.performanceCounters.recordRefresh('catalog-enumeration:openings', openingsMs);
       this.performanceCounters.recordRefresh('catalog-enumeration:build', Math.max(0, enumerationMs - timedMs));
+      // The stage rows of a catalog refresh. With `catalog-enumeration` they sum to the time from the start of the listing to
+      // the end of enrichment. `build` holds the time before enrichment that no other stage holds.
+      let stagedMs = 0;
+      const recordStage = (stage: string, ms: number): void => {
+        stagedMs += ms;
+        this.performanceCounters.recordRefresh(`refresh-stage:${stage}`, ms);
+      };
       if (this.repositoryScopeReady) {
         this.startupHistory?.stage('openingsEnumerated');
       }
@@ -11675,7 +11716,11 @@ export class PanelProvider implements vscode.Disposable {
               (session.childTranscript === true ||
                 (!this.catalogWalked && !checkedPaths.has(normalizeFsPath(session.file))))),
         );
-        const changed = await replacedCatalogFiles(heldSources, controller.signal);
+        const sweep = { checks: 0 };
+        const sweepStarted = performance.now();
+        const changed = await replacedCatalogFiles(heldSources, controller.signal, undefined, sweep);
+        this.performanceCounters.recordRefresh('refresh-stage:held-sweep', performance.now() - sweepStarted);
+        this.performanceCounters.recordWork('heldIdentityStat', sweep.checks);
         if (controller.signal.aborted || generation !== this.refreshGeneration) return;
         if (changed.length) {
           for (const file of changed) this.codexStats.markChanged(path.dirname(file), path.basename(file));
@@ -11772,7 +11817,12 @@ export class PanelProvider implements vscode.Disposable {
           );
           if (!reuseCatalog)
             for (const reason of walkReasons) this.performanceCounters.recordWork(`discoveryRequest:walked:${reason}`);
+          const discoveryStarted = performance.now();
           const discovered = await this.prepareClaudeChildren(generation, controller.signal, humanPromptWork);
+          const discoveryMs = performance.now() - discoveryStarted;
+          const waitMs = humanPromptWork.discoveryWaitMs;
+          if (waitMs !== undefined) recordStage('discovery-wait', waitMs);
+          recordStage('discovery-host', discoveryMs - (waitMs ?? 0));
           if (!discovered || controller.signal.aborted || generation !== this.refreshGeneration) {
             return;
           }
@@ -11800,8 +11850,11 @@ export class PanelProvider implements vscode.Disposable {
       const factsBefore = this.metadataFactsRevision ?? 0;
       // A selection that reads metadata before its render reads it for every listed session, as a catalog refresh does.
       const metadataSources = selectedOnly && !metadataAfterRender ? this.selectionSourcesOf(null, all) : all;
-      if (!metadataAfterRender && !(await this.prepareMetadata(metadataSources, generation, controller.signal))) {
-        return;
+      if (!metadataAfterRender) {
+        const metadataStarted = selectedOnly ? 0 : performance.now();
+        const prepared = await this.prepareMetadata(metadataSources, generation, controller.signal);
+        if (!selectedOnly) recordStage('metadata', performance.now() - metadataStarted);
+        if (!prepared) return;
       }
       if (!selectedOnly && !metadataAfterRender)
         this.performanceCounters?.recordStartup('metadataPrepared', performance.now());
@@ -12099,6 +12152,8 @@ export class PanelProvider implements vscode.Disposable {
         if (!selectedOnly && this.repositoryScopeReady && this.saved.agentRead?.length) this.restoreAgentReads();
         if (!selectedOnly) {
           this.scheduleProjectSpendHydration(generation);
+          const enrichmentStarted = performance.now();
+          recordStage('build', enrichmentStarted - enumerationEnded - stagedMs);
           const enrichment = await this.prepareRailEnrichment(all, generation, controller.signal);
           this.postSessionLoading(generation, controller.signal);
           if (
@@ -12108,6 +12163,7 @@ export class PanelProvider implements vscode.Disposable {
           ) {
             this.refreshFrom('enrichment', enrichment.changed, true, enrichment.stale.length ? enrichment.stale : null);
           } else if (quiet) this.commitQuietBasis(quiet, readsBefore, generation, controller.signal);
+          recordStage('enrichment', performance.now() - enrichmentStarted);
         }
         return;
       }
@@ -12283,6 +12339,8 @@ export class PanelProvider implements vscode.Disposable {
       if (listLoading.complete && this.authoritativeCatalogScope === loadingScope)
         this.loadingLine.hold(loadingScope, generation, selectedOnly ? 'selection' : 'render');
       const metadataAcceptedHosts = new Set<PanelHost>();
+      // The time inside the render post of every panel.
+      let postMs = 0;
       this.heldRailPayloads ??= new Map();
       this.heldHostRows ??= new WeakMap();
       for (const host of this.hosts) {
@@ -12441,31 +12499,33 @@ export class PanelProvider implements vscode.Disposable {
           this.loadingLine.held(loadingScope) && !listLoading.complete ? { ...listLoading, held: true } : listLoading,
         );
         this.publishSessionQueryContext();
+        const message = {
+          ...payload,
+          // A held line marks a pending stamp held. A newest-turn read then keeps the stamp incomplete, so the panel's completion
+          // acknowledgement waits for it, but the line stays hidden and the read reaches only the log.
+          startup:
+            selectedOnly && this.authoritativeCatalog === null
+              ? undefined
+              : this.loadingLine.present(
+                  selectedOnly ? 'selection' : 'render',
+                  this.withSourceCount({ ...listLoading, complete: !loadingNewest && listLoading.complete }),
+                  loadingScope,
+                  () => listBlocker ?? { reason: 'newest turn loading' },
+                ),
+          usage:
+            typeof this.usagePayloadForSession === 'function'
+              ? this.usagePayloadForSession(hostSession, host.webview)
+              : this.usagePayload(host.webview),
+          cards: this.themedFor(hostDrawn, host.webview, light),
+          // Heading figures are keyed by session. Cost and turn count cover its lifetime, while context describes the current window.
+          ...(selectedOnly ? {} : { stats: hostRail.stats }),
+          // Resolve icon-font rules for this webview. Image-only themes supply no font rules.
+          ...(selectedOnly ? {} : { iconFonts: this.icons.fontFaces(host.webview) }),
+        };
+        const postStarted = selectedOnly ? 0 : performance.now();
         void this.postRows(
           host,
-          {
-            ...payload,
-            // A held line marks a pending stamp held. A newest-turn read then keeps the stamp incomplete, so the panel's completion
-            // acknowledgement waits for it, but the line stays hidden and the read reaches only the log.
-            startup:
-              selectedOnly && this.authoritativeCatalog === null
-                ? undefined
-                : this.loadingLine.present(
-                    selectedOnly ? 'selection' : 'render',
-                    this.withSourceCount({ ...listLoading, complete: !loadingNewest && listLoading.complete }),
-                    loadingScope,
-                    () => listBlocker ?? { reason: 'newest turn loading' },
-                  ),
-            usage:
-              typeof this.usagePayloadForSession === 'function'
-                ? this.usagePayloadForSession(hostSession, host.webview)
-                : this.usagePayload(host.webview),
-            cards: this.themedFor(hostDrawn, host.webview, light),
-            // Heading figures are keyed by session. Cost and turn count cover its lifetime, while context describes the current window.
-            ...(selectedOnly ? {} : { stats: hostRail.stats }),
-            // Resolve icon-font rules for this webview. Image-only themes supply no font rules.
-            ...(selectedOnly ? {} : { iconFonts: this.icons.fontFaces(host.webview) }),
-          },
+          message,
           (serializedBytes) => {
             if (serializedBytes !== null) {
               largestRenderBytes = Math.max(largestRenderBytes ?? 0, serializedBytes);
@@ -12496,13 +12556,23 @@ export class PanelProvider implements vscode.Disposable {
           },
           () => {},
         );
-        if (!selectedOnly) this.performanceCounters.recordStartup('firstRenderPosted', performance.now());
+        if (!selectedOnly) {
+          const postEnded = performance.now();
+          postMs += postEnded - postStarted;
+          this.performanceCounters.recordStartup('firstRenderPosted', postEnded);
+          // The panel's row sender encoded this post synchronously, so its record describes this post.
+          const changed = this.rowSender(host).lastRailChanges;
+          if (changed)
+            for (const [field, rows] of Object.entries(changed.fields))
+              this.performanceCounters.recordWork(`renderPostField:${refreshReason}:${field}`, rows);
+        }
         if (!selectedOnly && (this.codexColdPass?.listing || this.finishedColdPass)) this.armColdPassPaintLimit();
         if (hostSession) {
           this.hostPreviousSessions?.set(host, hostSession);
         }
       }
       if (!selectedOnly) {
+        if (this.hosts.length) recordStage('post', postMs);
         this.projectSpendHydrationReady = true;
         this.scheduleProjectSpendHydration(generation);
       }
@@ -12559,8 +12629,11 @@ export class PanelProvider implements vscode.Disposable {
       }
       // Post an accepted selected window before the next bounded metadata batch.
       const factsRevision = this.metadataFactsRevision ?? 0;
-      if (metadataAfterRender && !(await this.prepareMetadata(all, generation, controller.signal))) {
-        return;
+      if (metadataAfterRender) {
+        const metadataStarted = performance.now();
+        const prepared = await this.prepareMetadata(all, generation, controller.signal);
+        recordStage('metadata', performance.now() - metadataStarted);
+        if (!prepared) return;
       }
       // The render drew each entry from before these reads, so a read that moved a drawn fact needs a follow-up render.
       const factsMoved = metadataAfterRender && (this.metadataFactsRevision ?? 0) > factsRevision;
@@ -12571,6 +12644,8 @@ export class PanelProvider implements vscode.Disposable {
       if (metadataAfterRender && this.metadataRevision > metadataRevision) {
         this.refreshFrom('metadata', false, true);
       }
+      const enrichmentStarted = performance.now();
+      recordStage('build', enrichmentStarted - enumerationEnded - stagedMs);
       if (
         (await this.prepareProgressive(sessions, generation, controller.signal)) &&
         !controller.signal.aborted &&
@@ -12585,6 +12660,7 @@ export class PanelProvider implements vscode.Disposable {
           this.refreshFrom('enrichment', changed, true, enrichment.stale.length ? enrichment.stale : null);
         } else if (quiet) this.commitQuietBasis(quiet, readsBefore, generation, controller.signal);
       }
+      recordStage('enrichment', performance.now() - enrichmentStarted);
     } catch (error) {
       // A computation that stopped part way leaves no state that a selection can extend.
       this.selectionBasis = undefined;
@@ -12938,7 +13014,21 @@ export class PanelProvider implements vscode.Disposable {
     if (this.dispatchDiscoveryPending || this.dispatchSpendPending || this.discoveryComplete !== undefined)
       return 'discovery';
     if (this.compressedRowsDirty?.size || this.compressedRowsWaiting) return 'compressedRows';
-    if (this.automaticCompactions?.size || Object.keys(this.live ?? {}).length) return 'presses';
+    // The gauges name the sessions whose presses keep a poll from standing in for its refresh.
+    const held = Object.entries(this.live ?? {});
+    let failed = 0;
+    let notShown = 0;
+    if (held.length) {
+      const shown = new Set([this.showing, ...(this.hostSessions?.values() ?? [])]);
+      for (const [session, presses] of held) {
+        if (presses.some((press) => press.failed)) failed++;
+        if (!shown.has(session)) notShown++;
+      }
+    }
+    this.performanceCounters.recordGauge?.('heldPresses', held.length);
+    this.performanceCounters.recordGauge?.('heldPressesFailed', failed);
+    this.performanceCounters.recordGauge?.('heldPressesNotShown', notShown);
+    if (this.automaticCompactions?.size || held.length) return 'presses';
     if (now >= basis.until) return 'deadline';
     // The listing of a poll's refresh starts the same way, and the snapshot keeps the periodic check of repository roots.
     const folders = this.folders();
@@ -16126,7 +16216,7 @@ export class PanelProvider implements vscode.Disposable {
   private async prepareClaudeChildren(
     generation: number,
     signal: AbortSignal,
-    humanPromptWork = { bytes: 0, sources: 0, reads: 0, unknown: new Set<string>() },
+    humanPromptWork: DiscoveryWork = { bytes: 0, sources: 0, reads: 0, unknown: new Set<string>() },
     continuation = false,
   ): Promise<boolean> {
     if (!signal.aborted && generation === this.refreshGeneration) {
@@ -16336,6 +16426,7 @@ export class PanelProvider implements vscode.Disposable {
       const { spendSources: _spendSources, ...sent } = this.discoveryCheckpoint;
       discovery = sent;
     }
+    const waitStarted = performance.now();
     const result = await this.progressiveWorker
       .run(
         {
@@ -16356,6 +16447,7 @@ export class PanelProvider implements vscode.Disposable {
         acknowledge,
       )
       .catch(() => null);
+    humanPromptWork.discoveryWaitMs = (humanPromptWork.discoveryWaitMs ?? 0) + performance.now() - waitStarted;
     const answeringWorker = this.progressiveWorker.currentThreadId ?? null;
     if (result && compressedList.compressed) {
       this.markCompressedRolloutsSent(compressedRevision);

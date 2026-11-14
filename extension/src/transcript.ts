@@ -1072,6 +1072,7 @@ function replacedAtPath(held: SessionFile, now: CatalogRevision): boolean {
 
 // Check held identities before catalog publication without blocking the extension host on filesystem reads.
 // Append-only changes retain the catalog. A missing or replaced source requires discovery again.
+// `sweep.checks` adds the number of file checks that the call starts.
 export async function replacedCatalogFiles(
   sessions: readonly SessionFile[],
   signal: AbortSignal,
@@ -1082,11 +1083,14 @@ export async function replacedCatalogFiles(
       return null;
     }
   },
+  sweep?: { checks: number },
 ): Promise<string[]> {
   const changed: string[] = [];
   for (let at = 0; at < sessions.length && !signal.aborted; at += 32) {
+    const batch = sessions.slice(at, at + 32);
+    if (sweep) sweep.checks += batch.length;
     await Promise.all(
-      sessions.slice(at, at + 32).map(async (session) => {
+      batch.map(async (session) => {
         const current = await statOf(session.file);
         if (!current || replacedAtPath(session, current)) changed.push(session.file);
       }),

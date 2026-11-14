@@ -12352,7 +12352,7 @@ test('derived session caches load, trim against the walk, and checkpoint after f
     /this\.checkpointDerivedCache\(\);/,
     'a populated derived cache still waits for provider disposal before reaching disk',
   );
-  const postAt = layoutIndexOf(refreshBody, 'this.postRows(host, {');
+  const postAt = layoutIndexOf(refreshBody, 'this.postRows(host, message');
   const checkpointAt = refreshBody.indexOf('this.checkpointDerivedCache();');
   assert.notEqual(postAt, -1, 'the first render is no longer posted from refresh');
   assert.notEqual(checkpointAt, -1, 'refresh no longer requests the cache checkpoint');
@@ -12442,7 +12442,7 @@ test('derived session caches load, trim against the walk, and checkpoint after f
 
 test('the first authoritative render precedes Project cost restoration and pricing', () => {
   const refresh = methodBody('async refresh(');
-  const renderAt = layoutIndexOf(refresh, 'this.postRows(host, {');
+  const renderAt = layoutIndexOf(refresh, 'this.postRows(host, message');
   const hydrationAt = refresh.indexOf('this.scheduleProjectSpendHydration(', renderAt);
   assert.ok(
     renderAt >= 0 && hydrationAt > renderAt,
@@ -33863,10 +33863,10 @@ test('a ready host stages worker-backed session data without clearing accepted c
     /if \(session\.sessionId === this\.showing\) \{ continue; \}/,
     'catalog enrichment can own a selected-session window read after selected work settles',
   );
-  const renderPost = layoutIndexOf(refresh, 'void this.postRows(host, {');
+  const renderPost = layoutIndexOf(refresh, 'void this.postRows(host, message');
   const deferredMetadata = layoutIndexOf(
     refresh,
-    'if (metadataAfterRender && !(await this.prepareMetadata(all, generation, controller.signal))) { return; }',
+    'const prepared = await this.prepareMetadata(all, generation, controller.signal);',
   );
   assert.ok(
     renderPost >= 0 && deferredMetadata > renderPost,
@@ -33874,7 +33874,7 @@ test('a ready host stages worker-backed session data without clearing accepted c
   );
   sourceMatch(
     refresh,
-    /const metadataSources = selectedOnly && !metadataAfterRender \? this\.selectionSourcesOf\(null, all\) : all;\s*if \(!metadataAfterRender && !\(await this\.prepareMetadata\(metadataSources, generation, controller\.signal\)\)\) \{\s*return;\s*\}/,
+    /const metadataSources = selectedOnly && !metadataAfterRender \? this\.selectionSourcesOf\(null, all\) : all;\s*if \(!metadataAfterRender\) \{[^}]*await this\.prepareMetadata\(metadataSources, generation, controller\.signal\);[^}]*if \(!prepared\) return;\s*\}/,
     'ordinary refreshes no longer hydrate metadata before their first rail',
   );
   sourceMatch(
@@ -43463,7 +43463,7 @@ test('catalog prefix resolution suspends through discovery progress failure canc
   }
   const refresh = methodBody('async refresh(');
   const acceptance = refresh.slice(
-    refresh.indexOf('if (!metadataAfterRender &&'),
+    refresh.indexOf('if (!metadataAfterRender) {'),
     refresh.indexOf('for (const session of Object.keys(this.awaitingSessionRecords))'),
   );
   const accept = new Function(
@@ -43472,7 +43472,7 @@ test('catalog prefix resolution suspends through discovery progress failure canc
     'controller',
     'orderSessionCatalog',
     'sessionDiscoveryMembership',
-    `return (async () => { const selectedOnly = false, metadataAfterRender = false, metadataSources = all; ${acceptance} })();`,
+    `return (async () => { const selectedOnly = false, metadataAfterRender = false, metadataSources = all, recordStage = () => {}; ${acceptance} })();`,
   );
   let metadata!: (value: boolean) => void;
   provider.prepareMetadata = () =>

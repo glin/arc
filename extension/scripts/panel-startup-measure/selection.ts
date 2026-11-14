@@ -385,9 +385,9 @@ export function instrumentSelection(tree: string): void {
   }
   patch(
     'panelhost.ts',
-    '            ...payload,',
-    `            ...payload,
-            __arcSelection: {session:hostSession, generation, complete:!loadingNewest && !selectedFailure},`,
+    '          ...payload,',
+    `          ...payload,
+          __arcSelection: {session:hostSession, generation, complete:!loadingNewest && !selectedFailure},`,
   );
   patch(
     'panelhost.ts',

@@ -2476,6 +2476,23 @@ test('every part row of the catalog enumeration reports and never fails', () => 
   assert.deepEqual([whole.reportOnly, whole.regressed], [false, true]);
 });
 
+test('a comparison whose baseline holds no refresh stage row reports the new rows and never fails on them', () => {
+  const stages = ['discovery-wait', 'discovery-host', 'metadata', 'build', 'post', 'enrichment', 'held-sweep'];
+  const names = stages.flatMap((stage) => [
+    `refreshCount:refresh-stage:${stage}`,
+    `refreshMs:refresh-stage:${stage}`,
+    `refreshMaxMs:refresh-stage:${stage}`,
+  ]);
+  const measures = compareResults(
+    [runnerResult()],
+    [runnerResult(Object.fromEntries(names.map((name) => [name, 4_000])))],
+  );
+  for (const name of names) {
+    const row = measures.find((measure) => measure.name === name)!;
+    assert.deepEqual([row.baseline, row.candidate, row.reportOnly, row.regressed], [null, 4_000, true, false], name);
+  }
+});
+
 test('the opening read counts of a saved snapshot reach the report and never fail', () => {
   const counters = new PanelPerformanceCounters();
   counters.recordWork('openingsRead:parents', 3);
@@ -8258,6 +8275,45 @@ test('a live press keeps every poll refreshing until the refresh at its limit dr
   }
 });
 
+test('a poll that held presses keep refreshing sets the held press gauges', async () => {
+  const now = 100_000_000;
+  const states: RailState[] = [];
+  const fixture = quietChildRefresh(now, 0, states, { startedAt: now - 100, endedAt: now, finished: true });
+  const { provider, poll, work } = fixture;
+  const gauges: Record<string, number> = {};
+  try {
+    await quietAfterTwoPolls(fixture, now);
+    provider.performanceCounters = {
+      ...provider.performanceCounters,
+      recordGauge: (name: string, value: number) => (gauges[name] = value),
+    };
+    const press = (sessionId: string, failed: boolean): LivePress => ({
+      sessionId,
+      agent: 'claude',
+      kind: 'prompt',
+      text: 'Continue',
+      at: now + 2_000,
+      reply: '',
+      midTurn: false,
+      ran: !failed,
+      started: !failed,
+      failed,
+      reason: failed ? 'The agent did not accept the prompt.' : '',
+    });
+    // A press of the shown session, a failed press of another session, and a press of another session.
+    provider.live = {
+      [provider.showing]: [press(provider.showing, false)],
+      failed: [press('failed', true)],
+      unshown: [press('unshown', false)],
+    };
+    await poll(now + 3_000);
+    assert.equal(work['poll:quietMiss:presses'], 1);
+    assert.deepEqual(gauges, { heldPresses: 3, heldPressesFailed: 1, heldPressesNotShown: 2 });
+  } finally {
+    fixture.restore();
+  }
+});
+
 test('a held dispatch fact that reaches its refresh time sends its spend-only request at the next poll', async () => {
   const now = 100_000_000;
   const states: RailState[] = [];
@@ -10988,6 +11044,144 @@ test('a catalog walk records each part of the enumeration time, and the parts su
     [8],
     'the stat of a selected-only refresh was not timed',
   );
+});
+
+// A refresh whose controlled clock moves only inside one step of each stage: the enumeration, the held-file sweep, the
+// discovery request on each side of its wait, the metadata reads, the render post, the build and the enrichment pass.
+function stagedRefreshHarness(scope: Record<string, unknown> = {}) {
+  let clock = 0;
+  const advance = (ms: number) => {
+    clock += ms;
+  };
+  const harness = bumpedCatalogHarness({
+    performance: { now: () => clock },
+    discoverClaudeSessionSpendSources: () => {
+      advance(13);
+      return [];
+    },
+    replacedCatalogFiles: async () => {
+      advance(2);
+      return [];
+    },
+    ...scope,
+  });
+  const { provider } = harness;
+  provider.codexColdReads = null;
+  const run = provider.progressiveWorker.run;
+  provider.progressiveWorker.run = (...args: unknown[]) => {
+    advance(100);
+    return run(...args);
+  };
+  const toSend = provider.compressedRolloutsToSend.bind(provider);
+  provider.compressedRolloutsToSend = () => {
+    advance(4);
+    return toSend();
+  };
+  provider.prepareMetadata = async () => {
+    advance(7);
+    return true;
+  };
+  const send = provider.sendToHost.bind(provider);
+  provider.sendToHost = (host: unknown, message: { type?: string }, ...rest: unknown[]) => {
+    if (message.type === 'render') advance(3);
+    return send(host, message, ...rest);
+  };
+  provider.glanceAt = () => {
+    advance(11);
+    return new Map();
+  };
+  provider.prepareRailEnrichment = async () => {
+    advance(5);
+    return { changed: false, stale: [] };
+  };
+  const refreshes = new Map<string, number[]>();
+  const work = new Map<string, number>();
+  provider.performanceCounters = {
+    ...provider.performanceCounters,
+    recordRefresh: (name: string, ms: number) => refreshes.set(name, [...(refreshes.get(name) ?? []), ms]),
+    recordWork: (name: string, count = 1) => work.set(name, (work.get(name) ?? 0) + count),
+  };
+  const stages = () => Object.fromEntries([...refreshes].filter(([name]) => name.startsWith('refresh-stage:')).sort());
+  return { ...harness, refreshes, work, stages, advance };
+}
+
+test('a catalog refresh that sends a discovery request and renders records each stage once', async () => {
+  const { provider, refreshes, stages } = stagedRefreshHarness();
+  await provider.refresh(true);
+  assert.deepEqual(
+    stages(),
+    {
+      'refresh-stage:build': [13],
+      'refresh-stage:discovery-host': [4],
+      'refresh-stage:discovery-wait': [100],
+      'refresh-stage:enrichment': [5],
+      'refresh-stage:held-sweep': [2],
+      'refresh-stage:metadata': [7],
+      'refresh-stage:post': [3],
+    },
+    'a stage was not recorded once, or its time went to another stage',
+  );
+  // The enumeration and the six stages split the refresh. The held-file sweep is a part of the build.
+  const parts = ['build', 'discovery-host', 'discovery-wait', 'enrichment', 'metadata', 'post'];
+  assert.equal(
+    refreshes.get('catalog-enumeration')![0] +
+      parts.reduce((sum, part) => sum + refreshes.get(`refresh-stage:${part}`)![0], 0),
+    refreshes.get('startup')![0],
+    'the enumeration and the stages do not sum to the refresh',
+  );
+
+  refreshes.clear();
+  await provider.refresh(true, false, false, true);
+  assert.ok(refreshes.has('catalog-enumeration'), 'the selected-only refresh did not run');
+  assert.deepEqual(stages(), {}, 'a selected-only refresh recorded a stage');
+});
+
+test('a refresh that returns after its discovery wait records only the stages that it finished', async () => {
+  const { provider, stages, advance } = stagedRefreshHarness();
+  // A request that the worker never answers ends the refresh after the wait.
+  provider.progressiveWorker.run = async () => {
+    advance(100);
+    return null;
+  };
+  await provider.refresh(true);
+  assert.deepEqual(stages(), {
+    'refresh-stage:discovery-host': [4],
+    'refresh-stage:discovery-wait': [100],
+    'refresh-stage:held-sweep': [2],
+  });
+});
+
+test('heldIdentityStat counts each file check of the held-file sweep of a refresh of one named path', async () => {
+  const checked: string[] = [];
+  // The named path keeps its revision, so the refresh keeps the held catalog.
+  let named: SessionFile | undefined;
+  const { provider, claude, claudeWalk, work } = stagedRefreshHarness({
+    revalidatedCatalogPaths,
+    fs: { ...fs, statSync: () => ({}) },
+    fileRevisionOf: () => ({ size: named!.size, mtimeMs: named!.mtimeMs, dev: named!.dev, ino: named!.ino }),
+    replacedCatalogFiles: (sessions: SessionFile[], signal: AbortSignal, _statOf: unknown, sweep: { checks: number }) =>
+      replacedCatalogFiles(
+        sessions,
+        signal,
+        async (file) => {
+          checked.push(file);
+          return sessions.find((session) => session.file === file)!;
+        },
+        sweep,
+      ),
+  });
+  named = claude;
+  claudeWalk.push(
+    ...['second', 'third'].map((name) => ({ ...claude, file: `fixture/${name}.jsonl`, sessionId: name })),
+  );
+  await provider.refresh(true);
+  checked.length = 0;
+  work.clear();
+  provider.targetedRefreshPaths = [claude.file];
+  await provider.refresh(true, true);
+  assert.ok(checked.length > 1, `the sweep checked ${checked.length} files`);
+  assert.ok(!checked.includes(claude.file), 'the sweep checked the named path');
+  assert.equal(work.get('heldIdentityStat'), checked.length, 'the counter missed or added a file check');
 });
 
 test('a cold handoff accepts the catalog without enumerating the rollout directory twice', async () => {
@@ -21640,6 +21834,26 @@ test('host startup timing ignores an old generation and an unready host acknowle
   assert.equal(typeof counters.snapshot().startup?.milestones.firstCard, 'number');
 });
 
+test('a completeRender acknowledgment after a refresh moved the generation counts as dropped', () => {
+  const provider = harness();
+  const panel = host();
+  const counters = new PanelPerformanceCounters();
+  provider.performanceCounters = counters;
+  provider.maybeStartCompressedLoad = () => {};
+  provider.readyHosts.add(panel);
+  // The panel painted the render of generation 1, and a refresh moved the generation before the acknowledgment arrived.
+  provider.refreshGeneration = 2;
+  provider.browserPainted(panel, 1, 'completeRender');
+  assert.equal(counters.snapshot().startup, undefined);
+  assert.equal(counters.snapshot().work['completeRenderDropped:staleGeneration'], 1);
+  provider.browserPainted(panel, 2, 'completeRender');
+  assert.equal(
+    counters.snapshot().work['completeRenderDropped:staleGeneration'],
+    1,
+    'an acknowledgment of the current generation counted as dropped',
+  );
+});
+
 // The ledger save methods, and the production waits their scheduler runs on.
 const LEDGER_SAVE_METHODS = [
   'newProjectSpendSaveScheduler',
@@ -23916,6 +24130,66 @@ test('a session list post counts the rows it carried and each row field that dif
     ],
     'a nested field change, a dropped field or a removed figure entry was not counted',
   );
+});
+
+test('a render post names each session list field that differs from the held card', async () => {
+  const provider = paintHarness(['sendToHost']);
+  const work = new Map<string, number>();
+  provider.performanceCounters = {
+    ...provider.performanceCounters,
+    recordWork: (name: string, count = 1) => work.set(name, (work.get(name) ?? 0) + count),
+  };
+  const fields = () => [...work].filter(([name]) => name.startsWith('renderPostField:')).sort();
+  const quiet = { id: 'quiet', status: 'done', label: 'Quiet', costDollars: 1 };
+  let rail: object[] = [{ id: 'claude-a', status: 'done', label: 'Session', costDollars: 1 }, quiet];
+  provider.useRailPayload(() => ({ rail, labels: [], views: [], railFilters: [], stats: {} }));
+  await provider.refresh(true);
+  assert.deepEqual(fields(), [], 'a snapshot named a field');
+  // The cost of one session moved, and the other card is a new object with the same fields.
+  rail = [{ id: 'claude-a', status: 'done', label: 'Session', costDollars: 2 }, { ...quiet }];
+  provider.refreshReason = 'transcript';
+  await provider.refresh(true);
+  assert.deepEqual(
+    fields(),
+    [['renderPostField:transcript:costDollars', 1]],
+    'the counter missed the field that moved, or named one that did not',
+  );
+});
+
+test('a render post measured by the diagnostics samples the bytes of its complete fields', async () => {
+  const posted = async (scope: Record<string, unknown> = {}) => {
+    const provider = paintHarness(['sendToHost'], scope);
+    provider.useRailPayload(() => ({ rail: [], labels: [], views: [], railFilters: [], stats: {} }));
+    provider.hidden = ['archived'];
+    provider.saved = { ...provider.saved, comments: [{ id: 'comment', text: 'Check this' }] };
+    provider.usagePayloadForSession = () => ({ bar: 'usage' });
+    const work = new Map<string, number>();
+    provider.performanceCounters = {
+      ...provider.performanceCounters,
+      recordWork: (name: string, count = 1) => work.set(name, (work.get(name) ?? 0) + count),
+    };
+    await provider.refresh(true);
+    return { provider, work };
+  };
+  const bytes = (work: Map<string, number>) =>
+    Object.fromEntries([...work].filter(([name]) => name.startsWith('renderPostBytes:')).sort());
+  const { provider, work } = await posted();
+  const message = provider.messages.find((sent: { type?: string }) => sent.type === 'render');
+  const size = (value: unknown) => Buffer.byteLength(JSON.stringify(value));
+  assert.deepEqual(bytes(work), {
+    'renderPostBytes:cards': size(message.cards),
+    'renderPostBytes:comments': size(message.comments),
+    'renderPostBytes:hidden': size(message.hidden),
+    'renderPostBytes:sampled': 1,
+    'renderPostBytes:usage': size(message.usage),
+  });
+  // The sixteenth post after a sampled post is the next one sampled.
+  for (let post = 0; post < 16; post++) await provider.refresh(true);
+  assert.equal(work.get('renderPostBytes:sampled'), 2, 'the sample did not take one post in sixteen');
+  assert.equal(work.get('renderPostBytes:hidden'), 2 * size(message.hidden));
+
+  // A message kind that the diagnostics do not measure takes no sample.
+  assert.deepEqual(bytes((await posted({ messageByteBudget: () => null })).work), {});
 });
 
 test('a draft hold among 2000 rows builds only draft payloads and preserves each panel rail', () => {

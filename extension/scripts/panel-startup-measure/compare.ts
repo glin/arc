@@ -96,6 +96,7 @@ export const REPORT_ONLY_PREFIXES = [
   'refreshMs:',
   'refreshMaxMs:',
   'refreshCount:catalog-enumeration:',
+  'refreshCount:refresh-stage:',
   'openingsRead:',
   ...CAUSE_COUNTER_PREFIXES,
   'compressedMerge',
