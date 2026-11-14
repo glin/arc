@@ -224,20 +224,21 @@ export const REFUSED_OPENING_FIRST_RETRY_MS = 1_000;
 // Intervals between refused reads of a rollout that keeps a held opening. The last interval repeats.
 const REFUSED_HELD_OPENING_RETRIES_MS = [10_000, 60_000, 600_000];
 
-// Readable openings stay cached while their file identity remains current. An unreadable head gets one retry, then waits for file growth.
+// Readable openings stay cached while their file identity remains current. A head with no opening record and a first line
+// past `FIRST_LINE_BYTES` get one retry, then wait for a change of the file size.
 // Refused reads retain no size marker. They use the first retry interval, then the repeated-refusal interval.
 // The default clock is monotonic.
 export class CodexMetaCache {
   private entries = new Map<
     string,
     | { meta: CodexSessionMeta; refused?: { triedAt: number; wait: number } }
-    | { meta: null; size: number | null }
+    | { meta: null; size: number | null; pastBound?: true; unsized?: boolean }
     | { meta: undefined; triedAt: number; wait: number }
   >();
   private changed = 0;
 
   constructor(
-    private readMeta: (file: string, onRead?: () => void) => CodexSessionMeta | null | undefined = readCodexOpening,
+    private readMeta: (file: string, onRead?: () => void) => CodexOpeningAnswer = readCodexOpeningAnswer,
     private sizeOf: (file: string) => number | null = fileSize,
     private now: () => number = () => performance.now(),
   ) {}
@@ -282,11 +283,18 @@ export class CodexMetaCache {
       if (this.retryPending(hit)) return null;
     } else if (hit?.meta === null) {
       size = this.sizeOf(file);
+      hit.unsized = size === null;
       if (size === null || (hit.size !== null && hit.size === size)) {
         return null;
       }
     }
-    const meta = this.readMeta(file, onRead);
+    const answer = this.readMeta(file, onRead);
+    if (answer === OPENING_PAST_BOUND) {
+      if (hit?.meta) this.delete(file);
+      this.entries.set(file, { meta: null, size, pastBound: true });
+      return null;
+    }
+    const meta = answer;
     // Refused reads keep an attempt time and retry interval instead of a file-size marker.
     if (meta === undefined) {
       if (hit?.meta) {
@@ -311,6 +319,15 @@ export class CodexMetaCache {
   // The held opening of a file, with no read.
   peek(file: string): CodexSessionMeta | null {
     return this.entries.get(file)?.meta ?? null;
+  }
+
+  // Why the last answer of `get` for a rollout without a working directory leaves the file undecided, or null when the
+  // head decided the file at its size. A held opening whose last read was refused is undecided.
+  openingGap(file: string): CodexOpeningGap | null {
+    const hit = this.entries.get(file);
+    if (!hit || hit.meta === undefined) return 'refused';
+    if (hit.meta === null) return hit.unsized ? 'stat' : hit.pastBound ? OPENING_PAST_BOUND : null;
+    return hit.refused ? 'refused' : null;
   }
 
   // A clock value before the last attempt makes the retry due immediately.
@@ -346,7 +363,10 @@ export class CodexMetaCache {
   // An aborted `signal` stops each lane before its next stat or read. A compressed rollout gets no read.
   async prime(
     files: readonly string[],
-    readAsync: (file: string, buf: Buffer) => Promise<CodexSessionMeta | null> = readCodexSessionMetaAsync,
+    readAsync: (
+      file: string,
+      buf: Buffer,
+    ) => Promise<CodexSessionMeta | null | typeof OPENING_PAST_BOUND> = readCodexOpeningAsync,
     limit = COLD_OPENING_READS,
     sizeAsync: (file: string) => Promise<number | null> = fileSizeAsync,
     signal?: AbortSignal,
@@ -370,20 +390,24 @@ export class CodexMetaCache {
           if (held.fileIdentity === undefined) legacy = held;
           else if (this.current(file, stat)) continue;
         }
-        let meta: CodexSessionMeta | null;
+        let answer: CodexSessionMeta | null | typeof OPENING_PAST_BOUND;
         try {
           buf ??= Buffer.allocUnsafe(META_BYTES);
-          meta = await readAsync(file, buf);
+          answer = await readAsync(file, buf);
         } catch {
           continue;
         }
+        const meta = answer === OPENING_PAST_BOUND ? null : answer;
         const size = meta ? null : await sizeAsync(file).catch(() => null);
         if (this.entries.get(file)?.meta !== held) continue;
         if (meta) {
           this.install(file, legacy && legacyKeeps(legacy, stat, meta) ? openingWithStat(legacy, stat!) : meta);
         } else {
           if (held) this.delete(file);
-          this.entries.set(file, { meta: null, size });
+          this.entries.set(
+            file,
+            answer === OPENING_PAST_BOUND ? { meta: null, size, pastBound: true } : { meta: null, size },
+          );
         }
       }
     };
@@ -469,13 +493,25 @@ export function isAgentRun(meta: CodexSessionMeta): boolean {
   );
 }
 
-// Maximum opening-record size. The opening includes the model's base instructions.
+// The opening-record size that the shared head buffers hold. The opening includes the model's base instructions.
 export const CODEX_OPENING_BYTES = 128 * 1024;
 const META_BYTES = CODEX_OPENING_BYTES;
 
 // How far into a rollout the first prompt can sit. Everything the model was told opens the
 // file ahead of it: the instructions, the sandbox rules and a snapshot of the workspace.
 export const CODEX_TITLE_BYTES = 1024 * 1024;
+
+// The longest first line that an opening read decides. A first line with no newline in `META_BYTES` reads on to this
+// bound in a buffer of its own. A first line that does not end inside it leaves the file undecided.
+const FIRST_LINE_BYTES = CODEX_TITLE_BYTES;
+
+// The answer of an opening read whose first line does not end inside `FIRST_LINE_BYTES` while the file goes on.
+export const OPENING_PAST_BOUND = 'pastBound';
+
+// Why a plain rollout leaves the admission of a listing incomplete. `refused` is a refused open or read,
+// `pastBound` is a first line that does not end inside `FIRST_LINE_BYTES`, and `stat` is a missing stat.
+export type CodexOpeningGap = 'refused' | typeof OPENING_PAST_BOUND | 'stat';
+
 export const CODEX_COMMIT_REPOSITORY_PARSER_VERSION = 4;
 
 // Maximum directory depth below the rollout root. Four levels include YYYY/MM/DD and one additional shard.
@@ -489,8 +525,15 @@ const FIRST_LINE_WINDOW = 16 * 1024;
 // two reads share it at once. Asynchronous reads each carry their own.
 let headBuffer: Buffer | null = null;
 
-// Returns the first line, null when no complete line is available, or undefined when another window is needed.
-function firstLineStep(buf: Buffer, have: number, read: number, want: number): string | null | undefined {
+// Returns the first line, null when no line ends inside `bound` and the file goes on, or undefined when another window
+// is needed.
+function firstLineStep(
+  buf: Buffer,
+  have: number,
+  read: number,
+  want: number,
+  bound: number,
+): string | null | undefined {
   // Bounded to this file's bytes, because the buffer past them holds an earlier file.
   const newline = buf.subarray(0, have + read).indexOf(0x0a, have);
   if (newline >= 0) {
@@ -499,10 +542,19 @@ function firstLineStep(buf: Buffer, have: number, read: number, want: number): s
   if (read < want) {
     return buf.toString('utf8', 0, have + read);
   }
-  return have + read >= META_BYTES ? null : undefined;
+  return have + read >= bound ? null : undefined;
 }
 
-// Read the first line in growing windows up to `META_BYTES`. Decode only through its newline.
+// The buffer for a window of `window` bytes. A window past the buffer takes a new buffer of `bound` bytes for the rest
+// of this read, so the shared head buffer and the buffer of each asynchronous read keep `META_BYTES`.
+function headRoom(buf: Buffer, have: number, window: number, bound: number): Buffer {
+  if (window <= buf.length) return buf;
+  const grown = Buffer.allocUnsafe(bound);
+  buf.copy(grown, 0, 0, have);
+  return grown;
+}
+
+// Read the first line in growing windows up to `FIRST_LINE_BYTES`. Decode only through its newline.
 // Accept an unterminated line when the file ends below the bound. Failed opens and reads throw.
 function firstLineOf(file: string, onRead?: () => void): { line: string | null; revision: FileRevision } {
   let fd = -1;
@@ -522,28 +574,31 @@ function firstLineOf(file: string, onRead?: () => void): { line: string | null; 
   }
 }
 
-function firstLineFromDescriptor(file: string, fd: number): string | null {
-  const buf = (headBuffer ??= Buffer.allocUnsafe(META_BYTES));
+function firstLineFromDescriptor(file: string, fd: number, bound = FIRST_LINE_BYTES): string | null {
+  let buf = (headBuffer ??= Buffer.allocUnsafe(META_BYTES));
   let have = 0;
   let window = FIRST_LINE_WINDOW;
   for (;;) {
     const want = window - have;
     const read = meterRead(file, fs.readSync(fd, buf, have, want, have), have);
-    const line = firstLineStep(buf, have, read, want);
+    const line = firstLineStep(buf, have, read, want, bound);
     if (line !== undefined) return line;
     have += read;
-    window = Math.min(window * 2, META_BYTES);
+    window = Math.min(window * 2, bound);
+    buf = headRoom(buf, have, window, bound);
   }
 }
 
+// `bound` limits the first line that the read decides. A session read passes `CODEX_OPENING_BYTES` to keep its byte limit.
 export function readQualifiedCodexOpening(
   file: string,
   onRead?: () => void,
+  bound = FIRST_LINE_BYTES,
 ): { value: CodexSessionMeta; revision: FileRevision } | null {
   const opening = readQualifiedOpening(
     file,
     (fd) => {
-      const meta = openingRecordOf(firstLineFromDescriptor(file, fd));
+      const meta = openingRecordOf(firstLineFromDescriptor(file, fd, bound));
       return meta?.sessionId && meta.cwd ? meta : null;
     },
     onRead,
@@ -563,28 +618,47 @@ async function firstLineOfAsync(file: string, buf: Buffer): Promise<{ line: stri
     for (;;) {
       const want = window - have;
       const { bytesRead: read } = await handle.read(buf, have, want, have);
-      const line = firstLineStep(buf, have, read, want);
+      const line = firstLineStep(buf, have, read, want, FIRST_LINE_BYTES);
       if (line !== undefined) {
         return { line, revision };
       }
       have += read;
-      window = Math.min(window * 2, META_BYTES);
+      window = Math.min(window * 2, FIRST_LINE_BYTES);
+      buf = headRoom(buf, have, window, FIRST_LINE_BYTES);
     }
   } finally {
     await handle?.close().catch(() => undefined);
   }
 }
 
-// Returns opening metadata, null for a head without it, or undefined for a refused read.
+// The opening of a rollout head in three classes. Opening metadata or null decide the file at its current size: null
+// is an empty head, a complete first line that is not an opening record, or an unterminated line that the file ends
+// inside and that does not parse as one. `OPENING_PAST_BOUND` and undefined, a refused open or read, leave it undecided.
+export type CodexOpeningAnswer = CodexSessionMeta | null | typeof OPENING_PAST_BOUND | undefined;
+
+function openingAnswerOf(
+  line: string | null,
+  revision: FileRevision,
+): CodexSessionMeta | null | typeof OPENING_PAST_BOUND {
+  if (line === null) return OPENING_PAST_BOUND;
+  const meta = openingRecordOf(line);
+  return meta ? openingWithStat(meta, revision) : null;
+}
+
 // Changes to persisted fields or their deriving helpers require a `CODEX_META_VERSION` change in `codexopenings.ts`.
-function readCodexOpeningRecord(file: string, onRead?: () => void): CodexSessionMeta | null | undefined {
+export function readCodexOpeningAnswer(file: string, onRead?: () => void): CodexOpeningAnswer {
   try {
     const { line, revision } = firstLineOf(file, onRead);
-    const meta = openingRecordOf(line);
-    return meta ? openingWithStat(meta, revision) : null;
+    return openingAnswerOf(line, revision);
   } catch {
     return undefined;
   }
+}
+
+// Returns opening metadata, null for a head without it, or undefined for a refused read.
+function readCodexOpeningRecord(file: string, onRead?: () => void): CodexSessionMeta | null | undefined {
+  const answer = readCodexOpeningAnswer(file, onRead);
+  return answer === OPENING_PAST_BOUND ? null : answer;
 }
 
 export function openingRecordOf(line: string | null): CodexSessionMeta | null {
@@ -646,9 +720,17 @@ export function readCodexOpening(file: string, onRead?: () => void): CodexSessio
 // `readCodexSessionMeta` off the extension host's main thread. `buf` holds `META_BYTES` and
 // belongs to this read until it settles. It rejects when the file system refuses the read.
 export async function readCodexSessionMetaAsync(file: string, buf: Buffer): Promise<CodexSessionMeta | null> {
+  const answer = await readCodexOpeningAsync(file, buf);
+  return answer === OPENING_PAST_BOUND ? null : answer;
+}
+
+// `readCodexOpeningAnswer` off the extension host's main thread. It rejects when the file system refuses the read.
+export async function readCodexOpeningAsync(
+  file: string,
+  buf: Buffer,
+): Promise<CodexSessionMeta | null | typeof OPENING_PAST_BOUND> {
   const { line, revision } = await firstLineOfAsync(file, buf);
-  const meta = openingRecordOf(line);
-  return meta ? openingWithStat(meta, revision) : null;
+  return openingAnswerOf(line, revision);
 }
 
 function str(value: unknown): string | null {
@@ -1025,6 +1107,8 @@ export interface CodexListing {
   walked: string[];
   enumeration: SourceEnumeration;
   admission: SourceEnumeration['status'];
+  // The number of rollouts that left admission incomplete, by cause. An incomplete enumeration adds none.
+  admissionGaps: Partial<Record<CodexOpeningGap, number>>;
 }
 
 export interface CodexSubagentFile {
@@ -1181,26 +1265,52 @@ export function codexRowAdmitted(
   return !!meta?.cwd && inFolders(meta.cwd) && !isHiddenThread(meta) && !!stat?.isFile && stat.size > 0;
 }
 
+// The opening reader of a listing with no cache. It keeps the cause of each undecided head for `openingGap`.
+function uncachedListingOpenings(): {
+  metaOf: (file: string) => CodexSessionMeta | null;
+  openingGap: (file: string) => CodexOpeningGap | null;
+} {
+  const gaps = new Map<string, CodexOpeningGap>();
+  return {
+    metaOf: (file) => {
+      const answer = readCodexOpeningAnswer(file);
+      if (answer === undefined || answer === OPENING_PAST_BOUND) {
+        gaps.set(file, answer === undefined ? 'refused' : OPENING_PAST_BOUND);
+        return null;
+      }
+      return answer;
+    },
+    openingGap: (file) => gaps.get(file) ?? null,
+  };
+}
+
 // List workspace sessions by newest activity, using each opening's recorded cwd for membership.
 // Callers supply cached opening and stat readers. `walked` defaults to a fresh traversal of `root`.
+// A rollout whose opening names no working directory lowers admission only when `openingGap` names a cause, so a head
+// that decides the file holds no session at its size leaves admission complete. With a caller's `metaOf` and no
+// `openingGap`, every such rollout is undecided.
 export function codexSessionFiles(
   root: string,
   folders: string[],
-  metaOf: (
+  metaOf?: (
     file: string,
     stat: () => RolloutStat | null,
     inFolders: (cwd: string) => boolean,
-  ) => CodexSessionMeta | null = readCodexSessionMeta,
+  ) => CodexSessionMeta | null,
   statOf: (file: string) => RolloutStat | null = readRolloutStat,
   walked?: string[],
   enumeration: SourceEnumeration = walked
     ? { status: 'incomplete', files: walked, uncertain: [root] }
     : enumerateRolloutFiles(root),
+  openingGap?: (file: string) => CodexOpeningGap | null,
 ): CodexListing {
+  if (!metaOf) ({ metaOf, openingGap } = uncachedListingOpenings());
+  const gapOf = openingGap ?? (() => 'refused' as const);
   walked ??= [...enumeration.files];
   let admission = enumeration.status;
+  const admissionGaps: CodexListing['admissionGaps'] = {};
   if (folders.length === 0) {
-    return { sessions: [], sources: [], subagents: [], walked, enumeration, admission };
+    return { sessions: [], sources: [], subagents: [], walked, enumeration, admission, admissionGaps };
   }
   const out: SessionFile[] = [];
   const sources: { file: string }[] = [];
@@ -1224,8 +1334,15 @@ export function codexSessionFiles(
     const meta = metaOf(file, currentStat, cwdInFolders);
     // No readable opening record means no cwd, and the path holds none either, so there is
     // nothing that puts the session in this workspace.
-    if (!meta || !meta.cwd) admission = 'incomplete';
-    if (!meta || !meta.cwd || !cwdInFolders(meta.cwd)) {
+    if (!meta?.cwd) {
+      const gap = gapOf(file);
+      if (gap) {
+        admission = 'incomplete';
+        admissionGaps[gap] = (admissionGaps[gap] ?? 0) + 1;
+      }
+      continue;
+    }
+    if (!cwdInFolders(meta.cwd)) {
       continue;
     }
     sources.push({ file });
@@ -1250,7 +1367,10 @@ export function codexSessionFiles(
       continue;
     }
     currentStat();
-    if (!stat) admission = 'incomplete';
+    if (!stat) {
+      admission = 'incomplete';
+      admissionGaps.stat = (admissionGaps.stat ?? 0) + 1;
+    }
     if (!stat || !codexRowAdmitted(meta, stat, cwdInFolders)) {
       continue;
     }
@@ -1268,7 +1388,15 @@ export function codexSessionFiles(
       agentRun: isAgentRun(meta),
     });
   }
-  return { sessions: out.sort((a, b) => b.mtimeMs - a.mtimeMs), sources, subagents, walked, enumeration, admission };
+  return {
+    sessions: out.sort((a, b) => b.mtimeMs - a.mtimeMs),
+    sources,
+    subagents,
+    walked,
+    enumeration,
+    admission,
+    admissionGaps,
+  };
 }
 
 // Find cached openings absent from the complete walk.

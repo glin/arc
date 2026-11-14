@@ -10599,6 +10599,7 @@ function bumpedCatalogHarness(
           uncertain: [],
         },
         admission: 'complete',
+        admissionGaps: {},
       }),
       readRolloutStat: () => null,
       staleMetas: () => [],
@@ -10855,6 +10856,7 @@ test('a catalog walk records each part of the enumeration time, and the parts su
         sources: [],
         enumeration: { status: 'complete', files: [codex.file], uncertain: [] },
         admission: 'complete',
+        admissionGaps: {},
       };
     },
     readRolloutStat: () => {
@@ -11559,6 +11561,27 @@ test('a file created after its folder was read waits for the next walk', async (
   await releaseAll(provider.refresh(true));
   assert.deepEqual(files(), [first, late].sort(), 'the next walk did not list the later file');
   assert.equal(walks.length, 2);
+});
+
+test('a walk counts the unavailable Claude openings once with their sources', async () => {
+  const refused = new Set<string>();
+  const { provider, writeParent, releaseAll } = slicedWalkHarness({
+    scanSessionCwd: (file: string, onUnreadable?: () => void, onRead?: () => void) => {
+      if (!refused.has(file)) return scanSessionCwd(file, onUnreadable, onRead);
+      onUnreadable?.();
+      return null;
+    },
+  });
+  writeParent('listed');
+  for (const id of ['refused-a', 'refused-b']) refused.add(writeParent(id));
+  const counters = new PanelPerformanceCounters();
+  provider.performanceCounters = counters;
+  await releaseAll(provider.refresh(true));
+  const gaps = Object.fromEntries(
+    Object.entries(counters.snapshot().work).filter(([name]) => name.startsWith('admissionGap:')),
+  );
+  assert.deepEqual(gaps, { 'admissionGap:claudeOpeningUnavailable': 2 }, 'the walk did not name the Claude arm');
+  assert.equal(provider.enumeratedAdmissionComplete, false, 'the unavailable openings left admission complete');
 });
 
 test('a file that lands after its folder was read asks for a walk at the next poll, after a synchronous commit during the slices', async () => {
@@ -15578,6 +15601,129 @@ test('an epoch of a walked request and a named request settles and leaves the li
   assert.equal(provider.sessionQueryContext().coverage, 'complete', 'the settled epoch left the listing incomplete');
 });
 
+// The start of one opening record, cut off with no newline. Its bytes are not valid JSON.
+function cutOffRollout(root: string, cwd: string, bytes: number): string {
+  const file = path.join(root, 'rollout-2026-11-06T00-00-00-0a0b0c0d-0000-7000-8000-000000000001.jsonl');
+  const record = JSON.stringify({
+    timestamp: '2026-11-06T00:00:00.000Z',
+    type: 'session_meta',
+    payload: { id: 'cut-off', cwd, base_instructions: { text: 'x'.repeat(bytes) } },
+  });
+  fs.writeFileSync(file, record.slice(0, bytes));
+  return file;
+}
+
+test('a rollout cut off inside its first line leaves the listing complete', async () => {
+  const harness = backfilledTwinHarness(['sessionQueryContext', 'sessionQueryRevisionFor', 'sessionsKeptByReader'], {
+    sessionQueryRevision,
+  });
+  const { provider, root, plain, releaseAll } = harness;
+  epochWorker(harness);
+  const counters = new PanelPerformanceCounters();
+  provider.performanceCounters = counters;
+  cutOffRollout(root, provider.folders()[0], 150 * 1024);
+  await releaseAll(provider.refresh(true));
+  assert.deepEqual(
+    (provider.authoritativeCatalog as SessionFile[]).map((row) => row.file),
+    [plain],
+    'the catalog did not hold the healthy rollout alone',
+  );
+  assert.equal(
+    counters.snapshot().work['acceptedUnsettledStopped:admission'],
+    undefined,
+    'the cut-off rollout stopped the listing at an admission gap',
+  );
+  assert.equal(provider.sessionQueryContext().coverage, 'complete', 'the cut-off rollout left the listing incomplete');
+});
+
+// Each case leaves one arm of the Codex listing undecided and returns the number of sources it leaves undecided. It
+// keeps each spy that it starts in `spies`.
+const codexAdmissionGaps: {
+  arm: string;
+  gap: (root: string, workspace: string, spies: { mockRestore(): void }[]) => number;
+}[] = [
+  {
+    arm: 'codexPastBound',
+    gap: (root) => {
+      for (const name of ['a', 'b'])
+        fs.writeFileSync(path.join(root, `rollout-long-${name}.jsonl`), 'x'.repeat(1100 * 1024));
+      return 2;
+    },
+  },
+  {
+    arm: 'codexRefused',
+    gap: (root, workspace, spies) => {
+      const file = cutOffRollout(root, workspace, 4 * 1024);
+      const open = mutableFs.openSync;
+      spies.push(
+        vi.spyOn(mutableFs, 'openSync').mockImplementation(((target: fs.PathLike, ...args: any[]) => {
+          if (String(target) === file) throw Object.assign(new Error('refused opening'), { code: 'EACCES' });
+          return (open as any)(target, ...args);
+        }) as typeof fs.openSync),
+      );
+      syncBuiltinESMExports();
+      return 1;
+    },
+  },
+  {
+    arm: 'codexStat',
+    gap: (root, workspace, spies) => {
+      const file = path.join(root, 'rollout-unstated.jsonl');
+      fs.writeFileSync(
+        file,
+        `${JSON.stringify({ timestamp: '2026-10-01T12:00:00.000Z', type: 'session_meta', payload: { id: 'unstated', cwd: workspace } })}\n`,
+      );
+      const stat = mutableFs.statSync;
+      spies.push(
+        vi.spyOn(mutableFs, 'statSync').mockImplementation(((target: fs.PathLike, ...args: any[]) => {
+          if (String(target) === file) throw Object.assign(new Error('refused stat'), { code: 'EACCES' });
+          return (stat as any)(target, ...args);
+        }) as typeof fs.statSync),
+      );
+      syncBuiltinESMExports();
+      return 1;
+    },
+  },
+  {
+    arm: 'codexEnumeration',
+    gap: (root, _workspace, spies) => {
+      const directory = path.join(root, '2026');
+      fs.mkdirSync(directory);
+      const readdir = mutableFs.promises.readdir;
+      spies.push(
+        vi
+          .spyOn(mutableFs.promises, 'readdir')
+          .mockImplementation(((target: fs.PathLike, ...args: any[]) =>
+            String(target) === directory
+              ? Promise.reject(Object.assign(new Error('refused directory'), { code: 'EACCES' }))
+              : (readdir as any)(target, ...args)) as typeof fs.promises.readdir),
+      );
+      return 1;
+    },
+  },
+];
+
+for (const { arm, gap } of codexAdmissionGaps)
+  test(`a walk counts the Codex admission gap ${arm} once with its sources`, async () => {
+    const { provider, root, writeRollout, releaseAll } = heldWalkHarness();
+    writeRollout('healthy');
+    const counters = new PanelPerformanceCounters();
+    provider.performanceCounters = counters;
+    const spies: { mockRestore(): void }[] = [];
+    let sources = 0;
+    try {
+      sources = gap(root, provider.folders()[0], spies);
+      await releaseAll(provider.refresh(true));
+    } finally {
+      for (const spy of spies) spy.mockRestore();
+      syncBuiltinESMExports();
+    }
+    const work = counters.snapshot().work;
+    const gaps = Object.fromEntries(Object.entries(work).filter(([name]) => name.startsWith('admissionGap:')));
+    assert.deepEqual(gaps, { [`admissionGap:${arm}`]: sources }, `the walk did not name the arm ${arm}`);
+    assert.equal(provider.enumeratedAdmissionComplete, false, `the arm ${arm} left admission complete`);
+  });
+
 test.skipIf(!rolloutCompression.zstdCompressSync)(
   'a rollout whose opening has no id lists under the id in its file name',
   async () => {
@@ -18379,6 +18525,7 @@ test.each([
           sources: [],
           enumeration: { status: 'complete', files: [codex.file], uncertain: [] },
           admission: 'complete',
+          admissionGaps: {},
         }),
       });
       parent = parentOf(codex);
@@ -25135,6 +25282,77 @@ test('the prompt check skips a compressed file without a read', async () => {
   assert.deepEqual(await provider.prepareHumanPrompts([session], true, new AbortController().signal), []);
   assert.deepEqual(checked, []);
 });
+
+// A prompt scan that answers at once.
+function* promptScanAnswer(answer: { found: boolean; complete: boolean }): Generator<number> {
+  yield* [];
+  return { bytes: 1, ...answer };
+}
+
+// Each case reaches one prompt admission arm that leaves admission incomplete. `stat` answers the nth file check of a file.
+const promptAdmissionGaps: { arm: string; stat: (call: number) => object; scan: () => Generator<number> }[] = [
+  {
+    arm: 'promptStat',
+    stat: () => {
+      throw Object.assign(new Error('refused stat'), { code: 'EACCES' });
+    },
+    scan: () => promptScanAnswer({ found: true, complete: true }),
+  },
+  {
+    arm: 'promptChanged',
+    stat: (call) => ({ size: 1, mtimeMs: 1, dev: 1, ino: call }),
+    scan: () => promptScanAnswer({ found: true, complete: true }),
+  },
+  {
+    arm: 'promptUnfinished',
+    stat: () => ({ size: 1, mtimeMs: 1, dev: 1, ino: 1 }),
+    scan: () => promptScanAnswer({ found: false, complete: false }),
+  },
+  {
+    arm: 'promptRefused',
+    stat: () => ({ size: 1, mtimeMs: 1, dev: 1, ino: 1 }),
+    scan: function* () {
+      yield* [];
+      throw Object.assign(new Error('refused read'), { code: 'EACCES' });
+    },
+  },
+];
+
+for (const { arm, stat, scan } of promptAdmissionGaps)
+  test(`a prompt pass counts the admission gap ${arm} once with its sources`, async () => {
+    const calls = new Map<string, number>();
+    const provider = completeDiscoveryHarness(undefined, false, ['prepareHumanPrompts'], {
+      fs: {
+        ...fs,
+        statSync: (file: string) => {
+          const call = (calls.get(file) ?? 0) + 1;
+          calls.set(file, call);
+          return stat(call);
+        },
+      },
+      humanPromptScanSteps: scan,
+      promptScanLists,
+    });
+    provider.humanScans = new Map();
+    provider.enumeratedAdmissionComplete = true;
+    const counters = new PanelPerformanceCounters();
+    provider.performanceCounters = counters;
+    const sessions = ['a', 'b'].map((id) => ({
+      file: `projects/${id}.jsonl`,
+      sessionId: id,
+      agent: 'claude',
+      size: 1,
+      mtimeMs: 1,
+      dev: 1,
+      ino: 1,
+    }));
+    await provider.prepareHumanPrompts(sessions, true, new AbortController().signal);
+    const gaps = Object.fromEntries(
+      Object.entries(counters.snapshot().work).filter(([name]) => name.startsWith('admissionGap:')),
+    );
+    assert.deepEqual(gaps, { [`admissionGap:${arm}`]: 2 }, `the prompt pass did not name the arm ${arm}`);
+    assert.equal(provider.enumeratedAdmissionComplete, false, `the arm ${arm} left admission complete`);
+  });
 
 // Replaces the harness's inert ledger save with the production save methods and scheduler.
 function useLedgerSave(provider: any): void {

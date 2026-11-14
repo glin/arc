@@ -810,7 +810,8 @@ interface CatalogEnumerationParts {
 // What the opening reads of a Claude listing found, apart from the working directories.
 interface ClaudeOpenings {
   observations: Pick<SessionCollisionObservation, 'source' | 'excluded'>[];
-  unavailable: boolean;
+  // The transcripts whose opening could not be read.
+  unavailable: Set<string>;
 }
 
 // The Claude half of a catalog walk, read in slices ahead of the commit. It holds no host state.
@@ -1910,8 +1911,8 @@ export class PanelProvider implements vscode.Disposable {
   // The rollouts whose openings the saved records supplied when this activation started.
   private savedCodexOpeningFiles: readonly string[] = [];
   private railPaintArrived = false;
-  // Whether a Claude opening could not be read by the last walk that listed the Claude sources.
-  private claudeWalkOpeningUnavailable = false;
+  // The Claude transcripts whose opening the last walk that listed the Claude sources could not read.
+  private claudeWalkOpeningUnavailable: ReadonlySet<string> = new Set();
   // True while the catalog's Codex rows came from the saved openings, which name only part of the rollout tree.
   private codexListingSeeded = false;
   private sourceEnumerations?: { claude: SourceEnumeration; codex: SourceEnumeration };
@@ -15483,7 +15484,7 @@ export class PanelProvider implements vscode.Disposable {
     started: Pick<ClaudeWalk, 'seeded' | 'watching' | 'startedAt'>,
     time: ListingTimer,
   ): WalkSteps<ClaudeWalk> {
-    const openings: ClaudeOpenings = { observations: [], unavailable: false };
+    const openings: ClaudeOpenings = { observations: [], unavailable: new Set() };
     const listing = yield* enumerateSessionFilesForSteps(
       projectsRoot(),
       roots,
@@ -15544,7 +15545,7 @@ export class PanelProvider implements vscode.Disposable {
             });
             return opening.value;
           }
-          openings.unavailable = true;
+          openings.unavailable.add(file);
           return null;
         });
         if (qualified !== null) return qualified;
@@ -15567,7 +15568,7 @@ export class PanelProvider implements vscode.Disposable {
           return hit.cwd;
         }
         if (hit && sameSessionRevision(hit, session)) {
-          openings.unavailable ||= hit.unavailable === true;
+          if (hit.unavailable === true) openings.unavailable.add(file);
           return hit.cwd;
         }
         let unavailable = false;
@@ -15575,7 +15576,7 @@ export class PanelProvider implements vscode.Disposable {
           file,
           () => {
             unavailable = true;
-            openings.unavailable = true;
+            openings.unavailable.add(file);
           },
           countParentRead,
         );
@@ -15816,7 +15817,7 @@ export class PanelProvider implements vscode.Disposable {
     const qualifiedCodexStats = new Map<string, ReturnType<typeof readRolloutStat>>();
     const openings: ClaudeOpenings = claudeWalk?.openings ?? {
       observations: [],
-      unavailable: heldClaude ? this.claudeWalkOpeningUnavailable : false,
+      unavailable: new Set(heldClaude ? this.claudeWalkOpeningUnavailable : []),
     };
     const claudeListing =
       heldClaude ??
@@ -15832,8 +15833,8 @@ export class PanelProvider implements vscode.Disposable {
       ...physicalContext,
       ...observation,
     }));
-    const claudeOpeningUnavailable = openings.unavailable;
-    this.claudeWalkOpeningUnavailable = claudeOpeningUnavailable;
+    const claudeOpeningUnavailable = openings.unavailable.size > 0;
+    this.claudeWalkOpeningUnavailable = openings.unavailable;
     const claude = claudeListing.sessions;
     const countCodexOpeningRead = () => this.performanceCounters?.recordWork('openingsRead:codex');
     // A hidden panel ignores watcher events, so a walk then stats every rollout and holds none.
@@ -15879,6 +15880,7 @@ export class PanelProvider implements vscode.Disposable {
         ),
       undefined,
       codexEnumeration,
+      (file) => this.codexMetas.openingGap(file),
     );
     if (!heldClaude) {
       const census =
@@ -15965,6 +15967,19 @@ export class PanelProvider implements vscode.Disposable {
     this.walkedClaude = claude.map((s) => s.file);
     // Exclude Claude peer wakes and commands answered by the CLI before catalog publication.
     const listed = deferHumanPrompts ? claude : claude.filter((s) => this.hasHumanPrompt(s, true));
+    // Each arm that lowers admission counts once for this walk, with the number of its sources.
+    const admissionGaps: [string, number][] = [
+      [
+        'codexEnumeration',
+        listing.enumeration.status === 'complete' ? 0 : Math.max(1, listing.enumeration.uncertain.length),
+      ],
+      ['codexRefused', listing.admissionGaps.refused ?? 0],
+      ['codexPastBound', listing.admissionGaps.pastBound ?? 0],
+      ['codexStat', listing.admissionGaps.stat ?? 0],
+      ['claudeOpeningUnavailable', openings.unavailable.size],
+    ];
+    for (const [arm, sources] of admissionGaps)
+      if (sources > 0) this.performanceCounters?.recordWork(`admissionGap:${arm}`, sources);
     this.enumeratedAdmissionComplete =
       !claudeOpeningUnavailable &&
       listing.admission === 'complete' &&
@@ -17026,9 +17041,21 @@ export class PanelProvider implements vscode.Disposable {
       !signal.aborted &&
       generation === this.refreshGeneration &&
       (selectionGeneration === undefined || selectionGeneration === this.selectionGeneration);
+    // Each arm that lowers admission counts once for this pass, with the number of its sources.
+    let gaps: Map<string, number> | undefined;
+    const lower = (arm: string, file: string) => {
+      this.enumeratedAdmissionComplete = false;
+      work.unknown.add(file);
+      gaps ??= new Map();
+      gaps.set(arm, (gaps.get(arm) ?? 0) + 1);
+    };
+    const finish = (admitted: SessionFile[]): SessionFile[] => {
+      for (const [arm, sources] of gaps ?? []) this.performanceCounters?.recordWork(`admissionGap:${arm}`, sources);
+      return admitted;
+    };
     const admitted: SessionFile[] = [];
     for (const session of sessions) {
-      if (!currentRefresh()) return [];
+      if (!currentRefresh()) return finish([]);
       if (session.agent !== 'claude' || session.childTranscript === true) {
         admitted.push(session);
         continue;
@@ -17076,7 +17103,7 @@ export class PanelProvider implements vscode.Disposable {
         work.sources = 0;
         work.reads = 0;
         work.bytes = 0;
-        if (!currentRefresh()) return [];
+        if (!currentRefresh()) return finish([]);
       }
       work.sources++;
       if (work.checks !== undefined) work.checks++;
@@ -17086,8 +17113,7 @@ export class PanelProvider implements vscode.Disposable {
       try {
         revision = fileRevisionOf(fs.statSync(session.file, { bigint: true }));
       } catch {
-        this.enumeratedAdmissionComplete = false;
-        work.unknown.add(session.file);
+        lower('promptStat', session.file);
         continue;
       }
       if (
@@ -17118,7 +17144,7 @@ export class PanelProvider implements vscode.Disposable {
             work.bytes = 0;
             work.sources = 0;
             work.reads = 0;
-            if (!currentRefresh()) return [];
+            if (!currentRefresh()) return finish([]);
           }
           step = steps.next();
         }
@@ -17127,12 +17153,12 @@ export class PanelProvider implements vscode.Disposable {
           work.sources = 0;
           work.reads = 0;
           work.bytes = 0;
-          if (!currentRefresh()) return [];
+          if (!currentRefresh()) return finish([]);
         }
         work.sources++;
         this.performanceCounters?.recordWork(`humanPromptStat:${cause}`);
         const current = fileRevisionOf(fs.statSync(session.file, { bigint: true }));
-        if (!currentRefresh()) return [];
+        if (!currentRefresh()) return finish([]);
         if (
           revision.dev !== current.dev ||
           revision.ino !== current.ino ||
@@ -17140,8 +17166,7 @@ export class PanelProvider implements vscode.Disposable {
           (current.size === revision.size && !sameSessionRevision(revision, current))
         ) {
           this.humanScans.delete(session.file);
-          this.enumeratedAdmissionComplete = false;
-          work.unknown.add(session.file);
+          lower('promptChanged', session.file);
           continue;
         }
         const scan = {
@@ -17165,18 +17190,17 @@ export class PanelProvider implements vscode.Disposable {
         )
           this.derivedCacheCheckpointState?.markChanged();
         if (!scan.found && scan.complete !== true) {
-          this.enumeratedAdmissionComplete = false;
-          work.unknown.add(session.file);
+          lower('promptUnfinished', session.file);
           if (current.size > revision.size) continue;
         }
         if (promptScanLists(scan)) admitted.push(session);
       } catch {
-        this.enumeratedAdmissionComplete = false;
-        work.unknown.add(session.file);
+        lower('promptRefused', session.file);
       } finally {
         steps.return({ bytes: 0, found: false });
       }
     }
+    if (gaps) finish(admitted);
     return admitted;
   }
 

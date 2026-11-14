@@ -4171,6 +4171,7 @@ test('command-only admission removes pending rows through every catalog path and
       subagents: [],
       enumeration: { status: 'complete', files: [], uncertain: [] },
       admission: 'complete',
+      admissionGaps: {},
     }),
   };
   const compile = (name: string, body: string, parameters: string) => {
@@ -6947,6 +6948,7 @@ test('window session pages lose coverage when a served transcript is replaced at
         subagents: [],
         enumeration: { status: 'complete', files: [], uncertain: [] },
         admission: 'complete',
+        admissionGaps: {},
       }),
     };
     const code = ts.transpileModule(

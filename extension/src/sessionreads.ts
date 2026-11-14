@@ -923,7 +923,7 @@ function qualifySessionReadSource(source: SessionFile, roots: readonly string[])
   const deadline = performance.now() + SESSION_READ_LIMITS.qualificationMs;
   const opening =
     source.agent === 'codex'
-      ? readQualifiedCodexOpening(source.file)
+      ? readQualifiedCodexOpening(source.file, undefined, CODEX_OPENING_BYTES)
       : readQualifiedOpening(source.file, (fd) => {
           const buffer = Buffer.allocUnsafe(64 * 1024);
           const bytes = meterRead(source.file, fs.readSync(fd, buffer, 0, buffer.length, 0));

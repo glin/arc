@@ -184,7 +184,7 @@ test.each(['claude', 'codex'] as const)(
       file,
       agent === 'claude'
         ? 'x'.repeat(64 * 1024)
-        : opening('C:/oversized').replace('x'.repeat(20 * 1024), 'x'.repeat(128 * 1024)),
+        : opening('C:/oversized').replace('x'.repeat(20 * 1024), 'x'.repeat(CODEX_TITLE_BYTES)),
     );
     assert.equal(read(), null, 'an oversized opening bypassed the byte limit');
   },
@@ -209,6 +209,8 @@ import { tempDir } from './temproot.ts';
 import type { BackwardRangeReader, TurnAgent } from './transcript.ts';
 import type { CodexSessionMeta, CodexSubagentFile, RolloutStat } from './codex.ts';
 import { PanelPerformanceCounters } from './performancediagnostics.ts';
+import { closeReadWindow, openReadWindow } from './readmeter.ts';
+import type { SourceEnumeration } from './sessioncoverage.ts';
 import { childFileTotals } from './childartifacts.ts';
 import { AgentSpendCache, childSpendRevisionKey, readChildSpend, spendFileVersion } from './agentspend.ts';
 import {
@@ -225,6 +227,8 @@ import {
   CODEX_STAT_ACTIVE_MS,
   CODEX_STAT_REVALIDATE_MS,
   CODEX_USAGE_ASSOCIATION_LIMIT,
+  CODEX_OPENING_BYTES,
+  CODEX_TITLE_BYTES,
   CodexMetaCache,
   coldOpeningPass,
   CodexStatCache,
@@ -6293,8 +6297,12 @@ test('an opening record longer than the first read is read whole', () => {
   assert.equal(read?.openedAt, ms(0));
 });
 
-test('an opening record longer than the head window is no opening record', () => {
-  assert.equal(readCodexSessionMeta(writeRollout([longOpening(200 * 1024), ...ordinaryTurn().slice(1)])), null);
+test('an opening record longer than the head window is read whole up to the first-line bound', () => {
+  assert.equal(
+    readCodexSessionMeta(writeRollout([longOpening(200 * 1024), ...ordinaryTurn().slice(1)]))?.cwd,
+    'c:\\repo',
+  );
+  assert.equal(readCodexSessionMeta(writeRollout([longOpening(CODEX_TITLE_BYTES), ...ordinaryTurn().slice(1)])), null);
 });
 
 test('the asynchronous opening read answers what the synchronous one does at every edge', async () => {
@@ -6304,6 +6312,7 @@ test('the asynchronous opening read answers what the synchronous one does at eve
     unterminated,
     writeRollout([longOpening(40 * 1024), ...ordinaryTurn().slice(1)]),
     writeRollout([longOpening(200 * 1024), ...ordinaryTurn().slice(1)]),
+    writeRollout([longOpening(CODEX_TITLE_BYTES), ...ordinaryTurn().slice(1)]),
   ];
   // One buffer across every read, as one lane of a cold pass uses it.
   const buf = Buffer.alloc(128 * 1024, 0x0a);
@@ -18849,6 +18858,153 @@ test('Codex unavailable openings and stats leave admitted membership incomplete'
   const root = sessionsRoot([{ day: '2026/08/25', name: ROLLOUT(UUID_A), records: [meta({ id: UUID_A })] }]);
   assert.equal(codexSessionFiles(root, ['c:/repo'], () => null).admission, 'incomplete');
   assert.equal(codexSessionFiles(root, ['c:/repo'], readCodexSessionMeta, () => null).admission, 'incomplete');
+});
+
+// A root with one healthy rollout of UUID_A in the folder, and `head` as the whole of a second rollout of UUID_B.
+function rootWithHead(head: string): { root: string; file: string } {
+  const root = sessionsRoot([{ day: '2026/08/25', name: ROLLOUT(UUID_A), records: [meta({ id: UUID_A })] }]);
+  const file = path.join(root, '2026', '08', '25', ROLLOUT(UUID_B));
+  fs.writeFileSync(file, head);
+  return { root, file };
+}
+
+// The start of one opening record of `bytes` bytes, cut off with no newline. Its bytes are not valid JSON.
+const cutOffOpening = (bytes: number) => JSON.stringify(longOpening(bytes)).slice(0, bytes);
+
+// The listing through the opening cache after a cold pass, through the cache alone as the host lists, and with no cache.
+async function listingsOf(root: string): Promise<Record<string, ReturnType<typeof codexSessionFiles>>> {
+  const through = (cache: CodexMetaCache, walked?: string[], enumeration?: SourceEnumeration) =>
+    codexSessionFiles(
+      root,
+      ['c:/repo'],
+      (file, stat, inFolders) => cache.listingOpening(file, stat, inFolders),
+      undefined,
+      walked,
+      enumeration,
+      (file) => cache.openingGap(file),
+    );
+  const primed = new CodexMetaCache();
+  const pass = await coldOpeningPass(primed, root);
+  return {
+    primed: through(primed, pass.walked, pass.enumeration!),
+    cached: through(new CodexMetaCache()),
+    uncached: codexSessionFiles(root, ['c:/repo']),
+  };
+}
+
+const listedIds = (listing: ReturnType<typeof codexSessionFiles>) => listing.sessions.map((row) => row.sessionId);
+
+test.each([
+  ['an empty rollout', ''],
+  ['a cut-off rollout below 128 KiB', cutOffOpening(100 * 1024)],
+  ['a cut-off rollout between 128 KiB and 1 MiB', cutOffOpening(600 * 1024)],
+  ['a complete first line that is not an opening record', `${JSON.stringify(event('user_message', 1))}\n`],
+  ['an opening record without a working directory', `${JSON.stringify(meta({ id: UUID_B, cwd: undefined }))}\n`],
+])('%s holds no session and leaves admission complete', async (_name, head) => {
+  const { root } = rootWithHead(head);
+  for (const [reader, listing] of Object.entries(await listingsOf(root))) {
+    assert.equal(listing.admission, 'complete', `${reader}: a decided head left admission incomplete`);
+    assert.deepEqual(listing.admissionGaps, {}, reader);
+    assert.deepEqual(listedIds(listing), [UUID_A], `${reader}: a head with no session gave a row`);
+  }
+});
+
+test('an opening record of 150 KiB with a working directory in the folder lists its session', async () => {
+  const { root } = rootWithHead(`${JSON.stringify(meta({ id: UUID_B, base_instructions: 'x'.repeat(150 * 1024) }))}\n`);
+  for (const [reader, listing] of Object.entries(await listingsOf(root))) {
+    assert.equal(listing.admission, 'complete', reader);
+    assert.deepEqual(listedIds(listing).sort(), [UUID_A, UUID_B].sort(), `${reader}: the long opening gave no row`);
+  }
+});
+
+test('a first line that does not end inside 1 MiB leaves admission incomplete', async () => {
+  const { root } = rootWithHead(cutOffOpening(CODEX_TITLE_BYTES + 64 * 1024));
+  for (const [reader, listing] of Object.entries(await listingsOf(root))) {
+    assert.equal(listing.admission, 'incomplete', `${reader}: an undecided head left admission complete`);
+    assert.deepEqual(listing.admissionGaps, { pastBound: 1 }, reader);
+    assert.deepEqual(listedIds(listing), [UUID_A], reader);
+  }
+});
+
+test('a refused opening read leaves admission incomplete', () => {
+  const { root, file } = rootWithHead(cutOffOpening(4 * 1024));
+  const native = createRequire(__filename)('node:fs') as typeof fs;
+  const open = native.openSync;
+  const spy = vi.spyOn(native, 'openSync').mockImplementation(((target: fs.PathLike, ...args: any[]) => {
+    if (String(target) === file) throw Object.assign(new Error('refused opening'), { code: 'EACCES' });
+    return (open as any)(target, ...args);
+  }) as typeof fs.openSync);
+  syncBuiltinESMExports();
+  try {
+    const cache = new CodexMetaCache();
+    const listings = {
+      cached: codexSessionFiles(
+        root,
+        ['c:/repo'],
+        (rollout, stat, inFolders) => cache.listingOpening(rollout, stat, inFolders),
+        undefined,
+        undefined,
+        undefined,
+        (rollout) => cache.openingGap(rollout),
+      ),
+      uncached: codexSessionFiles(root, ['c:/repo']),
+    };
+    for (const [reader, listing] of Object.entries(listings)) {
+      assert.equal(listing.admission, 'incomplete', `${reader}: a refused read left admission complete`);
+      assert.deepEqual(listing.admissionGaps, { refused: 1 }, reader);
+    }
+  } finally {
+    spy.mockRestore();
+    syncBuiltinESMExports();
+  }
+});
+
+test('a cut-off rollout that gains its complete opening record lists its session at the next walk', () => {
+  const { root, file } = rootWithHead(cutOffOpening(100 * 1024));
+  const cache = new CodexMetaCache();
+  const list = () =>
+    codexSessionFiles(
+      root,
+      ['c:/repo'],
+      (rollout, stat, inFolders) => cache.listingOpening(rollout, stat, inFolders),
+      undefined,
+      undefined,
+      undefined,
+      (rollout) => cache.openingGap(rollout),
+    );
+  const before = list();
+  assert.equal(before.admission, 'complete');
+  assert.deepEqual(listedIds(before), [UUID_A]);
+  fs.writeFileSync(
+    file,
+    `${JSON.stringify(meta({ id: UUID_B, base_instructions: { text: 'x'.repeat(100 * 1024) } }))}\n`,
+  );
+  const after = list();
+  assert.equal(after.admission, 'complete');
+  assert.deepEqual(listedIds(after).sort(), [UUID_A, UUID_B].sort(), 'the completed opening record gave no row');
+});
+
+test('an opening read whose first line ends inside 16 KiB reads that window alone and allocates no buffer', async () => {
+  const file = writeRollout([meta()]);
+  fs.appendFileSync(file, ignoredCodexLineOfBytes(64 * 1024));
+  // The first read allocates the shared head buffer.
+  readCodexSessionMeta(file);
+  const buf = Buffer.alloc(CODEX_OPENING_BYTES);
+  const allocations = vi.spyOn(Buffer, 'allocUnsafe');
+  const window = openReadWindow();
+  try {
+    assert.equal(readCodexSessionMeta(file)?.cwd, 'c:\\repo');
+    assert.equal(closeReadWindow(window).bytes, 16 * 1024, 'the opening read took more than its first window');
+    assert.equal((await readCodexSessionMetaAsync(file, buf))?.cwd, 'c:\\repo');
+    assert.deepEqual(
+      allocations.mock.calls.filter(([size]) => size >= 16 * 1024),
+      [],
+      'an opening read allocated a head buffer',
+    );
+  } finally {
+    closeReadWindow(window);
+    allocations.mockRestore();
+  }
 });
 
 test('failed Codex stat reads retain the held revision until enumeration proves absence', () => {
