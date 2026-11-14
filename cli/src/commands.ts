@@ -1,5 +1,14 @@
 type Flag = readonly [syntax: string, description: string];
-type Section = 'Reading' | 'Starting and sending' | 'Curating' | 'Compaction' | 'Cost' | 'Usage' | 'Setup' | 'Dispatch';
+type Section =
+  | 'Reading'
+  | 'Starting and sending'
+  | 'Curating'
+  | 'Compaction'
+  | 'Cost'
+  | 'Usage'
+  | 'Diagnostics'
+  | 'Setup'
+  | 'Dispatch';
 type Route =
   | 'collect'
   | 'statusline'
@@ -12,7 +21,8 @@ type Route =
   | 'usage'
   | 'skills'
   | 'run'
-  | 'dispatch';
+  | 'dispatch'
+  | 'diagnostics';
 
 export interface Command {
   name: string;
@@ -755,6 +765,31 @@ const definitions: readonly Command[] = [
       example: 'arc usage --agent claude',
     },
   },
+  {
+    name: 'diagnostics performance',
+    section: 'Diagnostics',
+    route: 'diagnostics',
+    action: 'performance',
+    help: {
+      summary: 'Save the performance diagnostics of the selected window to a file.',
+      synopsis: 'arc diagnostics performance --window ID [--json]',
+      flags: [
+        ['--window ID', 'Required. Select the window by its hostId from arc windows.'],
+        ['--json', 'Print version, file, bytes, and capturedAt instead of readable text.'],
+      ],
+      output: [
+        'Text names the saved file and its size in bytes.',
+        'The window writes the file to ARC_PERF_OUT_DIR when its editor has that variable, otherwise to its first folder.',
+        'The window shows no dialog and no notification.',
+      ],
+      refusals: [
+        'A window that lacks the performanceCapture capability must reload after an update. Nothing is sent to it.',
+        'A window with no folder and no ARC_PERF_OUT_DIR refuses. So does a failed write.',
+        'A request while a capture runs refuses. After 256 captures, the window refuses until a reload.',
+      ],
+      example: 'arc diagnostics performance --window WINDOW_ID --json',
+    },
+  },
 ];
 
 export function checkCommandHelp(commands: readonly Command[]): void {
@@ -868,6 +903,7 @@ export function renderOverviewHelp(): string {
     'Compaction',
     'Cost',
     'Usage',
+    'Diagnostics',
     'Dispatch',
     'Setup',
   ];

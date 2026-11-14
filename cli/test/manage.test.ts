@@ -10,6 +10,7 @@ import type { NativeEvent } from '../../extension/src/agentwire.ts';
 import * as sessionRequests from '../../extension/src/sessionrequests.ts';
 import { runManagement } from '../src/manage.ts';
 import { runCompact } from '../src/compact.ts';
+import { runDiagnostics } from '../src/diagnostics.ts';
 import { runSessions } from '../src/sessions.ts';
 import { collectRow, collectPage, collectTurns, smokeEnv } from './smoke-fixture.ts';
 
@@ -254,6 +255,36 @@ test('compact cancel crosses a real window channel and cancels the request in th
       await runCompact(['cancel', '--self', '--request-id', requestId, '--window', window, '--json']),
     );
     assert.deepEqual([answer.requestId, answer.state, answer.reason], [requestId, 'cancelled', COMPACT_CANCELLED]);
+  } finally {
+    await fixture.close();
+  }
+});
+
+// Catches a routing or parse mismatch between the CLI capture command and the window channel.
+test('diagnostics performance crosses a real window channel and prints the saved file', async () => {
+  const fixture = await host();
+  try {
+    const window = fixture.channel.hostId;
+    await assert.rejects(runDiagnostics('performance', ['--json']), /--window is required/);
+    await assert.rejects(runDiagnostics('performance', ['--window', window, '--file', 'x']), /Usage: arc diagnostics/);
+    await assert.rejects(runDiagnostics('performance', ['--window', window]), /must reload after an update/);
+    const file = join(fixture.home, 'arc-performance.json');
+    let calls = 0;
+    fixture.channel.setPerformanceCaptureHandler(() => {
+      calls++;
+      return { version: 1, file, bytes: 2048, capturedAt: Date.UTC(2026, 10, 13) };
+    });
+    assert.equal(
+      await runDiagnostics('performance', ['--window', window]),
+      `Saved performance diagnostics to ${file} (2048 bytes).`,
+    );
+    assert.deepEqual(JSON.parse(await runDiagnostics('performance', ['--window', window, '--json'])), {
+      version: 1,
+      file,
+      bytes: 2048,
+      capturedAt: Date.UTC(2026, 10, 13),
+    });
+    assert.equal(calls, 2);
   } finally {
     await fixture.close();
   }

@@ -79,6 +79,9 @@ export { FILTER_LIMITS } from './sessionfilter.ts';
 
 export const REQUESTER_PROVIDER_CAPABILITY = 'requesterProvider';
 export const SESSION_READ_CAPABILITY = 'sessionRead';
+// The window saves its performance diagnostics on request. Each activation saves at most PERFORMANCE_CAPTURE_LIMIT.
+export const PERFORMANCE_CAPTURE_CAPABILITY = 'performanceCapture';
+export const PERFORMANCE_CAPTURE_LIMIT = 256;
 
 export interface HostRegistration extends WindowInfo {
   address: string;
@@ -120,7 +123,8 @@ export interface SessionRequest {
     | 'compact-request'
     | 'compact-status'
     | 'compact-cancel'
-    | 'dispatch';
+    | 'dispatch'
+    | 'performance-capture';
   terminalOrigin?: TerminalOrigin;
   requester: string | null;
   // The requester's provider. The CLI sends it on send, session reads, and `arc start PROVIDER --arc-dispatch`, and only
@@ -205,6 +209,7 @@ export function parseSessionRequest(value: unknown): SessionRequest | null {
         'compact-request',
         'compact-status',
         'compact-cancel',
+        'performance-capture',
       ].includes(value.method as string))
   )
     return null;
@@ -244,6 +249,7 @@ export function parseSessionRequest(value: unknown): SessionRequest | null {
       'compact-status',
       'compact-cancel',
       'dispatch',
+      'performance-capture',
     ].includes(value.method as string) ||
     !(
       value.requester === null ||
@@ -479,6 +485,16 @@ export class WindowChannel {
   setDispatchHandler(handler: (request: SessionRequest) => unknown | Promise<unknown>): void {
     this.dispatchHandler = handler;
   }
+
+  private performanceCaptureHandler: (() => unknown | Promise<unknown>) | null = null;
+  private performanceCapture: Promise<unknown> | null = null;
+  private performanceCaptures = 0;
+
+  setPerformanceCaptureHandler(handler: () => unknown | Promise<unknown>): void {
+    this.performanceCaptureHandler = handler;
+    if (this.listening) this.publish();
+  }
+
   private guardedSendHandler: ((request: SessionRequest) => Promise<GuardedSendResult>) | null = null;
   private guardedReadHandler: ((request: SessionRequest) => Promise<ReadWriteResult>) | null = null;
 
@@ -567,6 +583,7 @@ export class WindowChannel {
         ...(this.dispatchHandler ? ['dispatchResults'] : []),
         ...(this.guardedReadHandler ? [SESSION_READ_CAPABILITY] : []),
         ...(this.guardedSendHandler ? ['agentMessageQueue', 'agentMessageSend'] : []),
+        ...(this.performanceCaptureHandler ? [PERFORMANCE_CAPTURE_CAPABILITY] : []),
       ],
     };
   }
@@ -765,6 +782,7 @@ export class WindowChannel {
                 return result;
               });
             }
+            if (request.method === 'performance-capture') return this.capturePerformance(request);
             if (request.method.startsWith('compact-')) {
               const data = this.compactHandler
                 ? this.compactHandler(request)
@@ -848,6 +866,31 @@ export class WindowChannel {
       },
       120_000,
     );
+  }
+
+  // One capture runs at a time. Every capture that reaches the handler uses the activation allowance, whatever its outcome.
+  private capturePerformance(request: SessionRequest): Promise<unknown> {
+    const handler = this.performanceCaptureHandler;
+    if (!handler) throw new Error('This Arc window does not support performance captures.');
+    if (this.performanceCapture)
+      throw new Error('This Arc window is already saving a performance capture. Request another after it finishes.');
+    if (this.performanceCaptures >= PERFORMANCE_CAPTURE_LIMIT)
+      throw new Error(
+        `This Arc window has saved ${PERFORMANCE_CAPTURE_LIMIT} performance captures. Reload the window to save more.`,
+      );
+    this.performanceCaptures++;
+    const capture = Promise.resolve().then(handler);
+    this.performanceCapture = capture;
+    return capture
+      .finally(() => {
+        if (this.performanceCapture === capture) this.performanceCapture = null;
+      })
+      .then((data) => {
+        const result = { window: this.info(), data };
+        if (Buffer.byteLength(JSON.stringify({ id: request.id, result }) + '\n') > this.limits.lineBytes)
+          throw new Error('The performance capture reply exceeds this window channel allowance.');
+        return result;
+      });
   }
 
   private binding(request: SessionRequest): unknown {
@@ -1150,7 +1193,7 @@ export async function requestWindow(
   guardedStart = false,
 ): Promise<unknown> {
   if (method === 'read' && !requestId) throw new Error('Marking read requires an explicit request ID.');
-  if (!selector && (method.startsWith('compact-') || method === 'dispatch'))
+  if (!selector && (method.startsWith('compact-') || method === 'dispatch' || method === 'performance-capture'))
     throw new Error('Select an Arc window with --window.');
   const automatic = !selector && integratedTerminal();
   const release = automatic ? await leaseWindowsPipe() : () => {};
@@ -1259,6 +1302,10 @@ export async function requestWindow(
       !entry.capabilities?.includes('dispatchResults')
     )
       throw new Error('The selected Arc window must reload before it can accept dispatch results. No prompt was sent.');
+    if (method === 'performance-capture' && !entry.capabilities?.includes(PERFORMANCE_CAPTURE_CAPABILITY))
+      throw new Error(
+        'The selected Arc window must reload after an update before it can save performance diagnostics. Nothing was saved.',
+      );
     if (method === 'read' && (!providerCapable(entry) || !entry.capabilities?.includes(SESSION_READ_CAPABILITY)))
       throw new Error('The selected Arc window does not support marking sessions read.');
     if (

@@ -7,6 +7,7 @@ import { runCollect } from './collect.ts';
 import { runManagement } from './manage.ts';
 import { runCompact } from './compact.ts';
 import { runDispatch } from './dispatch.ts';
+import { runDiagnostics } from './diagnostics.ts';
 import { runStandalone, runSupervisor } from './run.ts';
 import { produceStandaloneOutput } from './standalone.ts';
 import { DispatchReceipts } from '../../extension/src/dispatchreceipts.ts';
@@ -112,6 +113,9 @@ async function run(): Promise<void> {
       return;
     case 'compact':
       process.stdout.write(`${await runCompact(args.slice(1))}\n`);
+      return;
+    case 'diagnostics':
+      process.stdout.write(`${await runDiagnostics(command.action!, commandArgs)}\n`);
       return;
     case 'sessions':
       process.stdout.write(`${await runSessions(command.name as 'sessions' | 'session' | 'filter', commandArgs)}\n`);

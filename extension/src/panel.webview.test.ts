@@ -14539,6 +14539,35 @@ test('performance diagnostics are a redacted read-only snapshot of held state', 
     'capturing diagnostics starts work or reads an authoritative source',
   );
 
+  // A window channel capture writes the same file with no caller path and nothing shown in the window.
+  const channelCapture = memberFrom(panelHostSource, panelHostSource.indexOf('async capturePerformanceForChannel()'));
+  sourceMatch(
+    channelCapture,
+    /this\.performanceCounters\.recordCapture\(\)/,
+    'a channel capture is absent from its own monotonic count',
+  );
+  sourceMatch(
+    channelCapture,
+    /const snapshot = this\.performanceDiagnostics\(capturedAt\)/,
+    'a channel capture bypasses the tested diagnostic projection input',
+  );
+  sourceMatch(
+    channelCapture,
+    /savePerformanceDiagnosticsSnapshot\(\{/,
+    'a channel capture picks its own destination instead of the tested rules',
+  );
+  sourceDoesNotMatch(channelCapture, /\btarget\b/, 'a channel capture takes a destination from the caller');
+  sourceDoesNotMatch(
+    channelCapture,
+    /vscode\.window\.|showSaveDialog|show\w*Message/,
+    'a channel capture shows something in the window',
+  );
+  sourceDoesNotMatch(
+    channelCapture,
+    /\.refresh\(|allSessions\(|readSession|queueProjectSpend|saveSpendLedger|flushProjectSpend|statSync|readFile|createHash/,
+    'a channel capture starts work or reads an authoritative source',
+  );
+
   const snapshotBody = memberFrom(panelHostSource, panelHostSource.indexOf('private performanceDiagnostics('));
   sourceMatch(
     snapshotBody,
@@ -14660,6 +14689,93 @@ test('a capture that writes nothing puts its reason where a run with no reader c
   assert.ok(
     String(lines[1].reason).includes('out/startup.json'),
     'the logged refusal does not name the path it could not read',
+  );
+});
+
+test('a channel capture that writes nothing logs its reason, refuses, and shows nothing in the window', async () => {
+  const shown: string[] = [];
+  const diagnostics = createDiagnosticsLog({
+    enabled: false,
+    directory: tempDir('arc-channel-capture-log-'),
+    workspace: 'arc',
+    pid: 4242,
+    startedAt: Date.UTC(2026, 0, 1, 3, 4, 5),
+  });
+  const provider = Object.create(PanelProvider.prototype) as Record<string, unknown>;
+  Object.assign(provider, {
+    diagnostics,
+    disposed: false,
+    performanceCounters: { recordWork() {}, recordRowPost() {}, recordRowsGap() {}, recordCapture: () => undefined },
+    performanceDiagnostics: () => ({ schemaVersion: 1 }),
+  });
+  const editorWindow = vscode.window as unknown as Record<string, unknown>;
+  const fileUri = vscode.Uri as unknown as Record<string, unknown>;
+  const editorWorkspace = vscode.workspace as unknown as Record<string, unknown>;
+  for (const name of ['showErrorMessage', 'showInformationMessage', 'showWarningMessage', 'showSaveDialog'])
+    editorWindow[name] = (message: unknown) => {
+      shown.push(`${name}: ${String(message)}`);
+      return Promise.resolve(undefined);
+    };
+  fileUri.file = (file: string) => ({ fsPath: file });
+  let writes: { file: string; bytes: number }[] = [];
+  let failure: Error | null = new Error('EACCES: permission denied');
+  editorWorkspace.fs = {
+    writeFile: (uri: { fsPath: string }, contents: Uint8Array) => {
+      writes.push({ file: uri.fsPath, bytes: contents.byteLength });
+      return failure ? Promise.reject(failure) : Promise.resolve();
+    },
+  };
+  const directory = path.join(path.sep === '\\' ? 'C:\\arc-capture' : '/arc-capture', 'out');
+  const capture = provider as unknown as {
+    capturePerformanceForChannel(): Promise<{ version: number; file: string; bytes: number; capturedAt: number }>;
+  };
+  const outcomes: unknown[] = [];
+  const attempt = () =>
+    capture.capturePerformanceForChannel().then(
+      (value) => outcomes.push(value),
+      (error: Error) => outcomes.push(error.message),
+    );
+  try {
+    // No folder and no capture directory.
+    vi.stubEnv('ARC_PERF_OUT_DIR', '');
+    await attempt();
+    vi.stubEnv('ARC_PERF_OUT_DIR', directory);
+    await attempt();
+    failure = null;
+    await attempt();
+    provider.disposed = true;
+    writes = [];
+    await attempt();
+  } finally {
+    vi.unstubAllEnvs();
+    for (const name of ['showErrorMessage', 'showInformationMessage', 'showWarningMessage', 'showSaveDialog'])
+      delete editorWindow[name];
+    delete fileUri.file;
+    delete editorWorkspace.fs;
+  }
+
+  assert.deepEqual(shown, [], 'a channel capture showed something in the window');
+  assert.match(String(outcomes[0]), /Open a folder/, 'a capture with no destination did not refuse');
+  assert.match(String(outcomes[1]), /EACCES: permission denied/, 'a failed write did not refuse with its reason');
+  const saved = outcomes[2] as { version: number; file: string; bytes: number; capturedAt: number };
+  assert.equal(saved.version, 1);
+  assert.equal(path.dirname(saved.file), directory, 'the capture left the host capture directory');
+  assert.equal(saved.bytes, `${JSON.stringify({ schemaVersion: 1 }, null, 2)}\n`.length);
+  assert.ok(Number.isSafeInteger(saved.capturedAt));
+  assert.match(String(outcomes[3]), /closed/, 'a closed window saved a capture');
+  assert.deepEqual(writes, [], 'a closed window wrote a file');
+  const lines = fs
+    .readFileSync(diagnostics.file()!, 'utf8')
+    .trim()
+    .split('\n')
+    .map((line) => JSON.parse(line) as Record<string, unknown>);
+  assert.deepEqual(
+    lines.map((line) => [line.event, line.file === null ? null : path.dirname(String(line.file)), line.reason]),
+    [
+      ['performanceCaptureFailed', null, 'no open folder and no capture directory'],
+      ['performanceCaptureFailed', directory, 'EACCES: permission denied'],
+    ],
+    'a channel capture failure is not in the log a run with no reader can read',
   );
 });
 

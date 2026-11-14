@@ -23,6 +23,8 @@ import {
   discoverWindows,
   hostAddress,
   parseSessionRequest,
+  PERFORMANCE_CAPTURE_CAPABILITY,
+  PERFORMANCE_CAPTURE_LIMIT,
   pingWindow,
   SESSION_REQUEST_LIMITS,
   WindowChannel,
@@ -164,6 +166,20 @@ test('request schema rejects unsupported versions, methods, identifiers, and par
   }
   for (const cacheLifetime of ['2h', '1H', '', null, 3600, ['1h']])
     assert.equal(parseSessionRequest({ ...valid, method: 'start', params: { ...start, cacheLifetime } }), null);
+  // A performance capture takes no caller path, content or terminal routing.
+  const capture = { ...valid, method: 'performance-capture' };
+  assert.deepEqual(parseSessionRequest(capture), capture);
+  const origin = { platform: 'linux', caller: { pid: 30, birth: '300' }, root: { pid: 20, birth: '200' } };
+  assert.ok(parseSessionRequest({ ...valid, method: 'sessions', terminalOrigin: origin }));
+  for (const invalid of [
+    { ...capture, params: { file: '/tmp/capture.json' } },
+    { ...capture, params: { directory: 'out' } },
+    { ...capture, params: { snapshot: {} } },
+    { ...capture, params: null },
+    { ...capture, requester: 'agent', requesterProvider: 'claude' },
+    { ...capture, terminalOrigin: origin },
+  ])
+    assert.equal(parseSessionRequest(invalid), null);
 });
 
 test(
@@ -854,6 +870,9 @@ test('pending listener publication retains updates and read capability without p
     await Promise.all([f.started, updated]);
     assert.equal(JSON.parse(fs.readFileSync(f.file, 'utf8')).panelReady, true);
     assert.ok(JSON.parse(fs.readFileSync(f.file, 'utf8')).capabilities.includes('sessionRead'));
+    assert.ok(!JSON.parse(fs.readFileSync(f.file, 'utf8')).capabilities.includes(PERFORMANCE_CAPTURE_CAPABILITY));
+    f.channel.setPerformanceCaptureHandler(() => null);
+    assert.ok(JSON.parse(fs.readFileSync(f.file, 'utf8')).capabilities.includes(PERFORMANCE_CAPTURE_CAPABILITY));
     f.fail();
     await f.settle();
     await vi.advanceTimersByTimeAsync(100);
@@ -1568,6 +1587,49 @@ test(
     await vi.advanceTimersByTimeAsync(100);
     assert.equal(((await pending) as any).state, 'deadline');
     vi.useRealTimers();
+  },
+);
+
+test(
+  'performance capture needs an explicit window and its capability, and runs one capture at a time within its allowance',
+  { tags: ['subprocess'] },
+  async () => {
+    for (const key of ['TERM_PROGRAM', 'VSCODE_PID', 'VSCODE_IPC_HOOK_CLI']) vi.stubEnv(key, '');
+    const { channel, home } = await fixture();
+    await assert.rejects(requestWindow('performance-capture', {}, '', home), /--window/);
+    await assert.rejects(requestWindow('performance-capture', {}, channel.hostId, home), /must reload after an update/);
+    const reply = { version: 1, file: path.join(home, 'capture.json'), bytes: 42, capturedAt: 1 };
+    let calls = 0;
+    let release!: (value: unknown) => void;
+    channel.setPerformanceCaptureHandler(() => {
+      calls++;
+      return new Promise((resolve) => {
+        release = resolve;
+      });
+    });
+    const first = requestWindow('performance-capture', {}, channel.hostId, home);
+    await vi.waitFor(() => assert.equal(calls, 1));
+    await assert.rejects(requestWindow('performance-capture', {}, channel.hostId, home), /already saving/);
+    assert.equal(calls, 1, 'a second capture ran beside the first');
+    release(reply);
+    assert.deepEqual(await first, reply);
+    channel.setPerformanceCaptureHandler(() => {
+      calls++;
+      throw new Error('Arc could not save performance diagnostics to capture.json. EACCES');
+    });
+    await assert.rejects(requestWindow('performance-capture', {}, channel.hostId, home), /could not save.*EACCES/);
+    channel.setPerformanceCaptureHandler(() => ({ file: 'x'.repeat(SESSION_REQUEST_LIMITS.lineBytes) }));
+    await assert.rejects(requestWindow('performance-capture', {}, channel.hostId, home), /allowance/);
+    channel.setPerformanceCaptureHandler(() => {
+      calls++;
+      return reply;
+    });
+    // Each activation saves at most PERFORMANCE_CAPTURE_LIMIT captures. Start one short of it.
+    (channel as unknown as { performanceCaptures: number }).performanceCaptures = PERFORMANCE_CAPTURE_LIMIT - 1;
+    assert.deepEqual(await requestWindow('performance-capture', {}, channel.hostId, home), reply);
+    const admitted = calls;
+    await assert.rejects(requestWindow('performance-capture', {}, channel.hostId, home), /Reload the window/);
+    assert.equal(calls, admitted, 'a capture past the allowance reached the panel');
   },
 );
 
