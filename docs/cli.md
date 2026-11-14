@@ -239,6 +239,16 @@ Arc saves each account usage reading in `${ARC_HOME:-~/.arc}/usage/bounded-v1/`.
 
 `usage` reads every slot it can and reports each problem with the store `file` and a `message`. Store problems are a store folder with entries and no `format` file, and an unsupported `format` file. Slot problems are a payload without its metadata file, invalid or oversized metadata, and an unreadable metadata file or payload. A slot that changes during every read and skipped invalid lines are also slot problems. A skipped-lines problem also carries `skippedLines`. Text lists the problems below the readings. `usage` exits 1 when the store has problems and no slot reads, or when the store folder or its `format` file is unreadable. An empty or missing store exits 0. Text output prints one sentence that says no saved usage exists, and `--json` prints empty `readings` and `problems`. `--home PATH` reads another Arc home folder.
 
+## Save performance diagnostics
+
+Ask a window to save its performance diagnostics:
+
+```sh
+arc diagnostics performance --window WINDOW_ID
+```
+
+The output names the saved file. [Performance capture output](cli-reference.md#performance-capture) defines the fields and refusals.
+
 ## Status line
 
 [Configure Claude Code](../cli/README.md#status-line-setup) to run `arc statusline`. It reads one JSON object from stdin.

@@ -253,6 +253,14 @@ Status is `applied`, `dry-run`, `refused`, or `unknown`. Applied confirms saved 
 
 Unavailable source facts project no marks. Reader boundaries remain separate, and partial zero counts remain uncertain. Each activation retains at most 256 distinct read operation IDs. New IDs refuse at capacity. Retained retries, ordinary panel reading, preference resets, and source invalidation remain available. Saves share a limit of 256 pending jobs. Reloads invalidate prior receipts.
 
+## Performance capture
+
+`diagnostics performance` requires `--window`. `ARC_WINDOW` and terminal ownership never select its window. The selected window must list `performanceCapture`. Otherwise the command refuses before it connects and says that the window must reload after an update.
+
+Text output names the saved file and its size. `--json` prints `version: 1`, `file`, `bytes`, and `capturedAt`. `file` is the absolute path that the window wrote. `bytes` is its size. `capturedAt` is the capture time in milliseconds since the epoch. The output carries no capture content.
+
+The window refuses without an open folder or `ARC_PERF_OUT_DIR`, and refuses a relative `ARC_PERF_OUT_DIR` without an open folder. A failed write refuses with its reason. A request while another capture runs refuses. So does a request past the [activation allowance](window-channel.md#performance-capture). The exchange allows five seconds. A reply that does not arrive in time reports that the window did not answer, and the window can still write the file.
+
 ## Cost reports
 
 `cost` prints readable summaries, or one structured object with `--json`. Neither reads stdin. `schemaVersion: 3` identifies the contract. `buildCommit` identifies the bundled commit, or `unknown` without build identity. `rateNote` describes pricing.
