@@ -473,7 +473,7 @@ export function sessionDiscoveryMembership(
 }
 
 // The listed rows that a discovery request sends as parents: every row except a Claude child transcript and a compressed
-// rollout. A walk and a refresh that names files both build parents by this rule, so the worker compares equal sets.
+// rollout. A walk sends its parents by this rule. A refresh that names files uses it when no walk listed the current roots.
 // The worker receives compressed rollouts by name in the compressed rollout list.
 export function discoveryParentsOf(rows: readonly SessionFile[]): SessionFile[] {
   return rows.filter((row) => row.childTranscript !== true && !isCompressedRollout(row.file));

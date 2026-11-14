@@ -15648,8 +15648,15 @@ export class PanelProvider implements vscode.Disposable {
                 session.agent !== 'claude' || session.childTranscript === true || this.hasHumanPrompt(session),
             );
         const sorted = orderSessionCatalog(admitted, (session) => this.activityFor(session));
-        const listed = new Set(sorted.map((session) => session.file));
-        this.claudeParents = discoveryParentsOf([...sorted, ...parents.filter((session) => !listed.has(session.file))]);
+        // The parents are the parents of the last walk. A listed parent comes first, at the revision of its listed row.
+        // Without a walk of the current roots, the parents are the listed rows.
+        if (walk) {
+          const unlisted = new Set(parents.map((session) => session.file));
+          const listed = sorted.filter((session) => unlisted.delete(session.file));
+          this.claudeParents = unlisted.size
+            ? [...listed, ...parents.filter((session) => unlisted.has(session.file))]
+            : listed;
+        } else this.claudeParents = discoveryParentsOf(sorted);
         this.catalog = { folders: folderPrint, sessions: sorted };
         if (!settled) this.catalogWalked = false;
         return sorted;

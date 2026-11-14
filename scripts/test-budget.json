@@ -17,7 +17,7 @@
     },
     "one turn": {
       "reason": "Host block executions per added listed session stay fixed until a reduction lowers this row.",
-      "budget": 1109.975,
+      "budget": 1106.975,
       "margin": 0
     },
     "discovery reply": {
@@ -32,7 +32,7 @@
     },
     "append inside a turn": {
       "reason": "Host block executions per added listed session stay fixed until a reduction lowers this row.",
-      "budget": 618.24,
+      "budget": 615.24,
       "margin": 0
     }
   },

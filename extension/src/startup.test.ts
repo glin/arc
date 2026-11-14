@@ -15450,39 +15450,15 @@ test('a complete discovery reply keeps a backfilled row and gives it a spend sou
   );
 });
 
-test('a watcher refresh of a named path sends the parents that the walk sent', async () => {
-  const { provider, plain, requests, applyTwin, releaseAll } = backfilledTwinHarness();
-  await releaseAll(provider.refresh(true));
-  const walked = requests.at(-1)!;
-  applyTwin();
-  await vi.waitFor(() => assert.equal(provider.refreshController, null));
-  assert.ok(await provider.prepareClaudeChildren(provider.refreshGeneration, new AbortController().signal));
-  assert.equal(provider.dispatchDiscoveryPending, false, 'discovery did not settle before the watcher refresh');
-  const sent = requests.length;
-  provider.refreshFrom('watcher', false, false, [plain]);
-  await vi.waitFor(() => assert.equal(provider.refreshController, null));
-  assert.equal(requests.length, sent + 1, 'the watcher refresh sent no discovery request');
-  assert.deepEqual(
-    discoveryParentKeys(requests.at(-1)!),
-    discoveryParentKeys(walked),
-    'the watcher refresh sent other parents than the walk',
-  );
-});
-
-test('an epoch of a walked request and a named request settles and leaves the listing complete', async () => {
-  const { provider, plain, requests, worker, complete, applyTwin, releaseAll } = backfilledTwinHarness(
-    ['sessionQueryContext', 'sessionQueryRevisionFor', 'sessionsKeptByReader'],
-    { sessionQueryRevision },
-  );
-  // The worker fake answers as the worker does. The first request of an epoch fixes its parents. A complete reply settles
-  // members only when the request lists the same parent set. While `holdOpen` is set, the first reply of an epoch is partial.
+// Answers as the worker does. The first request of an epoch fixes its parents. A complete reply settles members only when
+// the request lists the same parent set. While `holdOpen` is set, the first reply of an epoch is partial.
+function epochWorker({ provider, worker, complete }: ReturnType<typeof backfilledTwinHarness>) {
+  const control = { holdOpen: false, epochs: [] as { requests: number; settled: boolean }[] };
   let epoch: (DiscoveryCheckpoint & { requests: number }) | null = null;
-  let holdOpen = false;
-  const epochs: { requests: number; settled: boolean }[] = [];
   worker.reply = (request) => {
     if (!epoch) {
       epoch = {
-        epoch: `epoch-${epochs.length + 1}`,
+        epoch: `epoch-${control.epochs.length + 1}`,
         compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
         parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
         parents: request.parents,
@@ -15496,11 +15472,11 @@ test('an epoch of a walked request and a named request settles and leaves the li
     }
     const { requests: count, ...checkpoint } = epoch;
     epoch.requests = count + 1;
-    if (holdOpen && count === 0)
+    if (control.holdOpen && count === 0)
       return { kind: 'claude-children-progress', checkpoint, continuation: true, referenceEntries: [] };
     const settled =
       JSON.stringify(discoveryParentKeys(request.parents)) === JSON.stringify(discoveryParentKeys(epoch.parents));
-    epochs.push({ requests: count + 1, settled });
+    control.epochs.push({ requests: count + 1, settled });
     epoch = null;
     return {
       ...complete({ parents: checkpoint.parents }),
@@ -15509,21 +15485,92 @@ test('an epoch of a walked request and a named request settles and leaves the li
       membershipSettled: settled,
     };
   };
-  // No continuation runs, so the epoch stays open until the named request, and the coverage read follows its reply.
+  // No continuation runs, so an epoch stays open until the next request that a test sends.
   provider.scheduleDiscoveryContinuation = () => {};
+  return control;
+}
+
+// A watcher refresh of one named path. It must list the held catalog and send one discovery request without a walk.
+async function namedWatcherRefresh(
+  { provider, requests, walks }: ReturnType<typeof backfilledTwinHarness>,
+  file: string,
+): Promise<SessionFile[]> {
+  const sent = requests.length;
+  const started = walks.length;
+  const walk = provider.catalogWalk?.generation;
+  provider.refreshFrom('watcher', false, false, [file]);
+  await vi.waitFor(() => assert.ok(provider.refreshController === null || walks.length > started));
+  assert.equal(walks.length, started, 'the watcher refresh walked');
+  assert.equal(provider.catalogWalk?.generation, walk, 'the watcher refresh walked');
+  assert.equal(requests.length, sent + 1, 'the watcher refresh sent no discovery request');
+  return requests.at(-1)!;
+}
+
+test('a watcher refresh of a named path sends the parents that the walk sent', async () => {
+  const harness = backfilledTwinHarness();
+  const { provider, plain, requests, applyTwin, releaseAll } = harness;
+  await releaseAll(provider.refresh(true));
+  const walked = requests.at(-1)!;
+  applyTwin();
+  await vi.waitFor(() => assert.equal(provider.refreshController, null));
+  assert.ok(await provider.prepareClaudeChildren(provider.refreshGeneration, new AbortController().signal));
+  assert.equal(provider.dispatchDiscoveryPending, false, 'discovery did not settle before the watcher refresh');
+  fs.appendFileSync(plain, '\n');
+  const sent = await namedWatcherRefresh(harness, plain);
+  assert.deepEqual(
+    discoveryParentKeys(sent),
+    discoveryParentKeys(walked),
+    'the watcher refresh sent other parents than the walk',
+  );
+  assert.equal(
+    sent.find((row) => row.file === plain)?.size,
+    fs.statSync(plain).size,
+    'the watcher refresh sent an earlier revision of the named file',
+  );
+});
+
+test('a watcher refresh of a named path leaves out a held row that the last walk did not list', async () => {
+  const harness = backfilledTwinHarness();
+  const { provider, plain, requests, writeRollout, releaseAll } = harness;
+  const control = epochWorker(harness);
+  const gone = writeRollout('gone');
+  await releaseAll(provider.refresh(true));
+  assert.ok(
+    provider.authoritativeCatalog.some((row: SessionFile) => row.file === gone),
+    'the fixture did not accept the row',
+  );
+  fs.rmSync(gone);
+  control.holdOpen = true;
+  await releaseAll(provider.refresh(true));
+  const walked = requests.at(-1)!;
+  assert.ok(
+    provider.catalog.sessions.some((row: SessionFile) => row.file === gone) && !walked.some((row) => row.file === gone),
+    'the fixture did not hold a row that the walk left out',
+  );
+  assert.deepEqual(
+    discoveryParentKeys(await namedWatcherRefresh(harness, plain)),
+    discoveryParentKeys(walked),
+    'the watcher refresh sent a held row that the walk left out',
+  );
+  assert.deepEqual(control.epochs.at(-1), { requests: 2, settled: true }, 'the epoch did not settle');
+});
+
+test('an epoch of a walked request and a named request settles and leaves the listing complete', async () => {
+  const harness = backfilledTwinHarness(['sessionQueryContext', 'sessionQueryRevisionFor', 'sessionsKeptByReader'], {
+    sessionQueryRevision,
+  });
+  const { provider, plain, applyTwin, releaseAll } = harness;
+  const control = epochWorker(harness);
   await releaseAll(provider.refresh(true));
   assert.equal(provider.sessionQueryContext().coverage, 'complete', 'the fixture did not start complete');
   applyTwin();
   await vi.waitFor(() => assert.equal(provider.refreshController, null));
-  holdOpen = true;
+  control.holdOpen = true;
   await releaseAll(provider.refresh(true));
   assert.equal(provider.dispatchDiscoveryPending, true, 'the walked request did not leave its epoch open');
-  const sent = requests.length;
-  provider.refreshFrom('watcher', false, false, [plain]);
-  await vi.waitFor(() => assert.equal(provider.refreshController, null));
-  assert.equal(requests.length, sent + 1, 'the watcher refresh sent no discovery request');
+  await namedWatcherRefresh(harness, plain);
   assert.deepEqual(
-    epochs.at(-1),
+    control.epochs.at(-1),
     { requests: 2, settled: true },
     'the epoch of a walked and a named request did not settle',
   );
