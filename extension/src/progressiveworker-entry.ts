@@ -329,12 +329,13 @@ function compressedRequestersOf(names: readonly string[]): CompressedRequesters 
   return files;
 }
 // The catalog of a receipt scan. The parents of a discovery request hold no compressed rollout, so a receipt whose requester is
-// a compressed rollout finds no requester row among them. The scan adds a Codex row for each compressed name whose session ID one name alone
-// carries and no Codex row of the catalog holds. The lookup reads only the agent, the session ID and the file of such a row.
+// a compressed rollout finds no requester row among them. The scan adds a Codex row for each compressed name whose session
+// ID one name alone carries and no row of the catalog holds. The host matches a parent by its session ID alone, so a row of
+// any agent with that ID excludes the name. The lookup reads only the agent, the session ID and the file of an added row.
 // The catalog itself returns when there is no row to add.
 function receiptCatalogOf(catalog: SessionFile[]): SessionFile[] {
   if (!compressedRequesters?.size) return catalog;
-  const held = new Set(catalog.flatMap((row) => (row.agent === 'codex' ? [row.sessionId] : [])));
+  const held = new Set(catalog.map((row) => row.sessionId));
   const added: SessionFile[] = [];
   for (const [sessionId, file] of compressedRequesters)
     if (file !== null && !held.has(sessionId)) added.push({ agent: 'codex', sessionId, file } as SessionFile);

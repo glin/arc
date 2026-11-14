@@ -18491,6 +18491,31 @@ test.skipIf(!zstdCompress)('a requester with a plain row and a listed twin keeps
   }
 });
 
+// A Claude session of the catalog holds the session ID of the compressed Codex requester. The host matches a parent by its
+// session ID alone, so a link to the Codex requester would place the child under the Claude session.
+test.skipIf(!zstdCompress)('a compressed name whose session ID a Claude row holds gives no requester row', async () => {
+  const { root, fx, stores, twin } = compressedRequesterFixture('codex');
+  const claude = fx.write('claude', fx.parent.sessionId);
+  const worker = new ProgressiveWorker(`process.env.ARC_HOME=${JSON.stringify(fx.home)};` + source);
+  try {
+    const reply = await completeDiscovery(
+      worker,
+      {
+        kind: 'claude-children',
+        parents: [claude, fx.child],
+        repositoryRoots: [root],
+        compressed: [twin],
+        compressedStores: stores,
+      },
+      1,
+      new AbortController().signal,
+    );
+    assert.deepEqual(dispatchedFrom(reply, fx.child.sessionId), { parent: undefined, facts: 0 });
+  } finally {
+    worker.stop();
+  }
+});
+
 test.skipIf(!zstdCompress)('two compressed names with one session ID give the requester no row', async () => {
   const { root, fx, twin, listed } = compressedRequesterFixture('codex');
   const elsewhere = path.join(root, 'elsewhere', path.basename(twin));
@@ -18510,17 +18535,22 @@ test.skipIf(!zstdCompress)('two compressed names with one session ID give the re
   }
 });
 
-// The first epoch has no list, so the launch ends at its requester. The store directories are an hour old, so the store
-// proves its revision and the second epoch reuses the completed scan.
+// The first epoch has no list, so the launch ends at its requester. The store directories are an hour old before the first
+// and the third epoch, so the store proves the revision of each scan that reads it. The second epoch reuses the completed
+// scan. Its link writes the relationship cache, so the third epoch reads the store again. The fourth epoch reuses that scan
+// with a list that drops the requester.
 test.skipIf(!zstdCompress)(
-  'a launch rejected at its compressed requester joins it when the list arrives with the next epoch',
+  'a launch rejected at its compressed requester joins it when the list arrives with the next epoch, and leaves when the list drops it',
   async () => {
     const { fx, request, listed } = compressedRequesterFixture('codex');
-    const hourAgo = Date.now() / 1000 - 3600;
-    for (const directory of [fx.receipts.root, path.join(fx.home, 'cache', 'dispatch-relationships')])
-      if (fs.existsSync(directory)) fs.utimesSync(directory, hourAgo, hourAgo);
+    const age = () => {
+      const hourAgo = Date.now() / 1000 - 3600;
+      for (const directory of [fx.receipts.root, path.join(fx.home, 'cache', 'dispatch-relationships')])
+        if (fs.existsSync(directory)) fs.utimesSync(directory, hourAgo, hourAgo);
+    };
     const worker = new ProgressiveWorker(`process.env.ARC_HOME=${JSON.stringify(fx.home)};` + source);
-    const epoch = async (sent: typeof request, generation: number) => {
+    const epoch = async (sent: typeof listed | typeof request, generation: number) => {
+      if (generation % 2) age();
       const counts = { rejected: 0, reuses: 0, reused: 0 };
       for (let pass = 0; pass < 100; pass++) {
         const result = await worker.run(sent, generation, new AbortController().signal);
@@ -18543,6 +18573,16 @@ test.skipIf(!zstdCompress)(
         counts: { rejected: 0, reuses: 1, reused: 1 },
         parent: fx.parent.sessionId,
         facts: 1,
+      });
+      assert.deepEqual(await epoch(listed, 3), {
+        counts: { rejected: 0, reuses: 0, reused: 0 },
+        parent: fx.parent.sessionId,
+        facts: 1,
+      });
+      assert.deepEqual(await epoch({ ...listed, compressed: [] }, 4), {
+        counts: { rejected: 1, reuses: 1, reused: 1 },
+        parent: undefined,
+        facts: 0,
       });
     } finally {
       worker.stop();
