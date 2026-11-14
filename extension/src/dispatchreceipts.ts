@@ -319,6 +319,11 @@ export function dispatchStartupRevision(file: string): string | null {
   const stat = fs.lstatSync(file, { bigint: true, throwIfNoEntry: false });
   return stat?.isFile() ? relationshipRevision(stat) : null;
 }
+// The form in which the file comparison of a receipt read compares a transcript path on a platform. On Windows it resolves
+// the path and lowers its letter case. On other platforms it resolves the path and keeps each backslash as a name character.
+export function dispatchFileKey(file: string, platform: NodeJS.Platform): string {
+  return platform === 'win32' ? path.win32.resolve(file).toLowerCase() : path.posix.resolve(file);
+}
 const emptyRelationshipStep = (): DispatchRelationshipStep => ({ entries: 0, bytes: 0, checks: 0 });
 
 // Each next call grants one filesystem operation. Zero grants preserve its position.
@@ -763,8 +768,7 @@ export class DispatchReceipts {
       reader.stop = 'session';
       return null;
     }
-    const normalize = (value: string) =>
-      this.platform === 'win32' ? paths.resolve(value).toLowerCase() : paths.resolve(value);
+    const normalize = (value: string) => dispatchFileKey(value, this.platform);
     if (normalize(startup.file) !== normalize(scoped.child.file)) {
       reader.stop = 'file';
       return null;

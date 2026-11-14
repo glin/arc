@@ -305,8 +305,8 @@ export interface DiscoveryCharges
   receiptScanReuses?: number;
   receiptScanReuseLaunches?: number;
   receiptScanReuseLaunchesUnlinked?: number;
-  // Each launch that a reused scan holds from the completed scan, ended without a link and names both identities, by the stop
-  // of its last read. It counts whether the scan reads it again or not.
+  // Each launch without a link that names both identities and that a reused scan holds, by the stop of its last read. It
+  // counts whether the scan reads it again or not.
   receiptScanReuseUnlinkedSession?: number;
   receiptScanReuseUnlinkedFile?: number;
   receiptScanReuseUnlinkedPath?: number;

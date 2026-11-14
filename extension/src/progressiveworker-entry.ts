@@ -138,6 +138,7 @@ import {
 import { TURN_QUIET_MS, statusOf } from './turncard';
 import {
   DispatchReceipts,
+  dispatchFileKey,
   dispatchStartupRevision,
   type DispatchRelationshipStop,
   type DispatchStartupRevision,
@@ -351,7 +352,7 @@ function receiptCatalogOf(catalog: SessionFile[]): SessionFile[] {
 // Sets the catalog of an open scan from its epoch's catalog. Each recorded launch whose identities changed rows is read again.
 function updateReceiptCatalog(scan: ReceiptScan, catalog: SessionFile[]): void {
   const next = receiptCatalogOf(catalog);
-  const changed = changedCatalogIdentities(scan.catalog, next);
+  const changed = changedCatalogIdentities(scan.catalog, next, scan.store.platform);
   for (const [launchId, identities] of scan.launches)
     if (identities.some((identity) => changed.has(identity))) retryReceiptLaunch(scan, launchId);
   scan.catalog = next;
@@ -463,8 +464,8 @@ const REUSE_UNLINKED_CHARGES = {
 // A scan for a new epoch from a completed scan. It reads again each launch whose requester or dispatched session changed
 // catalog rows. It also reads again each launch without a link whose read went past the file comparison of its dispatched
 // session. Such a read depends on files outside the store, such as the opening of the dispatched transcript. A launch without a
-// link that stopped at the lookup of its dispatched session or at the file comparison read only store files and catalog rows.
-// So only a change of those rows or of the store can link it. Any other launch without a link stopped at its requester or on
+// link can stop at the lookup of its dispatched session or at the file comparison. Such a read uses only store files and
+// catalog rows. So only a change of those rows or of the store can link it. Any other launch without a link stopped at its requester or on
 // a store file. Arc completes each write of such a file with a write in the store directory that moves the store revision.
 // The steps of the scan then check the dispatched transcript of each link that the scan holds. `work` counts each launch
 // without a link that names both identities, by its stop.
@@ -474,7 +475,7 @@ function reusedReceiptScan(
   work: HeldReceiptCounts['work'],
 ): ReceiptScan {
   const catalog = receiptCatalogOf(epoch.catalog);
-  const changed = changedCatalogIdentities(kept.catalog, catalog);
+  const changed = changedCatalogIdentities(kept.catalog, catalog, kept.store.platform);
   const scan: ReceiptScan = {
     ...kept,
     epoch: epoch.epoch,
@@ -533,18 +534,21 @@ function* keptStartupChecks(current: () => ReceiptScan): ReceiptScan['steps'] {
   }
 }
 const catalogIdentity = (agent: string, sessionId: string) => JSON.stringify([agent, sessionId]);
-const catalogRowPlace = (row: SessionFile) => `${normalizeFsPath(row.file)}|${row.childTranscript === true}`;
+// A row's file in the form that the file comparison of a receipt read uses on the platform of the receipts. Two rows with one
+// key compare the same way.
+const catalogRowPlace = (row: SessionFile, platform: NodeJS.Platform) =>
+  `${dispatchFileKey(row.file, platform)}|${row.childTranscript === true}`;
 function changedCatalogIdentities(
   before: readonly SessionFile[],
   after: readonly SessionFile[],
-  rowKey: (row: SessionFile) => string = catalogRowPlace,
+  platform: NodeJS.Platform,
 ): Set<string> {
   const rows = (catalog: readonly SessionFile[]) => {
     const byIdentity = new Map<string, string[]>();
     for (const row of catalog) {
       const key = catalogIdentity(row.agent, row.sessionId);
       const files = byIdentity.get(key) ?? [];
-      files.push(rowKey(row));
+      files.push(catalogRowPlace(row, platform));
       byIdentity.set(key, files);
     }
     return new Map([...byIdentity].map(([key, files]) => [key, JSON.stringify(files.sort())]));

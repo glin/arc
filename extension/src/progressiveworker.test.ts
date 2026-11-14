@@ -2427,20 +2427,29 @@ test('a launch rejected at its requester is read again only when its requester e
   }
 });
 
+type FixtureRow = ReturnType<ReturnType<typeof receiptDispatchFixture>['write']>;
 // A linked launch beside a launch to a dispatched session whose transcript exists. `rows` gives the catalog rows of that
-// session when the settling passes read the launch, so its read ends unlinked at or after the lookup of its dispatched session.
-// `grown` grows the parent and runs a pass, with the receipt work of that pass's replies.
+// session when the settling passes read the launch. Its read then ends unlinked at or after the lookup of its dispatched
+// session. `target` gives the row that the second launch dispatches to, and `launched` runs after the launches. `transform`
+// edits the worker source. `grown` grows the parent and runs a pass, with the receipt work of that pass's replies.
 async function unlinkedLaunchHarness(
   rows: (
     absent: import('./transcript').SessionFile,
     fx: ReturnType<typeof receiptDispatchFixture>,
   ) => object[] = () => [],
+  options: {
+    target?: (absent: FixtureRow, fx: ReturnType<typeof receiptDispatchFixture>) => FixtureRow;
+    launched?: (target: FixtureRow) => void;
+    transform?: (code: string) => string;
+  } = {},
 ) {
-  const harness = await receiptWalkHarness();
+  const harness = await receiptWalkHarness(undefined, options.transform);
   const { fx, host, charged } = harness;
-  const absent = fx.write('claude', 'ffffffff-1111-2222-3333-444444444444');
+  const written = fx.write('claude', 'ffffffff-1111-2222-3333-444444444444');
+  const absent = options.target?.(written, fx) ?? written;
   fx.launch();
   fx.launch(fx.parent, absent);
+  options.launched?.(absent);
   host.claudeParents = [...fx.catalog, ...rows(absent, fx)];
   await harness.settle();
   const counters = new PanelPerformanceCounters(0, 'receipt-reuse-stop');
@@ -2495,7 +2504,7 @@ test('a reused receipt scan reads no launch whose read stopped at the lookup of 
 });
 
 // The row of a copy of a session's transcript in another project directory.
-function rowElsewhere(fx: ReturnType<typeof receiptDispatchFixture>, row: import('./transcript').SessionFile) {
+function rowElsewhere<T extends { file: string }>(fx: ReturnType<typeof receiptDispatchFixture>, row: T) {
   const file = path.join(fx.projects, 'elsewhere', path.basename(row.file));
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.copyFileSync(row.file, file);
@@ -2529,6 +2538,82 @@ test.each(dispatchedSessionRows)(
     }
   },
 );
+
+// Fixes the platform of the file comparison in the worker source. The worker still reads its files with the rules of the host.
+function fileComparisonRule(platform: NodeJS.Platform) {
+  return (code: string) => {
+    const start = 'function dispatchFileKey(file, platform) {';
+    assert.equal(code.split(start).length - 1, 1, `the worker source has no ${start}`);
+    return code.replace(start, `${start}platform = ${JSON.stringify(platform)};`);
+  };
+}
+// The same path with each separator of the host replaced by the other separator.
+const otherSeparators = (file: string) => (file.includes('\\') ? file.replace(/\\/g, '/') : file.replace(/\//g, '\\'));
+
+// Under the POSIX rule a backslash is a name character. So a row whose path has the other separators names another file, and
+// the read stops at the file comparison. The catalog then names the startup file itself.
+test('a launch that stopped at the file comparison under the POSIX rule links after only the separators of its row change', async () => {
+  const { fx, worker, host, absent, grown, stops } = await unlinkedLaunchHarness(
+    (absent) => [{ ...absent, file: otherSeparators(absent.file) }],
+    { transform: fileComparisonRule('linux') },
+  );
+  try {
+    assert.equal((await grown()).parents.get(absent.sessionId), undefined);
+    host.claudeParents = [...fx.catalog, absent];
+    const joined = await grown();
+    assert.equal(joined.parents.get(absent.sessionId)?.parent, fx.parent.sessionId);
+    assert.equal(joined.parents.get(fx.child.sessionId)?.parent, fx.parent.sessionId);
+    assert.deepEqual(stops(), { reread: 1, session: 0, file: 2, path: 0, opening: 0 });
+  } finally {
+    worker.stop();
+    vi.unstubAllEnvs();
+  }
+});
+
+// Under the Windows rule the comparison holds two paths equal when they differ only in letter case or separators. So a row at
+// another file that changes only in those ways keeps the read at the file comparison. The reused scan reads it no more.
+test('a launch that stopped at the file comparison under the Windows rule stays unread after its row changes only in case and separators', async () => {
+  let elsewhere: import('./transcript').SessionFile | undefined;
+  const { fx, worker, host, absent, grown, stops } = await unlinkedLaunchHarness(
+    (absent, fx) => [(elsewhere = rowElsewhere(fx, absent))],
+    { transform: fileComparisonRule('win32') },
+  );
+  try {
+    assert.equal((await grown()).parents.get(absent.sessionId), undefined);
+    host.claudeParents = [...fx.catalog, { ...elsewhere!, file: otherSeparators(elsewhere!.file).toUpperCase() }];
+    const changed = await grown();
+    assert.equal(changed.parents.get(absent.sessionId), undefined);
+    assert.equal(changed.read, 0, 'the reused scan read the launch again');
+    assert.deepEqual(stops(), { reread: 0, session: 0, file: 2, path: 0, opening: 0 });
+  } finally {
+    worker.stop();
+    vi.unstubAllEnvs();
+  }
+});
+
+// The dispatched transcript lies in its own directory. The test replaces that directory before the settling passes, so the
+// read stops at the path checks. A directory outside the store decides that read, so each reused scan reads it again.
+test('a reused scan reads again a launch that stopped at the path checks', async () => {
+  const { worker, absent, grown, stops } = await unlinkedLaunchHarness((absent) => [absent], {
+    target: (written, fx) => rowElsewhere(fx, written),
+    launched: (target) => {
+      const ancestor = path.dirname(target.file);
+      fs.renameSync(ancestor, `${ancestor}-replaced`);
+      fs.mkdirSync(ancestor);
+      fs.copyFileSync(path.join(`${ancestor}-replaced`, path.basename(target.file)), target.file);
+      Object.assign(target, revisionOf(fs.statSync(target.file, { bigint: true })));
+    },
+  });
+  try {
+    const reused = await grown();
+    assert.equal(reused.parents.get(absent.sessionId), undefined);
+    assert.equal(reused.read, 1, 'the reused scan did not read the launch again');
+    assert.deepEqual(stops(), { reread: 1, session: 0, file: 0, path: 1, opening: 0 });
+  } finally {
+    worker.stop();
+    vi.unstubAllEnvs();
+  }
+});
 
 // The pass that drops the requester reads both launches again, and each read stops at the requester. The pass that restores
 // the requester reads both again. Only the first reuse holds a stop, which is the stop of the second launch.
@@ -2566,8 +2651,8 @@ test('a launch that stopped at its dispatched session links when a root change b
   }
 });
 
-// The reply at 9 minutes reuses the scan that read the store at 0 minutes, so the age bound still counts from 0 minutes, and
-// the scan at 11 minutes reads the launch that the reused scan skipped.
+// The reply at 9 minutes reuses the scan that read the store at 0 minutes. So the age bound still counts from 0 minutes. The
+// scan at 11 minutes reads the launch that the reused scan skipped.
 test('a launch that a reused scan skips is read again by the scan at the age bound', async () => {
   const { worker, absent, grown, advance, stops, counters } = await unlinkedLaunchHarness();
   try {

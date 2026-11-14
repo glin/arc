@@ -108,14 +108,16 @@ function relationshipFixture(
     standalone: settings(fx.home, { provider: childProvider, agentRun, ...(cwd ? { cwd } : {}) }),
   });
   const file = path.join(fx.home, name);
+  const ancestor = path.dirname(file);
+  fs.mkdirSync(ancestor, { recursive: true });
   const opening = Buffer.from(JSON.stringify({ sessionId: turn, cwd: cwd ?? fx.home }) + '\n' + 'x'.repeat(2048));
   fs.writeFileSync(file, opening);
   const stat = fs.statSync(file, { bigint: true });
-  const directory = fs.statSync(fx.home, { bigint: true });
+  const directory = fs.statSync(ancestor, { bigint: true });
   fx.receipts.startup(launch.launchId, {
     file,
     identity: `${stat.dev}:${stat.ino}`,
-    ancestor: fx.home,
+    ancestor,
     directory: `${directory.dev}:${directory.ino}`,
     cwd: fs.realpathSync.native(cwd ?? fx.home),
     bytes: opening.length,
@@ -1013,6 +1015,16 @@ test('the final step of each launch names it and the identities its catalog look
   assert.equal(unread.launchId, fx.launch.launchId);
   assert.equal(unread.identities, undefined);
   assert.equal(unread.stop, undefined);
+});
+
+// The transcript lies in its own directory. A new directory at the same path has another identity than the startup binding.
+test('the final step of a launch whose startup ancestor was replaced names the stop path', () => {
+  const fx = relationshipFixture('claude', 'codex', false, undefined, path.join('transcripts', 'native.jsonl'));
+  const ancestor = path.dirname(fx.file);
+  fs.renameSync(ancestor, `${ancestor}-replaced`);
+  fs.mkdirSync(ancestor);
+  const { last } = readOneLaunch(fx.receipts.relationship(fx.launch.launchId, fx.catalog));
+  assert.deepEqual([last?.reference, last?.stop], [undefined, 'path']);
 });
 
 test('receipt readers recheck early evidence after partial source reads', () => {
