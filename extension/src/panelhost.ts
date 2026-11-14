@@ -15649,7 +15649,7 @@ export class PanelProvider implements vscode.Disposable {
             );
         const sorted = orderSessionCatalog(admitted, (session) => this.activityFor(session));
         // The parents are the parents of the last walk. A listed parent comes first, at the revision of its listed row.
-        // Without a walk of the current roots, the parents are the listed rows.
+        // With no walk of these roots, they are the listed rows without child transcripts and compressed rollouts.
         if (walk) {
           const unlisted = new Set(parents.map((session) => session.file));
           const listed = sorted.filter((session) => unlisted.delete(session.file));
