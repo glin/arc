@@ -111,7 +111,7 @@ let modules: {
   BUDGET_CLOCK: number;
 };
 let workspace: BudgetWorkspace;
-let workerSource: (home: string) => string;
+let workerSource: (home: string, clock?: string) => string;
 const coverageSession = new Session();
 let coverageStarted = false;
 
@@ -159,10 +159,11 @@ export async function initializeBudgetHost(coverage = false) {
     write: false,
   }).outputFiles[0].text;
   // A frozen worker clock keeps every pass inside its deadlines, so one pass reads the same files on every run. It holds the
-  // start of the script, so the open spend band of a recently changed file applies as it does in a real host.
+  // start of the script, so the open spend band of a recently changed file applies as it does in a real host. A `clock` file
+  // adds the milliseconds that it holds, so a test moves the worker clock only when it writes the file.
   const temporary = workerTemporaryEnvironment(os.tmpdir(), fs.realpathSync.native);
-  workerSource = (home) =>
-    `performance.now=()=>0;Date.now=()=>${BUDGET_CLOCK};process.env.ARC_HOME=${JSON.stringify(home)};Object.assign(process.env,${JSON.stringify(temporary)});${bundle}`;
+  workerSource = (home, clock) =>
+    `performance.now=()=>0;Date.now=()=>${clock ? `${BUDGET_CLOCK}+Number(require('node:fs').readFileSync(${JSON.stringify(clock)},'utf8'))` : BUDGET_CLOCK};process.env.ARC_HOME=${JSON.stringify(home)};Object.assign(process.env,${JSON.stringify(temporary)});${bundle}`;
 }
 
 afterAll(async () => {
@@ -234,7 +235,7 @@ function countPost(posts: Counts, message: any): void {
 
 // One activation of the panel host. The host, its worker and its counters are real. The test owns the clock, the panel and
 // the watcher events.
-function activate(options: { stubReadPasses: boolean; coverage?: boolean }) {
+function activate(options: { stubReadPasses: boolean; coverage?: boolean; workerClock?: string }) {
   const { PanelProvider, ProgressiveWorker, CommitRepositories, RepositoryCommits } = modules;
   vi.spyOn(PanelProvider.prototype, 'wireEditorListeners').mockImplementation(() => {});
   vi.spyOn(PanelProvider.prototype, 'createRepositoryScope').mockImplementation(() => ({
@@ -253,7 +254,7 @@ function activate(options: { stubReadPasses: boolean; coverage?: boolean }) {
     { appendLine() {}, dispose() {} },
   ) as Record<string, any>;
   const worker = new ProgressiveWorker(
-    workerSource(workspace.home),
+    workerSource(workspace.home, options.workerClock),
     () => false,
     (file: string) => provider.repeatedCoverage(file, 'worker'),
     undefined,

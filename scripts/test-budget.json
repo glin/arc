@@ -123,28 +123,28 @@
       "margin": 0
     },
     "automatic save | readBytes": {
-      "reason": "Discovery reads each source once, and the receipt scan reads each receipt once. A rise means a step reads files again.",
-      "budget": 19563,
+      "reason": "Discovery reads each changed source once, and the receipt follow reads only the launches that the follow rules name. A rise means a step reads files again.",
+      "budget": 1076,
       "margin": 256
     },
     "automatic save | receiptChecks": {
-      "reason": "The scan checks each receipt file once. A rise means a step checks receipts again.",
-      "budget": 762,
+      "reason": "Each follow stats the dispatched transcript of each held link, and reads again only the launches that the follow rules name. A rise means a follow reads more launches.",
+      "budget": 12,
       "margin": 0
     },
     "automatic save | receiptEntries": {
-      "reason": "The receipt scan visits each receipt once for its pass. A rise means a step scans receipts again.",
-      "budget": 44,
+      "reason": "The frozen worker clock reads a time before the store writes, so the store stays young and each follow lists the root once. A rise means a step lists the root again or scans the store.",
+      "budget": 37,
       "margin": 0
     },
     "automatic save | receiptScanOpens": {
-      "reason": "A worker opens one receipt scan for a discovery pass. A rise means a step opens extra scans.",
-      "budget": 1,
+      "reason": "The kept scan answers this step with a follow, so the step opens no receipt scan. A rise means a step opens a scan that the kept scan could answer.",
+      "budget": 0,
       "margin": 0
     },
     "automatic save | receiptScanOpensAfterCompletion": {
-      "reason": "A completed pass keeps its receipt scan, and the next epoch reads the store from its first entry only when the kept scan cannot answer it. A spend-only pass opens none. A rise means a completion reopens a full receipt scan.",
-      "budget": 1,
+      "reason": "A completed pass keeps its receipt scan. The next epoch follows the store from it, and reads the store from its first entry only when the kept scan cannot answer it. A spend-only pass opens none. A rise means a completion reopens a full receipt scan.",
+      "budget": 0,
       "margin": 0
     },
     "automatic save | refreshCount:catalog-enumeration": {
@@ -228,28 +228,28 @@
       "margin": 0
     },
     "child watcher event | readBytes": {
-      "reason": "Discovery reads each source once, and the receipt scan reads each receipt once. A rise means a step reads files again.",
-      "budget": 21338,
+      "reason": "Discovery reads each changed source once, and the receipt follow reads only the launches that the follow rules name. A rise means a step reads files again.",
+      "budget": 5933,
       "margin": 256
     },
     "child watcher event | receiptChecks": {
-      "reason": "The scan checks each receipt file once. A rise means a step checks receipts again.",
-      "budget": 762,
+      "reason": "Each follow stats the dispatched transcript of each held link, and reads again only the launches that the follow rules name. A rise means a follow reads more launches.",
+      "budget": 136,
       "margin": 0
     },
     "child watcher event | receiptEntries": {
-      "reason": "The receipt scan visits each receipt once for its pass. A rise means a step scans receipts again.",
-      "budget": 44,
+      "reason": "The frozen worker clock reads a time before the store writes, so the store stays young and each follow lists the root once. A rise means a step lists the root again or scans the store.",
+      "budget": 37,
       "margin": 0
     },
     "child watcher event | receiptScanOpens": {
-      "reason": "A worker opens one receipt scan for a discovery pass. A rise means a step opens extra scans.",
-      "budget": 1,
+      "reason": "The kept scan answers this step with a follow, so the step opens no receipt scan. A rise means a step opens a scan that the kept scan could answer.",
+      "budget": 0,
       "margin": 0
     },
     "child watcher event | receiptScanOpensAfterCompletion": {
-      "reason": "A completed pass keeps its receipt scan, and the next epoch reads the store from its first entry only when the kept scan cannot answer it. A spend-only pass opens none. A rise means a completion reopens a full receipt scan.",
-      "budget": 1,
+      "reason": "A completed pass keeps its receipt scan. The next epoch follows the store from it, and reads the store from its first entry only when the kept scan cannot answer it. A spend-only pass opens none. A rise means a completion reopens a full receipt scan.",
+      "budget": 0,
       "margin": 0
     },
     "child watcher event | refreshCount:catalog-enumeration": {
@@ -413,7 +413,7 @@
       "margin": 0
     },
     "cold start | receiptScanOpensAfterCompletion": {
-      "reason": "A completed pass keeps its receipt scan, and the next epoch reads the store from its first entry only when the kept scan cannot answer it. A spend-only pass opens none. A rise means a completion reopens a full receipt scan.",
+      "reason": "A completed pass keeps its receipt scan. The next epoch follows the store from it, and reads the store from its first entry only when the kept scan cannot answer it. A spend-only pass opens none. A rise means a completion reopens a full receipt scan.",
       "budget": 0,
       "margin": 0
     },
@@ -518,28 +518,28 @@
       "margin": 0
     },
     "collision walk | readBytes": {
-      "reason": "Discovery reads each source once, and the receipt scan reads each receipt once. A rise means a step reads files again.",
-      "budget": 40441,
+      "reason": "Discovery reads each changed source once, and the receipt follow reads only the launches that the follow rules name. A rise means a step reads files again.",
+      "budget": 9631,
       "margin": 256
     },
     "collision walk | receiptChecks": {
-      "reason": "The scan checks each receipt file once. A rise means a step checks receipts again.",
-      "budget": 1524,
+      "reason": "Each follow stats the dispatched transcript of each held link, and reads again only the launches that the follow rules name. A rise means a follow reads more launches.",
+      "budget": 270,
       "margin": 0
     },
     "collision walk | receiptEntries": {
-      "reason": "The receipt scan visits each receipt once for its pass. A rise means a step scans receipts again.",
-      "budget": 88,
+      "reason": "The frozen worker clock reads a time before the store writes, so the store stays young and each follow lists the root once. A rise means a step lists the root again or scans the store.",
+      "budget": 74,
       "margin": 0
     },
     "collision walk | receiptScanOpens": {
-      "reason": "A worker opens one receipt scan for a discovery pass. A rise means a step opens extra scans.",
-      "budget": 2,
+      "reason": "The kept scan answers this step with a follow, so the step opens no receipt scan. A rise means a step opens a scan that the kept scan could answer.",
+      "budget": 0,
       "margin": 0
     },
     "collision walk | receiptScanOpensAfterCompletion": {
-      "reason": "A completed pass keeps its receipt scan, and the next epoch reads the store from its first entry only when the kept scan cannot answer it. A spend-only pass opens none. A rise means a completion reopens a full receipt scan.",
-      "budget": 2,
+      "reason": "A completed pass keeps its receipt scan. The next epoch follows the store from it, and reads the store from its first entry only when the kept scan cannot answer it. A spend-only pass opens none. A rise means a completion reopens a full receipt scan.",
+      "budget": 0,
       "margin": 0
     },
     "collision walk | refreshCount:catalog-enumeration": {
@@ -648,7 +648,7 @@
       "margin": 0
     },
     "completion | receiptScanOpensAfterCompletion": {
-      "reason": "A completed pass keeps its receipt scan, and the next epoch reads the store from its first entry only when the kept scan cannot answer it. A spend-only pass opens none. A rise means a completion reopens a full receipt scan.",
+      "reason": "A completed pass keeps its receipt scan. The next epoch follows the store from it, and reads the store from its first entry only when the kept scan cannot answer it. A spend-only pass opens none. A rise means a completion reopens a full receipt scan.",
       "budget": 0,
       "margin": 0
     },
@@ -748,7 +748,7 @@
       "margin": 0
     },
     "enrichment stale file | receiptScanOpensAfterCompletion": {
-      "reason": "A completed pass keeps its receipt scan, and the next epoch reads the store from its first entry only when the kept scan cannot answer it. A spend-only pass opens none. A rise means a completion reopens a full receipt scan.",
+      "reason": "A completed pass keeps its receipt scan. The next epoch follows the store from it, and reads the store from its first entry only when the kept scan cannot answer it. A spend-only pass opens none. A rise means a completion reopens a full receipt scan.",
       "budget": 0,
       "margin": 0
     },
@@ -818,28 +818,28 @@
       "margin": 0
     },
     "poll and backstop walk | readBytes": {
-      "reason": "Discovery reads each source once, and the receipt scan reads each receipt once. A rise means a step reads files again.",
-      "budget": 18487,
+      "reason": "Discovery reads each changed source once, and the receipt follow reads only the launches that the follow rules name. A rise means a step reads files again.",
+      "budget": 3082,
       "margin": 256
     },
     "poll and backstop walk | receiptChecks": {
-      "reason": "The scan checks each receipt file once. A rise means a step checks receipts again.",
-      "budget": 762,
+      "reason": "Each follow stats the dispatched transcript of each held link, and reads again only the launches that the follow rules name. A rise means a follow reads more launches.",
+      "budget": 135,
       "margin": 0
     },
     "poll and backstop walk | receiptEntries": {
-      "reason": "The receipt scan visits each receipt once for its pass. A rise means a step scans receipts again.",
-      "budget": 44,
+      "reason": "The frozen worker clock reads a time before the store writes, so the store stays young and each follow lists the root once. A rise means a step lists the root again or scans the store.",
+      "budget": 37,
       "margin": 0
     },
     "poll and backstop walk | receiptScanOpens": {
-      "reason": "A worker opens one receipt scan for a discovery pass. A rise means a step opens extra scans.",
-      "budget": 1,
+      "reason": "The kept scan answers this step with a follow, so the step opens no receipt scan. A rise means a step opens a scan that the kept scan could answer.",
+      "budget": 0,
       "margin": 0
     },
     "poll and backstop walk | receiptScanOpensAfterCompletion": {
-      "reason": "A completed pass keeps its receipt scan, and the next epoch reads the store from its first entry only when the kept scan cannot answer it. A spend-only pass opens none. A rise means a completion reopens a full receipt scan.",
-      "budget": 1,
+      "reason": "A completed pass keeps its receipt scan. The next epoch follows the store from it, and reads the store from its first entry only when the kept scan cannot answer it. A spend-only pass opens none. A rise means a completion reopens a full receipt scan.",
+      "budget": 0,
       "margin": 0
     },
     "poll and backstop walk | refreshCount:catalog-enumeration": {
@@ -943,7 +943,7 @@
       "margin": 0
     },
     "repeated record coverage | receiptScanOpensAfterCompletion": {
-      "reason": "A completed pass keeps its receipt scan, and the next epoch reads the store from its first entry only when the kept scan cannot answer it. A spend-only pass opens none. A rise means a completion reopens a full receipt scan.",
+      "reason": "A completed pass keeps its receipt scan. The next epoch follows the store from it, and reads the store from its first entry only when the kept scan cannot answer it. A spend-only pass opens none. A rise means a completion reopens a full receipt scan.",
       "budget": 0,
       "margin": 0
     },
@@ -1033,7 +1033,7 @@
       "margin": 0
     },
     "selection switch | receiptScanOpensAfterCompletion": {
-      "reason": "A completed pass keeps its receipt scan, and the next epoch reads the store from its first entry only when the kept scan cannot answer it. A spend-only pass opens none. A rise means a completion reopens a full receipt scan.",
+      "reason": "A completed pass keeps its receipt scan. The next epoch follows the store from it, and reads the store from its first entry only when the kept scan cannot answer it. A spend-only pass opens none. A rise means a completion reopens a full receipt scan.",
       "budget": 0,
       "margin": 0
     },
@@ -1108,7 +1108,7 @@
       "margin": 0
     },
     "session list update | receiptScanOpensAfterCompletion": {
-      "reason": "A completed pass keeps its receipt scan, and the next epoch reads the store from its first entry only when the kept scan cannot answer it. A spend-only pass opens none. A rise means a completion reopens a full receipt scan.",
+      "reason": "A completed pass keeps its receipt scan. The next epoch follows the store from it, and reads the store from its first entry only when the kept scan cannot answer it. A spend-only pass opens none. A rise means a completion reopens a full receipt scan.",
       "budget": 0,
       "margin": 0
     },
@@ -1238,7 +1238,7 @@
       "margin": 0
     },
     "warm start | receiptScanOpensAfterCompletion": {
-      "reason": "A completed pass keeps its receipt scan, and the next epoch reads the store from its first entry only when the kept scan cannot answer it. A spend-only pass opens none. A rise means a completion reopens a full receipt scan.",
+      "reason": "A completed pass keeps its receipt scan. The next epoch follows the store from it, and reads the store from its first entry only when the kept scan cannot answer it. A spend-only pass opens none. A rise means a completion reopens a full receipt scan.",
       "budget": 0,
       "margin": 0
     },

@@ -318,7 +318,9 @@ test.each([
   vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
   vi.setSystemTime(modules.BUDGET_CLOCK);
   const interval = vi.spyOn(globalThis, 'setInterval').mockImplementation((() => 0) as unknown as typeof setInterval);
-  const active = activate({ stubReadPasses: true });
+  const workerClock = path.join(tempDir('discovery-pass-clock-'), 'clock');
+  fs.writeFileSync(workerClock, '0');
+  const active = activate({ stubReadPasses: true, workerClock });
   const { provider, worker } = active;
   const send = worker.run.bind(worker);
   let requests = 0;
@@ -355,6 +357,8 @@ test.each([
     await active.settle();
     const unchanged = requests;
     requests = receiptBytes = receiptSlices = 0;
+    // The worker clock passes the full pass age bound, so the epoch of the native write reads the store from its first entry.
+    fs.writeFileSync(workerClock, String(10 * 60_000 + 1));
     const native = workspace.parents[listed === 2 ? 0 : 20];
     vi.advanceTimersByTime(1000);
     workspace.growSource(native, Date.now());
