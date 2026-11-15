@@ -317,7 +317,7 @@ interface ReceiptScan {
   rootNames: Map<string, string>;
   // Each launch whose last read used the relationship cache.
   cacheLaunches: Set<string>;
-  // The published file that the last read of each launch threw on. `stable` is true when the read before took the same stat.
+  // The published file that the last read of each launch threw on. `stable` is true when the read before took the same stats.
   unread: Map<string, { name: string; revision?: string; stable: boolean }>;
   // The root entries that the last read of each launch found absent.
   absent: Map<string, string[]>;
@@ -394,7 +394,8 @@ function updateReceiptCatalog(scan: ReceiptScan, catalog: SessionFile[]): void {
 // A completed scan answers a new epoch only within the full pass age bound of the host's walk gate, from the opening of the
 // scan that last read the store from its first entry.
 const RECEIPT_SCAN_REUSE_MAX_AGE_MS = 10 * 60_000;
-// The last completed receipt scan, which the next epoch reuses when the store proves that it did not change.
+// The last completed receipt scan. The next epoch reuses it unless keptScanRefusal names a reason, and follows a store that
+// moved.
 let keptReceiptScan: ReceiptScan | null = null;
 // Why the last receipt scan of this worker closed. The next scan counts it when it opens.
 let receiptScanClosed: 'epoch' | 'store' | 'refusal' | 'completion' | undefined;
@@ -1801,8 +1802,8 @@ async function execute(
     // A replaced store directory starts the scan again from its first entry, here and before publication. Other store changes
     // keep the scan's position.
     if (receiptScan && receiptScan.store.storeIdentity() !== receiptScan.storeIdentity) closeReceiptScan('store');
-    // The scan of a new epoch reuses the last completed scan when the store proves that it did not change. Otherwise it reads
-    // the store from its first entry.
+    // The scan of a new epoch reuses the last completed scan unless keptScanRefusal names a reason, and follows a store that
+    // moved. Otherwise it reads the store from its first entry.
     if (!receiptScan) {
       const kept = keptReceiptScan;
       keptReceiptScan = null;
@@ -2053,7 +2054,8 @@ async function execute(
       if (!proven || activeReceipts.unread.has(launchId) || listed) activeReceipts.owed.add(launchId);
       else activeReceipts.owed.delete(launchId);
     }
-    // An owed launch whose published file kept one stat across two reads and is older than the age bound withholds nothing.
+    // An owed launch whose read threw withholds nothing once two reads take the same stats of its published entries, and the
+    // newest of them is older than the age bound.
     // The full scan at the age bound reads a later write in place. Each follow still reads the launch again.
     const withheld = [...activeReceipts.owed].some((launchId) => {
       const unread = activeReceipts.unread.get(launchId);

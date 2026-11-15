@@ -311,8 +311,9 @@ export interface DiscoveryCharges
   receiptScanReuseUnlinkedFile?: number;
   receiptScanReuseUnlinkedPath?: number;
   receiptScanReuseUnlinkedOpening?: number;
-  // Each reused scan that followed a moved store or owed launches. A young follow ran while a store directory was too young
-  // to read. An unproved reused scan saw the revision move or read none. Root and cache name the part that the follow read.
+  // Each reused scan that followed a moved store or owed launches. A young follow reads the store at once, while a store
+  // directory is too young to prove a revision. An unproved reused scan saw the revision move or read none. Root and cache
+  // name the part that the follow read.
   // The names are the root entries that follows listed, and the changed names are the launches whose names differed.
   // The launches are the reads that follows sent. The owed launches are the size of the owed set at each complete reply.
   receiptScanFollows?: number;

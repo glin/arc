@@ -240,9 +240,13 @@ test('each write of a store root entry creates the entry, through any sync, call
       const call = match[1] ?? match[2];
       const args = argumentsAt(source, match.index + match[0].length - 1);
       if (!args.some((arg) => rootPath.test(arg))) continue;
-      const flags = args.slice(1).join(',');
+      // `open` takes its flags as the second argument. `writeFile` takes them as the `flag` property of its options.
+      const flags = call === 'open' ? (args[1] ?? '') : call === 'writeFile' ? (args[2] ?? '') : '';
       if (call === 'open' && !/['"][wa]|\+['"]|O_WRONLY|O_RDWR|O_CREAT|O_TRUNC|O_APPEND/.test(flags)) continue;
-      const exclusiveCreate = /['"]wx['"]|O_EXCL/.test(flags) && ['writeFile', 'open'].includes(call);
+      const exclusiveCreate =
+        call === 'open'
+          ? /['"]wx['"]|O_EXCL/.test(flags)
+          : call === 'writeFile' && /\bflag\s*:\s*(?:['"]wx['"]|[^,}]*O_EXCL)/.test(flags);
       if (['mkdir', 'exclusive', 'mark'].includes(call) || exclusiveCreate) creators.push(`${file} ${call}`);
       else refused.push(`${file}: ${match[0]}${args.join(', ').slice(0, 100)})`);
     }

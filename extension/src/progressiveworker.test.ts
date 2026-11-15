@@ -102,8 +102,9 @@ function ageReceiptStore(fx: ReturnType<typeof receiptDispatchFixture>, now = Da
   for (const directory of [fx.receipts.root, path.join(fx.home, 'cache', 'dispatch-relationships')])
     if (fs.existsSync(directory)) fs.utimesSync(directory, time, time);
 }
-// A worker clock an hour after the real time, so each store write of the test reads as older than the recent-write margin.
-const QUIET_RECEIPT_CLOCK = 'const quietClock=Date.now;Date.now=()=>quietClock()+3_600_000;';
+// A frozen worker clock an hour after the real time of the call. Each store write of the test reads as older than the
+// recent-write margin, and a completed scan never ages past the full pass age bound.
+const quietReceiptClock = () => `Date.now=()=>${Date.now() + 3_600_000};`;
 // The worker source with a completed receipt scan that never answers a new epoch, so each epoch reads the store from its
 // first entry.
 function fullReceiptScans(code: string): string {
@@ -213,7 +214,7 @@ test('a receipt created during a pass appears by the next pass', async () => {
   const turn = 'await receiptScanTurn();';
   assert.ok(source.includes(turn));
   const worker = new ProgressiveWorker(
-    `process.env.ARC_HOME=${JSON.stringify(fx.home)};performance.now=()=>0;${QUIET_RECEIPT_CLOCK}let paused=false;const gateFs=require('node:fs'),gatePort=require('node:worker_threads').parentPort;` +
+    `process.env.ARC_HOME=${JSON.stringify(fx.home)};performance.now=()=>0;${quietReceiptClock()}let paused=false;const gateFs=require('node:fs'),gatePort=require('node:worker_threads').parentPort;` +
       source.replace(
         turn,
         `${turn}if(!paused){paused=true;gatePort.postMessage({repeatedCoverage:'receipt-paused'});while(!gateFs.existsSync(${JSON.stringify(release)})&&!signal.aborted)${turn}}`,
@@ -2381,6 +2382,119 @@ test('an incomplete witness withholds the store revision while it is young, and 
   }
 });
 
+// A tool outside Arc puts a directory or a symbolic link at the anchor name of a launch. The read rejects the entry and
+// records its stat. A young entry withholds the store revision, and an old unchanged one withholds nothing after two reads.
+test.for(['directory', 'symbolic link'] as const)(
+  'an anchor replaced by a %s withholds the store revision while it is young, and an old unchanged one withholds nothing',
+  async (kind, { skip }) => {
+    const { fx, worker, once, settle, age, advance } = await receiptWalkHarness();
+    try {
+      fx.launch(fx.parent, fx.child);
+      await settle();
+      const { launchId } = fx.launch(fx.parent, fx.grandchild);
+      const anchor = path.join(fx.receipts.root, `${launchId}.json`);
+      fs.rmSync(anchor);
+      if (kind === 'directory') fs.mkdirSync(anchor);
+      else {
+        try {
+          fs.symlinkSync(path.join(fx.receipts.root, launchId, 'receipt.json'), anchor, 'file');
+        } catch (error) {
+          if (process.platform !== 'win32' || (error as NodeJS.ErrnoException).code !== 'EPERM') throw error;
+          skip();
+          return;
+        }
+      }
+      fs.lutimesSync(anchor, Date.now() / 1000, Date.now() / 1000);
+      age();
+      for (const read of ['first', 'second']) {
+        const young = await once();
+        assert.ok(young?.kind === 'claude-children');
+        assert.equal(young.receiptRevision, undefined, `the ${read} read of a young ${kind} reported a store revision`);
+      }
+      // The age bound opens a scan from the first entry, which reads the anchor once.
+      advance();
+      const full = await once();
+      assert.ok(full?.kind === 'claude-children');
+      assert.equal(full.receiptRevision, undefined, `a single read of an old ${kind} reported a store revision`);
+      const old = await once();
+      assert.ok(old?.kind === 'claude-children');
+      assert.notEqual(old.receiptRevision, undefined, `an old unchanged ${kind} withheld the store revision`);
+      assert.equal(linkedParent(old, fx.grandchild.sessionId), undefined);
+    } finally {
+      worker.stop();
+      vi.unstubAllEnvs();
+    }
+  },
+);
+
+// A witness with a wrong digest fails the identity check of its binding. The binding stays old and unchanged while the
+// witness changes between two reads, so the launch withholds the store revision until a third read takes the same stats.
+test('a witness that changes between two failed identity checks withholds the store revision', async () => {
+  const { fx, worker, once, settle, age } = await receiptWalkHarness();
+  try {
+    fx.launch(fx.parent, fx.child);
+    await settle();
+    const { launchId } = fx.launch(fx.parent, fx.grandchild);
+    const witness = path.join(fx.receipts.root, `${launchId}.accepted.json`);
+    const forge = (digit: string) =>
+      fs.writeFileSync(
+        witness,
+        JSON.stringify({ ...JSON.parse(fs.readFileSync(witness, 'utf8')), sha256: digit.repeat(64) }),
+      );
+    forge('0');
+    age();
+    const first = await once();
+    assert.ok(first?.kind === 'claude-children');
+    assert.equal(first.receiptRevision, undefined, 'the first read of a forged witness reported a store revision');
+    forge('1');
+    const changed = await once();
+    assert.ok(changed?.kind === 'claude-children');
+    assert.equal(
+      changed.receiptRevision,
+      undefined,
+      'a witness that changed between two reads reported a store revision',
+    );
+    const unchanged = await once();
+    assert.ok(unchanged?.kind === 'claude-children');
+    assert.notEqual(unchanged.receiptRevision, undefined, 'an old unchanged witness withheld the store revision');
+    assert.equal(linkedParent(unchanged, fx.grandchild.sessionId), undefined);
+  } finally {
+    worker.stop();
+    vi.unstubAllEnvs();
+  }
+});
+
+// The binding of a launch leaves its directory while its witness stays listed. The read finds the binding missing and names
+// the witness, so the launch withholds the store revision. The next follow after the binding returns links the launch.
+test('a listed witness whose binding is missing withholds the store revision until the binding returns', async () => {
+  const { fx, worker, once, settle, age } = await receiptWalkHarness();
+  try {
+    fx.launch(fx.parent, fx.child);
+    await settle();
+    const { launchId } = fx.launch(fx.parent, fx.grandchild);
+    const binding = path.join(fx.receipts.root, launchId, 'accepted.json');
+    fs.renameSync(binding, `${binding}.away`);
+    age();
+    for (const read of ['first', 'second']) {
+      const missing = await once();
+      assert.ok(missing?.kind === 'claude-children');
+      assert.equal(
+        missing.receiptRevision,
+        undefined,
+        `the ${read} read of a missing binding reported a store revision`,
+      );
+      assert.equal(linkedParent(missing, fx.grandchild.sessionId), undefined);
+    }
+    fs.renameSync(`${binding}.away`, binding);
+    const returned = await once();
+    assert.ok(returned?.kind === 'claude-children');
+    assert.equal(linkedParent(returned, fx.grandchild.sessionId), fx.parent.sessionId);
+  } finally {
+    worker.stop();
+    vi.unstubAllEnvs();
+  }
+});
+
 // The listing returns each launch directory first. At the other names, the hook publishes a refusal of the linked launch.
 // So the scan reads the launch before the refusal and lists the refusal after it.
 test('a refusal that a scan lists after it read the launch drops the link at the next follow', async () => {
@@ -3896,7 +4010,7 @@ test('receipt discovery defers a changing accepted source until a quiet epoch', 
   fx.launch();
   const prefix = `const receiptFs=require('node:fs');const receiptOpen=receiptFs.openSync,receiptRead=receiptFs.readSync;const receiptFiles=new Map();let receiptStartup=false,receiptChanged=false;receiptFs.openSync=function(p,...a){const fd=receiptOpen.call(this,p,...a);receiptFiles.set(fd,String(p));if(String(p).endsWith('startup.json'))receiptStartup=true;return fd;};receiptFs.readSync=function(fd,...a){const n=receiptRead.call(this,fd,...a);if(receiptStartup&&!receiptChanged&&receiptFiles.get(fd)===${JSON.stringify(fx.child.file)}){receiptChanged=true;receiptFs.appendFileSync(${JSON.stringify(fx.child.file)},String.fromCharCode(10));}return n;};`;
   const worker = new ProgressiveWorker(
-    `process.env.ARC_HOME=${JSON.stringify(fx.home)};` + QUIET_RECEIPT_CLOCK + prefix + source,
+    `process.env.ARC_HOME=${JSON.stringify(fx.home)};` + quietReceiptClock() + prefix + source,
   );
   const request = {
     kind: 'claude-children' as const,
@@ -19160,7 +19274,7 @@ for (const childAgent of ['codex', 'claude'] as const)
     async () => {
       const { fx, request, listed } = compressedRequesterFixture(childAgent);
       const worker = new ProgressiveWorker(
-        `process.env.ARC_HOME=${JSON.stringify(fx.home)};` + QUIET_RECEIPT_CLOCK + source,
+        `process.env.ARC_HOME=${JSON.stringify(fx.home)};` + quietReceiptClock() + source,
       );
       try {
         for (const [generation, sent] of [listed, request].entries()) {
@@ -19258,7 +19372,7 @@ test.skipIf(!zstdCompress)(
         if (fs.existsSync(directory)) fs.utimesSync(directory, hourAgo, hourAgo);
     };
     const worker = new ProgressiveWorker(
-      `process.env.ARC_HOME=${JSON.stringify(fx.home)};` + QUIET_RECEIPT_CLOCK + source,
+      `process.env.ARC_HOME=${JSON.stringify(fx.home)};` + quietReceiptClock() + source,
     );
     const epoch = async (sent: typeof listed | typeof request, generation: number) => {
       if (generation % 2) age();
@@ -19312,7 +19426,7 @@ test.skipIf(!zstdCompress)(
     for (const directory of [fx.receipts.root, path.join(fx.home, 'cache', 'dispatch-relationships')])
       if (fs.existsSync(directory)) fs.utimesSync(directory, hourAgo, hourAgo);
     const worker = new ProgressiveWorker(
-      `process.env.ARC_HOME=${JSON.stringify(fx.home)};` + QUIET_RECEIPT_CLOCK + source,
+      `process.env.ARC_HOME=${JSON.stringify(fx.home)};` + quietReceiptClock() + source,
     );
     const epoch = async (sent: typeof listed, generation: number) => {
       const counts = { reuses: 0, reread: 0, session: 0 };
