@@ -5966,7 +5966,7 @@ test('a refresh stamps the published membership when a source grew after its com
 
 for (const route of ['reused', 'targeted', 'full walk'] as const) {
   for (const replaced of ['Claude child', 'Codex rollout'] as const) {
-    test(`a ${route} catalog refresh replaces an unselected ${replaced}`, async () => {
+    test(`a ${route} catalog refresh checks an unselected ${replaced} only when it walks, and the walk lists its new identity`, async () => {
       const directory = tempDir('catalog-held-identities-');
       const fixed = new Date('2026-08-25T12:00:00Z');
       const childFile = path.join(directory, 'agent-child.jsonl');
@@ -6016,7 +6016,6 @@ for (const route of ['reused', 'targeted', 'full walk'] as const) {
       });
       provider.repositoryScopeRoots = [directory];
       provider.showing = parent.sessionId;
-      provider.catalogWalked = route === 'full walk';
       provider.targetedRefreshPaths = route === 'targeted' ? [parent.file] : null;
       provider.partial = [parent, otherParent, child, codex];
       provider.catalog = { sessions: provider.partial };
@@ -6026,6 +6025,7 @@ for (const route of ['reused', 'targeted', 'full walk'] as const) {
       provider.codexStats = stats;
       let walks = 0;
       provider.allSessions = (reuse: boolean) => {
+        provider.catalogWalked = !reuse;
         if (reuse) return provider.catalog.sessions;
         walks++;
         provider.catalog = {
@@ -6056,6 +6056,13 @@ for (const route of ['reused', 'targeted', 'full walk'] as const) {
       }
       assert.equal(stats.get(rollout)?.ino, codex.ino, 'the inactive cache did not retain the original identity');
       await provider.refresh(false, route !== 'full walk');
+      if (route !== 'full walk') {
+        // A refresh of the held catalog checks no unselected file. The next refresh that walks lists the new identity.
+        assert.deepEqual(checked, [], 'a refresh of the held catalog checked an unselected file');
+        assert.equal(walks, 0, 'a refresh of the held catalog walked');
+        provider.targetedRefreshPaths = null;
+        await provider.refresh(false, false);
+      }
       for (const held of [child, codex]) {
         const published = provider.authoritativeCatalog.find((source: any) => source.file === held.file);
         if (held.file === changedFile) {
@@ -6069,13 +6076,9 @@ for (const route of ['reused', 'targeted', 'full walk'] as const) {
       assert.notEqual(provider.sessionReadDiscoveryRevision, oldMembership);
       assert.ok(checked.includes(childFile), 'the refresh omitted the held child identity');
       assert.ok(checked.includes(rollout), 'the refresh omitted the cached Codex identity');
-      assert.equal(walks, route === 'full walk' ? 2 : 1);
-      assert.equal(checked.includes(parent.file), false, 'the refresh repeated the checked parent identity');
-      assert.equal(
-        checked.includes(otherParent.file),
-        route !== 'full walk',
-        'the refresh omitted an unchecked parent identity',
-      );
+      assert.equal(walks, 2);
+      assert.equal(checked.includes(parent.file), false, 'the walk checked a parent that it listed');
+      assert.equal(checked.includes(otherParent.file), false, 'the walk checked a parent that it listed');
       assert.equal(discoveries, 1, 'catalog reuse skipped child discovery after replacement');
     });
   }
@@ -11167,11 +11170,11 @@ test('a refresh that returns after its discovery wait records only the stages th
   });
 });
 
-test('heldIdentityStat counts each file check of the held-file sweep of a refresh of one named path', async () => {
+test('heldIdentityStat counts each file check of the held-file sweep of a walk, and a refresh of one named path sweeps nothing', async () => {
   const checked: string[] = [];
   // The named path keeps its revision, so the refresh keeps the held catalog.
   let named: SessionFile | undefined;
-  const { provider, claude, claudeWalk, work } = stagedRefreshHarness({
+  const { provider, claude, claudeWalk, work, refreshes } = stagedRefreshHarness({
     revalidatedCatalogPaths,
     fs: { ...fs, statSync: () => ({}) },
     fileRevisionOf: () => ({ size: named!.size, mtimeMs: named!.mtimeMs, dev: named!.dev, ino: named!.ino }),
@@ -11191,13 +11194,17 @@ test('heldIdentityStat counts each file check of the held-file sweep of a refres
     ...['second', 'third'].map((name) => ({ ...claude, file: `fixture/${name}.jsonl`, sessionId: name })),
   );
   await provider.refresh(true);
+  assert.ok(checked.length > 0, 'the walk checked no held file');
+  assert.ok(!checked.includes(claude.file), 'the walk checked a parent that it listed');
+  assert.equal(work.get('heldIdentityStat'), checked.length, 'the counter missed or added a file check');
   checked.length = 0;
   work.clear();
+  refreshes.clear();
   provider.targetedRefreshPaths = [claude.file];
   await provider.refresh(true, true);
-  assert.ok(checked.length > 1, `the sweep checked ${checked.length} files`);
-  assert.ok(!checked.includes(claude.file), 'the sweep checked the named path');
-  assert.equal(work.get('heldIdentityStat'), checked.length, 'the counter missed or added a file check');
+  assert.deepEqual(checked, [], 'a refresh of the held catalog checked a held file');
+  assert.equal(work.get('heldIdentityStat'), undefined, 'a refresh with no sweep counted a file check');
+  assert.equal(refreshes.has('refresh-stage:held-sweep'), false, 'a refresh with no sweep recorded the sweep stage');
 });
 
 test('a cold handoff accepts the catalog without enumerating the rollout directory twice', async () => {
@@ -13132,21 +13139,30 @@ test('a rollout created while the cold pass runs lists with the production watch
 test('a complete walk started by a replacement during the cold pass keeps the rows it found after the pass settles', async () => {
   const race = coldPassRaceHarness();
   const { provider, files, writeRollout, root } = race;
-  const seeded = race.seed('seeded');
+  // An idle rollout, so a walk takes the stat that the cache read within the last minute.
+  const idle = new Date(Date.now() - 24 * 60 * 60_000);
+  const seeded = writeRollout('seeded');
+  fs.utimesSync(seeded, idle, idle);
+  provider.codexMetas.get(seeded);
+  provider.savedCodexOpeningFiles = [...provider.codexMetas.keys()];
   const unseeded = writeRollout('unseeded');
   provider.refreshFrom('shell-ready', true);
   await race.untilEnumerated();
   await race.settle();
   const extra = writeRollout('extra');
-  const inode = fs.statSync(seeded, { bigint: true }).ino;
+  provider.watching = true;
+  const inode = provider.codexStats.get(seeded)?.ino;
   const replacement = `${seeded}.next`;
   fs.writeFileSync(
     replacement,
     `${JSON.stringify({ type: 'session_meta', payload: { id: 'seeded', cwd: path.join(root, 'project') } })}\n`,
   );
+  fs.utimesSync(replacement, idle, idle);
   fs.renameSync(replacement, seeded);
   assert.notEqual(fs.statSync(seeded, { bigint: true }).ino, inode, 'the rewrite kept the file identity');
-  provider.refreshFrom('replaced', false, true);
+  // A watcher batch names the replaced file. Its walk over the listing of the pass takes the held stat, and the held-file
+  // sweep of that walk finds the replacement and walks the rollout tree.
+  provider.refreshFrom('replaced', false, false, [seeded]);
   await race.settle();
   const afterWalk = files()?.includes(extra) ?? false;
   race.finishPass();
@@ -16494,7 +16510,10 @@ test('each catalog walk names its requester, and the re-list after a replaced fi
   const walkCounts = () =>
     Object.fromEntries(Object.entries(counters.snapshot().work).filter(([name]) => name.startsWith('walk:')));
   await requested(() => provider.refreshFrom('startup', true));
+  // A walk whose held-file sweep finds a replaced file lists the catalog again.
+  replaced = [file];
   await requested(() => provider.refreshFrom('poll'));
+  replaced = [];
   // A known path that changed identity fails targeted revalidation and walks.
   const copy = `${file}.copy`;
   fs.copyFileSync(file, copy);
@@ -16509,8 +16528,6 @@ test('each catalog walk names its requester, and the re-list after a replaced fi
     }),
   );
   assert.equal(counters.snapshot().watcherDecisions.targeted, 1, 'the watcher batch was not targeted');
-  replaced = [file];
-  await releaseAll(provider.refresh(true, true));
   assert.equal(walks.length, 4);
   assert.deepEqual(walkCounts(), {
     'walk:replacedFiles': 1,
@@ -16581,8 +16598,8 @@ test('each catalog walk names its requester, and the re-list after a replaced fi
 // Claude transcripts and Codex rollouts on disk, with the poll tick, the watcher batches, the clock and the directory
 // times driven by the test. `create` writes a file and moves its directory's time to the test clock, as the filesystem
 // does for a new entry. `hidden` holds project directories that the walk lists but leaves out of its directory
-// evidence, as when the poll's stat list misses a directory.
-function pollWalkHarness() {
+// evidence, as when the poll's stat list misses a directory. `scope` replaces the harness's module bindings.
+function pollWalkHarness(scope: Record<string, unknown> = {}) {
   const projects = tempDir('poll-walk-projects-');
   const project = path.join(projects, 'repo');
   const other = path.join(projects, 'other');
@@ -16596,6 +16613,8 @@ function pollWalkHarness() {
     directoryTimes.set(path.dirname(file), now);
     return file;
   };
+  // A delete or a rename over a file moves its directory's time to the test clock.
+  const moved = (file: string) => directoryTimes.set(path.dirname(file), now);
   const parent = path.join(project, 'parent.jsonl');
   fs.writeFileSync(parent, '{"type":"user"}\n');
   const subagents = path.join(project, 'parent', 'subagents');
@@ -16636,6 +16655,7 @@ function pollWalkHarness() {
       unknownPathShapes,
       unknownPathExtension,
       POLL_INTERVAL_MILLISECONDS: 5_000,
+      ...scope,
     },
     [
       'startPolling',
@@ -16734,6 +16754,7 @@ function pollWalkHarness() {
     subagents,
     counters,
     create,
+    moved,
     discoveries: () => discoveries,
     start,
     poll,
@@ -17613,6 +17634,93 @@ test('a child event that names a replaced transcript walks and lists the replace
   }
 });
 
+test('a watcher refresh that names one rollout checks no other listed file', async () => {
+  const { writeRollout, start, watch, walks, counters } = pollWalkHarness({ replacedCatalogFiles });
+  const rollouts = Array.from({ length: 8 }, (_, index) => writeRollout(`listed-${index}`));
+  try {
+    await start();
+    const listed = new Set(rollouts.map(normalizeFsPath));
+    const swept = () => counters.snapshot().work.heldIdentityStat ?? 0;
+    const before = swept();
+    assert.ok(before >= rollouts.length, 'the startup walk did not check the held rollouts');
+    const checks = vi.spyOn(mutableFs.promises, 'stat');
+    const syncChecks = vi.spyOn(mutableFs, 'statSync');
+    syncBuiltinESMExports();
+    let calls: unknown[][];
+    try {
+      fs.appendFileSync(rollouts[0], '{}\n');
+      await watch([[rollouts[0], 'change']]);
+      calls = [...checks.mock.calls, ...syncChecks.mock.calls];
+    } finally {
+      checks.mockRestore();
+      syncChecks.mockRestore();
+      syncBuiltinESMExports();
+    }
+    const checked = calls.filter(([file]) => listed.has(normalizeFsPath(String(file))));
+    assert.ok(checked.length <= 2, `the refresh made ${checked.length} checks of listed files`);
+    assert.equal(swept(), before, 'the refresh of the held catalog counted a held-file check');
+    assert.deepEqual(walks(), { 'walk:requested:startup': 1 }, 'the refresh of one named rollout walked');
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('a rollout replaced in a polled directory lists its new identity after the poll walk', async () => {
+  const { provider, writeRollout, start, poll, moved, walks } = pollWalkHarness({ replacedCatalogFiles });
+  const kept = writeRollout('kept');
+  const replaced = writeRollout('replaced');
+  // Idle rollouts, so a walk takes the held stat of a rollout that it read within the last minute.
+  const idle = new Date(Date.parse('2026-10-26T12:00:00.000Z'));
+  for (const file of [kept, replaced]) fs.utimesSync(file, idle, idle);
+  try {
+    await start();
+    provider.showing = 'kept';
+    provider.codexStats = new CodexStatCache(undefined, () => Date.now());
+    const held = provider.codexStats.get(replaced);
+    const next = `${replaced}.next`;
+    fs.writeFileSync(next, fs.readFileSync(replaced));
+    fs.utimesSync(next, idle, idle);
+    fs.renameSync(next, replaced);
+    moved(replaced);
+    assert.equal(provider.codexStats.get(replaced)?.ino, held?.ino, 'the cache did not hold the old identity');
+    await poll();
+    const row = provider.authoritativeCatalog.find(
+      (session: SessionFile) => normalizeFsPath(session.file) === normalizeFsPath(replaced),
+    );
+    assert.equal(String(row?.ino), String(readRolloutStat(replaced)?.ino), 'the list kept the old identity');
+    assert.equal(walks()['walk:requested:poll:directory'], 1, 'the poll did not walk for the moved directory');
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+for (const check of ['directory', 'backstop'] as const) {
+  test(`a rollout deleted from the list's directory leaves the list at the ${check} walk`, async () => {
+    const { provider, writeRollout, start, poll, moved, walks, listed } = pollWalkHarness({ replacedCatalogFiles });
+    writeRollout('kept');
+    const deleted = writeRollout('deleted');
+    try {
+      await start();
+      provider.showing = 'kept';
+      fs.rmSync(deleted);
+      if (check === 'directory') moved(deleted);
+      else {
+        // A directory whose time never moves, as on a synced folder, leaves the backstop walk.
+        provider.pollGate = new PollDirectoryGate(async () => ({ mtimeMs: 0, print: '0' }));
+        provider.catalogWalk = {
+          ...provider.catalogWalk,
+          startedAt: provider.catalogWalk.startedAt - POLL_BACKSTOP_WALK_MS,
+        };
+      }
+      await poll();
+      assert.ok(!listed(deleted), 'the deleted rollout stayed listed');
+      assert.equal(walks()[`walk:requested:poll:${check}`], 1, `the poll did not take the ${check} walk`);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+}
+
 test('every refresh caller names its reason', () => {
   const bare: string[] = [];
   for (const [name, receiver] of [
@@ -17671,8 +17779,9 @@ test('replacement recovery lists Codex rollouts through one asynchronous walk', 
   const reads = vi.spyOn(mutableFs, 'readdirSync');
   syncBuiltinESMExports();
   try {
-    await releaseAll(provider.refresh(true, true));
-    assert.equal(walks.length, 2, 'replacement recovery did not walk exactly once');
+    // The walk of the refresh and the walk of the recovery.
+    await releaseAll(provider.refresh(true));
+    assert.equal(walks.length, 3, 'replacement recovery did not walk exactly once');
     assert.equal(
       (reads.mock.calls as unknown[][]).filter((call) => String(call[0]).startsWith(root)).length,
       0,
@@ -22706,6 +22815,8 @@ test(
       },
       'catalog-overlap': async (side, pick) => {
         const { provider } = side;
+        // The listing stands for a walk, so the refresh waits at its held-file sweep and the selection overlaps it.
+        provider.catalogWalked = true;
         if (side.reference) {
           await select(side, side.panels[0], pick.session);
           await provider.refresh(false, true);

@@ -11599,6 +11599,8 @@ export class PanelProvider implements vscode.Disposable {
           walkReasons = [refreshReason];
         }
       }
+      // Whether this refresh listed the catalog from a walk, read before prompt admission yields to other catalog readers.
+      const listingWalked = this.catalogWalked || codexRelisted !== null;
       // A discovery request of this refresh also returns the time that it waited for the worker in `discoveryWaitMs`.
       const humanPromptWork: DiscoveryWork & { checks: number } = {
         bytes: 0,
@@ -11702,22 +11704,16 @@ export class PanelProvider implements vscode.Disposable {
         return;
       }
       // The first row of the shown session, which the held listing of the next poll's refresh checks again.
-      let shownSource: SessionFile | undefined;
-      if (!selectedOnly) {
-        const checkedPaths = new Set(
-          (targetedRefreshPaths?.length
-            ? targetedRefreshPaths
-            : [(shownSource = all.find((session) => session.sessionId === this.showing))?.file].filter(
-                (file): file is string => file !== undefined,
-              )
-          ).map(normalizeFsPath),
-        );
+      const shownSource =
+        selectedOnly || targetedRefreshPaths?.length
+          ? undefined
+          : all.find((session) => session.sessionId === this.showing);
+      // A refresh that walked checks the identities that its walk did not read again: each Codex row, whose stat the walk
+      // can reuse, and each child row, which discovery lists. A refresh of the held catalog checks only the files that its
+      // listing revalidates.
+      if (!selectedOnly && listingWalked) {
         const heldSources = all.filter(
-          (session) =>
-            session.agent === 'codex' ||
-            (!codexOnly &&
-              (session.childTranscript === true ||
-                (!this.catalogWalked && !checkedPaths.has(normalizeFsPath(session.file))))),
+          (session) => session.agent === 'codex' || (!codexOnly && session.childTranscript === true),
         );
         const sweep = { checks: 0 };
         const sweepStarted = performance.now();
