@@ -291,6 +291,17 @@ export interface DispatchRelationshipStep extends DispatchRelationshipAllowance 
   stop?: DispatchRelationshipStop;
   // The dispatched transcript of a found reference, with the revision that its opening check read.
   startup?: DispatchStartupRevision;
+  // The final step of a launch whose read used the relationship cache, because its working directory was missing.
+  cache?: true;
+  // The final step of a launch whose read stopped on its anchor or a binding names the root entry that publishes that file,
+  // with true when the file was missing.
+  unread?: { name: string; missing: boolean };
+}
+// The names in the store root by launch ID, sorted and joined, with a slash after a directory name. `complete` is true after
+// the listing read the last entry.
+export interface DispatchRootNames {
+  names: Map<string, string>;
+  complete: boolean;
 }
 export interface DispatchStartupRevision {
   file: string;
@@ -303,6 +314,16 @@ type RelationshipScan<T> = Generator<DispatchRelationshipStep, T, DispatchRelati
 export interface DispatchStoreRevision {
   store: string;
   observedAt: number;
+}
+// The device, inode and modification time of the store root and of the relationship cache directory. A part is an empty
+// string for a missing directory, undefined for a directory that is too young, and null for a path that cannot be read or
+// holds no directory.
+export interface DispatchStoreRevisions {
+  root: string | null | undefined;
+  cache: string | null | undefined;
+}
+export function joinedStoreRevision({ root, cache }: DispatchStoreRevisions): string | undefined {
+  return root == null || cache == null ? undefined : `${root}\0${cache}`;
 }
 // A write inside this margin of a stat can keep the directory's modification time on a filesystem with coarse times, so a
 // directory this young proves nothing about the next write.
@@ -333,6 +354,10 @@ class RelationshipReader {
   identities?: DispatchRelationshipIdentities;
   stop?: DispatchRelationshipStop;
   startup?: DispatchStartupRevision;
+  cache?: true;
+  unread?: { name: string; missing: boolean };
+  // True after a path check found no entry.
+  missing = false;
   readonly revisions = new Map<string, string | null>();
   readonly digests = new Map<string, string>();
   private readonly descriptors = new Set<number>();
@@ -392,8 +417,10 @@ class RelationshipReader {
         const physical = yield* this.operation('checks', () => fs.realpathSync.native(current));
         if (physical === '/private/tmp') break;
       }
-      if (!(yield* this.stat(current)) && !allowMissing)
+      if (!(yield* this.stat(current)) && !allowMissing) {
+        this.missing = true;
         throw new Error('The dispatch relationship path is unavailable.');
+      }
       if (current === paths.dirname(current)) break;
     }
   }
@@ -487,19 +514,22 @@ export class DispatchReceipts {
   // The device, inode and modification time of the store and relationship cache directories, or undefined when a directory is
   // too young to prove the next write or cannot be read. Writes inside a launch directory wait for the full pass age bound.
   storeRevision(now = Date.now()): string | undefined {
+    return joinedStoreRevision(this.storeRevisions(now));
+  }
+  storeRevisions(now = Date.now()): DispatchStoreRevisions {
     const paths = this.platform === 'win32' ? path.win32 : path.posix;
-    const parts: string[] = [];
-    for (const directory of [this.root, paths.dirname(this.relationshipCacheFile(''))]) {
+    const [root, cache] = [this.root, paths.dirname(this.relationshipCacheFile(''))].map((directory) => {
       let stat: fs.BigIntStats | undefined;
       try {
         stat = fs.lstatSync(directory, { bigint: true, throwIfNoEntry: false });
       } catch {
-        return undefined;
+        return null;
       }
-      if (stat && (!stat.isDirectory() || Number(stat.mtimeMs) > now - STORE_REVISION_MARGIN_MS)) return undefined;
-      parts.push(stat ? `${stat.dev}:${stat.ino}:${stat.mtimeNs}` : '');
-    }
-    return parts.join('\0');
+      if (stat && !stat.isDirectory()) return null;
+      if (stat && Number(stat.mtimeMs) > now - STORE_REVISION_MARGIN_MS) return undefined;
+      return stat ? `${stat.dev}:${stat.ino}:${stat.mtimeNs}` : '';
+    });
+    return { root, cache };
   }
   private relationshipCacheFile(id: string): string {
     const paths = this.platform === 'win32' ? path.win32 : path.posix;
@@ -555,6 +585,7 @@ export class DispatchReceipts {
         ...(reader.identities ? { identities: reader.identities } : {}),
         ...(reference ? { reference } : reader.stop ? { stop: reader.stop } : {}),
         ...(reference && reader.startup ? { startup: reader.startup } : {}),
+        ...(reader.cache ? { cache: reader.cache } : {}),
       };
       reader.progress = emptyRelationshipStep();
       return reference;
@@ -565,19 +596,25 @@ export class DispatchReceipts {
         ...(reader.identities ? { identities: reader.identities } : {}),
         ...(reader.stop ? { stop: reader.stop } : {}),
         ...(reader.refusal ? { refusal: { ...reader.refusal, launchId: id } } : {}),
+        ...(reader.cache ? { cache: reader.cache } : {}),
+        ...(reader.unread ? { unread: reader.unread } : {}),
       };
       return null;
     } finally {
       reader.dispose();
     }
   }
-  // Each iterator is one epoch. New epochs revisit delayed bindings and changed catalog scope.
+  // Each iterator is one epoch. New epochs revisit delayed bindings and changed catalog scope. `root` receives the names of
+  // a complete listing. Without `read`, the iterator lists the root with one step for each entry and reads no launch.
   *relationships(
     catalog: readonly SessionFile[] | (() => readonly SessionFile[]),
     signal?: AbortSignal,
+    root?: DispatchRootNames,
+    read = true,
   ): RelationshipScan<void> {
     const reader = new RelationshipReader(signal, this.platform);
     const launches = new Set<string>();
+    const listed = new Map<string, string[]>();
     let directory: fs.Dir | undefined;
     const close = () => {
       if (directory) {
@@ -599,12 +636,21 @@ export class DispatchReceipts {
       });
       for (;;) {
         const entry = yield* reader.operation('entries', () => directory!.readSync());
-        yield reader.progress;
-        reader.progress = emptyRelationshipStep();
+        if (read) {
+          yield reader.progress;
+          reader.progress = emptyRelationshipStep();
+        }
         if (!entry) break;
-        if (!entry.isDirectory() || !DISPATCH_ID.test(entry.name)) continue;
+        const id = entry.name.split('.')[0];
+        if (root && DISPATCH_ID.test(id))
+          listed.set(id, [...(listed.get(id) ?? []), entry.isDirectory() ? `${entry.name}/` : entry.name]);
+        if (!read || !entry.isDirectory() || !DISPATCH_ID.test(entry.name)) continue;
         launches.add(entry.name);
         yield* this.relationship(entry.name, catalog, signal);
+      }
+      if (root) {
+        for (const [id, names] of listed) root.names.set(id, names.sort().join('\0'));
+        root.complete = true;
       }
       yield reader.progress;
     } catch {
@@ -617,7 +663,7 @@ export class DispatchReceipts {
       close();
       reader.dispose();
     }
-    if (!reader.refusal && !signal?.aborted) yield* this.pruneRelationshipCache(launches, signal);
+    if (read && !reader.refusal && !signal?.aborted) yield* this.pruneRelationshipCache(launches, signal);
   }
   private *pruneRelationshipCache(launches: ReadonlySet<string>, signal?: AbortSignal): RelationshipScan<void> {
     const paths = this.platform === 'win32' ? path.win32 : path.posix;
@@ -670,7 +716,18 @@ export class DispatchReceipts {
     const paths = this.platform === 'win32' ? path.win32 : path.posix;
     const directory = paths.join(this.root, id);
     const file = paths.join(directory, 'receipt.json');
-    const anchor = JSON.parse(yield* reader.read(paths.join(this.root, `${id}.json`))) as Anchor;
+    // A root entry publishes each file that the read takes before a lookup. A failed read of such a file names that entry.
+    const published = function* <T>(name: string, read: () => RelationshipScan<T>): RelationshipScan<T> {
+      try {
+        return yield* read();
+      } catch (error) {
+        reader.unread = { name, missing: reader.missing };
+        throw error;
+      }
+    };
+    const anchor = yield* published(`${id}.json`, function* () {
+      return JSON.parse(yield* reader.read(paths.join(paths.dirname(directory), `${id}.json`))) as Anchor;
+    });
     const text = yield* reader.read(file);
     const folder = yield* reader.stat(directory);
     const receipt = yield* reader.stat(file);
@@ -707,7 +764,8 @@ export class DispatchReceipts {
       reader.identities = { requester };
       return null;
     }
-    const binding = function* (kind: 'accepted' | 'startup'): RelationshipScan<Record<string, unknown>> {
+    const binding = (kind: 'accepted' | 'startup') => published(`${id}.${kind}.json`, () => bound(kind));
+    const bound = function* (kind: 'accepted' | 'startup'): RelationshipScan<Record<string, unknown>> {
       const boundFile = paths.join(directory, `${kind}.json`);
       const boundText = yield* reader.read(boundFile);
       const witness = JSON.parse(yield* reader.read(paths.join(paths.dirname(directory), `${id}.${kind}.json`)));
@@ -780,6 +838,7 @@ export class DispatchReceipts {
     // Bind retained cwd agreement to the exact receipt, witnesses, bindings and their physical identities.
     const verification = payloadSha256(JSON.stringify([this.platform, [...reader.revisions], [...reader.digests]]));
     const cwdPresent = yield* reader.stat(options.cwd);
+    if (!cwdPresent) reader.cache = true;
     yield* reader.path(options.cwd, !cwdPresent);
     if (cwdPresent) {
       const cwd = yield* reader.operation('checks', () => fs.realpathSync.native(options.cwd));

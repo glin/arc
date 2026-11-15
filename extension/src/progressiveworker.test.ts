@@ -94,6 +94,22 @@ import {
   clockWriter,
 } from './turnfixtures';
 
+// Moves the receipt store directories past the recent-write margin of a clock that reads `now`, to a time that no other call
+// used, so a later write still moves their modification time.
+let receiptStoreAges = 0;
+function ageReceiptStore(fx: ReturnType<typeof receiptDispatchFixture>, now = Date.now()) {
+  const time = now / 1000 - 3600 - receiptStoreAges++;
+  for (const directory of [fx.receipts.root, path.join(fx.home, 'cache', 'dispatch-relationships')])
+    if (fs.existsSync(directory)) fs.utimesSync(directory, time, time);
+}
+// The worker source with a completed receipt scan that never answers a new epoch, so each epoch reads the store from its
+// first entry.
+function fullReceiptScans(code: string): string {
+  const bound = /\bRECEIPT_SCAN_REUSE_MAX_AGE_MS = [^;,\n]+/g;
+  assert.equal(code.match(bound)?.length, 1, 'The receipt reuse age bound did not match');
+  return code.replace(bound, 'RECEIPT_SCAN_REUSE_MAX_AGE_MS = -1');
+}
+
 test('receipt boundaries grant a parked backfill a turn after the first complete reply and serve a yield from that turn', async () => {
   const root = tempDir('receipt-backfill-');
   const fx = receiptDispatchFixture(root, 'claude', 'codex');
@@ -104,7 +120,8 @@ test('receipt boundaries grant a parked backfill a turn after the first complete
   const check = 'receiptSliceStart = charges.readBytes;';
   assert.ok(source.includes(start) && source.includes(boundary) && source.includes(check));
   // The first request runs before any complete reply. The third request receives a yield during its third backfill turn.
-  const code = source
+  // Each request reads the store from its first entry.
+  const code = fullReceiptScans(source)
     .replace(
       start,
       `${start}
@@ -217,11 +234,14 @@ test('a receipt created during a pass appears by the next pass', async () => {
     fx.launch(fx.parent, fx.child);
     fs.writeFileSync(release, 'ready');
     let result = await first;
+    // The store ages past the recent-write margin of the worker's clock, so the next pass follows the store.
     if (
       result?.value.kind === 'claude-children' &&
       !result.value.references.some((row) => row.sessionId === fx.child.sessionId)
-    )
+    ) {
+      ageReceiptStore(fx, Date.UTC(2026, 0, 2));
       result = await completeDiscovery(worker, request, 2, new AbortController().signal);
+    }
     assert.equal(result?.value.kind, 'claude-children');
     if (result?.value.kind !== 'claude-children') throw new Error('Discovery did not complete');
     assert.equal(sessionParentIndex(result.value.references).get(fx.child.sessionId)?.parent, fx.parent.sessionId);
@@ -404,7 +424,8 @@ test('a yield that reaches the worker before its discovery request costs that re
   const fx = receiptDispatchFixture(root, 'claude', 'codex');
   for (let index = 0; index < 32; index++)
     fx.launch({ ...fx.parent, sessionId: 'eeeeeeee-1111-2222-3333-444444444444' }, fx.child, true, false, 36 * 1024);
-  const worker = new ProgressiveWorker(`process.env.ARC_HOME=${JSON.stringify(fx.home)};` + source);
+  // Each epoch reads the store from its first entry.
+  const worker = new ProgressiveWorker(`process.env.ARC_HOME=${JSON.stringify(fx.home)};` + fullReceiptScans(source));
   const request = {
     kind: 'claude-children' as const,
     parents: fx.catalog,
@@ -661,7 +682,8 @@ test.each(['claude', 'codex'] as const)(
 );
 
 // The receipt scan resumes across continuations, so the step allowance of one request sets how many replies one scan takes.
-// An unsettled complete reply starts a new epoch and a new scan. A cancelled request keeps the scan's position. A targeted
+// An unsettled complete reply starts a new epoch, which reuses the completed scan of a quiet store. A cancelled request keeps
+// the scan's position. A targeted
 // refresh lists the same parents in activity order and a walk lists them in enumeration order, so a request can carry the
 // epoch's parents in another order, with a parent named twice, or in another path form.
 test('receipt scan replies follow the step allowance, restart after a parent change, settle after the same parents in another listing, and resume after cancellation', async () => {
@@ -788,17 +810,21 @@ test('receipt scan replies follow the step allowance, restart after a parent cha
     spendPasses: 1,
     spendVisits: 2,
   });
+  // The store directories move past the recent-write margin, so the second epoch reuses the completed scan whatever the time.
+  const quiet = Date.now() / 1000 - 3600;
+  for (const directory of [fx.receipts.root, path.join(fx.home, 'cache', 'dispatch-relationships')])
+    fs.utimesSync(directory, quiet, quiet);
   const restarted = await scan(false, { addParent: true });
   assert.equal(restarted.unsettled, 1, JSON.stringify(restarted));
   assert.ok(
-    restarted.answered >= 2 * replies && restarted.answered <= 2 * replies + 3,
+    restarted.answered >= replies + 1 && restarted.answered <= replies + 3,
     JSON.stringify({ whole, restarted }),
   );
-  assert.equal(restarted.entries, 2 * whole.entries);
+  assert.equal(restarted.entries, whole.entries);
   assert.deepEqual(restarted.charges, {
-    opens: 2,
+    opens: 1,
     newWorker: 1,
-    afterCompletion: 1,
+    afterCompletion: 0,
     parentChanges: 1,
     otherBranches: 0,
     aborts: 0,
@@ -1904,7 +1930,8 @@ async function receiptDiscoveryHost(
 }
 
 // A real receipt store and worker behind the host's walk gate. `age` moves the store directories past the recent-write margin
-// to a time no other call used, so a later write still moves their modification time. `advance` moves the host's clock and
+// to a time no other call used, so a later write still moves their modification time. `young` moves the store root's
+// modification time a minute past the host's clock, so the worker reads the root as young. `advance` moves the host's clock and
 // the worker's clock, by default past the full pass age bound. The worker reads its clock offset from a file. `transform`
 // edits the worker source, and `coverage` receives the worker's coverage messages. `replies` holds the charges of each reply.
 async function receiptWalkHarness(
@@ -1944,11 +1971,10 @@ async function receiptWalkHarness(
   let checks = 0;
   let launchesRead = 0;
   const charged: import('./progressiveworker').DiscoveryCharges[] = [];
-  let ages = 0;
-  const age = () => {
-    const time = Date.now() / 1000 - 3600 - ages++;
-    for (const directory of [fx.receipts.root, path.join(fx.home, 'cache', 'dispatch-relationships')])
-      if (fs.existsSync(directory)) fs.utimesSync(directory, time, time);
+  const age = () => ageReceiptStore(fx);
+  const young = () => {
+    const time = (Date.now() + 60_000) / 1000;
+    fs.utimesSync(fx.receipts.root, time, time);
   };
   // One request of the current refresh generation. A cancelled request returns undefined.
   const request = async (cancel?: AbortController) => {
@@ -2002,6 +2028,7 @@ async function receiptWalkHarness(
     cancelled,
     walk,
     age,
+    young,
     settle,
     advance,
     charged,
@@ -2051,7 +2078,7 @@ test.each(['added', 'changed', 'removed'] as const)(
       if (change === 'added') fx.launch(fx.parent, fx.grandchild);
       if (change === 'changed') fx.accept(waiting!.launchId, fx.grandchild);
       if (change === 'removed') fs.rmSync(path.join(fx.receipts.root, present!.launchId), { recursive: true });
-      // The aged directories prove a revision, so only the moved revision keeps the completed scan from answering.
+      // The aged directories prove a revision. The completed scan follows the moved root and reads the changed launch.
       age();
       const counters = new PanelPerformanceCounters(0, 'receipt-revision');
       host.performanceCounters = counters;
@@ -2060,13 +2087,267 @@ test.each(['added', 'changed', 'removed'] as const)(
       assert.equal(dispatched(reply).includes(fx.grandchild.sessionId), change !== 'removed');
       assert.ok(dispatched(reply).includes(fx.child.sessionId));
       const discovery = counters.snapshot().discovery;
-      assert.deepEqual([discovery.receiptScanOpensAfterCompletionRevision, discovery.receiptScanReuses], [1, 0]);
+      assert.deepEqual(
+        [
+          discovery.receiptScanOpens,
+          discovery.receiptScanOpensAfterCompletionRevision,
+          discovery.receiptScanFollowsRoot,
+          discovery.receiptScanFollowNamesChanged,
+          discovery.receiptScanFollowLaunches,
+        ],
+        [0, 0, 1, 1, 1],
+      );
     } finally {
       worker.stop();
       vi.unstubAllEnvs();
     }
   },
 );
+
+// The discovery counters of the passes that `run` starts, read from a fresh counter set.
+async function receiptCounted<T>(host: Record<string, any>, run: () => Promise<T>) {
+  const counters = new PanelPerformanceCounters(0, 'receipt-follow');
+  host.performanceCounters = counters;
+  const value = await run();
+  return { value, discovery: counters.snapshot().discovery };
+}
+const linkedParent = (value: { references: Parameters<typeof sessionParentIndex>[0] }, sessionId: string) =>
+  sessionParentIndex(value.references).get(sessionId)?.parent;
+
+// A moved root with the same names reads no receipt bytes. A new launch is the only launch that the follow reads.
+test('a completed receipt scan follows a moved store root and reads only the launch whose names changed', async () => {
+  const { fx, worker, host, pass, settle, age } = await receiptWalkHarness();
+  try {
+    fx.launch(fx.parent, fx.child);
+    await settle();
+    age();
+    const same = await receiptCounted(host, pass);
+    assert.deepEqual(
+      [
+        same.discovery.receiptScanOpens,
+        same.discovery.receiptScanFollowsRoot,
+        same.discovery.receiptScanFollowNamesChanged,
+        same.discovery.receiptScanFollowLaunches,
+        same.discovery.receiptBytes,
+      ],
+      [0, 1, 0, 0, 0],
+    );
+    fx.launch(fx.parent, fx.grandchild);
+    age();
+    const added = await receiptCounted(host, pass);
+    assert.equal(linkedParent(added.value, fx.grandchild.sessionId), fx.parent.sessionId);
+    assert.equal(linkedParent(added.value, fx.child.sessionId), fx.parent.sessionId);
+    assert.deepEqual(
+      [
+        added.discovery.receiptScanOpens,
+        added.discovery.receiptScanFollowsRoot,
+        added.discovery.receiptScanFollowNamesChanged,
+        added.discovery.receiptScanFollowLaunches,
+        added.discovery.receiptLaunchesRead,
+      ],
+      [0, 1, 1, 1, 1],
+    );
+  } finally {
+    worker.stop();
+    vi.unstubAllEnvs();
+  }
+});
+
+test('a launch accepted while the store root is young links at the next quiet follow', async () => {
+  const { fx, worker, host, pass, settle, age, young } = await receiptWalkHarness();
+  try {
+    fx.launch(fx.parent, fx.child);
+    const waiting = fx.launch(fx.parent, fx.grandchild, true, false);
+    await settle();
+    fx.accept(waiting.launchId, fx.grandchild);
+    young();
+    const deferred = await receiptCounted(host, pass);
+    assert.equal(linkedParent(deferred.value, fx.grandchild.sessionId), undefined, 'a young store was listed');
+    assert.equal(deferred.value.receiptRevision, undefined, 'a deferred follow reported a store revision');
+    assert.deepEqual(
+      [
+        deferred.discovery.receiptScanFollowsYoung,
+        deferred.discovery.receiptScanFollowsRoot,
+        deferred.discovery.receiptLaunchesRead,
+      ],
+      [1, 0, 0],
+    );
+    age();
+    const quiet = await receiptCounted(host, pass);
+    assert.equal(linkedParent(quiet.value, fx.grandchild.sessionId), fx.parent.sessionId);
+    assert.deepEqual([quiet.discovery.receiptScanOpens, quiet.discovery.receiptScanFollowsRoot], [0, 1]);
+  } finally {
+    worker.stop();
+    vi.unstubAllEnvs();
+  }
+});
+
+// Each launch and binding moves the root, and each move leaves it young. A store that never goes quiet lists at the deferral.
+test('root moves less than 2 s apart list the store once when it is quiet, and a store that stays young lists after the deferral', async () => {
+  const { fx, worker, host, pass, settle, age, young, advance } = await receiptWalkHarness();
+  try {
+    fx.launch(fx.parent, fx.child);
+    await settle();
+    const counters = new PanelPerformanceCounters(0, 'receipt-burst');
+    host.performanceCounters = counters;
+    const waiting = fx.launch(fx.parent, fx.grandchild, true, false);
+    young();
+    assert.equal(linkedParent(await pass(), fx.grandchild.sessionId), undefined);
+    fx.accept(waiting.launchId, fx.grandchild);
+    young();
+    assert.equal(linkedParent(await pass(), fx.grandchild.sessionId), undefined);
+    age();
+    assert.equal(linkedParent(await pass(), fx.grandchild.sessionId), fx.parent.sessionId);
+    const burst = counters.snapshot().discovery;
+    assert.deepEqual(
+      [burst.receiptScanOpens, burst.receiptScanFollowsYoung, burst.receiptScanFollowsRoot],
+      [0, 2, 1],
+      'the burst did not list the store once',
+    );
+    fx.launch(fx.parent, fx.write('claude', 'eeeeeeee-1111-2222-3333-444444444444'));
+    young();
+    const held = await receiptCounted(host, pass);
+    assert.deepEqual([held.discovery.receiptScanFollowsYoung, held.discovery.receiptLaunchesRead], [1, 0]);
+    advance(10_001);
+    young();
+    const listed = await receiptCounted(host, pass);
+    assert.equal(listed.value.receiptRevision, undefined, 'a follow of a young store reported a store revision');
+    assert.deepEqual(
+      [
+        listed.discovery.receiptScanOpens,
+        listed.discovery.receiptScanFollowsRoot,
+        listed.discovery.receiptScanFollowsUnproved,
+        listed.discovery.receiptScanFollowLaunches,
+      ],
+      // The new launch, and the linked launch whose cache entry moved the cache after the quiet follow read it.
+      [0, 1, 1, 2],
+      'the store that stayed young was not listed after the deferral',
+    );
+  } finally {
+    worker.stop();
+    vi.unstubAllEnvs();
+  }
+});
+
+// The writer creates a witness name and then writes its content. The test empties the witness after the binding and
+// restores it with no new root name.
+test('a witness that a follow read before its content completed links at the next quiet follow', async () => {
+  const { fx, worker, host, pass, settle, age } = await receiptWalkHarness();
+  try {
+    fx.launch(fx.parent, fx.child);
+    const waiting = fx.launch(fx.parent, fx.grandchild, true, false);
+    await settle();
+    fx.accept(waiting.launchId, fx.grandchild);
+    const witness = path.join(fx.receipts.root, `${waiting.launchId}.accepted.json`);
+    const content = fs.readFileSync(witness);
+    fs.writeFileSync(witness, '');
+    age();
+    const partial = await pass();
+    assert.equal(linkedParent(partial, fx.grandchild.sessionId), undefined);
+    assert.equal(partial.receiptRevision, undefined, 'a reply with an owed launch reported a store revision');
+    fs.writeFileSync(witness, content);
+    age();
+    const completed = await receiptCounted(host, pass);
+    assert.equal(linkedParent(completed.value, fx.grandchild.sessionId), fx.parent.sessionId);
+    assert.deepEqual([completed.discovery.receiptScanOpens, completed.discovery.receiptScanFollowNamesChanged], [0, 0]);
+  } finally {
+    worker.stop();
+    vi.unstubAllEnvs();
+  }
+});
+
+// The worker moves the root to an older time when the follow opens the new launch's anchor, after the listing.
+test('a follow whose store revision moves between its listing and its last read reads its launches again', async () => {
+  const marker = path.join(tempDir('receipt-follow-move-'), 'move');
+  const { fx, worker, host, pass, settle, age } = await receiptWalkHarness(
+    (fx) =>
+      `const moveFs=require('node:fs'),movePath=require('node:path'),moveOpen=moveFs.openSync;moveFs.openSync=function(p,...a){if(moveFs.existsSync(${JSON.stringify(marker)})&&movePath.dirname(String(p))===${JSON.stringify(fx.receipts.root)}&&/^[0-9a-f-]{36}[.]json$/.test(movePath.basename(String(p)))){moveFs.rmSync(${JSON.stringify(marker)});const t=Date.now()/1000-7200;moveFs.utimesSync(${JSON.stringify(fx.receipts.root)},t,t);}return moveOpen.call(this,p,...a);};`,
+  );
+  try {
+    fx.launch(fx.parent, fx.child);
+    await settle();
+    // The read of this launch stops at its dispatched session, which no catalog lists, so it writes no cache entry.
+    fx.launch(fx.parent, fx.write('claude', 'eeeeeeee-1111-2222-3333-444444444444'));
+    age();
+    fs.writeFileSync(marker, '');
+    const moved = await receiptCounted(host, pass);
+    assert.equal(fs.existsSync(marker), false, 'the follow read no new anchor');
+    assert.equal(moved.value.receiptRevision, undefined, 'an unproved follow reported a store revision');
+    assert.deepEqual([moved.discovery.receiptScanFollowsUnproved, moved.discovery.receiptScanFollowLaunches], [1, 1]);
+    const again = await receiptCounted(host, pass);
+    assert.notEqual(again.value.receiptRevision, undefined, 'a proven follow reported no store revision');
+    assert.deepEqual(
+      [
+        again.discovery.receiptScanOpens,
+        again.discovery.receiptScanFollowsUnproved,
+        again.discovery.receiptScanFollowLaunches,
+      ],
+      [0, 0, 1],
+    );
+  } finally {
+    worker.stop();
+    vi.unstubAllEnvs();
+  }
+});
+
+test('a moved relationship cache reads again only the launches whose last read used the cache', async () => {
+  const { fx, root, worker, host, pass, settle, age, advance } = await receiptWalkHarness();
+  try {
+    const work = path.join(root, 'work');
+    fs.mkdirSync(work);
+    fx.launch(fx.parent, fx.child);
+    const away = fx.launch(fx.parent, fx.grandchild, true, true, 0, work);
+    await settle();
+    fs.rmSync(work, { recursive: true });
+    // A full scan at the age bound reads the saved verification of the launch whose working directory is gone.
+    advance();
+    age();
+    assert.equal(linkedParent(await pass(), fx.grandchild.sessionId), fx.parent.sessionId);
+    const entry = path.join(fx.home, 'cache', 'dispatch-relationships', `${away.launchId}.json`);
+    fs.writeFileSync(`${entry}.tmp`, JSON.stringify('0'.repeat(64)));
+    fs.renameSync(`${entry}.tmp`, entry);
+    age();
+    const moved = await receiptCounted(host, pass);
+    assert.equal(
+      linkedParent(moved.value, fx.grandchild.sessionId),
+      undefined,
+      'the follow kept a link that the cache refuses',
+    );
+    assert.equal(linkedParent(moved.value, fx.child.sessionId), fx.parent.sessionId);
+    assert.deepEqual(
+      [
+        moved.discovery.receiptScanOpens,
+        moved.discovery.receiptScanFollowsCache,
+        moved.discovery.receiptScanFollowLaunches,
+        moved.discovery.receiptLaunchesRead,
+      ],
+      [0, 1, 1, 1],
+    );
+  } finally {
+    worker.stop();
+    vi.unstubAllEnvs();
+  }
+});
+
+// The follow at 6 minutes keeps the opening time of the full scan, so the age bound counts from 0 minutes.
+test('a follow keeps the age bound of the scan that read the store from its first entry', async () => {
+  const { fx, worker, host, pass, settle, age, advance } = await receiptWalkHarness();
+  try {
+    fx.launch(fx.parent, fx.child);
+    await settle();
+    advance(6 * 60_000);
+    fx.launch(fx.parent, fx.grandchild);
+    age();
+    const followed = await receiptCounted(host, pass);
+    assert.deepEqual([followed.discovery.receiptScanOpens, followed.discovery.receiptScanFollowsRoot], [0, 1]);
+    advance(5 * 60_000);
+    const aged = await receiptCounted(host, pass);
+    assert.deepEqual([aged.discovery.receiptScanOpens, aged.discovery.receiptScanOpensAfterCompletionAge], [1, 1]);
+  } finally {
+    worker.stop();
+    vi.unstubAllEnvs();
+  }
+});
 
 test('a replaced directory outside the store that a receipt checked starts a pass', async () => {
   const { fx, worker, walk, settle } = await receiptWalkHarness();
@@ -2799,7 +3080,7 @@ test('a root change between a completed scan and its reuse drops the link of a s
 });
 
 test('a receipt change between two walked requests scans the store and finds the change', async () => {
-  const { fx, worker, pass, walk, settle, checks } = await receiptWalkHarness();
+  const { fx, worker, pass, walk, settle, checks, age } = await receiptWalkHarness();
   try {
     fx.launch();
     await settle();
@@ -2808,6 +3089,8 @@ test('a receipt change between two walked requests scans the store and finds the
     fx.launch(fx.parent, fx.grandchild);
     growTranscript(fx.parent);
     assert.equal(await walk(), false);
+    // The store ages past the recent-write margin, so the pass follows the store.
+    age();
     const before = checks();
     const reply = await pass();
     assert.ok(checks() > before, 'the pass after a receipt change read no receipt');
@@ -2904,13 +3187,9 @@ test('a receipt store replaced after a completed scan starts the scan from its f
 });
 
 // A store directory written within the recent-write margin proves no revision. The test moves the modification time of the
-// store ahead of the clock after each write, so both scans see a store without a revision.
-test('a completed scan of a store that proves no revision is read again from the first entry', async () => {
-  const { fx, worker, pass } = await receiptWalkHarness();
-  const young = () => {
-    const time = Date.now() / 1000 + 3600;
-    fs.utimesSync(fx.receipts.root, time, time);
-  };
+// store ahead of the clock after each write, so the first scan reads a store without a revision and the second pass defers.
+test('a completed scan of a store that proved no revision follows the store when it is quiet', async () => {
+  const { fx, worker, pass, young, age } = await receiptWalkHarness();
   try {
     fx.launch(fx.parent, fx.child);
     young();
@@ -2918,6 +3197,8 @@ test('a completed scan of a store that proves no revision is read again from the
     fx.launch(fx.child, fx.grandchild);
     young();
     growTranscript(fx.parent);
+    assert.equal(sessionParentIndex((await pass()).references).get(fx.grandchild.sessionId), undefined);
+    age();
     const parents = sessionParentIndex((await pass()).references);
     assert.equal(parents.get(fx.child.sessionId)?.parent, fx.parent.sessionId);
     assert.equal(parents.get(fx.grandchild.sessionId)?.parent, fx.child.sessionId, 'the scan missed the new launch');
@@ -3271,6 +3552,7 @@ test('receipt discovery revisits pending identity and discards cancelled scope g
   try {
     assert.equal((await finish()).references.length, 0);
     fx.accept(launch.launchId);
+    ageReceiptStore(fx);
     const found = await finish();
     assert.equal(sessionParentIndex(found.references).get(fx.child.sessionId)?.owned, true);
     const controller = new AbortController();
@@ -18783,8 +19065,8 @@ test.skipIf(!zstdCompress)('two compressed names with one session ID give the re
 
 // The first epoch has no list, so the launch ends at its requester. The store directories are an hour old before the first
 // and the third epoch, so the store proves the revision of each scan that reads it. The second epoch reuses the completed
-// scan. Its link writes the relationship cache, so the third epoch reads the store again. The fourth epoch reuses that scan
-// with a list that drops the requester.
+// scan. Its link writes the relationship cache, so the second epoch proves no revision and the third epoch reads the launch
+// again. The fourth epoch reuses that scan with a list that drops the requester.
 test.skipIf(!zstdCompress)(
   'a launch rejected at its compressed requester joins it when the list arrives with the next epoch, and leaves when the list drops it',
   async () => {
@@ -18821,7 +19103,7 @@ test.skipIf(!zstdCompress)(
         facts: 1,
       });
       assert.deepEqual(await epoch(listed, 3), {
-        counts: { rejected: 0, reuses: 0, reused: 0 },
+        counts: { rejected: 0, reuses: 1, reused: 1 },
         parent: fx.parent.sessionId,
         facts: 1,
       });

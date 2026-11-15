@@ -160,6 +160,27 @@ test('a store modified inside the write margin gives no revision until it ages',
   assert.notEqual(receipts.storeRevision(mtimeMs + 2_001), absent);
 });
 
+// A completed scan follows a moved store root by its entry names. So each write of a root entry creates the entry, as an
+// exclusive file or a new directory. A rewrite in place, a rename over an entry and a removal keep the names.
+test('each write of a store root entry creates the entry', () => {
+  const source = fs.readFileSync(path.join(__dirname, 'dispatchreceipts.ts'), 'utf8');
+  const entry = String.raw`paths?\.join\(this\.root, [^,()]+\)`;
+  const held = [...source.matchAll(new RegExp(String.raw`const (\w+) = ${entry};`, 'g'))].map((match) => match[1]);
+  const rootEntry = new RegExp(String.raw`${entry}|\b(?:${held.join('|')})\b`);
+  const writes =
+    /\b(exclusive|fs\.mkdirSync|fs\.\w*(?:write|append|rename|link|unlink|rm|copy|truncate|utimes|symlink)\w*Sync|writeFileAtomically|this\.replace|mark)\(([^;]*)/g;
+  const creators: string[] = [];
+  for (const [, call, args] of source.matchAll(writes)) {
+    if (!rootEntry.test(args)) continue;
+    assert.ok(
+      ['exclusive', 'fs.mkdirSync'].includes(call),
+      `${call}(${args.slice(0, 80)} writes a store root entry in place`,
+    );
+    creators.push(call);
+  }
+  assert.ok(creators.length >= 4, `the scan found ${creators.length} root entry writes`);
+});
+
 test('a receipt that names a compressed child transcript links no session', () => {
   const fx = relationshipFixture('claude', 'codex', false, undefined, 'native.jsonl.zst');
   assert.deepEqual(drainRelationships(fx.receipts.relationships(fx.catalog)), []);

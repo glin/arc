@@ -140,8 +140,11 @@ import {
   DispatchReceipts,
   dispatchFileKey,
   dispatchStartupRevision,
+  joinedStoreRevision,
   type DispatchRelationshipStop,
+  type DispatchRootNames,
   type DispatchStartupRevision,
+  type DispatchStoreRevisions,
 } from './dispatchreceipts';
 import { admittedDispatchReferences } from './turnrail';
 import {
@@ -304,8 +307,26 @@ interface ReceiptScan {
   controller: AbortController;
   // The physical identity of the store directory when the scan opened it.
   storeIdentity: string;
-  // The store revision from before the scan opened the store, or undefined when the store proves nothing about a later read.
+  // The store revision at the opening of the scan, or undefined when the store proves nothing about a later read.
   storeRevision: string | undefined;
+  // The parts of the store revision that the root names and the cache reads of the scan answer for. A part that differs or is
+  // undefined at the next epoch makes that scan follow it.
+  revisions: DispatchStoreRevisions;
+  // The names of the last complete listing of the store root, by launch ID.
+  rootNames: Map<string, string>;
+  // Each launch whose last read used the relationship cache.
+  cacheLaunches: Set<string>;
+  // The root entry that publishes the file that the last read of each launch stopped on.
+  unread: Map<string, { name: string; missing: boolean }>;
+  // Each launch that waits for another read: its last read ran in a reused scan without a proven revision, or stopped on a
+  // published file that was present or that the listing names.
+  owed: Set<string>;
+  // Each launch that this scan read.
+  read: Set<string>;
+  // When the first reused scan that deferred its listing of a young store opened, until a scan follows the store.
+  deferredAt: number | undefined;
+  // What a reused scan follows, or null for a scan from the first entry.
+  follow: ReceiptFollow | null;
   // True after a refused read.
   unproved: boolean;
   // Each launch that a step named, with or without a link.
@@ -324,6 +345,19 @@ interface ReceiptScan {
   reuseClasses: Map<string, boolean>;
 }
 let receiptScan: ReceiptScan | null = null;
+// A reused scan of a young store defers its listing for at most this long, and then lists the store without proof.
+const RECEIPT_FOLLOW_DEFERRAL_MS = 10_000;
+// The store revision parts at the opening of a reused scan, what the scan follows, and its counts. `young` defers the
+// follow. `launches` holds each launch that the follow sends to be read again.
+interface ReceiptFollow {
+  before: DispatchStoreRevisions;
+  young: boolean;
+  root: boolean;
+  cache: boolean;
+  names: number;
+  changed: number;
+  launches: Set<string>;
+}
 // The compressed rollout names of the last list that a discovery request carried, by the session ID in each name. An ID that
 // more than one name carries maps to null.
 type CompressedRequesters = Map<string, string | null>;
@@ -376,7 +410,6 @@ const KEPT_SCAN_REFUSAL_CHARGES = {
   store: 'receiptScanOpensAfterCompletionStore',
   age: 'receiptScanOpensAfterCompletionAge',
   unproved: 'receiptScanOpensAfterCompletionUnproved',
-  revision: 'receiptScanOpensAfterCompletionRevision',
 } as const;
 type ReceiptOpenCharge =
   | 'receiptScanOpens'
@@ -443,16 +476,13 @@ function closeReceiptScan(cause: 'epoch' | 'store' | 'refusal'): void {
   keptReceiptScan = null;
 }
 // The first reason that a completed scan cannot answer a new epoch, or undefined when it can. The store must keep its
-// identity and prove the revision that the completed scan read, and the scan that read the store must be within the age bound.
+// identity, no read of the completed scan was refused, and the scan that read the store must be within the age bound.
 // A clock that reads earlier than the opening of that scan proves no age.
 function keptScanRefusal(kept: ReceiptScan): keyof typeof KEPT_SCAN_REFUSAL_CHARGES | undefined {
   if (kept.store.storeIdentity() !== kept.storeIdentity) return 'store';
   const age = Date.now() - kept.fullAt;
   if (age < 0 || age > RECEIPT_SCAN_REUSE_MAX_AGE_MS) return 'age';
-  if (kept.storeRevision === undefined || kept.unproved) return 'unproved';
-  const revision = kept.store.storeRevision();
-  if (revision === undefined) return 'unproved';
-  return revision === kept.storeRevision ? undefined : 'revision';
+  return kept.unproved ? 'unproved' : undefined;
 }
 // The count of each stop of a launch without a link that a reused scan holds.
 const REUSE_UNLINKED_CHARGES = {
@@ -466,9 +496,10 @@ const REUSE_UNLINKED_CHARGES = {
 // session. Such a read depends on files outside the store, such as the opening of the dispatched transcript. A launch without a
 // link can stop at the lookup of its dispatched session or at the file comparison. Such a read uses only store files and
 // catalog rows. So only a change of those rows or of the store can link it. Any other launch without a link stopped at its requester or on
-// a store file. Arc completes each write of such a file with a write in the store directory that moves the store revision.
-// The steps of the scan then check the dispatched transcript of each link that the scan holds. `work` counts each launch
-// without a link that names both identities, by its stop.
+// a store file. Arc publishes each such file with a new name in the store root, which the follow of a moved root reads.
+// A young store defers the follow until it is quiet or the deferral ends. The steps of the scan then check the dispatched
+// transcript of each link that the scan holds. `work` counts each launch without a link that names both identities, by its
+// stop.
 function reusedReceiptScan(
   kept: ReceiptScan,
   epoch: DiscoveryCheckpoint,
@@ -476,8 +507,24 @@ function reusedReceiptScan(
 ): ReceiptScan {
   const catalog = receiptCatalogOf(epoch.catalog);
   const changed = changedCatalogIdentities(kept.catalog, catalog, kept.store.platform);
+  const now = Date.now();
+  const before = kept.store.storeRevisions(now);
+  const deferredAt = before.root === undefined || before.cache === undefined ? (kept.deferredAt ?? now) : undefined;
+  const young = deferredAt !== undefined && now >= deferredAt && now - deferredAt < RECEIPT_FOLLOW_DEFERRAL_MS;
   const scan: ReceiptScan = {
     ...kept,
+    storeRevision: young ? undefined : joinedStoreRevision(before),
+    read: new Set(),
+    deferredAt: young ? deferredAt : undefined,
+    follow: {
+      before,
+      young,
+      root: !young && (before.root === undefined || before.root !== kept.revisions.root),
+      cache: !young && (before.cache === undefined || before.cache !== kept.revisions.cache),
+      names: 0,
+      changed: 0,
+      launches: new Set(),
+    },
     epoch: epoch.epoch,
     catalog,
     compressed: compressedRequesters,
@@ -515,12 +562,48 @@ function retryReceiptLaunch(scan: ReceiptScan, launchId: string): void {
   scan.reuseClasses.delete(launchId);
   scan.reuseRetries.set(launchId, unlinked);
 }
-// The steps of a reused scan. The first step reads nothing. Each later step stats the dispatched transcript of one link. A
-// transcript whose device, inode, size or times differ from its opening check, or that cannot be read, sends its launch to be
-// read again, so the read checks the opening again.
+// Sends a launch of a reused scan to be read again for its follow, once in the scan.
+function followReceiptLaunch(scan: ReceiptScan, launchId: string): void {
+  if (scan.follow!.launches.has(launchId)) return;
+  scan.follow!.launches.add(launchId);
+  retryReceiptLaunch(scan, launchId);
+}
+// The steps of a reused scan. The first step reads nothing. A follow of the root then lists the root with one step for each
+// entry, and sends each launch whose names changed to be read again. A follow of the cache sends each launch whose last read
+// used the cache. A follow that is not young sends each owed launch.
+// Each later step stats the dispatched transcript of one link. A transcript whose device, inode, size or times differ from
+// its opening check, or that cannot be read, sends its launch to be read again, so the read checks the opening again.
 function* keptStartupChecks(current: () => ReceiptScan): ReceiptScan['steps'] {
   yield { entries: 0, bytes: 0, checks: 0 };
   const scan = current();
+  const follow = scan.follow!;
+  if (follow.root) {
+    const listing: DispatchRootNames = { names: new Map(), complete: false };
+    yield* scan.store.relationships([], scan.controller.signal, listing, false);
+    if (listing.complete) {
+      for (const launchId of new Set([...scan.rootNames.keys(), ...listing.names.keys()])) {
+        const names = [scan.rootNames.get(launchId), listing.names.get(launchId)];
+        follow.names += names[1]?.split('\0').length ?? 0;
+        if (names[0] === names[1]) continue;
+        follow.changed++;
+        // A full scan reads only a launch that has a directory.
+        if (names.some((value) => value?.split('\0').includes(`${launchId}/`))) followReceiptLaunch(scan, launchId);
+      }
+      scan.rootNames = listing.names;
+      scan.revisions = { ...scan.revisions, root: follow.before.root };
+    } else {
+      // A listing that did not complete holds no links, as a scan from the first entry whose listing failed, and the next
+      // epoch reads the store from its first entry.
+      scan.references.clear();
+      scan.unproved = true;
+      return;
+    }
+  }
+  if (follow.cache) {
+    for (const launchId of scan.cacheLaunches) followReceiptLaunch(scan, launchId);
+    scan.revisions = { ...scan.revisions, cache: follow.before.cache };
+  }
+  if (!follow.young) for (const launchId of scan.owed) followReceiptLaunch(scan, launchId);
   for (const [launchId, startup] of [...scan.startups]) {
     if (!scan.references.has(launchId)) continue;
     let moved: boolean;
@@ -1740,16 +1823,26 @@ async function execute(
         if (refusal) opens.push(KEPT_SCAN_REFUSAL_CHARGES[refusal]);
         const controller = new AbortController();
         const store = new DispatchReceipts();
+        const revisions = store.storeRevisions();
+        const listing: DispatchRootNames = { names: new Map(), complete: false };
         const scan: ReceiptScan = {
           storeIdentity: store.storeIdentity(),
-          storeRevision: store.storeRevision(),
+          storeRevision: joinedStoreRevision(revisions),
+          revisions,
+          rootNames: listing.names,
+          cacheLaunches: new Set(),
+          unread: new Map(),
+          owed: new Set(),
+          read: new Set(),
+          deferredAt: undefined,
+          follow: null,
           unproved: false,
           epoch: epoch.epoch,
           store,
           controller,
           catalog: receiptCatalogOf(epoch.catalog),
           compressed: compressedRequesters,
-          steps: store.relationships(() => scan.catalog, controller.signal),
+          steps: store.relationships(() => scan.catalog, controller.signal, listing),
           launches: new Map(),
           references: new Map(),
           retries: [],
@@ -1872,6 +1965,11 @@ async function execute(
           if (reused) charges.receiptScanReuseLaunchesUnlinked!++;
         }
         activeReceipts.visited.add(launchId);
+        activeReceipts.read.add(launchId);
+        if (step.value.cache) activeReceipts.cacheLaunches.add(launchId);
+        else activeReceipts.cacheLaunches.delete(launchId);
+        if (step.value.unread) activeReceipts.unread.set(launchId, step.value.unread);
+        else activeReceipts.unread.delete(launchId);
         activeReceipts.references.delete(launchId);
         activeReceipts.startups.delete(launchId);
         if (step.value.startup) activeReceipts.startups.set(launchId, step.value.startup);
@@ -1940,6 +2038,31 @@ async function execute(
       charges.otherPassEnds++;
       return pending();
     }
+    // A reused scan proves its reads when the store revision after its last read equals the revision at its opening. A
+    // launch read without that proof stays owed, and so does a launch whose read stopped on a published file that was
+    // present or that the root names hold.
+    const follow = activeReceipts.follow;
+    const proven =
+      !follow ||
+      (activeReceipts.storeRevision !== undefined &&
+        activeReceipts.store.storeRevision() === activeReceipts.storeRevision);
+    for (const launchId of activeReceipts.read) {
+      const unread = activeReceipts.unread.get(launchId);
+      const named = !!unread && activeReceipts.rootNames.get(launchId)?.split('\0').includes(unread.name);
+      if (!proven || (unread && (!unread.missing || named))) activeReceipts.owed.add(launchId);
+      else activeReceipts.owed.delete(launchId);
+    }
+    if (follow) {
+      if (follow.young || follow.root || follow.cache || follow.launches.size) charges.receiptScanFollows!++;
+      if (follow.young) charges.receiptScanFollowsYoung!++;
+      else if (!proven) charges.receiptScanFollowsUnproved!++;
+      if (follow.root) charges.receiptScanFollowsRoot!++;
+      if (follow.cache) charges.receiptScanFollowsCache!++;
+      charges.receiptScanFollowNames! += follow.names;
+      charges.receiptScanFollowNamesChanged! += follow.changed;
+      charges.receiptScanFollowLaunches! += follow.launches.size;
+    }
+    charges.receiptScanOwedLaunches! += activeReceipts.owed.size;
     discoveryPosition = epoch.position;
     discoveryEpoch = null;
     epochParentKeys = null;
@@ -1981,7 +2104,7 @@ async function execute(
       roots: epoch.parents,
       scope: epoch.repositoryRoots,
       receiptStore: activeReceipts.storeIdentity,
-      ...(activeReceipts.storeRevision !== undefined && !activeReceipts.unproved
+      ...(activeReceipts.storeRevision !== undefined && !activeReceipts.unproved && proven && !activeReceipts.owed.size
         ? { receiptRevision: { store: activeReceipts.storeRevision, observedAt: activeReceipts.fullAt } }
         : {}),
     };
@@ -2391,6 +2514,15 @@ function emptyDiscoveryCharges(): DiscoveryCharges {
     receiptScanReuseUnlinkedFile: 0,
     receiptScanReuseUnlinkedPath: 0,
     receiptScanReuseUnlinkedOpening: 0,
+    receiptScanFollows: 0,
+    receiptScanFollowsYoung: 0,
+    receiptScanFollowsUnproved: 0,
+    receiptScanFollowsRoot: 0,
+    receiptScanFollowsCache: 0,
+    receiptScanFollowNames: 0,
+    receiptScanFollowNamesChanged: 0,
+    receiptScanFollowLaunches: 0,
+    receiptScanOwedLaunches: 0,
     unsettledUnfinishedSources: 0,
     unsettledDeferredSources: 0,
     unsettledUnreadSources: 0,

@@ -192,7 +192,7 @@ export function receiptDispatchFixture(root: string, parentAgent: 'claude' | 'co
   const child = write(childAgent, ids[1]);
   const grandchild = write(parentAgent, ids[2]);
   const receipts = new DispatchReceipts(home);
-  const accept = (id: string, target = child) => {
+  const accept = (id: string, target = child, cwd = root) => {
     const bytes = fs.readFileSync(target.file);
     const opening = bytes.subarray(0, bytes.indexOf(10) + 1);
     const stat = fs.statSync(target.file, { bigint: true });
@@ -203,13 +203,13 @@ export function receiptDispatchFixture(root: string, parentAgent: 'claude' | 'co
       identity: `${stat.dev}:${stat.ino}`,
       ancestor,
       directory: `${directory.dev}:${directory.ino}`,
-      cwd: fs.realpathSync.native(root),
+      cwd: fs.realpathSync.native(cwd),
       bytes: opening.length,
       sha256: payloadSha256(opening.toString()),
     });
     return receipts.standaloneSession(id, target.sessionId);
   };
-  const launch = (requester = parent, target = child, agentRun = true, accepted = true, padding = 0) => {
+  const launch = (requester = parent, target = child, agentRun = true, accepted = true, padding = 0, cwd = root) => {
     const result = receipts.reserve({
       origin: 'a'.repeat(24),
       requester: { provider: requester.agent, id: requester.sessionId },
@@ -222,7 +222,7 @@ export function receiptDispatchFixture(root: string, parentAgent: 'claude' | 'co
         provider: target.agent,
         command: target.agent,
         args: padding ? ['x'.repeat(padding)] : [],
-        cwd: root,
+        cwd,
         model: 'test',
         effort: 'high',
         name: 'Review',
@@ -237,7 +237,7 @@ export function receiptDispatchFixture(root: string, parentAgent: 'claude' | 'co
         deadlineMs: 1000,
       },
     });
-    if (accepted) accept(result.launchId, target);
+    if (accepted) accept(result.launchId, target, cwd);
     return result;
   };
   return {

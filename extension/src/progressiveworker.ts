@@ -311,6 +311,19 @@ export interface DiscoveryCharges
   receiptScanReuseUnlinkedFile?: number;
   receiptScanReuseUnlinkedPath?: number;
   receiptScanReuseUnlinkedOpening?: number;
+  // Each reused scan that followed a moved store or owed launches. A young follow deferred its listing, and an unproved follow
+  // that was not young saw the store revision move or no revision. Root and cache name the part that the follow read again.
+  // The names are the root entries that follows listed, and the changed names are the launches whose names differed.
+  // The launches are the reads that follows sent. The owed launches are the size of the owed set at each complete reply.
+  receiptScanFollows?: number;
+  receiptScanFollowsYoung?: number;
+  receiptScanFollowsUnproved?: number;
+  receiptScanFollowsRoot?: number;
+  receiptScanFollowsCache?: number;
+  receiptScanFollowNames?: number;
+  receiptScanFollowNamesChanged?: number;
+  receiptScanFollowLaunches?: number;
+  receiptScanOwedLaunches?: number;
   // A complete reply that leaves membership unsettled counts each branch that asked for another pass. The worker skips the
   // unread check once another branch asked.
   unsettledUnfinishedSources?: number;
