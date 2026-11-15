@@ -2762,6 +2762,8 @@ export class PanelProvider implements vscode.Disposable {
   private sessionReadFailures = new Set<string>();
   // Whether the latest catalog refresh read filesystem revisions. Project cost reuses those revisions only after a filesystem walk.
   private catalogWalked = true;
+  // The generation of the last catalog walk whose Codex and child rows a held-file sweep checked.
+  private sweptWalkGeneration = 0;
   // Diff sides by URI, in insertion order. The byte budget evicts the oldest entries.
   readonly patches = new Map<string, string>();
   private patchBytes = 0;
@@ -11600,7 +11602,9 @@ export class PanelProvider implements vscode.Disposable {
         }
       }
       // Whether this refresh listed the catalog from a walk, read before prompt admission yields to other catalog readers.
-      const listingWalked = this.catalogWalked || codexRelisted !== null;
+      // A walk outside a refresh, such as a content search, runs no sweep, so the next catalog refresh sweeps for it.
+      const walkGeneration = this.catalogWalk?.generation ?? 0;
+      const listingWalked = this.catalogWalked || codexRelisted !== null || walkGeneration > this.sweptWalkGeneration;
       // A discovery request of this refresh also returns the time that it waited for the worker in `discoveryWaitMs`.
       const humanPromptWork: DiscoveryWork & { checks: number } = {
         bytes: 0,
@@ -11708,9 +11712,9 @@ export class PanelProvider implements vscode.Disposable {
         selectedOnly || targetedRefreshPaths?.length
           ? undefined
           : all.find((session) => session.sessionId === this.showing);
-      // A refresh that walked checks the identities that its walk did not read again: each Codex row, whose stat the walk
-      // can reuse, and each child row, which discovery lists. A refresh of the held catalog checks only the files that its
-      // listing revalidates.
+      // After a walk, a refresh checks the identities that the walk did not read again. These are the Codex rows, whose stat
+      // the walk can reuse. Outside a Codex-only relist, they are also the child rows, which discovery lists. Any other
+      // refresh of the held catalog checks only the files that its listing revalidates.
       if (!selectedOnly && listingWalked) {
         const heldSources = all.filter(
           (session) => session.agent === 'codex' || (!codexOnly && session.childTranscript === true),
@@ -11721,6 +11725,7 @@ export class PanelProvider implements vscode.Disposable {
         this.performanceCounters.recordRefresh('refresh-stage:held-sweep', performance.now() - sweepStarted);
         this.performanceCounters.recordWork('heldIdentityStat', sweep.checks);
         if (controller.signal.aborted || generation !== this.refreshGeneration) return;
+        this.sweptWalkGeneration = Math.max(this.sweptWalkGeneration, walkGeneration);
         if (changed.length) {
           for (const file of changed) this.codexStats.markChanged(path.dirname(file), path.basename(file));
           const deferred = { needed: false };
