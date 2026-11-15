@@ -672,11 +672,11 @@ export function childEventNamesFiles(kind: string): boolean {
   return !DRAW_ONLY_CHILD_EVENTS.has(kind);
 }
 
-// Live child events that start no refresh. A `thinking` event carries no data. The directory watcher, the poll and the
-// turn's later events bring its transcript writes to the panel.
+// Live child events that start no refresh while a watcher covers each listed file of the session. A `thinking` event
+// carries no data. The directory watcher, the poll and the turn's later events bring its transcript writes to the panel.
 const NO_REFRESH_CHILD_EVENTS = new Set(['thinking']);
 
-// True when a live child event starts a refresh.
+// True when a live child event starts a refresh whatever the watchers cover.
 export function childEventRefreshes(kind: string): boolean {
   return !NO_REFRESH_CHILD_EVENTS.has(kind);
 }

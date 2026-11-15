@@ -7466,7 +7466,8 @@ export class PanelProvider implements vscode.Disposable {
         this.runningSinceKeys.delete(key);
       }
     }
-    this.running = next;
+    // An equal set keeps its identity, so the quiet basis of the poll stands.
+    if (moved) this.running = next;
     // Running status does not confirm prompt delivery. Reconcile live activity before removing completed entries.
     this.markStartedPresses();
     this.dropSpentPresses();
@@ -7520,7 +7521,9 @@ export class PanelProvider implements vscode.Disposable {
       observedExit = true;
     }
     const { exited, moved } = recordExits(this.exitedSinceKeys, this.exitedNow, keys, Date.now());
-    this.exitedNow = exited;
+    // An equal set keeps its identity, so the quiet basis of the poll stands.
+    if (exited.size !== this.exitedNow.size || [...exited].some((key) => !this.exitedNow.has(key)))
+      this.exitedNow = exited;
     for (const settlement of [...(this.clearSettlements?.values() ?? [])]) {
       const agent = settlement.state.agent;
       if (keys.includes(runningKey(agent, settlement.source)) || keys.includes(runningKey(agent, settlement.session))) {
@@ -11347,14 +11350,17 @@ export class PanelProvider implements vscode.Disposable {
 
   // An event from a live agent child refreshes from the held catalog. An event that records into the session's
   // transcript names the session's listed files. A new transcript arrives through its directory watcher or the poll.
-  // An event that starts no refresh counts under its kind.
+  // An event that starts no refresh still refreshes a session with a listed file in a directory that no watcher covers.
   refreshFromChild(kind: string, sessionId: string | null): void {
-    if (!childEventRefreshes(kind)) {
-      this.performanceCounters.recordWork(`childEventNoRefresh:${kind}`);
-      return;
-    }
     const files =
       sessionId && childEventNamesFiles(kind) ? listedFilesFor([sessionId], this.catalog?.sessions ?? []) : null;
+    if (!childEventRefreshes(kind)) {
+      if (!files?.some((file) => !this.watchers.has(path.dirname(file)))) {
+        this.performanceCounters.recordWork(`childEventNoRefresh:${kind}`);
+        return;
+      }
+      this.performanceCounters.recordWork(`childEventRefresh:${kind}:unwatched`);
+    }
     this.refreshFrom(`child:${kind}`, false, true, files);
   }
 

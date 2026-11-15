@@ -55,6 +55,9 @@ import {
   sessionReadStatus,
   sessionAttention,
   sessionExitMatches,
+  observeSessionExit,
+  observeSessionRun,
+  sessionSourceAdmitted,
 } from './sessionreads';
 import { listingQueryError } from './domain/session-query';
 import * as crypto from 'node:crypto';
@@ -356,6 +359,7 @@ import {
   inRailRunningGroup,
   liveBackgroundCommands,
   railCacheMarkOf,
+  recordExits,
   sessionRunningSince,
   sessionStatusOf,
   stableRailOrder,
@@ -16612,7 +16616,7 @@ test('each catalog walk names its requester, and the re-list after a replaced fi
 // times driven by the test. `create` writes a file and moves its directory's time to the test clock, as the filesystem
 // does for a new entry. `hidden` holds project directories that the walk lists but leaves out of its directory
 // evidence, as when the poll's stat list misses a directory. `scope` replaces the harness's module bindings.
-function pollWalkHarness(scope: Record<string, unknown> = {}) {
+function pollWalkHarness(scope: Record<string, unknown> = {}, extraMethods: string[] = []) {
   const projects = tempDir('poll-walk-projects-');
   const project = path.join(projects, 'repo');
   const other = path.join(projects, 'other');
@@ -16679,6 +16683,7 @@ function pollWalkHarness(scope: Record<string, unknown> = {}) {
       'unknownPathShapeOf',
       'refreshFromChild',
       'repeatedCoverage',
+      ...extraMethods,
     ],
   );
   const { provider } = harness;
@@ -16879,8 +16884,8 @@ function quietPolls(counters: PanelPerformanceCounters): Record<string, number> 
 
 // A poll walk harness whose refreshes take the exit that renders nothing when the listing, statuses and open children stand,
 // with the parent transcript shown.
-function quietPollHarness() {
-  const harness = pollWalkHarness();
+function quietPollHarness(scope: Record<string, unknown> = {}, extraMethods: string[] = []) {
+  const harness = pollWalkHarness(scope, extraMethods);
   const { provider, parent } = harness;
   provider.useRefreshGate(refreshWanted);
   provider.useListingSignature(listingSignature);
@@ -16922,19 +16927,40 @@ test('a shown transcript that grows with no watcher event lists its new revision
 });
 
 test('a thinking event from a live child starts no refresh and the next unchanged poll stays quiet', async () => {
-  const { start, poll, settle, counters, provider } = quietPollHarness();
+  const { start, poll, settle, counters, provider, parent } = quietPollHarness(
+    { recordExits, observeSessionRun, observeSessionExit, sessionSourceAdmitted },
+    ['setRunning', 'setExited', 'observeHostedSessions'],
+  );
   const receive = childEventRefresh();
+  Object.assign(provider, {
+    // A watcher covers the directory of the running session.
+    watchers: new Map([[path.dirname(parent), {}]]),
+    running: new Set(),
+    runningSinceKeys: new Map(),
+    exitedNow: new Set(),
+    exitedSinceKeys: new Map(),
+  });
+  // The hosted-state publication that the event handler in `extension.ts` runs before each refresh request.
+  const hosted = [{ key: runningKey('claude', 'parent'), token: 1, busy: true, exited: false }];
+  const publish = () => {
+    provider.setRunning([hosted[0].key], hosted);
+    provider.setExited([], hosted);
+  };
   try {
     await start();
+    publish();
+    await settle();
     await poll();
     await poll();
+    const before = quietPolls(counters);
+    publish();
     receive(provider, { get: () => ({ state: () => ({ sessionId: 'parent' }) }) }, 'child', { kind: 'thinking' });
     await settle();
     await poll();
     const { refreshes, work } = counters.snapshot();
     assert.equal(refreshes['child:thinking'], undefined, 'the thinking event started a refresh');
     assert.equal(work['childEventNoRefresh:thinking'], 1);
-    assert.deepEqual(quietPolls(counters), { 'poll:quietMiss:basis': 1, 'poll:quiet': 2, refreshes: 1 });
+    assert.deepEqual(quietPolls(counters), { ...before, 'poll:quiet': (before['poll:quiet'] ?? 0) + 1 });
   } finally {
     vi.useRealTimers();
   }
@@ -17617,6 +17643,27 @@ test('a selected draft keeps the held catalog through polls and child events', a
       await settle();
     }
     assert.equal(provider.showing, 'draft');
+    assert.deepEqual(walks(), { 'walk:requested:startup': 1 });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('a thinking event updates the row of a session that is not shown and whose directory has no watcher', async () => {
+  const { provider, project, other, create, writeRollout, start, walks, settle, counters } = pollWalkHarness();
+  const receive = childEventRefresh();
+  writeRollout('shown');
+  const unwatched = create(path.join(other, 'unwatched.jsonl'));
+  try {
+    await start();
+    provider.showing = 'shown';
+    provider.watchers = new Map([[project, {}]]);
+    fs.appendFileSync(unwatched, '{"type":"assistant"}\n');
+    receive(provider, { get: () => ({ state: () => ({ sessionId: 'unwatched' }) }) }, 'child', { kind: 'thinking' });
+    await settle();
+    const row = provider.authoritativeCatalog.find((session: SessionFile) => session.sessionId === 'unwatched');
+    assert.equal(row.size, fs.statSync(unwatched).size, 'the thinking event left the unwatched row at its old size');
+    assert.equal(counters.snapshot().work['childEventRefresh:thinking:unwatched'], 1);
     assert.deepEqual(walks(), { 'walk:requested:startup': 1 });
   } finally {
     vi.useRealTimers();
