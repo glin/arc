@@ -2,8 +2,9 @@ import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import {
   readCodexSession,
-  readQualifiedCodexOpening,
+  readSessionCodexOpening,
   CODEX_OPENING_BYTES,
+  OPENING_PAST_BOUND,
   createCodexSessionReducer,
   openingRecordOf,
 } from './codex.ts';
@@ -923,7 +924,7 @@ function qualifySessionReadSource(source: SessionFile, roots: readonly string[])
   const deadline = performance.now() + SESSION_READ_LIMITS.qualificationMs;
   const opening =
     source.agent === 'codex'
-      ? readQualifiedCodexOpening(source.file, undefined, CODEX_OPENING_BYTES)
+      ? readSessionCodexOpening(source.file)
       : readQualifiedOpening(source.file, (fd) => {
           const buffer = Buffer.allocUnsafe(64 * 1024);
           const bytes = meterRead(source.file, fs.readSync(fd, buffer, 0, buffer.length, 0));
@@ -955,6 +956,8 @@ function qualifySessionReadSource(source: SessionFile, roots: readonly string[])
     return 'The session source was replaced. Retry after session discovery.';
   if (!sessionSourceAdmitted(source, opening.revision))
     return 'The session source revision does not match supported growth. Retry after session discovery.';
+  if (opening.value === OPENING_PAST_BOUND)
+    return `The session opening exceeds the ${CODEX_OPENING_BYTES / 1024} KiB read limit. This command cannot read this session.`;
   if (typeof opening.value.sessionId !== 'string' || !opening.value.sessionId)
     return 'The session opening identity is unavailable. Retry the command.';
   if (opening.value.sessionId !== source.sessionId)

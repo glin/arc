@@ -535,7 +535,8 @@ export const CODEX_TITLE_BYTES = 1024 * 1024;
 // bound in a buffer of its own. A first line that does not end inside it leaves the file undecided.
 const FIRST_LINE_BYTES = CODEX_TITLE_BYTES;
 
-// The answer of an opening read whose first line does not end inside `FIRST_LINE_BYTES` while the file goes on.
+// The answer of an opening read whose first line does not end inside its bound while the file goes on. A session read
+// takes `CODEX_OPENING_BYTES` as its bound, and every other opening read takes `FIRST_LINE_BYTES`.
 export const OPENING_PAST_BOUND = 'pastBound';
 
 // Why a plain rollout leaves the admission of a listing incomplete. `refused` is a refused open or read,
@@ -619,21 +620,41 @@ function firstLineFromDescriptor(file: string, fd: number, bound = FIRST_LINE_BY
   }
 }
 
-// `bound` limits the first line that the read decides. A session read passes `CODEX_OPENING_BYTES` to keep its byte limit.
-export function readQualifiedCodexOpening(
+// `bound` limits the first line that the read decides. The value is `OPENING_PAST_BOUND` when that line does not end
+// inside `bound` while the file holds more bytes. A file that ends at or inside `bound` reads as no opening.
+function readCodexOpeningWithin(
   file: string,
+  bound: number,
   onRead?: () => void,
-  bound = FIRST_LINE_BYTES,
-): { value: CodexSessionMeta; revision: FileRevision } | null {
+): { value: CodexSessionMeta | typeof OPENING_PAST_BOUND; revision: FileRevision } | null {
   const opening = readQualifiedOpening(
     file,
     (fd) => {
-      const meta = openingRecordOf(firstLineFromDescriptor(file, fd, bound));
+      const line = firstLineFromDescriptor(file, fd, bound);
+      if (line === null) return OPENING_PAST_BOUND;
+      const meta = openingRecordOf(line);
       return meta?.sessionId && meta.cwd ? meta : null;
     },
     onRead,
   );
-  return opening ? { ...opening, value: openingWithStat(opening.value, opening.revision) } : null;
+  if (!opening) return null;
+  if (opening.value === OPENING_PAST_BOUND) return opening.revision.size > bound ? opening : null;
+  return { ...opening, value: openingWithStat(opening.value, opening.revision) };
+}
+
+export function readQualifiedCodexOpening(
+  file: string,
+  onRead?: () => void,
+): { value: CodexSessionMeta; revision: FileRevision } | null {
+  const opening = readCodexOpeningWithin(file, FIRST_LINE_BYTES, onRead);
+  return opening && opening.value !== OPENING_PAST_BOUND ? { value: opening.value, revision: opening.revision } : null;
+}
+
+// The opening that a session read qualifies, inside its byte limit of `CODEX_OPENING_BYTES`.
+export function readSessionCodexOpening(
+  file: string,
+): { value: CodexSessionMeta | typeof OPENING_PAST_BOUND; revision: FileRevision } | null {
+  return readCodexOpeningWithin(file, CODEX_OPENING_BYTES);
 }
 
 // Read the first line asynchronously. This read owns its `META_BYTES` buffer until settlement.

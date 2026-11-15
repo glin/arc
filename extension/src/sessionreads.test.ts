@@ -30,6 +30,7 @@ import {
   SESSION_READ_LIMITS,
 } from './sessionreads.ts';
 import { openReadWindow, closeReadWindow } from './readmeter.ts';
+import { CODEX_OPENING_BYTES } from './codex.ts';
 import * as repeatedRecords from './clauderepeated.ts';
 import { projectAgentRead, currentAgentRead, type AgentReadRecord } from './domain/read.ts';
 
@@ -701,31 +702,129 @@ test('bounded session reads preserve native provider turns and reject stale scop
   assert.equal('observation' in oversized, false);
 });
 
-test('a session read refuses a Codex opening record longer than 128 KiB after reading at most 128 KiB', () => {
-  const directory = tempDir('session-read-');
-  const file = path.join(directory, 'codex.jsonl');
-  const records = [
-    {
+// A Codex opening record whose line, with its newline, takes exactly `bytes` bytes.
+function codexOpeningLine(directory: string, bytes: number): Buffer {
+  const record = (padding: string) =>
+    JSON.stringify({
       type: 'session_meta',
       timestamp: '2026-10-08T12:00:00Z',
-      payload: { id: 'known', cwd: directory, source: 'cli', base_instructions: 'x'.repeat(150 * 1024) },
+      payload: { id: 'known', cwd: directory, source: 'cli', base_instructions: padding },
+    });
+  const line = Buffer.from(record('x'.repeat(bytes - 1 - Buffer.byteLength(record('')))) + '\n');
+  assert.equal(line.length, bytes);
+  return line;
+}
+
+const codexTurn = Buffer.from(
+  [
+    { type: 'event_msg', timestamp: '2026-10-08T12:00:01Z', payload: { type: 'task_started', turn_id: 'turn-1' } },
+    {
+      type: 'turn_context',
+      timestamp: '2026-10-08T12:00:01Z',
+      payload: { turn_id: 'turn-1', model: 'gpt-6.1-sol', effort: 'high' },
     },
     { type: 'event_msg', timestamp: '2026-10-08T12:00:01Z', payload: { type: 'user_message', message: 'prompt' } },
-  ];
-  fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
-  const source = {
-    agent: 'codex' as const,
-    file,
-    sessionId: 'known',
-    cwd: directory,
-    ...revisionOf(fs.statSync(file, { bigint: true })),
-  };
+    {
+      type: 'event_msg',
+      timestamp: '2026-10-08T12:00:01Z',
+      payload: { type: 'task_complete', turn_id: 'turn-1', last_agent_message: 'answer' },
+    },
+  ]
+    .map((record) => JSON.stringify(record) + '\n')
+    .join(''),
+);
+
+function sessionSource(agent: SessionFile['agent'], file: string, directory: string) {
+  return { agent, file, sessionId: 'known', cwd: directory, ...revisionOf(fs.statSync(file, { bigint: true })) };
+}
+
+const OPENING_UNAVAILABLE = 'The session opening is unavailable or changed during qualification. Retry the command.';
+
+test('a session read refuses a Codex opening record past 128 KiB without retry advice after reading at most 128 KiB', () => {
+  const directory = tempDir('session-read-');
+  const file = path.join(directory, 'codex.jsonl');
+  fs.writeFileSync(file, Buffer.concat([codexOpeningLine(directory, CODEX_OPENING_BYTES + 1), codexTurn]));
   const window = openReadWindow();
-  const refused = boundedSessionRead(source, 2, () => 'scope', null, [directory]);
+  const refused = boundedSessionRead(sessionSource('codex', file, directory), 2, () => 'scope', null, [directory]);
   const tally = closeReadWindow(window);
   assert.equal(refused.state, 'stale');
-  assert.match(refused.notes.join(' '), /opening is unavailable/);
-  assert.ok(tally.bytes <= 128 * 1024, `the qualification read ${tally.bytes} bytes`);
+  assert.deepEqual(refused.turns, []);
+  assert.deepEqual(refused.notes, [
+    'The session opening exceeds the 128 KiB read limit. This command cannot read this session.',
+  ]);
+  assert.doesNotMatch(refused.notes.join(' '), /retry/i);
+  assert.ok(tally.bytes <= CODEX_OPENING_BYTES, `the qualification read ${tally.bytes} bytes`);
+});
+
+test('a session read keeps the retry refusals for an opening that a retry can read', () => {
+  const directory = tempDir('session-read-');
+  const file = path.join(directory, 'codex.jsonl');
+  const read = (agent: SessionFile['agent'] = 'codex') =>
+    boundedSessionRead(sessionSource(agent, file, directory), 2, () => 'scope', null, [directory]);
+  // An opening record that ends at the last byte of the limit reads.
+  fs.writeFileSync(file, Buffer.concat([codexOpeningLine(directory, CODEX_OPENING_BYTES), codexTurn]));
+  const fits = read();
+  assert.equal(fits.state, 'current');
+  assert.deepEqual(
+    fits.turns.map((turn) => [turn.prompt, turn.summary]),
+    [['prompt', 'answer']],
+  );
+  // A first record that a writer has not finished, in a file that ends inside the limit or at it.
+  for (const bytes of [512, CODEX_OPENING_BYTES]) {
+    fs.writeFileSync(file, codexOpeningLine(directory, CODEX_OPENING_BYTES + 1).subarray(0, bytes));
+    const unfinished = read();
+    assert.equal(unfinished.state, 'stale');
+    assert.deepEqual(unfinished.notes, [OPENING_UNAVAILABLE], `a file of ${bytes} bytes`);
+  }
+  const oversized = Buffer.concat([codexOpeningLine(directory, CODEX_OPENING_BYTES + 1), codexTurn]);
+  fs.writeFileSync(file, oversized);
+  const source = sessionSource('codex', file, directory);
+  const openFile = filesystem.openSync;
+  const unreadable = vi.spyOn(filesystem, 'openSync').mockImplementation((...args: any[]) => {
+    if (args[0] === file) throw Object.assign(new Error('unread opening'), { code: 'EACCES' });
+    return (openFile as any)(...args);
+  });
+  syncBuiltinESMExports();
+  try {
+    assert.deepEqual(boundedSessionRead(source, 2, () => 'scope', null, [directory]).notes, [OPENING_UNAVAILABLE]);
+  } finally {
+    unreadable.mockRestore();
+    syncBuiltinESMExports();
+  }
+  const readFile = filesystem.readSync;
+  let wrote = false;
+  const writing = vi.spyOn(filesystem, 'readSync').mockImplementation((...args: any[]) => {
+    const bytes = (readFile as any)(...args);
+    if (!wrote) {
+      wrote = true;
+      fs.appendFileSync(file, '\n');
+    }
+    return bytes;
+  });
+  syncBuiltinESMExports();
+  try {
+    assert.deepEqual(boundedSessionRead(source, 2, () => 'scope', null, [directory]).notes, [OPENING_UNAVAILABLE]);
+  } finally {
+    writing.mockRestore();
+    syncBuiltinESMExports();
+  }
+  fs.renameSync(file, `${file}.retained`);
+  fs.writeFileSync(file, oversized);
+  assert.deepEqual(boundedSessionRead(source, 2, () => 'scope', null, [directory]).notes, [
+    'The session source was replaced. Retry after session discovery.',
+  ]);
+  // A Claude transcript whose first record is past the limit keeps its refusal.
+  fs.writeFileSync(
+    file,
+    JSON.stringify({
+      type: 'user',
+      sessionId: 'known',
+      cwd: directory,
+      timestamp: '2026-10-08T12:00:00Z',
+      message: { role: 'user', content: 'x'.repeat(CODEX_OPENING_BYTES) },
+    }) + '\n',
+  );
+  assert.deepEqual(read('claude').notes, [OPENING_UNAVAILABLE]);
 });
 
 test('session attention stays unknown for hidden panels and unavailable facts', () => {
