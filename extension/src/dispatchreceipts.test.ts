@@ -161,24 +161,94 @@ test('a store modified inside the write margin gives no revision until it ages',
 });
 
 // A completed scan follows a moved store root by its entry names. So each write of a root entry creates the entry, as an
-// exclusive file or a new directory. A rewrite in place, a rename over an entry and a removal keep the names.
-test('each write of a store root entry creates the entry', () => {
-  const source = fs.readFileSync(path.join(__dirname, 'dispatchreceipts.ts'), 'utf8');
-  const entry = String.raw`paths?\.join\(this\.root, [^,()]+\)`;
-  const held = [...source.matchAll(new RegExp(String.raw`const (\w+) = ${entry};`, 'g'))].map((match) => match[1]);
-  const rootEntry = new RegExp(String.raw`${entry}|\b(?:${held.join('|')})\b`);
+// exclusive file or a new directory. A rewrite in place, a rename or copy over an entry and a removal keep the names. The
+// scan reads each module that names the store root. It follows an alias of the root or of an entry through a declaration,
+// and a join, resolve or dirname with one name. It misses a path that a string concatenation, a function argument or a
+// property builds.
+test('each write of a store root entry creates the entry, through any sync, callback or promise write and any root alias', () => {
+  const repository = path.join(__dirname, '..', '..');
+  const join = String.raw`\bpaths?\.(?:join|resolve)\(\s*`;
+  const seeds = (file: string) => [
+    ...(file === 'extension/src/dispatchreceipts.ts' ? [String.raw`this\.root`] : []),
+    String.raw`\breceipts\.root\b`,
+    String.raw`${join}[^()]*'dispatch'\)`,
+  ];
+  const modules = ['extension/src', 'cli/src']
+    .flatMap((folder) =>
+      fs
+        .readdirSync(path.join(repository, folder), { recursive: true, encoding: 'utf8' })
+        .filter((name) => name.endsWith('.ts') && !name.endsWith('.test.ts'))
+        .map((name) => `${folder}/${name.replaceAll('\\', '/')}`),
+    )
+    .filter((file) => {
+      const source = fs.readFileSync(path.join(repository, file), 'utf8');
+      return seeds(file).some((seed) => new RegExp(seed).test(source));
+    })
+    .sort();
+  assert.deepEqual(
+    modules,
+    ['cli/src/run.ts', 'cli/src/standalone.ts', 'extension/src/dispatchreceipts.ts'],
+    'a module that names the store root joined or left the scan',
+  );
+  // The argument text of the call whose parenthesis opens at `open`, split at its top-level commas.
+  const argumentsAt = (source: string, open: number) => {
+    const parts: string[] = [];
+    let depth = 0;
+    let start = open + 1;
+    for (let index = open; index < source.length; index++) {
+      const char = source[index];
+      if (char === "'" || char === '"') {
+        index = source.indexOf(char, index + 1);
+        continue;
+      }
+      if (char === '(' || char === '[' || char === '{') depth++;
+      else if (char === ')' || char === ']' || char === '}') depth--;
+      if ((char === ',' && depth === 1) || depth === 0) {
+        parts.push(source.slice(start, index).trim());
+        start = index + 1;
+      }
+      if (depth === 0) return parts;
+    }
+    return parts;
+  };
   const writes =
-    /\b(exclusive|fs\.mkdirSync|fs\.\w*(?:write|append|rename|link|unlink|rm|copy|truncate|utimes|symlink)\w*Sync|writeFileAtomically|this\.replace|mark)\(([^;]*)/g;
+    /\b(?:fs\.promises\.|fsp\.|promises\.|fs\.)(writeFile|appendFile|open|rename|copyFile|cp|link|symlink|unlink|rm|rmdir|truncate|utimes|lutimes|chmod|chown|mkdir)(?:Sync)?\(|\b(writeFileAtomically|this\.replace|exclusive|mark)\(/g;
   const creators: string[] = [];
-  for (const [, call, args] of source.matchAll(writes)) {
-    if (!rootEntry.test(args)) continue;
-    assert.ok(
-      ['exclusive', 'fs.mkdirSync'].includes(call),
-      `${call}(${args.slice(0, 80)} writes a store root entry in place`,
-    );
-    creators.push(call);
+  const refused: string[] = [];
+  for (const file of modules) {
+    const source = fs.readFileSync(path.join(repository, file), 'utf8');
+    const roots = new Set(seeds(file));
+    const entries = new Set<string>();
+    const pattern = () => {
+      const names = entries.size ? String.raw`|\b(?:${[...entries].join('|')})\b` : '';
+      const root = String.raw`(?:${[...roots].join('|')}${entries.size ? String.raw`|paths?\.dirname\(\s*(?:${[...entries].join('|')})\s*\)` : ''})`;
+      return { root, entry: String.raw`(?:${join}${root}\s*,\s*[^,()]+\)${names})` };
+    };
+    for (let size = -1; size !== roots.size + entries.size;) {
+      size = roots.size + entries.size;
+      const { root, entry } = pattern();
+      const declared = (value: string) =>
+        [...source.matchAll(new RegExp(String.raw`\b(?:const|let|var)\s+(\w+)\s*=\s*${value}\s*[;,\n]`, 'g'))].map(
+          (match) => match[1],
+        );
+      for (const name of declared(root)) roots.add(String.raw`\b${name}\b`);
+      for (const name of declared(entry)) entries.add(name);
+    }
+    const { root, entry } = pattern();
+    const rootPath = new RegExp(String.raw`^(?:${entry}|${root})$`);
+    for (const match of source.matchAll(writes)) {
+      const call = match[1] ?? match[2];
+      const args = argumentsAt(source, match.index + match[0].length - 1);
+      if (!args.some((arg) => rootPath.test(arg))) continue;
+      const flags = args.slice(1).join(',');
+      if (call === 'open' && !/['"][wa]|\+['"]|O_WRONLY|O_RDWR|O_CREAT|O_TRUNC|O_APPEND/.test(flags)) continue;
+      const exclusiveCreate = /['"]wx['"]|O_EXCL/.test(flags) && ['writeFile', 'open'].includes(call);
+      if (['mkdir', 'exclusive', 'mark'].includes(call) || exclusiveCreate) creators.push(`${file} ${call}`);
+      else refused.push(`${file}: ${match[0]}${args.join(', ').slice(0, 100)})`);
+    }
   }
-  assert.ok(creators.length >= 4, `the scan found ${creators.length} root entry writes`);
+  assert.deepEqual(refused, [], 'a write replaces, removes or rewrites a store root entry in place');
+  assert.ok(creators.length >= 4, `the scan found ${creators.length} root entry creations`);
 });
 
 test('a receipt that names a compressed child transcript links no session', () => {

@@ -293,9 +293,11 @@ export interface DispatchRelationshipStep extends DispatchRelationshipAllowance 
   startup?: DispatchStartupRevision;
   // The final step of a launch whose read used the relationship cache, because its working directory was missing.
   cache?: true;
-  // The final step of a launch whose read stopped on its anchor or a binding names the root entry that publishes that file,
-  // with true when the file was missing.
-  unread?: { name: string; missing: boolean };
+  // A read or parse of the anchor or a binding can throw on a present file. The final step then names the root entry that
+  // publishes that file. `revision` is the stat of the last file that the read checked.
+  unread?: { name: string; revision?: string };
+  // The root entries that the read checked and found absent. A missing anchor or binding names the entry that publishes it.
+  absent?: string[];
 }
 // The names in the store root by launch ID, sorted and joined, with a slash after a directory name. `complete` is true after
 // the listing read the last entry.
@@ -316,8 +318,8 @@ export interface DispatchStoreRevision {
   observedAt: number;
 }
 // The device, inode and modification time of the store root and of the relationship cache directory. A part is an empty
-// string for a missing directory, undefined for a directory that is too young, and null for a path that cannot be read or
-// holds no directory.
+// string for a missing directory. It is undefined for a directory that is too young. It is null for a path that cannot be
+// read or holds no directory.
 export interface DispatchStoreRevisions {
   root: string | null | undefined;
   cache: string | null | undefined;
@@ -340,6 +342,11 @@ export function dispatchStartupRevision(file: string): string | null {
   const stat = fs.lstatSync(file, { bigint: true, throwIfNoEntry: false });
   return stat?.isFile() ? relationshipRevision(stat) : null;
 }
+// The modification time in milliseconds of a file revision that a receipt read took, or undefined for a directory.
+export function dispatchRevisionModifiedAt(revision: string): number | undefined {
+  const parts = revision.split(':');
+  return parts.length === 5 ? Number(BigInt(parts[3]) / 1_000_000n) : undefined;
+}
 // The form in which the file comparison of a receipt read compares a transcript path on a platform. On Windows it resolves
 // the path and lowers its letter case. On other platforms it resolves the path and keeps each backslash as a name character.
 export function dispatchFileKey(file: string, platform: NodeJS.Platform): string {
@@ -355,9 +362,12 @@ class RelationshipReader {
   stop?: DispatchRelationshipStop;
   startup?: DispatchStartupRevision;
   cache?: true;
-  unread?: { name: string; missing: boolean };
+  unread?: { name: string; revision?: string };
+  absent?: string[];
   // True after a path check found no entry.
   missing = false;
+  // The revision of the last path that a stat checked.
+  last?: string | null;
   readonly revisions = new Map<string, string | null>();
   readonly digests = new Map<string, string>();
   private readonly descriptors = new Set<number>();
@@ -404,6 +414,7 @@ class RelationshipReader {
     if (this.revisions.has(file) && this.revisions.get(file) !== revision)
       throw new Error('The dispatch relationship evidence changed.');
     this.revisions.set(file, revision);
+    this.last = revision;
     return stat;
   }
   *path(file: string, allowMissing = false): RelationshipScan<void> {
@@ -586,6 +597,7 @@ export class DispatchReceipts {
         ...(reference ? { reference } : reader.stop ? { stop: reader.stop } : {}),
         ...(reference && reader.startup ? { startup: reader.startup } : {}),
         ...(reader.cache ? { cache: reader.cache } : {}),
+        ...(reader.absent ? { absent: reader.absent } : {}),
       };
       reader.progress = emptyRelationshipStep();
       return reference;
@@ -598,6 +610,7 @@ export class DispatchReceipts {
         ...(reader.refusal ? { refusal: { ...reader.refusal, launchId: id } } : {}),
         ...(reader.cache ? { cache: reader.cache } : {}),
         ...(reader.unread ? { unread: reader.unread } : {}),
+        ...(reader.absent ? { absent: reader.absent } : {}),
       };
       return null;
     } finally {
@@ -716,12 +729,14 @@ export class DispatchReceipts {
     const paths = this.platform === 'win32' ? path.win32 : path.posix;
     const directory = paths.join(this.root, id);
     const file = paths.join(directory, 'receipt.json');
-    // A root entry publishes each file that the read takes before a lookup. A failed read of such a file names that entry.
+    // A root entry publishes the anchor and each binding. A read or parse of such a file that throws names that entry,
+    // unless the read was refused. A check of the anchor after its parse returns no link and names nothing.
     const published = function* <T>(name: string, read: () => RelationshipScan<T>): RelationshipScan<T> {
       try {
         return yield* read();
       } catch (error) {
-        reader.unread = { name, missing: reader.missing };
+        if (reader.missing) reader.absent = [...(reader.absent ?? []), name];
+        else if (!reader.refusal) reader.unread = { name, ...(reader.last ? { revision: reader.last } : {}) };
         throw error;
       }
     };
@@ -781,12 +796,14 @@ export class DispatchReceipts {
         throw new Error('The committed dispatch identity changed.');
       return value;
     };
+    const refusals = [`${id}.startup-refused.json`, `${id}.startup-refused.accepting.json`];
     for (const refused of [
       paths.join(directory, 'startup-refused.json'),
-      paths.join(this.root, `${id}.startup-refused.json`),
-      paths.join(this.root, `${id}.startup-refused.accepting.json`),
+      ...refusals.map((name) => paths.join(this.root, name)),
     ])
       if (yield* reader.stat(refused)) return null;
+    // A refusal that a writer publishes after this check adds one of these names to the root.
+    reader.absent = refusals;
     const accepted = yield* binding('accepted');
     if (
       accepted.provider !== options.provider ||
