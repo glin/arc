@@ -197,7 +197,7 @@
   "extension/src/startup.budget.test.ts": {
     "reason": "Session list reads, walks and posts must match their recorded counts through a real host and discovery worker. The script covers cold and warm starts, watcher events and polls. Controlled listed-session writes must reach settled discovery. A native write must take at most two host requests across receipt byte sizes and listed-session counts. First launch must publish before discovery completes. New native and dispatched sessions must join the list. A cold start whose transcripts fit in one request must publish its first sessions before the receipt scan ends. The completion must post the card of the finished rollout with its turn start, then post it again without it.",
     "cases": 5,
-    "matricesSha256": "9d947d34939aa619f27d4bd9f5600ba9deea5ec39849e980a58f9f509e49dce4"
+    "matricesSha256": "9fa2c8b866a5791629a737b809fc056a54cf2f78e5a4ff799f253c82f9205f73"
   },
   "extension/src/startup.host-work.budget.test.ts": {
     "reason": "Host block executions must detect new session traversals without product counters. The case covers settled polls, selections, one turn, discovery replies and session list posts. The selection must stay at or below its absolute block execution ceiling at each size.",
