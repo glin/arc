@@ -2,6 +2,7 @@ import { test, vi } from 'vitest';
 import assert from 'node:assert';
 import {
   BoundedTrailingScheduler,
+  childEventRefreshes,
   IntegrityScheduler,
   listedFilesFor,
   mergeRefreshRequests,
@@ -1011,4 +1012,10 @@ test('merged requests keep the files that reusing requests name', () => {
   assert.deepEqual(mergeRefreshRequests(request(true, ['a']), request(true, null)).changedPaths, ['a']);
   assert.deepEqual(mergeRefreshRequests(request(true, ['a']), request(false, ['b'])).changedPaths, ['a', 'b']);
   assert.equal(mergeRefreshRequests(request(true, ['a']), request(false, null)).changedPaths, null);
+});
+
+test('a thinking event is the only live child event that starts no refresh', () => {
+  assert.equal(childEventRefreshes('thinking'), false);
+  for (const kind of ['tool', 'turnEnd', 'ask', 'askResolved', 'session', 'ready', 'rateLimit', 'error'])
+    assert.equal(childEventRefreshes(kind), true, kind);
 });

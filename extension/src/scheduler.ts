@@ -672,6 +672,15 @@ export function childEventNamesFiles(kind: string): boolean {
   return !DRAW_ONLY_CHILD_EVENTS.has(kind);
 }
 
+// Live child events that start no refresh. A `thinking` event carries no data. The directory watcher, the poll and the
+// turn's later events bring its transcript writes to the panel.
+const NO_REFRESH_CHILD_EVENTS = new Set(['thinking']);
+
+// True when a live child event starts a refresh.
+export function childEventRefreshes(kind: string): boolean {
+  return !NO_REFRESH_CHILD_EVENTS.has(kind);
+}
+
 // The longest that a warm start's finished cold pass waits for the first list to paint before it lists its walk.
 export const COLD_PASS_PAINT_LIMIT_MS = 5_000;
 

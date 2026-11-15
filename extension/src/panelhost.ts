@@ -729,6 +729,7 @@ import {
   RefreshRequest,
   ScheduledRun,
   childEventNamesFiles,
+  childEventRefreshes,
   sessionDirectoryOwners,
   unknownPathExtension,
   unknownPathShapes,
@@ -11346,7 +11347,12 @@ export class PanelProvider implements vscode.Disposable {
 
   // An event from a live agent child refreshes from the held catalog. An event that records into the session's
   // transcript names the session's listed files. A new transcript arrives through its directory watcher or the poll.
+  // An event that starts no refresh counts under its kind.
   refreshFromChild(kind: string, sessionId: string | null): void {
+    if (!childEventRefreshes(kind)) {
+      this.performanceCounters.recordWork(`childEventNoRefresh:${kind}`);
+      return;
+    }
     const files =
       sessionId && childEventNamesFiles(kind) ? listedFilesFor([sessionId], this.catalog?.sessions ?? []) : null;
     this.refreshFrom(`child:${kind}`, false, true, files);

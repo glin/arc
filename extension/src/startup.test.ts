@@ -380,6 +380,7 @@ import {
   PollDirectoryGate,
   POLL_BACKSTOP_WALK_MS,
   childEventNamesFiles,
+  childEventRefreshes,
   listedFilesFor,
   sessionDirectoryOwners,
   unknownPathExtension,
@@ -16662,6 +16663,7 @@ function pollWalkHarness(scope: Record<string, unknown> = {}) {
       POLL_BACKSTOP_WALK_MS,
       sessionDirectoryOwners,
       childEventNamesFiles,
+      childEventRefreshes,
       listedFilesFor,
       watcherRefreshDecision,
       unknownPathShapes,
@@ -16914,6 +16916,25 @@ test('a shown transcript that grows with no watcher event lists its new revision
     const row = (provider.authoritativeCatalog as SessionFile[]).find((source) => source.file === parent);
     assert.equal(row?.size, fs.statSync(parent).size, 'the poll kept the revision from before the append');
     assert.equal(quietPolls(counters)['poll:quietMiss:shownFile'], 1);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('a thinking event from a live child starts no refresh and the next unchanged poll stays quiet', async () => {
+  const { start, poll, settle, counters, provider } = quietPollHarness();
+  const receive = childEventRefresh();
+  try {
+    await start();
+    await poll();
+    await poll();
+    receive(provider, { get: () => ({ state: () => ({ sessionId: 'parent' }) }) }, 'child', { kind: 'thinking' });
+    await settle();
+    await poll();
+    const { refreshes, work } = counters.snapshot();
+    assert.equal(refreshes['child:thinking'], undefined, 'the thinking event started a refresh');
+    assert.equal(work['childEventNoRefresh:thinking'], 1);
+    assert.deepEqual(quietPolls(counters), { 'poll:quietMiss:basis': 1, 'poll:quiet': 2, refreshes: 1 });
   } finally {
     vi.useRealTimers();
   }
@@ -17602,7 +17623,7 @@ test('a selected draft keeps the held catalog through polls and child events', a
   }
 });
 
-test('a thinking event from a live child updates its session row without a walk', async () => {
+test('a tool event from a live child updates its session row without a walk', async () => {
   const { provider, parent, writeRollout, start, walks, settle } = pollWalkHarness();
   const receive = childEventRefresh();
   writeRollout('shown');
@@ -17610,10 +17631,14 @@ test('a thinking event from a live child updates its session row without a walk'
     await start();
     provider.showing = 'shown';
     fs.appendFileSync(parent, '{"type":"assistant"}\n');
-    receive(provider, { get: () => ({ state: () => ({ sessionId: 'parent' }) }) }, 'child', { kind: 'thinking' });
+    receive(provider, { get: () => ({ state: () => ({ sessionId: 'parent' }) }) }, 'child', {
+      kind: 'tool',
+      name: 'Read',
+      input: {},
+    });
     await settle();
     const row = provider.authoritativeCatalog.find((session: SessionFile) => session.sessionId === 'parent');
-    assert.equal(row.size, fs.statSync(parent).size, 'the thinking event left the session row at its old size');
+    assert.equal(row.size, fs.statSync(parent).size, 'the tool event left the session row at its old size');
     assert.deepEqual(walks(), { 'walk:requested:startup': 1 });
   } finally {
     vi.useRealTimers();
