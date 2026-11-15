@@ -621,7 +621,7 @@ function firstLineFromDescriptor(file: string, fd: number, bound = FIRST_LINE_BY
 }
 
 // `bound` limits the first line that the read decides. The value is `OPENING_PAST_BOUND` when that line does not end
-// inside `bound` while the file holds more bytes. A file that ends at or inside `bound` reads as no opening.
+// inside `bound` while the file holds more bytes. A file that ends at or inside `bound` with that line unfinished reads as null.
 function readCodexOpeningWithin(
   file: string,
   bound: number,
