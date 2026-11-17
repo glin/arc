@@ -42,7 +42,7 @@ Positive model turns establish participating model completion. A zero-model resu
 
 ## Claude Remote Control
 
-`remote_control` sends an `enabled` boolean and starts no turn. Require `remote_control_available: true` in initialize. Ignore auto-enable fields. The toggle uses only this window's live Claude child. Refuse drafts, absent children, and fixed read-only policies. Send the toggle to agent runs like any other child. Start no child for a toggle.
+`remote_control` sends an `enabled` boolean and starts no turn. Require `remote_control_available: true` in initialize. Ignore auto-enable fields. The toggle reuses this window's Claude child or starts one through normal session startup. Recorded sessions resume in their recorded working directory. New drafts retain a provisional child and their selected setup until the first local or remote input adopts their identity. Startup sends no user prompt. Refuse fixed read-only policies before startup. Send the toggle to agent runs like any other child.
 
 Enable replies carry `session_url`, `connect_url`, `bridge_epoch`, and `bridge_session_id`. Retain the epoch for failure matching. Bridge identity never replaces local identity. Disable replies carry no fields. Errors retain prior state. [Prompt delivery](prompt-delivery.md#local-controls) owns link presentation.
 
@@ -94,13 +94,13 @@ Without a live child, Claude resumes in the recorded directory and sends only th
 
 [`AgentHost`](../extension/src/agenthost.ts) serializes openings by host key and provider session ID. Replacement and rename-only writers wait for confirmed prior exit, including IDs adopted under fresh keys. Termination requests do not release that barrier. Disposal refuses pending and later openings.
 
-Arc publishes restored archive membership at startup, every later change, and an empty set after a workspace clears. `AgentHost` acts only on complete sets. Idle and archive retirement wait for the latest turn-end usage and MCP reads from [`extension.ts`](../extension/src/extension.ts). Prompt and control activity must hold a lease before work. [`AgentHost`](../extension/src/agenthost.ts) owns eligibility, generations, and the `arc.agentIdleMinutes` timer.
+Arc publishes restored archive membership at startup, every later change, and an empty set after a workspace clears. `AgentHost` acts only on complete sets. Arc includes each archived provisional draft's provider session identity in that set. Idle and archive retirement wait for the latest turn-end usage and MCP reads from [`extension.ts`](../extension/src/extension.ts). Prompt and control activity must hold a lease before work. [`AgentHost`](../extension/src/agenthost.ts) owns eligibility, generations, and the `arc.agentIdleMinutes` timer.
 
 Identified background launches hold idle and targeted retirement until identified terminal completion. A root task notice releases its launch as a user record, or as a replayed user record when Claude absorbs the notice during a turn. Missing reads, source replacement, later turns, display expiry, Stop, and unknown notices never release those holds. Unresolved work retains its child until the reader archives the session. Archive retirement ignores this hold, so a background job that the session still runs can end with its child. A targeted retirement that waits on that child resolves after the child's exit is confirmed. Archive retirement past this hold closes the open launches of every session that the child ran, including a session that `/clear` replaced, until the window reloads. A resumed child and a later transcript read do not reopen them. A launch that the resumed session starts holds its child. A task ID that was not open at that close also holds its child, under a reused tool ID or from a foreground call.
 
 Remote Control states except off prevent unarchived idle retirement. Returning off starts a fresh idle window. Archive, targeted retirement, and shutdown ignore that Remote Control hold. Closing input precedes termination after the grace period. Arc never signals processes the child started.
 
-Abandoning a draft or closing the last panel retires retained draft MCP children. Retirement preserves saved identity and accepted settings for resume.
+Changing a draft setup, abandoning a draft, or closing the last panel retires retained draft children. Retirement preserves saved identity and accepted settings for resume.
 
 Agent-wide permission and MCP changes lease every target before the first await. MCP leases last through the final status read. Build replacement settings after prior exit. Preserve provisional draft settings during publication. A fork stores its accepted profile under the returned identity. [Catalogs and applied defaults](session-setup.md#catalogs-and-applied-defaults) owns draft profile acceptance.
 

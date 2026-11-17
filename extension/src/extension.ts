@@ -526,6 +526,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     },
     onEvent: ({ key, event, turnId, dispatchTurnId, usageSource }) => {
       panel.onDispatchEvent?.(key, event, dispatchTurnId ?? turnId);
+      if (event.kind === 'sessionInitialized') {
+        const draftOwner = [...draftMcpKeys].find(([, childKey]) => childKey === key)?.[0];
+        if (draftOwner) panel.noteDraftSession(draftOwner, event.sessionId);
+      }
       if (event.kind === 'responseRate') {
         const where = host.get(key)?.state().sessionId;
         if (where === event.rate.sessionId) panel.noteResponseRate(where, event.rate, turnId);
@@ -727,6 +731,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (commandStateChanges.delete(state.key)) {
         return;
       }
+      const draftOwner = [...draftMcpKeys].find(([, key]) => key === state.key)?.[0];
+      if (draftOwner && state.exited) panel.noteRemoteControlOff(draftOwner);
+      if (draftOwner && state.busy && state.sessionId) panel.noteDraftSession(draftOwner, state.sessionId);
       updateAgentAffordance();
       if (!state.busy && !state.exited) {
         void usageReads
@@ -789,7 +796,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     host.retainBackgroundWork(session.agent, session.sessionId, commands, children);
   panel.onArchivedSessionsChange = (sessions) => {
     compaction?.archived(sessions);
-    host.setArchived(sessions);
+    const archived = new Set(sessions);
+    for (const [draft, key] of draftMcpKeys) {
+      const session = host.get(key)?.state().sessionId;
+      if (sessions.has(draft) && session) archived.add(session);
+    }
+    host.setArchived(archived);
   };
 
   host.setArchived(panel.archivedSessions());
@@ -2190,15 +2202,44 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         await readIdleMcp(which, directory, owner, revision, mcpSurfaceGeneration);
       }
     });
-  // Remote Control acts only on this window's running Claude process for the session. It starts no child.
-  panel.onRemoteControl = async (session, observer) => {
-    const live = host.find('claude', session);
-    if (!live) return { result: { outcome: 'stopped' }, session: null };
-    // Name the session the child holds when each result arrives, because a Claude `/clear` changes it.
-    // A child that exited or lost its key names none: its exit already took the connection away.
-    const holder = () => (host.get(live.key) === live && !live.state().exited ? live.state().sessionId : null);
-    const settled = await host.remoteControl(live.key, (result) => observer(result, holder()));
-    return { result: settled ?? { outcome: 'stopped' }, session: holder() };
+  // Remote Control starts the session without submitting a prompt. Provisional children keep their draft owner until input starts.
+  panel.onRemoteControl = async (session, observer, cwd, draft, current) => {
+    const existing = draft ? null : host.find('claude', session);
+    if (draft?.policy?.readOnly || (!draft && (existing ? existing.policy : policies.read(session))?.readOnly))
+      return { result: { outcome: 'policy' }, session: null };
+    let live: AgentSession | null = null;
+    const holder = (): string | null => {
+      if (!live || host.get(live.key) !== live || live.state().exited) return null;
+      return draft && draftMcpKeys.get(draft.draftId) === live.key ? draft.draftId : live.state().sessionId;
+    };
+    const toggle = async (child: AgentSession) => {
+      live = child;
+      return await host.remoteControl(child.key, (result) => observer(result, holder()));
+    };
+    let result;
+    if (draft) {
+      const key = freshHostKey('claude', draft.draftId);
+      const plan = freshPlanForDraft(draft);
+      result = await host.withSessionActivity(
+        key,
+        () => {
+          if (!current()) throw new Error('The draft setup changed or its panel closed. Send the command again.');
+          draftMcpKeys.set(draft.draftId, key);
+          return plan();
+        },
+        async (child) => {
+          if (!current()) throw new Error('The draft setup changed or its panel closed. Send the command again.');
+          return await toggle(child);
+        },
+      );
+    } else {
+      result = existing
+        ? await host.withActivity(existing.key, toggle)
+        : await withExistingSessionActivity('claude', session, cwd, toggle, (reason) => {
+            throw new Error(reason);
+          });
+    }
+    return { result: result ?? { outcome: 'stopped' }, session: holder() };
   };
   const openPanelControl = panel.onPanelCommand;
   panel.onPanelCommand = (owner, agent, control, draft, cwd) => {
@@ -2241,6 +2282,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     for (const agent of USAGE_AGENT_ORDER) {
       acceptedDrafts.delete(freshHostKey(agent as AgentName, provisional));
     }
+    const key = draftMcpKeys.get(provisional);
+    if (key) host.cancelSessionRetirement(key);
+    draftMcpKeys.delete(provisional);
     mcpRefreshes.cancel(provisional);
     mcp.adopt(provisional, actual);
     if (activeMcpOwner === provisional) {
@@ -2253,7 +2297,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     mcpSurfaceGeneration++;
     mcp.invalidateInitialReads();
     mcpRefreshes.dispose();
-    for (const key of draftMcpKeys.values()) {
+    for (const [owner, key] of draftMcpKeys) {
+      panel.noteRemoteControlOff(owner);
       void host.retireSession(key);
     }
     draftMcpKeys.clear();
@@ -2552,7 +2597,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     publishPicks();
     return session;
   };
-  const freshPlanForDraft = (draft: NewSessionDraft, replayUserMessages = false): AgentPlanSource => {
+  const freshPlanForDraft = (draft: NewSessionDraft, replayUserMessages = false): (() => AgentPlan) => {
     const launch = launchFor(draft.profile.agent);
     if (launch.problem) {
       throw new Error(launch.problem);

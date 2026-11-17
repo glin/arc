@@ -5068,11 +5068,7 @@ export const REMOTE_CONTROL_ARGUMENTS =
 
 // A Remote Control toggle's result, including the refusals the panel decides before it reaches a Claude process.
 // `stopped` covers a session without a running Claude process in this window, including one that runs elsewhere.
-export type RemoteControlOutcome =
-  | RemoteControlResult
-  | { outcome: 'arguments' }
-  | { outcome: 'draft' }
-  | { outcome: 'stopped' };
+export type RemoteControlOutcome = RemoteControlResult | { outcome: 'arguments' } | { outcome: 'stopped' };
 
 // The Remote Control session link Arc may store, draw, link, and open. Only an `https:` URL with no
 // whitespace and no character that can open or close a Markdown link passes. Any other value is null.
@@ -5138,11 +5134,6 @@ export function remoteControlNotice(result: RemoteControlOutcome): { level: 'inf
       };
     case 'arguments':
       return { level: 'warning', text: 'Arc: send /remote-control or /rc by itself, with nothing after it.' };
-    case 'draft':
-      return {
-        level: 'warning',
-        text: 'Arc: Remote Control needs a running session. Send a first prompt, then run /remote-control again.',
-      };
     // `stopped` and `closed`.
     default:
       return {

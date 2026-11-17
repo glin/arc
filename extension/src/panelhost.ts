@@ -1682,6 +1682,8 @@ export class PanelProvider implements vscode.Disposable {
   // Connected Remote Control by session id, with the link that passed `remoteControlLink` or null.
   // Memory only: the link never enters saved drafts or workspace state.
   private remoteControl = new Map<string, { url: string | null }>();
+  // Pending and late results follow adoption even after navigation aliases expire. Retirement invalidates their displayed identity.
+  private remoteControlDrafts = new Map<string, { draft: NewSessionDraft; session: string | null }>();
   private clearingDraftRevision: { session: string; revision: number } | null = null;
   private panelRecoveryWaiters = new Map<string, { resolve(): void; reject(error: unknown): void }>();
   private disposed = false;
@@ -2219,13 +2221,16 @@ export class PanelProvider implements vscode.Disposable {
     | undefined;
   // Reads a Codex speed setting without a session or turn.
   public onReadFastEvidence: ((cwd: string | null, model: string) => Promise<ServiceTierEvidence | null>) | undefined;
-  // Toggles Remote Control on the session's running Claude process. `observer` receives later results.
+  // Starts or reuses the session's Claude process, then toggles Remote Control. `observer` receives later results.
   // Every result comes with the session id the process holds when it arrives, which a Claude `/clear`
   // changes, or null when that process has exited or retired.
   public onRemoteControl:
     | ((
         session: string,
         observer: (result: RemoteControlOutcome, session: string | null) => void,
+        cwd: string | null,
+        draft: NewSessionDraft | null,
+        current: () => boolean,
       ) => Promise<{ result: RemoteControlOutcome; session: string | null }>)
     | null = null;
   public onDraftProfileChanged: ((draft: NewSessionDraft) => void) | null = null;
@@ -7191,6 +7196,7 @@ export class PanelProvider implements vscode.Disposable {
     delete this.newDrafts[draftId];
     this.saved.readerParents = abandonReaderParents(this.saved.readerParents ?? {}, draftId);
     delete this.mcpServers[draftId];
+    if (this.remoteControl.has(draftId) || this.remoteControlDrafts.has(draftId)) this.noteRemoteControlOff(draftId);
     this.onDraftRemoved?.(removed);
     // Remove labels for the abandoned draft so they occupy no stored session slot.
     if (labelsOf(this.saved.labels, draftId).length) {
@@ -7202,6 +7208,14 @@ export class PanelProvider implements vscode.Disposable {
       this.refreshFrom('draft-removed', true);
     }
     return true;
+  }
+
+  // Remote input adopts the same draft state as the first local prompt. Local delivery retains its own acceptance boundary.
+  public noteDraftSession(provisional: string, actual: string): void {
+    const draft = this.newDrafts[provisional];
+    if (!draft || draftStarted(this.live[provisional] ?? [])) return;
+    this.adoptDraft(provisional, actual);
+    this.refreshFrom('draft-started', true);
   }
 
   private adoptDraft(
@@ -7274,6 +7288,10 @@ export class PanelProvider implements vscode.Disposable {
       this.mcpServers[actual] = draftMcp;
     }
     delete this.mcpServers[provisional];
+    const remoteDraft = this.remoteControlDrafts.get(provisional);
+    if (remoteDraft) remoteDraft.session = actual;
+    this.remoteControlDrafts.delete(provisional);
+    if (this.remoteControl.has(provisional)) this.moveRemoteControl(provisional, actual);
     this.onDraftAdopted?.(provisional, actual);
     if (this.detailsMenuArm?.session === provisional) {
       this.detailsMenuArm = { ...this.detailsMenuArm, session: actual };
@@ -7406,6 +7424,7 @@ export class PanelProvider implements vscode.Disposable {
       ...tier,
     });
     if (changed) {
+      if (this.remoteControl.has(session) || this.remoteControlDrafts.has(session)) this.noteRemoteControlOff(session);
       this.onDraftProfileChanged?.(draft);
       delete this.mcpServers[session];
       this.refreshUsageHandler?.(next.agent, false, session, next.agent, draft.cwd);
@@ -10657,22 +10676,41 @@ export class PanelProvider implements vscode.Disposable {
     return true;
   }
 
-  // Remote Control works on any session with a Claude process in this window, including an agent run.
+  // Remote Control starts or reuses a Claude process in this window, including an agent run.
   // A connection counts as the reader taking the session over, so the session that holds it leaves Run by agents.
   // The takeover leaves `agentRuns` unchanged, so the prompt-cache request of the session's resumes does not change.
   private async remoteControlFromComposer(sessionId: string): Promise<void> {
+    let draft = this.newDrafts[sessionId] ?? null;
+    if (draft && !draft.handChanged) {
+      draft = { ...draft, handChanged: true };
+      this.newDrafts[sessionId] = draft;
+    }
+    let owner = draft ? this.remoteControlDrafts.get(sessionId) : undefined;
+    if (draft && owner?.draft !== draft) {
+      if (owner) owner.session = null;
+      owner = { draft, session: sessionId };
+      this.remoteControlDrafts.set(sessionId, owner);
+    }
     const settle = (result: RemoteControlOutcome, session: string | null) => {
+      if (owner?.session === null) session = null;
+      else if (owner && session === sessionId) session = owner.session;
       this.noteRemoteControl(session, result);
       if (session !== null && result.outcome === 'connected') this.notePrompted(session);
       this.showRemoteControlNotice(result);
     };
     let result: RemoteControlOutcome;
     let holder: string | null = sessionId;
-    if (Object.prototype.hasOwnProperty.call(this.newDrafts, sessionId)) result = { outcome: 'draft' };
-    else if (!this.onRemoteControl) result = { outcome: 'stopped' };
+    if (!this.onRemoteControl) result = { outcome: 'stopped' };
     else
       try {
-        ({ result, session: holder } = await this.onRemoteControl(sessionId, settle));
+        ({ result, session: holder } = await this.onRemoteControl(
+          sessionId,
+          settle,
+          draft?.cwd ?? this.ownCwdForSession('claude', sessionId),
+          draft,
+          () =>
+            !draft || (owner?.session !== null && this.newDrafts[sessionId] === draft && !this.hidden.has(sessionId)),
+        ));
       } catch (error) {
         result = { outcome: 'refused', reason: (error as Error).message || 'unknown error', late: false };
       }
@@ -10694,6 +10732,9 @@ export class PanelProvider implements vscode.Disposable {
 
   // A Claude process that exits, retires, or shuts down takes its Remote Control connection with it.
   public noteRemoteControlOff(session: string): void {
+    const owner = this.remoteControlDrafts.get(session);
+    if (owner) owner.session = null;
+    this.remoteControlDrafts.delete(session);
     if (this.remoteControl.delete(session)) void this.post({ type: 'usage', usage: this.usagePayload() });
   }
 

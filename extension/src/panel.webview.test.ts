@@ -16900,7 +16900,7 @@ test('archive and turn-end wiring reaches the process lifecycle owner', () => {
   );
   sourceMatch(
     extensionSource,
-    /panel\.onArchivedSessionsChange = \(sessions\) => \{\s*compaction\?\.archived\(sessions\);\s*host\.setArchived\(sessions\);\s*\};\s*host\.setArchived\(panel\.archivedSessions\(\)\)/,
+    /panel\.onArchivedSessionsChange = \(sessions\) => \{\s*compaction\?\.archived\(sessions\);[\s\S]{0,350}host\.setArchived\(archived\);\s*\};\s*host\.setArchived\(panel\.archivedSessions\(\)\)/,
     'AgentHost does not receive both restored and later archive sets',
   );
   sourceMatch(
@@ -22575,6 +22575,9 @@ test('provider acceptance adopts overlapping drafts without losing either setup'
     assets: {},
     queues: {},
     mcpServers: { first: [{ name: 'notes', status: 'pending' }] },
+    remoteControl: new Map([['first', { url: REMOTE_LINK }]]),
+    remoteControlDrafts: new Map<string, { session: string | null }>(),
+    moveRemoteControl: compiledProviderMethod('function (previous, next)', 'public moveRemoteControl('),
     live: {
       first: [{ ...DRAFT_SENT, sessionId: 'first' }],
       second: [{ ...DRAFT_SENT, sessionId: 'second', at: DRAFT_SENT.at + 1 }],
@@ -22657,7 +22660,12 @@ test('provider acceptance adopts overlapping drafts without losing either setup'
   host.onDraftAdopted = (provisional, actual) => mcpAdoptions.push([provisional, actual]);
   host.hidden.add('first');
   host.onArchivedSessionsChange = (sessions) => archiveChanges.push([...sessions]);
+  const remoteOwner = { session: 'first' };
+  host.remoteControlDrafts.set('first', remoteOwner);
   adopt.call(host, 'first', 'actual-first');
+  assert.deepEqual([...host.remoteControl], [['actual-first', { url: REMOTE_LINK }]]);
+  assert.equal(remoteOwner.session, 'actual-first');
+  assert.equal(host.remoteControlDrafts.has('first'), false);
   assert.deepEqual(host.saved.readerParents, { 'actual-first': 'ancestor', second: 'actual-first' });
   assert.deepEqual(
     [...host.hostSessions.values()],
@@ -22999,6 +23007,8 @@ interface DraftPanel {
   profileChanges: NewSessionDraft[];
   catalogRequests: unknown[][];
   mcpServers: Record<string, unknown[]>;
+  remoteControl: Map<string, unknown>;
+  remoteControlDrafts: Map<string, unknown>;
   onDraftProfileChanged(draft: NewSessionDraft): void;
   refreshUsageHandler(agent: string, force: boolean, owner: string): void;
   refreshFrom(reason: string, force: boolean): void;
@@ -23050,6 +23060,8 @@ function draftPanel(
     profileChanges: [],
     catalogRequests: [],
     mcpServers: {},
+    remoteControl: new Map(),
+    remoteControlDrafts: new Map(),
     refreshFrom(_reason: string, force: boolean) {
       panel.refreshed.push(force);
     },
@@ -23195,6 +23207,8 @@ test('a draft leaves on a rail press unless the reader changed it on its own con
   // A custom profile source does not identify whether the reader changed this draft.
   const fromTheForm: SessionProfile = { ...DRAFT_SETUP, source: 'custom' };
   const host = (handChanged: boolean) => ({
+    remoteControl: new Map(),
+    remoteControlDrafts: new Map(),
     newDrafts: { d1: newSessionDraft('d1', DRAFT_CWD, 's1', DRAFT_MADE_AT, fromTheForm, null, handChanged) },
     drafts: { d1: '' },
     draftCommentIds: {},
@@ -28578,6 +28592,8 @@ function queueRecoveryProvider(comments: ReturnType<typeof applyComment> = []) {
   const writes: unknown[] = [];
   const provider = Object.create(PanelProvider.prototype) as Record<string, any>;
   Object.assign(provider, {
+    remoteControl: new Map(),
+    remoteControlDrafts: new Map(),
     queues: {},
     drafts: {},
     boxText: {},
@@ -30846,6 +30862,8 @@ function liveProviderFixture(press: LivePress, newest = turn({ startedAt: press.
   const provider = Object.create(PanelProvider.prototype) as LiveProvider;
   const host = { webview: {}, visible: () => true };
   Object.assign(provider, {
+    remoteControl: new Map(),
+    remoteControlDrafts: new Map(),
     // The fixture ledger supplies no dispatched cost contribution.
     lifetimeFigures: new SessionFiguresCache(),
     sessionSpendSources: [],
@@ -45934,7 +45952,7 @@ test('a queued Remote Control command stays queued when its files exceed the pro
   }
 });
 
-test('Remote Control refuses a draft and reaches the Claude process of an agent run', async () => {
+test('Remote Control starts a draft and reaches the Claude process of an agent run', async () => {
   const remoteControlFromComposer = compiledProviderMethod(
     'async function (sessionId)',
     'private async remoteControlFromComposer(',
@@ -45944,12 +45962,16 @@ test('Remote Control refuses a draft and reaches the Claude process of an agent 
   const prompted: string[] = [];
   const late: Array<(result: unknown, session: string | null) => void> = [];
   const replies: Record<string, unknown> = {
+    draft: { outcome: 'connected', url: null, late: false },
     run: { outcome: 'connected', url: null, late: false },
     live: { outcome: 'disconnected', late: false },
     slow: { outcome: 'uncertain' },
   };
   const provider = {
-    newDrafts: { draft: {} },
+    newDrafts: { draft: { cwd: '/draft', handChanged: true } },
+    hidden: new Set<string>(),
+    remoteControlDrafts: new Map(),
+    ownCwdForSession: () => '/recorded',
     saved: { agentRuns: ['run', 'slow'] },
     isAgentRunLaunch: compiledProviderMethod('function (session)', 'public isAgentRunLaunch('),
     async onRemoteControl(session: string, observer: (result: unknown, session: string | null) => void) {
@@ -45966,13 +45988,13 @@ test('Remote Control refuses a draft and reaches the Claude process of an agent 
     },
   };
   for (const session of ['draft', 'run', 'live', 'slow']) await remoteControlFromComposer.call(provider, session);
-  assert.deepEqual(reached, ['run', 'live', 'slow'], 'a draft reached, or an agent run missed, the Claude process');
-  assert.deepEqual(notices, [{ outcome: 'draft' }, replies.run, replies.live, replies.slow]);
-  assert.deepEqual(prompted, ['run'], 'only a connected result counts as a takeover');
+  assert.deepEqual(reached, ['draft', 'run', 'live', 'slow']);
+  assert.deepEqual(notices, [replies.draft, replies.run, replies.live, replies.slow]);
+  assert.deepEqual(prompted, ['draft', 'run'], 'only a connected result counts as a takeover');
   // A late connection is recorded under the session id the child holds when it arrives.
-  late[2]({ outcome: 'connected', url: null, late: true }, 'slow-cleared');
-  late[1]({ outcome: 'ended', reason: '' }, 'live');
-  assert.deepEqual(prompted, ['run', 'slow-cleared']);
+  late[3]({ outcome: 'connected', url: null, late: true }, 'slow-cleared');
+  late[2]({ outcome: 'ended', reason: '' }, 'live');
+  assert.deepEqual(prompted, ['draft', 'run', 'slow-cleared']);
   assert.deepEqual(provider.saved.agentRuns, ['run', 'slow'], 'Remote Control changed the launch record');
   assert.equal(provider.isAgentRunLaunch('run'), true, 'Remote Control changed the prompt-cache request of resumes');
 });
@@ -46188,6 +46210,9 @@ function remoteControlState() {
   const later: Array<(result: unknown, session: string | null) => void> = [];
   const provider = {
     newDrafts: {},
+    hidden: new Set<string>(),
+    remoteControlDrafts: new Map(),
+    ownCwdForSession: () => '/recorded',
     saved: { agentRuns: [] as string[] } as Record<string, unknown>,
     remoteControl: new Map<string, { url: string | null }>(),
     posted: [] as unknown[],
@@ -46254,8 +46279,9 @@ test('the prompt box keeps Remote Control from a connected result until the conn
   // A link that fails the check is stored as no link.
   await toggle('s2', { outcome: 'connected', url: 'https://claude.ai/[x](y)', late: false });
   assert.deepEqual(held(), { s2: { url: null } });
-  // A draft refusal changes nothing. An agent run holds its connection like any other session.
-  provider.newDrafts = { draft: {} };
+  // An unavailable startup changes nothing. An agent run holds its connection like any other session.
+  provider.newDrafts = { draft: { cwd: '/draft' } };
+  provider.replies.push({ result: { outcome: 'stopped' }, session: null });
   provider.saved.agentRuns = ['run'];
   await provider.remoteControlFromComposer('draft');
   assert.deepEqual(held(), { s2: { url: null } });
@@ -47324,4 +47350,105 @@ test('automatic resume candidates are idle Claude main sessions of this workspac
     { session: 'agent-run', cwd: '/work/agent-run', file: '/transcripts/agent-run.jsonl', name: 'Title agent-run' },
     { session: 'prompted', cwd: '/work/prompted', file: '/transcripts/prompted.jsonl', name: 'Title prompted' },
   ]);
+});
+
+test('fresh and queued Remote Control submissions pass the unsent draft setup without delivering a prompt', async () => {
+  for (const queued of [false, true]) {
+    const { provider, sendPrompt, delivered } = remoteControlProvider();
+    const remote = remoteControlState();
+    Object.assign(provider, remote.provider);
+    const draft = newSessionDraft('s1', DRAFT_CWD, null, DRAFT_MADE_AT, DRAFT_SETUP);
+    provider.newDrafts.s1 = draft;
+    const started: unknown[][] = [];
+    provider.onRemoteControl = async (...args: unknown[]) => {
+      started.push(args);
+      return { result: { outcome: 'connected', url: REMOTE_LINK, late: false }, session: 's1' };
+    };
+    provider.assets.s1 = [remoteFile('kept')];
+    provider.draftCommentIds.s1 = ['comment'];
+    if (queued) {
+      provider.queues.s1 = [remoteQueued('rc', '/remote-control', 's1')];
+      provider.flushQueue('s1');
+    } else sendPrompt.call(provider, '/rc', 's1', 1);
+    await vi.waitFor(() => assert.equal(started.length, 1));
+    await vi.waitFor(() => assert.equal(provider.remoteControl.has('s1'), true));
+    assert.equal(started[0][2], DRAFT_CWD);
+    assert.deepEqual((started[0][3] as NewSessionDraft).profile, DRAFT_SETUP);
+    assert.equal(provider.newDrafts.s1.handChanged, true);
+    assert.deepEqual(provider.assets.s1, [remoteFile('kept')]);
+    assert.deepEqual(provider.draftCommentIds.s1, ['comment']);
+    assert.deepEqual(delivered, []);
+  }
+});
+
+test('late Remote Control results follow draft adoption and ignore retired draft setups', async () => {
+  const { provider, later, toggle, held } = remoteControlState();
+  const draft = newSessionDraft('draft', DRAFT_CWD, null, DRAFT_MADE_AT, DRAFT_SETUP);
+  provider.newDrafts.draft = draft;
+  await toggle('draft', { outcome: 'uncertain' });
+  const owner = provider.remoteControlDrafts.get('draft');
+  owner.session = 'actual';
+  provider.remoteControlDrafts.delete('draft');
+  delete provider.newDrafts.draft;
+  later[0]({ outcome: 'connected', url: REMOTE_LINK, late: true }, 'actual');
+  assert.deepEqual(held(), { actual: { url: REMOTE_LINK } });
+  provider.newDrafts.other = { ...draft, draftId: 'other' };
+  await toggle('other', { outcome: 'uncertain' });
+  provider.noteRemoteControlOff('other');
+  later[1]({ outcome: 'connected', url: REMOTE_LINK, late: true }, 'unadopted-child');
+  assert.deepEqual(held(), { actual: { url: REMOTE_LINK } });
+});
+
+test('remote draft adoption preserves local delivery acceptance and captured setup', () => {
+  const adopt = compiledProviderMethod('function (provisional, actual)', 'public noteDraftSession(', { draftStarted });
+  const draft = newSessionDraft('draft', DRAFT_CWD, null, DRAFT_MADE_AT, DRAFT_SETUP);
+  const accepted: string[][] = [];
+  const provider: any = {
+    newDrafts: { draft },
+    live: { draft: [DRAFT_SENT] },
+    refreshFrom() {},
+    adoptDraft: (...args: string[]) => accepted.push(args),
+  };
+  adopt.call(provider, 'draft', 'actual');
+  assert.deepEqual(accepted, []);
+  provider.live.draft = [];
+  adopt.call(provider, 'draft', 'actual');
+  assert.deepEqual(accepted, [['draft', 'actual']]);
+  assert.deepEqual(draft.profile, DRAFT_SETUP);
+});
+
+test('a draft setup change removes the connection and invalidates its late result owner', () => {
+  const panel: any = draftPanel(DRAFT_SETUP);
+  const owner = { draft: panel.newDrafts.d1, session: 'd1' };
+  panel.remoteControl = new Map([['d1', { url: REMOTE_LINK }]]);
+  panel.remoteControlDrafts = new Map([['d1', owner]]);
+  panel.noteRemoteControlOff = compiledProviderMethod('function (session)', 'public noteRemoteControlOff(');
+  panel.press('model', 'sonnet');
+  assert.equal(panel.remoteControl.size, 0);
+  assert.equal(panel.remoteControlDrafts.size, 0);
+  assert.equal(owner.session, null);
+  assert.equal(panel.newDrafts.d1.profile.model, 'sonnet');
+});
+
+test('archiving a draft while its previous child exits invalidates waiting Remote Control startup', async () => {
+  const { provider } = remoteControlState();
+  const draft = newSessionDraft('draft', DRAFT_CWD, null, DRAFT_MADE_AT, DRAFT_SETUP);
+  provider.newDrafts.draft = draft;
+  let current: () => boolean = () => false;
+  provider.onRemoteControl = async (
+    _session: string,
+    _observer: unknown,
+    _cwd: unknown,
+    _draft: unknown,
+    isCurrent: () => boolean,
+  ) => {
+    current = isCurrent;
+    return { result: { outcome: 'uncertain' }, session: 'draft' };
+  };
+  await provider.remoteControlFromComposer('draft');
+  assert.equal(current(), true);
+  provider.hidden.add('draft');
+  assert.equal(current(), false);
+  provider.hidden.clear();
+  assert.equal(current(), true);
 });

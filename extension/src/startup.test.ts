@@ -3724,6 +3724,7 @@ function completeDiscoveryHarness(
       hosts = [{ webview: { postMessage: (message) => { this.messages.push(message.type === 'render' || message.type === 'rail' ? this.expandRows(message) : message); return Promise.resolve(true); } }, active: () => false, visible: () => true }]; readyHosts = new Set(this.hosts); panelVisibility = createPanelVisibility();
       refreshGeneration = 0; refreshController = null; pendingRefresh = null; refreshReason = 'startup'; targetedRefreshPaths = null; selectionGeneration = 0; selectionWork = null; selectionFailures = new Map(); interruptedRereads = new Map();
       repositoryScopeReady = true; repositoryScopeRoots = ['project']; awaitingSessionRecords = {}; newDrafts = {}; draftProfiles = {}; sessionOrigins = {}; drafts = {}; picks = {};
+      remoteControl = new Map(); remoteControlDrafts = new Map();
       refreshUsageHandler = null; initialCatalogRefreshPending = false; initialCatalogRefreshRequested = false;
       recentProfiles = []; models = {}; watching = false; trail = null; sessionAliases = new Map();
       threadNames = { stamp: '' }; lastSpendSourceSignature = ''; projectSpendLastOfferAt = 0;
@@ -34537,6 +34538,7 @@ test('hosted child exit leaves an ordinary reader queue entry waiting without a 
     policies: { forgetClear: () => {} },
     compaction: undefined,
     commandStateChanges: new Set(),
+    draftMcpKeys: new Map(),
     publishCommands: () => {},
     updateAgentAffordance: () => {},
     usageReads: { failDeferred: () => {} },
