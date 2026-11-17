@@ -47140,7 +47140,7 @@ test.each(['abandon', 'close'])(
   async (end) => {
     vi.useFakeTimers();
     const f = draftDiscoveryFixture();
-    const panel: any = {};
+    const panel: any = { noteDraftRemoteControlsOff() {} };
     wireDraftDiscoveryCallbacks(panel, f.commandDiscovery);
     try {
       void f.ask('codex', false, 'old', '/project/a');
@@ -47399,22 +47399,78 @@ test('late Remote Control results follow draft adoption and ignore retired draft
   assert.deepEqual(held(), { actual: { url: REMOTE_LINK } });
 });
 
-test('remote draft adoption preserves local delivery acceptance and captured setup', () => {
+test('remote draft adoption preserves local acceptance and saves its destination setup once', async () => {
   const adopt = compiledProviderMethod('function (provisional, actual)', 'public noteDraftSession(', { draftStarted });
   const draft = newSessionDraft('draft', DRAFT_CWD, null, DRAFT_MADE_AT, DRAFT_SETUP);
   const accepted: string[][] = [];
+  const recents: unknown[] = [];
+  const published: unknown[] = [];
+  const saved: Promise<void>[] = [];
   const provider: any = {
     newDrafts: { draft },
     live: { draft: [DRAFT_SENT] },
     refreshFrom() {},
     adoptDraft: (...args: string[]) => accepted.push(args),
+    setupProject: 'project',
+    setRecentProfiles: (value: unknown) => published.push(value),
   };
+  const source = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
+  const callback = esbuild.transformSync(statementFrom(source, source.indexOf('panel.onDraftRemoteInput =')), {
+    loader: 'ts',
+  }).code;
+  new Function('panel', 'setupProjects', 'setupStore', 'reportFailures', callback)(
+    provider,
+    {
+      resolve: async (cwd: string) => {
+        assert.equal(cwd, DRAFT_CWD);
+        return 'project';
+      },
+    },
+    {
+      accept: async (project: string, profile: SessionProfile) => {
+        recents.push([project, profile]);
+        return { recents: [profile] };
+      },
+    },
+    (work: () => Promise<void>) => saved.push(work()),
+  );
   adopt.call(provider, 'draft', 'actual');
   assert.deepEqual(accepted, []);
+  assert.deepEqual(recents, []);
   provider.live.draft = [];
   adopt.call(provider, 'draft', 'actual');
+  delete provider.newDrafts.draft;
+  adopt.call(provider, 'draft', 'actual');
+  await Promise.all(saved);
   assert.deepEqual(accepted, [['draft', 'actual']]);
+  assert.deepEqual(recents, [['project', DRAFT_SETUP]]);
+  assert.deepEqual(published, [[DRAFT_SETUP]]);
   assert.deepEqual(draft.profile, DRAFT_SETUP);
+});
+
+test('refused Remote Control leaves an untouched draft dismissible', async () => {
+  const { provider, toggle } = remoteControlState();
+  const draft = newSessionDraft('draft', DRAFT_CWD, null, DRAFT_MADE_AT, DRAFT_SETUP);
+  provider.newDrafts.draft = draft;
+  for (const refusal of [{ outcome: 'policy' }, { outcome: 'refused', reason: 'startup failed', late: false }]) {
+    await toggle('draft', refusal, null);
+    assert.equal(provider.newDrafts.draft.handChanged, false);
+    assert.ok(
+      abandonSessionDraft(
+        {
+          drafts: {},
+          queues: {},
+          live: {},
+          settings: {},
+          profiles: { draft: DRAFT_SETUP },
+          railOrder: [],
+          showing: 'draft',
+        },
+        'draft',
+        provider.newDrafts.draft.handChanged,
+      ),
+    );
+  }
 });
 
 test('a draft setup change removes the connection and invalidates its late result owner', () => {

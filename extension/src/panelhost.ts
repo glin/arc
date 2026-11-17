@@ -2222,8 +2222,8 @@ export class PanelProvider implements vscode.Disposable {
   // Reads a Codex speed setting without a session or turn.
   public onReadFastEvidence: ((cwd: string | null, model: string) => Promise<ServiceTierEvidence | null>) | undefined;
   // Starts or reuses the session's Claude process, then toggles Remote Control. `observer` receives later results.
-  // Every result comes with the session id the process holds when it arrives, which a Claude `/clear`
-  // changes, or null when that process has exited or retired.
+  // Results name the displayed draft until adoption, then the process's session. Claude `/clear` changes that session.
+  // An exited or retired process names no session.
   public onRemoteControl:
     | ((
         session: string,
@@ -2231,10 +2231,12 @@ export class PanelProvider implements vscode.Disposable {
         cwd: string | null,
         draft: NewSessionDraft | null,
         current: () => boolean,
+        archived: boolean,
       ) => Promise<{ result: RemoteControlOutcome; session: string | null }>)
     | null = null;
   public onDraftProfileChanged: ((draft: NewSessionDraft) => void) | null = null;
   public onDraftAdopted: ((provisional: string, actual: string) => void) | null = null;
+  public onDraftRemoteInput: ((draft: NewSessionDraft) => void) | null = null;
   public onSelectionChanged: ((session: string | null, agent?: AgentKind | null, cwd?: string | null) => void) | null =
     null;
   public onPanelsClosed: (() => void) | null = null;
@@ -7215,6 +7217,7 @@ export class PanelProvider implements vscode.Disposable {
     const draft = this.newDrafts[provisional];
     if (!draft || draftStarted(this.live[provisional] ?? [])) return;
     this.adoptDraft(provisional, actual);
+    this.onDraftRemoteInput?.(draft);
     this.refreshFrom('draft-started', true);
   }
 
@@ -7403,18 +7406,19 @@ export class PanelProvider implements vscode.Disposable {
       profile.permissionMode !== next.permissionMode;
     // Speed belongs to Codex. A draft that moves to Claude has no speed to carry.
     const tier = next.agent === 'codex' && draft.serviceTier !== undefined ? { serviceTier: draft.serviceTier } : {};
-    this.newDrafts[session] = {
-      ...newSessionDraft(
-        draft.draftId,
-        draft.cwd,
-        draft.sourceSession,
-        draft.createdAt,
-        next,
-        draft.origin,
-        draft.handChanged || changed,
-      ),
-      ...tier,
-    };
+    if (changed)
+      this.newDrafts[session] = {
+        ...newSessionDraft(
+          draft.draftId,
+          draft.cwd,
+          draft.sourceSession,
+          draft.createdAt,
+          next,
+          draft.origin,
+          draft.handChanged || changed,
+        ),
+        ...tier,
+      };
     this.picks = withSessionSettings(this.picks, session, {
       ...sessionSettingsForProfile(
         next,
@@ -10681,10 +10685,6 @@ export class PanelProvider implements vscode.Disposable {
   // The takeover leaves `agentRuns` unchanged, so the prompt-cache request of the session's resumes does not change.
   private async remoteControlFromComposer(sessionId: string): Promise<void> {
     let draft = this.newDrafts[sessionId] ?? null;
-    if (draft && !draft.handChanged) {
-      draft = { ...draft, handChanged: true };
-      this.newDrafts[sessionId] = draft;
-    }
     let owner = draft ? this.remoteControlDrafts.get(sessionId) : undefined;
     if (draft && owner?.draft !== draft) {
       if (owner) owner.session = null;
@@ -10694,6 +10694,17 @@ export class PanelProvider implements vscode.Disposable {
     const settle = (result: RemoteControlOutcome, session: string | null) => {
       if (owner?.session === null) session = null;
       else if (owner && session === sessionId) session = owner.session;
+      if (
+        session !== null &&
+        draft &&
+        !draft.handChanged &&
+        this.newDrafts[sessionId] === draft &&
+        ['connected', 'uncertain', 'busy'].includes(result.outcome)
+      ) {
+        draft = { ...draft, handChanged: true };
+        this.newDrafts[sessionId] = draft;
+        if (owner) owner.draft = draft;
+      }
       this.noteRemoteControl(session, result);
       if (session !== null && result.outcome === 'connected') this.notePrompted(session);
       this.showRemoteControlNotice(result);
@@ -10709,7 +10720,9 @@ export class PanelProvider implements vscode.Disposable {
           draft?.cwd ?? this.ownCwdForSession('claude', sessionId),
           draft,
           () =>
-            !draft || (owner?.session !== null && this.newDrafts[sessionId] === draft && !this.hidden.has(sessionId)),
+            !draft ||
+            (owner?.session !== null && this.newDrafts[sessionId] === owner?.draft && !this.hidden.has(sessionId)),
+          this.hidden.has(sessionId),
         ));
       } catch (error) {
         result = { outcome: 'refused', reason: (error as Error).message || 'unknown error', late: false };
@@ -10736,6 +10749,11 @@ export class PanelProvider implements vscode.Disposable {
     if (owner) owner.session = null;
     this.remoteControlDrafts.delete(session);
     if (this.remoteControl.delete(session)) void this.post({ type: 'usage', usage: this.usagePayload() });
+  }
+
+  // Panel closure cancels draft requests even while they wait for a previous child to exit.
+  public noteDraftRemoteControlsOff(): void {
+    for (const session of this.remoteControlDrafts.keys()) this.noteRemoteControlOff(session);
   }
 
   // A Claude `/clear` gives the connected process a new session id and keeps the connection.

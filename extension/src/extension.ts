@@ -1057,6 +1057,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
   const setupProjects = new SetupProjects(nodeGitRunner());
   const setupStore = new ProjectSetupStore(context.globalState);
+  panel.onDraftRemoteInput = (draft) => {
+    reportFailures(async () => {
+      const project = await setupProjects.resolve(draft.cwd);
+      const entry = await setupStore.accept(project, draft.profile);
+      if (project === panel.setupProject) panel.setRecentProfiles(entry.recents);
+    });
+  };
   let setupGeneration = 0;
   let setupRefresh: { folder: string | null; pending: Promise<void> } | null = null;
   const refreshSetups = (): Promise<void> => {
@@ -2203,10 +2210,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
     });
   // Remote Control starts the session without submitting a prompt. Provisional children keep their draft owner until input starts.
-  panel.onRemoteControl = async (session, observer, cwd, draft, current) => {
+  panel.onRemoteControl = async (session, observer, cwd, draft, current, archived) => {
     const existing = draft ? null : host.find('claude', session);
     if (draft?.policy?.readOnly || (!draft && (existing ? existing.policy : policies.read(session))?.readOnly))
       return { result: { outcome: 'policy' }, session: null };
+    if (archived) throw new Error('Unarchive this session before starting Remote Control.');
     let live: AgentSession | null = null;
     const holder = (): string | null => {
       if (!live || host.get(live.key) !== live || live.state().exited) return null;
@@ -2233,11 +2241,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         },
       );
     } else {
-      result = existing
-        ? await host.withActivity(existing.key, toggle)
-        : await withExistingSessionActivity('claude', session, cwd, toggle, (reason) => {
-            throw new Error(reason);
-          });
+      result = existing ? await host.withActivity(existing.key, toggle) : null;
+      if (result === null) {
+        if (!cwd)
+          throw new Error("This session's recorded working directory is unavailable. Reopen its folder and try again.");
+        result = await withExistingSessionActivity('claude', session, cwd, toggle, (reason) => {
+          throw new Error(reason);
+        });
+      }
     }
     return { result: result ?? { outcome: 'stopped' }, session: holder() };
   };
@@ -2293,6 +2304,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     publishMcp();
   };
   panel.onPanelsClosed = () => {
+    panel.noteDraftRemoteControlsOff();
     commandDiscovery.cancelAll();
     mcpSurfaceGeneration++;
     mcp.invalidateInitialReads();

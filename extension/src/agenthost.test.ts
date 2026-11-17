@@ -8954,7 +8954,7 @@ function idleMcpDiscovery(
       reads.push(`usage ${key}`);
     },
     refreshUsage: vi.fn<(agent: string, force: boolean, owner: string, ownerAgent: string, cwd: string) => void>(),
-    panel: {} as Record<string, (...args: unknown[]) => void>,
+    panel: { noteDraftRemoteControlsOff() {} } as Record<string, (...args: unknown[]) => void>,
   };
   const statements = [
     'const noteMcp =',
@@ -12794,7 +12794,8 @@ function extensionRemoteControl(
     cwd: string | null = null,
     draft: NewSessionDraft | null = null,
     current: () => boolean = () => true,
-  ) => panel.onRemoteControl(session, observer, cwd, draft, current);
+    archived = false,
+  ) => panel.onRemoteControl(session, observer, cwd, draft, current, archived);
 }
 
 function fireActiveTimers(timer: FakeAgentHostTimer): void {
@@ -12916,7 +12917,7 @@ test('Remote Control reaches only the live child of its own session, before and 
   second.say(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sess-2b' }) + '\n');
   await assert.rejects(
     toggle('sess-2', () => {}),
-    /Open a folder/,
+    /recorded working directory is unavailable/,
   );
   settle(host, 'one');
   settle(host, 'two');
@@ -12929,11 +12930,11 @@ test('Remote Control reaches only the live child of its own session, before and 
   assert.deepEqual(await off, { result: { outcome: 'disconnected', late: false }, session: 'sess-2b' });
   await assert.rejects(
     toggle('sess-1', () => {}),
-    /Open a folder/,
+    /recorded working directory is unavailable/,
   );
   await assert.rejects(
     toggle('missing', () => {}),
-    /Open a folder/,
+    /recorded working directory is unavailable/,
   );
   assert.equal(children.length, 2, 'a Remote Control toggle started a process');
 });
@@ -14248,7 +14249,7 @@ test('Remote Control startup refuses fixed policy and a missing folder without o
   const fixture = fakeHost();
   await assert.rejects(
     extensionRemoteControl(fixture.host)('missing-folder', () => {}),
-    /Open a folder/,
+    /recorded working directory is unavailable/,
   );
   assert.equal(fixture.children.length, 0);
 });
@@ -14275,7 +14276,10 @@ test('Remote Control draft children retire through profile changes, removal, and
   for (const action of ['profile', 'remove', 'close']) {
     const keys = new Map<string, string>();
     const off: string[] = [];
-    const panel: any = { noteRemoteControlOff: (session: string) => off.push(session) };
+    const panel: any = {
+      noteRemoteControlOff: (session: string) => off.push(session),
+      noteDraftRemoteControlsOff() {},
+    };
     const fixture = fakeHost();
     const toggle = extensionRemoteControl(fixture.host, { draftKeys: keys, panel });
     const draft = newSessionDraft('retained', WS, null, 0, {
@@ -14504,4 +14508,176 @@ test('an old draft exit preserves replacement Remote Control requested during in
       value.sent().some((message) => message.type === 'user'),
       false,
     );
+});
+
+async function draftRemoteControlFixture() {
+  vi.stubGlobal('PANEL_CSS', '');
+  vi.stubGlobal('PANEL_JS', '');
+  vi.stubGlobal('PANEL_DEV_SERVER_URL', null);
+  const { PanelProvider } = await import('./panelhost.ts');
+  const methods = PanelProvider.prototype as any;
+  const notices: any[] = [];
+  const keys = new Map<string, string>();
+  const fixture = fakeHost();
+  const draft = newSessionDraft('draft', WS, null, 0, {
+    agent: 'claude',
+    model: 'opus',
+    effort: '',
+    permissionMode: 'plan',
+    source: 'custom',
+  });
+  const panel: any = {
+    newDrafts: { draft },
+    draftProfiles: { draft: draft.profile },
+    live: {},
+    models: {},
+    assets: {},
+    picks: {},
+    mcpServers: {},
+    remoteControl: new Map(),
+    remoteControlDrafts: new Map(),
+    hidden: new Set(),
+    ownCwdForSession: () => WS,
+    notePrompted() {},
+    usagePayload() {},
+    post: async () => {},
+    showRemoteControlNotice: (result: unknown) => notices.push(result),
+  };
+  for (const method of [
+    'remoteControlFromComposer',
+    'noteRemoteControl',
+    'noteRemoteControlOff',
+    'noteDraftRemoteControlsOff',
+    'pickOnDraft',
+  ])
+    panel[method] = methods[method];
+  extensionRemoteControl(fixture.host, { panel, draftKeys: keys });
+  return { ...fixture, panel, keys, draft, notices };
+}
+
+test.each(['closed', 'reopened'])(
+  'closing the last panel cancels a replacement draft startup while %s',
+  async (state) => {
+    const { panel, keys, draft, host, children } = await draftRemoteControlFixture();
+    panel.onDraftProfileChanged = (previous: NewSessionDraft) =>
+      retireDraftProfile(host, previous, new McpBook(), new McpPendingRefreshes(), keys, new Set());
+    const old = panel.remoteControlFromComposer('draft');
+    await vi.waitFor(() => assert.equal(children.length, 1));
+    panel.pickOnDraft('draft', 'askmode', 'auto');
+    const waiting = panel.remoteControlFromComposer('draft');
+    assert.equal(keys.size, 0, 'the replacement registered before prior exit');
+    const source = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
+    runInNewContext(
+      esbuild.transformSync(statementFrom(source, source.indexOf('panel.onPanelsClosed =')), { loader: 'ts' }).code,
+      {
+        panel,
+        host,
+        draftMcpKeys: keys,
+        commandDiscovery: { cancelAll() {} },
+        mcpSurfaceGeneration: 0,
+        mcp: new McpBook(),
+        mcpRefreshes: new McpPendingRefreshes(),
+        activeMcpOwner: null,
+      },
+    );
+    panel.hosts = [];
+    panel.onPanelsClosed();
+    if (state === 'reopened') panel.hosts = [{}];
+    const child = children[0];
+    child.answerControl('initialize', { commands: [], remote_control_available: true });
+    await vi.waitFor(() => assert.equal(child.ended, true));
+    child.exit(0);
+    let settled = false;
+    void waiting.then(() => {
+      settled = true;
+    });
+    await vi.waitFor(() => assert.ok(children.length > 1 || settled));
+    assert.equal(children.length, 1, 'panel closure started a replacement child');
+    await Promise.all([old, waiting]);
+    assert.equal(remoteControlRequests(child).length, 0);
+    assert.equal(panel.remoteControlDrafts.size, 0);
+    assert.equal(panel.remoteControl.size, 0);
+    assert.equal(panel.newDrafts.draft.profile.permissionMode, 'auto');
+    assert.equal(draft.profile.permissionMode, 'plan');
+  },
+);
+
+test.each(['agent', 'askmode'])(
+  'selecting the current %s during draft initialization still connects',
+  async (control) => {
+    const { panel, children, notices } = await draftRemoteControlFixture();
+    const connecting = panel.remoteControlFromComposer('draft');
+    await vi.waitFor(() => assert.equal(children.length, 1));
+    panel.pickOnDraft('draft', control, control === 'agent' ? 'claude' : 'plan');
+    const child = children[0];
+    child.answerControl('initialize', { commands: [], remote_control_available: true });
+    await vi.waitFor(() => assert.ok(remoteControlRequests(child).length || notices.length));
+    assert.notEqual(notices.at(-1)?.outcome, 'refused', 'an unchanged setup refused Remote Control');
+    await answerRemoteControl(child, 1, {});
+    await connecting;
+    assert.equal(notices.at(-1).outcome, 'connected');
+    assert.equal(panel.remoteControl.has('draft'), true);
+    assert.equal(children.length, 1);
+  },
+);
+
+test.each(['draft', 'history'])('archived %s refuses Remote Control before starting a child', async (session) => {
+  const { panel, host, children, notices } = await draftRemoteControlFixture();
+  panel.hidden.add(session);
+  host.setArchived(new Set([session]));
+  let settled = false;
+  const attempted = panel.remoteControlFromComposer(session).then(() => {
+    settled = true;
+  });
+  await vi.waitFor(() => assert.ok(children.length || settled));
+  assert.equal(children.length, 0, 'an archived session started a child');
+  await attempted;
+  assert.equal(notices.at(-1).outcome, 'refused');
+  assert.match(notices.at(-1).reason, /Unarchive this session/);
+  assert.equal(panel.hidden.has(session), true);
+  assert.equal(panel.remoteControl.size, 0);
+  assert.equal(panel.newDrafts.draft.handChanged, false);
+  const policy = launchPolicy('claude', true)!;
+  const toggle = extensionRemoteControl(host, { policy });
+  const draft = session === 'draft' ? { ...panel.newDrafts.draft, policy } : null;
+  assert.equal(
+    (
+      await toggle(
+        session,
+        () => {},
+        WS,
+        draft,
+        () => true,
+        true,
+      )
+    ).result.outcome,
+    'policy',
+  );
+});
+
+test('Remote Control resumes after a found child finishes targeted retirement', async () => {
+  const fixture = fakeHost();
+  const opening = fixture.host.session('old', claudePlan(CLAUDE, { cwd: WS, resume: 'history' }));
+  const old = fixture.children[0];
+  old.answerControl('initialize', { commands: [], remote_control_available: true });
+  await opening;
+  let release = () => {};
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const activity = fixture.host.withActivity('old', () => held);
+  const retiring = fixture.host.retireSession('old');
+  assert.ok(fixture.host.find('claude', 'history'), 'the found child must still await retirement');
+  const connecting = extensionRemoteControl(fixture.host)('history', () => {}, WS);
+  release();
+  await activity;
+  await vi.waitFor(() => assert.equal(old.ended, true));
+  old.exit(0);
+  await retiring;
+  await vi.waitFor(() => assert.equal(fixture.children.length, 2));
+  const replacement = fixture.children[1];
+  replacement.answerControl('initialize', { commands: [], remote_control_available: true });
+  await answerRemoteControl(replacement, 1, {});
+  assert.equal((await connecting).result.outcome, 'connected');
+  assert.equal(remoteControlRequests(old).length, 0);
 });

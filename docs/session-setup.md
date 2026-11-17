@@ -12,7 +12,7 @@ New inherits the selected session's setup and stored permission, including an ag
 
 Current-setup launches and handoffs wait for pending model evidence before capturing the setup. Explicit model picks, recent setups, and pinned setups start without waiting. The initiating session and panel retain ownership.
 
-Pins and recents belong to the launch project, using the first folder in a multi-root workspace. Handoffs keep their source folder. Successful draft submission updates that destination's recents even after project selection changes.
+Pins and recents belong to the launch project, using the first folder in a multi-root workspace. Handoffs keep their source folder. Successful draft submission or first remote input updates that destination's recents even after project selection changes.
 
 [`domain/session-setups.ts`](../extension/src/domain/session-setups.ts) owns setup validation and recent-list limits. [Navigation](panel-navigation.md#context-menus-and-copy) owns response-link handoff content, setup, folder, labels, and source navigation.
 
