@@ -60,6 +60,8 @@ const MODEL_IDS = [
   'gpt-5.6-sol',
   'gpt-5.6-terra',
   'gpt-5.6-luna',
+  'gpt-6.2-sol',
+  'gpt-6.2-astra',
   'gpt-6-astra',
   'gpt-6.1-sol',
   'gpt-6.1-terra',
@@ -127,6 +129,44 @@ const OPENAI_TIER_AUDIT: Record<
   string,
   Record<string, { short?: ModelDefinition['rate']; long?: ModelDefinition['rate'] } | null>
 > = {
+  'gpt-6.2-sol': {
+    default: {
+      short: { input: 2, output: 10, cacheRead: 0.1, cacheWrite30m: 2.5 },
+      long: { input: 4, output: 15, cacheRead: 0.2, cacheWrite30m: 5 },
+    },
+    priority: {
+      short: { input: 4, output: 20, cacheRead: 0.2, cacheWrite30m: 5 },
+      long: { input: 8, output: 30, cacheRead: 0.4, cacheWrite30m: 10 },
+    },
+    batch: {
+      short: { input: 1, output: 5, cacheRead: 0.05, cacheWrite30m: 1.25 },
+      long: { input: 2, output: 7.5, cacheRead: 0.1, cacheWrite30m: 2.5 },
+    },
+    ultrafast: {
+      short: { input: 6, output: 30, cacheRead: 0.3, cacheWrite30m: 7.5 },
+      long: { input: 12, output: 45, cacheRead: 0.6, cacheWrite30m: 15 },
+    },
+    flex: null,
+  },
+  'gpt-6.2-astra': {
+    default: {
+      short: { input: 8, output: 40, cacheRead: 0.4, cacheWrite30m: 10 },
+      long: { input: 16, output: 60, cacheRead: 0.8, cacheWrite30m: 20 },
+    },
+    priority: {
+      short: { input: 16, output: 80, cacheRead: 0.8, cacheWrite30m: 20 },
+      long: { input: 32, output: 120, cacheRead: 1.6, cacheWrite30m: 40 },
+    },
+    batch: {
+      short: { input: 4, output: 20, cacheRead: 0.2, cacheWrite30m: 5 },
+      long: { input: 8, output: 30, cacheRead: 0.4, cacheWrite30m: 10 },
+    },
+    ultrafast: {
+      short: { input: 24, output: 120, cacheRead: 1.2, cacheWrite30m: 30 },
+      long: { input: 48, output: 180, cacheRead: 2.4, cacheWrite30m: 60 },
+    },
+    flex: null,
+  },
   'gpt-6-astra': {
     default: {
       short: {
@@ -906,6 +946,58 @@ const SUPPORT_MATRIX: { models: string[]; definition: ModelDefinition }[] = [
     },
   },
   claudeSupport(/^claude-haiku-4-5(?:-\d{8})?(?:\[[^\]]+\])?$/, ['claude-haiku-4-5'], { input: 1, output: 5 }, 200_000),
+  {
+    models: ['gpt-6.2-astra'],
+    definition: {
+      pattern: /^gpt-6\.2-astra$/,
+      rate: { input: 8, cacheWrite30m: 10, cacheRead: 0.4, output: 40 },
+      window: 1_050_000,
+      cachePolicy: directPolicy('30m'),
+      providers: ['openai'],
+      maxPricedContext: 272_000,
+      longContext: { threshold: 272_000, inputMultiplier: 2, outputMultiplier: 1.5 },
+      serviceTierMultipliers: { fast: 2, priority: 2, batch: 0.5, ultrafast: 6 },
+      serviceTierPromotions: { ultrafast: { before: '2027-03-01T08:00:00Z', multiplier: 3 } },
+      bedrock: {
+        prefixes: /^(?:us|global)?$/,
+        regionalMultiplier: 1.1,
+        window: 1_050_000,
+        cachePolicy: {
+          kind: 'documented',
+          lifetime: '30m',
+          sources: ['https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-6-2-astra.html'],
+        },
+        effectiveDate: null,
+        serviceTierMultipliers: { ultrafast: 6 },
+        serviceTierPromotions: { ultrafast: { before: '2027-03-01T08:00:00Z', multiplier: 3 } },
+      },
+    },
+  },
+  {
+    models: ['gpt-6.2-sol'],
+    definition: {
+      pattern: /^gpt-6\.2-sol$/,
+      rate: { input: 2, cacheWrite30m: 2.5, cacheRead: 0.1, output: 10 },
+      window: 1_050_000,
+      cachePolicy: directPolicy('30m'),
+      providers: ['openai'],
+      maxPricedContext: 272_000,
+      longContext: { threshold: 272_000, inputMultiplier: 2, outputMultiplier: 1.5 },
+      serviceTierMultipliers: { fast: 2, priority: 2, batch: 0.5, ultrafast: 6 },
+      serviceTierPromotions: { ultrafast: { before: '2027-03-01T08:00:00Z', multiplier: 3 } },
+      bedrock: {
+        prefixes: /^(?:us|global)?$/,
+        regionalMultiplier: 1.1,
+        window: 1_050_000,
+        cachePolicy: {
+          kind: 'documented',
+          lifetime: '30m',
+          sources: ['https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-6-2-sol.html'],
+        },
+        effectiveDate: null,
+      },
+    },
+  },
   openaiSupport(
     /^gpt-6-astra$/,
     ['gpt-6-astra'],
@@ -1332,7 +1424,7 @@ test('Bedrock GPT-6.1 Sol prices supported routes with its documented cache life
     'US.openai.gpt-6.1-sol',
     'openai.gpt-6.1-sol-extra',
     'openai.gpt-6.11-sol',
-    'openai.gpt-6.2-sol',
+    'openai.gpt-6.3-sol',
     'openai.gpt-5.6',
   ]) {
     assert.equal(rateFor(model, provider), null, model);
@@ -2827,52 +2919,60 @@ test('a cold Claude compaction writes the measured shared prefix without reading
 });
 
 test('every direct OpenAI model has an independent tier and request-band decision', () => {
-  for (const { models, definition } of SUPPORT_MATRIX.filter((entry) =>
-    entry.definition.providers?.includes('openai'),
-  )) {
-    for (const model of models) {
-      const key = model.replace(/-2026-\d{2}-\d{2}$/, '');
-      const audit = OPENAI_TIER_AUDIT[key];
-      assert.ok(audit, `${model} lacks its tier audit`);
-      assert.deepEqual(Object.keys(audit).sort(), ['batch', 'default', 'flex', 'priority', 'ultrafast']);
-      for (const [tier, bands] of Object.entries(audit))
-        for (const [band, requestTokens] of [
-          ['short', 272000],
-          ['long', 272001],
-        ] as const) {
-          const expected = bands?.[band];
-          for (const alias of tier === 'priority' ? ['priority', 'fast'] : [tier]) {
-            const quote = quoteUsage({
-              model,
-              provider: 'openai',
-              serviceTier: alias,
-              requestTokens,
-              usage: usage({
-                input: 1,
-                output: 1,
-                cacheRead: 1,
-                ...(expected?.cacheWrite30m === undefined ? {} : { cacheWrite30m: 1 }),
-              }),
-            });
-            if (!expected) assert.equal(quote, null, `${model} ${alias} ${band}`);
-            else assert.deepEqual(quote?.rate, expected, `${model} ${alias} ${band}`);
+  vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2026-11-18T00:00:00Z'));
+  try {
+    for (const { models, definition } of SUPPORT_MATRIX.filter((entry) =>
+      entry.definition.providers?.includes('openai'),
+    )) {
+      for (const model of models) {
+        const key = model.replace(/-2026-\d{2}-\d{2}$/, '');
+        const audit = OPENAI_TIER_AUDIT[key];
+        assert.ok(audit, `${model} lacks its tier audit`);
+        assert.deepEqual(Object.keys(audit).sort(), ['batch', 'default', 'flex', 'priority', 'ultrafast']);
+        for (const [tier, bands] of Object.entries(audit))
+          for (const [band, requestTokens] of [
+            ['short', 272000],
+            ['long', 272001],
+          ] as const) {
+            const expected = bands?.[band];
+            for (const alias of tier === 'priority' ? ['priority', 'fast'] : [tier]) {
+              const quote = quoteUsage({
+                model,
+                provider: 'openai',
+                serviceTier: alias,
+                requestTokens,
+                usage: usage({
+                  input: 1,
+                  output: 1,
+                  cacheRead: 1,
+                  ...(expected?.cacheWrite30m === undefined ? {} : { cacheWrite30m: 1 }),
+                }),
+              });
+              if (!expected) assert.equal(quote, null, `${model} ${alias} ${band}`);
+              else assert.deepEqual(quote?.rate, expected, `${model} ${alias} ${band}`);
+            }
           }
-        }
-      if (definition.serviceTierBands)
-        for (const tier of ['fast', 'priority']) {
-          assert.equal(quoteUsage({ model, provider: 'openai', serviceTier: tier, usage: usage({ input: 1 }) }), null);
-          assert.equal(
-            quoteUsage({
-              model,
-              provider: 'openai',
-              serviceTier: tier,
-              contextBand: 'long',
-              usage: usage({ input: 1 }),
-            }),
-            null,
-          );
-        }
+        if (definition.serviceTierBands)
+          for (const tier of ['fast', 'priority']) {
+            assert.equal(
+              quoteUsage({ model, provider: 'openai', serviceTier: tier, usage: usage({ input: 1 }) }),
+              null,
+            );
+            assert.equal(
+              quoteUsage({
+                model,
+                provider: 'openai',
+                serviceTier: tier,
+                contextBand: 'long',
+                usage: usage({ input: 1 }),
+              }),
+              null,
+            );
+          }
+      }
     }
+  } finally {
+    vi.restoreAllMocks();
   }
 });
 
@@ -2888,4 +2988,113 @@ test('configured prices require the matching canonical tier and retain recorded-
     3,
   );
   assert.equal(quoteUsage({ ...input, serviceTier: 'default', override: { ...override, serviceTier: 'fast' } }), null);
+});
+
+test('every required model retains independent production and expected support', () => {
+  for (const model of MODEL_IDS) {
+    assert.ok(
+      SUPPORT_MATRIX.some((entry) => entry.models.includes(model)),
+      `${model} lacks its independent decision`,
+    );
+    assert.ok(resolveModelPricing(model), `${model} lacks production support`);
+    if (model.startsWith('gpt-6.2-')) {
+      assert.ok(
+        SUPPORT_MATRIX.find((entry) => entry.models.includes(model))?.definition.bedrock,
+        `${model} lacks its independent Bedrock decision`,
+      );
+      assert.ok(resolveModelPricing(`openai.${model}`, 'amazon-bedrock'), `${model} lacks Bedrock support`);
+    }
+  }
+});
+
+test('GPT-6.2 exact identities keep unknown routes and effort retention unavailable', () => {
+  for (const model of ['gpt-6.2-sol', 'gpt-6.2-astra']) {
+    assert.equal(contextWindowFor(model, 'openai'), 1_050_000);
+    assert.equal(cacheLifetimeFor(model, 'openai'), '30m');
+    assert.equal(contextBandForRequest(model, 'openai', 272000), 'short');
+    assert.equal(contextBandForRequest(model, 'openai', 272001), 'long');
+    for (const provider of [null, 'openai', 'amazon-bedrock'])
+      assert.equal(effortChangeKeepsCache(model, provider), false);
+    for (const suffix of ['-2026-11-17', '-codex', '[1m]', '-extra']) assert.equal(rateFor(model + suffix), null);
+    for (const provider of ['azure', 'openrouter', 'amazon-bedrock']) assert.equal(rateFor(model, provider), null);
+    for (const prefix of ['eu', 'ap', 'US', 'xx'])
+      assert.equal(rateFor(`${prefix}.openai.${model}`, 'amazon-bedrock'), null);
+  }
+});
+
+test('GPT-6.2 Ultrafast promotion changes only its supported tier at the Pacific boundary', () => {
+  const now = vi.spyOn(Date, 'now');
+  try {
+    for (const [at, multiplier] of [
+      ['2027-03-01T07:59:59.999Z', 3],
+      ['2027-03-01T08:00:00Z', 6],
+    ] as const) {
+      now.mockReturnValue(Date.parse(at));
+      for (const [model, input] of [
+        ['gpt-6.2-sol', 2],
+        ['gpt-6.2-astra', 8],
+      ] as const) {
+        for (const [provider, prefix, regional] of [
+          ['openai', '', 1],
+          ['amazon-bedrock', 'openai.', 1.1],
+          ['amazon-bedrock', 'us.openai.', 1.1],
+          ['amazon-bedrock', 'global.openai.', 1],
+        ] as const) {
+          const id = prefix + model;
+          for (const [requestTokens, bandMultiplier] of [
+            [272000, 1],
+            [272001, 2],
+          ] as const) {
+            const quote = (serviceTier: string) =>
+              quoteUsage({
+                model: id,
+                provider,
+                serviceTier,
+                requestTokens,
+                usage: usage({ input: 1000000, cacheRead: 1000000, cacheWrite30m: 1000000, output: 1000000 }),
+              });
+            near(quote('default')?.rate?.input, input * regional * bandMultiplier, id);
+            if (provider === 'openai' || model === 'gpt-6.2-astra') {
+              const rate = quote('ultrafast')?.rate;
+              near(rate?.input, input * multiplier * regional * bandMultiplier, id);
+              near(rate?.cacheRead, input * 0.05 * multiplier * regional * bandMultiplier, id);
+              near(rate?.cacheWrite30m, input * 1.25 * multiplier * regional * bandMultiplier, id);
+              near(rate?.output, input * 5 * multiplier * regional * (bandMultiplier === 2 ? 1.5 : 1), id);
+            } else assert.equal(quote('ultrafast'), null);
+            for (const tier of provider === 'amazon-bedrock' ? ['fast', 'priority', 'flex', 'batch'] : ['flex'])
+              assert.equal(quote(tier), null, `${id} ${tier}`);
+          }
+        }
+      }
+      assert.equal(
+        quoteUsage({
+          model: 'gpt-6.1-sol',
+          provider: 'openai',
+          serviceTier: 'ultrafast',
+          requestTokens: 1000,
+          usage: usage({ input: 1000000 }),
+        })?.cost,
+        12,
+      );
+    }
+  } finally {
+    vi.restoreAllMocks();
+  }
+});
+
+test('GPT-6.2 next-turn estimates price both request bands and cache reads', () => {
+  for (const [model, input] of [
+    ['gpt-6.2-sol', 2],
+    ['gpt-6.2-astra', 8],
+  ] as const) {
+    for (const [contextTokens, multiplier] of [
+      [272000, 1],
+      [272001, 2],
+    ] as const) {
+      const floor = nextTurnFloor({ model, provider: 'openai', contextTokens, tier: '30m' });
+      assert.ok(floor, model);
+      near(floor?.warm, (contextTokens * input * 0.05 * multiplier) / 1000000, model);
+      near(floor?.cold, (contextTokens * input * 1.25 * multiplier) / 1000000, model);
+    }
+  }
 });

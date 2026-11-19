@@ -39,6 +39,7 @@ import {
   contextBandForRequest,
   hasRequestContextPricing,
   quoteUsage,
+  publicPricingValidUntil,
   BEDROCK_LIST_COST_BASIS,
 } from './pricing';
 import { parseSpendLedger, projectUsageKey } from './projectspendstate';
@@ -236,6 +237,8 @@ export class SessionFiguresCache<T, R, P = T> {
   private held = new Map<string, HeldSessionFigures<T, P>>();
   private value!: R;
   private input: unknown;
+  private pricedAt = Date.now();
+  private pricingUntil = publicPricingValidUntil(this.pricedAt);
 
   read(
     files: readonly SpendFileIndex[],
@@ -253,10 +256,13 @@ export class SessionFiguresCache<T, R, P = T> {
     const input = projection?.input;
     const project = projection?.project ?? ((figures: T) => figures as unknown as P);
     const inputMoved = input !== this.input;
+    const now = Date.now();
+    const pricingMoved = now < this.pricedAt || now >= this.pricingUntil;
     const heldFiles = this.files;
     if (
       heldFiles &&
       !inputMoved &&
+      !pricingMoved &&
       !this.pendingMoved(pending) &&
       sources === this.sources &&
       spendFileNormalizationGeneration === this.generation &&
@@ -288,6 +294,7 @@ export class SessionFiguresCache<T, R, P = T> {
       const previous = this.held.get(sessionId);
       if (
         previous &&
+        !pricingMoved &&
         sameSessionSources(previous.sources, group.sources) &&
         found.every((record, at) => record === previous.records[at]) &&
         sameWaiting(previous.waiting, waiting)
@@ -325,6 +332,8 @@ export class SessionFiguresCache<T, R, P = T> {
     this.sources = sources;
     this.generation = spendFileNormalizationGeneration;
     this.input = input;
+    this.pricedAt = now;
+    if (pricingMoved) this.pricingUntil = publicPricingValidUntil(now);
     if (moved) {
       this.value = assemble(
         new Map(
@@ -525,7 +534,7 @@ export function projectSpendSaveRetryDelay(retries: number): number | null {
 // Saved source records require a rebuild when the parser generation of their agent differs.
 // Increase an agent's generation when a stored field of its records changes the conclusions consumers draw from it.
 // Increase both generations for a change that alters both agents' records.
-export const PROJECT_SPEND_PARSER_GENERATIONS: Readonly<Record<'claude' | 'codex', number>> = { claude: 69, codex: 69 };
+export const PROJECT_SPEND_PARSER_GENERATIONS: Readonly<Record<'claude' | 'codex', number>> = { claude: 70, codex: 70 };
 
 // Earlier shared generations whose records of one agent match that agent's generation.
 // Each mapping names the agent generation of the stored facts.
@@ -1815,7 +1824,7 @@ export interface PricedCacheExpiryReturn {
 }
 const childExpiryPrices = new WeakMap<
   SpendFileIndex,
-  Map<ProjectSpendPricer, { facts: CacheExpiryFacts; returns: PricedCacheExpiryReturn[] }>
+  Map<ProjectSpendPricer, { facts: CacheExpiryFacts; validUntil: number; returns: PricedCacheExpiryReturn[] }>
 >();
 
 // Pricing depends on accepted record identity, its facts, and the pricing function's context.
@@ -1826,9 +1835,11 @@ export function pricedNativeCacheReturns(
   let prices = childExpiryPrices.get(source.revision);
   if (!prices) childExpiryPrices.set(source.revision, (prices = new Map()));
   let held = prices.get(pricer);
-  if (!held || held.facts !== source.facts) {
+  const validUntil = publicPricingValidUntil();
+  if (!held || held.facts !== source.facts || held.validUntil !== validUntil) {
     held = {
       facts: source.facts,
+      validUntil,
       returns: source.facts.returns.map((item) => ({
         item,
         cost: cacheExpiryExtraCost({ ...emptyCacheExpiryFacts(), returns: [item] }, pricer),

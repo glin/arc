@@ -2992,6 +2992,8 @@ test('standalone model selection preserves legacy aliases and configured provide
   };
   for (const [alias, model] of Object.entries(aliases)) check(alias, model);
   for (const model of [
+    'gpt-6.2-sol',
+    'gpt-6.2-astra',
     'gpt-6.1-terra',
     'gpt-5.6-terra',
     'gpt-5.6-sol-2026-09-01',
@@ -8176,4 +8178,24 @@ test('a reader /clear after attaching does not end a launch without a slash prom
     backgroundEnding('Review this folder.', [claudeUser('Review this folder.')], ordinaryPolls(movedSession)),
     /accepted dispatch turn cannot change/,
   );
+});
+
+test('GPT-6.2 standalone launches preserve exact model and all six efforts', () => {
+  const { home, args } = fixture();
+  for (const model of ['gpt-6.2-sol', 'gpt-6.2-astra']) {
+    for (const effort of ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']) {
+      const input = args.map((value, i) =>
+        i === args.indexOf('--model') + 1 ? model : i === args.indexOf('--effort') + 1 ? effort : value,
+      );
+      const parsed = parseRun(input, { CODEX_BIN: 'owned-codex', CODEX_HOME: home });
+      assert.equal(parsed.options.model, model);
+      assert.equal(parsed.options.args[parsed.options.args.indexOf('-m') + 1], model);
+      assert.ok(parsed.options.args.includes(`model_reasoning_effort=${effort}`));
+    }
+  }
+  const previous = parseRun(
+    args.map((value, i) => (i === args.indexOf('--model') + 1 ? 'sol' : value)),
+    { CODEX_BIN: 'owned-codex', CODEX_HOME: home },
+  );
+  assert.equal(previous.options.model, 'gpt-6.1-sol');
 });

@@ -8165,3 +8165,128 @@ test('host cost-state ticks match the reference through replacements and earlier
   assert.ok(actual.reads[2][1].costStateSupplement);
   checkTick();
 });
+
+test('GPT-6.2 unchanged sources rebuild literal spend generation 69 request bands', () => {
+  for (const [model, expected] of [
+    ['gpt-6.2-sol', 1.882004],
+    ['gpt-6.2-astra', 7.528016],
+  ] as const) {
+    const root = dir();
+    const file = path.join(root, 'gpt62.jsonl');
+    const at = '2026-11-18T00:00:00Z';
+    const records = [
+      { type: 'session_meta', timestamp: at, payload: { id: 'gpt62', model_provider: 'openai' } },
+      ...[272000, 272001].flatMap((input, i) => [
+        { type: 'event_msg', timestamp: at, payload: { type: 'task_started', turn_id: `turn-${i}` } },
+        { type: 'turn_context', timestamp: at, payload: { turn_id: `turn-${i}`, model } },
+        {
+          type: 'event_msg',
+          timestamp: at,
+          payload: {
+            type: 'token_count',
+            info: {
+              last_token_usage: {
+                input_tokens: input,
+                output_tokens: 10000,
+                cached_input_tokens: 0,
+                total_tokens: input + 10000,
+              },
+            },
+          },
+        },
+        { type: 'event_msg', timestamp: at, payload: { type: 'task_complete', turn_id: `turn-${i}` } },
+      ]),
+    ];
+    fs.writeFileSync(
+      file,
+      records.map((record) => JSON.stringify(record)).join(String.fromCharCode(10)) + String.fromCharCode(10),
+    );
+    const indexed = indexSpendFile(undefined, file, 'w', createCodexUsageLineReducer, 1).record;
+    const unbanded = {
+      ...indexed.buckets[0],
+      contextBand: null,
+      contextWindow: null,
+      requests: 2,
+      usage: { ...indexed.buckets[0].usage, requests: 2, input: 544001, output: 20000, byContextBand: undefined },
+    };
+    const stale = { ...indexed, parserGeneration: 69, buckets: [unbanded], lifetimeBuckets: [unbanded] };
+    saveSpendLedger(root, 'w', [stale]);
+    const saved = loadSpendLedger(root, 'w').files[0];
+    assert.ok(saved, 'the saved ledger lost its source');
+    assert.equal(indexSpendFile(stale, file, 'w', createCodexUsageLineReducer, 2).rebuilt, true);
+    const before = fs.statSync(file);
+    const rebuilt = indexSpendFile(saved, file, 'w', createCodexUsageLineReducer, 2);
+    assert.equal(rebuilt.rebuilt, true);
+    assert.deepEqual(rebuilt.record.buckets.map((bucket) => bucket.contextBand).sort(), ['long', 'short']);
+    const total = rebuilt.record.buckets.reduce((sum, bucket) => sum + publicProjectSpendPrice(bucket)!.dollars, 0);
+    assert.ok(Math.abs(total - expected) < 1e-12, String(total));
+    assert.equal(fs.statSync(file).size, before.size);
+    assert.equal(fs.statSync(file).mtimeMs, before.mtimeMs);
+  }
+});
+
+test('GPT-6.2 advisor requests rebuild literal Claude spend generation 69 bands', () => {
+  const root = dir();
+  const file = path.join(root, 'advisor.jsonl');
+  const records = [
+    advisorProbeRecords()[0],
+    ...advisorResponseRecords({
+      iterations: [
+        advisorIteration({ input_tokens: 1 }),
+        advisorIteration({ type: 'advisor_message', model: 'gpt-6.2-sol', input_tokens: 272000 }),
+        advisorIteration({ type: 'advisor_message', model: 'gpt-6.2-astra', input_tokens: 272001 }),
+      ],
+    }),
+  ];
+  fs.writeFileSync(
+    file,
+    records.map((record) => JSON.stringify(record)).join(String.fromCharCode(10)) + String.fromCharCode(10),
+  );
+  const current = indexSpendFile(undefined, file, 'w', createClaudeUsageLineReducer, 1).record;
+  const stale = {
+    ...current,
+    parserGeneration: 69,
+    buckets: current.buckets.map((bucket) => ({ ...bucket, contextBand: null })),
+  };
+  const rebuilt = indexSpendFile(stale, file, 'w', createClaudeUsageLineReducer, 2);
+  assert.equal(rebuilt.rebuilt, true);
+  const advisors = rebuilt.record.buckets.filter((bucket) => bucket.model?.startsWith('gpt-6.2-'));
+  assert.deepEqual(advisors.map((bucket) => [bucket.model, bucket.contextBand]).sort(), [
+    ['gpt-6.2-astra', 'long'],
+    ['gpt-6.2-sol', 'short'],
+  ]);
+});
+
+test('GPT-6.2 recorded prototype-property tiers leave neighboring Project cost priced', () => {
+  for (const tier of ['constructor', 'toString', '__proto__']) {
+    const root = dir();
+    const file = path.join(root, 'unknown-tier.jsonl');
+    const at = '2026-11-18T12:00:00Z';
+    const rows = [
+      { type: 'session_meta', payload: { id: 'unknown-tier', model_provider: 'amazon-bedrock' } },
+      ...['default', tier].flatMap((serviceTier, i) => [
+        { type: 'event_msg', payload: { type: 'task_started', turn_id: `turn-${i}` } },
+        {
+          type: 'event_msg',
+          payload: { type: 'thread_settings_applied', thread_settings: { service_tier: serviceTier } },
+        },
+        { type: 'turn_context', payload: { turn_id: `turn-${i}`, model: 'openai.gpt-6.2-astra' } },
+        {
+          type: 'event_msg',
+          payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 100, output_tokens: 10 } } },
+        },
+        { type: 'event_msg', payload: { type: 'task_complete', turn_id: `turn-${i}` } },
+      ]),
+    ];
+    fs.writeFileSync(file, rows.map((row) => JSON.stringify({ ...row, timestamp: at })).join('\n') + '\n');
+    const record = indexSpendFile(undefined, file, root, createCodexUsageLineReducer, Date.parse(at), {
+      now: () => 0,
+    }).record;
+    const unknown = record.buckets.find((bucket) => bucket.serviceTier === tier)!;
+    assert.ok(unknown, tier);
+    assert.equal(publicProjectSpendPrice(unknown), null, tier);
+    const window = prepareProjectSpendView([record], publicProjectSpendPrice, { now: Date.parse(at) }).windows[0];
+    assert.ok(Math.abs(window.dollars! - 0.00132) < 1e-12, `${tier}: ${window.dollars}`);
+    assert.equal(window.status, 'atLeast', tier);
+  }
+});

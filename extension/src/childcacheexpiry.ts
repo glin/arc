@@ -11,6 +11,7 @@ import {
 } from './projectspend';
 import type { Turn, TurnOutcome } from './transcript';
 import { CHILD_CLOSE_MARGIN_MS } from './turnrail';
+import { publicPricingValidUntil } from './pricing';
 
 export interface ChildExpiryAgent extends CacheExpiryCost {
   childId: string;
@@ -41,6 +42,7 @@ export class ChildCacheExpiryAttribution {
       revision: NativeChildCacheFacts['revision'];
       facts: CacheExpiryFacts;
       pricer: ProjectSpendPricer;
+      validUntil: number;
       returns: ReturnType<typeof pricedNativeCacheReturns>;
     }
   >();
@@ -54,6 +56,7 @@ export class ChildCacheExpiryAttribution {
     pricer: ProjectSpendPricer = publicProjectSpendPrice,
     inspect: (item: CacheExpiryReturn) => void = () => {},
   ): Map<string, ChildExpiryCost> {
+    const validUntil = publicPricingValidUntil();
     const bySession = new Map<string, Turn[]>();
     for (const turn of turns) {
       const group = bySession.get(turn.sessionId) ?? [];
@@ -94,12 +97,14 @@ export class ChildCacheExpiryAttribution {
           !priced ||
           priced.revision !== source.revision ||
           priced.facts !== source.facts ||
-          priced.pricer !== pricer
+          priced.pricer !== pricer ||
+          priced.validUntil !== validUntil
         ) {
           priced = {
             revision: source.revision,
             facts: source.facts,
             pricer,
+            validUntil,
             returns: pricedNativeCacheReturns(source, pricer),
           };
           this.prices.set(source.source, priced);

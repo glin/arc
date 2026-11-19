@@ -828,6 +828,7 @@ import {
   runningSdkTranscript,
   powershellDispatchExecution,
   advisorProbeRecords,
+  advisorIteration,
   advisorResponseRecords,
   PER_PASS_ITERATIONS,
   MIXED_PASS_ITERATIONS,
@@ -4194,4 +4195,148 @@ test('relationship load rejection names the provider and parser path stamp curso
       if (reason !== 'path') assert.equal(loaded.relationshipRejections?.get(normalizeFsPath(file)), reason);
     }
   }
+});
+
+test('GPT-6.2 pricing rebuilds literal saved Codex and Claude advisor metadata generations', async () => {
+  const { readSession, sessionStatFactsOf } = await import('./transcript.ts');
+  const { readCodexSession } = await import('./codex.ts');
+  for (const [agent, oldGeneration] of [
+    ['codex', 73],
+    ['claude', 74],
+  ] as const) {
+    const directory = folder();
+    const file = path.join(directory, 'cache.json');
+    const source = path.join(directory, 'gpt62.jsonl');
+    const at = '2026-11-18T00:00:00Z';
+    const records =
+      agent === 'claude'
+        ? [
+            advisorProbeRecords()[0],
+            ...advisorResponseRecords({
+              iterations: [
+                advisorIteration({ input_tokens: 1 }),
+                advisorIteration({ type: 'advisor_message', model: 'gpt-6.2-astra', input_tokens: 272001 }),
+              ],
+            }),
+          ]
+        : [
+            { type: 'session_meta', timestamp: at, payload: { id: 'gpt62', model_provider: 'openai' } },
+            { type: 'event_msg', timestamp: at, payload: { type: 'task_started', turn_id: 'turn' } },
+            { type: 'turn_context', timestamp: at, payload: { turn_id: 'turn', model: 'gpt-6.2-sol' } },
+            { type: 'event_msg', timestamp: at, payload: { type: 'user_message', message: 'Price the request' } },
+            {
+              type: 'event_msg',
+              timestamp: at,
+              payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 272001, output_tokens: 1 } } },
+            },
+            { type: 'event_msg', timestamp: at, payload: { type: 'task_complete', turn_id: 'turn' } },
+          ];
+    fs.writeFileSync(
+      source,
+      records.map((record) => JSON.stringify(record)).join(String.fromCharCode(10)) + String.fromCharCode(10),
+    );
+    const read = () => (agent === 'claude' ? readSession(source, 'gpt62') : readCodexSession(source, 'gpt62'));
+    const fresh = { ...title, stats: sessionStatFactsOf(read()) };
+    assert.ok(
+      fresh.stats?.turns[0].usageParts?.some(
+        (part) => part.model?.startsWith('gpt-6.2-') && part.contextBand === 'long',
+      ),
+      JSON.stringify({ agent, stats: fresh.stats }),
+    );
+    const stale = {
+      ...fresh,
+      stats: {
+        ...fresh.stats!,
+        turns: fresh.stats!.turns.map((turn) => ({
+          ...turn,
+          usageParts: turn.usageParts?.map((part) => ({ ...part, contextBand: null })),
+        })),
+      },
+    };
+    const agentOf = () => agent;
+    saveDerivedCache(file, [[source, stale]], [], [], undefined, undefined, [], agentOf);
+    const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+    saved.metadataGenerations[agent] = oldGeneration;
+    fs.writeFileSync(file, JSON.stringify(saved));
+    const before = fs.statSync(source);
+    const loaded = loadDerivedCache(file, { agentOf });
+    assert.equal(loaded.titles.size, 0, `${agent} kept obsolete pricing`);
+    assert.deepEqual(loaded.carriedNames.get(source), { label: title.label, fullLabel: title.fullLabel });
+    const rebuilt = { ...fresh, stats: sessionStatFactsOf(read()) };
+    saveDerivedCache(file, [[source, rebuilt]], [], [], undefined, undefined, [], agentOf);
+    assert.deepEqual(loadDerivedCache(file, { agentOf }).titles.get(source), rebuilt);
+    assert.equal(fs.statSync(source).size, before.size);
+    assert.equal(fs.statSync(source).mtimeMs, before.mtimeMs);
+  }
+});
+
+test('GPT-6.2 saved dispatch version 4 drops unbanded spend and rereads unchanged requests', () => {
+  const file = path.join(folder(), 'cache.json');
+  const source = path.join(path.dirname(file), 'child.jsonl');
+  const at = '2026-11-18T00:00:00Z';
+  const rows = [
+    { type: 'session_meta', payload: { id: 'child', model_provider: 'openai' } },
+    ...[272000, 272001].flatMap((input, i) => [
+      { type: 'event_msg', payload: { type: 'task_started', turn_id: `turn-${i}` } },
+      { type: 'turn_context', payload: { turn_id: `turn-${i}`, model: 'gpt-6.2-sol' } },
+      {
+        type: 'event_msg',
+        payload: { type: 'token_count', info: { last_token_usage: { input_tokens: input, output_tokens: 10000 } } },
+      },
+      { type: 'event_msg', payload: { type: 'task_complete', turn_id: `turn-${i}` } },
+    ]),
+  ];
+  fs.writeFileSync(source, rows.map((row) => JSON.stringify({ ...row, timestamp: at })).join('\n') + '\n');
+  fs.utimesSync(source, Date.parse(at) / 1000, Date.parse(at) / 1000);
+  const before = fs.statSync(source);
+  const revision = revisionOf(fs.statSync(source, { bigint: true }));
+  const fresh = readCodexAgentSpend(source);
+  const stale = structuredClone(fresh);
+  for (const model of stale.models) delete model.usage.byContextBand;
+  const entry: ClaudeChildReferenceCacheEntry = {
+    parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
+    ...revision,
+    sessionId: 'child',
+    childTranscript: false,
+    references: [],
+    dispatch: {
+      version: DISPATCH_FACTS_VERSION,
+      revision,
+      tree: 'unchanged',
+      facts: {
+        sessionId: 'child',
+        refreshAt: null,
+        revision,
+        spend: stale,
+        startedAt: null,
+        endedAt: null,
+        toolUses: 0,
+        person: false,
+      },
+    },
+  };
+  saveClaudeCache(file, [], [[source, entry]]);
+  const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.equal(saved.claudeChildReferences.length, 1);
+  saved.claudeChildReferences[0].entry.dispatch.version = 4;
+  fs.writeFileSync(file, JSON.stringify(saved));
+  const loaded = loadClaudeCache(file).claudeChildReferences.get(normalizeFsPath(source))!;
+  assert.equal(loaded.sessionId, 'child');
+  assert.deepEqual(loaded.references, []);
+  assert.equal(loaded.dispatch, undefined, 'saved version-4 spend retained missing request bands');
+  const reread = readCodexAgentSpend(source);
+  assert.deepEqual(Object.keys(reread.models[0].usage.byContextBand!).sort(), ['long', 'short']);
+  assert.ok(Math.abs(estimateCost(reread.models[0].usage, 'gpt-6.2-sol', 'openai')! - 1.882004) < 1e-12);
+  entry.dispatch = {
+    ...entry.dispatch!,
+    version: DISPATCH_FACTS_VERSION,
+    facts: { ...entry.dispatch!.facts, spend: reread },
+  };
+  saveClaudeCache(file, [], [[source, entry]]);
+  assert.deepEqual(
+    loadClaudeCache(file).claudeChildReferences.get(normalizeFsPath(source))?.dispatch?.facts.spend,
+    reread,
+  );
+  assert.equal(fs.statSync(source).size, before.size);
+  assert.equal(fs.statSync(source).mtimeMs, before.mtimeMs);
 });

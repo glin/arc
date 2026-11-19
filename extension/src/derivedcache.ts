@@ -1,3 +1,4 @@
+import { publicPricingValidUntil } from './pricing';
 import { validClaudeTaskCompletions } from './transcript';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -359,14 +360,25 @@ export function derivedTitleCacheRevision(entry: DerivedTitleEntry): Pick<FileRe
 export class SessionFactFigures<F, V> {
   private held = new Map<string, { facts: F; value: V }>();
   private value: Readonly<Record<string, V>> = {};
+  private pricedAt = Date.now();
+  private pricingUntil = publicPricingValidUntil(this.pricedAt);
+  private pricingInvalidated = false;
 
   read(
     sessions: readonly (readonly [sessionId: string, facts: F])[],
     derive: (facts: F, sessionId: string) => V,
     current: (value: V) => boolean = () => true,
   ): Readonly<Record<string, V>> {
+    const now = Date.now();
+    const pricingMoved = now < this.pricedAt || now >= this.pricingUntil;
+    if (pricingMoved) {
+      this.held.clear();
+      this.pricingInvalidated = true;
+      this.pricedAt = now;
+      this.pricingUntil = publicPricingValidUntil(now);
+    }
     const next = new Map<string, { facts: F; value: V }>();
-    let moved = false;
+    let moved = this.pricingInvalidated;
     for (const [sessionId, facts] of sessions) {
       const previous = this.held.get(sessionId);
       if (previous && previous.facts === facts && current(previous.value)) {
@@ -381,6 +393,7 @@ export class SessionFactFigures<F, V> {
       this.value = Object.fromEntries([...next].map(([sessionId, entry]) => [sessionId, entry.value]));
     }
     this.held = next;
+    this.pricingInvalidated = false;
     return this.value;
   }
 
@@ -391,6 +404,13 @@ export class SessionFactFigures<F, V> {
     derive: (facts: F, sessionId: string) => V,
     current: (value: V) => boolean = () => true,
   ): Readonly<Record<string, V>> {
+    const now = Date.now();
+    if (now < this.pricedAt || now >= this.pricingUntil) {
+      this.held.clear();
+      this.pricingInvalidated = true;
+      this.pricedAt = now;
+      this.pricingUntil = publicPricingValidUntil(now);
+    }
     const previous = this.held.get(sessionId);
     if (previous && previous.facts === facts && current(previous.value)) return this.value;
     return this.patch(sessionId, { facts, value: derive(facts, sessionId) });
@@ -905,7 +925,7 @@ export const MAX_CODEX_DISPATCH_CURSOR_BYTES = 64 * 1024 * 1024;
 export { MAX_CLAUDE_CHILD_REFERENCES_PER_FILE };
 // Bump when Claude or Codex dispatched spend reading changes what it derives. A mismatch drops the saved
 // facts and keeps their rows.
-export const DISPATCH_FACTS_VERSION = 4;
+export const DISPATCH_FACTS_VERSION = 5;
 export const MAX_SAVED_DISPATCH_FACTS_BYTES = 16 * 1024 * 1024;
 
 // A dispatched session's settled spend facts at one file revision and spend tree.
@@ -990,7 +1010,7 @@ export type MetadataGenerations = Readonly<Record<AgentKind, number>>;
 // The initial metadata budget, `INITIAL_RAIL_READ_BYTES`, spreads large workspace rebuilds across refreshes.
 // Targeted invalidation avoids a full rebuild when affected entries are identifiable at load.
 // Codex opening rows use `CODEX_META_VERSION` from codexopenings.ts and survive these generation changes.
-export const METADATA_GENERATIONS: MetadataGenerations = { claude: 74, codex: 73 };
+export const METADATA_GENERATIONS: MetadataGenerations = { claude: 75, codex: 74 };
 
 // The agent generations that each shared `metadataVersion` of `derived-session-cache-v1.json` matches.
 // Each pair names the agent generation of the stored facts.

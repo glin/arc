@@ -39,6 +39,8 @@ interface BedrockSupport {
   profileEffectiveDate?: string;
   // Omit this only when the published global rates equal the shared rates.
   rate?: Rate;
+  serviceTierMultipliers?: Readonly<Record<string, number>>;
+  serviceTierPromotions?: Readonly<Record<string, { before: string; multiplier: number }>>;
 }
 
 export interface ModelDefinition {
@@ -59,6 +61,8 @@ export interface ModelDefinition {
   fast?: Rate;
   // Only tiers published for this model have a multiplier. Others remain unpriced.
   serviceTierMultipliers?: Readonly<Record<string, number>>;
+  // Promotional tier multipliers apply before their exclusive timestamp, then use the published list multiplier.
+  serviceTierPromotions?: Readonly<Record<string, { before: string; multiplier: number }>>;
   // A restricted tier requires a recorded request band.
   serviceTierBands?: Readonly<Record<string, readonly UsageContextBand[]>>;
   // Exact category prices take precedence over tier multipliers.
@@ -229,6 +233,64 @@ export const MODEL_DEFINITIONS: readonly ModelDefinition[] = [
     rate: { input: 1, output: 5 },
     cachePolicy: CLAUDE_CACHE_POLICY,
     window: 200_000,
+  },
+  // https://developers.openai.com/api/docs/models/gpt-6.2-astra
+  // https://developers.openai.com/api/docs/pricing
+  {
+    pattern: /^gpt-6\.2-astra$/,
+    rate: { input: 8, cacheWrite30m: 10, cacheRead: 0.4, output: 40 },
+    window: 1_050_000,
+    cachePolicy: {
+      kind: 'documented',
+      lifetime: '30m',
+      sources: ['https://developers.openai.com/api/docs/guides/prompt-caching'],
+    },
+    providers: ['openai'],
+    serviceTierMultipliers: { fast: 2, priority: 2, batch: 0.5, ultrafast: 6 },
+    serviceTierPromotions: { ultrafast: { before: '2027-03-01T08:00:00Z', multiplier: 3 } },
+    maxPricedContext: 272_000,
+    longContext: { threshold: 272_000, inputMultiplier: 2, outputMultiplier: 1.5 },
+    bedrock: {
+      prefixes: /^(?:us|global)?$/,
+      regionalMultiplier: 1.1,
+      window: 1_050_000,
+      cachePolicy: {
+        kind: 'documented',
+        lifetime: '30m',
+        sources: ['https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-6-2-astra.html'],
+      },
+      effectiveDate: null,
+      serviceTierMultipliers: { ultrafast: 6 },
+      serviceTierPromotions: { ultrafast: { before: '2027-03-01T08:00:00Z', multiplier: 3 } },
+    },
+  },
+  // https://developers.openai.com/api/docs/models/gpt-6.2-sol
+  // https://developers.openai.com/api/docs/pricing
+  {
+    pattern: /^gpt-6\.2-sol$/,
+    rate: { input: 2, cacheWrite30m: 2.5, cacheRead: 0.1, output: 10 },
+    window: 1_050_000,
+    cachePolicy: {
+      kind: 'documented',
+      lifetime: '30m',
+      sources: ['https://developers.openai.com/api/docs/guides/prompt-caching'],
+    },
+    providers: ['openai'],
+    serviceTierMultipliers: { fast: 2, priority: 2, batch: 0.5, ultrafast: 6 },
+    serviceTierPromotions: { ultrafast: { before: '2027-03-01T08:00:00Z', multiplier: 3 } },
+    maxPricedContext: 272_000,
+    longContext: { threshold: 272_000, inputMultiplier: 2, outputMultiplier: 1.5 },
+    bedrock: {
+      prefixes: /^(?:us|global)?$/,
+      regionalMultiplier: 1.1,
+      window: 1_050_000,
+      cachePolicy: {
+        kind: 'documented',
+        lifetime: '30m',
+        sources: ['https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-6-2-sol.html'],
+      },
+      effectiveDate: null,
+    },
   },
   // https://developers.openai.com/api/docs/models/gpt-6-astra
   {
@@ -466,6 +528,21 @@ export const PROMOTIONS = MODEL_DEFINITIONS.flatMap((row) =>
   row.promotion ? [{ pattern: row.pattern, promo: row.promotion }] : [],
 );
 
+const PUBLIC_PRICING_CHANGES = [
+  ...new Set(
+    MODEL_DEFINITIONS.flatMap((row) =>
+      [row.serviceTierPromotions, row.bedrock?.serviceTierPromotions].flatMap((promotions) =>
+        Object.values(promotions ?? {}).map((promotion) => Date.parse(promotion.before)),
+      ),
+    ),
+  ),
+].sort((a, b) => a - b);
+
+// Dollar caches share this deadline with the host's calendar scheduler.
+export function publicPricingValidUntil(now = Date.now()): number {
+  return PUBLIC_PRICING_CHANGES.find((at) => at > now) ?? Infinity;
+}
+
 const CODEX_AUTO_REVIEW_MODEL = 'codex-auto-review';
 export const MODEL_RATE_ALIASES: Readonly<Record<string, string>> = {
   // https://help.openai.com/en/articles/20001415-chatgpt-rate-card-enterprise-token-based-pricing
@@ -657,11 +734,28 @@ function publicRateFor(
     return null;
   }
   const band = contextBand ?? contextBandForRequest(model, provider, requestTokens);
+  const tierPolicy = provider === 'amazon-bedrock' ? row.bedrock : row;
+  const tier = serviceTier ?? '';
+  const multipliers = tierPolicy?.serviceTierMultipliers;
+  const candidate = multipliers && Object.hasOwn(multipliers, tier) ? multipliers[tier] : undefined;
+  const listMultiplier = typeof candidate === 'number' && Number.isFinite(candidate) ? candidate : undefined;
+  const promotions = tierPolicy?.serviceTierPromotions;
+  const promotion = promotions && Object.hasOwn(promotions, tier) ? promotions[tier] : undefined;
+  const tierMultiplier =
+    listMultiplier !== undefined &&
+    promotion &&
+    Number.isFinite(promotion.multiplier) &&
+    Date.now() < Date.parse(promotion.before)
+      ? promotion.multiplier
+      : listMultiplier;
   if (provider === 'amazon-bedrock') {
-    return standard
+    return standard || tierMultiplier !== undefined
       ? {
-          rate: multiplied(longContextRate(row, band, resolved.rate), resolved.regionalMultiplier),
-          source: 'AWS Bedrock standard',
+          rate: multiplied(
+            longContextRate(row, band, resolved.rate),
+            resolved.regionalMultiplier * (standard ? 1 : tierMultiplier!),
+          ),
+          source: `AWS Bedrock ${standard ? 'standard' : serviceTier}`,
           effectiveDate: resolved.effectiveDate,
         }
       : null;
@@ -669,7 +763,6 @@ function publicRateFor(
   if (model === CODEX_AUTO_REVIEW_MODEL && !standard) return null;
   const allowedBands = row.serviceTierBands?.[serviceTier ?? ''];
   if (allowedBands && (band === null || !allowedBands.includes(band))) return null;
-  const tierMultiplier = row.serviceTierMultipliers?.[serviceTier ?? ''];
   if (!standard && !(fast && row.fast) && tierMultiplier === undefined) {
     return null;
   }

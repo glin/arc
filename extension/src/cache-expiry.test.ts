@@ -3467,3 +3467,53 @@ test('removing a middle copied compaction keeps surrounding boundaries and accep
     ) - first.compactAt,
   );
 });
+
+test('GPT-6.2 unchanged native child warnings reprice at the Ultrafast boundary', () => {
+  vi.useFakeTimers();
+  const boundary = Date.parse('2027-03-01T08:00:00Z');
+  vi.setSystemTime(boundary - 1);
+  try {
+    const main = indexed([claudePrompt(0, 'parent'), claudeResponse(1, { id: 'parent' })], claudeReducer);
+    const opening = JSON.parse(codexMeta());
+    opening.payload.parent_thread_id = 'parent';
+    opening.payload.source = { subagent: { thread_spawn: { parent_thread_id: 'parent' } } };
+    const child = indexed(
+      [
+        JSON.stringify(opening),
+        codexTaskStarted(0, 'one'),
+        codexSettings(0, 'ultrafast'),
+        codexTurnContext(0, 'one', 'gpt-6.2-sol'),
+        codexTokens(1, { input_tokens: 100000 }),
+        codexTokens(32, { input_tokens: 100000 }, { input_tokens: 200000 }),
+      ],
+      codexReducer,
+    );
+    assert.equal(facts(child).counts['30m'], 1);
+    const cache = sessionCacheFactsBySession(
+      [main, child],
+      [
+        { sessionId: 'parent', file: main.file, primary: true },
+        { sessionId: 'parent', file: child.file, primary: false },
+      ],
+    ).parent.expiry;
+    const turn = { ...readSession(main.file, 'parent').turns[0], endedAt: BASE + 40 * MINUTE };
+    const attribution = new ChildCacheExpiryAttribution();
+    const quote = vi.fn<typeof publicProjectSpendPrice>(publicProjectSpendPrice);
+    const read = () =>
+      attribution.read([turn], { parent: cache }, Date.now(), new Map(), new Set(), quote).get(turnKey(turn))!;
+    const before = read();
+    assert.ok(Math.abs(before.dollars! - 0.57) < 1e-12);
+    quote.mockClear();
+    assert.equal(read().dollars, before.dollars);
+    assert.equal(quote.mock.calls.length, 0, 'unchanged pricing repeated child quotes');
+    vi.setSystemTime(boundary);
+    const after = read();
+    const fresh = cacheExpiryExtraCost(cache, publicProjectSpendPrice);
+    assert.ok(Math.abs(fresh.dollars! - 1.14) < 1e-12);
+    assert.equal(after.dollars, fresh.dollars, 'retained child warning disagrees with the current public price');
+    assert.equal(after.status, fresh.status);
+    assert.equal(quote.mock.calls.length, 2);
+  } finally {
+    vi.useRealTimers();
+  }
+});

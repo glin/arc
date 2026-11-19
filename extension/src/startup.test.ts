@@ -292,7 +292,7 @@ import {
   unsentBySession,
   writeTimeOfVersion,
 } from './turnrail';
-import { recordedCostBasis } from './pricing';
+import { recordedCostBasis, publicPricingValidUntil } from './pricing';
 import { modelLabels, sameModelLabels } from './turnformat';
 import { isTurnRead, readMovedOnlyFor, turnKey } from './domain/read.ts';
 import { commitRowsOf } from './turncard';
@@ -3444,6 +3444,7 @@ function completeDiscoveryHarness(
   cacheStats: typeof derivedTitleCacheStats = derivedTitleCacheStats,
 ): any {
   scope = {
+    publicPricingValidUntil,
     startingWorktree,
     orderTimelineEntries: cardConsumers.orderTimelineEntries,
     ...scope,
@@ -24990,6 +24991,7 @@ function integrityHostHarness(scope: Record<string, unknown> = {}, extraMethods:
     projectSpendStorageDir: 'storage',
     projectSpendRevision: 0,
     projectSpendSnapshotPrice: publicProjectSpendPrice,
+    projectSpendSnapshotPricingUntil: publicPricingValidUntil(),
     projectSpendQueue: [],
     projectSpendQueued: new Set(),
     projectSpendTick: null,
@@ -32765,6 +32767,73 @@ test('Project cost snapshot switches A to B to A without accepting the earlier A
     assert.equal(provider.projectSpendPayload().windows[0].dollars, 11);
     assert.equal(offers, 0, 'a prior workspace offer reached the returned workspace');
     assert.equal(indexed, 0, 'a prior workspace index slice reached the returned workspace');
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('GPT-6.2 unchanged Project cost snapshots reprice at the Ultrafast boundary', async () => {
+  vi.useFakeTimers();
+  const boundary = Date.parse('2027-03-01T08:00:00Z');
+  vi.setSystemTime(boundary - 1000);
+  try {
+    const provider = projectSpendSnapshotHarness({}, ['scheduleProjectSpendMidnight']);
+    const file = snapshotSpendFile(0, '2027-03-01');
+    file.buckets[0] = {
+      ...file.buckets[0],
+      agent: 'Codex',
+      provider: 'openai',
+      model: 'gpt-6.2-sol',
+      serviceTier: 'ultrafast',
+      reportedCost: null,
+      contextBand: 'short',
+      usage: { input: 100000, output: 0, cacheWrite1h: 0, cacheWrite5m: 0, cacheRead: 0, thinking: 0 },
+    };
+    provider.projectSpendFiles = [file];
+    provider.projectSpendVisibleFiles = provider.projectSpendFiles;
+    const lifetime = new SessionFiguresCache();
+    const metadata = new SessionFactFigures();
+    const sources = [{ sessionId: 'priced', file: file.file, primary: true }];
+    const price = () => publicProjectSpendPrice(file.buckets[0])!.dollars;
+    const lifetimePrice = () =>
+      lifetime.read(provider.projectSpendVisibleFiles, sources, price, (figures) => figures.get('priced'));
+    const metadataPrice = () =>
+      metadata.read(
+        [
+          ['priced', file],
+          ['peer', file],
+        ],
+        price,
+      ).priced;
+    assert.equal(lifetimePrice(), price());
+    assert.equal(metadataPrice(), price());
+    provider.invalidateProjectSpendSnapshot();
+    await vi.runAllTimersAsync();
+    assert.ok(Math.abs(provider.projectSpendPayload().windows[0].dollars - 0.6) < 1e-12);
+    provider.scheduleProjectSpendMidnight();
+    await vi.advanceTimersByTimeAsync(boundary - Date.now());
+    await vi.waitFor(() =>
+      assert.equal(
+        provider.projectSpendPayload().windows[0].dollars,
+        publicProjectSpendPrice(file.buckets[0])!.dollars,
+      ),
+    );
+    assert.equal(lifetimePrice(), price(), 'retained lifetime figures kept the promotional price');
+    assert.equal(metadata.readOne('priced', file, price).priced, price());
+    assert.equal(metadataPrice(), price(), 'retained metadata figures kept the promotional price');
+    assert.equal(metadata.readOne('peer', file, price).peer, price());
+    assert.ok(Math.abs(provider.projectSpendPayload().windows[0].dollars - 1.2) < 1e-12);
+    assert.equal(provider.projectSpendVisibleFiles[0], file);
+    provider.cancelProjectSpendRebuild();
+    clearTimeout(provider.projectSpendMidnight);
+    vi.setSystemTime(boundary - 1000);
+    assert.equal(lifetimePrice(), price(), 'a backward clock kept the post-promotion lifetime price');
+    assert.equal(
+      metadata.readOne('priced', file, price).priced,
+      price(),
+      'a backward clock kept the post-promotion metadata price',
+    );
+    assert.deepEqual(Object.keys(metadata.read([['priced', file]], price)), ['priced']);
   } finally {
     vi.useRealTimers();
   }

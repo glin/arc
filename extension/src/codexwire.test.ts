@@ -5187,3 +5187,53 @@ test('explicit $fast still attaches a native skill named fast', async () => {
   ]);
   h.wire.close('test complete');
 });
+
+test('GPT-6.2 catalog preserves six efforts and each live model speed capability', async () => {
+  const efforts = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+  const data = [
+    { id: 'gpt-6.2-sol', serviceTiers: [{ id: 'priority' }, { id: 'ultrafast' }] },
+    { id: 'gpt-6.2-astra', serviceTiers: [{ id: 'priority' }] },
+  ].map((model) => ({ ...model, supportedReasoningEfforts: efforts.map((reasoningEffort) => ({ reasoningEffort })) }));
+  const catalog = readModels({ data }, 1);
+  assert.deepEqual(
+    catalog?.models.map((model) => model.value),
+    ['gpt-6.2-sol', 'gpt-6.2-astra'],
+  );
+  for (const model of catalog!.models)
+    assert.deepEqual(
+      model.efforts.map((effort) => effort.value),
+      efforts,
+    );
+  for (const [model, serviceTier, supported] of [
+    ['gpt-6.2-sol', 'ultrafast', true],
+    ['gpt-6.2-astra', 'priority', true],
+    ['gpt-6.2-astra', 'ultrafast', false],
+  ] as const) {
+    const h = harness();
+    const opening = h.wire.startThread({ cwd: 'C:/ws', model, serviceTier, effort: 'high' });
+    const refused = supported ? null : assert.rejects(opening, /does not offer/);
+    reply(h, { data });
+    if (supported) {
+      await vi.waitFor(() => assert.equal(h.parsed().at(-1).method, 'thread/start'));
+      assert.equal(h.parsed().at(-1).params.model, model);
+      assert.equal(h.parsed().at(-1).params.serviceTier, serviceTier);
+      reply(h, { thread: { id: THREAD }, model, serviceTier });
+      await opening;
+      await h.wire.setEffort('high');
+      const sending = h.wire.prompt('Owned launch check');
+      await vi.waitFor(() => assert.equal(h.parsed().at(-1).method, 'turn/start'));
+      assert.equal(h.parsed().at(-1).params.model, model);
+      assert.equal(h.parsed().at(-1).params.effort, 'high');
+      assert.equal(h.parsed().at(-1).params.serviceTier, serviceTier);
+      reply(h, { turn: { id: TURN } });
+      await sending;
+    } else {
+      await refused;
+      assert.equal(
+        h.parsed().some((message) => message.method === 'thread/start'),
+        false,
+      );
+    }
+    h.wire.close('finished');
+  }
+});

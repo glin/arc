@@ -131,6 +131,8 @@ test('a model reads its family and version, and an unknown model reads its recor
     ['claude-3-5-haiku-20241022', 'Haiku 3.5'],
     ['claude-fable-5-1', 'Fable 5.1'],
     ['claude-mythos-5-1', 'Mythos 5.1'],
+    ['gpt-6.2-sol', 'GPT-6.2-Sol'],
+    ['gpt-6.2-astra', 'GPT-6.2-Astra'],
     ['gpt-6.1-sol', 'GPT-6.1-Sol'],
     ['gpt-6-astra', 'GPT-6-Astra'],
     ['gpt-5.1-codex-max', 'GPT-5.1-Codex-Max'],

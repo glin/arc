@@ -1131,8 +1131,12 @@ test('cost selects the explicit Codex sessions root over the environment root', 
   }
 });
 
-test('cost prices recorded GPT-6.1 Sol and Terra requests and cache categories', async () => {
+test('cost prices recorded Sol Astra and Terra requests and cache categories', async () => {
   for (const [model, expected] of [
+    ['gpt-6.2-sol', 1.6],
+    ['gpt-6.2-astra', 6.4],
+    ['openai.gpt-6.2-sol', 1.76],
+    ['global.openai.gpt-6.2-astra', 6.4],
     ['gpt-6.1-terra', 0.8],
     ['openai.gpt-6.1-terra', 0.88],
     ['us.openai.gpt-6.1-terra', 0.88],
@@ -1151,7 +1155,7 @@ test('cost prices recorded GPT-6.1 Sol and Terra requests and cache categories',
           payload: {
             id: 'bedrock-sol',
             source: 'cli',
-            model_provider: model === 'gpt-6.1-terra' ? 'openai' : 'amazon-bedrock',
+            model_provider: model.startsWith('gpt-') ? 'openai' : 'amazon-bedrock',
           },
         },
         {

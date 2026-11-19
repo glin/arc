@@ -6330,3 +6330,14 @@ test('recorded request summaries price Astra Standard Fast and Ultrafast separat
   );
   assert.equal(summarizeRequests(requests).costUsd, 9);
 });
+
+test('GPT-6.2 request summaries retain provider prices in both bands', () => {
+  const requests = [
+    pricedRequest('gpt-6.2-sol', 272000, { contextBand: 'short' }),
+    pricedRequest('gpt-6.2-sol', 272001, { contextBand: 'long' }),
+    pricedRequest('gpt-6.2-astra', 272000, { contextBand: 'short' }),
+    pricedRequest('global.openai.gpt-6.2-astra', 272001, { provider: 'amazon-bedrock', contextBand: 'long' }),
+  ];
+  assert.equal(summarizeRequests(requests).costUsd, 8.16);
+  assert.equal(summarizeRequests(requests).pricedRequests, 4);
+});

@@ -1,3 +1,4 @@
+import { estimateCost } from './pricing';
 import { sessionCostProjection, sessionCostUsageOf } from './turncard';
 import { codexLeadingCompactionRecords } from './turnfixtures';
 
@@ -20266,4 +20267,47 @@ test('codex relationship pending records count boundary recovery at both file si
     measurements.push(bytes);
   }
   assert.deepEqual(measurements[0], measurements[1]);
+});
+
+test('GPT-6.2 readers retain both request bands and cache categories across checkpoints', () => {
+  for (const [model, expected] of [
+    ['gpt-6.2-sol', 1.6],
+    ['gpt-6.2-astra', 6.4],
+  ] as const) {
+    const records = [
+      meta({ model_provider: 'openai' }),
+      ...[220000, 220000, 320000].flatMap((input, i) => [
+        event('task_started', i * 10 + 1, { turn_id: `gpt62-${i}` }),
+        turnContext(i * 10 + 2, `gpt62-${i}`, model, 'high'),
+        tokens(i * 10 + 3, {
+          input_tokens: input,
+          cached_input_tokens: i === 2 ? 150000 : 100000,
+          cache_write_input_tokens: 20000,
+          output_tokens: 10000,
+          total_tokens: input + 10000,
+        }),
+        event('task_complete', i * 10 + 4, { turn_id: `gpt62-${i}`, last_agent_message: 'done' }),
+      ]),
+    ];
+    const file = writeRollout(records);
+    const fresh = readCodexSession(file, 'sess');
+    assert.deepEqual(
+      fresh.turns.map((turn) => turn.usageParts?.[0]?.contextBand),
+      ['short', 'short', 'long'],
+    );
+    assert.ok(fresh.turns.every((turn) => turn.model === model && turn.contextRequest?.lifetime === '30m'));
+    assert.ok(Math.abs(fresh.turns.reduce((sum, turn) => sum + turnCost(turn).dollars!, 0) - expected) < 1e-12);
+    const initial = readCodexSessionIncremental(file, 'sess');
+    fs.appendFileSync(file, JSON.stringify({ type: 'ignored' }) + String.fromCharCode(10));
+    const resumed = readCodexSessionIncremental(file, 'sess', initial.checkpoint ?? undefined);
+    assert.deepEqual(
+      resumed.read?.turns.map((turn) => turn.usage),
+      fresh.turns.map((turn) => turn.usage),
+    );
+    const child = readCodexAgentSpend(file);
+    assert.equal(child.models[0].model, model);
+    assert.equal(child.models[0].usage.byContextBand?.short?.requests, 2);
+    assert.equal(child.models[0].usage.byContextBand?.long?.requests, 1);
+    assert.ok(Math.abs(estimateCost(child.models[0].usage, model, 'openai')! - expected) < 1e-12);
+  }
 });

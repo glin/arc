@@ -1,3 +1,4 @@
+import { publicPricingValidUntil } from './pricing';
 import { parseLinkDestination, linkBrowserKind, type LinkDestination, type LinkOpening } from './domain/link-path';
 import { commandScope } from './commandcatalog';
 import { RESUME_WINDOW_MS, type ResumeCandidate } from './apierrorresume';
@@ -2798,6 +2799,7 @@ export class PanelProvider implements vscode.Disposable {
   private projectSpendSnapshot: ProjectSpendView | null = null;
   private projectSpendSnapshotDate: string | null = null;
   private projectSpendSnapshotPrice = publicProjectSpendPrice;
+  private projectSpendSnapshotPricingUntil = publicPricingValidUntil();
   private projectSpendTomorrow: { date: string; view: ProjectSpendView } | null = null;
   private projectSpendRebuild: ReturnType<typeof setTimeout> | null = null;
   private projectSpendBuild: Generator<void, ProjectSpendView> | null = null;
@@ -14804,6 +14806,7 @@ export class PanelProvider implements vscode.Disposable {
       const now = Date.now();
       const historyDays = readSetting('projectCost.historyDays');
       const price = publicProjectSpendPrice;
+      const pricingUntil = publicPricingValidUntil();
       const date = projectSpendWindows(now)[0].start;
       const truncation = (at: number): string => {
         const cutoff = projectSpendHistoryCutoff(historyDays, at);
@@ -14832,6 +14835,7 @@ export class PanelProvider implements vscode.Disposable {
           files !== this.projectSpendVisibleFiles ||
           historyDays !== readSetting('projectCost.historyDays') ||
           price !== publicProjectSpendPrice ||
+          pricingUntil !== publicPricingValidUntil() ||
           date !== projectSpendWindows(Date.now())[0].start ||
           periodKey !== truncation(Date.now())
         ) {
@@ -14859,6 +14863,7 @@ export class PanelProvider implements vscode.Disposable {
               this.publishProjectSpendCoverage?.(false);
               this.projectSpendSnapshotDate = date;
               this.projectSpendSnapshotPrice = price;
+              this.projectSpendSnapshotPricingUntil = pricingUntil;
               this.projectSpendTomorrow = {
                 date: projectSpendWindows(tomorrow.getTime())[0].start,
                 view: Object.freeze(result.value),
@@ -14879,7 +14884,11 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   private postProjectSpend(): void {
-    if (this.projectSpendSnapshotPrice !== publicProjectSpendPrice) this.invalidateProjectSpendSnapshot();
+    if (
+      this.projectSpendSnapshotPrice !== publicProjectSpendPrice ||
+      this.projectSpendSnapshotPricingUntil !== publicPricingValidUntil()
+    )
+      this.invalidateProjectSpendSnapshot();
     void this.post({ type: 'projectSpend', projectSpend: this.projectSpendPayload() });
   }
 
@@ -14998,6 +15007,8 @@ export class PanelProvider implements vscode.Disposable {
     const next = new Date(now);
     next.setHours(0, 0, 0, 0);
     next.setDate(next.getDate() + 1);
+    const pricingUntil = publicPricingValidUntil(now);
+    if (pricingUntil < next.getTime()) next.setTime(pricingUntil);
     const cutoff = this.projectSpendHistoryCutoff(now);
     if (cutoff !== null) {
       for (const window of projectSpendWindows(now)) {
@@ -15028,6 +15039,7 @@ export class PanelProvider implements vscode.Disposable {
         this.postProjectSpend();
         // The moved cutoff can settle or hold a dispatched source without queueing it.
         this.postDispatchedCostsIfMoved('historyCutoff');
+        if (pricingUntil !== publicPricingValidUntil()) this.refreshFrom('models', true, true, null, true, true);
         this.scheduleProjectSpendMidnight();
       },
       Math.max(1, next.getTime() - Date.now()),

@@ -33585,7 +33585,7 @@ test('selection and accepted worker results avoid unnecessary catalog walks', ()
   const reusing = [...panelHostSource.matchAll(/this\.refresh(?:From|As)\('[^']+', (?:true|false), true\b/g)];
   assert.equal(
     reusing.length,
-    25,
+    26,
     `${reusing.length} refresh callers reuse the held catalog. Selection, older-page loading, ` +
       'the accepted selected-worker follow-up, row delta recovery, repeated-record coverage, the listing after the cold opening pass, a poll at unchanged ' +
       'directories, a compressed facts batch, the redraw of a shown row that a batch changed, and the commit and model list updates, which change cards and no session row, must not repeat catalog enumeration.',
