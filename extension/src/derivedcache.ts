@@ -419,6 +419,13 @@ export class SessionFactFigures<F, V> {
   // Sets the figure of one session, or drops it with null. The output keeps its identity.
   // Session list keys detect replaced entries and changed membership. The caller requests publication after patching.
   patch(sessionId: string, entry: { facts: F; value: V } | null): Readonly<Record<string, V>> {
+    const now = Date.now();
+    if (now < this.pricedAt || now >= this.pricingUntil) {
+      this.held.clear();
+      this.pricingInvalidated = true;
+      this.pricedAt = now;
+      this.pricingUntil = publicPricingValidUntil(now);
+    }
     const value = this.value as Record<string, V>;
     if (entry) {
       this.held.set(sessionId, entry);

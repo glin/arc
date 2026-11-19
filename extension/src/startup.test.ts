@@ -32834,6 +32834,52 @@ test('GPT-6.2 unchanged Project cost snapshots reprice at the Ultrafast boundary
       'a backward clock kept the post-promotion metadata price',
     );
     assert.deepEqual(Object.keys(metadata.read([['priced', file]], price)), ['priced']);
+
+    vi.setSystemTime(boundary - 2000);
+    const rows = completeDiscoveryHarness();
+    rows.useSessionStats(sessionStatsFromFacts);
+    const session = { file: 'clock.jsonl.zst', sessionId: 'clock', agent: 'codex', size: 40, mtimeMs: 11 };
+    const facts: SessionStatFacts = {
+      turns: [
+        {
+          startedAt: boundary - 3000,
+          endedAt: boundary - 2500,
+          finished: true,
+          error: false,
+          model: 'gpt-6.2-sol',
+          provider: 'openai',
+          contextTokens: 0,
+          contextWindow: null,
+          childSpendPartial: false,
+          usage: { ...file.buckets[0].usage, requests: 1 },
+          usageParts: [
+            {
+              model: 'gpt-6.2-sol',
+              provider: 'openai',
+              serviceTier: 'ultrafast',
+              contextBand: 'short',
+              contextWindow: null,
+              inferenceClass: null,
+              usage: { ...file.buckets[0].usage, requests: 1 },
+            },
+          ],
+        },
+      ],
+      compactions: [],
+    };
+    rows.partial = [session];
+    rows.catalog = { sessions: [session] };
+    rows.discovery = Promise.resolve(true);
+    rows.metaFor = () => ({ stats: facts });
+    const cost = () => rows.metadataStatsBySession.clock.find((chip: any) => chip.metric === 'cost').dollars;
+    await rows.refresh(true);
+    assert.ok(Math.abs(cost() - 0.6) < 1e-12);
+    vi.setSystemTime(boundary + 1000);
+    rows.noteCompressedRowFacts([session], [], [session]);
+    assert.ok(Math.abs(cost() - 1.2) < 1e-12);
+    vi.setSystemTime(boundary - 1000);
+    await rows.refresh(true);
+    assert.ok(Math.abs(cost() - 0.6) < 1e-12, 'the session cost kept the price from the forward clock jump');
   } finally {
     vi.useRealTimers();
   }
