@@ -482,7 +482,7 @@ const definitions: readonly Command[] = [
       synopsis: 'arc session ID [--turns 1-20] [--window ID] [--json]',
       flags: [['--turns 1-20', 'Read this many newest turns. Default: 5.'], windowFlag, readJsonFlag],
       output: [
-        'Text shows delivered prompts and responses. JSON preserves state, partial, notes, and turn fields.',
+        'Text shows delivered prompts, responses, and current questions. JSON includes question IDs, text, options, and availability.',
         'An eligible owning requester receives observation for send. Eligible current replies include readObservation for delivered completed turns. Stale reads return no turns.',
       ],
       refusals: ['One unique scoped session ID is required. File paths do not select a source.', windowRefusal],
@@ -617,10 +617,14 @@ const definitions: readonly Command[] = [
     help: {
       summary: 'Deliver a requested message or an observed follow-up.',
       synopsis:
-        'arc send ID --prompt-file PATH [--queue | --observation OBSERVATION] --request-id ID [--window ID] [--json]',
+        'arc send ID --prompt-file PATH [--queue | --observation OBSERVATION | --answer-question QUESTION_ID] --request-id ID [--window ID] [--json]',
       flags: [
         ['--prompt-file PATH', 'Required. Read a regular UTF-8 file up to 48 KiB.'],
-        ['--queue, -q', 'Queue the message for idle delivery. Cannot combine with --observation.'],
+        ['--queue, -q', 'Queue the message for idle delivery. Cannot combine with another delivery flag.'],
+        [
+          '--answer-question QUESTION_ID',
+          'Answer this current nonsecret Codex async question with the exact prompt-file text.',
+        ],
         ['--observation OBSERVATION', 'Select parent-only continuation. Omit for ordinary reader-requested delivery.'],
         requestFlag,
         windowFlag,

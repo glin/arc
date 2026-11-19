@@ -2,6 +2,7 @@ import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypt
 import type { LauncherRequest } from './view/launcher';
 import type { SessionListingRow } from './sessionreads';
 import type { GuardedAttempt, GuardedReceipt, PromptEntry } from './agentwire';
+import { buildQuestionReply, type QuestionReply } from './codexreply';
 import {
   canonicalServiceTier,
   isServiceTier,
@@ -50,6 +51,7 @@ export interface SessionWriteParams {
   limit?: number;
   // A guarded follow-up names the observation that its prompt continues.
   observation?: string;
+  answerQuestion?: string;
   delivery?: 'auto';
 }
 
@@ -73,13 +75,18 @@ export function validSessionWrite(method: string, params: Record<string, unknown
     );
   if (method === 'send')
     return (
-      ['delivery,prompt,sessionId', 'observation,prompt,sessionId', 'prompt,sessionId'].includes(
-        Object.keys(params).sort().join(','),
-      ) &&
+      [
+        'answerQuestion,prompt,sessionId',
+        'delivery,prompt,sessionId',
+        'observation,prompt,sessionId',
+        'prompt,sessionId',
+      ].includes(Object.keys(params).sort().join(',')) &&
       (!Object.prototype.hasOwnProperty.call(params, 'delivery') || params.delivery === 'auto') &&
       text(params.sessionId, 256) &&
       !!params.sessionId &&
       text(params.prompt, 48 * 1024) &&
+      (!Object.prototype.hasOwnProperty.call(params, 'answerQuestion') ||
+        (text(params.answerQuestion, 4096) && !!params.answerQuestion)) &&
       (!Object.prototype.hasOwnProperty.call(params, 'observation') ||
         (typeof params.observation === 'string' && SESSION_OBSERVATION.test(params.observation)))
     );
@@ -510,7 +517,7 @@ export interface GuardedChild {
     commands: SlashSendTarget['commands'];
     skills: SlashSendTarget['skills'];
   };
-  guardedIdle(): string | null;
+  guardedIdle(questionId?: string): string | null;
   // How many turns this child has ended. Source growth with a new turn end is tracked work, not an outside change.
   guardedTurnEnds(): number;
 }
@@ -577,13 +584,16 @@ export interface AgentMessageBinding {
   readonly sessionId: string;
   current(): boolean;
   idle(): string | null;
+  question?(id: string): QuestionReply | null;
+  questionIdle?(id: string): string | null;
+  deliverAnswer?(id: string, text: string, beforeWrite: () => void): Promise<GuardedReceipt>;
   refusal(): string | null;
   // The bound child's published commands, read when the slash rule runs.
   sendTarget(): SlashSendTarget;
   invalidate(): void;
   reserve?(): (() => void) | null;
   liveReason?(): string | null;
-  pendingControl?(): boolean;
+  pendingControl?(queueDrain?: number): boolean;
   deliverLive?(text: string, beforeWrite: () => void): Promise<GuardedReceipt>;
   deliver(text: string, beforeWrite: () => void): Promise<GuardedReceipt>;
 }
@@ -1040,6 +1050,7 @@ export function interveneOnReaderInput(
 
 // The live child as the delivery port reads it. `AgentSession` implements it.
 export interface GuardedWriter extends GuardedChild {
+  guardedQuestion?(id: string): QuestionReply | null;
   guardedLiveReason?(): string | null;
   guardedLive?(
     text: string,
@@ -1081,16 +1092,26 @@ export function agentMessageBinding<C extends GuardedWriter>(
     sessionId: session,
     current,
     idle: () => child.guardedIdle(),
+    question: (id) => child.guardedQuestion?.(id) ?? null,
+    questionIdle: (id) => child.guardedIdle(id),
+    deliverAnswer: (id, text, beforeWrite) => deliver(text, beforeWrite, false, id),
     refusal,
     sendTarget: () => slashSendTarget(child),
     invalidate: () => policy.invalidate(session),
     reserve: () => policy.reserve(session),
     liveReason: () => (child.guardedLiveReason ? child.guardedLiveReason() : 'This agent cannot receive live input.'),
-    pendingControl: () => (policy.facts?.(session)?.pendingControls ?? 0) > 0,
+    pendingControl: (queueDrain = 0) => (policy.facts?.(session)?.pendingControls ?? 0) > queueDrain,
     deliverLive: (text, beforeWrite) => deliver(text, beforeWrite, true),
     deliver: (text, beforeWrite) => deliver(text, beforeWrite, false),
   };
-  async function deliver(text: string, beforeWrite: () => void, liveInput: boolean): Promise<GuardedReceipt> {
+  async function deliver(
+    text: string,
+    beforeWrite: () => void,
+    liveInput: boolean,
+    questionId?: string,
+  ): Promise<GuardedReceipt> {
+    const question = questionId ? child.guardedQuestion?.(questionId) : null;
+    const ends = child.guardedTurnEnds();
     let receipt: GuardedReceipt;
     let attempt: GuardedAttempt | null = null;
     try {
@@ -1099,7 +1120,8 @@ export function agentMessageBinding<C extends GuardedWriter>(
           live !== child ||
           !current() ||
           refusal() ||
-          (liveInput ? child.guardedLiveReason?.() !== null : child.guardedIdle() !== null)
+          (liveInput ? child.guardedLiveReason?.() !== null : child.guardedIdle(questionId) !== null) ||
+          (questionId && !question)
         )
           return {
             outcome: 'refused' as const,
@@ -1109,11 +1131,17 @@ export function agentMessageBinding<C extends GuardedWriter>(
         beforeWrite();
         const write = liveInput ? child.guardedLive!.bind(child) : child.guardedPrompt.bind(child);
         attempt = write(
-          text,
+          question ? buildQuestionReply([{ ...question, answer: text }]) : text,
           clientUuid(),
           (turnId) => submitted?.(child, turnId),
           () => {
             if (!current() || refusal()) throw new Error('The original agent no longer owns this message.');
+            if (
+              questionId &&
+              (child.guardedTurnEnds() !== ends ||
+                JSON.stringify(child.guardedQuestion?.(questionId)) !== JSON.stringify(question))
+            )
+              throw new Error('The pending question changed before the answer was sent.');
             beforeWrite();
           },
         );

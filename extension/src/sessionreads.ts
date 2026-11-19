@@ -30,6 +30,7 @@ import type { SessionStatus } from './domain/session-query.ts';
 import { railStatusRuns } from './domain/session-query.ts';
 import { onlyGrew } from './derivedcache.ts';
 import { READ_OBSERVATION_BYTES, type ReadObservationFacts } from './sessionwrites.ts';
+import type { Ask } from './agentwire';
 import { READ_LIMIT, type AgentReadSource } from './domain/read.ts';
 import { createClaudeRepeatedFilter, ClaudeRepeatedPrefix } from './clauderepeated.ts';
 import { meterRead } from './readmeter.ts';
@@ -889,6 +890,32 @@ export type SessionTurn = Pick<
   | 'interrupted'
   | 'error'
 >;
+
+export interface SessionQuestions {
+  state: 'current' | 'partial' | 'unavailable';
+  items: { id: string; question: string; options: { label: string; description: string }[] }[];
+}
+
+export function sessionQuestions<T extends object>(
+  reply: T,
+  asks: readonly Ask[] | null,
+): T & { questions: SessionQuestions } {
+  const questions: SessionQuestions = { state: asks === null ? 'unavailable' : 'current', items: [] };
+  const result = { ...reply, questions };
+  for (const ask of asks ?? []) {
+    if (ask.kind !== 'question') continue;
+    for (const question of ask.questions) {
+      if (question.secret) continue;
+      questions.items.push({ id: question.id, question: question.question, options: question.options });
+      if (Buffer.byteLength(JSON.stringify(result)) > SESSION_READ_LIMITS.outputBytes - 512) {
+        questions.items.pop();
+        questions.state = 'partial';
+        return result;
+      }
+    }
+  }
+  return result;
+}
 
 function revision(file: string): string | null {
   try {

@@ -2790,6 +2790,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   interveneOnReaderInput(panel, guardedSends);
   // The channel's send reaches the guarded mode of the wrapped `onSendPrompt`, which skips reader intervention.
   channel?.setGuardedReadHandler((request) => panel.guardedReadRequest(request));
+  panel.onSessionQuestions = (agent, session) => {
+    if (agent !== 'claude' && agent !== 'codex') return null;
+    const child = host.find(agent, session);
+    return child && !child.state().exited ? child.state().asks : null;
+  };
   channel?.setPerformanceCaptureHandler(() => panel.capturePerformanceForChannel());
   channel?.setGuardedSendHandler((request) =>
     Object.prototype.hasOwnProperty.call(request.params, 'observation')

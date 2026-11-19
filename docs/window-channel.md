@@ -65,3 +65,13 @@ One bridge process serves the Node host and exits when its stdin closes. The cha
 Every pipe instance rejects remote clients and denies Network access. The pipe grants its owner and SYSTEM full access. Local `CodexSandboxOffline` and `CodexSandboxOnline` accounts receive duplex access without pipe-instance creation rights. On the connected handle, clients check the server process id, its host parent, and the pipe owner before sending anything. Discovery requires that owner to match the registration file owner. Direct ping checks use the registered host process owner. Overlapped reads and writes preserve duplex operation. Operations retain native handles and buffers until completion after cancellation. Busy client opens retry within the request deadline. A client disconnect before acceptance closes its instance while the listener continues. Native admission, per-connection output, and bridge stdio have fixed limits.
 
 Discovery visits at most 1,024 directory entries plus one coverage check. It admits 256 valid hosts and pings eight concurrently. Invalid entries consume the directory allowance but not the host allowance. Unvisited entries or uncertain host responses mark discovery incomplete. Publication replaces one registration without scanning the shared directory for leftover atomic temporaries. An identical state publication restores a missing registration.
+
+## Named question answers
+
+`send` accepts `answerQuestion` with `prompt` and `sessionId` as an exclusive delivery mode. The window advertises `agentQuestionAnswer` while its guarded send handler is available. The client refuses older windows before transmission.
+
+The host builds the existing Codex reply envelope from one current nonsecret async question and the supplied answer. It requires the retained child, positive native idle evidence, current scope and source revision, and no unrelated blocking request. Source, question, controls, reservations, and child identity are checked again before native input. Accepted native receipt settles only the named question. Unknown delivery keeps the question pending and blocks later agent input.
+
+Named answers bypass queued messages without changing their entries or ordering. Only the queue-drain marker is excluded from pending controls. Actual controls, staging, submissions, unresolved handoffs, and recovery entries still block answers. Ordinary messages and observed follow-ups retain their open-question restrictions.
+
+Session reads add current live questions after accepted source qualification. Question projection omits secrets and reports unavailable or partial coverage explicitly within the existing response allowance. It grants no answering authority.

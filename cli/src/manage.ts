@@ -137,6 +137,7 @@ export async function runManagement(command: string, args: string[]): Promise<st
     '--name',
     '--label',
     '--observation',
+    '--answer-question',
     '--completion',
     '--report-file',
     '--cache-lifetime',
@@ -178,7 +179,7 @@ export async function runManagement(command: string, args: string[]): Promise<st
     command === 'setups'
       ? ['--window', '--json']
       : command === 'send'
-        ? ['--window', '--request-id', '--prompt-file', '--observation', '--queue', '--json']
+        ? ['--window', '--request-id', '--prompt-file', '--observation', '--answer-question', '--queue', '--json']
         : command === 'read'
           ? ['--window', '--request-id', '--observation', '--dry-run', '--json']
           : command === 'start'
@@ -253,10 +254,17 @@ export async function runManagement(command: string, args: string[]): Promise<st
   if (command === 'send') {
     if (sessions.length !== 1 || !options.has('--prompt-file') || !requestId)
       throw new Error(
-        'Usage: arc send ID --prompt-file FILE [--queue | --observation OBSERVATION] --request-id WINDOW:REQUEST [--window WINDOW] [--json]',
+        'Usage: arc send ID --prompt-file FILE [--queue | --observation OBSERVATION | --answer-question QUESTION_ID] --request-id WINDOW:REQUEST [--window WINDOW] [--json]',
       );
     if (flags.has('--queue') && options.has('--observation'))
       throw new Error('--queue cannot combine with --observation.');
+    if (options.has('--answer-question') && (flags.has('--queue') || options.has('--observation')))
+      throw new Error('--answer-question cannot combine with --queue or --observation.');
+    if (
+      options.has('--answer-question') &&
+      (!options.get('--answer-question') || options.get('--answer-question')!.length > 4096)
+    )
+      throw new Error('Supply one complete question ID from arc session --json.');
     if (options.has('--observation') && !SESSION_OBSERVATION.test(options.get('--observation')!))
       throw new Error('The observation is invalid. Copy it from arc session --json.');
     const identity = requesterIdentity();
@@ -270,11 +278,13 @@ export async function runManagement(command: string, args: string[]): Promise<st
     const params: SessionWriteParams = {
       sessionId: sessions[0],
       prompt,
-      ...(options.has('--observation')
-        ? { observation: options.get('--observation')! }
-        : flags.has('--queue')
-          ? {}
-          : { delivery: 'auto' as const }),
+      ...(options.has('--answer-question')
+        ? { answerQuestion: options.get('--answer-question')! }
+        : options.has('--observation')
+          ? { observation: options.get('--observation')! }
+          : flags.has('--queue')
+            ? {}
+            : { delivery: 'auto' as const }),
     };
     const result = (await requestWindow('send', params, window, undefined, requestId)) as {
       status: string;

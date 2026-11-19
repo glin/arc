@@ -69,6 +69,7 @@ import { nativeCitationPath } from './domain/file-citation';
 import { externalOpenEligible, externalOpenPath } from './externalopen';
 import {
   boundedSessionRead,
+  sessionQuestions,
   AgentReadSources,
   guardedSourceRevision,
   guardedSourceIdentity,
@@ -2474,6 +2475,7 @@ export class PanelProvider implements vscode.Disposable {
   public recoveryOrigin = crypto.randomBytes(16).toString('hex');
   public onRecoveryOrigin: ((origin: string) => void) | null = null;
   public onAnswerAsk: ((session: string, id: string, answer: AskAnswer) => boolean | Promise<boolean>) | null = null;
+  public onSessionQuestions: ((agent: string, session: string) => readonly Ask[] | null) | null = null;
   public onArchivedSessionsChange: ((sessions: ReadonlySet<string>) => void) | null = null;
   public onBackgroundWorkDetected:
     | ((
@@ -3756,7 +3758,7 @@ export class PanelProvider implements vscode.Disposable {
       if (matches.length !== 1) throw new Error('The session ID is unknown or ambiguous in this window.');
       if (!this.sessionReadAdmitted(matches[0]))
         throw new Error('The session membership is unavailable or ambiguous. Retry after session discovery.');
-      const result = boundedSessionRead(
+      const read = boundedSessionRead(
         this.readSource(matches[0]),
         request.params.turns!,
         scopeKey,
@@ -3769,6 +3771,10 @@ export class PanelProvider implements vscode.Disposable {
             ? this.readObservations.observe(requesterOf(request), facts)
             : null;
         },
+      );
+      const result = sessionQuestions(
+        read,
+        read.state === 'stale' ? null : (this.onSessionQuestions?.(matches[0].agent, matches[0].sessionId) ?? null),
       );
       const name = this.saved.initialNames?.[matches[0].sessionId];
       return name && matches[0].agent === name.provider
@@ -8286,7 +8292,8 @@ export class PanelProvider implements vscode.Disposable {
     request: AttributedRequest,
     binding: AgentMessageBinding | null,
   ): Promise<GuardedSendResult> {
-    if (request.params.delivery !== 'auto') return this.queueAgentMessage(request, binding);
+    const questionId = request.params.answerQuestion;
+    if (request.params.delivery !== 'auto' && !questionId) return this.queueAgentMessage(request, binding);
     const session = request.params.sessionId ?? '';
     const text = request.params.prompt ?? '';
     const refuse = (reason: string) => guardedRefusal(request.id, text, reason);
@@ -8300,6 +8307,8 @@ export class PanelProvider implements vscode.Disposable {
       );
     const release = binding.reserve?.();
     if (binding.reserve && !release) return refuse('Another message is still being delivered. No message was sent.');
+    const original = questionId ? this.guardedTargetFacts(session) : null;
+    const question = questionId ? binding.question?.(questionId) : null;
     const check = () => {
       const state = this.stateFor(session);
       const facts = this.guardedTargetFacts(session);
@@ -8318,24 +8327,70 @@ export class PanelProvider implements vscode.Disposable {
         binding.sessionId !== session
       )
         return 'The destination session is unavailable. No message was sent.';
+      if (questionId) {
+        if (
+          !question ||
+          !binding.deliverAnswer ||
+          !original?.scope ||
+          !original.sourceRevision ||
+          facts.scope !== original.scope ||
+          facts.sourceRevision !== original.sourceRevision ||
+          JSON.stringify(binding.question?.(questionId)) !== JSON.stringify(question)
+        )
+          return 'The pending question is unavailable or changed. No answer was sent.';
+        return binding.refusal();
+      }
       return binding.refusal() ?? slashSendRefusal(text, binding.sendTarget(), 'No message was sent.');
     };
     const waiting = () => {
       const state = this.stateFor(session)!;
       const facts = this.guardedTargetFacts(session)!;
-      if (state.queued.length) return 'Earlier messages are waiting.';
-      if (state.asks?.length) return 'The session is waiting for an answer.';
+      if (!questionId && state.queued.length) return 'Earlier messages are waiting.';
+      if (!questionId && state.asks?.length) return 'The session is waiting for an answer.';
       // Accepted running prompts remain visible until completion. They do not represent preparation.
       const activePrompts = (this.live[session] ?? []).filter(
         (press) => press.kind === 'prompt' && press.ran && press.started && !press.completed && !press.failed,
       ).length;
-      if (facts.pendingSubmissions > activePrompts || facts.pendingControls > 0 || binding.pendingControl?.())
+      const queueDrain = questionId ? Number(this.pendingQueueDrains.has(session)) : 0;
+      if (
+        facts.pendingSubmissions > (questionId ? 0 : activePrompts) ||
+        facts.pendingControls > queueDrain ||
+        binding.pendingControl?.(queueDrain) ||
+        (questionId &&
+          (this.queueHandoffInProgress(state) || state.queued.some((entry) => entry.delivery?.phase === 'recovery')))
+      )
         return 'The session has pending work.';
       return null;
     };
     try {
       const blocked = check();
       if (blocked) return refuse(blocked);
+      if (questionId) {
+        const reason = waiting() ?? binding.questionIdle?.(questionId) ?? null;
+        if (reason || !binding.questionIdle)
+          return refuse('The session cannot receive this answer while work is pending.');
+        const beforeWrite = () => {
+          const blocked = check() ?? waiting();
+          if (blocked) throw new Error(blocked);
+        };
+        beforeWrite();
+        binding.invalidate();
+        const receipt = await binding.deliverAnswer!(questionId, text, beforeWrite);
+        return {
+          version: 1,
+          status: receipt.outcome,
+          requestId: request.id,
+          payloadSha256: payloadSha256(text),
+          nativeTurnId: receipt.nativeTurnId,
+          delivery: 'turn',
+          reason:
+            receipt.outcome === 'accepted'
+              ? 'The session received the answer. This confirms receipt, not completed work.'
+              : receipt.outcome === 'unknown'
+                ? 'Answer delivery is unknown. Arc will not resend it.'
+                : 'The answer was not sent. ' + receipt.reason,
+        };
+      }
       const idle = binding.idle();
       // A slash command, and a Codex skill mention, keeps its native form only as a new turn, never as live input.
       const waitsForTurn =

@@ -863,6 +863,16 @@ test('human session reads preserve delivered text, identity, and uncertainty wit
       ],
       observation: 'SECRET_SEND',
       readObservation: 'SECRET_READ',
+      questions: {
+        state: 'current',
+        items: [
+          {
+            id: '["request_user_input_async","item",0]',
+            question: 'Which result?',
+            options: [{ label: 'Yes', description: 'Keep it' }],
+          },
+        ],
+      },
       notes: ['Older turn excluded.'],
     });
     const detail = (await call('session')).stdout;
@@ -873,6 +883,9 @@ test('human session reads preserve delivered text, identity, and uncertainty wit
       'error',
       'model',
       'high',
+      'Which result?',
+      'Question ID:',
+      'Option: Yes: Keep it',
       'Older turn excluded.',
       'partial',
       '--json',
@@ -1000,5 +1013,39 @@ test('hosted provider commands reject ambiguous grammar before requesting a wind
     assert.equal(request.mock.calls.length, 0);
   } finally {
     rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('named question sends preserve reader text and identity and refuse conflicting modes', async () => {
+  const fixture = await host();
+  try {
+    const text = '  reader answer\n\tunchanged  ';
+    writeFileSync(fixture.prompt, text);
+    const id = '["request_user_input_async","item",1]';
+    const args = [
+      'worker',
+      '--prompt-file',
+      fixture.prompt,
+      '--answer-question',
+      id,
+      '--request-id',
+      `${fixture.channel.hostId}:answer`,
+      '--json',
+    ];
+    await runManagement('send', args);
+    assert.deepEqual(fixture.requests[0].params, { sessionId: 'worker', prompt: text, answerQuestion: id });
+    for (const conflicting of [['--queue'], ['-q'], ['--observation', 'a.' + 'b'.repeat(43)]])
+      await assert.rejects(runManagement('send', [...args, ...conflicting]), /cannot combine/);
+    for (const invalid of ['', 'x'.repeat(4097)])
+      await assert.rejects(
+        runManagement(
+          'send',
+          args.map((one) => (one === id ? invalid : one)),
+        ),
+        /complete question ID/,
+      );
+    assert.equal(fixture.requests.length, 1);
+  } finally {
+    await fixture.close();
   }
 });

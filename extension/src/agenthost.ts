@@ -80,6 +80,7 @@ import { ARC_IDENTITY } from './identity';
 import { sessionHookEnvironment, sessionHookRuntime } from './bundledtools';
 import { sentence } from './sessionwrites';
 import { QuestionRecovery, questionIdentity, type RecoveredQuestion } from './questionrecovery';
+import type { QuestionReply } from './codexreply';
 import {
   admitClaudeSessionComponents,
   claudeSkillHome,
@@ -1556,12 +1557,12 @@ export class AgentSession {
 
   // Why this child cannot take a guarded prompt now, or null with positive idle evidence.
   // Initial `busy: false` alone is not evidence: the provider must have reported idle after its last input.
-  guardedIdle(): string | null {
+  guardedIdle(questionId?: string): string | null {
     if (this.exited || !this.ready || this.childTerminated) return 'unavailable';
     if (
       this.busy ||
       this.delivering.size > 0 ||
-      this.asks.size > 0 ||
+      (this.asks.size > 0 && (!questionId || !this.guardedQuestion(questionId))) ||
       this.heldEffort !== null ||
       this.effortSent !== null ||
       this.preparingTurns.size > 0 ||
@@ -1572,6 +1573,20 @@ export class AgentSession {
     )
       return 'busy';
     return this.driver.idleEvidence?.() === true ? null : 'unconfirmed';
+  }
+
+  guardedQuestion(questionId: string): QuestionReply | null {
+    if (this.agent !== 'codex') return null;
+    let found: QuestionReply | null = null;
+    for (const ask of this.asks.values()) {
+      if (ask.kind !== 'question' || ask.recovery || !this.driver.outlivesTurn?.(ask.id)) return null;
+      for (const question of ask.questions) {
+        if (question.id !== questionId) continue;
+        if (found || question.secret) return null;
+        found = { questionItemId: question.id, question: question.question, answer: '' };
+      }
+    }
+    return found;
   }
 
   guardedTurnEnds(): number {

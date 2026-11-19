@@ -1113,6 +1113,16 @@ export class CodexWire {
     }
     // A guarded start records how many turns were known when it wrote its input. A response naming one of them is a shared turn.
     const known = guard ? this.seenTurns.size : 0;
+    if (
+      guard &&
+      (this.closed ||
+        this.turns.length ||
+        this.compaction !== null ||
+        this.compactionUnresolved() ||
+        this.runningRootTurns.size ||
+        this.runningCompactionTurns.size)
+    )
+      throw new Error('the session is not idle');
     beforeWrite?.();
     guard?.prepareWrite();
     let requestId = 0;
@@ -1150,6 +1160,7 @@ export class CodexWire {
         ((this.seenTurns.get(turnId) ?? Infinity) <= known ||
           this.turns.some((turn) => turn !== active && turn.id === turnId && turn.threadId === threadId));
       if (threadId === this.thread) this.seeTurn(turnId);
+      if (!shared && threadId === this.thread) this.resolveRepliedAsks({ content });
       guard?.settle(
         shared
           ? {

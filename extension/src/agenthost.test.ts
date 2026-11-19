@@ -129,7 +129,16 @@ import { asyncQuestionId, buildQuestionReply } from './codexreply';
 import { launchPolicy, type LaunchPolicy } from './launchpolicy.ts';
 import { DispatchReceipts } from './dispatchreceipts';
 import { HostedDispatch, type SavedDispatchResponse } from './dispatchhost';
-import { payloadSha256 } from './sessionwrites';
+import {
+  payloadSha256,
+  GuardedSends,
+  agentMessageBinding,
+  guardedRefusal,
+  guardedPromptRefusal,
+  requesterOf,
+} from './sessionwrites';
+import { queuedSubmissionBookFits } from './turnview';
+import * as ts from 'typescript';
 import { LaunchPolicyStore } from './launchpolicystore.ts';
 import * as esbuild from 'esbuild';
 import { callSources, declarationSource, statementFrom, sourceMatch } from '../test/source-contract.ts';
@@ -5964,6 +5973,310 @@ test('a Codex async question stays open after its turn ends, and answering it st
   await vi.waitFor(() =>
     assert.equal(session.state().busy, true, 'the answer started a turn, so the session is working'),
   );
+});
+
+// The channel uses the production admission methods with the native child fixture.
+async function pendingQuestionMessageHost() {
+  const native = fakeHost();
+  const starting = native.host.session('cx', codexPlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT }));
+  const child = native.children[0];
+  await answerCodexHandshake(child);
+  child.reply({ thread: { id: 'thread-7' } });
+  const session = await starting;
+  const prompting = session.prompt('check the rail');
+  child.reply({ turn: { id: 'turn-1' } });
+  await prompting;
+  const registration = { accepted: true };
+  child.say(
+    JSON.stringify({
+      method: 'item/completed',
+      params: {
+        threadId: 'thread-7',
+        turnId: 'turn-1',
+        item: {
+          type: 'functionCallOutput',
+          id: 'registration',
+          output: JSON.stringify(registration),
+        },
+      },
+    }) + '\n',
+  );
+  child.say(
+    JSON.stringify({
+      method: 'item/completed',
+      params: {
+        threadId: 'thread-7',
+        turnId: 'turn-1',
+        item: {
+          type: 'agentMessage',
+          id: 'call-ask',
+          text: 'Which result?',
+          phase: 'final_answer',
+          delivery: 'async',
+          questions: [
+            { title: 'Which result?', options: ['Yes', 'No'] },
+            { title: 'Keep this open?', options: ['Yes'] },
+          ],
+        },
+      },
+    }) + '\n',
+  );
+  child.say(
+    JSON.stringify({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-7',
+        turn: { id: 'turn-1', status: 'completed', items: [] },
+      },
+    }) + '\n',
+  );
+  const source = fs.readFileSync(path.join(__dirname, 'panelhost.ts'), 'utf8');
+  const file = ts.createSourceFile('panelhost.ts', source, ts.ScriptTarget.Latest, true);
+  const owner = file.statements.find(
+    (one): one is ts.ClassDeclaration => ts.isClassDeclaration(one) && one.name?.text === 'PanelProvider',
+  )!;
+  const names = ['sendAgentMessage', 'queueAgentMessage', 'queueHandoffInProgress'];
+  const body = owner.members
+    .filter((one) => one.name && names.includes(one.name.getText(file)))
+    .map((one) => one.getText(file))
+    .join('\n');
+  const scope = {
+    crypto: { randomUUID: () => 'queued-message' },
+    guardedRefusal,
+    guardedPromptRefusal,
+    requesterOf,
+    payloadSha256,
+    queueSubmissionAfter,
+    queuedSubmissionBookFits,
+    normalizeQueuedSubmissions,
+    slashSendRefusal: () => null,
+    isSlashPrompt: () => false,
+  };
+  const Host = runInNewContext(esbuild.transformSync(`class Host { ${body} }; Host;`, { loader: 'ts' }).code, scope);
+  const panel: any = new Host();
+  let revision = 'original';
+  let control = 0;
+  let replacement = false;
+  const policy = new GuardedSends<typeof session>('window', () => (replacement ? null : session));
+  const binding = agentMessageBinding(
+    policy,
+    session,
+    {
+      find: () => (replacement ? null : session),
+      withActivity: async (_key, work) => work(session),
+    },
+    () => false,
+    () => 'answer-client',
+  );
+  Object.assign(panel, {
+    repositoryScopeReady: true,
+    queues: {},
+    agentMessages: new Map(),
+    queueHandoffs: new Set(),
+    pendingQueueDrains: new Set(),
+    clearSettlements: new Map(),
+    live: {},
+    stateFor: () => ({ ...session.state(), agent: 'codex', queued: panel.queues['thread-7'] ?? [] }),
+    membershipOf: () => 'present',
+    guardedTargetFacts: () => ({
+      current: true,
+      archived: false,
+      scope: 'scope',
+      sourceRevision: revision,
+      latestTurn: 'turn-1',
+      queued: panel.queues['thread-7']?.length ?? 0,
+      pendingSubmissions: 0,
+      pendingControls: control + Number(panel.pendingQueueDrains.has('thread-7')),
+      background: false,
+      writerConflict: false,
+    }),
+    writeDrafts: async () => {},
+    flushQueue: () => {},
+    flushAgentQueue: () => {},
+    post: async () => {},
+    usagePayload: () => ({}),
+    backgroundRefusal: () => null,
+  });
+  policy.facts = panel.guardedTargetFacts;
+  const request = {
+    id: 'window:answer',
+    requester: 'reader',
+    requesterProvider: 'codex' as const,
+    params: {
+      sessionId: 'thread-7',
+      prompt: '  reader answer\nunchanged  ',
+      answerQuestion: asyncQuestionId('call-ask', 0),
+    },
+  };
+  onTestFinished(() => native.host.dispose());
+  return {
+    ...native,
+    child,
+    session,
+    panel,
+    policy,
+    binding,
+    request,
+    setRevision: () => {
+      revision = 'replacement';
+    },
+    setControl: () => {
+      control++;
+    },
+    replace: () => {
+      replacement = true;
+    },
+  };
+}
+
+test('a named reader answer reaches the idle Codex child past an ordinary queued message and settles only its question', async () => {
+  const f = await pendingQuestionMessageHost();
+  assert.equal(f.session.state().busy, false);
+  assert.equal(f.session.guardedIdle(), 'busy');
+  assert.equal(f.session.state().asks.length, 1);
+  const plain = await f.panel.sendAgentMessage(
+    {
+      ...f.request,
+      id: 'window:plain',
+      params: {
+        sessionId: 'thread-7',
+        prompt: 'ordinary queued text',
+        delivery: 'auto',
+      },
+    },
+    f.binding,
+  );
+  assert.equal(plain.status, 'queued');
+  assert.equal(f.panel.pendingQueueDrains.has('thread-7'), true);
+  const queued = [...f.panel.queues['thread-7']];
+  let accepted = false;
+  const sending = f.panel.sendAgentMessage(f.request, f.binding).then((result: any) => {
+    accepted = true;
+    return result;
+  });
+  await vi.waitFor(() => assert.equal(f.child.sent().filter((message) => message.method === 'turn/start').length, 2));
+  assert.equal(accepted, false);
+  assert.equal(f.session.state().asks[0].kind, 'question');
+  const answer = f.child.sent().at(-1)?.params as { input: unknown; threadId: string } | undefined;
+  assert.ok(answer);
+  assert.deepEqual(answer.input, [
+    {
+      type: 'text',
+      text: buildQuestionReply([
+        {
+          questionItemId: f.request.params.answerQuestion,
+          question: 'Which result?',
+          answer: f.request.params.prompt,
+        },
+      ]),
+    },
+  ]);
+  assert.equal(answer.threadId, 'thread-7');
+  f.child.reply({ turn: { id: 'turn-answer' } });
+  assert.equal((await sending).status, 'accepted');
+  assert.deepEqual(f.panel.queues['thread-7'], queued);
+  const ask = f.session.state().asks[0];
+  assert.equal(ask.kind, 'question');
+  if (ask.kind === 'question')
+    assert.deepEqual(
+      ask.questions.map((question) => question.id),
+      [asyncQuestionId('call-ask', 1)],
+    );
+});
+
+test.each([
+  'stale',
+  'partial',
+  'active',
+  'permission',
+  'synchronous',
+  'recovered',
+  'secret',
+  'control',
+  'source',
+  'child',
+  'unknown',
+  'question-final',
+  'permission-final',
+  'control-final',
+  'active-final',
+])('a named question answer refuses unsafe %s delivery', async (condition) => {
+  const f = await pendingQuestionMessageHost();
+  if (condition === 'stale') f.request.params.answerQuestion = asyncQuestionId('missing', 0);
+  if (condition === 'partial') f.request.params.answerQuestion = 'call-ask';
+  if (condition === 'control') f.setControl();
+  if (condition === 'active')
+    f.child.say(
+      JSON.stringify({ method: 'turn/started', params: { threadId: 'thread-7', turn: { id: 'other-turn' } } }) + '\n',
+    );
+  if (condition === 'permission')
+    f.child.say(
+      JSON.stringify({
+        id: 900,
+        method: 'item/commandExecution/requestApproval',
+        params: { itemId: 'permission', command: 'echo hi' },
+      }) + '\n',
+    );
+  if (condition === 'synchronous')
+    f.child.say(
+      JSON.stringify({
+        id: 901,
+        method: 'item/tool/requestUserInput',
+        params: { itemId: 'sync', questions: [{ id: 'sync-question', question: 'Wait?', options: [] }] },
+      }) + '\n',
+    );
+  if (condition === 'recovered') {
+    const ask = f.session.state().asks[0];
+    if (ask.kind === 'question') ask.recovery = { blocked: false, detail: 'saved' };
+  }
+  if (condition === 'secret') {
+    const ask = f.session.state().asks[0];
+    if (ask.kind === 'question') ask.questions[0].secret = true;
+  }
+  if (condition === 'unknown') f.policy.settle('thread-7', { outcome: 'unknown', nativeTurnId: null, reason: 'lost' });
+  if (condition === 'source' || condition === 'child') {
+    const deliver = f.binding.deliverAnswer!;
+    f.binding.deliverAnswer = async (...args) => {
+      if (condition === 'source') f.setRevision();
+      else f.replace();
+      return deliver(...args);
+    };
+  }
+  if (condition.endsWith('-final')) {
+    const prompt = f.session.guardedPrompt.bind(f.session);
+    f.session.guardedPrompt = (...args) => {
+      if (condition === 'control-final') f.setControl();
+      if (condition === 'question-final') {
+        const ask = f.session.state().asks[0];
+        if (ask.kind === 'question') ask.questions[0].question = 'Changed question';
+      }
+      if (condition === 'permission-final')
+        f.child.say(
+          JSON.stringify({
+            id: 902,
+            method: 'item/commandExecution/requestApproval',
+            params: { itemId: 'late-permission' },
+          }) + '\n',
+        );
+      if (condition === 'active-final')
+        f.child.say(
+          JSON.stringify({ method: 'turn/started', params: { threadId: 'thread-7', turn: { id: 'late-turn' } } }) +
+            '\n',
+        );
+      return prompt(...args);
+    };
+  }
+  const write = f.child.stdin.write.bind(f.child.stdin);
+  f.child.stdin.write = (line: string) => {
+    const result = write(line);
+    if (JSON.parse(line).method === 'turn/start')
+      queueMicrotask(() => f.child.reply({ turn: { id: 'unsafe-answer' } }));
+    return result;
+  };
+  const before = f.child.sent().filter((message) => message.method === 'turn/start').length;
+  assert.equal((await f.panel.sendAgentMessage(f.request, f.binding)).status, 'refused');
+  assert.equal(f.child.sent().filter((message) => message.method === 'turn/start').length, before);
+  assert.equal(f.session.state().asks.length > 0, true);
 });
 
 test('a Codex async answer whose steer and prompt are both refused leaves the session idle', async () => {

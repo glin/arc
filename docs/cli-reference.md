@@ -77,7 +77,9 @@ Claude reports `none` with current whole-file metadata, known empty turn starts,
 
 ### Turn reads
 
-`session --json` returns `version`, `requester`, `id`, `provider`, `state`, `turns`, `subagentContext`, `partial`, `readByteLimit`, and `notes`. Eligible replies also supply `observation` for follow-ups and `readObservation` for read acknowledgments.
+`session --json` returns `version`, `requester`, `id`, `provider`, `state`, `turns`, `subagentContext`, `partial`, `readByteLimit`, `questions`, and `notes`. Eligible replies also supply `observation` for follow-ups and `readObservation` for read acknowledgments.
+
+`questions` contains `state` and `items`. Its state is `current`, `partial`, or `unavailable`. Each nonsecret question supplies `id`, `question`, and offered `options` with `label` and `description`. Questions come from the live child independently of bounded turn history. Missing live state reports unavailable. The response allowance excludes excess questions and reports partial coverage. Readable output includes the same question identities and options.
 
 `subagentContext` estimates the text that subagents returned into the current context, as `{ tokens, share, partial }`. `tokens` estimates from UTF-8 size, at approximately 2.79 bytes per token for Claude and four for Codex. `share` divides `tokens` by the recorded current context, or is `null` when that context is unknown. A share above 1 stays as computed. `partial` is `true` when the read could not reach every result the figure covers. `tokens` is `0` when the read shows no subagent result. The field is `null` when the read returns no current turns.
 
@@ -182,7 +184,9 @@ Each activation retains at most 4,096 shared write results for starts, curation,
 
 ## Follow-ups
 
-`send` requires exactly one native requester identity, from `CLAUDE_CODE_SESSION_ID` or `CODEX_THREAD_ID`. Without `--observation`, ordinary delivery requires `agentMessageSend` capability and transmits `delivery: "auto"`. Older windows refuse before transmission. Explicit `--queue` or `-q` requires `agentMessageQueue` and omits `delivery`. Upgraded hosts preserve queue-only behavior for legacy requests that omit both `delivery` and `observation`.
+`send` requires exactly one native requester identity, from `CLAUDE_CODE_SESSION_ID` or `CODEX_THREAD_ID`. Without `--observation` or `--answer-question`, ordinary delivery requires `agentMessageSend` capability and transmits `delivery: "auto"`. Older windows refuse before transmission. Explicit `--queue` or `-q` requires `agentMessageQueue` and omits `delivery`. Upgraded hosts preserve queue-only behavior for legacy requests that omit both `delivery` and `observation`.
+
+`--answer-question QUESTION_ID` selects an explicit reader answer instead of ordinary delivery. Copy one complete question ID from `arc session --json`. The prompt file supplies the exact reader answer, including free text outside offered options. This flag cannot combine with `--queue` or `--observation`. The window requires `agentQuestionAnswer`. [Named question answers](window-channel.md#named-question-answers) owns admission, native receipt, and queue handling.
 
 Ordinary accepted results include `delivery`: `turn` for idle prompt receipt, `steer` for exact-turn Codex acknowledgment, or `live` for Claude UUID replay. Receipt confirms neither completed work nor Claude consumption before the original turn ends. Queue admission includes `queuedSubmissionId` after durable saving. Admission creates no parent relationship or reader ownership. A retained retry returns its original result. Changing delivery mode under that request ID refuses.
 

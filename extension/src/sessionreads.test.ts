@@ -19,6 +19,7 @@ import { tempDir } from './temproot.ts';
 import { claudeSubagentResult } from './turnfixtures.ts';
 import {
   boundedSessionRead,
+  sessionQuestions,
   encodeSessionCursor,
   readSessionCursor,
   sessionAttention,
@@ -1610,4 +1611,38 @@ test('an unresolved task notice withholds completion after a quiet turn without 
     sessionReadStatus('session', outcome, false, false, undefined, endedAt + 1, { unchanged: true, mtimeMs: endedAt }),
     'stopped',
   );
+});
+
+test('current question reads retain exact identities and options within the reply limit without secret questions', () => {
+  const question = {
+    id: '["request_user_input_async","item",0]',
+    question: 'Which result?',
+    header: '',
+    options: [{ label: 'Yes', description: 'Keep it' }],
+    multiSelect: false,
+    secret: false,
+  };
+  const ask = {
+    kind: 'question' as const,
+    id: 'item',
+    questions: [question, { ...question, id: 'secret', question: 'private', secret: true }],
+    input: {},
+    toolUseId: 'item',
+  };
+  const current = sessionQuestions({ turns: [] }, [ask]);
+  assert.deepEqual(current.questions, {
+    state: 'current',
+    items: [{ id: question.id, question: question.question, options: question.options }],
+  });
+  assert.equal(JSON.stringify(current).includes('private'), false);
+  assert.deepEqual(sessionQuestions({}, null).questions, { state: 'unavailable', items: [] });
+  const bounded = sessionQuestions({}, [
+    {
+      ...ask,
+      questions: [question, { ...question, id: 'big', question: 'x'.repeat(SESSION_READ_LIMITS.outputBytes) }],
+    },
+  ]);
+  assert.equal(bounded.questions.state, 'partial');
+  assert.equal(bounded.questions.items.length, 1);
+  assert.ok(Buffer.byteLength(JSON.stringify(bounded)) < SESSION_READ_LIMITS.outputBytes);
 });

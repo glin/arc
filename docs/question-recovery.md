@@ -28,6 +28,8 @@ Question IDs are JSON text of `["request_user_input_async", itemId, index]`. Kee
 
 Each answer joins picked labels and written text with commas. Send through `turn/steer` while the question's turn runs. After completion or definite steer refusal, send the same text as a new prompt on the original thread. Both paths wait for skill admission. Stop cancels unsent answers through admission, steer refusal, and fallback preparation. Stopped unsent answers, admission failure before input, and prompt refusal offer the question again and release delivery state. Unknown steer or prompt delivery never retries.
 
+An explicit CLI answer names one current question through `--answer-question`. It requires an ended native turn in the existing live child. Recovered questions, synchronous questions, permissions, and secrets refuse this operation. [Window contracts](window-channel.md#named-question-answers) owns admission and queue handling.
+
 A new thread closes earlier-thread questions. Dismissal sends nothing. An envelope-only user message answers named questions, including replies from another client. Close an ask only when all its questions settle. Surrounding text makes a message ordinary prompt text.
 
 Saved async items use `event_msg` / `item_completed` with `AgentMessage`, `delivery: "async"`, `phase: "final_answer"`, and `questions`. The adjacent `function_call` is not a repeated response. No `response_item` repeats the text, and `task_complete.last_agent_message` excludes it. [`codex.ts`](../extension/src/codex.ts) owns saved-item projection.

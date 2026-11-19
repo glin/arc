@@ -156,6 +156,31 @@ function renderSession(reply: unknown): string {
     `Session ${metadata(reply.id)}  ${reply.provider}`,
     `State: ${reply.state}. History: ${reply.state !== 'current' ? 'unavailable' : reply.partial ? 'partial' : 'complete'}.`,
   ];
+  if (reply.questions !== undefined) {
+    const questions = reply.questions;
+    if (
+      !object(questions) ||
+      !oneOf(questions.state, ['current', 'partial', 'unavailable']) ||
+      !Array.isArray(questions.items)
+    )
+      humanReplyError();
+    lines.push(`Questions: ${questions.state}.`);
+    for (const question of questions.items) {
+      if (
+        !object(question) ||
+        typeof question.id !== 'string' ||
+        typeof question.question !== 'string' ||
+        !Array.isArray(question.options)
+      )
+        humanReplyError();
+      lines.push(`Question ID: ${metadata(question.id)}`, question.question);
+      for (const option of question.options) {
+        if (!object(option) || typeof option.label !== 'string' || typeof option.description !== 'string')
+          humanReplyError();
+        lines.push(`Option: ${metadata(option.label)}${option.description ? `: ${metadata(option.description)}` : ''}`);
+      }
+    }
+  } else lines.push('Questions: unavailable.');
   if (!reply.turns.length)
     lines.push(
       reply.state === 'current'

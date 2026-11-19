@@ -1483,3 +1483,31 @@ test('service tier schema and request binding reject changed speed while accepti
   assert.notDeepEqual(bind('priority'), bind('default'));
   assert.notDeepEqual(bind('default'), bind());
 });
+
+test('named question writes require a sole explicit answer mode and bind retries to the named identity', async () => {
+  const params = {
+    sessionId: 'worker',
+    prompt: 'reader answer',
+    answerQuestion: '["request_user_input_async","item",0]',
+  };
+  assert.equal(validSessionWrite('send', params), true);
+  for (const extra of [
+    { delivery: 'auto' },
+    { observation: 'a.' + 'b'.repeat(43) },
+    { answerQuestion: '' },
+    { answerQuestion: 'x'.repeat(4097) },
+  ])
+    assert.equal(validSessionWrite('send', { ...params, ...extra }), false);
+  const writes = new SessionWriteRequests('window');
+  let sent = 0;
+  const apply = () => {
+    sent++;
+    return guardedRefusal('window:answer', params.prompt, 'declined');
+  };
+  const first = await writes.runGuarded('window:answer', params, apply);
+  assert.deepEqual(await writes.runGuarded('window:answer', params, apply), first);
+  assert.equal(sent, 1);
+  await assert.rejects(async () =>
+    writes.runGuarded('window:answer', { ...params, answerQuestion: 'different' }, apply),
+  );
+});
