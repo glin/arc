@@ -2967,16 +2967,16 @@ test('standalone policy and literal argv preserve directories across platforms',
   assert.ok(claude.options.args.includes('-p'));
   assert.ok(claude.options.args.includes('--strict-mcp-config'));
 });
-test('standalone model selection preserves legacy aliases and configured provider boundaries', () => {
+test('standalone model selection resolves shorthands and preserves explicit IDs and provider boundaries', () => {
   const { home, args } = fixture();
   const env = { CODEX_BIN: 'owned-codex', CODEX_HOME: home };
   const aliases = {
-    sol: 'gpt-6.1-sol',
+    sol: 'gpt-6.2-sol',
     sol6: 'gpt-6-sol',
     terra: 'gpt-6.1-terra',
     luna: 'gpt-6-luna',
     luna6: 'gpt-6-luna',
-    astra: 'gpt-6-astra',
+    astra: 'gpt-6.2-astra',
   };
   const check = (input: string, expected: string) => {
     const parsed = parseRun(
@@ -2994,6 +2994,9 @@ test('standalone model selection preserves legacy aliases and configured provide
   for (const model of [
     'gpt-6.2-sol',
     'gpt-6.2-astra',
+    'gpt-6.1-sol',
+    'gpt-6-sol',
+    'gpt-6-astra',
     'gpt-6.1-terra',
     'gpt-5.6-terra',
     'gpt-5.6-sol-2026-09-01',
@@ -3006,19 +3009,22 @@ test('standalone model selection preserves legacy aliases and configured provide
     path.join(home, 'config.toml'),
     '# model_provider = "amazon-bedrock"\nmodel_provider = "openai"\n[model_providers.custom]\nmodel_provider = "amazon-bedrock"\n',
   );
-  check('sol', 'gpt-6.1-sol');
+  check('sol', 'gpt-6.2-sol');
   fs.writeFileSync(
     path.join(home, 'config.toml'),
     "model_provider = 'amazon-bedrock' # selected\n[profiles.other]\nmodel_provider = 'openai'\n",
   );
   for (const [alias, model] of Object.entries(aliases)) check(alias, `openai.${model}`);
   check('gpt-5.6-sol-2026-09-01', 'openai.gpt-5.6-sol-2026-09-01');
+  check('gpt-6.1-sol', 'openai.gpt-6.1-sol');
+  check('gpt-6-sol', 'openai.gpt-6-sol');
+  check('gpt-6-astra', 'openai.gpt-6-astra');
   check('gpt-6.1-terra', 'openai.gpt-6.1-terra');
   check('gpt-5.6-terra', 'openai.gpt-5.6-terra');
   check('openai.gpt-6-astra', 'openai.gpt-6-astra');
   check('custom.model', 'custom.model');
   fs.writeFileSync(path.join(home, 'config.toml'), '[profiles.other]\nmodel_provider = "amazon-bedrock"\n');
-  check('sol', 'gpt-6.1-sol');
+  check('sol', 'gpt-6.2-sol');
   const claudeArgs = args.map((value, i) => (i === 0 ? 'claude' : i === args.indexOf('--model') + 1 ? 'haiku' : value));
   const claude = parseRun([...claudeArgs, '--read-only'], env);
   assert.equal(claude.options.model, 'claude-haiku-5-5');
@@ -8193,9 +8199,4 @@ test('GPT-6.2 standalone launches preserve exact model and all six efforts', () 
       assert.ok(parsed.options.args.includes(`model_reasoning_effort=${effort}`));
     }
   }
-  const previous = parseRun(
-    args.map((value, i) => (i === args.indexOf('--model') + 1 ? 'sol' : value)),
-    { CODEX_BIN: 'owned-codex', CODEX_HOME: home },
-  );
-  assert.equal(previous.options.model, 'gpt-6.1-sol');
 });

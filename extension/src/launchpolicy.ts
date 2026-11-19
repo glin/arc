@@ -25,12 +25,12 @@ export interface LaunchPolicy {
 }
 
 export const codexModelShorthands: Readonly<Record<string, string>> = {
-  sol: 'gpt-6.1-sol',
+  sol: 'gpt-6.2-sol',
   sol6: 'gpt-6-sol',
   terra: 'gpt-6.1-terra',
   luna: 'gpt-6-luna',
   luna6: 'gpt-6-luna',
-  astra: 'gpt-6-astra',
+  astra: 'gpt-6.2-astra',
 };
 
 // Claude Code reads its prompt cache lifetime from this variable. A Claude launch can request one of these values.
