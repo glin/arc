@@ -1033,7 +1033,7 @@ function* assembleCostReport(
     ...(byTool ? { byTool } : {}),
     ...(untilText ? { untilText } : {}),
     ...(parentWindow ? { parentWindow } : {}),
-    rateNote: `List-price estimate, not a subscription charge.${sol ? ` GPT-5.6 Sol uses its promotional rate through ${sol.until}.` : ''}`,
+    rateNote: `List-price estimate, not a subscription charge.${sol ? ` GPT-5.6 Sol uses its retained promotional rate, with source review dated ${sol.until}.` : ''}`,
     cacheExpiryNote:
       'Codex cache-write counters establish volume, not lifetime. The model and provider establish documented lifetime. Claude child prompts have no visible turn boundary. Unknown request coverage makes observed adjacency uncertain and leaves the expiry input total unpriced.',
   };

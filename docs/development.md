@@ -142,6 +142,8 @@ Compare commits in equally configured checkouts, including build output and depe
 
 Change model and provider pricing in `extension/src/pricing.ts`.
 
+Pricing tests must use fixed quote times or controlled clocks. Review promotion guidance against its published source without making test results depend on today's date. Preserve promotion metadata and promotional rates after their review dates.
+
 1. Read primary pricing and cache-policy sources before adding a model or provider route. Check effort-change retention for each exact model identity and provider route. For Claude Code, consult [Changing effort level](https://code.claude.com/docs/en/prompt-caching#changing-effort-level).
 2. Define the exact model identity, base rates, request threshold, fallback context window, and explicit sourced cache policy once.
 3. Check `effortChangeKeepsCache` independently of `cachePolicy`. General prompt-cache support does not establish retention after an effort change. Set `true` only when primary retention evidence covers the whole pricing row. Use an exact-identity `RegExp` when primary evidence covers only part of the pricing row. Leave the field absent when primary evidence does not establish retention.

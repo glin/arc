@@ -6,7 +6,7 @@ export { formatCost } from './view/cost.ts';
 // Claude records cache reads and writes separately. Codex records them within total input.
 // Readers split those categories before pricing. Explicit cache-read and cache-write rates override the default multiples.
 // Estimates exclude negotiated discounts and do not represent invoices.
-// Promotional rows carry their current rates, end dates, and standard rates.
+// Promotional rows retain their rates, inclusive review dates, and standard rates.
 export interface Rate {
   input: number;
   output: number;
@@ -450,7 +450,7 @@ export const MODEL_DEFINITIONS: readonly ModelDefinition[] = [
     maxPricedContext: 272_000,
     longContext: { threshold: 272_000, inputMultiplier: 2, outputMultiplier: 1.5 },
   },
-  // The promotion carries its inclusive end date and standard rates.
+  // The promotion carries its inclusive review date and standard rates.
   {
     pattern: /^gpt-5\.6(?:-sol)?$/,
     promotion: {
@@ -458,7 +458,7 @@ export const MODEL_DEFINITIONS: readonly ModelDefinition[] = [
       standard: { input: 5, cacheWrite30m: 6.25, cacheRead: 0.5, output: 30 },
       note:
         'OpenAI held gpt-5.6-sol at $4/$20 at least to this date, against a standard $5/$30. ' +
-        'Check the published rate: either move the date out, or take the promotion off and use standard.',
+        'Review the published source before changing rates. Retain this promotion metadata and its promotional rates.',
     },
     rate: { input: 4, cacheWrite30m: 5, cacheRead: 0.4, output: 20 },
     window: 272_000,
@@ -518,11 +518,11 @@ export const MODEL_DEFINITIONS: readonly ModelDefinition[] = [
   },
 ];
 
-// Promotional rates carry an inclusive end date and their standard replacement rates.
-// pricing.test.ts fails after the end date, requiring a rate or promotion update.
+// Promotion metadata retains the inclusive source-review date and standard rates.
+// The review date does not switch runtime pricing.
 interface Promotion {
-  until: string; // ISO date the promotional rate is held to, inclusive
-  standard: Rate; // Rates to apply after the promotion ends.
+  until: string; // ISO source-review date, inclusive.
+  standard: Rate; // Published standard rates retained beside promotional rates.
   note: string; // Rate-source guidance for promotion updates.
 }
 

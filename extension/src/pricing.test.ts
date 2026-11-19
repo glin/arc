@@ -3,6 +3,7 @@ import { test, vi } from 'vitest';
 import assert from 'node:assert';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
+import ts from 'typescript';
 import {
   rateFor,
   effortChangeKeepsCache,
@@ -2131,23 +2132,56 @@ test('a retention lifetime without a write price keeps ordinary cold input', () 
   assert.equal(floor?.coldIsWrite, false);
 });
 
-test('a promotional rate is checked again once the date it was held to has passed', () => {
-  // Expired promotions require a rate review. Each promotion names its standard rate and review source.
-
-  const today = new Date().toISOString().slice(0, 10);
-  const over = PROMOTIONS.filter((p) => p.promo.until < today);
-  assert.deepEqual(
-    over.map((p) => String(p.pattern)),
-    [],
-    'a promotional rate is past the date it was held to:\n' +
-      over
-        .map(
-          (p) =>
-            `  ${p.pattern} was held to ${p.promo.until}, standard ` +
-            `$${p.promo.standard.input}/$${p.promo.standard.output}. ${p.promo.note}`,
-        )
-        .join('\n'),
+test('pricing tests use fixed dates or controlled clocks', () => {
+  const file = ts.createSourceFile(
+    'pricing.test.ts',
+    readFileSync(path.join(__dirname, 'pricing.test.ts'), 'utf8'),
+    ts.ScriptTarget.Latest,
+    true,
   );
+  const clocks: string[] = [];
+  const visit = (node: ts.Node): void => {
+    if (ts.isCallExpression(node) || ts.isNewExpression(node)) {
+      const callee = node.expression;
+      const date = ts.isIdentifier(callee) && callee.text === 'Date';
+      const now =
+        ts.isPropertyAccessExpression(callee) &&
+        callee.expression.getText(file) === 'Date' &&
+        callee.name.text === 'now';
+      if ((date && (ts.isCallExpression(node) || !node.arguments?.length)) || (ts.isCallExpression(node) && now))
+        clocks.push(node.getText(file));
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(file);
+  assert.deepEqual(clocks, [], 'pricing tests must use fixed dates or controlled clocks');
+});
+
+test('GPT-5.6 retains its promotion metadata and promotional category rates', () => {
+  for (const model of ['gpt-5.6', 'gpt-5.6-sol']) {
+    const promotion = PROMOTIONS.find(({ pattern }) => pattern.test(model));
+    assert.ok(promotion, `${model} retains its promotion metadata`);
+    assert.equal(promotion.promo.until, '2026-11-21');
+    assert.deepEqual(promotion.promo.standard, { input: 5, cacheWrite30m: 6.25, cacheRead: 0.5, output: 30 });
+    assert.deepEqual(rateFor(model), { input: 4, cacheWrite30m: 5, cacheRead: 0.4, output: 20 });
+    for (const at of ['2026-11-20T12:00:00Z', '2026-11-21T23:59:59Z', '2026-11-22T00:00:00Z', '2027-03-02T12:00:00Z']) {
+      for (const [category, cost] of [
+        ['input', 4],
+        ['cacheWrite30m', 5],
+        ['cacheRead', 0.4],
+        ['output', 20],
+      ] as const) {
+        const quote = quoteUsage({
+          model,
+          provider: 'openai',
+          usage: usage({ [category]: 1_000_000 }),
+          contextBand: 'short',
+          quotedAt: Date.parse(at),
+        });
+        assert.equal(quote?.cost, cost, `${model} ${category} at ${at}`);
+      }
+    }
+  }
 });
 
 test('every promotion names a row that exists, and every rate it names is real', () => {
