@@ -1412,7 +1412,7 @@ const args = process.argv.slice(2);
 const shells = [['sh', ['-c', 'arc --version']]];
 if (process.platform === 'win32') shells.push([process.env.ComSpec || 'cmd.exe', ['/d', '/c', 'arc --version']]);
 const results = shells.map(([command, argv]) => {
-  const run = spawnSync(command, argv, { encoding: 'utf8' });
+  const run = spawnSync(command, argv, { encoding: 'utf8', windowsHide: true });
   return { command, status: run.status, error: run.error?.message, stdout: run.stdout, stderr: run.stderr };
 });
 require('node:fs').writeFileSync(${JSON.stringify(record)}, JSON.stringify(results));
