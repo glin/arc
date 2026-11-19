@@ -2142,7 +2142,15 @@ test('pricing tests use fixed dates or controlled clocks', () => {
   const clocks: string[] = [];
   const unwrapExpression = (expression: ts.Expression): ts.Expression => {
     let current = expression;
-    while (ts.isParenthesizedExpression(current)) current = current.expression;
+    while (
+      ts.isParenthesizedExpression(current) ||
+      ts.isAsExpression(current) ||
+      ts.isSatisfiesExpression(current) ||
+      ts.isNonNullExpression(current) ||
+      ts.isTypeAssertionExpression(current)
+    ) {
+      current = current.expression;
+    }
     return current;
   };
   const visit = (node: ts.Node): void => {
