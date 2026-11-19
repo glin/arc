@@ -108,6 +108,8 @@ export interface UsageQuoteInput {
   serviceTier?: string | null;
   reportedCost?: number | null;
   override?: RateOverride | null;
+  // Public rates use this instant when supplied, independently of recorded request time.
+  quotedAt?: number;
 }
 
 export interface UsageQuote {
@@ -122,7 +124,7 @@ export interface UsageQuote {
   contextBand: 'short' | 'long' | null;
 }
 
-export type UsagePriceContext = Pick<UsageQuoteInput, 'inferenceClass' | 'serviceTier'>;
+export type UsagePriceContext = Pick<UsageQuoteInput, 'inferenceClass' | 'serviceTier' | 'quotedAt'>;
 
 // Each model definition requires rates, a fallback window, and a sourced cache policy.
 // Provider support carries its own policy, routing rules, and pricing differences.
@@ -715,6 +717,7 @@ function publicRateFor(
   inferenceClass: UsageQuoteInput['inferenceClass'],
   serviceTier: string | null,
   contextBand: UsageContextBand | null = null,
+  quotedAt?: number,
 ): { rate: Rate; source: string; effectiveDate: string | null; cacheWritesFree?: boolean } | null {
   const fast = serviceTier === FAST_SPEED;
   const standard = usesStandardPublicRate(provider, serviceTier);
@@ -745,7 +748,7 @@ function publicRateFor(
     listMultiplier !== undefined &&
     promotion &&
     Number.isFinite(promotion.multiplier) &&
-    Date.now() < Date.parse(promotion.before)
+    (quotedAt ?? Date.now()) < Date.parse(promotion.before)
       ? promotion.multiplier
       : listMultiplier;
   if (provider === 'amazon-bedrock') {
@@ -844,6 +847,7 @@ export function cacheLifetimeFor(model: string | null, provider: string | null =
 }
 
 export interface NextTurnFloorInput {
+  quotedAt?: number;
   // The input side of the request that established the current context level.
   contextTokens: number;
   // The answer written after that request. It is not part of the cache that request bought.
@@ -994,6 +998,7 @@ export function nextTurnFloor(input: NextTurnFloorInput): NextTurnFloor | null {
     requestTokens,
     inferenceClass: input.inferenceClass ?? null,
     serviceTier: input.serviceTier ?? null,
+    quotedAt: input.quotedAt,
   };
   const warm = quoteUsage({
     ...shared,
@@ -1108,6 +1113,7 @@ export function quoteUsage(input: UsageQuoteInput): UsageQuote | null {
         input.inferenceClass ?? null,
         null,
         contextBand,
+        input.quotedAt,
       )
     : null;
   const publicWriteRate = publicPrice?.rate.cacheWrite30m;
@@ -1128,6 +1134,7 @@ export function quoteUsage(input: UsageQuoteInput): UsageQuote | null {
         input.inferenceClass ?? null,
         input.serviceTier ?? null,
         contextBand,
+        input.quotedAt,
       );
   if (!priced) {
     return null;

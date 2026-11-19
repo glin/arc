@@ -353,7 +353,7 @@ export function derivedTitleCacheRevision(entry: DerivedTitleEntry): Pick<FileRe
 
 // Caches figures by session id and facts-object identity.
 // The `current` predicate rejects figures affected by changing external inputs, such as the clock.
-// The `derive` callback uses facts, current pricing and other unchanging inputs. Callers replace changed facts with a new object.
+// The `derive` callback prices at its supplied time. Callers replace changed facts with a new object.
 // `read` gives a new output when a figure moves, and the same output when every listed session keeps its figure.
 // `patch` changes the output in place. Session list keys compare the output identity and each entry's identity.
 // Removed sessions lose their figures.
@@ -366,7 +366,7 @@ export class SessionFactFigures<F, V> {
 
   read(
     sessions: readonly (readonly [sessionId: string, facts: F])[],
-    derive: (facts: F, sessionId: string) => V,
+    derive: (facts: F, sessionId: string, quotedAt: number) => V,
     current: (value: V) => boolean = () => true,
   ): Readonly<Record<string, V>> {
     const now = Date.now();
@@ -386,7 +386,7 @@ export class SessionFactFigures<F, V> {
         continue;
       }
       moved = true;
-      next.set(sessionId, { facts, value: derive(facts, sessionId) });
+      next.set(sessionId, { facts, value: derive(facts, sessionId, now) });
     }
     // Unchanged entries come from the held map, so equal sizes also mean equal membership.
     if (moved || next.size !== this.held.size) {
@@ -401,7 +401,7 @@ export class SessionFactFigures<F, V> {
   readOne(
     sessionId: string,
     facts: F,
-    derive: (facts: F, sessionId: string) => V,
+    derive: (facts: F, sessionId: string, quotedAt: number) => V,
     current: (value: V) => boolean = () => true,
   ): Readonly<Record<string, V>> {
     const now = Date.now();
@@ -413,13 +413,16 @@ export class SessionFactFigures<F, V> {
     }
     const previous = this.held.get(sessionId);
     if (previous && previous.facts === facts && current(previous.value)) return this.value;
-    return this.patch(sessionId, { facts, derive: () => derive(facts, sessionId) });
+    return this.patch(sessionId, { facts, derive: (quotedAt) => derive(facts, sessionId, quotedAt) }, now);
   }
 
   // Derives one figure after sampling its pricing interval, or drops it with null. The output keeps its identity.
   // Session list keys detect replaced entries and changed membership. The caller requests publication after patching.
-  patch(sessionId: string, entry: { facts: F; derive: () => V } | null): Readonly<Record<string, V>> {
-    const now = Date.now();
+  patch(
+    sessionId: string,
+    entry: { facts: F; derive: (quotedAt: number) => V } | null,
+    now = Date.now(),
+  ): Readonly<Record<string, V>> {
     if (now < this.pricedAt || now >= this.pricingUntil) {
       this.held.clear();
       this.pricingInvalidated = true;
@@ -428,7 +431,7 @@ export class SessionFactFigures<F, V> {
     }
     const value = this.value as Record<string, V>;
     if (entry) {
-      const derived = { facts: entry.facts, value: entry.derive() };
+      const derived = { facts: entry.facts, value: entry.derive(now) };
       this.held.set(sessionId, derived);
       value[sessionId] = derived.value;
     } else {

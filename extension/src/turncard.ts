@@ -2356,8 +2356,8 @@ export interface DispatchedCostUsage extends SessionCostUsage {
 export type PricedDispatchedCost = PricedSessionCost & { part: DispatchedCostUsage };
 
 // Prices dispatched usage parts for cached figure reads.
-export function priceDispatchedParts(parts: readonly DispatchedCostUsage[]): PricedDispatchedCost[] {
-  return parts.map((part) => priceSessionCost(part) as PricedDispatchedCost);
+export function priceDispatchedParts(parts: readonly DispatchedCostUsage[], quotedAt?: number): PricedDispatchedCost[] {
+  return parts.map((part) => priceSessionCost({ ...part, quotedAt }) as PricedDispatchedCost);
 }
 
 // Dispatched session contribution and coverage state.
@@ -5758,13 +5758,13 @@ export function composerRuntimeBySession(
 }
 
 // Prices request groups with retained rate and tier facts, falling back to aggregate usage when absent.
-function factCost(turn: SessionFigureTurn): SessionCostTotal {
+function factCost(turn: SessionFigureTurn, quotedAt?: number): SessionCostTotal {
   const exact = turn.usageParts?.length
-    ? sessionCostTotalOf(turn.usageParts.map((part) => priceSessionCost({ role: 'main', ...part })))
+    ? sessionCostTotalOf(turn.usageParts.map((part) => priceSessionCost({ role: 'main', ...part, quotedAt })))
     : null;
   const dollars = exact
     ? exact.dollars
-    : estimateCost(turn.usage, turn.model, turn.provider ?? null, turn.contextWindow);
+    : estimateCost(turn.usage, turn.model, turn.provider ?? null, turn.contextWindow, null, { quotedAt });
   return {
     dollars,
     partial: Boolean(turn.childSpendPartial) || (exact?.partial ?? (dollars === null && spentTokens(turn.usage))),
@@ -5807,6 +5807,7 @@ function costStat(
 }
 
 export interface SessionCostUsage {
+  quotedAt?: number;
   usageOrigin?: UsageOrigin;
   linkedInvocationId?: string | null;
   // The child session this usage ran in. Two invocations that resume one child name the same session.
@@ -6083,6 +6084,7 @@ function priceSessionCost(part: SessionCostUsage): PricedSessionCost {
   const priceContext = {
     inferenceClass: part.inferenceClass ?? null,
     serviceTier: part.serviceTier ?? null,
+    quotedAt: part.quotedAt,
   };
   const recordedListCost = recordedCostBasis(part.costBasis) ? part.recordedCost : undefined;
   const hasRecordedListCost = recordedListCost !== undefined;
@@ -7006,6 +7008,7 @@ const dollarsOf = (costs: readonly PricedSessionCost[]): number =>
 // The overheads a session cost popover names under "Included above", and the model labels its
 // model names read.
 export interface SessionOverheads {
+  quotedAt?: number;
   // The exact lifetime count of completed primary-session compactions.
   compactionCount?: number | null;
   expiry?: CacheExpiryFacts | null;
@@ -7038,6 +7041,7 @@ export function sessionCostProjection(
   const delegatedShort = (held: readonly PricedSessionCost[]) =>
     held.some((cost) => cost.part.scopeId !== undefined && scopeShort(cost.part.scopeId));
   const incomplete = mainShort || short;
+  parts = parts.map((part) => ({ ...part, quotedAt: overheads.quotedAt ?? part.quotedAt }));
   const costs = parts.map(priceSessionCost);
   const totals: readonly SessionCostTotal[] = incomplete ? [...costs, { dollars: null, partial: true }] : costs;
   const total = captured?.combined ?? sessionCostTotalOf(totals);
@@ -7164,7 +7168,9 @@ export function sessionCostProjection(
   const expiryCounted = overheads.expiry ? cacheExpiryReturnCount(overheads.expiry) : null;
   const expiryCount = expiryCounted?.count ?? 0;
   const expiryCost =
-    overheads.expiry && expiryCount > 0 ? cacheExpiryExtraCost(overheads.expiry, publicProjectSpendPrice) : null;
+    overheads.expiry && expiryCount > 0
+      ? cacheExpiryExtraCost(overheads.expiry, publicProjectSpendPrice, overheads.quotedAt)
+      : null;
   // A count that is a lower bound leaves the warning's cost added a lower bound too.
   const expiryWarned: CacheExpiryCost | null =
     expiryCost && expiryCounted?.atLeast && expiryCost.status === 'exact'
@@ -7436,6 +7442,7 @@ function sessionFigureStats(
   turns: readonly SessionFigureTurn[],
   compactions: readonly SessionFigureCompaction[],
   costOf: (turn: SessionFigureTurn) => SessionCostTotal,
+  quotedAt?: number,
 ): SessionStatChip[] {
   if (!turns.length) {
     return [];
@@ -7478,7 +7485,7 @@ function sessionFigureStats(
     const share = contextShare(contextTurn);
     const detailList = ctx.detailList!;
     const contextEntry = detailList.entries.find((entry) => entry.label === contextLabel)!;
-    const facts = contextDetailFacts(newest, !current.afterCompaction);
+    const facts = contextDetailFacts(newest, !current.afterCompaction, quotedAt);
     if (facts.entries.length) {
       facts.entries[0].separateBefore = true;
     }
@@ -7506,8 +7513,10 @@ export function sessionStatsFromFacts(
     readonly turns: readonly SessionFigureTurn[];
     readonly compactions: readonly SessionFigureCompaction[];
   } | null,
+  _sessionId?: string,
+  quotedAt?: number,
 ): SessionStatChip[] {
-  return facts ? sessionFigureStats(facts.turns, facts.compactions, factCost) : [];
+  return facts ? sessionFigureStats(facts.turns, facts.compactions, (turn) => factCost(turn, quotedAt), quotedAt) : [];
 }
 
 export function sessionStats(turns: Turn[], compactions: Compaction[]): SessionStatChip[] {
@@ -7590,11 +7599,11 @@ export function sessionStats(turns: Turn[], compactions: Compaction[]): SessionS
 }
 
 // Supporting context facts retain the scope of the loaded history and the latest priced turn.
-function contextDetailFacts(newest: SessionFigureTurn, includeReread = true): StatDetailList {
+function contextDetailFacts(newest: SessionFigureTurn, includeReread = true, quotedAt?: number): StatDetailList {
   const entries: StatDetailEntry[] = [];
   const notes: string[] = [];
   if (includeReread) {
-    const reread = formatCost(cacheReadCostOf(newest));
+    const reread = formatCost(cacheReadCostOf(newest, quotedAt));
     if (reread) {
       entries.push({ label: 'Latest turn cached input reads', value: reread });
       notes.push(COST_ESTIMATE_NOTE);
@@ -7604,9 +7613,9 @@ function contextDetailFacts(newest: SessionFigureTurn, includeReread = true): St
 }
 
 // Prices cached input reads with retained request rates and tiers, falling back to aggregate usage when absent.
-function cacheReadCostOf(turn: SessionFigureTurn): number | null {
+function cacheReadCostOf(turn: SessionFigureTurn, quotedAt?: number): number | null {
   if (!turn.usageParts?.length) {
-    return estimateCacheReadCost(turn.usage, turn.model, turn.provider ?? null, turn.contextWindow);
+    return estimateCacheReadCost(turn.usage, turn.model, turn.provider ?? null, turn.contextWindow, { quotedAt });
   }
   let dollars = 0;
   for (const part of turn.usageParts) {
@@ -7618,6 +7627,7 @@ function cacheReadCostOf(turn: SessionFigureTurn): number | null {
     const cost = usageCost(usage, part.model, part.provider, part.contextWindow, 'cacheRead', {
       inferenceClass: part.inferenceClass,
       serviceTier: part.serviceTier,
+      quotedAt,
     });
     if (cost === null) {
       return null;

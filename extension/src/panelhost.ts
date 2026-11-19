@@ -5775,7 +5775,7 @@ export class PanelProvider implements vscode.Disposable {
       const statFacts = derivedTitleStats(meta);
       this.metadataStatsBySession = this.metadataStatFigures.patch(row.sessionId, {
         facts: statFacts,
-        derive: () => sessionStatsFromFacts(statFacts),
+        derive: (quotedAt) => sessionStatsFromFacts(statFacts, undefined, quotedAt),
       });
       const cacheFacts = derivedTitleCacheStats(meta);
       this.metadataRailCaches = this.metadataCacheFigures.patch(row.sessionId, {
@@ -6194,9 +6194,8 @@ export class PanelProvider implements vscode.Disposable {
 
   // For a thread with a compressed entry, the shown record is the largest complete total. The ledger itself holds no
   // compressed record.
-  private compressedSpendPick(files: readonly SpendFileIndex[]): readonly SpendFileIndex[] {
+  private compressedSpendPick(files: readonly SpendFileIndex[], now = Date.now()): readonly SpendFileIndex[] {
     if (!this.compressedFacts?.size) return files;
-    const now = Date.now();
     const metasRevision = this.codexMetas.revision;
     const held = this.compressedSpendPicks.get(files);
     if (
@@ -6231,6 +6230,7 @@ export class PanelProvider implements vscode.Disposable {
       files,
       candidates,
       (file) => sessionIds.get(compressedPairKey(file, directories)) ?? null,
+      now,
     );
     this.compressedSpendPicks.set(files, {
       revision: this.compressedFactsRevision,
@@ -12409,7 +12409,7 @@ export class PanelProvider implements vscode.Disposable {
           this.metadataStatsBySession = this.metadataStatFigures.readOne(
             sessionId,
             derivedTitleStats(meta),
-            sessionStatsFromFacts,
+            (facts, _sessionId, quotedAt) => sessionStatsFromFacts(facts, undefined, quotedAt),
           );
           this.metadataRailCaches = this.metadataCacheFigures.readOne(
             sessionId,
@@ -12427,7 +12427,7 @@ export class PanelProvider implements vscode.Disposable {
       } else {
         this.metadataStatsBySession = this.metadataStatFigures.read(
           metadata.map(([sessionId, meta]) => [sessionId, derivedTitleStats(meta)] as const),
-          sessionStatsFromFacts,
+          (facts, _sessionId, quotedAt) => sessionStatsFromFacts(facts, undefined, quotedAt),
         );
         // Recompute expired cache marks so the cached value becomes null.
         const markNow = Date.now();
@@ -13981,8 +13981,7 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   // Retain the last complete lifetime figures until a replacement read completes.
-  private lifetimeDisplayFiles(): readonly SpendFileIndex[] {
-    const now = Date.now();
+  private lifetimeDisplayFiles(now = Date.now()): readonly SpendFileIndex[] {
     const held = this.lifetimeDisplayPick;
     if (
       held?.files === this.projectSpendFiles &&
@@ -13997,6 +13996,7 @@ export class PanelProvider implements vscode.Disposable {
       return held.picked;
     const picked = this.compressedSpendPick(
       sessionLifetimeDisplayFiles(this.projectSpendBusy(), this.projectSpendFiles, this.projectSpendVisibleFiles),
+      now,
     );
     this.lifetimeDisplayPick = {
       files: this.projectSpendFiles,
@@ -14089,11 +14089,12 @@ export class PanelProvider implements vscode.Disposable {
 
   private lifetimeFiguresBySession(): LifetimeFigures {
     const labels: ModelLabels | undefined = this.modelLabels;
+    const quotedAt = Date.now();
     // Cache lifetime figures by session sources, displayed records, pending-source state, and model display names.
     return this.lifetimeFigures.read(
-      this.lifetimeDisplayFiles(),
+      this.lifetimeDisplayFiles(quotedAt),
       this.rowSpendSources(),
-      (sessionId, files, sources, pending): SessionPricedFigures | undefined => {
+      (sessionId, files, sources, pending, quotedAt): SessionPricedFigures | undefined => {
         // The contributions are priced here, once per change, so a card draw only looks them up.
         const contributions = sources.some((source) => source.dispatchedVia !== undefined)
           ? dispatchedSpendPartsBySession(files, sources, pending)[sessionId]
@@ -14110,6 +14111,7 @@ export class PanelProvider implements vscode.Disposable {
                         return contribution.own?.parts.includes(part) ? { ...usage, own: true } : usage;
                       }),
                     ),
+                    quotedAt,
                   ),
                   short: contribution.short,
                   ...(contribution.own
@@ -14148,6 +14150,7 @@ export class PanelProvider implements vscode.Disposable {
             compactionCount: turns?.compactionCount ?? null,
             expiry: cache?.expiry ?? null,
             labels,
+            quotedAt,
           });
           return {
             stats: [...cost.stats, ...later],
@@ -14195,6 +14198,7 @@ export class PanelProvider implements vscode.Disposable {
           ...(dispatched ? { dispatched } : {}),
         }),
       },
+      quotedAt,
     );
   }
 
@@ -14825,7 +14829,7 @@ export class PanelProvider implements vscode.Disposable {
       const now = Date.now();
       const historyDays = readSetting('projectCost.historyDays');
       const price = publicProjectSpendPrice;
-      const pricingUntil = publicPricingValidUntil();
+      const pricingUntil = publicPricingValidUntil(now);
       const date = projectSpendWindows(now)[0].start;
       const truncation = (at: number): string => {
         const cutoff = projectSpendHistoryCutoff(historyDays, at);
@@ -14840,8 +14844,9 @@ export class PanelProvider implements vscode.Disposable {
       // Complete display arrays remain stable while resumable indexing replaces its records.
       const files = this.projectSpendVisibleFiles;
       // A thread with a compressed entry shows its largest complete total. The pick never enters the ledger.
-      const build = prepareProjectSpendViewSteps(this.compressedSpendPick(files), price, {
+      const build = prepareProjectSpendViewSteps(this.compressedSpendPick(files, now), price, {
         now,
+        quotedAt: now,
         historyCutoff: projectSpendHistoryCutoff(historyDays, now),
       });
       this.projectSpendBuild = build;
@@ -14872,6 +14877,7 @@ export class PanelProvider implements vscode.Disposable {
               projection = (function* () {
                 const next = yield* prepareProjectSpendViewSteps(files, price, {
                   now: tomorrow.getTime(),
+                  quotedAt: now,
                   historyCutoff: projectSpendHistoryCutoff(historyDays, tomorrow.getTime()),
                 });
                 if (checks) yield* checks.prepare(files);

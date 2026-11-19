@@ -3098,3 +3098,26 @@ test('GPT-6.2 next-turn estimates price both request bands and cache reads', () 
     }
   }
 });
+
+test('GPT-6.2 recursive quotes keep explicit time across changing ambient clocks', () => {
+  const boundary = Date.parse('2027-03-01T08:00:00Z');
+  const clock = vi.spyOn(Date, 'now');
+  try {
+    const short = usage({ requests: 1, input: 100000 });
+    const long = usage({ requests: 1, input: 300000 });
+    const mixed = usage({ requests: 2, input: 400000, byContextBand: { short, long } });
+    for (const [quotedAt, expected] of [
+      [boundary - 1, 4.2],
+      [boundary, 8.4],
+    ]) {
+      let calls = 0;
+      clock.mockImplementation(() => (++calls % 2 ? boundary + 20 : boundary - 20));
+      const input = { model: 'gpt-6.2-sol', provider: 'openai', serviceTier: 'ultrafast', quotedAt, usage: mixed };
+      near(quoteUsage(input)?.cost, expected, 'band quote');
+      near(estimateCost(mixed, input.model, input.provider, null, null, input), expected, 'band estimate');
+      assert.equal(calls, 0, 'an explicit quote consulted the ambient clock');
+    }
+  } finally {
+    clock.mockRestore();
+  }
+});

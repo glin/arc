@@ -220,7 +220,7 @@ export interface SpendLedger {
 // Cache session figures by their source lists, record identities, and pending ownership.
 // Source changes recalculate only sessions that reference them, including dispatched sources.
 // Records retain their identity until the ledger replaces them.
-// calculate must depend only on its arguments and pending.
+// calculate prices at its supplied time and otherwise depends only on its arguments and pending.
 // An optional projection is the last step over each session's figures, and reads one more input.
 // A new input runs only that step again, over the held figures, and never runs calculate.
 // assemble runs only when a session's figures or projections change.
@@ -248,15 +248,17 @@ export class SessionFiguresCache<T, R, P = T> {
       files: readonly SpendFileIndex[],
       sources: readonly SessionSpendSource[],
       pending: SpendSourcePending,
+      quotedAt: number,
     ) => T | undefined,
     assemble: (figures: ReadonlyMap<string, P>) => R,
     pending: SpendSourcePending = () => true,
     projection?: { input: unknown; project: (figures: T) => P },
+    quotedAt = Date.now(),
   ): R {
     const input = projection?.input;
     const project = projection?.project ?? ((figures: T) => figures as unknown as P);
     const inputMoved = input !== this.input;
-    const now = Date.now();
+    const now = quotedAt;
     const pricingMoved = now < this.pricedAt || now >= this.pricingUntil;
     const heldFiles = this.files;
     if (
@@ -315,6 +317,7 @@ export class SessionFiguresCache<T, R, P = T> {
         own,
         group.sources,
         (file, record) => held?.get(file) ?? pending(file, record),
+        now,
       );
       next.set(sessionId, {
         sources: group.sources,
@@ -746,7 +749,11 @@ export interface ProjectSpendPrice {
   provenance: ProjectSpendProvenance;
 }
 
-export type ProjectSpendPricer = (bucket: ProjectUsageBucket) => ProjectSpendPrice | null;
+export type ProjectSpendPricer = (
+  bucket: ProjectUsageBucket,
+  overrides?: readonly ModelPricingSetting[],
+  quotedAt?: number,
+) => ProjectSpendPrice | null;
 
 export interface ModelPricingSetting {
   model: string;
@@ -818,6 +825,7 @@ function recordedCostSource(basis: string | null | undefined): string | null {
 export function publicProjectSpendPrice(
   bucket: ProjectUsageBucket,
   overrides: readonly ModelPricingSetting[] = [],
+  quotedAt?: number,
 ): ProjectSpendPrice | null {
   const recordedSource = recordedCostSource(bucket.reportedCostBasis);
   if (bucket.reportedCost !== null && recordedSource) {
@@ -848,6 +856,7 @@ export function publicProjectSpendPrice(
     return null;
   }
   const quote = quoteUsage({
+    quotedAt,
     usage: bucket.usage,
     model: bucket.model,
     provider: bucket.provider,
@@ -1831,18 +1840,19 @@ const childExpiryPrices = new WeakMap<
 export function pricedNativeCacheReturns(
   source: NativeChildCacheFacts,
   pricer: ProjectSpendPricer,
+  quotedAt = Date.now(),
 ): readonly PricedCacheExpiryReturn[] {
   let prices = childExpiryPrices.get(source.revision);
   if (!prices) childExpiryPrices.set(source.revision, (prices = new Map()));
   let held = prices.get(pricer);
-  const validUntil = publicPricingValidUntil();
+  const validUntil = publicPricingValidUntil(quotedAt);
   if (!held || held.facts !== source.facts || held.validUntil !== validUntil) {
     held = {
       facts: source.facts,
       validUntil,
       returns: source.facts.returns.map((item) => ({
         item,
-        cost: cacheExpiryExtraCost({ ...emptyCacheExpiryFacts(), returns: [item] }, pricer),
+        cost: cacheExpiryExtraCost({ ...emptyCacheExpiryFacts(), returns: [item] }, pricer, quotedAt),
       })),
     };
     prices.set(pricer, held);
@@ -1880,12 +1890,16 @@ export function cacheExpiryRebuiltUsage(
 // with no known reusable size make the result a lower bound. A return measured from a compaction
 // with no recorded prefix has no reusable size. The result is unknown when no return is priced,
 // unless the complete return list is empty.
-export function cacheExpiryExtraCost(facts: CacheExpiryFacts, pricer: ProjectSpendPricer): CacheExpiryCost {
+export function cacheExpiryExtraCost(
+  facts: CacheExpiryFacts,
+  pricer: ProjectSpendPricer,
+  quotedAt = Date.now(),
+): CacheExpiryCost {
   if (facts.childSources?.length || facts.incompleteSources) {
     const parts = [
-      cacheExpiryExtraCost({ ...facts, childSources: undefined, incompleteSources: undefined }, pricer),
+      cacheExpiryExtraCost({ ...facts, childSources: undefined, incompleteSources: undefined }, pricer, quotedAt),
       ...(facts.childSources ?? []).map((source): CacheExpiryCost => {
-        const returns = pricedNativeCacheReturns(source, pricer);
+        const returns = pricedNativeCacheReturns(source, pricer, quotedAt);
         const known = returns.filter((item) => item.cost.dollars !== null);
         const partial = source.facts.truncated || returns.some((item) => item.cost.status !== 'exact');
         return {
@@ -1922,8 +1936,8 @@ export function cacheExpiryExtraCost(facts: CacheExpiryFacts, pricer: ProjectSpe
       ...item.request,
       contextBand: item.firstPassUsage ? (item.firstPassContextBand ?? null) : item.request.contextBand,
     };
-    const paidPrice = pricer({ ...request, usage: paid });
-    const readPrice = pricer({ ...request, usage: asRead });
+    const paidPrice = pricer({ ...request, usage: paid }, undefined, quotedAt);
+    const readPrice = pricer({ ...request, usage: asRead }, undefined, quotedAt);
     if (!paidPrice || !readPrice) {
       partial = true;
       continue;
@@ -2731,7 +2745,11 @@ function accumulator(): Accumulator {
   };
 }
 
-function priceBucket(bucket: ProjectUsageBucket, pricer: ProjectSpendPricer): ProjectSpendPrice | null {
+function priceBucket(
+  bucket: ProjectUsageBucket,
+  pricer: ProjectSpendPricer,
+  quotedAt: number,
+): ProjectSpendPrice | null {
   if (bucket.incomplete) {
     return null;
   }
@@ -2754,7 +2772,7 @@ function priceBucket(bucket: ProjectUsageBucket, pricer: ProjectSpendPricer): Pr
       provenance: 'reported',
     };
   }
-  return pricer(bucket);
+  return pricer(bucket, undefined, quotedAt);
 }
 
 function* directClaudeSourceSteps(files: readonly SpendFileIndex[]): Generator<
@@ -2880,7 +2898,7 @@ export function truncateProjectSpendView(view: ProjectSpendView, now: number, cu
 export function prepareProjectSpendView(
   files: readonly SpendFileIndex[],
   pricer: ProjectSpendPricer,
-  options: { now?: number; name?: string; indexing?: boolean; historyCutoff?: number | null } = {},
+  options: { now?: number; quotedAt?: number; name?: string; indexing?: boolean; historyCutoff?: number | null } = {},
 ): ProjectSpendView {
   const steps = prepareProjectSpendViewSteps(files, pricer, options);
   let result = steps.next();
@@ -2891,9 +2909,10 @@ export function prepareProjectSpendView(
 export function* prepareProjectSpendViewSteps(
   files: readonly SpendFileIndex[],
   pricer: ProjectSpendPricer,
-  options: { now?: number; name?: string; indexing?: boolean; historyCutoff?: number | null } = {},
+  options: { now?: number; quotedAt?: number; name?: string; indexing?: boolean; historyCutoff?: number | null } = {},
 ): Generator<void, ProjectSpendView> {
   const now = options.now ?? Date.now();
+  const quotedAt = options.quotedAt ?? Date.now();
   const windows = projectSpendWindows(now);
   const cutoff = options.historyCutoff ?? null;
   const truncated = new Map(
@@ -2959,7 +2978,7 @@ export function* prepareProjectSpendViewSteps(
         if (bucket.localDate >= windows[2].start) {
           if (earliestRecord === null || bucket.localDate < earliestRecord) earliestRecord = bucket.localDate;
         }
-        const price = priceBucket(bucket, pricer);
+        const price = priceBucket(bucket, pricer, quotedAt);
         for (const window of windows) {
           if (bucket.localDate < window.start) {
             continue;
@@ -4152,20 +4171,20 @@ export interface CompressedSpendCandidate {
 
 // The total a record covers: priced dollars first, then its request count. Records of one thread cover prefixes of one
 // byte stream, so the larger total covers the most bytes.
-export function spendRecordTotal(record: SpendFileIndex): { dollars: number; requests: number } {
+export function spendRecordTotal(record: SpendFileIndex, quotedAt = Date.now()): { dollars: number; requests: number } {
   const buckets = record.lifetimeBuckets ?? record.buckets;
   let dollars = 0;
   let requests = 0;
   for (const bucket of buckets) {
-    dollars += publicProjectSpendPrice(bucket)?.dollars ?? 0;
+    dollars += publicProjectSpendPrice(bucket, [], quotedAt)?.dollars ?? 0;
     requests += bucket.requests;
   }
   return { dollars, requests };
 }
 
-function spendTotalCompare(left: SpendFileIndex, right: SpendFileIndex): number {
-  const a = spendRecordTotal(left);
-  const b = spendRecordTotal(right);
+function spendTotalCompare(left: SpendFileIndex, right: SpendFileIndex, quotedAt = Date.now()): number {
+  const a = spendRecordTotal(left, quotedAt);
+  const b = spendRecordTotal(right, quotedAt);
   return a.dollars - b.dollars || a.requests - b.requests;
 }
 
@@ -4185,6 +4204,7 @@ export function compressedSpendDisplayFiles(
   files: readonly SpendFileIndex[],
   candidates: readonly CompressedSpendCandidate[],
   sessionIdOf: (file: string) => string | null,
+  quotedAt = Date.now(),
 ): readonly SpendFileIndex[] {
   if (!candidates.length) return files;
   // One thread is one group, whichever paths its compressed entries and plain records have.
@@ -4213,7 +4233,7 @@ export function compressedSpendDisplayFiles(
       out.push(...plain);
       continue;
     }
-    out.push(complete.reduce((best, record) => (spendTotalCompare(record, best) > 0 ? record : best)));
+    out.push(complete.reduce((best, record) => (spendTotalCompare(record, best, quotedAt) > 0 ? record : best)));
   }
   return out;
 }

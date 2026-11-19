@@ -35009,3 +35009,224 @@ test('a selected session with a dispatched child reads its newest turn once', as
     worker.stop();
   }
 });
+
+test('GPT-6.2 retained figures bind quotes across hidden clock crossings', async () => {
+  vi.useFakeTimers();
+  const boundary = Date.parse('2027-03-01T08:00:00Z');
+  const usage = { input: 100000, output: 0, cacheWrite1h: 0, cacheWrite5m: 0, cacheRead: 0, thinking: 0, requests: 1 };
+  const facts: SessionStatFacts = {
+    turns: [
+      {
+        startedAt: boundary - 3000,
+        endedAt: boundary - 2500,
+        finished: true,
+        error: false,
+        model: 'gpt-6.2-sol',
+        provider: 'openai',
+        contextTokens: 0,
+        contextWindow: null,
+        childSpendPartial: false,
+        usage,
+        usageParts: [
+          {
+            model: 'gpt-6.2-sol',
+            provider: 'openai',
+            serviceTier: 'ultrafast',
+            contextBand: 'short',
+            contextWindow: null,
+            inferenceClass: null,
+            usage,
+          },
+        ],
+      },
+    ],
+    compactions: [],
+  };
+  const dollars = (chips: ReturnType<typeof sessionStatsFromFacts>) =>
+    chips.find((chip) => chip.metric === 'cost')!.dollars!;
+  const observed: number[] = [];
+  try {
+    for (const [sample, crossed, returned] of [
+      [boundary - 500, boundary + 20, boundary - 200],
+      [boundary + 200, boundary - 20, boundary + 500],
+    ]) {
+      for (const path of ['read', 'readOne', 'patch']) {
+        vi.setSystemTime(sample);
+        const figures = new SessionFactFigures<SessionStatFacts, ReturnType<typeof sessionStatsFromFacts>>();
+        let calls = 0;
+        const derive = (value: SessionStatFacts, _id: string, quotedAt?: number) => {
+          calls++;
+          vi.setSystemTime(crossed);
+          const chips = sessionStatsFromFacts(value, undefined, quotedAt);
+          vi.setSystemTime(returned);
+          return chips;
+        };
+        const initial =
+          path === 'read'
+            ? figures.read([['priced', facts]], derive)
+            : path === 'readOne'
+              ? figures.readOne('priced', facts, derive)
+              : figures.patch('priced', { facts, derive: (at?: number) => derive(facts, 'priced', at) });
+        observed.push(dollars(initial.priced));
+        observed.push(dollars(figures.read([['priced', facts]], derive).priced));
+        assert.equal(calls, 1, path);
+      }
+      vi.setSystemTime(sample);
+      const source = snapshotSpendFile(0, '2027-03-01');
+      source.buckets[0] = {
+        ...source.buckets[0],
+        ...facts.turns[0].usageParts![0],
+        agent: 'Codex',
+        reportedCost: null,
+      };
+      const records = [source];
+      const sources = [{ sessionId: 'priced', file: source.file, primary: true }];
+      const lifetime = new SessionFiguresCache<number, number>();
+      let calculated = 0;
+      const calculate = (
+        _id: string,
+        files: readonly SpendFileIndex[],
+        _sources: unknown,
+        _pending: unknown,
+        at: number,
+      ) => {
+        calculated++;
+        vi.setSystemTime(crossed);
+        const amount = publicProjectSpendPrice(files[0].buckets[0], [], at)!.dollars;
+        vi.setSystemTime(returned);
+        return amount;
+      };
+      const assemble = (figures: ReadonlyMap<string, number>) => figures.get('priced')!;
+      observed.push(lifetime.read(records, sources, calculate, assemble));
+      observed.push(lifetime.read(records, sources, calculate, assemble));
+      assert.equal(calculated, 1, 'lifetime calculation');
+      vi.setSystemTime(sample);
+      const rows = completeDiscoveryHarness();
+      const session = { file: 'hidden-crossing.jsonl.zst', sessionId: 'priced', agent: 'codex', size: 40, mtimeMs: 11 };
+      rows.partial = [session];
+      rows.catalog = { sessions: [session] };
+      rows.discovery = Promise.resolve(true);
+      rows.metaFor = () => ({ stats: facts });
+      let calls = 0;
+      rows.useSessionStats((value: SessionStatFacts, _sessionId?: string, at?: number) => {
+        calls++;
+        vi.setSystemTime(crossed);
+        const chips = sessionStatsFromFacts(value, undefined, at);
+        vi.setSystemTime(returned);
+        return chips;
+      });
+      rows.noteCompressedRowFacts([session], [], [session]);
+      observed.push(dollars(rows.metadataStatsBySession.priced));
+      await rows.refresh(true);
+      observed.push(dollars(rows.metadataStatsBySession.priced));
+      assert.equal(calls, 1, 'compressed metadata');
+    }
+    assert.deepEqual(
+      observed.map((v) => Math.round(v * 100)),
+      [...Array(10).fill(60), ...Array(10).fill(120)],
+    );
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('GPT-6.2 nested source selections bind quotes across hidden clock crossings', async () => {
+  vi.useFakeTimers();
+  const boundary = Date.parse('2027-03-01T08:00:00Z');
+  vi.setSystemTime(boundary - 1000);
+  try {
+    const provider = projectSpendSnapshotHarness(
+      { compressedSpendDisplayFiles, compressedPairKey, sessionLifetimeDisplayFiles },
+      ['compressedSpendPick', 'lifetimeDisplayFiles'],
+    );
+    const plain = snapshotSpendFile(0, '2027-03-01');
+    plain.file = normalizeSpendFile(plain.file);
+    plain.buckets[0] = {
+      ...plain.buckets[0],
+      agent: 'Codex',
+      provider: 'openai',
+      model: 'gpt-6.2-sol',
+      serviceTier: 'default',
+      reportedCost: null,
+      contextBand: 'short',
+      usage: { input: 450000, output: 0, cacheWrite1h: 0, cacheWrite5m: 0, cacheRead: 0, thinking: 0 },
+    };
+    const compressed = {
+      ...plain,
+      buckets: [{ ...plain.buckets[0], serviceTier: 'ultrafast', usage: { ...plain.buckets[0].usage, input: 100000 } }],
+    };
+    provider.projectSpendFiles = [plain];
+    provider.projectSpendVisibleFiles = provider.projectSpendFiles;
+    provider.compressedFacts = new Map([
+      [
+        'compressed.jsonl.zst',
+        {
+          pairKey: plain.file,
+          threadId: 'priced',
+          complete: true,
+          spend: compressed,
+        },
+      ],
+    ]);
+    provider.compressedFactsRevision = 1;
+    provider.compressedSpendPicks = new WeakMap();
+    provider.codexMetas = { revision: 1, keys: () => [], peek: () => null };
+    provider.lifetimeDisplayPick = null;
+    provider.projectSpendBusy = () => false;
+    for (const [sample, crossed, returned, expected] of [
+      [boundary - 500, boundary + 20, boundary - 200, 90],
+      [boundary + 200, boundary - 20, boundary + 500, 120],
+    ]) {
+      provider.lifetimeDisplayPick = null;
+      provider.compressedSpendPicks = new WeakMap();
+      const lifetime = new SessionFiguresCache<number, number>();
+      const sources = [{ sessionId: 'priced', file: plain.file, primary: true }];
+      const select = provider.compressedSpendPick.bind(provider);
+      let crossing = false;
+      provider.compressedSpendPick = (files: readonly SpendFileIndex[], at?: number) => {
+        if (crossing) vi.setSystemTime(crossed);
+        const picked = select(files, at);
+        if (crossing) vi.setSystemTime(returned);
+        return picked;
+      };
+      const counted = compressed.buckets[0].usage;
+      Object.defineProperty(compressed.buckets[0], 'usage', {
+        configurable: true,
+        get: () => {
+          if (crossing) vi.setSystemTime(crossed);
+          return counted;
+        },
+      });
+      crossing = true;
+      vi.setSystemTime(sample);
+      const records = provider.lifetimeDisplayFiles();
+      const amount = lifetime.read(
+        records,
+        sources,
+        (_id, held, _sources, _pending, quotedAt?: number) => {
+          vi.setSystemTime(crossed);
+          const value = publicProjectSpendPrice(held[0].buckets[0], [], quotedAt)!.dollars;
+          vi.setSystemTime(returned);
+          return value;
+        },
+        (figures) => figures.get('priced')!,
+        undefined,
+        undefined,
+        sample,
+      );
+      assert.equal(Math.round(amount * 100), expected, 'lifetime picked a crossed quote');
+      assert.equal(provider.lifetimeDisplayFiles(), records, 'valid selection lost identity');
+      crossing = false;
+      provider.invalidateProjectSpendSnapshot();
+      await vi.runAllTimersAsync();
+      assert.equal(
+        Math.round(provider.projectSpendPayload().windows[0].dollars * 100),
+        expected,
+        'Project cost picked a crossed quote',
+      );
+      provider.compressedSpendPick = select;
+    }
+  } finally {
+    vi.useRealTimers();
+  }
+});
