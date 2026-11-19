@@ -32885,6 +32885,150 @@ test('GPT-6.2 unchanged Project cost snapshots reprice at the Ultrafast boundary
   }
 });
 
+test('GPT-6.2 metadata figures reprice when the clock moves during derivation', async () => {
+  vi.useFakeTimers();
+  const boundary = Date.parse('2027-03-01T08:00:00Z');
+  const usage = { input: 100000, output: 0, cacheWrite1h: 0, cacheWrite5m: 0, cacheRead: 0, thinking: 0, requests: 1 };
+  const facts: SessionStatFacts = {
+    turns: [
+      {
+        startedAt: boundary - 3000,
+        endedAt: boundary - 2500,
+        finished: true,
+        error: false,
+        model: 'gpt-6.2-sol',
+        provider: 'openai',
+        contextTokens: 0,
+        contextWindow: null,
+        childSpendPartial: false,
+        usage,
+        usageParts: [
+          {
+            model: 'gpt-6.2-sol',
+            provider: 'openai',
+            serviceTier: 'ultrafast',
+            contextBand: 'short',
+            contextWindow: null,
+            inferenceClass: null,
+            usage,
+          },
+        ],
+      },
+    ],
+    compactions: [],
+  };
+  const dollars = (chips: ReturnType<typeof sessionStatsFromFacts>) =>
+    chips.find((chip) => chip.metric === 'cost')!.dollars;
+  const observed: number[] = [];
+  try {
+    for (const [before, after] of [
+      [boundary - 1000, boundary + 1000],
+      [boundary + 1000, boundary - 1000],
+    ]) {
+      vi.setSystemTime(before);
+      const figures = new SessionFactFigures<SessionStatFacts, ReturnType<typeof sessionStatsFromFacts>>();
+      figures.readOne('priced', facts, (value) => {
+        const chips = sessionStatsFromFacts(value);
+        vi.setSystemTime(after);
+        return chips;
+      });
+      observed.push(dollars(figures.read([['priced', facts]], sessionStatsFromFacts).priced)!);
+
+      vi.setSystemTime(before);
+      const rows = completeDiscoveryHarness();
+      const session = { file: 'during-quote.jsonl.zst', sessionId: 'priced', agent: 'codex', size: 40, mtimeMs: 11 };
+      rows.partial = [session];
+      rows.catalog = { sessions: [session] };
+      rows.discovery = Promise.resolve(true);
+      rows.metaFor = () => ({ stats: facts });
+      rows.useSessionStats((value: SessionStatFacts) => {
+        const chips = sessionStatsFromFacts(value);
+        vi.setSystemTime(after);
+        return chips;
+      });
+      rows.noteCompressedRowFacts([session], [], [session]);
+      rows.useSessionStats(sessionStatsFromFacts);
+      await rows.refresh(true);
+      observed.push(dollars(rows.metadataStatsBySession.priced)!);
+    }
+    assert.deepEqual(
+      observed.map((value) => Math.round(value * 100)),
+      [120, 120, 60, 60],
+    );
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('GPT-6.2 colliding source selections reprice Project cost and lifetime figures', async () => {
+  vi.useFakeTimers();
+  const boundary = Date.parse('2027-03-01T08:00:00Z');
+  vi.setSystemTime(boundary - 1000);
+  try {
+    const provider = projectSpendSnapshotHarness(
+      { compressedSpendDisplayFiles, compressedPairKey, sessionLifetimeDisplayFiles },
+      ['compressedSpendPick', 'lifetimeDisplayFiles'],
+    );
+    const plain = snapshotSpendFile(0, '2027-03-01');
+    plain.file = normalizeSpendFile(plain.file);
+    plain.buckets[0] = {
+      ...plain.buckets[0],
+      agent: 'Codex',
+      provider: 'openai',
+      model: 'gpt-6.2-sol',
+      serviceTier: 'default',
+      reportedCost: null,
+      contextBand: 'short',
+      usage: { input: 450000, output: 0, cacheWrite1h: 0, cacheWrite5m: 0, cacheRead: 0, thinking: 0 },
+    };
+    const compressed = {
+      ...plain,
+      buckets: [{ ...plain.buckets[0], serviceTier: 'ultrafast', usage: { ...plain.buckets[0].usage, input: 100000 } }],
+    };
+    provider.projectSpendFiles = [plain];
+    provider.projectSpendVisibleFiles = provider.projectSpendFiles;
+    provider.compressedFacts = new Map([
+      [
+        'compressed.jsonl.zst',
+        {
+          pairKey: plain.file,
+          threadId: 'priced',
+          complete: true,
+          spend: compressed,
+        },
+      ],
+    ]);
+    provider.compressedFactsRevision = 1;
+    provider.compressedSpendPicks = new WeakMap();
+    provider.codexMetas = { revision: 1, keys: () => [], peek: () => null };
+    provider.lifetimeDisplayPick = null;
+    provider.projectSpendBusy = () => false;
+    const lifetime = new SessionFiguresCache<number, number>();
+    const sources = [{ sessionId: 'priced', file: plain.file, primary: true }];
+    const amounts: number[] = [];
+    for (const at of [boundary - 1000, boundary + 1000, boundary - 1000]) {
+      vi.setSystemTime(at);
+      const records = provider.lifetimeDisplayFiles();
+      const amount = lifetime.read(
+        records,
+        sources,
+        () => publicProjectSpendPrice(records[0].buckets[0])!.dollars,
+        (figures) => figures.get('priced')!,
+      );
+      amounts.push(amount);
+      provider.invalidateProjectSpendSnapshot();
+      await vi.runAllTimersAsync();
+      amounts.push(provider.projectSpendPayload().windows[0].dollars);
+    }
+    assert.deepEqual(
+      amounts.map((value) => Math.round(value * 100)),
+      [90, 90, 120, 120, 90, 90],
+    );
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 test('Project cost snapshot publishes the new calendar date inside the midnight callback', async () => {
   vi.useFakeTimers();
   vi.setSystemTime(new Date('2026-10-21T23:59:59'));

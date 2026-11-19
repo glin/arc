@@ -353,7 +353,7 @@ export function derivedTitleCacheRevision(entry: DerivedTitleEntry): Pick<FileRe
 
 // Caches figures by session id and facts-object identity.
 // The `current` predicate rejects figures affected by changing external inputs, such as the clock.
-// The `derive` callback must use facts and other unchanging inputs. Callers must replace changed facts with a new object.
+// The `derive` callback uses facts, current pricing and other unchanging inputs. Callers replace changed facts with a new object.
 // `read` gives a new output when a figure moves, and the same output when every listed session keeps its figure.
 // `patch` changes the output in place. Session list keys compare the output identity and each entry's identity.
 // Removed sessions lose their figures.
@@ -413,12 +413,12 @@ export class SessionFactFigures<F, V> {
     }
     const previous = this.held.get(sessionId);
     if (previous && previous.facts === facts && current(previous.value)) return this.value;
-    return this.patch(sessionId, { facts, value: derive(facts, sessionId) });
+    return this.patch(sessionId, { facts, derive: () => derive(facts, sessionId) });
   }
 
-  // Sets the figure of one session, or drops it with null. The output keeps its identity.
+  // Derives one figure after sampling its pricing interval, or drops it with null. The output keeps its identity.
   // Session list keys detect replaced entries and changed membership. The caller requests publication after patching.
-  patch(sessionId: string, entry: { facts: F; value: V } | null): Readonly<Record<string, V>> {
+  patch(sessionId: string, entry: { facts: F; derive: () => V } | null): Readonly<Record<string, V>> {
     const now = Date.now();
     if (now < this.pricedAt || now >= this.pricingUntil) {
       this.held.clear();
@@ -428,8 +428,9 @@ export class SessionFactFigures<F, V> {
     }
     const value = this.value as Record<string, V>;
     if (entry) {
-      this.held.set(sessionId, entry);
-      value[sessionId] = entry.value;
+      const derived = { facts: entry.facts, value: entry.derive() };
+      this.held.set(sessionId, derived);
+      value[sessionId] = derived.value;
     } else {
       this.held.delete(sessionId);
       delete value[sessionId];

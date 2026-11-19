@@ -1864,11 +1864,20 @@ export class PanelProvider implements vscode.Disposable {
     revision: number;
     metas: number;
     facts: number;
+    pricedAt: number;
+    pricingUntil: number;
     picked: readonly SpendFileIndex[];
   } | null = null;
   private readonly compressedSpendPicks = new WeakMap<
     readonly SpendFileIndex[],
-    { revision: number; spend: number; metas: number; picked: readonly SpendFileIndex[] }
+    {
+      revision: number;
+      spend: number;
+      metas: number;
+      pricedAt: number;
+      pricingUntil: number;
+      picked: readonly SpendFileIndex[];
+    }
   >();
   // Recorded working directories, keyed by transcript path. Missing values retry after the file revision changes.
   // `saved` marks a row from an earlier launch that no listing of this launch has compared with its file yet.
@@ -5766,12 +5775,12 @@ export class PanelProvider implements vscode.Disposable {
       const statFacts = derivedTitleStats(meta);
       this.metadataStatsBySession = this.metadataStatFigures.patch(row.sessionId, {
         facts: statFacts,
-        value: sessionStatsFromFacts(statFacts),
+        derive: () => sessionStatsFromFacts(statFacts),
       });
       const cacheFacts = derivedTitleCacheStats(meta);
       this.metadataRailCaches = this.metadataCacheFigures.patch(row.sessionId, {
         facts: cacheFacts,
-        value: this.noteRailMark(row.sessionId, railCacheMarkOf(cacheFacts, now)),
+        derive: () => this.noteRailMark(row.sessionId, railCacheMarkOf(cacheFacts, now)),
       });
       if (Object.hasOwn(this.parsedRailCaches, row.sessionId))
         this.metadataRailRevisions[row.sessionId] = derivedTitleCacheRevision(meta);
@@ -6187,12 +6196,15 @@ export class PanelProvider implements vscode.Disposable {
   // compressed record.
   private compressedSpendPick(files: readonly SpendFileIndex[]): readonly SpendFileIndex[] {
     if (!this.compressedFacts?.size) return files;
+    const now = Date.now();
     const metasRevision = this.codexMetas.revision;
     const held = this.compressedSpendPicks.get(files);
     if (
       held?.revision === this.compressedFactsRevision &&
       held.spend === this.projectSpendRevision &&
-      held.metas === metasRevision
+      held.metas === metasRevision &&
+      now >= held.pricedAt &&
+      now < held.pricingUntil
     )
       return held.picked;
     const candidates = [...this.compressedFacts.values()].flatMap((entry) =>
@@ -6224,6 +6236,8 @@ export class PanelProvider implements vscode.Disposable {
       revision: this.compressedFactsRevision,
       spend: this.projectSpendRevision,
       metas: metasRevision,
+      pricedAt: now,
+      pricingUntil: publicPricingValidUntil(now),
       picked,
     });
     return picked;
@@ -13968,6 +13982,7 @@ export class PanelProvider implements vscode.Disposable {
 
   // Retain the last complete lifetime figures until a replacement read completes.
   private lifetimeDisplayFiles(): readonly SpendFileIndex[] {
+    const now = Date.now();
     const held = this.lifetimeDisplayPick;
     if (
       held?.files === this.projectSpendFiles &&
@@ -13975,7 +13990,9 @@ export class PanelProvider implements vscode.Disposable {
       held.busy === this.projectSpendBusy() &&
       held.revision === this.projectSpendRevision &&
       held.facts === this.compressedFactsRevision &&
-      held.metas === (this.codexMetas?.revision ?? 0)
+      held.metas === (this.codexMetas?.revision ?? 0) &&
+      now >= held.pricedAt &&
+      now < held.pricingUntil
     )
       return held.picked;
     const picked = this.compressedSpendPick(
@@ -13988,6 +14005,8 @@ export class PanelProvider implements vscode.Disposable {
       revision: this.projectSpendRevision,
       facts: this.compressedFactsRevision,
       metas: this.codexMetas?.revision ?? 0,
+      pricedAt: now,
+      pricingUntil: publicPricingValidUntil(now),
       picked,
     };
     return picked;
