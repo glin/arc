@@ -4141,7 +4141,7 @@ test('a report filters request clocks and omits children outside the window', ()
     ['first', 'second'],
   );
   assert.equal(report.combined.requests, 3);
-  assert.match(report.rateNote, /retained promotional rate, with source review dated \d{4}-\d{2}-\d{2}/);
+  assert.match(report.rateNote, /promotional rates held through at least \d{4}-\d{2}-\d{2}/);
   const empty = sessionCostReport(parent, { since: '2026-09-27T00:00:00Z' });
   assert.equal(empty.parent.requests, 0);
   assert.equal(empty.parent.pricedRequests, 0);

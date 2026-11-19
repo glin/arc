@@ -2140,13 +2140,21 @@ test('pricing tests use fixed dates or controlled clocks', () => {
     true,
   );
   const clocks: string[] = [];
+  const unwrapExpression = (expression: ts.Expression): ts.Expression => {
+    let current = expression;
+    while (ts.isParenthesizedExpression(current)) current = current.expression;
+    return current;
+  };
   const visit = (node: ts.Node): void => {
     if (ts.isCallExpression(node) || ts.isNewExpression(node)) {
-      const callee = node.expression;
+      const callee = unwrapExpression(node.expression);
       const date = ts.isIdentifier(callee) && callee.text === 'Date';
+      const receiver = ts.isPropertyAccessExpression(callee) ? unwrapExpression(callee.expression) : undefined;
       const now =
         ts.isPropertyAccessExpression(callee) &&
-        callee.expression.getText(file) === 'Date' &&
+        receiver !== undefined &&
+        ts.isIdentifier(receiver) &&
+        receiver.text === 'Date' &&
         callee.name.text === 'now';
       if ((date && (ts.isCallExpression(node) || !node.arguments?.length)) || (ts.isCallExpression(node) && now))
         clocks.push(node.getText(file));
