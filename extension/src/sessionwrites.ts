@@ -2,7 +2,7 @@ import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypt
 import type { LauncherRequest } from './view/launcher';
 import type { SessionListingRow } from './sessionreads';
 import type { GuardedAttempt, GuardedReceipt, PromptEntry } from './agentwire';
-import { buildQuestionReply, type QuestionReply } from './codexreply';
+import type { QuestionReply } from './codexreply';
 import {
   canonicalServiceTier,
   isServiceTier,
@@ -1072,6 +1072,15 @@ export function agentMessageBinding<C extends GuardedWriter>(
   host: {
     find(agent: C['agent'], sessionId: string): C | null;
     withActivity<T>(key: string, work: (live: C) => Promise<T>): Promise<T | null>;
+    guardedQuestion(child: C, id: string): QuestionReply | null;
+    guardedAnswer(
+      child: C,
+      id: string,
+      text: string,
+      clientUuid: string,
+      onSubmitted?: (turnId: number) => void,
+      beforeWrite?: () => void,
+    ): GuardedAttempt;
   },
   writerFailure: (error: unknown) => boolean,
   clientUuid: () => string,
@@ -1092,7 +1101,7 @@ export function agentMessageBinding<C extends GuardedWriter>(
     sessionId: session,
     current,
     idle: () => child.guardedIdle(),
-    question: (id) => child.guardedQuestion?.(id) ?? null,
+    question: (id) => host.guardedQuestion(child, id),
     questionIdle: (id) => child.guardedIdle(id),
     deliverAnswer: (id, text, beforeWrite) => deliver(text, beforeWrite, false, id),
     refusal,
@@ -1110,7 +1119,7 @@ export function agentMessageBinding<C extends GuardedWriter>(
     liveInput: boolean,
     questionId?: string,
   ): Promise<GuardedReceipt> {
-    const question = questionId ? child.guardedQuestion?.(questionId) : null;
+    const question = questionId ? host.guardedQuestion(child, questionId) : null;
     const ends = child.guardedTurnEnds();
     let receipt: GuardedReceipt;
     let attempt: GuardedAttempt | null = null;
@@ -1129,9 +1138,14 @@ export function agentMessageBinding<C extends GuardedWriter>(
             reason: 'The original agent cannot receive this message.',
           };
         beforeWrite();
-        const write = liveInput ? child.guardedLive!.bind(child) : child.guardedPrompt.bind(child);
+        const write = questionId
+          ? (text: string, uuid: string, submitted?: (turn: number) => void, before?: () => void) =>
+              host.guardedAnswer(child, questionId, text, uuid, submitted, before)
+          : liveInput
+            ? child.guardedLive!.bind(child)
+            : child.guardedPrompt.bind(child);
         attempt = write(
-          question ? buildQuestionReply([{ ...question, answer: text }]) : text,
+          text,
           clientUuid(),
           (turnId) => submitted?.(child, turnId),
           () => {

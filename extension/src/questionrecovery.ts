@@ -2,7 +2,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { writeFileAtomically } from './atomicfile';
-import type { AskAnswer, QuestionAsk, WireEvent } from './agentwire';
+import type { AskAnswer, GuardedReceipt, QuestionAsk, WireEvent } from './agentwire';
 import { asyncQuestionItem, buildQuestionReply, parseQuestionReply } from './codexreply';
 
 export type QuestionDisposition = 'unresolved' | 'unknown' | 'answered' | 'declined' | 'cancelled';
@@ -327,6 +327,33 @@ export class QuestionRecovery {
               ...q,
               disposition: 'unknown',
               attempt: { id: attemptId, digest: text === null ? null : digest(text) },
+            }
+          : q,
+      ),
+    });
+  }
+  finishAnswer(identity: string, attemptId: string, questionId: string, receipt: GuardedReceipt): void {
+    if (!this.owns()) return;
+    const entry = this.data.questions.find((q) => q.identity === identity);
+    if (!entry || entry.disposition !== 'unknown' || entry.attempt?.id !== attemptId) return;
+    if (receipt.outcome === 'unknown') return;
+    const questions =
+      receipt.outcome === 'accepted' ? entry.ask.questions.filter((q) => q.id !== questionId) : entry.ask.questions;
+    const disposition = questions.length ? 'unresolved' : 'answered';
+    this.save({
+      ...this.data,
+      closed: disposition === 'answered' ? [...new Set([...this.data.closed, identity])] : this.data.closed,
+      questions: this.data.questions.map((q) =>
+        q.identity === identity
+          ? {
+              ...q,
+              disposition,
+              attempt: undefined,
+              settledQuestions:
+                receipt.outcome === 'accepted'
+                  ? [...new Set([...(q.settledQuestions ?? []), questionId])]
+                  : q.settledQuestions,
+              ask: { ...q.ask, questions },
             }
           : q,
       ),

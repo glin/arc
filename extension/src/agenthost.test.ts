@@ -5976,8 +5976,11 @@ test('a Codex async question stays open after its turn ends, and answering it st
 });
 
 // The channel uses the production admission methods with the native child fixture.
-async function pendingQuestionMessageHost() {
-  const native = fakeHost();
+async function pendingQuestionMessageHost(lifecycle: Parameters<typeof fakeHost>[2] = {}) {
+  const native = fakeHost(undefined, undefined, {
+    recovery: recoveryAt(tempDir('named-question-recovery-'), '1'),
+    ...lifecycle,
+  });
   const starting = native.host.session('cx', codexPlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT }));
   const child = native.children[0];
   await answerCodexHandshake(child);
@@ -6064,6 +6067,8 @@ async function pendingQuestionMessageHost() {
     {
       find: () => (replacement ? null : session),
       withActivity: async (_key, work) => work(session),
+      guardedQuestion: (live, id) => native.host.guardedQuestion(live, id),
+      guardedAnswer: (...args) => native.host.guardedAnswer(...args),
     },
     () => false,
     () => 'answer-client',
@@ -6184,13 +6189,177 @@ test('a named reader answer reaches the idle Codex child past an ordinary queued
     );
 });
 
+test('a named answer refuses a repeated live question with prior unknown recovery without changing the raw ask', async () => {
+  const root = tempDir('named-question-recovery-');
+  const store = recoveryAt(root, '1');
+  const f = await pendingQuestionMessageHost({ recovery: store });
+  store.begin(store.entries()[0].identity, null);
+  f.host.setRecovery(recoveryAt(root, '2'));
+  const published = f.host.waiting()[0].ask;
+  const raw = f.session.state().asks[0];
+  assert.equal(published.kind === 'question' && published.recovery?.blocked, true);
+  assert.equal(raw.kind === 'question' && raw.recovery, undefined);
+  assert.equal(f.host.answer('cx', 'call-ask', { decision: 'answer', answers: {} }), false);
+  const write = f.child.stdin.write.bind(f.child.stdin);
+  f.child.stdin.write = (line: string) => {
+    const result = write(line);
+    if (JSON.parse(line).method === 'turn/start')
+      queueMicrotask(() => f.child.reply({ turn: { id: 'duplicate-answer' } }));
+    return result;
+  };
+  const before = f.child.sent().length;
+  assert.equal((await f.panel.sendAgentMessage(f.request, f.binding)).status, 'refused');
+  assert.equal(f.child.sent().length, before);
+});
+
+test('a named answer retains unknown native delivery across recovery replacement and fresh-host reload', async () => {
+  const root = tempDir('named-question-recovery-');
+  const store = recoveryAt(root, '1');
+  const f = await pendingQuestionMessageHost({ recovery: store });
+  vi.useFakeTimers();
+  onTestFinished(() => {
+    vi.useRealTimers();
+  });
+  const sending = f.panel.sendAgentMessage(f.request, f.binding);
+  await vi.advanceTimersByTimeAsync(0);
+  assert.equal(f.child.sent().filter((message) => message.method === 'turn/start').length, 2);
+  assert.equal(store.entries()[0].disposition, 'unknown');
+  await vi.advanceTimersByTimeAsync(CODEX_DEADLINE_MS);
+  assert.equal((await sending).status, 'unknown');
+  f.host.setRecovery(recoveryAt(root, '2'));
+  const published = f.host.waiting()[0].ask;
+  assert.equal(published.kind === 'question' && published.recovery?.blocked, true);
+  f.host.dispose();
+  const after = fakeHost(undefined, undefined, { recovery: recoveryAt(root, '3') });
+  onTestFinished(() => after.host.dispose());
+  assert.equal(after.host.waiting()[0].recovered?.disposition, 'unknown');
+  const reloaded = after.host.waiting()[0].ask;
+  assert.equal(reloaded.kind === 'question' && reloaded.recovery?.blocked, true);
+});
+
+test.each([
+  'unavailable',
+  'capture-save',
+  'attempt-save',
+  'foreign-owner',
+  'source',
+  'source-final',
+  'owner-final',
+  'replacement-final',
+])('a named answer sends no native input after %s recovery admission failure', async (condition) => {
+  const root = tempDir('named-question-recovery-');
+  let fail = condition === 'capture-save';
+  let source = 'original-source';
+  const store = recoveryAt(root, '1', {
+    write: (file, text) => {
+      if (fail) throw new Error('full disk');
+      fs.writeFileSync(file, text);
+    },
+  });
+  const f = await pendingQuestionMessageHost({
+    recovery: condition === 'unavailable' ? undefined : store,
+    recoverySource: () => source,
+  });
+  if (condition === 'attempt-save') fail = true;
+  if (condition === 'foreign-owner') store.release();
+  if (condition === 'source') source = 'replacement-source';
+  const prompt = f.session.guardedPrompt.bind(f.session);
+  f.session.guardedPrompt = (...args) => {
+    if (condition === 'source-final') source = 'replacement-source';
+    if (condition === 'owner-final') store.release();
+    if (condition === 'replacement-final') f.host.setRecovery(recoveryAt(root, '2'));
+    return prompt(...args);
+  };
+  const write = f.child.stdin.write.bind(f.child.stdin);
+  f.child.stdin.write = (line: string) => {
+    const result = write(line);
+    if (JSON.parse(line).method === 'turn/start')
+      queueMicrotask(() => f.child.reply({ turn: { id: 'unsafe-answer' } }));
+    return result;
+  };
+  const before = f.child.sent().length;
+  assert.equal((await f.panel.sendAgentMessage(f.request, f.binding)).status, 'refused');
+  assert.equal(f.child.sent().length, before);
+  assert.equal(f.session.state().asks[0].kind, 'question');
+});
+
+test.each(['accepted', 'refused', 'newer-attempt', 'settlement-save'])(
+  'a named answer settles only its durable attempt after a %s receipt',
+  async (outcome) => {
+    const root = tempDir('named-question-recovery-');
+    let fail = false;
+    const store = recoveryAt(root, '1', {
+      write: (file, text) => {
+        if (fail) throw new Error('full disk');
+        fs.writeFileSync(file, text);
+      },
+    });
+    const f = await pendingQuestionMessageHost({ recovery: store });
+    const originalAsk = structuredClone(f.session.state().asks[0]);
+    assert.equal(originalAsk.kind, 'question');
+    if (originalAsk.kind !== 'question') throw new Error('Missing question fixture.');
+    const identity = store.entries()[0].identity;
+    const write = f.child.stdin.write.bind(f.child.stdin);
+    let persisted = false;
+    f.child.stdin.write = (line: string) => {
+      if (JSON.parse(line).method === 'turn/start') {
+        assert.equal(store.entries()[0].disposition, 'unknown');
+        persisted = true;
+      }
+      return write(line);
+    };
+    if (outcome === 'refused' || outcome === 'newer-attempt')
+      f.session.guardedPrompt = (_text, uuid, _submitted, beforeWrite) => {
+        const attempt = new GuardedAttempt(uuid, beforeWrite);
+        attempt.prepareWrite();
+        assert.equal(store.entries()[0].disposition, 'unknown');
+        persisted = true;
+        if (outcome === 'newer-attempt') {
+          store.settle(identity, 'unresolved');
+          store.begin(identity, null, 'replacement-attempt');
+        }
+        attempt.settle({ outcome: 'refused', nativeTurnId: null, reason: 'stopped before input' });
+        return attempt;
+      };
+    const sending = f.panel.sendAgentMessage(f.request, f.binding);
+    if (outcome === 'accepted' || outcome === 'settlement-save') {
+      await vi.waitFor(() =>
+        assert.equal(f.child.sent().filter((message) => message.method === 'turn/start').length, 2),
+      );
+      if (outcome === 'settlement-save') fail = true;
+      f.child.reply({ turn: { id: 'answer-turn' } });
+    }
+    assert.equal(
+      (await sending).status,
+      outcome === 'accepted' || outcome === 'settlement-save' ? 'accepted' : 'refused',
+    );
+    assert.equal(persisted, true);
+    if (outcome === 'accepted') assert.ok(f.binding.question?.(asyncQuestionId('call-ask', 1)));
+    fail = false;
+    f.host.dispose();
+    const restored = recoveryAt(root, '2');
+    assert.equal(restored.owns(), true);
+    const saved = restored.entries()[0];
+    assert.equal(saved.disposition, outcome === 'accepted' || outcome === 'refused' ? 'unresolved' : 'unknown');
+    if (outcome === 'newer-attempt') assert.equal(saved.attempt?.id, 'replacement-attempt');
+    if (outcome === 'accepted') {
+      assert.deepEqual(saved.settledQuestions, [asyncQuestionId('call-ask', 0)]);
+      restored.capture('codex', 'thread-7', WS, originalAsk);
+      assert.deepEqual(
+        restored.entries()[0].ask.questions.map((q) => q.id),
+        [asyncQuestionId('call-ask', 1)],
+      );
+    } else if (outcome === 'refused') assert.equal(saved.ask.questions.length, 2);
+    restored.release();
+  },
+);
+
 test.each([
   'stale',
   'partial',
   'active',
   'permission',
   'synchronous',
-  'recovered',
   'secret',
   'control',
   'source',
@@ -6225,10 +6394,6 @@ test.each([
         params: { itemId: 'sync', questions: [{ id: 'sync-question', question: 'Wait?', options: [] }] },
       }) + '\n',
     );
-  if (condition === 'recovered') {
-    const ask = f.session.state().asks[0];
-    if (ask.kind === 'question') ask.recovery = { blocked: false, detail: 'saved' };
-  }
   if (condition === 'secret') {
     const ask = f.session.state().asks[0];
     if (ask.kind === 'question') ask.questions[0].secret = true;

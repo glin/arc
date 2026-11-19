@@ -80,7 +80,7 @@ import { ARC_IDENTITY } from './identity';
 import { sessionHookEnvironment, sessionHookRuntime } from './bundledtools';
 import { sentence } from './sessionwrites';
 import { QuestionRecovery, questionIdentity, type RecoveredQuestion } from './questionrecovery';
-import type { QuestionReply } from './codexreply';
+import { buildQuestionReply, type QuestionReply } from './codexreply';
 import {
   admitClaudeSessionComponents,
   claudeSkillHome,
@@ -4290,6 +4290,71 @@ export class AgentHost {
         }
     }
     return session.answer(id, answer);
+  }
+
+  guardedQuestion(session: AgentSession, id: string): QuestionReply | null {
+    const state = session.state();
+    const question = session.guardedQuestion(id);
+    if (!question || !state.sessionId || this.find(state.agent, state.sessionId) !== session) return null;
+    if (!this.recovery) return null;
+    if (!this.recovery.owns()) return null;
+    const ask = state.asks.find((q) => q.kind === 'question' && q.questions.some((item) => item.id === id));
+    if (ask?.kind !== 'question') return null;
+    const identity = questionIdentity(state.agent, state.sessionId, state.cwd, ask);
+    const saved = this.recovery.entries().find((entry) => entry.identity === identity);
+    if (
+      !saved ||
+      saved.disposition !== 'unresolved' ||
+      !saved.ask.questions.some((item) => item.id === id) ||
+      (this.options.recoverySource &&
+        (!saved.source || this.options.recoverySource(state.agent, state.sessionId) !== saved.source))
+    )
+      return null;
+    return question;
+  }
+
+  guardedAnswer(
+    session: AgentSession,
+    id: string,
+    text: string,
+    clientUuid: string,
+    onSubmitted?: (turnId: number) => void,
+    beforeWrite?: () => void,
+  ): GuardedAttempt {
+    const recovery = this.recovery;
+    let identity: string | null = null;
+    const question = this.guardedQuestion(session, id);
+    if (!question) throw new Error('The pending question cannot receive this answer.');
+    const attempt = session.guardedPrompt(
+      buildQuestionReply([{ ...question, answer: text }]),
+      clientUuid,
+      onSubmitted,
+      () => {
+        beforeWrite?.();
+        if (
+          this.recovery !== recovery ||
+          JSON.stringify(this.guardedQuestion(session, id)) !== JSON.stringify(question)
+        )
+          throw new Error('The pending question changed before the answer was sent.');
+        if (recovery) {
+          const state = session.state();
+          const ask = state.asks.find((q) => q.kind === 'question' && q.questions.some((item) => item.id === id));
+          if (!state.sessionId || ask?.kind !== 'question')
+            throw new Error('The pending question cannot receive this answer.');
+          identity = questionIdentity(state.agent, state.sessionId, state.cwd, ask);
+          recovery.begin(identity, null, clientUuid);
+        }
+      },
+    );
+    void attempt.receipt.then((receipt) => {
+      if (!recovery || !identity) return;
+      try {
+        recovery.finishAnswer(identity, clientUuid, id, receipt);
+      } catch {
+        this.options.onRecoveryFailure?.();
+      }
+    });
+    return attempt;
   }
 
   questionRecovery(): QuestionRecovery | undefined {

@@ -33719,7 +33719,14 @@ function agentMessageHost(agent: 'claude' | 'codex') {
     agentMessageBinding(
       policy,
       child,
-      { find: live, withActivity: async (_key, work) => work(child) },
+      {
+        find: live,
+        withActivity: async (_key, work) => work(child),
+        guardedQuestion: () => null,
+        guardedAnswer: () => {
+          throw new Error('No question is pending.');
+        },
+      },
       () => false,
       randomUUID,
     );
