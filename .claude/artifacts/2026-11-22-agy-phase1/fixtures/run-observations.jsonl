@@ -1,0 +1,5 @@
+{"check":"launcher-version","args":["agy","--version"],"initialStdout":"1.5.8","postReviewStdout":"1.5.14"}
+{"check":"sandbox-launch","basis":"test harness launch arguments","argv":["agy","acp","--sandbox"],"cwd":"C:/TEMP/agy-phase1/worktree-a"}
+{"check":"prompts","unit":"attempts","terminalIncludesUnsettled":true,"routes":{"ACP":9,"print":2,"terminal":5},"total":16}
+{"check":"weekly-codex","source":"account/rateLimits/read","windowMinutes":10080,"startPercent":64,"midPercent":64,"postReviewPercent":64}
+{"check":"process-inventory","name":"agy.exe","remaining":0,"checkedAt":"2026-11-22T05:11:01.443639+00:00"}

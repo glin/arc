@@ -1,0 +1,5 @@
+{"case":"terminal edit without index","basis":"live transcript","attribution":"project","resumeDirectory":null}
+{"case":"print edit without index","basis":"live transcript","attribution":"worktree-b","resumeDirectory":null}
+{"case":"no workspace and no tool roots","basis":"live transcript without external workspace metadata","attribution":null,"resumeDirectory":null}
+{"case":"two worktree roots","basis":"composite fixture","attribution":null,"resumeDirectory":null}
+{"case":"read-only reference","basis":"subset of a live transcript","attribution":null,"resumeDirectory":null}
