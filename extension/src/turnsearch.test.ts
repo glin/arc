@@ -79,7 +79,7 @@ test('every axis the table holds can actually be asked for', () => {
           ? {
               field: axis.field,
               needle: value,
-              identities: { any: new Set([value]), claude: new Set(), codex: new Set() },
+              identities: { any: new Set([value]), claude: new Set(), codex: new Set(), agy: new Set() },
               ...(axis.prefix === 'id' ? { shorthand: true } : {}),
             }
           : { field: axis.field, needle: value };

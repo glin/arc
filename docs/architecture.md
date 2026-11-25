@@ -53,12 +53,14 @@ flowchart LR
   subgraph agents[Agent processes]
     claude[Claude CLI]
     codex[Codex CLI]
+    agy[Antigravity CLI]
     hooks[Claude hooks]
   end
 
   subgraph records[User data]
     transcripts[Claude transcripts]
     rollouts[Codex rollouts]
+    agyRecords[Antigravity transcripts]
     snapshots[First-touch snapshots]
     trigger[Manifest and trigger]
   end
@@ -75,10 +77,12 @@ flowchart LR
 
   claude --> transcripts
   codex --> rollouts
+  agy --> agyRecords
   hooks --> snapshots
   hooks --> trigger
   transcripts --> watcher
   rollouts --> watcher
+  agyRecords --> panelhost
   trigger --> watcher
   watcher --> panelhost
   snapshots --> panelhost
@@ -90,11 +94,12 @@ flowchart LR
   status --> cli
   transcripts --> cli
   rollouts --> cli
+  agyRecords --> cli
   cli <--> channel[Local window channel]
   channel <--> panelhost
 ```
 
-The extension never writes a file the agent changed. Hooks write only under the snapshot store. The panel opens files and diffs through VS Code. The CLI reads Claude status-line JSON from stdin or one session's Claude or Codex records from disk. Window discovery asks running extension hosts through their local channels.
+The extension never writes a file the agent changed. Hooks write only under the snapshot store. The panel opens files and diffs through VS Code. The CLI reads Claude status-line JSON from stdin or one session's Claude, Codex, or Antigravity records from disk. Window discovery asks running extension hosts through their local channels.
 
 Recorded work and host-owned live processes have separate authority. [Card sources](timeline.md#card-sources) defines their reconciliation. Reader-owned state survives independently of rebuildable parsing and spend caches. [Cache ownership](session-history.md#cache-ownership) defines those lifetimes. Receipt relationship scans supply neither billing evidence nor delivery authority. [Relationship discovery](session-discovery.md#relationship-discovery-contracts) defines their admission.
 
