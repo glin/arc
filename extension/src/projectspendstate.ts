@@ -1,3 +1,4 @@
+import { validAgyRecordedUsage } from './agyhistory';
 import { isDeepStrictEqual } from 'node:util';
 import { CODEX_USAGE_ASSOCIATION_LIMIT, type CodexUsageReducerState } from './codex';
 import {
@@ -786,8 +787,9 @@ function codexState(value: unknown): value is CodexUsageReducerState {
 
 function parserState(
   value: unknown,
-  parserKind: 'claude' | 'codex',
-): value is ClaudeUsageReducerState | CodexUsageReducerState {
+  parserKind: 'claude' | 'codex' | 'agy',
+): value is ClaudeUsageReducerState | CodexUsageReducerState | number {
+  if (parserKind === 'agy') return value === -1 || nonNegativeInteger(value);
   return parserKind === 'claude' ? claudeState(value) : codexState(value);
 }
 
@@ -873,11 +875,13 @@ function bucket(value: unknown): ProjectUsageBucket | null {
     (value.waits !== undefined && !usageWaits(value.waits)) ||
     (value.tools !== undefined && !usageTools(value.tools)) ||
     !turnUsage(value.usage) ||
-    !nonNegativeInteger(value.requests)
+    !nonNegativeInteger(value.requests) ||
+    (value.agyUsage !== undefined && (value.agent !== 'agy' || !validAgyRecordedUsage(value.agyUsage)))
   ) {
     return null;
   }
   return {
+    ...(validAgyRecordedUsage(value.agyUsage) ? { agyUsage: { ...value.agyUsage } } : {}),
     localDate: value.localDate,
     agent: value.agent,
     provider: value.provider,
@@ -1319,6 +1323,25 @@ function buckets(value: unknown): ProjectUsageBucket[] | null {
   return new Set(keys).size === keys.length ? parsed : null;
 }
 
+export function spendRecordAgent(
+  record: Pick<SpendFileIndex, 'parserKind' | 'lifetimeBuckets' | 'buckets'>,
+): NonNullable<SpendFileIndex['parserKind']> {
+  if (record.parserKind) return record.parserKind;
+  const buckets = record.lifetimeBuckets ?? record.buckets;
+  return buckets.some((bucket) => bucket.agent === 'agy')
+    ? 'agy'
+    : buckets.some((bucket) => bucket.agent.toLowerCase() === 'codex')
+      ? 'codex'
+      : 'claude';
+}
+
+// Historical attribution supplies no parser state to resume.
+export function normalizeHistoricalAgy(record: SpendFileIndex): SpendFileIndex {
+  if (record.parserKind !== undefined || spendRecordAgent(record) !== 'agy') return record;
+  const { parserGeneration: _generation, parserState: _state, ...historical } = record;
+  return { ...historical, parserKind: 'agy' };
+}
+
 function spendRecord(
   value: unknown,
   workspace: string,
@@ -1354,9 +1377,13 @@ function spendRecord(
     (value.complete !== undefined && typeof value.complete !== 'boolean') ||
     (value.scanOffset !== undefined && !nonNegativeInteger(value.scanOffset)) ||
     (value.missingAt !== undefined && !timestamp(value.missingAt)) ||
+    (value.agyRescanRequired !== undefined && (value.agyRescanRequired !== true || value.missingAt !== undefined)) ||
     (value.trailingBytes !== undefined && !validBase64(value.trailingBytes)) ||
     (value.pendingBytes !== undefined && !validBase64(value.pendingBytes)) ||
-    (value.parserKind !== undefined && value.parserKind !== 'claude' && value.parserKind !== 'codex') ||
+    (value.parserKind !== undefined &&
+      value.parserKind !== 'claude' &&
+      value.parserKind !== 'codex' &&
+      value.parserKind !== 'agy') ||
     (value.claudeRepeated !== undefined &&
       (value.parserKind !== 'claude' ||
         !validClaudeRepeatedState(value.claudeRepeated) ||
@@ -1366,9 +1393,12 @@ function spendRecord(
   }
   const currentBuckets = buckets(value.buckets);
   const lifetimeBuckets = value.lifetimeBuckets === undefined ? undefined : buckets(value.lifetimeBuckets);
-  if (!currentBuckets || lifetimeBuckets === null) {
+  if (!currentBuckets || lifetimeBuckets === null) return null;
+  if (
+    value.agyRescanRequired &&
+    spendRecordAgent({ parserKind: value.parserKind, buckets: currentBuckets, lifetimeBuckets }) !== 'agy'
+  )
     return null;
-  }
   if (
     value.costStateProgress !== undefined &&
     (!validClaudeCostProgress(value.costStateProgress) ||
@@ -1465,6 +1495,7 @@ function spendRecord(
     current &&
     parserKind !== undefined &&
     value.missingAt === undefined &&
+    value.agyRescanRequired !== true &&
     !parserState(value.parserState, parserKind)
   ) {
     return null;
@@ -1477,7 +1508,7 @@ function spendRecord(
   ) {
     return null;
   }
-  return {
+  return normalizeHistoricalAgy({
     file: normalizeFile(value.file),
     workspace: value.workspace,
     size: value.size,
@@ -1509,7 +1540,8 @@ function spendRecord(
     ...(value.scanOffset === undefined ? {} : { scanOffset: value.scanOffset }),
     ...(value.pendingBytes === undefined ? {} : { pendingBytes: value.pendingBytes }),
     ...(value.missingAt === undefined ? {} : { missingAt: value.missingAt }),
-  };
+    ...(value.agyRescanRequired === true ? { agyRescanRequired: true } : {}),
+  });
 }
 
 export function parseSpendLedger(
@@ -1576,5 +1608,39 @@ export function parseSpendLedger(
       }
     }
   }
-  return { workspace, parserGeneration, files, completeFiles };
+  const agyCompleteFiles: SpendFileIndex[] = [];
+  if (value.agyCompleteFiles !== undefined) {
+    if (!Array.isArray(value.agyCompleteFiles)) return null;
+    const partialAgy = new Set(
+      files
+        .filter(
+          (file) =>
+            file.parserKind === 'agy' &&
+            file.complete === false &&
+            file.missingAt === undefined &&
+            !file.agyRescanRequired,
+        )
+        .map((file) => file.file),
+    );
+    for (const raw of value.agyCompleteFiles) {
+      const item = spendRecord(raw, workspace, currentParser, normalizeFile);
+      if (
+        !item ||
+        item.parserKind !== 'agy' ||
+        item.complete === false ||
+        item.missingAt !== undefined ||
+        item.agyRescanRequired ||
+        !partialAgy.delete(item.file)
+      )
+        return null;
+      agyCompleteFiles.push(item);
+    }
+  }
+  return {
+    workspace,
+    parserGeneration,
+    files,
+    completeFiles,
+    ...(agyCompleteFiles.length ? { agyCompleteFiles } : {}),
+  };
 }

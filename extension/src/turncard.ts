@@ -1,3 +1,11 @@
+import {
+  AGY_COST_UNAVAILABLE,
+  agyTokenLines,
+  agyToolKind,
+  agyUsageDetail,
+  agyUsageFromTotals,
+  mergeAgyUsage,
+} from './agyhistory';
 import { wholePercent } from './view/tokens.ts';
 import { normalizeModelIdentity } from './domain/model-identity';
 import type { ChildExpiryAgent, ChildExpiryCost } from './childcacheexpiry';
@@ -592,6 +600,7 @@ export interface TurnCard {
 // Short agent names used on every card and session list row.
 // Model identities are separate and remain absent when the source omits them.
 export const AGENT_NAMES: Record<AgentKind, string> = {
+  agy: 'Antigravity',
   claude: 'Claude',
   codex: 'Codex',
 };
@@ -897,7 +906,11 @@ export function statusOf(turn: Turn | TurnOutcome, isLatest: boolean, now: numbe
   if (turn.interrupted) {
     return 'interrupted';
   }
-  if (turn.processEndedAt !== undefined) {
+  if (
+    turn.processEndedAt !== undefined ||
+    ('agent' in turn && turn.agent === 'agy') ||
+    ('recordedOnly' in turn && turn.recordedOnly)
+  ) {
     return 'stopped';
   }
   if (!isLatest) {
@@ -2329,6 +2342,7 @@ function turnOwnCost(turn: Turn): { own: number | null; exactOwn: SessionCostTot
 }
 
 export function turnCost(turn: Turn, agents?: Map<TurnAgent, AgentCost>): SessionCostTotal {
+  if (turn.agent === 'agy') return { dollars: null, partial: true };
   const { own, exactOwn } = turnOwnCost(turn);
   let dollars = own ?? 0;
   let priced = own !== null;
@@ -2490,6 +2504,7 @@ export function sessionCostUsageOf({ bucket, role, scopeId, agentName }: Session
     ...(bucket.unclassifiedCacheWrite ? { unclassifiedCacheWrite: bucket.unclassifiedCacheWrite } : {}),
     ...(bucket.incomplete ? { incomplete: true } : {}),
     ...(bucket.requestCountExact === false ? { requestCountExact: false as const } : {}),
+    ...(bucket.agyUsage ? { agyUsage: bucket.agyUsage } : {}),
     ...(bucket.compactionEstimate ? { compactionEstimate: true as const } : {}),
     ...(bucket.compactionUsage ? { compactionUsage: true as const } : {}),
     ...(bucket.waits ? { waits: bucket.waits } : {}),
@@ -3259,10 +3274,23 @@ function costDetailList(
   const expiryText = expiry ? cacheExpiryWarningText(expiry) : '';
   // The cache-expiry sentence follows the wait sentence as its own entry, so their dollars never add.
   const leading: StatDetailEntry[] = [
+    ...(turn.agent === 'agy'
+      ? [
+          {
+            label: AGY_COST_UNAVAILABLE,
+            lines: [...agyTokenLines(turn.agyUsage), agyUsageDetail(turn.agyUsage)],
+          },
+        ]
+      : []),
     ...waitWarnings.map((warning) => ({ label: waitShareText(warning, 'turn'), warning: true })),
     ...(expiryText ? [{ label: expiryText, warning: true }] : []),
   ];
-  const totalValue = totalLabel ? `${totalLabel}${total.partial ? '+' : ''}` : 'cost unavailable';
+  const totalValue =
+    turn.agent === 'agy'
+      ? AGY_COST_UNAVAILABLE
+      : totalLabel
+        ? `${totalLabel}${total.partial ? '+' : ''}`
+        : 'cost unavailable';
   const turnCategories = mainParts.length
     ? []
     : pricedUsageCategories(turn.usage, turn.model, turn.provider ?? null, turn.contextWindow);
@@ -4481,7 +4509,8 @@ function chipsOf(
   const shares = dispatched.map((cost) => dispatchedShare(turn, cost));
   const total = cardCostOf(turn, shares);
   // Keep a dispatched cost figure even when the parsed turn has no priced usage.
-  const cost = formatCost(total.dollars) ?? (shares.length ? ZERO_COST : null);
+  const cost =
+    turn.agent === 'agy' ? AGY_COST_UNAVAILABLE : (formatCost(total.dollars) ?? (shares.length ? ZERO_COST : null));
   if (cost) {
     const waitWarnings = waitShareWarnings(scopes[0]);
     const detailList = costDetailList(
@@ -4508,7 +4537,7 @@ function chipsOf(
     chips.push({
       kind: 'plain',
       metric: 'cost',
-      label: cost + (total.partial ? '+' : ''),
+      label: cost + (total.partial && turn.agent !== 'agy' ? '+' : ''),
       detail,
       detailList,
       ...(warnings.length
@@ -5563,7 +5592,9 @@ export function toCard(
         category:
           name === 'Skill'
             ? SKILL_STEP_KIND
-            : ((turn.agent === 'claude' ? CLAUDE_TOOL_KIND : CODEX_TOOL_KIND)[name] ?? 'other'),
+            : turn.agent === 'agy'
+              ? agyToolKind(name)
+              : ((turn.agent === 'claude' ? CLAUDE_TOOL_KIND : CODEX_TOOL_KIND)[name] ?? 'other'),
       }))
       .sort(mostCalledFirst),
     agents: agentCards,
@@ -5759,6 +5790,7 @@ export function composerRuntimeBySession(
 
 // Prices request groups with retained rate and tier facts, falling back to aggregate usage when absent.
 function factCost(turn: SessionFigureTurn, quotedAt?: number): SessionCostTotal {
+  if (turn.provider === 'agy') return { dollars: null, partial: true };
   const exact = turn.usageParts?.length
     ? sessionCostTotalOf(turn.usageParts.map((part) => priceSessionCost({ role: 'main', ...part, quotedAt })))
     : null;
@@ -5807,6 +5839,7 @@ function costStat(
 }
 
 export interface SessionCostUsage {
+  agyUsage?: Turn['agyUsage'];
   quotedAt?: number;
   usageOrigin?: UsageOrigin;
   linkedInvocationId?: string | null;
@@ -7051,7 +7084,32 @@ export function sessionCostProjection(
     [...unavailableUsageLines(unavailable), UNAVAILABLE_COST_NOTE].join('\n'),
   );
   if (!chip) {
-    return { stats: [], total };
+    return {
+      stats: parts.some((part) => part.agent === 'agy')
+        ? [
+            {
+              kind: 'plain',
+              metric: 'cost',
+              label: AGY_COST_UNAVAILABLE,
+              compactLabel: AGY_COST_UNAVAILABLE,
+              partial: true,
+              detail: agySessionUsageDetail(
+                parts
+                  .filter((part) => part.agent === 'agy')
+                  .reduce(
+                    (counts, part) =>
+                      mergeAgyUsage(
+                        counts,
+                        part.agyUsage ?? agyUsageFromTotals(part.usage, part.requestCountExact !== false),
+                      ),
+                    mainShort ? { incomplete: true } : {},
+                  ),
+              ),
+            },
+          ]
+        : [],
+      total,
+    };
   }
   if (unavailable.size > 0 || incomplete) {
     chip.partialDetail = unavailableUsageName(unavailable);
@@ -7438,6 +7496,10 @@ function sessionContextHover(detailList: StatDetailList): string {
   }).join('\n');
 }
 
+function agySessionUsageDetail(counts: NonNullable<Turn['agyUsage']>): string {
+  return [...agyTokenLines(counts), agyUsageDetail(counts)].join('\n');
+}
+
 function sessionFigureStats(
   turns: readonly SessionFigureTurn[],
   compactions: readonly SessionFigureCompaction[],
@@ -7461,6 +7523,15 @@ function sessionFigureStats(
   );
   if (cost) {
     chips.push(cost);
+  } else if (turns[0].provider === 'agy') {
+    chips.push({
+      kind: 'plain',
+      metric: 'cost',
+      label: AGY_COST_UNAVAILABLE,
+      compactLabel: AGY_COST_UNAVAILABLE,
+      partial: true,
+      detail: agySessionUsageDetail(turns.reduce((counts, turn) => mergeAgyUsage(counts, turn.agyUsage), {})),
+    });
   }
 
   const newest = turns.reduce((a, b) => (b.startedAt > a.startedAt ? b : a));

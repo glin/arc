@@ -1,3 +1,13 @@
+import {
+  readAgyHistoryPage,
+  createAgySessionReducer,
+  agyRetainedLine,
+  readAgySession,
+  readAgySessionAsync,
+  type AgyCheckpoint,
+  type AgyHistoryCursor,
+} from './agyhistory';
+import { sessionOutcomeOf, sessionStatFactsOf } from './transcript';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { readCodexContext } from './codexcontext';
@@ -43,6 +53,7 @@ import {
   createCodexSessionReducer,
   readCodexSessionMeta,
   openingRecordOf,
+  observeRolloutStat,
   codexSessionLineMayAffectRead,
   readCodexSessionTitlePair,
   readCodexTurnStarts,
@@ -151,6 +162,10 @@ import { admittedDispatchReferences } from './turnrail';
 import {
   CompressedStoreFollower,
   CompressedStoreHolder,
+  compareCompressedObservations,
+  compressedByteObservation,
+  compressedEntryCurrent,
+  compressedEntrySeed,
   postCompressedBatches,
   recordCompressedAdoption,
   recordCompressedNames,
@@ -643,6 +658,7 @@ let discoveryPosition = 0;
 let metadataRecovery: {
   file: string;
   sessionId: string;
+  agyRecovery?: number;
   work: ForwardReadOptions & { recovery: ForwardRecoveryControl };
   scan: Generator<void, IncrementalSessionResult<unknown>>;
 } | null = null;
@@ -919,60 +935,197 @@ function takeCompressedWriteBytes(): number {
 
 async function executeCompressedAdopt(
   request: Extract<ProgressiveRequest, { kind: 'compressed-adopt' }>,
+  signal: AbortSignal,
+  acknowledge?: (value: ProgressiveValue) => void,
 ): Promise<ProgressiveValue> {
-  const result = await recordCompressedAdoption(
-    request.adoption,
-    compressedHolder(request.stores.facts),
-    compressedHolder(request.stores.openings),
-  );
-  // No list of names follows a failed adoption, so its twin must reach the backfill here.
-  if (!result.adopted && result.durable)
-    compressedBackfills.get(request.stores.facts)?.noteAdoptionFailed(result.entry.file);
-  return {
-    kind: 'compressed-adopt',
-    adopted: result.adopted,
-    entry: result.entry,
-    durable: result.durable,
-    writeBytes: takeCompressedWriteBytes(),
+  const { twin } = request.adoption;
+  const runningFollower = compressedFollowers.get(request.stores.facts)?.follower;
+  const follower = runningFollower ?? new CompressedStoreFollower(request.stores.facts);
+  const settle = async (entry: import('./compressedstore').CompressedEntrySeed): Promise<ProgressiveValue> => {
+    const selected = await follower.adoptedEntry(entry, signal);
+    if (selected) compressedBackfills.get(request.stores.facts)?.noteAdoption(selected);
+    return {
+      kind: 'compressed-adopt',
+      adopted: true,
+      entry: selected ?? entry,
+      durable: !!selected,
+      ...(selected ? {} : { pending: true }),
+      writeBytes: takeCompressedWriteBytes(),
+    };
   };
+  const pending = request.pending;
+  if (pending?.file === twin && pending.adopted && pending.storeRecord) {
+    const stat = observeRolloutStat(twin);
+    if (stat === undefined) {
+      return { kind: 'compressed-adopt', adopted: true, entry: pending, durable: false, pending: true, writeBytes: 0 };
+    }
+    const current = follower.known().get(twin);
+    const held = compressedByteObservation(pending);
+    const latest = current && compressedEntryCurrent(current, stat) && compressedByteObservation(current);
+    const reobserved = held && latest && held.hash !== latest.hash && compareCompressedObservations(latest, held) > 0;
+    if (!reobserved && compressedEntryCurrent(pending, stat)) return settle(pending);
+  }
+  const facts = compressedHolder(request.stores.facts);
+  const result = await recordCompressedAdoption(request.adoption, facts, compressedHolder(request.stores.openings));
+  const record = facts.recordOf(result.entry);
+  const entry = record ? { ...result.entry, storeRecord: record } : result.entry;
+  if (!result.durable || !result.adopted || !record) {
+    if (result.durable && !result.adopted) compressedBackfills.get(request.stores.facts)?.noteAdoption(entry);
+    return {
+      kind: 'compressed-adopt',
+      adopted: result.adopted,
+      entry,
+      durable: result.durable && !result.adopted,
+      writeBytes: takeCompressedWriteBytes(),
+    };
+  }
+  compressedBackfills.get(request.stores.facts)?.noteAdoption(entry, true);
+  const saved = compressedEntrySeed(entry);
+  acknowledge?.({
+    kind: 'compressed-adopt',
+    adopted: true,
+    entry: saved,
+    durable: false,
+    pending: true,
+    writeBytes: 0,
+  });
+  return settle(saved);
 }
 
 // A worker keeps one follower per store. The first request of a worker reads the whole store, and a later request reads
 // only the bytes appended since.
-const compressedFollowers = new Map<string, CompressedStoreFollower>();
+interface CompressedFollow {
+  follower: CompressedStoreFollower;
+  owed: Map<string, import('./compressedstore').CompressedFactEntry>;
+  relocated: Map<string, import('./compressedstore').CompressedStoreRecord>;
+  spendRelocated: Map<string, import('./compressedstore').CompressedStoreRecord>;
+  lineage: Map<string, import('./compressedstore').CompressedLineage>;
+  running?: Promise<ProgressiveValue>;
+}
+
+const compressedFollowers = new Map<string, CompressedFollow>();
+
+let nextCompressedSpendRequest = 0;
+const compressedSpendRequests = new Map<
+  number,
+  (entry?: import('./compressedstore').CompressedFactEntry | null) => void
+>();
+
+function requestHeldCompressedSpend(
+  request: import('./compressedstore').CompressedSpendRequest,
+): Promise<import('./compressedstore').CompressedFactEntry | null | undefined> {
+  if (!parentPort) return Promise.resolve(undefined);
+  return new Promise((resolve) => {
+    const id = ++nextCompressedSpendRequest;
+    const settle = (entry?: import('./compressedstore').CompressedFactEntry | null) => {
+      clearTimeout(deadline);
+      compressedSpendRequests.delete(id);
+      resolve(entry);
+    };
+    const deadline = setTimeout(settle, 100);
+    deadline.unref();
+    compressedSpendRequests.set(id, settle);
+    parentPort!.postMessage({ compressedSpendRequest: { id, request } });
+  });
+}
 
 async function executeCompressedLoad(
   request: Extract<ProgressiveRequest, { kind: 'compressed-load' }>,
   signal: AbortSignal,
   acknowledge?: (value: ProgressiveValue) => void,
 ): Promise<ProgressiveValue> {
-  let follower = compressedFollowers.get(request.stores.facts);
-  if (!follower) {
-    follower = new CompressedStoreFollower(request.stores.facts);
-    compressedFollowers.set(request.stores.facts, follower);
+  let follow = compressedFollowers.get(request.stores.facts);
+  if (!follow) {
+    const follower = new CompressedStoreFollower(
+      request.stores.facts,
+      undefined,
+      undefined,
+      undefined,
+      requestHeldCompressedSpend,
+    );
     if (request.resume) follower.seed(request.resume);
+    follow = { follower, owed: new Map(), relocated: new Map(), spendRelocated: new Map(), lineage: new Map() };
+    compressedFollowers.set(request.stores.facts, follow);
   }
-  const polled = await follower.poll();
-  // An unreadable name stays in the reply, so a replaced worker keeps its mark. Other names reach the host only as paths.
-  const backfill = compressedBackfills.get(request.stores.facts);
-  const facts = polled.filter((entry) => (!entry.nameOnly || entry.unreadable) && !backfill?.published(entry));
-  const nameOnly = polled.filter((entry) => entry.nameOnly && !entry.unreadable).map((entry) => entry.file);
+  const previous = follow.running;
+  const running = previous
+    ? previous.catch(() => undefined).then(() => followCompressedLoad(follow, request, signal, acknowledge))
+    : followCompressedLoad(follow, request, signal, acknowledge);
+  follow.running = running;
+  try {
+    return await running;
+  } finally {
+    if (follow.running === running) follow.running = undefined;
+  }
+}
+
+async function followCompressedLoad(
+  { follower, owed, relocated, spendRelocated, lineage }: CompressedFollow,
+  request: Extract<ProgressiveRequest, { kind: 'compressed-load' }>,
+  signal: AbortSignal,
+  acknowledge?: (value: ProgressiveValue) => void,
+): Promise<ProgressiveValue> {
+  if (signal.aborted) return { kind: 'compressed-load', entries: [], done: false };
+  const polled = await follower.follow();
+  for (const entry of polled.entries) {
+    relocated.delete(entry.file);
+    owed.set(entry.file, entry);
+  }
+  for (const [file, record] of polled.relocated) relocated.set(file, record);
+  for (const [file, record] of polled.spendRelocated) spendRelocated.set(file, record);
+  for (const group of polled.lineage) lineage.set(group.file, group);
+  if (signal.aborted) return { kind: 'compressed-load', entries: [], done: false };
   const held = heldCompressedNames.get(request.stores.facts);
-  if (held) {
-    heldCompressedNames.delete(request.stores.facts);
-    noteCompressedNames(held, request.stores);
-  }
-  if (request.backfill) startCompressedBackfill(request.stores, request.backfill, follower);
-  const last = await postCompressedBatches(facts, signal, (batch) =>
-    acknowledge?.({ kind: 'compressed-load', entries: batch, done: false }),
+  const names = request.compressed ?? held;
+  if (names) noteCompressedNames(names, request.stores);
+  startCompressedBackfill(request, follower);
+  const worker = compressedBackfills.get(request.stores.facts);
+  const acceptedRepairs = request.repairs?.length ? worker?.acceptRepairs(request.repairs) : undefined;
+  const take = (batch: import('./compressedstore').CompressedFactEntry[]) => {
+    return batch.filter((entry) => {
+      if (worker?.awaitingPlacement(entry.file)) return false;
+      owed.delete(entry.file);
+      if (worker?.published(entry)) return false;
+      worker?.followed(entry);
+      return true;
+    });
+  };
+  const facts = [...owed.values()].filter(
+    (entry) => (!entry.nameOnly || entry.unreadable) && !worker?.awaitingPlacement(entry.file),
   );
+  const delivery = [...facts.map((entry) => ({ entry })), ...[...lineage.values()].map((group) => ({ group }))];
+  const takeBatch = (batch: typeof delivery) => {
+    const entries = take(batch.flatMap((item) => ('entry' in item ? [item.entry] : [])));
+    const groups = batch.flatMap((item) => ('group' in item ? [item.group] : []));
+    return { entries, ...(groups.length ? { lineage: groups } : {}) };
+  };
+  const last = await postCompressedBatches(delivery, signal, (batch) => {
+    if (acknowledge) acknowledge({ kind: 'compressed-load', ...takeBatch(batch), done: false });
+  });
+  if (signal.aborted) return { kind: 'compressed-load', entries: [], done: false };
+  const delivered = takeBatch(acknowledge ? last : delivery);
+  lineage.clear();
+  const nameOnly: string[] = [];
+  for (const [file, entry] of owed) {
+    if (!entry.nameOnly || entry.unreadable) continue;
+    nameOnly.push(file);
+    owed.delete(file);
+  }
+  const locations = [...relocated];
+  const spendLocations = [...spendRelocated];
+  relocated.clear();
+  spendRelocated.clear();
   return {
     kind: 'compressed-load',
-    entries: last,
+    ...delivered,
     done: true,
-    consumed: follower.offsets(),
+    ...(owed.size ? {} : { consumed: polled.offsets }),
     nameOnly,
-    ...(held ? { heldNamesRecorded: held.length } : {}),
+    ...(locations.length ? { relocated: locations } : {}),
+    ...(spendLocations.length ? { spendRelocated: spendLocations } : {}),
+    ...(held ? { heldNamesRecorded: names!.length } : {}),
+    ...(request.compressed ? { acceptedNames: true as const } : {}),
+    ...(acceptedRepairs?.length ? { acceptedRepairs } : {}),
   };
 }
 
@@ -992,24 +1145,29 @@ function backfillBusy(): boolean {
 }
 
 function startCompressedBackfill(
-  stores: import('./compressedstore').CompressedStorePaths,
-  start: { workspace: string; roots: string[]; launch: string },
+  request: Extract<ProgressiveRequest, { kind: 'compressed-load' }>,
   follower: CompressedStoreFollower,
 ): void {
+  const { stores, backfill: start, repairScope, placements } = request;
   let backfill = compressedBackfills.get(stores.facts);
   if (backfill) {
-    backfill.setRoots(start.roots);
+    if (repairScope !== undefined) backfill.setRepairScope(repairScope);
+    if (start) backfill.setRoots(start.roots);
     return;
   }
+  if (!start) return;
   backfill = new CompressedBackfill({
     facts: compressedHolder(stores.facts),
     openings: compressedHolder(stores.openings),
     workspace: start.workspace,
     roots: start.roots,
     launch: start.launch,
+    priorPlacements: repairScope === undefined ? undefined : placements,
     busy: backfillBusy,
     reading: readerWaits,
     known: () => follower.known(),
+    readKnown: (file) => follower.entry(file),
+    follower,
     inFolders: (roots) => folderMatcher([...roots]),
     post: (batch) => {
       parentPort?.postMessage({ compressedFacts: batch });
@@ -1018,6 +1176,7 @@ function startCompressedBackfill(
     },
   });
   compressedBackfills.set(stores.facts, backfill);
+  if (repairScope !== undefined) backfill.setRepairScope(repairScope);
   const names = compressedNames.get(stores.facts);
   if (names) backfill.setNames(names);
 }
@@ -1039,7 +1198,7 @@ function noteCompressedNames(
   // The record holds the worker for up to one slice, so it starts after the reply.
   setImmediate(() => {
     void recordCompressedNames(list, compressedHolder(stores.facts), {
-      known: compressedFollowers.get(stores.facts)?.known(),
+      known: compressedFollowers.get(stores.facts)?.follower.known(),
     }).then(() => {
       const bytes = takeCompressedWriteBytes();
       if (bytes) parentPort?.postMessage({ compressedStoreWrite: bytes });
@@ -1053,7 +1212,7 @@ async function execute(
   signal: AbortSignal,
   acknowledge?: (value: ProgressiveValue) => void,
 ): Promise<ProgressiveValue> {
-  if (request.kind === 'compressed-adopt') return executeCompressedAdopt(request);
+  if (request.kind === 'compressed-adopt') return executeCompressedAdopt(request, signal, acknowledge);
   if (request.kind === 'compressed-load') return executeCompressedLoad(request, signal, acknowledge);
   if (request.kind === 'codex-context') {
     if (isCompressedRollout(request.session.file)) return { kind: 'codex-context', estimate: null };
@@ -1073,7 +1232,11 @@ async function execute(
     if (metadataRecovery && metadataRecovery.sessionId !== request.session.sessionId) {
       return { kind: 'stale' };
     }
-    if (!metadataRecovery || metadataRecovery.file !== request.session.file) {
+    if (
+      !metadataRecovery ||
+      metadataRecovery.file !== request.session.file ||
+      metadataRecovery.agyRecovery !== request.agyRecovery
+    ) {
       const session = request.session;
       const control: ForwardRecoveryControl = {
         through: 0,
@@ -1081,9 +1244,12 @@ async function execute(
         retainedCharge: 0,
         retainedLimit: request.retainedBytes ?? 64 * 1024 * 1024,
         recordLimit: request.recordBytes ?? 16 * 1024 * 1024,
-        reduceAbove: request.reduceAboveBytes ?? 1024 * 1024,
-        accepts: session.agent === 'codex' ? codexSessionLineMayAffectRead : claudeSessionLineMayAffectRead,
-        ...(session.agent === 'codex' ? {} : { retain: claudeRetainedLine }),
+        reduceAbove: session.agent === 'agy' ? Infinity : (request.reduceAboveBytes ?? 1024 * 1024),
+        ...(session.agent === 'agy'
+          ? { retain: agyRetainedLine }
+          : session.agent === 'codex'
+            ? { accepts: codexSessionLineMayAffectRead }
+            : { accepts: claudeSessionLineMayAffectRead, retain: claudeRetainedLine }),
         fragments: [],
         fragmentBytes: 0,
       };
@@ -1091,18 +1257,21 @@ async function execute(
       metadataRecovery = {
         file: session.file,
         sessionId: session.sessionId,
+        agyRecovery: request.agyRecovery,
         work,
         scan: beginForwardSessionRecovery<unknown>(
           session.file,
           session.agent,
           session.sessionId,
           () =>
-            session.agent === 'codex'
-              ? createCodexSessionReducer(session.sessionId, { maxTurns: 40 }, request.opening ?? null)
-              : createClaudeSessionReducer(
-                  session.sessionId,
-                  withClaudeRepeated(session.file, { maxTurns: 40, childTranscript: session.childTranscript }),
-                ),
+            session.agent === 'agy'
+              ? createAgySessionReducer(session.file, session.sessionId, Number.MAX_SAFE_INTEGER)
+              : session.agent === 'codex'
+                ? createCodexSessionReducer(session.sessionId, { maxTurns: 40 }, request.opening ?? null)
+                : createClaudeSessionReducer(
+                    session.sessionId,
+                    withClaudeRepeated(session.file, { maxTurns: 40, childTranscript: session.childTranscript }),
+                  ),
           work,
         ),
       };
@@ -1514,6 +1683,7 @@ async function execute(
     const start = epoch.position % Math.max(1, rows.length);
     const ordered = [...rows.slice(start), ...rows.slice(0, start)];
     for (const [key, parent] of ordered) {
+      if (parent.agent === 'agy') continue;
       if (completed.has(key) || (epoch.protectedFile && key !== epoch.protectedFile)) continue;
       epoch.position = (rows.findIndex(([file]) => file === key) + 1) % Math.max(1, rows.length);
       const revision = seedMissing.delete(key) ? null : checkParent(parent.file);
@@ -2125,6 +2295,17 @@ async function execute(
     return { kind: 'stale', unread: true };
   }
   if (request.kind === 'starts') {
+    if (request.session.agent === 'agy') {
+      const { file, sessionId, size } = request.session;
+      const parsed = readAgySession(file, sessionId, { maxTurns: Number.MAX_SAFE_INTEGER });
+      return {
+        kind: 'starts',
+        starts: {
+          starts: parsed.read?.turns.map((turn) => turn.startedAt) ?? [],
+          whole: parsed.read !== null && parsed.read.readBytes === size,
+        },
+      };
+    }
     const starts =
       request.session.agent === 'claude'
         ? readSessionTurnStarts(request.session.file, undefined, request.session.childTranscript === true)
@@ -2140,6 +2321,30 @@ async function execute(
   if (request.kind === 'metadata') {
     const session = request.session;
     const tailBytes = request.tailBytes ?? 256 * 1024;
+    if (session.agent === 'agy') {
+      const { read } = readAgySession(session.file, session.sessionId, {
+        tailBytes,
+        maxTurns: Number.MAX_SAFE_INTEGER,
+      });
+      if (!read) return { kind: 'stale', unread: true };
+      const label = session.agyFirstPrompt ?? '';
+      return {
+        kind: 'metadata',
+        coverage: { whole: read.readBytes === session.size, windowBytes: tailBytes },
+        entry: {
+          sourceIdentity: { dev: session.dev ?? -1, ino: session.ino ?? -1 },
+          mtimeMs: session.mtimeMs,
+          size: session.size,
+          label,
+          fullLabel: label,
+          foldedLabel: label.toLocaleLowerCase(),
+          activityMs: read.turns.at(-1)?.endedAt ?? session.mtimeMs,
+          agentRun: false,
+          outcome: sessionOutcomeOf(read),
+          stats: sessionStatFactsOf(read),
+        },
+      };
+    }
     const meta =
       session.agent === 'claude'
         ? readSessionMeta(session.file, tailBytes, session.sessionId, session.childTranscript === true)
@@ -2183,6 +2388,37 @@ async function execute(
     maxTurns,
     tailBytes,
   } = request.input;
+  if (session.agent === 'agy' && request.kind === 'window') {
+    const checkpoint = revive(request.checkpoint) as AgyCheckpoint | undefined;
+    let result = await readAgySessionAsync(session.file, session.sessionId, maxTurns, tailBytes, checkpoint, {
+      signal,
+    });
+    if (result.read && !result.read.turns.length && result.checkpoint.coveredFrom > 0) {
+      const page = await readAgyHistoryPage(session.file, session.sessionId, null, { signal, targetTurns: 1 });
+      if (page.kind === 'page' && page.page.turns.length)
+        result = await readAgySessionAsync(
+          session.file,
+          session.sessionId,
+          maxTurns,
+          page.page.revision.size - page.page.ownedRange.start + 1,
+          undefined,
+          { signal },
+        );
+    }
+    if (!result.read) return { kind: 'stale' };
+    return {
+      kind: 'window',
+      read: result.read,
+      checkpoint: result.checkpoint,
+      reset: result.kind === 'reset',
+      appendFrom: result.appendFrom,
+      readBytes: result.readBytes,
+      agentKey: '',
+      structuralKey: '',
+      retainedBytes: Buffer.byteLength(JSON.stringify([result.read, result.checkpoint])),
+      checkpointBytes: Buffer.byteLength(JSON.stringify(result.checkpoint)),
+    };
+  }
   const claudeChildFor = (agent: AgentSpendRef) =>
     agent.toolUseId
       ? claudeChildren.find(
@@ -2275,7 +2511,7 @@ async function execute(
     const retained = request.pages.flatMap((page) => page.turns);
     retained.forEach((turn, index) => applyHiddenTurnFields(turn, request.hidden?.[index], session.agent === 'codex'));
     // Retained pages refresh together, and with the newest window when the host sends it last.
-    if (session.agent !== 'codex')
+    if (session.agent === 'claude')
       refreshRetainedClaudeAgentFacts(request.pages, agentSpendOf, agentSessionTargetOf, request.endsAtNewest === true);
     return {
       kind: 'retained',
@@ -2342,13 +2578,18 @@ async function execute(
             { signal, targetTurns: 20 },
             options,
           )
-        : await readCodexHistoryPageAsync(
-            session.file,
-            session.sessionId,
-            request.cursor as CodexHistoryCursor | null,
-            { signal, targetTurns: 20, ...bodyOptions },
-            options,
-          );
+        : session.agent === 'agy'
+          ? await readAgyHistoryPage(session.file, session.sessionId, request.cursor as AgyHistoryCursor | null, {
+              signal,
+              targetTurns: 20,
+            })
+          : await readCodexHistoryPageAsync(
+              session.file,
+              session.sessionId,
+              request.cursor as CodexHistoryCursor | null,
+              { signal, targetTurns: 20, ...bodyOptions },
+              options,
+            );
     if (result.kind === 'page') bindCommitSources(result.page.turns, session.file, sourceStamp);
     const body = compressed?.source.body;
     if (body && result.kind === 'page' && result.page.nextOlderCursor) {
@@ -3317,7 +3558,7 @@ async function handleMessage(message: {
     const metadataRequest =
       request.kind === 'metadata' ? { ...request, session: { ...request.session, ...before } } : null;
     if (
-      !metadataRequest &&
+      (!metadataRequest || requested.agent === 'agy') &&
       (before.size !== requested.size ||
         before.mtimeMs !== requested.mtimeMs ||
         ('dev' in requested && requested.dev !== before.dev) ||
@@ -3455,10 +3696,16 @@ parentPort?.on(
     releaseBody?: string;
     releaseStores?: boolean;
     compressedDecodeAck?: number;
+    compressedSpendReply?: { id: number; entry: import('./compressedstore').CompressedFactEntry | null };
     yieldDiscovery?: boolean;
   }) => {
     if (message.yieldDiscovery) {
       discoveryYield = true;
+      return;
+    }
+    if (message.compressedSpendReply) {
+      const { id, entry } = message.compressedSpendReply;
+      compressedSpendRequests.get(id)?.(entry);
       return;
     }
     if (message.compressedDecodeAck !== undefined) {
@@ -3471,6 +3718,7 @@ parentPort?.on(
       return;
     }
     if (message.releaseStores) {
+      for (const settle of compressedSpendRequests.values()) settle();
       for (const holder of compressedHolders.values()) holder.dispose();
       compressedHolders.clear();
       compressedFollowers.clear();
