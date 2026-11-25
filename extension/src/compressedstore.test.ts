@@ -13,6 +13,8 @@ import {
   compressedEntryCurrent,
   compressedEntrySeed,
   compressedEntryVersions,
+  compressedSpendOrigin,
+  heldCompressedSpend,
   CompressedStoreFollower,
   CompressedStoreHolder,
   COMPRESSED_FACTS_VERSION,
@@ -1147,6 +1149,32 @@ test('a stepped read of the store yields after every file', async () => {
   assert.ok(yields >= 3, `${yields} yields across 3 files`);
 });
 
+test('a resumed follower refuses changed facts at the same path and saved address', async () => {
+  const directory = tempDir('store-record-ref-');
+  const file = 'rollout.jsonl.zst';
+  const row = { ...entry(file), carriedName: { label: 'Before', fullLabel: 'Before' } };
+  const ledger = path.join(directory, 'segment-1-holder-0');
+  const line = JSON.stringify(row) + '\n';
+  fs.writeFileSync(ledger, line + JSON.stringify(entry('unrelated.jsonl.zst')) + '\n');
+  const follower = new CompressedStoreFollower(directory, () => null);
+  const [accepted] = await follower.poll();
+  assert.equal(accepted.storeRecord?.bytes, Buffer.byteLength(line));
+  const resumed = new CompressedStoreFollower(directory, () => null);
+  resumed.seed({ consumed: follower.offsets(), entries: [compressedEntrySeed(accepted)] });
+  assert.deepEqual(await resumed.poll(), []);
+  assert.equal(resumed.bytesRead, 0);
+  assert.deepEqual(resumed.entry(file), accepted);
+  const replacement = line.replaceAll('Before', 'Change');
+  assert.equal(Buffer.byteLength(replacement), Buffer.byteLength(line));
+  const fd = fs.openSync(ledger, 'r+');
+  try {
+    fs.writeSync(fd, replacement, 0);
+  } finally {
+    fs.closeSync(fd);
+  }
+  assert.equal(resumed.entry(file), undefined, 'the address supplied a different record for the same path');
+});
+
 test('a follower reads only the bytes appended since its last poll and a compaction repeats no entry', async () => {
   const { directory, clock, make, names } = storeFixture('store-follow', {
     segmentBytes: 4096,
@@ -1252,8 +1280,19 @@ test('a marked derivation never replaces a higher spend record and takes the mar
       file: 'x',
       buckets: [{ requests: dollars, reportedCost: dollars, reportedCostBasis: 'list' }],
     }) as unknown as SpendFileIndex;
-  const previous = entry('x', { spend: spend(7), undercount: false });
-  const marked = entry('x', { spend: spend(3), undercount: true });
+  const fileIdentity = { dev: '1', ino: '9007199254740997' };
+  const previous = entry('x', {
+    adopted: false,
+    fileIdentity,
+    spend: { ...spend(7), sourceIdentity: '1:9007199254740997' },
+    undercount: false,
+  });
+  const marked = entry('x', {
+    adopted: false,
+    fileIdentity,
+    spend: { ...spend(3), sourceIdentity: '1:9007199254740997' },
+    undercount: true,
+  });
   const kept = withKeptUndercount(previous, marked);
   assert.equal(kept.spend, previous.spend);
   assert.equal(kept.undercount, true);
@@ -1265,6 +1304,373 @@ test('a marked derivation never replaces a higher spend record and takes the mar
     unmarked.spend,
     'an unmarked derivation kept the old total',
   );
+});
+
+test.each([false, true])(
+  'a resumed compressed contributor survives compaction and a later authoritative decrease: legacy compaction %s',
+  async (legacy) => {
+    const store = storeFixture('store-compact-spend-');
+    const file = 'rollout.jsonl.zst';
+    const fileIdentity = { dev: '1', ino: '29' };
+    const revision = (mtimeMs: number, dollars: number, undercount = false) => {
+      const spend = {
+        file: file.replace(/\.zst$/, ''),
+        sourceIdentity: '1:29',
+        size: 100,
+        mtimeMs,
+        buckets: [{ requests: dollars, reportedCost: dollars, reportedCostBasis: 'list' }],
+      } as unknown as SpendFileIndex;
+      const hash = 'revision-' + mtimeMs;
+      return entry(file, {
+        mtimeMs,
+        fileIdentity,
+        hash,
+        adopted: false,
+        spend,
+        undercount,
+        spendOrigin: compressedSpendOrigin('t', spend, hash),
+      });
+    };
+    const higher = revision(1, 7);
+    const lower = revision(2, 3, true);
+    const segment = path.join(store.directory, 'segment-1-peer-0');
+    fs.writeFileSync(segment, [higher, lower].map((value) => JSON.stringify(value) + '\n').join(''));
+    const first = new CompressedStoreFollower(
+      store.directory,
+      () => null,
+      async () => {},
+    );
+    const [envelope] = await first.poll();
+    assert.equal(envelope.storeRecord?.input, path.basename(segment));
+    assert.ok(envelope.spendWitness);
+    assert.notEqual(envelope.spendWitness.digest, envelope.storeRecord?.digest);
+    const high = { ...higher, storeRecord: envelope.spendWitness };
+    const host = withKeptUndercount(high, envelope);
+    assert.equal(host.spend, high.spend);
+    assert.equal(host.spendRecord, high.storeRecord);
+    assert.equal(host.storeRecord, envelope.storeRecord);
+    const consumed = first.offsets();
+    if (legacy) {
+      const shard = 'shard-2-old-0';
+      fs.writeFileSync(path.join(store.directory, shard), JSON.stringify(lower) + '\n');
+      fs.writeFileSync(
+        path.join(store.directory, 'manifest-2-old-1'),
+        JSON.stringify({
+          factsVersion: 1,
+          epoch: 2,
+          token: 'old',
+          seq: 1,
+          shards: [shard],
+          inputs: [path.basename(segment)],
+        }),
+      );
+      fs.unlinkSync(segment);
+    }
+    let requested = 0;
+    const resumed = new CompressedStoreFollower(
+      store.directory,
+      () => null,
+      async () => {},
+      undefined,
+      async (request) => {
+        if (request.record.digest !== host.spendRecord?.digest) return null;
+        requested++;
+        return heldCompressedSpend(host, request) ?? null;
+      },
+    );
+    resumed.seed({ consumed, entries: [compressedEntrySeed(host)] });
+    const holder = store.make();
+    try {
+      const carried = await holder.appendCarryingFacts(revision(3, 2, true), () => true, resumed);
+      assert.equal(fs.existsSync(segment), false, 'recovery did not compact the witness out of its old location');
+      assert.ok(resumed.contributorBytesRead > 0);
+      assert.deepEqual(carried?.spend, higher.spend);
+      assert.equal(requested, legacy ? 1 : 0, 'a surviving durable line did not answer the spend request');
+      assert.deepEqual(readCompressedStore(store.directory).entries.get(file)?.spend, higher.spend);
+      assert.deepEqual(await holder.append([revision(4, 1)]), [true]);
+      const decreased = await holder.appendCarryingFacts(revision(5, 0, true), () => true, resumed);
+      assert.deepEqual(decreased?.spend, revision(4, 1).spend, 'a marked write revived a superseded higher amount');
+    } finally {
+      holder.dispose();
+    }
+  },
+);
+
+test.each([
+  'complete decrease',
+  'coalesced decrease',
+  'current compaction',
+  'legacy compaction',
+  'carried old amount',
+] as const)('a compressed follower preserves applicable spend after %s', async (transition) => {
+  const store = storeFixture('store-spend-authority-');
+  const file = 'rollout.jsonl.zst';
+  const fileIdentity = { dev: '1', ino: '29' };
+  const revision = (mtimeMs: number, dollars: number, undercount = false) => {
+    const spend = {
+      file: file.replace(/\.zst$/, ''),
+      sourceIdentity: '1:29',
+      size: 100,
+      mtimeMs,
+      buckets: [{ requests: dollars, reportedCost: dollars, reportedCostBasis: 'list' }],
+    } as unknown as SpendFileIndex;
+    const hash = 'revision-' + mtimeMs;
+    return entry(file, {
+      mtimeMs,
+      fileIdentity,
+      hash,
+      adopted: false,
+      spend,
+      undercount,
+      spendOrigin: compressedSpendOrigin('t', spend, hash),
+    });
+  };
+  const firstWriter = store.make();
+  const peer = store.make();
+  const writer = store.make();
+  let host: CompressedFactEntry | undefined;
+  const requested: string[] = [];
+  const follower = () =>
+    new CompressedStoreFollower(
+      store.directory,
+      () => null,
+      async () => {},
+      undefined,
+      async (request) => {
+        requested.push(request.record.digest);
+        return heldCompressedSpend(host, request) ?? null;
+      },
+    );
+  try {
+    const seven = revision(1, 7);
+    assert.deepEqual(await firstWriter.append([seven]), [true]);
+    const live = follower();
+    const [published] = await live.poll();
+    assert.deepEqual(published.spend, seven.spend);
+    host = published;
+    const ref = published.storeRecord!;
+    firstWriter.dispose();
+
+    const marked = revision(3, 2, true);
+    const decreases = transition !== 'legacy compaction';
+    let reader = live;
+    if (decreases) {
+      reader = follower();
+      reader.seed({ consumed: live.offsets(), entries: [compressedEntrySeed(published)] });
+      const complete = revision(2, 1);
+      const carriesOld = transition === 'carried old amount';
+      const successor = carriesOld ? withKeptUndercount(seven, marked) : marked;
+      const writes = [complete, successor];
+      if (transition === 'current compaction') {
+        const { spendOrigin: _ignored, ...legacy } = revision(3.5, 99, true);
+        writes.push(legacy);
+      }
+      assert.deepEqual(
+        await peer.append(writes),
+        writes.map(() => true),
+      );
+      peer.dispose();
+      if (transition === 'coalesced decrease' || carriesOld) {
+        const [envelope] = await reader.poll();
+        const expected = carriesOld ? complete.spend : marked.spend;
+        assert.deepEqual(envelope.spend, expected, 'the reply carried a superseded amount');
+        host = withKeptUndercount(published, envelope);
+        assert.deepEqual(host.spend, expected, 'the first coalesced reply revived the old host amount');
+        const restarted = follower();
+        restarted.seed({ consumed: reader.offsets(), entries: [compressedEntrySeed(host)] });
+        reader = restarted;
+      }
+    } else {
+      const shard = 'shard-2-old-0';
+      const { spendOrigin: _ignored, ...legacy } = marked;
+      fs.writeFileSync(path.join(store.directory, shard), JSON.stringify(legacy) + '\n');
+      fs.writeFileSync(
+        path.join(store.directory, 'manifest-2-old-1'),
+        JSON.stringify({ factsVersion: 1, epoch: 2, token: 'old', seq: 1, shards: [shard], inputs: [ref.input] }),
+      );
+      fs.unlinkSync(path.join(store.directory, ref.input));
+    }
+    const found = await writer.appendCarryingFacts(
+      revision(4, transition === 'carried old amount' ? 0 : 1, true),
+      () => true,
+      reader,
+    );
+    const expected = !decreases ? seven : transition === 'carried old amount' ? revision(2, 1) : marked;
+    assert.deepEqual(found?.spend, expected.spend, 'the durable amount did not follow complete source evidence');
+    assert.deepEqual(readCompressedStore(store.directory).entries.get(file)?.spend, expected.spend);
+    if (decreases) {
+      assert.ok(!requested.includes(ref.digest), 'the replaced complete amount was requested again');
+      const followed = (await reader.poll()).find((item) => item.file === file);
+      assert.ok(followed);
+      assert.deepEqual(
+        withKeptUndercount(host, followed).spend,
+        expected.spend,
+        'delivery revived the old host amount',
+      );
+      if (transition === 'current compaction')
+        assert.ok(!fs.existsSync(path.join(store.directory, ref.input)), 'the holder did not compact its inputs');
+    } else {
+      assert.deepEqual(requested, [ref.digest], 'the live contributor did not get one exact lookup');
+    }
+  } finally {
+    writer.dispose();
+    peer.dispose();
+    firstWriter.dispose();
+  }
+});
+
+test('a refused current facts input delays a conditional append without losing other writes', async () => {
+  const store = storeFixture('store-refused-cover-');
+  const file = 'rollout.jsonl.zst';
+  const input = 'segment-1-peer-0';
+  const at = '_facts_' + input;
+  const line = JSON.stringify(entry(file)) + '\n';
+  const manifest = { factsVersion: 1, epoch: 0, token: 'fixture', seq: 0, shards: [], inputs: [] };
+  fs.writeFileSync(path.join(store.directory, 'manifest-0-fixture-0'), JSON.stringify(manifest));
+  fs.writeFileSync(path.join(store.directory, input), line + line.slice(0, 13));
+  let refused = true;
+  const follower = new CompressedStoreFollower(
+    store.directory,
+    () => null,
+    async () => {},
+    (name) => {
+      if (refused && path.basename(name) === input) throw Object.assign(new Error(at), { code: 'EACCES' });
+      return fs.openSync(name, 'r');
+    },
+  );
+  const holder = store.make();
+  try {
+    const proposal = entry(file, { mtimeMs: 2_000, unreadable: true, nameOnly: true });
+    const pending = holder.appendCarryingFacts(proposal, () => true, follower);
+    const ready = entry('other.jsonl.zst');
+    assert.deepEqual(await holder.append([ready]), [true]);
+    assert.equal(holder.held, false);
+    assert.equal(holder.pending, 1);
+    assert.equal(follower.bytesRead, 0);
+    assert.notEqual(readCompressedStore(store.directory).entries.get(file)?.mtimeMs, proposal.mtimeMs);
+    refused = false;
+    store.clock.advance(5_000);
+    const written = await pending;
+    assert.equal(written?.mtimeMs, proposal.mtimeMs);
+    const [end] = follower.offsets().filter(([name]) => name === input);
+    assert.deepEqual(end, [input, Buffer.byteLength(line)], 'an unfinished line advanced the durable cursor');
+  } finally {
+    holder.dispose();
+  }
+});
+
+test('a marked replacement never inherits spend from the previous owner of its pathname', () => {
+  const spend = (dollars: number, ino: string) =>
+    ({
+      file: 'x',
+      sourceIdentity: '1:' + ino,
+      buckets: [{ requests: dollars, reportedCost: dollars, reportedCostBasis: 'list' }],
+    }) as unknown as SpendFileIndex;
+  const previous = entry('x', { adopted: false, fileIdentity: { dev: '1', ino: '29' }, spend: spend(7, '29') });
+  for (const [threadId, ino] of [
+    ['replacement', '29'],
+    ['t', '30'],
+    ['replacement', '30'],
+  ]) {
+    const replacement = entry('x', {
+      adopted: false,
+      threadId,
+      fileIdentity: { dev: '1', ino },
+      spend: spend(3, ino),
+      undercount: true,
+    });
+    assert.equal(withKeptUndercount(previous, replacement).spend, replacement.spend);
+  }
+});
+
+test('an adopted higher total keeps its plain identity through an incomplete decode', () => {
+  const source = { dev: '1', ino: '9007199254740997' };
+  const record = (dollars: number, sourceIdentity: string) =>
+    ({
+      file: 'x',
+      sourceIdentity,
+      buckets: [{ requests: dollars, reportedCost: dollars, reportedCostBasis: 'list' }],
+    }) as unknown as SpendFileIndex;
+  const adopted = entry('x', { fileIdentity: source, spend: record(7, '1:29') });
+  const next = entry('x', {
+    adopted: false,
+    fileIdentity: source,
+    spend: record(3, '1:9007199254740997'),
+    undercount: true,
+  });
+  const kept = withKeptUndercount(adopted, next);
+  assert.equal(kept.spend, adopted.spend);
+  assert.equal(kept.spendOrigin?.sourceIdentity, '1:29');
+  const current = { size: 100, mtimeMs: 1_000, ...source };
+  assert.equal(compressedEntryCurrent(kept, current), true);
+  assert.equal(compressedEntryCurrent(compressedEntrySeed(kept), current), true);
+  const mixed = { ...next, spend: adopted.spend };
+  assert.equal(compressedEntryCurrent(mixed, current), false);
+  assert.equal(compressedEntryCurrent(compressedEntrySeed(mixed), current), false);
+  const { fileIdentity: _identity, ...legacyOrdinary } = next;
+  assert.equal(compressedEntryCurrent(compressedEntrySeed(legacyOrdinary), current), true);
+  assert.equal(compressedEntryCurrent(compressedEntrySeed(legacyOrdinary), { ...current, ino: '29' }), false);
+  const { fileIdentity: _twin, ...legacyAdoption } = adopted;
+  assert.equal(compressedEntrySeed(legacyAdoption).fileIdentity, undefined);
+});
+
+test('a same-inode base-format marked total remains unverified after a cold store read', () => {
+  const { directory } = storeFixture('legacy-marked-spend');
+  const sourceIdentity = '1:29';
+  const legacy = entry('x', {
+    adopted: false,
+    threadId: 'replacement',
+    fileIdentity: { dev: '1', ino: '29' },
+    opening: { sessionId: 'replacement', cwd: '/repo' } as CompressedFactEntry['opening'],
+    decodedLength: 300,
+    undercount: true,
+    spend: { file: 'x', sourceIdentity, buckets: [] } as unknown as SpendFileIndex,
+  });
+  fs.writeFileSync(path.join(directory, 'segment-1-holder-0'), JSON.stringify(legacy) + '\n');
+  const loaded = readCompressedStore(directory).entries.get(legacy.file)!;
+  assert.equal(loaded.spend, undefined, 'the old total became the replacement session cost');
+  assert.equal(loaded.opening?.sessionId, 'replacement');
+  assert.equal(
+    compressedEntryCurrent(compressedEntrySeed(loaded), { size: 100, mtimeMs: 1_000, dev: '1', ino: '29' }),
+    false,
+  );
+});
+
+test('a byte-identical compressed copy keeps the verified historical spend and a current envelope', () => {
+  const { directory } = storeFixture('compressed-copy-spend');
+  const spend = (dollars: number, ino: string) =>
+    ({
+      file: 'x',
+      sourceIdentity: '1:' + ino,
+      buckets: [{ requests: dollars, reportedCost: dollars, reportedCostBasis: 'list' }],
+    }) as unknown as SpendFileIndex;
+  const ordinary = (ino: string, hash: string, amount: number, undercount = false) =>
+    entry('x', {
+      adopted: false,
+      fileIdentity: { dev: '1', ino },
+      hash,
+      decodedLength: 300,
+      undercount,
+      spend: spend(amount, ino),
+    });
+  const first = ordinary('29', 'original', 7);
+  const rewritten = withKeptUndercount(first, ordinary('29', 'marked', 3, true));
+  const copied = withKeptUndercount(rewritten, ordinary('30', 'marked', 3, true));
+  fs.writeFileSync(path.join(directory, 'segment-1-holder-0'), JSON.stringify(copied) + '\n');
+  const loaded = readCompressedStore(directory).entries.get('x')!;
+  assert.equal(
+    compressedEntryCurrent(loaded, { size: 100, mtimeMs: 1_000, dev: '1', ino: '30' }),
+    true,
+    'historical spend invalidated the copied rollout row',
+  );
+  assert.equal(loaded.spend?.sourceIdentity, first.spend?.sourceIdentity);
+  assert.deepEqual(loaded.spend, first.spend);
+  const copiedAgain = withKeptUndercount(loaded, ordinary('31', 'marked', 3, true));
+  assert.equal(
+    compressedEntryCurrent(compressedEntrySeed(copiedAgain), { size: 100, mtimeMs: 1_000, dev: '1', ino: '31' }),
+    true,
+  );
+  assert.deepEqual(copiedAgain.spend, first.spend);
 });
 
 const THREAD = '01a032c9-1a92-7931-845c-723117d24dbe';
