@@ -820,6 +820,25 @@ test('ID shorthand resolves unions and collisions against complete catalog ident
     assert.ok(!sessionQueryNeedsShorthand(query));
 });
 
+test('Antigravity ID prefixes work across the accepted catalog and under provider qualification', () => {
+  const prefix = '3352f6ae';
+  const rows = [
+    { id: prefix + '-5337-44ed-a42a-df1b4d26bbc8', agent: 'Antigravity', label: 'Antigravity session' },
+    { id: prefix + '-dec0-4ed0-8fbd-df1b4d26bbc8', agent: 'Claude', label: 'Claude session' },
+  ];
+  const context: SessionQueryContext = {
+    identities: rows.map(({ id, agent }) => ({ sessionId: id, agent })),
+    coverage: 'complete',
+    scope: 'project',
+    revision: '1',
+  };
+
+  assert.deepEqual(matchSessions(rows, 'id:' + prefix, context), rows);
+  assert.deepEqual(resolveSessionQuery('id:' + prefix, context).notes, [prefix + ' matches 2 sessions.']);
+  assert.deepEqual(matchSessions(rows, 'session:agy:' + prefix, context), [rows[0]]);
+  assert.deepEqual(matchSessions(rows, 'id:' + prefix + ' -id:agy:' + prefix, context), [rows[1]]);
+});
+
 test('unknown agent-run classification matches neither polarity', () => {
   const rows = [{ id: 'unknown', agent: 'Claude', label: 'unknown', runByAgent: null }];
   assert.deepEqual(matchSessions(rows, 'is:agentrun'), []);
