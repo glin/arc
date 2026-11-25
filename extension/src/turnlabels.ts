@@ -304,13 +304,14 @@ export function labelEditorReply(
   session: string,
   opener: string,
   browserSession: string = session,
+  headingSession: string = session,
 ): {
   type: 'labelEditor';
   session: string;
   heading: string;
   rows: (LabelCount & { applied: boolean })[];
 } {
-  const title = sessions.find((row) => row.id === session)?.label ?? session;
+  const title = sessions.find((row) => row.id === headingSession)?.label ?? session;
   return {
     type: 'labelEditor',
     session: browserSession,

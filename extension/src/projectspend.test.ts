@@ -1745,6 +1745,78 @@ test('persistence keeps the last complete display ledger apart from resumable sc
   assert.equal(resumed.record.buckets[0].requests, 2);
 });
 
+test.each(['return', 'displaced', 'display reference', 'legacy display'] as const)(
+  'Antigravity historical attribution survives a checkpoint with an inferred kind in %s',
+  (shape) => {
+    const folder = dir();
+    const source = path.join(folder, 'agy.jsonl');
+    const oldAgent = path.join(folder, 'other.jsonl');
+    const historical = (output: number) => {
+      const accounted = aggregateUsageEvents([{ ...event(stamp('2026-08-31T10:00:00')), agent: 'agy' }]);
+      const buckets = accounted.map((bucket) => ({ ...bucket, usage: { ...bucket.usage, output } }));
+      return spendRecord(source, {
+        parserGeneration: PROJECT_SPEND_PARSER_GENERATIONS.agy,
+        parserState: { untrusted: true },
+        buckets,
+        lifetimeBuckets: buckets,
+      });
+    };
+    const complete = historical(3);
+    const unrelated = spendRecord(oldAgent, { parserKind: 'claude' });
+    const working =
+      shape === 'return'
+        ? { ...complete, agyRescanRequired: true as const }
+        : shape === 'displaced'
+          ? { ...historical(7), complete: false as const }
+          : complete;
+    const display = shape === 'displaced' ? historical(2) : working;
+    const ledger = {
+      workspace: complete.workspace,
+      files: [working, unrelated],
+      ...(shape === 'legacy display'
+        ? { completeFiles: [complete, unrelated] }
+        : { displayFiles: [display === working ? 0 : display, 1] }),
+      ...(shape === 'displaced' ? { agyCompleteFiles: [complete] } : {}),
+    };
+    saveSpendLedger(folder, 'one', []);
+    fs.writeFileSync(path.join(folder, ledgerName(folder)), JSON.stringify(ledger));
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const loaded = loadSpendLedger(folder, 'one');
+      assert.deepEqual(
+        loaded.files.map((record) => record.file),
+        [working.file, unrelated.file],
+      );
+      for (const record of [loaded.files[0], loaded.completeFiles[0], ...(loaded.agyCompleteFiles ?? [])]) {
+        assert.equal(record.parserKind, 'agy');
+        assert.equal(record.parserState, undefined);
+        assert.equal(record.parserGeneration, undefined);
+      }
+      assert.equal(loaded.files[0].lifetimeBuckets?.[0].usage.output, shape === 'displaced' ? 7 : 3);
+      assert.equal(loaded.completeFiles[0].lifetimeBuckets?.[0].usage.output, shape === 'displaced' ? 2 : 3);
+      assert.equal(
+        loaded.agyCompleteFiles?.[0].lifetimeBuckets?.[0].usage.output,
+        shape === 'displaced' ? 3 : undefined,
+      );
+      assert.equal(loaded.files[0].agyRescanRequired, shape === 'return' ? true : undefined);
+      assert.deepEqual(loaded.files[1], unrelated);
+      saveSpendLedger(folder, 'one', loaded.files, loaded.completeFiles, loaded.agyCompleteFiles);
+    }
+    saveSpendLedger(
+      folder,
+      'one',
+      [working, unrelated],
+      [display, unrelated],
+      shape === 'displaced' ? [complete] : undefined,
+    );
+    const written = loadSpendLedger(folder, 'one');
+    assert.deepEqual(
+      written.files.map((record) => record.file),
+      [working.file, unrelated.file],
+    );
+    assert.equal(written.files[0].parserState, undefined);
+  },
+);
+
 test('a ledger save writes the whole ledger in pieces under 1 MiB', () => {
   const folder = dir();
   // Multi-byte text and records longer than one write, with surrogate pairs at both parities.
@@ -2002,7 +2074,10 @@ test('a second compression shows the plain $10 before the backfill decode and th
 
 test('a twin of another thread joins nothing and the plain record counts as it did', () => {
   const plain = dollarRecord('rollout-c.jsonl', 5);
-  const other = compressedCandidate('rollout-other.jsonl', 9, { threadId: 'other-thread' });
+  const other = compressedCandidate(plain.file, 9, {
+    threadId: 'other-thread',
+    spend: dollarRecord(plain.file + '.zst', 9),
+  });
   const shown = compressedSpendDisplayFiles([plain], [other], () => 'this-thread');
   assert.deepEqual(
     shown.map((record) => record.file).sort(),
