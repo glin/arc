@@ -141,8 +141,11 @@ export function unreadHeadBytes(
   return SESSION_HEAD_BYTES - HEAD_KEY_BYTES;
 }
 
-export type ProgressiveCheckpoint = ClaudeForwardCheckpoint | CodexForwardCheckpoint;
-export type ProgressiveCursor = ClaudeHistoryCursor | CodexHistoryCursor;
+export type ProgressiveCheckpoint =
+  | ClaudeForwardCheckpoint
+  | CodexForwardCheckpoint
+  | import('./agyhistory').AgyCheckpoint;
+export type ProgressiveCursor = ClaudeHistoryCursor | CodexHistoryCursor | import('./agyhistory').AgyHistoryCursor;
 export interface ProgressiveInput {
   session: SessionFile;
   folders: string[];
@@ -443,6 +446,9 @@ export type ProgressiveRequest =
       backfill?: { workspace: string; roots: string[]; launch: string };
       // Offsets and entries that a new worker takes in place of reading the whole store.
       resume?: import('./compressedstore').CompressedLoadResume;
+      repairs?: import('./compressedrollouts').CompressedRepair[];
+      repairScope?: number;
+      compressed?: string[];
     }
   | { kind: 'metadata'; session: SessionFile; opening?: CodexSessionMeta | null; tailBytes?: number }
   | {
@@ -451,6 +457,7 @@ export type ProgressiveRequest =
       opening?: CodexSessionMeta | null;
       sliceBytes: number;
       eligible: string[];
+      agyRecovery?: number;
       retainedBytes?: number;
       recordBytes?: number;
       reduceAboveBytes?: number;
@@ -486,6 +493,8 @@ export type ProgressiveValue =
       nameOnly?: string[];
       // On the final reply: the size of the list that waited for this first load, which the worker now records.
       heldNamesRecorded?: number;
+      acceptedRepairs?: import('./compressedrollouts').CompressedRepair[];
+      acceptedNames?: true;
     }
   | { kind: 'codex-context'; estimate: import('./codexcontext').CodexContextResult | null }
   | {

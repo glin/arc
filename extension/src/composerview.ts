@@ -1354,7 +1354,7 @@ export interface PromptDelivery {
   session?: string;
 }
 
-const LAUNCH_AGENTS: readonly AgentKind[] = ['claude', 'codex'];
+const LAUNCH_AGENTS = ['claude', 'codex'] as const;
 // The inherited row names its source because it sits outside the titled sections.
 const INHERITED_SOURCE_NAME = 'Inherited';
 const PINNED_HEADING = 'Pinned setups';
@@ -1472,7 +1472,7 @@ function inheritedProfile(state: ComposerState): SessionProfile {
   const model = state.profile ? state.profile.model : (settledValue(state) ?? state.settings.selectedModel);
   const effort = state.settings.selectedEffort || state.settings.confirmedEffort || '';
   return {
-    agent: state.agent,
+    agent: state.agent as SessionProfile['agent'],
     model,
     effort:
       !model && !state.profile && !state.settings.selectedEffort
@@ -1499,9 +1499,10 @@ export function sessionLauncherView(
   owner?: string,
 ): SessionLauncherView {
   const agents = launchAgents(models, defaults, pending);
-  const inherited = current
-    ? launchProfileRow('current', 'inherited', inheritedProfile(current), models, null, current.defaults)
-    : null;
+  const inherited =
+    current && current.agent !== 'agy'
+      ? launchProfileRow('current', 'inherited', inheritedProfile(current), models, null, current.defaults)
+      : null;
   const recentRow = (profile: SessionProfile, index: number) =>
     launchProfileRow(
       `recent:${index}`,
@@ -1594,7 +1595,7 @@ export function launcherProfile(view: SessionLauncherView, request: LauncherRequ
     return null;
   }
   return {
-    agent: choice.agent as AgentKind,
+    agent: choice.agent as SessionProfile['agent'],
     model: choice.model,
     effort: choice.effort,
     permissionMode: choice.permissionMode,

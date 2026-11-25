@@ -19,7 +19,9 @@ import { bundledTools } from '../../extension/scripts/bundled-tools.mjs';
 import { readSkillPayload, skillTemporaryRoots } from '../src/skillfiles.ts';
 import { operateSkill } from '../src/skills.ts';
 import { shellQuote } from '../src/standalone.ts';
+import { runCost } from '../src/cost.ts';
 import { runCollect } from '../src/collect.ts';
+import { runSessions } from '../src/sessions.ts';
 import { SESSION_PAGE_ERRORS } from '../../extension/src/sessionreads.ts';
 import {
   skillFiles,
@@ -32,6 +34,86 @@ import {
   expectedVersion,
   smokeEnv,
 } from './smoke-fixture.ts';
+
+test('mixed-provider listings retain all rows and Antigravity turns reach each reading command', async () => {
+  const providers = ['claude', 'codex', 'agy'];
+  const rows = providers.map((provider) =>
+    collectRow(provider, provider, {
+      provider,
+      path: null,
+      name: provider,
+      setup: { model: null, effort: null, source: 'unavailable' },
+      labels: [],
+      pinned: false,
+      archived: false,
+      runStatus: 'none',
+      lastActivity: null,
+      parent: null,
+      agentRun: false,
+      facts: 'current',
+    }),
+  );
+  const request = async (method, params) =>
+    method === 'sessions' ? collectPage(rows) : collectTurns(params.sessionId, { provider: params.sessionId });
+  const listing = await runSessions('sessions', [], request);
+  for (const provider of providers) assert.ok(listing.includes(provider));
+  assert.deepEqual(JSON.parse(await runSessions('sessions', ['--json'], request)).sessions, rows);
+  assert.match(await runSessions('session', ['agy'], request), /Session agy  agy/);
+  assert.equal(JSON.parse(await runSessions('session', ['agy', '--json'], request)).provider, 'agy');
+  for (const flags of [[], ['--json']]) {
+    const collection = JSON.parse(
+      await runCollect([...collectArgs, '--turns', '1', ...flags], {
+        now: () => 0,
+        request,
+      }),
+    );
+    assert.deepEqual(
+      collection.outcomes.map((outcome) => outcome.status),
+      ['completed', 'completed', 'completed'],
+    );
+    assert.deepEqual(collection.reads.map(({ reply }) => reply.provider).sort(), [...providers].sort());
+  }
+});
+
+test('Antigravity cost refuses unsupported analyses in text and JSON', async () => {
+  const brain = mkdtempSync(join(realpathSync(tmpdir()), 'arc-agy-cost-'));
+  const id = '00000000-0000-0000-0000-000000000009';
+  const log = join(brain, id, '.system_generated', 'logs');
+  const file = join(log, 'transcript_full.jsonl');
+  mkdirSync(log, { recursive: true });
+  writeFileSync(
+    file,
+    JSON.stringify({
+      type: 'PLANNER_RESPONSE',
+      step_index: 1,
+      created_at: '2026-11-22T05:00:00Z',
+      status: 'DONE',
+      content: 'Ready.',
+      output_tokens: 1,
+    }) + '\n',
+  );
+  try {
+    const failures = [];
+    for (const format of [[], ['--json']]) {
+      for (const flags of [['--by-tool'], ['--by-tool', '--until-text', 'Ready'], ['--window-agent', 'child']]) {
+        try {
+          await runCost([file, ...flags, ...format]);
+          failures.push('accepted ' + flags.join(' '));
+        } catch (error) {
+          failures.push(error.message);
+        }
+      }
+    }
+    const expected = [
+      'Antigravity cost does not support --by-tool.',
+      'Antigravity cost does not support --by-tool or --until-text.',
+      'Antigravity cost does not support --window-agent.',
+    ];
+    assert.deepEqual(failures, [...expected, ...expected]);
+  } finally {
+    rmSync(brain, { recursive: true, force: true });
+  }
+});
 
 test('collector restart excludes abandoned rows and preserves independent observations', async () => {
   const calls = [];

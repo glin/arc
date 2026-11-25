@@ -5,9 +5,15 @@ import * as path from 'node:path';
 import { processIsRunning, temporaryWriterGone, writeFileAtomically } from './atomicfile';
 import { CODEX_META_VERSION, createExclusive, releaseCodexOpeningsLock, takeCodexOpeningsLock } from './codexopenings';
 import { openingRecordOf, readRolloutStat, ROLLOUT_NAME, type CodexSessionMeta } from './codex';
-import { hashCompressedRollout, readCompressedFirstRecord, sameStat } from './compressedrollouts';
+import {
+  hashCompressedRollout,
+  readCompressedFirstRecord,
+  sameStat,
+  type CompressedRepair,
+} from './compressedrollouts';
 import type { DerivedTitleEntry } from './derivedcache';
 import { METADATA_GENERATIONS } from './derivedcache';
+import { supportedFileIdentity, type FileRevision } from './transcript';
 import {
   keepHigherSpend,
   normalizeWorkspace,
@@ -15,7 +21,7 @@ import {
   type SpendFileIndex,
 } from './projectspend';
 
-// Versions the fields and the derivation of a stored entry. Bump it when a stored field or its derivation changes.
+// Versions the stored entry. Bump it when a change prevents reuse of an older entry.
 export const COMPRESSED_FACTS_VERSION = 1;
 export const COMPRESSED_FACTS_STORE = 'compressed-rollout-facts-v1';
 export const COMPRESSED_OPENINGS_STORE = 'compressed-rollout-openings-v1';
@@ -53,6 +59,24 @@ export interface CompressedFactEntry {
   // The physical size and modification time of the `.jsonl.zst`. A name-only record has neither.
   size?: number;
   mtimeMs?: number;
+  fileIdentity?: Pick<FileRevision, 'dev' | 'ino'>;
+  // A slim seed keeps a conflict even after dropping the disagreeing facts.
+  identityConflict?: true;
+  // The seed still needs the compressed revision after the title and spend have been dropped.
+  factsNeedIdentity?: true;
+  // The source that supplied the amount, independently of the compressed envelope that now carries it.
+  spendOrigin?: {
+    version: 1;
+    threadId: string | null;
+    sourceIdentity: string | null;
+    size?: number;
+    mtimeMs?: number;
+    hash?: string;
+    retained?: true;
+  };
+  spendNeedsRepair?: true;
+  // The openings store saves the retry clock for an accepted repair.
+  repairRetry?: { launch: string; source: CompressedRepair; attempts: number; at: number };
   hash?: string;
   threadId?: string | null;
   decodedLength?: number;
@@ -168,6 +192,7 @@ export async function adoptCompressedTwin(
       ...compressedEntryVersions(),
       size: hashed.stat.size,
       mtimeMs: hashed.stat.mtimeMs,
+      fileIdentity: { dev: hashed.stat.dev, ino: hashed.stat.ino },
       hash: hashed.hash,
       threadId,
       complete: true,
@@ -177,6 +202,7 @@ export async function adoptCompressedTwin(
       ...(input.title ? { title: { ...input.title, size: hashed.stat.size, mtimeMs: hashed.stat.mtimeMs } } : {}),
       opening: input.opening ?? opening,
       spend: input.spend,
+      spendOrigin: compressedSpendOrigin(threadId, input.spend),
     },
   };
 }
@@ -192,6 +218,7 @@ export function compressedOpeningEntry(entry: CompressedFactEntry): CompressedFa
     spendGeneration: entry.spendGeneration,
     size: entry.size,
     mtimeMs: entry.mtimeMs,
+    fileIdentity: compressedEntryIdentity(entry) ?? undefined,
     threadId: entry.threadId,
     opening: entry.opening,
   };
@@ -204,14 +231,71 @@ export function boundedCompressedEntry(entry: CompressedFactEntry): CompressedFa
   return { ...rest, carriedName: { label: title.label, fullLabel: title.fullLabel } };
 }
 
-// A marked derivation never replaces a higher total. The entry keeps the higher spend record and takes the mark.
+export function compressedSpendOrigin(
+  threadId: CompressedFactEntry['threadId'],
+  spend: SpendFileIndex,
+  hash?: string,
+): NonNullable<CompressedFactEntry['spendOrigin']> {
+  return {
+    version: 1,
+    threadId: threadId ?? null,
+    sourceIdentity: spend.sourceIdentity ?? null,
+    size: spend.size,
+    mtimeMs: spend.mtimeMs,
+    hash,
+  };
+}
+
+function verifiedSpendOrigin(entry: CompressedFactEntry): boolean {
+  const origin = entry.spendOrigin;
+  return (
+    origin?.version === 1 &&
+    origin.threadId === (entry.threadId ?? null) &&
+    (!entry.spend ||
+      (origin.sourceIdentity === (entry.spend.sourceIdentity ?? null) &&
+        origin.size === entry.spend.size &&
+        origin.mtimeMs === entry.spend.mtimeMs)) &&
+    (origin.retained || entry.adopted || origin.hash === entry.hash)
+  );
+}
+
+// A legacy marked total can belong to an earlier session even when its physical witnesses agree.
+export function quarantineCompressedSpend(entry: CompressedFactEntry): CompressedFactEntry {
+  if (!entry.spend || !entry.undercount || verifiedSpendOrigin(entry)) return entry;
+  const identity = compressedEntryIdentity(entry);
+  const { spend: _spend, spendOrigin: _origin, ...facts } = entry;
+  return {
+    ...facts,
+    spendNeedsRepair: true,
+    ...(identity === null ? { identityConflict: true } : identity ? { fileIdentity: identity } : {}),
+  };
+}
+
+// Keep the higher total of a marked derivation when both entries belong to the same rollout and session.
 export function withKeptUndercount(
   previous: CompressedFactEntry | undefined,
   next: CompressedFactEntry,
 ): CompressedFactEntry {
-  if (!previous?.spend || !next.undercount || !next.spend) return next;
+  if (
+    !previous?.spend ||
+    previous.spendNeedsRepair ||
+    (previous.undercount && !verifiedSpendOrigin(previous)) ||
+    !next.undercount ||
+    !next.spend ||
+    !compressedFactsSameOwner(previous, next)
+  )
+    return next;
   const spend = keepHigherSpend(previous.spend, next.spend);
-  return spend === previous.spend ? { ...next, spend, undercount: true } : next;
+  if (spend !== previous.spend) return next;
+  return {
+    ...next,
+    spend,
+    undercount: true,
+    spendOrigin: {
+      ...(previous.spendOrigin ?? compressedSpendOrigin(previous.threadId, spend, previous.hash)),
+      retained: true,
+    },
+  };
 }
 
 // The version stamps of a new entry, as of this build.
@@ -232,20 +316,102 @@ export function compressedTitleCurrent(entry: CompressedFactEntry): boolean {
   return entry.factsVersion === COMPRESSED_FACTS_VERSION && entry.metadataGeneration === METADATA_GENERATIONS.codex;
 }
 
-// An entry is current when its stat matches the file and each version matches this build.
-export function compressedEntryCurrent(
-  entry: CompressedFactEntry,
-  stat: { size: number; mtimeMs: number } | null,
+type CompressedRevision = Pick<FileRevision, 'size' | 'mtimeMs'> & Partial<Pick<FileRevision, 'dev' | 'ino'>>;
+type CompressedIdentity = NonNullable<CompressedFactEntry['fileIdentity']>;
+
+function spendFileIdentity(spend: SpendFileIndex | undefined): CompressedIdentity | undefined {
+  if (typeof spend?.sourceIdentity !== 'string') return undefined;
+  const parts = spend.sourceIdentity.split(':');
+  const identity = { dev: parts[0], ino: parts[1] };
+  return parts.length === 2 && supportedFileIdentity(identity) ? identity : undefined;
+}
+
+// A decoded entry can store the compressed identity in its title and spend. An adopted entry stores plain identities there.
+export function compressedEntryIdentity(entry: CompressedFactEntry): CompressedIdentity | null | undefined {
+  const { opening, threadId } = entry;
+  if (entry.identityConflict || (opening?.sessionId && threadId && opening.sessionId !== threadId)) return null;
+  let identity = entry.fileIdentity && supportedFileIdentity(entry.fileIdentity) ? entry.fileIdentity : undefined;
+  const title = entry.title?.sourceIdentity;
+  const spend = spendFileIdentity(entry.spend);
+  if (entry.spendOrigin && !verifiedSpendOrigin(entry)) return null;
+  if (entry.adopted) {
+    return title && supportedFileIdentity(title) && spend && !compressedIdentityMatches(title, spend) ? null : identity;
+  }
+  for (const witness of [title, entry.spendOrigin?.retained ? undefined : spend]) {
+    if (!witness || !supportedFileIdentity(witness)) continue;
+    if (identity && !compressedIdentityMatches(identity, witness)) return null;
+    identity ??= witness;
+  }
+  return identity;
+}
+
+export function compressedFactsSameOwner(previous: CompressedFactEntry, next: CompressedFactEntry): boolean {
+  if (previous.file !== next.file || !previous.threadId || previous.threadId !== next.threadId) return false;
+  const before = compressedEntryIdentity(previous);
+  const after = compressedEntryIdentity(next);
+  return !!(
+    before !== null &&
+    after !== null &&
+    ((before && after && compressedIdentityMatches(before, after)) || (previous.hash && previous.hash === next.hash))
+  );
+}
+
+function compressedIdentityConflicts(
+  identity: CompressedIdentity | null | undefined,
+  stat: CompressedRevision,
+): boolean {
+  return identity === null || !!(identity && supportedFileIdentity(stat) && !compressedIdentityMatches(identity, stat));
+}
+
+export function compressedEntryConflicts(entry: CompressedFactEntry, stat: CompressedRevision): boolean {
+  return compressedIdentityConflicts(compressedEntryIdentity(entry), stat);
+}
+
+function factsNeedIdentity(entry: CompressedFactEntry): boolean {
+  return (
+    entry.factsNeedIdentity === true ||
+    (entry.decodedLength !== undefined && !!(entry.title || entry.spend || entry.carriedName))
+  );
+}
+
+// An entry is current when its revision and parser versions match.
+export function compressedEntryCurrent(entry: CompressedFactEntry, stat: CompressedRevision | null): boolean {
+  if (
+    !stat ||
+    entry.spendNeedsRepair ||
+    entry.size !== stat.size ||
+    entry.mtimeMs !== stat.mtimeMs ||
+    entry.factsVersion !== COMPRESSED_FACTS_VERSION ||
+    entry.codexMetaVersion !== CODEX_META_VERSION ||
+    entry.metadataGeneration !== METADATA_GENERATIONS.codex ||
+    entry.spendGeneration !== PROJECT_SPEND_PARSER_GENERATIONS.codex
+  )
+    return false;
+  const identity = compressedEntryIdentity(entry);
+  return (
+    !compressedIdentityConflicts(identity, stat) &&
+    (!!identity || !factsNeedIdentity(entry) || !supportedFileIdentity(stat))
+  );
+}
+
+function compressedIdentityMatches(
+  identity: Partial<Pick<FileRevision, 'dev' | 'ino'>>,
+  stat: Partial<Pick<FileRevision, 'dev' | 'ino'>>,
 ): boolean {
   return (
-    !!stat &&
-    entry.size === stat.size &&
-    entry.mtimeMs === stat.mtimeMs &&
-    entry.factsVersion === COMPRESSED_FACTS_VERSION &&
-    entry.codexMetaVersion === CODEX_META_VERSION &&
-    entry.metadataGeneration === METADATA_GENERATIONS.codex &&
-    entry.spendGeneration === PROJECT_SPEND_PARSER_GENERATIONS.codex
+    supportedFileIdentity(identity) &&
+    supportedFileIdentity(stat) &&
+    String(identity.dev) === String(stat.dev) &&
+    String(identity.ino) === String(stat.ino)
   );
+}
+
+// A contested row takes display facts only from the revision its opening qualified.
+export function compressedFactsMatchSource(entry: CompressedFactEntry, source: CompressedRevision): boolean {
+  if (entry.unreadable || entry.size !== source.size || entry.mtimeMs !== source.mtimeMs) return false;
+  const identity = compressedEntryIdentity(entry);
+  if (identity) return compressedIdentityMatches(identity, source);
+  return identity !== null && !entry.title && !entry.spend && !entry.carriedName;
 }
 
 // A name that a store file carries, split into its parts. `seq` counts the files of one holder, so a name is unique.
@@ -354,7 +520,7 @@ function parseEntry(text: string): CompressedFactEntry | null {
   try {
     const value = JSON.parse(text) as Partial<CompressedFactEntry>;
     return typeof value.file === 'string' && typeof value.factsVersion === 'number' && typeof value.pairKey === 'string'
-      ? (value as CompressedFactEntry)
+      ? quarantineCompressedSpend(value as CompressedFactEntry)
       : null;
   } catch {
     return null;
@@ -367,7 +533,7 @@ function readableFactsVersion(version: number | null): boolean {
 }
 
 // The physical stat that ranks an entry against its rollout, in the precision that adoption stores.
-export function compressedPhysicalStat(file: string): { size: number; mtimeMs: number } | null {
+export function compressedPhysicalStat(file: string): CompressedRevision | null {
   return readRolloutStat(file);
 }
 
@@ -389,7 +555,9 @@ interface RankFields {
   factsVersion: number;
   size?: number;
   mtimeMs?: number;
+  fileIdentity?: CompressedIdentity | null;
   decodedLength?: number;
+  spendNeedsRepair?: true;
   adoptionFailed?: boolean;
   nameOnly?: boolean;
 }
@@ -401,7 +569,9 @@ function rankFields(entry: CompressedFactEntry): RankFields {
     factsVersion: entry.factsVersion,
     size: entry.size,
     mtimeMs: entry.mtimeMs,
+    fileIdentity: compressedEntryIdentity(entry),
     decodedLength: entry.decodedLength,
+    spendNeedsRepair: entry.spendNeedsRepair,
     adoptionFailed: entry.adoptionFailed,
     nameOnly: entry.nameOnly,
   };
@@ -413,7 +583,10 @@ export type CompressedEntrySeed = Omit<CompressedFactEntry, 'title' | 'spend' | 
 
 export function compressedEntrySeed(entry: CompressedFactEntry): CompressedEntrySeed {
   const { title: _title, spend: _spend, carriedName: _carried, ...seed } = entry;
-  return seed;
+  const identity = compressedEntryIdentity(entry);
+  if (identity === null) return { ...seed, identityConflict: true };
+  if (identity) return { ...seed, fileIdentity: identity };
+  return factsNeedIdentity(entry) ? { ...seed, factsNeedIdentity: true } : seed;
 }
 
 export interface CompressedLoadResume {
@@ -435,23 +608,27 @@ interface RankedEntry {
 
 // Greater when `left` ranks first. Current fact version first, then an equal stat, then greater mtimeMs and size, then
 // an entry with a decoded length, an entry with facts, the higher epoch, the greater holder token and the later line.
-export function compareRankedEntries(
-  left: RankedEntry,
-  right: RankedEntry,
-  stat: { size: number; mtimeMs: number } | null,
-): number {
+export function compareRankedEntries(left: RankedEntry, right: RankedEntry, stat: CompressedRevision | null): number {
   const a = left.entry;
   const b = right.entry;
   const version =
     Number(a.factsVersion === COMPRESSED_FACTS_VERSION) - Number(b.factsVersion === COMPRESSED_FACTS_VERSION);
   if (version) return version;
-  const equal = (entry: RankFields) => (!!stat && entry.size === stat.size && entry.mtimeMs === stat.mtimeMs ? 1 : 0);
+  const equal = (entry: RankFields) => {
+    if (!stat || entry.size !== stat.size || entry.mtimeMs !== stat.mtimeMs) return 0;
+    if (entry.fileIdentity === null) return 0;
+    if (!entry.fileIdentity || !supportedFileIdentity(stat)) return 1;
+    return compressedIdentityMatches(entry.fileIdentity, stat) ? 2 : 0;
+  };
   const statRank = equal(a) - equal(b);
   if (statRank) return statRank;
   const mtime = (a.mtimeMs ?? -1) - (b.mtimeMs ?? -1);
   if (mtime) return mtime;
   const size = (a.size ?? -1) - (b.size ?? -1);
   if (size) return size;
+  // A current derived or terminal entry replaces an ambiguous amount, including across compaction and old writers.
+  const verified = Number(!a.spendNeedsRepair) - Number(!b.spendNeedsRepair);
+  if (verified) return verified;
   const decoded = Number(a.decodedLength !== undefined) - Number(b.decodedLength !== undefined);
   if (decoded) return decoded;
   const withFacts = (entry: RankFields) => (entry.adoptionFailed || entry.nameOnly ? 0 : 1);
@@ -585,12 +762,9 @@ function* storeReadSteps(
 }
 
 // Split entries into batches of at most `bytes`. A single larger record forms its own batch.
-export function compressedEntryBatches(
-  entries: readonly CompressedFactEntry[],
-  bytes = COMPRESSED_BATCH_BYTES,
-): CompressedFactEntry[][] {
-  const batches: CompressedFactEntry[][] = [];
-  let current: CompressedFactEntry[] = [];
+export function compressedEntryBatches<T>(entries: readonly T[], bytes = COMPRESSED_BATCH_BYTES): T[][] {
+  const batches: T[][] = [];
+  let current: T[] = [];
   let size = 0;
   for (const entry of entries) {
     const length = Buffer.byteLength(JSON.stringify(entry));
@@ -653,10 +827,18 @@ function readLockText(lock: string): string | null | 'missing' {
 
 // Every field of an entry that a reader can see change. A later file that repeats these values is not new for a host.
 function compressedEntryMark(entry: CompressedFactEntry): string {
+  const identity = compressedEntryIdentity(entry);
   return [
     entry.size,
     entry.mtimeMs,
+    identity === null,
+    identity?.dev,
+    identity?.ino,
     entry.hash,
+    entry.threadId,
+    entry.spendNeedsRepair,
+    entry.spendOrigin ? JSON.stringify(entry.spendOrigin) : undefined,
+
     entry.factsVersion,
     entry.codexMetaVersion,
     entry.metadataGeneration,
@@ -718,6 +900,20 @@ export class CompressedStoreFollower {
   // The newest entry of each path that a poll or the seed gave, without its title entry and spend record.
   known(): ReadonlyMap<string, CompressedEntrySeed> {
     return this.seeds;
+  }
+
+  // Reads the line already ranked by this follower, without walking the store again.
+  entry(file: string): CompressedFactEntry | undefined {
+    const ranked = this.best.get(file)?.ranked;
+    if (!ranked?.input) return undefined;
+    try {
+      const line = readLineAt(path.join(this.directory, ranked.input), ranked.offset, openForRead);
+      const entry = line === null ? null : parseEntry(line);
+      return entry?.file === file ? entry : undefined;
+    } catch {
+      // A compaction can replace the input before the next poll.
+      return undefined;
+    }
   }
 
   // The entries that are new or changed since the last poll.
