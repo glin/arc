@@ -1,21 +1,29 @@
 // The stores of compressed rollout facts. One directory per store holds an `epoch` file, the lock `backfill.lock`,
 // segments of one JSON line per revision, compacted shards and the manifests that name them. Only the worker writes.
+import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { processIsRunning, temporaryWriterGone, writeFileAtomically } from './atomicfile';
 import { CODEX_META_VERSION, createExclusive, releaseCodexOpeningsLock, takeCodexOpeningsLock } from './codexopenings';
 import { openingRecordOf, readRolloutStat, ROLLOUT_NAME, type CodexSessionMeta } from './codex';
-import { hashCompressedRollout, readCompressedFirstRecord, sameStat } from './compressedrollouts';
+import {
+  hashCompressedRollout,
+  readCompressedFirstRecord,
+  sameStat,
+  type CompressedRepair,
+} from './compressedrollouts';
 import type { DerivedTitleEntry } from './derivedcache';
 import { METADATA_GENERATIONS } from './derivedcache';
+import { supportedFileIdentity, type FileRevision } from './transcript';
 import {
   keepHigherSpend,
+  spendRecordTotal,
   normalizeWorkspace,
   PROJECT_SPEND_PARSER_GENERATIONS,
   type SpendFileIndex,
 } from './projectspend';
 
-// Versions the fields and the derivation of a stored entry. Bump it when a stored field or its derivation changes.
+// Versions the stored entry. Bump it when a change prevents reuse of an older entry.
 export const COMPRESSED_FACTS_VERSION = 1;
 export const COMPRESSED_FACTS_STORE = 'compressed-rollout-facts-v1';
 export const COMPRESSED_OPENINGS_STORE = 'compressed-rollout-openings-v1';
@@ -32,6 +40,7 @@ const RETRY_SPREAD_MS = 25_000;
 // A holder with no work left releases the lock after this time, so an idle window holds no lease.
 const IDLE_RELEASE_MS = 20_000;
 const READ_CHUNK = 64 * 1024;
+const FOLLOW_SLICE_BYTES = 4 * 1024 * 1024;
 // An entry above this many bytes drops its title entry. The row keeps a carried name and its cost.
 export const COMPRESSED_ENTRY_TITLE_BYTES = 1024 * 1024;
 // The worker posts at most this many bytes of entries in one batch, or one larger record.
@@ -53,6 +62,32 @@ export interface CompressedFactEntry {
   // The physical size and modification time of the `.jsonl.zst`. A name-only record has neither.
   size?: number;
   mtimeMs?: number;
+  fileIdentity?: Pick<FileRevision, 'dev' | 'ino'>;
+  // A slim seed keeps a conflict even after dropping the disagreeing facts.
+  identityConflict?: true;
+  // The seed still needs the compressed revision after the title and spend have been dropped.
+  factsNeedIdentity?: true;
+  // The source that supplied the amount, independently of the compressed envelope that now carries it.
+  spendOrigin?: {
+    version: 1;
+    threadId: string | null;
+    sourceIdentity: string | null;
+    size?: number;
+    mtimeMs?: number;
+    hash?: string;
+    retained?: true;
+  };
+  spendNeedsRepair?: true;
+  // The exact durable line, carried between the worker and host.
+  storeRecord?: CompressedStoreRecord;
+  // The durable line that supplied held spend when it differs from the ranked envelope.
+  spendRecord?: CompressedStoreRecord;
+  // An eligible amount that follows a different line than the displayed row.
+  spendWitness?: CompressedStoreRecord;
+  // A seed omits spend. The line must still be read before replacing a verified amount.
+  hasSpend?: true;
+  // The openings store saves the retry clock for an accepted repair.
+  repairRetry?: { launch: string; source: CompressedRepair; attempts: number; at: number };
   hash?: string;
   threadId?: string | null;
   decodedLength?: number;
@@ -168,6 +203,7 @@ export async function adoptCompressedTwin(
       ...compressedEntryVersions(),
       size: hashed.stat.size,
       mtimeMs: hashed.stat.mtimeMs,
+      fileIdentity: { dev: hashed.stat.dev, ino: hashed.stat.ino },
       hash: hashed.hash,
       threadId,
       complete: true,
@@ -177,6 +213,7 @@ export async function adoptCompressedTwin(
       ...(input.title ? { title: { ...input.title, size: hashed.stat.size, mtimeMs: hashed.stat.mtimeMs } } : {}),
       opening: input.opening ?? opening,
       spend: input.spend,
+      spendOrigin: compressedSpendOrigin(threadId, input.spend),
     },
   };
 }
@@ -192,6 +229,7 @@ export function compressedOpeningEntry(entry: CompressedFactEntry): CompressedFa
     spendGeneration: entry.spendGeneration,
     size: entry.size,
     mtimeMs: entry.mtimeMs,
+    fileIdentity: compressedEntryIdentity(entry) ?? undefined,
     threadId: entry.threadId,
     opening: entry.opening,
   };
@@ -204,14 +242,85 @@ export function boundedCompressedEntry(entry: CompressedFactEntry): CompressedFa
   return { ...rest, carriedName: { label: title.label, fullLabel: title.fullLabel } };
 }
 
-// A marked derivation never replaces a higher total. The entry keeps the higher spend record and takes the mark.
+export function compressedSpendOrigin(
+  threadId: CompressedFactEntry['threadId'],
+  spend: SpendFileIndex,
+  hash?: string,
+): NonNullable<CompressedFactEntry['spendOrigin']> {
+  return {
+    version: 1,
+    threadId: threadId ?? null,
+    sourceIdentity: spend.sourceIdentity ?? null,
+    size: spend.size,
+    mtimeMs: spend.mtimeMs,
+    hash,
+  };
+}
+
+function verifiedSpendOrigin(entry: CompressedFactEntry): boolean {
+  const origin = entry.spendOrigin;
+  return (
+    origin?.version === 1 &&
+    origin.threadId === (entry.threadId ?? null) &&
+    (!entry.spend ||
+      (origin.sourceIdentity === (entry.spend.sourceIdentity ?? null) &&
+        origin.size === entry.spend.size &&
+        origin.mtimeMs === entry.spend.mtimeMs)) &&
+    (origin.retained || entry.adopted || origin.hash === entry.hash)
+  );
+}
+
+// A legacy marked total can belong to an earlier session even when its physical witnesses agree.
+export function quarantineCompressedSpend(entry: CompressedFactEntry): CompressedFactEntry {
+  if (!entry.spend || !entry.undercount || verifiedSpendOrigin(entry)) return entry;
+  const identity = compressedEntryIdentity(entry);
+  const { spend: _spend, spendOrigin: _origin, ...facts } = entry;
+  return {
+    ...facts,
+    spendNeedsRepair: true,
+    ...(identity === null ? { identityConflict: true } : identity ? { fileIdentity: identity } : {}),
+  };
+}
+
+// Keep the higher total of a marked derivation when both entries belong to the same rollout and session.
 export function withKeptUndercount(
   previous: CompressedFactEntry | undefined,
   next: CompressedFactEntry,
 ): CompressedFactEntry {
-  if (!previous?.spend || !next.undercount || !next.spend) return next;
+  if (
+    !previous?.spend ||
+    previous.spendNeedsRepair ||
+    (previous.undercount && !verifiedSpendOrigin(previous)) ||
+    !next.undercount ||
+    !next.spend ||
+    !compressedFactsSameOwner(previous, next)
+  )
+    return next;
   const spend = keepHigherSpend(previous.spend, next.spend);
-  return spend === previous.spend ? { ...next, spend, undercount: true } : next;
+  if (spend !== previous.spend) return next;
+  return {
+    ...next,
+    spend,
+    spendRecord: previous.spendRecord ?? previous.storeRecord,
+    undercount: true,
+    spendOrigin: {
+      ...(previous.spendOrigin ?? compressedSpendOrigin(previous.threadId, spend, previous.hash)),
+      retained: true,
+    },
+  };
+}
+
+function eligibleCompressedSpend(entry: CompressedFactEntry): boolean {
+  return (
+    !!entry.spend &&
+    entry.spendGeneration === PROJECT_SPEND_PARSER_GENERATIONS.codex &&
+    !entry.spendNeedsRepair &&
+    (!entry.undercount || verifiedSpendOrigin(entry)) &&
+    !entry.nameOnly &&
+    !entry.adoptionFailed &&
+    !!entry.threadId &&
+    compressedEntryIdentity(entry) !== null
+  );
 }
 
 // The version stamps of a new entry, as of this build.
@@ -232,20 +341,102 @@ export function compressedTitleCurrent(entry: CompressedFactEntry): boolean {
   return entry.factsVersion === COMPRESSED_FACTS_VERSION && entry.metadataGeneration === METADATA_GENERATIONS.codex;
 }
 
-// An entry is current when its stat matches the file and each version matches this build.
-export function compressedEntryCurrent(
-  entry: CompressedFactEntry,
-  stat: { size: number; mtimeMs: number } | null,
+type CompressedRevision = Pick<FileRevision, 'size' | 'mtimeMs'> & Partial<Pick<FileRevision, 'dev' | 'ino'>>;
+type CompressedIdentity = NonNullable<CompressedFactEntry['fileIdentity']>;
+
+function spendFileIdentity(spend: SpendFileIndex | undefined): CompressedIdentity | undefined {
+  if (typeof spend?.sourceIdentity !== 'string') return undefined;
+  const parts = spend.sourceIdentity.split(':');
+  const identity = { dev: parts[0], ino: parts[1] };
+  return parts.length === 2 && supportedFileIdentity(identity) ? identity : undefined;
+}
+
+// A decoded entry can store the compressed identity in its title and spend. An adopted entry stores plain identities there.
+export function compressedEntryIdentity(entry: CompressedFactEntry): CompressedIdentity | null | undefined {
+  const { opening, threadId } = entry;
+  if (entry.identityConflict || (opening?.sessionId && threadId && opening.sessionId !== threadId)) return null;
+  let identity = entry.fileIdentity && supportedFileIdentity(entry.fileIdentity) ? entry.fileIdentity : undefined;
+  const title = entry.title?.sourceIdentity;
+  const spend = spendFileIdentity(entry.spend);
+  if (entry.spendOrigin && !verifiedSpendOrigin(entry)) return null;
+  if (entry.adopted) {
+    return title && supportedFileIdentity(title) && spend && !compressedIdentityMatches(title, spend) ? null : identity;
+  }
+  for (const witness of [title, entry.spendOrigin?.retained ? undefined : spend]) {
+    if (!witness || !supportedFileIdentity(witness)) continue;
+    if (identity && !compressedIdentityMatches(identity, witness)) return null;
+    identity ??= witness;
+  }
+  return identity;
+}
+
+export function compressedFactsSameOwner(previous: CompressedFactEntry, next: CompressedFactEntry): boolean {
+  if (previous.file !== next.file || !previous.threadId || previous.threadId !== next.threadId) return false;
+  const before = compressedEntryIdentity(previous);
+  const after = compressedEntryIdentity(next);
+  return !!(
+    before !== null &&
+    after !== null &&
+    ((before && after && compressedIdentityMatches(before, after)) || (previous.hash && previous.hash === next.hash))
+  );
+}
+
+function compressedIdentityConflicts(
+  identity: CompressedIdentity | null | undefined,
+  stat: CompressedRevision,
+): boolean {
+  return identity === null || !!(identity && supportedFileIdentity(stat) && !compressedIdentityMatches(identity, stat));
+}
+
+export function compressedEntryConflicts(entry: CompressedFactEntry, stat: CompressedRevision): boolean {
+  return compressedIdentityConflicts(compressedEntryIdentity(entry), stat);
+}
+
+function factsNeedIdentity(entry: CompressedFactEntry): boolean {
+  return (
+    entry.factsNeedIdentity === true ||
+    (entry.decodedLength !== undefined && !!(entry.title || entry.spend || entry.carriedName))
+  );
+}
+
+// An entry is current when its revision and parser versions match.
+export function compressedEntryCurrent(entry: CompressedFactEntry, stat: CompressedRevision | null): boolean {
+  if (
+    !stat ||
+    entry.spendNeedsRepair ||
+    entry.size !== stat.size ||
+    entry.mtimeMs !== stat.mtimeMs ||
+    entry.factsVersion !== COMPRESSED_FACTS_VERSION ||
+    entry.codexMetaVersion !== CODEX_META_VERSION ||
+    entry.metadataGeneration !== METADATA_GENERATIONS.codex ||
+    entry.spendGeneration !== PROJECT_SPEND_PARSER_GENERATIONS.codex
+  )
+    return false;
+  const identity = compressedEntryIdentity(entry);
+  return (
+    !compressedIdentityConflicts(identity, stat) &&
+    (!!identity || !factsNeedIdentity(entry) || !supportedFileIdentity(stat))
+  );
+}
+
+function compressedIdentityMatches(
+  identity: Partial<Pick<FileRevision, 'dev' | 'ino'>>,
+  stat: Partial<Pick<FileRevision, 'dev' | 'ino'>>,
 ): boolean {
   return (
-    !!stat &&
-    entry.size === stat.size &&
-    entry.mtimeMs === stat.mtimeMs &&
-    entry.factsVersion === COMPRESSED_FACTS_VERSION &&
-    entry.codexMetaVersion === CODEX_META_VERSION &&
-    entry.metadataGeneration === METADATA_GENERATIONS.codex &&
-    entry.spendGeneration === PROJECT_SPEND_PARSER_GENERATIONS.codex
+    supportedFileIdentity(identity) &&
+    supportedFileIdentity(stat) &&
+    String(identity.dev) === String(stat.dev) &&
+    String(identity.ino) === String(stat.ino)
   );
+}
+
+// A contested row takes display facts only from the revision its opening qualified.
+export function compressedFactsMatchSource(entry: CompressedFactEntry, source: CompressedRevision): boolean {
+  if (entry.unreadable || entry.size !== source.size || entry.mtimeMs !== source.mtimeMs) return false;
+  const identity = compressedEntryIdentity(entry);
+  if (identity) return compressedIdentityMatches(identity, source);
+  return identity !== null && !entry.title && !entry.spend && !entry.carriedName;
 }
 
 // A name that a store file carries, split into its parts. `seq` counts the files of one holder, so a name is unique.
@@ -295,7 +486,9 @@ function parseManifest(text: string): StoreManifest | null {
 
 function readManifest(directory: string, name: string, onUnreadable?: (name: string) => void): StoreManifest | null {
   try {
-    return parseManifest(fs.readFileSync(path.join(directory, name), 'utf8'));
+    const manifest = parseManifest(fs.readFileSync(path.join(directory, name), 'utf8'));
+    if (!manifest) onUnreadable?.(name);
+    return manifest;
   } catch {
     onUnreadable?.(name);
     return null;
@@ -354,7 +547,7 @@ function parseEntry(text: string): CompressedFactEntry | null {
   try {
     const value = JSON.parse(text) as Partial<CompressedFactEntry>;
     return typeof value.file === 'string' && typeof value.factsVersion === 'number' && typeof value.pairKey === 'string'
-      ? (value as CompressedFactEntry)
+      ? quarantineCompressedSpend(value as CompressedFactEntry)
       : null;
   } catch {
     return null;
@@ -367,7 +560,7 @@ function readableFactsVersion(version: number | null): boolean {
 }
 
 // The physical stat that ranks an entry against its rollout, in the precision that adoption stores.
-export function compressedPhysicalStat(file: string): { size: number; mtimeMs: number } | null {
+export function compressedPhysicalStat(file: string): CompressedRevision | null {
   return readRolloutStat(file);
 }
 
@@ -389,7 +582,11 @@ interface RankFields {
   factsVersion: number;
   size?: number;
   mtimeMs?: number;
+  fileIdentity?: CompressedIdentity | null;
+  threadId?: string | null;
+  hash?: string;
   decodedLength?: number;
+  spendNeedsRepair?: true;
   adoptionFailed?: boolean;
   nameOnly?: boolean;
 }
@@ -401,7 +598,11 @@ function rankFields(entry: CompressedFactEntry): RankFields {
     factsVersion: entry.factsVersion,
     size: entry.size,
     mtimeMs: entry.mtimeMs,
+    fileIdentity: compressedEntryIdentity(entry),
+    threadId: entry.threadId,
+    hash: entry.hash,
     decodedLength: entry.decodedLength,
+    spendNeedsRepair: entry.spendNeedsRepair,
     adoptionFailed: entry.adoptionFailed,
     nameOnly: entry.nameOnly,
   };
@@ -412,8 +613,12 @@ function rankFields(entry: CompressedFactEntry): RankFields {
 export type CompressedEntrySeed = Omit<CompressedFactEntry, 'title' | 'spend' | 'carriedName'>;
 
 export function compressedEntrySeed(entry: CompressedFactEntry): CompressedEntrySeed {
-  const { title: _title, spend: _spend, carriedName: _carried, ...seed } = entry;
-  return seed;
+  const { title: _title, spend, carriedName: _carried, ...seed } = entry;
+  if (spend) seed.hasSpend = true;
+  const identity = compressedEntryIdentity(entry);
+  if (identity === null) return { ...seed, identityConflict: true };
+  if (identity) return { ...seed, fileIdentity: identity };
+  return factsNeedIdentity(entry) ? { ...seed, factsNeedIdentity: true } : seed;
 }
 
 export interface CompressedLoadResume {
@@ -421,6 +626,66 @@ export interface CompressedLoadResume {
   entries: CompressedEntrySeed[];
   // The names the store holds with no facts, which the offsets cover and the host holds only as paths.
   nameOnly?: string[];
+}
+
+export interface CompressedStoreRecord {
+  input: string;
+  offset: number;
+  bytes: number;
+  digest: string;
+  spendDigest?: string;
+}
+
+export type CompressedSpendRequest = {
+  file: string;
+  record: CompressedStoreRecord;
+};
+
+function spendDigest(spend: SpendFileIndex | undefined): string | undefined {
+  return spend && recordDigest(JSON.stringify(spend));
+}
+
+function recordDigest(line: Buffer | string): string {
+  return createHash('sha256').update(line).digest('base64url');
+}
+
+// A host can return the exact amount it kept from a line that an older compactor retired.
+export function heldCompressedSpend(
+  entry: CompressedFactEntry | undefined,
+  { file, record }: CompressedSpendRequest,
+): CompressedFactEntry | undefined {
+  const held = entry?.spendRecord ?? entry?.storeRecord;
+  if (
+    !entry ||
+    entry.file !== file ||
+    held?.digest !== record.digest ||
+    !record.spendDigest ||
+    !eligibleCompressedSpend(entry) ||
+    spendDigest(entry.spend) !== record.spendDigest
+  )
+    return undefined;
+  const { pairKey, fileIdentity, size, mtimeMs, threadId, hash, spend, spendOrigin, adopted, unreadable, undercount } =
+    entry;
+  const witness = {
+    file,
+    pairKey,
+    fileIdentity: compressedEntryIdentity(entry) ?? fileIdentity,
+    size,
+    mtimeMs,
+    threadId,
+    hash,
+    spend,
+    spendOrigin,
+    adopted,
+    unreadable,
+    undercount,
+    factsVersion: entry.factsVersion,
+    codexMetaVersion: entry.codexMetaVersion,
+    metadataGeneration: entry.metadataGeneration,
+    spendGeneration: entry.spendGeneration,
+    storeRecord: record,
+  };
+  return Buffer.byteLength(JSON.stringify(witness)) <= COMPRESSED_BATCH_BYTES ? witness : undefined;
 }
 
 interface RankedEntry {
@@ -435,23 +700,27 @@ interface RankedEntry {
 
 // Greater when `left` ranks first. Current fact version first, then an equal stat, then greater mtimeMs and size, then
 // an entry with a decoded length, an entry with facts, the higher epoch, the greater holder token and the later line.
-export function compareRankedEntries(
-  left: RankedEntry,
-  right: RankedEntry,
-  stat: { size: number; mtimeMs: number } | null,
-): number {
+export function compareRankedEntries(left: RankedEntry, right: RankedEntry, stat: CompressedRevision | null): number {
   const a = left.entry;
   const b = right.entry;
   const version =
     Number(a.factsVersion === COMPRESSED_FACTS_VERSION) - Number(b.factsVersion === COMPRESSED_FACTS_VERSION);
   if (version) return version;
-  const equal = (entry: RankFields) => (!!stat && entry.size === stat.size && entry.mtimeMs === stat.mtimeMs ? 1 : 0);
+  const equal = (entry: RankFields) => {
+    if (!stat || entry.size !== stat.size || entry.mtimeMs !== stat.mtimeMs) return 0;
+    if (entry.fileIdentity === null) return 0;
+    if (!entry.fileIdentity || !supportedFileIdentity(stat)) return 1;
+    return compressedIdentityMatches(entry.fileIdentity, stat) ? 2 : 0;
+  };
   const statRank = equal(a) - equal(b);
   if (statRank) return statRank;
   const mtime = (a.mtimeMs ?? -1) - (b.mtimeMs ?? -1);
   if (mtime) return mtime;
   const size = (a.size ?? -1) - (b.size ?? -1);
   if (size) return size;
+  // A current derived or terminal entry replaces an ambiguous amount, including across compaction and old writers.
+  const verified = Number(!a.spendNeedsRepair) - Number(!b.spendNeedsRepair);
+  if (verified) return verified;
   const decoded = Number(a.decodedLength !== undefined) - Number(b.decodedLength !== undefined);
   if (decoded) return decoded;
   const withFacts = (entry: RankFields) => (entry.adoptionFailed || entry.nameOnly ? 0 : 1);
@@ -461,6 +730,72 @@ export function compareRankedEntries(
   if (left.epoch !== right.epoch) return left.epoch - right.epoch;
   if (left.token !== right.token) return left.token > right.token ? 1 : -1;
   return left.seq - right.seq || left.offset - right.offset;
+}
+
+function rankedRecord(entry: CompressedEntrySeed): RankedEntry {
+  const ref = entry.storeRecord;
+  const input = ref && storeName(ref.input);
+  return {
+    entry: rankFields(entry),
+    epoch: input ? input.epoch : -1,
+    token: input ? input.token : '',
+    input: input ? input.name : '',
+    offset: ref?.offset ?? -1,
+    seq: input ? input.seq : -1,
+  };
+}
+
+export function compareCompressedEntries(
+  left: CompressedEntrySeed,
+  right: CompressedEntrySeed,
+  stat: CompressedRevision | null,
+): number {
+  return compareRankedEntries(rankedRecord(left), rankedRecord(right), stat);
+}
+
+interface RankedSpend {
+  ranked: RankedEntry;
+  authority: RankedEntry | undefined;
+  total: ReturnType<typeof spendRecordTotal>;
+}
+
+function rankedSameOwner(a: RankedEntry, b: RankedEntry): boolean {
+  const { file, fileIdentity, threadId, hash } = a.entry;
+  const other = b.entry;
+  return (
+    file === other.file &&
+    !!threadId &&
+    threadId === other.threadId &&
+    fileIdentity !== null &&
+    other.fileIdentity !== null &&
+    ((!!fileIdentity && !!other.fileIdentity && compressedIdentityMatches(fileIdentity, other.fileIdentity)) ||
+      (!!hash && hash === other.hash))
+  );
+}
+
+// An authoritative revision can lower its contribution. A later partial revision can only raise it for the same owner.
+function rankSpend(
+  entry: CompressedFactEntry,
+  ranked: RankedEntry,
+  held: RankedSpend | undefined,
+  quotedAt: number,
+): RankedSpend | undefined {
+  if (!eligibleCompressedSpend(entry)) return undefined;
+  const authoritative = entry.complete !== false && !entry.undercount && !entry.unreadable;
+  if (held && !rankedSameOwner(held.ranked, ranked) && compareRankedEntries(ranked, held.ranked, null) <= 0)
+    return undefined;
+  if (!held || !rankedSameOwner(held.ranked, ranked)) {
+    return { ranked, authority: authoritative ? ranked : undefined, total: spendRecordTotal(entry.spend!, quotedAt) };
+  }
+  if (held.authority && compareRankedEntries(ranked, held.authority, null) < 0) return undefined;
+  const total = spendRecordTotal(entry.spend!, quotedAt);
+  if (authoritative && compareRankedEntries(ranked, held.ranked, null) >= 0)
+    return { ranked, authority: ranked, total };
+  const amount = total.dollars - held.total.dollars || total.requests - held.total.requests;
+  if (amount > 0 || (!amount && compareRankedEntries(ranked, held.ranked, null) > 0))
+    return { ranked, authority: authoritative ? ranked : held.authority, total };
+  if (authoritative) return { ...held, authority: ranked };
+  return undefined;
 }
 
 interface StoreView {
@@ -504,6 +839,9 @@ function storeView(directory: string, names: readonly string[], onUnreadable?: (
   const inputs = parsed.filter(
     (stored) =>
       (stored.kind === 'segment' || (stored.kind === 'shard' && named.has(stored.name))) && !retired.has(stored.name),
+  );
+  inputs.sort(
+    (left, right) => left.epoch - right.epoch || left.token.localeCompare(right.token) || left.seq - right.seq,
   );
   return { inputs, manifests, valid, current, retired };
 }
@@ -585,12 +923,9 @@ function* storeReadSteps(
 }
 
 // Split entries into batches of at most `bytes`. A single larger record forms its own batch.
-export function compressedEntryBatches(
-  entries: readonly CompressedFactEntry[],
-  bytes = COMPRESSED_BATCH_BYTES,
-): CompressedFactEntry[][] {
-  const batches: CompressedFactEntry[][] = [];
-  let current: CompressedFactEntry[] = [];
+export function compressedEntryBatches<T>(entries: readonly T[], bytes = COMPRESSED_BATCH_BYTES): T[][] {
+  const batches: T[][] = [];
+  let current: T[] = [];
   let size = 0;
   for (const entry of entries) {
     const length = Buffer.byteLength(JSON.stringify(entry));
@@ -653,10 +988,18 @@ function readLockText(lock: string): string | null | 'missing' {
 
 // Every field of an entry that a reader can see change. A later file that repeats these values is not new for a host.
 function compressedEntryMark(entry: CompressedFactEntry): string {
+  const identity = compressedEntryIdentity(entry);
   return [
     entry.size,
     entry.mtimeMs,
+    identity === null,
+    identity?.dev,
+    identity?.ino,
     entry.hash,
+    entry.threadId,
+    entry.spendNeedsRepair,
+    entry.spendOrigin ? JSON.stringify(entry.spendOrigin) : undefined,
+
     entry.factsVersion,
     entry.codexMetaVersion,
     entry.metadataGeneration,
@@ -673,26 +1016,89 @@ function compressedEntryMark(entry: CompressedFactEntry): string {
 }
 
 export function compressedEntrySame(left: CompressedFactEntry, right: CompressedFactEntry): boolean {
-  return compressedEntryMark(left) === compressedEntryMark(right);
+  return (
+    (!left.storeRecord || !right.storeRecord || left.storeRecord.digest === right.storeRecord.digest) &&
+    compressedEntryMark(left) === compressedEntryMark(right)
+  );
+}
+
+// Read one complete line from the store that supplied its address.
+export function readCompressedRecord(
+  directory: string,
+  file: string,
+  record: CompressedStoreRecord,
+): CompressedFactEntry | undefined {
+  const { input, offset, bytes, digest } = record;
+  const name = storeName(input);
+  if (
+    !name ||
+    name.kind === 'manifest' ||
+    path.basename(input) !== input ||
+    !Number.isSafeInteger(offset) ||
+    offset < 0 ||
+    !Number.isSafeInteger(bytes) ||
+    bytes < 2 ||
+    !Number.isSafeInteger(offset + bytes)
+  )
+    return undefined;
+  let fd: number | undefined;
+  try {
+    fd = openForRead(path.join(directory, input));
+    if (fs.fstatSync(fd).size < offset + bytes) return undefined;
+    const line = Buffer.allocUnsafe(bytes);
+    let read = 0;
+    while (read < bytes) {
+      const count = fs.readSync(fd, line, read, bytes - read, offset + read);
+      if (!count) return undefined;
+      read += count;
+    }
+    if (line[bytes - 1] !== 0x0a || recordDigest(line) !== digest) return undefined;
+    const entry = parseEntry(line.subarray(0, bytes - 1).toString('utf8'));
+    return entry?.file === file ? { ...entry, storeRecord: record } : undefined;
+  } catch {
+    // A compaction can retire the input before the next follow.
+    return undefined;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
 }
 
 // Reads one store as it changes. The first poll reads every file. Each later poll lists the store and reads only the
 // bytes appended since, so another window's entry arrives without a restart.
 export class CompressedStoreFollower {
   private readonly consumed = new Map<string, number>();
+  private readonly inputs = new Map<
+    string,
+    {
+      position: number;
+      start: number;
+      fragments: Buffer[];
+      versionKnown: boolean;
+      unsupported: boolean;
+    }
+  >();
   private readonly best = new Map<string, { ranked: RankedEntry; mark: string }>();
+  private readonly spend = new Map<string, RankedSpend & { record: CompressedStoreRecord }>();
+  private readonly quotedAt = Date.now();
+  private readonly resumedSpend = new Map<string, CompressedStoreRecord[]>();
+  private readonly relocated = new Map<string, CompressedStoreRecord>();
+  private readonly spendRelocated = new Map<string, CompressedStoreRecord>();
   private readonly seeds = new Map<string, CompressedEntrySeed>();
-  // The bytes every poll read so far.
+  private readonly changed = new Map<string, CompressedFactEntry>();
+  private readableInputs = new Set<string>();
+  private running: Promise<boolean> = Promise.resolve(true);
   bytesRead = 0;
+  contributorBytesRead = 0;
 
   constructor(
     readonly directory: string,
     private readonly statOf: typeof compressedPhysicalStat = compressedPhysicalStat,
     private readonly yieldStep: () => Promise<void> = yieldToEvents,
+    private readonly openInput: (file: string) => number = openForRead,
+    private readonly heldSpend?: (request: CompressedSpendRequest) => Promise<CompressedFactEntry | null | undefined>,
   ) {}
 
-  // A new worker starts from what the host holds, so its first poll reads only the bytes appended since the last reply.
-  // A seed ranks below any line that ties it, because a later line wins a tie.
+  // The host's offsets cover delivered envelopes and their spend witnesses.
   seed(resume: CompressedLoadResume): void {
     for (const [name, end] of resume.consumed) this.consumed.set(name, end);
     const nameSeeds = (resume.nameOnly ?? []).map((file): CompressedEntrySeed => ({
@@ -703,79 +1109,189 @@ export class CompressedStoreFollower {
     }));
     for (const seed of [...nameSeeds, ...resume.entries]) {
       this.best.set(seed.file, {
-        ranked: { entry: rankFields(seed), epoch: -1, token: '', input: '', offset: -1, seq: -1 },
+        ranked: rankedRecord(seed),
         mark: compressedEntryMark(seed),
       });
       this.seeds.set(seed.file, seed);
+      const records = [seed.spendRecord ?? (seed.hasSpend ? seed.storeRecord : undefined), seed.spendWitness].filter(
+        (record) => record !== undefined,
+      );
+      if (records.length) this.resumedSpend.set(seed.file, records);
     }
   }
 
-  // The byte offset that every poll reached in each store file.
   offsets(): [string, number][] {
     return [...this.consumed];
   }
 
-  // The newest entry of each path that a poll or the seed gave, without its title entry and spend record.
   known(): ReadonlyMap<string, CompressedEntrySeed> {
     return this.seeds;
   }
 
-  // The entries that are new or changed since the last poll.
-  async poll(): Promise<CompressedFactEntry[]> {
-    const names = listDirectory(this.directory);
-    const view = storeView(this.directory, names);
-    const present = new Set(names);
-    for (const name of this.consumed.keys()) if (!present.has(name)) this.consumed.delete(name);
-    const changed = new Map<string, CompressedFactEntry>();
-    for (const input of view.inputs) {
-      if (this.readInput(input, changed)) await this.yieldStep();
-    }
-    return [...changed.values()];
+  private takeRelocated(): [string, CompressedStoreRecord][] {
+    const entries = [...this.relocated];
+    this.relocated.clear();
+    return entries;
   }
 
-  // True when the input had new bytes.
-  private readInput(input: StoreName, changed: Map<string, CompressedFactEntry>): boolean {
+  private takeSpendRelocated(): [string, CompressedStoreRecord][] {
+    const entries = [...this.spendRelocated];
+    this.spendRelocated.clear();
+    return entries;
+  }
+
+  entry(file: string): CompressedFactEntry | undefined {
+    const record = this.seeds.get(file)?.storeRecord;
+    return record && readCompressedRecord(this.directory, file, record);
+  }
+
+  // A holder reads the same traversal as a follow. Only a follow takes the pending delivery.
+  private scan(limit: number): Promise<boolean> {
+    const running = this.running.catch(() => false).then(() => this.readView(limit));
+    this.running = running;
+    return running;
+  }
+
+  async poll(): Promise<CompressedFactEntry[]> {
+    return (await this.follow()).entries;
+  }
+
+  async follow(): Promise<{
+    entries: CompressedFactEntry[];
+    offsets: [string, number][];
+    relocated: [string, CompressedStoreRecord][];
+    spendRelocated: [string, CompressedStoreRecord][];
+  }> {
+    await this.scan(Infinity);
+    const entries = [...this.changed.values()].map((entry) => {
+      const record = this.spend.get(entry.file)?.record ?? this.resumedSpend.get(entry.file)?.[0];
+      return record && record.digest !== entry.storeRecord?.digest ? { ...entry, spendWitness: record } : entry;
+    });
+    this.changed.clear();
+    return {
+      entries,
+      offsets: this.offsets(),
+      relocated: this.takeRelocated(),
+      spendRelocated: this.takeSpendRelocated(),
+    };
+  }
+
+  cover(): Promise<boolean> {
+    return this.scan(FOLLOW_SLICE_BYTES);
+  }
+
+  private async readView(limit: number): Promise<boolean> {
+    let covered = true;
+    const unreadable = () => {
+      covered = false;
+    };
+    const names = listDirectory(this.directory, unreadable);
+    const view = storeView(this.directory, names, unreadable);
+    const present = new Set(names);
+    this.readableInputs = new Set(view.inputs.map(({ name }) => name));
+    for (const name of this.consumed.keys()) if (!present.has(name)) this.consumed.delete(name);
+    for (const name of this.inputs.keys()) if (!present.has(name)) this.inputs.delete(name);
+    let sliced = 0;
+    for (const input of view.inputs) {
+      let status: 'covered' | 'partial' | 'refused';
+      do {
+        const before = this.bytesRead;
+        status = this.readInput(input, Math.min(limit, FOLLOW_SLICE_BYTES - sliced));
+        const bytes = this.bytesRead - before;
+        limit -= bytes;
+        sliced += bytes;
+        if (sliced >= FOLLOW_SLICE_BYTES) {
+          sliced = 0;
+          await this.yieldStep();
+        }
+      } while (status === 'partial' && limit > 0);
+      if (status !== 'covered') covered = false;
+    }
+    return covered;
+  }
+
+  private readInput(input: StoreName, limit: number): 'covered' | 'partial' | 'refused' {
     const file = path.join(this.directory, input.name);
-    let size: number;
-    try {
-      size = fs.statSync(file).size;
-    } catch {
-      return false;
+    const start = this.consumed.get(input.name) ?? 0;
+    let cursor = this.inputs.get(input.name);
+    if (!cursor) {
+      cursor = { position: start, start, fragments: [], versionKnown: start > 0, unsupported: false };
+      this.inputs.set(input.name, cursor);
     }
-    let consumed = this.consumed.get(input.name);
-    if (consumed === undefined) {
-      if (!readableFactsVersion(fileFactsVersion(file))) {
+    let fd: number | undefined;
+    try {
+      const size = fs.statSync(file).size;
+      if (size < cursor.position) return 'refused';
+      if (size === cursor.position) return 'covered';
+      if (cursor.unsupported) {
+        cursor.position = size;
         this.consumed.set(input.name, size);
-        return false;
+        return 'covered';
       }
-      consumed = 0;
-    }
-    if (size <= consumed) return false;
-    let end = consumed;
-    try {
-      this.bytesRead += eachLine(
-        file,
-        (line, offset) => {
-          end = offset + line.length + 1;
+      if (limit <= 0) return 'partial';
+      fd = this.openInput(file);
+      const chunk = Buffer.allocUnsafe(READ_CHUNK);
+      while (cursor.position < size && limit > 0) {
+        const count = fs.readSync(fd, chunk, 0, Math.min(READ_CHUNK, size - cursor.position, limit), cursor.position);
+        if (!count) return 'refused';
+        this.bytesRead += count;
+        limit -= count;
+        const head = cursor.position;
+        cursor.position += count;
+        let from = 0;
+        for (
+          let end = chunk.subarray(0, count).indexOf(0x0a);
+          end >= 0;
+          end = chunk.subarray(0, count).indexOf(0x0a, from)
+        ) {
+          const part = chunk.subarray(from, end);
+          const line = cursor.fragments.length ? Buffer.concat([...cursor.fragments, part]) : part;
           const entry = parseEntry(line.toString('utf8'));
-          if (!entry || !readableFactsVersion(entry.factsVersion)) return;
-          this.rank(entry, input, offset, changed);
-        },
-        openForRead,
-        consumed,
-      );
+          if (!cursor.versionKnown) {
+            cursor.versionKnown = true;
+            cursor.unsupported = !!entry && !readableFactsVersion(entry.factsVersion);
+          }
+          if (cursor.unsupported) {
+            cursor.position = size;
+            cursor.fragments = [];
+            this.consumed.set(input.name, size);
+            return 'covered';
+          }
+          if (entry && readableFactsVersion(entry.factsVersion)) this.rank(entry, input, cursor.start, line);
+          from = end + 1;
+          cursor.start = head + from;
+          cursor.fragments = [];
+          this.consumed.set(input.name, cursor.start);
+        }
+        if (from < count) cursor.fragments.push(Buffer.from(chunk.subarray(from, count)));
+      }
+      return cursor.position === size ? 'covered' : 'partial';
     } catch {
-      // The file went away. The next listing no longer names it.
+      // A listed input that gave no answer leaves a conditional write pending.
+      return 'refused';
+    } finally {
+      if (fd !== undefined) fs.closeSync(fd);
     }
-    this.consumed.set(input.name, end);
-    return true;
+  }
+
+  noteAppend(entry: CompressedFactEntry, record: CompressedStoreRecord): void {
+    const { input, offset, bytes } = record;
+    const name = storeName(input)!;
+    this.readableInputs.add(input);
+    const cursor = this.inputs.get(input);
+    if ((cursor?.position ?? this.consumed.get(input) ?? 0) !== offset || (cursor && cursor.start !== offset)) return;
+    this.rank(entry, name, offset, record);
+    if (eligibleCompressedSpend(entry)) this.resumedSpend.delete(entry.file);
+    const end = offset + bytes;
+    this.consumed.set(input, end);
+    this.inputs.set(input, { position: end, start: end, fragments: [], versionKnown: true, unsupported: false });
   }
 
   private rank(
     entry: CompressedFactEntry,
     input: StoreName,
     offset: number,
-    changed: Map<string, CompressedFactEntry>,
+    line: Buffer | CompressedStoreRecord,
   ): void {
     const ranked: RankedEntry = {
       entry: rankFields(entry),
@@ -786,11 +1302,103 @@ export class CompressedStoreFollower {
       seq: input.seq,
     };
     const held = this.best.get(entry.file);
-    if (held && compareRankedEntries(ranked, held.ranked, this.statOf(entry.file)) <= 0) return;
+    const witness = this.spend.get(entry.file);
+    const better = !held || compareRankedEntries(ranked, held.ranked, this.statOf(entry.file)) > 0;
+    const spend = rankSpend(entry, ranked, witness, this.quotedAt);
+    if (!better && !spend) return;
+    const storeRecord = Buffer.isBuffer(line)
+      ? {
+          input: input.name,
+          offset,
+          bytes: line.length + 1,
+          digest: createHash('sha256').update(line).update('\n').digest('base64url'),
+          spendDigest: spendDigest(entry.spend),
+        }
+      : line;
+    const { digest } = storeRecord;
+    if (spend) {
+      const record = spend.ranked === ranked ? storeRecord : witness!.record;
+      this.spend.set(entry.file, { ...spend, record });
+      if (
+        spend.ranked === ranked &&
+        (!better || this.resumedSpend.get(entry.file)?.some((ref) => ref.digest === digest))
+      )
+        this.spendRelocated.set(entry.file, storeRecord);
+    }
+    if (!better) return;
     const mark = compressedEntryMark(entry);
+    const prior = this.seeds.get(entry.file)?.storeRecord;
+    const located = { ...entry, storeRecord };
     this.best.set(entry.file, { ranked, mark });
-    this.seeds.set(entry.file, compressedEntrySeed(entry));
-    if (held?.mark !== mark) changed.set(entry.file, entry);
+    this.seeds.set(entry.file, compressedEntrySeed(located));
+    if (held?.mark !== mark || (prior && prior.digest !== digest) || this.changed.has(entry.file)) {
+      this.relocated.delete(entry.file);
+      this.changed.set(entry.file, located);
+    } else if (!entry.nameOnly || entry.unreadable) {
+      this.relocated.set(entry.file, storeRecord);
+    }
+  }
+
+  // Exact hydration is limited to the affected path's ranked envelope and independent spend witnesses.
+  async carriedEntry(next: CompressedFactEntry): Promise<CompressedFactEntry | undefined> {
+    const file = next.file;
+    const seed = this.seeds.get(file);
+    const envelope = seed?.storeRecord;
+    const witness = this.spend.get(file)?.record;
+    const resumed = this.resumedSpend.get(file) ?? [];
+    const located = [...resumed, ...(next.unreadable || seed?.hasSpend ? [envelope] : []), witness];
+    const refs = new Map(located.flatMap((ref) => (ref ? [[ref.digest, ref]] : [])));
+    let prior: CompressedFactEntry | undefined;
+    const candidates: CompressedFactEntry[] = [];
+    for (const ref of refs.values()) {
+      let entry: CompressedFactEntry | undefined;
+      if (this.readableInputs.has(ref.input)) {
+        entry = readCompressedRecord(this.directory, file, ref);
+        if (!entry) return undefined;
+        this.contributorBytesRead += ref.bytes;
+      } else if (ref.spendDigest && resumed.includes(ref) && this.heldSpend) {
+        const answer = await this.heldSpend({ file, record: ref });
+        if (answer === undefined) return undefined;
+        entry = heldCompressedSpend(answer ?? undefined, { file, record: ref });
+      }
+      if (!entry) continue;
+      if (!compressedFactsSameOwner(entry, next)) continue;
+      if (ref.digest === envelope?.digest && !entry.nameOnly && !entry.adoptionFailed && !entry.spendNeedsRepair)
+        prior = entry;
+      if (eligibleCompressedSpend(entry)) candidates.push(entry);
+    }
+    candidates.sort((a, b) => compareCompressedEntries(a, b, null));
+    let spent: CompressedFactEntry | undefined;
+    for (const entry of candidates) {
+      if (
+        (entry.complete !== false && !entry.undercount && !entry.unreadable) ||
+        keepHigherSpend(spent?.spend, entry.spend) === entry.spend
+      )
+        spent = entry;
+    }
+    if (!next.unreadable) return withKeptUndercount(spent, next);
+    if (!prior && !spent) return next;
+    const kept = prior ?? spent!;
+    const { title, carriedName, complete } = kept;
+    const spend = spent?.spend;
+    return {
+      ...next,
+      nameOnly: undefined,
+      title: compressedTitleCurrent(kept) ? title : undefined,
+      carriedName:
+        carriedName ??
+        (title && !compressedTitleCurrent(kept) ? { label: title.label, fullLabel: title.fullLabel } : undefined),
+      complete,
+      hash: compressedEntryCurrent(kept, next as CompressedRevision) ? kept.hash : undefined,
+      spend,
+      spendOrigin:
+        spend && spent
+          ? {
+              ...(spent.spendOrigin ?? compressedSpendOrigin(spent.threadId, spend, spent.hash)),
+              retained: true,
+            }
+          : undefined,
+    };
   }
 }
 
@@ -860,8 +1468,12 @@ export class CompressedStoreHolder {
   private readonly compactSegments: number;
 
   private readonly queue: CompressedFactEntry[] = [];
-  private readonly flushed = new WeakSet<CompressedFactEntry>();
-  private readonly revisionTests = new WeakMap<CompressedFactEntry, () => boolean>();
+  private readonly flushed = new WeakMap<CompressedFactEntry, CompressedStoreRecord>();
+  private readonly revisionTests = new WeakMap<CompressedFactEntry, () => boolean | undefined>();
+  private readonly conditional = new WeakMap<CompressedFactEntry, CompressedStoreFollower>();
+  private readonly finalized = new WeakMap<CompressedFactEntry, CompressedFactEntry>();
+  private factsFollower?: CompressedStoreFollower;
+  private covered = false;
   private readonly withdrawn = new WeakSet<CompressedFactEntry>();
   private waiters: { entries: readonly CompressedFactEntry[]; settle: (durable: boolean) => void }[] = [];
   private token: string | null = null;
@@ -925,10 +1537,26 @@ export class CompressedStoreHolder {
   // Queue entries and work them off. The returned promise settles when this run of the queue ends, with one value per
   // entry: true when its line is on disk. A false value leaves the entry queued, and `durable` reports its end.
   // `revisionHolds` runs at the write. A false answer withdraws the entry, and nothing writes its line.
-  append(entries: readonly CompressedFactEntry[], revisionHolds?: () => boolean): Promise<boolean[]> {
+  append(entries: readonly CompressedFactEntry[], revisionHolds?: () => boolean | undefined): Promise<boolean[]> {
     if (revisionHolds) for (const entry of entries) this.revisionTests.set(entry, revisionHolds);
     this.queue.push(...entries);
     return this.work().then(() => entries.map((entry) => this.flushed.has(entry)));
+  }
+
+  async appendCarryingFacts(
+    entry: CompressedFactEntry,
+    revisionHolds: () => boolean | undefined,
+    follower?: CompressedStoreFollower,
+  ): Promise<CompressedFactEntry | undefined> {
+    this.factsFollower ??=
+      follower ?? new CompressedStoreFollower(this.directory, this.statOf, this.yieldStep, this.openInput);
+    if (entry.undercount || entry.unreadable) this.conditional.set(entry, this.factsFollower);
+    const [written] = await this.append([entry], revisionHolds);
+    return written || (await this.durable([entry])) ? this.finalized.get(entry) : undefined;
+  }
+
+  recordOf(entry: CompressedFactEntry): CompressedStoreRecord | undefined {
+    return this.flushed.get(entry);
   }
 
   // True when every entry reaches the disk, or false when one is withdrawn or the holder is disposed first.
@@ -969,19 +1597,28 @@ export class CompressedStoreHolder {
   }
 
   private async run(): Promise<void> {
-    while (this.queue.length && !this.disposed) {
-      this.cancelIdle?.();
-      this.cancelIdle = null;
-      if (!this.token && !(await this.takeLease())) {
-        this.retryLater();
+    if (this.cancelRetry) return;
+    this.cancelIdle?.();
+    this.cancelIdle = null;
+    if (this.queue.length && !this.token && !(await this.takeLease())) {
+      this.retryLater();
+      return;
+    }
+    const deferred = new Set<CompressedFactEntry>();
+    while (this.queue.length && this.token && !this.disposed) {
+      const first = this.queue[0];
+      if (deferred.has(first)) {
+        this.abandon();
         return;
       }
-      while (this.queue.length && this.token) {
-        if (!this.publishBatch()) return;
-        if (this.closedSegments >= this.compactSegments && this.compactionAllowed()) await this.compact(false);
-        await this.yieldStep();
-      }
+      const progress = await this.publishBatch();
       if (!this.token) return;
+      if (!progress) {
+        deferred.add(first);
+        this.queue.push(this.queue.shift()!);
+      }
+      if (this.closedSegments >= this.compactSegments && this.compactionAllowed()) await this.compact(false);
+      await this.yieldStep();
     }
     this.armIdleRelease();
   }
@@ -1058,6 +1695,7 @@ export class CompressedStoreHolder {
     this.cancelRenewal = null;
     this.token = null;
     this.epoch = null;
+    this.covered = false;
     if (token) {
       try {
         releaseCodexOpeningsLock(this.lock, token);
@@ -1186,20 +1824,58 @@ export class CompressedStoreHolder {
     this.closedSegments++;
   }
 
-  private publishBatch(): boolean {
+  private async publishBatch(): Promise<boolean> {
     let bytes = 0;
     let taken = 0;
     let oversized = false;
     const lines: string[] = [];
+    const prepared: CompressedFactEntry[] = [];
     while (taken < this.queue.length && bytes < this.segmentBytes) {
-      let entry = this.queue[taken];
-      if (this.revisionTests.get(entry)?.() === false) {
+      const queued = this.queue[taken];
+      const test = this.revisionTests.get(queued);
+      let revision = test ? test() : true;
+      if (revision === undefined) {
+        if (!taken) return false;
+        break;
+      }
+      if (!revision) {
         this.queue.splice(taken, 1);
-        this.withdrawn.add(entry);
+        this.withdrawn.add(queued);
         this.settleWaiters();
         continue;
       }
-      entry = boundedCompressedEntry(entry);
+      let entry = queued;
+      const follower = this.conditional.get(queued);
+      if (follower) {
+        if (taken) break;
+        if (!this.covered) {
+          const covered = await follower.cover();
+          if (!this.check() || !covered) return false;
+          this.covered = true;
+        }
+        const final = await follower.carriedEntry(queued);
+        if (!final) {
+          this.covered = false;
+          return false;
+        }
+        revision = test ? test() : true;
+        if (revision === undefined) return false;
+        if (!revision) {
+          this.queue.splice(taken, 1);
+          this.withdrawn.add(queued);
+          this.settleWaiters();
+          continue;
+        }
+        entry = final;
+      }
+      const {
+        storeRecord: _reference,
+        spendRecord: _spend,
+        spendWitness: _witness,
+        hasSpend: _hasSpend,
+        ...facts
+      } = entry;
+      entry = boundedCompressedEntry(facts);
       const line = `${JSON.stringify(entry)}\n`;
       const length = Buffer.byteLength(line);
       // A record above 4 MiB gets a segment file of its own.
@@ -1207,13 +1883,16 @@ export class CompressedStoreHolder {
         if (taken) break;
         oversized = true;
         lines.push(line);
+        prepared.push(entry);
         bytes = length;
         taken = 1;
         break;
       }
       lines.push(line);
+      prepared.push(entry);
       bytes += length;
       taken++;
+      if (follower) break;
     }
     if (!taken) return true;
     if (!this.check()) return false;
@@ -1226,7 +1905,23 @@ export class CompressedStoreHolder {
     this.wrote(bytes);
     this.fault('segment:flushed');
     if (!this.flushReachedStore(segment)) return false;
-    for (const flushed of this.queue.splice(0, taken)) this.flushed.add(flushed);
+    let offset = segment.bytes - bytes;
+    for (const [at, flushed] of this.queue.splice(0, taken).entries()) {
+      const line = lines[at];
+      const length = Buffer.byteLength(line);
+      const entry = prepared[at];
+      const storeRecord = {
+        input: segment.name,
+        offset,
+        bytes: length,
+        digest: recordDigest(line),
+        spendDigest: spendDigest(entry.spend),
+      };
+      this.flushed.set(flushed, storeRecord);
+      this.finalized.set(flushed, { ...entry, storeRecord });
+      if (this.covered) this.factsFollower?.noteAppend(entry, storeRecord);
+      offset += length;
+    }
     this.settleWaiters();
     if (oversized || segment.bytes >= this.segmentBytes) this.closeSegment();
     return true;
@@ -1260,9 +1955,17 @@ export class CompressedStoreHolder {
 
   // Recovery at a takeover, before the holder writes any shard, segment or manifest.
   private async recover(): Promise<void> {
-    const names = listDirectory(this.directory);
-    const view = storeView(this.directory, names);
+    let refused = false;
+    const unreadable = () => {
+      refused = true;
+    };
+    const names = listDirectory(this.directory, unreadable);
+    const view = storeView(this.directory, names, unreadable);
     this.fault('recovery:start');
+    if (refused) {
+      this.abandon();
+      return;
+    }
     // A holder paused since its listing deletes nothing, because the listing no longer describes the store.
     if (!this.check()) return;
     const current = view.current;
@@ -1332,6 +2035,7 @@ export class CompressedStoreHolder {
   private async compact(recovery: boolean): Promise<void> {
     if (!this.token) return;
     this.closeSegment();
+    this.covered = false;
     this.fault('compact:start');
     const names = listDirectory(this.directory);
     const view = storeView(this.directory, names);
@@ -1374,6 +2078,8 @@ export class CompressedStoreHolder {
     recovery: boolean,
   ): Promise<void> {
     const best = new Map<string, RankedEntry>();
+    const spend = new Map<string, RankedSpend>();
+    const quotedAt = this.now();
     for (const input of inputs) {
       this.readInputLines(input.name, (line, offset) => {
         const entry = parseEntry(line.toString('utf8'));
@@ -1388,6 +2094,8 @@ export class CompressedStoreHolder {
         };
         const held = best.get(entry.file);
         if (!held || compareRankedEntries(ranked, held, this.statOf(entry.file)) > 0) best.set(entry.file, ranked);
+        const witness = rankSpend(entry, ranked, spend.get(entry.file), quotedAt);
+        if (witness) spend.set(entry.file, witness);
       });
       await this.yieldStep();
     }
@@ -1409,7 +2117,10 @@ export class CompressedStoreHolder {
       bytes = 0;
       return true;
     };
-    for (const ranked of kept) {
+    for (const ranked of kept.flatMap((envelope) => {
+      const witness = spend.get(envelope.entry.file)?.ranked;
+      return witness && witness !== envelope && rankedSameOwner(witness, envelope) ? [witness, envelope] : [envelope];
+    })) {
       const line = `${this.readInputLine(ranked.input, ranked.offset)}\n`;
       text += line;
       bytes += Buffer.byteLength(line);
