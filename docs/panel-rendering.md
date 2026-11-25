@@ -38,6 +38,8 @@ Send snapshots on page readiness, gaps, failed or unready posts, and changes to 
 
 Selection messages replace drawn rows without changing delta bases. The next render replaces all three drawn lists. The next session list message replaces drawn `rail` and `stats`.
 
+A session list update carries corrected session rows when an Antigravity name loses its source authority. The host retires the affected names before it sends the update. An unchanged file can supply a fresh name when ownership returns. The panel replaces its held rows and refreshes descendant headings from the same update.
+
 ### Visibility and catalog availability
 
 Ready panels receive revisioned visibility, including initial visibility. `webview/retained-visibility.ts` owns paint and geometry checks. Hidden pages stay transparent until paint and a current observation agree on a positive rectangle that the visible area covers. Chromium snaps a webview frame's visible area to whole device pixels. At a fractional device pixel ratio, a fully shown page can report an intersection ratio below 1. Zoomed windows use such ratios. Coverage allows a shortfall of one device pixel per edge, plus 1/64 CSS pixel for layout rounding. Geometry changes invalidate prior observations and callbacks. Each generation uses a fresh observer. No larger minimum viewport applies. Without IntersectionObserver, paint alone releases the page.

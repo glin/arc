@@ -1,4 +1,6 @@
 import * as crypto from 'node:crypto';
+import { matchesAgyAdmission, agySessionId, type AgyAdmission } from './agydiscovery';
+import { createAgySessionReducer, readAgySession, AGY_COST_UNAVAILABLE } from './agyhistory';
 import * as fs from 'node:fs';
 import {
   readCodexSession,
@@ -36,6 +38,7 @@ import { createClaudeRepeatedFilter, ClaudeRepeatedPrefix } from './clauderepeat
 import { meterRead } from './readmeter.ts';
 import {
   beginForwardSessionRecovery,
+  CONTENT_ANCHOR_BYTES,
   readStableRange,
   ForwardRecoveryLimit,
   type IncrementalSessionResult,
@@ -889,7 +892,7 @@ export type SessionTurn = Pick<
   | 'finished'
   | 'interrupted'
   | 'error'
->;
+> & { agyUsage?: Turn['agyUsage']; cost?: { usd: null; display: string } };
 
 export interface SessionQuestions {
   state: 'current' | 'partial' | 'unavailable';
@@ -946,8 +949,40 @@ export function guardedSourceIdentity(source: Pick<SessionFile, 'file' | 'agent'
   }
 }
 
+export type AgyReadAdmission = () => AgyAdmission | undefined;
+
+function acceptsAgyStat(stat: fs.BigIntStats, source: SessionFile): boolean {
+  const revision = revisionOf(stat);
+  return (
+    stat.isFile() &&
+    sessionSourceAdmitted(source, revision) &&
+    source.size === revision.size &&
+    source.mtimeMs === revision.mtimeMs
+  );
+}
+
 // Qualify one accepted candidate without changing catalog membership or its retained revision.
-function qualifySessionReadSource(source: SessionFile, roots: readonly string[]): SessionFile | string {
+function qualifySessionReadSource(
+  source: SessionFile,
+  roots: readonly string[],
+  agy: AgyAdmission | undefined,
+): SessionFile | string {
+  if (source.agent === 'agy') {
+    if (!agy || !matchesAgyAdmission(source, agy)) return 'The Antigravity session needs current discovery.';
+    try {
+      const stat = fs.lstatSync(source.file, { bigint: true });
+      if (
+        agySessionId(source.file) === source.sessionId &&
+        source.agyOwnerRoot &&
+        isInside(source.agyOwnerRoot, [...roots]) &&
+        acceptsAgyStat(stat, source)
+      )
+        return source;
+    } catch {
+      // The file can disappear between listing and reading.
+    }
+    return 'The Antigravity session changed. Retry after session discovery.';
+  }
   const deadline = performance.now() + SESSION_READ_LIMITS.qualificationMs;
   const opening =
     source.agent === 'codex'
@@ -1009,27 +1044,46 @@ export const AGENT_SOURCE_LIMITS = {
 // Large sources and discarded identities retain uncertain coverage and admit no agent keys.
 export class AgentReadSources {
   private readonly held = new Map<string, AgentReadSource>();
+  private readonly agyAdmissions = new WeakMap<AgentReadSource, AgyAdmission>();
+
+  admissionOf(facts: AgentReadSource): AgyAdmission | undefined {
+    return this.agyAdmissions.get(facts);
+  }
+
+  forget(source: SessionFile): void {
+    this.held.delete(sessionSourceKey(source.agent, source.sessionId, source.file));
+  }
 
   resolve(
     source: SessionFile,
     scope: () => string | null,
     roots: readonly string[],
     expectedRevision?: string,
+    agy?: AgyReadAdmission,
   ): AgentReadSource | null {
+    const admission = source.agent === 'agy' ? agy?.() : undefined;
+    if (source.agent === 'agy' && (!admission || !matchesAgyAdmission(source, admission))) return null;
     const beforeScope = scope();
     const before = guardedSourceRevision(source.file);
     const identity = guardedSourceIdentity(source);
     if (beforeScope === null || before === null || identity === null) return null;
     const key = sessionSourceKey(source.agent, source.sessionId, source.file);
     const cached = this.held.get(key);
-    if (cached && (cached.sourceRevision !== before || cached.source !== identity || cached.scope !== beforeScope))
+    if (
+      cached &&
+      (cached.sourceRevision !== before ||
+        cached.source !== identity ||
+        cached.scope !== beforeScope ||
+        this.admissionOf(cached) !== admission)
+    )
       this.held.delete(key);
     if (expectedRevision !== undefined && expectedRevision !== before) return null;
-    const qualified = qualifySessionReadSource(source, roots);
+    const qualified = qualifySessionReadSource(source, roots, admission);
     if (typeof qualified === 'string' || guardedSourceRevision(source.file) !== before) return null;
     source = qualified;
     const size = source.size;
     const current = () =>
+      (!admission || agy?.() === admission) &&
       scope() === beforeScope &&
       guardedSourceRevision(source.file) === before &&
       guardedSourceIdentity(source) === identity;
@@ -1052,7 +1106,9 @@ export class AgentReadSources {
     if (size <= AGENT_SOURCE_LIMITS.bytes - CODEX_OPENING_BYTES) {
       let fd = -1;
       try {
+        if (admission && !current()) return null;
         fd = fs.openSync(source.file, 'r');
+        if (admission && !acceptsAgyStat(fs.fstatSync(fd, { bigint: true }), source)) return null;
         const body = Buffer.allocUnsafe(size);
         let offset = 0;
         while (offset < size) {
@@ -1061,19 +1117,19 @@ export class AgentReadSources {
           if (!count) return null;
           offset += count;
         }
+        if (admission && !acceptsAgyStat(fs.fstatSync(fd, { bigint: true }), source)) return null;
         const lines = body.toString('utf8').split('\n');
+        const maxTurns = AGENT_SOURCE_LIMITS.identities;
         const reducer =
-          source.agent === 'codex'
-            ? createCodexSessionReducer(
-                source.sessionId,
-                { maxTurns: AGENT_SOURCE_LIMITS.identities, turnsOnly: true },
-                openingRecordOf(lines[0]),
-              )
-            : createClaudeSessionReducer(source.sessionId, {
-                maxTurns: AGENT_SOURCE_LIMITS.identities,
-                turnsOnly: true,
-                childTranscript: source.childTranscript === true,
-              });
+          source.agent === 'agy'
+            ? createAgySessionReducer(source.file, source.sessionId, maxTurns)
+            : source.agent === 'codex'
+              ? createCodexSessionReducer(source.sessionId, { maxTurns, turnsOnly: true }, openingRecordOf(lines[0]))
+              : createClaudeSessionReducer(source.sessionId, {
+                  maxTurns,
+                  turnsOnly: true,
+                  childTranscript: source.childTranscript === true,
+                });
         const repeated = source.agent === 'claude' ? createClaudeRepeatedFilter() : () => false;
         for (const line of lines) if (!repeated(line)) reducer.pushLine(line);
         const read = reducer.finish(offset);
@@ -1103,6 +1159,7 @@ export class AgentReadSources {
     if (!current()) return null;
     facts.turns = Object.freeze(facts.turns.map((turn) => Object.freeze(turn)));
     Object.freeze(facts);
+    if (admission) this.agyAdmissions.set(facts, admission);
     this.held.set(key, facts);
     while (
       this.held.size > AGENT_SOURCE_LIMITS.sources ||
@@ -1128,6 +1185,7 @@ export function boundedSessionRead(
   roots: readonly string[],
   observe?: (facts: { scope: string; sourceRevision: string; latestTurn: string | null }) => string | null,
   observeRead?: (facts: ReadObservationFacts) => string | null,
+  agy?: AgyReadAdmission,
 ) {
   if (!Number.isSafeInteger(turns) || turns < 1 || turns > SESSION_READ_LIMITS.turns)
     throw new Error('Turns must be between 1 and 20.');
@@ -1150,43 +1208,50 @@ export function boundedSessionRead(
     result.notes.push('The session source or repository scope is unavailable.');
     return result;
   }
-  const qualified = qualifySessionReadSource(source, roots);
+  const admission = source.agent === 'agy' ? agy?.() : undefined;
+  const qualified = qualifySessionReadSource(source, roots, admission);
   if (typeof qualified === 'string') {
     result.state = 'stale';
     result.notes.push(qualified);
     return result;
   }
   source = qualified;
-  if (beforeScope !== scope() || before !== revision(source.file)) {
+  if (beforeScope !== scope() || before !== revision(source.file) || (admission && agy?.() !== admission)) {
     result.state = 'stale';
     result.notes.push('The session or repository scope changed during qualification. Retry the command.');
     return result;
   }
   const read =
-    source.agent === 'codex'
-      ? readCodexSession(source.file, source.sessionId, {
-          tailBytes: SESSION_READ_LIMITS.bytes - 2 * CODEX_OPENING_BYTES,
+    source.agent === 'agy'
+      ? readAgySession(source.file, source.sessionId, {
+          tailBytes: SESSION_READ_LIMITS.bytes - CONTENT_ANCHOR_BYTES,
           maxTurns: turns,
-          turnsOnly: true,
-        })
-      : readSession(source.file, source.sessionId, {
-          tailBytes: SESSION_READ_LIMITS.bytes - 64 * 1024,
-          maxTurns: turns,
-          childTranscript: source.childTranscript === true,
-          turnsOnly: true,
-          boundedRepeated: true,
-        });
-  if (beforeScope !== scope() || before !== revision(source.file)) {
+        }).read
+      : source.agent === 'codex'
+        ? readCodexSession(source.file, source.sessionId, {
+            tailBytes: SESSION_READ_LIMITS.bytes - 2 * CODEX_OPENING_BYTES,
+            maxTurns: turns,
+            turnsOnly: true,
+          })
+        : readSession(source.file, source.sessionId, {
+            tailBytes: SESSION_READ_LIMITS.bytes - 64 * 1024,
+            maxTurns: turns,
+            childTranscript: source.childTranscript === true,
+            turnsOnly: true,
+            boundedRepeated: true,
+          });
+  if (beforeScope !== scope() || before !== revision(source.file) || (admission && agy?.() !== admission)) {
     result.state = 'stale';
     result.notes.push('The session or repository scope changed during the read. Retry the command.');
     return result;
   }
+  if (!read) return result;
   result.state = read.turns.length ? 'current' : 'unparsed';
   result.partial = read.readBytes < source.size || read.turnLimitReached;
   const latest = read.turns.at(-1);
   result.subagentContext = sessionSubagentContext(read, read.readBytes < source.size);
   const observation =
-    observe && result.state === 'current' && latest
+    source.agent !== 'agy' && observe && result.state === 'current' && latest
       ? observe({ scope: beforeScope, sourceRevision: before, latestTurn: latest.promptId ?? null })
       : null;
   // The response limit below reserves room for the observation.
@@ -1194,7 +1259,24 @@ export function boundedSessionRead(
     (observation ? Buffer.byteLength(JSON.stringify({ observation })) : 0) + (observeRead ? READ_OBSERVATION_BYTES : 0);
   for (const turn of [...read.turns].reverse()) {
     const { promptId, startedAt, endedAt, prompt, summary, model, effort, finished, interrupted, error } = turn;
-    result.turns.push({ promptId, startedAt, endedAt, prompt, summary, model, effort, finished, interrupted, error });
+    result.turns.push({
+      promptId,
+      startedAt,
+      endedAt,
+      prompt,
+      summary,
+      model,
+      effort,
+      finished,
+      interrupted,
+      error,
+      ...(source.agent === 'agy'
+        ? {
+            agyUsage: turn.agyUsage,
+            cost: { usd: null, display: AGY_COST_UNAVAILABLE },
+          }
+        : {}),
+    });
     if (Buffer.byteLength(JSON.stringify(result)) + reserved > SESSION_READ_LIMITS.outputBytes - 512) {
       result.turns.pop();
       result.partial = true;
@@ -1267,7 +1349,7 @@ function sessionSubagentContext(
 export const RECORDED_REPLY_LIMITS = { sessions: 32, turns: 4, tailBytes: 1024 * 1024, sources: 1 } as const;
 
 export interface RecordedReply {
-  provider?: 'claude' | 'codex';
+  provider?: SessionFile['agent'];
   nativeTurnId?: string;
   ownerTurnId?: number;
   // The assistant message id of the final response.
@@ -1358,6 +1440,7 @@ export class RecordedReplies {
     let currentActive: SessionFile | null = null;
     for (let index = 0; index < sources.length; index++) {
       const source = sources[index];
+      if (source.agent === 'agy') continue;
       if (!this.waiting.get(source.sessionId)?.some((reply) => !reply.provider || reply.provider === source.agent))
         continue;
       if (
@@ -1570,7 +1653,7 @@ export class RecordedReplies {
   settle(
     session: string,
     turns: readonly (Pick<Turn, 'finalResponse'> & Partial<Pick<Turn, 'promptId'>>)[],
-    provider?: 'claude' | 'codex',
+    provider?: SessionFile['agent'],
   ): void {
     const held = this.waiting.get(session);
     if (!held) return;
@@ -1598,6 +1681,7 @@ export class RecordedReplies {
 // The newest recorded turns with their final responses. The read is bounded and
 // does not depend on a panel showing the session.
 export function recordedReplyTurns(source: SessionFile): Turn[] {
+  if (source.agent === 'agy') return [];
   return (source.agent === 'codex' ? readCodexSession : readSession)(source.file, source.sessionId, {
     maxTurns: RECORDED_REPLY_LIMITS.turns,
     tailBytes: RECORDED_REPLY_LIMITS.tailBytes,
