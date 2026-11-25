@@ -1368,6 +1368,10 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
         const projected = railAcrossSessionAdoption(msg.rail, msg.stats, msg.sessionAdoptions);
         const labeledBefore = latest ? labeledSessions() : null;
         if (latest) {
+          if (msg.sessions) {
+            latest.sessions = msg.sessions;
+            latest.sessionAdoptions = msg.sessionAdoptions;
+          }
           latest.rail = projected.rail;
           latest.stats = projected.stats;
           latest.labels = msg.labels;
@@ -1375,6 +1379,10 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
           latest.railFilters = msg.railFilters;
           latest.hidden = msg.hidden;
           latest.pinnedTop = msg.pinnedTop;
+        }
+        if (latest && msg.sessions) {
+          repaint();
+          return;
         }
         railRenderer.update(
           projected.rail,

@@ -88,9 +88,9 @@ export interface ForwardRecoveryControl {
   recordLimit: number;
   // An unfinished record larger than this is reduced while it is read, and the record limit applies to the reduced bytes.
   reduceAbove: number;
-  accepts(text: string): boolean;
-  // The text kept for an accepted record. Absent keeps the whole record.
-  retain?(text: string): string;
+  accepts?(text: string): boolean;
+  // The text kept for an accepted record. Null discards it. Absent keeps the whole record.
+  retain?(text: string): string | null;
   fragments: Buffer[];
   // Source bytes of the unfinished record, whether held whole or reduced.
   fragmentBytes: number;
@@ -152,13 +152,14 @@ export function* frameRecovery<State>(
         : body.subarray(start, end);
     }
     const text = bytes.toString('utf8');
-    if (control.accepts(text)) {
+    const retained = control.accepts?.(text) === false ? null : control.retain ? control.retain(text) : text;
+    if (retained !== null) {
       // Charge retained source text conservatively for strings and reducer associations.
-      const charge = bytes.length * 8 + 256;
+      const charge = (retained === text ? bytes.length : Buffer.byteLength(retained)) * 8 + 256;
       yield* reserve(charge);
       control.retainedCharge += charge;
       const line = {
-        text: control.retain ? control.retain(text) : text,
+        text: retained,
         start: appliedThrough,
         end: baseOffset + end,
         ...(reduced ? { reduced: true } : {}),
@@ -265,7 +266,7 @@ export interface SemanticHistoryOptions {
   pause?: () => Promise<void>;
 }
 
-const CONTENT_ANCHOR_BYTES = 4096;
+export const CONTENT_ANCHOR_BYTES = 4096;
 const DEFAULT_FORWARD_BYTES = 4 * 1024 * 1024;
 
 function sameRevision(a: FileRevision, b: FileRevision): boolean {

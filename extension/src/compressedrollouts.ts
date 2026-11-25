@@ -137,12 +137,61 @@ export function zstdFrames() {
 // zstd decoder, when the stream does not decode, or when no line ends within `maxBytes` decoded bytes. A body that ends
 // before its first line break answers null, because its first record is not complete. `report.failed` marks no decoder,
 // a stream that does not decode and a body that ends before its first line break. A file system refusal rejects.
-export async function readCompressedFirstRecord(
+export function readCompressedFirstRecord(
   file: string,
   maxBytes: number,
-  report?: { failed?: boolean },
+  report?: { failed?: boolean; stale?: boolean; bounded?: boolean },
+  expected?: CompressedStat,
+  placement?: { signal: AbortSignal; work?: CompressedOpeningWork },
 ): Promise<string | null> {
-  const decoder = await announcedZstdDecoder();
+  if (!expected)
+    return decodeCompressedFirstRecord(
+      () => fs.createReadStream(file, { highWaterMark: READ_CHUNK }),
+      maxBytes,
+      report,
+    );
+  return readPlacedFirstRecord(file, maxBytes, expected, report, placement);
+}
+
+async function readPlacedFirstRecord(
+  file: string,
+  maxBytes: number,
+  expected: CompressedStat,
+  report?: { failed?: boolean; stale?: boolean; bounded?: boolean },
+  placement?: { signal: AbortSignal; work?: CompressedOpeningWork },
+): Promise<string | null> {
+  if (placement?.signal.aborted) return null;
+  const handle = await fs.promises.open(file, 'r');
+  try {
+    if (!sameStat(revisionOf(await handle.stat({ bigint: true })), expected)) {
+      if (report) report.stale = true;
+      return null;
+    }
+    const first = await decodeCompressedFirstRecord(
+      () => compressedFileChunks(handle, maxBytes, placement?.signal, placement?.work),
+      maxBytes,
+      report,
+      placement?.signal,
+      placement?.work,
+    );
+    if (!sameStat(revisionOf(await handle.stat({ bigint: true })), expected)) {
+      if (report) report.stale = true;
+      return null;
+    }
+    return first;
+  } finally {
+    await handle.close();
+  }
+}
+
+async function decodeCompressedFirstRecord(
+  source: () => AsyncIterable<Buffer> | fs.ReadStream,
+  maxBytes: number,
+  report?: { failed?: boolean; bounded?: boolean },
+  signal?: AbortSignal,
+  work?: CompressedOpeningWork,
+): Promise<string | null> {
+  const decoder = await announcedZstdDecoder(signal ? DECODER_WINDOW_LOG : undefined);
   if (!decoder) {
     if (report) report.failed = true;
     return null;
@@ -153,16 +202,18 @@ export async function readCompressedFirstRecord(
   const stop = new AbortController();
   try {
     await pipeline(
-      fs.createReadStream(file, { highWaterMark: READ_CHUNK }),
+      source(),
       decoder,
       async (chunks: AsyncIterable<Buffer>) => {
         for await (const chunk of chunks) {
+          if (work) work.decodedBytes += chunk.length;
           const end = chunk.indexOf(0x0a);
           const part = end < 0 ? chunk : chunk.subarray(0, end);
           held.push(part);
           length += part.length;
           if (end >= 0 || length >= maxBytes) {
             line = end >= 0 && length <= maxBytes ? Buffer.concat(held).toString('utf8').replace(/\r$/, '') : null;
+            if (report && line === null) report.bounded = true;
             stop.abort();
             return;
           }
@@ -170,7 +221,7 @@ export async function readCompressedFirstRecord(
         if (report) report.failed = true;
         line = null;
       },
-      { signal: stop.signal },
+      { signal: signal ? AbortSignal.any([signal, stop.signal]) : stop.signal },
     );
   } catch (error) {
     if (line !== undefined) return line;
@@ -182,6 +233,60 @@ export async function readCompressedFirstRecord(
     throw error;
   }
   return line ?? null;
+}
+
+interface CompressedOpeningWork {
+  compressedBytes: number;
+  decodedBytes: number;
+}
+
+async function* compressedFileChunks(
+  handle: fs.promises.FileHandle,
+  maxBytes: number,
+  signal?: AbortSignal,
+  work?: CompressedOpeningWork,
+) {
+  for (let at = 0; at < maxBytes;) {
+    if (signal?.aborted) return;
+    const bytes = Buffer.allocUnsafe(Math.min(READ_CHUNK, maxBytes - at));
+    const { bytesRead } = await handle.read(bytes, 0, bytes.length, at);
+    if (!bytesRead) return;
+    if (work) work.compressedBytes += bytesRead;
+    at += bytesRead;
+    yield bytes.subarray(0, bytesRead);
+  }
+}
+
+// Read a contested opening with byte bounds on both sides of the decoder.
+export async function readQualifiedCompressedFirstRecord(
+  file: string,
+  maxBytes: number,
+  signal: AbortSignal,
+  work?: CompressedOpeningWork,
+): Promise<{ value: string; revision: FileRevision } | null> {
+  if (signal.aborted || !compressedRolloutsReadable()) return null;
+  const handle = await fs.promises.open(file, 'r').catch(() => null);
+  if (!handle) return null;
+  try {
+    const stat = await handle.stat({ bigint: true });
+    if (!stat.isFile()) return null;
+    const revision = revisionOf(stat);
+    const value = await decodeCompressedFirstRecord(
+      () => compressedFileChunks(handle, maxBytes, signal, work),
+      maxBytes,
+      undefined,
+      signal,
+      work,
+    );
+    if (value === null || signal.aborted || !sameStat(revision, revisionOf(await handle.stat({ bigint: true }))))
+      return null;
+    const named = await fs.promises.stat(file, { bigint: true });
+    return !signal.aborted && named.isFile() && sameStat(revision, revisionOf(named)) ? { value, revision } : null;
+  } catch {
+    return null;
+  } finally {
+    await handle.close().catch(() => {});
+  }
 }
 
 // The largest body that an open decodes. A larger body does not open.
@@ -320,6 +425,142 @@ class BodyCapError extends Error {}
 // A physical revision. A filesystem read can leave the device and inode out.
 type CompressedStat = Pick<FileRevision, 'size' | 'mtimeMs'> & Partial<Pick<FileRevision, 'dev' | 'ino'>>;
 
+export const COMPRESSED_REPAIR_LIMIT = 16;
+
+export interface CompressedPlacement {
+  file: string;
+  revision: FileRevision;
+  opening?: { sessionId: string; cwd: string; hidden: boolean; agentRun?: boolean };
+  hash?: string;
+  displacedHash?: string;
+}
+
+export interface CompressedMembershipCheck {
+  file: string;
+  proof: number;
+  pathnameHash?: true;
+  revision: FileRevision;
+  outcome: 'body' | 'excluded';
+  hash?: string;
+}
+
+export type CompressedMembershipAcknowledgment = CompressedMembershipCheck & { membership: number };
+
+export function sameCompressedPlacement(a: CompressedPlacement, b: CompressedPlacement): boolean {
+  return (
+    sameStat(a.revision, b.revision) &&
+    a.opening?.sessionId === b.opening?.sessionId &&
+    a.opening?.cwd === b.opening?.cwd &&
+    a.opening?.hidden === b.opening?.hidden &&
+    a.opening?.agentRun === b.opening?.agentRun &&
+    a.hash === b.hash &&
+    a.displacedHash === b.displacedHash
+  );
+}
+
+export interface CompressedRepair {
+  file: string;
+  size: number;
+  mtimeMs: number;
+  dev?: string | number;
+  ino?: string | number;
+  // Present only when a current opening qualified the owner.
+  sessionId?: string;
+  cwd?: string;
+  openingHash?: string;
+  qualification?: number;
+  claim?: number;
+  membership?: number;
+}
+
+export interface CompressedOpeningEvidence {
+  hash?: string;
+  sessionId?: string;
+  cwd?: string;
+  hidden?: boolean;
+  agentRun?: boolean;
+  nonOpening?: true;
+}
+
+export interface CompressedRepairEvidence extends CompressedStat {
+  file: string;
+  membership?: number;
+  machine?: CompressedOpeningEvidence;
+  adoption?: CompressedOpeningEvidence;
+  facts?: CompressedOpeningEvidence;
+}
+
+export type CompressedRepairSettlement = CompressedRepair & {
+  outcome: 'bounded' | 'unplaced-header' | 'unplaced-body' | 'ineligible' | 'repair-mismatch';
+  evidence: CompressedRepairEvidence;
+  successor?: CompressedOpeningEvidence;
+  observedHash?: string;
+};
+
+export type CompressedRepairReceipt = (CompressedRepair & { outcome: 'released' }) | CompressedRepairSettlement;
+
+export function sameCompressedRepairClaim(left: CompressedRepair, right: CompressedRepair): boolean {
+  return (
+    left.claim === right.claim &&
+    left.qualification === right.qualification &&
+    left.membership === right.membership &&
+    sameCompressedRepair(left, right)
+  );
+}
+
+// Missing optional proof leaves the existing observation in force.
+export function addsCompressedRepairProof(
+  previous: CompressedRepair & { observedHash?: string },
+  next: CompressedRepair,
+): boolean {
+  return (
+    previous.file !== next.file ||
+    previous.membership !== next.membership ||
+    !sameStat(previous, next) ||
+    (next.sessionId !== undefined && (next.sessionId !== previous.sessionId || next.cwd !== previous.cwd)) ||
+    (next.openingHash !== undefined &&
+      next.openingHash !== previous.openingHash &&
+      next.openingHash !== previous.observedHash) ||
+    (next.qualification !== undefined && next.qualification !== previous.qualification)
+  );
+}
+
+export function addsCompressedRepairEvidence(
+  previous: CompressedRepairEvidence | undefined,
+  next: CompressedRepairEvidence | undefined,
+): boolean {
+  if (!next) return false;
+  const adds = (before: CompressedOpeningEvidence | undefined, after: CompressedOpeningEvidence | undefined) =>
+    after !== undefined &&
+    ((after.hash !== undefined && after.hash !== before?.hash) ||
+      (after.nonOpening && !before?.nonOpening) ||
+      (after.sessionId !== undefined &&
+        (after.sessionId !== before?.sessionId ||
+          after.cwd !== before.cwd ||
+          after.hidden !== before.hidden ||
+          after.agentRun !== before.agentRun)));
+  return (
+    (next.machine !== undefined || next.adoption !== undefined || next.facts !== undefined) &&
+    (!previous ||
+      previous.file !== next.file ||
+      previous.membership !== next.membership ||
+      !sameStat(previous, next) ||
+      adds(previous.machine, next.machine) ||
+      adds(previous.adoption, next.adoption) ||
+      adds(previous.facts, next.facts))
+  );
+}
+
+export function sameCompressedRepair(left: CompressedRepair, right: CompressedRepair): boolean {
+  return (
+    left.file === right.file &&
+    left.sessionId === right.sessionId &&
+    left.cwd === right.cwd &&
+    left.openingHash === right.openingHash &&
+    sameStat(left, right)
+  );
+}
+
 export function sameStat(left: CompressedStat | null, right: CompressedStat | null): boolean {
   return (
     !!left &&
@@ -380,7 +621,7 @@ export type CompressedStreamRead =
 export async function streamCompressedRollout(
   file: string,
   consume: (chunk: Buffer) => void | Promise<void>,
-  limits: { signal?: AbortSignal } = {},
+  limits: { signal?: AbortSignal; expected?: CompressedStat } = {},
 ): Promise<CompressedStreamRead> {
   const decoder = await announcedZstdDecoder(DECODER_WINDOW_LOG);
   if (!decoder) return { kind: 'unsupported' };
@@ -395,6 +636,10 @@ export async function streamCompressedRollout(
   const frames = zstdFrames();
   try {
     const stat = revisionOf(await handle.stat({ bigint: true }));
+    if (limits.expected && !sameStat(limits.expected, stat)) {
+      decoder.destroy();
+      return { kind: 'stale' };
+    }
     await pipeline(
       handle.createReadStream({ highWaterMark: READ_CHUNK, autoClose: false }),
       async function* (chunks: AsyncIterable<Buffer>) {

@@ -181,6 +181,7 @@ Empty vendor homes count as unset.
 | `ARC_HOME` | The Arc store home. Snapshots sit below it, and the cache sits beside them | `~/.arc` |
 | `ARC_PROJECTS_ROOT` | Where Arc reads Claude Code transcripts | `~/.claude/projects` |
 | `ARC_CODEX_ROOT` | Where Arc reads Codex rollouts | `~/.codex/sessions` |
+| `ARC_AGY_BRAIN_ROOT` | Where Arc reads saved Antigravity sessions | `~/.gemini/antigravity-cli/brain` |
 | `ARC_IGNORE_ROOTS` | The paths a turn writes for itself, which no diff shows. Entries are separated like `PATH` entries. An empty value disables the rule | the temporary directory, Claude Code home, Codex home, and Arc home |
 | `CLAUDE_CONFIG_DIR` | The Claude Code home. Arc reads transcripts from `projects` below it and ignores agent-owned files below it | `~/.claude` |
 | `CODEX_HOME` | The Codex home. Arc reads rollouts from `sessions` below it and ignores agent-owned files below it | `~/.codex` |
