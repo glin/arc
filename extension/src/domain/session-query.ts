@@ -20,11 +20,25 @@ export interface SessionAxis {
   field: SessionField;
 }
 
+const SESSION_PROVIDERS = ['claude', 'codex', 'agy'] as const;
+type SessionProvider = (typeof SESSION_PROVIDERS)[number];
+const IDENTITY_SCOPES = ['any', ...SESSION_PROVIDERS] as const;
+type QueryIdentities = Record<(typeof IDENTITY_SCOPES)[number], Set<string>>;
+
+function sessionProvider(agent: string): SessionProvider | undefined {
+  const name = agent.toLowerCase();
+  return name === 'antigravity' ? 'agy' : SESSION_PROVIDERS.find((provider) => provider === name);
+}
+
+function queryIdentities(): QueryIdentities {
+  return { any: new Set(), claude: new Set(), codex: new Set(), agy: new Set() };
+}
+
 export interface FilterTerm {
   field: SessionField;
   needle: string;
   plain?: boolean;
-  identities?: { any: Set<string>; claude: Set<string>; codex: Set<string> };
+  identities?: QueryIdentities;
   invalid?: boolean;
   shorthand?: boolean;
   unresolved?: boolean;
@@ -316,10 +330,10 @@ function sessionSelector(word: QueryWord): FilterTerm | null {
   const prefix = wordPrefix(raw);
   if (prefix !== 'session' && prefix !== 'id') return null;
   const value = raw.slice(raw.indexOf(':') + 1);
-  const qualified = /^(claude|codex):(.+)$/i.exec(value);
-  const provider = qualified ? (qualified[1].toLowerCase() as 'claude' | 'codex') : 'any';
+  const qualified = /^(claude|codex|agy):(.+)$/i.exec(value);
+  const provider = sessionProvider(qualified?.[1] ?? '') ?? 'any';
   const id = qualified ? qualified[2] : value;
-  const identities = { any: new Set<string>(), claude: new Set<string>(), codex: new Set<string>() };
+  const identities = queryIdentities();
   const invalid = !id || /[\s:/\\]/.test(id);
   if (!invalid) identities[provider].add(id);
   return {
@@ -333,11 +347,7 @@ function sessionSelector(word: QueryWord): FilterTerm | null {
 }
 
 function identityKey(term: FilterTerm): string {
-  return JSON.stringify(
-    ['any', 'claude', 'codex'].map((provider) =>
-      [...(term.identities?.[provider as 'any' | 'claude' | 'codex'] ?? [])].sort(),
-    ),
-  );
+  return JSON.stringify(IDENTITY_SCOPES.map((provider) => [...(term.identities?.[provider] ?? [])].sort()));
 }
 
 export function sessionQueryError(query: string): string | null {
@@ -376,7 +386,7 @@ export function parseSessionQuery(query: string): SessionQuery {
     const first = selectors[left]!;
     const next = selectors[right]!;
     if (next.shorthand) first.shorthand = true;
-    for (const provider of ['any', 'claude', 'codex'] as const) {
+    for (const provider of IDENTITY_SCOPES) {
       for (const id of next.identities![provider]) first.identities![provider].add(id);
     }
     selectors[right] = first;
@@ -486,7 +496,7 @@ export function parseSessionQuery(query: string): SessionQuery {
   if (implicit.length > 1) {
     const first = implicit[0];
     for (const next of implicit.slice(1)) {
-      for (const provider of ['any', 'claude', 'codex'] as const)
+      for (const provider of IDENTITY_SCOPES)
         for (const id of next.identities![provider]) first.identities![provider].add(id);
     }
     out.terms = out.terms.filter((term) => !implicit.includes(term) || term === first);
@@ -542,7 +552,7 @@ export function sessionQueryNeedsShorthand(query: string): boolean {
   );
 }
 
-const identityIndexes = new WeakMap<readonly SessionQueryIdentity[], Map<string, Set<string>>>();
+const identityIndexes = new WeakMap<readonly SessionQueryIdentity[], Map<SessionProvider, Set<string>>>();
 const compiledQueries = new WeakMap<SessionQueryContext, Map<string, SessionQuery & { notes: string[] }>>();
 
 // Resolve once against the complete scoped catalog before callers narrow their row pools.
@@ -552,19 +562,19 @@ export function resolveSessionQuery(query: string, context?: SessionQueryContext
   const parsed = { ...parseSessionQuery(query), notes: [] as string[] };
   let index = context && identityIndexes.get(context.identities);
   if (context && !index) {
-    index = new Map([
-      ['claude', new Set<string>()],
-      ['codex', new Set<string>()],
-    ]);
-    for (const identity of context.identities) index.get(identity.agent.toLowerCase())?.add(identity.sessionId);
+    index = new Map(SESSION_PROVIDERS.map((provider) => [provider, new Set<string>()]));
+    for (const identity of context.identities) {
+      const provider = sessionProvider(identity.agent);
+      if (provider) index.get(provider)!.add(identity.sessionId);
+    }
     identityIndexes.set(context.identities, index);
   }
   for (const term of parsed.terms) {
     if (!term.identities || term.invalid) continue;
-    const resolved = { any: new Set<string>(), claude: new Set<string>(), codex: new Set<string>() };
-    for (const provider of ['any', 'claude', 'codex'] as const) {
+    const resolved = queryIdentities();
+    for (const provider of IDENTITY_SCOPES) {
       for (const id of term.identities[provider]) {
-        const providers = provider === 'any' ? (['claude', 'codex'] as const) : [provider];
+        const providers = provider === 'any' ? SESSION_PROVIDERS : [provider];
         const exact = providers.some((kind) => index?.get(kind)?.has(id));
         if (exact || !prefixValue(id) || (!context && !term.shorthand)) {
           resolved[provider].add(id);
@@ -790,11 +800,10 @@ export function sessionTermHolds(
     return false;
   if (term.field === 'session') {
     const identities = term.identities;
-    const provider = agent.toLowerCase();
+    const provider = sessionProvider(agent);
     const held =
       !!identities &&
-      (identities.any.has(sessionId) ||
-        ((provider === 'claude' || provider === 'codex') && identities[provider].has(sessionId)));
+      (identities.any.has(sessionId) || (provider !== undefined && identities[provider].has(sessionId)));
     return term.negated ? !held : held;
   }
   const held = plainTermHolds(

@@ -12,7 +12,7 @@ type RowRef = { page: number; row: number };
 type TurnReply = ObjectValue & {
   version: 1;
   id: string;
-  provider: 'claude' | 'codex';
+  provider: 'claude' | 'codex' | 'agy';
   state: 'current' | 'stale' | 'unparsed';
   turns: unknown[];
   partial: boolean;
@@ -52,7 +52,7 @@ function pageReply(value: unknown, limit: number): value is SessionPage {
         row.source.length > 0 &&
         row.source.length <= 256 &&
         (row.id === null || typeof row.id === 'string') &&
-        ['claude', 'codex'].includes(row.provider as string) &&
+        ['claude', 'codex', 'agy'].includes(row.provider as string) &&
         typeof row.ambiguous === 'boolean' &&
         strings(row.truncated),
     ) &&
@@ -72,7 +72,7 @@ function turnReply(value: unknown, turns: number): value is TurnReply {
     value.version === 1 &&
     (value.requester === null || typeof value.requester === 'string') &&
     typeof value.id === 'string' &&
-    ['claude', 'codex'].includes(value.provider as string) &&
+    ['claude', 'codex', 'agy'].includes(value.provider as string) &&
     ['current', 'stale', 'unparsed'].includes(value.state as string) &&
     Array.isArray(value.turns) &&
     value.turns.length <= turns &&
