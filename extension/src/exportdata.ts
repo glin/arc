@@ -15,7 +15,6 @@ import {
   readSessionCwd,
   type ClaudeRelationshipCursor,
   type ClaudeUsageReducerState,
-  type AgentKind,
   type SessionFile,
   type Turn,
   type Compaction,
@@ -139,6 +138,7 @@ interface Stamp {
   ctimeMs: number;
 }
 interface Entry extends SessionFile {
+  agent: ExportIdentity['agent'];
   runClassifier?: ReturnType<typeof createClaudeRunClassifier>;
   parentSessionId?: string;
   opening?: CodexSessionMeta | null;
@@ -179,7 +179,12 @@ const identityKey = (entry: ExportIdentity) =>
   `${entry.agent}:${entry.parentSessionId ?? ''}:${entry.sessionId.toLowerCase()}`;
 const entryKey = (entry: Entry) => entry.qualified ?? identityKey(entry);
 
-async function fileEntry(agent: AgentKind, file: string, sessionId: string, parentSessionId?: string): Promise<Entry> {
+async function fileEntry(
+  agent: ExportIdentity['agent'],
+  file: string,
+  sessionId: string,
+  parentSessionId?: string,
+): Promise<Entry> {
   // Export reads plain transcripts only. A compressed rollout is unavailable to it.
   if (isCompressedRollout(file)) throw new Error('The session file is unavailable.');
   const stat = await fs.lstat(file);
@@ -257,7 +262,7 @@ async function sourceDigest(entry: Entry, limits: ExportLimits, signal?: AbortSi
 async function inventoryOf(options: ExportCaptureOptions, limits: ExportLimits): Promise<Inventory> {
   const inventory: Inventory = { entries: [], partial: false, signature: '', issues: [], paths: 0, bytes: 0 };
   const identities: string[] = [];
-  const candidates: { agent: AgentKind; file: string; name: string }[] = [];
+  const candidates: { agent: ExportIdentity['agent']; file: string; name: string }[] = [];
   const issue = (reason: ExportOmissionReason) => {
     inventory.partial = true;
     if (!inventory.issues.includes(reason)) inventory.issues.push(reason);
@@ -272,7 +277,7 @@ async function inventoryOf(options: ExportCaptureOptions, limits: ExportLimits):
     inventory.bytes += bytes;
     return true;
   };
-  const walk = async (directory: string, agent: AgentKind, depth: number): Promise<void> => {
+  const walk = async (directory: string, agent: ExportIdentity['agent'], depth: number): Promise<void> => {
     checkExportCancellation(options.signal);
     let stream: Dir;
     try {
@@ -1005,6 +1010,7 @@ export async function captureSessionExport(
   options: ExportCaptureOptions,
   writer: ExportTransaction,
 ): Promise<ExportCapture> {
+  if (options.root.agent === 'agy') throw new Error('Antigravity session export is unavailable.');
   options = { ...options, readerState: snapshotExportReaderState(options.readerState) };
   const limits: ExportLimits = { ...EXPORT_LIMITS, ...options.limits };
   for (const limit of Object.values(limits))
@@ -1015,11 +1021,19 @@ export async function captureSessionExport(
   const inventorySignature = inventory.signature;
   const rootMatches = options.root.childTranscript
     ? []
-    : inventory.entries.filter((entry) => entryKey(entry) === identityKey(options.root));
+    : inventory.entries.filter(
+        (entry) =>
+          entryKey(entry) === identityKey({ ...options.root, agent: options.root.agent as ExportIdentity['agent'] }),
+      );
   if (rootMatches.length > 1) throw new Error('The selected session identity is ambiguous.');
   let root =
     rootMatches[0] ??
-    (await fileEntry(options.root.agent, options.root.file, options.root.sessionId, options.root.parentSessionId));
+    (await fileEntry(
+      options.root.agent as ExportIdentity['agent'],
+      options.root.file,
+      options.root.sessionId,
+      options.root.parentSessionId,
+    ));
   if (normalizeFsPath(root.file) !== normalizeFsPath(options.root.file))
     throw new Error('The selected session identity is ambiguous.');
   root = {

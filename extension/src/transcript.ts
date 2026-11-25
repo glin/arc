@@ -124,7 +124,8 @@ export { shortenTo } from './domain/text.ts';
 // Turns whose opening prompts lie before the tail are excluded. Selected reads can recover the newest turn.
 
 // Source agent for a session or turn, used by badges and source-specific readers.
-export type AgentKind = 'claude' | 'codex';
+export type AgentKind = 'claude' | 'codex' | 'agy';
+export type LaunchAgentKind = Exclude<AgentKind, 'agy'>;
 
 // One hunk of a Claude Code edit result, as the `diff` package's structuredPatch writes
 // it. `lines` carries each line prefixed with a space, a plus or a minus.
@@ -785,6 +786,13 @@ export function presentedStepDetail(name: string, input: Record<string, unknown>
 // Who opened a turn, when it was not the reader.
 export type TurnOrigin = 'scheduled';
 
+export interface AgyRecordedUsage {
+  input?: number;
+  cacheRead?: number;
+  output?: number;
+  incomplete?: true;
+}
+
 export interface Turn {
   agent: AgentKind;
   sessionId: string;
@@ -831,6 +839,7 @@ export interface Turn {
   // Calls that merged, host-side only, the way `commitIntents` is.
   landingIntents?: LandingIntent[];
   usage: TurnUsage;
+  agyUsage?: AgyRecordedUsage;
   usageParts?: TurnUsagePart[];
   contextTokens: number; // input plus cache of the turn's last real assistant message
   // Estimated text that subagents returned into the session's context, as it stood at the end
@@ -941,6 +950,8 @@ export interface SessionFile {
   agentRun?: boolean;
   // Claude marks every record in a native child transcript as sidechain content.
   childTranscript?: boolean;
+  agyOwnerRoot?: string;
+  agyFirstPrompt?: string;
 }
 
 export interface ClaudeChildSessionFile extends SessionFile {
@@ -962,7 +973,7 @@ export interface ClaudeSubagentSessionReference {
 
 export interface ClaudeDispatchSessionReference {
   kind: 'dispatch';
-  agent: AgentKind;
+  agent: LaunchAgentKind;
   parentSessionId: string;
   // A launch can record the complete session id or only its unique hexadecimal prefix.
   sessionId: string;
@@ -1116,7 +1127,7 @@ export function revalidatedCatalog(
   }
   const held = sessions[at];
   const now = statOf(held.file);
-  if (!now || replacedAtPath(held, now)) {
+  if (!now || replacedAtPath(held, now) || (held.agent === 'agy' && !sameSessionRevision(held, now))) {
     return null;
   }
   const out = [...sessions];
@@ -1146,7 +1157,7 @@ export function revalidatedCatalogPaths(
       return null;
     }
     const now = statOf(out[at].file);
-    if (!now || replacedAtPath(out[at], now)) {
+    if (!now || replacedAtPath(out[at], now) || (out[at].agent === 'agy' && !sameSessionRevision(out[at], now))) {
       return null;
     }
     if (!sameSessionRevision(out[at], now)) {
@@ -1250,6 +1261,7 @@ export interface SessionStatTurnFacts {
   // The metadata pass deliberately does not read child transcripts. Their presence makes
   // the parent-only cost a floor until the ordinary parser supplies the complete figure.
   childSpendPartial: boolean;
+  agyUsage?: AgyRecordedUsage;
   subagentContext?: SubagentContextFigure;
 }
 
@@ -1280,6 +1292,7 @@ export function sessionStatFactsOf(read: SessionRead): SessionStatFacts | null {
       model: turn.model,
       ...(turn.effort !== undefined ? { effort: turn.effort } : {}),
       provider: turn.provider ?? null,
+      ...(turn.agyUsage ? { agyUsage: { ...turn.agyUsage } } : {}),
       usage: {
         ...turn.usage,
         ...(turn.usage.byContextBand
@@ -1379,6 +1392,7 @@ export function sessionOutcomeOf(read: SessionRead): TurnOutcome | null {
   return newest
     ? {
         finished: newest.finished,
+        ...(newest.agent === 'agy' ? { recordedOnly: true as const } : {}),
         error: newest.error !== null,
         interrupted: newest.interrupted,
         endedAt: newest.endedAt,
@@ -2164,6 +2178,7 @@ export function readSessionWork(file: string, bytes = 256 * 1024, now = Infinity
 }
 
 export interface TurnOutcome {
+  recordedOnly?: true;
   // Structured task notices retain their classification across bounded and wider reads.
   taskCompletions?: ClaudeTaskCompletion[];
   finished: boolean;
@@ -4849,7 +4864,7 @@ export const RELATIONSHIP_READ_CAUSES = ['noEntry', 'rejected', 'resumed', 'grow
 export type RelationshipReadCause = (typeof RELATIONSHIP_READ_CAUSES)[number];
 export type RelationshipRejection = 'parser' | 'path' | 'stamp' | 'cursor' | 'state';
 export type RelationshipCauseCounters = Partial<
-  Record<`${AgentKind}Relationship${Capitalize<RelationshipReadCause>}${'Bytes' | 'Sources'}`, number>
+  Record<`${LaunchAgentKind}Relationship${Capitalize<RelationshipReadCause>}${'Bytes' | 'Sources'}`, number>
 >;
 const relationshipSources = new WeakMap<RelationshipReadMeter, Set<string>>();
 
@@ -4902,11 +4917,11 @@ export class RelationshipReader {
   private advanced = false;
   cause: RelationshipReadCause = 'noEntry';
   growthFrom = Infinity;
-  agent: AgentKind = 'claude';
+  agent: LaunchAgentKind = 'claude';
   private countCause(cause: RelationshipReadCause, bytes: number): void {
     if (!this.meter || bytes === 0) return;
     const prefix =
-      `${this.agent}Relationship${cause[0].toUpperCase()}${cause.slice(1)}` as `${AgentKind}Relationship${Capitalize<RelationshipReadCause>}`;
+      `${this.agent}Relationship${cause[0].toUpperCase()}${cause.slice(1)}` as `${LaunchAgentKind}Relationship${Capitalize<RelationshipReadCause>}`;
     const byteKey = `${prefix}Bytes` as const;
     const sourceKey = `${prefix}Sources` as const;
     this.meter[byteKey] = (this.meter[byteKey] ?? 0) + bytes;
@@ -5566,7 +5581,7 @@ function resumesClaudeSession(args: readonly string[]): boolean {
 }
 
 interface ClaudeDispatchLaunch {
-  agent: AgentKind;
+  agent: LaunchAgentKind;
   sessionId: string;
   name: string | null;
   owned: boolean;
@@ -6072,7 +6087,7 @@ export interface MetadataCoverage {
   windowBytes: number;
 }
 
-function sameFileRevision(snapshot: fs.Stats | fs.BigIntStats, revision: FileRevision): boolean {
+export function sameFileRevision(snapshot: fs.Stats | fs.BigIntStats, revision: FileRevision): boolean {
   const stat = revisionOf(snapshot);
   return (
     stat.size === revision.size &&

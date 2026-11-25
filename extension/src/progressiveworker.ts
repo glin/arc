@@ -141,8 +141,11 @@ export function unreadHeadBytes(
   return SESSION_HEAD_BYTES - HEAD_KEY_BYTES;
 }
 
-export type ProgressiveCheckpoint = ClaudeForwardCheckpoint | CodexForwardCheckpoint;
-export type ProgressiveCursor = ClaudeHistoryCursor | CodexHistoryCursor;
+export type ProgressiveCheckpoint =
+  | ClaudeForwardCheckpoint
+  | CodexForwardCheckpoint
+  | import('./agyhistory').AgyCheckpoint;
+export type ProgressiveCursor = ClaudeHistoryCursor | CodexHistoryCursor | import('./agyhistory').AgyHistoryCursor;
 export interface ProgressiveInput {
   session: SessionFile;
   folders: string[];
@@ -434,6 +437,7 @@ export type ProgressiveRequest =
   | {
       kind: 'compressed-adopt';
       adoption: import('./compressedstore').CompressedAdoptionInput;
+      pending?: import('./compressedstore').CompressedEntrySeed;
       stores: import('./compressedstore').CompressedStorePaths;
     }
   | {
@@ -443,6 +447,9 @@ export type ProgressiveRequest =
       backfill?: { workspace: string; roots: string[]; launch: string };
       // Offsets and entries that a new worker takes in place of reading the whole store.
       resume?: import('./compressedstore').CompressedLoadResume;
+      repairs?: import('./compressedrollouts').CompressedRepair[];
+      repairScope?: number;
+      compressed?: string[];
     }
   | { kind: 'metadata'; session: SessionFile; opening?: CodexSessionMeta | null; tailBytes?: number }
   | {
@@ -451,6 +458,7 @@ export type ProgressiveRequest =
       opening?: CodexSessionMeta | null;
       sliceBytes: number;
       eligible: string[];
+      agyRecovery?: number;
       retainedBytes?: number;
       recordBytes?: number;
       reduceAboveBytes?: number;
@@ -472,8 +480,9 @@ export type ProgressiveValue =
       kind: 'compressed-adopt';
       adopted: boolean;
       entry: import('./compressedstore').CompressedFactEntry;
-      // True when the entry's line is on disk.
+      // A saved adoption can still be waiting for the store to select its facts.
       durable: boolean;
+      pending?: true;
       writeBytes: number;
     }
   | {
@@ -482,10 +491,15 @@ export type ProgressiveValue =
       done: boolean;
       // On the final reply: the bytes this reply covers in each store file.
       consumed?: [string, number][];
+      relocated?: [string, import('./compressedstore').CompressedStoreRecord][];
+      spendRelocated?: [string, import('./compressedstore').CompressedStoreRecord][];
+      lineage?: import('./compressedstore').CompressedLineage[];
       // On the final reply: the names the poll read that hold no facts.
       nameOnly?: string[];
       // On the final reply: the size of the list that waited for this first load, which the worker now records.
       heldNamesRecorded?: number;
+      acceptedRepairs?: import('./compressedrollouts').CompressedRepair[];
+      acceptedNames?: true;
     }
   | { kind: 'codex-context'; estimate: import('./codexcontext').CodexContextResult | null }
   | {
@@ -800,6 +814,9 @@ export class ProgressiveWorker {
     private readonly onCompressedStoreWrite?: (bytes: number) => void,
     // Hears each batch of entries that the backfill published.
     private readonly onCompressedFacts?: (batch: import('./compressedbackfill').CompressedBackfillBatch) => void,
+    private readonly compressedSpendWitness?: (
+      request: import('./compressedstore').CompressedSpendRequest,
+    ) => import('./compressedstore').CompressedFactEntry | undefined,
   ) {}
 
   snapshot(): {
@@ -1017,7 +1034,14 @@ export class ProgressiveWorker {
           compressedDecode?: number;
           compressedStoreWrite?: number;
           compressedFacts?: import('./compressedbackfill').CompressedBackfillBatch;
+          compressedSpendRequest?: { id: number; request: import('./compressedstore').CompressedSpendRequest };
         }) => {
+          if (message.compressedSpendRequest) {
+            if (this.worker !== worker) return;
+            const { id, request } = message.compressedSpendRequest;
+            worker.postMessage({ compressedSpendReply: { id, entry: this.compressedSpendWitness?.(request) ?? null } });
+            return;
+          }
           if (message.compressedFacts) {
             if (this.worker === worker) this.onCompressedFacts?.(message.compressedFacts);
             return;
