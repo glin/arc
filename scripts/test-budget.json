@@ -498,8 +498,8 @@
       "margin": 0
     },
     "collision walk | pollDirectoryStats": {
-      "reason": "A poll stats each listed directory once. A rise means a poll checks more directories.",
-      "budget": 166,
+      "reason": "Each of the two polls stats each listed directory once, including the Antigravity root. A rise means a poll checks more directories.",
+      "budget": 168,
       "margin": 0
     },
     "collision walk | posted:render": {
@@ -813,8 +813,8 @@
       "margin": 0
     },
     "poll and backstop walk | pollDirectoryStats": {
-      "reason": "A poll stats each listed directory once. A rise means a poll checks more directories.",
-      "budget": 166,
+      "reason": "Each of the two polls stats each listed directory once, including the Antigravity root. A rise means a poll checks more directories.",
+      "budget": 168,
       "margin": 0
     },
     "poll and backstop walk | readBytes": {

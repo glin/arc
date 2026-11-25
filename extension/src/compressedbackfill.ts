@@ -11,29 +11,50 @@ import {
   createCodexSessionReducer,
   createCodexUsageLineReducer,
   isAgentRun,
+  isHiddenThread,
   openingRecordOf,
+  observeRolloutStat,
   readRolloutStat,
   ROLLOUT_NAME,
   type CodexSessionMeta,
 } from './codex';
-import { readCompressedFirstRecord, streamCompressedRollout, type CompressedStreamRead } from './compressedrollouts';
+import {
+  COMPRESSED_REPAIR_LIMIT,
+  readCompressedFirstRecord,
+  sameCompressedRepair,
+  sameCompressedPlacement,
+  sameStat,
+  streamCompressedRollout,
+  type CompressedPlacement,
+  type CompressedRepair,
+  type CompressedStreamRead,
+} from './compressedrollouts';
 import {
   COMPRESSED_BATCH_BYTES,
   COMPRESSED_ENTRY_TITLE_BYTES,
   boundedCompressedEntry,
-  compressedEntryBatches,
+  compareCompressedEntries,
+  reconcileCompressedEntries,
   compressedEntryCurrent,
+  compressedEntryConflicts,
+  compressedEntryIdentity,
+  compressedFactsSameOwner,
   compressedEntrySame,
   compressedEntrySeed,
   compressedEntryVersions,
   compressedOpeningEntry,
+  compressedByteObservation,
+  compareCompressedObservations,
   compressedPairKey,
+  compressedSpendOrigin,
   compressedTitleCurrent,
+  readCompressedRecord,
   readCompressedStoreInSteps,
   sessionKeyOf,
   withKeptUndercount,
   type CompressedEntrySeed,
   type CompressedFactEntry,
+  CompressedStoreFollower,
   type CompressedStoreHolder,
 } from './compressedstore';
 import type { DerivedTitleEntry } from './derivedcache';
@@ -46,6 +67,7 @@ import {
   TURN_START_BYTES,
   type FileRevision,
   type SessionRead,
+  supportedFileIdentity,
 } from './transcript';
 
 // A slice decodes one file and ends after this much output or this much time.
@@ -59,6 +81,7 @@ export const BACKFILL_TURN_LIMIT_MS = 100;
 // A decode that fails or ends inside a frame runs again after each of these delays, and then saves `unreadable`.
 export const BACKFILL_RETRY_DELAYS_MS = [10_000, 60_000, 600_000] as const;
 const BATCH_INTERVAL_MS = 1_000;
+const BATCH_FILE_LIMIT = 16;
 const ACTIVITY_TAIL_BYTES = 256 * 1024;
 const RECORD_HEAD_BYTES = 512;
 // Bounds of a forward recovery read, as the worker applies them to a metadata recovery.
@@ -293,15 +316,21 @@ export function compressedFactsFromDerivation(
 ): CompressedFactEntry {
   const finished = derivation.finish();
   const stat = read.stat;
-  const pairKey = compressedPairKey(file);
+  const threadId = sessionKeyOf(file, finished.opening);
+  const spend = finished.spend?.finish({
+    size: derivation.offset,
+    mtimeMs: stat.mtimeMs,
+    sourceIdentity: `${stat.dev}:${stat.ino}`,
+  });
   return {
     file,
-    pairKey,
+    pairKey: compressedPairKey(file),
     ...compressedEntryVersions(),
     size: stat.size,
     mtimeMs: stat.mtimeMs,
+    fileIdentity: { dev: stat.dev, ino: stat.ino },
     hash: read.hash,
-    threadId: sessionKeyOf(file, finished.opening),
+    threadId,
     decodedLength: derivation.offset,
     skippedRecords: derivation.skippedRecords,
     undercount: derivation.undercount,
@@ -315,25 +344,21 @@ export function compressedFactsFromDerivation(
       finished.tailWhole,
     ),
     opening: finished.opening,
-    ...(finished.spend
-      ? {
-          spend: finished.spend.finish({
-            size: derivation.offset,
-            mtimeMs: stat.mtimeMs,
-            sourceIdentity: `${stat.dev}:${stat.ino}`,
-          }),
-        }
-      : {}),
+    ...(spend ? { spend, spendOrigin: compressedSpendOrigin(threadId, spend, read.hash) } : {}),
   };
 }
 
 export interface CompressedBackfillBatch {
+  placements?: CompressedPlacement[];
+  retiredRepairs?: CompressedRepair[];
+  repairScope?: number;
   entries: CompressedFactEntry[];
   backfillMs: number;
 }
 
 export interface CompressedBackfillOptions {
-  facts: CompressedStoreHolder;
+  facts: Pick<CompressedStoreHolder, 'directory' | 'append' | 'durable'> &
+    Partial<Pick<CompressedStoreHolder, 'appendCarryingFacts' | 'recordOf'>>;
   openings: CompressedStoreHolder;
   workspace: string;
   roots: readonly string[];
@@ -345,12 +370,16 @@ export interface CompressedBackfillOptions {
   post: (batch: CompressedBackfillBatch) => void;
   // The entries of the facts store that the follower holds.
   known: () => ReadonlyMap<string, CompressedEntrySeed>;
+  readKnown?: (file: string) => CompressedFactEntry | undefined;
+  follower?: CompressedStoreFollower;
   inFolders: (roots: readonly string[]) => (cwd: string) => boolean;
   now?: () => number;
+  wallNow?: () => number;
   schedule?: (milliseconds: number, run: () => void) => () => void;
   yieldStep?: () => Promise<void>;
   wait?: (milliseconds: number) => Promise<void>;
   statOf?: typeof readRolloutStat;
+  observeStat?: typeof observeRolloutStat;
   exists?: (file: string) => boolean;
   readFirst?: typeof readCompressedFirstRecord;
   stream?: typeof streamCompressedRollout;
@@ -358,13 +387,32 @@ export interface CompressedBackfillOptions {
   limits?: { recordBytes?: number; reduceAbove?: number; retainedBytes?: number };
 }
 
-// `added` marks the opening read of a name that a later list added. The name keeps its place at the front of the queue
-// across every plan until its body starts, its opening rejects it, a list drops it, or its stored entry is current.
+type DeliveryPaths = { stat: ReturnType<typeof observeRolloutStat>; plain: boolean };
+type PlacementState = {
+  observed?: { placement: CompressedPlacement; machine?: CompressedFactEntry };
+  posted?: CompressedPlacement;
+  resumed?: boolean;
+  disputed?: CompressedPlacement['revision'];
+  pending?: boolean;
+};
+
+type PlannedOpening = { entry: CompressedFactEntry; stat: Job['stat']; machine?: CompressedFactEntry };
+type PersistenceWait = { resume?: () => void };
+
+type AdoptedPlacement = { entry: CompressedEntrySeed; opening?: CodexSessionMeta | null; pending?: true };
+
+// Priority keeps an event or an added name first through both opening placement and body scheduling.
 type Job = {
   kind: 'opening' | 'body';
   file: string;
   stat: NonNullable<ReturnType<typeof readRolloutStat>>;
-  added?: boolean;
+  generation: number;
+  priority?: boolean;
+  opening?: CodexSessionMeta;
+  machine?: CompressedFactEntry;
+  verifiedOpening?: CompressedFactEntry;
+  adoption?: AdoptedPlacement;
+  repair?: CompressedRepair;
 };
 
 // One worker holds one backfill per workspace store. Each list of names replaces the set. A name that the list no longer
@@ -372,19 +420,49 @@ type Job = {
 export class CompressedBackfill {
   private names: ReadonlySet<string> = new Set();
   private readonly events = new Set<string>();
+  private readonly waitingPlacements = new Set<string>();
   private readonly added = new Set<string>();
+  private readonly repairs = new Map<string, CompressedRepair>();
+  private readonly repairQueue = new Map<string, Job>();
+  private activeJob?: Job;
+  private persistence?: PersistenceWait;
+  private endStep?: () => void;
+  private readonly plannedOpenings = new Map<string, PlannedOpening>();
+  private readonly openingMisses = new Map<string, Job>();
   private readonly staleOpens = new Set<string>();
   private readonly results = new Map<string, CompressedEntrySeed>();
-  private readonly retries = new Map<string, { size: number; mtimeMs: number; attempts: number; at: number }>();
+  private readonly retries = new Map<
+    string,
+    { stat: Job['stat']; attempts: number; at: number; job?: Job; cancel?: () => void }
+  >();
   private readonly openingEntries = new Map<string, CompressedFactEntry>();
-  private openingsLoaded = false;
+  private readonly adoptedPlacements = new Map<string, AdoptedPlacement>();
+  private readonly machineOpenings = new Map<string, CompressedFactEntry>();
+  private readonly checkedMachineOpenings = new Map<
+    string,
+    { machine: CompressedFactEntry; opening: CodexSessionMeta | null }
+  >();
+  private readonly openingsInput: CompressedStoreFollower;
+  private readonly openingsAbort = new AbortController();
+  private openingsPending = false;
+  private openingsRead?: Promise<void>;
   private running = false;
   private dirty = false;
   private disposed = false;
   private inFolders: (cwd: string) => boolean;
   private rootsKey: string;
+  private repairScope?: number;
+  private generation = 0;
+  private scopePending = false;
   private decoding: { file: string; controller: AbortController } | null = null;
-  private readonly outbox = new Map<string, CompressedFactEntry>();
+  private readonly outbox = new Map<string, { entry: CompressedFactEntry; job: Job }>();
+  private readonly sent = new Map<string, CompressedEntrySeed>();
+  private readonly retiredRepairs = new Map<string, CompressedRepair>();
+  private readonly placements = new Map<string, PlacementState>();
+  private readonly flushReady = new Set<string>();
+  private readonly flushParked = new Map<string, number>();
+  private follow = 0;
+  private flushDue = false;
   private cancelFlush: (() => void) | null = null;
   private cancelReplan: (() => void) | null = null;
   private turnEnded: (() => void) | null = null;
@@ -393,10 +471,12 @@ export class CompressedBackfill {
   private lastFlush = -Infinity;
   private unpostedMs = 0;
   private readonly now: () => number;
+  private readonly wallNow: () => number;
   private readonly schedule: (milliseconds: number, run: () => void) => () => void;
   private readonly yieldStep: () => Promise<void>;
   private readonly wait: (milliseconds: number) => Promise<void>;
   private readonly statOf: typeof readRolloutStat;
+  private readonly observeStat: typeof observeRolloutStat;
   private readonly exists: (file: string) => boolean;
   private readonly readFirst: typeof readCompressedFirstRecord;
   private readonly stream: typeof streamCompressedRollout;
@@ -406,6 +486,7 @@ export class CompressedBackfill {
     this.inFolders = options.inFolders(options.roots);
     this.rootsKey = JSON.stringify(options.roots);
     this.now = options.now ?? performance.now.bind(performance);
+    this.wallNow = options.wallNow ?? Date.now;
     this.schedule =
       options.schedule ??
       ((milliseconds, run) => {
@@ -415,65 +496,373 @@ export class CompressedBackfill {
       });
     this.yieldStep = options.yieldStep ?? (() => new Promise((resolve) => setImmediate(resolve)));
     this.wait = options.wait ?? ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
-    this.statOf = options.statOf ?? readRolloutStat;
+    this.observeStat = options.observeStat ?? options.statOf ?? observeRolloutStat;
+    this.statOf = options.statOf ?? ((file) => this.observeStat(file) ?? null);
     this.exists = options.exists ?? ((file) => this.statOf(file) !== null);
     this.readFirst = options.readFirst ?? readCompressedFirstRecord;
     this.stream = options.stream ?? streamCompressedRollout;
     this.readStore = options.readStore ?? readCompressedStoreInSteps;
+    this.openingsInput = CompressedStoreFollower.forOpenings(
+      options.openings.directory,
+      () => this.planYield(),
+      (entry) => this.noteMachineOpening(entry),
+    );
   }
 
   // Each list from the host is the complete set. A name that a later list adds goes first.
   setNames(list: readonly string[]): void {
     const next = new Set(list);
     if (this.names.size) for (const name of next) if (!this.names.has(name)) this.added.add(name);
-    for (const name of this.added) if (!next.has(name)) this.added.delete(name);
+    for (const jobs of [this.added, this.events, this.staleOpens, this.waitingPlacements, this.flushReady])
+      for (const name of jobs) if (!next.has(name)) jobs.delete(name);
+    for (const file of this.flushParked.keys()) if (!next.has(file)) this.flushParked.delete(file);
     this.names = next;
+    for (const file of this.checkedMachineOpenings.keys())
+      if (!next.has(file)) this.checkedMachineOpenings.delete(file);
+    this.refreshMachineOpenings();
+    for (const [file, repair] of this.repairs) if (!next.has(file)) this.endRepair(repair, true);
+    for (const held of [
+      this.outbox,
+      this.sent,
+      this.results,
+      this.adoptedPlacements,
+      this.plannedOpenings,
+      this.openingMisses,
+    ]) {
+      for (const file of held.keys()) if (!next.has(file)) held.delete(file);
+    }
+    for (const [file, retry] of this.retries) {
+      if (next.has(file)) continue;
+      retry.cancel?.();
+      this.retries.delete(file);
+    }
+    for (const file of this.placements.keys()) if (!next.has(file)) this.placements.delete(file);
     if (this.decoding && !next.has(this.decoding.file)) this.decoding.controller.abort();
     this.dirty = true;
     void this.run();
   }
 
-  // A failed adoption needs the twin's body, and no list of names follows it.
-  noteAdoptionFailed(file: string): void {
+  // A listed revision can change without a change in the list. Queue only the accepted revisions.
+  acceptRepairs(requested: readonly CompressedRepair[]): CompressedRepair[] {
+    const accepted: CompressedRepair[] = [];
+    for (const repair of requested.slice(0, COMPRESSED_REPAIR_LIMIT)) {
+      const { file } = repair;
+      const held = this.repairs.get(file);
+      if (!held && this.repairs.size >= COMPRESSED_REPAIR_LIMIT) continue;
+      const stat = this.observeStat(file);
+      if (stat === undefined && this.names.has(file)) continue;
+      if (
+        !this.names.has(file) ||
+        (repair.cwd !== undefined && !this.inFolders(repair.cwd)) ||
+        !stat?.isFile ||
+        !sameStat(stat, repair) ||
+        this.exists(file.replace(/\.zst$/, ''))
+      ) {
+        if (held && sameCompressedRepair(held, repair)) this.endRepair(held, true);
+        else {
+          this.retiredRepairs.set(file, repair);
+          this.armFlush();
+        }
+        if (stat?.isFile && !sameStat(stat, repair)) this.noteReplacement(file);
+        continue;
+      }
+      accepted.push(repair);
+      if (held && sameCompressedRepair(held, repair)) continue;
+      if (held) this.endRepair(held, false);
+      this.retiredRepairs.delete(file);
+      this.repairs.set(file, repair);
+      const entry = this.factsOf(file, stat);
+      const adoption = this.adoptedPlacement(file, entry, stat);
+      const opening = this.placingOpening(file, entry, stat, adoption);
+      const opened =
+        opening && this.repairOpeningMatches(repair, opening) && codexRowAdmitted(opening, stat, this.inFolders);
+      const job: Job = {
+        file,
+        adoption,
+        stat,
+        generation: this.generation,
+        kind: opened ? 'body' : 'opening',
+        repair,
+        opening: opened ? opening : undefined,
+        machine: this.machineOpening(file, stat),
+      };
+      if (this.matchesOpeningMiss(job)) this.endRepair(repair, true);
+      else this.repairQueue.set(file, job);
+      if (this.activeJob?.file === file && !this.jobCurrent(this.activeJob)) this.decoding?.controller.abort();
+    }
+    if (accepted.length) void this.run();
+    return accepted;
+  }
+
+  private jobAllowed(job: Job, checked?: DeliveryPaths): boolean {
+    if (
+      this.disposed ||
+      this.scopePending ||
+      job.generation !== this.generation ||
+      !this.names.has(job.file) ||
+      (checked ? checked.plain : this.exists(job.file.replace(/\.zst$/, '')))
+    )
+      return false;
+    return !job.repair || this.repairs.get(job.file) === job.repair;
+  }
+
+  private jobRevision(job: Job, checked?: DeliveryPaths): boolean | undefined {
+    if (!this.jobAllowed(job, checked) || (job.opening && !codexRowAdmitted(job.opening, job.stat, this.inFolders))) {
+      if (job.repair) this.endRepair(job.repair, true);
+      return false;
+    }
+    if (this.machineWorkPending) return undefined;
+    const stat = checked ? checked.stat : this.observeStat(job.file);
+    if (stat === undefined) return undefined;
+    if (stat?.isFile && stat.size > 0) {
+      if (sameStat(job.stat, stat)) {
+        const machine = this.machineOpening(job.file, stat);
+        if (!this.sameMachinePlacement(job.machine, machine)) {
+          if (job.verifiedOpening && this.sameMachinePlacement(job.verifiedOpening, machine)) job.machine = machine;
+          else {
+            this.requeue({ ...job, kind: 'opening', opening: undefined, machine }, checked);
+            return false;
+          }
+        }
+        const followed = this.options.known().get(job.file);
+        const local = this.results.get(job.file);
+        const adoption =
+          job.adoption || followed?.adopted || local?.adopted || this.adoptedPlacements.has(job.file)
+            ? this.adoptedPlacement(job.file, this.factsOf(job.file, stat), stat)
+            : undefined;
+        if (adoption?.pending) return false;
+        if (job.adoption === adoption) return true;
+        if (job.repair) {
+          this.requeue({ ...job, kind: 'opening', opening: undefined, adoption }, checked);
+        } else this.noteReplacement(job.file);
+        return false;
+      }
+      this.noteReplacement(job.file);
+    }
+    if (job.repair) this.endRepair(job.repair, true);
+    return false;
+  }
+
+  private jobCurrent(job: Job): boolean {
+    return this.jobRevision(job) === true;
+  }
+
+  private noteReplacement(file: string): void {
+    if (!this.names.has(file)) return;
     this.events.add(file);
-    this.dirty = true;
     void this.run();
   }
 
-  // A load repeats the roots every 10 seconds, so only a change of the roots plans again. Each repeat also checks the
-  // files that failed, because a replaced file keeps its name.
-  setRoots(roots: readonly string[]): void {
-    const key = JSON.stringify(roots);
-    if (key === this.rootsKey) {
-      if (this.failedRevisionMoved()) {
-        this.dirty = true;
-        void this.run();
-      }
-      return;
+  private repairOpeningMatches(repair: CompressedRepair, opening: CodexSessionMeta | null | undefined): boolean {
+    return repair.sessionId === undefined || (opening?.sessionId === repair.sessionId && opening.cwd === repair.cwd);
+  }
+
+  private repairFactMatches(repair: CompressedRepair, entry: CompressedFactEntry): boolean {
+    return (
+      !entry.spendNeedsRepair &&
+      compressedEntryCurrent(entry, repair) &&
+      (entry.unreadable ? entry.unreadableLaunch === this.options.launch : entry.decodedLength !== undefined) &&
+      (entry.unreadable && !entry.opening
+        ? repair.sessionId === undefined || entry.threadId === repair.sessionId
+        : this.repairOpeningMatches(repair, entry.opening) &&
+          !!entry.opening?.cwd &&
+          this.inFolders(entry.opening.cwd) &&
+          !isHiddenThread(entry.opening))
+    );
+  }
+
+  private endRepair(repair: CompressedRepair, retired: boolean): void {
+    const { file } = repair;
+    if (this.repairs.get(file) !== repair) return;
+    this.repairs.delete(file);
+    this.repairQueue.delete(file);
+    const retry = this.retries.get(file);
+    if (retry?.job?.repair === repair) {
+      retry.cancel?.();
+      this.retries.delete(file);
     }
-    this.rootsKey = key;
-    this.inFolders = this.options.inFolders(roots);
-    this.dirty = true;
-    void this.run();
+    if (retired) {
+      this.retiredRepairs.set(file, repair);
+      this.armFlush();
+    }
+  }
+
+  private requeue(job: Job, checked?: DeliveryPaths): void {
+    if (job.generation !== this.generation) return;
+    if (!job.repair) {
+      this.events.add(job.file);
+    } else if (this.jobAllowed(job, checked)) {
+      this.repairQueue.set(job.file, job);
+    }
+  }
+
+  // The twin still needs a body decode after adoption.
+  noteAdoption(entry: CompressedFactEntry, pending = false): void {
+    this.notePlacementObservation(entry, pending);
+    if (!pending) this.noteReplacement(entry.file);
+  }
+
+  private notePlacementObservation(entry: CompressedFactEntry, pending = false): void {
+    const { file } = entry;
+    if (!this.names.has(file) || (!entry.adopted && !this.adoptedPlacements.has(file))) return;
+    const held = this.adoptedPlacements.get(file);
+    const stat = this.statOf(file);
+    if (!stat || !compressedEntryCurrent(entry, stat)) return;
+    const next = this.adoptedPlacement(file, entry, stat);
+    if (!next || next.entry.hash !== entry.hash) return;
+    if (next === held && (!held.pending || pending)) return;
+    next.pending = pending ? true : undefined;
+    const retry = this.retries.get(file);
+    if (retry) {
+      retry.cancel?.();
+      this.retries.delete(file);
+    }
+    if (this.decoding?.file === file && next !== held) this.decoding.controller.abort();
+    if (!pending) {
+      const repair = this.repairs.get(file);
+      if (repair && sameStat(repair, stat))
+        this.requeue({
+          kind: 'opening',
+          file,
+          stat,
+          generation: this.generation,
+          priority: true,
+          adoption: next,
+          repair,
+          machine: this.machineOpening(file, stat),
+        });
+      this.noteReplacement(file);
+    }
+  }
+
+  private adoptedPlacement(
+    file: string,
+    entry: CompressedEntrySeed | undefined,
+    stat: Job['stat'],
+  ): AdoptedPlacement | undefined {
+    const matches = (candidate: CompressedEntrySeed) =>
+      candidate.size === stat.size && candidate.mtimeMs === stat.mtimeMs && !compressedEntryConflicts(candidate, stat);
+    let held = this.adoptedPlacements.get(file);
+    if (held && !matches(held.entry)) {
+      this.adoptedPlacements.delete(file);
+      held = undefined;
+    }
+    if (!entry || (entry.adopted ? !matches(entry) : !held || !compressedEntryCurrent(entry, stat))) return held;
+    if (held) {
+      const before = compressedByteObservation(held.entry);
+      const next = compressedByteObservation(entry);
+      if (next && (!before || compareCompressedObservations(next, before) > 0)) {
+        if (held.entry.hash === entry.hash) {
+          held.entry = compressedEntrySeed(entry);
+          return held;
+        }
+      } else return held;
+    }
+    const placement = { entry: compressedEntrySeed(entry) };
+    this.adoptedPlacements.set(file, placement);
+    return placement;
+  }
+
+  suspendScope(scope: number): void {
+    if (this.repairScope === scope || this.scopePending) return;
+    this.scopePending = true;
+    this.generation++;
+    this.decoding?.controller.abort();
+    this.endTurn();
+    this.wake?.();
+  }
+
+  // Install the host's retained placements before the list or store follow can plan work for the new scope.
+  configureScope(
+    roots: readonly string[] | undefined,
+    scope?: number,
+    retained?: readonly CompressedPlacement[],
+  ): void {
+    const key = roots ? JSON.stringify(roots) : this.rootsKey;
+    const rescope =
+      this.scopePending ||
+      (scope !== undefined && this.repairScope !== undefined && scope !== this.repairScope) ||
+      key !== this.rootsKey;
+    if (!rescope && (scope === undefined || scope === this.repairScope)) return;
+    if (scope !== undefined) this.repairScope = scope;
+    if (roots && key !== this.rootsKey) {
+      this.rootsKey = key;
+      this.inFolders = this.options.inFolders(roots);
+    }
+    if (rescope) {
+      if (!this.scopePending) this.generation++;
+      this.decoding?.controller.abort();
+      for (const retry of this.retries.values()) retry.cancel?.();
+      this.retries.clear();
+      this.openingMisses.clear();
+      this.plannedOpenings.clear();
+      this.clearRepairs();
+      this.queue = [];
+      this.outbox.clear();
+      for (const [file, state] of this.placements) {
+        if (state.pending) this.placements.set(file, {});
+        else this.placements.delete(file);
+      }
+      this.dirty = true;
+    }
+    this.scopePending = false;
+    for (const placement of retained ?? []) this.placements.set(placement.file, { posted: placement, resumed: true });
+  }
+
+  setRepairScope(scope: number): void {
+    this.configureScope(undefined, scope);
+    if (this.dirty) void this.run();
+  }
+
+  // A store follow checks deferred deliveries without making quiet follows recheck settled files.
+  setRoots(roots: readonly string[]): void {
+    this.configureScope(roots);
+    this.refreshMachineOpenings();
+    const moved = this.failedRevisionMoved();
+    for (const file of this.waitingPlacements) this.events.add(file);
+    this.waitingPlacements.clear();
+    this.follow++;
+    this.armFlush();
+    if (moved || this.dirty || this.events.size || this.openingsPending) void this.run();
+  }
+
+  private clearRepairs(): void {
+    for (const repair of this.repairs.values()) this.endRepair(repair, false);
+    this.retiredRepairs.clear();
+    if (this.activeJob?.repair) this.decoding?.controller.abort();
   }
 
   // An open read this rollout. A rollout whose stored entry is not current goes first.
   noteOpened(file: string): void {
     const stat = this.statOf(file);
-    const entry = this.factsOf(file);
+    const entry = this.factsOf(file, stat);
     if (!stat || (entry && compressedEntryCurrent(entry, stat) && entry.decodedLength !== undefined)) return;
     this.staleOpens.add(file);
-    this.dirty = true;
     void this.run();
   }
 
   private failedRevisionMoved(): boolean {
     let moved = false;
     for (const [file, retry] of this.retries) {
-      const stat = this.statOf(file);
-      if (stat && stat.size === retry.size && stat.mtimeMs === retry.mtimeMs) continue;
-      this.retries.delete(file);
-      if (stat) this.events.add(file);
+      const stat = this.observeStat(file);
+      if (stat === undefined) continue;
+      if (sameStat(stat, retry.stat)) {
+        if (retry.job?.repair && !this.jobAllowed(retry.job)) {
+          this.endRepair(retry.job.repair, true);
+          continue;
+        }
+        if (!retry.cancel && retry.job && retry.at <= this.now()) {
+          this.requeue(retry.job);
+          moved = true;
+        }
+        continue;
+      }
+      if (retry.job?.repair) this.endRepair(retry.job.repair, true);
+      else {
+        retry.cancel?.();
+        this.retries.delete(file);
+      }
+      if (stat?.isFile && stat.size > 0) this.events.add(file);
       moved = true;
     }
     return moved;
@@ -481,37 +870,80 @@ export class CompressedBackfill {
 
   dispose(): void {
     this.disposed = true;
+    this.openingMisses.clear();
+    this.plannedOpenings.clear();
+    this.persistence?.resume?.();
+    this.openingsAbort.abort();
     this.decoding?.controller.abort();
+    this.wake?.();
     this.endTurn();
     this.cancelFlush?.();
     this.cancelFlush = null;
     this.cancelReplan?.();
     this.cancelReplan = null;
+    for (const retry of this.retries.values()) retry.cancel?.();
   }
 
-  // True for the line of an entry that a batch already carried to the host. An entry that waits for its batch stays in a
-  // load reply, so the offsets of that reply cover only entries that reach the host.
+  // Only a sent record can be excluded from a later follow.
   published(entry: CompressedFactEntry): boolean {
-    const held = this.results.get(entry.file);
-    return !!held && !this.outbox.has(entry.file) && compressedEntrySame(held, entry);
+    const held = this.sent.get(entry.file);
+    return !!held && compressedEntrySame(held, entry);
   }
 
-  private factsOf(file: string): CompressedEntrySeed | undefined {
-    return this.results.get(file) ?? this.options.known().get(file);
+  awaitingPlacement(file: string): boolean {
+    return this.placements.get(file)?.pending === true;
+  }
+
+  followed(entry: CompressedFactEntry): void {
+    const queued = this.outbox.get(entry.file);
+    const matched = !!queued && compressedEntrySame(queued.entry, entry);
+    if (matched) this.outbox.delete(entry.file);
+    this.noteSent(entry, matched);
+    this.notePlacementObservation(entry);
+    if (entry.adopted) this.noteReplacement(entry.file);
+  }
+
+  private noteSent(entry: CompressedFactEntry, fromOutbox: boolean, checked?: Job['stat']): void {
+    if (fromOutbox) {
+      const local = this.results.get(entry.file);
+      this.sent.set(entry.file, local && compressedEntrySame(local, entry) ? local : compressedEntrySeed(entry));
+    }
+    const repair = this.repairs.get(entry.file);
+    if (repair && this.repairFactMatches(repair, entry) && sameStat(repair, checked ?? this.statOf(entry.file)))
+      this.endRepair(repair, false);
+  }
+
+  private factsOf(file: string, stat: Job['stat'] | null): CompressedEntrySeed | undefined {
+    const local = this.results.get(file);
+    const followed = this.options.known().get(file);
+    if (!local || !followed) return local ?? followed;
+    return (
+      reconcileCompressedEntries(local, followed, stat) ??
+      (compareCompressedEntries(followed, local, stat) > 0 ? followed : local)
+    );
   }
 
   private async sliceEnd(slice: { bytes: number; started: number }): Promise<void> {
     this.unpostedMs += this.now() - slice.started;
     await this.yieldStep();
+    if (this.machineWorkPending) await this.followMachineOpenings();
+    if (this.flushDue) await this.deliverDueBatches();
     await this.waitIdle();
     slice.bytes = 0;
     slice.started = this.now();
   }
 
   // Lets one slice end while discovery requests wait, and resolves when it ended. A parked backfill starts the slice, and
-  // a decode in work ends the slice it holds. The result is null when a reader waits, or at any other step of the backfill.
+  // a decode or machine traversal in progress ends its current slice. A waiting reader takes precedence.
   takeTurn(): Promise<void> | null {
-    if ((!this.wake && !this.decoding) || this.disposed || this.options.reading?.()) return null;
+    if (
+      (!this.wake && !this.openingsRead && (!this.decoding || this.activeJob?.kind !== 'body')) ||
+      this.turnEnded ||
+      this.disposed ||
+      this.scopePending ||
+      this.options.reading?.()
+    )
+      return null;
     return new Promise((resolve) => {
       this.turnEnded = resolve;
       this.cancelTurnLimit = this.schedule(BACKFILL_TURN_LIMIT_MS, () => {
@@ -522,9 +954,7 @@ export class CompressedBackfill {
     });
   }
 
-  // A store write can wait on another window's lease. The backfill ends a held turn before each store write and each read
-  // of the facts store, and it grants no turn during them. A read of the openings store in a plan is synchronous between
-  // its yields, and its first yield ends a held turn.
+  // A wait for a store lease or a workspace store read ends the current turn. A machine store read ends it at a yield.
   private endTurn(): void {
     this.cancelTurnLimit?.();
     this.cancelTurnLimit = null;
@@ -535,7 +965,10 @@ export class CompressedBackfill {
   // Every call follows a finished step of work, so it ends a turn that waited on that step.
   private async waitIdle(): Promise<void> {
     this.endTurn();
-    while (this.options.busy() && !this.disposed && !this.turnEnded) await this.pause();
+    while (this.options.busy() && !this.disposed && (!this.turnEnded || this.options.reading?.())) {
+      if (this.options.reading?.()) this.endTurn();
+      await this.pause();
+    }
   }
 
   // Lasts until the next busy check, or until a turn starts.
@@ -551,13 +984,16 @@ export class CompressedBackfill {
   }
 
   private async run(): Promise<void> {
-    if (this.running || this.disposed) return;
+    if (this.running || this.disposed || this.scopePending) return;
     this.running = true;
     try {
-      while (!this.disposed) {
+      while (!this.disposed && !this.scopePending) {
+        if (this.machineWorkPending) await this.followMachineOpenings();
+        if (this.disposed || this.scopePending) return;
+        if (this.openingsPending) continue;
         if (this.dirty) {
           await this.waitIdle();
-          if (this.disposed) return;
+          if (this.disposed || this.scopePending) return;
           try {
             await this.plan();
           } catch {
@@ -565,39 +1001,205 @@ export class CompressedBackfill {
             break;
           }
         }
-        const job = this.queue.shift();
-        if (!job) break;
+        if (this.events.size || this.staleOpens.size) {
+          await this.waitIdle();
+          if (this.disposed || this.scopePending) return;
+          await this.planEvents();
+        }
+        if (this.openingsPending) continue;
+        if (this.flushDue) await this.deliverDueBatches();
+        if (this.dirty || this.events.size || this.staleOpens.size || this.openingsPending) continue;
+        this.armFlush();
+        const persistence = this.persistence;
+        if (persistence) {
+          if (!persistence.resume) break;
+          await this.waitIdle();
+          if (this.disposed || this.scopePending) return;
+          if (this.machineWorkPending || this.dirty || this.events.size || this.staleOpens.size || this.flushDue)
+            continue;
+          this.persistence = undefined;
+          await this.runStep(persistence.resume);
+          continue;
+        }
+        if (this.plannedOpenings.size) {
+          await this.runStep(() => void this.writePlannedOpenings().then(this.finishStep, this.finishStep));
+          continue;
+        }
+        if (!this.repairQueue.size && !this.queue.length) break;
         await this.waitIdle();
-        if (this.disposed) return;
-        // A name that a later list dropped, or that a plain rollout replaced, is no longer backfilled.
-        if (!this.names.has(job.file) || this.exists(job.file.replace(/\.zst$/, ''))) continue;
-        // Another window's backfill can decode a queued body while this one waits for the store lease.
-        const stored = this.factsOf(job.file);
+        if (this.disposed || this.scopePending) return;
+        if (this.openingsPending) continue;
+        const targeted = this.repairQueue.values().next().value;
+        const job = targeted ?? this.queue.shift();
+        if (!job) continue;
+        if (targeted) this.repairQueue.delete(job.file);
+        const current = this.jobRevision(job);
+        if (!current) {
+          if (current === undefined) this.waitForRevision(job);
+          continue;
+        }
+        const stored = this.factsOf(job.file, job.stat);
+        const observed =
+          (!job.adoption || job.adoption.entry.hash === stored?.hash) &&
+          (!stored || !this.machineOpeningConflicts(job.machine, stored)) &&
+          this.canReuseResumedFacts(job.file, stored);
+        if (job.repair && observed && (!job.adoption || job.kind === 'body') && this.replayRepair(job)) continue;
         if (
-          stored &&
-          compressedEntryCurrent(stored, job.stat) &&
-          stored.decodedLength !== undefined &&
-          !stored.unreadable
+          !job.repair &&
+          observed &&
+          stored?.decodedLength !== undefined &&
+          !stored.unreadable &&
+          compressedEntryCurrent(stored, job.stat)
         ) {
           this.added.delete(job.file);
           continue;
         }
-        try {
-          if (job.kind === 'opening') await this.deriveOpening(job);
-          else {
-            this.added.delete(job.file);
-            await this.deriveBody(job);
-          }
-        } catch {
-          // A throw on one file must not end the worker, or each new worker reaches the same file.
-          await this.retryLater(job).catch(() => undefined);
+        const retry = this.retries.get(job.file);
+        if (retry && sameStat(retry.stat, job.stat) && retry.at > this.now()) {
+          if (job.repair) retry.job = job;
+          continue;
         }
+        if (this.matchesOpeningMiss(job)) {
+          if (job.repair) this.endRepair(job.repair, true);
+          continue;
+        }
+        if (job.repair && this.restoreRepairRetry(job)) continue;
+        await this.runStep(() => void this.derive(job).then(this.finishStep, this.finishStep));
       }
     } finally {
       this.running = false;
       this.endTurn();
     }
-    if (this.dirty && !this.disposed) void this.run();
+    if ((this.dirty || this.events.size || this.staleOpens.size || this.openingsPending) && !this.disposed)
+      void this.run();
+  }
+
+  private async derive(job: Job): Promise<void> {
+    this.activeJob = job;
+    try {
+      if (job.kind === 'opening') await this.deriveOpening(job);
+      else {
+        this.openingMisses.delete(job.file);
+        this.added.delete(job.file);
+        await this.deriveBody(job);
+      }
+    } catch {
+      await this.retryLater(job).catch(() => undefined);
+    } finally {
+      this.activeJob = undefined;
+    }
+  }
+
+  private runStep(start: () => void): Promise<void> {
+    return new Promise((end) => {
+      this.endStep = end;
+      start();
+    });
+  }
+
+  private readonly finishStep = (): void => {
+    const end = this.endStep;
+    this.endStep = undefined;
+    end?.();
+  };
+
+  // A derivation resumes through the runner after a store operation. The runner can check machine input and deliver
+  // batches during the wait. It starts no other derivation or store write.
+  private waitForPersistence<T>(operation: () => Promise<T>): Promise<T> {
+    this.endTurn();
+    const pending: PersistenceWait = {};
+    this.persistence = pending;
+    return new Promise((resolve, reject) => {
+      const ready = (resume: () => void) => {
+        if (this.disposed) resume();
+        else {
+          pending.resume = resume;
+          void this.run();
+        }
+      };
+      void Promise.resolve()
+        .then(operation)
+        .then(
+          (value) => ready(() => resolve(value)),
+          (error: unknown) => ready(() => reject(error)),
+        );
+      this.finishStep();
+    });
+  }
+
+  private matchesOpeningMiss(job: Job): boolean {
+    const held = this.openingMisses.get(job.file);
+    if (!held) return false;
+    const evidence = (entry?: CompressedFactEntry) =>
+      entry?.physicalOpening && (entry.hash || (entry.opening?.sessionId && entry.opening.cwd)) ? entry : undefined;
+    if (
+      !sameStat(held.stat, job.stat) ||
+      (job.adoption && job.adoption !== held.adoption) ||
+      (job.repair?.openingHash && job.repair.openingHash !== (held.repair?.openingHash ?? held.machine?.hash)) ||
+      (evidence(job.machine) && !this.sameMachinePlacement(evidence(held.machine), job.machine))
+    ) {
+      this.openingMisses.delete(job.file);
+      return false;
+    }
+    return job.kind === 'opening';
+  }
+
+  private waitForRevision(job: Job): void {
+    const retry = this.retries.get(job.file);
+    if (retry && sameStat(retry.stat, job.stat)) {
+      if (retry.cancel) return;
+      if (retry.at <= this.now()) {
+        retry.job = job;
+        return;
+      }
+    }
+    const waiting = { stat: job.stat, attempts: retry?.attempts ?? 0, at: 0, job };
+    this.retries.set(job.file, waiting);
+    this.retryAfter(job, waiting, BACKFILL_RETRY_DELAYS_MS[0]);
+  }
+
+  private replayRepair(job: Job): boolean {
+    const repair = job.repair!;
+    const queued = this.outbox.get(job.file);
+    if (queued && this.repairFactMatches(repair, queued.entry)) return true;
+    const known = this.factsOf(job.file, job.stat);
+    if (!known || !this.repairFactMatches(repair, known)) return false;
+    const full = this.readContributor(known);
+    if (!full) {
+      this.waitForRevision(job);
+      return true;
+    }
+    if (!this.repairFactMatches(repair, full)) return false;
+    this.outbox.set(job.file, { entry: full, job });
+    this.flushReady.add(job.file);
+    this.armFlush();
+    return true;
+  }
+
+  private restoreRepairRetry(job: Job): boolean {
+    const retryHeld = this.retries.get(job.file);
+    if (retryHeld && sameStat(retryHeld.stat, job.stat)) return false;
+    const entry = this.openingEntries.get(job.file);
+    const saved = entry?.repairRetry;
+    if (
+      !entry ||
+      !saved ||
+      (job.machine && (!entry.opening || this.machineOpeningConflicts(job.machine, entry))) ||
+      saved.launch !== this.options.launch ||
+      !sameCompressedRepair(saved.source, job.repair!) ||
+      !Number.isInteger(saved.attempts) ||
+      saved.attempts < 1 ||
+      saved.attempts > BACKFILL_RETRY_DELAYS_MS.length ||
+      !Number.isFinite(saved.at) ||
+      !compressedEntryCurrent(entry, job.stat)
+    )
+      return false;
+    const delay = Math.max(0, Math.min(saved.at - this.wallNow(), BACKFILL_RETRY_DELAYS_MS[saved.attempts - 1]));
+    const retry = { stat: job.stat, attempts: saved.attempts, at: 0, job };
+    this.retries.set(job.file, retry);
+    if (!delay) return false;
+    this.retryAfter(job, retry, delay);
+    return true;
   }
 
   private queue: Job[] = [];
@@ -608,75 +1210,228 @@ export class CompressedBackfill {
     await this.waitIdle();
   }
 
-  private async plan(): Promise<void> {
-    this.dirty = false;
-    if (!this.openingsLoaded) {
-      const openings = await readCompressedStoreInSteps(this.options.openings.directory, this.statOf, () =>
-        this.planYield(),
-      );
-      for (const [file, entry] of openings.entries) this.openingEntries.set(file, entry);
-      this.openingsLoaded = true;
+  private get machineWorkPending(): boolean {
+    return this.openingsPending || !!this.openingsRead;
+  }
+
+  private refreshMachineOpenings(): void {
+    if (!this.names.size || this.disposed) return;
+    this.openingsPending = true;
+    // A decode also waits for I/O between slices. Follow there to stop a changed decode promptly.
+    if (this.decoding && !this.wake) void this.followMachineOpenings();
+  }
+
+  private async followMachineOpenings(): Promise<void> {
+    while (!this.disposed && this.machineWorkPending) {
+      if (!this.openingsRead) {
+        this.openingsRead = this.readMachineOpenings().finally(() => {
+          this.openingsRead = undefined;
+          this.endTurn();
+          this.armFlush();
+        });
+      }
+      await this.openingsRead;
     }
+  }
+
+  private async readMachineOpenings(): Promise<void> {
+    await this.waitIdle();
+    this.openingsPending = false;
+    if (this.disposed || this.scopePending || !this.names.size) return;
+    await this.openingsInput.follow(this.openingsAbort.signal).catch(() => undefined);
+  }
+
+  private writeRevision(job: Job): boolean | undefined {
+    if (!this.machineWorkPending) return this.jobRevision(job);
+    this.requeue(job);
+    return false;
+  }
+
+  private noteMachineOpening(entry: CompressedFactEntry): void {
+    if (this.disposed) return;
+    const { file } = entry;
+    const versions = compressedEntryVersions();
+    if (
+      entry.factsVersion !== versions.factsVersion ||
+      entry.codexMetaVersion !== versions.codexMetaVersion ||
+      entry.metadataGeneration !== versions.metadataGeneration ||
+      entry.spendGeneration !== versions.spendGeneration
+    )
+      return;
+    if (entry.repairRetry) {
+      const held = this.openingEntries.get(file);
+      if (!held || compareCompressedEntries(entry, held, null) > 0) this.openingEntries.set(file, entry);
+      return;
+    }
+    if (entry.opening === undefined) return;
+    const held = this.machineOpenings.get(file);
+    if (held && this.sameMachinePlacement(held, entry)) {
+      if (compareCompressedEntries(entry, held, null) > 0) {
+        held.storeRecord = entry.storeRecord;
+        held.factsOrder = entry.factsOrder;
+      }
+      return;
+    }
+    if (held && compareCompressedEntries(entry, held, this.names.has(file) ? this.statOf(file) : null) <= 0) return;
+    this.machineOpenings.set(file, entry);
+    this.checkedMachineOpenings.delete(file);
+    if (!this.names.has(file)) return;
+    if (!held && this.dirty && !this.activeJob && !this.queue.length && !this.repairQueue.size) return;
+    this.events.add(file);
+    const retry = this.retries.get(file);
+    retry?.cancel?.();
+    this.retries.delete(file);
+    const repair = this.repairs.get(file);
+    if (repair && retry?.job?.repair === repair)
+      this.requeue({ ...retry.job, kind: 'opening', opening: undefined, machine: entry });
+    if (this.decoding?.file === file) this.decoding.controller.abort();
+  }
+
+  private sameMachinePlacement(left?: CompressedFactEntry, right?: CompressedFactEntry): boolean {
+    if (left === right) return true;
+    if (!left || !right) return false;
+    const a = compressedEntryIdentity(left);
+    const b = compressedEntryIdentity(right);
+    return (
+      !!a === !!b &&
+      (!a || (String(a.dev) === String(b?.dev) && String(a.ino) === String(b?.ino))) &&
+      left.size === right.size &&
+      left.mtimeMs === right.mtimeMs &&
+      left.hash === right.hash &&
+      (left.physicalOpening === true) === (right.physicalOpening === true) &&
+      left.threadId === right.threadId &&
+      left.opening?.sessionId === right.opening?.sessionId &&
+      left.opening?.cwd === right.opening?.cwd &&
+      !this.machineOpeningConflicts(left, right)
+    );
+  }
+
+  private machineOpening(file: string, stat: Job['stat']): CompressedFactEntry | undefined {
+    const entry = this.machineOpenings.get(file);
+    return entry &&
+      compressedEntryCurrent(entry, stat) &&
+      (!supportedFileIdentity(stat) || !!compressedEntryIdentity(entry) || !entry.threadId)
+      ? entry
+      : undefined;
+  }
+
+  private machineOpeningConflicts(machine: CompressedFactEntry | undefined, entry: CompressedEntrySeed): boolean {
+    if (!machine) return false;
+    if (machine.hash !== undefined && entry.hash !== undefined && machine.hash !== entry.hash) return true;
+    const physical = machine.opening;
+    const recorded = entry.opening;
+    return (
+      !!physical?.sessionId &&
+      !!physical.cwd &&
+      !!recorded?.sessionId &&
+      !!recorded.cwd &&
+      (physical.sessionId !== recorded.sessionId ||
+        physical.cwd !== recorded.cwd ||
+        isHiddenThread(physical) !== isHiddenThread(recorded) ||
+        isAgentRun(physical) !== isAgentRun(recorded))
+    );
+  }
+
+  private async plan(): Promise<void> {
+    const generation = this.generation;
+    this.dirty = false;
     const [events, adopted, unplaced, placed]: Job[][] = [[], [], [], []];
-    const repairs: CompressedFactEntry[] = [];
     let started = this.now();
     for (const file of this.names) {
       if (this.disposed) return;
       if (this.now() - started >= PLAN_SLICE_MS) {
         await this.planYield();
+        if (this.disposed || generation !== this.generation) return;
         started = this.now();
       }
       try {
-        this.planName(file, { events, adopted, unplaced, placed }, repairs);
+        this.planName(file, { events, adopted, unplaced, placed });
       } catch {
         this.replanLater();
       }
     }
     placed.sort((left, right) => right.stat.mtimeMs - left.stat.mtimeMs);
     this.queue = [...events, ...adopted, ...unplaced, ...placed];
-    if (repairs.length) await this.appendOpenings(repairs);
+  }
+
+  private async planEvents(): Promise<void> {
+    const generation = this.generation;
+    const affected = new Set([...this.events, ...this.staleOpens]);
+    const events: Job[] = [];
+    let started = this.now();
+    for (const file of affected) {
+      if (this.now() - started >= PLAN_SLICE_MS) {
+        await this.planYield();
+        started = this.now();
+      }
+      if (this.disposed || generation !== this.generation) return;
+      try {
+        this.planName(file, { events, adopted: events, unplaced: events, placed: events });
+      } catch {
+        this.replanLater();
+      }
+    }
+    this.queue = [...events, ...this.queue.filter(({ file }) => !affected.has(file))];
   }
 
   private planName(
     file: string,
     { events, adopted, unplaced, placed }: { events: Job[]; adopted: Job[]; unplaced: Job[]; placed: Job[] },
-    repairs: CompressedFactEntry[],
   ): void {
-    const stat = this.statOf(file);
-    if (!stat?.isFile || this.exists(file.replace(/\.zst$/, ''))) return;
-    const retry = this.retries.get(file);
-    if (retry && retry.size === stat.size && retry.mtimeMs === stat.mtimeMs && retry.at > this.now()) return;
-    const entry = this.factsOf(file);
-    const current = entry && compressedEntryCurrent(entry, stat);
-    if (current && entry.decodedLength !== undefined && !entry.unreadable) {
-      this.added.delete(file);
-      this.repairOpening(file, entry, stat, repairs);
+    const event = this.events.delete(file) || this.waitingPlacements.has(file);
+    const stale = this.staleOpens.delete(file);
+    if (!this.names.has(file)) return;
+    const stat = this.observeStat(file);
+    if (stat === undefined) this.waitingPlacements.add(file);
+    else this.waitingPlacements.delete(file);
+    if (!stat?.isFile || stat.size === 0) return;
+    if (this.exists(file.replace(/\.zst$/, ''))) {
+      const placement = this.placements.get(file);
+      if (placement?.resumed) this.parkFlush(file);
       return;
     }
-    if (current && entry.unreadable && entry.unreadableLaunch === this.options.launch) {
+    const retry = this.retries.get(file);
+    if (retry && sameStat(retry.stat, stat) && retry.at > this.now()) return;
+    const entry = this.factsOf(file, stat);
+    const adoption = this.adoptedPlacement(file, entry, stat);
+    if (adoption?.pending) return;
+    const machine = this.machineOpening(file, stat);
+    const current =
+      entry &&
+      compressedEntryCurrent(entry, stat) &&
+      (!adoption || adoption.entry.hash === entry.hash) &&
+      !this.machineOpeningConflicts(machine, entry);
+    const opening = this.placingOpening(file, entry, stat, adoption);
+    this.notePlacement(file, stat, opening, entry, machine);
+    if (current && entry.decodedLength !== undefined && !entry.unreadable && this.canReuseResumedFacts(file, entry)) {
+      this.added.delete(file);
+      this.repairOpening(file, entry, stat, machine);
+      return;
+    }
+    if (
+      current &&
+      entry.unreadable &&
+      entry.unreadableLaunch === this.options.launch &&
+      this.canReuseResumedFacts(file, entry)
+    ) {
       this.retries.set(file, {
-        size: stat.size,
-        mtimeMs: stat.mtimeMs,
+        stat,
         attempts: BACKFILL_RETRY_DELAYS_MS.length,
         at: Infinity,
       });
       return;
     }
-    const job: Job = { kind: 'body', file, stat };
-    if (this.events.delete(file) || entry?.adoptionFailed || this.staleOpens.delete(file)) {
-      events.push(job);
-      return;
-    }
-    const added = this.added.has(file);
-    if (entry?.adopted && !added) {
-      adopted.push(job);
-      return;
-    }
-    // A name that a later list added goes first, and its opening still decides whether its folder admits it.
-    const opening = this.placingOpening(file, entry, stat);
-    if (opening === undefined) (added ? events : unplaced).push({ kind: 'opening', file, stat, added });
-    else if (codexRowAdmitted(opening, stat, this.inFolders)) (added ? events : placed).push(job);
-    else this.added.delete(file);
+    const priority = event || stale || !!entry?.adoptionFailed || this.added.has(file);
+    const scheduled = { file, stat, priority, adoption, machine, generation: this.generation };
+    if (opening === undefined) {
+      const job: Job = { kind: 'opening', ...scheduled };
+      if (!this.matchesOpeningMiss(job)) (priority ? events : unplaced).push(job);
+    } else if (opening && codexRowAdmitted(opening, stat, this.inFolders)) {
+      const job: Job = { kind: 'body', ...scheduled, opening };
+      if (priority) events.push(job);
+      else if (entry?.adopted && current) adopted.push(job);
+      else placed.push(job);
+    } else this.added.delete(file);
   }
 
   // A plan that could not read a name or the store runs again after the longest retry delay.
@@ -694,66 +1449,302 @@ export class CompressedBackfill {
   private repairOpening(
     file: string,
     entry: CompressedEntrySeed,
-    stat: { size: number; mtimeMs: number },
-    repairs: CompressedFactEntry[],
+    stat: Job['stat'],
+    machine: CompressedFactEntry | undefined,
   ): void {
-    const held = this.openingEntries.get(file);
-    if (!entry.opening || (held && compressedEntryCurrent(held, stat))) return;
+    const held = this.machineOpening(file, stat) ?? this.openingEntries.get(file);
+    if (
+      entry.adopted ||
+      entry.unreadable ||
+      !entry.opening ||
+      (held?.physicalOpening === true && !held.repairRetry && compressedEntryCurrent(held, stat))
+    )
+      return;
     const opening = compressedOpeningEntry(entry);
     this.openingEntries.set(file, opening);
-    repairs.push(opening);
+    this.plannedOpenings.set(file, { entry: opening, stat, machine });
   }
 
   private placingOpening(
     file: string,
     entry: CompressedEntrySeed | undefined,
-    stat: { size: number; mtimeMs: number },
+    stat: Job['stat'],
+    adoption = this.adoptedPlacement(file, entry, stat),
   ): CodexSessionMeta | null | undefined {
-    if (entry?.opening !== undefined && entry.opening !== null) return entry.opening;
+    const machine = this.machineOpening(file, stat);
+    if (machine) {
+      const checked = this.checkedMachineOpenings.get(file);
+      if (checked && this.sameMachinePlacement(checked.machine, machine)) return checked.opening;
+      if (
+        machine.physicalOpening !== true ||
+        (adoption && machine.hash !== adoption.entry.hash) ||
+        (entry &&
+          (!entry.adopted || machine.hash !== entry.hash) &&
+          compressedEntryCurrent(entry, stat) &&
+          this.machineOpeningConflicts(machine, entry))
+      )
+        return undefined;
+      if (this.placements.get(file)?.resumed && (!machine.opening?.sessionId || !machine.opening.cwd)) return undefined;
+      return machine.opening ?? null;
+    }
+    if (adoption?.opening !== undefined) return adoption.opening;
+    const current = (candidate: CompressedEntrySeed) =>
+      compressedEntryCurrent(candidate, stat) &&
+      (!supportedFileIdentity(stat) ||
+        !!compressedEntryIdentity(candidate) ||
+        (!candidate.adopted && !candidate.threadId));
+    if (!adoption && !this.placements.get(file)?.resumed && entry?.opening && !entry.unreadable && current(entry))
+      return entry.opening;
     const held = this.openingEntries.get(file);
-    return held && compressedEntryCurrent(held, stat) ? (held.opening ?? null) : undefined;
+    return held?.physicalOpening === true &&
+      !held.repairRetry &&
+      current(held) &&
+      (!adoption || held.hash === adoption.entry.hash)
+      ? (held.opening ?? null)
+      : undefined;
   }
 
-  private async appendOpenings(entries: CompressedFactEntry[]): Promise<void> {
-    this.endTurn();
-    const written = await this.options.openings.append(entries);
-    if (written.some((flushed) => !flushed)) await this.options.openings.durable(entries);
+  private machineOpeningMatches(file: string, entry: CompressedEntrySeed, stat: Job['stat']): boolean {
+    const machine = this.machineOpening(file, stat);
+    const local = this.openingEntries.get(file);
+    const held =
+      machine && this.checkedMachineOpenings.get(file)?.machine === machine && local?.physicalOpening === true
+        ? local
+        : (machine ?? local);
+    return (
+      held?.physicalOpening === true &&
+      !held.repairRetry &&
+      compressedEntryCurrent(held, stat) &&
+      held.threadId === entry.threadId &&
+      !this.machineOpeningConflicts(held, entry)
+    );
+  }
+
+  private appendOpenings(
+    entries: CompressedFactEntry[],
+    eligible: (entry: CompressedFactEntry) => boolean | undefined,
+  ): Promise<void> {
+    return this.waitForPersistence(async () => {
+      const written = await this.options.openings.append(entries, eligible);
+      if (written.some((flushed) => !flushed)) await this.options.openings.durable(entries);
+    });
+  }
+
+  private async writePlannedOpenings(): Promise<void> {
+    const planned = new Map(this.plannedOpenings);
+    this.plannedOpenings.clear();
+    const generation = this.generation;
+    const eligible = (entry: CompressedFactEntry) => {
+      const opening = planned.get(entry.file)!;
+      if (
+        this.disposed ||
+        this.scopePending ||
+        generation !== this.generation ||
+        !this.names.has(entry.file) ||
+        this.openingEntries.get(entry.file) !== entry
+      )
+        return false;
+      const stat = this.observeStat(entry.file);
+      if (
+        !this.machineWorkPending &&
+        stat?.isFile &&
+        sameStat(stat, opening.stat) &&
+        !this.exists(entry.file.replace(/\.zst$/, '')) &&
+        this.sameMachinePlacement(opening.machine, this.machineOpening(entry.file, stat))
+      )
+        return true;
+      this.waitingPlacements.add(entry.file);
+      return false;
+    };
+    await this.appendOpenings(
+      [...planned.values()].map(({ entry }) => entry),
+      eligible,
+    ).catch(() => this.replanLater());
   }
 
   private async deriveOpening(job: Job): Promise<void> {
     const started = this.now();
-    const report: { failed?: boolean } = {};
+    const report: { failed?: boolean; stale?: boolean } = {};
     let first: string | null = null;
+    const controller = new AbortController();
+    this.decoding = { file: job.file, controller };
     try {
-      first = await this.readFirst(job.file, COMPRESSED_ENTRY_TITLE_BYTES, report);
+      first = await this.readFirst(job.file, COMPRESSED_ENTRY_TITLE_BYTES, report, job.stat, {
+        signal: controller.signal,
+      });
     } catch {
       report.failed = true;
+    } finally {
+      this.decoding = null;
     }
-    // A failed read is not a rollout without an opening, so it takes the retries and saves no current opening.
+    if (this.machineWorkPending) await this.followMachineOpenings();
+    const current = this.jobRevision(job);
+    if (!current || report.stale) {
+      if (current === undefined || current) this.waitForRevision(job);
+      return;
+    }
+    // A failed read can retry without recording an opening.
+    if (job.adoption && !first) {
+      this.waitForRevision(job);
+      return;
+    }
     if (report.failed) {
       await this.retryLater(job);
       return;
     }
     const opening = openingRecordOf(first);
+    const facts = this.factsOf(job.file, job.stat);
+    if (first === null || (opening && !opening.cwd)) {
+      this.notePlacement(job.file, job.stat, undefined, facts, job.machine);
+      this.openingMisses.set(job.file, job);
+      if (job.repair) this.endRepair(job.repair, true);
+      const retry = this.retries.get(job.file);
+      retry?.cancel?.();
+      this.retries.delete(job.file);
+      this.added.delete(job.file);
+      return;
+    }
+    this.openingMisses.delete(job.file);
     const entry: CompressedFactEntry = {
       file: job.file,
       pairKey: compressedPairKey(job.file),
       ...compressedEntryVersions(),
       size: job.stat.size,
       mtimeMs: job.stat.mtimeMs,
+      ...(supportedFileIdentity(job.stat) ? { fileIdentity: { dev: job.stat.dev!, ino: job.stat.ino! } } : {}),
       threadId: sessionKeyOf(job.file, opening),
       opening,
+      physicalOpening: true,
+      hash: job.machine ? undefined : job.adoption?.entry.hash,
     };
-    this.openingEntries.set(job.file, entry);
-    await this.appendOpenings([entry]);
+    job.verifiedOpening = entry;
+    this.notePlacement(job.file, job.stat, opening, facts, job.machine, undefined, true);
+    if (job.machine) this.checkedMachineOpenings.set(job.file, { machine: job.machine, opening });
+    if (job.machine?.physicalOpening !== true || this.machineOpeningConflicts(job.machine, entry)) {
+      this.openingEntries.set(job.file, entry);
+      await this.appendOpenings([entry], () => this.writeRevision(job));
+    }
+    await this.finishOpening(job, opening, started);
+  }
+
+  private async finishOpening(job: Job, opening: CodexSessionMeta | null, started: number): Promise<void> {
+    if (this.machineWorkPending) await this.followMachineOpenings();
+    const afterWrite = this.jobRevision(job);
+    if (!afterWrite) {
+      if (afterWrite === undefined) this.waitForRevision(job);
+      return;
+    }
+    if (job.adoption) job.adoption.opening = opening;
     this.unpostedMs += this.now() - started;
     if (!codexRowAdmitted(opening, job.stat, this.inFolders)) {
+      if (job.repair) this.endRepair(job.repair, true);
       this.added.delete(job.file);
       return;
     }
-    const body: Job = { ...job, kind: 'body' };
-    if (job.added) this.queue.unshift(body);
+    const body: Job = { ...job, kind: 'body', opening: opening! };
+    if (job.repair && !this.repairOpeningMatches(job.repair, opening)) {
+      this.endRepair(job.repair, true);
+      delete body.repair;
+    }
+    if (body.repair) this.requeue(body);
+    else if (job.priority) this.queue.unshift(body);
     else this.insertBody(body);
+  }
+
+  // Placement is independent of the workspace entry's title and spend.
+  private notePlacement(
+    file: string,
+    stat: Job['stat'],
+    meta: CodexSessionMeta | null | undefined,
+    facts?: CompressedEntrySeed,
+    machine?: CompressedFactEntry,
+    hash?: string,
+    readPhysicalOpening = false,
+  ): void {
+    const held = this.placements.get(file);
+    const opening =
+      meta?.sessionId && meta.cwd
+        ? { sessionId: meta.sessionId, cwd: meta.cwd, hidden: isHiddenThread(meta) }
+        : undefined;
+    const scoped = opening && this.inFolders(opening.cwd);
+    if (
+      !held &&
+      !(scoped && opening.hidden) &&
+      !(facts && this.machineOpeningConflicts(machine, facts)) &&
+      !(facts?.opening?.cwd && opening && !scoped)
+    )
+      return;
+    if (!supportedFileIdentity(stat)) return;
+    const { size, mtimeMs, dev, ino } = stat;
+    const placement: CompressedPlacement = { file, revision: { size, mtimeMs, dev: dev!, ino: ino! }, opening };
+    const observed = held?.observed;
+    if (
+      !hash &&
+      opening &&
+      observed?.placement.hash &&
+      this.sameMachinePlacement(observed.machine, machine) &&
+      sameCompressedPlacement({ ...observed.placement, hash: undefined }, placement)
+    )
+      hash = observed.placement.hash;
+    const physical = machine?.physicalOpening && machine.opening;
+    if (
+      !hash &&
+      opening &&
+      physical &&
+      opening.sessionId === physical.sessionId &&
+      opening.cwd === physical.cwd &&
+      opening.hidden === isHiddenThread(physical)
+    )
+      hash = machine?.hash;
+    if (hash) placement.hash = hash;
+    const state = held ?? {};
+    this.placements.set(file, state);
+    const posted = state.posted;
+    const previousOpening = posted?.opening;
+    const changedOpening =
+      readPhysicalOpening &&
+      opening &&
+      previousOpening &&
+      (opening.sessionId !== previousOpening.sessionId ||
+        opening.cwd !== previousOpening.cwd ||
+        opening.hidden !== previousOpening.hidden);
+    const changedHash = posted?.hash && machine?.physicalOpening && machine.hash && machine.hash !== posted.hash;
+    const retained = state.resumed || !!(posted?.hash && previousOpening);
+    if (retained && (changedOpening || changedHash)) {
+      state.resumed = true;
+      state.disputed = placement.revision;
+    }
+    const visibleWithoutHash = scoped && !opening.hidden && !hash;
+    const withdraw = retained && sameStat(stat, state.disputed ?? null) && (!opening || visibleWithoutHash);
+    if (withdraw) placement.opening = undefined;
+    state.observed = {
+      placement: observed && sameCompressedPlacement(observed.placement, placement) ? observed.placement : placement,
+      machine,
+    };
+    if (
+      !withdraw &&
+      ((retained && !opening && sameStat(stat, posted?.revision ?? null)) || (state.resumed && visibleWithoutHash))
+    ) {
+      state.pending = false;
+      return;
+    }
+    if (state.posted && sameCompressedPlacement(state.posted, placement)) {
+      state.pending = false;
+      if (placement.hash || placement.opening?.hidden) {
+        state.resumed = false;
+        state.disputed = undefined;
+      }
+      if (!this.outbox.has(file)) this.flushParked.delete(file);
+    } else if (!state.pending || !observed || !sameCompressedPlacement(observed.placement, placement)) {
+      state.pending = true;
+      this.flushReady.add(file);
+    }
+    this.armFlush();
+  }
+
+  private canReuseResumedFacts(file: string, facts: CompressedEntrySeed | undefined): boolean {
+    const state = this.placements.get(file);
+    return !state?.resumed || (!!facts?.hash && state.observed?.placement.hash === facts.hash);
   }
 
   // A body of a name that its opening placed joins the queue newest first, after the remaining openings.
@@ -780,19 +1771,38 @@ export class CompressedBackfill {
         if (slice.bytes >= BACKFILL_SLICE_BYTES || this.now() - slice.started >= BACKFILL_SLICE_MS)
           await this.sliceEnd(slice);
       },
-      { signal: decoding.controller.signal },
+      { signal: decoding.controller.signal, expected: job.stat },
     ).finally(() => {
       this.decoding = null;
     });
     this.unpostedMs += this.now() - slice.started;
-    if (this.disposed || !this.names.has(job.file)) return;
+    if (this.machineWorkPending) await this.followMachineOpenings();
+    const current = this.jobRevision(job);
+    if (current === false) return;
     if (read.kind === 'decoded' && read.complete) {
-      await this.publish(compressedFactsFromDerivation(job.file, read, derivation));
+      const entry = compressedFactsFromDerivation(job.file, read, derivation);
+      if ((job.repair || entry.opening) && !codexRowAdmitted(entry.opening ?? null, job.stat, this.inFolders)) {
+        this.notePlacement(
+          job.file,
+          job.stat,
+          entry.opening,
+          this.factsOf(job.file, job.stat),
+          job.machine,
+          entry.hash,
+        );
+        if (job.repair) this.endRepair(job.repair, true);
+        return;
+      }
+      if (job.repair && !this.repairOpeningMatches(job.repair, entry.opening)) {
+        this.endRepair(job.repair, true);
+        job = { ...job, repair: undefined };
+      }
+      if (!(await this.publish(entry, job)) && job.repair && this.jobCurrent(job)) await this.retryLater(job);
       return;
     }
     // The stream changed during the read, so the next plan reads it again from the new revision.
-    if (read.kind === 'stale') {
-      this.dirty = true;
+    if (read.kind === 'stale' || current === undefined) {
+      this.waitForRevision(job);
       return;
     }
     if (read.kind !== 'cancelled') await this.retryLater(job);
@@ -800,39 +1810,74 @@ export class CompressedBackfill {
 
   // A zstd error, a cut twin, a file that does not open or a missing decoder runs again after each delay. A rollout that
   // left the disk ends at the next plan, which finds no file. After the last delay the entry saves `unreadable`, and
-  // another launch tries it once, because the stored mark holds the end of the count across launches. A new size or
-  // modification time restarts it.
+  // another launch tries it once, because the stored mark holds the end of the count across launches.
+  // A new revision restarts the count.
   private async retryLater(job: Job): Promise<void> {
+    const current = this.jobRevision(job);
+    if (!current) {
+      if (current === undefined) this.waitForRevision(job);
+      return;
+    }
     const held = this.retries.get(job.file);
-    const same = held && held.size === job.stat.size && held.mtimeMs === job.stat.mtimeMs;
-    const stored = this.factsOf(job.file);
-    const saved = stored?.unreadable && stored.size === job.stat.size && stored.mtimeMs === job.stat.mtimeMs;
+    const same = held && sameStat(held.stat, job.stat);
+    const stored = this.factsOf(job.file, job.stat);
+    const saved = stored?.unreadable && compressedEntryCurrent(stored, job.stat);
     const attempts = same ? held.attempts : 0;
     if (saved || attempts >= BACKFILL_RETRY_DELAYS_MS.length) {
       const ended = {
-        size: job.stat.size,
-        mtimeMs: job.stat.mtimeMs,
+        stat: job.stat,
         attempts: BACKFILL_RETRY_DELAYS_MS.length,
         at: Infinity,
+        job,
       };
       this.retries.set(job.file, ended);
       // A mark that did not reach the disk waits for the last retry delay before a later plan reads the name again.
       if (!(await this.publishUnreadable(job)))
-        this.retryAfter(ended, BACKFILL_RETRY_DELAYS_MS[BACKFILL_RETRY_DELAYS_MS.length - 1]);
+        this.retryAfter(job, ended, BACKFILL_RETRY_DELAYS_MS[BACKFILL_RETRY_DELAYS_MS.length - 1]);
       return;
     }
     const delay = BACKFILL_RETRY_DELAYS_MS[attempts];
-    const retry = { size: job.stat.size, mtimeMs: job.stat.mtimeMs, attempts: attempts + 1, at: 0 };
+    const retry = { stat: job.stat, attempts: attempts + 1, at: 0, job };
     this.retries.set(job.file, retry);
-    this.retryAfter(retry, delay);
+    if (job.repair) {
+      const opening = job.opening;
+      const held = this.openingEntries.get(job.file);
+      const hash = job.adoption?.entry.hash ?? (held?.opening === opening ? held?.hash : undefined);
+      const { dev, ino, size, mtimeMs } = job.stat;
+      const checkpoint: CompressedFactEntry = {
+        file: job.file,
+        pairKey: compressedPairKey(job.file),
+        ...compressedEntryVersions(),
+        size,
+        mtimeMs,
+        ...(dev !== undefined && ino !== undefined ? { fileIdentity: { dev, ino } } : {}),
+        threadId: sessionKeyOf(job.file, opening) ?? job.repair.sessionId,
+        ...(opening && { opening, physicalOpening: true, hash }),
+        repairRetry: {
+          launch: this.options.launch,
+          source: job.repair,
+          attempts: retry.attempts,
+          at: this.wallNow() + delay,
+        },
+      };
+      this.openingEntries.set(job.file, checkpoint);
+      await this.appendOpenings([checkpoint], () => this.writeRevision(job)).catch(() => undefined);
+    }
+    this.retryAfter(job, retry, delay);
   }
 
-  private retryAfter(retry: { at: number }, delay: number): void {
+  private retryAfter(job: Job, retry: { at: number; job?: Job; cancel?: () => void }, delay: number): void {
+    if (this.disposed || this.retries.get(job.file) !== retry) return;
+    retry.cancel?.();
     retry.at = this.now() + delay;
     // The timer can fire before `at` by the loop's cached time, so the firing itself marks the retry due.
-    this.schedule(delay, () => {
+    retry.cancel = this.schedule(delay, () => {
+      if (this.retries.get(job.file) !== retry) return;
+      retry.cancel = undefined;
       retry.at = -Infinity;
-      this.dirty = true;
+      const current = this.jobRevision(job);
+      if (current) this.requeue(retry.job ?? job);
+      else if (current === false) this.retries.delete(job.file);
       void this.run();
     });
   }
@@ -841,92 +1886,302 @@ export class CompressedBackfill {
   // neither lowers a shown total nor blanks a row. A store that does not answer publishes nothing, the entry stays and a
   // later plan runs. The result is true when the mark reached the disk.
   private async publishUnreadable(job: Job): Promise<boolean> {
-    const previous = this.factsOf(job.file);
-    const hasFacts = !!previous && !previous.nameOnly && !previous.adoptionFailed;
-    const stored = hasFacts ? await this.storedEntry(job.file) : undefined;
-    if (hasFacts && !stored) return false;
-    return this.publish({
-      ...(stored ? withoutOutdatedTitle(stored) : { complete: false, nameOnly: true }),
-      decodedLength: undefined,
+    const previous = this.factsOf(job.file, job.stat);
+    const opening = this.placingOpening(job.file, previous, job.stat);
+    const { size, mtimeMs, dev, ino } = job.stat;
+    const failed: CompressedFactEntry = {
       file: job.file,
       pairKey: previous?.pairKey || compressedPairKey(job.file),
       ...compressedEntryVersions(),
-      size: job.stat.size,
-      mtimeMs: job.stat.mtimeMs,
+      size,
+      mtimeMs,
+      ...(supportedFileIdentity(job.stat) ? { fileIdentity: { dev: dev!, ino: ino! } } : {}),
+      threadId: opening?.sessionId ?? job.repair?.sessionId,
+      opening,
       unreadable: true,
       unreadableLaunch: this.options.launch,
-    });
+    };
+    if (this.options.facts.appendCarryingFacts)
+      return this.publish({ ...failed, complete: false, nameOnly: true }, job);
+    const hasFacts = previous && !previous.nameOnly && !previous.adoptionFailed && !previous.spendNeedsRepair;
+    const stored = hasFacts ? await this.storedEntry(previous) : undefined;
+    if (hasFacts && !stored) return false;
+    if (!stored || stored.spendNeedsRepair || !compressedFactsSameOwner(stored, failed))
+      return this.publish({ ...failed, complete: false, nameOnly: true }, job, previous);
+    const sameRevision = compressedEntryCurrent(stored, job.stat);
+    return this.publish(
+      {
+        ...withoutOutdatedTitle(stored),
+        ...failed,
+        hash: sameRevision ? stored.hash : undefined,
+        spendOrigin: stored.spend
+          ? {
+              ...(stored.spendOrigin ?? compressedSpendOrigin(stored.threadId, stored.spend, stored.hash)),
+              retained: true,
+            }
+          : undefined,
+        decodedLength: undefined,
+      },
+      job,
+      previous,
+    );
   }
 
-  // The worker holds no title or spend, so the whole entry comes from the store.
-  private async storedEntry(file: string): Promise<CompressedFactEntry | undefined> {
-    return (await this.readFacts())?.get(file);
+  private readContributor(seed: CompressedEntrySeed): CompressedFactEntry | undefined {
+    const { file, storeRecord } = seed;
+    if (storeRecord) return readCompressedRecord(this.options.facts.directory, file, storeRecord);
+    const entry = this.options.readKnown?.(file);
+    return entry && compressedEntrySame(entry, seed) ? entry : undefined;
+  }
+
+  private async storedEntry(seed: CompressedEntrySeed): Promise<CompressedFactEntry | undefined> {
+    const entry = this.readContributor(seed);
+    if (entry || seed.storeRecord || this.options.readKnown) return entry;
+    return (await this.readFacts())?.get(seed.file);
   }
 
   // The entries of the facts store, or null when a store file gave no answer, because a compaction can retire a file during the read.
   private async readFacts(): Promise<ReadonlyMap<string, CompressedFactEntry> | null> {
     this.endTurn();
     let failed = false;
-    const read = await this.readStore(this.options.facts.directory, this.statOf, this.yieldStep, () => {
-      failed = true;
-    });
+    const read = await this.waitForPersistence(() =>
+      this.readStore(this.options.facts.directory, this.statOf, this.yieldStep, () => {
+        failed = true;
+      }),
+    );
     return failed ? null : read.entries;
   }
 
   // Each derivation is on disk before the next one starts. The result is true when the entry reached the disk.
-  private async publish(next: CompressedFactEntry): Promise<boolean> {
+  private async publish(next: CompressedFactEntry, job: Job, unreadableDonor?: CompressedEntrySeed): Promise<boolean> {
     this.endTurn();
-    let previous: CompressedFactEntry | undefined = this.results.get(next.file) ?? this.options.known().get(next.file);
-    // Only a marked derivation needs the stored spend record, so the worker holds no spend for the other entries.
-    if (next.undercount && !next.unreadable && !previous?.spend) {
-      const stored = await this.readFacts();
-      // A store that gave no answer can hold the higher total, so this derivation publishes nothing and a later plan runs it.
-      if (!stored) {
-        this.replanLater();
-        return false;
-      }
-      previous = stored.get(next.file) ?? previous;
+    if (this.machineWorkPending) await this.followMachineOpenings();
+    const facts = this.options.facts;
+    if (facts.appendCarryingFacts) {
+      const entry = await this.waitForPersistence(() =>
+        facts.appendCarryingFacts!(next, () => this.writeRevision(job), this.options.follower),
+      );
+      if (!entry) return false;
+      const current = this.jobRevision(job);
+      if (current === false) return false;
+      await this.publishedEntry(entry, job);
+      return true;
     }
-    const entry = boundedCompressedEntry(withKeptUndercount(previous, next));
-    const [written] = await this.options.facts.append([entry]);
-    // An entry that did not reach the disk plans its name again.
-    if (!written && !(await this.options.facts.durable([entry]))) {
-      this.dirty = true;
+    const { stat } = job;
+    if (!this.jobCurrent(job)) {
+      if (!job.repair) this.dirty = true;
       return false;
     }
-    this.results.set(entry.file, compressedEntrySeed(entry));
-    this.outbox.set(entry.file, entry);
-    // A held opening of this revision needs no second write.
-    const held = this.openingEntries.get(entry.file);
-    const openingWritten =
-      held?.opening && compressedEntryCurrent(held, { size: entry.size!, mtimeMs: entry.mtimeMs! });
-    if (entry.opening && !openingWritten) {
-      const opening = compressedOpeningEntry(entry);
-      this.openingEntries.set(entry.file, opening);
-      await this.appendOpenings([opening]);
+    const marked = next.undercount && !next.unreadable;
+    const resolveDonor = marked || next.unreadable;
+    const donor = next.unreadable ? unreadableDonor : marked ? this.factsOf(next.file, stat) : undefined;
+    let previous: CompressedFactEntry | undefined;
+    if (
+      marked &&
+      donor &&
+      !donor.spendNeedsRepair &&
+      !donor.nameOnly &&
+      !donor.adoptionFailed &&
+      (compressedFactsSameOwner(donor, next) || (!donor.storeRecord && !this.options.readKnown))
+    ) {
+      previous = await this.storedEntry(donor);
+      if (!previous && (donor.hasSpend || !donor.storeRecord || donor.spendOrigin)) {
+        if (!job.repair) this.replanLater();
+        return false;
+      }
     }
-    this.armFlush();
+    const revisionHolds = () => {
+      if (this.writeRevision(job) !== true) return false;
+      if (!resolveDonor) return true;
+      const current = this.factsOf(next.file, stat);
+      return current === donor || (!!current && !!donor && compressedEntrySame(current, donor));
+    };
+    const entry = boundedCompressedEntry(withKeptUndercount(previous, next));
+    const durable = await this.waitForPersistence(async () => {
+      const [written] = await facts.append([entry], revisionHolds);
+      return written || (await facts.durable([entry]));
+    });
+    // An entry that did not reach the disk plans its name again.
+    if (!durable) {
+      if (!job.repair) this.dirty = true;
+      return false;
+    }
+    if (!revisionHolds()) {
+      if (!job.repair) this.dirty = true;
+      return false;
+    }
+    const record = this.options.facts.recordOf?.(entry);
+    await this.publishedEntry(record ? { ...entry, storeRecord: record } : entry, job);
     return true;
   }
 
+  private async publishedEntry(entry: CompressedFactEntry, job: Job): Promise<void> {
+    this.results.set(entry.file, compressedEntrySeed(entry));
+    if (!entry.unreadable && !job.repair) {
+      this.retries.get(entry.file)?.cancel?.();
+      this.retries.delete(entry.file);
+    }
+    this.outbox.set(entry.file, { entry, job });
+    this.flushReady.add(entry.file);
+    if (!entry.unreadable) this.notePlacement(entry.file, job.stat, entry.opening, undefined, job.machine, entry.hash);
+    this.armFlush();
+    // A held opening of this revision needs no second write.
+    if (!entry.unreadable && entry.opening && !this.machineOpeningMatches(entry.file, entry, job.stat)) {
+      const opening = compressedOpeningEntry(entry);
+      this.openingEntries.set(entry.file, opening);
+      await this.appendOpenings([opening], () => this.writeRevision(job));
+    }
+  }
+
   private armFlush(): void {
-    if (this.cancelFlush || !this.outbox.size || this.disposed) return;
-    this.cancelFlush = this.schedule(Math.max(0, this.lastFlush + BATCH_INTERVAL_MS - this.now()), () => {
+    if (this.cancelFlush || this.flushDue || !this.owesBatch() || this.disposed || this.scopePending) return;
+    this.cancelFlush = this.schedule(Math.max(0, Math.ceil(this.lastFlush + BATCH_INTERVAL_MS - this.now())), () => {
       this.cancelFlush = null;
-      this.flush();
+      this.flushDue = true;
+      void this.run();
     });
   }
 
-  // At most one batch per second, of 4 MiB or one larger record.
+  private nextParkedFlush(): string | undefined {
+    const first = this.flushParked.entries().next().value;
+    return first && first[1] < this.follow ? first[0] : undefined;
+  }
+
+  private parkFlush(file: string): void {
+    this.flushReady.delete(file);
+    this.flushParked.delete(file);
+    this.flushParked.set(file, this.follow);
+  }
+
+  private owesBatch(): boolean {
+    return !!(this.flushReady.size || this.nextParkedFlush() || this.retiredRepairs.size);
+  }
+
+  private async deliverDueBatches(): Promise<void> {
+    while (this.flushDue && this.owesBatch()) {
+      if (
+        this.disposed ||
+        this.scopePending ||
+        this.machineWorkPending ||
+        this.dirty ||
+        this.events.size ||
+        this.staleOpens.size
+      )
+        return;
+      await this.waitIdle();
+      if (
+        this.disposed ||
+        this.scopePending ||
+        this.machineWorkPending ||
+        this.dirty ||
+        this.events.size ||
+        this.staleOpens.size
+      )
+        return;
+      this.flush();
+      if (this.flushDue && this.owesBatch()) await this.yieldStep();
+    }
+    if (!this.owesBatch()) this.flushDue = false;
+  }
+
+  // One slice checks at most two paths per file. A refused path or an owed notice with a plain twin waits for a follow.
   private flush(): void {
-    if (!this.outbox.size || this.disposed) return;
-    if (this.cancelFlush || this.now() < this.lastFlush + BATCH_INTERVAL_MS) return this.armFlush();
-    const [batch] = compressedEntryBatches([...this.outbox.values()], COMPRESSED_BATCH_BYTES);
-    for (const entry of batch) this.outbox.delete(entry.file);
+    const ready = this.flushReady.values();
+    const later: string[] = [];
+    const placements: CompressedPlacement[] = [];
+    const entries: { entry: CompressedFactEntry; stat: Job['stat'] }[] = [];
+    const retiredRepairs: CompressedRepair[] = [];
+    const started = this.now();
+    let bytes = 0;
+    const fits = (record: CompressedPlacement | CompressedFactEntry | CompressedRepair) => {
+      const length = Buffer.byteLength(JSON.stringify(record));
+      if (bytes && length + bytes > COMPRESSED_BATCH_BYTES) return false;
+      bytes += length;
+      return true;
+    };
+    for (let count = 0; count < BATCH_FILE_LIMIT && (!count || this.now() - started < PLAN_SLICE_MS); count++) {
+      const file = ready.next().value ?? this.nextParkedFlush();
+      if (file === undefined || bytes >= COMPRESSED_BATCH_BYTES) break;
+      this.flushReady.delete(file);
+      const parked = this.flushParked.delete(file);
+      const state = this.placements.get(file);
+      const placement = state?.pending ? state.observed?.placement : undefined;
+      const held = this.outbox.get(file);
+      const unplaced = state && !state.observed;
+      if (!placement && !held && !(parked || unplaced)) continue;
+      const stat = this.observeStat(file);
+      const plainFile = file.slice(0, -'.zst'.length);
+      const plain = stat?.isFile ? (this.options.exists ? this.exists(plainFile) : this.observeStat(plainFile)) : null;
+      if (stat === undefined || plain === undefined || (plain && (placement || unplaced))) {
+        this.parkFlush(file);
+        continue;
+      }
+      if (unplaced) {
+        if (stat?.isFile && stat.size > 0) this.events.add(file);
+        else this.placements.delete(file);
+      }
+      if (state && placement) {
+        if (
+          !stat?.isFile ||
+          !sameStat(stat, placement.revision) ||
+          !this.sameMachinePlacement(state.observed?.machine, this.machineOpening(file, stat))
+        ) {
+          state.pending = false;
+          state.observed = undefined;
+          if (stat?.isFile && stat.size > 0) this.events.add(file);
+          else this.placements.delete(file);
+          if (held) later.push(file);
+          continue;
+        }
+        if (!fits(placement)) {
+          later.push(file);
+          break;
+        }
+        placements.push(placement);
+      }
+      if (!held) continue;
+      const current = this.jobRevision(held.job, { stat, plain: !!plain });
+      if (current === undefined) {
+        this.parkFlush(file);
+        continue;
+      }
+      if (current && !fits(held.entry)) {
+        later.push(file);
+        break;
+      }
+      this.outbox.delete(file);
+      if (current) entries.push({ entry: held.entry, stat: held.job.stat });
+    }
+    for (const file of later) this.flushReady.add(file);
+    for (const repair of this.retiredRepairs.values()) {
+      if (retiredRepairs.length >= COMPRESSED_REPAIR_LIMIT || !fits(repair)) break;
+      retiredRepairs.push(repair);
+      this.retiredRepairs.delete(repair.file);
+    }
+    if (!entries.length && !placements.length && !retiredRepairs.length) return;
+    this.flushDue = false;
     this.lastFlush = this.now();
     const backfillMs = Math.round(this.unpostedMs);
     this.unpostedMs -= backfillMs;
-    this.options.post({ entries: batch, backfillMs });
+    const generation = this.generation;
+    this.options.post({
+      entries: entries.map(({ entry }) => entry),
+      backfillMs,
+      ...(placements.length ? { placements, repairScope: this.repairScope } : {}),
+      ...(retiredRepairs.length ? { retiredRepairs, repairScope: this.repairScope } : {}),
+    });
+    if (generation !== this.generation || this.disposed) return;
+    for (const { entry, stat } of entries) this.noteSent(entry, true, stat);
+    for (const placement of placements) {
+      const state = this.placements.get(placement.file);
+      if (state?.observed?.placement !== placement) continue;
+      state.posted = placement;
+      state.pending = false;
+      if (placement.hash || placement.opening?.hidden) {
+        state.resumed = false;
+        state.disputed = undefined;
+      }
+    }
     this.armFlush();
   }
 }
