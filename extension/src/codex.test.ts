@@ -18736,6 +18736,7 @@ test('asynchronous Codex enumeration matches the synchronous walk for every trav
     status: 'incomplete',
     root,
     directories: [] as string[],
+    directoryTree: { depth: 4, untraversed: [path.join(root, '2026', '10', '16', 'deep', 'deeper')] },
     files: [] as string[],
     uncertain: [] as string[],
     compressed: [] as string[],

@@ -326,6 +326,7 @@ export type HostToPanel =
   | SelectionMessage
   | {
       type: 'rail';
+      sessions?: PanelSessionRow[];
       rail: PanelRailCard[];
       stats: Record<string, PanelStat[]>;
       labels: LabelRow[];
@@ -913,6 +914,7 @@ export function parseHostToPanel(raw: unknown): HostToPanel | null {
       const stats = record(m.stats);
       const sessionAdoptions = m.sessionAdoptions === undefined ? [] : m.sessionAdoptions;
       return records(m.rail) &&
+        (m.sessions === undefined || records(m.sessions)) &&
         stats !== null &&
         Array.isArray(m.labels) &&
         m.labels.every(labelCount) &&
@@ -925,6 +927,7 @@ export function parseHostToPanel(raw: unknown): HostToPanel | null {
         rowDeltaHeaderValid(m.rows)
         ? {
             type: 'rail',
+            ...(m.sessions === undefined ? {} : { sessions: m.sessions as unknown as PanelSessionRow[] }),
             rail: m.rail as PanelRailCard[],
             stats: stats as Record<string, PanelStat[]>,
             labels: m.labels,

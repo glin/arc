@@ -1,3 +1,4 @@
+import { agyTokenLines } from '../../extension/src/agyhistory.ts';
 import { RAIL_FILTER_QUERY_LIMIT } from '../../extension/src/domain/rail-filters.ts';
 import { listingQueryError, sessionQueryError } from '../../extension/src/domain/session-query.ts';
 import { requestWindow, SESSION_CURSOR } from '../../extension/src/sessionrequests.ts';
@@ -54,7 +55,7 @@ function renderSessions(reply: unknown): string {
           nullableText(row.parent.id) &&
           oneOf(row.parent.relation, ['subagent', 'dispatched', 'reader']))
       ) ||
-      !oneOf(row.provider, ['claude', 'codex']) ||
+      !oneOf(row.provider, ['claude', 'codex', 'agy']) ||
       typeof row.ambiguous !== 'boolean' ||
       !texts(row.truncated) ||
       typeof row.pinned !== 'boolean' ||
@@ -125,7 +126,7 @@ function renderSession(reply: unknown): string {
     reply.version !== 1 ||
     !nullableText(reply.requester) ||
     typeof reply.id !== 'string' ||
-    !oneOf(reply.provider, ['claude', 'codex']) ||
+    !oneOf(reply.provider, ['claude', 'codex', 'agy']) ||
     !oneOf(reply.state, ['current', 'stale', 'unparsed']) ||
     typeof reply.partial !== 'boolean' ||
     typeof reply.readByteLimit !== 'number' ||
@@ -205,6 +206,7 @@ function renderSession(reply: unknown): string {
       ['Ended', turn.endedAt],
     ] as const)
       if (time > 0 && Math.abs(time) <= 8640000000000000) lines.push(`${label}: ${new Date(time).toISOString()}`);
+    if (reply.provider === 'agy') lines.push('Cost unavailable', ...agyTokenLines(turn.agyUsage));
     if (turn.error) lines.push(`Error: ${metadata(turn.error)}`);
     lines.push('Prompt:', turn.prompt, '', 'Response:', turn.summary);
   }
@@ -214,7 +216,11 @@ function renderSession(reply: unknown): string {
   return lines.join('\n');
 }
 
-export async function runSessions(command: 'sessions' | 'session' | 'filter', args: string[]): Promise<string> {
+export async function runSessions(
+  command: 'sessions' | 'session' | 'filter',
+  args: string[],
+  request: typeof requestWindow = requestWindow,
+): Promise<string> {
   let window: string | undefined;
   let sessionId: string | undefined;
   let turns = 5;
@@ -276,7 +282,7 @@ export async function runSessions(command: 'sessions' | 'session' | 'filter', ar
       : command === 'session'
         ? { sessionId, turns }
         : { ...(cursor && { cursor }), ...(limit && { limit }), ...(query !== undefined && { query }) };
-  const reply = await requestWindow(command, params, window);
+  const reply = await request(command, params, window);
   if (jsonSeen || command === 'filter') return JSON.stringify(reply);
   return command === 'sessions' ? renderSessions(reply) : renderSession(reply);
 }

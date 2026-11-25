@@ -273,7 +273,7 @@ The window refuses without an open folder or `ARC_PERF_OUT_DIR`, and refuses a r
 
 Explicit `--projects` and `--codex-sessions` roots override environment values. Claude uses `ARC_PROJECTS_ROOT`, otherwise `projects` under `CLAUDE_CONFIG_DIR` or `~/.claude`. Codex uses `ARC_CODEX_ROOT`, otherwise `sessions` under `CODEX_HOME` or `~/.codex`.
 
-ID discovery checks Claude project directories and Codex rollout filenames. Missing or multiple matches fail. Existing paths take precedence over ID discovery.
+Existing paths take precedence over ID discovery. ID discovery checks Claude project directories and Codex rollout filenames. An ID with no match there can resolve to an Antigravity transcript under the saved transcript root. Multiple native matches or a missing transcript fail.
 
 `--until` must be at or after `--since`. Equal bounds produce an empty main request window. That window applies to `parent`, `children`, and `combined`. Bounded reports retain children with requests, recorded failures, or intersecting coverage defects.
 
@@ -337,6 +337,8 @@ Tokens are observed subtotals. A normalized zero does not prove the source recor
 Model quantities reconcile with source billing before rounding. Full costs require complete or recorded-reconciled coverage and supported prices. Public dollar values round to four decimals after addition. Summed rounded model amounts can differ from rounded source amounts.
 
 ### Supplementary results
+
+Antigravity cost summaries include recorded token counts and model detail. Antigravity refuses tool breakdowns, text filters, and Agent windows in both text and JSON output.
 
 `--by-tool` splits each parent request's price evenly across the tool results it reads. A Claude request reads the results recorded before it. A Codex request reads the outputs recorded before its billing record, which is the first `token_usage_record` after each output. A Codex rollout without billing records reports every request as `no tool result`. Codex `wait_agent`, `wait`, and `write_stdin` calls form the `wait` kind.
 
