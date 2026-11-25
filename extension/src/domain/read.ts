@@ -77,7 +77,7 @@ export function newBySession(
 }
 
 export interface AgentReadRecord {
-  provider: 'claude' | 'codex';
+  provider: 'claude' | 'codex' | 'agy';
   sessionId: string;
   source: string;
   scope: string;
@@ -109,7 +109,7 @@ export function validAgentReadRecord(value: unknown): value is AgentReadRecord {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const r = value as AgentReadRecord;
   return (
-    (r.provider === 'claude' || r.provider === 'codex') &&
+    (r.provider === 'claude' || r.provider === 'codex' || r.provider === 'agy') &&
     ['sessionId', 'source', 'scope', 'sourceRevision', 'promptId'].every((key) => {
       const text = r[key as 'sessionId'];
       return typeof text === 'string' && text.length > 0 && text.length <= 4096;

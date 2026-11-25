@@ -1,4 +1,6 @@
 import { isInside, normalizeFsPath, supportedFileIdentity, sameSessionRevision, type SessionFile } from './transcript';
+import { isAgySessionId } from './agydiscovery';
+import { isCompressedRolloutName } from './compressedrollouts';
 import { sessionSourceKey, sessionCatalogMembership, type SessionPageSource } from './sessionreads';
 
 export type SessionCoverageDomain =
@@ -20,6 +22,8 @@ export interface SourceEnumeration {
   missingRoot?: boolean;
   root?: string;
   directories?: readonly string[];
+  // The Codex walk lists every directory in range. Links and directories beyond its limit are opaque.
+  directoryTree?: { depth: number; untraversed: readonly string[] };
   // The compressed Codex rollouts the walk saw. They are not in `files`, and the walk read no stat for them.
   compressed?: readonly string[];
 }
@@ -31,6 +35,7 @@ export interface SessionCoverage extends SourceEnumeration {
   members?: ReadonlySet<string>;
   paths?: ReadonlySet<string>;
   directoryPaths?: ReadonlySet<string>;
+  untraversedPaths?: ReadonlySet<string>;
 }
 
 export interface SessionCoverageContext {
@@ -52,6 +57,150 @@ export interface SessionCollisionObservation {
   hidden?: boolean;
 }
 
+export function sessionCoverageFileKey(agent: SessionFile['agent'], file: string): string {
+  return agent + '\0' + normalizeFsPath(file);
+}
+
+function qualifiedSessionObservations(
+  files: ReadonlyMap<string, SessionFile>,
+  context: SessionCoverageContext & { domain: 'physical' },
+  enumeration: { claude: SessionCoverage; codex: SessionCoverage },
+  observations: readonly SessionCollisionObservation[],
+  includeCompressed = false,
+): Map<string, SessionCollisionObservation> {
+  const qualified = new Map<string, SessionCollisionObservation>();
+  for (const observation of observations) {
+    const source = observation.source;
+    if (
+      observation.scope !== context.scope ||
+      observation.revision !== context.revision ||
+      (source.agent !== 'claude' && source.agent !== 'codex') ||
+      !supportedFileIdentity(source) ||
+      !Number.isSafeInteger(source.size) ||
+      source.size < 0 ||
+      !Number.isFinite(source.mtimeMs) ||
+      source.mtimeMs < 0 ||
+      sessionPresence(enumeration[source.agent], context, { file: source.file }) !== 'present'
+    )
+      continue;
+    const key = sessionCoverageFileKey(source.agent, source.file);
+    if (includeCompressed && source.agent === 'codex' && isCompressedRolloutName(source.file)) {
+      qualified.set(key, observation);
+      continue;
+    }
+    const listed = files.get(key);
+    const hidden = observation.hidden === true && source.agent === 'codex';
+    if (observation.hidden && (!hidden || listed)) continue;
+    if (
+      !observation.excluded &&
+      !hidden &&
+      (!listed ||
+        !sameSessionRevision(source, listed) ||
+        sessionCoverageMember(source) !== sessionCoverageMember(listed))
+    )
+      continue;
+    qualified.set(key, observation);
+  }
+  return qualified;
+}
+
+export function indexedPhysical(
+  enumeration: SourceEnumeration,
+  context: SessionCoverageContext & { domain: 'physical' },
+  files = enumeration.files,
+): SessionCoverage {
+  return {
+    ...enumeration,
+    ...context,
+    files,
+    paths: new Set(files.map(normalizeFsPath)),
+    directoryPaths: enumeration.directories
+      ? new Set(enumeration.directories.map((directory) => normalizeFsPath(directory).replace(/\/$/, '')))
+      : undefined,
+    untraversedPaths: enumeration.directoryTree
+      ? new Set(enumeration.directoryTree.untraversed.map(normalizeFsPath))
+      : undefined,
+  };
+}
+
+export function nativeReservationTwin(source: SessionFile): string | undefined {
+  if (source.agent !== 'codex') return undefined;
+  if (isCompressedRolloutName(source.file)) return source.file.slice(0, -'.zst'.length);
+  const twin = source.file + '.zst';
+  return isCompressedRolloutName(twin) ? twin : undefined;
+}
+
+// A qualified opening can resolve an earlier reservation even when its ID cannot reserve.
+export function retainNativeSessionReservations(
+  current: readonly SessionFile[],
+  previous: readonly SessionFile[] | undefined,
+  context: SessionCoverageContext & { domain: 'physical' },
+  enumeration: { claude: SourceEnumeration; codex: SourceEnumeration },
+  observations: readonly SessionCollisionObservation[],
+  inRoots: (cwd: string) => boolean,
+  compressed?: { coverage?: SessionCoverage; plainPresent: (file: string) => boolean },
+): SessionFile[] {
+  const files = new Map(
+    current
+      .filter((source) => !isCompressedRolloutName(source.file))
+      .map((source) => [sessionCoverageFileKey(source.agent, source.file), source]),
+  );
+  if (
+    !observations.some(({ excluded, hidden, source }) => excluded || hidden || isCompressedRolloutName(source.file)) &&
+    (!previous ||
+      previous.every(
+        (source) =>
+          files.get(sessionCoverageFileKey(source.agent, source.file))?.sessionId.toLowerCase() ===
+          source.sessionId.toLowerCase(),
+      ))
+  )
+    return [...files.values()].filter((source) => isAgySessionId(source.sessionId));
+
+  const physical = {
+    claude: indexedPhysical(enumeration.claude, context),
+    codex:
+      compressed?.coverage ??
+      indexedPhysical(enumeration.codex, context, [
+        ...enumeration.codex.files,
+        ...(enumeration.codex.compressed ?? []),
+      ]),
+  };
+  const qualified = qualifiedSessionObservations(files, context, physical, observations, true);
+  const plainPresence = (source: SessionFile): SessionPresence | undefined => {
+    if (!isCompressedRolloutName(source.file)) return undefined;
+    if (compressed?.plainPresent(source.file)) return 'present';
+    return sessionPresence(physical.codex, context, { file: nativeReservationTwin(source) });
+  };
+  for (const [key, { source, excluded }] of qualified) {
+    const plain = plainPresence(source);
+    if (!excluded && plain === 'unknown') {
+      qualified.delete(key);
+      continue;
+    }
+    if (excluded || plain === 'present') files.delete(key);
+    else files.set(key, source);
+  }
+  const reservations = [...files.values()].filter((source) => isAgySessionId(source.sessionId));
+  for (const source of previous ?? []) {
+    if (source.agent === 'agy' || (source.cwd && !inRoots(source.cwd))) continue;
+    const key = sessionCoverageFileKey(source.agent, source.file);
+    if (files.get(key)?.sessionId.toLowerCase() === source.sessionId.toLowerCase() || qualified.has(key)) continue;
+    const coverage = physical[source.agent];
+    if (plainPresence(source) === 'present') continue;
+    if (sessionPresence(coverage, context, { file: source.file }) === 'absent') {
+      const twin = nativeReservationTwin(source);
+      if (
+        !twin ||
+        qualified.has(sessionCoverageFileKey('codex', twin)) ||
+        sessionPresence(coverage, context, { file: twin }) === 'absent'
+      )
+        continue;
+    }
+    reservations.push(source);
+  }
+  return reservations;
+}
+
 // Retain competing sources until current identity, physical absence, or scope exclusion answers each source.
 export function reconcileSessionCollisions(
   current: readonly SessionPageSource[],
@@ -67,39 +216,14 @@ export function reconcileSessionCollisions(
   if (!known.size) return { scope: context.scope, sources: [] };
   const contested = new Set(known);
   const sources = new Map<string, Map<string, SessionFile>>();
-  const files = new Map<string, SessionFile>();
-  const fileKey = (source: SessionFile) => source.agent + '\0' + normalizeFsPath(source.file);
-  for (const entry of current) {
-    files.set(fileKey(entry.session), entry.session);
-  }
-  const qualified = new Map<string, SessionCollisionObservation>();
-  for (const observation of observations) {
-    const source = observation.source;
-    if (
-      observation.scope !== context.scope ||
-      observation.revision !== context.revision ||
-      (source.agent !== 'claude' && source.agent !== 'codex') ||
-      !supportedFileIdentity(source) ||
-      !Number.isSafeInteger(source.size) ||
-      source.size < 0 ||
-      !Number.isFinite(source.mtimeMs) ||
-      source.mtimeMs < 0 ||
-      sessionPresence({ ...enumeration[source.agent], ...context }, context, { file: source.file }) !== 'present'
-    )
-      continue;
-    const listed = files.get(fileKey(source));
-    const hidden = observation.hidden === true && source.agent === 'codex';
-    if (observation.hidden && (!hidden || listed)) continue;
-    if (
-      !observation.excluded &&
-      !hidden &&
-      (!listed ||
-        !sameSessionRevision(source, listed) ||
-        sessionCoverageMember(source) !== sessionCoverageMember(listed))
-    )
-      continue;
-    qualified.set(fileKey(source), observation);
-  }
+  const files = new Map(
+    current.map((entry) => [sessionCoverageFileKey(entry.session.agent, entry.session.file), entry.session]),
+  );
+  const physical = {
+    claude: indexedPhysical(enumeration.claude, context),
+    codex: indexedPhysical(enumeration.codex, context),
+  };
+  const qualified = qualifiedSessionObservations(files, context, physical, observations);
   for (const observation of qualified.values()) {
     if (observation.excluded || !observation.hidden) continue;
     const source = observation.source;
@@ -116,10 +240,10 @@ export function reconcileSessionCollisions(
   }
   if (previous) {
     for (const source of previous.sources) {
-      const observation = qualified.get(fileKey(source));
+      if (source.agent === 'agy') continue;
+      const observation = qualified.get(sessionCoverageFileKey(source.agent, source.file));
       if (observation) continue;
-      const physical = { ...enumeration[source.agent], ...context };
-      if (sessionPresence(physical, context, { file: source.file }) === 'absent') continue;
+      if (sessionPresence(physical[source.agent], context, { file: source.file }) === 'absent') continue;
       const group = sources.get(source.sessionId) ?? new Map<string, SessionFile>();
       group.set(sessionSourceKey(source.agent, source.sessionId, source.file), source);
       sources.set(source.sessionId, group);
@@ -131,12 +255,12 @@ export function reconcileSessionCollisions(
     if (!group?.size) continue;
     const only = group.values().next().value;
     if (group.size === 1 && !contested.has(id)) continue;
-    const observed = only && files.get(fileKey(only));
+    const observed = only && files.get(sessionCoverageFileKey(only.agent, only.file));
     if (
       group.size === 1 &&
       only &&
       observed?.sessionId === id &&
-      qualified.get(fileKey(observed))?.source.sessionId === id &&
+      qualified.get(sessionCoverageFileKey(observed.agent, observed.file))?.source.sessionId === id &&
       sessionCoverageMember(only) === sessionCoverageMember(observed)
     )
       continue;
@@ -180,13 +304,26 @@ export function sessionPresence(
     if (coverage.paths ? coverage.paths.has(file) : coverage.files.some((known) => normalizeFsPath(known) === file))
       return 'present';
     if (coverage.directories) {
-      const directory = file.slice(0, file.lastIndexOf('/'));
-      if (
-        !(coverage.directoryPaths
+      const visited = (directory: string) =>
+        coverage.directoryPaths
           ? coverage.directoryPaths.has(directory)
-          : coverage.directories.some((visited) => normalizeFsPath(visited).replace(/\/$/, '') === directory))
-      )
-        return 'unknown';
+          : coverage.directories!.some((path) => normalizeFsPath(path).replace(/\/$/, '') === directory);
+      let directory = file.slice(0, file.lastIndexOf('/'));
+      if (visited(directory)) return 'absent';
+      if (!coverage.root || !coverage.directoryTree) return 'unknown';
+      const root = normalizeFsPath(coverage.root).replace(/\/$/, '');
+      if (!directory.startsWith(root + '/')) return 'unknown';
+      const depth = directory.slice(root.length + 1).split('/').length;
+      if (depth > coverage.directoryTree.depth) return 'unknown';
+      while (directory !== root) {
+        const opaque = coverage.untraversedPaths
+          ? coverage.untraversedPaths.has(directory)
+          : coverage.directoryTree.untraversed.some((path) => normalizeFsPath(path) === directory);
+        if (opaque) return 'unknown';
+        directory = directory.slice(0, directory.lastIndexOf('/'));
+        if (visited(directory)) return 'absent';
+      }
+      return 'unknown';
     }
     return 'absent';
   }

@@ -60,7 +60,7 @@ An empty `active:` adds no term. Any other value that names no window, including
 
 ### Session identity
 
-`id:<ID>` and `session:<ID>` select native Claude or Codex identities. Qualify with `claude:` or `codex:` before the ID. Provider names ignore case. IDs preserve case. Paths provide no aliases.
+`id:<ID>` and `session:<ID>` select native Claude, Codex, or Antigravity identities. Qualify with `claude:`, `codex:`, or `agy:` before the ID. Provider names ignore case. IDs preserve case. Paths provide no aliases.
 
 Exact IDs win, including short IDs. Canonical 36-character UUIDs match exactly. Otherwise, values of at least eight characters expand across the complete scoped catalog. Shorter values match exactly. Unknown IDs match nothing. Duplicate source files retain rows but count as one provider identity.
 

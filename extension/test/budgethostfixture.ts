@@ -130,6 +130,7 @@ export async function initializeBudgetHost(coverage = false) {
   vi.stubEnv('ARC_HOME', path.join(root, 'arc'));
   vi.stubEnv('ARC_PROJECTS_ROOT', path.join(root, 'projects'));
   vi.stubEnv('ARC_CODEX_ROOT', path.join(root, 'sessions'));
+  vi.stubEnv('ARC_AGY_BRAIN_ROOT', path.join(root, 'agy'));
   const [{ budgetWorkspace, BUDGET_CLOCK }, host, worker, commits, repository, transcript, scheduler] =
     await Promise.all([
       import('../src/budgetworkspace.ts'),
