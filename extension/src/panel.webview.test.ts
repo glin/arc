@@ -1,7 +1,18 @@
+import type { SessionFile, SessionRead } from './transcript';
+import { readAgySession } from './agyhistory';
+import { currentAgyAdmission, isAgySessionId } from './agydiscovery';
 import { linkBrowserKind, parseLinkDestination } from './domain/link-path';
 import { isDeepStrictEqual } from 'node:util';
+import * as zlib from 'node:zlib';
 import { CommandCatalogs, CommandDiscovery, commandScope, commandSources } from './commandcatalog';
-import { isCompressedRollout } from './compressedrollouts.ts';
+import { isCompressedRollout, readCompressedFirstRecord, streamCompressedRollout } from './compressedrollouts.ts';
+import {
+  CompressedBackfill,
+  compressedFactsFromDerivation,
+  RolloutDerivation,
+  type CompressedBackfillBatch,
+} from './compressedbackfill';
+import { observeRolloutStat, openingRecordOf } from './codex';
 import { claudeChildFileFor, commitSourceStamp, recordCommits as recordTranscriptCommits } from './transcript';
 import {
   startingWorktree,
@@ -13,12 +24,27 @@ import { RepositoryCommits } from './gitcommits';
 import { commitCard, diffTitle, landingCard, turnFileContributors } from './turncard';
 import { groupCommitRows } from './view/card-presentation';
 import { candidateGitRunner } from './turnfixtures';
-import { compressedPairKey } from './compressedstore';
+import {
+  COMPRESSED_BATCH_BYTES,
+  STORE_LOCK,
+  compressedEntryVersions,
+  compressedPairKey,
+  compressedOpeningEntry,
+  recordCompressedAdoption,
+  type CompressedFactEntry,
+  CompressedStoreHolder,
+} from './compressedstore';
 import { CommitRepositories } from './commitrepositories';
 import { CLAUDE_CHILD_REFERENCE_PARSER_VERSION } from './derivedcache';
 import { discoveryCompatibility } from './progressiveworker';
 import { sessionPageSources } from './sessionreads';
-import { sessionCoverageMember, reconcileSessionCollisions } from './sessioncoverage';
+import {
+  sessionCoverageFileKey,
+  sessionCoverageMember,
+  reconcileSessionCollisions,
+  retainNativeSessionReservations,
+  nativeReservationTwin,
+} from './sessioncoverage';
 import { runningKey } from './composerview';
 import { HostReadPersistence, preserveHostRead } from './domain/read.ts';
 import { launchPolicy } from './launchpolicy';
@@ -327,18 +353,6 @@ test('response citation presses open external literal files without workspace or
 });
 
 test('heading worktree metadata follows each panel opening source and clears when selection changes', () => {
-  const begin = panelHostSource.indexOf('const startWorktree = startingWorktree(');
-  const end = panelHostSource.indexOf('const hostInput =', begin);
-  assert.ok(begin > 0 && end > begin);
-  const code = ts.transpileModule(
-    `function rows(sessions, hostSession, fullLabels, hostParent, selectedOnly = false, hostPreviousSession = null, selectionScope = null) { ${panelHostSource.slice(begin, end)} return hostRows; }`,
-    { compilerOptions: { target: ts.ScriptTarget.ES2022 } },
-  ).outputText;
-  const project = new Function('startingWorktree', 'PayloadRows', 'host', `${code}; return rows;`)(
-    startingWorktree,
-    PayloadRows,
-    {},
-  );
   const home = '/repo';
   const nested = '/repo/.claude/worktrees/é #L10';
   const sessions = [
@@ -348,31 +362,42 @@ test('heading worktree metadata follows each panel opening source and clears whe
     { sessionId: 'unknown', cwd: '/unknown' },
   ];
   const provider = {
+    hostRowsFor: PanelProvider.prototype['hostRowsFor'],
+    sessionRowOf: PanelProvider.prototype['sessionRowOf'],
     heldHostRows: new WeakMap(),
-    sessionRows: sessions.map((s) => ({ id: s.sessionId, label: s.sessionId })),
+    activityFor: () => 0,
+    agentRunFor: () => false,
+    noteRailInstant() {},
+    sessionLabel: (source: SessionFile) => ({ label: source.sessionId, fullLabel: source.sessionId }),
     folders: () => [home],
     repositoryScope: { checkoutSnapshot: () => [home, nested] },
   };
+  const rows = sessions.map((source) =>
+    provider.sessionRowOf({ ...source, agent: 'codex', file: source.sessionId, size: 1, mtimeMs: 1 }, new Map(), false),
+  );
+  const host = {} as Parameters<typeof provider.hostRowsFor>[0];
+  const project = (selected: string) =>
+    provider.hostRowsFor(host, rows, selected, undefined, true) as {
+      id: string;
+      startWorktree?: ReturnType<typeof startingWorktree>;
+    }[];
   for (const selected of ['child', 'parent', 'missing', 'unknown', 'child']) {
-    const rows = project.call(provider, sessions, selected, new Map(), null);
-    for (const row of rows)
+    const projected = project(selected);
+    for (const row of projected)
       assert.deepEqual(
         row.startWorktree,
         selected === 'child' && row.id === selected ? { name: 'é #L10', path: nested } : undefined,
       );
   }
   provider.repositoryScope.checkoutSnapshot = () => [home];
-  assert.equal(
-    project.call(provider, sessions, 'child', new Map(), null).find((row: { id: string }) => row.id === 'child')
-      .startWorktree,
-    undefined,
-  );
+  assert.equal(project('child').find((row) => row.id === 'child')?.startWorktree, undefined);
 });
 
 test('registered checkout identity changes reach the host metadata refresh callback', async () => {
   vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
   const factory = memberFrom(panelHostSource, panelHostSource.indexOf('private createRepositoryScope('));
-  const compiled = ts.transpileModule(`class Subject { ${factory} }`, {
+  const clear = memberFrom(panelHostSource, panelHostSource.indexOf('private clearCompressedRepairEvidence('));
+  const compiled = ts.transpileModule(`class Subject { ${factory} ${clear} }`, {
     compilerOptions: { target: ts.ScriptTarget.ES2022 },
   }).outputText;
   const Subject = new Function('RepositoryScope', `${compiled}\nreturn Subject;`)(RepositoryScope);
@@ -2699,7 +2724,7 @@ import { formatRelative } from './view/time.ts';
 import { outsideCommentMarks } from './webview/comments.ts';
 import { detailRowsFor } from './webview/card-rows.ts';
 import type { CardView } from './webview/payload-contracts.ts';
-import { parsePanelToHost } from './webview/protocol.ts';
+import { parseHostToPanel, parsePanelToHost } from './webview/protocol.ts';
 import {
   normalizePinnedSetups,
   normalizeSetupValues,
@@ -2802,7 +2827,7 @@ import type { WindowState } from './sessionrequests.ts';
 import { CommitRepositoryReservations } from './progressiveworker';
 import * as vscode from 'vscode';
 import { performance } from 'node:perf_hooks';
-import { replaceRows, replaceStats } from './webview/row-deltas.ts';
+import { replaceRows, replaceStats, RowDeltaReceiver } from './webview/row-deltas.ts';
 import {
   PanelPerformanceCounters,
   performanceDiagnosticsFileName,
@@ -2844,6 +2869,7 @@ vi.stubGlobal('PANEL_DEV_SERVER_URL', null);
 let PanelProvider: typeof import('./panelhost.ts').PanelProvider;
 import { SessionReadObservations } from './sessionwrites.ts';
 import { AgentReadSources } from './sessionreads.ts';
+import { scanAgySessions, type AgyDiscoveryCache, type AgySessionFile } from './agydiscovery.ts';
 import { createReadState } from './webview/read-state.ts';
 let previousArcHome: string | undefined;
 beforeAll(async () => {
@@ -3652,6 +3678,869 @@ function hostReadReceiptFixture(agent: 'claude' | 'codex' = 'codex') {
   return { ...f, source, file, alias, request };
 }
 
+test.each(['foreign', 'local'] as const)(
+  'Antigravity host drops revoked reads across an equal-tuple %s return',
+  async (owner) => {
+    const { provider } = orderedHostReadFixture();
+    const brain = tempDir('agy-host-revocation-');
+    const project = path.join(brain, 'alpha');
+    const other = path.join(brain, 'bravo');
+    const sessionId = '3352f6ae-5337-44ed-a42a-df1b4d26bbc8';
+    const transcript = path.join(brain, sessionId, '.system_generated', 'logs', 'transcript_full.jsonl');
+    const temporary = path.join(brain, 'held');
+    fs.mkdirSync(path.dirname(transcript), { recursive: true });
+    const at = new Date(2026, 10, 25, 12);
+    const body = (cwd: string, content: string) =>
+      [
+        { type: 'USER_INPUT', step_index: 0, content },
+        { type: 'PLANNER_RESPONSE', step_index: 1, tool_calls: [{ name: 'run_command', args: { Cwd: cwd } }] },
+      ]
+        .map((row) => JSON.stringify({ ...row, created_at: at.toISOString(), status: 'DONE' }) + '\n')
+        .join('');
+    const write = (file: string, cwd: string, prompt: string) => {
+      fs.writeFileSync(file, body(cwd, prompt));
+      fs.utimesSync(file, at, at);
+    };
+    const cache: AgyDiscoveryCache = new Map();
+    const discover = () => {
+      const scan = scanAgySessions(brain, [project], [], { cache });
+      let step = scan.next();
+      while (!step.done) step = scan.next();
+      return step.value.rows;
+    };
+    const brainVariable = 'ARC_AGY_BRAIN_ROOT';
+    const previousBrain = process.env[brainVariable];
+    process.env[brainVariable] = brain;
+    try {
+      write(transcript, project, 'Old prompt');
+      const catalog = discover();
+      assert.equal(catalog.length, 1);
+      const [source] = catalog;
+      const scope = JSON.stringify([project]);
+      let finish!: (value: unknown) => void;
+      let reads = 0;
+      const posts: any[] = [];
+      const pending = new Promise((resolve) => (finish = resolve));
+      Object.assign(provider, {
+        agyScan: { brain, roots: [project], workspace: project, folderPrint: project, cache },
+        repositoryScopeReady: true,
+        repositoryScopeRoots: [project],
+        repositoryScope: { snapshot: () => ({ roots: [project], ready: true }) },
+        authoritativeCatalog: catalog,
+        authoritativeCatalogScope: scope,
+        catalog: { sessions: catalog },
+        coverageRevision: 1,
+        membershipCoverage: {
+          domain: 'admitted',
+          scope,
+          revision: '1',
+          status: 'complete',
+          members: new Set([sessionCoverageMember(source)]),
+        },
+        cache: new Map(),
+        titles: new Map(),
+        carriedNames: new Map(),
+        corpus: new Map(),
+        showing: sessionId,
+        hostSessions: new Map(),
+        selectionGeneration: 1,
+        readWindows: new Map([[sessionId, { loadedTurns: 1 }]]),
+        history: new Map(),
+        refreshGeneration: 1,
+        anyVisible: () => true,
+        folders: () => [project],
+        allSessions: () => provider.authoritativeCatalog,
+        sessionParentEdges: () => ({ edges: new Map() }),
+        archivedSessions: () => new Set(),
+        agentRunFor: () => null,
+        sessionQueryContext: () => undefined,
+        post: (message: unknown) => posts.push(message),
+        startAgyDiscovery: () => {},
+        refreshFrom: () => {},
+        noteSessionRead: () => {},
+        noteChangedSession: () => {},
+        observeStoredEntry: () => {},
+        derivedCacheCheckpointState: { markChanged() {} },
+        progressiveWorker: {
+          run: () => {
+            reads++;
+            return reads === 1 ? pending : Promise.resolve(null);
+          },
+        },
+      });
+      const command = () =>
+        provider.readSessionRequest({
+          method: 'session',
+          params: { sessionId, turns: 1 },
+          requester: null,
+        });
+      assert.equal(command().turns[0]?.prompt, 'Old prompt');
+      const searchable = provider.searchCorpus(sessionId);
+      assert.equal(searchable[0]?.prompt, 'Old prompt');
+      provider.answerSearch('find:prompt', true);
+      assert.equal(posts.at(-1)?.hits.length, 1);
+      // The walked rows can read metadata before the channel has an accepted catalog.
+      provider.authoritativeCatalog = null;
+      const work = provider.prepareMetadata(catalog, 1, new AbortController().signal);
+      provider.authoritativeCatalog = catalog;
+      assert.equal(reads, 1);
+      fs.renameSync(transcript, temporary);
+      provider.revokeMissingAgyAdmission(transcript);
+      write(temporary, owner === 'local' ? project : other, 'New prompt');
+      fs.renameSync(temporary, transcript);
+      assert.equal(fs.statSync(transcript).size, source.size);
+      assert.equal(fs.statSync(transcript).ino, source.ino);
+      assert.equal(fs.statSync(transcript).mtimeMs, source.mtimeMs);
+      const revoked = () => {
+        try {
+          return command();
+        } catch (error) {
+          assert.match(String(error), /membership is unavailable/);
+          return { turns: [] };
+        }
+      };
+      if (owner === 'foreign') {
+        assert.deepEqual(revoked().turns, []);
+        assert.deepEqual(provider.searchCorpus(sessionId), []);
+        provider.answerSearch('find:prompt', true);
+        assert.deepEqual(posts.at(-1)?.hits, []);
+        await provider.completeSelectedWindow(sessionId, 1);
+        await provider.loadOlderHistory(sessionId);
+        await provider.prepareMetadata(catalog, 1, new AbortController().signal);
+        assert.equal(reads, 1);
+      }
+      const listed = discover();
+      if (owner === 'local') {
+        assert.equal(listed.length, 1);
+        provider.catalog.sessions = provider.authoritativeCatalog = listed;
+        assert.equal(command().turns[0]?.prompt, 'New prompt');
+      } else {
+        assert.deepEqual(listed, []);
+      }
+      finish({
+        generation: 1,
+        revision: source,
+        value: {
+          kind: 'metadata',
+          coverage: { whole: true, windowBytes: source.size },
+          entry: { size: source.size, mtimeMs: source.mtimeMs, label: 'Old prompt' },
+        },
+      });
+      await work;
+      assert.equal(provider.titles.has(transcript), false);
+      if (owner === 'local') {
+        provider.awaitingSessionRecords = { [sessionId.toUpperCase()]: {} };
+        assert.throws(command, /membership is unavailable/);
+      }
+    } finally {
+      if (previousBrain === undefined) delete process.env[brainVariable];
+      else process.env[brainVariable] = previousBrain;
+    }
+  },
+);
+
+function agyCollisionFixture(provider: any) {
+  const brain = tempDir('agy-host-collision-');
+  const project = path.join(brain, 'project');
+  const scope = JSON.stringify([project]);
+  const previousBrain = process.env.ARC_AGY_BRAIN_ROOT;
+  process.env.ARC_AGY_BRAIN_ROOT = brain;
+  const posts: any[] = [];
+  Object.assign(provider, {
+    repositoryScopeReady: true,
+    repositoryScopeRoots: [project],
+    repositoryScope: { snapshot: () => ({ roots: [project], ready: true }) },
+    authoritativeCatalogScope: scope,
+    coverageRevision: 1,
+    folders: () => [project],
+    allSessions: () => provider.authoritativeCatalog,
+    anyVisible: () => true,
+    refreshGeneration: 1,
+    catalog: { sessions: [] },
+    corpus: new Map(),
+    sessionParentEdges: () => ({ edges: new Map() }),
+    archivedSessions: () => new Set(),
+    agentRunFor: () => null,
+    sessionQueryContext: () => undefined,
+    post: (message: unknown) => posts.push(message),
+    refreshFrom() {},
+    noteSessionRead() {},
+    noteChangedSession() {},
+    observeStoredEntry() {},
+    derivedCacheCheckpointState: { markChanged() {} },
+  });
+  const publish = (sessions: SessionFile[]) => {
+    provider.authoritativeCatalog = sessions;
+    provider.catalog = { sessions };
+    provider.membershipCoverage = {
+      domain: 'admitted',
+      scope,
+      revision: '1',
+      status: 'complete',
+      members: new Set(sessions.map(sessionCoverageMember)),
+    };
+  };
+  const discover = async (): Promise<AgySessionFile[]> => {
+    if (provider.agyCatalog) provider.agyCatalog.publish = false;
+    provider.startAgyDiscovery(scope, [project]);
+    await vi.waitFor(() => assert.ok(provider.agyCatalog && !provider.agyScan.controller));
+    return provider.agyCatalog.rows;
+  };
+  const transcript = (directory: string) => path.join(directory, '.system_generated', 'logs', 'transcript_full.jsonl');
+  const write = (file: string, prompt: string, cwd = project) => {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(
+      file,
+      [
+        { type: 'USER_INPUT', content: prompt },
+        { type: 'PLANNER_RESPONSE', tool_calls: [{ name: 'run_command', args: { Cwd: cwd } }] },
+      ]
+        .map((row, step_index) =>
+          JSON.stringify({ ...row, step_index, created_at: '2026-11-25T18:00:00Z', status: 'DONE' }),
+        )
+        .join('\n') + '\n',
+    );
+  };
+  const command = (sessionId: string) =>
+    provider.readSessionRequest({ method: 'session', params: { sessionId, turns: 1 }, requester: null });
+  const draw = (source: SessionFile, read: SessionRead) => {
+    provider.cache.set(source.file, { read, revision: source });
+    Object.assign(provider, {
+      turnsByKey: new Map(),
+      promptsBySession: new Map(),
+      sentPrompts: {},
+      newestBySession: new Map(),
+      observeParsedNames() {},
+      trimOlderHistory() {},
+      readFor: () => ({ read, revision: source, maxTurns: 40 }),
+      drawTurnCards: (turns: SessionRead['turns']) =>
+        turns.map((turn) => {
+          const key = turnKey(turn);
+          provider.turnsByKey.set(key, turn);
+          return { kind: 'turn', key, sessionId: turn.sessionId, at: turn.startedAt, prompt: turn.prompt };
+        }),
+    });
+    provider.cards = provider.collect([source]);
+    return provider.cards;
+  };
+  const restore = () => {
+    provider.agyScan?.controller?.abort();
+    if (previousBrain === undefined) delete process.env.ARC_AGY_BRAIN_ROOT;
+    else process.env.ARC_AGY_BRAIN_ROOT = previousBrain;
+  };
+  return { brain, project, publish, discover, transcript, write, command, draw, posts, restore };
+}
+
+test.each(['exact', 'case-folded'] as const)(
+  'removing an excluded %s Antigravity transcript preserves the selected native pages and read',
+  { tags: ['subprocess'] },
+  async (spelling) => {
+    const nativeId = '3352f6ae-5337-44ed-a42a-df1b4d26bbc8';
+    const agyId = spelling === 'exact' ? nativeId : nativeId.toUpperCase();
+    const native = metadataEnrichmentFixture([]);
+    const { provider } = native;
+    const f = agyCollisionFixture(provider);
+    const file = path.join(f.project, 'native.jsonl');
+    const excluded = f.transcript(path.join(f.brain, agyId));
+    const record = (payload: object, timestamp: string) => JSON.stringify({ type: 'event_msg', timestamp, payload });
+    fs.mkdirSync(f.project);
+    fs.writeFileSync(
+      file,
+      [
+        JSON.stringify({ type: 'session_meta', payload: { id: nativeId, cwd: f.project, source: 'cli' } }),
+        ...Array.from({ length: 125 }, (_, index) => {
+          const timestamp = new Date(Date.UTC(2026, 10, 25, 18, 0, index)).toISOString();
+          return [
+            record({ type: 'task_started', turn_id: 'turn-' + index }, timestamp),
+            record({ type: 'user_message', message: 'Native prompt ' + index + ' ' + 'x'.repeat(128) }, timestamp),
+            record(
+              { type: 'task_complete', turn_id: 'turn-' + index, last_agent_message: 'Native response' },
+              timestamp,
+            ),
+          ];
+        }).flat(),
+      ].join('\n') + '\n',
+    );
+    const source = {
+      agent: 'codex' as const,
+      sessionId: nativeId,
+      file,
+      cwd: f.project,
+      ...revisionOf(fs.statSync(file, { bigint: true })),
+    };
+    try {
+      f.publish([source]);
+      const current = readCodexSession(file, nativeId, { maxTurns: 1, tailBytes: 4096 });
+      assert.match(current.turns[0]?.prompt ?? '', /^Native prompt 124 /);
+      Object.assign(provider, {
+        showing: nativeId,
+        hostSessions: new Map([[provider.hosts[0], nativeId]]),
+        readWindows: new Map([[nativeId, { loadedTurns: 1 }]]),
+        historyGeneration: 0,
+        agentReadSources: new AgentReadSources(),
+        admittedReadSources: new Map(),
+        readScopeKey: () => 'scope',
+        progressiveInput: () => ({ session: source, folders: [], children: [], maxTurns: 40, tailBytes: 4096 }),
+      });
+      provider.cache.set(file, { read: current });
+      await provider.loadOlderHistory(nativeId);
+      const before = provider.history.get(nativeId);
+      assert.ok(before?.cursor && before.pages.length);
+      const older = before.pages.flatMap((page: any) => page.turns);
+      assert.ok(older.some((turn: any) => turn.prompt.startsWith('Native prompt 123 ')));
+      const cards = f.draw(source, current);
+      assert.ok(cards.some((card: any) => card.prompt.startsWith('Native prompt 123 ')));
+      const loadedTurns = provider.readWindows.get(nativeId).loadedTurns;
+      assert.equal(loadedTurns, older.length + current.turns.length);
+      const facts = provider.currentReadSource({ sessionId: nativeId, provider: 'codex' });
+      assert.ok(facts?.turns.length);
+      assert.equal(provider.projectedReadFacts({ sessionId: nativeId, provider: 'codex' }), facts);
+      f.write(excluded, 'Excluded Antigravity prompt');
+      const [loser] = await f.discover();
+      assert.equal(loser.sessionId, agyId);
+      assert.equal(provider.agyReadAdmission(loser), undefined);
+
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => (release = resolve));
+      let pending: AbortSignal | undefined;
+      const run = native.worker.run.bind(native.worker);
+      native.worker.run = async (request, generation, signal) => {
+        pending = signal;
+        await held;
+        return run(request, generation, signal);
+      };
+      const load = provider.loadOlderHistory(nativeId);
+      assert.ok(pending && !pending.aborted);
+      try {
+        fs.unlinkSync(excluded);
+        assert.deepEqual(await f.discover(), []);
+        assert.ok(!pending.aborted);
+        assert.equal(provider.history.get(nativeId), before);
+        assert.equal(provider.readWindows.get(nativeId).loadedTurns, loadedTurns);
+        assert.equal(provider.cards, cards);
+        assert.equal(provider.projectedReadFacts({ sessionId: nativeId, provider: 'codex' }), facts);
+      } finally {
+        release();
+        await load;
+      }
+      assert.ok(provider.history.get(nativeId).pages.length > before.pages.length);
+      assert.equal(provider.history.get(nativeId).pages[0], before.pages[0]);
+      f.write(excluded, 'Excluded Antigravity returns');
+      assert.equal((await f.discover()).length, 1);
+      provider.displaceAgyReads(provider.authoritativeCatalog);
+      assert.equal(provider.cards, cards);
+      assert.equal(provider.projectedReadFacts({ sessionId: nativeId, provider: 'codex' }), facts);
+    } finally {
+      native.worker.stop();
+      f.restore();
+    }
+  },
+);
+
+test('admitted Antigravity spellings block reads before catalog publication and release with fresh authority', async () => {
+  const { provider } = orderedHostReadFixture();
+  const f = agyCollisionFixture(provider);
+  const id = '3352f6ae-5337-44ed-a42a-df1b4d26bbc8';
+  const sibling = id.toUpperCase();
+  const independent = '350ab399-37c3-4b75-a766-0d03737e7f23';
+  const primary = f.transcript(path.join(f.brain, id));
+  const separate = f.transcript(path.join(f.brain, independent));
+  const backing = path.join(f.brain, 'other-spelling');
+  const siblingFile = f.transcript(path.join(f.brain, sibling));
+  const siblingBacking = f.transcript(backing);
+  const logicalRoot = path.join(f.brain, sibling);
+  const unmapped: string[] = [];
+  const opens: string[] = [];
+  let hasSibling = false;
+  let unread = false;
+  const mutableFs = createRequire(__filename)('node:fs') as typeof fs;
+  const lstat = fs.lstatSync.bind(fs);
+  const stat = fs.statSync.bind(fs);
+  const open = fs.openSync.bind(fs);
+  const opendir = fs.opendirSync.bind(fs);
+  const mapped = (file: fs.PathLike) => {
+    if (typeof file !== 'string' || !file.startsWith(f.brain)) return file;
+    if (file === f.brain) return f.brain;
+    const [name] = path.relative(f.brain, file).split(path.sep);
+    if (name === id || name === independent) return file;
+    // Compare the logical spelling before path.relative can fold it on Windows.
+    if (file === logicalRoot || file.startsWith(logicalRoot + path.sep))
+      return backing + file.slice(logicalRoot.length);
+    unmapped.push(file);
+    throw new Error('Unmapped Antigravity fixture path');
+  };
+  f.write(primary, 'Primary prompt');
+  f.write(separate, 'Unrelated prompt');
+  f.write(siblingBacking, 'Sibling prompt');
+  const lstats = vi
+    .spyOn(mutableFs, 'lstatSync')
+    .mockImplementation(((file: fs.PathLike, options: any) => lstat(mapped(file), options)) as typeof fs.lstatSync);
+  const stats = vi
+    .spyOn(mutableFs, 'statSync')
+    .mockImplementation(((file: fs.PathLike, options: any) => stat(mapped(file), options)) as typeof fs.statSync);
+  const bodies = vi.spyOn(mutableFs, 'openSync').mockImplementation((file, flags, mode) => {
+    if (typeof file === 'string' && file.startsWith(f.brain)) opens.push(file);
+    return open(mapped(file), flags, mode);
+  });
+  const directories = vi.spyOn(mutableFs, 'opendirSync').mockImplementation((file, options) => {
+    if (file !== f.brain) return opendir(mapped(file), options);
+    if (unread) throw new Error('Directory is unavailable');
+    const entries = [id, independent, ...(hasSibling ? [sibling] : [])];
+    return {
+      readSync: () => {
+        const name = entries.shift();
+        return name === undefined ? null : { name, isDirectory: () => true };
+      },
+      closeSync() {},
+    } as fs.Dir;
+  });
+  syncBuiltinESMExports();
+  try {
+    Object.assign(provider, {
+      showing: id,
+      hostSessions: new Map(),
+      selectionGeneration: 1,
+      readWindows: new Map(),
+      history: new Map(),
+      cache: new Map(),
+      titles: new Map(),
+      carriedNames: new Map(),
+    });
+    const initial = await f.discover();
+    const source = initial.find((row) => row.sessionId === id)!;
+    f.publish(initial);
+    assert.equal(f.command(id).turns[0]?.prompt, 'Primary prompt');
+    const saved = readAgySession(primary, id);
+    assert.ok(saved.read);
+    assert.ok(f.draw(source, saved.read).some((card: any) => card.prompt === 'Primary prompt'));
+    assert.ok(provider.readWindows.has(id));
+    assert.equal(provider.currentReadSource({ sessionId: id, provider: 'agy' })?.provider, 'agy');
+    assert.equal(provider.searchCorpus(id)[0]?.prompt, 'Primary prompt');
+    provider.answerSearch('find:primary', true);
+    assert.equal(f.posts.at(-1)?.hits.length, 1);
+
+    const pending: { signal: AbortSignal; finish: (result: unknown) => void }[] = [];
+    provider.progressiveWorker = {
+      run: (_request: unknown, _generation: number, signal: AbortSignal) =>
+        new Promise((finish) => pending.push({ signal, finish })),
+    };
+    const signal = new AbortController().signal;
+    const work = provider.prepareMetadata([source], 1, signal);
+    const late = provider.runTranscriptRead({ kind: 'metadata', session: source }, 1, signal);
+    assert.equal(pending.length, 2);
+    const reply = {
+      generation: 1,
+      revision: source,
+      value: {
+        kind: 'metadata',
+        coverage: { whole: true, windowBytes: source.size },
+        entry: { size: source.size, mtimeMs: source.mtimeMs, label: 'Primary prompt' },
+      },
+    };
+    hasSibling = true;
+    const discovered = await f.discover();
+    const competitor = discovered.find((row) => row.sessionId === sibling)!;
+    assert.equal(competitor.file, siblingFile);
+    assert.notEqual(competitor.ino, source.ino);
+    assert.equal(provider.authoritativeCatalog, initial);
+    const previousOpens = opens.length;
+    assert.throws(() => f.command(id), /membership is unavailable/);
+    assert.deepEqual(provider.searchCorpus(id), []);
+    provider.answerSearch('find:primary', true);
+    assert.deepEqual(f.posts.at(-1)?.hits, []);
+    assert.match(provider.sessionLabel(source).label, /^Session /);
+    assert.deepEqual(provider.cards, []);
+    assert.equal(provider.readWindows.has(id), false);
+    assert.equal(provider.promptsBySession.has(id), false);
+    assert.equal(provider.admittedReadSources.has(id), false);
+    assert.equal(provider.cache.has(primary), false);
+    await provider.completeSelectedWindow(id, 1);
+    await provider.loadOlderHistory(id);
+    await provider.prepareMetadata([source], 1, signal);
+    assert.equal(opens.length, previousOpens);
+    assert.equal(pending.length, 2);
+    assert.ok(pending.every(({ signal }) => signal.aborted));
+    pending[0].finish(reply);
+    await work;
+    assert.equal(provider.titles.has(primary), false);
+    assert.equal(f.command(independent).turns[0]?.prompt, 'Unrelated prompt');
+    const unambiguous = provider.agyRowsFor(discovered);
+    assert.deepEqual(
+      unambiguous.map((row: SessionFile) => row.sessionId),
+      [independent],
+    );
+    f.publish(unambiguous);
+
+    unread = true;
+    await f.discover();
+    assert.equal(provider.liveAgyAdmission(source), undefined);
+    unread = false;
+    hasSibling = false;
+    const released = await f.discover();
+    const survivor = released.find((row) => row.sessionId === id)!;
+    assert.equal(survivor.size, source.size);
+    assert.equal(survivor.mtimeMs, source.mtimeMs);
+    assert.equal(survivor.dev, source.dev);
+    assert.equal(survivor.ino, source.ino);
+    assert.equal(provider.liveAgyAdmission(source, true), undefined);
+    assert.equal(provider.agyReadAdmission(survivor), undefined);
+    f.publish(released);
+    assert.equal(f.command(id).turns[0]?.prompt, 'Primary prompt');
+    assert.equal(f.command(independent).turns[0]?.prompt, 'Unrelated prompt');
+    pending[1].finish(reply);
+    assert.equal(await late, null);
+    assert.equal(provider.titles.has(primary), false);
+    assert.deepEqual(unmapped, []);
+  } finally {
+    directories.mockRestore();
+    bodies.mockRestore();
+    stats.mockRestore();
+    lstats.mockRestore();
+    syncBuiltinESMExports();
+    f.restore();
+  }
+});
+
+async function checkRetainedAgyName(
+  transition:
+    | 'deletion'
+    | 'native successor'
+    | 'native draft'
+    | 'successor with different spelling'
+    | 'successor after deletion'
+    | 'exact native after successor'
+    | 'wrong provider before successor',
+) {
+  const empty = tempDir('agy-revoked-name-native-roots-');
+  vi.stubEnv('ARC_PROJECTS_ROOT', empty);
+  vi.stubEnv('ARC_CODEX_ROOT', empty);
+  const id = '22f7e884-b10a-4fa3-916f-296e305dea02';
+  const exactAfter = transition === 'exact native after successor';
+  const wrongProvider = transition === 'wrong provider before successor';
+  const afterDeletion = transition === 'successor after deletion' || exactAfter || wrongProvider;
+  const agyId = transition === 'successor with different spelling' || exactAfter ? id.toUpperCase() : id;
+  const childId = 'native-child';
+  const prompt = 'Previously admitted Antigravity prompt';
+  const longName = prompt + ' with a longer session name';
+  const file = path.join(empty, 'native.jsonl');
+  fs.writeFileSync(file, '{}\n');
+  const child: SessionFile = {
+    agent: 'codex',
+    file,
+    sessionId: childId,
+    ...revisionOf(fs.statSync(file, { bigint: true })),
+  };
+  const sessions: SessionFile[] = [child];
+  const fixture = dispatchedRefreshFixture(sessions, {} as ProgressiveWorker, []);
+  const { provider, host } = fixture;
+  const f = agyCollisionFixture(provider);
+  const transcript = f.transcript(path.join(f.brain, agyId));
+  const nativeCheckout = path.join(f.project, 'native-checkout');
+  fs.mkdirSync(nativeCheckout, { recursive: true });
+  provider.repositoryScope.checkoutSnapshot = () => [f.project, nativeCheckout];
+  f.write(transcript, prompt);
+  try {
+    const admitted = await f.discover();
+    f.publish([...sessions, ...admitted]);
+    sessions.push(...admitted);
+    provider.sessionLabel = PanelProvider.prototype['sessionLabel'];
+    provider.parentOfShown = PanelProvider.prototype['parentOfShown'];
+    provider.post = PanelProvider.prototype['post'];
+    provider.postRail = PanelProvider.prototype['postRail'];
+    provider.railRevision = 0;
+    provider.railOrder = [];
+    provider.metadataStatFigures.patch = () => ({});
+    provider.metadataCacheFigures.patch = () => ({});
+    provider.railInputFor = (
+      (input) =>
+      (...args: unknown[]) => ({
+        ...input(...args),
+        sessions: provider.railRows(args[1]),
+        newest: provider.newestBySession,
+        railFilters: provider.saved.railFilters,
+      })
+    )(provider.railInputFor);
+    provider.saved.readerParents = { [childId]: agyId };
+    provider.metaFor = (source: SessionFile) =>
+      source.agent === 'agy' && provider.liveAgyAdmission(source, true) ? { label: prompt, fullLabel: longName } : {};
+    provider.hostSessions = new Map([[host, childId]]);
+    provider.showing = childId;
+    provider.persistHostState = async () => {};
+    await provider.refresh(true, true);
+    await Promise.all(fixture.refreshes);
+    const receiver = new RowDeltaReceiver(() => assert.fail('The accepted session list lost its baseline'));
+    const initial = fixture.posted.filter((post) => post.type === 'render').at(-1) as any;
+    assert.ok(initial);
+    assert.equal(initial.sessions.find((row: any) => row.id === childId)?.parent?.label, prompt);
+    assert.equal(initial.rail.find((row: any) => row.id === agyId)?.name, longName);
+    assert.ok(receiver.expand(initial));
+    const peer = { webview: {}, visible: () => true };
+    const peerPosts: any[] = [];
+    const send = provider.sendToHost;
+    provider.sendToHost = (target: unknown, message: unknown) => {
+      if (target !== peer) return send(target, message);
+      peerPosts.push(message);
+      return Promise.resolve(true);
+    };
+    provider.hosts.push(peer);
+    provider.readyHosts.add(peer);
+    provider.hostSessions.set(peer, agyId);
+    assert.equal(provider.usagePayloadForSession(agyId, peer.webview).composer?.targetName, prompt);
+
+    provider.clearSettlements = new Map();
+    provider.staging = new Set();
+    provider.draftProfiles = {};
+    provider.writeDrafts = async () => {};
+    provider.admittedReadSources = new Map();
+    provider.agentReadSources = new AgentReadSources();
+    provider.readObservations = new SessionReadObservations('agy-native-transition');
+    const retained = provider.sessionRows.find((row: any) => row.id === agyId);
+    let late: Promise<unknown> | undefined;
+    let finish: (() => void) | undefined;
+    let revoked: { native: string; label: string } | undefined;
+    const deletes = transition === 'deletion' || (afterDeletion && !exactAfter);
+    if (!deletes) {
+      fs.appendFileSync(
+        transcript,
+        '{"type":"PLANNER_RESPONSE","step_index":2,"status":"DONE","content":"Appended answer","created_at":"2026-11-25T18:00:01Z"}\n',
+      );
+      const appended = await f.discover();
+      assert.ok(appended[0].size > admitted[0].size);
+      sessions[sessions.length - 1] = appended[0];
+      provider.coverageRevision = 1;
+      f.publish(sessions);
+      assert.equal(provider.qualifiedSessionRow(retained).label, prompt);
+      provider.progressiveWorker = {
+        run(_request: unknown, _generation: number, signal: AbortSignal) {
+          signal.addEventListener('abort', () => {
+            revoked = {
+              native: provider.awaitingSessionRecords[id]?.agent,
+              label: provider.qualifiedSessionRow(retained).label,
+            };
+          });
+          return new Promise((resolve) => (finish = () => resolve({ generation: 1 })));
+        },
+      };
+      late = provider.runTranscriptRead(
+        { kind: 'metadata-recovery', session: appended[0] },
+        1,
+        new AbortController().signal,
+      );
+      assert.ok(finish);
+    }
+    const replacementName = transition === 'native draft' ? 'New Codex session' : 'Session 22f7e884';
+    const from = fixture.posted.length;
+    if (deletes) {
+      fs.unlinkSync(transcript);
+      provider.revokeMissingAgyAdmission(transcript);
+      if (afterDeletion) {
+        await vi.waitFor(() => {
+          assert.equal(peerPosts.filter((post) => post.type === 'usage').at(-1)?.usage.composer?.agent, 'agy');
+        });
+        assert.equal(provider.agyScan.cache.has(agyId), false);
+        peerPosts.length = 0;
+        provider.noteSessionMoved('moving-native', id, 'codex', nativeCheckout);
+        await vi.waitFor(() => {
+          assert.equal(peerPosts.filter((post) => post.type === 'usage').at(-1)?.usage.composer?.agent, 'codex');
+        });
+      }
+    } else if (transition !== 'native draft') {
+      provider.noteSessionMoved('moving-native', id, 'codex', nativeCheckout);
+    } else {
+      const provisional = 'draft:native';
+      provider.sessionRows = [
+        ...provider.sessionRows,
+        ...syntheticDraftRows([{ draftId: provisional, createdAt: 1, agent: 'Codex', agentKey: 'codex' }]),
+      ];
+      provider.adoptDraft(
+        provisional,
+        id,
+        { profile: { agent: 'codex' }, cwd: nativeCheckout, createdAt: 1 },
+        undefined,
+        true,
+      );
+    }
+    provider.newestBySession = new Map([[id, Date.now()]]);
+    await provider.onMessage(
+      {
+        type: 'setRailFilters',
+        railFilters: [{ id: 'native', name: 'Codex sessions', query: 'agent:codex', sort: 'latest' }],
+      },
+      host,
+    );
+    await provider.onMessage({ type: 'labelEditor', session: agyId }, host);
+    assert.equal(
+      provider.authoritativeCatalog.some((row: SessionFile) => row.agent === 'agy'),
+      true,
+    );
+    const posts = fixture.posted.slice(from) as any[];
+    const rail = posts.filter((post) => post.type === 'rail');
+    assert.ok(rail.some((post) => post.rows?.base !== null));
+    assert.doesNotMatch(JSON.stringify(rail), /Previously admitted Antigravity prompt/);
+    assert.ok(posts.find((post) => post.type === 'labelEditor')?.heading.includes(replacementName));
+    const corrected = rail
+      .map((message) => {
+        const parsed = parseHostToPanel(message);
+        assert.ok(parsed?.type === 'rail');
+        return receiver.expand(parsed);
+      })
+      .find((message) => message?.sessions);
+    if (!exactAfter)
+      assert.equal(corrected?.sessions?.find((row: any) => row.id === childId)?.parent?.label, replacementName);
+    assert.equal(corrected?.rail.find((row: any) => row.id === id)?.label, replacementName);
+    const fresh =
+      afterDeletion && !exactAfter
+        ? peerPosts.find((post) => post.type === 'rail' && post.rows)
+        : peerPosts.find((post) => post.type === 'rail');
+    if (!afterDeletion || exactAfter) assert.equal(fresh?.rows?.base, null);
+    const winningRows = fresh?.sessions.filter((row: any) => row.id === id);
+    assert.equal(winningRows?.length, 1);
+    const winner = winningRows[0];
+    assert.equal(winner.label, replacementName);
+    assert.equal(winner.fullLabel ?? winner.label, replacementName);
+    assert.equal(winner.agentKey, transition === 'deletion' ? 'agy' : 'codex');
+    assert.equal(winner.agent, transition === 'deletion' ? 'Antigravity' : 'Codex');
+    assert.equal(winner.shown, true);
+    if (transition !== 'deletion') {
+      assert.equal(winner.persisted, false);
+      assert.deepEqual(winner.startWorktree, { name: 'native-checkout', path: nativeCheckout });
+      assert.equal(peerPosts.filter((post) => post.type === 'usage').at(-1)?.usage.composer?.agent, 'codex');
+    }
+    assert.equal(peerPosts.filter((post) => post.type === 'usage').at(-1)?.usage.composer?.targetName, replacementName);
+    assert.doesNotMatch(JSON.stringify(peerPosts), /Previously admitted Antigravity prompt/);
+
+    const next = fixture.posted.length;
+    const refresh = provider.refresh;
+    provider.refresh = async () => {};
+    await provider.onMessage({ type: 'rowsGap' }, host);
+    provider.postRail(true);
+    const snapshot = fixture.posted.slice(next).find((post) => post.type === 'rail') as any;
+    assert.equal(snapshot?.rows?.base, null);
+    assert.doesNotMatch(JSON.stringify(snapshot), /Previously admitted Antigravity prompt/);
+    if (!exactAfter)
+      assert.equal(snapshot.sessions.find((row: any) => row.id === childId)?.parent?.label, replacementName);
+    assert.equal(snapshot.sessions.find((row: any) => row.id === childId)?.agentKey, 'codex');
+    if (transition === 'native draft') {
+      assert.deepEqual(
+        snapshot.sessions.filter((row: any) => row.id === id).map((row: any) => row.agentKey),
+        ['codex'],
+      );
+    }
+    if (afterDeletion) {
+      const nativeFile = path.join(nativeCheckout, id + '.jsonl');
+      fs.writeFileSync(
+        nativeFile,
+        JSON.stringify({
+          type: 'session_meta',
+          payload: { id, cwd: nativeCheckout, source: 'vscode' },
+        }) + '\n',
+      );
+      const readNative = (session: string) => {
+        const source = codexSessionFiles(nativeCheckout, [f.project]).sessions.find((row) => row.sessionId === session);
+        assert.ok(source);
+        return source;
+      };
+      const source = readNative(id);
+      provider.refresh = refresh;
+      provider.newestBySession = new Map();
+      provider.allSessions = () => sessions;
+      provider.prepareClaudeChildren = async () => {
+        provider.catalog = { sessions };
+        return true;
+      };
+      const refreshSources = async (...sources: SessionFile[]) => {
+        sessions.splice(1, sessions.length - 1, ...sources);
+        for (const current of sources) {
+          provider.enumeratedMembers.add(sessionCoverageMember(current));
+          const enumeration = provider.sourceEnumerations[current.agent];
+          if (!enumeration.files.includes(current.file)) enumeration.files.push(current.file);
+        }
+        await provider.refresh(true, false);
+        await Promise.all(fixture.refreshes);
+      };
+      if (exactAfter) {
+        fs.unlinkSync(transcript);
+        provider.revokeMissingAgyAdmission(transcript);
+      }
+      if (wrongProvider) {
+        const file = path.join(nativeCheckout, 'claude.jsonl');
+        fs.writeFileSync(file, JSON.stringify({ sessionId: id, cwd: nativeCheckout, type: 'user' }) + '\n');
+        const claude = {
+          ...source,
+          agent: 'claude' as const,
+          file,
+          ...revisionOf(fs.statSync(file, { bigint: true })),
+        };
+        for (const candidates of [[claude], [claude, source]]) {
+          await refreshSources(...candidates);
+          assert.equal(provider.awaitingSessionRecords[id]?.agent, 'codex');
+          assert.ok(provider.authoritativeCatalog.some((row: SessionFile) => row.agent === 'claude'));
+          assert.deepEqual(
+            provider
+              .hostRowsFor(peer, provider.sessionRows, id, undefined, true)
+              .filter((row: any) => row.shown)
+              .map((row: any) => [row.agentKey, row.persisted]),
+            [['codex', false]],
+          );
+          assert.equal(provider.usagePayloadForSession(id, peer.webview).composer?.agent, 'codex');
+          assert.equal(provider.stateFor(id), null);
+        }
+        fs.unlinkSync(file);
+      }
+      await refreshSources(source);
+      assert.equal(provider.awaitingSessionRecords[id], undefined);
+      assert.equal(provider.rowForSession(id)?.persisted, true);
+      assert.equal(provider.hostSessions.get(peer), id);
+      assert.equal(provider.agyReadAdmission(admitted[0]), undefined);
+      if (exactAfter) {
+        assert.equal(provider.rowForSession(agyId)?.id, id);
+        fs.unlinkSync(nativeFile);
+        provider.sourceEnumerations.codex.files.length = 0;
+        const file = path.join(nativeCheckout, agyId + '.jsonl');
+        fs.writeFileSync(
+          file,
+          JSON.stringify({ type: 'session_meta', payload: { id: agyId, cwd: nativeCheckout } }) + '\n',
+        );
+        await refreshSources(readNative(agyId));
+        await provider.onMessage({ type: 'showSession', session: agyId }, peer);
+        assert.equal(provider.hostSessions.get(peer), agyId);
+        assert.equal(provider.rowForSession(agyId)?.id, agyId);
+        assert.equal(provider.usagePayloadForSession(agyId, peer.webview).composer?.agent, 'codex');
+        finish?.();
+        assert.equal(await late, null);
+        return;
+      }
+    }
+    if (!deletes) {
+      assert.deepEqual(revoked, { native: 'codex', label: 'Session ' + agyId.slice(0, 8) });
+      assert.equal(provider.awaitingSessionRecords[id]?.agent, 'codex');
+      delete provider.awaitingSessionRecords[id];
+      provider.coverageRevision = 1;
+      f.publish(sessions);
+      assert.equal(provider.qualifiedSessionRow(retained).label, 'Session ' + agyId.slice(0, 8));
+      finish?.();
+      assert.equal(await late, null);
+      assert.equal(provider.sessionRowOf(sessions.at(-1)!, new Map(), false).label, prompt);
+      assert.equal(f.command(agyId).turns[0]?.prompt, prompt);
+    }
+  } finally {
+    f.restore();
+  }
+}
+
+test.each([
+  'deletion',
+  'native successor',
+  'native draft',
+  'successor with different spelling',
+  'successor after deletion',
+  'exact native after successor',
+  'wrong provider before successor',
+] as const)(
+  'retained session posts remove a revoked Antigravity name while the catalog refresh waits: %s',
+  checkRetainedAgyName,
+);
+
 test.each(['claude', 'codex'] as const)(
   'session reads qualify appended %s turns without republishing the catalog',
   async (agent) => {
@@ -4130,6 +5019,7 @@ test('command-only admission removes pending rows through every catalog path and
   let sources: any[] = [];
   const dependencies = {
     isCompressedRollout,
+    currentAgyAdmission,
     discoveryParentsOf,
     fs,
     fileRevisionOf: revisionOf,
@@ -4159,6 +5049,10 @@ test('command-only admission removes pending rows through every catalog path and
     sessionSourceKey,
     sessionCoverageMember,
     reconcileSessionCollisions,
+    retainNativeSessionReservations,
+    nativeReservationTwin,
+    sessionCoverageFileKey,
+    isAgySessionId,
     sessionPageSources,
     normalizeFsPath: renameTranscripts.normalizeFsPath,
     folderMatcher: renameTranscripts.folderMatcher,
@@ -6936,6 +7830,10 @@ test('window session pages lose coverage when a served transcript is replaced at
       sessionSourceKey,
       sessionCoverageMember,
       reconcileSessionCollisions,
+      retainNativeSessionReservations,
+      nativeReservationTwin,
+      sessionCoverageFileKey,
+      isAgySessionId,
       sessionPageSources,
       normalizeFsPath: renameTranscripts.normalizeFsPath,
       folderMatcher: renameTranscripts.folderMatcher,
@@ -12295,7 +13193,7 @@ test('a session joins the list only once a human has prompted it, and the cut st
   );
   sourceMatch(
     panelHostSource,
-    /const walkedSessions = orderSessionCatalog\(\[\.\.\.listed, \.\.\.this\.claudeChildren, \.\.\.codex\],[\s\S]*this\.activityFor\(session\)\);/,
+    /const walkedSessions = orderSessionCatalog\(\[\.\.\.listed, \.\.\.this\.claudeChildren, \.\.\.codex, \.\.\.agy\], \(session\) =>\s*this\.activityFor\(session\),?\s*\);/,
     'the filtered list is not what the panel merges',
   );
   sourceMatch(
@@ -12555,7 +13453,7 @@ test('clearing empties one session and leaves the other agents alone', () => {
   }
 });
 
-test('both agents reach one list, and each session is read and named by its own reader', () => {
+test('Claude, Codex, and Antigravity reach one list and use their own readers', () => {
   const marker = 'private allSessions(';
   const from = panelHostSource.indexOf(marker);
   assert.notEqual(from, -1, `panelhost.ts no longer contains "${marker}", so this guard cannot see the merge`);
@@ -12570,7 +13468,7 @@ test('both agents reach one list, and each session is read and named by its own 
     /enumerateSessionFilesForSteps\(projectsRoot\(\)/,
     'the list no longer holds Claude Code sessions from a walk',
   );
-  sourceMatch(merge, /codexSessionFiles\(codexSessionsRoot\(\)/, 'the list no longer holds Codex sessions');
+  sourceMatch(merge, /codexSessionFiles\(\s*codexRoot,\s*roots,/, 'the list no longer holds Codex sessions');
   sourceMatch(
     merge,
     /const scope = this\.repositoryScope\.snapshot\(workspaceFolders\);/,
@@ -12588,7 +13486,7 @@ test('both agents reach one list, and each session is read and named by its own 
   );
   sourceMatch(
     merge,
-    /codexSessionFiles\(codexSessionsRoot\(\), roots,/,
+    /const codexRoot = codexSessionsRoot\(\);[\s\S]*codexSessionFiles\(\s*codexRoot,\s*roots,/,
     'Codex discovery does not use the same registered worktree scope as Claude',
   );
   sourceMatch(
@@ -12609,8 +13507,8 @@ test('both agents reach one list, and each session is read and named by its own 
   // Match the combined catalog through its return statement.
   sourceMatch(
     merge,
-    /const walkedSessions = orderSessionCatalog\(\[\.\.\.listed, \.\.\.this\.claudeChildren, \.\.\.codex\],[\s\S]*this\.activityFor\(session\)\);[\s\S]*return walkedSessions;/,
-    'what the panel gets back is not both lists in one order, whatever was listed above it',
+    /const walkedSessions = orderSessionCatalog\(\[\.\.\.listed, \.\.\.this\.claudeChildren, \.\.\.codex, \.\.\.agy\], \(session\) =>\s*this\.activityFor\(session\),?\s*\);[\s\S]*return walkedSessions;/,
+    'the walk must return the combined catalog in activity order',
   );
   // Retain rollout metadata and trim its cache against walked files.
   sourceMatch(
@@ -12636,6 +13534,11 @@ test('both agents reach one list, and each session is read and named by its own 
     'the progressive worker does not dispatch each session to its own reader',
   );
   sourceMatch(
+    workerEntry,
+    /if \(session\.agent === 'agy' && request\.kind === 'window'\) \{ const checkpoint = [^;]+; let result = await readAgySessionAsync\(session\.file, session\.sessionId,/,
+    'the progressive worker must dispatch Antigravity history to its own reader',
+  );
+  sourceMatch(
     panelHostSource,
     /private readFor\([\s\S]*?const hit = this\.cache\.get\(session\.file\);/,
     'the host does not expose only an accepted worker window to card collection',
@@ -12653,7 +13556,7 @@ test('Claude child catalog membership does not depend on the evictable parent tu
   );
   sourceMatch(
     merge,
-    /\[\.\.\.listed, \.\.\.this\.claudeChildren, \.\.\.codex\]/,
+    /\[\.\.\.listed, \.\.\.this\.claudeChildren, \.\.\.codex, \.\.\.agy\]/,
     'verified children do not reach the complete catalog used by pinned and selected sessions',
   );
   sourceDoesNotMatch(
@@ -12892,7 +13795,8 @@ test("the host counts a dispatched session in its parent's cost once and files i
       metaFor: () => ({ agentRun: false }),
       dispatchFacts: new Map(),
       saved: normalizePanelState(null),
-      sessionRows: ['parent', 'child'].map((id) => ({ id, label: id })),
+      authoritativeCatalog: listed.map(session),
+      sessionRows: listed.map((id) => ({ id, label: id, agentKey: 'claude', persisted: true })),
       sessionParentEdgeSet: null,
     }) as Host;
     host.updateSessionSpendSources([], listed.map(session));
@@ -13959,12 +14863,12 @@ test('synthetic sessions become interactive only inside the current repository s
   );
   sourceMatch(
     refresh,
-    /const scopedPendingRecords = Object\.values\(this\.awaitingSessionRecords\)[\s\S]*pending\.cwd !== null[\s\S]*isInside\(pending\.cwd, this\.repositoryScopeRoots\)/,
+    /const scopedPendingRecords = Object\.values\(this\.awaitingSessionRecords\)[\s\S]*pending\.cwd === null \|\| !isInside\(pending\.cwd, this\.repositoryScopeRoots\)\) return false/,
     'a successor awaiting its record remains interactive after its workspace leaves',
   );
   sourceMatch(
     refresh,
-    /scopedDrafts\.map[\s\S]*scopedPendingRecords\.map[\s\S]*scopedDrafts\.map\(\(draft\) =>[\s\S]*syntheticDraftRows\(\[\s*\{\s*draftId: draft\.draftId,[\s\S]*scopedPendingRecords\.map\(\(pending\) =>[\s\S]*syntheticDraftRows\(\[\s*\{\s*draftId: pending\.sessionId,/,
+    /scopedDrafts\.map[\s\S]*scopedPendingRecords\.map[\s\S]*scopedDrafts\.map\(\(draft\) =>[\s\S]*syntheticDraftRows\(\[\s*\{\s*draftId: draft\.draftId,[\s\S]*scopedPendingRecords\.map\(\(pending\) =>[\s\S]*this\.pendingSessionRow\(pending\)/,
     'out-of-scope synthetic sessions still reach selection, launch, or session rows',
   );
 });
@@ -18283,7 +19187,7 @@ test('draft MCP wiring cancels stale work and leaves Codex Servers on its cached
   );
   sourceMatch(
     selection,
-    /if \(session && agent\) \{ refreshUsage\(agent, false, session, agent, cwd \?\? undefined\); \}/,
+    /if \(session && agent && agent !== 'agy'\) \{ refreshUsage\(agent, false, session, agent, cwd \?\? undefined\); \}/,
     'selecting a recorded session leaves its owner-scoped Servers state undiscovered',
   );
   const closeAt = extensionSource.indexOf('panel.onPanelsClosed =');
@@ -19761,8 +20665,8 @@ test('a skill row opens only a file the card itself published', () => {
 test('the session on screen scopes the search, and every wording follows the scope', () => {
   // Scope search inputs to the selected session before reading individual files.
   sourceMatch(
-    panelHostSource,
-    /const entries = retained[^;]*this\.searchCorpus\(this\.showing, walked\);[\s\S]*searchScope\(entries, this\.showing\)/,
+    memberFrom(panelHostSource, panelHostSource.indexOf('private answerSearch(')),
+    /const entries = retained[\s\S]*?this\.searchCorpus\(this\.showing, walked\);[\s\S]*searchScope\(entries, this\.showing\)/,
     'the search is not scoped to the session on screen through the tested rule',
   );
   sourceMatch(
@@ -20167,7 +21071,7 @@ test('nothing leaves the panel with no session shown', () => {
   const settled = panelHostSource.indexOf('this.showing = pickShowing(');
   for (const [what, line] of [
     ['the parse cut', 'const sessions = this.shownSessions(all);'],
-    ['what is drawn', 'const hostDrawn = drawnSessionCards(this.cards, hostSession);'],
+    ['what is drawn', 'drawnSessionCards(this.cards, hostSession)'],
     ['the rail', 'const hostInput = this.railInputFor(counts, statuses, openChildren, railNow, hostSession);'],
   ] as const) {
     const at = panelHostSource.indexOf(line);
@@ -20638,7 +21542,7 @@ test('a fresh session stays selected until its disk record is discoverable', () 
   assert.notEqual(adoptAt, -1, 'fresh session identity is no longer adopted');
   sourceMatch(
     adopt,
-    /this\.awaitingSessionRecords\[actual\] = \{[\s\S]*sessionId: actual,[\s\S]*createdAt: draft\.createdAt,[\s\S]*agent: draft\.profile\.agent,[\s\S]*cwd: draft\.cwd,/,
+    /this\.awaitNativeSessionRecord\(\{[\s\S]*sessionId: actual,[\s\S]*createdAt: draft\.createdAt,[\s\S]*agent: draft\.profile\.agent,[\s\S]*cwd: draft\.cwd,/,
     'adoption drops the synthetic row before the transcript or rollout can replace it',
   );
   sourceMatch(
@@ -20650,7 +21554,7 @@ test('a fresh session stays selected until its disk record is discoverable', () 
   const sessionMoved = memberFrom(panelHostSource, sessionMovedAt);
   sourceMatch(
     sessionMoved,
-    /agent: AgentKind, cwd: string \| null\)[\s\S]*this\.awaitingSessionRecords\[successor\] = \{[\s\S]*\bcwd\b/,
+    /agent: AgentKind, cwd: string \| null\)[\s\S]*this\.awaitNativeSessionRecord\(\{ sessionId: successor, createdAt: Date\.now\(\), agent, cwd, moved: true \}\)/,
     'a successor started inside a live child loses the source session cwd before its transcript arrives',
   );
   const extensionSource = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
@@ -20689,10 +21593,7 @@ test('a fresh session stays selected until its disk record is discoverable', () 
 
   const refreshAt = panelHostSource.indexOf('async refresh(');
   const refresh = panelHostSource.slice(refreshAt, panelHostSource.indexOf('private glanceAt(', refreshAt));
-  const clearAt = layoutIndexOf(
-    refresh,
-    "if (this.authoritativeCatalogScope === JSON.stringify(this.repositoryScopeRoots) && this.membershipOf(session, this.awaitingSessionRecords[session].agent) === 'present' && pendingResponseSessionAdmitted(this.awaitingSessionRecords[session], this.authoritativeCatalog ?? [])) { delete this.awaitingSessionRecords[session]; }",
-  );
+  const clearAt = refresh.indexOf('this.settlePendingSessionRecords(Object.keys(this.awaitingSessionRecords));');
   const pendingAt = refresh.indexOf('const scopedPendingRecords =');
   const selectAt = refresh.indexOf('this.showing = pickShowing(');
   assert.ok(
@@ -20706,7 +21607,7 @@ test('a fresh session stays selected until its disk record is discoverable', () 
   );
   sourceMatch(
     refresh,
-    /scopedPendingRecords\.map\(\(pending\) =>[\s\S]*syntheticDraftRows\(\[\s*\{\s*draftId: pending\.sessionId,[\s\S]*createdAt: pending\.createdAt,[\s\S]*agent: AGENT_NAMES\[pending\.agent\]/,
+    /scopedPendingRecords\.map\(\(pending\) =>[\s\S]*this\.pendingSessionRow\(pending\)/,
     'the selected actual id has no row or composer while its disk record is delayed',
   );
 
@@ -20745,7 +21646,7 @@ test('awaiting session state and delayed panel actions use the adopted identity'
   );
   sourceMatch(
     row,
-    /awaiting\.cwd === null[\s\S]*isInside\(awaiting\.cwd, this\.repositoryScopeRoots\)/,
+    /awaiting\?\.cwd && isInside\(awaiting\.cwd, this\.repositoryScopeRoots \?\? \[\]\)/,
     'an awaiting session outside the current repository scope can resume through fallback state',
   );
 
@@ -20829,6 +21730,9 @@ test('awaiting session state and delayed panel actions use the adopted identity'
     rowForSession(session: string) {
       return rowForSession.call(this, session);
     },
+    pendingSessionRow: PanelProvider.prototype['pendingSessionRow'],
+    agyPresentationSession: PanelProvider.prototype['agyPresentationSession'],
+    agyPendingPresentation: PanelProvider.prototype['agyPendingPresentation'],
     panelSession(session: string) {
       return panelSession.call(this, session);
     },
@@ -20983,6 +21887,9 @@ test('label requests keep the browser identity while reading durable label stora
   const labels = setSessionLabels({}, 'durable', ['release']);
   const provider = {
     sessionRows: [{ id: 'durable', label: 'Durable title' }],
+    rowForSession: PanelProvider.prototype['rowForSession'],
+    agyPresentationSession: PanelProvider.prototype['agyPresentationSession'],
+    agyPendingPresentation: PanelProvider.prototype['agyPendingPresentation'],
     saved: { labels },
     posted: [] as unknown[],
     post(message: unknown) {
@@ -22073,14 +22980,20 @@ function methodBody(marker: string): string {
   assert.ok(body !== undefined, `${marker} has no body this guard can read`);
   const extracted = body.slice(1, -1);
   if (marker === 'private allSessions(') {
-    return `const codexEnumeration = arguments[2]; const deferWalk = arguments[3]; const parts = arguments[5]; const claudeWalk = arguments[6];
+    return `const codexEnumeration = arguments[2]; const deferWalk = arguments[3]; const parts = arguments[5]; const claudeWalk = arguments[6]; const compressedOpenings = arguments[7];
+      this.contestedAgyFiles = function() {
+        ${methodBody('private contestedAgyFiles(')}
+      };
+      this.rememberAgyNativeRows = function(rows) {
+        ${methodBody('private rememberAgyNativeRows(')}
+      };
       this.collidingSources = function() {
         ${methodBody('private collidingSources(')}
       };
       this.claudeOpeningReader = function(inRoots, openings, time) {
         ${methodBody('private claudeOpeningReader(')}
       };
-      this.walkedSessions = function(roots, workspaceFolders, folderPrint, deferHumanPrompts, codexEnumeration, parts, heldClaude, slicedClaude) {
+      this.walkedSessions = function(roots, workspaceFolders, folderPrint, deferHumanPrompts, codexEnumeration, parts, heldClaude, slicedClaude, compressedOpenings) {
         ${methodBody('private walkedSessions(')}
       };
       ${extracted}`;
@@ -22346,6 +23259,7 @@ test.each([false, true])('/clear publishes the copied setup and preserves delega
     showing: 'old',
     hostSessions: new Map([[mappedHost, 'old']]),
     awaitingSessionRecords: {},
+    awaitNativeSessionRecord: PanelProvider.prototype['awaitNativeSessionRecord'],
     newDrafts: {},
     promptsBySession: new Map(),
     draftCommentIds: {},
@@ -22478,6 +23392,7 @@ test("/clear does not evict the source session's own labels at a full label reco
     railOrder: ['old'],
     showing: 'old',
     awaitingSessionRecords: {},
+    awaitNativeSessionRecord: PanelProvider.prototype['awaitNativeSessionRecord'],
     newDrafts: {},
     promptsBySession: new Map(),
     draftCommentIds: {},
@@ -22571,6 +23486,7 @@ test('provider acceptance adopts overlapping drafts without losing either setup'
       second: newSessionDraft('second', 'C:\\ws', null, 2, secondProfile),
     },
     awaitingSessionRecords: {},
+    awaitNativeSessionRecord: PanelProvider.prototype['awaitNativeSessionRecord'],
     drafts: { first: '', second: '' },
     assets: {},
     queues: {},
@@ -24362,7 +25278,7 @@ test('showing one session stages that session ahead of retained recent data', ()
   );
   sourceMatch(
     panelHostSource,
-    /const hostDrawn = drawnSessionCards\(this\.cards, hostSession\);/,
+    /const hostDrawn = [\s\S]*?drawnSessionCards\(this\.cards, hostSession\);/,
     'every parsed session is drawn, so the panel shows them all at once',
   );
   sourceMatch(
@@ -24377,7 +25293,7 @@ test('showing one session stages that session ahead of retained recent data', ()
   );
   sourceMatch(
     panelHostSource,
-    /return control \? \{ \.\.\.control, session: selectedSession\.sessionId \} : null;/,
+    /return control \? \{ \.\.\.control, session: qualifiedSelection\.sessionId \} : null;/,
     'the history control is not bound to the session that rendered it',
   );
   sourceMatch(
@@ -24398,7 +25314,7 @@ test('one older page is read at a time, for the session on screen alone', () => 
   );
   sourceMatch(
     body,
-    /!session \|\|\s*!visible\.has\(sessionId\) \|\|/,
+    /!session \|\|\s*!stillAdmitted\(\) \|\|\s*!visible\.has\(sessionId\) \|\|/,
     'a page is read for a session the reader already left',
   );
   sourceMatch(
@@ -24408,7 +25324,7 @@ test('one older page is read at a time, for the session on screen alone', () => 
   );
   sourceMatch(
     body,
-    /if \(this\.historyRequest\?\.generation !== generation\) \{ return; \}/,
+    /if \(this\.historyRequest\?\.generation !== generation \|\| !stillAdmitted\(\)\) \{ return; \}/,
     'a result from a cancelled or superseded request commits state anyway',
   );
   sourceMatch(
@@ -24428,7 +25344,7 @@ test('one older page is read at a time, for the session on screen alone', () => 
   );
   sourceMatch(
     body,
-    /\} catch \{\s*const held = this\.history\.get\(sessionId\) \?\? before;/,
+    /\} catch \{\s*if \(this\.historyRequest\?\.generation !== generation \|\| !stillAdmitted\(\)\) return;\s*const held = this\.history\.get\(sessionId\) \?\? before;/,
     'a page read that throws leaves the sentinel saying it is loading until the next poll',
   );
   sourceMatch(
@@ -24457,7 +25373,7 @@ test('one older page is read at a time, for the session on screen alone', () => 
   const reader = memberFrom(panelHostSource, readerAt);
   sourceMatch(
     reader,
-    /this\.progressiveWorker\.run\(\{[\s\S]*kind: 'page', input: this\.progressiveInput\(session\), cursor\b/,
+    /this\.runTranscriptRead\(\s*\{[\s\S]*kind: 'page', input: this\.progressiveInput\(session\), cursor\b/,
     'older history bypasses the progressive worker',
   );
   sourceMatch(
@@ -24535,7 +25451,7 @@ test('older pages survive an append, and go when the file or the budget says so'
   ]) {
     sourceMatch(
       memberFrom(panelHostSource, panelHostSource.indexOf(member)),
-      /this\.dropHistoryOfOtherPath\(session\);\s*const result = await this\.progressiveWorker\.run\(\s*\{\s*kind: 'window'/,
+      /this\.dropHistoryOfOtherPath\(session\);\s*const result = await this\.runTranscriptRead\(\s*\{\s*kind: 'window'/,
       `${member} reads a window of another path over the pages of the previous one`,
     );
   }
@@ -24552,7 +25468,7 @@ test('older pages survive an append, and go when the file or the budget says so'
   // Only the selected session decodes a compressed body, and each change that leaves it releases the body.
   sourceMatch(
     memberFrom(panelHostSource, panelHostSource.indexOf('private async prepareProgressive(')),
-    /if \(isCompressedRollout\(session\.file\)\) continue;\s*const previous = this\.cache\.get\(session\.file\);\s*this\.dropHistoryOfOtherPath\(session\);\s*const result = await this\.progressiveWorker\.run\(\s*\{\s*kind: 'window'/,
+    /if \(isCompressedRollout\(session\.file\)\) continue;\s*const previous = this\.cache\.get\(session\.file\);\s*this\.dropHistoryOfOtherPath\(session\);\s*const result = await this\.runTranscriptRead\(\s*\{\s*kind: 'window'/,
     'a background window decodes a compressed body',
   );
   sourceMatch(
@@ -24697,7 +25613,7 @@ test('a rail card wears the status that needs attention', () => {
   const postRail = memberFrom(panelHostSource, postRailAt);
   sourceMatch(
     postRail,
-    /const railAdoptions = sessionAdoptions\(this\.sessionAliases\);[\s\S]*?for \(const host of this\.hosts\) \{[\s\S]*?sharedRail[\s\S]*?buildRail\(this\.railInputFor\([\s\S]*?this\.hostSessions\?\.get\(host\) \?\? this\.showing[\s\S]*?sessionAdoptions: railAdoptions[\s\S]*?void this\.postRows\(host, message, \(serializedBytes\) => \{/,
+    /const railAdoptions = sessionAdoptions\(this\.sessionAliases\);[\s\S]*?for \(const host of this\.hosts\) \{[\s\S]*?sharedRail[\s\S]*?buildRail\(this\.railInputFor\([\s\S]*?this\.hostSessions\?\.get\(host\) \?\? this\.showing[\s\S]*?sessionAdoptions: railAdoptions[\s\S]*?void this\.postRows\(\s*host,\s*sessions \? \{ \.\.\.message, sessions \} : message,\s*\(serializedBytes\) => \{/,
     'a completed lifetime index updates the rail but leaves the open heading stale',
   );
   sourceMatch(
@@ -25332,7 +26248,7 @@ test('activity changes leave the rail order alone while a host remains open', ()
   // The catalog orders by activity, while the session list reconciles its displayed order separately.
   sourceMatch(
     panelHostSource,
-    /const walkedSessions = orderSessionCatalog\(\[\.\.\.listed, \.\.\.this\.claudeChildren, \.\.\.codex\],[\s\S]*this\.activityFor\(session\)\);/,
+    /const walkedSessions = orderSessionCatalog\(\[\.\.\.listed, \.\.\.this\.claudeChildren, \.\.\.codex, \.\.\.agy\], \(session\) =>\s*this\.activityFor\(session\),?\s*\);/,
     'the stable rail order replaced the recency order used outside the rail',
   );
   // Reused catalogs also order by the current activity reading.
@@ -30943,7 +31859,7 @@ function liveProviderFixture(press: LivePress, newest = turn({ startedAt: press.
     revisionOf: () => ({ mtimeMs: 10, size: 10 }),
     structuralKey: () => '',
     progressiveCurrent: () => false,
-    progressiveInput: () => ({}),
+    progressiveInput: (session: unknown) => ({ session }),
     dropOlderHistory: () => undefined,
     folders: () => [],
     postRail: () => undefined,
@@ -33585,10 +34501,10 @@ test('selection and accepted worker results avoid unnecessary catalog walks', ()
   const reusing = [...panelHostSource.matchAll(/this\.refresh(?:From|As)\('[^']+', (?:true|false), true\b/g)];
   assert.equal(
     reusing.length,
-    26,
+    28,
     `${reusing.length} refresh callers reuse the held catalog. Selection, older-page loading, ` +
       'the accepted selected-worker follow-up, row delta recovery, repeated-record coverage, the listing after the cold opening pass, a poll at unchanged ' +
-      'directories, a compressed facts batch, the redraw of a shown row that a batch changed, and the commit and model list updates, which change cards and no session row, must not repeat catalog enumeration.',
+      'directories, Antigravity discovery and missing-file revocations, a compressed facts batch, the redraw of a shown row that a batch changed, and the commit and model list updates, which change cards and no session row, must not repeat catalog enumeration.',
   );
   const refreshAt = panelHostSource.indexOf('async refresh(');
   const refresh = panelHostSource.slice(
@@ -33859,7 +34775,7 @@ test('a ready host stages worker-backed session data without clearing accepted c
   );
   sourceMatch(
     selected,
-    /const controller = new AbortController\(\);[\s\S]*this\.selectionWork = work;[\s\S]*this\.progressiveWorker\.run\([\s\S]*generation, controller\.signal[\s\S]*this\.refreshFrom\('selected-window', true, true, null, true, true\);/,
+    /const controller = new AbortController\(\);[\s\S]*this\.selectionWork = work;[\s\S]*this\.runTranscriptRead\([\s\S]*generation, controller\.signal[\s\S]*this\.refreshFrom\('selected-window', true, true, null, true, true\);/,
     'selected-window work shares the catalog refresh controller or does not publish when it finishes',
   );
   sourceDoesNotMatch(
@@ -34176,12 +35092,12 @@ test('session details keeps native controls and dialog lifetime outside the redr
   sourceMatch(details, /print !== dialogPrint/, 'ordinary redraws replace the Details dialog');
   sourceMatch(
     panelHostSource,
-    /const hostDrawn = drawnSessionCards\(this\.cards, hostSession\)/,
+    /const hostDrawn = [\s\S]*?drawnSessionCards\(this\.cards, hostSession\)/,
     'selected mode does not limit the cards posted to the chosen session',
   );
   sourceMatch(
     panelHostSource,
-    /const selected = source\.id === hostSession;\s*const full = selected \? \(fullLabels\.get\(source\.id\) \?\? source\.label\) : source\.label/,
+    /const full = shown \? \(details\?\.fullLabel \?\? source\.fullLabel \?\? source\.label\) : source\.label/,
     'hidden sessions can send their complete names in every render payload',
   );
   sourceMatch(
@@ -34196,19 +35112,19 @@ test('session details keeps native controls and dialog lifetime outside the redr
   );
   sourceMatch(
     panelHostSource,
-    /fullLabels\?\.set\(f\.sessionId, named\.fullLabel\)/,
-    'full names are not scoped to sessions with a drawn heading',
+    /\[sessionRowDetails\]: \{ cwd: f\.cwd, fullLabel: named\.fullLabel \}/,
+    'the full name does not come from the session source',
   );
 
   // Label-editor headings and prompt-box targets read the short session label.
   sourceMatch(
     panelHostSource,
-    /labelEditorReply\(this\.saved\.labels, this\.sessionRows, session, CARD_ACTIONS\.labelHeading, browserSession\)/,
+    /const row = this\.rowForSession\(session\);\s*return labelEditorReply\(\s*this\.saved\.labels,\s*row \? \[row\.agentKey === 'agy' \? this\.qualifiedSessionRow\(row\) : row\] : \[\],\s*session,\s*CARD_ACTIONS\.labelHeading,\s*browserSession,\s*row\?\.id,\s*\)/,
     'the label popover heading is built from rows other than the host session rows',
   );
   sourceMatch(
     fs.readFileSync(path.join(__dirname, 'turnlabels.ts'), 'utf8'),
-    /const title = sessions\.find\(\(row\) => row\.id === session\)\?\.label \?\? session;/,
+    /const title = sessions\.find\(\(row\) => row\.id === headingSession\)\?\.label \?\? session;/,
     'the label popover heading reads a field other than the sixty-character label',
   );
   sourceMatch(
@@ -34230,7 +35146,7 @@ test('session details keeps native controls and dialog lifetime outside the redr
   // Remove railName from the session rows supplied to the session view.
   sourceMatch(
     panelHostSource,
-    /const \{ railName: _railName, \.\.\.row \} = source;\s*return \{\s*\.\.\.row,/,
+    /railName: _railName,\s*fullLabel: _fullLabel,\s*\[agyRowSource\]: _source,\s*\[sessionRowDetails\]: _details,\s*\.\.\.row\s*\} = source;\s*return \{\s*\.\.\.row,/,
     "the render payload's session rows still carry the rail's own wide name",
   );
 });
@@ -34251,6 +35167,7 @@ test('a session row carries a bounded rail name, past the sixty-character cut th
   const built = esbuild.transformSync(
     `export function build(all, sessions, parentEdges, fullLabels, AGENT_NAMES, formatWhen, formatRelative, shortenTo, RAIL_NAME_LIMIT, fields) {
 const relativeChangeAt = () => 0;
+const sessionRowDetails = Symbol();
 class Rows {
 noteRailInstant() {}
 ${member}
@@ -37164,12 +38081,26 @@ test('reader parent navigation resolves adoption without following another panel
 
 test('reader heading projects catalog titles without changing delegated ownership', () => {
   const provider = Object.create(PanelProvider.prototype);
+  const cwd = tempDir('reader-heading-');
+  const source = (sessionId: string) => ({ sessionId, file: path.join(cwd, sessionId + '.jsonl'), agent: 'claude' });
   Object.assign(provider, {
     saved: normalizePanelState({ readerParents: { child: 'parent', missingChild: 'missing' } }),
     sessionRows: [
       { id: 'child', label: 'Child' },
-      { id: 'parent', label: 'Current title', hidden: true },
+      { id: 'parent', label: 'Current title', hidden: true, agentKey: 'claude', persisted: true },
+      { id: 'delegated', label: 'Delegated', agentKey: 'claude', persisted: true },
     ],
+    authoritativeCatalog: [source('parent'), source('delegated')],
+    claudeChildReferences: [
+      {
+        kind: 'dispatch',
+        agent: 'claude',
+        parentSessionId: 'parent',
+        sessionId: 'delegated',
+        file: source('delegated').file,
+      },
+    ],
+    repositoryScopeRoots: [cwd],
     sessionParentEdgeSet: { edges: new Map([['delegated', { parent: 'parent', relation: 'dispatched' }]]) },
   });
   const edges = provider.sessionParentEdgeSet.edges;
@@ -37180,6 +38111,14 @@ test('reader heading projects catalog titles without changing delegated ownershi
   provider.sessionRows.push({ id: 'missing', label: 'Rediscovered' });
   assert.equal(provider.parentOfShown('missingChild').id, 'missing');
   assert.deepEqual(provider.parentOfShown('delegated'), { id: 'parent', label: 'Renamed', relation: 'dispatched' });
+  provider.awaitingSessionRecords = {
+    delegated: { sessionId: 'delegated', agent: 'codex', cwd, replacesAgy: true },
+  };
+  assert.equal(
+    provider.parentOfShown('delegated'),
+    undefined,
+    'the pending Codex row inherited the recorded Claude parent',
+  );
   assert.equal(provider.sessionParentEdgeSet.edges, edges);
   assert.equal(edges.has('child'), false);
 });
@@ -43482,7 +44421,7 @@ test('catalog prefix resolution suspends through discovery progress failure canc
   const refresh = methodBody('async refresh(');
   const acceptance = refresh.slice(
     refresh.indexOf('if (!metadataAfterRender) {'),
-    refresh.indexOf('for (const session of Object.keys(this.awaitingSessionRecords))'),
+    refresh.indexOf('this.settlePendingSessionRecords(Object.keys(this.awaitingSessionRecords));'),
   );
   const accept = new Function(
     'all',
@@ -44011,6 +44950,2117 @@ async function coverageEnumerationFixture() {
   });
   return { provider, writes, root, workspace, worktree, projects, codex };
 }
+
+test('an unread walk retains a scoped unlisted Claude parent ahead of a late Antigravity admission', async () => {
+  const { provider, workspace, worktree, projects } = await coverageEnumerationFixture();
+  const id = '31a2aa13-6da5-4b28-89c0-032d72ddf063';
+  const f = agyCollisionFixture(provider);
+  provider.allSessions = PanelProvider.prototype['allSessions'];
+  provider.cache = new Map();
+  provider.admittedReadSources = new Map();
+  provider.history = new Map();
+  provider.repositoryScopeRoots = [workspace, worktree];
+  provider.folders = () => [workspace];
+  provider.repositoryScope = { snapshot: () => ({ ready: true, roots: [workspace, worktree], revision: 1 }) };
+  const folderPrint = workspace + '\0' + '1';
+  const scope = JSON.stringify([workspace, worktree]);
+  const directory = path.join(projects, renameTranscripts.projectSlug(worktree));
+  const otherDirectory = path.join(projects, renameTranscripts.projectSlug(workspace));
+  fs.mkdirSync(directory);
+  fs.mkdirSync(otherDirectory);
+  const parent = path.join(directory, id.toUpperCase() + '.jsonl');
+  fs.writeFileSync(parent, JSON.stringify({ type: 'assistant', cwd: worktree }) + '\n');
+  provider.hasHumanPrompt = (source: SessionFile) => {
+    provider.humanScans.set(source.file, { found: false, complete: true });
+    return false;
+  };
+  const transcript = f.transcript(path.join(f.brain, id));
+  f.write(transcript, 'Antigravity waits for native ownership', workspace);
+  const list = () => {
+    const sources = provider.allSessions();
+    provider.authoritativeCatalog = provider.acceptSessionCoverage(sources, scope);
+    provider.authoritativeCatalogScope = scope;
+    return provider.authoritativeCatalog;
+  };
+  const mutableFs = createRequire(__filename)('node:fs') as typeof fs;
+  const readdir = fs.readdirSync.bind(fs);
+  let denied = directory;
+  const refused = vi.spyOn(mutableFs, 'readdirSync').mockImplementation(((file: fs.PathLike, options: any) => {
+    if (file === denied) throw Object.assign(new Error('unread native project'), { code: 'EACCES' });
+    return readdir(file, options);
+  }) as typeof fs.readdirSync);
+  syncBuiltinESMExports();
+  try {
+    denied = '';
+    assert.deepEqual(list(), []);
+    assert.deepEqual(provider.walkedClaude, [parent]);
+    denied = directory;
+    assert.deepEqual(list(), []);
+    assert.equal(provider.sourceEnumerations.claude.status, 'incomplete');
+    assert.equal(fs.existsSync(parent), true);
+
+    provider.startAgyDiscovery(folderPrint, [workspace, worktree]);
+    await vi.waitFor(() => assert.ok(provider.agyCatalog && !provider.agyScan.controller));
+    const [agy] = provider.agyCatalog.rows;
+    assert.equal(agy.sessionId, id);
+    assert.deepEqual(list(), [], 'an unread native parent released the Antigravity row');
+    assert.equal(provider.agyReadAdmission(agy), undefined);
+    assert.throws(() => f.command(id), /session ID is unknown or ambiguous/);
+
+    denied = '';
+    assert.deepEqual(list(), [], 'the same scoped native parent must still win after it is read');
+    denied = otherDirectory;
+    fs.unlinkSync(parent);
+    assert.deepEqual(
+      list().map((source: SessionFile) => source.file),
+      [transcript],
+    );
+    assert.equal(provider.sourceEnumerations.claude.status, 'incomplete');
+    assert.ok(provider.agyReadAdmission(agy));
+    assert.equal(f.command(id).turns[0]?.prompt, 'Antigravity waits for native ownership');
+  } finally {
+    refused.mockRestore();
+    syncBuiltinESMExports();
+    f.restore();
+  }
+});
+
+const encodeRollout = (zlib as { zstdCompressSync?: (input: Buffer) => Buffer }).zstdCompressSync;
+
+test.each(['scoped replacement ID', 'excluded plain twin', 'scoped guardian during an unread walk'] as const)(
+  'a qualified Codex opening releases the former Antigravity reservation: %s',
+  async (replacement) => {
+    if (replacement !== 'scoped replacement ID' && !encodeRollout) return;
+    const { provider, workspace, worktree, root, codex } = await coverageEnumerationFixture();
+    const id = '31a2aa13-6da5-4b28-89c0-032d72ddf064';
+    const f = agyCollisionFixture(provider);
+    const scope = JSON.stringify([workspace, worktree]);
+    provider.allSessions = PanelProvider.prototype['allSessions'];
+    provider.folders = () => [workspace];
+    provider.repositoryScope = { snapshot: () => ({ ready: true, roots: [workspace, worktree], revision: 1 }) };
+    provider.cache = new Map();
+    provider.admittedReadSources = new Map();
+    provider.history = new Map();
+    const day = path.join(codex, '2026', '11', '25');
+    fs.mkdirSync(day, { recursive: true });
+    const plain = path.join(day, `rollout-2026-11-25T18-00-00-${id}.jsonl`);
+    const twin = plain + '.zst';
+    const opening = (sessionId: string, cwd: string) => ({ sessionId, cwd, source: 'vscode' });
+    const write = (sessionId: string, cwd: string, file = plain) => {
+      fs.writeFileSync(
+        file,
+        JSON.stringify({ type: 'session_meta', payload: { id: sessionId, cwd, source: 'vscode' } }) + '\n',
+      );
+    };
+    const guardian = replacement === 'scoped guardian during an unread walk';
+    const compressed = replacement !== 'scoped replacement ID';
+    const initial = compressed ? twin : plain;
+    if (compressed) {
+      write(id, workspace);
+      fs.writeFileSync(twin, encodeRollout!(fs.readFileSync(plain)));
+      fs.unlinkSync(plain);
+      provider.compressedFacts.set(twin, {
+        file: twin,
+        ...revisionOf(fs.statSync(twin, { bigint: true })),
+        threadId: id,
+        opening: opening(id, workspace),
+      });
+    } else {
+      write(id, workspace);
+    }
+    const transcript = f.transcript(path.join(f.brain, id));
+    f.write(transcript, 'Antigravity after Codex ownership', workspace);
+    const list = (): SessionFile[] => {
+      const sources = provider.allSessions();
+      provider.authoritativeCatalog = provider.acceptSessionCoverage(sources, scope);
+      provider.authoritativeCatalogScope = scope;
+      return provider.authoritativeCatalog;
+    };
+    const unread = path.join(codex, '2025');
+    fs.mkdirSync(unread);
+    const mutableFs = createRequire(__filename)('node:fs') as typeof fs;
+    const readdir = mutableFs.readdirSync.bind(mutableFs);
+    let denied = false;
+    const refused = vi.spyOn(mutableFs, 'readdirSync').mockImplementation(((file: fs.PathLike, options: any) => {
+      if (denied && file === unread) throw Object.assign(new Error('unread rollout directory'), { code: 'EACCES' });
+      return readdir(file, options);
+    }) as typeof fs.readdirSync);
+    syncBuiltinESMExports();
+    try {
+      assert.deepEqual(
+        list().map(({ file, sessionId }) => [file, sessionId]),
+        [[initial, id]],
+      );
+      provider.startAgyDiscovery(workspace + '\0' + '1', [workspace, worktree]);
+      await vi.waitFor(() => assert.ok(provider.agyCatalog && !provider.agyScan.controller));
+      assert.deepEqual(
+        list().map(({ file, sessionId }) => [file, sessionId]),
+        [[initial, id]],
+      );
+      if (guardian) {
+        denied = true;
+        fs.writeFileSync(
+          twin,
+          encodeRollout!(
+            Buffer.from(
+              JSON.stringify({
+                type: 'session_meta',
+                payload: { id, cwd: workspace, source: 'vscode', thread_source: 'guardian_review' },
+              }) + '\n',
+            ),
+          ),
+        );
+        const qualified = await provider.qualifyCompressedOpening(twin, new AbortController().signal);
+        assert.equal(qualified?.hidden, true);
+        assert.equal(provider.installCompressedOpening(qualified), true);
+        assert.deepEqual(list(), [], 'incomplete acceptance restored the former visible Codex row');
+        assert.equal(provider.membershipCoverage.status, 'incomplete');
+        assert.equal(provider.agyReadAdmission(provider.agyCatalog.rows[0]), undefined);
+        return;
+      }
+      if (compressed) {
+        fs.unlinkSync(twin);
+        write(id, root);
+      } else {
+        denied = true;
+        write('replacement', workspace);
+      }
+      const accepted = list();
+      assert.equal(provider.sourceEnumerations.codex.status, denied ? 'incomplete' : 'complete');
+      assert.deepEqual(
+        accepted.filter(({ agent }) => agent === 'codex').map(({ file, sessionId }) => [file, sessionId]),
+        compressed ? [] : [[plain, 'replacement']],
+      );
+      assert.equal(f.command(id).turns[0]?.prompt, 'Antigravity after Codex ownership');
+      const restored = path.join(day, `rollout-2026-11-25T18-01-00-${id}.jsonl`);
+      fs.unlinkSync(plain);
+      write(id, workspace, restored);
+      assert.deepEqual(
+        list().map(({ file, sessionId }) => [file, sessionId]),
+        [[restored, id]],
+      );
+    } finally {
+      refused.mockRestore();
+      syncBuiltinESMExports();
+      f.restore();
+    }
+  },
+);
+
+test.skipIf(!encodeRollout)(
+  'unread Codex walks keep a qualified compressed reservation after a held row merge',
+  async () => {
+    const { provider, workspace, worktree, codex } = await coverageEnumerationFixture();
+    const id = '31a2aa13-6da5-4b28-89c0-032d72ddf065';
+    const f = agyCollisionFixture(provider);
+    const scope = JSON.stringify([workspace, worktree]);
+    provider.allSessions = PanelProvider.prototype['allSessions'];
+    provider.folders = () => [workspace];
+    provider.repositoryScope = { snapshot: () => ({ ready: true, roots: [workspace, worktree], revision: 1 }) };
+    provider.cache = new Map();
+    provider.admittedReadSources = new Map();
+    provider.history = new Map();
+    provider.compressedRowsHeld = new Map();
+    provider.updateSessionSpendSources = () => {};
+    const day = path.join(codex, '2026', '11', '25');
+    fs.mkdirSync(day, { recursive: true });
+    const twin = path.join(day, `rollout-2026-11-25T18-00-00-${id}.jsonl.zst`);
+    const record = JSON.stringify({ type: 'session_meta', payload: { id, cwd: workspace, source: 'vscode' } }) + '\n';
+    fs.writeFileSync(twin, encodeRollout!(Buffer.from(record)));
+    const transcript = f.transcript(path.join(f.brain, id));
+    f.write(transcript, 'Antigravity waits for the compressed session', workspace);
+    const mutableFs = createRequire(__filename)('node:fs') as typeof fs;
+    const readdir = mutableFs.readdirSync.bind(mutableFs);
+    let denied = false;
+    const refused = vi.spyOn(mutableFs, 'readdirSync').mockImplementation(((file: fs.PathLike, options: any) => {
+      if (denied && file === day) throw Object.assign(new Error('unread rollout directory'), { code: 'EACCES' });
+      return readdir(file, options);
+    }) as typeof fs.readdirSync);
+    const stat = mutableFs.statSync.bind(mutableFs);
+    const unreadStat = vi.spyOn(mutableFs, 'statSync').mockImplementation(((file: fs.PathLike, options: any) => {
+      if (denied && file === twin) throw Object.assign(new Error('unread compressed rollout'), { code: 'EACCES' });
+      return stat(file, options);
+    }) as typeof fs.statSync);
+    syncBuiltinESMExports();
+    try {
+      provider.authoritativeCatalog = provider.acceptSessionCoverage(provider.allSessions(), scope);
+      provider.authoritativeCatalogScope = scope;
+      assert.deepEqual(provider.authoritativeCatalog, []);
+      provider.compressedFacts.set(twin, {
+        file: twin,
+        ...revisionOf(fs.statSync(twin, { bigint: true })),
+        threadId: id,
+        opening: { sessionId: id, cwd: workspace },
+      });
+      provider.compressedRowsDirty = new Set([twin]);
+      const merged = provider.allSessions('settled');
+      assert.deepEqual(
+        merged.map((row: SessionFile) => row.file),
+        [twin],
+      );
+      provider.startAgyDiscovery(workspace + '\0' + '1', [workspace, worktree]);
+      await vi.waitFor(() => assert.ok(provider.agyCatalog && !provider.agyScan.controller));
+      assert.ok(provider.agyNativeReservations.has(id));
+      denied = true;
+      for (let walk = 0; walk < 2; walk++) {
+        provider.authoritativeCatalog = provider.acceptSessionCoverage(provider.allSessions(), scope);
+        assert.equal(provider.sourceEnumerations.codex.status, 'incomplete');
+      }
+      assert.deepEqual(provider.authoritativeCatalog, []);
+      assert.throws(() => f.command(id), /session ID is unknown or ambiguous/);
+      denied = false;
+      fs.unlinkSync(twin);
+      provider.authoritativeCatalog = provider.acceptSessionCoverage(provider.allSessions(), scope);
+      assert.equal(f.command(id).turns[0]?.prompt, 'Antigravity waits for the compressed session');
+    } finally {
+      unreadStat.mockRestore();
+      refused.mockRestore();
+      syncBuiltinESMExports();
+      f.restore();
+    }
+  },
+);
+
+test
+  .skipIf(!encodeRollout)
+  .each([
+    'replacement',
+    'unread twin',
+    'delayed entry',
+    'deleted day',
+    'deleted month',
+    'cold native first',
+    'cold Antigravity first',
+  ] as const)(
+  'a qualified compressed twin outside scope releases a plain Codex reservation: %s',
+  async (transition) => {
+    const { provider, root, workspace, worktree, codex } = await coverageEnumerationFixture();
+    const id = '31a2aa13-6da5-4b28-89c0-032d72ddf066';
+    const f = agyCollisionFixture(provider);
+    const scope = JSON.stringify([workspace, worktree]);
+    provider.allSessions = PanelProvider.prototype['allSessions'];
+    provider.folders = () => [workspace];
+    provider.repositoryScope = { snapshot: () => ({ ready: true, roots: [workspace, worktree], revision: 1 }) };
+    provider.cache = new Map();
+    provider.admittedReadSources = new Map();
+    provider.history = new Map();
+    provider.compressedRowsHeld = new Map();
+    provider.updateSessionSpendSources = () => {};
+    const day = path.join(codex, '2026', '11', '25');
+    fs.mkdirSync(day, { recursive: true });
+    const plain = path.join(day, `rollout-2026-11-25T18-00-00-${id}.jsonl`);
+    const twin = plain + '.zst';
+    const unrelated = path.join(day, 'rollout-2026-11-25T18-00-01-11031ba1-e72e-4f2a-b030-c842ddee70cb.jsonl.zst');
+    const opening = (cwd: string) =>
+      JSON.stringify({ type: 'session_meta', payload: { id, cwd, source: 'vscode' } }) + '\n';
+    fs.writeFileSync(plain, opening(workspace));
+    fs.writeFileSync(unrelated, encodeRollout!(Buffer.from(opening(workspace))));
+    const opened: string[] = [];
+    let bytes = 0;
+    const open = fs.promises.open.bind(fs.promises);
+    let pause: (() => Promise<void>) | undefined;
+    const handles = vi.spyOn(fs.promises, 'open').mockImplementation(async (file, flags, mode) => {
+      const handle = await open(file, flags, mode);
+      if (typeof file === 'string' && file.endsWith('.jsonl.zst')) {
+        opened.push(file);
+        const read = handle.read.bind(handle);
+        vi.spyOn(handle, 'read').mockImplementation((async (...args: any[]) => {
+          const part = await (read as (...args: any[]) => ReturnType<typeof read>)(...args);
+          bytes += part.bytesRead;
+          return part;
+        }) as typeof handle.read);
+        const stat = handle.stat.bind(handle);
+        let checks = 0;
+        vi.spyOn(handle, 'stat').mockImplementation((async (...args: any[]) => {
+          const sampled = await (stat as (...args: any[]) => ReturnType<typeof stat>)(...args);
+          if (++checks === 2 && pause) {
+            // Windows refuses to replace an open destination. The pathname check still follows this sample.
+            await handle.close();
+            await pause();
+          }
+          return sampled;
+        }) as typeof handle.stat);
+      }
+      return handle;
+    });
+    const transcript = f.transcript(path.join(f.brain, id));
+    f.write(transcript, 'Antigravity after the compressed replacement', workspace);
+    try {
+      const accept = (rows: SessionFile[]) => {
+        provider.authoritativeCatalog = provider.acceptSessionCoverage(rows, scope);
+        provider.authoritativeCatalogScope = scope;
+      };
+      if (transition === 'cold native first' || transition === 'cold Antigravity first') {
+        const prior = revisionOf(fs.statSync(plain, { bigint: true }));
+        fs.writeFileSync(twin, encodeRollout!(Buffer.from(opening(root))));
+        const actual = revisionOf(fs.statSync(twin, { bigint: true }));
+        assert.notEqual(actual.ino, prior.ino);
+        fs.unlinkSync(plain);
+        const unrelatedId = '11031ba1-e72e-4f2a-b030-c842ddee70cb';
+        for (let second = 2; second < 34; second++) {
+          const file = path.join(
+            day,
+            'rollout-2026-11-25T18-00-' + String(second).padStart(2, '0') + '-' + unrelatedId + '.jsonl.zst',
+          );
+          fs.writeFileSync(file, encodeRollout!(Buffer.from(opening(workspace).replace(id, unrelatedId))));
+          provider.compressedFacts.set(file, {
+            file,
+            ...revisionOf(fs.statSync(file, { bigint: true })),
+            threadId: unrelatedId,
+            opening: { sessionId: unrelatedId, cwd: workspace },
+          });
+        }
+        const oldEntry = {
+          file: twin,
+          threadId: id,
+          opening: { sessionId: id, cwd: workspace },
+          size: actual.size,
+          mtimeMs: actual.mtimeMs,
+          fileIdentity: { dev: prior.dev, ino: prior.ino },
+          title: { label: 'Title of the former checkout' },
+        };
+        if (transition === 'cold native first') provider.applyCompressedEntries([oldEntry]);
+        accept(provider.allSessions());
+        assert.ok(!provider.agyNativeReservations.has(id));
+        provider.startAgyDiscovery(workspace + '\0' + '1', [workspace, worktree]);
+        await vi.waitFor(() => assert.ok(provider.agyCatalog && !provider.agyScan.controller));
+        accept(provider.allSessions());
+        assert.equal(f.command(id).turns[0]?.prompt, 'Antigravity after the compressed replacement');
+        if (transition === 'cold Antigravity first') {
+          provider.applyCompressedEntries([oldEntry]);
+          accept(provider.withCompressedFactRows(provider.authoritativeCatalog));
+          assert.equal(f.command(id).turns[0]?.prompt, 'Antigravity after the compressed replacement');
+        }
+        accept(await provider.walkCatalog(new AbortController().signal, provider.refreshGeneration));
+        assert.equal(f.command(id).turns[0]?.prompt, 'Antigravity after the compressed replacement');
+        assert.deepEqual(opened, [twin]);
+        assert.equal(bytes, fs.statSync(twin).size);
+        assert.equal(
+          provider.authoritativeCatalog.filter((row: SessionFile) => row.sessionId === unrelatedId).length,
+          32,
+        );
+        return;
+      }
+      const native = provider.allSessions();
+      assert.deepEqual(
+        native.map((row: SessionFile) => row.file),
+        [plain],
+      );
+      accept(native);
+      provider.startAgyDiscovery(workspace + '\0' + '1', [workspace, worktree]);
+      await vi.waitFor(() => assert.ok(provider.agyCatalog && !provider.agyScan.controller));
+      fs.unlinkSync(plain);
+      fs.writeFileSync(twin, encodeRollout!(Buffer.from(opening(root))));
+      provider.compressedFacts.set(twin, { threadId: id, opening: { sessionId: id, cwd: workspace } });
+      const walk = () => provider.walkCatalog(new AbortController().signal, provider.refreshGeneration);
+      const released = () => {
+        assert.deepEqual(
+          provider.authoritativeCatalog.map((row: SessionFile) => row.file),
+          [transcript],
+        );
+        assert.equal(f.command(id).turns[0]?.prompt, 'Antigravity after the compressed replacement');
+      };
+      accept(await walk());
+      await vi.waitFor(() => assert.ok(!provider.agyScan.controller));
+      released();
+      for (let index = 0; index < 2; index++) {
+        accept(await walk());
+        released();
+      }
+      assert.deepEqual(opened, [twin], 'unchanged evidence must not reopen either compressed file');
+      assert.equal(bytes, fs.statSync(twin).size);
+
+      const stale = { file: twin, threadId: id, opening: { sessionId: id, cwd: workspace } };
+      provider.applyCompressedEntries([{ ...stale, ...revisionOf(fs.statSync(twin, { bigint: true })) }]);
+      accept(provider.withCompressedFactRows(provider.authoritativeCatalog));
+      released();
+      accept(provider.relistHeldCodex(provider.sourceEnumerations.codex));
+      released();
+      accept(provider.withHeldCompressedRows([...provider.authoritativeCatalog, { ...native[0], file: twin }]));
+      released();
+
+      fs.writeFileSync(twin, encodeRollout!(Buffer.from(opening(workspace))));
+      provider.applyCompressedEntries([{ ...stale, ...revisionOf(fs.statSync(twin, { bigint: true })) }]);
+      accept(await walk());
+      assert.deepEqual(
+        provider.authoritativeCatalog.map((row: SessionFile) => row.file),
+        [twin],
+      );
+      assert.ok(provider.agyNativeReservations.has(id));
+      const compressedClaim = {
+        ...stale,
+        ...revisionOf(fs.statSync(twin, { bigint: true })),
+      };
+      if (transition === 'unread twin') {
+        const mutableFs = createRequire(__filename)('node:fs') as typeof fs;
+        const readdir = mutableFs.readdirSync.bind(mutableFs);
+        let denied = false;
+        const unread = vi.spyOn(mutableFs, 'readdirSync').mockImplementation(((file: fs.PathLike, options: any) => {
+          if (denied && file === day) throw Object.assign(new Error('unread rollout directory'), { code: 'EACCES' });
+          return readdir(file, options);
+        }) as typeof fs.readdirSync);
+        syncBuiltinESMExports();
+        try {
+          fs.writeFileSync(plain, opening(workspace).replace(id, 'different-native-id'));
+          accept(await walk());
+          assert.equal(f.command(id).turns[0]?.prompt, 'Antigravity after the compressed replacement');
+          denied = true;
+          for (let attempt = 0; attempt < 2; attempt++) {
+            accept(provider.allSessions());
+            assert.equal(provider.sourceEnumerations.codex.status, 'incomplete');
+            assert.ok(provider.authoritativeCatalog.every((row: SessionFile) => row.file !== twin));
+            assert.equal(f.command(id).turns[0]?.prompt, 'Antigravity after the compressed replacement');
+          }
+          provider.applyCompressedEntries([{ ...compressedClaim, hash: 'late facts' }]);
+          accept(provider.withCompressedFactRows(provider.authoritativeCatalog));
+          assert.ok(provider.authoritativeCatalog.every((row: SessionFile) => row.file !== twin));
+          assert.equal(f.command(id).turns[0]?.prompt, 'Antigravity after the compressed replacement');
+          assert.ok(fs.statSync(plain).isFile());
+          denied = false;
+          fs.unlinkSync(plain);
+          accept(await walk());
+          assert.ok(provider.agyNativeReservations.has(id));
+        } finally {
+          unread.mockRestore();
+          syncBuiltinESMExports();
+        }
+        return;
+      }
+
+      if (transition === 'deleted day' || transition === 'deleted month') {
+        const retired = transition === 'deleted day' ? day : path.dirname(day);
+        const moved = path.join(root, 'retired-rollout');
+        fs.renameSync(retired, moved);
+        accept(await walk());
+        released();
+        provider.applyCompressedEntries([compressedClaim]);
+        accept(provider.withCompressedFactRows(provider.authoritativeCatalog));
+        released();
+        fs.mkdirSync(day, { recursive: true });
+        fs.writeFileSync(twin, encodeRollout!(Buffer.from(opening(workspace))));
+        accept(await walk());
+        assert.ok(provider.agyNativeReservations.has(id));
+        return;
+      }
+
+      fs.writeFileSync(twin, encodeRollout!(Buffer.from(opening(root))));
+      accept(await walk());
+      released();
+      accept(await walk());
+      released();
+      if (transition === 'delayed entry') {
+        fs.unlinkSync(twin);
+        accept(await walk());
+        assert.ok(!provider.qualifiedCompressedOpenings.has(normalizeFsPath(twin)));
+        released();
+        fs.writeFileSync(twin, encodeRollout!(Buffer.from(opening(root))));
+        provider.applyCompressedEntries([compressedClaim]);
+        accept(provider.withCompressedFactRows(provider.authoritativeCatalog));
+        released();
+        accept(await walk());
+        released();
+        fs.writeFileSync(twin, encodeRollout!(Buffer.from(opening(workspace))));
+        accept(await walk());
+        assert.ok(provider.agyNativeReservations.has(id));
+        return;
+      }
+
+      fs.writeFileSync(twin, encodeRollout!(Buffer.from(opening(workspace))));
+      const replacement = path.join(day, 'replacement');
+      fs.copyFileSync(twin, replacement);
+      const fixtureTime = new Date('2026-11-25T18:00:00.000Z');
+      fs.utimesSync(twin, fixtureTime, fixtureTime);
+      fs.utimesSync(replacement, fixtureTime, fixtureTime);
+      const previous = revisionOf(fs.statSync(twin, { bigint: true }));
+      const next = revisionOf(fs.statSync(replacement, { bigint: true }));
+      assert.equal(previous.size, next.size);
+      assert.equal(previous.mtimeMs, next.mtimeMs);
+      assert.notEqual(previous.ino, next.ino);
+      const duringOpening = async (change: () => void) => {
+        let reached!: () => void;
+        let unblock!: () => void;
+        const started = new Promise<void>((resolve) => (reached = resolve));
+        const resume = new Promise<void>((resolve) => (unblock = resolve));
+        pause = () => {
+          reached();
+          return resume;
+        };
+        const changing = walk();
+        try {
+          await Promise.race([started, changing.then(() => assert.fail('The targeted opening was not read'))]);
+          change();
+        } finally {
+          pause = undefined;
+          unblock();
+        }
+        return changing;
+      };
+      accept(await duringOpening(() => fs.renameSync(replacement, twin)));
+      released();
+      provider.applyCompressedEntries([{ ...stale, ...next }]);
+      accept(await walk());
+      assert.deepEqual(
+        provider.authoritativeCatalog.map((row: SessionFile) => row.file),
+        [twin],
+      );
+
+      fs.writeFileSync(twin, encodeRollout!(Buffer.from(opening(root))));
+      assert.equal(
+        await duringOpening(() => {
+          provider.agyScopeEpoch = (provider.agyScopeEpoch ?? 0) + 1;
+          provider.repositoryScope.snapshot = () => ({ ready: true, roots: [workspace, worktree], revision: 2 });
+        }),
+        null,
+      );
+      assert.equal(provider.qualifiedCompressedOpenings.get(normalizeFsPath(twin))?.source.cwd, workspace);
+      await walk();
+      await vi.waitFor(() => assert.ok(provider.agyCatalog && !provider.agyScan.controller));
+      accept(await walk());
+      released();
+      assert.ok(opened.every((file) => file === twin));
+    } finally {
+      handles.mockRestore();
+      f.restore();
+    }
+  },
+);
+
+test
+  .skipIf(!encodeRollout)
+  .each([
+    'unopposed',
+    'contested',
+    'second claimant',
+    'visible replan',
+    'replace guardian with cursor',
+    'replace guardian before cursor',
+    'replacement stays hidden',
+    'checkout changes on the same worker',
+    'checkout changes on the same worker with a split handoff',
+    'checkout changes with jointly oversized placements and resume data',
+    'restart with contradicting bytes during a refused header',
+    'restart without contradicting bytes during a refused header',
+    'restart with a different visible header and a refused body',
+    'restart with a changed visible cwd and a refused body',
+    'restart with a matching visible header and a refused body',
+    'restart with a different visible header during an openings lease',
+    'restart with a matching visible header during an openings lease',
+    'restart with a different visible header during a facts lease',
+    'restart with a matching visible header during a facts lease',
+    'restart with a matching visible header beyond the decoded limit',
+    'temporary plain twin during repair admission',
+    'replacement receives acknowledged adopted opening bounds: inline',
+    'replacement receives acknowledged adopted opening bounds: split',
+    'a returned name after interrupted delist: inline',
+    'a returned name after interrupted delist: split',
+  ] as const)(
+  'a shared machine opening withdraws a previously published compressed session: %s',
+  async (competition) => {
+    const { provider, workspace, worktree, codex, root } = await coverageEnumerationFixture();
+    const f = agyCollisionFixture(provider);
+    const returned = competition.startsWith('a returned name');
+    const settled = returned || competition.startsWith('replacement receives acknowledged adopted opening bounds');
+    const restart = !settled && competition.startsWith('replace');
+    const checkout = competition.startsWith('checkout changes');
+    const split = competition === 'checkout changes on the same worker with a split handoff';
+    const combined = competition.includes('jointly oversized');
+    const refused = competition.startsWith('restart');
+    const contradicted = competition === 'restart with contradicting bytes during a refused header';
+    const leased = competition.endsWith('during an openings lease');
+    const factsLeased = competition.endsWith('during a facts lease');
+    const bounded = competition.endsWith('beyond the decoded limit');
+    const masked = competition === 'temporary plain twin during repair admission';
+    const splitSettlements = settled && competition.endsWith(': split');
+    const refusedBody = competition.endsWith('a refused body') || leased || factsLeased || bounded;
+    const changedId = competition.includes('different visible header');
+    const changedCwd = competition.includes('changed visible cwd');
+    const changedHeader = changedId || changedCwd;
+    const formerGuardian = restart || checkout;
+    const restoreVisible = formerGuardian && competition !== 'replacement stays hidden';
+    const replan = competition === 'visible replan';
+    const roots = [workspace, worktree];
+    const scope = JSON.stringify(roots);
+    const folderPrint = workspace + '\0' + '1';
+    const id = '77dd4c7c-32bd-4b82-a81d-080a7305348f';
+    const keepId = 'd6158353-a693-4a54-ba63-2b99ef943135';
+    const successorId = changedId ? '44d8c2d5-3515-4c1e-a7ca-558f22c3fbb9' : id;
+    const day = path.join(codex, '2026', '11', '25');
+    fs.mkdirSync(day, { recursive: true });
+    const plain = path.join(day, 'rollout-2026-11-25T18-00-00-' + id + '.jsonl');
+    const file = plain + '.zst';
+    const keep = path.join(day, 'rollout-2026-11-25T18-00-01-' + keepId + '.jsonl.zst');
+    const transcript = f.transcript(path.join(f.brain, id));
+    const stores = { facts: path.join(root, 'workspace-facts'), openings: path.join(root, 'machine') };
+    const writer = new CompressedStoreHolder(stores.facts);
+    const openings = new CompressedStoreHolder(stores.openings);
+    const peer = new CompressedStoreHolder(path.join(root, 'peer-facts'));
+    const factsLease = new CompressedStoreHolder(stores.facts);
+    const signal = new AbortController().signal;
+    const at = new Date('2026-11-25T18:00:00Z');
+    const { spendRecordTotal } = await import('./projectspend.js');
+    const priced = (records: import('./projectspend').SpendFileIndex[]) =>
+      records
+        .map((record) => ({ file: record.file, ...spendRecordTotal(record, at.getTime()) }))
+        .sort((a, b) => a.file.localeCompare(b.file));
+    Object.assign(provider, {
+      allSessions: PanelProvider.prototype['allSessions'],
+      folders: () => [workspace],
+      repositoryScope: { snapshot: () => ({ ready: true, roots, revision: 1 }) },
+      repositoryScopeRoots: roots,
+      agyScopeEpoch: 1,
+      cache: new Map(),
+      admittedReadSources: new Map(),
+      history: new Map(),
+      compressedRowsHeld: new Map(),
+      compressedFactsRevision: 0,
+      compressedRolloutsRevision: 0,
+      compressedLaunch: 'placement-withdrawal',
+      compressedNameOnly: new Set(),
+      compressedSpendPicks: new WeakMap(),
+      projectSpendRevision: 0,
+    });
+    const message = (cwd: string, sessionId: string, prompt: string, tokens = 1397, hidden = false) =>
+      [
+        {
+          type: 'session_meta',
+          payload: { id: sessionId, cwd, source: 'vscode', ...(hidden ? { thread_source: 'guardian_review' } : {}) },
+        },
+        { type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn' } },
+        { type: 'turn_context', payload: { turn_id: 'turn', cwd, model: 'gpt-5.6-sol' } },
+        { type: 'event_msg', payload: { type: 'user_message', message: prompt } },
+        {
+          type: 'event_msg',
+          payload: { type: 'token_count', info: { last_token_usage: { input_tokens: tokens, output_tokens: 10 } } },
+        },
+        { type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn' } },
+      ]
+        .map((record) => JSON.stringify({ timestamp: at.toISOString(), ...record }))
+        .join('\n') + '\n';
+    const frames = [
+      message(workspace, id, 'Earlier native session', 1397, formerGuardian),
+      message(
+        changedCwd ? worktree : replan || restoreVisible || refused ? workspace : root,
+        successorId,
+        'Current native session',
+        3794,
+        formerGuardian && !restoreVisible,
+      ),
+    ].map((text) => encodeRollout!(Buffer.from(text)));
+    if (bounded || settled) {
+      const [opening, ...body] = message(workspace, id, 'Current native session', 3794).split('\n');
+      const longOpening = { ...JSON.parse(opening), padding: 'x'.repeat(1024 * 1024) };
+      frames.push(encodeRollout!(Buffer.from([JSON.stringify(longOpening), ...body].join('\n'))));
+    }
+    const size = Math.max(...frames.map((frame) => frame.length)) + 8;
+    const place = (index: number) => {
+      const frame = frames[index];
+      const padding = Buffer.alloc(size - frame.length);
+      padding.writeUInt32LE(0x184d2a50);
+      padding.writeUInt32LE(padding.length - 8, 4);
+      fs.writeFileSync(file, Buffer.concat([frame, padding]));
+      fs.utimesSync(file, at, at);
+    };
+    const decode = async (target: string) => {
+      const derivation = new RolloutDerivation(target, normalizeWorkspace(workspace));
+      const result = await streamCompressedRollout(target, (chunk) => derivation.push(chunk));
+      assert.ok(result.kind === 'decoded', JSON.stringify(result));
+      return compressedFactsFromDerivation(target, result, derivation);
+    };
+    provider.offerCompressedRows = () => {};
+    const batches: CompressedBackfillBatch[] = [];
+    let acknowledgeBound = () => {};
+    const boundObserved = new Promise<void>((resolve) => (acknowledgeBound = resolve));
+    let acknowledgeRepair = () => {};
+    const repairDelivered = new Promise<void>((resolve) => (acknowledgeRepair = resolve));
+    const trace = () => ({
+      schedule: competition,
+      batches: batches.map((batch) => ({
+        placements: batch.placements,
+        bodies: batch.entries.map(({ file, hash, decodedLength }) => ({ file, hash, decodedLength })),
+      })),
+      held: provider.compressedFacts.get(file)?.hash,
+      placed: provider.compressedPlacements?.get(normalizeFsPath(file)),
+      title: provider.compressedTitleOf(file)?.label,
+    });
+    const probes = path.join(root, 'rollout-reads');
+    const siblingProbes = path.join(root, 'sibling-reads');
+    const denyHeader = path.join(root, 'deny-header');
+    const denyBody = path.join(root, 'deny-body');
+    const leaseWait = path.join(root, 'lease-wait');
+    const openingRead = path.join(root, 'opening-read');
+    const repairReads = path.join(root, 'repair-reads');
+    const plans = path.join(root, 'plans');
+    const workerSource =
+      `
+      {
+        const fs = require('node:fs');
+        if (${combined}) {
+          const stat = fs.statSync;
+          fs.statSync = function (target, ...args) {
+            if (typeof target === 'string' && target.startsWith(${JSON.stringify(path.join(day, 'retained-'))}))
+              throw Object.assign(new Error('missing synthetic path'), { code: 'ENOENT' });
+            return stat.call(this, target, ...args);
+          };
+        }
+        const open = fs.promises.open;
+        fs.promises.open = function (target, ...args) {
+          if (${returned} && target === ${JSON.stringify(keep)}) fs.appendFileSync(${JSON.stringify(siblingProbes)}, 'read\\n');
+          if (target === ${JSON.stringify(file)}) {
+            const kind = new Error().stack.includes('streamCompressedRollout') ? 'body' : 'header';
+            fs.appendFileSync(${JSON.stringify(probes)}, kind + '\\n');
+            if (fs.existsSync(kind === 'header' ? ${JSON.stringify(denyHeader)} : ${JSON.stringify(denyBody)}))
+              return Promise.reject(Object.assign(new Error('refused ' + kind), { code: 'EACCES' }));
+          }
+          return open.call(this, target, ...args);
+        };
+      }
+    ` +
+      getProgressiveWorkerSource() +
+      (settled
+        ? `
+      {
+        const fs = require('node:fs');
+        const run = CompressedBackfill.prototype.run;
+        CompressedBackfill.prototype.run = async function () {
+          await run.call(this);
+          if (!this.running && this.names.has(${JSON.stringify(file)})) fs.appendFileSync(${JSON.stringify(plans)}, 'idle');
+        };
+      }
+    `
+        : '') +
+      (masked
+        ? `
+      {
+        const fs = require('node:fs');
+        const deriveBody = CompressedBackfill.prototype.deriveBody;
+        CompressedBackfill.prototype.deriveBody = function (job) {
+          if (job.file === ${JSON.stringify(file)} && job.repair)
+            fs.appendFileSync(${JSON.stringify(repairReads)}, 'body');
+          return deriveBody.call(this, job);
+        };
+      }
+    `
+        : '') +
+      (leased || factsLeased || bounded
+        ? `
+      {
+        const fs = require('node:fs');
+        const target = ${JSON.stringify(file)};
+        const durable = CompressedStoreHolder.prototype.durable;
+        CompressedStoreHolder.prototype.durable = function (entries) {
+          if (this.directory === ${JSON.stringify(factsLeased ? stores.facts : stores.openings)} && entries.some(({ file }) => file === target))
+            fs.writeFileSync(${JSON.stringify(leaseWait)}, String(!this.held && this.pending > 0));
+          return durable.call(this, entries);
+        };
+        const retry = CompressedStoreHolder.prototype.retryLater;
+        CompressedStoreHolder.prototype.retryLater = function () {
+          if (this.directory === ${JSON.stringify(factsLeased ? stores.facts : stores.openings)}) this.retryDelay = () => 5000;
+          return retry.call(this);
+        };
+        const derive = CompressedBackfill.prototype.deriveOpening;
+        CompressedBackfill.prototype.deriveOpening = async function (job) {
+          const read = this.readFirst;
+          if (${factsLeased} && job.file === target) this.lastFlush = this.now();
+          this.readFirst = async (file, cap, report, stat, placement) => {
+            const work = { compressedBytes: 0, decodedBytes: 0 };
+            const line = await read(file, cap, report, stat, { ...placement, work });
+            if (file === target)
+              fs.writeFileSync(${JSON.stringify(openingRead)}, JSON.stringify({
+                cap, ...work, failed: !!report.failed, complete: line !== null,
+              }));
+            return line;
+          };
+          try {
+            return await derive.call(this, job);
+          } finally {
+            this.readFirst = read;
+          }
+        };
+      }
+    `
+        : '');
+    const reads = () => (fs.existsSync(probes) ? fs.readFileSync(probes, 'utf8').trim().split('\n') : []);
+    const requests: { bytes: number; placementBytes: number; names: boolean; part?: number; replyBytes?: number }[] =
+      [];
+    let dropPart: number | undefined;
+    let dropFinal = false;
+    let twinCreated = false;
+    const duringLease: boolean[] = [];
+    const makeWorker = () => {
+      const worker = new ProgressiveWorker(
+        workerSource,
+        () => true,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        (batch) => {
+          batches.push(batch);
+          if ((leased || factsLeased) && batch.placements?.some((notice) => notice.file === file))
+            duringLease.push((factsLeased ? factsLease : openings).held);
+          provider.applyCompressedBatch(batch);
+          if (batch.retiredRepairs?.some((receipt) => receipt.file === file && receipt.outcome === 'bounded'))
+            acknowledgeBound();
+          if (((masked && twinCreated) || settled) && batch.entries.some((entry) => entry.file === file && entry.spend))
+            acknowledgeRepair();
+        },
+      );
+      const run = worker.run.bind(worker);
+      worker.run = async (request, ...args) => {
+        if (request.kind !== 'compressed-load') return run(request, ...args);
+        const placementRecords = request.transferPart?.records.filter(([field]) => field === 'placement') ?? [];
+        const previous = { ...worker.transport };
+        const placementBytes =
+          request.placements?.length || placementRecords.length
+            ? Buffer.byteLength(JSON.stringify(request.placements ?? placementRecords))
+            : 0;
+        if (masked && !twinCreated && request.repairs?.some((repair) => repair.file === file)) {
+          twinCreated = true;
+          fs.writeFileSync(plain, message(root, id, 'Temporary plain twin'));
+        }
+        const result = await run(request, ...args);
+        requests.push({
+          bytes: worker.transport.requestJsonBytes - previous.requestJsonBytes,
+          placementBytes,
+          names: !!request.compressed,
+          part: request.transferPart?.part ?? request.transfer?.part,
+          replyBytes: worker.transport.replyJsonBytes - previous.replyJsonBytes,
+        });
+        if (combined) assert.ok(requests.at(-1)!.bytes <= COMPRESSED_BATCH_BYTES, JSON.stringify(requests.at(-1)));
+        if (dropPart !== undefined && request.transferPart?.part === dropPart) {
+          dropPart = undefined;
+          return null;
+        }
+        if (dropFinal && request.transfer) {
+          dropFinal = false;
+          return null;
+        }
+        return result;
+      };
+      return worker;
+    };
+    let worker = makeWorker();
+    provider.progressiveWorker = worker;
+    const load = {
+      kind: 'compressed-load' as const,
+      stores,
+      backfill: { workspace, roots, launch: 'placement-withdrawal' },
+      repairScope: 1,
+    };
+    provider.compressedStorePaths = () => stores;
+    const take = (value: import('./progressiveworker').ProgressiveValue | undefined) => {
+      if (value?.kind === 'compressed-load') provider.applyCompressedEntries(value.entries);
+    };
+    const poll = async (first = false) => {
+      if ((checkout || refused || masked || settled) && !first) {
+        assert.equal(await provider.runCompressedLoad(stores, take), true);
+        return;
+      }
+      const request = restart || checkout || refused ? provider.compressedLoadRequest(stores) : load;
+      const sent = {
+        ...request,
+        ...(first && provider.compressedRolloutsToSend(stores)),
+        ...(refused && first && !fs.existsSync(denyHeader) && { backfill: undefined }),
+      };
+      if (restart && process.env.ARC_ROUND26_MEASURE)
+        console.log(
+          JSON.stringify({
+            schedule: competition,
+            resumedPlacementBytes: Buffer.byteLength(JSON.stringify(request.placements ?? [])) - 2,
+          }),
+        );
+      const reply = await worker.run(sent, 1, signal);
+      assert.ok(reply?.value.kind === 'compressed-load' && reply.value.done);
+      provider.applyCompressedEntries(reply.value.entries);
+      if (checkout || refused || masked || (restart && competition === 'replace guardian with cursor'))
+        provider.noteCompressedLoad(
+          reply.value,
+          worker.currentThreadId,
+          provider.agyScopeEpoch,
+          sent.compressedRevision,
+          stores,
+        );
+    };
+    const list = async (walk = false, incomplete = false): Promise<string[]> => {
+      const enumeration = incomplete && {
+        ...provider.sourceEnumerations.codex,
+        status: 'incomplete',
+        uncertain: [codex],
+      };
+      const rows = walk
+        ? await provider.walkCatalog(signal, 1, undefined, enumeration || undefined)
+        : provider.allSessions();
+      provider.authoritativeCatalog = provider.acceptSessionCoverage(rows, scope);
+      provider.authoritativeCatalogScope = scope;
+      return provider.authoritativeCatalog.map((row: SessionFile) => row.file).sort();
+    };
+    try {
+      place(0);
+      fs.writeFileSync(keep, encodeRollout!(Buffer.from(message(workspace, keepId, 'Unrelated native session'))));
+      const original = await decode(file);
+      const other = await decode(keep);
+      assert.ok(other.spend);
+      if (settled) place(2);
+      const initial = settled
+        ? {
+            ...original,
+            ...revisionOf(fs.statSync(file, { bigint: true })),
+            adopted: true,
+            decodedLength: undefined,
+            undercount: true,
+            spendOrigin: undefined,
+          }
+        : masked
+          ? { ...original, undercount: true, spendOrigin: undefined }
+          : original;
+      assert.deepEqual(
+        await writer.append(formerGuardian ? [other] : [initial, other]),
+        formerGuardian ? [true] : [true, true],
+      );
+      writer.dispose();
+      if (!refusedBody)
+        assert.deepEqual(
+          await openings.append(
+            (settled || (refused && !contradicted) ? [other] : [original, other]).map(compressedOpeningEntry),
+          ),
+          settled || (refused && !contradicted) ? [true] : [true, true],
+        );
+      if (returned) openings.dispose();
+      assert.deepEqual(await list(), []);
+      provider.noteCompressedRollouts([file, keep]);
+      await poll(true);
+      if (settled) {
+        provider.compressedFacts.set(file, { ...initial, spend: undefined, spendNeedsRepair: true });
+        await list(true);
+        provider.reconcileCompressedRepair(file);
+        await poll();
+        const key = normalizeFsPath(file);
+        assert.ok(provider.compressedRepairs?.get(key) || provider.settledCompressedRepairs?.get(key));
+        await boundObserved;
+        const acknowledged = provider.settledCompressedRepairs?.get(key);
+        assert.equal(acknowledged?.outcome, 'bounded');
+        const priorReads = reads();
+        assert.ok(priorReads.length > 0 && priorReads.every((read) => read === 'header'));
+        if (returned) {
+          const revision = revisionOf(fs.statSync(file, { bigint: true }));
+          const previousMembership = acknowledged!.membership;
+          const siblingReads = fs.existsSync(siblingProbes) ? fs.readFileSync(siblingProbes, 'utf8') : '';
+          const parked = path.join(root, 'Returned.zst');
+          fs.renameSync(file, parked);
+          await list(true);
+          assert.equal(provider.compressedRollouts.has(file), false);
+          assert.equal(provider.settledCompressedRepairs.get(key), undefined);
+          const discovery = (split: boolean) => {
+            const parent = {
+              file: path.join(root, 'Absent.jsonl'),
+              sessionId: 'absent',
+              agent: 'claude' as const,
+              size: 0,
+              mtimeMs: 0,
+              padding: '',
+            };
+            const request = {
+              kind: 'claude-children' as const,
+              parents: split ? [parent] : [],
+              codexChildren: [],
+              repositoryRoots: roots,
+              sliceReply: true as const,
+            };
+            if (split) {
+              const baseBytes = Buffer.byteLength(
+                JSON.stringify({ id: Number.MAX_SAFE_INTEGER, generation: 3, request }),
+              );
+              parent.padding = 'x'.repeat(COMPRESSED_BATCH_BYTES - baseBytes - 64);
+            }
+            return request;
+          };
+          const admitted = () => provider.compressedRolloutsToSend(stores);
+          const beforeDelist = worker.transport.requestJsonBytes;
+          const beforeParts = worker.transport.requests;
+          const removed = await worker.run(discovery(true), 2, signal, undefined, undefined, {
+            current: () => worker.transport.requestJsonBytes === beforeDelist,
+            names: admitted,
+          });
+          assert.equal(removed, null);
+          const interruptedBytes = worker.transport.requestJsonBytes - beforeDelist;
+          const interruptedRequests = worker.transport.requests - beforeParts;
+          assert.equal(interruptedRequests, 1);
+          assert.ok(interruptedBytes > 0 && interruptedBytes < COMPRESSED_BATCH_BYTES);
+
+          fs.renameSync(parked, file);
+          provider.noteCompressedRollouts([file]);
+          await list(true);
+          provider.compressedFacts.set(file, { ...initial, spend: undefined, spendNeedsRepair: true });
+          provider.reconcileCompressedRepair(file);
+          const claim = provider.compressedRepairs?.get(key)?.repair;
+          assert.ok(claim && claim.membership !== previousMembership);
+          place(0);
+          assert.deepEqual(revisionOf(fs.statSync(file, { bigint: true })), revision);
+          provider.applyCompressedBatch({
+            entries: [],
+            backfillMs: 0,
+            repairScope: provider.agyScopeEpoch,
+            repairStores: stores,
+            retiredRepairs: [acknowledged!],
+            repairEvidence: [acknowledged!.evidence],
+          });
+          assert.equal(provider.compressedRepairs?.get(key)?.repair, claim);
+          assert.equal(provider.settledCompressedRepairs.get(key), undefined);
+          const beforeReturn = worker.transport.requestJsonBytes;
+          const beforeReturnParts = worker.transport.requests;
+          const answer = await worker.run(discovery(splitSettlements), 3, signal, undefined, undefined, {
+            current: () => true,
+            names: admitted,
+          });
+          assert.ok(answer?.value.kind === 'claude-children' || answer?.value.kind === 'claude-children-progress');
+          assert.equal(answer.value.compressedNames?.revision, provider.compressedRolloutsRevision);
+          const returnedBytes = worker.transport.requestJsonBytes - beforeReturn;
+          const returnedRequests = worker.transport.requests - beforeReturnParts;
+          assert.equal(returnedRequests, splitSettlements ? 3 : 1);
+          await poll();
+          await repairDelivered;
+          assert.deepEqual(await list(true), [file, keep].sort());
+          assert.equal(provider.compressedTitleOf(file)?.label, 'Earlier native session');
+          assert.equal(f.command(id).provider, 'codex');
+          assert.ok(original.spend);
+          assert.deepEqual(priced(provider.compressedSpendPick([])), priced([original.spend, other.spend]));
+          assert.deepEqual(reads(), [...priorReads, 'header', 'body']);
+          assert.equal(fs.existsSync(siblingProbes) ? fs.readFileSync(siblingProbes, 'utf8') : '', siblingReads);
+          const report = process.env.ARC_READER_TRANSFER_MEASURE;
+          if (report)
+            fs.appendFileSync(
+              report,
+              JSON.stringify({
+                competition,
+                interruptedBytes,
+                interruptedRequests,
+                returnedBytes,
+                returnedRequests,
+                reads: reads(),
+                siblingReads: 0,
+              }) + '\n',
+            );
+          return;
+        }
+        worker.stop();
+        fs.unlinkSync(plans);
+        worker = makeWorker();
+        provider.progressiveWorker = worker;
+        const existingRequests = requests.length;
+        if (splitSettlements) {
+          // Keep the real receipt alongside proof records that make the wire use more than one part.
+          for (let n = 0; n < 18; n++) {
+            const file = path.join(day, `unavailable-${n}.jsonl.zst`);
+            provider.compressedRollouts.add(file);
+            provider.settledCompressedRepairs.set(normalizeFsPath(file), {
+              ...acknowledged,
+              file,
+              evidence: { ...acknowledged.evidence, file },
+              openingHash: '0'.repeat(250_000),
+            });
+          }
+          provider.compressedRolloutsRevision++;
+          dropFinal = true;
+        }
+        await poll();
+        const replacementRequests = requests.slice(existingRequests);
+        assert.ok(replacementRequests.every(({ bytes }) => bytes <= COMPRESSED_BATCH_BYTES));
+        if (splitSettlements) {
+          assert.ok(replacementRequests.length >= 4, JSON.stringify(replacementRequests));
+          assert.equal(replacementRequests.at(-2)?.part, replacementRequests.at(-1)?.part);
+        } else assert.equal(replacementRequests.length, 1);
+        await vi.waitFor(() => assert.ok(fs.existsSync(plans), 'the replacement did not finish planning'));
+        assert.deepEqual(reads(), priorReads, 'replacement repeated an acknowledged physical read');
+        assert.deepEqual(priced(provider.compressedSpendPick([])), priced([other.spend]));
+        if (!splitSettlements) {
+          assert.ok(original.spend);
+          const priorRevision = revisionOf(fs.statSync(file, { bigint: true }));
+          place(0);
+          assert.deepEqual(revisionOf(fs.statSync(file, { bigint: true })), priorRevision);
+          assert.deepEqual(await openings.append([compressedOpeningEntry(original)]), [true]);
+          await poll();
+          await repairDelivered;
+          assert.deepEqual(await list(true), [file, keep].sort());
+          assert.equal(provider.compressedTitleOf(file)?.label, 'Earlier native session');
+          assert.equal(f.command(id).provider, 'codex');
+          assert.deepEqual(priced(provider.compressedSpendPick([])), priced([original.spend, other.spend]));
+          assert.deepEqual(reads(), [...priorReads, 'body']);
+        }
+        return;
+      }
+      if (masked) {
+        assert.ok(original.spend && other.spend);
+        assert.equal(provider.compressedFacts.get(file)?.spendNeedsRepair, true);
+        assert.deepEqual(await list(true), [file, keep].sort());
+        assert.deepEqual(priced(provider.compressedSpendPick([])), priced([other.spend]));
+        await poll();
+        await vi.waitFor(() =>
+          assert.ok(batches.some((batch) => batch.retiredRepairs?.some((repair) => repair.file === file))),
+        );
+        assert.deepEqual(await list(true), [keep]);
+        fs.unlinkSync(plain);
+        await list(true);
+        await poll();
+        await repairDelivered;
+        assert.deepEqual(priced(provider.compressedSpendPick([])), priced([original.spend, other.spend]));
+        await vi.waitFor(async () => assert.deepEqual(await list(true), [file, keep].sort()));
+        assert.equal(provider.compressedTitleOf(file)?.label, 'Earlier native session');
+        assert.equal(f.command(id).provider, 'codex');
+        assert.equal(fs.readFileSync(repairReads, 'utf8'), 'body');
+        const finishedReads = reads();
+        await poll();
+        assert.deepEqual(reads(), finishedReads);
+        return;
+      }
+      if (refused) {
+        if (fs.existsSync(probes)) fs.unlinkSync(probes);
+        const revision = revisionOf(fs.statSync(file, { bigint: true }));
+        assert.ok(original.opening && original.hash && original.spend && other.spend);
+        provider.applyCompressedBatch({
+          repairScope: 1,
+          memberships: [[file, provider.compressedMemberships.get(file)]],
+          placements: [
+            { file, revision, opening: { sessionId: id, cwd: workspace, hidden: false }, hash: original.hash },
+          ],
+          entries: [],
+          backfillMs: 0,
+        });
+        assert.deepEqual(await list(true), [file, keep].sort());
+        assert.equal(f.command(id).provider, 'codex');
+        assert.deepEqual(priced(provider.compressedSpendPick([])), priced([original.spend, other.spend]));
+        worker.stop();
+        place(bounded ? 2 : contradicted || refusedBody ? 1 : 0);
+        assert.deepEqual(revisionOf(fs.statSync(file, { bigint: true })), revision);
+        const current = await decode(file);
+        if (leased) {
+          assert.deepEqual(await openings.append([compressedOpeningEntry(other)]), [true]);
+          assert.equal(openings.held, true);
+          duringLease.length = 0;
+        }
+        if (factsLeased) {
+          assert.deepEqual(await factsLease.append([other]), [true]);
+          assert.equal(factsLease.held, true);
+        }
+        if (contradicted) {
+          assert.notEqual(current.hash, original.hash);
+          assert.deepEqual(await openings.append([compressedOpeningEntry(current)]), [true]);
+        }
+        const refusal = refusedBody ? denyBody : denyHeader;
+        const firstReads = refusedBody ? ['header', 'body'] : ['header'];
+        if (!factsLeased) fs.writeFileSync(refusal, '');
+        worker = makeWorker();
+        provider.progressiveWorker = worker;
+        await poll();
+        if (leased || factsLeased) {
+          await vi.waitFor(() => assert.equal(fs.readFileSync(leaseWait, 'utf8'), 'true'));
+          assert.equal(JSON.parse(fs.readFileSync(openingRead, 'utf8')).complete, true);
+          assert.deepEqual(reads(), factsLeased ? ['header', 'body'] : ['header']);
+          assert.equal((factsLeased ? factsLease : openings).held, true);
+          if (changedHeader) {
+            await vi.waitFor(() => assert.equal(provider.compressedTitleOf(file), undefined), { timeout: 2500 });
+            assert.deepEqual(duringLease, [true]);
+            provider.applyCompressedEntries([original]);
+            assert.deepEqual(await list(true), [keep]);
+            assert.throws(() => f.command(id), /membership|unknown or ambiguous/);
+            assert.deepEqual(priced(provider.compressedSpendPick([])), priced([other.spend]));
+          } else {
+            await poll();
+            assert.equal(provider.compressedTitleOf(file)?.label, 'Earlier native session');
+            assert.deepEqual(duringLease, []);
+            assert.deepEqual(await list(true), [file, keep].sort());
+            assert.equal(f.command(id).provider, 'codex');
+            assert.deepEqual(priced(provider.compressedSpendPick([])), priced([original.spend, other.spend]));
+          }
+          if (factsLeased) factsLease.dispose();
+          else {
+            fs.unlinkSync(refusal);
+            openings.dispose();
+          }
+          await vi.waitFor(() => assert.equal(provider.compressedTitleOf(file)?.label, 'Current native session'), {
+            timeout: 9000,
+          });
+          assert.deepEqual(await list(true), [file, keep].sort());
+          assert.equal(f.command(successorId).provider, 'codex');
+          assert.ok(current.spend);
+          assert.deepEqual(priced(provider.compressedSpendPick([])), priced([current.spend, other.spend]));
+          assert.deepEqual(reads(), ['header', 'body']);
+          if (process.env.ARC_ROUND29_MEASURE)
+            console.log(
+              JSON.stringify({
+                competition,
+                duringLease,
+                reads: reads(),
+                priced: priced(provider.compressedSpendPick([])),
+              }),
+            );
+          return;
+        }
+        if (bounded) {
+          const expectedSpend = priced([original.spend, other.spend]);
+          const check = async () => {
+            await vi.waitFor(() => {
+              const observed = JSON.parse(fs.readFileSync(openingRead, 'utf8'));
+              assert.equal(observed.complete, false);
+              assert.equal(observed.failed, false);
+              assert.ok(observed.decodedBytes >= observed.cap);
+            });
+            await poll();
+            assert.equal(provider.compressedTitleOf(file)?.label, 'Earlier native session');
+            assert.deepEqual(await list(true), [file, keep].sort());
+            assert.equal(f.command(id).provider, 'codex');
+            assert.deepEqual(priced(provider.compressedSpendPick([])), expectedSpend);
+            assert.ok(!batches.some((batch) => batch.placements?.some((p) => p.file === file && !p.opening)));
+          };
+          await check();
+          worker.stop();
+          await vi.waitFor(() => assert.equal(fs.existsSync(path.join(stores.openings, STORE_LOCK)), false));
+          assert.deepEqual(
+            await openings.append([{ ...compressedOpeningEntry(original), opening: null, hash: undefined }]),
+            [true],
+          );
+          openings.dispose();
+          fs.unlinkSync(openingRead);
+          worker = makeWorker();
+          provider.progressiveWorker = worker;
+          await poll();
+          await check();
+          assert.deepEqual(reads(), ['header', 'header']);
+          if (process.env.ARC_ROUND29_MEASURE)
+            console.log(
+              JSON.stringify({
+                competition,
+                reads: reads(),
+                opening: JSON.parse(fs.readFileSync(openingRead, 'utf8')),
+                priced: priced(provider.compressedSpendPick([])),
+              }),
+            );
+          return;
+        }
+        await vi.waitFor(() => assert.deepEqual(reads(), firstReads), { timeout: 4500 });
+        if (contradicted || changedHeader) {
+          await vi.waitFor(() => assert.equal(provider.compressedTitleOf(file), undefined), { timeout: 2500 });
+          const withdrawal = batches.flatMap((batch) => batch.placements ?? []).find((notice) => notice.file === file);
+          assert.ok(withdrawal && !withdrawal.hash && !withdrawal.opening);
+          provider.applyCompressedEntries([original]);
+          assert.deepEqual(await list(true), [keep]);
+          assert.throws(() => f.command(id), /membership|unknown or ambiguous/);
+          assert.deepEqual(priced(provider.compressedSpendPick([])), priced([other.spend]));
+          fs.unlinkSync(refusal);
+          if (!refusedBody) assert.deepEqual(await openings.append([compressedOpeningEntry(current)]), [true]);
+          await poll();
+          await vi.waitFor(() => assert.equal(provider.compressedTitleOf(file)?.label, 'Current native session'), {
+            timeout: 12_000,
+          });
+          assert.deepEqual(await list(true), [file, keep].sort());
+          assert.equal(f.command(successorId).provider, 'codex');
+          if (changedId) assert.throws(() => f.command(id), /membership|unknown or ambiguous/);
+          assert.ok(current.spend);
+          assert.deepEqual(priced(provider.compressedSpendPick([])), priced([current.spend, other.spend]));
+          if (refusedBody) assert.deepEqual(reads(), [...firstReads, 'header', 'body']);
+          else assert.deepEqual(reads(), ['header', 'header', 'body']);
+          provider.applyCompressedEntries([original]);
+          assert.equal(provider.compressedTitleOf(file)?.label, 'Current native session');
+          assert.deepEqual(priced(provider.compressedSpendPick([])), priced([current.spend, other.spend]));
+        } else {
+          await poll();
+          assert.equal(provider.compressedTitleOf(file)?.label, 'Earlier native session');
+          assert.deepEqual(await list(true), [file, keep].sort());
+          assert.equal(f.command(id).provider, 'codex');
+          assert.deepEqual(priced(provider.compressedSpendPick([])), priced([original.spend, other.spend]));
+          assert.ok(!batches.some((batch) => batch.placements?.some((p) => p.file === file)));
+          assert.deepEqual(reads(), firstReads);
+        }
+        if (process.env.ARC_ROUND27_MEASURE)
+          console.log(
+            JSON.stringify({ ...trace(), reads: reads(), requests, priced: priced(provider.compressedSpendPick([])) }),
+          );
+        return;
+      }
+      if (formerGuardian) {
+        await vi.waitFor(() => assert.ok(batches.some((batch) => batch.placements?.some((p) => p.file === file))));
+        assert.equal(provider.compressedFacts.has(file), false, 'the old guardian has no workspace facts');
+        assert.deepEqual(await list(true), [keep]);
+        if (!checkout) worker.stop();
+        const revision = revisionOf(fs.statSync(file, { bigint: true }));
+        if (restoreVisible) place(1);
+        if (checkout) fs.utimesSync(file, at, new Date(at.getTime() + 1000));
+        else assert.deepEqual(revisionOf(fs.statSync(file, { bigint: true })), revision);
+        const current = await decode(file);
+        if (restoreVisible) assert.deepEqual(await openings.append([compressedOpeningEntry(current)]), [true]);
+        if (competition === 'replace guardian before cursor') {
+          provider.applyCompressedEntries([current]);
+          assert.deepEqual(await list(true), [keep], 'facts alone lifted the guardian gate');
+          assert.throws(() => f.command(id), /membership|unknown or ambiguous/);
+        }
+        if (checkout) {
+          const nested = path.join(workspace, 'nested');
+          fs.mkdirSync(nested);
+          let output = 'worktree ' + workspace + '\0worktree ' + worktree + '\0';
+          let now = at.getTime();
+          const time = vi.spyOn(Date, 'now').mockImplementation(() => now);
+          const scopeChanges: string[] = [];
+          provider.repositoryScopeChanged = () => scopeChanges.push('roots');
+          const refreshFrom = provider.refreshFrom;
+          provider.refreshFrom = (source: string) => scopeChanges.push(source);
+          const repository: RepositoryScope = provider.createRepositoryScope({ run: async () => output });
+          provider.repositoryScope = repository;
+          try {
+            repository.snapshot([workspace]);
+            await vi.waitFor(() => assert.ok(repository.snapshot([workspace]).ready));
+            assert.deepEqual(repository.snapshot([workspace]).roots, roots);
+            output += 'worktree ' + nested + '\0';
+            now += REPOSITORY_SCOPE_REFRESH_MS;
+            repository.snapshot([workspace]);
+            await vi.waitFor(() => assert.equal(provider.agyScopeEpoch, 2));
+            assert.deepEqual(scopeChanges, ['roots', 'checkouts']);
+            assert.deepEqual(repository.snapshot([workspace]).roots, roots);
+            assert.ok(repository.checkoutSnapshot().includes(nested));
+          } finally {
+            time.mockRestore();
+            provider.refreshFrom = refreshFrom;
+            repository.dispose();
+          }
+          provider.repositoryScope = { snapshot: () => ({ ready: true, roots, revision: 1 }) };
+          const thread = worker.currentThreadId;
+          const listed = provider.compressedRolloutsRevision;
+          if (!split) {
+            provider.applyCompressedEntries([current]);
+            assert.deepEqual(await list(true), [keep], 'facts alone lifted the previous guardian gate');
+          }
+          if (split) {
+            const guardian = provider.compressedPlacements.get(normalizeFsPath(file)).placement;
+            const excess = [path.join(day, 'retained-one.jsonl.zst'), path.join(day, 'retained-two.jsonl.zst')];
+            for (const retained of excess) {
+              provider.compressedRollouts.add(retained);
+              provider.compressedPlacements.set(normalizeFsPath(retained), {
+                placement: { ...guardian, file: retained, hash: 'd'.repeat(2_200_000) },
+              });
+            }
+            dropPart = 0;
+            const first = requests.length;
+            assert.equal(await provider.runCompressedLoad(stores, take), false);
+            assert.equal(requests.length, first + 1);
+            assert.equal(provider.compressedTitleOf(file), undefined);
+            assert.equal(provider.compressedPlacementScope.scope, 1);
+            await poll();
+            const parts = requests.slice(first);
+            assert.deepEqual(
+              parts.map(({ part }) => part),
+              [0, 0, 1, 2],
+            );
+            assert.ok(parts.every(({ bytes }) => bytes <= COMPRESSED_BATCH_BYTES));
+            assert.ok(parts.slice(0, -1).every(({ placementBytes }) => placementBytes > 0));
+            assert.equal(parts.at(-1)?.placementBytes, 0);
+            for (const retained of excess) provider.compressedRollouts.delete(retained);
+          } else if (combined) {
+            const retained = provider.compressedPlacements.get(normalizeFsPath(file)).placement;
+            const files = Array.from({ length: 2_700 }, (_, n) => path.join(day, `retained-${n}.jsonl.zst`));
+            const oldCursor = provider.compressedLoadCursor;
+            assert.ok(oldCursor?.consumed.length);
+            const suffix = '古"\\'.repeat(105);
+            const oldNames = provider.compressedNameOnly;
+            provider.compressedNameOnly = new Set(oldNames);
+            for (const [index, fake] of files.entries()) {
+              provider.compressedRollouts.add(fake);
+              provider.compressedPlacements.set(normalizeFsPath(fake), {
+                placement: {
+                  ...retained,
+                  file: fake,
+                  opening: { ...retained.opening, cwd: workspace + suffix },
+                },
+              });
+              provider.compressedNameOnly.add(`store-only-${index}-${suffix}`);
+            }
+            worker.stop();
+            worker = makeWorker();
+            provider.progressiveWorker = worker;
+            const unpadded = provider.compressedLoadRequest(stores);
+            const partsOnly = Buffer.byteLength(JSON.stringify(unpadded.placements));
+            const missingBytes = 5 * 1024 * 1024 + 1 - partsOnly - Buffer.byteLength(JSON.stringify(unpadded.resume));
+            if (missingBytes > 0) provider.compressedNameOnly.add('padding-' + 'r'.repeat(missingBytes));
+            const request = provider.compressedLoadRequest(stores);
+            const resumeOnly = Buffer.byteLength(JSON.stringify(request.resume));
+            assert.ok(partsOnly < COMPRESSED_BATCH_BYTES && resumeOnly < COMPRESSED_BATCH_BYTES);
+            assert.ok(partsOnly + resumeOnly > 5 * 1024 * 1024);
+            const stringify = JSON.stringify;
+            let overflow = 0;
+            const serializer = vi.spyOn(JSON, 'stringify').mockImplementation((value, replacer, space) => {
+              if (
+                value?.request?.placements?.length === request.placements.length &&
+                value.request.resume?.nameOnly?.length === request.resume.nameOnly.length
+              ) {
+                overflow++;
+                throw new RangeError('Invalid string length');
+              }
+              return Reflect.apply(stringify, JSON, [value, replacer, space]);
+            });
+            let start = requests.length;
+            try {
+              dropPart = 1;
+              const interrupted = requests.length;
+              assert.equal(await provider.runCompressedLoad(stores, take), false);
+              assert.deepEqual(
+                requests.slice(interrupted).map(({ part }) => part),
+                [0, 1],
+              );
+              assert.equal(provider.compressedLoadCursor, oldCursor);
+              assert.equal(provider.compressedTitleOf(file), undefined);
+              assert.deepEqual(priced(provider.compressedSpendPick([])), priced([other.spend]));
+              start = requests.length;
+              dropFinal = true;
+              await poll();
+              const envelopes = requests.slice(start);
+              assert.ok(
+                envelopes.every(({ bytes }) => bytes <= COMPRESSED_BATCH_BYTES),
+                JSON.stringify(envelopes),
+              );
+              assert.ok(envelopes.length >= 4, JSON.stringify(envelopes));
+              assert.equal(
+                envelopes.at(-2)?.part,
+                envelopes.at(-1)?.part,
+                'a lost final reply did not retry its commit',
+              );
+              assert.equal(provider.compressedLoadCursor.worker, worker.currentThreadId);
+              const consumed = provider.compressedLoadCursor.consumed as [string, number][];
+              assert.ok(
+                consumed.length &&
+                  consumed.every(([input, end]) => end === fs.statSync(path.join(stores.facts, input)).size),
+              );
+              assert.ok(provider.compressedFacts.get(keep)?.spend);
+            } finally {
+              serializer.mockRestore();
+              assert.equal(overflow, 0, 'the host serialized the restart aggregate above the string ceiling');
+            }
+            for (const fake of files) {
+              provider.compressedRollouts.delete(fake);
+              provider.compressedPlacements.delete(normalizeFsPath(fake));
+            }
+            provider.compressedNameOnly = oldNames;
+            if (process.env.ARC_ROUND28_MEASURE || process.env.ARC_ROUND29_MEASURE)
+              console.log(
+                JSON.stringify({ schedule: competition, partsOnly, resumeOnly, envelopes: requests.slice(start) }),
+              );
+          } else await poll();
+          if (!combined) {
+            assert.equal(requests.at(-1)?.names, false, 'the checkout update resent the same list');
+            assert.equal(worker.currentThreadId, thread);
+          }
+          assert.equal(provider.compressedRolloutsRevision, listed);
+        } else {
+          worker = makeWorker();
+          provider.progressiveWorker = worker;
+          await poll(true);
+        }
+        if (!restoreVisible) {
+          assert.deepEqual(await list(true), [keep]);
+          assert.equal(provider.compressedFacts.has(file), false);
+          assert.deepEqual(reads(), [], 'an unchanged guardian started a rollout read');
+          assert.deepEqual(provider.compressedSpendPick([]), [other.spend]);
+          assert.throws(() => f.command(id), /membership|unknown or ambiguous/);
+          return;
+        }
+        await vi.waitFor(
+          () =>
+            assert.equal(provider.compressedTitleOf(file)?.label, 'Current native session', JSON.stringify(trace())),
+          { timeout: 4500 },
+        );
+        assert.deepEqual(await list(true), [file, keep].sort());
+        assert.equal(f.command(id).provider, 'codex');
+        assert.ok(current.spend && spendRecordTotal(current.spend, at.getTime()).dollars > 0);
+        assert.deepEqual(priced(provider.compressedSpendPick([])), priced([current.spend, other.spend]));
+        if (checkout) {
+          provider.applyCompressedBatch(
+            batches.find((b) => b.repairScope === 1 && b.placements?.some((p) => p.file === file))!,
+          );
+          await poll();
+          assert.equal(provider.compressedTitleOf(file)?.label, 'Current native session');
+          assert.equal(f.command(id).provider, 'codex');
+          assert.equal(requests.at(-1)?.placementBytes, 0);
+          assert.equal(requests.at(-1)?.names, false);
+          if (process.env.ARC_ROUND27_MEASURE)
+            console.log(
+              JSON.stringify({
+                ...trace(),
+                reads: reads(),
+                requests,
+                priced: priced(provider.compressedSpendPick([])),
+              }),
+            );
+        } else if (process.env.ARC_ROUND26_MEASURE)
+          console.log(JSON.stringify({ ...trace(), priced: priced(provider.compressedSpendPick([])) }));
+        return;
+      }
+      if (!replan && competition !== 'unopposed') {
+        f.write(transcript, 'Antigravity after the native departure', workspace);
+        provider.startAgyDiscovery(folderPrint, roots);
+        await vi.waitFor(() => assert.ok(provider.agyCatalog && !provider.agyScan.controller));
+      }
+      assert.deepEqual(await list(true), [file, keep].sort());
+      const held = provider.authoritativeCatalog.find((row: SessionFile) => row.file === file);
+      assert.ok(provider.sessionReadAdmitted(held));
+      assert.equal(f.command(id).provider, 'codex');
+      assert.equal(provider.compressedTitleOf(file)?.label, 'Earlier native session');
+      const spend: [] = [];
+      assert.deepEqual(new Set(provider.compressedSpendPick(spend)), new Set([original.spend, other.spend]));
+
+      if (competition === 'second claimant') {
+        const second = path.join(day, 'rollout-2026-11-25T18-01-00-' + id + '.jsonl');
+        fs.writeFileSync(second, message(workspace, id, 'Another native claimant'));
+        provider.rememberAgyNativeRows([{ agent: 'codex', file: second, sessionId: id, cwd: workspace }]);
+      }
+      const stat = revisionOf(fs.statSync(file, { bigint: true }));
+      place(1);
+      assert.deepEqual(revisionOf(fs.statSync(file, { bigint: true })), stat);
+      const current = await decode(file);
+      const moved = replan
+        ? { entry: current, adopted: true, durable: (await openings.append([compressedOpeningEntry(current)]))[0] }
+        : await recordCompressedAdoption(
+            { twin: file, plain, plainMtimeMs: at.getTime(), opening: original.opening!, spend: original.spend },
+            peer,
+            openings,
+          );
+      assert.ok(moved.adopted && moved.durable && moved.entry.hash !== original.hash);
+
+      await poll();
+      if (replan) {
+        await vi.waitFor(
+          () =>
+            assert.equal(provider.compressedTitleOf(file)?.label, 'Current native session', JSON.stringify(trace())),
+          { timeout: 4500 },
+        );
+        assert.deepEqual(await list(true), [file, keep].sort());
+        assert.equal(provider.compressedTitleOf(file)?.label, 'Current native session');
+        assert.equal(f.command(id).provider, 'codex');
+        assert.ok(current.spend && spendRecordTotal(current.spend, at.getTime()).dollars > 0);
+        assert.deepEqual(priced(provider.compressedSpendPick(spend)), priced([current.spend, other.spend]));
+        assert.deepEqual(reads(), ['header', 'body']);
+        const addedId = '47c62d38-36bd-4547-9be2-0dd2af85ccfd';
+        const added = path.join(day, 'rollout-2026-11-25T18-02-00-' + addedId + '.jsonl.zst');
+        fs.writeFileSync(
+          added,
+          encodeRollout!(Buffer.from(message(workspace, addedId, 'Unrelated guardian', 0, true))),
+        );
+        assert.deepEqual(await openings.append([compressedOpeningEntry(await decode(added))]), [true]);
+        await list(true);
+        const reply = await worker.run(
+          { ...load, compressed: [file, keep, added], compressedRevision: provider.compressedRolloutsRevision },
+          1,
+          signal,
+        );
+        assert.ok(reply?.value.kind === 'compressed-load');
+        await vi.waitFor(() => assert.ok(batches.some((batch) => batch.placements?.some((p) => p.file === added))), {
+          timeout: 4500,
+        });
+        assert.deepEqual(await list(true), [file, keep].sort(), 'the unchanged session vanished after replanning');
+        assert.equal(provider.compressedTitleOf(file)?.label, 'Current native session');
+        assert.equal(f.command(id).provider, 'codex');
+        assert.deepEqual(priced(provider.compressedSpendPick(spend)), priced([current.spend, other.spend]));
+        if (process.env.ARC_ROUND26_MEASURE)
+          console.log(
+            JSON.stringify({
+              schedule: competition,
+              target: file,
+              batches: batches.map((batch) => ({
+                placements: batch.placements,
+                bodies: batch.entries.map(({ file, decodedLength }) => ({ file, decodedLength })),
+              })),
+            }),
+          );
+        assert.deepEqual(reads(), ['header', 'body'], 'an unchanged opening started another rollout read');
+        const notices = batches.flatMap((batch) => batch.placements ?? []).filter((p) => p.file === file);
+        assert.equal(notices.filter((p) => p.hash === current.hash).length, 1);
+        assert.equal(notices.at(-1)?.hash, current.hash);
+        return;
+      }
+      await vi.waitFor(
+        () => {
+          assert.equal(provider.compressedTitleOf(file), undefined, 'the host retained the former native title');
+          assert.deepEqual(
+            provider.compressedSpendPick(spend),
+            [other.spend],
+            'the host retained the former Project cost',
+          );
+        },
+        { timeout: 4500 },
+      );
+      assert.throws(() => f.command(id), /membership|unknown or ambiguous/);
+      await vi.waitFor(
+        () =>
+          assert.ok(
+            batches.some((batch) => batch.placements?.some(({ opening }) => opening?.cwd === root)),
+            'the qualified outside opening did not reach the host',
+          ),
+        { timeout: 5000 },
+      );
+      const next = await list(true);
+      assert.ok(!next.includes(file) && next.includes(keep));
+      if (competition === 'contested') {
+        assert.ok(next.includes(transcript));
+        assert.equal(f.command(id).turns[0]?.prompt, 'Antigravity after the native departure');
+      }
+      if (competition === 'second claimant') assert.ok(!next.includes(transcript));
+
+      const firstBatchCount = batches.length;
+      provider.applyCompressedEntries([original]);
+      await poll();
+      assert.deepEqual(await list(true, true), next);
+      assert.equal(provider.sourceEnumerations.codex.status, 'incomplete');
+      assert.deepEqual(await list(true), next);
+      assert.deepEqual(provider.compressedSpendPick(spend), [other.spend]);
+      worker.stop();
+      worker = makeWorker();
+      await poll(true);
+      assert.deepEqual(await list(true), next);
+      assert.deepEqual(provider.compressedSpendPick(spend), [other.spend]);
+      assert.ok(firstBatchCount > 0);
+      if (process.env.ARC_ROUND25_MEASURE)
+        console.log(JSON.stringify({ competition, batches, stat, latestHash: moved.entry.hash }));
+    } finally {
+      worker.stop();
+      writer.dispose();
+      openings.dispose();
+      peer.dispose();
+      factsLease.dispose();
+      f.restore();
+    }
+  },
+);
+
+const guardianDeliverySchedules = [
+  'before discovery',
+  'after discovery',
+  'name removed',
+  'stale plain before discovery',
+  'stale plain after discovery',
+  'plain restored',
+  'transient actual twin before discovery',
+  'transient actual twin after discovery',
+  'actual twin remains through follows',
+  'transient actual twin with refused stat',
+  'transient actual twin across scope change',
+  'transient actual twin with compressed removal',
+] as const;
+
+test.skipIf(!encodeRollout).each(guardianDeliverySchedules)(
+  'a guardian changed before the batch flush reserves its physical ID: %s',
+  async (timing) => {
+    const { provider, workspace, worktree, codex, root } = await coverageEnumerationFixture();
+    const f = agyCollisionFixture(provider);
+    const roots = [workspace, worktree];
+    const scope = JSON.stringify(roots);
+    const folderPrint = workspace + '\0' + '1';
+    const id = '7ee9f755-d402-4783-ab84-9080112a39ae';
+    const earlierId = '77dd4c7c-32bd-4b82-a81d-080a7305348f';
+    const differentId = '00000000-0000-4000-a000-000000000000';
+    const day = path.join(codex, '2026', '11', '25');
+    fs.mkdirSync(day, { recursive: true });
+    const filename = (suffix: string) => path.join(day, 'rollout-2026-11-25T18-00-00-' + suffix + '.jsonl.zst');
+    const earlier = filename(earlierId);
+    const guardian = filename(differentId);
+    const plain = guardian.slice(0, -'.zst'.length);
+    const plainMessage =
+      JSON.stringify({ type: 'session_meta', payload: { id: differentId, cwd: workspace, source: 'vscode' } }) + '\n';
+    const masked = timing.startsWith('stale plain') || timing === 'plain restored';
+    const transient = timing.startsWith('transient actual twin');
+    const remains = timing === 'actual twin remains through follows';
+    let refuse = false;
+    let bodyStarts = 0;
+    const transcript = f.transcript(path.join(f.brain, id));
+    Object.assign(provider, {
+      allSessions: PanelProvider.prototype['allSessions'],
+      folders: () => [workspace],
+      repositoryScope: { snapshot: () => ({ ready: true, roots, revision: 1 }) },
+      repositoryScopeRoots: roots,
+      agyScopeEpoch: 1,
+      cache: new Map(),
+      admittedReadSources: new Map(),
+      history: new Map(),
+      compressedRowsHeld: new Map(),
+      compressedFactsRevision: 0,
+    });
+    provider.offerCompressedRows = () => {};
+    const openings = new CompressedStoreHolder(path.join(root, 'machine'));
+    const facts = new CompressedStoreHolder(path.join(root, 'facts'));
+    const factWrites = vi.spyOn(facts, 'append');
+    let clock = 0;
+    const pathChecks: string[] = [];
+    const flushes = new Map<() => void, number>();
+    const batches: CompressedBackfillBatch[] = [];
+    const advance = (delta: number) => {
+      clock += delta;
+      for (const [flush, at] of flushes)
+        if (at <= clock) {
+          flushes.delete(flush);
+          flush();
+        }
+    };
+    const backfill = new CompressedBackfill({
+      facts,
+      openings,
+      workspace,
+      roots,
+      launch: 'deferred-guardian',
+      busy: () => false,
+      known: () => new Map(),
+      inFolders: (folders) => (cwd) => folders.includes(cwd),
+      now: () => clock,
+      observeStat: (target) => {
+        if (target === guardian || target === plain) pathChecks.push(target);
+        return refuse && target === guardian ? undefined : observeRolloutStat(target);
+      },
+      schedule: (delay, run) => {
+        flushes.set(run, clock + delay);
+        return () => flushes.delete(run);
+      },
+      stream: async () => {
+        bodyStarts++;
+        assert.fail('a guardian started a body read');
+      },
+      post: (batch) => {
+        batches.push(batch);
+        provider.applyCompressedBatch(batch);
+      },
+    });
+    backfill.setRepairScope(1);
+    const write = (file: string, id: string): CompressedFactEntry => {
+      const line = JSON.stringify({
+        type: 'session_meta',
+        payload: { id, cwd: workspace, source: 'vscode', thread_source: 'guardian_review' },
+      });
+      fs.writeFileSync(file, encodeRollout!(Buffer.from(line + '\n')));
+      const { size, mtimeMs, dev, ino } = revisionOf(fs.statSync(file, { bigint: true }));
+      return {
+        file,
+        pairKey: compressedPairKey(file),
+        ...compressedEntryVersions(),
+        size,
+        mtimeMs,
+        fileIdentity: { dev, ino },
+        threadId: id,
+        opening: openingRecordOf(line),
+        physicalOpening: true,
+        hash: 'previous bytes',
+      };
+    };
+    const signal = new AbortController().signal;
+    const list = async (complete = true) => {
+      const enumeration = complete
+        ? undefined
+        : {
+            ...provider.sourceEnumerations.codex,
+            status: 'incomplete',
+            uncertain: [day],
+            files: provider.sourceEnumerations.codex.files.filter((file: string) => file !== plain),
+          };
+      const rows = await provider.walkCatalog(signal, 1, undefined, enumeration);
+      provider.authoritativeCatalog = provider.acceptSessionCoverage(rows, scope);
+      provider.authoritativeCatalogScope = scope;
+      return provider.authoritativeCatalog.map((row: SessionFile) => row.file);
+    };
+    const discover = async () => {
+      f.write(transcript, 'Antigravity with a guardian namesake', workspace);
+      provider.startAgyDiscovery(folderPrint, roots);
+      await vi.waitFor(() => assert.ok(provider.agyCatalog?.rows.length && !provider.agyScan.controller));
+    };
+    const idle = () => vi.waitFor(() => assert.equal(Reflect.get(backfill, 'running'), false));
+    try {
+      assert.deepEqual(await openings.append([write(earlier, earlierId)]), [true]);
+      assert.deepEqual(await list(), []);
+      backfill.setNames([earlier]);
+      await vi.waitFor(() => assert.equal(flushes.size, 1));
+      await idle();
+      advance(0);
+      await vi.waitFor(() => assert.equal(batches.length, 1));
+      if (
+        timing === 'after discovery' ||
+        timing === 'name removed' ||
+        timing === 'stale plain after discovery' ||
+        timing === 'transient actual twin after discovery'
+      ) {
+        await discover();
+        assert.deepEqual(await list(), [transcript]);
+        assert.equal(f.command(id).turns[0]?.prompt, 'Antigravity with a guardian namesake');
+      }
+      const first = write(guardian, id);
+      assert.deepEqual(await openings.append([first]), [true]);
+      if (masked) {
+        fs.writeFileSync(plain, plainMessage);
+        assert.ok((await list()).includes(plain));
+        fs.unlinkSync(plain);
+      }
+      provider.compressedRollouts.add(guardian);
+      backfill.setNames([earlier, guardian]);
+      await vi.waitFor(() => assert.equal(flushes.size, 1, 'the guardian did not queue behind the preceding batch'));
+      await idle();
+      assert.deepEqual(await openings.append([{ ...first, hash: 'replacement bytes' }]), [true]);
+      backfill.setRoots(roots);
+      await idle();
+      if (timing === 'name removed') {
+        fs.unlinkSync(guardian);
+        provider.compressedRollouts.delete(guardian);
+        backfill.setNames([earlier]);
+        await idle();
+      }
+      if (transient || remains) fs.writeFileSync(plain, plainMessage);
+      advance(1000);
+      await idle();
+      if (transient || remains) {
+        const notices = () => batches.flatMap((batch) => batch.placements ?? []).filter((p) => p.file === guardian);
+        assert.deepEqual(notices(), [], 'a plain twin was present during delivery');
+        assert.equal(flushes.size, 0, 'the twin armed another delivery without a follow');
+        const before = pathChecks.length;
+        const follow = async () => {
+          backfill.setRoots(roots);
+          advance(1000);
+          await idle();
+          advance(0);
+          await idle();
+        };
+        if (remains) {
+          await follow();
+          await follow();
+          assert.ok(pathChecks.length - before <= 4, 'the twin was checked more than once per follow');
+          assert.deepEqual(notices(), []);
+          await discover();
+          assert.deepEqual(new Set(await list()), new Set([plain, transcript]));
+          assert.equal(f.command(id).turns[0]?.prompt, 'Antigravity with a guardian namesake');
+          assert.equal(f.command(differentId).provider, 'codex');
+          return;
+        }
+        if (timing === 'transient actual twin across scope change') {
+          provider.agyScopeEpoch++;
+          backfill.setRepairScope(provider.agyScopeEpoch);
+          await idle();
+          await follow();
+          assert.deepEqual(notices(), [], 'old-scope work reached the host while the twin remained');
+        }
+        fs.unlinkSync(plain);
+        if (timing === 'transient actual twin with compressed removal') fs.unlinkSync(guardian);
+        if (timing === 'transient actual twin with refused stat') {
+          refuse = true;
+          await follow();
+          assert.deepEqual(notices(), []);
+          assert.equal(flushes.size, 0);
+          refuse = false;
+        }
+        await follow();
+        if (timing === 'transient actual twin with compressed removal') {
+          await discover();
+          assert.deepEqual(await list(), [transcript]);
+          assert.equal(f.command(id).turns[0]?.prompt, 'Antigravity with a guardian namesake');
+          assert.deepEqual(notices(), []);
+          return;
+        }
+        assert.equal(notices().length, 1, 'the eligible follow did not deliver the parked guardian');
+        assert.equal(notices()[0].hash, 'replacement bytes');
+        const after = pathChecks.length;
+        await follow();
+        assert.equal(pathChecks.length, after, 'a settled guardian added filesystem checks to a quiet follow');
+        assert.equal(notices().length, 1);
+        if (timing !== 'transient actual twin after discovery') await discover();
+        assert.deepEqual(await list(), []);
+        assert.throws(() => f.command(id), /unknown or ambiguous/);
+        assert.ok(batches.every((batch) => !batch.entries.length));
+        assert.equal(bodyStarts, 0);
+        assert.equal(factWrites.mock.calls.length, 0);
+        if (process.env.ARC_ROUND27_MEASURE)
+          console.log(
+            JSON.stringify({
+              timing,
+              pathChecks,
+              bodyStarts,
+              factWrites: factWrites.mock.calls.length,
+              replyBytes: batches.map((batch) => Buffer.byteLength(JSON.stringify(batch))),
+            }),
+          );
+        return;
+      }
+      if (timing === 'plain restored') {
+        fs.writeFileSync(plain, plainMessage);
+        await list();
+        await discover();
+        assert.deepEqual(new Set(await list()), new Set([plain, transcript]));
+        assert.equal(f.command(id).turns[0]?.prompt, 'Antigravity with a guardian namesake');
+        assert.equal(f.command(differentId).provider, 'codex');
+        return;
+      }
+      if (timing === 'stale plain after discovery') {
+        assert.ok((await list(false)).includes(transcript));
+        assert.equal(f.command(id).turns[0]?.prompt, 'Antigravity with a guardian namesake');
+      }
+      if (timing === 'stale plain before discovery') {
+        await list();
+        await vi.waitFor(() => assert.ok(!provider.agyScan?.controller));
+      }
+      if (timing === 'before discovery' || timing === 'stale plain before discovery') await discover();
+      const projected = await list();
+      if (timing === 'name removed') {
+        assert.deepEqual(projected, [transcript]);
+        assert.equal(f.command(id).turns[0]?.prompt, 'Antigravity with a guardian namesake');
+        return;
+      }
+      assert.deepEqual(projected, [], 'the retained guardian notice did not reserve the physical ID');
+      assert.throws(() => f.command(id), /unknown or ambiguous/);
+      assert.equal(
+        batches.flatMap((batch) => batch.placements ?? []).find((placement) => placement.file === guardian)?.hash,
+        'replacement bytes',
+        'an older guardian notice was posted after a newer revision',
+      );
+      backfill.setRoots(roots);
+      await idle();
+      advance(1000);
+      assert.equal(batches.length, 2, 'an unchanged follow posted the guardian again');
+      if (process.env.ARC_ROUND25_MEASURE)
+        console.log(JSON.stringify({ timing, notices: batches.map((batch) => batch.placements), facts: 0, bodies: 0 }));
+    } finally {
+      backfill.dispose();
+      openings.dispose();
+      facts.dispose();
+      f.restore();
+    }
+  },
+);
+
+async function checkHiddenAgyCollision(guardianFirst: boolean, compressed: boolean, stalePlacement = false) {
+  const { provider, workspace, worktree, codex, root } = await coverageEnumerationFixture();
+  const id = '7ee9f755-d402-4783-ab84-9080112a39ae';
+  const f = agyCollisionFixture(provider);
+  const roots = [workspace, worktree];
+  const scope = JSON.stringify(roots);
+  const folderPrint = workspace + '\0' + '1';
+  provider.allSessions = PanelProvider.prototype['allSessions'];
+  provider.folders = () => [workspace];
+  provider.repositoryScope = { snapshot: () => ({ ready: true, roots, revision: 1 }) };
+  provider.cache = new Map();
+  provider.admittedReadSources = new Map();
+  provider.history = new Map();
+  provider.compressedRowsHeld = new Map();
+  provider.noteCompressedRowFacts = () => {};
+  const day = path.join(codex, '2026', '11', '25');
+  fs.mkdirSync(day, { recursive: true });
+  const guardian = path.join(
+    day,
+    compressed ? 'rollout-2026-11-25T18-00-00-00000000-0000-4000-a000-000000000000.jsonl.zst' : 'guardian.jsonl',
+  );
+  const transcript = f.transcript(path.join(f.brain, id));
+  let backfill: CompressedBackfill | undefined;
+  const firsts: string[] = [];
+  const batches: CompressedBackfillBatch[] = [];
+  const written: CompressedFactEntry[] = [];
+  const holder = {
+    directory: path.join(root, 'placement-store'),
+    append: async (entries: CompressedFactEntry[]) => {
+      written.push(...entries);
+      return entries.map(() => true);
+    },
+  } as unknown as CompressedStoreHolder;
+  const writeGuardian = (cwd: string) => {
+    const source = guardianFirst ? { subagent: { other: 'guardian' } } : 'vscode';
+    const threadSource = { thread_source: guardianFirst ? 'subagent' : 'guardian_review' };
+    const opening = JSON.stringify({ type: 'session_meta', payload: { id, cwd, source, ...threadSource } }) + '\n';
+    fs.writeFileSync(guardian, compressed ? encodeRollout!(Buffer.from(opening)) : opening);
+    if (compressed && !stalePlacement) {
+      const { size, mtimeMs } = revisionOf(fs.statSync(guardian, { bigint: true }));
+      provider.noteHiddenCompressedOpening({ file: guardian, cwd, sessionId: id, size, mtimeMs });
+    }
+  };
+  const settle = (rows = provider.allSessions()) => {
+    provider.authoritativeCatalog = provider.acceptSessionCoverage(rows, scope);
+    provider.authoritativeCatalogScope = scope;
+    return provider.authoritativeCatalog.map((row: SessionFile) => row.file);
+  };
+  try {
+    if (guardianFirst) {
+      writeGuardian(workspace);
+      assert.deepEqual(settle(), []);
+    }
+    f.write(transcript, 'Antigravity shares an ID with a hidden rollout', workspace);
+    provider.startAgyDiscovery(folderPrint, roots);
+    await vi.waitFor(() => assert.ok(provider.agyCatalog && !provider.agyScan.controller));
+    if (!guardianFirst) {
+      assert.deepEqual(settle(), [transcript]);
+      assert.equal(f.command(id).turns[0]?.prompt, 'Antigravity shares an ID with a hidden rollout');
+      writeGuardian(workspace);
+      if (stalePlacement) {
+        const stale = {
+          file: guardian,
+          pairKey: guardian,
+          ...compressedEntryVersions(),
+          size: fs.statSync(guardian).size - 1,
+          mtimeMs: fs.statSync(guardian).mtimeMs,
+          threadId: 'previous-session',
+          opening: openingRecordOf(
+            JSON.stringify({
+              type: 'session_meta',
+              payload: { id: 'previous-session', cwd: root, source: 'vscode' },
+            }),
+          ),
+        };
+        backfill = new CompressedBackfill({
+          facts: holder,
+          openings: holder,
+          workspace,
+          roots,
+          launch: 'guardian-placement',
+          busy: () => false,
+          known: () => new Map([[guardian, stale]]),
+          inFolders: () => (cwd) => cwd === workspace,
+          readFirst: async (...args) => {
+            firsts.push(args[0]);
+            return readCompressedFirstRecord(...args);
+          },
+          stream: async () => assert.fail('A hidden rollout queued a body read'),
+          post: (batch) => {
+            batches.push(batch);
+            provider.applyCompressedBatch(batch);
+          },
+        });
+        provider.compressedRollouts.add(guardian);
+        backfill.setNames([guardian]);
+        await vi.waitFor(() => assert.equal(batches.length, 1));
+        assert.deepEqual(firsts, [guardian]);
+        assert.equal(written.length, 1);
+        assert.equal(batches[0].entries.length, 0);
+        assert.equal(batches[0].placements?.[0].opening?.sessionId, id);
+      }
+    } else {
+      assert.throws(() => f.command(id), /session ID is unknown or ambiguous/);
+    }
+    const list = async () =>
+      compressed
+        ? settle(await provider.walkCatalog(new AbortController().signal, provider.refreshGeneration))
+        : settle();
+    for (let walk = 0; walk < 2; walk++) {
+      assert.deepEqual(await list(), []);
+      assert.throws(() => f.command(id), /session ID is unknown or ambiguous/);
+    }
+    writeGuardian(root);
+    assert.deepEqual(await list(), [transcript]);
+    return f.command(id).turns[0]?.prompt;
+  } finally {
+    backfill?.dispose();
+    f.restore();
+  }
+}
+
+test.skipIf(!encodeRollout)(
+  'stale backfill placement reports the current compressed guardian to the host',
+  async () => {
+    assert.equal(await checkHiddenAgyCollision(false, true, true), 'Antigravity shares an ID with a hidden rollout');
+  },
+);
+
+test.each([false, true])(
+  'a first scoped guardian Codex opening reserves an Antigravity ID: guardian first %s',
+  async (guardianFirst) =>
+    assert.equal(await checkHiddenAgyCollision(guardianFirst, false), 'Antigravity shares an ID with a hidden rollout'),
+);
+test.skipIf(!encodeRollout).each([false, true])(
+  'a first scoped guardian compressed opening reserves an Antigravity ID: guardian first %s',
+  async (guardianFirst) =>
+    assert.equal(await checkHiddenAgyCollision(guardianFirst, true), 'Antigravity shares an ID with a hidden rollout'),
+);
 
 test.each([false, true])('unchanged Claude opening reuse retains unread worktree admission: %s', async (missingCwd) => {
   const { provider, workspace, worktree, projects } = await coverageEnumerationFixture();
@@ -45034,7 +48084,9 @@ test('a complete walk drops the cached openings and stats of a deleted rollout a
   };
   const kept = rollout('11111111-1111-4111-8111-111111111111');
   const deleted = rollout('22222222-2222-4222-8222-222222222222');
-  const unvisited = path.join(codex, '2020', '01', '01', 'rollout-33333333-3333-4333-8333-333333333333.jsonl');
+  const linked = path.join(codex, '2020');
+  fs.symlinkSync(path.dirname(directory), linked, 'junction');
+  const unvisited = path.join(linked, '01', '01', 'rollout-33333333-3333-4333-8333-333333333333.jsonl');
   provider.codexStats = new codexModule.CodexStatCache(() => ({ isFile: true, size: 1, mtimeMs: 1 }));
   provider.allSessions();
   for (const file of [kept, deleted, unvisited]) provider.codexStats.get(file);
@@ -45058,7 +48110,7 @@ test.each([false, true])(
   async (admitted) => {
     const enumeration = methodBody('private walkedSessions(');
     const quarantineSource = ts.transpileModule(
-      `function quarantine(claude, codex, scope, sourceObservations = [], childSources = [], heldClaude, slicedClaude) { const roots = scope.roots; const physicalContext = { domain: "physical", scope: JSON.stringify(scope.roots), revision: String(this.coverageRevision) }; const walkedSessions = [...claude, ...codex]; ${enumeration.slice(enumeration.indexOf('this.enumeratedMembers ='), enumeration.indexOf('this.catalog = { folders: folderPrint', enumeration.indexOf('this.enumeratedMembers =')))} }`,
+      `function quarantine(claude, codex, scope, sourceObservations = [], childSources = [], heldClaude, slicedClaude) { const roots = scope.roots; const physicalContext = { domain: "physical", scope: JSON.stringify(scope.roots), revision: String(this.coverageRevision) }; const agy = []; const walkedSessions = [...claude, ...codex, ...agy]; ${enumeration.slice(enumeration.indexOf('this.enumeratedMembers ='), enumeration.indexOf('this.catalog = { folders: folderPrint', enumeration.indexOf('this.enumeratedMembers =')))} }`,
       { compilerOptions: { target: ts.ScriptTarget.ES2022 } },
     ).outputText;
     const quarantine = new Function(

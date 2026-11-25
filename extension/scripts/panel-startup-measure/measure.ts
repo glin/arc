@@ -1557,7 +1557,7 @@ export function compressedUnreadableMarks(
 }
 
 // Count the names a measured launch still decodes. An admitted file counts without a current decoded entry in the
-// workspace store. Any other name counts without a `.jsonl` twin and without a current opening in the machine store,
+// workspace store. Any other name counts without a `.jsonl` twin and without a current physical opening in the machine store,
 // because the launch reads its first record otherwise. An entry that this launch marked unreadable at the file's current
 // revision counts as settled, because this launch gets no decoded length and no opening for that revision. A mark that
 // its own store held before the launch leaves its name pending, because another launch retries the revision. A failed
@@ -1592,7 +1592,7 @@ export function compressedPending(home: string, input: CompressedPendingInput): 
       if (!decoded) pending++;
     } else {
       const entry = openings.get(file);
-      if (!entry || !compressedEntryCurrent(entry, stat)) pending++;
+      if (entry?.physicalOpening !== true || !compressedEntryCurrent(entry, stat)) pending++;
     }
   }
   return pending;
