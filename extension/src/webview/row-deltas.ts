@@ -184,6 +184,10 @@ export class RowDeltaSender {
   // The `rail` rows that the last call to `encode` carried. Null after a reset and after a message that is not keyed rows.
   lastRailChanges: RailRowChanges | null = null;
 
+  hasSessionRows(): boolean {
+    return this.sessions !== null;
+  }
+
   reset(reason: RowResetReason): void {
     this.rowTexts = new WeakMap();
     this.revision = null;

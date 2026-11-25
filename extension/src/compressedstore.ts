@@ -1,21 +1,29 @@
 // The stores of compressed rollout facts. One directory per store holds an `epoch` file, the lock `backfill.lock`,
 // segments of one JSON line per revision, compacted shards and the manifests that name them. Only the worker writes.
+import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { processIsRunning, temporaryWriterGone, writeFileAtomically } from './atomicfile';
 import { CODEX_META_VERSION, createExclusive, releaseCodexOpeningsLock, takeCodexOpeningsLock } from './codexopenings';
 import { openingRecordOf, readRolloutStat, ROLLOUT_NAME, type CodexSessionMeta } from './codex';
-import { hashCompressedRollout, readCompressedFirstRecord, sameStat } from './compressedrollouts';
+import {
+  hashCompressedRollout,
+  readCompressedFirstRecord,
+  sameStat,
+  type CompressedRepair,
+} from './compressedrollouts';
 import type { DerivedTitleEntry } from './derivedcache';
 import { METADATA_GENERATIONS } from './derivedcache';
+import { supportedFileIdentity, type FileRevision } from './transcript';
 import {
-  keepHigherSpend,
+  spendRecordTotal,
+  spendTotalCompare,
   normalizeWorkspace,
   PROJECT_SPEND_PARSER_GENERATIONS,
   type SpendFileIndex,
 } from './projectspend';
 
-// Versions the fields and the derivation of a stored entry. Bump it when a stored field or its derivation changes.
+// Versions the stored entry. Bump it when a change prevents reuse of an older entry.
 export const COMPRESSED_FACTS_VERSION = 1;
 export const COMPRESSED_FACTS_STORE = 'compressed-rollout-facts-v1';
 export const COMPRESSED_OPENINGS_STORE = 'compressed-rollout-openings-v1';
@@ -32,6 +40,7 @@ const RETRY_SPREAD_MS = 25_000;
 // A holder with no work left releases the lock after this time, so an idle window holds no lease.
 const IDLE_RELEASE_MS = 20_000;
 const READ_CHUNK = 64 * 1024;
+const FOLLOW_SLICE_BYTES = 4 * 1024 * 1024;
 // An entry above this many bytes drops its title entry. The row keeps a carried name and its cost.
 export const COMPRESSED_ENTRY_TITLE_BYTES = 1024 * 1024;
 // The worker posts at most this many bytes of entries in one batch, or one larger record.
@@ -53,7 +62,40 @@ export interface CompressedFactEntry {
   // The physical size and modification time of the `.jsonl.zst`. A name-only record has neither.
   size?: number;
   mtimeMs?: number;
+  fileIdentity?: Pick<FileRevision, 'dev' | 'ino'>;
+  // A slim seed keeps a conflict even after dropping the disagreeing facts.
+  identityConflict?: true;
+  // The seed still needs the compressed revision after the title and spend have been dropped.
+  factsNeedIdentity?: true;
+  // The source that supplied the amount, independently of the compressed envelope that now carries it.
+  spendOrigin?: {
+    version: 1;
+    threadId: string | null;
+    sourceIdentity: string | null;
+    size?: number;
+    mtimeMs?: number;
+    hash?: string;
+    retained?: true;
+  };
+  spendNeedsRepair?: true;
+  // The original derivation's revision for a carried amount, and the complete revision that superseded older amounts.
+  spendRevision?: CompressedSpendRevision;
+  spendAuthority?: CompressedSpendRevision;
+  // The exact durable line, carried between the worker and host.
+  storeRecord?: CompressedStoreRecord;
+  // The durable line that supplied held spend when it differs from the ranked envelope.
+  spendRecord?: CompressedStoreRecord;
+  // An eligible amount that follows a different line than the displayed row.
+  spendWitness?: CompressedStoreRecord;
+  // A seed omits spend. The line must still be read before replacing a verified amount.
+  hasSpend?: true;
+  // The openings store saves the retry clock for an accepted repair.
+  repairRetry?: { launch: string; source: CompressedRepair; attempts: number; at: number };
   hash?: string;
+  // Original order of the compressed facts, independent of the source of any retained spend.
+  factsOrder?: CompressedOrder;
+  // A later observation of the same bytes can select an earlier, stronger derivation.
+  revisionObservation?: CompressedOrder;
   threadId?: string | null;
   decodedLength?: number;
   skippedRecords?: number;
@@ -168,6 +210,7 @@ export async function adoptCompressedTwin(
       ...compressedEntryVersions(),
       size: hashed.stat.size,
       mtimeMs: hashed.stat.mtimeMs,
+      fileIdentity: { dev: hashed.stat.dev, ino: hashed.stat.ino },
       hash: hashed.hash,
       threadId,
       complete: true,
@@ -177,6 +220,7 @@ export async function adoptCompressedTwin(
       ...(input.title ? { title: { ...input.title, size: hashed.stat.size, mtimeMs: hashed.stat.mtimeMs } } : {}),
       opening: input.opening ?? opening,
       spend: input.spend,
+      spendOrigin: compressedSpendOrigin(threadId, input.spend),
     },
   };
 }
@@ -192,6 +236,7 @@ export function compressedOpeningEntry(entry: CompressedFactEntry): CompressedFa
     spendGeneration: entry.spendGeneration,
     size: entry.size,
     mtimeMs: entry.mtimeMs,
+    fileIdentity: compressedEntryIdentity(entry) ?? undefined,
     threadId: entry.threadId,
     opening: entry.opening,
   };
@@ -204,14 +249,102 @@ export function boundedCompressedEntry(entry: CompressedFactEntry): CompressedFa
   return { ...rest, carriedName: { label: title.label, fullLabel: title.fullLabel } };
 }
 
-// A marked derivation never replaces a higher total. The entry keeps the higher spend record and takes the mark.
+export function compressedSpendOrigin(
+  threadId: CompressedFactEntry['threadId'],
+  spend: SpendFileIndex,
+  hash?: string,
+): NonNullable<CompressedFactEntry['spendOrigin']> {
+  return {
+    version: 1,
+    threadId: threadId ?? null,
+    sourceIdentity: spend.sourceIdentity ?? null,
+    size: spend.size,
+    mtimeMs: spend.mtimeMs,
+    hash,
+  };
+}
+
+function verifiedSpendOrigin(entry: CompressedFactEntry): boolean {
+  const origin = entry.spendOrigin;
+  return (
+    origin?.version === 1 &&
+    origin.threadId === (entry.threadId ?? null) &&
+    (!entry.spend ||
+      (origin.sourceIdentity === (entry.spend.sourceIdentity ?? null) &&
+        origin.size === entry.spend.size &&
+        origin.mtimeMs === entry.spend.mtimeMs)) &&
+    (origin.retained || entry.adopted || origin.hash === entry.hash)
+  );
+}
+
+// A legacy marked total can belong to an earlier session even when its physical witnesses agree.
+export function quarantineCompressedSpend(entry: CompressedFactEntry): CompressedFactEntry {
+  if (!entry.spend || !entry.undercount || verifiedSpendOrigin(entry)) return entry;
+  const identity = compressedEntryIdentity(entry);
+  const { spend: _spend, spendOrigin: _origin, spendRevision: _revision, spendAuthority: _authority, ...facts } = entry;
+  return {
+    ...facts,
+    spendNeedsRepair: true,
+    ...(identity === null ? { identityConflict: true } : identity ? { fileIdentity: identity } : {}),
+  };
+}
+
+// Keep applicable spend when both entries belong to the same rollout and session.
 export function withKeptUndercount(
   previous: CompressedFactEntry | undefined,
   next: CompressedFactEntry,
+  quotedAt?: number,
 ): CompressedFactEntry {
-  if (!previous?.spend || !next.undercount || !next.spend) return next;
-  const spend = keepHigherSpend(previous.spend, next.spend);
-  return spend === previous.spend ? { ...next, spend, undercount: true } : next;
+  if (!next.spend || (!next.undercount && !next.unreadable && !next.adopted)) return next;
+  const donor = previous && compressedFactsSameOwner(previous, next) ? previous : undefined;
+  const heldAuthority = donor && completeSpendRevision(donor);
+  if (!next.undercount && !next.unreadable) {
+    const revision = spendRevision(next);
+    return donor &&
+      donor.hash === next.hash &&
+      sameDecodedSpend(heldAuthority, revision) &&
+      compareRevisionStats(heldAuthority, revision) === 0
+      ? donor
+      : next;
+  }
+  const authority = laterSpendRevision(heldAuthority, completeSpendRevision(next));
+  const result = authority === next.spendAuthority ? next : { ...next, spendAuthority: authority };
+  const superseded = precedesSpendAuthority(spendRevision(next), authority);
+  if (!donor || !eligibleCompressedSpend(donor) || precedesSpendAuthority(spendRevision(donor), authority)) {
+    if (!superseded) return result;
+    const { spend: _spend, spendOrigin: _origin, spendRevision: _revision, spendRecord: _record, ...facts } = result;
+    return { ...facts, spendNeedsRepair: true };
+  }
+  if (!superseded && compareSpendEntries(donor, next, quotedAt) <= 0) return result;
+  return withSpendFrom(result, donor);
+}
+
+function withSpendFrom(entry: CompressedFactEntry, donor: CompressedFactEntry): CompressedFactEntry {
+  const spend = donor.spend!;
+  return {
+    ...entry,
+    spend,
+    spendRecord: donor.spendRecord ?? donor.storeRecord,
+    spendRevision: spendRevision(donor),
+    undercount: true,
+    spendOrigin: {
+      ...(donor.spendOrigin ?? compressedSpendOrigin(donor.threadId, spend, donor.hash)),
+      retained: true,
+    },
+  };
+}
+
+function eligibleCompressedSpend(entry: CompressedFactEntry): boolean {
+  return (
+    !!entry.spend &&
+    entry.spendGeneration === PROJECT_SPEND_PARSER_GENERATIONS.codex &&
+    !entry.spendNeedsRepair &&
+    (!entry.undercount || verifiedSpendOrigin(entry)) &&
+    !entry.nameOnly &&
+    !entry.adoptionFailed &&
+    !!entry.threadId &&
+    compressedEntryIdentity(entry) !== null
+  );
 }
 
 // The version stamps of a new entry, as of this build.
@@ -232,20 +365,102 @@ export function compressedTitleCurrent(entry: CompressedFactEntry): boolean {
   return entry.factsVersion === COMPRESSED_FACTS_VERSION && entry.metadataGeneration === METADATA_GENERATIONS.codex;
 }
 
-// An entry is current when its stat matches the file and each version matches this build.
-export function compressedEntryCurrent(
-  entry: CompressedFactEntry,
-  stat: { size: number; mtimeMs: number } | null,
+type CompressedRevision = Pick<FileRevision, 'size' | 'mtimeMs'> & Partial<Pick<FileRevision, 'dev' | 'ino'>>;
+type CompressedIdentity = NonNullable<CompressedFactEntry['fileIdentity']>;
+
+function spendFileIdentity(spend: SpendFileIndex | undefined): CompressedIdentity | undefined {
+  if (typeof spend?.sourceIdentity !== 'string') return undefined;
+  const parts = spend.sourceIdentity.split(':');
+  const identity = { dev: parts[0], ino: parts[1] };
+  return parts.length === 2 && supportedFileIdentity(identity) ? identity : undefined;
+}
+
+// A decoded entry can store the compressed identity in its title and spend. An adopted entry stores plain identities there.
+export function compressedEntryIdentity(entry: CompressedFactEntry): CompressedIdentity | null | undefined {
+  const { opening, threadId } = entry;
+  if (entry.identityConflict || (opening?.sessionId && threadId && opening.sessionId !== threadId)) return null;
+  let identity = entry.fileIdentity && supportedFileIdentity(entry.fileIdentity) ? entry.fileIdentity : undefined;
+  const title = entry.title?.sourceIdentity;
+  const spend = spendFileIdentity(entry.spend);
+  if (entry.spendOrigin && !verifiedSpendOrigin(entry)) return null;
+  if (entry.adopted) {
+    return title && supportedFileIdentity(title) && spend && !compressedIdentityMatches(title, spend) ? null : identity;
+  }
+  for (const witness of [title, entry.spendOrigin?.retained ? undefined : spend]) {
+    if (!witness || !supportedFileIdentity(witness)) continue;
+    if (identity && !compressedIdentityMatches(identity, witness)) return null;
+    identity ??= witness;
+  }
+  return identity;
+}
+
+export function compressedFactsSameOwner(previous: CompressedFactEntry, next: CompressedFactEntry): boolean {
+  if (previous.file !== next.file || !previous.threadId || previous.threadId !== next.threadId) return false;
+  const before = compressedEntryIdentity(previous);
+  const after = compressedEntryIdentity(next);
+  return !!(
+    before !== null &&
+    after !== null &&
+    ((before && after && compressedIdentityMatches(before, after)) || (previous.hash && previous.hash === next.hash))
+  );
+}
+
+function compressedIdentityConflicts(
+  identity: CompressedIdentity | null | undefined,
+  stat: CompressedRevision,
+): boolean {
+  return identity === null || !!(identity && supportedFileIdentity(stat) && !compressedIdentityMatches(identity, stat));
+}
+
+export function compressedEntryConflicts(entry: CompressedFactEntry, stat: CompressedRevision): boolean {
+  return compressedIdentityConflicts(compressedEntryIdentity(entry), stat);
+}
+
+function factsNeedIdentity(entry: CompressedFactEntry): boolean {
+  return (
+    entry.factsNeedIdentity === true ||
+    (entry.decodedLength !== undefined && !!(entry.title || entry.spend || entry.carriedName))
+  );
+}
+
+// An entry is current when its revision and parser versions match.
+export function compressedEntryCurrent(entry: CompressedFactEntry, stat: CompressedRevision | null): boolean {
+  if (
+    !stat ||
+    entry.spendNeedsRepair ||
+    entry.size !== stat.size ||
+    entry.mtimeMs !== stat.mtimeMs ||
+    entry.factsVersion !== COMPRESSED_FACTS_VERSION ||
+    entry.codexMetaVersion !== CODEX_META_VERSION ||
+    entry.metadataGeneration !== METADATA_GENERATIONS.codex ||
+    entry.spendGeneration !== PROJECT_SPEND_PARSER_GENERATIONS.codex
+  )
+    return false;
+  const identity = compressedEntryIdentity(entry);
+  return (
+    !compressedIdentityConflicts(identity, stat) &&
+    (!!identity || !factsNeedIdentity(entry) || !supportedFileIdentity(stat))
+  );
+}
+
+function compressedIdentityMatches(
+  identity: Partial<Pick<FileRevision, 'dev' | 'ino'>>,
+  stat: Partial<Pick<FileRevision, 'dev' | 'ino'>>,
 ): boolean {
   return (
-    !!stat &&
-    entry.size === stat.size &&
-    entry.mtimeMs === stat.mtimeMs &&
-    entry.factsVersion === COMPRESSED_FACTS_VERSION &&
-    entry.codexMetaVersion === CODEX_META_VERSION &&
-    entry.metadataGeneration === METADATA_GENERATIONS.codex &&
-    entry.spendGeneration === PROJECT_SPEND_PARSER_GENERATIONS.codex
+    supportedFileIdentity(identity) &&
+    supportedFileIdentity(stat) &&
+    String(identity.dev) === String(stat.dev) &&
+    String(identity.ino) === String(stat.ino)
   );
+}
+
+// A contested row takes display facts only from the revision its opening qualified.
+export function compressedFactsMatchSource(entry: CompressedFactEntry, source: CompressedRevision): boolean {
+  if (entry.unreadable || entry.size !== source.size || entry.mtimeMs !== source.mtimeMs) return false;
+  const identity = compressedEntryIdentity(entry);
+  if (identity) return compressedIdentityMatches(identity, source);
+  return identity !== null && !entry.title && !entry.spend && !entry.carriedName;
 }
 
 // A name that a store file carries, split into its parts. `seq` counts the files of one holder, so a name is unique.
@@ -295,7 +510,9 @@ function parseManifest(text: string): StoreManifest | null {
 
 function readManifest(directory: string, name: string, onUnreadable?: (name: string) => void): StoreManifest | null {
   try {
-    return parseManifest(fs.readFileSync(path.join(directory, name), 'utf8'));
+    const manifest = parseManifest(fs.readFileSync(path.join(directory, name), 'utf8'));
+    if (!manifest) onUnreadable?.(name);
+    return manifest;
   } catch {
     onUnreadable?.(name);
     return null;
@@ -354,7 +571,7 @@ function parseEntry(text: string): CompressedFactEntry | null {
   try {
     const value = JSON.parse(text) as Partial<CompressedFactEntry>;
     return typeof value.file === 'string' && typeof value.factsVersion === 'number' && typeof value.pairKey === 'string'
-      ? (value as CompressedFactEntry)
+      ? quarantineCompressedSpend(value as CompressedFactEntry)
       : null;
   } catch {
     return null;
@@ -367,7 +584,7 @@ function readableFactsVersion(version: number | null): boolean {
 }
 
 // The physical stat that ranks an entry against its rollout, in the precision that adoption stores.
-export function compressedPhysicalStat(file: string): { size: number; mtimeMs: number } | null {
+export function compressedPhysicalStat(file: string): CompressedRevision | null {
   return readRolloutStat(file);
 }
 
@@ -389,9 +606,31 @@ interface RankFields {
   factsVersion: number;
   size?: number;
   mtimeMs?: number;
+  fileIdentity?: CompressedIdentity | null;
+  threadId?: string | null;
+  hash?: string;
   decodedLength?: number;
+  spendNeedsRepair?: true;
+  verifiedBytes?: boolean;
+  fullDecode?: boolean;
   adoptionFailed?: boolean;
   nameOnly?: boolean;
+}
+
+function verifiesCompressedBytes(entry: CompressedFactEntry): boolean {
+  return (
+    entry.factsVersion === COMPRESSED_FACTS_VERSION &&
+    entry.codexMetaVersion === CODEX_META_VERSION &&
+    entry.metadataGeneration === METADATA_GENERATIONS.codex &&
+    entry.spendGeneration === PROJECT_SPEND_PARSER_GENERATIONS.codex &&
+    !!entry.hash &&
+    !!entry.threadId &&
+    !entry.unreadable &&
+    !entry.spendNeedsRepair &&
+    !entry.adoptionFailed &&
+    !entry.nameOnly &&
+    (!!entry.adopted || entry.decodedLength !== undefined)
+  );
 }
 
 function rankFields(entry: CompressedFactEntry): RankFields {
@@ -401,7 +640,13 @@ function rankFields(entry: CompressedFactEntry): RankFields {
     factsVersion: entry.factsVersion,
     size: entry.size,
     mtimeMs: entry.mtimeMs,
+    fileIdentity: compressedEntryIdentity(entry),
+    threadId: entry.threadId,
+    hash: entry.hash,
     decodedLength: entry.decodedLength,
+    spendNeedsRepair: entry.spendNeedsRepair,
+    verifiedBytes: verifiesCompressedBytes(entry),
+    fullDecode: entry.decodedLength !== undefined && !entry.adopted && entry.complete !== false && !entry.undercount,
     adoptionFailed: entry.adoptionFailed,
     nameOnly: entry.nameOnly,
   };
@@ -412,8 +657,15 @@ function rankFields(entry: CompressedFactEntry): RankFields {
 export type CompressedEntrySeed = Omit<CompressedFactEntry, 'title' | 'spend' | 'carriedName'>;
 
 export function compressedEntrySeed(entry: CompressedFactEntry): CompressedEntrySeed {
-  const { title: _title, spend: _spend, carriedName: _carried, ...seed } = entry;
-  return seed;
+  const { title: _title, spend, carriedName: _carried, ...seed } = entry;
+  if (spend) {
+    seed.hasSpend = true;
+    if (entry.unreadable && !entry.spendOrigin?.retained) seed.spendRevision = spendRevision(entry);
+  }
+  const identity = compressedEntryIdentity(entry);
+  if (identity === null) return { ...seed, identityConflict: true };
+  if (identity) return { ...seed, fileIdentity: identity };
+  return factsNeedIdentity(entry) ? { ...seed, factsNeedIdentity: true } : seed;
 }
 
 export interface CompressedLoadResume {
@@ -421,6 +673,187 @@ export interface CompressedLoadResume {
   entries: CompressedEntrySeed[];
   // The names the store holds with no facts, which the offsets cover and the host holds only as paths.
   nameOnly?: string[];
+}
+
+export interface CompressedStoreRecord {
+  input: string;
+  offset: number;
+  bytes: number;
+  digest: string;
+  spendDigest?: string;
+  order?: CompressedOrder;
+  spendRevision?: CompressedSpendRevision;
+}
+
+type CompressedOrder = [epoch: number, token: string, sequence: number, offset: number];
+
+interface CompressedSpendRevision {
+  mtimeMs?: number;
+  size?: number;
+  hash?: string;
+  decoded?: true;
+  order?: CompressedOrder;
+  observation?: CompressedOrder;
+}
+
+function spendRevision(entry: CompressedFactEntry, ranked?: RankedEntry): CompressedSpendRevision {
+  const stored = entry.spendRevision ?? entry.spendRecord?.spendRevision ?? entry.storeRecord?.spendRevision;
+  const origin = entry.spendOrigin;
+  if (origin?.retained) {
+    if (stored && (stored.hash || stored.mtimeMs === origin.mtimeMs)) return stored;
+    return { mtimeMs: origin.mtimeMs };
+  }
+  // A failed read only supplies a new envelope. An old spend size measures plain or decoded bytes.
+  if (entry.unreadable) return { mtimeMs: origin?.mtimeMs ?? entry.spend?.mtimeMs ?? entry.spendRevision?.mtimeMs };
+  const source = ranked ?? (entry.storeRecord && rankedRecord(entry));
+  const order = stored?.order ?? (source && factsOrder(source));
+  return {
+    mtimeMs: entry.mtimeMs,
+    size: entry.size,
+    hash: entry.hash,
+    decoded:
+      entry.decodedLength !== undefined && !entry.adopted && entry.complete !== false && !entry.undercount
+        ? true
+        : undefined,
+    order,
+  };
+}
+
+function completeSpendRevision(entry: CompressedFactEntry, ranked?: RankedEntry): CompressedSpendRevision | undefined {
+  if (
+    !entry.spendNeedsRepair &&
+    !entry.nameOnly &&
+    !entry.adoptionFailed &&
+    entry.spendGeneration === PROJECT_SPEND_PARSER_GENERATIONS.codex &&
+    entry.complete !== false &&
+    !entry.undercount &&
+    !entry.unreadable &&
+    !entry.spendOrigin?.retained &&
+    (entry.spend || entry.hasSpend)
+  ) {
+    const revision = spendRevision(entry, ranked);
+    const observation = entry.revisionObservation ?? ranked?.observation;
+    return observation ? { ...revision, observation } : revision;
+  }
+  return entry.spendAuthority;
+}
+
+function sameDecodedSpend(
+  left: CompressedSpendRevision | undefined,
+  right: CompressedSpendRevision,
+): left is CompressedSpendRevision & { decoded: true } {
+  return !!(left?.decoded && left.hash && left.hash === right.hash);
+}
+
+function compareSpendRevisions(left: CompressedSpendRevision, right: CompressedSpendRevision): number {
+  const revision = compareRevisionStats(left, right);
+  if (revision) return revision;
+  if (sameDecodedSpend(left, right) || sameDecodedSpend(right, left)) {
+    const decoded = Number(!!left.decoded) - Number(!!right.decoded);
+    if (decoded) return decoded;
+  }
+  if (left.hash && left.hash === right.hash) return compareOrder(left.order, right.order);
+  return compareOrder(left.observation ?? left.order, right.observation ?? right.order);
+}
+
+function compareOrder(left: CompressedOrder | undefined, right: CompressedOrder | undefined): number {
+  if (!left || !right) return Number(!!left) - Number(!!right);
+  const [aEpoch, aToken, aSequence, aOffset] = left;
+  const [bEpoch, bToken, bSequence, bOffset] = right;
+  return (
+    aEpoch - bEpoch || (aToken === bToken ? 0 : aToken > bToken ? 1 : -1) || aSequence - bSequence || aOffset - bOffset
+  );
+}
+
+function compareSpendEntries(left: CompressedFactEntry, right: CompressedFactEntry, quotedAt?: number): number {
+  return (
+    spendTotalCompare(left.spend!, right.spend!, quotedAt) ||
+    compareSpendRevisions(spendRevision(left), spendRevision(right))
+  );
+}
+
+function laterSpendRevision(
+  left: CompressedSpendRevision | undefined,
+  right: CompressedSpendRevision | undefined,
+): CompressedSpendRevision | undefined {
+  if (!left || !right) return left ?? right;
+  const rank = compareSpendRevisions(left, right);
+  return rank > 0 || (rank === 0 && compareOrder(left.observation, right.observation) > 0) ? left : right;
+}
+
+function precedesSpendAuthority(
+  revision: CompressedSpendRevision | undefined,
+  authority: CompressedSpendRevision | undefined,
+): boolean {
+  return !!revision && !!authority && compareSpendRevisions(revision, authority) < 0;
+}
+
+export type CompressedSpendRequest = {
+  file: string;
+  record: CompressedStoreRecord;
+};
+
+function spendDigest(spend: SpendFileIndex | undefined): string | undefined {
+  return spend && recordDigest(JSON.stringify(spend));
+}
+
+function recordDigest(line: Buffer | string): string {
+  return createHash('sha256').update(line).digest('base64url');
+}
+
+// A host can return the exact amount it kept from a line that an older compactor retired.
+export function heldCompressedSpend(
+  entry: CompressedFactEntry | undefined,
+  { file, record }: CompressedSpendRequest,
+): CompressedFactEntry | undefined {
+  const held = entry?.spendRecord ?? entry?.storeRecord;
+  if (
+    !entry ||
+    entry.file !== file ||
+    held?.digest !== record.digest ||
+    !record.spendDigest ||
+    !eligibleCompressedSpend(entry) ||
+    spendDigest(entry.spend) !== record.spendDigest
+  )
+    return undefined;
+  const revision = spendRevision(entry);
+  const requested = record.spendRevision;
+  if (
+    requested &&
+    (requested.hash !== revision.hash ||
+      requested.mtimeMs !== revision.mtimeMs ||
+      requested.size !== revision.size ||
+      requested.decoded !== revision.decoded ||
+      compareOrder(requested.order, revision.order) !== 0)
+  )
+    return undefined;
+  const { pairKey, fileIdentity, size, mtimeMs, threadId, hash, spend, spendOrigin, adopted, unreadable, undercount } =
+    entry;
+  const witness = {
+    file,
+    pairKey,
+    fileIdentity: compressedEntryIdentity(entry) ?? fileIdentity,
+    size,
+    mtimeMs,
+    threadId,
+    hash,
+    spend,
+    spendOrigin,
+    spendRevision: revision,
+    spendAuthority: completeSpendRevision(entry),
+    decodedLength: entry.decodedLength,
+    revisionObservation: entry.revisionObservation,
+    complete: entry.complete,
+    adopted,
+    unreadable,
+    undercount,
+    factsVersion: entry.factsVersion,
+    codexMetaVersion: entry.codexMetaVersion,
+    metadataGeneration: entry.metadataGeneration,
+    spendGeneration: entry.spendGeneration,
+    storeRecord: held,
+  };
+  return Buffer.byteLength(JSON.stringify(witness)) <= COMPRESSED_BATCH_BYTES ? witness : undefined;
 }
 
 interface RankedEntry {
@@ -431,36 +864,268 @@ interface RankedEntry {
   input: string;
   offset: number;
   seq: number;
+  order?: CompressedOrder;
+  observation?: CompressedOrder;
+  record?: CompressedStoreRecord;
+  completeSpend?: RankedSpend;
+}
+
+function factsOrder(ranked: RankedEntry): CompressedOrder | undefined {
+  return ranked.order ?? (ranked.epoch < 0 ? undefined : [ranked.epoch, ranked.token, ranked.seq, ranked.offset]);
+}
+
+function recordedFactsOrder(entry: CompressedEntrySeed): CompressedOrder | undefined {
+  if (entry.factsOrder) return entry.factsOrder;
+  const revision = entry.spendRevision;
+  if (
+    revision &&
+    !entry.unreadable &&
+    !entry.spendOrigin?.retained &&
+    revision.mtimeMs === entry.mtimeMs &&
+    revision.size === entry.size &&
+    (!revision.hash || revision.hash === entry.hash)
+  )
+    return revision.order;
+  return undefined;
+}
+
+function rankedLine(entry: CompressedFactEntry, input: StoreName, offset: number): RankedEntry {
+  return {
+    entry: rankFields(entry),
+    epoch: input.epoch,
+    token: input.token,
+    input: input.name,
+    offset,
+    seq: input.seq,
+    order: recordedFactsOrder(entry),
+  };
+}
+
+function compareRevisionStats(
+  left: Pick<RankFields, 'mtimeMs' | 'size'>,
+  right: Pick<RankFields, 'mtimeMs' | 'size'>,
+): number {
+  return (left.mtimeMs ?? -1) - (right.mtimeMs ?? -1) || (left.size ?? -1) - (right.size ?? -1);
+}
+
+function currentStatRank(entry: RankFields, stat: CompressedRevision | null): number {
+  if (!stat || entry.size !== stat.size || entry.mtimeMs !== stat.mtimeMs || entry.fileIdentity === null) return 0;
+  if (!entry.fileIdentity || !supportedFileIdentity(stat)) return 1;
+  return compressedIdentityMatches(entry.fileIdentity, stat) ? 2 : 0;
 }
 
 // Greater when `left` ranks first. Current fact version first, then an equal stat, then greater mtimeMs and size, then
 // an entry with a decoded length, an entry with facts, the higher epoch, the greater holder token and the later line.
-export function compareRankedEntries(
-  left: RankedEntry,
-  right: RankedEntry,
-  stat: { size: number; mtimeMs: number } | null,
-): number {
+export function compareRankedEntries(left: RankedEntry, right: RankedEntry, stat: CompressedRevision | null): number {
   const a = left.entry;
   const b = right.entry;
   const version =
     Number(a.factsVersion === COMPRESSED_FACTS_VERSION) - Number(b.factsVersion === COMPRESSED_FACTS_VERSION);
   if (version) return version;
-  const equal = (entry: RankFields) => (!!stat && entry.size === stat.size && entry.mtimeMs === stat.mtimeMs ? 1 : 0);
-  const statRank = equal(a) - equal(b);
+  const statRank = currentStatRank(a, stat) - currentStatRank(b, stat);
   if (statRank) return statRank;
-  const mtime = (a.mtimeMs ?? -1) - (b.mtimeMs ?? -1);
-  if (mtime) return mtime;
-  const size = (a.size ?? -1) - (b.size ?? -1);
-  if (size) return size;
+  const revision = compareRevisionStats(a, b);
+  if (revision) return revision;
+  // A current derived or terminal entry replaces an ambiguous amount, including across compaction and old writers.
+  const verified = Number(!a.spendNeedsRepair) - Number(!b.spendNeedsRepair);
+  if (verified) return verified;
+  if (a.verifiedBytes && b.verifiedBytes && a.hash === b.hash && rankedSameOwner(left, right)) {
+    const full = Number(!!a.fullDecode) - Number(!!b.fullDecode);
+    if (full) return full;
+  }
   const decoded = Number(a.decodedLength !== undefined) - Number(b.decodedLength !== undefined);
   if (decoded) return decoded;
   const withFacts = (entry: RankFields) => (entry.adoptionFailed || entry.nameOnly ? 0 : 1);
   // An `unreadable` entry with no facts carries `nameOnly`, so this rank also orders it below an entry with facts.
   const facts = withFacts(a) - withFacts(b);
   if (facts) return facts;
-  if (left.epoch !== right.epoch) return left.epoch - right.epoch;
-  if (left.token !== right.token) return left.token > right.token ? 1 : -1;
-  return left.seq - right.seq || left.offset - right.offset;
+  return (
+    compareOrder(factsOrder(left), factsOrder(right)) ||
+    left.epoch - right.epoch ||
+    (left.token === right.token ? 0 : left.token > right.token ? 1 : -1) ||
+    left.seq - right.seq ||
+    left.offset - right.offset
+  );
+}
+
+function rankedRecord(entry: CompressedEntrySeed): RankedEntry {
+  const ref = entry.storeRecord;
+  const input = ref && storeName(ref.input);
+  return {
+    entry: rankFields(entry),
+    epoch: input ? input.epoch : -1,
+    token: input ? input.token : '',
+    input: input ? input.name : '',
+    offset: ref?.offset ?? -1,
+    seq: input ? input.seq : -1,
+    order: recordedFactsOrder(entry) ?? ref?.order,
+    observation: entry.revisionObservation,
+    record: ref,
+  };
+}
+
+export function compareCompressedEntries(
+  left: CompressedEntrySeed,
+  right: CompressedEntrySeed,
+  stat: CompressedRevision | null,
+): number {
+  const a = rankedRecord(left);
+  const b = rankedRecord(right);
+  if (competingObservations(a, b, stat) && a.entry.hash !== b.entry.hash)
+    return compareOrder(observationOrder(a), observationOrder(b));
+  return compareRankedEntries(a, b, stat);
+}
+
+function observationOrder(ranked: RankedEntry): CompressedOrder | undefined {
+  return ranked.observation ?? factsOrder(ranked);
+}
+
+function competingObservations(a: RankedEntry, b: RankedEntry, stat: CompressedRevision | null): boolean {
+  const before = a.entry.fileIdentity;
+  const after = b.entry.fileIdentity;
+  return (
+    !!a.entry.verifiedBytes &&
+    !!b.entry.verifiedBytes &&
+    a.entry.size !== undefined &&
+    a.entry.mtimeMs !== undefined &&
+    compareRevisionStats(a.entry, b.entry) === 0 &&
+    currentStatRank(a.entry, stat) === currentStatRank(b.entry, stat) &&
+    (!before || !after || compressedIdentityMatches(before, after)) &&
+    rankedSameOwner(a, b) &&
+    (a.entry.hash === b.entry.hash || (!!observationOrder(a) && !!observationOrder(b)))
+  );
+}
+
+interface RankedFacts {
+  row: RankedEntry;
+  latest: RankedEntry;
+  alternatives?: Map<string, RankedEntry>;
+}
+
+function rankFacts(held: RankedFacts | undefined, next: RankedEntry, stat: CompressedRevision | null): RankedFacts {
+  if (!held || !competingObservations(held.latest, next, stat)) {
+    return held && compareRankedEntries(next, held.row, stat) <= 0 ? held : { row: next, latest: next };
+  }
+  const hash = next.entry.hash!;
+  const order = compareOrder(observationOrder(next), observationOrder(held.latest));
+  const latest =
+    order > 0 ||
+    (order === 0 && next.entry.hash === held.latest.entry.hash && compareRankedEntries(next, held.latest, stat) > 0)
+      ? next
+      : held.latest;
+  let alternatives = held.alternatives;
+  if (!alternatives && held.row.entry.hash !== hash) alternatives = new Map([[held.row.entry.hash!, held.row]]);
+  const earlier = alternatives?.get(hash) ?? (held.row.entry.hash === hash ? held.row : undefined);
+  const strongest = earlier && compareRankedEntries(next, earlier, stat) <= 0 ? earlier : next;
+  alternatives?.set(hash, strongest);
+  const row = latest.entry.hash === hash ? strongest : held.row;
+  if (row === held.row && latest === held.latest && alternatives === held.alternatives) return held;
+  return { row, latest, alternatives };
+}
+
+// Only later observations of the same bytes travel with the chosen row.
+function observedEntry(entry: CompressedFactEntry, facts: RankedFacts): CompressedFactEntry {
+  const observation = observationOrder(facts.latest);
+  const revisionObservation = compareOrder(observation, factsOrder(facts.row)) > 0 ? observation : undefined;
+  return entry.revisionObservation === revisionObservation ? entry : { ...entry, revisionObservation };
+}
+
+export function reconcileCompressedEntries(
+  held: CompressedFactEntry,
+  next: CompressedFactEntry,
+  stat: CompressedRevision | null = null,
+): CompressedFactEntry | undefined {
+  if (!held.hash || !next.hash) return undefined;
+  const before = rankedRecord(held);
+  const after = rankedRecord(next);
+  if (!competingObservations(before, after, stat)) return undefined;
+  const selected = rankFacts({ row: before, latest: before }, after, stat);
+  const keepHeld =
+    selected.row === before &&
+    (before.entry.hash !== after.entry.hash || compareRankedEntries(before, after, stat) > 0);
+  const row = keepHeld ? held : next;
+  return observedEntry(row, selected);
+}
+
+interface RankedSpend {
+  ranked: RankedEntry;
+  revision: CompressedSpendRevision;
+  authority: CompressedSpendRevision | undefined;
+  authorityLine: RankedEntry | undefined;
+  total: ReturnType<typeof spendRecordTotal>;
+}
+
+function rankedSameOwner(a: RankedEntry, b: RankedEntry): boolean {
+  const { file, fileIdentity, threadId, hash } = a.entry;
+  const other = b.entry;
+  return (
+    file === other.file &&
+    !!threadId &&
+    threadId === other.threadId &&
+    fileIdentity !== null &&
+    other.fileIdentity !== null &&
+    ((!!fileIdentity && !!other.fileIdentity && compressedIdentityMatches(fileIdentity, other.fileIdentity)) ||
+      (!!hash && hash === other.hash))
+  );
+}
+
+// An authoritative revision can lower its contribution. A later partial revision can only raise it for the same owner.
+function selectedCompleteSpend(facts: RankedFacts): RankedSpend | undefined {
+  const spend = facts.row.completeSpend;
+  if (!spend?.authority) return undefined;
+  const observation = observationOrder(facts.latest);
+  if (compareOrder(observation, spend.authority.order) <= 0) return spend;
+  return { ...spend, authority: { ...spend.authority, observation } };
+}
+
+function noteCompleteSpend(entry: CompressedFactEntry, ranked: RankedEntry, quotedAt: number): void {
+  if (!ranked.entry.verifiedBytes || !eligibleCompressedSpend(entry)) return;
+  const revision = completeSpendRevision(entry, ranked);
+  if (!revision || entry.spendOrigin?.retained || entry.undercount || entry.complete === false) return;
+  ranked.completeSpend = {
+    ranked,
+    revision: spendRevision(entry, ranked),
+    authority: revision,
+    authorityLine: ranked,
+    total: spendRecordTotal(entry.spend!, quotedAt),
+  };
+}
+
+function rankSpend(
+  entry: CompressedFactEntry,
+  ranked: RankedEntry,
+  held: RankedSpend | undefined,
+  quotedAt: number,
+  resumedAuthority?: CompressedSpendRevision,
+  complete?: RankedSpend,
+): RankedSpend | undefined {
+  const previous = held;
+  const selectedAuthority = complete?.authority;
+  if (complete && (!held || precedesSpendAuthority(held.revision, selectedAuthority))) held = complete;
+  resumedAuthority = laterSpendRevision(resumedAuthority, selectedAuthority);
+  const selected = held !== previous ? held : undefined;
+  if (!eligibleCompressedSpend(entry)) return selected;
+  if (held && !rankedSameOwner(held.ranked, ranked)) {
+    if (compareRankedEntries(ranked, held.ranked, null) <= 0) return selected;
+    held = undefined;
+  }
+  const revision = spendRevision(entry, ranked);
+  const supplied = completeSpendRevision(entry, ranked);
+  const authority = laterSpendRevision(laterSpendRevision(held?.authority, resumedAuthority), supplied);
+  const authorityLine = supplied && authority === supplied ? ranked : held?.authorityLine;
+  if (precedesSpendAuthority(revision, authority)) {
+    return held && authority !== held.authority && !precedesSpendAuthority(held.revision, authority)
+      ? { ...held, authority, authorityLine }
+      : selected;
+  }
+  const total = ranked.completeSpend?.total ?? spendRecordTotal(entry.spend!, quotedAt);
+  if (!held || precedesSpendAuthority(held.revision, authority))
+    return { ranked, revision, authority, authorityLine, total };
+  const amount = total.dollars - held.total.dollars || total.requests - held.total.requests;
+  if (amount > 0 || (!amount && compareSpendRevisions(revision, held.revision) > 0))
+    return { ranked, revision, authority, authorityLine, total };
+  if (authority !== held.authority) return { ...held, authority, authorityLine };
+  return selected;
 }
 
 interface StoreView {
@@ -504,6 +1169,9 @@ function storeView(directory: string, names: readonly string[], onUnreadable?: (
   const inputs = parsed.filter(
     (stored) =>
       (stored.kind === 'segment' || (stored.kind === 'shard' && named.has(stored.name))) && !retired.has(stored.name),
+  );
+  inputs.sort(
+    (left, right) => left.epoch - right.epoch || left.token.localeCompare(right.token) || left.seq - right.seq,
   );
   return { inputs, manifests, valid, current, retired };
 }
@@ -553,23 +1221,24 @@ function* storeReadSteps(
 ): Generator<void, CompressedStoreRead, void> {
   const names = listDirectory(directory, onUnreadable);
   const view = storeView(directory, names, onUnreadable);
-  const best = new Map<string, { ranked: RankedEntry; entry: CompressedFactEntry }>();
+  const best = new Map<string, { facts: RankedFacts; entry: CompressedFactEntry }>();
   for (const input of view.inputs) {
     if (!readableFactsVersion(fileFactsVersion(path.join(directory, input.name)))) continue;
     const readLine = (line: Buffer, offset: number) => {
       const entry = parseEntry(line.toString('utf8'));
       if (!entry || !readableFactsVersion(entry.factsVersion)) return;
-      const ranked: RankedEntry = {
-        entry: rankFields(entry),
-        epoch: input.epoch,
-        token: input.token,
-        input: input.name,
-        offset,
-        seq: input.seq,
-      };
+      const ranked = rankedLine(entry, input, offset);
+      if (ranked.entry.verifiedBytes) ranked.record = referenceOf(entry, ranked, line);
       const held = best.get(entry.file);
-      if (!held || compareRankedEntries(ranked, held.ranked, statOf(entry.file)) > 0)
-        best.set(entry.file, { ranked, entry });
+      const facts = rankFacts(held?.facts, ranked, held ? statOf(entry.file) : null);
+      if (facts === held?.facts) return;
+      const selected =
+        facts.row === ranked
+          ? entry
+          : facts.row === held?.facts.row
+            ? held.entry
+            : facts.row.record && readCompressedRecord(directory, entry.file, facts.row.record);
+      if (selected) best.set(entry.file, { facts, entry: observedEntry(selected, facts) });
     };
     try {
       eachLine(path.join(directory, input.name), readLine);
@@ -585,12 +1254,9 @@ function* storeReadSteps(
 }
 
 // Split entries into batches of at most `bytes`. A single larger record forms its own batch.
-export function compressedEntryBatches(
-  entries: readonly CompressedFactEntry[],
-  bytes = COMPRESSED_BATCH_BYTES,
-): CompressedFactEntry[][] {
-  const batches: CompressedFactEntry[][] = [];
-  let current: CompressedFactEntry[] = [];
+export function compressedEntryBatches<T>(entries: readonly T[], bytes = COMPRESSED_BATCH_BYTES): T[][] {
+  const batches: T[][] = [];
+  let current: T[] = [];
   let size = 0;
   for (const entry of entries) {
     const length = Buffer.byteLength(JSON.stringify(entry));
@@ -629,6 +1295,18 @@ function readLineAt(file: string, offset: number, open: (file: string) => number
   }
 }
 
+function referenceOf(entry: CompressedFactEntry, ranked: RankedEntry, line: Buffer): CompressedStoreRecord {
+  return {
+    input: ranked.input,
+    offset: ranked.offset,
+    bytes: line.length + 1,
+    digest: createHash('sha256').update(line).update('\n').digest('base64url'),
+    spendDigest: spendDigest(entry.spend),
+    order: ranked.order,
+    ...(eligibleCompressedSpend(entry) ? { spendRevision: spendRevision(entry, ranked) } : {}),
+  };
+}
+
 function readEpoch(directory: string): { e: number; token: string } | null {
   try {
     const parsed = JSON.parse(fs.readFileSync(path.join(directory, EPOCH_FILE), 'utf8')) as {
@@ -653,10 +1331,21 @@ function readLockText(lock: string): string | null | 'missing' {
 
 // Every field of an entry that a reader can see change. A later file that repeats these values is not new for a host.
 function compressedEntryMark(entry: CompressedFactEntry): string {
+  const identity = compressedEntryIdentity(entry);
   return [
     entry.size,
     entry.mtimeMs,
+    identity === null,
+    identity?.dev,
+    identity?.ino,
     entry.hash,
+    entry.threadId,
+    entry.spendNeedsRepair,
+    entry.spendOrigin ? JSON.stringify(entry.spendOrigin) : undefined,
+    entry.spendRevision ? JSON.stringify(entry.spendRevision) : undefined,
+    entry.spendAuthority ? JSON.stringify(entry.spendAuthority) : undefined,
+    entry.revisionObservation?.join(':'),
+
     entry.factsVersion,
     entry.codexMetaVersion,
     entry.metadataGeneration,
@@ -673,26 +1362,93 @@ function compressedEntryMark(entry: CompressedFactEntry): string {
 }
 
 export function compressedEntrySame(left: CompressedFactEntry, right: CompressedFactEntry): boolean {
-  return compressedEntryMark(left) === compressedEntryMark(right);
+  return (
+    (!left.storeRecord || !right.storeRecord || left.storeRecord.digest === right.storeRecord.digest) &&
+    compressedEntryMark(left) === compressedEntryMark(right)
+  );
+}
+
+// Read one complete line from the store that supplied its address.
+export function readCompressedRecord(
+  directory: string,
+  file: string,
+  record: CompressedStoreRecord,
+): CompressedFactEntry | undefined {
+  const { input, offset, bytes, digest } = record;
+  const name = storeName(input);
+  if (
+    !name ||
+    name.kind === 'manifest' ||
+    path.basename(input) !== input ||
+    !Number.isSafeInteger(offset) ||
+    offset < 0 ||
+    !Number.isSafeInteger(bytes) ||
+    bytes < 2 ||
+    !Number.isSafeInteger(offset + bytes)
+  )
+    return undefined;
+  let fd: number | undefined;
+  try {
+    fd = openForRead(path.join(directory, input));
+    if (fs.fstatSync(fd).size < offset + bytes) return undefined;
+    const line = Buffer.allocUnsafe(bytes);
+    let read = 0;
+    while (read < bytes) {
+      const count = fs.readSync(fd, line, read, bytes - read, offset + read);
+      if (!count) return undefined;
+      read += count;
+    }
+    if (line[bytes - 1] !== 0x0a || recordDigest(line) !== digest) return undefined;
+    const entry = parseEntry(line.subarray(0, bytes - 1).toString('utf8'));
+    return entry?.file === file ? { ...entry, storeRecord: record } : undefined;
+  } catch {
+    // A compaction can retire the input before the next follow.
+    return undefined;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
 }
 
 // Reads one store as it changes. The first poll reads every file. Each later poll lists the store and reads only the
 // bytes appended since, so another window's entry arrives without a restart.
 export class CompressedStoreFollower {
   private readonly consumed = new Map<string, number>();
-  private readonly best = new Map<string, { ranked: RankedEntry; mark: string }>();
+  private readonly inputs = new Map<
+    string,
+    {
+      position: number;
+      start: number;
+      fragments: Buffer[];
+      versionKnown: boolean;
+      unsupported: boolean;
+    }
+  >();
+  private readonly best = new Map<string, RankedFacts>();
+  private readonly spend = new Map<string, RankedSpend & { record: CompressedStoreRecord }>();
+  private readonly quotedAt = Date.now();
+  private readonly resumedSpend = new Map<
+    string,
+    { source: RankedEntry; authority?: CompressedSpendRevision; records: CompressedStoreRecord[] }
+  >();
+  private readonly changedSpend = new Set<string>();
+  private readonly relocated = new Map<string, CompressedStoreRecord>();
+  private readonly spendRelocated = new Map<string, CompressedStoreRecord>();
   private readonly seeds = new Map<string, CompressedEntrySeed>();
-  // The bytes every poll read so far.
+  private readonly changed = new Map<string, CompressedFactEntry>();
+  private readableInputs = new Set<string>();
+  private running: Promise<boolean> = Promise.resolve(true);
   bytesRead = 0;
+  contributorBytesRead = 0;
 
   constructor(
     readonly directory: string,
     private readonly statOf: typeof compressedPhysicalStat = compressedPhysicalStat,
     private readonly yieldStep: () => Promise<void> = yieldToEvents,
+    private readonly openInput: (file: string) => number = openForRead,
+    private readonly heldSpend?: (request: CompressedSpendRequest) => Promise<CompressedFactEntry | null | undefined>,
   ) {}
 
-  // A new worker starts from what the host holds, so its first poll reads only the bytes appended since the last reply.
-  // A seed ranks below any line that ties it, because a later line wins a tie.
+  // The host's offsets cover delivered envelopes and their spend witnesses.
   seed(resume: CompressedLoadResume): void {
     for (const [name, end] of resume.consumed) this.consumed.set(name, end);
     const nameSeeds = (resume.nameOnly ?? []).map((file): CompressedEntrySeed => ({
@@ -702,95 +1458,411 @@ export class CompressedStoreFollower {
       nameOnly: true,
     }));
     for (const seed of [...nameSeeds, ...resume.entries]) {
-      this.best.set(seed.file, {
-        ranked: { entry: rankFields(seed), epoch: -1, token: '', input: '', offset: -1, seq: -1 },
-        mark: compressedEntryMark(seed),
-      });
+      const ranked = rankedRecord(seed);
+      this.best.set(seed.file, { row: ranked, latest: ranked });
       this.seeds.set(seed.file, seed);
+      const held = seed.spendRecord ?? (seed.hasSpend ? seed.storeRecord : undefined);
+      const authority = completeSpendRevision(seed);
+      const records = [held && { ...held, spendRevision: spendRevision(seed) }, seed.spendWitness].filter(
+        (record): record is CompressedStoreRecord =>
+          record !== undefined && !precedesSpendAuthority(record.spendRevision, authority),
+      );
+      if (records.length || authority)
+        this.resumedSpend.set(seed.file, { source: rankedRecord(seed), authority, records });
     }
   }
 
-  // The byte offset that every poll reached in each store file.
   offsets(): [string, number][] {
     return [...this.consumed];
   }
 
-  // The newest entry of each path that a poll or the seed gave, without its title entry and spend record.
   known(): ReadonlyMap<string, CompressedEntrySeed> {
     return this.seeds;
   }
 
-  // The entries that are new or changed since the last poll.
-  async poll(): Promise<CompressedFactEntry[]> {
-    const names = listDirectory(this.directory);
-    const view = storeView(this.directory, names);
-    const present = new Set(names);
-    for (const name of this.consumed.keys()) if (!present.has(name)) this.consumed.delete(name);
-    const changed = new Map<string, CompressedFactEntry>();
-    for (const input of view.inputs) {
-      if (this.readInput(input, changed)) await this.yieldStep();
-    }
-    return [...changed.values()];
+  private takeRelocated(): [string, CompressedStoreRecord][] {
+    const entries = [...this.relocated];
+    this.relocated.clear();
+    return entries;
   }
 
-  // True when the input had new bytes.
-  private readInput(input: StoreName, changed: Map<string, CompressedFactEntry>): boolean {
+  private takeSpendRelocated(): [string, CompressedStoreRecord][] {
+    const entries = [...this.spendRelocated].filter(
+      ([file, record]) => this.spend.get(file)?.record.digest === record.digest,
+    );
+    this.spendRelocated.clear();
+    return entries;
+  }
+
+  entry(file: string): CompressedFactEntry | undefined {
+    const seed = this.seeds.get(file);
+    const record = seed?.storeRecord;
+    const entry = record && readCompressedRecord(this.directory, file, record);
+    return entry && seed?.revisionObservation ? { ...entry, revisionObservation: seed.revisionObservation } : entry;
+  }
+
+  // A holder reads the same traversal as a follow. Only a follow takes the pending delivery.
+  private scan(limit: number): Promise<boolean> {
+    const running = this.running.catch(() => false).then(() => this.readView(limit));
+    this.running = running;
+    return running;
+  }
+
+  async poll(): Promise<CompressedFactEntry[]> {
+    return (await this.follow()).entries;
+  }
+
+  async follow(): Promise<{
+    entries: CompressedFactEntry[];
+    offsets: [string, number][];
+    relocated: [string, CompressedStoreRecord][];
+    spendRelocated: [string, CompressedStoreRecord][];
+  }> {
+    await this.scan(Infinity);
+    for (const file of this.changedSpend) {
+      const entry = this.changed.get(file) ?? this.entry(file);
+      if (!entry) continue;
+      this.changed.set(file, entry);
+      this.changedSpend.delete(file);
+    }
+    const entries = [...this.changed.values()].map((entry) => {
+      const source = rankedRecord(entry);
+      const witness = this.spend.get(entry.file);
+      const resumed = this.resumedSpend.get(entry.file);
+      const live = witness && rankedSameOwner(witness.ranked, source) ? witness : undefined;
+      const seed = resumed && rankedSameOwner(resumed.source, source) ? resumed : undefined;
+      const authority = laterSpendRevision(live?.authority, seed?.authority);
+      const record =
+        live && !precedesSpendAuthority(live.revision, authority)
+          ? live.record
+          : seed?.records.find((ref) => !precedesSpendAuthority(ref.spendRevision, authority));
+      const ownAuthority = completeSpendRevision(entry);
+      const needsAuthority = authority && (!ownAuthority || compareSpendRevisions(authority, ownAuthority) > 0);
+      const distinct = record && record.digest !== entry.storeRecord?.digest;
+      if (!needsAuthority && !distinct) return entry;
+      const next = {
+        ...entry,
+        ...(needsAuthority ? { spendAuthority: authority } : {}),
+        ...(distinct ? { spendWitness: record } : {}),
+      };
+      const missing = !next.spend && !!record && verifiesCompressedBytes(next);
+      if (!missing && (!next.spend || !precedesSpendAuthority(spendRevision(next), authority))) return next;
+      const donor = record && this.readContributor(next.file, record);
+      if (missing && donor && eligibleCompressedSpend(donor) && compressedFactsSameOwner(donor, next))
+        return withSpendFrom(next, donor);
+      return withKeptUndercount(donor, next, this.quotedAt);
+    });
+    this.changed.clear();
+    return {
+      entries,
+      offsets: this.offsets(),
+      relocated: this.takeRelocated(),
+      spendRelocated: this.takeSpendRelocated(),
+    };
+  }
+
+  cover(): Promise<boolean> {
+    return this.scan(FOLLOW_SLICE_BYTES);
+  }
+
+  private async readView(limit: number): Promise<boolean> {
+    let covered = true;
+    const unreadable = () => {
+      covered = false;
+    };
+    const names = listDirectory(this.directory, unreadable);
+    const view = storeView(this.directory, names, unreadable);
+    const present = new Set(names);
+    this.readableInputs = new Set(view.inputs.map(({ name }) => name));
+    for (const name of this.consumed.keys()) if (!present.has(name)) this.consumed.delete(name);
+    for (const name of this.inputs.keys()) if (!present.has(name)) this.inputs.delete(name);
+    let sliced = 0;
+    for (const input of view.inputs) {
+      let status: 'covered' | 'partial' | 'refused';
+      do {
+        const before = this.bytesRead;
+        status = this.readInput(input, Math.min(limit, FOLLOW_SLICE_BYTES - sliced));
+        const bytes = this.bytesRead - before;
+        limit -= bytes;
+        sliced += bytes;
+        if (sliced >= FOLLOW_SLICE_BYTES) {
+          sliced = 0;
+          await this.yieldStep();
+        }
+      } while (status === 'partial' && limit > 0);
+      if (status !== 'covered') covered = false;
+    }
+    return covered;
+  }
+
+  private readInput(input: StoreName, limit: number): 'covered' | 'partial' | 'refused' {
     const file = path.join(this.directory, input.name);
-    let size: number;
-    try {
-      size = fs.statSync(file).size;
-    } catch {
-      return false;
+    const start = this.consumed.get(input.name) ?? 0;
+    let cursor = this.inputs.get(input.name);
+    if (!cursor) {
+      cursor = { position: start, start, fragments: [], versionKnown: start > 0, unsupported: false };
+      this.inputs.set(input.name, cursor);
     }
-    let consumed = this.consumed.get(input.name);
-    if (consumed === undefined) {
-      if (!readableFactsVersion(fileFactsVersion(file))) {
+    let fd: number | undefined;
+    try {
+      const size = fs.statSync(file).size;
+      if (size < cursor.position) return 'refused';
+      if (size === cursor.position) return 'covered';
+      if (cursor.unsupported) {
+        cursor.position = size;
         this.consumed.set(input.name, size);
-        return false;
+        return 'covered';
       }
-      consumed = 0;
-    }
-    if (size <= consumed) return false;
-    let end = consumed;
-    try {
-      this.bytesRead += eachLine(
-        file,
-        (line, offset) => {
-          end = offset + line.length + 1;
+      if (limit <= 0) return 'partial';
+      fd = this.openInput(file);
+      const chunk = Buffer.allocUnsafe(READ_CHUNK);
+      while (cursor.position < size && limit > 0) {
+        const count = fs.readSync(fd, chunk, 0, Math.min(READ_CHUNK, size - cursor.position, limit), cursor.position);
+        if (!count) return 'refused';
+        this.bytesRead += count;
+        limit -= count;
+        const head = cursor.position;
+        cursor.position += count;
+        let from = 0;
+        for (
+          let end = chunk.subarray(0, count).indexOf(0x0a);
+          end >= 0;
+          end = chunk.subarray(0, count).indexOf(0x0a, from)
+        ) {
+          const part = chunk.subarray(from, end);
+          const line = cursor.fragments.length ? Buffer.concat([...cursor.fragments, part]) : part;
           const entry = parseEntry(line.toString('utf8'));
-          if (!entry || !readableFactsVersion(entry.factsVersion)) return;
-          this.rank(entry, input, offset, changed);
-        },
-        openForRead,
-        consumed,
-      );
+          if (!cursor.versionKnown) {
+            cursor.versionKnown = true;
+            cursor.unsupported = !!entry && !readableFactsVersion(entry.factsVersion);
+          }
+          if (cursor.unsupported) {
+            cursor.position = size;
+            cursor.fragments = [];
+            this.consumed.set(input.name, size);
+            return 'covered';
+          }
+          if (entry && readableFactsVersion(entry.factsVersion)) this.rank(entry, input, cursor.start, line);
+          from = end + 1;
+          cursor.start = head + from;
+          cursor.fragments = [];
+          this.consumed.set(input.name, cursor.start);
+        }
+        if (from < count) cursor.fragments.push(Buffer.from(chunk.subarray(from, count)));
+      }
+      return cursor.position === size ? 'covered' : 'partial';
     } catch {
-      // The file went away. The next listing no longer names it.
+      // A listed input that gave no answer leaves a conditional write pending.
+      return 'refused';
+    } finally {
+      if (fd !== undefined) fs.closeSync(fd);
     }
-    this.consumed.set(input.name, end);
-    return true;
+  }
+
+  noteAppend(entry: CompressedFactEntry, record: CompressedStoreRecord): void {
+    const { input, offset, bytes } = record;
+    const name = storeName(input)!;
+    this.readableInputs.add(input);
+    const cursor = this.inputs.get(input);
+    if ((cursor?.position ?? this.consumed.get(input) ?? 0) !== offset || (cursor && cursor.start !== offset)) return;
+    this.rank(entry, name, offset, record);
+    if (eligibleCompressedSpend(entry)) this.resumedSpend.delete(entry.file);
+    const end = offset + bytes;
+    this.consumed.set(input, end);
+    this.inputs.set(input, { position: end, start: end, fragments: [], versionKnown: true, unsupported: false });
+  }
+
+  adoptedEntry(entry: CompressedFactEntry): CompressedFactEntry {
+    if (!entry.storeRecord || !entry.adopted) return entry;
+    const prior = this.seeds.get(entry.file);
+    this.noteAppend(entry, entry.storeRecord);
+    const selected = this.seeds.get(entry.file);
+    if (!prior || !selected?.storeRecord || selected.storeRecord.digest === entry.storeRecord.digest) return entry;
+    const ranked = reconcileCompressedEntries(selected, entry);
+    if (ranked?.storeRecord?.digest !== selected.storeRecord.digest) return entry;
+    const pending = this.changed.get(entry.file);
+    if (pending?.storeRecord?.digest === selected.storeRecord.digest) return pending;
+    // The host can reconcile ordinary same-byte replies with the row it already holds.
+    if (prior.hash === entry.hash && selected.hash === entry.hash) return entry;
+    const exact = this.readContributor(entry.file, selected.storeRecord);
+    return exact ? { ...exact, revisionObservation: ranked.revisionObservation } : entry;
+  }
+
+  private readContributor(file: string, record: CompressedStoreRecord): CompressedFactEntry | undefined {
+    if (!this.readableInputs.has(record.input)) return undefined;
+    const entry = readCompressedRecord(this.directory, file, record);
+    if (entry) this.contributorBytesRead += record.bytes;
+    return entry;
   }
 
   private rank(
     entry: CompressedFactEntry,
     input: StoreName,
     offset: number,
-    changed: Map<string, CompressedFactEntry>,
+    line: Buffer | CompressedStoreRecord,
   ): void {
-    const ranked: RankedEntry = {
-      entry: rankFields(entry),
-      epoch: input.epoch,
-      token: input.token,
-      input: input.name,
-      offset,
-      seq: input.seq,
+    const ranked = rankedLine(entry, input, offset);
+    const file = entry.file;
+    const held = this.best.get(file);
+    const prior = this.seeds.get(file);
+    const witness = this.spend.get(file);
+    const seed = this.resumedSpend.get(file);
+    const authority = seed && rankedSameOwner(seed.source, ranked) ? seed.authority : undefined;
+    const storeRecord = () => (ranked.record ??= Buffer.isBuffer(line) ? referenceOf(entry, ranked, line) : line);
+    if (ranked.entry.verifiedBytes) {
+      storeRecord();
+      if (input.kind === 'shard' && !ranked.order && held) {
+        const earlier =
+          held.latest.record?.digest === ranked.record!.digest
+            ? held.latest
+            : (held.alternatives?.get(entry.hash!) ?? (held.row.entry.hash === entry.hash ? held.row : undefined));
+        if (earlier?.record?.digest === ranked.record!.digest) {
+          ranked.order = factsOrder(earlier);
+          ranked.record!.order = ranked.order;
+          if (ranked.record!.spendRevision) ranked.record!.spendRevision = spendRevision(entry, ranked);
+        }
+      }
+      noteCompleteSpend(entry, ranked, this.quotedAt);
+    }
+    let facts = rankFacts(held, ranked, held ? this.statOf(file) : null);
+    let restored: CompressedFactEntry | undefined;
+    if (facts.row !== ranked && facts.row !== held?.row) {
+      // A previous derivation is usable while its exact line survives.
+      const address = facts.row.record;
+      restored = address && this.readContributor(file, address);
+      if (restored) {
+        if (!facts.row.completeSpend) noteCompleteSpend(restored, facts.row, this.quotedAt);
+      } else {
+        facts.alternatives?.set(entry.hash!, ranked);
+        facts = { ...facts, row: ranked };
+      }
+    }
+    const better = facts !== held;
+    if (better) this.best.set(file, facts);
+    let spend = rankSpend(entry, ranked, witness, this.quotedAt, authority, selectedCompleteSpend(facts));
+    const canRelocate = witness && !this.readableInputs.has(witness.record.input);
+    if (!better && !spend && !canRelocate) return;
+    const ref = storeRecord();
+    const { digest } = ref;
+    if (canRelocate && digest === witness.record.digest && !precedesSpendAuthority(witness.revision, authority)) {
+      // The compactor copied the bytes. Move the reference without changing when the amount was derived.
+      spend = spend?.authority === witness.authority || !spend ? { ...witness, ranked } : { ...spend, ranked };
+      ref.spendRevision = witness.revision;
+    }
+    if (spend) {
+      const record = spend.ranked === ranked ? ref : (spend.ranked.record ?? witness!.record);
+      this.spend.set(file, { ...spend, record });
+      if (
+        spend.ranked === ranked &&
+        (!better || this.resumedSpend.get(file)?.records.some((record) => record.digest === digest))
+      )
+        this.spendRelocated.set(file, ref);
+      if (
+        !better &&
+        spend.authority &&
+        (!witness?.authority || compareSpendRevisions(spend.authority, witness.authority) > 0)
+      )
+        this.changedSpend.add(file);
+    }
+    if (!better) return;
+
+    const selected = facts.row;
+    const address = selected === ranked ? ref : selected.record;
+    if (!address) return;
+    const pending = this.changed.get(file);
+    const chosen = selected === ranked ? entry : pending?.storeRecord?.digest === address.digest ? pending : restored;
+    const located = chosen && observedEntry({ ...chosen, storeRecord: address }, facts);
+    if (located) {
+      this.seeds.set(file, compressedEntrySeed(located));
+    } else if (selected === held?.row && prior) {
+      this.seeds.set(file, observedEntry(prior, facts));
+    } else return;
+    const next = this.seeds.get(file)!;
+    if (!prior || !compressedEntrySame(prior, next) || pending) {
+      this.relocated.delete(file);
+      if (located) this.changed.set(file, located);
+      else {
+        this.changed.delete(file);
+        this.changedSpend.add(file);
+      }
+    } else if ((!next.nameOnly || next.unreadable) && prior.storeRecord?.input !== address.input) {
+      this.relocated.set(file, address);
+    }
+  }
+
+  // Exact hydration is limited to the affected path's ranked envelope and independent spend witnesses.
+  async carriedEntry(next: CompressedFactEntry): Promise<CompressedFactEntry | undefined> {
+    const file = next.file;
+    const seed = this.seeds.get(file);
+    const envelope = seed?.storeRecord;
+    const observed = this.spend.get(file);
+    const seeded = this.resumedSpend.get(file);
+    const source = rankedRecord(next);
+    const live = observed && rankedSameOwner(observed.ranked, source) ? observed : undefined;
+    const resumed = seeded && rankedSameOwner(seeded.source, source) ? seeded : undefined;
+    const authority = laterSpendRevision(live?.authority, resumed?.authority);
+    const located = [
+      ...(resumed?.records ?? []),
+      ...(next.unreadable || seed?.hasSpend ? [envelope] : []),
+      live?.record,
+    ];
+    const refs = new Map(located.flatMap((ref) => (ref ? [[ref.digest, ref]] : [])));
+    let prior: CompressedFactEntry | undefined;
+    const candidates: CompressedFactEntry[] = [];
+    for (const ref of refs.values()) {
+      const needsTitle = next.unreadable && ref.digest === envelope?.digest;
+      if (!needsTitle && precedesSpendAuthority(ref.spendRevision, authority)) continue;
+      let entry: CompressedFactEntry | undefined;
+      if (this.readableInputs.has(ref.input)) {
+        entry = readCompressedRecord(this.directory, file, ref);
+        if (!entry) return undefined;
+        this.contributorBytesRead += ref.bytes;
+      } else if (ref.spendDigest && this.heldSpend && !precedesSpendAuthority(ref.spendRevision, authority)) {
+        const answer = await this.heldSpend({ file, record: ref });
+        if (answer === undefined) return undefined;
+        entry = heldCompressedSpend(answer ?? undefined, { file, record: ref });
+      }
+      if (!entry) continue;
+      if (!compressedFactsSameOwner(entry, next)) continue;
+      if (ref.digest === envelope?.digest && !entry.nameOnly && !entry.adoptionFailed && !entry.spendNeedsRepair)
+        prior = entry;
+      if (eligibleCompressedSpend(entry)) candidates.push(entry);
+    }
+    let latest = authority;
+    for (const entry of candidates) latest = laterSpendRevision(latest, completeSpendRevision(entry));
+    let spent: CompressedFactEntry | undefined;
+    for (const entry of candidates) {
+      if (
+        !precedesSpendAuthority(spendRevision(entry), latest) &&
+        (!spent || compareSpendEntries(entry, spent, this.quotedAt) > 0)
+      )
+        spent = entry;
+    }
+    const current = latest ? { ...next, spendAuthority: latest } : next;
+    if (!next.unreadable) return withKeptUndercount(spent, current, this.quotedAt);
+    if (!prior && !spent) return current;
+    const kept = prior ?? spent!;
+    const { title, carriedName, complete } = kept;
+    const spend = spent?.spend;
+    return {
+      ...current,
+      nameOnly: undefined,
+      title: compressedTitleCurrent(kept) ? title : undefined,
+      carriedName:
+        carriedName ??
+        (title && !compressedTitleCurrent(kept) ? { label: title.label, fullLabel: title.fullLabel } : undefined),
+      complete,
+      hash: compressedEntryCurrent(kept, next as CompressedRevision) ? kept.hash : undefined,
+      spend,
+      spendRevision: spent && spendRevision(spent),
+      spendOrigin:
+        spend && spent
+          ? {
+              ...(spent.spendOrigin ?? compressedSpendOrigin(spent.threadId, spend, spent.hash)),
+              retained: true,
+            }
+          : undefined,
     };
-    const held = this.best.get(entry.file);
-    if (held && compareRankedEntries(ranked, held.ranked, this.statOf(entry.file)) <= 0) return;
-    const mark = compressedEntryMark(entry);
-    this.best.set(entry.file, { ranked, mark });
-    this.seeds.set(entry.file, compressedEntrySeed(entry));
-    if (held?.mark !== mark) changed.set(entry.file, entry);
   }
 }
 
@@ -860,8 +1932,12 @@ export class CompressedStoreHolder {
   private readonly compactSegments: number;
 
   private readonly queue: CompressedFactEntry[] = [];
-  private readonly flushed = new WeakSet<CompressedFactEntry>();
-  private readonly revisionTests = new WeakMap<CompressedFactEntry, () => boolean>();
+  private readonly flushed = new WeakMap<CompressedFactEntry, CompressedStoreRecord>();
+  private readonly revisionTests = new WeakMap<CompressedFactEntry, () => boolean | undefined>();
+  private readonly conditional = new WeakMap<CompressedFactEntry, CompressedStoreFollower>();
+  private readonly finalized = new WeakMap<CompressedFactEntry, CompressedFactEntry>();
+  private factsFollower?: CompressedStoreFollower;
+  private covered = false;
   private readonly withdrawn = new WeakSet<CompressedFactEntry>();
   private waiters: { entries: readonly CompressedFactEntry[]; settle: (durable: boolean) => void }[] = [];
   private token: string | null = null;
@@ -925,10 +2001,26 @@ export class CompressedStoreHolder {
   // Queue entries and work them off. The returned promise settles when this run of the queue ends, with one value per
   // entry: true when its line is on disk. A false value leaves the entry queued, and `durable` reports its end.
   // `revisionHolds` runs at the write. A false answer withdraws the entry, and nothing writes its line.
-  append(entries: readonly CompressedFactEntry[], revisionHolds?: () => boolean): Promise<boolean[]> {
+  append(entries: readonly CompressedFactEntry[], revisionHolds?: () => boolean | undefined): Promise<boolean[]> {
     if (revisionHolds) for (const entry of entries) this.revisionTests.set(entry, revisionHolds);
     this.queue.push(...entries);
     return this.work().then(() => entries.map((entry) => this.flushed.has(entry)));
+  }
+
+  async appendCarryingFacts(
+    entry: CompressedFactEntry,
+    revisionHolds: () => boolean | undefined,
+    follower?: CompressedStoreFollower,
+  ): Promise<CompressedFactEntry | undefined> {
+    this.factsFollower ??=
+      follower ?? new CompressedStoreFollower(this.directory, this.statOf, this.yieldStep, this.openInput);
+    if (entry.undercount || entry.unreadable) this.conditional.set(entry, this.factsFollower);
+    const [written] = await this.append([entry], revisionHolds);
+    return written || (await this.durable([entry])) ? this.finalized.get(entry) : undefined;
+  }
+
+  recordOf(entry: CompressedFactEntry): CompressedStoreRecord | undefined {
+    return this.flushed.get(entry);
   }
 
   // True when every entry reaches the disk, or false when one is withdrawn or the holder is disposed first.
@@ -969,19 +2061,28 @@ export class CompressedStoreHolder {
   }
 
   private async run(): Promise<void> {
-    while (this.queue.length && !this.disposed) {
-      this.cancelIdle?.();
-      this.cancelIdle = null;
-      if (!this.token && !(await this.takeLease())) {
-        this.retryLater();
+    if (this.cancelRetry) return;
+    this.cancelIdle?.();
+    this.cancelIdle = null;
+    if (this.queue.length && !this.token && !(await this.takeLease())) {
+      this.retryLater();
+      return;
+    }
+    const deferred = new Set<CompressedFactEntry>();
+    while (this.queue.length && this.token && !this.disposed) {
+      const first = this.queue[0];
+      if (deferred.has(first)) {
+        this.abandon();
         return;
       }
-      while (this.queue.length && this.token) {
-        if (!this.publishBatch()) return;
-        if (this.closedSegments >= this.compactSegments && this.compactionAllowed()) await this.compact(false);
-        await this.yieldStep();
-      }
+      const progress = await this.publishBatch();
       if (!this.token) return;
+      if (!progress) {
+        deferred.add(first);
+        this.queue.push(this.queue.shift()!);
+      }
+      if (this.closedSegments >= this.compactSegments && this.compactionAllowed()) await this.compact(false);
+      await this.yieldStep();
     }
     this.armIdleRelease();
   }
@@ -1058,6 +2159,7 @@ export class CompressedStoreHolder {
     this.cancelRenewal = null;
     this.token = null;
     this.epoch = null;
+    this.covered = false;
     if (token) {
       try {
         releaseCodexOpeningsLock(this.lock, token);
@@ -1186,34 +2288,90 @@ export class CompressedStoreHolder {
     this.closedSegments++;
   }
 
-  private publishBatch(): boolean {
+  private async publishBatch(): Promise<boolean> {
     let bytes = 0;
     let taken = 0;
     let oversized = false;
     const lines: string[] = [];
+    const prepared: CompressedFactEntry[] = [];
     while (taken < this.queue.length && bytes < this.segmentBytes) {
-      let entry = this.queue[taken];
-      if (this.revisionTests.get(entry)?.() === false) {
+      const queued = this.queue[taken];
+      const test = this.revisionTests.get(queued);
+      let revision = test ? test() : true;
+      if (revision === undefined) {
+        if (!taken) return false;
+        break;
+      }
+      if (!revision) {
         this.queue.splice(taken, 1);
-        this.withdrawn.add(entry);
+        this.withdrawn.add(queued);
         this.settleWaiters();
         continue;
       }
-      entry = boundedCompressedEntry(entry);
-      const line = `${JSON.stringify(entry)}\n`;
-      const length = Buffer.byteLength(line);
+      let entry = queued;
+      const follower = this.conditional.get(queued);
+      if (follower) {
+        if (taken) break;
+        if (!this.covered) {
+          const covered = await follower.cover();
+          if (!this.check() || !covered) return false;
+          this.covered = true;
+        }
+        const final = await follower.carriedEntry(queued);
+        if (!final) {
+          this.covered = false;
+          return false;
+        }
+        revision = test ? test() : true;
+        if (revision === undefined) return false;
+        if (!revision) {
+          this.queue.splice(taken, 1);
+          this.withdrawn.add(queued);
+          this.settleWaiters();
+          continue;
+        }
+        entry = final;
+      }
+      const {
+        storeRecord: _reference,
+        spendRecord: _spend,
+        spendWitness: _witness,
+        hasSpend: _hasSpend,
+        revisionObservation: _observation,
+        ...facts
+      } = entry;
+      const serialized = (segment: OpenSegment | null) => {
+        const sequence = segment ? storeName(segment.name)!.seq : this.seq;
+        const order: CompressedOrder = [this.epoch!.e, this.token!, sequence, (segment?.bytes ?? 0) + bytes];
+        entry = { ...facts };
+        if (eligibleCompressedSpend(entry) && !entry.spendRevision) {
+          entry.spendRevision =
+            !entry.unreadable && !entry.spendOrigin?.retained
+              ? { mtimeMs: entry.mtimeMs, size: entry.size, order }
+              : spendRevision(entry);
+        }
+        if (verifiesCompressedBytes(entry) && !recordedFactsOrder(entry)) entry.factsOrder = order;
+        entry = boundedCompressedEntry(entry);
+        const line = `${JSON.stringify(entry)}\n`;
+        return { line, length: Buffer.byteLength(line) };
+      };
+      let { line, length } = serialized(this.open);
       // A record above 4 MiB gets a segment file of its own.
       if (length > this.segmentBytes) {
         if (taken) break;
         oversized = true;
+        if (this.open) ({ line, length } = serialized(null));
         lines.push(line);
+        prepared.push(entry);
         bytes = length;
         taken = 1;
         break;
       }
       lines.push(line);
+      prepared.push(entry);
       bytes += length;
       taken++;
+      if (follower) break;
     }
     if (!taken) return true;
     if (!this.check()) return false;
@@ -1226,7 +2384,25 @@ export class CompressedStoreHolder {
     this.wrote(bytes);
     this.fault('segment:flushed');
     if (!this.flushReachedStore(segment)) return false;
-    for (const flushed of this.queue.splice(0, taken)) this.flushed.add(flushed);
+    let offset = segment.bytes - bytes;
+    for (const [at, flushed] of this.queue.splice(0, taken).entries()) {
+      const line = lines[at];
+      const length = Buffer.byteLength(line);
+      const entry = prepared[at];
+      const storeRecord = {
+        input: segment.name,
+        offset,
+        bytes: length,
+        digest: recordDigest(line),
+        spendDigest: spendDigest(entry.spend),
+        order: recordedFactsOrder(entry),
+        spendRevision: eligibleCompressedSpend(entry) ? spendRevision(entry) : undefined,
+      };
+      this.flushed.set(flushed, storeRecord);
+      this.finalized.set(flushed, { ...entry, storeRecord });
+      if (this.covered) this.factsFollower?.noteAppend(entry, storeRecord);
+      offset += length;
+    }
     this.settleWaiters();
     if (oversized || segment.bytes >= this.segmentBytes) this.closeSegment();
     return true;
@@ -1260,9 +2436,17 @@ export class CompressedStoreHolder {
 
   // Recovery at a takeover, before the holder writes any shard, segment or manifest.
   private async recover(): Promise<void> {
-    const names = listDirectory(this.directory);
-    const view = storeView(this.directory, names);
+    let refused = false;
+    const unreadable = () => {
+      refused = true;
+    };
+    const names = listDirectory(this.directory, unreadable);
+    const view = storeView(this.directory, names, unreadable);
     this.fault('recovery:start');
+    if (refused) {
+      this.abandon();
+      return;
+    }
     // A holder paused since its listing deletes nothing, because the listing no longer describes the store.
     if (!this.check()) return;
     const current = view.current;
@@ -1332,6 +2516,7 @@ export class CompressedStoreHolder {
   private async compact(recovery: boolean): Promise<void> {
     if (!this.token) return;
     this.closeSegment();
+    this.covered = false;
     this.fault('compact:start');
     const names = listDirectory(this.directory);
     const view = storeView(this.directory, names);
@@ -1373,27 +2558,33 @@ export class CompressedStoreHolder {
     shards: string[],
     recovery: boolean,
   ): Promise<void> {
-    const best = new Map<string, RankedEntry>();
+    const best = new Map<string, RankedFacts>();
+    const spend = new Map<string, RankedSpend>();
+    const quotedAt = this.now();
     for (const input of inputs) {
       this.readInputLines(input.name, (line, offset) => {
         const entry = parseEntry(line.toString('utf8'));
         if (!entry || !readableFactsVersion(entry.factsVersion)) return;
-        const ranked: RankedEntry = {
-          entry: rankFields(entry),
-          epoch: input.epoch,
-          token: input.token,
-          input: input.name,
-          offset,
-          seq: input.seq,
-        };
+        const ranked = rankedLine(entry, input, offset);
         const held = best.get(entry.file);
-        if (!held || compareRankedEntries(ranked, held, this.statOf(entry.file)) > 0) best.set(entry.file, ranked);
+        noteCompleteSpend(entry, ranked, quotedAt);
+        const facts = rankFacts(held, ranked, held ? this.statOf(entry.file) : null);
+        if (facts !== held) best.set(entry.file, facts);
+        const witness = rankSpend(
+          entry,
+          ranked,
+          spend.get(entry.file),
+          quotedAt,
+          undefined,
+          selectedCompleteSpend(facts),
+        );
+        if (witness) spend.set(entry.file, witness);
       });
       await this.yieldStep();
     }
     const kept = [...best.values()]
-      .filter(({ entry }) => this.exists(entry.file) || this.exists(entry.file.replace(/\.zst$/, '')))
-      .sort((left, right) =>
+      .filter(({ row: { entry } }) => this.exists(entry.file) || this.exists(entry.file.replace(/\.zst$/, '')))
+      .sort(({ row: left }, { row: right }) =>
         left.entry.pairKey < right.entry.pairKey ? -1 : left.entry.pairKey > right.entry.pairKey ? 1 : 0,
       );
     let text = '';
@@ -1409,7 +2600,16 @@ export class CompressedStoreHolder {
       bytes = 0;
       return true;
     };
-    for (const ranked of kept) {
+    for (const ranked of kept.flatMap(({ row, latest }) => {
+      const witness = spend.get(row.entry.file);
+      const records =
+        witness && rankedSameOwner(witness.ranked, row)
+          ? new Set([row, latest, witness.ranked, witness.authorityLine])
+          : new Set([row, latest]);
+      return [...records]
+        .filter((record) => record !== undefined)
+        .sort((a, b) => compareOrder(factsOrder(a), factsOrder(b)));
+    })) {
       const line = `${this.readInputLine(ranked.input, ranked.offset)}\n`;
       text += line;
       bytes += Buffer.byteLength(line);
