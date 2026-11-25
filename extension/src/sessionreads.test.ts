@@ -432,6 +432,59 @@ test('read receipts contain only completed turns retained after the bounded resp
   assert.equal('readObservation' in overflow, false);
 });
 
+test('Antigravity session reads keep their byte limit and verify returned acknowledgments', () => {
+  const root = tempDir('agy-bounded-session-');
+  const sessionId = '00000000-0000-0000-0000-000000000009';
+  const log = path.join(root, sessionId, '.system_generated', 'logs');
+  const file = path.join(log, 'transcript_full.jsonl');
+  fs.mkdirSync(log, { recursive: true });
+  const at = '2026-11-22T05:00:00Z';
+  const lines =
+    [
+      { type: 'USER_INPUT', content: 'Finish.' },
+      { type: 'PLANNER_RESPONSE', content: 'Done.' },
+    ]
+      .map((row, step_index) => JSON.stringify({ ...row, step_index, created_at: at, status: 'DONE' }))
+      .join('\n') + '\n';
+  try {
+    fs.writeFileSync(file, ' '.repeat(SESSION_READ_LIMITS.bytes) + '\n' + lines);
+    const source: SessionFile = {
+      agent: 'agy',
+      sessionId,
+      file,
+      agyOwnerRoot: root,
+      ...revisionOf(fs.statSync(file, { bigint: true })),
+    };
+    let identities: AgentReadRecord[] = [];
+    const window = openReadWindow();
+    const reply = boundedSessionRead(
+      source,
+      2,
+      () => 'scope',
+      'fixture',
+      [root],
+      undefined,
+      ({ records }) => {
+        identities = records;
+        return 'receipt';
+      },
+    );
+    const metrics = closeReadWindow(window);
+    const facts = new AgentReadSources().resolve(source, () => 'scope', [root]);
+    assert.equal(reply.turns[0]?.summary, 'Done.');
+    assert.equal(identities.length, 1);
+    assert.deepEqual(
+      {
+        bounded: metrics.bytes <= SESSION_READ_LIMITS.bytes,
+        verified: currentAgentRead(identities[0], facts),
+      },
+      { bounded: true, verified: true },
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('bounded session reads preserve native provider turns and reject stale scope and source revisions', () => {
   const directory = tempDir('session-read-');
   for (const agent of ['claude', 'codex'] as const) {

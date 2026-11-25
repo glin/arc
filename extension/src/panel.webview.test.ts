@@ -12295,7 +12295,7 @@ test('a session joins the list only once a human has prompted it, and the cut st
   );
   sourceMatch(
     panelHostSource,
-    /const walkedSessions = orderSessionCatalog\(\[\.\.\.listed, \.\.\.this\.claudeChildren, \.\.\.codex\],[\s\S]*this\.activityFor\(session\)\);/,
+    /const walkedSessions = orderSessionCatalog\(\[\.\.\.listed, \.\.\.this\.claudeChildren, \.\.\.codex, \.\.\.agy\], \(session\) =>\s*this\.activityFor\(session\),?\s*\);/,
     'the filtered list is not what the panel merges',
   );
   sourceMatch(
@@ -12555,7 +12555,7 @@ test('clearing empties one session and leaves the other agents alone', () => {
   }
 });
 
-test('both agents reach one list, and each session is read and named by its own reader', () => {
+test('Claude, Codex, and Antigravity reach one list and use their own readers', () => {
   const marker = 'private allSessions(';
   const from = panelHostSource.indexOf(marker);
   assert.notEqual(from, -1, `panelhost.ts no longer contains "${marker}", so this guard cannot see the merge`);
@@ -12609,8 +12609,8 @@ test('both agents reach one list, and each session is read and named by its own 
   // Match the combined catalog through its return statement.
   sourceMatch(
     merge,
-    /const walkedSessions = orderSessionCatalog\(\[\.\.\.listed, \.\.\.this\.claudeChildren, \.\.\.codex\],[\s\S]*this\.activityFor\(session\)\);[\s\S]*return walkedSessions;/,
-    'what the panel gets back is not both lists in one order, whatever was listed above it',
+    /const walkedSessions = orderSessionCatalog\(\[\.\.\.listed, \.\.\.this\.claudeChildren, \.\.\.codex, \.\.\.agy\], \(session\) =>\s*this\.activityFor\(session\),?\s*\);[\s\S]*return walkedSessions;/,
+    'the walk must return the combined catalog in activity order',
   );
   // Retain rollout metadata and trim its cache against walked files.
   sourceMatch(
@@ -12636,6 +12636,11 @@ test('both agents reach one list, and each session is read and named by its own 
     'the progressive worker does not dispatch each session to its own reader',
   );
   sourceMatch(
+    workerEntry,
+    /if \(session\.agent === 'agy' && request\.kind === 'window'\) \{ const checkpoint = [^;]+; let result = await readAgySessionAsync\(session\.file, session\.sessionId,/,
+    'the progressive worker must dispatch Antigravity history to its own reader',
+  );
+  sourceMatch(
     panelHostSource,
     /private readFor\([\s\S]*?const hit = this\.cache\.get\(session\.file\);/,
     'the host does not expose only an accepted worker window to card collection',
@@ -12653,7 +12658,7 @@ test('Claude child catalog membership does not depend on the evictable parent tu
   );
   sourceMatch(
     merge,
-    /\[\.\.\.listed, \.\.\.this\.claudeChildren, \.\.\.codex\]/,
+    /\[\.\.\.listed, \.\.\.this\.claudeChildren, \.\.\.codex, \.\.\.agy\]/,
     'verified children do not reach the complete catalog used by pinned and selected sessions',
   );
   sourceDoesNotMatch(
@@ -18283,7 +18288,7 @@ test('draft MCP wiring cancels stale work and leaves Codex Servers on its cached
   );
   sourceMatch(
     selection,
-    /if \(session && agent\) \{ refreshUsage\(agent, false, session, agent, cwd \?\? undefined\); \}/,
+    /if \(session && agent && agent !== 'agy'\) \{ refreshUsage\(agent, false, session, agent, cwd \?\? undefined\); \}/,
     'selecting a recorded session leaves its owner-scoped Servers state undiscovered',
   );
   const closeAt = extensionSource.indexOf('panel.onPanelsClosed =');
@@ -25332,7 +25337,7 @@ test('activity changes leave the rail order alone while a host remains open', ()
   // The catalog orders by activity, while the session list reconciles its displayed order separately.
   sourceMatch(
     panelHostSource,
-    /const walkedSessions = orderSessionCatalog\(\[\.\.\.listed, \.\.\.this\.claudeChildren, \.\.\.codex\],[\s\S]*this\.activityFor\(session\)\);/,
+    /const walkedSessions = orderSessionCatalog\(\[\.\.\.listed, \.\.\.this\.claudeChildren, \.\.\.codex, \.\.\.agy\], \(session\) =>\s*this\.activityFor\(session\),?\s*\);/,
     'the stable rail order replaced the recency order used outside the rail',
   );
   // Reused catalogs also order by the current activity reading.
@@ -45058,7 +45063,7 @@ test.each([false, true])(
   async (admitted) => {
     const enumeration = methodBody('private walkedSessions(');
     const quarantineSource = ts.transpileModule(
-      `function quarantine(claude, codex, scope, sourceObservations = [], childSources = [], heldClaude, slicedClaude) { const roots = scope.roots; const physicalContext = { domain: "physical", scope: JSON.stringify(scope.roots), revision: String(this.coverageRevision) }; const walkedSessions = [...claude, ...codex]; ${enumeration.slice(enumeration.indexOf('this.enumeratedMembers ='), enumeration.indexOf('this.catalog = { folders: folderPrint', enumeration.indexOf('this.enumeratedMembers =')))} }`,
+      `function quarantine(claude, codex, scope, sourceObservations = [], childSources = [], heldClaude, slicedClaude) { const roots = scope.roots; const physicalContext = { domain: "physical", scope: JSON.stringify(scope.roots), revision: String(this.coverageRevision) }; const agy = []; const walkedSessions = [...claude, ...codex, ...agy]; ${enumeration.slice(enumeration.indexOf('this.enumeratedMembers ='), enumeration.indexOf('this.catalog = { folders: folderPrint', enumeration.indexOf('this.enumeratedMembers =')))} }`,
       { compilerOptions: { target: ts.ScriptTarget.ES2022 } },
     ).outputText;
     const quarantine = new Function(

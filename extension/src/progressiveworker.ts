@@ -141,8 +141,11 @@ export function unreadHeadBytes(
   return SESSION_HEAD_BYTES - HEAD_KEY_BYTES;
 }
 
-export type ProgressiveCheckpoint = ClaudeForwardCheckpoint | CodexForwardCheckpoint;
-export type ProgressiveCursor = ClaudeHistoryCursor | CodexHistoryCursor;
+export type ProgressiveCheckpoint =
+  | ClaudeForwardCheckpoint
+  | CodexForwardCheckpoint
+  | import('./agyhistory').AgyCheckpoint;
+export type ProgressiveCursor = ClaudeHistoryCursor | CodexHistoryCursor | import('./agyhistory').AgyHistoryCursor;
 export interface ProgressiveInput {
   session: SessionFile;
   folders: string[];

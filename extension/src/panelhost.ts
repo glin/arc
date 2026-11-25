@@ -115,6 +115,15 @@ import type { ClaudeForwardCheckpoint } from './claudehistory';
 import * as vscode from 'vscode';
 import { costStateDependency, costStateIdentity, reconcileClaudeCostState } from './claudecoststate';
 import { ClaudeCostStateDependencyIndex, invalidateClaudeCostSupplements } from './projectspend';
+import {
+  agyBrainRoot,
+  agyCollisionWith,
+  omitAgyCollisions,
+  scanAgySessions,
+  type AgyDiscoveryCache,
+  type AgyDiscoveryResult,
+} from './agydiscovery';
+import { createAgyUsageReducer, readAgySession } from './agyhistory';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { PlatformPath } from 'node:path';
@@ -714,8 +723,7 @@ import {
   staleCursorIsStuck,
   startSessionHistory,
 } from './historypages';
-import { ClaudeHistoryCursor } from './claudehistory';
-import { CodexHistoryCursor, type CodexForwardCheckpoint } from './codexhistory';
+import { type CodexForwardCheckpoint } from './codexhistory';
 import {
   BoundedTrailingScheduler,
   IntegrityScheduler,
@@ -882,7 +890,7 @@ const RECORDED_REPLY_RETRY_MS = 1_000;
 
 // Each source adapter owns the cursor for its next older page. The provider passes
 // it back to that adapter and drops it when the source revision changes.
-type HistoryCursor = ClaudeHistoryCursor | CodexHistoryCursor;
+type HistoryCursor = import('./progressiveworker').ProgressiveCursor;
 
 // A copy of `value` with the session's current speed selection. No selection leaves the field absent.
 function carryServiceTier<T extends { serviceTier?: ServiceTier }>(value: T, tier: ServiceTier | undefined): T {
@@ -923,6 +931,14 @@ type DiscoveryPendingWriter =
 
 // The scope text and source roots that physical membership checks share within one synchronous run.
 type PhysicalMembershipHeld = { scope?: string; claude?: string[]; codex?: string[] };
+
+interface ProjectSpendSource {
+  file: string;
+  agent: AgentKind;
+  primary?: boolean;
+  agySource?: SessionFile;
+  agyMissing?: true;
+}
 
 // Why an accepted catalog holds no session read revision, named in the performance counters.
 type AcceptedUnsettledCause =
@@ -1948,6 +1964,14 @@ export class PanelProvider implements vscode.Disposable {
   private enumeratedAmbiguousIds?: Set<string>;
   private enumeratedCollisions?: SessionCollisionEvidence;
   private enumeratedAdmissionComplete = false;
+  private agyCatalog?: AgyDiscoveryResult & { folderPrint: string; publish: boolean };
+  private agyScan?: {
+    key: string;
+    brain: string;
+    cache: AgyDiscoveryCache;
+    controller?: AbortController;
+    coveragePublished?: boolean;
+  };
   // The latest search query that arrived during the cold pass. Only it is answered after.
   private waitingSearch: string | null = null;
   // Titles and activity times share a revisioned read. Size or mtime changes invalidate the entry.
@@ -2332,7 +2356,7 @@ export class PanelProvider implements vscode.Disposable {
     )
       return;
     const state = this.stateFor(session);
-    if (!state) return;
+    if (!state || state.agent === 'agy') return;
     this.contextRequests.set(host, request);
     const aggregate = JSON.stringify(state.context);
     const model = state.settings.selectedModel || state.settings.confirmedModel || '';
@@ -2797,7 +2821,7 @@ export class PanelProvider implements vscode.Disposable {
   private projectSpendHydrationTick: ReturnType<typeof setTimeout> | null = null;
   // Integrity queues supplement targeted source events with independent periodic checks.
   private spendIntegrity?: IntegrityScheduler;
-  private spendSourcesByFile = new Map<string, { file: string; agent: AgentKind; primary?: boolean }>();
+  private spendSourcesByFile = new Map<string, ProjectSpendSource>();
   private spendFilesBySession = new Map<string, string[]>();
   private spendNativeChildren = new Set<string>();
   private spendRecordsByFile = new Map<string, number>();
@@ -2819,7 +2843,7 @@ export class PanelProvider implements vscode.Disposable {
   private childCacheExpiryAttribution = new ChildCacheExpiryAttribution();
   private projectSpendFiles: SpendFileIndex[] = [];
   private projectSpendVisibleFiles: SpendFileIndex[] = [];
-  private projectSpendQueue: { file: string; agent: AgentKind; primary?: boolean }[] = [];
+  private projectSpendQueue: ProjectSpendSource[] = [];
   private projectSpendQueued = new Set<string>();
   private projectSpendTick: ReturnType<typeof setTimeout> | null = null;
   private readonly projectSpendOffers = new Set<ReturnType<typeof setTimeout>>();
@@ -3551,6 +3575,7 @@ export class PanelProvider implements vscode.Disposable {
     const matches = accepted
       ? this.sessionPageIndexFor(accepted, key, roots).scoped.filter((source) => source.sessionId === session)
       : [];
+    if (matches.some((source) => source.agent === 'agy')) return null;
     const sourceRevision = matches.length === 1 ? guardedSourceRevision(matches[0].file) : null;
     const read = this.guardedReads?.get(session);
     const state = this.stateFor(session);
@@ -3978,9 +4003,10 @@ export class PanelProvider implements vscode.Disposable {
       this.sessionScopeMembers = { roots, inScope: folderMatcher(scopeRoots), members: new Map() };
     const { inScope, members } = this.sessionScopeMembers;
     const scoped = accepted.filter((source) => {
-      if (!source.cwd) return true;
-      let member = members.get(source.cwd);
-      if (member === undefined) members.set(source.cwd, (member = inScope(source.cwd)));
+      const directory = source.agent === 'agy' ? source.agyOwnerRoot : source.cwd;
+      if (!directory) return source.agent !== 'agy';
+      let member = members.get(directory);
+      if (member === undefined) members.set(directory, (member = inScope(directory)));
       return member;
     });
     let rows: Map<string, SessionFile> | undefined = new Map();
@@ -3993,6 +4019,7 @@ export class PanelProvider implements vscode.Disposable {
         prior.sessionId === source.sessionId &&
         prior.agent === source.agent &&
         prior.cwd === source.cwd &&
+        prior.agyOwnerRoot === source.agyOwnerRoot &&
         prior.dev === source.dev &&
         prior.ino === source.ino;
       rows.set(source.file, source);
@@ -4474,12 +4501,12 @@ export class PanelProvider implements vscode.Disposable {
     }
   }
 
-  // The directories the last walk read. Claude project directories, rollout date directories and both roots list
-  // sessions. A `subagents` directory holds one session's child transcripts.
+  // Source roots, Claude project directories, and rollout date directories list sessions.
+  // A `subagents` directory holds one session's child transcripts.
   private pollDirectories(): PollDirectories | null {
     const enumerations = this.sourceEnumerations;
     if (!enumerations) return null;
-    const listing: string[] = [];
+    const listing: string[] = this.agyScan ? [this.agyScan.brain] : [];
     const children: string[] = [];
     for (const enumeration of [enumerations.claude, enumerations.codex]) {
       if (enumeration.root) listing.push(enumeration.root);
@@ -4492,6 +4519,7 @@ export class PanelProvider implements vscode.Disposable {
 
   // Clear held rollout stats when polling stops. The next read must obtain fresh file revisions.
   private stopPolling(): void {
+    this.agyScan?.controller?.abort();
     this.spendIntegrity?.pause();
     if (this.projectSpendTick) clearTimeout(this.projectSpendTick);
     this.projectSpendTick = null;
@@ -5629,17 +5657,19 @@ export class PanelProvider implements vscode.Disposable {
       this.refreshCompressedFacts();
       return;
     }
-    const replaced = held.sessions.filter((session) => dirty.has(session.file));
     const { rows, added } = this.takeCompressedRows(dirty, this.compressedWalk);
+    const collides = agyCollisionWith(rows);
+    const replacedByBatch = (session: SessionFile) => dirty.has(session.file) || collides(session);
+    const replaced = held.sessions.filter(replacedByBatch);
     this.compressedSourcesOwed ||= added;
     const activity = (session: SessionFile) => this.activityFor(session);
     const sessions = placeInSessionCatalog(
-      held.sessions.filter((session) => !dirty.has(session.file)),
+      held.sessions.filter((session) => !replacedByBatch(session)),
       rows,
       activity,
     );
     const admitted = placeInSessionCatalog(
-      accepted.filter((session) => !dirty.has(session.file)),
+      accepted.filter((session) => !replacedByBatch(session)),
       rows,
       activity,
     );
@@ -6123,7 +6153,13 @@ export class PanelProvider implements vscode.Disposable {
     const walk = this.compressedWalk;
     if (!dirty?.size || !walk) return held;
     const { rows, added } = this.takeCompressedRows(dirty, walk);
-    const out = [...held.filter((session) => !(isCompressedRollout(session.file) && dirty.has(session.file))), ...rows];
+    const collides = agyCollisionWith(rows);
+    const out = [
+      ...held.filter(
+        (session) => !(isCompressedRollout(session.file) && dirty.has(session.file)) && !collides(session),
+      ),
+      ...rows,
+    ];
     // A row that joins between discovery replies needs its source now, or its cost waits for the next complete reply.
     if (added && this.claudeChildrenDiscovered)
       this.updateSessionSpendSources(
@@ -6164,12 +6200,11 @@ export class PanelProvider implements vscode.Disposable {
   private withHeldCompressedRows(sessions: SessionFile[]): SessionFile[] {
     if (!this.compressedRowsHeld?.size) return sessions;
     const listed = new Set(sessions.map((session) => session.file));
-    return [
-      ...sessions,
-      ...[...this.compressedRowsHeld.values()].filter(
-        (row) => !listed.has(row.file) && !listed.has(row.file.replace(/\.zst$/, '')),
-      ),
-    ];
+    const compressed = [...this.compressedRowsHeld.values()].filter(
+      (row) => !listed.has(row.file) && !listed.has(row.file.replace(/\.zst$/, '')),
+    );
+    const collides = agyCollisionWith([...sessions.filter((row) => row.agent !== 'agy'), ...compressed]);
+    return [...sessions.filter((row) => !collides(row)), ...compressed];
   }
 
   private compressedTitleOf(file: string): DerivedTitleEntry | undefined {
@@ -9549,13 +9584,16 @@ export class PanelProvider implements vscode.Disposable {
     recoveryId?: string,
   ): void {
     const state = captured ?? this.stateFor(session, true);
-    if (!state) {
+    if (!state || state.agent === 'agy') {
       void this.post({
         type: 'restoreDraft',
         session: browserSession,
         text,
         revision,
-        notice: sendRefusal(this.sendRefusalFor(session)),
+        notice:
+          state?.agent === 'agy'
+            ? 'Antigravity sessions are read-only in Arc.'
+            : sendRefusal(this.sendRefusalFor(session)),
       });
       return;
     }
@@ -11177,7 +11215,7 @@ export class PanelProvider implements vscode.Disposable {
   ): { root: SessionFile | null; readerState: ExportReaderState } {
     const parents = this.verifiedParentEdges(sources);
     const identity = (source: SessionFile): ExportIdentity => ({
-      agent: source.agent,
+      agent: source.agent as ExportIdentity['agent'],
       sessionId: source.sessionId,
       ...(source.childTranscript && parents.get(source.sessionId)
         ? { parentSessionId: parents.get(source.sessionId)!.parent }
@@ -15032,6 +15070,7 @@ export class PanelProvider implements vscode.Disposable {
     const next = new Date(now);
     next.setHours(0, 0, 0, 0);
     next.setDate(next.getDate() + 1);
+    const midnight = next.getTime();
     const pricingUntil = publicPricingValidUntil(now);
     if (pricingUntil < next.getTime()) next.setTime(pricingUntil);
     const cutoff = this.projectSpendHistoryCutoff(now);
@@ -15044,10 +15083,28 @@ export class PanelProvider implements vscode.Disposable {
     this.projectSpendMidnight = setTimeout(
       () => {
         this.projectSpendMidnight = null;
-        const date = projectSpendWindows(Date.now())[0].start;
-        if (this.projectSpendSnapshotDate !== date) {
+        const now = Date.now();
+        const date = projectSpendWindows(now)[0].start;
+        let displayRemoved = false;
+        if (now >= midnight) {
+          const resumable = pruneSpendFilesWithResult(this.projectSpendFiles, now);
+          const visible = pruneSpendFilesWithResult(this.projectSpendVisibleFiles, now);
+          if (resumable.pruned) {
+            this.projectSpendFiles = resumable.files;
+            this.spendRecordsByFile = new Map(resumable.files.map((record, index) => [record.file, index]));
+          }
+          if (visible.pruned) {
+            displayRemoved = visible.files.length < this.projectSpendVisibleFiles.length;
+            this.projectSpendVisibleFiles = visible.files;
+          }
+          if (resumable.pruned || visible.pruned) {
+            this.projectSpendRevision++;
+            this.scheduleProjectSpendSave();
+          }
+        }
+        if (displayRemoved || this.projectSpendSnapshotDate !== date) {
           this.projectSpendSnapshot =
-            this.projectSpendTomorrow?.date === date
+            !displayRemoved && this.projectSpendTomorrow?.date === date
               ? this.projectSpendTomorrow.view
               : this.unknownProjectSpendSnapshot();
           this.projectSpendSnapshotDate = date;
@@ -15056,8 +15113,8 @@ export class PanelProvider implements vscode.Disposable {
         if (this.projectSpendSnapshot) {
           this.projectSpendSnapshot = truncateProjectSpendView(
             this.projectSpendSnapshot,
-            Date.now(),
-            this.projectSpendHistoryCutoff(),
+            now,
+            this.projectSpendHistoryCutoff(now),
           );
         }
         this.invalidateProjectSpendSnapshot();
@@ -15078,8 +15135,8 @@ export class PanelProvider implements vscode.Disposable {
     this.spendSourcesByFile = new Map(sources.map((source) => [normalizeFsPath(source.file), source]));
     for (const record of this.projectSpendFiles) {
       const key = normalizeFsPath(record.file);
-      if (!this.spendSourcesByFile.has(key))
-        this.spendSourcesByFile.set(key, { file: record.file, agent: spendRecordAgent(record) });
+      const agent = spendRecordAgent(record);
+      if (!this.spendSourcesByFile.has(key)) this.spendSourcesByFile.set(key, { file: record.file, agent });
     }
     this.spendRecordsByFile = new Map(this.projectSpendFiles.map((record, index) => [record.file, index]));
     this.spendNativeChildren = new Set(
@@ -15144,7 +15201,8 @@ export class PanelProvider implements vscode.Disposable {
         // The spend reader cannot read a compressed rollout, so the check treats it as an unreadable source.
         if (isCompressedRollout(source.file)) return null;
         try {
-          const physical = await fs.promises.stat(source.file, { bigint: true });
+          const stat = source.agent === 'agy' ? fs.promises.lstat : fs.promises.stat;
+          const physical = await stat(source.file, { bigint: true });
           return physical.isFile() ? { source, stat: fileRevisionOf(physical) } : null;
         } catch (error) {
           return ['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')
@@ -15270,8 +15328,11 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   // Every source a spend offer would read, taken from the lists the last listing wrote.
-  private projectSpendSources(): { file: string; agent: AgentKind; primary?: boolean }[] {
+  private projectSpendSources(): ProjectSpendSource[] {
     return [
+      ...(this.catalog?.sessions ?? [])
+        .filter((source) => source.agent === 'agy')
+        .map((source) => ({ file: source.file, agent: 'agy' as const, primary: true, agySource: source })),
       ...this.claudeSpendSources.map((source) => ({
         file: source.file,
         agent: 'claude' as const,
@@ -15296,7 +15357,7 @@ export class PanelProvider implements vscode.Disposable {
   private queueProjectSpendIndex(
     listedRevisions: ReadonlyMap<string, SpendSourceRevision | null> = new Map(),
     onlyFiles: ReadonlySet<string> | null = null,
-    listedSources: readonly { file: string; agent: AgentKind; primary?: boolean }[] = this.projectSpendSources(),
+    listedSources: readonly ProjectSpendSource[] = this.projectSpendSources(),
     caller: 'spendOffer' | 'integrityCheck' = 'spendOffer',
   ): void {
     const workspace = this.projectSpendWorkspace;
@@ -15308,7 +15369,8 @@ export class PanelProvider implements vscode.Disposable {
     const found = new Set<string>();
     this.spendRecordsByFile ??= new Map(this.projectSpendFiles.map((file, index) => [file.file, index]));
     const cutoff = this.projectSpendHistoryCutoff();
-    const offer = (file: string, agent: AgentKind, primary?: boolean): void => {
+    const offer = (source: ProjectSpendSource): void => {
+      const { file, agent, primary } = source;
       const key = normalizeSpendFile(file);
       if (this.projectSpendQueued.has(key)) {
         return;
@@ -15318,6 +15380,20 @@ export class PanelProvider implements vscode.Disposable {
       const previous = at === undefined ? undefined : this.projectSpendFiles[at];
       // Offers reuse revisions from asynchronous integrity checks or accepted catalog reads.
       const revision: SpendSourceRevision | null | undefined = listedRevisions.get(file);
+      const admitted = source.agySource;
+      const agyMissing =
+        agent === 'agy' && revision === null && previous !== undefined && spendRecordAgent(previous) === 'agy';
+      if (
+        agent === 'agy' &&
+        !agyMissing &&
+        (!admitted ||
+          !revision ||
+          revision.size !== admitted.size ||
+          revision.mtimeMs !== admitted.mtimeMs ||
+          (revision.sourceIdentity !== undefined &&
+            revision.sourceIdentity !== String(admitted.dev) + ':' + admitted.ino))
+      )
+        return;
       const childPolicy =
         agent === 'claude' &&
         (primary === false ||
@@ -15337,18 +15413,17 @@ export class PanelProvider implements vscode.Disposable {
         return;
       }
       this.projectSpendQueued.add(key);
-      this.projectSpendQueue.push({ file, agent, primary });
+      this.projectSpendQueue.push(agyMissing ? { ...source, agyMissing: true } : source);
     };
-    for (const source of sources) {
-      offer(source.file, source.agent, source.primary);
-    }
+    for (const source of sources) offer(source);
     if (this.projectSpendQueue.length) this.projectSpendCostQueue = null;
     if (!onlyFiles) {
       for (const record of this.projectSpendFiles) {
         if (found.has(record.file)) {
           continue;
         }
-        offer(record.file, spendRecordAgent(record), !spendFileIsClaudeChild(record.file));
+        const agent = spendRecordAgent(record);
+        if (agent !== 'agy') offer({ file: record.file, agent, primary: !spendFileIsClaudeChild(record.file) });
       }
     }
     // This also publishes moved turn card costs, so a drain that queued nothing ends here. An integrity check that
@@ -15403,8 +15478,37 @@ export class PanelProvider implements vscode.Disposable {
       return;
     }
     const key = normalizeSpendFile(next.file);
+    let expectedRevision: FileRevision | null | undefined;
+    if (next.agyMissing) {
+      expectedRevision = null;
+    } else if (next.agent === 'agy') {
+      const offered = next.agySource;
+      const admitted = this.catalog?.sessions.find((row) => row.agent === 'agy' && row.file === next.file);
+      if (
+        this.repositoryScopeReady &&
+        offered &&
+        admitted?.agyOwnerRoot &&
+        admitted.sessionId === offered.sessionId &&
+        admitted.agyOwnerRoot === offered.agyOwnerRoot &&
+        isInside(admitted.agyOwnerRoot, this.repositoryScopeRoots)
+      ) {
+        try {
+          const stat = fs.lstatSync(next.file, { bigint: true });
+          const revision = fileRevisionOf(stat);
+          if (
+            stat.isFile() &&
+            supportedFileIdentity(admitted) &&
+            sameProgressiveRevision(revision, offered) &&
+            sameProgressiveRevision(revision, admitted)
+          )
+            expectedRevision = revision;
+        } catch {
+          // A later walk can qualify the source again.
+        }
+      }
+    }
     // The spend reader reads plain transcripts only. A compressed rollout leaves the queue as a failed index does.
-    if (isCompressedRollout(next.file)) {
+    if (isCompressedRollout(next.file) || (next.agent === 'agy' && expectedRevision === undefined)) {
       this.projectSpendQueued.delete(key);
       this.scheduleNextProjectSpendFile();
       return;
@@ -15412,21 +15516,37 @@ export class PanelProvider implements vscode.Disposable {
     this.spendRecordsByFile ??= new Map(this.projectSpendFiles.map((record, index) => [record.file, index]));
     const at = this.spendRecordsByFile.get(key) ?? -1;
     const previous = at >= 0 ? this.projectSpendFiles[at] : undefined;
+    // A confirmed deletion retains the last complete usage even when a replacement scan is unfinished.
+    const indexBase =
+      next.agyMissing && previous?.complete === false
+        ? (this.projectSpendVisibleFiles.find(
+            (record) =>
+              record.file === key &&
+              record.workspace === previous.workspace &&
+              record.complete !== false &&
+              spendRecordAgent(record) === 'agy',
+          ) ?? previous)
+        : previous;
     const makeReducer =
-      next.agent === 'claude'
-        ? (state: unknown) =>
-            createClaudeUsageLineReducer(state as Parameters<typeof createClaudeUsageLineReducer>[0], {
-              childTranscript: next.primary === false,
-              nativeChildRequests: (this.spendNativeChildren ??= new Set(
-                this.sessionSpendSources
-                  .filter((source) => source.nativeParentFile !== undefined)
-                  .map((source) => normalizeSpendFile(source.file)),
-              )).has(key),
-            })
-        : (state: unknown) => createCodexUsageLineReducer(state as Parameters<typeof createCodexUsageLineReducer>[0]);
+      next.agent === 'agy'
+        ? createAgyUsageReducer
+        : next.agent === 'claude'
+          ? (state: unknown) =>
+              createClaudeUsageLineReducer(state as Parameters<typeof createClaudeUsageLineReducer>[0], {
+                childTranscript: next.primary === false,
+                nativeChildRequests: (this.spendNativeChildren ??= new Set(
+                  this.sessionSpendSources
+                    .filter((source) => source.nativeParentFile !== undefined)
+                    .map((source) => normalizeSpendFile(source.file)),
+                )).has(key),
+              })
+          : (state: unknown) => createCodexUsageLineReducer(state as Parameters<typeof createCodexUsageLineReducer>[0]);
     let result: ReturnType<typeof indexSpendFile>;
     try {
-      result = indexSpendFile(previous, next.file, workspace, makeReducer);
+      result =
+        expectedRevision !== undefined
+          ? indexSpendFile(indexBase, next.file, workspace, makeReducer, { expectedRevision })
+          : indexSpendFile(previous, next.file, workspace, makeReducer);
     } catch {
       this.projectSpendQueued.delete(key);
       this.scheduleNextProjectSpendFile();
@@ -15442,7 +15562,7 @@ export class PanelProvider implements vscode.Disposable {
       this.projectSpendRevision++;
       this.invalidateProjectSpendSnapshot();
     }
-    if (result.stateChanged) {
+    if (result.stateChanged || indexBase !== previous) {
       this.scheduleProjectSpendSave();
     }
     if (spendRecordChangesRail(previous, result.record)) {
@@ -15459,8 +15579,10 @@ export class PanelProvider implements vscode.Disposable {
           stat.mtimeMs !== result.record.mtimeMs ||
           (result.record.sourceIdentity !== undefined && result.record.sourceIdentity !== `${stat.dev}:${stat.ino}`)
         ) {
-          this.projectSpendQueued.add(key);
-          this.projectSpendQueue.push(next);
+          if (next.agent !== 'agy') {
+            this.projectSpendQueued.add(key);
+            this.projectSpendQueue.push(next);
+          }
         } else if (result.found && this.spendChecks) {
           this.spendChecks.set(result.record, Date.now());
         }
@@ -15730,7 +15852,54 @@ export class PanelProvider implements vscode.Disposable {
       signal,
       parts ? { paused: (ms) => (parts.ms.listing += ms) } : {},
     );
-    return claudeWalk && { enumeration, claudeWalk };
+    if (!claudeWalk || signal.aborted) return null;
+    const checkouts = this.repositoryScope.checkoutSnapshot?.() ?? [];
+    this.startAgyDiscovery(folderPrint, [...new Set([...scope.roots, ...checkouts])]);
+    return { enumeration, claudeWalk };
+  }
+
+  private startAgyDiscovery(folderPrint: string, roots: string[]): void {
+    const brain = agyBrainRoot();
+    const key = JSON.stringify([brain, folderPrint, roots]);
+    if (this.agyScan?.key !== key) {
+      this.agyScan?.controller?.abort();
+      this.agyCatalog = undefined;
+      this.agyScan = { key, brain, cache: new Map() };
+    }
+    const scan = this.agyScan;
+    if (scan.controller || (this.agyCatalog?.folderPrint === folderPrint && this.agyCatalog.publish)) return;
+    const controller = new AbortController();
+    scan.controller = controller;
+    scan.coveragePublished = false;
+    const steps = scanAgySessions(brain, roots, [], { cache: scan.cache });
+    void (async () => {
+      try {
+        for (let step = steps.next(); !controller.signal.aborted; step = steps.next()) {
+          if (step.done) {
+            const { rows, complete, uncertain } = step.value;
+            const previous = this.agyCatalog;
+            const same =
+              previous?.folderPrint === folderPrint &&
+              previous.complete === complete &&
+              previous.rows.length === rows.length &&
+              previous.rows.every((row, index) => row === rows[index]) &&
+              previous.uncertain.size === uncertain.size &&
+              [...uncertain].every((id) => previous.uncertain.has(id));
+            const publish =
+              (complete && scan.coveragePublished === true) ||
+              (!same && (previous !== undefined || rows.length > 0 || !complete));
+            this.agyCatalog = { folderPrint, rows, complete, uncertain, publish };
+            scan.controller = undefined;
+            if (publish) this.refreshFrom('agy-discovery', false);
+            return;
+          }
+          await new Promise<void>((resolve) => setImmediate(resolve));
+        }
+      } finally {
+        steps.return({ rows: [], complete: false, uncertain: new Set() });
+        if (scan.controller === controller) scan.controller = undefined;
+      }
+    })();
   }
 
   // The Claude reads of a walk as steps. It writes no host state that the commit owns. An abandoned walk leaves the
@@ -16257,11 +16426,26 @@ export class PanelProvider implements vscode.Disposable {
     if (this.claudeChildrenDiscovered && this.pruneDerivedTitles(walked)) {
       this.derivedCacheCheckpointState.markChanged();
     }
-    const walkedSessions = orderSessionCatalog([...listed, ...this.claudeChildren, ...codex], (session) =>
+    if (this.agyCatalog?.folderPrint === folderPrint) this.agyCatalog.publish = false;
+    const agyRows = this.agyCatalog?.folderPrint === folderPrint ? this.agyCatalog.rows : [];
+    const agy = agyRows.length
+      ? omitAgyCollisions(
+          agyRows,
+          [
+            ...claude,
+            ...childSources,
+            ...this.claudeChildren,
+            ...codex,
+            ...(this.authoritativeCatalog ?? []).filter((row) => row.agent !== 'agy'),
+          ],
+          [...Object.keys(this.awaitingSessionRecords ?? {}), ...Object.keys(this.newDrafts ?? {})],
+        )
+      : [];
+    const walkedSessions = orderSessionCatalog([...listed, ...this.claudeChildren, ...codex, ...agy], (session) =>
       this.activityFor(session),
     );
     this.enumeratedMembers = new Set();
-    const enumeratedSources = sessionPageSources([...claude, ...childSources, ...codex]);
+    const enumeratedSources = sessionPageSources([...claude, ...childSources, ...codex, ...agy]);
     this.enumeratedCollisions = reconcileSessionCollisions(
       enumeratedSources,
       this.enumeratedCollisions,
@@ -16302,7 +16486,7 @@ export class PanelProvider implements vscode.Disposable {
     if (heldClaude) {
       // The walked rows list every Claude parent, and the held catalog lists only the parents that prompt admission kept.
       const held = orderSessionCatalog(
-        [...(this.catalog?.sessions ?? []).filter((session) => session.agent !== 'codex'), ...codex],
+        [...(this.catalog?.sessions ?? []).filter((session) => session.agent === 'claude'), ...codex, ...agy],
         (session) => this.activityFor(session),
       );
       this.catalog = { folders: folderPrint, sessions: held };
@@ -16333,6 +16517,7 @@ export class PanelProvider implements vscode.Disposable {
       this.codexSubagents,
       this.subagentDirectories,
       this.dispatchEdges(sessions),
+      sessions.filter((session) => session.agent === 'agy'),
     );
     const invalidated = invalidateClaudeCostSupplements(this.projectSpendFiles, this.sessionSpendSources);
     const invalidatedVisible = invalidateClaudeCostSupplements(this.projectSpendVisibleFiles, this.sessionSpendSources);
@@ -16666,12 +16851,15 @@ export class PanelProvider implements vscode.Disposable {
         // A session this panel started joins the accepted rows once its own source qualifies, so its name and recorded
         // responses replace the temporary ones without waiting for unrelated discovery.
         const started = accepted ? this.startedSources(this.catalog.sessions, accepted) : [];
-        this.catalog = {
-          ...this.catalog,
-          sessions: this.withHeldCompressedRows(
-            started.length ? [...accepted!, ...started] : (accepted ?? this.catalog.sessions),
-          ),
-        };
+        const agy = this.catalog.sessions.filter((source) => source.agent === 'agy');
+        const priorAgy = accepted?.filter((source) => source.agent === 'agy') ?? [];
+        const sameAgy = agy.length === priorAgy.length && agy.every((row, index) => row === priorAgy[index]);
+        const sessions = !accepted
+          ? this.catalog.sessions
+          : started.length || !sameAgy
+            ? [...accepted.filter((source) => source.agent !== 'agy'), ...started, ...agy]
+            : accepted;
+        this.catalog = { ...this.catalog, sessions: this.withHeldCompressedRows(sessions) };
       }
       if (this.dispatchedDiscoveryWaiting() !== discoveryWaiting) this.postDispatchedCostsIfMoved('childrenProgress');
       return this.authoritativeCatalog !== null || this.publishesWalkedRows();
@@ -16761,14 +16949,26 @@ export class PanelProvider implements vscode.Disposable {
       this.savedRowSources = null;
       return false;
     }
-    const roots = this.withHeldCompressedRows(discoveryRoots.filter((root) => admittedRoots.has(root)));
+    const roots = this.withHeldCompressedRows(
+      discoveryRoots.filter((root) => root.agent !== 'agy' && admittedRoots.has(root)),
+    );
+    const agyRows = held.filter((row) => row.agent === 'agy');
+    const agy = agyRows.length
+      ? omitAgyCollisions(
+          agyRows,
+          [...roots, ...this.claudeChildren],
+          [...Object.keys(this.awaitingSessionRecords ?? {}), ...Object.keys(this.newDrafts ?? {})],
+        )
+      : [];
     if (spendSources) {
       this.claudeSpendSources = spendSources.claude;
       this.codexSpendSources = spendSources.codex;
       this.codexSubagents = spendSources.children;
     }
     const codex = roots.filter((session) => session.agent === 'codex');
-    const sessions = orderSessionCatalog([...roots, ...this.claudeChildren], (session) => this.activityFor(session));
+    const sessions = orderSessionCatalog([...roots, ...this.claudeChildren, ...agy], (session) =>
+      this.activityFor(session),
+    );
     this.discoveryComplete = {
       scope: JSON.stringify(this.repositoryScopeRoots),
       files: new Set(sessions.map((session) => session.file)),
@@ -17111,6 +17311,7 @@ export class PanelProvider implements vscode.Disposable {
   private coveredMember(source: SessionFile, member?: string): boolean {
     return (
       !this.enumeratedAmbiguousIds?.has(source.sessionId) &&
+      (source.agent !== 'agy' || !this.agyCatalog?.uncertain.has(source.sessionId)) &&
       (this.enumeratedMembers?.has(member ?? sessionCoverageMember(source)) ||
         (source.childTranscript === true && !this.dispatchDiscoveryPending))
     );
@@ -17121,14 +17322,18 @@ export class PanelProvider implements vscode.Disposable {
     const enumeration = this.sourceEnumerations;
     const enumerated =
       !!enumeration && enumeration.claude.status === 'complete' && enumeration.codex.status === 'complete';
-    let complete = enumerated && this.enumeratedAdmissionComplete && !this.dispatchDiscoveryPending;
-    this.membershipCoverageGap = !enumerated
-      ? 'enumeration'
-      : !this.enumeratedAdmissionComplete
-        ? 'admission'
-        : this.dispatchDiscoveryPending
-          ? 'pendingSet'
-          : undefined;
+    const agyIncomplete =
+      this.agyScan !== undefined && (this.agyScan.controller !== undefined || this.agyCatalog?.complete !== true);
+    if (this.agyScan?.controller) this.agyScan.coveragePublished = true;
+    let complete = enumerated && !agyIncomplete && this.enumeratedAdmissionComplete && !this.dispatchDiscoveryPending;
+    this.membershipCoverageGap =
+      !enumerated || agyIncomplete
+        ? 'enumeration'
+        : !this.enumeratedAdmissionComplete
+          ? 'admission'
+          : this.dispatchDiscoveryPending
+            ? 'pendingSet'
+            : undefined;
     // The member key of each source, computed once in this call. A source that both lists hold is the same object.
     const memberKeys = new Map<SessionFile, string>();
     const memberOf = (source: SessionFile): string => {
@@ -17143,7 +17348,7 @@ export class PanelProvider implements vscode.Disposable {
       revision,
       status: complete ? 'complete' : 'incomplete',
       files: current.map((source) => source.file),
-      uncertain: [],
+      uncertain: agyIncomplete && this.agyScan ? [this.agyScan.brain] : [],
       members,
     };
     if (enumeration) {
@@ -17198,6 +17403,7 @@ export class PanelProvider implements vscode.Disposable {
       ...current,
       ...(this.authoritativeCatalog ?? []).filter(
         (source) =>
+          source.agent !== 'agy' &&
           !currentMembers.has(memberOf(source)) &&
           !unverified?.has(normalizeFsPath(source.file)) &&
           this.physicalMembershipOf(source.file, physical) !== 'absent',
@@ -17995,7 +18201,7 @@ export class PanelProvider implements vscode.Disposable {
         ? { label: carried.label, fullLabel: carried.fullLabel || carried.label }
         : sessionLabelOf(name, session.sessionId);
     }
-    const title = this.titleFor(session);
+    const title = this.titleFor(session) || session.agyFirstPrompt;
     if (!title && carried) {
       return { label: carried.label, fullLabel: carried.fullLabel || carried.label };
     }
@@ -19281,10 +19487,14 @@ export class PanelProvider implements vscode.Disposable {
   // Read current file identity and revision for stale-result and cursor checks.
   private revisionOf(session: SessionFile): FileRevision {
     try {
-      return fileRevisionOf(fs.statSync(session.file, { bigint: true }));
+      if (session.agent !== 'agy') return fileRevisionOf(fs.statSync(session.file, { bigint: true }));
+      const stat = fs.lstatSync(session.file, { bigint: true });
+      const revision = fileRevisionOf(stat);
+      if (stat.isFile() && sameProgressiveRevision(revision, session)) return revision;
     } catch {
-      return { size: -1, mtimeMs: -1, dev: -1, ino: -1 };
+      // The source can move between listing and reading.
     }
+    return { size: -1, mtimeMs: -1, dev: -1, ino: -1 };
   }
 
   private acceptSelectedMetadataRead(session: SessionFile, generation: number): void {
@@ -20257,8 +20467,17 @@ export class PanelProvider implements vscode.Disposable {
         continue;
       }
       // Search has a separate read window and cache so it does not replace selected-session reads.
-      const read =
-        session.agent === 'codex'
+      const agy =
+        session.agent === 'agy'
+          ? readAgySession(session.file, session.sessionId, {
+              maxTurns: Number.MAX_SAFE_INTEGER,
+              tailBytes: SEARCH_TAIL_BYTES,
+            })
+          : null;
+      if (agy && (!agy.checkpoint || !sameProgressiveRevision(agy.checkpoint.revision, session))) continue;
+      const read = agy
+        ? agy.read
+        : session.agent === 'codex'
           ? readCodexSession(session.file, session.sessionId, {
               maxTurns: Number.MAX_SAFE_INTEGER,
               tailBytes: SEARCH_TAIL_BYTES,
@@ -20270,6 +20489,7 @@ export class PanelProvider implements vscode.Disposable {
               turnsOnly: true,
               boundedRepeated: true,
             });
+      if (!read) continue;
       if (session.agent === 'claude') {
         this.observeParsedNames(read.turns, new Map([[session.sessionId, session]]));
       }

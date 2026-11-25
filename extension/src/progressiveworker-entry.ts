@@ -1,3 +1,13 @@
+import {
+  readAgyHistoryPage,
+  createAgySessionReducer,
+  agyRetainedLine,
+  readAgySession,
+  readAgySessionAsync,
+  type AgyCheckpoint,
+  type AgyHistoryCursor,
+} from './agyhistory';
+import { sessionOutcomeOf, sessionStatFactsOf } from './transcript';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { readCodexContext } from './codexcontext';
@@ -1081,9 +1091,12 @@ async function execute(
         retainedCharge: 0,
         retainedLimit: request.retainedBytes ?? 64 * 1024 * 1024,
         recordLimit: request.recordBytes ?? 16 * 1024 * 1024,
-        reduceAbove: request.reduceAboveBytes ?? 1024 * 1024,
-        accepts: session.agent === 'codex' ? codexSessionLineMayAffectRead : claudeSessionLineMayAffectRead,
-        ...(session.agent === 'codex' ? {} : { retain: claudeRetainedLine }),
+        reduceAbove: session.agent === 'agy' ? Infinity : (request.reduceAboveBytes ?? 1024 * 1024),
+        ...(session.agent === 'agy'
+          ? { retain: agyRetainedLine }
+          : session.agent === 'codex'
+            ? { accepts: codexSessionLineMayAffectRead }
+            : { accepts: claudeSessionLineMayAffectRead, retain: claudeRetainedLine }),
         fragments: [],
         fragmentBytes: 0,
       };
@@ -1097,12 +1110,14 @@ async function execute(
           session.agent,
           session.sessionId,
           () =>
-            session.agent === 'codex'
-              ? createCodexSessionReducer(session.sessionId, { maxTurns: 40 }, request.opening ?? null)
-              : createClaudeSessionReducer(
-                  session.sessionId,
-                  withClaudeRepeated(session.file, { maxTurns: 40, childTranscript: session.childTranscript }),
-                ),
+            session.agent === 'agy'
+              ? createAgySessionReducer(session.file, session.sessionId, Number.MAX_SAFE_INTEGER)
+              : session.agent === 'codex'
+                ? createCodexSessionReducer(session.sessionId, { maxTurns: 40 }, request.opening ?? null)
+                : createClaudeSessionReducer(
+                    session.sessionId,
+                    withClaudeRepeated(session.file, { maxTurns: 40, childTranscript: session.childTranscript }),
+                  ),
           work,
         ),
       };
@@ -1514,6 +1529,7 @@ async function execute(
     const start = epoch.position % Math.max(1, rows.length);
     const ordered = [...rows.slice(start), ...rows.slice(0, start)];
     for (const [key, parent] of ordered) {
+      if (parent.agent === 'agy') continue;
       if (completed.has(key) || (epoch.protectedFile && key !== epoch.protectedFile)) continue;
       epoch.position = (rows.findIndex(([file]) => file === key) + 1) % Math.max(1, rows.length);
       const revision = seedMissing.delete(key) ? null : checkParent(parent.file);
@@ -2125,6 +2141,17 @@ async function execute(
     return { kind: 'stale', unread: true };
   }
   if (request.kind === 'starts') {
+    if (request.session.agent === 'agy') {
+      const { file, sessionId, size } = request.session;
+      const parsed = readAgySession(file, sessionId, { maxTurns: Number.MAX_SAFE_INTEGER });
+      return {
+        kind: 'starts',
+        starts: {
+          starts: parsed.read?.turns.map((turn) => turn.startedAt) ?? [],
+          whole: parsed.read !== null && parsed.read.readBytes === size,
+        },
+      };
+    }
     const starts =
       request.session.agent === 'claude'
         ? readSessionTurnStarts(request.session.file, undefined, request.session.childTranscript === true)
@@ -2140,6 +2167,30 @@ async function execute(
   if (request.kind === 'metadata') {
     const session = request.session;
     const tailBytes = request.tailBytes ?? 256 * 1024;
+    if (session.agent === 'agy') {
+      const { read } = readAgySession(session.file, session.sessionId, {
+        tailBytes,
+        maxTurns: Number.MAX_SAFE_INTEGER,
+      });
+      if (!read) return { kind: 'stale', unread: true };
+      const label = session.agyFirstPrompt ?? '';
+      return {
+        kind: 'metadata',
+        coverage: { whole: read.readBytes === session.size, windowBytes: tailBytes },
+        entry: {
+          sourceIdentity: { dev: session.dev ?? -1, ino: session.ino ?? -1 },
+          mtimeMs: session.mtimeMs,
+          size: session.size,
+          label,
+          fullLabel: label,
+          foldedLabel: label.toLocaleLowerCase(),
+          activityMs: read.turns.at(-1)?.endedAt ?? session.mtimeMs,
+          agentRun: false,
+          outcome: sessionOutcomeOf(read),
+          stats: sessionStatFactsOf(read),
+        },
+      };
+    }
     const meta =
       session.agent === 'claude'
         ? readSessionMeta(session.file, tailBytes, session.sessionId, session.childTranscript === true)
@@ -2183,6 +2234,37 @@ async function execute(
     maxTurns,
     tailBytes,
   } = request.input;
+  if (session.agent === 'agy' && request.kind === 'window') {
+    const checkpoint = revive(request.checkpoint) as AgyCheckpoint | undefined;
+    let result = await readAgySessionAsync(session.file, session.sessionId, maxTurns, tailBytes, checkpoint, {
+      signal,
+    });
+    if (result.read && !result.read.turns.length && result.checkpoint.coveredFrom > 0) {
+      const page = await readAgyHistoryPage(session.file, session.sessionId, null, { signal, targetTurns: 1 });
+      if (page.kind === 'page' && page.page.turns.length)
+        result = await readAgySessionAsync(
+          session.file,
+          session.sessionId,
+          maxTurns,
+          page.page.revision.size - page.page.ownedRange.start + 1,
+          undefined,
+          { signal },
+        );
+    }
+    if (!result.read) return { kind: 'stale' };
+    return {
+      kind: 'window',
+      read: result.read,
+      checkpoint: result.checkpoint,
+      reset: result.kind === 'reset',
+      appendFrom: result.appendFrom,
+      readBytes: result.readBytes,
+      agentKey: '',
+      structuralKey: '',
+      retainedBytes: Buffer.byteLength(JSON.stringify([result.read, result.checkpoint])),
+      checkpointBytes: Buffer.byteLength(JSON.stringify(result.checkpoint)),
+    };
+  }
   const claudeChildFor = (agent: AgentSpendRef) =>
     agent.toolUseId
       ? claudeChildren.find(
@@ -2275,7 +2357,7 @@ async function execute(
     const retained = request.pages.flatMap((page) => page.turns);
     retained.forEach((turn, index) => applyHiddenTurnFields(turn, request.hidden?.[index], session.agent === 'codex'));
     // Retained pages refresh together, and with the newest window when the host sends it last.
-    if (session.agent !== 'codex')
+    if (session.agent === 'claude')
       refreshRetainedClaudeAgentFacts(request.pages, agentSpendOf, agentSessionTargetOf, request.endsAtNewest === true);
     return {
       kind: 'retained',
@@ -2342,13 +2424,18 @@ async function execute(
             { signal, targetTurns: 20 },
             options,
           )
-        : await readCodexHistoryPageAsync(
-            session.file,
-            session.sessionId,
-            request.cursor as CodexHistoryCursor | null,
-            { signal, targetTurns: 20, ...bodyOptions },
-            options,
-          );
+        : session.agent === 'agy'
+          ? await readAgyHistoryPage(session.file, session.sessionId, request.cursor as AgyHistoryCursor | null, {
+              signal,
+              targetTurns: 20,
+            })
+          : await readCodexHistoryPageAsync(
+              session.file,
+              session.sessionId,
+              request.cursor as CodexHistoryCursor | null,
+              { signal, targetTurns: 20, ...bodyOptions },
+              options,
+            );
     if (result.kind === 'page') bindCommitSources(result.page.turns, session.file, sourceStamp);
     const body = compressed?.source.body;
     if (body && result.kind === 'page' && result.page.nextOlderCursor) {
@@ -3317,7 +3404,7 @@ async function handleMessage(message: {
     const metadataRequest =
       request.kind === 'metadata' ? { ...request, session: { ...request.session, ...before } } : null;
     if (
-      !metadataRequest &&
+      (!metadataRequest || requested.agent === 'agy') &&
       (before.size !== requested.size ||
         before.mtimeMs !== requested.mtimeMs ||
         ('dev' in requested && requested.dev !== before.dev) ||

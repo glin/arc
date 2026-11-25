@@ -1,5 +1,6 @@
 // @module-tag subprocess
 import { revisionOf } from './transcript';
+import { readAgySession } from './agyhistory';
 import { beforeAll, test, vi } from 'vitest';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
@@ -7848,6 +7849,73 @@ test('generation 35 empty names reread an unchanged image-bearing rollout after 
     const restored = loadDerivedCache(cache, { agentOf: () => 'codex' }).titles.get(file)!;
     assert.equal(restored.label, result.value.entry.label);
     assert.equal(restored.fullLabel, result.value.entry.fullLabel);
+  } finally {
+    worker.stop();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('Antigravity metadata recovery retains the outcome and usage beyond a bounded history read', async () => {
+  const directory = tempDir('agy-metadata-source-');
+  const file = path.join(directory, 'transcript_full.jsonl');
+  const body =
+    [
+      { type: 'USER_INPUT', content: 'Keep the first prompt.' },
+      { type: 'SYSTEM_MESSAGE', content: 'System activity between the prompt and reply.' },
+      { type: 'PLANNER_RESPONSE', content: 'Finished.', input_tokens: 7, cache_read_tokens: 0, output_tokens: 2 },
+      ...Array.from({ length: 80 }, () => ({ type: 'SYSTEM_MESSAGE', content: 'x'.repeat(256) })),
+    ]
+      .map((row, step_index) =>
+        JSON.stringify({ ...row, step_index, created_at: timestamp(step_index), status: 'DONE' }),
+      )
+      .join('\n') + '\n';
+  fs.writeFileSync(file, body);
+  const session = {
+    file,
+    sessionId: 'session',
+    agent: 'agy' as const,
+    agyFirstPrompt: 'Keep the first prompt.',
+    ...revisionOf(fs.statSync(file, { bigint: true })),
+  };
+  const worker = new ProgressiveWorker(source);
+  const signal = new AbortController().signal;
+  const sliceBytes = 4096;
+  try {
+    const normal = readAgySession(file, session.sessionId, { tailBytes: session.size });
+    const turn = normal.read?.turns[0];
+    assert.equal(turn?.prompt, 'Keep the first prompt.');
+    assert.equal(turn?.summary, 'Finished.');
+    assert.deepEqual(turn?.agyUsage, { input: 7, cacheRead: 0, output: 2 });
+    assert.equal(turn?.endedAt, Date.parse(timestamp(82)));
+    assert.equal(normal.checkpoint?.parserState.active?.end, session.size - 1);
+    const narrow = await worker.run({ kind: 'metadata', session, tailBytes: sliceBytes }, 1, signal);
+    assert.ok(narrow?.value.kind === 'metadata');
+    assert.equal(narrow.value.coverage?.whole, false);
+    let reads = 0;
+    for (let i = 0; i < Math.ceil(session.size / sliceBytes) + 2; i++) {
+      const result = await worker.run(
+        {
+          kind: 'metadata-recovery',
+          session,
+          sliceBytes,
+          recordBytes: 512,
+          retainedBytes: 96 * 1024,
+          eligible: ['session'],
+        },
+        1,
+        signal,
+      );
+      assert.ok(result?.value.kind === 'metadata-recovery');
+      assert.ok(result.value.readBytes <= sliceBytes);
+      reads += result.value.readBytes;
+      assert.equal(result.value.through, reads);
+      if (result.value.status === 'pending') continue;
+      assert.equal(result.value.status, 'complete');
+      assert.equal(reads, session.size);
+      assert.deepEqual(result.value.read?.turns, normal.read?.turns);
+      return;
+    }
+    assert.fail('Antigravity metadata recovery did not finish');
   } finally {
     worker.stop();
     fs.rmSync(directory, { recursive: true, force: true });

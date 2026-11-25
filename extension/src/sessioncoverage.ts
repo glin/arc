@@ -116,6 +116,7 @@ export function reconcileSessionCollisions(
   }
   if (previous) {
     for (const source of previous.sources) {
+      if (source.agent === 'agy') continue;
       const observation = qualified.get(fileKey(source));
       if (observation) continue;
       const physical = { ...enumeration[source.agent], ...context };

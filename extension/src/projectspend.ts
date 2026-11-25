@@ -1,4 +1,6 @@
-import { revisionOf, validClaudeTaskCompletions } from './transcript';
+import { AGY_COST_UNAVAILABLE, agyUsageFromTotals, mergeAgyUsage } from './agyhistory';
+import type { AgentKind, AgyRecordedUsage, FileRevision } from './transcript';
+import { revisionOf, sameFileRevision, validClaudeTaskCompletions } from './transcript';
 import { meterRead } from './readmeter';
 import { combineCacheExpirySummaries, combineCacheExpiryAmounts } from './cacheexpirysummary';
 import crypto from 'node:crypto';
@@ -72,6 +74,7 @@ export interface UsageCounts {
 
 // Usage events carry request facts from transcript reducers into the spend index.
 export interface UsageEvent {
+  agyUsage?: AgyRecordedUsage;
   timestamp: number;
   agent: string;
   provider: string | null;
@@ -125,6 +128,7 @@ export interface UsageEvent {
 }
 
 export interface ProjectUsageBucket {
+  agyUsage?: AgyRecordedUsage;
   usageOrigin?: UsageOrigin;
   localDate: string;
   agent: string;
@@ -193,7 +197,7 @@ export interface SpendFileIndex {
   // Parser generation that produced this source's buckets and state.
   // A mismatch requires a rebuild even when size and modification time match.
   parserGeneration?: number;
-  parserKind?: 'claude' | 'codex';
+  parserKind?: AgentKind;
   indexedAt: number;
   parserState?: unknown;
   // The Claude repeated-record detector and the byte ranges of repeated records it found. Readers skip those ranges.
@@ -537,25 +541,26 @@ export function projectSpendSaveRetryDelay(retries: number): number | null {
 // Saved source records require a rebuild when the parser generation of their agent differs.
 // Increase an agent's generation when a stored field of its records changes the conclusions consumers draw from it.
 // Increase both generations for a change that alters both agents' records.
-export const PROJECT_SPEND_PARSER_GENERATIONS: Readonly<Record<'claude' | 'codex', number>> = { claude: 70, codex: 70 };
+export const PROJECT_SPEND_PARSER_GENERATIONS: Readonly<Record<AgentKind, number>> = { claude: 70, codex: 70, agy: 1 };
 
 // Earlier shared generations whose records of one agent match that agent's generation.
 // Each mapping names the agent generation of the stored facts.
 // A later bump of one agent's generation stops accepting that agent's earlier records.
-export const PROJECT_SPEND_PARSER_IMPORTS: Readonly<Record<'claude' | 'codex', Readonly<Record<number, number>>>> = {
+export const PROJECT_SPEND_PARSER_IMPORTS: Readonly<Record<AgentKind, Readonly<Record<number, number>>>> = {
   claude: { 65: 66 },
   codex: {},
+  agy: {},
 };
 
 // The generation a reducer of this kind writes. A record of an unknown kind matches no generation.
-export function spendParserGeneration(kind: 'claude' | 'codex' | undefined): number {
+export function spendParserGeneration(kind: AgentKind | undefined): number {
   return kind === undefined ? 0 : PROJECT_SPEND_PARSER_GENERATIONS[kind];
 }
 
 // Whether a saved record of this kind and generation holds current facts.
 // A record keeps the generation it was written with, so cost-state dependencies of unchanged sources keep their identity.
 export function spendParserCurrent(kind: unknown, generation: unknown): boolean {
-  if (kind !== 'claude' && kind !== 'codex') return false;
+  if (kind !== 'claude' && kind !== 'codex' && kind !== 'agy') return false;
   const current = PROJECT_SPEND_PARSER_GENERATIONS[kind];
   return generation === current || PROJECT_SPEND_PARSER_IMPORTS[kind][generation as number] === current;
 }
@@ -614,7 +619,7 @@ export function projectSpendOfferDecision(
 export interface UsageLineReducer<State = unknown> {
   nativeChildRequests?(): boolean;
   acceptsLine?(line: string): boolean;
-  parserKind?: 'claude' | 'codex';
+  parserKind?: AgentKind;
   pushLine(line: string, end?: number): readonly UsageEvent[];
   snapshot(): State;
   turnCount?(): number | null;
@@ -724,7 +729,7 @@ export interface ProjectSpendWindow {
 }
 
 export interface ProjectSpendCategory {
-  id: 'claude' | 'codex';
+  id: AgentKind;
   label: string;
   windows: ProjectSpendWindow[];
 }
@@ -1956,6 +1961,8 @@ function sameBuckets(left: readonly ProjectUsageBucket[], right: readonly Projec
 }
 
 export interface SpendIndexBudget {
+  // Null permits only confirmation that the path is absent.
+  expectedRevision?: FileRevision | null;
   maxBytes?: number;
   maxMilliseconds?: number;
   now?: () => number;
@@ -2039,6 +2046,12 @@ function spendAccumulator(
       };
       target.set(key, bucket);
     }
+    if (event.agyUsage) {
+      const held =
+        bucket.agyUsage ??
+        (bucket.requests ? agyUsageFromTotals(bucket.usage, bucket.requestCountExact !== false) : {});
+      bucket.agyUsage = mergeAgyUsage({ ...held }, event.agyUsage);
+    }
     addPricedUsage(bucket.usage, event.usage);
     bucket.unclassifiedCacheWrite = (bucket.unclassifiedCacheWrite ?? 0) + (event.unclassifiedCacheWrite ?? 0);
     if (!bucket.unclassifiedCacheWrite) {
@@ -2113,6 +2126,11 @@ function readIncremental(
 ): IncrementalRead {
   const fd = fs.openSync(file, 'r');
   try {
+    const checkRevision = () => {
+      if (budget.expectedRevision && !sameFileRevision(fs.fstatSync(fd, { bigint: true }), budget.expectedRevision))
+        throw new Error('The Antigravity session changed during the read.');
+    };
+    checkRevision();
     const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, budget.maxBytes ?? 64 * 1024));
     const maxBytes = budget.maxBytes ?? DEFAULT_SCAN_BYTES;
     const clock = budget.now ?? Date.now;
@@ -2254,6 +2272,7 @@ function readIncremental(
       completedOffset = position;
       held = Buffer.alloc(0);
     }
+    checkRevision();
     const repeatedState = repeated ? repeated.snapshot() : null;
     // Windowed readers in this process extend the published map instead of reading the file again.
     if (repeatedState && opened && !repeatedRevisionLost) {
@@ -2295,16 +2314,20 @@ export function indexSpendFile<State>(
   const normalizedWorkspace = normalizeWorkspace(workspace);
   const emptyReducer = makeReducer(undefined);
   const parserKind = emptyReducer.parserKind;
+  const expected = scanBudget.expectedRevision;
   let stat: ReturnType<typeof revisionOf>;
   try {
-    const physical = fs.statSync(file, { bigint: true });
+    const physical = expected === null ? fs.lstatSync(file, { bigint: true }) : fs.statSync(file, { bigint: true });
     stat = revisionOf(physical);
+    if (expected === null || (expected && !sameFileRevision(physical, expected)))
+      throw new Error('The Antigravity session changed before the read.');
     if (!physical.isFile()) {
       throw new Error('not a file');
     }
   } catch (error) {
+    if (expected) throw error;
     if (!['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')) {
-      if (previous)
+      if (previous && expected !== null)
         return {
           record: previous,
           totalsChanged: false,
@@ -2860,9 +2883,9 @@ function displayWindow(
   };
 }
 
-function spendAgent(agent: string): 'claude' | 'codex' | null {
+function spendAgent(agent: string): AgentKind | null {
   const normalized = agent.toLowerCase();
-  return normalized === 'claude' || normalized === 'codex' ? normalized : null;
+  return normalized === 'claude' || normalized === 'codex' || normalized === 'agy' ? normalized : null;
 }
 
 // Calendar callbacks update fixed-size period metadata before background aggregation finishes.
@@ -2920,9 +2943,9 @@ export function* prepareProjectSpendViewSteps(
   );
   const totals = new Map(windows.map((window) => [window.id, accumulator()]));
   const agentTotals = new Map(
-    ['claude', 'codex'].map((agent) => [agent, new Map(windows.map((window) => [window.id, accumulator()]))]),
+    ['claude', 'codex', 'agy'].map((agent) => [agent, new Map(windows.map((window) => [window.id, accumulator()]))]),
   );
-  const evidencedAgents = new Set<'claude' | 'codex'>();
+  const evidencedAgents = new Set<AgentKind>();
   const rateSources = new Map<string, { effectiveDate: string | null; provenance: ProjectSpendProvenance }>();
   let earliestRecord: string | null = null;
   const records = new Map<string, SpendFileIndex>();
@@ -2931,7 +2954,9 @@ export function* prepareProjectSpendViewSteps(
     records.set(file.file, file);
   }
   const directClaude = yield* directClaudeSourceSteps(files);
-  const incomplete = new Map(windows.map((window) => [window.id, { total: false, claude: false, codex: false }]));
+  const incomplete = new Map(
+    windows.map((window) => [window.id, { total: false, claude: false, codex: false, agy: false }]),
+  );
   let lastIndexedAt: number | null = null;
   for (const file of files) {
     yield;
@@ -2946,6 +2971,11 @@ export function* prepareProjectSpendViewSteps(
         }
         const affected = incomplete.get(window.id)!;
         affected.total = true;
+        if (file.parserKind === 'agy') {
+          affected.agy = true;
+          evidencedAgents.add('agy');
+          continue;
+        }
         if (!unresolvedOwnership) affected.claude = true;
         if (file.parserKind !== 'claude') {
           affected.codex = true;
@@ -3008,11 +3038,11 @@ export function* prepareProjectSpendViewSteps(
   for (const window of viewWindows) Object.freeze(window);
   Object.freeze(viewWindows);
   Object.freeze(viewSources);
-  const categories = (['claude', 'codex'] as const)
+  const categories = (['claude', 'codex', 'agy'] as const)
     .filter((agent) => evidencedAgents.has(agent))
     .map((agent) => ({
       id: agent,
-      label: `${agent === 'claude' ? 'Claude' : 'Codex'} spend`,
+      label: { claude: 'Claude spend', codex: 'Codex spend', agy: 'Antigravity spend' }[agent],
       windows: windows.map((window) =>
         displayWindow(
           agentTotals.get(agent)!.get(window.id)!,
@@ -3022,6 +3052,10 @@ export function* prepareProjectSpendViewSteps(
         ),
       ),
     }));
+  for (const category of categories)
+    if (category.id === 'agy')
+      for (const window of category.windows)
+        if (window.dollars === null && window.partial) window.display = AGY_COST_UNAVAILABLE;
   for (const category of categories) {
     for (const window of category.windows) Object.freeze(window);
     Object.freeze(category.windows);
@@ -3394,12 +3428,16 @@ export function* claudeSessionSpendSourceSteps(
 
 // Use the persisted parser kind when available.
 // Otherwise, infer Codex from any Codex lifetime bucket, falling back to windowed buckets for older records.
-export function spendRecordAgent(record: SpendFileIndex): 'claude' | 'codex' {
+export function spendRecordAgent(record: SpendFileIndex): AgentKind {
   if (record.parserKind) {
     return record.parserKind;
   }
   const buckets = record.lifetimeBuckets ?? record.buckets;
-  return buckets.some((bucket) => bucket.agent.toLowerCase() === 'codex') ? 'codex' : 'claude';
+  return buckets.some((bucket) => bucket.agent === 'agy')
+    ? 'agy'
+    : buckets.some((bucket) => bucket.agent.toLowerCase() === 'codex')
+      ? 'codex'
+      : 'claude';
 }
 
 export function spendFileIsClaudeChild(file: string): boolean {
@@ -3538,6 +3576,7 @@ export class SessionSpendSourceIndex {
     directories: SubagentDirectoryReader = uncachedSubagentDirectories,
     // Each dispatched session and the session that dispatched it, as child id to parent id.
     dispatchParents: ReadonlyMap<string, string> = new Map(),
+    agy: readonly SpendSessionFile[] = [],
   ): readonly SessionSpendSource[] {
     const listings = new Map<string, readonly string[]>();
     const listingOf = (directory: string) => {
@@ -3554,6 +3593,7 @@ export class SessionSpendSourceIndex {
         (child) =>
           `k\0${child.sessionId}\0${child.parentSessionId ?? ''}\0${child.file}\0${listingOf(subagentDirectoryOf(child)).join('\0')}`,
       ),
+      ...agy.map(({ sessionId, file }) => JSON.stringify(['agy', sessionId, file])),
       ...codex.map((session) => `s\0${session.sessionId}\0${session.file}`),
       ...codexChildren.map((child) => `x\0${child.threadId}\0${child.parentThreadId ?? ''}\0${child.file}`),
       ...[...dispatchParents].map(([child, parent]) => `d\0${child}\0${parent}`),
@@ -3594,7 +3634,11 @@ export class SessionSpendSourceIndex {
       }
     }
     this.held = withDispatchedSpendSources(
-      [...joined.values(), ...this.discover.codex(codex, codexChildren)],
+      [
+        ...joined.values(),
+        ...this.discover.codex(codex, codexChildren),
+        ...agy.map(({ sessionId, file }) => ({ sessionId, file, primary: true })),
+      ],
       dispatchParents,
       new Map([
         ...claudeChildren.flatMap((child) =>

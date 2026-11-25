@@ -109,6 +109,8 @@ Paths are relative to `extension/src/`. [Architecture](architecture.md) owns pac
 | `exportwriter.ts` | Generated assets, page spools, exclusive directory publication, cancellation, and ownership-checked cleanup | no |
 | `oversizedrecord.ts` | Incremental byte reducer that cuts the bulky strings and compaction history of one oversized record while metadata recovery reads it | no |
 | `claudehistory.ts` | Claude semantic-page and forward-checkpoint adapter, with resumable revisioned model-attachment recovery | no |
+| `agydiscovery.ts` | Scans saved Antigravity sessions in bounded slices and resolves project ownership | no |
+| `agyhistory.ts` | Maps saved Antigravity steps to shared turns, history pages, and recorded usage | no |
 | `codexhistory.ts` | Codex semantic-page and forward-checkpoint adapter, bounded display-model recovery, and bounded raw parent/child commit ownership coverage | no |
 | `historypages.ts` | Per-session older-history pages, completed turns displaced from an accepted selected window, their retention budget, and end-of-list control | no |
 | `turnview.ts` | Saved panel state, parse budgets, list selection, empty states, and re-exports | no |
