@@ -1,3 +1,4 @@
+import { AGY_COST_UNAVAILABLE, agyTokenLines } from '../../extension/src/agyhistory.ts';
 import {
   findSessionTranscriptAsync,
   sessionCostReportAsync,
@@ -30,7 +31,12 @@ function costJSON(report: SessionCostReport) {
 }
 
 function costText(report: SessionCostReport): string {
-  const money = (value: number | null | undefined) => (typeof value === 'number' ? `$${value.toFixed(4)}` : 'unknown');
+  const money = (value: number | null | undefined) =>
+    typeof value === 'number'
+      ? `$${value.toFixed(4)}`
+      : report.source.kind === 'agy'
+        ? AGY_COST_UNAVAILABLE
+        : 'unknown';
   const label = (value: string) => JSON.stringify(value).slice(1, -1);
   const lines = [
     `Cost: ${label(report.source.kind)} ${label(report.source.sessionId)}`,
@@ -61,6 +67,10 @@ function costText(report: SessionCostReport): string {
   summary('Parent', report.parent);
   for (const child of report.children) summary(`Child ${child.kind} ${child.sessionId} (${child.file})`, child);
   summary('Combined', report.combined);
+  if (report.source.kind === 'agy') {
+    const { uncachedInputTokens, cachedInputTokens, outputTokens } = report.parent;
+    lines.push(...agyTokenLines({ input: uncachedInputTokens, cacheRead: cachedInputTokens, output: outputTokens }));
+  }
   lines.push(report.rateNote);
   for (const [name, value] of [
     ['Parent', report.parent],

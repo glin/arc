@@ -1,4 +1,8 @@
-import { revisionOf, validClaudeTaskCompletions } from './transcript';
+import type { AgyAdmission } from './agydiscovery';
+import { CONTENT_ANCHOR_BYTES, readStableRange } from './history';
+import { AGY_COST_UNAVAILABLE, agyUsageFromTotals, mergeAgyUsage } from './agyhistory';
+import type { AgentKind, AgyRecordedUsage, FileRevision } from './transcript';
+import { revisionOf, sameFileRevision, validClaudeTaskCompletions } from './transcript';
 import { meterRead } from './readmeter';
 import { combineCacheExpirySummaries, combineCacheExpiryAmounts } from './cacheexpirysummary';
 import crypto from 'node:crypto';
@@ -42,7 +46,8 @@ import {
   publicPricingValidUntil,
   BEDROCK_LIST_COST_BASIS,
 } from './pricing';
-import { parseSpendLedger, projectUsageKey } from './projectspendstate';
+import { normalizeHistoricalAgy, parseSpendLedger, projectUsageKey, spendRecordAgent } from './projectspendstate';
+export { spendRecordAgent } from './projectspendstate';
 import type {
   CacheLifetime,
   CompactionSignal,
@@ -72,6 +77,7 @@ export interface UsageCounts {
 
 // Usage events carry request facts from transcript reducers into the spend index.
 export interface UsageEvent {
+  agyUsage?: AgyRecordedUsage;
   timestamp: number;
   agent: string;
   provider: string | null;
@@ -125,6 +131,7 @@ export interface UsageEvent {
 }
 
 export interface ProjectUsageBucket {
+  agyUsage?: AgyRecordedUsage;
   usageOrigin?: UsageOrigin;
   localDate: string;
   agent: string;
@@ -193,7 +200,7 @@ export interface SpendFileIndex {
   // Parser generation that produced this source's buckets and state.
   // A mismatch requires a rebuild even when size and modification time match.
   parserGeneration?: number;
-  parserKind?: 'claude' | 'codex';
+  parserKind?: AgentKind;
   indexedAt: number;
   parserState?: unknown;
   // The Claude repeated-record detector and the byte ranges of repeated records it found. Readers skip those ranges.
@@ -204,6 +211,20 @@ export interface SpendFileIndex {
   scanOffset?: number;
   pendingBytes?: string;
   missingAt?: number;
+  // A confirmed return preserves past usage and requires a fresh scan.
+  agyRescanRequired?: true;
+  [agySpendProgress]?: { admission: AgyAdmission; anchor?: SpendAnchor };
+}
+
+const agySpendProgress = Symbol('Antigravity spend progress');
+
+interface SpendAnchor {
+  end: number;
+  bytes: Buffer;
+}
+
+export function agySpendAtAdmission(record: SpendFileIndex, admission: AgyAdmission): boolean {
+  return record[agySpendProgress]?.admission === admission;
 }
 
 export interface SpendLedger {
@@ -215,6 +236,7 @@ export interface SpendLedger {
   // Last complete records supply display figures while partial rescans advance in files.
   // Filtering files by complete loses the previous complete record during a rescan.
   completeFiles: SpendFileIndex[];
+  agyCompleteFiles?: SpendFileIndex[];
 }
 
 // Cache session figures by their source lists, record identities, and pending ownership.
@@ -523,6 +545,10 @@ export function releaseSpendHeldLine(record: SpendFileIndex): SpendFileIndex {
     return record;
   }
   const { pendingBytes: _pendingBytes, trailingBytes: _trailingBytes, ...rest } = record;
+  const progress = record[agySpendProgress];
+  if (progress?.anchor && progress.anchor.end !== record.offset) {
+    rest[agySpendProgress] = { admission: progress.admission };
+  }
   return { ...rest, scanOffset: record.offset, trailing: '' };
 }
 // A failed ledger save tries again after this wait, and each later wait doubles. After
@@ -537,25 +563,26 @@ export function projectSpendSaveRetryDelay(retries: number): number | null {
 // Saved source records require a rebuild when the parser generation of their agent differs.
 // Increase an agent's generation when a stored field of its records changes the conclusions consumers draw from it.
 // Increase both generations for a change that alters both agents' records.
-export const PROJECT_SPEND_PARSER_GENERATIONS: Readonly<Record<'claude' | 'codex', number>> = { claude: 70, codex: 70 };
+export const PROJECT_SPEND_PARSER_GENERATIONS: Readonly<Record<AgentKind, number>> = { claude: 70, codex: 70, agy: 1 };
 
 // Earlier shared generations whose records of one agent match that agent's generation.
 // Each mapping names the agent generation of the stored facts.
 // A later bump of one agent's generation stops accepting that agent's earlier records.
-export const PROJECT_SPEND_PARSER_IMPORTS: Readonly<Record<'claude' | 'codex', Readonly<Record<number, number>>>> = {
+export const PROJECT_SPEND_PARSER_IMPORTS: Readonly<Record<AgentKind, Readonly<Record<number, number>>>> = {
   claude: { 65: 66 },
   codex: {},
+  agy: {},
 };
 
 // The generation a reducer of this kind writes. A record of an unknown kind matches no generation.
-export function spendParserGeneration(kind: 'claude' | 'codex' | undefined): number {
+export function spendParserGeneration(kind: AgentKind | undefined): number {
   return kind === undefined ? 0 : PROJECT_SPEND_PARSER_GENERATIONS[kind];
 }
 
 // Whether a saved record of this kind and generation holds current facts.
 // A record keeps the generation it was written with, so cost-state dependencies of unchanged sources keep their identity.
 export function spendParserCurrent(kind: unknown, generation: unknown): boolean {
-  if (kind !== 'claude' && kind !== 'codex') return false;
+  if (kind !== 'claude' && kind !== 'codex' && kind !== 'agy') return false;
   const current = PROJECT_SPEND_PARSER_GENERATIONS[kind];
   return generation === current || PROJECT_SPEND_PARSER_IMPORTS[kind][generation as number] === current;
 }
@@ -606,6 +633,7 @@ export function projectSpendOfferDecision(
     revision.size !== previous.size ||
     revision.mtimeMs !== previous.mtimeMs ||
     previous.missingAt !== undefined ||
+    previous.agyRescanRequired ||
     previous.complete === false ||
     !spendRecordHasLifetimeFacts(previous);
   return changed ? 'queue' : 'current';
@@ -614,7 +642,7 @@ export function projectSpendOfferDecision(
 export interface UsageLineReducer<State = unknown> {
   nativeChildRequests?(): boolean;
   acceptsLine?(line: string): boolean;
-  parserKind?: 'claude' | 'codex';
+  parserKind?: AgentKind;
   pushLine(line: string, end?: number): readonly UsageEvent[];
   snapshot(): State;
   turnCount?(): number | null;
@@ -724,7 +752,7 @@ export interface ProjectSpendWindow {
 }
 
 export interface ProjectSpendCategory {
-  id: 'claude' | 'codex';
+  id: AgentKind;
   label: string;
   windows: ProjectSpendWindow[];
 }
@@ -1956,6 +1984,9 @@ function sameBuckets(left: readonly ProjectUsageBucket[], right: readonly Projec
 }
 
 export interface SpendIndexBudget {
+  // Null permits only confirmation that the path is absent.
+  expectedRevision?: FileRevision | null;
+  agyAdmission?: AgyAdmission;
   maxBytes?: number;
   maxMilliseconds?: number;
   now?: () => number;
@@ -1981,6 +2012,7 @@ interface IncrementalRead {
   claudeRepeated: ClaudeRepeatedState | null;
   // True when a repeated-record lookup could not read the bytes before the restored offset.
   repeatedRevisionLost: boolean;
+  agyAnchor?: SpendAnchor;
 }
 
 // Adds the usage events of one rollout to its dated and lifetime buckets, and orders its requests for the cache expiry
@@ -2038,6 +2070,12 @@ function spendAccumulator(
         requests: 0,
       };
       target.set(key, bucket);
+    }
+    if (event.agyUsage) {
+      const held =
+        bucket.agyUsage ??
+        (bucket.requests ? agyUsageFromTotals(bucket.usage, bucket.requestCountExact !== false) : {});
+      bucket.agyUsage = mergeAgyUsage({ ...held }, event.agyUsage);
     }
     addPricedUsage(bucket.usage, event.usage);
     bucket.unclassifiedCacheWrite = (bucket.unclassifiedCacheWrite ?? 0) + (event.unclassifiedCacheWrite ?? 0);
@@ -2110,9 +2148,15 @@ function readIncremental(
   budget: SpendIndexBudget,
   // The saved repeated-record detector for a Claude source, or null for a source without one.
   restoredRepeated: ClaudeRepeatedState | null = null,
+  agyAnchor?: SpendAnchor,
 ): IncrementalRead {
   const fd = fs.openSync(file, 'r');
   try {
+    const checkRevision = () => {
+      if (budget.expectedRevision && !sameFileRevision(fs.fstatSync(fd, { bigint: true }), budget.expectedRevision))
+        throw new Error('The Antigravity session changed during the read.');
+    };
+    checkRevision();
     const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, budget.maxBytes ?? 64 * 1024));
     const maxBytes = budget.maxBytes ?? DEFAULT_SCAN_BYTES;
     const clock = budget.now ?? Date.now;
@@ -2149,6 +2193,7 @@ function readIncremental(
     // A slice reads its first chunk even past the deadline, so every slice makes progress.
     while (position < size && readBytes < maxBytes && (readBytes === 0 || clock() < deadline)) {
       const allowed = Math.min(chunk.length, size - position, maxBytes - readBytes);
+      const chunkStart = position;
       const read = meterRead(file, fs.readSync(fd, chunk, 0, allowed, position), position);
       if (read <= 0) {
         break;
@@ -2230,8 +2275,20 @@ function readIncremental(
         position = completedOffset;
         heldParts = [];
         heldLength = 0;
-        break;
       }
+      if (budget.agyAdmission && position > chunkStart) {
+        const end = position - chunkStart;
+        agyAnchor = {
+          end: position,
+          bytes: Buffer.from(
+            chunk.subarray(
+              Math.max(0, end - Math.min(CONTENT_ANCHOR_BYTES, Math.ceil((budget.maxBytes ?? DEFAULT_SCAN_BYTES) / 2))),
+              end,
+            ),
+          ),
+        };
+      }
+      if (stoppedBetweenLines) break;
       if (lineStart < read) {
         heldParts.push(Buffer.from(chunk.subarray(lineStart, read)));
         heldLength += read - lineStart;
@@ -2254,6 +2311,7 @@ function readIncremental(
       completedOffset = position;
       held = Buffer.alloc(0);
     }
+    checkRevision();
     const repeatedState = repeated ? repeated.snapshot() : null;
     // Windowed readers in this process extend the published map instead of reading the file again.
     if (repeatedState && opened && !repeatedRevisionLost) {
@@ -2273,6 +2331,7 @@ function readIncremental(
       cacheExpiry: spend.ledger(),
       claudeRepeated: repeatedState,
       repeatedRevisionLost,
+      agyAnchor: agyAnchor?.end === position ? agyAnchor : undefined,
     };
   } finally {
     fs.closeSync(fd);
@@ -2295,16 +2354,21 @@ export function indexSpendFile<State>(
   const normalizedWorkspace = normalizeWorkspace(workspace);
   const emptyReducer = makeReducer(undefined);
   const parserKind = emptyReducer.parserKind;
+  const expected = scanBudget.expectedRevision;
   let stat: ReturnType<typeof revisionOf>;
   try {
-    const physical = fs.statSync(file, { bigint: true });
+    const physical =
+      expected !== undefined ? fs.lstatSync(file, { bigint: true }) : fs.statSync(file, { bigint: true });
     stat = revisionOf(physical);
+    if (expected === null || (expected && !sameFileRevision(physical, expected)))
+      throw new Error('The Antigravity session changed before the read.');
     if (!physical.isFile()) {
       throw new Error('not a file');
     }
   } catch (error) {
+    if (expected) throw error;
     if (!['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')) {
-      if (previous)
+      if (previous && expected !== null)
         return {
           record: previous,
           totalsChanged: false,
@@ -2316,8 +2380,19 @@ export function indexSpendFile<State>(
         };
       throw error;
     }
+    if (expected === null && previous?.file === normalizedFile && previous.missingAt !== undefined) {
+      return {
+        record: previous,
+        totalsChanged: false,
+        stateChanged: false,
+        changed: false,
+        rebuilt: false,
+        found: false,
+        complete: true,
+      };
+    }
     invalidateSpendFileNormalization(file);
-    const record =
+    const record: SpendFileIndex =
       previous && previous.file === normalizedFile
         ? // A source that returns is read again from its start, so the record lets its held bytes go.
           { ...releaseSpendHeldLine(previous), missingAt: previous.missingAt ?? now }
@@ -2333,6 +2408,8 @@ export function indexSpendFile<State>(
             missingAt: now,
             ...(parserKind === undefined ? {} : { parserKind }),
           };
+    delete record.agyRescanRequired;
+    delete record[agySpendProgress];
     const stateChanged = !previous || previous.missingAt === undefined;
     return {
       record,
@@ -2351,13 +2428,46 @@ export function indexSpendFile<State>(
     (parserKind === undefined || previous.parserKind === parserKind) &&
     (previous.sourceIdentity === undefined || previous.sourceIdentity === `${stat.dev}:${stat.ino}`);
   const lifetimeReady = reusable && spendRecordHasLifetimeFacts(previous);
+  let restart = previous?.missingAt !== undefined || previous?.agyRescanRequired === true;
+  let readBudget = scanBudget;
+  const admission = scanBudget.agyAdmission;
+  if (admission && previous && !restart) {
+    const progress = previous[agySpendProgress];
+    if (!progress || progress.admission.lineage !== admission.lineage) {
+      restart = true;
+    } else if (!agySpendAtAdmission(previous, admission)) {
+      const end = previous.complete === false ? (previous.scanOffset ?? previous.offset) : previous.size;
+      const anchor = progress.anchor;
+      const maxBytes = scanBudget.maxBytes ?? DEFAULT_SCAN_BYTES;
+      if (
+        !anchor ||
+        anchor.end !== end ||
+        end > previous.size ||
+        stat.size <= previous.size ||
+        !expected ||
+        anchor.bytes.length >= maxBytes
+      ) {
+        restart = true;
+      } else {
+        const clock = scanBudget.now ?? Date.now;
+        const started = clock();
+        const sampled = readStableRange(file, end - anchor.bytes.length, anchor.bytes.length, expected);
+        restart = !sampled?.equals(anchor.bytes);
+        readBudget = {
+          ...scanBudget,
+          maxBytes: maxBytes - anchor.bytes.length,
+          maxMilliseconds: (scanBudget.maxMilliseconds ?? DEFAULT_SCAN_MILLISECONDS) - (clock() - started),
+        };
+      }
+    }
+  }
   const policyChanged =
     parserKind === 'claude' && previous?.cacheExpiryChildPolicy !== (emptyReducer.nativeChildRequests?.() === true);
   const unchanged =
     lifetimeReady &&
     previous.sourceIdentity === `${stat.dev}:${stat.ino}` &&
     previous.complete !== false &&
-    previous.missingAt === undefined &&
+    !restart &&
     (parserKind !== 'claude' || previous.cacheExpiryChildPolicy === (emptyReducer.nativeChildRequests?.() === true)) &&
     previous.size === stat.size &&
     previous.mtimeMs === stat.mtimeMs;
@@ -2375,14 +2485,14 @@ export function indexSpendFile<State>(
   const resuming =
     reusable &&
     previous.complete === false &&
-    previous.missingAt === undefined &&
+    !restart &&
     stat.size >= previous.size &&
     (stat.size > previous.size || stat.mtimeMs === previous.mtimeMs);
   const rebuilt =
     !reusable ||
     !lifetimeReady ||
     policyChanged ||
-    previous.missingAt !== undefined ||
+    restart ||
     stat.size < previous.size ||
     (!resuming && stat.size === previous.size);
   // A Claude source resumes only with the repeated-record detector that classified the bytes before its offset.
@@ -2403,8 +2513,9 @@ export function indexSpendFile<State>(
     base?.buckets ?? [],
     base?.lifetimeBuckets ?? [],
     base?.cacheExpiry,
-    scanBudget,
+    readBudget,
     parserKind === 'claude' ? (base?.claudeRepeated ?? emptyClaudeRepeatedState()) : null,
+    base?.[agySpendProgress]?.anchor,
   );
   if (scanned.repeatedRevisionLost) {
     forgetClaudeRepeatedLookups(file);
@@ -2451,6 +2562,7 @@ export function indexSpendFile<State>(
     indexedAt: now,
     parserState: reducer.snapshot(),
     ...(scanned.claudeRepeated ? { claudeRepeated: scanned.claudeRepeated } : {}),
+    ...(admission ? { [agySpendProgress]: { admission, anchor: scanned.agyAnchor } } : {}),
     complete: scanned.complete,
     ...(scanned.complete ? {} : { scanOffset: scanned.scanOffset, pendingBytes: scanned.trailing.toString('base64') }),
   };
@@ -2474,6 +2586,8 @@ export function indexSpendFile<State>(
     previous.complete !== record.complete ||
     previous.scanOffset !== record.scanOffset ||
     previous.pendingBytes !== record.pendingBytes ||
+    previous.missingAt !== record.missingAt ||
+    previous.agyRescanRequired !== record.agyRescanRequired ||
     previous.parserGeneration !== record.parserGeneration ||
     previous.parserKind !== record.parserKind;
   return {
@@ -2543,33 +2657,88 @@ function unreadSpendFile(file: string): boolean {
   return file.toLowerCase().endsWith('.jsonl.zst');
 }
 
-export function pruneSpendFilesWithResult(files: readonly SpendFileIndex[], now = Date.now()): PruneSpendFilesResult {
-  const cutoff = projectSpendWindows(now)[2].start;
+function keepSpendRecord(record: SpendFileIndex, datedBuckets: number): boolean {
+  return record.missingAt === undefined || datedBuckets > 0;
+}
+
+function pruneSpendRecords(
+  files: readonly SpendFileIndex[],
+  cutoff: string,
+  keep: (record: SpendFileIndex, datedBuckets: number) => boolean,
+): PruneSpendFilesResult {
   let pruned = false;
-  const retained = files
-    .filter((record) => {
-      const unread = unreadSpendFile(record.file);
-      if (unread) {
-        pruned = true;
-      }
-      return !unread;
-    })
-    .map((record) => {
-      const buckets = record.buckets.filter((bucket) => bucket.localDate >= cutoff);
-      if (buckets.length === record.buckets.length) {
-        return record;
-      }
+  const retained: SpendFileIndex[] = [];
+  for (const record of files) {
+    if (unreadSpendFile(record.file)) {
       pruned = true;
-      return { ...record, buckets };
-    })
-    .filter((record) => {
-      const keep = !record.missingAt || record.buckets.length > 0;
-      if (!keep) {
-        pruned = true;
-      }
-      return keep;
-    });
+      continue;
+    }
+    const buckets = record.buckets.filter((bucket) => bucket.localDate >= cutoff);
+    if (!keep(record, buckets.length)) {
+      pruned = true;
+    } else if (buckets.length !== record.buckets.length) {
+      pruned = true;
+      retained.push({ ...record, buckets });
+    } else {
+      retained.push(record);
+    }
+  }
   return { files: retained, pruned };
+}
+
+export function pruneSpendFilesWithResult(files: readonly SpendFileIndex[], now = Date.now()): PruneSpendFilesResult {
+  return pruneSpendRecords(files, projectSpendWindows(now)[2].start, keepSpendRecord);
+}
+
+function matchesAgyDisplay(display: SpendFileIndex, working: SpendFileIndex | undefined): boolean {
+  return working !== undefined && working.workspace === display.workspace && spendRecordAgent(working) === 'agy';
+}
+
+export function pruneSpendLedgerFiles(
+  files: readonly SpendFileIndex[],
+  completeFiles: readonly SpendFileIndex[],
+  now = Date.now(),
+  agyComplete: readonly SpendFileIndex[] = [],
+): { resumable: PruneSpendFilesResult; visible: PruneSpendFilesResult; displaced?: PruneSpendFilesResult } {
+  const cutoff = projectSpendWindows(now)[2].start;
+  const resumable = pruneSpendRecords(files, cutoff, keepSpendRecord);
+  if (files === completeFiles && !agyComplete.length) return { resumable, visible: resumable };
+
+  let byPath: Map<string, SpendFileIndex> | undefined;
+  const visible = pruneSpendRecords(completeFiles, cutoff, (record, datedBuckets) => {
+    if (spendRecordAgent(record) !== 'agy') return keepSpendRecord(record, datedBuckets);
+    // Publication takes each displayed source from a working path. That path owns the current deletion mark.
+    byPath ??= new Map(resumable.files.map((working) => [working.file, working]));
+    return matchesAgyDisplay(record, byPath.get(record.file));
+  });
+  const displaced = agyComplete.length
+    ? pruneSpendRecords(agyComplete, cutoff, (record) => {
+        byPath ??= new Map(resumable.files.map((working) => [working.file, working]));
+        const working = byPath.get(record.file);
+        return working?.complete === false && matchesAgyDisplay(record, working);
+      })
+    : undefined;
+  return { resumable, visible, ...(displaced ? { displaced } : {}) };
+}
+
+export function completeSpendFiles(
+  files: readonly SpendFileIndex[],
+  previous: readonly SpendFileIndex[],
+  agyComplete?: ReadonlyMap<string, SpendFileIndex>,
+): SpendFileIndex[] {
+  const byPath = new Map(previous.map((record) => [record.file, record]));
+  const complete: SpendFileIndex[] = [];
+  for (const working of files) {
+    if (working.complete !== false) {
+      complete.push(working);
+    } else {
+      const fallback = agyComplete?.get(working.file) ?? byPath.get(working.file);
+      if (fallback && (spendRecordAgent(fallback) !== 'agy' || matchesAgyDisplay(fallback, working))) {
+        complete.push(fallback);
+      }
+    }
+  }
+  return complete;
 }
 
 export function pruneSpendFiles(files: readonly SpendFileIndex[], now = Date.now()): SpendFileIndex[] {
@@ -2634,6 +2803,7 @@ export function loadSpendLedger(storageDirectory: string, workspace: string): Sp
       ...ledger,
       files: ledger.files.map(consumeSpendPadding),
       completeFiles: ledger.completeFiles.map(consumeSpendPadding),
+      ...(ledger.agyCompleteFiles ? { agyCompleteFiles: ledger.agyCompleteFiles.map(consumeSpendPadding) } : {}),
     };
   } catch {
     return {
@@ -2650,8 +2820,10 @@ export function saveSpendLedger(
   workspace: string,
   files: readonly SpendFileIndex[],
   completeFiles: readonly SpendFileIndex[] = files.filter((record) => record.complete !== false),
+  agyCompleteFiles?: Iterable<SpendFileIndex>,
 ): void {
-  const checkpoint = (record: SpendFileIndex): SpendFileIndex => {
+  const checkpoint = (input: SpendFileIndex): SpendFileIndex => {
+    const record = normalizeHistoricalAgy(input);
     const state = withRetainedRequestEvents(record.parserState);
     const normalizedFile = normalizeSpendFile(record.file);
     const bounded =
@@ -2705,7 +2877,17 @@ export function saveSpendLedger(
         JSON.stringify(checkpoint(present[found])) === text;
       write(separator + (same ? String(found) : text));
     });
-    write(']}');
+    write(']');
+    if (agyCompleteFiles) {
+      write(',"agyCompleteFiles":[');
+      let separator = '';
+      for (const record of agyCompleteFiles) {
+        write(separator + JSON.stringify(checkpoint(record)));
+        separator = ',';
+      }
+      write(']');
+    }
+    write('}');
   });
 }
 
@@ -2860,9 +3042,9 @@ function displayWindow(
   };
 }
 
-function spendAgent(agent: string): 'claude' | 'codex' | null {
+function spendAgent(agent: string): AgentKind | null {
   const normalized = agent.toLowerCase();
-  return normalized === 'claude' || normalized === 'codex' ? normalized : null;
+  return normalized === 'claude' || normalized === 'codex' || normalized === 'agy' ? normalized : null;
 }
 
 // Calendar callbacks update fixed-size period metadata before background aggregation finishes.
@@ -2920,9 +3102,9 @@ export function* prepareProjectSpendViewSteps(
   );
   const totals = new Map(windows.map((window) => [window.id, accumulator()]));
   const agentTotals = new Map(
-    ['claude', 'codex'].map((agent) => [agent, new Map(windows.map((window) => [window.id, accumulator()]))]),
+    ['claude', 'codex', 'agy'].map((agent) => [agent, new Map(windows.map((window) => [window.id, accumulator()]))]),
   );
-  const evidencedAgents = new Set<'claude' | 'codex'>();
+  const evidencedAgents = new Set<AgentKind>();
   const rateSources = new Map<string, { effectiveDate: string | null; provenance: ProjectSpendProvenance }>();
   let earliestRecord: string | null = null;
   const records = new Map<string, SpendFileIndex>();
@@ -2931,7 +3113,9 @@ export function* prepareProjectSpendViewSteps(
     records.set(file.file, file);
   }
   const directClaude = yield* directClaudeSourceSteps(files);
-  const incomplete = new Map(windows.map((window) => [window.id, { total: false, claude: false, codex: false }]));
+  const incomplete = new Map(
+    windows.map((window) => [window.id, { total: false, claude: false, codex: false, agy: false }]),
+  );
   let lastIndexedAt: number | null = null;
   for (const file of files) {
     yield;
@@ -2946,6 +3130,11 @@ export function* prepareProjectSpendViewSteps(
         }
         const affected = incomplete.get(window.id)!;
         affected.total = true;
+        if (file.parserKind === 'agy') {
+          affected.agy = true;
+          evidencedAgents.add('agy');
+          continue;
+        }
         if (!unresolvedOwnership) affected.claude = true;
         if (file.parserKind !== 'claude') {
           affected.codex = true;
@@ -3008,11 +3197,11 @@ export function* prepareProjectSpendViewSteps(
   for (const window of viewWindows) Object.freeze(window);
   Object.freeze(viewWindows);
   Object.freeze(viewSources);
-  const categories = (['claude', 'codex'] as const)
+  const categories = (['claude', 'codex', 'agy'] as const)
     .filter((agent) => evidencedAgents.has(agent))
     .map((agent) => ({
       id: agent,
-      label: `${agent === 'claude' ? 'Claude' : 'Codex'} spend`,
+      label: { claude: 'Claude spend', codex: 'Codex spend', agy: 'Antigravity spend' }[agent],
       windows: windows.map((window) =>
         displayWindow(
           agentTotals.get(agent)!.get(window.id)!,
@@ -3022,6 +3211,10 @@ export function* prepareProjectSpendViewSteps(
         ),
       ),
     }));
+  for (const category of categories)
+    if (category.id === 'agy')
+      for (const window of category.windows)
+        if (window.dollars === null && window.partial) window.display = AGY_COST_UNAVAILABLE;
   for (const category of categories) {
     for (const window of category.windows) Object.freeze(window);
     Object.freeze(category.windows);
@@ -3392,16 +3585,6 @@ export function* claudeSessionSpendSourceSteps(
   return sources;
 }
 
-// Use the persisted parser kind when available.
-// Otherwise, infer Codex from any Codex lifetime bucket, falling back to windowed buckets for older records.
-export function spendRecordAgent(record: SpendFileIndex): 'claude' | 'codex' {
-  if (record.parserKind) {
-    return record.parserKind;
-  }
-  const buckets = record.lifetimeBuckets ?? record.buckets;
-  return buckets.some((bucket) => bucket.agent.toLowerCase() === 'codex') ? 'codex' : 'claude';
-}
-
 export function spendFileIsClaudeChild(file: string): boolean {
   return path.basename(path.dirname(file)).toLowerCase() === 'subagents';
 }
@@ -3538,6 +3721,7 @@ export class SessionSpendSourceIndex {
     directories: SubagentDirectoryReader = uncachedSubagentDirectories,
     // Each dispatched session and the session that dispatched it, as child id to parent id.
     dispatchParents: ReadonlyMap<string, string> = new Map(),
+    agy: readonly SpendSessionFile[] = [],
   ): readonly SessionSpendSource[] {
     const listings = new Map<string, readonly string[]>();
     const listingOf = (directory: string) => {
@@ -3554,6 +3738,7 @@ export class SessionSpendSourceIndex {
         (child) =>
           `k\0${child.sessionId}\0${child.parentSessionId ?? ''}\0${child.file}\0${listingOf(subagentDirectoryOf(child)).join('\0')}`,
       ),
+      ...agy.map(({ sessionId, file }) => JSON.stringify(['agy', sessionId, file])),
       ...codex.map((session) => `s\0${session.sessionId}\0${session.file}`),
       ...codexChildren.map((child) => `x\0${child.threadId}\0${child.parentThreadId ?? ''}\0${child.file}`),
       ...[...dispatchParents].map(([child, parent]) => `d\0${child}\0${parent}`),
@@ -3594,7 +3779,11 @@ export class SessionSpendSourceIndex {
       }
     }
     this.held = withDispatchedSpendSources(
-      [...joined.values(), ...this.discover.codex(codex, codexChildren)],
+      [
+        ...joined.values(),
+        ...this.discover.codex(codex, codexChildren),
+        ...agy.map(({ sessionId, file }) => ({ sessionId, file, primary: true })),
+      ],
       dispatchParents,
       new Map([
         ...claudeChildren.flatMap((child) =>
@@ -4221,7 +4410,14 @@ export function compressedSpendDisplayFiles(
   const out: SpendFileIndex[] = [];
   for (const record of files) {
     const sessionId = sessionIdOf(record.file);
-    const key = byPair.get(canonicalPath(record.file)) ?? (sessionId && groups.has(sessionId) ? sessionId : undefined);
+    const pair = byPair.get(canonicalPath(record.file));
+    const pairedThread = pair && groups.get(pair)!.entries[0].threadId;
+    const key =
+      pair && (!sessionId || !pairedThread || sessionId === pairedThread)
+        ? pair
+        : sessionId && groups.has(sessionId)
+          ? sessionId
+          : undefined;
     if (key === undefined) out.push(record);
     else groups.get(key)!.plain.push(record);
   }
@@ -4250,7 +4446,10 @@ export function sessionLifetimeDisplayFiles(
   _indexing: boolean,
   resumable: readonly SpendFileIndex[],
   complete: readonly SpendFileIndex[],
+  agyComplete?: ReadonlyMap<string, SpendFileIndex>,
 ): readonly SpendFileIndex[] {
   const fallback = new Map(complete.map((record) => [record.file, record]));
-  return resumable.map((record) => (record.complete === false ? (fallback.get(record.file) ?? record) : record));
+  return resumable.map((record) =>
+    record.complete === false ? (agyComplete?.get(record.file) ?? fallback.get(record.file) ?? record) : record,
+  );
 }

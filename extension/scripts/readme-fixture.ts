@@ -27,10 +27,11 @@ import type { CacheExpiryCarry, ProjectUsageBucket, SpendFileIndex } from '../sr
 import { usageBar } from '../src/usageview.ts';
 import type { AgentUsage } from '../src/usageview.ts';
 import { renderRichMarkdown } from '../src/richtext.ts';
-import { counts, skillUse, subagent, turn } from '../src/turnfixtures.ts';
+import { counts, skillUse, subagent, turn as fixtureTurn } from '../src/turnfixtures.ts';
 import {
   SKILL_STEP_KIND,
   type Turn,
+  type LaunchAgentKind,
   type Compaction,
   type TurnUsage,
   type TurnUsagePart,
@@ -66,7 +67,14 @@ const file = (name: string, added: number, removed: number, isNew = false) => ({
   edits: [],
 });
 
-const readStateTurn: Turn = turn({
+type DemoTurn = Turn & { agent: LaunchAgentKind };
+
+function turn(over: Partial<DemoTurn> = {}): DemoTurn {
+  const agent = over.agent ?? 'claude';
+  return { ...fixtureTurn(over), agent };
+}
+
+const readStateTurn: DemoTurn = turn({
   agent: 'codex',
   sessionId: 'arc-read-state',
   sessionTitle: 'Keep unread results visible',
@@ -283,7 +291,7 @@ const readmeFilesTurn: Turn = {
   ],
 };
 
-const changesTurn: Turn = turn({
+const changesTurn: DemoTurn = turn({
   sessionId: 'arc-open-changes',
   sessionTitle: 'Open changed files',
   promptId: 'open-changed-files',
@@ -372,7 +380,7 @@ const nextTurn: Turn = {
   },
 };
 
-const beforeExpiry: Turn = turn({
+const beforeExpiry: DemoTurn = turn({
   agent: 'claude',
   sessionId: changesTurn.sessionId,
   sessionTitle: changesTurn.sessionTitle,
@@ -408,7 +416,7 @@ const expiryUsage = {
 };
 // The main agent makes five requests. The first starts the subagent and rewrites the expired cache, which is the request the expiry evidence holds. The other four read the rewritten cache while the context grows from about 160k to 190k tokens.
 const expiryTurnUsage = changesTurn.usage;
-const expiryTurn: Turn = {
+const expiryTurn: DemoTurn = {
   ...changesTurn,
   usage: expiryTurnUsage,
   contextTokens: 190_000,
@@ -418,7 +426,7 @@ const expiryTurn: Turn = {
 function firstRequestUsage(item: Turn): Turn['usage'] {
   return item.promptId === expiryTurn.promptId ? expiryUsage : item.usage;
 }
-const expiryHistory: Turn[] = [
+const expiryHistory: DemoTurn[] = [
   expiryTurn,
   { ...beforeExpiry, usage: expiryUsage, contextTokens: 162_000 },
   {
@@ -512,7 +520,7 @@ const cacheUsage: Turn['usage'] = {
   output: 12_000,
   thinking: 0,
 };
-const cacheTurn: Turn = turn({
+const cacheTurn: DemoTurn = turn({
   agent: 'codex',
   sessionId: 'arc-cache-run',
   sessionTitle: 'Inspect low cache reuse',
@@ -809,7 +817,7 @@ const demoHaikuTestUsage: TurnUsage = {
 };
 demoHaikuTestUsage.byContextBand = { short: { ...demoHaikuTestUsage } };
 
-const demoCodexReadStateTurn: Turn = {
+const demoCodexReadStateTurn: DemoTurn = {
   ...readStateTurn,
   agents: readStateAgents.filter((agent) => agent.id !== 'background-review'),
   summary:
@@ -914,7 +922,7 @@ const demoCodexReadStateTurn: Turn = {
   failures: [{ tool: 'npm test', message: 'The read-state test failed after switching views.' }],
 };
 
-const demoReadStateTurn: Turn = {
+const demoReadStateTurn: DemoTurn = {
   ...demoCodexReadStateTurn,
   agent: 'claude',
   model: 'claude-opus-5-5',
@@ -1041,7 +1049,7 @@ const demoReadStateTurn: Turn = {
 const demoTestAgent = demoReadStateTurn.agents.find((agent) => agent.id === 'luna-tests')!;
 const demoTestEndedAt = demoTestAgent.commits![0].at;
 
-export const DEMO_TURNS: Record<string, Turn[]> = {
+export const DEMO_TURNS: Record<string, DemoTurn[]> = {
   'arc-read-state': [
     demoReadStateTurn,
     turn({

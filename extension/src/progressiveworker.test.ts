@@ -1,5 +1,6 @@
 // @module-tag subprocess
 import { revisionOf } from './transcript';
+import { readAgySession } from './agyhistory';
 import { beforeAll, test, vi } from 'vitest';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
@@ -11,18 +12,22 @@ import { tempDir } from './temproot.ts';
 import {
   compressedEntryBatches,
   compressedEntryVersions,
+  compressedEntryCurrent,
   compressedEntrySeed,
   compressedPairKey,
   CompressedStoreFollower,
   readCompressedStore,
+  readCompressedStoreInSteps,
+  withKeptUndercount,
   type CompressedEntrySeed,
   type CompressedFactEntry,
-  type CompressedStoreHolder,
+  CompressedStoreHolder,
 } from './compressedstore.ts';
 import {
   BACKFILL_SLICE_BYTES,
   BACKFILL_TURN_LIMIT_MS,
   CompressedBackfill,
+  type CompressedBackfillBatch,
   compressedFactsFromDerivation,
   DiscoveryQueue,
   RolloutDerivation,
@@ -65,7 +70,7 @@ import {
   readCodexSessionTitlePair,
   type CodexSessionMeta,
 } from './codex';
-import { readRolloutStat, scanCodexDispatchReferences } from './codex';
+import { openingRecordOf, readRolloutStat, scanCodexDispatchReferences } from './codex';
 import { railCacheMarkOf, sessionParentIndex, agentRunAnswer } from './turnrail';
 import { logOf, toCard, turnCost } from './turncard';
 import { codexAgentSpendVersion, codexSpendIndex, type CodexSubagentFile } from './codex';
@@ -7854,6 +7859,73 @@ test('generation 35 empty names reread an unchanged image-bearing rollout after 
   }
 });
 
+test('Antigravity metadata recovery retains the outcome and usage beyond a bounded history read', async () => {
+  const directory = tempDir('agy-metadata-source-');
+  const file = path.join(directory, 'transcript_full.jsonl');
+  const body =
+    [
+      { type: 'USER_INPUT', content: 'Keep the first prompt.' },
+      { type: 'SYSTEM_MESSAGE', content: 'System activity between the prompt and reply.' },
+      { type: 'PLANNER_RESPONSE', content: 'Finished.', input_tokens: 7, cache_read_tokens: 0, output_tokens: 2 },
+      ...Array.from({ length: 80 }, () => ({ type: 'SYSTEM_MESSAGE', content: 'x'.repeat(256) })),
+    ]
+      .map((row, step_index) =>
+        JSON.stringify({ ...row, step_index, created_at: timestamp(step_index), status: 'DONE' }),
+      )
+      .join('\n') + '\n';
+  fs.writeFileSync(file, body);
+  const session = {
+    file,
+    sessionId: 'session',
+    agent: 'agy' as const,
+    agyFirstPrompt: 'Keep the first prompt.',
+    ...revisionOf(fs.statSync(file, { bigint: true })),
+  };
+  const worker = new ProgressiveWorker(source);
+  const signal = new AbortController().signal;
+  const sliceBytes = 4096;
+  try {
+    const normal = readAgySession(file, session.sessionId, { tailBytes: session.size });
+    const turn = normal.read?.turns[0];
+    assert.equal(turn?.prompt, 'Keep the first prompt.');
+    assert.equal(turn?.summary, 'Finished.');
+    assert.deepEqual(turn?.agyUsage, { input: 7, cacheRead: 0, output: 2 });
+    assert.equal(turn?.endedAt, Date.parse(timestamp(82)));
+    assert.equal(normal.checkpoint?.parserState.active?.end, session.size - 1);
+    const narrow = await worker.run({ kind: 'metadata', session, tailBytes: sliceBytes }, 1, signal);
+    assert.ok(narrow?.value.kind === 'metadata');
+    assert.equal(narrow.value.coverage?.whole, false);
+    let reads = 0;
+    for (let i = 0; i < Math.ceil(session.size / sliceBytes) + 2; i++) {
+      const result = await worker.run(
+        {
+          kind: 'metadata-recovery',
+          session,
+          sliceBytes,
+          recordBytes: 512,
+          retainedBytes: 96 * 1024,
+          eligible: ['session'],
+        },
+        1,
+        signal,
+      );
+      assert.ok(result?.value.kind === 'metadata-recovery');
+      assert.ok(result.value.readBytes <= sliceBytes);
+      reads += result.value.readBytes;
+      assert.equal(result.value.through, reads);
+      if (result.value.status === 'pending') continue;
+      assert.equal(result.value.status, 'complete');
+      assert.equal(reads, session.size);
+      assert.deepEqual(result.value.read?.turns, normal.read?.turns);
+      return;
+    }
+    assert.fail('Antigravity metadata recovery did not finish');
+  } finally {
+    worker.stop();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('metadata source recovery preserves earlier usage across slices append and restart', async () => {
   const directory = tempDir('metadata-source-slices-');
   const file = path.join(directory, 'session.jsonl');
@@ -10030,9 +10102,17 @@ test('Claude dispatch discovery resolves a unique catalog prefix without adding 
       timestamp: timestamp(2),
       message: {
         role: 'user',
-        content: [{ type: 'tool_result', tool_use_id: 'dispatch-1', content: 'backgrounded Â· 4f4bf298 Â· Review' }],
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'dispatch-1',
+            content: 'backgrounded Â· 4f4bf298 Â· Review',
+          },
+        ],
       },
-      toolUseResult: { stdout: 'backgrounded Â· 4f4bf298 Â· Review' },
+      toolUseResult: {
+        stdout: 'backgrounded Â· 4f4bf298 Â· Review',
+      },
     },
   ];
   fs.writeFileSync(parentFile, `${records.map((record) => JSON.stringify(record)).join('\n')}\n`);
@@ -18030,7 +18110,7 @@ const compressedOpening = {
 function backfillHarness(overrides: Partial<ConstructorParameters<typeof CompressedBackfill>[0]> = {}) {
   let clock = 1_000_000;
   const scheduled: { at: number; run: () => void }[] = [];
-  const batches: { entries: CompressedFactEntry[]; backfillMs: number; at: number }[] = [];
+  const batches: (CompressedBackfillBatch & { at: number })[] = [];
   const facts: CompressedFactEntry[] = [];
   const openings: CompressedFactEntry[] = [];
   const holder = (written: CompressedFactEntry[]) =>
@@ -18502,6 +18582,250 @@ function storeBackedFacts(directory: string) {
   };
 }
 
+test.skipIf(!zstdCompress)(
+  'a marked backfill publishes the new owner?s usage to the store and to the host',
+  async () => {
+    const directory = tempDir('compressed-spend-owner-');
+    const file = path.join(directory, 'rollout.jsonl.zst');
+    const store = storeBackedFacts(path.join(directory, 'facts'));
+    const write = (body: Buffer) => fs.writeFileSync(file, zstdCompress!(body));
+    const limits = { reduceAbove: 1024, recordBytes: 4096 };
+    write(codexRolloutBody(directory, () => [], 4));
+    const previous = await derivedFactsOf(file, limits);
+    store.line([previous]);
+    const nextId = 'b4d8a856-496b-4407-a61f-9deafd6db912';
+    const body = codexRolloutBody(
+      directory,
+      () => [
+        {
+          type: 'event_msg',
+          payload: { type: 'token_count', pad: 'z'.repeat(9000), info: null },
+        },
+      ],
+      1,
+    );
+    write(Buffer.from(body.toString().replaceAll(COMPRESSED_THREAD, nextId)));
+    const own = await derivedFactsOf(file, limits);
+    assert.equal(own.undercount, true);
+    assert.equal(own.threadId, nextId);
+    assert.deepEqual(own.fileIdentity, previous.fileIdentity);
+    assert.ok(spendRecordTotal(own.spend!).dollars < spendRecordTotal(previous.spend!).dollars);
+    const harness = backfillHarness({ facts: store.holder, limits });
+    harness.known.set(file, compressedEntrySeed(previous));
+    try {
+      harness.backfill.setNames([file]);
+      await vi.waitFor(() => {
+        harness.advance(1_000);
+        assert.equal(harness.batches.flatMap((batch) => batch.entries).length, 1);
+      });
+      const [posted] = harness.batches.flatMap((batch) => batch.entries);
+      assert.equal(posted.threadId, nextId);
+      assert.deepEqual(spendRecordTotal(posted.spend!), spendRecordTotal(own.spend!));
+      assert.equal(posted.spend?.sourceIdentity, own.spend?.sourceIdentity);
+      const persisted = readCompressedStore(store.holder.directory).entries.get(file);
+      assert.equal(persisted?.threadId, nextId);
+      assert.deepEqual(persisted?.spend, posted.spend);
+    } finally {
+      harness.backfill.dispose();
+    }
+  },
+);
+
+test.skipIf(!zstdCompress)(
+  'backfill keeps verified spend when an exact copy replaces a marked compressed rewrite',
+  async () => {
+    const directory = tempDir('compressed-spend-copy-');
+    const file = path.join(directory, 'rollout.jsonl.zst');
+    const copy = path.join(directory, 'copy');
+    const store = storeBackedFacts(path.join(directory, 'facts'));
+    const limits = { reduceAbove: 1024, recordBytes: 4096 };
+    fs.writeFileSync(file, zstdCompress!(codexRolloutBody(directory, () => [], 4)));
+    const initial = await derivedFactsOf(file, limits);
+    store.line([initial]);
+    const body = codexRolloutBody(
+      directory,
+      () => [{ type: 'event_msg', payload: { type: 'token_count', pad: 'z'.repeat(9000), info: null } }],
+      1,
+    );
+    fs.writeFileSync(file, zstdCompress!(body));
+    const own = await derivedFactsOf(file, limits);
+    assert.equal(own.undercount, true);
+    assert.ok(spendRecordTotal(initial.spend!).dollars > spendRecordTotal(own.spend!).dollars);
+    const index = async (prior: CompressedFactEntry) => {
+      const harness = backfillHarness({ facts: store.holder, limits });
+      harness.known.set(file, compressedEntrySeed(prior));
+      try {
+        harness.backfill.setNames([file]);
+        await vi.waitFor(() => {
+          harness.advance(1_000);
+          assert.equal(harness.batches.flatMap((batch) => batch.entries).length, 1);
+        });
+        return harness.batches.flatMap((batch) => batch.entries)[0];
+      } finally {
+        harness.backfill.dispose();
+      }
+    };
+    const rewritten = await index(initial);
+    assert.deepEqual(rewritten.spend, initial.spend);
+    fs.copyFileSync(file, copy);
+    fs.renameSync(copy, file);
+    const copied = await index(rewritten);
+    assert.notEqual(copied.fileIdentity?.ino, rewritten.fileIdentity?.ino);
+    assert.equal(copied.hash, rewritten.hash);
+    assert.deepEqual(copied.spend, initial.spend);
+    const loaded = readCompressedStore(store.holder.directory).entries.get(file)!;
+    assert.equal(
+      compressedEntryCurrent(loaded, readRolloutStat(file)),
+      true,
+      'the copied row was not current on restart',
+    );
+    assert.equal(loaded.spendOrigin?.sourceIdentity, initial.spend?.sourceIdentity);
+  },
+);
+
+test.skipIf(!zstdCompress)('two revisions between polls keep the most recent verified contributor', async () => {
+  const directory = tempDir('compressed-between-polls-');
+  const file = path.join(directory, 'rollout.jsonl.zst');
+  const store = storeBackedFacts(path.join(directory, 'facts'));
+  const holder = new CompressedStoreHolder(store.holder.directory);
+  const follower = new CompressedStoreFollower(store.holder.directory);
+  const limits = { reduceAbove: 1024, recordBytes: 4096 };
+  const write = (body: Buffer, second: number) => {
+    fs.writeFileSync(file, zstdCompress!(body));
+    const time = new Date(Date.UTC(2026, 10, 25, 18, 0, second));
+    fs.utimesSync(file, time, time);
+  };
+  write(
+    codexRolloutBody(directory, () => [], 1),
+    1,
+  );
+  const low = await derivedFactsOf(file, limits);
+  assert.deepEqual(await holder.append([low]), [true]);
+  await follower.poll();
+  const harness = backfillHarness({
+    facts: holder,
+    limits,
+    known: () => follower.known(),
+    readKnown: (name) => follower.entry(name),
+  });
+  try {
+    write(
+      codexRolloutBody(directory, () => [], 4),
+      2,
+    );
+    harness.backfill.setNames([file]);
+    await vi.waitFor(() => {
+      harness.advance(1000);
+      assert.equal(harness.batches.flatMap((batch) => batch.entries).length, 1);
+    });
+    const higher = harness.batches[0].entries[0];
+    assert.deepEqual(follower.entry(file)?.spend, low.spend, 'the follower moved before its next poll');
+    assert.ok(spendRecordTotal(higher.spend!).dollars > spendRecordTotal(low.spend!).dollars);
+    const marked = codexRolloutBody(
+      directory,
+      () => [{ type: 'event_msg', payload: { type: 'token_count', pad: 'z'.repeat(9000), info: null } }],
+      1,
+    );
+    write(marked, 3);
+    harness.backfill.noteOpened(file);
+    await vi.waitFor(() => {
+      harness.advance(1000);
+      assert.equal(harness.batches.flatMap((batch) => batch.entries).length, 2);
+    });
+    const latest = readCompressedStore(store.holder.directory).entries.get(file)!;
+    assert.equal(latest.undercount, true);
+    assert.deepEqual(
+      latest.spend,
+      higher.spend,
+      'the durable replacement used the follower amount from before the intervening write',
+    );
+    assert.equal(latest.spendOrigin?.hash, higher.hash);
+
+    write(
+      codexRolloutBody(directory, () => [], 6),
+      4,
+    );
+    const peer = await derivedFactsOf(file, limits);
+    store.line([peer]);
+    await follower.poll();
+    write(marked, 5);
+    harness.backfill.noteOpened(file);
+    await vi.waitFor(() => {
+      harness.advance(1000);
+      assert.equal(harness.batches.flatMap((batch) => batch.entries).length, 3);
+    });
+    const followed = readCompressedStore(store.holder.directory).entries.get(file)!;
+    assert.deepEqual(followed.spend, peer.spend, 'a newer durable peer did not supersede the local contributor');
+    assert.equal(followed.spendOrigin?.hash, peer.hash);
+  } finally {
+    harness.backfill.dispose();
+    holder.dispose();
+  }
+});
+
+test.skipIf(!zstdCompress)('a resumed targeted copy reads the contributor behind the consumed offsets', async () => {
+  const directory = tempDir('compressed-resumed-copy-');
+  const file = path.join(directory, 'rollout.jsonl.zst');
+  const store = storeBackedFacts(path.join(directory, 'facts'));
+  const holder = new CompressedStoreHolder(store.holder.directory);
+  const limits = { reduceAbove: 1024, recordBytes: 4096 };
+  const body = codexRolloutBody(
+    directory,
+    () => [{ type: 'event_msg', payload: { type: 'token_count', pad: 'z'.repeat(9000), info: null } }],
+    1,
+  );
+  fs.writeFileSync(file, zstdCompress!(codexRolloutBody(directory, () => [], 4)));
+  const initial = await derivedFactsOf(file, limits);
+  fs.writeFileSync(file, zstdCompress!(body));
+  const marked = withKeptUndercount(initial, await derivedFactsOf(file, limits));
+  assert.ok(marked.spendOrigin?.retained);
+  store.line([marked]);
+  const follower = new CompressedStoreFollower(store.holder.directory);
+  const [acknowledged] = await follower.poll();
+  const resumed = new CompressedStoreFollower(store.holder.directory);
+  resumed.seed({ consumed: follower.offsets(), entries: [compressedEntrySeed(acknowledged)] });
+  const copy = path.join(directory, 'copy');
+  fs.copyFileSync(file, copy);
+  fs.renameSync(copy, file);
+  assert.deepEqual(await resumed.poll(), []);
+  assert.equal(resumed.bytesRead, 0);
+
+  let wholeStoreReads = 0;
+  let bodyReads = 0;
+  const harness = backfillHarness({
+    facts: holder,
+    limits,
+    known: () => resumed.known(),
+    readKnown: (name) => resumed.entry(name),
+    readStore: async (...args) => {
+      wholeStoreReads++;
+      return readCompressedStoreInSteps(...args);
+    },
+    stream: (...args) => {
+      bodyReads++;
+      return streamCompressedRollout(...args);
+    },
+  });
+  const stat = readRolloutStat(file)!;
+  const repair = { file, ...stat, sessionId: marked.threadId!, cwd: marked.opening!.cwd! };
+  try {
+    harness.backfill.setNames([file]);
+    assert.deepEqual(harness.backfill.acceptRepairs([repair]), [repair]);
+    await vi.waitFor(() => {
+      harness.advance(1000);
+      assert.equal(harness.batches.flatMap((batch) => batch.entries).length, 1);
+    });
+    const latest = readCompressedStore(store.holder.directory).entries.get(file)!;
+    assert.equal(latest.fileIdentity?.ino, stat.ino);
+    assert.deepEqual(latest.spend, initial.spend);
+    assert.equal(bodyReads, 1);
+    assert.equal(wholeStoreReads, 0, 'one resumed repair reread the facts store');
+  } finally {
+    harness.backfill.dispose();
+    holder.dispose();
+  }
+});
+
 test.skipIf(!zstdCompress)('a failed decode keeps a shown total and the row name through a restart', async () => {
   const pair = compressedRolloutPair(undefined, 2);
   const whole = fs.readFileSync(pair.compressed);
@@ -18520,6 +18844,7 @@ test.skipIf(!zstdCompress)('a failed decode keeps a shown total and the row name
     ...compressedEntryVersions(),
     size: stat.size,
     mtimeMs: stat.mtimeMs,
+    fileIdentity: revisionOf(fs.statSync(pair.compressed, { bigint: true })),
     threadId: COMPRESSED_THREAD,
     adopted: true,
     complete: true,
@@ -18783,6 +19108,7 @@ test('a replaced file restarts a failed revision with an unchanged list and root
   const harness = backfillHarness({
     exists: () => false,
     statOf: () => stat,
+    readFirst: async () => unitOpeningLine,
     stream: async () => {
       decodes++;
       return { kind: 'failed' } as never;
@@ -18815,13 +19141,313 @@ test('a replaced file restarts a failed revision with an unchanged list and root
     harness.backfill.setRoots(['/']);
     await vi.waitFor(() => assert.equal(harness.scheduled.length, 0));
     assert.equal(decodes, 4, 'an unchanged file decoded again');
-    stat = { ...stat, size: stat.size + 1 };
+    stat = { ...stat, ino: stat.ino + 1 };
     harness.backfill.setRoots(['/']);
     await vi.waitFor(() => assert.equal(decodes, 5, 'the replaced file did not restart'));
     await vi.waitFor(() => assert.equal(harness.scheduled.length, 1));
     assert.equal(harness.scheduled[0].at - harness.now(), 10_000, 'the replaced file kept the old count');
   } finally {
     harness.backfill.dispose();
+  }
+});
+
+test.skipIf(!zstdCompress)(
+  'backfill replaces a main-format decoded entry after an equal-stat inode replacement',
+  async () => {
+    const directory = tempDir('compressed-upgrade-');
+    const file = path.join(directory, 'first.jsonl.zst');
+    const replacement = path.join(directory, 'replacement');
+    const time = new Date('2026-11-25T18:00:00.000Z');
+    const input = (text: string) => zstdCompress!(Buffer.from(unitOpeningLine + '\n' + text.repeat(64) + '\n'));
+    const encodings = 'bcdefghijklmnopqrstuvwxyz'.split('').map(input);
+    const first = input('a');
+    const next = encodings.find((encoded) => encoded.length === first.length);
+    assert.ok(next);
+    fs.writeFileSync(file, first);
+    fs.writeFileSync(replacement, next);
+    fs.utimesSync(file, time, time);
+    fs.utimesSync(replacement, time, time);
+    const before = await derivedFactsOf(file, { reduceAbove: 1024, recordBytes: 4096 });
+    const { fileIdentity, ...legacy } = before;
+    assert.ok(legacy.title?.sourceIdentity);
+    const harness = backfillHarness();
+    const factsDirectory = harness.backfill['options'].facts.directory;
+    fs.writeFileSync(path.join(factsDirectory, 'segment-1-legacy-0'), JSON.stringify(legacy) + '\n');
+    const follower = new CompressedStoreFollower(factsDirectory, readRolloutStat);
+    const read = await follower.poll();
+    assert.equal(read.length, 1);
+    harness.known.set(file, follower.known().get(file)!);
+    fs.renameSync(replacement, file);
+    const stat = readRolloutStat(file)!;
+    assert.equal(stat.size, before.size);
+    assert.equal(stat.mtimeMs, before.mtimeMs);
+    assert.notEqual(stat.ino, fileIdentity?.ino);
+    try {
+      harness.backfill.setNames([file]);
+      await vi.waitFor(() => assert.equal(harness.facts[0]?.fileIdentity?.ino, stat.ino));
+      assert.notEqual(harness.facts[0]?.hash, legacy.hash);
+      fs.writeFileSync(path.join(factsDirectory, 'segment-2-current-0'), JSON.stringify(harness.facts[0]) + '\n');
+      assert.equal(readCompressedStore(factsDirectory).entries.get(file)?.fileIdentity?.ino, stat.ino);
+    } finally {
+      harness.backfill.dispose();
+    }
+  },
+);
+
+test.skipIf(!zstdCompress)(
+  'an unchanged list repairs one replaced compressed rollout after the worker settles',
+  async () => {
+    const directory = tempDir('compressed-warm-repair-');
+    const file = path.join(directory, 'first.jsonl.zst');
+    const replacement = path.join(directory, 'replacement');
+    const names = Array.from({ length: 32 }, (_, i) => path.join(directory, i + '.jsonl.zst'));
+    const time = new Date('2026-11-25T18:00:00.000Z');
+    const input = (letter: string) =>
+      zstdCompress!(
+        Buffer.from(
+          unitOpeningLine +
+            '\n' +
+            letter.repeat(64) +
+            '\n' +
+            ('{"type":"other"}' + ' '.repeat(1024) + '\n').repeat(8_192),
+        ),
+      );
+    const initial = input('a');
+    const next = 'bcdefghijklmnopqrstuvwxyz'
+      .split('')
+      .map(input)
+      .find((value) => value.length === initial.length);
+    assert.ok(next);
+    fs.writeFileSync(file, initial);
+    fs.writeFileSync(replacement, next);
+    fs.utimesSync(file, time, time);
+    fs.utimesSync(replacement, time, time);
+    const before = await derivedFactsOf(file, { reduceAbove: 1024, recordBytes: 4096 });
+    const stats: string[] = [];
+    const passes: string[] = [];
+    let decodedBytes = 0;
+    const facts = new CompressedStoreHolder(path.join(directory, 'facts'));
+    const openings = new CompressedStoreHolder(path.join(directory, 'openings'));
+    const harness = backfillHarness({
+      facts,
+      openings,
+      exists: (name) => fs.existsSync(name),
+      statOf: (name) => {
+        stats.push(name);
+        return readRolloutStat(name);
+      },
+      stream: (name, consume, options) => {
+        passes.push(name);
+        return streamCompressedRollout(
+          name,
+          (chunk) => {
+            decodedBytes += chunk.length;
+            return consume(chunk);
+          },
+          options,
+        );
+      },
+    });
+    harness.known.set(file, compressedEntrySeed(before));
+    try {
+      harness.backfill.setNames([file, ...names]);
+      await vi.waitFor(() => assert.ok(stats.includes(names.at(-1)!)));
+      stats.length = 0;
+      fs.renameSync(replacement, file);
+      const stat = readRolloutStat(file)!;
+      assert.equal(stat.mtimeMs, before.mtimeMs);
+      assert.equal(stat.size, before.size);
+      assert.notEqual(stat.ino, before.fileIdentity?.ino);
+      harness.backfill.setRoots(['/']);
+      const opening = before.opening!;
+      const repair = { file, ...stat, sessionId: opening.sessionId!, cwd: opening.cwd! };
+      harness.backfill.acceptRepairs?.([repair]);
+      let rebuilt: CompressedFactEntry | undefined;
+      await vi.waitFor(
+        () => {
+          rebuilt = readCompressedStore(facts.directory).entries.get(file);
+          assert.equal(rebuilt?.fileIdentity?.ino, stat.ino, 'the replacement has no durable facts');
+        },
+        { timeout: 5_000 },
+      );
+      assert.notEqual(rebuilt?.hash, before.hash);
+      await vi.waitFor(() => {
+        harness.advance(0);
+        assert.equal(harness.batches[0]?.entries[0]?.hash, rebuilt?.hash, 'no worker batch carried the durable repair');
+      });
+      harness.backfill.acceptRepairs?.([repair]);
+      harness.backfill.setRoots(['/']);
+      assert.deepEqual(passes, [file]);
+      assert.equal(decodedBytes, rebuilt?.decodedLength);
+      assert.ok(decodedBytes > 8 * 1024 * 1024);
+      assert.ok(
+        stats.every((name) => name === file),
+        'the repair visited unrelated names',
+      );
+      const third = path.join(directory, 'third');
+      fs.writeFileSync(third, input('third'));
+      fs.utimesSync(third, new Date(time.getTime() + 1000), new Date(time.getTime() + 1000));
+      fs.renameSync(third, file);
+      const successor = readRolloutStat(file)!;
+      harness.backfill.setNames([file, ...names, path.join(directory, 'new.jsonl.zst')]);
+      await vi.waitFor(
+        () => {
+          harness.advance(1_000);
+          assert.equal(
+            harness.batches.flatMap((batch) => batch.entries).at(-1)?.fileIdentity?.ino,
+            successor.ino,
+            'the delivered repair blocked the next ordinary revision',
+          );
+        },
+        { timeout: 5_000 },
+      );
+      assert.equal(passes.length, 2);
+    } finally {
+      harness.backfill.dispose();
+      facts.dispose();
+      openings.dispose();
+    }
+  },
+);
+
+test.skipIf(!zstdCompress)(
+  'a contradicted compressed repair delivers the actual occupant through the worker',
+  async () => {
+    const directory = tempDir('worker-compressed-repair-owner-');
+    const file = path.join(directory, 'rollout.jsonl.zst');
+    const stores = { facts: path.join(directory, 'facts'), openings: path.join(directory, 'openings') };
+    fs.writeFileSync(file, zstdCompress!(codexRolloutBody(directory, () => [], 1)));
+    const current = await derivedFactsOf(file, { reduceAbove: 1024, recordBytes: 4096 });
+    const former = '81322345-6789-abcd-ef10-123456789abc';
+    const legacy = {
+      ...current,
+      threadId: former,
+      opening: { ...current.opening!, sessionId: former },
+      undercount: true,
+      spendOrigin: undefined,
+    };
+    storeBackedFacts(stores.facts).line([legacy]);
+    const batches: CompressedBackfillBatch[] = [];
+    const worker = new ProgressiveWorker(
+      source,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      (batch) => batches.push(batch),
+    );
+    const signal = new AbortController().signal;
+    const backfill = { workspace: directory, roots: [directory], launch: 'one' };
+    const repair = { file, ...readRolloutStat(file)!, sessionId: former, cwd: directory };
+    try {
+      const load = await worker.run(
+        { kind: 'compressed-load', stores, backfill, compressed: [file], repairScope: 1, repairs: [repair] },
+        1,
+        signal,
+      );
+      assert.ok(load?.value.kind === 'compressed-load');
+      assert.equal(load.value.acceptedRepairs?.[0].sessionId, former);
+      await vi.waitFor(
+        () => {
+          assert.ok(batches.some((batch) => batch.retiredRepairs?.some(({ sessionId }) => sessionId === former)));
+          assert.equal(
+            batches.flatMap(({ entries }) => entries).at(-1)?.threadId,
+            current.threadId,
+            'the contradicted repair hid the actual occupant from the host',
+          );
+        },
+        { timeout: 5000 },
+      );
+      const later = await worker.run({ kind: 'compressed-load', stores, backfill, repairScope: 1 }, 2, signal);
+      assert.ok(later?.value.kind === 'compressed-load');
+      assert.equal(
+        later.value.entries.some((entry) => entry.file === file),
+        false,
+        'follow repeated a delivered fact',
+      );
+      assert.equal(readCompressedStore(stores.facts).entries.get(file)?.threadId, current.threadId);
+    } finally {
+      worker.stop();
+    }
+  },
+);
+
+test.skipIf(!zstdCompress)('a replacement worker resumes a targeted repair from the saved retry clock', async () => {
+  const directory = tempDir('compressed-repair-retry-');
+  const file = path.join(directory, 'first.jsonl.zst');
+  const factsDirectory = path.join(directory, 'facts');
+  const openingsDirectory = path.join(directory, 'openings');
+  let clock = Date.UTC(2026, 10, 26);
+  let passes = 0;
+  fs.writeFileSync(file, zstdCompress!(Buffer.from(unitOpeningLine + '\n')));
+  const stat = readRolloutStat(file)!;
+  const opening = openingRecordOf(unitOpeningLine)!;
+  const repair = { file, ...stat, sessionId: opening.sessionId!, cwd: opening.cwd! };
+  const start = () => {
+    const facts = new CompressedStoreHolder(factsDirectory);
+    const openings = new CompressedStoreHolder(openingsDirectory);
+    const harness = backfillHarness({
+      facts,
+      openings,
+      wallNow: () => clock,
+      exists: (name) => fs.existsSync(name),
+      statOf: readRolloutStat,
+      stream: async () => {
+        passes++;
+        return { kind: 'failed' };
+      },
+    });
+    harness.backfill.setNames([file]);
+    assert.deepEqual(harness.backfill.acceptRepairs([repair]), [repair]);
+    return {
+      ...harness,
+      dispose() {
+        harness.backfill.dispose();
+        facts.dispose();
+        openings.dispose();
+      },
+    };
+  };
+  const first = start();
+  try {
+    await vi.waitFor(() => {
+      assert.ok(first.scheduled.some(({ at }) => at - first.now() === 10_000));
+      assert.equal(readCompressedStore(openingsDirectory).entries.get(file)?.repairRetry?.attempts, 1);
+    });
+  } finally {
+    first.dispose();
+  }
+  assert.equal(passes, 1);
+  clock += 3_000;
+  const second = start();
+  try {
+    await vi.waitFor(() => assert.ok(second.scheduled.some(({ at }) => at - second.now() === 7_000)));
+    assert.equal(passes, 1, 'a new worker repeated a body read before its saved retry');
+    for (const [delay, reads] of [
+      [7_000, 2],
+      [60_000, 3],
+      [600_000, 4],
+    ]) {
+      clock += delay;
+      second.advance(delay);
+      await vi.waitFor(() => assert.equal(passes, reads));
+      if (reads < 4) {
+        await vi.waitFor(() => {
+          assert.equal(readCompressedStore(openingsDirectory).entries.get(file)?.repairRetry?.attempts, reads);
+          const next = reads === 2 ? 60_000 : 600_000;
+          assert.ok(second.scheduled.some(({ at }) => at - second.now() === next));
+        });
+      }
+    }
+    await vi.waitFor(() => assert.equal(readCompressedStore(factsDirectory).entries.get(file)?.unreadable, true));
+    second.backfill.setRoots(['/']);
+    second.backfill.acceptRepairs([repair]);
+    second.advance(600_000);
+    assert.equal(passes, 4, 'the terminal revision decoded again');
+  } finally {
+    second.dispose();
   }
 });
 
@@ -19783,6 +20409,8 @@ function seedBody(harness: ReturnType<typeof backfillHarness>, file: string): vo
     file,
     pairKey: file,
     ...compressedEntryVersions(),
+    size: unitStat.size,
+    mtimeMs: unitStat.mtimeMs,
     opening: compressedOpening,
   });
 }
@@ -19901,6 +20529,81 @@ test('the worker posts at most one batch per second, of 4 MiB or one larger reco
   }
 });
 
+test.each(['new file', 'stale project facts', 'current machine opening'] as const)(
+  'the backfill reports the scoped guardian opening without decoding its body: %s',
+  async (placement) => {
+    const file = 'guardian.jsonl.zst';
+    const outsider = 'outside.jsonl.zst';
+    const id = '92a22379-9bbd-40c2-a993-3e02ee86408f';
+    const bodies: string[] = [];
+    const firsts: string[] = [];
+    const harness = backfillHarness({
+      exists: () => false,
+      statOf: () => ({ ...unitStat, isFile: true }),
+      inFolders: () => (cwd) => cwd === '/scope',
+      readFirst: async (file) => {
+        firsts.push(file);
+        return JSON.stringify({
+          type: 'session_meta',
+          payload: { id, cwd: file === outsider ? '/outside' : '/scope', thread_source: 'guardian_review' },
+        });
+      },
+      stream: async (file) => {
+        bodies.push(file);
+        return unitDecoded();
+      },
+    });
+    try {
+      const stale = {
+        file,
+        pairKey: file,
+        ...compressedEntryVersions(),
+        size: unitStat.size - 1,
+        mtimeMs: unitStat.mtimeMs,
+        threadId: 'other-id',
+        opening: { ...compressedOpening, sessionId: 'other-id', cwd: '/outside' },
+      };
+      if (placement !== 'new file') harness.known.set(file, stale);
+      if (placement === 'current machine opening') {
+        const entries = Reflect.get(harness.backfill, 'openingEntries') as Map<string, CompressedEntrySeed>;
+        entries.set(file, {
+          ...stale,
+          size: unitStat.size,
+          fileIdentity: unitStat,
+          threadId: id,
+          opening: openingRecordOf(
+            JSON.stringify({
+              type: 'session_meta',
+              payload: { id, cwd: '/scope', thread_source: 'guardian_review' },
+            }),
+          ),
+        });
+      }
+      const machine = placement === 'current machine opening';
+      harness.backfill.setNames([file, outsider]);
+      await vi.waitFor(() => assert.equal(harness.openings.length, machine ? 1 : 2));
+      await vi.waitFor(() => {
+        harness.advance(0);
+        assert.equal(harness.batches.length, 1);
+      });
+      assert.deepEqual(harness.batches[0].hiddenOpenings, [
+        {
+          file,
+          sessionId: id,
+          cwd: '/scope',
+          size: unitStat.size,
+          mtimeMs: unitStat.mtimeMs,
+        },
+      ]);
+      assert.deepEqual(harness.facts, []);
+      assert.deepEqual(bodies, []);
+      assert.deepEqual(firsts, machine ? [outsider] : [file, outsider]);
+    } finally {
+      harness.backfill.dispose();
+    }
+  },
+);
+
 test('a record above the batch size goes alone, and a list replaces the set', async () => {
   const oversized = 'z'.repeat(5 * 1024 * 1024);
   const harness = backfillHarness({
@@ -19987,6 +20690,7 @@ test('the backfill orders its queue, skips a twin, and treats each list as the c
         ...versions,
         size: 10,
         mtimeMs: stats[file].mtimeMs,
+        fileIdentity: stats[file],
         ...fields,
       });
     seed('failed.jsonl.zst', { adoptionFailed: true, opening: compressedOpening });
@@ -20115,13 +20819,17 @@ test('a list between an added name and its body keeps the body before the unplac
 test('a name that a list drops before its body starts keeps no place at the front', async () => {
   const order: string[] = [];
   const added = 'added.jsonl.zst';
+  let heldFirstOpening = false;
   let release = () => {};
   const harness = backfillHarness({
     exists: () => false,
     statOf: () => ({ ...unitStat, isFile: true }),
     readFirst: async (file) => {
       order.push(`opening ${file}`);
-      if (file === added) await new Promise<void>((resolve) => (release = resolve));
+      if (file === added && !heldFirstOpening) {
+        heldFirstOpening = true;
+        await new Promise<void>((resolve) => (release = resolve));
+      }
       return unitOpeningLine;
     },
     stream: async (file) => {
@@ -20194,6 +20902,8 @@ test('a publish appends the opening of a held opening of another generation and 
     codexMetaVersion,
     size: unitStat.size,
     mtimeMs: unitStat.mtimeMs,
+    fileIdentity: unitStat,
+    threadId: COMPRESSED_THREAD,
     opening: compressedOpening,
   });
   store.line([

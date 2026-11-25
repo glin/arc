@@ -1147,6 +1147,32 @@ test('a stepped read of the store yields after every file', async () => {
   assert.ok(yields >= 3, `${yields} yields across 3 files`);
 });
 
+test('a resumed follower refuses changed facts at the same path and saved address', async () => {
+  const directory = tempDir('store-record-ref-');
+  const file = 'rollout.jsonl.zst';
+  const row = { ...entry(file), carriedName: { label: 'Before', fullLabel: 'Before' } };
+  const ledger = path.join(directory, 'segment-1-holder-0');
+  const line = JSON.stringify(row) + '\n';
+  fs.writeFileSync(ledger, line + JSON.stringify(entry('unrelated.jsonl.zst')) + '\n');
+  const follower = new CompressedStoreFollower(directory, () => null);
+  const [accepted] = await follower.poll();
+  assert.equal(accepted.storeRecord?.bytes, Buffer.byteLength(line));
+  const resumed = new CompressedStoreFollower(directory, () => null);
+  resumed.seed({ consumed: follower.offsets(), entries: [compressedEntrySeed(accepted)] });
+  assert.deepEqual(await resumed.poll(), []);
+  assert.equal(resumed.bytesRead, 0);
+  assert.deepEqual(resumed.entry(file), accepted);
+  const replacement = line.replaceAll('Before', 'Change');
+  assert.equal(Buffer.byteLength(replacement), Buffer.byteLength(line));
+  const fd = fs.openSync(ledger, 'r+');
+  try {
+    fs.writeSync(fd, replacement, 0);
+  } finally {
+    fs.closeSync(fd);
+  }
+  assert.equal(resumed.entry(file), undefined, 'the address supplied a different record for the same path');
+});
+
 test('a follower reads only the bytes appended since its last poll and a compaction repeats no entry', async () => {
   const { directory, clock, make, names } = storeFixture('store-follow', {
     segmentBytes: 4096,
@@ -1252,8 +1278,19 @@ test('a marked derivation never replaces a higher spend record and takes the mar
       file: 'x',
       buckets: [{ requests: dollars, reportedCost: dollars, reportedCostBasis: 'list' }],
     }) as unknown as SpendFileIndex;
-  const previous = entry('x', { spend: spend(7), undercount: false });
-  const marked = entry('x', { spend: spend(3), undercount: true });
+  const fileIdentity = { dev: '1', ino: '9007199254740997' };
+  const previous = entry('x', {
+    adopted: false,
+    fileIdentity,
+    spend: { ...spend(7), sourceIdentity: '1:9007199254740997' },
+    undercount: false,
+  });
+  const marked = entry('x', {
+    adopted: false,
+    fileIdentity,
+    spend: { ...spend(3), sourceIdentity: '1:9007199254740997' },
+    undercount: true,
+  });
   const kept = withKeptUndercount(previous, marked);
   assert.equal(kept.spend, previous.spend);
   assert.equal(kept.undercount, true);
@@ -1265,6 +1302,120 @@ test('a marked derivation never replaces a higher spend record and takes the mar
     unmarked.spend,
     'an unmarked derivation kept the old total',
   );
+});
+
+test('a marked replacement never inherits spend from the previous owner of its pathname', () => {
+  const spend = (dollars: number, ino: string) =>
+    ({
+      file: 'x',
+      sourceIdentity: '1:' + ino,
+      buckets: [{ requests: dollars, reportedCost: dollars, reportedCostBasis: 'list' }],
+    }) as unknown as SpendFileIndex;
+  const previous = entry('x', { adopted: false, fileIdentity: { dev: '1', ino: '29' }, spend: spend(7, '29') });
+  for (const [threadId, ino] of [
+    ['replacement', '29'],
+    ['t', '30'],
+    ['replacement', '30'],
+  ]) {
+    const replacement = entry('x', {
+      adopted: false,
+      threadId,
+      fileIdentity: { dev: '1', ino },
+      spend: spend(3, ino),
+      undercount: true,
+    });
+    assert.equal(withKeptUndercount(previous, replacement).spend, replacement.spend);
+  }
+});
+
+test('an adopted higher total keeps its plain identity through an incomplete decode', () => {
+  const source = { dev: '1', ino: '9007199254740997' };
+  const record = (dollars: number, sourceIdentity: string) =>
+    ({
+      file: 'x',
+      sourceIdentity,
+      buckets: [{ requests: dollars, reportedCost: dollars, reportedCostBasis: 'list' }],
+    }) as unknown as SpendFileIndex;
+  const adopted = entry('x', { fileIdentity: source, spend: record(7, '1:29') });
+  const next = entry('x', {
+    adopted: false,
+    fileIdentity: source,
+    spend: record(3, '1:9007199254740997'),
+    undercount: true,
+  });
+  const kept = withKeptUndercount(adopted, next);
+  assert.equal(kept.spend, adopted.spend);
+  assert.equal(kept.spendOrigin?.sourceIdentity, '1:29');
+  const current = { size: 100, mtimeMs: 1_000, ...source };
+  assert.equal(compressedEntryCurrent(kept, current), true);
+  assert.equal(compressedEntryCurrent(compressedEntrySeed(kept), current), true);
+  const mixed = { ...next, spend: adopted.spend };
+  assert.equal(compressedEntryCurrent(mixed, current), false);
+  assert.equal(compressedEntryCurrent(compressedEntrySeed(mixed), current), false);
+  const { fileIdentity: _identity, ...legacyOrdinary } = next;
+  assert.equal(compressedEntryCurrent(compressedEntrySeed(legacyOrdinary), current), true);
+  assert.equal(compressedEntryCurrent(compressedEntrySeed(legacyOrdinary), { ...current, ino: '29' }), false);
+  const { fileIdentity: _twin, ...legacyAdoption } = adopted;
+  assert.equal(compressedEntrySeed(legacyAdoption).fileIdentity, undefined);
+});
+
+test('a same-inode base-format marked total remains unverified after a cold store read', () => {
+  const { directory } = storeFixture('legacy-marked-spend');
+  const sourceIdentity = '1:29';
+  const legacy = entry('x', {
+    adopted: false,
+    threadId: 'replacement',
+    fileIdentity: { dev: '1', ino: '29' },
+    opening: { sessionId: 'replacement', cwd: '/repo' } as CompressedFactEntry['opening'],
+    decodedLength: 300,
+    undercount: true,
+    spend: { file: 'x', sourceIdentity, buckets: [] } as unknown as SpendFileIndex,
+  });
+  fs.writeFileSync(path.join(directory, 'segment-1-holder-0'), JSON.stringify(legacy) + '\n');
+  const loaded = readCompressedStore(directory).entries.get(legacy.file)!;
+  assert.equal(loaded.spend, undefined, 'the old total became the replacement session cost');
+  assert.equal(loaded.opening?.sessionId, 'replacement');
+  assert.equal(
+    compressedEntryCurrent(compressedEntrySeed(loaded), { size: 100, mtimeMs: 1_000, dev: '1', ino: '29' }),
+    false,
+  );
+});
+
+test('a byte-identical compressed copy keeps the verified historical spend and a current envelope', () => {
+  const { directory } = storeFixture('compressed-copy-spend');
+  const spend = (dollars: number, ino: string) =>
+    ({
+      file: 'x',
+      sourceIdentity: '1:' + ino,
+      buckets: [{ requests: dollars, reportedCost: dollars, reportedCostBasis: 'list' }],
+    }) as unknown as SpendFileIndex;
+  const ordinary = (ino: string, hash: string, amount: number, undercount = false) =>
+    entry('x', {
+      adopted: false,
+      fileIdentity: { dev: '1', ino },
+      hash,
+      decodedLength: 300,
+      undercount,
+      spend: spend(amount, ino),
+    });
+  const first = ordinary('29', 'original', 7);
+  const rewritten = withKeptUndercount(first, ordinary('29', 'marked', 3, true));
+  const copied = withKeptUndercount(rewritten, ordinary('30', 'marked', 3, true));
+  fs.writeFileSync(path.join(directory, 'segment-1-holder-0'), JSON.stringify(copied) + '\n');
+  const loaded = readCompressedStore(directory).entries.get('x')!;
+  assert.equal(
+    compressedEntryCurrent(loaded, { size: 100, mtimeMs: 1_000, dev: '1', ino: '30' }),
+    true,
+    'historical spend invalidated the copied rollout row',
+  );
+  assert.equal(loaded.spend?.sourceIdentity, first.spend?.sourceIdentity);
+  assert.deepEqual(loaded.spend, first.spend);
+  const copiedAgain = withKeptUndercount(loaded, ordinary('31', 'marked', 3, true));
+  assert.equal(
+    compressedEntryCurrent(compressedEntrySeed(copiedAgain), { size: 100, mtimeMs: 1_000, dev: '1', ino: '31' }),
+    true,
+  );
+  assert.deepEqual(copiedAgain.spend, first.spend);
 });
 
 const THREAD = '01a032c9-1a92-7931-845c-723117d24dbe';

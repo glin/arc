@@ -914,6 +914,7 @@ class RolloutWalk {
   private status: SourceEnumeration['status'] = 'complete';
   private missingRoot = false;
   private readonly directories: string[] = [];
+  private readonly untraversed: string[] = [];
   private readonly files: string[] = [];
   private readonly compressed: string[] = [];
   private readonly uncertain: string[] = [];
@@ -944,10 +945,11 @@ class RolloutWalk {
   }
 
   result(): SourceEnumeration {
-    const { status, root, directories, files, uncertain, compressed } = this;
+    const { status, root, directories, files, uncertain, compressed, untraversed } = this;
+    const directoryTree = { depth: WALK_DEPTH, untraversed };
     return this.missingRoot
-      ? { status, root, directories, files, uncertain, compressed, missingRoot: true }
-      : { status, root, directories, files, uncertain, compressed };
+      ? { status, root, directories, directoryTree, files, uncertain, compressed, missingRoot: true }
+      : { status, root, directories, directoryTree, files, uncertain, compressed };
   }
 
   // Collects rollouts in entry order until the next directory to descend into, which then waits
@@ -969,10 +971,11 @@ class RolloutWalk {
             this.depth = depth + 1;
             return;
           }
-        } else if (entry.name.endsWith('.jsonl')) {
-          this.files.push(path.join(dir, entry.name));
-        } else if (isCompressedRolloutName(entry.name)) {
-          this.compressed.push(path.join(dir, entry.name));
+          this.untraversed.push(path.join(dir, entry.name));
+        } else {
+          if (entry.isSymbolicLink?.()) this.untraversed.push(path.join(dir, entry.name));
+          if (entry.name.endsWith('.jsonl')) this.files.push(path.join(dir, entry.name));
+          else if (isCompressedRolloutName(entry.name)) this.compressed.push(path.join(dir, entry.name));
         }
       }
       open.pop();
