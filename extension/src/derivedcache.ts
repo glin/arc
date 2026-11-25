@@ -1,5 +1,7 @@
 import { publicPricingValidUntil } from './pricing';
 import { validClaudeTaskCompletions } from './transcript';
+import { agyBrainRoot, agySessionId } from './agydiscovery';
+import { validAgyRecordedUsage } from './agyhistory';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { boundedCommitRepositories, type VerifiedCommitRepository } from './commitrepositories';
@@ -28,6 +30,7 @@ import {
   sessionOutcomeOf,
   sessionStatFactsOf,
   type AgentKind,
+  type LaunchAgentKind,
   type RelationshipRejection,
   type SavedClaudeOpening,
   type AgentRunScan,
@@ -1012,7 +1015,7 @@ interface StoredCache {
   claudeOpenings?: StoredClaudeOpenings;
 }
 
-export type MetadataGenerations = Readonly<Record<AgentKind, number>>;
+export type MetadataGenerations = Readonly<Record<Exclude<AgentKind, 'agy'>, number> & { agy?: number }>;
 
 // Versions stored metadata for each agent. A mismatch drops that agent's entries and carries their names until metadata replaces them.
 // Bump an agent's generation for stored field changes or changed derivation rules of its sessions, including agent-run classification in transcript.ts and codex.ts.
@@ -1021,7 +1024,7 @@ export type MetadataGenerations = Readonly<Record<AgentKind, number>>;
 // The initial metadata budget, `INITIAL_RAIL_READ_BYTES`, spreads large workspace rebuilds across refreshes.
 // Targeted invalidation avoids a full rebuild when affected entries are identifiable at load.
 // Codex opening rows use `CODEX_META_VERSION` from codexopenings.ts and survive these generation changes.
-export const METADATA_GENERATIONS: MetadataGenerations = { claude: 75, codex: 74 };
+export const METADATA_GENERATIONS: MetadataGenerations = { claude: 75, codex: 74, agy: 3 };
 
 // The agent generations that each shared `metadataVersion` of `derived-session-cache-v1.json` matches.
 // Each pair names the agent generation of the stored facts.
@@ -1036,6 +1039,8 @@ export const V1_METADATA_GENERATIONS: Readonly<Record<number, Partial<MetadataGe
 export function sourceAgentOf(file: string): AgentKind | null {
   const claude = isInside(file, [projectsRoot()]);
   const codex = isInside(file, [codexSessionsRoot()]);
+  const agy = agySessionId(file) !== null && isInside(file, [agyBrainRoot()]);
+  if (agy) return claude || codex ? null : 'agy';
   return claude === codex ? null : claude ? 'claude' : 'codex';
 }
 
@@ -1170,7 +1175,8 @@ function carryNames(
 function metadataGenerations(value: unknown): value is MetadataGenerations {
   return (
     record(value) &&
-    [value.claude, value.codex].every((generation) => Number.isInteger(generation) && (generation as number) >= 0)
+    [value.claude, value.codex].every((generation) => Number.isInteger(generation) && (generation as number) >= 0) &&
+    (value.agy === undefined || (Number.isInteger(value.agy) && (value.agy as number) >= 0))
   );
 }
 
@@ -1206,6 +1212,7 @@ function outcome(value: unknown): value is TurnOutcome | null {
   return (
     record(value) &&
     typeof value.finished === 'boolean' &&
+    (value.recordedOnly === undefined || value.recordedOnly === true) &&
     typeof value.error === 'boolean' &&
     typeof value.interrupted === 'boolean' &&
     finite(value.endedAt) &&
@@ -1411,6 +1418,7 @@ function stats(value: unknown): value is SessionStatFacts | null {
         (turn.effort === undefined || turn.effort === null || nonEmptyText(turn.effort)) &&
         (turn.provider === null || nonEmptyText(turn.provider)) &&
         usage(turn.usage) &&
+        (turn.agyUsage === undefined || (turn.provider === 'agy' && validAgyRecordedUsage(turn.agyUsage))) &&
         usageParts(turn.usageParts) &&
         nonNegative(turn.contextTokens) &&
         nullableFinite(turn.contextWindow) &&
@@ -1945,13 +1953,16 @@ export function loadDerivedCache(
       : format === 1
         ? (V1_METADATA_GENERATIONS[parsed.metadataVersion as number] ?? {})
         : (parsed.metadataGenerations as MetadataGenerations);
-    const compatible = (agent: AgentKind | null) => agent !== null && stored[agent] === generations[agent];
+    const compatible = (agent: AgentKind | null) =>
+      agent !== null && generations[agent] !== undefined && stored[agent] === generations[agent];
     const agentOfRow = (row: Record<string, unknown>): AgentKind | null => {
       if (format === 1) return agentOf(row.file as string);
       const qualified = agentOf(row.file as string);
-      return (row.agent === 'claude' || row.agent === 'codex') && qualified === row.agent ? row.agent : null;
+      return (row.agent === 'claude' || row.agent === 'codex' || row.agent === 'agy') && qualified === row.agent
+        ? row.agent
+        : null;
     };
-    if (!compatible('claude') && !compatible('codex')) {
+    if (!compatible('claude') && !compatible('codex') && !compatible('agy')) {
       loaded.reuse.reason = 'generation-mismatch';
       carryNames(loaded.carriedNames, parsed.titles, (row) => row.entry);
     } else if (!Array.isArray(parsed.titles)) {
@@ -2095,7 +2106,7 @@ export function saveDerivedCache(
   promptScans: Iterable<[string, HumanPromptScan]> = [],
   unsettledAdoptions: Iterable<[string, string]> = [],
   claudeOpenings?: SavedClaudeOpenings,
-  saved?: (dropped: Record<AgentKind, number>) => void,
+  saved?: (dropped: Record<LaunchAgentKind, number>) => void,
 ): void {
   const savedScans = new Map<string, HumanPromptScan>();
   for (const [scanFile, scan] of promptScans) {

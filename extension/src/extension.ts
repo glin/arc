@@ -792,8 +792,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     channel.setCompactRequestHandler((request) => owner.handle(request));
     context.subscriptions.push({ dispose: () => owner.dispose() });
   }
-  panel.onBackgroundWorkDetected = (session, commands, children) =>
-    host.retainBackgroundWork(session.agent, session.sessionId, commands, children);
+  panel.onBackgroundWorkDetected = (session, commands, children) => {
+    if (session.agent !== 'agy') host.retainBackgroundWork(session.agent, session.sessionId, commands, children);
+  };
   panel.onArchivedSessionsChange = (sessions) => {
     compaction?.archived(sessions);
     const archived = new Set(sessions);
@@ -1325,7 +1326,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   // Control-only plans use the same executable selection as live children.
   // Codex command discovery runs separately from account and model reads.
-  const idlePlanFor = (agent: AgentName, cwd: string, discoverCommands = false): AgentPlan | null => {
+  const idlePlanFor = (agent: AgentName | 'agy', cwd: string, discoverCommands = false): AgentPlan | null => {
+    if (agent === 'agy') return null;
     const launch =
       agent === 'claude'
         ? { ...claudeLaunch(readSetting('claudePath'), thisMachine()), sessionSkills: sessionSkillSelection }
@@ -1872,6 +1874,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     mcpAgent?: string,
     mcpCwd?: string,
   ): void => {
+    if (only && only !== 'claude' && only !== 'codex') return;
     const agents = only ? [only] : USAGE_AGENT_ORDER;
     if (force) {
       for (const agent of agents) {
@@ -1938,6 +1941,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     guarded?: GuardedDelivery,
     report?: (message: string) => void,
   ): Promise<PromptDelivery & { guarded?: GuardedSendResult }> => {
+    if (agent === 'agy') return { delivered: false, reason: 'Antigravity sessions are read-only in Arc.' };
     if (guarded) {
       // Guarded delivery mode. It requires the recorded child and never reopens, resumes, forks, or shows a dialog.
       // It writes only the requested text, with no attachments, comments, or prompt history.
@@ -2166,7 +2170,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
   panel.onTurnsFinished = (agents) => {
     for (const agent of agents) {
-      refreshUsage(agent, false);
+      if (agent === 'claude' || agent === 'codex') refreshUsage(agent, false);
     }
   };
 
@@ -2174,7 +2178,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   let activeMcpOwner: string | null = null;
   panel.onPanelCommand = (owner, agent, control, draft, cwd) =>
     reportFailures(async () => {
-      if (control !== 'mcp') {
+      if (control !== 'mcp' || agent === 'agy') {
         return;
       }
       const which = agent as AgentName;
@@ -2268,7 +2272,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       mcpRefreshes.cancel(activeMcpOwner);
       activeMcpOwner = null;
     }
-    if (session && agent) {
+    if (session && agent && agent !== 'agy') {
       refreshUsage(agent, false, session, agent, cwd ?? undefined);
     }
   };
@@ -2343,6 +2347,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   panel.onPicked = (agent, session, control, value, settledModel, cwd) =>
     reportFailures(async () => {
+      if (agent === 'agy') return;
       const which = agent as AgentName;
       if (control === 'askmode') {
         await acceptedAskModePick(which, value, (mode) => setAskModeFor(which, mode, session));
@@ -2382,42 +2387,45 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   };
   // Rename through a live child when available. Otherwise start a control-only child. Claude needs the original working directory to locate its transcript.
   panel.onRenameSession = (agent, session, cwd, title, file) =>
-    renameAgentSession(host, {
-      agent,
-      sessionId: session,
-      title,
-      file,
-      idlePlan: () => {
-        const launch = launchFor(agent);
-        if (launch.problem) {
-          throw new Error(launch.problem);
-        }
-        if (agent === 'claude') {
-          if (!cwd) {
-            throw new Error('Arc cannot tell which folder this session ran in.');
-          }
-          const mode = askModeFor(agent, session);
-          return claudeRenamePlan(launch, {
-            cwd,
-            resume: session,
-            policy: policies.read(session),
-            title,
-            agentRun: panel.isAgentRunLaunch?.(session) ?? false,
-            ...(mode ? { permissionMode: claudeAskMode(mode) } : {}),
-            model: modelFor(agent, session),
-            effort: effortFor(agent, session),
-          });
-        }
-        // The Codex child sends one request after its handshake, so any existing folder serves.
-        return codexRenamePlan(launch, {
-          cwd: cwd ?? path.dirname(file),
-          clientInfo: CLIENT_INFO,
-          threadId: session,
+    agent === 'agy'
+      ? Promise.reject(new Error('Antigravity sessions are read-only in Arc.'))
+      : renameAgentSession(host, {
+          agent,
+          sessionId: session,
           title,
+          file,
+          idlePlan: () => {
+            const launch = launchFor(agent);
+            if (launch.problem) {
+              throw new Error(launch.problem);
+            }
+            if (agent === 'claude') {
+              if (!cwd) {
+                throw new Error('Arc cannot tell which folder this session ran in.');
+              }
+              const mode = askModeFor(agent, session);
+              return claudeRenamePlan(launch, {
+                cwd,
+                resume: session,
+                policy: policies.read(session),
+                title,
+                agentRun: panel.isAgentRunLaunch?.(session) ?? false,
+                ...(mode ? { permissionMode: claudeAskMode(mode) } : {}),
+                model: modelFor(agent, session),
+                effort: effortFor(agent, session),
+              });
+            }
+            // The Codex child sends one request after its handshake, so any existing folder serves.
+            return codexRenamePlan(launch, {
+              cwd: cwd ?? path.dirname(file),
+              clientInfo: CLIENT_INFO,
+              threadId: session,
+              title,
+            });
+          },
         });
-      },
-    });
   panel.onRenameStartedSession = async (agent, sessionId, cwd, rawTitle, current) => {
+    if (agent === 'agy') throw new Error('Antigravity sessions are read-only in Arc.');
     const title = sessionRenameTitle(rawTitle);
     if (!title) throw new Error('Enter a session name.');
     await renameAgentSession(host, {
@@ -2485,12 +2493,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           });
     };
   const withExistingSessionActivity = async <T>(
-    which: AgentName,
+    which: AgentName | 'agy',
     session: string,
     cwd: string | null,
     work: (session: AgentSession) => Promise<T>,
     report?: (message: string) => void,
   ): Promise<T | null> => {
+    if (which === 'agy') {
+      report?.('Antigravity sessions are read-only in Arc.');
+      return null;
+    }
     if (!cwd) {
       if (report) report('Open a folder first. The agent runs in it.');
       else void vscode.window.showWarningMessage('Arc: open a folder first. The agent runs in it.');

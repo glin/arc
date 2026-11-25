@@ -1,3 +1,5 @@
+import { agyBrainRoot, agySessionId, findAgyTranscript } from './agydiscovery';
+import { agyUsageDetail, createAgyUsageReducer, mergeAgyUsage } from './agyhistory';
 import fs from 'node:fs';
 import { combineCacheExpirySummaries, combineCacheExpiryAmounts } from './cacheexpirysummary';
 import path from 'node:path';
@@ -101,6 +103,7 @@ function* costScanLines(
 export interface SessionRoots {
   projects?: string;
   codexSessions?: string;
+  agyBrain?: string;
 }
 
 export type SessionSourceKind =
@@ -109,6 +112,7 @@ export type SessionSourceKind =
   | 'claude-session'
   | 'codex'
   | 'codex-thread'
+  | 'agy'
   | 'claude-print';
 
 export interface SessionSource {
@@ -122,6 +126,7 @@ export interface SessionSource {
 }
 
 export interface SessionRequest extends UsageEvent {
+  agyUsage?: import('./transcript').AgyRecordedUsage;
   toolCalls: number;
   evidenceOnly?: true;
   billingRecord?: true;
@@ -851,6 +856,25 @@ export async function sessionCostReportAsync(
   return drainCostStepsAsync(assembleCostReport(sources, options, window), signal);
 }
 
+function agyCostSummary(requests: readonly SessionRequest[]): SessionCostSummary {
+  const counts = requests.reduce(
+    (total, request) => mergeAgyUsage(total, request.agyUsage),
+    {} as import('./transcript').AgyRecordedUsage,
+  );
+  return {
+    requests: requests.length,
+    pricedRequests: 0,
+    unpricedRequests: requests.length,
+    coverage: 'unknown-request-coverage',
+    requestCountExact: false,
+    costUsd: null,
+    toolCalls: requests.reduce((total, request) => total + request.toolCalls, 0),
+    ...(counts.input !== undefined ? { uncachedInputTokens: counts.input } : {}),
+    ...(counts.cacheRead !== undefined ? { cachedInputTokens: counts.cacheRead } : {}),
+    ...(counts.output !== undefined ? { outputTokens: counts.output } : {}),
+  };
+}
+
 function* assembleCostReport(
   sources: SessionSource[],
   options: SessionCostOptions,
@@ -884,6 +908,14 @@ function* assembleCostReport(
     return unknown ? 'unknown' : (previous ?? undefined);
   };
   const parent = sources[0];
+  if (parent.kind === 'agy') {
+    const unsupported = [
+      options.byTool && '--by-tool',
+      options.untilText && '--until-text',
+      options.windowAgent && '--window-agent',
+    ].filter(Boolean);
+    if (unsupported.length) throw new Error('Antigravity cost does not support ' + unsupported.join(' or ') + '.');
+  }
   const allParentRequests = yield* allRequestsFor(parent);
   const parentRequests = allParentRequests.filter(inWindow);
   const retained: { source: SessionSource; requests: SessionRequest[]; summary: SessionCostSummary }[] = [];
@@ -912,6 +944,36 @@ function* assembleCostReport(
     options.byModel,
     expiryPredecessor(allParentRequests),
   );
+  if (parent.kind === 'agy') {
+    const counts = parentRequests.reduce((total, request) => mergeAgyUsage(total, request.agyUsage), {});
+    const summary = agyCostSummary(parentRequests);
+    const parentSummary = { ...summary };
+    if (options.byModel) {
+      const models = new Map<string | null, SessionRequest[]>();
+      for (const request of parentRequests) {
+        const held = models.get(request.model) ?? [];
+        held.push(request);
+        models.set(request.model, held);
+      }
+      parentSummary.modelCosts = [...models].map(([model, requests]) => ({ model, ...agyCostSummary(requests) }));
+    }
+    return {
+      source: { kind: 'agy', file: parent.file, sessionId: parent.sessionId },
+      ...(since !== null || until !== null
+        ? {
+            window: {
+              since: since === null ? null : new Date(since).toISOString(),
+              until: until === null ? null : new Date(until).toISOString(),
+            },
+          }
+        : {}),
+      parent: parentSummary,
+      combined: summary,
+      children: [],
+      rateNote: agyUsageDetail(counts),
+      cacheExpiryNote: '',
+    };
+  }
   const childReports = retained.map(({ source, summary }) => ({
     kind: source.kind,
     file: source.file,
@@ -1099,6 +1161,10 @@ function* sessionTranscriptSteps(
   for (const file of yield* rolloutPaths(codexStore(roots), signal)) {
     yield;
     if (path.basename(file).endsWith(`-${target}.jsonl`)) matches.push(file);
+  }
+  if (matches.length === 0) {
+    const agy = findAgyTranscript(roots.agyBrain ?? agyBrainRoot(), target);
+    if (agy) return agy;
   }
   if (matches.length === 0) throw new Error(`No transcript found for ${target}`);
   if (matches.length > 1) throw new Error(`More than one transcript matched ${target}: ${matches.join(', ')}`);
@@ -1840,7 +1906,7 @@ function reconcileCodexCosts(
 // The reducers own request identity. This pass retains their final positive event and its first position.
 export function readSessionRequests(
   file: string,
-  role: SessionSourceKind = isCodex(file) ? 'codex' : 'claude',
+  role: SessionSourceKind = agySessionId(file) ? 'agy' : isCodex(file) ? 'codex' : 'claude',
   invocationId?: string,
   failedToolTimestamps?: number[],
 ): SessionRequest[] {
@@ -1853,6 +1919,14 @@ function* sessionRequestSteps(
   invocationId?: string,
   failedToolTimestamps?: number[],
 ): CostSteps<SessionRequest[]> {
+  if (role === 'agy') {
+    const reducer = createAgyUsageReducer(undefined);
+    const requests: SessionRequest[] = [];
+    yield* costScanLines(file, (line) => {
+      requests.push(...reducer.pushLine(line));
+    });
+    return requests;
+  }
   const codex =
     role === 'codex' || role === 'codex-thread' || role === 'claude-print' || (role === 'claude' && isCodex(file));
   const reducer = codex
@@ -2706,6 +2780,8 @@ function* sessionSourceSteps(
   signal?: AbortSignal,
 ): CostSteps<SessionSource[]> {
   const absolute = path.resolve(file);
+  const agy = agySessionId(absolute);
+  if (agy) return [{ kind: 'agy', file: absolute, sessionId: agy }];
   const catalogRefusals = new Map<'claude' | 'codex', { error: unknown }>();
   const refuseCatalog = (agent: 'claude' | 'codex', error: unknown) => {
     signal?.throwIfAborted();
