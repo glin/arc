@@ -42,6 +42,28 @@ const NATIVE_CODEX_ID = 'bbbbbbbb-2222-4222-8222-222222222222';
 const at = (second: number) => new Date(Date.UTC(2026, 8, 29, 12, 0, second)).toISOString();
 const record = (type: string, second: number, fields: object) => ({ type, timestamp: at(second), ...fields });
 
+test('Antigravity export refuses before inventory or history reads', async () => {
+  const f = fixture();
+  const writer = await ExportTransaction.create(f.output);
+  const phases: string[] = [];
+  try {
+    await assert.rejects(
+      captureSessionExport(
+        {
+          ...f.options,
+          root: { ...f.options.root, agent: 'agy' },
+          progress: (phase) => phases.push(phase),
+        },
+        writer,
+      ),
+      /Antigravity session export is unavailable/,
+    );
+    assert.deepEqual(phases, []);
+  } finally {
+    await writer.dispose();
+  }
+});
+
 test('capture preserves the leading compaction placement association', async () => {
   const f = fixture();
   const leading = codexLeadingCompactionRecords();

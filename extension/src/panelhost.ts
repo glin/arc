@@ -7,22 +7,57 @@ import { DispatchReceipts, type DispatchStoreRevision } from './dispatchreceipts
 import {
   sessionCoverageMember,
   reconcileSessionCollisions,
+  indexedPhysical,
+  retainNativeSessionReservations,
+  nativeReservationTwin,
+  sessionCoverageFileKey,
   sessionPresence,
   type SessionCollisionEvidence,
   type SessionCollisionObservation,
   type SessionCoverage,
+  type SessionCoverageContext,
   type SourceEnumeration,
 } from './sessioncoverage';
-import { compressedRolloutsReadable, isCompressedRollout } from './compressedrollouts';
 import {
+  COMPRESSED_REPAIR_LIMIT,
+  compressedRolloutsReadable,
+  addsCompressedRepairEvidence,
+  addsCompressedRepairProof,
+  sameCompressedRepairClaim,
+  sameCompressedPlacement,
+  type CompressedPlacement,
+  type CompressedRepair,
+  type CompressedRepairEvidence,
+  type CompressedRepairSettlement,
+  isCompressedRollout,
+  readQualifiedCompressedFirstRecord,
+  sameStat as sameCompressedRevision,
+} from './compressedrollouts';
+import {
+  COMPRESSED_ENTRY_TITLE_BYTES,
   COMPRESSED_FACTS_STORE,
   COMPRESSED_OPENINGS_STORE,
+  compareCompressedEntries,
+  reconcileCompressedEntries,
   compressedEntrySame,
+  compressedEntryCurrent,
+  compressedEntryIdentity,
+  compressedEntryConflicts,
+  compressedFactsMatchSource,
   compressedEntrySeed,
+  compressedByteObservation,
+  COMPRESSED_BATCH_BYTES,
+  compareCompressedObservations,
+  type CompressedByteObservation,
+  type CompressedLineage,
   compressedPairKey,
   compressedTitleCurrent,
+  sessionKeyOf,
+  quarantineCompressedSpend,
   withKeptUndercount,
+  heldCompressedSpend,
   type CompressedFactEntry,
+  type CompressedEntrySeed,
   type CompressedStorePaths,
 } from './compressedstore';
 import {
@@ -115,6 +150,22 @@ import type { ClaudeForwardCheckpoint } from './claudehistory';
 import * as vscode from 'vscode';
 import { costStateDependency, costStateIdentity, reconcileClaudeCostState } from './claudecoststate';
 import { ClaudeCostStateDependencyIndex, invalidateClaudeCostSupplements } from './projectspend';
+import {
+  agyAdmissionOf,
+  agyBrainRoot,
+  agyCollisionWith,
+  agySessionId,
+  clearAgyDiscoveryCache,
+  currentAgyAdmission,
+  renewAgyAdmission,
+  discardAgyDiscoveryEntry,
+  isAgySessionId,
+  scanAgySessions,
+  type AgyAdmission,
+  type AgyDiscoveryCache,
+  type AgyDiscoveryResult,
+} from './agydiscovery';
+import { createAgyUsageReducer, readAgySession } from './agyhistory';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { PlatformPath } from 'node:path';
@@ -212,6 +263,7 @@ import { onClaudeRepeatedCoverage } from './clauderepeated';
 import {
   CodexMetaCache,
   readQualifiedCodexOpening,
+  openingRecordOf,
   CodexStatCache,
   CodexSubagentFile,
   ThreadNames,
@@ -228,6 +280,7 @@ import {
   codexSpendIndex,
   codexTitleFor,
   readCodexSession,
+  observeRolloutStat,
   readRolloutStat,
   readThreadNames,
   staleMetas,
@@ -605,7 +658,9 @@ import {
   compressedSpendDisplayFiles,
   projectSpendDisplayFiles,
   truncateProjectSpendView,
-  pruneSpendFilesWithResult,
+  pruneSpendLedgerFiles,
+  completeSpendFiles,
+  agySpendAtAdmission,
   projectSpendHistoryCutoff,
   projectSpendOfferDecision,
   projectSpendWindows,
@@ -714,8 +769,7 @@ import {
   staleCursorIsStuck,
   startSessionHistory,
 } from './historypages';
-import { ClaudeHistoryCursor } from './claudehistory';
-import { CodexHistoryCursor, type CodexForwardCheckpoint } from './codexhistory';
+import { type CodexForwardCheckpoint } from './codexhistory';
 import {
   BoundedTrailingScheduler,
   IntegrityScheduler,
@@ -786,6 +840,14 @@ import {
 import {
   ProgressiveWorker,
   acceptsProgressiveResult,
+  compressedLoadRecords,
+  compressedRequestBytes,
+  compressedTransferBatches,
+  sameCompressedStores,
+  type CompressedLoadRequest,
+  type CompressedNamesReceipt,
+  type CompressedTransferPart,
+  type CompressedTransferReceipt,
   metadataReadBudget,
   preservesLoadedHistory,
   sameProgressiveRevision,
@@ -795,6 +857,7 @@ import {
   type DispatchSessionFacts,
   type ProgressiveCheckpoint,
   type ProgressiveInput,
+  type ProgressiveRequest,
   type ProgressiveResult,
 } from './progressiveworker';
 import { panelShell } from './paneldevelopment';
@@ -865,6 +928,8 @@ interface AwaitingSessionRecord {
   createdAt: number;
   agent: AgentKind;
   cwd: string | null;
+  moved?: true;
+  replacesAgy?: true;
 }
 interface WindowRead {
   read: SessionRead;
@@ -882,7 +947,7 @@ const RECORDED_REPLY_RETRY_MS = 1_000;
 
 // Each source adapter owns the cursor for its next older page. The provider passes
 // it back to that adapter and drops it when the source revision changes.
-type HistoryCursor = ClaudeHistoryCursor | CodexHistoryCursor;
+type HistoryCursor = import('./progressiveworker').ProgressiveCursor;
 
 // A copy of `value` with the session's current speed selection. No selection leaves the field absent.
 function carryServiceTier<T extends { serviceTier?: ServiceTier }>(value: T, tier: ServiceTier | undefined): T {
@@ -923,6 +988,16 @@ type DiscoveryPendingWriter =
 
 // The scope text and source roots that physical membership checks share within one synchronous run.
 type PhysicalMembershipHeld = { scope?: string; claude?: string[]; codex?: string[] };
+
+interface ProjectSpendSource {
+  file: string;
+  agent: AgentKind;
+  primary?: boolean;
+  agySource?: SessionFile;
+  agyMissing?: true;
+}
+
+type ProjectSpendRevision = SpendSourceRevision & { agyPhysical?: FileRevision };
 
 // Why an accepted catalog holds no session read revision, named in the performance counters.
 type AcceptedUnsettledCause =
@@ -1460,9 +1535,35 @@ interface PanelHost {
   onDidDispose(listener: () => void): vscode.Disposable;
 }
 
+const agyRowSource = Symbol('Antigravity row source');
+const sessionRowDetails = Symbol('Session row details');
+interface AgyRowProducer {
+  source: SessionFile;
+  revoked: boolean;
+}
+type HiddenCompressedOpening = Pick<SessionFile, 'file' | 'sessionId' | 'size' | 'mtimeMs'> & { cwd: string };
+type CompressedOpeningCheck = {
+  revision: ReturnType<typeof readRolloutStat>;
+  observation?: CompressedByteObservation;
+  notices?: Map<string, { entry: CompressedEntrySeed; observation: CompressedByteObservation }[]>;
+  changed?: true;
+};
+type CompressedOpening = Pick<SessionCollisionObservation, 'source' | 'hidden'> & {
+  observation?: CompressedByteObservation;
+  qualification?: number;
+  check?: CompressedOpeningCheck;
+  pending?: true;
+};
+interface CompressedWalkOpenings {
+  folderPrint: string;
+  observations: CompressedOpening[];
+}
+
 type PanelRowSender = RowDeltaSender & {
+  agyRowsRevision?: number;
   acceptedCards?: Map<string, unknown>;
   acceptedWindow?: SessionRead;
+  acceptedAgySource?: SessionFile;
   cardPost?: number;
   acceptedCardPost?: number;
 };
@@ -1571,6 +1672,7 @@ import { mergeSubmittedPrompts, type SubmittedPrompt } from './webview/state';
 
 interface SelectionWork {
   sessionId: string;
+  source?: SessionFile;
   generation: number;
   controller: AbortController;
   host?: PanelHost;
@@ -1717,6 +1819,10 @@ export class PanelProvider implements vscode.Disposable {
     () => this.performanceCounters?.recordWork('compressedDecodes'),
     (bytes) => this.performanceCounters?.recordWork('compressedStoreWriteBytes', bytes),
     (batch) => this.applyCompressedBatch(batch),
+    (request) => {
+      const entry = this.compressedFacts.get(request.file);
+      return entry && this.compressedPlacementAllows(entry) ? heldCompressedSpend(entry, request) : undefined;
+    },
   );
   private readonly commitRepositoryReservations = new CommitRepositoryReservations();
   private readonly commitRepositoryReplies = new Map<string, { key: string; reply: CommitRepositoryReply }>();
@@ -1816,14 +1922,36 @@ export class PanelProvider implements vscode.Disposable {
   private readonly codexStats = new CodexStatCache();
   // Compressed Codex rollouts that the walk listed or a wake batch named. A name gives a row only through a stored entry.
   private readonly compressedRollouts = new Set<string>();
+  private compressedMemberships?: Map<string, number>;
+  private compressedMembershipChecks?: Set<string>;
+  private compressedInventoryComplete = false;
   private compressedRolloutsRevision = 0;
-  // The revision and worker thread of the last `compressed` list that discovery sent.
-  private compressedRolloutsSent: { worker: number | null; revision: number } | null = null;
+  private compressedRolloutsSent: {
+    worker: number;
+    revision: number;
+    stores: CompressedStorePaths;
+  } | null = null;
   // The entries of the stores, by twin path. Compressed facts never enter `titles`, which the checkpoint saves.
   private compressedFacts = new Map<string, CompressedFactEntry>();
   private compressedFactsRevision = 0;
+  // A later walk can outlive the reservation that first qualified this opening.
+  private qualifiedCompressedOpenings?: Map<string, CompressedOpening>;
+  private compressedOpeningChecks?: Map<string, CompressedOpeningCheck>;
+  private compressedRepairs?: Map<string, { repair: CompressedRepair; scope: number; worker?: number }>;
+  private settledCompressedRepairs?: Map<string, CompressedRepairSettlement>;
+  private compressedRepairEvidence?: Map<string, CompressedRepairEvidence>;
+  private releasedCompressedRepairs?: Map<string, string>;
+  private compressedRepairSequence = 0;
+  private hiddenCompressedOpenings?: Map<string, HiddenCompressedOpening>;
+  private compressedPlacements?: Map<
+    string,
+    { placement: CompressedPlacement; blockedHash?: string; maskedScope?: number }
+  >;
   // Plain rollouts whose adoption of their twin has not settled, and the row each held.
-  private adoptionsUnsettled = new Map<string, { twin: string; row: SessionFile | null; running: boolean }>();
+  private adoptionsUnsettled = new Map<
+    string,
+    { twin: string; row: SessionFile | null; running: boolean; pending?: CompressedEntrySeed }
+  >();
   // True from the start of a panel with a store until the load of the stores ends.
   private compressedLoadPending = false;
   private compressedLoadStarted = false;
@@ -1840,6 +1968,8 @@ export class PanelProvider implements vscode.Disposable {
     listed: ReadonlySet<string>;
     complete: boolean;
     inFolders: (cwd: string) => boolean;
+    physical?: SessionCoverage;
+    plainTwins?: Set<string>;
   } | null = null;
   // Set by a compressed-facts refresh, so the next list that it builds sets the `compressedRows` gauge.
   private compressedFactsRefreshDue = false;
@@ -1854,6 +1984,10 @@ export class PanelProvider implements vscode.Disposable {
   private selectedRefreshes = 0;
   // The last store offsets of the load, so a new worker reads only the bytes after them.
   private compressedLoadCursor: { worker: number | null; consumed: [string, number][] } | null = null;
+  private compressedPlacementScope?: { worker: number; scope: number; stores: CompressedStorePaths };
+  private compressedTransferId = 0;
+  private compressedLineage?: Map<string, CompressedLineage>;
+  private pendingCompressedLineage?: { worker: number | null; groups: Map<string, CompressedLineage> };
   // Names in the store with no facts. The host keeps only the paths, for a worker that replaces the current one.
   private readonly compressedNameOnly = new Set<string>();
   private readonly compressedLaunch = crypto.randomUUID();
@@ -1868,6 +2002,7 @@ export class PanelProvider implements vscode.Disposable {
     pricingUntil: number;
     picked: readonly SpendFileIndex[];
   } | null = null;
+  private readonly rejectedCompressedFacts = new WeakSet<CompressedFactEntry>();
   private readonly compressedSpendPicks = new WeakMap<
     readonly SpendFileIndex[],
     {
@@ -1948,6 +2083,44 @@ export class PanelProvider implements vscode.Disposable {
   private enumeratedAmbiguousIds?: Set<string>;
   private enumeratedCollisions?: SessionCollisionEvidence;
   private enumeratedAdmissionComplete = false;
+  private agyScopeEpoch = 0;
+  private agyCatalog?: AgyDiscoveryResult & { folderPrint: string; publish: boolean };
+  private agyNativeReservations?: Map<string, SessionFile[]>;
+  private hiddenCodexOpenings?: { folderPrint: string; root: string; files: Map<string, Set<string>> };
+  private agyRedrawQueued = false;
+  private agyRowsRevision = 0;
+  private agyNativePresentation?: Map<
+    string,
+    {
+      displaced: string;
+      sessionId: string;
+      agent: 'claude' | 'codex';
+      scope: string;
+      member?: string;
+    }
+  >;
+  private agyRetiredRows?: Set<string>;
+  private agyRowProducers?: Map<string, AgyRowProducer>;
+  private agyAuthorities?: WeakMap<AgyAdmission, AgyAdmission>;
+  private agyTimelineSources?: Map<string, SessionFile>;
+  private agyComposerSources?: Map<string, SessionFile>;
+  private agyGlanceSources?: Map<string, SessionFile>;
+  private agyOutcomeSources?: Map<string, SessionFile>;
+  private agyMetadataSources?: Map<string, SessionFile>;
+  private agyScan?: {
+    key: string;
+    brain: string;
+    folderPrint: string;
+    roots: string[];
+    workspace: string;
+    cache: AgyDiscoveryCache;
+    reading?: string;
+    controller?: AbortController;
+    coveragePublished?: boolean;
+  };
+  private agyReadCatalogs?: WeakMap<readonly SessionFile[], ReadonlyMap<string, SessionFile | null>>;
+  private agyReadWork?: WeakMap<AgyAdmission, { controller: AbortController; recovery: number }>;
+  private agyReadSequence = 0;
   // The latest search query that arrived during the cold pass. Only it is answered after.
   private waitingSearch: string | null = null;
   // Titles and activity times share a revisioned read. Size or mtime changes invalidate the entry.
@@ -2102,7 +2275,12 @@ export class PanelProvider implements vscode.Disposable {
   private historyStructuralKeys = new Map<string, string>();
   // The one page read allowed to be in flight, and the generation that discards a result
   // whose session, transcript or provider moved while it ran.
-  private historyRequest: { sessionId: string; controller: AbortController; generation: number } | null = null;
+  private historyRequest: {
+    sessionId: string;
+    controller: AbortController;
+    generation: number;
+    source?: SessionFile;
+  } | null = null;
   private historyGeneration = 0;
   // The navigation trail shared by this provider's hosts. A window reload starts a new trail.
   private trail: Trail = emptyTrail();
@@ -2332,7 +2510,7 @@ export class PanelProvider implements vscode.Disposable {
     )
       return;
     const state = this.stateFor(session);
-    if (!state) return;
+    if (!state || state.agent === 'agy') return;
     this.contextRequests.set(host, request);
     const aggregate = JSON.stringify(state.context);
     const model = state.settings.selectedModel || state.settings.confirmedModel || '';
@@ -2614,6 +2792,7 @@ export class PanelProvider implements vscode.Disposable {
       readBytes: number;
       turnLimitReached: boolean;
       loadedTurns: number;
+      agySource?: SessionFile;
     }
   >();
   // Turn references from the selected window, before the card budget limits its payload.
@@ -2638,6 +2817,9 @@ export class PanelProvider implements vscode.Disposable {
     persisted: boolean;
     label: string;
     railName?: string;
+    [agyRowSource]?: { producer: AgyRowProducer };
+    [sessionRowDetails]?: { cwd?: string; fullLabel?: string };
+    fullLabel?: string;
     agent: string;
     agentKey: AgentKind;
     when: string;
@@ -2713,7 +2895,10 @@ export class PanelProvider implements vscode.Disposable {
   // Selection-independent turn starts, projected from accepted metadata and lifetime facts.
   private windows = new Map<string, TurnStarts>();
   // Search entries by session file revision. Entries contain prompts and summaries without tool-result bodies.
-  private corpus = new Map<string, { mtimeMs: number; size: number; entries: SearchEntry[] }>();
+  private corpus = new Map<
+    string,
+    { mtimeMs: number; size: number; entries: SearchEntry[]; agyAdmission?: AgyAdmission }
+  >();
   private disposables: vscode.Disposable[] = [];
   private poll: ReturnType<typeof setInterval> | null = null;
   private pollGate: PollDirectoryGate | null = null;
@@ -2797,7 +2982,7 @@ export class PanelProvider implements vscode.Disposable {
   private projectSpendHydrationTick: ReturnType<typeof setTimeout> | null = null;
   // Integrity queues supplement targeted source events with independent periodic checks.
   private spendIntegrity?: IntegrityScheduler;
-  private spendSourcesByFile = new Map<string, { file: string; agent: AgentKind; primary?: boolean }>();
+  private spendSourcesByFile = new Map<string, ProjectSpendSource>();
   private spendFilesBySession = new Map<string, string[]>();
   private spendNativeChildren = new Set<string>();
   private spendRecordsByFile = new Map<string, number>();
@@ -2819,7 +3004,8 @@ export class PanelProvider implements vscode.Disposable {
   private childCacheExpiryAttribution = new ChildCacheExpiryAttribution();
   private projectSpendFiles: SpendFileIndex[] = [];
   private projectSpendVisibleFiles: SpendFileIndex[] = [];
-  private projectSpendQueue: { file: string; agent: AgentKind; primary?: boolean }[] = [];
+  private projectSpendAgyComplete?: Map<string, SpendFileIndex>;
+  private projectSpendQueue: ProjectSpendSource[] = [];
   private projectSpendQueued = new Set<string>();
   private projectSpendTick: ReturnType<typeof setTimeout> | null = null;
   private readonly projectSpendOffers = new Set<ReturnType<typeof setTimeout>>();
@@ -3038,7 +3224,14 @@ export class PanelProvider implements vscode.Disposable {
       : [];
     if (matches.length !== 1 || matches[0].agent !== record.provider || !this.sessionReadAdmitted(matches[0]))
       return null;
-    const facts = this.agentReadSources.resolve(this.readSource(matches[0]), () => this.readScopeKey(), roots);
+    const source = matches[0];
+    const facts = this.agentReadSources.resolve(
+      this.readSource(source),
+      () => this.readScopeKey(),
+      roots,
+      undefined,
+      source.agent === 'agy' ? () => this.agyReadAdmission(source) : undefined,
+    );
     if (facts) {
       this.admittedReadSources.delete(record.sessionId);
       this.admittedReadSources.set(record.sessionId, facts);
@@ -3055,14 +3248,31 @@ export class PanelProvider implements vscode.Disposable {
     const held = new Map<string, AgentReadSource | null>();
     return (record) => {
       const key = `${record.provider}:${record.sessionId}`;
-      if (!held.has(key)) held.set(key, open ? this.currentReadSource(record) : this.projectedReadFacts(record));
-      return held.get(key)!;
+      if (!held.has(key)) {
+        const facts = open ? this.currentReadSource(record) : this.projectedReadFacts(record);
+        held.set(key, facts);
+        return facts;
+      }
+      const facts = held.get(key)!;
+      if (facts?.provider === 'agy') {
+        const source = this.agyCatalogRow(record.sessionId.toLowerCase(), this.authoritativeCatalog);
+        if (!source) return null;
+        const admission = this.agyReadAdmission(source);
+        if (
+          !admission ||
+          this.agentReadSources.admissionOf(facts) !== admission ||
+          this.readScopeKey() !== facts.scope ||
+          guardedSourceRevision(source.file) !== facts.sourceRevision
+        )
+          return null;
+      }
+      return facts;
     };
   }
 
   private projectedReadFacts(record: AgentReadRecord): AgentReadSource | null {
     const facts = this.admittedReadSources.get(record.sessionId);
-    if (!facts || facts.scope !== this.readScopeKey()) return null;
+    if (!facts || facts.provider !== record.provider || facts.scope !== this.readScopeKey()) return null;
     const roots = this.repositoryScope.snapshot(this.folders()).roots;
     const matches =
       this.authoritativeCatalogScope === JSON.stringify(roots)
@@ -3073,6 +3283,7 @@ export class PanelProvider implements vscode.Disposable {
     return matches.length === 1 &&
       matches[0].agent === facts.provider &&
       this.sessionReadAdmitted(matches[0]) &&
+      (facts.provider !== 'agy' || this.agentReadSources.admissionOf(facts) === this.agyReadAdmission(matches[0])) &&
       guardedSourceIdentity(matches[0]) === facts.source &&
       guardedSourceRevision(matches[0].file) === facts.sourceRevision
       ? facts
@@ -3167,6 +3378,8 @@ export class PanelProvider implements vscode.Disposable {
 
   public guardedReadRequest(request: import('./sessionrequests').SessionRequest) {
     const owner = this.readOwner();
+    const facts = this.readFacts();
+    const orderedFacts = this.readFacts();
     return runSessionRead(
       {
         requestId: request.id,
@@ -3177,10 +3390,10 @@ export class PanelProvider implements vscode.Disposable {
       },
       this.readObservations,
       owner.operations,
-      this.readFacts(),
+      facts,
       (state) => owner.persistRead(state),
       () => owner.publishAccepted(),
-      this.readFacts(),
+      (record) => (record.provider === 'agy' ? facts(record) : orderedFacts(record)),
     );
   }
 
@@ -3531,7 +3744,12 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   private sessionReadAdmitted(source: SessionFile): boolean {
-    return !this.enumeratedAmbiguousIds?.has(source.sessionId) && this.membershipOf(source.sessionId) === 'present';
+    if (!this.compressedProjectionCurrent(source)) return false;
+    return (
+      !this.enumeratedAmbiguousIds?.has(source.sessionId) &&
+      this.membershipOf(source.sessionId) === 'present' &&
+      (source.agent !== 'agy' || !!this.agyReadAdmission(source))
+    );
   }
 
   // Keeps the facts of a current session read and returns the observation the policy signs for them, if any.
@@ -3551,6 +3769,7 @@ export class PanelProvider implements vscode.Disposable {
     const matches = accepted
       ? this.sessionPageIndexFor(accepted, key, roots).scoped.filter((source) => source.sessionId === session)
       : [];
+    if (matches.some((source) => source.agent === 'agy' || !this.compressedProjectionCurrent(source))) return null;
     const sourceRevision = matches.length === 1 ? guardedSourceRevision(matches[0].file) : null;
     const read = this.guardedReads?.get(session);
     const state = this.stateFor(session);
@@ -3782,6 +4001,7 @@ export class PanelProvider implements vscode.Disposable {
             ? this.readObservations.observe(requesterOf(request), facts)
             : null;
         },
+        matches[0].agent === 'agy' ? () => this.agyReadAdmission(matches[0]) : undefined,
       );
       const result = sessionQuestions(
         read,
@@ -3805,6 +4025,16 @@ export class PanelProvider implements vscode.Disposable {
         ? index.sources
         : sessionPageSources(index.scoped.filter((source) => source.sessionId === target));
     const secret = (this.sessionCursorSecret ??= crypto.randomBytes(32));
+    if (
+      (this.agyReadCatalogs ||
+        this.qualifiedCompressedOpenings?.size ||
+        this.compressedPlacements?.size ||
+        this.compressedMembershipChecks?.size) &&
+      accepted
+    )
+      sources = sources.filter(({ session }) =>
+        session.agent === 'agy' ? this.agyReadAdmission(session, accepted) : this.compressedProjectionCurrent(session),
+      );
     const query = request.params.query;
     if (query !== undefined) {
       const error = listingQueryError(query);
@@ -3835,7 +4065,8 @@ export class PanelProvider implements vscode.Disposable {
       }
       const meta = this.titleEntryOf(source.file);
       const revision = this.revisionOf(source);
-      const sourceCurrent = sameProgressiveRevision(revision, source);
+      const sourceCurrent =
+        (source.agent !== 'agy' || !!this.agyReadAdmission(source)) && sameProgressiveRevision(revision, source);
       const current = sourceCurrent && meta !== undefined && sameSessionRevision(meta, source);
       const outcome = sourceCurrent && meta && sameSessionRevision(meta, source) ? meta.outcome : undefined;
       const held = this.cache.get(source.file);
@@ -3937,6 +4168,7 @@ export class PanelProvider implements vscode.Disposable {
         const current =
           meta !== undefined &&
           sameSessionRevision(meta, source) &&
+          (source.agent !== 'agy' || !!this.agyReadAdmission(source)) &&
           sameProgressiveRevision(this.revisionOf(source), source);
         metadata.agentRun = current ? this.agentRunFor(source, edges) : source.childTranscript === true ? true : null;
         if (metadata.agentRun === null) unavailableMetadata = true;
@@ -3978,9 +4210,10 @@ export class PanelProvider implements vscode.Disposable {
       this.sessionScopeMembers = { roots, inScope: folderMatcher(scopeRoots), members: new Map() };
     const { inScope, members } = this.sessionScopeMembers;
     const scoped = accepted.filter((source) => {
-      if (!source.cwd) return true;
-      let member = members.get(source.cwd);
-      if (member === undefined) members.set(source.cwd, (member = inScope(source.cwd)));
+      const directory = source.agent === 'agy' ? source.agyOwnerRoot : source.cwd;
+      if (!directory) return source.agent !== 'agy';
+      let member = members.get(directory);
+      if (member === undefined) members.set(directory, (member = inScope(directory)));
       return member;
     });
     let rows: Map<string, SessionFile> | undefined = new Map();
@@ -3993,6 +4226,7 @@ export class PanelProvider implements vscode.Disposable {
         prior.sessionId === source.sessionId &&
         prior.agent === source.agent &&
         prior.cwd === source.cwd &&
+        prior.agyOwnerRoot === source.agyOwnerRoot &&
         prior.dev === source.dev &&
         prior.ino === source.ino;
       rows.set(source.file, source);
@@ -4175,6 +4409,11 @@ export class PanelProvider implements vscode.Disposable {
       this.titles = cached.titles;
       // Cached negative answers require current classifier evidence after restart.
       for (const [file, entry] of this.titles) {
+        if (agySessionId(file) !== null && isInside(file, [agyBrainRoot()])) {
+          this.titles.delete(file);
+          cached.carriedNames.delete(file);
+          continue;
+        }
         if (entry.agentRun === false) this.titles.set(file, { ...entry, agentRun: null, foldedLabel: undefined });
       }
       this.claudeChildReferenceEntries = cached.claudeChildReferences;
@@ -4474,12 +4713,12 @@ export class PanelProvider implements vscode.Disposable {
     }
   }
 
-  // The directories the last walk read. Claude project directories, rollout date directories and both roots list
-  // sessions. A `subagents` directory holds one session's child transcripts.
+  // Source roots, Claude project directories, and rollout date directories list sessions.
+  // A `subagents` directory holds one session's child transcripts.
   private pollDirectories(): PollDirectories | null {
     const enumerations = this.sourceEnumerations;
     if (!enumerations) return null;
-    const listing: string[] = [];
+    const listing: string[] = this.agyScan ? [this.agyScan.brain] : [];
     const children: string[] = [];
     for (const enumeration of [enumerations.claude, enumerations.codex]) {
       if (enumeration.root) listing.push(enumeration.root);
@@ -4492,6 +4731,7 @@ export class PanelProvider implements vscode.Disposable {
 
   // Clear held rollout stats when polling stops. The next read must obtain fresh file revisions.
   private stopPolling(): void {
+    this.agyScan?.controller?.abort();
     this.spendIntegrity?.pause();
     if (this.projectSpendTick) clearTimeout(this.projectSpendTick);
     this.projectSpendTick = null;
@@ -5076,6 +5316,9 @@ export class PanelProvider implements vscode.Disposable {
       Date.now,
       (decision) => this.loadingLine.scopeDecision(decision),
       () => {
+        this.agyScopeEpoch++;
+        this.clearCompressedRepairEvidence();
+        if (this.agyScan) this.clearAgyDiscovery();
         this.refreshFrom('checkouts', true, true, null, false, true);
       },
     );
@@ -5083,6 +5326,9 @@ export class PanelProvider implements vscode.Disposable {
 
   // Runs on first scope readiness and whenever the repository scope roots change.
   private repositoryScopeChanged(): void {
+    this.agyScopeEpoch++;
+    this.clearCompressedRepairEvidence();
+    if (this.agyScan) this.clearAgyDiscovery();
     for (const host of this.hosts) this.performanceCounters?.abandonSelection?.(host, 'scope-changed');
     this.initialNamesChanged();
     // A catalog listed under the previous roots cannot render the current scope.
@@ -5129,6 +5375,9 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   private workspaceFoldersChanged(): void {
+    this.agyScopeEpoch++;
+    this.clearCompressedRepairEvidence();
+    if (this.agyScan) this.clearAgyDiscovery();
     for (const host of this.hosts) this.performanceCounters?.abandonSelection?.(host, 'workspace-changed');
     this.cancelProjectSpendHydration();
     this.projectSpendHydrationReady = false;
@@ -5542,18 +5791,145 @@ export class PanelProvider implements vscode.Disposable {
     void this.loadCompressedFacts(stores);
   }
 
+  private noteCompressedOpeningObservation(
+    entry: CompressedEntrySeed,
+    notice: CompressedByteObservation,
+    observed?: CompressedOpening,
+    check?: CompressedOpeningCheck,
+  ): 'stale' | 'changed' | undefined {
+    if (check && !check.revision) {
+      const identity = compressedEntryIdentity(entry);
+      const key = JSON.stringify([
+        entry.size,
+        entry.mtimeMs,
+        identity && String(identity.dev),
+        identity && String(identity.ino),
+      ]);
+      const notices = (check.notices ??= new Map());
+      const ranked = [...(notices.get(key) ?? []), { entry, observation: notice }].sort((a, b) =>
+        compareCompressedObservations(b.observation, a.observation),
+      );
+      const different = ranked.find((candidate) => candidate.observation.hash !== ranked[0].observation.hash);
+      notices.set(key, different ? [different, ranked[0]] : [ranked[0]]);
+    } else if (check?.revision && compressedFactsMatchSource(entry, check.revision)) {
+      const before = check.observation;
+      if (!before || compareCompressedObservations(notice, before) > 0) {
+        if (before?.hash !== notice.hash) check.changed = true;
+        check.observation = notice;
+      }
+    }
+    if (!observed || !compressedFactsMatchSource(entry, observed.source)) return undefined;
+    const before = observed.observation;
+    const order = before ? compareCompressedObservations(notice, before) : 1;
+    if (order <= 0) return before?.hash !== notice.hash ? 'stale' : undefined;
+    observed.observation = notice;
+    if (before?.hash === notice.hash) return undefined;
+    observed.pending = true;
+    this.compressedRowsHeld?.delete(entry.file);
+    this.noteChangedSession(entry.file);
+    this.compressedSourcesOwed = true;
+    this.compressedSpendPostOwed = true;
+    this.compressedFactsChanged();
+    return 'changed';
+  }
+
   // True when an entry changed the facts. A backfill batch moves the project spend at the next poll.
-  private applyCompressedEntries(entries: readonly CompressedFactEntry[], afterPoll = false): boolean {
+  private applyCompressedEntries(
+    entries: readonly CompressedFactEntry[],
+    afterPoll = false,
+    contested = false,
+  ): boolean {
     let changed = false;
-    for (const entry of entries) {
+    for (const incoming of entries) {
+      const entry = quarantineCompressedSpend(incoming);
       const held = this.compressedFacts.get(entry.file);
-      const next = withKeptUndercount(held, entry);
-      if (held && compressedEntrySame(held, next)) continue;
+      const physical = this.compressedWalk?.physical;
+      const absent = physical && sessionPresence(physical, physical, { file: entry.file }) === 'absent';
+      const key =
+        this.qualifiedCompressedOpenings?.size || this.compressedOpeningChecks?.size || this.compressedPlacements?.size
+          ? normalizeFsPath(entry.file)
+          : undefined;
+      const observed = key === undefined ? undefined : this.qualifiedCompressedOpenings?.get(key);
+      const check = key === undefined ? undefined : this.compressedOpeningChecks?.get(key);
+      const placed = key !== undefined && this.compressedPlacements?.has(key);
+      const allowed = this.compressedPlacementAllows(entry);
+      const heldAllowed = held && this.compressedPlacementAllows(held);
+      let stat: ReturnType<typeof readRolloutStat> | undefined;
+      // Keep the workspace store's ranked facts while physical placement withholds their projection.
+      if (placed && !allowed && held) {
+        stat = readRolloutStat(entry.file);
+        if (compareCompressedEntries(entry, held, stat) <= 0) continue;
+      }
+      const notice = (observed || check) && (allowed || heldAllowed) && compressedByteObservation(entry);
+      const observation = notice && this.noteCompressedOpeningObservation(entry, notice, observed, check);
+      if (observation === 'stale') continue;
+      if (observation === 'changed') {
+        stat ??= readRolloutStat(entry.file);
+        contested = true;
+      }
+      // An unresolved opening keeps its reservation while the selected facts wait for the physical read.
+      if (observed?.pending && !placed && (!notice || notice.hash !== observed.observation?.hash)) {
+        stat ??= readRolloutStat(entry.file);
+        if (
+          !notice ||
+          !stat ||
+          sameCompressedRevision(observed.source, stat) ||
+          !compressedFactsMatchSource(entry, stat)
+        )
+          continue;
+      }
+      const previous = allowed && !heldAllowed ? undefined : held;
+      const reconciled = previous && reconcileCompressedEntries(previous, entry);
+      const next = withKeptUndercount(previous, reconciled ?? entry);
+      if (held && compressedEntrySame(held, next)) {
+        if (entry.storeRecord && compareCompressedEntries(entry, held, null) > 0) held.storeRecord = entry.storeRecord;
+        if (next.spendWitness) held.spendWitness = next.spendWitness;
+        continue;
+      }
+      stat ??= absent || held || observed ? readRolloutStat(entry.file) : null;
+      if (absent && !compressedEntryCurrent(next, stat)) continue;
+      if (observed && !observed.pending && !placed && sameCompressedRevision(observed.source, stat)) {
+        if (
+          entry.threadId !== observed.source.sessionId ||
+          ((!entry.unreadable || entry.opening) && entry.opening?.cwd !== observed.source.cwd) ||
+          compressedEntryConflicts(entry, observed.source) ||
+          entry.size !== observed.source.size ||
+          entry.mtimeMs !== observed.source.mtimeMs
+        )
+          continue;
+      }
+      if (
+        previous &&
+        compressedEntryCurrent(previous, stat) &&
+        (!compressedEntryCurrent(next, stat) || (!previous.spendNeedsRepair && next.spendNeedsRepair))
+      )
+        continue;
       this.compressedFacts.set(entry.file, next);
+      if (this.compressedRepairs?.size || next.spendNeedsRepair)
+        this.reconcileCompressedRepair(entry.file, this.qualifiedCompressedOpenings?.get(normalizeFsPath(entry.file)));
+      const opening = next.opening;
+      contested ||= this.compressedContestsAgy(next.threadId) || this.compressedContestsAgy(opening?.sessionId);
+      if (
+        opening?.sessionId &&
+        opening.cwd &&
+        !this.compressedPlacements?.has(normalizeFsPath(next.file)) &&
+        isHiddenThread(opening) &&
+        next.size !== undefined &&
+        next.mtimeMs !== undefined
+      ) {
+        this.noteHiddenCompressedOpening({
+          file: next.file,
+          sessionId: opening.sessionId,
+          cwd: opening.cwd,
+          size: next.size,
+          mtimeMs: next.mtimeMs,
+        });
+      }
       (this.compressedRowsDirty ??= new Set()).add(entry.file);
       changed = true;
     }
     if (changed) this.compressedFactsChanged(afterPoll);
+    if (contested) this.refreshFrom('agy-discovery');
     return changed;
   }
 
@@ -5561,9 +5937,223 @@ export class PanelProvider implements vscode.Disposable {
   // `applyCompressedRows`.
   private applyCompressedBatch(batch: import('./compressedbackfill').CompressedBackfillBatch): void {
     if (batch.backfillMs) this.performanceCounters?.recordWork('backfillMs', batch.backfillMs);
-    for (const entry of batch.entries)
-      if (entry.skippedRecords) this.nameCompressedSkips(entry.file, entry.skippedRecords);
-    if (this.applyCompressedEntries(batch.entries, true)) this.offerCompressedRows();
+    const memberships = batch.memberships && new Map(batch.memberships);
+    const current = (file: string, membership: number | undefined) =>
+      this.compressedMemberships?.get(file) === membership;
+    let placed = false;
+    let contested = false;
+    const currentScope =
+      batch.repairScope === this.agyScopeEpoch &&
+      (!batch.repairStores || sameCompressedStores(batch.repairStores, this.compressedStorePaths() ?? undefined));
+    if (currentScope) {
+      for (const placement of batch.placements ?? []) {
+        if (!current(placement.file, memberships?.get(placement.file))) continue;
+        const accepted = this.noteCompressedPlacement(placement);
+        if (accepted === undefined) continue;
+        placed = true;
+        contested ||= accepted;
+      }
+    }
+    if (currentScope && batch.repairStores && batch.repairScope !== undefined) {
+      const confirmed: import('./compressedrollouts').CompressedMembershipAcknowledgment[] = [];
+      for (const check of batch.membershipChecks ?? []) {
+        const { file } = check;
+        const membership = memberships?.get(file);
+        if (membership === undefined || !current(file, membership)) continue;
+        if (!this.compressedMembershipChecks?.has(file)) {
+          confirmed.push({ ...check, membership });
+          continue;
+        }
+        const placement = this.compressedPlacements?.get(normalizeFsPath(file));
+        if (placement?.maskedScope !== undefined) continue;
+        const stat = observeRolloutStat(file);
+        if (
+          !stat?.isFile ||
+          !sameCompressedRevision(check.revision, stat) ||
+          observeRolloutStat(file.slice(0, -'.zst'.length)) !== null
+        )
+          continue;
+        if (check.outcome === 'body') {
+          const entry = batch.entries.find((entry) => entry.file === file);
+          if (!entry || !check.hash || entry.hash !== check.hash || !compressedFactsMatchSource(entry, check.revision))
+            continue;
+        }
+        this.compressedMembershipChecks.delete(file);
+        confirmed.push({ ...check, membership });
+        (this.compressedRowsDirty ??= new Set()).add(file);
+        placed = true;
+      }
+      if (confirmed.length)
+        this.progressiveWorker?.confirmCompressedMemberships?.(batch.repairStores, batch.repairScope, confirmed);
+    }
+    const entries = batch.entries.filter(
+      ({ file }) =>
+        (batch.repairScope === undefined || currentScope) &&
+        current(file, memberships?.get(file)) &&
+        !this.compressedMembershipChecks?.has(file),
+    );
+    for (const entry of entries) if (entry.skippedRecords) this.nameCompressedSkips(entry.file, entry.skippedRecords);
+    if (placed) this.compressedFactsChanged();
+    const changed = this.applyCompressedEntries(entries, true, contested);
+    if (placed || changed) this.offerCompressedRows();
+    if (
+      batch.repairScope !== this.agyScopeEpoch ||
+      !batch.repairStores ||
+      !sameCompressedStores(batch.repairStores, this.compressedStorePaths() ?? undefined)
+    )
+      return;
+    for (const evidence of batch.repairEvidence ?? []) {
+      if (!this.compressedRollouts.has(evidence.file) || !current(evidence.file, evidence.membership)) continue;
+      const key = normalizeFsPath(evidence.file);
+      const held = this.compressedRepairEvidence?.get(key);
+      if (!addsCompressedRepairEvidence(held, evidence)) continue;
+      (this.compressedRepairEvidence ??= new Map()).set(key, evidence);
+      if (this.settledCompressedRepairs?.has(key))
+        this.reconcileCompressedRepair(evidence.file, this.qualifiedCompressedOpenings?.get(key));
+    }
+    for (const receipt of batch.retiredRepairs ?? []) {
+      if (!this.compressedRollouts.has(receipt.file) || !current(receipt.file, receipt.membership)) continue;
+      const key = normalizeFsPath(receipt.file);
+      const held = this.compressedRepairs?.get(key);
+      if (!held || held.scope !== batch.repairScope || !sameCompressedRepairClaim(held.repair, receipt)) continue;
+      this.compressedRepairs!.delete(key);
+      const evidence = this.compressedRepairEvidence?.get(key);
+      if (
+        receipt.outcome !== 'released' &&
+        (!evidence ||
+          !sameCompressedRevision(receipt, evidence) ||
+          !addsCompressedRepairEvidence(receipt.evidence, evidence))
+      ) {
+        (this.settledCompressedRepairs ??= new Map()).set(key, receipt);
+        this.reconcileCompressedRepair(receipt.file, this.qualifiedCompressedOpenings?.get(key));
+      } else {
+        (this.releasedCompressedRepairs ??= new Map()).set(key, receipt.file);
+      }
+    }
+  }
+
+  private clearCompressedRepairEvidence(): void {
+    this.compressedRepairs?.clear();
+    this.settledCompressedRepairs?.clear();
+    this.compressedRepairEvidence?.clear();
+    this.releasedCompressedRepairs?.clear();
+  }
+
+  private noteCompressedPlacement(placement: CompressedPlacement): boolean | undefined {
+    const { file, revision, opening } = placement;
+    if (!this.compressedRollouts?.has(file) && !this.compressedWalk?.listed.has(file)) return undefined;
+    const key = normalizeFsPath(file);
+    const walk = this.compressedWalk;
+    const masked = walk && this.compressedPlainPresent(file, walk);
+    const stat = readRolloutStat(file);
+    if (!supportedFileIdentity(revision) || (stat && (!stat.isFile || !sameCompressedRevision(revision, stat))))
+      return undefined;
+    const previous = this.compressedPlacements?.get(key);
+    const maskedScope = masked ? this.agyScopeEpoch : undefined;
+    if (previous && previous.maskedScope === maskedScope && sameCompressedPlacement(previous.placement, placement))
+      return undefined;
+    const entry = this.compressedFacts.get(file);
+    const blockedHash = placement.hash ? undefined : (previous?.blockedHash ?? previous?.placement.hash ?? entry?.hash);
+    (this.compressedPlacements ??= new Map()).set(key, { placement, blockedHash, maskedScope });
+    const observed = this.qualifiedCompressedOpenings?.get(key);
+    const check = this.compressedOpeningChecks?.get(key);
+    if (check) check.changed = true;
+    if (observed) observed.pending = true;
+    if (masked) return undefined;
+    this.hiddenCompressedOpenings?.delete(key);
+    this.compressedRowsHeld?.delete(file);
+    (this.compressedRowsDirty ??= new Set()).add(file);
+    this.cache?.delete(file);
+    this.titles?.delete(file);
+    this.carriedNames?.delete(file);
+    this.corpus?.delete(file);
+    this.noteChangedSession(file);
+    const ids = new Set([
+      entry?.threadId,
+      observed?.source.sessionId,
+      previous?.placement.opening?.sessionId,
+      opening?.sessionId,
+    ]);
+    for (const id of ids) {
+      if (!id) continue;
+      const history = this.history?.get(id);
+      if (history?.file === file) this.dropOlderHistory(id);
+      if (this.authoritativeCatalog?.some((source) => source.sessionId === id && source.file === file)) {
+        this.guardedReads?.delete(id);
+        this.admittedReadSources?.delete(id);
+      }
+    }
+    this.compressedSourcesOwed = true;
+    this.compressedSpendPostOwed = true;
+    const contested = !!observed || !!check || [...ids].some((id) => this.compressedContestsAgy(id));
+    if (
+      !contested &&
+      stat &&
+      opening &&
+      walk &&
+      (!walk.inFolders(opening.cwd) || this.compressedPairListed(file, walk))
+    ) {
+      const source: SessionFile = {
+        agent: 'codex',
+        file,
+        sessionId: opening.sessionId,
+        cwd: opening.cwd,
+        ...revision,
+      };
+      this.replaceCompressedReservation(source, walk.inFolders, ids);
+    }
+    return contested;
+  }
+
+  private compressedPlacementAllows(entry: CompressedFactEntry): boolean {
+    if (this.compressedMembershipChecks?.has(entry.file)) return false;
+    if (!this.compressedPlacements?.size) return true;
+    const held = this.compressedPlacements.get(normalizeFsPath(entry.file));
+    if (!held) return true;
+    const { placement, blockedHash, maskedScope } = held;
+    return (
+      maskedScope === undefined &&
+      !!placement.opening &&
+      !placement.opening.hidden &&
+      entry.threadId === placement.opening.sessionId &&
+      entry.opening?.cwd === placement.opening.cwd &&
+      compressedFactsMatchSource(entry, placement.revision) &&
+      (placement.hash ? entry.hash === placement.hash : !blockedHash || entry.hash !== blockedHash)
+    );
+  }
+
+  private replaceCompressedReservation(
+    source: SessionFile,
+    inRoots: (cwd: string) => boolean,
+    former: Iterable<string | null | undefined>,
+  ): void {
+    const file = normalizeFsPath(source.file);
+    for (const id of former) {
+      if (!id) continue;
+      const key = id.toLowerCase();
+      const held = this.agyNativeReservations?.get(key);
+      if (!held) continue;
+      const remaining = held.filter((row) => row.agent !== 'codex' || normalizeFsPath(row.file) !== file);
+      if (remaining.length) this.agyNativeReservations?.set(key, remaining);
+      else this.agyNativeReservations?.delete(key);
+    }
+    if (inRoots(source.cwd!)) this.rememberAgyNativeRows([source]);
+  }
+
+  private noteHiddenCompressedOpening(opening: HiddenCompressedOpening): boolean {
+    if (!isAgySessionId(opening.sessionId)) return false;
+    const key = normalizeFsPath(opening.file);
+    const hints = (this.hiddenCompressedOpenings ??= new Map());
+    const held = hints.get(key);
+    if (
+      held?.sessionId === opening.sessionId &&
+      held.cwd === opening.cwd &&
+      held.size === opening.size &&
+      held.mtimeMs === opening.mtimeMs
+    )
+      return false;
+    hints.set(key, opening);
+    return true;
   }
 
   // The first batch applies at once. A batch that arrives within the next COMPRESSED_ROWS_APPLY_MS waits for the window to
@@ -5629,30 +6219,40 @@ export class PanelProvider implements vscode.Disposable {
       this.refreshCompressedFacts();
       return;
     }
-    const replaced = held.sessions.filter((session) => dirty.has(session.file));
     const { rows, added } = this.takeCompressedRows(dirty, this.compressedWalk);
+    const collides = agyCollisionWith(rows);
+    const replacedByBatch = (session: SessionFile) =>
+      dirty.has(session.file) ||
+      collides(session) ||
+      (!!this.qualifiedCompressedOpenings?.size &&
+        session.agent === 'codex' &&
+        dirty.has(session.file + '.zst') &&
+        !this.compressedProjectionCurrent(session));
+    const replaced = held.sessions.filter(replacedByBatch);
     this.compressedSourcesOwed ||= added;
     const activity = (session: SessionFile) => this.activityFor(session);
     const sessions = placeInSessionCatalog(
-      held.sessions.filter((session) => !dirty.has(session.file)),
+      held.sessions.filter((session) => !replacedByBatch(session)),
       rows,
       activity,
     );
     const admitted = placeInSessionCatalog(
-      accepted.filter((session) => !dirty.has(session.file)),
+      accepted.filter((session) => !replacedByBatch(session)),
       rows,
       activity,
     );
     this.compressedFirstRowRedrawOwed ||= accepted.length === 0 && rows.length > 0;
     this.catalog = { ...held, sessions };
     this.authoritativeCatalog = admitted;
+    if (this.agyScan?.cache.size) this.displaceAgyReads(admitted);
     this.noteCompressedMembership(accepted, admitted, replaced, rows, scope);
     this.noteCompressedCoverage(admitted, replaced, rows);
-    this.noteCompressedRowFacts(admitted, replaced, rows);
+    const changed = new Set([...rows, ...replaced].map((row) => row.sessionId));
+    const settled = this.settlePendingSessionRecords(changed);
+    this.noteCompressedRowFacts(admitted, replaced, rows, changed, settled);
     this.compressedFactsRefreshDue = true;
     this.noteCompressedRowsGauge(sessions);
     this.armCompressedRowsTimer();
-    const changed = new Set([...rows, ...replaced].map((row) => row.sessionId));
     const shown = new Set([this.showing, ...(this.hostSessions?.values() ?? [])].filter((id) => id !== null));
     const parents = this.sessionParentsOf();
     // The spend of a row under the open session joins the total of that session.
@@ -5661,7 +6261,12 @@ export class PanelProvider implements vscode.Disposable {
       return shown.has(id) || (parent !== undefined && shown.has(parent));
     });
     this.compressedSpendPostOwed = true;
-    if (showsChanged) this.settleCompressedSpend();
+    if (
+      showsChanged ||
+      (this.compressedPlacements?.size &&
+        replaced.some((row) => this.compressedPlacements!.has(normalizeFsPath(row.file))))
+    )
+      this.settleCompressedSpend();
     this.postRail(true, 'compressedBatch', undefined, false);
     // A row that a panel shows redraws through the selected-window path. So does the first row of an empty list when no
     // session is shown.
@@ -5761,14 +6366,26 @@ export class PanelProvider implements vscode.Disposable {
     admitted: readonly SessionFile[],
     replaced: readonly SessionFile[],
     rows: readonly SessionFile[],
+    changed: ReadonlySet<string> = new Set([...replaced, ...rows].map((source) => source.sessionId)),
+    settled: ReadonlySet<string> = new Set(),
   ): void {
     const now = Date.now();
     const wordingDay = railWordingDay(now);
-    for (const session of replaced) {
-      this.metadataStatsBySession = this.metadataStatFigures.patch(session.sessionId, null);
-      this.metadataRailCaches = this.metadataCacheFigures.patch(session.sessionId, null);
-      this.windows.delete(session.sessionId);
+    const owners = this.scopedAgyPendingOwners();
+    const reset = new Set(replaced.map((source) => source.sessionId));
+    for (const id of changed) if (this.agyPendingPresentation(id)) reset.add(id);
+    if (owners.size) rows = rows.filter((source) => this.pendingPresentationAllows(source, owners));
+    for (const id of reset) {
+      this.metadataStatsBySession = this.metadataStatFigures.patch(id, null);
+      this.metadataRailCaches = this.metadataCacheFigures.patch(id, null);
+      this.windows.delete(id);
+      this.sessionOutcomes.delete(id);
+      this.agyGlanceSources?.delete(id);
+      this.agyOutcomeSources?.delete(id);
+      this.agyMetadataSources?.delete(id);
     }
+    if (this.agyScan?.cache.size || this.agyOutcomeSources?.size)
+      this.agyOutcomeSources = this.rememberAgyProjections(this.agyOutcomeSources, rows, true);
     for (const [sessionId, starts] of this.glanceAt(rows, [])) this.windows.set(sessionId, starts);
     for (const row of rows) {
       const meta = this.metaFor(row);
@@ -5788,17 +6405,34 @@ export class PanelProvider implements vscode.Disposable {
     for (const [sessionId, outcome] of this.outcomesFor(rows)) this.sessionOutcomes.set(sessionId, outcome);
     const shown = new Set([this.showing, ...(this.hostSessions?.values() ?? [])]);
     const edges = this.sessionParentEdges(admitted).edges;
-    const listed = new Map(this.sessionRows.map((row) => [row.id, row]));
+    const listed = new Map(
+      this.sessionRows.filter((row) => row.persisted && !reset.has(row.id)).map((row) => [row.id, row]),
+    );
     for (const row of rows)
-      listed.set(row.sessionId, this.sessionRowOf(row, edges, shown.has(row.sessionId), undefined, wordingDay));
+      listed.set(row.sessionId, this.sessionRowOf(row, edges, shown.has(row.sessionId), wordingDay));
+    const synthetic = this.sessionRows.filter(
+      (row) =>
+        !row.persisted &&
+        !settled.has(row.id) &&
+        (!this.awaitingSessionRecords?.[row.id]?.replacesAgy ||
+          this.agyPendingPresentation(row.id)?.agent === row.agentKey),
+    );
+    for (const owner of owners.values())
+      if (!synthetic.some((row) => row.id === owner.sessionId)) synthetic.push(this.pendingSessionRow(owner));
+    const presentation = owners.size
+      ? admitted.filter((source) => this.pendingPresentationAllows(source, owners))
+      : admitted;
     this.sessionRows = [
-      ...this.sessionRows.filter((row) => !row.persisted),
-      ...admitted.map(
+      ...synthetic,
+      ...presentation.map(
         (source) =>
-          listed.get(source.sessionId) ??
-          this.sessionRowOf(source, edges, shown.has(source.sessionId), undefined, wordingDay),
+          listed.get(source.sessionId) ?? this.sessionRowOf(source, edges, shown.has(source.sessionId), wordingDay),
       ),
     ];
+    if (this.selectionRows && (owners.size || settled.size)) {
+      const selectedRows = new Map(this.sessionRows.filter((row) => changed.has(row.id)).map((row) => [row.id, row]));
+      this.selectionRows = [...this.selectionRows.filter((row) => !changed.has(row.id)), ...selectedRows.values()];
+    }
   }
 
   // Applies rows that waited for a refresh or selection to end. A waiting refresh merges them itself.
@@ -5829,13 +6463,133 @@ export class PanelProvider implements vscode.Disposable {
     return {
       resume: {
         consumed: cursor.consumed,
-        entries: [...this.compressedFacts.values()].map(compressedEntrySeed),
+        entries: [...this.compressedFacts.values()]
+          .filter((entry) => !this.compressedLineage?.has(entry.file))
+          .map(compressedEntrySeed),
+        ...(this.compressedLineage?.size ? { lineage: [...this.compressedLineage.values()] } : {}),
         nameOnly: [...this.compressedNameOnly].filter((file) => !this.compressedFacts.has(file)),
       },
     };
   }
 
-  private compressedLoadRequest(stores: CompressedStorePaths) {
+  private reconcileCompressedRepair(file: string, opening?: CompressedOpening): void {
+    const key = normalizeFsPath(file);
+    if (opening?.pending) return;
+    const entry = this.compressedFacts.get(file);
+    const walk = this.compressedWalk;
+    const source = opening?.source;
+    const current = source ?? (entry?.spendNeedsRepair ? observeRolloutStat(file) : null);
+    if (current === undefined) return;
+    if (
+      !walk ||
+      !current ||
+      ('isFile' in current && (!current.isFile || current.size <= 0)) ||
+      (source && (!source.cwd || !walk.inFolders(source.cwd) || opening?.hidden)) ||
+      this.compressedPlainPresent(file, walk) ||
+      (walk.physical && sessionPresence(walk.physical, walk.physical, { file }) === 'absent') ||
+      (entry &&
+        !entry.spendNeedsRepair &&
+        (entry.unreadable
+          ? entry.unreadableLaunch === this.compressedLaunch && compressedEntryCurrent(entry, current)
+          : !!source &&
+            entry.threadId === source.sessionId &&
+            entry.opening?.cwd === source.cwd &&
+            compressedFactsMatchSource(entry, current)))
+    ) {
+      this.compressedRepairs?.delete(key);
+      return;
+    }
+    const { size, mtimeMs, dev, ino } = current;
+    const placement = this.compressedPlacements?.get(key)?.placement;
+    const openingHash =
+      opening?.observation?.hash ??
+      (placement?.opening && sameCompressedRevision(placement.revision, current) ? placement.hash : undefined);
+    const membership = this.compressedMemberships?.get(file);
+    const repair: CompressedRepair = {
+      file,
+      ...(membership !== undefined && { membership }),
+      size,
+      mtimeMs,
+      dev,
+      ino,
+      ...(source ? { sessionId: source.sessionId, cwd: source.cwd } : {}),
+      ...(openingHash ? { openingHash } : {}),
+      ...(opening?.qualification !== undefined && { qualification: opening.qualification }),
+    };
+    this.releasedCompressedRepairs?.delete(key);
+    const settled = this.settledCompressedRepairs?.get(key);
+    const evidence = this.compressedRepairEvidence?.get(key);
+    if (
+      settled &&
+      !addsCompressedRepairProof(settled, repair) &&
+      (!evidence ||
+        !sameCompressedRevision(repair, evidence) ||
+        !addsCompressedRepairEvidence(settled.evidence, evidence))
+    )
+      return;
+    if (settled) this.settledCompressedRepairs!.delete(key);
+    const held = this.compressedRepairs?.get(key);
+    if (held && held.scope === this.agyScopeEpoch && !addsCompressedRepairProof(held.repair, repair)) return;
+    repair.claim = this.compressedRepairSequence = (this.compressedRepairSequence ?? 0) + 1;
+    (this.compressedRepairs ??= new Map()).set(key, { repair, scope: this.agyScopeEpoch });
+  }
+
+  private compressedRepairsToSend(): CompressedRepair[] {
+    const released: [string, string][] = [];
+    for (const item of this.releasedCompressedRepairs ?? []) {
+      released.push(item);
+      if (released.length >= COMPRESSED_REPAIR_LIMIT) break;
+    }
+    for (const [key, file] of released) {
+      this.releasedCompressedRepairs!.delete(key);
+      if (!this.compressedRollouts.has(file)) continue;
+      const stat = observeRolloutStat(file);
+      const masked = this.compressedWalk && this.compressedPlainPresent(file, this.compressedWalk);
+      const plain = stat?.isFile && !masked ? observeRolloutStat(file.slice(0, -'.zst'.length)) : undefined;
+      if (stat?.isFile && stat.size > 0 && plain === null) {
+        this.reconcileCompressedRepair(file, this.qualifiedCompressedOpenings?.get(key));
+      } else this.releasedCompressedRepairs!.set(key, file);
+    }
+    const offers: [string, { repair: CompressedRepair; scope: number; worker?: number }][] = [];
+    const worker = this.progressiveWorker.currentThreadId;
+    for (const [key, held] of this.compressedRepairs ?? []) {
+      if (held.scope !== this.agyScopeEpoch || !this.compressedRollouts.has(held.repair.file)) {
+        this.compressedRepairs!.delete(key);
+        continue;
+      }
+      if (worker != null && held.worker === worker) continue;
+      offers.push([key, held]);
+      if (offers.length >= COMPRESSED_REPAIR_LIMIT) break;
+    }
+    for (const [key, held] of offers) {
+      this.compressedRepairs!.delete(key);
+      this.compressedRepairs!.set(key, held);
+    }
+    return offers.map(([, held]) => held.repair);
+  }
+
+  private compressedLoadRequest(stores: CompressedStorePaths): CompressedLoadRequest {
+    const repairs = this.compressedRepairsToSend();
+    const accepted = this.compressedPlacementScope;
+    const current =
+      accepted?.worker === this.progressiveWorker.currentThreadId &&
+      accepted?.scope === this.agyScopeEpoch &&
+      accepted?.stores.facts === stores.facts &&
+      accepted.stores.openings === stores.openings;
+    const placements = !current
+      ? [...(this.compressedPlacements?.values() ?? [])]
+          .filter(
+            ({ placement, maskedScope }) =>
+              (maskedScope === undefined || maskedScope === this.agyScopeEpoch) &&
+              this.compressedRollouts.has(placement.file),
+          )
+          .map(({ placement }) => placement)
+      : [];
+    const settlements = !current
+      ? [...(this.settledCompressedRepairs?.values() ?? [])].filter(({ file }) => this.compressedRollouts.has(file))
+      : [];
+    const list = this.compressedRolloutsToSend(stores);
+    const { compressed, compressedMemberships, compressedRevision } = list;
     return {
       kind: 'compressed-load' as const,
       stores,
@@ -5845,16 +6599,246 @@ export class PanelProvider implements vscode.Disposable {
         launch: this.compressedLaunch,
       },
       ...this.compressedResume(),
+      repairScope: this.agyScopeEpoch,
+      ...(repairs.length ? { repairs } : {}),
+      ...(placements.length ? { placements } : {}),
+      ...(settlements.length ? { settlements, settlementRevision: this.compressedRolloutsRevision } : {}),
+      ...(compressed ? { compressed, compressedMemberships, compressedRevision } : {}),
     };
   }
 
-  private noteCompressedLoad(value: import('./progressiveworker').ProgressiveValue | undefined): void {
+  private noteCompressedLoad(
+    value: import('./progressiveworker').ProgressiveValue | undefined,
+    worker?: number | null,
+    scope = this.agyScopeEpoch,
+    namesRevision?: number,
+    stores?: CompressedStorePaths,
+  ): void {
     if (value?.kind !== 'compressed-load') return;
+    if (worker !== undefined && worker !== this.progressiveWorker.currentThreadId) return;
+    // These offsets and ranks describe the workspace store even if the repository scope changed during the read.
+    const thread = worker ?? null;
+    if (value.lineage?.length) {
+      const pending = this.pendingCompressedLineage;
+      const groups =
+        pending?.worker === thread
+          ? pending.groups
+          : (this.pendingCompressedLineage = { worker: thread, groups: new Map() }).groups;
+      for (const group of value.lineage) groups.set(group.file, group);
+    }
+    if (value.done && value.consumed) {
+      const pending = this.pendingCompressedLineage;
+      if (pending?.worker === thread) {
+        const lineage = (this.compressedLineage ??= new Map());
+        for (const [file, group] of pending.groups) {
+          if (group.selected) lineage.set(file, group);
+          else lineage.delete(file);
+        }
+      }
+      this.pendingCompressedLineage = undefined;
+      this.compressedLoadCursor = { worker: thread, consumed: value.consumed };
+    }
+    if (scope !== this.agyScopeEpoch) return;
+    if (worker != null) {
+      if (stores && value.done) this.compressedPlacementScope = { worker, scope, stores };
+      if (stores && namesRevision !== undefined && value.compressedNames?.revision === namesRevision)
+        this.markCompressedRolloutsSent(value.compressedNames, worker, stores, scope);
+      for (const repair of value.acceptedRepairs ?? []) {
+        const held = this.compressedRepairs?.get(normalizeFsPath(repair.file));
+        if (held && held.scope === scope && sameCompressedRepairClaim(held.repair, repair)) held.worker = worker;
+      }
+    }
     for (const file of value.nameOnly ?? []) this.compressedNameOnly.add(file);
     if (value.heldNamesRecorded)
       this.performanceCounters?.recordWork?.('compressedNames:recorded', value.heldNamesRecorded);
-    if (value.consumed)
-      this.compressedLoadCursor = { worker: this.progressiveWorker.currentThreadId ?? null, consumed: value.consumed };
+    for (const [file, record] of value.relocated ?? []) {
+      const entry = this.compressedFacts.get(file);
+      if (entry?.storeRecord?.digest === record.digest) entry.storeRecord = record;
+    }
+    for (const [file, record] of value.spendRelocated ?? []) {
+      const entry = this.compressedFacts.get(file);
+      if (!entry) continue;
+      if (entry.spendRecord?.digest === record.digest) entry.spendRecord = record;
+      entry.spendWitness = record;
+    }
+  }
+
+  private async stageCompressedTransfer(
+    stores: CompressedStorePaths,
+    scope: number,
+    records: Iterable<CompressedTransferPart['records'][number]>,
+    generation: number,
+    signal: AbortSignal,
+    expectedThread?: number,
+  ): Promise<{ transfer: CompressedTransferReceipt; worker: number } | undefined> {
+    const id = (this.compressedTransferId = (this.compressedTransferId ?? 0) + 1);
+    const header = { kind: 'compressed-load' as const, stores, repairScope: scope };
+    const purpose = 'load';
+    const batches = compressedTransferBatches(header, id, purpose, records, generation);
+    let worker = expectedThread;
+    let part = 0;
+    let dispatched: number | null = null;
+    let complete = false;
+    try {
+      for (const batch of batches) {
+        if (signal.aborted || scope !== this.agyScopeEpoch) return undefined;
+        const running = this.progressiveWorker.run(
+          { ...header, transferPart: { id, part, purpose, records: batch } },
+          generation,
+          signal,
+          undefined,
+          worker,
+        );
+        dispatched = this.progressiveWorker.currentThreadId;
+        const result = await running;
+        if (
+          result?.value.kind !== 'compressed-load' ||
+          result.value.stagedTransfer?.id !== id ||
+          result.value.stagedTransfer.part !== part ||
+          result.workerThreadId == null ||
+          result.workerThreadId !== this.progressiveWorker.currentThreadId ||
+          (worker !== undefined && result.workerThreadId !== worker)
+        )
+          return undefined;
+        worker = result.workerThreadId;
+        part++;
+      }
+      if (worker === undefined || signal.aborted || scope !== this.agyScopeEpoch) return undefined;
+      complete = true;
+      return { transfer: { id, part }, worker };
+    } finally {
+      if (!complete && dispatched != null)
+        this.progressiveWorker.discardCompressedTransfer(dispatched, { stores, scope, purpose, id });
+    }
+  }
+
+  private async runCompressedLoad(
+    stores: CompressedStorePaths,
+    take: (value: import('./progressiveworker').ProgressiveValue | undefined) => void,
+  ): Promise<boolean> {
+    const scope = this.agyScopeEpoch;
+    const generation = this.refreshGeneration;
+    const signal = new AbortController().signal;
+    const request = this.compressedLoadRequest(stores);
+    let final = request;
+    let expectedThread = this.progressiveWorker.currentThreadId ?? undefined;
+    if (compressedRequestBytes(request, generation) > COMPRESSED_BATCH_BYTES) {
+      const staged = await this.stageCompressedTransfer(
+        stores,
+        scope,
+        compressedLoadRecords(request),
+        generation,
+        signal,
+        expectedThread,
+      );
+      if (!staged) return false;
+      expectedThread = staged.worker;
+      const {
+        placements: _placements,
+        repairs: _repairs,
+        settlements: _settlements,
+        compressedMemberships: _memberships,
+        ...rest
+      } = request;
+      final = {
+        ...rest,
+        ...(request.backfill ? { backfill: { ...request.backfill, roots: [] } } : {}),
+        ...(request.resume ? { resume: { consumed: [], entries: [] } } : {}),
+        ...(request.compressed ? { compressed: [] } : {}),
+        transfer: staged.transfer,
+      };
+      if (compressedRequestBytes(final, generation) > COMPRESSED_BATCH_BYTES) {
+        this.progressiveWorker.discardCompressedTransfer(staged.worker, {
+          stores,
+          scope,
+          purpose: 'load',
+          id: staged.transfer.id,
+        });
+        return false;
+      }
+    }
+    const settlementSnapshotCurrent = () =>
+      request.settlementRevision === undefined ||
+      (request.settlementRevision === this.compressedRolloutsRevision &&
+        request.settlements!.length === this.settledCompressedRepairs?.size &&
+        request.settlements!.every(
+          (entry) => this.settledCompressedRepairs?.get(normalizeFsPath(entry.file)) === entry,
+        ));
+    if (!settlementSnapshotCurrent()) {
+      if (final.transfer && expectedThread != null)
+        this.progressiveWorker.discardCompressedTransfer(expectedThread, {
+          stores,
+          scope,
+          purpose: 'load',
+          id: final.transfer.id,
+        });
+      return false;
+    }
+    let worker = this.progressiveWorker.currentThreadId;
+    const sendLoad = () =>
+      this.progressiveWorker.run(
+        final,
+        generation,
+        signal,
+        (progress) => {
+          if (worker !== this.progressiveWorker.currentThreadId) return;
+          take(progress.value);
+          if (progress.value.kind === 'compressed-load' && progress.value.lineage)
+            this.noteCompressedLoad(progress.value, worker, scope);
+        },
+        expectedThread,
+      );
+    const running = sendLoad();
+    worker = this.progressiveWorker.currentThreadId;
+    let result = await running;
+    if (
+      !result &&
+      final.transfer &&
+      expectedThread === worker &&
+      worker != null &&
+      worker === this.progressiveWorker.currentThreadId &&
+      scope === this.agyScopeEpoch &&
+      settlementSnapshotCurrent()
+    )
+      result = await sendLoad();
+    if (worker !== this.progressiveWorker.currentThreadId) return false;
+    if (final.transfer && worker != null)
+      this.progressiveWorker.discardCompressedTransfer(worker, {
+        stores,
+        scope,
+        purpose: 'load',
+        id: final.transfer.id,
+      });
+    const value = result?.value;
+    const installed =
+      request.settlementRevision === undefined ||
+      (settlementSnapshotCurrent() &&
+        value?.kind === 'compressed-load' &&
+        value.settlementRevision === request.settlementRevision);
+    take(value);
+    this.noteCompressedLoad(value, worker, scope, request.compressedRevision, installed ? stores : undefined);
+    return value?.kind === 'compressed-load' && value.done && installed;
+  }
+
+  private applyCompressedLoadEntries(
+    value: import('./progressiveworker').ProgressiveValue | undefined,
+    scope: number,
+    stores: CompressedStorePaths,
+  ): boolean {
+    if (
+      value?.kind !== 'compressed-load' ||
+      scope !== this.agyScopeEpoch ||
+      !sameCompressedStores(stores, this.compressedStorePaths() ?? undefined)
+    )
+      return false;
+    const memberships = value.memberships && new Map(value.memberships);
+    return this.applyCompressedEntries(
+      value.entries.filter(
+        ({ file }) =>
+          this.compressedMemberships?.get(file) === memberships?.get(file) &&
+          !this.compressedMembershipChecks?.has(file),
+      ),
+    );
   }
 
   private compressedFactsChanged(afterPoll = false): void {
@@ -5871,20 +6855,13 @@ export class PanelProvider implements vscode.Disposable {
     const started = performance.now();
     this.noteCompressedDecoderMissing();
     let applied = false;
+    const scope = this.agyScopeEpoch;
     const take = (value: import('./progressiveworker').ProgressiveValue | undefined) => {
-      if (value?.kind === 'compressed-load' && this.applyCompressedEntries(value.entries)) applied = true;
+      if (this.applyCompressedLoadEntries(value, scope, stores)) applied = true;
     };
     let cutOff = false;
     try {
-      const result = await this.progressiveWorker.run(
-        this.compressedLoadRequest(stores),
-        this.refreshGeneration,
-        new AbortController().signal,
-        (progress) => take(progress.value),
-      );
-      cutOff = !result;
-      take(result?.value);
-      this.noteCompressedLoad(result?.value);
+      cutOff = !(await this.runCompressedLoad(stores, take));
     } catch {
       // A failed load leaves the rows of this activation without stored facts.
     }
@@ -5923,21 +6900,16 @@ export class PanelProvider implements vscode.Disposable {
     }
     if (this.anyVisible()) {
       let applied = false;
+      const scope = this.agyScopeEpoch;
       const take = (value: import('./progressiveworker').ProgressiveValue | undefined) => {
-        if (value?.kind === 'compressed-load' && this.applyCompressedEntries(value.entries)) applied = true;
+        if (this.applyCompressedLoadEntries(value, scope, stores)) applied = true;
       };
       try {
-        const result = await this.progressiveWorker.run(
-          this.compressedLoadRequest(stores),
-          this.refreshGeneration,
-          new AbortController().signal,
-          (progress) => take(progress.value),
-        );
-        take(result?.value);
-        this.noteCompressedLoad(result?.value);
+        await this.runCompressedLoad(stores, take);
       } catch {
         // A later poll reads the same bytes again.
       }
+      this.resumeCompressedAdoptions();
       if (applied) this.refreshCompressedFacts();
     }
     this.armCompressedFollow();
@@ -5968,7 +6940,7 @@ export class PanelProvider implements vscode.Disposable {
   private beginCompressedAdoption(plain: string, twin: string, row: SessionFile | null): void {
     const held = this.adoptionsUnsettled.get(plain);
     if (held?.running) return;
-    this.adoptionsUnsettled.set(plain, { twin, row: row ?? held?.row ?? null, running: true });
+    this.adoptionsUnsettled.set(plain, { ...held, twin, row: row ?? held?.row ?? null, running: true });
     this.derivedCacheCheckpointState.markChanged(true);
     void this.adoptCompressedTwin(plain, twin);
   }
@@ -5992,46 +6964,97 @@ export class PanelProvider implements vscode.Disposable {
     // A current adopted entry already holds these facts. Another adoption can only fail it.
     const stored = this.compressedFacts.get(twin);
     const twinStat = readRolloutStat(twin);
-    if (stored?.adopted && twinStat && stored.size === twinStat.size && stored.mtimeMs === twinStat.mtimeMs) {
+    if (
+      !held.pending &&
+      stored?.adopted &&
+      compressedEntryCurrent(stored, twinStat) &&
+      compressedEntryIdentity(stored)
+    ) {
       this.adoptionsUnsettled.delete(plain);
       this.derivedCacheCheckpointState.markChanged(true);
       this.compressedFactsRefreshDue = true;
       this.refreshFrom('compressed-facts', true);
       return;
     }
-    const title = this.titles.get(plain);
+    const opening = this.codexMetas.peek(plain);
+    const revision = held.row ?? opening?.fileIdentity;
+    const plainIdentity = revision && supportedFileIdentity(revision) ? `${revision.dev}:${revision.ino}` : undefined;
+    const currentTitle = this.titles.get(plain);
+    const titleIdentity = currentTitle?.sourceIdentity;
+    const title =
+      !plainIdentity || !titleIdentity || `${titleIdentity.dev}:${titleIdentity.ino}` === plainIdentity
+        ? currentTitle
+        : undefined;
     // The plain file can be gone, so the twin's directory supplies the physical path of the ledger's key.
     const plainKey = compressedPairKey(twin);
     const spend = [...this.projectSpendVisibleFiles, ...this.projectSpendFiles].find(
-      (record) => normalizeSpendFile(record.file) === plainKey && record.complete !== false,
+      (record) =>
+        normalizeSpendFile(record.file) === plainKey &&
+        record.complete !== false &&
+        (!plainIdentity || !record.sourceIdentity || record.sourceIdentity === plainIdentity),
     );
-    const result = await this.progressiveWorker
+    const worker = this.progressiveWorker;
+    const scope = this.agyScopeEpoch;
+    const membership = this.compressedMemberships?.get(twin);
+    let thread: number | null | undefined;
+    const active = () =>
+      !this.disposed &&
+      scope === this.agyScopeEpoch &&
+      membership === this.compressedMemberships?.get(twin) &&
+      this.adoptionsUnsettled.get(plain) === held &&
+      worker === this.progressiveWorker &&
+      (thread === undefined || thread === worker.currentThreadId);
+    const notePending = (entry: CompressedEntrySeed) => {
+      if (!active() || entry.file !== twin || !entry.adopted || !entry.storeRecord) return;
+      const notice = compressedByteObservation(entry);
+      if (!notice) return;
+      const before = held.pending && compressedByteObservation(held.pending);
+      if (before && compareCompressedObservations(notice, before) <= 0) return;
+      held.pending = compressedEntrySeed(entry);
+      const key = normalizeFsPath(twin);
+      const opening = this.qualifiedCompressedOpenings?.get(key);
+      const check = this.compressedOpeningChecks?.get(key);
+      if (this.noteCompressedOpeningObservation(entry, notice, opening, check) === 'changed')
+        this.refreshFrom('agy-discovery');
+    };
+    const running = worker
       .run(
         {
           kind: 'compressed-adopt',
+          ...(held.pending ? { pending: held.pending } : {}),
+          ...(membership !== undefined && { membership }),
           adoption: {
             twin,
             plain,
             plainMtimeMs: held.row?.mtimeMs ?? spend?.mtimeMs ?? title?.mtimeMs ?? -1,
             title,
-            opening: this.codexMetas.peek(plain),
+            opening,
             spend,
           },
           stores,
         },
         this.refreshGeneration,
         new AbortController().signal,
+        ({ value }) => {
+          if (value.kind === 'compressed-adopt' && value.pending) notePending(value.entry);
+        },
       )
       .catch(() => null);
-    const value = result?.value;
+    thread = worker.currentThreadId;
+    const value = (await running)?.value;
+    if (!active()) {
+      held.running = false;
+      return;
+    }
     if (value?.kind === 'compressed-adopt' && value.writeBytes)
       this.performanceCounters?.recordWork('compressedStoreWriteBytes', value.writeBytes);
     // An adoption settles only with its entry on disk. Until then the plain path stays retained and a later walk retries.
     if (value?.kind !== 'compressed-adopt' || !value.durable) {
+      if (value?.kind === 'compressed-adopt' && value.pending) notePending(value.entry);
       held.running = false;
       return;
     }
-    this.applyCompressedEntries([value.entry]);
+    if (!this.compressedMembershipChecks?.has(twin)) this.applyCompressedEntries([value.entry]);
     if (!value.adopted) {
       this.titles.delete(plain);
       this.noteChangedSession(plain);
@@ -6049,45 +7072,96 @@ export class PanelProvider implements vscode.Disposable {
   private compressedRowsOf(
     listing: ReturnType<typeof codexSessionFiles>,
     inFolders: (cwd: string) => boolean,
+    context: SessionCoverageContext & { domain: 'physical' },
+    previousIndex?: SessionCoverage,
   ): SessionFile[] {
     const out: SessionFile[] = [];
     const walked = new Set(listing.walked);
     const listed = new Set(listing.enumeration.compressed ?? []);
     const complete = listing.enumeration.status === 'complete';
-    this.compressedWalk = { walked, listed, complete, inFolders };
+    const previous = this.compressedWalk;
+    const physical =
+      previousIndex ??
+      (listed.size ||
+      this.compressedFacts?.size ||
+      previous?.plainTwins?.size ||
+      this.qualifiedCompressedOpenings?.size ||
+      this.hiddenCompressedOpenings?.size
+        ? this.compressedPhysicalCoverage(listing.enumeration, context)
+        : undefined);
+    const plainTwins = physical ? new Set<string>() : undefined;
+    const walk = { walked, listed, complete, inFolders, physical, plainTwins };
+    if (physical) {
+      const pairs = new Set([
+        ...listed,
+        ...this.compressedFacts.keys(),
+        ...(previous?.physical?.scope === physical.scope && previous.physical.root === physical.root
+          ? (previous.plainTwins ?? [])
+          : []),
+      ]);
+      for (const twin of pairs) {
+        const key = normalizeFsPath(twin);
+        const plain = key.slice(0, -'.zst'.length);
+        const presence = sessionPresence(physical, physical, { file: plain });
+        if (
+          presence === 'present' ||
+          (presence === 'unknown' &&
+            previous?.physical?.scope === physical.scope &&
+            previous.physical.root === physical.root &&
+            previous.plainTwins?.has(key))
+        )
+          plainTwins!.add(key);
+      }
+    }
+    this.compressedWalk = walk;
+    for (const opening of this.qualifiedCompressedOpenings?.values() ?? [])
+      this.reconcileCompressedRepair(opening.source.file, opening);
     this.compressedRowsDirty = null;
     this.compressedRowsHeld?.clear();
     if (complete) {
       for (const row of this.catalog?.sessions ?? []) {
         if (row.agent !== 'codex' || !row.file.endsWith('.jsonl') || walked.has(row.file)) continue;
         const twin = `${row.file}.zst`;
-        if (!listed.has(twin)) continue;
+        if (!listed.has(twin) || this.compressedSupersedesPlain(twin, row, inFolders)) continue;
         // A new compression of a resumed rollout replaces the twin, so an entry of another revision adopts again.
         const entry = this.compressedFacts.get(twin);
         const stat = entry ? readRolloutStat(twin) : null;
-        if (!entry || (stat && (entry.size !== stat.size || entry.mtimeMs !== stat.mtimeMs)))
+        if (
+          !entry ||
+          (stat && (!compressedEntryCurrent(entry, stat) || (entry.adopted && !compressedEntryIdentity(entry))))
+        )
           this.beginCompressedAdoption(row.file, twin, row);
       }
       for (const [plain, held] of this.adoptionsUnsettled)
         if (!held.running) this.beginCompressedAdoption(plain, held.twin, held.row);
     }
     for (const [plain, held] of this.adoptionsUnsettled) {
-      if (!walked.has(plain) && held.row) out.push(held.row);
+      if (!walked.has(plain) && held.row && !this.compressedSupersedesPlain(held.twin, held.row, inFolders))
+        out.push(held.row);
     }
     for (const [twin, entry] of this.compressedFacts) {
       const plain = twin.replace(/\.zst$/, '');
-      if (!walked.has(plain) && complete && !listed.has(twin)) {
+      if (
+        !walked.has(plain) &&
+        !listed.has(twin) &&
+        (physical ? sessionPresence(physical, physical, { file: twin }) === 'absent' : complete)
+      ) {
         this.compressedFacts.delete(twin);
+        this.compressedRepairs?.delete(normalizeFsPath(twin));
         this.compressedFactsChanged();
         continue;
       }
+      const observed = this.qualifiedCompressedOpenings?.get(normalizeFsPath(twin));
+      if (observed?.pending) continue;
+      if (!this.compressedPlacementAllows(entry)) continue;
+      if (entry.spendNeedsRepair && !observed) this.reconcileCompressedRepair(twin);
       const opening = entry.opening;
       if (opening?.cwd && !inFolders(opening.cwd)) {
         this.compressedFacts.delete(twin);
         this.compressedFactsChanged();
         continue;
       }
-      const row = this.compressedRowOf(twin, entry, walked);
+      const row = this.compressedRowOf(twin, entry, walk);
       if (!row) continue;
       out.push(row);
       this.compressedRowsHeld?.set(twin, row);
@@ -6095,15 +7169,189 @@ export class PanelProvider implements vscode.Disposable {
     return out;
   }
 
+  private compressedSupersedesPlain(twin: string, plain: SessionFile, inFolders: (cwd: string) => boolean): boolean {
+    const key = normalizeFsPath(twin);
+    const held = this.compressedPlacements?.get(key);
+    const placement = held?.placement.opening;
+    if (
+      held?.maskedScope === undefined &&
+      placement &&
+      (!inFolders(placement.cwd) ||
+        placement.hidden ||
+        placement.sessionId !== plain.sessionId ||
+        placement.cwd !== plain.cwd)
+    )
+      return true;
+    const opening = this.qualifiedCompressedOpenings?.get(key);
+    return (
+      !!opening &&
+      (opening.pending ||
+        !opening.source.cwd ||
+        !inFolders(opening.source.cwd) ||
+        opening.hidden === true ||
+        opening.source.sessionId !== plain.sessionId ||
+        opening.source.cwd !== plain.cwd ||
+        !sameCompressedRevision(opening.source, readRolloutStat(twin)))
+    );
+  }
+
+  private compressedPhysicalCoverage(
+    enumeration: SourceEnumeration,
+    context: SessionCoverageContext & { domain: 'physical' },
+  ): SessionCoverage {
+    return indexedPhysical(
+      {
+        ...enumeration,
+        root: enumeration.root ?? codexSessionsRoot(),
+        status: this.codexListingSeeded ? 'unavailable' : enumeration.status,
+      },
+      context,
+      [...enumeration.files, ...(enumeration.compressed ?? [])],
+    );
+  }
+
+  private compressedPlainPresent(twin: string, walk: NonNullable<typeof this.compressedWalk>): boolean {
+    const plain = twin.slice(0, -'.zst'.length);
+    return walk.walked.has(plain) || walk.plainTwins?.has(normalizeFsPath(twin)) === true;
+  }
+
+  private compressedContestsAgy(id: string | null | undefined): boolean {
+    return !!id && isAgySessionId(id) && !!this.agyCatalogRow(id.toLowerCase(), this.agyCatalog?.rows);
+  }
+
+  private currentCompressedProjections(rows: SessionFile[]): SessionFile[] {
+    if (
+      !this.agyCatalog?.rows.length &&
+      !this.qualifiedCompressedOpenings?.size &&
+      !this.compressedPlacements?.size &&
+      !this.compressedMembershipChecks?.size &&
+      !this.compressedWalk?.plainTwins?.size
+    )
+      return rows;
+    return rows.filter((source) => this.compressedProjectionCurrent(source));
+  }
+
+  private compressedProjectionCurrent(source: SessionFile): boolean {
+    if (source.agent !== 'codex') return true;
+    const walk = this.compressedWalk;
+    if (!isCompressedRollout(source.file)) {
+      if (!walk || walk.walked.has(source.file)) return true;
+      if (!this.qualifiedCompressedOpenings?.size && !this.compressedPlacements?.size) return true;
+      const twin = nativeReservationTwin(source);
+      return !twin || !this.compressedSupersedesPlain(twin, source, walk.inFolders);
+    }
+    if (this.compressedMembershipChecks?.has(source.file) || (walk && this.compressedPlainPresent(source.file, walk)))
+      return false;
+    const contested = this.compressedContestsAgy(source.sessionId);
+    const observed = this.qualifiedCompressedOpenings?.get(normalizeFsPath(source.file));
+    if (observed?.pending) return false;
+    const entry = this.compressedFacts?.get(source.file);
+    if (
+      this.compressedPlacements?.has(normalizeFsPath(source.file)) &&
+      (!entry || !this.compressedPlacementAllows(entry))
+    )
+      return false;
+    if (!observed)
+      return (
+        !contested &&
+        (!entry ||
+          (entry.threadId === source.sessionId &&
+            entry.opening?.cwd === source.cwd &&
+            !compressedEntryConflicts(entry, source) &&
+            (entry.mtimeMs === undefined || entry.mtimeMs === source.mtimeMs) &&
+            (entry.size === undefined || entry.size === source.size)))
+      );
+    return (
+      !!entry &&
+      !!walk &&
+      !!source.cwd &&
+      walk.inFolders(source.cwd) &&
+      (!contested || this.compressedPairAdmitted(source.file, source.sessionId, walk)) &&
+      !observed.hidden &&
+      observed.source.sessionId === source.sessionId &&
+      observed.source.cwd === source.cwd &&
+      entry.threadId === source.sessionId &&
+      entry.opening?.cwd === source.cwd &&
+      (!observed.observation || observed.observation.hash === entry.hash) &&
+      compressedFactsMatchSource(entry, source) &&
+      sameCompressedRevision(source, observed.source)
+    );
+  }
+
+  private compressedPairListed(twin: string, walk: NonNullable<typeof this.compressedWalk>): boolean {
+    const physical = walk.physical;
+    return (
+      !!physical &&
+      sessionPresence(physical, physical, { file: twin.slice(0, -'.zst'.length) }) === 'absent' &&
+      sessionPresence(physical, physical, { file: twin }) === 'present'
+    );
+  }
+
+  private compressedPairAdmitted(
+    twin: string,
+    sessionId: string,
+    walk: NonNullable<typeof this.compressedWalk>,
+  ): boolean {
+    if (this.compressedPlainPresent(twin, walk)) return false;
+    if (this.compressedPairListed(twin, walk)) return true;
+    const physical = walk.physical;
+    if (physical && sessionPresence(physical, physical, { file: twin }) === 'absent') return false;
+    const key = normalizeFsPath(twin);
+    return (
+      this.agyNativeReservations
+        ?.get(sessionId.toLowerCase())
+        ?.some((source) => source.agent === 'codex' && normalizeFsPath(source.file) === key) === true
+    );
+  }
+
   // The row of one compressed entry, or null when the entry gives none.
-  private compressedRowOf(twin: string, entry: CompressedFactEntry, walked: ReadonlySet<string>): SessionFile | null {
+  private compressedRowOf(
+    twin: string,
+    entry: CompressedFactEntry,
+    walk: NonNullable<typeof this.compressedWalk>,
+  ): SessionFile | null {
     const plain = twin.replace(/\.zst$/, '');
     const opening = entry.opening;
-    if (entry.adoptionFailed || entry.nameOnly || walked.has(plain) || !opening?.cwd || isHiddenThread(opening))
+    if (
+      entry.adoptionFailed ||
+      entry.nameOnly ||
+      !this.compressedPlacementAllows(entry) ||
+      this.compressedPlainPresent(twin, walk) ||
+      !opening?.cwd ||
+      isHiddenThread(opening)
+    )
       return null;
     if (this.adoptionsUnsettled.has(plain)) return null;
     const stat = readRolloutStat(twin);
     if (!stat?.isFile || !entry.threadId) return null;
+    if (compressedEntryConflicts(entry, stat)) {
+      if (this.rejectedCompressedFacts && !this.rejectedCompressedFacts.has(entry)) {
+        this.rejectedCompressedFacts.add(entry);
+        this.compressedFactsChanged();
+      }
+      return null;
+    }
+    if (this.rejectedCompressedFacts?.delete(entry)) this.compressedFactsChanged();
+    const key = normalizeFsPath(twin);
+    const observed = this.qualifiedCompressedOpenings?.get(key);
+    if (observed?.pending) return null;
+    const contested = this.compressedContestsAgy(entry.threadId) || this.compressedContestsAgy(opening.sessionId);
+    if (
+      contested &&
+      (!observed ||
+        !compressedFactsMatchSource(entry, stat) ||
+        !this.compressedPairAdmitted(twin, entry.threadId, walk))
+    )
+      return null;
+    if (
+      observed &&
+      (!sameCompressedRevision(observed.source, stat) ||
+        (observed.observation && observed.observation.hash !== entry.hash) ||
+        observed.hidden ||
+        observed.source.sessionId !== entry.threadId ||
+        observed.source.cwd !== opening.cwd)
+    )
+      return null;
     return {
       agent: 'codex',
       file: twin,
@@ -6121,9 +7369,15 @@ export class PanelProvider implements vscode.Disposable {
   private withCompressedFactRows(held: SessionFile[]): SessionFile[] {
     const dirty = this.compressedRowsDirty;
     const walk = this.compressedWalk;
-    if (!dirty?.size || !walk) return held;
+    if (!dirty?.size || !walk) return this.currentCompressedProjections(held);
     const { rows, added } = this.takeCompressedRows(dirty, walk);
-    const out = [...held.filter((session) => !(isCompressedRollout(session.file) && dirty.has(session.file))), ...rows];
+    const collides = agyCollisionWith(rows);
+    const out = [
+      ...this.currentCompressedProjections(held).filter(
+        (session) => !(isCompressedRollout(session.file) && dirty.has(session.file)) && !collides(session),
+      ),
+      ...rows,
+    ];
     // A row that joins between discovery replies needs its source now, or its cost waits for the next complete reply.
     if (added && this.claudeChildrenDiscovered)
       this.updateSessionSpendSources(
@@ -6147,7 +7401,7 @@ export class PanelProvider implements vscode.Disposable {
       this.compressedRowsHeld.delete(twin);
       const entry = this.compressedFacts.get(twin);
       if (!entry || (entry.opening?.cwd && !walk.inFolders(entry.opening.cwd))) continue;
-      const row = this.compressedRowOf(twin, entry, walk.walked);
+      const row = this.compressedRowOf(twin, entry, walk);
       if (!row) continue;
       rows.push(row);
       this.compressedRowsHeld.set(twin, row);
@@ -6156,33 +7410,40 @@ export class PanelProvider implements vscode.Disposable {
       this.discoveryComplete?.revisions?.set(row.file, { ...row });
       if (!this.enumeratedAmbiguousIds?.has(row.sessionId)) this.enumeratedMembers?.add(sessionCoverageMember(row));
     }
+    if (rows.length && this.agyScan?.cache.size) this.displaceAgyReads(rows);
     return { rows, added };
   }
 
   // Each discovery reply holds only the parents it was sent, and no compressed rollout is sent. The compressed rows
   // of the last list join it. A plain row of the same rollout wins.
   private withHeldCompressedRows(sessions: SessionFile[]): SessionFile[] {
+    sessions = this.currentCompressedProjections(sessions);
     if (!this.compressedRowsHeld?.size) return sessions;
     const listed = new Set(sessions.map((session) => session.file));
-    return [
-      ...sessions,
-      ...[...this.compressedRowsHeld.values()].filter(
-        (row) => !listed.has(row.file) && !listed.has(row.file.replace(/\.zst$/, '')),
-      ),
-    ];
+    const compressed = [...this.compressedRowsHeld.values()].filter(
+      (row) =>
+        !listed.has(row.file) && !listed.has(row.file.replace(/\.zst$/, '')) && this.compressedProjectionCurrent(row),
+    );
+    const collides = agyCollisionWith([...sessions.filter((row) => row.agent !== 'agy'), ...compressed]);
+    return [...sessions.filter((row) => !collides(row)), ...compressed];
   }
 
   private compressedTitleOf(file: string): DerivedTitleEntry | undefined {
     if (!isCompressedRollout(file)) return undefined;
     const entry = this.compressedFacts?.get(file);
-    return entry?.title && compressedTitleCurrent(entry) ? entry.title : undefined;
+    return entry?.title &&
+      !this.rejectedCompressedFacts?.has(entry) &&
+      this.compressedTitleEligible(entry) &&
+      compressedTitleCurrent(entry)
+      ? entry.title
+      : undefined;
   }
 
   // A row whose stored title is out of version, or dropped for size, shows the name it carries.
   private compressedCarriedNameOf(file: string): CarriedName | undefined {
     if (!isCompressedRollout(file)) return undefined;
     const entry = this.compressedFacts?.get(file);
-    if (!entry) return undefined;
+    if (!entry || this.rejectedCompressedFacts?.has(entry) || !this.compressedTitleEligible(entry)) return undefined;
     if (entry.title && !compressedTitleCurrent(entry))
       return { label: entry.title.label, fullLabel: entry.title.fullLabel };
     return entry.carriedName;
@@ -6190,6 +7451,32 @@ export class PanelProvider implements vscode.Disposable {
 
   private titleEntryOf(file: string): DerivedTitleEntry | undefined {
     return this.titles.get(file) ?? this.compressedTitleOf(file);
+  }
+
+  private compressedTitleEligible(entry: CompressedFactEntry): boolean {
+    if (compressedEntryIdentity(entry) === null || !this.compressedPlacementAllows(entry)) return false;
+    const observed = this.qualifiedCompressedOpenings?.size
+      ? this.qualifiedCompressedOpenings.get(normalizeFsPath(entry.file))
+      : undefined;
+    return !observed || (!observed.hidden && this.compressedSpendCurrent(entry));
+  }
+
+  private compressedSpendCurrent(entry: CompressedFactEntry): boolean {
+    const observed = this.qualifiedCompressedOpenings?.get(normalizeFsPath(entry.file));
+    const walk = this.compressedWalk;
+    return (
+      !!observed &&
+      !observed.pending &&
+      !observed.hidden &&
+      (!observed.observation || observed.observation.hash === entry.hash) &&
+      !!walk &&
+      observed.source.sessionId === entry.threadId &&
+      observed.source.cwd === entry.opening?.cwd &&
+      !!observed.source.cwd &&
+      walk.inFolders(observed.source.cwd) &&
+      this.compressedPairAdmitted(entry.file, observed.source.sessionId, walk) &&
+      compressedFactsMatchSource(entry, observed.source)
+    );
   }
 
   // For a thread with a compressed entry, the shown record is the largest complete total. The ledger itself holds no
@@ -6207,7 +7494,14 @@ export class PanelProvider implements vscode.Disposable {
     )
       return held.picked;
     const candidates = [...this.compressedFacts.values()].flatMap((entry) =>
-      entry.spend
+      entry.spend &&
+      !this.rejectedCompressedFacts?.has(entry) &&
+      this.compressedPlacementAllows(entry) &&
+      compressedEntryIdentity(entry) !== null &&
+      (!(
+        this.compressedContestsAgy(entry.threadId) || this.qualifiedCompressedOpenings?.has(normalizeFsPath(entry.file))
+      ) ||
+        this.compressedSpendCurrent(entry))
         ? [
             {
               pairKey: entry.pairKey,
@@ -6390,6 +7684,18 @@ export class PanelProvider implements vscode.Disposable {
   // `acrossScopeMove` also admits a session that `admittedAcrossScopeMove` keeps through a repository scope change.
   private stateFor(session: string, acrossScopeMove = false): ComposerState | null {
     if (!this.newDrafts[session] && this.enumeratedAmbiguousIds?.has(session)) return null;
+    const pending = this.agyPendingPresentation(session);
+    if (
+      pending &&
+      this.authoritativeCatalog?.some(
+        (source) =>
+          source.sessionId === session &&
+          source.agent !== pending.agent &&
+          source.agent !== 'agy' &&
+          (!source.cwd || isInside(source.cwd, this.repositoryScopeRoots)),
+      )
+    )
+      return null;
     if (
       this.membershipCoverage &&
       !this.newDrafts[session] &&
@@ -6443,11 +7749,18 @@ export class PanelProvider implements vscode.Disposable {
     return this.membershipOf(session) === 'unknown' ? 'loading' : 'unavailable';
   }
 
-  private rowForSession(session: string): { id: string; label: string; agentKey: AgentKind } | null {
+  private rowForSession(session: string): (typeof this.sessionRows)[number] | null {
+    session = this.agyPresentationSession(session);
+    const owner = this.agyPendingPresentation(session);
+    if (owner) return this.pendingSessionRow(owner);
     const recorded = this.sessionRows.find((row) => row.id === session);
-    if (recorded) {
-      return recorded;
-    }
+    const awaiting = Object.prototype.hasOwnProperty.call(this.awaitingSessionRecords ?? {}, session)
+      ? this.awaitingSessionRecords[session]
+      : undefined;
+    if (recorded && recorded.agentKey !== 'agy' && (recorded.persisted || !awaiting?.replacesAgy)) return recorded;
+    const pending = awaiting?.cwd && isInside(awaiting.cwd, this.repositoryScopeRoots ?? []) ? awaiting : undefined;
+    if (recorded && recorded.agentKey !== 'agy') return pending ? recorded : null;
+    if (recorded && !pending?.replacesAgy) return recorded;
     const draft = Object.prototype.hasOwnProperty.call(this.newDrafts, session) ? this.newDrafts[session] : undefined;
     if (draft && isInside(draft.cwd, this.repositoryScopeRoots)) {
       return (
@@ -6461,22 +7774,82 @@ export class PanelProvider implements vscode.Disposable {
         ])[0] ?? null
       );
     }
-    const awaiting = Object.prototype.hasOwnProperty.call(this.awaitingSessionRecords, session)
-      ? this.awaitingSessionRecords[session]
-      : undefined;
-    if (!awaiting || awaiting.cwd === null || !isInside(awaiting.cwd, this.repositoryScopeRoots)) {
-      return null;
+    return pending ? this.pendingSessionRow(pending) : null;
+  }
+
+  private pendingSessionRow(record: AwaitingSessionRecord): (typeof this.sessionRows)[number] {
+    const [row] = syntheticDraftRows([
+      {
+        draftId: record.sessionId,
+        createdAt: record.createdAt,
+        agent: AGENT_NAMES[record.agent],
+        agentKey: record.agent,
+      },
+    ]);
+    if (!record.replacesAgy) return row;
+    const label = record.moved ? `Session ${record.sessionId.slice(0, 8)}` : row.label;
+    return { ...row, label, fullLabel: label, [sessionRowDetails]: { cwd: record.cwd ?? undefined } };
+  }
+
+  private settlePendingSessionRecords(ids: Iterable<string>): Set<string> {
+    const settled = new Set<string>();
+    if (this.authoritativeCatalogScope !== JSON.stringify(this.repositoryScopeRoots)) return settled;
+    for (const id of ids) {
+      const pending = this.awaitingSessionRecords?.[id];
+      if (
+        !pending ||
+        this.membershipOf(id, pending.agent) !== 'present' ||
+        !pendingResponseSessionAdmitted(pending, this.authoritativeCatalog ?? [])
+      )
+        continue;
+      delete this.awaitingSessionRecords[id];
+      settled.add(id);
+      const takeover = pending.replacesAgy && this.agyNativePresentation?.get(id.toLowerCase());
+      if (takeover && takeover.sessionId === id && takeover.agent === pending.agent) {
+        const source = this.authoritativeCatalog?.find((candidate) => candidate.sessionId === id);
+        if (source) takeover.member = sessionCoverageMember(source);
+      }
     }
-    return (
-      syntheticDraftRows([
-        {
-          draftId: awaiting.sessionId,
-          createdAt: awaiting.createdAt,
-          agent: AGENT_NAMES[awaiting.agent],
-          agentKey: awaiting.agent,
-        },
-      ])[0] ?? null
-    );
+    return settled;
+  }
+
+  private scopedAgyPendingOwners(): Map<string, AwaitingSessionRecord> {
+    const owners = new Map<string, AwaitingSessionRecord>();
+    for (const id of Object.keys(this.awaitingSessionRecords ?? {})) {
+      const pending = this.agyPendingPresentation(id);
+      if (pending) owners.set(id.toLowerCase(), pending);
+    }
+    return owners;
+  }
+
+  private pendingPresentationAllows(source: SessionFile, owners: ReadonlyMap<string, AwaitingSessionRecord>): boolean {
+    const pending = owners.get(source.sessionId.toLowerCase());
+    return !pending || (source.agent !== 'agy' && !this.agyPendingPresentation(source.sessionId));
+  }
+
+  private agyPendingPresentation(session: string): AwaitingSessionRecord | undefined {
+    const pending = this.awaitingSessionRecords?.[session];
+    return pending?.replacesAgy && pending.cwd && isInside(pending.cwd, this.repositoryScopeRoots)
+      ? pending
+      : undefined;
+  }
+
+  private agyPresentationSession(session: string): string {
+    const takeover = this.agyNativePresentation?.get(session.toLowerCase());
+    if (!takeover || takeover.displaced !== session || takeover.sessionId === session) return session;
+    const scope = JSON.stringify(this.repositoryScopeRoots);
+    if (takeover.scope !== scope || this.agyPendingPresentation(session)) return session;
+    const catalog = this.authoritativeCatalogScope === scope ? (this.authoritativeCatalog ?? []) : [];
+    const current = (source: SessionFile) =>
+      source.agent !== 'agy' && (!source.cwd || isInside(source.cwd, this.repositoryScopeRoots));
+    if (catalog.some((source) => source.sessionId === session && current(source))) return session;
+    if (this.agyPendingPresentation(takeover.sessionId)?.agent === takeover.agent) return takeover.sessionId;
+    const matches = catalog.filter((source) => source.sessionId === takeover.sessionId && current(source));
+    return matches.length === 1 &&
+      matches[0].agent === takeover.agent &&
+      takeover.member === sessionCoverageMember(matches[0])
+      ? takeover.sessionId
+      : session;
   }
 
   private panelSession(session: string, host?: PanelHost): string {
@@ -6530,10 +7903,8 @@ export class PanelProvider implements vscode.Disposable {
     });
   }
 
-  private stateForRow(
-    row: { id: string; label: string; agentKey: AgentKind },
-    webview?: vscode.Webview,
-  ): ComposerState {
+  private stateForRow(row: (typeof this.sessionRows)[number], webview?: vscode.Webview): ComposerState {
+    if (row.agentKey === 'agy') row = this.qualifiedSessionRow(row);
     const runtime = this.composerRuntime?.get(row.id) ?? null;
     const pick = sessionSettings(this.picks, row.id);
     const newDraft = this.newDrafts[row.id] ?? null;
@@ -7034,15 +8405,17 @@ export class PanelProvider implements vscode.Disposable {
           return;
         }
         const session = { ...source, ...this.revisionOf(source) };
+        const admitted = session.agent !== 'agy' || this.agyReadAdmission(session);
+        if (!admitted) return;
         const held = this.cache.get(session.file);
         if (isCompressedRollout(session.file)) this.compressedBodyFile = session.file;
         this.dropHistoryOfOtherPath(session);
-        const result = await this.progressiveWorker.run(
+        const result = await this.runTranscriptRead(
           { kind: 'window', input: this.progressiveInput(session), checkpoint: this.windowCheckpoint(session, held) },
           generation,
           controller.signal,
         );
-        if (!current()) return;
+        if (!current() || (session.agent === 'agy' && this.agyReadAdmission(session) !== admitted)) return;
         if (!result) {
           void vscode.window.showInformationMessage(handoffRefusalMessage('source', key !== null));
           return;
@@ -7074,7 +8447,11 @@ export class PanelProvider implements vscode.Disposable {
           currentRecordsBySession(value.read.turns, value.read.compactions).newestCompactions,
           new Map([[sessionId, value.read.lastReportedModel ?? null]]),
         ).get(sessionId);
-        if (runtime) this.composerRuntime.set(sessionId, runtime);
+        if (runtime) {
+          this.composerRuntime.set(sessionId, runtime);
+          if (session.agent === 'agy' || this.agyComposerSources?.size)
+            this.agyComposerSources = this.rememberAgyProjections(this.agyComposerSources, [session], true);
+        }
         if (session.agent === 'codex' || !value.recoveryPending) {
           if (launch) {
             healthOutcome = this.newSession(launch.request, owner, launch) ? 'returned' : 'rejected';
@@ -7316,6 +8693,12 @@ export class PanelProvider implements vscode.Disposable {
     const remoteDraft = this.remoteControlDrafts.get(provisional);
     if (remoteDraft) remoteDraft.session = actual;
     this.remoteControlDrafts.delete(provisional);
+    this.awaitNativeSessionRecord({
+      sessionId: actual,
+      createdAt: draft.createdAt,
+      agent: draft.profile.agent,
+      cwd: draft.cwd,
+    });
     if (this.remoteControl.has(provisional)) this.moveRemoteControl(provisional, actual);
     this.onDraftAdopted?.(provisional, actual);
     if (this.detailsMenuArm?.session === provisional) {
@@ -7334,12 +8717,6 @@ export class PanelProvider implements vscode.Disposable {
     delete this.draftCommentIds[provisional];
     // Replace the provisional ID in navigation before catalog reconciliation removes it.
     this.trail = renamePlace(this.trail, provisional, actual);
-    this.awaitingSessionRecords[actual] = {
-      sessionId: actual,
-      createdAt: draft.createdAt,
-      agent: draft.profile.agent,
-      cwd: draft.cwd,
-    };
     // Persist reader-started ownership after the temporary awaiting-record row disappears.
     if (!deferredPersistence) this.rememberStarted(actual);
     else {
@@ -7785,14 +9162,9 @@ export class PanelProvider implements vscode.Disposable {
         this.hostPreviousSessions.set(host, successor);
       }
     }
+    this.awaitNativeSessionRecord({ sessionId: successor, createdAt: Date.now(), agent, cwd, moved: true });
     for (const entry of this.queues[successor] ?? [])
       if (entry.recoveryId) this.confirmPromptOwner(entry.recoveryId, successor);
-    this.awaitingSessionRecords[successor] = {
-      sessionId: successor,
-      createdAt: Date.now(),
-      agent,
-      cwd,
-    };
     this.rememberStarted(successor);
     if (this.isAgentRunLaunch?.(source)) {
       this.startedHere.delete(successor);
@@ -9549,13 +10921,16 @@ export class PanelProvider implements vscode.Disposable {
     recoveryId?: string,
   ): void {
     const state = captured ?? this.stateFor(session, true);
-    if (!state) {
+    if (!state || state.agent === 'agy') {
       void this.post({
         type: 'restoreDraft',
         session: browserSession,
         text,
         revision,
-        notice: sendRefusal(this.sendRefusalFor(session)),
+        notice:
+          state?.agent === 'agy'
+            ? 'Antigravity sessions are read-only in Arc.'
+            : sendRefusal(this.sendRefusalFor(session)),
       });
       return;
     }
@@ -10971,7 +12346,15 @@ export class PanelProvider implements vscode.Disposable {
 
   // Build label-editor rows from provider-owned labels and catalog sessions.
   private labelEditorReply(session: string, browserSession: string = session): unknown {
-    return labelEditorReply(this.saved.labels, this.sessionRows, session, CARD_ACTIONS.labelHeading, browserSession);
+    const row = this.rowForSession(session);
+    return labelEditorReply(
+      this.saved.labels,
+      row ? [row.agentKey === 'agy' ? this.qualifiedSessionRow(row) : row] : [],
+      session,
+      CARD_ACTIONS.labelHeading,
+      browserSession,
+      row?.id,
+    );
   }
 
   // Copy one turn's comments through `emitTurnComments`. An empty result leaves the clipboard unchanged.
@@ -11177,7 +12560,7 @@ export class PanelProvider implements vscode.Disposable {
   ): { root: SessionFile | null; readerState: ExportReaderState } {
     const parents = this.verifiedParentEdges(sources);
     const identity = (source: SessionFile): ExportIdentity => ({
-      agent: source.agent,
+      agent: source.agent as ExportIdentity['agent'],
       sessionId: source.sessionId,
       ...(source.childTranscript && parents.get(source.sessionId)
         ? { parentSessionId: parents.get(source.sessionId)!.parent }
@@ -12017,6 +13400,7 @@ export class PanelProvider implements vscode.Disposable {
         const listedRows = new Set(all.map((session) => session.file));
         all = this.acceptSessionCoverage(all, catalogScope);
         this.authoritativeCatalog = all;
+        if (this.agyScan?.cache.size) this.displaceAgyReads(all);
         this.scopeSessionDirectories?.clear();
         this.authoritativeCatalogScope = catalogScope;
         // A reply over the saved openings cannot complete the list. It waits for the refresh that lists the walk of the pass.
@@ -12062,15 +13446,7 @@ export class PanelProvider implements vscode.Disposable {
         if (!this.codexListingSeeded) this.discoveryComplete = undefined;
         this.publishSessionQueryContext();
       }
-      for (const session of Object.keys(this.awaitingSessionRecords)) {
-        if (
-          this.authoritativeCatalogScope === JSON.stringify(this.repositoryScopeRoots) &&
-          this.membershipOf(session, this.awaitingSessionRecords[session].agent) === 'present' &&
-          pendingResponseSessionAdmitted(this.awaitingSessionRecords[session], this.authoritativeCatalog ?? [])
-        ) {
-          delete this.awaitingSessionRecords[session];
-        }
-      }
+      this.settlePendingSessionRecords(Object.keys(this.awaitingSessionRecords));
       const scopedDrafts = Object.values(this.newDrafts).filter((draft) =>
         isInside(draft.cwd, this.repositoryScopeRoots),
       );
@@ -12085,14 +13461,20 @@ export class PanelProvider implements vscode.Disposable {
         : null;
       if (selectedOnly)
         all = orderSessionCatalog(this.selectionSourcesOf(selectionScope, all), (session) => this.activityFor(session));
-      const scopedPendingRecords = Object.values(this.awaitingSessionRecords).filter(
-        (pending) =>
-          pending.cwd !== null &&
-          isInside(pending.cwd, this.repositoryScopeRoots) &&
-          !(selectionScope
-            ? this.selectionSources!.byId.has(pending.sessionId)
-            : all.some((source) => source.sessionId === pending.sessionId)),
-      );
+      const pendingAgyOwners = new Map<string, AwaitingSessionRecord>();
+      const scopedPendingRecords = Object.values(this.awaitingSessionRecords).filter((pending) => {
+        if (pending.cwd === null || !isInside(pending.cwd, this.repositoryScopeRoots)) return false;
+        const id = pending.sessionId.toLowerCase();
+        if (pending.replacesAgy || this.agyCatalogRow(id, this.agyCatalog?.rows)?.agent === 'agy') {
+          pendingAgyOwners.set(id, pending);
+          if (!pending.replacesAgy) this.reconcileAgySessionRows(id, pending);
+          return true;
+        }
+        const sources = selectionScope ? (this.selectionSources!.byId.get(pending.sessionId) ?? []) : all;
+        return !sources.some((source) => source.sessionId === pending.sessionId);
+      });
+      const agyRowsRevision = this.agyRowsRevision;
+      if (pendingAgyOwners.size) all = all.filter((source) => this.pendingPresentationAllows(source, pendingAgyOwners));
       this.ensureProjectSpendWorkspace();
       // Settle selection before requesting a window or building cards. The rail and payload use
       // the same selection. Newest activity selects the default session.
@@ -12146,6 +13528,8 @@ export class PanelProvider implements vscode.Disposable {
       const basisBefore = this.selectionBasis;
       const changedBefore = this.settleChangedSessions(selectionScope, all);
       const outcomes = this.outcomesFor(all);
+      if (this.agyScan?.cache.size || this.agyOutcomeSources?.size)
+        this.agyOutcomeSources = this.rememberAgyProjections(this.agyOutcomeSources, all, Boolean(selectionScope));
       if (selectionScope) {
         this.selectionOutcomes = outcomes;
         this.sessionOutcomes ??= new Map();
@@ -12201,7 +13585,10 @@ export class PanelProvider implements vscode.Disposable {
       // Newly enriched metadata can change unread answers without changing transcript revisions.
       const glanced = this.windows.size;
       const heldWindows = this.windows;
+      const heldGlanceSources = this.agyGlanceSources;
       const windows = this.glanceAt(all, sessions);
+      if (this.agyScan?.cache.size || heldGlanceSources?.size)
+        this.agyGlanceSources = this.rememberAgyProjections(heldGlanceSources, all, Boolean(selectionScope));
       if (selectionScope) {
         this.selectionWindows = windows;
         for (const source of all) {
@@ -12212,7 +13599,11 @@ export class PanelProvider implements vscode.Disposable {
       } else {
         this.windows = windows;
         for (const [session, window] of heldWindows) {
-          if (!this.windows.has(session) && this.membershipOf(session) === 'unknown') this.windows.set(session, window);
+          if (!this.windows.has(session) && this.membershipOf(session) === 'unknown') {
+            this.windows.set(session, window);
+            const source = heldGlanceSources?.get(session);
+            if (source) this.agyGlanceSources?.set(session, source);
+          }
         }
       }
       const statusFacts = [
@@ -12323,9 +13714,12 @@ export class PanelProvider implements vscode.Disposable {
           (sessionId) => index.byId.get(sessionId)?.[0],
         );
       } else this.evictCache(sessions, all);
+      if (agyRowsRevision !== this.agyRowsRevision) return;
       const newestBefore = this.newestBySession;
       this.cards = this.collect(
-        sessions.filter((session) => this.cache.has(session.file)),
+        sessions
+          .filter((session) => this.cache.has(session.file))
+          .filter((session) => session.agent !== 'agy' || this.agyReadAdmission(session, all, true)),
         now,
         liveChildren,
       );
@@ -12339,7 +13733,6 @@ export class PanelProvider implements vscode.Disposable {
       // Build the rows of the computed sessions, independent of selected transcript reads. A selection with a scope builds the
       // rows of its scope, and every other refresh builds the rows of every listed session.
       const counts = this.unreadCounts();
-      const fullLabels = new Map<string, string>();
       const wordingDay = railWordingDay(now);
       this.heldSessionRows ??= new PayloadRows();
       let sessionRows = all.map((f) =>
@@ -12347,7 +13740,6 @@ export class PanelProvider implements vscode.Disposable {
           f,
           parentEdges.edges,
           sessions.some((s) => s.sessionId === f.sessionId),
-          fullLabels,
           wordingDay,
         ),
       );
@@ -12370,16 +13762,8 @@ export class PanelProvider implements vscode.Disposable {
         ...scopedPendingRecords.map((pending) =>
           this.heldSessionRows!.read(
             pending.sessionId,
-            [false, pending.createdAt, pending.agent, wordingDay],
-            () =>
-              syntheticDraftRows([
-                {
-                  draftId: pending.sessionId,
-                  createdAt: pending.createdAt,
-                  agent: AGENT_NAMES[pending.agent],
-                  agentKey: pending.agent,
-                },
-              ])[0],
+            [false, pending.createdAt, pending.agent, wordingDay, pending.replacesAgy, pending.cwd],
+            () => this.pendingSessionRow(pending),
           ),
         ),
         ...sessionRows,
@@ -12401,6 +13785,8 @@ export class PanelProvider implements vscode.Disposable {
         this.drainInitialCatalogRefresh();
         this.drainPendingQueues();
       }
+      if (this.agyScan?.cache.size || this.agyMetadataSources?.size)
+        this.agyMetadataSources = this.rememberAgyProjections(this.agyMetadataSources, all, Boolean(selectionScope));
       const metadata = all.map((session) => [session.sessionId, this.metaFor(session)] as const);
       if (selectionScope) {
         // The shared figures keep their identity, and the session list keys compare each entry.
@@ -12492,51 +13878,22 @@ export class PanelProvider implements vscode.Disposable {
       for (const host of this.hosts) {
         const hostSession = this.hostSessions?.get(host) ?? this.showing;
         const hostPreviousSession = this.hostPreviousSessions?.get(host) ?? previousSelection;
-        const hostDrawn = drawnSessionCards(this.cards, hostSession);
+        const hostDrawn =
+          hostSession && this.agyPendingPresentation(hostSession) ? [] : drawnSessionCards(this.cards, hostSession);
         // Only the selected row carries its full name, parent relationship, and starting worktree.
         const hostParent = this.parentOfShown(hostSession);
-        const startWorktree = startingWorktree(
-          sessions.find((session) => session.sessionId === hostSession)?.cwd,
-          this.folders()[0],
-          this.repositoryScope?.checkoutSnapshot?.() ?? [],
-        );
         // A selection posts only the rows it changes in this panel, so it builds those rows alone.
         const changedRows = selectedOnly ? new Set([hostSession, hostPreviousSession]) : null;
         // Omit `railName` from general session rows. Session-list cards read it through the separate session-list payload.
-        let heldHostRows = this.heldHostRows.get(host);
-        if (!heldHostRows) {
-          heldHostRows = new PayloadRows();
-          this.heldHostRows.set(host, heldHostRows);
-        }
-        if (!selectionScope) heldHostRows.retain(new Set(this.sessionRows.map((row) => row.id)));
-        const hostRows = (
+        const hostRows = this.hostRowsFor(
+          host,
           changedRows
             ? (this.selectionRows ?? this.sessionRows).filter((row) => changedRows.has(row.id))
-            : this.sessionRows
-        ).map((source) => {
-          const selected = source.id === hostSession;
-          const full = selected ? (fullLabels.get(source.id) ?? source.label) : source.label;
-          return heldHostRows.read(
-            source.id,
-            [
-              source,
-              selected,
-              full,
-              selected ? JSON.stringify(hostParent) : null,
-              selected ? JSON.stringify(startWorktree) : null,
-            ],
-            () => {
-              const { railName: _railName, ...row } = source;
-              return {
-                ...row,
-                ...(full === row.label ? {} : { fullLabel: full }),
-                ...(selected && hostParent ? { parent: hostParent } : {}),
-                ...(selected && startWorktree ? { startWorktree } : {}),
-                shown: selected,
-              };
-            },
-          );
-        });
+            : this.sessionRows,
+          hostSession,
+          hostParent,
+          !selectionScope,
+        );
         const hostInput = this.railInputFor(counts, statuses, openChildren, railNow, hostSession);
         // A selection hands the payload of a session that no panel shows any more to the session it shows, so the next
         // render compares its rows with the rows that panel holds.
@@ -12561,13 +13918,17 @@ export class PanelProvider implements vscode.Disposable {
               return heldRail.read(hostInput, railPayload, wordingDay);
             })();
         const selectedSession = sessions.find((session) => session.sessionId === hostSession);
-        const loadingNewest = selectedSession ? !this.progressiveCurrent(selectedSession) : false;
+        const qualifiedSelection =
+          selectedSession?.agent === 'agy' && !this.agyReadAdmission(selectedSession, all, true)
+            ? undefined
+            : selectedSession;
+        const loadingNewest = qualifiedSelection ? !this.progressiveCurrent(qualifiedSelection) : false;
         const loadingLabel = loadingNewest
           ? (hostRows.find((row) => row.id === hostSession)?.label ?? hostSession)
           : null;
-        const selectedFailure = selectedSession && this.drawnSelectionFailure(selectedSession);
+        const selectedFailure = qualifiedSelection && this.drawnSelectionFailure(qualifiedSelection);
         if (selectedFailure) this.performanceCounters?.abandonSelection?.(host, 'read-failed');
-        else if (!selectedSession && (this.authoritativeCatalog !== null || this.newDrafts[hostSession ?? '']))
+        else if (!qualifiedSelection && (this.authoritativeCatalog !== null || this.newDrafts[hostSession ?? '']))
           this.performanceCounters?.abandonSelection?.(
             host,
             this.newDrafts[hostSession ?? ''] ? 'draft' : 'session-unavailable',
@@ -12581,30 +13942,30 @@ export class PanelProvider implements vscode.Disposable {
             : { diagnosis: { message: 'Could not read this session. Select it to try again.' }, history: null }
           : newestTurnLoading(loadingLabel, hostDrawn.length > 0);
         const olderHistory = (() => {
-          const window = selectedSession ? this.readWindows.get(selectedSession.sessionId) : undefined;
-          if (!selectedSession || !window) {
+          const window = qualifiedSelection ? this.readWindows.get(qualifiedSelection.sessionId) : undefined;
+          if (!qualifiedSelection || !window) {
             return null;
           }
           if (discoveryLoading.history) {
             return discoveryLoading.history;
           }
-          const held = this.history.get(selectedSession.sessionId);
+          const held = this.history.get(qualifiedSelection.sessionId);
           const control = olderHistoryControl({
-            sessionId: selectedSession.sessionId,
+            sessionId: qualifiedSelection.sessionId,
             possible: olderHistoryPossible({
-              size: selectedSession.size,
+              size: qualifiedSelection.size,
               readBytes: window.readBytes,
               turnLimitReached: window.turnLimitReached,
             }),
             paged: held !== undefined && held.requests > 0,
             atBeginning: held?.atBeginning ?? false,
-            busy: this.historyRequest?.sessionId === selectedSession.sessionId,
+            busy: this.historyRequest?.sessionId === qualifiedSelection.sessionId,
             failed: held?.failed ?? false,
             emptyRuns: held?.emptyRuns ?? 0,
             requests: held?.requests ?? 0,
             loadedTurns: window.loadedTurns,
           });
-          return control ? { ...control, session: selectedSession.sessionId } : null;
+          return control ? { ...control, session: qualifiedSelection.sessionId } : null;
         })();
         const diagnosis =
           discoveryLoading.diagnosis ??
@@ -12677,9 +14038,11 @@ export class PanelProvider implements vscode.Disposable {
               largestRenderBytes = Math.max(largestRenderBytes ?? 0, serializedBytes);
             }
           },
-          selectedSession ? this.cache.get(selectedSession.file)?.read : undefined,
-          Boolean(selectedSession) && (hostDrawn.length > 0 || !loadingNewest) && !selectedFailure,
+          qualifiedSelection ? this.cache.get(qualifiedSelection.file)?.read : undefined,
+          Boolean(qualifiedSelection) && (hostDrawn.length > 0 || !loadingNewest) && !selectedFailure,
           wordingDay,
+          qualifiedSelection,
+          all,
         ).then(
           (accepted) => {
             if (accepted && !controller?.signal.aborted && generation === this.refreshGeneration) {
@@ -12949,9 +14312,10 @@ export class PanelProvider implements vscode.Disposable {
   private selectionSourcesOf(scope: ReadonlySet<string> | null, admitted: readonly SessionFile[]): SessionFile[] {
     const replaced = new Map(admitted.map((source) => [source.file, source]));
     const catalog = this.authoritativeCatalog ?? [];
-    return (scope ? this.sourcesForSelection(catalog, scope) : catalog).map(
+    const sources = (scope ? this.sourcesForSelection(catalog, scope) : catalog).map(
       (source) => replaced.get(source.file) ?? source,
     );
+    return this.currentCompressedProjections(sources);
   }
 
   // A computation of every listed session takes every changed fact and sets aside the state that a selection extends, until
@@ -13283,25 +14647,149 @@ export class PanelProvider implements vscode.Disposable {
       };
   }
 
+  private qualifiedSessionRow(row: (typeof this.sessionRows)[number]): (typeof this.sessionRows)[number] {
+    const producer = row[agyRowSource]?.producer;
+    if (!producer || (!producer.revoked && this.agyReadAdmission(producer.source, undefined, true))) return row;
+    const { [agyRowSource]: _source, [sessionRowDetails]: _details, railName: _railName, ...held } = row;
+    return { ...held, label: `Session ${producer.source.sessionId.slice(0, 8)}` };
+  }
+
+  private reconcileAgySessionRows(id: string, pending?: AwaitingSessionRecord, producer?: AgyRowProducer): boolean {
+    if (pending?.cwd && isInside(pending.cwd, this.repositoryScopeRoots)) pending.replacesAgy = true;
+    else pending = undefined;
+    const record = pending;
+    const sessionRows = this.sessionRows;
+    type Row = (typeof sessionRows)[number];
+    const native = record
+      ? sessionRows.find((row) => row.id === record.sessionId && row.agentKey === record.agent && !row.persisted)
+      : sessionRows.find((row) => row.id.toLowerCase() === id && row.agentKey !== 'agy');
+    const winner =
+      native && record && native[sessionRowDetails]?.cwd !== record.cwd
+        ? { ...native, [sessionRowDetails]: { ...native[sessionRowDetails], cwd: record.cwd ?? undefined } }
+        : (native ?? (record ? this.pendingSessionRow(record) : undefined));
+    const keeps = (row: Row) => row === native || (native && row.id === native.id && row.agentKey === native.agentKey);
+    const reconcile = (rows: readonly Row[] | undefined, addWinner: boolean) => {
+      if (!rows) return undefined;
+      const hasNative = winner && rows.some(keeps);
+      let changed = false;
+      let placed = false;
+      const next = rows.flatMap((row) => {
+        if (winner && keeps(row)) {
+          changed ||= winner !== row;
+          return [winner];
+        }
+        const owns = producer && row[agyRowSource]?.producer === producer;
+        const contested =
+          winner &&
+          ((row.agentKey === 'agy' && row.id.toLowerCase() === id) || (record && row.id === record.sessionId));
+        if (!owns && !contested) return [row];
+        changed = true;
+        if (hasNative || placed) return [];
+        placed = true;
+        return [winner ?? this.qualifiedSessionRow(row)];
+      });
+      if (winner && addWinner && !hasNative && !placed) return [...next, winner];
+      return changed ? next : undefined;
+    };
+    const rows = reconcile(sessionRows, !!record);
+    const selection = reconcile(this.selectionRows, false);
+    if (rows) this.sessionRows = rows;
+    if (selection) this.selectionRows = selection;
+    const displaced =
+      producer?.source.sessionId ??
+      sessionRows.find((row) => row.agentKey === 'agy' && row.id.toLowerCase() === id)?.id;
+    if (winner && displaced && (winner.agentKey === 'claude' || winner.agentKey === 'codex')) {
+      const sources = record
+        ? []
+        : (this.authoritativeCatalog ?? []).filter((source) => source.sessionId === winner.id);
+      (this.agyNativePresentation ??= new Map()).set(id, {
+        displaced,
+        sessionId: winner.id,
+        agent: winner.agentKey,
+        scope: JSON.stringify(this.repositoryScopeRoots),
+        ...(sources.length === 1 ? { member: sessionCoverageMember(sources[0]) } : {}),
+      });
+      const selected = this.agyPresentationSession(displaced);
+      const settle = (session: string | null) => (session === displaced ? selected : session);
+      this.showing = settle(this.showing);
+      this.previousSelection = settle(this.previousSelection);
+      for (const selections of [this.hostSessions, this.hostPreviousSessions])
+        for (const [host, session] of selections ?? []) if (session === displaced) selections.set(host, selected);
+      if (displaced !== selected && this.trail) this.trail = renamePlace(this.trail, displaced, selected);
+    }
+    if (!rows && !selection) return false;
+    this.agyRowsRevision = (this.agyRowsRevision ?? 0) + 1;
+    (this.agyRetiredRows ??= new Set()).add(id);
+    return true;
+  }
+
+  private hostRowsFor(
+    host: PanelHost,
+    rows: typeof this.sessionRows,
+    selected: string | null,
+    parent: SessionParent | undefined,
+    fullList: boolean,
+  ) {
+    this.heldHostRows ??= new WeakMap();
+    let held = this.heldHostRows.get(host);
+    if (!held) this.heldHostRows.set(host, (held = new PayloadRows()));
+    if (fullList) held.retain(new Set(rows.map((row) => row.id)));
+    return rows.map((input) => {
+      const source = input[agyRowSource] ? this.qualifiedSessionRow(input) : input;
+      const shown = source.id === selected;
+      const details = source[sessionRowDetails];
+      const full = shown ? (details?.fullLabel ?? source.fullLabel ?? source.label) : source.label;
+      const worktree =
+        shown && details?.cwd
+          ? startingWorktree(details.cwd, this.folders()[0], this.repositoryScope?.checkoutSnapshot?.() ?? [])
+          : undefined;
+      return held.read(
+        source.id,
+        [source, shown, full, shown ? JSON.stringify(parent) : null, shown ? JSON.stringify(worktree) : null],
+        () => {
+          const {
+            railName: _railName,
+            fullLabel: _fullLabel,
+            [agyRowSource]: _source,
+            [sessionRowDetails]: _details,
+            ...row
+          } = source;
+          return {
+            ...row,
+            ...(full === row.label ? {} : { fullLabel: full }),
+            ...(shown && parent ? { parent } : {}),
+            ...(shown && worktree ? { startWorktree: worktree } : {}),
+            shown,
+          };
+        },
+      );
+    });
+  }
+
   // The session list row of one catalog entry.
   private sessionRowOf(
     f: SessionFile,
     edges: ReadonlyMap<string, SessionParentEdge>,
     shown: boolean,
-    fullLabels?: Map<string, string>,
     wordingDay = railWordingDay(Date.now()),
   ): (typeof this.sessionRows)[number] {
     // Use recorded activity time, with mtime only when metadata has no timestamp.
     const at = this.activityFor(f);
     const named = this.sessionLabel(f);
+    let producer: AgyRowProducer | undefined;
+    if (f.agent === 'agy' && this.agyReadAdmission(f, undefined, true)) {
+      this.agyNativePresentation?.delete(f.sessionId.toLowerCase());
+      const producers = (this.agyRowProducers ??= new Map());
+      producer = producers.get(f.file);
+      if (!producer) producers.set(f.file, (producer = { source: f, revoked: false }));
+    }
     const label = named.label;
-    fullLabels?.set(f.sessionId, named.fullLabel);
     const relative = formatRelative(at);
     const agentRun = this.agentRunFor(f, edges);
     this.heldSessionRows ??= new PayloadRows();
     return this.heldSessionRows.read(
       f.sessionId,
-      [at, label, named.fullLabel, f.agent, shown, relative, agentRun, wordingDay],
+      [at, label, named.fullLabel, f.agent, f.cwd, shown, relative, agentRun, wordingDay, producer],
       () => {
         this.noteRailInstant(f.sessionId, relativeChangeAt(at));
         // Bound session-list names by `RAIL_NAME_LIMIT`. Other session surfaces retain the short label.
@@ -13311,6 +14799,8 @@ export class PanelProvider implements vscode.Disposable {
           persisted: true,
           label,
           ...(railName === label ? {} : { railName }),
+          ...(producer ? { [agyRowSource]: { producer } } : {}),
+          ...(f.agent !== 'agy' || producer ? { [sessionRowDetails]: { cwd: f.cwd, fullLabel: named.fullLabel } } : {}),
           // Use the shared calendar formatter for session activity.
           when: formatWhen(at),
           // `agent` is the displayed name. `agentKey` identifies catalogs, prompt settings, and agent callbacks.
@@ -13995,7 +15485,12 @@ export class PanelProvider implements vscode.Disposable {
     )
       return held.picked;
     const picked = this.compressedSpendPick(
-      sessionLifetimeDisplayFiles(this.projectSpendBusy(), this.projectSpendFiles, this.projectSpendVisibleFiles),
+      sessionLifetimeDisplayFiles(
+        this.projectSpendBusy(),
+        this.projectSpendFiles,
+        this.projectSpendVisibleFiles,
+        this.projectSpendAgyComplete,
+      ),
       now,
     );
     this.lifetimeDisplayPick = {
@@ -14484,15 +15979,29 @@ export class PanelProvider implements vscode.Disposable {
     if (inputsChanged) {
       this.railRevision++;
     }
+    const needsRows = (host: PanelHost) => {
+      if (!this.readyHosts.has(host)) return false;
+      const sender = this.rowSender(host);
+      return sender.agyRowsRevision !== this.agyRowsRevision || !sender.hasSessionRows();
+    };
+    const correcting = this.agyRowsRevision > 0 && this.hosts.some(needsRows);
     this.publishSessionQueryContext();
     const day = railWordingDay(Date.now());
-    if (this.lastRailRevision === this.railRevision && this.lastRailDay === day) {
+    if (!correcting && this.lastRailRevision === this.railRevision && this.lastRailDay === day) {
       this.performanceCounters?.recordWork('railSkippedRevision');
       return;
     }
     if (this.catalog && refreshCatalogFacts) {
-      this.windows = this.glanceAt(this.catalog.sessions, []);
-      this.sessionOutcomes = this.outcomesFor(this.catalog.sessions);
+      const owners = this.scopedAgyPendingOwners();
+      const sources = owners.size
+        ? this.catalog.sessions.filter((source) => this.pendingPresentationAllows(source, owners))
+        : this.catalog.sessions;
+      this.windows = this.glanceAt(sources, []);
+      this.sessionOutcomes = this.outcomesFor(sources);
+      if (this.agyScan?.cache.size || this.agyGlanceSources?.size || this.agyOutcomeSources?.size) {
+        this.agyGlanceSources = this.rememberAgyProjections(this.agyGlanceSources, sources);
+        this.agyOutcomeSources = this.rememberAgyProjections(this.agyOutcomeSources, sources);
+      }
     }
     const counts = knownCounts ?? this.unreadCounts();
     const countsJson = JSON.stringify([...counts]);
@@ -14503,7 +16012,7 @@ export class PanelProvider implements vscode.Disposable {
     const pendingAnswers = this.lifetimeFigures.answers();
     const railAdoptions = sessionAdoptions(this.sessionAliases);
     const adoptionsJson = JSON.stringify(railAdoptions);
-    if (sameRailInputs(this.lastRailKey, key) && adoptionsJson === this.lastRailAdoptionsJson) {
+    if (!correcting && sameRailInputs(this.lastRailKey, key) && adoptionsJson === this.lastRailAdoptionsJson) {
       this.railPendingAnswers = pendingAnswers;
       this.lastRailRevision = this.railRevision;
       this.lastRailDay = day;
@@ -14538,9 +16047,14 @@ export class PanelProvider implements vscode.Disposable {
           pinnedTop: [...this.pinnedTop],
         },
       );
+      const showing = this.hostSessions?.get(host) ?? this.showing;
+      const correctRows = correcting && needsRows(host);
+      const sessions = correctRows
+        ? this.hostRowsFor(host, this.sessionRows, showing, this.parentOfShown(showing), true)
+        : undefined;
       void this.postRows(
         host,
-        message,
+        sessions ? { ...message, sessions } : message,
         (serializedBytes) => {
           if (serializedBytes !== null) {
             largestRailBytes = Math.max(largestRailBytes ?? 0, serializedBytes);
@@ -14592,6 +16106,8 @@ export class PanelProvider implements vscode.Disposable {
     selectedWindow?: SessionRead,
     selectionReady = false,
     wordingDay = railWordingDay(Date.now()),
+    selectedSource?: SessionFile,
+    selectedCatalog?: readonly SessionFile[],
   ): Thenable<boolean> {
     if (message.type !== 'render' && message.type !== 'rail' && message.type !== 'selection') {
       return this.sendToHost(host, message, measured);
@@ -14602,6 +16118,9 @@ export class PanelProvider implements vscode.Disposable {
       ? new Map(message.cards.filter((card) => 'commits' in card).map((card) => [card.key, card.commits]))
       : undefined;
     const cardPost = cards ? (sender.cardPost = (sender.cardPost ?? 0) + 1) : 0;
+    const selected = selectedSource?.agent === 'agy' ? selectedSource : undefined;
+    const admission = selected && this.agyReadAdmission(selected, selectedCatalog, true);
+    if (selected && !admission) return Promise.resolve(false);
     // An unready panel drops the post, so it prints no rows. The panel may hold other rows when it becomes ready.
     if (!this.readyHosts.has(host)) {
       sender.reset('unready');
@@ -14619,6 +16138,7 @@ export class PanelProvider implements vscode.Disposable {
       kind === 'selection' ? message : sender.encode(message as Record<string, unknown> & RowLists, globals);
     // The sender described what it encoded. Record it beside the bytes the post measured.
     const encoding = kind === 'selection' ? null : sender.lastEncoding;
+    if (kind !== 'selection' && Array.isArray(message.sessions)) sender.agyRowsRevision = this.agyRowsRevision;
     const selectionTiming = selectionReady
       ? this.performanceCounters?.selectionRender?.(host, message.showing as string | null)
       : undefined;
@@ -14639,9 +16159,15 @@ export class PanelProvider implements vscode.Disposable {
           sender.reset('unaccepted');
           if (selectionTiming) this.performanceCounters?.abandonSelection?.(host, 'post-rejected', selectionTiming.id);
         }
-        if (accepted && cards && cardPost > (sender.acceptedCardPost ?? 0)) {
+        if (
+          accepted &&
+          cards &&
+          cardPost > (sender.acceptedCardPost ?? 0) &&
+          (!selected || (admission && this.agyReadAdmission(selected, selectedCatalog, true) === admission))
+        ) {
           sender.acceptedCards = cards;
           sender.acceptedWindow = selectedWindow;
+          sender.acceptedAgySource = selected;
           sender.acceptedCardPost = cardPost;
         }
       },
@@ -14696,6 +16222,7 @@ export class PanelProvider implements vscode.Disposable {
     this.projectSpendIndexing = false;
     this.projectSpendFiles = [];
     this.projectSpendVisibleFiles = [];
+    this.projectSpendAgyComplete = undefined;
     this.invalidateProjectSpendSnapshot();
     if (this.projectSpendHydrated) {
       this.scheduleProjectSpendMidnight();
@@ -14749,8 +16276,13 @@ export class PanelProvider implements vscode.Disposable {
       this.scheduleProjectSpendHydration(this.refreshGeneration);
       return;
     }
-    const resumable = pruneSpendFilesWithResult(ledger.files);
-    const visible = pruneSpendFilesWithResult(ledger.completeFiles);
+    const { resumable, visible, displaced } = pruneSpendLedgerFiles(
+      ledger.files,
+      ledger.completeFiles,
+      Date.now(),
+      ledger.agyCompleteFiles,
+    );
+    this.projectSpendAgyComplete = displaced && new Map(displaced.files.map((record) => [record.file, record]));
     this.projectSpendFiles = resumable.files;
     this.projectSpendVisibleFiles = visible.files;
     this.spendRecordsByFile = new Map(this.projectSpendFiles.map((record, index) => [record.file, index]));
@@ -14759,7 +16291,7 @@ export class PanelProvider implements vscode.Disposable {
     if (this.watching) this.spendIntegrity?.start();
     this.projectSpendRevision++;
     this.invalidateProjectSpendSnapshot();
-    if (resumable.pruned || visible.pruned) {
+    if (resumable.pruned || visible.pruned || displaced?.pruned) {
       this.scheduleProjectSpendSave();
     }
     this.scheduleProjectSpendMidnight();
@@ -14977,7 +16509,13 @@ export class PanelProvider implements vscode.Disposable {
             const saving = this.health?.begin('ledgerSave');
             let saved = false;
             try {
-              saveSpendLedger(directory, workspace, this.projectSpendFiles, this.projectSpendVisibleFiles);
+              saveSpendLedger(
+                directory,
+                workspace,
+                this.projectSpendFiles,
+                this.projectSpendVisibleFiles,
+                this.projectSpendAgyComplete?.values(),
+              );
               saved = true;
             } finally {
               if (saving) this.health?.settle(saving, saved ? 'returned' : 'failed');
@@ -15020,6 +16558,39 @@ export class PanelProvider implements vscode.Disposable {
     }
   }
 
+  private pruneProjectSpendLedger(now: number): boolean {
+    const { resumable, visible, displaced } = pruneSpendLedgerFiles(
+      this.projectSpendFiles,
+      this.projectSpendVisibleFiles,
+      now,
+      this.projectSpendAgyComplete && [...this.projectSpendAgyComplete.values()],
+    );
+    if (resumable.pruned) {
+      this.projectSpendFiles = resumable.files;
+      this.spendRecordsByFile = new Map(resumable.files.map((record, index) => [record.file, index]));
+    }
+    const displayRemoved = visible.files.length < this.projectSpendVisibleFiles.length;
+    if (visible.pruned) this.projectSpendVisibleFiles = visible.files;
+    if (displaced?.pruned) {
+      this.projectSpendAgyComplete = displaced.files.length
+        ? new Map(displaced.files.map((record) => [record.file, record]))
+        : undefined;
+    }
+    if (resumable.pruned || visible.pruned || displaced?.pruned) {
+      this.projectSpendRevision++;
+      this.scheduleProjectSpendSave();
+    }
+    return displayRemoved;
+  }
+
+  private expireMissingAgySpend(record: SpendFileIndex, now: number): boolean {
+    const cutoff = projectSpendWindows(now)[2].start;
+    if (record.buckets.some((bucket) => bucket.localDate >= cutoff) || !this.pruneProjectSpendLedger(now)) return false;
+    this.projectSpendSnapshot = this.unknownProjectSpendSnapshot();
+    this.projectSpendTomorrow = null;
+    return true;
+  }
+
   private scheduleProjectSpendMidnight(): void {
     if (this.projectSpendMidnight) {
       clearTimeout(this.projectSpendMidnight);
@@ -15032,6 +16603,7 @@ export class PanelProvider implements vscode.Disposable {
     const next = new Date(now);
     next.setHours(0, 0, 0, 0);
     next.setDate(next.getDate() + 1);
+    const midnight = next.getTime();
     const pricingUntil = publicPricingValidUntil(now);
     if (pricingUntil < next.getTime()) next.setTime(pricingUntil);
     const cutoff = this.projectSpendHistoryCutoff(now);
@@ -15044,10 +16616,12 @@ export class PanelProvider implements vscode.Disposable {
     this.projectSpendMidnight = setTimeout(
       () => {
         this.projectSpendMidnight = null;
-        const date = projectSpendWindows(Date.now())[0].start;
-        if (this.projectSpendSnapshotDate !== date) {
+        const now = Date.now();
+        const date = projectSpendWindows(now)[0].start;
+        const displayRemoved = now >= midnight && this.pruneProjectSpendLedger(now);
+        if (displayRemoved || this.projectSpendSnapshotDate !== date) {
           this.projectSpendSnapshot =
-            this.projectSpendTomorrow?.date === date
+            !displayRemoved && this.projectSpendTomorrow?.date === date
               ? this.projectSpendTomorrow.view
               : this.unknownProjectSpendSnapshot();
           this.projectSpendSnapshotDate = date;
@@ -15056,8 +16630,8 @@ export class PanelProvider implements vscode.Disposable {
         if (this.projectSpendSnapshot) {
           this.projectSpendSnapshot = truncateProjectSpendView(
             this.projectSpendSnapshot,
-            Date.now(),
-            this.projectSpendHistoryCutoff(),
+            now,
+            this.projectSpendHistoryCutoff(now),
           );
         }
         this.invalidateProjectSpendSnapshot();
@@ -15078,8 +16652,8 @@ export class PanelProvider implements vscode.Disposable {
     this.spendSourcesByFile = new Map(sources.map((source) => [normalizeFsPath(source.file), source]));
     for (const record of this.projectSpendFiles) {
       const key = normalizeFsPath(record.file);
-      if (!this.spendSourcesByFile.has(key))
-        this.spendSourcesByFile.set(key, { file: record.file, agent: spendRecordAgent(record) });
+      const agent = spendRecordAgent(record);
+      if (!this.spendSourcesByFile.has(key)) this.spendSourcesByFile.set(key, { file: record.file, agent });
     }
     this.spendRecordsByFile = new Map(this.projectSpendFiles.map((record, index) => [record.file, index]));
     this.spendNativeChildren = new Set(
@@ -15144,7 +16718,8 @@ export class PanelProvider implements vscode.Disposable {
         // The spend reader cannot read a compressed rollout, so the check treats it as an unreadable source.
         if (isCompressedRollout(source.file)) return null;
         try {
-          const physical = await fs.promises.stat(source.file, { bigint: true });
+          const stat = source.agent === 'agy' ? fs.promises.lstat : fs.promises.stat;
+          const physical = await stat(source.file, { bigint: true });
           return physical.isFile() ? { source, stat: fileRevisionOf(physical) } : null;
         } catch (error) {
           return ['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')
@@ -15154,7 +16729,7 @@ export class PanelProvider implements vscode.Disposable {
       }),
     );
     if (!current() || this.disposed || epoch !== this.projectSpendEpoch) return;
-    const revisions = new Map<string, SpendSourceRevision | null>();
+    const revisions = new Map<string, ProjectSpendRevision | null>();
     const ready: typeof sources = [];
     for (const checked of accepted) {
       if (!checked) continue;
@@ -15163,20 +16738,30 @@ export class PanelProvider implements vscode.Disposable {
       const record = at === undefined ? undefined : this.projectSpendFiles[at];
       if (!stat && record?.missingAt !== undefined) this.spendChecks.set(record, Date.now());
       if (stat && source.agent === 'codex') this.codexStats.accept(source.file, { ...stat, isFile: true });
+      const agy = stat && source.agent === 'agy' ? this.qualifiedAgySpendRevision(source, stat) : undefined;
       if (
         stat &&
         record &&
         record.complete !== false &&
         record.missingAt === undefined &&
+        !record.agyRescanRequired &&
         record.size === stat.size &&
         record.mtimeMs === stat.mtimeMs &&
-        record.sourceIdentity === `${stat.dev}:${stat.ino}`
+        record.sourceIdentity === `${stat.dev}:${stat.ino}` &&
+        (source.agent !== 'agy' || (agy && agySpendAtAdmission(record, agy.admission)))
       ) {
         this.spendChecks.set(record, Date.now());
       }
       revisions.set(
         source.file,
-        stat ? { size: stat.size, mtimeMs: stat.mtimeMs, sourceIdentity: `${stat.dev}:${stat.ino}` } : null,
+        stat
+          ? {
+              size: stat.size,
+              mtimeMs: stat.mtimeMs,
+              sourceIdentity: `${stat.dev}:${stat.ino}`,
+              ...(source.agent === 'agy' ? { agyPhysical: stat } : {}),
+            }
+          : null,
       );
       ready.push(source);
     }
@@ -15220,17 +16805,25 @@ export class PanelProvider implements vscode.Disposable {
         this.scheduleProjectSpendIndex(new Map(), onlyFiles);
         return;
       }
-      const revisions = new Map<string, SpendSourceRevision | null>(listedRevisions);
+      const revisions = new Map<string, ProjectSpendRevision | null>(listedRevisions);
       for (let offset = 0; offset < sources.length; offset += 16) {
         await Promise.all(
           sources.slice(offset, offset + 16).map(async (source) => {
-            if (revisions.has(source.file) || (onlyFiles && !onlyFiles.has(normalizeFsPath(source.file)))) return;
+            if (onlyFiles && !onlyFiles.has(normalizeFsPath(source.file))) return;
+            const agy = source.agent === 'agy';
+            const at = agy ? this.spendRecordsByFile.get(normalizeSpendFile(source.file)) : undefined;
+            const missing = at !== undefined && this.projectSpendFiles[at]?.missingAt !== undefined;
+            if (revisions.has(source.file) && !missing) return;
             try {
-              const stat = fileRevisionOf(await fs.promises.stat(source.file, { bigint: true }));
+              const readStat = agy ? fs.promises.lstat : fs.promises.stat;
+              const physical = await readStat(source.file, { bigint: true });
+              if (agy && !physical.isFile()) return;
+              const stat = fileRevisionOf(physical);
               revisions.set(source.file, {
                 size: stat.size,
                 mtimeMs: stat.mtimeMs,
                 sourceIdentity: `${stat.dev}:${stat.ino}`,
+                ...(agy ? { agyPhysical: stat } : {}),
               });
             } catch (error) {
               if (['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? ''))
@@ -15270,8 +16863,11 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   // Every source a spend offer would read, taken from the lists the last listing wrote.
-  private projectSpendSources(): { file: string; agent: AgentKind; primary?: boolean }[] {
+  private projectSpendSources(): ProjectSpendSource[] {
     return [
+      ...(this.catalog?.sessions ?? [])
+        .filter((source) => source.agent === 'agy')
+        .map((source) => ({ file: source.file, agent: 'agy' as const, primary: true, agySource: source })),
       ...this.claudeSpendSources.map((source) => ({
         file: source.file,
         agent: 'claude' as const,
@@ -15293,10 +16889,225 @@ export class PanelProvider implements vscode.Disposable {
     this.projectSpendOffers.clear();
   }
 
+  private agyCatalogRow(
+    id: string,
+    catalog: readonly SessionFile[] | null | undefined,
+  ): SessionFile | null | undefined {
+    if (!catalog) return undefined;
+    const indexes = (this.agyReadCatalogs ??= new WeakMap());
+    let index = indexes.get(catalog);
+    if (!index) {
+      const byId = new Map<string, SessionFile | null>();
+      for (const row of catalog) {
+        if (row.agent === 'codex' && isCompressedRollout(row.file)) continue;
+        const id = row.sessionId.toLowerCase();
+        byId.set(id, byId.has(id) ? null : row);
+      }
+      indexes.set(catalog, (index = byId));
+    }
+    return index.get(id);
+  }
+
+  private agyCatalogConflict(id: string, catalog: readonly SessionFile[]): boolean {
+    const row = this.agyCatalogRow(id, catalog);
+    return row === null || (row !== undefined && row.agent !== 'agy');
+  }
+
+  private agyNativeConflict(id: string, catalog?: readonly SessionFile[] | null): boolean {
+    if (catalog && this.agyCatalogConflict(id, catalog)) return true;
+    if (this.agyNativeReservations?.has(id)) return true;
+    for (const rows of [this.claudeChildren, !this.claudeChildrenDiscovered ? this.cachedLinks?.children : undefined]) {
+      if (rows && this.agyCatalogConflict(id, rows)) return true;
+    }
+    if (!this.agyNativeReservations) {
+      // Before a walk supplies reservations, the held catalogs carry native ownership.
+      for (const rows of [this.catalog?.sessions, this.authoritativeCatalog])
+        if (rows && this.agyCatalogConflict(id, rows)) return true;
+    }
+    return (
+      [...(this.enumeratedAmbiguousIds ?? [])].some((ambiguous) => ambiguous.toLowerCase() === id) ||
+      [...Object.keys(this.awaitingSessionRecords ?? {}), ...Object.keys(this.newDrafts ?? {})].some(
+        (reserved) => reserved.toLowerCase() === id,
+      )
+    );
+  }
+
+  private rememberAgyNativeRows(rows: readonly SessionFile[]): void {
+    for (const row of rows) {
+      if (row.agent === 'agy' || !isAgySessionId(row.sessionId)) continue;
+      const reservations = (this.agyNativeReservations ??= new Map<string, SessionFile[]>());
+      const id = row.sessionId.toLowerCase();
+      const held = reservations.get(id);
+      if (!held) reservations.set(id, [row]);
+      else {
+        const file = sessionCoverageFileKey(row.agent, row.file);
+        const at = held.findIndex((source) => sessionCoverageFileKey(source.agent, source.file) === file);
+        if (at === -1) held.push(row);
+        else held[at] = row;
+      }
+    }
+  }
+
+  private displaceAgyReads(catalog: readonly SessionFile[]): void {
+    for (const { row } of this.agyScan?.cache.values() ?? []) {
+      if (!row || !this.agyNativeConflict(row.sessionId.toLowerCase(), catalog)) continue;
+      const { file, sessionId } = row;
+      const discovered = agyAdmissionOf(row)!;
+      const admission = this.agyAuthorities?.get(discovered) ?? discovered;
+      const facts = this.admittedReadSources?.get(sessionId);
+      if (
+        this.agyReadWork?.has(admission) ||
+        this.agyRowProducers?.has(file) ||
+        this.cache.has(file) ||
+        this.titles.has(file) ||
+        this.corpus.has(file) ||
+        this.history.get(sessionId)?.file === file ||
+        this.agyTimelineSources?.has(sessionId) ||
+        this.agyComposerSources?.has(sessionId) ||
+        this.agyGlanceSources?.has(sessionId) ||
+        this.agyOutcomeSources?.has(sessionId) ||
+        this.agyMetadataSources?.has(sessionId) ||
+        (facts && this.agentReadSources.admissionOf(facts) === admission)
+      ) {
+        this.changeAgyAdmission(row, null);
+      }
+    }
+  }
+
+  private awaitNativeSessionRecord(record: AwaitingSessionRecord): void {
+    this.awaitingSessionRecords[record.sessionId] = record;
+    if (!isAgySessionId(record.sessionId)) return;
+    const id = record.sessionId.toLowerCase();
+    const live = [...(this.agyScan?.cache.values() ?? [])].flatMap(({ row }) =>
+      row?.sessionId.toLowerCase() === id ? [row] : [],
+    );
+    const rendered = this.sessionRows?.some((row) => row.agentKey === 'agy' && row.id.toLowerCase() === id);
+    if ((!live.length && !rendered) || !record.cwd || !isInside(record.cwd, this.repositoryScopeRoots)) return;
+    record.replacesAgy = true;
+    if (this.reconcileAgySessionRows(id, record)) this.queueAgyRedraw();
+    for (const row of live) this.changeAgyAdmission(row, null);
+  }
+
+  private liveAgyAdmission(source: SessionFile, retained = false): AgyAdmission | undefined {
+    const scan = this.agyScan;
+    if (
+      !scan ||
+      this.disposed ||
+      scan.brain !== agyBrainRoot() ||
+      !source.agyOwnerRoot ||
+      !supportedFileIdentity(source)
+    )
+      return undefined;
+    return currentAgyAdmission(scan.cache, source, retained);
+  }
+
+  // A catalog selects the row. The live discovery admission supplies its authority.
+  private agyReadAdmission(
+    source: SessionFile,
+    catalog: readonly SessionFile[] | null | undefined = this.authoritativeCatalog,
+    retained = false,
+  ): AgyAdmission | undefined {
+    const live = this.liveAgyAdmission(source, retained);
+    if (!live) return undefined;
+    const id = source.sessionId.toLowerCase();
+    const row = this.agyCatalogRow(id, catalog);
+    return row && this.liveAgyAdmission(row, retained) === live && !this.agyNativeConflict(id, catalog)
+      ? (this.agyAuthorities?.get(live) ?? live)
+      : undefined;
+  }
+
+  private agyRowsFor(rows: readonly SessionFile[], competition?: readonly SessionFile[]): SessionFile[] {
+    return rows.filter(
+      (row) =>
+        row.agent === 'agy' &&
+        this.liveAgyAdmission(row) &&
+        !this.agyNativeConflict(row.sessionId.toLowerCase(), competition),
+    );
+  }
+
+  private runTranscriptRead(
+    request: Extract<ProgressiveRequest, { session: SessionFile } | { input: ProgressiveInput }>,
+    generation: number,
+    signal: AbortSignal,
+    catalog?: readonly SessionFile[],
+  ): Promise<ProgressiveResult | null> {
+    const session = 'input' in request ? request.input.session : request.session;
+    if (session.agent !== 'agy') {
+      if (!isCompressedRollout(session.file)) return this.progressiveWorker.run(request, generation, signal);
+      const key = normalizeFsPath(session.file);
+      const placement = this.compressedPlacements?.get(key);
+      const membership = this.compressedMemberships?.get(session.file);
+      if (
+        (placement || this.compressedMembershipChecks?.has(session.file)) &&
+        !this.compressedProjectionCurrent(session)
+      )
+        return Promise.resolve(null);
+      return this.progressiveWorker
+        .run(request, generation, signal)
+        .then((reply) =>
+          this.compressedPlacements?.get(key) === placement &&
+          this.compressedMemberships?.get(session.file) === membership &&
+          !this.compressedMembershipChecks?.has(session.file)
+            ? reply
+            : null,
+        );
+    }
+    const admission = this.agyReadAdmission(session, catalog);
+    if (!admission || signal.aborted || this.revisionOf(session).size < 0) return Promise.resolve(null);
+    const bindings = (this.agyReadWork ??= new WeakMap());
+    let work = bindings.get(admission);
+    if (!work) {
+      this.agyReadSequence = (this.agyReadSequence ?? 0) + 1;
+      work = { controller: new AbortController(), recovery: this.agyReadSequence };
+      bindings.set(admission, work);
+    }
+    const admissionSignal = AbortSignal.any([signal, work.controller.signal]);
+    return this.progressiveWorker
+      .run(
+        request.kind === 'metadata-recovery' ? { ...request, agyRecovery: work.recovery } : request,
+        generation,
+        admissionSignal,
+      )
+      .then((result) =>
+        !admissionSignal.aborted && this.agyReadAdmission(session, catalog) === admission ? result : null,
+      );
+  }
+
+  private qualifiedAgySpendRevision(
+    source: ProjectSpendSource,
+    revision?: Pick<SessionFile, 'dev' | 'ino' | 'size' | 'mtimeMs'>,
+  ): { revision: FileRevision; admission: AgyAdmission } | undefined {
+    const offered = source.agySource;
+    const scan = this.agyScan;
+    if (
+      !scan ||
+      scan.workspace !== this.projectSpendWorkspace ||
+      !this.repositoryScopeReady ||
+      !offered?.agyOwnerRoot ||
+      offered.file !== source.file ||
+      !isInside(offered.agyOwnerRoot, this.repositoryScopeRoots)
+    )
+      return undefined;
+    const admission = this.agyReadAdmission(offered, this.catalog?.sessions ?? null);
+    if (!admission) return undefined;
+    if (!revision) {
+      try {
+        const stat = fs.lstatSync(source.file, { bigint: true });
+        if (!stat.isFile()) return undefined;
+        revision = fileRevisionOf(stat);
+      } catch {
+        return undefined;
+      }
+    }
+    return sameProgressiveRevision(admission.revision, revision)
+      ? { revision: admission.revision, admission }
+      : undefined;
+  }
+
   private queueProjectSpendIndex(
-    listedRevisions: ReadonlyMap<string, SpendSourceRevision | null> = new Map(),
+    listedRevisions: ReadonlyMap<string, ProjectSpendRevision | null> = new Map(),
     onlyFiles: ReadonlySet<string> | null = null,
-    listedSources: readonly { file: string; agent: AgentKind; primary?: boolean }[] = this.projectSpendSources(),
+    listedSources: readonly ProjectSpendSource[] = this.projectSpendSources(),
     caller: 'spendOffer' | 'integrityCheck' = 'spendOffer',
   ): void {
     const workspace = this.projectSpendWorkspace;
@@ -15307,17 +17118,47 @@ export class PanelProvider implements vscode.Disposable {
     const queued = this.projectSpendQueue.length;
     const found = new Set<string>();
     this.spendRecordsByFile ??= new Map(this.projectSpendFiles.map((file, index) => [file.file, index]));
-    const cutoff = this.projectSpendHistoryCutoff();
-    const offer = (file: string, agent: AgentKind, primary?: boolean): void => {
+    const now = Date.now();
+    const cutoff = this.projectSpendHistoryCutoff(now);
+    let displayRemoved = false;
+    const offer = (source: ProjectSpendSource): void => {
+      const { file, agent, primary } = source;
       const key = normalizeSpendFile(file);
-      if (this.projectSpendQueued.has(key)) {
-        return;
-      }
+      const pending = this.projectSpendQueued.has(key);
+      if (pending && agent !== 'agy') return;
       found.add(key);
-      const at = this.spendRecordsByFile.get(key);
-      const previous = at === undefined ? undefined : this.projectSpendFiles[at];
+      let at = this.spendRecordsByFile.get(key);
+      let previous = at === undefined ? undefined : this.projectSpendFiles[at];
       // Offers reuse revisions from asynchronous integrity checks or accepted catalog reads.
-      const revision: SpendSourceRevision | null | undefined = listedRevisions.get(file);
+      const revision = listedRevisions.get(file);
+      const admitted = source.agySource;
+      const agyMissing =
+        agent === 'agy' &&
+        revision === null &&
+        (admitted !== undefined || (previous && spendRecordAgent(previous) === 'agy'));
+      if (
+        agent === 'agy' &&
+        !agyMissing &&
+        (!admitted ||
+          !revision ||
+          revision.size !== admitted.size ||
+          revision.mtimeMs !== admitted.mtimeMs ||
+          (revision.sourceIdentity !== undefined &&
+            revision.sourceIdentity !== String(admitted.dev) + ':' + admitted.ino))
+      )
+        return;
+      const returning =
+        agent === 'agy' && revision && previous?.missingAt !== undefined && spendRecordAgent(previous) === 'agy';
+      const pendingAgyAt =
+        agent === 'agy' && pending
+          ? this.projectSpendQueue.findIndex((entry) => entry.agent === 'agy' && normalizeSpendFile(entry.file) === key)
+          : -1;
+      const pendingAgy = this.projectSpendQueue[pendingAgyAt];
+      const agy =
+        agent === 'agy' && !agyMissing
+          ? this.qualifiedAgySpendRevision(source, returning ? undefined : (revision?.agyPhysical ?? admitted))
+          : undefined;
+      if (agent === 'agy' && !agyMissing && (!agy || ((returning || pending) && !revision?.agyPhysical))) return;
       const childPolicy =
         agent === 'claude' &&
         (primary === false ||
@@ -15326,34 +17167,68 @@ export class PanelProvider implements vscode.Disposable {
               .filter((source) => source.nativeParentFile !== undefined)
               .map((source) => normalizeSpendFile(source.file)),
           )).has(key));
-      let decision = projectSpendOfferDecision(previous, revision, cutoff);
-      if (decision !== 'skip' && revision?.sourceIdentity && previous?.sourceIdentity !== revision.sourceIdentity)
-        decision = 'queue';
+      const acceptedAt = returning ? Date.now() : now;
+      if (returning && previous && at !== undefined) {
+        if (this.expireMissingAgySpend(previous, acceptedAt)) displayRemoved = true;
+        at = this.spendRecordsByFile.get(key);
+        if (at !== undefined && this.projectSpendFiles[at] === previous) {
+          const { missingAt: _missingAt, ...retained } = previous;
+          this.projectSpendFiles[at] = { ...retained, agyRescanRequired: true };
+          this.projectSpendRevision++;
+          this.invalidateProjectSpendSnapshot();
+          this.scheduleProjectSpendSave();
+        }
+        previous = at === undefined ? undefined : this.projectSpendFiles[at];
+      }
+      let decision = projectSpendOfferDecision(
+        previous,
+        revision,
+        acceptedAt === now ? cutoff : this.projectSpendHistoryCutoff(acceptedAt),
+      );
       if (
-        decision === 'skip' ||
-        (decision !== 'queue' && (agent !== 'claude' || (previous?.cacheExpiryChildPolicy ?? false) === childPolicy))
-      ) {
+        decision !== 'skip' &&
+        (agyMissing ||
+          (revision?.sourceIdentity && previous?.sourceIdentity !== revision.sourceIdentity) ||
+          (agy && previous && !agySpendAtAdmission(previous, agy.admission)))
+      )
+        decision = 'queue';
+      if (decision === 'skip') {
+        if (pendingAgy && !pendingAgy.agyMissing) {
+          this.projectSpendQueue.splice(pendingAgyAt, 1);
+          this.projectSpendQueued.delete(key);
+        }
+        this.spendChecks?.account(key, true);
+        return;
+      }
+      if (pending) {
+        if (pendingAgy && (!agyMissing || decision === 'queue')) {
+          // Keep the positive offer if the next read finds the file again.
+          this.projectSpendQueue[pendingAgyAt] = agyMissing ? { ...pendingAgy, agyMissing: true } : source;
+        }
+        return;
+      }
+      if (decision !== 'queue' && (agent !== 'claude' || (previous?.cacheExpiryChildPolicy ?? false) === childPolicy)) {
         this.spendChecks?.account(key, true);
         return;
       }
       this.projectSpendQueued.add(key);
-      this.projectSpendQueue.push({ file, agent, primary });
+      this.projectSpendQueue.push(agyMissing ? { ...source, agySource: undefined, agyMissing: true } : source);
     };
-    for (const source of sources) {
-      offer(source.file, source.agent, source.primary);
-    }
+    for (const source of sources) offer(source);
     if (this.projectSpendQueue.length) this.projectSpendCostQueue = null;
     if (!onlyFiles) {
       for (const record of this.projectSpendFiles) {
         if (found.has(record.file)) {
           continue;
         }
-        offer(record.file, spendRecordAgent(record), !spendFileIsClaudeChild(record.file));
+        const agent = spendRecordAgent(record);
+        if (agent !== 'agy') offer({ file: record.file, agent, primary: !spendFileIsClaudeChild(record.file) });
       }
     }
     // This also publishes moved turn card costs, so a drain that queued nothing ends here. An integrity check that
     // queued no source changed no ledger record, so it publishes costs only when the pending state moved.
     this.postRailIfSpendPendingMoved(caller, caller !== 'integrityCheck' || this.projectSpendQueue.length > queued);
+    if (displayRemoved) this.postProjectSpend();
     if (!this.projectSpendQueue.length && !this.projectSpendIndexing) {
       return;
     }
@@ -15403,8 +17278,12 @@ export class PanelProvider implements vscode.Disposable {
       return;
     }
     const key = normalizeSpendFile(next.file);
-    // The spend reader reads plain transcripts only. A compressed rollout leaves the queue as a failed index does.
-    if (isCompressedRollout(next.file)) {
+    const agy = next.agent === 'agy' && !next.agyMissing ? this.qualifiedAgySpendRevision(next) : undefined;
+    const expectedRevision = next.agyMissing ? null : agy?.revision;
+    const skip = agy && projectSpendOfferDecision(undefined, agy.revision, this.projectSpendHistoryCutoff()) === 'skip';
+    // A compressed rollout or an unqualified offer leaves the queue without reading.
+    if (skip) this.spendChecks?.account(key, true);
+    if (skip || isCompressedRollout(next.file) || (next.agent === 'agy' && expectedRevision === undefined)) {
       this.projectSpendQueued.delete(key);
       this.scheduleNextProjectSpendFile();
       return;
@@ -15412,25 +17291,59 @@ export class PanelProvider implements vscode.Disposable {
     this.spendRecordsByFile ??= new Map(this.projectSpendFiles.map((record, index) => [record.file, index]));
     const at = this.spendRecordsByFile.get(key) ?? -1;
     const previous = at >= 0 ? this.projectSpendFiles[at] : undefined;
+    // A confirmed deletion retains the last complete usage even when a replacement scan is unfinished.
+    const fallback =
+      next.agyMissing && previous?.complete === false
+        ? (this.projectSpendAgyComplete?.get(key) ??
+          this.projectSpendVisibleFiles.find(
+            (record) =>
+              record.file === key &&
+              record.workspace === previous.workspace &&
+              record.complete !== false &&
+              spendRecordAgent(record) === 'agy',
+          ))
+        : previous;
+    const indexBase = fallback && fallback !== previous ? { ...fallback, missingAt: previous?.missingAt } : fallback;
     const makeReducer =
-      next.agent === 'claude'
-        ? (state: unknown) =>
-            createClaudeUsageLineReducer(state as Parameters<typeof createClaudeUsageLineReducer>[0], {
-              childTranscript: next.primary === false,
-              nativeChildRequests: (this.spendNativeChildren ??= new Set(
-                this.sessionSpendSources
-                  .filter((source) => source.nativeParentFile !== undefined)
-                  .map((source) => normalizeSpendFile(source.file)),
-              )).has(key),
-            })
-        : (state: unknown) => createCodexUsageLineReducer(state as Parameters<typeof createCodexUsageLineReducer>[0]);
+      next.agent === 'agy'
+        ? createAgyUsageReducer
+        : next.agent === 'claude'
+          ? (state: unknown) =>
+              createClaudeUsageLineReducer(state as Parameters<typeof createClaudeUsageLineReducer>[0], {
+                childTranscript: next.primary === false,
+                nativeChildRequests: (this.spendNativeChildren ??= new Set(
+                  this.sessionSpendSources
+                    .filter((source) => source.nativeParentFile !== undefined)
+                    .map((source) => normalizeSpendFile(source.file)),
+                )).has(key),
+              })
+          : (state: unknown) => createCodexUsageLineReducer(state as Parameters<typeof createCodexUsageLineReducer>[0]);
     let result: ReturnType<typeof indexSpendFile>;
     try {
-      result = indexSpendFile(previous, next.file, workspace, makeReducer);
+      result =
+        expectedRevision !== undefined
+          ? indexSpendFile(indexBase, next.file, workspace, makeReducer, {
+              expectedRevision,
+              agyAdmission: agy?.admission,
+            })
+          : indexSpendFile(previous, next.file, workspace, makeReducer);
     } catch {
-      this.projectSpendQueued.delete(key);
+      if (next.agyMissing && next.agySource) {
+        this.projectSpendQueue.unshift({ ...next, agyMissing: undefined });
+      } else {
+        this.projectSpendQueued.delete(key);
+      }
       this.scheduleNextProjectSpendFile();
       return;
+    }
+    const confirmedAgyAbsence = next.agyMissing && result.record.missingAt !== undefined;
+    if (next.agent === 'agy') {
+      if (confirmedAgyAbsence || result.complete) {
+        this.projectSpendAgyComplete?.delete(key);
+      } else if (previous && previous.complete !== false && !this.projectSpendVisibleFiles.includes(previous)) {
+        const { missingAt: _missingAt, agyRescanRequired: _rescan, ...complete } = previous;
+        (this.projectSpendAgyComplete ??= new Map()).set(key, complete);
+      }
     }
     if (at >= 0) {
       this.projectSpendFiles[at] = result.record;
@@ -15442,7 +17355,7 @@ export class PanelProvider implements vscode.Disposable {
       this.projectSpendRevision++;
       this.invalidateProjectSpendSnapshot();
     }
-    if (result.stateChanged) {
+    if (result.stateChanged || indexBase !== previous) {
       this.scheduleProjectSpendSave();
     }
     if (spendRecordChangesRail(previous, result.record)) {
@@ -15459,8 +17372,10 @@ export class PanelProvider implements vscode.Disposable {
           stat.mtimeMs !== result.record.mtimeMs ||
           (result.record.sourceIdentity !== undefined && result.record.sourceIdentity !== `${stat.dev}:${stat.ino}`)
         ) {
-          this.projectSpendQueued.add(key);
-          this.projectSpendQueue.push(next);
+          if (next.agent !== 'agy') {
+            this.projectSpendQueued.add(key);
+            this.projectSpendQueue.push(next);
+          }
         } else if (result.found && this.spendChecks) {
           this.spendChecks.set(result.record, Date.now());
         }
@@ -15485,6 +17400,8 @@ export class PanelProvider implements vscode.Disposable {
     } else {
       this.projectSpendQueue.push(next);
     }
+    if (confirmedAgyAbsence && this.expireMissingAgySpend(result.record, Date.now())) this.postProjectSpend();
+    if (confirmedAgyAbsence) this.revokeMissingAgyAdmission(next.file);
     this.scheduleNextProjectSpendFile();
   }
 
@@ -15582,24 +17499,35 @@ export class PanelProvider implements vscode.Disposable {
 
   private finishProjectSpendIndex(): void {
     this.projectSpendCostQueue = null;
-    const pruned = pruneSpendFilesWithResult(this.projectSpendFiles);
-    this.projectSpendFiles = pruned.files;
-    this.spendRecordsByFile = new Map(this.projectSpendFiles.map((record, index) => [record.file, index]));
-    this.spendChecks?.publish();
-    const previousDisplay = new Map(this.projectSpendVisibleFiles.map((record) => [record.file, record]));
-    const displayFiles = this.projectSpendFiles.flatMap((record) =>
-      record.complete === false
-        ? previousDisplay.has(record.file)
-          ? [previousDisplay.get(record.file)!]
-          : []
-        : [record],
+    const workingCount = this.projectSpendFiles.length;
+    const { resumable, visible, displaced } = pruneSpendLedgerFiles(
+      this.projectSpendFiles,
+      this.projectSpendVisibleFiles,
+      Date.now(),
+      this.projectSpendAgyComplete && [...this.projectSpendAgyComplete.values()],
     );
+    this.projectSpendFiles = resumable.files;
+    this.spendRecordsByFile = new Map(resumable.files.map((record, index) => [record.file, index]));
+    this.spendChecks?.publish();
+    const latest = displaced && new Map(displaced.files.map((record) => [record.file, record]));
+    const displayFiles = completeSpendFiles(resumable.files, visible.files, latest);
+    if (this.projectSpendAgyComplete?.size) this.scheduleProjectSpendSave();
+    this.projectSpendAgyComplete = undefined;
     const displayMoved =
-      pruned.pruned ||
+      resumable.pruned ||
       this.projectSpendVisibleFiles.length !== displayFiles.length ||
       this.projectSpendVisibleFiles.some((file, at) => file !== displayFiles[at]);
     // Advance the ledger revision when displayed files change. Schedule persistence so repeated appends still share bounded saves.
     if (displayMoved) {
+      if (
+        resumable.files.length < workingCount &&
+        this.projectSpendVisibleFiles.some(
+          (record) => spendRecordAgent(record) === 'agy' && !this.spendRecordsByFile.has(record.file),
+        )
+      ) {
+        this.projectSpendSnapshot = this.unknownProjectSpendSnapshot();
+        this.projectSpendTomorrow = null;
+      }
       this.projectSpendVisibleFiles = displayFiles;
       this.projectSpendRevision++;
       this.invalidateProjectSpendSnapshot();
@@ -15634,6 +17562,7 @@ export class PanelProvider implements vscode.Disposable {
     supplied?: SourceEnumeration,
   ): Promise<SessionFile[] | null> {
     const root = codexSessionsRoot();
+    const agyScopeEpoch = this.agyScopeEpoch;
     // The walk serves every waiting request that walks and names no file, so none of them walks again after it.
     let walkEnded = () => {};
     const running = {
@@ -15679,12 +17608,26 @@ export class PanelProvider implements vscode.Disposable {
       !signal.aborted &&
       generation === this.refreshGeneration &&
       this.anyVisible() &&
+      this.agyScopeEpoch === agyScopeEpoch &&
       codexSessionsRoot() === root;
     // A walk that ends without a catalog hands back the broad walk it folded, so the waiting request walks.
     this.pendingRefresh = settleWalkFold(this.pendingRefresh, running, listed);
-    if (!listed) return null;
-    // Scope resolves again after the walk. A scope that became unresolved lists nothing and discards the walk.
-    return this.allSessions(false, true, walked.enumeration, undefined, undefined, parts, walked.claudeWalk);
+    try {
+      if (!listed) return null;
+      // Scope resolves again after the walk. A scope that became unresolved lists nothing and discards the walk.
+      return this.allSessions(
+        false,
+        true,
+        walked.enumeration,
+        undefined,
+        undefined,
+        parts,
+        walked.claudeWalk,
+        walked.compressedOpenings,
+      );
+    } finally {
+      this.releaseCompressedOpeningChecks(walked?.compressedOpenings?.observations ?? []);
+    }
   }
 
   // Waits for the cold opening pass and for a running catalog walk. Answers true when a walk ran, so the caller can read
@@ -15710,7 +17653,11 @@ export class PanelProvider implements vscode.Disposable {
     signal: AbortSignal,
     supplied: SourceEnumeration | undefined,
     parts: CatalogEnumerationParts | undefined,
-  ): Promise<{ enumeration: SourceEnumeration; claudeWalk?: ClaudeWalk } | null> {
+  ): Promise<{
+    enumeration: SourceEnumeration;
+    claudeWalk?: ClaudeWalk;
+    compressedOpenings?: CompressedWalkOpenings;
+  } | null> {
     const started = {
       seeded: supplied !== undefined && supplied === this.codexColdPass?.listing,
       watching: this.watching,
@@ -15723,6 +17670,7 @@ export class PanelProvider implements vscode.Disposable {
     const workspaceFolders = this.folders();
     const scope = this.repositoryScope.snapshot(workspaceFolders);
     if (!scope.ready) return { enumeration };
+    const agyScopeEpoch = this.agyScopeEpoch;
     const time: ListingTimer = parts?.time ?? ((_part, run) => run());
     const folderPrint = `${workspaceFolders.join('\n')}\0${scope.revision}`;
     const claudeWalk = await walkInSlices(
@@ -15730,7 +17678,430 @@ export class PanelProvider implements vscode.Disposable {
       signal,
       parts ? { paused: (ms) => (parts.ms.listing += ms) } : {},
     );
-    return claudeWalk && { enumeration, claudeWalk };
+    if (!claudeWalk || signal.aborted) return null;
+    if (this.agyScopeEpoch === agyScopeEpoch) {
+      const checkouts = this.repositoryScope.checkoutSnapshot?.() ?? [];
+      this.startAgyDiscovery(folderPrint, [...new Set([...scope.roots, ...checkouts])]);
+    }
+    const contested = enumeration.compressed?.length ? this.contestedAgyFiles() : undefined;
+    const candidates =
+      this.agyCatalog?.folderPrint === folderPrint
+        ? this.contestedCompressedFiles(this.agyCatalog.rows, scope.roots, enumeration.compressed)
+        : undefined;
+    const masked =
+      enumeration.status === 'complete' &&
+      this.compressedPlacements &&
+      [...this.compressedPlacements.values()].some(({ maskedScope }) => maskedScope === agyScopeEpoch);
+    if (!contested?.size && !this.qualifiedCompressedOpenings?.size && !candidates?.size && !masked)
+      return { enumeration, claudeWalk };
+    const observations: CompressedOpening[] = [];
+    const plainFiles = new Set(enumeration.files.map(normalizeFsPath));
+    for (const file of enumeration.compressed ?? []) {
+      const key = normalizeFsPath(file);
+      const held = this.qualifiedCompressedOpenings?.get(key);
+      if (plainFiles.has(key.slice(0, -'.zst'.length))) continue;
+      const awaitingTwin = this.compressedPlacements?.get(key)?.maskedScope;
+      if (awaitingTwin !== undefined && (!masked || awaitingTwin !== agyScopeEpoch)) continue;
+      if (awaitingTwin === undefined) {
+        if (!held && !contested?.has(sessionCoverageFileKey('codex', file)) && !candidates?.has(key)) continue;
+        if (held && !held.pending && sameCompressedRevision(held.source, readRolloutStat(file))) continue;
+      }
+      const opening = await this.qualifyCompressedOpening(file, signal);
+      if (opening) observations.push(opening);
+      if (signal.aborted) {
+        this.releaseCompressedOpeningChecks(observations);
+        return null;
+      }
+    }
+    return { enumeration, claudeWalk, compressedOpenings: { folderPrint, observations } };
+  }
+
+  private async qualifyCompressedOpening(file: string, signal: AbortSignal): Promise<CompressedOpening | null> {
+    const key = normalizeFsPath(file);
+    const revision = readRolloutStat(file);
+    const held = this.qualifiedCompressedOpenings?.get(key);
+    const plain = file.slice(0, -'.zst'.length);
+    const adoption = this.adoptionsUnsettled?.get(plain);
+    const candidates = [this.compressedFacts.get(file), adoption?.twin === file ? adoption.pending : undefined];
+    const placement = this.compressedPlacements?.get(key);
+    const heldObservation = held?.observation;
+    const observationAt = (source: NonNullable<ReturnType<typeof readRolloutStat>>) => {
+      let observation =
+        held &&
+        sameCompressedRevision(held.source, source) &&
+        (!placement ||
+          (placement.placement.opening?.sessionId === held.source.sessionId &&
+            placement.placement.opening?.cwd === held.source.cwd &&
+            (!placement.placement.hash || placement.placement.hash === heldObservation?.hash) &&
+            (!placement.blockedHash || placement.blockedHash !== heldObservation?.hash)))
+          ? heldObservation
+          : undefined;
+      for (const entry of candidates) {
+        const next =
+          entry &&
+          this.compressedPlacementAllows(entry) &&
+          compressedFactsMatchSource(entry, source) &&
+          compressedByteObservation(entry);
+        if (next && (!observation || compareCompressedObservations(next, observation) > 0)) observation = next;
+      }
+      return observation;
+    };
+    const check: CompressedOpeningCheck = { revision, observation: revision ? observationAt(revision) : undefined };
+    (this.compressedOpeningChecks ??= new Map()).set(key, check);
+    this.performanceCounters?.recordWork('openingsRead:compressedCollisions');
+    const work = { compressedBytes: 0, decodedBytes: 0 };
+    const first = await readQualifiedCompressedFirstRecord(file, COMPRESSED_ENTRY_TITLE_BYTES, signal, work);
+    this.performanceCounters?.recordWork('openingsRead:compressedCollisionInputBytes', work.compressedBytes);
+    this.performanceCounters?.recordWork('openingsRead:compressedCollisionOutputBytes', work.decodedBytes);
+    const opening = openingRecordOf(first?.value ?? null);
+    if (first && !revision) {
+      check.revision = { ...first.revision, isFile: true };
+      check.observation = observationAt(check.revision);
+      for (const notices of check.notices?.values() ?? [])
+        for (const { entry, observation } of notices)
+          this.noteCompressedOpeningObservation(entry, observation, undefined, check);
+      check.notices = undefined;
+    }
+    const announced = placement?.placement;
+    const announcedOpening = announced?.opening;
+    const verifiedFallback =
+      first &&
+      opening?.cwd &&
+      announced?.hash &&
+      announcedOpening &&
+      announced.hash === check.observation?.hash &&
+      sameCompressedRevision(announced.revision, first.revision) &&
+      announcedOpening.sessionId === sessionKeyOf(file, opening) &&
+      announcedOpening.cwd === opening.cwd &&
+      announcedOpening.hidden === isHiddenThread(opening);
+    const sessionId = opening?.sessionId ?? (verifiedFallback ? announcedOpening?.sessionId : undefined);
+    if (
+      !first ||
+      signal.aborted ||
+      !sessionId ||
+      !opening?.cwd ||
+      !supportedFileIdentity(first.revision) ||
+      check.changed ||
+      (revision && !sameCompressedRevision(revision, first.revision))
+    ) {
+      if (this.compressedOpeningChecks?.get(key) === check) this.compressedOpeningChecks.delete(key);
+      if (check.changed && !signal.aborted) this.retryCompressedOpening(key);
+      return null;
+    }
+    if (
+      placement?.maskedScope === undefined &&
+      announced &&
+      announcedOpening &&
+      sameCompressedRevision(announced.revision, first.revision) &&
+      (announcedOpening.sessionId !== sessionId ||
+        announcedOpening.cwd !== opening.cwd ||
+        announcedOpening.hidden !== isHiddenThread(opening))
+    ) {
+      if (this.compressedOpeningChecks?.get(key) === check) this.compressedOpeningChecks.delete(key);
+      return null;
+    }
+    return {
+      source: { agent: 'codex', file, sessionId, cwd: opening.cwd, ...first.revision },
+      hidden: isHiddenThread(opening),
+      check,
+    };
+  }
+
+  // A notice after the read began needs a walk of its own. The active walk cannot satisfy it.
+  private retryCompressedOpening(key: string): void {
+    void (this.catalogWalkRunning?.ended ?? Promise.resolve()).then(() => {
+      if (!this.disposed && !this.compressedOpeningChecks?.has(key)) this.refreshFrom('agy-discovery');
+    });
+  }
+
+  private releaseCompressedOpeningChecks(openings: readonly CompressedOpening[]): void {
+    for (const { source, check } of openings) {
+      const key = normalizeFsPath(source.file);
+      if (check && this.compressedOpeningChecks?.get(key) === check) this.compressedOpeningChecks.delete(key);
+    }
+  }
+
+  private contestedCompressedFiles(
+    rows: readonly SessionFile[],
+    roots: string[],
+    listed = this.sourceEnumerations?.codex.compressed,
+  ): Set<string> | undefined {
+    if (!rows.length) return undefined;
+    const ids = new Set(rows.map((row) => row.sessionId.toLowerCase()));
+    const inRoots = folderMatcher(roots);
+    const files = new Set<string>();
+    for (const file of listed ?? []) {
+      const id = sessionKeyOf(file, null);
+      if (id && ids.has(id.toLowerCase())) files.add(normalizeFsPath(file));
+    }
+    for (const [file, opening] of this.hiddenCompressedOpenings ?? []) {
+      if (ids.has(opening.sessionId.toLowerCase()) && inRoots(opening.cwd)) files.add(file);
+    }
+    for (const [file, { placement, maskedScope }] of this.compressedPlacements ?? []) {
+      const opening = placement.opening;
+      if (
+        (maskedScope === undefined || maskedScope === this.agyScopeEpoch) &&
+        opening &&
+        ids.has(opening.sessionId.toLowerCase()) &&
+        inRoots(opening.cwd)
+      )
+        files.add(file);
+    }
+    for (const [file, entry] of this.compressedFacts ?? []) {
+      if (
+        entry.opening?.cwd &&
+        inRoots(entry.opening.cwd) &&
+        (ids.has(entry.threadId?.toLowerCase() ?? '') || ids.has(entry.opening.sessionId?.toLowerCase() ?? ''))
+      )
+        files.add(normalizeFsPath(file));
+    }
+    return files;
+  }
+
+  private rememberAgyProjections(
+    held: Map<string, SessionFile> | undefined,
+    sources: readonly SessionFile[],
+    merge = false,
+  ): Map<string, SessionFile> | undefined {
+    if (!held?.size && !this.agyScan?.cache.size) return undefined;
+    const owners = merge && held ? held : new Map<string, SessionFile>();
+    for (const source of sources) {
+      if (source.agent === 'agy') owners.set(source.sessionId, source);
+      else if (merge) owners.delete(source.sessionId);
+    }
+    return owners;
+  }
+
+  private changeAgyAdmission(previous: SessionFile, next: SessionFile | null): void {
+    const discovered = agyAdmissionOf(previous);
+    if (!discovered) return;
+    const admission = this.agyAuthorities?.get(discovered) ?? discovered;
+    const { file, sessionId } = previous;
+    const owns = (source: SessionFile | undefined) =>
+      source?.agent === 'agy' && source.file === file && agyAdmissionOf(source)?.lineage === admission.lineage;
+    const drop = (owners: Map<string, SessionFile> | undefined) =>
+      owns(owners?.get(sessionId)) && owners!.delete(sessionId);
+    const append = owns(next ?? undefined) && next?.agyOwnerRoot === previous.agyOwnerRoot;
+    let rowsChanged = false;
+    if (!append) {
+      (this.agyAuthorities ??= new WeakMap()).set(discovered, renewAgyAdmission(discovered));
+      const producer = this.agyRowProducers?.get(file);
+      if (producer && owns(producer.source)) {
+        producer.revoked = true;
+        this.agyRowProducers?.delete(file);
+        const id = sessionId.toLowerCase();
+        const pending = Object.values(this.awaitingSessionRecords ?? {}).filter(
+          (record) =>
+            record.sessionId.toLowerCase() === id && record.cwd && isInside(record.cwd, this.repositoryScopeRoots),
+        );
+        rowsChanged = this.reconcileAgySessionRows(id, pending.length === 1 ? pending[0] : undefined, producer);
+      }
+    }
+    const work = this.agyReadWork?.get(admission);
+    this.agyReadWork?.delete(admission);
+    this.corpus?.delete(file);
+    const facts = this.admittedReadSources?.get(sessionId);
+    if (facts && this.agentReadSources?.admissionOf(facts) === admission) {
+      this.admittedReadSources.delete(sessionId);
+      this.restoredReadSources = undefined;
+    }
+    this.agentReadSources?.forget(previous);
+    if (append) {
+      work?.controller.abort();
+      return;
+    }
+
+    const id = sessionId.toLowerCase();
+    let redraw = [this.catalog?.sessions, this.authoritativeCatalog].some((rows) =>
+      owns(this.agyCatalogRow(id, rows) ?? undefined),
+    );
+    for (const host of this.hosts ?? []) {
+      const sender = this.rowSenders?.get(host);
+      if (sender && owns(sender.acceptedAgySource)) {
+        sender.acceptedWindow = undefined;
+        sender.acceptedCards = undefined;
+        sender.acceptedAgySource = undefined;
+        redraw = true;
+      }
+    }
+    this.cache?.delete(file);
+    this.titles?.delete(file);
+    this.carriedNames?.delete(file);
+    this.selectionFailures?.delete(file);
+    this.interruptedRereads?.delete(file);
+    for (const read of ['metadata', 'starts', 'enrichment', 'recovery'])
+      this.sessionReadFailures?.delete(file + '\0' + read);
+    const history = this.history?.get(sessionId);
+    if (history?.file === file) {
+      this.history.delete(sessionId);
+      this.historyStructuralKeys?.delete(sessionId);
+    }
+    if (owns(this.readWindows?.get(sessionId)?.agySource)) this.readWindows.delete(sessionId);
+    if (drop(this.agyGlanceSources)) {
+      this.selectionWindows?.delete(sessionId);
+      this.windows?.delete(sessionId);
+    }
+    if (drop(this.agyOutcomeSources)) {
+      this.selectionOutcomes?.delete(sessionId);
+      this.sessionOutcomes?.delete(sessionId);
+    }
+    if (drop(this.agyComposerSources)) this.composerRuntime?.delete(sessionId);
+    if (drop(this.agyMetadataSources)) {
+      if (this.metadataStatFigures) this.metadataStatsBySession = this.metadataStatFigures.patch(sessionId, null);
+      if (this.metadataCacheFigures) this.metadataRailCaches = this.metadataCacheFigures.patch(sessionId, null);
+      if (this.metadataRailRevisions) delete this.metadataRailRevisions[sessionId];
+    }
+    if (drop(this.agyTimelineSources)) {
+      redraw = true;
+      this.newestBySession?.delete(sessionId);
+      this.newestCompactionBySession?.delete(sessionId);
+      this.promptsBySession?.delete(sessionId);
+      if (this.statsBySession) delete this.statsBySession[sessionId];
+      if (this.parsedRailCaches) delete this.parsedRailCaches[sessionId];
+      this.cards = (this.cards ?? []).filter((card) => !card.key.startsWith(sessionId + ':'));
+      this.parsedRefs = this.parsedRefs?.filter((turn) => turn.sessionId !== sessionId) ?? [];
+      this.turnMarks = this.turnMarks?.filter((turn) => !turn.id.startsWith(sessionId + ':')) ?? [];
+      for (const [key, turn] of this.turnsByKey ?? []) if (turn.sessionId === sessionId) this.turnsByKey.delete(key);
+      for (const [key, record] of this.compactionsByCard ?? [])
+        if (record.sessionId === sessionId) this.compactionsByCard.delete(key);
+    }
+    if (owns(this.historyRequest?.source)) {
+      this.historyRequest!.controller.abort();
+      this.historyRequest = null;
+      redraw = true;
+    }
+    const selection = this.selectionWorks?.get(sessionId) ?? this.selectionWork;
+    if (owns(selection?.source)) {
+      selection!.controller.abort();
+      redraw = true;
+    }
+    this.noteChangedSession?.(file);
+    this.metadataRevision = (this.metadataRevision ?? 0) + 1;
+    this.metadataFactsRevision = (this.metadataFactsRevision ?? 0) + 1;
+    this.derivedCacheCheckpointState?.markChanged();
+    work?.controller.abort();
+    if (redraw || rowsChanged) this.queueAgyRedraw();
+  }
+
+  private queueAgyRedraw(): void {
+    if (this.agyRedrawQueued) return;
+    this.agyRedrawQueued = true;
+    queueMicrotask(() => {
+      this.agyRedrawQueued = false;
+      if (this.agyRowsRevision > 0) {
+        this.postRail(true, 'agy-discovery', undefined, false);
+        const retired = this.agyRetiredRows;
+        this.agyRetiredRows = undefined;
+        if (
+          this.hosts?.some((host) => retired?.has((this.hostSessions?.get(host) ?? this.showing ?? '').toLowerCase()))
+        )
+          void this.post({ type: 'usage' });
+      }
+      this.refreshFrom('agy-discovery', true, true, null, true);
+    });
+  }
+
+  private clearAgyDiscovery(): void {
+    const scan = this.agyScan;
+    this.agyScan = undefined;
+    this.agyCatalog = undefined;
+    if (scan) clearAgyDiscoveryCache(scan.cache, (previous, next) => this.changeAgyAdmission(previous, next));
+    this.agyNativePresentation?.clear();
+    scan?.controller?.abort();
+  }
+
+  private revokeMissingAgyAdmission(file: string): void {
+    const scan = this.agyScan;
+    const id = agySessionId(file);
+    if (!scan || !id || normalizeFsPath(path.resolve(file, '..', '..', '..', '..')) !== normalizeFsPath(scan.brain))
+      return;
+    const key = scan.cache.has(id)
+      ? id
+      : process.platform === 'win32'
+        ? [...scan.cache.keys()].find((key) => key.toLowerCase() === id.toLowerCase())
+        : undefined;
+    const cached = key === undefined ? undefined : scan.cache.get(key);
+    const target = normalizeFsPath(file);
+    const matches = (candidate: string | undefined) => candidate !== undefined && normalizeFsPath(candidate) === target;
+    if (key !== undefined && (matches(cached?.item.file) || matches(cached?.row?.file))) {
+      discardAgyDiscoveryEntry(scan.cache, key, (previous, next) => this.changeAgyAdmission(previous, next));
+    } else if (!matches(scan.reading)) {
+      return;
+    }
+    scan.controller?.abort();
+    scan.controller = undefined;
+    scan.reading = undefined;
+    if (this.agyCatalog) this.agyCatalog.publish = false;
+    this.startAgyDiscovery(scan.folderPrint, scan.roots);
+    this.refreshFrom('agy-discovery', true, true, null, true, true);
+  }
+
+  private startAgyDiscovery(folderPrint: string, roots: string[]): void {
+    const brain = agyBrainRoot();
+    const key = JSON.stringify([brain, folderPrint, roots]);
+    if (this.agyScan?.key !== key) {
+      this.clearAgyDiscovery();
+      this.agyScan = {
+        key,
+        brain,
+        folderPrint,
+        roots,
+        workspace: projectSpendWorkspace(this.folders(), MULTI_ROOT_SPEND_WORKSPACE_PREFIX),
+        cache: new Map(),
+      };
+    }
+    const scan = this.agyScan;
+    if (scan.controller || (this.agyCatalog?.folderPrint === folderPrint && this.agyCatalog.publish)) return;
+    const controller = new AbortController();
+    scan.controller = controller;
+    scan.coveragePublished = false;
+    const steps = scanAgySessions(brain, roots, [], {
+      cache: scan.cache,
+      admissionChanged: (previous, next) => this.changeAgyAdmission(previous, next),
+      visit: (file) => {
+        scan.reading = file;
+      },
+    });
+    void (async () => {
+      try {
+        while (!controller.signal.aborted) {
+          const step = steps.next();
+          if (step.done) {
+            if (scan.brain !== agyBrainRoot()) return;
+            const { rows, complete, uncertain } = step.value;
+            this.reserveHiddenCodexOpenings(rows, folderPrint);
+            const candidates = this.contestedCompressedFiles(rows, this.repositoryScopeRoots);
+            if (candidates?.size) {
+              await this.reserveContestedCompressedOpenings(candidates, folderPrint, controller.signal);
+              if (controller.signal.aborted || this.agyScan !== scan || scan.brain !== agyBrainRoot()) return;
+            }
+            const previous = this.agyCatalog;
+            const same =
+              previous?.folderPrint === folderPrint &&
+              previous.complete === complete &&
+              previous.rows.length === rows.length &&
+              previous.rows.every((row, index) => row === rows[index]) &&
+              previous.uncertain.size === uncertain.size &&
+              [...uncertain].every((id) => previous.uncertain.has(id));
+            const publish =
+              (complete && scan.coveragePublished === true) ||
+              (!same && (previous !== undefined || rows.length > 0 || !complete));
+            this.agyCatalog = { folderPrint, rows, complete, uncertain, publish };
+            scan.controller = undefined;
+            scan.reading = undefined;
+            if (publish) this.refreshFrom('agy-discovery', false);
+            return;
+          }
+          await new Promise<void>((resolve) => setImmediate(resolve));
+        }
+      } finally {
+        steps.return({ rows: [], complete: false, uncertain: new Set() });
+        if (scan.controller === controller) {
+          scan.controller = undefined;
+          scan.reading = undefined;
+        }
+      }
+    })();
   }
 
   // The Claude reads of a walk as steps. It writes no host state that the commit owns. An abandoned walk leaves the
@@ -15761,13 +18132,164 @@ export class PanelProvider implements vscode.Disposable {
     return { folderPrint, listing, census, spendSources, openings, ...started };
   }
 
+  private qualifyCodexOpening(file: string, onRead: () => void) {
+    const opening = readQualifiedCodexOpening(file, onRead);
+    if (!opening) return null;
+    const source: SessionFile = {
+      agent: 'codex',
+      file,
+      sessionId: opening.value.sessionId!,
+      cwd: opening.value.cwd!,
+      ...opening.revision,
+    };
+    return { source, meta: opening.value, hidden: isHiddenThread(opening.value) };
+  }
+
+  // A prior listing can meet a guardian before the Antigravity scan meets its ID.
+  private reserveHiddenCodexOpenings(rows: readonly SessionFile[], folderPrint: string): void {
+    const held = this.hiddenCodexOpenings;
+    if (!held || held.folderPrint !== folderPrint || held.root !== codexSessionsRoot() || !held.files.size) return;
+    const inRoots = folderMatcher(this.repositoryScopeRoots);
+    const ids = new Set(rows.map((row) => row.sessionId.toLowerCase()));
+    const count = () => this.performanceCounters?.recordWork('openingsRead:collisions');
+    for (const id of ids) {
+      for (const file of held.files.get(id) ?? []) {
+        if (this.agyNativeReservations?.get(id)?.some((source) => source.file === file)) continue;
+        const qualified = this.qualifyCodexOpening(file, count);
+        if (
+          qualified &&
+          supportedFileIdentity(qualified.source) &&
+          inRoots(qualified.source.cwd!) &&
+          ids.has(qualified.source.sessionId.toLowerCase())
+        ) {
+          this.rememberAgyNativeRows([qualified.source]);
+        }
+      }
+    }
+  }
+
+  private async reserveContestedCompressedOpenings(
+    files: Set<string>,
+    folderPrint: string,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const walking = this.catalogWalkRunning;
+    if (walking) await walking.ended;
+    if (signal.aborted) return;
+    const enumeration = this.sourceEnumerations?.codex;
+    const walk = this.compressedWalk;
+    if (!enumeration?.compressed?.length || !walk?.physical) return;
+    const generation = this.refreshGeneration;
+    const epoch = this.agyScopeEpoch;
+    const root = codexSessionsRoot();
+    const ready: CompressedOpening[] = [];
+    for (const file of enumeration.compressed) {
+      const key = normalizeFsPath(file);
+      if (!files.has(key) || !this.compressedPairListed(file, walk)) continue;
+      const maskedScope = this.compressedPlacements?.get(key)?.maskedScope;
+      if (maskedScope !== undefined && (!walk.complete || maskedScope !== epoch)) continue;
+      const held = this.qualifiedCompressedOpenings?.get(key);
+      if (
+        maskedScope === undefined &&
+        held &&
+        !held.pending &&
+        sameCompressedRevision(held.source, readRolloutStat(file))
+      )
+        continue;
+      const qualified = await this.qualifyCompressedOpening(file, signal);
+      if (qualified) ready.push(qualified);
+      if (signal.aborted) {
+        this.releaseCompressedOpeningChecks(ready);
+        return;
+      }
+    }
+    const folders = this.folders();
+    const scope = this.repositoryScope.snapshot(folders);
+    if (
+      signal.aborted ||
+      generation !== this.refreshGeneration ||
+      this.agyScopeEpoch !== epoch ||
+      this.sourceEnumerations?.codex !== enumeration ||
+      this.compressedWalk !== walk ||
+      codexSessionsRoot() !== root ||
+      !scope.ready ||
+      folderPrint !== `${folders.join('\n')}\0${scope.revision}`
+    ) {
+      this.releaseCompressedOpeningChecks(ready);
+      return;
+    }
+    const inRoots = folderMatcher(scope.roots);
+    for (const opening of ready) {
+      const { source } = opening;
+      const previous = this.qualifiedCompressedOpenings?.get(normalizeFsPath(source.file))?.source;
+      if (!this.installCompressedOpening(opening)) continue;
+      this.replaceCompressedReservation(source, inRoots, [
+        previous?.sessionId,
+        this.compressedFacts.get(source.file)?.threadId,
+      ]);
+    }
+  }
+
+  private installCompressedOpening(opening: CompressedOpening): boolean {
+    const { source, hidden, check } = opening;
+    const file = source.file;
+    const key = normalizeFsPath(file);
+    if (!check || this.compressedOpeningChecks?.get(key) !== check) return false;
+    this.compressedOpeningChecks.delete(key);
+    if (check.changed) {
+      this.retryCompressedOpening(key);
+      return false;
+    }
+    const stat = readRolloutStat(file);
+    if (!stat?.isFile || !sameCompressedRevision(source, stat)) return false;
+    const placement = this.compressedPlacements?.get(key);
+    if (placement?.maskedScope !== undefined) {
+      if (placement.maskedScope !== this.agyScopeEpoch || observeRolloutStat(file.slice(0, -'.zst'.length)) !== null)
+        return false;
+      const announced = placement.placement.opening;
+      if (
+        sameCompressedRevision(placement.placement.revision, source) &&
+        announced?.sessionId === source.sessionId &&
+        announced.cwd === source.cwd &&
+        announced.hidden === !!hidden
+      )
+        placement.maskedScope = undefined;
+      else this.compressedPlacements?.delete(key);
+    } else if (placement && !sameCompressedRevision(placement.placement.revision, source)) {
+      this.compressedPlacements?.delete(key);
+    }
+    const installed = {
+      source,
+      hidden,
+      observation: check.observation,
+      qualification: (this.compressedRepairSequence = (this.compressedRepairSequence ?? 0) + 1),
+    };
+    (this.qualifiedCompressedOpenings ??= new Map()).set(key, installed);
+    this.reconcileCompressedRepair(file, installed);
+    if (this.compressedFacts.has(file)) this.compressedFactsChanged();
+    this.compressedRowsHeld?.delete(file);
+    if (this.compressedFacts.has(file)) (this.compressedRowsDirty ??= new Set()).add(file);
+    return true;
+  }
+
   // Answers whether the held same-ID evidence names a source, so that a listing reads that source's qualified opening.
   private collidingSources(): (agent: 'claude' | 'codex', file: string) => boolean {
-    const collisionFiles = new Set(
-      this.enumeratedCollisions?.sources.map((source) => source.agent + '\0' + normalizeFsPath(source.file)),
-    );
+    const collisionFiles = this.contestedAgyFiles();
+    for (const source of this.enumeratedCollisions?.sources ?? [])
+      collisionFiles.add(sessionCoverageFileKey(source.agent, source.file));
     // Without a collision, no file needs its path normalized to find that out.
-    return (agent, file) => collisionFiles.size > 0 && collisionFiles.has(agent + '\0' + normalizeFsPath(file));
+    return (agent, file) => collisionFiles.size > 0 && collisionFiles.has(sessionCoverageFileKey(agent, file));
+  }
+
+  private contestedAgyFiles(): Set<string> {
+    const collisionFiles = new Set<string>();
+    for (const row of this.agyCatalog?.rows ?? [])
+      for (const source of this.agyNativeReservations?.get(row.sessionId.toLowerCase()) ?? []) {
+        collisionFiles.add(sessionCoverageFileKey(source.agent, source.file));
+        const twin = nativeReservationTwin(source);
+        if (twin) collisionFiles.add(sessionCoverageFileKey(source.agent, twin));
+      }
+    return collisionFiles;
   }
 
   // Reads the working directory of one Claude parent for a listing, from the held row or from its transcript.
@@ -15849,11 +18371,19 @@ export class PanelProvider implements vscode.Disposable {
   // longer lists. An incomplete walk removes nothing, because its unread directories can still hold a listed name.
   private noteCompressedRollouts(names: readonly string[], walk?: SourceEnumeration): void {
     let changed = false;
+    let previouslyVisible = false;
     if (walk?.status === 'complete') {
       const listed = new Set(walk.compressed);
       for (const name of this.compressedRollouts) {
         if (!listed.has(name)) {
           this.compressedRollouts.delete(name);
+          this.compressedMemberships?.delete(name);
+          this.compressedMembershipChecks?.delete(name);
+          const key = normalizeFsPath(name);
+          this.compressedRepairs?.delete(key);
+          this.settledCompressedRepairs?.delete(key);
+          this.compressedRepairEvidence?.delete(key);
+          this.releasedCompressedRepairs?.delete(key);
           changed = true;
         }
       }
@@ -15861,9 +18391,16 @@ export class PanelProvider implements vscode.Disposable {
     for (const name of names) {
       if (!this.compressedRollouts.has(name)) {
         this.compressedRollouts.add(name);
+        (this.compressedMemberships ??= new Map()).set(name, this.compressedRolloutsRevision + 1);
+        if (this.compressedInventoryComplete) {
+          (this.compressedMembershipChecks ??= new Set()).add(name);
+          previouslyVisible ||= this.compressedFacts.has(name);
+        }
         changed = true;
       }
     }
+    if (previouslyVisible) this.compressedFactsChanged();
+    if (walk?.status === 'complete') this.compressedInventoryComplete = true;
     if (changed) this.compressedRolloutsRevision++;
   }
 
@@ -15881,6 +18418,7 @@ export class PanelProvider implements vscode.Disposable {
     walkCause = 'unnamed',
     parts?: CatalogEnumerationParts,
     claudeWalk?: ClaudeWalk,
+    compressedOpenings?: CompressedWalkOpenings,
   ): SessionFile[] {
     const workspaceFolders = this.folders();
     const scope = this.repositoryScope.snapshot(workspaceFolders);
@@ -15934,13 +18472,21 @@ export class PanelProvider implements vscode.Disposable {
           this.walkedCatalog = { ...walk, sessions: walked, parents };
         }
         const joining = new Set([...walkNamed].map(normalizeFsPath));
-        const listing = [...held, ...(walked ?? []).filter((session) => joining.has(normalizeFsPath(session.file)))];
-        const admitted = deferHumanPrompts
-          ? listing
-          : listing.filter(
-              (session) =>
-                session.agent !== 'claude' || session.childTranscript === true || this.hasHumanPrompt(session),
-            );
+        const listing = this.currentCompressedProjections([
+          ...held,
+          ...(walked ?? []).filter((session) => joining.has(normalizeFsPath(session.file))),
+        ]);
+        const admitted =
+          deferHumanPrompts && !this.agyScan
+            ? listing
+            : listing.filter((session) =>
+                session.agent === 'agy'
+                  ? this.agyReadAdmission(session, listing, true)
+                  : deferHumanPrompts ||
+                    session.agent !== 'claude' ||
+                    session.childTranscript === true ||
+                    this.hasHumanPrompt(session),
+              );
         const sorted = orderSessionCatalog(admitted, (session) => this.activityFor(session));
         // The parents are the parents of the last walk. A listed parent comes first, at the revision of its listed row.
         // With no walk of these roots, they are the listed rows without child transcripts and compressed rollouts.
@@ -15978,13 +18524,18 @@ export class PanelProvider implements vscode.Disposable {
       const held = revalidated ?? (outsideWalk ? [...this.catalog.sessions] : null);
       // Reorder reused catalog rows after updating file revisions.
       if (held) {
-        const joined = this.withCompressedFactRows(held);
-        const admitted = deferHumanPrompts
-          ? joined
-          : joined.filter(
-              (session) =>
-                session.agent !== 'claude' || session.childTranscript === true || this.hasHumanPrompt(session),
-            );
+        const joined = this.currentCompressedProjections(this.withCompressedFactRows(held));
+        const admitted =
+          deferHumanPrompts && !this.agyScan
+            ? joined
+            : joined.filter((session) =>
+                session.agent === 'agy'
+                  ? this.agyReadAdmission(session, joined, true)
+                  : deferHumanPrompts ||
+                    session.agent !== 'claude' ||
+                    session.childTranscript === true ||
+                    this.hasHumanPrompt(session),
+              );
         const sorted = orderSessionCatalog(admitted, (session) => this.activityFor(session));
         // Retain the updated rows so later selections reuse their current revisions.
         this.catalog = { folders: folderPrint, sessions: sorted };
@@ -16030,6 +18581,7 @@ export class PanelProvider implements vscode.Disposable {
       parts,
       undefined,
       claudeWalk,
+      compressedOpenings,
     );
   }
 
@@ -16059,6 +18611,7 @@ export class PanelProvider implements vscode.Disposable {
     heldClaude?: SourceEnumeration & { sessions: SessionFile[] },
     // The Claude half of this walk, read in slices. A walk that scope moved under reads the Claude sources here instead.
     slicedClaude?: ClaudeWalk,
+    compressedOpenings?: CompressedWalkOpenings,
   ): SessionFile[] {
     const time: ListingTimer = parts?.time ?? ((_part, run) => run());
     const codexRevision = this.codexMetas.revision;
@@ -16073,6 +18626,12 @@ export class PanelProvider implements vscode.Disposable {
       revision: String(this.coverageRevision),
     };
     const qualifiedCodexStats = new Map<string, ReturnType<typeof readRolloutStat>>();
+    const codexRoot = codexSessionsRoot();
+    const agyIds =
+      this.agyCatalog?.folderPrint === folderPrint
+        ? new Set(this.agyCatalog.rows.map((row) => row.sessionId.toLowerCase()))
+        : undefined;
+    const hiddenFiles = new Map<string, Set<string>>();
     const openings: ClaudeOpenings = claudeWalk?.openings ?? {
       observations: [],
       unavailable: new Set(heldClaude ? this.claudeWalkOpeningUnavailable : []),
@@ -16095,39 +18654,39 @@ export class PanelProvider implements vscode.Disposable {
     this.claudeWalkOpeningUnavailable = openings.unavailable;
     const claude = claudeListing.sessions;
     const countCodexOpeningRead = () => this.performanceCounters?.recordWork('openingsRead:codex');
+    const qualify = (file: string) =>
+      time('openings:collisions', () => {
+        const qualified = this.qualifyCodexOpening(file, countCollisionRead);
+        if (!qualified) return null;
+        const { source, meta, hidden } = qualified;
+        this.codexMetas.install(file, meta);
+        this.codexStats.delete(file);
+        sourceObservations.push({ ...physicalContext, source, excluded: !inRoots(source.cwd!), hidden });
+        qualifiedCodexStats.set(file, { ...source, isFile: true });
+        return meta;
+      });
+    const rememberHidden = (id: string, file: string) => {
+      let files = hiddenFiles.get(id);
+      if (!files) hiddenFiles.set(id, (files = new Set()));
+      files.add(file);
+    };
     // A hidden panel ignores watcher events, so a walk then stats every rollout and holds none.
     const listing = codexSessionFiles(
-      codexSessionsRoot(),
+      codexRoot,
       roots,
       (file, stat, inFolders) => {
         if (isCompressedRollout(file)) return null;
-        if (collides('codex', file)) {
-          const qualified = time('openings:collisions', () => {
-            const opening = readQualifiedCodexOpening(file, countCollisionRead);
-            if (!opening) return null;
-            const source: SessionFile = {
-              agent: 'codex',
-              file,
-              sessionId: opening.value.sessionId!,
-              cwd: opening.value.cwd!,
-              ...opening.revision,
-            };
-            this.codexMetas.install(file, opening.value);
-            this.codexStats.delete(file);
-            sourceObservations.push({
-              ...physicalContext,
-              source,
-              excluded: !inRoots(source.cwd!),
-              hidden: isHiddenThread(opening.value),
-            });
-            qualifiedCodexStats.set(file, { ...opening.revision, isFile: true });
-            return opening.value;
-          });
-          if (qualified) return qualified;
-        }
-        return this.codexMetas.listingOpening(file, stat, inFolders, countCodexOpeningRead, (lookup) =>
-          time('openings:codex', lookup),
-        );
+        const contested = collides('codex', file);
+        let meta =
+          (contested ? qualify(file) : null) ??
+          this.codexMetas.listingOpening(file, stat, inFolders, countCodexOpeningRead, (lookup) =>
+            time('openings:codex', lookup),
+          );
+        if (!meta?.cwd || !meta.sessionId || !isHiddenThread(meta) || !inFolders(meta.cwd)) return meta;
+        if (!contested && agyIds?.has(meta.sessionId.toLowerCase())) meta = qualify(file) ?? meta;
+        if (meta.cwd && meta.sessionId && isHiddenThread(meta) && inFolders(meta.cwd) && isAgySessionId(meta.sessionId))
+          rememberHidden(meta.sessionId.toLowerCase(), file);
+        return meta;
       },
       (file) =>
         time(
@@ -16140,6 +18699,17 @@ export class PanelProvider implements vscode.Disposable {
       codexEnumeration,
       (file) => this.codexMetas.openingGap(file),
     );
+    const heldHidden = this.hiddenCodexOpenings;
+    if (
+      listing.enumeration.status !== 'complete' &&
+      heldHidden?.folderPrint === folderPrint &&
+      heldHidden.root === codexRoot
+    ) {
+      const reached = new Set(listing.walked);
+      for (const [id, files] of heldHidden.files)
+        for (const file of files) if (!reached.has(file)) rememberHidden(id, file);
+    }
+    this.hiddenCodexOpenings = hiddenFiles.size ? { folderPrint, root: codexRoot, files: hiddenFiles } : undefined;
     if (!heldClaude) {
       const census =
         claudeWalk?.census ??
@@ -16182,14 +18752,7 @@ export class PanelProvider implements vscode.Disposable {
     let physical: SessionCoverage | undefined;
     const absent = (file: string) => {
       if (!isInside(file, [codexSessionsRoot()])) return false;
-      physical ??= {
-        ...listing.enumeration,
-        ...physicalContext,
-        paths: new Set(listing.enumeration.files.map(normalizeFsPath)),
-        directoryPaths: listing.enumeration.directories
-          ? new Set(listing.enumeration.directories.map((directory) => normalizeFsPath(directory).replace(/\/$/, '')))
-          : undefined,
-      };
+      physical ??= this.compressedPhysicalCoverage(listing.enumeration, physicalContext);
       return sessionPresence(physical, physicalContext, { file }) === 'absent';
     };
     for (const file of staleMetas(this.codexStats.keys(), listing.walked, listing.enumeration, absent)) {
@@ -16217,7 +18780,38 @@ export class PanelProvider implements vscode.Disposable {
             codex: listing.sources,
             children: listing.subagents,
           };
-    const compressedRows = this.compressedRowsOf(listing, inRoots);
+    if (compressedOpenings?.folderPrint === folderPrint) {
+      for (const opening of compressedOpenings.observations) this.installCompressedOpening(opening);
+    }
+    const compressedEvidence: SessionCollisionObservation[] = [];
+    if (
+      this.qualifiedCompressedOpenings?.size ||
+      this.hiddenCompressedOpenings?.size ||
+      this.compressedPlacements?.size
+    ) {
+      const listed = new Set((listing.enumeration.compressed ?? []).map(normalizeFsPath));
+      for (const [file, hint] of this.hiddenCompressedOpenings ?? [])
+        if (!listed.has(file) && absent(hint.file)) this.hiddenCompressedOpenings!.delete(file);
+      for (const [file, { placement, maskedScope }] of this.compressedPlacements ?? [])
+        if (
+          (maskedScope !== undefined && maskedScope !== this.agyScopeEpoch) ||
+          (!listed.has(file) && absent(placement.file))
+        )
+          this.compressedPlacements!.delete(file);
+      for (const [file, { source, hidden, pending }] of this.qualifiedCompressedOpenings ?? []) {
+        if (!listed.has(file)) {
+          if (absent(source.file)) {
+            this.qualifiedCompressedOpenings?.delete(file);
+            this.compressedRepairs?.delete(file);
+          }
+          continue;
+        }
+        const stat = readRolloutStat(source.file);
+        if (!pending && !this.codexListingSeeded && stat?.isFile && sameCompressedRevision(source, stat))
+          compressedEvidence.push({ ...physicalContext, source, hidden, excluded: !inRoots(source.cwd!) });
+      }
+    }
+    const compressedRows = this.compressedRowsOf(listing, inRoots, physicalContext, physical);
     const codex = compressedRows.length
       ? [...listing.sessions, ...compressedRows].sort((a, b) => b.mtimeMs - a.mtimeMs)
       : listing.sessions;
@@ -16257,11 +18851,30 @@ export class PanelProvider implements vscode.Disposable {
     if (this.claudeChildrenDiscovered && this.pruneDerivedTitles(walked)) {
       this.derivedCacheCheckpointState.markChanged();
     }
-    const walkedSessions = orderSessionCatalog([...listed, ...this.claudeChildren, ...codex], (session) =>
+    if (this.agyCatalog?.folderPrint === folderPrint) this.agyCatalog.publish = false;
+    const reservations = retainNativeSessionReservations(
+      [...claude, ...childSources, ...codex],
+      this.agyNativeReservations && [...this.agyNativeReservations.values()].flat(),
+      physicalContext,
+      this.sourceEnumerations,
+      compressedEvidence.length ? [...sourceObservations, ...compressedEvidence] : sourceObservations,
+      inRoots,
+      this.compressedWalk
+        ? {
+            coverage: this.compressedWalk.physical,
+            plainPresent: (file) => this.compressedPlainPresent(file, this.compressedWalk!),
+          }
+        : undefined,
+    );
+    this.agyNativeReservations = new Map();
+    this.rememberAgyNativeRows(reservations);
+    const agy = this.agyCatalog?.folderPrint === folderPrint ? this.agyRowsFor(this.agyCatalog.rows) : [];
+    if (this.agyScan?.cache.size) this.displaceAgyReads([]);
+    const walkedSessions = orderSessionCatalog([...listed, ...this.claudeChildren, ...codex, ...agy], (session) =>
       this.activityFor(session),
     );
     this.enumeratedMembers = new Set();
-    const enumeratedSources = sessionPageSources([...claude, ...childSources, ...codex]);
+    const enumeratedSources = sessionPageSources([...claude, ...childSources, ...codex, ...agy]);
     this.enumeratedCollisions = reconcileSessionCollisions(
       enumeratedSources,
       this.enumeratedCollisions,
@@ -16302,7 +18915,7 @@ export class PanelProvider implements vscode.Disposable {
     if (heldClaude) {
       // The walked rows list every Claude parent, and the held catalog lists only the parents that prompt admission kept.
       const held = orderSessionCatalog(
-        [...(this.catalog?.sessions ?? []).filter((session) => session.agent !== 'codex'), ...codex],
+        [...(this.catalog?.sessions ?? []).filter((session) => session.agent === 'claude'), ...codex, ...agy],
         (session) => this.activityFor(session),
       );
       this.catalog = { folders: folderPrint, sessions: held };
@@ -16333,6 +18946,7 @@ export class PanelProvider implements vscode.Disposable {
       this.codexSubagents,
       this.subagentDirectories,
       this.dispatchEdges(sessions),
+      sessions.filter((session) => session.agent === 'agy'),
     );
     const invalidated = invalidateClaudeCostSupplements(this.projectSpendFiles, this.sessionSpendSources);
     const invalidatedVisible = invalidateClaudeCostSupplements(this.projectSpendVisibleFiles, this.sessionSpendSources);
@@ -16366,19 +18980,55 @@ export class PanelProvider implements vscode.Disposable {
     }
   }
 
-  // The host set of compressed rollouts, when the current worker has not answered a request that carried this revision.
-  private compressedRolloutsToSend(): { compressed?: string[]; compressedStores?: CompressedStorePaths } {
-    const stores = this.compressedStorePaths();
+  // Send the complete list until the current worker acknowledges this revision for these stores.
+  private compressedRolloutsToSend(stores = this.compressedStorePaths()): {
+    compressed?: string[];
+    compressedMemberships?: number[];
+    compressedStores?: CompressedStorePaths;
+    compressedRevision?: number;
+    compressedScope?: number;
+  } {
     if (!stores) return {};
-    const worker = this.progressiveWorker.currentThreadId ?? null;
     const sent = this.compressedRolloutsSent;
-    if (sent && sent.worker === worker && sent.revision === this.compressedRolloutsRevision) return {};
-    return { compressed: [...this.compressedRollouts], compressedStores: stores };
+    if (
+      sent &&
+      sent.worker === this.progressiveWorker.currentThreadId &&
+      sent.revision === this.compressedRolloutsRevision &&
+      sameCompressedStores(sent.stores, stores)
+    )
+      return {};
+    const compressed = [...this.compressedRollouts];
+    const memberships = this.compressedMemberships;
+    return {
+      compressed,
+      ...(memberships && {
+        compressedMemberships: compressed.map(
+          (file) => (memberships.get(file) ?? 0) * (this.compressedMembershipChecks?.has(file) ? -1 : 1),
+        ),
+      }),
+      compressedStores: stores,
+      compressedRevision: this.compressedRolloutsRevision,
+      compressedScope: this.agyScopeEpoch,
+    };
   }
 
-  // The worker answered the request that carried the list. A superseded or cancelled request keeps the list unsent.
-  private markCompressedRolloutsSent(revision: number): void {
-    this.compressedRolloutsSent = { worker: this.progressiveWorker.currentThreadId ?? null, revision };
+  private markCompressedRolloutsSent(
+    receipt: CompressedNamesReceipt,
+    worker: number,
+    stores: CompressedStorePaths,
+    scope: number,
+  ): boolean {
+    const current = this.compressedStorePaths();
+    if (
+      worker !== this.progressiveWorker.currentThreadId ||
+      scope !== this.agyScopeEpoch ||
+      receipt.revision !== this.compressedRolloutsRevision ||
+      !current ||
+      !sameCompressedStores(stores, current)
+    )
+      return false;
+    this.compressedRolloutsSent = { worker, revision: receipt.revision, stores };
+    return true;
   }
 
   private async prepareClaudeChildren(
@@ -16586,51 +19236,52 @@ export class PanelProvider implements vscode.Disposable {
       this.epochCodexChildren = codexChildren?.length ? await this.unlistedCodexChildren(parents, codexChildren) : [];
       this.epochSidecars = discoverySourceStamps(subagentSidecars(childSources ?? []));
     }
-    const compressedList = this.compressedRolloutsToSend();
+    const compressedStores = this.compressedStorePaths();
     const compressedRevision = this.compressedRolloutsRevision;
+    const compressedScope = this.agyScopeEpoch;
     // The host keeps the spend sources of its checkpoint, and the worker reads none of them.
     let discovery: import('./progressiveworker').DiscoveryCheckpoint | undefined;
     if (this.discoveryCheckpoint) {
       const { spendSources: _spendSources, ...sent } = this.discoveryCheckpoint;
       discovery = sent;
     }
+    const request: Extract<ProgressiveRequest, { kind: 'claude-children' }> = {
+      kind: 'claude-children',
+      codexChildren,
+      parents,
+      repositoryRoots: this.repositoryScopeRoots,
+      referenceEntries: [...this.claudeChildReferenceEntries],
+      relationshipRejections: this.relationshipRejections,
+      discovery,
+      // A refresh waits on its first reply. A continuation keeps its receipt slices in one request until
+      // the host accepts its first catalog.
+      ...(!continuation || !this.authoritativeCatalog ? { sliceReply: true as const } : {}),
+    };
+    const current = () =>
+      !this.disposed &&
+      generation === this.refreshGeneration &&
+      compressedScope === this.agyScopeEpoch &&
+      compressedRevision === this.compressedRolloutsRevision &&
+      sameCompressedStores(compressedStores ?? undefined, this.compressedStorePaths() ?? undefined);
+    let namesMs = 0;
     const waitStarted = performance.now();
     const result = await this.progressiveWorker
-      .run(
-        {
-          kind: 'claude-children',
-          codexChildren,
-          parents,
-          repositoryRoots: this.repositoryScopeRoots,
-          referenceEntries: [...this.claudeChildReferenceEntries],
-          relationshipRejections: this.relationshipRejections,
-          discovery,
-          // A refresh waits on its own request before it renders. A continuation keeps its receipt slices in one request until
-          // the host accepts its first catalog.
-          ...(!continuation || !this.authoritativeCatalog ? { sliceReply: true as const } : {}),
-          ...compressedList,
+      .run(request, generation, signal, acknowledge, undefined, {
+        current,
+        names: () => {
+          const started = performance.now();
+          const names = this.compressedRolloutsToSend(compressedStores);
+          namesMs += performance.now() - started;
+          return names;
         },
-        generation,
-        signal,
-        acknowledge,
-      )
+      })
       .catch(() => null);
-    humanPromptWork.discoveryWaitMs = (humanPromptWork.discoveryWaitMs ?? 0) + performance.now() - waitStarted;
-    const answeringWorker = this.progressiveWorker.currentThreadId ?? null;
-    if (result && compressedList.compressed) {
-      this.markCompressedRolloutsSent(compressedRevision);
-      // Any reply that carries the list says how the worker took it. A request that ends another way keeps the list unsent.
-      const taken =
-        result.value.kind === 'claude-children' ||
-        result.value.kind === 'claude-children-progress' ||
-        result.value.kind === 'claude-children-delta'
-          ? result.value.compressedNames
-          : undefined;
-      if (taken) this.performanceCounters?.recordWork?.(`compressedNames:${taken}`, compressedList.compressed.length);
-    }
+    humanPromptWork.discoveryWaitMs =
+      (humanPromptWork.discoveryWaitMs ?? 0) + performance.now() - waitStarted - namesMs;
+    const answeringWorker = result?.workerThreadId ?? this.progressiveWorker.currentThreadId ?? null;
     if (!result) {
       if (signal.aborted) this.performanceCounters?.recordDiscoveryAbort?.();
-      this.failSessionLoading(generation, signal);
+      if (current()) this.failSessionLoading(generation, signal);
       return false;
     }
     if (!acknowledge(result)) return false;
@@ -16641,6 +19292,17 @@ export class PanelProvider implements vscode.Disposable {
       progress.kind !== 'claude-children-delta'
     )
       return false;
+    const receipt = progress.compressedNames;
+    if (
+      receipt &&
+      compressedStores &&
+      receipt.revision === compressedRevision &&
+      compressedScope !== undefined &&
+      result.workerThreadId != null
+    ) {
+      if (this.markCompressedRolloutsSent(receipt, result.workerThreadId, compressedStores, compressedScope))
+        this.performanceCounters?.recordWork?.(`compressedNames:${receipt.state}`, this.compressedRollouts.size);
+    }
     this.performanceCounters?.recordDiscovery?.(
       progress.charges,
       {
@@ -16666,12 +19328,20 @@ export class PanelProvider implements vscode.Disposable {
         // A session this panel started joins the accepted rows once its own source qualifies, so its name and recorded
         // responses replace the temporary ones without waiting for unrelated discovery.
         const started = accepted ? this.startedSources(this.catalog.sessions, accepted) : [];
-        this.catalog = {
-          ...this.catalog,
-          sessions: this.withHeldCompressedRows(
-            started.length ? [...accepted!, ...started] : (accepted ?? this.catalog.sessions),
-          ),
-        };
+        const held = accepted ?? this.catalog.sessions;
+        const agy = this.agyRowsFor(this.catalog.sessions);
+        const priorAgy = held.filter((source) => source.agent === 'agy');
+        const sameAgy = agy.length === priorAgy.length && agy.every((row, index) => row === priorAgy[index]);
+        const agyIds = agy.length ? new Set(agy.map((source) => source.sessionId.toLowerCase())) : undefined;
+        const sessions =
+          started.length || !sameAgy
+            ? [
+                ...held.filter((source) => source.agent !== 'agy' && !agyIds?.has(source.sessionId.toLowerCase())),
+                ...started,
+                ...agy,
+              ]
+            : held;
+        this.catalog = { ...this.catalog, sessions: this.withHeldCompressedRows(sessions) };
       }
       if (this.dispatchedDiscoveryWaiting() !== discoveryWaiting) this.postDispatchedCostsIfMoved('childrenProgress');
       return this.authoritativeCatalog !== null || this.publishesWalkedRows();
@@ -16682,8 +19352,10 @@ export class PanelProvider implements vscode.Disposable {
     const membersSettled = !this.dispatchDiscoveryPending;
     if (this.dispatchDiscoveryPending) this.dispatchDiscoveryPendingWriter = 'unsettledReply';
     this.dispatchSpendPending = progress.continuation && progress.membershipSettled === true;
-    this.applyDispatchFacts(progress.dispatchFacts ?? []);
     this.claudeChildren = progress.children;
+    this.rememberAgyNativeRows(progress.children);
+    if (this.agyScan?.cache.size) this.displaceAgyReads(progress.children);
+    this.applyDispatchFacts(progress.dispatchFacts ?? []);
     this.claudeChildrenDiscovered = true;
     if (!this.dispatchDiscoveryPending) {
       // A settled reply verifies the links that the first catalog published from the saved set, and replaces the saved set. A
@@ -16761,14 +19433,24 @@ export class PanelProvider implements vscode.Disposable {
       this.savedRowSources = null;
       return false;
     }
-    const roots = this.withHeldCompressedRows(discoveryRoots.filter((root) => admittedRoots.has(root)));
+    const roots = this.withHeldCompressedRows(
+      discoveryRoots.filter((root) => root.agent !== 'agy' && admittedRoots.has(root)),
+    );
+    let agy: SessionFile[] = [];
+    if (this.agyScan?.cache.size) {
+      const competition = [...roots, ...this.claudeChildren];
+      agy = this.agyRowsFor(held, competition);
+      this.displaceAgyReads(competition);
+    }
     if (spendSources) {
       this.claudeSpendSources = spendSources.claude;
       this.codexSpendSources = spendSources.codex;
       this.codexSubagents = spendSources.children;
     }
     const codex = roots.filter((session) => session.agent === 'codex');
-    const sessions = orderSessionCatalog([...roots, ...this.claudeChildren], (session) => this.activityFor(session));
+    const sessions = orderSessionCatalog([...roots, ...this.claudeChildren, ...agy], (session) =>
+      this.activityFor(session),
+    );
     this.discoveryComplete = {
       scope: JSON.stringify(this.repositoryScopeRoots),
       files: new Set(sessions.map((session) => session.file)),
@@ -16960,6 +19642,7 @@ export class PanelProvider implements vscode.Disposable {
     this.cachedLinksOffered = true;
     this.cachedLinks = { scope, references: published.references, children: published.children };
     if (this.catalog) this.catalog = { ...this.catalog, sessions: published.sessions };
+    if (this.agyScan?.cache.size) this.displaceAgyReads(published.children);
     this.dispatchDiscoveryPending = true;
     this.dispatchDiscoveryPendingWriter = 'cachedLinks';
     this.sessionQueryDiscoveryPending = true;
@@ -17111,24 +19794,38 @@ export class PanelProvider implements vscode.Disposable {
   private coveredMember(source: SessionFile, member?: string): boolean {
     return (
       !this.enumeratedAmbiguousIds?.has(source.sessionId) &&
+      (source.agent !== 'agy' || !this.agyCatalog?.uncertain.has(source.sessionId)) &&
       (this.enumeratedMembers?.has(member ?? sessionCoverageMember(source)) ||
         (source.childTranscript === true && !this.dispatchDiscoveryPending))
     );
   }
 
   private acceptSessionCoverage(current: SessionFile[], scope: string): SessionFile[] {
+    current = this.currentCompressedProjections(current);
+    let agyIds: Set<string> | undefined;
+    if (current.some((source) => source.agent === 'agy'))
+      current = current.filter((source) => {
+        if (source.agent !== 'agy') return true;
+        if (!this.agyReadAdmission(source, current, true)) return false;
+        (agyIds ??= new Set()).add(source.sessionId.toLowerCase());
+        return true;
+      });
     const revision = String((this.coverageRevision = (this.coverageRevision ?? 0) + 1));
     const enumeration = this.sourceEnumerations;
     const enumerated =
       !!enumeration && enumeration.claude.status === 'complete' && enumeration.codex.status === 'complete';
-    let complete = enumerated && this.enumeratedAdmissionComplete && !this.dispatchDiscoveryPending;
-    this.membershipCoverageGap = !enumerated
-      ? 'enumeration'
-      : !this.enumeratedAdmissionComplete
-        ? 'admission'
-        : this.dispatchDiscoveryPending
-          ? 'pendingSet'
-          : undefined;
+    const agyIncomplete =
+      this.agyScan !== undefined && (this.agyScan.controller !== undefined || this.agyCatalog?.complete !== true);
+    if (this.agyScan?.controller) this.agyScan.coveragePublished = true;
+    let complete = enumerated && !agyIncomplete && this.enumeratedAdmissionComplete && !this.dispatchDiscoveryPending;
+    this.membershipCoverageGap =
+      !enumerated || agyIncomplete
+        ? 'enumeration'
+        : !this.enumeratedAdmissionComplete
+          ? 'admission'
+          : this.dispatchDiscoveryPending
+            ? 'pendingSet'
+            : undefined;
     // The member key of each source, computed once in this call. A source that both lists hold is the same object.
     const memberKeys = new Map<SessionFile, string>();
     const memberOf = (source: SessionFile): string => {
@@ -17143,7 +19840,7 @@ export class PanelProvider implements vscode.Disposable {
       revision,
       status: complete ? 'complete' : 'incomplete',
       files: current.map((source) => source.file),
-      uncertain: [],
+      uncertain: agyIncomplete && this.agyScan ? [this.agyScan.brain] : [],
       members,
     };
     if (enumeration) {
@@ -17163,13 +19860,12 @@ export class PanelProvider implements vscode.Disposable {
       };
     }
     if (this.physicalCoverage) {
-      for (const fact of Object.values(this.physicalCoverage)) {
-        fact.paths = new Set(fact.files.map(normalizeFsPath));
-        if (fact.directories)
-          fact.directoryPaths = new Set(
-            fact.directories.map((directory) => normalizeFsPath(directory).replace(/\/$/, '')),
-          );
-      }
+      const context = { domain: 'physical' as const, scope, revision };
+      const codex = this.physicalCoverage.codex;
+      this.physicalCoverage = {
+        claude: indexedPhysical(this.physicalCoverage.claude, context),
+        codex: this.compressedPhysicalCoverage(codex, context),
+      };
     }
     const currentMembers = new Set(current.map(memberOf));
     const physical: PhysicalMembershipHeld = {};
@@ -17194,11 +19890,16 @@ export class PanelProvider implements vscode.Disposable {
         : undefined;
     if (this.cachedLinks?.settled) this.cachedLinks = undefined;
     if (complete || this.authoritativeCatalogScope !== scope) return current;
+    const acceptedFiles = new Set(current.map((source) => sessionCoverageFileKey(source.agent, source.file)));
     return [
       ...current,
       ...(this.authoritativeCatalog ?? []).filter(
         (source) =>
+          source.agent !== 'agy' &&
+          this.compressedProjectionCurrent(source) &&
+          !agyIds?.has(source.sessionId.toLowerCase()) &&
           !currentMembers.has(memberOf(source)) &&
+          !acceptedFiles.has(sessionCoverageFileKey(source.agent, source.file)) &&
           !unverified?.has(normalizeFsPath(source.file)) &&
           this.physicalMembershipOf(source.file, physical) !== 'absent',
       ),
@@ -17527,7 +20228,8 @@ export class PanelProvider implements vscode.Disposable {
   private async prepareMetadata(sessions: SessionFile[], generation: number, signal: AbortSignal): Promise<boolean> {
     let remaining = INITIAL_RAIL_READ_BYTES;
     for (const session of sessions) {
-      if (isCompressedRollout(session.file)) continue;
+      if (isCompressedRollout(session.file) || (session.agent === 'agy' && !this.agyReadAdmission(session, sessions)))
+        continue;
       const previous = this.titles.get(session.file);
       if (previous && sameSessionRevision(previous, session) && previous.foldedLabel !== undefined) {
         this.observeStoredEntry(session, previous);
@@ -17538,17 +20240,17 @@ export class PanelProvider implements vscode.Disposable {
         break;
       }
       remaining -= bytes;
-      const result = await this.progressiveWorker
-        .run(
-          {
-            kind: 'metadata',
-            session,
-            opening: session.agent === 'codex' ? this.codexMetas.savedOpening(session.file) : undefined,
-          },
-          generation,
-          signal,
-        )
-        .catch(() => null);
+      const result = await this.runTranscriptRead(
+        {
+          kind: 'metadata',
+          session,
+          opening: session.agent === 'codex' ? this.codexMetas.savedOpening(session.file) : undefined,
+        },
+        generation,
+        signal,
+        sessions,
+      ).catch(() => null);
+      if (session.agent === 'agy' && !this.agyReadAdmission(session, sessions)) continue;
       const currentRevision = this.revisionOf(session);
       this.noteSessionRead(session, 'metadata', result !== null, generation, signal);
       const grewAfterRead = Boolean(
@@ -17614,6 +20316,7 @@ export class PanelProvider implements vscode.Disposable {
       if (signal.aborted) {
         break;
       }
+      if (session.agent === 'agy' && !this.agyReadAdmission(session, sessions)) continue;
       const previous = this.titles.get(session.file);
       const needs = previous ? railEnrichmentNeeds(previous, session) : null;
       if (!previous || !needs) {
@@ -17631,9 +20334,13 @@ export class PanelProvider implements vscode.Disposable {
       remaining -= bytes;
       let next = previous;
       if (needsStarts) {
-        const result = await this.progressiveWorker
-          .run({ kind: 'starts', session, agentRunScan: previous.agentRunScan }, generation, signal)
-          .catch(() => null);
+        const result = await this.runTranscriptRead(
+          { kind: 'starts', session, agentRunScan: previous.agentRunScan },
+          generation,
+          signal,
+          sessions,
+        ).catch(() => null);
+        if (session.agent === 'agy' && !this.agyReadAdmission(session, sessions)) continue;
         this.noteSessionRead(session, 'starts', result !== null, generation, signal);
         // A failed or rejected read of one source moves on to the next session.
         // A session that grows during every pass then never holds back the sessions after it.
@@ -17673,18 +20380,18 @@ export class PanelProvider implements vscode.Disposable {
           continue;
         }
         remaining -= metadataBytes;
-        const result = await this.progressiveWorker
-          .run(
-            {
-              kind: 'metadata',
-              session,
-              tailBytes: RAIL_ENRICHMENT_READ_BYTES,
-              opening: session.agent === 'codex' ? this.codexMetas.savedOpening(session.file) : undefined,
-            },
-            generation,
-            signal,
-          )
-          .catch(() => null);
+        const result = await this.runTranscriptRead(
+          {
+            kind: 'metadata',
+            session,
+            tailBytes: RAIL_ENRICHMENT_READ_BYTES,
+            opening: session.agent === 'codex' ? this.codexMetas.savedOpening(session.file) : undefined,
+          },
+          generation,
+          signal,
+          sessions,
+        ).catch(() => null);
+        if (session.agent === 'agy' && !this.agyReadAdmission(session, sessions)) continue;
         this.noteSessionRead(session, 'enrichment', result !== null, generation, signal);
         if (!result || signal.aborted) {
           if (signal.aborted || generation !== this.refreshGeneration) break;
@@ -17728,7 +20435,11 @@ export class PanelProvider implements vscode.Disposable {
     changed = drawn || (stored && (stale.length > 0 || deferred));
     const eligible = sessions.filter((session) => {
       const entry = this.titles.get(session.file);
-      return entry && railEnrichmentNeeds(entry, session)?.recovery;
+      return (
+        (session.agent !== 'agy' || this.agyReadAdmission(session, sessions)) &&
+        entry &&
+        railEnrichmentNeeds(entry, session)?.recovery
+      );
     });
     const eligibleIds = new Set(eligible.map((session) => session.sessionId));
     this.progressiveWorker.retainMetadataRecovery?.([...eligibleIds]);
@@ -17748,19 +20459,19 @@ export class PanelProvider implements vscode.Disposable {
     if (active && remaining > 0 && !signal.aborted && generation === this.refreshGeneration) {
       const sliceBytes = Math.min(remaining, RAIL_ENRICHMENT_READ_BYTES);
       remaining -= sliceBytes;
-      const result = await this.progressiveWorker
-        .run(
-          {
-            kind: 'metadata-recovery',
-            session: active,
-            sliceBytes,
-            eligible: eligible.map((session) => session.sessionId),
-            opening: active.agent === 'codex' ? this.codexMetas.savedOpening(active.file) : undefined,
-          },
-          generation,
-          signal,
-        )
-        .catch(() => null);
+      const result = await this.runTranscriptRead(
+        {
+          kind: 'metadata-recovery',
+          session: active,
+          sliceBytes,
+          eligible: eligible.map((session) => session.sessionId),
+          opening: active.agent === 'codex' ? this.codexMetas.savedOpening(active.file) : undefined,
+        },
+        generation,
+        signal,
+        sessions,
+      ).catch(() => null);
+      if (active.agent === 'agy' && !this.agyReadAdmission(active, sessions)) return { changed, stale, progress };
       this.noteSessionRead(active, 'recovery', result !== null, generation, signal);
       if (
         result &&
@@ -17995,7 +20706,11 @@ export class PanelProvider implements vscode.Disposable {
         ? { label: carried.label, fullLabel: carried.fullLabel || carried.label }
         : sessionLabelOf(name, session.sessionId);
     }
-    const title = this.titleFor(session);
+    if (session.agent === 'agy' && !this.agyReadAdmission(session, undefined, true)) {
+      const label = `Session ${session.sessionId.slice(0, 8)}`;
+      return { label, fullLabel: label };
+    }
+    const title = this.titleFor(session) || session.agyFirstPrompt;
     if (!title && carried) {
       return { label: carried.label, fullLabel: carried.fullLabel || carried.label };
     }
@@ -18048,20 +20763,61 @@ export class PanelProvider implements vscode.Disposable {
   private parentOfShown(session: string | null): SessionParent | undefined {
     this.indexSessionRows();
     const rowOf = (id: string) => {
-      const sources = this.selectionOutcomes && this.selectionSources?.byId.get(id);
-      if (sources?.length === 1) return { id, label: this.sessionLabel(sources[0]).label };
+      id = this.agyPresentationSession(id);
       const at = this.sessionRowIndex!.byId.get(id);
-      return at === undefined ? undefined : this.sessionRows[at];
+      const selected = this.selectionOutcomes && this.selectionRows?.find((row) => row.id === id);
+      const row = selected || (at === undefined ? undefined : this.sessionRows[at]);
+      const pending = this.agyPendingPresentation(id);
+      if (pending) return this.pendingSessionRow(pending);
+      const sources = this.selectionOutcomes && this.selectionSources?.byId.get(id);
+      if (sources?.length === 1 && (!row || row.agentKey === sources[0].agent))
+        return { id, label: this.sessionLabel(sources[0]).label, agentKey: sources[0].agent };
+      return row && this.qualifiedSessionRow(row);
     };
     const parentId = session ? this.saved.readerParents?.[session] : undefined;
     if (parentId) {
       const parent = rowOf(parentId);
       return parent ? { id: parent.id, label: parent.label, relation: 'reader' } : undefined;
     }
-    const held = this.sessionParentEdgeSet;
-    const edge = session ? held?.edges.get(session) : undefined;
-    const parent = edge && rowOf(edge.parent);
-    return parent && edge ? { id: parent.id, label: parent.label, relation: edge.relation } : undefined;
+    if (!session || this.agyPendingPresentation(session)) return undefined;
+    const edge = this.sessionParentsOf().get(session);
+    if (!edge || this.agyPendingPresentation(edge.parent)) return undefined;
+    const child = rowOf(session);
+    const parent = rowOf(edge.parent);
+    if (!child || !parent || child.id !== session || parent.id !== edge.parent) return undefined;
+    const { references, children, codex } = this.sessionParents!;
+    if (edge.relation === 'dispatched') {
+      const selected = this.selectionOutcomes && this.selectionSources?.byId.get(child.id);
+      const catalog = this.authoritativeCatalog ?? this.catalog?.sessions ?? [];
+      const files = (selected || catalog).filter(
+        (source) => source.sessionId === child.id && source.agent === child.agentKey,
+      );
+      const pair = (file: string) => normalizeFsPath(file.replace(/\.jsonl\.zst$/, '.jsonl'));
+      if (
+        !references.some(
+          (reference) =>
+            reference.kind === 'dispatch' &&
+            reference.sessionId === child.id &&
+            reference.parentSessionId === parent.id &&
+            reference.agent === child.agentKey &&
+            reference.file !== null &&
+            files.some((source) => pair(source.file) === pair(reference.file!)),
+        )
+      )
+        return undefined;
+      if (catalog.some((source) => source.sessionId === parent.id && source.agent !== parent.agentKey))
+        return undefined;
+    } else if (
+      child.agentKey !== parent.agentKey ||
+      !(child.agentKey === 'codex'
+        ? codex?.some(
+            (source) => source.threadId === child.id && source.parentThreadId === parent.id && !source.backgroundReview,
+          )
+        : child.agentKey === 'claude' &&
+          children?.some((source) => source.sessionId === child.id && source.parentSessionId === parent.id))
+    )
+      return undefined;
+    return { id: parent.id, label: parent.label, relation: edge.relation };
   }
 
   // The dispatched edges among `sessions`, as child id to parent id.
@@ -18599,6 +21355,7 @@ export class PanelProvider implements vscode.Disposable {
     const entry = this.cache.get(session.file);
     return Boolean(
       entry &&
+      (session.agent !== 'agy' || this.agyReadAdmission(session)) &&
       entry.key === transcriptReadCacheKey(session, TRANSCRIPT_TURN_LIMIT, TRANSCRIPT_TAIL_BYTES, this.folders()) &&
       entry.structuralKey === this.structuralKey(session),
     );
@@ -18644,7 +21401,7 @@ export class PanelProvider implements vscode.Disposable {
     const pages = history?.pages ?? [];
     const historyVersions = new Map<string, string>();
     if (pages.length) this.historyAgentKey(session, pages, undefined, historyVersions, now);
-    const updated = await this.progressiveWorker.run(
+    const updated = await this.runTranscriptRead(
       {
         kind: 'retained',
         input: this.progressiveInput(session, now),
@@ -18655,7 +21412,11 @@ export class PanelProvider implements vscode.Disposable {
       generation,
       signal,
     );
-    if (signal.aborted || this.cache.get(session.file) !== entry) {
+    if (
+      signal.aborted ||
+      this.cache.get(session.file) !== entry ||
+      (session.agent === 'agy' && !this.agyReadAdmission(session))
+    ) {
       return false;
     }
     entry.agentKey = agentKey;
@@ -18717,8 +21478,9 @@ export class PanelProvider implements vscode.Disposable {
     ) {
       return null;
     }
+    if (this.agyPendingPresentation(work.sessionId)) return null;
     const session = this.authoritativeCatalog?.find((candidate) => candidate.sessionId === work.sessionId);
-    if (!session) return null;
+    if (!session || (session.agent === 'agy' && !this.agyReadAdmission(session))) return null;
     let revision: FileRevision;
     try {
       revision = this.revisionOf(session);
@@ -18747,11 +21509,19 @@ export class PanelProvider implements vscode.Disposable {
     this.selectionWork = work;
     this.selectionWorks?.set(sessionId, work);
     let retryLatestRevision = false;
+    let admission: AgyAdmission | undefined;
+    const stillAdmitted = (source: SessionFile | null): source is SessionFile =>
+      source !== null &&
+      work.source?.agent === source.agent &&
+      work.source.file === source.file &&
+      (!admission || this.agyReadAdmission(source) === admission);
     // Track work that can change the drawn window, so an unchanged cached result does not trigger another render.
     let roundTrip = false;
     try {
       let session = this.currentSelectedSession(work);
       if (!session) return;
+      work.source = session;
+      admission = session.agent === 'agy' ? this.agyReadAdmission(session) : undefined;
       const history = this.history.get(sessionId);
       const historyVersions = new Map<string, string>();
       const historyNow = Date.now();
@@ -18763,7 +21533,7 @@ export class PanelProvider implements vscode.Disposable {
         roundTrip = true;
         const windowVersions = new Map<string, string>();
         const window = this.jointSplitWindow(session, windowVersions, historyNow);
-        const updated = await this.progressiveWorker.run(
+        const updated = await this.runTranscriptRead(
           {
             kind: 'retained',
             input: this.progressiveInput(session, historyNow),
@@ -18774,7 +21544,7 @@ export class PanelProvider implements vscode.Disposable {
           controller.signal,
         );
         const current = this.currentSelectedSession(work);
-        if (!current) {
+        if (!stillAdmitted(current)) {
           return;
         }
         const currentRevision = this.revisionOf(current);
@@ -18832,7 +21602,7 @@ export class PanelProvider implements vscode.Disposable {
             !isDeepStrictEqual(this.history.get(sessionId)?.pages, drawnPages);
           // Recheck the parent after child-spend refresh. A parent append requires a new selected window.
           const refreshed = this.currentSelectedSession(work);
-          if (!refreshed) {
+          if (!stillAdmitted(refreshed)) {
             return;
           }
           session = refreshed;
@@ -18850,7 +21620,7 @@ export class PanelProvider implements vscode.Disposable {
           controller.signal,
         );
         const refreshed = this.currentSelectedSession(work);
-        if (!refreshed) return;
+        if (!stillAdmitted(refreshed)) return;
         session = refreshed;
         // Sources can change while hydration waits, and a rejected reply stores nothing, so read the current keys again.
         let currentKeys: Map<string, string> | undefined;
@@ -18910,7 +21680,7 @@ export class PanelProvider implements vscode.Disposable {
       // The window request opens the body, so the worker holds this path from here.
       if (compressed) this.compressedBodyFile = session.file;
       this.dropHistoryOfOtherPath(session);
-      const result = await this.progressiveWorker.run(
+      const result = await this.runTranscriptRead(
         {
           kind: 'window',
           input: this.progressiveInput(session),
@@ -18920,7 +21690,7 @@ export class PanelProvider implements vscode.Disposable {
         controller.signal,
       );
       const current = this.currentSelectedSession(work);
-      if (!current) {
+      if (!stillAdmitted(current)) {
         return;
       }
       const currentRevision = this.revisionOf(current);
@@ -18989,7 +21759,7 @@ export class PanelProvider implements vscode.Disposable {
         controller.signal,
       );
       const enriched = this.currentSelectedSession(work);
-      if (!enriched) return;
+      if (!stillAdmitted(enriched)) return;
       if (!sameProgressiveRevision(result.revision, this.revisionOf(enriched))) {
         retryLatestRevision = true;
         return;
@@ -19015,7 +21785,7 @@ export class PanelProvider implements vscode.Disposable {
       if (changed) this.refreshFrom('selected-commits', true, true, null, true, true);
     } catch {
       const current = this.currentSelectedSession(work);
-      if (current) {
+      if (stillAdmitted(current)) {
         this.selectionFailures.set(current.file, { sessionId, generation, revision: this.revisionOf(current) });
         this.refreshFrom('selected-failure', true, true, null, true, true);
       }
@@ -19055,6 +21825,8 @@ export class PanelProvider implements vscode.Disposable {
       if (signal.aborted) {
         return false;
       }
+      const current = () => session.agent !== 'agy' || !!this.agyReadAdmission(session);
+      if (!current()) continue;
       const selectedFailure = this.drawnSelectionFailure(session);
       if (this.selectionFailureOf(session) && !selectedFailure) this.selectionFailures.delete(session.file);
       if (session.sessionId === this.showing) {
@@ -19068,7 +21840,7 @@ export class PanelProvider implements vscode.Disposable {
       if (history?.pages.length && this.historyStructuralKeys.get(session.sessionId) !== historyKey) {
         const windowVersions = new Map<string, string>();
         const window = this.jointSplitWindow(session, windowVersions, historyNow);
-        const updated = await this.progressiveWorker.run(
+        const updated = await this.runTranscriptRead(
           {
             kind: 'retained',
             input: this.progressiveInput(session, historyNow),
@@ -19078,11 +21850,13 @@ export class PanelProvider implements vscode.Disposable {
           generation,
           signal,
         );
+        if (!current()) continue;
         if (
           !updated ||
           signal.aborted ||
           !acceptsProgressiveResult(updated, this.refreshGeneration, this.revisionOf(session))
         ) {
+          if (session.agent === 'agy' && !signal.aborted) continue;
           return false;
         }
         if (updated.value.kind === 'retained' && this.history.get(session.sessionId) === history) {
@@ -19122,7 +21896,7 @@ export class PanelProvider implements vscode.Disposable {
       if (isCompressedRollout(session.file)) continue;
       const previous = this.cache.get(session.file);
       this.dropHistoryOfOtherPath(session);
-      const result = await this.progressiveWorker.run(
+      const result = await this.runTranscriptRead(
         {
           kind: 'window',
           input: this.progressiveInput(session),
@@ -19131,11 +21905,13 @@ export class PanelProvider implements vscode.Disposable {
         generation,
         signal,
       );
+      if (!current()) continue;
       if (
         !result ||
         signal.aborted ||
         !acceptsProgressiveResult(result, this.refreshGeneration, this.revisionOf(session))
       ) {
+        if (session.agent === 'agy' && !signal.aborted) continue;
         return false;
       }
       if (result.value.kind !== 'window') {
@@ -19201,10 +21977,23 @@ export class PanelProvider implements vscode.Disposable {
       this.historyRequest = null;
     }
     const session = this.allSessions(walked ? 'settled' : true).find((candidate) => candidate.sessionId === sessionId);
+    const catalog = this.authoritativeCatalog;
+    const stillAdmitted = () => {
+      if (session?.agent === 'agy') return this.agyReadAdmission(session) && this.revisionOf(session).size >= 0;
+      const latest = this.authoritativeCatalog;
+      return (
+        !latest ||
+        latest === catalog ||
+        this.sourcesForSelection(latest, new Set([sessionId])).some(
+          (candidate) => candidate.agent === session?.agent && candidate.file === session.file,
+        )
+      );
+    };
     const visible = selected();
     const window = this.readWindows.get(sessionId);
     if (
       !session ||
+      !stillAdmitted() ||
       !visible.has(sessionId) ||
       !window ||
       (this.history.get(sessionId) ?? startSessionHistory(session, 0)).atBeginning
@@ -19217,7 +22006,7 @@ export class PanelProvider implements vscode.Disposable {
     }
     const controller = new AbortController();
     const generation = ++this.historyGeneration;
-    this.historyRequest = { sessionId, controller, generation };
+    this.historyRequest = { sessionId, controller, generation, source: session };
     // Publish loading before the page read, reusing the catalog.
     this.refreshFrom('history', true, true, null, true, true);
     const before = this.history.get(sessionId) ?? startSessionHistory<HistoryCursor>(session, Date.now());
@@ -19225,7 +22014,7 @@ export class PanelProvider implements vscode.Disposable {
     try {
       const reads = historyPageReads(window.loadedTurns);
       for (let attempt = 0; attempt < reads; attempt++) {
-        if (this.historyRequest?.generation !== generation) {
+        if (this.historyRequest?.generation !== generation || !stillAdmitted()) {
           return;
         }
         // Read retained history anew after each await because a refresh can replace its pages or cursor.
@@ -19235,7 +22024,7 @@ export class PanelProvider implements vscode.Disposable {
         }
         const tail = this.cache.get(session.file)?.read ?? { turns: [], compactions: [] };
         const outcome = await this.readOlderHistoryPage(session, held.cursor, controller.signal);
-        if (this.historyRequest?.generation !== generation) {
+        if (this.historyRequest?.generation !== generation || !stillAdmitted()) {
           return;
         }
         const current = this.history.get(sessionId) ?? held;
@@ -19260,6 +22049,7 @@ export class PanelProvider implements vscode.Disposable {
       }
       // Convert read failures to settled history state so loading does not remain active.
     } catch {
+      if (this.historyRequest?.generation !== generation || !stillAdmitted()) return;
       const held = this.history.get(sessionId) ?? before;
       this.history.set(
         sessionId,
@@ -19270,6 +22060,7 @@ export class PanelProvider implements vscode.Disposable {
         this.historyRequest = null;
       }
     }
+    if (!stillAdmitted()) return;
     const settled = this.history.get(sessionId);
     if (settled) {
       this.history.set(sessionId, afterHistoryRequest(settled, before));
@@ -19281,10 +22072,14 @@ export class PanelProvider implements vscode.Disposable {
   // Read current file identity and revision for stale-result and cursor checks.
   private revisionOf(session: SessionFile): FileRevision {
     try {
-      return fileRevisionOf(fs.statSync(session.file, { bigint: true }));
+      if (session.agent !== 'agy') return fileRevisionOf(fs.statSync(session.file, { bigint: true }));
+      const stat = fs.lstatSync(session.file, { bigint: true });
+      const revision = fileRevisionOf(stat);
+      if (stat.isFile() && sameProgressiveRevision(revision, session)) return revision;
     } catch {
-      return { size: -1, mtimeMs: -1, dev: -1, ino: -1 };
+      // The source can move between listing and reading.
     }
+    return { size: -1, mtimeMs: -1, dev: -1, ino: -1 };
   }
 
   private acceptSelectedMetadataRead(session: SessionFile, generation: number): void {
@@ -19316,7 +22111,7 @@ export class PanelProvider implements vscode.Disposable {
     const generation = this.historyGeneration;
     // A page of a compressed rollout opens its body in the worker.
     if (isCompressedRollout(session.file)) this.compressedBodyFile = session.file;
-    const result = await this.progressiveWorker.run(
+    const result = await this.runTranscriptRead(
       {
         kind: 'page',
         input: this.progressiveInput(session),
@@ -19815,6 +22610,7 @@ export class PanelProvider implements vscode.Disposable {
         turnLimitReached: read.turnLimitReached,
         // Count the tail and retained pages together for the history sentinel.
         loadedTurns: read.turns.length + older.turns.length,
+        ...(session.agent === 'agy' ? { agySource: session } : {}),
       });
       turns.push(...read.turns, ...older.turns);
       compactions.push(...read.compactions, ...older.compactions);
@@ -19831,10 +22627,19 @@ export class PanelProvider implements vscode.Disposable {
     this.turnMarks = turns.map((t) => ({ id: turnKey(t), agent: t.agent, finished: t.finished }));
     const currentRecords = currentRecordsBySession(turns, compactions);
     const heldNewest = this.newestBySession;
+    const heldTimelineSources = this.agyTimelineSources;
+    if (this.agyScan?.cache.size || heldTimelineSources?.size || this.agyComposerSources?.size) {
+      this.agyTimelineSources = this.rememberAgyProjections(heldTimelineSources, sessions);
+      this.agyComposerSources = this.rememberAgyProjections(this.agyComposerSources, sessions);
+    }
     this.newestBySession = currentRecords.newestTurns;
     for (const [session, newest] of heldNewest) {
-      if (!this.newestBySession.has(session) && this.membershipOf(session) === 'unknown')
+      if (!this.newestBySession.has(session) && this.membershipOf(session) === 'unknown') {
+        const source = heldTimelineSources?.get(session);
+        if (source && sessions.some((current) => current.sessionId === session)) continue;
         this.newestBySession.set(session, newest);
+        if (source) this.agyTimelineSources?.set(session, source);
+      }
     }
     this.composerRuntime = composerRuntimeBySession(turns, currentRecords.newestCompactions, lastReportedModels);
     // Build recorded prompt recall in newest-first order, including messages submitted during a turn.
@@ -20194,9 +22999,18 @@ export class PanelProvider implements vscode.Disposable {
         ? this.sessionPageIndexFor(accepted, roots, repository?.roots ?? []).scoped
         : []
       : null;
-    const admitted = retainedSessions ? new Set(retainedSessions.map((source) => source.file)) : null;
+    const admitted = retainedSessions ? new Map(retainedSessions.map((source) => [source.file, source])) : null;
     const entries = retained
-      ? [...this.corpus.entries()].filter(([file]) => admitted?.has(file)).flatMap(([, source]) => source.entries)
+      ? [...this.corpus].flatMap(([file, cached]) => {
+          const source = admitted?.get(file);
+          if (!source) return [];
+          if (
+            source.agent === 'agy' &&
+            (!cached.agyAdmission || cached.agyAdmission !== this.agyReadAdmission(source, accepted))
+          )
+            return [];
+          return cached.entries;
+        })
       : this.searchCorpus(this.showing, walked);
     const scope = searchScope(entries, this.showing);
     // Apply current labels, pins, archive state, and agent-run classification at search time. Transcript revisions do not track reader state.
@@ -20245,9 +23059,11 @@ export class PanelProvider implements vscode.Disposable {
       }
       // Content search reads plain transcripts only, so it skips a compressed rollout.
       if (isCompressedRollout(session.file)) continue;
+      const admission = session.agent === 'agy' ? this.agyReadAdmission(session, all) : undefined;
+      if (session.agent === 'agy' && !admission) continue;
       const held = this.corpus.get(session.file);
       // Compare size and mtime so appends within one timestamp tick invalidate cached entries.
-      if (held && held.mtimeMs === session.mtimeMs && held.size === session.size) {
+      if (held && held.agyAdmission === admission && held.mtimeMs === session.mtimeMs && held.size === session.size) {
         // Refresh cached entries' names without rereading unchanged transcript text.
         const named = this.sessionLabel(session).label;
         for (const entry of held.entries) {
@@ -20257,8 +23073,23 @@ export class PanelProvider implements vscode.Disposable {
         continue;
       }
       // Search has a separate read window and cache so it does not replace selected-session reads.
-      const read =
-        session.agent === 'codex'
+      if (admission && this.revisionOf(session).size < 0) continue;
+      const agy = admission
+        ? readAgySession(session.file, session.sessionId, {
+            maxTurns: Number.MAX_SAFE_INTEGER,
+            tailBytes: SEARCH_TAIL_BYTES,
+          })
+        : null;
+      if (
+        agy &&
+        (!agy.checkpoint ||
+          !sameProgressiveRevision(agy.checkpoint.revision, session) ||
+          this.agyReadAdmission(session, all) !== admission)
+      )
+        continue;
+      const read = agy
+        ? agy.read
+        : session.agent === 'codex'
           ? readCodexSession(session.file, session.sessionId, {
               maxTurns: Number.MAX_SAFE_INTEGER,
               tailBytes: SEARCH_TAIL_BYTES,
@@ -20270,6 +23101,7 @@ export class PanelProvider implements vscode.Disposable {
               turnsOnly: true,
               boundedRepeated: true,
             });
+      if (!read) continue;
       if (session.agent === 'claude') {
         this.observeParsedNames(read.turns, new Map([[session.sessionId, session]]));
       }
@@ -20287,7 +23119,7 @@ export class PanelProvider implements vscode.Disposable {
         // Report whether this search read reached the transcript's beginning, independently of retained timeline pages.
         whole: read.readBytes >= session.size,
       }));
-      this.corpus.set(session.file, { mtimeMs: session.mtimeMs, size: session.size, entries });
+      this.corpus.set(session.file, { mtimeMs: session.mtimeMs, size: session.size, entries, agyAdmission: admission });
       out.push(...entries);
     }
     return out;
@@ -20546,8 +23378,10 @@ export class PanelProvider implements vscode.Disposable {
             ...parsed,
             session:
               parsed.type === 'showReaderParent' || (parsed.type === 'showSession' && parsed.responseLink === true)
-                ? resolveSessionAlias(this.sessionAliases, parsed.session)
-                : this.panelSession(parsed.session, host),
+                ? this.agyPresentationSession(resolveSessionAlias(this.sessionAliases, parsed.session))
+                : parsed.type === 'showSession'
+                  ? this.agyPresentationSession(this.panelSession(parsed.session, host))
+                  : this.panelSession(parsed.session, host),
           }
         : parsed;
     if (!message) {
@@ -20627,6 +23461,7 @@ export class PanelProvider implements vscode.Disposable {
             sender.reset('ready');
             sender.acceptedCards = undefined;
             sender.acceptedWindow = undefined;
+            sender.acceptedAgySource = undefined;
             sender.acceptedCardPost = sender.cardPost = (sender.cardPost ?? 0) + 1;
           }
           this.browserReady(host);

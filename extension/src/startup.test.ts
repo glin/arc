@@ -1,4 +1,23 @@
+import {
+  COMPRESSED_REPAIR_LIMIT,
+  addsCompressedRepairEvidence,
+  addsCompressedRepairProof,
+  sameCompressedRepairClaim,
+} from './compressedrollouts';
 import { formatWhen, formatRelative } from './turnformat';
+import { createAgyUsageReducer } from './agyhistory';
+import {
+  agyCollisionWith,
+  agySessionId,
+  agyAdmissionOf,
+  clearAgyDiscoveryCache,
+  currentAgyAdmission,
+  renewAgyAdmission,
+  discardAgyDiscoveryEntry,
+  scanAgySessions,
+  isAgySessionId,
+  type AgyDiscoveryCache,
+} from './agydiscovery';
 import type { RailStatus } from './view/rail';
 import { startingWorktree } from './repositoryscope';
 import { StartupHistory } from './diagnosticslog';
@@ -34,8 +53,22 @@ import {
 import { sessionStatsFromFacts } from './turncard';
 import { LIVE_PRESS_LIMIT_MS, runningKey, sessionRunning, type LivePress } from './composerview';
 import { compatibleDiscovery, discoveryCompatibility } from './progressiveworker';
+import {
+  compressedLoadRecords,
+  compressedRequestBytes,
+  compressedTransferBatches,
+  sameCompressedStores,
+} from './progressiveworker';
 import { claudeDispatchTranscript } from './turnfixtures';
-import { sessionCoverageMember, sessionPresence, reconcileSessionCollisions } from './sessioncoverage';
+import {
+  indexedPhysical,
+  sessionCoverageMember,
+  sessionPresence,
+  reconcileSessionCollisions,
+  retainNativeSessionReservations,
+  nativeReservationTwin,
+  sessionCoverageFileKey,
+} from './sessioncoverage';
 import {
   discoveryMemberRevisions,
   discoveryParentsOf,
@@ -104,13 +137,21 @@ import * as path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { isDeepStrictEqual } from 'node:util';
 import * as zlib from 'node:zlib';
-import { compressedRolloutsReadable, isCompressedRollout, streamCompressedRollout } from './compressedrollouts.ts';
+import {
+  compressedRolloutsReadable,
+  isCompressedRollout,
+  readQualifiedCompressedFirstRecord,
+  sameCompressedPlacement,
+  sameStat as sameCompressedRevision,
+  streamCompressedRollout,
+} from './compressedrollouts.ts';
 import { CompressedBackfill, RolloutDerivation, compressedFactsFromDerivation } from './compressedbackfill.ts';
 import { compressedSpendDisplayFiles, projectSpendWorkspace } from './projectspend.ts';
 import { MULTI_ROOT_SPEND_WORKSPACE_PREFIX } from './identity.ts';
-import { isAgentRun, isHiddenThread, staleMetas } from './codex.ts';
+import { isAgentRun, isHiddenThread, openingRecordOf, staleMetas } from './codex.ts';
 import { arcHome } from './store.ts';
 import {
+  COMPRESSED_ENTRY_TITLE_BYTES,
   COMPRESSED_FACTS_STORE,
   COMPRESSED_FACTS_VERSION,
   COMPRESSED_OPENINGS_STORE,
@@ -121,9 +162,20 @@ import {
   readCompressedStore,
   withKeptUndercount,
   compressedEntrySame,
+  compareCompressedEntries,
+  compressedEntryCurrent,
+  compressedEntryIdentity,
+  quarantineCompressedSpend,
+  compressedEntryConflicts,
+  compressedFactsMatchSource,
+  sessionKeyOf,
   adoptCompressedTwin,
+  recordCompressedAdoption,
+  CompressedStoreFollower,
+  CompressedStoreHolder,
   type CompressedAdoptionInput,
 } from './compressedstore.ts';
+import * as compressedStore from './compressedstore.ts';
 import ts from 'typescript';
 import { agentSpendIsOpen, heaviestModel, OPEN_SPEND_BAND_MS, spendFileVersion, spendTokens } from './agentspend';
 import {
@@ -132,6 +184,7 @@ import {
   CodexStatCache,
   codexSessionFiles,
   readRolloutStat,
+  observeRolloutStat,
   readCodexSessionTitlePair,
   coldOpeningPass,
   enumerateRolloutFilesAsync,
@@ -199,6 +252,7 @@ import {
 import {
   aggregateUsageEvents,
   type UsageEvent,
+  type ProjectSpendView,
   projectSpendDisplayFiles,
   prepareProjectSpendViewSteps,
   truncateProjectSpendView,
@@ -216,7 +270,10 @@ import {
   SpendCoverage,
   spendRecordAgent,
   spendSourceHeld,
+  agySpendAtAdmission,
   pruneSpendFilesWithResult,
+  pruneSpendLedgerFiles,
+  completeSpendFiles,
   sessionLifetimeDisplayFiles,
   spendRecordChangesRail,
   spendRecordHoldsLongLine,
@@ -3112,6 +3169,12 @@ const OPTIONAL_PANEL_PROVIDER_STUBS = `
       agentSpendKey() { return 'spend'; }
       refreshAgentFacts() {}
       usagePayloadForSession(session, webview) { return this.usagePayload(webview); }
+      startAgyDiscovery() {}
+      agyReadCatalogs; agyReadWork; agyReadSequence = 0; agyScan; agyCatalog;
+      agyRowsRevision = 0; agyRowFiles; agyAuthorities; agyNativeReservations;
+      agentReadSources; admittedReadSources = new Map(); selectionWindows; selectionWorks;
+      corpus = new Map(); composerRuntime; turnsByKey; metadataFactsRevision; carriedNames; rowSenders;
+      metadataStatFigures; metadataCacheFigures; metadataRailRevisions; parsedRailCaches;
 `;
 
 function panelProviderMemberNames(): Set<string> {
@@ -3188,11 +3251,134 @@ function guardedHarness<T extends object>(provider: T): T {
 // The members that a named member calls, which a harness carries with it.
 function withCompanionMethods(names: Iterable<string>): string[] {
   const out = [...names];
+  if (
+    ['acceptSessionCoverage', 'allSessions', 'mergeCompressedRows', 'selectionSourcesOf'].some((name) =>
+      out.includes(name),
+    )
+  )
+    out.push('currentCompressedProjections', 'compressedPhysicalCoverage');
+  if (['walkCatalog', 'walkedSessions', 'relistHeldCodex'].some((name) => out.includes(name)))
+    out.push(
+      'contestedCompressedFiles',
+      'compressedPhysicalCoverage',
+      'relistHeldCodex',
+      'releaseCompressedOpeningChecks',
+    );
+  if (['withHeldCompressedRows', 'compressedRowOf', 'currentCompressedProjections'].some((name) => out.includes(name)))
+    out.push('compressedProjectionCurrent', 'compressedPairAdmitted', 'compressedPairListed', 'compressedPlainPresent');
+  if (
+    [
+      'applyCompressedEntries',
+      'compressedRowOf',
+      'currentCompressedProjections',
+      'compressedSpendPick',
+      'withHeldCompressedRows',
+    ].some((name) => out.includes(name))
+  )
+    out.push('compressedContestsAgy', 'agyCatalogRow');
+  if (out.includes('compressedSpendPick')) out.push('compressedSpendCurrent');
+  if (
+    [
+      'applyCompressedEntries',
+      'compressedRowOf',
+      'compressedRowsOf',
+      'compressedProjectionCurrent',
+      'compressedSpendPick',
+      'compressedTitleOf',
+      'compressedCarriedNameOf',
+      'qualifyCompressedOpening',
+    ].some((name) => out.includes(name))
+  )
+    out.push('compressedPlacementAllows');
+  if (out.includes('applyCompressedBatch')) out.push('noteCompressedPlacement');
+  if (out.includes('noteCompressedPlacement') || out.includes('reserveContestedCompressedOpenings'))
+    out.push('replaceCompressedReservation');
+  if (out.includes('compressedTitleOf') || out.includes('compressedCarriedNameOf'))
+    out.push('compressedTitleEligible', 'compressedSpendCurrent');
+  if (out.includes('applyCompressedEntries') || out.includes('adoptCompressedTwin'))
+    out.push('noteCompressedOpeningObservation');
+  if (['applyCompressedEntries', 'installCompressedOpening', 'compressedRowsOf'].some((name) => out.includes(name)))
+    out.push('reconcileCompressedRepair', 'compressedPlainPresent');
+  if (out.includes('compressedLoadRequest')) out.push('compressedRepairsToSend');
+  if (out.includes('workspaceFoldersChanged') || out.includes('repositoryScopeChanged'))
+    out.push('clearCompressedRepairEvidence');
+  if (['refresh', 'mergeCompressedRows', 'postRail'].some((name) => out.includes(name)))
+    out.push(
+      'settlePendingSessionRecords',
+      'pendingPresentationAllows',
+      'scopedAgyPendingOwners',
+      'agyPendingPresentation',
+    );
+  if (out.includes('compressedProjectionCurrent')) out.push('compressedSupersedesPlain');
+  const bodyReads = [
+    'prepareMetadata',
+    'prepareRailEnrichment',
+    'prepareProgressive',
+    'completeSelectedWindow',
+    'refreshAgentFacts',
+    'readOlderHistoryPage',
+    'finishHandoffRecovery',
+  ];
+  if (bodyReads.some((name) => out.includes(name))) out.push('runTranscriptRead');
+  if (out.includes('loadOlderHistory')) out.push('sourcesForSelection');
+  if (
+    [
+      'runTranscriptRead',
+      'allSessions',
+      'applyDispatchFacts',
+      'refresh',
+      'mergeCompressedRows',
+      'searchCorpus',
+      'answerSearch',
+      'sessionLabel',
+      'qualifiedAgySpendRevision',
+    ].some((name) => out.includes(name))
+  )
+    out.push(
+      'agyReadAdmission',
+      'liveAgyAdmission',
+      'agyRowsFor',
+      'agyNativeConflict',
+      'agyCatalogRow',
+      'agyCatalogConflict',
+    );
+  if (
+    ['refresh', 'collect', 'postRail', 'noteCompressedRowFacts', 'finishHandoffRecovery'].some((name) =>
+      out.includes(name),
+    )
+  )
+    out.push('rememberAgyProjections');
+  if (
+    out.some(
+      (name) => name === 'clearAgyDiscovery' || name === 'revokeMissingAgyAdmission' || name === 'startAgyDiscovery',
+    )
+  )
+    out.push('changeAgyAdmission', 'clearAgyDiscovery', 'agyCatalogRow');
+  if (['refresh', 'mergeCompressedRows', 'allSessions', 'applyDispatchFacts'].some((name) => out.includes(name)))
+    out.push('displaceAgyReads', 'changeAgyAdmission');
+  if (out.includes('adoptDraft') || out.includes('adoptSuccessor'))
+    out.push('awaitNativeSessionRecord', 'changeAgyAdmission', 'agyCatalogRow');
   if (out.includes('lifetimeFiguresBySession')) out.push('rowSpendSources', 'admitSavedSpendSources');
+  if (out.includes('indexNextProjectSpendFile') || out.includes('scheduleProjectSpendMidnight'))
+    out.push('pruneProjectSpendLedger');
+  if (out.includes('indexNextProjectSpendFile') || out.includes('finishProjectSpendIndex'))
+    out.push('unknownProjectSpendSnapshot');
   if (out.includes('writeDerivedCache')) out.push('spendSourcesFile', 'writeSettledSpendSources');
   if (out.includes('claudeStructuralKey') || out.includes('claudeChildRevisions')) out.push('childParents');
   if (out.includes('pollCatalog')) out.push('quietPoll', 'quietPollMiss');
   if (out.includes('refresh')) out.push('quietSnapshot', 'commitQuietBasis');
+  if (out.includes('refresh') || out.includes('postRail'))
+    out.push('hostRowsFor', 'qualifiedSessionRow', 'pendingSessionRow');
+  if (['changeAgyAdmission', 'awaitNativeSessionRecord', 'postRail'].some((name) => out.includes(name)))
+    out.push('reconcileAgySessionRows', 'qualifiedSessionRow', 'pendingSessionRow', 'queueAgyRedraw');
+  if (['parentOfShown', 'rowForSession', 'reconcileAgySessionRows'].some((name) => out.includes(name)))
+    out.push('agyPresentationSession');
+  if (
+    ['refresh', 'currentSelectedSession', 'agyPresentationSession', 'rowForSession', 'stateFor'].some((name) =>
+      out.includes(name),
+    )
+  )
+    out.push('agyPendingPresentation');
   if (out.includes('quietSnapshot') || out.includes('quietPollMiss')) out.push('hostSessionsKey', 'quietSpendInputs');
   if (['selectionScope', 'recordSelectionBasis', 'quietSnapshot', 'quietPollMiss'].some((name) => out.includes(name)))
     out.push('basisInputs', 'basisInputMoved');
@@ -3292,6 +3478,8 @@ function harness(pendingRefresh = false, registerRefreshHandler = true, extraMet
     const messageByteBudget = () => null;
     const spendFileVersion = () => 'unchanged';
     const codexSessionIndexPath = () => 'index';
+    const agyRowSource = Symbol();
+    const sessionRowDetails = Symbol();
     const shortenTo = (line, limit, ellipsis) => line.length <= limit ? line : line.slice(0, Math.max(0, limit - ellipsis.length)) + ellipsis;
     const RAIL_NAME_LIMIT = 200;
     export class Harness {
@@ -3349,6 +3537,8 @@ function harness(pendingRefresh = false, registerRefreshHandler = true, extraMet
     'COMPRESSED_OPENINGS_STORE',
     'compressedTitleCurrent',
     'withKeptUndercount',
+    'reconcileCompressedEntries',
+    'compareCompressedEntries',
     'compressedEntrySame',
     'compressedSpendDisplayFiles',
     'normalizeSpendFile',
@@ -3370,6 +3560,8 @@ function harness(pendingRefresh = false, registerRefreshHandler = true, extraMet
     COMPRESSED_OPENINGS_STORE,
     compressedTitleCurrent,
     withKeptUndercount,
+    reconcileCompressedEntries,
+    compareCompressedEntries,
     compressedEntrySame,
     compressedSpendDisplayFiles,
     normalizeSpendFile,
@@ -3476,11 +3668,25 @@ function completeDiscoveryHarness(
     compatibleDiscovery,
     discoveryCompatibility,
     projectSpendWindows,
+    pruneSpendFilesWithResult: unchangedSpendFiles,
+    completeSpendFiles,
+    spendRecordAgent,
     sessionCoverageMember,
+    indexedPhysical,
     reconcileSessionCollisions,
+    retainNativeSessionReservations,
+    nativeReservationTwin,
+    sessionCoverageFileKey,
+    isAgySessionId,
     sessionCatalogMembership,
     discoveryMemberRevisions,
     discoveryParentsOf,
+    agyCollisionWith,
+    agyAdmissionOf,
+    clearAgyDiscoveryCache,
+    currentAgyAdmission,
+    renewAgyAdmission,
+    discardAgyDiscoveryEntry,
     discoveryHeldStamps,
     walkStampFiles,
     discoverySourceStamps,
@@ -3502,8 +3708,36 @@ function completeDiscoveryHarness(
     runningKey,
     replacedCatalogFiles: async () => [],
     enumerateRolloutFilesAsync,
+    compressedEntryIdentity,
+    quarantineCompressedSpend,
+    reconcileCompressedEntries,
+    compareCompressedEntries,
+    compressedEntrySeed: compressedStore.compressedEntrySeed,
+    compressedByteObservation: compressedStore.compressedByteObservation,
+    compressedLoadRecords,
+    compressedRequestBytes,
+    compressedTransferBatches,
+    sameCompressedStores,
+    COMPRESSED_BATCH_BYTES: compressedStore.COMPRESSED_BATCH_BYTES,
+    compareCompressedObservations: compressedStore.compareCompressedObservations,
+    COMPRESSED_REPAIR_LIMIT,
+    addsCompressedRepairEvidence,
+    addsCompressedRepairProof,
+    sameCompressedRepairClaim,
+    compressedEntryCurrent,
+    compressedEntryConflicts,
+    compressedFactsMatchSource,
+    sessionKeyOf,
+    readRolloutStat,
+    observeRolloutStat,
+    openingRecordOf,
+    readQualifiedCompressedFirstRecord,
+    sameCompressedRevision,
+    sameCompressedPlacement,
+    COMPRESSED_ENTRY_TITLE_BYTES,
     enumerateClaudeChildSources,
     isCompressedRollout,
+    isHiddenThread,
     historyOfOtherPath,
     noteHarnessScopeMiss,
     ...scope,
@@ -3610,7 +3844,8 @@ function completeDiscoveryHarness(
       'compressedFactsChanged',
       'invalidateProjectSpendSnapshot',
     );
-  if (names.includes('walkedSessions')) names.push('compressedRowsOf');
+  if (names.includes('walkedSessions'))
+    names.push('compressedRowsOf', 'compressedSupersedesPlain', 'qualifyCodexOpening');
   if (names.includes('runPendingWatch')) names.push('compressedFormChange');
   if (names.includes('browserPainted'))
     names.push('maybeStartCompressedLoad', 'loadCompressedFacts', 'applyCompressedEntries', 'compressedStorePaths');
@@ -3618,6 +3853,8 @@ function completeDiscoveryHarness(
     'refreshCompressedFacts',
     'noteCompressedRowsGauge',
     'compressedLoadRequest',
+    'runCompressedLoad',
+    'applyCompressedLoadEntries',
     'compressedResume',
     'noteCompressedLoad',
     'withCompressedFactRows',
@@ -3662,8 +3899,19 @@ function completeDiscoveryHarness(
     'walkCatalog',
     'catalogSettled',
     'collectCatalogWalk',
+    'qualifyCompressedOpening',
+    'retryCompressedOpening',
+    'releaseCompressedOpeningChecks',
+    'reserveContestedCompressedOpenings',
+    'contestedHiddenCompressed',
+    'reserveHiddenCodexOpenings',
+    'reserveHiddenCompressedOpenings',
+    'installCompressedOpening',
+    'noteHiddenCompressedOpening',
     'claudeWalkSteps',
     'collidingSources',
+    'contestedAgyFiles',
+    'rememberAgyNativeRows',
     'claudeOpeningReader',
   );
   names.push(...withCompanionMethods(names).slice(names.length));
@@ -3696,6 +3944,8 @@ function completeDiscoveryHarness(
     const readSetting = ${scope.snapshotHistoryDays ? 'snapshotHistoryDays' : '() => 3'}; const isLightColourTheme = () => false;
     const sessionLabelOf = (name, id) => ({ label: name?.label || 'Session ' + id.slice(0, 8), fullLabel: name?.fullLabel || name?.label || 'Session ' + id.slice(0, 8) });
     const storedSessionName = ${scope.realStoredSessionName ? 'realStoredSessionName' : '() => null'};
+    const agyRowSource = Symbol();
+    const sessionRowDetails = Symbol();
     const shortenTo = (line, limit, ellipsis) => line.length <= limit ? line : line.slice(0, Math.max(0, limit - ellipsis.length)) + ellipsis;
     const RAIL_NAME_LIMIT = 200; const COMPRESSED_ROWS_APPLY_MS = 2_000;
     const TRANSCRIPT_TURN_LIMIT = 40; const TRANSCRIPT_TAIL_BYTES = 1024;
@@ -3715,6 +3965,7 @@ function completeDiscoveryHarness(
       ${names.includes('repositoryCommits') ? '' : 'repositoryCommits = new RepositoryCommits({ run: async () => null }, () => {});'}
       _showing = null; selections = []; messages = []; partial = []; catalog = null; drawnCards = [];
       coverageRevision = 0; enumeratedAdmissionComplete = true; claudeChildren = []; compressedRollouts = new Set();
+      rejectedCompressedFacts = new WeakSet();
       compressedLoadPending = false; compressedFollowTimer = null; compressedRolloutsRevision = 0; compressedFacts = new Map(); compressedFactsRevision = 0; adoptionsUnsettled = new Map(); compressedSpendPicks = new WeakMap(); compressedLaunch = 'launch-test'; compressedWalk = null; compressedRowsDirty = null; compressedRowsHeld = new Map(); compressedNameOnly = new Set(); compressedFactsRefreshDue = false; compressedLoadCursor = null; lifetimeDisplayPick = null;
       authoritativeCatalog = null; attachmentHandoffs = new Set(); titles = new Map();
       metadataRevision = 0; drawnMetadataRevision = 0; startupProgressAt = 0;
@@ -4032,6 +4283,7 @@ function railEnrichmentHarness(
       codexMetas = { get() { return undefined; }, savedOpening() { return null; } };
       derivedCacheCheckpointState = { changes: 0, markChanged() { this.changes++; } };
       progressiveWorker;
+      ${owner.members.find((member) => member.name?.getText(file) === 'runTranscriptRead')?.getText(file) ?? ''}
       constructor(run) { this.progressiveWorker = { run }; }
       revisionOf(session) { return { size: session.size, mtimeMs: session.mtimeMs, dev: 1, ino: 2 }; }
       observeStoredName(_session, entry) { return entry; }
@@ -4062,6 +4314,7 @@ function railEnrichmentHarness(
     'withMetadataCoverage',
     'shownTitleFacts',
     'withoutHeldStarts',
+    'isCompressedRollout',
     compiled,
   )(
     module,
@@ -4081,6 +4334,7 @@ function railEnrichmentHarness(
     withMetadataCoverage,
     shownTitleFacts,
     withoutHeldStarts,
+    isCompressedRollout,
   );
   return guardedHarness(new module.exports.Harness(run));
 }
@@ -4156,6 +4410,7 @@ function metadataHarness(
       derivedCacheCheckpointState = { markChanged() {} };
       claudeChildReferenceEntries = new Map(); codexOpenings = null; threadNames = { names: new Map(), fullNames: new Map() };
       startupCache = {}; progressiveWorker; sessionNames; derivedCacheFile;
+      ${owner.members.find((member) => member.name?.getText(file) === 'runTranscriptRead')?.getText(file) ?? ''}
       constructor(run, sessionNames, derivedCacheFile) {
         this.progressiveWorker = { run }; this.sessionNames = sessionNames; this.derivedCacheFile = derivedCacheFile;
         ${restore}
@@ -4191,6 +4446,9 @@ function metadataHarness(
     sameSavedSpendFiles,
     SAVED_SPEND_SOURCES_FILE,
     sessionLabelOf,
+    agySessionId,
+    agyBrainRoot: () => '',
+    isInside,
     codexTitleFor,
     isCompressedRollout,
     compressedTitleCurrent,
@@ -4270,7 +4528,7 @@ function selectedWindowHarness(
     ...extra,
     // evictCache calls pruneDerivedTitles and evictOverBudget.
     ...(extra.includes('evictCache') ? ['pruneDerivedTitles', 'evictOverBudget'] : []),
-    ...withCompanionMethods(extra),
+    ...withCompanionMethods(['currentSelectedSession', 'completeSelectedWindow', 'readOlderHistoryPage', ...extra]),
   ]);
   const body = owner.members
     .filter((member) => member.name && names.has(member.name.getText(file)))
@@ -4313,6 +4571,7 @@ function selectedWindowHarness(
       walkedClaude = []; titles = new Map(); carriedNames = new Map(); cwds = new Map(); humanScans = new Map(); claudeChildStatWrites = new Map();
       derivedCacheCheckpointState = { markChanged() {} };
       progressiveWorker;
+      ${owner.members.find((member) => member.name?.getText(file) === 'runTranscriptRead')?.getText(file) ?? ''}
       constructor(run) { this.progressiveWorker = { run }; }
       get authoritativeCatalog() { return Array.isArray(this.catalog) ? this.catalog : (this.catalog?.sessions ?? [this.session]); }
       revisionOf(session) { return { size: session.size, mtimeMs: session.mtimeMs, dev: session.dev, ino: session.ino }; }
@@ -4373,12 +4632,15 @@ function selectedWindowHarness(
     'selectedDependencies',
     'claudeRelationshipKey',
     'isCompressedRollout',
+    'normalizeFsPath',
     'compressedRolloutsReadable',
     'readRolloutStat',
     'COMPRESSED_FACTS_STORE',
     'COMPRESSED_OPENINGS_STORE',
     'compressedTitleCurrent',
     'withKeptUndercount',
+    'reconcileCompressedEntries',
+    'compareCompressedEntries',
     'compressedEntrySame',
     'compressedSpendDisplayFiles',
     'normalizeSpendFile',
@@ -4423,12 +4685,15 @@ function selectedWindowHarness(
     selectedDependencies,
     claudeRelationshipKey,
     isCompressedRollout,
+    normalizeFsPath,
     compressedRolloutsReadable,
     readRolloutStat,
     COMPRESSED_FACTS_STORE,
     COMPRESSED_OPENINGS_STORE,
     compressedTitleCurrent,
     withKeptUndercount,
+    reconcileCompressedEntries,
+    compareCompressedEntries,
     compressedEntrySame,
     compressedSpendDisplayFiles,
     normalizeSpendFile,
@@ -7721,7 +7986,7 @@ test('a selected-only refresh before the catalog keeps every held title, and the
     mtimeMs: 1,
   };
   const codex = {
-    file: 'rollout-codex.jsonl',
+    file: 'sessions/rollout-codex.jsonl',
     sessionId: 'codex',
     agent: 'codex',
     activity: 200,
@@ -7738,7 +8003,7 @@ test('a selected-only refresh before the catalog keeps every held title, and the
     mtimeMs: 1,
   };
   const gone = {
-    file: 'gone.jsonl',
+    file: 'sessions/gone.jsonl',
     sessionId: 'gone',
     agent: 'codex',
     activity: 50,
@@ -11094,7 +11359,8 @@ function stagedRefreshHarness(scope: Record<string, unknown> = {}) {
   const { provider } = harness;
   provider.codexColdReads = null;
   const run = provider.progressiveWorker.run;
-  provider.progressiveWorker.run = (...args: unknown[]) => {
+  provider.progressiveWorker.run = (...args: Parameters<import('./progressiveworker').ProgressiveWorker['run']>) => {
+    args[5]?.names();
     advance(100);
     return run(...args);
   };
@@ -11174,7 +11440,10 @@ test('a refresh that posts to two panels records one post row that holds both po
 test('a refresh that returns after its discovery wait records only the stages that it finished', async () => {
   const { provider, stages, advance } = stagedRefreshHarness();
   // A request that the worker never answers ends the refresh after the wait.
-  provider.progressiveWorker.run = async () => {
+  provider.progressiveWorker.run = async (
+    ...args: Parameters<import('./progressiveworker').ProgressiveWorker['run']>
+  ) => {
+    args[5]?.names();
     advance(100);
     return null;
   };
@@ -11569,6 +11838,127 @@ function slicedWalkHarness(scope: Record<string, unknown> = {}, extraMethods: st
     pausedMs: () => pausedMs,
   };
 }
+
+test('the catalog publishes while Antigravity discovery waits between slices', async () => {
+  const brain = tempDir('agy-walk-');
+  let scans = 0;
+  let advance: (() => void) | undefined;
+  const { provider, writeParent } = slicedWalkHarness(
+    {
+      agyBrainRoot: () => brain,
+      scanAgySessions: function* () {
+        scans++;
+        yield { rows: 32, bytes: 128 * 1024 };
+        return { rows: [], complete: true, uncertain: new Set() };
+      },
+      setImmediate: (resume: () => void) => {
+        advance = resume;
+      },
+    },
+    ['startAgyDiscovery'],
+  );
+  const parent = writeParent('first');
+  const enumeration = { files: [], directories: [], uncertain: [], compressed: [], status: 'complete' };
+  const signal = new AbortController().signal;
+  try {
+    const walked = await provider.collectCatalogWalk(brain, signal, enumeration, undefined);
+    assert.deepEqual(
+      walked.claudeWalk.listing.sessions.map((source: SessionFile) => source.file),
+      [parent],
+    );
+    assert.equal(scans, 1);
+    assert.ok(advance);
+    await provider.collectCatalogWalk(brain, signal, enumeration, undefined);
+    assert.equal(scans, 1);
+  } finally {
+    advance?.();
+  }
+});
+
+test('an Antigravity session stays listed and selected when its transcript changes during discovery', async () => {
+  const brain = tempDir('agy-growing-brain-');
+  const id = '3352f6ae-5337-44ed-a42a-df1b4d26bbc8';
+  const log = path.join(brain, id, '.system_generated', 'logs');
+  const file = path.join(log, 'transcript_full.jsonl');
+  fs.mkdirSync(log, { recursive: true });
+  let appendDuringRead = false;
+  const { provider, releaseAll } = slicedWalkHarness(
+    {
+      agyBrainRoot: () => brain,
+      scanAgySessions: function* (...args: Parameters<typeof scanAgySessions>) {
+        const scan = scanAgySessions(args[0], args[1], args[2], { ...args[3], bytes: 128 });
+        for (let step = scan.next(); ; step = scan.next()) {
+          if (step.done) return step.value;
+          if (appendDuringRead && step.value.bytes > 0) {
+            appendDuringRead = false;
+            fs.appendFileSync(file, line('SYSTEM_MESSAGE', 2, { content: 'Saved.' }));
+          }
+          yield step.value;
+        }
+      },
+    },
+    ['startAgyDiscovery', 'currentSelectedSession', 'revisionOf'],
+  );
+  const line = (type: string, step_index: number, rest: object) =>
+    JSON.stringify({ type, step_index, created_at: '2026-11-22T05:00:00Z', status: 'DONE', ...rest }) + '\n';
+  const [project] = provider.folders();
+  fs.writeFileSync(
+    file,
+    line('USER_INPUT', 0, { content: 'Keep me selected.' }) +
+      line('PLANNER_RESPONSE', 1, { tool_calls: [{ name: 'run_command', args: { Cwd: project } }] }),
+  );
+  provider.refreshFrom = () => {};
+  const rows = () => (provider.authoritativeCatalog as SessionFile[]).filter((row) => row.agent === 'agy');
+  const walk = () => releaseAll(provider.refresh(true));
+  const scanDone = () => vi.waitFor(() => assert.equal(provider.agyScan?.controller, undefined));
+  await walk();
+  await scanDone();
+  await walk();
+  const first = rows()[0];
+  assert.equal(first?.file, file);
+  assert.equal(provider.showing, id);
+
+  fs.appendFileSync(file, line('SYSTEM_MESSAGE', 3, { content: 'Writing.' }));
+  appendDuringRead = true;
+  await walk();
+  await scanDone();
+  await walk();
+  assert.deepEqual(
+    {
+      rows: rows().map(({ file, size }) => ({ file, size })),
+      showing: provider.showing,
+      coverage: provider.membershipCoverage.status,
+    },
+    { rows: [{ file, size: first.size }], showing: id, coverage: 'incomplete' },
+  );
+
+  const selectionWork = { sessionId: id, generation: provider.selectionGeneration, controller: new AbortController() };
+  provider.selectionWork = selectionWork;
+  provider.selectionWorks?.set(id, selectionWork);
+  assert.equal(provider.currentSelectedSession(selectionWork), null, 'selection read an unadmitted revision');
+
+  const open = mutableFs.opendirSync;
+  const failOpen = vi.spyOn(mutableFs, 'opendirSync').mockImplementation((directory, options) => {
+    if (directory === brain) throw Object.assign(new Error('unreadable'), { code: 'EACCES' });
+    return open(directory, options);
+  });
+  try {
+    await walk();
+    await scanDone();
+    assert.equal(rows()[0]?.size, first.size);
+    assert.equal(provider.showing, id);
+    assert.equal(provider.membershipCoverage.status, 'incomplete');
+  } finally {
+    failOpen.mockRestore();
+  }
+
+  await walk();
+  await scanDone();
+  await walk();
+  assert.equal(rows()[0]?.size, fs.statSync(file).size);
+  assert.equal(provider.showing, id);
+  assert.equal(provider.membershipCoverage.status, 'complete');
+});
 
 test('a watcher batch during a sliced walk folds into the walk, and a file in an unread folder lists at the commit', async () => {
   const { provider, walks, files, writeParent, pauseOnce } = slicedWalkHarness();
@@ -13310,6 +13700,8 @@ function adoptionHarness(extraScope: Record<string, unknown> = {}) {
   return { ...harness, opened, adopted: () => adopted, wake, settle };
 }
 
+const { reconcileCompressedEntries } = compressedStore;
+
 const twinThread = '01a032c9-1a92-7931-845c-723117d24dbe';
 
 async function adoptedPair(extraScope: Record<string, unknown> = {}) {
@@ -13494,8 +13886,10 @@ test.skipIf(!rolloutCompression.zstdCompressSync)(
       file: twin,
       pairKey: 'x',
       adopted: true,
+      ...compressedEntryVersions(),
       size: stat.size,
       mtimeMs: stat.mtimeMs,
+      fileIdentity: { dev: stat.dev, ino: stat.ino },
     };
     provider.compressedFacts.set(twin, current);
     provider.adoptionsUnsettled.set(plain, { twin, row: null, running: false });
@@ -13524,6 +13918,7 @@ test.skipIf(!rolloutCompression.zstdCompressSync)(
         },
       },
       () => true,
+      { domain: 'physical', scope: JSON.stringify(provider.repositoryScopeRoots), revision: '1' },
     );
     await vi.waitFor(() => assert.deepEqual(adopted(), [twin], 'a twin of another revision kept the older entry'));
   },
@@ -13557,6 +13952,857 @@ test.skipIf(!rolloutCompression.zstdCompressSync)(
     assert.deepEqual(files(), [], 'a failed adoption kept a row');
     assert.equal(provider.titles.has(plain), false, 'a failed adoption kept the plain title');
     assert.equal(provider.compressedFacts.get(twin)?.adoptionFailed, true);
+  },
+);
+
+test.skipIf(!rolloutCompression.zstdCompressSync)(
+  'the direct adoption reply cannot replace decoded spend for its twin',
+  async () => {
+    const { provider, plain, twin, writeTwin, releaseAll, adopted } = await adoptedPair();
+    writeTwin();
+    const plainStat = readRolloutStat(plain)!;
+    fs.unlinkSync(plain);
+    const derivation = new RolloutDerivation(twin, normalizeWorkspace('project'));
+    const read = await streamCompressedRollout(twin, (chunk) => derivation.push(chunk));
+    assert.ok(read.kind === 'decoded');
+    const decoded = compressedFactsFromDerivation(twin, read, derivation);
+    assert.ok(decoded.spend);
+    provider.applyCompressedEntries([decoded]);
+    provider.adoptionsUnsettled.set(plain, {
+      twin,
+      row: { ...plainStat, file: plain, agent: 'codex', sessionId: twinThread },
+      running: true,
+    });
+    await releaseAll(provider.adoptCompressedTwin(plain, twin));
+    assert.deepEqual(adopted(), [twin]);
+    assert.equal(provider.adoptionsUnsettled.size, 0);
+    assert.deepEqual(provider.compressedSpendPick([]), [decoded.spend], 'the settled adoption replaced decoded spend');
+  },
+);
+
+test.skipIf(!rolloutCompression.zstdCompressSync).each(['direct first', 'follow first', 'unread prefix'] as const)(
+  'equal-stat adoption and follow publish the same Project cost: %s',
+  async (order) => {
+    const { provider, plain, twin, releaseAll } = await adoptedPair();
+    const plainStat = readRolloutStat(plain)!;
+    const now = new Date().toISOString();
+    const usage = (input_tokens: number) =>
+      [
+        { type: 'event_msg', payload: { type: 'task_started', turn_id: 'priced' } },
+        { type: 'turn_context', payload: { turn_id: 'priced', model: 'gpt-5.6-sol' } },
+        {
+          type: 'event_msg',
+          payload: { type: 'token_count', info: { last_token_usage: { input_tokens, output_tokens: 10 } } },
+        },
+        { type: 'event_msg', payload: { type: 'task_complete', turn_id: 'priced' } },
+      ]
+        .map((record) => JSON.stringify({ ...record, timestamp: now }))
+        .join('\n') + '\n';
+    const plainBody = fs.readFileSync(plain);
+    const original = order === 'unread prefix' ? Buffer.concat([plainBody, Buffer.from(usage(3000))]) : plainBody;
+    const label = JSON.stringify({ type: 'event_msg', payload: { type: 'user_message', message: 'Earlier row' } });
+    const older = Buffer.concat([
+      order === 'unread prefix' ? plainBody : original,
+      Buffer.from(order === 'unread prefix' ? usage(1000) : label + '\n'),
+    ]);
+    const frames = [older, original].map((body) => rolloutCompression.zstdCompressSync!(body));
+    const bytes = Math.max(...frames.map((frame) => frame.length)) + 8;
+    const place = (which: number) => {
+      const frame = frames[which];
+      const pad = Buffer.alloc(bytes - frame.length);
+      pad.writeUInt32LE(0x184d2a50, 0);
+      pad.writeUInt32LE(pad.length - 8, 4);
+      fs.writeFileSync(twin, Buffer.concat([frame, pad]));
+      const at = new Date(plainStat.mtimeMs);
+      fs.utimesSync(twin, at, at);
+    };
+    const stores = provider.compressedStorePaths();
+    const writer = new CompressedStoreHolder(stores.facts);
+    const peer = new CompressedStoreFollower(stores.facts);
+    const openingWriter = new CompressedStoreHolder(stores.openings);
+    const expected = provider.projectSpendVisibleFiles[0];
+    const worker = order === 'unread prefix' ? titleWorker() : undefined;
+    const signal = new AbortController().signal;
+    try {
+      if (worker) {
+        fs.mkdirSync(stores.facts, { recursive: true });
+        const manifest = { factsVersion: 1, epoch: 0, token: 'first', seq: 0, shards: [], inputs: [] };
+        fs.writeFileSync(path.join(stores.facts, 'manifest-0-first-0'), JSON.stringify(manifest));
+      }
+      place(0);
+      const before = readRolloutStat(twin)!;
+      const derivation = new RolloutDerivation(twin, normalizeWorkspace('project'));
+      const read = await streamCompressedRollout(twin, (chunk) => derivation.push(chunk));
+      assert.ok(read.kind === 'decoded');
+      const decoded = compressedFactsFromDerivation(twin, read, derivation);
+      assert.ok(decoded.decodedLength && decoded.spend);
+      assert.deepEqual(await writer.append([decoded]), [true]);
+      const [earlier] = await peer.poll();
+      provider.applyCompressedEntries([earlier]);
+      assert.deepEqual(provider.compressedSpendPick([]), [decoded.spend]);
+
+      place(1);
+      assert.deepEqual(readRolloutStat(twin), before);
+      fs.unlinkSync(plain);
+      provider.adoptionsUnsettled.set(plain, {
+        twin,
+        row: { ...plainStat, file: plain, agent: 'codex', sessionId: twinThread },
+        running: true,
+      });
+      if (worker) {
+        const later = new RolloutDerivation(twin, normalizeWorkspace('project'));
+        const next = await streamCompressedRollout(twin, (chunk) => later.push(chunk));
+        assert.ok(next.kind === 'decoded');
+        assert.deepEqual(await writer.append([compressedFactsFromDerivation(twin, next, later)]), [true]);
+        const beforeAdoption = await worker.run({ kind: 'compressed-load', stores }, 1, signal);
+        assert.ok(beforeAdoption?.value.kind === 'compressed-load' && beforeAdoption.value.done);
+        provider.applyCompressedEntries(beforeAdoption.value.entries);
+        writer.dispose();
+
+        const prefix = path.join(path.dirname(twin), 'unrelated.jsonl.zst');
+        const body = original.toString().replace(twinThread, '01a032c9-1a92-7931-845c-723117d24dbf');
+        const workspace = earlier.opening!.cwd!;
+        fs.writeFileSync(prefix, rolloutCompression.zstdCompressSync!(Buffer.from(body)));
+        await worker.run(
+          {
+            kind: 'compressed-load',
+            stores,
+            compressed: [prefix],
+            compressedRevision: 1,
+            backfill: { workspace, roots: [workspace], launch: 'first-cost' },
+          },
+          1,
+          signal,
+        );
+        await vi.waitFor(() => assert.ok(readCompressedStore(stores.facts).entries.get(prefix)?.decodedLength), {
+          timeout: 8000,
+        });
+        place(0);
+        assert.deepEqual(readRolloutStat(twin), before);
+
+        const cost = projectSpendSnapshotHarness();
+        for (const method of PROJECT_SPEND_SNAPSHOT_METHODS) provider[method] = cost[method];
+        provider.projectSpendWorkspace = 'project';
+        provider.projectSpendSnapshot = provider.unknownProjectSpendSnapshot();
+        provider.projectSpendRebuild = null;
+        provider.projectSpendBuild = null;
+        provider.refreshFrom = () => {};
+        const publications: number[] = [];
+        provider.post = async (post: { type: string; projectSpend?: { windows: { dollars: number | null }[] } }) => {
+          const amount = post.projectSpend?.windows[0].dollars;
+          if (post.type === 'projectSpend' && amount !== null && amount !== undefined) publications.push(amount);
+        };
+        provider.progressiveWorker.run = async (...args: Parameters<ProgressiveWorker['run']>) => {
+          const result = await worker.run(...args);
+          if (args[0].kind === 'compressed-adopt') {
+            provider.projectSpendVisibleFiles = [];
+            provider.projectSpendFiles = [];
+          }
+          return result;
+        };
+        await provider.adoptCompressedTwin(plain, twin);
+        assert.equal(provider.adoptionsUnsettled.size, 0);
+        assert.equal(spendConsumers.spendRecordTotal(decoded.spend).requests, 1);
+        await vi.waitFor(() => assert.ok(publications.length), { timeout: 6000 });
+        assert.equal(
+          publications[0],
+          spendConsumers.spendRecordTotal(decoded.spend).dollars,
+          'the first Project cost lost the surviving decode',
+        );
+        assert.equal(provider.compressedFacts.get(twin)?.storeRecord?.digest, earlier.storeRecord?.digest);
+        return;
+      }
+      const run = provider.progressiveWorker.run;
+      let followed = false;
+      provider.progressiveWorker.run = async (
+        request: { kind: string; adoption: CompressedAdoptionInput },
+        ...args: unknown[]
+      ) => {
+        if (request.kind !== 'compressed-adopt') return run.call(provider.progressiveWorker, request, ...args);
+        const found = await recordCompressedAdoption(request.adoption, writer, openingWriter);
+        assert.ok(found.adopted && found.durable);
+        assert.ok(found.entry.hash && found.entry.hash !== earlier.hash);
+        provider.projectSpendVisibleFiles = [];
+        provider.projectSpendFiles = [];
+        if (order === 'follow first') {
+          provider.applyCompressedEntries(await peer.poll());
+          followed = true;
+          assert.deepEqual(provider.compressedSpendPick([]), [expected], 'the following window kept the old amount');
+        }
+        const entry = { ...found.entry, storeRecord: writer.recordOf(found.entry) };
+        return { generation: 0, revision: null, value: { ...found, kind: 'compressed-adopt', entry } };
+      };
+      await releaseAll(provider.adoptCompressedTwin(plain, twin));
+      assert.deepEqual(
+        provider.compressedSpendPick([]),
+        [expected],
+        'the direct reply did not publish the adopted amount',
+      );
+      if (!followed) provider.applyCompressedEntries(await peer.poll());
+      provider.applyCompressedEntries([earlier]);
+      assert.deepEqual(provider.compressedSpendPick([]), [expected], 'a delayed older row replaced the adopted amount');
+      assert.equal(provider.compressedFacts.get(twin)?.adopted, true);
+      assert.equal(provider.compressedFacts.get(twin)?.title?.label, 'Keep me');
+    } finally {
+      worker?.stop();
+      writer.dispose();
+      openingWriter.dispose();
+    }
+  },
+);
+
+test.skipIf(!rolloutCompression.zstdCompressSync).each([
+  ['outside', 'no refusal'],
+  ['same opening', 'reservation stat refusal'],
+  ['same opening', 'catalog stat refusal'],
+] as const)(
+  'a pending watcher adoption suspends the previous contested opening: %s, %s',
+  async (placement, schedule) => {
+    let refuse = false;
+    let refuseStat = false;
+    let refusedStats = 0;
+    let headers = 0;
+    const work = { compressedBytes: 0, decodedBytes: 0 };
+    const { provider, plain, twin, wake } = await adoptedPair({
+      readRolloutStat: (file: string) => {
+        if (refuseStat && isCompressedRollout(file)) {
+          refuseStat = false;
+          refusedStats++;
+          return null;
+        }
+        return readRolloutStat(file);
+      },
+      readQualifiedCompressedFirstRecord: (file: string, max: number, signal: AbortSignal) => {
+        headers++;
+        return refuse ? Promise.resolve(null) : readQualifiedCompressedFirstRecord(file, max, signal, work);
+      },
+      scopeInside: (cwd: string, roots: string[]) => roots.includes(cwd),
+    });
+    const inScope = provider.repositoryScopeRoots[0];
+    const outside = tempDir('pending-adoption-outside-');
+    const at = new Date(fs.statSync(plain).mtimeMs);
+    const time = new Date().toISOString();
+    const frame = (cwd: string, input_tokens: number, id = twinThread) =>
+      rolloutCompression.zstdCompressSync!(
+        Buffer.from(
+          [
+            { type: 'session_meta', payload: { id, cwd, source: 'vscode' } },
+            { type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn' } },
+            { type: 'turn_context', payload: { turn_id: 'turn', cwd, model: 'gpt-5.6-sol' } },
+            { type: 'event_msg', payload: { type: 'user_message', message: 'Contested rollout' } },
+            {
+              type: 'event_msg',
+              payload: { type: 'token_count', info: { last_token_usage: { input_tokens, output_tokens: 10 } } },
+            },
+            { type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn' } },
+          ]
+            .map((record) => JSON.stringify({ timestamp: time, ...record }))
+            .join('\n') + '\n',
+        ),
+      );
+    const frames = [frame(inScope, 1700), frame(placement === 'outside' ? outside : inScope, 3400)];
+    const length = Math.max(...frames.map((item) => item.length)) + 8;
+    const place = (index: number) => {
+      const item = frames[index];
+      const pad = Buffer.alloc(length - item.length);
+      pad.writeUInt32LE(0x184d2a50);
+      pad.writeUInt32LE(pad.length - 8, 4);
+      fs.writeFileSync(twin, Buffer.concat([item, pad]));
+      fs.utimesSync(twin, at, at);
+    };
+    const stores = provider.compressedStorePaths();
+    const writer = new CompressedStoreHolder(stores.facts);
+    const refusedInput = path.join(stores.facts, 'segment-0-refused-0');
+    const refusal = path.join(path.dirname(twin), 'refuse-store-input');
+    const worker = titleWorker(`
+      {
+        const fs = require('node:fs');
+        const open = fs.openSync;
+        fs.openSync = function (file, ...args) {
+          if (file === ${JSON.stringify(refusedInput)} && fs.existsSync(${JSON.stringify(refusal)}))
+            throw Object.assign(new Error('access denied'), { code: 'EACCES' });
+          return open.call(this, file, ...args);
+        };
+      }
+    `);
+    const signal = new AbortController().signal;
+    const decode = async (file = twin) => {
+      const derivation = new RolloutDerivation(file, normalizeWorkspace(inScope));
+      const read = await streamCompressedRollout(file, (chunk) => derivation.push(chunk));
+      assert.ok(read.kind === 'decoded');
+      return compressedFactsFromDerivation(file, read, derivation);
+    };
+    let release!: () => void;
+    const finalReply = new Promise<void>((resolve) => (release = resolve));
+    try {
+      fs.mkdirSync(stores.facts, { recursive: true });
+      fs.writeFileSync(
+        path.join(stores.facts, 'manifest-0-first-0'),
+        JSON.stringify({
+          factsVersion: 1,
+          epoch: 0,
+          token: 'first',
+          seq: 0,
+          shards: [],
+          inputs: [],
+        }),
+      );
+      place(1);
+      const returning = await decode();
+      const large = {
+        ...returning,
+        title: undefined,
+        carriedName: { label: 'Physical', fullLabel: 'x'.repeat(17 * 1024 * 1024) },
+      };
+      assert.deepEqual(await writer.append([large]), [true]);
+      assert.ok(writer.recordOf(large)!.bytes > 16 * 1024 * 1024);
+      place(0);
+      const stat = readRolloutStat(twin);
+      const old = await decode();
+      assert.deepEqual(await writer.append([old]), [true]);
+      writer.dispose();
+      const initial = await worker.run({ kind: 'compressed-load', stores }, 1, signal);
+      assert.ok(initial?.value.kind === 'compressed-load' && initial.value.done);
+      assert.equal(initial.value.entries[0]?.hash, old.hash);
+      provider.applyCompressedEntries(initial.value.entries);
+      const qualified = await provider.qualifyCompressedOpening(twin, signal);
+      assert.ok(provider.installCompressedOpening(qualified));
+      const folders = provider.folders();
+      const folderPrint = folders.join('\n') + '\0' + provider.repositoryScope.snapshot(folders).revision;
+      provider.agyCatalog = { folderPrint, rows: [{ sessionId: twinThread, agent: 'agy' }] };
+      provider.agyNativeReservations = new Map([[twinThread, [qualified.source]]]);
+      provider.refreshFrom = () => {};
+
+      const plainSpend = provider.projectSpendVisibleFiles;
+      const enumeration = { status: 'complete', files: [], uncertain: [], compressed: [twin] };
+      provider.sourceEnumerations.codex = enumeration;
+      const physical = { domain: 'physical', scope: JSON.stringify(provider.repositoryScopeRoots), revision: '23' };
+      // The previous compressed projection is current until the watcher sees the return of the other bytes.
+      const visible = provider.compressedRowsOf(
+        { walked: [], enumeration },
+        (cwd: string) => cwd === inScope,
+        physical,
+      );
+      assert.equal(visible[0]?.file, twin);
+      assert.deepEqual(provider.compressedSpendPick([]), [old.spend]);
+      assert.ok(provider.compressedTitleOf(twin));
+
+      let received = false;
+      let replied = false;
+      provider.progressiveWorker.run = async (
+        ...[request, generation, adoptionSignal, progress]: Parameters<ProgressiveWorker['run']>
+      ) => {
+        const result = await worker.run(request, generation, adoptionSignal, (notice) => {
+          if (notice.value.kind !== 'compressed-adopt' || !notice.value.pending) return;
+          assert.equal(notice.value.entry.hash, returning.hash);
+          assert.equal(notice.value.entry.spend, undefined);
+          provider.projectSpendVisibleFiles = [];
+          progress?.(notice);
+          received = true;
+        });
+        if (request.kind === 'compressed-adopt') {
+          replied = true;
+          assert.ok(
+            result?.value.kind === 'compressed-adopt' && result.value.pending,
+            'the oversized source did not block follow',
+          );
+          await finalReply;
+        }
+        return result;
+      };
+      provider.projectSpendVisibleFiles = plainSpend;
+      place(1);
+      assert.deepEqual(readRolloutStat(twin), stat);
+      fs.unlinkSync(plain);
+      wake([[plain, 'rename']]);
+      await vi.waitFor(() => assert.equal(received, true, 'the worker sent no pending receipt'));
+      const spent: SpendFileIndex[] = [];
+      assert.deepEqual(
+        provider.compressedSpendPick(spent),
+        [],
+        'the pending receipt left the previous Project cost active',
+      );
+      assert.deepEqual(provider.currentCompressedProjections(visible), []);
+      assert.equal(provider.compressedTitleOf(twin), undefined);
+      assert.deepEqual(provider.agyNativeReservations.get(twinThread), [qualified.source]);
+      assert.equal(provider.compressedFacts.get(twin)?.hash, old.hash, 'the pending receipt replaced ranked facts');
+
+      const requalify = () =>
+        provider.reserveContestedCompressedOpenings(new Set([normalizeFsPath(twin)]), folderPrint, signal);
+      refuse = true;
+      await requalify();
+      assert.equal(headers, 2);
+      assert.deepEqual(provider.agyNativeReservations.get(twinThread), [qualified.source]);
+      refuse = false;
+      refuseStat = schedule === 'reservation stat refusal';
+      await requalify();
+      assert.equal(refusedStats, Number(schedule === 'reservation stat refusal'));
+      assert.equal(headers, 3);
+      assert.equal(provider.agyNativeReservations.has(twinThread), placement === 'same opening');
+      assert.deepEqual(provider.compressedSpendPick(spent), [], 'physical placement reauthorized an older hash');
+      assert.equal(provider.compressedTitleOf(twin), undefined);
+      assert.deepEqual(provider.currentCompressedProjections(visible), []);
+      await vi.waitFor(() => assert.equal(replied, true));
+      release();
+      await vi.waitFor(() => assert.equal(provider.adoptionsUnsettled.get(plain)?.running, false));
+      await requalify();
+      assert.equal(headers, 3, 'the terminal pending reply repeated the header');
+      const saved = provider.adoptionsUnsettled.get(plain)?.pending;
+      assert.equal(saved?.hash, returning.hash);
+      provider.qualifiedCompressedOpenings.delete(normalizeFsPath(twin));
+      refuseStat = schedule === 'catalog stat refusal';
+      const walked = await provider.collectCatalogWalk(path.dirname(twin), signal, enumeration);
+      assert.equal(refusedStats, Number(schedule !== 'no refusal'));
+      const first = walked.compressedOpenings.observations.find(
+        (opening: { source: SessionFile }) => opening.source.file === twin,
+      );
+      assert.equal(first?.check?.observation?.hash, returning.hash, 'the catalog walk lost the pending observation');
+      assert.ok(provider.installCompressedOpening(first));
+      assert.deepEqual(provider.compressedSpendPick(spent), [], 'the first read reauthorized an older hash');
+      assert.equal(provider.compressedTitleOf(twin), undefined);
+      assert.deepEqual(provider.currentCompressedProjections(visible), []);
+      if (placement === 'outside') {
+        // The other rollout settles and publishes while the closed input still blocks this adoption.
+        const blocked = saved.storeRecord;
+        const closed = path.join(stores.facts, blocked.input);
+        assert.equal(fs.statSync(closed).size, blocked.offset + blocked.bytes);
+        worker.stop();
+        await vi.waitFor(
+          () => {
+            for (const directory of [stores.facts, stores.openings])
+              assert.equal(fs.existsSync(path.join(directory, 'backfill.lock')), false);
+          },
+          { timeout: 6000 },
+        );
+        const otherId = '01a032c9-1a92-7931-845c-723117d24dbf';
+        const other = plain.replace(twinThread, otherId);
+        const otherTwin = other + '.zst';
+        fs.writeFileSync(otherTwin, frame(inScope, 2100, otherId));
+        fs.utimesSync(otherTwin, at, at);
+        const full = await decode(otherTwin);
+        const otherWriter = new CompressedStoreHolder(stores.facts);
+        try {
+          assert.deepEqual(await otherWriter.append([full]), [true]);
+        } finally {
+          otherWriter.dispose();
+        }
+        const otherSpend = {
+          ...snapshotSpendFile(2, new Date().toISOString().slice(0, 10), 1),
+          file: normalizeSpendFile(other),
+          workspace: normalizeWorkspace('project'),
+        };
+        provider.projectSpendVisibleFiles = [otherSpend];
+        const snapshot = projectSpendSnapshotHarness();
+        for (const method of PROJECT_SPEND_SNAPSHOT_METHODS) provider[method] = snapshot[method];
+        provider.projectSpendWorkspace = 'project';
+        provider.projectSpendSnapshot = provider.unknownProjectSpendSnapshot();
+        provider.projectSpendRebuild = null;
+        provider.projectSpendBuild = null;
+        const publications: number[] = [];
+        provider.post = async (post: { type: string; projectSpend?: { windows: { dollars: number | null }[] } }) => {
+          const amount = post.projectSpend?.windows[0].dollars;
+          if (post.type === 'projectSpend' && amount !== null && amount !== undefined) publications.push(amount);
+        };
+        let peerReceipt: ReturnType<typeof compressedEntrySeed> | undefined;
+        let retryWrites: number | undefined;
+        let settled: compressedStore.CompressedFactEntry | undefined;
+        let peerRequest: Extract<ProgressiveRequest, { kind: 'compressed-adopt' }> | undefined;
+        const follow = async () => {
+          const request = { kind: 'compressed-load' as const, stores, ...provider.compressedResume() };
+          const running = worker.run(request, 1, signal, ({ value }) => {
+            if (value.kind !== 'compressed-load') return;
+            provider.applyCompressedEntries(value.entries);
+            provider.noteCompressedLoad(value, worker.currentThreadId);
+          });
+          const result = await running;
+          assert.ok(result?.value.kind === 'compressed-load' && result.value.done);
+          provider.applyCompressedEntries(result.value.entries);
+          provider.noteCompressedLoad(result.value, worker.currentThreadId);
+          return result.value;
+        };
+        provider.progressiveWorker = {
+          ...provider.progressiveWorker,
+          get currentThreadId() {
+            return worker.currentThreadId;
+          },
+          run: async (...args: Parameters<ProgressiveWorker['run']>) => {
+            const result = await worker.run(...args);
+            if (args[0].kind === 'compressed-adopt') {
+              assert.ok(result?.value.kind === 'compressed-adopt');
+              if (args[0].pending) {
+                retryWrites = result.value.writeBytes;
+                settled = result.value.entry;
+              } else {
+                assert.ok(result.value.pending, 'the refused input did not hold the receipt');
+                peerReceipt = result.value.entry;
+                peerRequest = args[0];
+              }
+              provider.projectSpendVisibleFiles = [];
+            }
+            return result;
+          },
+        };
+        await follow();
+        assert.equal(provider.compressedFacts.get(otherTwin)?.hash, full.hash);
+        fs.writeFileSync(refusedInput, '\n');
+        fs.writeFileSync(refusal, '');
+        provider.beginCompressedAdoption(other, otherTwin, {
+          ...readRolloutStat(otherTwin),
+          file: other,
+          agent: 'codex',
+          sessionId: otherId,
+          cwd: inScope,
+        });
+        await vi.waitFor(
+          () => {
+            assert.ok(peerReceipt?.storeRecord);
+            assert.equal(provider.adoptionsUnsettled.get(other)?.running, false);
+          },
+          { timeout: 6000 },
+        );
+        assert.ok(peerReceipt?.storeRecord);
+        const receipt = peerReceipt.storeRecord;
+        assert.equal(peerReceipt.hash, full.hash);
+        provider.projectSpendVisibleFiles = [];
+        await follow();
+        const { consumed } = provider.compressedLoadCursor;
+        assert.equal(new Map(consumed).get(blocked.input) ?? 0, blocked.offset);
+        assert.ok(new Map<string, number>(consumed).get(receipt.input)! >= receipt.offset + receipt.bytes);
+        const selected = provider.compressedFacts.get(otherTwin);
+        assert.notEqual(selected.storeRecord.digest, receipt.digest);
+        assert.equal(selected.title.label, full.title?.label);
+        assert.deepEqual(selected.spend, full.spend);
+        const originalThread = worker.currentThreadId;
+        worker.stop();
+        fs.unlinkSync(refusal);
+        const resume = provider.compressedResume().resume;
+        assert.deepEqual(resume.consumed, consumed);
+        await follow();
+        assert.notEqual(worker.currentThreadId, originalThread);
+        publications.length = 0;
+        await provider.adoptCompressedTwin(other, otherTwin);
+        assert.equal(
+          provider.adoptionsUnsettled.has(other),
+          false,
+          'the replacement kept the acknowledged adoption pending',
+        );
+        assert.equal(retryWrites, 0);
+        assert.ok(settled?.complete);
+        assert.equal(settled.title?.label, full.title?.label);
+        assert.deepEqual(settled.spend, full.spend);
+        assert.ok(provider.adoptionsUnsettled.has(plain));
+        const listed = { ...enumeration, compressed: [twin, otherTwin] };
+        const rows = provider.compressedRowsOf(
+          { walked: [], enumeration: listed },
+          (cwd: string) => cwd === inScope,
+          physical,
+        );
+        assert.ok(rows.some((row: SessionFile) => row.file === otherTwin));
+        await vi.waitFor(() => assert.ok(publications.length));
+        assert.ok(full.spend);
+        assert.equal(publications[0], spendConsumers.spendRecordTotal(full.spend).dollars);
+        assert.ok(peerRequest);
+        const input = path.join(stores.facts, receipt.input);
+        const shard = 'shard-999-copied-0';
+        const receiptBytes = fs.readFileSync(input);
+        assert.equal(receiptBytes.length, receipt.offset + receipt.bytes);
+        fs.writeFileSync(path.join(stores.facts, shard), receiptBytes.subarray(receipt.offset));
+        fs.writeFileSync(
+          path.join(stores.facts, 'manifest-999-copied-1'),
+          JSON.stringify({
+            factsVersion: full.factsVersion,
+            epoch: 999,
+            token: 'copied',
+            seq: 1,
+            shards: [shard],
+            inputs: [receipt.input],
+          }),
+        );
+        await vi.waitFor(() => assert.equal(fs.existsSync(path.join(stores.facts, 'backfill.lock')), false));
+        fs.unlinkSync(input);
+        await follow();
+        const group = provider.compressedLineage.get(otherTwin);
+        const moved = group.sources[group.latest].record;
+        assert.equal(moved.input, shard);
+        assert.equal(moved.digest, receipt.digest);
+        assert.deepEqual(moved.order, receipt.order);
+        assert.equal(new Map(provider.compressedLoadCursor.consumed).has(receipt.input), false);
+        worker.stop();
+        await follow();
+        const relocated = await worker.run({ ...peerRequest, pending: peerReceipt }, 1, signal);
+        assert.ok(relocated?.value.kind === 'compressed-adopt');
+        assert.equal(relocated.value.durable, true, 'the replacement lost the acknowledged relocated observation');
+        assert.equal(relocated.value.writeBytes, 0);
+        assert.deepEqual(relocated.value.entry.spend, full.spend);
+        if (process.env.ARC_ROUND24_MEASURE)
+          console.log(
+            JSON.stringify({
+              scenario: 'restart with one hash',
+              dollars: publications[0],
+              requests: spendConsumers.spendRecordTotal(full.spend).requests,
+              resumeBytes: Buffer.byteLength(JSON.stringify(resume)),
+              heldInputOffset: blocked.offset,
+              rankedInputOffset: new Map(consumed).get(receipt.input),
+              retryWrites,
+            }),
+          );
+      }
+      if (process.env.ARC_ROUND24_MEASURE)
+        console.log(JSON.stringify({ placement, schedule, headers, refusedStats, ...work }));
+    } finally {
+      release();
+      worker.stop();
+      writer.dispose();
+    }
+  },
+);
+
+test.skipIf(!rolloutCompression.zstdCompressSync).each([
+  ['decoded opening', 'reservation', false],
+  ['adopted old opening', 'catalog walk', false],
+  ['decoded opening', 'catalog walk', true],
+  ['adopted different owner', 'reservation', false],
+  ['adopted old opening', 'reservation', false, 'refused stat'],
+  ['adopted old opening', 'catalog walk', false, 'refused stat'],
+  ['adopted old opening', 'catalog walk', false, 'first opening'],
+  ['adopted old opening', 'reservation', false, 'first opening'],
+] as const)(
+  'a contested byte change with %s requalifies through the %s (newer notice: %s, schedule: %s)',
+  async (...[notice, route, race, schedule]) => {
+    let refusedFile: string | undefined;
+    let refused = 0;
+    let finish: (() => void) | undefined;
+    let entered: (() => void) | undefined;
+    let measured: string[] = [];
+    const qualify: typeof readQualifiedCompressedFirstRecord = async (file, limit, signal, work) => {
+      measured.push(file);
+      const opened = await readQualifiedCompressedFirstRecord(file, limit, signal, work);
+      if (entered) {
+        const hold = new Promise<void>((resolve) => (finish = resolve));
+        entered();
+        await hold;
+      }
+      return opened;
+    };
+    const { provider, plain, twin } = await adoptedPair({
+      readQualifiedCompressedFirstRecord: qualify,
+      readRolloutStat: (file: string) => {
+        if (file === refusedFile) {
+          refusedFile = undefined;
+          refused++;
+          return null;
+        }
+        return readRolloutStat(file);
+      },
+      scopeInside: (cwd: string, roots: string[]) => roots.includes(cwd),
+    });
+    const inScope = provider.repositoryScopeRoots[0];
+    const outside = tempDir('contested-compressed-outside-');
+    const at = new Date(fs.statSync(plain).mtimeMs);
+    const laterId = notice === 'adopted different owner' ? '01a032c9-1a92-7931-845c-723117d24dbf' : twinThread;
+    const timestamp = '2026-10-01T12:00:00.000Z';
+    const frames = [inScope, outside].map((cwd, index) =>
+      rolloutCompression.zstdCompressSync!(
+        Buffer.from(
+          [
+            { timestamp, type: 'session_meta', payload: { id: index ? laterId : twinThread, cwd, source: 'vscode' } },
+            { timestamp, type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn' } },
+            { timestamp, type: 'turn_context', payload: { turn_id: 'turn', cwd, model: 'gpt-5.6-sol' } },
+            { timestamp, type: 'event_msg', payload: { type: 'user_message', message: 'Contested rollout' } },
+            {
+              timestamp,
+              type: 'event_msg',
+              payload: {
+                type: 'token_count',
+                info: { last_token_usage: { input_tokens: 1700, output_tokens: 10 } },
+              },
+            },
+            { timestamp, type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn' } },
+          ]
+            .map((record) => JSON.stringify(record))
+            .join('\n') + '\n',
+        ),
+      ),
+    );
+    const bytes = Math.max(...frames.map((frame) => frame.length)) + 8;
+    const place = (index: number) => {
+      const frame = frames[index];
+      const pad = Buffer.alloc(bytes - frame.length);
+      pad.writeUInt32LE(0x184d2a50);
+      pad.writeUInt32LE(pad.length - 8, 4);
+      fs.writeFileSync(twin, Buffer.concat([frame, pad]));
+      fs.utimesSync(twin, at, at);
+    };
+    const stores = provider.compressedStorePaths();
+    const writer = new CompressedStoreHolder(stores.facts);
+    const openings = new CompressedStoreHolder(stores.openings);
+    const follower = new CompressedStoreFollower(stores.facts);
+    const signal = new AbortController().signal;
+    const decode = async () => {
+      const derivation = new RolloutDerivation(twin, normalizeWorkspace(inScope));
+      const read = await streamCompressedRollout(twin, (chunk) => derivation.push(chunk));
+      assert.ok(read.kind === 'decoded');
+      return compressedFactsFromDerivation(twin, read, derivation);
+    };
+    try {
+      const plainSpend = provider.projectSpendVisibleFiles[0];
+      provider.projectSpendVisibleFiles = [];
+      provider.projectSpendFiles = [];
+      provider.refreshFrom = () => {};
+      provider.startAgyDiscovery = () => {};
+      fs.unlinkSync(plain);
+      place(0);
+      const before = readRolloutStat(twin);
+      const old = await decode();
+      assert.ok(old.spend && old.title);
+      assert.equal(spendConsumers.spendRecordTotal(old.spend).requests, 1);
+      assert.deepEqual(await writer.append([old]), [true]);
+      const [initial] = await follower.poll();
+      provider.applyCompressedEntries([initial]);
+      const known = await provider.qualifyCompressedOpening(twin, signal);
+      assert.equal(known?.source.cwd, inScope);
+      if (schedule !== 'first opening') assert.ok(provider.installCompressedOpening(known));
+
+      const folders = provider.folders();
+      const folderPrint = `${folders.join('\n')}\0${provider.repositoryScope.snapshot(folders).revision}`;
+      provider.agyCatalog = { folderPrint, rows: [{ sessionId: twinThread, agent: 'agy' }] };
+      provider.agyNativeReservations = new Map(schedule === 'first opening' ? [] : [[twinThread, [known.source]]]);
+      const enumeration = { status: 'complete', files: [], uncertain: [], compressed: [twin] };
+      provider.sourceEnumerations.codex = enumeration;
+      const priorRows: SessionFile[] = provider.compressedRowsOf(
+        { walked: [], enumeration },
+        (cwd: string) => cwd === inScope,
+        { domain: 'physical', scope: JSON.stringify(provider.repositoryScopeRoots), revision: '21' },
+      );
+      assert.deepEqual(
+        priorRows.map((row) => row.file),
+        schedule === 'first opening' ? [] : [twin],
+      );
+      const spendInputs: SpendFileIndex[] = [];
+      if (schedule !== 'first opening') {
+        assert.deepEqual(provider.compressedSpendPick(spendInputs), [initial.spend]);
+        assert.ok(provider.compressedTitleOf(twin));
+      }
+
+      const requalify = async () => {
+        if (route === 'reservation') {
+          await provider.reserveContestedCompressedOpenings(new Set([normalizeFsPath(twin)]), folderPrint, signal);
+        } else {
+          const read = await provider.collectCatalogWalk(path.dirname(twin), signal, enumeration);
+          for (const next of read.compressedOpenings.observations) provider.installCompressedOpening(next);
+        }
+      };
+      let firstRead: Promise<void> | undefined;
+      if (schedule === 'first opening') {
+        const firstEntered = new Promise<void>((resolve) => (entered = resolve));
+        firstRead = requalify();
+        await Promise.race([firstEntered, firstRead]);
+        assert.ok(finish, 'the first qualification did not start');
+      }
+      place(1);
+      assert.deepEqual(readRolloutStat(twin), before);
+      if (notice === 'decoded opening') {
+        assert.deepEqual(await writer.append([await decode()]), [true]);
+      } else {
+        const adopted = await recordCompressedAdoption(
+          {
+            plain,
+            twin,
+            plainMtimeMs: at.getTime(),
+            opening: { ...old.opening!, sessionId: laterId },
+            spend: plainSpend,
+          },
+          writer,
+          openings,
+        );
+        assert.ok(adopted.adopted && adopted.durable);
+        assert.equal(adopted.entry.opening?.cwd, inScope);
+      }
+      const [successor] = await follower.poll();
+      assert.ok(successor?.hash && successor.hash !== initial.hash, 'the store did not deliver the changed bytes');
+      assert.equal(successor.threadId, laterId);
+      if (schedule === 'refused stat') refusedFile = twin;
+      provider.applyCompressedEntries([successor]);
+      if (schedule === 'refused stat') assert.equal(refused, 1);
+      if (firstRead) {
+        entered = undefined;
+        finish!();
+        await firstRead;
+        assert.ok(
+          !provider.qualifiedCompressedOpenings?.has(normalizeFsPath(twin)),
+          'the first opening borrowed a newer witness',
+        );
+        assert.equal(provider.agyNativeReservations.has(twinThread), false);
+        await requalify();
+        assert.equal(provider.qualifiedCompressedOpenings.get(normalizeFsPath(twin)).source.cwd, outside);
+        assert.deepEqual(provider.compressedSpendPick(spendInputs), []);
+        return;
+      }
+      assert.deepEqual(provider.currentCompressedProjections(priorRows), [], 'the old workspace kept read authority');
+      assert.deepEqual(provider.compressedSpendPick(spendInputs), [], 'the old workspace kept Project cost');
+      assert.equal(provider.compressedTitleOf(twin), undefined);
+      assert.deepEqual(
+        provider.agyNativeReservations.get(twinThread),
+        [known.source],
+        'unresolved scope released the reservation',
+      );
+
+      measured = [];
+      const beforeWork = provider.performanceCounters.snapshot().work;
+      const readEntered = new Promise<void>((resolve) => (entered = resolve));
+      const pending = requalify();
+      await Promise.race([readEntered, pending]);
+      assert.ok(finish, 'qualification reused the matched stat');
+      assert.deepEqual(measured, [twin]);
+      assert.deepEqual(provider.compressedSpendPick(spendInputs), []);
+      let inScopeSpend = initial.spend;
+      if (race) {
+        place(0);
+        assert.deepEqual(readRolloutStat(twin), before);
+        assert.deepEqual(await writer.append([await decode()]), [true]);
+        const [latest] = await follower.poll();
+        assert.equal(latest.hash, initial.hash);
+        inScopeSpend = latest.spend;
+        provider.applyCompressedEntries([latest]);
+      }
+      entered = undefined;
+      finish();
+      await pending;
+      if (race) {
+        assert.deepEqual(
+          provider.currentCompressedProjections(priorRows),
+          [],
+          'the obsolete opening completed the newer notice',
+        );
+        assert.deepEqual(provider.compressedSpendPick(spendInputs), []);
+        await requalify();
+        assert.deepEqual(provider.currentCompressedProjections(priorRows), priorRows);
+        assert.deepEqual(provider.compressedSpendPick(spendInputs), [inScopeSpend]);
+      } else {
+        assert.equal(provider.qualifiedCompressedOpenings.get(normalizeFsPath(twin)).source.cwd, outside);
+        assert.deepEqual(provider.currentCompressedProjections(priorRows), []);
+        assert.deepEqual(provider.compressedSpendPick(spendInputs), []);
+        if (route === 'reservation') assert.equal(provider.agyNativeReservations.has(twinThread), false);
+      }
+
+      provider.applyCompressedEntries([successor, initial]);
+      await requalify();
+      assert.deepEqual(
+        measured,
+        race ? [twin, twin] : [twin],
+        'a duplicate or delayed observation read the opening again',
+      );
+      const work = provider.performanceCounters.snapshot().work;
+      const delta = (name: string) => (work[name] ?? 0) - (beforeWork[name] ?? 0);
+      const inputBytes = delta('openingsRead:compressedCollisionInputBytes');
+      const outputBytes = delta('openingsRead:compressedCollisionOutputBytes');
+      assert.equal(inputBytes, measured.length * bytes);
+      assert.ok(outputBytes > 0 && outputBytes <= measured.length * 1024 * 1024);
+    } finally {
+      finish?.();
+      writer.dispose();
+      openings.dispose();
+    }
   },
 );
 
@@ -13626,6 +14872,7 @@ test('discovery sends the compressed list only when the set changed since the la
   provider.progressiveWorker = { currentThreadId: 1 };
   provider.compressedRollouts = new Set(['a.jsonl.zst', 'b.jsonl.zst']);
   provider.compressedRolloutsRevision = 3;
+  provider.agyScopeEpoch = 1;
   provider.compressedRolloutsSent = null;
   const stores = {
     facts: path.join('cache', COMPRESSED_FACTS_STORE),
@@ -13634,17 +14881,19 @@ test('discovery sends the compressed list only when the set changed since the la
   assert.deepEqual(provider.compressedRolloutsToSend(), {
     compressed: ['a.jsonl.zst', 'b.jsonl.zst'],
     compressedStores: stores,
+    compressedRevision: 3,
+    compressedScope: 1,
   });
   assert.deepEqual(
     provider.compressedRolloutsToSend().compressed,
     ['a.jsonl.zst', 'b.jsonl.zst'],
     'a list the worker did not answer stayed marked as sent',
   );
-  provider.markCompressedRolloutsSent(provider.compressedRolloutsRevision);
+  provider.markCompressedRolloutsSent({ revision: provider.compressedRolloutsRevision, state: 'held' }, 1, stores, 1);
   assert.deepEqual(provider.compressedRolloutsToSend(), {}, 'an unchanged set was sent again');
   provider.compressedRolloutsRevision++;
   assert.deepEqual(provider.compressedRolloutsToSend().compressed, ['a.jsonl.zst', 'b.jsonl.zst']);
-  provider.markCompressedRolloutsSent(provider.compressedRolloutsRevision);
+  provider.markCompressedRolloutsSent({ revision: provider.compressedRolloutsRevision, state: 'held' }, 1, stores, 1);
   provider.progressiveWorker.currentThreadId = 2;
   assert.deepEqual(
     provider.compressedRolloutsToSend().compressed,
@@ -13824,6 +15073,7 @@ test('a superseded discovery request sends the compressed list again with the ne
   provider.derivedCacheFile = path.join('cache', 'derived.json');
   provider.compressedRollouts = new Set(['a.jsonl.zst']);
   provider.compressedRolloutsRevision = 1;
+  provider.agyScopeEpoch = 1;
   provider.compressedRolloutsSent = null;
   provider.performanceCounters = new PanelPerformanceCounters(1000);
   const checkpoint = {
@@ -13838,9 +15088,10 @@ test('a superseded discovery request sends the compressed list again with the ne
   };
   const answer = {
     generation: 4,
+    workerThreadId: 1,
     value: {
       kind: 'claude-children-progress',
-      compressedNames: 'recorded',
+      compressedNames: { revision: 1, state: 'recorded' },
       checkpoint,
       referenceEntries: [],
       continuation: true,
@@ -13864,13 +15115,15 @@ test('a superseded discovery request sends the compressed list again with the ne
     },
   };
   const requests: { compressed?: string[] }[] = [];
-  const replies: unknown[] = [null, answer, answer];
+  const noReceipt = { ...answer, value: { ...answer.value, compressedNames: undefined } };
+  const wrongThread = { ...answer, workerThreadId: 2 };
+  const replies: unknown[] = [null, noReceipt, wrongThread, answer, noReceipt];
   provider.progressiveWorker = {
     ...provider.progressiveWorker,
     currentThreadId: 1,
     endDiscoveryReplyGap() {},
-    run: (request: { compressed?: string[] }) => {
-      requests.push(request);
+    run: (...args: Parameters<import('./progressiveworker').ProgressiveWorker['run']>) => {
+      requests.push({ ...args[5]?.names() });
       return Promise.resolve(replies.shift());
     },
   };
@@ -13880,7 +15133,11 @@ test('a superseded discovery request sends the compressed list again with the ne
   await provider.prepareClaudeChildren(4, new AbortController().signal);
   assert.deepEqual(requests[1].compressed, ['a.jsonl.zst'], 'the lost list was not sent again');
   await provider.prepareClaudeChildren(4, new AbortController().signal);
-  assert.equal(requests[2].compressed, undefined, 'a delivered list was sent again');
+  assert.deepEqual(requests[2].compressed, ['a.jsonl.zst'], 'an answer without a receipt marked the list sent');
+  await provider.prepareClaudeChildren(4, new AbortController().signal);
+  assert.deepEqual(requests[3].compressed, ['a.jsonl.zst'], 'another worker marked the list sent');
+  await provider.prepareClaudeChildren(4, new AbortController().signal);
+  assert.equal(requests[4].compressed, undefined, 'a delivered list was sent again');
   assert.equal(
     provider.performanceCounters.snapshot().work['compressedNames:recorded'],
     1,
@@ -13995,15 +15252,27 @@ test('compressedPending counts each admitted file without a current decoded entr
       metadataGeneration: pendingVersions.metadataGeneration - 1,
     }),
   ]);
-  writeSegment(openings, [entry('opened.zst', { opening: null })]);
+  writeSegment(openings, [
+    entry('opened.zst', { opening: null, physicalOpening: true }),
+    entry('legacy.zst', { opening: null }),
+  ]);
   const input = {
-    names: ['done.zst', 'adopted.zst', 'unreadable.zst', 'stale.zst', 'opened.zst', 'noopening.zst', 'twin.zst'],
+    names: [
+      'done.zst',
+      'adopted.zst',
+      'unreadable.zst',
+      'stale.zst',
+      'opened.zst',
+      'legacy.zst',
+      'noopening.zst',
+      'twin.zst',
+    ],
     admitted: new Set(['done.zst', 'adopted.zst', 'unreadable.zst', 'stale.zst']),
     statOf: () => pendingStat,
     exists: (file: string) => file === 'twin',
   };
-  // adopted and stale have no current decoded entry, and noopening has no opening.
-  assert.equal(compressedPending(home, input), 3);
+  // Adopted and stale need a body. Legacy and noopening need the first record.
+  assert.equal(compressedPending(home, input), 4);
 });
 
 test('compressedPending counts an entry the backfill marked unreadable at the current revision as settled', () => {
@@ -14228,6 +15497,7 @@ test('a stored entry keeps a row with a carried name across a version mismatch a
       compressed,
     },
   });
+  const context = { domain: 'physical', scope: JSON.stringify(provider.repositoryScopeRoots), revision: '1' };
   const twin = path.join(harness.root, `rollout-${twinThread}.jsonl.zst`);
   fs.writeFileSync(twin, 'x');
   const entry: any = {
@@ -14248,7 +15518,7 @@ test('a stored entry keeps a row with a carried name across a version mismatch a
     },
   };
   provider.compressedFacts.set(twin, entry);
-  const rows = provider.compressedRowsOf(walking([], [twin]), () => true);
+  const rows = provider.compressedRowsOf(walking([], [twin]), () => true, context);
   assert.deepEqual(
     rows.map((row: SessionFile) => row.file),
     [twin],
@@ -14258,16 +15528,16 @@ test('a stored entry keeps a row with a carried name across a version mismatch a
   assert.equal(provider.compressedTitleOf(twin), undefined, 'an outdated title entry was shown as current');
   // A listed plain twin gives no row, and the entry stays a ledger candidate.
   assert.deepEqual(
-    provider.compressedRowsOf(walking([twin.replace(/\.zst$/, '')], [twin]), () => true),
+    provider.compressedRowsOf(walking([twin.replace(/\.zst$/, '')], [twin]), () => true, context),
     [],
   );
   assert.equal(provider.compressedFacts.has(twin), true);
   // A complete walk that lists neither form drops the entry.
-  provider.compressedRowsOf(walking([], []), () => true);
+  provider.compressedRowsOf(walking([], []), () => true, context);
   assert.equal(provider.compressedFacts.has(twin), false);
   // An out-of-scope entry is dropped.
   provider.compressedFacts.set(twin, entry);
-  provider.compressedRowsOf(walking([], [twin]), () => false);
+  provider.compressedRowsOf(walking([], [twin]), () => false, context);
   assert.equal(provider.compressedFacts.has(twin), false);
 });
 
@@ -14550,6 +15820,7 @@ test('a backfill batch reaches the held catalog and the gauge without a walk', a
   const walksBefore = walks.length;
   assert.equal(gauges.compressedRows, undefined, 'the gauge moved without a compressed-facts refresh');
   provider.applyCompressedBatch({
+    memberships: [[twin, provider.compressedMemberships.get(twin)]],
     entries: [
       {
         file: twin,
@@ -14606,6 +15877,7 @@ test('a batch row added while a complete reply waits joins that reply', async ()
   provider.discoveryComplete = reply;
   provider.dispatchDiscoveryPendingWriter = undefined;
   provider.applyCompressedBatch({
+    memberships: [[twin, provider.compressedMemberships.get(twin)]],
     entries: [
       {
         file: twin,
@@ -14682,12 +15954,12 @@ async function batchApplyHarness(
       entry: {
         file: twin,
         pairKey: twin.replace(/\.zst$/, ''),
-        factsVersion: COMPRESSED_FACTS_VERSION,
-        metadataGeneration: METADATA_GENERATIONS.codex,
+        ...compressedEntryVersions(),
+        fileIdentity: { dev: stat.dev, ino: stat.ino },
         size: stat.size,
         mtimeMs: stat.mtimeMs,
         threadId: thread,
-        opening: { ...backfillOpening, cwd: provider.repositoryScopeRoots[0] },
+        opening: { ...backfillOpening, sessionId: thread, cwd: provider.repositoryScopeRoots[0] },
         spend: { file: twin.replace(/\.zst$/, ''), buckets: [] },
         complete: true,
         decodedLength: 500,
@@ -14715,6 +15987,204 @@ const pollOnce = async (provider: any) => {
   provider.refreshFrom = () => {};
   await provider.pollCatalog();
 };
+
+test('the first compressed batch post keeps a scoped pending successor as the only presentation owner', async () => {
+  const { provider, entryOf, plain } = await batchApplyHarness();
+  const { twin, entry } = entryOf(twinThread);
+  provider.awaitingSessionRecords[twinThread] = {
+    sessionId: twinThread,
+    agent: 'claude',
+    cwd: provider.repositoryScopeRoots[0],
+    replacesAgy: true,
+  };
+  provider.showing = twinThread;
+  provider.claudeChildReferences = [
+    {
+      kind: 'dispatch',
+      agent: 'codex',
+      sessionId: twinThread,
+      parentSessionId: 'plain',
+      file: twin,
+      toolUseIds: [],
+      name: null,
+      owned: true,
+    },
+  ];
+  provider.refreshFrom = () => {};
+  provider.sessionRows = [{ id: twinThread, agentKey: 'claude', persisted: false }];
+  const posts: { id: string; agentKey: string }[][] = [];
+  provider.useRailPayload(({ sessions }: { sessions: (typeof posts)[number] }) => {
+    posts.push(sessions);
+    return { rail: [], labels: [], views: [], railFilters: [], stats: {} };
+  });
+  const peer = provider.hosts[0];
+  provider.readyHosts.add(peer);
+  provider.agyRowsRevision = 1;
+  const snapshots: Array<{ id: string; parent?: unknown }[]> = [];
+  const post = provider.postRows.bind(provider);
+  provider.postRows = (host: unknown, message: { sessions?: (typeof snapshots)[number] }, ...args: unknown[]) => {
+    if (host === peer && message.sessions) snapshots.push(message.sessions);
+    return post(host, message, ...args);
+  };
+  provider.applyCompressedBatch({ entries: [entry], backfillMs: 0 });
+  assert.ok(provider.authoritativeCatalog.some((source: SessionFile) => source.file === twin));
+  assert.deepEqual(
+    posts[0]?.filter((row) => row.id === twinThread).map((row) => row.agentKey),
+    ['claude'],
+    'the first peer rail post gave the selected ID to a different provider',
+  );
+  assert.equal(provider.windows.has(twinThread), false);
+  assert.ok(provider.awaitingSessionRecords[twinThread]);
+  assert.equal(
+    provider.authoritativeCatalog.some((source: SessionFile) => source.file === plain),
+    true,
+  );
+  const selected = snapshots[0]?.find(({ id }) => id === twinThread);
+  assert.ok(selected, 'the recovering peer received no pending row');
+  assert.equal(selected.parent, undefined, 'the recovering peer received the recorded Codex parent');
+  provider.saved.readerParents = { [twinThread]: 'plain' };
+  assert.equal(
+    provider.parentOfShown(twinThread)?.relation,
+    'reader',
+    'the pending row lost an eligible reader parent',
+  );
+  delete provider.saved.readerParents[twinThread];
+  delete provider.awaitingSessionRecords[twinThread];
+  provider.sessionRows = provider.sessionRows.map((row: { id: string }) =>
+    row.id === twinThread ? { ...row, persisted: true, agentKey: 'codex' } : row,
+  );
+  assert.equal(
+    provider.parentOfShown(twinThread)?.relation,
+    'dispatched',
+    'the recorded Codex row lost its own parent',
+  );
+  endBatchWindow(provider);
+});
+
+test('a late legacy amount requests the current compressed revision without claiming its former owner', async () => {
+  const { provider, root, entryOf } = await batchApplyHarness();
+  provider.derivedCacheFile = path.join(root, 'workspace.json');
+  provider.compressedLoadPending = false;
+  provider.armCompressedFollow = () => {};
+  provider.refreshFrom = () => {};
+  const { twin, entry } = entryOf(twinThread);
+  provider.compressedRollouts.add(twin);
+  const replacement = path.join(root, 'successor');
+  fs.writeFileSync(replacement, 'replacement');
+  fs.renameSync(replacement, twin);
+  const current = readRolloutStat(twin)!;
+  const requests: Extract<ProgressiveRequest, { kind: 'compressed-load' }>[] = [];
+  provider.progressiveWorker = {
+    currentThreadId: 1,
+    run: async (request: (typeof requests)[number]) => {
+      requests.push(request);
+      return { value: { kind: 'compressed-load', entries: [], done: true } };
+    },
+  };
+  provider.applyCompressedBatch({ entries: [{ ...entry, undercount: true }], backfillMs: 0 });
+  await provider.followCompressedFacts();
+  const [repair] = requests.at(-1)?.repairs ?? [];
+  assert.equal(repair?.ino, current.ino);
+  assert.equal(repair?.sessionId, undefined, 'the legacy occupant claimed the replacement revision');
+  assert.equal(repair?.cwd, undefined);
+  endBatchWindow(provider);
+});
+
+test('a visible store follow sends only unsettled opening revisions to its worker', async () => {
+  const { provider, root, entryOf } = await batchApplyHarness();
+  provider.derivedCacheFile = path.join(root, 'workspace.json');
+  provider.compressedLoadPending = false;
+  provider.armCompressedFollow = () => {};
+  provider.agyScopeEpoch = 1;
+  provider.refreshFrom = () => {};
+  const id = twinThread;
+  const { twin, entry } = entryOf(id);
+  provider.compressedRollouts.add(twin);
+  const requests: Extract<ProgressiveRequest, { kind: 'compressed-load' }>[] = [];
+  let acceptedRepairs: NonNullable<(typeof requests)[number]['repairs']> = [];
+  let entries: ReturnType<typeof entryOf>['entry'][] = [];
+  const worker = {
+    currentThreadId: 1,
+    run: async (request: (typeof requests)[number], generation: number) => {
+      requests.push(request);
+      return {
+        generation,
+        value: {
+          kind: 'compressed-load',
+          done: true,
+          acceptedRepairs,
+          entries,
+          ...(request.compressed
+            ? { compressedNames: { revision: request.compressedRevision, state: 'recorded' } }
+            : {}),
+        },
+      };
+    },
+  };
+  provider.progressiveWorker = worker;
+  provider.compressedRolloutsSent = {
+    worker: 1,
+    revision: provider.compressedRolloutsRevision,
+    stores: provider.compressedStorePaths(),
+  };
+  provider.applyCompressedBatch({ entries: [entry], backfillMs: 0 });
+  const sourceOf = () => ({
+    ...readRolloutStat(twin)!,
+    file: twin,
+    agent: 'codex',
+    sessionId: id,
+    cwd: provider.repositoryScopeRoots[0],
+  });
+  const install = (source: ReturnType<typeof sourceOf>) => {
+    const key = normalizeFsPath(source.file);
+    const check = { revision: source };
+    provider.compressedOpeningChecks = new Map([[key, check]]);
+    assert.equal(provider.installCompressedOpening({ source, hidden: false, check }), true);
+    assert.equal(provider.compressedOpeningChecks.has(key), false);
+  };
+  install(sourceOf());
+  await provider.followCompressedFacts();
+  assert.equal(requests.at(-1)?.repairs, undefined, 'current facts sent a repair');
+  const newer = path.join(root, 'newer');
+  fs.writeFileSync(newer, 'x');
+  fs.renameSync(newer, twin);
+  const changed = sourceOf();
+  assert.notEqual(changed.ino, entry.fileIdentity.ino);
+  install(changed);
+  await provider.followCompressedFacts();
+  const sent = requests.at(-1)!;
+  assert.equal(sent.compressed, undefined, 'a changed opening resent the acknowledged list');
+  assert.deepEqual(
+    sent.repairs?.map(({ file, ino }) => [file, ino]),
+    [[twin, changed.ino]],
+  );
+  acceptedRepairs = sent.repairs!;
+  await provider.followCompressedFacts();
+  await provider.followCompressedFacts();
+  assert.equal(requests.at(-1)?.repairs, undefined, 'an acknowledged worker took the same repair twice');
+  worker.currentThreadId = 2;
+  await provider.followCompressedFacts();
+  assert.deepEqual(requests.at(-1)?.repairs, acceptedRepairs);
+  assert.deepEqual(requests.at(-1)?.compressed, [twin], 'a replacement worker received no allowed names');
+  const repaired = {
+    ...entry,
+    size: changed.size,
+    mtimeMs: changed.mtimeMs,
+    fileIdentity: { dev: changed.dev!, ino: changed.ino! },
+  };
+  entries = [repaired];
+  await provider.followCompressedFacts();
+  provider.applyCompressedBatch({ entries: [entry], backfillMs: 0 });
+  assert.equal(
+    provider.compressedFacts.get(twin)?.fileIdentity?.ino,
+    changed.ino,
+    'a delayed batch restored old facts',
+  );
+  worker.currentThreadId = 3;
+  await provider.followCompressedFacts();
+  assert.equal(requests.at(-1)?.repairs, undefined, 'settled facts left a repair owed');
+  endBatchWindow(provider);
+});
 
 test('fifty batches during pending discovery list their rows with no discovery request or catalog enumeration', async () => {
   const { provider, plain, work, refreshes, gauges, posted, sourceUpdates, entryOf } = await batchApplyHarness(
@@ -15664,6 +17134,7 @@ function backfilledTwinHarness(extraMethods: string[] = [], scope: Record<string
   };
   const applyTwin = () =>
     provider.applyCompressedBatch({
+      memberships: [[twin, provider.compressedMemberships.get(twin)]],
       entries: [
         {
           file: twin,
@@ -15725,6 +17196,67 @@ test('a complete discovery reply keeps a backfilled row and gives it a spend sou
   assert.ok(
     sourceUpdates.at(-1)?.some((row) => row.file === twin),
     'the compressed row reached no spend source',
+  );
+});
+
+test('Antigravity native IDs yield to compressed Codex backfill and partial discovery replies', async () => {
+  const { provider, root, twin, worker, complete, applyTwin, releaseAll } = backfilledTwinHarness();
+  await releaseAll(provider.refresh(true));
+  const agy: SessionFile = {
+    agent: 'agy',
+    sessionId: twinThread,
+    file: path.join(root, 'transcript_full.jsonl'),
+    agyOwnerRoot: root,
+    size: 300,
+    mtimeMs: 1,
+  };
+  provider.catalog.sessions = [...provider.catalog.sessions, agy];
+  provider.authoritativeCatalog = [...provider.authoritativeCatalog, agy];
+  const matches = (rows: SessionFile[]) =>
+    rows.filter((row) => row.sessionId === twinThread).map(({ agent, file }) => ({ agent, file }));
+  applyTwin();
+  await vi.waitFor(() => assert.equal(provider.refreshController, null));
+  const backfill = [matches(provider.catalog.sessions), matches(provider.authoritativeCatalog)];
+  const accepted = [...provider.authoritativeCatalog];
+  // A relationship reply can still hold an earlier walk while a compressed row is available.
+  provider.catalog.sessions = [...provider.catalog.sessions.filter((row: SessionFile) => row.file !== twin), agy];
+  provider.authoritativeCatalog = accepted.filter((row: SessionFile) => row.file !== twin && row.agent !== 'agy');
+  worker.reply = (request) => ({ ...complete(request), complete: false, continuation: true });
+  await provider.prepareClaudeChildren(provider.refreshGeneration, new AbortController().signal);
+  const codex = [{ agent: 'codex', file: twin }];
+  assert.deepEqual(
+    { backfill, partial: matches(provider.catalog.sessions) },
+    { backfill: [codex, codex], partial: codex },
+  );
+});
+
+test('a newly settled Claude child takes priority over an Antigravity session with the same native ID', async () => {
+  const { provider, root, worker, complete, releaseAll } = backfilledTwinHarness();
+  await releaseAll(provider.refresh(true));
+  const id = '3352f6ae-5337-44ed-a42a-df1b4d26bbc8';
+  const agy: SessionFile = {
+    agent: 'agy',
+    sessionId: id,
+    file: path.join(root, 'transcript_full.jsonl'),
+    agyOwnerRoot: root,
+    size: 300,
+    mtimeMs: 1,
+  };
+  const child: SessionFile = {
+    agent: 'claude',
+    sessionId: id.toUpperCase(),
+    file: path.join(root, 'agent-child.jsonl'),
+    childTranscript: true,
+    size: 400,
+    mtimeMs: 2,
+  };
+  provider.catalog.sessions = [...provider.catalog.sessions, agy];
+  worker.reply = (request) => ({ ...complete(request), children: [child] });
+
+  assert.equal(await provider.prepareClaudeChildren(provider.refreshGeneration, new AbortController().signal), true);
+  assert.deepEqual(
+    provider.catalog.sessions.filter((row: SessionFile) => row.sessionId.toLowerCase() === id),
+    [child],
   );
 });
 
@@ -16129,13 +17661,16 @@ test('a new worker takes the host offsets and entries in place of the whole stor
   provider.folders = () => ['c:/repo'];
   provider.repositoryScopeRoots = ['c:/repo'];
   provider.compressedFacts.set('a', entry({ file: 'a' }));
-  provider.noteCompressedLoad({
-    kind: 'compressed-load',
-    entries: [],
-    done: true,
-    consumed: [['segment-1-t-0', 12]],
-    nameOnly: ['names.zst'],
-  });
+  provider.noteCompressedLoad(
+    {
+      kind: 'compressed-load',
+      entries: [],
+      done: true,
+      consumed: [['segment-1-t-0', 12]],
+      nameOnly: ['names.zst'],
+    },
+    1,
+  );
   assert.equal(
     provider.compressedLoadRequest({ facts: 'f', openings: 'o' }).resume,
     undefined,
@@ -16192,6 +17727,7 @@ test('a facts version bump keeps the row and its carried name through the real s
       },
     },
     () => true,
+    { domain: 'physical', scope: JSON.stringify(provider.repositoryScopeRoots), revision: '1' },
   );
   assert.deepEqual(
     rows.map((row: SessionFile) => row.file),
@@ -17636,7 +19172,7 @@ test('a selected draft keeps the held catalog through polls and child events', a
     await start();
     // A draft in repository scope stays selected through each refresh.
     provider.newDrafts = {
-      draft: { draftId: 'draft', cwd: provider.repositoryScopeRoots[0] },
+      draft: { draftId: 'draft', cwd: provider.repositoryScopeRoots[0], createdAt: 1, profile: { agent: 'codex' } },
     };
     provider.showing = 'draft';
     for (let interval = 0; interval < 11; interval++) {
@@ -22139,6 +23675,17 @@ function heldLedgerFile(): Error {
   });
 }
 
+function unchangedSpendFiles(files: unknown[]) {
+  return { files, pruned: false };
+}
+
+function unchangedSpendLedger(files: unknown[], completeFiles: unknown[]) {
+  return {
+    resumable: unchangedSpendFiles(files),
+    visible: unchangedSpendFiles(completeFiles),
+  };
+}
+
 // The harness supplies session list payloads and records later posts.
 function railPostHarness(extraMethods: string[], scope: Record<string, unknown> = {}): any {
   const provider = completeDiscoveryHarness(
@@ -22153,10 +23700,7 @@ function railPostHarness(extraMethods: string[], scope: Record<string, unknown> 
       remapReaderParents,
       readMovedOnlyFor,
       STATE_KEY: 'arc.panel',
-      pruneSpendFilesWithResult: (files: unknown[]) => ({
-        files,
-        pruned: false,
-      }),
+      pruneSpendLedgerFiles: unchangedSpendLedger,
       ...scope,
     },
   );
@@ -23802,7 +25346,7 @@ test.each([
   provider.agentSpendKey = () => (kind === 'facts' ? 'moved' : 'agents');
   let current = kind !== 'file';
   provider.progressiveCurrent = () => current;
-  provider.progressiveInput = () => ({});
+  provider.progressiveInput = (source: SessionFile) => ({ session: source });
   provider.acceptSelectedMetadataRead = () => {};
   provider.updateHistoryAfterAcceptedWindow = () => {};
   provider.commitRepositoryContexts = () => [];
@@ -24884,10 +26428,7 @@ function spendOfferHarness(scope: Record<string, unknown> = {}): any {
       projectSpendWorkspace: (folders: string[]) => folders[0] ?? null,
       MULTI_ROOT_SPEND_WORKSPACE_PREFIX: 'multi:',
       loadSpendLedger: () => ({ files: [], completeFiles: [] }),
-      pruneSpendFilesWithResult: (files: unknown[]) => ({
-        files,
-        pruned: false,
-      }),
+      pruneSpendLedgerFiles: unchangedSpendLedger,
       ...scope,
     },
   );
@@ -24948,6 +26489,11 @@ function integrityHostHarness(scope: Record<string, unknown> = {}, extraMethods:
       'checkProjectSpendSources',
       'publishProjectSpendCoverage',
       'queueProjectSpendIndex',
+      'qualifiedAgySpendRevision',
+      'expireMissingAgySpend',
+      'revokeMissingAgyAdmission',
+      'startAgyDiscovery',
+      'clearAgyDiscovery',
       'indexNextProjectSpendFile',
       'finishProjectSpendIndex',
       'projectSpendHistoryCutoff',
@@ -24976,6 +26522,10 @@ function integrityHostHarness(scope: Record<string, unknown> = {}, extraMethods:
       releaseSpendHeldLine,
       createClaudeUsageLineReducer,
       createCodexUsageLineReducer,
+      agySpendAtAdmission,
+      agySessionId,
+      scanAgySessions,
+      setImmediate,
       indexSpendFile,
       invalidateSpendFileNormalization: () => {},
       prepareProjectSpendViewSteps,
@@ -25020,12 +26570,1449 @@ function integrityHostHarness(scope: Record<string, unknown> = {}, extraMethods:
     poll: null,
   });
   provider.projectSpendSources = () => [];
-  provider.scheduleProjectSpendSave = () => {};
+  if (!extraMethods.includes('scheduleProjectSpendSave')) provider.scheduleProjectSpendSave = () => {};
   if (!extraMethods.includes('postRailIfSpendPendingMoved')) provider.postRailIfSpendPendingMoved = () => {};
   if (!extraMethods.includes('postDispatchedCostsIfMoved')) provider.postDispatchedCostsIfMoved = () => {};
   provider.indexNextClaudeCostState = () => false;
+  if (scope.agyBrainRoot) provider.refreshFrom = () => {};
   return provider;
 }
+
+function agySpendDiscovery(brain: string, roots: string[], bytes = 512) {
+  const cache: AgyDiscoveryCache = new Map();
+  const folderPrint = roots[0];
+  const key = JSON.stringify([brain, folderPrint, roots]);
+  const scope = { agyBrainRoot: () => brain };
+  const scan = { key, brain, folderPrint, roots, workspace: roots[0], cache };
+  const rows = () => {
+    const discovery = scanAgySessions(brain, roots, [], { cache, bytes });
+    let step = discovery.next();
+    while (!step.done) {
+      assert.ok(step.value.bytes <= bytes);
+      step = discovery.next();
+    }
+    return step.value.rows;
+  };
+  return { scope, scan, rows };
+}
+
+test('Project cost keeps admitted Antigravity usage when new tool evidence removes project membership', async () => {
+  const root = tempDir('agy-spend-membership-');
+  const project = path.join(root, 'project');
+  const sibling = path.join(root, 'sibling');
+  const id = '3352f6ae-5337-44ed-a42a-df1b4d26bbc8';
+  const log = path.join(root, id, '.system_generated', 'logs');
+  const file = path.join(log, 'transcript_full.jsonl');
+  fs.mkdirSync(log, { recursive: true });
+  const line = (type: string, step_index: number, rest: object) =>
+    JSON.stringify({ type, step_index, created_at: new Date().toISOString(), status: 'DONE', ...rest }) + '\n';
+  fs.writeFileSync(
+    file,
+    line('USER_INPUT', 0, { content: 'Keep the usage.' }) +
+      line('PLANNER_RESPONSE', 1, { output_tokens: 3, tool_calls: [{ name: 'run_command', args: { Cwd: project } }] }),
+  );
+  const discovery = agySpendDiscovery(root, [project, sibling]);
+  const admitted = discovery.rows()[0];
+  assert.equal(admitted?.agyOwnerRoot, project);
+  const previous = indexSpendFile(undefined, file, project, createAgyUsageReducer).record;
+  const reads: string[] = [];
+  const provider = integrityHostHarness({
+    ...discovery.scope,
+    createAgyUsageReducer,
+    indexSpendFile: (...args: Parameters<typeof indexSpendFile>) => {
+      reads.push(args[1]);
+      return indexSpendFile(...args);
+    },
+    sameProgressiveRevision,
+    normalizeSpendFile,
+    spendFileIsClaudeChild: () => false,
+  });
+  provider.agyScan = discovery.scan;
+  provider.projectSpendFiles = [previous];
+  provider.projectSpendWorkspace = project;
+  provider.repositoryScopeRoots = [project, sibling];
+  provider.repositoryScopeReady = true;
+  provider.catalog = { sessions: [admitted] };
+  provider.authoritativeCatalog = [admitted];
+  const key = normalizeSpendFile(file);
+  provider.spendRecordsByFile = new Map([[key, 0]]);
+  provider.projectSpendQueue = [{ file, agent: 'agy', primary: true, agySource: admitted }];
+  provider.projectSpendQueued = new Set([key]);
+  provider.scheduleNextProjectSpendFile = () => {};
+  fs.appendFileSync(
+    file,
+    line('PLANNER_RESPONSE', 2, {
+      output_tokens: 9999,
+      tool_calls: [{ name: 'run_command', args: { Cwd: sibling } }],
+    }),
+  );
+  assert.deepEqual(discovery.rows(), []);
+  provider.indexNextProjectSpendFile();
+  provider.catalog.sessions = [];
+  provider.authoritativeCatalog = [];
+  provider.updateProjectSpendIntegrity([]);
+  provider.queueProjectSpendIndex(new Map([[file, readRolloutStat(file)!]]));
+  await provider.checkProjectSpendSources([normalizeFsPath(file)], () => true);
+  assert.deepEqual(
+    {
+      reads,
+      record: provider.projectSpendFiles[0],
+      queue: provider.projectSpendQueue,
+    },
+    { reads: [], record: previous, queue: [] },
+  );
+});
+
+test.each(['complete', 'unfinished without usage', 'unfinished with earlier usage'])(
+  'Project cost keeps published Antigravity usage until it expires after deletion of a %s scan',
+  async (scanState) => {
+    const root = tempDir('agy-spend-retention-');
+    const project = path.join(root, 'project');
+    const storage = path.join(root, 'ledger');
+    const log = path.join(root, '3352f6ae-5337-44ed-a42a-df1b4d26bbc8', '.system_generated', 'logs');
+    const file = path.join(log, 'transcript_full.jsonl');
+    fs.mkdirSync(log, { recursive: true });
+    const usageDate = new Date(2026, 10, 25, 12);
+    const line = (type: string, step_index: number, rest: object, at = usageDate) =>
+      JSON.stringify({ type, step_index, created_at: at.toISOString(), status: 'DONE', ...rest }) + '\n';
+    const ownership = { tool_calls: [{ name: 'run_command', args: { Cwd: project } }] };
+    const earlier = new Date(2026, 10, 22, 12);
+    const firstSlice =
+      line('USER_INPUT', 0, { content: 'Index the new revision.' }, earlier) +
+      (scanState === 'unfinished with earlier usage'
+        ? line('PLANNER_RESPONSE', 1, { output_tokens: 99 }, earlier)
+        : '');
+    const body =
+      line('USER_INPUT', 0, { content: 'Keep the usage.' }) +
+      line('PLANNER_RESPONSE', 1, { output_tokens: 3, ...ownership });
+    const discovery = agySpendDiscovery(root, [project]);
+    fs.writeFileSync(file, body);
+    fs.utimesSync(file, usageDate, usageDate);
+    const admitted = discovery.rows()[0];
+    assert.equal(admitted?.agyOwnerRoot, project);
+    const previous = indexSpendFile(undefined, file, project, createAgyUsageReducer, usageDate.getTime()).record;
+    const readStat = vi.fn<(name: string) => Promise<fs.BigIntStats>>((name) =>
+      fs.promises.lstat(name, { bigint: true }),
+    );
+    const provider = integrityHostHarness(
+      {
+        ...LEDGER_SAVE_SCOPE,
+        ...discovery.scope,
+        createAgyUsageReducer,
+        normalizeSpendFile,
+        productionNormalizeFsPath: normalizeFsPath,
+        projectSpendWindows,
+        truncateProjectSpendView,
+        pruneSpendLedgerFiles,
+        pruneSpendFilesWithResult,
+        sameProgressiveRevision,
+        saveSpendLedger,
+        scopeInside: isInside,
+        snapshotHistoryDays: () => 0,
+        fs: { ...fs, promises: { ...fs.promises, lstat: readStat } },
+        indexSpendFile: (
+          previous: SpendFileIndex | undefined,
+          file: string,
+          workspace: string,
+          reducer: typeof createAgyUsageReducer,
+          budget: { expectedRevision: ReturnType<typeof fileRevisionOf> | null },
+        ) =>
+          indexSpendFile(previous, file, workspace, reducer, {
+            ...budget,
+            maxBytes: Buffer.byteLength(firstSlice),
+            maxMilliseconds: Infinity,
+          }),
+      },
+      [...LEDGER_SAVE_METHODS, 'scheduleProjectSpendMidnight', 'unknownProjectSpendSnapshot'],
+    );
+    provider.agyScan = discovery.scan;
+    provider.projectSpendStorageDir = storage;
+    provider.performanceCounters.recordLedgerSave = () => {};
+    provider.projectSpendWorkspace = project;
+    provider.projectSpendFiles = [previous];
+    provider.repositoryScopeRoots = [project];
+    provider.repositoryScopeReady = true;
+    provider.catalog = { sessions: [admitted] };
+    provider.projectSpendSources = () =>
+      provider.catalog.sessions.map((row: SessionFile) => ({ file, agent: 'agy', agySource: row, primary: true }));
+    const key = normalizeFsPath(previous.file);
+    const check = () => provider.checkProjectSpendSources([key], () => true);
+    provider.scheduleNextProjectSpendFile = () => {};
+    vi.useFakeTimers();
+    provider.projectSpendSaveScheduler = provider.newProjectSpendSaveScheduler();
+    const open = vi.spyOn(mutableFs, 'openSync');
+    syncBuiltinESMExports();
+    try {
+      vi.setSystemTime(new Date(2026, 10, 26, 12));
+      provider.finishProjectSpendIndex();
+      assert.equal(provider.projectSpendVisibleFiles[0], previous);
+      let working = previous;
+      if (scanState !== 'complete') {
+        const nextStep = scanState === 'unfinished with earlier usage' ? 2 : 1;
+        const incoming = path.join(log, 'replacement.jsonl');
+        fs.writeFileSync(
+          incoming,
+          firstSlice + line('PLANNER_RESPONSE', nextStep, { output_tokens: 7, ...ownership }, earlier),
+        );
+        fs.utimesSync(incoming, earlier, earlier);
+        fs.unlinkSync(file);
+        fs.renameSync(incoming, file);
+        const replacement = discovery.rows()[0];
+        assert.equal(replacement?.agyOwnerRoot, project);
+        assert.notEqual(replacement.ino, admitted.ino);
+        provider.catalog.sessions = [replacement];
+        provider.updateProjectSpendIntegrity([replacement]);
+        await check();
+        assert.equal(provider.projectSpendQueue.length, 1);
+        provider.indexNextProjectSpendFile();
+        working = provider.projectSpendFiles[0];
+        assert.equal(working.complete, false);
+        assert.equal(working.offset, Buffer.byteLength(firstSlice));
+        assert.equal(working.buckets.length, scanState === 'unfinished without usage' ? 0 : 1);
+        assert.notDeepEqual(working.lifetimeBuckets, previous.lifetimeBuckets);
+        assert.equal(provider.projectSpendVisibleFiles[0], previous);
+        provider.flushProjectSpendSave();
+        const saved = loadSpendLedger(storage, project);
+        assert.equal(saved.files[0]?.offset, working.offset);
+        assert.deepEqual(saved.completeFiles[0]?.buckets, previous.buckets);
+      }
+      open.mockClear();
+      readStat.mockRejectedValueOnce(Object.assign(new Error('temporarily unreadable'), { code: 'EACCES' }));
+      provider.updateProjectSpendIntegrity(provider.catalog.sessions);
+      await check();
+      assert.equal(provider.projectSpendQueue.length, scanState === 'complete' ? 0 : 1);
+      assert.equal(provider.projectSpendFiles[0], working);
+      assert.equal(provider.projectSpendVisibleFiles[0], previous);
+
+      fs.unlinkSync(file);
+      assert.deepEqual(discovery.rows(), []);
+      provider.catalog.sessions = [];
+      if (scanState !== 'complete') {
+        provider.indexNextProjectSpendFile();
+        assert.equal(provider.projectSpendQueue.length, 0);
+        assert.equal(provider.projectSpendFiles[0], working);
+      }
+      provider.updateProjectSpendIntegrity([]);
+      await check();
+
+      // A path can reappear between the integrity check and the drain.
+      fs.writeFileSync(file, body.replace('Keep the usage.', 'Replacement file.'));
+      provider.indexNextProjectSpendFile();
+      assert.equal(provider.projectSpendFiles[0], working);
+      assert.equal(provider.projectSpendVisibleFiles[0], previous);
+
+      fs.unlinkSync(file);
+      await check();
+      provider.indexNextProjectSpendFile();
+      provider.finishProjectSpendIndex();
+      const [missing] = provider.projectSpendVisibleFiles as SpendFileIndex[];
+      assert.equal(missing?.missingAt, Date.now());
+      assert.equal(provider.projectSpendFiles[0], missing);
+      assert.equal(missing.complete, true);
+      assert.deepEqual(missing.buckets, previous.buckets);
+      assert.deepEqual(missing.lifetimeBuckets, previous.lifetimeBuckets);
+      assert.ok(previous.buckets.length > 0 && previous.lifetimeBuckets!.length > 0);
+      assert.deepEqual(
+        open.mock.calls.filter(
+          ([name, flags]) => typeof name === 'string' && normalizeFsPath(name) === key && flags === 'r',
+        ),
+        [],
+      );
+
+      provider.flushProjectSpendSave();
+      const restored = loadSpendLedger(storage, project);
+      assert.equal(restored.files[0]?.missingAt, missing.missingAt);
+      assert.deepEqual(restored.files[0]?.lifetimeBuckets, previous.lifetimeBuckets);
+      assert.deepEqual(restored.completeFiles[0]?.buckets, previous.buckets);
+      provider.projectSpendFiles = restored.files;
+      provider.projectSpendVisibleFiles = restored.completeFiles;
+
+      const cutoff = new Date(2026, 11, 25).getTime();
+      vi.setSystemTime(cutoff - 1000);
+      provider.projectSpendSnapshot = provider.unknownProjectSpendSnapshot();
+      provider.invalidateProjectSpendSnapshot();
+      await vi.waitFor(() => assert.equal(provider.projectSpendPayload().indexing, false));
+      assert.deepEqual(provider.projectSpendQueue, []);
+      assert.equal(provider.projectSpendQueued.size, 0);
+      assert.equal(provider.projectSpendTick, null);
+
+      provider.scheduleProjectSpendMidnight();
+      await vi.advanceTimersByTimeAsync(cutoff - Date.now() - 1);
+      const category = provider.projectSpendPayload().categories[0];
+      assert.equal(category?.id, 'agy');
+      assert.equal(category.windows.find((window: { id: string }) => window.id === 'thirtyDays').unpricedRequests, 1);
+      assert.deepEqual(provider.projectSpendVisibleFiles, restored.completeFiles);
+      assert.deepEqual(loadSpendLedger(storage, project).files[0]?.lifetimeBuckets, previous.lifetimeBuckets);
+
+      await vi.advanceTimersByTimeAsync(1);
+      assert.equal(Date.now(), cutoff);
+      assert.deepEqual(provider.projectSpendPayload().categories, []);
+      assert.deepEqual(provider.projectSpendVisibleFiles, []);
+      assert.deepEqual(provider.projectSpendFiles, []);
+      assert.deepEqual(provider.projectSpendQueue, []);
+      await vi.advanceTimersByTimeAsync(PROJECT_SPEND_SAVE_MS);
+      assert.deepEqual(provider.projectSpendPayload().categories, []);
+      const expired = loadSpendLedger(storage, project);
+      assert.deepEqual(expired.files, []);
+      assert.deepEqual(expired.completeFiles, []);
+    } finally {
+      open.mockRestore();
+      syncBuiltinESMExports();
+      vi.useRealTimers();
+    }
+  },
+);
+
+function agyRetentionRequest(project: string, at: Date, step: number, output: number): string {
+  return (
+    JSON.stringify({
+      type: 'PLANNER_RESPONSE',
+      step_index: step,
+      created_at: at.toISOString(),
+      status: 'DONE',
+      output_tokens: output,
+      tool_calls: [{ name: 'run_command', args: { Cwd: project } }],
+    }) + '\n'
+  );
+}
+
+function agyRetentionHost(
+  storage: string,
+  project: string,
+  scope: Record<string, unknown> = {},
+  methods: string[] = [],
+) {
+  const provider = integrityHostHarness(
+    {
+      ...LEDGER_SAVE_SCOPE,
+      createAgyUsageReducer,
+      normalizeSpendFile,
+      productionNormalizeFsPath: normalizeFsPath,
+      loadSpendLedger,
+      saveSpendLedger,
+      truncateProjectSpendView,
+      pruneSpendLedgerFiles,
+      pruneSpendFilesWithResult,
+      sameProgressiveRevision,
+      scopeInside: isInside,
+      snapshotHistoryDays: () => 0,
+      ...scope,
+    },
+    [...LEDGER_SAVE_METHODS, 'scheduleProjectSpendMidnight', 'unknownProjectSpendSnapshot', ...methods],
+  );
+  provider.projectSpendStorageDir = storage;
+  provider.projectSpendWorkspace = project;
+  provider.projectSpendSnapshot = provider.unknownProjectSpendSnapshot();
+  provider.projectSpendSaveScheduler = provider.newProjectSpendSaveScheduler();
+  provider.performanceCounters.recordLedgerSave = () => {};
+  return provider;
+}
+
+test.each(['deletion', 'readmission', 'queued marked return', 'queued unmarked return', 'late deletion'])(
+  'Project cost applies Antigravity %s across midnight while another scan is queued',
+  async (transition) => {
+    const queuedReturn = transition === 'queued marked return' || transition === 'queued unmarked return';
+    const returning = transition === 'readmission' || queuedReturn;
+    const root = tempDir('agy-spend-active-retention-');
+    const project = path.join(root, 'project');
+    const storage = path.join(root, 'ledger');
+    const log = path.join(root, '3352f6ae-5337-44ed-a42a-df1b4d26bbc8', '.system_generated', 'logs');
+    const agy = path.join(log, 'transcript_full.jsonl');
+    const claude = path.join(root, 'other.jsonl');
+    const day = new Date(2026, 10, 25, 12);
+    const later = new Date(2026, 10, 26, 12);
+    const cutoff = new Date(2026, 11, 25).getTime();
+    const claudeRequest = (id: string, output: number) =>
+      JSON.stringify({
+        type: 'assistant',
+        timestamp: later.toISOString(),
+        uuid: id,
+        message: { id, model: 'claude-haiku-4-5', usage: { input_tokens: 1, output_tokens: output } },
+      }) + '\n';
+    const agyFirst = agyRetentionRequest(project, later, 0, 7);
+    const agySecond = agyRetentionRequest(project, later, 1, 11);
+    const claudeFirst = claudeRequest('one', 13);
+    const claudeSecond = claudeRequest('two', 17);
+    const claudeThird = claudeRequest('tri', 19);
+    const agyBudget = Buffer.byteLength(agyFirst);
+    const claudeBudget = Buffer.byteLength(claudeFirst);
+    const discovery = agySpendDiscovery(root, [project]);
+    const admitted = () => {
+      const rows = discovery.rows();
+      assert.equal(rows[0]?.agyOwnerRoot, project);
+      return rows;
+    };
+    fs.mkdirSync(log, { recursive: true });
+    const prompt = (step: number) =>
+      JSON.stringify({
+        type: 'USER_INPUT',
+        step_index: step,
+        created_at: day.toISOString(),
+        status: 'DONE',
+        content: 'Record usage.',
+      }) + '\n';
+    fs.writeFileSync(agy, prompt(0) + agyRetentionRequest(project, day, 1, 3));
+    fs.writeFileSync(claude, claudeRequest('original', 5));
+    fs.utimesSync(agy, day, day);
+    fs.utimesSync(claude, day, day);
+
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(cutoff - 1000 - (queuedReturn ? PROJECT_SPEND_SAVE_MS : 0));
+      const admittedAgy = admitted()[0];
+      const previous = indexSpendFile(undefined, agy, project, createAgyUsageReducer, {
+        expectedRevision: fileRevisionOf(fs.lstatSync(agy, { bigint: true })),
+        agyAdmission: currentAgyAdmission(discovery.scan.cache, admittedAgy),
+      }).record;
+      const other = indexSpendFile(undefined, claude, project, createClaudeUsageLineReducer).record;
+      const provider = agyRetentionHost(storage, project, {
+        ...discovery.scope,
+        indexSpendFile: (...args: Parameters<typeof indexSpendFile>) =>
+          indexSpendFile(args[0], args[1], args[2], args[3], {
+            ...(typeof args[4] === 'object' ? args[4] : {}),
+            maxBytes: normalizeFsPath(args[1]) === normalizeFsPath(agy) ? agyBudget : claudeBudget,
+            maxMilliseconds: Infinity,
+          }),
+      });
+      provider.agyScan = discovery.scan;
+      provider.projectSpendFiles = [previous, other];
+      provider.repositoryScopeRoots = [project];
+      provider.repositoryScopeReady = true;
+      provider.catalog = { sessions: admitted() };
+      provider.projectSpendSources = () => [
+        ...provider.catalog.sessions.map((row: SessionFile) => ({
+          file: agy,
+          agent: 'agy',
+          agySource: row,
+          primary: true,
+        })),
+        { file: claude, agent: 'claude', primary: true },
+      ];
+      // Release one production index tick at a time.
+      provider.scheduleNextProjectSpendFile = () => {};
+      provider.finishProjectSpendIndex();
+
+      const offerDeletion = async () => {
+        fs.unlinkSync(agy);
+        provider.catalog.sessions = [];
+        provider.updateProjectSpendIntegrity([]);
+        await provider.checkProjectSpendSources([normalizeFsPath(agy)], () => true);
+        assert.ok(provider.projectSpendQueue.some((entry: { agyMissing?: boolean }) => entry.agyMissing));
+      };
+
+      if (transition !== 'late deletion') await offerDeletion();
+      if (returning) {
+        provider.indexNextProjectSpendFile();
+        if (transition === 'queued unmarked return') {
+          assert.equal(provider.projectSpendVisibleFiles[0], previous);
+        } else {
+          provider.indexNextProjectSpendFile();
+          assert.equal(provider.projectSpendVisibleFiles[0]?.missingAt, Date.now());
+        }
+        fs.writeFileSync(agy, agyFirst + agySecond + prompt(2));
+        fs.utimesSync(agy, later, later);
+        provider.catalog.sessions = admitted();
+      }
+
+      const incoming = path.join(root, 'incoming.jsonl');
+      fs.writeFileSync(incoming, claudeFirst + claudeSecond + claudeThird);
+      fs.utimesSync(incoming, later, later);
+      fs.unlinkSync(claude);
+      fs.renameSync(incoming, claude);
+      provider.updateProjectSpendIntegrity(provider.catalog.sessions);
+      const offeredFiles = transition === 'late deletion' ? [claude] : queuedReturn ? [claude, agy] : [agy, claude];
+      await provider.checkProjectSpendSources(
+        (queuedReturn ? [claude, agy] : [agy, claude]).map(normalizeFsPath),
+        () => true,
+      );
+      assert.deepEqual(
+        provider.projectSpendQueue.map((entry: { file: string }) => normalizeFsPath(entry.file)),
+        offeredFiles.map(normalizeFsPath),
+      );
+      if (transition !== 'late deletion' && !queuedReturn) provider.indexNextProjectSpendFile();
+      provider.indexNextProjectSpendFile();
+      const [workingAgy, firstClaudeSlice] = provider.projectSpendFiles as SpendFileIndex[];
+      let workingClaude = firstClaudeSlice;
+      if (transition === 'deletion') {
+        assert.equal(workingAgy.missingAt, Date.now());
+        assert.equal(provider.projectSpendVisibleFiles[0], previous);
+      } else if (transition === 'readmission') {
+        assert.equal(workingAgy.missingAt, undefined);
+        assert.equal(workingAgy.offset, agyBudget);
+        assert.equal(workingAgy.lifetimeBuckets?.[0].usage.output, 7);
+      }
+      assert.equal(workingClaude.complete, false);
+      assert.equal(workingClaude.offset, claudeBudget);
+      assert.equal(provider.projectSpendVisibleFiles[1], other);
+      if (!queuedReturn) provider.flushProjectSpendSave();
+
+      const agyRequests = (host = provider) =>
+        (host.projectSpendPayload() as ProjectSpendView).categories
+          .find((category) => category.id === 'agy')
+          ?.windows.find((window) => window.id === 'thirtyDays')?.unpricedRequests;
+      provider.scheduleProjectSpendMidnight();
+      await vi.waitFor(() => assert.equal(agyRequests(), 1));
+      await vi.advanceTimersByTimeAsync(cutoff - Date.now() - 1);
+      const recoveryStorage = path.join(root, 'before-cutoff');
+      if (transition === 'queued marked return') {
+        fs.cpSync(storage, recoveryStorage, { recursive: true });
+      }
+      assert.equal(agyRequests(), 1);
+      assert.equal(loadSpendLedger(storage, project).completeFiles[0]?.lifetimeBuckets?.[0].requests, 1);
+
+      await vi.advanceTimersByTimeAsync(1);
+      assert.equal(Date.now(), cutoff);
+      const expectedAgy = transition === 'deletion' ? undefined : 0;
+      assert.equal(agyRequests(), expectedAgy, 'the midnight payload used the wrong display membership');
+      if (transition === 'late deletion') {
+        await offerDeletion();
+        provider.indexNextProjectSpendFile();
+        workingClaude = provider.projectSpendFiles[provider.spendRecordsByFile.get(other.file)];
+        assert.equal(workingClaude.complete, false);
+        assert.equal(workingClaude.offset, claudeBudget + Buffer.byteLength(claudeSecond));
+        provider.indexNextProjectSpendFile();
+        assert.equal(agyRequests(), undefined, 'confirmation retained usage that had already expired');
+      }
+      await vi.waitFor(() => {
+        assert.equal(provider.projectSpendRebuild, null);
+        assert.equal(provider.projectSpendBuild, null);
+      });
+      const retainedAgy = returning;
+      assert.equal(agyRequests(), retainedAgy ? 0 : undefined, 'the rebuilt payload used the wrong display membership');
+      assert.equal(provider.projectSpendPayload().indexing, true);
+      assert.equal(
+        provider.projectSpendQueue.some(
+          (entry: { file: string }) => normalizeFsPath(entry.file) === normalizeFsPath(claude),
+        ),
+        true,
+      );
+      assert.equal(provider.projectSpendQueued.has(other.file), true);
+      assert.equal(provider.projectSpendFiles[provider.spendRecordsByFile.get(other.file)], workingClaude);
+
+      await vi.advanceTimersByTimeAsync(PROJECT_SPEND_SAVE_MS);
+      const saved = loadSpendLedger(storage, project);
+      const savedAgy = saved.files.find((record) => record.file === previous.file);
+      const savedDisplay = saved.completeFiles.find((record) => record.file === previous.file);
+      if (!retainedAgy) {
+        assert.equal(savedAgy, undefined);
+        assert.equal(savedDisplay, undefined);
+      } else {
+        assert.equal(savedAgy?.offset, queuedReturn ? previous.offset : agyBudget);
+        assert.equal(savedAgy?.complete, !queuedReturn ? false : previous.complete);
+        assert.equal(savedAgy?.missingAt, undefined);
+        assert.deepEqual(savedDisplay?.buckets, []);
+        assert.deepEqual(savedDisplay?.lifetimeBuckets, previous.lifetimeBuckets);
+      }
+      assert.equal(saved.files.find((record) => record.file === other.file)?.offset, workingClaude.offset);
+      assert.deepEqual(
+        saved.completeFiles.find((record) => record.file === other.file)?.lifetimeBuckets,
+        other.lifetimeBuckets,
+      );
+
+      if (queuedReturn) {
+        assert.equal(savedAgy?.agyRescanRequired, true);
+        const resumed = agyRetentionHost(
+          transition === 'queued marked return' ? recoveryStorage : storage,
+          project,
+          {},
+          ['hydrateProjectSpend'],
+        );
+        resumed.projectSpendHydrated = false;
+        resumed.scheduleProjectSpendIndex = () => {};
+        resumed.hydrateProjectSpend(project, resumed.refreshGeneration, null);
+        await vi.waitFor(() => assert.equal(agyRequests(resumed), 0));
+        assert.deepEqual(resumed.projectSpendQueue, []);
+        const recovered = (resumed.projectSpendFiles as SpendFileIndex[]).find(
+          (record) => record.file === previous.file,
+        );
+        assert.equal(recovered?.agyRescanRequired, true);
+        assert.equal(recovered?.offset, previous.offset);
+        assert.deepEqual(recovered?.lifetimeBuckets, previous.lifetimeBuckets);
+        assert.deepEqual(
+          (resumed.projectSpendVisibleFiles as SpendFileIndex[]).find((record) => record.file === previous.file)
+            ?.lifetimeBuckets,
+          previous.lifetimeBuckets,
+        );
+
+        provider.indexNextProjectSpendFile();
+        const partial = provider.projectSpendFiles[provider.spendRecordsByFile.get(previous.file)] as SpendFileIndex;
+        assert.equal(partial.offset, agyBudget);
+        assert.equal(partial.lifetimeBuckets?.[0].usage.output, 7);
+        assert.equal(partial.agyRescanRequired, undefined);
+        const lifetime = sessionLifetimeDisplayFiles(
+          true,
+          provider.projectSpendFiles,
+          provider.projectSpendVisibleFiles,
+        );
+        assert.deepEqual(
+          lifetime.find((record) => record.file === previous.file)?.lifetimeBuckets,
+          previous.lifetimeBuckets,
+        );
+        await vi.advanceTimersByTimeAsync(PROJECT_SPEND_SAVE_MS);
+        const checkpoint = loadSpendLedger(storage, project);
+        assert.equal(checkpoint.files.find((record) => record.file === previous.file)?.offset, agyBudget);
+        assert.deepEqual(
+          checkpoint.completeFiles.find((record) => record.file === previous.file)?.lifetimeBuckets,
+          previous.lifetimeBuckets,
+        );
+      }
+      for (let tick = 0; tick < 10 && provider.projectSpendIndexing; tick++) {
+        provider.indexNextProjectSpendFile();
+      }
+      assert.deepEqual(provider.projectSpendQueue, []);
+      assert.equal(provider.projectSpendIndexing, false);
+      await vi.waitFor(() => assert.equal(provider.projectSpendPayload().indexing, false));
+      const visible = provider.projectSpendVisibleFiles as SpendFileIndex[];
+      assert.equal(visible.find((record) => record.file === other.file)?.lifetimeBuckets?.[0].usage.output, 49);
+      assert.equal(visible.find((record) => record.file === other.file)?.lifetimeBuckets?.[0].requests, 3);
+      assert.equal(agyRequests(), retainedAgy ? 2 : undefined);
+      if (retainedAgy) {
+        assert.equal(visible.find((record) => record.file === previous.file)?.lifetimeBuckets?.[0].usage.output, 18);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  },
+);
+
+test.each([
+  'a metadata-only offer',
+  'an obsolete admission',
+  'a return after expiry',
+  'an equal revision',
+  'a newer revision on the same inode',
+  'a revoked scope after a verified return',
+  'a later confirmed absence',
+])('Project cost applies Antigravity return rules for %s', async (change) => {
+  const root = tempDir('agy-spend-return-');
+  const project = path.join(root, 'project');
+  const log = path.join(root, '3352f6ae-5337-44ed-a42a-df1b4d26bbc8', '.system_generated', 'logs');
+  const file = path.join(log, 'transcript_full.jsonl');
+  const held = path.join(root, 'held.jsonl');
+  const day = new Date(2026, 10, 25, 12);
+  const cutoff = new Date(2026, 11, 25).getTime();
+  const prompt =
+    JSON.stringify({
+      type: 'USER_INPUT',
+      step_index: 0,
+      created_at: day.toISOString(),
+      status: 'DONE',
+      content: 'Record usage.',
+    }) + '\n';
+  const original = prompt + agyRetentionRequest(project, day, 1, 3);
+  const replacement = prompt + agyRetentionRequest(project, day, 1, 7);
+  const appended = agyRetentionRequest(project, day, 2, 11);
+  fs.mkdirSync(log, { recursive: true });
+  fs.writeFileSync(file, original);
+  fs.utimesSync(file, day, day);
+
+  const discovery = agySpendDiscovery(root, [project]);
+  const admit = () => {
+    const row = discovery.rows()[0];
+    assert.equal(row?.agyOwnerRoot, project);
+    return row;
+  };
+  const storage = path.join(root, 'ledger');
+  vi.useFakeTimers();
+  try {
+    vi.setSystemTime(cutoff - 1000);
+    const prior = indexSpendFile(undefined, file, project, createAgyUsageReducer).record;
+    const initial = fileRevisionOf(fs.lstatSync(file, { bigint: true }));
+    const positiveReads: Array<{ revision: unknown; output: number | undefined; offset: number }> = [];
+    const provider = agyRetentionHost(storage, project, {
+      ...discovery.scope,
+      indexSpendFile: (...args: Parameters<typeof indexSpendFile>) => {
+        const result = indexSpendFile(...args);
+        const revision = typeof args[4] === 'object' && args[4].expectedRevision;
+        if (revision) {
+          positiveReads.push({
+            revision,
+            output: result.record.lifetimeBuckets?.[0]?.usage.output,
+            offset: result.record.offset,
+          });
+        }
+        return result;
+      },
+    });
+    provider.agyScan = discovery.scan;
+    provider.projectSpendFiles = [prior];
+    provider.repositoryScopeRoots = [project];
+    provider.repositoryScopeReady = true;
+    provider.catalog = { sessions: [] };
+    provider.projectSpendSources = () =>
+      provider.catalog.sessions.map((row: SessionFile) => ({ file, agent: 'agy', agySource: row, primary: true }));
+    provider.scheduleNextProjectSpendFile = () => {};
+    provider.finishProjectSpendIndex();
+
+    const check = () => {
+      provider.updateProjectSpendIntegrity(provider.catalog.sessions);
+      return provider.checkProjectSpendSources([normalizeFsPath(file)], () => true);
+    };
+    fs.renameSync(file, held);
+    await check();
+    provider.indexNextProjectSpendFile();
+    provider.indexNextProjectSpendFile();
+    const deletedAt = Date.now();
+    assert.equal(provider.projectSpendFiles[0]?.missingAt, deletedAt);
+    fs.writeFileSync(held, replacement);
+    fs.utimesSync(held, day, day);
+    fs.renameSync(held, file);
+    const admitted = admit();
+    provider.catalog.sessions = [admitted];
+    assert.deepEqual(fileRevisionOf(fs.lstatSync(file, { bigint: true })), initial);
+
+    if (change === 'a metadata-only offer' || change === 'an obsolete admission') {
+      if (change === 'a metadata-only offer') {
+        const { size, mtimeMs } = admitted;
+        provider.queueProjectSpendIndex(new Map([[file, { size, mtimeMs }]]));
+      } else {
+        const checking = check();
+        provider.catalog.sessions = [{ ...admitted, sessionId: 'changed-session' }];
+        await checking;
+      }
+      assert.equal(provider.projectSpendQueue.length, 0);
+      assert.equal(provider.projectSpendFiles[0]?.missingAt, deletedAt);
+      provider.scheduleProjectSpendMidnight();
+      await vi.advanceTimersByTimeAsync(cutoff - Date.now());
+      assert.deepEqual(provider.projectSpendFiles, []);
+      assert.deepEqual(provider.projectSpendVisibleFiles, []);
+      assert.deepEqual(positiveReads, []);
+      return;
+    }
+
+    if (change === 'a return after expiry') {
+      const historyCutoff = provider.projectSpendHistoryCutoff.bind(provider);
+      provider.projectSpendHistoryCutoff = (now?: number) => {
+        const limit = historyCutoff(now);
+        vi.setSystemTime(cutoff);
+        return limit;
+      };
+    }
+    await check();
+    assert.equal(provider.projectSpendQueue.length, 1);
+    assert.deepEqual(positiveReads, []);
+
+    if (change === 'a return after expiry') {
+      assert.deepEqual(provider.projectSpendFiles, []);
+      assert.deepEqual(provider.projectSpendVisibleFiles, []);
+    } else if (change === 'a revoked scope after a verified return') {
+      provider.repositoryScopeReady = false;
+      provider.scheduleProjectSpendMidnight();
+      await vi.advanceTimersByTimeAsync(cutoff - Date.now());
+      provider.indexNextProjectSpendFile();
+      provider.indexNextProjectSpendFile();
+      assert.deepEqual(positiveReads, []);
+      assert.deepEqual(provider.projectSpendFiles[0]?.lifetimeBuckets, prior.lifetimeBuckets);
+      assert.deepEqual(provider.projectSpendVisibleFiles[0]?.lifetimeBuckets, prior.lifetimeBuckets);
+      provider.flushProjectSpendSave();
+      const saved = loadSpendLedger(storage, project);
+      assert.equal(saved.files[0]?.agyRescanRequired, true);
+      assert.equal(saved.completeFiles[0], saved.files[0]);
+      return;
+    } else if (change === 'a later confirmed absence') {
+      vi.setSystemTime(deletedAt + 1);
+      fs.renameSync(file, held);
+      provider.catalog.sessions = [];
+      await check();
+      assert.equal(provider.projectSpendQueue.length, 1);
+
+      // This check must leave the positive operation queued when the file reappears before the tick.
+      fs.renameSync(held, file);
+      provider.catalog.sessions = [admitted];
+      provider.indexNextProjectSpendFile();
+      assert.equal(provider.projectSpendQueue.length, 1);
+      assert.equal(provider.projectSpendFiles[0]?.missingAt, undefined);
+      assert.deepEqual(positiveReads, []);
+
+      fs.renameSync(file, held);
+      provider.catalog.sessions = [];
+      await check();
+      provider.indexNextProjectSpendFile();
+      assert.deepEqual(positiveReads, []);
+      assert.equal(provider.projectSpendFiles[0]?.missingAt, Date.now());
+      assert.equal(provider.projectSpendFiles[0]?.agyRescanRequired, undefined);
+      assert.deepEqual(provider.projectSpendFiles[0]?.lifetimeBuckets, prior.lifetimeBuckets);
+      provider.scheduleProjectSpendMidnight();
+      await vi.advanceTimersByTimeAsync(cutoff - Date.now());
+      assert.deepEqual(provider.projectSpendFiles, []);
+      assert.deepEqual(provider.projectSpendVisibleFiles, []);
+      return;
+    }
+
+    const grew = change === 'a newer revision on the same inode';
+    if (grew) {
+      fs.appendFileSync(file, appended);
+      fs.utimesSync(file, day, day);
+      provider.catalog.sessions = [admit()];
+      await check();
+      assert.equal(provider.projectSpendQueue.length, 1);
+    }
+    const revision = fileRevisionOf(fs.lstatSync(file, { bigint: true }));
+    assert.equal(revision.ino, initial.ino);
+    provider.indexNextProjectSpendFile();
+    provider.indexNextProjectSpendFile();
+    assert.deepEqual(positiveReads, [{ revision, output: grew ? 18 : 7, offset: revision.size }]);
+    assert.equal(provider.projectSpendVisibleFiles[0]?.lifetimeBuckets?.[0].usage.output, grew ? 18 : 7);
+    assert.equal(provider.projectSpendFiles[0]?.agyRescanRequired, undefined);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+function agySpendPrompt(at: Date, content = 'Record usage.'): string {
+  return (
+    JSON.stringify({ type: 'USER_INPUT', step_index: 0, created_at: at.toISOString(), status: 'DONE', content }) + '\n'
+  );
+}
+
+function agySpendPath(brain: string): string {
+  const file = path.join(
+    brain,
+    '3352f6ae-5337-44ed-a42a-df1b4d26bbc8',
+    '.system_generated',
+    'logs',
+    'transcript_full.jsonl',
+  );
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  return file;
+}
+
+function useAgySpendCatalog(provider: any, roots: string[]) {
+  provider.folders = () => [roots[0]];
+  provider.repositoryScopeRoots = roots;
+  provider.repositoryScopeReady = true;
+  provider.catalog = { sessions: [] };
+  provider.projectSpendSources = () =>
+    (provider.catalog.sessions as SessionFile[])
+      .filter((row) => row.agent === 'agy')
+      .map((row) => ({ file: row.file, agent: 'agy', agySource: row, primary: true }));
+  provider.scheduleNextProjectSpendFile = () => {};
+}
+
+function checkAgySpend(provider: any, file: string): Promise<void> {
+  provider.updateProjectSpendIntegrity(provider.catalog.sessions);
+  return provider.checkProjectSpendSources([normalizeFsPath(file)], () => true);
+}
+
+function agyOutput(records: readonly SpendFileIndex[], file: string): number | undefined {
+  return records
+    .find((record) => record.file === normalizeSpendFile(file))
+    ?.lifetimeBuckets?.reduce((output, bucket) => output + bucket.usage.output, 0);
+}
+
+test.each(['settled foreign', 'suspended foreign', 'settled local', 'expired foreign'])(
+  'Antigravity discovery requires new ownership after an equal-tuple %s return',
+  async (order) => {
+    const brain = tempDir('agy-spend-revoked-');
+    const project = path.join(brain, 'alpha');
+    const foreign = path.join(brain, 'bravo');
+    const file = agySpendPath(brain);
+    const held = path.join(brain, 'held.jsonl');
+    const storage = path.join(brain, 'ledger');
+    const day = new Date(2026, 10, 25, 12);
+    const cutoff = new Date(2026, 11, 25).getTime();
+    const suspended = order === 'suspended foreign';
+    const local = order === 'settled local';
+    const padding = suspended
+      ? JSON.stringify({
+          type: 'SYSTEM_MESSAGE',
+          step_index: 2,
+          created_at: day.toISOString(),
+          status: 'DONE',
+          content: 'Saved.',
+        }) + '\n'
+      : '';
+    const prompt = agySpendPrompt(day);
+    const body = prompt + agyRetentionRequest(project, day, 1, 3);
+    const resumedBody = prompt + agyRetentionRequest(local ? project : foreign, day, 1, 7) + padding;
+    const resumes: Array<() => void> = [];
+    const spendReads: string[] = [];
+    let holdPublication = false;
+    let membershipBytes = 0;
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(cutoff - 1000);
+      const provider = agyRetentionHost(storage, project, {
+        agyBrainRoot: () => brain,
+        scanAgySessions: function* (...args: Parameters<typeof scanAgySessions>) {
+          const steps = scanAgySessions(args[0], args[1], args[2], { ...args[3], bytes: 512, rows: 2 });
+          for (let step = steps.next(); ; step = steps.next()) {
+            if (step.done) {
+              if (holdPublication) {
+                holdPublication = false;
+                yield { rows: 0, bytes: 0 };
+              }
+              return step.value;
+            }
+            assert.ok(step.value.bytes <= 512);
+            membershipBytes += step.value.bytes;
+            yield step.value;
+          }
+        },
+        setImmediate: (resume: () => void) => resumes.push(resume),
+        indexSpendFile: (...args: Parameters<typeof indexSpendFile>) => {
+          const budget = typeof args[4] === 'object' ? args[4] : {};
+          if (budget.expectedRevision) spendReads.push(args[1]);
+          return indexSpendFile(args[0], args[1], args[2], args[3], {
+            ...budget,
+            maxBytes: 512,
+            maxMilliseconds: Infinity,
+          });
+        },
+      });
+      const roots = [project];
+      useAgySpendCatalog(provider, roots);
+      const finishWalk = async () => {
+        for (let count = 0; resumes.length && count < 32; count++) {
+          resumes.shift()!();
+          await Promise.resolve();
+        }
+        assert.deepEqual(resumes, []);
+      };
+      const publish = () => {
+        provider.catalog.sessions = provider.agyCatalog.rows;
+        provider.agyCatalog.publish = false;
+      };
+      fs.writeFileSync(file, body);
+      fs.utimesSync(file, day, day);
+      provider.startAgyDiscovery(project, roots);
+      await finishWalk();
+      publish();
+      const old = provider.catalog.sessions[0];
+      assert.equal(old.agyOwnerRoot, project);
+      await checkAgySpend(provider, file);
+      provider.indexNextProjectSpendFile();
+      provider.indexNextProjectSpendFile();
+      assert.equal(agyOutput(provider.projectSpendVisibleFiles, file), 3);
+      spendReads.length = 0;
+
+      if (suspended) {
+        fs.appendFileSync(file, padding);
+        fs.utimesSync(file, day, day);
+        holdPublication = true;
+        provider.startAgyDiscovery(project, roots);
+        for (let count = 0; count < 32; count++) {
+          if (!holdPublication) break;
+          resumes.shift()!();
+          await Promise.resolve();
+        }
+        assert.equal(holdPublication, false);
+        assert.ok(provider.agyScan.controller);
+      }
+      const before = fileRevisionOf(fs.lstatSync(file, { bigint: true }));
+      fs.renameSync(file, held);
+      await checkAgySpend(provider, file);
+      provider.indexNextProjectSpendFile();
+      assert.equal(provider.projectSpendFiles[0]?.missingAt, Date.now());
+      if (order === 'expired foreign') {
+        provider.scheduleProjectSpendMidnight();
+        await vi.advanceTimersByTimeAsync(cutoff - Date.now());
+        assert.deepEqual(provider.projectSpendFiles, []);
+      }
+
+      fs.writeFileSync(held, resumedBody);
+      fs.utimesSync(held, day, day);
+      fs.renameSync(held, file);
+      assert.deepEqual(fileRevisionOf(fs.lstatSync(file, { bigint: true })), before);
+      await checkAgySpend(provider, file);
+      assert.deepEqual(provider.projectSpendQueue, [], 'the old catalog row authorizes an equal-tuple return');
+      assert.deepEqual(spendReads, []);
+      const observedBytes = membershipBytes;
+      await finishWalk();
+      provider.agyCatalog.publish = false;
+      provider.startAgyDiscovery(project, roots);
+      await finishWalk();
+      publish();
+      assert.ok(membershipBytes > observedBytes, 'the return did not read ownership again');
+      await checkAgySpend(provider, file);
+      if (local) {
+        assert.equal(provider.projectSpendFiles[0]?.missingAt, undefined);
+        assert.equal(spendReads.length, 0);
+        provider.indexNextProjectSpendFile();
+        assert.equal(agyOutput(provider.projectSpendFiles, file), 7);
+      } else {
+        assert.deepEqual(provider.catalog.sessions, []);
+        assert.deepEqual(provider.projectSpendQueue, []);
+        assert.deepEqual(spendReads, []);
+        assert.equal(agyOutput(provider.projectSpendFiles, file), order === 'expired foreign' ? undefined : 3);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  },
+);
+
+test.each(['before', 'after', 'queued before'])(
+  'Antigravity keeps only unexpired lifetime usage on a history-limited return %s midnight',
+  async (when) => {
+    const brain = tempDir('agy-history-limited-return-');
+    const project = path.join(brain, 'project');
+    const storage = path.join(brain, 'ledger');
+    const file = agySpendPath(brain);
+    const day = new Date(2026, 10, 25, 12);
+    const midnight = new Date(2026, 11, 25).getTime();
+    const discovery = agySpendDiscovery(brain, [project]);
+    const body = agySpendPrompt(day) + agyRetentionRequest(project, day, 1, 3);
+    let days = 0;
+    const positiveOffsets: number[] = [];
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(midnight - PROJECT_SPEND_SAVE_MS - 1);
+      const host = agyRetentionHost(storage, project, {
+        ...discovery.scope,
+        snapshotHistoryDays: () => days,
+        indexSpendFile: (...args: Parameters<typeof indexSpendFile>) => {
+          if (typeof args[4] === 'object' && args[4].expectedRevision)
+            positiveOffsets.push(args[0]?.agyRescanRequired ? 0 : (args[0]?.offset ?? 0));
+          return indexSpendFile(...args);
+        },
+      });
+      useAgySpendCatalog(host, [project]);
+      host.agyScan = discovery.scan;
+      const restore = () => {
+        fs.writeFileSync(file, body);
+        fs.utimesSync(file, day, day);
+        host.catalog.sessions = discovery.rows();
+      };
+      restore();
+      await checkAgySpend(host, file);
+      host.indexNextProjectSpendFile();
+      host.indexNextProjectSpendFile();
+      assert.equal(agyOutput(host.projectSpendVisibleFiles, file), 3);
+      fs.unlinkSync(file);
+      await checkAgySpend(host, file);
+      host.indexNextProjectSpendFile();
+      host.indexNextProjectSpendFile();
+      assert.equal(host.projectSpendFiles[0]?.missingAt, Date.now());
+      positiveOffsets.length = 0;
+      if (when === 'after') vi.setSystemTime(midnight);
+      if (when !== 'queued before') days = 1;
+      restore();
+      await checkAgySpend(host, file);
+      days = 1;
+      host.indexNextProjectSpendFile();
+      host.indexNextProjectSpendFile();
+      assert.deepEqual(positiveOffsets, []);
+      host.scheduleProjectSpendMidnight();
+      await vi.advanceTimersByTimeAsync(Math.max(0, midnight - Date.now()) + PROJECT_SPEND_SAVE_MS);
+      const saved = loadSpendLedger(storage, project);
+      const expected = when === 'after' ? undefined : 3;
+      assert.equal(agyOutput(saved.files, file), expected);
+      assert.equal(agyOutput(saved.completeFiles, file), expected);
+      assert.equal(saved.files[0]?.agyRescanRequired, expected === undefined ? undefined : true);
+      assert.equal(saved.files[0]?.missingAt, undefined);
+      if (expected !== undefined) {
+        assert.deepEqual(saved.files[0]?.buckets, []);
+        days = 0;
+        await checkAgySpend(host, file);
+        host.indexNextProjectSpendFile();
+        assert.deepEqual(positiveOffsets, [0]);
+        assert.equal(agyOutput(host.projectSpendFiles, file), expected);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  },
+);
+
+test.each([false, true])(
+  'Antigravity saves its latest complete usage during an unrelated drain with earlier publication %s',
+  async (published) => {
+    const brain = tempDir('agy-spend-displaced-');
+    const project = path.join(brain, 'project');
+    const file = agySpendPath(brain);
+    const claude = path.join(brain, 'unrelated.jsonl');
+    const storage = path.join(brain, 'ledger');
+    const earlier = new Date(2026, 10, 24, 12);
+    const day = new Date(2026, 10, 25, 12);
+    const later = new Date(2026, 10, 26, 12);
+    const discovery = agySpendDiscovery(brain, [project]);
+    const part = agySpendPrompt(later) + agyRetentionRequest(project, later, 1, 7);
+    const budget = Buffer.byteLength(part);
+    const shellLine =
+      JSON.stringify({ type: 'user', cwd: project, message: { role: 'user', content: 'Hold indexing.' } }) + '\n';
+    fs.writeFileSync(claude, shellLine.repeat(24));
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(later);
+      const makeHost = () => {
+        const provider = agyRetentionHost(
+          storage,
+          project,
+          {
+            ...discovery.scope,
+            sessionLifetimeDisplayFiles,
+            indexSpendFile: (...args: Parameters<typeof indexSpendFile>) =>
+              indexSpendFile(args[0], args[1], args[2], args[3], {
+                ...(typeof args[4] === 'object' ? args[4] : {}),
+                maxBytes: args[1] === file ? budget : Buffer.byteLength(shellLine),
+                maxMilliseconds: Infinity,
+              }),
+          },
+          ['hydrateProjectSpend', 'lifetimeDisplayFiles'],
+        );
+        useAgySpendCatalog(provider, [project]);
+        provider.agyScan = discovery.scan;
+        provider.compressedSpendPick = (records: readonly SpendFileIndex[]) => records;
+        return provider;
+      };
+      const host = makeHost();
+      const setFile = (content: string, at: Date) => {
+        fs.writeFileSync(file, content);
+        fs.utimesSync(file, at, at);
+        host.catalog.sessions = discovery.rows();
+      };
+      const scan = async () => {
+        await checkAgySpend(host, file);
+        if (host.projectSpendQueue[0]?.file === claude) host.indexNextProjectSpendFile();
+        assert.equal(host.projectSpendQueue[0]?.file, file);
+        host.indexNextProjectSpendFile();
+      };
+      if (published) {
+        setFile(agySpendPrompt(earlier) + agyRetentionRequest(project, earlier, 1, 2), earlier);
+        await scan();
+        host.indexNextProjectSpendFile();
+        assert.equal(agyOutput(host.projectSpendVisibleFiles, file), 2);
+      }
+      host.queueProjectSpendIndex(new Map([[claude, readRolloutStat(claude)!]]), null, [
+        { file: claude, agent: 'claude' },
+      ]);
+      setFile(agySpendPrompt(day) + agyRetentionRequest(project, day, 1, 3), day);
+      await scan();
+      assert.equal(agyOutput(host.projectSpendFiles, file), 3);
+      fs.unlinkSync(file);
+      await scan();
+      setFile(part + agyRetentionRequest(project, later, 2, 11), later);
+      await scan();
+      assert.equal(agyOutput(host.projectSpendFiles, file), 7);
+      assert.equal(
+        host.projectSpendFiles.find((record: SpendFileIndex) => record.file === normalizeSpendFile(file))?.offset,
+        budget,
+      );
+      assert.equal(agyOutput(host.lifetimeDisplayFiles(), file), 3);
+      assert.equal(agyOutput(host.projectSpendVisibleFiles, file), published ? 2 : undefined);
+      assert.deepEqual(
+        host.projectSpendQueue.map((item: { file: string }) => item.file),
+        [claude, file],
+      );
+      const unrelatedOffset = host.projectSpendFiles.find(
+        (record: SpendFileIndex) => record.file === normalizeSpendFile(claude),
+      ).offset;
+
+      await vi.advanceTimersByTimeAsync(PROJECT_SPEND_SAVE_MS);
+      assert.equal(host.projectSpendPayload().earliestRecord, published ? '2026-11-24' : null);
+      assert.equal(agyOutput(loadSpendLedger(storage, project).files, file), 7);
+      const reload = () => {
+        const recovered = makeHost();
+        recovered.projectSpendHydrated = false;
+        recovered.scheduleProjectSpendIndex = () => {};
+        recovered.resumeCompressedAdoptions = () => {};
+        recovered.hydrateProjectSpend(project, recovered.refreshGeneration, null);
+        return recovered;
+      };
+      const recovered = reload();
+      assert.equal(agyOutput(recovered.lifetimeDisplayFiles(), file), 3);
+      assert.equal(agyOutput(recovered.projectSpendVisibleFiles, file), published ? 2 : undefined);
+      assert.equal(
+        recovered.projectSpendFiles.find((record: SpendFileIndex) => record.file === normalizeSpendFile(claude)).offset,
+        unrelatedOffset,
+      );
+
+      fs.unlinkSync(file);
+      await checkAgySpend(recovered, file);
+      recovered.indexNextProjectSpendFile();
+      assert.equal(agyOutput(recovered.projectSpendFiles, file), 3);
+      assert.equal(agyOutput(recovered.projectSpendVisibleFiles, file), published ? 2 : undefined);
+      await vi.advanceTimersByTimeAsync(PROJECT_SPEND_SAVE_MS);
+      assert.equal(agyOutput(loadSpendLedger(storage, project).files, file), 3);
+      recovered.indexNextProjectSpendFile();
+      assert.equal(agyOutput(recovered.projectSpendVisibleFiles, file), 3);
+      assert.ok(
+        recovered.projectSpendVisibleFiles.some(
+          (record: SpendFileIndex) =>
+            record.file === normalizeSpendFile(file) && record.buckets[0]?.localDate === '2026-11-25',
+        ),
+      );
+      const cutoff = new Date(2026, 11, 25).getTime();
+      vi.setSystemTime(cutoff - 1);
+      const expiring = reload();
+      assert.equal(agyOutput(expiring.lifetimeDisplayFiles(), file), 3);
+      assert.equal(expiring.projectSpendQueue.length, 0);
+      await vi.advanceTimersByTimeAsync(1);
+      assert.equal(agyOutput(expiring.lifetimeDisplayFiles(), file), undefined);
+      assert.equal(agyOutput(expiring.projectSpendVisibleFiles, file), undefined);
+    } finally {
+      vi.useRealTimers();
+    }
+  },
+);
+
+test.each(['opening rewrite', 'cursor rewrite', 'append'])(
+  'Antigravity spend checks a revised prefix before resuming after %s',
+  async (change) => {
+    const brain = tempDir('agy-spend-continuity-');
+    const project = path.join(brain, 'project');
+    const file = agySpendPath(brain);
+    const day = new Date(2026, 10, 26, 12);
+    const sys = (step_index: number, size: number) =>
+      JSON.stringify({
+        type: 'SYSTEM_MESSAGE',
+        step_index,
+        created_at: day.toISOString(),
+        status: 'DONE',
+        content: 'x'.repeat(size),
+      }) + '\n';
+    const opening = agySpendPrompt(day) + (change === 'opening rewrite' ? '' : sys(1, 6000));
+    const counted = (tokens: number) => agyRetentionRequest(project, day, 2, tokens);
+    const tail = sys(3, change === 'opening rewrite' ? 900 : 8000);
+    const prefix = opening + counted(7);
+    const offset = Buffer.byteLength(prefix);
+    const budget = offset + 12;
+    const body = prefix + tail;
+    const next = agyRetentionRequest(project, day, 4, 11);
+    const discovery = agySpendDiscovery(brain, [project], 512);
+    const reads: Array<{ offset: number; bytes: number }> = [];
+    let indexing = false;
+    const readSync = mutableFs.readSync;
+    const trackRead = (fd: number, buffer: NodeJS.ArrayBufferView, start: number, length: number, position: number) => {
+      const bytes = readSync(fd, buffer, start, length, position);
+      if (indexing) reads.push({ offset: position, bytes });
+      return bytes;
+    };
+    const tracked = vi.spyOn(mutableFs, 'readSync').mockImplementation(trackRead as typeof readSync);
+    syncBuiltinESMExports();
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(day);
+      const provider = agyRetentionHost(path.join(brain, 'ledger'), project, {
+        ...discovery.scope,
+        indexSpendFile: (...args: Parameters<typeof indexSpendFile>) => {
+          indexing = true;
+          try {
+            return indexSpendFile(args[0], args[1], args[2], args[3], {
+              ...(typeof args[4] === 'object' ? args[4] : {}),
+              maxBytes: budget,
+              maxMilliseconds: Infinity,
+            });
+          } finally {
+            indexing = false;
+          }
+        },
+      });
+      useAgySpendCatalog(provider, [project]);
+      provider.agyScan = discovery.scan;
+      fs.writeFileSync(file, body);
+      fs.utimesSync(file, day, day);
+      provider.catalog.sessions = discovery.rows();
+      const original = provider.catalog.sessions[0];
+      await checkAgySpend(provider, file);
+      provider.indexNextProjectSpendFile();
+      assert.equal(provider.projectSpendFiles[0]?.offset, offset);
+      assert.equal(provider.projectSpendFiles[0]?.scanOffset, budget);
+      assert.equal(Buffer.from(provider.projectSpendFiles[0]?.pendingBytes, 'base64').length, 12);
+      assert.equal(agyOutput(provider.projectSpendFiles, file), 7);
+
+      const grew = change === 'append' ? body : opening + counted(5) + tail;
+      fs.writeFileSync(file, grew + next);
+      fs.utimesSync(file, day, day);
+      provider.catalog.sessions = discovery.rows();
+      if (change === 'append') {
+        fs.appendFileSync(file, sys(5, 32));
+        fs.utimesSync(file, day, day);
+        provider.catalog.sessions = discovery.rows();
+      }
+      assert.equal(provider.catalog.sessions[0]?.ino, original.ino);
+      assert.ok(provider.catalog.sessions[0]?.size > original.size);
+      await checkAgySpend(provider, file);
+      assert.equal(provider.projectSpendQueue.length, 1);
+      reads.length = 0;
+      provider.indexNextProjectSpendFile();
+      const firstReads = reads.slice();
+      const bytes = firstReads.reduce((sum, read) => sum + read.bytes, 0);
+      assert.ok(bytes > 0 && bytes <= budget);
+      for (let count = 0; provider.projectSpendQueue.length && count < 12; count++)
+        provider.indexNextProjectSpendFile();
+      assert.deepEqual(provider.projectSpendQueue, []);
+      assert.equal(provider.projectSpendFiles[0]?.size, provider.catalog.sessions[0]?.size);
+      assert.equal(provider.projectSpendFiles[0]?.complete, true);
+      assert.equal(agyOutput(provider.projectSpendFiles, file), change === 'append' ? 18 : 16);
+      if (change === 'append') {
+        const sample = firstReads[0].offset < budget ? firstReads.shift() : undefined;
+        if (sample) assert.equal(sample.offset + sample.bytes, budget);
+        assert.equal(firstReads[0]?.offset, budget, 'the append replays bytes before the saved scan cursor');
+      } else {
+        const data = firstReads.at(change === 'cursor rewrite' ? 1 : 0);
+        assert.equal(data?.offset, 0, 'the revised prefix inherited earlier usage');
+      }
+    } finally {
+      tracked.mockRestore();
+      syncBuiltinESMExports();
+      vi.useRealTimers();
+    }
+  },
+);
+
+test.each([false, true])(
+  'Antigravity rebuilds cold progress on an equal tuple with rewritten bytes %s',
+  async (rewritten) => {
+    const brain = tempDir('agy-spend-cold-');
+    const project = path.join(brain, 'project');
+    const file = agySpendPath(brain);
+    const storage = path.join(brain, 'ledger');
+    const day = new Date(2026, 10, 26, 12);
+    const prompt = agySpendPrompt(day);
+    const prefix = prompt + agyRetentionRequest(project, day, 1, 7);
+    const tail = agyRetentionRequest(project, day, 2, 11);
+    const maxBytes = Buffer.byteLength(prefix);
+    const write = (text: string) => {
+      fs.writeFileSync(file, text);
+      fs.utimesSync(file, day, day);
+    };
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(day);
+      write(prompt + agyRetentionRequest(project, day, 1, 3));
+      const display = indexSpendFile(undefined, file, project, createAgyUsageReducer).record;
+      write(prefix + tail);
+      const warm = agySpendDiscovery(brain, [project]);
+      const admitted = warm.rows()[0];
+      const revision = fileRevisionOf(fs.lstatSync(file, { bigint: true }));
+      const prior = indexSpendFile(display, file, project, createAgyUsageReducer, {
+        maxBytes,
+        expectedRevision: revision,
+        agyAdmission: currentAgyAdmission(warm.scan.cache, admitted),
+        maxMilliseconds: Infinity,
+      }).record;
+      assert.equal(prior.complete, false);
+      assert.equal(prior.offset, maxBytes);
+      saveSpendLedger(storage, project, [prior], [display]);
+      if (rewritten) write(prompt + agyRetentionRequest(project, day, 1, 5) + tail);
+      assert.deepEqual(fileRevisionOf(fs.lstatSync(file, { bigint: true })), revision);
+
+      const cold = agySpendDiscovery(brain, [project]);
+      const provider = agyRetentionHost(
+        storage,
+        project,
+        {
+          ...cold.scope,
+          sessionLifetimeDisplayFiles,
+          indexSpendFile: (...args: Parameters<typeof indexSpendFile>) =>
+            indexSpendFile(args[0], args[1], args[2], args[3], {
+              ...(typeof args[4] === 'object' ? args[4] : {}),
+              maxBytes,
+              maxMilliseconds: Infinity,
+            }),
+        },
+        ['hydrateProjectSpend', 'lifetimeDisplayFiles'],
+      );
+      useAgySpendCatalog(provider, [project]);
+      provider.agyScan = cold.scan;
+      provider.catalog.sessions = cold.rows();
+      provider.projectSpendHydrated = false;
+      provider.compressedSpendPick = (records: readonly SpendFileIndex[]) => records;
+      provider.scheduleProjectSpendIndex = () => {};
+      provider.resumeCompressedAdoptions = () => {};
+      provider.hydrateProjectSpend(project, provider.refreshGeneration, null);
+      assert.equal(agyOutput(provider.lifetimeDisplayFiles(), file), 3);
+      await checkAgySpend(provider, file);
+      provider.indexNextProjectSpendFile();
+      assert.equal(provider.projectSpendFiles[0]?.offset, maxBytes);
+      assert.equal(agyOutput(provider.projectSpendFiles, file), rewritten ? 5 : 7);
+      assert.equal(agyOutput(provider.lifetimeDisplayFiles(), file), 3);
+      provider.indexNextProjectSpendFile();
+      provider.indexNextProjectSpendFile();
+      assert.equal(agyOutput(provider.projectSpendVisibleFiles, file), rewritten ? 16 : 18);
+    } finally {
+      vi.useRealTimers();
+    }
+  },
+);
+
+test.each(['marked working copy', 'orphaned display'])(
+  'Project cost hydrates an expired Antigravity %s without republishing it',
+  async (shape) => {
+    const root = tempDir('agy-spend-hydration-retention-');
+    const project = path.join(root, 'project');
+    const storage = path.join(root, 'ledger');
+    const day = new Date(2026, 10, 25, 12);
+    const later = new Date(2026, 10, 26, 12);
+    const cutoff = new Date(2026, 11, 25).getTime();
+
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(cutoff - 1);
+      const prior = (name: string, at: Date, output: number) => {
+        const file = path.join(root, name + '.jsonl');
+        fs.writeFileSync(file, agyRetentionRequest(project, at, 0, output));
+        fs.utimesSync(file, at, at);
+        return indexSpendFile(undefined, file, project, createAgyUsageReducer).record;
+      };
+      const expired = prior('expired', day, 3);
+      fs.unlinkSync(expired.file);
+      const missing = { ...expired, missingAt: Date.now() };
+      const lifetime = prior('present-lifetime', day, 5);
+      const current = prior('present-current', later, 7);
+      const fallback = { ...prior('replacement', day, 11), missingAt: Date.now() };
+      const partial = agyRetentionRequest(project, later, 0, 13);
+      fs.writeFileSync(fallback.file, partial + agyRetentionRequest(project, later, 1, 17));
+      fs.utimesSync(fallback.file, later, later);
+      const replacement = indexSpendFile(fallback, fallback.file, project, createAgyUsageReducer, {
+        maxBytes: Buffer.byteLength(partial),
+        maxMilliseconds: Infinity,
+      }).record;
+      assert.equal(replacement.complete, false);
+      assert.equal(replacement.missingAt, undefined);
+
+      const working = [lifetime, current, replacement];
+      const displayed = [lifetime, current, fallback];
+      if (shape === 'marked working copy') {
+        working.unshift(missing);
+        displayed.unshift(expired);
+      } else {
+        displayed.unshift({ ...expired, buckets: [] });
+      }
+      saveSpendLedger(storage, project, working, displayed);
+      assert.equal(loadSpendLedger(storage, project).completeFiles[0]?.file, expired.file);
+
+      vi.setSystemTime(cutoff);
+      const provider = agyRetentionHost(storage, project, {}, ['hydrateProjectSpend']);
+      provider.projectSpendHydrated = false;
+      provider.scheduleProjectSpendIndex = () => {};
+      provider.hydrateProjectSpend(project, provider.refreshGeneration, null);
+      await vi.waitFor(() => assert.equal(provider.projectSpendPayload().indexing, false));
+
+      const expectedDisplay = [lifetime.file, current.file, fallback.file];
+      assert.deepEqual(
+        provider.projectSpendVisibleFiles.map((record: SpendFileIndex) => record.file),
+        expectedDisplay,
+      );
+      const view = provider.projectSpendPayload() as ProjectSpendView;
+      assert.deepEqual(
+        view.categories.map((category) => category.id),
+        ['agy'],
+      );
+      assert.equal(view.categories[0].windows.find((window) => window.id === 'thirtyDays')?.unpricedRequests, 1);
+      await vi.advanceTimersByTimeAsync(PROJECT_SPEND_SAVE_MS);
+      const saved = loadSpendLedger(storage, project);
+      assert.deepEqual(
+        saved.files.map((record) => record.file),
+        expectedDisplay,
+      );
+      assert.deepEqual(
+        saved.completeFiles.map((record) => record.file),
+        expectedDisplay,
+      );
+      assert.deepEqual(saved.files[0]?.buckets, []);
+      assert.deepEqual(saved.files[0]?.lifetimeBuckets, lifetime.lifetimeBuckets);
+      assert.deepEqual(saved.completeFiles[2]?.buckets, []);
+      assert.deepEqual(saved.completeFiles[2]?.lifetimeBuckets, fallback.lifetimeBuckets);
+      assert.equal(saved.files[2]?.offset, replacement.offset);
+      assert.equal(saved.files[2]?.complete, false);
+    } finally {
+      vi.useRealTimers();
+    }
+  },
+);
 
 test.each(['stat', 'open', 'read'])(
   'failed %s after a replacement slice retains complete published cost and age',
@@ -26169,10 +29156,7 @@ test('a cold start completes its session render before it restores Project cost'
         order.push('ledger restored');
         return { files: [], completeFiles: [] };
       },
-      pruneSpendFilesWithResult: (files: object[]) => ({
-        files,
-        pruned: false,
-      }),
+      pruneSpendLedgerFiles: unchangedSpendLedger,
     });
     provider.projectSpendHydrated = false;
     provider.projectSpendHydrationReady = false;
@@ -32563,6 +35547,8 @@ function projectSpendSnapshotHarness(scope: Record<string, unknown> = {}, extraM
       projectSpendWindows,
       projectSpendDisplayFiles,
       truncateProjectSpendView,
+      pruneSpendLedgerFiles,
+      pruneSpendFilesWithResult,
       projectSpendHistoryCutoff,
       publicProjectSpendPrice,
       ...scope,
@@ -32636,10 +35622,7 @@ test.each(['resumable updates', 'unchanged completed index passes'])(
     try {
       const provider = projectSpendSnapshotHarness(
         {
-          pruneSpendFilesWithResult: (files: SpendFileIndex[]) => ({
-            files,
-            pruned: false,
-          }),
+          pruneSpendFilesWithResult: unchangedSpendFiles,
         },
         ['finishProjectSpendIndex'],
       );
@@ -33087,10 +36070,7 @@ test('Project cost snapshot hydration replaces an interrupted build without coun
     const provider = projectSpendSnapshotHarness(
       {
         loadSpendLedger: () => ({ files: restored, completeFiles: restored }),
-        pruneSpendFilesWithResult: (files: SpendFileIndex[]) => ({
-          files,
-          pruned: false,
-        }),
+        pruneSpendLedgerFiles: unchangedSpendLedger,
       },
       ['hydrateProjectSpend'],
     );
@@ -33128,6 +36108,7 @@ async function hydrateCompressedRolloutLedger(scope: Record<string, unknown> = {
   const provider = projectSpendSnapshotHarness(
     {
       loadSpendLedger,
+      pruneSpendLedgerFiles,
       pruneSpendFilesWithResult,
       normalizeSpendFile,
       spendRecordChangesRail: () => false,
@@ -33616,10 +36597,7 @@ test('Project cost snapshot rejects hydration from an earlier workspace epoch af
     let loads = 0;
     const provider = projectSpendSnapshotHarness(
       {
-        pruneSpendFilesWithResult: (files: SpendFileIndex[]) => ({
-          files,
-          pruned: false,
-        }),
+        pruneSpendLedgerFiles: unchangedSpendLedger,
         loadSpendLedger: () => {
           loads++;
           return { files: [], completeFiles: [] };
@@ -33863,6 +36841,7 @@ function agentMessageHost(agent: 'claude' | 'codex') {
     'readerWork',
     'continuationWork',
     'guardedTargetFacts',
+    'compressedProjectionCurrent',
     'releaseStaging',
     'livePressAnswered',
     'forgetLivePress',
@@ -33899,6 +36878,7 @@ function agentMessageHost(agent: 'claude' | 'codex') {
     queueCanDrain,
     queueEdit,
     guardedSourceRevision,
+    isCompressedRollout,
     ACTIVE_RAIL_STATUSES: new Set(['running', 'waiting', 'subagents', 'background']),
     commentsForActiveSubmission,
     pressesAfterHandoff,

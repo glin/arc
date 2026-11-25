@@ -250,7 +250,8 @@ function ProjectSpendDialog({ owner }: { owner: ProjectSpendRenderer }): Compone
   const windows = Array.isArray(spend?.windows) ? spend.windows : [];
   const claude = spend ? projectSpendCategory(spend, 'claude') : null;
   const codex = spend ? projectSpendCategory(spend, 'codex') : null;
-  const categories = [claude, codex].filter((category): category is ProjectSpendCategory => !!category);
+  const agy = spend ? projectSpendCategory(spend, 'agy') : null;
+  const categories = [claude, codex, agy].filter((category): category is ProjectSpendCategory => !!category);
   const omitted = categories.filter((category) =>
     categoryWindows(category).some(
       (period) => !!period.unpricedRequests && windows.some((column) => column.id === period.id),
@@ -319,6 +320,14 @@ function ProjectSpendDialog({ owner }: { owner: ProjectSpendRenderer }): Compone
                 columns: windows,
                 period: snapshot.period,
               }),
+              agy &&
+                h(SpendRow, {
+                  key: 'agy',
+                  name: projectSpendAgentName(agy.label),
+                  windows: categoryWindows(agy),
+                  columns: windows,
+                  period: snapshot.period,
+                }),
               h(SpendRow, {
                 key: 'total',
                 name: 'Total',
