@@ -1,3 +1,6 @@
+import { COMPRESSED_BATCH_BYTES, compressedEntryBatchIterator } from './compressedbatches';
+import type { CompressedLoadResume, CompressedStorePaths } from './compressedstore';
+import type { CompressedPlacement, CompressedRepair } from './compressedrollouts';
 import type { RelationshipCauseCounters } from './transcript';
 import { Worker } from 'node:worker_threads';
 import { CODEX_META_VERSION } from './codexopenings';
@@ -141,8 +144,11 @@ export function unreadHeadBytes(
   return SESSION_HEAD_BYTES - HEAD_KEY_BYTES;
 }
 
-export type ProgressiveCheckpoint = ClaudeForwardCheckpoint | CodexForwardCheckpoint;
-export type ProgressiveCursor = ClaudeHistoryCursor | CodexHistoryCursor;
+export type ProgressiveCheckpoint =
+  | ClaudeForwardCheckpoint
+  | CodexForwardCheckpoint
+  | import('./agyhistory').AgyCheckpoint;
+export type ProgressiveCursor = ClaudeHistoryCursor | CodexHistoryCursor | import('./agyhistory').AgyHistoryCursor;
 export interface ProgressiveInput {
   session: SessionFile;
   folders: string[];
@@ -408,6 +414,157 @@ export interface ChildFileEdits {
 // The largest child transcript a file action reads, the same bound as one whole-file rail read.
 export const CHILD_EDIT_READ_BYTES = INITIAL_RAIL_READ_BYTES;
 
+export interface CompressedNamesReceipt {
+  revision: number;
+  state: 'held' | 'recorded';
+}
+
+export interface CompressedTransferReceipt {
+  id: number;
+  part: number;
+}
+
+export type CompressedTransferRecord =
+  | ['root', string]
+  | ['placement', CompressedPlacement]
+  | ['repair', CompressedRepair]
+  | ['name', string]
+  | ['offset', CompressedLoadResume['consumed'][number]]
+  | ['entry', CompressedLoadResume['entries'][number]]
+  | ['nameOnly', string]
+  | ['lineage', NonNullable<CompressedLoadResume['lineage']>[number]];
+
+export interface CompressedTransferCancellation {
+  stores: CompressedStorePaths;
+  scope: number;
+  purpose: CompressedTransferPart['purpose'];
+  id: number;
+}
+
+export interface CompressedTransferPart extends CompressedTransferReceipt {
+  purpose: 'load' | 'discovery';
+  records: CompressedTransferRecord[];
+}
+
+export interface CompressedLoadRequest {
+  kind: 'compressed-load';
+  stores: CompressedStorePaths;
+  // Present once the first render and the first pass ended.
+  backfill?: { workspace: string; roots: string[]; launch: string };
+  resume?: CompressedLoadResume;
+  placements?: CompressedPlacement[];
+  repairs?: CompressedRepair[];
+  repairScope?: number;
+  compressed?: string[];
+  compressedRevision?: number;
+  transfer?: CompressedTransferReceipt;
+  transferPart?: CompressedTransferPart;
+}
+
+export function sameCompressedStores(a: CompressedStorePaths | undefined, b: CompressedStorePaths): boolean {
+  return a?.facts === b.facts && a?.openings === b.openings;
+}
+
+// These messages contain JSON-shaped data. Stop counting when the remaining bytes cannot hold the next value.
+function cappedJsonBytes(value: unknown, limit: number): number {
+  if (typeof value === 'string') {
+    if (value.length + 2 > limit) return limit + 1;
+    return Buffer.byteLength(JSON.stringify(value));
+  }
+  if (value == null || typeof value !== 'object') return Buffer.byteLength(JSON.stringify(value ?? null));
+
+  let bytes = 2;
+  let comma = 0;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      bytes += comma + cappedJsonBytes(item, limit - bytes - comma);
+      if (bytes > limit) return limit + 1;
+      comma = 1;
+    }
+  } else {
+    const object = value as Record<string, unknown>;
+    for (const key in object) {
+      if (!Object.hasOwn(object, key) || object[key] === undefined) continue;
+      bytes += comma + cappedJsonBytes(key, limit - bytes - comma) + 1;
+      if (bytes > limit) return limit + 1;
+      bytes += cappedJsonBytes(object[key], limit - bytes);
+      if (bytes > limit) return limit + 1;
+      comma = 1;
+    }
+  }
+  return bytes;
+}
+
+export function compressedRequestBytes(request: ProgressiveRequest, generation: number): number {
+  // Reserve the largest request ID. The compressed request kinds have no repeated-record sidecar.
+  return cappedJsonBytes({ id: Number.MAX_SAFE_INTEGER, generation, request }, COMPRESSED_BATCH_BYTES);
+}
+
+export function compressedTransferBatches(
+  header: Pick<CompressedLoadRequest, 'kind' | 'stores' | 'repairScope'>,
+  id: number,
+  purpose: CompressedTransferPart['purpose'],
+  records: Iterable<CompressedTransferRecord>,
+  generation: number,
+): Iterable<CompressedTransferRecord[]> {
+  const envelope: CompressedLoadRequest = {
+    ...header,
+    transferPart: { id, part: Number.MAX_SAFE_INTEGER, purpose, records: [] },
+  };
+  const budget = COMPRESSED_BATCH_BYTES - compressedRequestBytes(envelope, generation);
+  if (budget <= 0) return [];
+  return compressedEntryBatchIterator(records, budget, 1, (record) => cappedJsonBytes(record, budget));
+}
+
+export function* compressedLoadRecords(request: CompressedLoadRequest): Iterable<CompressedTransferRecord> {
+  for (const root of request.backfill?.roots ?? []) yield ['root', root];
+  for (const placement of request.placements ?? []) yield ['placement', placement];
+  for (const repair of request.repairs ?? []) yield ['repair', repair];
+  for (const name of request.compressed ?? []) yield ['name', name];
+  for (const offset of request.resume?.consumed ?? []) yield ['offset', offset];
+  for (const entry of request.resume?.entries ?? []) yield ['entry', entry];
+  for (const path of request.resume?.nameOnly ?? []) yield ['nameOnly', path];
+  for (const lineage of request.resume?.lineage ?? []) yield ['lineage', lineage];
+}
+
+export function assembleCompressedLoad(
+  request: CompressedLoadRequest,
+  parts: readonly (readonly CompressedTransferRecord[])[],
+): CompressedLoadRequest {
+  const { transfer: _transfer, ...load } = request;
+  for (const part of parts) {
+    for (const [field, record] of part) {
+      switch (field) {
+        case 'root':
+          load.backfill?.roots.push(record);
+          break;
+        case 'placement':
+          (load.placements ??= []).push(record);
+          break;
+        case 'repair':
+          (load.repairs ??= []).push(record);
+          break;
+        case 'name':
+          load.compressed?.push(record);
+          break;
+        case 'offset':
+          load.resume?.consumed.push(record);
+          break;
+        case 'entry':
+          load.resume?.entries.push(record);
+          break;
+        case 'nameOnly':
+          if (load.resume) (load.resume.nameOnly ??= []).push(record);
+          break;
+        case 'lineage':
+          if (load.resume) (load.resume.lineage ??= []).push(record);
+          break;
+      }
+    }
+  }
+  return load;
+}
+
 export type ProgressiveRequest =
   | { kind: 'codex-context'; session: SessionFile }
   | { kind: 'child-file-edits'; source: ChildEditSource; keys: string[]; folders: string[] }
@@ -429,21 +586,18 @@ export type ProgressiveRequest =
       spendOnly?: true;
       // The complete host set of compressed rollouts, sent only when the set changed since the last send to this worker.
       compressed?: string[];
-      compressedStores?: import('./compressedstore').CompressedStorePaths;
+      compressedStores?: CompressedStorePaths;
+      compressedRevision?: number;
+      compressedScope?: number;
+      compressedTransfer?: CompressedTransferReceipt;
     }
   | {
       kind: 'compressed-adopt';
       adoption: import('./compressedstore').CompressedAdoptionInput;
+      pending?: import('./compressedstore').CompressedEntrySeed;
       stores: import('./compressedstore').CompressedStorePaths;
     }
-  | {
-      kind: 'compressed-load';
-      stores: import('./compressedstore').CompressedStorePaths;
-      // Present once the first render and the first pass ended. The worker starts the backfill on it.
-      backfill?: { workspace: string; roots: string[]; launch: string };
-      // Offsets and entries that a new worker takes in place of reading the whole store.
-      resume?: import('./compressedstore').CompressedLoadResume;
-    }
+  | CompressedLoadRequest
   | { kind: 'metadata'; session: SessionFile; opening?: CodexSessionMeta | null; tailBytes?: number }
   | {
       kind: 'metadata-recovery';
@@ -451,6 +605,7 @@ export type ProgressiveRequest =
       opening?: CodexSessionMeta | null;
       sliceBytes: number;
       eligible: string[];
+      agyRecovery?: number;
       retainedBytes?: number;
       recordBytes?: number;
       reduceAboveBytes?: number;
@@ -472,8 +627,9 @@ export type ProgressiveValue =
       kind: 'compressed-adopt';
       adopted: boolean;
       entry: import('./compressedstore').CompressedFactEntry;
-      // True when the entry's line is on disk.
+      // A saved adoption can still be waiting for the store to select its facts.
       durable: boolean;
+      pending?: true;
       writeBytes: number;
     }
   | {
@@ -482,10 +638,16 @@ export type ProgressiveValue =
       done: boolean;
       // On the final reply: the bytes this reply covers in each store file.
       consumed?: [string, number][];
+      relocated?: [string, import('./compressedstore').CompressedStoreRecord][];
+      spendRelocated?: [string, import('./compressedstore').CompressedStoreRecord][];
+      lineage?: import('./compressedstore').CompressedLineage[];
       // On the final reply: the names the poll read that hold no facts.
       nameOnly?: string[];
       // On the final reply: the size of the list that waited for this first load, which the worker now records.
       heldNamesRecorded?: number;
+      acceptedRepairs?: import('./compressedrollouts').CompressedRepair[];
+      compressedNames?: CompressedNamesReceipt;
+      stagedTransfer?: CompressedTransferReceipt;
     }
   | { kind: 'codex-context'; estimate: import('./codexcontext').CodexContextResult | null }
   | {
@@ -500,7 +662,7 @@ export type ProgressiveValue =
   | {
       kind: 'claude-children';
       // How the worker took the `compressed` list of the request.
-      compressedNames?: 'held' | 'recorded';
+      compressedNames?: CompressedNamesReceipt;
       compatibility?: string;
       references: ClaudeChildSessionReference[];
       children: ClaudeChildSessionFile[];
@@ -523,7 +685,7 @@ export type ProgressiveValue =
     }
   | {
       kind: 'claude-children-delta';
-      compressedNames?: 'held' | 'recorded';
+      compressedNames?: CompressedNamesReceipt;
       referenceEntries: Array<[string, ClaudeChildReferenceCacheEntry]>;
       checkpoint?: DiscoveryCheckpoint;
       epoch: string;
@@ -552,7 +714,7 @@ export type ProgressiveValue =
     }
   | {
       kind: 'claude-children-progress';
-      compressedNames?: 'held' | 'recorded';
+      compressedNames?: CompressedNamesReceipt;
       referenceEntries: Array<[string, ClaudeChildReferenceCacheEntry]>;
       checkpoint: DiscoveryCheckpoint;
       continuation: true;
@@ -609,6 +771,7 @@ export interface ProgressiveResult {
   revision: FileRevision | null;
   value: ProgressiveValue;
   workerMemory?: WorkerMemory;
+  workerThreadId?: number;
 }
 
 export interface WorkerMemory {
@@ -800,6 +963,9 @@ export class ProgressiveWorker {
     private readonly onCompressedStoreWrite?: (bytes: number) => void,
     // Hears each batch of entries that the backfill published.
     private readonly onCompressedFacts?: (batch: import('./compressedbackfill').CompressedBackfillBatch) => void,
+    private readonly compressedSpendWitness?: (
+      request: import('./compressedstore').CompressedSpendRequest,
+    ) => import('./compressedstore').CompressedFactEntry | undefined,
   ) {}
 
   snapshot(): {
@@ -937,19 +1103,25 @@ export class ProgressiveWorker {
     this.worker?.postMessage({ releaseBody: file });
   }
 
+  discardCompressedTransfer(worker: number, transfer: CompressedTransferCancellation): void {
+    if (this.currentThreadId === worker) this.worker?.postMessage({ discardCompressedTransfer: transfer });
+  }
+
   run(
     request: ProgressiveRequest,
     generation: number,
     signal: AbortSignal,
     progress?: (value: ProgressiveResult) => void,
+    expectedThread?: number,
   ): Promise<ProgressiveResult | null> {
-    if (request.kind !== 'claude-children') return this.runAdmitted(request, generation, signal, progress);
+    if (request.kind !== 'claude-children')
+      return this.runAdmitted(request, generation, signal, progress, expectedThread);
     if (signal.aborted) return Promise.resolve(null);
     return new Promise((resolve, reject) => {
       const start = () => {
         signal.removeEventListener('abort', cancel);
         this.discoveryActive = true;
-        void this.runAdmitted(request, generation, signal, progress)
+        void this.runAdmitted(request, generation, signal, progress, expectedThread)
           .then(resolve, reject)
           .finally(() => {
             this.discoveryActive = false;
@@ -979,8 +1151,9 @@ export class ProgressiveWorker {
     generation: number,
     signal: AbortSignal,
     progress?: (value: ProgressiveResult) => void,
+    expectedThread?: number,
   ): Promise<ProgressiveResult | null> {
-    if (signal.aborted) {
+    if (signal.aborted || (expectedThread !== undefined && this.currentThreadId !== expectedThread)) {
       return Promise.resolve(null);
     }
     if (!this.worker) {
@@ -1017,7 +1190,14 @@ export class ProgressiveWorker {
           compressedDecode?: number;
           compressedStoreWrite?: number;
           compressedFacts?: import('./compressedbackfill').CompressedBackfillBatch;
+          compressedSpendRequest?: { id: number; request: import('./compressedstore').CompressedSpendRequest };
         }) => {
+          if (message.compressedSpendRequest) {
+            if (this.worker !== worker) return;
+            const { id, request } = message.compressedSpendRequest;
+            worker.postMessage({ compressedSpendReply: { id, entry: this.compressedSpendWitness?.(request) ?? null } });
+            return;
+          }
           if (message.compressedFacts) {
             if (this.worker === worker) this.onCompressedFacts?.(message.compressedFacts);
             return;
@@ -1110,6 +1290,8 @@ export class ProgressiveWorker {
                 applyHiddenTurnFields(turn, hidden.turns[index], hidden.redefinesDetail),
               );
             }
+            if (message.result && (held.kind === 'compressed-load' || held.kind === 'claude-children'))
+              Object.defineProperty(message.result, 'workerThreadId', { value: worker.threadId });
             held.resolve(message.result ?? null);
           }
         },
@@ -1174,7 +1356,7 @@ export class ProgressiveWorker {
     if (
       request.kind === 'compressed-adopt' ||
       request.kind === 'compressed-load' ||
-      (request.kind === 'claude-children' && request.compressed)
+      (request.kind === 'claude-children' && (request.compressed || request.compressedTransfer))
     )
       this.workerOpenedStores = true;
     const id = ++this.nextId;

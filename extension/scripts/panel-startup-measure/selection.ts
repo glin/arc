@@ -418,7 +418,7 @@ export function instrumentSelection(tree: string): void {
   const stages: [string, string][] = [
     ['      const admissionCandidates = all;', "__arcStage('revalidated');"],
     [
-      '      const counts = this.unreadCounts();\n      const fullLabels',
+      '      // rows of its scope, and every other refresh builds the rows of every listed session.\n      const counts = this.unreadCounts();',
       "__arcStage('listing', {catalog: all.length});",
     ],
     [

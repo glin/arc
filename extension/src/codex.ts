@@ -914,6 +914,7 @@ class RolloutWalk {
   private status: SourceEnumeration['status'] = 'complete';
   private missingRoot = false;
   private readonly directories: string[] = [];
+  private readonly untraversed: string[] = [];
   private readonly files: string[] = [];
   private readonly compressed: string[] = [];
   private readonly uncertain: string[] = [];
@@ -944,10 +945,11 @@ class RolloutWalk {
   }
 
   result(): SourceEnumeration {
-    const { status, root, directories, files, uncertain, compressed } = this;
+    const { status, root, directories, files, uncertain, compressed, untraversed } = this;
+    const directoryTree = { depth: WALK_DEPTH, untraversed };
     return this.missingRoot
-      ? { status, root, directories, files, uncertain, compressed, missingRoot: true }
-      : { status, root, directories, files, uncertain, compressed };
+      ? { status, root, directories, directoryTree, files, uncertain, compressed, missingRoot: true }
+      : { status, root, directories, directoryTree, files, uncertain, compressed };
   }
 
   // Collects rollouts in entry order until the next directory to descend into, which then waits
@@ -969,10 +971,11 @@ class RolloutWalk {
             this.depth = depth + 1;
             return;
           }
-        } else if (entry.name.endsWith('.jsonl')) {
-          this.files.push(path.join(dir, entry.name));
-        } else if (isCompressedRolloutName(entry.name)) {
-          this.compressed.push(path.join(dir, entry.name));
+          this.untraversed.push(path.join(dir, entry.name));
+        } else {
+          if (entry.isSymbolicLink?.()) this.untraversed.push(path.join(dir, entry.name));
+          if (entry.name.endsWith('.jsonl')) this.files.push(path.join(dir, entry.name));
+          else if (isCompressedRolloutName(entry.name)) this.compressed.push(path.join(dir, entry.name));
         }
       }
       open.pop();
@@ -1198,15 +1201,20 @@ export interface RolloutStat {
 }
 
 export function readRolloutStat(file: string): RolloutStat | null {
+  return observeRolloutStat(file) ?? null;
+}
+
+export function observeRolloutStat(file: string): RolloutStat | null | undefined {
   try {
     const stat = fs.statSync(file, { bigint: true });
     return {
       ...revisionOf(stat),
       isFile: stat.isFile(),
     };
-  } catch {
-    return null;
-  } // vanished mid-scan
+  } catch (error) {
+    const { code } = error as NodeJS.ErrnoException;
+    return code === 'ENOENT' || code === 'ENOTDIR' ? null : undefined;
+  }
 }
 
 async function readRolloutStatAsync(file: string): Promise<RolloutStat | null> {
